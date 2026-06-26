@@ -117,6 +117,67 @@ try {
     exit 1
 }
 
+# 6b. exercise the per-session model + PATCH meta endpoint, so a
+# regression on the new sessionMeta persistence path is caught
+# even when no real LLM is configured.
+Step "6b" "per-session model: create + PATCH + list"
+try {
+    # Pick a real provider/model from the running config so we
+    # don't have to hard-code one in the smoke test.
+    $provs = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/providers" -UseBasicParsing -TimeoutSec 5 | ConvertFrom-Json
+    $prov = $provs.providers[0]
+    $model = $prov.models[0].name
+    $provName = $prov.name
+    Write-Host "  using provider=$provName model=$model" -ForegroundColor DarkGray
+
+    # Create session A with model X.
+    $bodyA = @{ provider = $provName; model = $model } | ConvertTo-Json
+    $sessA = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/sessions" -Method POST -ContentType "application/json" -Body $bodyA -UseBasicParsing -TimeoutSec 5 | ConvertFrom-Json
+    if ($sessA.provider -ne $provName -or $sessA.model -ne $model) {
+        throw "create: provider=$($sessA.provider) model=$($sessA.model), want $provName/$model"
+    }
+    Write-Host "OK: created session A id=$($sessA.id) meta=($($sessA.provider)/$($sessA.model))" -ForegroundColor Green
+
+    # PATCH the session to swap the model.
+    $patchBody = @{ model = $prov.models[-1].name } | ConvertTo-Json
+    $patched = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/sessions/$($sessA.id)" -Method PATCH -ContentType "application/json" -Body $patchBody -UseBasicParsing -TimeoutSec 5 | ConvertFrom-Json
+    if ($patched.model -ne $prov.models[-1].name) {
+        throw "patch: model=$($patched.model), want $($prov.models[-1].name)"
+    }
+    Write-Host "OK: PATCH updated session A model -> $($patched.model)" -ForegroundColor Green
+
+    # GET /sessions/:id round-trip to confirm the meta is
+    # actually persisted on the server.
+    $re = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/sessions/$($sessA.id)" -UseBasicParsing -TimeoutSec 5 | ConvertFrom-Json
+    if ($re.model -ne $prov.models[-1].name) {
+        throw "GET round-trip: model=$($re.model), want $($prov.models[-1].name)"
+    }
+    Write-Host "OK: GET /sessions/:id returns the updated model" -ForegroundColor Green
+
+    # /sessions list should include the same meta.
+    $list = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/sessions" -UseBasicParsing -TimeoutSec 5 | ConvertFrom-Json
+    $found = $list.sessions | Where-Object { $_.id -eq $sessA.id } | Select-Object -First 1
+    if (-not $found -or $found.model -ne $prov.models[-1].name) {
+        throw "list: meta for session A not present or wrong ($($found.model))"
+    }
+    Write-Host "OK: GET /sessions includes the per-session meta" -ForegroundColor Green
+
+    # Bad model → 400.
+    try {
+        $bad = @{ provider = $provName; model = "definitely-not-a-real-model" } | ConvertTo-Json
+        $null = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/sessions/$($sessA.id)" -Method PATCH -ContentType "application/json" -Body $bad -UseBasicParsing -TimeoutSec 5
+        throw "PATCH with bad model returned non-error"
+    } catch {
+        # 4xx is what we want. Accept any non-2xx response.
+        if ($_.Exception.Response.StatusCode.value__ -lt 400) { throw }
+    }
+    Write-Host "OK: PATCH with unknown model → 4xx" -ForegroundColor Green
+} catch {
+    Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
+    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+
 # 7. kill pchat-gui (which should kill the child pchat-server)
 Step 7 "stop pchat-gui (kills child pchat-server)"
 # Use taskkill /T /F so the whole process tree dies even if pchat-gui's

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/p-chat/pchat/internal/config"
@@ -64,7 +65,7 @@ func TestModelMaxTokensOutput_PerModelOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts := OptionsFromConfig(*cfg) // MaxTokens=4096 from global
-	stream := c.ChatStreamWithOptions(context.Background(), "test", []openai.ChatCompletionMessage{
+	stream := c.ChatStreamWithOptions(context.Background(), "test", "big", []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleUser, Content: "hi"},
 	}, nil, opts)
 	// Drain the stream.
@@ -141,7 +142,7 @@ func TestModelMaxTokensOutput_FallsBackToCallerWhenUnset(t *testing.T) {
 	}
 	c, _ := NewClient(cfg)
 	opts := ChatOptions{MaxTokens: 1234}
-	stream := c.ChatStreamWithOptions(context.Background(), "p", []openai.ChatCompletionMessage{
+	stream := c.ChatStreamWithOptions(context.Background(), "p", "m", []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleUser, Content: "hi"},
 	}, nil, opts)
 	for range stream {
@@ -153,5 +154,85 @@ func TestModelMaxTokensOutput_FallsBackToCallerWhenUnset(t *testing.T) {
 	// "max_tokens":1234 so we know it wasn't just dropped.
 	if !strings.Contains("", "") { // placeholder; the assertion above is enough
 		_ = capturedMax
+	}
+}
+
+// TestPerRequestModelDoesNotRace verifies that two concurrent
+// ChatStreamWithOptions calls on the same provider, with different
+// per-request model names, each send the right model on the wire
+// and don't trample each other through the shared
+// providerEntry.model field. This is the regression test for
+// "switching model in one session changes the model used by all
+// other sessions on the same provider".
+func TestPerRequestModelDoesNotRace(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		expected = map[string]int{
+			"big":   0,
+			"small": 0,
+		}
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(buf)
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(buf, &req)
+		mu.Lock()
+		expected[req.Model]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	cfg := &config.LLMConfig{
+		Default: "p",
+		Providers: []config.ProviderConfig{
+			{
+				Name:    "p",
+				Protocol: "openai",
+				BaseURL: srv.URL,
+				Model:   "small",
+				Models:  []config.ModelConfig{{Name: "small"}, {Name: "big"}},
+			},
+		},
+	}
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Launch N=20 concurrent calls, half on "big" and half on
+	// "small", on the same provider. None should see the wrong
+	// model on the wire.
+	const N = 20
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		model := "small"
+		if i%2 == 0 {
+			model = "big"
+		}
+		go func(model string) {
+			defer wg.Done()
+			stream := c.ChatStreamWithOptions(context.Background(), "p", model, []openai.ChatCompletionMessage{
+				{Role: openai.ChatMessageRoleUser, Content: "hi"},
+			}, nil, ChatOptions{})
+			for range stream {
+			}
+		}(model)
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if expected["big"] != N/2 {
+		t.Errorf("big model seen %d times, want %d (race on shared providerEntry.model?)", expected["big"], N/2)
+	}
+	if expected["small"] != N/2 {
+		t.Errorf("small model seen %d times, want %d (race on shared providerEntry.model?)", expected["small"], N/2)
 	}
 }

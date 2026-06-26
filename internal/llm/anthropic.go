@@ -91,7 +91,7 @@ type anthropicMessageDelta struct {
 	} `json:"usage"`
 }
 
-func (c *AnthropicClient) ChatStream(ctx context.Context, messages []Message) <-chan StreamChunk {
+func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, messages []Message) <-chan StreamChunk {
 	ch := make(chan StreamChunk, 64)
 
 	go func() {
@@ -117,8 +117,15 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, messages []Message) <-
 			}
 		}
 
+		// Per-request model takes priority; fall back to the
+		// default the client was constructed with.
+		model := modelName
+		if model == "" {
+			model = c.model
+		}
+
 		reqBody := anthropicRequest{
-			Model:     c.model,
+			Model:     model,
 			MaxTokens: 4096,
 			Messages:  anthropicMsgs,
 			Stream:    true,
@@ -210,7 +217,7 @@ func (c *AnthropicClient) handleStreamEvent(eventType, dataJSON string, ch chan<
 	}
 }
 
-func (c *AnthropicClient) Chat(ctx context.Context, messages []Message) (string, error) {
+func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages []Message) (string, error) {
 	var systemMsg string
 	var anthropicMsgs []anthropicMessage
 
@@ -230,8 +237,13 @@ func (c *AnthropicClient) Chat(ctx context.Context, messages []Message) (string,
 		}
 	}
 
+	model := modelName
+	if model == "" {
+		model = c.model
+	}
+
 	reqBody := anthropicRequest{
-		Model:     c.model,
+		Model:     model,
 		MaxTokens: 4096,
 		Messages:  anthropicMsgs,
 		Stream:    false,

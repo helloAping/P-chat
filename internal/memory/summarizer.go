@@ -116,7 +116,7 @@ func (sm *Summarizer) summarize(ctx context.Context, text string) (string, error
 		"请用简洁的要点形式总结以下对话片段，保留关键信息（用户需求、决策、工具调用结果等）。" +
 			"不要超过 200 字。\n\n---\n%s\n---", text,
 	)
-	resp, err := sm.llm.Chat(ctx, sm.provider, []llm.Message{
+	resp, err := sm.llm.Chat(ctx, sm.provider, "", []llm.Message{
 		{Role: "user", Content: prompt},
 	})
 	if err != nil {

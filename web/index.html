@@ -88,6 +88,21 @@ input, textarea { font-family: inherit; }
 .session-item .del { opacity: 0; color: var(--error); font-size: 11px; padding: 2px 6px; background: transparent; border: none; }
 .session-item:hover .del { opacity: 1; }
 .session-item .del:hover { color: #f55; }
+/* Pulsing dot next to sessions that are streaming in the background. */
+.session-item .streaming-dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--accent-2);
+    box-shadow: 0 0 6px var(--accent-2);
+    animation: streaming-pulse 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+    margin-left: 4px;
+}
+@keyframes streaming-pulse {
+    0%, 100% { opacity: 0.45; transform: scale(0.85); }
+    50%      { opacity: 1;    transform: scale(1.1); }
+}
 
 #sidebar-footer {
     border-top: 1px solid var(--border);
@@ -616,14 +631,93 @@ const $ = (id) => document.getElementById(id);
 const state = {
     sessions: [],
     currentID: null,
-    abort: null,
-    isStreaming: false,
     styles: [],
     providers: [],
-    currentProvider: null,
-    currentModel: null,
-    currentStyle: "tech",
+    // Global defaults used when creating a new conversation. These
+    // are derived from /api/v1/providers at boot (the provider
+    // marked `is_default: true` and its `default: true` model)
+    // and never change at runtime — they're the "what does a brand
+    // new chat use?" answer.
+    defaultProvider: null,
+    defaultModel: null,
+    defaultStyle: "tech",
+    // Per-session provider / model / style overrides. Keyed by
+    // session id; populated from /api/v1/sessions and /api/v1/
+    // sessions/:id responses, and updated on every picker change.
+    // Pure runtime cache; NOT persisted to localStorage — the
+    // server (conversations.metadata column) is the single source
+    // of truth. A page refresh re-hydrates from the next /sessions
+    // call.
+    sessionMeta: {},
+    // Background streams. A stream lives here from "user pressed
+    // Enter" to "SSE done or aborted". When the user switches to
+    // another session, the stream continues to run in the
+    // background and the entry stays in this map until completion.
+    // The webview does NOT cancel streams on switch — the server
+    // keeps streaming and the assistant message gets persisted to
+    // the store; a silent refetch picks it up later.
+    streaming: {},
+    // Cache of /api/v1/sessions/:id/messages responses keyed by
+    // session id. Used to avoid re-fetching when switching back
+    // to a session that hasn't changed. Invalidated whenever a
+    // background stream finishes for a session the user isn't
+    // currently viewing.
+    sessionMessages: {},
 };
+
+// currentMeta returns the per-session meta for state.currentID,
+// filling in the global defaults for any field the server didn't
+// record. The result is always a complete {provider, model, style}
+// tuple so the picker always has a coherent value to show.
+function currentMeta() {
+    if (!state.currentID) {
+        return { provider: state.defaultProvider, model: state.defaultModel, style: state.defaultStyle };
+    }
+    const m = state.sessionMeta[state.currentID] || {};
+    return {
+        provider: m.provider || state.defaultProvider,
+        model:    m.model    || state.defaultModel,
+        style:    m.style    || state.defaultStyle,
+    };
+}
+
+// setSessionMeta updates both the in-memory cache and the
+// server (fire-and-forget PATCH). Errors are surfaced as a toast
+// but never block the picker UI.
+function setSessionMeta(id, patch) {
+    if (!id) return;
+    const cur = state.sessionMeta[id] || {};
+    const next = { ...cur, ...patch };
+    state.sessionMeta[id] = next;
+    // Sync to server. Use raw fetch (not api()) so the streaming
+    // SSE connection we hold for this session isn't blocked by
+    // the response.
+    fetch(`${API}/api/v1/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+    }).then(async (res) => {
+        if (!res.ok) {
+            const t = await res.text();
+            throw new Error(`HTTP ${res.status}: ${t}`);
+        }
+        // Server may have rewritten the meta (e.g. provider change
+        // resets model to provider default). Re-read to stay in sync.
+        const updated = await res.json();
+        state.sessionMeta[id] = {
+            provider: updated.provider,
+            model:    updated.model,
+            style:    updated.style,
+        };
+        if (id === state.currentID) {
+            renderProviderPicker();
+            renderModelPicker();
+            renderStylePicker();
+        }
+    }).catch((e) => {
+        toast("同步失败: " + e.message, "error");
+    });
+}
 
 // ---------- API ----------
 async function api(path, opts = {}) {
@@ -667,9 +761,10 @@ async function loadProviders() {
 function renderStylePicker() {
     const wrap = $("style-picker");
     wrap.innerHTML = "";
+    const cur = currentMeta().style;
     for (const s of state.styles) {
         const btn = document.createElement("button");
-        btn.className = "style-btn" + (s.id === state.currentStyle ? " active" : "");
+        btn.className = "style-btn" + (s.id === cur ? " active" : "");
         btn.textContent = s.id;
         btn.title = s.label + " — " + s.desc;
         btn.onclick = () => selectStyle(s.id);
@@ -678,7 +773,9 @@ function renderStylePicker() {
 }
 
 // renderProviderPicker populates the top-level "Provider"
-// dropdown in the sidebar.
+// dropdown in the sidebar. Reflects the per-session override for
+// the current session (or the global default when no session is
+// selected).
 function renderProviderPicker() {
     const sel = $("provider-picker");
     sel.innerHTML = "";
@@ -690,22 +787,25 @@ function renderProviderPicker() {
         return;
     }
     sel.disabled = false;
+    const cur = currentMeta().provider;
     for (const p of state.providers) {
         const o = document.createElement("option");
         o.value = p.name;
         o.textContent = p.name + (p.is_default ? "  (默认)" : "");
-        if (p.name === state.currentProvider) o.selected = true;
+        if (p.name === cur) o.selected = true;
         sel.appendChild(o);
     }
     sel.onchange = () => onProviderChanged(sel.value);
 }
 
 // renderModelPicker populates the second-level "Model" dropdown
-// with every model under the currently-selected provider.
+// with every model under the currently-selected provider. Selection
+// is driven by the per-session meta.
 function renderModelPicker() {
     const sel = $("model-picker");
     sel.innerHTML = "";
-    const prov = state.providers.find(p => p.name === state.currentProvider);
+    const meta = currentMeta();
+    const prov = state.providers.find(p => p.name === meta.provider);
     if (!prov) {
         const o = document.createElement("option");
         o.textContent = "(请先选 provider)";
@@ -719,7 +819,7 @@ function renderModelPicker() {
         const o = document.createElement("option");
         o.value = m.name;
         o.textContent = (m.display_name || m.name) + (m.default ? "  (默认)" : "");
-        if (m.name === state.currentModel) o.selected = true;
+        if (m.name === meta.model) o.selected = true;
         sel.appendChild(o);
     }
     sel.onchange = () => selectModel(sel.value);
@@ -729,42 +829,54 @@ function renderModelPicker() {
 // provider. The model select is rebuilt to show that provider's
 // models; if the previous model still exists under the new
 // provider, keep it selected, otherwise fall back to the
-// provider's default model.
+// provider's default model. The change is also written back to
+// the per-session meta on the server (so the picker state is
+// preserved across reloads and other tabs).
 function onProviderChanged(providerName) {
     const prov = state.providers.find(p => p.name === providerName);
     if (!prov) return;
-    state.currentProvider = providerName;
+    const id = state.currentID;
+    const cur = id ? (state.sessionMeta[id] || {}) : {};
     const models = (prov.models && prov.models.length > 0) ? prov.models : [{ name: prov.model }];
-    // If the previously-selected model still exists under the new
-    // provider, keep it; otherwise fall back to the default model.
-    const stillExists = models.find(m => m.name === state.currentModel);
+    const stillExists = models.find(m => m.name === cur.model);
+    let newModel = cur.model;
     if (!stillExists) {
         const def = models.find(m => m.default) || models[0];
-        state.currentModel = def ? def.name : prov.model;
+        newModel = def ? def.name : prov.model;
     }
     renderModelPicker();
-    toast(`提供商: ${providerName}` + (stillExists ? "" : ` → ${state.currentModel}`));
+    if (id) {
+        setSessionMeta(id, { provider: providerName, model: newModel });
+    } else {
+        // No session yet — bump the global default so the next
+        // createSession() picks it up.
+        state.defaultProvider = providerName;
+        state.defaultModel = newModel;
+    }
+    toast(`提供商: ${providerName}` + (stillExists ? "" : ` → ${newModel}`));
 }
 
 async function selectStyle(id) {
-    if (id === state.currentStyle) return;
-    state.currentStyle = id;
-    renderStylePicker();
+    const cur = currentMeta().style;
+    if (id === cur) return;
     if (state.currentID) {
-        try {
-            // Style is per-session. We don't have a PATCH endpoint for
-            // style, so we just remember it client-side and send it
-            // with each SendMessage (server falls back to default if
-            // empty).
-            // Re-render header if needed.
-        } catch (e) { toast("风格切换失败: " + e.message, "error"); }
+        setSessionMeta(state.currentID, { style: id });
+    } else {
+        state.defaultStyle = id;
     }
+    renderStylePicker();
     toast("风格: " + id);
 }
 
 async function selectModel(value) {
-    state.currentModel = value;
-    toast(`模型: ${state.currentProvider} / ${value}`);
+    const id = state.currentID;
+    const meta = currentMeta();
+    if (id) {
+        setSessionMeta(id, { model: value });
+    } else {
+        state.defaultModel = value;
+    }
+    toast(`模型: ${meta.provider} / ${value}`);
 }
 
 // ---------- Settings modal ----------
@@ -797,7 +909,7 @@ function openSettings() {
         toast("尚未配置任何 provider", "error");
         return;
     }
-    settingsState.activeProvider = state.currentProvider || state.providers[0].name;
+    settingsState.activeProvider = currentMeta().provider || state.providers[0].name;
     settingsState.tab = "models";
     settingsState.editingModel = null;
     $("settings-modal").classList.add("show");
@@ -1005,12 +1117,24 @@ function renderSettingsProviderTable() {
                     // so if the user deleted the *active* one
                     // they'd hit an error, but we already
                     // disabled the button for the default).
-                    if (state.currentProvider === p.name) {
+                    if (currentMeta().provider === p.name) {
+                        // The current session is using the deleted
+                        // provider. If a session is selected, push
+                        // the fallback onto that session so the
+                        // picker stays consistent. If no session
+                        // is selected, just update the global
+                        // default used by the next createSession().
                         const fallback = state.providers.find(x => x.name !== p.name && x.is_default)
                             || state.providers.find(x => x.name !== p.name);
                         if (fallback) {
-                            state.currentProvider = fallback.name;
-                            state.currentModel = fallback.model;
+                            const models = (fallback.models && fallback.models.length > 0) ? fallback.models : [{ name: fallback.model }];
+                            const m = models.find(x => x.default) || models[0];
+                            if (state.currentID) {
+                                setSessionMeta(state.currentID, { provider: fallback.name, model: m ? m.name : fallback.model });
+                            } else {
+                                state.defaultProvider = fallback.name;
+                                state.defaultModel = m ? m.name : fallback.model;
+                            }
                         }
                     }
                     await loadProviders();
@@ -1130,6 +1254,19 @@ function escapeAttr(s) {
 async function loadSessions() {
     const r = await api("/api/v1/sessions");
     state.sessions = r.sessions || [];
+    // Pull per-session provider/model/style off the response so
+    // the picker state is right the moment the sidebar renders.
+    // Old sessions (pre-meta) get empty objects; the per-session
+    // resolver falls back to the configured default.
+    for (const sess of state.sessions) {
+        if (sess.provider || sess.model || sess.style) {
+            state.sessionMeta[sess.id] = {
+                provider: sess.provider,
+                model:    sess.model,
+                style:    sess.style,
+            };
+        }
+    }
     renderSessionList();
     if (!state.currentID && state.sessions.length > 0) {
         await switchSession(state.sessions[0].id);
@@ -1139,16 +1276,19 @@ async function loadSessions() {
 }
 
 async function createSession() {
+    // New conversations use the global default provider/model/style.
+    // The server resolves empty values to the configured default +
+    // that provider's EffectiveModel; we then mirror the response
+    // into our local cache.
     const s = await api("/api/v1/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ style: state.currentStyle, provider: state.currentProvider }),
+        body: JSON.stringify({
+            style:    state.defaultStyle,
+            provider: state.defaultProvider,
+            model:    state.defaultModel,
+        }),
     });
-    // Push the new session into the local list so the sidebar
-    // updates immediately, then switch the chat view to it. We
-    // don't call loadSessions() first because that resets the
-    // active highlight based on the OLD currentID; we want the
-    // new one highlighted.
     const newSession = {
         id: s.id,
         title: s.title || "",
@@ -1156,6 +1296,12 @@ async function createSession() {
         updated_at: s.updated_at || Math.floor(Date.now() / 1000),
     };
     state.sessions.unshift(newSession);
+    // Mirror the server-resolved meta into the local cache.
+    state.sessionMeta[s.id] = {
+        provider: s.provider,
+        model:    s.model,
+        style:    s.style,
+    };
     state.currentID = s.id;
     renderSessionList();
     await switchSession(s.id);
@@ -1237,10 +1383,41 @@ async function loadMessages(id) {
     return api(`/api/v1/sessions/${id}/messages`);
 }
 
+// attachStreamingUI is called by switchSession when the user
+// navigates to a session whose stream is still running in the
+// background. The existing partialDiv is mounted into the
+// messages pane, and the stream continues to feed it as new
+// tokens arrive.
+function attachStreamingUI(id) {
+    const s = state.streaming[id];
+    if (!s) return;
+    const msgs = $("messages");
+    msgs.innerHTML = "";
+    // Rebuild from the existing history cache (if any) plus the
+    // in-flight partial div so the user sees everything up to the
+    // current point in the right order.
+    const cached = state.sessionMessages[id] || [];
+    for (const m of cached) appendHistoryMessage(m);
+    // Re-attach the streaming partial at the end.
+    if (s.partialDiv) msgs.appendChild(s.partialDiv);
+    // If the user message is still in flight (rare — usually it's
+    // already in the cache), make sure it's at the top.
+    if (s.userDiv) msgs.insertBefore(s.userDiv, msgs.firstChild);
+    scrollToBottom(true);
+    showHeaderMeta();
+}
+
 async function switchSession(id) {
-    if (state.isStreaming) stopGeneration();
+    // Do NOT abort streams here. Background streams keep
+    // running so they auto-complete; the user can come back to
+    // a fully-formed message. The streaming[id] entry stays
+    // until the server closes the SSE.
     state.currentID = id;
     renderSessionList();
+    // Picker state must reflect the per-session meta.
+    renderProviderPicker();
+    renderModelPicker();
+    renderStylePicker();
 
     const s = state.sessions.find((x) => x.id === id);
     $("session-title").textContent = s ? (s.title || "(无标题)") : "未选择会话";
@@ -1249,20 +1426,39 @@ async function switchSession(id) {
     hideHeaderMeta();
     if (!s) { showEmptyState(); return; }
 
-    try {
-        const r = await loadMessages(id);
-        const msgs = r.messages || [];
+    // Three rendering cases:
+    //   (A) this session is currently streaming → attach live UI
+    //   (B) we have a cached message list → render it
+    //   (C) fresh load from the server
+    if (state.streaming[id]) {
+        attachStreamingUI(id);
+    } else if (state.sessionMessages[id]) {
+        const msgs = state.sessionMessages[id];
         if (msgs.length === 0) {
             showEmptyState();
         } else {
-            for (const m of msgs) {
-                appendHistoryMessage(m);
-            }
+            for (const m of msgs) appendHistoryMessage(m);
         }
-    } catch (e) {
-        appendError(e.message);
+        scrollToBottom(false);
+    } else {
+        try {
+            const r = await loadMessages(id);
+            const msgs = r.messages || [];
+            state.sessionMessages[id] = msgs;
+            if (msgs.length === 0) {
+                showEmptyState();
+            } else {
+                for (const m of msgs) appendHistoryMessage(m);
+            }
+        } catch (e) {
+            appendError(e.message);
+        }
+        scrollToBottom(false);
     }
-    scrollToBottom(false);
+    // The send/stop button reflects whether THIS session is
+    // streaming — a different session may be streaming in the
+    // background and we don't want to mis-attribute its state.
+    refreshSendStopButton();
 }
 
 // ---------- Render ----------
@@ -1271,11 +1467,14 @@ function renderSessionList() {
     list.innerHTML = "";
     for (const s of state.sessions) {
         const item = document.createElement("div");
-        item.className = "session-item" + (s.id === state.currentID ? " active" : "");
+        const isActive = s.id === state.currentID;
+        item.className = "session-item" + (isActive ? " active" : "");
         item.dataset.id = s.id;
+        const dot = state.streaming[s.id] ? `<span class="streaming-dot" title="正在生成"></span>` : "";
         item.innerHTML = `
             <div class="title">${escapeHTML(s.title || "(无标题)")}</div>
             <div class="time">${formatTime(s.updated_at)}</div>
+            ${dot}
             <button class="del" title="删除">✕</button>
         `;
         item.addEventListener("click", (e) => {
@@ -1367,30 +1566,43 @@ async function sendMessage(text) {
     const id = state.currentID;
     removeEmptyState();
 
-    appendMsg("user", text, false);
+    const meta = currentMeta();
+    // Append user + assistant divs to the messages pane (we may
+    // be the active session OR we may be running in the
+    // background — the latter means these divs live in the
+    // current view briefly, then we drop them and operate on
+    // detached nodes that we re-attach when the user comes back).
+    const userDiv = appendMsg("user", text, false);
+    const asstDiv = appendMsg("assistant", "", true);
     // Auto-generate the title from the first user message in a
     // fresh session. Fire-and-forget; the sidebar + header
     // update as soon as the PATCH returns, without blocking
     // the chat.
     autoTitleIfBlank(id, text);
-    const asstDiv = appendMsg("assistant", "", true);
     let contentBuf = "";
     let pending = "";  // pending markdown to render
 
     const ctrl = new AbortController();
-    state.abort = ctrl;
-    state.isStreaming = true;
-    showStopButton();
-    showHeaderMeta();
+    // Record this stream in state.streaming[id] so:
+    //   - switchSession can re-attach the live UI to the view
+    //   - renderSessionList can show the pulsing "●" indicator
+    //   - refreshSendStopButton knows to show "stop" not "send"
+    state.streaming[id] = { ctrl, userDiv, asstDiv, contentBuf: "" };
+    if (id === state.currentID) {
+        showStopButton();
+        showHeaderMeta();
+    }
+    renderSessionList(); // pick up the streaming dot
 
     let lastRender = 0;
     function flushRender() {
         if (pending) {
             contentBuf += pending;
             pending = "";
+            state.streaming[id].contentBuf = contentBuf;
             asstDiv.innerHTML = renderMarkdown(contentBuf);
         }
-        scrollToBottom(true);
+        if (id === state.currentID) scrollToBottom(true);
     }
     function scheduleRender() {
         const now = performance.now();
@@ -1406,11 +1618,12 @@ async function sendMessage(text) {
         }
     }
 
+    let provider = meta.provider, model = meta.model;
     try {
         const res = await fetch(`${API}/api/v1/sessions/${id}/messages`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: text, style: state.currentStyle }),
+            body: JSON.stringify({ message: text, style: meta.style, provider, model }),
             signal: ctrl.signal,
         });
         if (!res.ok) {
@@ -1447,6 +1660,8 @@ async function sendMessage(text) {
                     errDiv.textContent = ev.error || "unknown error";
                     asstDiv.appendChild(errDiv);
                 } else if (ev.type === "done") {
+                    if (ev.provider) provider = ev.provider;
+                    if (ev.model) model = ev.model;
                     updateHeaderMeta(ev.tokens_in, ev.tokens_out, ev.elapsed);
                 }
             }
@@ -1466,15 +1681,75 @@ async function sendMessage(text) {
             asstDiv.innerHTML = `<div class="error">${escapeHTML(e.message)}</div>`;
         }
     } finally {
-        state.abort = null;
-        state.isStreaming = false;
-        showSendButton();
-        asstDiv.classList.remove("streaming");
+        // Stream is done for this session — drop the streaming
+        // entry and refresh the sidebar (so the pulsing dot
+        // disappears). If the user is still on this session,
+        // also flip the button back to "send".
+        delete state.streaming[id];
+        renderSessionList();
+        if (id === state.currentID) {
+            refreshSendStopButton();
+            asstDiv.classList.remove("streaming");
+        }
+        // Server has the canonical state now (the assistant
+        // message was persisted during the ReAct loop, plus the
+        // user message). Refresh the in-memory cache so a
+        // switch-back shows the latest content without a network
+        // round-trip. Skip the network request when we ARE the
+        // active session — our DOM already shows everything
+        // correctly, and a refetch would only add latency.
+        if (id !== state.currentID) {
+            refreshSessionCache(id);
+        } else {
+            // Re-snapshot our current pane into the cache so a
+            // later switch-back is fast.
+            snapshotCurrentMessages(id);
+        }
     }
 }
 
+// refreshSessionCache is the "background stream finished while
+// the user was elsewhere" path. We pull a fresh message list
+// from the server and replace the in-memory cache, so the next
+// time the user switches to this session, the messages are
+// already there. Errors are silent (toast) — the cache is
+// best-effort.
+async function refreshSessionCache(id) {
+    try {
+        const r = await loadMessages(id);
+        state.sessionMessages[id] = r.messages || [];
+    } catch (e) {
+        // best-effort
+    }
+}
+
+// snapshotCurrentMessages re-reads the DOM into the cache.
+// Cheaper than a refetch and works for the active-session case
+// where we just rendered everything live.
+function snapshotCurrentMessages(id) {
+    const msgs = $("messages").querySelectorAll(".msg");
+    const out = [];
+    for (const div of msgs) {
+        const role = div.classList.contains("user") ? "user"
+                   : div.classList.contains("assistant") ? "assistant"
+                   : div.classList.contains("tool") ? "tool"
+                   : null;
+        if (!role) continue;
+        out.push({
+            role,
+            content: div.dataset.rawContent || div.textContent || "",
+            name: div.dataset.toolName || undefined,
+        });
+    }
+    if (out.length > 0) state.sessionMessages[id] = out;
+}
+
 function stopGeneration() {
-    if (state.abort) state.abort.abort();
+    // Abort only the current session's stream — any other
+    // session streaming in the background is left alone.
+    if (state.currentID && state.streaming[state.currentID]) {
+        state.streaming[state.currentID].ctrl.abort();
+    }
 }
 
 function showStopButton() {
@@ -1484,6 +1759,17 @@ function showStopButton() {
 function showSendButton() {
     $("send").classList.remove("hide");
     $("stop").classList.remove("show");
+}
+
+// refreshSendStopButton picks "stop" vs "send" based on whether
+// the CURRENT session is streaming. A different session running
+// in the background does NOT affect this.
+function refreshSendStopButton() {
+    if (state.currentID && state.streaming[state.currentID]) {
+        showStopButton();
+    } else {
+        showSendButton();
+    }
 }
 
 function showHeaderMeta() {
@@ -1600,7 +1886,10 @@ function formatTime(unixSec) {
 $("send").addEventListener("click", () => {
     const input = $("input");
     const text = input.value.trim();
-    if (!text || state.isStreaming) return;
+    // Block sending if the CURRENT session is already streaming.
+    // (A different session streaming in the background is fine.)
+    const currentStreaming = state.currentID && state.streaming[state.currentID];
+    if (!text || currentStreaming) return;
     input.value = "";
     input.style.height = "auto";
     $("send").disabled = true;
@@ -1610,7 +1899,9 @@ $("send").addEventListener("click", () => {
 $("stop").addEventListener("click", stopGeneration);
 
 $("new-session").addEventListener("click", async () => {
-    if (state.isStreaming) stopGeneration();
+    // Don't abort the current session's stream — let it keep
+    // running in the background. The user just navigates to a
+    // fresh session; the old one completes automatically.
     await createSession();
 });
 
@@ -1657,7 +1948,7 @@ input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         $("send").click();
-    } else if (e.key === "Escape" && state.isStreaming) {
+    } else if (e.key === "Escape" && state.currentID && state.streaming[state.currentID]) {
         e.preventDefault();
         stopGeneration();
     }
@@ -1707,24 +1998,25 @@ $("session-title").addEventListener("keydown", (e) => {
 (async function init() {
     try {
         await Promise.all([loadStyles(), loadProviders()]);
-        // pick a sensible default style/provider
-        if (state.styles.find(s => s.id === "tech")) state.currentStyle = "tech";
+        // Default style for fresh sessions.
+        if (state.styles.find(s => s.id === "tech")) state.defaultStyle = "tech";
+        // Default provider + model for fresh sessions. These get
+        // used by createSession() when no session is selected.
         if (state.providers.length > 0) {
             // Prefer the server-marked default; fall back to the
             // first provider.
             const def = state.providers.find(p => p.is_default) || state.providers[0];
-            state.currentProvider = def.name;
-            // Pick the provider's default model (marked
-            // `default: true`) when there is one, otherwise the
-            // first entry of models, otherwise the legacy
-            // single-model field.
+            state.defaultProvider = def.name;
             const models = (def.models && def.models.length > 0) ? def.models : [{ name: def.model }];
             const m = models.find(x => x.default) || models[0];
-            state.currentModel = m ? m.name : def.model;
+            state.defaultModel = m ? m.name : def.model;
         }
         renderStylePicker();
         renderProviderPicker();
         renderModelPicker();
+        // loadSessions re-hydrates state.sessionMeta from the
+        // server response, then switchSession (called inside) sets
+        // the picker to match the per-session meta.
         await loadSessions();
     } catch (e) {
         appendError("初始化失败: " + e.message);

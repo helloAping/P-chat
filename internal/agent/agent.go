@@ -95,6 +95,12 @@ type ChatRequest struct {
 	Style    style.Style   `json:"style"`
 	Messages []llm.Message `json:"messages"`
 	Provider string        `json:"provider,omitempty"`
+	// Model is the per-request model name. When non-empty, the LLM
+	// client uses it for this call (overriding the shared
+	// providerEntry.model). When empty, the provider's default
+	// applies. This is what lets multiple sessions on the same
+	// provider use different models concurrently without racing.
+	Model    string        `json:"model,omitempty"`
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools. The agent will
 	// inject a system hint and skip the tool loop.
@@ -386,7 +392,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				argsAccum   = make(map[int]*nativeToolCall)
 			)
 
-			stream := a.llm.ChatStreamWithOptions(ctx, req.Provider, msgs, openAITools, a.options)
+			stream := a.llm.ChatStreamWithOptions(ctx, req.Provider, req.Model, msgs, openAITools, a.options)
 			for chunk := range stream {
 				if chunk.Err != nil {
 					ch <- ChatStreamChunk{Phase: "llm", Error: chunk.Err.Error(), Done: true}

@@ -130,15 +130,15 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 	return nil
 }
 
-func (c *Client) ChatStream(ctx context.Context, providerName string, messages []Message) <-chan StreamChunk {
-	return c.ChatStreamWithOptions(ctx, providerName, messages, nil, ChatOptions{})
+func (c *Client) ChatStream(ctx context.Context, providerName, modelName string, messages []Message) <-chan StreamChunk {
+	return c.ChatStreamWithOptions(ctx, providerName, modelName, messages, nil, ChatOptions{})
 }
 
 // ChatStreamWithTools streams a chat completion with optional tool definitions.
 // When tools is non-empty, the LLM may emit native tool calls (OpenAI's
 // `tool_calls` field) which are surfaced as `StreamChunk.ToolCallDelta` chunks.
-func (c *Client) ChatStreamWithTools(ctx context.Context, providerName string, messages []Message, tools []openai.Tool) <-chan StreamChunk {
-	return c.ChatStreamWithOptions(ctx, providerName, messages, tools, ChatOptions{})
+func (c *Client) ChatStreamWithTools(ctx context.Context, providerName, modelName string, messages []Message, tools []openai.Tool) <-chan StreamChunk {
+	return c.ChatStreamWithOptions(ctx, providerName, modelName, messages, tools, ChatOptions{})
 }
 
 // SetModel switches the active model for a provider. Pass an empty
@@ -176,24 +176,33 @@ func (c *Client) providerDefaultModel(providerName string) string {
 	return ""
 }
 // disable tool calling.
-func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName string, messages []Message, tools []openai.Tool, opts ChatOptions) <-chan StreamChunk {
+func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelName string, messages []Message, tools []openai.Tool, opts ChatOptions) <-chan StreamChunk {
 	p, ok := c.providers[providerName]
 	if !ok {
 		p = c.providers[c.default_]
+	}
+
+	// Per-request model takes priority; fall back to the provider's
+	// configured default. This lets multiple sessions on the same
+	// provider use different models concurrently without racing on
+	// the shared providerEntry.model field.
+	model := modelName
+	if model == "" {
+		model = p.model
 	}
 
 	if p.protocol == "anthropic" {
 		// Anthropic support for tools is not implemented in this branch.
 		// Fall back to plain streaming (the anthropic client ignores
 		// opts for now).
-		return p.anthropic.ChatStream(ctx, messages)
+		return p.anthropic.ChatStream(ctx, model, messages)
 	}
 
 	// OpenAI protocol
-	return c.openaiStream(ctx, p, messages, tools, opts)
+	return c.openaiStream(ctx, p, model, messages, tools, opts)
 }
 
-func (c *Client) openaiStream(ctx context.Context, p *providerEntry, messages []Message, tools []openai.Tool, opts ChatOptions) <-chan StreamChunk {
+func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model string, messages []Message, tools []openai.Tool, opts ChatOptions) <-chan StreamChunk {
 	ch := make(chan StreamChunk, 64)
 
 	go func() {
@@ -203,12 +212,12 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, messages []
 		// (Per-model MaxTokensOutput is non-zero → use it; otherwise
 		// keep whatever the caller passed, including the global
 		// LLMConfig.MaxTokens baked in by the agent.)
-		if mt := c.ModelMaxTokensOutput(p.name, p.model); mt > 0 {
+		if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
 			opts.MaxTokens = mt
 		}
 
 		req := openai.ChatCompletionRequest{
-			Model:    p.model,
+			Model:    model,
 			Messages: messages,
 			Stream:   true,
 			StreamOptions: &openai.StreamOptions{
@@ -275,25 +284,30 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, messages []
 	return ch
 }
 
-func (c *Client) Chat(ctx context.Context, providerName string, messages []Message) (string, error) {
+func (c *Client) Chat(ctx context.Context, providerName, modelName string, messages []Message) (string, error) {
 	p, ok := c.providers[providerName]
 	if !ok {
 		p = c.providers[c.default_]
 	}
 
+	model := modelName
+	if model == "" {
+		model = p.model
+	}
+
 	if p.protocol == "anthropic" {
-		return p.anthropic.Chat(ctx, messages)
+		return p.anthropic.Chat(ctx, model, messages)
 	}
 
 	// OpenAI protocol
 	req := openai.ChatCompletionRequest{
-		Model:    p.model,
+		Model:    model,
 		Messages: messages,
 	}
 
 	// Per-model MaxTokensOutput overrides the caller's opts (and
 	// therefore the global LLMConfig.MaxTokens).
-	if mt := c.ModelMaxTokensOutput(p.name, p.model); mt > 0 {
+	if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
 		req.MaxTokens = mt
 	}
 

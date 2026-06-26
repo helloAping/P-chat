@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,11 +28,12 @@ type Handler struct {
 	cfg   *config.Config
 	store *memory.Store
 
-	// sessionMeta remembers the per-session style + provider
-	// overrides. The Conversation table doesn't store these (yet),
-	// so we use an in-memory map keyed by session id. This is good
-	// enough for the GUI/CLI use case; for true multi-process
-	// support this would need to move to SQLite.
+	// sessionMeta remembers the per-session style + provider +
+	// model overrides. The in-memory map is the hot path for
+	// reads; every write is also persisted to conversations.metadata
+	// (a JSON blob on the Conversation row) so the override
+	// survives a pchat-server restart. On startup we lazily
+	// re-hydrate the map from the store on first access.
 	metaMu sync.Mutex
 	meta   map[string]sessionMeta
 }
@@ -39,6 +41,16 @@ type Handler struct {
 type sessionMeta struct {
 	Style    string
 	Provider string
+	Model    string
+}
+
+// sessionMetaBlob is the on-disk shape written to
+// conversations.metadata. The field names are JSON lower-case so
+// the web side can pass them straight back to the PATCH endpoint.
+type sessionMetaBlob struct {
+	Style    string `json:"style,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store) *Handler {
@@ -50,33 +62,126 @@ func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store) *Handle
 	}
 }
 
-func (h *Handler) setSessionMeta(id, style, provider string) {
+// setSessionMeta updates the in-memory cache and, when any field
+// actually changes, writes the new meta blob through to the
+// conversations.metadata column. Empty arguments are ignored (so
+// "leave provider alone, just change model" is expressible).
+func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	h.metaMu.Lock()
 	defer h.metaMu.Unlock()
 	m := h.meta[id]
-	if style != "" {
+	changed := false
+	if style != "" && style != m.Style {
 		m.Style = style
+		changed = true
 	}
-	if provider != "" {
+	if provider != "" && provider != m.Provider {
 		m.Provider = provider
+		changed = true
+	}
+	if model != "" && model != m.Model {
+		m.Model = model
+		changed = true
+	}
+	if !changed {
+		return
 	}
 	h.meta[id] = m
+	if h.store == nil {
+		return
+	}
+	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model})
+	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
+		// Non-fatal: in-memory map already updated, request still
+		// works for this session. The next setSessionMeta call
+		// will retry the write.
+		return
+	}
+}
+
+// ensureMetaLoaded re-hydrates the in-memory meta map for `id`
+// from conversations.metadata, on first read. After the first
+// hit the map stays warm for the rest of the process lifetime.
+func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
+	h.metaMu.Lock()
+	defer h.metaMu.Unlock()
+	if m, ok := h.meta[id]; ok {
+		return m
+	}
+	m := sessionMeta{}
+	if h.store != nil {
+		if cv, err := h.store.GetConversation(id); err == nil && cv.Metadata != "" {
+			var blob sessionMetaBlob
+			if json.Unmarshal([]byte(cv.Metadata), &blob) == nil {
+				m.Style = blob.Style
+				m.Provider = blob.Provider
+				m.Model = blob.Model
+			}
+		}
+	}
+	h.meta[id] = m
+	return m
 }
 
 func (h *Handler) sessionStyle(id string) string {
-	h.metaMu.Lock()
-	defer h.metaMu.Unlock()
-	return h.meta[id].Style
+	m := h.ensureMetaLoaded(id)
+	return m.Style
 }
 
 func (h *Handler) sessionProvider(id string) string {
-	h.metaMu.Lock()
-	defer h.metaMu.Unlock()
-	if p := h.meta[id].Provider; p != "" {
+	m := h.ensureMetaLoaded(id)
+	if p := m.Provider; p != "" {
 		return p
 	}
 	// Fall back to the configured default
 	return h.cfg.LLM.Default
+}
+
+// sessionModel returns the per-session model name, falling back to
+// the provider's default model (EffectiveModel) when no override is
+// set. Returns "" if the provider itself is unknown.
+func (h *Handler) sessionModel(id, provider string) string {
+	m := h.ensureMetaLoaded(id)
+	if m.Model != "" {
+		return m.Model
+	}
+	for _, p := range h.cfg.LLM.Providers {
+		if p.Name == provider {
+			return p.EffectiveModel()
+		}
+	}
+	return ""
+}
+
+// validProvider returns true if name is a configured provider.
+func (h *Handler) validProvider(name string) bool {
+	for _, p := range h.cfg.LLM.Providers {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// validModel returns true if name exists under provider
+// (configured models list) OR is the provider's single-model
+// legacy form (ProviderConfig.Model).
+func (h *Handler) validModel(provider, name string) bool {
+	for _, p := range h.cfg.LLM.Providers {
+		if p.Name != provider {
+			continue
+		}
+		if p.Model == name {
+			return true
+		}
+		for _, m := range p.Models {
+			if m.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // --- Request/Response types ---
@@ -85,26 +190,51 @@ func (h *Handler) sessionProvider(id string) string {
 type SendMessageRequest struct {
 	Message string `json:"message" binding:"required"`
 	Style   string `json:"style,omitempty"`
+	// Provider / Model, when set, override the per-session defaults
+	// for this turn. They are also written back to the per-session
+	// meta so subsequent turns keep using the new model. Empty
+	// values mean "no change".
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
 // CreateSessionRequest is the body of POST /sessions.
 type CreateSessionRequest struct {
 	Style    string `json:"style,omitempty"`
 	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 	Title    string `json:"title,omitempty"`
 }
 
-// RenameSessionRequest is the body of PATCH /sessions/:id.
+// RenameSessionRequest is the body of PATCH /sessions/:id when the
+// caller only wants to change the title.
 type RenameSessionRequest struct {
 	Title string `json:"title" binding:"required"`
 }
 
+// UpdateSessionMetaRequest is the body of PATCH /sessions/:id when
+// the caller wants to change provider / model / style. All fields
+// are pointers so the client can send partial updates — a missing
+// field means "leave that field alone", a non-nil field means
+// "set this to the new value (possibly empty)".
+type UpdateSessionMetaRequest struct {
+	Provider *string `json:"provider,omitempty"`
+	Model    *string `json:"model,omitempty"`
+	Style    *string `json:"style,omitempty"`
+}
+
 // SessionResponse is the JSON form of a memory.Conversation.
+// Provider / Model / Style reflect the per-session overrides
+// (resolved from the in-memory + on-disk meta blob, with the
+// process default for unset fields).
 type SessionResponse struct {
 	ID        string `json:"id"`
 	Title     string `json:"title"`
-	CreatedAt int64 `json:"created_at"`
-	UpdatedAt int64 `json:"updated_at"`
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Style     string `json:"style,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
 }
 
 // MessageResponse is the JSON form of a single message in a
@@ -116,6 +246,11 @@ type MessageResponse struct {
 	CreatedAt  int64  `json:"created_at"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
 	Name       string `json:"name,omitempty"`
+	// Provider / Model that produced the assistant's reply, when
+	// known. Populated only for messages tagged at request time;
+	// the legacy single-conversation flow leaves them empty.
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
 // StreamEvent is one chunk of a Server-Sent Events stream from
@@ -136,9 +271,11 @@ type StreamEvent struct {
 	ToolElapsed string `json:"tool_elapsed,omitempty"`
 
 	// Done fields
-	TokensIn  int `json:"tokens_in,omitempty"`
-	TokensOut int `json:"tokens_out,omitempty"`
+	TokensIn  int    `json:"tokens_in,omitempty"`
+	TokensOut int    `json:"tokens_out,omitempty"`
 	Elapsed   string `json:"elapsed,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model,omitempty"`
 
 	// Error fields
 	Error      string `json:"error,omitempty"`
@@ -193,7 +330,7 @@ func (h *Handler) ListSessions(c *gin.Context) {
 	convs := h.store.ListConversations()
 	out := make([]SessionResponse, 0, len(convs))
 	for _, conv := range convs {
-		out = append(out, sessionToResponse(conv))
+		out = append(out, h.sessionToResponse(conv))
 	}
 	c.JSON(http.StatusOK, gin.H{"sessions": out})
 }
@@ -218,13 +355,40 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	if req.Title != "" {
 		_ = h.store.RenameConversation(id, req.Title)
 	}
-	h.setSessionMeta(id, req.Style, req.Provider)
+
+	// Resolve the effective provider/model for this new session.
+	// Priority: request body → configured default provider →
+	// that provider's default model. Validate before persisting
+	// so we never end up with a session pointing at a stale
+	// (deleted) provider/model.
+	provider := req.Provider
+	if provider == "" {
+		provider = h.cfg.LLM.Default
+	}
+	if !h.validProvider(provider) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unknown provider %q", provider)})
+		return
+	}
+	model := req.Model
+	if model == "" {
+		for _, p := range h.cfg.LLM.Providers {
+			if p.Name == provider {
+				model = p.EffectiveModel()
+				break
+			}
+		}
+	} else if !h.validModel(provider, model) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model %q not found under provider %q", model, provider)})
+		return
+	}
+
+	h.setSessionMeta(id, req.Style, provider, model)
 
 	// Re-fetch and return the full session record.
 	convs := h.store.ListConversations()
 	for _, cv := range convs {
 		if cv.ID == id {
-			c.JSON(http.StatusCreated, sessionToResponse(cv))
+			c.JSON(http.StatusCreated, h.sessionToResponse(cv))
 			return
 		}
 	}
@@ -241,7 +405,7 @@ func (h *Handler) GetSession(c *gin.Context) {
 	convs := h.store.ListConversations()
 	for _, cv := range convs {
 		if cv.ID == id {
-			c.JSON(http.StatusOK, sessionToResponse(cv))
+			c.JSON(http.StatusOK, h.sessionToResponse(cv))
 			return
 		}
 	}
@@ -258,6 +422,12 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
+	// Drop the cached meta so a recycled id (extremely unlikely
+	// with our id scheme, but possible across long uptimes) does
+	// not inherit the dead session's overrides.
+	h.metaMu.Lock()
+	delete(h.meta, id)
+	h.metaMu.Unlock()
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }
 
@@ -277,6 +447,128 @@ func (h *Handler) RenameSession(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"renamed": id, "title": req.Title})
+}
+
+// UpdateSessionMeta is the "change provider / model / style without
+// sending a message" endpoint. Bound to PATCH /sessions/:id. The
+// request body uses pointer fields so callers can send partial
+// updates. The response is the refreshed SessionResponse so the
+// web UI can sync the picker state in one round-trip.
+//
+// To stay backwards-compatible with the old PATCH behaviour
+// (which only renamed a session), this handler also accepts a
+// plain `{"title": "..."}` body and dispatches to the rename path.
+func (h *Handler) UpdateSessionMeta(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+
+	// Verify the session exists before we touch anything.
+	cv, err := h.store.GetConversation(id)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Peek at the raw body. If the only key is "title", route to
+	// RenameSession for backwards compat. Otherwise try the meta
+	// update.
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Restore the body so the next ShouldBindJSON call still sees it.
+	c.Request.Body = io.NopCloser(strings.NewReader(string(raw)))
+
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Legacy rename path: only the title field is present.
+	if _, hasTitle := probe["title"]; hasTitle {
+		if len(probe) == 1 {
+			var req RenameSessionRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			// Match the old "binding:required" semantics:
+			// reject empty title explicitly so legacy callers
+			// keep getting a 400 on a degenerate body.
+			if strings.TrimSpace(req.Title) == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "title is required"})
+				return
+			}
+			if err := h.store.RenameConversation(id, req.Title); err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+				return
+			}
+			cv.Title = req.Title
+			c.JSON(http.StatusOK, h.sessionToResponse(cv))
+			return
+		}
+		// title + meta in one body: rename first, then update meta.
+		var rn RenameSessionRequest
+		if err := json.Unmarshal(raw, &rn); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if strings.TrimSpace(rn.Title) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "title is required"})
+			return
+		}
+		if err := h.store.RenameConversation(id, rn.Title); err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		cv.Title = rn.Title
+	}
+
+	var req UpdateSessionMetaRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validate provider (if specified) before touching meta.
+	provider := h.sessionProvider(id)
+	if req.Provider != nil {
+		if !h.validProvider(*req.Provider) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unknown provider %q", *req.Provider)})
+			return
+		}
+		provider = *req.Provider
+	}
+	if req.Model != nil {
+		if !h.validModel(provider, *req.Model) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model %q not found under provider %q", *req.Model, provider)})
+			return
+		}
+	}
+	h.setSessionMeta(id, deref(req.Style), provider, deref(req.Model))
+
+	// Re-read so the response reflects the on-disk truth.
+	cv, err = h.store.GetConversation(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, h.sessionToResponse(cv))
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // --- Messages ---
@@ -311,6 +603,12 @@ func (h *Handler) ListMessages(c *gin.Context) {
 // SendMessage is the main streaming endpoint. It accepts a user
 // message, appends it to the session's history, and streams the
 // assistant's response back as Server-Sent Events.
+//
+// The request may optionally carry `provider` and/or `model` to
+// override the per-session defaults. Overrides are validated
+// against the configured providers and models, then written back
+// to the session meta so the next message in this session keeps
+// using the new model.
 func (h *Handler) SendMessage(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
@@ -335,7 +633,32 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		s = style.Tech
 	}
 
+	// Resolve provider: body override → per-session override →
+	// configured default. Validate before mutating anything.
 	provider := h.sessionProvider(id)
+	if req.Provider != "" {
+		if !h.validProvider(req.Provider) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unknown provider %q", req.Provider)})
+			return
+		}
+		provider = req.Provider
+	}
+
+	// Resolve model: body override → per-session override → that
+	// provider's EffectiveModel.
+	model := h.sessionModel(id, provider)
+	if req.Model != "" {
+		if !h.validModel(provider, req.Model) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model %q not found under provider %q", req.Model, provider)})
+			return
+		}
+		model = req.Model
+	}
+
+	// Persist whichever fields the caller actually changed. The
+	// setSessionMeta helper is a no-op when nothing differs, so
+	// sending an empty body is fine.
+	h.setSessionMeta(id, string(s), provider, model)
 
 	// Build messages: history + new user message
 	histMsgs := h.store.GetMessages()
@@ -349,6 +672,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	chatReq := agent.ChatRequest{
 		Style:    s,
 		Provider: provider,
+		Model:    model,
 		Messages: msgs,
 	}
 
@@ -358,13 +682,15 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Session-ID", id)
+	c.Header("X-Provider", provider)
+	c.Header("X-Model", model)
 
 	c.Stream(func(w io.Writer) bool {
 		chunk, ok := <-stream
 		if !ok {
 			return false
 		}
-		ev := chunkToEvent(chunk)
+		ev := chunkToEvent(chunk, provider, model)
 		data, _ := json.Marshal(ev)
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 			return false
@@ -374,9 +700,12 @@ func (h *Handler) SendMessage(c *gin.Context) {
 }
 
 // chunkToEvent maps an internal ChatStreamChunk to a public
-// StreamEvent the API exposes.
-func chunkToEvent(chunk agent.ChatStreamChunk) StreamEvent {
-	ev := StreamEvent{Phase: chunk.Phase, Step: chunk.Step, Message: chunk.Message}
+// StreamEvent the API exposes. provider/model are stamped on
+// every event so the client can show a small "produced by" badge
+// on the assistant message even when the model is unknown to the
+// chunk itself.
+func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {
+	ev := StreamEvent{Phase: chunk.Phase, Step: chunk.Step, Message: chunk.Message, Provider: provider, Model: model}
 
 	if chunk.Content != "" {
 		ev.Type = "content"
@@ -428,12 +757,32 @@ func chunkToEvent(chunk agent.ChatStreamChunk) StreamEvent {
 }
 
 // sessionToResponse converts a memory.Conversation into the API
-// representation. The import is local because the signature uses
-// only primitives.
-func sessionToResponse(cv memory.Conversation) SessionResponse {
+// representation. The per-session provider/model/style are read
+// from the meta cache (lazily re-hydrated from
+// conversations.metadata). When the session has no override, the
+// server's default provider + EffectiveModel is reported so the
+// client always sees a complete picker state.
+func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
+	m := h.ensureMetaLoaded(cv.ID)
+	provider := m.Provider
+	if provider == "" {
+		provider = h.cfg.LLM.Default
+	}
+	model := m.Model
+	if model == "" {
+		for _, p := range h.cfg.LLM.Providers {
+			if p.Name == provider {
+				model = p.EffectiveModel()
+				break
+			}
+		}
+	}
 	return SessionResponse{
 		ID:        cv.ID,
 		Title:     cv.Title,
+		Provider:  provider,
+		Model:     model,
+		Style:     m.Style,
 		CreatedAt: cv.CreatedAt.Unix(),
 		UpdatedAt: cv.UpdatedAt.Unix(),
 	}

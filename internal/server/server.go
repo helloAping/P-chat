@@ -12,15 +12,22 @@ import (
 )
 
 type Server struct {
-	cfg    *config.Config
-	agent  *agent.Agent
-	store  *memory.Store
-	engine *gin.Engine
+	cfg     *config.Config
+	agent   *agent.Agent
+	store   *memory.Store
+	engine  *gin.Engine
+	handler *Handler
 }
 
 // Engine returns the underlying gin.Engine so tests (or embedders)
 // can drive the server via httptest without exposing internals.
 func (s *Server) Engine() *gin.Engine { return s.engine }
+
+// Handler returns the request handler so tests (and embedders)
+// can call helpers that aren't bound to an HTTP route — e.g.
+// sessionToResponse or the per-session meta resolvers. Stable
+// public API; safe to call from outside this package.
+func (s *Server) Handler() *Handler { return s.handler }
 
 // New builds the HTTP server. The store is used for session/message
 // persistence. The agent is used for chat calls. The web frontend is
@@ -84,7 +91,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/sessions", h.ListSessions)
 		api.POST("/sessions", h.CreateSession)
 		api.GET("/sessions/:id", h.GetSession)
-		api.PATCH("/sessions/:id", h.RenameSession)
+		// PATCH /sessions/:id handles both "rename only" (legacy
+		// body shape: {"title": "..."}) and "update per-session
+		// provider/model/style" (pointer fields). The handler
+		// dispatches based on the body.
+		api.PATCH("/sessions/:id", h.UpdateSessionMeta)
 		api.DELETE("/sessions/:id", h.DeleteSession)
 
 		// Messages
@@ -98,7 +109,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		r.StaticFS("/app", staticFS)
 	}
 
-	return &Server{cfg: cfg, agent: agt, store: store, engine: r}
+	return &Server{cfg: cfg, agent: agt, store: store, engine: r, handler: h}
 }
 
 func (s *Server) Run() error {

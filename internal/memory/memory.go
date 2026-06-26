@@ -470,6 +470,50 @@ func (s *Store) RenameConversation(id, title string) error {
 	return nil
 }
 
+// UpdateConversationMeta overwrites the JSON metadata blob for a
+// conversation. Pass an empty string to clear it. The caller is
+// responsible for serialising whatever payload it wants to keep —
+// typically {provider, model, style}. Used by the HTTP layer to
+// persist per-session model/style overrides so they survive a
+// pchat-server restart.
+func (s *Store) UpdateConversationMeta(id, meta string) error {
+	_ = s.Flush()
+	var v any
+	if meta == "" {
+		v = nil
+	} else {
+		v = meta
+	}
+	res, err := s.db.Exec(`UPDATE conversations SET metadata = ? WHERE id = ?`, v, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("conversation %q not found", id)
+	}
+	return nil
+}
+
+// GetConversation fetches a single conversation by id. Returns
+// sql.ErrNoRows if the id is unknown — callers usually translate
+// that into a 404.
+func (s *Store) GetConversation(id string) (Conversation, error) {
+	_ = s.Flush()
+	var c Conversation
+	var created, updated int64
+	err := s.db.QueryRow(
+		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,'') FROM conversations WHERE id = ?`,
+		id,
+	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata)
+	if err != nil {
+		return Conversation{}, err
+	}
+	c.CreatedAt = time.Unix(created, 0)
+	c.UpdatedAt = time.Unix(updated, 0)
+	return c, nil
+}
+
 // DeleteConversation removes a conversation and all its messages.
 func (s *Store) DeleteConversation(id string) error {
 	_, err := s.db.Exec(`DELETE FROM conversations WHERE id = ?`, id)

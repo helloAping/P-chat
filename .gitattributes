@@ -52,7 +52,8 @@
 *.gif           binary
 *.ico           binary
 *.webp          binary
-*.svg           text eol=lf  # keep SVG diffable
+# SVGs are text, keep them diffable across platforms
+*.svg           text eol=lf
 
 # Fonts / media
 *.woff          binary
