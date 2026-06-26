@@ -1,24 +1,85 @@
 /* Global styles for the P-Chat Vue frontend. Most UI is rendered
  * through Naive UI components, which carry their own theming.
- * This file only holds the layout shell, scrollbar tweaks, and
- * a few utility classes the components reuse. */
+ * This file holds the design tokens, layout shell, scrollbar
+ * tweaks, and a few utility classes the components reuse.
+ *
+ * Design tokens are split into semantic variables
+ * (--bg, --bg-2, --text, --accent, --warn, ...) and component
+ * code MUST consume the semantic ones, not raw hex. The two
+ * theme variants (dark / light) override the semantic vars
+ * via a `data-theme` attribute on the document root.
+ */
 
-:root {
-  --bg: #0f1115;
-  --bg-2: #1a1d24;
-  --bg-3: #252830;
-  --bg-input: #1a1d24;
-  --text: #e6e6e6;
-  --text-2: #b0b3ba;
-  --text-3: #8a8d95;
-  --text-4: #5a5d65;
-  --border: #2a2d35;
-  --border-2: #3a3d45;
-  --accent: #4a4dff;
-  --accent-2: #7a7dff;
-  --error: #e55;
-  --success: #5a5;
-  --warn: #ea5;
+:root,
+:root[data-theme="dark"] {
+  /* Surfaces — from back-most to front-most */
+  --bg:        #0f1115;
+  --bg-2:      #1a1d24;
+  --bg-3:      #252830;
+  --bg-input:  #1a1d24;
+
+  /* Text */
+  --text:      #e6e6e6;
+  --text-2:    #b0b3ba;
+  --text-3:    #8a8d95;
+  --text-4:    #5a5d65;
+
+  /* Borders */
+  --border:    #2a2d35;
+  --border-2:  #3a3d45;
+
+  /* Brand accent — drives the primary CTA, the active item
+     highlight, the streaming dot, and the model-row "is
+     default" tint. Single source of truth. */
+  --accent:        #4a4dff;
+  --accent-2:      #7a7dff;
+  --accent-soft:   rgba(74, 77, 255, 0.12);
+  --accent-border: rgba(74, 77, 255, 0.35);
+
+  /* Status colors */
+  --error:        #e55;
+  --error-soft:   rgba(238, 85, 85, 0.14);
+  --success:      #5a5;
+  --success-soft: rgba(85, 170, 85, 0.16);
+  --warn:         #ea5;
+  --warn-soft:    rgba(234, 170, 85, 0.16);
+
+  /* Translucent on-message-button background (used inside
+     assistant bubbles where the bg is --accent). */
+  --on-accent:    #ffffff;
+
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg:        #fafbfc;
+  --bg-2:      #f0f2f5;
+  --bg-3:      #e6e9ee;
+  --bg-input:  #ffffff;
+
+  --text:      #1a1d24;
+  --text-2:    #4a4d55;
+  --text-3:    #6a6d75;
+  --text-4:    #9a9da5;
+
+  --border:    #d8dbe0;
+  --border-2:  #c8cbd0;
+
+  --accent:        #4042e6;
+  --accent-2:      #5a5cff;
+  --accent-soft:   rgba(64, 66, 230, 0.10);
+  --accent-border: rgba(64, 66, 230, 0.30);
+
+  --error:        #d33;
+  --error-soft:   rgba(221, 51, 51, 0.10);
+  --success:      #2a7a2a;
+  --success-soft: rgba(42, 122, 42, 0.12);
+  --warn:         #c97a00;
+  --warn-soft:    rgba(201, 122, 0, 0.14);
+
+  --on-accent:    #ffffff;
+
+  color-scheme: light;
 }
 
 html, body, #app {

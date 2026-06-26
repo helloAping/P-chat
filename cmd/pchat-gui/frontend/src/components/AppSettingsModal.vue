@@ -721,17 +721,17 @@ function fmtContext(n?: number) {
   min-height: 480px;
 }
 .provider-list {
-  border: 1px solid var(--border-2, #e5e7eb);
+  border: 1px solid var(--border-2);
   border-radius: 6px;
-  background: var(--bg-2, #fafafa);
+  background: var(--bg-2);
   display: flex; flex-direction: column;
   overflow: hidden;
 }
 .provider-list-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 10px;
-  border-bottom: 1px solid var(--border-2, #e5e7eb);
-  background: var(--bg-3, #f3f4f6);
+  border-bottom: 1px solid var(--border-2);
+  background: var(--bg-3);
 }
 .list-title { font-size: 12px; font-weight: 600; }
 .provider-items { flex: 1; overflow: auto; padding: 4px; }
@@ -742,12 +742,12 @@ function fmtContext(n?: number) {
   margin-bottom: 2px;
   transition: background 0.15s;
 }
-.provider-item:hover { background: var(--bg-3, #f3f4f6); }
+.provider-item:hover { background: var(--bg-3); }
 .provider-item.active {
-  background: var(--primary-color, #18a058);
-  color: white;
+  background: var(--accent);
+  color: var(--on-accent);
 }
-.provider-item.active .muted { color: rgba(255,255,255,0.85); }
+.provider-item.active .muted { color: rgba(255, 255, 255, 0.85); }
 .provider-item-head {
   display: flex; align-items: center; gap: 6px;
   margin-bottom: 2px;
@@ -759,14 +759,14 @@ function fmtContext(n?: number) {
 }
 
 .provider-detail {
-  border: 1px solid var(--border-2, #e5e7eb);
+  border: 1px solid var(--border-2);
   border-radius: 6px;
-  background: var(--bg-1, #fff);
+  background: var(--bg-2);
   display: flex; flex-direction: column;
   overflow: hidden;
 }
 .detail-section {
-  border-bottom: 1px solid var(--border-2, #e5e7eb);
+  border-bottom: 1px solid var(--border-2);
   padding: 12px 14px;
 }
 .detail-section:last-child { border-bottom: none; flex: 1; overflow: auto; }
@@ -797,19 +797,19 @@ function fmtContext(n?: number) {
   padding: 6px 8px;
   font-weight: 600;
   color: var(--text-2);
-  border-bottom: 1px solid var(--border-2, #e5e7eb);
-  background: var(--bg-2, #fafafa);
+  border-bottom: 1px solid var(--border-2);
+  background: var(--bg-2);
 }
 .model-table td {
   padding: 8px;
-  border-bottom: 1px solid var(--border-2, #e5e7eb);
+  border-bottom: 1px solid var(--border-2);
   vertical-align: middle;
 }
 .model-table tr.is-default {
-  background: rgba(24, 160, 88, 0.05);
+  background: var(--success-soft);
 }
 .model-id {
-  background: var(--bg-3, #f3f4f6);
+  background: var(--bg-3);
   padding: 1px 6px;
   border-radius: 3px;
   font-family: ui-monospace, Menlo, monospace;
@@ -821,14 +821,14 @@ function fmtContext(n?: number) {
 .add-form {
   margin-top: 8px;
   padding: 10px;
-  background: var(--bg-2, #fafafa);
-  border: 1px solid var(--border-2, #e5e7eb);
+  background: var(--bg-2);
+  border: 1px solid var(--border-2);
   border-radius: 6px;
 }
 .style-row {
   display: flex; justify-content: space-between; align-items: center;
   padding: 8px 10px;
-  background: var(--bg-3, #f3f4f6);
+  background: var(--bg-3);
   border-radius: 6px;
   margin-bottom: 6px;
   gap: 12px;
@@ -839,7 +839,7 @@ function fmtContext(n?: number) {
   max-width: 480px;
 }
 code {
-  background: var(--bg-3, #f3f4f6); padding: 1px 6px; border-radius: 3px;
+  background: var(--bg-3); padding: 1px 6px; border-radius: 3px;
   font-family: ui-monospace, Menlo, monospace; font-size: 12px;
 }
 </style>

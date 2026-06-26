@@ -5,6 +5,12 @@ import { state, createSession, deleteSessionById, renameSession, switchSession }
 
 const emit = defineEmits<{ (e: 'open-settings'): void }>()
 
+// Two-way binding to the themeName in App.vue. The
+// v-model:theme-name shorthand emits 'update:themeName'
+// when this component flips it, and App.vue applies the
+// change to <html data-theme=…> + localStorage.
+const themeName = defineModel<'dark' | 'light'>('themeName', { default: 'dark' })
+
 const message = useMessage()
 
 const sortedSessions = computed(() =>
@@ -43,6 +49,14 @@ function formatTime(t: number) {
 function openSettings() {
   emit('open-settings')
 }
+
+// The toggle button is a single icon that flips between
+// 🌙 (currently dark) and ☀ (currently light) so the
+// label always shows the *target* — what the user is
+// about to switch to, not the current state.
+function toggleTheme() {
+  themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
+}
 </script>
 
 <template>
@@ -51,6 +65,9 @@ function openSettings() {
       <div class="logo">💬 P-Chat</div>
       <NSpace size="small">
         <NButton size="small" type="primary" @click="onNew" title="新建会话">+ 新建</NButton>
+        <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'">
+          {{ themeName === 'dark' ? '🌙' : '☀' }}
+        </NButton>
         <NButton size="small" quaternary @click="openSettings" title="设置">⚙</NButton>
       </NSpace>
     </div>

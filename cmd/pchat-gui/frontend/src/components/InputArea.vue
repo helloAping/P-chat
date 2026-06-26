@@ -660,12 +660,12 @@ onMounted(() => {
   border: none; border-radius: 8px;
   font-size: 14px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
-  background: var(--accent); color: #fff;
+  background: var(--accent); color: var(--on-accent);
 }
-.send-btn:disabled { background: #333; color: #666; cursor: not-allowed; }
-.send-btn:hover:not(:disabled) { background: #5a5dff; }
+.send-btn:disabled { background: var(--bg-3); color: var(--text-4); cursor: not-allowed; }
+.send-btn:hover:not(:disabled) { background: var(--accent-2); }
 .stop-btn { background: var(--error); }
-.stop-btn:hover { background: #d77; }
+.stop-btn:hover { background: var(--error); opacity: 0.85; }
 
 .input-bottom {
   display: flex; justify-content: space-between; align-items: center;

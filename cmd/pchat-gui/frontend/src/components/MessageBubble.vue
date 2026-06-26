@@ -94,7 +94,7 @@ function shortWarnText(t?: string): string {
 }
 .msg.user .bubble {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 .msg.assistant .bubble {
   background: var(--bg-3);
@@ -143,7 +143,7 @@ function shortWarnText(t?: string): string {
 }
 .msg-image:hover { opacity: 0.92; }
 .msg-file {
-  background: rgba(255,255,255,0.1);
+  background: var(--bg-3);
   border: 1px solid var(--border-2);
   border-radius: 4px;
   padding: 2px 6px;
@@ -155,15 +155,15 @@ function shortWarnText(t?: string): string {
 }
 .msg-image-warn {
   display: inline-flex; align-items: center; gap: 6px;
-  background: rgba(255, 180, 0, 0.12);
-  border: 1px dashed var(--warn, #c8a040);
+  background: var(--warn-soft);
+  border: 1px dashed var(--warn);
   border-radius: 6px;
   padding: 4px 8px;
   font-size: 12px;
   color: var(--text-2);
   max-width: 100%;
 }
-.warn-icon { color: var(--warn, #c8a040); }
+.warn-icon { color: var(--warn); }
 .warn-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .msg.streaming .bubble { animation: pulse 1.5s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
