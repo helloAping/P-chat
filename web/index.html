@@ -409,10 +409,27 @@ input, textarea { font-family: inherit; }
 #stop:hover { background: #d77; }
 #attach-btn {
     background: var(--bg-3); color: var(--text-2);
-    padding: 0; width: 40px; font-size: 18px;
+    border: 1px dashed var(--border-2);
+    border-radius: 10px;
+    padding: 0 12px;
+    width: auto; height: 40px;
+    font-size: 12px;
+    display: flex; align-items: center; gap: 6px;
+    flex-shrink: 0;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
-#attach-btn:hover { background: var(--bg-4); color: var(--accent-2); }
+#attach-btn:hover { background: var(--bg-4); border-color: var(--accent-2); color: var(--accent-2); }
+#attach-btn .icon { font-size: 16px; line-height: 1; }
 #attach-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Highlight the drop zone while a file is being dragged
+ * over the messages pane. */
+#messages.dragover, #input-wrap.dragover {
+    outline: 2px dashed var(--accent-2);
+    outline-offset: -4px;
+    background: var(--bg-3);
+}
 
 /* Attachment strip: shown above the textarea when at least one
  * file is staged. Each chip is a small preview card: image files
@@ -459,6 +476,16 @@ input, textarea { font-family: inherit; }
 .attachment-chip .remove:hover { color: var(--error); }
 .attachment-chip.uploading { opacity: 0.5; }
 .attachment-chip.error { border-color: var(--error); }
+.attach-hint {
+    flex: 1 0 100%;
+    background: rgba(255, 180, 0, 0.08);
+    border: 1px solid rgba(255, 180, 0, 0.3);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: #ffcb6b;
+    line-height: 1.4;
+}
 #stop.show { display: block; }
 #send.hide { display: none; }
 
@@ -563,8 +590,11 @@ input, textarea { font-family: inherit; }
             <span><kbd>Esc</kbd> 取消</span>
         </div>
     </div>
-    <button id="attach-btn" title="添加附件">📎</button>
-    <input type="file" id="attach-input" multiple style="display:none">
+    <button id="attach-btn" title="添加附件(支持拖拽)">
+        <span class="icon">📎</span><span>附件</span>
+    </button>
+    <input type="file" id="attach-input" multiple style="display:none"
+        accept="image/*,audio/*,text/*,.pdf,.json,.md,.txt,.csv,.yaml,.yml,.go,.py,.js,.ts">
     <button id="send">发送</button>
     <button id="stop" title="停止生成">停止</button>
 </div>
@@ -2012,9 +2042,40 @@ function fileIconFor(kind) {
     }
 }
 
+// modelSupportsVision returns true when the currently-active
+// model name suggests it can read images. Heuristic — the
+// /providers response doesn't currently expose a capability
+// flag, so we match common naming patterns. False positives
+// are fine (we only use this for an inline hint, not to gate
+// the request).
+function modelSupportsVision(modelName) {
+    if (!modelName) return false;
+    const m = String(modelName).toLowerCase();
+    if (m.includes("vision") || m.includes("gpt-4o") || m.includes("gpt-4-vision")
+        || m.includes("claude-3") || m.includes("claude-4") || m.includes("opus")
+        || m.includes("sonnet") || m.includes("haiku") || m.includes("gemini")
+        || m.includes("qwen-vl") || m.includes("doubao-vision")
+        || m.includes("yi-vision") || m.includes("mimo-v")) return true;
+    return false;
+}
+
 function renderPendingAttachments() {
     const wrap = $("attachments");
     wrap.innerHTML = "";
+    const meta = currentMeta();
+    const hasImage = state.pendingAttachments.some(a => a.kind === "image");
+    const visionCapable = modelSupportsVision(meta.model);
+    if (hasImage && !visionCapable) {
+        // Inline hint: the user is staging an image but the
+        // currently-selected model likely can't read it. We
+        // don't block the send — the user may know better
+        // (some proxy endpoints map image to text descriptions)
+        // — but we make the caveat obvious.
+        const hint = document.createElement("div");
+        hint.className = "attach-hint";
+        hint.textContent = `当前模型 “${meta.model}” 可能不支持图片,建议切到视觉模型(GPT-4o / Claude 3.5 Sonnet / Doubao-vision)`;
+        wrap.appendChild(hint);
+    }
     for (let i = 0; i < state.pendingAttachments.length; i++) {
         const a = state.pendingAttachments[i];
         const chip = document.createElement("div");
@@ -2126,6 +2187,71 @@ $("attach-input").addEventListener("change", async (e) => {
     e.target.value = ""; // reset so the same file can be picked again
     for (const f of files) {
         uploadOneFile(f);
+    }
+});
+
+// Drag-and-drop support: dropping a file onto the messages pane
+// or the input area adds it to the staged attachments. The
+// <input type="file"> doesn't fire for drops; we wire the same
+// uploadOneFile path so the picker and DnD stay in sync.
+const DROP_ZONES = [$("messages"), $("input-wrap"), $("attach-btn")];
+for (const z of DROP_ZONES) {
+    if (!z) continue;
+    // dragenter / dragover must preventDefault for drop to fire.
+    z.addEventListener("dragover", (e) => {
+        if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files")) {
+            e.preventDefault();
+            z.classList.add("dragover");
+        }
+    });
+    z.addEventListener("dragleave", () => z.classList.remove("dragover"));
+    z.addEventListener("drop", (e) => {
+        e.preventDefault();
+        z.classList.remove("dragover");
+        const files = Array.from(e.dataTransfer?.files || []);
+        for (const f of files) {
+            uploadOneFile(f);
+        }
+    });
+}
+// Suppress the browser's default "open file" behaviour when
+// the user misses the drop zone and drops onto document body.
+window.addEventListener("dragover", (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files")) {
+        e.preventDefault();
+    }
+});
+window.addEventListener("drop", (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files")) {
+        e.preventDefault();
+        const files = Array.from(e.dataTransfer?.files || []);
+        for (const f of files) {
+            uploadOneFile(f);
+        }
+    }
+});
+
+// Clipboard image paste: a screenshot copied to the
+// clipboard (Snipping Tool, PrintScreen, etc.) lands on the
+// textarea as a `paste` event with image/png in the
+// clipboardData. Stage it as an attachment; no file picker
+// involved.
+$("input").addEventListener("paste", (e) => {
+    const items = e.clipboardData?.items || [];
+    for (const it of items) {
+        if (it.kind === "file" && it.type.startsWith("image/")) {
+            const file = it.getAsFile();
+            if (file) {
+                e.preventDefault();
+                // Give it a sensible name — clipboard items
+                // don't carry a filename on most platforms.
+                const name = file.name && file.name !== "image.png"
+                    ? file.name
+                    : `clipboard-${Date.now()}.png`;
+                const renamed = new File([file], name, { type: file.type });
+                uploadOneFile(renamed);
+            }
+        }
     }
 });
 
