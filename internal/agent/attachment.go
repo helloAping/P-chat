@@ -82,6 +82,17 @@ func (r *DiskAttachmentResolver) Resolve(a Attachment) (string, int64) {
 // decides what to do).
 //
 // The resolver is required; nil is a programming error.
+//
+// Both OpenAI and Anthropic paths populate the same MultiContent
+// field on the user message. The two wire formats differ, but
+// they share the same building blocks:
+//
+//	OpenAI  image_url  → { type: image_url, image_url: { url: "data:..." } }
+//	Anthropic image    → { type: image,     source:   { type: base64, media_type, data } }
+//
+// The LLM client translates at the wire boundary (see
+// internal/llm/anthropic.go), so the agent layer stays
+// protocol-agnostic.
 func expandAttachments(msgs []llm.Message, atts []Attachment, r AttachmentResolver) []llm.Message {
 	if len(atts) == 0 || r == nil || len(msgs) == 0 {
 		return msgs
@@ -182,6 +193,19 @@ func expandAttachments(msgs []llm.Message, atts []Attachment, r AttachmentResolv
 	out = append(out, msgs[:len(msgs)-1]...)
 	out = append(out, newMsg)
 	return out
+}
+
+// ExpandAttachments is the protocol-aware dispatcher used by the
+// agent layer when building the message list for a chat call.
+// `protocol` is the value of cfg.LLM.Providers[i].GetProtocol()
+// ("openai" or "anthropic"). Unknown protocols fall back to the
+// OpenAI shape; the LLM client decides what to do with it.
+//
+// Both protocols share the same MultiContent representation at
+// the agent layer (text + image_url). The LLM client
+// serialises per protocol at the wire boundary.
+func ExpandAttachments(protocol string, msgs []llm.Message, atts []Attachment, r AttachmentResolver) []llm.Message {
+	return expandAttachments(msgs, atts, r)
 }
 
 // dataURL is a small helper that builds a data: URL from the

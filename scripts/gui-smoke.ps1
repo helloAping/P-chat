@@ -117,6 +117,57 @@ try {
     exit 1
 }
 
+# 6a. exercise the upload endpoint: a tiny PNG must be accepted,
+#     classified as image, and stored at ~/.p-chat/uploads/.
+Step "6a" "POST /api/v1/uploads accepts a PNG and returns metadata"
+try {
+    # 1x1 transparent PNG (8-byte signature + IHDR + IDAT + IEND)
+    $png = [byte[]]@(
+        0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,
+        0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,
+        0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+        0x08,0x06,0x00,0x00,0x00,0x1f,0x15,0xc4,
+        0x89,0x00,0x00,0x00,0x0d,0x49,0x44,0x41,
+        0x54,0x78,0x9c,0x62,0x00,0x01,0x00,0x00,
+        0x05,0x00,0x01,0x0d,0x0a,0x2d,0xb4,0x00,
+        0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,
+        0x42,0x60,0x82
+    )
+    $tmpPng = Join-Path $env:TEMP "pchat-smoke-attachment.png"
+    [System.IO.File]::WriteAllBytes($tmpPng, $png)
+    try {
+        # Use HttpClient + MultipartFormDataContent — this is the
+        # canonical way to build a multipart/form-data body in
+        # .NET and avoids the brittle boundary-escaping that
+        # hand-rolled StreamWriter constructions hit.
+        Add-Type -AssemblyName System.Net.Http
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.UseDefaultCredentials = $true
+        $http = [System.Net.Http.HttpClient]::new($handler)
+        $content = [System.Net.Http.MultipartFormDataContent]::new()
+        $fileStream = [System.IO.File]::OpenRead($tmpPng)
+        $fileContent = [System.Net.Http.StreamContent]::new($fileStream)
+        $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("image/png")
+        $content.Add($fileContent, "file", "dot.png")
+        $resp = $http.PostAsync("http://127.0.0.1:$port/api/v1/uploads", $content).GetAwaiter().GetResult()
+        $respBody = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if ($resp.StatusCode -ne 201) { throw "upload status = $($resp.StatusCode), body = $respBody" }
+        $up = $respBody | ConvertFrom-Json
+        if ($up.kind -ne "image") { throw "kind = $($up.kind), want image" }
+        if ($up.id.Length -ne 16) { throw "id length = $($up.id.Length), want 16" }
+        if (-not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".p-chat\uploads\$($up.id)-$($up.name)"))) {
+            throw "uploaded file not on disk at ~/.p-chat/uploads/$($up.id)-$($up.name)"
+        }
+        Write-Host "OK: uploaded id=$($up.id) kind=$($up.kind) size=$($up.size)" -ForegroundColor Green
+    } finally {
+        Remove-Item -LiteralPath $tmpPng -ErrorAction SilentlyContinue
+    }
+} catch {
+    Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
+    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+
 # 6b. exercise the per-session model + PATCH meta endpoint, so a
 # regression on the new sessionMeta persistence path is caught
 # even when no real LLM is configured.

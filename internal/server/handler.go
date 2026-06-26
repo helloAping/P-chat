@@ -54,12 +54,19 @@ type sessionMetaBlob struct {
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store) *Handler {
-	return &Handler{
+	h := &Handler{
 		agent: a,
 		cfg:   cfg,
 		store: store,
 		meta:  make(map[string]sessionMeta),
 	}
+	// Wire the upload resolver so the agent can read attached
+	// files by their upload id. The resolver lives in the agent
+	// (not the handler) because attachment expansion happens
+	// inside the LLM call path, after the handler has already
+	// handed the request to the agent.
+	a.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
+	return h
 }
 
 // setSessionMeta updates the in-memory cache and, when any field
@@ -196,6 +203,15 @@ type SendMessageRequest struct {
 	// values mean "no change".
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
+	// Attachments is a list of file ids (returned earlier by
+	// POST /api/v1/uploads) the user attached to this turn. The
+	// handler reads each file from the uploads dir, classifies
+	// it (image / audio / text / file), and expands the trailing
+	// user message into a multi-part content array before
+	// sending to the LLM. The protocol-specific serialisation
+	// (OpenAI image_url vs Anthropic image+source) is handled
+	// by the LLM client.
+	Attachments []agent.Attachment `json:"attachments,omitempty"`
 }
 
 // CreateSessionRequest is the body of POST /sessions.
@@ -670,10 +686,11 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	})
 
 	chatReq := agent.ChatRequest{
-		Style:    s,
-		Provider: provider,
-		Model:    model,
-		Messages: msgs,
+		Style:       s,
+		Provider:    provider,
+		Model:       model,
+		Messages:    msgs,
+		Attachments: req.Attachments,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)

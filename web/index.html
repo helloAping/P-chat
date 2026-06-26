@@ -395,7 +395,7 @@ input, textarea { font-family: inherit; }
     background: var(--bg-3); border: 1px solid var(--border-2);
     border-radius: 3px; padding: 0 4px; font-family: var(--mono); font-size: 9px;
 }
-#send, #stop {
+#send, #stop, #attach-btn {
     background: var(--accent); color: #fff;
     border: none; border-radius: 10px;
     padding: 0 18px; cursor: pointer;
@@ -407,6 +407,58 @@ input, textarea { font-family: inherit; }
 #send:disabled { background: #333; color: #666; cursor: not-allowed; }
 #stop { background: var(--error); display: none; }
 #stop:hover { background: #d77; }
+#attach-btn {
+    background: var(--bg-3); color: var(--text-2);
+    padding: 0; width: 40px; font-size: 18px;
+}
+#attach-btn:hover { background: var(--bg-4); color: var(--accent-2); }
+#attach-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Attachment strip: shown above the textarea when at least one
+ * file is staged. Each chip is a small preview card: image files
+ * get a 40x40 thumbnail via /api/v1/uploads/:id, everything else
+ * gets a generic file icon + name. Clicking the × removes the
+ * attachment from the next message; it does NOT delete the file
+ * on the server (uploads are session-scoped; gc is TODO). */
+#attachments {
+    flex: 1;
+    display: flex; flex-wrap: wrap; gap: 6px;
+    padding: 0 0 6px 0;
+}
+#attachments:empty { display: none; }
+.attachment-chip {
+    display: flex; align-items: center; gap: 6px;
+    background: var(--bg-3);
+    border: 1px solid var(--border-2);
+    border-radius: 6px;
+    padding: 4px 8px 4px 4px;
+    font-size: 11px; color: var(--text-2);
+    max-width: 200px;
+}
+.attachment-chip .thumb {
+    width: 28px; height: 28px; border-radius: 4px;
+    background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; color: var(--text-3);
+    flex-shrink: 0;
+    overflow: hidden;
+}
+.attachment-chip .thumb img {
+    width: 100%; height: 100%; object-fit: cover;
+}
+.attachment-chip .name {
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.attachment-chip .remove {
+    background: transparent; border: none;
+    color: var(--text-4); cursor: pointer;
+    font-size: 14px; padding: 0 4px;
+    line-height: 1;
+}
+.attachment-chip .remove:hover { color: var(--error); }
+.attachment-chip.uploading { opacity: 0.5; }
+.attachment-chip.error { border-color: var(--error); }
 #stop.show { display: block; }
 #send.hide { display: none; }
 
@@ -503,6 +555,7 @@ input, textarea { font-family: inherit; }
 
 <div id="input-area">
     <div id="input-wrap">
+        <div id="attachments"></div>
         <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行，Esc 取消"></textarea>
         <div id="input-hint">
             <span><kbd>Enter</kbd> 发送</span>
@@ -510,6 +563,8 @@ input, textarea { font-family: inherit; }
             <span><kbd>Esc</kbd> 取消</span>
         </div>
     </div>
+    <button id="attach-btn" title="添加附件">📎</button>
+    <input type="file" id="attach-input" multiple style="display:none">
     <button id="send">发送</button>
     <button id="stop" title="停止生成">停止</button>
 </div>
@@ -663,6 +718,19 @@ const state = {
     // background stream finishes for a session the user isn't
     // currently viewing.
     sessionMessages: {},
+    // Staged attachments (files the user picked from disk and
+    // uploaded to /api/v1/uploads but hasn't sent yet). Each
+    // entry is the JSON returned by the upload endpoint:
+    // { id, name, size, kind, mime }. Stays in memory only —
+    // never persisted to localStorage. Cleared on:
+    //   - successful send (chip consumed)
+    //   - explicit remove (× on chip)
+    //   - session switch (chips belong to the conversation
+    //     turn they were staged for, not to the global input).
+    // The latter is a deliberate UX choice: switching
+    // conversations drops staged work, matching the typical
+    // chat-app behaviour.
+    pendingAttachments: [],
 };
 
 // currentMeta returns the per-session meta for state.currentID,
@@ -1413,6 +1481,17 @@ async function switchSession(id) {
     // a fully-formed message. The streaming[id] entry stays
     // until the server closes the SSE.
     state.currentID = id;
+    // Staged attachments belong to the message they were
+    // picked for. Switching conversations drops them — the
+    // files remain on the server until garbage-collected, but
+    // the user has to re-pick them for the new conversation.
+    // (Persistence is intentionally server-side: even if the
+    // user logs out and back in, those uploaded files are
+    // still retrievable by id.)
+    if (state.pendingAttachments.length > 0) {
+        state.pendingAttachments = [];
+        renderPendingAttachments();
+    }
     renderSessionList();
     // Picker state must reflect the per-session meta.
     renderProviderPicker();
@@ -1619,13 +1698,32 @@ async function sendMessage(text) {
     }
 
     let provider = meta.provider, model = meta.model;
+    // Snapshot the staged attachments for this turn. We only
+    // send attachments that finished uploading successfully;
+    // pending / failed ones stay in the strip so the user can
+    // retry. The snapshot is consumed (state.pendingAttachments
+    // cleared) on the first successful POST below.
+    const atts = state.pendingAttachments
+        .filter(a => !a._uploading && !a._error && a.id)
+        .map(a => ({ id: a.id, name: a.name, kind: a.kind, mime: a.mime }));
     try {
         const res = await fetch(`${API}/api/v1/sessions/${id}/messages`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: text, style: meta.style, provider, model }),
+            body: JSON.stringify({
+                message: text, style: meta.style, provider, model,
+                attachments: atts,
+            }),
             signal: ctrl.signal,
         });
+        // First-line response means the request was accepted;
+        // clear the chip strip regardless of streaming outcome.
+        // (The server has already read the file from disk, so
+        // we don't need to keep the metadata around.)
+        if (atts.length > 0) {
+            state.pendingAttachments = [];
+            renderPendingAttachments();
+        }
         if (!res.ok) {
             const t = await res.text();
             asstDiv.innerHTML = `<div class="error">${escapeHTML(t)}</div>`;
@@ -1882,6 +1980,116 @@ function formatTime(unixSec) {
     return (d.getMonth() + 1) + "/" + d.getDate();
 }
 
+// ---------- Attachments ----------
+//
+// The attachment flow is:
+//   1. user picks files via the paperclip button (or drags
+//      future versions) → <input type="file" multiple>
+//   2. each file is POSTed to /api/v1/uploads (multipart); the
+//      response carries { id, name, size, kind, mime }
+//   3. we stage the metadata in state.pendingAttachments and
+//      render a chip for each
+//   4. on send, the staged metadata goes into the request body
+//      as `attachments: [...]`; the server resolves each id
+//      to an on-disk file and expands the user message into a
+//      multi-part content array
+//   5. on successful send, the chip is removed from the strip
+//
+// State is per-message, not per-session: switching sessions
+// drops the staged chips. This matches the typical chat-app
+// behaviour and avoids the "stale file from yesterday's
+// conversation" surprise.
+
+// fileIconFor returns a single-character glyph for a given
+// attachment kind. Image kinds get nothing (the chip uses the
+// actual <img> thumbnail instead).
+function fileIconFor(kind) {
+    switch (kind) {
+        case "audio": return "🔊";
+        case "text":  return "≡";
+        case "file":  return "📄";
+        default:      return "📎";
+    }
+}
+
+function renderPendingAttachments() {
+    const wrap = $("attachments");
+    wrap.innerHTML = "";
+    for (let i = 0; i < state.pendingAttachments.length; i++) {
+        const a = state.pendingAttachments[i];
+        const chip = document.createElement("div");
+        chip.className = "attachment-chip" + (a._uploading ? " uploading" : "") + (a._error ? " error" : "");
+        chip.dataset.idx = i;
+        const thumb = document.createElement("div");
+        thumb.className = "thumb";
+        if (a.kind === "image") {
+            const img = document.createElement("img");
+            img.src = `${API}/api/v1/uploads/${encodeURIComponent(a.id)}`;
+            img.alt = a.name;
+            thumb.appendChild(img);
+        } else {
+            thumb.textContent = fileIconFor(a.kind);
+        }
+        const name = document.createElement("div");
+        name.className = "name";
+        name.textContent = a.name;
+        name.title = `${a.name} (${formatSize(a.size)}, ${a.kind})`;
+        const rm = document.createElement("button");
+        rm.className = "remove";
+        rm.title = "移除";
+        rm.textContent = "×";
+        rm.onclick = (e) => {
+            e.stopPropagation();
+            state.pendingAttachments.splice(i, 1);
+            renderPendingAttachments();
+        };
+        chip.append(thumb, name, rm);
+        wrap.appendChild(chip);
+    }
+}
+
+function formatSize(n) {
+    if (!n) return "0 B";
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+// uploadOneFile POSTs a single file to /api/v1/uploads and
+// returns the metadata. Errors are surfaced via toast and a
+// short-lived "error" chip (the user can × it and retry).
+async function uploadOneFile(file) {
+    const idx = state.pendingAttachments.length;
+    const placeholder = {
+        id: "", name: file.name, size: file.size,
+        kind: "file", mime: file.type || "",
+        _uploading: true, _error: false,
+    };
+    state.pendingAttachments.push(placeholder);
+    renderPendingAttachments();
+    const fd = new FormData();
+    fd.append("file", file);
+    try {
+        const res = await fetch(`${API}/api/v1/uploads`, { method: "POST", body: fd });
+        if (!res.ok) {
+            const t = await res.text();
+            throw new Error(`HTTP ${res.status}: ${t}`);
+        }
+        const meta = await res.json();
+        state.pendingAttachments[idx] = {
+            id: meta.id, name: meta.name, size: meta.size,
+            kind: meta.kind, mime: meta.mime,
+        };
+        renderPendingAttachments();
+    } catch (e) {
+        // Mark the placeholder as failed; user can × and retry.
+        state.pendingAttachments[idx]._uploading = false;
+        state.pendingAttachments[idx]._error = true;
+        renderPendingAttachments();
+        toast(`上传失败: ${e.message}`, "error");
+    }
+}
+
 // ---------- Event handlers ----------
 $("send").addEventListener("click", () => {
     const input = $("input");
@@ -1903,6 +2111,22 @@ $("new-session").addEventListener("click", async () => {
     // running in the background. The user just navigates to a
     // fresh session; the old one completes automatically.
     await createSession();
+});
+
+// Attach-file button: opens the native file picker. The
+// <input type="file" multiple> is hidden; we click it
+// programmatically. After the user picks, we upload each file
+// in parallel — the chips appear in pending state and become
+// real once the upload completes.
+$("attach-btn").addEventListener("click", () => {
+    $("attach-input").click();
+});
+$("attach-input").addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = ""; // reset so the same file can be picked again
+    for (const f of files) {
+        uploadOneFile(f);
+    }
 });
 
 // Settings modal wiring

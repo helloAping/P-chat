@@ -33,8 +33,9 @@ type Agent struct {
 	cfg      *config.Config
 	skills   []skill.Skill
 	rules    []rules.Rule
-	sandbox  tool.SandboxChecker // optional; nil disables sandbox enforcement
-	options  llm.ChatOptions     // per-request sampling; populated from cfg
+	sandbox  tool.SandboxChecker    // optional; nil disables sandbox enforcement
+	options  llm.ChatOptions        // per-request sampling; populated from cfg
+	attach   AttachmentResolver     // optional; turns Attachment IDs into file paths for upload expansion
 
 	// bypassOnce, when true, makes the NEXT tool call skip the
 	// sandbox check (set by /unsafe once). Reset after the call.
@@ -91,6 +92,32 @@ func New(cfg *config.Config, llmClient *llm.Client, styleMgr *style.Manager, sto
 	}
 }
 
+// SetAttachmentResolver installs the resolver that turns
+// ChatRequest.Attachments (file ids posted by the client) into
+// on-disk paths. Pass nil to disable attachment expansion (the
+// caller is responsible for setting a non-nil resolver when
+// SendMessageRequest.Attachments may be non-empty).
+func (a *Agent) SetAttachmentResolver(r AttachmentResolver) {
+	a.attach = r
+}
+
+// protocolFor returns the configured protocol ("openai" /
+// "anthropic" / ...) for the given provider name. Falls back to
+// "openai" when the provider is unknown — the existing LLM
+// client already falls back to OpenAI shape in that case so
+// attachment expansion does the same.
+func (a *Agent) protocolFor(providerName string) string {
+	if a.cfg == nil {
+		return "openai"
+	}
+	for _, p := range a.cfg.LLM.Providers {
+		if p.Name == providerName {
+			return p.GetProtocol()
+		}
+	}
+	return "openai"
+}
+
 type ChatRequest struct {
 	Style    style.Style   `json:"style"`
 	Messages []llm.Message `json:"messages"`
@@ -100,7 +127,15 @@ type ChatRequest struct {
 	// providerEntry.model). When empty, the provider's default
 	// applies. This is what lets multiple sessions on the same
 	// provider use different models concurrently without racing.
-	Model    string        `json:"model,omitempty"`
+	Model string `json:"model,omitempty"`
+	// Attachments are file ids the user attached to this turn.
+	// Resolved to on-disk paths via the agent's AttachmentResolver
+	// and expanded into the last user message's MultiContent
+	// before being sent to the LLM. Nil/empty = no attachments.
+	// Both OpenAI and Anthropic protocols consume the same
+	// MultiContent representation at this layer; the LLM client
+	// serialises per protocol at the wire boundary.
+	Attachments []Attachment `json:"attachments,omitempty"`
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools. The agent will
 	// inject a system hint and skip the tool loop.
@@ -348,6 +383,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 		}
 		msgs = append(msgs, req.Messages...)
+
+		// Expand any user-uploaded attachments into the trailing
+		// user message's MultiContent. The expansion is
+		// protocol-agnostic at the agent layer — both OpenAI and
+		// Anthropic consume the same MultiContent representation
+		// (text + image_url parts); the LLM client serialises
+		// per protocol at the wire boundary.
+		if len(req.Attachments) > 0 && a.attach != nil {
+			protocol := a.protocolFor(req.Provider)
+			msgs = ExpandAttachments(protocol, msgs, req.Attachments, a.attach)
+			ch <- ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))}
+		}
 
 		if a.store != nil {
 			ch <- ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入 %d 条消息到记忆", len(req.Messages))}

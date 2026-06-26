@@ -36,8 +36,44 @@ func NewAnthropicClient(baseURL, apiKey, model string) *AnthropicClient {
 }
 
 type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string             `json:"role"`
+	Content anthropicBlocksRaw `json:"content"`
+}
+
+// anthropicBlocksRaw is the wire format of an Anthropic message
+// content field. Anthropic accepts a plain string for single-text
+// messages and a JSON array of content blocks for multi-part
+// (text + image / document / tool_use). We always send the
+// array form here — it's accepted by every modern Claude model
+// and lets the agent layer stay protocol-agnostic when it
+// builds the message list.
+type anthropicBlocksRaw []anthropicContentBlock
+
+func (b anthropicBlocksRaw) MarshalJSON() ([]byte, error) {
+	if len(b) == 0 {
+		return []byte(`""`), nil
+	}
+	if len(b) == 1 && b[0].Type == "text" {
+		// Single text block → emit as a plain string for
+		// compatibility with older Claude models.
+		return json.Marshal(b[0].Text)
+	}
+	return json.Marshal([]anthropicContentBlock(b))
+}
+
+type anthropicContentBlock struct {
+	Type   string                  `json:"type"`
+	Text   string                  `json:"text,omitempty"`
+	Source *anthropicContentSource  `json:"source,omitempty"`
+}
+
+// anthropicContentSource is the per-block source field. Used by
+// image and document blocks.
+type anthropicContentSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 type anthropicRequest struct {
@@ -46,11 +82,6 @@ type anthropicRequest struct {
 	Messages  []anthropicMessage `json:"messages"`
 	Stream    bool               `json:"stream"`
 	System    string             `json:"system,omitempty"`
-}
-
-type anthropicContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
 }
 
 type anthropicResponse struct {
@@ -97,7 +128,11 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 	go func() {
 		defer close(ch)
 
-		// Convert messages: separate system from user/assistant
+		// Convert messages: separate system from user/assistant,
+		// and translate OpenAI-shaped MultiContent (text + image_url)
+		// into Anthropic content blocks. A message that has no
+		// MultiContent falls back to a single text block; a message
+		// that has MultiContent becomes a list of typed blocks.
 		var systemMsg string
 		var anthropicMsgs []anthropicMessage
 
@@ -112,7 +147,7 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 			default:
 				anthropicMsgs = append(anthropicMsgs, anthropicMessage{
 					Role:    msg.Role,
-					Content: msg.Content,
+					Content: openAIToAnthropicContent(msg),
 				})
 			}
 		}
@@ -232,7 +267,7 @@ func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages [
 		default:
 			anthropicMsgs = append(anthropicMsgs, anthropicMessage{
 				Role:    msg.Role,
-				Content: msg.Content,
+				Content: openAIToAnthropicContent(msg),
 			})
 		}
 	}
@@ -286,4 +321,100 @@ func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages [
 	}
 
 	return result.Content[0].Text, nil
+}
+
+// openAIToAnthropicContent converts a single OpenAI-shaped
+// ChatCompletionMessage into Anthropic content blocks. The
+// message may carry a plain text Content, a MultiContent array
+// of text + image_url parts, or both — in any case we emit the
+// right Anthropic-side shape:
+//
+//   - Plain text only: a single text block. (MarshalJSON then
+//     downgrades the array to a JSON string for older models.)
+//   - Mixed: a list of text + image blocks. Image blocks carry
+//     a base64 source with the data URL decomposed into
+//     media_type + raw data.
+//
+// We deliberately don't translate OpenAI's "input_audio" part
+// because the agent layer doesn't synthesize one — audio
+// attachments fall through as text markers (see
+// internal/agent/attachment.go).
+func openAIToAnthropicContent(msg Message) anthropicBlocksRaw {
+	if len(msg.MultiContent) == 0 {
+		// Plain text path. The empty-block case (no MultiContent
+		// and no Content) emits an empty string so the request
+		// stays well-formed for both legacy and modern models.
+		return anthropicBlocksRaw{{Type: "text", Text: msg.Content}}
+	}
+
+	out := make(anthropicBlocksRaw, 0, len(msg.MultiContent))
+	for _, p := range msg.MultiContent {
+		switch p.Type {
+		case "text":
+			out = append(out, anthropicContentBlock{Type: "text", Text: p.Text})
+		case "image_url":
+			if p.ImageURL == nil {
+				continue
+			}
+			mime, data, ok := splitDataURL(p.ImageURL.URL)
+			if !ok {
+				// Not a data: URL (could be a remote https://
+				// URL). Anthropic also accepts URL sources
+				// for vision, so forward it as-is.
+				out = append(out, anthropicContentBlock{
+					Type:   "image",
+					Source: &anthropicContentSource{Type: "url", URL: p.ImageURL.URL},
+				})
+				continue
+			}
+			out = append(out, anthropicContentBlock{
+				Type: "image",
+				Source: &anthropicContentSource{
+					Type:      "base64",
+					MediaType: mime,
+					Data:      data,
+				},
+			})
+		default:
+			// Unknown / unsupported part type (e.g. input_audio).
+			// Don't drop silently — keep the model aware of
+			// what was attached by emitting a text marker.
+			out = append(out, anthropicContentBlock{
+				Type: "text",
+				Text: fmt.Sprintf("(unsupported content part: type=%s)", p.Type),
+			})
+		}
+	}
+	return out
+}
+
+// splitDataURL parses "data:<mime>;base64,<data>" into its
+// components. Returns ok=false if the input isn't a data URL
+// at all (callers should fall back to a URL source).
+func splitDataURL(s string) (mime string, data string, ok bool) {
+	const prefix = "data:"
+	if len(s) < len(prefix) || s[:len(prefix)] != prefix {
+		return "", "", false
+	}
+	rest := s[len(prefix):]
+	// Find the ";base64," marker; anything before is the mime
+	// type, anything after is the base64 payload.
+	const sep = ";base64,"
+	idx := -1
+	if len(rest) >= len(sep) && rest[len(rest)-len(sep):] == sep {
+		// trailing ";base64,"
+		idx = len(rest) - len(sep)
+	} else {
+		// find ";base64," anywhere
+		for i := 0; i+len(sep) <= len(rest); i++ {
+			if rest[i:i+len(sep)] == sep {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		return "", "", false
+	}
+	return rest[:idx], rest[idx+len(sep):], true
 }
