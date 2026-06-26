@@ -6,7 +6,7 @@
 // insensitively. Unknown commands fall through to the normal send
 // path so the LLM can answer "what is /foo?" questions naturally.
 
-import { onMounted, ref } from 'vue'
+import { h, onMounted, ref } from 'vue'
 import { NInput, NButton, NSpace, NScrollbar, useMessage } from 'naive-ui'
 import * as api from '../api/client'
 import {
@@ -301,8 +301,16 @@ import { computed } from 'vue'
 // both the active provider and the active model in a single
 // onChange — which is what makes the "merged" picker feel native.
 interface ModelOption {
+  // Two-line label: primary (display_name or name) + a
+  // sub-line of "model-id · 128k · 👁 · ⭐". The sub-line is
+  // styled by renderLabel (see template) — it never
+  // appears in the small pill when the option is selected.
   label: string
   value: string
+  // Sub-line is rendered separately so it can be styled
+  // differently. We pass it through to render-label via the
+  // option's `value` key.
+  meta?: string
 }
 interface GroupOption {
   type: 'group'
@@ -311,7 +319,7 @@ interface GroupOption {
 }
 type SelectOption = ModelOption | GroupOption
 
-const providers = ref<any[]>([])
+const providers = ref<api.ProviderInfo[]>([])
 const modelOptions = ref<SelectOption[]>([])
 const styleOptions = ref<{ label: string; value: string }[]>([])
 
@@ -331,26 +339,60 @@ async function loadConfig() {
   } catch { /* ignore */ }
 }
 
+// fmtContext turns a raw token count into a compact human
+// string ("128k", "1.5m", "8k"). Returns "" for 0/unknown so
+// the sub-line is short.
+function fmtContext(n?: number) {
+  if (!n || n <= 0) return ''
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}m`
+  if (n >= 1024) return `${Math.round(n / 1024)}k`
+  return String(n)
+}
+
 function rebuildModelOptions() {
   const groups: GroupOption[] = []
   for (const p of providers.value) {
     const ms: ModelOption[] = []
     // Multi-model form (preferred).
     for (const m of (p.models || [])) {
-      const name = m.name || m
-      const tag = m.supports_vision ? ' · 👁' : ''
-      const display = (m.display_name || name) + tag
-      ms.push({ label: display, value: `${p.name}::${name}` })
+      const name = m.name
+      const primary = m.display_name || name
+      // Build the sub-line: "id · 128k · vision · default"
+      const subParts: string[] = []
+      subParts.push(name)
+      const ctx = fmtContext(m.max_tokens_context)
+      if (ctx) subParts.push(ctx)
+      if (m.capabilities?.supports_vision) subParts.push('视觉')
+      if (m.default) subParts.push('默认')
+      ms.push({
+        label: primary,
+        value: `${p.name}::${name}`,
+        meta: subParts.join(' · '),
+      })
     }
     // Legacy single-`model` form (when p.models is empty).
     if (ms.length === 0 && p.model) {
-      ms.push({ label: p.model, value: `${p.name}::${p.model}` })
+      ms.push({ label: p.model, value: `${p.name}::${p.model}`, meta: p.model })
     }
     if (ms.length > 0) {
       groups.push({ type: 'group', label: p.name, children: ms })
     }
   }
   modelOptions.value = groups
+}
+
+// renderLabel is the slot the NSelect uses for each option
+// in the dropdown panel. The compact-pill (`render-tag`)
+// view is handled by the default NSelect behaviour — the
+// model name alone is fine when the option is collapsed.
+function renderLabel(option: any) {
+  if (!option || option.type === 'group') return option?.label || ''
+  const meta = option.meta as string | undefined
+  if (!meta || meta === option.label) return option.label
+  return h('div', { class: 'model-option' }, [
+    h('div', { class: 'model-option-primary' }, option.label),
+    h('div', { class: 'model-option-meta' }, meta),
+  ])
 }
 
 function currentSelection(): string {
@@ -508,7 +550,8 @@ onMounted(() => {
           :disabled="!state.currentID"
           filterable
           class="picker picker-wide"
-          title="选择模型 (按提供商分组; 👁 表示支持图片输入)"
+          :render-label="renderLabel"
+          title="选择模型 (按提供商分组; ⭐ 默认 · 视觉 = 支持图片)"
           placeholder="选择模型"
         />
       </div>
@@ -658,6 +701,25 @@ onMounted(() => {
   min-width: 180px;
   max-width: 240px;
   flex: 1 1 180px;
+}
+
+/* Two-line model option in the dropdown panel. The primary
+   line is the display_name (bold-ish); the sub-line carries
+   the model id, context size, and capability badges. */
+.model-option {
+  display: flex; flex-direction: column;
+  line-height: 1.25;
+  padding: 2px 0;
+}
+.model-option-primary {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-1);
+}
+.model-option-meta {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 1px;
 }
 
 /* The input area must be height-bounded: with many attachments

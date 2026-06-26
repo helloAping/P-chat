@@ -4,31 +4,75 @@
 //   1. LLM 提供商 — provider / model / API key CRUD
 //   2. 风格配置   — built-in + user-added style CRUD
 //
-// The previous incarnation conflated the two; tabbing them out gives
-// each section enough room to be useful on its own and matches the
-// way the user thinks about the data (one is per-session config, the
-// other is global).
+// Providers tab is a left/right split:
+//   - Left column: provider list (name + protocol + model count +
+//     default tag). Click to select. "+" adds a new provider.
+//   - Right column: detail pane for the selected provider. Shows
+//     a top "basic" form (name / protocol / base_url / api_key /
+//     default toggle) and a bottom model table (per-model
+//     display_name / context / max_tokens / capabilities).
+//     Each model row has edit / set-default / delete actions; the
+//     table footer has a "+ 添加模型" button.
+//
+// The form is intentionally a single form covering the whole
+// provider — name and protocol are editable on existing entries
+// (the unified PATCH endpoint supports renames and protocol
+// switches). The "保存" button only sends the fields the user
+// actually changed, mirroring the backend's "non-empty means
+// write, otherwise leave alone" contract.
 
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
-  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, useMessage,
+  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NTooltip, NIcon, useMessage,
 } from 'naive-ui'
 import * as api from '../api/client'
 
 const message = useMessage()
 const tab = ref<'providers' | 'styles'>('providers')
 
-// --- Provider state (unchanged behaviour, just moved into its own tab) ---
-const providers = ref<any[]>([])
+// --- Provider state ---
+const providers = ref<api.ProviderInfo[]>([])
+const selectedName = ref<string | null>(null)
+const selected = computed(() =>
+  providers.value.find(p => p.name === selectedName.value) || null,
+)
+
+// Edit form (top of right pane). Mirrors the unified PATCH body.
+const editName = ref('')
+const editProtocol = ref<'openai' | 'anthropic'>('openai')
+const editBaseURL = ref('')
+const editAPIKey = ref('')
+const editIsDefault = ref(false)
+
+// Track which fields the user actually touched so we only PATCH
+// the dirty ones. The backend treats non-empty values as "set"
+// and empty values as "leave alone", so this list is the
+// source of truth for the request body.
+const dirty = ref<Set<string>>(new Set())
+
+// Add-provider form
 const showAddProvider = ref(false)
 const newName = ref('')
 const newProtocol = ref<'openai' | 'anthropic'>('openai')
 const newBaseURL = ref('')
 const newAPIKey = ref('')
 const newModel = ref('')
-const activeProvider = ref<string | null>(null)
-const editAPIKey = ref('')
+
+// Add-model form
+const showAddModel = ref(false)
+const newModelName = ref('')
+const newModelDisplay = ref('')
+const newModelCtx = ref<number | null>(null)
+const newModelOut = ref<number | null>(null)
+const newModelVision = ref(false)
+
+// Edit-model form (re-uses showAddModel for layout).
+const editingModelName = ref<string | null>(null)
+const editModelDisplay = ref('')
+const editModelCtx = ref<number | null>(null)
+const editModelOut = ref<number | null>(null)
+const editModelVision = ref(false)
 
 // --- Style state ---
 const styles = ref<api.StyleInfo[]>([])
@@ -52,6 +96,16 @@ async function refreshProviders() {
   try {
     const p = await api.listProviders()
     providers.value = p.providers || []
+    // If nothing is selected yet, pick the first one so the
+    // right pane is never empty.
+    if (!selectedName.value && providers.value.length > 0) {
+      selectProvider(providers.value[0].name)
+    } else if (selectedName.value && !providers.value.find(x => x.name === selectedName.value)) {
+      // The selected provider just got deleted; fall back to
+      // the first remaining one (or nothing).
+      selectedName.value = providers.value[0]?.name ?? null
+      if (selectedName.value) hydrateEditForm(selectedName.value)
+    }
   } catch (e: any) {
     message.error(`加载 providers 失败: ${e.message}`)
   }
@@ -66,7 +120,32 @@ async function refreshStyles() {
   }
 }
 
-// --- Provider handlers (unchanged) ---
+function selectProvider(name: string) {
+  selectedName.value = name
+  hydrateEditForm(name)
+}
+
+// hydrateEditForm copies the server-resolved fields into the
+// edit form. dirty is reset so an out-of-band server change
+// doesn't get clobbered.
+function hydrateEditForm(name: string) {
+  const p = providers.value.find(x => x.name === name)
+  if (!p) return
+  editName.value = p.name
+  editProtocol.value = (p.protocol as 'openai' | 'anthropic') || 'openai'
+  editBaseURL.value = p.base_url
+  editAPIKey.value = p.api_key
+  editIsDefault.value = p.is_default
+  dirty.value = new Set()
+}
+
+function markDirty(field: string) {
+  dirty.value.add(field)
+}
+
+function resetDirty() { dirty.value = new Set() }
+
+// --- Provider handlers ---
 
 async function onAddProvider() {
   if (!newName.value.trim() || !newProtocol.value || !newModel.value.trim()) {
@@ -85,13 +164,14 @@ async function onAddProvider() {
     showAddProvider.value = false
     newName.value = ''; newBaseURL.value = ''; newAPIKey.value = ''; newModel.value = ''
     await refreshProviders()
+    selectProvider(newName.value.trim())
   } catch (e: any) {
     message.error(`添加失败: ${e.message}`)
   }
 }
 
 async function onDeleteProvider(name: string) {
-  if (!window.confirm(`确定删除 provider "${name}"?`)) return
+  if (!window.confirm(`确定删除 provider "${name}"? 该 provider 下的所有模型配置也会被删除。`)) return
   try {
     await api.deleteProvider(name)
     message.success('已删除')
@@ -101,25 +181,157 @@ async function onDeleteProvider(name: string) {
   }
 }
 
-async function onSetDefaultProvider(name: string) {
+async function onSaveProvider() {
+  if (!selected.value) return
+  const name = selected.value.name
+  if (dirty.value.size === 0) {
+    message.info('没有改动')
+    return
+  }
+  // Build a PATCH body with only the dirty fields. The server
+  // treats empty strings as "leave alone" for every field
+  // except api_key, which we always send when the user
+  // touched the form (even if they only "re-typed" the same
+  // value — the user explicitly edited the field, so we
+  // honour that). The rename is a separate concern.
+  const body: api.UpdateProviderRequest = {}
+  if (dirty.value.has('name') && editName.value.trim() && editName.value.trim() !== name) {
+    body.name = editName.value.trim()
+  }
+  if (dirty.value.has('protocol')) {
+    body.protocol = editProtocol.value
+  }
+  if (dirty.value.has('base_url')) {
+    body.base_url = editBaseURL.value.trim()
+  }
+  if (dirty.value.has('api_key')) {
+    body.api_key = editAPIKey.value
+  }
+  if (dirty.value.has('is_default') && editIsDefault.value) {
+    body.set_default = true
+  }
   try {
-    await api.setDefaultProvider(name)
-    message.success(`已设为默认: ${name}`)
+    const updated = await api.updateProvider(name, body)
+    message.success('已保存')
     await refreshProviders()
+    // If renamed, the new name is in the response; select it
+    // so the user can keep editing.
+    selectProvider(updated.name)
   } catch (e: any) {
-    message.error(`设置失败: ${e.message}`)
+    message.error(`保存失败: ${e.message}`)
   }
 }
 
-async function onSaveAPIKey() {
-  if (!activeProvider.value) return
+// --- Model handlers ---
+
+async function onAddModel() {
+  if (!selected.value) return
+  if (!newModelName.value.trim()) {
+    message.warning('模型名称为必填')
+    return
+  }
+  const providerName = selected.value.name
+  const modelName = newModelName.value.trim()
   try {
-    await api.setProviderAPIKey(activeProvider.value, editAPIKey.value)
-    message.success('已保存 API Key')
-    activeProvider.value = null
-    editAPIKey.value = ''
+    await api.addModel(providerName, {
+      name: modelName,
+      display_name: newModelDisplay.value.trim() || undefined,
+      max_tokens_context: newModelCtx.value ?? undefined,
+      max_tokens_output: newModelOut.value ?? undefined,
+    })
+    // The capabilities block is a separate PATCH; if it
+    // fails, the model is still created — surface the error
+    // but don't roll back.
+    if (newModelVision.value) {
+      try {
+        await api.setModelCapabilities(providerName, modelName, {
+          supports_vision: true,
+          context_window: newModelCtx.value ?? 0,
+        })
+      } catch (capErr: any) {
+        message.warning(`模型已添加, 但能力标记失败: ${capErr.message}`)
+      }
+    }
+    message.success('已添加模型')
+    showAddModel.value = false
+    newModelName.value = ''; newModelDisplay.value = ''
+    newModelCtx.value = null; newModelOut.value = null; newModelVision.value = false
+    await refreshProviders()
+  } catch (e: any) {
+    message.error(`添加失败: ${e.message}`)
+  }
+}
+
+function onEditModel(m: api.ModelInfo) {
+  if (!selected.value) return
+  editingModelName.value = m.name
+  editModelDisplay.value = m.display_name || ''
+  editModelCtx.value = m.max_tokens_context ?? null
+  editModelOut.value = m.max_tokens_output ?? null
+  editModelVision.value = !!m.capabilities?.supports_vision
+  showAddModel.value = true
+}
+
+async function onSaveModel() {
+  if (!selected.value || !editingModelName.value) return
+  const provider = selected.value.name
+  const model = editingModelName.value
+  try {
+    // updateModel semantics: 0 / "" in a numeric field means
+    // "leave alone" (see internal/config/manager.go
+    // UpdateModel). So we only send positive values; the
+    // capabilities PATCH (which always replaces the block)
+    // carries the rest.
+    const ctx = editModelCtx.value && editModelCtx.value > 0 ? editModelCtx.value : 0
+    const out = editModelOut.value && editModelOut.value > 0 ? editModelOut.value : 0
+    await api.updateModel(provider, model, {
+      display_name: editModelDisplay.value,
+      max_tokens_context: ctx,
+      max_tokens_output: out,
+    })
+    await api.setModelCapabilities(provider, model, {
+      supports_vision: editModelVision.value,
+      context_window: editModelCtx.value ?? 0,
+    })
+    message.success('已保存')
+    onCancelEditModel()
+    await refreshProviders()
   } catch (e: any) {
     message.error(`保存失败: ${e.message}`)
+  }
+}
+
+function onCancelEditModel() {
+  showAddModel.value = false
+  editingModelName.value = null
+  editModelDisplay.value = ''
+  editModelCtx.value = null
+  editModelOut.value = null
+  editModelVision.value = false
+  newModelName.value = ''; newModelDisplay.value = ''
+  newModelCtx.value = null; newModelOut.value = null; newModelVision.value = false
+}
+
+async function onDeleteModel(model: string) {
+  if (!selected.value) return
+  if (!window.confirm(`确定删除模型 "${model}"?`)) return
+  try {
+    await api.deleteModel(selected.value.name, model)
+    message.success('已删除')
+    await refreshProviders()
+  } catch (e: any) {
+    message.error(`删除失败: ${e.message}`)
+  }
+}
+
+async function onSetDefaultModel(model: string) {
+  if (!selected.value) return
+  try {
+    await api.setDefaultModel(selected.value.name, model)
+    message.success(`已设为默认模型: ${model}`)
+    await refreshProviders()
+  } catch (e: any) {
+    message.error(`设置失败: ${e.message}`)
   }
 }
 
@@ -198,71 +410,227 @@ async function onDeleteStyle(id: string) {
   }
 }
 
-// Cancel/close handlers.
-
 function close() { (window as any).closeAppSettings?.() }
 function closeStyleEditor() { showAddStyle.value = false; resetNewStyle() }
 
-// Built-in style ids that are read-only on the API; the UI mirrors
-// that so the user doesn't get a misleading 400 when they click
-// edit / delete on a built-in.
 const builtInStyles = new Set(['cute', 'guofeng', 'tech'])
 function isBuiltIn(id: string) { return builtInStyles.has(id) }
+
+// protocol options reused in two places.
+const protocolOptions = [
+  { label: 'OpenAI 兼容', value: 'openai' },
+  { label: 'Anthropic (Claude)', value: 'anthropic' },
+]
+
+// model-table row helpers
+function fmtContext(n?: number) {
+  if (!n || n <= 0) return '—'
+  if (n >= 1024) return `${Math.round(n / 1024)}k`
+  return String(n)
+}
 </script>
 
 <template>
-  <NModal :show="true" @update:show="close" preset="card" title="应用设置" style="width: 760px; max-height: 80vh; overflow: auto">
-    <NTabs v-model:value="tab" type="line" animated>
-      <NTabPane name="providers" tab="LLM 提供商">
-        <NSpace vertical size="large">
-          <div>
-            <h3 class="section-title">已配置的 LLM 提供商</h3>
-            <NSpace vertical size="small">
-              <div v-for="p in providers" :key="p.name" class="provider-row">
-                <div class="provider-meta">
-                  <NTag :type="p.is_default ? 'success' : 'default'" size="small" style="margin-right: 6px">
-                    {{ p.is_default ? '默认' : '备选' }}
-                  </NTag>
-                  <strong>{{ p.name }}</strong>
-                  <span class="muted">({{ p.protocol }} · {{ p.model }})</span>
-                </div>
-                <NSpace size="small">
-                  <NButton size="small" @click="activeProvider = p.name; editAPIKey = ''">修改 Key</NButton>
-                  <NButton size="small" v-if="!p.is_default" @click="onSetDefaultProvider(p.name)">设为默认</NButton>
-                  <NButton size="small" v-if="!p.is_default" type="error" ghost @click="onDeleteProvider(p.name)">删除</NButton>
-                </NSpace>
-              </div>
-            </NSpace>
-            <NSpace style="margin-top: 8px">
-              <NButton size="small" @click="showAddProvider = !showAddProvider" type="primary" ghost>
-                {{ showAddProvider ? '取消' : '+ 添加 Provider' }}
+  <NModal :show="true" @update:show="close" preset="card" title="应用设置" style="width: 920px; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column">
+    <NTabs v-model:value="tab" type="line" animated style="flex: 1; min-height: 0; display: flex; flex-direction: column">
+      <NTabPane name="providers" tab="LLM 提供商" style="flex: 1; min-height: 0; overflow: auto">
+        <div class="providers-split">
+          <!-- Left: provider list -->
+          <div class="provider-list">
+            <div class="provider-list-header">
+              <span class="list-title">提供商 ({{ providers.length }})</span>
+              <NButton size="tiny" type="primary" ghost @click="showAddProvider = !showAddProvider">
+                {{ showAddProvider ? '取消' : '+ 新增' }}
               </NButton>
-            </NSpace>
+            </div>
             <div v-if="showAddProvider" class="add-form">
               <NSpace vertical size="small">
-                <NInput v-model:value="newName" placeholder="名称 (例: my-openai)" size="small" />
-                <NSelect
-                  v-model:value="newProtocol"
-                  :options="[{label:'openai',value:'openai'},{label:'anthropic',value:'anthropic'}]"
-                  size="small"
-                />
-                <NInput v-model:value="newBaseURL" placeholder="Base URL (可空)" size="small" />
-                <NInput v-model:value="newAPIKey" placeholder="API Key (可空)" type="password" size="small" show-password-on="click" />
-                <NInput v-model:value="newModel" placeholder="默认模型名 (例: gpt-4o-mini)" size="small" />
-                <NButton type="primary" size="small" @click="onAddProvider">提交</NButton>
+                <NInput v-model:value="newName" placeholder="名称" size="tiny" />
+                <NSelect v-model:value="newProtocol" :options="protocolOptions" size="tiny" />
+                <NInput v-model:value="newBaseURL" placeholder="Base URL" size="tiny" />
+                <NInput v-model:value="newAPIKey" placeholder="API Key" type="password" size="tiny" show-password-on="click" />
+                <NInput v-model:value="newModel" placeholder="默认模型" size="tiny" />
+                <NButton type="primary" size="tiny" @click="onAddProvider">提交</NButton>
               </NSpace>
+            </div>
+            <div class="provider-items">
+              <div
+                v-for="p in providers"
+                :key="p.name"
+                class="provider-item"
+                :class="{ active: p.name === selectedName }"
+                @click="selectProvider(p.name)"
+              >
+                <div class="provider-item-head">
+                  <NTag v-if="p.is_default" type="success" size="tiny" :bordered="false">默认</NTag>
+                  <strong class="provider-item-name">{{ p.name }}</strong>
+                </div>
+                <div class="provider-item-sub">
+                  <NTag size="tiny" :bordered="false">{{ p.protocol }}</NTag>
+                  <span class="muted">{{ p.models?.length || 0 }} 模型</span>
+                </div>
+              </div>
+              <div v-if="providers.length === 0" class="muted empty-hint">还没有 provider</div>
             </div>
           </div>
 
-          <div v-if="activeProvider">
-            <h3 class="section-title">修改 API Key — {{ activeProvider }}</h3>
-            <NSpace>
-              <NInput v-model:value="editAPIKey" placeholder="新的 API Key" type="password" show-password-on="click" style="width: 360px" />
-              <NButton type="primary" @click="onSaveAPIKey">保存</NButton>
-              <NButton @click="activeProvider = null">取消</NButton>
-            </NSpace>
+          <!-- Right: detail pane -->
+          <div class="provider-detail">
+            <div v-if="!selected" class="muted empty-hint">← 选择左侧的 provider</div>
+            <template v-else>
+              <!-- Basic info form -->
+              <div class="detail-section">
+                <div class="detail-section-head">
+                  <h3 class="section-title">基本信息</h3>
+                  <NSpace>
+                    <NButton size="small" @click="onSaveProvider" type="primary" :disabled="dirty.size === 0">
+                      保存
+                    </NButton>
+                    <NButton size="small" @click="hydrateEditForm(selected.name)" :disabled="dirty.size === 0">重置</NButton>
+                    <NPopconfirm
+                      v-if="!selected.is_default"
+                      @positive-click="onDeleteProvider(selected.name)"
+                      positive-text="删除"
+                      negative-text="取消"
+                    >
+                      <template #trigger>
+                        <NButton size="small" type="error" ghost>删除 provider</NButton>
+                      </template>
+                      确定删除 provider "{{ selected.name }}" 及其下所有模型？
+                    </NPopconfirm>
+                    <NTag v-else size="small" :bordered="false" type="default">默认 provider 不可删除</NTag>
+                  </NSpace>
+                </div>
+                <div class="detail-form">
+                  <NSpace vertical size="small">
+                    <div class="form-row">
+                      <span class="form-label">名称</span>
+                      <NInput
+                        v-model:value="editName"
+                        size="small"
+                        :status="dirty.has('name') && editName.trim() === selected.name ? 'warning' : undefined"
+                        @update:value="markDirty('name')"
+                      />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">协议</span>
+                      <NSelect
+                        v-model:value="editProtocol"
+                        :options="protocolOptions"
+                        size="small"
+                        @update:value="markDirty('protocol')"
+                      />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">Base URL</span>
+                      <NInput
+                        v-model:value="editBaseURL"
+                        size="small"
+                        placeholder="https://api.openai.com/v1"
+                        @update:value="markDirty('base_url')"
+                      />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">API Key</span>
+                      <NInput
+                        v-model:value="editAPIKey"
+                        size="small"
+                        type="password"
+                        show-password-on="click"
+                        placeholder="sk-..."
+                        @update:value="markDirty('api_key')"
+                      />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">设为默认</span>
+                      <NSwitch
+                        :value="editIsDefault"
+                        :disabled="selected.is_default"
+                        @update:value="(v: boolean) => { editIsDefault = v; markDirty('is_default') }"
+                      />
+                      <span v-if="selected.is_default" class="muted form-hint">当前已是默认</span>
+                    </div>
+                  </NSpace>
+                </div>
+              </div>
+
+              <!-- Model table -->
+              <div class="detail-section">
+                <div class="detail-section-head">
+                  <h3 class="section-title">模型 ({{ selected.models?.length || 0 }})</h3>
+                  <NButton size="small" type="primary" ghost @click="onCancelEditModel(); showAddModel = !showAddModel">
+                    {{ showAddModel ? '取消' : '+ 添加模型' }}
+                  </NButton>
+                </div>
+                <div v-if="showAddModel" class="add-form">
+                  <NSpace vertical size="small">
+                    <div v-if="editingModelName" class="muted form-hint">编辑模型: <code>{{ editingModelName }}</code></div>
+                    <NInput
+                      v-model:value="newModelName"
+                      :disabled="!!editingModelName"
+                      placeholder="模型 ID (例: gpt-4o-mini)"
+                      size="small"
+                    />
+                    <NInput v-model:value="newModelDisplay" placeholder="显示名 (例: GPT-4o mini)" size="small" />
+                    <div class="form-row">
+                      <span class="form-label">上下文 (tokens)</span>
+                      <NInputNumber v-model:value="newModelCtx" :min="0" :step="1024" placeholder="例: 128000" size="small" style="flex: 1" />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">最大输出 (tokens)</span>
+                      <NInputNumber v-model:value="newModelOut" :min="0" :step="512" placeholder="例: 4096" size="small" style="flex: 1" />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">支持视觉</span>
+                      <NSwitch v-model:value="newModelVision" />
+                    </div>
+                    <NSpace>
+                      <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">
+                        {{ editingModelName ? '保存修改' : '添加模型' }}
+                      </NButton>
+                      <NButton size="small" @click="onCancelEditModel">取消</NButton>
+                    </NSpace>
+                  </NSpace>
+                </div>
+                <table v-if="selected.models && selected.models.length" class="model-table">
+                  <thead>
+                    <tr>
+                      <th>模型</th>
+                      <th>显示名</th>
+                      <th>上下文</th>
+                      <th>输出上限</th>
+                      <th>能力</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="m in selected.models" :key="m.name" :class="{ 'is-default': m.default }">
+                      <td>
+                        <code class="model-id">{{ m.name }}</code>
+                        <NTag v-if="m.default" type="success" size="tiny" :bordered="false" style="margin-left: 6px">默认</NTag>
+                      </td>
+                      <td>{{ m.display_name || '—' }}</td>
+                      <td><span class="muted">{{ fmtContext(m.max_tokens_context) }}</span></td>
+                      <td><span class="muted">{{ m.max_tokens_output || '—' }}</span></td>
+                      <td>
+                        <NTag v-if="m.capabilities?.supports_vision" type="info" size="tiny" :bordered="false">👁 视觉</NTag>
+                        <span v-else class="muted">—</span>
+                      </td>
+                      <td>
+                        <NSpace size="small">
+                          <NButton size="tiny" @click="onEditModel(m)">编辑</NButton>
+                          <NButton v-if="!m.default" size="tiny" @click="onSetDefaultModel(m.name)">设为默认</NButton>
+                          <NButton size="tiny" type="error" ghost @click="onDeleteModel(m.name)">删除</NButton>
+                        </NSpace>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div v-else class="muted empty-hint">还没有模型。点击「+ 添加模型」配置。</div>
+              </div>
+            </template>
           </div>
-        </NSpace>
+        </div>
       </NTabPane>
 
       <NTabPane name="styles" tab="风格配置">
@@ -342,27 +710,136 @@ function isBuiltIn(id: string) { return builtInStyles.has(id) }
 </template>
 
 <style scoped>
-.section-title { margin: 0 0 8px 0; font-size: 13px; font-weight: 600; }
-.provider-row, .style-row {
+.section-title { margin: 0; font-size: 13px; font-weight: 600; }
+
+/* Providers tab — left/right split */
+.providers-split {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 12px;
+  height: 60vh;
+  min-height: 480px;
+}
+.provider-list {
+  border: 1px solid var(--border-2, #e5e7eb);
+  border-radius: 6px;
+  background: var(--bg-2, #fafafa);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.provider-list-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-2, #e5e7eb);
+  background: var(--bg-3, #f3f4f6);
+}
+.list-title { font-size: 12px; font-weight: 600; }
+.provider-items { flex: 1; overflow: auto; padding: 4px; }
+.provider-item {
+  padding: 8px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-bottom: 2px;
+  transition: background 0.15s;
+}
+.provider-item:hover { background: var(--bg-3, #f3f4f6); }
+.provider-item.active {
+  background: var(--primary-color, #18a058);
+  color: white;
+}
+.provider-item.active .muted { color: rgba(255,255,255,0.85); }
+.provider-item-head {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 2px;
+}
+.provider-item-name { font-size: 13px; }
+.provider-item-sub {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px;
+}
+
+.provider-detail {
+  border: 1px solid var(--border-2, #e5e7eb);
+  border-radius: 6px;
+  background: var(--bg-1, #fff);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.detail-section {
+  border-bottom: 1px solid var(--border-2, #e5e7eb);
+  padding: 12px 14px;
+}
+.detail-section:last-child { border-bottom: none; flex: 1; overflow: auto; }
+.detail-section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.detail-form { padding: 4px 0; }
+
+.form-row {
+  display: flex; align-items: center; gap: 10px;
+}
+.form-label {
+  font-size: 12px;
+  width: 100px;
+  color: var(--text-2);
+}
+.form-hint { font-size: 11px; }
+
+/* Model table */
+.model-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.model-table th {
+  text-align: left;
+  padding: 6px 8px;
+  font-weight: 600;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border-2, #e5e7eb);
+  background: var(--bg-2, #fafafa);
+}
+.model-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--border-2, #e5e7eb);
+  vertical-align: middle;
+}
+.model-table tr.is-default {
+  background: rgba(24, 160, 88, 0.05);
+}
+.model-id {
+  background: var(--bg-3, #f3f4f6);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+}
+
+.muted { color: var(--text-3); font-size: 12px; }
+.empty-hint { padding: 20px; text-align: center; }
+.add-form {
+  margin-top: 8px;
+  padding: 10px;
+  background: var(--bg-2, #fafafa);
+  border: 1px solid var(--border-2, #e5e7eb);
+  border-radius: 6px;
+}
+.style-row {
   display: flex; justify-content: space-between; align-items: center;
   padding: 8px 10px;
-  background: var(--bg-3);
+  background: var(--bg-3, #f3f4f6);
   border-radius: 6px;
   margin-bottom: 6px;
   gap: 12px;
 }
-.provider-meta, .style-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.style-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
 .style-desc {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   max-width: 480px;
 }
-.muted { color: var(--text-3); font-size: 12px; }
-.add-form {
-  margin-top: 8px; padding: 8px;
-  background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 6px;
-}
 code {
-  background: var(--bg-3); padding: 1px 6px; border-radius: 3px;
+  background: var(--bg-3, #f3f4f6); padding: 1px 6px; border-radius: 3px;
   font-family: ui-monospace, Menlo, monospace; font-size: 12px;
 }
 </style>

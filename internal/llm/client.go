@@ -193,9 +193,14 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelN
 
 	if p.protocol == "anthropic" {
 		// Anthropic support for tools is not implemented in this branch.
-		// Fall back to plain streaming (the anthropic client ignores
-		// opts for now).
-		return p.anthropic.ChatStream(ctx, model, messages)
+		// Resolve max_tokens the same way the OpenAI branch does
+		// (per-model MaxTokensOutput > global opts.MaxTokens > 0)
+		// and pass it through.
+		anthMax := opts.MaxTokens
+		if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
+			anthMax = mt
+		}
+		return p.anthropic.ChatStream(ctx, model, messages, anthMax)
 	}
 
 	// OpenAI protocol
@@ -296,7 +301,15 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 	}
 
 	if p.protocol == "anthropic" {
-		return p.anthropic.Chat(ctx, model, messages)
+		// Resolve max_tokens: per-model MaxTokensOutput > 0
+		// (Anthropic's API requires a positive value; we don't
+		// consult a global default here — the non-streaming Chat
+		// entry point doesn't take ChatOptions).
+		anthMax := 0
+		if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
+			anthMax = mt
+		}
+		return p.anthropic.Chat(ctx, model, messages, anthMax)
 	}
 
 	// OpenAI protocol

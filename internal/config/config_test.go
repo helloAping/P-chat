@@ -620,3 +620,194 @@ func TestStripBOM(t *testing.T) {
 		t.Errorf("short data should pass through unchanged")
 	}
 }
+
+// TestUpdateProvider_Rename_CascadesDefault verifies that
+// renaming a provider that is the global default also
+// updates cfg.LLM.Default.
+func TestUpdateProvider_Rename_CascadesDefault(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k", "model": "m" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := UpdateProvider("cs", ProviderPatch{Name: "cs-renamed"})
+	if err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	if updated.Name != "cs-renamed" {
+		t.Errorf("returned name = %q, want cs-renamed", updated.Name)
+	}
+	cfg, _ := Load("")
+	if cfg.LLM.Default != "cs-renamed" {
+		t.Errorf("default = %q, want cs-renamed (cascade)", cfg.LLM.Default)
+	}
+	if len(cfg.LLM.Providers) != 1 || cfg.LLM.Providers[0].Name != "cs-renamed" {
+		t.Errorf("provider list = %+v", cfg.LLM.Providers)
+	}
+}
+
+// TestUpdateProvider_Rename_CollisionRejected ensures a
+// rename that lands on an existing name is rejected before
+// disk is touched.
+func TestUpdateProvider_Rename_CollisionRejected(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://a", "api_key": "k1", "model": "m" },
+      { "name": "other", "protocol": "openai", "base_url": "http://b", "api_key": "k2", "model": "n" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	_, err := UpdateProvider("cs", ProviderPatch{Name: "other"})
+	if err == nil {
+		t.Fatal("expected collision error")
+	}
+	cfg, _ := Load("")
+	if cfg.LLM.Providers[0].Name != "cs" {
+		t.Errorf("provider name changed on error: %q", cfg.LLM.Providers[0].Name)
+	}
+}
+
+// TestUpdateProvider_ProtocolChange verifies that the
+// protocol field can be switched between openai/anthropic and
+// is persisted.
+func TestUpdateProvider_ProtocolChange(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k", "model": "m" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := UpdateProvider("cs", ProviderPatch{Protocol: "anthropic"})
+	if err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	if updated.GetProtocol() != "anthropic" {
+		t.Errorf("protocol = %q, want anthropic", updated.GetProtocol())
+	}
+	cfg, _ := Load("")
+	if cfg.LLM.Providers[0].GetProtocol() != "anthropic" {
+		t.Errorf("reloaded protocol = %q", cfg.LLM.Providers[0].GetProtocol())
+	}
+}
+
+// TestUpdateProvider_ProtocolInvalid verifies a typo in
+// the protocol field is rejected.
+func TestUpdateProvider_ProtocolInvalid(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k", "model": "m" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	_, err := UpdateProvider("cs", ProviderPatch{Protocol: "gopher"})
+	if err == nil {
+		t.Fatal("expected invalid protocol error")
+	}
+}
+
+// TestUpdateProvider_PartialPatch verifies that omitted
+// fields are left untouched: changing the base URL must not
+// wipe the API key.
+func TestUpdateProvider_PartialPatch(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://old", "api_key": "sk-original", "model": "m" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := UpdateProvider("cs", ProviderPatch{BaseURL: "http://new"})
+	if err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	if updated.BaseURL != "http://new" {
+		t.Errorf("BaseURL = %q, want http://new", updated.BaseURL)
+	}
+	if updated.APIKey != "sk-original" {
+		t.Errorf("APIKey = %q, want sk-original (must be preserved on partial patch)", updated.APIKey)
+	}
+}
+
+// TestUpdateProvider_SetDefault verifies IsDefault promotes
+// the target provider to the global default and leaves the
+// others alone.
+func TestUpdateProvider_SetDefault(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://a", "api_key": "k1", "model": "m" },
+      { "name": "newdefault", "protocol": "openai", "base_url": "http://b", "api_key": "k2", "model": "n" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpdateProvider("newdefault", ProviderPatch{IsDefault: true}); err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	cfg, _ := Load("")
+	if cfg.LLM.Default != "newdefault" {
+		t.Errorf("default = %q, want newdefault", cfg.LLM.Default)
+	}
+}
+
+// TestUpdateProvider_NotFound covers the simple
+// error case: target provider doesn't exist.
+func TestUpdateProvider_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{"llm":{"default":"cs","providers":[{"name":"cs","protocol":"openai","base_url":"http://x","api_key":"k","model":"m"}]}}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	_, err := UpdateProvider("ghost", ProviderPatch{Name: "new"})
+	if err == nil {
+		t.Fatal("expected not-found error")
+	}
+}

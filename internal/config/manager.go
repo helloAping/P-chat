@@ -122,6 +122,105 @@ func SetProviderAPIKey(name, apiKey string) error {
 	return fmt.Errorf("provider %q not found", name)
 }
 
+// ProviderPatch is the unified set of fields the web UI can
+// change on an existing provider. Every field is optional —
+// pass a non-nil pointer / non-empty string to set, leave the
+// zero value to leave the field alone.
+//
+// The zero-value semantics are important: the JSON body the UI
+// sends lists only the fields the user actually edited, and the
+// handler must not silently wipe fields the user did not
+// include in the request.
+type ProviderPatch struct {
+	// Name, if non-empty, renames the provider. A name
+	// collision with another provider returns an error.
+	Name string
+	// Protocol, if non-empty, switches the dispatch
+	// protocol. Accepted values: "openai", "anthropic".
+	Protocol string
+	// BaseURL, if non-empty, replaces the API base URL.
+	BaseURL string
+	// APIKey, if non-empty, replaces the API key. (An
+	// empty value here means "do not touch the key" — use
+	// the dedicated SetProviderAPIKey flow or send a
+	// separate request to clear it.)
+	APIKey string
+	// ClearAPIKey, if true, forces the key to be emptied
+	// even when the user-supplied APIKey is "".
+	ClearAPIKey bool
+	// IsDefault, if true, promotes this provider to be the
+	// global default. (False is a no-op so the UI can
+	// always include the field without unintended
+	// demotions.)
+	IsDefault bool
+}
+
+// UpdateProvider applies a ProviderPatch to an existing
+// provider. The patch is the single source of truth for "what
+// changed" — non-provided fields are left untouched.
+//
+// Renames cascade: if the renamed provider was the global
+// default, `cfg.LLM.Default` is updated to the new name. The
+// change is persisted to ~/.p-chat/config.json atomically; if
+// the rename collides with an existing provider, the file is
+// not touched.
+func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error) {
+	cfg, err := Load("")
+	if err != nil {
+		return nil, err
+	}
+	idx := -1
+	for i, p := range cfg.LLM.Providers {
+		if p.Name == oldName {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("provider %q not found", oldName)
+	}
+	p := cfg.LLM.Providers[idx]
+
+	// Handle rename first because every subsequent field
+	// check needs to look at the new name.
+	if patch.Name != "" && patch.Name != oldName {
+		for _, other := range cfg.LLM.Providers {
+			if other.Name == patch.Name {
+				return nil, fmt.Errorf("provider %q already exists", patch.Name)
+			}
+		}
+		if cfg.LLM.Default == oldName {
+			cfg.LLM.Default = patch.Name
+		}
+		p.Name = patch.Name
+	}
+	if patch.Protocol != "" {
+		switch patch.Protocol {
+		case "openai", "anthropic":
+			p.Protocol = patch.Protocol
+		default:
+			return nil, fmt.Errorf("invalid protocol %q (allowed: openai, anthropic)", patch.Protocol)
+		}
+	}
+	if patch.BaseURL != "" {
+		p.BaseURL = patch.BaseURL
+	}
+	if patch.ClearAPIKey {
+		p.APIKey = ""
+	} else if patch.APIKey != "" {
+		p.APIKey = patch.APIKey
+	}
+	if patch.IsDefault {
+		cfg.LLM.Default = p.Name
+	}
+	cfg.LLM.Providers[idx] = p
+	mgr := NewManager()
+	if err := mgr.SaveGlobal(cfg); err != nil {
+		return nil, err
+	}
+	return &cfg.LLM.Providers[idx], nil
+}
+
 // AddModel appends a new model to a provider's Models list. If the
 // provider only has the legacy single `model` field, the model is
 // migrated into the Models list. Returns the updated provider.

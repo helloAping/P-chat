@@ -529,6 +529,140 @@ func TestAddModel_AcceptsMaxTokens(t *testing.T) {
 	}
 }
 
+// TestUpdateProvider_PatchBaseURL exercises the unified
+// PATCH /api/v1/providers/:name endpoint. Sending only a
+// base_url change must not wipe the existing API key.
+func TestUpdateProvider_PatchBaseURL(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("PATCH", srv.URL+"/api/v1/providers/ollama", strings.NewReader(`{"base_url":"http://new.example.com/v1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	var body struct {
+		Name    string `json:"name"`
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.BaseURL != "http://new.example.com/v1" {
+		t.Errorf("base_url = %q", body.BaseURL)
+	}
+	if body.APIKey == "" {
+		t.Error("api_key must be preserved on partial patch")
+	}
+}
+
+// TestUpdateProvider_Rename verifies the new name is
+// persisted and the global default is cascaded.
+func TestUpdateProvider_Rename(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	// Add a fresh provider so we don't disturb the test
+	// server's default (used by other tests).
+	addBody := `{"name":"old","protocol":"openai","base_url":"http://x","api_key":"k","model":"m"}`
+	ar, err := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(addBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ar.Body.Close()
+	if ar.StatusCode != http.StatusCreated {
+		t.Fatalf("add: %d", ar.StatusCode)
+	}
+
+	req, _ := http.NewRequest("PATCH", srv.URL+"/api/v1/providers/old", strings.NewReader(`{"name":"renamed"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Name != "renamed" {
+		t.Errorf("name = %q, want renamed", body.Name)
+	}
+
+	// Old name should 404 now.
+	g, _ := http.Get(srv.URL + "/api/v1/providers/old")
+	g.Body.Close()
+	if g.StatusCode != http.StatusNotFound {
+		t.Errorf("old name should be gone, got %d", g.StatusCode)
+	}
+}
+
+// TestUpdateProvider_RenameCollision ensures a rename that
+// collides with another provider is rejected with 409.
+func TestUpdateProvider_RenameCollision(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	// "ollama" is in the default test config; "extra" doesn't exist
+	// yet. Add it.
+	ab, _ := http.Post(srv.URL+"/api/v1/providers", "application/json",
+		strings.NewReader(`{"name":"extra","protocol":"openai","base_url":"http://x","api_key":"k","model":"m"}`))
+	ab.Body.Close()
+
+	req, _ := http.NewRequest("PATCH", srv.URL+"/api/v1/providers/extra", strings.NewReader(`{"name":"ollama"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusConflict {
+		t.Errorf("status = %d, want 409", r.StatusCode)
+	}
+}
+
+// TestUpdateProvider_ProtocolChange switches a provider
+// from openai to anthropic via PATCH.
+func TestUpdateProvider_ProtocolChange(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	ab, _ := http.Post(srv.URL+"/api/v1/providers", "application/json",
+		strings.NewReader(`{"name":"switchee","protocol":"openai","base_url":"http://x","api_key":"k","model":"m"}`))
+	ab.Body.Close()
+
+	req, _ := http.NewRequest("PATCH", srv.URL+"/api/v1/providers/switchee", strings.NewReader(`{"protocol":"anthropic"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+	var body struct {
+		Protocol string `json:"protocol"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Protocol != "anthropic" {
+		t.Errorf("protocol = %q, want anthropic", body.Protocol)
+	}
+}
+
 // ====================================================================
 // Add provider API (covers the new web UI add-provider form)
 // ====================================================================

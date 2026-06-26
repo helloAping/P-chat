@@ -122,7 +122,12 @@ type anthropicMessageDelta struct {
 	} `json:"usage"`
 }
 
-func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, messages []Message) <-chan StreamChunk {
+// anthropicDefaultMaxTokens is the fallback used when no per-call
+// or per-model max_tokens is provided. Anthropic's API requires
+// max_tokens on every request, so we can't simply omit it.
+const anthropicDefaultMaxTokens = 4096
+
+func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, messages []Message, maxTokens int) <-chan StreamChunk {
 	ch := make(chan StreamChunk, 64)
 
 	go func() {
@@ -159,9 +164,17 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 			model = c.model
 		}
 
+		// Resolve max_tokens: explicit per-call override wins,
+		// then the model's MaxTokensOutput, then 4096 (Anthropic
+		// requires a positive value; 0 is not accepted).
+		effectiveMax := maxTokens
+		if effectiveMax <= 0 {
+			effectiveMax = anthropicDefaultMaxTokens
+		}
+
 		reqBody := anthropicRequest{
 			Model:     model,
-			MaxTokens: 4096,
+			MaxTokens: effectiveMax,
 			Messages:  anthropicMsgs,
 			Stream:    true,
 			System:    systemMsg,
@@ -252,7 +265,7 @@ func (c *AnthropicClient) handleStreamEvent(eventType, dataJSON string, ch chan<
 	}
 }
 
-func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages []Message) (string, error) {
+func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages []Message, maxTokens int) (string, error) {
 	var systemMsg string
 	var anthropicMsgs []anthropicMessage
 
@@ -277,9 +290,15 @@ func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages [
 		model = c.model
 	}
 
+	// Resolve max_tokens (see ChatStream for the same rule).
+	effectiveMax := maxTokens
+	if effectiveMax <= 0 {
+		effectiveMax = anthropicDefaultMaxTokens
+	}
+
 	reqBody := anthropicRequest{
 		Model:     model,
-		MaxTokens: 4096,
+		MaxTokens: effectiveMax,
 		Messages:  anthropicMsgs,
 		Stream:    false,
 		System:    systemMsg,

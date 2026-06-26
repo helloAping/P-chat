@@ -73,32 +73,83 @@ func (h *Handler) DeleteProvider(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "name": name})
 }
 
-// SetProviderAPIKeyRequest is the body of PATCH /api/v1/providers/:name.
-type SetProviderAPIKeyRequest struct {
-	APIKey string `json:"api_key"`
+// UpdateProviderRequest is the body of PATCH /api/v1/providers/:name.
+//
+// Every field is optional. To set a field, include it with a
+// non-zero / non-empty value. Fields you omit are left
+// untouched on disk. To explicitly clear the API key, send
+// `{"api_key": ""}` and the server will write ""; the regular
+// "omit means leave alone" rule still applies to the other
+// fields.
+type UpdateProviderRequest struct {
+	Name     string `json:"name,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+	BaseURL  string `json:"base_url,omitempty"`
+	APIKey   string `json:"api_key,omitempty"`
+	// SetDefault, when true, makes this provider the global
+	// default. False is a no-op (the UI can always include
+	// the field without accidentally demoting a provider).
+	SetDefault bool `json:"set_default,omitempty"`
 }
 
-// SetProviderAPIKey PATCH /api/v1/providers/:name
+// UpdateProvider PATCH /api/v1/providers/:name
 //
-// Updates the API key (and only the API key) for an existing
-// provider. The provider must already exist.
-func (h *Handler) SetProviderAPIKey(c *gin.Context) {
+// Unified edit endpoint. Replaces the old "api_key only"
+// endpoint. Supports renaming a provider, switching its
+// protocol (openai/anthropic), updating the base URL, the API
+// key, and promoting it to the global default. Every field is
+// optional; non-zero values are written, others left alone.
+//
+// On success the response body is the updated ProviderFull so
+// the UI can re-render without a follow-up GET.
+func (h *Handler) UpdateProvider(c *gin.Context) {
 	if h.cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
-	name := c.Param("name")
-	var req SetProviderAPIKeyRequest
+	oldName := c.Param("name")
+	var req UpdateProviderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	if err := config.SetProviderAPIKey(name, req.APIKey); err != nil {
+	updated, err := config.UpdateProvider(oldName, config.ProviderPatch{
+		Name:      req.Name,
+		Protocol:  req.Protocol,
+		BaseURL:   req.BaseURL,
+		APIKey:    req.APIKey,
+		IsDefault: req.SetDefault,
+	})
+	if err != nil {
+		// Most common failure: name collision on rename.
+		if strings.Contains(err.Error(), "already exists") {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if strings.Contains(err.Error(), "invalid protocol") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if strings.Contains(err.Error(), "not found") {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	h.reloadAfterConfigChange()
-	c.JSON(http.StatusOK, gin.H{"ok": true, "name": name})
+	// Return the full ProviderFull shape so the UI can re-render
+	// without a follow-up GET. Use the *new* name (which may
+	// differ from oldName when the user renamed the provider).
+	c.JSON(http.StatusOK, ProviderFull{
+		Name:      updated.Name,
+		Protocol:  updated.GetProtocol(),
+		BaseURL:   updated.BaseURL,
+		APIKey:    updated.APIKey,
+		IsDefault: updated.Name == h.cfg.LLM.Default,
+		Models:    updated.AllModels(),
+		Model:     updated.EffectiveModel(),
+	})
 }
 
 // SetDefaultProviderRequest is the body of POST /api/v1/providers/:name/default.

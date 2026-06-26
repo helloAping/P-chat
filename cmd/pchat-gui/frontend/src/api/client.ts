@@ -142,8 +142,44 @@ export function uploadURL(id: string): string {
 }
 
 // --- Providers / Models ---
+export interface ModelInfo {
+  name: string
+  display_name?: string
+  description?: string
+  default?: boolean
+  max_tokens_context?: number
+  max_tokens_output?: number
+  // Per-model hints. Mirrors config.Capabilities on the
+  // server. The UI uses supports_vision to render a 👁
+  // badge in the model picker; thinking_effort is shown
+  // as a chip in the model edit form.
+  capabilities?: {
+    thinking_effort?: 'off' | 'low' | 'medium' | 'high' | ''
+    context_window?: number
+    supports_vision?: boolean
+    supports_audio?: boolean
+  }
+}
+
+export interface ProviderInfo {
+  name: string
+  protocol: 'openai' | 'anthropic' | string
+  base_url: string
+  api_key: string
+  is_default: boolean
+  // Slim view from GET /api/v1/providers.
+  model: string
+  models: ModelInfo[]
+}
+
 export const listProviders = () =>
-  jsonFetch<{ providers: any[] }>('/api/v1/providers')
+  jsonFetch<{ providers: ProviderInfo[] }>('/api/v1/providers')
+
+// Rich view (GET /api/v1/providers/:name) returns the same
+// shape; the slim list view and the rich per-provider view
+// use the same struct.
+export const getProvider = (name: string) =>
+  jsonFetch<ProviderInfo>(`/api/v1/providers/${encodeURIComponent(name)}`)
 
 // --- Style management (app-level CRUD) ---
 export interface StyleInfo {
@@ -235,11 +271,81 @@ export const setDefaultProvider = (name: string) =>
     method: 'POST',
   })
 
-export const setProviderAPIKey = (name: string, apiKey: string) =>
-  jsonFetch<{ ok: boolean }>(`/api/v1/providers/${encodeURIComponent(name)}`, {
+// UpdateProviderRequest is the body of the unified
+// PATCH /api/v1/providers/:name. Every field is optional;
+// the server only writes the non-empty ones. Pass set_default
+// (not is_default) to promote a provider to the global default.
+export interface UpdateProviderRequest {
+  name?: string
+  protocol?: 'openai' | 'anthropic'
+  base_url?: string
+  api_key?: string
+  set_default?: boolean
+}
+
+export const updateProvider = (name: string, req: UpdateProviderRequest) =>
+  jsonFetch<ProviderInfo>(`/api/v1/providers/${encodeURIComponent(name)}`, {
     method: 'PATCH',
-    body: JSON.stringify({ api_key: apiKey }),
+    body: JSON.stringify(req),
   })
+
+// --- Per-model CRUD ---
+export interface AddModelRequest {
+  name: string
+  display_name?: string
+  description?: string
+  max_tokens_context?: number
+  max_tokens_output?: number
+}
+
+export const addModel = (provider: string, req: AddModelRequest) =>
+  jsonFetch<{ ok: boolean; name: string }>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/models`,
+    { method: 'POST', body: JSON.stringify(req) },
+  )
+
+export interface UpdateModelRequest {
+  display_name?: string
+  description?: string
+  max_tokens_context?: number
+  max_tokens_output?: number
+  clear_all?: boolean
+}
+
+export const updateModel = (provider: string, model: string, req: UpdateModelRequest) =>
+  jsonFetch<{ ok: boolean; provider: string; model: string }>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/models/${encodeURIComponent(model)}`,
+    { method: 'PUT', body: JSON.stringify(req) },
+  )
+
+export const deleteModel = (provider: string, model: string) =>
+  jsonFetch<{ ok: boolean }>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/models/${encodeURIComponent(model)}`,
+    { method: 'DELETE' },
+  )
+
+export const setDefaultModel = (provider: string, model: string) =>
+  jsonFetch<{ ok: boolean }>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/models/${encodeURIComponent(model)}/default`,
+    { method: 'POST' },
+  )
+
+export interface SetCapabilitiesRequest {
+  thinking_effort?: 'off' | 'low' | 'medium' | 'high' | ''
+  context_window?: number
+  supports_vision?: boolean
+  supports_audio?: boolean
+}
+
+export const setModelCapabilities = (
+  provider: string,
+  model: string,
+  req: SetCapabilitiesRequest,
+) =>
+  jsonFetch<{ ok: boolean }>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/models/${encodeURIComponent(model)}/capabilities`,
+    { method: 'PATCH', body: JSON.stringify(req) },
+  )
 
 // --- Streaming send ---
 export interface InlineAttachment {
