@@ -24,10 +24,10 @@
 // Layout at runtime (after install):
 //
 //   %LOCALAPPDATA%\Programs\P-Chat\
-//   ├── pchat-gui.exe        (this binary)
-//   ├── pchat-server.exe     (the HTTP API + web UI)
-//   ├── install.ps1
-//   └── uninstall.ps1
+//   鈹溾攢鈹€ pchat-gui.exe        (this binary)
+//   鈹溾攢鈹€ pchat-server.exe     (the HTTP API + web UI)
+//   鈹溾攢鈹€ install.ps1
+//   鈹斺攢鈹€ uninstall.ps1
 package main
 
 import (
@@ -43,10 +43,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v2"
@@ -85,7 +87,7 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
 <body>
 <div class="wrap">
 <h1>P-Chat</h1>
-<p><span id="msg">正在启动后端服务</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></p>
+<p><span id="msg">姝ｅ湪鍚姩鍚庣鏈嶅姟</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></p>
 </div>
 <script>
 (function(){
@@ -97,7 +99,7 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
   }
   function tick(){
     tries++;
-    if (tries > 300) { fail('后端服务启动超时（60秒），请查看 pchat-gui.log / pchat-server.log'); return; }
+    if (tries > 300) { fail('鍚庣鏈嶅姟鍚姩瓒呮椂锛?0绉掞級锛岃鏌ョ湅 pchat-gui.log / pchat-server.log'); return; }
     fetch('/api/v1/health', {cache:'no-store', credentials:'omit'})
       .then(function(r){
         // We only treat the backend as "ready" when we get a real JSON
@@ -118,7 +120,7 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
         throw new Error('not ready');
       })
       .catch(function(){
-        msg.textContent = '正在启动后端服务';
+        msg.textContent = '姝ｅ湪鍚姩鍚庣鏈嶅姟';
         setTimeout(tick, 200);
       });
   }
@@ -393,6 +395,11 @@ func (a *App) spawnAndWatch() {
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(), "PCHAT_PORT="+strconv.Itoa(port))
+	// pchat-gui is a WINDOWS_GUI subsystem binary, but Go's
+	// os/exec still allocates a fresh console for child processes
+	// unless we set CREATE_NO_WINDOW explicitly. Without this, every
+	// launch would pop up a black console window for pchat-server.
+	hideChildConsole(cmd)
 	// Forward child output to the same log file the GUI uses so users
 	// can see both pchat-gui and pchat-server logs side by side.
 	if lf, lfErr := os.OpenFile(filepath.Join(filepath.Dir(bin), "pchat-server.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); lfErr == nil {
@@ -503,4 +510,27 @@ func pickConfigPath() string {
 		return yamlPath
 	}
 	return jsonPath
+}
+
+// hideChildConsole suppresses the stray console window that Go's
+// os/exec allocates for child processes on Windows even when the
+// parent is a WINDOWS_GUI subsystem binary. Without this every
+// launch of pchat-server.exe would flash a black console at the
+// user. The same helper is a no-op on non-Windows platforms where
+// there is no console window to suppress.
+//
+// We use the raw CREATE_NO_WINDOW (0x08000000) creation flag
+// rather than the windows-specific SysProcAttr.HideWindow so the
+// syscall struct stays portable. See
+// https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+const createNoWindow = 0x08000000
+
+func hideChildConsole(cmd *exec.Cmd) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= createNoWindow
 }

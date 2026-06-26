@@ -17,3 +17,9 @@ func SetSysProcAttrNewPG(cmd *exec.Cmd) {
 	}
 	cmd.SysProcAttr.Setpgid = true
 }
+
+// SetSysProcAttrHiddenWindow is a no-op on non-Windows. Windows
+// GUI apps need CREATE_NO_WINDOW to suppress the popup console
+// for child processes; Unix processes don't have a console window
+// to suppress.
+func SetSysProcAttrHiddenWindow(_ *exec.Cmd) {}
