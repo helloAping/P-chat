@@ -20,11 +20,35 @@ import (
 // Kind is one of "image", "audio", "text", "file" — see the
 // expandAttachments switch for the per-kind handling.
 type Attachment struct {
+	// ID is the server-side upload id (legacy path; the handler
+	// resolves it through AttachmentResolver). Optional when
+	// Data is set.
 	ID   string `json:"id"`
+	// Name is the original filename, used for the message bubble
+	// and for the system prompt's "## Uploaded Attachments"
+	// section.
 	Name string `json:"name"`
+	// Size is the file size in bytes. Computed from Data when
+	// the attachment is inlined.
 	Size int64  `json:"size,omitempty"`
+	// Kind is "image" | "audio" | "text" | "file". Drives the
+	// multi-content part type and the system prompt section.
 	Kind string `json:"kind"`
+	// MIME is the file's MIME type, when known.
 	MIME string `json:"mime,omitempty"`
+	// Data is the inline base64 (or text) payload. When set, it
+	// takes precedence over ID — the resolver path is skipped
+	// entirely. This is the path the new SPA uses: the
+	// frontend has the bytes already, no need to round-trip
+	// them through the upload + disk-read cycle.
+	//
+	// The frontend often sends the inline payload as `url`
+	// (the same field the LLM wire format uses, e.g. a
+	// "data:image/png;base64,..." string for an image_url
+	// part). We accept either; resolveInline() picks whichever
+	// is non-empty.
+	Data string `json:"data,omitempty"`
+	URL  string `json:"url,omitempty"`
 }
 
 // AttachmentResolver turns an Attachment into the actual file
@@ -93,7 +117,17 @@ func (r *DiskAttachmentResolver) Resolve(a Attachment) (string, int64) {
 // The LLM client translates at the wire boundary (see
 // internal/llm/anthropic.go), so the agent layer stays
 // protocol-agnostic.
-func expandAttachments(msgs []llm.Message, atts []Attachment, r AttachmentResolver) []llm.Message {
+//
+// If a VisionCapable function is supplied, image parts are only
+// emitted for models that return true. Otherwise the image is
+// dropped and a text marker ("(image: foo.png, N bytes; the
+// current model does not support image input, file is kept at
+// <path>)") is appended so the user is told *why* their image
+// didn't reach the model — without it the LLM can only answer
+// based on the text, leaving the user to wonder what went wrong.
+// The check is "no" not "drop silently" so the user can switch
+// to a vision-capable model and re-send if needed.
+func expandAttachments(msgs []llm.Message, atts []Attachment, r AttachmentResolver, visionCapable func() bool) []llm.Message {
 	if len(atts) == 0 || r == nil || len(msgs) == 0 {
 		return msgs
 	}
@@ -117,32 +151,88 @@ func expandAttachments(msgs []llm.Message, atts []Attachment, r AttachmentResolv
 	}
 
 	for _, a := range atts {
-		path, _ := r.Resolve(a)
-		if path == "" {
-			parts = append(parts, openai.ChatMessagePart{
-				Type: openai.ChatMessagePartTypeText,
-				Text: fmt.Sprintf("(attachment %s not found on server)", a.Name),
-			})
-			continue
+		// Two ways to get the bytes:
+		//   - a.Data / a.URL: inlined by the client (the new
+		//     SPA path; the message is self-contained, no disk
+		//     read needed). URL is preferred for image_url
+		//     attachments because the frontend already has the
+		//     data: URL in that exact form.
+		//   - a.ID: legacy upload-id path; resolve through the
+		//     resolver and read from disk. Kept for back-compat
+		//     and for non-SPA clients (e.g. the in-tree REPL).
+		var data []byte
+		var path string
+		inlineRaw := a.Data
+		if a.URL != "" {
+			inlineRaw = a.URL
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			parts = append(parts, openai.ChatMessagePart{
-				Type: openai.ChatMessagePartTypeText,
-				Text: fmt.Sprintf("(failed to read %s: %v)", a.Name, err),
-			})
-			continue
+		if inlineRaw != "" {
+			if a.Kind == "text" {
+				data = []byte(inlineRaw)
+			} else {
+				// data: URL → strip the prefix and base64-decode.
+				// We expect the same shape dataURL() produces so
+				// the round-trip is symmetric.
+				cleaned := strings.TrimPrefix(inlineRaw, "data:")
+				if i := strings.Index(cleaned, ";base64,"); i >= 0 {
+					cleaned = cleaned[i+len(";base64,"):]
+				}
+				decoded, err := base64.StdEncoding.DecodeString(cleaned)
+				if err != nil {
+					parts = append(parts, openai.ChatMessagePart{
+						Type: openai.ChatMessagePartTypeText,
+						Text: fmt.Sprintf("(attachment %s has invalid base64 data: %v)", a.Name, err),
+					})
+					continue
+				}
+				data = decoded
+			}
+		} else {
+			path, _ = r.Resolve(a)
+			if path == "" {
+				parts = append(parts, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: fmt.Sprintf("(attachment %s not found on server)", a.Name),
+				})
+				continue
+			}
+			read, err := os.ReadFile(path)
+			if err != nil {
+				parts = append(parts, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: fmt.Sprintf("(failed to read %s: %v)", a.Name, err),
+				})
+				continue
+			}
+			data = read
 		}
 		switch a.Kind {
 		case "image":
-			mime := a.MIME
-			if mime == "" {
-				mime = "image/png"
+			// Skip the image_url part for models that don't accept
+			// vision input. We still surface a one-line marker so
+			// the user (and the LLM) know the upload happened and
+			// can re-send with a vision-capable model.
+			if visionCapable != nil && !visionCapable() {
+				parts = append(parts, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: fmt.Sprintf("(attached image: %s, %d bytes — current model does not support image input; bytes are kept in the message itself)",
+						a.Name, len(data)),
+				})
+				continue
+			}
+
+			mime := imageMIME(a.Name, a.MIME)
+			// When the bytes were inlined, we already have a
+			// data: URL in a.Data / a.URL; otherwise wrap the raw
+			// bytes for the LLM.
+			url := inlineRaw
+			if url == "" {
+				url = dataURL(mime, data)
 			}
 			parts = append(parts, openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeImageURL,
 				ImageURL: &openai.ChatMessageImageURL{
-					URL: dataURL(mime, data),
+					URL: url,
 				},
 			})
 		case "audio":
@@ -155,8 +245,8 @@ func expandAttachments(msgs []llm.Message, atts []Attachment, r AttachmentResolv
 			// go-openai v1.41+ can re-enable the real block.
 			parts = append(parts, openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeText,
-				Text: fmt.Sprintf("(attached audio: %s, %d bytes, MIME=%s —server side: file kept at %s)",
-					a.Name, len(data), a.MIME, path),
+				Text: fmt.Sprintf("(attached audio: %s, %d bytes, MIME=%s)",
+					a.Name, len(data), a.MIME),
 			})
 		case "text":
 			// Cap the text dump at 200 KB to keep requests
@@ -204,8 +294,41 @@ func expandAttachments(msgs []llm.Message, atts []Attachment, r AttachmentResolv
 // Both protocols share the same MultiContent representation at
 // the agent layer (text + image_url). The LLM client
 // serialises per protocol at the wire boundary.
-func ExpandAttachments(protocol string, msgs []llm.Message, atts []Attachment, r AttachmentResolver) []llm.Message {
-	return expandAttachments(msgs, atts, r)
+//
+// visionCapable is an optional callback that returns whether
+// the *current* (provider, model) pair supports image input.
+// When nil or returning true, image attachments are inlined as
+// image_url parts as before. When false, images are dropped
+// and a short text marker is added instead.
+func ExpandAttachments(protocol string, msgs []llm.Message, atts []Attachment, r AttachmentResolver, visionCapable func() bool) []llm.Message {
+	return expandAttachments(msgs, atts, r, visionCapable)
+}
+
+// imageMIME returns the MIME type for an image attachment. Uses
+// the stored MIME when it's a valid image type; otherwise falls
+// back to extension-based detection. This ensures the data URL
+// always carries the correct media type for the LLM.
+func imageMIME(name, storedMIME string) string {
+	if storedMIME != "" && strings.HasPrefix(storedMIME, "image/") {
+		return storedMIME
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".bmp":
+		return "image/bmp"
+	case ".svg":
+		return "image/svg+xml"
+	default:
+		return "image/png"
+	}
 }
 
 // dataURL is a small helper that builds a data: URL from the

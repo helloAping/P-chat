@@ -100,7 +100,7 @@ func (h *Handler) Upload(c *gin.Context) {
 		Name:     fh.Filename,
 		Size:     written,
 		Kind:     string(classifyUpload(fh.Filename, fh.Header.Get("Content-Type"))),
-		MIME:     fh.Header.Get("Content-Type"),
+		MIME:     detectMIME(fh.Filename, fh.Header.Get("Content-Type")),
 		StoredAs: stored,
 	}
 	c.JSON(http.StatusCreated, meta)
@@ -116,6 +116,7 @@ func (h *Handler) GetUpload(c *gin.Context) {
 		return
 	}
 	dir := UploadDir()
+	_ = os.MkdirAll(dir, 0o755)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
@@ -129,10 +130,60 @@ func (h *Handler) GetUpload(c *gin.Context) {
 		if !strings.HasPrefix(e.Name(), prefix) {
 			continue
 		}
-		c.File(filepath.Join(dir, e.Name()))
+		fullPath := filepath.Join(dir, e.Name())
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if ct := mimeByExt(ext); ct != "" {
+			c.Header("Content-Type", ct)
+		}
+		c.File(fullPath)
 		return
 	}
 	c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+}
+
+func mimeByExt(ext string) string {
+	switch ext {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".bmp":
+		return "image/bmp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg":
+		return "audio/ogg"
+	case ".m4a":
+		return "audio/mp4"
+	case ".flac":
+		return "audio/flac"
+	case ".txt":
+		return "text/plain"
+	case ".md":
+		return "text/markdown"
+	case ".csv":
+		return "text/csv"
+	case ".json":
+		return "application/json"
+	case ".yaml", ".yml":
+		return "application/yaml"
+	case ".xml":
+		return "application/xml"
+	case ".html", ".htm":
+		return "text/html"
+	case ".pdf":
+		return "application/pdf"
+	default:
+		return ""
+	}
 }
 
 // newUploadID returns 16 hex chars of randomness. Plenty for
@@ -187,4 +238,18 @@ func classifyUpload(name, mime string) uploadKind {
 		return kindText
 	}
 	return kindFile
+}
+
+// detectMIME picks the MIME type for a file. Extension-based
+// detection is preferred because browsers often send a generic
+// "application/octet-stream" for common image formats. Falls back
+// to the browser-supplied MIME when the extension is unknown.
+func detectMIME(name, browserMIME string) string {
+	if ct := mimeByExt(strings.ToLower(filepath.Ext(name))); ct != "" {
+		return ct
+	}
+	if browserMIME != "" {
+		return browserMIME
+	}
+	return "application/octet-stream"
 }

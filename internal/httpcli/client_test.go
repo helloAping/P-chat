@@ -40,7 +40,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
 
-	srv := server.New(cfg, agt, store)
+	srv := server.New(cfg, agt, store, styleMgr)
 	return httptest.NewServer(srv.Engine())
 }
 

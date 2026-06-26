@@ -89,7 +89,7 @@ func newTestServerWithConfig(t *testing.T, jsonBody string) (*Server, *config.Co
 	tool.RegisterBuiltin(tools)
 
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	return New(cfg, agt, store), cfg
+	return New(cfg, agt, store, styleMgr), cfg
 }
 
 // ====================================================================
@@ -849,7 +849,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := New(cfg, agt, store)
+	srv1 := New(cfg, agt, store, styleMgr)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro"}`)
 	if err := store.Close(); err != nil {
@@ -867,7 +867,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	tools2 := tool.NewRegistry()
 	tool.RegisterBuiltin(tools2)
 	agt2 := agent.New(cfg, llmClient2, styleMgr2, store2, tools2)
-	srv2 := New(cfg, agt2, store2)
+	srv2 := New(cfg, agt2, store2, styleMgr2)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil)
@@ -895,11 +895,121 @@ func TestDeleteSession_DropsCachedMeta(t *testing.T) {
 	wd := httptest.NewRecorder()
 	s.engine.ServeHTTP(wd, httptest.NewRequest("DELETE", "/api/v1/sessions/"+sess.ID, nil))
 	if wd.Code != 200 {
-		t.Fatalf("delete: %d", wd.Code)
+		t.Fatalf("delete: %d", w.Code)
 	}
 	// After delete, the meta map should not hold a stale entry.
 	if _, ok := s.Handler().meta[sess.ID]; ok {
 		t.Error("meta cache should drop deleted session")
+	}
+}
+
+// TestSessionStyle_PersistsAndRoundTrips is the regression for the
+// "switching session wipes the style picker" bug. The chain we
+// exercise is:
+//
+//  1. PATCH a session with {style:"guofeng"}.
+ 	//  2. GET /sessions (the list) reports style=guofeng for that id.
+ 	//  3. After a server "restart" (new handler on the same store),
+ 	//     GET /sessions/:id still reports style=guofeng — proving
+ 	//     the SessionResponse has the resolved value (not the raw
+ 	//     metadata blob) and survives the hot-path cache being
+ 	//     rebuilt from disk.
+func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	pchatDir := filepath.Join(dir, ".p-chat")
+	if err := os.MkdirAll(pchatDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pchatDir, "config.json"), []byte(richTestConfigJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	llmClient, _ := llm.NewClient(&cfg.LLM)
+	styleMgr, _ := style.NewManager(config.PromptDir())
+	storePath := filepath.Join(dir, "store.db")
+	store, err := memory.OpenAt(storePath, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := tool.NewRegistry()
+	tool.RegisterBuiltin(tools)
+	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
+	srv1 := New(cfg, agt, store, styleMgr)
+
+	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro","style":"tech"}`)
+
+	// 1. PATCH a different style.
+	w := patchSession(t, srv1, sess.ID, `{"style":"guofeng"}`)
+	if w.Code != 200 {
+		t.Fatalf("patch: %d, body=%s", w.Code, w.Body.String())
+	}
+	var patched SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&patched)
+	if patched.Style != "guofeng" {
+		t.Errorf("PATCH response Style = %q, want guofeng", patched.Style)
+	}
+
+	// 2. GET /sessions (list) reports the resolved style.
+	wl := httptest.NewRecorder()
+	srv1.engine.ServeHTTP(wl, httptest.NewRequest("GET", "/api/v1/sessions", nil))
+	if wl.Code != 200 {
+		t.Fatalf("list: %d", wl.Code)
+	}
+	var listResp struct {
+		Sessions []SessionResponse `json:"sessions"`
+	}
+	_ = json.NewDecoder(wl.Body).Decode(&listResp)
+	var found *SessionResponse
+	for i := range listResp.Sessions {
+		if listResp.Sessions[i].ID == sess.ID {
+			found = &listResp.Sessions[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("session %s missing from list", sess.ID)
+	}
+	if found.Style != "guofeng" {
+		t.Errorf("list reports Style = %q, want guofeng", found.Style)
+	}
+	if found.Provider != "cs" || found.Model != "doubao-pro" {
+		t.Errorf("list reports provider=%q model=%q, want cs/doubao-pro", found.Provider, found.Model)
+	}
+
+	// 3. Restart: reopen store, build a new handler, the meta must
+	//    survive.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store2, err := memory.OpenAt(storePath, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	llmClient2, _ := llm.NewClient(&cfg.LLM)
+	styleMgr2, _ := style.NewManager(config.PromptDir())
+	tools2 := tool.NewRegistry()
+	tool.RegisterBuiltin(tools2)
+	agt2 := agent.New(cfg, llmClient2, styleMgr2, store2, tools2)
+	srv2 := New(cfg, agt2, store2, styleMgr2)
+
+	wg := httptest.NewRecorder()
+	srv2.engine.ServeHTTP(wg, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if wg.Code != 200 {
+		t.Fatalf("get: %d, body=%s", wg.Code, wg.Body.String())
+	}
+	var afterRestart SessionResponse
+	_ = json.NewDecoder(wg.Body).Decode(&afterRestart)
+	if afterRestart.Style != "guofeng" {
+		t.Errorf("after restart Style = %q, want guofeng", afterRestart.Style)
+	}
+	if afterRestart.Provider != "cs" || afterRestart.Model != "doubao-pro" {
+		t.Errorf("after restart provider=%q model=%q, want cs/doubao-pro", afterRestart.Provider, afterRestart.Model)
 	}
 }
 

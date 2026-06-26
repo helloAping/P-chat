@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -78,14 +79,18 @@ func (m *Manager) resolvePromptDir() string {
 	return paths.GlobalPromptsDir()
 }
 
-// loadAll loads both identity and soul files for each style.
-// Directory layout:
+// loadAll loads both identity and soul files for each style
+// (built-in + user-added). Directory layout:
 //
 //	<prompts>/
-//	  identity/{cute,guofeng,tech}.md
-//	  soul/{cute,guofeng,tech}.md
+//	  identity/{cute,guofeng,tech,...}.md
+//	  soul/{cute,guofeng,tech,...}.md
 func (m *Manager) loadAll() error {
-	for _, s := range []Style{Cute, Guofeng, Tech} {
+	all := m.ListAll()
+	// Drop any previously loaded user-added styles so deletions
+	// take effect on reload.
+	m.sections = make(map[Style]SoulSection, len(all))
+	for _, s := range all {
 		var sec SoulSection
 
 		identityPath := filepath.Join(m.dir, "identity", string(s)+".md")
@@ -153,14 +158,198 @@ func (m *Manager) GetSystemPrompt(s Style) (string, error) {
 }
 
 func (m *Manager) Label(s Style) string {
-	if label, ok := styleLabels[s]; ok {
-		return label
-	}
-	return string(s)
+	return m.DisplayLabel(s)
 }
 
 func (m *Manager) List() []Style {
 	return []Style{Cute, Guofeng, Tech}
+}
+
+// ListAll returns every style known to the manager: the built-in
+// three (cute/guofeng/tech) plus any user-added styles found on
+// disk under <dir>/identity and <dir>/soul. The result is sorted
+// (built-ins first, then alphabetically) so the UI is stable.
+func (m *Manager) ListAll() []Style {
+	seen := map[Style]bool{}
+	for _, s := range m.List() {
+		seen[s] = true
+	}
+	// Scan the prompts dir for any extra identity files.
+	identityDir := filepath.Join(m.dir, "identity")
+	if entries, err := os.ReadDir(identityDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := strings.TrimSuffix(e.Name(), ".md")
+			if name == "" {
+				continue
+			}
+			s := Style(name)
+			if !seen[s] {
+				seen[s] = true
+			}
+		}
+	}
+	out := make([]Style, 0, len(seen))
+	for _, s := range m.List() {
+		if seen[s] {
+			out = append(out, s)
+		}
+	}
+	extras := []Style{}
+	for s := range seen {
+		isBuiltin := false
+		for _, b := range m.List() {
+			if s == b {
+				isBuiltin = true
+				break
+			}
+		}
+		if !isBuiltin {
+			extras = append(extras, s)
+		}
+	}
+	sort.Slice(extras, func(i, j int) bool { return extras[i] < extras[j] })
+	out = append(out, extras...)
+	return out
+}
+
+// DisplayLabel returns the human-readable label for a style, e.g.
+// "小P (PiPi)". Falls back to the raw id when not in the built-in
+// map (the user-added case where the label is stored in metadata).
+func (m *Manager) DisplayLabel(s Style) string {
+	if label, ok := styleLabels[s]; ok {
+		return label
+	}
+	// User-added style: try the metadata sidecar next to the prompt
+	// files, or fall back to the id.
+	metaPath := filepath.Join(m.dir, string(s)+".label")
+	if data, err := os.ReadFile(metaPath); err == nil {
+		return strings.TrimSpace(string(data))
+	}
+	return string(s)
+}
+
+// Create adds a new user-defined style by writing the identity
+// and soul files. The id is normalised (lowercased, non-alpha
+// stripped) so it is safe to use as a filename and as a session
+// meta value. Returns an error if the id is empty, already taken,
+// or contains no letter (would yield a useless filename).
+func (m *Manager) Create(id, label, identity, soul string) (Style, error) {
+	id = normaliseStyleID(id)
+	if id == "" {
+		return "", fmt.Errorf("style id must contain at least one letter")
+	}
+	for _, b := range m.List() {
+		if Style(id) == b {
+			return "", fmt.Errorf("style id %q is reserved (built-in)", id)
+		}
+	}
+	// Refuse to overwrite an existing style — user must DELETE
+	// first or PATCH the existing one.
+	if _, err := os.Stat(filepath.Join(m.dir, "identity", id+".md")); err == nil {
+		return "", fmt.Errorf("style %q already exists; delete it first", id)
+	}
+	if err := os.MkdirAll(filepath.Join(m.dir, "identity"), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Join(m.dir, "soul"), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(m.dir, "identity", id+".md"), []byte(identity), 0o644); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(m.dir, "soul", id+".md"), []byte(soul), 0o644); err != nil {
+		return "", err
+	}
+	if label != "" {
+		_ = os.WriteFile(filepath.Join(m.dir, id+".label"), []byte(label), 0o644)
+	}
+	// Reload the in-memory cache so the new style is immediately
+	// available to existing sessions.
+	if err := m.loadAll(); err != nil {
+		return "", err
+	}
+	return Style(id), nil
+}
+
+// Update overwrites the label / identity / soul of an existing
+// style. Empty fields are skipped (caller can leave them off the
+// request body to keep the existing value).
+func (m *Manager) Update(id, label, identity, soul string) error {
+	id = normaliseStyleID(id)
+	if id == "" {
+		return fmt.Errorf("style id must contain at least one letter")
+	}
+	// Block edits to the three built-ins — they're a system
+	// contract. Users who want their own variant should
+	// create a new style and edit that instead.
+	for _, b := range m.List() {
+		if Style(id) == b {
+			return fmt.Errorf("built-in style %q is read-only; create a new style to customise", id)
+		}
+	}
+	if identity != "" {
+		if err := os.WriteFile(filepath.Join(m.dir, "identity", id+".md"), []byte(identity), 0o644); err != nil {
+			return err
+		}
+	}
+	if soul != "" {
+		if err := os.WriteFile(filepath.Join(m.dir, "soul", id+".md"), []byte(soul), 0o644); err != nil {
+			return err
+		}
+	}
+	if label != "" {
+		if err := os.WriteFile(filepath.Join(m.dir, id+".label"), []byte(label), 0o644); err != nil {
+			return err
+		}
+	}
+	return m.loadAll()
+}
+
+// Delete removes a user-defined style. The built-ins are protected
+// to avoid leaving the running sessions with no usable system
+// prompt; deleting them would be a foot-gun.
+func (m *Manager) Delete(id string) error {
+	id = normaliseStyleID(id)
+	if id == "" {
+		return fmt.Errorf("style id must contain at least one letter")
+	}
+	for _, b := range m.List() {
+		if Style(id) == b {
+			return fmt.Errorf("built-in style %q cannot be deleted", id)
+		}
+	}
+	if err := os.Remove(filepath.Join(m.dir, "identity", id+".md")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(filepath.Join(m.dir, "soul", id+".md")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(filepath.Join(m.dir, id+".label")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return m.loadAll()
+}
+
+// normaliseStyleID lowercases the id and strips out anything that
+// isn't [a-z0-9-_.]. The result is safe to use as a filename and
+// as a session-meta value.
+func normaliseStyleID(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func ParseStyle(s string) (Style, error) {

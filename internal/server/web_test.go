@@ -39,7 +39,7 @@ func newWebServer(t *testing.T) *httptest.Server {
 
 	// Use an absolute path so the test is cwd-independent.
 	absWeb, _ := filepath.Abs("../../web")
-	return httptest.NewServer(server.NewWithStaticDir(cfg, agt, store, absWeb).Engine())
+	return httptest.NewServer(server.NewWithStaticDir(cfg, agt, store, styleMgr, absWeb).Engine())
 }
 
 func TestWebGUI_IndexPage(t *testing.T) {
@@ -59,23 +59,15 @@ func TestWebGUI_IndexPage(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	got := string(body)
 
-	// Sanity checks on the page.
+	// The Vue 3 SPA shell is tiny — everything else lives in the
+	// bundled JS/CSS. We just sanity-check the mount point, title,
+	// and that the JS/CSS assets are wired up.
 	wants := []string{
-		"<title>P-Chat</title>",    // title tag
-		"session-list",             // session list container
-		"sendMessage",              // main chat send function
-		"renderMarkdown",           // markdown renderer
-		"style-picker",             // style switcher (sidebar)
-		"model-picker",             // model switcher (sidebar)
-		"selectStyle",              // style switcher handler
-		"selectModel",              // model switcher handler
-		"stopGeneration",           // stop button binding
-		"updateHeaderMeta",         // status bar (tokens / elapsed)
-		"scheduleRender",           // throttled streaming render
-		"id=\"stop\"",              // stop button element
-		"id=\"meta-tokens\"",       // tokens pill
-		"id=\"meta-elapsed\"",      // elapsed pill
-		"session-title",            // session title (dblclick rename)
+		"<title>P-Chat</title>",  // title tag
+		`<div id="app">`,        // Vue mount point
+		`/app/assets/`,           // asset base path
+		`.js"`,                   // at least one JS bundle linked
+		`.css"`,                  // at least one CSS bundle linked
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

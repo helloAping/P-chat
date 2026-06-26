@@ -5,8 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
+	"strings"
+
+	"github.com/p-chat/pchat/internal/paths"
 )
 
 type Tool struct {
@@ -153,7 +158,11 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "read_file",
-		Description: "Read the full contents of a text file. Use for inspecting source files, configs, or any text artifact. Binary files will return garbled content.",
+		Description: "Read the full contents of a TEXT file. Use for inspecting source files, configs, or any text artifact. " +
+			"DO NOT call read_file on images, audio, video, PDFs, archives, or any binary file — " +
+			"those will return a binary error. " +
+			"Images uploaded by the user are ALREADY available as vision input (image_url) in the user message; " +
+			"just look at them directly, do NOT call read_file on the on-disk copy.",
 		Parameters: ObjectSchema(map[string]any{
 			"path": StringProp("Absolute or relative path to the file"),
 		}, []string{"path"}),
@@ -223,6 +232,22 @@ func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 		return &CallResult{Content: "path is required", IsError: true}, nil
 	}
 
+	// Block access to the upload directory. Uploaded files are
+	// images/audio/etc. that the user already attached to the
+	// chat as vision/audio content; reading them back from disk
+	// is pointless and confuses the LLM into thinking the model
+	// doesn't support the content type.
+	if isInUploadDir(a.Path) {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_UPLOAD_DIR: read blocked — %s is inside the chat upload directory. "+
+					"Uploaded files are already inlined in the user message as vision/image "+
+					"content; do NOT call read_file on them. Just respond based on the "+
+					"attachment you already received.", a.Path),
+			IsError: true,
+		}, nil
+	}
+
 	data, err := readFileForTool(a.Path)
 	if err != nil {
 		// Binary files get a clearer message than the bare
@@ -287,4 +312,59 @@ func handleListFiles(ctx context.Context, args json.RawMessage) (*CallResult, er
 		return &CallResult{Content: err.Error(), IsError: true}, nil
 	}
 	return &CallResult{Content: entries}, nil
+}
+
+// isInUploadDir reports whether the given file path lives inside
+// the chat upload directory. Uploaded files (images, audio, etc.)
+// are already inlined in the user message as multimodal content;
+// the read_file tool is never the right way to access them and
+// calling it on an uploaded image produces a confusing "model
+// doesn't support image input" reply.
+//
+// The check is intentionally broad: absolute paths, relative paths
+// (resolved against CWD), and bare filenames that match an
+// uploaded file are all rejected. The LLM in practice uses
+// whatever the user's last turn mentioned, which is often a bare
+// filename like "image.png".
+func isInUploadDir(p string) bool {
+	if p == "" {
+		return false
+	}
+	upDir := filepath.Clean(paths.GlobalDir() + string(filepath.Separator) + "uploads")
+
+	// 1. Absolute path that lives under the upload dir.
+	if filepath.IsAbs(p) {
+		return strings.HasPrefix(filepath.Clean(p), upDir)
+	}
+
+	// 2. Bare filename ("image.png", "foo/bar.png", etc.) — match
+	//    against the on-disk uploads directory listing. If a file
+	//    with the same name was uploaded, reject.
+	//    We strip any leading "./" and trim to the base name to
+	//    keep the check cheap.
+	cleaned := filepath.Clean(p)
+	if entries, err := os.ReadDir(upDir); err == nil {
+		// Match by full suffix path (foo.png, sub/foo.png) AND
+		// by base name when the model asks for just "image.png".
+		base := filepath.Base(cleaned)
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if e.Name() == cleaned || e.Name() == base {
+				return true
+			}
+		}
+	}
+
+	// 3. Path contains a separator — try resolving it relative
+	//    to the upload dir. If it lands inside, reject.
+	if strings.Contains(p, string(filepath.Separator)) {
+		tryPath := filepath.Join(upDir, cleaned)
+		if _, err := os.Stat(tryPath); err == nil {
+			return true
+		}
+	}
+
+	return false
 }

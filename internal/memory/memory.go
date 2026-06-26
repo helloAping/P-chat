@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/paths"
 	_ "modernc.org/sqlite"
@@ -397,7 +398,9 @@ func (s *Store) GetMessages() []llm.Message {
 			return out
 		}
 		msg := llm.Message{Role: role, Content: content}
-		// Re-attach metadata (e.g. tool_call_id, name) for tool messages.
+		// Re-attach metadata (e.g. tool_call_id, name, tool_calls,
+		// multi_content) for tool messages, assistant messages with
+		// native tool calls, and user messages with attachments.
 		if metadata.Valid && metadata.String != "" {
 			var meta map[string]string
 			if json.Unmarshal([]byte(metadata.String), &meta) == nil {
@@ -406,6 +409,26 @@ func (s *Store) GetMessages() []llm.Message {
 				}
 				if v, ok := meta["name"]; ok {
 					msg.Name = v
+				}
+				if v, ok := meta["tool_calls"]; ok && v != "" {
+					// Restore the native tool_calls array so the
+					// next turn's history replay matches the tool
+					// result messages' tool_call_id references.
+					var tcs []openai.ToolCall
+					if json.Unmarshal([]byte(v), &tcs) == nil {
+						msg.ToolCalls = tcs
+					}
+				}
+				if v, ok := meta["multi_content"]; ok && v != "" {
+					// Restore the multi-part content array (text +
+					// image_url) so uploaded images survive across
+					// turns. Without this the LLM would lose the
+					// image on the next turn and try to re-read it
+					// via read_file.
+					var parts []openai.ChatMessagePart
+					if json.Unmarshal([]byte(v), &parts) == nil {
+						msg.MultiContent = parts
+					}
 				}
 			}
 		}

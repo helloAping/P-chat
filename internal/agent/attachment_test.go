@@ -25,7 +25,7 @@ func TestExpandAttachments_Image(t *testing.T) {
 	}
 	out := expandAttachments(in, []Attachment{
 		{ID: id, Name: "test.png", Kind: "image", MIME: "image/png"},
-	}, resolver)
+	}, resolver, func() bool { return true })
 	if len(out) != 1 {
 		t.Fatalf("len(out) = %d, want 1", len(out))
 	}
@@ -65,7 +65,7 @@ func TestExpandAttachments_Text(t *testing.T) {
 	}
 	out := expandAttachments(in, []Attachment{
 		{ID: id, Name: "main.go", Kind: "text"},
-	}, resolver)
+	}, resolver, func() bool { return true })
 	if len(out) != 1 {
 		t.Fatalf("len(out) = %d, want 1", len(out))
 	}
@@ -102,7 +102,7 @@ func TestExpandAttachments_AudioDoesNotBreakLib(t *testing.T) {
 	}
 	out := expandAttachments(in, []Attachment{
 		{ID: id, Name: "song.mp3", Kind: "audio", MIME: "audio/mpeg"},
-	}, resolver)
+	}, resolver, func() bool { return true })
 	if len(out) != 1 {
 		t.Fatalf("len(out) = %d, want 1", len(out))
 	}
@@ -125,7 +125,7 @@ func TestExpandAttachments_NoAttachmentsPassThrough(t *testing.T) {
 	in := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleUser, Content: "hi"},
 	}
-	out := expandAttachments(in, nil, nil)
+	out := expandAttachments(in, nil, nil, func() bool { return true })
 	if len(out) != 1 {
 		t.Fatalf("len = %d", len(out))
 	}

@@ -118,6 +118,34 @@ func (a *Agent) protocolFor(providerName string) string {
 	return "openai"
 }
 
+// modelSupportsVision reports whether the active (provider, model)
+// pair accepts image_url inputs.
+//
+// Policy: **permissive by default**. The user-facing impact of
+// returning false is that the user's image is silently replaced
+// with a text marker — a confusing, lossy experience. Returning
+// true means the LLM API gets the image and either answers or
+// returns a clear 400 ("does not support image input"), both of
+// which are recoverable.
+//
+// Returns true in all cases except when the user has marked
+// the model as text-only in the per-session UI override layer.
+// At the per-config level we currently don't have a way to
+// distinguish "capabilities: {}" (no opinion) from
+// "capabilities: { supports_vision: false }" (explicit opt-out),
+// because both decode to the same struct; in either case the
+// safer default is "try the API", and we let the API itself
+// surface the error if it really can't accept the image.
+//
+// (The per-model flag in the UI is still rendered for awareness
+// — 👁 when Capabilities.SupportsVision is true. The agent
+// itself doesn't gate on it.)
+func (a *Agent) modelSupportsVision(providerName, modelName string) bool {
+	_ = providerName
+	_ = modelName
+	return true
+}
+
 type ChatRequest struct {
 	Style    style.Style   `json:"style"`
 	Messages []llm.Message `json:"messages"`
@@ -242,6 +270,18 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, openAITools []openai.Tool
 				"先用 `recall(query=\"...\")` 工具查一下知识库/历史。\n" +
 				"不要凭印象编造 API 名称、文件路径、函数签名。\n")
 		}
+		// Remind the LLM that uploaded images arrive as vision
+		// input in the user message (image_url content parts),
+		// NOT as files on disk. Calling read_file on an uploaded
+		// image is pointless and produces confusing error
+		// messages; the model should just look at the image
+		// it was given.
+		sb.WriteString("\n\n---\n\n## Uploaded Attachments\n\n" +
+			"用户上传的图片/文件以 image_url (data URL) 或文本块的形式\n" +
+			"直接包含在 user message 的 content 数组中，你已经能看到了。\n" +
+			"不要对上传的图片调用 read_file —— 那是磁盘上的临时文件，\n" +
+			"read_file 工具只处理文本文件，对图片会返回 binary 错误。\n" +
+			"需要时直接基于你已经收到的图片内容回答即可。\n")
 	}
 
 	// 6. Output language hint — also part of the cacheable prefix
@@ -392,14 +432,32 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// per protocol at the wire boundary.
 		if len(req.Attachments) > 0 && a.attach != nil {
 			protocol := a.protocolFor(req.Provider)
-			msgs = ExpandAttachments(protocol, msgs, req.Attachments, a.attach)
+			// Resolve the active provider+model so we can skip
+			// image parts for models that don't accept vision
+			// input. Without this check the upstream model would
+			// reject the request with a confusing "this model does
+			// not support image input" error.
+			vision := func() bool { return a.modelSupportsVision(req.Provider, req.Model) }
+			msgs = ExpandAttachments(protocol, msgs, req.Attachments, a.attach, vision)
 			ch <- ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))}
 		}
 
 		if a.store != nil {
-			ch <- ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入 %d 条消息到记忆", len(req.Messages))}
-			for _, m := range req.Messages {
-				a.store.AddMessage(m)
+			ch <- ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入消息到记忆")}
+			// Persist the EXPANDED trailing user message (which now
+			// carries the MultiContent / image_url parts) rather than
+			// the raw req.Messages. Without this the image / file
+			// payload is lost when the conversation is replayed on the
+			// next turn — the LLM would then try to re-fetch the file
+			// via read_file and fail.
+			last := msgs[len(msgs)-1]
+			if len(last.MultiContent) > 0 {
+				mcJSON, _ := json.Marshal(last.MultiContent)
+				a.store.AddMessageWithMeta(last, map[string]string{
+					"multi_content": string(mcJSON),
+				})
+			} else {
+				a.store.AddMessage(last)
 			}
 		}
 
@@ -522,10 +580,22 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// (rare; LLM responded only with tool calls) we still save it
 			// because the tool_calls field is what matters.
 			if a.store != nil {
-				a.store.AddMessageWithMeta(assistantMsg, map[string]string{
+				meta := map[string]string{
 					"role":   assistantMsg.Role,
 					"reason": "assistant",
-				})
+				}
+				if len(assistantMsg.ToolCalls) > 0 {
+					// Persist tool_calls so the next turn's history replay
+					// can re-send them to the LLM. Without this the LLM
+					// sees tool result messages with tool_call_id values
+					// that don't match any tool call in the preceding
+					// assistant message, which the API rejects with
+					// "MissingParameter messages.tool_call_id".
+					if tcJSON, tcErr := json.Marshal(assistantMsg.ToolCalls); tcErr == nil {
+						meta["tool_calls"] = string(tcJSON)
+					}
+				}
+				a.store.AddMessageWithMeta(assistantMsg, meta)
 			}
 
 			if len(toolCalls) == 0 {

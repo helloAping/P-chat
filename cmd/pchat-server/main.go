@@ -91,7 +91,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if wd := serverproc.WebDirFromEnv(); wd != "" {
 		staticFS = http.Dir(wd)
 	}
-	srv := server.NewWithStaticFS(cfg, agt, memStore, staticFS)
+	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, staticFS)
 
 	// PCHAT_PORT overrides the configured port. This is how the
 	// parent process (pchat / pchat-gui) tells us which ephemeral

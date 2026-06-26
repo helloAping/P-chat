@@ -29,8 +29,10 @@ var ErrBinaryFile = errors.New("binary file")
 // readFileForTool is the path used by the read_file tool. It
 // returns ErrBinaryFile (with a clear message) when the target
 // is a known binary type, so the agent can surface a useful
-// "this is an image; vision not supported" reply instead of
-// dumping garbled bytes into the next model turn.
+// reply instead of dumping garbled bytes into the next model
+// turn. For uploaded images the message also tells the model
+// the image is already available as vision input in the
+// conversation, so it should NOT try read_file on it.
 //
 // Detection (in order):
 //  1. Extension: known binary (image / audio / video / archive /
@@ -47,9 +49,12 @@ func readFileForTool(p string) ([]byte, error) {
 	}
 	ext := strings.ToLower(path.Ext(p))
 	if kind, ok := binaryKindByExt(ext); ok {
-		return nil, fmt.Errorf("%w: %s (%s); the read_file tool only handles text files. "+
-			"If you need to look at this file, ask the user to convert it to text "+
-			"or use a vision-capable model", ErrBinaryFile, p, kind)
+		hint := "If you need to look at this file, ask the user to convert it to text or use a vision-capable model"
+		if kind == "image" {
+			hint = "This image is ALREADY attached to the user's message as vision input — you can see it directly. Do NOT call read_file on uploaded images; just respond based on the image you already received."
+		}
+		return nil, fmt.Errorf("%w: %s (%s); the read_file tool only handles text files. %s",
+			ErrBinaryFile, p, kind, hint)
 	}
 	data, err := os.ReadFile(p)
 	if err != nil {

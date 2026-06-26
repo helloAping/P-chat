@@ -24,9 +24,10 @@ import (
 // agent and the persistent memory store so that messages and
 // sessions survive across requests.
 type Handler struct {
-	agent *agent.Agent
-	cfg   *config.Config
-	store *memory.Store
+	agent    *agent.Agent
+	cfg      *config.Config
+	store    *memory.Store
+	styleMgr *style.Manager
 
 	// sessionMeta remembers the per-session style + provider +
 	// model overrides. The in-memory map is the hot path for
@@ -53,12 +54,13 @@ type sessionMetaBlob struct {
 	Model    string `json:"model,omitempty"`
 }
 
-func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store) *Handler {
+func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager) *Handler {
 	h := &Handler{
-		agent: a,
-		cfg:   cfg,
-		store: store,
-		meta:  make(map[string]sessionMeta),
+		agent:    a,
+		cfg:      cfg,
+		store:    store,
+		styleMgr: styleMgr,
+		meta:     make(map[string]sessionMeta),
 	}
 	// Wire the upload resolver so the agent can read attached
 	// files by their upload id. The resolver lives in the agent
@@ -203,14 +205,15 @@ type SendMessageRequest struct {
 	// values mean "no change".
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
-	// Attachments is a list of file ids (returned earlier by
-	// POST /api/v1/uploads) the user attached to this turn. The
-	// handler reads each file from the uploads dir, classifies
-	// it (image / audio / text / file), and expands the trailing
-	// user message into a multi-part content array before
-	// sending to the LLM. The protocol-specific serialisation
-	// (OpenAI image_url vs Anthropic image+source) is handled
-	// by the LLM client.
+	// Attachments are the files the user attached to this turn.
+	// The new SPA path sends the bytes inline in `Data` (a data:
+	// URL for binaries, raw text for text files). The legacy
+	// path sends an `id` from /api/v1/uploads which the
+	// resolver reads from disk. Either way the handler hands
+	// the agent a list and the agent turns them into a
+	// multi-part trailing user message before the LLM call.
+	// The protocol-specific serialisation (OpenAI image_url vs
+	// Anthropic image+source) is handled by the LLM client.
 	Attachments []agent.Attachment `json:"attachments,omitempty"`
 }
 
@@ -267,6 +270,23 @@ type MessageResponse struct {
 	// the legacy single-conversation flow leaves them empty.
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
+	// Attachments are the image/file parts that were sent with this
+	// user message, in their wire form (data URLs for images, text
+	// blocks for files). The frontend renders them as part of the
+	// message bubble so the user can see what was actually sent.
+	Attachments []AttachmentPart `json:"attachments,omitempty"`
+}
+
+// AttachmentPart is a single part of a multi-content message,
+// suitable for the frontend to render. Mirrors the OpenAI
+// ChatMessagePart shape but is scoped to what the UI needs.
+type AttachmentPart struct {
+	Type     string `json:"type"`               // "image_url" | "text"
+	URL      string `json:"url,omitempty"`       // data URL for images
+	Text     string `json:"text,omitempty"`      // text body for text parts
+	Name     string `json:"name,omitempty"`     // original filename, for display
+	MIME     string `json:"mime,omitempty"`     // MIME type
+	Kind     string `json:"kind,omitempty"`     // image / audio / text / file
 }
 
 // StreamEvent is one chunk of a Server-Sent Events stream from
@@ -304,33 +324,191 @@ func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
+// StyleMeta is the wire shape returned by /api/v1/styles. id is
+// the machine identifier (used as the session-meta value), label
+// is the human-readable display name, and desc is a one-line
+// description that comes from the style's identity/*.md file's
+// first non-empty paragraph (or a generic fallback when the
+// style has no description of its own).
+type StyleMeta struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Desc  string `json:"desc"`
+}
+
 func (h *Handler) Styles(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"styles": []gin.H{
-			{"id": "cute", "label": "小P (PiPi)", "desc": "软萌治愈风格"},
-			{"id": "guofeng", "label": "墨言 (MoYan)", "desc": "古风雅致风格"},
-			{"id": "tech", "label": "NEXUS (零号)", "desc": "科技极客风格"},
-		},
+	if h.styleMgr == nil {
+		c.JSON(http.StatusOK, gin.H{"styles": []StyleMeta{}})
+		return
+	}
+	out := []StyleMeta{}
+	for _, s := range h.styleMgr.ListAll() {
+		out = append(out, StyleMeta{
+			ID:    string(s),
+			Label: h.styleMgr.Label(s),
+			Desc:  styleDescFor(h.styleMgr, s),
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"styles": out})
+}
+
+// styleDescFor extracts a one-line description from a style's
+// identity text. We use the first non-empty, non-heading paragraph
+// — that's where the prompt typically introduces the persona
+// ("你是墨言..."). Falls back to the label for built-ins and a
+// generic message for user-added styles whose first paragraph is
+// missing.
+func styleDescFor(m *style.Manager, s style.Style) string {
+	identity, err := m.GetIdentity(s)
+	if err != nil || identity == "" {
+		return ""
+	}
+	for _, line := range strings.Split(identity, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "" {
+			continue
+		}
+		// Skip the markdown header line.
+		if strings.HasPrefix(trim, "#") {
+			continue
+		}
+		// Take the first non-heading line and cap at ~60 runes so
+		// the table row stays one line.
+		r := []rune(trim)
+		if len(r) > 60 {
+			return string(r[:60]) + "…"
+		}
+		return trim
+	}
+	return ""
+}
+
+// CreateStyleRequest is the POST /api/v1/styles body.
+type CreateStyleRequest struct {
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Identity string `json:"identity"`
+	Soul     string `json:"soul"`
+}
+
+func (h *Handler) CreateStyle(c *gin.Context) {
+	if h.styleMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "style manager not available"})
+		return
+	}
+	var req CreateStyleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if req.Identity == "" {
+		req.Identity = "# P-Chat AI 编程程序\n\n当前是 P-Chat AI 编程程序。\n"
+	}
+	if req.Soul == "" {
+		req.Soul = "你是一个 AI 助手。"
+	}
+	s, err := h.styleMgr.Create(req.ID, req.Label, req.Identity, req.Soul)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"id":    string(s),
+		"label": h.styleMgr.Label(s),
+		"desc":  styleDescFor(h.styleMgr, s),
 	})
 }
 
+// GetStyle returns the full identity + soul of a single style.
+func (h *Handler) GetStyle(c *gin.Context) {
+	if h.styleMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "style manager not available"})
+		return
+	}
+	id := c.Param("id")
+	s := style.Style(id)
+	identity, err := h.styleMgr.GetIdentity(s)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	soul, _ := h.styleMgr.GetSoul(s)
+	c.JSON(http.StatusOK, gin.H{
+		"id":       id,
+		"label":    h.styleMgr.Label(s),
+		"identity": identity,
+		"soul":     soul,
+	})
+}
+
+// UpdateStyleRequest is the PATCH /api/v1/styles/:id body. Any
+// non-empty field is overwritten; empty fields are skipped.
+type UpdateStyleRequest struct {
+	Label    string `json:"label,omitempty"`
+	Identity string `json:"identity,omitempty"`
+	Soul     string `json:"soul,omitempty"`
+}
+
+func (h *Handler) UpdateStyle(c *gin.Context) {
+	if h.styleMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "style manager not available"})
+		return
+	}
+	id := c.Param("id")
+	var req UpdateStyleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if err := h.styleMgr.Update(id, req.Label, req.Identity, req.Soul); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id})
+}
+
+func (h *Handler) DeleteStyle(c *gin.Context) {
+	if h.styleMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "style manager not available"})
+		return
+	}
+	id := c.Param("id")
+	if err := h.styleMgr.Delete(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id})
+}
+
 func (h *Handler) Providers(c *gin.Context) {
+	type modelInfo struct {
+		config.ModelConfig
+		SupportsVision bool `json:"supports_vision"`
+	}
 	type providerInfo struct {
-		Name     string               `json:"name"`
-		Model    string               `json:"model"`
-		Protocol string               `json:"protocol"`
-		IsDefault bool                `json:"is_default"`
-		Models   []config.ModelConfig `json:"models"`
+		Name      string      `json:"name"`
+		Model     string      `json:"model"`
+		Protocol  string      `json:"protocol"`
+		IsDefault bool        `json:"is_default"`
+		Models    []modelInfo `json:"models"`
 	}
 
 	providers := []providerInfo{}
 	for _, p := range h.cfg.LLM.Providers {
+		raw := p.AllModels()
+		ms := make([]modelInfo, 0, len(raw))
+		for _, m := range raw {
+			ms = append(ms, modelInfo{
+				ModelConfig:    m,
+				SupportsVision: m.Capabilities.SupportsVision,
+			})
+		}
 		providers = append(providers, providerInfo{
 			Name:      p.Name,
 			Model:     p.EffectiveModel(),
 			Protocol:  p.GetProtocol(),
 			IsDefault: p.Name == h.cfg.LLM.Default,
-			Models:    p.AllModels(),
+			Models:    ms,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"providers": providers})
@@ -604,16 +782,103 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	out := make([]MessageResponse, 0, len(msgs))
 	for _, m := range msgs {
 		created := time.Now().Unix() // best-effort; exact ts requires schema change
-		out = append(out, MessageResponse{
+		resp := MessageResponse{
 			ID:         0, // not exposed individually yet
 			Role:       m.Role,
 			Content:    m.Content,
 			CreatedAt:  created,
 			ToolCallID: m.ToolCallID,
 			Name:       m.Name,
-		})
+		}
+		// Surface image / file attachments that were part of the
+		// user message so the UI can render them in the bubble.
+		// For user messages we lift the *first* plain text part
+		// back into `content` so the spoken text becomes the
+		// main bubble body and the attachments render as chips
+		// alongside it. This mirrors what the frontend already
+		// does at send time and means reloading a session after
+		// a server restart shows the same message layout.
+		if len(m.MultiContent) > 0 {
+			liftedText := false
+			for _, p := range m.MultiContent {
+				switch p.Type {
+				case "image_url":
+					url := ""
+					if p.ImageURL != nil {
+						url = p.ImageURL.URL
+					}
+					resp.Attachments = append(resp.Attachments, AttachmentPart{
+						Type: "image_url",
+						URL:  url,
+						MIME: mimeFromDataURL(url),
+						Kind: "image",
+					})
+				case "text":
+					// Skip the "image not supported" marker for
+					// user-message text-lifting: it's a system
+					// note, not what the user typed. It still
+					// gets emitted as an attachment so the UI
+					// can show the warning chip.
+					isWarn := strings.HasPrefix(p.Text, "(attached image:") && strings.Contains(p.Text, "does not support image input")
+					if m.Role == "user" && !liftedText && !isWarn {
+						resp.Content = p.Text
+						liftedText = true
+						continue
+					}
+					if isWarn {
+						resp.Attachments = append(resp.Attachments, AttachmentPart{
+							Type: "text",
+							Text: p.Text,
+							Name: "image-not-supported",
+							Kind: "image_not_supported",
+							MIME: "text/plain",
+						})
+						continue
+					}
+					name, kind, mime := inferTextPartMeta(p.Text)
+					resp.Attachments = append(resp.Attachments, AttachmentPart{
+						Type: "text",
+						Text: p.Text,
+						Name: name,
+						Kind: kind,
+						MIME: mime,
+					})
+				}
+			}
+		}
+		out = append(out, resp)
 	}
 	c.JSON(http.StatusOK, gin.H{"messages": out})
+}
+
+// mimeFromDataURL extracts the MIME type from a data URL
+// ("data:<mime>;base64,..."). Returns "" if the URL is not a
+// data URL.
+func mimeFromDataURL(u string) string {
+	if !strings.HasPrefix(u, "data:") {
+		return ""
+	}
+	rest := strings.TrimPrefix(u, "data:")
+	if i := strings.Index(rest, ";"); i >= 0 {
+		return rest[:i]
+	}
+	return ""
+}
+
+// inferTextPartMeta pulls a filename / kind hint out of a text
+// part produced by the agent's attachment expansion. The agent
+// prefixes file dumps with "--- <name> ---"; we surface that as
+// the part's display name.
+func inferTextPartMeta(s string) (name, kind, mime string) {
+	s = strings.TrimSpace(s)
+	const marker = "--- "
+	if strings.HasPrefix(s, marker) {
+		rest := strings.TrimPrefix(s, marker)
+		if i := strings.Index(rest, " ---"); i >= 0 {
+			return rest[:i], "text", "text/plain"
+		}
+	}
+	return "", "text", "text/plain"
 }
 
 // SendMessage is the main streaming endpoint. It accepts a user
@@ -642,11 +907,21 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		return
 	}
 
-	// Resolve style (per-session override > body > default)
+	// Resolve style: body override → per-session override →
+	// configured default → built-in "tech" fallback. The
+	// per-session lookup is the one piece that was missing —
+	// without it, switching the picker never took effect on the
+	// next message because the body always omits the style.
 	s, _ := style.ParseStyle(req.Style)
 	if s == "" {
-		// Fall back to the agent's default
-		s = style.Tech
+		s = style.Style(h.sessionStyle(id))
+	}
+	if s == "" {
+		if def := style.Style(h.cfg.Style.Default); def != "" {
+			s = def
+		} else {
+			s = style.Tech
+		}
 	}
 
 	// Resolve provider: body override → per-session override →

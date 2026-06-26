@@ -1,0 +1,51 @@
+/* Global styles for the P-Chat Vue frontend. Most UI is rendered
+ * through Naive UI components, which carry their own theming.
+ * This file only holds the layout shell, scrollbar tweaks, and
+ * a few utility classes the components reuse. */
+
+:root {
+  --bg: #0f1115;
+  --bg-2: #1a1d24;
+  --bg-3: #252830;
+  --bg-input: #1a1d24;
+  --text: #e6e6e6;
+  --text-2: #b0b3ba;
+  --text-3: #8a8d95;
+  --text-4: #5a5d65;
+  --border: #2a2d35;
+  --border-2: #3a3d45;
+  --accent: #4a4dff;
+  --accent-2: #7a7dff;
+  --error: #e55;
+  --success: #5a5;
+  --warn: #ea5;
+}
+
+html, body, #app {
+  margin: 0; padding: 0;
+  height: 100%; width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+}
+
+* { box-sizing: border-box; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-4); }
+
+/* Markdown body for assistant messages */
+.md-body { line-height: 1.6; }
+.md-body p { margin: 0 0 8px 0; }
+.md-body p:last-child { margin-bottom: 0; }
+.md-body code { background: var(--bg-3); padding: 2px 6px; border-radius: 3px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.9em; }
+.md-body pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow-x: auto; }
+.md-body pre code { background: none; padding: 0; }
+.md-body a { color: var(--accent-2); }
+.md-body ul, .md-body ol { padding-left: 24px; }
+.md-body blockquote { border-left: 3px solid var(--border-2); padding-left: 12px; color: var(--text-2); margin: 8px 0; }
