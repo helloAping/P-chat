@@ -1,4 +1,4 @@
-package tool
+﻿package tool
 
 import (
 	"context"
@@ -153,5 +153,95 @@ func TestObjectSchema_Basic(t *testing.T) {
 	}
 	if !strings.Contains(string(s), `"required"`) {
 		t.Errorf("schema missing required: %s", s)
+	}
+}
+func TestReadFile_RefusesImageByExtension(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "image.png")
+	if err := os.WriteFile(p, []byte("fake png content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := handleReadFile(context.Background(), []byte(`{"path":"`+filepath.ToSlash(p)+`"}`))
+	if !res.IsError {
+		t.Fatalf("expected error, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "image") {
+		t.Errorf("error should mention image, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "vision") {
+		t.Errorf("error should hint at vision, got %q", res.Content)
+	}
+}
+
+func TestReadFile_RefusesAudioByExtension(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "song.mp3")
+	if err := os.WriteFile(p, []byte("fake mp3"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := handleReadFile(context.Background(), []byte(`{"path":"`+filepath.ToSlash(p)+`"}`))
+	if !res.IsError {
+		t.Fatalf("expected error, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "audio") {
+		t.Errorf("error should mention audio, got %q", res.Content)
+	}
+}
+
+func TestReadFile_RefusesBinaryByContent(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "data.bin")
+	// PNG signature: 89 50 4E 47 0D 0A 1A 0A + garbage.
+	binary := append([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, []byte("not really a png")...)
+	if err := os.WriteFile(p, binary, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := handleReadFile(context.Background(), []byte(`{"path":"`+filepath.ToSlash(p)+`"}`))
+	if !res.IsError {
+		t.Fatalf("expected error, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "binary") {
+		t.Errorf("error should mention binary, got %q", res.Content)
+	}
+}
+
+func TestReadFile_AllowsText(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "hello.txt")
+	if err := os.WriteFile(p, []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := handleReadFile(context.Background(), []byte(`{"path":"`+filepath.ToSlash(p)+`"}`))
+	if res.IsError {
+		t.Fatalf("text file should not error, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "hello world") {
+		t.Errorf("text content not returned, got %q", res.Content)
+	}
+}
+
+func TestReadFile_AllowsUnknownExtensionWithText(t *testing.T) {
+	// .xyz is not in the binary list. Even with an unknown
+	// extension, a text-content file should be readable.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "weird.xyz")
+	if err := os.WriteFile(p, []byte("just text"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := handleReadFile(context.Background(), []byte(`{"path":"`+filepath.ToSlash(p)+`"}`))
+	if res.IsError {
+		t.Fatalf("unknown-ext text should not error, got %q", res.Content)
+	}
+}
+
+func TestIsBinary(t *testing.T) {
+	if isBinary([]byte("plain text")) {
+		t.Error("plain text shouldn't be binary")
+	}
+	if !isBinary([]byte{0x00, 0x01, 0x02}) {
+		t.Error("a NUL byte should make it binary")
+	}
+	if isBinary(nil) {
+		t.Error("empty should not be binary")
 	}
 }

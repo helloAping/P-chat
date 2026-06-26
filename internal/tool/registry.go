@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -222,8 +223,20 @@ func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 		return &CallResult{Content: "path is required", IsError: true}, nil
 	}
 
-	data, err := readFile(a.Path)
+	data, err := readFileForTool(a.Path)
 	if err != nil {
+		// Binary files get a clearer message than the bare
+		// error. Everything else uses the normal error
+		// channel so the LLM can react.
+		if errors.Is(err, ErrBinaryFile) {
+			return &CallResult{
+				Content: err.Error() + "\nHint: if the user uploaded this file as an attachment, " +
+					"the chat UI already inlines it as a multimodal part when the model " +
+					"supports vision. Otherwise ask the user to switch to a vision-capable " +
+					"model or paste the relevant text manually.",
+				IsError: true,
+			}, nil
+		}
 		return &CallResult{Content: err.Error(), IsError: true}, nil
 	}
 	return &CallResult{Content: string(data)}, nil

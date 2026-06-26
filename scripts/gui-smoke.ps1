@@ -1,0 +1,158 @@
+# End-to-end smoke test for the desktop app bundle.
+#
+#   1. install.ps1 to a temp InstallDir (with -Portable so we don't
+#      touch the real Start Menu / registry)
+#   2. launch the installed pchat-gui.exe, wait for pchat-server
+#      to become healthy
+#   3. hit /api/v1/health + /api/v1/providers through the spawned
+#      server
+#   4. kill pchat-gui
+#   5. uninstall.ps1 to clean up
+#
+# Exits 0 on full pass, non-zero on any failure.
+
+$ErrorActionPreference = "Stop"
+
+$bundle   = "D:\develop\project\P-chat\cmd\pchat-gui\build\bin"
+$install  = Join-Path $env:TEMP "pchat-smoke-install"
+$log      = Join-Path $env:TEMP "pchat-smoke.log"
+$guiLog   = Join-Path $install "pchat-gui.log"
+$serverLog= Join-Path $install "pchat-server.log"
+
+function Step($n, $msg) { Write-Host ""; Write-Host "==== [$n] $msg ====" -ForegroundColor Cyan }
+
+# 0. clean previous state
+Get-Process -Name "pchat-gui","pchat-server" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
+if (Test-Path -LiteralPath $install) { Remove-Item -LiteralPath $install -Recurse -Force }
+
+# 1. install (no -Portable, so we get a real separate install dir; no
+#    Start Menu / registry because the test passes -NoStartMenu)
+Step 1 "install.ps1 -NoStartMenu -InstallDir $install"
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bundle "install.ps1") -NoStartMenu -InstallDir $install 2>&1 | Tee-Object -FilePath $log | Out-Null
+if (-not (Test-Path -LiteralPath (Join-Path $install "pchat-gui.exe"))) {
+    Write-Host "FAIL: pchat-gui.exe missing after install" -ForegroundColor Red
+    Get-Content -LiteralPath $log -Raw | Out-String
+    exit 1
+}
+if (-not (Test-Path -LiteralPath (Join-Path $install "pchat-server.exe"))) {
+    Write-Host "FAIL: pchat-server.exe missing after install" -ForegroundColor Red
+    Get-Content -LiteralPath $log -Raw | Out-String
+    exit 1
+}
+if (-not (Test-Path -LiteralPath (Join-Path $install "uninstall.ps1"))) {
+    Write-Host "FAIL: uninstall.ps1 missing after install" -ForegroundColor Red
+    exit 1
+}
+Write-Host "OK: bundle present in $install" -ForegroundColor Green
+
+# 2. launch the installed pchat-gui
+Step 2 "launch pchat-gui.exe from $install"
+Remove-Item -LiteralPath $guiLog,$serverLog -ErrorAction SilentlyContinue
+$proc = Start-Process -FilePath (Join-Path $install "pchat-gui.exe") -PassThru -WindowStyle Hidden
+Start-Sleep -Seconds 2
+if ($proc.HasExited) {
+    Write-Host "FAIL: pchat-gui exited immediately (code=$($proc.ExitCode))" -ForegroundColor Red
+    if (Test-Path -LiteralPath $guiLog) { Get-Content -LiteralPath $guiLog -Raw | Out-String }
+    exit 1
+}
+Write-Host "OK: pchat-gui PID=$($proc.Id) is running" -ForegroundColor Green
+
+# 3. wait for pchat-server to become healthy (pchat-gui spawns it as a child)
+Step 3 "wait for pchat-server to become healthy (max 30s)"
+$port = $null
+$deadline = (Get-Date).AddSeconds(30)
+while ((Get-Date) -lt $deadline) {
+    if (Test-Path -LiteralPath $guiLog) {
+        $m = Select-String -Path $guiLog -Pattern "picked port (\d+)" -ErrorAction SilentlyContinue
+        if ($m) { $port = [int]$m.Matches[0].Groups[1].Value; break }
+    }
+    Start-Sleep -Milliseconds 500
+}
+if (-not $port) {
+    Write-Host "FAIL: pchat-gui never picked a port" -ForegroundColor Red
+    if (Test-Path -LiteralPath $guiLog) { Get-Content -LiteralPath $guiLog -Raw | Out-String }
+    if (Test-Path -LiteralPath $serverLog) { Get-Content -LiteralPath $serverLog -Raw | Out-String }
+    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+Write-Host "OK: pchat-gui picked port $port" -ForegroundColor Green
+
+# 4. hit /api/v1/health
+Step 4 "GET http://127.0.0.1:$port/api/v1/health"
+try {
+    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/health" -UseBasicParsing -TimeoutSec 5
+    if ($r.StatusCode -ne 200) { throw "status=$($r.StatusCode)" }
+    Write-Host "OK: $($r.Content)" -ForegroundColor Green
+} catch {
+    Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
+    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+
+# 5. hit /api/v1/providers to confirm web UI flow
+Step 5 "GET http://127.0.0.1:$port/api/v1/providers"
+try {
+    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/providers" -UseBasicParsing -TimeoutSec 5
+    if ($r.StatusCode -ne 200) { throw "status=$($r.StatusCode)" }
+    $body = $r.Content
+    if ($body -notmatch '"cs"') { throw "providers response missing 'cs': $body" }
+    Write-Host "OK: providers list contains user-configured 'cs' provider" -ForegroundColor Green
+} catch {
+    Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
+    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+
+# 6. fetch the web UI HTML to confirm web/index.html is reachable
+Step 6 "GET http://127.0.0.1:$port/app/index.html"
+try {
+    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/app/index.html" -UseBasicParsing -TimeoutSec 5
+    if ($r.StatusCode -ne 200) { throw "status=$($r.StatusCode)" }
+    if ($r.Content -notmatch '<title>P-Chat</title>') { throw "html title is not P-Chat" }
+    Write-Host "OK: web/index.html served, content-length=$($r.Content.Length)" -ForegroundColor Green
+} catch {
+    Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
+    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+
+# 7. kill pchat-gui (which should kill the child pchat-server)
+Step 7 "stop pchat-gui (kills child pchat-server)"
+# Use taskkill /T /F so the whole process tree dies even if pchat-gui's
+# graceful-shutdown handler doesn't get a chance to run. This is the
+# same behavior the uninstall script relies on.
+& taskkill /T /F /PID $proc.Id 2>&1 | Out-Null
+# Give the kernel a moment to reap.
+for ($i = 0; $i -lt 20; $i++) {
+    $still = Get-Process -Name "pchat-gui","pchat-server" -ErrorAction SilentlyContinue
+    if (-not $still) { break }
+    Start-Sleep -Milliseconds 250
+}
+$stillRunning = Get-Process -Name "pchat-gui","pchat-server" -ErrorAction SilentlyContinue
+if ($stillRunning) {
+    Write-Host "WARN: $($stillRunning.Count) leftover process(es) - cleaning up" -ForegroundColor Yellow
+    & taskkill /T /F /IM "pchat-server.exe" 2>&1 | Out-Null
+    & taskkill /T /F /IM "pchat-gui.exe"    2>&1 | Out-Null
+}
+Write-Host "OK: cleanup done" -ForegroundColor Green
+
+# 8. uninstall (full remove)
+Step 8 "uninstall.ps1"
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $install "uninstall.ps1") 2>&1 | Tee-Object -FilePath $log -Append | Out-Null
+Start-Sleep -Seconds 1
+if (Test-Path -LiteralPath $install) {
+    # The uninstall may have scheduled a deferred delete; wait briefly
+    Start-Sleep -Seconds 2
+    if (Test-Path -LiteralPath $install) {
+        Write-Host "WARN: $install still exists after uninstall; manual cleanup" -ForegroundColor Yellow
+    } else {
+        Write-Host "OK: $install removed" -ForegroundColor Green
+    }
+} else {
+    Write-Host "OK: $install removed" -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Host "==== SMOKE TEST PASSED ====" -ForegroundColor Green
+exit 0

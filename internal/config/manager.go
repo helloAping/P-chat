@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 
 	"github.com/p-chat/pchat/internal/paths"
-	"gopkg.in/yaml.v3"
 )
 
 // Manager handles reading and writing config files.
@@ -26,15 +25,12 @@ func (m *Manager) Load() (*Config, error) {
 	return Load("")
 }
 
-// SaveGlobal saves the config to ~/.p-chat/config.yaml
+// SaveGlobal saves the config to ~/.p-chat/config.json.
 func (m *Manager) SaveGlobal(cfg *Config) error {
-	if err := os.MkdirAll(filepath.Dir(m.globalPath), 0o755); err != nil {
-		return err
-	}
 	return m.writeConfig(m.globalPath, cfg)
 }
 
-// SaveProject saves the config to .p-chat/config.yaml
+// SaveProject saves the config to .p-chat/config.json.
 func (m *Manager) SaveProject(cfg *Config) error {
 	if err := os.MkdirAll(filepath.Dir(m.projectPath), 0o755); err != nil {
 		return err
@@ -43,31 +39,27 @@ func (m *Manager) SaveProject(cfg *Config) error {
 }
 
 func (m *Manager) writeConfig(path string, cfg *Config) error {
-	data, err := yaml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-	return os.WriteFile(path, data, 0o644)
+	return writeConfigJSON(path, cfg)
 }
 
-// AddProvider adds or replaces a provider in the global config
+// AddProvider adds a new provider to the global config. If a
+// provider with the same name already exists, the call returns
+// an error and the config is left unchanged. (The web UI uses
+// this strict semantics so a typo doesn't silently overwrite
+// an existing provider; the CLI's /config add flow can call
+// the upsert variant explicitly if it wants overwrite
+// behavior.)
 func AddProvider(p ProviderConfig) error {
 	cfg, err := Load("")
 	if err != nil {
 		return err
 	}
-
-	found := false
-	for i, existing := range cfg.LLM.Providers {
+	for _, existing := range cfg.LLM.Providers {
 		if existing.Name == p.Name {
-			cfg.LLM.Providers[i] = p
-			found = true
-			break
+			return fmt.Errorf("provider %q already exists; use a different name (or remove the existing one first)", p.Name)
 		}
 	}
-	if !found {
-		cfg.LLM.Providers = append(cfg.LLM.Providers, p)
-	}
+	cfg.LLM.Providers = append(cfg.LLM.Providers, p)
 
 	mgr := NewManager()
 	return mgr.SaveGlobal(cfg)
@@ -235,6 +227,86 @@ func SetDefaultModel(providerName, modelName string) error {
 	return fmt.Errorf("provider %q not found", providerName)
 }
 
+// UpdateModel replaces the fields of a single model under a
+// provider. The Name is the immutable lookup key. The supplied
+// patch is applied to the existing model (the model is not
+// removed-and-readded), so per-model settings such as Default
+// stay consistent.
+//
+// When clearAll is true, DisplayName / Description /
+// MaxTokensContext / MaxTokensOutput are all reset to their
+// zero values, and only Capabilities (which is always
+// replaced) is taken from the patch. Use this to reset a model
+// to "just a name".
+//
+// Otherwise the patch is merged: a zero value in a numeric
+// patch field means "leave alone"; an empty DisplayName /
+// Description also means "leave alone". The current value is
+// kept. This matches the PUT semantics documented in
+// internal/server/provider_api.go.
+//
+// If the provider only has the legacy single `model` field, the
+// update is interpreted as a migration: the legacy entry is
+// promoted into Models[name] and the supplied patch is applied
+// to that entry.
+func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll bool) (*ProviderConfig, error) {
+	cfg, err := Load("")
+	if err != nil {
+		return nil, err
+	}
+	for i, p := range cfg.LLM.Providers {
+		if p.Name != providerName {
+			continue
+		}
+		// Legacy single-model form: migrate the legacy entry
+		// into Models so the rest of the function can treat it
+		// uniformly.
+		if len(p.Models) == 0 && p.Model != "" {
+			p.Models = []ModelConfig{{Name: p.Model, Default: true}}
+		}
+		// After migration, the model must be in p.Models.
+		idx := -1
+		for j := range p.Models {
+			if p.Models[j].Name == modelName {
+				idx = j
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("model %q not found under provider %q", modelName, providerName)
+		}
+		m := &p.Models[idx]
+		if clearAll {
+			m.DisplayName = ""
+			m.Description = ""
+			m.MaxTokensContext = 0
+			m.MaxTokensOutput = 0
+		} else {
+			if patch.DisplayName != "" {
+				m.DisplayName = patch.DisplayName
+			}
+			if patch.Description != "" {
+				m.Description = patch.Description
+			}
+			if patch.MaxTokensContext != 0 {
+				m.MaxTokensContext = patch.MaxTokensContext
+			}
+			if patch.MaxTokensOutput != 0 {
+				m.MaxTokensOutput = patch.MaxTokensOutput
+			}
+		}
+		// Capabilities is always replaced (it's a struct value).
+		m.Capabilities = patch.Capabilities
+		cfg.LLM.Providers[i] = p
+		mgr := NewManager()
+		if err := mgr.SaveGlobal(cfg); err != nil {
+			return nil, err
+		}
+		return &p, nil
+	}
+	return nil, fmt.Errorf("provider %q not found", providerName)
+}
+
 // ThinkingEffort hints how much "thinking" a model should do before
 // answering. It's an enum the UI/CLI write into config; providers
 // translate it into their own native parameter.
@@ -251,10 +323,10 @@ const (
 // can read at runtime. They're informational; the provider's own
 // /models endpoint is the source of truth where available.
 type Capabilities struct {
-	ThinkingEffort ThinkingEffort `yaml:"thinking_effort,omitempty" json:"thinking_effort,omitempty"`
-	ContextWindow  int            `yaml:"context_window,omitempty" json:"context_window,omitempty"`
-	SupportsVision bool           `yaml:"supports_vision,omitempty" json:"supports_vision,omitempty"`
-	SupportsAudio  bool           `yaml:"supports_audio,omitempty" json:"supports_audio,omitempty"`
+	ThinkingEffort ThinkingEffort `json:"thinking_effort,omitempty"`
+	ContextWindow  int            `json:"context_window,omitempty"`
+	SupportsVision bool           `json:"supports_vision,omitempty"`
+	SupportsAudio  bool           `json:"supports_audio,omitempty"`
 }
 
 // SetModelCapabilities replaces the Capabilities block for a single

@@ -1,23 +1,30 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
-	"gopkg.in/yaml.v3"
 )
 
+// Config is the on-disk configuration of P-Chat, stored as JSON in
+// ~/.p-chat/config.json (with a per-project .p-chat/config.json
+// overlay). Project overrides global.
+//
+// Field tags use `json` exclusively; the previous yaml tags have
+// been removed. The loader still accepts a legacy config.yaml as
+// a one-shot migration source — see Load.
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	LLM      LLMConfig      `yaml:"llm"`
-	Style    StyleConfig    `yaml:"style"`
-	Tools    ToolsConfig    `yaml:"tools"`
-	Memory   MemoryConfig   `yaml:"memory"`
-	Sandbox  SandboxConfig  `yaml:"sandbox"`
-	SubAgent SubAgentConfig `yaml:"subagent"`
+	Server   ServerConfig   `json:"server"`
+	LLM      LLMConfig      `json:"llm"`
+	Style    StyleConfig    `json:"style"`
+	Tools    ToolsConfig    `json:"tools"`
+	Memory   MemoryConfig   `json:"memory"`
+	Sandbox  SandboxConfig  `json:"sandbox"`
+	SubAgent SubAgentConfig `json:"subagent"`
 }
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
@@ -30,17 +37,17 @@ type Config struct {
 // DeniedTools is a blacklist applied after AllowedTools. Useful for
 // blocking dangerous tools like `exec_command` while keeping the rest.
 type SubAgentConfig struct {
-	AllowedTools []string `yaml:"allowed_tools,omitempty"`
-	DeniedTools  []string `yaml:"denied_tools,omitempty"`
+	AllowedTools []string `json:"allowed_tools,omitempty"`
+	DeniedTools  []string `json:"denied_tools,omitempty"`
 
-	// Timeout is the per-sub-agent execution cap. Parsed from yaml
+	// Timeout is the per-sub-agent execution cap. Parsed from JSON
 	// (e.g. "5m", "30s"). Zero means no explicit cap (the runner
 	// applies a sensible default of 5 minutes).
-	Timeout string `yaml:"timeout,omitempty"`
+	Timeout string `json:"timeout,omitempty"`
 
 	// CacheTTL is how long a sub-agent result stays cached. Parsed
-	// from yaml. Zero disables caching.
-	CacheTTL string `yaml:"cache_ttl,omitempty"`
+	// from JSON. Zero disables caching.
+	CacheTTL string `json:"cache_ttl,omitempty"`
 }
 
 // TimeoutDuration returns the parsed timeout, or 5m if unset/invalid.
@@ -93,64 +100,91 @@ func (s SubAgentConfig) ToolAllowed(name string) bool {
 }
 
 type ServerConfig struct {
-	Host string `yaml:"host"`
-	Port int    `yaml:"port"`
+	Host string `json:"host"`
+	Port int    `json:"port"`
 }
 
+// LLMConfig is the LLM block of the user config.
+//
+// `default` selects which provider is used when no provider is
+// requested explicitly. Each provider may expose multiple models
+// (see ProviderConfig) that share the same base URL + API key.
 type LLMConfig struct {
-	Default    string           `yaml:"default"`
-	Providers  []ProviderConfig `yaml:"providers"`
+	Default   string           `json:"default"`
+	Providers []ProviderConfig `json:"providers"`
 
 	// Sampling parameters applied to every chat call unless overridden
-	// by the provider. Set to 0 to use the API default.
-	Temperature float64 `yaml:"temperature,omitempty"`
-	TopP        float64 `yaml:"top_p,omitempty"`
-	MaxTokens   int     `yaml:"max_tokens,omitempty"`
+	// by a specific model. Set to 0 to use the API default.
+	Temperature float64 `json:"temperature,omitempty"`
+	TopP        float64 `json:"top_p,omitempty"`
+	MaxTokens   int     `json:"max_tokens,omitempty"`
 
 	// Output is a presentation hint.
-	Output OutputConfig `yaml:"output"`
+	Output OutputConfig `json:"output"`
 }
 
 type OutputConfig struct {
 	// Language is the language the assistant should respond in.
 	// One of "zh", "en", "auto" (default "auto" = match the user).
-	Language string `yaml:"language,omitempty"`
+	Language string `json:"language,omitempty"`
 
 	// Verbose controls how much detail the UI shows for tool calls.
 	// When true, full arguments and longer result previews are shown.
-	Verbose bool `yaml:"verbose,omitempty"`
+	Verbose bool `json:"verbose,omitempty"`
 }
 
 // ProviderConfig defines an LLM provider. A single provider can
 // expose multiple models (e.g. "openai" with gpt-4o, gpt-4o-mini, gpt-3.5-turbo)
-// that share the same base URL and API key. Use either the legacy
-// `model` field (one model) or `models` (multiple, with optional
-// default). When both are present the first entry of `models` with
-// `default: true` wins; otherwise `models[0]` is used.
+// that share the same base URL and API key.
+//
+// Use `models` (multi-model) for new entries. The legacy `model`
+// field is still recognized for backward compat: when `models` is
+// empty the value of `model` is used as a single-model provider.
 type ProviderConfig struct {
-	Name     string        `yaml:"name"`
-	Protocol string        `yaml:"protocol"` // "openai" | "anthropic"
-	Type     string        `yaml:"type"`     // alias for Protocol (backward compat)
-	BaseURL  string        `yaml:"base_url"`
-	APIKey   string        `yaml:"api_key"`
-	Model    string        `yaml:"model"`     // legacy: single model
-	Models   []ModelConfig `yaml:"models,omitempty"`
+	Name     string        `json:"name"`
+	Protocol string        `json:"protocol,omitempty"` // "openai" | "anthropic"
+	Type     string        `json:"type,omitempty"`     // alias for Protocol (backward compat)
+	BaseURL  string        `json:"base_url"`
+	APIKey   string        `json:"api_key"`
+	Model    string        `json:"model,omitempty"`     // legacy: single model
+	Models   []ModelConfig `json:"models,omitempty"`
 }
 
 // ModelConfig describes a single model under a provider.
+//
+// A model can override the provider-level sampling defaults with
+// MaxTokensContext (the model's input window — informational;
+// the chat client does not currently truncate) and MaxTokensOutput
+// (the per-response cap, sent as `max_tokens` to the API; 0 = use
+// the global config value).
 type ModelConfig struct {
 	// Name is the model identifier sent to the API (e.g. "gpt-4o").
-	Name string `yaml:"name"`
+	Name string `json:"name"`
 	// DisplayName is shown in /model and /config. Optional.
-	DisplayName string `yaml:"display_name,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
 	// Default marks one of the provider's models as the default.
 	// At most one model per provider may set this to true.
-	Default bool `yaml:"default,omitempty"`
+	Default bool `json:"default,omitempty"`
 	// Description is shown in /model.
-	Description string `yaml:"description,omitempty"`
+	Description string `json:"description,omitempty"`
+
+	// MaxTokensContext is the model's input context window size
+	// (informational). Examples: 8192 (gpt-3.5), 128000 (gpt-4o),
+	// 200000 (claude-sonnet). Used by the UI to display "8k / 16k"
+	// hints. Zero means "unknown".
+	MaxTokensContext int `json:"max_tokens_context,omitempty"`
+
+	// MaxTokensOutput is the per-response cap. Sent to the API as
+	// `max_tokens`. Zero means "fall back to LLMConfig.MaxTokens",
+	// and that in turn defaults to 0 (= "no cap, let the API
+	// decide"). Note: some newer OpenAI models (o1, gpt-5) require
+	// `max_completion_tokens` instead; the client transparently
+	// maps MaxTokensOutput into the right field.
+	MaxTokensOutput int `json:"max_tokens_output,omitempty"`
+
 	// Capabilities carries per-model hints (vision/audio/thinking).
 	// Optional; providers may also discover these at runtime.
-	Capabilities Capabilities `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	Capabilities Capabilities `json:"capabilities,omitempty"`
 }
 
 // GetProtocol returns the protocol, falling back to Type, then "openai".
@@ -182,6 +216,30 @@ func (p ProviderConfig) EffectiveModel() string {
 	return p.Model
 }
 
+// FindModel returns a pointer to the named model under this provider
+// (or nil if absent). The pointer aliases the in-memory config, so
+// callers can mutate fields directly and have the change reflected
+// in the slice.
+//
+// When the provider uses the legacy single-`model` form, this
+// function returns a pointer to a synthetic copy. Mutating it does
+// NOT persist; callers should fall back to AddModel / RemoveModel
+// for legacy single-model providers.
+func (p *ProviderConfig) FindModel(name string) *ModelConfig {
+	for i := range p.Models {
+		if p.Models[i].Name == name {
+			return &p.Models[i]
+		}
+	}
+	if p.Model == name {
+		// Returned pointer aliases a stack-local copy; safe
+		// for read-only access.
+		m := ModelConfig{Name: p.Model}
+		return &m
+	}
+	return nil
+}
+
 // AllModels returns the list of model names for this provider, in
 // user-facing order. Always includes at least one entry (the
 // effective model).
@@ -207,27 +265,24 @@ func (p ProviderConfig) DisplayModel() string {
 	return eff
 }
 
-// GetProtocol returns the protocol, falling back to Type, then "openai".
-// (moved above; this is the canonical definition)
-
 type StyleConfig struct {
-	Default string `yaml:"default"`
+	Default string `json:"default"`
 }
 
 type ToolsConfig struct {
-	Enabled []string           `yaml:"enabled"`
-	Servers []ToolServerConfig `yaml:"servers"`
+	Enabled []string           `json:"enabled"`
+	Servers []ToolServerConfig `json:"servers"`
 }
 
 type ToolServerConfig struct {
-	Name    string   `yaml:"name"`
-	Command string   `yaml:"command"`
-	Args    []string `yaml:"args"`
+	Name    string   `json:"name"`
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
 }
 
 type MemoryConfig struct {
-	Enabled    bool `yaml:"enabled"`
-	MaxHistory int  `yaml:"max_history"`
+	Enabled    bool `json:"enabled"`
+	MaxHistory int  `json:"max_history"`
 }
 
 // SandboxConfig controls which actions LLM-driven tools can take
@@ -235,7 +290,7 @@ type MemoryConfig struct {
 type SandboxConfig struct {
 	// Enabled turns all sandbox checks on/off. When false, every tool
 	// call runs unimpeded (use with care).
-	Enabled bool `yaml:"enabled"`
+	Enabled bool `json:"enabled"`
 
 	// RequireConfirm controls when a tool call must wait for user
 	// approval before running. Allowed values:
@@ -243,50 +298,115 @@ type SandboxConfig struct {
 	//   "dangerous" - ask only for hits against dangerous patterns
 	//   "always"    - ask for every tool call (very conservative)
 	// Default: "dangerous".
-	RequireConfirm string `yaml:"require_confirm,omitempty"`
+	RequireConfirm string `json:"require_confirm,omitempty"`
 
 	// WriteProtectedPaths is a list of path prefixes that write_file /
 	// edit_file must not touch. The "~" prefix expands to the user's
 	// home directory. Matches are case-insensitive on Windows.
-	WriteProtectedPaths []string `yaml:"write_protected_paths,omitempty"`
+	WriteProtectedPaths []string `json:"write_protected_paths,omitempty"`
 
 	// ExecDangerousPatterns is a list of regex patterns. If the
 	// command passed to exec_command matches any pattern, the call is
 	// blocked (or held for confirmation, per RequireConfirm).
-	ExecDangerousPatterns []string `yaml:"exec_dangerous_patterns,omitempty"`
+	ExecDangerousPatterns []string `json:"exec_dangerous_patterns,omitempty"`
 
 	// MaxCommandLength caps the size of a single exec_command. Default
 	// 4096 bytes.
-	MaxCommandLength int `yaml:"max_command_length,omitempty"`
+	MaxCommandLength int `json:"max_command_length,omitempty"`
 }
 
-// Load merges global (~/.p-chat/config.yaml) and project (.p-chat/config.yaml) configs.
-// Project config overrides global config.
+// utf8BOM is the byte order mark some Windows editors (Notepad,
+// PowerShell's [IO.File]::WriteAllText with a UTF-8 BOM, etc.)
+// prepend to UTF-8 files. Go's encoding/json refuses to parse a
+// file starting with BOM, so we strip it here. JSON spec says BOM
+// is allowed but not required; for config files we treat it as
+// "harmless" and just remove it.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// stripBOM returns data with a leading UTF-8 BOM removed. If no
+// BOM is present, data is returned unchanged.
+func stripBOM(data []byte) []byte {
+	if len(data) >= 3 && data[0] == utf8BOM[0] && data[1] == utf8BOM[1] && data[2] == utf8BOM[2] {
+		return data[3:]
+	}
+	return data
+}
+
+// Load merges global (~/.p-chat/config.json) and project
+// (.p-chat/config.json) configs, then a custom path on top.
+//
+// Behavior:
+//   - First call attempts to load the JSON files.
+//   - If the JSON global file is missing BUT a legacy YAML
+//     (config.yaml) exists, the YAML is read once and migrated
+//     to JSON. The original YAML is preserved (we copy, not move)
+//     so users can roll back if needed.
+//   - Missing files are not an error; the default config is used
+//     for the missing layer.
+//   - A leading UTF-8 BOM in the JSON file is silently stripped
+//     (some Windows tools add one).
+//   - When a customPath is passed and cannot be read / parsed,
+//     an error is returned (the user explicitly asked for it).
 func Load(customPath string) (*Config, error) {
 	cfg := Default()
 
-	// Load global config
+	// Global layer.
 	if data, err := os.ReadFile(paths.GlobalConfig()); err == nil {
-		_ = yaml.Unmarshal(data, cfg)
+		data = stripBOM(data)
+		if err := json.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parse global config %s: %w", paths.GlobalConfig(), err)
+		}
+	} else if os.IsNotExist(err) {
+		// One-shot yaml → json migration.
+		if yamlData, yerr := os.ReadFile(paths.GlobalConfigYAML()); yerr == nil {
+			if jerr := unmarshalYAML(yamlData, cfg); jerr == nil {
+				_ = writeConfigJSON(paths.GlobalConfig(), cfg)
+				_ = os.WriteFile(paths.GlobalConfigYAML(), yamlData, 0o644)
+			}
+		}
+	} else {
+		// Permission / IO error reading global — surface to caller.
+		return nil, fmt.Errorf("read global config: %w", err)
 	}
 
-	// Load project config (overrides global)
+	// Project layer (overrides global).
 	if data, err := os.ReadFile(paths.ProjectConfig()); err == nil {
-		_ = yaml.Unmarshal(data, cfg)
+		data = stripBOM(data)
+		if err := json.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parse project config %s: %w", paths.ProjectConfig(), err)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read project config: %w", err)
 	}
 
-	// Load custom path (highest priority)
+	// Custom path (highest priority).
 	if customPath != "" {
 		data, err := os.ReadFile(customPath)
 		if err != nil {
 			return nil, fmt.Errorf("read config %s: %w", customPath, err)
 		}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
+		data = stripBOM(data)
+		if err := json.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config %s: %w", customPath, err)
 		}
 	}
 
 	return cfg, nil
+}
+
+// writeConfigJSON is the package-private helper used by both the
+// Manager and the migration path. Errors are returned so the caller
+// can decide whether to surface them (Manager surfaces, migration
+// swallows).
+func writeConfigJSON(path string, cfg *Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 func Default() *Config {
@@ -345,7 +465,7 @@ func PromptDir() string {
 
 // defaultWriteProtectedPaths returns the conservative baseline list of
 // paths that LLM-driven tools should never touch. Users can override
-// or extend this list in their config.yaml.
+// or extend this list in their config.json.
 func defaultWriteProtectedPaths() []string {
 	home, _ := os.UserHomeDir()
 	prefixes := []string{}

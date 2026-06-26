@@ -199,6 +199,14 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, messages []
 	go func() {
 		defer close(ch)
 
+		// Per-model overrides win over the supplied opts when set.
+		// (Per-model MaxTokensOutput is non-zero → use it; otherwise
+		// keep whatever the caller passed, including the global
+		// LLMConfig.MaxTokens baked in by the agent.)
+		if mt := c.ModelMaxTokensOutput(p.name, p.model); mt > 0 {
+			opts.MaxTokens = mt
+		}
+
 		req := openai.ChatCompletionRequest{
 			Model:    p.model,
 			Messages: messages,
@@ -283,6 +291,12 @@ func (c *Client) Chat(ctx context.Context, providerName string, messages []Messa
 		Messages: messages,
 	}
 
+	// Per-model MaxTokensOutput overrides the caller's opts (and
+	// therefore the global LLMConfig.MaxTokens).
+	if mt := c.ModelMaxTokensOutput(p.name, p.model); mt > 0 {
+		req.MaxTokens = mt
+	}
+
 	resp, err := p.openai.CreateChatCompletion(ctx, req)
 	if err != nil {
 		return "", err
@@ -353,6 +367,40 @@ func (c *Client) DisplayModel(providerName string) string {
 		}
 	}
 	return ""
+}
+
+// ContextWindow returns the configured input context window for a
+// given (provider, model) pair, or 0 if the model is unknown or
+// has no MaxTokensContext set. Informational — the chat client
+// does not currently truncate prompts to fit.
+func (c *Client) ContextWindow(providerName, modelName string) int {
+	for _, p := range c.cfgModels {
+		if p.Name != providerName {
+			continue
+		}
+		if m := p.FindModel(modelName); m != nil {
+			return m.MaxTokensContext
+		}
+		return 0
+	}
+	return 0
+}
+
+// ModelMaxTokensOutput returns the per-model MaxTokensOutput
+// override, or 0 if the model is unknown / unset. Callers usually
+// fall back to LLMConfig.MaxTokens (the global setting) when
+// this returns 0.
+func (c *Client) ModelMaxTokensOutput(providerName, modelName string) int {
+	for _, p := range c.cfgModels {
+		if p.Name != providerName {
+			continue
+		}
+		if m := p.FindModel(modelName); m != nil {
+			return m.MaxTokensOutput
+		}
+		return 0
+	}
+	return 0
 }
 
 func (c *Client) Default() string {

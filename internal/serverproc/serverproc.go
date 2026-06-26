@@ -36,6 +36,10 @@ type Options struct {
 	// Stderr/Stdout for the subprocess; nil = /dev/null (silent).
 	Stderr *os.File
 	Stdout *os.File
+	// WebDir, when non-empty, is forwarded to pchat-server as
+	// PCHAT_WEB_DIR so it knows where the web/index.html lives.
+	// If empty, pchat-server falls back to its CWD/web.
+	WebDir string
 	// PingTimeout caps how long we wait for the server to be ready.
 	PingTimeout time.Duration
 }
@@ -65,13 +69,30 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	args := []string{"--config", opts.ConfigPath}
 	if opts.ConfigPath == "" {
 		// Resolve the user's default config so the child can find it.
+		// pchat config moved from yaml to json in 0.10; we try
+		// json first, then fall back to yaml for older installs.
 		if home, _ := os.UserHomeDir(); home != "" {
-			args = []string{"--config", filepath.Join(home, ".p-chat", "config.yaml")}
+			jsonPath := filepath.Join(home, ".p-chat", "config.json")
+			yamlPath := filepath.Join(home, ".p-chat", "config.yaml")
+			switch {
+			case fileExists(jsonPath):
+				args = []string{"--config", jsonPath}
+			case fileExists(yamlPath):
+				args = []string{"--config", yamlPath}
+			default:
+				// Neither file exists; let pchat-server use its
+				// built-in default (it will create config.json
+				// on first save).
+				args = []string{"--config", jsonPath}
+			}
 		}
 	}
 
 	cmd := exec.CommandContext(ctx, opts.ServerBin, args...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PCHAT_PORT=%d", port))
+	if opts.WebDir != "" {
+		cmd.Env = append(cmd.Env, "PCHAT_WEB_DIR="+opts.WebDir)
+	}
 	// PCHAT_PORT is informational; the real port comes from --config.
 	// We also set the listen address via env so the child binds to
 	// the port we picked. (pchat-server reads PCHAT_PORT to override
@@ -167,4 +188,20 @@ func PortFromEnv() int {
 	}
 	p, _ := strconv.Atoi(s)
 	return p
+}
+
+// WebDirFromEnv returns the PCHAT_WEB_DIR env var (empty if
+// missing). The server uses this to find the web/index.html
+// static dir when launched as a subprocess by `pchat web`. If
+// empty, the server falls back to its CWD/web, which only works
+// when the user runs pchat-server from the repo root.
+func WebDirFromEnv() string {
+	return os.Getenv("PCHAT_WEB_DIR")
+}
+
+// fileExists is a small helper to avoid an os.Stat import noise
+// at every call site.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

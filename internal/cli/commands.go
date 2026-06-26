@@ -1150,13 +1150,23 @@ func cmdConfigModel(ctx cliContext, args string) error {
 		fmt.Println("  子命令:")
 		fmt.Println("    list    [provider]               - 列出全部 (或指定 provider) 的模型")
 		fmt.Println("    add     <provider> <model> [...]  - 加一个新模型到 provider")
+		fmt.Println("    edit    <provider> <model> [...]  - 修改模型 (display_name / max_tokens)")
 		fmt.Println("    remove  <provider> <model>      - 删除一个模型")
 		fmt.Println("    default <provider> <model>      - 设为默认模型")
+		fmt.Println()
+		fmt.Println("  add/edit 选项 (key=value 形式):")
+		fmt.Println("    display_name=<text>     显示名 (edit 留空=清空)")
+		fmt.Println("    description=<text>      描述")
+		fmt.Println("    max_tokens_context=<n>  上下文窗口大小 (e.g. 8192, 128000)")
+		fmt.Println("    max_tokens_output=<n>   单次回复上限 (e.g. 4096, 8192)")
+		fmt.Println("    default=true|false      (add 时) 是否设为默认")
 		fmt.Println()
 		fmt.Println("  示例:")
 		fmt.Println("    /config model list")
 		fmt.Println("    /config model list cs")
 		fmt.Println("    /config model add openai o1-preview \"o1 Preview\" \"Reasoning model\"")
+		fmt.Println("    /config model add openai gpt-4o-mini display_name=\"GPT-4o Mini\" max_tokens_context=128000")
+		fmt.Println("    /config model edit openai gpt-4o-mini max_tokens_output=8192")
 		fmt.Println("    /config model remove openai gpt-3.5-turbo")
 		fmt.Println("    /config model default openai o1-preview")
 		return nil
@@ -1174,17 +1184,19 @@ func cmdConfigModel(ctx cliContext, args string) error {
 		return cmdConfigModelList(ctx, target)
 	case "add":
 		if len(restFields) < 2 {
-			color.Red("  用法: /config model add <provider> <model> [display_name] [description]")
+			color.Red("  用法: /config model add <provider> <model> [display_name] [description] [k=v ...]")
 			return nil
 		}
-		var display, desc string
-		if len(restFields) >= 3 {
-			display = restFields[2]
+		m, extra := parseModelKV(restFields[2:])
+		m.Name = restFields[1]
+		return cmdConfigModelAddFull(ctx, restFields[0], m, extra)
+	case "edit", "set":
+		if len(restFields) < 2 {
+			color.Red("  用法: /config model edit <provider> <model> [k=v ...]")
+			return nil
 		}
-		if len(restFields) >= 4 {
-			desc = strings.Join(restFields[3:], " ")
-		}
-		return cmdConfigModelAdd(ctx, restFields[0], restFields[1], display, desc)
+		patch, _ := parseModelKV(restFields[2:])
+		return cmdConfigModelEdit(ctx, restFields[0], restFields[1], patch)
 	case "remove", "rm", "delete", "del":
 		if len(restFields) != 2 {
 			color.Red("  用法: /config model remove <provider> <model>")
@@ -1201,6 +1213,52 @@ func cmdConfigModel(ctx cliContext, args string) error {
 		color.Red("  未知子命令: %s", action)
 		return nil
 	}
+}
+
+// parseModelKV extracts model fields from a slice of CLI args.
+// Positional args (any token that doesn't contain "=" and isn't
+// already consumed as display_name/description in the caller's
+// pre-processing) are returned as "extra" so callers can decide
+// what to do with them.
+//
+// Recognized keys:
+//   display_name, description, max_tokens_context, max_tokens_output, default
+func parseModelKV(args []string) (config.ModelConfig, []string) {
+	m := config.ModelConfig{}
+	var extra []string
+	for _, a := range args {
+		idx := strings.Index(a, "=")
+		if idx <= 0 {
+			extra = append(extra, a)
+			continue
+		}
+		key := a[:idx]
+		val := a[idx+1:]
+		switch key {
+		case "display_name":
+			m.DisplayName = val
+		case "description":
+			m.Description = val
+		case "max_tokens_context", "context":
+			n, err := strconv.Atoi(val)
+			if err == nil && n > 0 {
+				m.MaxTokensContext = n
+			}
+		case "max_tokens_output", "max_tokens", "output":
+			n, err := strconv.Atoi(val)
+			if err == nil && n > 0 {
+				m.MaxTokensOutput = n
+			}
+		case "default":
+			b, err := strconv.ParseBool(val)
+			if err == nil {
+				m.Default = b
+			}
+		default:
+			extra = append(extra, a)
+		}
+	}
+	return m, extra
 }
 
 func cmdConfigModelList(ctx cliContext, target string) error {
@@ -1248,6 +1306,22 @@ func cmdConfigModelList(ctx cliContext, target string) error {
 			if m.Name != disp {
 				line += color.HiBlackString("  (%s)", m.Name)
 			}
+			// Show per-model max_tokens hints, if set.
+			settings := ctx.GetModelSettings(prov, m.Name)
+			if settings.MaxTokensContext > 0 || settings.MaxTokensOutput > 0 {
+				hint := color.HiBlackString("  [")
+				if settings.MaxTokensContext > 0 {
+					hint += color.HiBlackString("ctx=%s", humanInt(settings.MaxTokensContext))
+				}
+				if settings.MaxTokensContext > 0 && settings.MaxTokensOutput > 0 {
+					hint += color.HiBlackString(", ")
+				}
+				if settings.MaxTokensOutput > 0 {
+					hint += color.HiBlackString("out=%s", humanInt(settings.MaxTokensOutput))
+				}
+				hint += color.HiBlackString("]")
+				line += " " + hint
+			}
 			fmt.Println(line)
 			if m.Description != "" {
 				color.HiBlack("        " + m.Description)
@@ -1258,6 +1332,21 @@ func cmdConfigModelList(ctx cliContext, target string) error {
 	return nil
 }
 
+// humanInt formats an int with a k/m suffix for compact display
+// (e.g. 8192 -> "8k", 128000 -> "128k", 2000000 -> "2m"). Used
+// by /config model list to keep per-model max_tokens hints on
+// one line.
+func humanInt(n int) string {
+	switch {
+	case n >= 1_000_000 && n%1_000_000 == 0:
+		return fmt.Sprintf("%dm", n/1_000_000)
+	case n >= 1000 && n%1000 == 0:
+		return fmt.Sprintf("%dk", n/1000)
+	default:
+		return strconv.Itoa(n)
+	}
+}
+
 func cmdConfigModelAdd(ctx cliContext, providerName, modelName, displayName, description string) error {
 	if err := ctx.AddModel(providerName, modelName, displayName, description); err != nil {
 		color.Red("  ✗ %v", err)
@@ -1265,6 +1354,41 @@ func cmdConfigModelAdd(ctx cliContext, providerName, modelName, displayName, des
 	}
 	color.Green("  ✓ 已添加模型: %s/%s", providerName, modelName)
 	color.HiBlack("    用 /model 切换到 %s 后生效", modelName)
+	return nil
+}
+
+// cmdConfigModelAddFull is the rich version used by the
+// key=value parser: it can carry max_tokens_context,
+// max_tokens_output, and the default flag.
+func cmdConfigModelAddFull(ctx cliContext, providerName string, m config.ModelConfig, extra []string) error {
+	// Tolerate the legacy positional form: first extra = display
+	// name, the rest joined = description. This keeps
+	// "/config model add openai o1-preview \"O1\" \"Reasoning model\""
+	// working.
+	if m.DisplayName == "" && len(extra) >= 1 {
+		m.DisplayName = extra[0]
+	}
+	if m.Description == "" && len(extra) >= 2 {
+		m.Description = strings.Join(extra[1:], " ")
+	}
+	if err := ctx.AddModelFull(providerName, m); err != nil {
+		color.Red("  ✗ %v", err)
+		return nil
+	}
+	color.Green("  ✓ 已添加模型: %s/%s", providerName, m.Name)
+	if m.MaxTokensContext > 0 || m.MaxTokensOutput > 0 {
+		color.HiBlack("    上限: context=%d, output=%d", m.MaxTokensContext, m.MaxTokensOutput)
+	}
+	color.HiBlack("    用 /model 切换到 %s 后生效", m.Name)
+	return nil
+}
+
+func cmdConfigModelEdit(ctx cliContext, providerName, modelName string, patch config.ModelConfig) error {
+	if err := ctx.UpdateModel(providerName, modelName, patch); err != nil {
+		color.Red("  ✗ %v", err)
+		return nil
+	}
+	color.Green("  ✓ 已更新模型: %s/%s", providerName, modelName)
 	return nil
 }
 

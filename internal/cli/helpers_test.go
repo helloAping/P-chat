@@ -1,12 +1,12 @@
 package cli
 
 import (
+	"encoding/json"
 	"os"
 
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/paths"
-	"gopkg.in/yaml.v3"
 )
 
 // buildTestLLMClient loads the global config (which the test sets
@@ -36,11 +36,11 @@ func configLoadForTest() (*config.Config, error) {
 	return config.Load("")
 }
 
-// configSaveForTest serializes a config back to the global yaml.
+// configSaveForTest serializes a config back to the global config file.
 // Tests use this to simulate edits made outside of the
 // config.AddModel / RemoveModel helpers.
 func configSaveForTest(cfg *config.Config) error {
-	data, err := yaml.Marshal(cfg)
+	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}

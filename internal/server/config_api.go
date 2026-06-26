@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/config"
@@ -20,6 +21,8 @@ type AddProviderRequest struct {
 //
 // Writes the new provider to ~/.p-chat/config.json and reloads
 // the in-memory LLM client so the change takes effect immediately.
+// A name collision returns 409 Conflict (not 500) so the
+// web UI can show a clear "already exists" message.
 func (h *Handler) AddProvider(c *gin.Context) {
 	if h.cfg == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
@@ -37,6 +40,13 @@ func (h *Handler) AddProvider(c *gin.Context) {
 		APIKey:   req.APIKey,
 		Model:    req.Model,
 	}); err != nil {
+		// The most common error is "already exists"; treat
+		// that as a 409 so the UI can show a friendly
+		// message. Other errors stay 500.
+		if strings.Contains(err.Error(), "already exists") {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -111,9 +121,11 @@ func (h *Handler) SetDefaultProvider(c *gin.Context) {
 
 // AddModelRequest is the body of POST /api/v1/providers/:name/models.
 type AddModelRequest struct {
-	Name        string `json:"name" binding:"required"`
-	DisplayName string `json:"display_name"`
-	Description string `json:"description"`
+	Name             string `json:"name" binding:"required"`
+	DisplayName      string `json:"display_name"`
+	Description      string `json:"description"`
+	MaxTokensContext int    `json:"max_tokens_context"`
+	MaxTokensOutput  int    `json:"max_tokens_output"`
 }
 
 // AddModel POST /api/v1/providers/:name/models
@@ -129,9 +141,11 @@ func (h *Handler) AddModel(c *gin.Context) {
 		return
 	}
 	if _, err := config.AddModel(name, config.ModelConfig{
-		Name:         req.Name,
-		DisplayName:  req.DisplayName,
-		Description:  req.Description,
+		Name:             req.Name,
+		DisplayName:      req.DisplayName,
+		Description:      req.Description,
+		MaxTokensContext: req.MaxTokensContext,
+		MaxTokensOutput:  req.MaxTokensOutput,
 	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

@@ -1,11 +1,51 @@
 version: '3'
 
+vars:
+  GOPROXY: 'https://goproxy.cn,direct'
+
 tasks:
+  sync:web:
+    desc: 同步 web/ 到 cmd/pchat-server/web/（embed 需要真实目录）
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync-web.ps1
+    silent: false
+
   build:
     desc: 编译 CLI 和 Server
+    deps: [sync:web]
     cmds:
       - go build -o bin/pchat.exe ./cmd/pchat
       - go build -o bin/pchat-server.exe ./cmd/pchat-server
+    silent: false
+
+  build:gui:
+    desc: 编译桌面端 (Wails v2)
+    dir: cmd\pchat-gui
+    cmds:
+      - cmd: wails build -platform windows/amd64
+        env:
+          GOPROXY: '{{.GOPROXY}}'
+          GOTOOLCHAIN: auto
+    silent: false
+
+  build:gui:npm:
+    desc: 桌面端 — 仅刷新前端依赖（首次构建前需要）
+    dir: cmd\pchat-gui\frontend
+    cmds:
+      - npm install
+
+  build:all:
+    desc: 同时编译 CLI / Server / 桌面端
+    cmds:
+      - task: build
+      - task: build:gui
+
+  package:gui:
+    desc: 把桌面端打包到 bin\（含 pchat-server.exe + install/uninstall 脚本）
+    cmds:
+      - task: build
+      - task: build:gui
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-gui.ps1
     silent: false
 
   cli:
@@ -17,6 +57,25 @@ tasks:
     desc: 运行 HTTP Server
     cmds:
       - go run ./cmd/pchat-server
+
+  gui:
+    desc: 启动桌面端 (开发模式)
+    dir: cmd\pchat-gui
+    cmds:
+      - cmd: wails dev
+        env:
+          GOPROXY: '{{.GOPROXY}}'
+          GOTOOLCHAIN: auto
+
+  install:gui:
+    desc: 安装桌面端到 %LOCALAPPDATA%\Programs\P-Chat\
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File cmd\pchat-gui\build\bin\install.ps1
+
+  uninstall:gui:
+    desc: 卸载桌面端
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File cmd\pchat-gui\build\bin\uninstall.ps1
 
   tidy:
     desc: 整理依赖
@@ -38,7 +97,19 @@ tasks:
     cmds:
       - go test ./... -v
 
+  test:gui:
+    desc: 桌面端单元测试
+    dir: cmd\pchat-gui
+    cmds:
+      - go test -v ./
+
+  smoke:gui:
+    desc: 桌面端端到端冒烟 (装 -> 启 -> 后端健康 -> 卸)
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gui-smoke.ps1
+
   clean:
     desc: 清理编译产物
     cmds:
       - Remove-Item -Recurse -Force bin -ErrorAction SilentlyContinue
+      - Remove-Item -Recurse -Force cmd\pchat-gui\build\bin -ErrorAction SilentlyContinue

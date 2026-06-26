@@ -53,6 +53,21 @@ func TestPortFromEnv(t *testing.T) {
 	}
 }
 
+func TestWebDirFromEnv(t *testing.T) {
+	cases := map[string]string{
+		"":                            "",
+		"web":                         "web",
+		`C:\Users\me\src\p-chat\web`:  `C:\Users\me\src\p-chat\web`,
+		"/home/me/p-chat/web":         "/home/me/p-chat/web",
+	}
+	for input, want := range cases {
+		t.Setenv("PCHAT_WEB_DIR", input)
+		if got := WebDirFromEnv(); got != want {
+			t.Errorf("WebDirFromEnv(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 // TestStart_RealBinary builds a real pchat-server binary in a temp
 // dir, starts it as a subprocess, waits for /health, then stops it.
 // This is the only end-to-end check that the launch plumbing works
@@ -68,26 +83,32 @@ func TestStart_RealBinary(t *testing.T) {
 	t.Setenv("USERPROFILE", tmp)
 	t.Setenv("HOME", tmp)
 
-	// Need a config file so pchat-server can start.
-	cfg := `llm:
-  default: ollama
-  providers:
-    - name: ollama
-      protocol: openai
-      base_url: http://localhost:11434/v1
-      api_key: ollama
-      model: llama3
-`
+	// Need a config file so pchat-server can start. Since the
+	// config format moved to JSON in 0.10, write JSON.
+	cfg := `{
+  "llm": {
+    "default": "ollama",
+    "providers": [
+      {
+        "name": "ollama",
+        "protocol": "openai",
+        "base_url": "http://localhost:11434/v1",
+        "api_key": "ollama",
+        "model": "llama3"
+      }
+    ]
+  }
+}`
 	if err := os.MkdirAll(filepath.Join(tmp, ".p-chat"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(tmp, ".p-chat", "config.yaml"), []byte(cfg), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, ".p-chat", "config.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	srv, err := Start(context.Background(), Options{
 		ServerBin:   bin,
-		ConfigPath:  filepath.Join(tmp, ".p-chat", "config.yaml"),
+		ConfigPath:  filepath.Join(tmp, ".p-chat", "config.json"),
 		PingTimeout: 10 * time.Second,
 	})
 	if err != nil {

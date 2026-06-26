@@ -7,11 +7,11 @@ import (
 	"syscall"
 )
 
-// setSysProcAttrNewPG puts cmd in a new process group so signals to
+// SetSysProcAttrNewPG puts cmd in a new process group so signals to
 // the parent (Ctrl+C, SIGTERM) don't propagate. Used for detached
 // helpers like opening the default browser - we don't want killing
 // pchat to close the user's browser.
-func setSysProcAttrNewPG(cmd *exec.Cmd) {
+func SetSysProcAttrNewPG(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}

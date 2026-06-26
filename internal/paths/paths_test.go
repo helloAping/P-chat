@@ -86,8 +86,8 @@ func TestPathConstants(t *testing.T) {
 		prefix string
 		suffix string
 	}{
-		"GlobalConfig":     {GlobalDir(), "config.yaml"},
-		"ProjectConfig":   {ProjectDir(), "config.yaml"},
+		"GlobalConfig":     {GlobalDir(), "config.json"},
+		"ProjectConfig":   {ProjectDir(), "config.json"},
 		"GlobalAgents":     {GlobalDir(), "AGENTS.md"},
 		"GlobalSkillsDir":  {GlobalDir(), "skills"},
 		"ProjectSkillsDir": {ProjectDir(), "skills"},

@@ -1,4 +1,4 @@
-package server_test
+﻿package server_test
 
 import (
 	"bytes"
@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/server"
 )
 
@@ -144,7 +145,7 @@ func TestProviders_AddAndDelete(t *testing.T) {
 	}
 
 	// The config file on disk should now contain "testprov".
-	cfgPath := filepath.Join(os.Getenv("USERPROFILE"), ".p-chat", "config.yaml")
+	cfgPath := filepath.Join(os.Getenv("USERPROFILE"), ".p-chat", "config.json")
 	data, _ := os.ReadFile(cfgPath)
 	if !strings.Contains(string(data), "testprov") {
 		t.Errorf("config.json missing testprov:\n%s", data)
@@ -186,7 +187,7 @@ func TestProviders_AddAndDelete(t *testing.T) {
 	}
 	data2, _ := os.ReadFile(cfgPath)
 	if strings.Contains(string(data2), "testprov") {
-		t.Errorf("config.yaml still has testprov after delete:\n%s", data2)
+		t.Errorf("config.json still has testprov after delete:\n%s", data2)
 	}
 }
 
@@ -352,3 +353,308 @@ func TestCommands_ListAndRun(t *testing.T) {
 
 // Helper: not actually used by the tests but kept for parity.
 var _ = fmt.Sprintf
+
+// ====================================================================
+// Per-model configuration API
+// ====================================================================
+
+// TestUpdateModel_AddsMaxTokens verifies the PUT
+// /api/v1/providers/:name/models/:model endpoint accepts the
+// max_tokens_context / max_tokens_output fields and persists
+// them. The slim GET /api/v1/providers endpoint should also
+// return the new fields in the `models` array.
+func TestUpdateModel_AddsMaxTokens(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	// Add a fresh provider to avoid touching the seed "ollama"
+	// (which the default-rejection tests need).
+	addBody := `{"name":"cap","protocol":"openai","base_url":"http://example.com/v1","api_key":"sk","model":"gpt-test"}`
+	r, err := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(addBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("add: %d", r.StatusCode)
+	}
+
+	// Update the model with per-model max_tokens.
+	putBody := `{"display_name":"GPT Test","max_tokens_context":128000,"max_tokens_output":8192}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/api/v1/providers/cap/models/gpt-test", strings.NewReader(putBody))
+	req.Header.Set("Content-Type", "application/json")
+	ru, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ru.Body.Close()
+	if ru.StatusCode != 200 {
+		t.Fatalf("PUT status = %d, want 200", ru.StatusCode)
+	}
+
+	// GET rich provider view; the model should have the
+	// max_tokens set.
+	rg, err := http.Get(srv.URL + "/api/v1/providers/cap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rg.Body.Close()
+	var body struct {
+		Models []struct {
+			Name             string `json:"name"`
+			DisplayName      string `json:"display_name"`
+			MaxTokensContext int    `json:"max_tokens_context"`
+			MaxTokensOutput  int    `json:"max_tokens_output"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(rg.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Models) != 1 {
+		t.Fatalf("models = %d, want 1", len(body.Models))
+	}
+	m := body.Models[0]
+	if m.MaxTokensContext != 128000 {
+		t.Errorf("max_tokens_context = %d, want 128000", m.MaxTokensContext)
+	}
+	if m.MaxTokensOutput != 8192 {
+		t.Errorf("max_tokens_output = %d, want 8192", m.MaxTokensOutput)
+	}
+	if m.DisplayName != "GPT Test" {
+		t.Errorf("display_name = %q, want %q", m.DisplayName, "GPT Test")
+	}
+}
+
+// TestUpdateModel_NotFound covers the error path: PUT to an
+// unknown model returns 400.
+func TestUpdateModel_NotFound(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("PUT", srv.URL+"/api/v1/providers/ollama/models/missing", strings.NewReader(`{"max_tokens_output":2048}`))
+	req.Header.Set("Content-Type", "application/json")
+	ru, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ru.Body.Close()
+	if ru.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", ru.StatusCode)
+	}
+}
+
+// TestProviders_RichModelFields ensures the slim GET
+// /api/v1/providers response now includes models + is_default
+// (so the UI cascade can render without a second round-trip).
+func TestProviders_RichModelFields(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	r, err := http.Get(srv.URL + "/api/v1/providers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	var body struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Providers) == 0 {
+		t.Fatal("no providers")
+	}
+	for _, p := range body.Providers {
+		if _, ok := p["models"]; !ok {
+			t.Errorf("provider %v missing 'models' array", p["name"])
+		}
+		if _, ok := p["is_default"]; !ok {
+			t.Errorf("provider %v missing 'is_default' field", p["name"])
+		}
+	}
+}
+
+// TestAddModel_AcceptsMaxTokens verifies the POST
+// /api/v1/providers/:name/models endpoint accepts the new
+// per-model max_tokens fields.
+func TestAddModel_AcceptsMaxTokens(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	addBody := `{"name":"cap2","protocol":"openai","base_url":"http://example.com/v1","api_key":"sk","model":"placeholder"}`
+	r, _ := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(addBody))
+	r.Body.Close()
+
+	// Add a new model with max_tokens.
+	modelBody := `{"name":"new-model","display_name":"New Model","max_tokens_context":64000,"max_tokens_output":4096}`
+	mr, err := http.Post(srv.URL+"/api/v1/providers/cap2/models", "application/json", strings.NewReader(modelBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mr.Body.Close()
+	if mr.StatusCode != http.StatusCreated {
+		t.Fatalf("add model: %d", mr.StatusCode)
+	}
+
+	// Verify it's there with the right fields.
+	rg, err := http.Get(srv.URL + "/api/v1/providers/cap2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rg.Body.Close()
+	var body struct {
+		Models []struct {
+			Name             string `json:"name"`
+			MaxTokensContext int    `json:"max_tokens_context"`
+			MaxTokensOutput  int    `json:"max_tokens_output"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(rg.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range body.Models {
+		if m.Name == "new-model" {
+			found = true
+			if m.MaxTokensContext != 64000 {
+				t.Errorf("max_tokens_context = %d, want 64000", m.MaxTokensContext)
+			}
+			if m.MaxTokensOutput != 4096 {
+				t.Errorf("max_tokens_output = %d, want 4096", m.MaxTokensOutput)
+			}
+		}
+	}
+	if !found {
+		t.Error("new-model not found in provider models")
+	}
+}
+
+// ====================================================================
+// Add provider API (covers the new web UI add-provider form)
+// ====================================================================
+
+// TestAddProvider_BareProvider verifies POST /api/v1/providers
+// works without a model field — the user might want to add a
+// provider shell and then add models to it later.
+func TestAddProvider_BareProvider(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	body := `{"name":"openai-bare","protocol":"openai","base_url":"https://api.openai.com/v1","api_key":"sk-x"}`
+	r, err := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", r.StatusCode)
+	}
+
+	// Verify it's in the list with no model.
+	r2, err := http.Get(srv.URL + "/api/v1/providers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Body.Close()
+	var list struct {
+		Providers []struct {
+			Name     string               `json:"name"`
+			Protocol string               `json:"protocol"`
+			Model    string               `json:"model"`
+			Models   []config.ModelConfig `json:"models"`
+		} `json:"providers"`
+	}
+	if err := json.NewDecoder(r2.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range list.Providers {
+		if p.Name == "openai-bare" {
+			found = true
+			if p.Protocol != "openai" {
+				t.Errorf("protocol = %q, want openai", p.Protocol)
+			}
+			// No model supplied — should be OK (EffectiveModel
+			// falls back to the empty string).
+		}
+	}
+	if !found {
+		t.Error("openai-bare not found in providers list")
+	}
+}
+
+// TestAddProvider_AnthropicProtocol verifies the protocol
+// dropdown in the web UI maps to a real config.Protocol value.
+func TestAddProvider_AnthropicProtocol(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	body := `{"name":"anthropic-test","protocol":"anthropic","base_url":"https://api.anthropic.com","api_key":"sk-ant","model":"claude-sonnet-4-5"}`
+	r, err := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", r.StatusCode)
+	}
+
+	r2, err := http.Get(srv.URL + "/api/v1/providers/anthropic-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Body.Close()
+	var p struct {
+		Protocol string `json:"protocol"`
+		Model    string `json:"model"`
+	}
+	if err := json.NewDecoder(r2.Body).Decode(&p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Protocol != "anthropic" {
+		t.Errorf("protocol = %q, want anthropic", p.Protocol)
+	}
+	if p.Model != "claude-sonnet-4-5" {
+		t.Errorf("model = %q, want claude-sonnet-4-5", p.Model)
+	}
+}
+
+// TestAddProvider_RejectsDuplicate verifies the API refuses to
+// add a second provider with the same name. The web UI's
+// failure path turns this into a friendly toast.
+func TestAddProvider_RejectsDuplicate(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	body := `{"name":"dup","protocol":"openai","base_url":"http://x","api_key":"k","model":"m"}`
+	r, _ := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(body))
+	r.Body.Close()
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("first add: %d, want 201", r.StatusCode)
+	}
+
+	r2, _ := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(body))
+	r2.Body.Close()
+	if r2.StatusCode == http.StatusCreated {
+		t.Error("duplicate add should not return 201")
+	}
+	// 409 Conflict for "already exists" is what the web UI
+	// branches on. Other 4xx/5xx would be a server bug.
+	if r2.StatusCode != http.StatusConflict {
+		t.Errorf("duplicate add: status = %d, want 409 Conflict", r2.StatusCode)
+	}
+}
+
+// TestAddProvider_RequiresName covers the bad-name path (the
+// web UI rejects this client-side; the API is the safety net).
+func TestAddProvider_RequiresName(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	body := `{"protocol":"openai","base_url":"http://x"}`
+	r, _ := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(body))
+	r.Body.Close()
+	if r.StatusCode == http.StatusCreated {
+		t.Error("empty name should not succeed")
+	}
+}

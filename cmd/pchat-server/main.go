@@ -1,7 +1,10 @@
 package main
 
 import (
+	"embed"
 	"fmt"
+	"io/fs"
+	"net/http"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -15,6 +18,9 @@ import (
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 )
+
+//go:embed all:web
+var embeddedWebRaw embed.FS
 
 var cfgFile string
 
@@ -66,7 +72,26 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	agt := agent.New(cfg, llmClient, styleMgr, memStore, toolReg)
 
-	srv := server.New(cfg, agt, memStore)
+	// Static-dir resolution: by default the web frontend is served
+	// from the embedded filesystem so the binary is self-contained
+	// and works from any CWD (this matters for pchat-gui, which
+	// launches us from the install dir where there is no web/
+	// directory). When the parent process sets PCHAT_WEB_DIR we
+	// honour that override so `pchat web` (which keeps web/ on
+	// disk and edits it live) still works.
+	//
+	// //go:embed all:web stores files under the "web" prefix inside
+	// the embed.FS, but Gin's StaticFS expects index.html at the
+	// root of the served FS, so we re-root with fs.Sub.
+	webSub, err := fs.Sub(embeddedWebRaw, "web")
+	if err != nil {
+		return fmt.Errorf("locate embedded web/: %w", err)
+	}
+	var staticFS http.FileSystem = http.FS(webSub)
+	if wd := serverproc.WebDirFromEnv(); wd != "" {
+		staticFS = http.Dir(wd)
+	}
+	srv := server.NewWithStaticFS(cfg, agt, memStore, staticFS)
 
 	// PCHAT_PORT overrides the configured port. This is how the
 	// parent process (pchat / pchat-gui) tells us which ephemeral

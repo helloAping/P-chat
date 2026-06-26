@@ -1,8 +1,10 @@
-package config
+﻿package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -160,19 +162,22 @@ func TestAddModel(t *testing.T) {
 
 	// Seed: write a known config with one provider that has a
 	// legacy `model` field.
-	initial := `server:
-  host: 127.0.0.1
-  port: 8960
-llm:
-  default: cs
-  providers:
-    - name: cs
-      protocol: openai
-      base_url: http://example.com/v1
-      api_key: sk-x
-      model: doubao-seed-2.0-lite
-`
-	cfgPath := dir + "/.p-chat/config.yaml"
+	initial := `{
+  "server": { "host": "127.0.0.1", "port": 8960 },
+  "llm": {
+    "default": "cs",
+    "providers": [
+      {
+        "name": "cs",
+        "protocol": "openai",
+        "base_url": "http://example.com/v1",
+        "api_key": "sk-x",
+        "model": "doubao-seed-2.0-lite"
+      }
+    ]
+  }
+}`
+	cfgPath := dir + "/.p-chat/config.json"
 	if err := osWriteFile(cfgPath, initial); err != nil {
 		t.Fatal(err)
 	}
@@ -211,17 +216,15 @@ func TestAddModel_RejectsDuplicate(t *testing.T) {
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
 
-	initial := `llm:
-  default: cs
-  providers:
-    - name: cs
-      protocol: openai
-      base_url: http://example.com/v1
-      api_key: sk-x
-      models:
-        - name: foo
-`
-	if err := osWriteFile(dir+"/.p-chat/config.yaml", initial); err != nil {
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x", "models": [{ "name": "foo" }] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,15 +239,15 @@ func TestAddModel_SetsNewDefaultWhenFirst(t *testing.T) {
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
 
-	initial := `llm:
-  default: cs
-  providers:
-    - name: cs
-      protocol: openai
-      base_url: http://example.com/v1
-      api_key: sk-x
-`
-	if err := osWriteFile(dir+"/.p-chat/config.yaml", initial); err != nil {
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
 		t.Fatal(err)
 	}
 	// No models yet; adding the first one should make it default.
@@ -262,19 +265,15 @@ func TestRemoveModel(t *testing.T) {
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
 
-	initial := `llm:
-  default: cs
-  providers:
-    - name: cs
-      protocol: openai
-      base_url: http://example.com/v1
-      api_key: sk-x
-      models:
-        - name: a
-        - name: b
-        - name: c
-`
-	if err := osWriteFile(dir+"/.p-chat/config.yaml", initial); err != nil {
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x", "models": [{ "name": "a" }, { "name": "b" }, { "name": "c" }] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
 		t.Fatal(err)
 	}
 
@@ -296,19 +295,15 @@ func TestSetDefaultModel(t *testing.T) {
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
 
-	initial := `llm:
-  default: cs
-  providers:
-    - name: cs
-      protocol: openai
-      base_url: http://example.com/v1
-      api_key: sk-x
-      models:
-        - name: a
-          default: true
-        - name: b
-`
-	if err := osWriteFile(dir+"/.p-chat/config.yaml", initial); err != nil {
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x", "models": [{ "name": "a", "default": true }, { "name": "b" }] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
 		t.Fatal(err)
 	}
 	if err := SetDefaultModel("cs", "b"); err != nil {
@@ -330,17 +325,15 @@ func TestRemoveModel_NotFound(t *testing.T) {
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
 
-	initial := `llm:
-  default: cs
-  providers:
-    - name: cs
-      protocol: openai
-      base_url: http://example.com/v1
-      api_key: sk-x
-      models:
-        - name: a
-`
-	if err := osWriteFile(dir+"/.p-chat/config.yaml", initial); err != nil {
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x", "models": [{ "name": "a" }] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
 		t.Fatal(err)
 	}
 	if err := RemoveModel("cs", "missing"); err == nil {
@@ -351,6 +344,221 @@ func TestRemoveModel_NotFound(t *testing.T) {
 	}
 }
 
+func TestUpdateModel_PerModelMaxTokens(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x", "models": [{ "name": "small", "max_tokens_output": 1024 }, { "name": "big" }] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+
+	// Apply a patch: set big's display_name + output cap.
+	_, err := UpdateModel("cs", "big", ModelConfig{
+		DisplayName:     "Big Model",
+		MaxTokensOutput: 8192,
+	}, false)
+	if err != nil {
+		t.Fatalf("UpdateModel: %v", err)
+	}
+
+	cfg, _ := Load("")
+	big := cfg.LLM.Providers[0].Models[1]
+	if big.DisplayName != "Big Model" {
+		t.Errorf("display_name = %q, want %q", big.DisplayName, "Big Model")
+	}
+	if big.MaxTokensOutput != 8192 {
+		t.Errorf("max_tokens_output = %d, want 8192", big.MaxTokensOutput)
+	}
+	// The other model should be untouched.
+	small := cfg.LLM.Providers[0].Models[0]
+	if small.MaxTokensOutput != 1024 {
+		t.Errorf("small max_tokens_output = %d, want 1024 (unchanged)", small.MaxTokensOutput)
+	}
+}
+
+func TestUpdateModel_ClearAll(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x", "models": [{ "name": "m", "display_name": "M", "max_tokens_output": 4096 }] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpdateModel("cs", "m", ModelConfig{}, true); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := Load("")
+	m := cfg.LLM.Providers[0].Models[0]
+	if m.DisplayName != "" || m.MaxTokensOutput != 0 {
+		t.Errorf("clear_all didn't reset: %+v", m)
+	}
+}
+
+func TestUpdateModel_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x", "models": [{ "name": "a" }] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpdateModel("cs", "missing", ModelConfig{MaxTokensOutput: 100}, false); err == nil {
+		t.Error("expected error for missing model")
+	}
+	if _, err := UpdateModel("nonexistent", "a", ModelConfig{MaxTokensOutput: 100}, false); err == nil {
+		t.Error("expected error for missing provider")
+	}
+}
+
+func TestLoad_MigratesLegacyYAMLToJSON(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	// Write a legacy yaml file.
+	yamlPath := dir + "/.p-chat/config.yaml"
+	yamlContent := `server:
+  host: 127.0.0.1
+  port: 8960
+llm:
+  default: cs
+  providers:
+    - name: cs
+      protocol: openai
+      base_url: http://example.com/v1
+      api_key: sk-x
+      models:
+        - name: doubao-seed-2.0-lite
+          max_tokens_output: 4096
+        - name: deepseek-v4-flash
+          max_tokens_context: 128000
+`
+	if err := osWriteFile(yamlPath, yamlContent); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.Default != "cs" {
+		t.Errorf("default = %q, want cs", cfg.LLM.Default)
+	}
+	if len(cfg.LLM.Providers) != 1 {
+		t.Fatalf("providers: %d", len(cfg.LLM.Providers))
+	}
+	p := cfg.LLM.Providers[0]
+	if len(p.Models) != 2 {
+		t.Fatalf("models: %d, want 2", len(p.Models))
+	}
+	if p.Models[0].Name != "doubao-seed-2.0-lite" || p.Models[0].MaxTokensOutput != 4096 {
+		t.Errorf("migrated model 0 wrong: %+v", p.Models[0])
+	}
+	if p.Models[1].Name != "deepseek-v4-flash" || p.Models[1].MaxTokensContext != 128000 {
+		t.Errorf("migrated model 1 wrong: %+v", p.Models[1])
+	}
+
+	// After migration, the JSON file should exist.
+	jsonPath := dir + "/.p-chat/config.json"
+	if _, err := os.Stat(jsonPath); err != nil {
+		t.Errorf("expected config.json to be created: %v", err)
+	}
+	// The yaml file is preserved (so the user can roll back).
+	if _, err := os.Stat(yamlPath); err != nil {
+		t.Errorf("expected config.yaml to be preserved: %v", err)
+	}
+}
+
+func TestLoad_NoConfigFallsBackToDefault(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Errorf("default server.host = %q, want 127.0.0.1", cfg.Server.Host)
+	}
+}
+
+func TestProviderConfig_FindModel(t *testing.T) {
+	p := ProviderConfig{
+		Name: "x",
+		Models: []ModelConfig{
+			{Name: "a", Default: true, MaxTokensOutput: 1024},
+			{Name: "b", MaxTokensContext: 128000},
+		},
+	}
+	if p.FindModel("a") == nil {
+		t.Error("FindModel(a) = nil")
+	}
+	if p.FindModel("missing") != nil {
+		t.Error("FindModel(missing) should be nil")
+	}
+}
+
+func TestModelConfig_JSONRoundTrip(t *testing.T) {
+	// Make sure MaxTokensContext / MaxTokensOutput survive
+	// JSON encode + decode (no yaml tag interference).
+	orig := ModelConfig{
+		Name:             "x",
+		DisplayName:      "X",
+		Default:          true,
+		MaxTokensContext: 128000,
+		MaxTokensOutput:  8192,
+		Capabilities: Capabilities{
+			ThinkingEffort: ThinkingEffortHigh,
+		},
+	}
+	data, err := jsonMarshal(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(data, `"max_tokens_context":128000`) {
+		t.Errorf("json should contain max_tokens_context:128000: %s", data)
+	}
+	if !contains(data, `"max_tokens_output":8192`) {
+		t.Errorf("json should contain max_tokens_output:8192: %s", data)
+	}
+	var got ModelConfig
+	if err := jsonUnmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxTokensContext != 128000 || got.MaxTokensOutput != 8192 {
+		t.Errorf("roundtrip lost fields: %+v", got)
+	}
+	if got.Capabilities.ThinkingEffort != ThinkingEffortHigh {
+		t.Errorf("roundtrip lost thinking effort: %+v", got)
+	}
+}
+
 // osWriteFile is a tiny test helper that creates the parent dir
 // and writes the file in one call.
 func osWriteFile(path, content string) error {
@@ -358,4 +566,57 @@ func osWriteFile(path, content string) error {
 		return err
 	}
 	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+// jsonMarshal / jsonUnmarshal are thin wrappers so the
+// TestModelConfig_JSONRoundTrip test can verify the field tags
+// without depending on the implementation file.
+func jsonMarshal(v any) ([]byte, error)    { return json.Marshal(v) }
+func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
+
+// contains is a tiny helper around strings.Contains.
+func contains(haystack []byte, needle string) bool {
+	return strings.Contains(string(haystack), needle)
+}
+
+func TestLoad_StripsBOMFromConfig(t *testing.T) {
+	// Windows tools (Notepad, PowerShell Set-Content with -Encoding
+	// UTF8, .NET StreamWriter with BOM=true) often save UTF-8
+	// files with a leading EF BB BF byte sequence. Go's
+	// encoding/json refuses to parse such a file, so Load must
+	// strip the BOM before unmarshalling.
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	clean := []byte(`{"llm":{"default":"cs","providers":[{"name":"cs","protocol":"openai","base_url":"http://x","api_key":"k","model":"m"}]}}`)
+	data := append(append([]byte{}, bom...), clean...)
+
+	if err := osWriteFile(dir+"/.p-chat/config.json", string(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load with BOM should succeed, got: %v", err)
+	}
+	if cfg.LLM.Default != "cs" {
+		t.Errorf("default = %q, want cs", cfg.LLM.Default)
+	}
+}
+
+func TestStripBOM(t *testing.T) {
+	clean := []byte(`{"a":1}`)
+	if got := stripBOM(clean); string(got) != string(clean) {
+		t.Errorf("no BOM should pass through unchanged")
+	}
+	bom := append([]byte{0xEF, 0xBB, 0xBF}, clean...)
+	if got := stripBOM(bom); string(got) != string(clean) {
+		t.Errorf("BOM should be stripped, got %q", got)
+	}
+	short := []byte{0xEF, 0xBB}
+	if got := stripBOM(short); string(got) != string(short) {
+		t.Errorf("short data should pass through unchanged")
+	}
 }

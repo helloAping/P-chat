@@ -100,10 +100,12 @@ type ProviderInfo struct {
 // endpoint), (2) the current-model field on ProviderInfo. The JSON
 // shape is intentionally small so it can sit in either payload.
 type Model struct {
-	Name         string `json:"name"`
-	DisplayName  string `json:"display_name,omitempty"`
-	Default      bool   `json:"default,omitempty"`
-	Description  string `json:"description,omitempty"`
+	Name             string `json:"name"`
+	DisplayName      string `json:"display_name,omitempty"`
+	Default          bool   `json:"default,omitempty"`
+	Description      string `json:"description,omitempty"`
+	MaxTokensContext int    `json:"max_tokens_context,omitempty"`
+	MaxTokensOutput  int    `json:"max_tokens_output,omitempty"`
 }
 
 // StyleInfo mirrors the styles endpoint payload.

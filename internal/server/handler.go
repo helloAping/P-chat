@@ -163,17 +163,21 @@ func (h *Handler) Styles(c *gin.Context) {
 
 func (h *Handler) Providers(c *gin.Context) {
 	type providerInfo struct {
-		Name     string `json:"name"`
-		Model    string `json:"model"`
-		Protocol string `json:"protocol"`
+		Name     string               `json:"name"`
+		Model    string               `json:"model"`
+		Protocol string               `json:"protocol"`
+		IsDefault bool                `json:"is_default"`
+		Models   []config.ModelConfig `json:"models"`
 	}
 
 	providers := []providerInfo{}
 	for _, p := range h.cfg.LLM.Providers {
 		providers = append(providers, providerInfo{
-			Name:     p.Name,
-			Model:    p.Model,
-			Protocol: p.GetProtocol(),
+			Name:      p.Name,
+			Model:     p.EffectiveModel(),
+			Protocol:  p.GetProtocol(),
+			IsDefault: p.Name == h.cfg.LLM.Default,
+			Models:    p.AllModels(),
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"providers": providers})

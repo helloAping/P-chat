@@ -77,6 +77,7 @@ func init() {
 	rootCmd.AddCommand(skillsCmd)
 	rootCmd.AddCommand(rulesCmd)
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(webCmd)
 	rootCmd.AddCommand(versionCmd)
 }
 

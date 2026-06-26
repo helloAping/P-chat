@@ -92,13 +92,20 @@ func TestProviders(t *testing.T) {
 		t.Errorf("status = %d, want 200", w.Code)
 	}
 	var body struct {
-		Providers []map[string]string `json:"providers"`
+		Providers []map[string]any `json:"providers"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
 	if len(body.Providers) == 0 {
 		t.Error("expected at least one provider")
+	}
+	// Each provider should expose a "models" array (even if empty)
+	// so the UI can render a cascade.
+	for _, p := range body.Providers {
+		if _, ok := p["models"]; !ok {
+			t.Errorf("provider %v missing models array", p["name"])
+		}
 	}
 }
 

@@ -12,6 +12,12 @@ import (
 // APIError is a normalized, user-friendly representation of any
 // non-2xx response from an upstream LLM API. The original
 // (possibly typed) error is preserved via Unwrap.
+//
+// Note: SSE-stream errors (where the HTTP response is 200 OK and
+// the error is delivered as a `data: {"error": ...}` line in the
+// stream) are also represented as *APIError. In that case
+// StatusCode is 0 and the Kind/Message/Suggestion are derived
+// from the Type/Code fields by applySSECodeClassification.
 type APIError struct {
 	// StatusCode is the HTTP status from the upstream API, or 0
 	// when the error is not an HTTP error (e.g. network/timeout).
@@ -106,6 +112,14 @@ func ClassifyAPIError(providerName string, err error) error {
 			StatusCode: openaiErr.HTTPStatusCode,
 			Cause:      err,
 		}
+		// SSE-stream errors arrive with HTTPStatusCode == 0 (the
+		// HTTP response itself is 200 OK; the error is delivered
+		// as a `data: {"error": ...}` line and the SDK wraps it in
+		// an *APIError). Classify those by Type/Code instead.
+		if openaiErr.HTTPStatusCode == 0 {
+			applySSECodeClassification(out, openaiErr, providerName)
+			return out
+		}
 		switch {
 		case openaiErr.HTTPStatusCode == 401, openaiErr.HTTPStatusCode == 403:
 			out.Kind = KindAuth
@@ -159,4 +173,94 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// codeString normalises the *openai.APIError.Code field (which is
+// `any` because the JSON spec lets it be a string OR a number) into
+// a string we can match on.
+func codeString(c any) string {
+	switch v := c.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%d", int(v))
+	case int:
+		return fmt.Sprintf("%d", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// applySSECodeClassification maps the Type/Code fields of an SSE
+// stream error (HTTPStatusCode == 0) into the appropriate
+// *APIError.Kind, with a Chinese message and a useful suggestion.
+//
+// The OpenAI-style taxonomy is loosely:
+//
+//	type=invalid_request_error  -> KindBadRequest
+//	type=authentication_error   -> KindAuth
+//	type=permission_denied      -> KindAuth
+//	type=not_found_error        -> KindNotFound
+//	type=rate_limit_error       -> KindRateLimit
+//	type=insufficient_quota     -> KindRateLimit (quota == rate limit in spirit)
+//	type=server_error           -> KindServer
+//	code=route_not_found        -> KindServer (proxy has no upstream route for this model)
+//
+// The proxy the user was using (api-convert.08ms.cn) returns
+// `type: "server_error", code: "route_not_found"` for models that
+// have no working upstream — which is the case we most want to
+// classify cleanly. See errors_test.go for the canonical examples.
+func applySSECodeClassification(out *APIError, openaiErr *openai.APIError, providerName string) {
+	t := strings.ToLower(strings.TrimSpace(openaiErr.Type))
+	code := strings.ToLower(strings.TrimSpace(codeString(openaiErr.Code)))
+	msg := openaiErr.Message
+
+	// route_not_found is special: the proxy has no upstream route
+	// for this model. We always want the user-facing suggestion to
+	// point them at a model switch, regardless of type.
+	isRouteNotFound := code == "route_not_found" ||
+		strings.Contains(strings.ToLower(msg), "no available route")
+
+	switch {
+	case t == "authentication_error" || code == "invalid_api_key" || code == "invalid_api_key.":
+		out.Kind = KindAuth
+		out.Message = "API key 无效或未授权"
+		out.Suggestion = fmt.Sprintf("用 /config key %s <新key> 更新", providerName)
+	case t == "permission_denied":
+		out.Kind = KindAuth
+		out.Message = "权限不足"
+		out.Suggestion = "确认该 API key 对当前模型有访问权限"
+	case t == "not_found_error" || code == "model_not_found" || code == "model_not_exists":
+		out.Kind = KindNotFound
+		out.Message = fmt.Sprintf("模型不存在 (%s)", truncate(msg, 80))
+		out.Suggestion = "/model 切换到该 provider 已配置的模型"
+	case t == "rate_limit_error" || code == "rate_limit_exceeded":
+		out.Kind = KindRateLimit
+		out.Message = "请求频率超限 (rate limit)"
+		out.Suggestion = "稍后重试，或考虑切换到更便宜的模型"
+	case t == "insufficient_quota" || code == "insufficient_quota":
+		out.Kind = KindRateLimit
+		out.Message = "账户配额已用尽"
+		out.Suggestion = "到 provider 控制台充值或更换 API key"
+	case t == "invalid_request_error":
+		out.Kind = KindBadRequest
+		out.Message = "请求格式或参数被拒绝"
+		out.Suggestion = "检查提示词长度 / 工具 schema 是否合法"
+	case t == "server_error" || isRouteNotFound:
+		out.Kind = KindServer
+		if isRouteNotFound {
+			out.Message = fmt.Sprintf("provider 端无路由 (%s)", truncate(msg, 80))
+			out.Suggestion = fmt.Sprintf("在 /model 切换到 %s 下其他模型，或换 provider", providerName)
+		} else {
+			out.Message = fmt.Sprintf("上游服务异常 (%s)", truncate(msg, 80))
+			out.Suggestion = "稍后重试，或切换到其他 provider"
+		}
+	default:
+		out.Kind = KindUnknown
+		out.Message = truncate(msg, 120)
+	}
 }

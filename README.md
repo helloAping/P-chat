@@ -1,6 +1,6 @@
 # P-Chat
 
-**对话式 AI Agent · 三种人格 · 四端同源**
+**对话式 AI Agent · 三种人格 · 四端同源（CLI / HTTP / 桌面端 / 移动端）**
 
 ## 快速开始
 
@@ -9,8 +9,8 @@
 首次运行会自动创建 `~/.p-chat/` 目录结构：
 
 ```bash
-# 编辑配置文件
-~/.p-chat/config.yaml
+# 编辑配置文件（新版 JSON，旧版 YAML 仍兼容）
+~/.p-chat/config.json
 
 # 填入你的 API Key
 ```
@@ -36,13 +36,30 @@ pchat-server.exe
 # → http://127.0.0.1:8960/api/v1/health
 ```
 
-### 4. 编译
+### 4. 运行桌面端 (Wails v2)
 
 ```bash
-task build
-# 或
-go build -o bin/pchat.exe ./cmd/pchat
-go build -o bin/pchat-server.exe ./cmd/pchat-server
+# 一次性打包出所有产物
+task package:gui
+
+# 装到 %LOCALAPPDATA%\Programs\P-Chat\（带开始菜单快捷方式 + 卸载项）
+task install:gui
+
+# 启动
+"%LOCALAPPDATA%\Programs\P-Chat\pchat-gui.exe"
+
+# 卸载
+task uninstall:gui
+```
+
+桌面端架构：`pchat-gui.exe` 启动时拉起 `pchat-server.exe`（同目录子进程，端口随机），等后端就绪后 webview 自动跳转到 `http://127.0.0.1:<port>/app/index.html` —— 跟浏览器打开 `pchat web` 是同一份 `web/index.html`，所以功能 1:1 一致。关窗自动杀子进程。
+
+### 5. 编译
+
+```bash
+task build          # CLI + Server
+task build:gui      # 桌面端 (Wails v2)
+task package:gui    # 全部打包到 bin\
 ```
 
 ## 目录结构
@@ -51,7 +68,7 @@ go build -o bin/pchat-server.exe ./cmd/pchat-server
 
 ```
 ~/.p-chat/
-├── config.yaml         # 主配置（LLM、Server、Memory 等）
+├── config.json         # 主配置（LLM、Server、Memory 等；旧版 config.yaml 仍兼容）
 ├── AGENTS.md           # 全局 Agent 指令
 ├── skills/             # 全局技能
 │   └── code-review/
@@ -71,7 +88,7 @@ go build -o bin/pchat-server.exe ./cmd/pchat-server
 
 ```
 .p-chat/
-├── config.yaml         # 项目配置（覆盖全局）
+├── config.json         # 项目配置（覆盖全局）
 ├── AGENTS.md           # 项目级 Agent 指令
 ├── skills/             # 项目级技能
 │   └── my-skill/
@@ -86,7 +103,13 @@ go build -o bin/pchat-server.exe ./cmd/pchat-server
 P-chat/
 ├── cmd/
 │   ├── pchat/           # CLI 入口
-│   └── pchat-server/    # HTTP Server 入口
+│   ├── pchat-server/    # HTTP Server 入口
+│   └── pchat-gui/       # 桌面端 (Wails v2)
+│       ├── main.go      # 拉起 pchat-server 子进程 + WebView2 窗口
+│       ├── install.ps1  # 安装脚本（开始菜单 + 注册表卸载项）
+│       ├── uninstall.ps1
+│       ├── frontend/    # 加载页（调 WaitReady() 后跳转到 pchat-server URL）
+│       └── build/       # Wails 产物
 ├── internal/
 │   ├── agent/           # Agent 核心
 │   ├── agents/          # AGENTS.md 加载
@@ -96,12 +119,14 @@ P-chat/
 │   ├── paths/           # 路径解析
 │   ├── rules/           # 规则加载
 │   ├── server/          # HTTP Server
+│   ├── serverproc/      # 子进程拉起 + 健康等待
 │   ├── skill/           # 技能加载
 │   ├── style/           # 风格管理
 │   └── tool/            # 内置工具
 ├── prompts/             # 本地风格提示词
 ├── configs/             # 示例配置
-├── web/                 # 桌面端前端
+├── scripts/             # 打包 + 冒烟测试脚本
+├── web/                 # Web UI 入口（桌面端和 pchat web 共用）
 ├── go.mod
 ├── Taskfile.yml
 └── README.md
@@ -112,8 +137,8 @@ P-chat/
 配置加载顺序（后加载覆盖先加载）：
 
 1. 默认值（代码内置）
-2. `~/.p-chat/config.yaml`（全局配置）
-3. `.p-chat/config.yaml`（项目配置）
+2. `~/.p-chat/config.json`（全局配置；旧版 `config.yaml` 仍兼容，自动迁移）
+3. `.p-chat/config.json`（项目配置）
 4. `--config` 参数指定的文件（最高优先级）
 
 ## 风格人格
@@ -250,8 +275,8 @@ data: {"content":"","done":true}
 - [x] AGENTS.md 支持
 - [x] Skills 技能系统
 - [x] Rules 规则系统
+- [x] Wails v2 桌面端 (与 web 端共用 web/index.html，1:1 功能)
 - [ ] MCP 工具协议集成
-- [ ] Tauri/Wails 桌面端
 - [ ] iOS SwiftUI 客户端
 - [ ] 本地 LLM (Ollama) 深度集成
 - [ ] 代码沙箱 (Docker)

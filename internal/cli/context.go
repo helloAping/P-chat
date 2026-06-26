@@ -67,11 +67,16 @@ type cliContext interface {
 	SetDefaultProvider(name string) error
 	// Model management (for /config model ...)
 	AddModel(provider, name, display, desc string) error
+	AddModelFull(provider string, m config.ModelConfig) error
+	UpdateModel(provider, name string, patch config.ModelConfig) error
 	RemoveModel(provider, name string) error
 	SetDefaultModel(provider, name string) error
 	// ListAllModels returns (provider, model, display, isDefault) for
 	// every model across every provider, used by /config model list.
 	ListAllModels(provider string) []ModelView
+	// GetModelSettings returns the per-model MaxTokensContext /
+	// MaxTokensOutput overrides, or zero if unknown.
+	GetModelSettings(provider, model string) ModelSettings
 	// ReloadConfig re-reads the on-disk config and rebuilds the LLM
 	// client. Returns an error in HTTP mode.
 	ReloadConfig() error
@@ -171,6 +176,13 @@ type ModelView struct {
 	DisplayName string
 	Description string
 	Default     bool
+}
+
+// ModelSettings is the (MaxTokensContext, MaxTokensOutput) pair for
+// a single (provider, model). Zero values mean "unset".
+type ModelSettings struct {
+	MaxTokensContext int
+	MaxTokensOutput  int
 }
 
 // ToolView is a single registered tool's metadata for /tools.
@@ -408,15 +420,45 @@ func (c *localContext) SetDefaultProvider(name string) error {
 
 func (c *localContext) AddModel(provider, name, display, desc string) error {
 	updated, err := config.AddModel(provider, config.ModelConfig{
-		Name:         name,
-		DisplayName:  display,
-		Description:  desc,
+		Name:        name,
+		DisplayName: display,
+		Description: desc,
 	})
 	if err != nil {
 		return err
 	}
 	_ = updated
 	return c.r.reloadLLMClient()
+}
+
+func (c *localContext) AddModelFull(provider string, m config.ModelConfig) error {
+	if _, err := config.AddModel(provider, m); err != nil {
+		return err
+	}
+	return c.r.reloadLLMClient()
+}
+
+func (c *localContext) UpdateModel(provider, name string, patch config.ModelConfig) error {
+	if _, err := config.UpdateModel(provider, name, patch, false); err != nil {
+		return err
+	}
+	return c.r.reloadLLMClient()
+}
+
+func (c *localContext) GetModelSettings(provider, model string) ModelSettings {
+	for _, p := range c.r.cfg.LLM.Providers {
+		if p.Name != provider {
+			continue
+		}
+		if m := p.FindModel(model); m != nil {
+			return ModelSettings{
+				MaxTokensContext: m.MaxTokensContext,
+				MaxTokensOutput:  m.MaxTokensOutput,
+			}
+		}
+		return ModelSettings{}
+	}
+	return ModelSettings{}
 }
 
 func (c *localContext) RemoveModel(provider, name string) error {
@@ -729,9 +771,12 @@ func (c *httpContext) RemoveProvider(name string) error           { return c.uns
 func (c *httpContext) SetProviderAPIKey(name, key string) error  { return c.unsupported("SetProviderAPIKey") }
 func (c *httpContext) SetDefaultProvider(name string) error      { return c.unsupported("SetDefaultProvider") }
 func (c *httpContext) AddModel(p, n, d, dd string) error         { return c.unsupported("AddModel") }
+func (c *httpContext) AddModelFull(p string, m config.ModelConfig) error { return c.unsupported("AddModelFull") }
+func (c *httpContext) UpdateModel(p, n string, patch config.ModelConfig) error { return c.unsupported("UpdateModel") }
 func (c *httpContext) RemoveModel(p, n string) error              { return c.unsupported("RemoveModel") }
 func (c *httpContext) SetDefaultModel(p, n string) error          { return c.unsupported("SetDefaultModel") }
 func (c *httpContext) ListAllModels(provider string) []ModelView  { return nil }
+func (c *httpContext) GetModelSettings(p, m string) ModelSettings { return ModelSettings{} }
 func (c *httpContext) ReloadConfig() error                        { return c.unsupported("ReloadConfig") }
 
 func (c *httpContext) ListSessions(ctx context.Context) ([]httpcli.Session, error) {

@@ -23,16 +23,29 @@ type Server struct {
 func (s *Server) Engine() *gin.Engine { return s.engine }
 
 // New builds the HTTP server. The store is used for session/message
-// persistence. The agent is used for chat calls.
+// persistence. The agent is used for chat calls. The web frontend is
+// served from an embedded filesystem so the binary is self-contained.
 func New(cfg *config.Config, agt *agent.Agent, store *memory.Store) *Server {
-	return NewWithStaticDir(cfg, agt, store, "web")
+	return NewWithStaticFS(cfg, agt, store, nil)
 }
 
 // NewWithStaticDir is like New but lets the caller pick where the
-// static frontend lives. Used by tests (which may be invoked from
-// any cwd) and by a future packaging step that wants to bundle the
-// web/ output in a different location.
+// static frontend lives on disk. Used by tests and by the `pchat web`
+// parent process, which sets PCHAT_WEB_DIR to the absolute path of the
+// web/ output. Pass an empty string to skip static serving entirely
+// (useful for tests that don't ship the frontend).
 func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store, staticDir string) *Server {
+	if staticDir == "" {
+		return NewWithStaticFS(cfg, agt, store, nil)
+	}
+	return NewWithStaticFS(cfg, agt, store, http.Dir(staticDir))
+}
+
+// NewWithStaticFS is the lowest-level constructor: it accepts an
+// http.FileSystem directly. Pass nil to skip static serving. In
+// production pchat-server passes http.FS(embeddedWebFS) so the
+// frontend ships inside the binary and works from any CWD.
+func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, staticFS http.FileSystem) *Server {
 	if os.Getenv("PC_HTTP_DEBUG") == "1" {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -54,6 +67,7 @@ func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store,
 		api.PATCH("/providers/:name", h.SetProviderAPIKey)
 		api.POST("/providers/:name/default", h.SetDefaultProvider)
 		api.POST("/providers/:name/models", h.AddModel)
+		api.PUT("/providers/:name/models/:model", h.UpdateModel)
 		api.DELETE("/providers/:name/models/:model", h.DeleteModel)
 		api.POST("/providers/:name/models/:model/default", h.SetDefaultModel)
 		api.PATCH("/providers/:name/models/:model/capabilities", h.SetCapabilities)
@@ -79,11 +93,9 @@ func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store,
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the
-	// browser-based client load their assets from /app. If
-	// staticDir is empty, the route is skipped (useful for tests
-	// that don't ship the frontend).
-	if staticDir != "" {
-		r.StaticFS("/app", http.Dir(staticDir))
+	// browser-based client load their assets from /app.
+	if staticFS != nil {
+		r.StaticFS("/app", staticFS)
 	}
 
 	return &Server{cfg: cfg, agent: agt, store: store, engine: r}

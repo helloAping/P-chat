@@ -22,13 +22,31 @@ func ProjectDir() string {
 	return filepath.Join(cwd, ProjectDirName)
 }
 
-// GlobalConfig returns ~/.p-chat/config.yaml
+// GlobalConfig returns the primary global config file
+// (JSON, ~/.p-chat/config.json).
+//
+// The legacy YAML path (~/.p-chat/config.yaml) is still recognized
+// by the config loader as a one-shot migration source — see
+// config.Load. New code should not reference the YAML path
+// directly; use the config package for I/O.
 func GlobalConfig() string {
+	return filepath.Join(GlobalDir(), "config.json")
+}
+
+// ProjectConfig returns the primary project config file
+// (JSON, .p-chat/config.json).
+func ProjectConfig() string {
+	return filepath.Join(ProjectDir(), "config.json")
+}
+
+// GlobalConfigYAML is the legacy global config path. Kept only
+// so the loader can detect and migrate old installs.
+func GlobalConfigYAML() string {
 	return filepath.Join(GlobalDir(), "config.yaml")
 }
 
-// ProjectConfig returns .p-chat/config.yaml
-func ProjectConfig() string {
+// ProjectConfigYAML is the legacy project config path.
+func ProjectConfigYAML() string {
 	return filepath.Join(ProjectDir(), "config.yaml")
 }
 
