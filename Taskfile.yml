@@ -5,13 +5,19 @@ vars:
 
 tasks:
   build:frontend:
-    desc: 编译 Vue 前端 (Vite SPA)，输出到 web/
+    desc: 编译 Vue 前端 (Vite SPA)，输出到 web/ 并同步到 embed 目录
     dir: cmd\pchat-gui\frontend
     cmds:
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\..\scripts\clean-frontend-output.ps1"
       - cmd: npm install
         ignore_error: true
       - npm run build
+      # Sync MUST run after `npm run build` so it picks up the
+      # freshly emitted index.html / assets/. Putting it in
+      # build:all's `deps:` list is wrong: Task runs sibling deps
+      # in parallel by default, so the sync can race ahead of
+      # clean-frontend-output.ps1 and copy an empty tree.
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\..\scripts\sync-web.ps1"
     sources:
       - package.json
       - package-lock.json
@@ -32,7 +38,7 @@ tasks:
 
   build:
     desc: 编译 CLI 和 Server（前端由 build:gui:npm 统一调度）
-    deps: [build:frontend, sync:web]
+    deps: [build:frontend]
     cmds:
       - go build -o bin/pchat.exe ./cmd/pchat
       - go build -o bin/pchat-server.exe ./cmd/pchat-server
