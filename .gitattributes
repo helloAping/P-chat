@@ -1,0 +1,116 @@
+# =============================================================================
+# P-Chat .gitattributes
+# =============================================================================
+# Ensures consistent text handling across operating systems.
+# `git add` and `git diff` will treat the files as text per these rules
+# regardless of where the contributor checked out.
+# =============================================================================
+
+# Default: LF in the repo, native on checkout (use `core.autocrlf=input`
+# on Windows for symmetric behaviour). If you want a single line-ending
+# policy regardless of OS, switch the fallback below to `eol=lf`.
+*               text=auto eol=lf
+
+
+# -----------------------------------------------------------------------------
+# Source code: enforce LF
+# -----------------------------------------------------------------------------
+*.go            text eol=lf
+*.py            text eol=lf
+*.js            text eol=lf
+*.ts            text eol=lf
+*.jsx           text eol=lf
+*.tsx           text eol=lf
+*.css           text eol=lf
+*.scss          text eol=lf
+*.html          text eol=lf
+*.json          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+*.md            text eol=lf
+*.sh            text eol=lf
+*.bash          text eol=lf
+*.zsh           text eol=lf
+
+
+# -----------------------------------------------------------------------------
+# Windows-only scripts must keep CRLF on disk
+# -----------------------------------------------------------------------------
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf
+
+
+# -----------------------------------------------------------------------------
+# Binary: mark explicitly so `git diff` doesn't try to diff them
+# -----------------------------------------------------------------------------
+# Images
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.webp          binary
+*.svg           text eol=lf  # keep SVG diffable
+
+# Fonts / media
+*.woff          binary
+*.woff2         binary
+*.ttf           binary
+*.otf           binary
+*.mp3           binary
+*.mp4           binary
+*.wav           binary
+*.webm          binary
+
+# Archives
+*.zip           binary
+*.tar           binary
+*.gz            binary
+*.tgz           binary
+*.7z            binary
+*.rar           binary
+
+# Documents
+*.pdf           binary
+*.doc           binary
+*.docx          binary
+*.xls           binary
+*.xlsx          binary
+*.ppt           binary
+*.pptx          binary
+
+# Executables / objects
+*.exe           binary
+*.dll           binary
+*.so            binary
+*.dylib         binary
+*.o             binary
+*.a             binary
+
+# Databases / coverage
+*.db            binary
+*.db-wal        binary
+*.db-shm        binary
+*.sqlite        binary
+*.sqlite3       binary
+coverage.out    binary
+coverage.html   binary
+*.prof          binary
+*.pprof         binary
+
+
+# -----------------------------------------------------------------------------
+# Shell scripts: ensure executable bit is preserved on Linux/macOS checkouts
+# (Windows can't represent the bit, so it just gets stored as is).
+# -----------------------------------------------------------------------------
+*.sh            text eol=lf
+
+
+# -----------------------------------------------------------------------------
+# LFS hooks (placeholder — enable if the project starts hosting large files)
+# -----------------------------------------------------------------------------
+# *.psd           filter=lfs diff=lfs merge=lfs -text
+# *.mov           filter=lfs diff=lfs merge=lfs -text
+# *.mp4           filter=lfs diff=lfs merge=lfs -text

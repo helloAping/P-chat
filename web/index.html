@@ -1,0 +1,1019 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P-Chat</title>
+<style>
+:root {
+    --bg: #0a0a0a;
+    --bg-2: #0d0d0d;
+    --bg-3: #141414;
+    --bg-4: #1a1a1a;
+    --bg-input: #161618;
+    --border: #1f1f1f;
+    --border-2: #2a2a2a;
+    --text: #e0e0e0;
+    --text-2: #aaa;
+    --text-3: #777;
+    --text-4: #555;
+    --accent: #4a4dff;
+    --accent-2: #7c8dff;
+    --accent-bg: #1a1a2e;
+    --accent-bg-2: #2a2a3e;
+    --error: #c66;
+    --warn: #e0a040;
+    --ok: #5cd29f;
+    --user-bg: #1a1a2e;
+    --asst-bg: #141414;
+    --tool-bg: #181a1f;
+    --tool-border: #2a2d35;
+    --shadow: 0 4px 16px rgba(0,0,0,0.4);
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Consolas", "Microsoft YaHei Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    grid-template-rows: 56px 1fr 88px;
+    height: 100vh;
+    overflow: hidden;
+}
+button { font-family: inherit; cursor: pointer; }
+input, textarea { font-family: inherit; }
+
+/* ====== Sidebar ====== */
+#sidebar {
+    grid-row: 1 / span 3;
+    background: var(--bg-2);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+}
+#sidebar-header {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+    flex-shrink: 0;
+}
+#sidebar-header h1 { font-size: 16px; font-weight: 600; flex: 1; }
+#new-session {
+    background: var(--accent-bg); color: var(--accent-2);
+    border: 1px solid #2d2d4e;
+    border-radius: 6px; padding: 5px 10px;
+    cursor: pointer; font-size: 12px;
+    transition: background 0.15s;
+}
+#new-session:hover { background: var(--accent-bg-2); }
+#session-list { flex: 1; overflow-y: auto; padding: 8px 0; }
+.session-item {
+    padding: 8px 16px;
+    cursor: pointer;
+    display: flex; align-items: center; gap: 8px;
+    color: var(--text-2);
+    border-left: 3px solid transparent;
+    transition: background 0.1s;
+}
+.session-item:hover { background: var(--bg-3); color: #eee; }
+.session-item.active {
+    background: var(--accent-bg); color: #fff;
+    border-left-color: var(--accent-2);
+}
+.session-item .title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-item .time { font-size: 10px; color: var(--text-4); }
+.session-item .del { opacity: 0; color: var(--error); font-size: 11px; padding: 2px 6px; background: transparent; border: none; }
+.session-item:hover .del { opacity: 1; }
+.session-item .del:hover { color: #f55; }
+
+#sidebar-footer {
+    border-top: 1px solid var(--border);
+    padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 8px;
+    flex-shrink: 0;
+}
+.sidebar-section { font-size: 10px; color: var(--text-4); text-transform: uppercase; letter-spacing: 0.5px; }
+.style-picker { display: flex; gap: 4px; }
+.style-btn {
+    flex: 1; padding: 5px 6px; font-size: 11px;
+    background: var(--bg-3); color: var(--text-2);
+    border: 1px solid var(--border-2);
+    border-radius: 5px;
+    transition: all 0.15s;
+}
+.style-btn:hover { background: var(--bg-4); color: #fff; }
+.style-btn.active {
+    background: var(--accent-bg); color: var(--accent-2);
+    border-color: var(--accent);
+}
+.model-picker {
+    width: 100%;
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border-2);
+    border-radius: 5px;
+    padding: 6px 8px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.model-picker:hover { border-color: var(--accent); }
+.model-picker:focus { outline: none; border-color: var(--accent); }
+
+/* ====== Header ====== */
+#header {
+    grid-row: 1; grid-column: 2;
+    padding: 0 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+    background: var(--bg);
+}
+#session-title { font-size: 15px; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#session-title[contenteditable="true"] {
+    background: var(--bg-3);
+    border-radius: 4px;
+    padding: 2px 6px;
+    outline: 1px solid var(--accent);
+}
+.header-meta { display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--text-3); }
+.header-meta .pill {
+    background: var(--bg-3);
+    border: 1px solid var(--border-2);
+    padding: 2px 8px; border-radius: 10px;
+}
+
+/* ====== Messages ====== */
+#messages {
+    grid-row: 2; grid-column: 2;
+    overflow-y: auto;
+    padding: 24px 32px;
+    display: flex; flex-direction: column;
+    scroll-behavior: smooth;
+}
+#messages::-webkit-scrollbar { width: 8px; }
+#messages::-webkit-scrollbar-track { background: transparent; }
+#messages::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
+#messages::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
+
+.msg {
+    margin-bottom: 16px;
+    max-width: 80%;
+    padding: 10px 14px;
+    border-radius: 8px;
+    line-height: 1.6;
+    word-wrap: break-word;
+    font-size: 14px;
+}
+.msg.user { align-self: flex-end; background: var(--user-bg); }
+.msg.assistant { align-self: flex-start; background: var(--asst-bg); }
+.msg.tool {
+    align-self: stretch; max-width: 100%;
+    background: var(--tool-bg); border: 1px solid var(--tool-border);
+    color: #9ab; font-size: 12px; font-family: var(--mono);
+    padding: 8px 12px;
+}
+.msg.tool.error { border-color: #4a2828; color: var(--error); }
+.msg.tool.warn { border-color: #4a4028; color: var(--warn); }
+.msg.tool .role { font-size: 10px; color: var(--text-4); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+.msg.tool .label { color: var(--accent-2); }
+.msg.tool .args { color: #678; font-size: 11px; margin-top: 2px; white-space: pre-wrap; word-break: break-all; }
+.msg.tool .result { white-space: pre-wrap; color: #789; margin-top: 4px; max-height: 200px; overflow-y: auto; }
+.msg.tool .toggle {
+    color: var(--text-3); font-size: 10px; cursor: pointer;
+    margin-left: 8px; user-select: none;
+}
+.msg.tool .toggle:hover { color: var(--accent-2); }
+.msg.tool.collapsed .args, .msg.tool.collapsed .result { display: none; }
+
+/* Markdown-rendered content */
+.msg p { margin: 0 0 8px 0; }
+.msg p:last-child { margin-bottom: 0; }
+.msg h1, .msg h2, .msg h3 { margin: 12px 0 6px 0; font-weight: 600; line-height: 1.3; }
+.msg h1 { font-size: 18px; }
+.msg h2 { font-size: 16px; }
+.msg h3 { font-size: 14px; }
+.msg ul, .msg ol { margin: 4px 0 8px 0; padding-left: 20px; }
+.msg li { margin: 2px 0; }
+.msg code {
+    font-family: var(--mono); font-size: 0.9em;
+    background: rgba(255,255,255,0.08);
+    padding: 1px 5px; border-radius: 3px;
+}
+.msg pre {
+    margin: 6px 0;
+    background: var(--bg);
+    border: 1px solid var(--border-2);
+    border-radius: 6px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.5;
+}
+.msg pre code {
+    background: transparent; padding: 0; font-size: inherit;
+}
+.msg blockquote {
+    border-left: 3px solid var(--border-2);
+    margin: 6px 0; padding: 2px 0 2px 12px;
+    color: var(--text-2);
+}
+.msg a { color: var(--accent-2); text-decoration: none; }
+.msg a:hover { text-decoration: underline; }
+.msg hr { border: none; border-top: 1px solid var(--border-2); margin: 8px 0; }
+.msg table { border-collapse: collapse; margin: 6px 0; }
+.msg th, .msg td { border: 1px solid var(--border-2); padding: 4px 8px; }
+.msg th { background: var(--bg-3); }
+
+/* Cursor blink for streaming */
+.streaming::after {
+    content: "▍";
+    color: var(--accent-2);
+    animation: blink 1s steps(2) infinite;
+    margin-left: 2px;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+.phase {
+    align-self: stretch; text-align: center;
+    color: var(--text-4); font-size: 11px; padding: 4px;
+    font-style: italic;
+}
+.error { color: var(--error); background: #2a1818; padding: 8px 12px; border-radius: 6px; margin: 8px 0; font-size: 13px; }
+.empty-state { color: var(--text-4); text-align: center; margin: auto; padding: 32px; }
+.empty-state h2 { font-size: 18px; font-weight: 500; margin-bottom: 8px; color: var(--text-3); }
+.empty-state p { font-size: 13px; }
+
+/* ====== Input area ====== */
+#input-area {
+    grid-row: 3; grid-column: 1 / -1;
+    padding: 12px 24px 16px;
+    border-top: 1px solid var(--border);
+    display: flex; gap: 10px; align-items: flex-end;
+    background: var(--bg);
+}
+#input-wrap {
+    flex: 1;
+    background: var(--bg-input);
+    border: 1px solid var(--border-2);
+    border-radius: 10px;
+    padding: 10px 14px;
+    transition: border-color 0.15s;
+    display: flex; flex-direction: column;
+}
+#input-wrap:focus-within { border-color: var(--accent); }
+#input {
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+    resize: none;
+    min-height: 20px;
+    max-height: 120px;
+    width: 100%;
+    font-family: inherit;
+}
+#input-hint {
+    font-size: 10px; color: var(--text-4); margin-top: 4px;
+    display: flex; gap: 12px;
+}
+#input-hint kbd {
+    background: var(--bg-3); border: 1px solid var(--border-2);
+    border-radius: 3px; padding: 0 4px; font-family: var(--mono); font-size: 9px;
+}
+#send, #stop {
+    background: var(--accent); color: #fff;
+    border: none; border-radius: 10px;
+    padding: 0 18px; cursor: pointer;
+    font-size: 14px; font-weight: 500;
+    height: 40px;
+    transition: background 0.15s;
+}
+#send:hover { background: #5a5dff; }
+#send:disabled { background: #333; color: #666; cursor: not-allowed; }
+#stop { background: var(--error); display: none; }
+#stop:hover { background: #d77; }
+#stop.show { display: block; }
+#send.hide { display: none; }
+
+/* Modal */
+.modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 100;
+}
+.modal-backdrop.show { display: flex; }
+.modal {
+    background: var(--bg-2);
+    border: 1px solid var(--border-2);
+    border-radius: 10px;
+    padding: 20px;
+    min-width: 360px; max-width: 480px;
+    box-shadow: var(--shadow);
+}
+.modal h3 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+.modal-list { max-height: 320px; overflow-y: auto; margin: 8px 0; }
+.modal-item {
+    padding: 10px 12px; border-radius: 6px;
+    cursor: pointer; display: flex; align-items: center; gap: 10px;
+    transition: background 0.1s;
+}
+.modal-item:hover { background: var(--bg-3); }
+.modal-item.active { background: var(--accent-bg); }
+.modal-item .name { flex: 1; font-size: 13px; }
+.modal-item .meta { font-size: 11px; color: var(--text-3); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.modal-btn {
+    padding: 6px 12px; border-radius: 5px; font-size: 12px;
+    background: var(--bg-3); color: var(--text);
+    border: 1px solid var(--border-2);
+}
+.modal-btn:hover { background: var(--bg-4); }
+.modal-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Toast */
+.toast {
+    position: fixed; bottom: 100px; left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: var(--bg-3); color: var(--text);
+    border: 1px solid var(--border-2);
+    border-radius: 6px; padding: 8px 14px;
+    font-size: 12px;
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.2s, transform 0.2s;
+    z-index: 200;
+    box-shadow: var(--shadow);
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.error { background: #2a1818; border-color: #4a2828; color: var(--error); }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+    <div id="sidebar-header">
+        <h1>P-Chat</h1>
+        <button id="new-session" title="新建会话">+ 新建</button>
+    </div>
+    <div id="session-list"></div>
+    <div id="sidebar-footer">
+        <div class="sidebar-section">风格</div>
+        <div class="style-picker" id="style-picker"></div>
+        <div class="sidebar-section">模型</div>
+        <select class="model-picker" id="model-picker"><option>加载中…</option></select>
+    </div>
+</div>
+
+<div id="header">
+    <div id="session-title" title="双击重命名">未选择会话</div>
+    <div class="header-meta" id="header-meta" style="display:none">
+        <span class="pill" id="meta-tokens">0 / 0 tok</span>
+        <span class="pill" id="meta-elapsed">0.0s</span>
+    </div>
+</div>
+
+<div id="messages">
+    <div class="empty-state" id="empty-state">
+        <h2>👋 欢迎使用 P-Chat</h2>
+        <p>新建一个会话或选择左侧已有会话开始对话</p>
+    </div>
+</div>
+
+<div id="input-area">
+    <div id="input-wrap">
+        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行，Esc 取消"></textarea>
+        <div id="input-hint">
+            <span><kbd>Enter</kbd> 发送</span>
+            <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
+            <span><kbd>Esc</kbd> 取消</span>
+        </div>
+    </div>
+    <button id="send">发送</button>
+    <button id="stop" title="停止生成">停止</button>
+</div>
+
+<div class="modal-backdrop" id="model-modal">
+    <div class="modal">
+        <h3>选择模型</h3>
+        <div class="modal-list" id="model-modal-list"></div>
+        <div class="modal-actions">
+            <button class="modal-btn" id="model-modal-cancel">取消</button>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = "";  // same origin
+const $ = (id) => document.getElementById(id);
+
+const state = {
+    sessions: [],
+    currentID: null,
+    abort: null,
+    isStreaming: false,
+    styles: [],
+    providers: [],
+    currentProvider: null,
+    currentModel: null,
+    currentStyle: "tech",
+};
+
+// ---------- API ----------
+async function api(path, opts = {}) {
+    const res = await fetch(API + path, opts);
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+    if (res.status === 204) return null;
+    const ct = res.headers.get("content-type") || "";
+    return ct.includes("json") ? res.json() : res.text();
+}
+
+// ---------- Toast ----------
+let toastTimer = null;
+function toast(msg, type = "info") {
+    const el = $("toast");
+    el.textContent = msg;
+    el.className = "toast show" + (type === "error" ? " error" : "");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.className = "toast" + (type === "error" ? " error" : ""); }, 2400);
+}
+
+// ---------- Styles / providers ----------
+async function loadStyles() {
+    const r = await api("/api/v1/styles");
+    state.styles = r.styles || [];
+    renderStylePicker();
+}
+
+async function loadProviders() {
+    const r = await api("/api/v1/providers");
+    state.providers = r.providers || [];
+    renderModelPicker();
+}
+
+function renderStylePicker() {
+    const wrap = $("style-picker");
+    wrap.innerHTML = "";
+    for (const s of state.styles) {
+        const btn = document.createElement("button");
+        btn.className = "style-btn" + (s.id === state.currentStyle ? " active" : "");
+        btn.textContent = s.id;
+        btn.title = s.label + " — " + s.desc;
+        btn.onclick = () => selectStyle(s.id);
+        wrap.appendChild(btn);
+    }
+}
+
+function renderModelPicker() {
+    const sel = $("model-picker");
+    sel.innerHTML = "";
+    if (state.providers.length === 0) {
+        const o = document.createElement("option");
+        o.textContent = "(未配置提供商)";
+        sel.appendChild(o);
+        sel.disabled = true;
+        return;
+    }
+    sel.disabled = false;
+    for (const p of state.providers) {
+        const o = document.createElement("option");
+        o.value = p.name + "|" + p.model;
+        o.textContent = `${p.name} / ${p.model}`;
+        if (p.name === state.currentProvider && p.model === state.currentModel) {
+            o.selected = true;
+        }
+        sel.appendChild(o);
+    }
+    sel.onchange = () => selectModel(sel.value);
+}
+
+async function selectStyle(id) {
+    if (id === state.currentStyle) return;
+    state.currentStyle = id;
+    renderStylePicker();
+    if (state.currentID) {
+        try {
+            // Style is per-session. We don't have a PATCH endpoint for
+            // style, so we just remember it client-side and send it
+            // with each SendMessage (server falls back to default if
+            // empty).
+            // Re-render header if needed.
+        } catch (e) { toast("风格切换失败: " + e.message, "error"); }
+    }
+    toast("风格: " + id);
+}
+
+async function selectModel(value) {
+    const [name, model] = value.split("|");
+    state.currentProvider = name;
+    state.currentModel = model;
+    toast(`模型: ${name} / ${model}`);
+}
+
+// ---------- Sessions ----------
+async function loadSessions() {
+    const r = await api("/api/v1/sessions");
+    state.sessions = r.sessions || [];
+    renderSessionList();
+    if (!state.currentID && state.sessions.length > 0) {
+        await switchSession(state.sessions[0].id);
+    } else if (state.sessions.length === 0) {
+        showEmptyState();
+    }
+}
+
+async function createSession() {
+    const s = await api("/api/v1/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ style: state.currentStyle, provider: state.currentProvider }),
+    });
+    state.currentID = s.id;
+    await loadSessions();
+    focusInput();
+}
+
+async function deleteSession(id) {
+    if (!confirm("删除这个会话？")) return;
+    await api(`/api/v1/sessions/${id}`, { method: "DELETE" });
+    if (state.currentID === id) {
+        state.currentID = null;
+        showEmptyState();
+    }
+    await loadSessions();
+}
+
+async function renameSession(id, newTitle) {
+    try {
+        await api(`/api/v1/sessions/${id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: newTitle }),
+        });
+        await loadSessions();
+    } catch (e) {
+        toast("重命名失败: " + e.message, "error");
+    }
+}
+
+async function loadMessages(id) {
+    return api(`/api/v1/sessions/${id}/messages`);
+}
+
+async function switchSession(id) {
+    if (state.isStreaming) stopGeneration();
+    state.currentID = id;
+    renderSessionList();
+
+    const s = state.sessions.find((x) => x.id === id);
+    $("session-title").textContent = s ? (s.title || "(无标题)") : "未选择会话";
+
+    $("messages").innerHTML = "";
+    hideHeaderMeta();
+    if (!s) { showEmptyState(); return; }
+
+    try {
+        const r = await loadMessages(id);
+        const msgs = r.messages || [];
+        if (msgs.length === 0) {
+            showEmptyState();
+        } else {
+            for (const m of msgs) {
+                appendHistoryMessage(m);
+            }
+        }
+    } catch (e) {
+        appendError(e.message);
+    }
+    scrollToBottom(false);
+}
+
+// ---------- Render ----------
+function renderSessionList() {
+    const list = $("session-list");
+    list.innerHTML = "";
+    for (const s of state.sessions) {
+        const item = document.createElement("div");
+        item.className = "session-item" + (s.id === state.currentID ? " active" : "");
+        item.dataset.id = s.id;
+        item.innerHTML = `
+            <div class="title">${escapeHTML(s.title || "(无标题)")}</div>
+            <div class="time">${formatTime(s.updated_at)}</div>
+            <button class="del" title="删除">✕</button>
+        `;
+        item.addEventListener("click", (e) => {
+            if (e.target.classList.contains("del")) {
+                deleteSession(s.id);
+            } else {
+                switchSession(s.id);
+            }
+        });
+        list.appendChild(item);
+    }
+}
+
+function showEmptyState() {
+    $("messages").innerHTML = `
+        <div class="empty-state">
+            <h2>👋 欢迎使用 P-Chat</h2>
+            <p>新建一个会话或选择左侧已有会话开始对话</p>
+        </div>`;
+}
+
+function appendHistoryMessage(m) {
+    const role = m.role;
+    if (role === "user") {
+        appendMsg("user", m.content, false);
+    } else if (role === "assistant") {
+        appendMsg("assistant", m.content || "", false);
+    } else if (role === "tool" || m.name) {
+        appendToolMessage({
+            tool_name: m.name || "tool",
+            tool_result: m.content,
+            tool_status: m.tool_call_id ? "ok" : "ok",
+        });
+    } else {
+        // system or unknown
+    }
+}
+
+function appendMsg(role, text, streaming) {
+    const div = document.createElement("div");
+    div.className = `msg ${role}` + (streaming ? " streaming" : "");
+    if (text) div.innerHTML = renderMarkdown(text);
+    $("messages").appendChild(div);
+    if (streaming) scrollToBottom(true);
+    return div;
+}
+
+function appendToolMessage(ev) {
+    const div = document.createElement("div");
+    div.className = "msg tool collapsed";
+    if (ev.tool_status === "error") div.classList.add("error");
+    if (ev.tool_status === "warn") div.classList.add("warn");
+
+    const labelMap = { ok: "✓", error: "✗", warn: "!", start: "·" };
+    const label = labelMap[ev.tool_status] || "·";
+    div.innerHTML = `
+        <div class="role">tool <span class="toggle">[展开]</span></div>
+        <div><span class="label">${label} ${escapeHTML(ev.tool_name || "")}</span> ${escapeHTML(ev.tool_elapsed || "")}</div>
+        ${ev.tool_args ? `<div class="args">${escapeHTML(truncate(ev.tool_args, 200))}</div>` : ""}
+        ${ev.tool_result ? `<div class="result">${escapeHTML(truncate(ev.tool_result, 1000))}</div>` : ""}
+        ${ev.tool_error ? `<div class="result">${escapeHTML(ev.tool_error)}</div>` : ""}
+    `;
+    div.querySelector(".toggle").onclick = (e) => {
+        e.stopPropagation();
+        div.classList.toggle("collapsed");
+        e.target.textContent = div.classList.contains("collapsed") ? "[展开]" : "[收起]";
+    };
+    $("messages").appendChild(div);
+    scrollToBottom(true);
+    return div;
+}
+
+function appendError(msg) {
+    const div = document.createElement("div");
+    div.className = "error";
+    div.textContent = msg;
+    $("messages").appendChild(div);
+    scrollToBottom(true);
+}
+
+function scrollToBottom(smooth) {
+    const m = $("messages");
+    m.scrollTo({ top: m.scrollHeight, behavior: smooth ? "smooth" : "instant" });
+}
+
+// ---------- Streaming ----------
+async function sendMessage(text) {
+    if (!state.currentID) await createSession();
+    const id = state.currentID;
+    removeEmptyState();
+
+    appendMsg("user", text, false);
+    const asstDiv = appendMsg("assistant", "", true);
+    let contentBuf = "";
+    let pending = "";  // pending markdown to render
+
+    const ctrl = new AbortController();
+    state.abort = ctrl;
+    state.isStreaming = true;
+    showStopButton();
+    showHeaderMeta();
+
+    let lastRender = 0;
+    function flushRender() {
+        if (pending) {
+            contentBuf += pending;
+            pending = "";
+            asstDiv.innerHTML = renderMarkdown(contentBuf);
+        }
+        scrollToBottom(true);
+    }
+    function scheduleRender() {
+        const now = performance.now();
+        if (now - lastRender > 50) {  // throttle: 20fps
+            flushRender();
+            lastRender = now;
+        } else if (!scheduleRender._t) {
+            scheduleRender._t = setTimeout(() => {
+                scheduleRender._t = null;
+                flushRender();
+                lastRender = performance.now();
+            }, 50);
+        }
+    }
+
+    try {
+        const res = await fetch(`${API}/api/v1/sessions/${id}/messages`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: text, style: state.currentStyle }),
+            signal: ctrl.signal,
+        });
+        if (!res.ok) {
+            const t = await res.text();
+            asstDiv.innerHTML = `<div class="error">${escapeHTML(t)}</div>`;
+            return;
+        }
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split("\n");
+            buf = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith("data: ")) continue;
+                let ev;
+                try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+                if (ev.type === "content" && ev.content) {
+                    pending += ev.content;
+                    scheduleRender();
+                } else if (ev.type === "tool") {
+                    // Flush any pending content first.
+                    flushRender();
+                    appendToolMessage(ev);
+                } else if (ev.type === "phase" && ev.message) {
+                    // Could show a small "thinking" line; keep simple.
+                } else if (ev.type === "error") {
+                    flushRender();
+                    const errDiv = document.createElement("div");
+                    errDiv.className = "error";
+                    errDiv.textContent = ev.error || "unknown error";
+                    asstDiv.appendChild(errDiv);
+                } else if (ev.type === "done") {
+                    updateHeaderMeta(ev.tokens_in, ev.tokens_out, ev.elapsed);
+                }
+            }
+        }
+        flushRender();
+        if (!contentBuf && !asstDiv.querySelector(".error")) {
+            asstDiv.innerHTML = "<em style='color:#666'>(空响应)</em>";
+        }
+    } catch (e) {
+        if (e.name === "AbortError") {
+            flushRender();
+            const note = document.createElement("div");
+            note.className = "phase";
+            note.textContent = "⏹ 已停止生成";
+            asstDiv.appendChild(note);
+        } else {
+            asstDiv.innerHTML = `<div class="error">${escapeHTML(e.message)}</div>`;
+        }
+    } finally {
+        state.abort = null;
+        state.isStreaming = false;
+        showSendButton();
+        asstDiv.classList.remove("streaming");
+    }
+}
+
+function stopGeneration() {
+    if (state.abort) state.abort.abort();
+}
+
+function showStopButton() {
+    $("send").classList.add("hide");
+    $("stop").classList.add("show");
+}
+function showSendButton() {
+    $("send").classList.remove("hide");
+    $("stop").classList.remove("show");
+}
+
+function showHeaderMeta() {
+    $("header-meta").style.display = "flex";
+}
+function hideHeaderMeta() {
+    $("header-meta").style.display = "none";
+}
+function updateHeaderMeta(tIn, tOut, elapsed) {
+    if (typeof tIn === "number" && typeof tOut === "number") {
+        $("meta-tokens").textContent = `${tIn} / ${tOut} tok`;
+    }
+    if (elapsed) {
+        $("meta-elapsed").textContent = elapsed;
+    }
+}
+
+function removeEmptyState() {
+    const es = $("empty-state");
+    if (es) es.remove();
+}
+
+// ---------- Markdown rendering (lightweight, no CDN) ----------
+function renderMarkdown(src) {
+    if (!src) return "";
+    // 1. Extract code blocks into placeholders so the inline passes
+    //    don't mangle them.
+    const codeBlocks = [];
+    src = src.replace(/```(\w*)\n([\s\S]*?)```/g, (m, lang, code) => {
+        codeBlocks.push({ lang, code });
+        return `\u0000CODE${codeBlocks.length - 1}\u0000`;
+    });
+    // 2. Inline code
+    const inlineCodes = [];
+    src = src.replace(/`([^`\n]+)`/g, (m, c) => {
+        inlineCodes.push(c);
+        return `\u0000IC${inlineCodes.length - 1}\u0000`;
+    });
+    // 3. Escape HTML
+    src = escapeHTML(src);
+    // 4. Headings
+    src = src.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+    src = src.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+    src = src.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+    // 5. Bold / italic
+    src = src.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    src = src.replace(/(^|\W)\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    // 6. Links [text](url)
+    src = src.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => {
+        if (!/^https?:\/\//.test(u) && !u.startsWith("/")) return `${t}`;
+        return `<a href="${u}" target="_blank" rel="noopener">${t}</a>`;
+    });
+    // 7. Blockquote
+    src = src.replace(/^&gt; (.+)$/gm, "<blockquote>$1</blockquote>");
+    // 8. Horizontal rule
+    src = src.replace(/^---$/gm, "<hr>");
+    // 9. Unordered lists
+    src = src.replace(/(^|\n)((?:[-*] .+\n?)+)/g, (m, pre, block) => {
+        const items = block.trim().split("\n").map(l => `<li>${l.replace(/^[-*] /, "")}</li>`).join("");
+        return `${pre}<ul>${items}</ul>`;
+    });
+    // 10. Ordered lists
+    src = src.replace(/(^|\n)((?:\d+\. .+\n?)+)/g, (m, pre, block) => {
+        const items = block.trim().split("\n").map(l => `<li>${l.replace(/^\d+\. /, "")}</li>`).join("");
+        return `${pre}<ol>${items}</ol>`;
+    });
+    // 11. Paragraphs: collapse consecutive newlines, wrap each line
+    src = src.split(/\n{2,}/).map(p => {
+        if (/^<(h\d|ul|ol|blockquote|hr|pre)/.test(p.trim())) return p;
+        // Code-block placeholders must be treated as block-level too,
+        // so they don't get wrapped in <p>.
+        if (/^\u0000CODE\d+\u0000$/.test(p.trim())) return p;
+        return `<p>${p.replace(/\n/g, "<br>")}</p>`;
+    }).join("\n");
+    // 12. Restore code blocks / inline code
+    src = src.replace(/\u0000CODE(\d+)\u0000/g, (_, i) => {
+        const b = codeBlocks[+i];
+        return `<pre><code class="lang-${escapeHTML(b.lang)}">${escapeHTML(b.code)}</code></pre>`;
+    });
+    src = src.replace(/\u0000IC(\d+)\u0000/g, (_, i) => {
+        return `<code>${escapeHTML(inlineCodes[+i])}</code>`;
+    });
+    return src;
+}
+
+// ---------- Helpers ----------
+function escapeHTML(s) {
+    if (s == null) return "";
+    return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function truncate(s, n) {
+    s = String(s || "");
+    if (s.length <= n) return s;
+    return s.slice(0, n) + "…";
+}
+
+function formatTime(unixSec) {
+    if (!unixSec) return "";
+    const d = new Date(unixSec * 1000);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) {
+        return d.toTimeString().slice(0, 5);
+    }
+    return (d.getMonth() + 1) + "/" + d.getDate();
+}
+
+// ---------- Event handlers ----------
+$("send").addEventListener("click", () => {
+    const input = $("input");
+    const text = input.value.trim();
+    if (!text || state.isStreaming) return;
+    input.value = "";
+    input.style.height = "auto";
+    $("send").disabled = true;
+    sendMessage(text).finally(() => { $("send").disabled = false; });
+});
+
+$("stop").addEventListener("click", stopGeneration);
+
+$("new-session").addEventListener("click", async () => {
+    if (state.isStreaming) stopGeneration();
+    await createSession();
+});
+
+const input = $("input");
+input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        $("send").click();
+    } else if (e.key === "Escape" && state.isStreaming) {
+        e.preventDefault();
+        stopGeneration();
+    }
+});
+// auto-grow textarea
+input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 120) + "px";
+});
+
+// session title: double-click to rename
+$("session-title").addEventListener("dblclick", () => {
+    if (!state.currentID) return;
+    const el = $("session-title");
+    el.contentEditable = "true";
+    el.focus();
+    // select all
+    const r = document.createRange();
+    r.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+});
+$("session-title").addEventListener("blur", async () => {
+    const el = $("session-title");
+    if (el.contentEditable !== "true") return;
+    el.contentEditable = "false";
+    const newTitle = el.textContent.trim();
+    if (newTitle && state.currentID) {
+        await renameSession(state.currentID, newTitle);
+    }
+});
+$("session-title").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+        e.preventDefault();
+        $("session-title").blur();
+    } else if (e.key === "Escape") {
+        e.preventDefault();
+        // restore old title
+        const s = state.sessions.find(x => x.id === state.currentID);
+        $("session-title").textContent = s ? (s.title || "(无标题)") : "未选择会话";
+        $("session-title").blur();
+    }
+});
+
+// ---------- Boot ----------
+(async function init() {
+    try {
+        await Promise.all([loadStyles(), loadProviders()]);
+        // pick a sensible default style/provider
+        if (state.styles.find(s => s.id === "tech")) state.currentStyle = "tech";
+        if (state.providers.length > 0) {
+            const p = state.providers[0];
+            state.currentProvider = p.name;
+            state.currentModel = p.model;
+        }
+        renderStylePicker();
+        renderModelPicker();
+        await loadSessions();
+    } catch (e) {
+        appendError("初始化失败: " + e.message);
+    }
+    focusInput();
+})();
+
+function focusInput() {
+    setTimeout(() => $("input").focus(), 50);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,220 @@
+# =============================================================================
+# P-Chat .gitignore
+# =============================================================================
+# Order matters within a section: more specific patterns first.
+# Lines starting with `#` are comments; blank lines separate sections.
+#
+# To verify nothing leaks: `git status --ignored` and `git check-ignore -v <path>`.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Go build artifacts
+# -----------------------------------------------------------------------------
+# Project-local bin/ output of `go build ./...` and `Taskfile.yml` targets.
+bin/
+# Stale build outputs left in the repo root from `go build -o pchat.exe`.
+/pchat
+/pchat.exe
+/pchat-server
+/pchat-server.exe
+/pchat-gui
+/pchat-gui.exe
+# Test binaries (Go writes them next to the package on `go test -c`).
+*.test
+*.test.exe
+*.out
+# Coverage profiles (`go test -coverprofile=...`).
+coverage.out
+coverage.html
+*.cover
+*.coverprofile
+# Go workspace (multi-module) — only relevant if a developer opts in locally.
+/go.work
+/go.work.sum
+
+# -----------------------------------------------------------------------------
+# Vendored / downloaded dependencies
+# -----------------------------------------------------------------------------
+vendor/
+# `go mod download` cache is in $GOPATH/pkg/mod, never in-repo, but be safe.
+.gocache/
+
+# -----------------------------------------------------------------------------
+# P-Chat runtime state
+# -----------------------------------------------------------------------------
+# Global runtime directory: ~/.p-chat/  (per paths.GlobalDirName).
+# This is the per-user store of secrets, memory DB, and tools cache.
+# NEVER commit this — it contains the user's SQLite memory and any
+# per-provider API keys that override the on-disk config.
+.p-chat/
+# Legacy pre-0.4 names (kept until we're sure nobody has them).
+.pchat/
+# Project-local runtime (e.g. AGENTS.md / .p-chat/ inside a project
+# when running `pchat` inside a code repo). Committed by `pchat init`
+# *is* allowed — the project's own .p-chat/AGENTS.md is content.
+# We only ignore generated state inside .p-chat/, not the dir itself.
+
+# Memory database: SQLite + WAL + SHM sidecars. These end up inside
+# ~/.p-chat/memory/ but path them explicitly in case someone symlinks
+# the data dir into the project.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Legacy memory file (pre-SQLite).
+memory.json
+conversations.json
+
+# Knowledge base index (rebuilt on scan; large binary blobs).
+.p-chat/knowledge/
+.pchat/knowledge/
+
+# -----------------------------------------------------------------------------
+# Test scratch
+# -----------------------------------------------------------------------------
+# `test_http/` is a manual smoke-test scratch dir created during HTTP
+# refactors. It contains captured server.out/server.err and is
+# reproducible.
+test_http/
+# Generic scratch dirs that the test commands sometimes use.
+scratch/
+tmp/
+.tmp/
+
+# -----------------------------------------------------------------------------
+# Local config overrides
+# -----------------------------------------------------------------------------
+# configs/config.yaml IS the committed template (with empty api_key
+# fields). Users drop their real keys into a sibling .local file.
+configs/*.local.yaml
+configs/*.local.yml
+# Any file that explicitly contains credentials. Even with the *.local
+# pattern above, a stray `api_key: sk-...` in the tracked config.yaml
+# would still be committed — keep the broad secret fallback.
+*.secret.yaml
+*.secrets.yaml
+.env
+.env.local
+.env.*.local
+
+# -----------------------------------------------------------------------------
+# Server logs and runtime output
+# -----------------------------------------------------------------------------
+*.log
+server.log
+server.err
+server.out
+*.out
+*.err
+
+# -----------------------------------------------------------------------------
+# Operating system noise
+# -----------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+# Linux
+*~
+
+# -----------------------------------------------------------------------------
+# Editors / IDEs
+# -----------------------------------------------------------------------------
+# IntelliJ / GoLand / WebStorm
+.idea/
+*.iml
+*.iws
+*.ipr
+# VS Code
+.vscode/
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+# Vim / Emacs
+*.swp
+*.swo
+*~
+.*.sw[a-z]
+\#*\#
+.\#*
+# JetBrains scratch / run configs
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/dictionaries
+.idea/shelf/
+
+# -----------------------------------------------------------------------------
+# Build / packaging outputs from CI
+# -----------------------------------------------------------------------------
+# release.yml writes to dist/ on the runner; we never want to commit
+# that locally either.
+dist/
+artifacts/
+*.tar.gz
+*.zip
+# Compiled object / linker files.
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# -----------------------------------------------------------------------------
+# Coverage / profiling reports
+# -----------------------------------------------------------------------------
+*.prof
+*.pprof
+*.trace
+.pgo/
+
+# -----------------------------------------------------------------------------
+# Node / web tooling (in case anyone adds a JS build step later)
+# -----------------------------------------------------------------------------
+node_modules/
+.next/
+.nuxt/
+.cache/
+.parcel-cache/
+*.min.js
+*.min.css
+*.bundle.js
+*.bundle.css
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
+# Local override file for editor / tooling settings
+.local/
+# Anything that starts with "tmp" or ends in ".bak"
+*.bak
+*.tmp
+*.orig
+*.rej
+*.swp
+*.swo
+# Backup files from various editors
+*.goutputstream-*
+*.kate-swp
+
+# =============================================================================
+# Allowed exceptions
+# =============================================================================
+# If a file matches an ignore above but you really need to commit it,
+# use `git add -f <path>` to override. Common legitimate cases:
+#   - .gitkeep in otherwise-empty dirs
+#   - .github/workflows/* is committed
+#   - configs/config.yaml is committed (template)
+#   - web/ static assets are committed
+# =============================================================================

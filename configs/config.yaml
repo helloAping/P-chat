@@ -1,0 +1,113 @@
+server:
+  host: "127.0.0.1"
+  port: 8960
+
+llm:
+  default: "openai"
+
+  # Sampling parameters applied to every chat call.
+  # Leave 0 to use the API's own default.
+  # temperature: 0.7    # lower = more deterministic, higher = more creative
+  # top_p: 0.9         # nucleus sampling
+  # max_tokens: 2048   # cap on completion length
+
+  # Output presentation.
+  output:
+    language: "auto"  # "zh" | "en" | "auto" (match user's input)
+    # verbose: false   # when true, UI shows full tool args/results
+
+  providers:
+    # Single-model form (legacy): one `model` field
+    - name: "claude"
+      protocol: "anthropic"
+      base_url: "https://api.anthropic.com"
+      api_key: ""
+      model: "claude-3-5-sonnet-20241022"
+
+    # Multi-model form: one provider, multiple model ids sharing the
+    # same base URL and API key. Set `default: true` on one of the
+    # entries to mark the provider's default; otherwise the first
+    # entry wins.
+    - name: "openai"
+      protocol: "openai"
+      base_url: "https://api.openai.com/v1"
+      api_key: ""
+      models:
+        - name: "gpt-4o"
+          default: true
+          display_name: "GPT-4o"
+          description: "Most capable, multimodal"
+        - name: "gpt-4o-mini"
+          display_name: "GPT-4o mini"
+          description: "Fast and cheap"
+        - name: "o1-preview"
+          display_name: "o1 Preview"
+          description: "Reasoning model"
+
+    # Custom (proxy) with multiple Doubao models.
+    - name: "cs"
+      protocol: "openai"
+      base_url: "http://api-convert.08ms.cn/v1"
+      api_key: ""
+      models:
+        - name: "doubao-seed-2.0-lite"
+          default: true
+        - name: "doubao-pro"
+        - name: "doubao-lite-32k"
+
+    - name: "deepseek"
+      protocol: "openai"
+      base_url: "https://api.deepseek.com/v1"
+      api_key: ""
+      model: "deepseek-chat"
+
+    - name: "ollama"
+      protocol: "openai"
+      base_url: "http://localhost:11434/v1"
+      api_key: "ollama"
+      model: "llama3"
+
+style:
+  default: "tech"
+
+tools:
+  enabled:
+    - "fs-tool"
+    - "shell-tool"
+  servers: []
+
+memory:
+  enabled: true
+  max_history: 50
+
+sandbox:
+  enabled: true
+  require_confirm: dangerous   # dangerous | always | never
+  # write_protected_paths:
+  #   - "~/.ssh/"
+  #   - "~/.bashrc"
+  #   - "/etc/"
+  # exec_dangerous_patterns:
+  #   - 'rm\s+-rf\s+/'
+  #   - 'mkfs\.'
+
+# Sub-agent configuration (for the `task` tool).
+# `task` spawns an isolated sub-agent with its own system prompt + tool set.
+# - `allowed_tools`: whitelist; when non-empty, ONLY these tools are passed
+#   to the sub-agent (in addition to excluding `task` itself).
+# - `denied_tools`: blacklist; when `allowed_tools` is empty, these are
+#   excluded from the parent's tool set when building the sub-agent.
+#   Default: `["exec_command"]` for safety.
+# - `timeout`: per-sub-agent execution cap. Default: "5m".
+# - `cache_ttl`: how long identical (description, style, provider) results
+#   are reused. Default: "5m". Set to "0s" to disable caching.
+subagent:
+  denied_tools:
+    - "exec_command"
+  timeout: "5m"
+  cache_ttl: "5m"
+  # Example: only allow safe tools (whitelist mode)
+  # allowed_tools:
+  #   - "read_file"
+  #   - "write_file"
+  #   - "list_files"

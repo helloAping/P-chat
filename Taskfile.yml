@@ -1,0 +1,44 @@
+version: '3'
+
+tasks:
+  build:
+    desc: 编译 CLI 和 Server
+    cmds:
+      - go build -o bin/pchat.exe ./cmd/pchat
+      - go build -o bin/pchat-server.exe ./cmd/pchat-server
+    silent: false
+
+  cli:
+    desc: 运行 CLI
+    cmds:
+      - go run ./cmd/pchat --style tech
+
+  server:
+    desc: 运行 HTTP Server
+    cmds:
+      - go run ./cmd/pchat-server
+
+  tidy:
+    desc: 整理依赖
+    cmds:
+      - go mod tidy
+
+  fmt:
+    desc: 格式化代码
+    cmds:
+      - gofmt -w .
+
+  vet:
+    desc: 静态检查
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: 运行测试
+    cmds:
+      - go test ./... -v
+
+  clean:
+    desc: 清理编译产物
+    cmds:
+      - Remove-Item -Recurse -Force bin -ErrorAction SilentlyContinue
