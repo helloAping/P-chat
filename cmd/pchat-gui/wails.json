@@ -2,6 +2,7 @@
   "$schema": "https://wails.io/schemas/config.v2.json",
   "name": "pchat-gui",
   "outputfilename": "pchat-gui",
+  "ldflags": "-H windowsgui -s -w",
   "author": {
     "name": "P-Chat",
     "email": "admin@08ms.cn"
