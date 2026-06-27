@@ -4,8 +4,10 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/p-chat/pchat/internal/agent"
@@ -45,6 +47,23 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Ensure ~/.p-chat directory structure exists
 	if err := paths.EnsureGlobal(); err != nil {
 		return fmt.Errorf("init directories: %w", err)
+	}
+
+	// Mirror the standard log to a file under ~/.p-chat so
+	// the LLM-SSE debug output is easy to find when pchat-server
+	// is launched as a child process (e.g. by pchat-gui) and
+	// stderr is not visible in a terminal. The first few raw
+	// chunks of every stream + a final chunk-count summary
+	// are written here.
+	//
+	// pchat-gui's stderr was previously lost on Windows when
+	// the parent process did not have a console — so even with
+	// a fix that correctly handles non-standard proxy field
+	// names, we still need a way for the user to inspect what
+	// the proxy actually sent. This log is the answer.
+	if logFile, err := os.OpenFile(filepath.Join(paths.GlobalDir(), "server-debug.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		log.SetOutput(logFile)
 	}
 
 	cfg, err := config.Load(cfgFile)

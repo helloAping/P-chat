@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -316,12 +317,32 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		// separated by blank lines, each line starting with
 		// "data: " followed by the JSON payload, and a final
 		// "data: [DONE]" sentinel.
-		reader := bufio.NewReader(resp.Body)
+		//
+		// We log the first 3 raw chunks and a final summary
+		// (chunk count / content chars / thinking chars /
+		// parse failures) at the end of the stream. This
+		// is invaluable when debugging proxy gateways (like
+		// api-convert.08ms.cn) that occasionally rename the
+		// standard fields — e.g. an upstream that uses
+		// `delta.text` instead of `delta.content` will
+		// surface a "0 chars received" line at the end of
+		// the stream and the user can copy the raw chunk
+		// dump into the issue tracker.
+		reader := bufio.NewReaderSize(resp.Body, 1<<20)
+		var (
+			rawChunks      int
+			parseFailures  int
+			contentChars   int
+			thinkingChars  int
+			choiceCount    int
+		)
 		for {
 			line, err := reader.ReadBytes('\n')
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					ch <- StreamChunk{Done: true}
+					log.Printf("[llm/%s/%s] stream ended: chunks=%d parsed=%d content=%d thinking=%d parse_errs=%d",
+						p.name, model, rawChunks, rawChunks-parseFailures, contentChars, thinkingChars, parseFailures)
 					return
 				}
 				ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
@@ -339,25 +360,57 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			payload := bytes.TrimPrefix(line, []byte("data: "))
 			if bytes.Equal(payload, []byte("[DONE]")) {
 				ch <- StreamChunk{Done: true}
+				log.Printf("[llm/%s/%s] stream ended at [DONE]: chunks=%d content=%d thinking=%d parse_errs=%d",
+					p.name, model, rawChunks, contentChars, thinkingChars, parseFailures)
 				return
+			}
+			rawChunks++
+			if rawChunks <= 3 {
+				// Dump the first few raw chunks verbatim so
+				// the field names are visible in the server
+				// log when debugging a misbehaving proxy.
+				log.Printf("[llm/%s/%s] raw chunk #%d: %s", p.name, model, rawChunks, string(payload))
 			}
 			var r openaiStreamResponse
 			if err := json.Unmarshal(payload, &r); err != nil {
 				// Skip malformed lines (some providers send
 				// keepalive pings or partial JSON during
 				// reconnects).
+				parseFailures++
+				if parseFailures <= 3 {
+					log.Printf("[llm/%s/%s] parse error on chunk #%d: %v payload=%s", p.name, model, rawChunks, err, string(payload))
+				}
 				continue
 			}
 			for _, choice := range r.Choices {
+				choiceCount++
 				// Reasoning chain-of-thought (DeepSeek
 				// `reasoning_content`, OpenAI o1
-				// reasoning tokens). Empty for models
-				// that don't surface thinking.
+				// `reasoning` field). Both are
+				// surfaced as Thinking chunks, never
+				// folded into Content.
 				if choice.Delta.ReasoningContent != "" {
+					thinkingChars += len(choice.Delta.ReasoningContent)
 					ch <- StreamChunk{Thinking: choice.Delta.ReasoningContent}
+				} else if choice.Delta.Reasoning != "" {
+					thinkingChars += len(choice.Delta.Reasoning)
+					ch <- StreamChunk{Thinking: choice.Delta.Reasoning}
 				}
-				if choice.Delta.Content != "" {
-					ch <- StreamChunk{Content: choice.Delta.Content}
+				// Text delta. Standard OpenAI uses
+				// `delta.content`, but some proxies
+				// (notably api-convert.08ms.cn) and the
+				// legacy /v1/completions endpoint use
+				// `text` instead. Fall back to `text`
+				// so the user's chat doesn't render
+				// empty when the proxy has a slightly
+				// different wire shape.
+				delta := choice.Delta.Content
+				if delta == "" {
+					delta = choice.Delta.Text
+				}
+				if delta != "" {
+					contentChars += len(delta)
+					ch <- StreamChunk{Content: delta}
 				}
 				for _, tc := range choice.Delta.ToolCalls {
 					delta := &ToolCallDelta{
@@ -368,6 +421,18 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 					}
 					ch <- StreamChunk{ToolCallDelta: delta}
 				}
+			}
+			// usage may come in a final chunk with no
+			// choices; the SDK hoists it to the top of
+			// the next loop iteration's response.
+			if r.Usage != nil {
+				ch <- StreamChunk{
+					TokensIn:  r.Usage.PromptTokens,
+					TokensOut: r.Usage.CompletionTokens,
+				}
+			}
+			if rawChunks == 1 && choiceCount == 0 {
+				log.Printf("[llm/%s/%s] first chunk had no choices (top-level keys: %v)", p.name, model, topLevelKeys(payload))
 			}
 			if r.Usage != nil {
 				ch <- StreamChunk{
@@ -406,6 +471,13 @@ type openaiStreamChoice struct {
 type openaiStreamChoiceDelta struct {
 	Role             string                    `json:"role,omitempty"`
 	Content          string                    `json:"content,omitempty"`
+	// Text is the legacy /v1/completions field name
+	// (completions API, not chat). Some OpenAI-compatible
+	// proxies that route the chat completions endpoint
+	// through a completions-style backend emit `text`
+	// instead of `content` — we read both and pick whichever
+	// is non-empty.
+	Text             string                    `json:"text,omitempty"`
 	// ReasoningContent is the chain-of-thought / reasoning
 	// delta. Sent by DeepSeek (their `reasoning_content`
 	// field) and by OpenAI o-series models (their
@@ -609,4 +681,23 @@ func ToolsFromRegistry(tools []tool.Tool) []openai.Tool {
 		})
 	}
 	return out
+}
+
+// topLevelKeys returns the top-level JSON keys of a raw
+// payload, for diagnostic logging when a proxy emits an
+// unexpected wire shape. Used by the SSE parser to log
+// the field names we saw when the first chunk had no
+// `choices` field (which usually means the proxy returned
+// a wrapped envelope, e.g. `{"data": [...]}` or
+// `{"message": {"content": "..."}}`).
+func topLevelKeys(payload []byte) []string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
