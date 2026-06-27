@@ -104,6 +104,21 @@ tasks:
     cmds:
       - powershell -NoProfile -ExecutionPolicy Bypass -File cmd\pchat-gui\build\bin\uninstall.ps1
 
+  install:agents:
+    desc: 建立 agent 工具符号链接 (.opencode/.codex/.claude → .agents/AGENTS.md)
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File ".agents\scripts\install.ps1"
+
+  install:agents:force:
+    desc: 重新建立 agent 工具符号链接 (覆盖已有)
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File ".agents\scripts\install.ps1" -Force
+
+  install:agents:dryrun:
+    desc: 预览 install:agents 会做什么 (不实际修改)
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File ".agents\scripts\install.ps1" -DryRun
+
   tidy:
     desc: 整理依赖
     cmds:
