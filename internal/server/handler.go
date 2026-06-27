@@ -275,6 +275,32 @@ type MessageResponse struct {
 	// blocks for files). The frontend renders them as part of the
 	// message bubble so the user can see what was actually sent.
 	Attachments []AttachmentPart `json:"attachments,omitempty"`
+	// Parts is the assistant message's structured rendering:
+	// text + thinking + tool calls + sub-agent cards in stream
+	// order. Mirrors src/api/client.ts:MessagePart on the client.
+	// Populated only for assistant messages; the agent encodes
+	// it as JSON in messages.metadata and the handler decodes
+	// it back here so a session reload replays the same view
+	// the user saw during streaming. Without this, thinking
+	// blocks and tool cards vanish on every reopen.
+	Parts []MessagePart `json:"parts,omitempty"`
+}
+
+// MessagePart is one block of a structured assistant message.
+// Wire shape is identical to the client-side MessagePart so the
+// web UI can drop it directly into its `message.parts` array.
+type MessagePart struct {
+	Kind      string        `json:"kind"`
+	Text      string        `json:"text,omitempty"`
+	Streaming bool          `json:"streaming,omitempty"`
+	Name      string        `json:"name,omitempty"`
+	Args      string        `json:"args,omitempty"`
+	Status    string        `json:"status,omitempty"`
+	Result    string        `json:"result,omitempty"`
+	Error     string        `json:"error,omitempty"`
+	Elapsed   string        `json:"elapsed,omitempty"`
+	Task      string        `json:"task,omitempty"`
+	Parts     []MessagePart `json:"parts,omitempty"`
 }
 
 // AttachmentPart is a single part of a multi-content message,
@@ -349,6 +375,12 @@ type StreamEvent struct {
 	// Error fields
 	Error      string `json:"error,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
+	// ErrorKind is the classification of the error
+	// ("auth_error", "rate_limit", "vision_unsupported", …).
+	// Empty when the chunk isn't an error or wasn't
+	// classified. The UI uses "vision_unsupported" to
+	// render a special chip on the offending user message.
+	ErrorKind string `json:"error_kind,omitempty"`
 }
 
 // --- Health / metadata ---
@@ -811,10 +843,19 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	msgs := h.store.GetMessages()
+	// Use the variant that returns raw metadata so we can pull
+	// the assistant message's `parts` blob (thinking + tool +
+	// sub-agent) back out of the SQLite row. GetMessages
+	// discards everything it doesn't recognise, which used to
+	// drop the parts silently — the user would reopen a
+	// session and see only the plain text.
+	msgs, metas, createds := h.store.GetMessagesWithMeta()
 	out := make([]MessageResponse, 0, len(msgs))
-	for _, m := range msgs {
+	for i, m := range msgs {
 		created := time.Now().Unix() // best-effort; exact ts requires schema change
+		if i < len(createds) && createds[i] != 0 {
+			created = createds[i]
+		}
 		resp := MessageResponse{
 			ID:         0, // not exposed individually yet
 			Role:       m.Role,
@@ -822,6 +863,16 @@ func (h *Handler) ListMessages(c *gin.Context) {
 			CreatedAt:  created,
 			ToolCallID: m.ToolCallID,
 			Name:       m.Name,
+		}
+		// Restore the assistant message's structured parts
+		// (text + thinking + tool + sub-agent). The agent
+		// encodes them as JSON in messages.metadata under the
+		// "parts" key. Decoding is best-effort: a malformed
+		// row falls back to plain text only.
+		if i < len(metas) && metas[i] != "" {
+			if parts := decodePartsFromMeta(metas[i], m.Content); len(parts) > 0 {
+				resp.Parts = parts
+			}
 		}
 		// Surface image / file attachments that were part of the
 		// user message so the UI can render them in the bubble.
@@ -912,6 +963,56 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 		}
 	}
 	return "", "text", "text/plain"
+}
+
+// decodePartsFromMeta pulls the assistant message's `parts`
+// (thinking + tool + sub-agent) out of the raw metadata string
+// and the message content.
+//
+// Storage format:
+//   - meta["thinking"]  → raw thinking text (not JSON-encoded)
+//   - meta["parts"]     → only structural parts (tool + sub_agent)
+//   - content           → text part on reload (not duplicated in meta)
+//
+// Returns nil when the row has no parts — that's the legacy
+// path where the assistant message is just plain text, and the
+// UI's `parts.length > 0` check falls through to the markdown
+// fallback in MessageBubble. The decode is best-effort:
+// malformed JSON produces nil so the UI degrades to plain text
+// rather than 500-ing.
+func decodePartsFromMeta(meta string, content string) []MessagePart {
+	if meta == "" {
+		return nil
+	}
+	var blob map[string]string
+	if err := json.Unmarshal([]byte(meta), &blob); err != nil {
+		return nil
+	}
+
+	var parts []MessagePart
+
+	// 1. Thinking — stored as raw string (no double-encode).
+	if t, ok := blob["thinking"]; ok && t != "" {
+		parts = append(parts, MessagePart{Kind: "thinking", Text: t})
+	}
+
+	// 2. Structural parts (tool + sub_agent) — JSON blob.
+	if raw, ok := blob["parts"]; ok && raw != "" {
+		var structural []MessagePart
+		if err := json.Unmarshal([]byte(raw), &structural); err == nil {
+			parts = append(parts, structural...)
+		}
+	}
+
+	// 3. Text — from content (not stored in meta).
+	if content != "" {
+		parts = append(parts, MessagePart{Kind: "text", Text: content})
+	}
+
+	if len(parts) == 0 {
+		return nil
+	}
+	return parts
 }
 
 // SendMessage is the main streaming endpoint. It accepts a user
@@ -1060,6 +1161,8 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 	if chunk.Error != "" {
 		ev.Type = "error"
 		ev.Error = chunk.Error
+		ev.Suggestion = chunk.Suggestion
+		ev.ErrorKind = chunk.ErrorKind
 		return ev
 	}
 	if chunk.Done {

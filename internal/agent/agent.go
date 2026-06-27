@@ -121,28 +121,45 @@ func (a *Agent) protocolFor(providerName string) string {
 // modelSupportsVision reports whether the active (provider, model)
 // pair accepts image_url inputs.
 //
-// Policy: **permissive by default**. The user-facing impact of
-// returning false is that the user's image is silently replaced
-// with a text marker — a confusing, lossy experience. Returning
-// true means the LLM API gets the image and either answers or
-// returns a clear 400 ("does not support image input"), both of
-// which are recoverable.
+// Policy: **permissive by default**, with one exception. If the
+// user has explicitly marked the model as text-only via
+// `capabilities: { supports_vision: false }` in the config, we
+// return false so the agent drops the image and writes the
+// "this model does not support image input" marker instead of
+// round-tripping a request the API will reject.
 //
-// Returns true in all cases except when the user has marked
-// the model as text-only in the per-session UI override layer.
-// At the per-config level we currently don't have a way to
-// distinguish "capabilities: {}" (no opinion) from
-// "capabilities: { supports_vision: false }" (explicit opt-out),
-// because both decode to the same struct; in either case the
-// safer default is "try the API", and we let the API itself
-// surface the error if it really can't accept the image.
-//
-// (The per-model flag in the UI is still rendered for awareness
-// — 👁 when Capabilities.SupportsVision is true. The agent
-// itself doesn't gate on it.)
+// "No opinion" (capabilities: {} or capabilities absent) keeps
+// the old permissive behaviour: send the image and let the API
+// surface a "does not support image input" error if it really
+// can't accept the image. That error is then caught by
+// ClassifyAPIError → KindVisionUnsupported and shown to the user
+// as a clear, actionable warning chip on their message.
 func (a *Agent) modelSupportsVision(providerName, modelName string) bool {
-	_ = providerName
-	_ = modelName
+	if a.cfg == nil {
+		return true
+	}
+	for _, p := range a.cfg.LLM.Providers {
+		if p.Name != providerName {
+			continue
+		}
+		for _, m := range p.Models {
+			if m.Name == modelName {
+				// Explicit opt-out: capabilities.supports_vision = false.
+				// Capabilities is a struct (not a pointer), so an absent
+				// value zero-fills the field; the only way to land in
+				// the `return false` branch is to have explicitly set
+				// supports_vision: false in the config (or via the
+				// model editor in the UI).
+				return m.Capabilities.SupportsVision
+			}
+		}
+		// Provider found, model not in the configured list: permissive
+		// default. The API itself will reject if the model is genuinely
+		// non-vision, and the agent will surface the classified error
+		// to the user.
+		return true
+	}
+	// Provider not found in config: permissive default.
 	return true
 }
 
@@ -182,6 +199,18 @@ type ChatStreamChunk struct {
 	Thinking string `json:"thinking,omitempty"`
 	Done     bool   `json:"done"`
 	Error    string `json:"error,omitempty"`
+	// Suggestion is an optional actionable hint that
+	// accompanies an Error. Populated by the agent from
+	// *llm.APIError.Suggestion after ClassifyAPIError runs.
+	// Empty for non-classified errors or non-error chunks.
+	Suggestion string `json:"suggestion,omitempty"`
+	// ErrorKind is the classification of an Error chunk.
+	// One of the strings returned by llm.ErrorKind.String()
+	// ("auth_error", "rate_limit", "vision_unsupported", …).
+	// Empty when the chunk isn't an error or wasn't
+	// classified. The UI uses "vision_unsupported" to
+	// render a special chip on the user message.
+	ErrorKind string `json:"error_kind,omitempty"`
 
 	Phase    string `json:"phase,omitempty"`
 	Message  string `json:"message,omitempty"`
@@ -401,6 +430,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 	go func() {
 		defer close(ch)
+		// partsAcc accumulates the trailing assistant message's
+		// parts (text + thinking + tool + sub_agent) as chunks
+		// flow through. It's mutated both by the main LLM-stream
+		// loop and by the per-tool forwarders (which carry
+		// sub-agent events), so it carries its own mutex. The
+		// final snapshot is encoded into the persisted message
+		// metadata under "parts" so the same view comes back
+		// when the user reopens the session.
+		partsAcc := newPartsAccumulator()
 		// Recover from any panic inside the goroutine so a malformed
 		// LLM response or a buggy tool handler doesn't kill the whole
 		// REPL. The panic stack trace is sent as a final Error chunk.
@@ -510,6 +548,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		for round := 0; round < maxRounds; round++ {
 			roundStart := time.Now()
 			roundNum := round + 1
+			// Each round gets its own parts accumulator so
+			// the persisted assistant message only carries
+			// that round's thinking / text / tools. Before
+			// this reset every round's snapshot included all
+			// previous rounds, producing duplication on
+			// reload and making long multi-round
+			// conversations show repeated thinking blocks.
+			partsAcc = newPartsAccumulator()
 
 			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 调用 LLM", roundNum, maxRounds), Round: roundNum, MaxRound: maxRounds}
 
@@ -523,7 +569,27 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			stream := a.llm.ChatStreamWithOptions(ctx, req.Provider, req.Model, msgs, openAITools, a.options)
 			for chunk := range stream {
 				if chunk.Err != nil {
-					ch <- ChatStreamChunk{Phase: "llm", Error: chunk.Err.Error(), Done: true}
+					// Classify the upstream error so the user
+					// gets a Chinese message + a useful
+					// suggestion instead of a raw English
+					// string. The classification also flags
+					// vision-unsupported as a distinct
+					// category the UI can render as a chip on
+					// the offending user message.
+					classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
+					errMsg, errSuggestion, errKind := chunk.Err.Error(), "", ""
+					if apiErr, ok := classified.(*llm.APIError); ok {
+						errMsg = apiErr.Message
+						errSuggestion = apiErr.Suggestion
+						errKind = apiErr.Kind.String()
+					}
+					ch <- ChatStreamChunk{
+						Phase:      "llm",
+						Error:      errMsg,
+						Suggestion: errSuggestion,
+						ErrorKind:  errKind,
+						Done:       true,
+					}
 					return
 				}
 				if chunk.Done {
@@ -539,6 +605,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if chunk.Content != "" {
 					fullContent += chunk.Content
+					partsAcc.update(ChatStreamChunk{Content: chunk.Content})
 					ch <- ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut}
 				}
 				if chunk.Thinking != "" {
@@ -550,6 +617,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// message can show a running token
 					// total while still streaming.
 					fullThinking += chunk.Thinking
+					partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
 					ch <- ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut}
 				}
 				if chunk.ToolCallDelta != nil {
@@ -629,6 +697,34 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						meta["tool_calls"] = string(tcJSON)
 					}
 				}
+				// Persist the rendered parts (text + thinking +
+				// tool + sub-agent) as JSON. When the user
+				// reopens this session, GET /sessions/:id/messages
+				// reads this back and the chat UI replays the
+				// full view (thinking block, tool cards, sub-
+				// agent cards) instead of just the plain text
+				// content. Without this the user's previous
+				// reasoning and tool invocations vanish on every
+				// reload.
+				//
+				// Storage design:
+				//   - Thinking: raw string in meta["thinking"]
+				//     (no JSON double-encode).
+				//   - Text: derived from message content on
+				//     reload (no duplication).
+				//   - Tool + sub-agent: compact JSON in
+				//     meta["parts"] (only structural info).
+				if fullThinking != "" {
+					meta["thinking"] = fullThinking
+				}
+				// Keep only structural parts (tool + sub_agent);
+				// thinking and text are stored elsewhere.
+				structural := snapshotStructural(partsAcc)
+				if len(structural) > 0 {
+					if pj, pjErr := json.Marshal(structural); pjErr == nil {
+						meta["parts"] = string(pj)
+					}
+				}
 				a.store.AddMessageWithMeta(assistantMsg, meta)
 			}
 
@@ -663,7 +759,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if len(argsPreview) > 200 {
 					argsPreview = argsPreview[:200] + "..."
 				}
-				ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
+				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
+				partsAcc.update(startChunk)
+				ch <- startChunk
 			}
 
 			// Each tool call gets its own event channel. The agent loop
@@ -685,6 +783,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				go func() {
 					defer close(fwd.done)
 					for ev := range eventCh {
+						// Sub-agent / tool events arrive here
+						// from the per-tool dispatcher. Feed
+						// them into the parts accumulator so
+						// nested cards survive a session
+						// reload, then forward to the main
+						// channel for the live UI.
+						partsAcc.update(ev)
 						ch <- ev
 					}
 				}()
@@ -757,10 +862,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					} else if o.err != nil {
 						errMsg = o.err.Error()
 					}
-					ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					partsAcc.update(errChunk)
+					ch <- errChunk
 					toolMsg := openai.ChatCompletionMessage{
 						Role:       openai.ChatMessageRoleTool,
-						Content:    fmt.Sprintf("error: %s", errMsg),
+						Content:    fmt.Sprintf("error: %s\n\n工具 %s 执行失败。请分析错误原因后调整方案并重试；反复失败请告知用户。", errMsg, tc.Name),
 						ToolCallID: tc.ID,
 					}
 					msgs = append(msgs, toolMsg)
@@ -785,20 +892,30 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}, resultPreview)
 
 				if result.IsError {
-					ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					partsAcc.update(warnChunk)
+					ch <- warnChunk
 				} else {
-					ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					partsAcc.update(okChunk)
+					ch <- okChunk
 				}
 
+			llmContent := result.Content
+			if result.IsError {
+				llmContent = fmt.Sprintf("error: %s\n\n工具 %s 返回了错误状态。请根据以上错误信息分析原因、调整参数或方案后重试；反复失败请告知用户。", result.Content, tc.Name)
+			} else {
+				llmContent = truncateToolResult(tc.Name, result.Content)
+			}
 				msgs = append(msgs, openai.ChatCompletionMessage{
 					Role:       openai.ChatMessageRoleTool,
-					Content:    result.Content,
+					Content:    llmContent,
 					ToolCallID: tc.ID,
 				})
 				if a.store != nil {
 					a.store.AddMessageWithMeta(openai.ChatCompletionMessage{
 						Role:       openai.ChatMessageRoleTool,
-						Content:    result.Content,
+						Content:    llmContent,
 						ToolCallID: tc.ID,
 					}, map[string]string{
 						"tool_call_id": tc.ID,
@@ -855,6 +972,59 @@ func availableToolNames(tools []tool.Tool) string {
 		names = append(names, t.Name)
 	}
 	return strings.Join(names, ", ")
+}
+
+const (
+	// Tool result caps keep the LLM context and SQLite
+	// storage bounded even when a tool produces massive
+	// output (e.g. systeminfo, a large log file).
+	// The UI stream preview is already capped at 300
+	// chars; these limits apply to what the LLM sees
+	// and what gets persisted in the messages table.
+	//
+	// Cap choice rationale:
+	//   - exec_command: keep the tail (last N chars) —
+	//     stdout/stderr errors and summaries are at the
+	//     end.
+	//   - read_file / list_files: keep the head — the
+	//     first N chars are the file/dir contents.
+	//   - fallback: keep the head.
+	maxToolResultExec    = 4000 // exec_command, bash
+	maxToolResultRead    = 8000 // read_file
+	maxToolResultDefault = 6000
+)
+
+func truncateToolResult(name string, content string) string {
+	if len(content) <= maxToolResultDefault {
+		return content
+	}
+
+	var cap_ int
+	keepHead := true
+	switch name {
+	case "exec_command", "bash", "shell":
+		cap_ = maxToolResultExec
+		keepHead = false
+	case "read_file", "list_files", "recall":
+		cap_ = maxToolResultRead
+	default:
+		cap_ = maxToolResultDefault
+	}
+
+	if len(content) <= cap_ {
+		return content
+	}
+
+	var truncated string
+	if keepHead {
+		truncated = content[:cap_]
+	} else {
+		truncated = content[len(content)-cap_:]
+	}
+
+	skipped := len(content) - len(truncated)
+	return fmt.Sprintf("%s\n\n[truncated: %d bytes skipped, total %d → %d]",
+		truncated, skipped, len(content), len(truncated))
 }
 
 // parseMarkdownToolCalls extracts ```tool_call ... ``` blocks from the LLM

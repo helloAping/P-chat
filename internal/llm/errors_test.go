@@ -326,3 +326,86 @@ func TestCodeString(t *testing.T) {
 		}
 	}
 }
+
+func TestClassifyAPIError_VisionUnsupported(t *testing.T) {
+	cases := []struct {
+		name string
+		in   error
+	}{
+		{
+			// The exact message the user pasted in the bug report.
+			name: "anthropic 'Cannot read' form",
+			in:   errors.New(`Cannot read "image.png" (this model does not support image input). Inform the user.`),
+		},
+		{
+			name: "openai 'does not support image inputs'",
+			in:   errors.New("This model does not support image inputs."),
+		},
+		{
+			name: "image input is not supported",
+			in:   errors.New("image input is not supported by this model"),
+		},
+		{
+			name: "does not accept image content",
+			in:   errors.New("The model does not accept image content."),
+		},
+		{
+			// Wrapped in an *openai.APIError (the SSE-delivered path).
+			name: "via openai.APIError SSE",
+			in: &openai.APIError{
+				Type:    "invalid_request_error",
+				Message: "Cannot read \"image.png\" (this model does not support image input). Inform the user.",
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ClassifyAPIError("cs", c.in)
+			var apiErr *APIError
+			if !errors.As(got, &apiErr) {
+				t.Fatalf("expected *APIError, got %T", got)
+			}
+			if apiErr.Kind != KindVisionUnsupported {
+				t.Errorf("Kind = %v, want KindVisionUnsupported", apiErr.Kind)
+			}
+			if apiErr.Message == "" {
+				t.Error("Message should be non-empty")
+			}
+			if apiErr.Suggestion == "" {
+				t.Error("Suggestion should be non-empty")
+			}
+			if !strings.Contains(apiErr.Suggestion, "model") {
+				t.Errorf("Suggestion should mention 'model', got %q", apiErr.Suggestion)
+			}
+		})
+	}
+}
+
+func TestIsVisionUnsupportedError(t *testing.T) {
+	positive := []string{
+		`Cannot read "image.png" (this model does not support image input). Inform the user.`,
+		"This model does not support image inputs.",
+		"image input is not supported",
+		"The model does not accept image content.",
+		"No support for image attachments.",
+	}
+	for _, s := range positive {
+		if !IsVisionUnsupportedError(errors.New(s)) {
+			t.Errorf("expected true for %q", s)
+		}
+	}
+	negative := []string{
+		"rate limit exceeded",
+		"connection refused",
+		"API key invalid",
+		"model not found",
+	}
+	for _, s := range negative {
+		if IsVisionUnsupportedError(errors.New(s)) {
+			t.Errorf("expected false for %q", s)
+		}
+	}
+	if IsVisionUnsupportedError(nil) {
+		t.Error("nil error should give false")
+	}
+}

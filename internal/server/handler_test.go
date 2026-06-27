@@ -368,6 +368,124 @@ func TestListMessages_NotFound(t *testing.T) {
 	}
 }
 
+// TestListMessages_PartsRoundTrip verifies that an assistant
+// message's `parts` blob (text + thinking + tool + sub-agent,
+// encoded by the agent into messages.metadata under "parts")
+// is decoded and surfaced in the API response. The frontend
+// relies on this to render the same view on session reload
+// that the user saw while streaming — without it, the
+// thinking block and tool cards disappear.
+func TestListMessages_PartsRoundTrip(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	// Switch to / create a fresh session, then add a user
+	// message and an assistant message whose metadata carries
+	// a parts blob.
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCurrent(store.CurrentConversationID()); err != nil {
+		t.Fatal(err)
+	}
+	store.AddMessage(llm.Message{Role: "user", Content: "hi"})
+	partsBlob := []agent.MessagePart{
+		{Kind: "tool", Name: "read_file", Args: `{"path":"x"}`, Status: "ok", Result: "data", Elapsed: "5ms"},
+		{Kind: "sub_agent", Task: "list repo", Status: "ok", Elapsed: "1s", Parts: []agent.MessagePart{
+			{Kind: "text", Text: "found 3 files"},
+		}},
+	}
+	partsJSON, _ := json.Marshal(partsBlob)
+	store.AddMessageWithMeta(llm.Message{Role: "assistant", Content: "hello there"}, map[string]string{
+		"thinking": "let me think",
+		"parts":    string(partsJSON),
+	})
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hit the API.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+store.CurrentConversationID()+"/messages", nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Messages []MessageResponse `json:"messages"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Messages) != 2 {
+		t.Fatalf("want 2 messages, got %d", len(body.Messages))
+	}
+
+	// User message: no parts.
+	if len(body.Messages[0].Parts) != 0 {
+		t.Errorf("user message should have no parts, got %d", len(body.Messages[0].Parts))
+	}
+
+	// Assistant message: parts rebuilt from
+	// meta.thinking + structural meta.parts + content.
+	// Order: thinking, then structural parts (tool, sub_agent),
+	// then text from content.
+	asst := body.Messages[1]
+	if len(asst.Parts) != 4 {
+		t.Fatalf("want 4 parts, got %d (%+v)", len(asst.Parts), asst.Parts)
+	}
+	if asst.Parts[0].Kind != "thinking" || asst.Parts[0].Text != "let me think" {
+		t.Errorf("parts[0] thinking wrong: %+v", asst.Parts[0])
+	}
+	if asst.Parts[1].Kind != "tool" || asst.Parts[1].Name != "read_file" || asst.Parts[1].Status != "ok" {
+		t.Errorf("parts[1] tool wrong: %+v", asst.Parts[1])
+	}
+	if asst.Parts[2].Kind != "sub_agent" || asst.Parts[2].Task != "list repo" {
+		t.Errorf("parts[2] sub_agent wrong: %+v", asst.Parts[2])
+	}
+	if asst.Parts[3].Kind != "text" || asst.Parts[3].Text != "hello there" {
+		t.Errorf("parts[3] text wrong: %+v", asst.Parts[3])
+	}
+	if len(asst.Parts[2].Parts) != 1 || asst.Parts[2].Parts[0].Text != "found 3 files" {
+		t.Errorf("sub-agent inner parts wrong: %+v", asst.Parts[2].Parts)
+	}
+}
+
+// TestListMessages_NoPartsOnLegacyMessage verifies the
+// fallback path: assistant messages without a `parts` blob
+// in metadata return an empty Parts array (and the client
+// falls back to markdown-of-content rendering). This
+// preserves back-compat for sessions that predate the
+// parts-persistence feature.
+func TestListMessages_NoPartsOnLegacyMessage(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCurrent(store.CurrentConversationID()); err != nil {
+		t.Fatal(err)
+	}
+	store.AddMessage(llm.Message{Role: "user", Content: "hi"})
+	store.AddMessage(llm.Message{Role: "assistant", Content: "just text"})
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+store.CurrentConversationID()+"/messages", nil)
+	s.engine.ServeHTTP(w, req)
+	var body struct {
+		Messages []MessageResponse `json:"messages"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&body)
+	if len(body.Messages[1].Parts) != 0 {
+		t.Errorf("legacy assistant message should have no parts, got %+v", body.Messages[1].Parts)
+	}
+	if body.Messages[1].Content != "just text" {
+		t.Errorf("legacy content wrong: %q", body.Messages[1].Content)
+	}
+}
+
 func TestSendMessage_BadRequest(t *testing.T) {
 	s, _ := newTestServer(t)
 	w := httptest.NewRecorder()

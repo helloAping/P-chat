@@ -442,6 +442,113 @@ func (s *Store) CurrentConversationID() string {
 	return s.currentID
 }
 
+// MessageWithMeta is a row from the messages table paired with
+// its raw metadata blob. The store's GetMessages helper only
+// re-hydrates a small set of well-known fields (tool_call_id,
+// tool_calls, multi_content) into the standard llm.Message.
+// Anything else (notably the assistant message's `parts`
+// rendering) is still in the raw JSON and must be read by
+// callers that need it. GET /sessions/:id/messages uses this
+// to forward the parts blob verbatim to the web client so
+// thinking blocks / tool cards / sub-agent cards survive a
+// session reload.
+type MessageWithMeta struct {
+	Msg      llm.Message
+	Metadata string
+	// CreatedAt is the row's creation timestamp (unix seconds).
+	// Not part of llm.Message because the LLM client doesn't
+	// need it, but the UI uses it to order messages within a
+	// session.
+	CreatedAt int64
+}
+
+// GetMessagesWithMeta is like GetMessages but returns the raw
+// metadata string alongside each message. The two slices are
+// parallel: out[i] and metaRaw[i] describe the same row. Used
+// by the server's history endpoint so it can pass through
+// fields the store doesn't know about (e.g. the assistant
+// message's `parts` rendering, which is encoded as JSON in
+// metadata under the "parts" key by the agent).
+func (s *Store) GetMessagesWithMeta() ([]llm.Message, []string, []int64) {
+	_ = s.Flush()
+	convID := s.currentID
+	if convID == "" {
+		return nil, nil, nil
+	}
+
+	limit := s.maxHistory
+	rows, err := s.db.Query(
+		`SELECT id, role, content, metadata, created_at FROM messages
+		 WHERE conversation_id = ?
+		 ORDER BY id DESC LIMIT ?`,
+		convID, limitOrHuge(limit),
+	)
+	if err != nil {
+		return nil, nil, nil
+	}
+	defer rows.Close()
+
+	type row struct {
+		msg      llm.Message
+		meta     string
+		created  int64
+	}
+	var rev []row
+	for rows.Next() {
+		var (
+			id        int64
+			role, content string
+			metadata  sql.NullString
+			created   int64
+		)
+		if err := rows.Scan(&id, &role, &content, &metadata, &created); err != nil {
+			break
+		}
+		msg := llm.Message{Role: role, Content: content}
+		metaStr := ""
+		if metadata.Valid {
+			metaStr = metadata.String
+		}
+		// Re-attach metadata (same logic as GetMessages).
+		if metaStr != "" {
+			var meta map[string]string
+			if json.Unmarshal([]byte(metaStr), &meta) == nil {
+				if v, ok := meta["tool_call_id"]; ok {
+					msg.ToolCallID = v
+				}
+				if v, ok := meta["name"]; ok {
+					msg.Name = v
+				}
+				if v, ok := meta["tool_calls"]; ok && v != "" {
+					var tcs []openai.ToolCall
+					if json.Unmarshal([]byte(v), &tcs) == nil {
+						msg.ToolCalls = tcs
+					}
+				}
+				if v, ok := meta["multi_content"]; ok && v != "" {
+					var parts []openai.ChatMessagePart
+					if json.Unmarshal([]byte(v), &parts) == nil {
+						msg.MultiContent = parts
+					}
+				}
+			}
+		}
+		rev = append(rev, row{msg: msg, meta: metaStr, created: created})
+	}
+
+	// Reverse so output is oldest-first, matching GetMessages.
+	n := len(rev)
+	msgs := make([]llm.Message, n)
+	metas := make([]string, n)
+	createds := make([]int64, n)
+	for i := 0; i < n; i++ {
+		msgs[i] = rev[n-1-i].msg
+		metas[i] = rev[n-1-i].meta
+		createds[i] = rev[n-1-i].created
+	}
+	return msgs, metas, createds
+}
+
 // SetCurrent switches the active conversation.
 func (s *Store) SetCurrent(id string) error {
 	_ = s.Flush()

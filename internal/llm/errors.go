@@ -57,6 +57,11 @@ const (
 	KindNetwork
 	// KindTimeout: ctx deadline exceeded.
 	KindTimeout
+	// KindVisionUnsupported: the LLM API rejected an image input
+	// with a clear "this model does not support image input" style
+	// error. The image was not processed; the user can either drop
+	// the image or switch to a vision-capable model.
+	KindVisionUnsupported
 )
 
 func (k ErrorKind) String() string {
@@ -75,6 +80,8 @@ func (k ErrorKind) String() string {
 		return "network_error"
 	case KindTimeout:
 		return "timeout"
+	case KindVisionUnsupported:
+		return "vision_unsupported"
 	default:
 		return "unknown"
 	}
@@ -103,6 +110,26 @@ func ClassifyAPIError(providerName string, err error) error {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		return err
+	}
+
+	// "Model does not support image input" cuts across
+	// every classification path (HTTP 400, SSE stream
+	// error, plain error). Check it first so the more
+	// specific vision-unsupported message wins over the
+	// generic bad_request / rate_limit / server_error
+	// buckets. Without this, an SSE-delivered error like
+	//   type: invalid_request_error
+	//   message: Cannot read "image.png" (this model does not support image input)
+	// would land in KindBadRequest with a generic
+	// "请求格式或参数被拒绝" message and a tool-schema
+	// suggestion that's actively misleading.
+	if IsVisionUnsupportedError(err) {
+		return &APIError{
+			Kind:       KindVisionUnsupported,
+			Message:    "当前模型不支持图片输入",
+			Suggestion: "移除附件中的图片，或在 /model 切换到支持视觉的模型（如 gpt-4o / claude-3.5+）",
+			Cause:      err,
+		}
 	}
 
 	// OpenAI SDK API errors carry HTTP status.
@@ -166,6 +193,43 @@ func ClassifyAPIError(providerName string, err error) error {
 
 	// Fall through: unknown error, pass through.
 	return err
+}
+
+// IsVisionUnsupportedError reports whether the upstream LLM
+// rejected an image input. The various providers all use
+// slightly different phrasings for the same underlying problem,
+// so we match on a few stable substrings rather than a single
+// exact string.
+//
+// Examples seen in the wild:
+//   - "Cannot read \"image.png\" (this model does not support image input). Inform the user."
+//   - "This model does not support image inputs."
+//   - "Image input is not supported by this model."
+//   - "The model does not accept image content."
+//
+// Anything matching one of these (case-insensitive) is treated
+// as a vision-unsupported error.
+func IsVisionUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "does not support image input"),
+		strings.Contains(msg, "does not support image inputs"),
+		strings.Contains(msg, "does not accept image"),
+		strings.Contains(msg, "image input is not supported"),
+		strings.Contains(msg, "no support for image"):
+		return true
+	}
+	// "Cannot read \"image.png\" ... Inform the user." — the
+	// proxy's standard error when a non-vision model is sent
+	// an image. We anchor on both halves so we don't false-match
+	// a generic "cannot read" error.
+	if strings.Contains(msg, "cannot read") && strings.Contains(msg, "inform the user") {
+		return true
+	}
+	return false
 }
 
 func truncate(s string, n int) string {
