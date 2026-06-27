@@ -1,26 +1,49 @@
 <script setup lang="ts">
+// MessageBubble renders one Message. The assistant
+// message body is built from a flat parts array
+// (text + thinking + tool calls + sub-agents), each
+// rendered by a dedicated sub-component. User / system
+// messages still go through the markdown pipeline.
+//
+// Loading: while the assistant is streaming and no
+// content has arrived yet, the bubble shows three
+// bouncing dots (iMessage-style).
 import { computed } from 'vue'
-import { NScrollbar, NSpin, NTag } from 'naive-ui'
 import { marked } from 'marked'
-import type { Message } from '../api/client'
+import type { Message, MessagePart } from '../api/client'
 import { state } from '../stores/chat'
+import ThinkingBlock from './ThinkingBlock.vue'
+import ToolCallCard from './ToolCallCard.vue'
+import SubAgentCard from './SubAgentCard.vue'
+import LoadingDots from './LoadingDots.vue'
 
 const props = defineProps<{ message: Message; streaming?: boolean }>()
 
-const html = computed(() => {
-  // system, user, and assistant all render through the markdown
-  // pipeline. The role only affects the surrounding bubble chrome.
+// The role check is unchanged: tool messages are not
+// rendered as bubbles; they live inside the assistant
+// message as ToolCallCard parts.
+const isSystem = computed(() => props.message.role === 'system')
+
+// For user / system messages, the markdown pipeline
+// renders the whole `content` string. For assistant
+// messages, we render `parts` instead. (We still
+// support legacy assistant messages that have only
+// `content` and no `parts` — the server's history
+// endpoint returns content-only messages, so the
+// fallback is important.)
+const assistantHtml = computed(() => '')
+
+const userHtml = computed(() => {
   if (props.message.role === 'tool') return ''
   const md = marked.parse(props.message.content || '', { async: false, breaks: true })
   return md as string
 })
 
-const isSystem = computed(() => props.message.role === 'system')
-
+// Attachments (images / files) — only used by user
+// messages today, but kept general.
 function openLightbox(src: string, alt: string) {
   state.lightbox = { show: true, src, alt }
 }
-
 function thumbText(kind?: string) {
   switch (kind) {
     case 'image': return '🖼'
@@ -29,24 +52,37 @@ function thumbText(kind?: string) {
     default:      return '📄'
   }
 }
-
-// shortWarnText trims the agent's "attached image" marker down
-// to a one-liner. The full text is in the title attr; on the
-// bubble we just want "model does not support image" + the
-// filename to make it obvious what was rejected.
 function shortWarnText(t?: string): string {
   if (!t) return 'image skipped'
   const m = t.match(/\(attached image: ([^,]+)/)
   const name = m ? m[1].trim() : 'image'
   return `${name} · model does not support image input`
 }
+
+// Show the loading-dots placeholder when the
+// assistant is streaming but no content / thinking /
+// tool part has arrived yet. (Without this, the user
+// sees nothing for the first ~1-3 seconds of a chat.)
+const showLoadingDots = computed(() => {
+  return props.streaming === true
+      && props.message.role === 'assistant'
+      && !props.message.content
+      && (!props.message.parts || props.message.parts.length === 0)
+})
+
+// Token usage badge — only show if we have it.
+const hasTokens = computed(() =>
+  props.message.role === 'assistant'
+  && (props.message.tokens_in || props.message.tokens_out)
+)
 </script>
 
 <template>
-  <div class="msg" :class="message.role + (streaming ? ' streaming' : '')">
+  <div class="msg" :class="message.role + (streaming && message.role === 'assistant' ? ' streaming' : '')">
     <div class="bubble">
       <div v-if="isSystem" class="system-icon">›</div>
       <div class="bubble-body">
+        <!-- Attachments (user / tool) -->
         <div v-if="message.attachments && message.attachments.length" class="attachments">
           <template v-for="(a, i) in message.attachments" :key="i">
             <img
@@ -70,8 +106,49 @@ function shortWarnText(t?: string): string {
             </div>
           </template>
         </div>
-        <div v-if="html" class="md-body" v-html="html"></div>
-        <NSpin v-if="streaming && !message.content" size="small" />
+
+        <!-- User / system: markdown of `content` -->
+        <div
+          v-if="message.role === 'user' || message.role === 'system'"
+          class="md-body"
+          v-html="userHtml"
+        />
+
+        <!-- Assistant: parts-driven render.
+             Falls back to markdown of `content` for
+             messages loaded from history (no parts
+             were persisted server-side). -->
+        <template v-if="message.role === 'assistant'">
+          <template v-if="message.parts && message.parts.length">
+            <template v-for="(p, i) in message.parts" :key="i">
+              <ThinkingBlock
+                v-if="p.kind === 'thinking'"
+                :part="p"
+                :default-open="streaming && p.kind === 'thinking' && p.streaming && i === message.parts.length - 1"
+              />
+              <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
+              <SubAgentCard v-else-if="p.kind === 'sub_agent'" :part="p" />
+              <div
+                v-else-if="p.kind === 'text'"
+                class="md-body"
+                v-html="marked.parse(p.text || '', { async: false, breaks: true })"
+              />
+            </template>
+          </template>
+          <template v-else-if="message.content">
+            <div class="md-body" v-html="userHtml"></div>
+          </template>
+          <LoadingDots v-if="showLoadingDots" />
+        </template>
+
+        <!-- Footer for assistant: tokens / elapsed -->
+        <div v-if="hasTokens" class="msg-meta">
+          <span v-if="message.tokens_in || message.tokens_out">
+            {{ message.tokens_in || 0 }}↓ / {{ message.tokens_out || 0 }}↑
+          </span>
+          <span v-if="message.elapsed" class="msg-elapsed">· {{ message.elapsed }}</span>
+          <span v-if="message.model" class="msg-model">· {{ message.model }}</span>
+        </div>
       </div>
     </div>
   </div>
@@ -165,6 +242,24 @@ function shortWarnText(t?: string): string {
 }
 .warn-icon { color: var(--warn); }
 .warn-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* The pulsing animation. The bubble's border stays
+ * solid; only its opacity breathes. While the new
+ * three-bouncing-dots placeholder is showing, this
+ * animation is suppressed (the dots are lively
+ * enough on their own). */
 .msg.streaming .bubble { animation: pulse 1.5s infinite; }
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.85; } }
+
+.msg-meta {
+  margin-top: 6px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border-2);
+  font-size: 11px;
+  color: var(--text-4);
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.msg-elapsed, .msg-model { color: var(--text-4); }
 </style>

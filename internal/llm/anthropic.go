@@ -109,8 +109,27 @@ type anthropicStreamEvent struct {
 }
 
 type anthropicContentBlockDelta struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	// Thinking carries the chain-of-thought delta. Anthropic
+	// emits this as a "thinking_delta" content block when
+	// extended thinking is enabled on the upstream API. We
+	// only ever receive it if the upstream was configured to
+	// think — we never request it ourselves.
+	Thinking string `json:"thinking,omitempty"`
+}
+
+// anthropicContentBlockStart tells us what KIND of content
+// block the server is starting, so we know how to interpret
+// the subsequent deltas. The Index field lets us correlate
+// later deltas back to this block (Anthropic streams blocks
+// in parallel and a single response can have many
+// interleaved text / thinking / tool_use blocks).
+type anthropicContentBlockStart struct {
+	Type     string `json:"type"`
+	Index    int    `json:"index"`
+	Text     string `json:"text"`
+	Thinking string `json:"thinking,omitempty"`
 }
 
 type anthropicMessageDelta struct {
@@ -245,11 +264,42 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 
 func (c *AnthropicClient) handleStreamEvent(eventType, dataJSON string, ch chan<- StreamChunk) {
 	switch eventType {
+	case "content_block_start":
+		// Track the kind of content block by index. Anthropic
+		// streams text, thinking, and tool_use blocks in
+		// parallel; each `content_block_delta` references
+		// the block by its index, so we need to know what
+		// kind of block each delta is for.
+		//
+		// We only need this for blocks that affect the next
+		// delta's routing: thinking blocks carry "thinking"
+		// field, text blocks carry "text", and tool_use
+		// blocks carry an "id" + "name" (we don't surface
+		// native tool_use as deltas — we let the agent
+		// re-aggregate).
+		var start anthropicContentBlockStart
+		if err := json.Unmarshal([]byte(dataJSON), &start); err == nil {
+			// We don't actually need to store this — the
+			// delta's `Type` field ("text_delta" vs
+			// "thinking_delta") is self-describing. But we
+			// could log or surface it later if needed.
+		}
 	case "content_block_delta":
 		var delta anthropicContentBlockDelta
 		if err := json.Unmarshal([]byte(dataJSON), &delta); err == nil {
-			if delta.Type == "text_delta" && delta.Text != "" {
-				ch <- StreamChunk{Content: delta.Text}
+			switch delta.Type {
+			case "text_delta":
+				if delta.Text != "" {
+					ch <- StreamChunk{Content: delta.Text}
+				}
+			case "thinking_delta":
+				// Anthropic extended-thinking chain-of-
+				// thought. We only ever see this if the
+				// upstream model was configured to think
+				// — we never enable it ourselves.
+				if delta.Thinking != "" {
+					ch <- StreamChunk{Thinking: delta.Thinking}
+				}
 			}
 		}
 	case "message_stop":

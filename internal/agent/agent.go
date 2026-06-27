@@ -172,8 +172,16 @@ type ChatRequest struct {
 
 type ChatStreamChunk struct {
 	Content string `json:"content"`
-	Done    bool   `json:"done"`
-	Error   string `json:"error,omitempty"`
+	// Thinking carries a delta of the model's reasoning /
+	// chain-of-thought text. Only populated by LLM clients
+	// that surface a separate reasoning stream (Anthropic
+	// thinking blocks, DeepSeek reasoning_content, OpenAI o1
+	// reasoning tokens, etc.). Empty for models that don't
+	// emit thinking. The UI renders it as a collapsible
+	// gray block (DeepSeek-style) when non-empty.
+	Thinking string `json:"thinking,omitempty"`
+	Done     bool   `json:"done"`
+	Error    string `json:"error,omitempty"`
 
 	Phase    string `json:"phase,omitempty"`
 	Message  string `json:"message,omitempty"`
@@ -191,10 +199,20 @@ type ChatStreamChunk struct {
 	TokensIn  int `json:"tokens_in,omitempty"`
 	TokensOut int `json:"tokens_out,omitempty"`
 
-	// SubAgent is true when this chunk originated from a sub-agent
-	// (e.g. a `task` tool call). The UI should render such events as
-	// nested / indented.
+	// SubAgent is true when this chunk originated from a
+	// sub-agent (e.g. a `task` tool call). The UI should
+	// render such events as nested / indented.
 	SubAgent bool `json:"sub_agent,omitempty"`
+	// SubAgentTask is the human description of the sub-agent
+	// (the `description` argument passed to the `task` tool).
+	// Surfaced by the parent as a card header so the user
+	// can see what the sub-agent was asked to do.
+	SubAgentTask string `json:"sub_agent_task,omitempty"`
+	// SubAgentStatus is one of "start" (the sub-agent just
+	// began), "ok" (it finished successfully), "error" (it
+	// failed). Other phase values are treated as
+	// in-progress.
+	SubAgentStatus string `json:"sub_agent_status,omitempty"`
 }
 
 // buildStaticSystemPrompt builds the **prefix-cacheable** portion of the
@@ -496,9 +514,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 调用 LLM", roundNum, maxRounds), Round: roundNum, MaxRound: maxRounds}
 
 			var (
-				fullContent string
-				toolCalls   []nativeToolCall
-				argsAccum   = make(map[int]*nativeToolCall)
+				fullContent  string
+				fullThinking string
+				toolCalls    []nativeToolCall
+				argsAccum    = make(map[int]*nativeToolCall)
 			)
 
 			stream := a.llm.ChatStreamWithOptions(ctx, req.Provider, req.Model, msgs, openAITools, a.options)
@@ -521,6 +540,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if chunk.Content != "" {
 					fullContent += chunk.Content
 					ch <- ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut}
+				}
+				if chunk.Thinking != "" {
+					// Forward thinking deltas as their own
+					// StreamChunk so the UI can render them
+					// separately (DeepSeek-style
+					// collapsible block). The TokensIn/Out
+					// are passed through so the assistant
+					// message can show a running token
+					// total while still streaming.
+					fullThinking += chunk.Thinking
+					ch <- ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut}
 				}
 				if chunk.ToolCallDelta != nil {
 					tcd := chunk.ToolCallDelta

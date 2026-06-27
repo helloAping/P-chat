@@ -532,6 +532,63 @@ func TestChunkToEvent(t *testing.T) {
 			t.Errorf("Type = %q, want phase", ev.Type)
 		}
 	})
+	t.Run("thinking", func(t *testing.T) {
+		ev := chunkToEvent(agent.ChatStreamChunk{Thinking: "let me think..."}, "cs", "gpt-4o")
+		if ev.Type != "thinking" {
+			t.Errorf("Type = %q, want thinking", ev.Type)
+		}
+		if ev.Thinking != "let me think..." {
+			t.Errorf("Thinking = %q", ev.Thinking)
+		}
+		if ev.Content != "" {
+			t.Errorf("Content = %q, want empty (thinking should not carry content)", ev.Content)
+		}
+	})
+	t.Run("tool_with_sub_agent", func(t *testing.T) {
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			Phase: "tool", Step: "call-1-ok", ToolName: "read_file", ToolResult: "hi",
+			SubAgent: true, SubAgentTask: "list repo", SubAgentStatus: "ok",
+		}, "cs", "gpt-4o")
+		if ev.Type != "tool" {
+			t.Errorf("Type = %q, want tool", ev.Type)
+		}
+		if !ev.SubAgent {
+			t.Errorf("SubAgent = false, want true")
+		}
+		if ev.SubAgentTask != "list repo" {
+			t.Errorf("SubAgentTask = %q, want %q", ev.SubAgentTask, "list repo")
+		}
+		if ev.SubAgentStatus != "ok" {
+			t.Errorf("SubAgentStatus = %q, want ok", ev.SubAgentStatus)
+		}
+	})
+	t.Run("sub_agent_lifecycle", func(t *testing.T) {
+		// The sub-agent start/ok/err events come through as
+		// plain phase events (no content / no tool_name) with
+		// the SubAgent flag set. They should still surface as
+		// "phase" so the client can hook them.
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			Phase: "sub_agent_start", SubAgent: true, SubAgentTask: "build foo", SubAgentStatus: "start",
+		}, "cs", "gpt-4o")
+		if ev.Type != "phase" {
+			t.Errorf("Type = %q, want phase", ev.Type)
+		}
+		if !ev.SubAgent {
+			t.Errorf("SubAgent = false, want true")
+		}
+		if ev.SubAgentStatus != "start" {
+			t.Errorf("SubAgentStatus = %q, want start", ev.SubAgentStatus)
+		}
+	})
+	t.Run("tool_args_round_trip", func(t *testing.T) {
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			Phase: "tool", Step: "call-2-ok", ToolName: "exec_command",
+			ToolArgs: `{"cmd":"ls -la"}`, ToolResult: "...",
+		}, "cs", "gpt-4o")
+		if ev.ToolArgs != `{"cmd":"ls -la"}` {
+			t.Errorf("ToolArgs = %q, want raw json", ev.ToolArgs)
+		}
+	})
 }
 
 func TestSessionToResponse(t *testing.T) {

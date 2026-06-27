@@ -324,6 +324,22 @@ func (d *Default) Run(ctx context.Context, req Request) (Result, error) {
 		return hit, nil
 	}
 
+	// Emit a single synthetic "start" event for the parent's UI so it
+	// can open a nested sub-agent card immediately. The card header
+	// shows the task description; the card body fills in as content /
+	// thinking / tool events flow through below. SubAgent=true tags
+	// the event so the parent knows to route it to the matching
+	// nested card (keyed by task description, since the wire doesn't
+	// carry a sub-agent id).
+	if d.OnEvent != nil {
+		d.OnEvent(agent.ChatStreamChunk{
+			Phase:          "sub_agent_start",
+			SubAgent:       true,
+			SubAgentTask:   req.Description,
+			SubAgentStatus: "start",
+		})
+	}
+
 	// Per-sub-agent timeout. Default 5 minutes, or use the config if set.
 	timeout := 5 * time.Minute
 	if d.Cfg != nil {
@@ -373,13 +389,21 @@ func (d *Default) Run(ctx context.Context, req Request) (Result, error) {
 		content             string
 		tokensIn, tokensOut int
 		rounds              int
+		failed              bool
 	)
 	for chunk := range stream {
+		// Tag every chunk as sub-agent so the parent can route it
+		// into the matching nested card. Stamp the task on each
+		// event too — the parent UI keys cards by task description
+		// (since the wire has no sub-agent id), so the tag must
+		// ride along.
+		chunk.SubAgent = true
+		chunk.SubAgentTask = req.Description
+
 		if chunk.Error != "" {
-			stripped := chunk
-			stripped.Content = ""
-			tryForward(stripped, d.OnEvent)
-			return Result{}, fmt.Errorf("llm error: %s", chunk.Error)
+			failed = true
+			tryForward(chunk, d.OnEvent)
+			break
 		}
 		if chunk.Content != "" {
 			content += chunk.Content
@@ -394,18 +418,44 @@ func (d *Default) Run(ctx context.Context, req Request) (Result, error) {
 			rounds = chunk.Round
 		}
 
-		// Forward non-content events to the parent (Phase + Done) so it
-		// can render nested progress. We strip Content because the
-		// parent's UI shows the sub-agent's full result separately.
-		if chunk.Phase != "" || chunk.Done {
-			stripped := chunk
-			stripped.Content = ""
-			tryForward(stripped, d.OnEvent)
-		}
+		// Forward EVERY non-error event to the parent so the
+		// nested card's body can stream text, thinking, and
+		// tool calls in real time. (Previously we stripped
+		// Content — the parent only got phase/done — so the
+		// user could never see the sub-agent's reasoning or
+		// tool calls, only the final result. The full text
+		// is still preserved in `content` for the tool
+		// return payload, so the parent LLM sees the same
+		// answer either way.)
+		tryForward(chunk, d.OnEvent)
 
 		if chunk.Done {
 			break
 		}
+	}
+
+	// Emit the closing status event. The parent UI uses this
+	// to flip the card from "running" to "ok" / "err" and
+	// to collapse / stop the spinner.
+	status := "ok"
+	if failed {
+		status = "err"
+	}
+	if d.OnEvent != nil {
+		d.OnEvent(agent.ChatStreamChunk{
+			Phase:          "sub_agent_" + status,
+			SubAgent:       true,
+			SubAgentTask:   req.Description,
+			SubAgentStatus: status,
+		})
+	}
+
+	if failed {
+		// We already forwarded the error chunk above; just
+		// return without a result. The tool layer will turn
+		// the lack of result into a "sub-agent failed"
+		// CallResult.
+		return Result{}, fmt.Errorf("sub-agent stream errored")
 	}
 
 	res := Result{

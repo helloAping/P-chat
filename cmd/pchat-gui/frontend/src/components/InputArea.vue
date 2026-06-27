@@ -11,7 +11,7 @@ import { NInput, NButton, NSpace, NScrollbar, useMessage } from 'naive-ui'
 import * as api from '../api/client'
 import {
   state, currentMeta, addAttachment, removeAttachment, clearAttachments,
-  isStreaming, startStream, stopStream, appendAssistantChunk, endStream,
+  isStreaming, startStream, stopStream, appendStreamEvent, endStream,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage,
 } from '../stores/chat'
@@ -218,13 +218,10 @@ async function send() {
   clearAttachments()
   sending.value = true
   const ctrl = new AbortController()
-  startStream(id, ctrl, (ev) => {
-    if (ev.type === 'content' && ev.content) {
-      appendAssistantChunk(id, ev.content)
-    } else if (ev.error) {
-      message.error(ev.error)
-    }
-  })
+  // Install the placeholder assistant message immediately so
+  // the three-bouncing-dots spinner is reachable. The actual
+  // mutation happens in the onEvent callback below.
+  startStream(id, ctrl)
   try {
     await api.streamMessages(id, {
       message: text,
@@ -234,8 +231,15 @@ async function send() {
       attachments: inlineAttachments,
       signal: ctrl.signal,
       onEvent: (ev) => {
-        const s = state.streaming[id]
-        if (s) s.onEvent(ev)
+        // Surface top-level errors (auth, network) as
+        // toast notifications. Per-event errors
+        // (e.g. tool execution failure) flow through
+        // appendStreamEvent and are rendered inline.
+        if (ev.type === 'error' && ev.error) {
+          message.error(ev.error)
+          return
+        }
+        appendStreamEvent(id, ev)
       },
     })
   } catch (e: any) {

@@ -37,16 +37,79 @@ export interface MessageAttachment {
   kind?: string
 }
 
+// MessagePart is one block of content inside a Message.
+// The assistant message model is a flat list of parts in
+// stream order: text + thinking + tool calls + sub-agents
+// interleave freely as the upstream LLM emits them.
+//
+// User / system messages are still just a single text
+// string under `content` — they don't have parts.
+export type MessagePart =
+  | { kind: 'text'; text: string }
+  | { kind: 'thinking'; text: string; streaming?: boolean }
+  | {
+      kind: 'tool'
+      // The tool call's stable id, e.g. "read_file".
+      // For non-native calls parsed out of markdown, the
+      // id is undefined and the call is keyed by index.
+      id?: string
+      name: string
+      // JSON-encoded arguments string. Empty until the
+      // call's args have been parsed.
+      args?: string
+      // 'start' | 'ok' | 'warn' | 'error'. Defaults to
+      // 'start' on creation; updated when the matching
+      // 'tool' event arrives.
+      status: 'start' | 'ok' | 'warn' | 'error'
+      result?: string
+      error?: string
+      elapsed?: string
+    }
+  | {
+      kind: 'sub_agent'
+      // The sub-agent's task description. Acts as the
+      // card's primary label and the unique key (no id
+      // on the wire).
+      task: string
+      // 'start' | 'ok' | 'err'.
+      status: 'start' | 'ok' | 'err'
+      // The sub-agent's own message stream — same
+      // MessagePart union, recursively nested. (We don't
+      // actually recurse in practice; sub-agents cannot
+      // spawn sub-agents. The type just allows it.)
+      parts: MessagePart[]
+      elapsed?: string
+    }
+
+export type SubAgentPart = Extract<MessagePart, { kind: 'sub_agent' }>
+export type ToolPart = Extract<MessagePart, { kind: 'tool' }>
+export type TextPart = Extract<MessagePart, { kind: 'text' }>
+export type ThinkingPart = Extract<MessagePart, { kind: 'thinking' }>
+
 export interface Message {
   id?: number
   role: 'user' | 'assistant' | 'tool' | 'system'
+  // For user / system messages this is the text body.
+  // For assistant messages, prefer `parts` — but `content`
+  // is kept in sync as a denormalized cache so the
+  // markdown pipeline can render the whole thing without
+  // walking the parts array.
   content: string
+  // Structured parts (assistant messages only). May be
+  // empty for older messages loaded from history (the
+  // server only persists the final content text).
+  parts?: MessagePart[]
   created_at?: number
   tool_call_id?: string
   name?: string
   provider?: string
   model?: string
   attachments?: MessageAttachment[]
+  // Final token usage + elapsed time, stamped on the
+  // assistant message when the 'done' event arrives.
+  tokens_in?: number
+  tokens_out?: number
+  elapsed?: string
 }
 
 export interface SessionMeta {
@@ -387,17 +450,39 @@ export interface StreamEvent {
   phase?: string
   step?: string
   message?: string
+  // Content is a text delta (assistant prose). Populated when
+  // type === 'content'. The client appends it to the trailing
+  // text part of the assistant message.
   content?: string
+  // Thinking is a reasoning / chain-of-thought delta
+  // (DeepSeek reasoning_content, OpenAI o1 reasoning, Anthropic
+  // thinking_delta). Populated when type === 'thinking'. The
+  // client appends it to the trailing thinking part of the
+  // assistant message.
+  thinking?: string
   tool_name?: string
   tool_status?: string
   tool_result?: string
   tool_error?: string
   tool_elapsed?: string
+  // tool_args is the JSON-encoded arguments string the tool
+  // was called with. Best-effort: LLM clients only surface this
+  // once the call is complete.
+  tool_args?: string
+  // Sub-agent fields. When sub_agent is true, the event
+  // originated from a `task` tool's child run. The client
+  // routes such events into the matching nested card (keyed
+  // by sub_agent_task).
+  sub_agent?: boolean
+  sub_agent_task?: string
+  sub_agent_status?: 'start' | 'ok' | 'err' | string
   tokens_in?: number
   tokens_out?: number
+  elapsed?: string
   provider?: string
   model?: string
   error?: string
+  suggestion?: string
 }
 
 export async function streamMessages(sessionId: string, opts: SendOptions): Promise<void> {

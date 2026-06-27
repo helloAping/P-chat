@@ -291,20 +291,53 @@ type AttachmentPart struct {
 
 // StreamEvent is one chunk of a Server-Sent Events stream from
 // POST /sessions/:id/messages. The Type field is one of:
-// "content", "phase", "tool", "error", "done".
+// "content", "thinking", "tool", "phase", "error", "done".
+//
+// The wire is intentionally flat: every event carries
+// provider+model so the client doesn't have to remember
+// per-session state, and any combination of fields may be
+// non-empty on any event. The client discriminates by
+// (type, content, thinking, tool_*, sub_agent_*) — not by
+// exclusive categories.
 type StreamEvent struct {
-	Type    string `json:"type"`
+	Type string `json:"type"`
+	// Content is an assistant text delta. Type "content" on
+	// its own; "thinking" events have non-empty Thinking
+	// and empty Content.
 	Content string `json:"content,omitempty"`
-	Phase   string `json:"phase,omitempty"`
-	Step    string `json:"step,omitempty"`
-	Message string `json:"message,omitempty"`
+	// Thinking is a reasoning / chain-of-thought delta.
+	// Only emitted by LLM clients that surface a separate
+	// reasoning stream (Anthropic thinking blocks,
+	// DeepSeek reasoning_content, OpenAI o1 reasoning).
+	// Type "thinking" on its own.
+	Thinking string `json:"thinking,omitempty"`
+	Phase    string `json:"phase,omitempty"`
+	Step     string `json:"step,omitempty"`
+	Message  string `json:"message,omitempty"`
 
-	// Tool fields
-	ToolName   string `json:"tool_name,omitempty"`
+	// Tool fields — Type "tool".
+	ToolName    string `json:"tool_name,omitempty"`
 	ToolStatus  string `json:"tool_status,omitempty"`
 	ToolResult  string `json:"tool_result,omitempty"`
 	ToolError   string `json:"tool_error,omitempty"`
 	ToolElapsed string `json:"tool_elapsed,omitempty"`
+	// ToolArgs is the JSON-encoded arguments string the
+	// tool was called with (best-effort; LLM clients only
+	// surface this once the call is complete, not as a
+	// delta).
+	ToolArgs string `json:"tool_args,omitempty"`
+
+	// Sub-agent fields. When SubAgent is true, the event
+	// originated from a `task` tool's child run, not the
+	// parent agent. The UI renders the stream of such
+	// events inside a nested card with header
+	// `SubAgentTask`. The card's outer status (running /
+	// ok / error) is driven by the matching
+	// "sub_agent_start" / "sub_agent_ok" / "sub_agent_err"
+	// phase events.
+	SubAgent       bool   `json:"sub_agent,omitempty"`
+	SubAgentTask   string `json:"sub_agent_task,omitempty"`
+	SubAgentStatus string `json:"sub_agent_status,omitempty"`
 
 	// Done fields
 	TokensIn  int    `json:"tokens_in,omitempty"`
@@ -996,17 +1029,50 @@ func (h *Handler) SendMessage(c *gin.Context) {
 // every event so the client can show a small "produced by" badge
 // on the assistant message even when the model is unknown to the
 // chunk itself.
+//
+// Mapping rules (order matters — more specific first):
+//   1. Error chunk     → "error" event
+//   2. Done chunk      → "done" event
+//   3. Tool call chunk → "tool" event
+//   4. Thinking delta  → "thinking" event
+//   5. Content delta   → "content" event
+//   6. Phase chunk     → "phase" event
+//   7. Anything else   → "phase" heartbeat (so the client
+//      doesn't appear to hang on a quiet channel).
+//
+// Sub-agent fields are copied verbatim when set, regardless
+// of which type the chunk maps to. This lets the parent
+// surface a single nested "sub-agent" card whose inner
+// stream is a mix of content / thinking / phase events all
+// tagged with sub_agent=true.
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {
-	ev := StreamEvent{Phase: chunk.Phase, Step: chunk.Step, Message: chunk.Message, Provider: provider, Model: model}
+	ev := StreamEvent{
+		Phase:          chunk.Phase,
+		Step:           chunk.Step,
+		Message:        chunk.Message,
+		Provider:       provider,
+		Model:          model,
+		SubAgent:       chunk.SubAgent,
+		SubAgentTask:   chunk.SubAgentTask,
+		SubAgentStatus: chunk.SubAgentStatus,
+	}
 
-	if chunk.Content != "" {
-		ev.Type = "content"
-		ev.Content = chunk.Content
+	if chunk.Error != "" {
+		ev.Type = "error"
+		ev.Error = chunk.Error
+		return ev
+	}
+	if chunk.Done {
+		ev.Type = "done"
+		ev.TokensIn = chunk.TokensIn
+		ev.TokensOut = chunk.TokensOut
+		ev.Elapsed = chunk.Duration
 		return ev
 	}
 	if chunk.ToolName != "" {
 		ev.Type = "tool"
 		ev.ToolName = chunk.ToolName
+		ev.ToolArgs = chunk.ToolArgs
 		ev.ToolResult = chunk.ToolResult
 		ev.ToolError = chunk.ToolError
 		ev.ToolElapsed = chunk.ToolElapsed
@@ -1022,21 +1088,21 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		}
 		return ev
 	}
-	if chunk.Error != "" {
-		ev.Type = "error"
-		ev.Error = chunk.Error
-		// Try to extract a suggestion (the *llm.APIError format is
-		// "[kind] message" and the UI prefix is already there).
+	if chunk.Thinking != "" {
+		ev.Type = "thinking"
+		ev.Thinking = chunk.Thinking
 		return ev
 	}
-	if chunk.Done {
-		ev.Type = "done"
-		ev.TokensIn = chunk.TokensIn
-		ev.TokensOut = chunk.TokensOut
-		ev.Elapsed = chunk.Duration
+	if chunk.Content != "" {
+		ev.Type = "content"
+		ev.Content = chunk.Content
 		return ev
 	}
-	// Other phase events (system, memory, plan) — surface as "phase"
+	// Other phase events (system, memory, plan, sub-agent
+	// start/ok/err) — surface as "phase" with the original
+	// Phase/Step/Message fields. Sub-agent lifecycle events
+	// (sub_agent_start / sub_agent_ok / sub_agent_err) come
+	// through here.
 	if chunk.Phase != "" {
 		ev.Type = "phase"
 		return ev

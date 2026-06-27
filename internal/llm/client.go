@@ -1,10 +1,15 @@
 package llm
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"strings"
 
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/tool"
@@ -14,9 +19,16 @@ import (
 type Message = openai.ChatCompletionMessage
 
 type StreamChunk struct {
-	Content   string
-	Done      bool
-	Err       error
+	Content string
+	// Thinking is a reasoning / chain-of-thought delta. Only
+	// populated by LLM clients that surface a separate
+	// reasoning stream (DeepSeek reasoning_content, OpenAI
+	// o1 reasoning tokens). Empty for models that don't
+	// emit thinking. Surfaced all the way to the UI as a
+	// collapsible "thinking" block (DeepSeek-style).
+	Thinking string
+	Done     bool
+	Err      error
 	TokensIn  int
 	TokensOut int
 
@@ -62,11 +74,22 @@ type ProviderInfo struct {
 }
 
 type providerEntry struct {
-	name     string // provider name (for error messages)
-	protocol string // "openai" or "anthropic"
-	openai   *openai.Client
+	name      string // provider name (for error messages)
+	protocol  string // "openai" or "anthropic"
+	openai    *openai.Client
 	anthropic *AnthropicClient
-	model    string
+	model     string
+	// apiKey + baseURL are stored alongside the SDK client so
+	// the OpenAI streaming code path can build its own HTTP
+	// request. We can't use the SDK's stream reader for
+	// streaming because the SDK's ChatCompletionStreamChoiceDelta
+	// doesn't expose `reasoning_content` (DeepSeek) — and
+	// reading it requires access to the raw response bytes,
+	// which the SDK consumes internally. The custom stream
+	// also lets us apply the same retry / abort / context
+	// semantics uniformly.
+	apiKey  string
+	baseURL string
 }
 
 type Client struct {
@@ -109,6 +132,8 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 			name:     p.Name,
 			protocol: p.GetProtocol(),
 			model:    p.EffectiveModel(), // start with the default model
+			apiKey:   p.APIKey,
+			baseURL:  p.BaseURL,
 		}
 
 		switch p.GetProtocol() {
@@ -242,15 +267,58 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			req.Tools = tools
 		}
 
-		stream, err := p.openai.CreateChatCompletionStream(ctx, req)
+		// We deliberately bypass `p.openai.CreateChatCompletionStream`
+		// here. The upstream SDK's `ChatCompletionStreamChoiceDelta`
+		// struct has no `ReasoningContent` field, so DeepSeek-style
+		// chain-of-thought deltas (and OpenAI o1 reasoning tokens)
+		// are silently dropped on the floor. We can't recover them
+		// after the SDK has consumed the SSE body either, so the
+		// only way to surface them is to drive the HTTP request
+		// ourselves and parse the raw response.
+		//
+		// The trade-off: we replicate ~30 lines of URL + auth +
+		// SSE-parsing code, in exchange for actually seeing the
+		// thinking stream. Same protocol, same auth scheme
+		// (Bearer token), same JSON shape.
+		body, err := json.Marshal(req)
+		if err != nil {
+			ch <- StreamChunk{Err: fmt.Errorf("marshal openai request: %w", err)}
+			return
+		}
+		endpoint := strings.TrimRight(p.baseURL, "/") + "/chat/completions"
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			ch <- StreamChunk{Err: fmt.Errorf("build openai request: %w", err)}
+			return
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Cache-Control", "no-cache")
+		httpReq.Header.Set("Connection", "keep-alive")
+		if p.apiKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+		}
+		httpClient := &http.Client{Timeout: 0}
+		resp, err := httpClient.Do(httpReq)
 		if err != nil {
 			ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
 			return
 		}
-		defer stream.Close()
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			// Read up to 4 KB of body for the error message.
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("openai http %d: %s", resp.StatusCode, string(errBody)))}
+			return
+		}
 
+		// SSE line reader. Standard text/event-stream: events
+		// separated by blank lines, each line starting with
+		// "data: " followed by the JSON payload, and a final
+		// "data: [DONE]" sentinel.
+		reader := bufio.NewReader(resp.Body)
 		for {
-			resp, err := stream.Recv()
+			line, err := reader.ReadBytes('\n')
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					ch <- StreamChunk{Done: true}
@@ -259,34 +327,117 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 				ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
 				return
 			}
-			if len(resp.Choices) > 0 {
-				choice := resp.Choices[0]
+			line = bytes.TrimRight(line, "\r\n")
+			if len(line) == 0 {
+				continue
+			}
+			// Skip SSE comment lines (":") and any non-data
+			// framing lines ("event:", "id:").
+			if !bytes.HasPrefix(line, []byte("data: ")) {
+				continue
+			}
+			payload := bytes.TrimPrefix(line, []byte("data: "))
+			if bytes.Equal(payload, []byte("[DONE]")) {
+				ch <- StreamChunk{Done: true}
+				return
+			}
+			var r openaiStreamResponse
+			if err := json.Unmarshal(payload, &r); err != nil {
+				// Skip malformed lines (some providers send
+				// keepalive pings or partial JSON during
+				// reconnects).
+				continue
+			}
+			for _, choice := range r.Choices {
+				// Reasoning chain-of-thought (DeepSeek
+				// `reasoning_content`, OpenAI o1
+				// reasoning tokens). Empty for models
+				// that don't surface thinking.
+				if choice.Delta.ReasoningContent != "" {
+					ch <- StreamChunk{Thinking: choice.Delta.ReasoningContent}
+				}
 				if choice.Delta.Content != "" {
 					ch <- StreamChunk{Content: choice.Delta.Content}
 				}
 				for _, tc := range choice.Delta.ToolCalls {
 					delta := &ToolCallDelta{
-						Index:    0,
+						Index:    tc.Index,
 						ID:       tc.ID,
 						Name:     tc.Function.Name,
 						ArgsJSON: tc.Function.Arguments,
 					}
-					if tc.Index != nil {
-						delta.Index = *tc.Index
-					}
 					ch <- StreamChunk{ToolCallDelta: delta}
 				}
 			}
-			if resp.Usage != nil {
+			if r.Usage != nil {
 				ch <- StreamChunk{
-					TokensIn:  resp.Usage.PromptTokens,
-					TokensOut: resp.Usage.CompletionTokens,
+					TokensIn:  r.Usage.PromptTokens,
+					TokensOut: r.Usage.CompletionTokens,
 				}
 			}
 		}
 	}()
 
 	return ch
+}
+
+// openaiStreamResponse is the wire shape of a single SSE
+// `data:` payload from the OpenAI streaming API. We can't
+// reuse the upstream SDK's `openai.ChatCompletionStreamResponse`
+// because its `Delta` struct doesn't expose
+// `ReasoningContent` — that field would be silently dropped
+// by the JSON decoder.
+type openaiStreamResponse struct {
+	ID                string                         `json:"id"`
+	Object            string                         `json:"object"`
+	Created           int64                          `json:"created"`
+	Model             string                         `json:"model"`
+	Choices           []openaiStreamChoice           `json:"choices"`
+	Usage             *openaiStreamUsage             `json:"usage,omitempty"`
+	SystemFingerprint string                         `json:"system_fingerprint,omitempty"`
+}
+
+type openaiStreamChoice struct {
+	Index        int                       `json:"index"`
+	Delta        openaiStreamChoiceDelta   `json:"delta"`
+	FinishReason *string                   `json:"finish_reason,omitempty"`
+}
+
+type openaiStreamChoiceDelta struct {
+	Role             string                    `json:"role,omitempty"`
+	Content          string                    `json:"content,omitempty"`
+	// ReasoningContent is the chain-of-thought / reasoning
+	// delta. Sent by DeepSeek (their `reasoning_content`
+	// field) and by OpenAI o-series models (their
+	// `reasoning` field, depending on the SDK version).
+	// Empty for models that don't emit thinking.
+	ReasoningContent string                    `json:"reasoning_content,omitempty"`
+	Reasoning        string                    `json:"reasoning,omitempty"`
+	FunctionCall     *openaiStreamFunctionCall `json:"function_call,omitempty"`
+	ToolCalls        []openaiStreamToolCall    `json:"tool_calls,omitempty"`
+}
+
+type openaiStreamFunctionCall struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+type openaiStreamToolCall struct {
+	Index    int                       `json:"index"`
+	ID       string                    `json:"id"`
+	Type     string                    `json:"type"`
+	Function openaiStreamToolCallFunc  `json:"function"`
+}
+
+type openaiStreamToolCallFunc struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+type openaiStreamUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 func (c *Client) Chat(ctx context.Context, providerName, modelName string, messages []Message) (string, error) {
