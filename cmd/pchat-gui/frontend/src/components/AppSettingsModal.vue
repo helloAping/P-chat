@@ -124,22 +124,48 @@ async function refreshStyles() {
   }
 }
 
-function selectProvider(name: string) {
+// selectProvider switches the right pane to `name`. The
+// slim list endpoint doesn't carry base_url / api_key (those
+// are secrets kept off the wire for the list view), so we
+// also fetch the rich per-provider view (GET
+// /api/v1/providers/:name) and hydrate the form from that
+// — otherwise the user would see empty Base URL / API Key
+// fields even though the server has values for them.
+async function selectProvider(name: string) {
   selectedName.value = name
+  // First, paint the form with whatever the slim list view
+  // already has (name / protocol / is_default) so the
+  // right pane doesn't show a flash of "← 选择左侧" while
+  // the rich request is in flight.
   hydrateEditForm(name)
+  try {
+    const rich = await api.getProvider(name)
+    // Update the providers cache so the model table also
+    // gets the full per-model settings.
+    const idx = providers.value.findIndex(x => x.name === name)
+    if (idx >= 0) providers.value[idx] = rich
+    // Now re-hydrate the form with the rich view (which
+    // carries base_url + api_key).
+    hydrateEditForm(name, rich)
+  } catch (e: any) {
+    message.error(`加载 provider "${name}" 失败: ${e.message}`)
+  }
 }
 
 // hydrateEditForm copies the server-resolved fields into the
 // edit form. dirty is reset so an out-of-band server change
-// doesn't get clobbered.
-function hydrateEditForm(name: string) {
-  const p = providers.value.find(x => x.name === name)
-  if (!p) return
-  editName.value = p.name
-  editProtocol.value = (p.protocol as 'openai' | 'anthropic') || 'openai'
-  editBaseURL.value = p.base_url
-  editAPIKey.value = p.api_key
-  editIsDefault.value = p.is_default
+// doesn't get clobbered. The second `p` argument lets the
+// caller pass the rich per-provider view (which has
+// base_url + api_key); if omitted, we fall back to whatever
+// is in the providers cache.
+function hydrateEditForm(name: string, p?: api.ProviderInfo) {
+  const src = p || providers.value.find(x => x.name === name)
+  if (!src) return
+  editName.value = src.name
+  editProtocol.value = (src.protocol as 'openai' | 'anthropic') || 'openai'
+  editBaseURL.value = src.base_url || ''
+  editAPIKey.value = src.api_key || ''
+  editIsDefault.value = !!src.is_default
   dirty.value = new Set()
 }
 
@@ -157,8 +183,9 @@ async function onAddProvider() {
     return
   }
   try {
+    const addedName = newName.value.trim()
     await api.addProvider({
-      name: newName.value.trim(),
+      name: addedName,
       protocol: newProtocol.value,
       base_url: newBaseURL.value.trim(),
       api_key: newAPIKey.value.trim(),
@@ -168,7 +195,7 @@ async function onAddProvider() {
     showAddProvider.value = false
     newName.value = ''; newBaseURL.value = ''; newAPIKey.value = ''; newModel.value = ''
     await refreshProviders()
-    selectProvider(newName.value.trim())
+    await selectProvider(addedName)
   } catch (e: any) {
     message.error(`添加失败: ${e.message}`)
   }
@@ -219,8 +246,10 @@ async function onSaveProvider() {
     message.success('已保存')
     await refreshProviders()
     // If renamed, the new name is in the response; select it
-    // so the user can keep editing.
-    selectProvider(updated.name)
+    // so the user can keep editing. selectProvider also
+    // fetches the rich per-provider view, which re-hydrates
+    // the form with the up-to-date base_url / api_key.
+    await selectProvider(updated.name)
   } catch (e: any) {
     message.error(`保存失败: ${e.message}`)
   }

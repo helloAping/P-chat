@@ -6,7 +6,7 @@
 // insensitively. Unknown commands fall through to the normal send
 // path so the LLM can answer "what is /foo?" questions naturally.
 
-import { h, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { NInput, NButton, NSpace, NScrollbar, useMessage } from 'naive-ui'
 import * as api from '../api/client'
 import {
@@ -301,16 +301,14 @@ import { computed } from 'vue'
 // both the active provider and the active model in a single
 // onChange — which is what makes the "merged" picker feel native.
 interface ModelOption {
-  // Two-line label: primary (display_name or name) + a
-  // sub-line of "model-id · 128k · 👁 · ⭐". The sub-line is
-  // styled by renderLabel (see template) — it never
-  // appears in the small pill when the option is selected.
+  // Single-line label: display_name (preferred) or raw model
+  // id. The dropdown is intentionally simple — one row, one
+  // model — so the user can scan a long list of models
+  // without having to parse a noisy 2-line layout per row.
+  // The default-model marker is shown as a small ⭐ suffix
+  // in the label so it's visible at a glance.
   label: string
   value: string
-  // Sub-line is rendered separately so it can be styled
-  // differently. We pass it through to render-label via the
-  // option's `value` key.
-  meta?: string
 }
 interface GroupOption {
   type: 'group'
@@ -339,16 +337,6 @@ async function loadConfig() {
   } catch { /* ignore */ }
 }
 
-// fmtContext turns a raw token count into a compact human
-// string ("128k", "1.5m", "8k"). Returns "" for 0/unknown so
-// the sub-line is short.
-function fmtContext(n?: number) {
-  if (!n || n <= 0) return ''
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}m`
-  if (n >= 1024) return `${Math.round(n / 1024)}k`
-  return String(n)
-}
-
 function rebuildModelOptions() {
   const groups: GroupOption[] = []
   for (const p of providers.value) {
@@ -356,23 +344,21 @@ function rebuildModelOptions() {
     // Multi-model form (preferred).
     for (const m of (p.models || [])) {
       const name = m.name
+      // Use display_name as the user-facing label so the
+      // dropdown shows a friendly name when one is set, and
+      // falls back to the raw model id otherwise. The default
+      // model gets a ⭐ prefix to mirror the badge the user
+      // sees in the model table on the settings page.
       const primary = m.display_name || name
-      // Build the sub-line: "id · 128k · vision · default"
-      const subParts: string[] = []
-      subParts.push(name)
-      const ctx = fmtContext(m.max_tokens_context)
-      if (ctx) subParts.push(ctx)
-      if (m.capabilities?.supports_vision) subParts.push('视觉')
-      if (m.default) subParts.push('默认')
+      const label = m.default ? `⭐ ${primary}` : primary
       ms.push({
-        label: primary,
+        label,
         value: `${p.name}::${name}`,
-        meta: subParts.join(' · '),
       })
     }
     // Legacy single-`model` form (when p.models is empty).
     if (ms.length === 0 && p.model) {
-      ms.push({ label: p.model, value: `${p.name}::${p.model}`, meta: p.model })
+      ms.push({ label: p.model, value: `${p.name}::${p.model}` })
     }
     if (ms.length > 0) {
       groups.push({ type: 'group', label: p.name, children: ms })
@@ -381,22 +367,12 @@ function rebuildModelOptions() {
   modelOptions.value = groups
 }
 
-// renderOption is invoked for every row inside the dropdown panel
-// (NOT for the closed-pill display — that uses `option.label`
-// straight from `renderLabel`'s default, which is `display_name`).
-// We use the two-line layout here so the user can see the raw
-// model id and capability tags at a glance, without paying that
-// cost on the always-visible selected pill.
-function renderOption(info: { node: any; option: any; selected: boolean }) {
-  const opt = info.option
-  if (!opt || opt.type === 'group') return opt?.label || ''
-  const meta = opt.meta as string | undefined
-  if (!meta || meta === opt.label) return info.node
-  return h('div', { class: 'model-option' }, [
-    h('div', { class: 'model-option-primary' }, opt.label),
-    h('div', { class: 'model-option-meta' }, meta),
-  ])
-}
+// The model picker uses a flat single-line label per option.
+// No custom render-function is needed — the default NSelect
+// label rendering handles both the dropdown row and the
+// closed selected-pill display, and both show the same
+// `display_name` (or raw `name`) with a ⭐ prefix for the
+// default model.
 
 function currentSelection(): string {
   const m = currentMeta.value
@@ -553,8 +529,7 @@ onMounted(() => {
           :disabled="!state.currentID"
           filterable
           class="picker picker-wide"
-          :render-option="renderOption"
-          title="选择模型 (按提供商分组; ⭐ 默认 · 视觉 = 支持图片)"
+          title="选择模型 (按提供商分组; ⭐ = 默认)"
           placeholder="选择模型"
         />
       </div>
@@ -704,25 +679,6 @@ onMounted(() => {
   min-width: 180px;
   max-width: 240px;
   flex: 1 1 180px;
-}
-
-/* Two-line model option in the dropdown panel. The primary
-   line is the display_name (bold-ish); the sub-line carries
-   the model id, context size, and capability badges. */
-.model-option {
-  display: flex; flex-direction: column;
-  line-height: 1.25;
-  padding: 2px 0;
-}
-.model-option-primary {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-1);
-}
-.model-option-meta {
-  font-size: 11px;
-  color: var(--text-3);
-  margin-top: 1px;
 }
 
 /* The input area must be height-bounded: with many attachments
