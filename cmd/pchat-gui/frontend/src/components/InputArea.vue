@@ -6,14 +6,14 @@
 // insensitively. Unknown commands fall through to the normal send
 // path so the LLM can answer "what is /foo?" questions naturally.
 
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, computed } from 'vue'
 import { NInput, NButton, NSpace, NScrollbar, useMessage } from 'naive-ui'
 import * as api from '../api/client'
 import {
   state, currentMeta, addAttachment, removeAttachment, clearAttachments,
   isStreaming, startStream, stopStream, appendStreamEvent, endStream,
   switchSession, renameSession, createSession, deleteSessionById,
-  currentMessages, appendSystemMessage,
+  currentMessages, appendSystemMessage, loadProviders,
 } from '../stores/chat'
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
@@ -176,8 +176,14 @@ async function send() {
   }
 
   if (!state.currentID) {
-    const r = await api.createSession()
-    await switchSession(r.id)
+    // Use the store's createSession() — it both creates the
+    // session on the server AND inserts it into state.sessions
+    // so switchSession() can find it for picker hydration.
+    // The previous bare api.createSession() call bypassed the
+    // store and left the new session invisible to currentMeta,
+    // which manifested as "model selection empty after first
+    // message" in the chat NSelect.
+    await createSession()
   }
   const id = state.currentID
   const meta = currentMeta.value
@@ -286,8 +292,6 @@ onMounted(() => {
 
 // --- Inline session config (model picker, grouped by provider) ---
 
-import { computed } from 'vue'
-
 // `modelOptions` is the grouped NSelect option list. The shape is:
 //
 //   [
@@ -321,46 +325,20 @@ interface GroupOption {
 }
 type SelectOption = ModelOption | GroupOption
 
-const providers = ref<api.ProviderInfo[]>([])
-const modelOptions = ref<SelectOption[]>([])
-const styleOptions = ref<{ label: string; value: string }[]>([])
-
-async function loadConfig() {
-  try {
-    const [pr, st] = await Promise.all([api.listProviders(), api.getStyles()])
-    providers.value = pr.providers || []
-    // /api/v1/styles returns a list of { id, label, desc } objects;
-    // we want the dropdown to show the human label and persist the
-    // machine id (which is what the session meta / system prompt
-    // actually understands).
-    styleOptions.value = (st.styles || []).map((x: any) => ({
-      label: x.label || x.id,
-      value: x.id,
-    }))
-    rebuildModelOptions()
-  } catch { /* ignore */ }
-}
-
-function rebuildModelOptions() {
+// Use the store-level providers list (loaded once at app
+// boot) so the chat NSelect can read the same model list
+// the picker on the right of the input shows. We keep
+// modelOptions as a local computed off state.providers.
+const modelOptions = computed<SelectOption[]>(() => {
   const groups: GroupOption[] = []
-  for (const p of providers.value) {
+  for (const p of state.providers as any[]) {
     const ms: ModelOption[] = []
-    // Multi-model form (preferred).
     for (const m of (p.models || [])) {
       const name = m.name
-      // Use display_name as the user-facing label so the
-      // dropdown shows a friendly name when one is set, and
-      // falls back to the raw model id otherwise. The default
-      // model gets a ⭐ prefix to mirror the badge the user
-      // sees in the model table on the settings page.
       const primary = m.display_name || name
       const label = m.default ? `⭐ ${primary}` : primary
-      ms.push({
-        label,
-        value: `${p.name}::${name}`,
-      })
+      ms.push({ label, value: `${p.name}::${name}` })
     }
-    // Legacy single-`model` form (when p.models is empty).
     if (ms.length === 0 && p.model) {
       ms.push({ label: p.model, value: `${p.name}::${p.model}` })
     }
@@ -368,7 +346,25 @@ function rebuildModelOptions() {
       groups.push({ type: 'group', label: p.name, children: ms })
     }
   }
-  modelOptions.value = groups
+  return groups
+})
+
+const styleOptions = ref<{ label: string; value: string }[]>([])
+
+async function loadConfig() {
+  try {
+    // Providers live in the store so other components (the
+    // chat NSelect, the AppSettingsModal) all read from one
+    // source of truth. loadProviders() is idempotent.
+    await loadProviders()
+    // Styles are still local to this component; only the
+    // chat input shows them.
+    const st = await api.getStyles()
+    styleOptions.value = (st.styles || []).map((x: any) => ({
+      label: x.label || x.id,
+      value: x.id,
+    }))
+  } catch { /* ignore */ }
 }
 
 // The model picker uses a flat single-line label per option.

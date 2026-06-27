@@ -163,6 +163,9 @@ export const health = () => jsonFetch<{ status: string }>('/api/v1/health')
 // --- Sessions ---
 export const listSessions = () => jsonFetch<{ sessions: Session[] }>('/api/v1/sessions')
 
+export const getSession = (id: string) =>
+  jsonFetch<Session>(`/api/v1/sessions/${encodeURIComponent(id)}`)
+
 export const createSession = () =>
   jsonFetch<{ id: string }>('/api/v1/sessions', { method: 'POST' })
 

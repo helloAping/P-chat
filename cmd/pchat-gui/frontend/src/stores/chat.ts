@@ -39,6 +39,13 @@ export const state = reactive({
   }>,
   pendingAttachments: [] as PendingAttachment[],
   providers: [] as any[],
+  // Resolved default model from the providers list. Set by
+  // loadProviders() so the per-session fallback (when the
+  // server hasn't told us yet) has something meaningful to
+  // show — otherwise the chat NSelect renders empty and the
+  // "no model selected" symptom is indistinguishable from
+  // "no providers configured".
+  defaultModel: null as { provider: string; model: string } | null,
   sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string }>,
   lightbox: { show: false, src: '', alt: '' },
   showSettings: false,
@@ -48,9 +55,23 @@ export const currentMessages = computed(() =>
   state.sessionMessages[state.currentID] || [],
 )
 
-export const currentMeta = computed(() =>
-  state.sessionMeta[state.currentID] || { style: 'tech', provider: '', model: '', title: '' },
-)
+// currentMeta resolves the per-session picker state
+// (style / provider / model / title). When the server
+// hasn't told us yet (newly created session, or a
+// switchSession race before listMessages returns),
+// fall back to the resolved default model so the chat
+// NSelect shows a real value instead of being empty.
+export const currentMeta = computed(() => {
+  const m = state.sessionMeta[state.currentID]
+  if (m) return m
+  const def = state.defaultModel
+  return {
+    style: 'tech',
+    provider: def?.provider || '',
+    model: def?.model || '',
+    title: '',
+  }
+})
 
 // --- Session management ---
 
@@ -75,18 +96,84 @@ export async function switchSession(id: string) {
   // directly. The old code read s?.metadata which the server
   // never sends — that's why switching sessions always wiped
   // the pickers back to "tech" / empty.
+  //
+  // The session might be brand-new (just created via
+  // createSession in send()) and therefore not yet in
+  // state.sessions; the find() below is purely a label
+  // fallback. If we miss, we leave sessionMeta[id] alone —
+  // currentMeta() will fall back to the resolved default
+  // model.
   const s = state.sessions.find(s => s.id === id)
-  state.sessionMeta[id] = {
-    style: s?.style || 'tech',
-    provider: s?.provider || '',
-    model: s?.model || '',
-    title: s?.title || '',
+  if (s) {
+    state.sessionMeta[id] = {
+      style:   s.style || 'tech',
+      provider: s.provider || '',
+      model:   s.model || '',
+      title:   s.title || '',
+    }
+  }
+}
+
+// loadProviders fetches the provider list and resolves
+// the "default" model — the first provider with
+// is_default: true, else the first provider; within that
+// provider, the first model with default: true, else the
+// first model. This is the same fallback chain the
+// server applies server-side, computed once on the client
+// so the chat NSelect can show a real value before any
+// session is created / before any user pick.
+export async function loadProviders() {
+  try {
+    const r = await api.listProviders()
+    const ps = r.providers || []
+    state.providers = ps
+    if (ps.length === 0) {
+      state.defaultModel = null
+      return
+    }
+    const def = ps.find(p => p.is_default) || ps[0]
+    const m = (def.models || []).find(x => x.default) || (def.models || [])[0]
+    if (def && m) {
+      state.defaultModel = { provider: def.name, model: m.name }
+    } else if (def && def.model) {
+      // Legacy single-model form.
+      state.defaultModel = { provider: def.name, model: def.model }
+    } else {
+      state.defaultModel = null
+    }
+  } catch {
+    state.defaultModel = null
   }
 }
 
 export async function createSession(): Promise<string> {
   const { id } = await api.createSession()
-  state.sessions.unshift({ id, title: '(新会话)', created_at: Date.now() / 1000, updated_at: Date.now() / 1000 })
+  // Fetch the freshly created session's resolved meta from
+  // the server. The server's sessionToResponse applies the
+  // per-session override → global default chain for
+  // provider/model, so this is the only place we get a
+  // guaranteed-correct default value to seed state.sessions
+  // with. Without this round-trip the chat NSelect would
+  // stay empty until the user manually picked a model.
+  let resolved: Session | null = null
+  try {
+    resolved = await api.getSession(id)
+  } catch {
+    // Non-fatal: switchSession will still set up a
+    // sessionMeta entry; currentMeta falls back to
+    // state.defaultModel.
+  }
+  const fresh: Session = resolved || {
+    id,
+    title: '(新会话)',
+    created_at: Date.now() / 1000,
+    updated_at: Date.now() / 1000,
+  }
+  // If the server returned a session with the
+  // already-resolved title (it does — sessionToResponse
+  // always returns the persisted title), use it; otherwise
+  // keep the placeholder.
+  state.sessions.unshift(fresh)
   await switchSession(id)
   return id
 }
