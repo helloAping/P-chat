@@ -16,6 +16,7 @@ import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import SubAgentCard from './SubAgentCard.vue'
 import LoadingDots from './LoadingDots.vue'
+import TypedText from './TypedText.vue'
 
 const props = defineProps<{ message: Message; streaming?: boolean }>()
 
@@ -59,6 +60,24 @@ function shortWarnText(t?: string): string {
   return `${name} · model does not support image input`
 }
 
+// lastTextPartIndex returns the index in `parts` of the
+// trailing text part, or -1 if there isn't one. The
+// bubble uses this to decide which text part should
+// run the typewriter animation: only the last one,
+// since earlier text parts are no longer growing.
+function lastTextPartIndex(parts: MessagePart[] | undefined): number {
+  if (!parts) return -1
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i].kind === 'text') return i
+  }
+  return -1
+}
+const lastTextIdx = computed(() =>
+  props.message.role === 'assistant'
+    ? lastTextPartIndex(props.message.parts)
+    : -1,
+)
+
 // Show the loading-dots placeholder when the
 // assistant is streaming but no content / thinking /
 // tool part has arrived yet. (Without this, the user
@@ -74,6 +93,17 @@ const showLoadingDots = computed(() => {
 const hasTokens = computed(() =>
   props.message.role === 'assistant'
   && (props.message.tokens_in || props.message.tokens_out)
+)
+
+// "Image not supported" — when the LLM rejects the
+// user's image with the "this model does not support
+// image input" error, the chat store tags the trailing
+// user message with `visionUnsupported: true`. We
+// surface a dedicated chip under the attachments so
+// the user can see *why* the image was ignored, even
+// after the toast disappears.
+const showVisionWarn = computed(() =>
+  props.message.role === 'user' && props.message.visionUnsupported === true,
 )
 </script>
 
@@ -107,6 +137,19 @@ const hasTokens = computed(() =>
           </template>
         </div>
 
+        <!-- Vision-not-supported warning chip. Shown when the
+             LLM rejected the user's image with the "this
+             model does not support image input" error. The
+             chat store sets `message.visionUnsupported: true`
+             on the trailing user message when that error
+             arrives. Sits just below the attachments / text
+             so the user can see *why* the image was ignored. -->
+        <div v-if="showVisionWarn" class="vision-warn">
+          <span class="warn-icon">⚠</span>
+          <span class="warn-text">图片未处理：当前模型不支持图片输入</span>
+          <span class="warn-hint">切换到支持视觉的模型（如 gpt-4o / claude-3.5+）后重新发送</span>
+        </div>
+
         <!-- User / system: markdown of `content` -->
         <div
           v-if="message.role === 'user' || message.role === 'system'"
@@ -117,7 +160,11 @@ const hasTokens = computed(() =>
         <!-- Assistant: parts-driven render.
              Falls back to markdown of `content` for
              messages loaded from history (no parts
-             were persisted server-side). -->
+             were persisted server-side).
+             The last text part runs the typewriter
+             animation while the bubble is streaming —
+             earlier text parts and the post-stream view
+             are rendered without animation. -->
         <template v-if="message.role === 'assistant'">
           <template v-if="message.parts && message.parts.length">
             <template v-for="(p, i) in message.parts" :key="i">
@@ -128,6 +175,11 @@ const hasTokens = computed(() =>
               />
               <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
               <SubAgentCard v-else-if="p.kind === 'sub_agent'" :part="p" />
+              <TypedText
+                v-else-if="p.kind === 'text' && i === lastTextIdx && streaming"
+                :text="p.text || ''"
+                :active="true"
+              />
               <div
                 v-else-if="p.kind === 'text'"
                 class="md-body"
@@ -242,6 +294,27 @@ const hasTokens = computed(() =>
 }
 .warn-icon { color: var(--warn); }
 .warn-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Full-width "image not supported" warning that sits under
+ * a user message's attachments. Used when the LLM rejected
+ * the image with a vision_unsupported error — the inline
+ * msg-image-warn chip is per-attachment; this is the
+ * higher-level "the whole image was skipped" notice that
+ * the chat store tags on the message itself. */
+.vision-warn {
+  display: flex; align-items: center; gap: 6px;
+  flex-wrap: wrap;
+  background: var(--warn-soft);
+  border: 1px dashed var(--warn);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-2);
+  margin: 6px 0 4px 0;
+}
+.vision-warn .warn-icon { color: var(--warn); font-size: 14px; }
+.vision-warn .warn-text { color: var(--text); font-weight: 500; }
+.vision-warn .warn-hint { color: var(--text-3); font-size: 11px; }
 
 /* The pulsing animation. The bubble's border stays
  * solid; only its opacity breathes. While the new

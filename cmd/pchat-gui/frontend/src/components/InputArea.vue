@@ -241,8 +241,17 @@ async function send() {
         // toast notifications. Per-event errors
         // (e.g. tool execution failure) flow through
         // appendStreamEvent and are rendered inline.
+        // Errors with a suggestion get a longer-duration
+        // toast so the user has time to read the fix
+        // hint (especially the vision_unsupported case
+        // where the toast is the first place they see
+        // the actionable advice).
         if (ev.type === 'error' && ev.error) {
-          message.error(ev.error)
+          if (ev.suggestion) {
+            message.error(`${ev.error}\n${ev.suggestion}`, { duration: 8000 })
+          } else {
+            message.error(ev.error)
+          }
           return
         }
         appendStreamEvent(id, ev)

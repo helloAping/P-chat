@@ -567,7 +567,41 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // user sees it. The MessageBubble also styles
       // it as a soft-error variant.
       appendTextPart(m, ev.error ? `\n\n⚠ ${ev.error}\n` : '\n\n⚠ (stream error)\n')
+      // Vision-unsupported errors get extra treatment:
+      // tag the trailing user message so the bubble
+      // shows a dedicated warning chip under the
+      // attachments. The chip outlives the toast and
+      // tells the user *which* image was ignored and
+      // how to fix it.
+      if (ev.error_kind === 'vision_unsupported') {
+        markVisionUnsupported(id)
+      }
       break
+  }
+}
+
+// markVisionUnsupported finds the trailing user message in
+// the given session and sets `visionUnsupported: true`. Used
+// when the LLM rejects the user's image with the
+// "model does not support image input" error. Idempotent —
+// if the message is already tagged, this is a no-op so
+// re-rendering the same error event is safe.
+function markVisionUnsupported(id: string) {
+  const msgs = state.sessionMessages[id]
+  if (!msgs) return
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m.role === 'user') {
+      m.visionUnsupported = true
+      return
+    }
+    if (m.role === 'assistant') {
+      // Walk past the assistant turn that produced the
+      // error; the user message that triggered it is
+      // somewhere above. If we hit the top of the
+      // session without finding one, the message has
+      // been pruned and we drop the tag silently.
+    }
   }
 }
 

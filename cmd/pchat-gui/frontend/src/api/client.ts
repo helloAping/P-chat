@@ -110,6 +110,16 @@ export interface Message {
   tokens_in?: number
   tokens_out?: number
   elapsed?: string
+  // visionUnsupported is set on a *user* message when the
+  // LLM rejected the user's image with the "this model
+  // does not support image input" error. The chat store
+  // tags the trailing user message when the error event
+  // (ErrorKind === "vision_unsupported") arrives. The
+  // MessageBubble renders a clear warning chip below
+  // the attachment so the user sees *why* the image was
+  // ignored, even after the toast disappears. Only
+  // meaningful on role==="user".
+  visionUnsupported?: boolean
 }
 
 export interface SessionMeta {
@@ -486,6 +496,14 @@ export interface StreamEvent {
   model?: string
   error?: string
   suggestion?: string
+  // error_kind is the classification of the error
+  // ("auth_error", "rate_limit", "vision_unsupported", …).
+  // Populated by the server's chunkToEvent when the
+  // classifier identifies the error. The chat store
+  // uses "vision_unsupported" specifically to tag the
+  // trailing user message with visionUnsupported: true
+  // so the MessageBubble can render a clear chip.
+  error_kind?: string
 }
 
 export async function streamMessages(sessionId: string, opts: SendOptions): Promise<void> {
