@@ -48,6 +48,17 @@ type MessagePart struct {
 	Parts    []MessagePart `json:"parts,omitempty"`
 }
 
+// nativeToolCall is the parsed form of a tool call, whether it
+// arrived as a native LLM tool_call delta or was extracted from a
+// markdown tool_call fence in the content. The agent uses this to
+// dispatch tool execution and to build the assistant message's
+// persistence metadata.
+type nativeToolCall struct {
+	ID       string
+	Name     string
+	ArgsJSON string
+}
+
 // partsAccumulator mutates a `[]MessagePart` in place as
 // ChatStreamChunk events arrive. It's safe to call from multiple
 // goroutines (the LLM-stream reader in the main loop, plus the

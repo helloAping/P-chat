@@ -21,8 +21,6 @@ import (
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
-
-	openai "github.com/sashabaranov/go-openai"
 )
 
 type Agent struct {
@@ -164,26 +162,17 @@ func (a *Agent) modelSupportsVision(providerName, modelName string) bool {
 }
 
 type ChatRequest struct {
-	Style    style.Style   `json:"style"`
-	Messages []llm.Message `json:"messages"`
-	Provider string        `json:"provider,omitempty"`
-	// Model is the per-request model name. When non-empty, the LLM
-	// client uses it for this call (overriding the shared
-	// providerEntry.model). When empty, the provider's default
-	// applies. This is what lets multiple sessions on the same
-	// provider use different models concurrently without racing.
-	Model string `json:"model,omitempty"`
+	Style    style.Style       `json:"style"`
+	Messages []llm.ChatMessage `json:"messages"`
+	Provider string            `json:"provider,omitempty"`
+	Model    string            `json:"model,omitempty"`
 	// Attachments are file ids the user attached to this turn.
-	// Resolved to on-disk paths via the agent's AttachmentResolver
-	// and expanded into the last user message's MultiContent
-	// before being sent to the LLM. Nil/empty = no attachments.
-	// Both OpenAI and Anthropic protocols consume the same
-	// MultiContent representation at this layer; the LLM client
-	// serialises per protocol at the wire boundary.
+	// Expanded into the message list as separate ChatMessage
+	// entries (text + image/file) before being sent to the LLM.
+	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
 	// PlanMode, when true, asks the LLM to produce a step-by-step
-	// plan in plain text instead of executing tools. The agent will
-	// inject a system hint and skip the tool loop.
+	// plan in plain text instead of executing tools.
 	PlanMode bool `json:"plan_mode,omitempty"`
 }
 
@@ -253,11 +242,10 @@ type ChatStreamChunk struct {
 // between rounds within a chat, AND between chats within a session. The
 // only thing that should change in this string is the underlying files
 // (AGENTS.md, rules, skills) or the chosen style.
-func (a *Agent) buildStaticSystemPrompt(s style.Style, openAITools []openai.Tool) (string, string, error) {
-	// Build a signature so we can skip rebuilding when nothing changed.
-	toolNames := make([]string, 0, len(openAITools))
-	for _, t := range openAITools {
-		toolNames = append(toolNames, t.Function.Name)
+func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef) (string, string, error) {
+	toolNames := make([]string, 0, len(toolDefs))
+	for _, t := range toolDefs {
+		toolNames = append(toolNames, t.Name)
 	}
 	lang := ""
 	if a.cfg != nil {
@@ -298,7 +286,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, openAITools []openai.Tool
 	sb.WriteString("\n---\n\n")
 
 	// 5. Tool hint — stable per session (tools don't change at runtime).
-	if len(openAITools) > 0 {
+	if len(toolDefs) > 0 {
 		sb.WriteString(buildToolHint(a.tools.List()))
 		// Encourage the LLM to consult its knowledge base before
 		// answering questions it might not know. The `recall` tool
@@ -456,8 +444,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 		ch <- ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."}
 		availableTools := a.tools.List()
-		openAITools := llm.ToolsFromRegistry(availableTools)
-		if len(openAITools) > 0 {
+		toolDefs := llm.ToolsFromRegistryDef(availableTools)
+		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
 			for _, t := range availableTools {
 				names = append(names, t.Name)
@@ -465,59 +453,42 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			ch <- ChatStreamChunk{Phase: "tools", Step: "tools", Message: fmt.Sprintf("可用工具 (%d): %s", len(availableTools), strings.Join(names, ", "))}
 		} else {
 			ch <- ChatStreamChunk{Phase: "tools", Step: "tools", Message: "未注册任何工具"}
-			openAITools = nil
+			toolDefs = nil
 		}
 
 		ch <- ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."}
-		// The static system prompt is built ONCE per session (or whenever the
-		// underlying files / style change). It's identical between rounds,
-		// so the LLM's prefix cache hits on it across rounds.
-		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, openAITools)
+		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs)
 		if err != nil {
 			ch <- ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true}
 			return
 		}
 		ch <- ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))}
 
-		msgs := []llm.Message{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+		// Build the message list: system prompt + user messages.
+		// Each message is a separate protocol-agnostic ChatMessage.
+		msgs := []llm.ChatMessage{
+			{Role: llm.RoleSystem, Type: llm.TypeText, Content: systemPrompt},
 		}
 		msgs = append(msgs, req.Messages...)
 
-		// Expand any user-uploaded attachments into the trailing
-		// user message's MultiContent. The expansion is
-		// protocol-agnostic at the agent layer — both OpenAI and
-		// Anthropic consume the same MultiContent representation
-		// (text + image_url parts); the LLM client serialises
-		// per protocol at the wire boundary.
+		// Expand any user-uploaded attachments into separate
+		// ChatMessage entries (text msg + image/file msgs).
 		if len(req.Attachments) > 0 && a.attach != nil {
 			protocol := a.protocolFor(req.Provider)
-			// Resolve the active provider+model so we can skip
-			// image parts for models that don't accept vision
-			// input. Without this check the upstream model would
-			// reject the request with a confusing "this model does
-			// not support image input" error.
 			vision := func() bool { return a.modelSupportsVision(req.Provider, req.Model) }
-			msgs = ExpandAttachments(protocol, msgs, req.Attachments, a.attach, vision)
+			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision)
 			ch <- ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))}
 		}
 
 		if a.store != nil {
 			ch <- ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入消息到记忆")}
-			// Persist the EXPANDED trailing user message (which now
-			// carries the MultiContent / image_url parts) rather than
-			// the raw req.Messages. Without this the image / file
-			// payload is lost when the conversation is replayed on the
-			// next turn — the LLM would then try to re-fetch the file
-			// via read_file and fail.
-			last := msgs[len(msgs)-1]
-			if len(last.MultiContent) > 0 {
-				mcJSON, _ := json.Marshal(last.MultiContent)
-				a.store.AddMessageWithMeta(last, map[string]string{
-					"multi_content": string(mcJSON),
-				})
-			} else {
-				a.store.AddMessage(last)
+			// Persist all user-facing messages (including
+			// image attachments as separate rows).
+			for _, m := range msgs {
+				if m.Role == llm.RoleSystem {
+					continue
+				}
+				a.store.AddChatMessage(m)
 			}
 		}
 
@@ -526,7 +497,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// before actually executing it.
 		maxRounds := 5
 		if req.PlanMode {
-			openAITools = nil // disable tool calls for this turn
+			toolDefs = nil
 			msgs[0].Content += "\n\n---\n\n## Plan Mode\n\n" +
 				"你正在 PLAN MODE：不要调用任何工具。\n" +
 				"请用纯文本给出 step-by-step 执行计划：\n" +
@@ -543,18 +514,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 		var totalIn, totalOut int
 
-		useNativeTools := len(openAITools) > 0
-
 		for round := 0; round < maxRounds; round++ {
 			roundStart := time.Now()
 			roundNum := round + 1
-			// Each round gets its own parts accumulator so
-			// the persisted assistant message only carries
-			// that round's thinking / text / tools. Before
-			// this reset every round's snapshot included all
-			// previous rounds, producing duplication on
-			// reload and making long multi-round
-			// conversations show repeated thinking blocks.
 			partsAcc = newPartsAccumulator()
 
 			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 调用 LLM", roundNum, maxRounds), Round: roundNum, MaxRound: maxRounds}
@@ -566,16 +528,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				argsAccum    = make(map[int]*nativeToolCall)
 			)
 
-			stream := a.llm.ChatStreamWithOptions(ctx, req.Provider, req.Model, msgs, openAITools, a.options)
+			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, msgs, toolDefs, a.options)
 			for chunk := range stream {
 				if chunk.Err != nil {
-					// Classify the upstream error so the user
-					// gets a Chinese message + a useful
-					// suggestion instead of a raw English
-					// string. The classification also flags
-					// vision-unsupported as a distinct
-					// category the UI can render as a chip on
-					// the offending user message.
 					classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
 					errMsg, errSuggestion, errKind := chunk.Err.Error(), "", ""
 					if apiErr, ok := classified.(*llm.APIError); ok {
@@ -609,13 +564,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					ch <- ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut}
 				}
 				if chunk.Thinking != "" {
-					// Forward thinking deltas as their own
-					// StreamChunk so the UI can render them
-					// separately (DeepSeek-style
-					// collapsible block). The TokensIn/Out
-					// are passed through so the assistant
-					// message can show a running token
-					// total while still streaming.
 					fullThinking += chunk.Thinking
 					partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
 					ch <- ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut}
@@ -642,90 +590,56 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, maxRounds, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
 
-			// If the LLM did not emit native tool calls, fall back to the
-			// legacy markdown block parser.
 			if len(toolCalls) == 0 {
 				toolCalls = parseMarkdownToolCalls(fullContent)
-				if len(toolCalls) > 0 {
-					useNativeTools = false
-				}
 			}
 
-			// Build the assistant message we record in the conversation.
-			assistantMsg := openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleAssistant,
+			// Build the assistant message for the conversation.
+			// Emit as a single text ChatMessage (tool calls are
+			// separate messages appended below).
+			assistantMsg := llm.ChatMessage{
+				Role:    llm.RoleAssistant,
+				Type:    llm.TypeText,
 				Content: fullContent,
-			}
-			if useNativeTools && len(toolCalls) > 0 {
-				assistantMsg.ToolCalls = make([]openai.ToolCall, 0, len(toolCalls))
-				for _, tc := range toolCalls {
-					// Each tool call needs an ID and a Type field.
-					id := tc.ID
-					if id == "" {
-						id = "call_" + uuid.NewString()
-					}
-					assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, openai.ToolCall{
-						ID:   id,
-						Type: openai.ToolTypeFunction,
-						Function: openai.FunctionCall{
-							Name:      tc.Name,
-							Arguments: tc.ArgsJSON,
-						},
-					})
-				}
 			}
 			msgs = append(msgs, assistantMsg)
 
-			// Always save the assistant message to the store, even when
-			// it has tool_calls (so the next turn can replay the full
-			// conversation including the tool calls). For empty content
-			// (rare; LLM responded only with tool calls) we still save it
-			// because the tool_calls field is what matters.
+			// Persist the assistant text message.
 			if a.store != nil {
 				meta := map[string]string{
 					"role":   assistantMsg.Role,
 					"reason": "assistant",
 				}
-				if len(assistantMsg.ToolCalls) > 0 {
-					// Persist tool_calls so the next turn's history replay
-					// can re-send them to the LLM. Without this the LLM
-					// sees tool result messages with tool_call_id values
-					// that don't match any tool call in the preceding
-					// assistant message, which the API rejects with
-					// "MissingParameter messages.tool_call_id".
-					if tcJSON, tcErr := json.Marshal(assistantMsg.ToolCalls); tcErr == nil {
-						meta["tool_calls"] = string(tcJSON)
-					}
-				}
-				// Persist the rendered parts (text + thinking +
-				// tool + sub-agent) as JSON. When the user
-				// reopens this session, GET /sessions/:id/messages
-				// reads this back and the chat UI replays the
-				// full view (thinking block, tool cards, sub-
-				// agent cards) instead of just the plain text
-				// content. Without this the user's previous
-				// reasoning and tool invocations vanish on every
-				// reload.
-				//
-				// Storage design:
-				//   - Thinking: raw string in meta["thinking"]
-				//     (no JSON double-encode).
-				//   - Text: derived from message content on
-				//     reload (no duplication).
-				//   - Tool + sub-agent: compact JSON in
-				//     meta["parts"] (only structural info).
 				if fullThinking != "" {
 					meta["thinking"] = fullThinking
 				}
-				// Keep only structural parts (tool + sub_agent);
-				// thinking and text are stored elsewhere.
 				structural := snapshotStructural(partsAcc)
 				if len(structural) > 0 {
 					if pj, pjErr := json.Marshal(structural); pjErr == nil {
 						meta["parts"] = string(pj)
 					}
 				}
-				a.store.AddMessageWithMeta(assistantMsg, meta)
+				a.store.AddChatMessageWithMeta(assistantMsg, meta)
+			}
+
+			// Append tool_call messages for each tool call.
+			for _, tc := range toolCalls {
+				id := tc.ID
+				if id == "" {
+					id = "call_" + uuid.NewString()
+				}
+				tcm := llm.ChatMessage{
+					Role:      llm.RoleAssistant,
+					Type:      llm.TypeToolCall,
+					ToolID:    id,
+					ToolName:  tc.Name,
+					ToolInput: tc.ArgsJSON,
+				}
+				msgs = append(msgs, tcm)
+				if a.store != nil {
+					a.store.AddChatMessage(tcm)
+				}
+				tc.ID = id
 			}
 
 			if len(toolCalls) == 0 {
@@ -865,16 +779,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(errChunk)
 					ch <- errChunk
-					toolMsg := openai.ChatCompletionMessage{
-						Role:       openai.ChatMessageRoleTool,
-						Content:    fmt.Sprintf("error: %s\n\n工具 %s 执行失败。请分析错误原因后调整方案并重试；反复失败请告知用户。", errMsg, tc.Name),
-						ToolCallID: tc.ID,
+					toolMsg := llm.ChatMessage{
+						Role:      llm.RoleTool,
+						Type:      llm.TypeToolResult,
+						Content:   fmt.Sprintf("error: %s\n\n工具 %s 执行失败。请分析错误原因后调整方案并重试；反复失败请告知用户。", errMsg, tc.Name),
+						ToolID:    tc.ID,
+						ToolName:  tc.Name,
+						ToolError: true,
 					}
 					msgs = append(msgs, toolMsg)
 					if a.store != nil {
-						a.store.AddMessageWithMeta(toolMsg, map[string]string{
-							"tool_call_id": tc.ID,
-						})
+						a.store.AddChatMessage(toolMsg)
 					}
 					continue
 				}
@@ -907,20 +822,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			} else {
 				llmContent = truncateToolResult(tc.Name, result.Content)
 			}
-				msgs = append(msgs, openai.ChatCompletionMessage{
-					Role:       openai.ChatMessageRoleTool,
-					Content:    llmContent,
-					ToolCallID: tc.ID,
-				})
+				toolMsg := llm.ChatMessage{
+					Role:      llm.RoleTool,
+					Type:      llm.TypeToolResult,
+					Content:   llmContent,
+					ToolID:    tc.ID,
+					ToolName:  tc.Name,
+					ToolError: result.IsError,
+				}
+				msgs = append(msgs, toolMsg)
 				if a.store != nil {
-					a.store.AddMessageWithMeta(openai.ChatCompletionMessage{
-						Role:       openai.ChatMessageRoleTool,
-						Content:    llmContent,
-						ToolCallID: tc.ID,
-					}, map[string]string{
-						"tool_call_id": tc.ID,
-						"tool_name":    tc.Name,
-					})
+					a.store.AddChatMessage(toolMsg)
 				}
 			}
 		}
@@ -940,12 +852,6 @@ func formatElapsed(d time.Duration) string {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
-}
-
-type nativeToolCall struct {
-	ID       string
-	Name     string
-	ArgsJSON string
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction

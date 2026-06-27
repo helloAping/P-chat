@@ -62,9 +62,17 @@ func (b anthropicBlocksRaw) MarshalJSON() ([]byte, error) {
 }
 
 type anthropicContentBlock struct {
-	Type   string                  `json:"type"`
-	Text   string                  `json:"text,omitempty"`
+	Type   string                   `json:"type"`
+	Text   string                   `json:"text,omitempty"`
 	Source *anthropicContentSource  `json:"source,omitempty"`
+	// Tool use fields
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+	// Tool result fields
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
 }
 
 // anthropicContentSource is the per-block source field. Used by
@@ -82,6 +90,13 @@ type anthropicRequest struct {
 	Messages  []anthropicMessage `json:"messages"`
 	Stream    bool               `json:"stream"`
 	System    string             `json:"system,omitempty"`
+	Tools     []anthropicTool    `json:"tools,omitempty"`
+}
+
+type anthropicTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
 }
 
 type anthropicResponse struct {

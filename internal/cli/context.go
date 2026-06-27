@@ -13,10 +13,10 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/httpcli"
+	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
-	openai "github.com/sashabaranov/go-openai"
 )
 
 // cliContext abstracts everything slash commands need to know about
@@ -867,9 +867,9 @@ func (c *httpContext) AgentsContext() (string, string, error) {
 
 // lastUserContent extracts the trailing user message from a list
 // of agent messages, matching the chat command's normal use.
-func lastUserContent(msgs []openai.ChatCompletionMessage) string {
+func lastUserContent(msgs []llm.ChatMessage) string {
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == openai.ChatMessageRoleUser {
+		if msgs[i].Role == llm.RoleUser {
 			return msgs[i].Content
 		}
 	}
@@ -952,12 +952,13 @@ func runLocalPlan(ctx cliContext, args string) error {
 	}
 
 	// Build the request: full history + the task as a user message.
-	msgs := []openai.ChatCompletionMessage{}
+	msgs := []llm.ChatMessage{}
 	if r.store != nil {
-		msgs = append(msgs, r.store.GetMessages()...)
+		msgs = append(msgs, r.store.GetChatMessages()...)
 	}
-	msgs = append(msgs, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
+	msgs = append(msgs, llm.ChatMessage{
+		Role:    llm.RoleUser,
+		Type:    llm.TypeText,
 		Content: task,
 	})
 
@@ -1058,7 +1059,7 @@ func runLocalPlan(ctx cliContext, args string) error {
 // runLocalExecutePlan runs the approved plan by sending the
 // assistant plan + a "go" user message back to the LLM. Lives in
 // repl.go alongside runLocalPlan.
-func runLocalExecutePlan(ctx cliContext, msgs []openai.ChatCompletionMessage, plan, provModel, task string) error {
+func runLocalExecutePlan(ctx cliContext, msgs []llm.ChatMessage, plan, provModel, task string) error {
 	lc := asLocalContext(ctx)
 	r := lc.r
 	color.Green("  ✓ 已批准。开始执行...")
@@ -1066,11 +1067,13 @@ func runLocalExecutePlan(ctx cliContext, msgs []openai.ChatCompletionMessage, pl
 	planReq := agent.ChatRequest{
 		Style:    r.style,
 		Provider: r.provider,
-		Messages: append(msgs, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleAssistant,
+		Messages: append(msgs, llm.ChatMessage{
+			Role:    llm.RoleAssistant,
+			Type:    llm.TypeText,
 			Content: plan,
-		}, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleUser,
+		}, llm.ChatMessage{
+			Role:    llm.RoleUser,
+			Type:    llm.TypeText,
 			Content: "好的，请按计划执行。",
 		}),
 	}

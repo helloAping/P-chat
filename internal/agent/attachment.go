@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/p-chat/pchat/internal/llm"
-	"github.com/sashabaranov/go-openai"
+	openai "github.com/sashabaranov/go-openai"
 )
 
 // Attachment describes a user-uploaded file that hangs off a
@@ -93,7 +93,116 @@ func (r *DiskAttachmentResolver) Resolve(a Attachment) (string, int64) {
 	return "", 0
 }
 
-// expandAttachments walks req.Attachments, reads each file from
+// --- New ChatMessage-based attachment expansion ---
+
+// ExpandAttachmentsCM converts a list of Attachment objects into
+// separate llm.ChatMessage entries (one text msg + one per
+// attachment). Each image/audio/file becomes its own row with
+// type=image/audio/file and Content as raw base64. Text
+// attachments are inlined as type=text blocks.
+//
+// visionCapable is an optional callback; when it returns false,
+// image attachments are replaced with a text marker.
+func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachment, r AttachmentResolver, visionCapable func() bool) []llm.ChatMessage {
+	if len(atts) == 0 || r == nil {
+		return msgs
+	}
+
+	// Find the last user message and split text + attachments
+	// into separate ChatMessage rows. All user text stays
+	// first, then each attachment appends after.
+	var result []llm.ChatMessage
+	for _, m := range msgs {
+		result = append(result, m)
+	}
+
+	for _, a := range atts {
+		data, _ := resolveAttachmentData(a, r)
+		if data == nil {
+			continue
+		}
+
+		switch a.Kind {
+		case "image":
+			mime := imageMIME(a.Name, a.MIME)
+			if visionCapable != nil && !visionCapable() {
+				result = append(result, llm.ChatMessage{
+					Role:    llm.RoleUser,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("(attached image: %s, %d bytes — current model does not support image input)", a.Name, len(data)),
+				})
+				continue
+			}
+			result = append(result, llm.ChatMessage{
+				Role:     llm.RoleUser,
+				Type:     llm.TypeImage,
+				Content:  base64.StdEncoding.EncodeToString(data),
+				Name:     a.Name,
+				MimeType: mime,
+			})
+		case "audio":
+			result = append(result, llm.ChatMessage{
+				Role:    llm.RoleUser,
+				Type:    llm.TypeText,
+				Content: fmt.Sprintf("(attached audio: %s, %d bytes, MIME=%s)", a.Name, len(data), a.MIME),
+			})
+		case "text":
+			const maxTextDump = 200 << 10
+			body := string(data)
+			if len(body) > maxTextDump {
+				body = body[:maxTextDump] + "\n... (truncated)"
+			}
+			result = append(result, llm.ChatMessage{
+				Role:    llm.RoleUser,
+				Type:    llm.TypeText,
+				Content: fmt.Sprintf("--- %s ---\n%s", a.Name, body),
+			})
+		default:
+			result = append(result, llm.ChatMessage{
+				Role:    llm.RoleUser,
+				Type:    llm.TypeText,
+				Content: fmt.Sprintf("(attached file: %s, %d bytes, kind=%s)", a.Name, len(data), a.Kind),
+			})
+		}
+	}
+	return result
+}
+
+// resolveAttachmentData returns the raw bytes for an attachment.
+// Inlined data (URL or Data field) is preferred; otherwise the
+// resolver is used to read from disk.
+func resolveAttachmentData(a Attachment, r AttachmentResolver) ([]byte, string) {
+	inlineRaw := a.Data
+	if a.URL != "" {
+		inlineRaw = a.URL
+	}
+	if inlineRaw != "" {
+		if a.Kind == "text" {
+			return []byte(inlineRaw), inlineRaw
+		}
+		cleaned := strings.TrimPrefix(inlineRaw, "data:")
+		if i := strings.Index(cleaned, ";base64,"); i >= 0 {
+			cleaned = cleaned[i+len(";base64,"):]
+		}
+		decoded, err := base64.StdEncoding.DecodeString(cleaned)
+		if err != nil {
+			return nil, ""
+		}
+		return decoded, inlineRaw
+	}
+
+	path, _ := r.Resolve(a)
+	if path == "" {
+		return nil, ""
+	}
+	read, err := os.ReadFile(path)
+	if err != nil {
+		return nil, ""
+	}
+	return read, path
+}
+
+// --- Legacy attachment expansion (kept for backward compat) ---
 // disk via the resolver, and returns a NEW user message that
 // replaces the trailing user message in req.Messages with a
 // multi-part OpenAI content array (text + image_url /

@@ -23,7 +23,6 @@ import (
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
-	openai "github.com/sashabaranov/go-openai"
 )
 
 // Request is what the main agent passes to the runner.
@@ -377,8 +376,8 @@ func (d *Default) Run(ctx context.Context, req Request) (Result, error) {
 	chatReq := agent.ChatRequest{
 		Style:    s,
 		Provider: prov,
-		Messages: []llm.Message{
-			{Role: openai.ChatMessageRoleUser, Content: req.Description},
+		Messages: []llm.ChatMessage{
+			{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Description},
 		},
 	}
 

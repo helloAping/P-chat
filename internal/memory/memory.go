@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -311,7 +312,248 @@ func (s *Store) AddMessageWithMeta(msg llm.Message, meta map[string]string) {
 	}
 }
 
-// Flush writes any pending messages to disk.
+// AddChatMessage records a ChatMessage (protocol-agnostic format).
+// It automatically encodes metadata based on the message type
+// so that GetChatMessages() can restore the full message shape.
+func (s *Store) AddChatMessage(msg llm.ChatMessage) {
+	meta := encodeChatMeta(msg)
+	b, _ := json.Marshal(meta)
+	s.pendingMu.Lock()
+	s.pendingWrites = append(s.pendingWrites, Message{
+		ConversationID: s.currentID,
+		Role:           msg.Role,
+		Content:        msg.Content,
+		CreatedAt:      time.Now(),
+		Metadata:       string(b),
+	})
+	full := len(s.pendingWrites) >= s.maxPending
+	s.pendingMu.Unlock()
+	if full {
+		_ = s.Flush()
+	}
+}
+
+// AddChatMessageWithMeta records a ChatMessage with additional
+// metadata. extraMeta is merged into the auto-generated metadata
+// from encodeChatMeta (auto-generated keys take precedence so
+// the canonical fields are preserved unless extraMeta explicitly
+// overwrites them).
+func (s *Store) AddChatMessageWithMeta(msg llm.ChatMessage, extraMeta map[string]string) {
+	m := encodeChatMeta(msg)
+	for k, v := range extraMeta {
+		m[k] = v
+	}
+	b, _ := json.Marshal(m)
+	s.pendingMu.Lock()
+	s.pendingWrites = append(s.pendingWrites, Message{
+		ConversationID: s.currentID,
+		Role:           msg.Role,
+		Content:        msg.Content,
+		CreatedAt:      time.Now(),
+		Metadata:       string(b),
+	})
+	full := len(s.pendingWrites) >= s.maxPending
+	s.pendingMu.Unlock()
+	if full {
+		_ = s.Flush()
+	}
+}
+
+// GetChatMessages returns the current conversation's history as
+// protocol-agnostic ChatMessage values. It handles both the new
+// metadata format and the legacy format.
+func (s *Store) GetChatMessages() []llm.ChatMessage {
+	msgs, _, _ := s.GetChatMessagesWithMeta()
+	return msgs
+}
+
+// GetChatMessagesWithMeta returns ChatMessage history alongside
+// raw metadata strings and creation timestamps.
+func (s *Store) GetChatMessagesWithMeta() ([]llm.ChatMessage, []string, []int64) {
+	_ = s.Flush()
+	convID := s.currentID
+	if convID == "" {
+		return nil, nil, nil
+	}
+
+	limit := s.maxHistory
+	rows, err := s.db.Query(
+		`SELECT id, role, content, metadata, created_at FROM messages
+		 WHERE conversation_id = ?
+		 ORDER BY id DESC LIMIT ?`,
+		convID, limitOrHuge(limit),
+	)
+	if err != nil {
+		return nil, nil, nil
+	}
+	defer rows.Close()
+
+	type row struct {
+		msg     llm.ChatMessage
+		meta    string
+		created int64
+	}
+	var rev []row
+	for rows.Next() {
+		var (
+			id                    int64
+			role, content         string
+			metaStr               sql.NullString
+			created               int64
+		)
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created); err != nil {
+			break
+		}
+		meta := ""
+		if metaStr.Valid {
+			meta = metaStr.String
+		}
+		msgs := decodeChatMessages(role, content, meta)
+		for _, m := range msgs {
+			rev = append(rev, row{msg: m, meta: meta, created: created})
+		}
+	}
+	n := len(rev)
+	msgs := make([]llm.ChatMessage, n)
+	metas := make([]string, n)
+	createds := make([]int64, n)
+	for i := 0; i < n; i++ {
+		msgs[i] = rev[n-1-i].msg
+		metas[i] = rev[n-1-i].meta
+		createds[i] = rev[n-1-i].created
+	}
+	return msgs, metas, createds
+}
+
+// encodeChatMeta builds the canonical metadata map for a
+// ChatMessage.
+func encodeChatMeta(msg llm.ChatMessage) map[string]string {
+	m := make(map[string]string)
+	if msg.Type != "" {
+		m["type"] = msg.Type
+	}
+	if msg.Name != "" {
+		m["name"] = msg.Name
+	}
+	if msg.MimeType != "" {
+		m["mime_type"] = msg.MimeType
+	}
+	if msg.ToolID != "" {
+		m["tool_id"] = msg.ToolID
+	}
+	if msg.ToolName != "" {
+		m["tool_name"] = msg.ToolName
+	}
+	if msg.ToolInput != "" {
+		m["tool_input"] = msg.ToolInput
+	}
+	if msg.ToolError {
+		m["tool_error"] = "true"
+	}
+	return m
+}
+
+// decodeChatMessages decodes one row from the messages table into
+// one or more ChatMessage values. Handles both new format (type key)
+// and legacy format (multi_content / tool_calls / tool_call_id).
+func decodeChatMessages(role, content string, metaStr string) []llm.ChatMessage {
+	if metaStr == "" || metaStr == "{}" {
+		if content != "" {
+			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content}}
+		}
+		return nil
+	}
+
+	var meta map[string]string
+	if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
+		if content != "" {
+			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content}}
+		}
+		return nil
+	}
+
+	// New format: metadata has a "type" key.
+	if t, ok := meta["type"]; ok && t != "" {
+		return []llm.ChatMessage{{
+			Role:      role,
+			Type:      t,
+			Content:   content,
+			Name:      meta["name"],
+			MimeType:  meta["mime_type"],
+			ToolID:    meta["tool_id"],
+			ToolName:  meta["tool_name"],
+			ToolInput: meta["tool_input"],
+			ToolError: meta["tool_error"] == "true",
+		}}
+	}
+
+	// Legacy format: multi_content → split into separate messages.
+	if mcJSON, ok := meta["multi_content"]; ok && mcJSON != "" {
+		var parts []openai.ChatMessagePart
+		if err := json.Unmarshal([]byte(mcJSON), &parts); err == nil {
+			var msgs []llm.ChatMessage
+			for _, p := range parts {
+				switch p.Type {
+				case "text":
+					if p.Text != "" {
+						msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: p.Text})
+					}
+				case "image_url":
+					if p.ImageURL != nil {
+						data := extractBase64FromDataURL(p.ImageURL.URL)
+						msgs = append(msgs, llm.ChatMessage{
+							Role:    role,
+							Type:    llm.TypeImage,
+							Content: data,
+						})
+					}
+				}
+			}
+			if len(msgs) == 0 && content != "" {
+				msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: content})
+			}
+			return msgs
+		}
+	}
+
+	// Legacy format: tool_calls → assistant message + tool_call parts.
+	if tcJSON, ok := meta["tool_calls"]; ok && tcJSON != "" {
+		var tcs []openai.ToolCall
+		if err := json.Unmarshal([]byte(tcJSON), &tcs); err == nil {
+			var msgs []llm.ChatMessage
+			if content != "" {
+				msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: content})
+			}
+			for _, tc := range tcs {
+				msgs = append(msgs, llm.ChatMessage{
+					Role:      role,
+					Type:      llm.TypeToolCall,
+					ToolID:    tc.ID,
+					ToolName:  tc.Function.Name,
+					ToolInput: tc.Function.Arguments,
+				})
+			}
+			return msgs
+		}
+	}
+
+	// Legacy format: tool_call_id → tool_result message.
+	if tcID, ok := meta["tool_call_id"]; ok && tcID != "" {
+		return []llm.ChatMessage{{
+			Role:     llm.RoleTool,
+			Type:     llm.TypeToolResult,
+			Content:  content,
+			ToolID:   tcID,
+			ToolName: meta["tool_name"],
+		}}
+	}
+
+	// Fallback.
+	if content != "" {
+		return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content}}
+	}
+	return nil
+}
 func (s *Store) Flush() error {
 	s.pendingMu.Lock()
 	pending := s.pendingWrites
@@ -734,6 +976,21 @@ func limitOrHuge(n int) int {
 		return 1 << 30
 	}
 	return n
+}
+
+// extractBase64FromDataURL strips the "data:<mime>;base64," prefix
+// from a data: URL and returns the raw base64 payload.
+func extractBase64FromDataURL(s string) string {
+	const prefix = "data:"
+	if !strings.HasPrefix(s, prefix) {
+		return s
+	}
+	rest := s[len(prefix):]
+	idx := strings.Index(rest, ";base64,")
+	if idx < 0 {
+		return rest
+	}
+	return rest[idx+len(";base64,"):]
 }
 
 // ----- file helpers (used only during legacy migration) -----

@@ -17,7 +17,6 @@ import (
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
-	"github.com/sashabaranov/go-openai"
 )
 
 // Handler serves the P-Chat HTTP API. It holds references to the
@@ -849,85 +848,46 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// discards everything it doesn't recognise, which used to
 	// drop the parts silently — the user would reopen a
 	// session and see only the plain text.
-	msgs, metas, createds := h.store.GetMessagesWithMeta()
+	msgs, metas, createds := h.store.GetChatMessagesWithMeta()
 	out := make([]MessageResponse, 0, len(msgs))
 	for i, m := range msgs {
-		created := time.Now().Unix() // best-effort; exact ts requires schema change
+		created := time.Now().Unix()
 		if i < len(createds) && createds[i] != 0 {
 			created = createds[i]
 		}
 		resp := MessageResponse{
-			ID:         0, // not exposed individually yet
-			Role:       m.Role,
-			Content:    m.Content,
-			CreatedAt:  created,
-			ToolCallID: m.ToolCallID,
-			Name:       m.Name,
+			ID:        0,
+			Role:      m.Role,
+			Content:   m.Content,
+			CreatedAt: created,
+			Name:      m.Name,
 		}
-		// Restore the assistant message's structured parts
-		// (text + thinking + tool + sub-agent). The agent
-		// encodes them as JSON in messages.metadata under the
-		// "parts" key. Decoding is best-effort: a malformed
-		// row falls back to plain text only.
+
+		// Image messages: compute a data URL for the frontend.
+		if m.Type == llm.TypeImage && m.Content != "" {
+			mime := m.MimeType
+			if mime == "" {
+				mime = "image/png"
+			}
+			dataURL := "data:" + mime + ";base64," + m.Content
+			resp.Attachments = append(resp.Attachments, AttachmentPart{
+				Type: "image_url",
+				URL:  dataURL,
+				Name: m.Name,
+				Kind: "image",
+				MIME: mime,
+			})
+		}
+
+		// Tool call metadata.
+		if m.ToolID != "" {
+			resp.ToolCallID = m.ToolID
+		}
+
+		// Restore assistant parts from metadata.
 		if i < len(metas) && metas[i] != "" {
 			if parts := decodePartsFromMeta(metas[i], m.Content); len(parts) > 0 {
 				resp.Parts = parts
-			}
-		}
-		// Surface image / file attachments that were part of the
-		// user message so the UI can render them in the bubble.
-		// For user messages we lift the *first* plain text part
-		// back into `content` so the spoken text becomes the
-		// main bubble body and the attachments render as chips
-		// alongside it. This mirrors what the frontend already
-		// does at send time and means reloading a session after
-		// a server restart shows the same message layout.
-		if len(m.MultiContent) > 0 {
-			liftedText := false
-			for _, p := range m.MultiContent {
-				switch p.Type {
-				case "image_url":
-					url := ""
-					if p.ImageURL != nil {
-						url = p.ImageURL.URL
-					}
-					resp.Attachments = append(resp.Attachments, AttachmentPart{
-						Type: "image_url",
-						URL:  url,
-						MIME: mimeFromDataURL(url),
-						Kind: "image",
-					})
-				case "text":
-					// Skip the "image not supported" marker for
-					// user-message text-lifting: it's a system
-					// note, not what the user typed. It still
-					// gets emitted as an attachment so the UI
-					// can show the warning chip.
-					isWarn := strings.HasPrefix(p.Text, "(attached image:") && strings.Contains(p.Text, "does not support image input")
-					if m.Role == "user" && !liftedText && !isWarn {
-						resp.Content = p.Text
-						liftedText = true
-						continue
-					}
-					if isWarn {
-						resp.Attachments = append(resp.Attachments, AttachmentPart{
-							Type: "text",
-							Text: p.Text,
-							Name: "image-not-supported",
-							Kind: "image_not_supported",
-							MIME: "text/plain",
-						})
-						continue
-					}
-					name, kind, mime := inferTextPartMeta(p.Text)
-					resp.Attachments = append(resp.Attachments, AttachmentPart{
-						Type: "text",
-						Text: p.Text,
-						Name: name,
-						Kind: kind,
-						MIME: mime,
-					})
-				}
 			}
 		}
 		out = append(out, resp)
@@ -1086,11 +1046,12 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	h.setSessionMeta(id, string(s), provider, model)
 
 	// Build messages: history + new user message
-	histMsgs := h.store.GetMessages()
-	msgs := make([]openai.ChatCompletionMessage, 0, len(histMsgs)+1)
+	histMsgs := h.store.GetChatMessages()
+	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	msgs = append(msgs, histMsgs...)
-	msgs = append(msgs, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
+	msgs = append(msgs, llm.ChatMessage{
+		Role:    llm.RoleUser,
+		Type:    llm.TypeText,
 		Content: req.Message,
 	})
 

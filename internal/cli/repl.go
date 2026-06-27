@@ -20,7 +20,6 @@ import (
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/tool"
-	openai "github.com/sashabaranov/go-openai"
 
 	"golang.org/x/term"
 )
@@ -182,14 +181,13 @@ func (r *REPL) chat(input string) {
 	// We deliberately keep this list scoped to the *current* conversation.
 	// /new starts a fresh conversation, so this naturally isolates
 	// sessions even if the same REPL stays open.
-	msgs := []openai.ChatCompletionMessage{}
+	msgs := []llm.ChatMessage{}
 	if r.store != nil {
-		// GetMessages returns up to maxHistory messages, oldest first,
-		// already in llm.Message form (with tool_call_id re-attached).
-		msgs = append(msgs, r.store.GetMessages()...)
+		msgs = append(msgs, r.store.GetChatMessages()...)
 	}
-	msgs = append(msgs, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
+	msgs = append(msgs, llm.ChatMessage{
+		Role:    llm.RoleUser,
+		Type:    llm.TypeText,
 		Content: input,
 	})
 

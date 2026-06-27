@@ -71,7 +71,7 @@ func TestBuildStaticSystemPrompt_DifferentTools(t *testing.T) {
 	agt := New(cfg, llmClient, styleMgr, store, tools)
 
 	// Pass different tool sets; sig should differ.
-	openAITools := llm.ToolsFromRegistry([]tool.Tool{
+	openAITools := llm.ToolsFromRegistryDef([]tool.Tool{
 		{Name: "x", Description: "x"},
 	})
 

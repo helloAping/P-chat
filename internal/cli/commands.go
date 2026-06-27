@@ -13,9 +13,9 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/httpcli"
+	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/sandbox"
 	"github.com/p-chat/pchat/internal/style"
-	openai "github.com/sashabaranov/go-openai"
 )
 
 // errQuit is a sentinel error returned by /quit. The REPL loop
@@ -1012,7 +1012,7 @@ func setupTest(ctx cliContext, scanner *bufio.Scanner) error {
 	// which is enough to verify connectivity.
 	stream, err := ctx.ChatStream(context.Background(), agent.ChatRequest{
 		Provider: p.Name,
-		Messages: []openai.ChatCompletionMessage{{Role: "user", Content: "Hi"}},
+		Messages: []llm.ChatMessage{{Role: "user", Content: "Hi"}},
 	})
 	if err != nil {
 		color.Red("  ✗ 连接失败: %v", err)
@@ -1518,7 +1518,7 @@ func configTestQuick(ctx cliContext, args string) error {
 
 	stream, err := ctx.ChatStream(context.Background(), agent.ChatRequest{
 		Provider: name,
-		Messages: []openai.ChatCompletionMessage{{Role: "user", Content: "Hi"}},
+		Messages: []llm.ChatMessage{{Role: "user", Content: "Hi"}},
 	})
 	if err != nil {
 		color.Red("  ✗ 连接失败: %v", err)
@@ -1617,7 +1617,7 @@ func cmdPlan(ctx cliContext, args string) error {
 // so both the y and e flows can share it.
 //
 // Like cmdPlan, this is REPL-only and lives in repl.go.
-func executePlan(ctx cliContext, msgs []openai.ChatCompletionMessage, plan, provModel, task string) error {
+func executePlan(ctx cliContext, msgs []llm.ChatMessage, plan, provModel, task string) error {
 	return runLocalExecutePlan(ctx, msgs, plan, provModel, task)
 }
 

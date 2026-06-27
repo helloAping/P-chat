@@ -79,18 +79,10 @@ type providerEntry struct {
 	protocol  string // "openai" or "anthropic"
 	openai    *openai.Client
 	anthropic *AnthropicClient
+	adapter   ProtocolAdapter // new protocol-agnostic adapter
 	model     string
-	// apiKey + baseURL are stored alongside the SDK client so
-	// the OpenAI streaming code path can build its own HTTP
-	// request. We can't use the SDK's stream reader for
-	// streaming because the SDK's ChatCompletionStreamChoiceDelta
-	// doesn't expose `reasoning_content` (DeepSeek) — and
-	// reading it requires access to the raw response bytes,
-	// which the SDK consumes internally. The custom stream
-	// also lets us apply the same retry / abort / context
-	// semantics uniformly.
-	apiKey  string
-	baseURL string
+	apiKey    string
+	baseURL   string
 }
 
 type Client struct {
@@ -140,10 +132,12 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 		switch p.GetProtocol() {
 		case "anthropic":
 			entry.anthropic = NewAnthropicClient(p.BaseURL, p.APIKey, p.EffectiveModel())
+			entry.adapter = NewAnthropicAdapter(p.BaseURL, p.APIKey, p.Name)
 		default: // "openai"
 			clientCfg := openai.DefaultConfig(p.APIKey)
 			clientCfg.BaseURL = p.BaseURL
 			entry.openai = openai.NewClientWithConfig(clientCfg)
+			entry.adapter = NewOpenAIAdapter(p.BaseURL, p.APIKey, p.Name)
 		}
 
 		c.providers[p.Name] = entry
@@ -201,6 +195,83 @@ func (c *Client) providerDefaultModel(providerName string) string {
 	}
 	return ""
 }
+
+// ChatStreamCM streams a chat completion using protocol-agnostic
+// ChatMessage and ToolDef values. It selects the appropriate
+// ProtocolAdapter for the provider and delegates to it.
+func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName string, messages []ChatMessage, tools []ToolDef, opts ChatOptions) <-chan StreamChunk {
+	p, ok := c.providers[providerName]
+	if !ok {
+		p = c.providers[c.default_]
+	}
+
+	model := modelName
+	if model == "" {
+		model = p.model
+	}
+
+	// Resolve max_tokens: per-model > global opts > 0.
+	maxTokens := opts.MaxTokens
+	if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
+		maxTokens = mt
+	}
+
+	// System prompt is extracted from messages with role=system
+	// by the adapter; we pass an empty string here since
+	// ChatMessage[] already includes system messages.
+	req, err := p.adapter.Build(messages, model, maxTokens, tools, "", float32(opts.Temperature), float32(opts.TopP))
+	if err != nil {
+		ch := make(chan StreamChunk, 1)
+		ch <- StreamChunk{Err: err}
+		close(ch)
+		return ch
+	}
+
+	// Send the request and return the parsed stream.
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
+	if err != nil {
+		ch := make(chan StreamChunk, 1)
+		ch <- StreamChunk{Err: err}
+		close(ch)
+		return ch
+	}
+	for k, v := range req.Headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	httpClient := NewHTTPClient()
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		ch := make(chan StreamChunk, 1)
+		ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
+		close(ch)
+		return ch
+	}
+	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		ch := make(chan StreamChunk, 1)
+		ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(errBody)))}
+		close(ch)
+		return ch
+	}
+
+	return p.adapter.ParseStream(resp.Body)
+}
+
+// ToolsFromRegistryDef builds []ToolDef from the tool registry.
+func ToolsFromRegistryDef(tools []tool.Tool) []ToolDef {
+	out := make([]ToolDef, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, ToolDef{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		})
+	}
+	return out
+}
+
 // disable tool calling.
 func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelName string, messages []Message, tools []openai.Tool, opts ChatOptions) <-chan StreamChunk {
 	p, ok := c.providers[providerName]
