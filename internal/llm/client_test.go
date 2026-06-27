@@ -224,3 +224,134 @@ func newTestClient(name, baseURL string) (*Client, error) {
 	}
 	return c, nil
 }
+
+// TestExtractContent_FieldNames covers the walker's
+// ability to find content in proxies that use any of
+// the known candidate field names at any depth. This
+// is the regression test for the api-convert.08ms.cn
+// proxy that emits a wire shape the standard
+// openaiStreamResponse struct can't decode into
+// `choices[].delta.content`.
+func TestExtractContent_FieldNames(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "standard_delta_content",
+			payload: `{"choices":[{"delta":{"content":"hello"}}]}`,
+			want:    "hello",
+		},
+		{
+			name:    "legacy_delta_text",
+			payload: `{"choices":[{"delta":{"text":"hello"}}]}`,
+			want:    "hello",
+		},
+		{
+			name:    "wrapped_envelope",
+			payload: `{"data":{"choices":[{"delta":{"content":"hello"}}]}}`,
+			want:    "hello",
+		},
+		{
+			name:    "chatml_message_content",
+			payload: `{"choices":[{"message":{"content":"hello"}}]}`,
+			want:    "hello",
+		},
+		{
+			name:    "top_level_content",
+			payload: `{"content":"hello"}`,
+			want:    "hello",
+		},
+		{
+			name:    "output_text_field",
+			payload: `{"choices":[{"delta":{"output_text":"hello"}}]}`,
+			want:    "hello",
+		},
+		{
+			name:    "no_match",
+			payload: `{"choices":[{"delta":{"role":"assistant"}}]}`,
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := extractContent([]byte(tc.payload))
+			if got != tc.want {
+				t.Errorf("extractContent(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractThinking_FieldNames(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "deepseek_reasoning_content",
+			payload: `{"choices":[{"delta":{"reasoning_content":"thinking..."}}]}`,
+			want:    "thinking...",
+		},
+		{
+			name:    "openai_reasoning",
+			payload: `{"choices":[{"delta":{"reasoning":"thinking..."}}]}`,
+			want:    "thinking...",
+		},
+		{
+			name:    "thoughts_field",
+			payload: `{"choices":[{"delta":{"thoughts":"thinking..."}}]}`,
+			want:    "thinking...",
+		},
+		{
+			name:    "no_thinking",
+			payload: `{"choices":[{"delta":{"content":"hi"}}]}`,
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := extractThinking([]byte(tc.payload))
+			if got != tc.want {
+				t.Errorf("extractThinking(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOpenAIStream_WrappedEnvelope is the
+// end-to-end version of the proxy-envelope test
+// (vs. the unit-level extractContent test above).
+// The mock server returns a wrapped envelope that
+// the standard openaiStreamResponse struct can't
+// decode into choices[].delta.content. The walker
+// must recover the text and emit it as a Content
+// chunk so the user's chat isn't empty.
+func TestOpenAIStream_WrappedEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		fmt.Fprintf(w, "data: {\"data\":{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}}\n\n"); fl.Flush()
+		fmt.Fprintf(w, "data: {\"data\":{\"choices\":[{\"delta\":{\"content\":\" world\"}}]}}\n\n"); fl.Flush()
+		fmt.Fprintf(w, "data: [DONE]\n\n"); fl.Flush()
+	}))
+	defer srv.Close()
+
+	c, err := newTestClient("openai", srv.URL)
+	if err != nil { t.Fatal(err) }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	chunks := readAll(c.ChatStream(ctx, "openai", "test-model", []Message{{Role: "user", Content: "hi"}}))
+
+	var content strings.Builder
+	for _, c := range chunks {
+		if c.Err != nil { t.Fatalf("stream error: %v", c.Err) }
+		if c.Content != "" { content.WriteString(c.Content) }
+	}
+	if got := content.String(); got != "hello world" {
+		t.Errorf("content = %q, want %q (walker should have recovered it from the wrapped envelope)", got, "hello world")
+	}
+}

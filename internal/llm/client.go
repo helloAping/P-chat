@@ -431,14 +431,42 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 					TokensOut: r.Usage.CompletionTokens,
 				}
 			}
+			// Last-resort fallback: if the standard
+			// struct parser found no content AND no
+			// thinking, scan the raw JSON for any field
+			// whose name matches the content or
+			// thinking candidates. Some proxies (and
+			// homegrown OpenAI-compatible gateways)
+			// wrap responses in arbitrary envelopes —
+			// `{"data": {"choices": [{"delta": {...}}]}}`
+			// or `{"message": {"content": "..."}}` — and
+			// the standard decode would find nothing.
+			// The walker extracts the first non-empty
+			// string value at any depth that matches a
+			// known content / thinking field name, and
+			// emits it as a chunk. This is intentionally
+			// permissive: if the proxy uses ANY of the
+			// field names in contentCandidateNames /
+			// thinkingCandidateNames, the user's chat
+			// renders the reply.
+			if choiceCount == 0 || (contentChars == 0 && thinkingChars == 0) {
+				if v, path := extractContent(payload); v != "" {
+					if rawChunks <= 3 {
+						log.Printf("[llm/%s/%s] walker recovered content from path=%q (len=%d)", p.name, model, path, len(v))
+					}
+					contentChars += len(v)
+					ch <- StreamChunk{Content: v}
+				}
+				if v, path := extractThinking(payload); v != "" {
+					if rawChunks <= 3 {
+						log.Printf("[llm/%s/%s] walker recovered thinking from path=%q (len=%d)", p.name, model, path, len(v))
+					}
+					thinkingChars += len(v)
+					ch <- StreamChunk{Thinking: v}
+				}
+			}
 			if rawChunks == 1 && choiceCount == 0 {
 				log.Printf("[llm/%s/%s] first chunk had no choices (top-level keys: %v)", p.name, model, topLevelKeys(payload))
-			}
-			if r.Usage != nil {
-				ch <- StreamChunk{
-					TokensIn:  r.Usage.PromptTokens,
-					TokensOut: r.Usage.CompletionTokens,
-				}
 			}
 		}
 	}()
@@ -700,4 +728,112 @@ func topLevelKeys(payload []byte) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// contentCandidateNames is the ordered list of JSON
+// field names we treat as "this is the assistant's
+// text delta" when scanning an unknown proxy payload.
+// Standard OpenAI is `content`; legacy completions
+// uses `text`; some gateways use `message.content`
+// (chatml wrapper) or `text_chunk` (custom proxy).
+// The list is checked in order against the first
+// non-empty string value found at any depth.
+var contentCandidateNames = []string{
+	"content",
+	"text",
+	"text_chunk",
+	"message",
+	"output_text",
+	"response",
+	"completion",
+	"delta_text",
+	"chunk",
+}
+
+// thinkingCandidateNames is the same idea for the
+// chain-of-thought / reasoning stream. The standard
+// DeepSeek field is `reasoning_content`; OpenAI o1
+// uses `reasoning`; some proxies use `thoughts` or
+// `chain_of_thought`.
+var thinkingCandidateNames = []string{
+	"reasoning_content",
+	"reasoning",
+	"reasoning_text",
+	"thoughts",
+	"chain_of_thought",
+	"think",
+	"inner_monologue",
+	"reflection",
+}
+
+// extractContent scans a raw JSON payload for any field
+// whose name matches one of the content candidates.
+// Returns the first non-empty string value found, and
+// the JSON path (e.g. "choices.0.delta.content") it
+// was found at — both surfaced in the diagnostic log so
+// the user can see what field name the proxy is using.
+//
+// The scan is depth-first but bounded (maxDepth=8) to
+// avoid pathological recursion on circular-looking
+// JSON, and maxResults=10 so a chunk that contains
+// many small strings doesn't get walked forever.
+func extractContent(payload []byte) (string, string) {
+	var v any
+	if err := json.Unmarshal(payload, &v); err != nil {
+		return "", ""
+	}
+	return walkForField(v, contentCandidateNames, "", 0, 8, 10)
+}
+
+func extractThinking(payload []byte) (string, string) {
+	var v any
+	if err := json.Unmarshal(payload, &v); err != nil {
+		return "", ""
+	}
+	return walkForField(v, thinkingCandidateNames, "", 0, 8, 10)
+}
+
+func walkForField(v any, names []string, path string, depth, maxDepth, maxResults int) (string, string) {
+	if depth > maxDepth {
+		return "", ""
+	}
+	switch t := v.(type) {
+	case string:
+		// Reached a leaf string. We only return at the
+		// caller who matched the name; this branch
+		// doesn't trigger because the matching happens
+		// in the map case below.
+		return "", ""
+	case map[string]any:
+		// Check direct children first (shallowest wins).
+		for _, name := range names {
+			if val, ok := t[name]; ok {
+				if s, ok := val.(string); ok && s != "" {
+					return s, path + "." + name
+				}
+			}
+		}
+		// Then recurse, but only if the value looks
+		// promising (map / slice). Skip large string
+		// leaves to avoid recursing into the actual
+		// content payload.
+		for k, val := range t {
+			switch val.(type) {
+			case map[string]any, []any:
+				if got, p := walkForField(val, names, path+"."+k, depth+1, maxDepth, maxResults); got != "" {
+					return got, p
+				}
+			}
+		}
+	case []any:
+		for i, item := range t {
+			switch item.(type) {
+			case map[string]any, []any:
+				if got, p := walkForField(item, names, fmt.Sprintf("%s[%d]", path, i), depth+1, maxDepth, maxResults); got != "" {
+					return got, p
+				}
+			}
+		}
+	}
+	return "", ""
 }
