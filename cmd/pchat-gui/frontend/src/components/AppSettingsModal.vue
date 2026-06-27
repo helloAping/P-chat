@@ -61,14 +61,18 @@ const newModel = ref('')
 
 // Add-model form
 const showAddModel = ref(false)
-const newModelName = ref('')
-const newModelDisplay = ref('')
-const newModelCtx = ref<number | null>(null)
-const newModelOut = ref<number | null>(null)
-const newModelVision = ref(false)
 
-// Edit-model form (re-uses showAddModel for layout).
+// Single model form backing the add/edit panel. The form
+// template binds to these refs regardless of which mode
+// (`editingModelName` set = edit, otherwise = add). This
+// keeps the form's `v-model` wiring trivial and guarantees
+// that opening edit mode actually populates the visible
+// fields (the previous code had a parallel `newModel*` ref
+// family the form was wired to, so clicking "edit" did
+// nothing on screen — values were silently written to the
+// unused `editModel*` family).
 const editingModelName = ref<string | null>(null)
+const editModelName = ref('')
 const editModelDisplay = ref('')
 const editModelCtx = ref<number | null>(null)
 const editModelOut = ref<number | null>(null)
@@ -224,38 +228,52 @@ async function onSaveProvider() {
 
 // --- Model handlers ---
 
+// Reset the model form to a blank "add" state.
+function resetModelForm() {
+  editingModelName.value = null
+  editModelName.value = ''
+  editModelDisplay.value = ''
+  editModelCtx.value = null
+  editModelOut.value = null
+  editModelVision.value = false
+}
+
+function onShowAddModel() {
+  resetModelForm()
+  showAddModel.value = !showAddModel.value
+}
+
 async function onAddModel() {
   if (!selected.value) return
-  if (!newModelName.value.trim()) {
+  const name = editModelName.value.trim()
+  if (!name) {
     message.warning('模型名称为必填')
     return
   }
   const providerName = selected.value.name
-  const modelName = newModelName.value.trim()
   try {
     await api.addModel(providerName, {
-      name: modelName,
-      display_name: newModelDisplay.value.trim() || undefined,
-      max_tokens_context: newModelCtx.value ?? undefined,
-      max_tokens_output: newModelOut.value ?? undefined,
+      name,
+      display_name: editModelDisplay.value.trim() || undefined,
+      max_tokens_context: editModelCtx.value ?? undefined,
+      max_tokens_output: editModelOut.value ?? undefined,
     })
     // The capabilities block is a separate PATCH; if it
     // fails, the model is still created — surface the error
     // but don't roll back.
-    if (newModelVision.value) {
+    if (editModelVision.value) {
       try {
-        await api.setModelCapabilities(providerName, modelName, {
+        await api.setModelCapabilities(providerName, name, {
           supports_vision: true,
-          context_window: newModelCtx.value ?? 0,
+          context_window: editModelCtx.value ?? 0,
         })
       } catch (capErr: any) {
         message.warning(`模型已添加, 但能力标记失败: ${capErr.message}`)
       }
     }
     message.success('已添加模型')
+    resetModelForm()
     showAddModel.value = false
-    newModelName.value = ''; newModelDisplay.value = ''
-    newModelCtx.value = null; newModelOut.value = null; newModelVision.value = false
     await refreshProviders()
   } catch (e: any) {
     message.error(`添加失败: ${e.message}`)
@@ -264,7 +282,16 @@ async function onAddModel() {
 
 function onEditModel(m: api.ModelInfo) {
   if (!selected.value) return
+  // Switch the form into "edit" mode and pre-populate every
+  // field with the model's current values. The previous
+  // version had two parallel ref families (`newModel*` for
+  // add, `editModel*` for edit) but the form template was
+  // wired only to `newModel*`, so opening edit left the
+  // form blank. Now there's one set of refs; the template
+  // branches on `editingModelName` for the model-id input
+  // and the submit button label.
   editingModelName.value = m.name
+  editModelName.value = m.name
   editModelDisplay.value = m.display_name || ''
   editModelCtx.value = m.max_tokens_context ?? null
   editModelOut.value = m.max_tokens_output ?? null
@@ -294,7 +321,8 @@ async function onSaveModel() {
       context_window: editModelCtx.value ?? 0,
     })
     message.success('已保存')
-    onCancelEditModel()
+    resetModelForm()
+    showAddModel.value = false
     await refreshProviders()
   } catch (e: any) {
     message.error(`保存失败: ${e.message}`)
@@ -302,14 +330,8 @@ async function onSaveModel() {
 }
 
 function onCancelEditModel() {
+  resetModelForm()
   showAddModel.value = false
-  editingModelName.value = null
-  editModelDisplay.value = ''
-  editModelCtx.value = null
-  editModelOut.value = null
-  editModelVision.value = false
-  newModelName.value = ''; newModelDisplay.value = ''
-  newModelCtx.value = null; newModelOut.value = null; newModelVision.value = false
 }
 
 async function onDeleteModel(model: string) {
@@ -558,7 +580,7 @@ function fmtContext(n?: number) {
               <div class="detail-section">
                 <div class="detail-section-head">
                   <h3 class="section-title">模型 ({{ selected.models?.length || 0 }})</h3>
-                  <NButton size="small" type="primary" ghost @click="onCancelEditModel(); showAddModel = !showAddModel">
+                  <NButton size="small" type="primary" ghost @click="onShowAddModel">
                     {{ showAddModel ? '取消' : '+ 添加模型' }}
                   </NButton>
                 </div>
@@ -566,23 +588,23 @@ function fmtContext(n?: number) {
                   <NSpace vertical size="small">
                     <div v-if="editingModelName" class="muted form-hint">编辑模型: <code>{{ editingModelName }}</code></div>
                     <NInput
-                      v-model:value="newModelName"
+                      v-model:value="editModelName"
                       :disabled="!!editingModelName"
                       placeholder="模型 ID (例: gpt-4o-mini)"
                       size="small"
                     />
-                    <NInput v-model:value="newModelDisplay" placeholder="显示名 (例: GPT-4o mini)" size="small" />
+                    <NInput v-model:value="editModelDisplay" placeholder="显示名 (例: GPT-4o mini)" size="small" />
                     <div class="form-row">
                       <span class="form-label">上下文 (tokens)</span>
-                      <NInputNumber v-model:value="newModelCtx" :min="0" :step="1024" placeholder="例: 128000" size="small" style="flex: 1" />
+                      <NInputNumber v-model:value="editModelCtx" :min="0" :step="1024" placeholder="例: 128000" size="small" style="flex: 1" />
                     </div>
                     <div class="form-row">
                       <span class="form-label">最大输出 (tokens)</span>
-                      <NInputNumber v-model:value="newModelOut" :min="0" :step="512" placeholder="例: 4096" size="small" style="flex: 1" />
+                      <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="例: 4096" size="small" style="flex: 1" />
                     </div>
                     <div class="form-row">
                       <span class="form-label">支持视觉</span>
-                      <NSwitch v-model:value="newModelVision" />
+                      <NSwitch v-model:value="editModelVision" />
                     </div>
                     <NSpace>
                       <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">

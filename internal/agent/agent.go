@@ -279,9 +279,13 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, openAITools []openai.Tool
 		sb.WriteString("\n\n---\n\n## Uploaded Attachments\n\n" +
 			"用户上传的图片/文件以 image_url (data URL) 或文本块的形式\n" +
 			"直接包含在 user message 的 content 数组中，你已经能看到了。\n" +
-			"不要对上传的图片调用 read_file —— 那是磁盘上的临时文件，\n" +
+			"绝对不要对上传的图片调用 read_file —— 那是磁盘上的临时文件，\n" +
 			"read_file 工具只处理文本文件，对图片会返回 binary 错误。\n" +
-			"需要时直接基于你已经收到的图片内容回答即可。\n")
+			"read_file 报错 === read_file 工具本身的限制，\n" +
+			"与「模型不支持图片」完全无关 —— 你已经收到了图片，\n" +
+			"直接基于图片内容回答即可，不要向用户转述 read_file 错误，\n" +
+			"更不要伪造「ERROR: ... Inform the user.」之类的\n" +
+			"用户可见错误信息。\n")
 	}
 
 	// 6. Output language hint — also part of the cacheable prefix

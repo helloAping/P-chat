@@ -381,16 +381,19 @@ function rebuildModelOptions() {
   modelOptions.value = groups
 }
 
-// renderLabel is the slot the NSelect uses for each option
-// in the dropdown panel. The compact-pill (`render-tag`)
-// view is handled by the default NSelect behaviour — the
-// model name alone is fine when the option is collapsed.
-function renderLabel(option: any) {
-  if (!option || option.type === 'group') return option?.label || ''
-  const meta = option.meta as string | undefined
-  if (!meta || meta === option.label) return option.label
+// renderOption is invoked for every row inside the dropdown panel
+// (NOT for the closed-pill display — that uses `option.label`
+// straight from `renderLabel`'s default, which is `display_name`).
+// We use the two-line layout here so the user can see the raw
+// model id and capability tags at a glance, without paying that
+// cost on the always-visible selected pill.
+function renderOption(info: { node: any; option: any; selected: boolean }) {
+  const opt = info.option
+  if (!opt || opt.type === 'group') return opt?.label || ''
+  const meta = opt.meta as string | undefined
+  if (!meta || meta === opt.label) return info.node
   return h('div', { class: 'model-option' }, [
-    h('div', { class: 'model-option-primary' }, option.label),
+    h('div', { class: 'model-option-primary' }, opt.label),
     h('div', { class: 'model-option-meta' }, meta),
   ])
 }
@@ -550,7 +553,7 @@ onMounted(() => {
           :disabled="!state.currentID"
           filterable
           class="picker picker-wide"
-          :render-label="renderLabel"
+          :render-option="renderOption"
           title="选择模型 (按提供商分组; ⭐ 默认 · 视觉 = 支持图片)"
           placeholder="选择模型"
         />
