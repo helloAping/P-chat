@@ -382,6 +382,21 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 				}
 				continue
 			}
+			// If the proxy returned an error envelope
+			// (`{"error":{"message":"..."}}`) instead of
+			// content, surface it as a classified API
+			// error and stop the stream. Without this
+			// check, the walker fallback below would
+			// (wrongly) recover the error's `message`
+			// field and emit it as a content chunk —
+			// making the user's chat show a fake
+			// assistant reply that is actually a
+			// provider rate-limit / auth error.
+			if proxyErr := extractProxyError(payload); proxyErr != "" {
+				log.Printf("[llm/%s/%s] proxy error chunk: %s", p.name, model, proxyErr)
+				ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("openai proxy error: %s", proxyErr))}
+				return
+			}
 			for _, choice := range r.Choices {
 				choiceCount++
 				// Reasoning chain-of-thought (DeepSeek
@@ -730,19 +745,77 @@ func topLevelKeys(payload []byte) []string {
 	return keys
 }
 
+// extractProxyError checks whether a raw SSE payload
+// is a proxy-side error envelope (top-level `error`
+// object) rather than a content delta. Returns the
+// human-readable error message if so, or "" if the
+// payload is a normal response.
+//
+// A proxy that returns 200 OK with
+//   {"error": {"message": "...", "type": "...", "code": "..."}}
+// is a common OpenAI-compatible pattern for surfacing
+// upstream failures (rate limits, quota exceeded,
+// bad request) without breaking the SSE framing. The
+// standard struct parser sees an empty `choices` and
+// silently does nothing, which then causes the walker
+// to (wrongly) recover the error's `message` field as
+// fake content. We need to detect this case explicitly
+// and surface it as a classified error so the user
+// sees a proper error message instead of a chat
+// bubble filled with the proxy's error text.
+func extractProxyError(payload []byte) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return ""
+	}
+	raw, ok := m["error"]
+	if !ok {
+		return ""
+	}
+	// Sometimes the error is a plain string
+	// (`{"error": "rate limited"}`); more often it's
+	// an object (`{"error": {"message": "..."}}`).
+	var obj struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.Message != "" {
+		if obj.Code != "" {
+			return fmt.Sprintf("[%s] %s", obj.Code, obj.Message)
+		}
+		if obj.Type != "" {
+			return fmt.Sprintf("[%s] %s", obj.Type, obj.Message)
+		}
+		return obj.Message
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return ""
+}
+
 // contentCandidateNames is the ordered list of JSON
 // field names we treat as "this is the assistant's
 // text delta" when scanning an unknown proxy payload.
 // Standard OpenAI is `content`; legacy completions
-// uses `text`; some gateways use `message.content`
-// (chatml wrapper) or `text_chunk` (custom proxy).
-// The list is checked in order against the first
-// non-empty string value found at any depth.
+// uses `text`; some gateways use `text_chunk` (custom
+// proxy) or `output_text` (OpenAI Responses API).
+//
+// Note: `message` is intentionally NOT in the list.
+// A common proxy pattern is
+//   {"error": {"message": "..."}}
+// and including `message` as a content candidate
+// would (and did) cause the walker to surface the
+// error message as a fake assistant reply. The
+// standard struct path handles the real
+// `choices[0].delta.content` case; the walker is
+// only invoked when that path returns nothing.
 var contentCandidateNames = []string{
 	"content",
 	"text",
 	"text_chunk",
-	"message",
 	"output_text",
 	"response",
 	"completion",

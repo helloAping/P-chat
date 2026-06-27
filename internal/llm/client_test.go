@@ -355,3 +355,77 @@ func TestOpenAIStream_WrappedEnvelope(t *testing.T) {
 		t.Errorf("content = %q, want %q (walker should have recovered it from the wrapped envelope)", got, "hello world")
 	}
 }
+
+// TestOpenAIStream_ProxyErrorEnvelope is the
+// regression test for the api-convert.08ms.cn
+// behaviour: a proxy that returns 200 OK with
+// `{"error": {"message": "..."}}` instead of
+// content. The parser must surface this as a
+// classified error, not as a fake content chunk.
+//
+// Previously the walker would recover `error.message`
+// as content, and the user's chat would render a
+// bubble filled with "Provider rate limited: ..."
+// as if the LLM had answered. That's worse than
+// the original 0-char behaviour because the user
+// would think the LLM responded.
+func TestOpenAIStream_ProxyErrorEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		fmt.Fprintf(w, "data: {\"error\":{\"message\":\"Provider rate limited: status=429, body=...\",\"type\":\"server_error\",\"code\":\"provider_rate_limited\"}}\n\n"); fl.Flush()
+		fmt.Fprintf(w, "data: [DONE]\n\n"); fl.Flush()
+	}))
+	defer srv.Close()
+
+	c, err := newTestClient("openai", srv.URL)
+	if err != nil { t.Fatal(err) }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	chunks := readAll(c.ChatStream(ctx, "openai", "test-model", []Message{{Role: "user", Content: "hi"}}))
+
+	if len(chunks) != 1 {
+		t.Fatalf("got %d chunks, want 1 (the error chunk + no walker recovery)", len(chunks))
+	}
+	if chunks[0].Err == nil {
+		t.Fatal("expected an error chunk, got nil")
+	}
+	if !strings.Contains(chunks[0].Err.Error(), "Provider rate limited") {
+		t.Errorf("error = %q, want it to contain %q", chunks[0].Err.Error(), "Provider rate limited")
+	}
+	if !strings.Contains(chunks[0].Err.Error(), "provider_rate_limited") {
+		t.Errorf("error = %q, want it to contain code %q", chunks[0].Err.Error(), "provider_rate_limited")
+	}
+}
+
+func TestExtractProxyError(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "object_envelope",
+			payload: `{"error":{"message":"quota exceeded","code":"quota_exceeded"}}`,
+			want:    "[quota_exceeded] quota exceeded",
+		},
+		{
+			name:    "string_envelope",
+			payload: `{"error":"rate limited"}`,
+			want:    "rate limited",
+		},
+		{
+			name:    "no_error",
+			payload: `{"choices":[{"delta":{"content":"hi"}}]}`,
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractProxyError([]byte(tc.payload)); got != tc.want {
+				t.Errorf("extractProxyError = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
