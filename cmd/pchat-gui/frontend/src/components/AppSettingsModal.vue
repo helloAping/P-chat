@@ -27,6 +27,7 @@ import {
   NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NTooltip, NIcon, useMessage,
 } from 'naive-ui'
 import * as api from '../api/client'
+import { loadProviders } from '../stores/chat'
 
 const message = useMessage()
 const tab = ref<'providers' | 'styles'>('providers')
@@ -113,6 +114,10 @@ async function refreshProviders() {
   } catch (e: any) {
     message.error(`加载 providers 失败: ${e.message}`)
   }
+  // Also refresh the chat store so active sessions pick up
+  // capability changes (e.g. toggling vision support) without
+  // needing to close and reopen the chat.
+  loadProviders()
 }
 
 async function refreshStyles() {
