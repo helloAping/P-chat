@@ -726,6 +726,23 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"archived": id})
 }
 
+// PermanentDeleteSession DELETE /api/v1/sessions/:id/permanent
+func (h *Handler) PermanentDeleteSession(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	if err := h.store.DeleteConversation(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	h.metaMu.Lock()
+	delete(h.meta, id)
+	h.metaMu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"deleted": id})
+}
+
 func (h *Handler) RenameSession(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})

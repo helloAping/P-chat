@@ -268,6 +268,9 @@ export const unarchiveSession = (id: string) =>
 export const listArchived = () =>
   jsonFetch<{ sessions: Session[] }>('/api/v1/sessions/archived')
 
+export const permanentDeleteSession = (id: string) =>
+  jsonFetch<{ deleted: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/permanent`, { method: 'DELETE' })
+
 // --- Uploads ---
 export async function uploadFile(file: File): Promise<UploadMeta> {
   const fd = new FormData()

@@ -122,6 +122,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/sessions/:id/archive", h.ArchiveSession)
 		api.POST("/sessions/:id/unarchive", h.UnarchiveSession)
 		api.GET("/sessions/archived", h.ListArchived)
+		api.DELETE("/sessions/:id/permanent", h.PermanentDeleteSession)
 
 		// Projects
 		api.GET("/projects", h.ListProjects)

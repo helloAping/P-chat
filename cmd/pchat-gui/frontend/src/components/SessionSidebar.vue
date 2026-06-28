@@ -45,7 +45,7 @@ async function confirmDeleteSession() {
   await deleteSessionById(id)
   showConfirmDeleteSession.value = false
   pendingDeleteSessionId.value = ''
-  message.info('已删除')
+  message.info('已归档')
 }
 
 async function confirmDeleteProject() {
@@ -190,13 +190,13 @@ function toggleTheme() {
       </div>
     </NModal>
 
-    <!-- Confirmation: delete session -->
-    <NModal v-model:show="showConfirmDeleteSession" preset="card" title="确认删除" style="width: 360px">
+    <!-- Confirmation: archive session -->
+    <NModal v-model:show="showConfirmDeleteSession" preset="card" title="确认归档" style="width: 360px">
       <div class="confirm-body">
-        <p>确定要删除此会话吗？此操作不可撤销。</p>
+        <p>确定要归档此会话吗？归档后可在「设置 → 归档」中恢复。</p>
         <div class="confirm-actions">
           <NButton size="small" @click="showConfirmDeleteSession = false">取消</NButton>
-          <NButton size="small" type="error" @click="confirmDeleteSession">删除</NButton>
+          <NButton size="small" type="warning" @click="confirmDeleteSession">归档</NButton>
         </div>
       </div>
     </NModal>

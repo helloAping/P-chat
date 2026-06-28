@@ -478,6 +478,8 @@ function close() { (window as any).closeAppSettings?.() }
 // --- Archive state ---
 const archivedSessions = ref<Session[]>([])
 const loadingArchived = ref(false)
+const showConfirmPermDelete = ref(false)
+const pendingPermDeleteId = ref('')
 
 function groupByProject(sessions: Session[]): Map<string, Session[]> {
   const map = new Map<string, Session[]>()
@@ -512,6 +514,25 @@ async function onUnarchive(id: string) {
     message.success('已恢复')
   } catch (e: any) {
     message.error(e.message || '恢复失败')
+  }
+}
+
+function onPermDelete(id: string) {
+  pendingPermDeleteId.value = id
+  showConfirmPermDelete.value = true
+}
+
+async function confirmPermDelete() {
+  const id = pendingPermDeleteId.value
+  if (!id) return
+  try {
+    await api.permanentDeleteSession(id)
+    archivedSessions.value = archivedSessions.value.filter(s => s.id !== id)
+    showConfirmPermDelete.value = false
+    pendingPermDeleteId.value = ''
+    message.info('已永久删除')
+  } catch (e: any) {
+    message.error(e.message || '删除失败')
   }
 }
 function closeStyleEditor() { showAddStyle.value = false; resetNewStyle() }
@@ -821,10 +842,22 @@ function fmtContext(n?: number) {
             <span class="archive-title">{{ s.title || '(无标题)' }}</span>
             <span class="archive-meta">{{ formatArchiveTime(s.updated_at) }}</span>
             <NButton size="tiny" quaternary @click="onUnarchive(s.id)">恢复</NButton>
+            <NButton size="tiny" quaternary @click="onPermDelete(s.id)" style="color: var(--warn)">删除</NButton>
           </div>
         </div>
       </NTabPane>
     </NTabs>
+
+    <!-- Confirmation: permanent delete from archive -->
+    <NModal v-model:show="showConfirmPermDelete" preset="card" title="确认永久删除" style="width: 360px">
+      <div class="confirm-body">
+        <p>确定要永久删除此会话吗？此操作不可撤销。</p>
+        <div class="confirm-actions">
+          <NButton size="small" @click="showConfirmPermDelete = false">取消</NButton>
+          <NButton size="small" type="error" @click="confirmPermDelete">永久删除</NButton>
+        </div>
+      </div>
+    </NModal>
 
     <template #footer>
       <NSpace justify="end">
@@ -983,4 +1016,7 @@ code {
 .archive-row:hover { background: var(--bg-3); }
 .archive-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .archive-meta { font-size: 11px; color: var(--text-4); white-space: nowrap; }
+.confirm-body { padding: 8px 0; }
+.confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
+.confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
 </style>
