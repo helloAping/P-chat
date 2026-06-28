@@ -64,6 +64,15 @@ async function onAddProject() {
   }
 }
 
+async function pickDirectory() {
+  try {
+    const handle = await (window as any).showDirectoryPicker()
+    newProjectPath.value = handle.name
+  } catch {
+    // User cancelled or API not available
+  }
+}
+
 async function onRemoveProject(path: string) {
   try {
     await api.removeProject(path)
@@ -146,7 +155,10 @@ function toggleTheme() {
         <label>项目名称</label>
         <NInput v-model:value="newProjectName" placeholder="例如：我的项目" />
         <label style="margin-top: 12px">项目目录</label>
-        <NInput v-model:value="newProjectPath" placeholder="例如：D:\projects\my-app" />
+        <div class="path-row">
+          <NInput v-model:value="newProjectPath" placeholder="例如：D:\projects\my-app" style="flex:1" />
+          <NButton size="small" @click="pickDirectory" title="选择目录">浏览</NButton>
+        </div>
         <div class="project-actions">
           <NButton size="small" @click="showAddProject = false">取消</NButton>
           <NButton size="small" type="primary" @click="onAddProject">添加</NButton>
@@ -210,5 +222,8 @@ function toggleTheme() {
 }
 .project-actions {
   margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end;
+}
+.path-row {
+  display: flex; gap: 8px; align-items: center;
 }
 </style>
