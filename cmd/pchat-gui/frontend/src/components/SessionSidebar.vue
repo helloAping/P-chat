@@ -16,7 +16,9 @@ const message = useMessage()
 const showAddProject = ref(false)
 const newProjectName = ref('')
 const newProjectPath = ref('')
-
+const showConfirmDeleteProject = ref(false)
+const showConfirmDeleteSession = ref(false)
+const pendingDeleteSessionId = ref('')
 const sortedSessions = computed(() =>
   [...state.sessions].sort((a, b) => b.updated_at - a.updated_at),
 )
@@ -33,8 +35,24 @@ async function onNew() {
 
 async function onDelete(id: string, e: Event) {
   e.stopPropagation()
+  pendingDeleteSessionId.value = id
+  showConfirmDeleteSession.value = true
+}
+
+async function confirmDeleteSession() {
+  const id = pendingDeleteSessionId.value
+  if (!id) return
   await deleteSessionById(id)
+  showConfirmDeleteSession.value = false
+  pendingDeleteSessionId.value = ''
   message.info('已删除')
+}
+
+async function confirmDeleteProject() {
+  const path = state.activeProjectPath
+  if (!path) return
+  await onRemoveProject(path)
+  showConfirmDeleteProject.value = false
 }
 
 async function onRename(id: string) {
@@ -127,6 +145,7 @@ function toggleTheme() {
         @update:value="onProjectChange"
       />
       <NButton size="tiny" quaternary @click="showAddProject = true" title="添加项目">+</NButton>
+      <NButton v-if="state.activeProjectPath" size="tiny" quaternary @click="showConfirmDeleteProject = true" title="删除项目" style="color: var(--warn)">×</NButton>
     </div>
     <NScrollbar style="flex: 1">
       <div class="session-list">
@@ -164,6 +183,28 @@ function toggleTheme() {
         <div class="project-actions">
           <NButton size="small" @click="showAddProject = false">取消</NButton>
           <NButton size="small" type="primary" @click="onAddProject">添加</NButton>
+        </div>
+      </div>
+    </NModal>
+
+    <!-- Confirmation: delete session -->
+    <NModal v-model:show="showConfirmDeleteSession" preset="card" title="确认删除" style="width: 360px">
+      <div class="confirm-body">
+        <p>确定要删除此会话吗？此操作不可撤销。</p>
+        <div class="confirm-actions">
+          <NButton size="small" @click="showConfirmDeleteSession = false">取消</NButton>
+          <NButton size="small" type="error" @click="confirmDeleteSession">删除</NButton>
+        </div>
+      </div>
+    </NModal>
+
+    <!-- Confirmation: delete project -->
+    <NModal v-model:show="showConfirmDeleteProject" preset="card" title="确认删除项目" style="width: 360px">
+      <div class="confirm-body">
+        <p>确定要删除当前项目吗？该项目的会话不会被删除，但将不再关联到此项目。</p>
+        <div class="confirm-actions">
+          <NButton size="small" @click="showConfirmDeleteProject = false">取消</NButton>
+          <NButton size="small" type="error" @click="confirmDeleteProject">删除</NButton>
         </div>
       </div>
     </NModal>
@@ -228,4 +269,7 @@ function toggleTheme() {
 .path-row {
   display: flex; gap: 8px; align-items: center;
 }
+.confirm-body { padding: 8px 0; }
+.confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
+.confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
 </style>
