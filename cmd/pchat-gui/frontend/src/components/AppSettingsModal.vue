@@ -550,6 +550,13 @@ const savedRepos = ref<api.SavedRepo[]>([])
 const showAddRepo = ref(false)
 const newRepoName = ref('')
 const newRepoUrl = ref('')
+const activeRepoUrl = ref('')
+
+const builtInRepos = [
+  { name: 'Anthropic 官方技能', url: 'https://github.com/anthropics/skills' },
+  { name: 'Awesome Claude Skills', url: 'https://github.com/ComposioHQ/awesome-claude-skills' },
+  { name: 'P-Chat 官方技能', url: 'https://github.com/p-chat-community/skills' },
+]
 
 async function refreshRepos() {
   try {
@@ -559,6 +566,7 @@ async function refreshRepos() {
 }
 
 function onSelectRepo(url: string) {
+  activeRepoUrl.value = url
   searchQuery.value = url
   onSearchSkills()
 }
@@ -943,19 +951,29 @@ function fmtContext(n?: number) {
       </NTabPane>
 
       <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; overflow: auto">
-        <!-- Saved repos -->
+        <!-- Built-in repos -->
         <div class="skill-repos">
+          <span class="skill-hint">官方仓库</span>
+          <div class="repo-chips">
+            <NButton v-for="r in builtInRepos" :key="r.url" size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'" @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+          </div>
+        </div>
+        <!-- Saved repos -->
+        <div v-if="savedRepos.length" class="skill-repos" style="margin-top:12px">
           <div class="skill-repos-header">
-            <span class="skill-hint">技能仓库</span>
+            <span class="skill-hint">我的仓库</span>
             <NButton size="tiny" quaternary @click="showAddRepo = true">+ 添加</NButton>
           </div>
-          <div v-if="!savedRepos.length" class="empty-hint" style="padding:4px 0;font-size:12px">暂无保存的仓库，点击「+ 添加」输入 GitHub 地址</div>
-          <div v-else class="repo-chips">
-            <div v-for="r in savedRepos" :key="r.url" class="repo-chip-row">
-              <NButton size="tiny" quaternary @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+          <div class="repo-chips">
+            <template v-for="r in savedRepos" :key="r.url">
+              <NButton size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'" @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
               <NButton size="tiny" quaternary @click="onRemoveRepo(r.url)" style="color:var(--warn);font-size:10px">×</NButton>
-            </div>
+            </template>
           </div>
+        </div>
+        <div v-if="!savedRepos.length" class="skill-repos" style="margin-top:8px">
+          <span class="skill-hint" style="color:var(--text-4)">我的仓库（暂无）</span>
+          <NButton size="tiny" quaternary @click="showAddRepo = true" style="margin-left:4px">+ 添加</NButton>
         </div>
         <div class="skill-divider" />
         <!-- Search and install -->
