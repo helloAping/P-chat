@@ -122,6 +122,36 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 			continue
 		}
 
+		// Extension-driven routing for document formats that
+		// should be saved to workspace (read_docx / read_pdf).
+		ext := strings.ToLower(filepath.Ext(a.Name))
+		isDocx := ext == ".docx"
+		isPdf := ext == ".pdf"
+
+		if isDocx || isPdf {
+			path, wrote := saveToWorkspace(a.Name, data)
+			var tool string
+			if isDocx {
+				tool = "read_docx"
+			} else {
+				tool = "read_pdf"
+			}
+			if wrote {
+				result = append(result, llm.ChatMessage{
+					Role:    llm.RoleUser,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("文件已保存到工作区: %s (%d 字节)。使用 %s 工具读取全文。", path, len(data), tool),
+				})
+			} else {
+				result = append(result, llm.ChatMessage{
+					Role:    llm.RoleUser,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("(收到文件: %s, %d 字节, %s — 无法保存到工作区)", a.Name, len(data), ext),
+				})
+			}
+			continue
+		}
+
 		switch a.Kind {
 		case "image":
 			mime := imageMIME(a.Name, a.MIME)
@@ -147,16 +177,35 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 				Content: fmt.Sprintf("(attached audio: %s, %d bytes, MIME=%s)", a.Name, len(data), a.MIME),
 			})
 		case "text":
-			const maxTextDump = 200 << 10
-			body := string(data)
-			if len(body) > maxTextDump {
-				body = body[:maxTextDump] + "\n... (truncated)"
+			const maxInlineText = 8 << 10 // 8 KB
+			if len(data) <= maxInlineText {
+				body := string(data)
+				result = append(result, llm.ChatMessage{
+					Role:    llm.RoleUser,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("--- %s ---\n%s", a.Name, body),
+				})
+			} else {
+				path, wrote := saveToWorkspace(a.Name, data)
+				if wrote {
+					result = append(result, llm.ChatMessage{
+						Role:    llm.RoleUser,
+						Type:    llm.TypeText,
+						Content: fmt.Sprintf("文件已保存到工作区: %s (%d 字符, %d 字节)。使用 read_file 工具读取全文。", path, len(data), len(data)),
+					})
+				} else {
+					body := string(data)
+					const maxTextDump = 200 << 10
+					if len(body) > maxTextDump {
+						body = body[:maxTextDump] + "\n... (truncated)"
+					}
+					result = append(result, llm.ChatMessage{
+						Role:    llm.RoleUser,
+						Type:    llm.TypeText,
+						Content: fmt.Sprintf("--- %s ---\n%s", a.Name, body),
+					})
+				}
 			}
-			result = append(result, llm.ChatMessage{
-				Role:    llm.RoleUser,
-				Type:    llm.TypeText,
-				Content: fmt.Sprintf("--- %s ---\n%s", a.Name, body),
-			})
 		default:
 			result = append(result, llm.ChatMessage{
 				Role:    llm.RoleUser,
@@ -166,6 +215,27 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 		}
 	}
 	return result
+}
+
+// saveToWorkspace writes data to workspace/<name> (relative to
+// os.Getwd), creating directories as needed. Returns the written
+// path and whether the write succeeded.
+func saveToWorkspace(name string, data []byte) (string, bool) {
+	wd, err := os.Getwd()
+	if err != nil {
+		wd = "."
+	}
+	// Sanitise: always write under workspace/ so the LLM knows
+	// where uploaded files land.
+	dest := filepath.Join(wd, "workspace", filepath.Base(name))
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", false
+	}
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		return "", false
+	}
+	// Return a path relative to workspace for clean display.
+	return "workspace/" + filepath.Base(name), true
 }
 
 // resolveAttachmentData returns the raw bytes for an attachment.

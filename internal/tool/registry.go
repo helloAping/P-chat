@@ -178,6 +178,22 @@ func RegisterBuiltin(r *Registry) {
 	}, handleWriteFile)
 
 	r.Register(Tool{
+		Name:        "read_docx",
+		Description: "Extract and return the full plain text content from a .docx (Word) file. Use this for reading Word documents uploaded by the user. Returns the document text as a single string.",
+		Parameters: ObjectSchema(map[string]any{
+			"path": StringProp("Absolute or relative path to the .docx file"),
+		}, []string{"path"}),
+	}, handleReadDocx)
+
+	r.Register(Tool{
+		Name:        "read_pdf",
+		Description: "Extract and return the full plain text content from a .pdf file. Use this for reading PDF documents uploaded by the user. Returns the document text as a single string.",
+		Parameters: ObjectSchema(map[string]any{
+			"path": StringProp("Absolute or relative path to the .pdf file"),
+		}, []string{"path"}),
+	}, handleReadPdf)
+
+	r.Register(Tool{
 		Name:        "list_files",
 		Description: "List files and subdirectories in a directory. Returns names only, not recursive.",
 		Parameters: ObjectSchema(map[string]any{
@@ -367,4 +383,36 @@ func isInUploadDir(p string) bool {
 	}
 
 	return false
+}
+
+// handleReadDocx is the tool handler for read_docx.
+func handleReadDocx(ctx context.Context, args json.RawMessage) (*CallResult, error) {
+	var a readFileArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return &CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
+	}
+	if a.Path == "" {
+		return &CallResult{Content: "path is required", IsError: true}, nil
+	}
+	text, err := readDocx(a.Path)
+	if err != nil {
+		return &CallResult{Content: err.Error(), IsError: true}, nil
+	}
+	return &CallResult{Content: text}, nil
+}
+
+// handleReadPdf is the tool handler for read_pdf.
+func handleReadPdf(ctx context.Context, args json.RawMessage) (*CallResult, error) {
+	var a readFileArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return &CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
+	}
+	if a.Path == "" {
+		return &CallResult{Content: "path is required", IsError: true}, nil
+	}
+	text, err := readPdf(a.Path)
+	if err != nil {
+		return &CallResult{Content: err.Error(), IsError: true}, nil
+	}
+	return &CallResult{Content: text}, nil
 }

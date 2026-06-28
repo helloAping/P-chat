@@ -6,7 +6,7 @@
 // insensitively. Unknown commands fall through to the normal send
 // path so the LLM can answer "what is /foo?" questions naturally.
 
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, ref, computed, watch, nextTick } from 'vue'
 import { NInput, NButton, NSpace, NScrollbar, useMessage } from 'naive-ui'
 import * as api from '../api/client'
 import {
@@ -18,6 +18,27 @@ import {
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const inputText = ref('')
+
+// Textarea auto-resize: grow with content, cap at 4 lines, then scroll.
+const TEXTAREA_MAX_LINES = 4
+function resizeTextarea() {
+  const el = inputEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  const lineHeight = parseFloat(getComputedStyle(el).lineHeight)
+  const paddingTop = parseFloat(getComputedStyle(el).paddingTop)
+  const paddingBottom = parseFloat(getComputedStyle(el).paddingBottom)
+  const maxH = lineHeight * TEXTAREA_MAX_LINES + paddingTop + paddingBottom
+  const scrollH = el.scrollHeight
+  el.style.height = Math.min(scrollH, maxH) + 'px'
+  el.style.overflowY = scrollH > maxH ? 'auto' : 'hidden'
+}
+
+watch(inputText, () => nextTick(resizeTextarea))
+watch(() => state.pendingAttachments.length, () => nextTick(resizeTextarea))
+
+// Also sync after backspace / clear (send resets inputText to '').
+onMounted(() => nextTick(resizeTextarea))
 const sending = ref(false)
 const showSessionConfig = ref(false)
 const message = useMessage()
@@ -630,8 +651,7 @@ onMounted(() => {
   outline: none;
   resize: none;
   width: 100%;
-  min-height: 20px;
-  max-height: 120px;
+  /* Height is managed by resizeTextarea(). */
   font-family: inherit;
   line-height: 1.5;
   /* Tight top margin so the textarea sits right under the chip
