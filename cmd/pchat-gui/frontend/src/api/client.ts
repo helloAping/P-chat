@@ -323,6 +323,9 @@ export const listArchived = () =>
 export const permanentDeleteSession = (id: string) =>
   jsonFetch<{ deleted: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/permanent`, { method: 'DELETE' })
 
+export const clearSessionMessages = (id: string) =>
+  jsonFetch<{ cleared: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/messages`, { method: 'DELETE' })
+
 // --- Uploads ---
 export async function uploadFile(file: File): Promise<UploadMeta> {
   const fd = new FormData()

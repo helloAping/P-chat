@@ -237,10 +237,14 @@ async function runSlash(name: string, args: string): Promise<boolean> {
       return true
     case 'clear': {
       if (state.currentID) {
-        // Clear the local cache for the current session; the on-disk
-        // history is preserved. Use a fresh session for a real reset.
-        state.sessionMessages[state.currentID] = []
-        appendSystemMessage('已清空当前对话视图(服务器历史已保留)。')
+        try {
+          await api.clearSessionMessages(state.currentID)
+          state.sessionMessages[state.currentID] = []
+          state.sessionTodos = {}
+          appendSystemMessage('已清空当前对话历史。')
+        } catch (e: any) {
+          appendSystemMessage(`清空失败: ${e.message}`)
+        }
       }
       return true
     }

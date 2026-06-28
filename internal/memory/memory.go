@@ -977,6 +977,19 @@ func (s *Store) DeleteConversation(id string) error {
 	return nil
 }
 
+// ClearMessages deletes all messages and summaries for a conversation
+// without removing the conversation record itself (preserves session ID).
+func (s *Store) ClearMessages(conversationID string) error {
+	_ = s.Flush()
+	if _, err := s.db.Exec(`DELETE FROM messages WHERE conversation_id = ?`, conversationID); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM summaries WHERE conversation_id = ?`, conversationID); err != nil {
+		return err
+	}
+	return nil
+}
+
 // SaveSummary records a compressed summary for a range of messages in a
 // conversation. Used by the auto-summarize feature.
 func (s *Store) SaveSummary(conversationID string, startID, endID int64, summary string) error {

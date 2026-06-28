@@ -747,6 +747,20 @@ func (h *Handler) PermanentDeleteSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }
 
+// ClearSessionMessages DELETE /api/v1/sessions/:id/messages
+func (h *Handler) ClearSessionMessages(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	if err := h.store.ClearMessages(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"cleared": id})
+}
+
 func (h *Handler) RenameSession(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})

@@ -652,9 +652,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, maxRounds, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
 
-			if len(toolCalls) == 0 {
-				toolCalls = parseMarkdownToolCalls(fullContent)
-			}
+		if len(toolCalls) == 0 {
+			toolCalls = parseMarkdownToolCalls(fullContent)
+		}
+		// When tool calls are present (native or markdown), strip
+		// markdown tool_call blocks from the text content so the
+		// user doesn't see both raw tool blocks AND tool cards.
+		if len(toolCalls) > 0 {
+			fullContent = cleanMarkdownToolCalls(fullContent)
+		}
 
 			// Build the assistant message for the conversation.
 			// Emit as a single text ChatMessage (tool calls are
@@ -1089,4 +1095,28 @@ func parseMarkdownToolCalls(content string) []nativeToolCall {
 		idx = ei + len(end)
 	}
 	return calls
+}
+
+// cleanMarkdownToolCalls removes ```tool_call ... ``` blocks from
+// assistant text content so the user sees clean text without raw
+// tool call JSON mixed in.
+func cleanMarkdownToolCalls(content string) string {
+	const start = "```tool_call\n"
+	const end = "\n```"
+	result := content
+	for {
+		si := strings.Index(result, start)
+		if si < 0 {
+			break
+		}
+		ei := strings.Index(result[si+len(start):], end)
+		if ei < 0 {
+			break
+		}
+		ei += si + len(start) + len(end)
+		// Remove the block and replace with a single newline to
+		// avoid joining adjacent text without whitespace.
+		result = result[:si] + result[ei:]
+	}
+	return strings.TrimSpace(result)
 }
