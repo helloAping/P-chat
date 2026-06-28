@@ -47,7 +47,7 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 		}
 		ids = append(ids, id)
 	}
-	if len(ids) <= sm.triggerAt {
+	if len(ids) == 0 {
 		return false, "", nil
 	}
 
@@ -74,10 +74,13 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 			toSummarize = append(toSummarize, id)
 		}
 	}
-	if len(toSummarize) < 4 {
+	if len(toSummarize) == 0 {
 		return false, "", nil
 	}
 	half := len(toSummarize) / 2
+	if half < 1 {
+		half = 1
+	}
 	if half > 20 {
 		half = 20
 	}
