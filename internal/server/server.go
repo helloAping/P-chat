@@ -107,6 +107,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// Messages
 		api.GET("/sessions/:id/messages", h.ListMessages)
 		api.POST("/sessions/:id/messages", h.SendMessage)
+		api.POST("/sessions/:id/compress", h.CompressConversation)
+		api.PATCH("/sessions/:id/context-level", h.SetContextLevel)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the

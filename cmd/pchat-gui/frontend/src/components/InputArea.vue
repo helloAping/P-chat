@@ -44,6 +44,21 @@ const sending = ref(false)
 const showSessionConfig = ref(false)
 const message = useMessage()
 const fileInput = ref<HTMLInputElement | null>(null)
+const contextLevel = ref('medium')
+
+// Context level options (like Codex compact/max).
+const contextLevelOptions = [
+  { label: '紧凑 15', value: 'compact' },
+  { label: '中等 50', value: 'medium' },
+  { label: '最大 200', value: 'max' },
+]
+
+async function onChangeContextLevel(val: string) {
+  contextLevel.value = val
+  if (state.currentID) {
+    try { await api.setContextLevel(state.currentID, val) } catch {}
+  }
+}
 
 // CmdSpec is imported from CommandPalette.vue
 
@@ -205,6 +220,21 @@ async function runSlash(name: string, args: string): Promise<boolean> {
         appendSystemMessage(`已重命名为: ${args}`)
       } else {
         appendSystemMessage('用法: /rename <新标题>')
+      }
+      return true
+    }
+    case 'compress': {
+      if (state.currentID) {
+        try {
+          const r = await api.compressConversation(state.currentID)
+          if (r.compressed) {
+            appendSystemMessage(`对话已压缩。\n\n摘要:\n${r.summary}`)
+          } else {
+            appendSystemMessage('对话消息数未达阈值，无需压缩。')
+          }
+        } catch (e: any) {
+          appendSystemMessage(`压缩失败: ${e.message}`)
+        }
       }
       return true
     }
@@ -609,6 +639,15 @@ onMounted(() => {
           <span>📎</span><span>添加附件</span>
         </button>
         <NSelect
+          v-model:value="contextLevel"
+          :options="contextLevelOptions"
+          size="small"
+          class="picker picker-narrow"
+          title="对话上下文级别 (紧凑/中等/最大)"
+          placeholder="上下文"
+          @update:value="onChangeContextLevel"
+        />
+        <NSelect
           v-model:value="currentStyleValue"
           :options="styleOptions"
           size="small"
@@ -784,6 +823,11 @@ onMounted(() => {
   min-width: 180px;
   max-width: 240px;
   flex: 1 1 180px;
+}
+.picker-narrow {
+  min-width: 70px;
+  max-width: 90px;
+  flex: 0 0 auto;
 }
 
 /* The input area must be height-bounded: with many attachments

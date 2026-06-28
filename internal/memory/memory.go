@@ -363,20 +363,30 @@ func (s *Store) AddChatMessageWithMeta(msg llm.ChatMessage, extraMeta map[string
 // protocol-agnostic ChatMessage values. It handles both the new
 // metadata format and the legacy format.
 func (s *Store) GetChatMessages() []llm.ChatMessage {
-	msgs, _, _ := s.GetChatMessagesWithMeta()
+	return s.GetChatMessagesN(s.maxHistory)
+}
+
+// GetChatMessagesN is like GetChatMessages with an explicit limit.
+func (s *Store) GetChatMessagesN(limit int) []llm.ChatMessage {
+	msgs, _, _ := s.GetChatMessagesWithMetaN(limit)
 	return msgs
 }
 
 // GetChatMessagesWithMeta returns ChatMessage history alongside
 // raw metadata strings and creation timestamps.
 func (s *Store) GetChatMessagesWithMeta() ([]llm.ChatMessage, []string, []int64) {
+	return s.GetChatMessagesWithMetaN(s.maxHistory)
+}
+
+// GetChatMessagesWithMetaN is like GetChatMessagesWithMeta but
+// allows overriding the fetch limit. Use 0 for unlimited.
+func (s *Store) GetChatMessagesWithMetaN(limit int) ([]llm.ChatMessage, []string, []int64) {
 	_ = s.Flush()
 	convID := s.currentID
 	if convID == "" {
 		return nil, nil, nil
 	}
 
-	limit := s.maxHistory
 	rows, err := s.db.Query(
 		`SELECT id, role, content, metadata, created_at FROM messages
 		 WHERE conversation_id = ?

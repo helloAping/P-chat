@@ -197,6 +197,15 @@ export const updateSessionMeta = (
     body: JSON.stringify(fields),
   })
 
+export const compressConversation = (id: string) =>
+  jsonFetch<{ compressed: boolean; summary: string }>(`/api/v1/sessions/${id}/compress`, { method: 'POST' })
+
+export const setContextLevel = (id: string, level: string) =>
+  jsonFetch<{ ok: boolean; context_level: string }>(`/api/v1/sessions/${id}/context-level`, {
+    method: 'PATCH',
+    body: JSON.stringify({ level }),
+  })
+
 // --- Messages ---
 export const listMessages = (id: string) =>
   jsonFetch<{ messages: Message[] }>(`/api/v1/sessions/${id}/messages`)

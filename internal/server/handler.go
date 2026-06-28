@@ -23,34 +23,31 @@ import (
 // agent and the persistent memory store so that messages and
 // sessions survive across requests.
 type Handler struct {
-	agent    *agent.Agent
-	cfg      *config.Config
-	store    *memory.Store
-	styleMgr *style.Manager
+	agent      *agent.Agent
+	cfg        *config.Config
+	store      *memory.Store
+	styleMgr   *style.Manager
+	summarizer *memory.Summarizer
 
-	// sessionMeta remembers the per-session style + provider +
-	// model overrides. The in-memory map is the hot path for
-	// reads; every write is also persisted to conversations.metadata
-	// (a JSON blob on the Conversation row) so the override
-	// survives a pchat-server restart. On startup we lazily
-	// re-hydrate the map from the store on first access.
 	metaMu sync.Mutex
 	meta   map[string]sessionMeta
 }
 
 type sessionMeta struct {
-	Style    string
-	Provider string
-	Model    string
+	Style        string
+	Provider     string
+	Model        string
+	ContextLevel string // "compact" | "medium" | "max"
 }
 
 // sessionMetaBlob is the on-disk shape written to
 // conversations.metadata. The field names are JSON lower-case so
 // the web side can pass them straight back to the PATCH endpoint.
 type sessionMetaBlob struct {
-	Style    string `json:"style,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
+	Style        string `json:"style,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
+	ContextLevel string `json:"context_level,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager) *Handler {
@@ -98,7 +95,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	if h.store == nil {
 		return
 	}
-	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model})
+	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ContextLevel: m.ContextLevel})
 	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
 		// Non-fatal: in-memory map already updated, request still
 		// works for this session. The next setSessionMeta call
@@ -124,6 +121,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.Style = blob.Style
 				m.Provider = blob.Provider
 				m.Model = blob.Model
+				m.ContextLevel = blob.ContextLevel
 			}
 		}
 	}
@@ -848,7 +846,9 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// discards everything it doesn't recognise, which used to
 	// drop the parts silently — the user would reopen a
 	// session and see only the plain text.
-	msgs, metas, createds := h.store.GetChatMessagesWithMeta()
+	meta := h.ensureMetaLoaded(id)
+	limit := contextLevelLimit(meta.ContextLevel)
+	msgs, metas, createds := h.store.GetChatMessagesWithMetaN(limit)
 	out := make([]MessageResponse, 0, len(msgs))
 	for i, m := range msgs {
 		created := time.Now().Unix()
@@ -1053,7 +1053,9 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	h.setSessionMeta(id, string(s), provider, model)
 
 	// Build messages: history + new user message
-	histMsgs := h.store.GetChatMessages()
+	meta := h.ensureMetaLoaded(id)
+	limit := contextLevelLimit(meta.ContextLevel)
+	histMsgs := h.store.GetChatMessagesN(limit)
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	msgs = append(msgs, histMsgs...)
 	msgs = append(msgs, llm.ChatMessage{
@@ -1230,6 +1232,72 @@ func ParseLimit(c *gin.Context, def int) int {
 		return def
 	}
 	return n
+}
+
+// SetSummarizer wires the summarizer for compress support.
+func (h *Handler) SetSummarizer(sm *memory.Summarizer) {
+	h.summarizer = sm
+}
+
+// CompressConversation compresses the current conversation's history.
+// POST /api/v1/sessions/:id/compress
+func (h *Handler) CompressConversation(c *gin.Context) {
+	id := c.Param("id")
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "store not available"})
+		return
+	}
+	if h.summarizer == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "summarizer not available"})
+		return
+	}
+	if err := h.store.SetCurrent(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	ok, summary, err := h.summarizer.Compress(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"compressed": ok, "summary": summary})
+}
+
+// SetContextLevel updates the per-session context level.
+// PATCH /api/v1/sessions/:id/context-level
+func (h *Handler) SetContextLevel(c *gin.Context) {
+	id := c.Param("id")
+	var req struct{ Level string `json:"level"` }
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Level != "compact" && req.Level != "medium" && req.Level != "max" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "level must be compact, medium, or max"})
+		return
+	}
+	h.metaMu.Lock()
+	m := h.meta[id]
+	m.ContextLevel = req.Level
+	h.meta[id] = m
+	h.metaMu.Unlock()
+	if h.store != nil {
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ContextLevel: m.ContextLevel})
+		_ = h.store.UpdateConversationMeta(id, string(blob))
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "context_level": req.Level})
+}
+
+// contextLevelLimit returns the message fetch limit for a context level.
+func contextLevelLimit(level string) int {
+	switch level {
+	case "compact":
+		return 15
+	case "max":
+		return 200
+	default:
+		return 50
+	}
 }
 
 // reloadAfterConfigChange re-reads the on-disk config, rebuilds the

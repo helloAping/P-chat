@@ -346,10 +346,10 @@ func TestMigrateLegacy_NotExist(t *testing.T) {
 }
 
 func TestTruncate(t *testing.T) {
-	if got := truncate("hello", 10); got != "hello" {
+	if got := truncateStr("hello", 10); got != "hello" {
 		t.Errorf("short string: %q", got)
 	}
-	if got := truncate("hello world this is long", 10); !strings.HasSuffix(got, "...") {
+	if got := truncateStr("hello world this is long", 10); !strings.HasSuffix(got, "...") {
 		t.Errorf("truncated should end with ..., got %q", got)
 	}
 }
