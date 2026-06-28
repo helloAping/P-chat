@@ -689,7 +689,7 @@ function fmtContext(n?: number) {
         </div>
       </NTabPane>
 
-      <NTabPane name="styles" tab="风格配置">
+      <NTabPane name="styles" tab="风格配置" style="flex: 1; min-height: 0; overflow: auto">
         <NSpace vertical size="large">
           <div>
             <h3 class="section-title">已配置的风格</h3>
