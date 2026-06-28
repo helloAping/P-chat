@@ -24,6 +24,7 @@ const GROUP_LABELS: Record<string, string> = {
   config: '配置',
   info: '信息',
   danger: '危险',
+  skill: '技能',
 }
 
 const filtered = computed(() => {

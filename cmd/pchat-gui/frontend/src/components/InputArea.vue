@@ -282,16 +282,6 @@ async function runSlash(name: string, args: string): Promise<boolean> {
       return true
     }
   }
-  // Skill slash commands — load content and inject.
-  if (skillCommands.value.some(c => c.name === name)) {
-    try {
-      const r = await api.getSkill(name)
-      appendSystemMessage(r.skill.content || `技能「${name}」已加载（无 SKILL.md 内容）。`)
-    } catch (e: any) {
-      appendSystemMessage(`技能 /${name} 加载失败: ${e.message}`)
-    }
-    return true
-  }
   // Fall back to the server's command endpoint for anything else.
   try {
     const r = await api.runCommand(name, args)
@@ -333,11 +323,42 @@ async function send() {
     const parsed = parseSlashLine()
     inputText.value = ''
     if (parsed) {
-      sending.value = true
-      try { await runSlash(parsed.name, parsed.args) }
-      finally { sending.value = false }
+      // Skill commands: load content and send to LLM.
+      if (skillCommands.value.some(c => c.name === parsed.name)) {
+        sending.value = true
+        try {
+          const r = await api.getSkill(parsed.name)
+          const skillContent = r.skill.content || ''
+          const userInput = parsed.args || ''
+          // Rebuild inputText: skill content prepended, then user args.
+          inputText.value = userInput
+          // Proceed with normal send — skill content becomes the
+          // user message so the LLM gets both skill + user query.
+          // We push a system note first so the user sees what happened.
+          appendSystemMessage(`已加载技能「${parsed.name}」` + (userInput ? `，将连同问题一起发送` : ''))
+          // Inject skill content as a system instruction BEFORE the user message.
+          const id = state.currentID
+          if (id) {
+            if (!state.sessionMessages[id]) state.sessionMessages[id] = []
+            state.sessionMessages[id].push({ role: 'system', content: skillContent })
+            api.saveSystemMessage(id, skillContent)
+          }
+          // Fall through to normal send.
+          sending.value = false
+        } catch (e: any) {
+          appendSystemMessage(`技能 /${parsed.name} 加载失败: ${e.message}`)
+          sending.value = false
+          return
+        }
+      } else {
+        sending.value = true
+        try { await runSlash(parsed.name, parsed.args) }
+        finally { sending.value = false }
+        return
+      }
+    } else {
+      return
     }
-    return
   }
 
   if (!state.currentID) {
