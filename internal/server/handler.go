@@ -1052,10 +1052,20 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// sending an empty body is fine.
 	h.setSessionMeta(id, string(s), provider, model)
 
-	// Build messages: history + new user message
+	// Build messages: history after last compression + new user message.
+	// Messages older than the compressed range are replaced by the
+	// CompressedSummary field on the ChatRequest.
 	meta := h.ensureMetaLoaded(id)
 	limit := contextLevelLimit(meta.ReasoningEffort)
-	histMsgs := h.store.GetChatMessagesN(limit)
+	lastComp := h.store.LastCompressedID()
+	var histMsgs []llm.ChatMessage
+	var compSummary string
+	if lastComp > 0 {
+		histMsgs, _, _ = h.store.GetChatMessagesAfterID(limit, lastComp)
+		compSummary = h.store.CompressedSummary()
+	} else {
+		histMsgs = h.store.GetChatMessagesN(limit)
+	}
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
 		if m.Role == llm.RoleSystem || m.Type == llm.TypeImage {
@@ -1070,12 +1080,13 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	})
 
 	chatReq := agent.ChatRequest{
-		Style:          s,
-		Provider:       provider,
-		Model:          model,
-		Messages:       msgs,
-		Attachments:    req.Attachments,
-		ReasoningEffort: meta.ReasoningEffort,
+		Style:             s,
+		Provider:          provider,
+		Model:             model,
+		Messages:          msgs,
+		Attachments:       req.Attachments,
+		ReasoningEffort:   meta.ReasoningEffort,
+		CompressedSummary: compSummary,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)

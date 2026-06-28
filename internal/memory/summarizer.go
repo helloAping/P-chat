@@ -77,14 +77,12 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 	if len(toSummarize) == 0 {
 		return false, "", nil
 	}
-	half := len(toSummarize) / 2
-	if half < 1 {
-		half = 1
+	// Summarize ALL unsummarized messages (explicit /compress).
+	// Cap at 100 to avoid excessive prompt length.
+	rangeIDs := toSummarize
+	if len(rangeIDs) > 100 {
+		rangeIDs = rangeIDs[:100]
 	}
-	if half > 20 {
-		half = 20
-	}
-	rangeIDs := toSummarize[:half]
 	startID, endID := rangeIDs[0], rangeIDs[len(rangeIDs)-1]
 
 	texts := make([]string, 0, len(rangeIDs))

@@ -180,6 +180,10 @@ type ChatRequest struct {
 	// does before responding. off|low|medium|high|max. Empty means
 	// the model default.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// CompressedSummary is a pre-summarized version of older
+	// conversation history. When non-empty, it is appended to the
+	// system prompt so the LLM has context from before compression.
+	CompressedSummary string `json:"compressed_summary,omitempty"`
 }
 
 type ChatStreamChunk struct {
@@ -469,6 +473,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			return
 		}
 		ch <- ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))}
+
+		// Append compressed summary if provided (from /compress).
+		if req.CompressedSummary != "" {
+			systemPrompt += "\n\n[前文摘要]\n" + req.CompressedSummary
+		}
 
 		// Build the message list: system prompt + user messages.
 		// Each message is a separate protocol-agnostic ChatMessage.

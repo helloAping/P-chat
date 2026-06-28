@@ -955,6 +955,100 @@ func (s *Store) GetSummaries(conversationID string) []Summary {
 	return out
 }
 
+// LastCompressedID returns the highest range_end across all summaries
+// for the current conversation, or 0 if nothing has been compressed.
+func (s *Store) LastCompressedID() int64 {
+	var maxEnd sql.NullInt64
+	_ = s.db.QueryRow(
+		`SELECT MAX(range_end) FROM summaries WHERE conversation_id = ?`,
+		s.currentID,
+	).Scan(&maxEnd)
+	if maxEnd.Valid {
+		return maxEnd.Int64
+	}
+	return 0
+}
+
+// CompressedSummary returns the concatenated text of all summaries
+// for the current conversation, or empty string if none.
+func (s *Store) CompressedSummary() string {
+	rows, err := s.db.Query(
+		`SELECT summary FROM summaries WHERE conversation_id = ? ORDER BY range_start ASC`,
+		s.currentID,
+	)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	var parts []string
+	for rows.Next() {
+		var txt string
+		if err := rows.Scan(&txt); err != nil {
+			continue
+		}
+		parts = append(parts, txt)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// GetChatMessagesAfterID returns up to limit ChatMessage rows with
+// id > afterID from the current conversation, oldest first. Use 0
+// for afterID to get all messages (no filter).
+func (s *Store) GetChatMessagesAfterID(limit int, afterID int64) ([]llm.ChatMessage, []string, []int64) {
+	_ = s.Flush()
+	convID := s.currentID
+	if convID == "" {
+		return nil, nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT id, role, content, metadata, created_at FROM messages
+		 WHERE conversation_id = ? AND id > ?
+		 ORDER BY id DESC LIMIT ?`,
+		convID, afterID, limitOrHuge(limit),
+	)
+	if err != nil {
+		return nil, nil, nil
+	}
+	defer rows.Close()
+
+	type row struct {
+		msg     llm.ChatMessage
+		meta    string
+		created int64
+	}
+	var rev []row
+	for rows.Next() {
+		var (
+			id                    int64
+			role, content         string
+			metaStr               sql.NullString
+			created               int64
+		)
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created); err != nil {
+			break
+		}
+		meta := ""
+		if metaStr.Valid {
+			meta = metaStr.String
+		}
+		msgs := decodeChatMessages(role, content, meta)
+		for _, m := range msgs {
+			rev = append(rev, row{msg: m, meta: meta, created: created})
+		}
+	}
+	// Reverse to ASC order.
+	n := len(rev)
+	out := make([]llm.ChatMessage, n)
+	metas := make([]string, n)
+	createds := make([]int64, n)
+	for i, r := range rev {
+		out[n-1-i] = r.msg
+		metas[n-1-i] = r.meta
+		createds[n-1-i] = r.created
+	}
+	return out, metas, createds
+}
+
 // ConversationMessageCount returns the number of messages in the current
 // conversation.
 func (s *Store) ConversationMessageCount() int {
