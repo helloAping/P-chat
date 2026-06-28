@@ -276,6 +276,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		skillSignature(a.skills),
 		strings.Join(toolNames, ","),
 		lang,
+		projectRoot,
 	}, "|")
 	if sig == a.staticPromptID && a.staticPrompt != "" {
 		return a.staticPrompt, sig, nil
@@ -341,7 +342,16 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 			"用户可见错误信息。\n")
 	}
 
-	// 6. Output language hint — also part of the cacheable prefix
+	// 6. Project root — tells the LLM which directory to use
+	// as CWD for exec_command and file operations.
+	if projectRoot != "" {
+		sb.WriteString(fmt.Sprintf("\n---\n\n## 项目目录\n\n当前项目根目录是 `%s`。\n"+
+			"执行命令（exec_command）时，默认工作目录为此目录，\n"+
+			"无需在 work_dir 参数中重复指定。\n"+
+			"读写文件时，相对路径以此目录为基准。\n", projectRoot))
+	}
+
+	// 7. Output language hint — also part of the cacheable prefix
 	// because changing it forces a full re-build anyway.
 	if lang == "zh" {
 		sb.WriteString("\n---\n\n## 输出语言\n\n请用简体中文回答用户的问题。\n")
@@ -729,6 +739,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
+				}
+				if req.ProjectRoot != "" {
+					tctx = tool.WithProjectRoot(tctx, req.ProjectRoot)
 				}
 				tctx, cancel := context.WithTimeout(tctx, 5*time.Minute)
 

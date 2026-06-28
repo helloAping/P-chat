@@ -59,6 +59,24 @@ func sandboxFromCtx(ctx context.Context) SandboxChecker {
 	return nil
 }
 
+type projectRootKey struct{}
+
+// WithProjectRoot stores the session's project root directory in ctx.
+func WithProjectRoot(ctx context.Context, root string) context.Context {
+	if root == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, projectRootKey{}, root)
+}
+
+// projectRootFromCtx extracts the project root, or returns "".
+func projectRootFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(projectRootKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 type Registry struct {
 	tools map[string]ToolHandler
 	meta  map[string]Tool
@@ -245,6 +263,8 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	cmd := exec.CommandContext(ctx, "cmd", "/C", a.Command)
 	if a.WorkDir != "" {
 		cmd.Dir = a.WorkDir
+	} else if root := projectRootFromCtx(ctx); root != "" {
+		cmd.Dir = root
 	}
 
 	out, err := cmd.CombinedOutput()

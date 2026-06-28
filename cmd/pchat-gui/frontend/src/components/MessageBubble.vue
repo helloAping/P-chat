@@ -35,7 +35,6 @@ const isSystem = computed(() => props.message.role === 'system')
 const assistantHtml = computed(() => '')
 
 const userHtml = computed(() => {
-  if (props.message.role === 'tool') return ''
   const md = marked.parse(props.message.content || '', { async: false, breaks: true })
   return md as string
 })
@@ -150,9 +149,9 @@ const showVisionWarn = computed(() =>
           <span class="warn-hint">切换到支持视觉的模型（如 gpt-4o / claude-3.5+）后重新发送</span>
         </div>
 
-        <!-- User / system: markdown of `content` -->
+        <!-- User / system / tool: markdown of `content` -->
         <div
-          v-if="message.role === 'user' || message.role === 'system'"
+          v-if="message.role === 'user' || message.role === 'system' || message.role === 'tool'"
           class="md-body"
           v-html="userHtml"
         />

@@ -610,19 +610,16 @@ func (h *Handler) ListSessions(c *gin.Context) {
 		return
 	}
 	projectPath := c.Query("project_path")
+	hasProjectParam := c.Request.URL.Query().Has("project_path")
 	convs := h.store.ListConversations()
 	out := make([]SessionResponse, 0, len(convs))
 	for _, conv := range convs {
 		resp := h.sessionToResponse(conv)
-		// Filter by project_path when query param is present.
-		// Empty query means "all sessions"; explicit "" means
-		// "only global (non-project) sessions".
 		if projectPath != "" {
 			if resp.ProjectPath != projectPath {
 				continue
 			}
-		} else if c.Query("project_path") != "" {
-			// Explicit ?project_path= — show only global sessions.
+		} else if hasProjectParam {
 			if resp.ProjectPath != "" {
 				continue
 			}
@@ -940,6 +937,13 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		// render the raw base64 string as text.
 		if m.Type == llm.TypeImage {
 			resp.Content = ""
+		}
+		// Tool call / result messages are embedded in the
+		// main assistant message's Parts — the separate rows
+		// are only for DB reconstruction and cause blank
+		// bubbles if returned to the frontend.
+		if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
+			continue
 		}
 
 		out = append(out, resp)
