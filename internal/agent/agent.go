@@ -922,13 +922,13 @@ func formatElapsed(d time.Duration) string {
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
-// filterToolCalls removes TypeToolCall messages from a slice.
-// These carry metadata only and would cause API errors if sent
-// to providers that validate tool_call/tool_result pairing.
+// filterToolCalls removes TypeToolCall and TypeToolResult messages.
+// These carry metadata only and would cause API errors if sent to
+// providers that validate tool_call/tool_result pairing.
 func filterToolCalls(msgs []llm.ChatMessage) []llm.ChatMessage {
 	out := make([]llm.ChatMessage, 0, len(msgs))
 	for _, m := range msgs {
-		if m.Type == llm.TypeToolCall {
+		if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
 			continue
 		}
 		out = append(out, m)

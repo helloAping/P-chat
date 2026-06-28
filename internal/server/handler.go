@@ -1135,7 +1135,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	}
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
-		if m.Role == llm.RoleSystem || m.Type == llm.TypeImage || m.Type == llm.TypeToolCall {
+		if m.Role == llm.RoleSystem || m.Type == llm.TypeImage || m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
 			continue
 		}
 		msgs = append(msgs, m)
