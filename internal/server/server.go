@@ -134,6 +134,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 
 		// Skills
 		api.GET("/skills", h.ListSkills)
+		api.GET("/skills/:name", h.GetSkill)
 		api.POST("/skills/install", h.InstallSkill)
 		api.DELETE("/skills/:name", h.DeleteSkill)
 		api.GET("/skills/search", h.SearchSkills)

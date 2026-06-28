@@ -259,6 +259,7 @@ export interface SkillItem {
   name: string
   description: string
   path: string
+  content?: string
 }
 
 export interface SearchSkillItem {
@@ -269,6 +270,9 @@ export interface SearchSkillItem {
 
 export const listSkills = () =>
   jsonFetch<{ skills: SkillItem[] }>('/api/v1/skills')
+
+export const getSkill = (name: string) =>
+  jsonFetch<{ skill: SkillItem }>(`/api/v1/skills/${encodeURIComponent(name)}`)
 
 export const installSkill = (name: string, url: string) =>
   jsonFetch<{ ok: boolean; name: string }>('/api/v1/skills/install', {

@@ -70,6 +70,7 @@ async function onChangeReasoningEffort(val: string) {
 // CmdSpec is imported from CommandPalette.vue
 
 const commandList = ref<CmdSpec[]>([])
+const skillCommands = ref<CmdSpec[]>([])
 
 // Merge local commands that aren't in the server list.
 const LOCAL_COMMANDS: CmdSpec[] = [
@@ -87,6 +88,9 @@ const allCommands = computed(() => {
   for (const c of commandList.value) {
     if (!localNames.has(c.name)) merged.push(c)
   }
+  for (const c of skillCommands.value) {
+    if (!localNames.has(c.name)) merged.push(c)
+  }
   return merged
 })
 
@@ -97,7 +101,20 @@ onMounted(async () => {
   } catch {
     // Non-fatal: slash palette will simply be empty.
   }
+  loadSkillCommands()
 })
+
+async function loadSkillCommands() {
+  try {
+    const r = await api.listSkills()
+    skillCommands.value = (r.skills || []).map(s => ({
+      name: s.name,
+      description: s.description || '加载技能上下文',
+      group: 'skill' as const,
+      web_safe: true,
+    }))
+  } catch { /* ignore */ }
+}
 
 function onPickFiles() {
   fileInput.value?.click()
@@ -264,6 +281,16 @@ async function runSlash(name: string, args: string): Promise<boolean> {
       }
       return true
     }
+  }
+  // Skill slash commands — load content and inject.
+  if (skillCommands.value.some(c => c.name === name)) {
+    try {
+      const r = await api.getSkill(name)
+      appendSystemMessage(r.skill.content || `技能「${name}」已加载（无 SKILL.md 内容）。`)
+    } catch (e: any) {
+      appendSystemMessage(`技能 /${name} 加载失败: ${e.message}`)
+    }
+    return true
   }
   // Fall back to the server's command endpoint for anything else.
   try {

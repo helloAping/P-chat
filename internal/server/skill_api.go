@@ -18,6 +18,7 @@ type skillResponse struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Path        string `json:"path"`
+	Content     string `json:"content,omitempty"`
 }
 
 // ListSkills GET /api/v1/skills
@@ -36,6 +37,28 @@ func (h *Handler) ListSkills(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"skills": out})
+}
+
+// GetSkill GET /api/v1/skills/:name
+func (h *Handler) GetSkill(c *gin.Context) {
+	name := c.Param("name")
+	skills, err := skill.LoadAll()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	for _, s := range skills {
+		if s.Name == name {
+			c.JSON(http.StatusOK, gin.H{"skill": skillResponse{
+				Name:        s.Name,
+				Description: s.Description,
+				Path:        s.Path,
+				Content:     s.Content,
+			}})
+			return
+		}
+	}
+	c.JSON(http.StatusNotFound, gin.H{"error": "skill not found"})
 }
 
 // DeleteSkill DELETE /api/v1/skills/:name
@@ -276,14 +299,32 @@ func searchSkills(q string) ([]searchResult, error) {
 
 func extractFirstLine(content string) string {
 	lines := strings.Split(content, "\n")
+	var para []string
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			if len(para) > 0 {
+				break
+			}
 			continue
 		}
-		return strings.TrimSpace(line)
+		para = append(para, trimmed)
 	}
-	return ""
+	if len(para) == 0 {
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			return line
+		}
+		return ""
+	}
+	result := strings.Join(para, " ")
+	if len(result) > 200 {
+		result = result[:200] + "..."
+	}
+	return result
 }
 
 // --- Skill repos ---
