@@ -258,6 +258,16 @@ export const pickFolder = () =>
 export const listMessages = (id: string) =>
   jsonFetch<{ messages: Message[] }>(`/api/v1/sessions/${id}/messages`)
 
+// --- Archive ---
+export const archiveSession = (id: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST' })
+
+export const unarchiveSession = (id: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/sessions/${encodeURIComponent(id)}/unarchive`, { method: 'POST' })
+
+export const listArchived = () =>
+  jsonFetch<{ sessions: Session[] }>('/api/v1/sessions/archived')
+
 // --- Uploads ---
 export async function uploadFile(file: File): Promise<UploadMeta> {
   const fd = new FormData()

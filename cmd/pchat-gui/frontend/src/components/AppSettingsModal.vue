@@ -28,9 +28,10 @@ import {
 } from 'naive-ui'
 import * as api from '../api/client'
 import { loadProviders } from '../stores/chat'
+import type { Session } from '../api/client'
 
 const message = useMessage()
-const tab = ref<'providers' | 'styles'>('providers')
+const tab = ref<'providers' | 'styles' | 'archive'>('providers')
 
 // --- Provider state ---
 const providers = ref<api.ProviderInfo[]>([])
@@ -91,6 +92,12 @@ const isEdit = ref(false)
 
 onMounted(async () => {
   await refresh()
+})
+
+watch(tab, (v) => {
+  if (v === 'archive' && !archivedSessions.value.length) {
+    loadArchived()
+  }
 })
 
 async function refresh() {
@@ -467,7 +474,53 @@ async function onDeleteStyle(id: string) {
 }
 
 function close() { (window as any).closeAppSettings?.() }
+
+// --- Archive state ---
+const archivedSessions = ref<Session[]>([])
+const loadingArchived = ref(false)
+
+function groupByProject(sessions: Session[]): Map<string, Session[]> {
+  const map = new Map<string, Session[]>()
+  for (const s of sessions) {
+    const key = s.project_path || '(全局)'
+    if (!map.has(key)) map.set(key, [])
+    map.get(key)!.push(s)
+  }
+  return map
+}
+const archivedGroups = computed(() => {
+  const map = groupByProject(archivedSessions.value)
+  return Array.from(map.entries())
+})
+
+async function loadArchived() {
+  loadingArchived.value = true
+  try {
+    const r = await api.listArchived()
+    archivedSessions.value = r.sessions || []
+  } catch (e: any) {
+    message.error(e.message || '加载归档失败')
+  } finally {
+    loadingArchived.value = false
+  }
+}
+
+async function onUnarchive(id: string) {
+  try {
+    await api.unarchiveSession(id)
+    archivedSessions.value = archivedSessions.value.filter(s => s.id !== id)
+    message.success('已恢复')
+  } catch (e: any) {
+    message.error(e.message || '恢复失败')
+  }
+}
 function closeStyleEditor() { showAddStyle.value = false; resetNewStyle() }
+
+function formatArchiveTime(ts: number): string {
+  const d = new Date(ts * 1000)
+  return d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) + ' ' +
+    d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+}
 
 const builtInStyles = new Set(['cute', 'guofeng', 'tech'])
 function isBuiltIn(id: string) { return builtInStyles.has(id) }
@@ -757,6 +810,20 @@ function fmtContext(n?: number) {
         </NSpace>
         </div>
       </NTabPane>
+
+      <NTabPane name="archive" tab="归档" style="flex: 1; min-height: 0; overflow: auto">
+        <div v-if="!archivedSessions.length && !loadingArchived" class="empty-hint">
+          暂无归档对话
+        </div>
+        <div v-else v-for="[project, sessions] in archivedGroups" :key="project" class="archive-group">
+          <div class="archive-group-title">{{ project }}</div>
+          <div v-for="s in (sessions as Session[])" :key="s.id" class="archive-row">
+            <span class="archive-title">{{ s.title || '(无标题)' }}</span>
+            <span class="archive-meta">{{ formatArchiveTime(s.updated_at) }}</span>
+            <NButton size="tiny" quaternary @click="onUnarchive(s.id)">恢复</NButton>
+          </div>
+        </div>
+      </NTabPane>
     </NTabs>
 
     <template #footer>
@@ -902,6 +969,18 @@ function fmtContext(n?: number) {
 }
 code {
   background: var(--bg-3); padding: 1px 6px; border-radius: 3px;
-  font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+  font-family: ui-monospace, Menlo, monospace; font-size: 12px;}
+.archive-group { margin-bottom: 16px; }
+.archive-group-title {
+  font-weight: 600; font-size: 13px;
+  padding: 4px 0 8px; border-bottom: 1px solid var(--border-2);
+  margin-bottom: 8px; color: var(--text-2);
 }
+.archive-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 8px; border-radius: 6px;
+}
+.archive-row:hover { background: var(--bg-3); }
+.archive-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-meta { font-size: 11px; color: var(--text-4); white-space: nowrap; }
 </style>

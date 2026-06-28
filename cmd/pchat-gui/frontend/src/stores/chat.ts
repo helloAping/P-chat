@@ -219,7 +219,7 @@ export async function createSession(): Promise<string> {
 }
 
 export async function deleteSessionById(id: string) {
-  await api.deleteSession(id)
+  await api.archiveSession(id)
   state.sessions = state.sessions.filter(s => s.id !== id)
   delete state.sessionMessages[id]
   delete state.sessionMeta[id]

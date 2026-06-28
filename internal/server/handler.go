@@ -716,17 +716,14 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
-	if err := h.store.DeleteConversation(id); err != nil {
+	if err := h.store.ArchiveConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	// Drop the cached meta so a recycled id (extremely unlikely
-	// with our id scheme, but possible across long uptimes) does
-	// not inherit the dead session's overrides.
 	h.metaMu.Lock()
 	delete(h.meta, id)
 	h.metaMu.Unlock()
-	c.JSON(http.StatusOK, gin.H{"deleted": id})
+	c.JSON(http.StatusOK, gin.H{"archived": id})
 }
 
 func (h *Handler) RenameSession(c *gin.Context) {
@@ -1456,6 +1453,10 @@ func (h *Handler) RemoveProject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
 		return
 	}
+	// Archive all sessions associated with this project.
+	if h.store != nil {
+		h.store.ArchiveByProjectPath(req.Path)
+	}
 	projects, err := project.Remove(req.Path)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1509,4 +1510,48 @@ func (h *Handler) PickFolder(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"path": path})
+}
+
+// --- Archive ---
+
+// ArchiveSession POST /api/v1/sessions/:id/archive
+func (h *Handler) ArchiveSession(c *gin.Context) {
+	id := c.Param("id")
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	if err := h.store.ArchiveConversation(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// UnarchiveSession POST /api/v1/sessions/:id/unarchive
+func (h *Handler) UnarchiveSession(c *gin.Context) {
+	id := c.Param("id")
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	if err := h.store.UnarchiveConversation(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ListArchived GET /api/v1/sessions/archived
+func (h *Handler) ListArchived(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	convs := h.store.ListArchivedConversations()
+	out := make([]SessionResponse, 0, len(convs))
+	for _, conv := range convs {
+		out = append(out, h.sessionToResponse(conv))
+	}
+	c.JSON(http.StatusOK, gin.H{"sessions": out})
 }

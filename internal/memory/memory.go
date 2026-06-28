@@ -28,6 +28,7 @@ type Conversation struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Metadata  string    `json:"metadata,omitempty"`
+	Archived  bool      `json:"archived"`
 }
 
 // Message is one entry in a conversation's history.
@@ -193,6 +194,8 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("exec %q: %w", q, err)
 		}
 	}
+	// Migration: add archived column to conversations (v2 schema).
+	s.db.Exec(`ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`)
 	return nil
 }
 
@@ -820,7 +823,7 @@ func (s *Store) SetCurrent(id string) error {
 // ListConversations returns all conversations ordered by updated_at desc.
 func (s *Store) ListConversations() []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,'') FROM conversations ORDER BY updated_at DESC, id DESC`)
+	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`)
 	if err != nil {
 		return nil
 	}
@@ -829,11 +832,13 @@ func (s *Store) ListConversations() []Conversation {
 	for rows.Next() {
 		var c Conversation
 		var created, updated int64
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata); err != nil {
+		var archived int
+		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived); err != nil {
 			return out
 		}
 		c.CreatedAt = time.Unix(created, 0)
 		c.UpdatedAt = time.Unix(updated, 0)
+		c.Archived = archived != 0
 		out = append(out, c)
 	}
 	return out
@@ -884,16 +889,69 @@ func (s *Store) GetConversation(id string) (Conversation, error) {
 	_ = s.Flush()
 	var c Conversation
 	var created, updated int64
+	var archived int
 	err := s.db.QueryRow(
-		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,'') FROM conversations WHERE id = ?`,
+		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE id = ?`,
 		id,
-	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata)
+	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived)
 	if err != nil {
 		return Conversation{}, err
 	}
 	c.CreatedAt = time.Unix(created, 0)
 	c.UpdatedAt = time.Unix(updated, 0)
+	c.Archived = archived != 0
 	return c, nil
+}
+
+// ArchiveConversation marks a conversation as archived.
+func (s *Store) ArchiveConversation(id string) error {
+	_, err := s.db.Exec(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`, time.Now().Unix(), id)
+	return err
+}
+
+// UnarchiveConversation restores an archived conversation.
+func (s *Store) UnarchiveConversation(id string) error {
+	_, err := s.db.Exec(`UPDATE conversations SET archived = 0, updated_at = ? WHERE id = ?`, time.Now().Unix(), id)
+	return err
+}
+
+// ArchiveByProjectPath archives all conversations whose metadata
+// contains the given project_path.
+func (s *Store) ArchiveByProjectPath(projectPath string) (int, error) {
+	now := time.Now().Unix()
+	res, err := s.db.Exec(
+		`UPDATE conversations SET archived = 1, updated_at = ? WHERE metadata LIKE ?`,
+		now, `%"project_path":"`+projectPath+`"%`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// ListArchivedConversations returns all archived conversations.
+func (s *Store) ListArchivedConversations() []Conversation {
+	_ = s.Flush()
+	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []Conversation
+	for rows.Next() {
+		var c Conversation
+		var created, updated int64
+		var archived int
+		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived); err != nil {
+			return out
+		}
+		c.CreatedAt = time.Unix(created, 0)
+		c.UpdatedAt = time.Unix(updated, 0)
+		c.Archived = archived != 0
+		out = append(out, c)
+	}
+	return out
 }
 
 // DeleteConversation removes a conversation and all its messages.
