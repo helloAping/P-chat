@@ -47,11 +47,17 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const reasoningEffort = ref('off')
 
 const reasoningEffortOptions = [
-  { label: '推理 关闭', value: 'off' },
-  { label: '推理 低', value: 'low' },
-  { label: '推理 中', value: 'medium' },
-  { label: '推理 高', value: 'high' },
-  { label: '推理 最高', value: 'max' },
+  {
+    type: 'group' as const,
+    label: '推理',
+    children: [
+      { label: '关闭', value: 'off' },
+      { label: '低', value: 'low' },
+      { label: '中', value: 'medium' },
+      { label: '高', value: 'high' },
+      { label: '最高', value: 'max' },
+    ],
+  },
 ]
 
 async function onChangeReasoningEffort(val: string) {
