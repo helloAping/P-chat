@@ -1057,7 +1057,12 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	limit := contextLevelLimit(meta.ReasoningEffort)
 	histMsgs := h.store.GetChatMessagesN(limit)
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
-	msgs = append(msgs, histMsgs...)
+	for _, m := range histMsgs {
+		if m.Role == llm.RoleSystem {
+			continue
+		}
+		msgs = append(msgs, m)
+	}
 	msgs = append(msgs, llm.ChatMessage{
 		Role:    llm.RoleUser,
 		Type:    llm.TypeText,
@@ -1288,6 +1293,38 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
+}
+
+// SaveSystemMessage persists a system message to the conversation
+// history for display-only purposes. System messages are shown in
+// the chat window but excluded from LLM context.
+// POST /api/v1/sessions/:id/system-message
+func (h *Handler) SaveSystemMessage(c *gin.Context) {
+	id := c.Param("id")
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	var body struct{ Content string `json:"content"` }
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if body.Content == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "content is required"})
+		return
+	}
+	if err := h.store.SetCurrent(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	h.store.AddChatMessage(llm.ChatMessage{
+		Role:    llm.RoleSystem,
+		Type:    llm.TypeText,
+		Content: body.Content,
+	})
+	h.store.Flush()
+	c.JSON(http.StatusCreated, gin.H{"ok": true})
 }
 
 // contextLevelLimit returns the default message fetch limit.

@@ -622,6 +622,7 @@ export function appendSystemMessage(text: string) {
   if (!id) return
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
   state.sessionMessages[id].push({ role: 'system', content: text })
+  api.saveSystemMessage(id, text)
 }
 
 export function endStream(id: string) {

@@ -206,6 +206,12 @@ export const setReasoningEffort = (id: string, level: string) =>
     body: JSON.stringify({ level }),
   })
 
+export const saveSystemMessage = (id: string, content: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/sessions/${id}/system-message`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  })
+
 // --- Messages ---
 export const listMessages = (id: string) =>
   jsonFetch<{ messages: Message[] }>(`/api/v1/sessions/${id}/messages`)
