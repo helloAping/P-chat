@@ -1,0 +1,250 @@
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/internal/skill"
+)
+
+type skillResponse struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Path        string `json:"path"`
+}
+
+// ListSkills GET /api/v1/skills
+func (h *Handler) ListSkills(c *gin.Context) {
+	skills, err := skill.LoadAll()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	out := make([]skillResponse, 0, len(skills))
+	for _, s := range skills {
+		out = append(out, skillResponse{
+			Name:        s.Name,
+			Description: s.Description,
+			Path:        s.Path,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"skills": out})
+}
+
+// DeleteSkill DELETE /api/v1/skills/:name
+func (h *Handler) DeleteSkill(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "skill name is required"})
+		return
+	}
+	dir := filepath.Join(paths.GlobalSkillsDir(), name)
+	if err := os.RemoveAll(dir); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// Reload agent skills so the system prompt updates.
+	if h.agent != nil {
+		h.agent.Reload()
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+type installSkillRequest struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+// InstallSkill POST /api/v1/skills/install
+// URL can be a GitHub repo or a raw SKILL.md URL.
+func (h *Handler) InstallSkill(c *gin.Context) {
+	var req installSkillRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if req.URL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required"})
+		return
+	}
+	name := req.Name
+	if name == "" {
+		name = inferSkillName(req.URL)
+	}
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	content, err := fetchSkillContent(req.URL)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	dir := filepath.Join(paths.GlobalSkillsDir(), name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if h.agent != nil {
+		h.agent.Reload()
+	}
+	c.JSON(http.StatusCreated, gin.H{"ok": true, "name": name})
+}
+
+// inferSkillName extracts a skill name from a URL.
+func inferSkillName(url string) string {
+	// Try raw GitHub path: .../skills/name/SKILL.md
+	if idx := strings.Index(url, "/skills/"); idx >= 0 {
+		rest := url[idx+len("/skills/"):]
+		if i := strings.Index(rest, "/"); i >= 0 {
+			return rest[:i]
+		}
+	}
+	// Try GitHub repo: github.com/user/repo
+	if strings.Contains(url, "github.com") {
+		parts := strings.Split(strings.TrimRight(url, "/"), "/")
+		if len(parts) >= 2 {
+			repo := parts[len(parts)-1]
+			repo = strings.TrimSuffix(repo, ".git")
+			return repo
+		}
+	}
+	return ""
+}
+
+// fetchSkillContent downloads the SKILL.md from a remote URL.
+func fetchSkillContent(url string) (string, error) {
+	// Convert GitHub repo URL to raw SKILL.md URL.
+	rawURL := url
+	if strings.Contains(url, "github.com") && !strings.Contains(url, "raw.githubusercontent.com") {
+		// github.com/user/repo → raw.githubusercontent.com/user/repo/main/SKILL.md
+		rawURL = strings.Replace(url, "github.com", "raw.githubusercontent.com", 1)
+		rawURL = strings.TrimRight(rawURL, "/")
+		rawURL += "/main/SKILL.md"
+	} else if strings.Contains(url, "github.com") && strings.Contains(url, "/blob/") {
+		rawURL = strings.Replace(url, "github.com", "raw.githubusercontent.com", 1)
+		rawURL = strings.Replace(rawURL, "/blob/", "/", 1)
+	}
+
+	resp, err := http.Get(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s: %w", rawURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch %s: HTTP %d", rawURL, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+	return string(body), nil
+}
+
+// GET /api/v1/skills/search searches for skills in a GitHub repo.
+// Expects ?q= query parameter (repo URL or search term).
+func (h *Handler) SearchSkills(c *gin.Context) {
+	q := c.Query("q")
+	if q == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "q is required"})
+		return
+	}
+	results, err := searchSkills(q)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"results": results})
+}
+
+type searchResult struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	URL         string `json:"url"`
+}
+
+func searchSkills(q string) ([]searchResult, error) {
+	// Search a GitHub repository for skill directories.
+	// Uses GitHub API to list directories under the skills/ path.
+	repoURL := q
+	if !strings.Contains(repoURL, "github.com") {
+		return nil, fmt.Errorf("only GitHub repositories are supported, e.g. https://github.com/user/repo")
+	}
+	repoURL = strings.TrimRight(repoURL, "/")
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+
+	// Extract owner/repo from URL
+	parts := strings.Split(strings.TrimPrefix(repoURL, "https://github.com/"), "/")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("invalid GitHub repository URL")
+	}
+	owner, repo := parts[0], parts[1]
+
+	// Use GitHub API to list skills directory
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/skills", owner, repo)
+	req, _ := http.NewRequest("GET", apiURL, nil)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned %d — ensure the repo exists and has a skills/ directory", resp.StatusCode)
+	}
+	var entries []struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		return nil, fmt.Errorf("parse API response: %w", err)
+	}
+
+	var results []searchResult
+	for _, e := range entries {
+		if e.Type != "dir" {
+			continue
+		}
+		// Try to fetch the skill's description from its SKILL.md
+		desc := ""
+		rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/main/skills/%s/SKILL.md", owner, repo, e.Name)
+		if d, err := fetchSkillContent(rawURL); err == nil {
+			desc = extractFirstLine(d)
+		}
+		results = append(results, searchResult{
+			Name:        e.Name,
+			Description: desc,
+			URL:         fmt.Sprintf("https://github.com/%s/%s", owner, repo),
+		})
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no skill directories found in %s/%s/skills/", owner, repo)
+	}
+	return results, nil
+}
+
+func extractFirstLine(content string) string {
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return strings.TrimSpace(line)
+	}
+	return ""
+}

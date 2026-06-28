@@ -254,6 +254,34 @@ export const removeProject = (path: string) =>
 export const pickFolder = () =>
   jsonFetch<{ path: string }>('/api/v1/dialog/folder', { method: 'POST' })
 
+// --- Skills ---
+export interface SkillItem {
+  name: string
+  description: string
+  path: string
+}
+
+export interface SearchSkillItem {
+  name: string
+  description: string
+  url: string
+}
+
+export const listSkills = () =>
+  jsonFetch<{ skills: SkillItem[] }>('/api/v1/skills')
+
+export const installSkill = (name: string, url: string) =>
+  jsonFetch<{ ok: boolean; name: string }>('/api/v1/skills/install', {
+    method: 'POST',
+    body: JSON.stringify({ name, url }),
+  })
+
+export const deleteSkill = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/skills/${encodeURIComponent(name)}`, { method: 'DELETE' })
+
+export const searchSkills = (q: string) =>
+  jsonFetch<{ results: SearchSkillItem[] }>(`/api/v1/skills/search?q=${encodeURIComponent(q)}`)
+
 // --- Messages ---
 export const listMessages = (id: string) =>
   jsonFetch<{ messages: Message[] }>(`/api/v1/sessions/${id}/messages`)

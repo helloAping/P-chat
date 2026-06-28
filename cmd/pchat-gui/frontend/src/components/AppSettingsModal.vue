@@ -31,7 +31,7 @@ import { loadProviders, loadSessions } from '../stores/chat'
 import type { Session } from '../api/client'
 
 const message = useMessage()
-const tab = ref<'providers' | 'styles' | 'archive'>('providers')
+const tab = ref<'providers' | 'styles' | 'archive' | 'skills'>('providers')
 
 // --- Provider state ---
 const providers = ref<api.ProviderInfo[]>([])
@@ -97,6 +97,8 @@ onMounted(async () => {
 watch(tab, (v) => {
   if (v === 'archive' && !archivedSessions.value.length) {
     loadArchived()
+  } else if (v === 'skills') {
+    refreshSkills()
   }
 })
 
@@ -536,6 +538,57 @@ async function confirmPermDelete() {
     message.error(e.message || '删除失败')
   }
 }
+
+// --- Skills state ---
+const loadedSkills = ref<api.SkillItem[]>([])
+const searchResults = ref<api.SearchSkillItem[]>([])
+const searchQuery = ref('')
+const searching = ref(false)
+const installing = ref('')
+
+async function refreshSkills() {
+  try {
+    const r = await api.listSkills()
+    loadedSkills.value = r.skills || []
+  } catch { /* ignore */ }
+}
+
+async function onSearchSkills() {
+  if (!searchQuery.value.trim()) return
+  searching.value = true
+  try {
+    const r = await api.searchSkills(searchQuery.value.trim())
+    searchResults.value = r.results || []
+  } catch (e: any) {
+    message.error(e.message || '搜索失败')
+    searchResults.value = []
+  } finally {
+    searching.value = false
+  }
+}
+
+async function onInstallSkill(name: string, url: string) {
+  installing.value = name
+  try {
+    await api.installSkill(name, url)
+    message.success(`已安装: ${name}`)
+    await refreshSkills()
+  } catch (e: any) {
+    message.error(e.message || '安装失败')
+  } finally {
+    installing.value = ''
+  }
+}
+
+async function onDeleteSkill(name: string) {
+  try {
+    await api.deleteSkill(name)
+    loadedSkills.value = loadedSkills.value.filter(s => s.name !== name)
+    message.success(`已删除: ${name}`)
+  } catch (e: any) {
+    message.error(e.message || '删除失败')
+  }
+}
 function closeStyleEditor() { showAddStyle.value = false; resetNewStyle() }
 
 function formatArchiveTime(ts: number): string {
@@ -847,6 +900,36 @@ function fmtContext(n?: number) {
           </div>
         </div>
       </NTabPane>
+
+      <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; overflow: auto">
+        <!-- Search and install -->
+        <div class="skill-search">
+          <NInput v-model:value="searchQuery" placeholder="GitHub 仓库地址，例如 https://github.com/user/repo" size="small" style="flex:1" @keyup.enter="onSearchSkills" />
+          <NButton size="small" type="primary" :loading="searching" @click="onSearchSkills">搜索</NButton>
+        </div>
+        <div v-if="searchResults.length" class="skill-search-results">
+          <div v-for="r in searchResults" :key="r.name" class="skill-search-row">
+            <div class="skill-search-info">
+              <span class="skill-search-name">{{ r.name }}</span>
+              <span class="skill-search-desc">{{ r.description }}</span>
+            </div>
+            <NButton size="tiny" type="primary" :loading="installing === r.name" @click="onInstallSkill(r.name, r.url)">安装</NButton>
+          </div>
+        </div>
+
+        <div class="skill-divider" />
+
+        <!-- Loaded skills -->
+        <div class="skill-hint">已加载的技能 ({{ loadedSkills.length }})</div>
+        <div v-if="!loadedSkills.length" class="empty-hint" style="padding:12px">暂无已安装技能</div>
+        <div v-for="s in loadedSkills" :key="s.name" class="skill-row">
+          <div class="skill-info">
+            <span class="skill-name">{{ s.name }}</span>
+            <span class="skill-desc">{{ s.description }}</span>
+          </div>
+          <NButton size="tiny" quaternary @click="onDeleteSkill(s.name)" style="color:var(--warn)">删除</NButton>
+        </div>
+      </NTabPane>
     </NTabs>
 
     <!-- Confirmation: permanent delete from archive -->
@@ -1020,4 +1103,24 @@ code {
 .confirm-body { padding: 8px 0; }
 .confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.skill-search { display: flex; gap: 8px; margin-bottom: 12px; }
+.skill-search-results { margin-bottom: 12px; }
+.skill-search-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-radius: 6px;
+}
+.skill-search-row:hover { background: var(--bg-3); }
+.skill-search-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.skill-search-name { font-size: 13px; font-weight: 500; }
+.skill-search-desc { font-size: 11px; color: var(--text-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-divider { border-top: 1px solid var(--border-2); margin: 12px 0; }
+.skill-hint { font-size: 12px; color: var(--text-3); margin-bottom: 8px; }
+.skill-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-radius: 6px;
+}
+.skill-row:hover { background: var(--bg-3); }
+.skill-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.skill-name { font-size: 13px; font-weight: 500; }
+.skill-desc { font-size: 11px; color: var(--text-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
