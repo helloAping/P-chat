@@ -183,7 +183,12 @@ func (r *REPL) chat(input string) {
 	// sessions even if the same REPL stays open.
 	msgs := []llm.ChatMessage{}
 	if r.store != nil {
-		msgs = append(msgs, r.store.GetChatMessages()...)
+		for _, m := range r.store.GetChatMessages() {
+			if m.Role == llm.RoleSystem || m.Type == llm.TypeImage {
+				continue
+			}
+			msgs = append(msgs, m)
+		}
 	}
 	msgs = append(msgs, llm.ChatMessage{
 		Role:    llm.RoleUser,

@@ -954,7 +954,12 @@ func runLocalPlan(ctx cliContext, args string) error {
 	// Build the request: full history + the task as a user message.
 	msgs := []llm.ChatMessage{}
 	if r.store != nil {
-		msgs = append(msgs, r.store.GetChatMessages()...)
+		for _, m := range r.store.GetChatMessages() {
+			if m.Type == llm.TypeImage {
+				continue
+			}
+			msgs = append(msgs, m)
+		}
 	}
 	msgs = append(msgs, llm.ChatMessage{
 		Role:    llm.RoleUser,

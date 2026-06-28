@@ -1058,7 +1058,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	histMsgs := h.store.GetChatMessagesN(limit)
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
-		if m.Role == llm.RoleSystem {
+		if m.Role == llm.RoleSystem || m.Type == llm.TypeImage {
 			continue
 		}
 		msgs = append(msgs, m)
