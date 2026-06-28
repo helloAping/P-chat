@@ -572,10 +572,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 		var totalIn, totalOut int
 
-		// Repeated tool call detection: track the last 3 tool name+args pairs.
-		var lastToolCalls [3]string
-		lastToolIdx := 0
-
 		for round := 0; round < maxRounds; round++ {
 			roundStart := time.Now()
 			roundNum := round + 1
@@ -696,24 +692,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if len(toolCalls) == 0 {
 				persistAssistant(a.store, assistantMsg, fullThinking, partsAcc)
 				ch <- ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
-				ch <- ChatStreamChunk{Done: true}
-				return
-			}
-
-			// Repeated-call detection: if the last 3 tool calls
-			// are the same tool with matching args prefix, warn
-			// and stop to avoid infinite loops.
-			for _, tc := range toolCalls {
-				sig := tc.Name + ":" + (tc.ArgsJSON + "            ")[:12]
-				lastToolCalls[lastToolIdx%3] = sig
-				lastToolIdx++
-			}
-			if lastToolIdx >= 3 &&
-				lastToolCalls[0] != "" &&
-				lastToolCalls[0] == lastToolCalls[1] &&
-				lastToolCalls[1] == lastToolCalls[2] {
-				persistAssistant(a.store, assistantMsg, fullThinking, partsAcc)
-				ch <- ChatStreamChunk{Phase: "loop_warn", Step: "loop-warn", Message: fmt.Sprintf("检测到同一工具连续重复调用 3 次 (%s)，已暂停以防死循环。请检查任务是否完成或调整方案后继续。", toolCalls[0].Name), Round: roundNum, MaxRound: maxRounds}
 				ch <- ChatStreamChunk{Done: true}
 				return
 			}
