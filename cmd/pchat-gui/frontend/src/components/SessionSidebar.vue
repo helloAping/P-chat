@@ -129,7 +129,7 @@ function toggleTheme() {
     <div class="sidebar-header">
       <div class="logo">💬 P-Chat</div>
       <NSpace size="small">
-        <NButton size="small" type="primary" @click="onNew" title="新建会话">+ 新建</NButton>
+        <NButton size="small" type="primary" @click="onNew">+ 新建会话</NButton>
         <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'">
           {{ themeName === 'dark' ? '🌙' : '☀' }}
         </NButton>
@@ -144,8 +144,8 @@ function toggleTheme() {
         placeholder="选择项目"
         @update:value="onProjectChange"
       />
-      <NButton size="tiny" quaternary @click="showAddProject = true" title="添加项目">+</NButton>
-      <NButton v-if="state.activeProjectPath" size="tiny" quaternary @click="showConfirmDeleteProject = true" title="删除项目" style="color: var(--warn)">×</NButton>
+      <NButton size="tiny" quaternary @click="showAddProject = true" title="添加项目目录" style="font-size:11px">+目录</NButton>
+      <NButton v-if="state.activeProjectPath" size="tiny" quaternary @click="showConfirmDeleteProject = true" title="删除当前项目" style="color: var(--warn); font-size:11px">移除</NButton>
     </div>
     <NScrollbar style="flex: 1">
       <div class="session-list">
