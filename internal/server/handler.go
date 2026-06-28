@@ -890,6 +890,13 @@ func (h *Handler) ListMessages(c *gin.Context) {
 				resp.Parts = parts
 			}
 		}
+		// Image messages carry their payload as data URLs in
+		// Attachments; clear Content so the frontend doesn't
+		// render the raw base64 string as text.
+		if m.Type == llm.TypeImage {
+			resp.Content = ""
+		}
+
 		out = append(out, resp)
 	}
 	c.JSON(http.StatusOK, gin.H{"messages": out})
