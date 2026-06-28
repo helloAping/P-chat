@@ -63,7 +63,7 @@ type installSkillRequest struct {
 }
 
 // InstallSkill POST /api/v1/skills/install
-// URL can be a GitHub repo or a raw SKILL.md URL.
+// URL should be a raw SKILL.md URL (from search results).
 func (h *Handler) InstallSkill(c *gin.Context) {
 	var req installSkillRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -127,31 +127,58 @@ func inferSkillName(url string) string {
 
 // fetchSkillContent downloads the SKILL.md from a remote URL.
 func fetchSkillContent(url string) (string, error) {
-	// Convert GitHub repo URL to raw SKILL.md URL.
-	rawURL := url
-	if strings.Contains(url, "github.com") && !strings.Contains(url, "raw.githubusercontent.com") {
-		// github.com/user/repo → raw.githubusercontent.com/user/repo/main/SKILL.md
-		rawURL = strings.Replace(url, "github.com", "raw.githubusercontent.com", 1)
-		rawURL = strings.TrimRight(rawURL, "/")
-		rawURL += "/main/SKILL.md"
-	} else if strings.Contains(url, "github.com") && strings.Contains(url, "/blob/") {
-		rawURL = strings.Replace(url, "github.com", "raw.githubusercontent.com", 1)
-		rawURL = strings.Replace(rawURL, "/blob/", "/", 1)
-	}
-
-	resp, err := http.Get(rawURL)
+	rawURL := toRawURL(url)
+	resp, err := httpGet(rawURL)
 	if err != nil {
-		return "", fmt.Errorf("fetch %s: %w", rawURL, err)
+		// Try master branch if main failed.
+		if strings.Contains(rawURL, "/main/") {
+			altURL := strings.Replace(rawURL, "/main/", "/master/", 1)
+			resp, err = httpGet(altURL)
+			if err != nil {
+				return "", fmt.Errorf("fetch %s: %w", rawURL, err)
+			}
+		} else {
+			return "", fmt.Errorf("fetch %s: %w", rawURL, err)
+		}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch %s: HTTP %d", rawURL, resp.StatusCode)
-	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
 	}
 	return string(body), nil
+}
+
+func httpGet(url string) (*http.Response, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return resp, nil
+}
+
+// toRawURL converts a GitHub URL to a raw content URL.
+func toRawURL(url string) string {
+	if strings.Contains(url, "raw.githubusercontent.com") {
+		return url
+	}
+	if !strings.Contains(url, "github.com") {
+		return url
+	}
+	// github.com/user/repo → raw.githubusercontent.com/user/repo/main/SKILL.md
+	rawURL := strings.Replace(url, "github.com", "raw.githubusercontent.com", 1)
+	rawURL = strings.TrimRight(rawURL, "/")
+	rawURL = strings.Replace(rawURL, "/blob/", "/", 1)
+	// If the URL already points to a file, use it as-is after conversion.
+	// Otherwise append /main/SKILL.md for repo-level searches.
+	if !strings.HasSuffix(rawURL, ".md") && !strings.Contains(rawURL, "/raw/") {
+		rawURL += "/main/SKILL.md"
+	}
+	return rawURL
 }
 
 // GET /api/v1/skills/search searches for skills in a GitHub repo.
@@ -228,7 +255,7 @@ func searchSkills(q string) ([]searchResult, error) {
 		results = append(results, searchResult{
 			Name:        e.Name,
 			Description: desc,
-			URL:         fmt.Sprintf("https://github.com/%s/%s", owner, repo),
+			URL:         fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/main/skills/%s/SKILL.md", owner, repo, e.Name),
 		})
 	}
 	if len(results) == 0 {
