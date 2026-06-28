@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -1555,6 +1556,15 @@ func (h *Handler) UnarchiveSession(c *gin.Context) {
 	if err := h.store.UnarchiveConversation(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	// If the session's project directory no longer exists (project
+	// was removed), clear the project association so it shows under
+	// the global view.
+	meta := h.ensureMetaLoaded(id)
+	if meta.ProjectPath != "" {
+		if _, err := os.Stat(meta.ProjectPath); os.IsNotExist(err) {
+			h.setSessionMetaProjectPath(id, "")
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

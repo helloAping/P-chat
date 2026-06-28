@@ -27,7 +27,7 @@ import {
   NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NTooltip, NIcon, useMessage,
 } from 'naive-ui'
 import * as api from '../api/client'
-import { loadProviders } from '../stores/chat'
+import { loadProviders, loadSessions } from '../stores/chat'
 import type { Session } from '../api/client'
 
 const message = useMessage()
@@ -511,6 +511,7 @@ async function onUnarchive(id: string) {
   try {
     await api.unarchiveSession(id)
     archivedSessions.value = archivedSessions.value.filter(s => s.id !== id)
+    await loadSessions()
     message.success('已恢复')
   } catch (e: any) {
     message.error(e.message || '恢复失败')
