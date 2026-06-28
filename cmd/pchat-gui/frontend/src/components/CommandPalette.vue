@@ -58,9 +58,10 @@ const filtered = computed(() => {
 <style scoped>
 .cmd-palette {
   background: var(--bg-1);
+  background-color: #1e1e2e; /* solid fallback for transparency */
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 -4px 16px rgba(0,0,0,0.15);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
   max-height: 240px;
   overflow-y: auto;
   z-index: 9999;

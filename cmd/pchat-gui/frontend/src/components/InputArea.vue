@@ -64,6 +64,25 @@ async function onChangeContextLevel(val: string) {
 
 const commandList = ref<CmdSpec[]>([])
 
+// Merge local commands that aren't in the server list.
+const LOCAL_COMMANDS: CmdSpec[] = [
+  { name: 'help', description: '显示可用命令列表', group: 'info', web_safe: true },
+  { name: 'new', description: '开启新对话', group: 'session', web_safe: true },
+  { name: 'clear', description: '清空当前对话视图', group: 'session', web_safe: true },
+  { name: 'rename', description: '重命名当前会话', args: '<标题>', group: 'session', web_safe: true },
+  { name: 'forget', description: '删除当前会话', group: 'session', web_safe: true },
+  { name: 'compress', description: '压缩对话历史(LLM摘要)', group: 'session', web_safe: true },
+]
+
+const allCommands = computed(() => {
+  const localNames = new Set(LOCAL_COMMANDS.map(c => c.name))
+  const merged = [...LOCAL_COMMANDS]
+  for (const c of commandList.value) {
+    if (!localNames.has(c.name)) merged.push(c)
+  }
+  return merged
+})
+
 onMounted(async () => {
   try {
     const r = await api.listCommands()
@@ -145,7 +164,7 @@ function onSelectCommand(c: CmdSpec) {
 
 function onPaletteKeyDown(e: KeyboardEvent) {
   if (!showPalette.value) return
-  const total = commandList.value.filter(c =>
+  const total = allCommands.value.filter(c =>
     !paletteFilter.value ||
     c.name.toLowerCase().includes(paletteFilter.value.toLowerCase()) ||
     c.description.toLowerCase().includes(paletteFilter.value.toLowerCase()),
@@ -159,7 +178,7 @@ function onPaletteKeyDown(e: KeyboardEvent) {
     paletteIndex.value = (paletteIndex.value - 1 + total) % total
   } else if (e.key === 'Enter' && showPalette.value) {
     e.preventDefault()
-    const filtered = commandList.value.filter(c =>
+    const filtered = allCommands.value.filter(c =>
       !paletteFilter.value ||
       c.name.toLowerCase().includes(paletteFilter.value.toLowerCase()) ||
       c.description.toLowerCase().includes(paletteFilter.value.toLowerCase()),
@@ -258,6 +277,7 @@ function renderHelp(): string {
     ['/clear', '清空当前对话视图'],
     ['/rename <标题>', '重命名当前会话'],
     ['/forget', '删除当前会话'],
+    ['/compress', '压缩对话历史(LLM摘要)'],
   ]
   for (const [k, d] of local) lines.push(`  ${k.padEnd(20)} ${d}`)
   if (commandList.value.length > 0) {
@@ -639,15 +659,6 @@ onMounted(() => {
           <span>📎</span><span>添加附件</span>
         </button>
         <NSelect
-          v-model:value="contextLevel"
-          :options="contextLevelOptions"
-          size="small"
-          class="picker picker-narrow"
-          title="对话上下文级别 (紧凑/中等/最大)"
-          placeholder="上下文"
-          @update:value="onChangeContextLevel"
-        />
-        <NSelect
           v-model:value="currentStyleValue"
           :options="styleOptions"
           size="small"
@@ -661,10 +672,18 @@ onMounted(() => {
           :options="modelOptions"
           size="small"
           :disabled="!state.currentID"
-          filterable
           class="picker picker-wide"
           title="选择模型 (按提供商分组; ⭐ = 默认)"
           placeholder="选择模型"
+        />
+        <NSelect
+          v-model:value="contextLevel"
+          :options="contextLevelOptions"
+          size="small"
+          class="picker picker-narrow"
+          title="对话上下文级别 (紧凑/中等/最大)"
+          placeholder="上下文"
+          @update:value="onChangeContextLevel"
         />
       </div>
       <div class="hints">
@@ -679,7 +698,7 @@ onMounted(() => {
   <Teleport to="body">
     <CommandPalette
       v-if="showPalette"
-      :commands="commandList"
+      :commands="allCommands"
       :filter="paletteFilter"
       :selected-index="paletteIndex"
       :style="paletteStyle"
