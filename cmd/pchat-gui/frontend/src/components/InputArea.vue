@@ -8,6 +8,7 @@
 
 import { onMounted, ref, computed, watch, nextTick } from 'vue'
 import { NInput, NButton, NSpace, NScrollbar, useMessage } from 'naive-ui'
+import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import * as api from '../api/client'
 import {
   state, currentMeta, addAttachment, removeAttachment, clearAttachments,
@@ -44,13 +45,7 @@ const showSessionConfig = ref(false)
 const message = useMessage()
 const fileInput = ref<HTMLInputElement | null>(null)
 
-interface CmdSpec {
-  name: string
-  description: string
-  args?: string
-  group: string
-  web_safe: boolean
-}
+// CmdSpec is imported from CommandPalette.vue
 
 const commandList = ref<CmdSpec[]>([])
 
@@ -95,7 +90,58 @@ function onPaste(e: ClipboardEvent) {
   }
 }
 
-// --- Slash command handling ---
+// --- Slash command palette ---
+
+const showPalette = ref(false)
+const paletteFilter = ref('')
+const paletteIndex = ref(0)
+
+// Watch input: show palette when user types / at start of line.
+watch(inputText, () => {
+  const m = inputText.value.match(/^\s*\/(\S*)$/)
+  if (m) {
+    showPalette.value = true
+    paletteFilter.value = m[1]
+    paletteIndex.value = 0
+  } else {
+    showPalette.value = false
+  }
+})
+
+function onSelectCommand(c: CmdSpec) {
+  inputText.value = '/' + c.name + ' '
+  showPalette.value = false
+  inputEl.value?.focus()
+}
+
+function onPaletteKeyDown(e: KeyboardEvent) {
+  if (!showPalette.value) return
+  const total = commandList.value.filter(c =>
+    !paletteFilter.value ||
+    c.name.toLowerCase().includes(paletteFilter.value.toLowerCase()) ||
+    c.description.toLowerCase().includes(paletteFilter.value.toLowerCase()),
+  ).length
+  if (total === 0) return
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    paletteIndex.value = (paletteIndex.value + 1) % total
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    paletteIndex.value = (paletteIndex.value - 1 + total) % total
+  } else if (e.key === 'Enter' && showPalette.value) {
+    e.preventDefault()
+    const filtered = commandList.value.filter(c =>
+      !paletteFilter.value ||
+      c.name.toLowerCase().includes(paletteFilter.value.toLowerCase()) ||
+      c.description.toLowerCase().includes(paletteFilter.value.toLowerCase()),
+    )
+    if (filtered.length > 0 && paletteIndex.value < filtered.length) {
+      onSelectCommand(filtered[paletteIndex.value])
+    }
+  } else if (e.key === 'Escape') {
+    showPalette.value = false
+  }
+}
 
 function isSlashLine() {
   // Only treat the line as a command if "/" is the first non-ws char.
@@ -294,6 +340,11 @@ function stop() {
 }
 
 function onKeyDown(e: KeyboardEvent) {
+  // Palette navigation takes priority when open.
+  if (showPalette.value && (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter' || e.key === 'Escape')) {
+    onPaletteKeyDown(e)
+    return
+  }
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     send()
@@ -492,6 +543,13 @@ onMounted(() => {
           <button class="rm" @click="removeAttachment(i)" title="移除">×</button>
         </div>
       </div>
+      <CommandPalette
+        v-if="showPalette"
+        :commands="commandList"
+        :filter="paletteFilter"
+        :selected-index="paletteIndex"
+        @select="onSelectCommand"
+      />
       <textarea
         ref="inputEl"
         v-model="inputText"
