@@ -555,7 +555,6 @@ const activeRepoUrl = ref('')
 const builtInRepos = [
   { name: 'Anthropic 官方技能', url: 'https://github.com/anthropics/skills' },
   { name: 'Awesome Claude Skills', url: 'https://github.com/ComposioHQ/awesome-claude-skills' },
-  { name: 'P-Chat 官方技能', url: 'https://github.com/p-chat-community/skills' },
 ]
 
 async function refreshRepos() {
