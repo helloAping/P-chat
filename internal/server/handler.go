@@ -34,20 +34,20 @@ type Handler struct {
 }
 
 type sessionMeta struct {
-	Style        string
-	Provider     string
-	Model        string
-	ContextLevel string // "compact" | "medium" | "max"
+	Style          string
+	Provider       string
+	Model          string
+	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
 }
 
 // sessionMetaBlob is the on-disk shape written to
 // conversations.metadata. The field names are JSON lower-case so
 // the web side can pass them straight back to the PATCH endpoint.
 type sessionMetaBlob struct {
-	Style        string `json:"style,omitempty"`
-	Provider     string `json:"provider,omitempty"`
-	Model        string `json:"model,omitempty"`
-	ContextLevel string `json:"context_level,omitempty"`
+	Style          string `json:"style,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager) *Handler {
@@ -95,7 +95,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	if h.store == nil {
 		return
 	}
-	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ContextLevel: m.ContextLevel})
+	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort})
 	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
 		// Non-fatal: in-memory map already updated, request still
 		// works for this session. The next setSessionMeta call
@@ -121,7 +121,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.Style = blob.Style
 				m.Provider = blob.Provider
 				m.Model = blob.Model
-				m.ContextLevel = blob.ContextLevel
+				m.ReasoningEffort = blob.ReasoningEffort
 			}
 		}
 	}
@@ -847,7 +847,7 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// drop the parts silently — the user would reopen a
 	// session and see only the plain text.
 	meta := h.ensureMetaLoaded(id)
-	limit := contextLevelLimit(meta.ContextLevel)
+	limit := contextLevelLimit(meta.ReasoningEffort)
 	msgs, metas, createds := h.store.GetChatMessagesWithMetaN(limit)
 	out := make([]MessageResponse, 0, len(msgs))
 	for i, m := range msgs {
@@ -1054,7 +1054,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 
 	// Build messages: history + new user message
 	meta := h.ensureMetaLoaded(id)
-	limit := contextLevelLimit(meta.ContextLevel)
+	limit := contextLevelLimit(meta.ReasoningEffort)
 	histMsgs := h.store.GetChatMessagesN(limit)
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	msgs = append(msgs, histMsgs...)
@@ -1065,11 +1065,12 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	})
 
 	chatReq := agent.ChatRequest{
-		Style:       s,
-		Provider:    provider,
-		Model:       model,
-		Messages:    msgs,
-		Attachments: req.Attachments,
+		Style:          s,
+		Provider:       provider,
+		Model:          model,
+		Messages:       msgs,
+		Attachments:    req.Attachments,
+		ReasoningEffort: meta.ReasoningEffort,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -1263,41 +1264,35 @@ func (h *Handler) CompressConversation(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"compressed": ok, "summary": summary})
 }
 
-// SetContextLevel updates the per-session context level.
-// PATCH /api/v1/sessions/:id/context-level
-func (h *Handler) SetContextLevel(c *gin.Context) {
+// SetReasoningEffort updates the per-session reasoning effort.
+// PATCH /api/v1/sessions/:id/reasoning-effort
+func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	id := c.Param("id")
 	var req struct{ Level string `json:"level"` }
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if req.Level != "compact" && req.Level != "medium" && req.Level != "max" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "level must be compact, medium, or max"})
+	valid := map[string]bool{"off": true, "low": true, "medium": true, "high": true, "max": true}
+	if !valid[req.Level] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "level must be off, low, medium, high, or max"})
 		return
 	}
 	h.metaMu.Lock()
 	m := h.meta[id]
-	m.ContextLevel = req.Level
+	m.ReasoningEffort = req.Level
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ContextLevel: m.ContextLevel})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "context_level": req.Level})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
 }
 
-// contextLevelLimit returns the message fetch limit for a context level.
+// contextLevelLimit returns the default message fetch limit.
 func contextLevelLimit(level string) int {
-	switch level {
-	case "compact":
-		return 15
-	case "max":
-		return 200
-	default:
-		return 50
-	}
+	return 50
 }
 
 // reloadAfterConfigChange re-reads the on-disk config, rebuilds the

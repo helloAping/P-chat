@@ -52,9 +52,10 @@ type ToolCallDelta struct {
 // Temperature == 0 and TopP == 0 it picks a default; MaxTokens == 0
 // means "no cap".
 type ChatOptions struct {
-	Temperature float64
-	TopP        float64
-	MaxTokens   int
+	Temperature    float64
+	TopP           float64
+	MaxTokens      int
+	ReasoningEffort string // off|low|medium|high|max; empty means not set
 }
 
 // OptionsFromConfig converts the user-facing config into ChatOptions.
@@ -225,6 +226,12 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 		ch <- StreamChunk{Err: err}
 		close(ch)
 		return ch
+	}
+
+	// Inject reasoning_effort (OpenAI) or thinking (Anthropic)
+	// into the request body when the caller sets a reasoning level.
+	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
+		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
 	}
 
 	// Send the request and return the parsed stream.
@@ -980,4 +987,51 @@ func walkForField(v any, names []string, path string, depth, maxDepth, maxResult
 		}
 	}
 	return "", ""
+}
+
+// injectReasoning adds reasoning_effort (OpenAI-compatible) or thinking
+// (Anthropic) to the JSON body of an LLM request.
+func injectReasoning(body []byte, protocol, level string) []byte {
+	if level == "" || level == "off" {
+		return body
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	switch protocol {
+	case "openai":
+		m["reasoning_effort"] = level
+	case "anthropic":
+		budget := reasoningBudget(level)
+		m["thinking"] = map[string]any{
+			"type":          "enabled",
+			"budget_tokens": budget,
+		}
+		// Ensure max_tokens > budget_tokens. Anthropic requires
+		// max_tokens to be larger than the thinking budget.
+		if mt, ok := m["max_tokens"].(float64); ok && int(mt) <= budget {
+			m["max_tokens"] = float64(budget + 4096)
+		}
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return b
+}
+
+// reasoningBudget maps a reasoning effort level to an Anthropic
+// thinking budget_tokens value.
+func reasoningBudget(level string) int {
+	switch level {
+	case "low":
+		return 1024
+	case "max":
+		return 32768
+	case "high":
+		return 16384
+	default: // medium
+		return 4096
+	}
 }

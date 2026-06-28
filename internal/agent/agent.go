@@ -174,6 +174,10 @@ type ChatRequest struct {
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools.
 	PlanMode bool `json:"plan_mode,omitempty"`
+	// ReasoningEffort controls how much reasoning/thinking the LLM
+	// does before responding. off|low|medium|high|max. Empty means
+	// the model default.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type ChatStreamChunk struct {
@@ -528,7 +532,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				argsAccum    = make(map[int]*nativeToolCall)
 			)
 
-			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, msgs, toolDefs, a.options)
+			opts := a.options
+			if req.ReasoningEffort != "" {
+				opts.ReasoningEffort = req.ReasoningEffort
+			}
+			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, msgs, toolDefs, opts)
 			for chunk := range stream {
 				if chunk.Err != nil {
 					classified := llm.ClassifyAPIError(req.Provider, chunk.Err)

@@ -200,8 +200,8 @@ export const updateSessionMeta = (
 export const compressConversation = (id: string) =>
   jsonFetch<{ compressed: boolean; summary: string }>(`/api/v1/sessions/${id}/compress`, { method: 'POST' })
 
-export const setContextLevel = (id: string, level: string) =>
-  jsonFetch<{ ok: boolean; context_level: string }>(`/api/v1/sessions/${id}/context-level`, {
+export const setReasoningEffort = (id: string, level: string) =>
+  jsonFetch<{ ok: boolean; reasoning_effort: string }>(`/api/v1/sessions/${id}/reasoning-effort`, {
     method: 'PATCH',
     body: JSON.stringify({ level }),
   })

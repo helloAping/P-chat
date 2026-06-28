@@ -44,19 +44,20 @@ const sending = ref(false)
 const showSessionConfig = ref(false)
 const message = useMessage()
 const fileInput = ref<HTMLInputElement | null>(null)
-const contextLevel = ref('medium')
+const reasoningEffort = ref('off')
 
-// Context level options (like Codex compact/max).
-const contextLevelOptions = [
-  { label: '紧凑 15', value: 'compact' },
-  { label: '中等 50', value: 'medium' },
-  { label: '最大 200', value: 'max' },
+const reasoningEffortOptions = [
+  { label: '推理 关闭', value: 'off' },
+  { label: '推理 低', value: 'low' },
+  { label: '推理 中', value: 'medium' },
+  { label: '推理 高', value: 'high' },
+  { label: '推理 最高', value: 'max' },
 ]
 
-async function onChangeContextLevel(val: string) {
-  contextLevel.value = val
+async function onChangeReasoningEffort(val: string) {
+  reasoningEffort.value = val
   if (state.currentID) {
-    try { await api.setContextLevel(state.currentID, val) } catch {}
+    try { await api.setReasoningEffort(state.currentID, val) } catch {}
   }
 }
 
@@ -677,13 +678,13 @@ onMounted(() => {
           placeholder="选择模型"
         />
         <NSelect
-          v-model:value="contextLevel"
-          :options="contextLevelOptions"
+          v-model:value="reasoningEffort"
+          :options="reasoningEffortOptions"
           size="small"
           class="picker picker-narrow"
-          title="对话上下文级别 (紧凑/中等/最大)"
-          placeholder="上下文"
-          @update:value="onChangeContextLevel"
+          title="推理等级 (off/low/medium/high/max)"
+          placeholder="推理"
+          @update:value="onChangeReasoningEffort"
         />
       </div>
       <div class="hints">
