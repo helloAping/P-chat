@@ -89,7 +89,7 @@ export const currentMeta = computed(() => {
 // --- Session management ---
 
 export async function loadSessions() {
-  const { sessions } = await api.listSessions(state.activeProjectPath || undefined)
+  const { sessions } = await api.listSessions(state.activeProjectPath)
   state.sessions = sessions
   if (!state.currentID && sessions.length > 0) {
     await switchSession(sessions[0].id)

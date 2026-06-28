@@ -1017,9 +1017,9 @@ func decodePartsFromMeta(meta string, content string) []MessagePart {
 	}
 
 	// 3. Text — from content (not stored in meta).
-	if content != "" {
-		parts = append(parts, MessagePart{Kind: "text", Text: content})
-	}
+	// Always append so the frontend's parts path has a text
+	// slot even when the LLM round ended with tool-only output.
+	parts = append(parts, MessagePart{Kind: "text", Text: content})
 
 	if len(parts) == 0 {
 		return nil

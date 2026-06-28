@@ -179,9 +179,9 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 export const health = () => jsonFetch<{ status: string }>('/api/v1/health')
 
 // --- Sessions ---
-export const listSessions = (projectPath?: string) =>
+export const listSessions = (projectPath: string) =>
   jsonFetch<{ sessions: Session[] }>(
-    `/api/v1/sessions${projectPath !== undefined ? `?project_path=${encodeURIComponent(projectPath)}` : ''}`,
+    `/api/v1/sessions?project_path=${encodeURIComponent(projectPath)}`,
   )
 
 export const getSession = (id: string) =>
