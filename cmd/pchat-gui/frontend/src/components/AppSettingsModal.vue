@@ -546,6 +546,17 @@ const searchQuery = ref('')
 const searching = ref(false)
 const installing = ref('')
 
+const builtInRepos = [
+  { name: 'OpenCode 官方技能', url: 'https://github.com/anomalyco/opencode' },
+  { name: 'P-Chat 社区技能', url: 'https://github.com/p-chat-community/skills' },
+  { name: 'Matt Pocock 工程技能', url: 'https://github.com/mattpocock/engineering-skills' },
+]
+
+function onSelectRepo(url: string) {
+  searchQuery.value = url
+  onSearchSkills()
+}
+
 async function refreshSkills() {
   try {
     const r = await api.listSkills()
@@ -902,6 +913,14 @@ function fmtContext(n?: number) {
       </NTabPane>
 
       <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; overflow: auto">
+        <!-- Built-in repos -->
+        <div class="skill-repos">
+          <span class="skill-hint">内置仓库</span>
+          <div class="repo-chips">
+            <NButton v-for="r in builtInRepos" :key="r.url" size="tiny" quaternary @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+          </div>
+        </div>
+        <div class="skill-divider" />
         <!-- Search and install -->
         <div class="skill-search">
           <NInput v-model:value="searchQuery" placeholder="GitHub 仓库地址，例如 https://github.com/user/repo" size="small" style="flex:1" @keyup.enter="onSearchSkills" />
@@ -1104,6 +1123,8 @@ code {
 .confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .skill-search { display: flex; gap: 8px; margin-bottom: 12px; }
+.skill-repos { margin-bottom: 4px; }
+.repo-chips { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
 .skill-search-results { margin-bottom: 12px; }
 .skill-search-row {
   display: flex; align-items: center; gap: 8px;
