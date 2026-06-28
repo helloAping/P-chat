@@ -696,15 +696,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				return
 			}
 
-			// Context window warning: when the message list grows
-			// too large, warn or auto-stop.
-			if len(msgs) > 60 {
+			// Context window warning: count only meaningful
+			// messages (exclude tool_call/tool_result metadata).
+			meaningful := countMeaningfulMessages(msgs)
+			if meaningful > 120 {
 				persistAssistant(a.store, assistantMsg, fullThinking, partsAcc)
-				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条消息，接近上限，已自动停止。建议执行 /compress 压缩历史后继续。", len(msgs)), Round: roundNum, MaxRound: maxRounds}
+				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条有效消息，接近上限，已自动停止。建议执行 /compress 压缩历史后继续。", meaningful), Round: roundNum, MaxRound: maxRounds}
 				ch <- ChatStreamChunk{Done: true}
 				return
-			} else if len(msgs) > 40 {
-				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条消息，建议在完成当前任务后执行 /compress 压缩历史。", len(msgs)), Round: roundNum, MaxRound: maxRounds}
+			} else if meaningful > 80 {
+				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条有效消息，建议在完成当前任务后执行 /compress 压缩历史。", meaningful), Round: roundNum, MaxRound: maxRounds}
 			}
 
 			ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds}
@@ -934,6 +935,19 @@ func filterToolCalls(msgs []llm.ChatMessage) []llm.ChatMessage {
 		out = append(out, m)
 	}
 	return out
+}
+
+// countMeaningfulMessages counts messages that contribute to the
+// context window (excludes tool_call/tool_result metadata rows).
+func countMeaningfulMessages(msgs []llm.ChatMessage) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 func persistAssistant(store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator) {
