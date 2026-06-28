@@ -551,6 +551,7 @@ const showAddRepo = ref(false)
 const newRepoName = ref('')
 const newRepoUrl = ref('')
 const activeRepoUrl = ref('')
+const skillFilter = ref('')
 
 const builtInRepos = [
   { name: 'Anthropic 官方技能', url: 'https://github.com/anthropics/skills' },
@@ -593,6 +594,22 @@ async function onRemoveRepo(url: string) {
     message.error(e.message || '移除失败')
   }
 }
+
+const filteredSkills = computed(() => {
+  const q = skillFilter.value.trim().toLowerCase()
+  if (!q) return loadedSkills.value
+  return loadedSkills.value.filter(s =>
+    s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q),
+  )
+})
+
+const filteredSearchResults = computed(() => {
+  const q = skillFilter.value.trim().toLowerCase()
+  if (!q) return searchResults.value
+  return searchResults.value.filter(s =>
+    s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q),
+  )
+})
 
 async function refreshSkills() {
   try {
@@ -975,13 +992,14 @@ function fmtContext(n?: number) {
           <NButton size="tiny" quaternary @click="showAddRepo = true" style="margin-left:4px">+ 添加</NButton>
         </div>
         <div class="skill-divider" />
-        <!-- Search and install -->
+        <!-- Filter & search -->
         <div class="skill-search">
-          <NInput v-model:value="searchQuery" placeholder="GitHub 仓库地址，例如 https://github.com/user/repo" size="small" style="flex:1" @keyup.enter="onSearchSkills" />
-          <NButton size="small" type="primary" :loading="searching" @click="onSearchSkills">搜索</NButton>
+          <NInput v-model:value="skillFilter" placeholder="搜索/筛选技能..." size="small" clearable style="flex:1" />
         </div>
+        <!-- Search results from remote repo -->
         <div v-if="searchResults.length" class="skill-search-results">
-          <div v-for="r in searchResults" :key="r.name" class="skill-search-row">
+          <div class="skill-section-title">仓库技能（{{ filteredSearchResults.length }}）</div>
+          <div v-for="r in filteredSearchResults" :key="r.name" class="skill-search-row">
             <div class="skill-search-info">
               <span class="skill-search-name">{{ r.name }}</span>
               <span class="skill-search-desc">{{ r.description }}</span>
@@ -990,12 +1008,10 @@ function fmtContext(n?: number) {
           </div>
         </div>
 
-        <div class="skill-divider" />
-
         <!-- Loaded skills -->
-        <div class="skill-hint">已加载的技能 ({{ loadedSkills.length }})</div>
-        <div v-if="!loadedSkills.length" class="empty-hint" style="padding:12px">暂无已安装技能</div>
-        <div v-for="s in loadedSkills" :key="s.name" class="skill-row">
+        <div class="skill-section-title" style="margin-top:12px">已加载（{{ filteredSkills.length }}）</div>
+        <div v-if="!filteredSkills.length" class="empty-hint" style="padding:12px">暂无匹配技能</div>
+        <div v-for="s in filteredSkills" :key="s.name" class="skill-row">
           <div class="skill-info">
             <span class="skill-name">{{ s.name }}</span>
             <span class="skill-desc">{{ s.description }}</span>
@@ -1206,6 +1222,7 @@ code {
 .skill-search-desc { font-size: 11px; color: var(--text-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .skill-divider { border-top: 1px solid var(--border-2); margin: 12px 0; }
 .skill-hint { font-size: 12px; color: var(--text-3); margin-bottom: 8px; }
+.skill-section-title { font-size: 12px; color: var(--text-3); margin-bottom: 6px; }
 .skill-row {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 8px; border-radius: 6px;
