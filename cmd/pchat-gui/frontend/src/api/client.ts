@@ -86,6 +86,12 @@ export type ToolPart = Extract<MessagePart, { kind: 'tool' }>
 export type TextPart = Extract<MessagePart, { kind: 'text' }>
 export type ThinkingPart = Extract<MessagePart, { kind: 'thinking' }>
 
+export interface TodoItem {
+  id: string
+  content: string
+  status: string
+}
+
 export interface Message {
   id?: number
   role: 'user' | 'assistant' | 'tool' | 'system'
@@ -211,6 +217,9 @@ export const saveSystemMessage = (id: string, content: string) =>
     method: 'POST',
     body: JSON.stringify({ content }),
   })
+
+export const getTodos = (id: string) =>
+  jsonFetch<{ todos: TodoItem[] }>(`/api/v1/sessions/${id}/todos`)
 
 // --- Messages ---
 export const listMessages = (id: string) =>

@@ -17,6 +17,7 @@ import (
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 // Handler serves the P-Chat HTTP API. It holds references to the
@@ -1087,6 +1088,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		Attachments:       req.Attachments,
 		ReasoningEffort:   meta.ReasoningEffort,
 		CompressedSummary: compSummary,
+		SessionID:         id,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -1336,6 +1338,14 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 	})
 	h.store.Flush()
 	c.JSON(http.StatusCreated, gin.H{"ok": true})
+}
+
+// GetTodos returns the current todo list for a session.
+// GET /api/v1/sessions/:id/todos
+func (h *Handler) GetTodos(c *gin.Context) {
+	id := c.Param("id")
+	todos := tool.GetSessionTodos(id)
+	c.JSON(http.StatusOK, gin.H{"todos": todos})
 }
 
 // contextLevelLimit returns the default message fetch limit.

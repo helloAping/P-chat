@@ -200,6 +200,25 @@ func RegisterBuiltin(r *Registry) {
 			"path": StringProp("Directory path; pass '.' or empty for the current working directory"),
 		}, []string{"path"}),
 	}, handleListFiles)
+
+	r.Register(Tool{
+		Name:        "todo_write",
+		Description: "Create and manage a structured task list for your current coding session. Use this to plan work, track progress, and show the user what you're doing. Each todo item has an id, content, and status (pending/in_progress/done/cancelled). Always include the full list when calling this tool — it replaces the previous list entirely.",
+		Parameters: ObjectSchema(map[string]any{
+			"todos": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":      map[string]any{"type": "string", "description": "Unique identifier for this todo item"},
+						"content": map[string]any{"type": "string", "description": "The task description"},
+						"status":  map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "done", "cancelled"}, "description": "Current status"},
+					},
+					"required": []string{"id", "content", "status"},
+				},
+			},
+		}, []string{"todos"}),
+	}, handleTodoWrite)
 }
 
 type execArgs struct {

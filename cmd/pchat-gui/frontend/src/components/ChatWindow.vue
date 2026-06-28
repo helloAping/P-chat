@@ -3,6 +3,7 @@ import { ref, nextTick, watch, computed, onMounted } from 'vue'
 import { NScrollbar, NSpin, NSpace, NButton, NInput, NTooltip, useMessage, NIcon } from 'naive-ui'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
+import TodoPanel from './TodoPanel.vue'
 import { state, currentMessages, isStreaming, switchSession } from '../stores/chat'
 
 const messagesEl = ref<HTMLElement | null>(null)
@@ -29,6 +30,7 @@ onMounted(() => scrollToBottom())
         {{ state.sessions.find(s => s.id === state.currentID)?.title || 'P-Chat' }}
       </div>
     </div>
+    <TodoPanel />
     <NScrollbar ref="messagesEl" class="messages-scroll" :native-scrollbar="false">
       <div class="messages">
         <div v-if="currentMessages.length === 0" class="empty">

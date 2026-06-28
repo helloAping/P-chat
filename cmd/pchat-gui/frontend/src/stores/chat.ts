@@ -4,7 +4,7 @@
 
 import { reactive, ref, computed } from 'vue'
 import * as api from '../api/client'
-import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart } from '../api/client'
+import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem } from '../api/client'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -47,12 +47,17 @@ export const state = reactive({
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
   sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string }>,
+  sessionTodos: {} as Record<string, TodoItem[]>,
   lightbox: { show: false, src: '', alt: '' },
   showSettings: false,
 })
 
 export const currentMessages = computed(() =>
   state.sessionMessages[state.currentID] || [],
+)
+
+export const currentTodos = computed(() =>
+  state.sessionTodos[state.currentID] || [],
 )
 
 // currentMeta resolves the per-session picker state
@@ -111,6 +116,13 @@ export async function switchSession(id: string) {
       model:   s.model || '',
       title:   s.title || '',
     }
+  }
+  // Load per-session todos.
+  if (!state.sessionTodos[id]) {
+    try {
+      const t = await api.getTodos(id)
+      state.sessionTodos[id] = t.todos || []
+    } catch { /* ignore — server may not have todos yet */ }
   }
 }
 
@@ -183,6 +195,7 @@ export async function deleteSessionById(id: string) {
   state.sessions = state.sessions.filter(s => s.id !== id)
   delete state.sessionMessages[id]
   delete state.sessionMeta[id]
+  delete state.sessionTodos[id]
   if (state.currentID === id) {
     state.currentID = state.sessions[0]?.id || ''
     if (state.currentID) await switchSession(state.currentID)
@@ -529,6 +542,13 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             elapsed: ev.tool_elapsed,
           })
         }
+      }
+      // Sync todo list from todo_write tool results.
+      if (ev.tool_name === 'todo_write' && ev.tool_status === 'ok' && ev.tool_result) {
+        try {
+          const todos: TodoItem[] = JSON.parse(ev.tool_result)
+          state.sessionTodos[id] = todos
+        } catch { /* not JSON, ignore */ }
       }
       break
     }

@@ -184,6 +184,9 @@ type ChatRequest struct {
 	// conversation history. When non-empty, it is appended to the
 	// system prompt so the LLM has context from before compression.
 	CompressedSummary string `json:"compressed_summary,omitempty"`
+	// SessionID is the current conversation identifier. Used by
+	// tools that need per-session state (e.g. todo_write).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 type ChatStreamChunk struct {
@@ -708,7 +711,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				wg.Add(1)
 
 				eventCh := make(chan ChatStreamChunk, 16)
-				tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
+			tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
+				if req.SessionID != "" {
+					tctx = tool.WithSessionID(tctx, req.SessionID)
+				}
 				tctx, cancel := context.WithTimeout(tctx, 5*time.Minute)
 
 				fwd := forwarder{done: make(chan struct{})}
