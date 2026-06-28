@@ -57,18 +57,13 @@ const filtered = computed(() => {
 
 <style scoped>
 .cmd-palette {
-  position: absolute;
-  bottom: 100%;
-  left: 0;
-  right: 0;
-  margin-bottom: 4px;
   background: var(--bg-1);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 -4px 16px rgba(0,0,0,0.15);
   max-height: 240px;
   overflow-y: auto;
-  z-index: 100;
+  z-index: 9999;
 }
 .cmd-item {
   display: flex;

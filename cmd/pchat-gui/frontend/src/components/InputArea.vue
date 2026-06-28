@@ -108,6 +108,20 @@ watch(inputText, () => {
   }
 })
 
+// Position the palette above the textarea in viewport coords.
+const paletteStyle = computed(() => {
+  const el = inputEl.value
+  if (!el) return {}
+  const r = el.getBoundingClientRect()
+  return {
+    position: 'fixed',
+    left: r.left + 'px',
+    width: r.width + 'px',
+    bottom: (window.innerHeight - r.top + 4) + 'px',
+    maxHeight: Math.min(240, r.top - 12) + 'px',
+  }
+})
+
 function onSelectCommand(c: CmdSpec) {
   inputText.value = '/' + c.name + ' '
   showPalette.value = false
@@ -543,13 +557,6 @@ onMounted(() => {
           <button class="rm" @click="removeAttachment(i)" title="移除">×</button>
         </div>
       </div>
-      <CommandPalette
-        v-if="showPalette"
-        :commands="commandList"
-        :filter="paletteFilter"
-        :selected-index="paletteIndex"
-        @select="onSelectCommand"
-      />
       <textarea
         ref="inputEl"
         v-model="inputText"
@@ -629,6 +636,17 @@ onMounted(() => {
       </div>
     </div>
   </div>
+  <!-- Teleported to body to avoid clipping by .input-area overflow -->
+  <Teleport to="body">
+    <CommandPalette
+      v-if="showPalette"
+      :commands="commandList"
+      :filter="paletteFilter"
+      :selected-index="paletteIndex"
+      :style="paletteStyle"
+      @select="onSelectCommand"
+    />
+  </Teleport>
 </template>
 
 <style scoped>
