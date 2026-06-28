@@ -125,28 +125,38 @@ func inferSkillName(url string) string {
 	return ""
 }
 
-// fetchSkillContent downloads the SKILL.md from a remote URL.
+// fetchSkillContent downloads the SKILL.md (or README.md) from a
+// remote URL. Tries SKILL.md first, then README.md, and both main
+// and master branches.
 func fetchSkillContent(url string) (string, error) {
 	rawURL := toRawURL(url)
-	resp, err := httpGet(rawURL)
-	if err != nil {
-		// Try master branch if main failed.
-		if strings.Contains(rawURL, "/main/") {
-			altURL := strings.Replace(rawURL, "/main/", "/master/", 1)
-			resp, err = httpGet(altURL)
-			if err != nil {
-				return "", fmt.Errorf("fetch %s: %w", rawURL, err)
-			}
-		} else {
-			return "", fmt.Errorf("fetch %s: %w", rawURL, err)
+	// Try multiple branch + filename combinations.
+	trials := []string{rawURL}
+	if strings.Contains(rawURL, "/main/") {
+		trials = append(trials, strings.Replace(rawURL, "/main/", "/master/", 1))
+	}
+	// Try README.md as fallback for each branch.
+	for _, t := range append([]string{}, trials...) {
+		if strings.HasSuffix(t, "SKILL.md") {
+			trials = append(trials, strings.Replace(t, "SKILL.md", "README.md", 1))
 		}
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+	var lastErr error
+	for _, t := range trials {
+		resp, err := httpGet(t)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read response: %w", err)
+			continue
+		}
+		return string(body), nil
 	}
-	return string(body), nil
+	return "", fmt.Errorf("skill not found (tried %d URLs, last: %w)", len(trials), lastErr)
 }
 
 func httpGet(url string) (*http.Response, error) {
@@ -230,7 +240,7 @@ func searchSkills(q string) ([]searchResult, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned %d — ensure the repo exists and has a skills/ directory", resp.StatusCode)
+		return nil, fmt.Errorf("GitHub API returned %d — 请确认仓库存在且包含 skills/ 目录", resp.StatusCode)
 	}
 	var entries []struct {
 		Name string `json:"name"`
@@ -291,7 +301,12 @@ func loadSkillRepos() ([]skillRepo, error) {
 	data, err := os.ReadFile(skillReposPath())
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			// Seed with the official P-Chat skill repository.
+			defaults := []skillRepo{
+				{Name: "P-Chat 官方技能", URL: "https://github.com/p-chat-community/skills"},
+			}
+			_ = saveSkillRepos(defaults)
+			return defaults, nil
 		}
 		return nil, err
 	}
