@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, useMessage } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NCard, useMessage } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
@@ -141,7 +141,7 @@ function toggleTheme() {
       </div>
     </NScrollbar>
 
-    <NModal v-model:show="showAddProject" title="添加项目">
+    <NModal v-model:show="showAddProject" preset="card" title="添加项目" style="width: 420px">
       <div class="add-project-form">
         <label>项目名称</label>
         <NInput v-model:value="newProjectName" placeholder="例如：我的项目" />
