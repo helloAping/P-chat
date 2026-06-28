@@ -129,7 +129,6 @@ function toggleTheme() {
     <div class="sidebar-header">
       <div class="logo">💬 P-Chat</div>
       <NSpace size="small">
-        <NButton size="small" type="primary" @click="onNew">+ 新建会话</NButton>
         <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'">
           {{ themeName === 'dark' ? '🌙' : '☀' }}
         </NButton>
@@ -170,6 +169,10 @@ function toggleTheme() {
         </div>
       </div>
     </NScrollbar>
+
+    <div class="sidebar-footer">
+      <NButton size="small" type="primary" block @click="onNew">+ 新建会话</NButton>
+    </div>
 
     <NModal v-model:show="showAddProject" preset="card" title="添加项目" style="width: 420px">
       <div class="add-project-form">
@@ -272,4 +275,8 @@ function toggleTheme() {
 .confirm-body { padding: 8px 0; }
 .confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.sidebar-footer {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
 </style>
