@@ -345,10 +345,10 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	// 6. Project root — tells the LLM which directory to use
 	// as CWD for exec_command and file operations.
 	if projectRoot != "" {
-		sb.WriteString(fmt.Sprintf("\n---\n\n## 项目目录\n\n当前项目根目录是 `%s`。\n"+
-			"exec_command 默认在此目录执行，**不要**传 work_dir 参数——\n"+
-			"省略即可，系统会自动使用项目根目录。\n"+
-			"read_file、write_file 的相对路径以此目录为基准。\n", projectRoot))
+		sb.WriteString(fmt.Sprintf("\n---\n\n## 项目目录\n\n你的工作目录已固定为 `%s`。\n"+
+			"exec_command 不传 work_dir——已自动使用此目录，\n"+
+			"传了 work_dir 也不会生效。\n"+
+			"read_file/write_file 的相对路径以此目录为基准。\n", projectRoot))
 	}
 
 	// 7. Output language hint — also part of the cacheable prefix
