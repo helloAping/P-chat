@@ -65,6 +65,12 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 
 	h := NewHandler(agt, cfg, store, styleMgr)
 
+	// Wire the summarizer so /compress works.
+	if lc := agt.LLM(); lc != nil && cfg.LLM.Default != "" {
+		sm := memory.NewSummarizer(store, lc, cfg.LLM.Default, 50)
+		h.SetSummarizer(sm)
+	}
+
 	api := r.Group("/api/v1")
 	{
 		api.GET("/health", h.Health)

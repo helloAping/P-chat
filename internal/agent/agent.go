@@ -62,6 +62,8 @@ func (a *Agent) SetSandbox(s tool.SandboxChecker) {
 	a.sandbox = s
 }
 
+func (a *Agent) LLM() *llm.Client { return a.llm }
+
 // SetLLM swaps the agent's LLM client. Used by the HTTP layer after
 // a config change so new providers / API keys take effect immediately.
 func (a *Agent) SetLLM(c *llm.Client) {
