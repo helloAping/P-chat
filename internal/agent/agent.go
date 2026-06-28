@@ -590,7 +590,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if req.ReasoningEffort != "" {
 				opts.ReasoningEffort = req.ReasoningEffort
 			}
-			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, msgs, toolDefs, opts)
+			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, filterToolCalls(msgs), toolDefs, opts)
 			for chunk := range stream {
 				if chunk.Err != nil {
 					classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
@@ -920,6 +920,20 @@ func formatElapsed(d time.Duration) string {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
+// filterToolCalls removes TypeToolCall messages from a slice.
+// These carry metadata only and would cause API errors if sent
+// to providers that validate tool_call/tool_result pairing.
+func filterToolCalls(msgs []llm.ChatMessage) []llm.ChatMessage {
+	out := make([]llm.ChatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Type == llm.TypeToolCall {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 func persistAssistant(store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator) {
