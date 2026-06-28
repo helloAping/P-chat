@@ -689,7 +689,8 @@ function fmtContext(n?: number) {
         </div>
       </NTabPane>
 
-      <NTabPane name="styles" tab="风格配置" style="flex: 1; min-height: 0; overflow: auto">
+      <NTabPane name="styles" tab="风格配置">
+        <div class="styles-tab-body">
         <NSpace vertical size="large">
           <div>
             <h3 class="section-title">已配置的风格</h3>
@@ -754,6 +755,7 @@ function fmtContext(n?: number) {
             </div>
           </div>
         </NSpace>
+        </div>
       </NTabPane>
     </NTabs>
 
@@ -880,6 +882,10 @@ function fmtContext(n?: number) {
   background: var(--bg-2);
   border: 1px solid var(--border-2);
   border-radius: 6px;
+}
+.styles-tab-body {
+  max-height: calc(80vh - 160px);
+  overflow: auto;
 }
 .style-row {
   display: flex; justify-content: space-between; align-items: center;
