@@ -1495,3 +1495,18 @@ func (h *Handler) reloadAfterConfigChange() {
 	}
 	h.agent.SetLLM(newClient)
 }
+
+// PickFolder opens the native OS folder picker dialog and returns
+// the selected absolute path. POST /api/v1/dialog/folder
+func (h *Handler) PickFolder(c *gin.Context) {
+	path, err := nativePickFolder()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if path == "" {
+		c.JSON(http.StatusOK, gin.H{"path": ""})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"path": path})
+}

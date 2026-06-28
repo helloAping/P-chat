@@ -250,6 +250,10 @@ export const removeProject = (path: string) =>
     body: JSON.stringify({ path }),
   })
 
+// --- Dialog ---
+export const pickFolder = () =>
+  jsonFetch<{ path: string }>('/api/v1/dialog/folder', { method: 'POST' })
+
 // --- Messages ---
 export const listMessages = (id: string) =>
   jsonFetch<{ messages: Message[] }>(`/api/v1/sessions/${id}/messages`)
