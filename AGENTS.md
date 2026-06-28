@@ -77,12 +77,36 @@ internal/
   rules/         → .rules/ directory watcher
   skill/         → .skills/ directory loader
   sandbox/       → Tool execution guards
+  project/       → Project directory registry
   httpcli/       → HTTP client for remote REPL
   paths/         → ~/.p-chat directory resolution
   knowledge/     → Knowledge retrieval
   recall/        → Memory recall augment
   serverproc/    → Server process lifecycle
+  project/       → Project directory registry (~/.p-chat/projects.json)
 ```
+
+## Project system
+
+Users can register project directories. Each project has:
+
+| File | Path |
+|------|------|
+| Project config | `<project>/.p-chat/config.json` (merged atop global config) |
+| Project AGENTS instructions | `<project>/AGENTS.md` (merged with global AGENTS.md) |
+| Project skills | `<project>/.p-chat/skills/` |
+| Project rules | `<project>/.p-chat/rules/` |
+
+Sessions belong to a project (or global). When a session has `project_path` set in metadata:
+- `config.LoadWithProjectRoot("", projectRoot)` merges the project's `.p-chat/config.json` over the global config
+- `agents.LoadAllWithRoot(projectRoot)` includes the project's `AGENTS.md`
+- The agent's `buildStaticSystemPrompt` includes project root in its cache signature
+
+API: `GET/POST/DELETE /api/v1/projects`, sessions filter by `?project_path=`.
+
+## Frontend modal constraints
+
+All `NModal` instances **must** use `preset="card"` — plain `NModal` has a transparent backdrop that is invisible against the theme background. Card preset provides the proper `var(--bg-2)` / `var(--border)` themed rendering.
 
 ## Build commands
 
