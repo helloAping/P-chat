@@ -346,9 +346,9 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	// as CWD for exec_command and file operations.
 	if projectRoot != "" {
 		sb.WriteString(fmt.Sprintf("\n---\n\n## 项目目录\n\n当前项目根目录是 `%s`。\n"+
-			"执行命令（exec_command）时，默认工作目录为此目录，\n"+
-			"无需在 work_dir 参数中重复指定。\n"+
-			"读写文件时，相对路径以此目录为基准。\n", projectRoot))
+			"exec_command 默认在此目录执行，**不要**传 work_dir 参数——\n"+
+			"省略即可，系统会自动使用项目根目录。\n"+
+			"read_file、write_file 的相对路径以此目录为基准。\n", projectRoot))
 	}
 
 	// 7. Output language hint — also part of the cacheable prefix

@@ -77,6 +77,20 @@ func projectRootFromCtx(ctx context.Context) string {
 	return ""
 }
 
+// resolveToProjectRoot resolves a path to an absolute path.
+// If the path is relative, it is resolved against the project
+// root from the context. If the path is already absolute or no
+// project root is set, it is returned unchanged.
+func resolveToProjectRoot(ctx context.Context, p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	if root := projectRootFromCtx(ctx); root != "" {
+		return filepath.Join(root, p)
+	}
+	return p
+}
+
 type Registry struct {
 	tools map[string]ToolHandler
 	meta  map[string]Tool
@@ -261,9 +275,14 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	}
 
 	cmd := exec.CommandContext(ctx, "cmd", "/C", a.Command)
+	root := projectRootFromCtx(ctx)
 	if a.WorkDir != "" {
-		cmd.Dir = a.WorkDir
-	} else if root := projectRootFromCtx(ctx); root != "" {
+		if filepath.IsAbs(a.WorkDir) || root == "" {
+			cmd.Dir = a.WorkDir
+		} else {
+			cmd.Dir = filepath.Join(root, a.WorkDir)
+		}
+	} else if root != "" {
 		cmd.Dir = root
 	}
 
@@ -286,6 +305,7 @@ func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 	if a.Path == "" {
 		return &CallResult{Content: "path is required", IsError: true}, nil
 	}
+	a.Path = resolveToProjectRoot(ctx, a.Path)
 
 	// Block access to the upload directory. Uploaded files are
 	// images/audio/etc. that the user already attached to the
@@ -335,6 +355,7 @@ func handleWriteFile(ctx context.Context, args json.RawMessage) (*CallResult, er
 	if a.Path == "" {
 		return &CallResult{Content: "path is required", IsError: true}, nil
 	}
+	a.Path = resolveToProjectRoot(ctx, a.Path)
 
 	if sb := sandboxFromCtx(ctx); sb != nil && !sb.CheckWriteBool(a.Path) {
 		return &CallResult{
@@ -361,6 +382,7 @@ func handleListFiles(ctx context.Context, args json.RawMessage) (*CallResult, er
 	if a.Path == "" {
 		a.Path = "."
 	}
+	a.Path = resolveToProjectRoot(ctx, a.Path)
 
 	entries, err := listDir(a.Path)
 	if err != nil {
