@@ -196,6 +196,10 @@ type ChatRequest struct {
 	// activated via slash command. It is appended to the system
 	// prompt so the LLM sees it without cluttering the chat.
 	SkillContext string `json:"skill_context,omitempty"`
+	// MaxRounds caps the ReAct tool-use loop. 0 means default (50).
+	// After MaxRounds the loop stops and the user can continue
+	// with a follow-up message.
+	MaxRounds int `json:"max_rounds,omitempty"`
 }
 
 type ChatStreamChunk struct {
@@ -546,7 +550,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Plan mode: tell the LLM to produce a step-by-step plan in
 		// pure text (no tool calls). The user will review the plan
 		// before actually executing it.
-		maxRounds := 5
+		maxRounds := req.MaxRounds
+		if maxRounds <= 0 {
+			maxRounds = 50
+		}
 		if req.PlanMode {
 			toolDefs = nil
 			msgs[0].Content += "\n\n---\n\n## Plan Mode\n\n" +
@@ -564,6 +571,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		var totalIn, totalOut int
+
+		// Repeated tool call detection: track the last 3 tool name+args pairs.
+		var lastToolCalls [3]string
+		lastToolIdx := 0
 
 		for round := 0; round < maxRounds; round++ {
 			roundStart := time.Now()
@@ -659,23 +670,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 			msgs = append(msgs, assistantMsg)
 
-			// Persist the assistant text message.
-			if a.store != nil {
-				meta := map[string]string{
-					"role":   assistantMsg.Role,
-					"reason": "assistant",
-				}
-				if fullThinking != "" {
-					meta["thinking"] = fullThinking
-				}
-				structural := snapshotStructural(partsAcc)
-				if len(structural) > 0 {
-					if pj, pjErr := json.Marshal(structural); pjErr == nil {
-						meta["parts"] = string(pj)
-					}
-				}
-				a.store.AddChatMessageWithMeta(assistantMsg, meta)
-			}
+			// Persist assistant message later — after tool
+			// results are in partsAcc (see end of this round).
 
 			// Append tool_call messages for each tool call.
 			for _, tc := range toolCalls {
@@ -698,9 +694,39 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 
 			if len(toolCalls) == 0 {
+				persistAssistant(a.store, assistantMsg, fullThinking, partsAcc)
 				ch <- ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
 				ch <- ChatStreamChunk{Done: true}
 				return
+			}
+
+			// Repeated-call detection: if the last 3 tool calls
+			// are the same tool with matching args prefix, warn
+			// and stop to avoid infinite loops.
+			for _, tc := range toolCalls {
+				sig := tc.Name + ":" + (tc.ArgsJSON + "            ")[:12]
+				lastToolCalls[lastToolIdx%3] = sig
+				lastToolIdx++
+			}
+			if lastToolIdx >= 3 &&
+				lastToolCalls[0] != "" &&
+				lastToolCalls[0] == lastToolCalls[1] &&
+				lastToolCalls[1] == lastToolCalls[2] {
+				persistAssistant(a.store, assistantMsg, fullThinking, partsAcc)
+				ch <- ChatStreamChunk{Phase: "loop_warn", Step: "loop-warn", Message: fmt.Sprintf("检测到同一工具连续重复调用 3 次 (%s)，已暂停以防死循环。请检查任务是否完成或调整方案后继续。", toolCalls[0].Name), Round: roundNum, MaxRound: maxRounds}
+				ch <- ChatStreamChunk{Done: true}
+				return
+			}
+
+			// Context window warning: when the message list grows
+			// too large, warn or auto-stop.
+			if len(msgs) > 60 {
+				persistAssistant(a.store, assistantMsg, fullThinking, partsAcc)
+				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条消息，接近上限，已自动停止。建议执行 /compress 压缩历史后继续。", len(msgs)), Round: roundNum, MaxRound: maxRounds}
+				ch <- ChatStreamChunk{Done: true}
+				return
+			} else if len(msgs) > 40 {
+				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条消息，建议在完成当前任务后执行 /compress 压缩历史。", len(msgs)), Round: roundNum, MaxRound: maxRounds}
 			}
 
 			ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds}
@@ -896,9 +922,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					a.store.AddChatMessage(toolMsg)
 				}
 			}
+			// Persist assistant message now that tool
+			// results are captured in partsAcc.
+			persistAssistant(a.store, assistantMsg, fullThinking, partsAcc)
 		}
 
-		ch <- ChatStreamChunk{Phase: "done", Step: "max-rounds", Message: fmt.Sprintf("达到最大轮次 %d, 强制结束 (总耗时 %s)", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
+		ch <- ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。工具执行结果已保留，发送新消息可继续。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
 		ch <- ChatStreamChunk{Done: true}
 	}()
 
@@ -913,6 +942,26 @@ func formatElapsed(d time.Duration) string {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
+func persistAssistant(store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator) {
+	if store == nil {
+		return
+	}
+	meta := map[string]string{
+		"role":   msg.Role,
+		"reason": "assistant",
+	}
+	if fullThinking != "" {
+		meta["thinking"] = fullThinking
+	}
+	structural := snapshotStructural(partsAcc)
+	if len(structural) > 0 {
+		if pj, pjErr := json.Marshal(structural); pjErr == nil {
+			meta["parts"] = string(pj)
+		}
+	}
+	store.AddChatMessageWithMeta(msg, meta)
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction
