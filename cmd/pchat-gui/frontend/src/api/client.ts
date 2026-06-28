@@ -282,6 +282,26 @@ export const deleteSkill = (name: string) =>
 export const searchSkills = (q: string) =>
   jsonFetch<{ results: SearchSkillItem[] }>(`/api/v1/skills/search?q=${encodeURIComponent(q)}`)
 
+export interface SavedRepo {
+  name: string
+  url: string
+}
+
+export const listSkillRepos = () =>
+  jsonFetch<{ repos: SavedRepo[] }>('/api/v1/skills/repos')
+
+export const addSkillRepo = (name: string, url: string) =>
+  jsonFetch<{ repos: SavedRepo[] }>('/api/v1/skills/repos', {
+    method: 'POST',
+    body: JSON.stringify({ name, url }),
+  })
+
+export const removeSkillRepo = (url: string) =>
+  jsonFetch<{ repos: SavedRepo[] }>('/api/v1/skills/repos', {
+    method: 'DELETE',
+    body: JSON.stringify({ url }),
+  })
+
 // --- Messages ---
 export const listMessages = (id: string) =>
   jsonFetch<{ messages: Message[] }>(`/api/v1/sessions/${id}/messages`)

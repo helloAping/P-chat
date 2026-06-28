@@ -99,6 +99,7 @@ watch(tab, (v) => {
     loadArchived()
   } else if (v === 'skills') {
     refreshSkills()
+    refreshRepos()
   }
 })
 
@@ -545,16 +546,45 @@ const searchResults = ref<api.SearchSkillItem[]>([])
 const searchQuery = ref('')
 const searching = ref(false)
 const installing = ref('')
+const savedRepos = ref<api.SavedRepo[]>([])
+const showAddRepo = ref(false)
+const newRepoName = ref('')
+const newRepoUrl = ref('')
 
-const builtInRepos = [
-  { name: 'OpenCode 官方技能', url: 'https://github.com/anomalyco/opencode' },
-  { name: 'P-Chat 社区技能', url: 'https://github.com/p-chat-community/skills' },
-  { name: 'Matt Pocock 工程技能', url: 'https://github.com/mattpocock/engineering-skills' },
-]
+async function refreshRepos() {
+  try {
+    const r = await api.listSkillRepos()
+    savedRepos.value = r.repos || []
+  } catch { /* ignore */ }
+}
 
 function onSelectRepo(url: string) {
   searchQuery.value = url
   onSearchSkills()
+}
+
+async function onAddRepo() {
+  if (!newRepoName.value.trim() || !newRepoUrl.value.trim()) return
+  try {
+    const r = await api.addSkillRepo(newRepoName.value.trim(), newRepoUrl.value.trim())
+    savedRepos.value = r.repos || []
+    showAddRepo.value = false
+    newRepoName.value = ''
+    newRepoUrl.value = ''
+    message.success('仓库已添加')
+  } catch (e: any) {
+    message.error(e.message || '添加失败')
+  }
+}
+
+async function onRemoveRepo(url: string) {
+  try {
+    const r = await api.removeSkillRepo(url)
+    savedRepos.value = r.repos || []
+    message.info('仓库已移除')
+  } catch (e: any) {
+    message.error(e.message || '移除失败')
+  }
 }
 
 async function refreshSkills() {
@@ -913,11 +943,18 @@ function fmtContext(n?: number) {
       </NTabPane>
 
       <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; overflow: auto">
-        <!-- Built-in repos -->
+        <!-- Saved repos -->
         <div class="skill-repos">
-          <span class="skill-hint">内置仓库</span>
-          <div class="repo-chips">
-            <NButton v-for="r in builtInRepos" :key="r.url" size="tiny" quaternary @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+          <div class="skill-repos-header">
+            <span class="skill-hint">技能仓库</span>
+            <NButton size="tiny" quaternary @click="showAddRepo = true">+ 添加</NButton>
+          </div>
+          <div v-if="!savedRepos.length" class="empty-hint" style="padding:4px 0;font-size:12px">暂无保存的仓库，点击「+ 添加」输入 GitHub 地址</div>
+          <div v-else class="repo-chips">
+            <div v-for="r in savedRepos" :key="r.url" class="repo-chip-row">
+              <NButton size="tiny" quaternary @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+              <NButton size="tiny" quaternary @click="onRemoveRepo(r.url)" style="color:var(--warn);font-size:10px">×</NButton>
+            </div>
           </div>
         </div>
         <div class="skill-divider" />
@@ -958,6 +995,20 @@ function fmtContext(n?: number) {
         <div class="confirm-actions">
           <NButton size="small" @click="showConfirmPermDelete = false">取消</NButton>
           <NButton size="small" type="error" @click="confirmPermDelete">永久删除</NButton>
+        </div>
+      </div>
+    </NModal>
+
+    <!-- Add skill repo -->
+    <NModal v-model:show="showAddRepo" preset="card" title="添加技能仓库" style="width: 420px">
+      <div class="add-project-form">
+        <label>仓库名称</label>
+        <NInput v-model:value="newRepoName" placeholder="例如：我的技能仓库" />
+        <label style="margin-top: 12px">GitHub 地址</label>
+        <NInput v-model:value="newRepoUrl" placeholder="例如：https://github.com/user/repo" />
+        <div class="project-actions">
+          <NButton size="small" @click="showAddRepo = false">取消</NButton>
+          <NButton size="small" type="primary" @click="onAddRepo">添加</NButton>
         </div>
       </div>
     </NModal>
@@ -1124,7 +1175,9 @@ code {
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .skill-search { display: flex; gap: 8px; margin-bottom: 12px; }
 .skill-repos { margin-bottom: 4px; }
+.skill-repos-header { display: flex; justify-content: space-between; align-items: center; }
 .repo-chips { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.repo-chip-row { display: inline-flex; align-items: center; }
 .skill-search-results { margin-bottom: 12px; }
 .skill-search-row {
   display: flex; align-items: center; gap: 8px;

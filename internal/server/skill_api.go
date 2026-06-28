@@ -248,3 +248,108 @@ func extractFirstLine(content string) string {
 	}
 	return ""
 }
+
+// --- Skill repos ---
+
+type skillRepo struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+func skillReposPath() string {
+	return filepath.Join(paths.GlobalDir(), "skill-repos.json")
+}
+
+func loadSkillRepos() ([]skillRepo, error) {
+	data, err := os.ReadFile(skillReposPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var repos []skillRepo
+	if err := json.Unmarshal(data, &repos); err != nil {
+		return nil, err
+	}
+	return repos, nil
+}
+
+func saveSkillRepos(repos []skillRepo) error {
+	if err := os.MkdirAll(paths.GlobalDir(), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(repos, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(skillReposPath(), data, 0o644)
+}
+
+// ListSkillRepos GET /api/v1/skills/repos
+func (h *Handler) ListSkillRepos(c *gin.Context) {
+	repos, err := loadSkillRepos()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if repos == nil {
+		repos = []skillRepo{}
+	}
+	c.JSON(http.StatusOK, gin.H{"repos": repos})
+}
+
+// AddSkillRepo POST /api/v1/skills/repos
+func (h *Handler) AddSkillRepo(c *gin.Context) {
+	var req skillRepo
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if req.Name == "" || req.URL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and url are required"})
+		return
+	}
+	repos, err := loadSkillRepos()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	for _, r := range repos {
+		if r.URL == req.URL {
+			c.JSON(http.StatusOK, gin.H{"repos": repos})
+			return
+		}
+	}
+	repos = append(repos, req)
+	if err := saveSkillRepos(repos); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"repos": repos})
+}
+
+// RemoveSkillRepo DELETE /api/v1/skills/repos
+func (h *Handler) RemoveSkillRepo(c *gin.Context) {
+	var req struct{ URL string `json:"url"` }
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	repos, err := loadSkillRepos()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	filtered := make([]skillRepo, 0, len(repos))
+	for _, r := range repos {
+		if r.URL != req.URL {
+			filtered = append(filtered, r)
+		}
+	}
+	if err := saveSkillRepos(filtered); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"repos": filtered})
+}
