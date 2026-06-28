@@ -187,6 +187,11 @@ type ChatRequest struct {
 	// SessionID is the current conversation identifier. Used by
 	// tools that need per-session state (e.g. todo_write).
 	SessionID string `json:"session_id,omitempty"`
+	// ProjectRoot is the absolute path to the project directory
+	// this session belongs to. When non-empty, project-level
+	// config and AGENTS.md are loaded from this root instead of
+	// the server's CWD.
+	ProjectRoot string `json:"project_root,omitempty"`
 }
 
 type ChatStreamChunk struct {
@@ -255,7 +260,7 @@ type ChatStreamChunk struct {
 // between rounds within a chat, AND between chats within a session. The
 // only thing that should change in this string is the underlying files
 // (AGENTS.md, rules, skills) or the chosen style.
-func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef) (string, string, error) {
+func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, projectRoot string) (string, string, error) {
 	toolNames := make([]string, 0, len(toolDefs))
 	for _, t := range toolDefs {
 		toolNames = append(toolNames, t.Name)
@@ -266,7 +271,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef) (
 	}
 	sig := strings.Join([]string{
 		string(s),
-		agentsSignature(),
+		agentsSignatureWithRoot(projectRoot),
 		rulesSignature(a.rules),
 		skillSignature(a.skills),
 		strings.Join(toolNames, ","),
@@ -287,7 +292,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef) (
 	sb.WriteString("\n\n---\n\n")
 
 	// 2. AGENTS instructions — stable until files change.
-	sb.WriteString(agents.LoadAll())
+	sb.WriteString(agents.LoadAllWithRoot(projectRoot))
 	sb.WriteString("\n---\n\n")
 
 	// 3. Rules — stable until files change.
@@ -372,6 +377,16 @@ func (a *Agent) StaticPromptInfo() (prompt string, sig string, built bool) {
 // of AGENTS files. We use mtime + size to detect changes cheaply.
 func agentsSignature() string {
 	g, _ := os.Stat(paths.GlobalAgents())
+	p, _ := os.Stat(paths.ProjectAgents())
+	return fileSig(g) + "|" + fileSig(p)
+}
+
+func agentsSignatureWithRoot(root string) string {
+	g, _ := os.Stat(paths.GlobalAgents())
+	if root != "" {
+		p, _ := os.Stat(paths.ProjectAgentsWithRoot(root))
+		return fileSig(g) + "|" + fileSig(p) + "|" + root
+	}
 	p, _ := os.Stat(paths.ProjectAgents())
 	return fileSig(g) + "|" + fileSig(p)
 }
@@ -470,7 +485,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		ch <- ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."}
-		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs)
+		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, req.ProjectRoot)
 		if err != nil {
 			ch <- ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true}
 			return

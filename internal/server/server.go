@@ -117,6 +117,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.PATCH("/sessions/:id/reasoning-effort", h.SetReasoningEffort)
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)
 		api.GET("/sessions/:id/todos", h.GetTodos)
+
+		// Projects
+		api.GET("/projects", h.ListProjects)
+		api.POST("/projects", h.AddProject)
+		api.DELETE("/projects", h.RemoveProject)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the

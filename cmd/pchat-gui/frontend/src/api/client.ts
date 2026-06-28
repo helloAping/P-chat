@@ -18,6 +18,7 @@ export interface Session {
   style?: string
   provider?: string
   model?: string
+  project_path?: string
 }
 
 export interface Attachment {
@@ -134,6 +135,7 @@ export interface SessionMeta {
   style: string
   provider: string
   model: string
+  project_path?: string
   created_at: number
   updated_at: number
 }
@@ -177,13 +179,19 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 export const health = () => jsonFetch<{ status: string }>('/api/v1/health')
 
 // --- Sessions ---
-export const listSessions = () => jsonFetch<{ sessions: Session[] }>('/api/v1/sessions')
+export const listSessions = (projectPath?: string) =>
+  jsonFetch<{ sessions: Session[] }>(
+    `/api/v1/sessions${projectPath !== undefined ? `?project_path=${encodeURIComponent(projectPath)}` : ''}`,
+  )
 
 export const getSession = (id: string) =>
   jsonFetch<Session>(`/api/v1/sessions/${encodeURIComponent(id)}`)
 
-export const createSession = () =>
-  jsonFetch<{ id: string }>('/api/v1/sessions', { method: 'POST' })
+export const createSession = (projectPath?: string) =>
+  jsonFetch<{ id: string }>(
+    '/api/v1/sessions',
+    { method: 'POST', body: JSON.stringify({ project_path: projectPath || '' }) },
+  )
 
 export const deleteSession = (id: string) =>
   jsonFetch<{ ok: boolean }>(`/api/v1/sessions/${id}`, { method: 'DELETE' })
@@ -220,6 +228,27 @@ export const saveSystemMessage = (id: string, content: string) =>
 
 export const getTodos = (id: string) =>
   jsonFetch<{ todos: TodoItem[] }>(`/api/v1/sessions/${id}/todos`)
+
+// --- Projects ---
+export interface ProjectItem {
+  name: string
+  path: string
+}
+
+export const listProjects = () =>
+  jsonFetch<{ projects: ProjectItem[] }>('/api/v1/projects')
+
+export const addProject = (name: string, path: string) =>
+  jsonFetch<{ projects: ProjectItem[] }>('/api/v1/projects', {
+    method: 'POST',
+    body: JSON.stringify({ name, path }),
+  })
+
+export const removeProject = (path: string) =>
+  jsonFetch<{ projects: ProjectItem[] }>('/api/v1/projects', {
+    method: 'DELETE',
+    body: JSON.stringify({ path }),
+  })
 
 // --- Messages ---
 export const listMessages = (id: string) =>

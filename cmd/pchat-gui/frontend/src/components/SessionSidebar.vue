@@ -1,21 +1,30 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, useMessage } from 'naive-ui'
-import { state, createSession, deleteSessionById, renameSession, switchSession } from '../stores/chat'
+import { computed, ref } from 'vue'
+import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, useMessage } from 'naive-ui'
+import {
+  state, createSession, deleteSessionById, renameSession, switchSession,
+  loadProjects, setActiveProject,
+} from '../stores/chat'
+import * as api from '../api/client'
+import type { SelectOption } from 'naive-ui'
 
 const emit = defineEmits<{ (e: 'open-settings'): void }>()
 
-// Two-way binding to the themeName in App.vue. The
-// v-model:theme-name shorthand emits 'update:themeName'
-// when this component flips it, and App.vue applies the
-// change to <html data-theme=…> + localStorage.
 const themeName = defineModel<'dark' | 'light'>('themeName', { default: 'dark' })
 
 const message = useMessage()
+const showAddProject = ref(false)
+const newProjectName = ref('')
+const newProjectPath = ref('')
 
 const sortedSessions = computed(() =>
   [...state.sessions].sort((a, b) => b.updated_at - a.updated_at),
 )
+
+const projectOptions = computed<SelectOption[]>(() => [
+  { label: '🌐 全局', value: '' },
+  ...state.projects.map(p => ({ label: `📁 ${p.name}`, value: p.path })),
+])
 
 async function onNew() {
   const id = await createSession()
@@ -37,6 +46,37 @@ async function onRename(id: string) {
   }
 }
 
+async function onProjectChange(path: string) {
+  await setActiveProject(path)
+}
+
+async function onAddProject() {
+  if (!newProjectName.value.trim() || !newProjectPath.value.trim()) return
+  try {
+    await api.addProject(newProjectName.value.trim(), newProjectPath.value.trim())
+    await loadProjects()
+    message.success('项目已添加')
+    showAddProject.value = false
+    newProjectName.value = ''
+    newProjectPath.value = ''
+  } catch (e: any) {
+    message.error(e.message || '添加失败')
+  }
+}
+
+async function onRemoveProject(path: string) {
+  try {
+    await api.removeProject(path)
+    await loadProjects()
+    if (state.activeProjectPath === path) {
+      await setActiveProject('')
+    }
+    message.info('项目已移除')
+  } catch (e: any) {
+    message.error(e.message || '移除失败')
+  }
+}
+
 function formatTime(t: number) {
   const d = new Date(t * 1000)
   const now = new Date()
@@ -50,10 +90,6 @@ function openSettings() {
   emit('open-settings')
 }
 
-// The toggle button is a single icon that flips between
-// 🌙 (currently dark) and ☀ (currently light) so the
-// label always shows the *target* — what the user is
-// about to switch to, not the current state.
 function toggleTheme() {
   themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
 }
@@ -70,6 +106,16 @@ function toggleTheme() {
         </NButton>
         <NButton size="small" quaternary @click="openSettings" title="设置">⚙</NButton>
       </NSpace>
+    </div>
+    <div class="project-bar">
+      <NSelect
+        :value="state.activeProjectPath"
+        :options="projectOptions"
+        size="small"
+        placeholder="选择项目"
+        @update:value="onProjectChange"
+      />
+      <NButton size="tiny" quaternary @click="showAddProject = true" title="添加项目">+</NButton>
     </div>
     <NScrollbar style="flex: 1">
       <div class="session-list">
@@ -94,6 +140,19 @@ function toggleTheme() {
         </div>
       </div>
     </NScrollbar>
+
+    <NModal v-model:show="showAddProject" title="添加项目">
+      <div class="add-project-form">
+        <label>项目名称</label>
+        <NInput v-model:value="newProjectName" placeholder="例如：我的项目" />
+        <label style="margin-top: 12px">项目目录</label>
+        <NInput v-model:value="newProjectPath" placeholder="例如：D:\projects\my-app" />
+        <div class="project-actions">
+          <NButton size="small" @click="showAddProject = false">取消</NButton>
+          <NButton size="small" type="primary" @click="onAddProject">添加</NButton>
+        </div>
+      </div>
+    </NModal>
   </aside>
 </template>
 
@@ -137,4 +196,19 @@ function toggleTheme() {
   cursor: pointer; padding: 2px 6px; border-radius: 3px; font-size: 12px;
 }
 .icon-btn:hover { background: var(--bg-4); color: var(--text); }
+.project-bar {
+  display: flex; align-items: center; gap: 4px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.project-bar :deep(.n-base-select) { flex: 1; }
+.add-project-form {
+  padding: 16px; min-width: 320px;
+}
+.add-project-form label {
+  display: block; font-size: 13px; margin-bottom: 4px; color: var(--text-2);
+}
+.project-actions {
+  margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end;
+}
 </style>

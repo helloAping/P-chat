@@ -111,6 +111,39 @@ func ToolsDir() string {
 	return filepath.Join(GlobalDir(), "tools")
 }
 
+// ProjectsFile returns ~/.p-chat/projects.json
+func ProjectsFile() string {
+	return filepath.Join(GlobalDir(), "projects.json")
+}
+
+// ProjectsFileDir returns ~/.p-chat (parent of projects.json)
+func ProjectsFileDir() string {
+	return GlobalDir()
+}
+
+// WithRoot variants – return paths relative to an explicit project root
+// instead of os.Getwd(). Used when a session has a project_path override.
+
+func ProjectConfigWithRoot(root string) string {
+	return filepath.Join(root, ProjectDirName, "config.json")
+}
+
+func ProjectAgentsWithRoot(root string) string {
+	return filepath.Join(root, "AGENTS.md")
+}
+
+func ProjectSkillsDirWithRoot(root string) string {
+	return filepath.Join(root, ProjectDirName, "skills")
+}
+
+func ProjectRulesDirWithRoot(root string) string {
+	return filepath.Join(root, ProjectDirName, "rules")
+}
+
+func ProjectPromptsDirWithRoot(root string) string {
+	return filepath.Join(root, "prompts")
+}
+
 // EnsureGlobal creates ~/.p-chat and subdirectories if they don't exist
 func EnsureGlobal() error {
 	dirs := []string{

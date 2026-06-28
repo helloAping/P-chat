@@ -19,7 +19,7 @@ import SessionSidebar from './components/SessionSidebar.vue'
 import ChatWindow from './components/ChatWindow.vue'
 import AppSettingsModal from './components/AppSettingsModal.vue'
 import ImageLightbox from './components/ImageLightbox.vue'
-import { state, loadSessions, loadProviders } from './stores/chat'
+import { state, loadSessions, loadProviders, loadProjects } from './stores/chat'
 
 const showAppSettings = ref(false)
 
@@ -100,7 +100,7 @@ onMounted(async () => {
     // Providers must load before the chat NSelect first
     // renders, so currentMeta() has something to fall back
     // to. Run in parallel with loadSessions.
-    await Promise.all([loadSessions(), loadProviders()])
+    await Promise.all([loadSessions(), loadProviders(), loadProjects()])
   } catch (e) {
     console.error('init failed', e)
   }

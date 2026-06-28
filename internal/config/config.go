@@ -348,6 +348,13 @@ func stripBOM(data []byte) []byte {
 //   - When a customPath is passed and cannot be read / parsed,
 //     an error is returned (the user explicitly asked for it).
 func Load(customPath string) (*Config, error) {
+	return LoadWithProjectRoot(customPath, "")
+}
+
+// LoadWithProjectRoot merges global, project-root, and custom configs.
+// When projectRoot is non-empty, the project layer is loaded from
+// `<projectRoot>/.p-chat/config.json` instead of os.Getwd().
+func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	cfg := Default()
 
 	// Global layer.
@@ -365,15 +372,20 @@ func Load(customPath string) (*Config, error) {
 			}
 		}
 	} else {
-		// Permission / IO error reading global — surface to caller.
 		return nil, fmt.Errorf("read global config: %w", err)
 	}
 
 	// Project layer (overrides global).
-	if data, err := os.ReadFile(paths.ProjectConfig()); err == nil {
+	var projectConfigPath string
+	if projectRoot != "" {
+		projectConfigPath = paths.ProjectConfigWithRoot(projectRoot)
+	} else {
+		projectConfigPath = paths.ProjectConfig()
+	}
+	if data, err := os.ReadFile(projectConfigPath); err == nil {
 		data = stripBOM(data)
 		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse project config %s: %w", paths.ProjectConfig(), err)
+			return nil, fmt.Errorf("parse project config %s: %w", projectConfigPath, err)
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read project config: %w", err)

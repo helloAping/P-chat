@@ -4,7 +4,7 @@
 
 import { reactive, ref, computed } from 'vue'
 import * as api from '../api/client'
-import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem } from '../api/client'
+import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem } from '../api/client'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -50,6 +50,8 @@ export const state = reactive({
   sessionTodos: {} as Record<string, TodoItem[]>,
   lightbox: { show: false, src: '', alt: '' },
   showSettings: false,
+  projects: [] as ProjectItem[],
+  activeProjectPath: '' as string,
 })
 
 export const currentMessages = computed(() =>
@@ -59,6 +61,12 @@ export const currentMessages = computed(() =>
 export const currentTodos = computed(() =>
   state.sessionTodos[state.currentID] || [],
 )
+
+export const activeProjectName = computed(() => {
+  if (!state.activeProjectPath) return '全局'
+  const p = state.projects.find(p => p.path === state.activeProjectPath)
+  return p?.name || state.activeProjectPath
+})
 
 // currentMeta resolves the per-session picker state
 // (style / provider / model / title). When the server
@@ -81,11 +89,30 @@ export const currentMeta = computed(() => {
 // --- Session management ---
 
 export async function loadSessions() {
-  const { sessions } = await api.listSessions()
+  const { sessions } = await api.listSessions(state.activeProjectPath || undefined)
   state.sessions = sessions
   if (!state.currentID && sessions.length > 0) {
     await switchSession(sessions[0].id)
   }
+}
+
+export async function loadProjects() {
+  try {
+    const r = await api.listProjects()
+    state.projects = r.projects || []
+  } catch {
+    state.projects = []
+  }
+}
+
+export async function setActiveProject(path: string) {
+  state.activeProjectPath = path
+  state.currentID = ''
+  state.sessions = []
+  state.sessionMessages = {}
+  state.sessionMeta = {}
+  state.sessionTodos = {}
+  await loadSessions()
 }
 
 export async function switchSession(id: string) {
@@ -159,7 +186,8 @@ export async function loadProviders() {
 }
 
 export async function createSession(): Promise<string> {
-  const { id } = await api.createSession()
+  const projectPath = state.activeProjectPath || undefined
+  const { id } = await api.createSession(projectPath)
   // Fetch the freshly created session's resolved meta from
   // the server. The server's sessionToResponse applies the
   // per-session override → global default chain for

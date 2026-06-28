@@ -16,6 +16,7 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/project"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -35,20 +36,22 @@ type Handler struct {
 }
 
 type sessionMeta struct {
-	Style          string
-	Provider       string
-	Model          string
+	Style           string
+	Provider        string
+	Model           string
 	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
+	ProjectPath     string // project root directory, "" = global
 }
 
 // sessionMetaBlob is the on-disk shape written to
 // conversations.metadata. The field names are JSON lower-case so
 // the web side can pass them straight back to the PATCH endpoint.
 type sessionMetaBlob struct {
-	Style          string `json:"style,omitempty"`
-	Provider       string `json:"provider,omitempty"`
-	Model          string `json:"model,omitempty"`
+	Style           string `json:"style,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	ProjectPath     string `json:"project_path,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager) *Handler {
@@ -96,7 +99,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	if h.store == nil {
 		return
 	}
-	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort})
+	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath})
 	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
 		// Non-fatal: in-memory map already updated, request still
 		// works for this session. The next setSessionMeta call
@@ -123,6 +126,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.Provider = blob.Provider
 				m.Model = blob.Model
 				m.ReasoningEffort = blob.ReasoningEffort
+				m.ProjectPath = blob.ProjectPath
 			}
 		}
 	}
@@ -158,6 +162,25 @@ func (h *Handler) sessionModel(id, provider string) string {
 		}
 	}
 	return ""
+}
+
+// sessionProjectPath returns the project path for a session.
+func (h *Handler) sessionProjectPath(id string) string {
+	m := h.ensureMetaLoaded(id)
+	return m.ProjectPath
+}
+
+// setSessionMetaProjectPath updates just the project_path field.
+func (h *Handler) setSessionMetaProjectPath(id, projectPath string) {
+	h.metaMu.Lock()
+	m := h.meta[id]
+	m.ProjectPath = projectPath
+	h.meta[id] = m
+	h.metaMu.Unlock()
+	if h.store != nil {
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath})
+		_ = h.store.UpdateConversationMeta(id, string(blob))
+	}
 }
 
 // validProvider returns true if name is a configured provider.
@@ -217,10 +240,11 @@ type SendMessageRequest struct {
 
 // CreateSessionRequest is the body of POST /sessions.
 type CreateSessionRequest struct {
-	Style    string `json:"style,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
-	Title    string `json:"title,omitempty"`
+	Style       string `json:"style,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	Model       string `json:"model,omitempty"`
+	Title       string `json:"title,omitempty"`
+	ProjectPath string `json:"project_path,omitempty"`
 }
 
 // RenameSessionRequest is the body of PATCH /sessions/:id when the
@@ -245,13 +269,14 @@ type UpdateSessionMetaRequest struct {
 // (resolved from the in-memory + on-disk meta blob, with the
 // process default for unset fields).
 type SessionResponse struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Style     string `json:"style,omitempty"`
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Provider    string `json:"provider,omitempty"`
+	Model       string `json:"model,omitempty"`
+	Style       string `json:"style,omitempty"`
+	ProjectPath string `json:"project_path,omitempty"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
 }
 
 // MessageResponse is the JSON form of a single message in a
@@ -584,10 +609,25 @@ func (h *Handler) ListSessions(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
 		return
 	}
+	projectPath := c.Query("project_path")
 	convs := h.store.ListConversations()
 	out := make([]SessionResponse, 0, len(convs))
 	for _, conv := range convs {
-		out = append(out, h.sessionToResponse(conv))
+		resp := h.sessionToResponse(conv)
+		// Filter by project_path when query param is present.
+		// Empty query means "all sessions"; explicit "" means
+		// "only global (non-project) sessions".
+		if projectPath != "" {
+			if resp.ProjectPath != projectPath {
+				continue
+			}
+		} else if c.Query("project_path") != "" {
+			// Explicit ?project_path= — show only global sessions.
+			if resp.ProjectPath != "" {
+				continue
+			}
+		}
+		out = append(out, resp)
 	}
 	c.JSON(http.StatusOK, gin.H{"sessions": out})
 }
@@ -640,6 +680,10 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 
 	h.setSessionMeta(id, req.Style, provider, model)
+	// Store project path if provided.
+	if req.ProjectPath != "" {
+		h.setSessionMetaProjectPath(id, req.ProjectPath)
+	}
 
 	// Re-fetch and return the full session record.
 	convs := h.store.ListConversations()
@@ -1089,6 +1133,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		ReasoningEffort:   meta.ReasoningEffort,
 		CompressedSummary: compSummary,
 		SessionID:         id,
+		ProjectRoot:       meta.ProjectPath,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -1228,13 +1273,14 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		}
 	}
 	return SessionResponse{
-		ID:        cv.ID,
-		Title:     cv.Title,
-		Provider:  provider,
-		Model:     model,
-		Style:     m.Style,
-		CreatedAt: cv.CreatedAt.Unix(),
-		UpdatedAt: cv.UpdatedAt.Unix(),
+		ID:          cv.ID,
+		Title:       cv.Title,
+		Provider:    provider,
+		Model:       model,
+		Style:       m.Style,
+		ProjectPath: m.ProjectPath,
+		CreatedAt:   cv.CreatedAt.Unix(),
+		UpdatedAt:   cv.UpdatedAt.Unix(),
 	}
 }
 
@@ -1302,7 +1348,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
@@ -1346,6 +1392,76 @@ func (h *Handler) GetTodos(c *gin.Context) {
 	id := c.Param("id")
 	todos := tool.GetSessionTodos(id)
 	c.JSON(http.StatusOK, gin.H{"todos": todos})
+}
+
+// --- Project CRUD ---
+
+type projectResponse struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// ListProjects GET /api/v1/projects
+func (h *Handler) ListProjects(c *gin.Context) {
+	projects, err := project.Load()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if projects == nil {
+		projects = []project.Project{}
+	}
+	out := make([]projectResponse, 0, len(projects))
+	for _, p := range projects {
+		out = append(out, projectResponse{Name: p.Name, Path: p.Path})
+	}
+	c.JSON(http.StatusOK, gin.H{"projects": out})
+}
+
+// AddProject POST /api/v1/projects
+func (h *Handler) AddProject(c *gin.Context) {
+	var req projectResponse
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if req.Name == "" || req.Path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and path are required"})
+		return
+	}
+	projects, err := project.Add(req.Name, req.Path)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	out := make([]projectResponse, 0, len(projects))
+	for _, p := range projects {
+		out = append(out, projectResponse{Name: p.Name, Path: p.Path})
+	}
+	c.JSON(http.StatusCreated, gin.H{"projects": out})
+}
+
+// RemoveProject DELETE /api/v1/projects
+func (h *Handler) RemoveProject(c *gin.Context) {
+	var req struct{ Path string `json:"path"` }
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if req.Path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
+		return
+	}
+	projects, err := project.Remove(req.Path)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	out := make([]projectResponse, 0, len(projects))
+	for _, p := range projects {
+		out = append(out, projectResponse{Name: p.Name, Path: p.Path})
+	}
+	c.JSON(http.StatusOK, gin.H{"projects": out})
 }
 
 // contextLevelLimit returns the default message fetch limit.
