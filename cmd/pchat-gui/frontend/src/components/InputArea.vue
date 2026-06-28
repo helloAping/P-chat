@@ -316,50 +316,49 @@ function renderHelp(): string {
 }
 
 async function send() {
-  const text = inputText.value.trim()
-  if (!text || sending.value) return
+  const raw = inputText.value.trim()
+  if (!raw || sending.value) return
 
   if (isSlashLine()) {
     const parsed = parseSlashLine()
-    inputText.value = ''
     if (parsed) {
-      // Skill commands: load content and send to LLM.
+      // Skill commands: load content, merge with user args,
+      // then send as a single message to the LLM.
       if (skillCommands.value.some(c => c.name === parsed.name)) {
         sending.value = true
         try {
           const r = await api.getSkill(parsed.name)
           const skillContent = r.skill.content || ''
           const userInput = parsed.args || ''
-          // Rebuild inputText: skill content prepended, then user args.
-          inputText.value = userInput
-          // Proceed with normal send — skill content becomes the
-          // user message so the LLM gets both skill + user query.
-          // We push a system note first so the user sees what happened.
-          appendSystemMessage(`已加载技能「${parsed.name}」` + (userInput ? `，将连同问题一起发送` : ''))
-          // Inject skill content as a system instruction BEFORE the user message.
-          const id = state.currentID
-          if (id) {
-            if (!state.sessionMessages[id]) state.sessionMessages[id] = []
-            state.sessionMessages[id].push({ role: 'system', content: skillContent })
-            api.saveSystemMessage(id, skillContent)
-          }
-          // Fall through to normal send.
+          // Build one combined message: skill instruction + user query.
+          const combined = skillContent
+            ? `${skillContent}\n\n---\n\n${userInput || '请根据以上技能内容回答问题'}`
+            : userInput
+          inputText.value = combined
           sending.value = false
+          // Fall through to normal send below.
         } catch (e: any) {
           appendSystemMessage(`技能 /${parsed.name} 加载失败: ${e.message}`)
           sending.value = false
+          inputText.value = ''
           return
         }
       } else {
+        inputText.value = ''
         sending.value = true
         try { await runSlash(parsed.name, parsed.args) }
         finally { sending.value = false }
         return
       }
     } else {
+      inputText.value = ''
       return
     }
   }
+
+  const text = inputText.value.trim()
+  inputText.value = ''
+  if (!text) return
 
   if (!state.currentID) {
     // Use the store's createSession() — it both creates the

@@ -48,7 +48,7 @@ const filtered = computed(() => {
     >
       <span class="cmd-name">/{{ c.name }}<span v-if="c.args" class="cmd-args"> {{ c.args }}</span></span>
       <span class="cmd-desc">{{ c.description }}</span>
-      <span class="cmd-group" v-if="GROUP_LABELS[c.group]">{{ GROUP_LABELS[c.group] }}</span>
+      <span class="cmd-group" :class="'group-' + c.group" v-if="GROUP_LABELS[c.group]">{{ GROUP_LABELS[c.group] }}</span>
     </div>
   </div>
   <div v-else-if="filter && props.commands.length" class="cmd-palette">
@@ -117,5 +117,10 @@ const filtered = computed(() => {
   background: var(--bg-3);
   color: var(--text-4);
   flex-shrink: 0;
+}
+.cmd-group.group-skill {
+  background: rgba(99,139,248,0.15);
+  color: #638bf8;
+  font-weight: 500;
 }
 </style>
