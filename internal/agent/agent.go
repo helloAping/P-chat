@@ -192,6 +192,10 @@ type ChatRequest struct {
 	// config and AGENTS.md are loaded from this root instead of
 	// the server's CWD.
 	ProjectRoot string `json:"project_root,omitempty"`
+	// SkillContext is the full SKILL.md content for a skill
+	// activated via slash command. It is appended to the system
+	// prompt so the LLM sees it without cluttering the chat.
+	SkillContext string `json:"skill_context,omitempty"`
 }
 
 type ChatStreamChunk struct {
@@ -505,6 +509,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Append compressed summary if provided (from /compress).
 		if req.CompressedSummary != "" {
 			systemPrompt += "\n\n[前文摘要]\n" + req.CompressedSummary
+		}
+		// Append active skill context (from /skillname slash command).
+		if req.SkillContext != "" {
+			systemPrompt += "\n\n---\n\n## 激活的技能上下文\n\n" + req.SkillContext + "\n"
 		}
 
 		// Build the message list: system prompt + user messages.

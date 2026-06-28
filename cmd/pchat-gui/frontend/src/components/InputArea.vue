@@ -71,6 +71,7 @@ async function onChangeReasoningEffort(val: string) {
 
 const commandList = ref<CmdSpec[]>([])
 const skillCommands = ref<CmdSpec[]>([])
+let pendingSkillContext = ''
 
 // Merge local commands that aren't in the server list.
 const LOCAL_COMMANDS: CmdSpec[] = [
@@ -330,11 +331,11 @@ async function send() {
           const r = await api.getSkill(parsed.name)
           const skillContent = r.skill.content || ''
           const userInput = parsed.args || ''
-          // Build one combined message: skill instruction + user query.
-          const combined = skillContent
-            ? `${skillContent}\n\n---\n\n${userInput || '请根据以上技能内容回答问题'}`
-            : userInput
-          inputText.value = combined
+          pendingSkillContext = skillContent
+          // Show a clean system note instead of dumping skill content.
+          appendSystemMessage(`已激活技能「${parsed.name}」` + (userInput ? `: ${userInput}` : ''))
+          // Use only the user's input as the visible message.
+          inputText.value = userInput || `请根据技能「${parsed.name}」的内容提供帮助`
           sending.value = false
           // Fall through to normal send below.
         } catch (e: any) {
@@ -421,7 +422,9 @@ async function send() {
       style: meta.style,
       attachments: inlineAttachments,
       signal: ctrl.signal,
+      skill_context: pendingSkillContext || undefined,
       onEvent: (ev) => {
+        pendingSkillContext = ''
         // Surface top-level errors (auth, network) as
         // toast notifications. Per-event errors
         // (e.g. tool execution failure) flow through

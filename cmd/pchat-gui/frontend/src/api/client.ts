@@ -578,6 +578,7 @@ export interface SendOptions {
   attachments?: InlineAttachment[]
   signal?: AbortSignal
   onEvent: (ev: StreamEvent) => void
+  skill_context?: string
 }
 
 export interface StreamEvent {
@@ -638,6 +639,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
       model: opts.model,
       style: opts.style,
       attachments: opts.attachments,
+      skill_context: opts.skill_context || '',
     }),
     signal: opts.signal,
   })

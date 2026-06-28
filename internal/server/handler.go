@@ -237,6 +237,9 @@ type SendMessageRequest struct {
 	// The protocol-specific serialisation (OpenAI image_url vs
 	// Anthropic image+source) is handled by the LLM client.
 	Attachments []agent.Attachment `json:"attachments,omitempty"`
+	// SkillContext is the full SKILL.md content for a skill
+	// activated via /skillname slash command.
+	SkillContext string `json:"skill_context,omitempty"`
 }
 
 // CreateSessionRequest is the body of POST /sessions.
@@ -1153,6 +1156,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		CompressedSummary: compSummary,
 		SessionID:         id,
 		ProjectRoot:       meta.ProjectPath,
+		SkillContext:      req.SkillContext,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
