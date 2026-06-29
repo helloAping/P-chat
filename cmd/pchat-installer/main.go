@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 )
 
-//go:embed assets/*
+//go:embed assets
 var bundled embed.FS
 
 func main() {
@@ -55,7 +56,7 @@ func extractAssets(dest string) error {
 		return err
 	}
 	for _, e := range entries {
-		src := filepath.Join("assets", e.Name())
+		src := path.Join("assets", e.Name())
 		if e.IsDir() {
 			if err := copyDir(src, filepath.Join(dest, e.Name())); err != nil {
 				return fmt.Errorf("复制 %s: %w", e.Name(), err)
@@ -88,7 +89,7 @@ func copyDir(src string, dst string) error {
 		return err
 	}
 	for _, e := range entries {
-		s := filepath.Join(src, e.Name())
+		s := path.Join(src, e.Name())
 		d := filepath.Join(dst, e.Name())
 		if e.IsDir() {
 			if err := copyDir(s, d); err != nil {
