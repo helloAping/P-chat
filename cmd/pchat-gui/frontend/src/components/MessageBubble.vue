@@ -224,22 +224,10 @@ const showVisionWarn = computed(() =>
           <template v-if="message.parts && message.parts.length">
             <template v-for="(p, i) in message.parts" :key="i">
               <ThinkingBlock
-                v-if="p.kind === 'thinking' && isLiveThinkingPart(i, p.kind, message.parts)"
+                v-if="p.kind === 'thinking'"
                 :part="p"
-                :default-open="true"
+                :default-open="isLiveThinkingPart(i, p.kind, message.parts)"
               />
-              <details
-                v-else-if="p.kind === 'thinking'"
-                class="thinking-block"
-                :class="{ streaming: p.streaming }"
-              >
-                <summary>
-                  <span class="caret">▸</span>
-                  <span class="label">思考过程</span>
-                  <span class="meta" v-if="p.text">{{ p.text.length }} 字</span>
-                </summary>
-                <pre class="thinking-body">{{ p.text }}</pre>
-              </details>
               <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
               <SubAgentCard v-else-if="p.kind === 'sub_agent'" :part="p" />
               <TypedText
