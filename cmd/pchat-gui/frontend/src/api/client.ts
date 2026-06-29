@@ -658,6 +658,34 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
+
+  // Per-event render flush. This is the critical bit
+  // that makes streaming feel "live" in the UI:
+  //
+  //   1. `reader.read()` resolves with whatever bytes
+  //      the browser has buffered. That can be ONE
+  //      SSE event, or TEN of them packed into the
+  //      same TCP packet.
+  //   2. The inner `while` loop processes every complete
+  //      event in the buffer synchronously. Without the
+  //      yield below, all N events land in the chat
+  //      store in the same microtask, Vue's reactivity
+  //      batches them into ONE re-render, and the user
+  //      sees the assistant bubble jump from empty to
+  //      "fully formed" — i.e. the "appears all at
+  //      once" bug.
+  //   3. Yielding with `setTimeout(0)` after each event
+  //      forces Vue to flush its pending render before
+  //      the next event is processed, so the user
+  //      actually sees the text grow chunk by chunk.
+  //
+  // We only yield for events that affect the visible
+  // bubble (content / thinking) — phase / tool /
+  // done events are bookkeeping and can be batched.
+  const flush = () => new Promise<void>(r => setTimeout(r, 0))
+  const shouldFlush = (ev: StreamEvent): boolean =>
+    ev.type === 'content' || ev.type === 'thinking'
+
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
@@ -673,6 +701,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
       try {
         const ev = JSON.parse(data) as StreamEvent
         opts.onEvent(ev)
+        if (shouldFlush(ev)) await flush()
       } catch (e) {
         console.warn('SSE parse error', e, 'raw:', data.slice(0, 200))
       }
