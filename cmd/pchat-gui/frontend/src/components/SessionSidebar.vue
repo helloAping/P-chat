@@ -24,6 +24,9 @@ const newProjectPath = ref('')
 const showConfirmDeleteProject = ref(false)
 const showConfirmDeleteSession = ref(false)
 const showAbout = ref(false)
+const showRename = ref(false)
+const renameId = ref('')
+const renameTitle = ref('')
 const updateInfo = ref<UpdateInfo | null>(null)
 const pendingDeleteSessionId = ref('')
 const sortedSessions = computed(() =>
@@ -65,10 +68,24 @@ async function confirmDeleteProject() {
 async function onRename(id: string) {
   const s = state.sessions.find(s => s.id === id)
   if (!s) return
-  const title = window.prompt('新标题', s.title || '')
-  if (title != null && title.trim()) {
-    await renameSession(id, title.trim())
+  renameId.value = id
+  renameTitle.value = s.title || ''
+  showRename.value = true
+}
+
+async function confirmRename() {
+  const title = renameTitle.value.trim()
+  if (title) {
+    try {
+      await renameSession(renameId.value, title)
+      message.success('已重命名')
+    } catch (e: any) {
+      message.error(`重命名失败: ${e.message}`)
+    }
   }
+  showRename.value = false
+  renameId.value = ''
+  renameTitle.value = ''
 }
 
 async function onProjectChange(path: string) {
@@ -232,6 +249,22 @@ onMounted(() => {
         <div class="confirm-actions">
           <NButton size="small" @click="showConfirmDeleteProject = false">取消</NButton>
           <NButton size="small" type="error" @click="confirmDeleteProject">删除</NButton>
+        </div>
+      </div>
+    </NModal>
+
+    <!-- Rename session -->
+    <NModal v-model:show="showRename" preset="card" title="重命名会话" style="width: 360px">
+      <div class="confirm-body">
+        <NInput
+          v-model:value="renameTitle"
+          placeholder="输入新标题"
+          @keyup.enter="confirmRename"
+          autofocus
+        />
+        <div class="confirm-actions" style="margin-top: 16px">
+          <NButton size="small" @click="showRename = false">取消</NButton>
+          <NButton size="small" type="primary" @click="confirmRename">确认</NButton>
         </div>
       </div>
     </NModal>

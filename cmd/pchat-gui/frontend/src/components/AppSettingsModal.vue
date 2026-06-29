@@ -217,7 +217,6 @@ async function onAddProvider() {
 }
 
 async function onDeleteProvider(name: string) {
-  if (!window.confirm(`确定删除 provider "${name}"? 该 provider 下的所有模型配置也会被删除。`)) return
   try {
     await api.deleteProvider(name)
     message.success('已删除')
@@ -380,7 +379,6 @@ function onCancelEditModel() {
 
 async function onDeleteModel(model: string) {
   if (!selected.value) return
-  if (!window.confirm(`确定删除模型 "${model}"?`)) return
   try {
     await api.deleteModel(selected.value.name, model)
     message.success('已删除')
@@ -466,7 +464,6 @@ async function onUpdateStyle() {
 }
 
 async function onDeleteStyle(id: string) {
-  if (!window.confirm(`确定删除风格 "${id}"? 删除后相关会话将回退到默认风格。`)) return
   try {
     await api.deleteStyle(id)
     message.success(`已删除: ${id}`)
@@ -860,7 +857,12 @@ function fmtContext(n?: number) {
                     <div class="model-card-actions">
                       <NButton size="tiny" quaternary @click="onEditModel(m)" title="编辑">✎</NButton>
                       <NButton v-if="!m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认">★</NButton>
-                      <NButton size="tiny" quaternary type="error" @click="onDeleteModel(m.name)" title="删除">✕</NButton>
+                      <NPopconfirm @positive-click="onDeleteModel(m.name)" positive-text="删除" negative-text="取消">
+                        <template #trigger>
+                          <NButton size="tiny" quaternary type="error" title="删除">✕</NButton>
+                        </template>
+                        确定删除模型 "{{ m.name }}"？
+                      </NPopconfirm>
                     </div>
                   </div>
                 </div>
