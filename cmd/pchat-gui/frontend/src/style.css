@@ -111,6 +111,47 @@ html, body, #app {
 .md-body ul, .md-body ol { padding-left: 24px; }
 .md-body blockquote { border-left: 3px solid var(--border-2); padding-left: 12px; color: var(--text-2); margin: 8px 0; }
 
+/* Tables */
+.md-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 13px;
+}
+.md-body thead { border-bottom: 2px solid var(--border-2); }
+.md-body th {
+  text-align: left;
+  padding: 8px 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  background: var(--bg-2);
+}
+.md-body th:first-child { border-radius: 6px 0 0 0; }
+.md-body th:last-child { border-radius: 0 6px 0 0; }
+.md-body td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.md-body tr:last-child td { border-bottom: none; }
+.md-body tr:nth-child(even) td { background: var(--bg-2); }
+
+/* Headings */
+.md-body h1 { font-size: 1.4em; font-weight: 700; margin: 16px 0 10px; color: var(--text); }
+.md-body h2 { font-size: 1.25em; font-weight: 600; margin: 14px 0 8px; color: var(--text); }
+.md-body h3 { font-size: 1.1em; font-weight: 600; margin: 12px 0 6px; color: var(--text-2); }
+.md-body h4 { font-size: 1em; font-weight: 600; margin: 10px 0 6px; color: var(--text-2); }
+
+/* Horizontal rule */
+.md-body hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+
+/* Images */
+.md-body img { max-width: 100%; border-radius: 6px; }
+
+/* Inline emphasis */
+.md-body strong { color: var(--text); }
+.md-body em { color: var(--text-2); }
+
 /* Command output (rendered as HTML inside system messages) */
 .cmd-help, .cmd-providers, .cmd-models, .cmd-styles, .cmd-skills, .cmd-config { font-size: 13px; }
 .cmd-group { margin-bottom: 12px; }
