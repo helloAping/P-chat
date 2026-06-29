@@ -5,9 +5,18 @@
 // rendered by a dedicated sub-component. User / system
 // messages still go through the markdown pipeline.
 //
-// Loading: while the assistant is streaming and no
-// content has arrived yet, the bubble shows three
-// bouncing dots (iMessage-style).
+// Loading indicator: while the assistant is streaming
+// and no parts have arrived yet, the bubble shows a
+// single blinking caret (▍) — the typewriter cursor.
+// This is the *same* component (`TypedText`) that
+// renders the streaming text; it just happens to be
+// mounted with empty text. When the first SSE content
+// chunk arrives, the placeholder is replaced by a
+// real `TypedText` instance that animates the text
+// in. There is no separate "loading dots" component
+// in this path — the typewriter cursor *is* the
+// loading indicator, and it transitions seamlessly
+// into the typewriter animation.
 //
 // Animation lifecycle:
 //   - For each text/thinking part, the typewriter
@@ -28,7 +37,6 @@ import { state } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import SubAgentCard from './SubAgentCard.vue'
-import LoadingDots from './LoadingDots.vue'
 import TypedText from './TypedText.vue'
 
 const props = defineProps<{ message: Message; streaming?: boolean }>()
@@ -129,15 +137,27 @@ const lastTextIdx = computed(() =>
     : -1,
 )
 
-// Show loading dots only when truly idle — no status text,
-// no content, and no tool parts yet.
-const showLoadingDots = computed(() => {
-  const m = props.message as any
-  return props.streaming === true
-      && props.message.role === 'assistant'
-      && !props.message.content
-      && (!props.message.parts || props.message.parts.length === 0)
-      && (!m._statusText || m._statusText.length === 0)
+// showTypewriterPlaceholder is the "ready to receive SSE"
+// indicator: a blinking caret (`▍`) sitting alone in
+// the bubble while the assistant message has no parts
+// yet. It replaces the old three-bouncing-dots loader —
+// the typewriter cursor *is* the loader, and it
+// transitions seamlessly into the typewriter animation
+// the moment the first content chunk arrives.
+const showTypewriterPlaceholder = computed(() => {
+  if (props.streaming !== true) return false
+  if (props.message.role !== 'assistant') return false
+  const parts = props.message.parts
+  if (!parts || parts.length === 0) return true
+  // Even if the parts array is non-empty, we still want
+  // the placeholder if every entry is non-rendering
+  // (defensive — shouldn't happen today, but keeps the
+  // bubble from going blank between the placeholder and
+  // the first real part).
+  return !parts.some(p =>
+    p.kind === 'text' || p.kind === 'thinking' ||
+    p.kind === 'tool' || p.kind === 'sub_agent',
+  )
 })
 
 const statusLines = computed(() => {
@@ -257,7 +277,18 @@ const showVisionWarn = computed(() =>
           <template v-else-if="message.content">
             <div class="md-body" v-html="userHtml"></div>
           </template>
-          <LoadingDots v-if="showLoadingDots" />
+          <!-- Typewriter placeholder: a blinking caret
+               alone in the bubble, ready to receive the
+               first SSE content chunk. This replaces the
+               three-bouncing-dots loader; the typewriter
+               cursor *is* the loading indicator, and it
+               transitions seamlessly into the typewriter
+               animation when the first part arrives. -->
+          <TypedText
+            v-else-if="showTypewriterPlaceholder"
+            :text="''"
+            :active="true"
+          />
         </template>
 
         <!-- Footer for assistant: tokens / elapsed -->
