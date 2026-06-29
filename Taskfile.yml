@@ -82,11 +82,21 @@ tasks:
     cmds:
       - npm install
 
+  build:setup:
+    desc: 构建单文件安装器 bin/pchat-setup.exe（依赖 build + build:gui）
+    deps: [build, build:gui]
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
+    generates:
+      - bin/pchat-setup.exe
+    silent: false
+
   build:all:
-    desc: 同时编译 CLI / Server / 桌面端
+    desc: 同时编译 CLI / Server / 桌面端 / 安装器
     cmds:
       - task: build
       - task: build:gui
+      - task: build:setup
 
   package:gui:
     desc: 把桌面端打包到 bin\（含前端 SPA + pchat-server.exe + install/uninstall 脚本）
