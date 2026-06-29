@@ -9,6 +9,16 @@
 
 
 # -----------------------------------------------------------------------------
+# Agent tool symlinks (.opencode / .claude / .codex → .agents)
+# -----------------------------------------------------------------------------
+# This project only uses .agents/. The other three are symlinks or
+# copies created by .agents/scripts/install.ps1 for compatibility.
+.opencode/
+.claude/
+.codex/
+
+
+# -----------------------------------------------------------------------------
 # Go build artifacts
 # -----------------------------------------------------------------------------
 # Project-local bin/ output of `go build ./...` and `Taskfile.yml` targets.
