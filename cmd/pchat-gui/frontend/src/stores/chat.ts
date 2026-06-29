@@ -584,17 +584,15 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
     case 'phase':
       // Sub-agent lifecycle: open / close the nested card.
       if (ev.sub_agent_status) {
-        if (!sub) break // unknown task — drop
+        if (!sub) break
         sub.status = ev.sub_agent_status as any
         if (ev.sub_agent_status !== 'start' && ev.elapsed) sub.elapsed = ev.elapsed
       }
-      // Other phases (system / memory / plan) are
-      // intentionally not rendered — they were
-      // implementation chatter and the user only
-      // complained about noise, never about missing
-      // progress indicators. (If we want to bring them
-      // back as a status strip, the place to hook is
-      // here.)
+      // Surface phase messages as a live status bar.
+      if (ev.message) {
+        if (!m._statusText) (m as any)._statusText = []
+        ;(m as any)._statusText.push(ev.message)
+      }
       break
     case 'done':
       // Final token counts. We don't reset streaming

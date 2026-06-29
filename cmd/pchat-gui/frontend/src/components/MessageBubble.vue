@@ -77,15 +77,23 @@ const lastTextIdx = computed(() =>
     : -1,
 )
 
-// Show the loading-dots placeholder when the
-// assistant is streaming but no content / thinking /
-// tool part has arrived yet. (Without this, the user
-// sees nothing for the first ~1-3 seconds of a chat.)
+// Show loading dots only when truly idle — no status text,
+// no content, and no tool parts yet.
 const showLoadingDots = computed(() => {
+  const m = props.message as any
   return props.streaming === true
       && props.message.role === 'assistant'
       && !props.message.content
       && (!props.message.parts || props.message.parts.length === 0)
+      && (!m._statusText || m._statusText.length === 0)
+})
+
+const statusLines = computed(() => {
+  const m = props.message as any
+  if (!m._statusText || !m._statusText.length) return []
+  // Show only the last 5 lines to keep the bar compact.
+  const lines = m._statusText as string[]
+  return lines.slice(-5)
 })
 
 // Token usage badge — only show if we have it.
@@ -165,6 +173,10 @@ const showVisionWarn = computed(() =>
              earlier text parts and the post-stream view
              are rendered without animation. -->
         <template v-if="message.role === 'assistant'">
+          <!-- Live status bar during streaming -->
+          <div v-if="statusLines.length" class="stream-status">
+            <div v-for="(line, i) in statusLines" :key="i" class="status-line">{{ line }}</div>
+          </div>
           <template v-if="message.parts && message.parts.length">
             <template v-for="(p, i) in message.parts" :key="i">
               <ThinkingBlock
@@ -175,7 +187,7 @@ const showVisionWarn = computed(() =>
               <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
               <SubAgentCard v-else-if="p.kind === 'sub_agent'" :part="p" />
               <TypedText
-                v-else-if="p.kind === 'text' && i === lastTextIdx && streaming"
+                v-else-if="p.kind === 'text' && streaming"
                 :text="p.text || ''"
                 :active="true"
               />
@@ -334,4 +346,18 @@ const showVisionWarn = computed(() =>
   flex-wrap: wrap;
 }
 .msg-elapsed, .msg-model { color: var(--text-4); }
+.stream-status {
+  margin-bottom: 6px;
+  padding: 4px 10px;
+  background: var(--bg-3);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.6;
+}
+.status-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 </style>

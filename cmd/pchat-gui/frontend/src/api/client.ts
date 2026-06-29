@@ -128,6 +128,9 @@ export interface Message {
   // ignored, even after the toast disappears. Only
   // meaningful on role==="user".
   visionUnsupported?: boolean
+  // Live status text during streaming (populated by
+  // appendStreamEvent from phase events).
+  _statusText?: string[]
 }
 
 export interface SessionMeta {

@@ -1,34 +1,75 @@
 <script setup lang="ts">
-// DeepSeek-style "thinking" block. Default-collapsed,
-// shows the model's chain-of-thought / reasoning text
-// when expanded. While streaming, the block has a
-// shimmer animation and a "思考中…" hint to make it
-// obvious the model is still working.
-//
-// Used both for top-level thinking (parent agent's
-// reasoning) and for sub-agent thinking (rendered
-// inside the sub-agent card).
-import { computed, ref } from 'vue'
+import { computed, ref, watch, onUnmounted } from 'vue'
 import type { ThinkingPart } from '../api/client'
 
 const props = defineProps<{
   part: ThinkingPart
-  // When true, force the block open. Used by the
-  // assistant bubble while the assistant is still
-  // streaming — keeps the user oriented to what's
-  // happening.
   defaultOpen?: boolean
 }>()
 
 const open = ref(!!props.defaultOpen)
 
+// Typewriter animation for thinking text while streaming.
+const displayed = ref(props.part.streaming ? '' : (props.part.text || ''))
+let raf = 0
+let lastT = 0
+let carry = 0
+
+function step(t: number) {
+  if (!props.part.streaming) {
+    displayed.value = props.part.text || ''
+    raf = 0
+    return
+  }
+  const full = props.part.text || ''
+  if (displayed.value.length >= full.length) {
+    raf = 0
+    return
+  }
+  const dt = lastT ? t - lastT : 0
+  lastT = t
+  carry += (dt / 1000) * 120 // chars/sec for thinking
+  const n = Math.floor(carry)
+  if (n > 0) {
+    displayed.value = full.slice(0, displayed.value.length + n)
+    carry -= n
+  }
+  raf = requestAnimationFrame(step)
+}
+
+function startAnim() {
+  if (raf) return
+  lastT = 0
+  carry = 0
+  raf = requestAnimationFrame(step)
+}
+
+function stopAnim() {
+  if (raf) {
+    cancelAnimationFrame(raf)
+    raf = 0
+  }
+}
+
+watch(() => props.part.text, () => {
+  if (props.part.streaming) {
+    startAnim()
+  } else {
+    displayed.value = props.part.text || ''
+  }
+})
+
+watch(() => props.part.streaming, (v) => {
+  if (!v) {
+    displayed.value = props.part.text || ''
+    stopAnim()
+  }
+})
+
+onUnmounted(stopAnim)
+
 const html = computed(() => {
-  // Plain-text pre-wrap rendering. The model's
-  // reasoning is rarely markdown-formatted, and we
-  // don't want to leak any tool-call syntax the
-  // LLM emitted mid-thought. Just escape and
-  // preserve newlines.
-  const text = props.part.text || ''
+  const text = displayed.value
   return text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
