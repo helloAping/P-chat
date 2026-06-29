@@ -623,6 +623,19 @@ export const setModelCapabilities = (
     { method: 'PATCH', body: JSON.stringify(req) },
   )
 
+// --- Upstream models ---
+export interface UpstreamModelItem {
+  id: string
+  created: number
+  owned_by: string
+  added: boolean
+}
+
+export const fetchUpstreamModels = (provider: string) =>
+  jsonFetch<{ models: UpstreamModelItem[] }>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/upstream-models`,
+  )
+
 // --- Streaming send ---
 export interface InlineAttachment {
   // 'image_url' for image parts, 'text' for file bodies.

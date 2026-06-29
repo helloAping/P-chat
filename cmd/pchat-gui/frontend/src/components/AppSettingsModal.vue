@@ -80,6 +80,12 @@ const editModelCtx = ref<number | null>(null)
 const editModelOut = ref<number | null>(null)
 const editModelVision = ref(false)
 
+// Upstream models
+const showUpstreamModels = ref(false)
+const upstreamModels = ref<api.UpstreamModelItem[]>([])
+const fetchingUpstream = ref(false)
+const upstreamError = ref('')
+
 // --- Style state ---
 const styles = ref<api.StyleInfo[]>([])
 const showAddStyle = ref(false)
@@ -398,6 +404,36 @@ async function onSetDefaultModel(model: string) {
     await refreshProviders()
   } catch (e: any) {
     message.error(`设置失败: ${e.message}`)
+  }
+}
+
+async function onFetchUpstreamModels() {
+  if (!selected.value) return
+  fetchingUpstream.value = true
+  upstreamError.value = ''
+  try {
+    const res = await api.fetchUpstreamModels(selected.value.name)
+    upstreamModels.value = res.models || []
+    showUpstreamModels.value = true
+  } catch (e: any) {
+    upstreamError.value = e.message || '获取失败'
+  } finally {
+    fetchingUpstream.value = false
+  }
+}
+
+async function onImportUpstreamModel(m: api.UpstreamModelItem) {
+  if (!selected.value || m.added) return
+  const providerName = selected.value.name
+  try {
+    await api.addModel(providerName, { name: m.id })
+    message.success(`已添加模型: ${m.id}`)
+    await refreshProviders()
+    // Refresh the upstream list to mark this one as added.
+    const idx = upstreamModels.value.findIndex(x => x.id === m.id)
+    if (idx >= 0) upstreamModels.value[idx] = { ...upstreamModels.value[idx], added: true }
+  } catch (e: any) {
+    message.error(`添加失败: ${e.message}`)
   }
 }
 
@@ -934,9 +970,14 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
               <div class="detail-section">
                 <div class="detail-section-head">
                   <h3 class="section-title">模型 ({{ selected.models?.length || 0 }})</h3>
-                  <NButton size="small" type="primary" ghost @click="onShowAddModel">
-                    {{ showAddModel ? '取消' : '+ 添加模型' }}
-                  </NButton>
+                  <NSpace size="small">
+                    <NButton size="small" type="primary" ghost @click="onShowAddModel">
+                      {{ showAddModel ? '取消' : '+ 添加模型' }}
+                    </NButton>
+                    <NButton size="small" @click="onFetchUpstreamModels" :loading="fetchingUpstream">
+                      获取模型
+                    </NButton>
+                  </NSpace>
                 </div>
                 <div v-if="showAddModel" class="add-form">
                   <NSpace vertical size="small">
@@ -1002,6 +1043,30 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
             </template>
           </div>
         </div>
+
+        <!-- Upstream models modal -->
+        <NModal v-model:show="showUpstreamModels" preset="card" title="上游模型列表" style="width: 500px">
+          <div v-if="upstreamError" class="upstream-error">{{ upstreamError }}</div>
+          <template v-else>
+            <p class="upstream-hint">以下是从 {{ selected?.name }} 上游获取的可用模型，点击即可添加。</p>
+            <div v-if="!upstreamModels.length" class="muted empty-hint">未获取到模型列表</div>
+            <div v-else class="upstream-list">
+              <div
+                v-for="m in upstreamModels"
+                :key="m.id"
+                class="upstream-item"
+                :class="{ added: m.added }"
+              >
+                <span class="upstream-id">{{ m.id }}</span>
+                <span class="upstream-owner" v-if="m.owned_by">{{ m.owned_by }}</span>
+                <NButton v-if="!m.added" size="tiny" type="primary" ghost @click="onImportUpstreamModel(m)">
+                  添加
+                </NButton>
+                <NTag v-else size="tiny" type="default">已添加</NTag>
+              </div>
+            </div>
+          </template>
+        </NModal>
       </NTabPane>
 
       <NTabPane name="styles" tab="风格配置">
@@ -1467,4 +1532,17 @@ code {
 .skill-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .skill-name { font-size: 13px; font-weight: 500; }
 .skill-desc { font-size: 11px; color: var(--text-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upstream-error { color: var(--warn); padding: 8px 0; }
+.upstream-hint { font-size: 13px; color: var(--text-3); margin: 0 0 12px; }
+.upstream-list { max-height: 400px; overflow: auto; }
+.upstream-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-2);
+  font-size: 13px;
+}
+.upstream-item:hover { background: var(--bg-3); }
+.upstream-id { flex: 1; font-family: ui-monospace, monospace; font-size: 12.5px; }
+.upstream-owner { color: var(--text-4); font-size: 11px; }
+.upstream-item.added { opacity: 0.6; }
 </style>

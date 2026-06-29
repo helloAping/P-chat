@@ -91,6 +91,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.DELETE("/providers/:name/models/:model", h.DeleteModel)
 		api.POST("/providers/:name/models/:model/default", h.SetDefaultModel)
 		api.PATCH("/providers/:name/models/:model/capabilities", h.SetCapabilities)
+		api.GET("/providers/:name/upstream-models", h.FetchUpstreamModels)
 
 		// Uploads
 		api.POST("/uploads", h.Upload)
