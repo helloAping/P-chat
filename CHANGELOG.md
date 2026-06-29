@@ -445,16 +445,10 @@ total   ~84 tests passing
 - **每个 step 结束**: 重新构建 `bin/pchat.exe` + `bin/pchat-server.exe` + 写测试
 
 
-### ��1������ܽ�
-
-- ɳ�����: 18 ��Ĭ��Σ��ģʽ + 16 ��Ĭ�ϱ���·��
-- ͨ�� ctx ע�빤�ߣ�0 �Ķ������й���ǩ��
-- 21 ����Ԫ����ȫ��ͨ����sandbox + tool integration��
-- /unsafe �ṩ 3 ��: once / on / off
-- ������Ϣ�Ѻ�: ������������/·�� + ��ʾ
 
 
-## v0.6.0 �� Client-server architecture + Web GUI
+
+## v0.6.0 — Client-server architecture + Web GUI
 
 ### New: HTTP client (internal/httpcli)
 - \Client\ wraps pchat-server's REST API
@@ -503,31 +497,73 @@ total   ~84 tests passing
 ## v0.7.0 — Web GUI 补完
 
 ### web/index.html 重写 (12.8 KB → 33 KB)
+- 侧边栏 style/model 选择器、停止按钮、状态栏(token/elapsed)
+- 轻量 Markdown 渲染(无 CDN)、tool 调用面板(可折叠)
+- 双击重命名、Esc 取消、Enter 发送、Toast 提示
+- 14 个 GUI sanity check + 18 个 markdown 渲染 case 全过
 
-**修复的 bug**
-- `switchSession` 里 user 消息漏渲染 (line 349 当时是 `m.role === "tool" ? "tool" : m.role` 把 user 和 assistant 都当一类)
-- 流式渲染时 `textContent =` 重建整块 DOM，性能差
-- `/expand` 风格的 tool args 没有显示
+## v0.8.0 — Vue 3 前端重写 + 流式 UI 升级
 
-**新增**
-- 侧边栏底部 style 切换器 (3 pill 按钮: cute/guofeng/tech)
-- 侧边栏底部 model 下拉选择器 (从 `/api/v1/providers` 拉)
-- 真正的流式渲染：throttled DOM update (50ms 一次，20fps)
-- 停止按钮 (流式时切换显示，绑 `state.abort.abort`)
-- 状态栏：`tokens_in` / `tokens_out` / `elapsed` 三块 pill
-- 轻量 Markdown 渲染 (无 CDN，自写)：
-  - 标题、bold/italic、列表、blockquote、hr
-  - 行内 code + 代码块 (用 placeholder 防 inline pass 误改)
-  - 链接 (白名单 http/https/内部路径)
-  - HTML escape
-- 历史消息正确渲染 (user / assistant / tool 分类)
-- Tool 调用面板：可折叠、显示 args、显示 result、显示 elapsed
-- 停止生成时显示 "⏹ 已停止生成" 标记
-- 双击会话标题可重命名 (PATCH /sessions/:id)
-- Esc 取消生成、Enter 发送、Shift+Enter 换行
-- Toast 提示 (风格切换、模型切换、错误)
-- 流式光标动画 (▍ 闪烁)
+### Vue 3 + Vite + Naive UI 前端
 
-**测试**
-- `TestWebGUI_IndexPage` 扩展为 14 个 sanity check (style-picker、model-picker、selectStyle、selectModel、stopGeneration、updateHeaderMeta、scheduleRender 等)
-- 18 个 markdown 渲染 case 全过 (plain / bold / italic / 各级 heading / link / code block / inline code / list / numbered / escape / blockquote / hr / nested / paragraphs / br / code at start)
+- 从 vanilla HTML/JS (`web/index.html`) 迁移到完整的 Vue 3 SPA
+- Pinia 状态管理 (`stores/chat.ts`)：session 列表、messages、streaming state
+- TypeScript 类型定义：`Message` / `MessagePart` / `StreamEvent` 等
+- `api/client.ts`：fetch-based HTTP 客户端 + SSE 流式消费
+
+### Message parts 渲染系统
+
+Assistant 消息用 `parts[]` 数组替代纯文本 content：
+
+| Part | Component | 说明 |
+|------|-----------|------|
+| `text` | TypedText | marked.parse + CSS ::after 闪烁光标 |
+| `thinking` | ThinkingBlock | 可折叠面板，流式时自动展开 |
+| `tool` | ToolCallCard | 工具名/参数/结果/耗时 |
+| `sub_agent` | SubAgentCard | 嵌套子代理卡片，独立 parts[] |
+
+### SSE 流式渲染修复
+
+- **根因**：`streamMessages()` 内层 while 循环同步处理同个 TCP 包中所有 SSE 事件，Vue 响应式合并为一次 render
+- **修复**：每个 content/thinking 事件后 `setTimeout(0)` 让出事件循环，强制 Vue 在事件间 flush render
+- **效果**：文字随 LLM token 逐 chunk 增长，实现 ChatGPT 风格打字机效果
+- 无人工动画延迟、无 rAF 循环、无 speed 计算
+
+### ThinkingBlock 可折叠面板
+
+- `<button>` header + `v-show` body（非原生 `<details>`）
+- 流式时自动展开，用户点击后粘性控制
+- 三角箭头旋转 90° 动画、图标(齿轮/灯泡)、字符计数
+- `<pre>` + `white-space: pre-wrap; word-break: break-all` 自动换行
+
+### 项目系统
+
+- `~/.p-chat/projects.json` 注册项目目录
+- Session 关联 `project_path`：独立上下文、独立 AGENTS.md
+- 项目级配置合并：`.p-chat/config.json` + `AGENTS.md` + skills + rules
+- API: `GET/POST/DELETE /api/v1/projects`，session 过滤 `?project_path=`
+- GUI 侧边栏项目选择器，含新增/删除确认对话框
+- 原生文件夹选择器：`POST /api/v1/dialog/folder`
+
+### 会话归档
+
+- `archived` 列标记软删除
+- `DELETE /sessions/:id` → 归档，`POST /unarchive` → 恢复，`DELETE /permanent` → 永久删除
+- `GET /sessions/archived` 列出已归档
+
+### 技能管理 (GUI)
+
+- 浏览/搜索/安装/卸载技能
+- 内置仓库源管理 (`/skills/repos`)
+- 斜杠命令含"技能"标签组
+
+### 其他
+
+- **Plan/Build 模式切换**：GUI 按钮 `🔨 构建` / `📋 计划`，`plan_mode` 元数据持久化
+- **Tool 结果持久化**：`persistAssistant()` 在工具执行**后**调用，snapshot 包含 thinking + text + tool 完整结果
+- **DeepSeek 兼容**：`normalizeToolResults()` 将 ToolResult role 转为 User
+- **Context 管理**：>80 条警告、>120 条自动停止建议 `/compress`
+- **Phase 状态栏**：显示 agent 最近 5 步状态
+- **SSE flush**：`X-Accel-Buffering: no` + `c.Writer.Flush()`
+- **Blinking caret placeholder**：流式开始时渲染前显示闪烁光标，替代 LoadingDots
+- **供应商多模型**：per-provider `models` 列表，`capabilities` 标记(thinking_effort/supports_vision)

@@ -108,7 +108,11 @@ P-chat/
 │       ├── main.go      # 拉起 pchat-server 子进程 + WebView2 窗口
 │       ├── install.ps1  # 安装脚本（开始菜单 + 注册表卸载项）
 │       ├── uninstall.ps1
-│       ├── frontend/    # 加载页（调 WaitReady() 后跳转到 pchat-server URL）
+│       ├── frontend/    # Vue 3 + Vite + Naive UI SPA
+│       │   └── src/
+│       │       ├── api/client.ts     # HTTP/SSE 客户端
+│       │       ├── stores/chat.ts    # Pinia 会话状态
+│       │       └── components/       # 18 个 Vue 组件
 │       └── build/       # Wails 产物
 ├── internal/
 │   ├── agent/           # Agent 核心
@@ -238,29 +242,82 @@ llm:
 
 ## HTTP API
 
+所有端点都在 `/api/v1/` 下。
+
+### 核心
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/v1/health` | 健康检查 |
-| GET | `/api/v1/styles` | 获取可用风格列表 |
-| GET | `/api/v1/providers` | 获取可用 LLM 提供商 |
-| POST | `/api/v1/chat` | 流式对话 (SSE) |
+| GET | `/health` | 健康检查 |
+| GET/POST/PATCH/DELETE | `/styles` / `/:id` | 风格 CRUD（identity + soul） |
+| GET/POST/PATCH/DELETE | `/providers` / `/:name` | 供应商管理 |
+| POST/PUT/DELETE | `/providers/:name/models` / `/:model` | 模型 CRUD |
+| POST | `/providers/:name/models/:model/default` | 设默认模型 |
+| PATCH | `/providers/:name/models/:model/capabilities` | 模型能力标记（vision/thinking） |
 
-### POST /api/v1/chat
+### 会话
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/POST | `/sessions` | 列出/创建（支持 `?project_path=` 过滤） |
+| GET/PATCH/DELETE | `/sessions/:id` | 获取/更新元数据/归档 |
+| GET | `/sessions/:id/messages` | 历史消息 |
+| POST | `/sessions/:id/messages` | **发送消息（SSE 流式响应）** |
+| POST | `/sessions/:id/compress` | 压缩对话 |
+| PATCH | `/sessions/:id/reasoning-effort` | 设置思考深度 |
+| POST | `/sessions/:id/system-message` | 自定义 system prompt |
+| DELETE | `/sessions/:id/messages` | 清空会话 |
+
+### 归档
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/sessions/:id/archive` | 软删除 |
+| POST | `/sessions/:id/unarchive` | 恢复 |
+| GET | `/sessions/archived` | 列出已归档 |
+| DELETE | `/sessions/:id/permanent` | 永久删除 |
+
+### 项目
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/POST/DELETE | `/projects` | 列出/添加/移除项目目录 |
+| POST | `/dialog/folder` | 打开原生文件夹选择对话框 |
+
+### 技能
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/skills` | 列出已安装技能 |
+| POST | `/skills/install` | 安装技能 |
+| DELETE | `/skills/:name` | 卸载技能 |
+| GET | `/skills/search?q=` | 搜索技能仓库 |
+
+### 其他
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/uploads` | 文件上传（multipart） |
+| GET | `/uploads/:id` | 获取已上传文件 |
+| GET | `/commands` | 列出斜杠命令 |
+| POST | `/commands/:name` | 执行斜杠命令 |
+
+### POST /api/v1/sessions/:id/messages (SSE)
 
 ```json
 {
   "message": "你好",
   "style": "cute",
-  "provider": "openai"
+  "provider": "openai",
+  "model": "gpt-4o",
+  "attachments": []
 }
 ```
 
 响应 (SSE):
 
 ```
-data: {"content":"你好呀","done":false}
-data: {"content":"！","done":false}
-data: {"content":"","done":true}
+data: {"type":"thinking","thinking":"我需要分析用户的问题..."}
+data: {"type":"phase","step":"analyzing","message":"分析问题..."}
+data: {"type":"content","content":"你好呀"}
+data: {"type":"tool","tool_name":"read_file","tool_args":"{}","tool_status":"start"}
+data: {"type":"tool","tool_name":"read_file","tool_status":"ok","tool_result":"..."}
+data: {"type":"content","content":"！"}
+data: {"type":"done","tokens_in":123,"tokens_out":456,"elapsed":"2.3s"}
 ```
 
 ## 开发任务
@@ -270,13 +327,20 @@ data: {"content":"","done":true}
 - [x] CLI 交互
 - [x] HTTP Server
 - [x] 多模型支持 (OpenAI 兼容协议)
-- [x] 会话记忆
-- [x] 内置工具 (文件/Shell)
+- [x] 会话记忆 (SQLite)
+- [x] 内置工具 (文件/Shell/子代理)
 - [x] AGENTS.md 支持
 - [x] Skills 技能系统
 - [x] Rules 规则系统
-- [x] Wails v2 桌面端 (与 web 端共用 web/index.html，1:1 功能)
+- [x] Wails v2 桌面端
+- [x] Vue 3 + Vite + Naive UI 前端
+- [x] SSE 流式渲染（逐事件 flush、打字机效果）
+- [x] 思考过程展示（可折叠面板）
+- [x] 项目系统（多项目目录注册）
+- [x] 会话归档/恢复
+- [x] 技能安装/搜索（GUI）
+- [x] Plan/Build 模式切换
+- [x] 供应商多模型（per-provider models）
 - [ ] MCP 工具协议集成
-- [ ] iOS SwiftUI 客户端
 - [ ] 本地 LLM (Ollama) 深度集成
 - [ ] 代码沙箱 (Docker)
