@@ -21,6 +21,23 @@ import (
 	"github.com/p-chat/pchat/internal/tool"
 )
 
+// streamRecorder wraps httptest.ResponseRecorder with a CloseNotify
+// method. Gin's c.Stream() needs http.CloseNotifier, but the interface
+// was removed from httptest.ResponseRecorder in Go 1.25.
+type streamRecorder struct {
+	*httptest.ResponseRecorder
+	closeCh chan bool
+}
+
+func (r *streamRecorder) CloseNotify() <-chan bool { return r.closeCh }
+
+func newStreamRecorder() *streamRecorder {
+	return &streamRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		closeCh:          make(chan bool, 1),
+	}
+}
+
 func newTestServer(t *testing.T) (*Server, *config.Config) {
 	return newTestServerWithConfig(t, richTestConfig())
 }
@@ -549,7 +566,7 @@ func TestSendMessage_StreamsSSE(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	w2 := httptest.NewRecorder()
+	w2 := newStreamRecorder()
 	body := bytes.NewBufferString(`{"message":"hi","style":"tech"}`)
 	req := httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/messages", body).WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
