@@ -668,8 +668,8 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
       try {
         const ev = JSON.parse(data) as StreamEvent
         opts.onEvent(ev)
-      } catch {
-        // ignore malformed event
+      } catch (e) {
+        console.warn('SSE parse error', e, 'raw:', data.slice(0, 200))
       }
     }
   }

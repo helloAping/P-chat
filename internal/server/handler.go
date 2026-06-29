@@ -1149,8 +1149,13 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	}
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
-		if m.Role == llm.RoleSystem || m.Type == llm.TypeImage || m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
+		if m.Role == llm.RoleSystem || m.Type == llm.TypeImage || m.Type == llm.TypeToolCall {
 			continue
+		}
+		// Tool results → User role so providers don't reject
+		// orphaned 'tool' messages without preceding tool_calls.
+		if m.Type == llm.TypeToolResult {
+			m.Role = llm.RoleUser
 		}
 		msgs = append(msgs, m)
 	}
@@ -1178,9 +1183,14 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
 	c.Header("X-Session-ID", id)
 	c.Header("X-Provider", provider)
 	c.Header("X-Model", model)
+
+	// Flush headers immediately so the browser knows this is
+	// a streaming response (not waiting for full body).
+	c.Writer.Flush()
 
 	c.Stream(func(w io.Writer) bool {
 		chunk, ok := <-stream

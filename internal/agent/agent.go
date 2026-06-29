@@ -590,7 +590,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if req.ReasoningEffort != "" {
 				opts.ReasoningEffort = req.ReasoningEffort
 			}
-			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, filterToolCalls(msgs), toolDefs, opts)
+			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, normalizeToolResults(msgs), toolDefs, opts)
 			for chunk := range stream {
 				if chunk.Err != nil {
 					classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
@@ -929,14 +929,19 @@ func formatElapsed(d time.Duration) string {
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
-// filterToolCalls removes TypeToolCall and TypeToolResult messages.
-// These carry metadata only and would cause API errors if sent to
-// providers that validate tool_call/tool_result pairing.
-func filterToolCalls(msgs []llm.ChatMessage) []llm.ChatMessage {
+// normalizeToolResults removes TypeToolCall metadata rows and
+// converts TypeToolResult messages to User role. This way providers
+// that validate tool_call/tool_result pairing (DeepSeek, etc.) see
+// normal user-assistant-user conversation, and the LLM still sees
+// tool results as part of the ongoing dialogue.
+func normalizeToolResults(msgs []llm.ChatMessage) []llm.ChatMessage {
 	out := make([]llm.ChatMessage, 0, len(msgs))
 	for _, m := range msgs {
-		if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
+		if m.Type == llm.TypeToolCall {
 			continue
+		}
+		if m.Type == llm.TypeToolResult {
+			m.Role = llm.RoleUser
 		}
 		out = append(out, m)
 	}

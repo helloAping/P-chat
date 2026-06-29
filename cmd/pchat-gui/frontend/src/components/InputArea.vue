@@ -444,7 +444,9 @@ async function send() {
           } else {
             message.error(ev.error)
           }
-          return
+          // Still call appendStreamEvent so the error text
+          // renders inline in the assistant bubble — the
+          // user sees context for the failure.
         }
         appendStreamEvent(id, ev)
       },
