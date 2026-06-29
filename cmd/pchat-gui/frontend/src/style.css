@@ -110,3 +110,34 @@ html, body, #app {
 .md-body a { color: var(--accent-2); }
 .md-body ul, .md-body ol { padding-left: 24px; }
 .md-body blockquote { border-left: 3px solid var(--border-2); padding-left: 12px; color: var(--text-2); margin: 8px 0; }
+
+/* Command output (rendered as HTML inside system messages) */
+.cmd-help, .cmd-providers, .cmd-models, .cmd-styles, .cmd-skills, .cmd-config { font-size: 13px; }
+.cmd-group { margin-bottom: 12px; }
+.cmd-group-label { font-size: 11px; font-weight: 600; color: var(--text-3); text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
+.cmd-row { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; }
+.cmd-name { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--accent-2); background: var(--bg-3); padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+.cmd-desc { color: var(--text-2); }
+.cmd-info { color: var(--text-3); font-size: 12.5px; padding: 4px 0; }
+.cmd-card {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 8px 10px; margin-bottom: 4px;
+  border-radius: 6px;
+  background: var(--bg-3); border: 1px solid var(--border-2);
+}
+.cmd-card-head { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.cmd-card-meta { font-size: 11.5px; color: var(--text-3); }
+.cmd-section { margin-bottom: 10px; }
+.cmd-section-label { font-size: 11px; font-weight: 600; color: var(--text-3); margin-bottom: 4px; }
+.cmd-item {
+  padding: 3px 4px; font-size: 12px;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.cmd-muted { font-size: 11px; color: var(--text-3); }
+.cmd-tag {
+  display: inline-block; font-size: 10px; padding: 0 5px; border-radius: 3px;
+  line-height: 18px; font-weight: 500;
+}
+.cmd-tag.tag-def { background: var(--success-soft); color: var(--success); }
+.cmd-tag.tag-prot { background: var(--bg-2); color: var(--text-2); }
+.cmd-tag.tag-vis { background: var(--accent-soft); color: var(--accent-2); }

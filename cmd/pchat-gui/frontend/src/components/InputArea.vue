@@ -252,6 +252,24 @@ async function runSlash(name: string, args: string): Promise<boolean> {
     case '?':
       appendSystemMessage(renderHelp())
       return true
+    case 'provider':
+    case 'providers':
+      appendSystemMessage(await renderProviders())
+      return true
+    case 'model':
+    case 'models':
+      appendSystemMessage(await renderModels(args))
+      return true
+    case 'style':
+    case 'styles':
+      appendSystemMessage(await renderStyles())
+      return true
+    case 'skills':
+      appendSystemMessage(await renderSkills())
+      return true
+    case 'config':
+      appendSystemMessage(await renderConfig())
+      return true
     case 'clear': {
       if (state.currentID) {
         try {
@@ -316,25 +334,137 @@ async function runSlash(name: string, args: string): Promise<boolean> {
 }
 
 function renderHelp(): string {
-  const lines: string[] = ['可用命令:']
-  const local: Array<[string, string]> = [
-    ['/help', '显示此帮助'],
-    ['/new', '开启新对话'],
-    ['/clear', '清空当前对话视图'],
-    ['/rename <标题>', '重命名当前会话'],
-    ['/forget', '删除当前会话'],
-    ['/compress', '压缩对话历史(LLM摘要)'],
-  ]
-  for (const [k, d] of local) lines.push(`  ${k.padEnd(20)} ${d}`)
-  if (commandList.value.length > 0) {
-    lines.push('')
-    lines.push('更多命令(由服务器提供):')
-    for (const c of commandList.value) {
-      const a = c.args ? ` ${c.args}` : ''
-      lines.push(`  /${c.name.padEnd(12)}${a.padEnd(20)} ${c.description}`)
-    }
+  const groups: Record<string, { name: string; args?: string; description: string }[]> = {}
+  for (const c of allCommands.value) {
+    const g = c.group || 'other'
+    if (!groups[g]) groups[g] = []
+    groups[g].push({ name: c.name, args: c.args, description: c.description })
   }
-  return lines.join('\n')
+  const groupLabels: Record<string, string> = {
+    session: '会话', info: '信息', config: '配置', skill: '技能', other: '其他',
+  }
+  let html = '<div class="cmd-help">'
+  for (const [g, items] of Object.entries(groups)) {
+    html += `<div class="cmd-group"><div class="cmd-group-label">${groupLabels[g] || g}</div>`
+    for (const c of items) {
+      const cmd = c.args ? `/${c.name} ${c.args}` : `/${c.name}`
+      html += `<div class="cmd-row"><code class="cmd-name">${cmd}</code><span class="cmd-desc">${c.description}</span></div>`
+    }
+    html += '</div>'
+  }
+  html += '</div>'
+  return html
+}
+
+async function renderProviders(): Promise<string> {
+  try {
+    const r = await api.listProviders()
+    const ps = r.providers || []
+    if (!ps.length) return '<div class="cmd-info">暂无已配置的提供商。</div>'
+    let html = '<div class="cmd-providers">'
+    for (const p of ps) {
+      const modelCount = (p.models && p.models.length) ? `${p.models.length} 个模型` : ''
+      const defTag = p.is_default ? ' <span class="cmd-tag tag-def">默认</span>' : ''
+      html += `<div class="cmd-card">
+        <div class="cmd-card-head"><strong>${p.name}</strong>${defTag}<span class="cmd-tag tag-prot">${p.protocol}</span></div>
+        <div class="cmd-card-meta">${p.base_url || ''}${modelCount ? ' · ' + modelCount : ''}</div>
+      </div>`
+    }
+    html += '</div>'
+    return html
+  } catch (e: any) {
+    return `获取提供商信息失败: ${e.message}`
+  }
+}
+
+async function renderModels(args: string): Promise<string> {
+  try {
+    const r = await api.listProviders()
+    const ps = r.providers || []
+    if (!ps.length) return '<div class="cmd-info">暂无已配置的提供商。使用 /provider 查看。</div>'
+    let html = '<div class="cmd-models">'
+    for (const p of ps) {
+      const models = p.models && p.models.length ? p.models : []
+      html += `<div class="cmd-section"><div class="cmd-section-label">${p.name}</div>`
+      if (!models.length) {
+        html += `<div class="cmd-item">${p.model || '(默认模型未设置)'}</div>`
+      } else {
+        for (const m of models) {
+          const defTag = m.default ? ' <span class="cmd-tag tag-def">★</span>' : ''
+          const visionTag = m.capabilities?.supports_vision ? ' <span class="cmd-tag tag-vis">视觉</span>' : ''
+          const ctx = m.max_tokens_context ? `${fmtK(m.max_tokens_context)} ctx` : ''
+          const out = m.max_tokens_output ? `${fmtK(m.max_tokens_output)} out` : ''
+          const meta = [ctx, out].filter(Boolean).join(' · ')
+          html += `<div class="cmd-item">${m.name}${defTag}${visionTag}${meta ? ` <span class="cmd-muted">${meta}</span>` : ''}</div>`
+        }
+      }
+      html += '</div>'
+    }
+    html += '</div>'
+    return html
+  } catch (e: any) {
+    return `获取模型列表失败: ${e.message}`
+  }
+}
+
+async function renderStyles(): Promise<string> {
+  try {
+    const r = await api.getStyles()
+    const styles = r.styles || []
+    if (!styles.length) return '<div class="cmd-info">暂无风格配置。</div>'
+    let html = '<div class="cmd-styles">'
+    for (const s of styles) {
+      html += `<div class="cmd-card">
+        <div class="cmd-card-head"><strong>${s.label}</strong> <span class="cmd-muted">${s.id}</span></div>
+        <div class="cmd-card-meta">${s.desc || ''}</div>
+      </div>`
+    }
+    html += '</div>'
+    return html
+  } catch (e: any) {
+    return `获取风格列表失败: ${e.message}`
+  }
+}
+
+async function renderSkills(): Promise<string> {
+  try {
+    const r = await api.listSkills()
+    const skills = r.skills || []
+    if (!skills.length) return '<div class="cmd-info">暂无已安装的技能。使用 /skills 搜索安装。</div>'
+    let html = '<div class="cmd-skills">'
+    for (const s of skills) {
+      html += `<div class="cmd-card">
+        <div class="cmd-card-head"><strong>/${s.name}</strong></div>
+        <div class="cmd-card-meta">${s.description || ''}</div>
+      </div>`
+    }
+    html += '</div>'
+    return html
+  } catch (e: any) {
+    return `获取技能列表失败: ${e.message}`
+  }
+}
+
+async function renderConfig(): Promise<string> {
+  try {
+    const r = await api.listProviders()
+    const ps = r.providers || []
+    let html = '<div class="cmd-config">'
+    html += `<div class="cmd-section"><div class="cmd-section-label">已配置提供商 (${ps.length})</div>`
+    for (const p of ps) {
+      const model = p.models && p.models.length ? p.models.find(m => m.default)?.name || p.models[0]?.name : p.model
+      html += `<div class="cmd-item"><strong>${p.name}</strong> <span class="cmd-tag tag-prot">${p.protocol}</span> → ${model || '—'}</div>`
+    }
+    html += '</div></div>'
+    return html
+  } catch (e: any) {
+    return `获取配置信息失败: ${e.message}`
+  }
+}
+
+function fmtK(n: number): string {
+  if (n >= 1000) return (n / 1000).toFixed(0) + 'k'
+  return String(n)
 }
 
 async function send() {
