@@ -8,13 +8,16 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/internal/sandbox"
 	"github.com/p-chat/pchat/internal/server"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
@@ -89,7 +92,36 @@ func runServer(cmd *cobra.Command, args []string) error {
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
 
+	mcpMgr := mcp.NewManager(toolReg)
+	mcpMgr.SetGlobalEnabled(cfg.MCP.Enabled)
+	for _, srvCfg := range cfg.MCP.Servers {
+		if err := mcpMgr.AddServer(configToMCP(srvCfg)); err != nil {
+			log.Printf("[mcp] add server %s: %v", srvCfg.Name, err)
+		}
+	}
+
+	// Register the todo persistence hook so todo lists survive
+	// server restarts by writing to SQLite.
+	tool.PersistTodos = func(sessionID string, todos []tool.TodoItem) {
+		memTodos := make([]memory.TodoItem, len(todos))
+		for i, t := range todos {
+			memTodos[i] = memory.TodoItem{
+				ID:      t.ID,
+				Content: t.Content,
+				Status:  t.Status,
+			}
+		}
+		_ = memStore.SaveTodos(sessionID, memTodos)
+	}
+
 	agt := agent.New(cfg, llmClient, styleMgr, memStore, toolReg)
+
+	sbx, err := sandbox.New(cfg.Sandbox)
+	if err != nil {
+		log.Printf("[sandbox] init error: %v (sandbox disabled)", err)
+	} else {
+		agt.SetSandbox(sbx)
+	}
 
 	// Static-dir resolution: by default the web frontend is served
 	// from the embedded filesystem so the binary is self-contained
@@ -110,7 +142,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if wd := serverproc.WebDirFromEnv(); wd != "" {
 		staticFS = http.Dir(wd)
 	}
-	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, staticFS)
+	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, staticFS, mcpMgr)
 
 	// PCHAT_PORT overrides the configured port. This is how the
 	// parent process (pchat / pchat-gui) tells us which ephemeral
@@ -122,4 +154,27 @@ func runServer(cmd *cobra.Command, args []string) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, port)
 	fmt.Printf("P-Chat Server 启动于 http://%s\n", addr)
 	return srv.RunAt(addr)
+}
+
+func configToMCP(cfg config.MCPServerConfig) mcp.ServerConfig {
+	timeout := 60 * time.Second
+	if cfg.Timeout != "" {
+		if d, err := time.ParseDuration(cfg.Timeout); err == nil && d > 0 {
+			timeout = d
+		}
+	}
+	tp := cfg.Type
+	if tp == "" {
+		tp = "stdio"
+	}
+	return mcp.ServerConfig{
+		Name:    cfg.Name,
+		Type:    tp,
+		Command: cfg.Command,
+		Args:    cfg.Args,
+		Env:     cfg.Env,
+		URL:     cfg.URL,
+		Enabled: cfg.Enabled,
+		Timeout: timeout,
+	}
 }

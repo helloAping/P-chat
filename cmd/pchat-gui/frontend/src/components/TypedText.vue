@@ -1,29 +1,22 @@
 <script setup lang="ts">
-// TypedText — renders `text` directly with a blinking
-// caret at the trailing edge while the message is
-// being received.
+// TypedText — renders text as raw plain-text via direct DOM
+// `textContent` assignment during streaming. No `marked.parse()`
+// is called while the stream is active — that would re-parse
+// the full accumulated text on every delta, causing O(n²) CPU
+// cost and making the DOM appear to "freeze" during fast
+// streaming.
 //
-// We intentionally do **not** run an artificial
-// typewriter animation. The "typewriter" feel comes
-// from the natural SSE stream: the LLM emits content
-// chunk by chunk over the network, `props.text` grows
-// in real time, and the DOM re-renders the new text on
-// each chunk. That's the ChatGPT-style streaming
-// experience the user expects — text appears as fast
-// as the model produces it, with no artificial delay.
+// Instead, we watch `props.text` and write it directly to a
+// `<pre>` element's `textContent`. The browser handles text
+// layout natively (no virtual DOM diff, no innerHTML rebuild).
 //
-// The blinking caret (`▍`) is a pure CSS animation on
-// a `::after` pseudo-element. It is always present
-// while the component is mounted; the parent decides
-// when to unmount it (i.e. switch to the static
-// markdown render) by passing a different `active`
-// value, or by removing the component entirely. We
-// keep the `active` prop for API stability with the
-// parent, but the component no longer gates
-// rendering on it.
+// When streaming ends, the parent (MessageBubble) unmounts us
+// and switches to the static markdown render (`marked.parse()`
+// once, after the full text is known). The `active` prop is
+// kept for API compatibility but is no longer used internally
+// — the parent controls lifecycle.
 
-import { computed } from 'vue'
-import { marked } from 'marked'
+import { ref, watch } from 'vue'
 
 const props = withDefaults(defineProps<{
   text: string
@@ -32,23 +25,42 @@ const props = withDefaults(defineProps<{
   active: true,
 })
 
-const html = computed(() =>
-  marked.parse(props.text || '', { async: false, breaks: true }) as string,
-)
+const el = ref<HTMLElement | null>(null)
+
+// Direct textContent write — no markdown, no v-html, no
+// virtual DOM diffing. On each SSE delta this is O(1) work
+// for the browser (append N chars to the existing text
+// run). The trailing `▍` caret is pure CSS on `::after`.
+const update = (t: string) => {
+  if (el.value) el.value.textContent = t
+}
+
+watch(() => props.text, update, { immediate: true })
 </script>
 
 <template>
-  <div class="md-body typed-text" v-html="html" />
+  <pre ref="el" class="typed-text">{{ text }}</pre>
 </template>
 
 <style scoped>
+.typed-text {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
 /* The blinking caret at the trailing edge of the text.
- * Pure CSS — the caret is part of every TypedText
- * instance while the bubble is "live" (i.e. the
- * parent is still receiving SSE chunks for it). The
- * parent unmounts the component when the stream is
- * done, at which point the caret disappears with
- * the rest of the element. */
+ * Pure CSS — part of every TypedText while the bubble
+ * is "live". The parent unmounts the component when
+ * streaming ends, at which point the caret disappears
+ * and the static markdown render takes over. */
 .typed-text::after {
   content: '▍';
   display: inline-block;

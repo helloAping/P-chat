@@ -57,6 +57,7 @@ var commandRegistry = []commandSpec{
 	{Name: "debug", Description: "诊断信息 (cache|memory)", Args: "[topic]", Group: "info", WebSafe: true},
 	{Name: "expand", Description: "查看工具调用历史结果", Args: "[index|last]", Group: "info", WebSafe: true},
 	{Name: "plan", Description: "让LLM 制定计划后再执行", Args: "<task>", Group: "session", WebSafe: false},
+	{Name: "permission", Description: "设置权限级别 (ask|auto|full)", Args: "<level>", Group: "config", WebSafe: true},
 	{Name: "quit", Description: "退出REPL", Group: "danger", WebSafe: false},
 }
 
@@ -136,7 +137,7 @@ func (h *Handler) RunCommand(c *gin.Context) {
 		}
 		c.JSON(http.StatusOK, CommandResult{Output: out})
 	case "config":
-		// /style, /model, /provider, /tools, /config —these have
+		// /style, /model, /provider, /tools, /config, /permission —these have
 		// dedicated REST endpoints that the UI should call. We
 		// accept the command but point the client at the proper
 		// endpoint.

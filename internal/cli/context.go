@@ -17,6 +17,7 @@ import (
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 // cliContext abstracts everything slash commands need to know about
@@ -43,6 +44,7 @@ type cliContext interface {
 	RenameSession(ctx context.Context, id, title string) error
 	DeleteSession(ctx context.Context, id string) error
 	CurrentMessageCount() int
+	SubmitQuestionAnswer(ctx context.Context, sessionID string, answers map[string]string) error
 
 	// === Models / providers ===
 	ListProviders(ctx context.Context) ([]httpcli.ProviderInfo, error)
@@ -295,6 +297,14 @@ func (c *localContext) DeleteSession(ctx context.Context, id string) error {
 
 func (c *localContext) CurrentMessageCount() int {
 	return c.r.store.ConversationMessageCount()
+}
+
+func (c *localContext) SubmitQuestionAnswer(ctx context.Context, sessionID string, answers map[string]string) error {
+	resp := tool.QuestionResponse{Answers: answers}
+	if !tool.SubmitAnswer(sessionID, resp) {
+		return fmt.Errorf("no pending question for session %s", sessionID)
+	}
+	return nil
 }
 
 func (c *localContext) ListProviders(ctx context.Context) ([]httpcli.ProviderInfo, error) {
@@ -809,6 +819,10 @@ func (c *httpContext) DeleteSession(ctx context.Context, id string) error {
 }
 func (c *httpContext) CurrentMessageCount() int { return 0 }
 
+func (c *httpContext) SubmitQuestionAnswer(ctx context.Context, sessionID string, answers map[string]string) error {
+	return c.c.SubmitQuestionResponse(ctx, sessionID, answers)
+}
+
 func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
 	out := make(chan agent.ChatStreamChunk, 16)
 	go func() {
@@ -894,18 +908,19 @@ func lastUserContent(msgs []llm.ChatMessage) string {
 // agent.ChatStreamChunk shape used by the local UI renderer.
 func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 	return agent.ChatStreamChunk{
-		Content:     ev.Content,
-		Phase:       ev.Phase,
-		Step:        ev.Step,
-		Message:     ev.Msg,
-		ToolName:    ev.ToolName,
-		ToolResult:  ev.ToolResult,
-		ToolError:   ev.ToolError,
-		ToolElapsed: ev.ToolElapsed,
-		TokensIn:    ev.TokensIn,
-		TokensOut:   ev.TokensOut,
-		Duration:    ev.Elapsed,
-		Error:       ev.Error,
+		Content:      ev.Content,
+		Phase:        ev.Phase,
+		Step:         ev.Step,
+		Message:      ev.Msg,
+		ToolName:     ev.ToolName,
+		ToolResult:   ev.ToolResult,
+		ToolError:    ev.ToolError,
+		ToolElapsed:  ev.ToolElapsed,
+		TokensIn:     ev.TokensIn,
+		TokensOut:    ev.TokensOut,
+		Duration:     ev.Elapsed,
+		Error:        ev.Error,
+		QuestionJSON: ev.QuestionJSON,
 	}
 }
 

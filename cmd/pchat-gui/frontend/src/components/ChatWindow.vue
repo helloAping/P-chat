@@ -5,6 +5,7 @@ import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
 import { state, currentMessages, isStreaming, switchSession } from '../stores/chat'
+import * as api from '../api/client'
 
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
@@ -21,6 +22,16 @@ watch(() => currentMessages.value, () => scrollToBottom(), { deep: true })
 watch(() => state.currentID, () => scrollToBottom())
 
 onMounted(() => scrollToBottom())
+
+async function onOpenExplorer() {
+  if (!state.activeProjectPath) return
+  try { await api.openExplorer(state.activeProjectPath) } catch { /* ignore */ }
+}
+
+async function onOpenTerminal() {
+  if (!state.activeProjectPath) return
+  try { await api.openTerminal(state.activeProjectPath) } catch { /* ignore */ }
+}
 </script>
 
 <template>
@@ -28,6 +39,10 @@ onMounted(() => scrollToBottom())
     <div class="chat-header">
       <div class="header-title">
         {{ state.sessions.find(s => s.id === state.currentID)?.title || 'P-Chat' }}
+      </div>
+      <div v-if="state.activeProjectPath" class="header-actions">
+        <NButton size="tiny" quaternary @click="onOpenExplorer" title="打开资源管理器">📂</NButton>
+        <NButton size="tiny" quaternary @click="onOpenTerminal" title="打开终端">🖥</NButton>
       </div>
     </div>
     <TodoPanel />
@@ -63,11 +78,13 @@ onMounted(() => scrollToBottom())
   padding: 0 16px;
   display: flex;
   align-items: center;
+  justify-content: space-between;
   border-bottom: 1px solid var(--border);
   background: var(--bg-2);
   flex-shrink: 0;
 }
 .header-title { font-weight: 500; font-size: 14px; }
+.header-actions { display: flex; align-items: center; gap: 2px; }
 .messages-scroll { flex: 1; min-height: 0; }
 .messages {
   padding: 12px 0;

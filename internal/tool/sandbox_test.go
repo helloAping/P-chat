@@ -15,6 +15,15 @@ type stubSandbox struct {
 
 func (s *stubSandbox) CheckExecBool(_ string) bool  { return s.execAllowed }
 func (s *stubSandbox) CheckWriteBool(_ string) bool { return s.writeAllowed }
+func (s *stubSandbox) CheckExecDecision(_ string) SandboxDecision {
+	if s.execAllowed { return SandboxAllow }
+	return SandboxBlock
+}
+func (s *stubSandbox) CheckWriteDecision(_ string) SandboxDecision {
+	if s.writeAllowed { return SandboxAllow }
+	return SandboxBlock
+}
+func (s *stubSandbox) MatchedPattern(_ string) string { return "" }
 
 func TestExecCommand_SandboxBlocks(t *testing.T) {
 	ctx := WithSandbox(context.Background(), &stubSandbox{execAllowed: false})

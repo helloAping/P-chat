@@ -31,7 +31,7 @@ import { loadProviders, loadSessions } from '../stores/chat'
 import type { Session } from '../api/client'
 
 const message = useMessage()
-const tab = ref<'providers' | 'styles' | 'archive' | 'skills'>('providers')
+const tab = ref<'providers' | 'styles' | 'archive' | 'skills' | 'mcp'>('providers')
 
 // --- Provider state ---
 const providers = ref<api.ProviderInfo[]>([])
@@ -100,6 +100,8 @@ watch(tab, (v) => {
   } else if (v === 'skills') {
     refreshSkills()
     refreshRepos()
+  } else if (v === 'mcp') {
+    refreshMCP()
   }
 })
 
@@ -674,6 +676,135 @@ function fmtContext(n?: number) {
   if (n >= 1024) return `${Math.round(n / 1024)}k`
   return String(n)
 }
+
+// --- MCP ---
+const mcpServers = ref<api.MCPServerInfo[]>([])
+const mcpGlobalEnabled = ref(false)
+const showAddMCP = ref(false)
+const newMCPType = ref<'stdio' | 'sse'>('stdio')
+const newMCPName = ref('')
+const newMCPCommand = ref('')
+const newMCPArgs = ref('')
+const newMCPEnv = ref('')
+const newMCPUrl = ref('')
+const newMCPEnabled = ref(true)
+
+async function refreshMCP() {
+  try {
+    const r = await api.listMCPServers()
+    mcpServers.value = r.servers || []
+    mcpGlobalEnabled.value = r.global_enabled
+  } catch (e: any) {
+    message.error(`加载 MCP 失败: ${e.message}`)
+  }
+}
+
+async function onToggleMCPGlobal(v: boolean) {
+  try {
+    await api.setMCPGlobal(v)
+    mcpGlobalEnabled.value = v
+  } catch (e: any) {
+    message.error(`切换 MCP 全局状态失败: ${e.message}`)
+  }
+}
+
+async function onToggleMCPServer(name: string, enabled: boolean) {
+  try {
+    if (enabled) {
+      await api.addMCPServer({
+        name,
+        command: '', // use existing config, server restores from persisted config
+        enabled: true,
+      })
+    } else {
+      await api.removeMCPServer(name)
+    }
+    await refreshMCP()
+  } catch (e: any) {
+    message.error(`操作失败: ${e.message}`)
+  }
+}
+
+async function onRestartMCPServer(name: string) {
+  try {
+    await api.restartMCPServer(name)
+    await refreshMCP()
+  } catch (e: any) {
+    message.error(`重启失败: ${e.message}`)
+  }
+}
+
+async function onAddMCPServer() {
+  if (!newMCPName.value) {
+    message.error('名称为必填项')
+    return
+  }
+  if (newMCPType.value === 'stdio' && !newMCPCommand.value) {
+    message.error('Stdio 模式需要填写命令')
+    return
+  }
+  if (newMCPType.value === 'sse' && !newMCPUrl.value) {
+    message.error('SSE 模式需要填写 URL')
+    return
+  }
+  try {
+    const args = newMCPArgs.value
+      ? newMCPArgs.value.split(/\s+/).filter(Boolean)
+      : []
+    let env: Record<string, string> | undefined
+    if (newMCPEnv.value) {
+      try { env = JSON.parse(newMCPEnv.value) } catch { /* ignore */ }
+    }
+    await api.addMCPServer({
+      name: newMCPName.value,
+      type: newMCPType.value,
+      command: newMCPCommand.value,
+      args,
+      env,
+      url: newMCPUrl.value || undefined,
+      enabled: newMCPEnabled.value,
+    })
+    showAddMCP.value = false
+    newMCPType.value = 'stdio'
+    newMCPName.value = ''
+    newMCPCommand.value = ''
+    newMCPArgs.value = ''
+    newMCPEnv.value = ''
+    newMCPUrl.value = ''
+    newMCPEnabled.value = true
+    await refreshMCP()
+  } catch (e: any) {
+    message.error(`添加失败: ${e.message}`)
+  }
+}
+
+async function onRemoveMCPServer(name: string) {
+  try {
+    await api.removeMCPServer(name)
+    await refreshMCP()
+  } catch (e: any) {
+    message.error(`删除失败: ${e.message}`)
+  }
+}
+
+function mcpStateLabel(s: api.MCPServerInfo['state']) {
+  switch (s) {
+    case 'running': return '运行中'
+    case 'starting': return '启动中'
+    case 'stopped': return '已停止'
+    case 'error': return '错误'
+    default: return s
+  }
+}
+
+function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'error' | 'default' {
+  switch (s) {
+    case 'running': return 'success'
+    case 'starting': return 'warning'
+    case 'error': return 'error'
+    default: return 'default'
+  }
+}
 </script>
 
 <template>
@@ -1008,6 +1139,85 @@ function fmtContext(n?: number) {
             <span class="skill-desc">{{ s.description }}</span>
           </div>
           <NButton size="tiny" quaternary @click="onDeleteSkill(s.name)" style="color:var(--warn)">删除</NButton>
+        </div>
+      </NTabPane>
+
+      <NTabPane name="mcp" tab="MCP" style="flex: 1; min-height: 0; overflow: auto">
+        <div style="display:flex;flex-direction:column;gap:16px;padding:4px 0">
+          <!-- Global toggle -->
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <span style="font-weight:600">启用 MCP</span>
+            <NSwitch :value="mcpGlobalEnabled" @update:value="onToggleMCPGlobal" />
+          </div>
+
+          <!-- Server list -->
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;align-items:center;justify-content:space-between">
+              <span style="font-size:13px;color:var(--text-3)">服务器</span>
+              <NButton size="tiny" quaternary @click="showAddMCP = !showAddMCP">
+                {{ showAddMCP ? '取消' : '+ 添加' }}
+              </NButton>
+            </div>
+
+            <!-- Add form -->
+            <div v-if="showAddMCP" style="display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-2)">
+              <div style="display:flex;gap:8px">
+                <NButton size="tiny" :type="newMCPType === 'stdio' ? 'primary' : 'default'" @click="newMCPType = 'stdio'">
+                  Stdio
+                </NButton>
+                <NButton size="tiny" :type="newMCPType === 'sse' ? 'primary' : 'default'" @click="newMCPType = 'sse'">
+                  SSE
+                </NButton>
+              </div>
+              <NInput v-model:value="newMCPName" placeholder="名称 (如 playwright)" size="small" />
+              <template v-if="newMCPType === 'stdio'">
+                <NInput v-model:value="newMCPCommand" placeholder="命令 (如 npx)" size="small" />
+                <NInput v-model:value="newMCPArgs" placeholder="参数 (空格分隔，如 -y @anthropic/mcp-server-playwright)" size="small" />
+                <NInput v-model:value="newMCPEnv" placeholder='环境变量 (JSON 格式)' size="small" />
+              </template>
+              <template v-else>
+                <NInput v-model:value="newMCPUrl" placeholder="SSE URL (如 http://localhost:3001/mcp)" size="small" />
+              </template>
+              <div style="display:flex;align-items:center;gap:8px">
+                <span style="font-size:12px">启动</span>
+                <NSwitch v-model:value="newMCPEnabled" size="small" />
+              </div>
+              <NButton type="primary" size="small" @click="onAddMCPServer" style="align-self:flex-start">添加</NButton>
+            </div>
+
+            <!-- Server rows -->
+            <div v-if="!mcpServers.length && !showAddMCP" style="padding:20px;text-align:center;color:var(--text-4);font-size:13px">
+              暂无 MCP 服务器，点击 "+ 添加" 开始
+            </div>
+            <div
+              v-for="s in mcpServers"
+              :key="s.name"
+              style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border:1px solid var(--border);border-radius:6px"
+            >
+              <div style="display:flex;flex-direction:column;gap:2px;min-width:0">
+                <span style="font-weight:500">{{ s.name }}</span>
+                <div style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-3)">
+                  <NTag :type="mcpStateType(s.state)" size="tiny" :bordered="false">{{ mcpStateLabel(s.state) }}</NTag>
+                  <span>{{ s.tool_count }} 个工具</span>
+                  <span v-if="s.error" style="color:var(--error)">{{ s.error }}</span>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
+                <NSwitch
+                  :value="s.state === 'running' || s.state === 'starting'"
+                  @update:value="(v: boolean) => onToggleMCPServer(s.name, v)"
+                  size="small"
+                />
+                <NButton size="tiny" quaternary @click="onRestartMCPServer(s.name)" title="重启">↻</NButton>
+                <NPopconfirm @positive-click="onRemoveMCPServer(s.name)">
+                  <template #trigger>
+                    <NButton size="tiny" quaternary style="color:var(--warn)">×</NButton>
+                  </template>
+                  确定删除 "{{ s.name }}"？
+                </NPopconfirm>
+              </div>
+            </div>
+          </div>
         </div>
       </NTabPane>
     </NTabs>

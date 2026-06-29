@@ -38,7 +38,22 @@ type SandboxChecker interface {
 	CheckExecBool(command string) bool
 	// CheckWriteBool returns true if the path is permitted to be written.
 	CheckWriteBool(path string) bool
+	// CheckExecDecision returns the full Decision (allow/block/confirm).
+	CheckExecDecision(command string) SandboxDecision
+	// CheckWriteDecision returns the full Decision for write.
+	CheckWriteDecision(path string) SandboxDecision
+	// MatchedPattern returns the regex pattern that matched, or "".
+	MatchedPattern(command string) string
 }
+
+// SandboxDecision mirrors sandbox.Decision without importing sandbox.
+type SandboxDecision int
+
+const (
+	SandboxAllow   SandboxDecision = 0
+	SandboxBlock   SandboxDecision = 1
+	SandboxConfirm SandboxDecision = 2
+)
 
 type sandboxKey struct{}
 
@@ -108,6 +123,11 @@ func NewRegistry() *Registry {
 func (r *Registry) Register(t Tool, h ToolHandler) {
 	r.tools[t.Name] = h
 	r.meta[t.Name] = t
+}
+
+func (r *Registry) Unregister(name string) {
+	delete(r.tools, name)
+	delete(r.meta, name)
 }
 
 func (r *Registry) Get(name string) (ToolHandler, bool) {
@@ -251,6 +271,28 @@ func RegisterBuiltin(r *Registry) {
 			},
 		}, []string{"todos"}),
 	}, handleTodoWrite)
+
+	r.Register(Tool{
+		Name:        "question",
+		Description: "Ask the user a question (or set of questions) when you need clarification, a decision, or input before proceeding. Each question can have multiple-choice options or allow free-text input. Use this when you are uncertain about requirements, need to choose between approaches, or want the user to confirm a plan before executing. The user's answers will be returned so you can continue.",
+		Parameters: ObjectSchema(map[string]any{
+			"questions": map[string]any{
+				"type": "array",
+				"minItems": 1,
+				"maxItems": 4,
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"question":     map[string]any{"type": "string", "description": "The complete question to ask the user"},
+						"header":       map[string]any{"type": "string", "maxLength": 12, "description": "Short label (max 12 chars) shown as a chip/tag"},
+						"options":      map[string]any{"type": "array", "minItems": 2, "maxItems": 4, "items": map[string]any{"type": "object", "properties": map[string]any{"label": map[string]any{"type": "string", "description": "Display text (1-5 words)"}, "description": map[string]any{"type": "string", "description": "Explanation of this choice"}}, "required": []string{"label", "description"}}},
+						"multi_select": map[string]any{"type": "boolean", "description": "Allow selecting multiple options (default false)"},
+					},
+					"required": []string{"question", "header", "options"},
+				},
+			},
+		}, []string{"questions"}),
+	}, handleQuestion)
 }
 
 type execArgs struct {

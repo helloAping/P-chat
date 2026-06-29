@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/project"
 	"github.com/p-chat/pchat/internal/style"
@@ -31,6 +33,7 @@ type Handler struct {
 	store      *memory.Store
 	styleMgr   *style.Manager
 	summarizer *memory.Summarizer
+	mcpMgr     *mcp.Manager
 
 	metaMu sync.Mutex
 	meta   map[string]sessionMeta
@@ -43,6 +46,7 @@ type sessionMeta struct {
 	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
 	ProjectPath     string // project root directory, "" = global
 	PlanMode        bool   // plan mode (no tools, single turn)
+	PermissionLevel string // "ask" | "auto" | "full"
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -55,14 +59,16 @@ type sessionMetaBlob struct {
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	ProjectPath     string `json:"project_path,omitempty"`
 	PlanMode        bool   `json:"plan_mode,omitempty"`
+	PermissionLevel string `json:"permission_level,omitempty"`
 }
 
-func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager) *Handler {
+func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Handler {
 	h := &Handler{
 		agent:    a,
 		cfg:      cfg,
 		store:    store,
 		styleMgr: styleMgr,
+		mcpMgr:   mcpMgr,
 		meta:     make(map[string]sessionMeta),
 	}
 	// Wire the upload resolver so the agent can read attached
@@ -102,7 +108,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	if h.store == nil {
 		return
 	}
-	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
 	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
 		// Non-fatal: in-memory map already updated, request still
 		// works for this session. The next setSessionMeta call
@@ -131,6 +137,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.ReasoningEffort = blob.ReasoningEffort
 				m.ProjectPath = blob.ProjectPath
 				m.PlanMode = blob.PlanMode
+				m.PermissionLevel = blob.PermissionLevel
 			}
 		}
 	}
@@ -182,7 +189,7 @@ func (h *Handler) setSessionMetaProjectPath(id, projectPath string) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 }
@@ -269,6 +276,9 @@ type UpdateSessionMetaRequest struct {
 	Provider *string `json:"provider,omitempty"`
 	Model    *string `json:"model,omitempty"`
 	Style    *string `json:"style,omitempty"`
+	// PermissionLevel sets the sandbox permission level for this session.
+	// Values: "ask", "auto", "full". Omit to leave unchanged.
+	PermissionLevel *string `json:"permission_level,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -283,6 +293,7 @@ type SessionResponse struct {
 	Style       string `json:"style,omitempty"`
 	ProjectPath string `json:"project_path,omitempty"`
 	PlanMode    bool   `json:"plan_mode,omitempty"`
+	PermissionLevel string `json:"permission_level,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 }
@@ -402,6 +413,16 @@ type StreamEvent struct {
 	Elapsed   string `json:"elapsed,omitempty"`
 	Provider  string `json:"provider,omitempty"`
 	Model     string `json:"model,omitempty"`
+
+	// Question fields — when the question tool is called, the
+	// server emits a "question" event with question_json set
+	// to the serialized question array. The frontend renders
+	// a modal and posts the answer back.
+	QuestionJSON string `json:"question_json,omitempty"`
+
+	// ToolConfirm fields — when the sandbox requires user
+	// confirmation before executing a tool.
+	ToolConfirmJSON string `json:"tool_confirm_json,omitempty"`
 
 	// Error fields
 	Error      string `json:"error,omitempty"`
@@ -889,6 +910,24 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 	}
 	h.setSessionMeta(id, deref(req.Style), provider, deref(req.Model))
 
+	// Handle permission level separately — validate and write directly.
+	if req.PermissionLevel != nil {
+		level := *req.PermissionLevel
+		if level != "ask" && level != "auto" && level != "full" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": `permission_level must be "ask", "auto", or "full"`})
+			return
+		}
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.PermissionLevel = level
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		if h.store != nil {
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+			_ = h.store.UpdateConversationMeta(id, string(blob))
+		}
+	}
+
 	// Re-read so the response reflects the on-disk truth.
 	cv, err = h.store.GetConversation(id)
 	if err != nil {
@@ -1181,6 +1220,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		ProjectRoot:       meta.ProjectPath,
 		SkillContext:      req.SkillContext,
 		PlanMode:          meta.PlanMode,
+		PermissionLevel:   meta.PermissionLevel,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -1244,6 +1284,18 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		SubAgentStatus: chunk.SubAgentStatus,
 	}
 
+	// Question events are emitted by the question tool handler
+	// before it blocks waiting for user input.
+	if chunk.QuestionJSON != "" {
+		ev.Type = "question"
+		ev.QuestionJSON = chunk.QuestionJSON
+		return ev
+	}
+	if chunk.ToolConfirmJSON != "" {
+		ev.Type = "tool_confirm"
+		ev.ToolConfirmJSON = chunk.ToolConfirmJSON
+		return ev
+	}
 	if chunk.Error != "" {
 		ev.Type = "error"
 		ev.Error = chunk.Error
@@ -1332,6 +1384,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		Style:       m.Style,
 		ProjectPath: m.ProjectPath,
 		PlanMode:    m.PlanMode,
+		PermissionLevel: m.PermissionLevel,
 		CreatedAt:   cv.CreatedAt.Unix(),
 		UpdatedAt:   cv.UpdatedAt.Unix(),
 	}
@@ -1401,7 +1454,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
@@ -1444,7 +1497,60 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 func (h *Handler) GetTodos(c *gin.Context) {
 	id := c.Param("id")
 	todos := tool.GetSessionTodos(id)
+	// On cold cache (server restart), hydrate from SQLite.
+	if len(todos) == 0 && h.store != nil {
+		dbTodos := h.store.LoadTodos(id)
+		if len(dbTodos) > 0 {
+			toolTodos := make([]tool.TodoItem, len(dbTodos))
+			for i, t := range dbTodos {
+				toolTodos[i] = tool.TodoItem{
+					ID:      t.ID,
+					Content: t.Content,
+					Status:  t.Status,
+				}
+			}
+			tool.SetSessionTodos(id, toolTodos)
+			todos = toolTodos
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"todos": todos})
+}
+
+// QuestionResponse receives the user's answer to a pending
+// question from the frontend and delivers it to the waiting
+// question tool handler.
+// POST /api/v1/sessions/:id/question-response
+func (h *Handler) QuestionResponse(c *gin.Context) {
+	id := c.Param("id")
+	var resp tool.QuestionResponse
+	if err := c.ShouldBindJSON(&resp); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !tool.SubmitAnswer(id, resp) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no pending question for this session"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ConfirmResponse receives the user's approve/reject answer to a
+// pending tool confirm prompt.
+// POST /api/v1/sessions/:id/confirm-response
+func (h *Handler) ConfirmResponse(c *gin.Context) {
+	id := c.Param("id")
+	var body struct {
+		Approved bool `json:"approved"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !tool.SubmitConfirm(id, body.Approved) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no pending confirm for this session"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // --- Project CRUD ---
@@ -1615,4 +1721,159 @@ func (h *Handler) ListArchived(c *gin.Context) {
 		out = append(out, h.sessionToResponse(conv))
 	}
 	c.JSON(http.StatusOK, gin.H{"sessions": out})
+}
+
+// ListMCPServers GET /api/v1/mcp/servers
+func (h *Handler) ListMCPServers(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusOK, gin.H{"servers": []mcp.ServerInfo{}, "global_enabled": false})
+		return
+	}
+	servers := h.mcpMgr.List()
+	c.JSON(http.StatusOK, gin.H{"servers": servers, "global_enabled": h.mcpMgr.GlobalEnabled()})
+}
+
+// AddMCPServer POST /api/v1/mcp/servers
+func (h *Handler) AddMCPServer(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+
+	var body struct {
+		Name    string            `json:"name"`
+		Type    string            `json:"type,omitempty"`
+		Command string            `json:"command"`
+		Args    []string          `json:"args"`
+		Env     map[string]string `json:"env,omitempty"`
+		URL     string            `json:"url,omitempty"`
+		Enabled bool              `json:"enabled"`
+		Timeout string            `json:"timeout,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if body.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if body.Type != "sse" && body.Command == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "command is required for stdio transport"})
+		return
+	}
+	if body.Type == "sse" && body.URL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required for SSE transport"})
+		return
+	}
+
+	var timeout time.Duration
+	if body.Timeout != "" {
+		if d, err := time.ParseDuration(body.Timeout); err == nil && d > 0 {
+			timeout = d
+		}
+	}
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
+	tp := body.Type
+	if tp == "" {
+		tp = "stdio"
+	}
+
+	if err := h.mcpMgr.AddServer(mcp.ServerConfig{
+		Name:    body.Name,
+		Type:    tp,
+		Command: body.Command,
+		Args:    body.Args,
+		Env:     body.Env,
+		URL:     body.URL,
+		Enabled: body.Enabled,
+		Timeout: timeout,
+	}); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	h.persistMCPServers()
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// RemoveMCPServer DELETE /api/v1/mcp/servers/:name
+func (h *Handler) RemoveMCPServer(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+	name := c.Param("name")
+	if err := h.mcpMgr.RemoveServer(name); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	h.persistMCPServers()
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// RestartMCPServer POST /api/v1/mcp/servers/:name/restart
+func (h *Handler) RestartMCPServer(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+	name := c.Param("name")
+	if err := h.mcpMgr.Restart(name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// SetMCPGlobal PATCH /api/v1/mcp/global
+func (h *Handler) SetMCPGlobal(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	h.mcpMgr.SetGlobalEnabled(body.Enabled)
+	h.persistMCPServers()
+	c.JSON(http.StatusOK, gin.H{"global_enabled": h.mcpMgr.GlobalEnabled()})
+}
+
+func (h *Handler) persistMCPServers() {
+	srvInfos := h.mcpMgr.List()
+	servers := make([]config.MCPServerConfig, 0, len(srvInfos))
+	for _, info := range srvInfos {
+		srv, ok := h.mcpMgr.GetServer(info.Name)
+		if !ok {
+			continue
+		}
+		timeoutStr := ""
+		if srv.Timeout > 0 {
+			timeoutStr = srv.Timeout.String()
+		}
+		servers = append(servers, config.MCPServerConfig{
+			Name:    srv.Name,
+			Type:    srv.Type,
+			Command: srv.Command,
+			Args:    srv.Args,
+			Env:     srv.Env,
+			URL:     srv.URL,
+			Enabled: srv.Enabled,
+			Timeout: timeoutStr,
+		})
+	}
+	h.cfg.MCP.Servers = servers
+	h.cfg.MCP.Enabled = h.mcpMgr.GlobalEnabled()
+	if mgr := config.NewManager(); mgr != nil {
+		if err := mgr.SaveGlobal(h.cfg); err != nil {
+			log.Printf("[mcp] persist config: %v", err)
+		}
+	}
 }

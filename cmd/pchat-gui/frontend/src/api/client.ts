@@ -20,6 +20,7 @@ export interface Session {
   model?: string
   project_path?: string
   plan_mode?: boolean
+  permission_level?: string
 }
 
 export interface Attachment {
@@ -141,6 +142,7 @@ export interface SessionMeta {
   model: string
   project_path?: string
   plan_mode?: boolean
+  permission_level?: string
   created_at: number
   updated_at: number
 }
@@ -156,6 +158,8 @@ export interface UpdateSessionMetaResponse {
   style?: string
   provider?: string
   model?: string
+  plan_mode?: boolean
+  permission_level?: string
   created_at?: number
   updated_at?: number
 }
@@ -209,7 +213,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean }>,
+  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -233,6 +237,24 @@ export const saveSystemMessage = (id: string, content: string) =>
 
 export const getTodos = (id: string) =>
   jsonFetch<{ todos: TodoItem[] }>(`/api/v1/sessions/${id}/todos`)
+
+export interface QuestionItem {
+  question: string
+  header: string
+  options: { label: string; description: string }[]
+  multi_select?: boolean
+}
+
+export interface QuestionResponsePayload {
+  questions: QuestionItem[]
+  answers: Record<string, string>
+}
+
+export const submitQuestionResponse = (id: string, resp: QuestionResponsePayload) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/sessions/${id}/question-response`, {
+    method: 'POST',
+    body: JSON.stringify(resp),
+  })
 
 // --- Projects ---
 export interface ProjectItem {
@@ -258,6 +280,16 @@ export const removeProject = (path: string) =>
 // --- Dialog ---
 export const pickFolder = () =>
   jsonFetch<{ path: string }>('/api/v1/dialog/folder', { method: 'POST' })
+
+export const openExplorer = async (path: string) => {
+  const { OpenExplorer } = await import('../../wailsjs/go/main/App')
+  await OpenExplorer(path)
+}
+
+export const openTerminal = async (path: string) => {
+  const { OpenTerminal } = await import('../../wailsjs/go/main/App')
+  await OpenTerminal(path)
+}
 
 // --- Skills ---
 export interface SkillItem {
@@ -309,6 +341,44 @@ export const removeSkillRepo = (url: string) =>
   jsonFetch<{ repos: SavedRepo[] }>('/api/v1/skills/repos', {
     method: 'DELETE',
     body: JSON.stringify({ url }),
+  })
+
+// --- MCP ---
+export interface MCPServerInfo {
+  name: string
+  state: 'stopped' | 'starting' | 'running' | 'error'
+  tool_count: number
+  error?: string
+}
+
+export const listMCPServers = () =>
+  jsonFetch<{ servers: MCPServerInfo[]; global_enabled: boolean }>('/api/v1/mcp/servers')
+
+export const addMCPServer = (cfg: {
+  name: string
+  type?: string
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  url?: string
+  enabled?: boolean
+  timeout?: string
+}) =>
+  jsonFetch<{ ok: boolean }>('/api/v1/mcp/servers', {
+    method: 'POST',
+    body: JSON.stringify(cfg),
+  })
+
+export const removeMCPServer = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}`, { method: 'DELETE' })
+
+export const restartMCPServer = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}/restart`, { method: 'POST' })
+
+export const setMCPGlobal = (enabled: boolean) =>
+  jsonFetch<{ global_enabled: boolean }>('/api/v1/mcp/global', {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled }),
   })
 
 // --- Messages ---
@@ -635,6 +705,23 @@ export interface StreamEvent {
   // trailing user message with visionUnsupported: true
   // so the MessageBubble can render a clear chip.
   error_kind?: string
+
+  // question_json carries the serialized question payload
+  // when type === 'question'. The chat store parses it
+  // and surfaces a QuestionModal for the user to answer.
+  question_json?: string
+
+  // tool_confirm_json carries the serialized confirm request
+  // when type === 'tool_confirm'. The chat store surfaces a
+  // simple approve/reject dialog.
+  tool_confirm_json?: string
+}
+
+export async function submitConfirmResponse(sessionId: string, approved: boolean): Promise<void> {
+  await jsonFetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/confirm-response`, {
+    method: 'POST',
+    body: JSON.stringify({ approved }),
+  })
 }
 
 export async function streamMessages(sessionId: string, opts: SendOptions): Promise<void> {
@@ -659,32 +746,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   const decoder = new TextDecoder()
   let buf = ''
 
-  // Per-event render flush. This is the critical bit
-  // that makes streaming feel "live" in the UI:
-  //
-  //   1. `reader.read()` resolves with whatever bytes
-  //      the browser has buffered. That can be ONE
-  //      SSE event, or TEN of them packed into the
-  //      same TCP packet.
-  //   2. The inner `while` loop processes every complete
-  //      event in the buffer synchronously. Without the
-  //      yield below, all N events land in the chat
-  //      store in the same microtask, Vue's reactivity
-  //      batches them into ONE re-render, and the user
-  //      sees the assistant bubble jump from empty to
-  //      "fully formed" — i.e. the "appears all at
-  //      once" bug.
-  //   3. Yielding with `setTimeout(0)` after each event
-  //      forces Vue to flush its pending render before
-  //      the next event is processed, so the user
-  //      actually sees the text grow chunk by chunk.
-  //
-  // We only yield for events that affect the visible
-  // bubble (content / thinking) — phase / tool /
-  // done events are bookkeeping and can be batched.
   const flush = () => new Promise<void>(r => setTimeout(r, 0))
-  const shouldFlush = (ev: StreamEvent): boolean =>
-    ev.type === 'content' || ev.type === 'thinking'
 
   while (true) {
     const { value, done } = await reader.read()
@@ -701,7 +763,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
       try {
         const ev = JSON.parse(data) as StreamEvent
         opts.onEvent(ev)
-        if (shouldFlush(ev)) await flush()
+        await flush()
       } catch (e) {
         console.warn('SSE parse error', e, 'raw:', data.slice(0, 200))
       }

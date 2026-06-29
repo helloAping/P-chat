@@ -84,6 +84,28 @@ async function togglePlanMode() {
   } catch {}
 }
 
+const permissionLevel = computed(() => {
+  if (!state.currentID) return 'ask'
+  return state.sessionMeta[state.currentID]?.permission_level || 'ask'
+})
+
+const permissionOptions = [
+  { label: '🔒 始终询问', value: 'ask' },
+  { label: '🔓 替我审批', value: 'auto' },
+  { label: '🔑 完全访问', value: 'full' },
+]
+
+async function onChangePermissionLevel(val: string) {
+  if (!state.currentID) return
+  try {
+    await api.updateSessionMeta(state.currentID, { permission_level: val })
+    state.sessionMeta[state.currentID] = {
+      ...state.sessionMeta[state.currentID],
+      permission_level: val,
+    }
+  } catch {}
+}
+
 // CmdSpec is imported from CommandPalette.vue
 
 const commandList = ref<CmdSpec[]>([])
@@ -928,6 +950,15 @@ onMounted(() => {
           title="切换计划/构建模式"
           style="font-size:11px"
         >{{ planMode ? '📋 计划' : '🔨 构建' }}</NButton>
+        <NSelect
+          v-model:value="permissionLevel"
+          :options="permissionOptions"
+          size="small"
+          :disabled="!state.currentID"
+          class="picker picker-narrow"
+          title="权限级别"
+          @update:value="onChangePermissionLevel"
+        />
       </div>
       <div class="hints">
         <span><kbd>Enter</kbd> 发送</span>

@@ -180,9 +180,13 @@ func (r *REPL) chat(input string) {
 
 	provModel := r.providerModel()
 	ui := NewChatUI(r.provider, provModel)
-	ui.PrintBannerHeader(input)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	ui.SetQuestionHandler(r.ctx.GetCurrentSessionID(), func(sid string, answers map[string]string) error {
+		return r.ctx.SubmitQuestionAnswer(ctx, sid, answers)
+	})
+	ui.PrintBannerHeader(input)
+
 	r.mu.Lock()
 	r.cancelCurrent = cancel
 	r.mu.Unlock()

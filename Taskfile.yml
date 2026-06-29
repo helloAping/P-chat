@@ -53,6 +53,7 @@ tasks:
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
+      - cmd: powershell -NoProfile -Command "Copy-Item -LiteralPath 'build\bin\pchat-gui.exe' -Destination '..\..\bin\pchat-gui.exe' -Force"
     silent: false
 
   build:gui:linux:

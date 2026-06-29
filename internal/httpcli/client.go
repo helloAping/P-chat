@@ -86,6 +86,9 @@ type StreamEvent struct {
 	// Error fields
 	Error      string `json:"error,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
+
+	// Question event (LLM asks user a question)
+	QuestionJSON string `json:"question_json,omitempty"`
 }
 
 // ProviderInfo mirrors the providers endpoint payload.
@@ -366,6 +369,15 @@ func (c *Client) DisplayModel(provider string) string {
 		}
 	}
 	return models[0].DisplayName
+}
+
+// SubmitQuestionResponse sends the user's answer to a pending
+// question back to the server so the agent can continue.
+func (c *Client) SubmitQuestionResponse(ctx context.Context, sessionID string, answers map[string]string) error {
+	body := map[string]interface{}{
+		"answers": answers,
+	}
+	return c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/question-response", body, nil)
 }
 
 // Flush is a no-op for the HTTP client; the server persists data

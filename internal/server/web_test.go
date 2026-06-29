@@ -39,7 +39,7 @@ func newWebServer(t *testing.T) *httptest.Server {
 
 	// Use an absolute path so the test is cwd-independent.
 	absWeb, _ := filepath.Abs("../../web")
-	return httptest.NewServer(server.NewWithStaticDir(cfg, agt, store, styleMgr, absWeb).Engine())
+	return httptest.NewServer(server.NewWithStaticDir(cfg, agt, store, styleMgr, absWeb, nil).Engine())
 }
 
 func TestWebGUI_IndexPage(t *testing.T) {

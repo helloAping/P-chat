@@ -106,6 +106,11 @@ func KnowledgeDir() string {
 	return filepath.Join(GlobalDir(), "knowledge")
 }
 
+// UploadsDir returns ~/.p-chat/uploads/ (file uploads)
+func UploadsDir() string {
+	return filepath.Join(GlobalDir(), "uploads")
+}
+
 // ToolsDir returns ~/.p-chat/tools/
 func ToolsDir() string {
 	return filepath.Join(GlobalDir(), "tools")
@@ -153,6 +158,8 @@ func EnsureGlobal() error {
 		GlobalPromptsDir(),
 		MemoryDir(),
 		ToolsDir(),
+		KnowledgeDir(),
+		UploadsDir(),
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {

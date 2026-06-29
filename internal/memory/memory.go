@@ -188,6 +188,15 @@ func (s *Store) migrate() error {
 			dim        INTEGER NOT NULL,
 			created_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS todo_items (
+			session_id TEXT NOT NULL,
+			item_id    TEXT NOT NULL,
+			content    TEXT NOT NULL,
+			status     TEXT NOT NULL DEFAULT 'pending',
+			sort_order INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (session_id, item_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_todo_session ON todo_items(session_id)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
@@ -1134,6 +1143,58 @@ func (s *Store) ConversationMessageCount() int {
 // DB returns the underlying *sql.DB for advanced callers (knowledge
 // package). Not part of the stable API.
 func (s *Store) DB() *sql.DB { return s.db }
+
+// TodoItem is a single task in a session's todo list.
+type TodoItem struct {
+	ID      string `json:"id"`
+	Content string `json:"content"`
+	Status  string `json:"status"`
+}
+
+// SaveTodos persists a session's todo list to SQLite.
+// Replaces the entire list atomically.
+func (s *Store) SaveTodos(sessionID string, todos []TodoItem) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM todo_items WHERE session_id = ?`, sessionID); err != nil {
+		return err
+	}
+	for i, t := range todos {
+		if _, err := tx.Exec(
+			`INSERT INTO todo_items(session_id, item_id, content, status, sort_order) VALUES (?, ?, ?, ?, ?)`,
+			sessionID, t.ID, t.Content, t.Status, i,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LoadTodos loads a session's todo list from SQLite.
+// Returns nil if no todos exist.
+func (s *Store) LoadTodos(sessionID string) []TodoItem {
+	rows, err := s.db.Query(
+		`SELECT item_id, content, status FROM todo_items WHERE session_id = ? ORDER BY sort_order ASC`,
+		sessionID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []TodoItem
+	for rows.Next() {
+		var t TodoItem
+		if err := rows.Scan(&t.ID, &t.Content, &t.Status); err != nil {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
 
 // newConvID generates a sortable, unique conversation id.
 // Uses nanosecond precision + a small atomic counter to guarantee

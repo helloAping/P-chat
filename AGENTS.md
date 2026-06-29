@@ -63,7 +63,8 @@ cmd/pchat-gui/frontend/src/
     ├── SubAgentCard.vue     → nested sub-agent run with own parts[]
     ├── SessionSidebar.vue   → session list, project selector, settings
     ├── CommandPalette.vue   → / slash command inline autocomplete
-    ├── TodoPanel.vue        → pending todos from agent loop
+    ├── TodoPanel.vue        → pending todos from agent loop (interactive: check, edit, remove)
+    ├── QuestionModal.vue    → multi-choice question dialog (LLM asks, user answers)
     ├── ImageLightbox.vue    → full-screen image viewer
     ├── LoadingDots.vue      → sub-agent loading spinner
     └── AppSettingsModal.vue → provider/model/style management
@@ -99,6 +100,7 @@ chat store (appendStreamEvent)
   │ appends content to trailing TextPart.text
   │ appends thinking to trailing ThinkingPart.text
   │ creates ToolPart / SubAgentPart on tool events
+  │ emits "question" event → QuestionModal opens (user answers → POST /question-response → tool unblocks)
   ▼
 Vue reactivity → re-render affected DOM nodes
 ```
@@ -156,7 +158,7 @@ internal/
   llm/           → ChatMessage, ProtocolAdapter, StreamChunk, error classification
   memory/        → SQLite conversation store (chat history + metadata)
   server/        → Gin HTTP handlers (sessions, messages, uploads, providers, projects, skills, archive)
-  tool/          → Tool registry (exec, read/write, sub-agent)
+  tool/          → Tool registry (exec, read/write, todo_write, question, sub-agent)
   cli/           → REPL, commands, ChatUI terminal rendering, SSE event adapter
   subagent/      → Nested agent runner
   style/         → Personality style management
@@ -199,6 +201,7 @@ All endpoints under `/api/v1/`.
 | PATCH | `/sessions/:id/reasoning-effort` | Set DeepSeek/OpenAI thinking level |
 | POST | `/sessions/:id/system-message` | Save custom system prompt |
 | GET | `/sessions/:id/todos` | Get pending todos |
+| POST | `/sessions/:id/question-response` | Submit answer to pending question |
 | DELETE | `/sessions/:id/messages` | Clear session messages |
 
 ### Archive
@@ -288,8 +291,12 @@ for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
 ### Plan Mode
 
 Per-session toggle (`🔨 构建` / `📋 计划`) stored in session metadata as `plan_mode`.
-When enabled: `toolDefs = nil` (no tools), `maxRounds = 1` (single turn).
-The LLM produces a step-by-step plan in plain text for user review.
+When enabled:
+- Only `todo_write` and `question` tools are available (execution tools disabled)
+- `maxRounds = 1` (single turn)
+- The LLM produces a step-by-step plan, optionally broke down via `todo_write`, and may
+  ask clarifying questions with `question` if requirements are vague.
+- User reviews, then switches back to build mode to execute.
 
 ### Tool result persistence
 
@@ -298,6 +305,42 @@ The LLM produces a step-by-step plan in plain text for user review.
 ### DeepSeek compatibility
 
 `normalizeToolResults()` converts ToolResult role→User role so DeepSeek models accept the tool-result messages. Applied in `agent.go` and `handler.go`.
+
+### Question tool (pause/resume)
+
+The `question` tool allows the LLM to pause execution and ask the user a
+multiple-choice question before continuing. Architecture:
+
+1. **LLM calls `question` tool** with `{ questions: [...] }` (1-4 questions, 2-4 options each)
+2. **Tool handler** (`internal/tool/question.go:handleQuestion`):
+   - Sends question payload through the tool event channel as `ChatStreamChunk{QuestionJSON: ...}`
+   - Registers a response channel keyed by session ID
+   - **Blocks** on the response channel (with 5-minute timeout)
+3. **SSE handler** maps `QuestionJSON` → `StreamEvent{type: "question"}`, forwarded to frontend
+4. **Frontend** (`QuestionModal.vue`): renders modal with radio/checkbox options + navigation
+5. **User answers** → `submitQuestionAnswer()` → `POST /api/v1/sessions/:id/question-response`
+6. **Server** delivers answer to the blocked tool handler's channel
+7. **Tool handler** resumes, returns answer as tool result, LLM continues the loop
+
+### Todo persistence
+
+Todo lists are now persisted to SQLite (`todo_items` table) via the
+`tool.PersistTodos` hook. On `GET /sessions/:id/todos`, the handler
+hydrates the in-memory cache from SQLite on cold start, ensuring todos
+survive server restarts.
+
+### System prompt instructions
+
+The static system prompt now includes:
+- **Task Planning**: instructions encouraging `todo_write` use for complex multi-step tasks
+- **Asking the User**: instructions for when to use the `question` tool (requirements clarification, architecture decisions, plan confirmation)
+
+### CLI/terminal display (TODO)
+
+The `question` tool currently only surfaces the question modal in the Vue GUI.
+Terminal (CLI) rendering via the `cli/` package is not yet implemented — the
+CLI REPL should render questions inline with keyboard navigation. This is
+deferred to a future iteration.
 
 ## Build commands
 

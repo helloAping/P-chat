@@ -4,7 +4,7 @@
 
 import { reactive, ref, computed } from 'vue'
 import * as api from '../api/client'
-import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem } from '../api/client'
+import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -46,8 +46,13 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean }>,
+  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string }>,
   sessionTodos: {} as Record<string, TodoItem[]>,
+  // Pending question from the LLM's question tool. When
+  // non-null, QuestionModal renders it and blocks until
+  // the user answers.
+  pendingQuestion: null as { questions: QuestionItem[]; resolve: (answers: Record<string, string>) => void } | null,
+  pendingConfirm: null as { toolName: string; args: string; reason: string; resolve: (approved: boolean) => void } | null,
   lightbox: { show: false, src: '', alt: '' },
   showSettings: false,
   projects: [] as ProjectItem[],
@@ -143,6 +148,7 @@ export async function switchSession(id: string) {
       model:     s.model || '',
       title:     s.title || '',
       plan_mode: s.plan_mode || false,
+      permission_level: s.permission_level || 'ask',
     }
   }
   // Load per-session todos.
@@ -250,6 +256,7 @@ export async function renameSession(id: string, title: string) {
       style: resp.style ?? state.sessionMeta[id].style,
       provider: resp.provider ?? state.sessionMeta[id].provider,
       model: resp.model ?? state.sessionMeta[id].model,
+      permission_level: resp.permission_level ?? state.sessionMeta[id].permission_level,
     }
   }
 }
@@ -609,6 +616,37 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         if (p.kind === 'thinking' && p.streaming) p.streaming = false
       })
       break
+    case 'question':
+      // LLM is asking the user a question. Parse the
+      // question JSON and surface it via QuestionModal.
+      if (ev.question_json) {
+        try {
+          const questions: QuestionItem[] = JSON.parse(ev.question_json)
+          // Create a Promise that resolves when the user answers.
+          const answerPromise = new Promise<Record<string, string>>((resolve) => {
+            state.pendingQuestion = { questions, resolve }
+          })
+          // The answer will be submitted via submitQuestionAnswer().
+        } catch { /* ignore parse errors */ }
+      }
+      break
+    case 'tool_confirm':
+      if (ev.tool_confirm_json) {
+        try {
+          const cfm = JSON.parse(ev.tool_confirm_json) as { tool_name: string; args: string; reason: string }
+          new Promise<boolean>((resolve) => {
+            state.pendingConfirm = {
+              toolName: cfm.tool_name,
+              args: cfm.args,
+              reason: cfm.reason,
+              resolve,
+            }
+          }).then((approved) => {
+            submitConfirmResponseInner(id, approved)
+          })
+        } catch { /* ignore */ }
+      }
+      break
     case 'error':
       // Render the error in the message content so the
       // user sees it. The MessageBubble also styles
@@ -685,6 +723,38 @@ export function endStream(id: string) {
     }
   }
   delete state.streaming[id]
+}
+
+export function submitQuestionAnswer(answers: Record<string, string>) {
+  const id = state.currentID
+  if (!id || !state.pendingQuestion) return
+  const pq = state.pendingQuestion
+  state.pendingQuestion = null
+  // Resolve the Promise so the LLM continues.
+  pq.resolve(answers)
+  // POST the answer to the server so the blocked tool handler
+  // receives it and the agent loop continues.
+  api.submitQuestionResponse(id, {
+    questions: pq.questions,
+    answers,
+  })
+}
+
+async function submitConfirmResponseInner(id: string, approved: boolean) {
+  try {
+    await api.submitConfirmResponse(id, approved)
+  } catch {
+    // server already unblocked via resolve
+  }
+}
+
+export function submitToolConfirm(approved: boolean) {
+  const id = state.currentID
+  if (!id || !state.pendingConfirm) return
+  const pc = state.pendingConfirm
+  state.pendingConfirm = null
+  pc.resolve(approved)
+  submitConfirmResponseInner(id, approved)
 }
 
 export const isStreaming = computed(() => !!state.streaming[state.currentID])

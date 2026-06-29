@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
 )
@@ -34,8 +35,8 @@ func (s *Server) Handler() *Handler { return s.handler }
 // New builds the HTTP server. The store is used for session/message
 // persistence. The agent is used for chat calls. The web frontend is
 // served from an embedded filesystem so the binary is self-contained.
-func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager) *Server {
-	return NewWithStaticFS(cfg, agt, store, styleMgr, nil)
+func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Server {
+	return NewWithStaticFS(cfg, agt, store, styleMgr, nil, mcpMgr)
 }
 
 // NewWithStaticDir is like New but lets the caller pick where the
@@ -43,18 +44,18 @@ func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *st
 // parent process, which sets PCHAT_WEB_DIR to the absolute path of the
 // web/ output. Pass an empty string to skip static serving entirely
 // (useful for tests that don't ship the frontend).
-func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, staticDir string) *Server {
+func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, staticDir string, mcpMgr *mcp.Manager) *Server {
 	if staticDir == "" {
-		return NewWithStaticFS(cfg, agt, store, styleMgr, nil)
+		return NewWithStaticFS(cfg, agt, store, styleMgr, nil, mcpMgr)
 	}
-	return NewWithStaticFS(cfg, agt, store, styleMgr, http.Dir(staticDir))
+	return NewWithStaticFS(cfg, agt, store, styleMgr, http.Dir(staticDir), mcpMgr)
 }
 
 // NewWithStaticFS is the lowest-level constructor: it accepts an
 // http.FileSystem directly. Pass nil to skip static serving. In
 // production pchat-server passes http.FS(embeddedWebFS) so the
 // frontend ships inside the binary and works from any CWD.
-func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, staticFS http.FileSystem) *Server {
+func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, staticFS http.FileSystem, mcpMgr *mcp.Manager) *Server {
 	if os.Getenv("PC_HTTP_DEBUG") == "1" {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -63,7 +64,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	h := NewHandler(agt, cfg, store, styleMgr)
+	h := NewHandler(agt, cfg, store, styleMgr, mcpMgr)
 
 	// Wire the summarizer so /compress works.
 	if lc := agt.LLM(); lc != nil && cfg.LLM.Default != "" {
@@ -117,6 +118,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.PATCH("/sessions/:id/reasoning-effort", h.SetReasoningEffort)
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)
 		api.GET("/sessions/:id/todos", h.GetTodos)
+		api.POST("/sessions/:id/question-response", h.QuestionResponse)
+		api.POST("/sessions/:id/confirm-response", h.ConfirmResponse)
 
 		// Archive
 		api.POST("/sessions/:id/archive", h.ArchiveSession)
@@ -142,6 +145,13 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/skills/repos", h.ListSkillRepos)
 		api.POST("/skills/repos", h.AddSkillRepo)
 		api.DELETE("/skills/repos", h.RemoveSkillRepo)
+
+		// MCP
+		api.GET("/mcp/servers", h.ListMCPServers)
+		api.POST("/mcp/servers", h.AddMCPServer)
+		api.DELETE("/mcp/servers/:name", h.RemoveMCPServer)
+		api.POST("/mcp/servers/:name/restart", h.RestartMCPServer)
+		api.PATCH("/mcp/global", h.SetMCPGlobal)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the

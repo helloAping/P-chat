@@ -196,6 +196,9 @@ type ChatRequest struct {
 	// activated via slash command. It is appended to the system
 	// prompt so the LLM sees it without cluttering the chat.
 	SkillContext string `json:"skill_context,omitempty"`
+	// PermissionLevel overrides the sandbox confirm behaviour for
+	// this session. Values: "ask", "auto", "full". Default "ask".
+	PermissionLevel string `json:"permission_level,omitempty"`
 	// MaxRounds caps the ReAct tool-use loop. 0 means default (50).
 	// After MaxRounds the loop stops and the user can continue
 	// with a follow-up message.
@@ -257,6 +260,18 @@ type ChatStreamChunk struct {
 	// failed). Other phase values are treated as
 	// in-progress.
 	SubAgentStatus string `json:"sub_agent_status,omitempty"`
+
+	// Question fields — when the question tool emits a
+	// question event, QuestionJSON carries the serialized
+	// question payload (JSON array of Question objects).
+	// The frontend renders it as a modal dialog and posts
+	// the answer back via POST /sessions/:id/question-response.
+	QuestionJSON string `json:"question_json,omitempty"`
+
+	// ToolConfirm fields — when the sandbox decides a tool call
+	// needs user confirmation, ToolConfirmJSON carries the serialized
+	// ConfirmRequest. The frontend renders a confirm dialog.
+	ToolConfirmJSON string `json:"tool_confirm_json,omitempty"`
 }
 
 // buildStaticSystemPrompt builds the **prefix-cacheable** portion of the
@@ -320,10 +335,16 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		// is added by the CLI at startup; here we just remind the
 		// model to use it.
 		hasRecall := false
+		hasQuestion := false
+		hasTodoWrite := false
 		for _, t := range a.tools.List() {
-			if t.Name == "recall" {
+			switch t.Name {
+			case "recall":
 				hasRecall = true
-				break
+			case "question":
+				hasQuestion = true
+			case "todo_write":
+				hasTodoWrite = true
 			}
 		}
 		if hasRecall {
@@ -331,6 +352,28 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 				"当你不确定某条信息、需要查代码/文档、或想引用历史对话时，\n" +
 				"先用 `recall(query=\"...\")` 工具查一下知识库/历史。\n" +
 				"不要凭印象编造 API 名称、文件路径、函数签名。\n")
+		}
+		if hasTodoWrite {
+			sb.WriteString("\n\n---\n\n## Task Planning with todo_write\n\n" +
+				"使用 `todo_write` 工具创建和管理结构化任务列表。\n" +
+				"何时使用：复杂多步骤任务（3+ 步）、用户明确要求、收到新指令后、开始或完成工作时。\n" +
+				"规则：\n" +
+				"- 始终包含完整列表（替换式，非追加式）\n" +
+				"- 同时只能有一个任务处于 in_progress\n" +
+				"- 完成任务后立即标记为 done（不要批量标记）\n" +
+				"- 如果测试失败、实现不完整或错误未解决，不要标记为 done\n" +
+				"- 状态: pending（待处理）、in_progress（进行中）、done（已完成）、cancelled（已取消）\n")
+		}
+		if hasQuestion {
+			sb.WriteString("\n\n---\n\n## Asking the User (question tool)\n\n" +
+				"当你需要用户决策、明确需求或在执行前确认计划时，使用 `question` 工具。\n" +
+				"何时使用：\n" +
+				"- 需求不明确，有多个可行的技术方案\n" +
+				"- 需要用户选择工具、框架或架构\n" +
+				"- 在执行前需要用户确认关键决策\n" +
+				"- 用户指令模糊，需要澄清\n" +
+				"最多一次提 4 个问题，每个问题 2-4 个选项。\n" +
+				"不要在简单/琐碎的事务上使用（如「我能开始吗？」）。\n")
 		}
 		// Remind the LLM that uploaded images arrive as vision
 		// input in the user message (image_url content parts),
@@ -547,22 +590,31 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 		}
 
-		// Plan mode: tell the LLM to produce a step-by-step plan in
-		// pure text (no tool calls). The user will review the plan
-		// before actually executing it.
+		// Plan mode: the LLM can use `todo_write` to break down
+		// the analysis into steps, and `question` to clarify vague
+		// requirements. Other tools are disabled — Plan Mode is
+		// for planning, not executing.
 		maxRounds := 0 // 0 = unlimited; >0 = capped
 		if req.PlanMode {
-			toolDefs = nil
+			var planTools []llm.ToolDef
+			for _, t := range toolDefs {
+				if t.Name == "todo_write" || t.Name == "question" {
+					planTools = append(planTools, t)
+				}
+			}
+			toolDefs = planTools
 			msgs[0].Content += "\n\n---\n\n## Plan Mode\n\n" +
-				"你正在 PLAN MODE：不要调用任何工具。\n" +
-				"请用纯文本给出 step-by-step 执行计划：\n" +
+				"你正在 PLAN MODE：不要调用任何执行类工具 (exec_command, write_file, task 等)。\n" +
+				"你可以使用 `todo_write` 将分析/计划拆分为步骤，\n" +
+				"也可以使用 `question` 向用户澄清模糊需求。\n" +
+				"请给出 step-by-step 执行计划：\n" +
 				"1. 每一步做什么\n" +
 				"2. 每一步预期使用什么工具 (read_file, write_file, exec_command, list_files, task 等)\n" +
 				"3. 每一步的预期结果\n" +
 				"4. 风险 / 依赖 / 边界\n" +
-				"用户审阅后会用 y/n/e 决定是否执行。\n"
+				"用户审阅后切换回构建模式执行。\n"
 			maxRounds = 1
-			ch <- ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (单轮纯文本，无工具调用)"}
+			ch <- ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (可用 todo_write / question，最多单轮)"}
 		} else {
 			ch <- ChatStreamChunk{Phase: "plan", Step: "plan", Message: "构建模式 — LLM 自主决定何时终止"}
 		}
@@ -752,13 +804,24 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				wg.Add(1)
 
 				eventCh := make(chan ChatStreamChunk, 16)
-			tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
+				tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
+				}
+				if req.PermissionLevel != "" {
+					tctx = tool.WithPermissionLevel(tctx, req.PermissionLevel)
 				}
 				if req.ProjectRoot != "" {
 					tctx = tool.WithProjectRoot(tctx, req.ProjectRoot)
 				}
+				// Inject event sender so the question tool can
+				// emit "question" events through the SSE stream.
+				tctx = tool.WithEventSender(tctx, func(jsonData string) {
+					select {
+					case eventCh <- ChatStreamChunk{QuestionJSON: jsonData}:
+					default:
+					}
+				})
 				tctx, cancel := context.WithTimeout(tctx, 5*time.Minute)
 
 				fwd := forwarder{done: make(chan struct{})}
@@ -804,10 +867,77 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// short-circuit dangerous operations. If the user
 					// ran /unsafe once, the next call bypasses the
 					// sandbox check entirely.
+					//
+					// Permission level (per-session) controls sandbox
+					// behaviour:
+					//   "full" — skip all sandbox checks
+					//   "auto" — auto-approve confirm decisions
+					//   "ask"  — normal confirm flow (default)
 					toolCtx := tctx
+					permLevel, _ := tctx.Value(tool.PermissionLevelKey{}).(string)
+					if permLevel == "" {
+						permLevel = tool.PermissionAsk
+					}
 					bypass := a.bypassOnce.Swap(false)
-					if a.sandbox != nil && !bypass {
+					sandboxActive := a.sandbox != nil && !bypass && permLevel != tool.PermissionFull
+					if sandboxActive {
 						toolCtx = tool.WithSandbox(tctx, a.sandbox)
+
+						// Confirm-check for dangerous tools.
+						// If the sandbox returns Confirm, pause and
+						// wait for user approval before executing
+						// (unless permission level is "auto").
+						if tc.Name == "exec_command" || tc.Name == "write_file" {
+							var decision tool.SandboxDecision
+							var reason string
+							if tc.Name == "exec_command" {
+								decision = a.sandbox.CheckExecDecision(tc.ArgsJSON)
+								reason = a.sandbox.MatchedPattern(tc.ArgsJSON)
+							} else {
+								var wa struct{ Path string `json:"path"` }
+								json.Unmarshal([]byte(tc.ArgsJSON), &wa)
+								decision = a.sandbox.CheckWriteDecision(wa.Path)
+							}
+							if decision == tool.SandboxConfirm {
+								if permLevel == tool.PermissionAuto {
+									// Auto-approve: skip confirm modal,
+									// emit a brief notification event instead.
+									select {
+									case eventCh <- ChatStreamChunk{
+										Content: fmt.Sprintf("🔓 [自动通过] %s", tc.Name),
+									}:
+									default:
+									}
+								} else {
+									// Normal confirm flow.
+									cfm := tool.ConfirmRequest{
+										ToolName: tc.Name,
+										Args:     tc.ArgsJSON,
+										Reason:   reason,
+									}
+									var sessionID string
+									if sid, ok := tctx.Value(tool.SessionIDKey{}).(string); ok {
+										sessionID = sid
+									}
+									select {
+									case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(cfm)}:
+									default:
+									}
+									approved, cfmErr := tool.WaitForConfirm(toolCtx, sessionID, cfm)
+									if cfmErr != nil || !approved {
+										outcomes[i] = toolOutcome{
+											idx: i,
+											tc:  tc,
+											result: &tool.CallResult{
+												Content: "工具调用被用户拒绝",
+												IsError: true,
+											},
+										}
+										return
+									}
+								}
+							}
+						}
 					}
 					result, err := handler(toolCtx, argsRaw)
 					outcomes[i] = toolOutcome{

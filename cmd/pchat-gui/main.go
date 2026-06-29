@@ -203,6 +203,55 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("ServeHTTP: %s %s -> %d", r.Method, r.URL.Path, ww.status)
 }
 
+// OpenExplorer opens the OS-native file manager at the given directory path.
+func (a *App) OpenExplorer(path string) {
+	if err := openExplorer(path); err != nil {
+		log.Printf("OpenExplorer %q: %v", path, err)
+	}
+}
+
+// OpenTerminal opens the OS-native terminal at the given directory path.
+func (a *App) OpenTerminal(path string) {
+	if err := openTerminal(path); err != nil {
+		log.Printf("OpenTerminal %q: %v", path, err)
+	}
+}
+
+// openExplorer opens the OS file manager at the given path.
+func openExplorer(path string) error {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("path not accessible: %w", err)
+	}
+	if !stat.IsDir() {
+		return fmt.Errorf("not a directory: %s", path)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("explorer", path).Start()
+	default:
+		return fmt.Errorf("file explorer not supported on %s", runtime.GOOS)
+	}
+}
+
+// openTerminal opens a new terminal window at the given path.
+func openTerminal(path string) error {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("path not accessible: %w", err)
+	}
+	if !stat.IsDir() {
+		return fmt.Errorf("not a directory: %s", path)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		script := fmt.Sprintf(`Start-Process powershell -ArgumentList '-NoExit','-Command','Set-Location ''%s'''`, path)
+		return exec.Command("powershell", "-NoProfile", "-Command", script).Start()
+	default:
+		return fmt.Errorf("terminal not supported on %s", runtime.GOOS)
+	}
+}
+
 func writeLoading(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -494,8 +543,8 @@ func pickFreePort() (int, error) {
 }
 
 // pickConfigPath returns the user's p-chat config path. Prefers the
-// newer json file, falls back to yaml. Empty string means "use
-// pchat-server's built-in default".
+// newer json file, falls back to yaml. Returns "" when neither exists
+// (fresh install — pchat-server uses built-in defaults).
 func pickConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -509,7 +558,7 @@ func pickConfigPath() string {
 	if _, err := os.Stat(yamlPath); err == nil {
 		return yamlPath
 	}
-	return jsonPath
+	return ""
 }
 
 // hideChildConsole suppresses the stray console window that Go's

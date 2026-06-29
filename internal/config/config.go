@@ -25,6 +25,7 @@ type Config struct {
 	Memory   MemoryConfig   `json:"memory"`
 	Sandbox  SandboxConfig  `json:"sandbox"`
 	SubAgent SubAgentConfig `json:"subagent"`
+	MCP      MCPConfig      `json:"mcp"`
 }
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
@@ -280,6 +281,22 @@ type ToolServerConfig struct {
 	Args    []string `json:"args"`
 }
 
+type MCPConfig struct {
+	Enabled bool              `json:"enabled"`
+	Servers []MCPServerConfig `json:"servers"`
+}
+
+type MCPServerConfig struct {
+	Name    string            `json:"name"`
+	Type    string            `json:"type,omitempty"`   // "stdio" (default) | "sse"
+	Command string            `json:"command"`
+	Args    []string          `json:"args"`
+	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`    // for SSE transport
+	Enabled bool              `json:"enabled"`
+	Timeout string            `json:"timeout,omitempty"`
+}
+
 type MemoryConfig struct {
 	Enabled    bool `json:"enabled"`
 	MaxHistory int  `json:"max_history"`
@@ -370,6 +387,11 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 				_ = writeConfigJSON(paths.GlobalConfig(), cfg)
 				_ = os.WriteFile(paths.GlobalConfigYAML(), yamlData, 0o644)
 			}
+		} else {
+			// No config at all — fresh install. Write the
+			// default config so it exists on disk for future
+			// edits and the --config argument works next time.
+			_ = writeConfigJSON(paths.GlobalConfig(), cfg)
 		}
 	} else {
 		return nil, fmt.Errorf("read global config: %w", err)
@@ -395,6 +417,13 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	if customPath != "" {
 		data, err := os.ReadFile(customPath)
 		if err != nil {
+			if os.IsNotExist(err) {
+				// User passed --config pointing to a file that
+				// doesn't exist yet (fresh install).  Treat it
+				// as a no-op so the caller gets a valid default
+				// config that can be saved later.
+				return cfg, nil
+			}
 			return nil, fmt.Errorf("read config %s: %w", customPath, err)
 		}
 		data = stripBOM(data)
@@ -460,6 +489,9 @@ func Default() *Config {
 			// Default safety stance: deny exec_command in sub-agents.
 			// Users can override by setting allowed_tools explicitly.
 			DeniedTools: []string{"exec_command"},
+		},
+		MCP: MCPConfig{
+			Enabled: false,
 		},
 	}
 }
