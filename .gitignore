@@ -280,3 +280,4 @@ cmd/pchat-gui/pchat-gui.exe
 cmd/pchat-installer/assets/
 # Installer output.
 /bin/pchat-setup.exe
+/pchat-installer.exe
