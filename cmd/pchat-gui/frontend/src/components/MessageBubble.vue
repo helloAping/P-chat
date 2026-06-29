@@ -301,24 +301,26 @@ const showVisionWarn = computed(() =>
   border: 1px solid var(--border);
 }
 .msg.system {
-  justify-content: center;
-  margin: 4px 16px;
+  margin: 6px 16px;
 }
 .msg.system .bubble {
-  background: transparent;
+  background: var(--bg-3);
   color: var(--text-2);
-  font-size: 12px;
-  max-width: 90%;
-  display: flex; align-items: flex-start; gap: 6px;
-  border-left: 2px solid var(--border-2);
-  padding: 4px 8px 4px 8px;
+  font-size: 12.5px;
+  max-width: 85%;
+  display: flex; align-items: flex-start; gap: 8px;
+  border: 1px solid var(--border-2);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 12px;
 }
 .system-icon {
-  color: var(--text-4);
+  color: var(--accent);
   font-family: ui-monospace, Menlo, monospace;
   font-weight: 700;
+  font-size: 14px;
   flex-shrink: 0;
-  line-height: 1.6;
+  line-height: 1.4;
 }
 .bubble-body { min-width: 0; flex: 1; }
 .attachments {

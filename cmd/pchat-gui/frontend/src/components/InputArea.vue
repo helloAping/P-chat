@@ -308,14 +308,18 @@ async function runSlash(name: string, args: string): Promise<boolean> {
     }
     case 'compress': {
       if (state.currentID) {
+        const id = state.currentID
+        const msgIndex = pushLoadingMessage('⏳ 正在压缩对话历史…')
         try {
-          const r = await api.compressConversation(state.currentID)
+          const r = await api.compressConversation(id)
+          removeMessage(id, msgIndex)
           if (r.compressed) {
-            appendSystemMessage(`对话已压缩。\n\n摘要:\n${r.summary}`)
+            pushAssistantMessage(id, `## 📋 对话压缩摘要\n\n${r.summary}`)
           } else {
             appendSystemMessage('对话消息数未达阈值，无需压缩。')
           }
         } catch (e: any) {
+          removeMessage(id, msgIndex)
           appendSystemMessage(`压缩失败: ${e.message}`)
         }
       }
@@ -465,6 +469,27 @@ async function renderConfig(): Promise<string> {
 function fmtK(n: number): string {
   if (n >= 1000) return (n / 1000).toFixed(0) + 'k'
   return String(n)
+}
+
+function pushLoadingMessage(text: string): number {
+  const id = state.currentID
+  if (!id) return -1
+  if (!state.sessionMessages[id]) state.sessionMessages[id] = []
+  const idx = state.sessionMessages[id].length
+  state.sessionMessages[id].push({ role: 'system', content: text } as any)
+  return idx
+}
+
+function removeMessage(sessionId: string, index: number) {
+  const msgs = state.sessionMessages[sessionId]
+  if (msgs && index >= 0 && index < msgs.length) {
+    msgs.splice(index, 1)
+  }
+}
+
+function pushAssistantMessage(sessionId: string, content: string) {
+  if (!state.sessionMessages[sessionId]) state.sessionMessages[sessionId] = []
+  state.sessionMessages[sessionId].push({ role: 'assistant', content, parts: [] })
 }
 
 async function send() {
