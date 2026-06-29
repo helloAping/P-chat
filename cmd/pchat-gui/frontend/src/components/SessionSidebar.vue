@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NCard, NTag, NPopconfirm, useMessage } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NCard, NTag, useMessage } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
-  loadProjects, setActiveProject, loadProviders,
+  loadProjects, setActiveProject,
 } from '../stores/chat'
 import * as api from '../api/client'
 import type { SelectOption } from 'naive-ui'
@@ -113,16 +113,6 @@ async function onRemoveProject(path: string) {
   }
 }
 
-async function onDeleteProvider(name: string) {
-  try {
-    await api.deleteProvider(name)
-    message.success(`已删除 ${name}`)
-    await loadProviders()
-  } catch (e: any) {
-    message.error(`删除失败: ${e.message}`)
-  }
-}
-
 function formatTime(t: number) {
   const d = new Date(t * 1000)
   const now = new Date()
@@ -179,31 +169,6 @@ onMounted(() => {
       />
       <NButton size="tiny" quaternary @click="showAddProject = true" title="添加项目目录" style="font-size:11px">+目录</NButton>
       <NButton v-if="state.activeProjectPath" size="tiny" quaternary @click="showConfirmDeleteProject = true" title="删除当前项目" style="color: var(--warn); font-size:11px">移除</NButton>
-    </div>
-    <div class="provider-bar" v-if="state.providers.length > 0">
-      <div class="provider-bar-title">供应商</div>
-      <div class="provider-list">
-        <div
-          v-for="p in state.providers"
-          :key="p.name"
-          class="provider-item"
-        >
-          <span class="provider-name">{{ p.name }}</span>
-          <NTag size="tiny" :bordered="false">{{ p.protocol }}</NTag>
-          <NPopconfirm
-            v-if="!p.is_default"
-            @positive-click="onDeleteProvider(p.name)"
-            positive-text="删除"
-            negative-text="取消"
-          >
-            <template #trigger>
-              <button class="icon-btn" title="删除供应商">✕</button>
-            </template>
-            确定删除 "{{ p.name }}" 及其下所有模型？
-          </NPopconfirm>
-          <NTag v-else size="tiny" :bordered="false" type="default">默认</NTag>
-        </div>
-      </div>
     </div>
     <NScrollbar style="flex: 1">
       <div class="session-list">
@@ -347,38 +312,6 @@ onMounted(() => {
   border-bottom: 1px solid var(--border);
 }
 .project-bar :deep(.n-base-select) { flex: 1; }
-.provider-bar {
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border);
-}
-.provider-bar-title {
-  font-size: 11px;
-  color: var(--text-4);
-  text-transform: uppercase;
-  margin-bottom: 4px;
-}
-.provider-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.provider-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  padding: 2px 4px;
-  border-radius: 3px;
-}
-.provider-item:hover {
-  background: var(--bg-3);
-}
-.provider-name {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .add-project-form {
   padding: 16px; min-width: 320px;
 }

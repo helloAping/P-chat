@@ -713,6 +713,17 @@ function fmtContext(n?: number) {
                 <div class="provider-item-head">
                   <NTag v-if="p.is_default" type="success" size="tiny" :bordered="false">默认</NTag>
                   <strong class="provider-item-name">{{ p.name }}</strong>
+                  <NPopconfirm
+                    v-if="!p.is_default"
+                    @positive-click="(e: Event) => { e.stopPropagation(); onDeleteProvider(p.name) }"
+                    positive-text="删除"
+                    negative-text="取消"
+                  >
+                    <template #trigger>
+                      <NButton size="tiny" quaternary type="error" @click.stop title="删除供应商" class="provider-del-btn">✕</NButton>
+                    </template>
+                    确定删除 "{{ p.name }}" 及其下所有模型？
+                  </NPopconfirm>
                 </div>
                 <div class="provider-item-sub">
                   <NTag size="tiny" :bordered="false">{{ p.protocol }}</NTag>
@@ -829,40 +840,30 @@ function fmtContext(n?: number) {
                     </NSpace>
                   </NSpace>
                 </div>
-                <table v-if="selected.models && selected.models.length" class="model-table">
-                  <thead>
-                    <tr>
-                      <th>模型</th>
-                      <th>显示名</th>
-                      <th>上下文</th>
-                      <th>输出上限</th>
-                      <th>能力</th>
-                      <th>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="m in selected.models" :key="m.name" :class="{ 'is-default': m.default }">
-                      <td>
-                        <code class="model-id">{{ m.name }}</code>
-                        <NTag v-if="m.default" type="success" size="tiny" :bordered="false" style="margin-left: 6px">默认</NTag>
-                      </td>
-                      <td>{{ m.display_name || '—' }}</td>
-                      <td><span class="muted">{{ fmtContext(m.max_tokens_context) }}</span></td>
-                      <td><span class="muted">{{ m.max_tokens_output || '—' }}</span></td>
-                      <td>
-                        <NTag v-if="m.capabilities?.supports_vision" type="info" size="tiny" :bordered="false">👁 视觉</NTag>
-                        <span v-else class="muted">—</span>
-                      </td>
-                      <td>
-                        <NSpace size="small">
-                          <NButton size="tiny" @click="onEditModel(m)">编辑</NButton>
-                          <NButton v-if="!m.default" size="tiny" @click="onSetDefaultModel(m.name)">设为默认</NButton>
-                          <NButton size="tiny" type="error" ghost @click="onDeleteModel(m.name)">删除</NButton>
-                        </NSpace>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
+                <div v-if="selected.models && selected.models.length" class="model-list">
+                  <div
+                    v-for="m in selected.models"
+                    :key="m.name"
+                    class="model-card"
+                    :class="{ 'is-default': m.default }"
+                  >
+                    <div class="model-card-top">
+                      <span class="model-card-name">{{ m.name }}</span>
+                      <NTag v-if="m.default" type="success" size="tiny" :bordered="false">默认</NTag>
+                      <NTag v-if="m.capabilities?.supports_vision" size="tiny" :bordered="false" type="info">视觉</NTag>
+                    </div>
+                    <div class="model-card-meta" v-if="m.display_name || m.max_tokens_context || m.max_tokens_output">
+                      <span v-if="m.display_name" class="model-meta-item">{{ m.display_name }}</span>
+                      <span v-if="m.max_tokens_context" class="model-meta-item">上下文 {{ fmtContext(m.max_tokens_context) }}</span>
+                      <span v-if="m.max_tokens_output" class="model-meta-item">输出 {{ m.max_tokens_output }}</span>
+                    </div>
+                    <div class="model-card-actions">
+                      <NButton size="tiny" quaternary @click="onEditModel(m)" title="编辑">✎</NButton>
+                      <NButton v-if="!m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认">★</NButton>
+                      <NButton size="tiny" quaternary type="error" @click="onDeleteModel(m.name)" title="删除">✕</NButton>
+                    </div>
+                  </div>
+                </div>
                 <div v-else class="muted empty-hint">还没有模型。点击「+ 添加模型」配置。</div>
               </div>
             </template>
@@ -1086,6 +1087,12 @@ function fmtContext(n?: number) {
   margin-bottom: 2px;
 }
 .provider-item-name { font-size: 13px; }
+.provider-del-btn {
+  opacity: 0;
+  margin-left: auto;
+  transition: opacity 0.15s;
+}
+.provider-item:hover .provider-del-btn { opacity: 1; }
 .provider-item-sub {
   display: flex; align-items: center; gap: 6px;
   font-size: 11px;
@@ -1119,27 +1126,56 @@ function fmtContext(n?: number) {
 }
 .form-hint { font-size: 11px; }
 
-/* Model table */
-.model-table {
-  width: 100%;
-  border-collapse: collapse;
+/* Model cards */
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.model-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-3);
+  border: 1px solid var(--border-2);
+  font-size: 12.5px;
+}
+.model-card.is-default {
+  border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 6%, var(--bg-3));
+}
+.model-card-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 140px;
+  flex-shrink: 0;
+}
+.model-card-name {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 12px;
+  font-weight: 500;
 }
-.model-table th {
-  text-align: left;
-  padding: 6px 8px;
-  font-weight: 600;
-  color: var(--text-2);
-  border-bottom: 1px solid var(--border-2);
-  background: var(--bg-2);
+.model-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  color: var(--text-3);
+  font-size: 11.5px;
 }
-.model-table td {
-  padding: 8px;
-  border-bottom: 1px solid var(--border-2);
-  vertical-align: middle;
+.model-meta-item {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.model-table tr.is-default {
-  background: var(--success-soft);
+.model-card-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
 }
 .model-id {
   background: var(--bg-3);
