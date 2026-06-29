@@ -38,7 +38,9 @@ pchat-server.exe
 
 ### 4. 运行桌面端 (Wails v2)
 
-```bash
+**Windows:**
+
+```powershell
 # 一次性打包出所有产物
 task package:gui
 
@@ -52,7 +54,29 @@ task install:gui
 task uninstall:gui
 ```
 
-桌面端架构：`pchat-gui.exe` 启动时拉起 `pchat-server.exe`（同目录子进程，端口随机），等后端就绪后 webview 自动跳转到 `http://127.0.0.1:<port>/app/index.html` —— 跟浏览器打开 `pchat web` 是同一份 `web/index.html`，所以功能 1:1 一致。关窗自动杀子进程。
+**Linux:**
+
+```bash
+# 打包（Wails GUI 必须在 Linux 上编译）
+task package:gui:linux
+# 或者：make package-linux
+
+# 安装到 ~/.local/bin/（含 .desktop 快捷方式）
+cd build/bin && ./install.sh
+
+# 系统级安装
+cd build/bin && sudo ./install.sh --prefix /usr/local
+
+# 便携模式（不安到系统目录）
+cd build/bin && ./install.sh --portable
+
+# 卸载
+~/.local/share/pchat/uninstall.sh
+# 同时删除 ~/.p-chat/ 数据
+~/.local/share/pchat/uninstall.sh --remove-data
+```
+
+桌面端架构：`pchat-gui` 启动时拉起 `pchat-server`（同目录子进程，端口随机），等后端就绪后 webview 自动跳转到 `http://127.0.0.1:<port>/app/index.html` —— 跟浏览器打开 `pchat web` 是同一份 `web/index.html`，所以功能 1:1 一致。关窗自动杀子进程。
 
 ### 5. 编译
 

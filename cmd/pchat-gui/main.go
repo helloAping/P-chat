@@ -87,7 +87,7 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
 <body>
 <div class="wrap">
 <h1>P-Chat</h1>
-<p><span id="msg">姝ｅ湪鍚姩鍚庣鏈嶅姟</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></p>
+<p><span id="msg">正在启动后端服务</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></p>
 </div>
 <script>
 (function(){
@@ -99,7 +99,7 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
   }
   function tick(){
     tries++;
-    if (tries > 300) { fail('鍚庣鏈嶅姟鍚姩瓒呮椂锛?0绉掞級锛岃鏌ョ湅 pchat-gui.log / pchat-server.log'); return; }
+    if (tries > 300) { fail('后端服务启动超时（60秒），请查看 pchat-gui.log / pchat-server.log'); return; }
     fetch('/api/v1/health', {cache:'no-store', credentials:'omit'})
       .then(function(r){
         // We only treat the backend as "ready" when we get a real JSON
@@ -120,7 +120,7 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
         throw new Error('not ready');
       })
       .catch(function(){
-        msg.textContent = '姝ｅ湪鍚姩鍚庣鏈嶅姟';
+        msg.textContent = '正在启动后端服务';
         setTimeout(tick, 200);
       });
   }

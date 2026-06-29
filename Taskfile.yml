@@ -55,6 +55,27 @@ tasks:
           GOTOOLCHAIN: auto
     silent: false
 
+  build:gui:linux:
+    desc: 编译 Linux 桌面端 (Wails v2)
+    deps: [build:frontend]
+    dir: cmd\pchat-gui
+    cmds:
+      - cmd: wails build -platform linux/amd64 -s
+        env:
+          GOPROXY: '{{.GOPROXY}}'
+          GOTOOLCHAIN: auto
+    silent: false
+
+  build:server:linux:
+    desc: 交叉编译 Linux Server 二进制
+    cmds:
+      - cmd: go build -o bin/pchat-server-linux ./cmd/pchat-server
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+    silent: false
+
   build:gui:npm:
     desc: 桌面端 — 仅刷新前端依赖（首次构建前需要）
     dir: cmd\pchat-gui\frontend
@@ -73,6 +94,16 @@ tasks:
       - task: build
       - task: build:gui
       - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-gui.ps1
+    silent: false
+
+  package:gui:linux:
+    desc: 打包 Linux 安装包到 build/bin/
+    cmds:
+      - task: build:frontend
+      - task: build:gui:linux
+      - powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -LiteralPath 'bin\pchat-server.exe' -Destination 'build\bin\pchat-server' -Force; if (-not (Test-Path 'build\bin\pchat-server')) { throw 'server binary not found' }"
+      - powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Path 'build\bin\web' -Force | Out-Null; Copy-Item -Path 'web\*' -Destination 'build\bin\web\' -Recurse -Force"
+      - powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -LiteralPath 'scripts\install-linux.sh' -Destination 'build\bin\install.sh' -Force; Copy-Item -LiteralPath 'scripts\uninstall-linux.sh' -Destination 'build\bin\uninstall.sh' -Force"
     silent: false
 
   cli:
@@ -99,10 +130,20 @@ tasks:
     cmds:
       - powershell -NoProfile -ExecutionPolicy Bypass -File cmd\pchat-gui\build\bin\install.ps1
 
+  install:gui:linux:
+    desc: 安装 Linux 桌面端到 ~/.local/
+    cmds:
+      - cmd: bash build/bin/install.sh
+
   uninstall:gui:
     desc: 卸载桌面端
     cmds:
       - powershell -NoProfile -ExecutionPolicy Bypass -File cmd\pchat-gui\build\bin\uninstall.ps1
+
+  uninstall:gui:linux:
+    desc: 卸载 Linux 桌面端
+    cmds:
+      - cmd: bash build/bin/uninstall.sh
 
   install:agents:
     desc: 建立 agent 工具符号链接 (.opencode/.codex/.claude → .agents/AGENTS.md)
