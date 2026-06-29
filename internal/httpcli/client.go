@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 )
 
 // Client talks to pchat-server over HTTP. All methods are safe for
@@ -36,12 +35,13 @@ type Client struct {
 }
 
 // NewClient builds a client targeting the given base URL (e.g.
-// "http://127.0.0.1:8960"). A 30s timeout covers the slowest SSE
-// stream (long LLM responses).
+// "http://127.0.0.1:8960"). No timeout is set on the HTTP client —
+// SSE streams for long agent runs can last minutes; the caller
+// controls cancellation via context.
 func NewClient(base string) *Client {
 	return &Client{
 		base: strings.TrimRight(base, "/"),
-		http: &http.Client{Timeout: 30 * time.Second},
+		http: &http.Client{Timeout: 0},
 	}
 }
 

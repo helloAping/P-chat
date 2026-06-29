@@ -734,6 +734,17 @@ type httpContext struct {
 	curSess string
 }
 
+// NewHTTPContext creates a cliContext backed by an httpcli.Client.
+// All operations go through the pchat-server REST API.
+func NewHTTPContext(c *httpcli.Client, style, provider, sessionID string) cliContext {
+	return &httpContext{
+		c:       c,
+		style:   style,
+		prov:    provider,
+		curSess: sessionID,
+	}
+}
+
 func (c *httpContext) unsupported(op string) error {
 	return &ErrUnsupported{Op: op}
 }

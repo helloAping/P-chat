@@ -1,26 +1,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"time"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
-	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/cli"
 	"github.com/p-chat/pchat/internal/config"
-	"github.com/p-chat/pchat/internal/knowledge"
-	"github.com/p-chat/pchat/internal/llm"
-	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/paths"
-	"github.com/p-chat/pchat/internal/recall"
-	"github.com/p-chat/pchat/internal/sandbox"
+	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
-	"github.com/p-chat/pchat/internal/subagent"
-	"github.com/p-chat/pchat/internal/tool"
 )
 
 var (
@@ -92,6 +88,13 @@ func runREPL(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("init directories: %w", err)
 	}
 
+	// Redirect log output to a debug file so raw LLM JSON chunks
+	// don't leak to the terminal during "思考中" (thinking).
+	if logFile, err := os.OpenFile(filepath.Join(paths.GlobalDir(), "server-debug.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600); err == nil {
+		log.SetOutput(logFile)
+	}
+
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -100,7 +103,6 @@ func runREPL(cmd *cobra.Command, args []string) error {
 	// Resolve style
 	s := style.Style(cfg.Style.Default)
 	if styleStr != "" {
-		var err error
 		s, err = style.ParseStyle(styleStr)
 		if err != nil {
 			return err
@@ -113,72 +115,93 @@ func runREPL(cmd *cobra.Command, args []string) error {
 		prov = provider
 	}
 
-	llmClient, err := llm.NewClient(&cfg.LLM)
+	// Start pchat-server as a child process. The CLI no longer runs
+	// the agent in-process — all chat goes through the server's SSE
+	// endpoint, sharing the same code path as the GUI.
+	bin, err := resolveServerBinary("")
 	if err != nil {
-		return fmt.Errorf("init LLM: %w", err)
+		return fmt.Errorf("pchat-server: %w", err)
 	}
+	webDir := resolveWebDir()
 
-	styleMgr, err := style.NewManager("")
+	dim := color.New(color.FgHiBlack)
+	dim.Printf("  pchat-server: %s\n", bin)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	srv, err := serverproc.Start(ctx, serverproc.Options{
+		ServerBin: bin,
+		Port:      0,
+		ConfigPath: cfgFile,
+		WebDir:    webDir,
+	})
 	if err != nil {
-		return fmt.Errorf("init style: %w", err)
+		return fmt.Errorf("start pchat-server: %w", err)
+	}
+	defer srv.Stop()
+
+	// Build HTTP client and context. All chat and session operations
+	// go through the server's REST API.
+	httpClient := httpcli.NewClient(srv.BaseURL)
+	if err := httpClient.Ping(context.Background()); err != nil {
+		return fmt.Errorf("server not ready: %w", err)
 	}
 
-	memStore, err := memory.Open(cfg.Memory.MaxHistory)
+	// Fetch providers so the client can answer ProviderModel().
+	providers, err := httpClient.ListProviders(context.Background())
 	if err != nil {
-		return fmt.Errorf("init memory: %w", err)
+		dim.Printf("  (warn: failed to list providers: %v)\n", err)
 	}
+	httpClient.SetCfgProviders(providers)
+	httpClient.SetCurrentProvider(prov)
 
-	toolReg := tool.NewRegistry()
-	tool.RegisterBuiltin(toolReg)
-
-	// Sub-agent runner for the `task` tool. Sub-agents spawned by `task`
-	// will get a tool registry that excludes `task` itself, so we can
-	// safely register it on the same registry.
-	cacheTTL := cfg.SubAgent.CacheTTLDuration()
-	if cacheTTL == 0 {
-		cacheTTL = 5 * time.Minute
-	}
-	subRunner := &subagent.Default{
-		Cfg:            cfg,
-		LLM:            llmClient,
-		StyleMgr:       styleMgr,
-		ParentTools:    toolReg,
-		ParentStyle:    s,
-		ParentProvider: prov,
-		Cache:          subagent.NewCache(cacheTTL),
-	}
-	taskTool, taskHandler := subRunner.Tool()
-	toolReg.Register(taskTool, taskHandler)
-
-	agt := agent.New(cfg, llmClient, styleMgr, memStore, toolReg)
-	agt.SetChatOptions(llm.OptionsFromConfig(cfg.LLM))
-
-	// Build the sandbox from config and attach to the agent so all
-	// tool calls go through it.
-	sbx, err := sandbox.New(cfg.Sandbox)
+	// Find or create a session for the REPL.
+	sessions, err := httpClient.ListSessions(context.Background())
 	if err != nil {
-		return fmt.Errorf("init sandbox: %w", err)
+		dim.Printf("  (warn: failed to list sessions: %v)\n", err)
 	}
-	agt.SetSandbox(sbx)
+	var curSess string
+	if len(sessions) > 0 {
+		curSess = sessions[len(sessions)-1].ID
+	} else {
+		newSess, err := httpClient.CreateSession(context.Background(), httpcli.CreateSessionOpts{
+			Style:    string(s),
+			Provider: prov,
+		})
+		if err != nil {
+			return fmt.Errorf("create session: %w", err)
+		}
+		curSess = newSess.ID
+	}
 
-	// Knowledge base + recall engine. Uses the local hash embedder by
-	// default; users can switch to OpenAI in the future.
-	embedder := knowledge.NewLocalHashEmbedder()
-	indexer := knowledge.NewIndexer(memStore.DB(), embedder)
-	retriever := knowledge.NewRetriever(memStore.DB(), embedder)
-	recallEngine := recall.New(memStore, retriever, embedder)
-	kbMgr := cli.NewKBManager(indexer, nil)
+	cliCtx := cli.NewHTTPContext(httpClient, string(s), prov, curSess)
+	repl := cli.NewREPL(cliCtx, cfg, s, prov)
 
-	// Register the recall tool on the parent's registry only. The
-	// sub-agent's `Run` already excludes it from its clone.
-	registerRecallTool(toolReg, recallEngine)
+	// Run REPL in a goroutine; listen for SIGINT in the main goroutine
+	// so we can cleanly stop the server on Ctrl+C.
+	replDone := make(chan error, 1)
+	go func() {
+		replDone <- repl.Run()
+		cancel()
+	}()
 
-	repl := cli.NewREPL(cfg, agt, llmClient, styleMgr, toolReg, s, prov)
-	repl.SetSubAgentCache(subRunner.Cache)
-	repl.SetStore(memStore)
-	repl.SetRecallEngine(recallEngine)
-	repl.SetKBManager(kbMgr)
-	return repl.Run()
+	select {
+	case err := <-replDone:
+		if err != nil {
+			dim.Printf("\n  REPL ended: %v\n", err)
+		}
+	case sig := <-sigCh:
+		dim.Printf("\n  收到信号 %v, 正在退出...\n", sig)
+		cancel()
+	}
+
+	srv.Stop()
+	return nil
 }
 
 func runInit(cmd *cobra.Command, args []string) error {

@@ -5,30 +5,41 @@ Agent-driven chat application (Go + Vue 3 + Vite + SQLite).
 ## Architecture
 
 ```
-                    ┌─────────────────┐
-                    │   ChatMessage   │ ← protocol-agnostic
-                    │ (llm package)   │   persist & internal
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              │              │              │
-       ┌──────▼──────┐ ┌─────▼──────┐      │
-       │ OpenAI      │ │ Anthropic  │      │
-       │ Adapter     │ │ Adapter    │      │
-       └──────┬──────┘ └─────┬──────┘      │
-              │              │              │
-        ┌─────▼──────┐ ┌─────▼──────┐      │
-        │ /chat/     │ │ /v1/       │      │
-        │ completions│ │ messages   │      │
-        └────────────┘ └────────────┘      │
-                                           │
-                              ┌────────────▼────────────┐
-                              │     memory.Store         │
-                              │  SQLite ~/.p-chat/store  │
-                              │  (columns: id, role,     │
-                              │   content, metadata)     │
-                              └─────────────────────────┘
+   ┌──────────┐       HTTP SSE        ┌──────────────┐
+   │ CLI REPL │ ────────────────────> │ pchat-server │
+   │ (ChatUI) │ <── SSE events ─────  │   (Gin)      │
+   └──────────┘                       └──────┬───────┘
+   ┌──────────┐                              │
+   │ Vue GUI  │ ──── HTTP SSE ───────────────┘
+   │ (browser)│
+   └──────────┘
+
+                     ┌─────────────────┐
+                     │   ChatMessage   │ ← protocol-agnostic
+                     │ (llm package)   │   persist & internal
+                     └────────┬────────┘
+                              │
+               ┌──────────────┼──────────────┐
+               │              │              │
+        ┌──────▼──────┐ ┌─────▼──────┐      │
+        │ OpenAI      │ │ Anthropic  │      │
+        │ Adapter     │ │ Adapter    │      │
+        └──────┬──────┘ └─────┬──────┘      │
+               │              │              │
+         ┌─────▼──────┐ ┌─────▼──────┐      │
+         │ /chat/     │ │ /v1/       │      │
+         │ completions│ │ messages   │      │
+         └────────────┘ └────────────┘      │
+                                            │
+                               ┌────────────▼────────────┐
+                               │     memory.Store         │
+                               │  SQLite ~/.p-chat/store  │
+                               │  (columns: id, role,     │
+                               │   content, metadata)     │
+                               └─────────────────────────┘
 ```
+
+**CLI and GUI now share the same code path**: both connect to pchat-server via HTTP SSE. The CLI no longer runs the agent in-process — it auto-starts pchat-server as a child process (via `serverproc.Start`) and sends messages through `POST /api/v1/sessions/:id/messages`. The `ChatUI` renders SSE events the same way it always did, just over HTTP instead of direct channel reads.
 
 ## Frontend architecture (Vue 3 + Vite)
 
@@ -135,7 +146,7 @@ Adapters skip agent-internal types (thinking, sub-agent messages).
 
 ```
 cmd/
-  pchat/          → CLI (Go REPL)
+  pchat/          → CLI (Go REPL, thin SSE client)
   pchat-server/   → HTTP server (Gin)
   pchat-gui/      → Vue 3 frontend + Wails v2
 
@@ -146,7 +157,7 @@ internal/
   memory/        → SQLite conversation store (chat history + metadata)
   server/        → Gin HTTP handlers (sessions, messages, uploads, providers, projects, skills, archive)
   tool/          → Tool registry (exec, read/write, sub-agent)
-  cli/           → REPL, commands, model handling
+  cli/           → REPL, commands, ChatUI terminal rendering, SSE event adapter
   subagent/      → Nested agent runner
   style/         → Personality style management
   agents/        → AGENTS.md instructions loader
@@ -154,7 +165,7 @@ internal/
   skill/         → .skills/ directory loader
   sandbox/       → Tool execution guards
   project/       → Project directory registry
-  httpcli/       → HTTP client for remote REPL
+  httpcli/       → HTTP client for CLI REPL (shared SSE path)
   paths/         → ~/.p-chat directory resolution
   knowledge/     → Knowledge retrieval
   recall/        → Memory recall augment
