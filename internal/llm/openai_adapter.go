@@ -98,7 +98,7 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 				content = fmt.Sprintf("error: %s\n工具 %s 执行失败。请分析错误原因后调整方案并重试；反复失败请告知用户。", msg.Content, msg.ToolName)
 			}
 			openaiMsgs = append(openaiMsgs, openai.ChatCompletionMessage{
-				Role:       openai.ChatMessageRoleTool,
+				Role:       openaiChatRole(msg.Role),
 				Content:    content,
 				ToolCallID: msg.ToolID,
 				Name:       msg.ToolName,
