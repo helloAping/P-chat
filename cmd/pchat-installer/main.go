@@ -152,7 +152,7 @@ func runInstall(tmp, target string) error {
 	ps1 := filepath.Join(tmp, "install.ps1")
 	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
 		"-File", ps1,
-		"-TargetDir", target,
+		"-InstallDir", target,
 		"-AddToPath",
 	)
 	cmd.Dir = tmp

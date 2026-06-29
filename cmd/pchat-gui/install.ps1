@@ -14,7 +14,8 @@
 param(
     [string] $InstallDir = "",
     [switch] $NoStartMenu,
-    [switch] $Portable
+    [switch] $Portable,
+    [switch] $AddToPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -87,6 +88,17 @@ if (-not $Portable) {
     Set-ItemProperty -LiteralPath $regPath -Name "NoModify"        -Value 1
     Set-ItemProperty -LiteralPath $regPath -Name "NoRepair"        -Value 1
     Write-Host "[install] registered uninstall entry: $regPath"
+}
+
+# --- PATH ----------------------------------------------------------------
+if ($AddToPath -and -not $Portable) {
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if ($userPath -notlike "*$target*") {
+        [Environment]::SetEnvironmentVariable("Path", "$userPath;$target", "User")
+        Write-Host "[install] added to user PATH: $target"
+    } else {
+        Write-Host "[install] PATH already contains: $target"
+    }
 }
 
 Write-Host "[install] done.  Launch: $target\pchat-gui.exe"
