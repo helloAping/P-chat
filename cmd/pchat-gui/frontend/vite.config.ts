@@ -1,6 +1,11 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
+import { readFileSync } from 'node:fs'
+
+const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../wails.json', import.meta.url)), 'utf-8'))
+const APP_VERSION = pkg.info?.productVersion || '0.1.0'
+const GITHUB_REPO = 'helloAping/P-chat'
 
 // Vite config for the P-Chat SPA. Output goes to the repo-root
 // `web/` directory so pchat-server (which embeds that directory
@@ -14,6 +19,10 @@ import { fileURLToPath, URL } from 'node:url'
 export default defineConfig({
   base: '/app/',
   plugins: [vue()],
+  define: {
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
+    __GITHUB_REPO__: JSON.stringify(GITHUB_REPO),
+  },
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

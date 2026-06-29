@@ -1,12 +1,17 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NCard, useMessage } from 'naive-ui'
+import { computed, ref, onMounted } from 'vue'
+import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NCard, NTag, useMessage } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
 } from '../stores/chat'
 import * as api from '../api/client'
 import type { SelectOption } from 'naive-ui'
+import { checkUpdate } from '../api/update'
+import type { UpdateInfo } from '../api/update'
+
+const APP_VERSION = __APP_VERSION__
+const GITHUB_REPO = __GITHUB_REPO__
 
 const emit = defineEmits<{ (e: 'open-settings'): void }>()
 
@@ -18,6 +23,8 @@ const newProjectName = ref('')
 const newProjectPath = ref('')
 const showConfirmDeleteProject = ref(false)
 const showConfirmDeleteSession = ref(false)
+const showAbout = ref(false)
+const updateInfo = ref<UpdateInfo | null>(null)
 const pendingDeleteSessionId = ref('')
 const sortedSessions = computed(() =>
   [...state.sessions].sort((a, b) => b.updated_at - a.updated_at),
@@ -122,6 +129,19 @@ function openSettings() {
 function toggleTheme() {
   themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
 }
+
+function openAbout() {
+  showAbout.value = true
+  checkUpdate().then(info => {
+    if (info) updateInfo.value = info
+  })
+}
+
+onMounted(() => {
+  checkUpdate().then(info => {
+    if (info) updateInfo.value = info
+  })
+})
 </script>
 
 <template>
@@ -129,6 +149,10 @@ function toggleTheme() {
     <div class="sidebar-header">
       <div class="logo">💬 P-Chat</div>
       <NSpace size="small">
+        <NButton size="small" quaternary @click="openAbout" title="关于我们" style="position:relative">
+          ℹ
+          <span v-if="updateInfo?.hasUpdate" class="update-dot"></span>
+        </NButton>
         <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'">
           {{ themeName === 'dark' ? '🌙' : '☀' }}
         </NButton>
@@ -211,6 +235,34 @@ function toggleTheme() {
         </div>
       </div>
     </NModal>
+
+    <!-- About modal -->
+    <NModal v-model:show="showAbout" preset="card" title="关于 P-Chat" style="width: 380px">
+      <div class="about-body">
+        <p class="about-name">P-Chat</p>
+        <p class="about-version">版本 v{{ APP_VERSION }}</p>
+        <p class="about-desc">对话式 AI Agent · CLI / HTTP / 桌面端三端同源</p>
+        <p class="about-desc">Go + Vue 3 + Vite + SQLite · Wails v2</p>
+        <p class="about-desc">OpenAI / Anthropic 双协议 · ReAct 工具调用循环</p>
+
+        <template v-if="updateInfo">
+          <div v-if="updateInfo.hasUpdate" class="update-banner">
+            <NTag type="warning" size="small">发现新版本</NTag>
+            <p><strong>{{ updateInfo.latest }}</strong> (当前 {{ APP_VERSION }})</p>
+            <p class="update-body" v-if="updateInfo.body">{{ updateInfo.body }}</p>
+            <NButton size="small" type="primary" tag="a" :href="updateInfo.url" target="_blank">前往下载</NButton>
+          </div>
+          <p v-else class="update-ok">当前已是最新版本 ({{ APP_VERSION }})</p>
+        </template>
+        <p v-else class="update-ok">正在检查更新…</p>
+
+        <div class="about-links">
+          <a :href="'https://github.com/' + GITHUB_REPO" target="_blank">GitHub</a>
+          <span class="sep">·</span>
+          <a :href="'https://github.com/' + GITHUB_REPO + '/issues'" target="_blank">反馈问题</a>
+        </div>
+      </div>
+    </NModal>
   </aside>
 </template>
 
@@ -279,4 +331,32 @@ function toggleTheme() {
   padding: 8px 10px;
   border-top: 1px solid var(--border);
 }
+.update-dot {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  background: var(--warn, #f0a020);
+  border-radius: 50%;
+  animation: pulse 1.2s infinite;
+}
+.about-body { padding: 4px 0; }
+.about-name { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+.about-version { font-size: 13px; color: var(--text-3); margin: 0 0 12px; }
+.about-desc { font-size: 13px; color: var(--text-2); margin: 0 0 4px; }
+.update-banner {
+  margin: 12px 0;
+  padding: 12px;
+  background: var(--warn-soft, rgba(240, 160, 32, 0.1));
+  border: 1px solid var(--warn, #f0a020);
+  border-radius: 6px;
+}
+.update-banner p { margin: 4px 0; font-size: 13px; }
+.update-body { color: var(--text-3); font-size: 12px !important; max-height: 120px; overflow: auto; white-space: pre-wrap; }
+.update-ok { font-size: 13px; color: var(--text-4); margin: 12px 0; }
+.about-links { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-2); font-size: 13px; }
+.about-links a { color: var(--accent); text-decoration: none; }
+.about-links a:hover { text-decoration: underline; }
+.about-links .sep { color: var(--text-4); margin: 0 6px; }
 </style>
