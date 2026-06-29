@@ -46,7 +46,7 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string }>,
+  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean }>,
   sessionTodos: {} as Record<string, TodoItem[]>,
   lightbox: { show: false, src: '', alt: '' },
   showSettings: false,
@@ -138,10 +138,11 @@ export async function switchSession(id: string) {
   const s = state.sessions.find(s => s.id === id)
   if (s) {
     state.sessionMeta[id] = {
-      style:   s.style || 'tech',
-      provider: s.provider || '',
-      model:   s.model || '',
-      title:   s.title || '',
+      style:     s.style || 'tech',
+      provider:  s.provider || '',
+      model:     s.model || '',
+      title:     s.title || '',
+      plan_mode: s.plan_mode || false,
     }
   }
   // Load per-session todos.

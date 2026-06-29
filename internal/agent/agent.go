@@ -550,10 +550,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Plan mode: tell the LLM to produce a step-by-step plan in
 		// pure text (no tool calls). The user will review the plan
 		// before actually executing it.
-		maxRounds := req.MaxRounds
-		if maxRounds <= 0 {
-			maxRounds = 50
-		}
+		maxRounds := 0 // 0 = unlimited; >0 = capped
 		if req.PlanMode {
 			toolDefs = nil
 			msgs[0].Content += "\n\n---\n\n## Plan Mode\n\n" +
@@ -567,17 +564,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			maxRounds = 1
 			ch <- ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (单轮纯文本，无工具调用)"}
 		} else {
-			ch <- ChatStreamChunk{Phase: "plan", Step: "plan", Message: fmt.Sprintf("规划: 最多 %d 轮 ReAct 循环", maxRounds)}
+			ch <- ChatStreamChunk{Phase: "plan", Step: "plan", Message: "构建模式 — LLM 自主决定何时终止"}
 		}
 
 		var totalIn, totalOut int
 
-		for round := 0; round < maxRounds; round++ {
+		for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
 			roundStart := time.Now()
-			roundNum := round + 1
+			roundNum := round
 			partsAcc = newPartsAccumulator()
 
-			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 调用 LLM", roundNum, maxRounds), Round: roundNum, MaxRound: maxRounds}
+			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds}
 
 			var (
 				fullContent  string
@@ -650,7 +647,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				toolCalls = append(toolCalls, *t)
 			}
 
-			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, maxRounds, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
+			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
 
 		if len(toolCalls) == 0 {
 			toolCalls = parseMarkdownToolCalls(fullContent)
@@ -912,7 +909,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			persistAssistant(a.store, assistantMsg, fullThinking, partsAcc)
 		}
 
-		ch <- ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。工具执行结果已保留，发送新消息可继续。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
+		if maxRounds > 0 {
+			ch <- ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
+		}
 		ch <- ChatStreamChunk{Done: true}
 	}()
 

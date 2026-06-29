@@ -42,6 +42,7 @@ type sessionMeta struct {
 	Model           string
 	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
 	ProjectPath     string // project root directory, "" = global
+	PlanMode        bool   // plan mode (no tools, single turn)
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -53,6 +54,7 @@ type sessionMetaBlob struct {
 	Model           string `json:"model,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	ProjectPath     string `json:"project_path,omitempty"`
+	PlanMode        bool   `json:"plan_mode,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager) *Handler {
@@ -100,7 +102,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	if h.store == nil {
 		return
 	}
-	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath})
+	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
 	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
 		// Non-fatal: in-memory map already updated, request still
 		// works for this session. The next setSessionMeta call
@@ -128,6 +130,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.Model = blob.Model
 				m.ReasoningEffort = blob.ReasoningEffort
 				m.ProjectPath = blob.ProjectPath
+				m.PlanMode = blob.PlanMode
 			}
 		}
 	}
@@ -179,7 +182,7 @@ func (h *Handler) setSessionMetaProjectPath(id, projectPath string) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 }
@@ -279,6 +282,7 @@ type SessionResponse struct {
 	Model       string `json:"model,omitempty"`
 	Style       string `json:"style,omitempty"`
 	ProjectPath string `json:"project_path,omitempty"`
+	PlanMode    bool   `json:"plan_mode,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 }
@@ -1176,6 +1180,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		SessionID:         id,
 		ProjectRoot:       meta.ProjectPath,
 		SkillContext:      req.SkillContext,
+		PlanMode:          meta.PlanMode,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -1326,6 +1331,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		Model:       model,
 		Style:       m.Style,
 		ProjectPath: m.ProjectPath,
+		PlanMode:    m.PlanMode,
 		CreatedAt:   cv.CreatedAt.Unix(),
 		UpdatedAt:   cv.UpdatedAt.Unix(),
 	}
@@ -1395,7 +1401,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})

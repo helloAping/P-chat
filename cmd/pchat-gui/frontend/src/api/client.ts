@@ -19,6 +19,7 @@ export interface Session {
   provider?: string
   model?: string
   project_path?: string
+  plan_mode?: boolean
 }
 
 export interface Attachment {
@@ -136,6 +137,7 @@ export interface SessionMeta {
   provider: string
   model: string
   project_path?: string
+  plan_mode?: boolean
   created_at: number
   updated_at: number
 }
@@ -204,7 +206,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; provider: string; model: string; title: string }>,
+  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',

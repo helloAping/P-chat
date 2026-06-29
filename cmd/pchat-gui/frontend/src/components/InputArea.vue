@@ -67,6 +67,23 @@ async function onChangeReasoningEffort(val: string) {
   }
 }
 
+const planMode = computed(() => {
+  if (!state.currentID) return false
+  return state.sessionMeta[state.currentID]?.plan_mode || false
+})
+
+async function togglePlanMode() {
+  if (!state.currentID) return
+  const next = !planMode.value
+  try {
+    await api.updateSessionMeta(state.currentID, { plan_mode: next })
+    state.sessionMeta[state.currentID] = {
+      ...state.sessionMeta[state.currentID],
+      plan_mode: next,
+    }
+  } catch {}
+}
+
 // CmdSpec is imported from CommandPalette.vue
 
 const commandList = ref<CmdSpec[]>([])
@@ -748,6 +765,14 @@ onMounted(() => {
           placeholder="推理"
           @update:value="onChangeReasoningEffort"
         />
+        <NButton
+          size="small"
+          :type="planMode ? 'primary' : 'default'"
+          :disabled="!state.currentID"
+          @click="togglePlanMode"
+          title="切换计划/构建模式"
+          style="font-size:11px"
+        >{{ planMode ? '📋 计划' : '🔨 构建' }}</NButton>
       </div>
       <div class="hints">
         <span><kbd>Enter</kbd> 发送</span>

@@ -108,6 +108,42 @@ API: `GET/POST/DELETE /api/v1/projects`, sessions filter by `?project_path=`.
 
 All `NModal` instances **must** use `preset="card"` — plain `NModal` has a transparent backdrop that is invisible against the theme background. Card preset provides the proper `var(--bg-2)` / `var(--border)` themed rendering.
 
+## Agent loop
+
+The agent runs a ReAct-style tool-use loop (`internal/agent/agent.go` `ChatWithTools`):
+
+```go
+// Infinite loop — the LLM decides when to terminate:
+//   - len(toolCalls) == 0 → natural completion
+//   - context >120 meaningful messages → auto-stop with suggestion
+//   - user cancels (ctx.Err() != nil) → abort
+for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
+    // 1. Call LLM (streaming)
+    // 2. Parse tool calls from response (native or markdown)
+    // 3. Clean markdown tool_call blocks from text content
+    // 4. If no tool calls → done, return
+    // 5. Execute tools (parallel for same-round calls)
+    // 6. Append tool results to context for next round
+    // 7. Convert tool results to User role (DeepSeek compat)
+    // 8. persistAssistant() snapshots parts AFTER tool execution
+}
+```
+
+### Loop exit conditions
+
+| Condition | Phase | Behavior |
+|-----------|-------|----------|
+| `len(toolCalls) == 0` | `done` | LLM finished naturally |
+| `meaningful > 80` | `context_warn` | Warning only |
+| `meaningful > 120` | `context_warn` | Auto-stop, suggest /compress |
+| `ctx.Err() != nil` | (error path) | User cancelled |
+
+### Plan Mode
+
+Per-session toggle (`🔨 构建` / `📋 计划`) stored in session metadata as `plan_mode`.
+When enabled: `toolDefs = nil` (no tools), `maxRounds = 1` (single turn).
+The LLM produces a step-by-step plan in plain text for user review.
+
 ## Build commands
 
 ```powershell
