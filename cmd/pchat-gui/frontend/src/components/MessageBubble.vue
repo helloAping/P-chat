@@ -5,32 +5,29 @@
 // rendered by a dedicated sub-component. User / system
 // messages still go through the markdown pipeline.
 //
-// Loading indicator: while the assistant is streaming
-// and no parts have arrived yet, the bubble shows a
-// single blinking caret (▍) — the typewriter cursor.
-// This is the *same* component (`TypedText`) that
-// renders the streaming text; it just happens to be
-// mounted with empty text. When the first SSE content
-// chunk arrives, the placeholder is replaced by a
-// real `TypedText` instance that animates the text
-// in. There is no separate "loading dots" component
-// in this path — the typewriter cursor *is* the
-// loading indicator, and it transitions seamlessly
-// into the typewriter animation.
+// Streaming model: the chat UI doesn't run its own
+// typewriter animation. The "typewriter" effect is
+// the natural SSE stream itself — the LLM emits
+// content chunk by chunk over the network, the chat
+// store appends each chunk to the trailing text part,
+// and the DOM re-renders on each tick. The user sees
+// the text grow in real time, exactly like ChatGPT.
 //
-// Animation lifecycle:
-//   - For each text/thinking part, the typewriter
-//     component (`TypedText` / `ThinkingBlock`) animates
-//     from empty to the full text and emits `done`.
-//   - The bubble keeps using the animated component
-//     for that part until `done` arrives. We do NOT
-//     switch to the static markdown render based on
-//     the `streaming` flag — the LLM may have finished
-//     emitting in 200ms, but the user still needs to
-//     actually see the text appear.
-//   - History messages (no streaming, parts already
-//     complete) are marked as done up-front on mount.
-import { computed, reactive, onMounted } from 'vue'
+// Concretely:
+//   - `TypedText` is a thin wrapper around
+//     `marked.parse()` plus a blinking `::after` caret.
+//     It renders the text verbatim and updates the
+//     DOM as `props.text` grows. No rAF loop, no
+//     artificial delay.
+//   - The caret is shown only on the *trailing* text
+//     part of an actively-streaming message. Earlier
+//     text parts (e.g. before a tool call) and post-
+//     stream text use the static markdown render.
+//   - The placeholder `TypedText` (empty text) is
+//     shown before the first SSE event arrives, so
+//     the user sees a blinking caret alone in the
+//     bubble as soon as they hit send.
+import { computed } from 'vue'
 import { marked } from 'marked'
 import type { Message, MessagePart } from '../api/client'
 import { state } from '../stores/chat'
@@ -41,44 +38,38 @@ import TypedText from './TypedText.vue'
 
 const props = defineProps<{ message: Message; streaming?: boolean }>()
 
-// completedParts tracks the indices in `message.parts`
-// whose typewriter animation has finished. A plain
-// reactive object is used (rather than a reactive Set)
-// because plain-object property access has the most
-// predictable reactivity semantics across Vue 3's
-// compiler — the template's `isAnimating` call reads
-// `completedParts[idx]`, which is tracked directly.
-// Only text / thinking parts go in here; tool /
-// sub_agent parts are always rendered statically.
-const completedParts = reactive<Record<number, boolean>>({})
-
-function onPartDone(idx: number) {
-  completedParts[idx] = true
-}
-
-function isAnimating(idx: number, kind: string): boolean {
-  if (kind !== 'text' && kind !== 'thinking') return false
-  return !completedParts[idx]
-}
-
-// History messages (loaded from the server, not from
-// an active stream) already have their full text — no
-// typewriter needed. Mark all of their text/thinking
-// parts as complete up-front so the static render
-// takes over immediately. For an in-flight message
-// (`streaming=true`), we leave the parts un-marked so
-// the animation can run.
-onMounted(() => {
-  if (props.streaming) return
-  const parts = props.message.parts
-  if (!parts) return
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i]
-    if (p.kind === 'text' || p.kind === 'thinking') {
-      completedParts[i] = true
-    }
+// isLiveTextPart returns true for the trailing text
+// part of an actively-streaming message. This is the
+// one part that should render through `TypedText`
+// (so the caret is visible). All other text parts
+// (earlier in the same turn, or after streaming has
+// ended) use the static markdown render.
+function isLiveTextPart(idx: number, kind: string, parts: MessagePart[] | undefined): boolean {
+  if (kind !== 'text') return false
+  if (!props.streaming) return false
+  if (!parts || parts.length === 0) return false
+  // Find the last text part in the array.
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i].kind === 'text') return i === idx
   }
-})
+  return false
+}
+
+// isLiveThinkingPart mirrors isLiveTextPart for the
+// thinking trace. While streaming, the trailing
+// thinking part (if any) renders through
+// `ThinkingBlock` with its shimmer effect; once
+// streaming ends, it falls back to the collapsed
+// static view.
+function isLiveThinkingPart(idx: number, kind: string, parts: MessagePart[] | undefined): boolean {
+  if (kind !== 'thinking') return false
+  if (!props.streaming) return false
+  if (!parts || parts.length === 0) return false
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i].kind === 'thinking') return i === idx
+  }
+  return false
+}
 
 // The role check is unchanged: tool messages are not
 // rendered as bubbles; they live inside the assistant
@@ -119,41 +110,18 @@ function shortWarnText(t?: string): string {
   return `${name} · model does not support image input`
 }
 
-// lastTextPartIndex returns the index in `parts` of the
-// trailing text part, or -1 if there isn't one. The
-// bubble uses this to decide which text part should
-// run the typewriter animation: only the last one,
-// since earlier text parts are no longer growing.
-function lastTextPartIndex(parts: MessagePart[] | undefined): number {
-  if (!parts) return -1
-  for (let i = parts.length - 1; i >= 0; i--) {
-    if (parts[i].kind === 'text') return i
-  }
-  return -1
-}
-const lastTextIdx = computed(() =>
-  props.message.role === 'assistant'
-    ? lastTextPartIndex(props.message.parts)
-    : -1,
-)
-
-// showTypewriterPlaceholder is the "ready to receive SSE"
-// indicator: a blinking caret (`▍`) sitting alone in
-// the bubble while the assistant message has no parts
-// yet. It replaces the old three-bouncing-dots loader —
-// the typewriter cursor *is* the loader, and it
-// transitions seamlessly into the typewriter animation
-// the moment the first content chunk arrives.
+// showTypewriterPlaceholder is the "ready to receive
+// SSE" indicator: a blinking caret (`▍`) sitting alone
+// in the bubble while the assistant message has no
+// parts yet. It replaces the old three-bouncing-dots
+// loader — the typewriter cursor *is* the loader, and
+// the natural SSE stream takes over the moment the
+// first content chunk arrives.
 const showTypewriterPlaceholder = computed(() => {
   if (props.streaming !== true) return false
   if (props.message.role !== 'assistant') return false
   const parts = props.message.parts
   if (!parts || parts.length === 0) return true
-  // Even if the parts array is non-empty, we still want
-  // the placeholder if every entry is non-rendering
-  // (defensive — shouldn't happen today, but keeps the
-  // bubble from going blank between the placeholder and
-  // the first real part).
   return !parts.some(p =>
     p.kind === 'text' || p.kind === 'thinking' ||
     p.kind === 'tool' || p.kind === 'sub_agent',
@@ -240,12 +208,14 @@ const showVisionWarn = computed(() =>
              Falls back to markdown of `content` for
              messages loaded from history (no parts
              were persisted server-side).
-             Each text / thinking part keeps its
-             typewriter render until the animation
-             itself emits `done` — `streaming` flipping
-             off does NOT switch us to a static render,
-             because the LLM may have finished emitting
-             before the user could see the animation. -->
+             The trailing text/thinking part of an
+             actively-streaming message renders through
+             `TypedText` / `ThinkingBlock` (with the
+             blinking caret on the text part) so the
+             user sees the SSE stream arrive in real
+             time. All other parts — earlier text in
+             the same turn, post-stream text, tools,
+             sub-agents — render statically. -->
         <template v-if="message.role === 'assistant'">
           <!-- Live status bar during streaming -->
           <div v-if="statusLines.length" class="stream-status">
@@ -254,18 +224,28 @@ const showVisionWarn = computed(() =>
           <template v-if="message.parts && message.parts.length">
             <template v-for="(p, i) in message.parts" :key="i">
               <ThinkingBlock
-                v-if="p.kind === 'thinking'"
+                v-if="p.kind === 'thinking' && isLiveThinkingPart(i, p.kind, message.parts)"
                 :part="p"
-                :default-open="isAnimating(i, p.kind)"
-                @done="onPartDone(i)"
+                :default-open="true"
               />
+              <details
+                v-else-if="p.kind === 'thinking'"
+                class="thinking-block"
+                :class="{ streaming: p.streaming }"
+              >
+                <summary>
+                  <span class="caret">▸</span>
+                  <span class="label">思考过程</span>
+                  <span class="meta" v-if="p.text">{{ p.text.length }} 字</span>
+                </summary>
+                <pre class="thinking-body">{{ p.text }}</pre>
+              </details>
               <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
               <SubAgentCard v-else-if="p.kind === 'sub_agent'" :part="p" />
               <TypedText
-                v-else-if="p.kind === 'text' && isAnimating(i, p.kind)"
+                v-else-if="p.kind === 'text' && isLiveTextPart(i, p.kind, message.parts)"
                 :text="p.text || ''"
                 :active="true"
-                @done="onPartDone(i)"
               />
               <div
                 v-else-if="p.kind === 'text'"
@@ -277,13 +257,11 @@ const showVisionWarn = computed(() =>
           <template v-else-if="message.content">
             <div class="md-body" v-html="userHtml"></div>
           </template>
-          <!-- Typewriter placeholder: a blinking caret
+          <!-- Streaming placeholder: a blinking caret
                alone in the bubble, ready to receive the
-               first SSE content chunk. This replaces the
-               three-bouncing-dots loader; the typewriter
-               cursor *is* the loading indicator, and it
-               transitions seamlessly into the typewriter
-               animation when the first part arrives. -->
+               first SSE content chunk. Visible only
+               while streaming and the message has no
+               renderable parts yet. -->
           <TypedText
             v-else-if="showTypewriterPlaceholder"
             :text="''"
