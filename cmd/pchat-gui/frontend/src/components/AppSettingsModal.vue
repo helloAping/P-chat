@@ -736,18 +736,6 @@ function fmtContext(n?: number) {
                       保存
                     </NButton>
                     <NButton size="small" @click="hydrateEditForm(selected.name)" :disabled="dirty.size === 0">重置</NButton>
-                    <NPopconfirm
-                      v-if="!selected.is_default"
-                      @positive-click="onDeleteProvider(selected.name)"
-                      positive-text="删除"
-                      negative-text="取消"
-                    >
-                      <template #trigger>
-                        <NButton size="small" type="error" ghost>删除 provider</NButton>
-                      </template>
-                      确定删除 provider "{{ selected.name }}" 及其下所有模型？
-                    </NPopconfirm>
-                    <NTag v-else size="small" :bordered="false" type="default">默认 provider 不可删除</NTag>
                   </NSpace>
                 </div>
                 <div class="detail-form">
