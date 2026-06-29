@@ -1,47 +1,115 @@
 <script setup lang="ts">
+// ThinkingBlock renders a `<details>` block for the
+// thinking trace of an assistant turn. While the part is
+// streaming, the body fills up character-by-character
+// (typewriter). The animation continues until the full
+// text has been revealed; we do NOT snap to the full
+// text when `part.streaming` flips false — the parent
+// will swap to a static render when the `done` event
+// fires.
+//
+// Why the animation is independent of `streaming`:
+// the LLM may finish emitting in 200ms; the user needs
+// to actually see the text appear, not jump from
+// "loading dots" to "fully-rendered text".
+
 import { computed, ref, watch, onUnmounted } from 'vue'
 import type { ThinkingPart } from '../api/client'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   part: ThinkingPart
   defaultOpen?: boolean
-}>()
+  minDuration?: number
+  maxDuration?: number
+}>(), {
+  minDuration: 400,
+  maxDuration: 2500,
+})
+
+const emit = defineEmits<{ (e: 'done'): void }>()
 
 const open = ref(!!props.defaultOpen)
 
-// Typewriter animation for thinking text while streaming.
-const displayed = ref(props.part.streaming ? '' : (props.part.text || ''))
+// graphemes split by code point / grapheme cluster, so
+// CJK characters never get sliced mid-character.
+const graphemes = computed(() => splitGraphemes(props.part.text || ''))
+const total = computed(() => graphemes.value.length)
+
+const displayedIdx = ref(props.part.streaming ? 0 : total.value)
+const displayed = computed(() =>
+  graphemes.value.slice(0, displayedIdx.value).join(''),
+)
+
 let raf = 0
 let lastT = 0
 let carry = 0
+let doneEmitted = false
+
+const effectiveSpeed = computed(() => {
+  const len = total.value
+  if (len === 0) return 120
+  const baseSpeed = 120 // chars/sec for thinking (a bit faster than prose)
+  const minLen = (props.minDuration / 1000) * baseSpeed
+  const maxLen = (props.maxDuration / 1000) * baseSpeed
+  if (len <= minLen) return baseSpeed
+  if (len >= maxLen) return len / (props.maxDuration / 1000)
+  return baseSpeed
+})
 
 function step(t: number) {
-  if (!props.part.streaming) {
-    displayed.value = props.part.text || ''
+  if (displayedIdx.value >= total.value) {
     raf = 0
-    return
-  }
-  const full = props.part.text || ''
-  if (displayed.value.length >= full.length) {
-    raf = 0
+    if (!doneEmitted && total.value > 0) {
+      doneEmitted = true
+      emit('done')
+    }
     return
   }
   const dt = lastT ? t - lastT : 0
   lastT = t
-  carry += (dt / 1000) * 120 // chars/sec for thinking
+  carry += (dt / 1000) * effectiveSpeed.value
   const n = Math.floor(carry)
   if (n > 0) {
-    displayed.value = full.slice(0, displayed.value.length + n)
+    displayedIdx.value = Math.min(total.value, displayedIdx.value + n)
     carry -= n
+  }
+  if (displayedIdx.value >= total.value) {
+    raf = 0
+    if (!doneEmitted) {
+      doneEmitted = true
+      emit('done')
+    }
+    return
   }
   raf = requestAnimationFrame(step)
 }
 
+let safetyTimer = 0
+
 function startAnim() {
   if (raf) return
+  if (displayedIdx.value >= total.value) {
+    if (!doneEmitted && total.value > 0) {
+      doneEmitted = true
+      emit('done')
+    }
+    return
+  }
   lastT = 0
   carry = 0
   raf = requestAnimationFrame(step)
+  if (safetyTimer) clearTimeout(safetyTimer)
+  safetyTimer = window.setTimeout(() => {
+    if (doneEmitted) return
+    if (displayedIdx.value < total.value) {
+      displayedIdx.value = total.value
+    }
+    if (raf) { cancelAnimationFrame(raf); raf = 0 }
+    if (!doneEmitted && total.value > 0) {
+      doneEmitted = true
+      emit('done')
+    }
+  }, props.maxDuration + 1000)
 }
 
 function stopAnim() {
@@ -49,22 +117,43 @@ function stopAnim() {
     cancelAnimationFrame(raf)
     raf = 0
   }
+  if (safetyTimer) {
+    clearTimeout(safetyTimer)
+    safetyTimer = 0
+  }
 }
 
-watch(() => props.part.text, () => {
-  if (props.part.streaming) {
-    startAnim()
-  } else {
-    displayed.value = props.part.text || ''
+watch(total, (next) => {
+  if (next === 0) {
+    displayedIdx.value = 0
+    doneEmitted = false
+    stopAnim()
+    return
   }
-})
+  if (displayedIdx.value > next) {
+    displayedIdx.value = next
+  }
+  if (doneEmitted && displayedIdx.value < next) {
+    doneEmitted = false
+  }
+  // Always start the animation when the text grows —
+  // don't gate it on `part.streaming`, because the
+  // animation is independent of the streaming flag
+  // (it plays out to the full text regardless).
+  startAnim()
+}, { immediate: true })
 
 watch(() => props.part.streaming, (v) => {
-  if (!v) {
-    displayed.value = props.part.text || ''
-    stopAnim()
-  }
-})
+  // streaming=false is NOT a stop signal — let the
+  // animation play out to the end. streaming=true
+  // just kicks the loop in.
+  if (v) startAnim()
+}, { immediate: true })
+
+// Initial kick: same belt-and-braces as TypedText.
+if (displayedIdx.value < total.value && !raf) {
+  startAnim()
+}
 
 onUnmounted(stopAnim)
 
@@ -75,6 +164,14 @@ const html = computed(() => {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
 })
+
+function splitGraphemes(s: string): string[] {
+  if (typeof Intl !== 'undefined' && (Intl as any).Segmenter) {
+    const seg = new (Intl as any).Segmenter(undefined, { granularity: 'grapheme' })
+    return Array.from(seg.segment(s), (x: any) => x.segment)
+  }
+  return Array.from(s)
+}
 </script>
 
 <template>

@@ -8,7 +8,20 @@
 // Loading: while the assistant is streaming and no
 // content has arrived yet, the bubble shows three
 // bouncing dots (iMessage-style).
-import { computed } from 'vue'
+//
+// Animation lifecycle:
+//   - For each text/thinking part, the typewriter
+//     component (`TypedText` / `ThinkingBlock`) animates
+//     from empty to the full text and emits `done`.
+//   - The bubble keeps using the animated component
+//     for that part until `done` arrives. We do NOT
+//     switch to the static markdown render based on
+//     the `streaming` flag — the LLM may have finished
+//     emitting in 200ms, but the user still needs to
+//     actually see the text appear.
+//   - History messages (no streaming, parts already
+//     complete) are marked as done up-front on mount.
+import { computed, reactive, onMounted } from 'vue'
 import { marked } from 'marked'
 import type { Message, MessagePart } from '../api/client'
 import { state } from '../stores/chat'
@@ -19,6 +32,45 @@ import LoadingDots from './LoadingDots.vue'
 import TypedText from './TypedText.vue'
 
 const props = defineProps<{ message: Message; streaming?: boolean }>()
+
+// completedParts tracks the indices in `message.parts`
+// whose typewriter animation has finished. A plain
+// reactive object is used (rather than a reactive Set)
+// because plain-object property access has the most
+// predictable reactivity semantics across Vue 3's
+// compiler — the template's `isAnimating` call reads
+// `completedParts[idx]`, which is tracked directly.
+// Only text / thinking parts go in here; tool /
+// sub_agent parts are always rendered statically.
+const completedParts = reactive<Record<number, boolean>>({})
+
+function onPartDone(idx: number) {
+  completedParts[idx] = true
+}
+
+function isAnimating(idx: number, kind: string): boolean {
+  if (kind !== 'text' && kind !== 'thinking') return false
+  return !completedParts[idx]
+}
+
+// History messages (loaded from the server, not from
+// an active stream) already have their full text — no
+// typewriter needed. Mark all of their text/thinking
+// parts as complete up-front so the static render
+// takes over immediately. For an in-flight message
+// (`streaming=true`), we leave the parts un-marked so
+// the animation can run.
+onMounted(() => {
+  if (props.streaming) return
+  const parts = props.message.parts
+  if (!parts) return
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i]
+    if (p.kind === 'text' || p.kind === 'thinking') {
+      completedParts[i] = true
+    }
+  }
+})
 
 // The role check is unchanged: tool messages are not
 // rendered as bubbles; they live inside the assistant
@@ -168,10 +220,12 @@ const showVisionWarn = computed(() =>
              Falls back to markdown of `content` for
              messages loaded from history (no parts
              were persisted server-side).
-             The last text part runs the typewriter
-             animation while the bubble is streaming —
-             earlier text parts and the post-stream view
-             are rendered without animation. -->
+             Each text / thinking part keeps its
+             typewriter render until the animation
+             itself emits `done` — `streaming` flipping
+             off does NOT switch us to a static render,
+             because the LLM may have finished emitting
+             before the user could see the animation. -->
         <template v-if="message.role === 'assistant'">
           <!-- Live status bar during streaming -->
           <div v-if="statusLines.length" class="stream-status">
@@ -182,14 +236,16 @@ const showVisionWarn = computed(() =>
               <ThinkingBlock
                 v-if="p.kind === 'thinking'"
                 :part="p"
-                :default-open="streaming && p.kind === 'thinking' && p.streaming && i === message.parts.length - 1"
+                :default-open="isAnimating(i, p.kind)"
+                @done="onPartDone(i)"
               />
               <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
               <SubAgentCard v-else-if="p.kind === 'sub_agent'" :part="p" />
               <TypedText
-                v-else-if="p.kind === 'text' && streaming"
+                v-else-if="p.kind === 'text' && isAnimating(i, p.kind)"
                 :text="p.text || ''"
                 :active="true"
+                @done="onPartDone(i)"
               />
               <div
                 v-else-if="p.kind === 'text'"
