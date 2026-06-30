@@ -153,6 +153,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, port)
 	fmt.Printf("P-Chat Server 启动于 http://%s\n", addr)
+	log.Printf("pchat-server version=dev-20260630 question-tracing=enabled")
 	return srv.RunAt(addr)
 }
 

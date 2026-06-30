@@ -18,16 +18,17 @@ tasks:
       # in parallel by default, so the sync can race ahead of
       # clean-frontend-output.ps1 and copy an empty tree.
       - powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\..\scripts\sync-web.ps1"
-    sources:
-      - package.json
-      - package-lock.json
-      - vite.config.ts
-      - tsconfig.json
-      - index.html
-      - src/**/*
-    generates:
-      - ../../../web/index.html
-      - ../../../web/assets/**
+    # Intentionally no `sources:` / `generates:` — we always
+    # rebuild. The user's complaint was that the SPA shipped
+    # stale assets because the file-mtime check missed a
+    # change (e.g. edits in `node_modules`-adjacent files, or
+    # build-generated config that we don't list). Forcing a
+    # full rebuild on every `build:all` / `build:dev` adds
+    # ~10-15s but guarantees the binary embeds the same code
+    # the dev server shows. The clean-frontend-output wipe at
+    # the top of this task is the other half of the safety
+    # net — without it, content-hashed Vite assets from a
+    # previous build pile up in the embed and grow the binary.
     silent: false
 
   sync:web:
@@ -84,12 +85,12 @@ tasks:
       - npm install
 
   build:setup:
-    desc: 构建单文件安装器 bin/pchat-setup.exe（依赖 build + build:gui）
+    desc: 构建单文件安装器 bin/pchat-setup-v{version}.exe（依赖 build + build:gui）
     deps: [build, build:gui]
     cmds:
       - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
     generates:
-      - bin/pchat-setup.exe
+      - bin/pchat-setup-v*.exe
     silent: false
 
   build:all:
@@ -135,6 +136,27 @@ tasks:
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
+
+  build:dev:
+    desc: 快速编译并启动 GUI 测试环境（绕过 wails dev，前端内嵌到 pchat-server）
+    deps: [build:frontend]
+    cmds:
+      - powershell -NoProfile -Command "New-Item -ItemType Directory -Path dev-bin -Force | Out-Null"
+      - go build -o dev-bin/pchat-server.exe ./cmd/pchat-server
+      - go build -o dev-bin/pchat.exe ./cmd/pchat
+      - task: build:dev:gui
+      - powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name 'pchat-gui' -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name 'pchat-server' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 500"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\dev-bin\pchat-gui.exe'"
+
+  build:dev:gui:
+    internal: true
+    dir: cmd\pchat-gui
+    cmds:
+      - cmd: wails build -debug -s
+        env:
+          GOPROXY: '{{.GOPROXY}}'
+          GOTOOLCHAIN: auto
+      - cmd: powershell -NoProfile -Command "Copy-Item -LiteralPath 'build\bin\pchat-gui.exe' -Destination '..\..\dev-bin\pchat-gui.exe' -Force"
 
   install:gui:
     desc: 安装桌面端到 %LOCALAPPDATA%\Programs\P-Chat\
@@ -206,5 +228,6 @@ tasks:
     desc: 清理编译产物
     cmds:
       - Remove-Item -Recurse -Force bin -ErrorAction SilentlyContinue
+      - Remove-Item -Recurse -Force dev-bin -ErrorAction SilentlyContinue
       - Remove-Item -Recurse -Force cmd\pchat-gui\build\bin -ErrorAction SilentlyContinue
       - Remove-Item -Recurse -Force web\assets -ErrorAction SilentlyContinue
