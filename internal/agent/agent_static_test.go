@@ -89,6 +89,9 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	cfgEn := &config.Config{
 		LLM: config.LLMConfig{Output: config.OutputConfig{Language: "en"}},
 	}
+	cfgAuto := &config.Config{
+		LLM: config.LLMConfig{Output: config.OutputConfig{Language: "auto"}},
+	}
 
 	llmClient, _ := llm.NewClient(&config.LLMConfig{Default: "ollama", Providers: []config.ProviderConfig{
 		{Name: "ollama", Protocol: "openai", BaseURL: "http://localhost", Model: "x"},
@@ -111,6 +114,122 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	if !contains(pEn, "English") {
 		t.Error("English language hint missing")
 	}
+
+	// The "auto" / empty language must produce the opencode-
+	// style fallback: "Respond in the same language as the
+	// conversation." This is the default behaviour — we don't
+	// want every prompt to hardcode a language.
+	store3, _ := memory.OpenAt(":memory:", 50)
+	defer store3.Close()
+	a3 := New(cfgAuto, llmClient, styleMgr, store3, tools)
+	pAuto, _, _ := a3.buildStaticSystemPrompt(style.Tech, nil, "")
+	if !contains(pAuto, "same language as the conversation") {
+		t.Error("opencode-style language hint missing for auto mode")
+	}
+}
+
+// TestBuildStaticSystemPrompt_NoFabricatedErrorInstruction
+// covers the regression: the old "Uploaded Attachments"
+// section literally primed the LLM with the string
+// "ERROR: ... Inform the user" by name, which is what made
+// the model echo that exact phrasing back to users. The new
+// section is positive and language-neutral; verify it does
+// NOT mention the forbidden phrase.
+func TestBuildStaticSystemPrompt_NoFabricatedErrorInstruction(t *testing.T) {
+	cfg := &config.Config{}
+	llmClient, _ := llm.NewClient(&config.LLMConfig{Default: "ollama", Providers: []config.ProviderConfig{
+		{Name: "ollama", Protocol: "openai", BaseURL: "http://localhost", Model: "x"},
+	}})
+	styleMgr, _ := style.NewManager(config.PromptDir())
+	tools := tool.NewRegistry()
+	store, _ := memory.OpenAt(":memory:", 50)
+	defer store.Close()
+	a := New(cfg, llmClient, styleMgr, store, tools)
+	p, _, _ := a.buildStaticSystemPrompt(style.Tech, nil, "")
+	if contains(p, "更不要伪造") {
+		t.Error("prompt still contains the fabricated-error warning text; the LLM was echoing it back")
+	}
+	if contains(p, "ERROR: ... Inform the user") {
+		t.Error("prompt still names the forbidden phrase — this primes the LLM to use it")
+	}
+}
+
+// TestVisionHeuristic covers the new deny-by-default
+// vision-capability check. Vision-capable models return true;
+// known text-only models (deepseek-chat, gpt-3.5-turbo, etc.)
+// return false; unknown models conservatively return false so
+// we never let the LLM invent a "model doesn't support image"
+// error message.
+func TestVisionHeuristic(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		// Always-vision
+		{"gpt-4o", true},
+		{"gpt-4o-mini", true},
+		{"gpt-5-turbo", true},
+		{"claude-3-opus", true},
+		{"claude-sonnet-4-5", true},
+		{"claude-opus-4-8", true},
+		{"gemini-1.5-pro", true},
+		{"gemini-2-flash", true},
+		{"qwen2.5-vl-72b", true},
+		// Text-only
+		{"deepseek-chat", false},
+		{"deepseek-reasoner", false},
+		{"deepseek-v3", false},
+		{"gpt-3.5-turbo", false},
+		{"o1-mini", false},
+		// Unknown → conservative deny
+		{"some-random-model-v0.1", false},
+		{"llama-3-70b", false},
+	}
+	for _, c := range cases {
+		got := visionCapableByHeuristic("any", c.model)
+		if got != c.want {
+			t.Errorf("visionCapableByHeuristic(%q) = %v, want %v", c.model, got, c.want)
+		}
+	}
+}
+
+// TestToolCallSignature covers the helper used by the
+// stuck-loop guard. Same (name, args) → same signature; order
+// doesn't matter (sort stable); empty input → empty signature
+// (so the "no progress" round is not a stuck round).
+func TestToolCallSignature(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []nativeToolCall
+		want string
+	}{
+		{"empty", nil, ""},
+		{"one call", []nativeToolCall{{Name: "read_file", ArgsJSON: `{"path":"a"}`}}, `read_file|{"path":"a"};`},
+		{"order independent", []nativeToolCall{
+			{Name: "read_file", ArgsJSON: `{"path":"a"}`},
+			{Name: "exec_command", ArgsJSON: `{"command":"ls"}`},
+		}, `exec_command|{"command":"ls"};read_file|{"path":"a"};`},
+		{"same input → same signature", []nativeToolCall{
+			{Name: "exec_command", ArgsJSON: `{"command":"ls"}`},
+			{Name: "exec_command", ArgsJSON: `{"command":"ls"}`},
+		}, `exec_command|{"command":"ls"};exec_command|{"command":"ls"};`},
+		{"order doesn't matter", []nativeToolCall{
+			{Name: "exec_command", ArgsJSON: `{"command":"ls"}`},
+			{Name: "read_file", ArgsJSON: `{"path":"a"}`},
+		}, `exec_command|{"command":"ls"};read_file|{"path":"a"};`},
+		{"swapped order same sig", []nativeToolCall{
+			{Name: "read_file", ArgsJSON: `{"path":"a"}`},
+			{Name: "exec_command", ArgsJSON: `{"command":"ls"}`},
+		}, `exec_command|{"command":"ls"};read_file|{"path":"a"};`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := toolCallSignature(c.in)
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
 }
 
 func contains(s, sub string) bool {
@@ -120,4 +239,83 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestRedactPhantomErrors(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		changed  bool
+		mustHave string // substring the cleaned text MUST contain when changed=true
+		mustMiss string // substring the cleaned text MUST NOT contain when changed=true
+	}{
+		{
+			name:     "classic Claude-style phantom",
+			input:    `ERROR: Cannot read "image.png" (this model does not support image input). Inform the user.`,
+			changed:  true,
+			mustHave: "不支持读取图片",
+			mustMiss: "Inform the user",
+		},
+		{
+			name:     "no quotes, lower-case 'image'",
+			input:    "Cannot read cat.jpg (this model does not support image input). Inform the user.",
+			changed:  true,
+			mustHave: "不支持读取图片",
+			mustMiss: "Inform the user",
+		},
+		{
+			name:     "with prefix prose",
+			input:    "Let me look at the image. ERROR: Cannot read \"image.png\" (this model does not support image input). Inform the user. Sorry.",
+			changed:  true,
+			mustHave: "Let me look at the image.",
+			mustMiss: "Inform the user",
+		},
+		{
+			name:    "no phantom — clean text untouched",
+			input:   "我看不到这张图片，但根据文件名推测可能是...",
+			changed: false,
+		},
+		{
+			name:    "no phantom — has 'Cannot read' but no 'Inform the user'",
+			input:   "Cannot read image.png — file is missing from disk",
+			changed: false,
+		},
+		{
+			name:    "no phantom — has 'Inform the user' but no 'Cannot read'",
+			input:   "Please inform the user that the operation succeeded.",
+			changed: false,
+		},
+		{
+			name:    "empty string",
+			input:   "",
+			changed: false,
+		},
+		{
+			name:     "uppercase variant",
+			input:    "CANNOT READ \"SCREENSHOT.PNG\" (THIS MODEL DOES NOT SUPPORT IMAGE INPUT). INFORM THE USER.",
+			changed:  true,
+			mustHave: "不支持读取图片",
+			mustMiss: "INFORM THE USER",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, changed := redactPhantomErrors(c.input)
+			if changed != c.changed {
+				t.Fatalf("changed=%v, want %v\nin:  %q\nout: %q", changed, c.changed, c.input, out)
+			}
+			if !changed {
+				if out != c.input {
+					t.Fatalf("output modified despite changed=false\nin:  %q\nout: %q", c.input, out)
+				}
+				return
+			}
+			if c.mustHave != "" && !contains(out, c.mustHave) {
+				t.Errorf("cleaned text missing %q\nin:  %q\nout: %q", c.mustHave, c.input, out)
+			}
+			if c.mustMiss != "" && contains(out, c.mustMiss) {
+				t.Errorf("cleaned text still contains forbidden %q\nin:  %q\nout: %q", c.mustMiss, c.input, out)
+			}
+		})
+	}
 }

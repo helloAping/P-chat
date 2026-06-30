@@ -38,14 +38,30 @@ func TestChatWithTools_PanicRecovery(t *testing.T) {
 
 	stream := agt.ChatWithTools(ctx, req)
 	// We expect the stream to close (Done=true or context cancel).
+	// The first chunk must be SessionStatus=busy (announces the
+	// turn start so the frontend TodoPanel state machine can
+	// flip `live` to true). The SessionStatus=idle chunk is
+	// sent in a deferred closer, which runs AFTER any final
+	// Done chunk — so we keep reading until the channel is
+	// closed, not just until Done.
+	var firstBusy, lastIdle bool
 	count := 0
 	for chunk := range stream {
 		count++
-		if chunk.Done || chunk.Error != "" {
-			break
+		if chunk.SessionStatus == "busy" {
+			firstBusy = true
+		}
+		if chunk.SessionStatus == "idle" {
+			lastIdle = true
 		}
 	}
 	if count == 0 {
 		t.Error("expected at least one chunk from the stream")
+	}
+	if !firstBusy {
+		t.Error("expected first chunk to carry SessionStatus=busy")
+	}
+	if !lastIdle {
+		t.Error("expected SessionStatus=idle to be emitted before the stream closed")
 	}
 }

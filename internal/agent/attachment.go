@@ -156,10 +156,17 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 		case "image":
 			mime := imageMIME(a.Name, a.MIME)
 			if visionCapable != nil && !visionCapable() {
+				// Neutral factual marker. The phrasing is deliberately
+				// bland — it tells the LLM the bytes are unavailable
+				// without priming it to produce a Claude-style
+				// "Cannot read image.png ... Inform the user." phantom.
+				// The post-stream redactor in agent.go (redactPhantomErrors)
+				// still catches any phantom the model emits despite this
+				// neutral wording.
 				result = append(result, llm.ChatMessage{
 					Role:    llm.RoleUser,
 					Type:    llm.TypeText,
-					Content: fmt.Sprintf("(attached image: %s, %d bytes — current model does not support image input)", a.Name, len(data)),
+					Content: fmt.Sprintf("[%s: %d bytes — 当前模型不支持视觉输入，图片已上传但未发送]", a.Name, len(data)),
 				})
 				continue
 			}
@@ -175,6 +182,18 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 				Role:    llm.RoleUser,
 				Type:    llm.TypeText,
 				Content: fmt.Sprintf("(attached audio: %s, %d bytes, MIME=%s)", a.Name, len(data), a.MIME),
+			})
+		case "video":
+			// No LLM adapter today accepts a video input block
+			// inline. The bytes are uploaded and rendered in
+			// the chat bubble as a <video> element so the
+			// user can preview them; the model just gets a
+			// metadata marker so it knows something was
+			// attached.
+			result = append(result, llm.ChatMessage{
+				Role:    llm.RoleUser,
+				Type:    llm.TypeText,
+				Content: fmt.Sprintf("(attached video: %s, %d bytes, MIME=%s)", a.Name, len(data), a.MIME),
 			})
 		case "text":
 			const maxInlineText = 8 << 10 // 8 KB
