@@ -5,6 +5,54 @@
 
 const BASE = '' // same origin; pchat-server serves both UI and API
 
+// directBackendURL returns the pchat-server base URL for the
+// streaming endpoint. In the Wails desktop app the webview
+// normally talks to the server through the AssetServer proxy, but
+// the proxy's response writer buffers the entire response body
+// and only flushes when the request handler returns — useless for
+// SSE streams that may park for minutes (the `question` tool
+// flow). The webview calls window.go.main.App.GetBackendURL() to
+// get the child's listen address and opens a direct connection
+// for streaming.
+//
+// In the browser build the binding doesn't exist and we fall
+// back to the same-origin BASE.
+function directBackendURL(): string {
+  if (typeof window === 'undefined') return BASE
+  // Fast path: pchat-gui injects this from the Go side after the
+  // child server passes its health check. Avoids a Go round-trip
+  // for every stream.
+  const injected = (window as any).__PCHAT_BACKEND__
+  if (typeof injected === 'string' && injected) return injected
+  // Slower path: ask the Wails binding directly. Returns "" if
+  // the child hasn't announced its port yet.
+  const wails = (window as any).go?.main?.App?.GetBackendURL
+  if (typeof wails === 'function') {
+    try {
+      const v = wails()
+      if (typeof v === 'string' && v) return v
+    } catch { /* binding not ready */ }
+  }
+  return BASE
+}
+
+// waitForDirectBackend polls for the backend URL for up to ~5s.
+// pchat-gui publishes the URL via the GetBackendURL binding after
+// the child server passes its health check — the same moment the
+// real UI takes over from the loading screen. The publish is fast
+// but async: if the user hits Enter before it lands, we'd
+// otherwise fall through to the Wails proxy and the SSE event
+// would sit in the response-writer buffer. Waiting here is cheap
+// and removes the race.
+async function waitForDirectBackend(): Promise<string> {
+  for (let i = 0; i < 50; i++) {
+    const url = directBackendURL()
+    if (url && url !== BASE) return url
+    await new Promise<void>(r => setTimeout(r, 100))
+  }
+  return directBackendURL()
+}
+
 export interface Session {
   id: string
   title: string
@@ -21,6 +69,7 @@ export interface Session {
   project_path?: string
   plan_mode?: boolean
   permission_level?: string
+  reasoning_effort?: string
 }
 
 export interface Attachment {
@@ -28,11 +77,16 @@ export interface Attachment {
   name: string
   size: number
   mime: string
-  kind: 'image' | 'audio' | 'text' | 'file'
+  kind: 'image' | 'audio' | 'video' | 'text' | 'file'
 }
 
 export interface MessageAttachment {
-  type: 'image_url' | 'text'
+  // image_url  — image; rendered as <img> with click-to-zoom
+  // audio_url  — audio; rendered as <audio controls>
+  // video_url  — video; rendered as <video controls>
+  // text       — anything else (file body, unsupported media
+  //             with a text marker, etc.)
+  type: 'image_url' | 'audio_url' | 'video_url' | 'text'
   url?: string
   text?: string
   name?: string
@@ -149,10 +203,6 @@ export interface SessionMeta {
 
 export interface UpdateSessionMetaResponse {
   ok?: boolean
-  // When the server resolves fallbacks (e.g. the user picked a
-  // provider but the request body didn't include a model), the
-  // resolved values come back as a full SessionResponse so the
-  // client can sync its picker state.
   id?: string
   title?: string
   style?: string
@@ -160,6 +210,7 @@ export interface UpdateSessionMetaResponse {
   model?: string
   plan_mode?: boolean
   permission_level?: string
+  reasoning_effort?: string
   created_at?: number
   updated_at?: number
 }
@@ -382,8 +433,38 @@ export const setMCPGlobal = (enabled: boolean) =>
   })
 
 // --- Messages ---
-export const listMessages = (id: string) =>
-  jsonFetch<{ messages: Message[] }>(`/api/v1/sessions/${id}/messages`)
+
+// PageOpts controls infinite-scroll history loading.
+// beforeId: the lowest row id from the previous page; pass 0
+//   (or omit) for the most recent page.
+// limit: page size. The server applies the per-session context
+//   cap when 0 is passed.
+export interface PageOpts {
+  beforeId?: number
+  limit?: number
+}
+
+export interface ListMessagesResult {
+  messages: Message[]
+  has_more: boolean
+  // The id to pass as `beforeId` on the next page request.
+  // Always the smallest row id in `messages`. 0 when the
+  // returned page is empty.
+  oldest_id: number
+}
+
+// listMessages fetches a page of session history. Omit
+// `opts` to get the full history (first open after reload —
+// the server applies the context-window cap automatically).
+export const listMessages = (id: string, opts?: PageOpts) => {
+  const q = new URLSearchParams()
+  if (opts?.beforeId && opts.beforeId > 0) q.set('before_id', String(opts.beforeId))
+  if (opts?.limit && opts.limit > 0) q.set('limit', String(opts.limit))
+  const qs = q.toString()
+  return jsonFetch<ListMessagesResult>(
+    `/api/v1/sessions/${id}/messages${qs ? '?' + qs : ''}`,
+  )
+}
 
 // --- Archive ---
 export const archiveSession = (id: string) =>
@@ -638,18 +719,20 @@ export const fetchUpstreamModels = (provider: string) =>
 
 // --- Streaming send ---
 export interface InlineAttachment {
-  // 'image_url' for image parts, 'text' for file bodies.
-  type: 'image_url' | 'text'
-  // For image_url: the data: URL (e.g. "data:image/png;base64,...")
-  // carrying the inline file bytes. For text: undefined (the
-  // text body is in `text`).
+  // 'image_url' for images, 'audio_url' / 'video_url' for media
+  // the chat bubble can preview, 'text' for file bodies the
+  // model only gets to read as text.
+  type: 'image_url' | 'audio_url' | 'video_url' | 'text'
+  // For image_url / audio_url / video_url: the data: URL
+  // (e.g. "data:image/png;base64,...") carrying the inline
+  // file bytes. For text: undefined (the body is in `text`).
   url?: string
-  // For text: the file body. For image_url: undefined.
+  // For text: the file body. For *_url: undefined.
   text?: string
   // Original filename, kept around for the chat bubble label and
   // for the backend's debug logs.
   name: string
-  // 'image' | 'audio' | 'text' | 'file'
+  // 'image' | 'audio' | 'video' | 'text' | 'file'
   kind: string
   // MIME type, used to pick the right wrapping ("data:image/...;base64,"
   // vs raw text).
@@ -680,6 +763,14 @@ export interface StreamEvent {
   // Content is a text delta (assistant prose). Populated when
   // type === 'content'. The client appends it to the trailing
   // text part of the assistant message.
+  //
+  // When type === 'content_rewrite' (emitted by the agent's
+  // post-stream redactor, e.g. when it strips a phantom vision
+  // error), this field carries the *replacement* text. The client
+  // should REPLACE the trailing text part's text with this value
+  // rather than append it. The redactor runs after the model
+  // stream ends and may swap out a model-fabricated error string
+  // for a clean user-facing message.
   content?: string
   // Thinking is a reasoning / chain-of-thought delta
   // (DeepSeek reasoning_content, OpenAI o1 reasoning, Anthropic
@@ -690,6 +781,13 @@ export interface StreamEvent {
   tool_name?: string
   tool_status?: string
   tool_result?: string
+  // tool_result_full is the untruncated tool result for tools
+  // whose output the chat store needs to JSON.parse (todo_write,
+  // question). tool_result is a 300-char preview suitable for
+  // human display; tool_result_full preserves the full payload
+  // (newlines and all). The chat store uses tool_result_full in
+  // preference to tool_result when present.
+  tool_result_full?: string
   tool_error?: string
   tool_elapsed?: string
   // tool_args is the JSON-encoded arguments string the tool
@@ -728,6 +826,17 @@ export interface StreamEvent {
   // when type === 'tool_confirm'. The chat store surfaces a
   // simple approve/reject dialog.
   tool_confirm_json?: string
+
+  // session_status is the lifecycle signal for a chat turn:
+  // "busy" at the start of the agent loop, "idle" when it
+  // exits (any reason — success, error, cancel, max-rounds,
+  // stuck, panic). The chat store uses this to maintain
+  // state.sessionWorking[id]; the TodoPanel state machine
+  // uses `live = state.sessionWorking[id]` to decide whether
+  // to show or clear stale todos. Without this signal, the
+  // dock can't tell "LLM is mid-turn, keep todos" from
+  // "LLM stopped and forgot to clear them".
+  session_status?: 'busy' | 'idle' | 'retry' | string
 }
 
 export async function submitConfirmResponse(sessionId: string, approved: boolean): Promise<void> {
@@ -738,48 +847,77 @@ export async function submitConfirmResponse(sessionId: string, approved: boolean
 }
 
 export async function streamMessages(sessionId: string, opts: SendOptions): Promise<void> {
-  const res = await fetch(`${BASE}/api/v1/sessions/${sessionId}/messages`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      message: opts.message,
-      provider: opts.provider,
-      model: opts.model,
-      style: opts.style,
-      attachments: opts.attachments,
-      skill_context: opts.skill_context || '',
-    }),
-    signal: opts.signal,
+  // Route the SSE stream through the Go side via the StreamMessages
+  // Wails binding. The Wails AssetServer's response writer buffers
+  // the entire body and only flushes when the request handler
+  // returns, which doesn't happen for a 5-minute question tool
+  // block. A direct fetch() to the backend hits CORS/Private
+  // Network Access friction from the wails.localhost origin and
+  // times out. The Go binding is a direct in-process call — no
+  // CORS, no buffering beyond the standard chunked transfer.
+  const { StreamMessages, CancelStream } = await import('../../wailsjs/go/main/App')
+  const { EventsOn, EventsOff } = await import('../../wailsjs/runtime/runtime')
+
+  const body = JSON.stringify({
+    message: opts.message,
+    provider: opts.provider,
+    model: opts.model,
+    style: opts.style,
+    attachments: opts.attachments,
+    skill_context: opts.skill_context || '',
   })
-  if (!res.ok || !res.body) {
-    const t = await res.text()
-    throw new Error(`HTTP ${res.status}: ${t}`)
-  }
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
 
   const flush = () => new Promise<void>(r => setTimeout(r, 0))
-
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    let idx
-    while ((idx = buf.indexOf('\n\n')) >= 0) {
-      const chunk = buf.slice(0, idx)
-      buf = buf.slice(idx + 2)
-      const line = chunk.split('\n').find(l => l.startsWith('data: '))
-      if (!line) continue
-      const data = line.slice(6).trim()
-      if (!data || data === '[DONE]') continue
+  const offEvent = EventsOn('stream:event', (...args: any[]) => {
+    const raw = args[0] as string
+    try {
+      const wrap = JSON.parse(raw) as { session: string; event: string; data: string }
+      // Drop events that belong to a different session. Wails
+      // EventsOn is process-global; two parallel StreamMessages
+      // calls share the channel. Without this filter, session B's
+      // events would land in session A's message list.
+      if (wrap.session && wrap.session !== sessionId) return
+      if (wrap.event && wrap.event !== 'message' && wrap.event !== '') return
+      const data = (wrap.data || '').trim()
+      if (!data || data === '[DONE]') return
+      const ev = JSON.parse(data) as StreamEvent
+      // Wrap the dispatch in its own try/catch. The handler mutates
+      // Vue reactive state, which can synchronously run a render
+      // flush; if any Naive UI internals (popover, tooltip, NMessage
+      // instance) try to querySelectorAll a DOM element that's been
+      // swapped out mid-flush, an unhandled TypeError escapes the
+      // Vue scheduler and surfaces in the console as
+      // "P.querySelectorAll is not a function" — with no other
+      // recovery. We log and continue, so the next event still lands.
       try {
-        const ev = JSON.parse(data) as StreamEvent
         opts.onEvent(ev)
-        await flush()
-      } catch (e) {
-        console.warn('SSE parse error', e, 'raw:', data.slice(0, 200))
+      } catch (inner) {
+        console.warn('[stream] event handler threw, continuing:', inner)
       }
+    } catch (e) {
+      console.warn('SSE parse error', e, 'raw:', (raw || '').slice(0, 200))
     }
+  })
+  const offEnd = EventsOn('stream:end', (...args: any[]) => {
+    // stream:end carries the session id of the stream that
+    // finished. Ignore ends from other concurrent streams.
+    const sid = args[0] as string
+    if (sid && sid !== sessionId) return
+    // stream:end is informational; the Go binding's StreamMessages
+    // promise resolving is the actual signal that the stream is
+    // done. Nothing to do here.
+  })
+
+  try {
+    await StreamMessages(sessionId, body)
+    // Give the final event a tick to land in the JS event loop.
+    await flush()
+  } catch (e: any) {
+    offEvent()
+    offEnd()
+    if (opts.signal?.aborted) return
+    throw new Error(`stream: ${e?.message || e}`)
   }
+  offEvent()
+  offEnd()
 }

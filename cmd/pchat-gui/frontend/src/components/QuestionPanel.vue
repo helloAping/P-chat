@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { NModal, NButton, NRadio, NCheckbox, NSpace, NTag, NScrollbar, NInput } from 'naive-ui'
+import { NButton, NRadio, NCheckbox, NSpace, NTag, NInput, NIcon } from 'naive-ui'
 import { state, submitQuestionAnswer, currentPendingQuestion } from '../stores/chat'
 import type { QuestionItem } from '../api/client'
 
@@ -8,21 +8,38 @@ const currentIndex = ref(0)
 const answers = ref<Record<string, string>>({})
 const multiAnswers = ref<Record<string, string[]>>({})
 const customInputs = ref<Record<string, string>>({})
+const open = ref(false)
+const userToggled = ref(false)
 
 const OTHER_LABEL = '其他'
 
+// Show the question for the session the user is currently
+// viewing. Background sessions can hold their own pending
+// question — those won't surface here until the user switches.
 const questions = computed(() => currentPendingQuestion.value?.questions || [])
 const currentQuestion = computed(() => questions.value[currentIndex.value] || null)
 const isLast = computed(() => currentIndex.value >= questions.value.length - 1)
+const questionCount = computed(() => questions.value.length)
 
 watch(currentPendingQuestion, (q) => {
   if (q) {
+    console.log('[QuestionPanel] received %d questions', q.questions.length)
     currentIndex.value = 0
     answers.value = {}
     multiAnswers.value = {}
     customInputs.value = {}
+    open.value = true
+    userToggled.value = false
+  } else {
+    console.log('[QuestionPanel] pendingQuestion cleared')
+    open.value = false
   }
 })
+
+function toggle() {
+  open.value = !open.value
+  userToggled.value = true
+}
 
 function selectOption(value: string) {
   if (!currentQuestion.value) return
@@ -51,7 +68,6 @@ function selectOption(value: string) {
     const idx = arr.indexOf(value)
     if (idx >= 0) arr.splice(idx, 1)
     else arr.push(value)
-    // Deselect "其他" if any normal option is selected (for single select behavior)
     const otherIdx = arr.indexOf(OTHER_LABEL)
     if (otherIdx >= 0) {
       arr.splice(otherIdx, 1)
@@ -119,7 +135,6 @@ function submit() {
   submitQuestionAnswer(all)
 }
 
-// Merge predefined options with dynamic "其他" entry
 const displayOptions = computed(() => {
   const q = currentQuestion.value
   if (!q) return []
@@ -135,84 +150,125 @@ const displayOptions = computed(() => {
 </script>
 
 <template>
-  <NModal
-    v-if="currentPendingQuestion"
-    :show="true"
-    preset="card"
-    :closable="false"
-    :mask-closable="false"
-    title="💬 LLM 的提问"
-    style="max-width: 560px"
-  >
-    <div class="qnav">
-      <NTag
-        v-for="(q, i) in questions"
-        :key="i"
-        :type="i === currentIndex ? 'primary' : 'default'"
-        size="small"
-        class="qnav-tag"
-        :class="{ 'qnav-answered': i < currentIndex || answers[q.question] || (q.multi_select && multiAnswers[q.question]?.length) }"
-        @click="currentIndex = i"
-      >
-        {{ q.header }}
-      </NTag>
-    </div>
-    <div v-if="currentQuestion" class="qbody">
-      <div class="qtext">{{ currentQuestion.question }}<span v-if="currentQuestion.multi_select" class="qmulti"> (多选)</span></div>
-      <div class="qopts">
-        <div
-          v-for="opt in displayOptions"
-          :key="opt.label"
-          class="qopt"
-          :class="{ 'qopt-sel': isSelected(opt.label), 'qopt-other': opt.label === OTHER_LABEL }"
-          @click="selectOption(opt.label)"
+  <div v-if="currentPendingQuestion" class="question-panel" :class="{ 'qpanel-open': open }">
+    <div class="qpanel-header" @click="toggle">
+      <span class="qpanel-arrow" :class="{ 'qpanel-arrow-rotated': open }">▶</span>
+      <span class="qpanel-title">LLM 的提问</span>
+      <span class="qpanel-progress">{{ currentIndex + 1 }}/{{ questionCount }}</span>
+      <div class="qnav-tags">
+        <NTag
+          v-for="(q, i) in questions"
+          :key="i"
+          :type="i === currentIndex ? 'primary' : 'default'"
+          size="small"
+          class="qnav-tag"
+          :class="{ 'qnav-answered': i < currentIndex || answers[q.question] || (q.multi_select && multiAnswers[q.question]?.length) }"
+          @click.stop="currentIndex = i"
         >
-          <NRadio
-            v-if="!currentQuestion.multi_select"
-            :checked="isSelected(opt.label)"
-            class="qopt-radio"
-          />
-          <NCheckbox
-            v-else
-            :checked="isSelected(opt.label)"
-            class="qopt-check"
-          />
-          <div class="qopt-body">
-            <div class="qopt-label">{{ opt.label }}</div>
-            <div class="qopt-desc">{{ opt.description }}</div>
-            <div
-              v-if="opt.label === OTHER_LABEL && opt.isOtherSelected"
-              class="qopt-custom"
-              @click.stop
-            >
-              <NInput
-                v-model:value="customInputs[currentQuestion.question]"
-                size="small"
-                placeholder="请输入自定义内容..."
-                :autofocus="true"
-              />
+          {{ q.header }}
+        </NTag>
+      </div>
+    </div>
+    <div v-show="open" class="qpanel-body">
+      <div v-if="currentQuestion">
+        <div class="qtext">{{ currentQuestion.question }}<span v-if="currentQuestion.multi_select" class="qmulti"> (多选)</span></div>
+        <div class="qopts">
+          <div
+            v-for="opt in displayOptions"
+            :key="opt.label"
+            class="qopt"
+            :class="{ 'qopt-sel': isSelected(opt.label), 'qopt-other': opt.label === OTHER_LABEL }"
+            @click="selectOption(opt.label)"
+          >
+            <NRadio
+              v-if="!currentQuestion.multi_select"
+              :checked="isSelected(opt.label)"
+              class="qopt-radio"
+            />
+            <NCheckbox
+              v-else
+              :checked="isSelected(opt.label)"
+              class="qopt-check"
+            />
+            <div class="qopt-body">
+              <div class="qopt-label">{{ opt.label }}</div>
+              <div class="qopt-desc">{{ opt.description }}</div>
+              <div
+                v-if="opt.label === OTHER_LABEL && opt.isOtherSelected"
+                class="qopt-custom"
+                @click.stop
+              >
+                <NInput
+                  v-model:value="customInputs[currentQuestion.question]"
+                  size="small"
+                  placeholder="请输入自定义内容..."
+                  :autofocus="true"
+                />
+              </div>
             </div>
           </div>
         </div>
+        <div class="qpanel-footer">
+          <NSpace justify="end">
+            <NButton v-if="currentIndex > 0" @click="prev" size="small">上一步</NButton>
+            <NButton type="primary" @click="next" :disabled="!canProceed()" size="small">
+              {{ isLast ? '提交' : '下一步' }}
+            </NButton>
+          </NSpace>
+        </div>
       </div>
     </div>
-    <template #footer>
-      <NSpace justify="end">
-        <NButton v-if="currentIndex > 0" @click="prev" size="small">上一步</NButton>
-        <NButton type="primary" @click="next" :disabled="!canProceed()" size="small">
-          {{ isLast ? '提交' : '下一步' }}
-        </NButton>
-      </NSpace>
-    </template>
-  </NModal>
+  </div>
 </template>
 
 <style scoped>
-.qnav {
+.question-panel {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  flex-shrink: 0;
+}
+.qpanel-open {
+  background: var(--bg);
+}
+.qpanel-header {
   display: flex;
-  gap: 6px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  user-select: none;
+  min-height: 36px;
+}
+.qpanel-header:hover {
+  background: var(--bg-hover);
+}
+.qpanel-arrow {
+  font-size: 10px;
+  transition: transform 0.15s;
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+.qpanel-arrow-rotated {
+  transform: rotate(90deg);
+}
+.qpanel-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-1);
+  flex-shrink: 0;
+}
+.qpanel-progress {
+  font-size: 11px;
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.qnav-tags {
+  display: flex;
+  gap: 4px;
   flex-wrap: wrap;
-  margin-bottom: 16px;
+  flex: 1;
+  justify-content: flex-end;
 }
 .qnav-tag {
   cursor: pointer;
@@ -221,14 +277,14 @@ const displayOptions = computed(() => {
 .qnav-answered {
   opacity: 1;
 }
-.qbody {
-  min-height: 120px;
+.qpanel-body {
+  padding: 0 16px 12px;
 }
 .qtext {
   font-size: 14px;
   font-weight: 600;
   color: var(--text-1);
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 .qmulti {
   font-weight: 400;
@@ -239,6 +295,8 @@ const displayOptions = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
 }
 .qopt {
   display: flex;
@@ -281,5 +339,8 @@ const displayOptions = computed(() => {
 }
 .qopt-custom {
   margin-top: 8px;
+}
+.qpanel-footer {
+  margin-top: 12px;
 }
 </style>

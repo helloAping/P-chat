@@ -3,7 +3,7 @@ import { onMounted, onUnmounted, watch } from 'vue'
 import { state } from '../stores/chat'
 
 function close() {
-  state.lightbox = { show: false, src: '', alt: '' }
+  state.lightbox = { show: false, src: '', alt: '', kind: 'image' }
 }
 
 function onKey(e: KeyboardEvent) {
@@ -19,9 +19,18 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
     <div v-if="state.lightbox.show" class="lightbox" @click="close">
       <button class="close-btn" @click.stop="close" title="关闭 (Esc)">×</button>
       <img
+        v-if="state.lightbox.kind === 'image'"
         :src="state.lightbox.src"
         :alt="state.lightbox.alt"
-        class="lightbox-img"
+        class="lightbox-media"
+        @click.stop
+      />
+      <video
+        v-else-if="state.lightbox.kind === 'video'"
+        :src="state.lightbox.src"
+        class="lightbox-media"
+        controls
+        autoplay
         @click.stop
       />
     </div>
@@ -36,13 +45,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
   z-index: 1000;
   cursor: zoom-out;
 }
-.lightbox-img {
+.lightbox-media {
   max-width: 95vw;
   max-height: 95vh;
   object-fit: contain;
   border-radius: 6px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
   cursor: default;
+  background: #000;
 }
 .close-btn {
   position: absolute; top: 16px; right: 16px;
@@ -51,6 +61,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
   color: #fff; border: none; border-radius: 50%;
   font-size: 24px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
+  z-index: 1;
 }
 .close-btn:hover { background: rgba(255, 255, 255, 0.25); }
 

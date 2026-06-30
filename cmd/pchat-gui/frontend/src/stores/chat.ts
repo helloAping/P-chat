@@ -37,7 +37,21 @@ export const state = reactive({
     ctrl: AbortController
     asstContent: string
   }>,
-  pendingAttachments: [] as PendingAttachment[],
+  // Per-session history-paging cursor. The first page
+  // (loaded by switchSession) sets oldestId to the id of the
+  // last (oldest) message in the page; subsequent pages are
+  // fetched with before_id=oldestId. When hasMore is false,
+  // the user has scrolled to the start of the conversation.
+  sessionPaging: {} as Record<string, {
+    oldestId: number
+    hasMore: boolean
+    loading: boolean
+  }>,
+  // Attachments staged in the InputArea. Per-session so
+  // switching conversations mid-edit keeps each session's
+  // staged files intact — the previous global array would
+  // either lose them on switch or leak across sessions.
+  pendingAttachments: {} as Record<string, PendingAttachment[]>,
   providers: [] as any[],
   // Resolved default model from the providers list. Set by
   // loadProviders() so the per-session fallback (when the
@@ -46,14 +60,22 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string }>,
+  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string }>,
   sessionTodos: {} as Record<string, TodoItem[]>,
-  // Pending question from the LLM's question tool. When
-  // non-null, QuestionModal renders it and blocks until
-  // the user answers.
-  pendingQuestion: null as { questions: QuestionItem[]; resolve: (answers: Record<string, string>) => void } | null,
-  pendingConfirm: null as { toolName: string; args: string; reason: string; resolve: (approved: boolean) => void } | null,
-  lightbox: { show: false, src: '', alt: '' },
+  // sessionWorking is the per-session "is the LLM mid-turn"
+  // flag, derived from the `session_status` SSE event. The
+  // TodoPanel state machine reads this to decide whether
+  // stale todos should be kept (live) or cleared (idle).
+  // Default false (idle) — sessions that have never been
+  // streamed to aren't busy.
+  sessionWorking: {} as Record<string, boolean>,
+  // Pending question from the LLM's question tool, keyed by
+  // session id. Background sessions may have a question open
+  // while the user is viewing another session, so the global
+  // flag had to go.
+  pendingQuestion: {} as Record<string, { questions: QuestionItem[]; resolve: (answers: Record<string, string>) => void }>,
+  pendingConfirm: {} as Record<string, { toolName: string; args: string; reason: string; resolve: (approved: boolean) => void }>,
+  lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
   projects: [] as ProjectItem[],
   activeProjectPath: '' as string,
@@ -66,6 +88,27 @@ export const currentMessages = computed(() =>
 export const currentTodos = computed(() =>
   state.sessionTodos[state.currentID] || [],
 )
+
+// currentSessionWorking — true while the LLM is mid-turn
+// for the current session. The TodoPanel state machine
+// combines this with currentTodos to decide whether to
+// show, hide, or clear the dock.
+export const currentSessionWorking = computed(() =>
+  !!state.sessionWorking[state.currentID],
+)
+
+// clearSessionTodos wipes the local todo list for a session.
+// Used by the TodoPanel's "stale-clear" hack when the
+// session goes idle without the LLM writing `todos: []`.
+// Mirrors opencode's `session-composer-state.ts:113-118`:
+// "Keep stale turn todos from reopening if the model
+// never clears them." Server-side state in SQLite is NOT
+// touched — only the in-memory cache. Reloading the
+// session re-hydrates from SQLite.
+export function clearSessionTodos(id: string) {
+  if (!id) return
+  state.sessionTodos[id] = []
+}
 
 export const activeProjectName = computed(() => {
   if (!state.activeProjectPath) return '全局'
@@ -117,14 +160,55 @@ export async function setActiveProject(path: string) {
   state.sessionMessages = {}
   state.sessionMeta = {}
   state.sessionTodos = {}
+  state.sessionWorking = {}
+  state.sessionPaging = {}
+  // Revoke blob URLs for any staged attachments in the
+  // sessions we're discarding, then drop the maps entirely.
+  // Question / confirm dialogs keyed to those sessions get
+  // resolved with no-op values so any awaiters unblock.
+  for (const arr of Object.values(state.pendingAttachments)) {
+    for (const a of arr) {
+      if (a._blobURL) URL.revokeObjectURL(a._blobURL)
+    }
+  }
+  state.pendingAttachments = {}
+  for (const [id, pq] of Object.entries(state.pendingQuestion)) {
+    pq.resolve({})
+    delete state.pendingQuestion[id]
+  }
+  for (const [id, pc] of Object.entries(state.pendingConfirm)) {
+    pc.resolve(false)
+    delete state.pendingConfirm[id]
+  }
+  for (const [id, s] of Object.entries(state.streaming)) {
+    s.ctrl.abort()
+    delete state.streaming[id]
+  }
   await loadSessions()
 }
+
+// initialHistoryLimit is the page size for the first history
+// load when switching to a session. Picked to cover a typical
+// long conversation (50 messages = ~25 turns) so the user
+// rarely needs to scroll up to see more. Subsequent pages
+// (loaded by loadMoreMessages) use the same size.
+const initialHistoryLimit = 50
 
 export async function switchSession(id: string) {
   state.currentID = id
   if (!state.sessionMessages[id]) {
-    const r = await api.listMessages(id)
+    // First visit to this session: load the most recent page
+    // only. Older pages are fetched on-demand by
+    // loadMoreMessages when the user scrolls to the top of
+    // the message list. This keeps switch-to-session latency
+    // bounded regardless of how long the conversation is.
+    const r = await api.listMessages(id, { limit: initialHistoryLimit })
     state.sessionMessages[id] = r.messages
+    state.sessionPaging[id] = {
+      oldestId: r.oldest_id,
+      hasMore: r.has_more,
+      loading: false,
+    }
   }
   // Hydrate per-session meta. The server's SessionResponse
   // (GET /api/v1/sessions) already resolves style/provider/model
@@ -149,6 +233,7 @@ export async function switchSession(id: string) {
       title:     s.title || '',
       plan_mode: s.plan_mode || false,
       permission_level: s.permission_level || 'ask',
+      reasoning_effort: s.reasoning_effort || 'off',
     }
   }
   // Load per-session todos.
@@ -157,6 +242,47 @@ export async function switchSession(id: string) {
       const t = await api.getTodos(id)
       state.sessionTodos[id] = t.todos || []
     } catch { /* ignore — server may not have todos yet */ }
+  }
+}
+
+// loadMoreMessages fetches the next page of older history
+// for the given session and prepends the result to the
+// in-memory message list. Returns true if more pages remain
+// (caller can chain another loadMoreMessages). Returns false
+// when the session is at the start of its history or when
+// a load is already in flight.
+//
+// Idempotency: if a load is already in flight (e.g. the
+// user scrolled to the top multiple times in quick
+// succession) the second call returns false without making
+// an HTTP request — protects against request amplification
+// from rapid scroll events.
+export async function loadMoreMessages(id: string): Promise<boolean> {
+  const paging = state.sessionPaging[id]
+  if (!paging || !paging.hasMore || paging.loading) return false
+  paging.loading = true
+  try {
+    const r = await api.listMessages(id, {
+      beforeId: paging.oldestId,
+      limit: initialHistoryLimit,
+    })
+    if (r.messages.length > 0) {
+      // Prepend the new (older) page to the front of the
+      // existing message list. The server returns messages
+      // oldest-first within the page, so concatenation in
+      // the order [older..., existing...] preserves the
+      // global oldest-first ordering.
+      const existing = state.sessionMessages[id] || []
+      state.sessionMessages[id] = [...r.messages, ...existing]
+    }
+    paging.oldestId = r.oldest_id
+    paging.hasMore = r.has_more
+    return r.has_more
+  } catch (e) {
+    console.warn('loadMoreMessages failed:', e)
+    return false
+  } finally {
+    paging.loading = false
   }
 }
 
@@ -231,6 +357,28 @@ export async function deleteSessionById(id: string) {
   delete state.sessionMessages[id]
   delete state.sessionMeta[id]
   delete state.sessionTodos[id]
+  delete state.sessionWorking[id]
+  delete state.sessionPaging[id]
+  // Per-session state must also be torn down so a session with
+  // the same id later (after createSession) doesn't see the
+  // previous session's staged attachments or stale question /
+  // confirm dialogs.
+  for (const a of (state.pendingAttachments[id] || [])) {
+    if (a._blobURL) URL.revokeObjectURL(a._blobURL)
+  }
+  delete state.pendingAttachments[id]
+  if (state.pendingQuestion[id]) {
+    state.pendingQuestion[id].resolve({})  // unblock any awaiter
+    delete state.pendingQuestion[id]
+  }
+  if (state.pendingConfirm[id]) {
+    state.pendingConfirm[id].resolve(false)
+    delete state.pendingConfirm[id]
+  }
+  if (state.streaming[id]) {
+    state.streaming[id].ctrl.abort()
+    delete state.streaming[id]
+  }
   if (state.currentID === id) {
     state.currentID = state.sessions[0]?.id || ''
     if (state.currentID) await switchSession(state.currentID)
@@ -257,6 +405,7 @@ export async function renameSession(id: string, title: string) {
       provider: resp.provider ?? state.sessionMeta[id].provider,
       model: resp.model ?? state.sessionMeta[id].model,
       permission_level: resp.permission_level ?? state.sessionMeta[id].permission_level,
+      reasoning_effort: resp.reasoning_effort ?? state.sessionMeta[id].reasoning_effort,
     }
   }
 }
@@ -267,6 +416,7 @@ export function guessKind(name: string, mime: string): string {
   const ext = (name || '').split('.').pop()?.toLowerCase() || ''
   const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'tiff', 'tif']
   const audioExts = ['mp3', 'wav', 'm4a', 'ogg', 'flac', 'opus', 'aac', 'pcm', 'wma']
+  const videoExts = ['mp4', 'webm', 'mov', 'mkv', 'm4v', 'avi']
   const textExts  = ['txt', 'md', 'csv', 'json', 'yaml', 'yml', 'xml', 'html', 'htm',
     'js', 'ts', 'tsx', 'jsx', 'go', 'py', 'rs', 'java', 'c', 'cpp',
     'h', 'hpp', 'cs', 'rb', 'php', 'sh', 'bash', 'zsh', 'ps1',
@@ -274,15 +424,19 @@ export function guessKind(name: string, mime: string): string {
     'vue', 'svelte', 'swift', 'kt', 'scala', 'r', 'm', 'mm']
   if (imageExts.includes(ext)) return 'image'
   if (audioExts.includes(ext)) return 'audio'
+  if (videoExts.includes(ext)) return 'video'
   if (textExts.includes(ext)) return 'text'
   if (mime?.startsWith('image/')) return 'image'
   if (mime?.startsWith('audio/')) return 'audio'
+  if (mime?.startsWith('video/')) return 'video'
   if (mime && (mime.startsWith('text/') || mime === 'application/json')) return 'text'
   return 'file'
 }
 
 export async function addAttachment(file: File) {
-  const idx = state.pendingAttachments.length
+  const id = state.currentID
+  if (!id) return
+  if (!state.pendingAttachments[id]) state.pendingAttachments[id] = []
   const guessedKind = guessKind(file.name, file.type || '')
   const blobURL = URL.createObjectURL(file)
   const placeholder: PendingAttachment = {
@@ -291,11 +445,11 @@ export async function addAttachment(file: File) {
     _file: file, _blobURL: blobURL, _uploading: true, _error: false,
     _previewURL: blobURL,
   }
-  state.pendingAttachments.push(placeholder)
+  state.pendingAttachments[id].push(placeholder)
   // Cache a base64 data URL up-front so the message can be
   // displayed + sent without re-reading the file from disk.
   // For text attachments this is just the utf-8 text; for binary
-  // (images/audio) it's the data: URL the LLM wants anyway.
+  // (images/audio/video) it's the data: URL the LLM wants anyway.
   try {
     placeholder._dataURL = await readAsDataURL(file, guessedKind)
   } catch {
@@ -338,16 +492,22 @@ function readAsDataURL(file: File, kind: string): Promise<string> {
 }
 
 export function removeAttachment(idx: number) {
-  const a = state.pendingAttachments[idx]
+  const id = state.currentID
+  if (!id) return
+  const arr = state.pendingAttachments[id]
+  if (!arr) return
+  const a = arr[idx]
   if (a?._blobURL) URL.revokeObjectURL(a._blobURL)
-  state.pendingAttachments.splice(idx, 1)
+  arr.splice(idx, 1)
 }
 
 export function clearAttachments() {
-  for (const a of state.pendingAttachments) {
+  const id = state.currentID
+  if (!id) return
+  for (const a of (state.pendingAttachments[id] || [])) {
     if (a._blobURL) URL.revokeObjectURL(a._blobURL)
   }
-  state.pendingAttachments = []
+  state.pendingAttachments[id] = []
 }
 
 // --- Streaming ---
@@ -515,6 +675,24 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         }
       }
       break
+    case 'content_rewrite': {
+      // Post-stream redactor rewrote the assistant's trailing
+      // text. Replace the existing trailing text part in place
+      // rather than appending a duplicate. If there's no text
+      // part yet (unlikely but possible if rewrite arrives
+      // before any content deltas), create one. The replacement
+      // is a full rewrite — the stream is already over by the
+      // time the redactor runs, so no streaming flag is needed.
+      if (!ev.content) break
+      const parts = sub ? sub.parts : m.parts!
+      const last = parts[parts.length - 1]
+      if (last && last.kind === 'text') {
+        last.text = ev.content
+      } else {
+        parts.push({ kind: 'text', text: ev.content })
+      }
+      break
+    }
     case 'thinking':
       if (ev.thinking) {
         if (sub) {
@@ -579,12 +757,22 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           })
         }
       }
-      // Sync todo list from todo_write tool results.
-      if (ev.tool_name === 'todo_write' && ev.tool_status === 'ok' && ev.tool_result) {
-        try {
-          const todos: TodoItem[] = JSON.parse(ev.tool_result)
-          state.sessionTodos[id] = todos
-        } catch { /* not JSON, ignore */ }
+      // Sync todo list from todo_write tool results. Prefer
+      // the untruncated tool_result_full (newlines intact, no
+      // 300-char cap) so JSON.parse succeeds for lists with
+      // many todos or long content. Fall back to the
+      // display-only tool_result preview for older server
+      // versions that don't emit tool_result_full.
+      if (ev.tool_name === 'todo_write' && ev.tool_status === 'ok') {
+        const payload = ev.tool_result_full || ev.tool_result
+        if (payload) {
+          try {
+            const todos: TodoItem[] = JSON.parse(payload)
+            if (Array.isArray(todos)) {
+              state.sessionTodos[id] = todos
+            }
+          } catch { /* not JSON, ignore */ }
+        }
       }
       break
     }
@@ -599,6 +787,24 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.message) {
         if (!m._statusText) (m as any)._statusText = []
         ;(m as any)._statusText.push(ev.message)
+      }
+      break
+    case 'session_status':
+      // Lifecycle signal from the agent loop:
+      //   "busy"  — turn just started, more chunks coming.
+      //             Set state.sessionWorking[id] = true.
+      //   "idle"  — turn exited (any reason). Set to false.
+      //             If the LLM never wrote `todos: []`, the
+      //             TodoPanel state machine's "clear" path
+      //             handles stale-cleanup; we don't wipe
+      //             here.
+      //   "retry" — same as busy (treat as live).
+      // The TodoPanel reads `currentSessionWorking` to
+      // decide show vs hide vs clear.
+      if (ev.session_status === 'busy' || ev.session_status === 'retry') {
+        state.sessionWorking[id] = true
+      } else if (ev.session_status === 'idle') {
+        state.sessionWorking[id] = false
       }
       break
     case 'done':
@@ -619,15 +825,24 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
     case 'question':
       // LLM is asking the user a question. Parse the
       // question JSON and surface it via QuestionModal.
+      // Keyed by session id so a background session's
+      // question doesn't appear (or get answered) on the
+      // session the user happens to be viewing.
+      console.log('[chat] received question event, question_json length:', ev.question_json?.length ?? 0)
       if (ev.question_json) {
         try {
           const questions: QuestionItem[] = JSON.parse(ev.question_json)
+          console.log('[chat] parsed %d questions', questions.length)
           // Create a Promise that resolves when the user answers.
           const answerPromise = new Promise<Record<string, string>>((resolve) => {
-            state.pendingQuestion = { questions, resolve }
+            state.pendingQuestion[id] = { questions, resolve }
           })
           // The answer will be submitted via submitQuestionAnswer().
-        } catch { /* ignore parse errors */ }
+        } catch {
+          console.error('[question] failed to parse question_json:', ev.question_json?.slice(0, 200))
+        }
+      } else {
+        console.warn('[chat] question event with no question_json')
       }
       break
     case 'tool_confirm':
@@ -635,7 +850,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         try {
           const cfm = JSON.parse(ev.tool_confirm_json) as { tool_name: string; args: string; reason: string }
           new Promise<boolean>((resolve) => {
-            state.pendingConfirm = {
+            state.pendingConfirm[id] = {
               toolName: cfm.tool_name,
               args: cfm.args,
               reason: cfm.reason,
@@ -726,18 +941,25 @@ export function endStream(id: string) {
 }
 
 export function submitQuestionAnswer(answers: Record<string, string>) {
-  const id = state.currentID
-  if (!id || !state.pendingQuestion) return
-  const pq = state.pendingQuestion
-  state.pendingQuestion = null
-  // Resolve the Promise so the LLM continues.
-  pq.resolve(answers)
-  // POST the answer to the server so the blocked tool handler
-  // receives it and the agent loop continues.
-  api.submitQuestionResponse(id, {
-    questions: pq.questions,
-    answers,
-  })
+  // Always answer the question that belongs to the *session
+  // that asked it* — not whatever session the user happens to
+  // be viewing. The sessionID is captured in the question
+  // event's key; we just look it up here.
+  for (const [sid, pq] of Object.entries(state.pendingQuestion)) {
+    if (pq) {
+      const id = sid
+      delete state.pendingQuestion[id]
+      // Resolve the Promise so the LLM continues.
+      pq.resolve(answers)
+      // POST the answer to the server so the blocked tool handler
+      // receives it and the agent loop continues.
+      api.submitQuestionResponse(id, {
+        questions: pq.questions,
+        answers,
+      })
+      return
+    }
+  }
 }
 
 async function submitConfirmResponseInner(id: string, approved: boolean) {
@@ -749,12 +971,59 @@ async function submitConfirmResponseInner(id: string, approved: boolean) {
 }
 
 export function submitToolConfirm(approved: boolean) {
-  const id = state.currentID
-  if (!id || !state.pendingConfirm) return
-  const pc = state.pendingConfirm
-  state.pendingConfirm = null
-  pc.resolve(approved)
-  submitConfirmResponseInner(id, approved)
+  // Same multi-session reasoning as submitQuestionAnswer:
+  // the confirm belongs to whichever session requested it.
+  for (const [sid, pc] of Object.entries(state.pendingConfirm)) {
+    if (pc) {
+      const id = sid
+      delete state.pendingConfirm[id]
+      pc.resolve(approved)
+      submitConfirmResponseInner(id, approved)
+      return
+    }
+  }
 }
 
+// isStreaming answers "is the *current* session streaming?"
+// — the InputArea uses this to decide between the Send and
+// Stop buttons. Background sessions may also be streaming
+// (see isAnyStreaming) without affecting the current view.
 export const isStreaming = computed(() => !!state.streaming[state.currentID])
+
+// isAnyStreaming is true if *any* session is generating.
+// SessionSidebar uses this to surface the per-session dot
+// indicator regardless of which session the user is on.
+export const isAnyStreaming = computed(() => Object.keys(state.streaming).length > 0)
+
+// isSessionStreaming lets callers check a specific session
+// without coupling to state.currentID. The stop() handler
+// uses it to operate on the session the user is actually
+// viewing even if its streaming entry is keyed differently
+// than expected.
+export function isSessionStreaming(id: string): boolean {
+  return !!state.streaming[id]
+}
+
+// currentPendingQuestion / currentPendingConfirm resolve the
+// pending question / tool confirm for the session the user is
+// currently viewing. Background sessions can have their own
+// pendingQuestion / pendingConfirm — those won't show up here
+// and won't be visible to the user until they switch to that
+// session. Submitting an answer (in submitQuestionAnswer /
+// submitToolConfirm) is keyed off the session that asked, not
+// state.currentID.
+export const currentPendingQuestion = computed(() =>
+  state.pendingQuestion[state.currentID] || null,
+)
+export const currentPendingConfirm = computed(() =>
+  state.pendingConfirm[state.currentID] || null,
+)
+
+// currentAttachments returns the staged attachments for the
+// session the user is currently viewing. Per-session storage
+// lets users start editing a message in one conversation,
+// switch to another, and have their staged files preserved
+// when they switch back.
+export const currentAttachments = computed(() =>
+  state.pendingAttachments[state.currentID] || [],
+)

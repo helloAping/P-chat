@@ -11,7 +11,7 @@ import { NInput, NButton, NSpace, NScrollbar, useMessage } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import * as api from '../api/client'
 import {
-  state, currentMeta, addAttachment, removeAttachment, clearAttachments,
+  state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments,
   isStreaming, startStream, stopStream, appendStreamEvent, endStream,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
@@ -36,7 +36,7 @@ function resizeTextarea() {
 }
 
 watch(inputText, () => nextTick(resizeTextarea))
-watch(() => state.pendingAttachments.length, () => nextTick(resizeTextarea))
+watch(() => currentAttachments.value.length, () => nextTick(resizeTextarea))
 
 // Also sync after backspace / clear (send resets inputText to '').
 onMounted(() => nextTick(resizeTextarea))
@@ -44,7 +44,20 @@ const sending = ref(false)
 const showSessionConfig = ref(false)
 const message = useMessage()
 const fileInput = ref<HTMLInputElement | null>(null)
-const reasoningEffort = ref('off')
+const reasoningEffort = computed({
+  get: () => {
+    if (!state.currentID) return 'off'
+    return state.sessionMeta[state.currentID]?.reasoning_effort || 'off'
+  },
+  set: async (val: string) => {
+    if (!state.currentID) return
+    state.sessionMeta[state.currentID] = {
+      ...state.sessionMeta[state.currentID],
+      reasoning_effort: val,
+    }
+    try { await api.setReasoningEffort(state.currentID, val) } catch {}
+  },
+})
 
 const reasoningEffortOptions = [
   {
@@ -59,13 +72,6 @@ const reasoningEffortOptions = [
     ],
   },
 ]
-
-async function onChangeReasoningEffort(val: string) {
-  reasoningEffort.value = val
-  if (state.currentID) {
-    try { await api.setReasoningEffort(state.currentID, val) } catch {}
-  }
-}
 
 const planMode = computed(() => {
   if (!state.currentID) return false
@@ -516,7 +522,15 @@ function pushAssistantMessage(sessionId: string, content: string) {
 
 async function send() {
   const raw = inputText.value.trim()
-  if (!raw || sending.value) return
+  if (!raw) return
+  // NOTE: we intentionally do NOT gate on `sending.value`
+  // here. That ref is local to this InputArea instance, but
+  // multiple conversations can stream in parallel. If session
+  // A is mid-stream, `sending` is true; the user switching to
+  // session B (which is not streaming) should still be able to
+  // send. The send/stop button is already gated on
+  // `isStreaming` (per-session), so double-clicks within the
+  // same session are already impossible.
 
   if (isSlashLine()) {
     const parsed = parseSlashLine()
@@ -579,15 +593,28 @@ async function send() {
   //     bubble (the data URL goes into `url`, the original file
   //     name into `name`) so the user sees the image right
   //     away, not after a server round-trip.
+  //
+  // Attachments are read from the *current* session's pending
+  // list — per-session storage means staging files in one
+  // conversation doesn't leak into another when the user
+  // switches.
   const inlineAttachments: api.InlineAttachment[] = []
   const bubbleAttachments: api.InlineAttachment[] = []
-  for (const a of state.pendingAttachments) {
+  for (const a of currentAttachments.value) {
     if (a._error) continue
     const data = a._dataURL
     if (!data) continue
     if (a.kind === 'image') {
       inlineAttachments.push({ type: 'image_url', url: data, name: a.name, kind: a.kind, mime: a.mime })
       bubbleAttachments.push({ type: 'image_url', url: data, name: a.name, kind: a.kind, mime: a.mime })
+    } else if (a.kind === 'audio' || a.kind === 'video') {
+      // Audio and video ride the same wire path as images:
+      // base64 data URL on a *_url attachment type. The LLM
+      // can't actually hear/watch them today (no native
+      // adapter), but the chat bubble renders a player.
+      const wire = a.kind === 'audio' ? 'audio_url' : 'video_url'
+      inlineAttachments.push({ type: wire, url: data, name: a.name, kind: a.kind, mime: a.mime })
+      bubbleAttachments.push({ type: wire, url: data, name: a.name, kind: a.kind, mime: a.mime })
     } else {
       inlineAttachments.push({ type: 'text', text: data, name: a.name, kind: a.kind, mime: a.mime })
       bubbleAttachments.push({ type: 'text', text: data, name: a.name, kind: a.kind, mime: a.mime })
@@ -841,21 +868,22 @@ onMounted(() => {
       class="input-wrap"
       :class="{
         dragover: isDragging,
-        'has-attachments': state.pendingAttachments.length > 0,
+        'has-attachments': currentAttachments.length > 0,
       }"
       @dragover="onDragOver"
       @dragleave="onDragLeave"
       @drop="onDrop"
     >
-      <div v-if="state.pendingAttachments.length > 0" class="attach-strip">
+      <div v-if="currentAttachments.length > 0" class="attach-strip">
         <div
-          v-for="(a, i) in state.pendingAttachments"
+          v-for="(a, i) in currentAttachments"
           :key="i"
           class="attach-chip"
           :class="{ uploading: a._uploading, error: a._error }"
         >
           <div class="thumb">
             <img v-if="a.kind === 'image'" :src="a._previewURL" :alt="a.name" />
+            <video v-else-if="a.kind === 'video'" :src="a._previewURL" muted preload="metadata" />
             <span v-else-if="a.kind === 'audio'">🔊</span>
             <span v-else-if="a.kind === 'text'">📝</span>
             <span v-else>📄</span>
@@ -864,66 +892,53 @@ onMounted(() => {
           <button class="rm" @click="removeAttachment(i)" title="移除">×</button>
         </div>
       </div>
-      <textarea
-        ref="inputEl"
-        v-model="inputText"
-        class="textarea"
-        rows="1"
-        :placeholder="isSlashLine() ? '输入 / 后跟命令 (例如 /help)' : '输入消息，Enter 发送，Shift+Enter 换行，Esc 停止，/ 前缀是命令'"
-        @keydown="onKeyDown"
-        @paste="onPaste"
-      ></textarea>
-      <button
-        v-if="!isStreaming"
-        class="send-btn"
-        :disabled="!inputText.trim()"
-        @click="send"
-        title="发送 (Enter)"
-      >➤</button>
-      <button
-        v-else
-        class="stop-btn"
-        @click="stop"
-        title="停止 (Esc)"
-      >■</button>
-    </div>
-
-    <!-- Two always-visible dropdowns (no toggle button): one for
-         style, one for the (provider, model) pair. Both are
-         per-session — they live next to the attach button so the
-         user can switch context mid-conversation.
-
-         The bottom row is split into two sub-rows:
-           - controls: 📎 add + style + model (these can grow)
-           - hints: keyboard shortcuts (compact, pushed right)
-         Splitting prevents the row from overflowing on narrow
-         chat windows, which previously pushed the entire input
-         area — and the chat above it — out of the visible
-         viewport. The full input-area is also bounded by
-         `max-height` with internal scrolling so it can never
-         exceed a sane share of the window. -->
-    <div class="input-bottom">
-      <input
-        ref="fileInput"
-        type="file"
-        multiple
-        style="display:none"
-        accept="image/*,audio/*,text/*,.pdf,.json,.md,.txt,.csv,.yaml,.yml,.go,.py,.js,.ts"
-        @change="onFiles(($event.target as HTMLInputElement).files)"
-      />
-      <div class="input-controls">
-        <button class="attach-btn" @click="onPickFiles" title="添加附件(支持拖拽、剪贴板粘贴)">
-          <span>📎</span><span>添加附件</span>
-        </button>
+      <div class="input-row">
+        <button class="attach-icon-btn" @click="onPickFiles" title="添加附件(支持拖拽、剪贴板粘贴)">📎</button>
+        <textarea
+          ref="inputEl"
+          v-model="inputText"
+          class="textarea"
+          rows="1"
+          :placeholder="isSlashLine() ? '输入 / 后跟命令 (例如 /help)' : '输入消息，Enter 发送，Shift+Enter 换行，Esc 停止，/ 前缀是命令'"
+          @keydown="onKeyDown"
+          @paste="onPaste"
+        ></textarea>
         <NSelect
           v-model:value="currentStyleValue"
           :options="styleOptions"
-          size="small"
+          size="tiny"
           :disabled="!state.currentID"
-          class="picker"
+          class="style-pick"
           title="选择人格风格"
-          placeholder="选择风格"
+          placeholder="风格"
         />
+        <button
+          v-if="!isStreaming"
+          class="send-btn"
+          :disabled="!inputText.trim()"
+          @click="send"
+          title="发送 (Enter)"
+        >➤</button>
+        <button
+          v-else
+          class="stop-btn"
+          @click="stop"
+          title="停止 (Esc)"
+        >■</button>
+      </div>
+    </div>
+    <input
+      ref="fileInput"
+      type="file"
+      multiple
+      style="display:none"
+      accept="image/*,audio/*,video/*,text/*,.pdf,.json,.md,.txt,.csv,.yaml,.yml,.go,.py,.js,.ts"
+      @change="onFiles(($event.target as HTMLInputElement).files)"
+    />
+
+    <!-- Bottom row: model picker + quick settings + hints -->
+    <div class="input-bottom">
+      <div class="input-main">
         <NSelect
           v-model:value="currentSelectionValue"
           :options="modelOptions"
@@ -933,6 +948,8 @@ onMounted(() => {
           title="选择模型 (按提供商分组; ⭐ = 默认)"
           placeholder="选择模型"
         />
+      </div>
+      <div class="input-secondary">
         <NSelect
           v-model:value="reasoningEffort"
           :options="reasoningEffortOptions"
@@ -940,7 +957,6 @@ onMounted(() => {
           class="picker picker-narrow"
           title="推理等级 (off/low/medium/high/max)"
           placeholder="推理"
-          @update:value="onChangeReasoningEffort"
         />
         <NButton
           size="small"
@@ -948,23 +964,21 @@ onMounted(() => {
           :disabled="!state.currentID"
           @click="togglePlanMode"
           title="切换计划/构建模式"
-          style="font-size:11px"
         >{{ planMode ? '📋 计划' : '🔨 构建' }}</NButton>
         <NSelect
           v-model:value="permissionLevel"
           :options="permissionOptions"
           size="small"
           :disabled="!state.currentID"
-          class="picker picker-narrow"
+          class="picker picker-perm"
           title="权限级别"
           @update:value="onChangePermissionLevel"
         />
-      </div>
-      <div class="hints">
-        <span><kbd>Enter</kbd> 发送</span>
-        <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
-        <span><kbd>Esc</kbd> 停止</span>
-        <span><kbd>/</kbd> 命令</span>
+        <div class="hints">
+          <span><kbd>Enter</kbd> 发送</span>
+          <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
+          <span><kbd>Esc</kbd> 停止</span>
+        </div>
       </div>
     </div>
   </div>
@@ -1039,11 +1053,10 @@ onMounted(() => {
  * padding + textarea's top margin provides the spacing, and
  * the box's outer border wraps both). */
 .input-wrap {
-  position: relative;
   background: var(--bg-input);
   border: 1px solid var(--border-2);
   border-radius: 10px;
-  padding: 0 48px 0 12px;
+  padding: 0 12px 0 12px;
   transition: border-color 0.15s;
   display: flex;
   flex-direction: column;
@@ -1051,6 +1064,22 @@ onMounted(() => {
 .input-wrap.has-attachments { padding-top: 0; }
 .input-wrap:focus-within { border-color: var(--accent); }
 .input-wrap.dragover { border-color: var(--accent-2); background: var(--bg-3); }
+.input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.attach-icon-btn {
+  width: 32px; height: 32px;
+  border: none; border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 16px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+.attach-icon-btn:hover { color: var(--accent); background: var(--bg-3); }
 .textarea {
   background: transparent;
   border: none;
@@ -1058,47 +1087,45 @@ onMounted(() => {
   font-size: 14px;
   outline: none;
   resize: none;
-  width: 100%;
+  flex: 1;
   /* Height is managed by resizeTextarea(). */
   font-family: inherit;
   line-height: 1.5;
-  /* Tight top margin so the textarea sits right under the chip
-   * strip; the strip's own padding-bottom provides the visual
-   * gap, which keeps them joined to the same box. */
   margin: 0;
   padding: 8px 0 8px 0;
 }
+.style-pick {
+  --n-border: none !important;
+  --n-border-hover: none !important;
+  --n-border-focus: none !important;
+  --n-box-shadow-focus: none !important;
+  flex: 0 0 auto;
+  min-width: 72px;
+  max-width: 100px;
+}
+.style-pick :deep(.n-base-selection) {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+.style-pick :deep(.n-base-selection:hover) {
+  background: var(--bg-3) !important;
+}
 .send-btn, .stop-btn {
-  position: absolute;
-  right: 8px; bottom: 8px;
   width: 32px; height: 32px;
   border: none; border-radius: 8px;
   font-size: 14px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   background: var(--accent); color: var(--on-accent);
+  flex-shrink: 0;
+  margin-left: 8px;
 }
 .send-btn:disabled { background: var(--bg-3); color: var(--text-4); cursor: not-allowed; }
 .send-btn:hover:not(:disabled) { background: var(--accent-2); }
 .stop-btn { background: var(--error); }
 .stop-btn:hover { background: var(--error); opacity: 0.85; }
 
-.input-bottom {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-top: 6px; gap: 6px;
-}
-.attach-btn {
-  background: transparent; color: var(--text-2);
-  border: 1px dashed var(--border-2);
-  border-radius: 6px;
-  padding: 4px 10px;
-  font-size: 12px;
-  cursor: pointer;
-  display: flex; align-items: center; gap: 4px;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-.attach-btn:hover { background: var(--bg-3); border-color: var(--accent-2); color: var(--accent-2); }
-.attach-btn.active { background: var(--bg-3); border-style: solid; border-color: var(--accent); color: var(--accent); }
-.hints { font-size: 10px; color: var(--text-4); display: flex; gap: 12px; margin-left: auto; }
+.hints { font-size: 10px; color: var(--text-4); display: flex; gap: 10px; margin-left: auto; white-space: nowrap; }
 .hints kbd {
   background: var(--bg-3); border: 1px solid var(--border-2);
   border-radius: 3px; padding: 0 4px; font-family: ui-monospace, Menlo, monospace; font-size: 9px;
@@ -1106,20 +1133,23 @@ onMounted(() => {
 
 /* Inline session-config dropdowns (always visible, no toggle). */
 .picker {
-  /* The two NSelects sit in the bottom bar; a fixed-ish width keeps
-     them readable without crowding the hints on the right. */
   min-width: 110px;
-  max-width: 160px;
+  max-width: 150px;
   flex: 0 0 auto;
 }
 .picker-wide {
-  min-width: 180px;
-  max-width: 240px;
+  min-width: 170px;
+  max-width: 260px;
   flex: 1 1 180px;
 }
 .picker-narrow {
-  min-width: 70px;
-  max-width: 90px;
+  min-width: 72px;
+  max-width: 100px;
+  flex: 0 0 auto;
+}
+.picker-perm {
+  min-width: 120px;
+  max-width: 150px;
   flex: 0 0 auto;
 }
 
@@ -1142,17 +1172,22 @@ onMounted(() => {
 }
 .input-bottom {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   margin-top: 6px;
-  gap: 6px 8px;
+  gap: 6px;
 }
-.input-controls {
+.input-main {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+}
+.input-secondary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
   flex: 1 1 auto;
   min-width: 0;
+  justify-content: flex-end;
 }
 </style>

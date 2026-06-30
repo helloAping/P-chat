@@ -27,16 +27,26 @@
 //     shown before the first SSE event arrives, so
 //     the user sees a blinking caret alone in the
 //     bubble as soon as they hit send.
-import { computed } from 'vue'
+import { computed, nextTick, useTemplateRef, watch } from 'vue'
 import { marked } from 'marked'
-import type { Message, MessagePart } from '../api/client'
+import { useMessage } from 'naive-ui'
+import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import { state } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import SubAgentCard from './SubAgentCard.vue'
 import TypedText from './TypedText.vue'
+import {
+  copyImageToClipboard, copyText, downloadBlob, downloadFromUrl,
+  extensionForMime, fetchAsBlob,
+} from '../utils/clipboard'
 
 const props = defineProps<{ message: Message; streaming?: boolean }>()
+// toast is the Naive UI useMessage() handle. Used to
+// surface "已复制"/"已下载" feedback at the top of the
+// screen. Named `toast` rather than `message` so it
+// doesn't shadow `props.message` (the chat Message).
+const toast = useMessage()
 
 // isLiveTextPart returns true for the trailing text
 // part of an actively-streaming message. This is the
@@ -92,17 +102,230 @@ const userHtml = computed(() => {
 
 // Attachments (images / files) — only used by user
 // messages today, but kept general.
-function openLightbox(src: string, alt: string) {
-  state.lightbox = { show: true, src, alt }
+function openLightbox(src: string, alt: string, kind: 'image' | 'video' = 'image') {
+  state.lightbox = { show: true, src, alt, kind }
 }
 function thumbText(kind?: string) {
   switch (kind) {
     case 'image': return '🖼'
     case 'audio': return '🔊'
+    case 'video': return '🎬'
     case 'text':  return '📝'
     default:      return '📄'
   }
 }
+
+// --- Copy / download for attachments ------------------------
+
+// friendlyAttachmentName picks a sensible filename for a
+// download when the original name is missing or weird.
+function friendlyAttachmentName(a: MessageAttachment): string {
+  if (a.name && a.name.trim()) return a.name
+  const mime = a.mime || (a.kind === 'image' ? 'image/png'
+    : a.kind === 'audio' ? 'audio/mpeg'
+    : a.kind === 'video' ? 'video/mp4' : 'text/plain')
+  const stem = a.kind && a.kind !== 'file' ? a.kind : 'attachment'
+  return `${stem}-${Date.now()}${extensionForMime(mime)}`
+}
+
+async function copyAttachment(a: MessageAttachment) {
+  if (a.type === 'text') {
+    if (a.text) {
+      const ok = await copyText(a.text)
+      toast[ok ? 'success' : 'error'](ok ? '已复制' : '复制失败')
+      return
+    }
+  }
+  if (!a.url) {
+    toast.error('没有可复制的内容')
+    return
+  }
+  // Image attachments can go on the system clipboard
+  // via the ClipboardItem API. Audio/video fall back to
+  // a regular download (no browser-side clipboard
+  // support for those).
+  if (a.type === 'image_url') {
+    try {
+      const blob = await fetchAsBlob(a.url)
+      const ok = await copyImageToClipboard(blob)
+      if (ok) {
+        toast.success('已复制到剪贴板')
+        return
+      }
+    } catch { /* fall through to download */ }
+    downloadFromUrl(a.url, friendlyAttachmentName(a))
+    toast.info('剪贴板不支持图片，已改为下载')
+    return
+  }
+  downloadFromUrl(a.url, friendlyAttachmentName(a))
+  toast.success('已下载')
+}
+
+async function downloadAttachment(a: MessageAttachment) {
+  if (a.type === 'text' && a.text) {
+    const blob = new Blob([a.text], { type: a.mime || 'text/plain' })
+    downloadBlob(blob, friendlyAttachmentName(a))
+    toast.success('已下载')
+    return
+  }
+  if (!a.url) {
+    toast.error('没有可下载的内容')
+    return
+  }
+  if (a.url.startsWith('data:')) {
+    downloadFromUrl(a.url, friendlyAttachmentName(a))
+    toast.success('已下载')
+    return
+  }
+  try {
+    const blob = await fetchAsBlob(a.url)
+    downloadBlob(blob, friendlyAttachmentName(a))
+    toast.success('已下载')
+  } catch (e: any) {
+    toast.error(`下载失败: ${e?.message || e}`)
+  }
+}
+
+// --- Copy whole message -------------------------------------
+
+// messageMarkdownText returns a clean text representation
+// of the message: for user messages that's the raw
+// `content`, for assistant messages it's the joined text
+// parts. Attachments and tool calls are skipped.
+function messageMarkdownText(): string {
+  const m = props.message
+  if (m.role === 'user' || m.role === 'system' || m.role === 'tool') {
+    return m.content || ''
+  }
+  if (m.parts && m.parts.length) {
+    return m.parts
+      .filter((p: any) => p.kind === 'text')
+      .map((p: any) => p.text || '')
+      .join('\n\n')
+  }
+  return m.content || ''
+}
+
+async function copyEntireMessage() {
+  const text = messageMarkdownText()
+  if (!text) {
+    toast.error('消息为空')
+    return
+  }
+  const ok = await copyText(text)
+  toast[ok ? 'success' : 'error'](ok ? '已复制整条消息' : '复制失败')
+}
+
+// --- Code-block toolbar injection ---------------------------
+
+// mdBodyEl is the ref on every <div class="md-body"
+// v-html="..."> in the template. We watch it and inject
+// a copy / download toolbar into each <pre> child.
+// Marked's output for fenced code blocks is
+// <pre><code class="language-xxx">…</code></pre>; we leave
+// the <pre>/<code> alone and prepend the toolbar.
+const mdBodyEl = useTemplateRef<HTMLElement>('mdBodyEl')
+
+// processedPres tracks <pre> nodes that already have a
+// toolbar attached, so we don't double-inject on every
+// watcher tick. WeakSet keeps it from preventing GC on
+// the <pre> nodes (which get replaced when the message
+// updates).
+const processedPres = new WeakSet<HTMLPreElement>()
+
+function injectCodeToolbars(root: HTMLElement | null) {
+  if (!root) return
+  const pres = root.querySelectorAll('pre')
+  pres.forEach((pre) => {
+    if (processedPres.has(pre)) return
+    const wrapper = document.createElement('div')
+    wrapper.className = 'code-block'
+    const toolbar = document.createElement('div')
+    toolbar.className = 'code-toolbar'
+    const copyBtn = document.createElement('button')
+    copyBtn.type = 'button'
+    copyBtn.className = 'code-btn code-btn-copy'
+    copyBtn.textContent = '复制'
+    copyBtn.setAttribute('data-code-action', 'copy')
+    const dlBtn = document.createElement('button')
+    dlBtn.type = 'button'
+    dlBtn.className = 'code-btn code-btn-download'
+    dlBtn.textContent = '下载'
+    dlBtn.setAttribute('data-code-action', 'download')
+    toolbar.appendChild(copyBtn)
+    toolbar.appendChild(dlBtn)
+    pre.parentNode?.insertBefore(wrapper, pre)
+    wrapper.appendChild(toolbar)
+    wrapper.appendChild(pre)
+    processedPres.add(pre)
+  })
+}
+
+// onCodeClick handles clicks on the toolbar buttons via
+// event delegation. One listener per md-body covers every
+// <pre> inside.
+async function onCodeClick(e: Event) {
+  const target = e.target as HTMLElement
+  const btn = target.closest<HTMLButtonElement>('[data-code-action]')
+  if (!btn) return
+  const action = btn.getAttribute('data-code-action')
+  const pre = btn.closest('pre')
+  if (!pre) return
+  const code = pre.querySelector('code')
+  const text = code?.textContent || pre.textContent || ''
+  if (action === 'copy') {
+    const ok = await copyText(text)
+    btn.textContent = ok ? '已复制' : '失败'
+    setTimeout(() => { btn.textContent = '复制' }, 1200)
+  } else if (action === 'download') {
+    const langClass = Array.from(code?.classList || []).find(c => c.startsWith('language-'))
+    const lang = langClass ? langClass.slice('language-'.length) : ''
+    const ext = langExt(lang) || '.txt'
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+    downloadBlob(blob, `snippet-${Date.now()}${ext}`)
+  }
+}
+
+// langExt maps common marked.js language class names to
+// their file extension.
+function langExt(lang: string): string {
+  const l = lang.toLowerCase()
+  const map: Record<string, string> = {
+    py: '.py', python: '.py',
+    js: '.js', javascript: '.js', jsx: '.jsx',
+    ts: '.ts', typescript: '.ts', tsx: '.tsx',
+    go: '.go',
+    rs: '.rs', rust: '.rs',
+    java: '.java',
+    rb: '.rb', ruby: '.rb',
+    sh: '.sh', bash: '.sh', zsh: '.sh',
+    json: '.json',
+    yaml: '.yaml', yml: '.yml',
+    toml: '.toml',
+    xml: '.xml',
+    html: '.html', htm: '.html',
+    css: '.css', scss: '.scss', less: '.less',
+    md: '.md', markdown: '.md',
+    sql: '.sql',
+    txt: '.txt', text: '.txt',
+    vue: '.vue', svelte: '.svelte',
+  }
+  return map[l] || ''
+}
+
+// Re-inject toolbars whenever the markdown HTML changes
+// (new SSE chunk, message re-render, etc.). The
+// processedPres set keeps re-runs cheap — each <pre> is
+// only touched once.
+watch(mdBodyEl, async (el) => {
+  await nextTick()
+  injectCodeToolbars(el)
+}, { flush: 'post' })
+
+watch(userHtml, async () => {
+  await nextTick()
+  injectCodeToolbars(mdBodyEl.value)
+})
 function shortWarnText(t?: string): string {
   if (!t) return 'image skipped'
   const m = t.match(/\(attached image: ([^,]+)/)
@@ -159,17 +382,59 @@ const showVisionWarn = computed(() =>
     <div class="bubble">
       <div v-if="isSystem" class="system-icon">›</div>
       <div class="bubble-body">
+        <!-- Hover-revealed bubble actions: copy the whole
+             message. Works on user (copies raw input), assistant
+             (joins text parts), and system bubbles. -->
+        <div class="bubble-actions" :data-role="message.role">
+          <button
+            type="button"
+            class="bubble-action-btn"
+            title="复制整条消息"
+            @click="copyEntireMessage"
+          >📋</button>
+        </div>
+
         <!-- Attachments (user / tool) -->
         <div v-if="message.attachments && message.attachments.length" class="attachments">
           <template v-for="(a, i) in message.attachments" :key="i">
-            <img
-              v-if="a.type === 'image_url' && a.url"
-              class="msg-image"
-              :src="a.url"
-              :alt="a.name || 'image'"
-              loading="lazy"
-              @click="openLightbox(a.url, a.name || 'image')"
-            />
+            <div v-if="a.type === 'image_url' && a.url" class="attach-wrap">
+              <img
+                class="msg-image"
+                :src="a.url"
+                :alt="a.name || 'image'"
+                loading="lazy"
+                @click="openLightbox(a.url, a.name || 'image', 'image')"
+              />
+              <div class="attach-actions">
+                <button type="button" class="attach-action-btn" title="复制图片" @click="copyAttachment(a)">📋</button>
+                <button type="button" class="attach-action-btn" title="下载图片" @click="downloadAttachment(a)">⬇</button>
+              </div>
+            </div>
+            <div v-else-if="a.type === 'video_url' && a.url" class="attach-wrap">
+              <video
+                class="msg-video"
+                :src="a.url"
+                controls
+                preload="metadata"
+                :title="a.name || 'video'"
+                @click.stop
+              />
+              <div class="attach-actions">
+                <button type="button" class="attach-action-btn" title="下载视频" @click="downloadAttachment(a)">⬇</button>
+              </div>
+            </div>
+            <div v-else-if="a.type === 'audio_url' && a.url" class="attach-wrap">
+              <audio
+                class="msg-audio"
+                :src="a.url"
+                controls
+                preload="metadata"
+                :title="a.name || 'audio'"
+              />
+              <div class="attach-actions">
+                <button type="button" class="attach-action-btn" title="下载音频" @click="downloadAttachment(a)">⬇</button>
+              </div>
+            </div>
             <div
               v-else-if="a.type === 'text' && a.kind === 'image_not_supported'"
               class="msg-image-warn"
@@ -178,8 +443,14 @@ const showVisionWarn = computed(() =>
               <span class="warn-icon">⚠</span>
               <span class="warn-text">{{ shortWarnText(a.text) }}</span>
             </div>
-            <div v-else-if="a.type === 'text'" class="msg-file" :title="a.text">
-              {{ thumbText(a.kind) }} {{ a.name || '文件' }}
+            <div v-else-if="a.type === 'text'" class="msg-file-wrap">
+              <div class="msg-file" :title="a.text">
+                {{ thumbText(a.kind) }} {{ a.name || '文件' }}
+              </div>
+              <div class="attach-actions attach-actions-inline">
+                <button type="button" class="attach-action-btn" title="复制内容" @click="copyAttachment(a)">📋</button>
+                <button type="button" class="attach-action-btn" title="下载" @click="downloadAttachment(a)">⬇</button>
+              </div>
             </div>
           </template>
         </div>
@@ -200,8 +471,10 @@ const showVisionWarn = computed(() =>
         <!-- User / system / tool: markdown of `content` -->
         <div
           v-if="message.role === 'user' || message.role === 'system' || message.role === 'tool'"
+          ref="mdBodyEl"
           class="md-body"
           v-html="userHtml"
+          @click="onCodeClick"
         />
 
         <!-- Assistant: parts-driven render.
@@ -237,13 +510,20 @@ const showVisionWarn = computed(() =>
               />
               <div
                 v-else-if="p.kind === 'text'"
+                ref="mdBodyEl"
                 class="md-body"
                 v-html="marked.parse(p.text || '', { async: false, breaks: true })"
+                @click="onCodeClick"
               />
             </template>
           </template>
           <template v-else-if="message.content">
-            <div class="md-body" v-html="userHtml"></div>
+            <div
+              ref="mdBodyEl"
+              class="md-body"
+              v-html="userHtml"
+              @click="onCodeClick"
+            ></div>
           </template>
           <!-- Streaming placeholder: a blinking caret
                alone in the bubble, ready to receive the
@@ -284,6 +564,7 @@ const showVisionWarn = computed(() =>
   border-radius: 10px;
   word-wrap: break-word;
   overflow-wrap: break-word;
+  position: relative;
 }
 .msg.user .bubble {
   background: var(--accent);
@@ -323,6 +604,53 @@ const showVisionWarn = computed(() =>
   line-height: 1.4;
 }
 .bubble-body { min-width: 0; flex: 1; }
+
+/* Bubble-level "copy whole message" affordance. Pinned to
+ * the top-right of the bubble, visible on hover so it
+ * doesn't crowd the bubble when not needed. The same
+ * affordance works on user, assistant, and system bubbles
+ * — the source text is selected per role. */
+.bubble-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 2;
+}
+.bubble:hover .bubble-actions { opacity: 1; }
+.bubble-action-btn {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-2);
+  color: var(--text-2);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  opacity: 0.92;
+}
+.bubble-action-btn:hover {
+  background: var(--bg-3);
+  color: var(--text);
+  opacity: 1;
+}
+.msg.user .bubble-action-btn {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: var(--on-accent);
+}
+.msg.user .bubble-action-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+  color: var(--on-accent);
+}
 .attachments {
   display: flex;
   flex-wrap: wrap;
@@ -335,8 +663,57 @@ const showVisionWarn = computed(() =>
   border-radius: 6px;
   cursor: zoom-in;
   background: var(--bg);
+  display: block;
 }
 .msg-image:hover { opacity: 0.92; }
+
+/* attach-wrap is the container that holds the
+ * attachment preview plus its hover-revealed action
+ * toolbar. Position relative so the toolbar can anchor
+ * to the corner without breaking layout. */
+.attach-wrap {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+}
+.attach-wrap:hover .attach-actions,
+.attach-wrap:focus-within .attach-actions { opacity: 1; }
+.attach-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 2;
+}
+.attach-actions-inline {
+  position: static;
+  display: inline-flex;
+  vertical-align: middle;
+  margin-left: 4px;
+  opacity: 1;
+}
+.attach-action-btn {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  backdrop-filter: blur(2px);
+}
+.attach-action-btn:hover {
+  background: rgba(0, 0, 0, 0.8);
+}
 .msg-file {
   background: var(--bg-3);
   border: 1px solid var(--border-2);
@@ -347,7 +724,10 @@ const showVisionWarn = computed(() =>
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: inline-block;
+  vertical-align: middle;
 }
+.msg-file-wrap { display: inline-flex; align-items: center; max-width: 100%; }
 .msg-image-warn {
   display: inline-flex; align-items: center; gap: 6px;
   background: var(--warn-soft);
@@ -414,5 +794,50 @@ const showVisionWarn = computed(() =>
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+</style>
+
+<style>
+/* Code-block copy/download toolbar styles. These are global
+ * (not scoped) because we inject the toolbar into the
+ * marked-rendered <pre> elements via DOM manipulation —
+ * scoped styles don't reach injected DOM. We use a
+ * dedicated class prefix (.code-block / .code-toolbar /
+ * .code-btn) so there's no collision with other code. */
+.code-block {
+  position: relative;
+  margin: 8px 0;
+}
+.code-block > pre {
+  margin: 0;
+}
+.code-toolbar {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 1;
+}
+.code-block:hover .code-toolbar,
+.code-block:focus-within .code-toolbar { opacity: 1; }
+.code-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-2);
+  cursor: pointer;
+  line-height: 1.4;
+  font-family: inherit;
+  opacity: 0.92;
+}
+.code-btn:hover {
+  background: var(--bg-3);
+  color: var(--text);
+  opacity: 1;
 }
 </style>
