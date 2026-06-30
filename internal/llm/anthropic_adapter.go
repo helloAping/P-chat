@@ -194,37 +194,79 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 
 // ParseStream reads an Anthropic SSE stream and emits StreamChunk
 // values.
+//
+// Uses bufio.Reader.ReadBytes('\n') with a 1 MB initial buffer
+// (growing as needed) instead of bufio.Scanner — Anthropic
+// reasoning/thinking deltas and long image-content blocks can
+// produce single `data:` lines that exceed the default
+// bufio.MaxScanTokenSize of 64 KiB, which silently truncates the
+// stream. See opencode's anthropic-messages.ts:242-249 for the
+// equivalent sseFraming pipeline.
 func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 	ch := make(chan StreamChunk, 64)
 
 	go func() {
 		defer close(ch)
 
-		scanner := bufio.NewScanner(r)
-		for scanner.Scan() {
-			line := scanner.Text()
+		reader := bufio.NewReaderSize(r, 1<<20)
+		var eventType string
+		for {
+			line, err := readSSELine(reader)
+			if err != nil {
+				if err != io.EOF {
+					ch <- StreamChunk{Err: err}
+				}
+				return
+			}
 			if line == "" {
+				// Blank line = end of SSE event. Reset and
+				// continue. The data was already dispatched
+				// when we read the "data: " line.
+				eventType = ""
 				continue
 			}
 			if strings.HasPrefix(line, "event: ") {
-				if !scanner.Scan() {
-					break
-				}
-				dataLine := scanner.Text()
-				if !strings.HasPrefix(dataLine, "data: ") {
-					continue
-				}
-				dataJSON := strings.TrimPrefix(dataLine, "data: ")
-				eventType := strings.TrimPrefix(line, "event: ")
-				a.handleStreamEvent(eventType, dataJSON, ch)
+				eventType = strings.TrimPrefix(line, "event: ")
+				continue
 			}
-		}
-		if err := scanner.Err(); err != nil {
-			ch <- StreamChunk{Err: err}
+			if strings.HasPrefix(line, "data: ") {
+				dataJSON := strings.TrimPrefix(line, "data: ")
+				a.handleStreamEvent(eventType, dataJSON, ch)
+				continue
+			}
+			// Comment lines (": something"), id lines, or
+			// unknown fields — ignore.
 		}
 	}()
 
 	return ch
+}
+
+// readSSELine reads one logical SSE line, stripping a single
+// trailing "\r" so CRLF transport works. Returns the line
+// (without trailing newline) or an error.
+func readSSELine(r *bufio.Reader) (string, error) {
+	var buf bytes.Buffer
+	for {
+		chunk, err := r.ReadBytes('\n')
+		if len(chunk) > 0 {
+			line := chunk
+			if len(line) > 0 && line[len(line)-1] == '\n' {
+				line = line[:len(line)-1]
+			}
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+			buf.Write(line)
+		}
+		if err != nil {
+			if err == io.EOF && buf.Len() > 0 {
+				return buf.String(), io.EOF
+			}
+			return "", err
+		}
+		return buf.String(), nil
+	}
 }
 
 // Send executes the HTTP request and returns a stream channel.
@@ -260,14 +302,14 @@ func (a *AnthropicAdapter) handleStreamEvent(eventType, dataJSON string, ch chan
 	case "content_block_delta":
 		var delta anthropicContentBlockDelta
 		if err := json.Unmarshal([]byte(dataJSON), &delta); err == nil {
-			switch delta.Type {
+			switch delta.Delta.Type {
 			case "text_delta":
-				if delta.Text != "" {
-					ch <- StreamChunk{Content: delta.Text}
+				if delta.Delta.Text != "" {
+					ch <- StreamChunk{Content: delta.Delta.Text}
 				}
 			case "thinking_delta":
-				if delta.Thinking != "" {
-					ch <- StreamChunk{Thinking: delta.Thinking}
+				if delta.Delta.Thinking != "" {
+					ch <- StreamChunk{Thinking: delta.Delta.Thinking}
 				}
 			}
 		}

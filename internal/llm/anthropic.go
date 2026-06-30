@@ -125,13 +125,14 @@ type anthropicStreamEvent struct {
 
 type anthropicContentBlockDelta struct {
 	Type     string `json:"type"`
-	Text     string `json:"text"`
-	// Thinking carries the chain-of-thought delta. Anthropic
-	// emits this as a "thinking_delta" content block when
-	// extended thinking is enabled on the upstream API. We
-	// only ever receive it if the upstream was configured to
-	// think — we never request it ourselves.
-	Thinking string `json:"thinking,omitempty"`
+	Index    int    `json:"index,omitempty"`
+	Delta    struct {
+		Type     string `json:"type"`
+		Text     string `json:"text,omitempty"`
+		Thinking string `json:"thinking,omitempty"`
+		// Anthropic tool_use deltas: streamed JSON input.
+		PartialJSON string `json:"partial_json,omitempty"`
+	} `json:"delta"`
 }
 
 // anthropicContentBlockStart tells us what KIND of content
@@ -244,33 +245,34 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 			return
 		}
 
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			line := scanner.Text()
+		// Use bufio.Reader.ReadBytes('\n') with a 1 MB initial
+		// buffer so reasoning/long-content SSE payloads don't get
+		// truncated by bufio.MaxScanTokenSize (64 KiB). See
+		// anthropic_adapter.go for the primary fix; this is the
+		// same logic kept in sync for the legacy non-stream
+		// adapter used by Chat().
+		reader := bufio.NewReaderSize(resp.Body, 1<<20)
+		var eventType string
+		for {
+			line, err := readSSELine(reader)
+			if err != nil {
+				if err != io.EOF {
+					ch <- StreamChunk{Err: err}
+				}
+				return
+			}
 			if line == "" {
+				eventType = ""
 				continue
 			}
-
-			// SSE format: "event: xxx\ndata: xxx"
 			if strings.HasPrefix(line, "event: ") {
-				// Read the next data line
-				if !scanner.Scan() {
-					break
-				}
-				dataLine := scanner.Text()
-				if !strings.HasPrefix(dataLine, "data: ") {
-					continue
-				}
-				dataJSON := strings.TrimPrefix(dataLine, "data: ")
-
-				eventType := strings.TrimPrefix(line, "event: ")
+				eventType = strings.TrimPrefix(line, "event: ")
+				continue
+			}
+			if strings.HasPrefix(line, "data: ") {
+				dataJSON := strings.TrimPrefix(line, "data: ")
 				c.handleStreamEvent(eventType, dataJSON, ch)
 			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			ch <- StreamChunk{Err: err}
-			return
 		}
 	}()
 
@@ -302,18 +304,18 @@ func (c *AnthropicClient) handleStreamEvent(eventType, dataJSON string, ch chan<
 	case "content_block_delta":
 		var delta anthropicContentBlockDelta
 		if err := json.Unmarshal([]byte(dataJSON), &delta); err == nil {
-			switch delta.Type {
+			switch delta.Delta.Type {
 			case "text_delta":
-				if delta.Text != "" {
-					ch <- StreamChunk{Content: delta.Text}
+				if delta.Delta.Text != "" {
+					ch <- StreamChunk{Content: delta.Delta.Text}
 				}
 			case "thinking_delta":
 				// Anthropic extended-thinking chain-of-
 				// thought. We only ever see this if the
 				// upstream model was configured to think
 				// — we never enable it ourselves.
-				if delta.Thinking != "" {
-					ch <- StreamChunk{Thinking: delta.Thinking}
+				if delta.Delta.Thinking != "" {
+					ch <- StreamChunk{Thinking: delta.Delta.Thinking}
 				}
 			}
 		}
