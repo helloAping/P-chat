@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -75,15 +76,23 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 
 	qj, _ := json.Marshal(questions)
 	if sendFn != nil {
+		log.Printf("[question] sending %d questions to eventCh (session=%s)", len(questions), sessionID)
 		sendFn(string(qj))
+		log.Printf("[question] sendFn returned (session=%s)", sessionID)
+	} else {
+		log.Printf("[question] WARNING: sendFn is nil (session=%s)", sessionID)
 	}
 
+	log.Printf("[question] waiting for user answer (session=%s, timeout=5m)", sessionID)
 	select {
 	case <-ctx.Done():
+		log.Printf("[question] ctx cancelled (session=%s): %v", sessionID, ctx.Err())
 		return QuestionResponse{}, ctx.Err()
 	case resp := <-ch:
+		log.Printf("[question] received answer (session=%s, %d answers)", sessionID, len(resp.Answers))
 		return resp, nil
 	case <-time.After(5 * time.Minute):
+		log.Printf("[question] timeout (session=%s)", sessionID)
 		return QuestionResponse{}, fmt.Errorf("question timed out waiting for user response")
 	}
 }

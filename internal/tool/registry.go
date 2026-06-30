@@ -274,18 +274,18 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "question",
-		Description: "Ask the user a question (or set of questions) when you need clarification, a decision, or input before proceeding. Each question can have multiple-choice options or allow free-text input. Use this when you are uncertain about requirements, need to choose between approaches, or want the user to confirm a plan before executing. The user's answers will be returned so you can continue.",
+		Description: "Ask the user a question (or set of questions) when you need clarification, a decision, or input before proceeding. Each question can have multiple-choice options or allow free-text input. Use this when you are uncertain about requirements, need to choose between approaches, or want the user to confirm a plan before executing. The user's answers will be returned so you can continue. Important: for every question, always include an '其他' (Other) option at the end so the user can provide a custom answer if none of the predefined options fit.",
 		Parameters: ObjectSchema(map[string]any{
 			"questions": map[string]any{
-				"type": "array",
+				"type":     "array",
 				"minItems": 1,
-				"maxItems": 4,
+				"maxItems": 10,
 				"items": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"question":     map[string]any{"type": "string", "description": "The complete question to ask the user"},
 						"header":       map[string]any{"type": "string", "maxLength": 12, "description": "Short label (max 12 chars) shown as a chip/tag"},
-						"options":      map[string]any{"type": "array", "minItems": 2, "maxItems": 4, "items": map[string]any{"type": "object", "properties": map[string]any{"label": map[string]any{"type": "string", "description": "Display text (1-5 words)"}, "description": map[string]any{"type": "string", "description": "Explanation of this choice"}}, "required": []string{"label", "description"}}},
+						"options":      map[string]any{"type": "array", "minItems": 2, "maxItems": 8, "items": map[string]any{"type": "object", "properties": map[string]any{"label": map[string]any{"type": "string", "description": "Display text (1-5 words)"}, "description": map[string]any{"type": "string", "description": "Explanation of this choice"}}, "required": []string{"label", "description"}}},
 						"multi_select": map[string]any{"type": "boolean", "description": "Allow selecting multiple options (default false)"},
 					},
 					"required": []string{"question", "header", "options"},
@@ -316,6 +316,25 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 		}, nil
 	}
 
+	// Block commands that try to read uploaded files. The
+	// LLM, when handed a vision-incompatible image, has
+	// historically used `cat image.png` / `xxd image.png` /
+	// `type image.png` to "see" the file. The bytes are
+	// useless as text; the LLM then invents a "model doesn't
+	// support image input" error message. read_file already
+	// rejects upload-dir paths; we mirror that here so
+	// exec_command is not an escape hatch.
+	if reason := commandReferencesUploadFile(a.Command); reason != "" {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_UPLOAD_DIR: command blocked — %s is inside the chat upload directory. "+
+					"Uploaded files are already inlined in the user message as vision/image "+
+					"content; do NOT shell out to read them. Just respond based on the "+
+					"attachment you already received.", reason),
+			IsError: true,
+		}, nil
+	}
+
 	cmd := exec.CommandContext(ctx, "cmd", "/C", a.Command)
 	root := projectRootFromCtx(ctx)
 	if a.WorkDir != "" {
@@ -330,9 +349,38 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return &CallResult{Content: fmt.Sprintf("%s\nERROR: %v", string(out), err), IsError: true}, nil
+		// Don't prefix with "ERROR: " — the LLM has been
+		// observed to copy that exact string back to the
+		// user as a fabricated tool error. The structured
+		// IsError flag is what carries the error signal;
+		// the content should describe what actually went
+		// wrong in plain language.
+		return &CallResult{Content: strings.TrimRight(string(out), "\r\n") + "\n" + err.Error(), IsError: true}, nil
 	}
 	return &CallResult{Content: string(out)}, nil
+}
+
+// commandReferencesUploadFile scans a shell command for tokens
+// that look like paths or filenames pointing into the chat
+// upload directory. Returns the matched path if found, "" if
+// the command is safe. The check is best-effort: it splits on
+// common shell-tokenising characters and on whitespace, then
+// asks isInUploadDir() for each token. The LLM doesn't try to
+// obfuscate, so a simple split is enough.
+func commandReferencesUploadFile(cmd string) string {
+	if cmd == "" {
+		return ""
+	}
+	// Split on whitespace and on common shell metachars.
+	for _, sep := range []string{" ", "\t", "\n", ">", "<", "|", ";", "&", "(", ")", "\"", "'", "`", ","} {
+		cmd = strings.ReplaceAll(cmd, sep, " ")
+	}
+	for _, tok := range strings.Fields(cmd) {
+		if isInUploadDir(tok) {
+			return tok
+		}
+	}
+	return ""
 }
 
 type readFileArgs struct {
