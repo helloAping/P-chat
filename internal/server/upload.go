@@ -17,11 +17,15 @@ import (
 // uploadKind classifies an uploaded file for the UI. The LLM layer
 // uses this to decide how to feed the file to the model:
 //
-//   image  �?OpenAI image_url content block (vision)
-//   audio  �?OpenAI input_audio content block (gpt-4o-audio)
-//   text   �?- text/* or anything we can read as text; appended to
+//   image  → OpenAI image_url content block (vision)
+//   audio  → text marker (no native audio wire block in the
+//            adapters yet — see ExpandAttachmentsCM)
+//   video  → text marker (no native video wire block in any
+//            adapter today; rendered in the chat bubble as a
+//            <video> element so the user can still preview it)
+//   text   → text/* or anything we can read as text; appended to
 //            the user message as a code-fenced block
-//   file   �?- unknown binary; also appended as a textual marker
+//   file   → unknown binary; also appended as a textual marker
 //            "filename: <name>, size: N" so the model at least
 //            knows the user attached something.
 type uploadKind string
@@ -29,6 +33,7 @@ type uploadKind string
 const (
 	kindImage uploadKind = "image"
 	kindAudio uploadKind = "audio"
+	kindVideo uploadKind = "video"
 	kindText  uploadKind = "text"
 	kindFile  uploadKind = "file"
 )
@@ -165,6 +170,16 @@ func mimeByExt(ext string) string {
 		return "audio/mp4"
 	case ".flac":
 		return "audio/flac"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	case ".mkv":
+		return "video/x-matroska"
+	case ".m4v":
+		return "video/x-m4v"
 	case ".txt":
 		return "text/plain"
 	case ".md":
@@ -211,10 +226,10 @@ func validUploadID(s string) bool {
 	return true
 }
 
-// classifyUpload picks image / audio / text / file based on the
-// extension and the Content-Type header. The MIME header is
-// advisory; the extension wins for the common cases where the
-// browser sends a generic "application/octet-stream".
+// classifyUpload picks image / audio / video / text / file
+// based on the extension and the Content-Type header. The MIME
+// header is advisory; the extension wins for the common cases
+// where the browser sends a generic "application/octet-stream".
 func classifyUpload(name, mime string) uploadKind {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
@@ -222,6 +237,8 @@ func classifyUpload(name, mime string) uploadKind {
 		return kindImage
 	case ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".aac", ".pcm":
 		return kindAudio
+	case ".mp4", ".webm", ".mov", ".mkv", ".m4v":
+		return kindVideo
 	case ".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".xml", ".html", ".htm",
 		".js", ".ts", ".tsx", ".jsx", ".go", ".py", ".rs", ".java", ".c", ".cpp",
 		".h", ".hpp", ".cs", ".rb", ".php", ".sh", ".bash", ".zsh", ".ps1",
@@ -233,6 +250,9 @@ func classifyUpload(name, mime string) uploadKind {
 	}
 	if strings.HasPrefix(mime, "audio/") {
 		return kindAudio
+	}
+	if strings.HasPrefix(mime, "video/") {
+		return kindVideo
 	}
 	if strings.HasPrefix(mime, "text/") || strings.HasPrefix(mime, "application/json") {
 		return kindText

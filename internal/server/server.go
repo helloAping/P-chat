@@ -64,6 +64,17 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	r := gin.New()
 	r.Use(gin.Recovery())
 
+	// CORS: pchat-server is normally hit same-origin (browser at
+	// http://127.0.0.1:PORT, server at the same URL). The Wails
+	// desktop app is the exception: its WebView2 lives on
+	// http://wails.localhost and proxies through the AssetServer.
+	// For SSE endpoints that can't be streamed through the
+	// AssetServer's buffered response writer, the webview opens
+	// a direct connection to the backend. The middleware below
+	// permits that one cross-origin case without weakening the
+	// default same-origin policy.
+	r.Use(corsMiddleware())
+
 	h := NewHandler(agt, cfg, store, styleMgr, mcpMgr)
 
 	// Wire the summarizer so /compress works.
@@ -174,4 +185,60 @@ func (s *Server) Run() error {
 // the PCHAT_PORT env var.
 func (s *Server) RunAt(addr string) error {
 	return s.engine.Run(addr)
+}
+
+// corsMiddleware adds the headers Chromium/WebView2 needs to allow
+// the Wails webview (origin http://wails.localhost) to call the
+// backend at http://127.0.0.1:<port> directly. The webview needs
+// this bypass for the streaming /api/v1/sessions/:id/messages SSE
+// endpoint because the Wails AssetServer's response writer buffers
+// the entire body and only sends it when the request handler
+// returns — useless for an SSE stream that parks for minutes
+// waiting on the user (the `question` tool flow).
+//
+// Same-origin browser clients (origin == backend address) are
+// unaffected: the wildcard "*" origin header is the spec-compliant
+// response for "no credentialed cross-origin", and we don't send
+// Access-Control-Allow-Credentials. The 127.0.0.1 listen address
+// already prevents WAN access, so a permissive CORS policy is safe
+// in practice.
+//
+// We also handle Chromium's Private Network Access (PNA) check.
+// The Wails origin is treated as a "public" origin by Chromium,
+// and 127.0.0.1 is a private network, so the browser sends a
+// preflight with `Access-Control-Request-Private-Network: true`
+// and refuses to make the request unless we echo back
+// `Access-Control-Allow-Private-Network: true`. Without this,
+// `fetch()` from the Wails webview to the child server just
+// times out.
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin")
+		// Same-origin requests send Origin too; reflect it back so
+		// credentialed clients stay on a strict allow-list. For
+		// cross-origin (wails.localhost) we echo the origin as well,
+		// which is required for `fetch(..., { credentials: 'omit' })`.
+		if origin != "" {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Vary", "Origin")
+		} else {
+			c.Header("Access-Control-Allow-Origin", "*")
+		}
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		c.Header("Access-Control-Max-Age", "600")
+		// Private Network Access (Chromium 94+). The Wails origin
+		// is a "public" origin and 127.0.0.1 is private; without
+		// echoing the request flag, the browser blocks the request
+		// outright. See https://developer.chrome.com/docs/privacy-security/private-network-access
+		if c.GetHeader("Access-Control-Request-Private-Network") == "true" {
+			c.Header("Access-Control-Allow-Private-Network", "true")
+		}
+		// Preflight: short-circuit and let the request through.
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
 }

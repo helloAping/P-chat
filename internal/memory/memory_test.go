@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -351,5 +352,60 @@ func TestTruncate(t *testing.T) {
 	}
 	if got := truncateStr("hello world this is long", 10); !strings.HasSuffix(got, "...") {
 		t.Errorf("truncated should end with ..., got %q", got)
+	}
+}
+
+// TestStore_GetChatMessagesWithMetaPage exercises the paged
+// variant: insert 5 messages, fetch the most recent 2, then
+// walk back via before_id until we hit the head.
+func TestStore_GetChatMessagesWithMetaPage(t *testing.T) {
+	s := testStore(t)
+	cid, err := s.NewConversation()
+	if err != nil {
+		t.Fatalf("NewConversation: %v", err)
+	}
+	_ = s.SetCurrent(cid)
+
+	for i := 0; i < 5; i++ {
+		s.AddMessage(llm.Message{Role: "user", Content: fmt.Sprintf("msg-%d", i)})
+	}
+	_ = s.Flush()
+
+	// Page 1: latest 2, no cursor.
+	msgs, _, _, ids := s.GetChatMessagesWithMetaPage(cid, 0, 2)
+	if len(msgs) != 2 {
+		t.Fatalf("page 1: want 2 msgs, got %d", len(msgs))
+	}
+	// With 5 messages (ids 1..5) and DESC LIMIT 2, the SQL
+	// layer returns rows in [5, 4] order; we then reverse to
+	// oldest-first, so the page is [msg-3, msg-4] (ids 4, 5).
+	if msgs[0].Content != "msg-3" || msgs[1].Content != "msg-4" {
+		t.Errorf("page 1 contents wrong: %+v", msgs)
+	}
+	if ids[0] != 4 {
+		t.Errorf("page 1: oldest id should be 4, got %d", ids[0])
+	}
+
+	// Page 2: before id 4 (the oldest of page 1), next 2 →
+	// eligible ids are {1, 2, 3}; SQL returns [3, 2]; we
+	// reverse to [msg-1, msg-2] (ids 2, 3).
+	msgs2, _, _, ids2 := s.GetChatMessagesWithMetaPage(cid, 4, 2)
+	if len(msgs2) != 2 {
+		t.Fatalf("page 2: want 2 msgs, got %d", len(msgs2))
+	}
+	if msgs2[0].Content != "msg-1" || msgs2[1].Content != "msg-2" {
+		t.Errorf("page 2 contents wrong: %+v", msgs2)
+	}
+	if ids2[0] != 2 {
+		t.Errorf("page 2: oldest id should be 2, got %d", ids2[0])
+	}
+
+	// has_more for the original oldest row (id 1) → false.
+	if s.HasOlderMessages(cid, 1) {
+		t.Errorf("HasOlderMessages(cid, 1) should be false")
+	}
+	// has_more for the middle row (id 3) → true (msg 0, 1 are older).
+	if !s.HasOlderMessages(cid, 3) {
+		t.Errorf("HasOlderMessages(cid, 3) should be true")
 	}
 }

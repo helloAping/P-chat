@@ -294,6 +294,7 @@ type SessionResponse struct {
 	ProjectPath string `json:"project_path,omitempty"`
 	PlanMode    bool   `json:"plan_mode,omitempty"`
 	PermissionLevel string `json:"permission_level,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 }
@@ -387,8 +388,16 @@ type StreamEvent struct {
 	ToolName    string `json:"tool_name,omitempty"`
 	ToolStatus  string `json:"tool_status,omitempty"`
 	ToolResult  string `json:"tool_result,omitempty"`
-	ToolError   string `json:"tool_error,omitempty"`
-	ToolElapsed string `json:"tool_elapsed,omitempty"`
+	// ToolResultFull is the untruncated tool result for tools
+	// whose output the frontend needs to parse (todo_write).
+	// ToolResult is a 300-char preview for display; ToolResultFull
+	// preserves the full payload (newlines and all) so the
+	// frontend can JSON.parse it without corruption. The chat
+	// store uses ToolResultFull in preference to ToolResult when
+	// the tool name is todo_write / question.
+	ToolResultFull string `json:"tool_result_full,omitempty"`
+	ToolError      string `json:"tool_error,omitempty"`
+	ToolElapsed    string `json:"tool_elapsed,omitempty"`
 	// ToolArgs is the JSON-encoded arguments string the
 	// tool was called with (best-effort; LLM clients only
 	// surface this once the call is complete, not as a
@@ -423,6 +432,16 @@ type StreamEvent struct {
 	// ToolConfirm fields — when the sandbox requires user
 	// confirmation before executing a tool.
 	ToolConfirmJSON string `json:"tool_confirm_json,omitempty"`
+
+	// SessionStatus is the lifecycle signal for a chat turn:
+	// "busy" at the start of the agent loop, "idle" when it
+	// exits (any reason — success, error, cancel, max-rounds,
+	// stuck, panic). The frontend uses it to drive the
+	// TodoPanel state machine: `live = session_status === "busy"`.
+	// Without this signal, the UI has no way to tell "the LLM
+	// is mid-turn, don't clear stale todos" from "the LLM
+	// stopped and forgot to clear them".
+	SessionStatus string `json:"session_status,omitempty"`
 
 	// Error fields
 	Error      string `json:"error,omitempty"`
@@ -952,78 +971,229 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
-	// Switch to this session so GetMessages returns its history.
-	if err := h.store.SetCurrent(id); err != nil {
+	// Use the per-session query — do NOT mutate the global
+	// currentID here. Two concurrent ListMessages on different
+	// sessions would otherwise race.
+	if _, err := h.store.GetConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	// Use the variant that returns raw metadata so we can pull
-	// the assistant message's `parts` blob (thinking + tool +
-	// sub-agent) back out of the SQLite row. GetMessages
-	// discards everything it doesn't recognise, which used to
-	// drop the parts silently — the user would reopen a
-	// session and see only the plain text.
+
+	// Pagination:
+	//   ?before_id=N  — return only messages with id < N
+	//   ?limit=K      — cap the result at K rows
+	//
+	// When neither is set the response is the full history,
+	// which is the right thing for the first switch into a
+	// session that the frontend has never seen (e.g. after
+	// app reload). When both are set, the frontend is
+	// asking for the next page of older history — typical
+	// infinite-scroll-triggered request.
+	//
+	// The `has_more` flag is computed by checking whether the
+	// conversation still has rows older than the oldest one
+	// we just returned. We avoid returning the full count
+	// (which would let the client show "1,234 messages" in
+	// the UI later) to keep the payload small.
+	beforeID := parseInt64Query(c, "before_id", 0)
+	queryLimit := parseIntQuery(c, "limit", 0)
+
 	meta := h.ensureMetaLoaded(id)
-	limit := contextLevelLimit(meta.ReasoningEffort)
-	msgs, metas, createds := h.store.GetChatMessagesWithMetaN(limit)
-	out := make([]MessageResponse, 0, len(msgs))
-	for i, m := range msgs {
-		created := time.Now().Unix()
-		if i < len(createds) && createds[i] != 0 {
-			created = createds[i]
-		}
-		resp := MessageResponse{
-			ID:        0,
-			Role:      m.Role,
-			Content:   m.Content,
-			CreatedAt: created,
-			Name:      m.Name,
-		}
+	contextCap := contextLevelLimit(meta.ReasoningEffort)
 
-		// Image messages: compute a data URL for the frontend.
-		if m.Type == llm.TypeImage && m.Content != "" {
-			mime := m.MimeType
-			if mime == "" {
-				mime = "image/png"
-			}
-			dataURL := "data:" + mime + ";base64," + m.Content
-			resp.Attachments = append(resp.Attachments, AttachmentPart{
-				Type: "image_url",
-				URL:  dataURL,
-				Name: m.Name,
-				Kind: "image",
-				MIME: mime,
-			})
-		}
-
-		// Tool call metadata.
-		if m.ToolID != "" {
-			resp.ToolCallID = m.ToolID
-		}
-
-		// Restore assistant parts from metadata.
-		if i < len(metas) && metas[i] != "" {
-			if parts := decodePartsFromMeta(metas[i], m.Content); len(parts) > 0 {
-				resp.Parts = parts
-			}
-		}
-		// Image messages carry their payload as data URLs in
-		// Attachments; clear Content so the frontend doesn't
-		// render the raw base64 string as text.
-		if m.Type == llm.TypeImage {
-			resp.Content = ""
-		}
-		// Tool call / result messages are embedded in the
-		// main assistant message's Parts — the separate rows
-		// are only for DB reconstruction and cause blank
-		// bubbles if returned to the frontend.
-		if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
-			continue
-		}
-
-		out = append(out, resp)
+	// Effective limit: explicit query param wins; otherwise
+	// the context-window cap (keeps the same default the old
+	// un-paged endpoint used).
+	limit := queryLimit
+	if limit <= 0 || limit > contextCap {
+		limit = contextCap
 	}
-	c.JSON(http.StatusOK, gin.H{"messages": out})
+
+	msgs, metas, createds, rowIDs := h.store.GetChatMessagesWithMetaPage(id, beforeID, limit)
+	out := make([]MessageResponse, 0, len(msgs))
+	// rowIDs[i] is the SQLite row id for msgs[i]. We pair them
+	// in buildMessageResponse so the client can use the lowest
+	// row id as the `before_id` cursor for the next page.
+	// rowIDs is in DESC order (matches the row order), so
+	// rowIDs[len-1] is the smallest id (oldest returned row).
+	for i, m := range msgs {
+		resp := buildMessageResponse(m, metas, createds, i, rowIDs[i])
+		if resp != nil {
+			out = append(out, *resp)
+		}
+	}
+
+	var (
+		hasMore   = false
+		oldestID int64
+	)
+	if len(rowIDs) > 0 {
+		oldestID = rowIDs[len(rowIDs)-1]
+		// `has_more` = "is there at least one row older
+		// than the oldest one we returned?". Cheap: a single
+		// indexed COUNT/EXISTS query.
+		hasMore = h.store.HasOlderMessages(id, oldestID)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"messages":  out,
+		"has_more":  hasMore,
+		"oldest_id": oldestID,
+	})
+}
+
+// buildMessageResponse shapes one ChatMessage row into the
+// public MessageResponse. Returns nil for rows the frontend
+// shouldn't render (tool call / tool result rows are
+// reconstructed into the assistant message's Parts; image
+// rows are surfaced as Attachments). rowID is the SQLite row
+// id, propagated so the client can use it as the
+// `before_id` cursor for the next page request.
+func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64) *MessageResponse {
+	created := time.Now().Unix()
+	if i < len(createds) && createds[i] != 0 {
+		created = createds[i]
+	}
+	resp := MessageResponse{
+		ID:        rowID,
+		Role:      m.Role,
+		Content:   m.Content,
+		CreatedAt: created,
+		Name:      m.Name,
+	}
+
+	// Media messages (image / audio / video): compute a data
+	// URL for the frontend. The frontend's MessageBubble
+	// distinguishes them by the `kind` field and the wire
+	// `type` (image_url / audio_url / video_url). We keep
+	// the same structure for all three so the storage
+	// path (raw base64 in messages.content) is identical.
+	if isMediaType(m.Type) && m.Content != "" {
+		mime := m.MimeType
+		if mime == "" {
+			mime = defaultMIMEForType(m.Type)
+		}
+		dataURL := "data:" + mime + ";base64," + m.Content
+		resp.Attachments = append(resp.Attachments, AttachmentPart{
+			Type: typeURLFor(m.Type),
+			URL:  dataURL,
+			Name: m.Name,
+			Kind: kindFor(m.Type),
+			MIME: mime,
+		})
+	}
+
+	// Tool call metadata.
+	if m.ToolID != "" {
+		resp.ToolCallID = m.ToolID
+	}
+
+	// Restore assistant parts from metadata.
+	if i < len(metas) && metas[i] != "" {
+		if parts := decodePartsFromMeta(metas[i], m.Content); len(parts) > 0 {
+			resp.Parts = parts
+		}
+	}
+	// Media messages carry their payload as data URLs in
+	// Attachments; clear Content so the frontend doesn't
+	// render the raw base64 string as text.
+	if isMediaType(m.Type) {
+		resp.Content = ""
+	}
+	// Tool call / result messages are embedded in the
+	// main assistant message's Parts — the separate rows
+	// are only for DB reconstruction and cause blank
+	// bubbles if returned to the frontend.
+	if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
+		return nil
+	}
+
+	return &resp
+}
+
+// parseInt64Query returns the int64 value of a query string
+// parameter, or `def` if the parameter is missing or invalid.
+func parseInt64Query(c *gin.Context, key string, def int64) int64 {
+	raw := c.Query(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// parseIntQuery returns the int value of a query string
+// parameter, or `def` if the parameter is missing or invalid.
+func parseIntQuery(c *gin.Context, key string, def int) int {
+	raw := c.Query(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// isMediaType reports whether t is a binary media type the
+// frontend can render inline (image / audio / video). All three
+// share the same storage path: raw base64 in messages.content,
+// surfaced to the UI as a data URL on the MessageAttachment.
+func isMediaType(t string) bool {
+	return t == llm.TypeImage || t == llm.TypeAudio || t == llm.TypeVideo
+}
+
+// defaultMIMEForType picks a sane MIME for a media row whose
+// metadata didn't capture one (defensive; the upload pipeline
+// always sets it). Bumping a video without a recorded MIME
+// down to video/mp4 lets the <video> element at least try
+// to play it.
+func defaultMIMEForType(t string) string {
+	switch t {
+	case llm.TypeImage:
+		return "image/png"
+	case llm.TypeAudio:
+		return "audio/mpeg"
+	case llm.TypeVideo:
+		return "video/mp4"
+	}
+	return "application/octet-stream"
+}
+
+// typeURLFor maps a media Type to the wire name the frontend
+// uses on MessageAttachment. We keep the OpenAI-style *_url
+// suffix for symmetry with the existing image path; the
+// MessageBubble component dispatches on this string.
+func typeURLFor(t string) string {
+	switch t {
+	case llm.TypeImage:
+		return "image_url"
+	case llm.TypeAudio:
+		return "audio_url"
+	case llm.TypeVideo:
+		return "video_url"
+	}
+	return ""
+}
+
+// kindFor maps a media Type to the lower-level "kind" the
+// frontend uses for its MessageAttachment.kind (drives the
+// chip icon / fallback render). Same vocabulary as the
+// uploadKind constants on the way in.
+func kindFor(t string) string {
+	switch t {
+	case llm.TypeImage:
+		return "image"
+	case llm.TypeAudio:
+		return "audio"
+	case llm.TypeVideo:
+		return "video"
+	}
+	return "file"
 }
 
 // mimeFromDataURL extracts the MIME type from a data URL
@@ -1121,7 +1291,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
-	if err := h.store.SetCurrent(id); err != nil {
+	if _, err := h.store.GetConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
@@ -1178,17 +1348,19 @@ func (h *Handler) SendMessage(c *gin.Context) {
 
 	// Build messages: history after last compression + new user message.
 	// Messages older than the compressed range are replaced by the
-	// CompressedSummary field on the ChatRequest.
+	// CompressedSummary field on the ChatRequest. All reads go through
+	// the per-session variants so concurrent SendMessage calls on
+	// different sessions don't race.
 	meta := h.ensureMetaLoaded(id)
 	limit := contextLevelLimit(meta.ReasoningEffort)
-	lastComp := h.store.LastCompressedID()
+	lastComp := h.store.LastCompressedIDFor(id)
 	var histMsgs []llm.ChatMessage
 	var compSummary string
 	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterID(limit, lastComp)
-		compSummary = h.store.CompressedSummary()
+		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, limit, lastComp)
+		compSummary = h.store.CompressedSummaryFor(id)
 	} else {
-		histMsgs = h.store.GetChatMessagesN(limit)
+		histMsgs = h.store.GetChatMessagesFor(id, limit)
 	}
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
@@ -1243,9 +1415,21 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			return false
 		}
 		ev := chunkToEvent(chunk, provider, model)
+		if ev.Type == "question" {
+			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
+		}
 		data, _ := json.Marshal(ev)
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 			return false
+		}
+		// Flush after every event so the client sees it
+		// immediately, even when the next event is far
+		// away (e.g. the question tool blocks waiting
+		// for user input). Gin's stream writer already
+		// calls Flush(), but belt-and-suspenders for
+		// reverse-proxy scenarios (Wails desktop GUI).
+		if fl, ok := c.Writer.(http.Flusher); ok {
+			fl.Flush()
 		}
 		return !chunk.Done
 	})
@@ -1282,6 +1466,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		SubAgent:       chunk.SubAgent,
 		SubAgentTask:   chunk.SubAgentTask,
 		SubAgentStatus: chunk.SubAgentStatus,
+		SessionStatus:  chunk.SessionStatus,
 	}
 
 	// Question events are emitted by the question tool handler
@@ -1315,6 +1500,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolName = chunk.ToolName
 		ev.ToolArgs = chunk.ToolArgs
 		ev.ToolResult = chunk.ToolResult
+		ev.ToolResultFull = chunk.ToolResultFull
 		ev.ToolError = chunk.ToolError
 		ev.ToolElapsed = chunk.ToolElapsed
 		switch {
@@ -1337,6 +1523,17 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 	if chunk.Content != "" {
 		ev.Type = "content"
 		ev.Content = chunk.Content
+		return ev
+	}
+	// ContentRewrite: the agent's post-stream redactor rewrote
+	// the assistant's trailing text (e.g. stripped a phantom
+	// vision error). The UI should REPLACE the trailing text
+	// part with this value, not append it. We treat this as a
+	// distinct event type so the chat store can route it
+	// differently from regular content deltas.
+	if chunk.ContentRewrite != "" {
+		ev.Type = "content_rewrite"
+		ev.Content = chunk.ContentRewrite
 		return ev
 	}
 	// Other phase events (system, memory, plan, sub-agent
@@ -1385,6 +1582,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		ProjectPath: m.ProjectPath,
 		PlanMode:    m.PlanMode,
 		PermissionLevel: m.PermissionLevel,
+		ReasoningEffort: m.ReasoningEffort,
 		CreatedAt:   cv.CreatedAt.Unix(),
 		UpdatedAt:   cv.UpdatedAt.Unix(),
 	}
@@ -1422,7 +1620,7 @@ func (h *Handler) CompressConversation(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "summarizer not available"})
 		return
 	}
-	if err := h.store.SetCurrent(id); err != nil {
+	if _, err := h.store.GetConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
@@ -1479,11 +1677,11 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "content is required"})
 		return
 	}
-	if err := h.store.SetCurrent(id); err != nil {
+	if _, err := h.store.GetConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	h.store.AddChatMessage(llm.ChatMessage{
+	h.store.AddChatMessageTo(id, llm.ChatMessage{
 		Role:    llm.RoleSystem,
 		Type:    llm.TypeText,
 		Content: body.Content,

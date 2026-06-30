@@ -724,6 +724,30 @@ func TestChunkToEvent(t *testing.T) {
 			t.Errorf("ToolArgs = %q, want raw json", ev.ToolArgs)
 		}
 	})
+	t.Run("session_status_busy", func(t *testing.T) {
+		// The lifecycle signal emitted at the start of the
+		// agent loop. Must be a top-level StreamEvent field so
+		// the chat store can flip state.sessionWorking[id]
+		// without needing a Phase/Type match.
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			SessionStatus: "busy",
+		}, "cs", "gpt-4o")
+		if ev.SessionStatus != "busy" {
+			t.Errorf("SessionStatus = %q, want busy", ev.SessionStatus)
+		}
+	})
+	t.Run("session_status_idle", func(t *testing.T) {
+		// The lifecycle signal emitted on every exit point
+		// (success, error, cancel, max-rounds, stuck, panic).
+		// The TodoPanel state machine uses "idle" to clear
+		// stale todos the LLM never wrote `todos: []` for.
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			SessionStatus: "idle",
+		}, "cs", "gpt-4o")
+		if ev.SessionStatus != "idle" {
+			t.Errorf("SessionStatus = %q, want idle", ev.SessionStatus)
+		}
+	})
 }
 
 func TestSessionToResponse(t *testing.T) {

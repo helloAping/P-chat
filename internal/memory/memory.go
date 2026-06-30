@@ -287,9 +287,18 @@ func (s *Store) NewConversation() (string, error) {
 // AddMessage records a message in the current conversation. Writes are
 // buffered and flushed asynchronously; call Flush() to force.
 func (s *Store) AddMessage(msg llm.Message) {
+	s.AddMessageTo(s.currentID, msg)
+}
+
+// AddMessageTo is like AddMessage but writes to an explicit
+// conversation. This is the multi-session-safe variant —
+// AddMessage reads the shared s.currentID, which is a race
+// hazard when several goroutines stream into different
+// conversations at once.
+func (s *Store) AddMessageTo(convID string, msg llm.Message) {
 	s.pendingMu.Lock()
 	s.pendingWrites = append(s.pendingWrites, Message{
-		ConversationID: s.currentID,
+		ConversationID: convID,
 		Role:           msg.Role,
 		Content:        msg.Content,
 		CreatedAt:      time.Now(),
@@ -304,14 +313,20 @@ func (s *Store) AddMessage(msg llm.Message) {
 // AddMessageWithMeta is like AddMessage but stores extra metadata
 // (tool_call_id, tool name, etc.) as JSON.
 func (s *Store) AddMessageWithMeta(msg llm.Message, meta map[string]string) {
+	s.AddMessageWithMetaTo(s.currentID, msg, meta)
+}
+
+// AddMessageWithMetaTo is the multi-session-safe variant of
+// AddMessageWithMeta (see AddMessageTo for the rationale).
+func (s *Store) AddMessageWithMetaTo(convID string, msg llm.Message, meta map[string]string) {
 	if len(meta) == 0 {
-		s.AddMessage(msg)
+		s.AddMessageTo(convID, msg)
 		return
 	}
 	b, _ := json.Marshal(meta)
 	s.pendingMu.Lock()
 	s.pendingWrites = append(s.pendingWrites, Message{
-		ConversationID: s.currentID,
+		ConversationID: convID,
 		Role:           msg.Role,
 		Content:        msg.Content,
 		CreatedAt:      time.Now(),
@@ -328,11 +343,18 @@ func (s *Store) AddMessageWithMeta(msg llm.Message, meta map[string]string) {
 // It automatically encodes metadata based on the message type
 // so that GetChatMessages() can restore the full message shape.
 func (s *Store) AddChatMessage(msg llm.ChatMessage) {
+	s.AddChatMessageTo(s.currentID, msg)
+}
+
+// AddChatMessageTo is the multi-session-safe variant of
+// AddChatMessage. Use this from goroutines that may overlap
+// (e.g. concurrent SendMessage on different sessions).
+func (s *Store) AddChatMessageTo(convID string, msg llm.ChatMessage) {
 	meta := encodeChatMeta(msg)
 	b, _ := json.Marshal(meta)
 	s.pendingMu.Lock()
 	s.pendingWrites = append(s.pendingWrites, Message{
-		ConversationID: s.currentID,
+		ConversationID: convID,
 		Role:           msg.Role,
 		Content:        msg.Content,
 		CreatedAt:      time.Now(),
@@ -351,6 +373,11 @@ func (s *Store) AddChatMessage(msg llm.ChatMessage) {
 // the canonical fields are preserved unless extraMeta explicitly
 // overwrites them).
 func (s *Store) AddChatMessageWithMeta(msg llm.ChatMessage, extraMeta map[string]string) {
+	s.AddChatMessageWithMetaTo(s.currentID, msg, extraMeta)
+}
+
+// AddChatMessageWithMetaTo is the multi-session-safe variant.
+func (s *Store) AddChatMessageWithMetaTo(convID string, msg llm.ChatMessage, extraMeta map[string]string) {
 	m := encodeChatMeta(msg)
 	for k, v := range extraMeta {
 		m[k] = v
@@ -358,7 +385,7 @@ func (s *Store) AddChatMessageWithMeta(msg llm.ChatMessage, extraMeta map[string
 	b, _ := json.Marshal(m)
 	s.pendingMu.Lock()
 	s.pendingWrites = append(s.pendingWrites, Message{
-		ConversationID: s.currentID,
+		ConversationID: convID,
 		Role:           msg.Role,
 		Content:        msg.Content,
 		CreatedAt:      time.Now(),
@@ -384,6 +411,42 @@ func (s *Store) GetChatMessagesN(limit int) []llm.ChatMessage {
 	return msgs
 }
 
+// GetChatMessagesFor is the multi-session-safe variant — pass
+// the conversation id explicitly instead of relying on the
+// shared currentID. Empty convID returns no messages.
+func (s *Store) GetChatMessagesFor(convID string, limit int) []llm.ChatMessage {
+	msgs, _, _ := s.GetChatMessagesWithMetaFor(convID, limit)
+	return msgs
+}
+
+// CountChatMessages returns the total number of messages in
+// convID. Used by the history-paging endpoint to decide
+// whether there are older messages to load.
+func (s *Store) CountChatMessages(convID string) int {
+	if convID == "" {
+		return 0
+	}
+	var n int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE conversation_id = ?`, convID).Scan(&n)
+	return n
+}
+
+// HasOlderMessages reports whether convID has at least one
+// message with id < oldestID. Used by the paged
+// ListMessages handler to set `has_more` without loading
+// the whole history. Cheap: a single indexed EXISTS query.
+func (s *Store) HasOlderMessages(convID string, oldestID int64) bool {
+	if convID == "" || oldestID <= 0 {
+		return false
+	}
+	var exists bool
+	_ = s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ? AND id < ?)`,
+		convID, oldestID,
+	).Scan(&exists)
+	return exists
+}
+
 // GetChatMessagesWithMeta returns ChatMessage history alongside
 // raw metadata strings and creation timestamps.
 func (s *Store) GetChatMessagesWithMeta() ([]llm.ChatMessage, []string, []int64) {
@@ -393,24 +456,65 @@ func (s *Store) GetChatMessagesWithMeta() ([]llm.ChatMessage, []string, []int64)
 // GetChatMessagesWithMetaN is like GetChatMessagesWithMeta but
 // allows overriding the fetch limit. Use 0 for unlimited.
 func (s *Store) GetChatMessagesWithMetaN(limit int) ([]llm.ChatMessage, []string, []int64) {
+	return s.GetChatMessagesWithMetaFor(s.currentID, limit)
+}
+
+// GetChatMessagesWithMetaFor is the multi-session-safe variant.
+// Pass the conversation id explicitly; empty id returns nil.
+func (s *Store) GetChatMessagesWithMetaFor(convID string, limit int) ([]llm.ChatMessage, []string, []int64) {
+	msgs, metas, createds, _ := s.GetChatMessagesWithMetaPage(convID, 0, limit)
+	return msgs, metas, createds
+}
+
+// GetChatMessagesWithMetaPage is the paged variant of
+// GetChatMessagesWithMetaFor. Pass beforeID > 0 to fetch only
+// messages with id < beforeID (for infinite-scroll history
+// loading). The result is always returned oldest-first; the
+// caller does no further ordering.
+//
+// `limit` follows the same convention as elsewhere: 0 means
+// "no limit". For paging you almost always want a positive
+// limit (e.g. 50) so the response is bounded.
+//
+// The fourth return value is the list of SQLite row ids
+// (parallel to msgs / metas / createds). The frontend uses
+// them as the `before_id` cursor for the next page request.
+func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64) {
 	_ = s.Flush()
-	convID := s.currentID
 	if convID == "" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
-	rows, err := s.db.Query(
-		`SELECT id, role, content, metadata, created_at FROM messages
-		 WHERE conversation_id = ?
-		 ORDER BY id DESC LIMIT ?`,
-		convID, limitOrHuge(limit),
+	// Two query shapes: with and without the beforeID filter.
+	// We could use a single query with "id < ? OR ? = 0" but
+	// keeping the predicates narrow helps the SQLite planner
+	// and keeps the EXPLAIN QUERY PLAN output readable.
+	var (
+		rows *sql.Rows
+		err  error
 	)
+	if beforeID > 0 {
+		rows, err = s.db.Query(
+			`SELECT id, role, content, metadata, created_at FROM messages
+			 WHERE conversation_id = ? AND id < ?
+			 ORDER BY id DESC LIMIT ?`,
+			convID, beforeID, limitOrHuge(limit),
+		)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT id, role, content, metadata, created_at FROM messages
+			 WHERE conversation_id = ?
+			 ORDER BY id DESC LIMIT ?`,
+			convID, limitOrHuge(limit),
+		)
+	}
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	defer rows.Close()
 
 	type row struct {
+		id      int64
 		msg     llm.ChatMessage
 		meta    string
 		created int64
@@ -432,19 +536,21 @@ func (s *Store) GetChatMessagesWithMetaN(limit int) ([]llm.ChatMessage, []string
 		}
 		msgs := decodeChatMessages(role, content, meta)
 		for _, m := range msgs {
-			rev = append(rev, row{msg: m, meta: meta, created: created})
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created})
 		}
 	}
 	n := len(rev)
-	msgs := make([]llm.ChatMessage, n)
+	out := make([]llm.ChatMessage, n)
 	metas := make([]string, n)
 	createds := make([]int64, n)
+	ids := make([]int64, n)
 	for i := 0; i < n; i++ {
-		msgs[i] = rev[n-1-i].msg
+		out[i] = rev[n-1-i].msg
 		metas[i] = rev[n-1-i].meta
 		createds[i] = rev[n-1-i].created
+		ids[i] = rev[n-1-i].id
 	}
-	return msgs, metas, createds
+	return out, metas, createds, ids
 }
 
 // encodeChatMeta builds the canonical metadata map for a
@@ -1038,10 +1144,19 @@ func (s *Store) GetSummaries(conversationID string) []Summary {
 // LastCompressedID returns the highest range_end across all summaries
 // for the current conversation, or 0 if nothing has been compressed.
 func (s *Store) LastCompressedID() int64 {
+	return s.LastCompressedIDFor(s.currentID)
+}
+
+// LastCompressedIDFor is the multi-session-safe variant — pass
+// the conversation id explicitly.
+func (s *Store) LastCompressedIDFor(convID string) int64 {
+	if convID == "" {
+		return 0
+	}
 	var maxEnd sql.NullInt64
 	_ = s.db.QueryRow(
 		`SELECT MAX(range_end) FROM summaries WHERE conversation_id = ?`,
-		s.currentID,
+		convID,
 	).Scan(&maxEnd)
 	if maxEnd.Valid {
 		return maxEnd.Int64
@@ -1052,9 +1167,17 @@ func (s *Store) LastCompressedID() int64 {
 // CompressedSummary returns the concatenated text of all summaries
 // for the current conversation, or empty string if none.
 func (s *Store) CompressedSummary() string {
+	return s.CompressedSummaryFor(s.currentID)
+}
+
+// CompressedSummaryFor is the multi-session-safe variant.
+func (s *Store) CompressedSummaryFor(convID string) string {
+	if convID == "" {
+		return ""
+	}
 	rows, err := s.db.Query(
 		`SELECT summary FROM summaries WHERE conversation_id = ? ORDER BY range_start ASC`,
-		s.currentID,
+		convID,
 	)
 	if err != nil {
 		return ""
@@ -1075,8 +1198,13 @@ func (s *Store) CompressedSummary() string {
 // id > afterID from the current conversation, oldest first. Use 0
 // for afterID to get all messages (no filter).
 func (s *Store) GetChatMessagesAfterID(limit int, afterID int64) ([]llm.ChatMessage, []string, []int64) {
+	return s.GetChatMessagesAfterIDFor(s.currentID, limit, afterID)
+}
+
+// GetChatMessagesAfterIDFor is the multi-session-safe variant of
+// GetChatMessagesAfterID. Pass the conversation id explicitly.
+func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int64) ([]llm.ChatMessage, []string, []int64) {
 	_ = s.Flush()
-	convID := s.currentID
 	if convID == "" {
 		return nil, nil, nil
 	}
