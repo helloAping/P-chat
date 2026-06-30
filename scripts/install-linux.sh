@@ -28,6 +28,7 @@ done
 # --- locate binaries ---
 SRC_GUI="$EXEC_DIR/pchat-gui"
 SRC_SERVER="$EXEC_DIR/pchat-server"
+SRC_CLI="$EXEC_DIR/pchat"
 SRC_UNINSTALL="$EXEC_DIR/uninstall.sh"
 
 if [[ ! -f "$SRC_GUI" ]]; then
@@ -37,6 +38,12 @@ fi
 if [[ ! -f "$SRC_SERVER" ]]; then
   echo "ERROR: pchat-server not found next to install.sh ($EXEC_DIR)"
   exit 1
+fi
+# SRC_CLI is optional — older bundles may not have it. Skip
+# silently if missing rather than failing the install.
+HAVE_CLI=false
+if [[ -f "$SRC_CLI" ]]; then
+  HAVE_CLI=true
 fi
 
 BIN_DIR="$PREFIX/bin"
@@ -64,9 +71,15 @@ install_bin() {
 if ! $PORTABLE; then
   install_bin "$SRC_GUI"    "$BIN_DIR/pchat-gui"
   install_bin "$SRC_SERVER" "$BIN_DIR/pchat-server"
+  if $HAVE_CLI; then
+    install_bin "$SRC_CLI"  "$BIN_DIR/pchat"
+  fi
 else
   install_bin "$SRC_GUI"    "$EXEC_DIR/pchat-gui"
   install_bin "$SRC_SERVER" "$EXEC_DIR/pchat-server"
+  if $HAVE_CLI; then
+    install_bin "$SRC_CLI"  "$EXEC_DIR/pchat"
+  fi
 fi
 
 # Copy uninstall script
@@ -106,6 +119,9 @@ fi
 echo ""
 echo "[install] done."
 echo "  Run:  $BIN_DIR/pchat-gui"
+if $HAVE_CLI; then
+  echo "  CLI:  $BIN_DIR/pchat  (also in PATH if ~/.local/bin is on it)"
+fi
 echo "  Data: ~/.p-chat/"
 if $PORTABLE; then
   echo "  Uninstall: rm -rf $EXEC_DIR"

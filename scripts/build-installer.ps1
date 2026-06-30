@@ -16,6 +16,16 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
+# Read version from wails.json (same source as Vite's __APP_VERSION__).
+$wailsJson = Join-Path $root "cmd\pchat-gui\wails.json"
+$version  = "0.1.0"
+if (Test-Path -LiteralPath $wailsJson) {
+    $json = Get-Content -LiteralPath $wailsJson -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($json.info.productVersion) { $version = $json.info.productVersion }
+}
+
+$exeName = "pchat-setup-v$version.exe"
+
 $bin       = Join-Path $root "bin"
 $assets    = Join-Path $root "cmd\pchat-installer\assets"
 
@@ -50,7 +60,8 @@ Copy-Item -LiteralPath $installPs -Destination "$assets\install.ps1" -Force
 Copy-Item -LiteralPath $uninstPs  -Destination "$assets\uninstall.ps1" -Force
 
 # --- build ---
-Write-Host "[build-installer] go build → bin/pchat-setup.exe"
-go build -o "$bin\pchat-setup.exe" "$root\cmd\pchat-installer"
+Write-Host "[build-installer] go build → $exeName"
+$outPath = Join-Path $bin $exeName
+go build -o $outPath "$root\cmd\pchat-installer"
 
-Write-Host "[build-installer] 完成: $bin\pchat-setup.exe"
+Write-Host "[build-installer] 完成: $outPath"

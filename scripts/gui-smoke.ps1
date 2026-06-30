@@ -22,7 +22,7 @@ $serverLog= Join-Path $install "pchat-server.log"
 function Step($n, $msg) { Write-Host ""; Write-Host "==== [$n] $msg ====" -ForegroundColor Cyan }
 
 # 0. clean previous state
-Get-Process -Name "pchat-gui","pchat-server" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 if (Test-Path -LiteralPath $install) { Remove-Item -LiteralPath $install -Recurse -Force }
 
@@ -37,6 +37,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $install "pchat-gui.exe"))) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $install "pchat-server.exe"))) {
     Write-Host "FAIL: pchat-server.exe missing after install" -ForegroundColor Red
+    Get-Content -LiteralPath $log -Raw | Out-String
+    exit 1
+}
+if (-not (Test-Path -LiteralPath (Join-Path $install "pchat.exe"))) {
+    Write-Host "FAIL: pchat.exe missing after install (CLI not bundled)" -ForegroundColor Red
     Get-Content -LiteralPath $log -Raw | Out-String
     exit 1
 }
@@ -237,15 +242,16 @@ Step 7 "stop pchat-gui (kills child pchat-server)"
 & taskkill /T /F /PID $proc.Id 2>&1 | Out-Null
 # Give the kernel a moment to reap.
 for ($i = 0; $i -lt 20; $i++) {
-    $still = Get-Process -Name "pchat-gui","pchat-server" -ErrorAction SilentlyContinue
+    $still = Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue
     if (-not $still) { break }
     Start-Sleep -Milliseconds 250
 }
-$stillRunning = Get-Process -Name "pchat-gui","pchat-server" -ErrorAction SilentlyContinue
+$stillRunning = Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue
 if ($stillRunning) {
     Write-Host "WARN: $($stillRunning.Count) leftover process(es) - cleaning up" -ForegroundColor Yellow
     & taskkill /T /F /IM "pchat-server.exe" 2>&1 | Out-Null
     & taskkill /T /F /IM "pchat-gui.exe"    2>&1 | Out-Null
+    & taskkill /T /F /IM "pchat.exe"        2>&1 | Out-Null
 }
 Write-Host "OK: cleanup done" -ForegroundColor Green
 
