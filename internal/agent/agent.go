@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -588,21 +589,61 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 				"最多一次提 4 个问题，每个问题 2-4 个选项。\n" +
 				"不要在简单/琐碎的事务上使用（如「我能开始吗？」）。\n")
 		}
+
+		// opcode-style tool catalog: explicitly list every
+		// available tool so the LLM does NOT hallucinate
+		// non-existent tools (e.g. grep, bash, find).
+		sb.WriteString("\n\n---\n\n## Available Tools\n\n")
+		sb.WriteString("You have access to these tools. Call ONLY the tools in this list.\n\n")
+		sb.WriteString("| Tool | What it does |\n")
+		sb.WriteString("|------|-------------|\n")
+		for _, t := range a.tools.List() {
+			desc := t.Description
+			if idx := strings.Index(desc, "."); idx > 0 {
+				desc = desc[:idx]
+			}
+			sb.WriteString(fmt.Sprintf("| `%s` | %s |\n", t.Name, desc))
+		}
+		sb.WriteString("\nOperation → correct tool mapping:\n")
+		sb.WriteString("- Read a file → `read_file` (NOT `cat` / `type` / `head` / `tail`)\n")
+		sb.WriteString("- Write a file → `write_file` (NOT `echo >` / `cat >`)\n")
+		sb.WriteString("- List directory → `list_files` (NOT `ls` / `dir`)\n")
+		sb.WriteString("- System commands → `exec_command` (NOT `bash` / `sh` / `powershell`)\n")
+		sb.WriteString("- Search file contents → `exec_command` with shell search commands\n")
+		sb.WriteString("- Manage tasks → `todo_write`\n")
+		sb.WriteString("- Ask user → `question`\n")
+
+		// opcode-style platform awareness (see opencode's
+		// shell/prompt.ts): tell the LLM what OS and shell
+		// it is running under so it knows which commands
+		// are available and which are NOT.
+		sb.WriteString("\n\n---\n\n## Platform\n\n")
+		sb.WriteString(fmt.Sprintf("Platform: %s\n", runtime.GOOS))
+		if runtime.GOOS == "windows" {
+			sb.WriteString("Shell for exec_command: cmd.exe /C <command>\n")
+			sb.WriteString("Chain commands: `&` (always run next) or `&&` (only if previous succeeded).\n\n")
+			sb.WriteString("Available built-in commands:\n")
+			sb.WriteString("  dir       — list directory contents (NOT ls)\n")
+			sb.WriteString("  type      — print file content (NOT cat)\n")
+			sb.WriteString("  findstr   — search text in files (NOT grep / rg)\n")
+			sb.WriteString("  echo      — print text\n")
+			sb.WriteString("  copy      — copy files (NOT cp)\n")
+			sb.WriteString("  move      — move / rename files (NOT mv)\n")
+			sb.WriteString("  del / rd  — delete files / dirs (NOT rm)\n")
+			sb.WriteString("  mkdir     — create directory\n")
+			sb.WriteString("  cd        — change directory (prefer using work_dir parameter)\n")
+			sb.WriteString("  set       — set / show environment variables (NOT export)\n")
+			sb.WriteString("\nCommands that do NOT exist on Windows (never call these):\n")
+			sb.WriteString("  grep, rg, ls, bash, sh, find, cp, mv, rm, cat, chmod, sudo\n")
+			sb.WriteString("\nPowerShell is available via: pwsh -NoProfile -Command \"...\"\n")
+		} else {
+			sb.WriteString("Shell for exec_command: /bin/sh -c <command>\n")
+			sb.WriteString("Standard Unix tools are available (grep, ls, cat, find, etc.).\n")
+		}
+
 		// Remind the LLM that uploaded images arrive as vision
 		// input in the user message (image_url content parts),
-		// NOT as files on disk. Calling read_file on an uploaded
-		// image is pointless and produces confusing error
-		// messages; the model should just look at the image
-		// it was given.
-		//
-		// opencode-style positive framing: state the desired
-		// behaviour, do not enumerate forbidden phrasings (the
-		// previous version of this section literally primed the
-		// LLM with "ERROR: ... Inform the user" by name, which
-		// is why the model kept echoing that string back to
-		// users). See opencode's PROMPT_COMPACTION for the same
-		// "Respond in the same language as the conversation"
-		// principle.
+		// NOT as files on disk.
 		sb.WriteString("\n\n---\n\n## Uploaded Attachments\n\n" +
 			"User-uploaded images and files are sent directly inside the user message — " +
 			"images as image_url content parts (data URLs), text files as inline blocks. " +

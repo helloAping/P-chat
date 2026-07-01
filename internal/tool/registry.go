@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -349,13 +350,28 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// Don't prefix with "ERROR: " — the LLM has been
-		// observed to copy that exact string back to the
-		// user as a fabricated tool error. The structured
-		// IsError flag is what carries the error signal;
-		// the content should describe what actually went
-		// wrong in plain language.
-		return &CallResult{Content: strings.TrimRight(string(out), "\r\n") + "\n" + err.Error(), IsError: true}, nil
+		content := strings.TrimRight(string(out), "\r\n")
+		if content != "" {
+			content += "\n"
+		}
+		content += err.Error()
+
+		// opcode-style actionable hints: when a command fails
+		// because it doesn't exist on this platform, tell the
+		// LLM about alternatives so it can recover.
+		if runtime.GOOS == "windows" {
+			switch {
+			case strings.Contains(err.Error(), "is not recognized"):
+				content += "\nHint: This command doesn't exist on Windows. Use findstr (not grep), dir (not ls), type (not cat), or pwsh -NoProfile -Command \"...\" for PowerShell scripts."
+			case strings.Contains(err.Error(), "The system cannot find the file"):
+				content += "\nHint: The executable was not found. Check the command name — on Windows the available commands are: dir, findstr, type, copy, move, del, mkdir, cd, set, pwsh."
+			}
+		} else {
+			if strings.Contains(err.Error(), "executable file not found") || strings.Contains(err.Error(), "command not found") {
+				content += "\nHint: The command was not found. Try installing it or use an alternative."
+			}
+		}
+		return &CallResult{Content: content, IsError: true}, nil
 	}
 	return &CallResult{Content: string(out)}, nil
 }
