@@ -19,7 +19,7 @@ $guiWeb  = Join-Path $srcGui "web"
 
 if (-not (Test-Path -LiteralPath $srcGui)) { throw "pchat-gui build dir not found: $srcGui" }
 if (-not (Test-Path -LiteralPath $binDir)) { throw "bin dir not found: $binDir" }
-if (-not (Test-Path -LiteralPath $webDir)) { throw "web/ (built SPA) not found: $webDir — run 'task build:frontend' first" }
+if (-not (Test-Path -LiteralPath $webDir)) { throw "web/ (built SPA) not found: $webDir -- run 'task build:frontend' first" }
 
 # --- Server binary (embeds the SPA) ---
 Copy-Item -LiteralPath (Join-Path $binDir "pchat-server.exe") -Destination (Join-Path $srcGui "pchat-server.exe") -Force
