@@ -4,14 +4,16 @@ on:
   push:
     tags:
       - 'v*'
+    branches:
+      - feat_更新
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [windows, linux]
-        goarch: [amd64]
+  release:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -21,65 +23,33 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
-      - name: Build frontend
+      - name: Install tools
         run: |
-          cd frontend
-          npm ci
-          npm run build
+          go install github.com/go-task/task/v3/cmd/task@latest
+          go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-      - name: Sync web to embed dir
+      - name: task build:all
+        run: task build:all
+
+      - name: Build Linux binaries
         run: |
-          mkdir -p cmd/pchat-server/web
-          cp -rf web/index.html web/assets cmd/pchat-server/web/
+          $tag = if ($env:GITHUB_REF -match 'refs/tags/(.+)') { $matches[1] } else { 'test' }
+          mkdir "bin/$tag-linux" -Force
 
-      - name: Build Go binaries
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          ext=""
-          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-          go build -o "bin/pchat-server${ext}" ./cmd/pchat-server
-          go build -o "bin/pchat${ext}" ./cmd/pchat
+          $env:GOOS = "linux"; $env:GOARCH = "amd64"
+          go build -o "bin/$tag-linux/pchat" ./cmd/pchat
+          go build -o "bin/$tag-linux/pchat-server" ./cmd/pchat-server
 
-      - name: Package archives
-        shell: bash
-        run: |
-          OS=${{ matrix.goos }}
-          TAG=${GITHUB_REF#refs/tags/}
-          DIST_DIR="dist"
+          Copy-Item -Recurse "web/" "bin/$tag-linux/web/"
+          cd bin; tar czf "../$tag-linux-amd64.tar.gz" "$tag-linux"
 
-          mkdir -p "${DIST_DIR}/${TAG}-${OS}-amd64"
-
-          # binaries
-          if [ "$OS" = "windows" ]; then
-            cp bin/pchat.exe "${DIST_DIR}/${TAG}-${OS}-amd64/"
-            cp bin/pchat-server.exe "${DIST_DIR}/${TAG}-${OS}-amd64/"
-          else
-            cp bin/pchat "${DIST_DIR}/${TAG}-${OS}-amd64/"
-            cp bin/pchat-server "${DIST_DIR}/${TAG}-${OS}-amd64/"
-          fi
-
-          # web assets (shared)
-          cp -rf web/ "${DIST_DIR}/${TAG}-${OS}-amd64/web/"
-
-          # archive
-          if [ "$OS" = "windows" ]; then
-            cd "${DIST_DIR}" && zip -r "${TAG}-${OS}-amd64.zip" "${TAG}-${OS}-amd64"
-          else
-            cd "${DIST_DIR}" && tar czf "${TAG}-${OS}-amd64.tar.gz" "${TAG}-${OS}-amd64"
-          fi
-
-          # rename for upload
-          if [ "$OS" = "windows" ]; then
-            echo "ARCHIVE=${DIST_DIR}/${TAG}-windows-amd64.zip" >> $GITHUB_ENV
-          else
-            echo "ARCHIVE=${DIST_DIR}/${TAG}-linux-amd64.tar.gz" >> $GITHUB_ENV
-          fi
-
-      - uses: softprops/action-gh-release@v2
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ARCHIVE }}
-          generate_release_notes: true
+          files: |
+            bin/pchat-setup-v*.exe
+            *-linux-amd64.tar.gz
+          generate_release_notes: false
