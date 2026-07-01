@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +22,9 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
       - name: Build frontend
         run: |
           cd frontend
@@ -30,34 +33,35 @@ jobs:
 
       - name: Sync web to embed dir
         run: |
-          mkdir -p cmd/pchat-server/web
-          cp -rf web/index.html web/assets cmd/pchat-server/web/
+          New-Item -ItemType Directory -Path "cmd\pchat-server\web" -Force
+          Copy-Item -Recurse -Force "web\index.html" "cmd\pchat-server\web\"
+          Copy-Item -Recurse -Force "web\assets" "cmd\pchat-server\web\"
 
-      - name: Build & package (Windows)
+      - name: Build Go server + CLI
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          mkdir -p "bin/${TAG}/web"
+          go build -o bin/pchat-server.exe ./cmd/pchat-server
+          go build -o bin/pchat.exe ./cmd/pchat
 
-          GOOS=windows GOARCH=amd64 go build -o "bin/${TAG}/pchat.exe" ./cmd/pchat
-          GOOS=windows GOARCH=amd64 go build -o "bin/${TAG}/pchat-server.exe" ./cmd/pchat-server
-          cp -rf web/index.html web/assets "bin/${TAG}/web/"
-
-          cd bin && zip -r "../${TAG}-windows-amd64.zip" "${TAG}"
-
-      - name: Build & package (Linux)
+      - name: Build Wails GUI
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          mkdir -p "bin/${TAG}/web"
+          cd cmd/pchat-gui
+          wails build -platform windows/amd64 -s
 
-          GOOS=linux GOARCH=amd64 go build -o "bin/${TAG}/pchat" ./cmd/pchat
-          GOOS=linux GOARCH=amd64 go build -o "bin/${TAG}/pchat-server" ./cmd/pchat-server
-          cp -rf web/index.html web/assets "bin/${TAG}/web/"
+      - name: Package GUI bundle
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-gui.ps1
 
-          cd bin && tar czf "../${TAG}-linux-amd64.tar.gz" "${TAG}"
+      - name: Read version
+        id: version
+        run: |
+          $v = (Get-Content VERSION -Raw).Trim()
+          if (-not $v) { $v = "0.1.0" }
+          echo "value=$v" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Build setup installer
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            *-windows-amd64.zip
-            *-linux-amd64.tar.gz
+          files: bin/pchat-setup-v${{ steps.version.outputs.value }}.exe
           generate_release_notes: false
