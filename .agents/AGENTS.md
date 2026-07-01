@@ -51,6 +51,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | CLI 终端 | [`.agents/docs/cli.md`](docs/cli.md) |
 | Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
+| 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
 | 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
 
 **模块文档位置**：`.agents/docs/` 目录下，每个模块一个 `.md` 文件。
@@ -119,7 +120,7 @@ D:\develop\project\P-chat\
 │   ├── agents/                 # AGENTS.md 加载器
 │   ├── rules/                  # .rules/ 规则监听
 │   ├── knowledge/              # RAG 知识检索
-│   ├── recall/                 # 记忆召回
+│   ├── upgrade/                # 版本升级系统
 │   ├── paths/                  # ~/.p-chat 路径解析
 │   ├── httpcli/                # CLI HTTP+SSE 客户端
 │   └── serverproc/             # 服务器进程生命周期管理
@@ -245,6 +246,22 @@ parser 三层 fallback：
 
 - Go: `camelCase` 私有，`PascalCase` 导出
 - TS: `camelCase` 变量/函数，`PascalCase` 类型/组件
+
+### 2.5 版本升级（强约束）
+
+**任何涉及以下内容的变更，必须通过 `internal/upgrade/` 包编写升级步骤，禁止在其他地方写 ad-hoc 迁移代码：**
+
+- `~/.p-chat/` 目录结构变更
+- SQLite schema 变更（表结构、新增列）
+- 配置文件格式变更
+- 数据存储位置/格式变更（如 prompts 文件→DB）
+
+**变更流程**：
+1. 在 `internal/upgrade/version.go` 中新增版本常量，更新 `Current`
+2. 在 `internal/upgrade/steps.go` 中注册升级函数
+3. 升级函数需满足：幂等（`IF NOT EXISTS`）、顺序性、断点续升
+
+详见 [`.agents/docs/upgrade.md`](docs/upgrade.md)。
 
 ---
 

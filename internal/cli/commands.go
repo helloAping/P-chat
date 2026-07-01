@@ -305,7 +305,6 @@ func init() {
 				"  .p-chat/\n" +
 				"    AGENTS.md         (空模板, 用户编辑)\n" +
 				"    rules/            (空目录, 放规则)\n" +
-				"    prompts/          (可选, 覆盖全局 prompts)\n" +
 				"    skills/           (可选, 放项目级 skill)",
 			Examples: []string{
 				"/init",

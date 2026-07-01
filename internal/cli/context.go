@@ -596,7 +596,7 @@ func (c *localContext) ChatStream(ctx context.Context, req agent.ChatRequest) (<
 	return c.r.agent.ChatStream(ctx, req), nil
 }
 
-func (c *localContext) StyleLabel(s style.Style) string { return c.r.styleMgr.Label(s) }
+func (c *localContext) StyleLabel(s style.Style) string { return c.r.styleMgr.DisplayLabel(s) }
 func (c *localContext) ListStyles() []style.Style        { return c.r.styleMgr.List() }
 func (c *localContext) StyleName() string                 { return string(c.r.style) }
 

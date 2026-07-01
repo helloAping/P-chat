@@ -45,11 +45,6 @@ func GlobalConfigYAML() string {
 	return filepath.Join(GlobalDir(), "config.yaml")
 }
 
-// ProjectConfigYAML is the legacy project config path.
-func ProjectConfigYAML() string {
-	return filepath.Join(ProjectDir(), "config.yaml")
-}
-
 // GlobalAgents returns ~/.p-chat/AGENTS.md
 func GlobalAgents() string {
 	return filepath.Join(GlobalDir(), "AGENTS.md")

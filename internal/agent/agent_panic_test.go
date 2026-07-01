@@ -10,6 +10,7 @@ import (
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/upgrade"
 )
 
 // TestChatWithTools_PanicRecovery verifies that a panic inside the
@@ -20,6 +21,7 @@ func TestChatWithTools_PanicRecovery(t *testing.T) {
 	llmClient, _ := llm.NewClient(&cfg.LLM)
 	store, _ := memory.OpenAt(":memory:", 50)
 	defer store.Close()
+	upgrade.SeedForTesting(store.DB())
 	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 

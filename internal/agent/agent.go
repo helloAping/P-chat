@@ -83,8 +83,8 @@ func (a *Agent) SetChatOptions(opts llm.ChatOptions) {
 }
 
 // getStyleMemory 读取当前风格的 Memory 内容。空字符串表示未配置。
-// Memory 独立于 identity/soul 存储在 prompts/memory/{id}.md，
-// 是用户自定义的背景知识，动态注入到每轮对话末尾。
+// Memory 存储在数据库 styles.memory 列，是用户自定义的背景知识，
+// 动态注入到每轮对话末尾。
 func (a *Agent) getStyleMemory(s style.Style) string {
 	if a.styleMgr == nil {
 		return ""

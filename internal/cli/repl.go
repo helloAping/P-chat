@@ -233,7 +233,7 @@ func (r *REPL) styleLabel() string {
 		return r.ctx.StyleLabel(r.style)
 	}
 	if r.styleMgr != nil {
-		return r.styleMgr.Label(r.style)
+		return r.styleMgr.DisplayLabel(r.style)
 	}
 	return string(r.style)
 }

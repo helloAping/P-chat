@@ -2,17 +2,10 @@ package style
 
 import (
 	"database/sql"
-	"embed"
 	"fmt"
-	"log"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
-
-//go:embed prompts/*.md
-var builtinFS embed.FS
 
 type Style string
 
@@ -50,190 +43,11 @@ type Manager struct {
 	db *sql.DB
 }
 
-// NewManager opens the style database. On first run (empty styles table)
-// it seeds the three built-in styles and attempts to migrate user-defined
-// styles from the legacy prompts/ directory on disk.
+// NewManager creates a style manager backed by the styles table.
+// The table must already exist and contain at least the three
+// built-in rows (seeded by the upgrade package on first run).
 func NewManager(db *sql.DB) (*Manager, error) {
-	m := &Manager{db: db}
-
-	count, err := m.count()
-	if err != nil {
-		return nil, fmt.Errorf("style: count: %w", err)
-	}
-	if count == 0 {
-		if err := m.seed(); err != nil {
-			return nil, fmt.Errorf("style: seed: %w", err)
-		}
-	}
-	return m, nil
-}
-
-// count returns the number of rows in the styles table.
-func (m *Manager) count() (int, error) {
-	var n int
-	err := m.db.QueryRow(`SELECT COUNT(*) FROM styles`).Scan(&n)
-	return n, err
-}
-
-// seed populates the database on first run. Built-in styles are loaded
-// from the embedded FS; user-defined styles are imported from the legacy
-// prompts/ (v1 identity+soul or v2 style/) directory, then the directory
-// is renamed to .migrated-v1 so it never runs twice.
-func (m *Manager) seed() error {
-	// 1. Built-in styles from embedded FS.
-	entries, err := builtinFS.ReadDir("prompts")
-	if err != nil {
-		return fmt.Errorf("read embedded prompts: %w", err)
-	}
-	for _, e := range entries {
-		id := strings.TrimSuffix(e.Name(), ".md")
-		if id == "" {
-			continue
-		}
-		data, err := builtinFS.ReadFile("prompts/" + e.Name())
-		if err != nil {
-			return fmt.Errorf("read embedded %s: %w", e.Name(), err)
-		}
-		s := Style(id)
-		isBuiltin := s == Cute || s == Guofeng || s == Tech
-		label := styleLabels[s]
-		if label == "" {
-			label = id
-		}
-		if err := m.insert(id, label, string(data), "", isBuiltin); err != nil {
-			return fmt.Errorf("insert %s: %w", id, err)
-		}
-	}
-
-	// 2. Try importing user-defined styles from the legacy prompts/ dir.
-	promptDir := resolvePromptDir()
-	m.importLegacy(promptDir)
-
-	return nil
-}
-
-// resolvePromptDir returns the prompts directory path (used only during seed).
-func resolvePromptDir() string {
-	cwd, _ := os.Getwd()
-	projectPrompts := filepath.Join(cwd, "prompts")
-	if _, err := os.Stat(projectPrompts); err == nil {
-		return projectPrompts
-	}
-	return filepath.Join(os.Getenv("USERPROFILE"), ".p-chat", "prompts")
-}
-
-// importLegacy reads v1 (identity/+soul/) or v2 (style/) files and inserts
-// user-defined styles into the database. Built-in styles in the legacy dir
-// are skipped (already seeded from embedded FS). Only user-style files are
-// renamed to .v1.bak — the directory itself is left intact.
-func (m *Manager) importLegacy(dir string) {
-	imported := 0
-
-	// v2 layout first
-	styleDir := filepath.Join(dir, "style")
-	if entries, err := os.ReadDir(styleDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			id := strings.TrimSuffix(e.Name(), ".md")
-			if id == "" {
-				continue
-			}
-			s := Style(id)
-			if s == Cute || s == Guofeng || s == Tech {
-				continue
-			}
-			data, err := os.ReadFile(filepath.Join(styleDir, e.Name()))
-			if err != nil {
-				log.Printf("[style] import %s: read error: %v", id, err)
-				continue
-			}
-			label := readLabelFile(dir, id)
-			if err := m.insert(id, label, string(data), "", false); err != nil {
-				log.Printf("[style] import %s: insert error: %v", id, err)
-				continue
-			}
-			imported++
-			log.Printf("[style] imported %q from style/%s.md", id, id)
-		}
-	}
-
-	// v1 layout: identity/ + soul/
-	idDir := filepath.Join(dir, "identity")
-	soDir := filepath.Join(dir, "soul")
-	if entries, err := os.ReadDir(idDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			id := strings.TrimSuffix(e.Name(), ".md")
-			if id == "" {
-				continue
-			}
-			s := Style(id)
-			if s == Cute || s == Guofeng || s == Tech {
-				continue
-			}
-			if m.exists(id) {
-				continue
-			}
-			var parts []string
-			if data, err := os.ReadFile(filepath.Join(idDir, id+".md")); err == nil {
-				parts = append(parts, string(data))
-			}
-			if data, err := os.ReadFile(filepath.Join(soDir, id+".md")); err == nil {
-				parts = append(parts, string(data))
-			}
-			if len(parts) == 0 {
-				continue
-			}
-			prompt := strings.Join(parts, "\n\n---\n\n")
-			label := readLabelFile(dir, id)
-			if err := m.insert(id, label, prompt, "", false); err != nil {
-				log.Printf("[style] import %s: insert error: %v", id, err)
-				continue
-			}
-			imported++
-			log.Printf("[style] imported %q from identity+soul", id)
-		}
-	}
-
-	if imported > 0 {
-		log.Printf("[style] seed: imported %d user-defined styles from %s", imported, dir)
-	}
-}
-
-func readLabelFile(dir, id string) string {
-	data, err := os.ReadFile(filepath.Join(dir, id+".label"))
-	if err != nil {
-		return id
-	}
-	return strings.TrimSpace(string(data))
-}
-
-// exists checks whether a style is already in the database.
-func (m *Manager) exists(id string) bool {
-	var dummy int
-	err := m.db.QueryRow(`SELECT 1 FROM styles WHERE id=?`, id).Scan(&dummy)
-	return err == nil
-}
-
-// insert adds a single style row.
-func (m *Manager) insert(id, label, prompt, memory string, builtin bool) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := m.db.Exec(
-		`INSERT OR IGNORE INTO styles (id, label, prompt, memory, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		id, label, prompt, memory, boolToInt(builtin), now, now,
-	)
-	return err
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
+	return &Manager{db: db}, nil
 }
 
 // GetSystemPrompt returns the full style prompt.
@@ -267,10 +81,6 @@ func (m *Manager) GetSoul(s Style) (string, error) {
 		return "", fmt.Errorf("unknown style: %s", s)
 	}
 	return "", nil
-}
-
-func (m *Manager) Label(s Style) string {
-	return m.DisplayLabel(s)
 }
 
 func (m *Manager) List() []Style {
@@ -336,7 +146,12 @@ func (m *Manager) Create(id, label, prompt, memory string) (Style, error) {
 	if prompt == "" {
 		prompt = fmt.Sprintf("# %s\n\n你是一个 AI 助手。", id)
 	}
-	if err := m.insert(id, label, prompt, memory, false); err != nil {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := m.db.Exec(
+		`INSERT INTO styles (id, label, prompt, memory, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?)`,
+		id, label, prompt, memory, now, now,
+	)
+	if err != nil {
 		return "", fmt.Errorf("create style %q: %w", id, err)
 	}
 	return Style(id), nil
@@ -369,7 +184,7 @@ func (m *Manager) Update(id, label, prompt, memory string) error {
 		args = append(args, memory)
 	}
 	if len(sets) == 1 {
-		return nil // nothing to update
+		return nil
 	}
 	args = append(args, id)
 	_, err := m.db.Exec(`UPDATE styles SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
@@ -389,6 +204,12 @@ func (m *Manager) Delete(id string) error {
 	}
 	_, err := m.db.Exec(`DELETE FROM styles WHERE id=? AND is_builtin=0`, id)
 	return err
+}
+
+func (m *Manager) exists(id string) bool {
+	var dummy int
+	err := m.db.QueryRow(`SELECT 1 FROM styles WHERE id=?`, id).Scan(&dummy)
+	return err == nil
 }
 
 func normaliseStyleID(s string) string {

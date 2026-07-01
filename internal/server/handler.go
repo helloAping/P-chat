@@ -581,7 +581,7 @@ func (h *Handler) Styles(c *gin.Context) {
 	for _, s := range h.styleMgr.ListAll() {
 		out = append(out, StyleMeta{
 			ID:    string(s),
-			Label: h.styleMgr.Label(s),
+			Label: h.styleMgr.DisplayLabel(s),
 			Desc:  styleDescFor(h.styleMgr, s),
 		})
 	}
@@ -654,7 +654,7 @@ func (h *Handler) CreateStyle(c *gin.Context) {
 	}
 	c.JSON(http.StatusCreated, gin.H{
 		"id":    string(s),
-		"label": h.styleMgr.Label(s),
+		"label": h.styleMgr.DisplayLabel(s),
 		"desc":  styleDescFor(h.styleMgr, s),
 	})
 }
@@ -675,7 +675,7 @@ func (h *Handler) GetStyle(c *gin.Context) {
 	memory, _ := h.styleMgr.GetMemory(s)
 	c.JSON(http.StatusOK, gin.H{
 		"id":     id,
-		"label":  h.styleMgr.Label(s),
+		"label":  h.styleMgr.DisplayLabel(s),
 		"prompt": prompt,
 		"memory": memory,
 	})

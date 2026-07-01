@@ -299,11 +299,8 @@ func (m *Manager) runServer(ctx context.Context, name string) {
 				}
 				m.mu.Unlock()
 				log.Printf("[mcp/%s] stopped", name)
-				return
 			}
-			// Connection dropped unexpectedly — try reconnect.
-			retries = 0
-			continue
+			return
 		}
 
 		retries++

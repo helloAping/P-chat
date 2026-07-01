@@ -12,7 +12,6 @@ func testDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Create the styles table (normally done by memory migration V3).
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS styles (
     id          TEXT PRIMARY KEY,
     label       TEXT NOT NULL DEFAULT '',
@@ -20,10 +19,19 @@ func testDB(t *testing.T) *sql.DB {
     memory      TEXT NOT NULL DEFAULT '',
     is_builtin  INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-)`)
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')))`)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Seed built-in styles (normally done by upgrade package).
+	seed := map[string]string{
+		"cute":    "小P (PiPi)",
+		"guofeng": "墨言 (MoYan)",
+		"tech":    "NEXUS (零号)",
+	}
+	for id, label := range seed {
+		db.Exec(`INSERT OR IGNORE INTO styles (id, label, prompt, memory, is_builtin, created_at, updated_at)
+			VALUES (?, ?, ?, '', 1, datetime('now'), datetime('now'))`, id, label, "# "+label)
 	}
 	t.Cleanup(func() { db.Close() })
 	return db

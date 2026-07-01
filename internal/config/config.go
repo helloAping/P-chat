@@ -496,17 +496,6 @@ func Default() *Config {
 	}
 }
 
-// PromptDir returns the prompts directory (project/prompts first, then ~/.p-chat/prompts)
-func PromptDir() string {
-	// Check project-level prompts first
-	cwd, _ := os.Getwd()
-	projectPrompts := filepath.Join(cwd, "prompts")
-	if _, err := os.Stat(projectPrompts); err == nil {
-		return projectPrompts
-	}
-	return paths.GlobalPromptsDir()
-}
-
 // defaultWriteProtectedPaths returns the conservative baseline list of
 // paths that LLM-driven tools should never touch. Users can override
 // or extend this list in their config.json.

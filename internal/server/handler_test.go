@@ -19,6 +19,7 @@ import (
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/upgrade"
 )
 
 // streamRecorder wraps httptest.ResponseRecorder with a CloseNotify
@@ -101,6 +102,7 @@ func newTestServerWithConfig(t *testing.T, jsonBody string) (*Server, *config.Co
 	llmClient, _ := llm.NewClient(&cfg.LLM)
 	store, _ := memory.OpenAt(":memory:", 50)
 	t.Cleanup(func() { store.Close() })
+	upgrade.SeedForTesting(store.DB())
 	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
@@ -1061,6 +1063,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	upgrade.SeedForTesting(store.DB())
 	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
@@ -1078,6 +1081,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store2.Close()
+	upgrade.SeedForTesting(store2.DB())
 	llmClient2, _ := llm.NewClient(&cfg.LLM)
 	styleMgr2, _ := style.NewManager(store2.DB())
 	tools2 := tool.NewRegistry()
@@ -1151,6 +1155,7 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	upgrade.SeedForTesting(store.DB())
 	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
@@ -1207,6 +1212,7 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store2.Close()
+	upgrade.SeedForTesting(store2.DB())
 	llmClient2, _ := llm.NewClient(&cfg.LLM)
 	styleMgr2, _ := style.NewManager(store2.DB())
 	tools2 := tool.NewRegistry()

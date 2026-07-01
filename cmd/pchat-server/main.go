@@ -24,6 +24,7 @@ import (
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/upgrade"
 	"github.com/p-chat/pchat/internal/version"
 )
 
@@ -85,6 +86,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 	memStore, err := memory.Open(cfg.Memory.MaxHistory)
 	if err != nil {
 		return fmt.Errorf("init memory: %w", err)
+	}
+
+	// Run the upgrade system: checks ~/.p-chat/version and applies
+	// any pending structural migrations (SQL + files + config).
+	if err := upgrade.Run(memStore.DB()); err != nil {
+		return fmt.Errorf("upgrade: %w", err)
 	}
 
 	styleMgr, err := style.NewManager(memStore.DB())
