@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
 )
@@ -253,6 +256,16 @@ func RegisterBuiltin(r *Registry) {
 			"path": StringProp("Directory path; pass '.' or empty for the current working directory"),
 		}, []string{"path"}),
 	}, handleListFiles)
+
+	r.Register(Tool{
+		Name:        "web_fetch",
+		Description: "Fetch the content of a URL and return it as text. Use for reading online documentation, API responses, web pages, or any publicly accessible HTTP resource. The response is limited to 1 MB of text. Supports HTTP and HTTPS URLs only.",
+		Parameters: ObjectSchema(map[string]any{
+			"url":    StringProp("The full URL to fetch (must start with http:// or https://)"),
+			"method": StringEnumProp("HTTP method to use (default GET)", "GET", "POST"),
+			"body":   StringProp("Request body for POST requests (plain text or JSON)"),
+		}, []string{"url"}),
+	}, handleWebFetch)
 
 	r.Register(Tool{
 		Name:        "todo_write",
@@ -582,4 +595,81 @@ func handleReadPdf(ctx context.Context, args json.RawMessage) (*CallResult, erro
 		return &CallResult{Content: err.Error(), IsError: true}, nil
 	}
 	return &CallResult{Content: text}, nil
+}
+
+type webFetchArgs struct {
+	URL    string `json:"url"`
+	Method string `json:"method,omitempty"`
+	Body   string `json:"body,omitempty"`
+}
+
+func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, error) {
+	var a webFetchArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return &CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
+	}
+	if a.URL == "" {
+		return &CallResult{Content: "url is required", IsError: true}, nil
+	}
+
+	lower := strings.ToLower(a.URL)
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		return &CallResult{Content: "E_PROTO: only http:// and https:// URLs are supported", IsError: true}, nil
+	}
+	if strings.HasPrefix(lower, "http://127.") || strings.HasPrefix(lower, "http://localhost") || strings.HasPrefix(lower, "http://0.0.0.0") {
+		return &CallResult{Content: "E_PROTO: fetching from loopback addresses is not allowed for security", IsError: true}, nil
+	}
+
+	method := "GET"
+	if a.Method != "" {
+		method = strings.ToUpper(a.Method)
+	}
+	if method != "GET" && method != "POST" {
+		return &CallResult{Content: "E_ARGS: method must be GET or POST", IsError: true}, nil
+	}
+
+	var reqBody io.Reader
+	if a.Body != "" {
+		if method != "POST" {
+			return &CallResult{Content: "E_ARGS: body is only valid with POST method", IsError: true}, nil
+		}
+		reqBody = strings.NewReader(a.Body)
+	}
+
+	httpCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(httpCtx, method, a.URL, reqBody)
+	if err != nil {
+		return &CallResult{Content: "request error: " + err.Error(), IsError: true}, nil
+	}
+	req.Header.Set("User-Agent", "P-Chat/1.0")
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return &CallResult{Content: "fetch error: " + err.Error(), IsError: true}, nil
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return &CallResult{Content: "read error: " + err.Error(), IsError: true}, nil
+	}
+
+	statusPrefix := ""
+	if resp.StatusCode >= 400 {
+		statusPrefix = fmt.Sprintf("HTTP %d\n\n", resp.StatusCode)
+	}
+
+	cType := strings.ToLower(resp.Header.Get("Content-Type"))
+	isHTTPError := resp.StatusCode >= 400
+	if strings.HasPrefix(cType, "application/json") || isHTTPError {
+		return &CallResult{Content: statusPrefix + string(body)}, nil
+	}
+
+	return &CallResult{Content: statusPrefix + string(body)}, nil
 }

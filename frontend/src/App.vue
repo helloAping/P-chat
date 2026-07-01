@@ -19,6 +19,7 @@ import SessionSidebar from './components/SessionSidebar.vue'
 import ChatWindow from './components/ChatWindow.vue'
 import AppSettingsModal from './components/AppSettingsModal.vue'
 import ImageLightbox from './components/ImageLightbox.vue'
+import PlanReviewModal from './components/PlanReviewModal.vue'
 import { state, loadSessions, loadProviders, loadProjects, submitToolConfirm, currentPendingConfirm } from './stores/chat'
 
 const showAppSettings = ref(false)
@@ -142,8 +143,9 @@ onMounted(async () => {
                   <NButton type="primary" @click="submitToolConfirm(true)">允许执行</NButton>
                 </NSpace>
               </div>
-            </NModal>
-          </div>
+              </NModal>
+              <PlanReviewModal />
+            </div>
         </NNotificationProvider>
       </NDialogProvider>
     </NMessageProvider>

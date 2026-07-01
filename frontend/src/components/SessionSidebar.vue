@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, onMounted } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NCard, NTag, useMessage } from 'naive-ui'
+import { computed, ref, onMounted, watch } from 'vue'
+import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NCard, NTag, NSpin, NDropdown, useMessage } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
@@ -9,6 +9,8 @@ import * as api from '../api/client'
 import type { SelectOption } from 'naive-ui'
 import { checkUpdate } from '../api/update'
 import type { UpdateInfo } from '../api/update'
+import type { SearchResult } from '../api/client'
+import TokenStatsModal from './TokenStatsModal.vue'
 
 const APP_VERSION = __APP_VERSION__
 const GITHUB_REPO = __GITHUB_REPO__
@@ -16,6 +18,34 @@ const GITHUB_REPO = __GITHUB_REPO__
 const emit = defineEmits<{ (e: 'open-settings'): void }>()
 
 const themeName = defineModel<'dark' | 'light'>('themeName', { default: 'dark' })
+const showTokenStats = ref(false)
+
+const menuOptions = computed(() => [
+  {
+    label: 'Token 用量',
+    key: 'token-stats',
+    icon: () => '📊',
+  },
+  {
+    label: '设置',
+    key: 'settings',
+    icon: () => '⚙',
+  },
+  { type: 'divider' as const, key: 'd1' },
+  {
+    label: updateInfo.value?.hasUpdate ? `关于 (新版本 ${updateInfo.value.latest})` : '关于',
+    key: 'about',
+    icon: () => updateInfo.value?.hasUpdate ? '🔔' : 'ℹ',
+  },
+])
+
+function handleMenuSelect(key: string) {
+  switch (key) {
+    case 'token-stats': showTokenStats.value = true; break
+    case 'settings': emit('open-settings'); break
+    case 'about': openAbout(); break
+  }
+}
 
 const message = useMessage()
 const showAddProject = ref(false)
@@ -32,6 +62,41 @@ const pendingDeleteSessionId = ref('')
 const sortedSessions = computed(() =>
   [...state.sessions].sort((a, b) => b.updated_at - a.updated_at),
 )
+
+// Search state
+const searchQuery = ref('')
+const searchResults = ref<SearchResult[]>([])
+const searchLoading = ref(false)
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+
+function doSearch() {
+  const q = searchQuery.value.trim()
+  if (!q) {
+    searchResults.value = []
+    searchLoading.value = false
+    return
+  }
+  searchLoading.value = true
+  api.searchMessages(q, 15).then(
+    r => { searchResults.value = r.results; searchLoading.value = false },
+    () => { searchLoading.value = false },
+  )
+}
+
+watch(searchQuery, () => {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(doSearch, 300)
+})
+
+function clearSearch() {
+  searchQuery.value = ''
+  searchResults.value = []
+}
+
+function jumpToResult(r: SearchResult) {
+  clearSearch()
+  switchSession(r.conversation_id)
+}
 
 const projectOptions = computed<SelectOption[]>(() => [
   { label: '🌐 全局', value: '' },
@@ -166,14 +231,12 @@ onMounted(() => {
     <div class="sidebar-header">
       <div class="logo">💬 P-Chat</div>
       <NSpace size="small">
-        <NButton size="small" quaternary @click="openAbout" title="关于我们" style="position:relative">
-          ℹ
-          <span v-if="updateInfo?.hasUpdate" class="update-dot"></span>
-        </NButton>
         <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'">
           {{ themeName === 'dark' ? '🌙' : '☀' }}
         </NButton>
-        <NButton size="small" quaternary @click="openSettings" title="设置">⚙</NButton>
+        <NDropdown trigger="click" :options="menuOptions" @select="handleMenuSelect">
+          <NButton size="small" quaternary title="更多">⋯</NButton>
+        </NDropdown>
       </NSpace>
     </div>
     <div class="project-bar">
@@ -187,8 +250,40 @@ onMounted(() => {
       <NButton size="tiny" quaternary @click="showAddProject = true" title="添加项目目录" style="font-size:11px">+目录</NButton>
       <NButton v-if="state.activeProjectPath" size="tiny" quaternary @click="showConfirmDeleteProject = true" title="删除当前项目" style="color: var(--warn); font-size:11px">移除</NButton>
     </div>
+    <div class="search-bar">
+      <NInput
+        v-model:value="searchQuery"
+        size="small"
+        placeholder="搜索会话内容..."
+        clearable
+        @clear="clearSearch"
+      >
+        <template #prefix>🔍</template>
+      </NInput>
+    </div>
     <NScrollbar style="flex: 1">
-      <div class="session-list">
+      <!-- Search results -->
+      <div v-if="searchQuery.trim()" class="search-results">
+        <NSpin :show="searchLoading" size="small">
+          <div v-if="searchResults.length === 0 && !searchLoading" class="search-empty">
+            无匹配结果
+          </div>
+          <div
+            v-for="r in searchResults"
+            :key="`${r.conversation_id}-${r.message_id}`"
+            class="search-result-item"
+            @click="jumpToResult(r)"
+          >
+            <div class="result-header">
+              <span class="result-title">{{ r.conversation_title || '(无标题)' }}</span>
+              <span class="result-time">{{ formatTime(r.created_at) }}</span>
+            </div>
+            <div class="result-snippet">{{ r.snippet }}</div>
+          </div>
+        </NSpin>
+      </div>
+      <!-- Session list (hidden when searching) -->
+      <div v-else class="session-list">
         <div
           v-for="s in sortedSessions"
           :key="s.id"
@@ -296,6 +391,9 @@ onMounted(() => {
         </div>
       </div>
     </NModal>
+
+    <TokenStatsModal v-model:show="showTokenStats" />
+
   </aside>
 </template>
 
@@ -345,6 +443,18 @@ onMounted(() => {
   border-bottom: 1px solid var(--border);
 }
 .project-bar :deep(.n-base-select) { flex: 1; }
+.search-bar { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.search-results { padding: 8px; }
+.search-result-item {
+  padding: 10px 12px; margin-bottom: 6px; border-radius: 6px;
+  cursor: pointer; background: var(--bg-3); transition: background 0.1s;
+}
+.search-result-item:hover { background: var(--bg-4); }
+.result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.result-title { font-size: 12px; font-weight: 600; }
+.result-time { font-size: 10px; color: var(--text-4); }
+.result-snippet { font-size: 12px; color: var(--text-2); line-height: 1.4; white-space: pre-wrap; word-break: break-all; }
+.search-empty { text-align: center; padding: 24px; color: var(--text-4); font-size: 13px; }
 .add-project-form {
   padding: 16px; min-width: 320px;
 }

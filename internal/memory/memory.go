@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +51,16 @@ type Summary struct {
 	RangeEnd       int64     `json:"range_end"`
 	Summary        string    `json:"summary"`
 	CreatedAt      time.Time `json:"created_at"`
+}
+
+// SearchResult is one hit from a full-text search across messages.
+type SearchResult struct {
+	ConversationID    string `json:"conversation_id"`
+	ConversationTitle string `json:"conversation_title"`
+	MessageID         int64  `json:"message_id"`
+	Role              string `json:"role"`
+	Snippet           string `json:"snippet"`
+	CreatedAt         int64  `json:"created_at"`
 }
 
 // Store is the central accessor for the SQLite-backed memory database.
@@ -1484,11 +1496,176 @@ func newConvID() string {
 	return fmt.Sprintf("conv_%d_%d", time.Now().UnixNano(), n)
 }
 
+// SearchMessages performs a simple LIKE-based full-text search
+// across messages in all active (non-archived) conversations.
+// Returns up to `limit` results sorted by created_at desc.
+func (s *Store) SearchMessages(q string, limit int) []SearchResult {
+	_ = s.Flush()
+	if q == "" {
+		return nil
+	}
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return nil
+	}
+
+	rows, err := s.db.Query(
+		`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at
+		 FROM messages m
+		 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
+		 WHERE m.content LIKE ?
+		 ORDER BY m.created_at DESC
+		 LIMIT ?`,
+		"%"+q+"%", limitOrHuge(limit),
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var out []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		var content string
+		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt); err != nil {
+			break
+		}
+		r.Snippet = snippet(content, q, 120)
+		out = append(out, r)
+	}
+	return out
+}
+
+// snippet extracts a short window around the first occurrence of
+// `q` in `content`, capped at maxLen runes.
+func snippet(content, q string, maxLen int) string {
+	lower := strings.ToLower(content)
+	qlower := strings.ToLower(q)
+	idx := strings.Index(lower, qlower)
+	if idx < 0 {
+		runes := []rune(content)
+		if len(runes) <= maxLen {
+			return content
+		}
+		return string(runes[:maxLen]) + "…"
+	}
+	// Center the window around the match.
+	runes := []rune(content)
+	start := idx - (maxLen-len(q))/2
+	if start < 0 {
+		start = 0
+	}
+	end := start + maxLen
+	if end > len(runes) {
+		end = len(runes)
+		start = end - maxLen
+		if start < 0 {
+			start = 0
+		}
+	}
+	s := string(runes[start:end])
+	if start > 0 {
+		s = "…" + s
+	}
+	if end < len(runes) {
+		s = s + "…"
+	}
+	return s
+}
+
 func limitOrHuge(n int) int {
 	if n <= 0 {
 		return 1 << 30
 	}
 	return n
+}
+
+// ConversationTokenStats holds aggregated token usage for one conversation.
+type ConversationTokenStats struct {
+	ConversationID    string  `json:"conversation_id"`
+	ConversationTitle string  `json:"conversation_title"`
+	TokensIn          int     `json:"tokens_in"`
+	TokensOut         int     `json:"tokens_out"`
+	MsgCount          int     `json:"msg_count"`
+	UpdatedAt         int64   `json:"updated_at"`
+}
+
+// TokenStats scans messages metadata for assistant messages with
+// tokens_in / tokens_out keys and aggregates per conversation.
+func (s *Store) TokenStats() []ConversationTokenStats {
+	_ = s.Flush()
+	rows, err := s.db.Query(`
+		SELECT m.conversation_id,
+			   COALESCE(c.title, ''),
+			   m.metadata,
+			   c.updated_at,
+			   (SELECT COUNT(*) FROM messages m2 WHERE m2.conversation_id = m.conversation_id) AS msg_count
+		FROM messages m
+		JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
+		WHERE m.role = 'assistant' AND m.metadata IS NOT NULL AND m.metadata != ''
+	`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	type convAgg struct {
+		Title     string
+		TokensIn  int
+		TokensOut int
+		MsgCount  int
+		UpdatedAt int64
+	}
+	agg := make(map[string]*convAgg)
+
+	for rows.Next() {
+		var convID, title, metaStr string
+		var updatedAt int64
+		var msgCount int
+		if err := rows.Scan(&convID, &title, &metaStr, &updatedAt, &msgCount); err != nil {
+			break
+		}
+		e, ok := agg[convID]
+		if !ok {
+			e = &convAgg{Title: title, UpdatedAt: updatedAt}
+			agg[convID] = e
+		}
+		// Take the max msg_count across multiple rows for the same conv.
+		if msgCount > e.MsgCount {
+			e.MsgCount = msgCount
+		}
+
+		// Parse tokens from metadata JSON.
+		var meta map[string]string
+		if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
+			continue
+		}
+		if t, ok := meta["tokens_in"]; ok {
+			if v, err := strconv.Atoi(t); err == nil {
+				e.TokensIn += v
+			}
+		}
+		if t, ok := meta["tokens_out"]; ok {
+			if v, err := strconv.Atoi(t); err == nil {
+				e.TokensOut += v
+			}
+		}
+	}
+
+	var out []ConversationTokenStats
+	for convID, e := range agg {
+		out = append(out, ConversationTokenStats{
+			ConversationID:    convID,
+			ConversationTitle: e.Title,
+			TokensIn:          e.TokensIn,
+			TokensOut:         e.TokensOut,
+			MsgCount:          e.MsgCount,
+			UpdatedAt:         e.UpdatedAt,
+		})
+	}
+	// Sort by updated_at desc.
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
+	return out
 }
 
 // extractBase64FromDataURL strips the "data:<mime>;base64," prefix

@@ -1224,7 +1224,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 
 			if len(toolCalls) == 0 {
-				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc)
+				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
 				ch <- ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
 				ch <- ChatStreamChunk{Done: true}
 				return
@@ -1234,7 +1234,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// messages (exclude tool_call/tool_result metadata).
 			meaningful := countMeaningfulMessages(msgs)
 			if meaningful > 120 {
-				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc)
+				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
 				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条有效消息，接近上限，已自动停止。建议执行 /compress 压缩历史后继续。", meaningful), Round: roundNum, MaxRound: maxRounds}
 				ch <- ChatStreamChunk{Done: true}
 				return
@@ -1567,7 +1567,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 			// Persist assistant message now that tool
 			// results are captured in partsAcc.
-			persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc)
+			persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
 
 			// Stuck-loop guard. Compute a stable signature of
 			// this round's tool calls and whether any errored.
@@ -1651,7 +1651,7 @@ func countMeaningfulMessages(msgs []llm.ChatMessage) int {
 	return n
 }
 
-func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator) {
+func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int) {
 	if store == nil {
 		return
 	}
@@ -1661,6 +1661,12 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 	}
 	if fullThinking != "" {
 		meta["thinking"] = fullThinking
+	}
+	if tokensIn > 0 {
+		meta["tokens_in"] = fmt.Sprintf("%d", tokensIn)
+	}
+	if tokensOut > 0 {
+		meta["tokens_out"] = fmt.Sprintf("%d", tokensOut)
 	}
 	structural := snapshotStructural(partsAcc)
 	if len(structural) > 0 {

@@ -321,6 +321,11 @@ func (c *AnthropicClient) handleStreamEvent(eventType, dataJSON string, ch chan<
 		}
 	case "message_stop":
 		ch <- StreamChunk{Done: true}
+	case "message_delta":
+		var delta anthropicMessageDelta
+		if err := json.Unmarshal([]byte(dataJSON), &delta); err == nil {
+			ch <- StreamChunk{TokensOut: delta.Usage.OutputTokens}
+		}
 	case "error":
 		var errResp struct {
 			Type    string `json:"type"`

@@ -252,6 +252,31 @@ export interface UploadMeta {
   mime: string
 }
 
+export interface SearchResult {
+  conversation_id: string
+  conversation_title: string
+  message_id: number
+  role: string
+  snippet: string
+  created_at: number
+}
+
+export interface SearchResponse {
+  results: SearchResult[]
+}
+
+export interface TokenStat {
+  conversation_id: string
+  conversation_title: string
+  tokens_in: number
+  tokens_out: number
+  msg_count: number
+  updated_at: number
+}
+
+export const fetchTokenStats = () =>
+  jsonFetch<{ stats: TokenStat[] }>('/api/v1/token-stats')
+
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + url, {
     ...init,
@@ -266,6 +291,12 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 
 // --- Health ---
 export const health = () => jsonFetch<{ status: string }>('/api/v1/health')
+
+// --- Search ---
+export const searchMessages = (q: string, limit = 20) =>
+  jsonFetch<SearchResponse>(
+    `/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`,
+  )
 
 // --- Sessions ---
 export const listSessions = (projectPath: string) =>
@@ -334,6 +365,12 @@ export const submitQuestionResponse = (id: string, resp: QuestionResponsePayload
   jsonFetch<{ ok: boolean }>(`/api/v1/sessions/${id}/question-response`, {
     method: 'POST',
     body: JSON.stringify(resp),
+  })
+
+export const executePlan = (id: string, planText: string) =>
+  jsonFetch<{ ok: boolean; id: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/execute-plan`, {
+    method: 'POST',
+    body: JSON.stringify({ plan_text: planText }),
   })
 
 // --- Projects ---
