@@ -95,6 +95,78 @@ func TestPartsAccumulator_SubAgent(t *testing.T) {
 	}
 }
 
+// TestPartsAccumulator_SubAgentMetadata verifies that the
+// four new sub-agent metadata fields (agent_type, agent_color,
+// agent_model, task_id) ride along on the lifecycle events
+// and survive a snapshot. This is what the SubAgentCard
+// reads to render the agent name + accent + model chip + the
+// resumable task_id badge.
+func TestPartsAccumulator_SubAgentMetadata(t *testing.T) {
+	acc := newPartsAccumulator()
+	acc.update(ChatStreamChunk{
+		SubAgent: true, SubAgentStatus: "start", SubAgentTask: "audit",
+		SubAgentType: "explore", SubAgentColor: "#44BA81",
+		SubAgentModel: "gpt-4o-mini", SubAgentTaskID: "audit-2025-01-15",
+	})
+	acc.update(ChatStreamChunk{
+		SubAgent: true, SubAgentStatus: "ok", SubAgentTask: "audit", Duration: "3.4s",
+	})
+
+	parts := acc.snapshot()
+	if len(parts) != 1 {
+		t.Fatalf("want single sub_agent part, got %+v", parts)
+	}
+	sub := parts[0]
+	if sub.AgentType != "explore" {
+		t.Errorf("AgentType = %q, want explore", sub.AgentType)
+	}
+	if sub.AgentColor != "#44BA81" {
+		t.Errorf("AgentColor = %q, want #44BA81", sub.AgentColor)
+	}
+	if sub.AgentModel != "gpt-4o-mini" {
+		t.Errorf("AgentModel = %q, want gpt-4o-mini", sub.AgentModel)
+	}
+	if sub.TaskID != "audit-2025-01-15" {
+		t.Errorf("TaskID = %q, want audit-2025-01-15", sub.TaskID)
+	}
+	if sub.Elapsed != "3.4s" {
+		t.Errorf("Elapsed = %q, want 3.4s", sub.Elapsed)
+	}
+}
+
+// TestPartsAccumulator_SubAgentMetadataBackfill verifies
+// that a model that arrives on a later chunk (after the
+// start event) still gets stamped onto the sub-agent part.
+// This matters because the sub-agent runner may not know
+// the resolved model until after the first round.
+func TestPartsAccumulator_SubAgentMetadataBackfill(t *testing.T) {
+	acc := newPartsAccumulator()
+	acc.update(ChatStreamChunk{
+		SubAgent: true, SubAgentStatus: "start", SubAgentTask: "audit",
+		SubAgentType: "explore",
+		// No SubAgentModel yet.
+	})
+	// Mid-stream content chunk that carries the model.
+	acc.update(ChatStreamChunk{
+		SubAgent: true, SubAgentTask: "audit", SubAgentModel: "claude-haiku-4-5",
+		Content: "thinking...",
+	})
+	acc.update(ChatStreamChunk{
+		SubAgent: true, SubAgentStatus: "ok", SubAgentTask: "audit", Duration: "2s",
+	})
+
+	parts := acc.snapshot()
+	if len(parts) != 1 {
+		t.Fatalf("want single sub_agent part, got %+v", parts)
+	}
+	if parts[0].AgentModel != "claude-haiku-4-5" {
+		t.Errorf("AgentModel = %q, want claude-haiku-4-5 (backfilled)", parts[0].AgentModel)
+	}
+	if parts[0].AgentType != "explore" {
+		t.Errorf("AgentType = %q, want explore (from start event)", parts[0].AgentType)
+	}
+}
+
 func TestPartsAccumulator_DoneClearsStreaming(t *testing.T) {
 	acc := newPartsAccumulator()
 	acc.update(ChatStreamChunk{Thinking: "reasoning..."})

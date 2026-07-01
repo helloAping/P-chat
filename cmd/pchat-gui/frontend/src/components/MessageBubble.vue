@@ -42,6 +42,13 @@ import {
 } from '../utils/clipboard'
 
 const props = defineProps<{ message: Message; streaming?: boolean }>()
+const emit = defineEmits<{
+  rollback: []
+  fork: []
+}>()
+
+function onRollback() { emit('rollback') }
+function onFork() { emit('fork') }
 // toast is the Naive UI useMessage() handle. Used to
 // surface "已复制"/"已下载" feedback at the top of the
 // screen. Named `toast` rather than `message` so it
@@ -382,18 +389,6 @@ const showVisionWarn = computed(() =>
     <div class="bubble">
       <div v-if="isSystem" class="system-icon">›</div>
       <div class="bubble-body">
-        <!-- Hover-revealed bubble actions: copy the whole
-             message. Works on user (copies raw input), assistant
-             (joins text parts), and system bubbles. -->
-        <div class="bubble-actions" :data-role="message.role">
-          <button
-            type="button"
-            class="bubble-action-btn"
-            title="复制整条消息"
-            @click="copyEntireMessage"
-          >📋</button>
-        </div>
-
         <!-- Attachments (user / tool) -->
         <div v-if="message.attachments && message.attachments.length" class="attachments">
           <template v-for="(a, i) in message.attachments" :key="i">
@@ -547,24 +542,47 @@ const showVisionWarn = computed(() =>
         </div>
       </div>
     </div>
+    <!-- Bubble actions: copy + rollback, shown below the bubble on hover -->
+    <div class="bubble-actions" :data-role="message.role">
+      <button
+        type="button"
+        class="bubble-action-btn"
+        title="复制整条消息"
+        @click="copyEntireMessage"
+      >📋</button>
+      <button
+        v-if="message.role === 'user' && !streaming"
+        type="button"
+        class="bubble-action-btn bubble-action-fork"
+        title="从此消息创建分支对话"
+        @click="onFork"
+      >⑂</button>
+      <button
+        v-if="message.role === 'user' && !streaming"
+        type="button"
+        class="bubble-action-btn bubble-action-rollback"
+        title="撤回此消息及之后的回复"
+        @click="onRollback"
+      >↩</button>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .msg {
   display: flex;
+  flex-direction: column;
   margin: 6px 16px;
 }
-.msg.user { justify-content: flex-end; }
-.msg.assistant { justify-content: flex-start; }
-.msg.tool { justify-content: flex-start; }
+.msg.user { align-items: flex-end; }
+.msg.assistant { align-items: flex-start; }
+.msg.tool { align-items: flex-start; }
 .bubble {
   max-width: 80%;
   padding: 8px 12px;
   border-radius: 10px;
   word-wrap: break-word;
   overflow-wrap: break-word;
-  position: relative;
 }
 .msg.user .bubble {
   background: var(--accent);
@@ -605,25 +623,20 @@ const showVisionWarn = computed(() =>
 }
 .bubble-body { min-width: 0; flex: 1; }
 
-/* Bubble-level "copy whole message" affordance. Pinned to
- * the top-right of the bubble, visible on hover so it
- * doesn't crowd the bubble when not needed. The same
- * affordance works on user, assistant, and system bubbles
- * — the source text is selected per role. */
+/* Bubble-level actions: copy + rollback. Sit below the bubble,
+ * visible on hover. No longer absolutely positioned so they
+ * don't overlap the message text. */
 .bubble-actions {
-  position: absolute;
-  top: 4px;
-  right: 4px;
   display: flex;
   gap: 4px;
   opacity: 0;
   transition: opacity 0.15s ease;
-  z-index: 2;
+  padding-top: 4px;
 }
-.bubble:hover .bubble-actions { opacity: 1; }
+.msg:hover .bubble-actions { opacity: 1; }
 .bubble-action-btn {
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -632,10 +645,10 @@ const showVisionWarn = computed(() =>
   background: var(--bg-2);
   color: var(--text-2);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 10px;
   line-height: 1;
   padding: 0;
-  opacity: 0.92;
+  opacity: 0.85;
 }
 .bubble-action-btn:hover {
   background: var(--bg-3);
@@ -650,6 +663,11 @@ const showVisionWarn = computed(() =>
 .msg.user .bubble-action-btn:hover {
   background: rgba(255, 255, 255, 0.3);
   color: var(--on-accent);
+}
+.bubble-action-rollback:hover {
+  background: var(--warning-suppl, #fff3cd) !important;
+  color: #b85c00 !important;
+  border-color: var(--warning, #f0a020) !important;
 }
 .attachments {
   display: flex;

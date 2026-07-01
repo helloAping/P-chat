@@ -1,34 +1,33 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Install agent tool symlinks pointing to .agents/AGENTS.md.
+    安装 agent 工具目录符号链接，将 .opencode/.codex/.claude 指向 .agents/。
 
 .DESCRIPTION
-    Creates the following symlinks so that opencode / codex / claude
-    all read the same canonical agent instructions:
+    创建以下目录级符号链接（Junction），使得各 agent 工具读取 .agents/ 下的完整内容：
 
-        .opencode/AGENTS.md  -> ./.agents/AGENTS.md
-        .codex/AGENTS.md     -> ./.agents/AGENTS.md
-        .claude/CLAUDE.md    -> ./.agents/AGENTS.md
+        .opencode  ->  .agents/     (opencode 读取 .opencode/AGENTS.md)
+        .codex     ->  .agents/     (codex 读取 .codex/AGENTS.md)
+        .claude    ->  .agents/     (claude 读取 .claude/CLAUDE.md)
 
-    On Windows, symlinks require either administrator privileges
-    or Developer Mode. If the symlink creation fails, this script
-    falls back to copying the file (no longer a symlink — the
-    user will need to re-run this script to pick up future edits).
+    目录级的好处：.agents/ 下的所有子目录（docs/、scripts/）都自动通过符号链接可见，
+    无需为每个文件单独建链接。
+
+    对于 .p-chat（已有本地配置内容），仅同步 AGENTS.md 文件级副本。
+
+    Windows 优先使用 Junction（mklink /J，无需管理员），失败时回退到副本。
 
 .PARAMETER Force
-    Replace existing files / symlinks at the target paths.
+    替换已存在的目标路径。
 
 .PARAMETER DryRun
-    Print what would be done without making any changes.
+    仅打印操作，不做任何更改。
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1
-    # Idempotent install. Run from the repo root.
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 -Force -DryRun
-    # Show what install -Force would do, without doing it.
+    powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 -Force
 #>
 
 [CmdletBinding()]
@@ -40,114 +39,136 @@ param(
 $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot  = Resolve-Path (Join-Path $ScriptDir '..\..')
-$Canonical = Join-Path $RepoRoot '.agents\AGENTS.md'
+$AgentsDir = Join-Path $RepoRoot '.agents'
+$Canonical = Join-Path $AgentsDir 'AGENTS.md'
 
-# Validate the canonical file exists.
+# ---- 验证 canonical 文件存在 ----
 if (-not (Test-Path -LiteralPath $Canonical)) {
     Write-Error "Canonical file not found: $Canonical"
     exit 1
 }
 
-# Each tool's expected location -> relative target inside the repo.
-$Links = @(
-    @{ Path = '.opencode\AGENTS.md';  Target = '.agents\AGENTS.md' }
-    @{ Path = '.codex\AGENTS.md';     Target = '.agents\AGENTS.md' }
-    @{ Path = '.claude\CLAUDE.md';    Target = '.agents\AGENTS.md' }
+# ---- 确保 .agents/CLAUDE.md 存在（claude 需要的文件名） ----
+$ClaudeFile = Join-Path $AgentsDir 'CLAUDE.md'
+if (-not (Test-Path -LiteralPath $ClaudeFile)) {
+    Write-Host "  Creating $ClaudeFile (copy of AGENTS.md for claude)"
+    if (-not $DryRun) {
+        Copy-Item -LiteralPath $Canonical -Destination $ClaudeFile -Force
+    }
+}
+
+# ---- 目录级符号链接列表 ----
+# 每个工具目录都指向 .agents/，之后 .opencode/AGENTS.md = .agents/AGENTS.md，依此类推。
+$DirLinks = @(
+    @{ Path = '.opencode' }   # opencode reads .opencode/AGENTS.md
+    @{ Path = '.codex'    }   # codex reads .codex/AGENTS.md
+    @{ Path = '.claude'   }   # claude reads .claude/CLAUDE.md
 )
 
-function New-OrUpdate-Link {
+# ---- .p-chat AGENTS.md 同步（文件级，因其已有本地配置内容） ----
+$PchatAgents = Join-Path $RepoRoot '.p-chat\AGENTS.md'
+
+function New-DirectoryLink {
     param(
         [string]$LinkPath,
         [string]$Target
     )
 
     $absLinkPath = Join-Path $RepoRoot $LinkPath
-    $linkDir     = Split-Path -Parent $absLinkPath
-    # All tool symlinks in this project sit at the repo root one
-    # level deep (.opencode/, .codex/, .claude/), so the relative
-    # path from each link's parent directory back to the canonical
-    # is always "../.agents/AGENTS.md". We don't use
-    # [System.IO.Path]::GetRelativePath() because it isn't
-    # available on PowerShell 5.1 (Desktop Edition) — it's a
-    # .NET Core / .NET 5+ API.
-    $relTarget = '../.agents/AGENTS.md'
+    $absTarget   = $AgentsDir
 
     if ($DryRun) {
-        Write-Host "  [dry-run] $LinkPath  ->  $relTarget"
+        Write-Host "  [dry-run] $LinkPath  ->  .agents/"
         return
     }
 
-    # Ensure the parent directory exists.
-    if (-not (Test-Path -LiteralPath $linkDir)) {
-        New-Item -ItemType Directory -Path $linkDir -Force | Out-Null
-    }
-
-    # If the link already exists, decide what to do.
+    # 如果已存在且是正确的 Junction，跳过。
     if (Test-Path -LiteralPath $absLinkPath) {
         $item = Get-Item -LiteralPath $absLinkPath -Force
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-            # Already a symlink. Check the target.
+            # 已是符号链接/Junction。检查目标。
             $existingTarget = $item.Target
-            if ($existingTarget -eq $relTarget) {
-                Write-Host "  [ok]      $LinkPath (already points to $relTarget)"
+            $normalizedExisting = (Resolve-Path $existingTarget -ErrorAction SilentlyContinue).Path
+            $normalizedTarget = (Resolve-Path $absTarget).Path
+            if ($normalizedExisting -eq $normalizedTarget) {
+                Write-Host "  [ok]      $LinkPath (already points to .agents/)"
                 return
             }
-            if ($Force) {
-                Remove-Item -LiteralPath $absLinkPath -Force
-            } else {
-                Write-Host "  [skip]    $LinkPath already exists (target=$existingTarget, want=$relTarget). Use -Force to replace."
-                return
-            }
-        } else {
-            # A real file or directory. With -Force, replace it.
             if ($Force) {
                 Remove-Item -LiteralPath $absLinkPath -Recurse -Force
             } else {
-                Write-Host "  [skip]    $LinkPath is a real file/dir. Use -Force to replace."
+                Write-Host "  [skip]    $LinkPath already exists (target=$existingTarget). Use -Force to replace."
+                return
+            }
+        } else {
+            # 普通目录。仅 -Force 时移除。
+            if ($Force) {
+                Remove-Item -LiteralPath $absLinkPath -Recurse -Force
+            } else {
+                Write-Host "  [skip]    $LinkPath is a real directory. Use -Force to replace."
                 return
             }
         }
     }
 
-    # Try symlink first. On Windows, this requires either admin
-    # privileges or Developer Mode to be enabled. If it fails,
-    # fall back to a plain copy.
+    # 优先用 Junction（无需管理员权限，目录级，但绝对路径）。
+    # 失败时回退到目录符号链接（需要管理员/开发者模式）。
+    # 再失败则回退到副本模式。
     try {
-        $output = & cmd /c "mklink `"$LinkPath`" `"$relTarget`"" 2>&1
+        # mklink /J 创建 Junction。目标必须是绝对路径。
+        $output = & cmd /c "mklink /J `"$LinkPath`" `"$absTarget`"" 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Write-Host "  [linked]  $LinkPath  ->  $relTarget"
+            Write-Host "  [junction] $LinkPath  ->  .agents/"
             return
         }
-        $errCode = $LASTEXITCODE
-        throw "mklink exit ${errCode}: $output"
+        throw "mklink /J exit $LASTEXITCODE : $output"
     } catch {
-        Write-Warning "Symlink failed for $LinkPath — falling back to copy. (Enable Developer Mode or run as admin for symlinks.)"
+        Write-Warning "Junction failed for $LinkPath — trying mklink /D."
         try {
-            # mklink with a relative target creates a symlink; if
-            # it failed (e.g. permission denied), copy the file.
-            # Note: we always copy the file CONTENTS so the target
-            # is identical, not a symlink to the canonical.
-            $canonicalContents = Get-Content -LiteralPath $Canonical -Raw
-            Set-Content -LiteralPath $absLinkPath -Value $canonicalContents -NoNewline
-            Write-Host "  [copied]  $LinkPath  <-  $Canonical  (no symlink: $(($_.Exception.Message -split "`n")[0]))"
+            $output = & cmd /c "mklink /D `"$LinkPath`" `.agents`"" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  [symlink]  $LinkPath  ->  .agents/"
+                return
+            }
+            throw "mklink /D exit $LASTEXITCODE : $output"
         } catch {
-            Write-Error "Failed to create $LinkPath : $_"
+            Write-Warning "Directory symlink also failed for $LinkPath — falling back to file copy."
+            # 创建目录并复制所有文件。
+            try {
+                New-Item -ItemType Directory -Path $absLinkPath -Force | Out-Null
+                Copy-Item -Recurse -LiteralPath $absTarget\* -Destination $absLinkPath -Force
+                Write-Host "  [copied]   $LinkPath  <-  .agents/  (no symlink available)"
+            } catch {
+                Write-Error "Failed to create $LinkPath : $_"
+            }
         }
     }
 }
 
+# ---- 执行安装 ----
 Write-Host ""
-Write-Host "Installing agent tool symlinks (canonical: $Canonical)"
+Write-Host "Installing agent tool directory links -> .agents/"
 Write-Host "Repo root: $RepoRoot"
 Write-Host ""
 
-foreach ($l in $Links) {
-    New-OrUpdate-Link -LinkPath $l.Path -Target $l.Target
+foreach ($l in $DirLinks) {
+    New-DirectoryLink -LinkPath $l.Path -Target $l.Target
 }
 
-# If the root AGENTS.md is still the project-init stub
-# (the old `176 bytes` template), replace it with a symlink
-# so all paths lead to the same canonical file.
+# ---- .p-chat AGENTS.md 同步（文件级副本，不覆盖目录） ----
+$pchatDir = Join-Path $RepoRoot '.p-chat'
+if (Test-Path -LiteralPath $pchatDir) {
+    if ($DryRun) {
+        Write-Host "  [dry-run] .p-chat/AGENTS.md  <-  .agents/AGENTS.md"
+    } else {
+        Copy-Item -LiteralPath $Canonical -Destination $PchatAgents -Force
+        Write-Host "  [copied]   .p-chat/AGENTS.md  <-  .agents/AGENTS.md  (file level, .p-chat has local config)"
+    }
+} else {
+    Write-Host "  [skip]     .p-chat/ not found (nothing to sync)"
+}
+
+# ---- 根 AGENTS.md stub 替换 ----
 $rootAgents = Join-Path $RepoRoot 'AGENTS.md'
 if (Test-Path -LiteralPath $rootAgents) {
     $rootItem = Get-Item -LiteralPath $rootAgents -Force
@@ -158,42 +179,33 @@ if (Test-Path -LiteralPath $rootAgents) {
             if ($contents -match '在此描述你的项目') { $stub = $true }
         } catch {}
         if ($stub) {
-            $relRoot = '../.agents/AGENTS.md'
             if ($DryRun) {
-                Write-Host "  [dry-run] AGENTS.md (root)  ->  $relRoot  (would replace stub)"
+                Write-Host "  [dry-run] AGENTS.md (root) would be replaced by symlink"
             } else {
+                Remove-Item -LiteralPath $rootAgents -Force
                 try {
-                    Remove-Item -LiteralPath $rootAgents -Force
-                    & cmd /c "mklink `"AGENTS.md`" `"$relRoot`"" 2>&1 | Out-Null
+                    & cmd /c "mklink `"AGENTS.md`" `.agents\AGENTS.md`" 2>&1 | Out-Null
                     if ($LASTEXITCODE -eq 0) {
-                        Write-Host "  [linked]  AGENTS.md (root)  ->  $relRoot  (was a stub)"
+                        Write-Host "  [linked]   AGENTS.md (root)  ->  .agents/AGENTS.md  (was a stub)"
                     } else {
                         throw "mklink exit $LASTEXITCODE"
                     }
                 } catch {
-                    # Symlink failed. Recover by writing the
-                    # canonical contents back as a plain file
-                    # (better than leaving the root with no
-                    # AGENTS.md at all — many tools read the
-                    # root path unconditionally).
-                    Write-Warning "Root AGENTS.md symlink failed; rewriting it as a copy of the canonical. (Run as admin or enable Developer Mode for symlinks.)"
-                    try {
-                        $canonicalContents = Get-Content -LiteralPath $Canonical -Raw
-                        Set-Content -LiteralPath $rootAgents -Value $canonicalContents -NoNewline
-                        Write-Host "  [copied]  AGENTS.md (root)  <-  $Canonical  (no symlink)"
-                    } catch {
-                        Write-Error "Failed to write $rootAgents : $_"
-                    }
+                    Copy-Item -LiteralPath $Canonical -Destination $rootAgents -Force
+                    Write-Host "  [copied]   AGENTS.md (root)  <-  .agents/AGENTS.md  (no symlink)"
                 }
             }
         } else {
-            Write-Host "  [skip]    AGENTS.md (root) is non-trivial content; not touching it."
+            Write-Host "  [skip]     AGENTS.md (root) is non-trivial content; not touching it."
         }
     } else {
-        Write-Host "  [ok]      AGENTS.md (root) is already a symlink"
+        Write-Host "  [ok]       AGENTS.md (root) is already a symlink"
     }
 }
 
 Write-Host ""
-Write-Host "Done. Agent tools will now read .agents/AGENTS.md."
-Write-Host "Edit .agents/AGENTS.md to update the canonical spec for all tools."
+Write-Host "Done. Agent tools will now read .agents/ content via:"
+Write-Host "  .opencode/AGENTS.md  -> .agents/AGENTS.md"
+Write-Host "  .codex/AGENTS.md     -> .agents/AGENTS.md"
+Write-Host "  .claude/CLAUDE.md    -> .agents/CLAUDE.md"
+Write-Host "  .opencode/docs/      -> .agents/docs/"

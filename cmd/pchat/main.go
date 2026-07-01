@@ -17,6 +17,7 @@ import (
 	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/version"
 )
 
 var (
@@ -60,7 +61,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "显示版本信息",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("P-Chat v0.1.0")
+		fmt.Println("P-Chat " + version.FullString())
 	},
 }
 

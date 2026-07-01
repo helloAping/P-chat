@@ -2,81 +2,70 @@
 
 本目录是 **canonical agent 规范来源**，供多种 agent 工具（opencode / codex / claude 等）共享。
 
-## 文件
+## 文件结构
 
-| 文件 | 用途 |
-| --- | --- |
-| `AGENTS.md` | 主规范文档（与根 `AGENTS.md` 同源） |
-| `README.md` | 本文件 |
-| `scripts/install.ps1` | Windows 安装脚本（PowerShell 5.1+） |
-| `scripts/install.sh` | Unix 安装脚本（bash） |
+```
+.agents/
+├── AGENTS.md           # ★ 主规范文档（所有工具的权威来源）
+├── README.md           # 本文件
+├── CLAUDE.md           # → AGENTS.md 的副本（claude 的工具约定文件名）
+├── docs/               # ★ 按模块拆分的详细文档
+│   ├── INDEX.md        #   总索引："想改 X → 读哪个文档"
+│   ├── agent.md        #   Agent ReAct 循环
+│   ├── llm.md          #   LLM 客户端 + 协议适配
+│   ├── server.md       #   HTTP API + SSE
+│   ├── tool.md         #   工具注册 + 内置工具
+│   ├── subagent.md     #   子代理系统
+│   ├── memory.md       #   SQLite 持久化
+│   ├── config.md       #   配置管理
+│   ├── cli.md          #   CLI REPL
+│   ├── frontend.md     #   Vue 3 前端
+│   └── infrastructure.md # 基础设施模块
+└── scripts/
+    ├── install.ps1     # Windows 安装脚本
+    └── install.sh      # Unix 安装脚本
+```
 
-## 为什么需要这个目录
+## 设计理念
 
 不同 agent 工具的指令文件路径不同：
 
-| 工具 | 默认读 |
-| --- | --- |
-| opencode | `<repo-root>/AGENTS.md` |
-| codex | `<repo-root>/.codex/AGENTS.md`（约定） |
-| claude | `<repo-root>/CLAUDE.md` 或 `<repo-root>/.claude/CLAUDE.md`（约定） |
+| 工具 | 默认读 | 约定 |
+| --- | --- | --- |
+| opencode | `<repo-root>/AGENTS.md` | 同时检查 `.opencode/AGENTS.md` |
+| codex | `<repo-root>/.codex/AGENTS.md` | |
+| claude | `<repo-root>/CLAUDE.md` 或 `.claude/CLAUDE.md` | |
 
-如果不统一，开发者切换工具时需要维护多份规范。本目录通过**符号链接**让所有工具都指向同一份 `.agents/AGENTS.md`，单点修改、到处生效。
+为解决多工具维护问题，**安装脚本创建目录级符号链接**：
+
+```
+.opencode  ──junction──>  .agents/   （所有子文件自动路由）
+.codex     ──junction──>  .agents/
+.claude    ──junction──>  .agents/
+```
+
+之后无论用哪个工具，`<工具目录>/AGENTS.md` 都指向 `.agents/AGENTS.md`，
+`<工具目录>/docs/` 都指向 `.agents/docs/`，单一来源、修改即同步。
 
 ## 安装
 
-### 一键安装（推荐）
-
 ```powershell
-# Windows
+# Windows（PowerShell 5.1+）
 powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1
 
 # Unix
 bash .agents/scripts/install.sh
 ```
 
-执行后自动建立：
-- `.opencode/AGENTS.md` → `./.agents/AGENTS.md`
-- `.codex/AGENTS.md` → `./.agents/AGENTS.md`
-- `.claude/CLAUDE.md` → `./.agents/AGENTS.md`
+执行后自动建立目录级符号链接。若符号链接创建失败（权限不足），回退到文件副本。
 
-如果检测到根 `AGENTS.md` 是项目初始化的 stub（< 1KB，且模板占位文字「在此描述你的项目」），会同时把根文件替换为指向 `.agents/AGENTS.md` 的符号链接。
+## Agent 启动检查
 
-### 手动安装
-
-如果不想跑脚本，可以手动创建符号链接（Windows 需要开发者模式）：
-
-```powershell
-# Windows（PowerShell 5.1）
-New-Item -ItemType SymbolicLink -Path ".opencode\AGENTS.md" -Target ".\.agents\AGENTS.md"
-New-Item -ItemType SymbolicLink -Path ".codex\AGENTS.md" -Target ".\.agents\AGENTS.md"
-New-Item -ItemType SymbolicLink -Path ".claude\CLAUDE.md" -Target ".\.agents\AGENTS.md"
-```
-
-```bash
-# Unix
-ln -s .agents/AGENTS.md .opencode/AGENTS.md
-ln -s .agents/AGENTS.md .codex/AGENTS.md
-ln -s .agents/AGENTS.md .claude/CLAUDE.md
-```
-
-## 权限
-
-Windows 创建符号链接需要**管理员**或**开发者模式**开启。脚本检测失败时自动 fallback 到 `Copy-Item`（不再是符号链接，修改时需重跑 install）。
+每个 agent 在开始工作前执行：
+1. 检查 `.opencode/` 是否存在且为符号链接
+2. 不存在 → 运行 install 脚本重建
+3. 存在 → 读取 `AGENTS.md` 获取规范
 
 ## 修改规范
 
-只改 `.agents/AGENTS.md`。所有工具会通过符号链接读取最新内容。
-
-如果用 fallback 模式（copy），需要重跑 install 脚本让其他目录同步。
-
-## 卸载
-
-```powershell
-# 移除符号链接
-Remove-Item .opencode\AGENTS.md
-Remove-Item .codex\AGENTS.md
-Remove-Item .claude\CLAUDE.md
-```
-
-注意：**不要** `Remove-Item -Recurse` — 那会跟随符号链接删除 `.agents/AGENTS.md` 本身。
+修改 `.agents/AGENTS.md` 或 `.agents/docs/` 下的文档。所有工具通过目录级符号链接自动读取最新内容。

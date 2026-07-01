@@ -124,9 +124,66 @@ func (u *ChatUI) Handle(chunk agent.ChatStreamChunk) {
 
 // handleSubAgentEvent renders a chunk that came from a nested sub-agent.
 // Events are shown indented under the parent tool call that triggered them.
+//
+// Visual design (mirrors Claude Code's `renderToolUseProgressMessage`
+// for the sub-agent progress line):
+//
+//   - sub_agent_start   →  ⌥ agent-name · task description
+//   - sub_agent_ok/err  →  ✓ agent-name (1.2s, 5 tools)  or  ✗ ...
+//   - llm round-N done  →  ↳ LLM: short message
+//   - tool call-N       →  ↳ toolname(args)
+//   - tool ok           →  ↳ ✓ toolname
+//   - tool err/warn     →  ↳ ✗ toolname
+//   - content delta     →  text rendered with the dim style, indented
+//
+// Text deltas are no longer suppressed — the previous "let the
+// final result handle it" design made sub-agents feel opaque.
+// We render them with a dim style so they don't drown out the
+// parent's own stream, but the user can see what the sub-agent
+// is actually thinking. The final result is still returned in
+// full to the parent (no change in behavior at the LLM layer).
 func (u *ChatUI) handleSubAgentEvent(chunk agent.ChatStreamChunk) {
 	dim := color.New(color.FgHiBlack)
 	indent := "    " // 4 spaces: aligned under "  ● task(args)"
+
+	// Synthetic start event: open the sub-agent card on its
+	// own line. We print the agent name (when known) so the
+	// user can see which specialized agent was used.
+	if chunk.Phase == "sub_agent_start" {
+		header := indent + "↳ "
+		if chunk.SubAgentType != "" {
+			header += color.HiCyanString("%s ", chunk.SubAgentType)
+		} else {
+			header += color.HiCyanString("sub-agent ")
+		}
+		header += chunk.SubAgentTask
+		fmt.Println()
+		fmt.Println(header)
+		return
+	}
+
+	// Synthetic close event: summary line with elapsed
+	// time + tool count + model (when known).
+	if chunk.Phase == "sub_agent_ok" || chunk.Phase == "sub_agent_err" {
+		var icon string
+		if chunk.Phase == "sub_agent_ok" {
+			icon = color.HiGreenString("✓")
+		} else {
+			icon = color.HiRedString("✗")
+		}
+		summary := indent + "↳ " + icon + " "
+		if chunk.SubAgentType != "" {
+			summary += chunk.SubAgentType + " "
+		}
+		if chunk.Duration != "" {
+			summary += "(" + chunk.Duration + ")"
+		}
+		if chunk.SubAgentModel != "" {
+			summary += " " + color.HiBlackString("[%s]", chunk.SubAgentModel)
+		}
+		fmt.Println(summary)
+		return
+	}
 
 	if chunk.Phase == "llm" {
 		switch {
@@ -159,8 +216,12 @@ func (u *ChatUI) handleSubAgentEvent(chunk agent.ChatStreamChunk) {
 	}
 
 	if chunk.Content != "" {
-		// Sub-agent text output. Don't print directly; the parent's
-		// task result will show the full final text.
+		// Sub-agent text delta. Render it dim + indented so
+		// the parent's own stream stays the visual focus.
+		// The full text is also accumulated by the parent's
+		// task tool result, so the LLM still sees the same
+		// final answer either way.
+		dim.Printf("%s%s", indent, chunk.Content)
 		return
 	}
 

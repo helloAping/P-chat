@@ -21,9 +21,12 @@ const (
 // SoulSection holds the two-part system prompt for a given style:
 //   - Identity: the program identity (P-Chat xxx AI 编程程序 ...)
 //   - Soul: the personality / character / voice configuration
+//   - Memory: 用户自定义的背景知识，动态注入到每轮对话上下文末尾，
+//     修改即生效、不破坏 LLM 静态缓存
 type SoulSection struct {
-	Identity string // 当前是 P-Chat xxx 风格的 AI 编程程序 ...
-	Soul     string // 性格、说话风格、工具调用规范 ...
+	Identity string
+	Soul     string
+	Memory   string
 }
 
 var styleLabels = map[Style]string{
@@ -103,6 +106,11 @@ func (m *Manager) loadAll() error {
 			sec.Soul = string(data)
 		}
 
+		memPath := filepath.Join(m.dir, "memory", string(s)+".md")
+		if data, err := os.ReadFile(memPath); err == nil {
+			sec.Memory = string(data)
+		}
+
 		// If neither file is present, fall back to built-in defaults
 		if sec.Identity == "" && sec.Soul == "" {
 			sec.Identity = defaultIdentity(s)
@@ -138,6 +146,17 @@ func (m *Manager) GetSoul(s Style) (string, error) {
 		return "", fmt.Errorf("unknown style: %s", s)
 	}
 	return sec.Soul, nil
+}
+
+// GetMemory returns the user-defined memory for a style.
+// 记忆内容从 prompts/memory/{id}.md 加载，独立于身份和灵魂，
+// 使用方负责决定是否注入到上下文中。
+func (m *Manager) GetMemory(s Style) (string, error) {
+	sec, ok := m.sections[s]
+	if !ok {
+		return "", fmt.Errorf("unknown style: %s", s)
+	}
+	return sec.Memory, nil
 }
 
 // GetSystemPrompt returns identity + soul joined, ready to be sent as
@@ -236,7 +255,7 @@ func (m *Manager) DisplayLabel(s Style) string {
 // stripped) so it is safe to use as a filename and as a session
 // meta value. Returns an error if the id is empty, already taken,
 // or contains no letter (would yield a useless filename).
-func (m *Manager) Create(id, label, identity, soul string) (Style, error) {
+func (m *Manager) Create(id, label, identity, soul, memory string) (Style, error) {
 	id = normaliseStyleID(id)
 	if id == "" {
 		return "", fmt.Errorf("style id must contain at least one letter")
@@ -266,6 +285,12 @@ func (m *Manager) Create(id, label, identity, soul string) (Style, error) {
 	if label != "" {
 		_ = os.WriteFile(filepath.Join(m.dir, id+".label"), []byte(label), 0o644)
 	}
+	if memory != "" {
+		if err := os.MkdirAll(filepath.Join(m.dir, "memory"), 0o755); err != nil {
+			return "", err
+		}
+		_ = os.WriteFile(filepath.Join(m.dir, "memory", id+".md"), []byte(memory), 0o644)
+	}
 	// Reload the in-memory cache so the new style is immediately
 	// available to existing sessions.
 	if err := m.loadAll(); err != nil {
@@ -274,10 +299,10 @@ func (m *Manager) Create(id, label, identity, soul string) (Style, error) {
 	return Style(id), nil
 }
 
-// Update overwrites the label / identity / soul of an existing
+// Update overwrites the label / identity / soul / memory of an existing
 // style. Empty fields are skipped (caller can leave them off the
 // request body to keep the existing value).
-func (m *Manager) Update(id, label, identity, soul string) error {
+func (m *Manager) Update(id, label, identity, soul, memory string) error {
 	id = normaliseStyleID(id)
 	if id == "" {
 		return fmt.Errorf("style id must contain at least one letter")
@@ -305,6 +330,11 @@ func (m *Manager) Update(id, label, identity, soul string) error {
 			return err
 		}
 	}
+	if memory != "" {
+		if err := os.WriteFile(filepath.Join(m.dir, "memory", id+".md"), []byte(memory), 0o644); err != nil {
+			return err
+		}
+	}
 	return m.loadAll()
 }
 
@@ -328,6 +358,9 @@ func (m *Manager) Delete(id string) error {
 		return err
 	}
 	if err := os.Remove(filepath.Join(m.dir, id+".label")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(filepath.Join(m.dir, "memory", id+".md")); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return m.loadAll()

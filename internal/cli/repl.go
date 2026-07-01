@@ -13,6 +13,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
@@ -44,15 +45,18 @@ type REPL struct {
 
 	mu            sync.Mutex
 	cancelCurrent context.CancelFunc // set while a chat is in flight
+
+	rollbackUndo map[string][]httpcli.Message // session-id → last rollback snapshot
 }
 
 func NewREPL(ctx cliContext, cfg *config.Config, s style.Style, provider string) *REPL {
 	return &REPL{
-		ctx:      ctx,
-		cfg:      cfg,
-		style:    s,
-		provider: provider,
-		useTools: true,
+		ctx:          ctx,
+		cfg:          cfg,
+		style:        s,
+		provider:     provider,
+		useTools:     true,
+		rollbackUndo: make(map[string][]httpcli.Message),
 	}
 }
 

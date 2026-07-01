@@ -1,3 +1,19 @@
+// Package agent 实现 P-Chat 的核心 ReAct 工具调用循环。
+//
+// ChatWithTools 是入口函数，负责：
+//  1. 构建系统提示词（风格 + AGENTS.md + 规则 + 技能）
+//  2. 调用 LLM 获取流式响应
+//  3. 解析工具调用（原生 tool_calls 或 markdown ```tool_call 块回退）
+//  4. 并行执行工具（每个工具在独立 goroutine 中运行，通过 per-tool eventCh 通信）
+//  5. 将工具结果反馈给 LLM，继续循环直到 LLM 决定结束或达到轮次上限
+//
+// 数据流：LLM → ChatStreamChunk channel → 工具派发 → per-tool eventCh → forwarder → 主 channel → SSE → 前端
+//
+// 修改指南：
+//   - ChatWithTools 在 agent.go 约 900 行
+//   - 工具派发逻辑在 agent.go:1150-1471
+//   - parts 累加器在 parts.go
+//   - 相关模块文档：docs/modules/agent.md
 package agent
 
 import (
@@ -42,6 +58,13 @@ type Agent struct {
 	// sandbox check (set by /unsafe once). Reset after the call.
 	bypassOnce atomic.Bool
 
+	// subagentRegistry, if non-nil, is published to the tool
+	// dispatcher's context so the `task` tool can resolve
+	// `subagent_type` to a registered AgentInfo. The server
+	// wires a registry built from the built-in agents + any
+	// user-defined `.p-chat/agent/*.md` files at startup.
+	subagentRegistry SubagentRegistry
+
 	// Cached static system prompt (style + AGENTS + rules + skills + tool hint).
 	// Keyed by (style, available-tools-hash). Invalidated by Reload() or when
 	// the user changes style. This is the part that's identical across all
@@ -56,6 +79,17 @@ type Agent struct {
 // the underlying API defaults.
 func (a *Agent) SetChatOptions(opts llm.ChatOptions) {
 	a.options = opts
+}
+
+// getStyleMemory 读取当前风格的 Memory 内容。空字符串表示未配置。
+// Memory 独立于 identity/soul 存储在 prompts/memory/{id}.md，
+// 是用户自定义的背景知识，动态注入到每轮对话末尾。
+func (a *Agent) getStyleMemory(s style.Style) string {
+	if a.styleMgr == nil {
+		return ""
+	}
+	m, _ := a.styleMgr.GetMemory(s)
+	return m
 }
 
 // SetSandbox installs a sandbox checker. The same checker is forwarded
@@ -78,6 +112,16 @@ func (a *Agent) SetLLM(c *llm.Client) {
 // the next tool call.
 func (a *Agent) BypassSandboxOnce() {
 	a.bypassOnce.Store(true)
+}
+
+// SetSubagentRegistry installs the registry that the `task` tool
+// uses to resolve `subagent_type` arguments. The registry carries
+// the built-in agents (general-purpose, explore, plan) plus any
+// user-defined `.p-chat/agent/*.md` agents. The tool itself lives
+// in internal/subagent; the agent package only needs a small
+// read-only interface so the tool can stay decoupled.
+func (a *Agent) SetSubagentRegistry(r SubagentRegistry) {
+	a.subagentRegistry = r
 }
 
 func New(cfg *config.Config, llmClient *llm.Client, styleMgr *style.Manager, store *memory.Store, tools *tool.Registry) *Agent {
@@ -268,6 +312,27 @@ type ChatRequest struct {
 	// After MaxRounds the loop stops and the user can continue
 	// with a follow-up message.
 	MaxRounds int `json:"max_rounds,omitempty"`
+	// PromptOv, when non-empty, REPLACES the agent's normal
+	// system prompt (style + AGENTS + rules + skills) for this
+	// turn. Used by the sub-agent runner to install a
+	// specialized persona (e.g. the "explore" or "plan"
+	// prompts) without the user having to define a style.
+	// Empty = inherit the agent's normal prompt.
+	PromptOv string `json:"prompt_override,omitempty"`
+	// SubagentType is the agent name when this ChatRequest was
+	// issued from the sub-agent runner. Empty for top-level
+	// chats. The agent's tool hint and system prompt can
+	// branch on this (e.g. hide the `task` tool in the
+	// description so the sub-agent doesn't see what it cannot
+	// use).
+	SubagentType string `json:"subagent_type,omitempty"`
+	// SubagentColor is the agent's accent color. Surfaced on
+	// the SubAgentCard in the GUI and the agent-name badge in
+	// the CLI.
+	SubagentColor string `json:"subagent_color,omitempty"`
+	// SubagentTaskID is the resume-by-id key. Empty for
+	// ad-hoc runs. Populated from Args.TaskID.
+	SubagentTaskID string `json:"subagent_task_id,omitempty"`
 }
 
 type ChatStreamChunk struct {
@@ -334,6 +399,49 @@ type ChatStreamChunk struct {
 	// failed). Other phase values are treated as
 	// in-progress.
 	SubAgentStatus string `json:"sub_agent_status,omitempty"`
+	// SubAgentType is the agent name (e.g. "explore",
+	// "general-purpose") selected by the parent LLM via the
+	// `subagent_type` arg of the `task` tool. Surfaced in the
+	// card header so the user can see which agent was used.
+	SubAgentType string `json:"sub_agent_type,omitempty"`
+	// SubAgentModel is the model the sub-agent is using
+	// (e.g. "openai/gpt-4o-mini"). Defaults to the parent's
+	// model if the sub-agent does not specify one.
+	SubAgentModel string `json:"sub_agent_model,omitempty"`
+	// SubAgentColor is the agent's accent color in
+	// "#RRGGBB" or a CSS color name. Drives the card's
+	// border-left and icon tint.
+	SubAgentColor string `json:"sub_agent_color,omitempty"`
+	// SubAgentTaskID is an optional stable identifier the
+	// LLM can pass back to resume / dedupe the sub-agent
+	// run. Opaque string; currently SHA-256 truncated.
+	SubAgentTaskID string `json:"sub_agent_task_id,omitempty"`
+	// SubAgentDescription is the one-line "when to use" hint
+	// for the agent (e.g. "Fast read-only file search.").
+	// Surfaced as a hover tooltip on the agent-name badge in
+	// the SubAgentCard so the user can read the full hint
+	// without expanding the card body.
+	SubAgentDescription string `json:"sub_agent_description,omitempty"`
+
+	// ThinkingRewrite is emitted by the post-stream redactor
+	// when the LLM's thinking block contained a phantom
+	// vision error. Same shape as ContentRewrite but for the
+	// thinking part; the UI REPLACES the trailing thinking
+	// part's text with this value. Empty when no rewrite is
+	// needed.
+	ThinkingRewrite string `json:"thinking_rewrite,omitempty"`
+
+	// SubAgentFailureReason is set on the synthetic
+	// `sub_agent_err` close event so the UI can show the
+	// user *why* the sub-agent failed. Empty on
+	// `sub_agent_ok` close events. Mirrors the soft-fail
+	// vs hard-fail distinction made by the runner: a
+	// "soft" failure (content was produced before the
+	// error) reports a friendly reason like
+	// "tail-end stream error"; a "hard" failure (no
+	// content) reports the actual error message from
+	// the underlying chunk.
+	SubAgentFailureReason string `json:"sub_agent_failure_reason,omitempty"`
 
 	// Question fields — when the question tool emits a
 	// question event, QuestionJSON carries the serialized
@@ -402,9 +510,20 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	var sb strings.Builder
 
 	// 1. Style (identity + soul) — short, stable per session.
+	// Graceful fallback: if the requested style isn't registered
+	// (e.g. legacy config still says "default", or a user-defined
+	// style was deleted), fall back to "tech" (the built-in
+	// absolute default) rather than failing the entire turn.
+	// Logging the fallback keeps the misconfiguration visible.
 	stylePrompt, err := a.styleMgr.GetSystemPrompt(s)
 	if err != nil {
-		return "", sig, err
+		log.Printf("[agent] style %q not found (%v) — falling back to %q", s, err, style.Tech)
+		stylePrompt, err = a.styleMgr.GetSystemPrompt(style.Tech)
+		if err != nil {
+			// Last-resort: tech must be a built-in. If even
+			// this fails, the style manager is broken.
+			return "", sig, fmt.Errorf("style fallback failed: %w", err)
+		}
 	}
 	sb.WriteString(stylePrompt)
 	sb.WriteString("\n\n---\n\n")
@@ -604,6 +723,82 @@ func GetToolEventChan(ctx context.Context) chan<- ChatStreamChunk {
 	return nil
 }
 
+// parentModelCtxKey is the context key under which the agent publishes
+// the *current turn's* (provider, model) pair. Sub-agents read this via
+// GetParentModel(ctx) so the child session inherits the same model the
+// user selected for the main conversation, not the server's startup
+// default (which can differ when the user has switched providers/models
+// mid-session via the GUI picker).
+type parentModelCtxKey struct{}
+
+// WithParentModel returns a new ctx carrying the parent turn's
+// (provider, model) pair. Either may be empty; the tool handler should
+// treat empty values as "no override, use the runner's default".
+func WithParentModel(ctx context.Context, provider, model string) context.Context {
+	if provider == "" && model == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, parentModelCtxKey{}, [2]string{provider, model})
+}
+
+// GetParentModel returns the (provider, model) pair published by the
+// parent agent, or empty strings when no value was published.
+func GetParentModel(ctx context.Context) (provider, model string) {
+	if v, ok := ctx.Value(parentModelCtxKey{}).([2]string); ok {
+		return v[0], v[1]
+	}
+	return "", ""
+}
+
+// subagentRegistryCtxKey is the context key under which the agent
+// publishes the sub-agent registry to the `task` tool. The tool uses
+// this to resolve the `subagent_type` argument to an AgentInfo (name,
+// description, prompt, model, color, tools whitelist) and to build a
+// dynamic tool description that lists the available agents.
+//
+// The registry is a small read-only interface (just `Get` and `List`)
+// so the tool package can stay decoupled from internal/subagent.
+type subagentRegistryCtxKey struct{}
+
+// SubagentRegistry is the read-only view the `task` tool needs.
+// Defined here (not in internal/subagent) to keep the dependency
+// direction tool → subagent one-way. The concrete implementation
+// lives in internal/subagent/registry.go.
+type SubagentRegistry interface {
+	Get(name string) (SubagentInfo, bool)
+	List() []SubagentInfo
+}
+
+// SubagentInfo is the registry's view of one agent. Kept minimal:
+// just the fields the `task` tool needs to (a) build a description
+// and (b) wire the child session.
+type SubagentInfo struct {
+	Name        string
+	Description string
+	Prompt      string
+	Model       string
+	Color       string
+	Tools       []string
+}
+
+// WithSubagentRegistry returns a new ctx carrying the given
+// sub-agent registry. Called by the server's tool dispatcher so
+// the `task` tool can resolve subagent_type at call time.
+func WithSubagentRegistry(ctx context.Context, r SubagentRegistry) context.Context {
+	if r == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, subagentRegistryCtxKey{}, r)
+}
+
+// GetSubagentRegistry returns the registry from ctx, or nil.
+func GetSubagentRegistry(ctx context.Context) SubagentRegistry {
+	if v, ok := ctx.Value(subagentRegistryCtxKey{}).(SubagentRegistry); ok {
+		return v
+	}
+	return nil
+}
+
 // ChatStream is a single-turn chat with no tool support. For multi-turn
 // ReAct with tool use, use ChatWithTools.
 func (a *Agent) ChatStream(ctx context.Context, req ChatRequest) <-chan ChatStreamChunk {
@@ -681,6 +876,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			ch <- ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true}
 			return
 		}
+		// Sub-agent prompt override. When the sub-agent runner
+		// supplies a prompt (from the agent's own prompt or the
+		// request's `prompt` arg), it REPLACES the normal
+		// system prompt. We still append compressed summary /
+		// skill context below so the child retains access to
+		// any user context that was in flight.
+		if req.PromptOv != "" {
+			systemPrompt = req.PromptOv
+		}
 		ch <- ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))}
 
 		// Append compressed summary if provided (from /compress).
@@ -690,6 +894,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Append active skill context (from /skillname slash command).
 		if req.SkillContext != "" {
 			systemPrompt += "\n\n---\n\n## 激活的技能上下文\n\n" + req.SkillContext + "\n"
+		}
+		// Append style memory (动态注入，不破坏静态缓存)
+		if styleMemory := a.getStyleMemory(req.Style); styleMemory != "" {
+			systemPrompt += "\n\n---\n\n## 我的上下文\n\n" + styleMemory
 		}
 
 		// Build the message list: system prompt + user messages.
@@ -901,9 +1109,20 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// as a Claude response), so we filter it AFTER the stream
 		// ends and emit a content_rewrite event so the UI replaces
 		// what the user already saw.
+		//
+		// Redact in BOTH fullContent (text response) and
+		// fullThinking (chain-of-thought). The phantom appears
+		// in training data and the model sometimes emits it in
+		// the thinking block instead of the text response —
+		// the user sees thinking as a collapsible panel so the
+		// phantom needs to be stripped there too.
 		if redacted, changed := redactPhantomErrors(fullContent); changed {
 			fullContent = redacted
 			ch <- ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted}
+		}
+		if redactedT, changedT := redactPhantomErrors(fullThinking); changedT {
+			fullThinking = redactedT
+			ch <- ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT}
 		}
 
 			// Build the assistant message for the conversation.
@@ -998,8 +1217,29 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			for i, tc := range toolCalls {
 				wg.Add(1)
 
-				eventCh := make(chan ChatStreamChunk, 16)
+				// Per-tool event channel. Buffer is 64 (was 16) so
+				// a sub-agent producing many content/thinking/tool
+				// chunks can never fill it up and drop the closing
+				// sub_agent_ok / sub_agent_err event — which would
+				// leave the GUI's nested card stuck in the "running"
+				// spinner forever. 64 is comfortably larger than
+				// the chunk count a single sub-agent turn produces
+				// in practice; if a turn ever needs more, the
+				// forwarder will drain it before the next push.
+				eventCh := make(chan ChatStreamChunk, 64)
 				tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
+				if a.subagentRegistry != nil {
+					tctx = WithSubagentRegistry(tctx, a.subagentRegistry)
+				}
+				// Publish the parent turn's current (provider, model)
+				// pair so the sub-agent tool handler can inherit the
+				// same model the user selected for the main
+				// conversation. Without this the sub-agent would
+				// fall back to whatever the server's startup
+				// default was, which silently breaks model
+				// selection when the user has switched models
+				// mid-session.
+				tctx = WithParentModel(tctx, req.Provider, req.Model)
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
 				}
@@ -1587,15 +1827,20 @@ func cleanMarkdownToolCalls(content string) string {
 // distinguishes a phantom from a legitimate "I can't read this
 // file" error. We want to redact the former, not the latter.
 //
-// Flags: `(?is)` = case-insensitive + dotall (so `.*?` matches
-// across line breaks; some phantoms wrap to two lines).
+// Flags: `(?is)` = case-insensitive + dotall.
 //
-// The pattern is line-bounded (`[^\n]*?` between the trigger
+// The middle match `[\s\S]{0,400}?` crosses line breaks (so
+// phantoms that wrap "Inform the user." onto a new line are
+// still caught — this is a very common formatting the LLM
+// produces). The 400-character cap is much larger than any
+// legitimate phantom but small enough that a multi-paragraph
+// response that happens to mention both trigger phrases won't
+// be nuked wholesale.
 // words) so a multi-paragraph assistant reply that *mentions*
 // the phrase "Cannot read ... Inform the user" in passing
 // (e.g. quoting documentation) doesn't get redacted wholesale.
 var phantomVisionErrorRe = regexp.MustCompile(
-	`(?is)Cannot read[^\n]*?Inform the user\.?`,
+	`(?is)Cannot read[\s\S]{0,400}?Inform the user\.?`,
 )
 
 // phantomVisionErrorReplacement is the clean user-facing message

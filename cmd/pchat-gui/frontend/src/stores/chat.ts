@@ -2,8 +2,9 @@
 // keeps the surface small — we don't need time-travel debugging
 // or modular stores for a chat app.
 
-import { reactive, ref, computed } from 'vue'
+import { reactive, ref, computed, watch } from 'vue'
 import * as api from '../api/client'
+import { notifyManager } from '../utils/notify'
 import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
 
 export interface PendingAttachment {
@@ -79,6 +80,10 @@ export const state = reactive({
   showSettings: false,
   projects: [] as ProjectItem[],
   activeProjectPath: '' as string,
+  // Rollback undo buffer — only the most recent rollback per session.
+  rollbackUndo: {} as Record<string, { messages: Message[]; fromIndex: number } | null>,
+  // Pending text to fill into the input area after a rollback.
+  pendingInput: {} as Record<string, string>,
 })
 
 export const currentMessages = computed(() =>
@@ -133,6 +138,38 @@ export const currentMeta = computed(() => {
     title: '',
   }
 })
+
+// Global phantom scrub. Walks every message in every
+// session whenever the messages map changes. The
+// per-part scrub in `appendTextPart` catches the common
+// case, but a stored phantom from a pre-fix version
+// (or a phantom injected through a path we haven't
+// audited) would still be visible until the user
+// reloads. This deep watcher makes the scrub a
+// no-op-when-clean, side-effect-when-dirty background
+// job that runs on every reactive change. Performance
+// is fine in practice (sessions have <100 messages,
+// each with <20 parts, the regex is cheap).
+//
+// We scrub in place — the `m.parts` arrays are
+// reactive so the Vue components re-render
+// automatically. We only assign when the scrub
+// actually changes a value, to avoid spurious
+// reactive triggers.
+watch(
+  () => state.sessionMessages,
+  (sessions) => {
+    if (!sessions) return
+    for (const id in sessions) {
+      const msgs = sessions[id]
+      if (!msgs) continue
+      for (const m of msgs) {
+        scrubMessagePhantoms(m)
+      }
+    }
+  },
+  { deep: true },
+)
 
 // --- Session management ---
 
@@ -203,6 +240,16 @@ export async function switchSession(id: string) {
     // the message list. This keeps switch-to-session latency
     // bounded regardless of how long the conversation is.
     const r = await api.listMessages(id, { limit: initialHistoryLimit })
+    // Client-side phantom scrub. The server's
+    // post-stream redactor normally catches these, but a
+    // session loaded from disk may contain a phantom that
+    // was persisted before the redactor existed (e.g. a
+    // user upgrading from a version without the fix).
+    // Walking the parts here and scrubbing any matching
+    // text keeps the chat history clean.
+    for (const m of r.messages) {
+      if (m.parts) scrubMessagePhantoms(m)
+    }
     state.sessionMessages[id] = r.messages
     state.sessionPaging[id] = {
       oldestId: r.oldest_id,
@@ -571,11 +618,27 @@ function findOrCreateLastAssistant(id: string): Message {
 // creating it if missing. Sub-agents are not nested
 // further (a sub-agent can't spawn sub-agents), so the
 // parts list we operate on is always at the top level.
-function findOrCreateSubAgent(m: Message, task: string): MessagePart & { kind: 'sub_agent' } {
+//
+// If `ev` is provided and the part is being created
+// (not just looked up), the new metadata fields
+// (agentType / agentColor / agentModel / taskId) are
+// seeded from the event so the card's header can
+// render the agent name on the very first frame.
+function findOrCreateSubAgent(
+  m: Message,
+  task: string,
+  ev?: api.StreamEvent,
+): MessagePart & { kind: 'sub_agent' } {
   if (!m.parts) m.parts = []
   for (let i = m.parts.length - 1; i >= 0; i--) {
     const p = m.parts[i]
-    if (p.kind === 'sub_agent' && p.task === task) return p
+    if (p.kind === 'sub_agent' && p.task === task) {
+      // Backfill any metadata that arrived on a later
+      // event (e.g. the close event may carry the
+      // resolved model name).
+      if (ev) backfillSubAgentMetadata(p, ev)
+      return p
+    }
   }
   const sub: MessagePart = {
     kind: 'sub_agent',
@@ -583,8 +646,28 @@ function findOrCreateSubAgent(m: Message, task: string): MessagePart & { kind: '
     status: 'start',
     parts: [],
   }
+  if (ev) backfillSubAgentMetadata(sub, ev)
   m.parts.push(sub)
   return sub as any
+}
+
+// backfillSubAgentMetadata copies the sub-agent
+// metadata fields from the SSE event onto the part.
+// Idempotent: missing fields on the event leave the
+// existing values alone. Called from both the part
+// creation path (initial seed) and from
+// findOrCreateSubAgent's match path (in case the
+// metadata arrived on a later event).
+function backfillSubAgentMetadata(
+  p: MessagePart & { kind: 'sub_agent' },
+  ev: api.StreamEvent,
+) {
+  if (ev.sub_agent_type && !p.agentType) p.agentType = ev.sub_agent_type
+  if (ev.sub_agent_color && !p.agentColor) p.agentColor = ev.sub_agent_color
+  if (ev.sub_agent_model && !p.agentModel) p.agentModel = ev.sub_agent_model
+  if (ev.sub_agent_task_id && !p.taskId) p.taskId = ev.sub_agent_task_id
+  if (ev.sub_agent_description && !p.agentDescription) p.agentDescription = ev.sub_agent_description
+  if (ev.sub_agent_failure_reason && !p.failureReason) p.failureReason = ev.sub_agent_failure_reason
 }
 
 // appendToSubAgent routes a content / thinking delta
@@ -617,14 +700,106 @@ function appendToSubAgent(
 // behaviour of DeepSeek-style UIs that show thinking
 // and text side by side: streaming text never overwrites
 // a thinking block.
+// PHANTOM_RE mirrors the server-side `phantomVisionErrorRe` regex
+// in `internal/agent/agent.go` (which the post-stream redactor
+// uses to scrub "Cannot read ... Inform the user" from the
+// LLM's text). The server-side redactor should always catch
+// these, but LLMs sometimes emit the phantom in positions the
+// server can't see (e.g. a `m.content` rebuild on session reload,
+// or a chat-store replay during recovery). This client-side
+// filter is the last line of defence: it scrubs any text
+// chunk that matches the same pattern, in place, before
+// the Vue render pass.
+//
+// Matches: "Cannot read <anything-up-to-400-chars> Inform the
+// user." (case-insensitive, dotall).
+const PHANTOM_RE = /Cannot read[\s\S]{0,400}?Inform the user\.?/i
+const PHANTOM_REPLACEMENT =
+  '（当前模型不支持读取图片。请在「设置 → 提供商/模型」中切换到支持视觉的模型后重新发送。）'
+
+/** Returns true if `s` contains a phantom error pattern. */
+function containsPhantomError(s: string): boolean {
+  if (!s) return false
+  return PHANTOM_RE.test(s)
+}
+
+/** Replaces every phantom-error match in `s` with the
+ *  user-facing Chinese message. Returns the (possibly
+ *  unchanged) string. */
+function scrubPhantomError(s: string): string {
+  if (!s) return s
+  if (!containsPhantomError(s)) return s
+  return s.replace(PHANTOM_RE, PHANTOM_REPLACEMENT)
+}
+
+/** Walks a message and every nested part, scrubbing any
+ *  phantom error patterns from text fields. Mutates the
+ *  message in place. Used on session load and on the
+ *  safety-net `done` handler so a stored phantom from an
+ *  older version doesn't reappear. */
+function scrubMessagePhantoms(m: Message) {
+  const walk = (parts: MessagePart[] | undefined) => {
+    if (!parts) return
+    for (const p of parts) {
+      if (p.kind === 'text' && p.text) {
+        const scrubbed = scrubPhantomError(p.text)
+        if (scrubbed !== p.text) p.text = scrubbed
+      } else if (p.kind === 'thinking' && p.text) {
+        const scrubbed = scrubPhantomError(p.text)
+        if (scrubbed !== p.text) p.text = scrubbed
+      } else if (p.kind === 'sub_agent') {
+        walk(p.parts)
+      }
+    }
+  }
+  walk(m.parts)
+  if (m.content) {
+    const scrubbed = scrubPhantomError(m.content)
+    if (scrubbed !== m.content) m.content = scrubbed
+  }
+  if (m.thinking) {
+    const scrubbed = scrubPhantomError(m.thinking)
+    if (scrubbed !== m.thinking) m.thinking = scrubbed
+  }
+}
+
 function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null) {
   const parts = (target ?? m.parts)!
+  // Two-pass scrub:
+  //
+  //  1. scrub the incoming delta (catches the case where
+  //     a single delta *is* the phantom).
+  //  2. AFTER appending, check the last ~600 chars of the
+  //     trailing text part. This catches the case where
+  //     the phantom is split across multiple deltas
+  //     (e.g. "Cannot read" arrives in delta N, and
+  //     " Inform the user." arrives in delta N+1 — the
+  //     per-delta scrub misses it, but the buffer
+  //     catches it once both pieces are assembled).
+  //
+  // We append the raw delta first (so the user sees
+  // text streaming in real time), then scrub the last
+  // 600 chars. The scrub is synchronous so Vue's next
+  // tick won't render the phantom.
   if (parts.length === 0 || parts[parts.length - 1].kind !== 'text') {
-    parts.push({ kind: 'text', text: delta })
+    parts.push({ kind: 'text', text: scrubPhantomError(delta) })
   } else {
-    ;(parts[parts.length - 1] as any).text += delta
+    const last = parts[parts.length - 1] as any
+    last.text = (last.text || '') + delta
+    // Buffer-based scrub for split phantoms.
+    const buf = last.text.length > 600 ? last.text.slice(-600) : last.text
+    const m = PHANTOM_RE.exec(buf)
+    if (m) {
+      const matchStartInBuf = m.index
+      const matchEndInBuf = m.index + m[0].length
+      const totalLen = last.text.length
+      const bufStartInText = totalLen - buf.length
+      const absStart = bufStartInText + matchStartInBuf
+      const absEnd = bufStartInText + matchEndInBuf
+      last.text = last.text.slice(0, absStart) + PHANTOM_REPLACEMENT + last.text.slice(absEnd)
+    }
   }
-  m.content += delta
+  m.content += scrubPhantomError(delta)
 }
 
 function appendThinkingPart(m: Message, delta: string, target?: MessagePart[] | null) {
@@ -655,14 +830,31 @@ function appendThinkingPart(m: Message, delta: string, target?: MessagePart[] | 
 //   - 'phase' / 'done' / 'error': top-level only (the
 //     sub-agent emits its own start/ok/err phases).
 //   - 'done' stamps the message with token counts.
+// ★ appendStreamEvent — SSE 事件的单一分发入口。
+//
+// 每一个流事件都调用此函数，用于：
+//   - content/thinking 增量 → 追加到尾部 text/thinking part
+//   - tool 事件 → 创建/更新 ToolCallCard
+//   - phase + sub_agent_status → 创建/关闭 SubAgentCard
+//   - done → 设置 token 计数、清除 streaming flags、安全网检查
+//   - question → 弹出 QuestionModal
+//   - error → 追加错误文本、标记 vision_unsupported
+//
+// 子代理事件通过 ev.sub_agent + ev.sub_agent_task 路由到匹配的嵌套 SubAgentCard。
+//
+// 修改指南 → docs/modules/frontend.md
 export function appendStreamEvent(id: string, ev: api.StreamEvent) {
   const m = findOrCreateLastAssistant(id)
   if (!m.parts) m.parts = []
 
   // Locate / create the sub-agent part if applicable.
+  // The same event is passed in so the part can be
+  // seeded with the agent's metadata (type, color,
+  // model, task_id) on first creation, or backfilled
+  // on subsequent events.
   let sub: (MessagePart & { kind: 'sub_agent' }) | null = null
   if (ev.sub_agent && ev.sub_agent_task) {
-    sub = findOrCreateSubAgent(m, ev.sub_agent_task)
+    sub = findOrCreateSubAgent(m, ev.sub_agent_task, ev)
   }
 
   switch (ev.type) {
@@ -684,12 +876,33 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // is a full rewrite — the stream is already over by the
       // time the redactor runs, so no streaming flag is needed.
       if (!ev.content) break
+      const cleanedContent = scrubPhantomError(ev.content)
       const parts = sub ? sub.parts : m.parts!
       const last = parts[parts.length - 1]
       if (last && last.kind === 'text') {
-        last.text = ev.content
+        last.text = cleanedContent
       } else {
-        parts.push({ kind: 'text', text: ev.content })
+        parts.push({ kind: 'text', text: cleanedContent })
+      }
+      break
+    }
+    case 'thinking_rewrite': {
+      // Same as content_rewrite but for the LLM's
+      // chain-of-thought. The phantom sometimes appears in
+      // the thinking block instead of the text response
+      // (the LLM is "thinking out loud" about the phantom
+      // pattern) and we want it stripped there too so the
+      // collapsible thinking panel doesn't show the
+      // fabricated error.
+      if (!ev.thinking) break
+      const cleanedThinking = scrubPhantomError(ev.thinking)
+      const parts = sub ? sub.parts : m.parts!
+      const last = parts[parts.length - 1]
+      if (last && last.kind === 'thinking') {
+        last.text = cleanedThinking
+        last.streaming = false
+      } else {
+        parts.push({ kind: 'thinking', text: cleanedThinking, streaming: false })
       }
       break
     }
@@ -778,10 +991,18 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
     }
     case 'phase':
       // Sub-agent lifecycle: open / close the nested card.
+      // The sub-agent runner emits synthetic start/ok/err
+      // phase events with sub_agent=true and
+      // sub_agent_status set. These are routed through
+      // the same findOrCreateSubAgent path as the live
+      // content stream above, so the card's metadata
+      // (type/color/model/task_id) is seeded on the
+      // start event and stamped on the close event.
       if (ev.sub_agent_status) {
         if (!sub) break
         sub.status = ev.sub_agent_status as any
         if (ev.sub_agent_status !== 'start' && ev.elapsed) sub.elapsed = ev.elapsed
+        if (ev.sub_agent_model && !sub.agentModel) sub.agentModel = ev.sub_agent_model
       }
       // Surface phase messages as a live status bar.
       if (ev.message) {
@@ -821,6 +1042,47 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       walkParts(m.parts!, (p) => {
         if (p.kind === 'thinking' && p.streaming) p.streaming = false
       })
+      // Safety net: if the parent's turn ended (Done) and any
+      // sub-agent part is still in 'start' state, the close
+      // event must have been dropped (channel backpressure or
+      // out-of-order delivery). Force-close it as 'err' so
+      // the card never stays spinning forever. The user can
+      // still read whatever text the subagent did produce.
+      walkParts(m.parts!, (p) => {
+        if (p.kind === 'sub_agent' && p.status === 'start') {
+          p.status = 'err'
+        }
+      })
+      // Final phantom scrub. By the time the parent's
+      // stream ends, all content + thinking + sub-agent
+      // parts have been appended. Walk the message and
+      // scrub any phantom the server-side redactor may
+      // have missed (e.g. a phantom inside a tool result
+      // string the parent LLM echoed back, or a phantom
+      // the LLM produced AFTER the redactor's
+      // content_rewrite event was processed).
+      scrubMessagePhantoms(m)
+      // Stamp the server-assigned row id on the user message
+      // that started this turn and on the assistant reply so
+      // fork/rollback can target either.
+      if (ev.user_message_id || ev.last_message_id) {
+        const msgs = state.sessionMessages[id]
+        if (msgs) {
+          if (ev.user_message_id) {
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              if (msgs[i].role === 'user') { msgs[i].id = ev.user_message_id; break }
+            }
+          }
+          if (ev.last_message_id) {
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              if (msgs[i].role === 'assistant') { msgs[i].id = ev.last_message_id; break }
+            }
+          }
+        }
+      }
+      // 提示音 + 系统通知：对话完成
+      notifyManager.play('done')
+      if (!sub) notifyManager.notify('P-Chat', '对话已完成')
       break
     case 'question':
       // LLM is asking the user a question. Parse the
@@ -837,6 +1099,9 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           const answerPromise = new Promise<Record<string, string>>((resolve) => {
             state.pendingQuestion[id] = { questions, resolve }
           })
+          // 提示音 + 系统通知：LLM 提问
+          notifyManager.play('question')
+          notifyManager.notify('P-Chat', '向您提问')
           // The answer will be submitted via submitQuestionAnswer().
         } catch {
           console.error('[question] failed to parse question_json:', ev.question_json?.slice(0, 200))
@@ -859,6 +1124,9 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           }).then((approved) => {
             submitConfirmResponseInner(id, approved)
           })
+          // 提示音 + 系统通知：请求确认
+          notifyManager.play('confirm')
+          notifyManager.notify('沙箱请求', `批准 ${cfm.tool_name}?`)
         } catch { /* ignore */ }
       }
       break
@@ -876,6 +1144,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.error_kind === 'vision_unsupported') {
         markVisionUnsupported(id)
       }
+      // 提示音：对话出错
+      notifyManager.play('error')
       break
   }
 }
@@ -918,11 +1188,13 @@ function walkParts(parts: MessagePart[], fn: (p: MessagePart) => void) {
 // "system" is reused for render purposes; the markdown pipeline
 // handles it the same as assistant messages.
 export function appendSystemMessage(text: string) {
-  const id = state.currentID
-  if (!id) return
-  if (!state.sessionMessages[id]) state.sessionMessages[id] = []
-  state.sessionMessages[id].push({ role: 'system', content: text })
-  api.saveSystemMessage(id, text)
+  const cid = state.currentID
+  if (!cid) return
+  if (!state.sessionMessages[cid]) state.sessionMessages[cid] = []
+  // Scrub phantom errors from system messages too (the
+  // /compress / /status slash commands could echo one if
+  // a prior turn failed).
+  state.sessionMessages[cid].push({ role: 'system', content: scrubPhantomError(text) })
 }
 
 export function endStream(id: string) {
@@ -1027,3 +1299,80 @@ export const currentPendingConfirm = computed(() =>
 export const currentAttachments = computed(() =>
   state.pendingAttachments[state.currentID] || [],
 )
+
+// --- Rollback ---
+
+export const currentRollbackBanner = computed(() => {
+  const undo = state.rollbackUndo[state.currentID]
+  if (!undo || !undo.messages.length) return null
+  return { count: undo.messages.length }
+})
+
+export const currentPendingInput = computed(() =>
+  state.pendingInput[state.currentID] || '',
+)
+
+// rollbackTo deletes the message at the given index (and all later
+// messages) from the session. It calls the server API, saves the
+// deleted messages for undo, and auto-fills the input with the
+// last rolled-back user message.
+export async function rollbackTo(sessionId: string, messageIndex: number) {
+  const msgs = state.sessionMessages[sessionId]
+  if (!msgs) return
+  const msg = msgs[messageIndex]
+  if (!msg?.id) return
+
+  // If currently streaming, abort first.
+  if (state.streaming[sessionId]) {
+    stopStream(sessionId)
+  }
+
+  const result = await api.rollbackMessages(sessionId, msg.id)
+
+  state.rollbackUndo[sessionId] = {
+    messages: result.deleted_messages,
+    fromIndex: messageIndex,
+  }
+
+  msgs.splice(messageIndex)
+
+  const lastUser = [...result.deleted_messages].reverse().find(m => m.role === 'user')
+  state.pendingInput[sessionId] = lastUser?.content || ''
+}
+
+// undoRollback restores the messages deleted by the most recent
+// rollback in the given session.
+export async function undoRollback(sessionId: string) {
+  const undo = state.rollbackUndo[sessionId]
+  if (!undo || !undo.messages.length) return
+
+  await api.undoRollback(sessionId, undo.messages)
+
+  const msgs = state.sessionMessages[sessionId]
+  if (msgs) {
+    msgs.splice(undo.fromIndex, 0, ...undo.messages)
+  }
+  state.rollbackUndo[sessionId] = null
+  state.pendingInput[sessionId] = ''
+}
+
+// dismissRollback clears the rollback undo buffer and pending
+// input without restoring the deleted messages.
+export function dismissRollback(sessionId: string) {
+  state.rollbackUndo[sessionId] = null
+  state.pendingInput[sessionId] = ''
+}
+
+// --- Fork ---
+
+export async function forkSession(sourceId: string, messageIndex: number) {
+  const msgs = state.sessionMessages[sourceId]
+  if (!msgs) return
+  const msg = msgs[messageIndex]
+  if (!msg?.id) return
+
+  const session = await api.forkSession(sourceId, msg.id)
+
+  state.sessions.unshift(session)
+  await switchSession(session.id)
+}

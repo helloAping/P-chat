@@ -86,6 +86,9 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	api := r.Group("/api/v1")
 	{
 		api.GET("/health", h.Health)
+		api.GET("/version", h.VersionHandler)
+		api.GET("/migrations", h.MigrationStatus)
+		api.POST("/migrations/rollback", h.MigrationRollback)
 		api.GET("/styles", h.Styles)
 		api.POST("/styles", h.CreateStyle)
 		api.GET("/styles/:id", h.GetStyle)
@@ -139,6 +142,9 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/sessions/archived", h.ListArchived)
 		api.DELETE("/sessions/:id/permanent", h.PermanentDeleteSession)
 		api.DELETE("/sessions/:id/messages", h.ClearSessionMessages)
+		api.POST("/sessions/:id/rollback", h.RollbackMessages)
+		api.POST("/sessions/:id/rollback/undo", h.UndoRollback)
+		api.POST("/sessions/:id/fork", h.ForkSession)
 
 		// Projects
 		api.GET("/projects", h.ListProjects)

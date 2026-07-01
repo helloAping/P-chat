@@ -22,6 +22,7 @@ import (
 	"github.com/p-chat/pchat/internal/project"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/version"
 )
 
 // Handler serves the P-Chat HTTP API. It holds references to the
@@ -415,13 +416,57 @@ type StreamEvent struct {
 	SubAgent       bool   `json:"sub_agent,omitempty"`
 	SubAgentTask   string `json:"sub_agent_task,omitempty"`
 	SubAgentStatus string `json:"sub_agent_status,omitempty"`
+	// SubAgentType is the agent name (e.g. "explore",
+	// "plan", "general-purpose", or a custom agent from
+	// .p-chat/agent/*.md). Surfaced in the SubAgentCard
+	// header so the user can see which agent ran.
+	SubAgentType string `json:"sub_agent_type,omitempty"`
+	// SubAgentColor is the agent's accent color ("#RRGGBB"
+	// or CSS color name). Tints the card border + badge.
+	SubAgentColor string `json:"sub_agent_color,omitempty"`
+	// SubAgentModel is the model the sub-agent is using
+	// (e.g. "gpt-4o-mini"). Shown as a small chip in the
+	// card header.
+	SubAgentModel string `json:"sub_agent_model,omitempty"`
+	// SubAgentTaskID is the resume-by-id key. Surfaced as
+	// a monospace badge in the card footer.
+	SubAgentTaskID string `json:"sub_agent_task_id,omitempty"`
+	// SubAgentDescription is the agent's "when to use" hint.
+	// Surfaced as a hover tooltip on the agent-name badge
+	// in the SubAgentCard so the user can read the full
+	// hint without expanding the card body.
+	SubAgentDescription string `json:"sub_agent_description,omitempty"`
+
+	// ThinkingRewrite is the post-stream redactor's
+	// replacement text for the LLM's thinking block. The
+	// UI should REPLACE the trailing thinking part's text
+	// with this value (same pattern as content_rewrite
+	// for the text body). Empty when no rewrite is needed.
+	ThinkingRewrite string `json:"thinking_rewrite,omitempty"`
+
+	// SubAgentFailureReason explains why the sub-agent
+	// failed. Only set on `sub_agent_err` close events.
+	// The Wails GUI surfaces this in the SubAgentCard
+	// header so the user can tell "stream tail-end
+	// hiccup" (soft fail, content was already produced)
+	// from "could not reach the LLM" (hard fail, no
+	// content). Empty on `sub_agent_ok` close events.
+	SubAgentFailureReason string `json:"sub_agent_failure_reason,omitempty"`
 
 	// Done fields
-	TokensIn  int    `json:"tokens_in,omitempty"`
-	TokensOut int    `json:"tokens_out,omitempty"`
-	Elapsed   string `json:"elapsed,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
+	TokensIn      int    `json:"tokens_in,omitempty"`
+	TokensOut     int    `json:"tokens_out,omitempty"`
+	Elapsed       string `json:"elapsed,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Model         string `json:"model,omitempty"`
+	// UserMessageID is the SQLite row id of the user message
+	// that started this turn. Set only on the "done" event so
+	// the frontend can stamp it on the local Message for fork.
+	UserMessageID int64 `json:"user_message_id,omitempty"`
+	// LastMessageID is the highest row id in this session
+	// (typically the assistant reply just produced). Used to
+	// stamp the assistant message for fork targeting.
+	LastMessageID int64 `json:"last_message_id,omitempty"`
 
 	// Question fields — when the question tool is called, the
 	// server emits a "question" event with question_json set
@@ -458,6 +503,61 @@ type StreamEvent struct {
 
 func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// VersionHandler GET /api/v1/version
+func (h *Handler) VersionHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"version":    version.String(),
+		"full":       version.FullString(),
+		"git_commit": version.GitCommit,
+	})
+}
+
+// MigrationStatus GET /api/v1/migrations
+func (h *Handler) MigrationStatus(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	current, available, err := h.store.AppliedMigrations()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"current":   current,
+		"available": available,
+	})
+}
+
+// MigrationRollback POST /api/v1/migrations/rollback
+func (h *Handler) MigrationRollback(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	var body struct {
+		Target int `json:"target"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if body.Target < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "target must be >= 0"})
+		return
+	}
+	if err := h.store.Rollback(body.Target); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	current, available, _ := h.store.AppliedMigrations()
+	c.JSON(http.StatusOK, gin.H{
+		"ok":        true,
+		"current":   current,
+		"available": available,
+	})
 }
 
 // StyleMeta is the wire shape returned by /api/v1/styles. id is
@@ -525,6 +625,7 @@ type CreateStyleRequest struct {
 	Label    string `json:"label"`
 	Identity string `json:"identity"`
 	Soul     string `json:"soul"`
+	Memory   string `json:"memory,omitempty"`
 }
 
 func (h *Handler) CreateStyle(c *gin.Context) {
@@ -543,7 +644,7 @@ func (h *Handler) CreateStyle(c *gin.Context) {
 	if req.Soul == "" {
 		req.Soul = "你是一个 AI 助手。"
 	}
-	s, err := h.styleMgr.Create(req.ID, req.Label, req.Identity, req.Soul)
+	s, err := h.styleMgr.Create(req.ID, req.Label, req.Identity, req.Soul, req.Memory)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -569,11 +670,13 @@ func (h *Handler) GetStyle(c *gin.Context) {
 		return
 	}
 	soul, _ := h.styleMgr.GetSoul(s)
+	memory, _ := h.styleMgr.GetMemory(s)
 	c.JSON(http.StatusOK, gin.H{
 		"id":       id,
 		"label":    h.styleMgr.Label(s),
 		"identity": identity,
 		"soul":     soul,
+		"memory":   memory,
 	})
 }
 
@@ -583,6 +686,7 @@ type UpdateStyleRequest struct {
 	Label    string `json:"label,omitempty"`
 	Identity string `json:"identity,omitempty"`
 	Soul     string `json:"soul,omitempty"`
+	Memory   string `json:"memory,omitempty"`
 }
 
 func (h *Handler) UpdateStyle(c *gin.Context) {
@@ -596,7 +700,7 @@ func (h *Handler) UpdateStyle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	if err := h.styleMgr.Update(id, req.Label, req.Identity, req.Soul); err != nil {
+	if err := h.styleMgr.Update(id, req.Label, req.Identity, req.Soul, req.Memory); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -803,6 +907,100 @@ func (h *Handler) ClearSessionMessages(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"cleared": id})
+}
+
+// RollbackMessages POST /api/v1/sessions/:id/rollback
+// Deletes the message with the given id and all messages after it.
+// Returns the deleted messages so the client can undo.
+func (h *Handler) RollbackMessages(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	var req struct {
+		BeforeID int64 `json:"before_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.BeforeID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "before_id is required and must be > 0"})
+		return
+	}
+
+	deleted, err := h.store.DeleteMessagesFrom(id, req.BeforeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"deleted_count":    len(deleted),
+		"deleted_messages": deleted,
+	})
+}
+
+// ForkSession POST /api/v1/sessions/:id/fork
+// Creates a new session containing all messages up to and including
+// before_id from the source session.
+func (h *Handler) ForkSession(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	var req struct {
+		BeforeID int64 `json:"before_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.BeforeID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "before_id is required and must be > 0"})
+		return
+	}
+
+	conv, err := h.store.ForkConversation(id, req.BeforeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	srcMeta := h.ensureMetaLoaded(id)
+	h.setSessionMeta(conv.ID, srcMeta.Style, srcMeta.Provider, srcMeta.Model)
+	if srcMeta.ProjectPath != "" {
+		h.setSessionMetaProjectPath(conv.ID, srcMeta.ProjectPath)
+	}
+
+	c.JSON(http.StatusCreated, h.sessionToResponse(*conv))
+}
+
+// UndoRollback POST /api/v1/sessions/:id/rollback/undo
+// Restores previously-deleted messages.
+func (h *Handler) UndoRollback(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	var req struct {
+		Messages []memory.Message `json:"messages"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Override conversation_id from the URL to prevent cross-session
+	// injection.
+	for i := range req.Messages {
+		req.Messages[i].ConversationID = id
+	}
+
+	if err := h.store.RestoreMessages(req.Messages); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":             true,
+		"restored_count": len(req.Messages),
+	})
 }
 
 func (h *Handler) RenameSession(c *gin.Context) {
@@ -1415,6 +1613,14 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			return false
 		}
 		ev := chunkToEvent(chunk, provider, model)
+		if chunk.Done {
+			if uid := h.store.GetLastUserMessageID(id); uid > 0 {
+				ev.UserMessageID = uid
+			}
+			if lid := h.store.GetLastMessageID(id); lid > 0 {
+				ev.LastMessageID = lid
+			}
+		}
 		if ev.Type == "question" {
 			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
 		}
@@ -1441,21 +1647,24 @@ func (h *Handler) SendMessage(c *gin.Context) {
 // on the assistant message even when the model is unknown to the
 // chunk itself.
 //
-// Mapping rules (order matters — more specific first):
-//   1. Error chunk     → "error" event
-//   2. Done chunk      → "done" event
-//   3. Tool call chunk → "tool" event
-//   4. Thinking delta  → "thinking" event
-//   5. Content delta   → "content" event
-//   6. Phase chunk     → "phase" event
-//   7. Anything else   → "phase" heartbeat (so the client
-//      doesn't appear to hang on a quiet channel).
+// ★ chunkToEvent 是服务端 ChatStreamChunk → 前端 StreamEvent 的映射器。
+// 映射规则（按优先级，更具体的匹配优先）：
+//   1. question JSON 非空     → type:"question"   (问题模态框)
+//   2. tool_confirm JSON 非空 → type:"tool_confirm" (沙箱确认)
+//   3. Error 非空             → type:"error"       (LLM 错误)
+//   4. Done == true           → type:"done"        (★ 终止 SSE)
+//   5. ToolName 非空          → type:"tool"        (工具调用结果)
+//   6. Thinking 非空          → type:"thinking"    (思考增量)
+//   7. Content 非空           → type:"content"     (文本增量)
+//   8. ContentRewrite 非空    → type:"content_rewrite" (后处理文本重写)
+//   9. ThinkingRewrite 非空   → type:"thinking_rewrite"
+//  10. Phase 非空             → type:"phase"       (子代理开始/结束 + 系统状态)
+//  11. 其他                   → type:"phase"       (心跳)
 //
-// Sub-agent fields are copied verbatim when set, regardless
-// of which type the chunk maps to. This lets the parent
-// surface a single nested "sub-agent" card whose inner
-// stream is a mix of content / thinking / phase events all
-// tagged with sub_agent=true.
+// Sub_agent 字段在所有分支中无条件拷贝，确保子代理的 content/thinking/tool/phase
+// 事件全部带有 sub_agent=true 标记，前端能正确路由到嵌套 SubAgentCard。
+//
+// 修改指南 → docs/modules/server.md
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {
 	ev := StreamEvent{
 		Phase:          chunk.Phase,
@@ -1466,7 +1675,22 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		SubAgent:       chunk.SubAgent,
 		SubAgentTask:   chunk.SubAgentTask,
 		SubAgentStatus: chunk.SubAgentStatus,
+		SubAgentType:   chunk.SubAgentType,
+		SubAgentColor:  chunk.SubAgentColor,
+		SubAgentModel:  chunk.SubAgentModel,
+		SubAgentTaskID: chunk.SubAgentTaskID,
+		SubAgentDescription: chunk.SubAgentDescription,
+		SubAgentFailureReason: chunk.SubAgentFailureReason,
+		ThinkingRewrite: chunk.ThinkingRewrite,
 		SessionStatus:  chunk.SessionStatus,
+		// Elapsed carries the duration the server stamped on the
+		// chunk. The agent sets it on the final "done" chunk AND
+		// on every sub_agent_* lifecycle close event (so the
+		// SubAgentCard can show the elapsed time once the run
+		// finishes). Surfacing it here unconditionally lets the
+		// frontend read ev.elapsed on phase events without
+		// waiting for a separate "done" tick.
+		Elapsed: chunk.Duration,
 	}
 
 	// Question events are emitted by the question tool handler
@@ -1492,7 +1716,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.Type = "done"
 		ev.TokensIn = chunk.TokensIn
 		ev.TokensOut = chunk.TokensOut
-		ev.Elapsed = chunk.Duration
+		// ev.Elapsed already populated above (chunk.Duration).
 		return ev
 	}
 	if chunk.ToolName != "" {
@@ -1534,6 +1758,15 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 	if chunk.ContentRewrite != "" {
 		ev.Type = "content_rewrite"
 		ev.Content = chunk.ContentRewrite
+		return ev
+	}
+	// ThinkingRewrite: same pattern but for the LLM's
+	// chain-of-thought block. Some phantoms appear in
+	// thinking rather than the text response; the UI
+	// replaces the trailing thinking part's text.
+	if chunk.ThinkingRewrite != "" {
+		ev.Type = "thinking_rewrite"
+		ev.Thinking = chunk.ThinkingRewrite
 		return ev
 	}
 	// Other phase events (system, memory, plan, sub-agent

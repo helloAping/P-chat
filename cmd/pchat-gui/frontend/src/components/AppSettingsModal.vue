@@ -24,13 +24,133 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
-  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NTooltip, NIcon, useMessage,
+  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NTooltip, NIcon, NPopover, useMessage,
 } from 'naive-ui'
 import * as api from '../api/client'
 import { loadProviders, loadSessions } from '../stores/chat'
 import type { Session } from '../api/client'
 
 const message = useMessage()
+
+// ---- 风格样例模板 ----
+const EXAMPLE_SCENARIOS = ['编程', '日常工作', '角色扮演'] as const
+
+const EXAMPLE_TEMPLATES: Record<string, Record<string, string>> = {
+  identity: {
+    '编程': `你叫 P-Chat，是一个本地 AI 编程助手。
+
+你的能力：
+• 精通 Go / Vue 3 / TypeScript / SQLite
+• 可以读写文件、执行 shell 命令
+• 仅操作工作目录内的文件
+
+行为准则：
+• 先读代码再给建议，不凭空猜测
+• 修改后建议跑测试验证
+• 不输出密钥 / token 到任何地方`,
+    '日常工作': `你叫 P-Chat，是一个全能办公助手。
+
+你的能力：
+• 撰写邮件、报告、文档
+• 整理会议纪要、任务清单
+• 分析数据、制作摘要
+• 搜索本地文件、管理知识库
+
+行为准则：
+• 回复结构清晰，善用标题和列表
+• 主动提醒遗漏的事项
+• 对不确定的信息标注"待确认"`,
+    '角色扮演': `你叫小灵，是用户的私人 AI 助理。
+
+你的性格：
+• 活泼开朗，偶尔俏皮
+• 对技术问题也保持耐心和热情
+• 像一个靠谱又有趣的朋友
+
+你的职责：
+• 管理用户的日程和任务
+• 帮用户学习和研究新技术
+• 在用户焦虑时给予鼓励`,
+  },
+  soul: {
+    '编程': `语气：简洁、直击要害，像 code review 评论。
+不使用「当然可以」「没问题」等寒暄。
+
+格式：
+• 代码块用 \`\`\`go 标注语言
+• 路径用反引号 \`internal/agent/agent.go\`
+• 每个回复控制在小屏一屏内
+
+原则：
+• 先给答案，再给解释
+• 错误用中文描述，不贴原始 stack trace
+• 不确定时主动说明，不编造`,
+    '日常工作': `语气：专业但不冰冷，像靠谱的同事。
+适当使用「建议」「推荐」等柔和词汇。
+
+格式：
+• 要点用 - 列表
+• 关键信息加 **粗体**
+• 重要结论写在最前面
+
+原则：
+• 先总结后展开
+• 主动追问不清晰的指令
+• 输出可复制使用的成品（邮件正文、表格等）`,
+    '角色扮演': `语气：温暖、随和，像深夜聊天的朋友。
+偶尔用「哈哈」「~」等轻松表达。
+
+格式：
+• 用自然段对话，不用列表
+• 技术内容用比喻解释
+• 回复长度 2-5 句，不写小作文
+
+原则：
+• 先共情再建议
+• 记住用户的偏好和习惯
+• 在合适的时候开玩笑`,
+  },
+  memory: {
+    '编程': `- 当前项目：P-Chat (Go + Vue 3 桌面聊天应用)
+- 数据库：SQLite @ ~/.p-chat/memory/store.db
+- 后端端口：动态分配，默认随机
+- 测试命令：go test -count=1 ./...
+- 构建命令：task build:all
+- 代码风格：Go camelCase, TS camelCase, 中文注释`,
+    '日常工作': `- 我负责的产品线：用户增长与留存
+- 团队规模：6 人（2 后端 + 2 前端 + 1 设计 + 1 PM）
+- 本周重点：Q3 OKR 评审 & 新版首页 A/B
+- 常用文档：docs/内部 Wiki / Notion
+- 会议时间：每天 10:00 站会`,
+    '角色扮演': `- 用户喜欢在晚上 9 点后专心工作
+- 用户最近在学习 Rust 和系统编程
+- 用户喜欢简洁的 UI 和 dark theme
+- 用户的理想早餐是可颂 + 冰美式
+- 用户这周压力比较大，需要鼓励`,
+  },
+}
+
+const exampleActiveScene = ref<Record<string, string>>({
+  identity: '编程',
+  soul: '编程',
+  memory: '编程',
+})
+
+function fillExample(field: 'identity' | 'soul' | 'memory') {
+  const scene = exampleActiveScene.value[field]
+  const tpl = EXAMPLE_TEMPLATES[field]?.[scene] || ''
+  if (field === 'identity') newStyleIdentity.value = tpl
+  else if (field === 'soul') newStyleSoul.value = tpl
+  else if (field === 'memory') newStyleMemory.value = tpl
+}
+
+// ID 唯一性校验（仅在新增时检查，编辑时 ID 只读）
+const idConflict = computed(() => {
+  if (isEdit.value) return false
+  const v = newStyleId.value.trim()
+  if (!v) return false
+  return styles.value.some(s => s.id === v)
+})
 const tab = ref<'providers' | 'styles' | 'archive' | 'skills' | 'mcp'>('providers')
 
 // --- Provider state ---
@@ -94,6 +214,7 @@ const newStyleId = ref('')
 const newStyleLabel = ref('')
 const newStyleIdentity = ref('')
 const newStyleSoul = ref('')
+const newStyleMemory = ref('')
 const isEdit = ref(false)
 
 onMounted(async () => {
@@ -444,6 +565,7 @@ function resetNewStyle() {
   newStyleLabel.value = ''
   newStyleIdentity.value = ''
   newStyleSoul.value = ''
+  newStyleMemory.value = ''
   isEdit.value = false
   editingStyle.value = null
 }
@@ -459,6 +581,7 @@ async function onCreateStyle() {
       label: newStyleLabel.value.trim(),
       identity: newStyleIdentity.value,
       soul: newStyleSoul.value,
+      memory: newStyleMemory.value,
     })
     message.success(`已创建: ${newStyleId.value}`)
     showAddStyle.value = false
@@ -474,9 +597,10 @@ async function onEditStyle(id: string) {
     const s = await api.getStyle(id)
     editingStyle.value = s
     newStyleId.value = s.id
-    newStyleLabel.value = s.label
-    newStyleIdentity.value = s.identity
-    newStyleSoul.value = s.soul
+    newStyleLabel.value = s.label || ''
+    newStyleIdentity.value = s.identity || ''
+    newStyleSoul.value = s.soul || ''
+    newStyleMemory.value = (s as any).memory || ''
     isEdit.value = true
     showAddStyle.value = true
   } catch (e: any) {
@@ -491,6 +615,7 @@ async function onUpdateStyle() {
       label: newStyleLabel.value,
       identity: newStyleIdentity.value,
       soul: newStyleSoul.value,
+      memory: newStyleMemory.value,
     })
     message.success(`已保存: ${editingStyle.value.id}`)
     showAddStyle.value = false
@@ -1071,22 +1196,19 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
 
       <NTabPane name="styles" tab="风格配置">
         <div class="styles-tab-body">
-        <NSpace vertical size="large">
-          <div>
-            <h3 class="section-title">已配置的风格</h3>
-            <div v-for="s in styles" :key="s.id" class="style-row">
-              <div class="style-meta">
-                <div>
-                  <NTag size="small" :type="isBuiltIn(s.id) ? 'success' : 'info'" style="margin-right: 6px">
-                    {{ isBuiltIn(s.id) ? '内置' : '自定义' }}
-                  </NTag>
-                  <strong>{{ s.label }}</strong>
-                  <span class="muted">(<code>{{ s.id }}</code>)</span>
-                </div>
-                <div class="muted style-desc">{{ s.desc || '（无描述）' }}</div>
+          <h3 class="section-title">已配置的风格</h3>
+          <div class="style-grid">
+            <div v-for="s in styles" :key="s.id" class="style-card">
+              <div class="style-card-top">
+                <NTag size="small" :type="isBuiltIn(s.id) ? 'success' : 'info'">
+                  {{ isBuiltIn(s.id) ? '内置' : '自定义' }}
+                </NTag>
+                <span class="style-card-id"><code>{{ s.id }}</code></span>
               </div>
-              <NSpace size="small">
-                <NButton size="small" @click="onEditStyle(s.id)">查看/编辑</NButton>
+              <div class="style-card-label">{{ s.label }}</div>
+              <div class="style-card-desc">{{ s.desc || '（无描述）' }}</div>
+              <div class="style-card-actions">
+                <NButton size="small" quaternary @click="onEditStyle(s.id)">查看/编辑</NButton>
                 <NPopconfirm
                   v-if="!isBuiltIn(s.id)"
                   @positive-click="onDeleteStyle(s.id)"
@@ -1094,47 +1216,112 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
                   negative-text="取消"
                 >
                   <template #trigger>
-                    <NButton size="small" type="error" ghost>删除</NButton>
+                    <NButton size="small" quaternary type="error">删除</NButton>
                   </template>
                   确定删除风格 "{{ s.id }}" ? 该会话将回退到默认风格。
                 </NPopconfirm>
-                <NTag v-else size="small" :bordered="false" type="default">只读</NTag>
-              </NSpace>
-            </div>
-            <NSpace style="margin-top: 8px">
-              <NButton size="small" @click="() => { showAddStyle = !showAddStyle; if (showAddStyle) resetNewStyle() }" type="primary" ghost>
-                {{ showAddStyle ? '取消' : '+ 新增风格' }}
-              </NButton>
-            </NSpace>
-
-            <div v-if="showAddStyle" class="add-form">
-              <NSpace vertical size="small">
-                <NInput v-model:value="newStyleId" placeholder="id (英文/数字/下划线, 例: warm)" size="small" :disabled="isEdit" />
-                <NInput v-model:value="newStyleLabel" placeholder="显示名 (例: 温暖)" size="small" />
-                <NInput
-                  v-model:value="newStyleIdentity"
-                  placeholder="Identity (系统提示中的「你是谁」部分, 支持 markdown)"
-                  type="textarea"
-                  :rows="4"
-                  size="small"
-                />
-                <NInput
-                  v-model:value="newStyleSoul"
-                  placeholder="Soul (性格、说话风格)"
-                  type="textarea"
-                  :rows="2"
-                  size="small"
-                />
-                <NSpace>
-                  <NButton type="primary" size="small" @click="isEdit ? onUpdateStyle() : onCreateStyle()">
-                    {{ isEdit ? '保存修改' : '创建风格' }}
-                  </NButton>
-                  <NButton size="small" @click="closeStyleEditor">取消</NButton>
-                </NSpace>
-              </NSpace>
+              </div>
             </div>
           </div>
-        </NSpace>
+
+          <NButton size="small" style="margin-top:12px"
+            @click="() => { showAddStyle = !showAddStyle; if (showAddStyle) resetNewStyle() }" type="primary" ghost>
+            {{ showAddStyle ? '取消' : '+ 新增风格' }}
+          </NButton>
+
+          <!-- ---- 编辑/新增表单 ---- -->
+          <div v-if="showAddStyle" class="style-editor">
+            <div class="editor-header">
+              <span>{{ isEdit ? '编辑风格' : '新增风格' }}</span>
+            </div>
+
+            <!-- 元数据行 -->
+            <div class="editor-meta">
+              <div class="meta-item">
+                <label>ID</label>
+                <NInput v-model:value="newStyleId" placeholder="英文/数字/下划线，如 warm" size="small" :disabled="isEdit"
+                  :status="idConflict ? 'error' : undefined" />
+                <span class="meta-hint" :class="{ 'meta-hint-err': idConflict }">
+                  {{ idConflict ? '该 ID 已被占用' : '纯英文+数字+下划线，唯一标识，不可重复' }}
+                </span>
+              </div>
+              <div class="meta-item">
+                <label>显示名称</label>
+                <NInput v-model:value="newStyleLabel" placeholder="如：温暖" size="small" />
+              </div>
+            </div>
+
+            <!-- 内容区：身份 (左) | 灵魂 (右) -->
+            <div class="editor-content">
+              <div class="editor-col">
+                <div class="field-head">
+                  身份 (Identity)<span class="field-hint">— 定义「我是谁」</span>
+                  <NPopover trigger="hover" placement="bottom" style="max-width:440px">
+                    <template #trigger><span class="help-badge">?</span></template>
+                    <div class="example-card">
+                      <div class="example-scenes">
+                        <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
+                          :type="exampleActiveScene.identity === sc ? 'primary' : 'default'"
+                          @click="exampleActiveScene.identity = sc">{{ sc }}</NButton>
+                      </div>
+                      <pre class="example-content">{{ EXAMPLE_TEMPLATES.identity[exampleActiveScene.identity] }}</pre>
+                      <NButton size="tiny" type="primary" ghost block @click="fillExample('identity')">填入此样例</NButton>
+                    </div>
+                  </NPopover>
+                </div>
+                <NInput v-model:value="newStyleIdentity" placeholder="角色身份描述，支持 markdown"
+                  type="textarea" :rows="6" size="small" class="editor-textarea" />
+              </div>
+
+              <div class="editor-col">
+                <div class="field-head">
+                  灵魂 (Soul)<span class="field-hint">— 定义「我的语气」</span>
+                  <NPopover trigger="hover" placement="bottom" style="max-width:440px">
+                    <template #trigger><span class="help-badge">?</span></template>
+                    <div class="example-card">
+                      <div class="example-scenes">
+                        <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
+                          :type="exampleActiveScene.soul === sc ? 'primary' : 'default'"
+                          @click="exampleActiveScene.soul = sc">{{ sc }}</NButton>
+                      </div>
+                      <pre class="example-content">{{ EXAMPLE_TEMPLATES.soul[exampleActiveScene.soul] }}</pre>
+                      <NButton size="tiny" type="primary" ghost block @click="fillExample('soul')">填入此样例</NButton>
+                    </div>
+                  </NPopover>
+                </div>
+                <NInput v-model:value="newStyleSoul" placeholder="说话风格与回复格式"
+                  type="textarea" :rows="6" size="small" class="editor-textarea" />
+              </div>
+            </div>
+
+            <!-- 记忆：全宽 -->
+            <div class="editor-memory">
+              <div class="field-head">
+                记忆 (Memory)<span class="field-hint">— 定义「我记得的事情」</span>
+                <NPopover trigger="hover" placement="bottom" style="max-width:440px">
+                  <template #trigger><span class="help-badge">?</span></template>
+                  <div class="example-card">
+                    <div class="example-scenes">
+                      <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
+                        :type="exampleActiveScene.memory === sc ? 'primary' : 'default'"
+                        @click="exampleActiveScene.memory = sc">{{ sc }}</NButton>
+                    </div>
+                    <pre class="example-content">{{ EXAMPLE_TEMPLATES.memory[exampleActiveScene.memory] }}</pre>
+                    <NButton size="tiny" type="primary" ghost block @click="fillExample('memory')">填入此样例</NButton>
+                  </div>
+                </NPopover>
+              </div>
+              <NInput v-model:value="newStyleMemory" placeholder="背景资料、项目信息、用户偏好，每行一条"
+                type="textarea" :rows="4" size="small" class="editor-textarea" />
+            </div>
+
+            <div class="editor-actions">
+              <NButton size="small" @click="closeStyleEditor">取消</NButton>
+              <NButton type="primary" size="small" @click="isEdit ? onUpdateStyle() : onCreateStyle()">
+                {{ isEdit ? '保存修改' : '创建风格' }}
+              </NButton>
+            </div>
+          </div>
         </div>
       </NTabPane>
 
@@ -1475,18 +1662,82 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
   max-height: calc(80vh - 160px);
   overflow: auto;
 }
-.style-row {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 8px 10px;
-  background: var(--bg-3);
-  border-radius: 6px;
-  margin-bottom: 6px;
-  gap: 12px;
+/* ---- 风格卡片网格 ---- */
+.style-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
 }
-.style-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
-.style-desc {
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  max-width: 480px;
+.style-card {
+  background: var(--bg-3);
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 8px;
+  transition: border-color .15s;
+}
+.style-card:hover { border-color: var(--accent); }
+.style-card-top { display: flex; align-items: center; gap: 8px; }
+.style-card-id { font-size: 12px; color: var(--text-3); }
+.style-card-label { font-size: 16px; font-weight: 600; }
+.style-card-desc {
+  font-size: 12px; color: var(--text-3); line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.style-card-actions {
+  display: flex; gap: 4px; margin-top: 4px;
+  border-top: 1px solid var(--border-2); padding-top: 10px;
+}
+/* ---- 风格编辑器 ---- */
+.style-editor {
+  margin-top: 14px;
+  background: var(--bg-3);
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  padding: 16px 20px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.editor-header {
+  font-size: 15px; font-weight: 700;
+  padding-bottom: 10px; border-bottom: 1px solid var(--border-2);
+}
+.editor-meta { display: flex; gap: 16px; }
+.meta-item { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.meta-item label { font-size: 12px; font-weight: 600; color: var(--text-2); }
+.meta-hint { font-size: 11px; color: var(--text-3); }
+.meta-hint-err { color: var(--warn); }
+.editor-content { display: flex; gap: 16px; }
+.editor-col { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.editor-memory { display: flex; flex-direction: column; gap: 6px; }
+.editor-textarea { flex: 1; }
+.editor-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 6px; }
+/* ---- 旧样式保留 ---- */
+.field-head {
+  font-size: 13px; font-weight: 600; color: var(--text-1);
+}
+.field-hint {
+  font-weight: 400; color: var(--text-3); font-size: 12px;
+}
+.field-desc {
+  font-size: 12px; color: var(--text-3); line-height: 1.5;
+  margin-top: -4px;
+}
+.help-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--bg-3); border: 1px solid var(--border-2);
+  font-size: 10px; font-weight: 700; color: var(--text-2);
+  cursor: help; margin-left: 4px; vertical-align: middle;
+  user-select: none;
+}
+.help-badge:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+.example-card { padding: 4px 0; }
+.example-scenes { display: flex; gap: 4px; margin-bottom: 8px; }
+.example-content {
+  margin: 0; padding: 8px; background: var(--bg-3); border-radius: 4px;
+  font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all;
+  max-height: 300px; overflow: auto;
+  font-family: ui-monospace, Menlo, monospace;
 }
 code {
   background: var(--bg-3); padding: 1px 6px; border-radius: 3px;

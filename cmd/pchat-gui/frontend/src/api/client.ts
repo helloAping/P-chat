@@ -136,6 +136,30 @@ export type MessagePart =
       // spawn sub-agents. The type just allows it.)
       parts: MessagePart[]
       elapsed?: string
+      // The agent's name (e.g. "explore", "plan",
+      // "general-purpose", or a custom agent from
+      // .p-chat/agent/*.md). Surfaced in the card header.
+      agentType?: string
+      // The agent's accent color ("#RRGGBB" or CSS color
+      // name). Tints the card border + badge.
+      agentColor?: string
+      // The model the sub-agent is using (e.g.
+      // "gpt-4o-mini"). Shown as a small chip when set.
+      agentModel?: string
+      // The resume-by-id key. Surfaced as a monospace
+      // badge in the footer; click to copy.
+      taskId?: string
+      // The agent's one-line "when to use" hint from the
+      // registry. Surfaced as a hover tooltip on the
+      // agent-name badge so the user can read the full
+      // hint without expanding the card body.
+      agentDescription?: string
+      // The reason the sub-agent failed. Only set when
+      // status === 'err'. Surfaced as a tooltip on the
+      // "失败" status so the user can see *why* without
+      // expanding the card body. Empty for soft-fail
+      // (content produced) and for ok status.
+      failureReason?: string
     }
 
 export type SubAgentPart = Extract<MessagePart, { kind: 'sub_agent' }>
@@ -162,6 +186,11 @@ export interface Message {
   // empty for older messages loaded from history (the
   // server only persists the final content text).
   parts?: MessagePart[]
+  // The LLM's chain-of-thought (assistant messages only).
+  // Rendered as a collapsible "thinking" panel. The
+  // post-stream redactor may rewrite this if the LLM
+  // produced a phantom error in the thinking block.
+  thinking?: string
   created_at?: number
   tool_call_id?: string
   name?: string
@@ -482,6 +511,31 @@ export const permanentDeleteSession = (id: string) =>
 export const clearSessionMessages = (id: string) =>
   jsonFetch<{ cleared: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/messages`, { method: 'DELETE' })
 
+// --- Rollback ---
+export interface RollbackResult {
+  deleted_count: number
+  deleted_messages: Message[]
+}
+
+export const rollbackMessages = (sessionId: string, beforeId: number) =>
+  jsonFetch<RollbackResult>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/rollback`,
+    { method: 'POST', body: JSON.stringify({ before_id: beforeId }) },
+  )
+
+export const undoRollback = (sessionId: string, messages: Message[]) =>
+  jsonFetch<{ ok: boolean; restored_count: number }>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/rollback/undo`,
+    { method: 'POST', body: JSON.stringify({ messages }) },
+  )
+
+// --- Fork ---
+export const forkSession = (sessionId: string, beforeId: number) =>
+  jsonFetch<Session>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/fork`,
+    { method: 'POST', body: JSON.stringify({ before_id: beforeId }) },
+  )
+
 // --- Uploads ---
 export async function uploadFile(file: File): Promise<UploadMeta> {
   const fd = new FormData()
@@ -548,6 +602,7 @@ export interface StyleInfo {
 export interface StyleDetail extends StyleInfo {
   identity: string
   soul: string
+  memory?: string
 }
 
 export const getStyles = () => jsonFetch<{ styles: StyleInfo[] }>('/api/v1/styles')
@@ -560,6 +615,7 @@ export interface CreateStyleRequest {
   label: string
   identity: string
   soul: string
+  memory?: string
 }
 
 export const createStyle = (req: CreateStyleRequest) =>
@@ -572,6 +628,7 @@ export interface UpdateStyleRequest {
   label?: string
   identity?: string
   soul?: string
+  memory?: string
 }
 
 export const updateStyle = (id: string, req: UpdateStyleRequest) =>
@@ -801,6 +858,18 @@ export interface StreamEvent {
   sub_agent?: boolean
   sub_agent_task?: string
   sub_agent_status?: 'start' | 'ok' | 'err' | string
+  sub_agent_type?: string
+  sub_agent_color?: string
+  sub_agent_model?: string
+  sub_agent_task_id?: string
+  sub_agent_description?: string
+  sub_agent_failure_reason?: string
+  // thinking_rewrite is the post-stream redactor's
+  // replacement text for the LLM's thinking block. The
+  // UI should REPLACE the trailing thinking part's text
+  // with this value (same pattern as content_rewrite for
+  // the text body). Empty when no rewrite is needed.
+  thinking_rewrite?: string
   tokens_in?: number
   tokens_out?: number
   elapsed?: string
@@ -837,6 +906,13 @@ export interface StreamEvent {
   // dock can't tell "LLM is mid-turn, keep todos" from
   // "LLM stopped and forgot to clear them".
   session_status?: 'busy' | 'idle' | 'retry' | string
+
+  // user_message_id is the SQLite row id of the user message
+  // that started this turn. Set only on the "done" event.
+  user_message_id?: number
+  // last_message_id is the highest row id in this session
+  // (typically the assistant reply just produced).
+  last_message_id?: number
 }
 
 export async function submitConfirmResponse(sessionId: string, approved: boolean): Promise<void> {

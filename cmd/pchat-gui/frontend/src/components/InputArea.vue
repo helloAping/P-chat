@@ -15,10 +15,14 @@ import {
   isStreaming, startStream, stopStream, appendStreamEvent, endStream,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
+  currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
 } from '../stores/chat'
+import { notifyManager } from '../utils/notify'
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const inputText = ref('')
+// 本地 ref 代理静音状态，确保 Vue 模板能跟踪变化
+const mute = ref(notifyManager.mute)
 
 // Textarea auto-resize: grow with content, cap at 4 lines, then scroll.
 const TEXTAREA_MAX_LINES = 4
@@ -37,6 +41,17 @@ function resizeTextarea() {
 
 watch(inputText, () => nextTick(resizeTextarea))
 watch(() => currentAttachments.value.length, () => nextTick(resizeTextarea))
+
+// Sync rollback pending input to the textarea.
+watch(currentPendingInput, (val) => {
+  if (val) {
+    inputText.value = val
+    nextTick(() => {
+      inputEl.value?.focus()
+      resizeTextarea()
+    })
+  }
+})
 
 // Also sync after backspace / clear (send resets inputText to '').
 onMounted(() => nextTick(resizeTextarea))
@@ -110,6 +125,12 @@ async function onChangePermissionLevel(val: string) {
       permission_level: val,
     }
   } catch {}
+}
+
+function onToggleMute() {
+  notifyManager.unlock()
+  notifyManager.mute = !notifyManager.mute
+  mute.value = notifyManager.mute
 }
 
 // CmdSpec is imported from CommandPalette.vue
@@ -634,6 +655,8 @@ async function send() {
   inputText.value = ''
   clearAttachments()
   sending.value = true
+  // 首次用户交互时解锁 Web Audio（浏览器自动播放策略要求）
+  notifyManager.unlock()
   const ctrl = new AbortController()
   // Install the placeholder assistant message immediately so
   // the three-bouncing-dots spinner is reachable. The actual
@@ -856,6 +879,13 @@ onMounted(() => {
 
 <template>
   <div class="input-area">
+    <!-- Rollback undo banner -->
+    <div v-if="currentRollbackBanner" class="rollback-banner">
+      <span class="rollback-banner-icon">↩</span>
+      <span class="rollback-banner-text">已撤回 {{ currentRollbackBanner.count }} 条消息</span>
+      <button class="rollback-banner-undo" @click="undoRollback(state.currentID)">撤销</button>
+      <button class="rollback-banner-dismiss" @click="dismissRollback(state.currentID)">×</button>
+    </div>
     <!-- Attachments live INSIDE the same input-wrap as the
          textarea. They wrap to multiple rows as the dialog
          width changes; we don't use a horizontal scrollbar
@@ -974,6 +1004,13 @@ onMounted(() => {
           title="权限级别"
           @update:value="onChangePermissionLevel"
         />
+        <NButton
+          size="small"
+          :type="mute ? 'warning' : 'default'"
+          :disabled="!state.currentID"
+          @click="onToggleMute"
+          title="提示音开关"
+        >{{ mute ? '🔇' : '🔊' }}</NButton>
         <div class="hints">
           <span><kbd>Enter</kbd> 发送</span>
           <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
@@ -1046,6 +1083,52 @@ onMounted(() => {
   flex-shrink: 0;
 }
 .rm:hover { color: var(--error); }
+
+/* Rollback undo banner */
+.rollback-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  margin-bottom: 8px;
+  background: var(--warning-suppl, #fff8e1);
+  border: 1px solid var(--warning, #f0a020);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.rollback-banner-icon {
+  font-size: 15px;
+  color: var(--warning, #f0a020);
+}
+.rollback-banner-text {
+  color: var(--text);
+  flex: 1;
+}
+.rollback-banner-undo {
+  background: none;
+  border: none;
+  color: var(--warning, #f0a020);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+.rollback-banner-undo:hover {
+  background: var(--warning, #f0a020);
+  color: #fff;
+}
+.rollback-banner-dismiss {
+  background: none;
+  border: none;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 4px;
+  line-height: 1;
+}
+.rollback-banner-dismiss:hover {
+  color: var(--text);
+}
 
 /* The dialog "box": textarea + optional attach strip share a
  * single rounded container. The flex column lets the strip

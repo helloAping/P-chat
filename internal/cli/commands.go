@@ -360,6 +360,42 @@ func init() {
 			},
 			Handler: cmdQuit,
 		},
+		{
+			Name: "/rollback", Aliases: []string{"/rb"}, Description: "撤回消息到指定位置",
+			Usage: "/rollback [id|last]",
+			Args: "[id]: 消息的整数 ID (≥1)。撤回该消息及其之后的所有消息。\n" +
+				"  [last]: (默认) 撤回最后一条用户消息及之后的所有回复。\n" +
+				"  不带参数等同于 last。",
+			Examples: []string{
+				"/rollback",
+				"/rollback last",
+				"/rollback 42",
+			},
+			Handler: cmdRollback,
+		},
+		{
+			Name: "/undo", Aliases: []string{}, Description: "撤销最近一次撤回",
+			Usage: "/undo",
+			Args: "无参。\n" +
+				"  - 恢复最近一次 /rollback 删除的消息\n" +
+				"  - 仅保留最近一次撤回的撤销信息",
+			Examples: []string{
+				"/undo",
+			},
+			Handler: cmdUndo,
+		},
+		{
+			Name: "/fork", Aliases: []string{"/branch"}, Description: "从指定消息处创建分支对话",
+			Usage: "/fork [消息序号]",
+			Args: "消息序号  - 从第几条消息处分支（1-based，默认列出消息供选择）\n" +
+				"      新会话复制序号及其之前的所有消息，原会话保持不变",
+			Examples: []string{
+				"/fork",
+				"/fork 5",
+				"/branch 3",
+			},
+			Handler: cmdFork,
+		},
 	}
 
 	// Pre-compute a name/alias → *SlashCommand index for fast /help lookups.
@@ -1588,6 +1624,182 @@ func cmdClear(ctx cliContext, args string) error {
 	fmt.Print("\033[2J\033[H")
 	color.Green("  ✓ 已清空当前对话 (%s) 的所有消息", convID)
 	fmt.Println()
+	return nil
+}
+
+// cmdRollback deletes messages from the given id (inclusive) onward.
+// /rollback or /rollback last → rolls back to the last user message.
+// /rollback <id> → rolls back to that specific message id.
+func cmdRollback(ctx cliContext, args string) error {
+	convID := ctx.GetCurrentSessionID()
+	if convID == "" {
+		color.Yellow("  当前无活跃会话")
+		return nil
+	}
+
+	msgs, err := ctx.GetCurrentSessionMessages(context.Background())
+	if err != nil {
+		color.Red("  ✗ 获取消息失败: %v", err)
+		return nil
+	}
+	if len(msgs) == 0 {
+		color.Yellow("  当前会话无消息")
+		return nil
+	}
+
+	var targetID int64
+	args = strings.TrimSpace(args)
+	switch args {
+	case "", "last":
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role == "user" {
+				targetID = msgs[i].ID
+				break
+			}
+		}
+		if targetID == 0 {
+			color.Yellow("  未找到用户消息")
+			return nil
+		}
+	default:
+		id, err := strconv.ParseInt(args, 10, 64)
+		if err != nil {
+			color.Red("  ✗ 无效的消息 ID: %s", args)
+			return nil
+		}
+		found := false
+		for _, m := range msgs {
+			if m.ID == id {
+				targetID = id
+				found = true
+				break
+			}
+		}
+		if !found {
+			color.Red("  ✗ 消息 ID %d 不存在", id)
+			return nil
+		}
+	}
+
+	delCount := 0
+	for _, m := range msgs {
+		if m.ID >= targetID {
+			delCount++
+		}
+	}
+
+	color.Yellow("  将撤回 %d 条消息 (ID ≥ %d)", delCount, targetID)
+	fmt.Print("  确认撤回? [y/N] ")
+	var confirm string
+	fmt.Scanln(&confirm)
+	if confirm != "y" && confirm != "Y" {
+		color.HiBlack("  已取消")
+		return nil
+	}
+
+	deleted, err := ctx.RollbackMessages(context.Background(), convID, targetID)
+	if err != nil {
+		color.Red("  ✗ 撤回失败: %v", err)
+		return nil
+	}
+
+	ctx.SaveRollbackUndo(convID, deleted)
+
+	color.Green("  ✓ 已撤回 %d 条消息 (输入 /undo 撤销)", len(deleted))
+	return nil
+}
+
+// cmdUndo restores the messages that were deleted by the most recent
+// /rollback command.
+func cmdUndo(ctx cliContext, args string) error {
+	convID := ctx.GetCurrentSessionID()
+	if convID == "" {
+		color.Yellow("  当前无活跃会话")
+		return nil
+	}
+
+	undoMsgs := ctx.GetRollbackUndo(convID)
+	if len(undoMsgs) == 0 {
+		color.Yellow("  没有可撤销的撤回")
+		return nil
+	}
+
+	if err := ctx.UndoRollback(context.Background(), convID, undoMsgs); err != nil {
+		color.Red("  ✗ 撤销失败: %v", err)
+		return nil
+	}
+
+	ctx.ClearRollbackUndo(convID)
+	color.Green("  ✓ 已恢复 %d 条消息", len(undoMsgs))
+	return nil
+}
+
+func cmdFork(ctx cliContext, args string) error {
+	curID := ctx.GetCurrentSessionID()
+	if curID == "" {
+		color.Yellow("  当前无活跃会话")
+		return nil
+	}
+
+	msgs, err := ctx.GetCurrentSessionMessages(context.Background())
+	if err != nil {
+		color.Red("  ✗ 获取消息失败: %v", err)
+		return nil
+	}
+	if len(msgs) == 0 {
+		color.HiBlack("  当前会话没有消息可分支")
+		return nil
+	}
+
+	var targetID int64
+	var targetIdx int
+	args = strings.TrimSpace(args)
+
+	if args == "" {
+		fmt.Println("选择分支点（输入序号）：")
+		for i, m := range msgs {
+			role := "👤"
+			if m.Role == "assistant" {
+				role = "🤖"
+			}
+			preview := m.Content
+			if len(preview) > 60 {
+				preview = preview[:60] + "..."
+			}
+			fmt.Printf("  %2d  %s  %s\n", i+1, role, preview)
+		}
+		fmt.Print("序号> ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() {
+			color.HiBlack("  已取消")
+			return nil
+		}
+		idx, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
+		if err != nil || idx < 1 || idx > len(msgs) {
+			color.HiBlack("  无效序号")
+			return nil
+		}
+		targetID = msgs[idx-1].ID
+		targetIdx = idx - 1
+	} else {
+		n, err := strconv.Atoi(args)
+		if err != nil || n < 1 || n > len(msgs) {
+			color.HiBlack("  无效序号，有效范围 1-%d", len(msgs))
+			return nil
+		}
+		targetID = msgs[n-1].ID
+		targetIdx = n - 1
+	}
+
+	sess, err := ctx.ForkSession(context.Background(), curID, targetID)
+	if err != nil {
+		color.Red("  ✗ 创建分支失败: %v", err)
+		return nil
+	}
+
+	ctx.SetCurrentSession(sess.ID)
+	color.Green("  ✓ 已创建分支对话 %s（含 %d 条消息）", sess.ID[:16], targetIdx+1)
+	color.Cyan("    标题: %s", sess.Title)
 	return nil
 }
 

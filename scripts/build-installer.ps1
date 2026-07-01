@@ -16,12 +16,12 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
-# Read version from wails.json (same source as Vite's __APP_VERSION__).
-$wailsJson = Join-Path $root "cmd\pchat-gui\wails.json"
+# Read version from VERSION file (single source of truth).
+$versionFile = Join-Path $root "VERSION"
 $version  = "0.1.0"
-if (Test-Path -LiteralPath $wailsJson) {
-    $json = Get-Content -LiteralPath $wailsJson -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($json.info.productVersion) { $version = $json.info.productVersion }
+if (Test-Path -LiteralPath $versionFile) {
+    $v = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+    if ($v) { $version = $v }
 }
 
 $exeName = "pchat-setup-v$version.exe"

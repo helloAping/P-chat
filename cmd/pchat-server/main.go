@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
@@ -21,7 +22,9 @@ import (
 	"github.com/p-chat/pchat/internal/server"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/version"
 )
 
 //go:embed all:web
@@ -92,6 +95,54 @@ func runServer(cmd *cobra.Command, args []string) error {
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
 
+	// Build the sub-agent catalog. Three sources, in priority
+	// order (last wins):
+	//   1. Built-in agents: general-purpose, explore, plan
+	//   2. User-defined agents in ~/.p-chat/agent/*.md
+	//   3. Per-project agents in <project>/.p-chat/agent/*.md
+	// (Project wins over user wins over built-in on name
+	// collision — mirrors the config layering rule.)
+	subagentReg := subagent.NewRegistry()
+	subagentReg.RegisterAll(subagent.Builtins())
+	if userAgents, err := subagent.LoadFromDir(filepath.Join(paths.GlobalDir(), "agent")); err != nil {
+		log.Printf("[subagent] load user agents: %v", err)
+	} else {
+		subagentReg.RegisterAll(userAgents)
+	}
+	// Per-project agents: walk registered projects. For each
+	// project, load <root>/.p-chat/agent/*.md and overlay.
+	for _, proj := range loadProjectRoots(cfg) {
+		if proj == "" {
+			continue
+		}
+		dir := filepath.Join(proj, ".p-chat", "agent")
+		if pa, err := subagent.LoadFromDir(dir); err != nil {
+			log.Printf("[subagent] load project %s agents: %v", proj, err)
+		} else if len(pa) > 0 {
+			subagentReg.RegisterAll(pa)
+		}
+	}
+	log.Printf("[subagent] registered %d agent(s): %v", len(subagentReg.List()), agentNames(subagentReg))
+
+	// Build the sub-agent runner. The CLI registers a parallel
+	// runner, but the server is the canonical path. Wiring
+	// happens here so the `task` tool is live for every
+	// session from the first turn.
+	runner := &subagent.Default{
+		Cfg:            cfg,
+		LLM:            llmClient,
+		StyleMgr:       styleMgr,
+		ParentTools:    toolReg,
+		ParentStyle:    style.Style(currentStyleName(cfg)),
+		ParentProvider: defaultProviderName(cfg),
+		Registry:       subagentReg,
+		Cache:          subagent.NewCache(cfg.SubAgent.CacheTTLDuration()),
+	}
+	tt, hh := runner.Tool()
+	toolReg.Register(tt, hh)
+	log.Printf("[subagent] task tool registered (timeout=%s cache_ttl=%s)",
+		cfg.SubAgent.TimeoutDuration(), cfg.SubAgent.CacheTTLDuration())
+
 	mcpMgr := mcp.NewManager(toolReg)
 	mcpMgr.SetGlobalEnabled(cfg.MCP.Enabled)
 	for _, srvCfg := range cfg.MCP.Servers {
@@ -115,6 +166,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	agt := agent.New(cfg, llmClient, styleMgr, memStore, toolReg)
+	// Expose the sub-agent catalog to the agent's tool
+	// dispatcher so the `task` tool can resolve
+	// subagent_type at call time. The adapter is a thin
+	// shim that hides the subagent package's full AgentInfo
+	// (which has UI / source fields the tool doesn't need)
+	// behind the agent package's smaller SubagentInfo view.
+	agt.SetSubagentRegistry(subagent.SubagentRegistryAdapter{R: subagentReg})
 
 	sbx, err := sandbox.New(cfg.Sandbox)
 	if err != nil {
@@ -153,7 +211,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, port)
 	fmt.Printf("P-Chat Server 启动于 http://%s\n", addr)
-	log.Printf("pchat-server version=dev-20260630 question-tracing=enabled")
+	log.Printf("pchat-server version=%s question-tracing=enabled", version.FullString())
 	return srv.RunAt(addr)
 }
 
@@ -178,4 +236,94 @@ func configToMCP(cfg config.MCPServerConfig) mcp.ServerConfig {
 		Enabled: cfg.Enabled,
 		Timeout: timeout,
 	}
+}
+
+// loadProjectRoots returns the absolute paths of every project
+// registered in the user's config, or an empty slice if no
+// projects are registered. Used at startup to overlay
+// per-project sub-agent definitions on top of the global
+// agents.
+//
+// The implementation is intentionally lightweight — it just
+// reads ~/.p-chat/projects.json (the same file the projects API
+// serves). We don't pull in the full project package because
+// main.go is the bootstrap path and we want it free of optional
+// failure modes.
+func loadProjectRoots(cfg *config.Config) []string {
+	pf := filepath.Join(paths.GlobalDir(), "projects.json")
+	data, err := os.ReadFile(pf)
+	if err != nil {
+		return nil
+	}
+	// Minimal parse: we only need the `path` field of each
+	// entry. The project package's full Project struct is
+	// more than we need here.
+	var entries []struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Printf("[subagent] parse projects.json: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Path != "" {
+			out = append(out, e.Path)
+		}
+	}
+	return out
+}
+
+// agentNames returns the sorted names of all registered agents.
+// Used only for the startup log line.
+func agentNames(r *subagent.Registry) []string {
+	list := r.List()
+	out := make([]string, 0, len(list))
+	for _, a := range list {
+		out = append(out, a.Name)
+	}
+	return out
+}
+
+// currentStyleName returns the user's chosen style. Used as
+// the sub-agent runner's ParentStyle fallback (when the LLM
+// doesn't pass an explicit `style` arg to the `task` tool).
+//
+// Priority: PCHAT_STYLE env var → cfg.Style.Default → "tech"
+// (built-in absolute fallback). "tech" is the most neutral of
+// the three built-in styles and is the same value the config
+// loader uses as the out-of-the-box default.
+//
+// IMPORTANT: this must return a value that resolves to a
+// registered style. The earlier "default" fallback silently
+// broke every sub-agent call: the runner inherited it as
+// ParentStyle, the sub-agent's system prompt build then
+// errored with "unknown style: default", and the conversation
+// stopped mid-turn. See subagent_test.go for the regression
+// test that guards against this.
+func currentStyleName(cfg *config.Config) string {
+	if v := os.Getenv("PCHAT_STYLE"); v != "" {
+		return v
+	}
+	if cfg != nil && cfg.Style.Default != "" {
+		return cfg.Style.Default
+	}
+	return "tech"
+}
+
+// defaultProviderName returns the user's chosen LLM provider
+// (the `llm.default` config key, or the first configured
+// provider if unset). Used as the sub-agent's fallback
+// provider.
+func defaultProviderName(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	if cfg.LLM.Default != "" {
+		return cfg.LLM.Default
+	}
+	if len(cfg.LLM.Providers) > 0 {
+		return cfg.LLM.Providers[0].Name
+	}
+	return ""
 }

@@ -409,3 +409,84 @@ func TestStore_GetChatMessagesWithMetaPage(t *testing.T) {
 		t.Errorf("HasOlderMessages(cid, 3) should be true")
 	}
 }
+
+// ---- Migration tests ----
+
+func TestMigration_RunToLatest(t *testing.T) {
+	s := testStore(t)
+	cur, avail, err := s.AppliedMigrations()
+	if err != nil {
+		t.Fatalf("AppliedMigrations: %v", err)
+	}
+	if cur != avail {
+		t.Errorf("expected current (%d) == available (%d) after fresh open", cur, avail)
+	}
+}
+
+func TestMigration_RollbackThenUpgrade(t *testing.T) {
+	s := testStore(t)
+	_, avail, _ := s.AppliedMigrations()
+	if avail < 2 {
+		t.Skip("need at least 2 migrations")
+	}
+	// Rollback to version 1
+	if err := s.Rollback(1); err != nil {
+		t.Fatalf("Rollback(1): %v", err)
+	}
+	cur, _, _ := s.AppliedMigrations()
+	if cur != 1 {
+		t.Errorf("after rollback to 1, current=%d", cur)
+	}
+	// Migration should re-apply on next Migrate
+	if err := s.Migrate(); err != nil {
+		t.Fatalf("Migrate after rollback: %v", err)
+	}
+	cur, _, _ = s.AppliedMigrations()
+	if cur != avail {
+		t.Errorf("after re-migrate, expected current=%d got %d", avail, cur)
+	}
+}
+
+func TestMigration_Idempotent(t *testing.T) {
+	s := testStore(t)
+	// Run migrate twice — should be no-op
+	if err := s.Migrate(); err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+	cur1, _, _ := s.AppliedMigrations()
+	if err := s.Migrate(); err != nil {
+		t.Fatalf("third Migrate: %v", err)
+	}
+	cur2, _, _ := s.AppliedMigrations()
+	if cur1 != cur2 {
+		t.Errorf("idempotent fails: cur1=%d cur2=%d", cur1, cur2)
+	}
+}
+
+func TestMigration_Bootstrap(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "bootstrap.db")
+
+	// 1. Create a blank database and apply all migrations.
+	s1, err := OpenAt(dbPath, 50)
+	if err != nil {
+		t.Fatalf("OpenAt #1: %v", err)
+	}
+	s1.Close()
+
+	// 2. Re-open (which calls migrate via OpenAt). This tests the
+	//    idempotent path: schema_migrations already exists, all
+	//    rows are already there, zero work should be done.
+	s2, err := OpenAt(dbPath, 50)
+	if err != nil {
+		t.Fatalf("OpenAt #2: %v", err)
+	}
+	defer s2.Close()
+	cur, avail, err := s2.AppliedMigrations()
+	if err != nil {
+		t.Fatalf("AppliedMigrations: %v", err)
+	}
+	if cur != avail {
+		t.Errorf("on reopen: current=%d available=%d", cur, avail)
+	}
+}

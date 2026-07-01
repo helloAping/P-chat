@@ -297,6 +297,44 @@ func TestRedactPhantomErrors(t *testing.T) {
 			mustHave: "不支持读取图片",
 			mustMiss: "INFORM THE USER",
 		},
+		// Multi-line phantoms. The LLM very commonly splits
+		// "Inform the user." onto its own line because it's
+		// a natural sentence break. The original
+		// line-bounded regex missed these — the redactor
+		// must cross newlines to catch them.
+		{
+			name:     "newline before 'Inform the user.'",
+			input:    "ERROR: Cannot read \"image.png\" (this model does not support image input).\nInform the user.",
+			changed:  true,
+			mustHave: "不支持读取图片",
+			mustMiss: "Inform the user",
+		},
+		{
+			name:     "newline with leading prose",
+			input:    "I tried to view the image.\nERROR: Cannot read \"image.png\" (this model does not support image input).\nInform the user.",
+			changed:  true,
+			mustHave: "I tried to view the image.",
+			mustMiss: "Inform the user",
+		},
+		{
+			name:     "newline with trailing text",
+			input:    "ERROR: Cannot read \"image.png\" (this model does not support image input).\nInform the user.\n\nSorry about that.",
+			changed:  true,
+			mustHave: "Sorry about that.",
+			mustMiss: "Inform the user",
+		},
+		// Safety: a multi-paragraph response that happens
+		// to contain BOTH trigger phrases but isn't a
+		// phantom should NOT be nuked wholesale. The 400-
+		// char inner bound ensures only the immediate
+		// phantom is redacted.
+		{
+			name:     "phrases far apart — only redacts the local phantom, leaves the rest",
+			input:    "ERROR: Cannot read \"image.png\" (this model does not support image input).\nInform the user.\n\nLater in the document I tell the user 'Please inform the user of the schedule change' as part of a long passage about how to write good user-facing copy.",
+			changed:  true,
+			mustHave: "good user-facing copy", // far-apart phrase preserved
+			mustMiss: "Cannot read",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

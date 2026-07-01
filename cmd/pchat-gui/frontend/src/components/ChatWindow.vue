@@ -5,7 +5,7 @@ import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
 import QuestionPanel from './QuestionPanel.vue'
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession } from '../stores/chat'
 import * as api from '../api/client'
 
 const messagesEl = ref<HTMLElement | null>(null)
@@ -91,6 +91,30 @@ async function onOpenTerminal() {
   if (!state.activeProjectPath) return
   try { await api.openTerminal(state.activeProjectPath) } catch { /* ignore */ }
 }
+
+function handleRollback(index: number) {
+  if (!state.currentID) return
+  rollbackTo(state.currentID, index)
+}
+
+async function handleFork(index: number) {
+  if (!state.currentID) return
+  // Fork at the assistant reply that follows the user message so
+  // the forked conversation ends with a complete exchange instead
+  // of a dangling user message.
+  const msgs = state.sessionMessages[state.currentID]
+  const asstIdx = index + 1
+  const targetIdx = (msgs && asstIdx < msgs.length && msgs[asstIdx].role === 'assistant')
+    ? asstIdx : index
+  message.info('正在创建分支对话...')
+  try {
+    await forkSession(state.currentID, targetIdx)
+    message.success('已创建分支对话')
+  } catch (e) {
+    console.error('fork failed:', e)
+    message.error('创建分支对话失败')
+  }
+}
 </script>
 
 <template>
@@ -120,6 +144,8 @@ async function onOpenTerminal() {
           :key="i"
           :message="m"
           :streaming="isStreaming && i === currentMessages.length - 1 && m.role === 'assistant'"
+          @rollback="handleRollback(i)"
+          @fork="handleFork(i)"
         />
       </div>
     </NScrollbar>

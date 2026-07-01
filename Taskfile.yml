@@ -2,6 +2,10 @@ version: '3'
 
 vars:
   GOPROXY: 'https://goproxy.cn,direct'
+  VERSION:
+    sh: powershell -NoProfile -Command "(Get-Content VERSION -Raw).Trim()"
+  GIT_COMMIT:
+    sh: powershell -NoProfile -Command "try { (git rev-parse --short HEAD).Trim() } catch { '' }"
 
 tasks:
   build:frontend:
@@ -41,8 +45,8 @@ tasks:
     desc: 编译 CLI 和 Server（前端由 build:gui:npm 统一调度）
     deps: [build:frontend]
     cmds:
-      - go build -o bin/pchat.exe ./cmd/pchat
-      - go build -o bin/pchat-server.exe ./cmd/pchat-server
+      - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat.exe ./cmd/pchat
+      - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server.exe ./cmd/pchat-server
     silent: false
 
   build:gui:
@@ -50,7 +54,7 @@ tasks:
     deps: [build:frontend]
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -platform windows/amd64 -s
+      - cmd: wails build -platform windows/amd64 -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -62,7 +66,7 @@ tasks:
     deps: [build:frontend]
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -platform linux/amd64 -s
+      - cmd: wails build -platform linux/amd64 -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -71,7 +75,7 @@ tasks:
   build:server:linux:
     desc: 交叉编译 Linux Server 二进制
     cmds:
-      - cmd: go build -o bin/pchat-server-linux ./cmd/pchat-server
+      - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-linux ./cmd/pchat-server
         env:
           GOOS: linux
           GOARCH: amd64

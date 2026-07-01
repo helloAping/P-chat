@@ -54,6 +54,7 @@ type Summary struct {
 // Store is the central accessor for the SQLite-backed memory database.
 type Store struct {
 	db         *sql.DB
+	dbPath     string // filesystem path, set by OpenAt (empty for in-memory)
 	mu         sync.Mutex
 	currentID  string
 	maxHistory int
@@ -87,14 +88,18 @@ func OpenAt(dbPath string, maxHistory int) (*Store, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	db.SetMaxOpenConns(1) // sqlite is single-writer; serialize to avoid lock errors
+	// WAL mode supports concurrent readers + single writer.
+	// A pool size of 4 allows concurrent reads while avoiding
+	// contention on the single-writer lock.
+	db.SetMaxOpenConns(4)
 
 	s := &Store{
 		db:            db,
+		dbPath:        dbPath,
 		maxHistory:    maxHistory,
 		maxPending:    20,
 		flushInterval: 2 * time.Second,
@@ -147,65 +152,7 @@ func ensureDir() error {
 }
 
 func (s *Store) migrate() error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS conversations (
-			id          TEXT PRIMARY KEY,
-			title       TEXT,
-			created_at  INTEGER NOT NULL,
-			updated_at  INTEGER NOT NULL,
-			metadata    TEXT
-		)`,
-		`CREATE TABLE IF NOT EXISTS messages (
-			id              INTEGER PRIMARY KEY AUTOINCREMENT,
-			conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-			role            TEXT NOT NULL,
-			content         TEXT NOT NULL,
-			tokens          INTEGER NOT NULL DEFAULT 0,
-			created_at      INTEGER NOT NULL,
-			metadata        TEXT
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id)`,
-		`CREATE TABLE IF NOT EXISTS summaries (
-			conversation_id TEXT NOT NULL,
-			range_start      INTEGER NOT NULL,
-			range_end        INTEGER NOT NULL,
-			summary          TEXT NOT NULL,
-			created_at       INTEGER NOT NULL,
-			PRIMARY KEY (conversation_id, range_start)
-		)`,
-		`CREATE TABLE IF NOT EXISTS chunks (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			source      TEXT NOT NULL,
-			content     TEXT NOT NULL,
-			metadata    TEXT,
-			created_at  INTEGER NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source)`,
-		`CREATE TABLE IF NOT EXISTS embeddings (
-			chunk_id   INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
-			model      TEXT NOT NULL,
-			vector     BLOB NOT NULL,
-			dim        INTEGER NOT NULL,
-			created_at INTEGER NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS todo_items (
-			session_id TEXT NOT NULL,
-			item_id    TEXT NOT NULL,
-			content    TEXT NOT NULL,
-			status     TEXT NOT NULL DEFAULT 'pending',
-			sort_order INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (session_id, item_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_todo_session ON todo_items(session_id)`,
-	}
-	for _, q := range stmts {
-		if _, err := s.db.Exec(q); err != nil {
-			return fmt.Errorf("exec %q: %w", q, err)
-		}
-	}
-	// Migration: add archived column to conversations (v2 schema).
-	s.db.Exec(`ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`)
-	return nil
+	return s.Migrate()
 }
 
 // migrateLegacy imports the old JSON file and renames it on success.
@@ -1103,6 +1050,208 @@ func (s *Store) ClearMessages(conversationID string) error {
 		return err
 	}
 	return nil
+}
+
+// ForkConversation copies all messages up to and including
+// beforeID from sourceConvID into a brand-new conversation.
+// The new title is "[Fork] " + source title. Returns the new
+// conversation.
+func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversation, error) {
+	_ = s.Flush()
+
+	src, err := s.GetConversation(sourceConvID)
+	if err != nil {
+		return nil, fmt.Errorf("fork: source conversation: %w", err)
+	}
+
+	newID := newConvID()
+	now := time.Now().Unix()
+	title := "[Fork] " + src.Title
+	if _, err := s.db.Exec(
+		`INSERT INTO conversations(id, title, created_at, updated_at, metadata) VALUES (?, ?, ?, ?, ?)`,
+		newID, title, now, now, src.Metadata,
+	); err != nil {
+		return nil, fmt.Errorf("fork: create conversation: %w", err)
+	}
+
+	// Read all messages into memory BEFORE starting a transaction.
+	// With SetMaxOpenConns(1) the single connection is held while
+	// rows is open; a tx.Begin() would deadlock waiting for it.
+	rows, err := s.db.Query(
+		`SELECT role, content, metadata, created_at FROM messages
+		 WHERE conversation_id = ? AND id <= ? ORDER BY id ASC`,
+		sourceConvID, beforeID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("fork: query messages: %w", err)
+	}
+
+	type row struct {
+		role, content, meta string
+		created             int64
+	}
+	var msgs []row
+	for rows.Next() {
+		var r row
+		var metaStr sql.NullString
+		if err := rows.Scan(&r.role, &r.content, &metaStr, &r.created); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if metaStr.Valid {
+			r.meta = metaStr.String
+		}
+		msgs = append(msgs, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	if len(msgs) == 0 {
+		s.db.Exec(`DELETE FROM conversations WHERE id = ?`, newID)
+		return nil, fmt.Errorf("fork: no messages to copy (before_id %d not found in session %s)", beforeID, sourceConvID)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	// Clean up the empty conversation on failure.
+	ok := false
+	defer func() {
+		if !ok {
+			tx.Rollback()
+			s.db.Exec(`DELETE FROM conversations WHERE id = ?`, newID)
+		}
+	}()
+
+	stmt, err := tx.Prepare(
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata) VALUES (?, ?, ?, ?, ?)`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	for _, r := range msgs {
+		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	ok = true
+
+	conv, err := s.GetConversation(newID)
+	if err != nil {
+		return nil, err
+	}
+	return &conv, nil
+}
+
+// GetLastUserMessageID returns the SQLite row id of the most
+// recently inserted user message for the given session. Returns
+// 0 when no user messages exist.
+func (s *Store) GetLastUserMessageID(convID string) int64 {
+	_ = s.Flush()
+	var id int64
+	_ = s.db.QueryRow(
+		`SELECT id FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1`,
+		convID,
+	).Scan(&id)
+	return id
+}
+
+// GetLastMessageID returns the highest SQLite row id for the given
+// session (the most recently inserted message of any role). Returns
+// 0 when the session has no messages.
+func (s *Store) GetLastMessageID(convID string) int64 {
+	_ = s.Flush()
+	var id int64
+	_ = s.db.QueryRow(
+		`SELECT id FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1`,
+		convID,
+	).Scan(&id)
+	return id
+}
+
+// DeleteMessagesFrom deletes all messages with id >= fromID in the
+// given conversation and returns the deleted messages so the caller
+// can undo the operation with RestoreMessages.
+func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Message, error) {
+	_ = s.Flush()
+
+	// Snapshot the rows before deleting.
+	rows, err := s.db.Query(
+		`SELECT id, conversation_id, role, content, tokens, created_at, metadata
+		 FROM messages WHERE conversation_id = ? AND id >= ? ORDER BY id`,
+		conversationID, fromID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deleted []Message
+	for rows.Next() {
+		var m Message
+		var created int64
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata); err != nil {
+			return deleted, err
+		}
+		m.CreatedAt = time.Unix(created, 0)
+		deleted = append(deleted, m)
+	}
+	if err := rows.Err(); err != nil {
+		return deleted, err
+	}
+
+	if len(deleted) == 0 {
+		return nil, nil
+	}
+
+	if _, err := s.db.Exec(
+		`DELETE FROM messages WHERE conversation_id = ? AND id >= ?`,
+		conversationID, fromID,
+	); err != nil {
+		return nil, err
+	}
+	return deleted, nil
+}
+
+// RestoreMessages inserts previously-deleted messages back into the
+// messages table with their original ids. This is the inverse of
+// DeleteMessagesFrom. Callers should only restore messages that were
+// previously returned by DeleteMessagesFrom.
+func (s *Store) RestoreMessages(messages []Message) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(
+		`INSERT OR REPLACE INTO messages(id, conversation_id, role, content, tokens, created_at, metadata)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, m := range messages {
+		if _, err := stmt.Exec(m.ID, m.ConversationID, m.Role, m.Content, m.Tokens, m.CreatedAt.Unix(), m.Metadata); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // SaveSummary records a compressed summary for a range of messages in a
