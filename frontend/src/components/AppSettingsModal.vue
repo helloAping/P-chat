@@ -702,7 +702,8 @@ const showAddRepo = ref(false)
 const newRepoName = ref('')
 const newRepoUrl = ref('')
 const activeRepoUrl = ref('')
-const skillFilter = ref('')
+const repoSkillFilter = ref('')
+const installedSkillFilter = ref('')
 
 const builtInRepos = [
   { name: 'Anthropic 官方技能', url: 'https://github.com/anthropics/skills' },
@@ -747,7 +748,7 @@ async function onRemoveRepo(url: string) {
 }
 
 const filteredSkills = computed(() => {
-  const q = skillFilter.value.trim().toLowerCase()
+  const q = installedSkillFilter.value.trim().toLowerCase()
   if (!q) return loadedSkills.value
   return loadedSkills.value.filter(s =>
     s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q),
@@ -755,7 +756,7 @@ const filteredSkills = computed(() => {
 })
 
 const filteredSearchResults = computed(() => {
-  const q = skillFilter.value.trim().toLowerCase()
+  const q = repoSkillFilter.value.trim().toLowerCase()
   if (!q) return searchResults.value
   return searchResults.value.filter(s =>
     s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q),
@@ -1311,57 +1312,74 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
         </div>
       </NTabPane>
 
-      <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; overflow: auto">
-        <!-- Built-in repos -->
-        <div class="skill-repos">
-          <span class="skill-hint">官方仓库</span>
+      <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; display: flex; flex-direction: column">
+        <!-- Repo chips (top bar) -->
+        <div class="skill-repos-bar">
+          <span class="skill-hint" style="white-space:nowrap">官方仓库</span>
           <div class="repo-chips">
-            <NButton v-for="r in builtInRepos" :key="r.url" size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'" @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+            <NButton v-for="r in builtInRepos" :key="r.url" size="tiny"
+              :type="activeRepoUrl === r.url ? 'primary' : 'default'"
+              @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
           </div>
-        </div>
-        <!-- Saved repos -->
-        <div v-if="savedRepos.length" class="skill-repos" style="margin-top:12px">
-          <div class="skill-repos-header">
-            <span class="skill-hint">我的仓库</span>
-            <NButton size="tiny" quaternary @click="showAddRepo = true">+ 添加</NButton>
-          </div>
-          <div class="repo-chips">
+          <span v-if="savedRepos.length" class="skill-hint" style="margin-left:8px">我的</span>
+          <div v-if="savedRepos.length" class="repo-chips">
             <template v-for="r in savedRepos" :key="r.url">
-              <NButton size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'" @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
-              <NButton size="tiny" quaternary @click="onRemoveRepo(r.url)" style="color:var(--warn);font-size:10px">×</NButton>
+              <NButton size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'"
+                @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+              <NButton size="tiny" quaternary @click="onRemoveRepo(r.url)"
+                style="color:var(--warn);font-size:10px;min-width:16px;padding:0 2px">×</NButton>
             </template>
           </div>
-        </div>
-        <div v-if="!savedRepos.length" class="skill-repos" style="margin-top:8px">
-          <span class="skill-hint" style="color:var(--text-4)">我的仓库（暂无）</span>
-          <NButton size="tiny" quaternary @click="showAddRepo = true" style="margin-left:4px">+ 添加</NButton>
-        </div>
-        <div class="skill-divider" />
-        <!-- Filter & search -->
-        <div class="skill-search">
-          <NInput v-model:value="skillFilter" placeholder="搜索/筛选技能..." size="small" clearable style="flex:1" />
-        </div>
-        <!-- Search results from remote repo -->
-        <div v-if="searchResults.length" class="skill-search-results">
-          <div class="skill-section-title">仓库技能（{{ filteredSearchResults.length }}）</div>
-          <div v-for="r in filteredSearchResults" :key="r.name" class="skill-search-row">
-            <div class="skill-search-info">
-              <span class="skill-search-name">{{ r.name }}</span>
-              <span class="skill-search-desc">{{ r.description }}</span>
-            </div>
-            <NButton size="tiny" type="primary" :loading="installing === r.name" @click="onInstallSkill(r.name, r.url)">安装</NButton>
-          </div>
+          <NButton size="tiny" quaternary @click="showAddRepo = true" style="margin-left:2px">+添加</NButton>
+          <span v-if="searching" style="font-size:11px;color:var(--text-4);margin-left:8px">加载中…</span>
         </div>
 
-        <!-- Loaded skills -->
-        <div class="skill-section-title" style="margin-top:12px">已加载（{{ filteredSkills.length }}）</div>
-        <div v-if="!filteredSkills.length" class="empty-hint" style="padding:12px">暂无匹配技能</div>
-        <div v-for="s in filteredSkills" :key="s.name" class="skill-row">
-          <div class="skill-info">
-            <span class="skill-name">{{ s.name }}</span>
-            <span class="skill-desc">{{ s.description }}</span>
+        <!-- Two-column body -->
+        <div class="skill-columns">
+          <!-- Left: repo search results -->
+          <div class="skill-col skill-col-left">
+            <div class="skill-col-header">
+              <span class="skill-section-title">仓库技能</span>
+              <NInput v-model:value="repoSkillFilter" placeholder="筛选…" size="tiny" clearable style="width:130px" />
+            </div>
+            <div class="skill-col-body">
+              <div v-if="!activeRepoUrl" class="empty-hint">选择上方仓库查看可安装的技能</div>
+              <div v-else-if="searching" class="empty-hint">正在加载…</div>
+              <div v-else-if="!filteredSearchResults.length" class="empty-hint">
+                {{ searchResults.length ? '无匹配' : '该仓库无可安装技能' }}
+              </div>
+              <template v-else>
+                <div v-for="r in filteredSearchResults" :key="r.name" class="skill-result-row">
+                  <div class="skill-result-info">
+                    <span class="skill-result-name">{{ r.name }}</span>
+                    <span class="skill-result-desc">{{ r.description }}</span>
+                  </div>
+                  <NButton size="tiny" type="primary" :loading="installing === r.name"
+                    @click="onInstallSkill(r.name, r.url)">安装</NButton>
+                </div>
+              </template>
+            </div>
           </div>
-          <NButton size="tiny" quaternary @click="onDeleteSkill(s.name)" style="color:var(--warn)">删除</NButton>
+
+          <!-- Right: installed skills -->
+          <div class="skill-col skill-col-right">
+            <div class="skill-col-header">
+              <span class="skill-section-title">已安装（{{ loadedSkills.length }}）</span>
+              <NInput v-model:value="installedSkillFilter" placeholder="筛选…" size="tiny" clearable style="width:130px" />
+            </div>
+            <div class="skill-col-body">
+              <div v-if="!filteredSkills.length" class="empty-hint">{{ installedSkillFilter ? '无匹配' : '暂无已安装技能' }}</div>
+              <template v-else>
+                <div v-for="s in filteredSkills" :key="s.name" class="skill-result-row">
+                  <div class="skill-result-info">
+                    <span class="skill-result-name">{{ s.name }}</span>
+                    <span class="skill-result-desc">{{ s.description }}</span>
+                  </div>
+                  <NButton size="tiny" quaternary @click="onDeleteSkill(s.name)" style="color:var(--warn)">删除</NButton>
+                </div>
+              </template>
+            </div>
+          </div>
         </div>
       </NTabPane>
 
@@ -1729,31 +1747,49 @@ code {
 .confirm-body { padding: 8px 0; }
 .confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.skill-repos-bar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-2);
+  flex-shrink: 0;
+}
+.repo-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.skill-columns {
+  flex: 1; min-height: 0;
+  display: flex; gap: 0;
+  margin-top: 8px;
+}
+.skill-col {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column;
+}
+.skill-col-left { border-right: 1px solid var(--border-2); padding-right: 12px; }
+.skill-col-right { padding-left: 12px; }
+.skill-col-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 6px; gap: 8px; flex-shrink: 0;
+}
+.skill-col-body {
+  flex: 1 1 auto; min-height: 0;
+  max-height: calc(80vh - 220px);
+  overflow-y: auto;
+}
+.skill-section-title { font-size: 12px; color: var(--text-3); white-space: nowrap; }
+.skill-hint { font-size: 12px; color: var(--text-3); }
+.skill-result-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px; border-radius: 4px;
+}
+.skill-result-row:hover { background: var(--bg-3); }
+.skill-result-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.skill-result-name { font-size: 12.5px; font-weight: 500; }
+.skill-result-desc {
+  font-size: 11px; color: var(--text-4);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .skill-search { display: flex; gap: 8px; margin-bottom: 12px; }
-.skill-repos { margin-bottom: 4px; }
-.skill-repos-header { display: flex; justify-content: space-between; align-items: center; }
-.repo-chips { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
-.repo-chip-row { display: inline-flex; align-items: center; }
 .skill-search-results { margin-bottom: 12px; }
-.skill-search-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 8px; border-radius: 6px;
-}
-.skill-search-row:hover { background: var(--bg-3); }
-.skill-search-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.skill-search-name { font-size: 13px; font-weight: 500; }
-.skill-search-desc { font-size: 11px; color: var(--text-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .skill-divider { border-top: 1px solid var(--border-2); margin: 12px 0; }
-.skill-hint { font-size: 12px; color: var(--text-3); margin-bottom: 8px; }
-.skill-section-title { font-size: 12px; color: var(--text-3); margin-bottom: 6px; }
-.skill-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 8px; border-radius: 6px;
-}
-.skill-row:hover { background: var(--bg-3); }
-.skill-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.skill-name { font-size: 13px; font-weight: 500; }
-.skill-desc { font-size: 11px; color: var(--text-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .upstream-error { color: var(--warn); padding: 8px 0; }
 .upstream-hint { font-size: 13px; color: var(--text-3); margin: 0 0 12px; }
 .upstream-list { max-height: 400px; overflow: auto; }

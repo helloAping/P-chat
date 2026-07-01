@@ -788,6 +788,36 @@ func (h *Handler) ListSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"sessions": out})
 }
 
+func (h *Handler) SearchMessages(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	q := c.Query("q")
+	if q == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "query parameter 'q' is required"})
+		return
+	}
+	limit := parseIntQuery(c, "limit", 20)
+	results := h.store.SearchMessages(q, limit)
+	if results == nil {
+		results = []memory.SearchResult{}
+	}
+	c.JSON(http.StatusOK, gin.H{"results": results})
+}
+
+func (h *Handler) TokenStats(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	stats := h.store.TokenStats()
+	if stats == nil {
+		stats = []memory.ConversationTokenStats{}
+	}
+	c.JSON(http.StatusOK, gin.H{"stats": stats})
+}
+
 func (h *Handler) CreateSession(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
@@ -1989,6 +2019,50 @@ func (h *Handler) ConfirmResponse(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ExecutePlan saves a user-reviewed plan as an assistant message
+// and clears plan mode so the next user message triggers actual
+// execution. The frontend should follow up by sending a normal
+// message (e.g. "请按计划执行") via the streaming endpoint.
+// POST /api/v1/sessions/:id/execute-plan
+func (h *Handler) ExecutePlan(c *gin.Context) {
+	id := c.Param("id")
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	var body struct {
+		PlanText string `json:"plan_text"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.PlanText == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "plan_text is required"})
+		return
+	}
+	if _, err := h.store.GetConversation(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	h.store.AddChatMessageTo(id, llm.ChatMessage{
+		Role:    llm.RoleAssistant,
+		Type:    llm.TypeText,
+		Content: body.PlanText,
+	})
+	h.store.Flush()
+
+	// Turn off plan mode for this session.
+	h.metaMu.Lock()
+	m := h.meta[id]
+	m.PlanMode = false
+	h.meta[id] = m
+	h.metaMu.Unlock()
+	if h.store != nil {
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: false, PermissionLevel: m.PermissionLevel})
+		_ = h.store.UpdateConversationMeta(id, string(blob))
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id})
 }
 
 // --- Project CRUD ---

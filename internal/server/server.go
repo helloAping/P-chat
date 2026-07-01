@@ -117,6 +117,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 
 		// Sessions
 		api.GET("/sessions", h.ListSessions)
+		api.GET("/search", h.SearchMessages)
+		api.GET("/token-stats", h.TokenStats)
 		api.POST("/sessions", h.CreateSession)
 		api.GET("/sessions/:id", h.GetSession)
 		// PATCH /sessions/:id handles both "rename only" (legacy
@@ -135,6 +137,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/sessions/:id/todos", h.GetTodos)
 		api.POST("/sessions/:id/question-response", h.QuestionResponse)
 		api.POST("/sessions/:id/confirm-response", h.ConfirmResponse)
+		api.POST("/sessions/:id/execute-plan", h.ExecutePlan)
 
 		// Archive
 		api.POST("/sessions/:id/archive", h.ArchiveSession)

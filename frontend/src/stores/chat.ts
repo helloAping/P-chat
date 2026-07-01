@@ -76,6 +76,7 @@ export const state = reactive({
   // flag had to go.
   pendingQuestion: {} as Record<string, { questions: QuestionItem[]; resolve: (answers: Record<string, string>) => void }>,
   pendingConfirm: {} as Record<string, { toolName: string; args: string; reason: string; resolve: (approved: boolean) => void }>,
+  pendingPlanText: {} as Record<string, string>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
   projects: [] as ProjectItem[],
@@ -1083,6 +1084,15 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // 提示音 + 系统通知：对话完成
       notifyManager.play('done')
       if (!sub) notifyManager.notify('P-Chat', '对话已完成')
+
+      // Plan mode: when the stream ends in plan mode, capture
+      // the plan text for review before execution.
+      if (!sub && state.sessionMeta[id]?.plan_mode) {
+        const planText = assembleTextContent(m.parts)
+        if (planText) {
+          state.pendingPlanText[id] = planText
+        }
+      }
       break
     case 'question':
       // LLM is asking the user a question. Parse the
@@ -1180,6 +1190,23 @@ function walkParts(parts: MessagePart[], fn: (p: MessagePart) => void) {
     fn(p)
     if (p.kind === 'sub_agent') walkParts(p.parts, fn)
   }
+}
+
+function assembleTextContent(parts: MessagePart[] | undefined): string {
+  if (!parts) return ''
+  let out = ''
+  walkParts(parts, p => {
+    if (p.kind === 'text') out += p.text
+  })
+  return out
+}
+
+export function clearPendingPlan(id: string) {
+  delete state.pendingPlanText[id]
+}
+
+export function getPendingPlanText(id: string): string {
+  return state.pendingPlanText[id] || ''
 }
 
 // appendSystemMessage pushes a UI-only "system" message bubble

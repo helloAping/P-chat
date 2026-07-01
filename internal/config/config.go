@@ -186,6 +186,13 @@ type ModelConfig struct {
 	// Capabilities carries per-model hints (vision/audio/thinking).
 	// Optional; providers may also discover these at runtime.
 	Capabilities Capabilities `json:"capabilities,omitempty"`
+
+	// PricePer1KInput is the cost in USD per 1000 input tokens.
+	// Used for cost estimation in the token dashboard. Zero means unknown.
+	PricePer1KInput float64 `json:"price_per_1k_input,omitempty"`
+
+	// PricePer1KOutput is the cost in USD per 1000 output tokens.
+	PricePer1KOutput float64 `json:"price_per_1k_output,omitempty"`
 }
 
 // GetProtocol returns the protocol, falling back to Type, then "openai".
