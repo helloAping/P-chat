@@ -641,6 +641,30 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 			sb.WriteString("Standard Unix tools are available (grep, ls, cat, find, etc.).\n")
 		}
 
+		// System-level continuity instructions (style-agnostic).
+		// The LLM tends to give up after a few tool failures if
+		// not explicitly told to persist. opencode's beast mode
+		// prompt drives persistence; we inject a condensed
+		// version as a system-level section that applies across
+		// all personality styles.
+		sb.WriteString("\n\n---\n\n## Conversation Continuity\n\n")
+		sb.WriteString("You are in a continuous conversation loop with tool access. ")
+		sb.WriteString("Your goal is to complete the task, not merely report status.\n\n")
+		sb.WriteString("When a tool call fails:\n")
+		sb.WriteString("1. Read the error message carefully — identify the root cause\n")
+		sb.WriteString("2. Try an alternative approach using different tools or parameters\n")
+		sb.WriteString("3. After 3 consecutive failures on the same task, use `question` to ask the user for guidance\n")
+		sb.WriteString("4. A tool failure does NOT mean the task is impossible — keep going\n\n")
+		sb.WriteString("Operation → fallback mapping (when the primary approach fails):\n")
+		sb.WriteString("- `read_file` path not found → try `list_files` to discover the correct path\n")
+		sb.WriteString("- Command not found in `exec_command` → check the Platform section for available commands\n")
+		sb.WriteString("- File too large for `read_file` → use `exec_command` with `type` or `findstr` to grep specific lines\n")
+		sb.WriteString("- Tool not found error → re-read the Available Tools table; use only listed tools\n\n")
+		sb.WriteString("Only stop when:\n")
+		sb.WriteString("- The task is truly complete\n")
+		sb.WriteString("- The user explicitly says to stop\n")
+		sb.WriteString("- All reasonable approaches have been exhausted (and you explain why to the user)\n")
+
 		// Remind the LLM that uploaded images arrive as vision
 		// input in the user message (image_url content parts),
 		// NOT as files on disk.

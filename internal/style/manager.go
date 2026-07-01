@@ -1,14 +1,18 @@
 package style
 
 import (
+	"database/sql"
+	"embed"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
-
-	"github.com/p-chat/pchat/internal/paths"
+	"time"
 )
+
+//go:embed prompts/*.md
+var builtinFS embed.FS
 
 type Style string
 
@@ -18,15 +22,9 @@ const (
 	Tech    Style = "tech"
 )
 
-// SoulSection holds the two-part system prompt for a given style:
-//   - Identity: the program identity (P-Chat xxx AI 编程程序 ...)
-//   - Soul: the personality / character / voice configuration
-//   - Memory: 用户自定义的背景知识，动态注入到每轮对话上下文末尾，
-//     修改即生效、不破坏 LLM 静态缓存
-type SoulSection struct {
-	Identity string
-	Soul     string
-	Memory   string
+type Section struct {
+	Prompt string
+	Memory string
 }
 
 var styleLabels = map[Style]string{
@@ -41,7 +39,6 @@ var styleDisplayName = map[Style]string{
 	Tech:    "科技风",
 }
 
-// DisplayName returns the human-readable style name (e.g. "可爱风", "古风", "科技风").
 func (s Style) DisplayName() string {
 	if name, ok := styleDisplayName[s]; ok {
 		return name
@@ -50,130 +47,226 @@ func (s Style) DisplayName() string {
 }
 
 type Manager struct {
-	dir     string
-	sections map[Style]SoulSection
+	db *sql.DB
 }
 
-func NewManager(dir string) (*Manager, error) {
-	m := &Manager{
-		dir:      dir,
-		sections: make(map[Style]SoulSection),
-	}
+// NewManager opens the style database. On first run (empty styles table)
+// it seeds the three built-in styles and attempts to migrate user-defined
+// styles from the legacy prompts/ directory on disk.
+func NewManager(db *sql.DB) (*Manager, error) {
+	m := &Manager{db: db}
 
-	// If no custom dir, use default resolution
-	if dir == "" {
-		m.dir = m.resolvePromptDir()
+	count, err := m.count()
+	if err != nil {
+		return nil, fmt.Errorf("style: count: %w", err)
 	}
-
-	if err := m.loadAll(); err != nil {
-		return nil, err
+	if count == 0 {
+		if err := m.seed(); err != nil {
+			return nil, fmt.Errorf("style: seed: %w", err)
+		}
 	}
 	return m, nil
 }
 
-func (m *Manager) resolvePromptDir() string {
-	// Check project-level prompts first
+// count returns the number of rows in the styles table.
+func (m *Manager) count() (int, error) {
+	var n int
+	err := m.db.QueryRow(`SELECT COUNT(*) FROM styles`).Scan(&n)
+	return n, err
+}
+
+// seed populates the database on first run. Built-in styles are loaded
+// from the embedded FS; user-defined styles are imported from the legacy
+// prompts/ (v1 identity+soul or v2 style/) directory, then the directory
+// is renamed to .migrated-v1 so it never runs twice.
+func (m *Manager) seed() error {
+	// 1. Built-in styles from embedded FS.
+	entries, err := builtinFS.ReadDir("prompts")
+	if err != nil {
+		return fmt.Errorf("read embedded prompts: %w", err)
+	}
+	for _, e := range entries {
+		id := strings.TrimSuffix(e.Name(), ".md")
+		if id == "" {
+			continue
+		}
+		data, err := builtinFS.ReadFile("prompts/" + e.Name())
+		if err != nil {
+			return fmt.Errorf("read embedded %s: %w", e.Name(), err)
+		}
+		s := Style(id)
+		isBuiltin := s == Cute || s == Guofeng || s == Tech
+		label := styleLabels[s]
+		if label == "" {
+			label = id
+		}
+		if err := m.insert(id, label, string(data), "", isBuiltin); err != nil {
+			return fmt.Errorf("insert %s: %w", id, err)
+		}
+	}
+
+	// 2. Try importing user-defined styles from the legacy prompts/ dir.
+	promptDir := resolvePromptDir()
+	m.importLegacy(promptDir)
+
+	return nil
+}
+
+// resolvePromptDir returns the prompts directory path (used only during seed).
+func resolvePromptDir() string {
 	cwd, _ := os.Getwd()
 	projectPrompts := filepath.Join(cwd, "prompts")
 	if _, err := os.Stat(projectPrompts); err == nil {
 		return projectPrompts
 	}
-	// Fall back to global prompts
-	return paths.GlobalPromptsDir()
+	return filepath.Join(os.Getenv("USERPROFILE"), ".p-chat", "prompts")
 }
 
-// loadAll loads both identity and soul files for each style
-// (built-in + user-added). Directory layout:
-//
-//	<prompts>/
-//	  identity/{cute,guofeng,tech,...}.md
-//	  soul/{cute,guofeng,tech,...}.md
-func (m *Manager) loadAll() error {
-	all := m.ListAll()
-	// Drop any previously loaded user-added styles so deletions
-	// take effect on reload.
-	m.sections = make(map[Style]SoulSection, len(all))
-	for _, s := range all {
-		var sec SoulSection
+// importLegacy reads v1 (identity/+soul/) or v2 (style/) files and inserts
+// user-defined styles into the database. Built-in styles in the legacy dir
+// are skipped (already seeded from embedded FS). Only user-style files are
+// renamed to .v1.bak — the directory itself is left intact.
+func (m *Manager) importLegacy(dir string) {
+	imported := 0
 
-		identityPath := filepath.Join(m.dir, "identity", string(s)+".md")
-		if data, err := os.ReadFile(identityPath); err == nil {
-			sec.Identity = string(data)
-		}
-
-		soulPath := filepath.Join(m.dir, "soul", string(s)+".md")
-		if data, err := os.ReadFile(soulPath); err == nil {
-			sec.Soul = string(data)
-		}
-
-		memPath := filepath.Join(m.dir, "memory", string(s)+".md")
-		if data, err := os.ReadFile(memPath); err == nil {
-			sec.Memory = string(data)
-		}
-
-		// If neither file is present, fall back to built-in defaults
-		if sec.Identity == "" && sec.Soul == "" {
-			sec.Identity = defaultIdentity(s)
-			sec.Soul = defaultSoul(s)
-		} else {
-			// Fill in any missing half
-			if sec.Identity == "" {
-				sec.Identity = defaultIdentity(s)
+	// v2 layout first
+	styleDir := filepath.Join(dir, "style")
+	if entries, err := os.ReadDir(styleDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
 			}
-			if sec.Soul == "" {
-				sec.Soul = defaultSoul(s)
+			id := strings.TrimSuffix(e.Name(), ".md")
+			if id == "" {
+				continue
 			}
+			s := Style(id)
+			if s == Cute || s == Guofeng || s == Tech {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(styleDir, e.Name()))
+			if err != nil {
+				log.Printf("[style] import %s: read error: %v", id, err)
+				continue
+			}
+			label := readLabelFile(dir, id)
+			if err := m.insert(id, label, string(data), "", false); err != nil {
+				log.Printf("[style] import %s: insert error: %v", id, err)
+				continue
+			}
+			imported++
+			log.Printf("[style] imported %q from style/%s.md", id, id)
 		}
-
-		m.sections[s] = sec
 	}
-	return nil
+
+	// v1 layout: identity/ + soul/
+	idDir := filepath.Join(dir, "identity")
+	soDir := filepath.Join(dir, "soul")
+	if entries, err := os.ReadDir(idDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			id := strings.TrimSuffix(e.Name(), ".md")
+			if id == "" {
+				continue
+			}
+			s := Style(id)
+			if s == Cute || s == Guofeng || s == Tech {
+				continue
+			}
+			if m.exists(id) {
+				continue
+			}
+			var parts []string
+			if data, err := os.ReadFile(filepath.Join(idDir, id+".md")); err == nil {
+				parts = append(parts, string(data))
+			}
+			if data, err := os.ReadFile(filepath.Join(soDir, id+".md")); err == nil {
+				parts = append(parts, string(data))
+			}
+			if len(parts) == 0 {
+				continue
+			}
+			prompt := strings.Join(parts, "\n\n---\n\n")
+			label := readLabelFile(dir, id)
+			if err := m.insert(id, label, prompt, "", false); err != nil {
+				log.Printf("[style] import %s: insert error: %v", id, err)
+				continue
+			}
+			imported++
+			log.Printf("[style] imported %q from identity+soul", id)
+		}
+	}
+
+	if imported > 0 {
+		log.Printf("[style] seed: imported %d user-defined styles from %s", imported, dir)
+	}
 }
 
-// GetIdentity returns just the identity section ("当前是 P-Chat xxx AI 编程程序 ...").
-func (m *Manager) GetIdentity(s Style) (string, error) {
-	sec, ok := m.sections[s]
-	if !ok {
+func readLabelFile(dir, id string) string {
+	data, err := os.ReadFile(filepath.Join(dir, id+".label"))
+	if err != nil {
+		return id
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// exists checks whether a style is already in the database.
+func (m *Manager) exists(id string) bool {
+	var dummy int
+	err := m.db.QueryRow(`SELECT 1 FROM styles WHERE id=?`, id).Scan(&dummy)
+	return err == nil
+}
+
+// insert adds a single style row.
+func (m *Manager) insert(id, label, prompt, memory string, builtin bool) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := m.db.Exec(
+		`INSERT OR IGNORE INTO styles (id, label, prompt, memory, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id, label, prompt, memory, boolToInt(builtin), now, now,
+	)
+	return err
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// GetSystemPrompt returns the full style prompt.
+func (m *Manager) GetSystemPrompt(s Style) (string, error) {
+	var prompt string
+	err := m.db.QueryRow(`SELECT prompt FROM styles WHERE id=?`, string(s)).Scan(&prompt)
+	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("unknown style: %s", s)
 	}
-	return sec.Identity, nil
-}
-
-// GetSoul returns just the soul section (性格/说话风格/工具规范).
-func (m *Manager) GetSoul(s Style) (string, error) {
-	sec, ok := m.sections[s]
-	if !ok {
-		return "", fmt.Errorf("unknown style: %s", s)
-	}
-	return sec.Soul, nil
+	return prompt, err
 }
 
 // GetMemory returns the user-defined memory for a style.
-// 记忆内容从 prompts/memory/{id}.md 加载，独立于身份和灵魂，
-// 使用方负责决定是否注入到上下文中。
 func (m *Manager) GetMemory(s Style) (string, error) {
-	sec, ok := m.sections[s]
-	if !ok {
+	var memory string
+	err := m.db.QueryRow(`SELECT memory FROM styles WHERE id=?`, string(s)).Scan(&memory)
+	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("unknown style: %s", s)
 	}
-	return sec.Memory, nil
+	return memory, err
 }
 
-// GetSystemPrompt returns identity + soul joined, ready to be sent as
-// the first system-prompt section.
-func (m *Manager) GetSystemPrompt(s Style) (string, error) {
-	sec, ok := m.sections[s]
-	if !ok {
+// GetIdentity returns the full prompt (compat alias for GetSystemPrompt).
+func (m *Manager) GetIdentity(s Style) (string, error) {
+	return m.GetSystemPrompt(s)
+}
+
+// GetSoul returns empty (deprecated, kept for API compat).
+func (m *Manager) GetSoul(s Style) (string, error) {
+	if !m.exists(string(s)) {
 		return "", fmt.Errorf("unknown style: %s", s)
 	}
-	var parts []string
-	if sec.Identity != "" {
-		parts = append(parts, sec.Identity)
-	}
-	if sec.Soul != "" {
-		parts = append(parts, sec.Soul)
-	}
-	return strings.Join(parts, "\n\n---\n\n"), nil
+	return "", nil
 }
 
 func (m *Manager) Label(s Style) string {
@@ -184,78 +277,50 @@ func (m *Manager) List() []Style {
 	return []Style{Cute, Guofeng, Tech}
 }
 
-// ListAll returns every style known to the manager: the built-in
-// three (cute/guofeng/tech) plus any user-added styles found on
-// disk under <dir>/identity and <dir>/soul. The result is sorted
-// (built-ins first, then alphabetically) so the UI is stable.
+// ListAll returns all styles, built-in first then user-defined alphabetically.
 func (m *Manager) ListAll() []Style {
-	seen := map[Style]bool{}
-	for _, s := range m.List() {
-		seen[s] = true
+	rows, err := m.db.Query(`SELECT id, is_builtin FROM styles ORDER BY is_builtin DESC, id ASC`)
+	if err != nil {
+		return nil
 	}
-	// Scan the prompts dir for any extra identity files.
-	identityDir := filepath.Join(m.dir, "identity")
-	if entries, err := os.ReadDir(identityDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := strings.TrimSuffix(e.Name(), ".md")
-			if name == "" {
-				continue
-			}
-			s := Style(name)
-			if !seen[s] {
-				seen[s] = true
-			}
-		}
-	}
-	out := make([]Style, 0, len(seen))
-	for _, s := range m.List() {
-		if seen[s] {
-			out = append(out, s)
-		}
-	}
+	defer rows.Close()
+
+	out := []Style{}
 	extras := []Style{}
-	for s := range seen {
-		isBuiltin := false
-		for _, b := range m.List() {
-			if s == b {
-				isBuiltin = true
-				break
-			}
+	for rows.Next() {
+		var id string
+		var builtin int
+		if err := rows.Scan(&id, &builtin); err != nil {
+			continue
 		}
-		if !isBuiltin {
+		s := Style(id)
+		if builtin == 1 {
+			out = append(out, s)
+		} else {
 			extras = append(extras, s)
 		}
 	}
-	sort.Slice(extras, func(i, j int) bool { return extras[i] < extras[j] })
 	out = append(out, extras...)
+	if len(out) == 0 {
+		out = []Style{Cute, Guofeng, Tech}
+	}
 	return out
 }
 
-// DisplayLabel returns the human-readable label for a style, e.g.
-// "小P (PiPi)". Falls back to the raw id when not in the built-in
-// map (the user-added case where the label is stored in metadata).
+// DisplayLabel returns the human-readable label for a style.
 func (m *Manager) DisplayLabel(s Style) string {
 	if label, ok := styleLabels[s]; ok {
 		return label
 	}
-	// User-added style: try the metadata sidecar next to the prompt
-	// files, or fall back to the id.
-	metaPath := filepath.Join(m.dir, string(s)+".label")
-	if data, err := os.ReadFile(metaPath); err == nil {
-		return strings.TrimSpace(string(data))
+	var label string
+	if err := m.db.QueryRow(`SELECT label FROM styles WHERE id=?`, string(s)).Scan(&label); err == nil && label != "" {
+		return label
 	}
 	return string(s)
 }
 
-// Create adds a new user-defined style by writing the identity
-// and soul files. The id is normalised (lowercased, non-alpha
-// stripped) so it is safe to use as a filename and as a session
-// meta value. Returns an error if the id is empty, already taken,
-// or contains no letter (would yield a useless filename).
-func (m *Manager) Create(id, label, identity, soul, memory string) (Style, error) {
+// Create adds a new user-defined style.
+func (m *Manager) Create(id, label, prompt, memory string) (Style, error) {
 	id = normaliseStyleID(id)
 	if id == "" {
 		return "", fmt.Errorf("style id must contain at least one letter")
@@ -265,82 +330,53 @@ func (m *Manager) Create(id, label, identity, soul, memory string) (Style, error
 			return "", fmt.Errorf("style id %q is reserved (built-in)", id)
 		}
 	}
-	// Refuse to overwrite an existing style — user must DELETE
-	// first or PATCH the existing one.
-	if _, err := os.Stat(filepath.Join(m.dir, "identity", id+".md")); err == nil {
+	if m.exists(id) {
 		return "", fmt.Errorf("style %q already exists; delete it first", id)
 	}
-	if err := os.MkdirAll(filepath.Join(m.dir, "identity"), 0o755); err != nil {
-		return "", err
+	if prompt == "" {
+		prompt = fmt.Sprintf("# %s\n\n你是一个 AI 助手。", id)
 	}
-	if err := os.MkdirAll(filepath.Join(m.dir, "soul"), 0o755); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(filepath.Join(m.dir, "identity", id+".md"), []byte(identity), 0o644); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(filepath.Join(m.dir, "soul", id+".md"), []byte(soul), 0o644); err != nil {
-		return "", err
-	}
-	if label != "" {
-		_ = os.WriteFile(filepath.Join(m.dir, id+".label"), []byte(label), 0o644)
-	}
-	if memory != "" {
-		if err := os.MkdirAll(filepath.Join(m.dir, "memory"), 0o755); err != nil {
-			return "", err
-		}
-		_ = os.WriteFile(filepath.Join(m.dir, "memory", id+".md"), []byte(memory), 0o644)
-	}
-	// Reload the in-memory cache so the new style is immediately
-	// available to existing sessions.
-	if err := m.loadAll(); err != nil {
-		return "", err
+	if err := m.insert(id, label, prompt, memory, false); err != nil {
+		return "", fmt.Errorf("create style %q: %w", id, err)
 	}
 	return Style(id), nil
 }
 
-// Update overwrites the label / identity / soul / memory of an existing
-// style. Empty fields are skipped (caller can leave them off the
-// request body to keep the existing value).
-func (m *Manager) Update(id, label, identity, soul, memory string) error {
+// Update overwrites an existing style.
+func (m *Manager) Update(id, label, prompt, memory string) error {
 	id = normaliseStyleID(id)
 	if id == "" {
 		return fmt.Errorf("style id must contain at least one letter")
 	}
-	// Block edits to the three built-ins — they're a system
-	// contract. Users who want their own variant should
-	// create a new style and edit that instead.
 	for _, b := range m.List() {
 		if Style(id) == b {
 			return fmt.Errorf("built-in style %q is read-only; create a new style to customise", id)
 		}
 	}
-	if identity != "" {
-		if err := os.WriteFile(filepath.Join(m.dir, "identity", id+".md"), []byte(identity), 0o644); err != nil {
-			return err
-		}
-	}
-	if soul != "" {
-		if err := os.WriteFile(filepath.Join(m.dir, "soul", id+".md"), []byte(soul), 0o644); err != nil {
-			return err
-		}
-	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	sets := []string{"updated_at = ?"}
+	args := []any{now}
 	if label != "" {
-		if err := os.WriteFile(filepath.Join(m.dir, id+".label"), []byte(label), 0o644); err != nil {
-			return err
-		}
+		sets = append(sets, "label = ?")
+		args = append(args, label)
+	}
+	if prompt != "" {
+		sets = append(sets, "prompt = ?")
+		args = append(args, prompt)
 	}
 	if memory != "" {
-		if err := os.WriteFile(filepath.Join(m.dir, "memory", id+".md"), []byte(memory), 0o644); err != nil {
-			return err
-		}
+		sets = append(sets, "memory = ?")
+		args = append(args, memory)
 	}
-	return m.loadAll()
+	if len(sets) == 1 {
+		return nil // nothing to update
+	}
+	args = append(args, id)
+	_, err := m.db.Exec(`UPDATE styles SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
+	return err
 }
 
-// Delete removes a user-defined style. The built-ins are protected
-// to avoid leaving the running sessions with no usable system
-// prompt; deleting them would be a foot-gun.
+// Delete removes a user-defined style.
 func (m *Manager) Delete(id string) error {
 	id = normaliseStyleID(id)
 	if id == "" {
@@ -351,24 +387,10 @@ func (m *Manager) Delete(id string) error {
 			return fmt.Errorf("built-in style %q cannot be deleted", id)
 		}
 	}
-	if err := os.Remove(filepath.Join(m.dir, "identity", id+".md")); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Remove(filepath.Join(m.dir, "soul", id+".md")); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Remove(filepath.Join(m.dir, id+".label")); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Remove(filepath.Join(m.dir, "memory", id+".md")); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return m.loadAll()
+	_, err := m.db.Exec(`DELETE FROM styles WHERE id=? AND is_builtin=0`, id)
+	return err
 }
 
-// normaliseStyleID lowercases the id and strips out anything that
-// isn't [a-z0-9-_.]. The result is safe to use as a filename and
-// as a session-meta value.
 func normaliseStyleID(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	var b strings.Builder
@@ -395,35 +417,5 @@ func ParseStyle(s string) (Style, error) {
 		return Tech, nil
 	default:
 		return "", fmt.Errorf("unknown style: %q, available: cute | guofeng | tech", s)
-	}
-}
-
-// defaultIdentity is a built-in fallback used when the identity/*.md file
-// is missing.
-func defaultIdentity(s Style) string {
-	name := s.DisplayName()
-	switch s {
-	case Cute:
-		return fmt.Sprintf("# P-Chat %s AI 编程程序\n\n当前是 P-Chat %s（小P）风格的 AI 编程程序。\n\n你是小P（PiPi），一只住在用户电脑里的电子小仓鼠。核心能力是 AI 辅助编程。", name, name)
-	case Guofeng:
-		return fmt.Sprintf("# P-Chat %s AI 编程程序\n\n当前是 P-Chat %s（墨言）风格的 AI 编程程序。\n\n你是墨言（MoYan），隐于山水的书生幕僚。核心能力是 AI 辅助编程。", name, name)
-	case Tech:
-		return fmt.Sprintf("# P-Chat %s AI 编程程序\n\n当前是 P-Chat %s（NEXUS）风格的 AI 编程程序。\n\n你是 NEXUS（零号），代号 000 的工程化 AI Agent。核心能力是 AI 辅助编程。", name, name)
-	default:
-		return fmt.Sprintf("# P-Chat AI 编程程序\n\n当前是 P-Chat AI 编程程序。")
-	}
-}
-
-// defaultSoul is a built-in fallback used when the soul/*.md file is missing.
-func defaultSoul(s Style) string {
-	switch s {
-	case Cute:
-		return "性格：软萌、热情、治愈。说话带语气词和颜文字。称呼用户为「主人」。"
-	case Guofeng:
-		return "性格：温文尔雅、谦逊有礼。自称「在下」，称呼用户为「君」。说话有文言韵味。"
-	case Tech:
-		return "性格：冷静、精确、高效。结构化输出，异常码呈现。技术术语直接用英文。"
-	default:
-		return "你是一个 AI 助手。"
 	}
 }

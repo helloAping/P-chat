@@ -600,8 +600,7 @@ export interface StyleInfo {
 }
 
 export interface StyleDetail extends StyleInfo {
-  identity: string
-  soul: string
+  prompt: string
   memory?: string
 }
 
@@ -613,8 +612,7 @@ export const getStyle = (id: string) =>
 export interface CreateStyleRequest {
   id: string
   label: string
-  identity: string
-  soul: string
+  prompt: string
   memory?: string
 }
 
@@ -626,8 +624,7 @@ export const createStyle = (req: CreateStyleRequest) =>
 
 export interface UpdateStyleRequest {
   label?: string
-  identity?: string
-  soul?: string
+  prompt?: string
   memory?: string
 }
 

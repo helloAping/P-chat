@@ -33,9 +33,9 @@ func newTestServer(t *testing.T) *httptest.Server {
 		t.Fatalf("load config: %v", err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(dir+"/test.db", 50)
 	t.Cleanup(func() { store.Close() })
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)

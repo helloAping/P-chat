@@ -36,79 +36,77 @@ const message = useMessage()
 const EXAMPLE_SCENARIOS = ['编程', '日常工作', '角色扮演'] as const
 
 const EXAMPLE_TEMPLATES: Record<string, Record<string, string>> = {
-  identity: {
-    '编程': `你叫 P-Chat，是一个本地 AI 编程助手。
+  prompt: {
+    '编程': `# 编程助手
 
-你的能力：
-• 精通 Go / Vue 3 / TypeScript / SQLite
-• 可以读写文件、执行 shell 命令
-• 仅操作工作目录内的文件
+你是 P-Chat，一个本地 AI 编程助手。
 
-行为准则：
-• 先读代码再给建议，不凭空猜测
-• 修改后建议跑测试验证
-• 不输出密钥 / token 到任何地方`,
-    '日常工作': `你叫 P-Chat，是一个全能办公助手。
+## 人设
+- 精通 Go / Vue 3 / TypeScript / SQLite
+- 可以读写文件、执行 shell 命令
+- 仅操作工作目录内的文件
 
-你的能力：
-• 撰写邮件、报告、文档
-• 整理会议纪要、任务清单
-• 分析数据、制作摘要
-• 搜索本地文件、管理知识库
+## 性格
+- 简洁、直击要害，像 code review 评论
+- 不使用「当然可以」「没问题」等寒暄
+- 先给答案，再给解释
 
-行为准则：
-• 回复结构清晰，善用标题和列表
-• 主动提醒遗漏的事项
-• 对不确定的信息标注"待确认"`,
-    '角色扮演': `你叫小灵，是用户的私人 AI 助理。
+## 格式
+- 代码块用 \`\`\`go 标注语言
+- 路径用反引号 \`internal/agent/agent.go\`
+- 错误用中文描述，不贴原始 stack trace
 
-你的性格：
-• 活泼开朗，偶尔俏皮
-• 对技术问题也保持耐心和热情
-• 像一个靠谱又有趣的朋友
+## 行为准则
+- 先读代码再给建议，不凭空猜测
+- 修改后建议跑测试验证
+- 不输出密钥 / token 到任何地方`,
+    '日常工作': `# 办公助手
 
-你的职责：
-• 管理用户的日程和任务
-• 帮用户学习和研究新技术
-• 在用户焦虑时给予鼓励`,
-  },
-  soul: {
-    '编程': `语气：简洁、直击要害，像 code review 评论。
-不使用「当然可以」「没问题」等寒暄。
+你是 P-Chat，一个全能办公助手。
 
-格式：
-• 代码块用 \`\`\`go 标注语言
-• 路径用反引号 \`internal/agent/agent.go\`
-• 每个回复控制在小屏一屏内
+## 人设
+- 撰写邮件、报告、文档
+- 整理会议纪要、任务清单
+- 分析数据、制作摘要
+- 搜索本地文件、管理知识库
 
-原则：
-• 先给答案，再给解释
-• 错误用中文描述，不贴原始 stack trace
-• 不确定时主动说明，不编造`,
-    '日常工作': `语气：专业但不冰冷，像靠谱的同事。
-适当使用「建议」「推荐」等柔和词汇。
+## 性格
+- 专业但不冰冷，像靠谱的同事
+- 适当使用「建议」「推荐」等柔和词汇
+- 主动追问不清晰的指令
 
-格式：
-• 要点用 - 列表
-• 关键信息加 **粗体**
-• 重要结论写在最前面
+## 格式
+- 要点用 - 列表
+- 关键信息加 **粗体**
+- 重要结论写在最前面
 
-原则：
-• 先总结后展开
-• 主动追问不清晰的指令
-• 输出可复制使用的成品（邮件正文、表格等）`,
-    '角色扮演': `语气：温暖、随和，像深夜聊天的朋友。
-偶尔用「哈哈」「~」等轻松表达。
+## 行为准则
+- 回复结构清晰，善用标题和列表
+- 主动提醒遗漏的事项
+- 对不确定的信息标注"待确认"`,
+    '角色扮演': `# 小灵
 
-格式：
-• 用自然段对话，不用列表
-• 技术内容用比喻解释
-• 回复长度 2-5 句，不写小作文
+你是小灵，用户的私人 AI 助理。
 
-原则：
-• 先共情再建议
-• 记住用户的偏好和习惯
-• 在合适的时候开玩笑`,
+## 人设
+- 活泼开朗，偶尔俏皮
+- 对技术问题也保持耐心和热情
+- 像一个靠谱又有趣的朋友
+
+## 性格
+- 温暖、随和，像深夜聊天的朋友
+- 偶尔用「哈哈」「~」等轻松表达
+- 先共情再建议
+
+## 格式
+- 用自然段对话，不用列表
+- 技术内容用比喻解释
+- 回复长度适中，不写小作文
+
+## 行为准则
+- 管理用户的日程和任务
+- 帮用户学习和研究新技术
+- 在用户焦虑时给予鼓励`,
   },
   memory: {
     '编程': `- 当前项目：P-Chat (Go + Vue 3 桌面聊天应用)
@@ -131,16 +129,14 @@ const EXAMPLE_TEMPLATES: Record<string, Record<string, string>> = {
 }
 
 const exampleActiveScene = ref<Record<string, string>>({
-  identity: '编程',
-  soul: '编程',
+  prompt: '编程',
   memory: '编程',
 })
 
-function fillExample(field: 'identity' | 'soul' | 'memory') {
+function fillExample(field: 'prompt' | 'memory') {
   const scene = exampleActiveScene.value[field]
   const tpl = EXAMPLE_TEMPLATES[field]?.[scene] || ''
-  if (field === 'identity') newStyleIdentity.value = tpl
-  else if (field === 'soul') newStyleSoul.value = tpl
+  if (field === 'prompt') newStylePrompt.value = tpl
   else if (field === 'memory') newStyleMemory.value = tpl
 }
 
@@ -212,8 +208,7 @@ const showAddStyle = ref(false)
 const editingStyle = ref<api.StyleDetail | null>(null)
 const newStyleId = ref('')
 const newStyleLabel = ref('')
-const newStyleIdentity = ref('')
-const newStyleSoul = ref('')
+const newStylePrompt = ref('')
 const newStyleMemory = ref('')
 const isEdit = ref(false)
 
@@ -563,8 +558,7 @@ async function onImportUpstreamModel(m: api.UpstreamModelItem) {
 function resetNewStyle() {
   newStyleId.value = ''
   newStyleLabel.value = ''
-  newStyleIdentity.value = ''
-  newStyleSoul.value = ''
+  newStylePrompt.value = ''
   newStyleMemory.value = ''
   isEdit.value = false
   editingStyle.value = null
@@ -579,8 +573,7 @@ async function onCreateStyle() {
     await api.createStyle({
       id: newStyleId.value.trim(),
       label: newStyleLabel.value.trim(),
-      identity: newStyleIdentity.value,
-      soul: newStyleSoul.value,
+      prompt: newStylePrompt.value,
       memory: newStyleMemory.value,
     })
     message.success(`已创建: ${newStyleId.value}`)
@@ -598,9 +591,8 @@ async function onEditStyle(id: string) {
     editingStyle.value = s
     newStyleId.value = s.id
     newStyleLabel.value = s.label || ''
-    newStyleIdentity.value = s.identity || ''
-    newStyleSoul.value = s.soul || ''
-    newStyleMemory.value = (s as any).memory || ''
+    newStylePrompt.value = s.prompt || ''
+    newStyleMemory.value = s.memory || ''
     isEdit.value = true
     showAddStyle.value = true
   } catch (e: any) {
@@ -613,8 +605,7 @@ async function onUpdateStyle() {
   try {
     await api.updateStyle(editingStyle.value.id, {
       label: newStyleLabel.value,
-      identity: newStyleIdentity.value,
-      soul: newStyleSoul.value,
+      prompt: newStylePrompt.value,
       memory: newStyleMemory.value,
     })
     message.success(`已保存: ${editingStyle.value.id}`)
@@ -1251,46 +1242,26 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
               </div>
             </div>
 
-            <!-- 内容区：身份 (左) | 灵魂 (右) -->
+            <!-- 内容区：Prompt -->
             <div class="editor-content">
-              <div class="editor-col">
+              <div class="editor-col" style="flex: 1">
                 <div class="field-head">
-                  身份 (Identity)<span class="field-hint">— 定义「我是谁」</span>
+                  Prompt<span class="field-hint">— 人设 + 性格 + 说话风格 + 表达模板</span>
                   <NPopover trigger="hover" placement="bottom" style="max-width:440px">
                     <template #trigger><span class="help-badge">?</span></template>
                     <div class="example-card">
                       <div class="example-scenes">
                         <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
-                          :type="exampleActiveScene.identity === sc ? 'primary' : 'default'"
-                          @click="exampleActiveScene.identity = sc">{{ sc }}</NButton>
+                          :type="exampleActiveScene.prompt === sc ? 'primary' : 'default'"
+                          @click="exampleActiveScene.prompt = sc">{{ sc }}</NButton>
                       </div>
-                      <pre class="example-content">{{ EXAMPLE_TEMPLATES.identity[exampleActiveScene.identity] }}</pre>
-                      <NButton size="tiny" type="primary" ghost block @click="fillExample('identity')">填入此样例</NButton>
+                      <pre class="example-content">{{ EXAMPLE_TEMPLATES.prompt[exampleActiveScene.prompt] }}</pre>
+                      <NButton size="tiny" type="primary" ghost block @click="fillExample('prompt')">填入此样例</NButton>
                     </div>
                   </NPopover>
                 </div>
-                <NInput v-model:value="newStyleIdentity" placeholder="角色身份描述，支持 markdown"
-                  type="textarea" :rows="6" size="small" class="editor-textarea" />
-              </div>
-
-              <div class="editor-col">
-                <div class="field-head">
-                  灵魂 (Soul)<span class="field-hint">— 定义「我的语气」</span>
-                  <NPopover trigger="hover" placement="bottom" style="max-width:440px">
-                    <template #trigger><span class="help-badge">?</span></template>
-                    <div class="example-card">
-                      <div class="example-scenes">
-                        <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
-                          :type="exampleActiveScene.soul === sc ? 'primary' : 'default'"
-                          @click="exampleActiveScene.soul = sc">{{ sc }}</NButton>
-                      </div>
-                      <pre class="example-content">{{ EXAMPLE_TEMPLATES.soul[exampleActiveScene.soul] }}</pre>
-                      <NButton size="tiny" type="primary" ghost block @click="fillExample('soul')">填入此样例</NButton>
-                    </div>
-                  </NPopover>
-                </div>
-                <NInput v-model:value="newStyleSoul" placeholder="说话风格与回复格式"
-                  type="textarea" :rows="6" size="small" class="editor-textarea" />
+                <NInput v-model:value="newStylePrompt" placeholder="人设 + 性格 + 说话风格 + 表达模板，支持 markdown"
+                  type="textarea" :rows="12" size="small" class="editor-textarea" />
               </div>
             </div>
 

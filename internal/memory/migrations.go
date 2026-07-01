@@ -92,6 +92,21 @@ DROP TABLE IF EXISTS conversations;
 		Up:      `ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0`,
 		Down:    `ALTER TABLE conversations DROP COLUMN archived`,
 	},
+	{
+		Version: 3,
+		Name:    "add_styles",
+		Up: `
+CREATE TABLE IF NOT EXISTS styles (
+    id          TEXT PRIMARY KEY,
+    label       TEXT NOT NULL DEFAULT '',
+    prompt      TEXT NOT NULL DEFAULT '',
+    memory      TEXT NOT NULL DEFAULT '',
+    is_builtin  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);`,
+		Down: `DROP TABLE IF EXISTS styles`,
+	},
 }
 
 // 在 migrations 表和可变 Schema 之前必须创建

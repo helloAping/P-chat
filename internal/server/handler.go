@@ -589,27 +589,20 @@ func (h *Handler) Styles(c *gin.Context) {
 }
 
 // styleDescFor extracts a one-line description from a style's
-// identity text. We use the first non-empty, non-heading paragraph
-// — that's where the prompt typically introduces the persona
-// ("你是墨言..."). Falls back to the label for built-ins and a
-// generic message for user-added styles whose first paragraph is
-// missing.
+// prompt text (first non-empty, non-heading line).
 func styleDescFor(m *style.Manager, s style.Style) string {
-	identity, err := m.GetIdentity(s)
-	if err != nil || identity == "" {
+	prompt, err := m.GetIdentity(s)
+	if err != nil || prompt == "" {
 		return ""
 	}
-	for _, line := range strings.Split(identity, "\n") {
+	for _, line := range strings.Split(prompt, "\n") {
 		trim := strings.TrimSpace(line)
 		if trim == "" {
 			continue
 		}
-		// Skip the markdown header line.
 		if strings.HasPrefix(trim, "#") {
 			continue
 		}
-		// Take the first non-heading line and cap at ~60 runes so
-		// the table row stays one line.
 		r := []rune(trim)
 		if len(r) > 60 {
 			return string(r[:60]) + "…"
@@ -620,11 +613,14 @@ func styleDescFor(m *style.Manager, s style.Style) string {
 }
 
 // CreateStyleRequest is the POST /api/v1/styles body.
+// v2 uses "prompt" (single merged field); v1 "identity"/"soul" are
+// accepted for backward compat and merged with a --- separator.
 type CreateStyleRequest struct {
 	ID       string `json:"id"`
 	Label    string `json:"label"`
-	Identity string `json:"identity"`
-	Soul     string `json:"soul"`
+	Identity string `json:"identity,omitempty"`
+	Soul     string `json:"soul,omitempty"`
+	Prompt   string `json:"prompt,omitempty"`
 	Memory   string `json:"memory,omitempty"`
 }
 
@@ -638,13 +634,20 @@ func (h *Handler) CreateStyle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	if req.Identity == "" {
-		req.Identity = "# P-Chat AI 编程程序\n\n当前是 P-Chat AI 编程程序。\n"
+	prompt := req.Prompt
+	if prompt == "" {
+		// v1 compat: merge identity + soul
+		id := req.Identity
+		so := req.Soul
+		if id == "" {
+			id = "# P-Chat AI 编程程序\n\n当前是 P-Chat AI 编程程序。\n"
+		}
+		if so == "" {
+			so = "你是一个 AI 助手。"
+		}
+		prompt = id + "\n\n---\n\n" + so
 	}
-	if req.Soul == "" {
-		req.Soul = "你是一个 AI 助手。"
-	}
-	s, err := h.styleMgr.Create(req.ID, req.Label, req.Identity, req.Soul, req.Memory)
+	s, err := h.styleMgr.Create(req.ID, req.Label, prompt, req.Memory)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -656,7 +659,7 @@ func (h *Handler) CreateStyle(c *gin.Context) {
 	})
 }
 
-// GetStyle returns the full identity + soul of a single style.
+// GetStyle returns the full prompt of a single style.
 func (h *Handler) GetStyle(c *gin.Context) {
 	if h.styleMgr == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "style manager not available"})
@@ -664,28 +667,27 @@ func (h *Handler) GetStyle(c *gin.Context) {
 	}
 	id := c.Param("id")
 	s := style.Style(id)
-	identity, err := h.styleMgr.GetIdentity(s)
+	prompt, err := h.styleMgr.GetIdentity(s)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	soul, _ := h.styleMgr.GetSoul(s)
 	memory, _ := h.styleMgr.GetMemory(s)
 	c.JSON(http.StatusOK, gin.H{
-		"id":       id,
-		"label":    h.styleMgr.Label(s),
-		"identity": identity,
-		"soul":     soul,
-		"memory":   memory,
+		"id":     id,
+		"label":  h.styleMgr.Label(s),
+		"prompt": prompt,
+		"memory": memory,
 	})
 }
 
-// UpdateStyleRequest is the PATCH /api/v1/styles/:id body. Any
-// non-empty field is overwritten; empty fields are skipped.
+// UpdateStyleRequest is the PATCH /api/v1/styles/:id body.
+// v2 uses "prompt"; v1 "identity"/"soul" accepted and merged.
 type UpdateStyleRequest struct {
 	Label    string `json:"label,omitempty"`
 	Identity string `json:"identity,omitempty"`
 	Soul     string `json:"soul,omitempty"`
+	Prompt   string `json:"prompt,omitempty"`
 	Memory   string `json:"memory,omitempty"`
 }
 
@@ -700,7 +702,12 @@ func (h *Handler) UpdateStyle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	if err := h.styleMgr.Update(id, req.Label, req.Identity, req.Soul, req.Memory); err != nil {
+	prompt := req.Prompt
+	if prompt == "" && (req.Identity != "" || req.Soul != "") {
+		// v1 compat: merge identity + soul
+		prompt = req.Identity + "\n\n---\n\n" + req.Soul
+	}
+	if err := h.styleMgr.Update(id, req.Label, prompt, req.Memory); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

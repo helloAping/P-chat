@@ -13,9 +13,9 @@ import (
 func TestBuildStaticSystemPrompt_CacheHit(t *testing.T) {
 	cfg, _ := config.Load("")
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(":memory:", 50)
 	defer store.Close()
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 
 	agt := New(cfg, llmClient, styleMgr, store, tools)
@@ -45,9 +45,9 @@ func TestBuildStaticSystemPrompt_CacheHit(t *testing.T) {
 func TestBuildStaticSystemPrompt_DifferentStyle(t *testing.T) {
 	cfg, _ := config.Load("")
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(":memory:", 50)
 	defer store.Close()
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 
 	agt := New(cfg, llmClient, styleMgr, store, tools)
@@ -63,9 +63,9 @@ func TestBuildStaticSystemPrompt_DifferentStyle(t *testing.T) {
 func TestBuildStaticSystemPrompt_DifferentTools(t *testing.T) {
 	cfg, _ := config.Load("")
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(":memory:", 50)
 	defer store.Close()
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 
 	agt := New(cfg, llmClient, styleMgr, store, tools)
@@ -96,11 +96,11 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	llmClient, _ := llm.NewClient(&config.LLMConfig{Default: "ollama", Providers: []config.ProviderConfig{
 		{Name: "ollama", Protocol: "openai", BaseURL: "http://localhost", Model: "x"},
 	}})
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	tools := tool.NewRegistry()
 
 	store1, _ := memory.OpenAt(":memory:", 50)
 	defer store1.Close()
+	styleMgr, _ := style.NewManager(store1.DB())
 	a1 := New(cfgZh, llmClient, styleMgr, store1, tools)
 	pZh, _, _ := a1.buildStaticSystemPrompt(style.Tech, nil, "")
 	if !contains(pZh, "简体中文") {
@@ -140,10 +140,10 @@ func TestBuildStaticSystemPrompt_NoFabricatedErrorInstruction(t *testing.T) {
 	llmClient, _ := llm.NewClient(&config.LLMConfig{Default: "ollama", Providers: []config.ProviderConfig{
 		{Name: "ollama", Protocol: "openai", BaseURL: "http://localhost", Model: "x"},
 	}})
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	tools := tool.NewRegistry()
 	store, _ := memory.OpenAt(":memory:", 50)
 	defer store.Close()
+	styleMgr, _ := style.NewManager(store.DB())
 	a := New(cfg, llmClient, styleMgr, store, tools)
 	p, _, _ := a.buildStaticSystemPrompt(style.Tech, nil, "")
 	if contains(p, "更不要伪造") {

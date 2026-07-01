@@ -82,14 +82,14 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("init LLM: %w", err)
 	}
 
-	styleMgr, err := style.NewManager("")
-	if err != nil {
-		return fmt.Errorf("init style: %w", err)
-	}
-
 	memStore, err := memory.Open(cfg.Memory.MaxHistory)
 	if err != nil {
 		return fmt.Errorf("init memory: %w", err)
+	}
+
+	styleMgr, err := style.NewManager(memStore.DB())
+	if err != nil {
+		return fmt.Errorf("init style: %w", err)
 	}
 
 	toolReg := tool.NewRegistry()

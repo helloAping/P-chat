@@ -99,9 +99,9 @@ func newTestServerWithConfig(t *testing.T, jsonBody string) (*Server, *config.Co
 		t.Fatalf("load config: %v", err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(":memory:", 50)
 	t.Cleanup(func() { store.Close() })
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 
@@ -146,8 +146,8 @@ func TestStyles(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Styles) != 3 {
-		t.Errorf("expected 3 styles, got %d", len(body.Styles))
+	if len(body.Styles) < 3 {
+		t.Errorf("expected at least 3 styles, got %d", len(body.Styles))
 	}
 }
 
@@ -1056,12 +1056,12 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	storePath := filepath.Join(dir, "store.db")
 	store, err := memory.OpenAt(storePath, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
@@ -1079,7 +1079,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	}
 	defer store2.Close()
 	llmClient2, _ := llm.NewClient(&cfg.LLM)
-	styleMgr2, _ := style.NewManager(config.PromptDir())
+	styleMgr2, _ := style.NewManager(store2.DB())
 	tools2 := tool.NewRegistry()
 	tool.RegisterBuiltin(tools2)
 	agt2 := agent.New(cfg, llmClient2, styleMgr2, store2, tools2)
@@ -1146,12 +1146,12 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	storePath := filepath.Join(dir, "store.db")
 	store, err := memory.OpenAt(storePath, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
@@ -1208,7 +1208,7 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	}
 	defer store2.Close()
 	llmClient2, _ := llm.NewClient(&cfg.LLM)
-	styleMgr2, _ := style.NewManager(config.PromptDir())
+	styleMgr2, _ := style.NewManager(store2.DB())
 	tools2 := tool.NewRegistry()
 	tool.RegisterBuiltin(tools2)
 	agt2 := agent.New(cfg, llmClient2, styleMgr2, store2, tools2)

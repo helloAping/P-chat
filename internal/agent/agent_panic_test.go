@@ -18,9 +18,9 @@ import (
 func TestChatWithTools_PanicRecovery(t *testing.T) {
 	cfg, _ := config.Load("")
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(":memory:", 50)
 	defer store.Close()
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 
 	agt := New(cfg, llmClient, styleMgr, store, tools)
