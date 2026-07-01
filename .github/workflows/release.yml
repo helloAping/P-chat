@@ -22,46 +22,16 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Install Wails
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
-
-      - name: Build frontend
+      - name: Install tools
         run: |
-          cd frontend
-          npm ci
-          npm run build
+          go install github.com/go-task/task/v3/cmd/task@latest
+          go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-      - name: Sync web to embed dir
-        run: |
-          New-Item -ItemType Directory -Path "cmd\pchat-server\web" -Force
-          Copy-Item -Recurse -Force "web\index.html" "cmd\pchat-server\web\"
-          Copy-Item -Recurse -Force "web\assets" "cmd\pchat-server\web\"
+      - name: task build:all
+        run: task build:all
 
-      - name: Build Go server + CLI
-        run: |
-          go build -o bin/pchat-server.exe ./cmd/pchat-server
-          go build -o bin/pchat.exe ./cmd/pchat
-
-      - name: Build Wails GUI
-        run: |
-          cd cmd/pchat-gui
-          wails build -platform windows/amd64 -s
-
-      - name: Package GUI bundle
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-gui.ps1
-
-      - name: Read version
-        id: version
-        run: |
-          $v = (Get-Content VERSION -Raw).Trim()
-          if (-not $v) { $v = "0.1.0" }
-          echo "value=$v" >> $env:GITHUB_OUTPUT
-        shell: pwsh
-
-      - name: Build setup installer
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
-
-      - uses: softprops/action-gh-release@v2
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
         with:
-          files: bin/pchat-setup-v${{ steps.version.outputs.value }}.exe
+          files: bin/pchat-setup-v*.exe
           generate_release_notes: false
