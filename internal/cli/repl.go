@@ -13,6 +13,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
@@ -25,35 +26,37 @@ import (
 )
 
 type REPL struct {
-	cfg          *config.Config
-	agent        *agent.Agent
-	llm          *llm.Client
-	styleMgr     *style.Manager
-	tools        *tool.Registry
-	store        *memory.Store
-	style        style.Style
-	provider     string
-	useTools     bool
+	ctx cliContext // primary context (HTTP mode)
+
+	cfg      *config.Config
+	agent    *agent.Agent
+	llm      *llm.Client
+	styleMgr *style.Manager
+	tools    *tool.Registry
+	store    *memory.Store
+	style    style.Style
+	provider string
+	useTools bool
+
 	subCache     *subagent.Cache
 	recallEngine *recall.Engine
 	kbManager    *KBManager
 	toolCache    *toolResultCache
 
-	mu             sync.Mutex
-	cancelCurrent  context.CancelFunc // set while a chat is in flight
+	mu            sync.Mutex
+	cancelCurrent context.CancelFunc // set while a chat is in flight
+
+	rollbackUndo map[string][]httpcli.Message // session-id → last rollback snapshot
 }
 
-func NewREPL(cfg *config.Config, agt *agent.Agent, llmClient *llm.Client, styleMgr *style.Manager, tools *tool.Registry, s style.Style, provider string) *REPL {
+func NewREPL(ctx cliContext, cfg *config.Config, s style.Style, provider string) *REPL {
 	return &REPL{
-		cfg:       cfg,
-		agent:     agt,
-		llm:       llmClient,
-		styleMgr:  styleMgr,
-		tools:     tools,
-		style:     s,
-		provider:  provider,
-		useTools:  true,
-		toolCache: newToolResultCache(20),
+		ctx:          ctx,
+		cfg:          cfg,
+		style:        s,
+		provider:     provider,
+		useTools:     true,
+		rollbackUndo: make(map[string][]httpcli.Message),
 	}
 }
 
@@ -87,11 +90,11 @@ func (r *REPL) SetKBManager(m *KBManager) {
 	r.kbManager = m
 }
 
-// asContext returns a cliContext backed by this REPL. Slash
-// commands receive this view instead of the raw *REPL so the same
-// handlers can run in HTTP mode (backed by httpcli.Client) without
-// changes.
+// asContext returns a cliContext backed by this REPL.
 func (r *REPL) asContext() cliContext {
+	if r.ctx != nil {
+		return r.ctx
+	}
 	return &localContext{r: r}
 }
 
@@ -100,8 +103,9 @@ func (r *REPL) Run() error {
 		return fmt.Errorf("init directories: %w", err)
 	}
 
-	model := r.llm.GetModel(r.provider)
-	printWelcomeBanner(r.styleMgr.Label(r.style), r.provider, model)
+	model := r.providerModel()
+	label := r.styleLabel()
+	printWelcomeBanner(label, r.provider, model)
 
 	for {
 		input, isSlash, err := InputLine(r.style, r.provider)
@@ -147,10 +151,6 @@ func (r *REPL) Run() error {
 
 		r.chat(input)
 	}
-
-	if r.store != nil {
-		_ = r.store.Flush()
-	}
 	return nil
 }
 
@@ -174,42 +174,23 @@ func (r *REPL) readMultiLine(scanner *bufio.Scanner) string {
 }
 
 func (r *REPL) chat(input string) {
-	// Build the request messages: history of the current conversation
-	// + the new user input. The agent will then add the system prompt
-	// at the front, so the LLM sees: [system, history..., user_input].
-	//
-	// We deliberately keep this list scoped to the *current* conversation.
-	// /new starts a fresh conversation, so this naturally isolates
-	// sessions even if the same REPL stays open.
-	msgs := []llm.ChatMessage{}
-	if r.store != nil {
-		for _, m := range r.store.GetChatMessages() {
-			if m.Role == llm.RoleSystem || m.Type == llm.TypeImage {
-				continue
-			}
-			msgs = append(msgs, m)
-		}
-	}
-	msgs = append(msgs, llm.ChatMessage{
-		Role:    llm.RoleUser,
-		Type:    llm.TypeText,
-		Content: input,
-	})
-
 	req := agent.ChatRequest{
 		Style:    r.style,
 		Provider: r.provider,
-		Messages: msgs,
+		Messages: []llm.ChatMessage{
+			{Role: llm.RoleUser, Type: llm.TypeText, Content: input},
+		},
 	}
 
-	provModel := r.llm.GetModel(r.provider)
+	provModel := r.providerModel()
 	ui := NewChatUI(r.provider, provModel)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ui.SetQuestionHandler(r.ctx.GetCurrentSessionID(), func(sid string, answers map[string]string) error {
+		return r.ctx.SubmitQuestionAnswer(ctx, sid, answers)
+	})
 	ui.PrintBannerHeader(input)
 
-	// Set up a cancellable context. The user can press Esc to abort
-	// the in-flight LLM/tool call; the watcher goroutine below
-	// listens for raw-mode Esc input and triggers cancel().
-	ctx, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()
 	r.cancelCurrent = cancel
 	r.mu.Unlock()
@@ -222,74 +203,39 @@ func (r *REPL) chat(input string) {
 
 	go r.watchEsc(ctx, cancel)
 
-	var stream <-chan agent.ChatStreamChunk
-	if r.useTools && r.tools != nil && len(r.tools.List()) > 0 {
-		stream = r.agent.ChatWithTools(ctx, req)
-	} else {
-		stream = r.agent.ChatStream(ctx, req)
+	stream, err := r.ctx.ChatWithTools(ctx, req)
+	if err != nil {
+		ui.Handle(agent.ChatStreamChunk{Error: err.Error(), Done: true})
+		ui.Finish()
+		return
 	}
-
-	// Track the most recent tool call's metadata so we can record
-	// the result into the tool result cache when the call completes.
-	var lastToolName, lastToolArgs string
-	var lastToolStart time.Time
 
 	for chunk := range stream {
 		ui.Handle(chunk)
-		r.recordToolChunk(chunk, &lastToolName, &lastToolArgs, &lastToolStart)
 	}
 	ui.Finish()
 }
 
-// recordToolChunk updates the per-tool-call tracker state and, when a
-// tool call completes, pushes a result into the cache for /expand.
-func (r *REPL) recordToolChunk(chunk agent.ChatStreamChunk, lastName, lastArgs *string, lastStart *time.Time) {
-	if chunk.SubAgent {
-		return // ignore sub-agent tool events (not in main chat cache)
+// providerModel returns the current model name for display.
+func (r *REPL) providerModel() string {
+	if r.ctx != nil {
+		return r.ctx.GetCurrentModel()
 	}
-	if chunk.Phase != "tool" {
-		return
+	if r.llm != nil {
+		return r.llm.GetModel(r.provider)
 	}
-	step := chunk.Step
-	switch {
-	case len(step) > 5 && step[len(step)-2:] == "ok":
-		errStr := ""
-		if chunk.ToolError != "" {
-			errStr = chunk.ToolError
-		}
-		dur := time.Duration(0)
-		if !lastStart.IsZero() {
-			dur = time.Since(*lastStart)
-		}
-		r.toolCache.record(*lastName, *lastArgs, chunk.ToolResult, errStr, dur)
-		*lastName, *lastArgs = "", ""
-		*lastStart = time.Time{}
-	case len(step) > 5 && step[len(step)-2:] == "rr" && step[len(step)-3] == 'e':
-		// call-N-err (handler error)
-		errStr := chunk.ToolError
-		dur := time.Duration(0)
-		if !lastStart.IsZero() {
-			dur = time.Since(*lastStart)
-		}
-		r.toolCache.record(*lastName, *lastArgs, "", errStr, dur)
-		*lastName, *lastArgs = "", ""
-		*lastStart = time.Time{}
-	case len(step) > 5 && step[len(step)-2:] == "rn" && step[len(step)-3] == 'a':
-		// call-N-warn (tool returned error in result)
-		errStr := "tool returned error"
-		dur := time.Duration(0)
-		if !lastStart.IsZero() {
-			dur = time.Since(*lastStart)
-		}
-		r.toolCache.record(*lastName, *lastArgs, chunk.ToolResult, errStr, dur)
-		*lastName, *lastArgs = "", ""
-		*lastStart = time.Time{}
-	case strings.HasPrefix(step, "call-") && !strings.Contains(step, "ok") &&
-		!strings.Contains(step, "err") && !strings.Contains(step, "warn"):
-		*lastName = chunk.ToolName
-		*lastArgs = chunk.ToolArgs
-		*lastStart = time.Now()
+	return ""
+}
+
+// styleLabel returns the human-readable label for the current style.
+func (r *REPL) styleLabel() string {
+	if r.ctx != nil {
+		return r.ctx.StyleLabel(r.style)
 	}
+	if r.styleMgr != nil {
+		return r.styleMgr.DisplayLabel(r.style)
+	}
+	return string(r.style)
 }
 
 // reloadConfig reloads the config and recreates the LLM client

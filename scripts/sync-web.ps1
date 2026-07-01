@@ -13,9 +13,15 @@ $dst  = Join-Path $root "cmd\pchat-server\web"
 if (-not (Test-Path -LiteralPath $src)) { throw "source not found: $src" }
 
 # Wipe and re-create the destination so removed files don't linger.
+# Don't pipe Get-ChildItem into Remove-Item — once a parent is removed the
+# children reference paths that no longer exist, producing
+# "Remove-Item : 系统找不到指定的文件。" errors. Wipe the whole tree in one
+# call instead. -ErrorAction SilentlyContinue makes the script tolerant of
+# the destination being absent (e.g. a parallel writer racing us).
 if (Test-Path -LiteralPath $dst) {
-    Get-ChildItem -LiteralPath $dst -Recurse -Force | Remove-Item -Recurse -Force
-} else {
+    Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction SilentlyContinue
+}
+if (-not (Test-Path -LiteralPath $dst)) {
     New-Item -ItemType Directory -Path $dst -Force | Out-Null
 }
 

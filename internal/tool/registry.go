@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -38,7 +39,22 @@ type SandboxChecker interface {
 	CheckExecBool(command string) bool
 	// CheckWriteBool returns true if the path is permitted to be written.
 	CheckWriteBool(path string) bool
+	// CheckExecDecision returns the full Decision (allow/block/confirm).
+	CheckExecDecision(command string) SandboxDecision
+	// CheckWriteDecision returns the full Decision for write.
+	CheckWriteDecision(path string) SandboxDecision
+	// MatchedPattern returns the regex pattern that matched, or "".
+	MatchedPattern(command string) string
 }
+
+// SandboxDecision mirrors sandbox.Decision without importing sandbox.
+type SandboxDecision int
+
+const (
+	SandboxAllow   SandboxDecision = 0
+	SandboxBlock   SandboxDecision = 1
+	SandboxConfirm SandboxDecision = 2
+)
 
 type sandboxKey struct{}
 
@@ -108,6 +124,11 @@ func NewRegistry() *Registry {
 func (r *Registry) Register(t Tool, h ToolHandler) {
 	r.tools[t.Name] = h
 	r.meta[t.Name] = t
+}
+
+func (r *Registry) Unregister(name string) {
+	delete(r.tools, name)
+	delete(r.meta, name)
 }
 
 func (r *Registry) Get(name string) (ToolHandler, bool) {
@@ -251,6 +272,28 @@ func RegisterBuiltin(r *Registry) {
 			},
 		}, []string{"todos"}),
 	}, handleTodoWrite)
+
+	r.Register(Tool{
+		Name:        "question",
+		Description: "Ask the user a question (or set of questions) when you need clarification, a decision, or input before proceeding. Each question can have multiple-choice options or allow free-text input. Use this when you are uncertain about requirements, need to choose between approaches, or want the user to confirm a plan before executing. The user's answers will be returned so you can continue. Important: for every question, always include an '其他' (Other) option at the end so the user can provide a custom answer if none of the predefined options fit.",
+		Parameters: ObjectSchema(map[string]any{
+			"questions": map[string]any{
+				"type":     "array",
+				"minItems": 1,
+				"maxItems": 10,
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"question":     map[string]any{"type": "string", "description": "The complete question to ask the user"},
+						"header":       map[string]any{"type": "string", "maxLength": 12, "description": "Short label (max 12 chars) shown as a chip/tag"},
+						"options":      map[string]any{"type": "array", "minItems": 2, "maxItems": 8, "items": map[string]any{"type": "object", "properties": map[string]any{"label": map[string]any{"type": "string", "description": "Display text (1-5 words)"}, "description": map[string]any{"type": "string", "description": "Explanation of this choice"}}, "required": []string{"label", "description"}}},
+						"multi_select": map[string]any{"type": "boolean", "description": "Allow selecting multiple options (default false)"},
+					},
+					"required": []string{"question", "header", "options"},
+				},
+			},
+		}, []string{"questions"}),
+	}, handleQuestion)
 }
 
 type execArgs struct {
@@ -274,6 +317,25 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 		}, nil
 	}
 
+	// Block commands that try to read uploaded files. The
+	// LLM, when handed a vision-incompatible image, has
+	// historically used `cat image.png` / `xxd image.png` /
+	// `type image.png` to "see" the file. The bytes are
+	// useless as text; the LLM then invents a "model doesn't
+	// support image input" error message. read_file already
+	// rejects upload-dir paths; we mirror that here so
+	// exec_command is not an escape hatch.
+	if reason := commandReferencesUploadFile(a.Command); reason != "" {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_UPLOAD_DIR: command blocked — %s is inside the chat upload directory. "+
+					"Uploaded files are already inlined in the user message as vision/image "+
+					"content; do NOT shell out to read them. Just respond based on the "+
+					"attachment you already received.", reason),
+			IsError: true,
+		}, nil
+	}
+
 	cmd := exec.CommandContext(ctx, "cmd", "/C", a.Command)
 	root := projectRootFromCtx(ctx)
 	if a.WorkDir != "" {
@@ -288,9 +350,53 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return &CallResult{Content: fmt.Sprintf("%s\nERROR: %v", string(out), err), IsError: true}, nil
+		content := strings.TrimRight(string(out), "\r\n")
+		if content != "" {
+			content += "\n"
+		}
+		content += err.Error()
+
+		// opcode-style actionable hints: when a command fails
+		// because it doesn't exist on this platform, tell the
+		// LLM about alternatives so it can recover.
+		if runtime.GOOS == "windows" {
+			switch {
+			case strings.Contains(err.Error(), "is not recognized"):
+				content += "\nHint: This command doesn't exist on Windows. Use findstr (not grep), dir (not ls), type (not cat), or pwsh -NoProfile -Command \"...\" for PowerShell scripts."
+			case strings.Contains(err.Error(), "The system cannot find the file"):
+				content += "\nHint: The executable was not found. Check the command name — on Windows the available commands are: dir, findstr, type, copy, move, del, mkdir, cd, set, pwsh."
+			}
+		} else {
+			if strings.Contains(err.Error(), "executable file not found") || strings.Contains(err.Error(), "command not found") {
+				content += "\nHint: The command was not found. Try installing it or use an alternative."
+			}
+		}
+		return &CallResult{Content: content, IsError: true}, nil
 	}
 	return &CallResult{Content: string(out)}, nil
+}
+
+// commandReferencesUploadFile scans a shell command for tokens
+// that look like paths or filenames pointing into the chat
+// upload directory. Returns the matched path if found, "" if
+// the command is safe. The check is best-effort: it splits on
+// common shell-tokenising characters and on whitespace, then
+// asks isInUploadDir() for each token. The LLM doesn't try to
+// obfuscate, so a simple split is enough.
+func commandReferencesUploadFile(cmd string) string {
+	if cmd == "" {
+		return ""
+	}
+	// Split on whitespace and on common shell metachars.
+	for _, sep := range []string{" ", "\t", "\n", ">", "<", "|", ";", "&", "(", ")", "\"", "'", "`", ","} {
+		cmd = strings.ReplaceAll(cmd, sep, " ")
+	}
+	for _, tok := range strings.Fields(cmd) {
+		if isInUploadDir(tok) {
+			return tok
+		}
+	}
+	return ""
 }
 
 type readFileArgs struct {

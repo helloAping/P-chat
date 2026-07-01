@@ -80,10 +80,11 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 			case fileExists(yamlPath):
 				args = []string{"--config", yamlPath}
 			default:
-				// Neither file exists; let pchat-server use its
-				// built-in default (it will create config.json
-				// on first save).
-				args = []string{"--config", jsonPath}
+				// Neither file exists yet — fresh install.
+				// Don't pass --config so pchat-server uses its
+				// built-in defaults. The config file will be
+				// created on first save.
+				args = nil
 			}
 		}
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/upgrade"
 )
 
 // streamRecorder wraps httptest.ResponseRecorder with a CloseNotify
@@ -99,14 +100,15 @@ func newTestServerWithConfig(t *testing.T, jsonBody string) (*Server, *config.Co
 		t.Fatalf("load config: %v", err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(":memory:", 50)
 	t.Cleanup(func() { store.Close() })
+	upgrade.SeedForTesting(store.DB())
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	return New(cfg, agt, store, styleMgr), cfg
+	return New(cfg, agt, store, styleMgr, nil), cfg
 }
 
 // ====================================================================
@@ -146,8 +148,8 @@ func TestStyles(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Styles) != 3 {
-		t.Errorf("expected 3 styles, got %d", len(body.Styles))
+	if len(body.Styles) < 3 {
+		t.Errorf("expected at least 3 styles, got %d", len(body.Styles))
 	}
 }
 
@@ -724,6 +726,30 @@ func TestChunkToEvent(t *testing.T) {
 			t.Errorf("ToolArgs = %q, want raw json", ev.ToolArgs)
 		}
 	})
+	t.Run("session_status_busy", func(t *testing.T) {
+		// The lifecycle signal emitted at the start of the
+		// agent loop. Must be a top-level StreamEvent field so
+		// the chat store can flip state.sessionWorking[id]
+		// without needing a Phase/Type match.
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			SessionStatus: "busy",
+		}, "cs", "gpt-4o")
+		if ev.SessionStatus != "busy" {
+			t.Errorf("SessionStatus = %q, want busy", ev.SessionStatus)
+		}
+	})
+	t.Run("session_status_idle", func(t *testing.T) {
+		// The lifecycle signal emitted on every exit point
+		// (success, error, cancel, max-rounds, stuck, panic).
+		// The TodoPanel state machine uses "idle" to clear
+		// stale todos the LLM never wrote `todos: []` for.
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			SessionStatus: "idle",
+		}, "cs", "gpt-4o")
+		if ev.SessionStatus != "idle" {
+			t.Errorf("SessionStatus = %q, want idle", ev.SessionStatus)
+		}
+	})
 }
 
 func TestSessionToResponse(t *testing.T) {
@@ -1032,16 +1058,17 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	storePath := filepath.Join(dir, "store.db")
 	store, err := memory.OpenAt(storePath, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
+	upgrade.SeedForTesting(store.DB())
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := New(cfg, agt, store, styleMgr)
+	srv1 := 	New(cfg, agt, store, styleMgr, nil)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro"}`)
 	if err := store.Close(); err != nil {
@@ -1054,12 +1081,13 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store2.Close()
+	upgrade.SeedForTesting(store2.DB())
 	llmClient2, _ := llm.NewClient(&cfg.LLM)
-	styleMgr2, _ := style.NewManager(config.PromptDir())
+	styleMgr2, _ := style.NewManager(store2.DB())
 	tools2 := tool.NewRegistry()
 	tool.RegisterBuiltin(tools2)
 	agt2 := agent.New(cfg, llmClient2, styleMgr2, store2, tools2)
-	srv2 := New(cfg, agt2, store2, styleMgr2)
+	srv2 := New(cfg, agt2, store2, styleMgr2, nil)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil)
@@ -1122,16 +1150,17 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	storePath := filepath.Join(dir, "store.db")
 	store, err := memory.OpenAt(storePath, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
+	upgrade.SeedForTesting(store.DB())
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := New(cfg, agt, store, styleMgr)
+	srv1 := 	New(cfg, agt, store, styleMgr, nil)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro","style":"tech"}`)
 
@@ -1183,12 +1212,13 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store2.Close()
+	upgrade.SeedForTesting(store2.DB())
 	llmClient2, _ := llm.NewClient(&cfg.LLM)
-	styleMgr2, _ := style.NewManager(config.PromptDir())
+	styleMgr2, _ := style.NewManager(store2.DB())
 	tools2 := tool.NewRegistry()
 	tool.RegisterBuiltin(tools2)
 	agt2 := agent.New(cfg, llmClient2, styleMgr2, store2, tools2)
-	srv2 := New(cfg, agt2, store2, styleMgr2)
+	srv2 := New(cfg, agt2, store2, styleMgr2, nil)
 
 	wg := httptest.NewRecorder()
 	srv2.engine.ServeHTTP(wg, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))

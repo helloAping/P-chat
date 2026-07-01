@@ -50,6 +50,7 @@ const (
 	TypeText       = "text"
 	TypeImage      = "image"
 	TypeAudio      = "audio"
+	TypeVideo      = "video"
 	TypeFile       = "file"
 	TypeThinking   = "thinking"
 	TypeToolCall   = "tool_call"

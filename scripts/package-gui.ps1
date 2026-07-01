@@ -24,6 +24,12 @@ if (-not (Test-Path -LiteralPath $webDir)) { throw "web/ (built SPA) not found: 
 # --- Server binary (embeds the SPA) ---
 Copy-Item -LiteralPath (Join-Path $binDir "pchat-server.exe") -Destination (Join-Path $srcGui "pchat-server.exe") -Force
 
+# --- CLI binary (REPL) ---
+# install.ps1 (now) requires pchat.exe to sit next to it, so
+# `pchat` can land in $target during install and become
+# available on the user PATH after `-AddToPath`.
+Copy-Item -LiteralPath (Join-Path $binDir "pchat.exe") -Destination (Join-Path $srcGui "pchat.exe") -Force
+
 # --- Install scripts ---
 Copy-Item -LiteralPath (Join-Path $root "cmd\pchat-gui\install.ps1")   -Destination (Join-Path $srcGui "install.ps1")   -Force
 Copy-Item -LiteralPath (Join-Path $root "cmd\pchat-gui\uninstall.ps1") -Destination (Join-Path $srcGui "uninstall.ps1") -Force

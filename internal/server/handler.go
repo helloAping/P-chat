@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -16,10 +17,12 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/project"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/version"
 )
 
 // Handler serves the P-Chat HTTP API. It holds references to the
@@ -31,6 +34,7 @@ type Handler struct {
 	store      *memory.Store
 	styleMgr   *style.Manager
 	summarizer *memory.Summarizer
+	mcpMgr     *mcp.Manager
 
 	metaMu sync.Mutex
 	meta   map[string]sessionMeta
@@ -43,6 +47,7 @@ type sessionMeta struct {
 	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
 	ProjectPath     string // project root directory, "" = global
 	PlanMode        bool   // plan mode (no tools, single turn)
+	PermissionLevel string // "ask" | "auto" | "full"
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -55,14 +60,16 @@ type sessionMetaBlob struct {
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	ProjectPath     string `json:"project_path,omitempty"`
 	PlanMode        bool   `json:"plan_mode,omitempty"`
+	PermissionLevel string `json:"permission_level,omitempty"`
 }
 
-func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager) *Handler {
+func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Handler {
 	h := &Handler{
 		agent:    a,
 		cfg:      cfg,
 		store:    store,
 		styleMgr: styleMgr,
+		mcpMgr:   mcpMgr,
 		meta:     make(map[string]sessionMeta),
 	}
 	// Wire the upload resolver so the agent can read attached
@@ -102,7 +109,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	if h.store == nil {
 		return
 	}
-	blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
 	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
 		// Non-fatal: in-memory map already updated, request still
 		// works for this session. The next setSessionMeta call
@@ -131,6 +138,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.ReasoningEffort = blob.ReasoningEffort
 				m.ProjectPath = blob.ProjectPath
 				m.PlanMode = blob.PlanMode
+				m.PermissionLevel = blob.PermissionLevel
 			}
 		}
 	}
@@ -182,7 +190,7 @@ func (h *Handler) setSessionMetaProjectPath(id, projectPath string) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 }
@@ -269,6 +277,9 @@ type UpdateSessionMetaRequest struct {
 	Provider *string `json:"provider,omitempty"`
 	Model    *string `json:"model,omitempty"`
 	Style    *string `json:"style,omitempty"`
+	// PermissionLevel sets the sandbox permission level for this session.
+	// Values: "ask", "auto", "full". Omit to leave unchanged.
+	PermissionLevel *string `json:"permission_level,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -283,6 +294,8 @@ type SessionResponse struct {
 	Style       string `json:"style,omitempty"`
 	ProjectPath string `json:"project_path,omitempty"`
 	PlanMode    bool   `json:"plan_mode,omitempty"`
+	PermissionLevel string `json:"permission_level,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 }
@@ -376,8 +389,16 @@ type StreamEvent struct {
 	ToolName    string `json:"tool_name,omitempty"`
 	ToolStatus  string `json:"tool_status,omitempty"`
 	ToolResult  string `json:"tool_result,omitempty"`
-	ToolError   string `json:"tool_error,omitempty"`
-	ToolElapsed string `json:"tool_elapsed,omitempty"`
+	// ToolResultFull is the untruncated tool result for tools
+	// whose output the frontend needs to parse (todo_write).
+	// ToolResult is a 300-char preview for display; ToolResultFull
+	// preserves the full payload (newlines and all) so the
+	// frontend can JSON.parse it without corruption. The chat
+	// store uses ToolResultFull in preference to ToolResult when
+	// the tool name is todo_write / question.
+	ToolResultFull string `json:"tool_result_full,omitempty"`
+	ToolError      string `json:"tool_error,omitempty"`
+	ToolElapsed    string `json:"tool_elapsed,omitempty"`
 	// ToolArgs is the JSON-encoded arguments string the
 	// tool was called with (best-effort; LLM clients only
 	// surface this once the call is complete, not as a
@@ -395,13 +416,77 @@ type StreamEvent struct {
 	SubAgent       bool   `json:"sub_agent,omitempty"`
 	SubAgentTask   string `json:"sub_agent_task,omitempty"`
 	SubAgentStatus string `json:"sub_agent_status,omitempty"`
+	// SubAgentType is the agent name (e.g. "explore",
+	// "plan", "general-purpose", or a custom agent from
+	// .p-chat/agent/*.md). Surfaced in the SubAgentCard
+	// header so the user can see which agent ran.
+	SubAgentType string `json:"sub_agent_type,omitempty"`
+	// SubAgentColor is the agent's accent color ("#RRGGBB"
+	// or CSS color name). Tints the card border + badge.
+	SubAgentColor string `json:"sub_agent_color,omitempty"`
+	// SubAgentModel is the model the sub-agent is using
+	// (e.g. "gpt-4o-mini"). Shown as a small chip in the
+	// card header.
+	SubAgentModel string `json:"sub_agent_model,omitempty"`
+	// SubAgentTaskID is the resume-by-id key. Surfaced as
+	// a monospace badge in the card footer.
+	SubAgentTaskID string `json:"sub_agent_task_id,omitempty"`
+	// SubAgentDescription is the agent's "when to use" hint.
+	// Surfaced as a hover tooltip on the agent-name badge
+	// in the SubAgentCard so the user can read the full
+	// hint without expanding the card body.
+	SubAgentDescription string `json:"sub_agent_description,omitempty"`
+
+	// ThinkingRewrite is the post-stream redactor's
+	// replacement text for the LLM's thinking block. The
+	// UI should REPLACE the trailing thinking part's text
+	// with this value (same pattern as content_rewrite
+	// for the text body). Empty when no rewrite is needed.
+	ThinkingRewrite string `json:"thinking_rewrite,omitempty"`
+
+	// SubAgentFailureReason explains why the sub-agent
+	// failed. Only set on `sub_agent_err` close events.
+	// The Wails GUI surfaces this in the SubAgentCard
+	// header so the user can tell "stream tail-end
+	// hiccup" (soft fail, content was already produced)
+	// from "could not reach the LLM" (hard fail, no
+	// content). Empty on `sub_agent_ok` close events.
+	SubAgentFailureReason string `json:"sub_agent_failure_reason,omitempty"`
 
 	// Done fields
-	TokensIn  int    `json:"tokens_in,omitempty"`
-	TokensOut int    `json:"tokens_out,omitempty"`
-	Elapsed   string `json:"elapsed,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
+	TokensIn      int    `json:"tokens_in,omitempty"`
+	TokensOut     int    `json:"tokens_out,omitempty"`
+	Elapsed       string `json:"elapsed,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Model         string `json:"model,omitempty"`
+	// UserMessageID is the SQLite row id of the user message
+	// that started this turn. Set only on the "done" event so
+	// the frontend can stamp it on the local Message for fork.
+	UserMessageID int64 `json:"user_message_id,omitempty"`
+	// LastMessageID is the highest row id in this session
+	// (typically the assistant reply just produced). Used to
+	// stamp the assistant message for fork targeting.
+	LastMessageID int64 `json:"last_message_id,omitempty"`
+
+	// Question fields — when the question tool is called, the
+	// server emits a "question" event with question_json set
+	// to the serialized question array. The frontend renders
+	// a modal and posts the answer back.
+	QuestionJSON string `json:"question_json,omitempty"`
+
+	// ToolConfirm fields — when the sandbox requires user
+	// confirmation before executing a tool.
+	ToolConfirmJSON string `json:"tool_confirm_json,omitempty"`
+
+	// SessionStatus is the lifecycle signal for a chat turn:
+	// "busy" at the start of the agent loop, "idle" when it
+	// exits (any reason — success, error, cancel, max-rounds,
+	// stuck, panic). The frontend uses it to drive the
+	// TodoPanel state machine: `live = session_status === "busy"`.
+	// Without this signal, the UI has no way to tell "the LLM
+	// is mid-turn, don't clear stale todos" from "the LLM
+	// stopped and forgot to clear them".
+	SessionStatus string `json:"session_status,omitempty"`
 
 	// Error fields
 	Error      string `json:"error,omitempty"`
@@ -418,6 +503,61 @@ type StreamEvent struct {
 
 func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// VersionHandler GET /api/v1/version
+func (h *Handler) VersionHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"version":    version.String(),
+		"full":       version.FullString(),
+		"git_commit": version.GitCommit,
+	})
+}
+
+// MigrationStatus GET /api/v1/migrations
+func (h *Handler) MigrationStatus(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	current, available, err := h.store.AppliedMigrations()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"current":   current,
+		"available": available,
+	})
+}
+
+// MigrationRollback POST /api/v1/migrations/rollback
+func (h *Handler) MigrationRollback(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	var body struct {
+		Target int `json:"target"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if body.Target < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "target must be >= 0"})
+		return
+	}
+	if err := h.store.Rollback(body.Target); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	current, available, _ := h.store.AppliedMigrations()
+	c.JSON(http.StatusOK, gin.H{
+		"ok":        true,
+		"current":   current,
+		"available": available,
+	})
 }
 
 // StyleMeta is the wire shape returned by /api/v1/styles. id is
@@ -441,7 +581,7 @@ func (h *Handler) Styles(c *gin.Context) {
 	for _, s := range h.styleMgr.ListAll() {
 		out = append(out, StyleMeta{
 			ID:    string(s),
-			Label: h.styleMgr.Label(s),
+			Label: h.styleMgr.DisplayLabel(s),
 			Desc:  styleDescFor(h.styleMgr, s),
 		})
 	}
@@ -449,27 +589,20 @@ func (h *Handler) Styles(c *gin.Context) {
 }
 
 // styleDescFor extracts a one-line description from a style's
-// identity text. We use the first non-empty, non-heading paragraph
-// — that's where the prompt typically introduces the persona
-// ("你是墨言..."). Falls back to the label for built-ins and a
-// generic message for user-added styles whose first paragraph is
-// missing.
+// prompt text (first non-empty, non-heading line).
 func styleDescFor(m *style.Manager, s style.Style) string {
-	identity, err := m.GetIdentity(s)
-	if err != nil || identity == "" {
+	prompt, err := m.GetIdentity(s)
+	if err != nil || prompt == "" {
 		return ""
 	}
-	for _, line := range strings.Split(identity, "\n") {
+	for _, line := range strings.Split(prompt, "\n") {
 		trim := strings.TrimSpace(line)
 		if trim == "" {
 			continue
 		}
-		// Skip the markdown header line.
 		if strings.HasPrefix(trim, "#") {
 			continue
 		}
-		// Take the first non-heading line and cap at ~60 runes so
-		// the table row stays one line.
 		r := []rune(trim)
 		if len(r) > 60 {
 			return string(r[:60]) + "…"
@@ -480,11 +613,15 @@ func styleDescFor(m *style.Manager, s style.Style) string {
 }
 
 // CreateStyleRequest is the POST /api/v1/styles body.
+// v2 uses "prompt" (single merged field); v1 "identity"/"soul" are
+// accepted for backward compat and merged with a --- separator.
 type CreateStyleRequest struct {
 	ID       string `json:"id"`
 	Label    string `json:"label"`
-	Identity string `json:"identity"`
-	Soul     string `json:"soul"`
+	Identity string `json:"identity,omitempty"`
+	Soul     string `json:"soul,omitempty"`
+	Prompt   string `json:"prompt,omitempty"`
+	Memory   string `json:"memory,omitempty"`
 }
 
 func (h *Handler) CreateStyle(c *gin.Context) {
@@ -497,25 +634,32 @@ func (h *Handler) CreateStyle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	if req.Identity == "" {
-		req.Identity = "# P-Chat AI 编程程序\n\n当前是 P-Chat AI 编程程序。\n"
+	prompt := req.Prompt
+	if prompt == "" {
+		// v1 compat: merge identity + soul
+		id := req.Identity
+		so := req.Soul
+		if id == "" {
+			id = "# P-Chat AI 编程程序\n\n当前是 P-Chat AI 编程程序。\n"
+		}
+		if so == "" {
+			so = "你是一个 AI 助手。"
+		}
+		prompt = id + "\n\n---\n\n" + so
 	}
-	if req.Soul == "" {
-		req.Soul = "你是一个 AI 助手。"
-	}
-	s, err := h.styleMgr.Create(req.ID, req.Label, req.Identity, req.Soul)
+	s, err := h.styleMgr.Create(req.ID, req.Label, prompt, req.Memory)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
 		"id":    string(s),
-		"label": h.styleMgr.Label(s),
+		"label": h.styleMgr.DisplayLabel(s),
 		"desc":  styleDescFor(h.styleMgr, s),
 	})
 }
 
-// GetStyle returns the full identity + soul of a single style.
+// GetStyle returns the full prompt of a single style.
 func (h *Handler) GetStyle(c *gin.Context) {
 	if h.styleMgr == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "style manager not available"})
@@ -523,26 +667,28 @@ func (h *Handler) GetStyle(c *gin.Context) {
 	}
 	id := c.Param("id")
 	s := style.Style(id)
-	identity, err := h.styleMgr.GetIdentity(s)
+	prompt, err := h.styleMgr.GetIdentity(s)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	soul, _ := h.styleMgr.GetSoul(s)
+	memory, _ := h.styleMgr.GetMemory(s)
 	c.JSON(http.StatusOK, gin.H{
-		"id":       id,
-		"label":    h.styleMgr.Label(s),
-		"identity": identity,
-		"soul":     soul,
+		"id":     id,
+		"label":  h.styleMgr.DisplayLabel(s),
+		"prompt": prompt,
+		"memory": memory,
 	})
 }
 
-// UpdateStyleRequest is the PATCH /api/v1/styles/:id body. Any
-// non-empty field is overwritten; empty fields are skipped.
+// UpdateStyleRequest is the PATCH /api/v1/styles/:id body.
+// v2 uses "prompt"; v1 "identity"/"soul" accepted and merged.
 type UpdateStyleRequest struct {
 	Label    string `json:"label,omitempty"`
 	Identity string `json:"identity,omitempty"`
 	Soul     string `json:"soul,omitempty"`
+	Prompt   string `json:"prompt,omitempty"`
+	Memory   string `json:"memory,omitempty"`
 }
 
 func (h *Handler) UpdateStyle(c *gin.Context) {
@@ -556,7 +702,12 @@ func (h *Handler) UpdateStyle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	if err := h.styleMgr.Update(id, req.Label, req.Identity, req.Soul); err != nil {
+	prompt := req.Prompt
+	if prompt == "" && (req.Identity != "" || req.Soul != "") {
+		// v1 compat: merge identity + soul
+		prompt = req.Identity + "\n\n---\n\n" + req.Soul
+	}
+	if err := h.styleMgr.Update(id, req.Label, prompt, req.Memory); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -765,6 +916,100 @@ func (h *Handler) ClearSessionMessages(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"cleared": id})
 }
 
+// RollbackMessages POST /api/v1/sessions/:id/rollback
+// Deletes the message with the given id and all messages after it.
+// Returns the deleted messages so the client can undo.
+func (h *Handler) RollbackMessages(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	var req struct {
+		BeforeID int64 `json:"before_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.BeforeID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "before_id is required and must be > 0"})
+		return
+	}
+
+	deleted, err := h.store.DeleteMessagesFrom(id, req.BeforeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"deleted_count":    len(deleted),
+		"deleted_messages": deleted,
+	})
+}
+
+// ForkSession POST /api/v1/sessions/:id/fork
+// Creates a new session containing all messages up to and including
+// before_id from the source session.
+func (h *Handler) ForkSession(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	var req struct {
+		BeforeID int64 `json:"before_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.BeforeID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "before_id is required and must be > 0"})
+		return
+	}
+
+	conv, err := h.store.ForkConversation(id, req.BeforeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	srcMeta := h.ensureMetaLoaded(id)
+	h.setSessionMeta(conv.ID, srcMeta.Style, srcMeta.Provider, srcMeta.Model)
+	if srcMeta.ProjectPath != "" {
+		h.setSessionMetaProjectPath(conv.ID, srcMeta.ProjectPath)
+	}
+
+	c.JSON(http.StatusCreated, h.sessionToResponse(*conv))
+}
+
+// UndoRollback POST /api/v1/sessions/:id/rollback/undo
+// Restores previously-deleted messages.
+func (h *Handler) UndoRollback(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	var req struct {
+		Messages []memory.Message `json:"messages"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Override conversation_id from the URL to prevent cross-session
+	// injection.
+	for i := range req.Messages {
+		req.Messages[i].ConversationID = id
+	}
+
+	if err := h.store.RestoreMessages(req.Messages); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":             true,
+		"restored_count": len(req.Messages),
+	})
+}
+
 func (h *Handler) RenameSession(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
@@ -889,6 +1134,24 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 	}
 	h.setSessionMeta(id, deref(req.Style), provider, deref(req.Model))
 
+	// Handle permission level separately — validate and write directly.
+	if req.PermissionLevel != nil {
+		level := *req.PermissionLevel
+		if level != "ask" && level != "auto" && level != "full" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": `permission_level must be "ask", "auto", or "full"`})
+			return
+		}
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.PermissionLevel = level
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		if h.store != nil {
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+			_ = h.store.UpdateConversationMeta(id, string(blob))
+		}
+	}
+
 	// Re-read so the response reflects the on-disk truth.
 	cv, err = h.store.GetConversation(id)
 	if err != nil {
@@ -913,78 +1176,229 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
-	// Switch to this session so GetMessages returns its history.
-	if err := h.store.SetCurrent(id); err != nil {
+	// Use the per-session query — do NOT mutate the global
+	// currentID here. Two concurrent ListMessages on different
+	// sessions would otherwise race.
+	if _, err := h.store.GetConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	// Use the variant that returns raw metadata so we can pull
-	// the assistant message's `parts` blob (thinking + tool +
-	// sub-agent) back out of the SQLite row. GetMessages
-	// discards everything it doesn't recognise, which used to
-	// drop the parts silently — the user would reopen a
-	// session and see only the plain text.
+
+	// Pagination:
+	//   ?before_id=N  — return only messages with id < N
+	//   ?limit=K      — cap the result at K rows
+	//
+	// When neither is set the response is the full history,
+	// which is the right thing for the first switch into a
+	// session that the frontend has never seen (e.g. after
+	// app reload). When both are set, the frontend is
+	// asking for the next page of older history — typical
+	// infinite-scroll-triggered request.
+	//
+	// The `has_more` flag is computed by checking whether the
+	// conversation still has rows older than the oldest one
+	// we just returned. We avoid returning the full count
+	// (which would let the client show "1,234 messages" in
+	// the UI later) to keep the payload small.
+	beforeID := parseInt64Query(c, "before_id", 0)
+	queryLimit := parseIntQuery(c, "limit", 0)
+
 	meta := h.ensureMetaLoaded(id)
-	limit := contextLevelLimit(meta.ReasoningEffort)
-	msgs, metas, createds := h.store.GetChatMessagesWithMetaN(limit)
-	out := make([]MessageResponse, 0, len(msgs))
-	for i, m := range msgs {
-		created := time.Now().Unix()
-		if i < len(createds) && createds[i] != 0 {
-			created = createds[i]
-		}
-		resp := MessageResponse{
-			ID:        0,
-			Role:      m.Role,
-			Content:   m.Content,
-			CreatedAt: created,
-			Name:      m.Name,
-		}
+	contextCap := contextLevelLimit(meta.ReasoningEffort)
 
-		// Image messages: compute a data URL for the frontend.
-		if m.Type == llm.TypeImage && m.Content != "" {
-			mime := m.MimeType
-			if mime == "" {
-				mime = "image/png"
-			}
-			dataURL := "data:" + mime + ";base64," + m.Content
-			resp.Attachments = append(resp.Attachments, AttachmentPart{
-				Type: "image_url",
-				URL:  dataURL,
-				Name: m.Name,
-				Kind: "image",
-				MIME: mime,
-			})
-		}
-
-		// Tool call metadata.
-		if m.ToolID != "" {
-			resp.ToolCallID = m.ToolID
-		}
-
-		// Restore assistant parts from metadata.
-		if i < len(metas) && metas[i] != "" {
-			if parts := decodePartsFromMeta(metas[i], m.Content); len(parts) > 0 {
-				resp.Parts = parts
-			}
-		}
-		// Image messages carry their payload as data URLs in
-		// Attachments; clear Content so the frontend doesn't
-		// render the raw base64 string as text.
-		if m.Type == llm.TypeImage {
-			resp.Content = ""
-		}
-		// Tool call / result messages are embedded in the
-		// main assistant message's Parts — the separate rows
-		// are only for DB reconstruction and cause blank
-		// bubbles if returned to the frontend.
-		if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
-			continue
-		}
-
-		out = append(out, resp)
+	// Effective limit: explicit query param wins; otherwise
+	// the context-window cap (keeps the same default the old
+	// un-paged endpoint used).
+	limit := queryLimit
+	if limit <= 0 || limit > contextCap {
+		limit = contextCap
 	}
-	c.JSON(http.StatusOK, gin.H{"messages": out})
+
+	msgs, metas, createds, rowIDs := h.store.GetChatMessagesWithMetaPage(id, beforeID, limit)
+	out := make([]MessageResponse, 0, len(msgs))
+	// rowIDs[i] is the SQLite row id for msgs[i]. We pair them
+	// in buildMessageResponse so the client can use the lowest
+	// row id as the `before_id` cursor for the next page.
+	// rowIDs is in DESC order (matches the row order), so
+	// rowIDs[len-1] is the smallest id (oldest returned row).
+	for i, m := range msgs {
+		resp := buildMessageResponse(m, metas, createds, i, rowIDs[i])
+		if resp != nil {
+			out = append(out, *resp)
+		}
+	}
+
+	var (
+		hasMore   = false
+		oldestID int64
+	)
+	if len(rowIDs) > 0 {
+		oldestID = rowIDs[len(rowIDs)-1]
+		// `has_more` = "is there at least one row older
+		// than the oldest one we returned?". Cheap: a single
+		// indexed COUNT/EXISTS query.
+		hasMore = h.store.HasOlderMessages(id, oldestID)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"messages":  out,
+		"has_more":  hasMore,
+		"oldest_id": oldestID,
+	})
+}
+
+// buildMessageResponse shapes one ChatMessage row into the
+// public MessageResponse. Returns nil for rows the frontend
+// shouldn't render (tool call / tool result rows are
+// reconstructed into the assistant message's Parts; image
+// rows are surfaced as Attachments). rowID is the SQLite row
+// id, propagated so the client can use it as the
+// `before_id` cursor for the next page request.
+func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64) *MessageResponse {
+	created := time.Now().Unix()
+	if i < len(createds) && createds[i] != 0 {
+		created = createds[i]
+	}
+	resp := MessageResponse{
+		ID:        rowID,
+		Role:      m.Role,
+		Content:   m.Content,
+		CreatedAt: created,
+		Name:      m.Name,
+	}
+
+	// Media messages (image / audio / video): compute a data
+	// URL for the frontend. The frontend's MessageBubble
+	// distinguishes them by the `kind` field and the wire
+	// `type` (image_url / audio_url / video_url). We keep
+	// the same structure for all three so the storage
+	// path (raw base64 in messages.content) is identical.
+	if isMediaType(m.Type) && m.Content != "" {
+		mime := m.MimeType
+		if mime == "" {
+			mime = defaultMIMEForType(m.Type)
+		}
+		dataURL := "data:" + mime + ";base64," + m.Content
+		resp.Attachments = append(resp.Attachments, AttachmentPart{
+			Type: typeURLFor(m.Type),
+			URL:  dataURL,
+			Name: m.Name,
+			Kind: kindFor(m.Type),
+			MIME: mime,
+		})
+	}
+
+	// Tool call metadata.
+	if m.ToolID != "" {
+		resp.ToolCallID = m.ToolID
+	}
+
+	// Restore assistant parts from metadata.
+	if i < len(metas) && metas[i] != "" {
+		if parts := decodePartsFromMeta(metas[i], m.Content); len(parts) > 0 {
+			resp.Parts = parts
+		}
+	}
+	// Media messages carry their payload as data URLs in
+	// Attachments; clear Content so the frontend doesn't
+	// render the raw base64 string as text.
+	if isMediaType(m.Type) {
+		resp.Content = ""
+	}
+	// Tool call / result messages are embedded in the
+	// main assistant message's Parts — the separate rows
+	// are only for DB reconstruction and cause blank
+	// bubbles if returned to the frontend.
+	if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
+		return nil
+	}
+
+	return &resp
+}
+
+// parseInt64Query returns the int64 value of a query string
+// parameter, or `def` if the parameter is missing or invalid.
+func parseInt64Query(c *gin.Context, key string, def int64) int64 {
+	raw := c.Query(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// parseIntQuery returns the int value of a query string
+// parameter, or `def` if the parameter is missing or invalid.
+func parseIntQuery(c *gin.Context, key string, def int) int {
+	raw := c.Query(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// isMediaType reports whether t is a binary media type the
+// frontend can render inline (image / audio / video). All three
+// share the same storage path: raw base64 in messages.content,
+// surfaced to the UI as a data URL on the MessageAttachment.
+func isMediaType(t string) bool {
+	return t == llm.TypeImage || t == llm.TypeAudio || t == llm.TypeVideo
+}
+
+// defaultMIMEForType picks a sane MIME for a media row whose
+// metadata didn't capture one (defensive; the upload pipeline
+// always sets it). Bumping a video without a recorded MIME
+// down to video/mp4 lets the <video> element at least try
+// to play it.
+func defaultMIMEForType(t string) string {
+	switch t {
+	case llm.TypeImage:
+		return "image/png"
+	case llm.TypeAudio:
+		return "audio/mpeg"
+	case llm.TypeVideo:
+		return "video/mp4"
+	}
+	return "application/octet-stream"
+}
+
+// typeURLFor maps a media Type to the wire name the frontend
+// uses on MessageAttachment. We keep the OpenAI-style *_url
+// suffix for symmetry with the existing image path; the
+// MessageBubble component dispatches on this string.
+func typeURLFor(t string) string {
+	switch t {
+	case llm.TypeImage:
+		return "image_url"
+	case llm.TypeAudio:
+		return "audio_url"
+	case llm.TypeVideo:
+		return "video_url"
+	}
+	return ""
+}
+
+// kindFor maps a media Type to the lower-level "kind" the
+// frontend uses for its MessageAttachment.kind (drives the
+// chip icon / fallback render). Same vocabulary as the
+// uploadKind constants on the way in.
+func kindFor(t string) string {
+	switch t {
+	case llm.TypeImage:
+		return "image"
+	case llm.TypeAudio:
+		return "audio"
+	case llm.TypeVideo:
+		return "video"
+	}
+	return "file"
 }
 
 // mimeFromDataURL extracts the MIME type from a data URL
@@ -1082,7 +1496,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
-	if err := h.store.SetCurrent(id); err != nil {
+	if _, err := h.store.GetConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
@@ -1139,17 +1553,19 @@ func (h *Handler) SendMessage(c *gin.Context) {
 
 	// Build messages: history after last compression + new user message.
 	// Messages older than the compressed range are replaced by the
-	// CompressedSummary field on the ChatRequest.
+	// CompressedSummary field on the ChatRequest. All reads go through
+	// the per-session variants so concurrent SendMessage calls on
+	// different sessions don't race.
 	meta := h.ensureMetaLoaded(id)
 	limit := contextLevelLimit(meta.ReasoningEffort)
-	lastComp := h.store.LastCompressedID()
+	lastComp := h.store.LastCompressedIDFor(id)
 	var histMsgs []llm.ChatMessage
 	var compSummary string
 	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterID(limit, lastComp)
-		compSummary = h.store.CompressedSummary()
+		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, limit, lastComp)
+		compSummary = h.store.CompressedSummaryFor(id)
 	} else {
-		histMsgs = h.store.GetChatMessagesN(limit)
+		histMsgs = h.store.GetChatMessagesFor(id, limit)
 	}
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
@@ -1181,6 +1597,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		ProjectRoot:       meta.ProjectPath,
 		SkillContext:      req.SkillContext,
 		PlanMode:          meta.PlanMode,
+		PermissionLevel:   meta.PermissionLevel,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -1203,9 +1620,29 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			return false
 		}
 		ev := chunkToEvent(chunk, provider, model)
+		if chunk.Done {
+			if uid := h.store.GetLastUserMessageID(id); uid > 0 {
+				ev.UserMessageID = uid
+			}
+			if lid := h.store.GetLastMessageID(id); lid > 0 {
+				ev.LastMessageID = lid
+			}
+		}
+		if ev.Type == "question" {
+			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
+		}
 		data, _ := json.Marshal(ev)
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 			return false
+		}
+		// Flush after every event so the client sees it
+		// immediately, even when the next event is far
+		// away (e.g. the question tool blocks waiting
+		// for user input). Gin's stream writer already
+		// calls Flush(), but belt-and-suspenders for
+		// reverse-proxy scenarios (Wails desktop GUI).
+		if fl, ok := c.Writer.(http.Flusher); ok {
+			fl.Flush()
 		}
 		return !chunk.Done
 	})
@@ -1217,21 +1654,24 @@ func (h *Handler) SendMessage(c *gin.Context) {
 // on the assistant message even when the model is unknown to the
 // chunk itself.
 //
-// Mapping rules (order matters — more specific first):
-//   1. Error chunk     → "error" event
-//   2. Done chunk      → "done" event
-//   3. Tool call chunk → "tool" event
-//   4. Thinking delta  → "thinking" event
-//   5. Content delta   → "content" event
-//   6. Phase chunk     → "phase" event
-//   7. Anything else   → "phase" heartbeat (so the client
-//      doesn't appear to hang on a quiet channel).
+// ★ chunkToEvent 是服务端 ChatStreamChunk → 前端 StreamEvent 的映射器。
+// 映射规则（按优先级，更具体的匹配优先）：
+//   1. question JSON 非空     → type:"question"   (问题模态框)
+//   2. tool_confirm JSON 非空 → type:"tool_confirm" (沙箱确认)
+//   3. Error 非空             → type:"error"       (LLM 错误)
+//   4. Done == true           → type:"done"        (★ 终止 SSE)
+//   5. ToolName 非空          → type:"tool"        (工具调用结果)
+//   6. Thinking 非空          → type:"thinking"    (思考增量)
+//   7. Content 非空           → type:"content"     (文本增量)
+//   8. ContentRewrite 非空    → type:"content_rewrite" (后处理文本重写)
+//   9. ThinkingRewrite 非空   → type:"thinking_rewrite"
+//  10. Phase 非空             → type:"phase"       (子代理开始/结束 + 系统状态)
+//  11. 其他                   → type:"phase"       (心跳)
 //
-// Sub-agent fields are copied verbatim when set, regardless
-// of which type the chunk maps to. This lets the parent
-// surface a single nested "sub-agent" card whose inner
-// stream is a mix of content / thinking / phase events all
-// tagged with sub_agent=true.
+// Sub_agent 字段在所有分支中无条件拷贝，确保子代理的 content/thinking/tool/phase
+// 事件全部带有 sub_agent=true 标记，前端能正确路由到嵌套 SubAgentCard。
+//
+// 修改指南 → docs/modules/server.md
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {
 	ev := StreamEvent{
 		Phase:          chunk.Phase,
@@ -1242,8 +1682,36 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		SubAgent:       chunk.SubAgent,
 		SubAgentTask:   chunk.SubAgentTask,
 		SubAgentStatus: chunk.SubAgentStatus,
+		SubAgentType:   chunk.SubAgentType,
+		SubAgentColor:  chunk.SubAgentColor,
+		SubAgentModel:  chunk.SubAgentModel,
+		SubAgentTaskID: chunk.SubAgentTaskID,
+		SubAgentDescription: chunk.SubAgentDescription,
+		SubAgentFailureReason: chunk.SubAgentFailureReason,
+		ThinkingRewrite: chunk.ThinkingRewrite,
+		SessionStatus:  chunk.SessionStatus,
+		// Elapsed carries the duration the server stamped on the
+		// chunk. The agent sets it on the final "done" chunk AND
+		// on every sub_agent_* lifecycle close event (so the
+		// SubAgentCard can show the elapsed time once the run
+		// finishes). Surfacing it here unconditionally lets the
+		// frontend read ev.elapsed on phase events without
+		// waiting for a separate "done" tick.
+		Elapsed: chunk.Duration,
 	}
 
+	// Question events are emitted by the question tool handler
+	// before it blocks waiting for user input.
+	if chunk.QuestionJSON != "" {
+		ev.Type = "question"
+		ev.QuestionJSON = chunk.QuestionJSON
+		return ev
+	}
+	if chunk.ToolConfirmJSON != "" {
+		ev.Type = "tool_confirm"
+		ev.ToolConfirmJSON = chunk.ToolConfirmJSON
+		return ev
+	}
 	if chunk.Error != "" {
 		ev.Type = "error"
 		ev.Error = chunk.Error
@@ -1255,7 +1723,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.Type = "done"
 		ev.TokensIn = chunk.TokensIn
 		ev.TokensOut = chunk.TokensOut
-		ev.Elapsed = chunk.Duration
+		// ev.Elapsed already populated above (chunk.Duration).
 		return ev
 	}
 	if chunk.ToolName != "" {
@@ -1263,6 +1731,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolName = chunk.ToolName
 		ev.ToolArgs = chunk.ToolArgs
 		ev.ToolResult = chunk.ToolResult
+		ev.ToolResultFull = chunk.ToolResultFull
 		ev.ToolError = chunk.ToolError
 		ev.ToolElapsed = chunk.ToolElapsed
 		switch {
@@ -1285,6 +1754,26 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 	if chunk.Content != "" {
 		ev.Type = "content"
 		ev.Content = chunk.Content
+		return ev
+	}
+	// ContentRewrite: the agent's post-stream redactor rewrote
+	// the assistant's trailing text (e.g. stripped a phantom
+	// vision error). The UI should REPLACE the trailing text
+	// part with this value, not append it. We treat this as a
+	// distinct event type so the chat store can route it
+	// differently from regular content deltas.
+	if chunk.ContentRewrite != "" {
+		ev.Type = "content_rewrite"
+		ev.Content = chunk.ContentRewrite
+		return ev
+	}
+	// ThinkingRewrite: same pattern but for the LLM's
+	// chain-of-thought block. Some phantoms appear in
+	// thinking rather than the text response; the UI
+	// replaces the trailing thinking part's text.
+	if chunk.ThinkingRewrite != "" {
+		ev.Type = "thinking_rewrite"
+		ev.Thinking = chunk.ThinkingRewrite
 		return ev
 	}
 	// Other phase events (system, memory, plan, sub-agent
@@ -1332,6 +1821,8 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		Style:       m.Style,
 		ProjectPath: m.ProjectPath,
 		PlanMode:    m.PlanMode,
+		PermissionLevel: m.PermissionLevel,
+		ReasoningEffort: m.ReasoningEffort,
 		CreatedAt:   cv.CreatedAt.Unix(),
 		UpdatedAt:   cv.UpdatedAt.Unix(),
 	}
@@ -1369,7 +1860,7 @@ func (h *Handler) CompressConversation(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "summarizer not available"})
 		return
 	}
-	if err := h.store.SetCurrent(id); err != nil {
+	if _, err := h.store.GetConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
@@ -1401,7 +1892,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
@@ -1426,11 +1917,11 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "content is required"})
 		return
 	}
-	if err := h.store.SetCurrent(id); err != nil {
+	if _, err := h.store.GetConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	h.store.AddChatMessage(llm.ChatMessage{
+	h.store.AddChatMessageTo(id, llm.ChatMessage{
 		Role:    llm.RoleSystem,
 		Type:    llm.TypeText,
 		Content: body.Content,
@@ -1444,7 +1935,60 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 func (h *Handler) GetTodos(c *gin.Context) {
 	id := c.Param("id")
 	todos := tool.GetSessionTodos(id)
+	// On cold cache (server restart), hydrate from SQLite.
+	if len(todos) == 0 && h.store != nil {
+		dbTodos := h.store.LoadTodos(id)
+		if len(dbTodos) > 0 {
+			toolTodos := make([]tool.TodoItem, len(dbTodos))
+			for i, t := range dbTodos {
+				toolTodos[i] = tool.TodoItem{
+					ID:      t.ID,
+					Content: t.Content,
+					Status:  t.Status,
+				}
+			}
+			tool.SetSessionTodos(id, toolTodos)
+			todos = toolTodos
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"todos": todos})
+}
+
+// QuestionResponse receives the user's answer to a pending
+// question from the frontend and delivers it to the waiting
+// question tool handler.
+// POST /api/v1/sessions/:id/question-response
+func (h *Handler) QuestionResponse(c *gin.Context) {
+	id := c.Param("id")
+	var resp tool.QuestionResponse
+	if err := c.ShouldBindJSON(&resp); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !tool.SubmitAnswer(id, resp) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no pending question for this session"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ConfirmResponse receives the user's approve/reject answer to a
+// pending tool confirm prompt.
+// POST /api/v1/sessions/:id/confirm-response
+func (h *Handler) ConfirmResponse(c *gin.Context) {
+	id := c.Param("id")
+	var body struct {
+		Approved bool `json:"approved"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !tool.SubmitConfirm(id, body.Approved) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no pending confirm for this session"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // --- Project CRUD ---
@@ -1615,4 +2159,159 @@ func (h *Handler) ListArchived(c *gin.Context) {
 		out = append(out, h.sessionToResponse(conv))
 	}
 	c.JSON(http.StatusOK, gin.H{"sessions": out})
+}
+
+// ListMCPServers GET /api/v1/mcp/servers
+func (h *Handler) ListMCPServers(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusOK, gin.H{"servers": []mcp.ServerInfo{}, "global_enabled": false})
+		return
+	}
+	servers := h.mcpMgr.List()
+	c.JSON(http.StatusOK, gin.H{"servers": servers, "global_enabled": h.mcpMgr.GlobalEnabled()})
+}
+
+// AddMCPServer POST /api/v1/mcp/servers
+func (h *Handler) AddMCPServer(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+
+	var body struct {
+		Name    string            `json:"name"`
+		Type    string            `json:"type,omitempty"`
+		Command string            `json:"command"`
+		Args    []string          `json:"args"`
+		Env     map[string]string `json:"env,omitempty"`
+		URL     string            `json:"url,omitempty"`
+		Enabled bool              `json:"enabled"`
+		Timeout string            `json:"timeout,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if body.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if body.Type != "sse" && body.Command == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "command is required for stdio transport"})
+		return
+	}
+	if body.Type == "sse" && body.URL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required for SSE transport"})
+		return
+	}
+
+	var timeout time.Duration
+	if body.Timeout != "" {
+		if d, err := time.ParseDuration(body.Timeout); err == nil && d > 0 {
+			timeout = d
+		}
+	}
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
+	tp := body.Type
+	if tp == "" {
+		tp = "stdio"
+	}
+
+	if err := h.mcpMgr.AddServer(mcp.ServerConfig{
+		Name:    body.Name,
+		Type:    tp,
+		Command: body.Command,
+		Args:    body.Args,
+		Env:     body.Env,
+		URL:     body.URL,
+		Enabled: body.Enabled,
+		Timeout: timeout,
+	}); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	h.persistMCPServers()
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// RemoveMCPServer DELETE /api/v1/mcp/servers/:name
+func (h *Handler) RemoveMCPServer(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+	name := c.Param("name")
+	if err := h.mcpMgr.RemoveServer(name); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	h.persistMCPServers()
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// RestartMCPServer POST /api/v1/mcp/servers/:name/restart
+func (h *Handler) RestartMCPServer(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+	name := c.Param("name")
+	if err := h.mcpMgr.Restart(name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// SetMCPGlobal PATCH /api/v1/mcp/global
+func (h *Handler) SetMCPGlobal(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	h.mcpMgr.SetGlobalEnabled(body.Enabled)
+	h.persistMCPServers()
+	c.JSON(http.StatusOK, gin.H{"global_enabled": h.mcpMgr.GlobalEnabled()})
+}
+
+func (h *Handler) persistMCPServers() {
+	srvInfos := h.mcpMgr.List()
+	servers := make([]config.MCPServerConfig, 0, len(srvInfos))
+	for _, info := range srvInfos {
+		srv, ok := h.mcpMgr.GetServer(info.Name)
+		if !ok {
+			continue
+		}
+		timeoutStr := ""
+		if srv.Timeout > 0 {
+			timeoutStr = srv.Timeout.String()
+		}
+		servers = append(servers, config.MCPServerConfig{
+			Name:    srv.Name,
+			Type:    srv.Type,
+			Command: srv.Command,
+			Args:    srv.Args,
+			Env:     srv.Env,
+			URL:     srv.URL,
+			Enabled: srv.Enabled,
+			Timeout: timeoutStr,
+		})
+	}
+	h.cfg.MCP.Servers = servers
+	h.cfg.MCP.Enabled = h.mcpMgr.GlobalEnabled()
+	if mgr := config.NewManager(); mgr != nil {
+		if err := mgr.SaveGlobal(h.cfg); err != nil {
+			log.Printf("[mcp] persist config: %v", err)
+		}
+	}
 }

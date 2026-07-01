@@ -45,11 +45,6 @@ func GlobalConfigYAML() string {
 	return filepath.Join(GlobalDir(), "config.yaml")
 }
 
-// ProjectConfigYAML is the legacy project config path.
-func ProjectConfigYAML() string {
-	return filepath.Join(ProjectDir(), "config.yaml")
-}
-
 // GlobalAgents returns ~/.p-chat/AGENTS.md
 func GlobalAgents() string {
 	return filepath.Join(GlobalDir(), "AGENTS.md")
@@ -106,6 +101,11 @@ func KnowledgeDir() string {
 	return filepath.Join(GlobalDir(), "knowledge")
 }
 
+// UploadsDir returns ~/.p-chat/uploads/ (file uploads)
+func UploadsDir() string {
+	return filepath.Join(GlobalDir(), "uploads")
+}
+
 // ToolsDir returns ~/.p-chat/tools/
 func ToolsDir() string {
 	return filepath.Join(GlobalDir(), "tools")
@@ -153,6 +153,8 @@ func EnsureGlobal() error {
 		GlobalPromptsDir(),
 		MemoryDir(),
 		ToolsDir(),
+		KnowledgeDir(),
+		UploadsDir(),
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {

@@ -1,13 +1,16 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
 	"github.com/p-chat/pchat/internal/agent"
+	"golang.org/x/term"
 )
 
 // ChatUI renders chat interactions in a clean, Claude-Code-inspired style.
@@ -19,6 +22,10 @@ import (
 type ChatUI struct {
 	provider string
 	model    string
+
+	// Question support
+	sessionID    string
+	submitAnswer func(sessionID string, answers map[string]string) error
 
 	// Spinner state
 	spinner *Spinner
@@ -48,6 +55,13 @@ func NewChatUI(provider, model string) *ChatUI {
 		start:        time.Now(),
 		firstContent: true,
 	}
+}
+
+// SetQuestionHandler wires up the session ID and a submit callback
+// so that ChatUI can render interactive questions when the LLM asks.
+func (u *ChatUI) SetQuestionHandler(sessionID string, submit func(sessionID string, answers map[string]string) error) {
+	u.sessionID = sessionID
+	u.submitAnswer = submit
 }
 
 // Handle processes a single chunk from the agent stream.
@@ -101,13 +115,75 @@ func (u *ChatUI) Handle(chunk agent.ChatStreamChunk) {
 	if chunk.Content != "" {
 		u.handleContent(chunk.Content)
 	}
+
+	// Question event (LLM asks the user a question)
+	if chunk.QuestionJSON != "" {
+		u.handleQuestionEvent(chunk.QuestionJSON)
+	}
 }
 
 // handleSubAgentEvent renders a chunk that came from a nested sub-agent.
 // Events are shown indented under the parent tool call that triggered them.
+//
+// Visual design (mirrors Claude Code's `renderToolUseProgressMessage`
+// for the sub-agent progress line):
+//
+//   - sub_agent_start   →  ⌥ agent-name · task description
+//   - sub_agent_ok/err  →  ✓ agent-name (1.2s, 5 tools)  or  ✗ ...
+//   - llm round-N done  →  ↳ LLM: short message
+//   - tool call-N       →  ↳ toolname(args)
+//   - tool ok           →  ↳ ✓ toolname
+//   - tool err/warn     →  ↳ ✗ toolname
+//   - content delta     →  text rendered with the dim style, indented
+//
+// Text deltas are no longer suppressed — the previous "let the
+// final result handle it" design made sub-agents feel opaque.
+// We render them with a dim style so they don't drown out the
+// parent's own stream, but the user can see what the sub-agent
+// is actually thinking. The final result is still returned in
+// full to the parent (no change in behavior at the LLM layer).
 func (u *ChatUI) handleSubAgentEvent(chunk agent.ChatStreamChunk) {
 	dim := color.New(color.FgHiBlack)
 	indent := "    " // 4 spaces: aligned under "  ● task(args)"
+
+	// Synthetic start event: open the sub-agent card on its
+	// own line. We print the agent name (when known) so the
+	// user can see which specialized agent was used.
+	if chunk.Phase == "sub_agent_start" {
+		header := indent + "↳ "
+		if chunk.SubAgentType != "" {
+			header += color.HiCyanString("%s ", chunk.SubAgentType)
+		} else {
+			header += color.HiCyanString("sub-agent ")
+		}
+		header += chunk.SubAgentTask
+		fmt.Println()
+		fmt.Println(header)
+		return
+	}
+
+	// Synthetic close event: summary line with elapsed
+	// time + tool count + model (when known).
+	if chunk.Phase == "sub_agent_ok" || chunk.Phase == "sub_agent_err" {
+		var icon string
+		if chunk.Phase == "sub_agent_ok" {
+			icon = color.HiGreenString("✓")
+		} else {
+			icon = color.HiRedString("✗")
+		}
+		summary := indent + "↳ " + icon + " "
+		if chunk.SubAgentType != "" {
+			summary += chunk.SubAgentType + " "
+		}
+		if chunk.Duration != "" {
+			summary += "(" + chunk.Duration + ")"
+		}
+		if chunk.SubAgentModel != "" {
+			summary += " " + color.HiBlackString("[%s]", chunk.SubAgentModel)
+		}
+		fmt.Println(summary)
+		return
+	}
 
 	if chunk.Phase == "llm" {
 		switch {
@@ -140,8 +216,12 @@ func (u *ChatUI) handleSubAgentEvent(chunk agent.ChatStreamChunk) {
 	}
 
 	if chunk.Content != "" {
-		// Sub-agent text output. Don't print directly; the parent's
-		// task result will show the full final text.
+		// Sub-agent text delta. Render it dim + indented so
+		// the parent's own stream stays the visual focus.
+		// The full text is also accumulated by the parent's
+		// task tool result, so the LLM still sees the same
+		// final answer either way.
+		dim.Printf("%s%s", indent, chunk.Content)
 		return
 	}
 
@@ -266,6 +346,170 @@ func (u *ChatUI) handleToolEvent(chunk agent.ChatStreamChunk) {
 		}
 		fmt.Println()
 		return
+	}
+}
+
+// questionOpt is an internal type for rendering a single option.
+type questionOpt struct {
+	Label    string
+	Selected bool
+}
+
+type cliQuestion struct {
+	Question    string `json:"question"`
+	Header      string `json:"header"`
+	Options     []struct {
+		Label       string `json:"label"`
+		Description string `json:"description"`
+	} `json:"options"`
+	MultiSelect bool `json:"multi_select,omitempty"`
+}
+
+func (u *ChatUI) handleQuestionEvent(rawJSON string) {
+	u.stopSpinner()
+	u.ensureLine()
+	fmt.Println()
+
+	var questions []cliQuestion
+	if err := json.Unmarshal([]byte(rawJSON), &questions); err != nil {
+		color.Red("  ✗ 无法解析问题: %v", err)
+		return
+	}
+	if len(questions) == 0 {
+		return
+	}
+
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		u.questionFallback(questions)
+		return
+	}
+	defer term.Restore(fd, oldState)
+
+	answers := make(map[string]string)
+	printed := 0
+
+	for qi, q := range questions {
+		opts := make([]questionOpt, len(q.Options))
+		for i, o := range q.Options {
+			opts[i] = questionOpt{Label: o.Label, Selected: false}
+		}
+
+		cursor := 0
+
+		render := func() {
+			clearLines(printed)
+			cyan := color.New(color.FgCyan, color.Bold)
+			white := color.New(color.FgWhite)
+			hiBlack := color.New(color.FgHiBlack)
+			green := color.New(color.FgGreen)
+
+			cyan.Printf("  [%d/%d] %s\n", qi+1, len(questions), q.Question)
+			lines := 1
+			for i, o := range q.Options {
+				mark := "  "
+				if i == cursor {
+					mark = "→ "
+				}
+				sel := " "
+				if q.MultiSelect {
+					if opts[i].Selected {
+						sel = "*"
+					} else {
+						sel = " "
+					}
+				}
+				desc := ""
+				if o.Description != "" {
+					desc = fmt.Sprintf("  — %s", o.Description)
+				}
+				if i == cursor {
+					green.Printf("  %s%s %s%s\n", mark, sel, o.Label, desc)
+				} else {
+					hiBlack.Printf("  %s%s %s%s\n", mark, sel, o.Label, desc)
+				}
+				lines++
+			}
+			white.Println("  ─────────────────────────────────────")
+			if q.MultiSelect {
+				hiBlack.Println("  ↑↓ 移动  Space 选择  Enter 确认")
+			} else {
+				hiBlack.Println("  ↑↓ 选择  Enter 确认")
+			}
+			lines += 2
+			printed = lines
+		}
+
+		render()
+
+		buf := make([]byte, 3)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
+				break
+			}
+
+			if buf[0] == '\r' || buf[0] == '\n' {
+				if q.MultiSelect {
+					var selected []string
+					for i, opt := range opts {
+						if opt.Selected {
+							selected = append(selected, q.Options[i].Label)
+						}
+					}
+					answers[q.Header] = strings.Join(selected, ", ")
+				} else {
+					answers[q.Header] = q.Options[cursor].Label
+				}
+				break
+			}
+
+			if buf[0] == ' ' && q.MultiSelect {
+				opts[cursor].Selected = !opts[cursor].Selected
+			}
+
+			if buf[0] == 0x1b && n >= 3 && buf[1] == '[' {
+				switch buf[2] {
+				case 'A':
+					if cursor > 0 {
+						cursor--
+					}
+				case 'B':
+					if cursor < len(q.Options)-1 {
+						cursor++
+					}
+				}
+			}
+
+			if buf[0] == 3 {
+				clearLines(printed)
+				color.Yellow("  ⚠ 问题已取消")
+				return
+			}
+
+			clearLines(printed)
+			render()
+		}
+	}
+
+	clearLines(printed)
+	fmt.Println()
+
+	if u.submitAnswer != nil {
+		if err := u.submitAnswer(u.sessionID, answers); err != nil {
+			color.Red("  ✗ 提交答案失败: %v", err)
+		}
+	}
+}
+
+func (u *ChatUI) questionFallback(questions []cliQuestion) {
+	color.Yellow("  ⚠ 终端不支持交互模式，回答默认选项")
+	for _, q := range questions {
+		color.Cyan("  Q: %s", q.Question)
+		for i, o := range q.Options {
+			color.HiBlack("    %d. %s", i+1, o.Label)
+		}
 	}
 }
 

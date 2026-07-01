@@ -2,13 +2,17 @@ version: '3'
 
 vars:
   GOPROXY: 'https://goproxy.cn,direct'
+  VERSION:
+    sh: powershell -NoProfile -Command "(Get-Content VERSION -Raw).Trim()"
+  GIT_COMMIT:
+    sh: powershell -NoProfile -Command "try { (git rev-parse --short HEAD).Trim() } catch { '' }"
 
 tasks:
   build:frontend:
     desc: 编译 Vue 前端 (Vite SPA)，输出到 web/ 并同步到 embed 目录
-    dir: cmd\pchat-gui\frontend
+    dir: frontend
     cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\..\scripts\clean-frontend-output.ps1"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\clean-frontend-output.ps1"
       - cmd: npm install
         ignore_error: true
       - npm run build
@@ -17,17 +21,18 @@ tasks:
       # build:all's `deps:` list is wrong: Task runs sibling deps
       # in parallel by default, so the sync can race ahead of
       # clean-frontend-output.ps1 and copy an empty tree.
-      - powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\..\scripts\sync-web.ps1"
-    sources:
-      - package.json
-      - package-lock.json
-      - vite.config.ts
-      - tsconfig.json
-      - index.html
-      - src/**/*
-    generates:
-      - ../../../web/index.html
-      - ../../../web/assets/**
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\sync-web.ps1"
+    # Intentionally no `sources:` / `generates:` — we always
+    # rebuild. The user's complaint was that the SPA shipped
+    # stale assets because the file-mtime check missed a
+    # change (e.g. edits in `node_modules`-adjacent files, or
+    # build-generated config that we don't list). Forcing a
+    # full rebuild on every `build:all` / `build:dev` adds
+    # ~10-15s but guarantees the binary embeds the same code
+    # the dev server shows. The clean-frontend-output wipe at
+    # the top of this task is the other half of the safety
+    # net — without it, content-hashed Vite assets from a
+    # previous build pile up in the embed and grow the binary.
     silent: false
 
   sync:web:
@@ -40,8 +45,8 @@ tasks:
     desc: 编译 CLI 和 Server（前端由 build:gui:npm 统一调度）
     deps: [build:frontend]
     cmds:
-      - go build -o bin/pchat.exe ./cmd/pchat
-      - go build -o bin/pchat-server.exe ./cmd/pchat-server
+      - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat.exe ./cmd/pchat
+      - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server.exe ./cmd/pchat-server
     silent: false
 
   build:gui:
@@ -49,10 +54,11 @@ tasks:
     deps: [build:frontend]
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -platform windows/amd64 -s
+      - cmd: wails build -platform windows/amd64 -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
+      - cmd: powershell -NoProfile -Command "Copy-Item -LiteralPath 'build\bin\pchat-gui.exe' -Destination '..\..\bin\pchat-gui.exe' -Force"
     silent: false
 
   build:gui:linux:
@@ -60,7 +66,7 @@ tasks:
     deps: [build:frontend]
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -platform linux/amd64 -s
+      - cmd: wails build -platform linux/amd64 -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -69,7 +75,7 @@ tasks:
   build:server:linux:
     desc: 交叉编译 Linux Server 二进制
     cmds:
-      - cmd: go build -o bin/pchat-server-linux ./cmd/pchat-server
+      - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-linux ./cmd/pchat-server
         env:
           GOOS: linux
           GOARCH: amd64
@@ -78,15 +84,25 @@ tasks:
 
   build:gui:npm:
     desc: 桌面端 — 仅刷新前端依赖（首次构建前需要）
-    dir: cmd\pchat-gui\frontend
+    dir: frontend
     cmds:
       - npm install
 
+  build:setup:
+    desc: 构建单文件安装器 bin/pchat-setup-v{version}.exe（依赖 build + build:gui）
+    deps: [build, build:gui]
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
+    generates:
+      - bin/pchat-setup-v*.exe
+    silent: false
+
   build:all:
-    desc: 同时编译 CLI / Server / 桌面端
+    desc: 同时编译 CLI / Server / 桌面端 / 安装器
     cmds:
       - task: build
       - task: build:gui
+      - task: build:setup
 
   package:gui:
     desc: 把桌面端打包到 bin\（含前端 SPA + pchat-server.exe + install/uninstall 脚本）
@@ -124,6 +140,27 @@ tasks:
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
+
+  build:dev:
+    desc: 快速编译并启动 GUI 测试环境（绕过 wails dev，前端内嵌到 pchat-server）
+    deps: [build:frontend]
+    cmds:
+      - powershell -NoProfile -Command "New-Item -ItemType Directory -Path dev-bin -Force | Out-Null"
+      - go build -o dev-bin/pchat-server.exe ./cmd/pchat-server
+      - go build -o dev-bin/pchat.exe ./cmd/pchat
+      - task: build:dev:gui
+      - powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name 'pchat-gui' -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name 'pchat-server' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 500"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\dev-bin\pchat-gui.exe'"
+
+  build:dev:gui:
+    internal: true
+    dir: cmd\pchat-gui
+    cmds:
+      - cmd: wails build -debug -s
+        env:
+          GOPROXY: '{{.GOPROXY}}'
+          GOTOOLCHAIN: auto
+      - cmd: powershell -NoProfile -Command "Copy-Item -LiteralPath 'build\bin\pchat-gui.exe' -Destination '..\..\dev-bin\pchat-gui.exe' -Force"
 
   install:gui:
     desc: 安装桌面端到 %LOCALAPPDATA%\Programs\P-Chat\
@@ -195,5 +232,6 @@ tasks:
     desc: 清理编译产物
     cmds:
       - Remove-Item -Recurse -Force bin -ErrorAction SilentlyContinue
+      - Remove-Item -Recurse -Force dev-bin -ErrorAction SilentlyContinue
       - Remove-Item -Recurse -Force cmd\pchat-gui\build\bin -ErrorAction SilentlyContinue
       - Remove-Item -Recurse -Force web\assets -ErrorAction SilentlyContinue

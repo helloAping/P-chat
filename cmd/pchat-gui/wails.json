@@ -2,6 +2,9 @@
   "$schema": "https://wails.io/schemas/config.v2.json",
   "name": "pchat-gui",
   "outputfilename": "pchat-gui",
+  "frontend:dist:dir": "../../web",
+  "frontend:dir": "../../frontend",
+  "frontend:dev:url": "http://localhost:5173/app",
   "ldflags": "-H windowsgui -s -w",
   "author": {
     "name": "P-Chat",

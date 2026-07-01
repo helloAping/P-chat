@@ -2,7 +2,7 @@
 //
 // The assistant message is rendered to the user as a flat list of
 // "parts" (text + thinking + tool calls + sub-agents) in stream
-// order. The client (cmd/pchat-gui/frontend) mirrors this in
+// order. The client (frontend/src/) mirrors this in
 // src/api/client.ts:MessagePart, and the server's wire type
 // (internal/server/handler.go:StreamEvent) flattens the per-part
 // events back out for streaming.
@@ -15,6 +15,22 @@
 // thinking blocks, tool calls, and sub-agent cards all come back
 // — they don't just disappear into a plain `content` text.
 package agent
+
+// partsAccumulator 维护当前轮次助手消息的结构化 parts 列表。
+//
+// 支持四种 part 类型：
+//   - text      — 文本增量（由 appendTextPart 追加）
+//   - thinking  — 思考增量（由 appendThinkingPart 追加，含 streaming flag）
+//   - tool      — 工具调用卡片（start/ok/err 状态，由 update 驱动）
+//   - sub_agent — 嵌套子代理卡片（start/ok/err 状态，含内嵌 Parts）
+//
+// 并发安全：自有 mutex，主 LLM 流循环和 per-tool forwarder 同时写入。
+//
+// 持久化：snapshotStructural() 只保留 tool + sub_agent part → meta["parts"] JSON。
+//   text 和 thinking 不从快照写入 DB，而是在 GET /messages 时从 content 和
+//   meta["thinking"] 字段还原（见 handler.go decodePartsFromMeta）。
+//
+// 修改指南 → docs/modules/agent.md
 
 import (
 	"encoding/json"
@@ -46,6 +62,27 @@ type MessagePart struct {
 	Elapsed  string        `json:"elapsed,omitempty"`
 	Task     string        `json:"task,omitempty"`
 	Parts    []MessagePart `json:"parts,omitempty"`
+	// AgentType is the sub-agent's registered name
+	// ("explore", "plan", "general-purpose", or a custom
+	// agent from .p-chat/agent/*.md). Set on sub_agent
+	// parts so the card can render the agent label after a
+	// session reload.
+	AgentType string `json:"agent_type,omitempty"`
+	// AgentColor is the sub-agent's accent color. Same
+	// rationale as AgentType.
+	AgentColor string `json:"agent_color,omitempty"`
+	// AgentModel is the model the sub-agent used. Surfaced
+	// in the card header.
+	AgentModel string `json:"agent_model,omitempty"`
+	// TaskID is the resume-by-id key (Args.task_id).
+	// Surfaced in the card footer as a monospace badge.
+	TaskID string `json:"task_id,omitempty"`
+	// AgentDescription is the one-line "when to use" hint
+	// from the agent's registry entry. Surfaced as a
+	// hover tooltip on the agent-name badge in the card
+	// header so the user can read the full hint without
+	// expanding the body.
+	AgentDescription string `json:"agent_description,omitempty"`
 }
 
 // nativeToolCall is the parsed form of a tool call, whether it
@@ -139,10 +176,15 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			// this also ensures the part exists for any
 			// nested content / thinking that follows.
 			sub := MessagePart{
-				Kind:   "sub_agent",
-				Task:   c.SubAgentTask,
-				Status: "start",
-				Parts:  nil,
+				Kind:              "sub_agent",
+				Task:              c.SubAgentTask,
+				Status:            "start",
+				AgentType:         c.SubAgentType,
+				AgentColor:        c.SubAgentColor,
+				AgentModel:        c.SubAgentModel,
+				AgentDescription:  c.SubAgentDescription,
+				TaskID:            c.SubAgentTaskID,
+				Parts:             nil,
 			}
 			a.parts = append(a.parts, sub)
 			a.activeSub = len(a.parts) - 1
@@ -153,19 +195,69 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		// match by Task + Status=="start" so concurrent
 		// sub-agents (theoretically) don't trip each other.
 		for i := len(a.parts) - 1; i >= 0; i-- {
-			p := a.parts[i]
-			if p.Kind == "sub_agent" && p.Task == c.SubAgentTask && p.Status == "start" {
-				a.parts[i].Status = c.SubAgentStatus
-				if c.Duration != "" {
-					a.parts[i].Elapsed = c.Duration
-				}
-				a.activeSet = false
-				a.activeSub = -1
-				return
+			if a.parts[i].Kind != "sub_agent" || a.parts[i].Task != c.SubAgentTask || a.parts[i].Status != "start" {
+				continue
 			}
+			a.parts[i].Status = c.SubAgentStatus
+			if c.Duration != "" {
+				a.parts[i].Elapsed = c.Duration
+			}
+			// Backfill any metadata that arrived on
+			// the close event (e.g. the model name
+			// may only be known after the first
+			// chunk).
+			if c.SubAgentModel != "" && a.parts[i].AgentModel == "" {
+				a.parts[i].AgentModel = c.SubAgentModel
+			}
+			if c.SubAgentColor != "" && a.parts[i].AgentColor == "" {
+				a.parts[i].AgentColor = c.SubAgentColor
+			}
+			// ★ 清除嵌套 thinking parts 的 streaming flag。
+			// 子代理的 Done chunk 不再转发到 partsAcc（subagent.go
+			// 拦截了它），所以 Done 分支无法为子代理清理 streaming。
+			// 关闭事件是唯一可用的清理钩子——若此处不清，thinking
+			// 块在持久化时会带 streaming=true，并在会话重载后显示
+			// 永久闪烁效果。
+			// Clear streaming flags on nested thinking
+			// parts so they don't persist as "still
+			// streaming" across session reloads. The
+			// Done chunk (which normally handles this)
+			// is NOT forwarded for sub-agents — the
+			// close event is the only cleanup hook.
+			for j := range a.parts[i].Parts {
+				if a.parts[i].Parts[j].Kind == "thinking" && a.parts[i].Parts[j].Streaming {
+					a.parts[i].Parts[j].Streaming = false
+				}
+			}
+			a.activeSet = false
+			a.activeSub = -1
+			return
 		}
 		// Unknown task — drop.
 		return
+	}
+
+	// Mid-stream metadata backfill: while a sub-agent is
+	// running, the parent may emit a content / thinking /
+	// tool chunk with SubAgent=true and an updated
+	// SubAgentModel (e.g. the LLM resolved the model name
+	// after the first round). Walk the trailing sub_agent
+	// part with matching task and stamp the new field.
+	// Note: we index a.parts[i] directly (not a local copy)
+	// so the mutation lands on the persisted struct.
+	if c.SubAgent && c.SubAgentTask != "" {
+		for i := len(a.parts) - 1; i >= 0; i-- {
+			if a.parts[i].Kind != "sub_agent" || a.parts[i].Task != c.SubAgentTask {
+				continue
+			}
+			if c.SubAgentModel != "" && a.parts[i].AgentModel == "" {
+				a.parts[i].AgentModel = c.SubAgentModel
+			}
+			if c.SubAgentColor != "" && a.parts[i].AgentColor == "" {
+				a.parts[i].AgentColor = c.SubAgentColor
+			}
+			break
+		}
 	}
 
 	// Tool call: start / ok / warn / error.

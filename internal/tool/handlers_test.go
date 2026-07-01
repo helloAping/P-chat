@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/paths"
 )
 
 func TestReadFile_RequiresPath(t *testing.T) {
@@ -243,5 +245,95 @@ func TestIsBinary(t *testing.T) {
 	}
 	if isBinary(nil) {
 		t.Error("empty should not be binary")
+	}
+}
+
+// TestCommandReferencesUploadFile covers the helper that
+// exec_command uses to detect shell commands that try to read
+// files from the chat upload directory. The LLM has been
+// observed calling `cat image.png`, `xxd image.png`, and
+// `type image.png` to "see" an image whose model doesn't
+// support vision — we want to block these so the model gets a
+// clear E_UPLOAD_DIR error instead of trying to interpret
+// binary noise.
+func TestCommandReferencesUploadFile(t *testing.T) {
+	// Plant a fake upload so isInUploadDir() matches.
+	upDir := filepath.Join(paths.GlobalDir(), "uploads")
+	if err := os.MkdirAll(upDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(upDir, "evil.png")
+	if err := os.WriteFile(fake, []byte{0x89, 0x50, 0x4E, 0x47}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseName := filepath.Base(fake)
+
+	cases := []struct {
+		name   string
+		cmd    string
+		blocks bool
+	}{
+		{"empty", "", false},
+		{"plain safe", "dir", false},
+		{"cat bare filename", "cat " + baseName, true},
+		{"cat absolute path", "cat " + filepath.ToSlash(fake), true},
+		{"type windows-style", "type " + baseName, true},
+		{"xxd pipe", "xxd " + baseName + " | head", true},
+		{"redirected", "cat " + baseName + " > /tmp/x", true},
+		{"semicolon chained", "echo hi; cat " + baseName, true},
+		{"and chained", "ls && cat " + baseName, true},
+		{"quoted", `"cat ` + baseName + `"`, true},
+		{"safe file", "cat /etc/hostname", false},
+		{"safe with similar prefix", "cat evillooking.png", false}, // not in upload dir
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := commandReferencesUploadFile(c.cmd)
+			blocks := got != ""
+			if blocks != c.blocks {
+				t.Errorf("commandReferencesUploadFile(%q) blocked=%v, want %v (matched=%q)", c.cmd, blocks, c.blocks, got)
+			}
+		})
+	}
+}
+
+// TestHandleExecCommand_BlocksUploadFile ensures the
+// exec_command handler rejects shell commands that reference
+// files in the upload directory. Mirrors the read_file
+// behaviour, prevents the LLM from bypassing the vision
+// filter via shell.
+func TestHandleExecCommand_BlocksUploadFile(t *testing.T) {
+	upDir := filepath.Join(paths.GlobalDir(), "uploads")
+	if err := os.MkdirAll(upDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(upDir, "blocked.png")
+	if err := os.WriteFile(fake, []byte{0x89, 0x50}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// `cat` the upload — should be blocked.
+	res, _ := handleExecCommand(context.Background(), []byte(`{"command":"cat `+filepath.ToSlash(fake)+`"}`))
+	if !res.IsError {
+		t.Fatalf("expected error, got success: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "E_UPLOAD_DIR") {
+		t.Errorf("expected E_UPLOAD_DIR in error, got: %s", res.Content)
+	}
+}
+
+// TestHandleExecCommand_NoErrorPrefix ensures the error
+// content does not start with "ERROR: " — the previous
+// implementation prefixed it that way, which the LLM has been
+// observed to copy back to the user verbatim.
+func TestHandleExecCommand_NoErrorPrefix(t *testing.T) {
+	// Force a non-zero exit by running a command that
+	// will exit non-zero. Use a non-existent executable.
+	res, _ := handleExecCommand(context.Background(), []byte(`{"command":"this_exe_does_not_exist_12345"}`))
+	if !res.IsError {
+		t.Fatal("expected non-zero exit to produce an error result")
+	}
+	if strings.HasPrefix(strings.TrimSpace(res.Content), "ERROR:") {
+		t.Errorf("exec_command error content should not start with 'ERROR:', got: %q", res.Content)
 	}
 }

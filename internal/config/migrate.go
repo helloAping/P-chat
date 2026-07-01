@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"gopkg.in/yaml.v3"
@@ -191,11 +190,4 @@ func unmarshalYAML(data []byte, cfg *Config) error {
 
 	*cfg = converted
 	return nil
-}
-
-// marshalYAML is unused at runtime but exported for tests so we
-// can verify round-trip behavior. Keeping the helper here means
-// the yaml knowledge stays in this file.
-func marshalYAML(cfg *Config) ([]byte, error) {
-	return json.Marshal(cfg)
 }

@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 // Decision is the outcome of a sandbox check.
@@ -53,7 +54,7 @@ func (d Decision) String() string {
 // the process.
 type Sandbox struct {
 	enabled       bool
-	requireMode   string // "always" | "dangerous" | "never"
+	requireMode   string // "always" | "dangerous" | "confirm" | "never"
 	maxCmdLen     int
 	protectedDirs []string // resolved absolute paths (no ~ inside)
 	protectedGlobs []string // raw globs that we still do a substring match for
@@ -128,6 +129,8 @@ func (s *Sandbox) CheckExec(command string) Decision {
 		return Block
 	case "always":
 		return Confirm
+	case "confirm":
+		return Confirm
 	default: // "dangerous"
 		return Block
 	}
@@ -181,6 +184,16 @@ func (s *Sandbox) CheckExecBool(command string) bool {
 // CheckWriteBool satisfies the tool.SandboxChecker interface.
 func (s *Sandbox) CheckWriteBool(path string) bool {
 	return s.CheckWrite(path).Allowed()
+}
+
+// CheckExecDecision satisfies the expanded tool.SandboxChecker.
+func (s *Sandbox) CheckExecDecision(command string) tool.SandboxDecision {
+	return tool.SandboxDecision(s.CheckExec(command))
+}
+
+// CheckWriteDecision satisfies the expanded tool.SandboxChecker.
+func (s *Sandbox) CheckWriteDecision(path string) tool.SandboxDecision {
+	return tool.SandboxDecision(s.CheckWrite(path))
 }
 
 // anyMatch returns true if command matches any dangerous pattern.

@@ -17,6 +17,7 @@ import (
 	"github.com/p-chat/pchat/internal/server"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/upgrade"
 )
 
 // newTestServer wires the real server.Handler behind an httptest
@@ -33,14 +34,15 @@ func newTestServer(t *testing.T) *httptest.Server {
 		t.Fatalf("load config: %v", err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(dir+"/test.db", 50)
 	t.Cleanup(func() { store.Close() })
+	upgrade.SeedForTesting(store.DB())
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
 
-	srv := server.New(cfg, agt, store, styleMgr)
+	srv := server.New(cfg, agt, store, styleMgr, nil)
 	return httptest.NewServer(srv.Engine())
 }
 

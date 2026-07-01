@@ -14,9 +14,11 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 // cliContext abstracts everything slash commands need to know about
@@ -43,6 +45,17 @@ type cliContext interface {
 	RenameSession(ctx context.Context, id, title string) error
 	DeleteSession(ctx context.Context, id string) error
 	CurrentMessageCount() int
+	SubmitQuestionAnswer(ctx context.Context, sessionID string, answers map[string]string) error
+
+	// === Rollback ===
+	RollbackMessages(ctx context.Context, conversationID string, fromID int64) ([]httpcli.Message, error)
+	UndoRollback(ctx context.Context, conversationID string, messages []httpcli.Message) error
+	SaveRollbackUndo(convID string, msgs []httpcli.Message)
+	GetRollbackUndo(convID string) []httpcli.Message
+	ClearRollbackUndo(convID string)
+
+	// === Fork ===
+	ForkSession(ctx context.Context, sourceID string, beforeID int64) (*httpcli.Session, error)
 
 	// === Models / providers ===
 	ListProviders(ctx context.Context) ([]httpcli.ProviderInfo, error)
@@ -297,6 +310,70 @@ func (c *localContext) CurrentMessageCount() int {
 	return c.r.store.ConversationMessageCount()
 }
 
+func (c *localContext) SubmitQuestionAnswer(ctx context.Context, sessionID string, answers map[string]string) error {
+	resp := tool.QuestionResponse{Answers: answers}
+	if !tool.SubmitAnswer(sessionID, resp) {
+		return fmt.Errorf("no pending question for session %s", sessionID)
+	}
+	return nil
+}
+
+func (c *localContext) RollbackMessages(ctx context.Context, convID string, fromID int64) ([]httpcli.Message, error) {
+	deleted, err := c.r.store.DeleteMessagesFrom(convID, fromID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]httpcli.Message, 0, len(deleted))
+	for _, m := range deleted {
+		out = append(out, httpcli.Message{
+			ID:        m.ID,
+			Role:      m.Role,
+			Content:   m.Content,
+			CreatedAt: m.CreatedAt.Unix(),
+		})
+	}
+	return out, nil
+}
+
+func (c *localContext) UndoRollback(ctx context.Context, convID string, messages []httpcli.Message) error {
+	ms := make([]memory.Message, 0, len(messages))
+	for _, m := range messages {
+		ms = append(ms, memory.Message{
+			ID:             m.ID,
+			ConversationID: convID,
+			Role:           m.Role,
+			Content:        m.Content,
+			CreatedAt:      time.Unix(m.CreatedAt, 0),
+		})
+	}
+	return c.r.store.RestoreMessages(ms)
+}
+
+func (c *localContext) SaveRollbackUndo(convID string, msgs []httpcli.Message) {
+	c.r.rollbackUndo[convID] = msgs
+}
+
+func (c *localContext) GetRollbackUndo(convID string) []httpcli.Message {
+	return c.r.rollbackUndo[convID]
+}
+
+func (c *localContext) ClearRollbackUndo(convID string) {
+	delete(c.r.rollbackUndo, convID)
+}
+
+func (c *localContext) ForkSession(ctx context.Context, sourceID string, beforeID int64) (*httpcli.Session, error) {
+	conv, err := c.r.store.ForkConversation(sourceID, beforeID)
+	if err != nil {
+		return nil, err
+	}
+	return &httpcli.Session{
+		ID:        conv.ID,
+		Title:     conv.Title,
+		CreatedAt: conv.CreatedAt.Unix(),
+		UpdatedAt: conv.UpdatedAt.Unix(),
+	}, nil
+}
+
 func (c *localContext) ListProviders(ctx context.Context) ([]httpcli.ProviderInfo, error) {
 	ps := c.r.cfg.LLM.Providers
 	out := make([]httpcli.ProviderInfo, 0, len(ps))
@@ -519,7 +596,7 @@ func (c *localContext) ChatStream(ctx context.Context, req agent.ChatRequest) (<
 	return c.r.agent.ChatStream(ctx, req), nil
 }
 
-func (c *localContext) StyleLabel(s style.Style) string { return c.r.styleMgr.Label(s) }
+func (c *localContext) StyleLabel(s style.Style) string { return c.r.styleMgr.DisplayLabel(s) }
 func (c *localContext) ListStyles() []style.Style        { return c.r.styleMgr.List() }
 func (c *localContext) StyleName() string                 { return string(c.r.style) }
 
@@ -732,6 +809,19 @@ type httpContext struct {
 	style   string
 	prov    string
 	curSess string
+
+	rollbackUndo map[string][]httpcli.Message
+}
+
+// NewHTTPContext creates a cliContext backed by an httpcli.Client.
+// All operations go through the pchat-server REST API.
+func NewHTTPContext(c *httpcli.Client, style, provider, sessionID string) cliContext {
+	return &httpContext{
+		c:       c,
+		style:   style,
+		prov:    provider,
+		curSess: sessionID,
+	}
 }
 
 func (c *httpContext) unsupported(op string) error {
@@ -797,6 +887,41 @@ func (c *httpContext) DeleteSession(ctx context.Context, id string) error {
 	return c.c.DeleteSession(ctx, id)
 }
 func (c *httpContext) CurrentMessageCount() int { return 0 }
+
+func (c *httpContext) RollbackMessages(ctx context.Context, convID string, fromID int64) ([]httpcli.Message, error) {
+	result, err := c.c.RollbackMessages(ctx, convID, fromID)
+	if err != nil {
+		return nil, err
+	}
+	return result.DeletedMessages, nil
+}
+
+func (c *httpContext) UndoRollback(ctx context.Context, convID string, messages []httpcli.Message) error {
+	return c.c.UndoRollbackMessages(ctx, convID, messages)
+}
+
+func (c *httpContext) SaveRollbackUndo(convID string, msgs []httpcli.Message) {
+	if c.rollbackUndo == nil {
+		c.rollbackUndo = make(map[string][]httpcli.Message)
+	}
+	c.rollbackUndo[convID] = msgs
+}
+
+func (c *httpContext) GetRollbackUndo(convID string) []httpcli.Message {
+	return c.rollbackUndo[convID]
+}
+
+func (c *httpContext) ClearRollbackUndo(convID string) {
+	delete(c.rollbackUndo, convID)
+}
+
+func (c *httpContext) ForkSession(ctx context.Context, sourceID string, beforeID int64) (*httpcli.Session, error) {
+	return c.c.ForkSession(ctx, sourceID, beforeID)
+}
+
+func (c *httpContext) SubmitQuestionAnswer(ctx context.Context, sessionID string, answers map[string]string) error {
+	return c.c.SubmitQuestionResponse(ctx, sessionID, answers)
+}
 
 func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
 	out := make(chan agent.ChatStreamChunk, 16)
@@ -883,18 +1008,19 @@ func lastUserContent(msgs []llm.ChatMessage) string {
 // agent.ChatStreamChunk shape used by the local UI renderer.
 func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 	return agent.ChatStreamChunk{
-		Content:     ev.Content,
-		Phase:       ev.Phase,
-		Step:        ev.Step,
-		Message:     ev.Msg,
-		ToolName:    ev.ToolName,
-		ToolResult:  ev.ToolResult,
-		ToolError:   ev.ToolError,
-		ToolElapsed: ev.ToolElapsed,
-		TokensIn:    ev.TokensIn,
-		TokensOut:   ev.TokensOut,
-		Duration:    ev.Elapsed,
-		Error:       ev.Error,
+		Content:      ev.Content,
+		Phase:        ev.Phase,
+		Step:         ev.Step,
+		Message:      ev.Msg,
+		ToolName:     ev.ToolName,
+		ToolResult:   ev.ToolResult,
+		ToolError:    ev.ToolError,
+		ToolElapsed:  ev.ToolElapsed,
+		TokensIn:     ev.TokensIn,
+		TokensOut:    ev.TokensOut,
+		Duration:     ev.Elapsed,
+		Error:        ev.Error,
+		QuestionJSON: ev.QuestionJSON,
 	}
 }
 

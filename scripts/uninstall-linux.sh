@@ -27,7 +27,7 @@ DESKTOP_FILE="$PREFIX/share/applications/pchat.desktop"
 echo "[uninstall] prefix: $PREFIX"
 
 # --- stop running instances ---
-for proc in pchat-gui pchat-server; do
+for proc in pchat-gui pchat-server pchat; do
   if pid=$(pgrep -f "$proc" 2>/dev/null || true); then
     echo "[uninstall] stopping $proc (PID: $pid)"
     kill "$pid" 2>/dev/null || true
@@ -36,7 +36,7 @@ for proc in pchat-gui pchat-server; do
 done
 
 # --- remove binaries ---
-for bin in pchat-gui pchat-server; do
+for bin in pchat-gui pchat-server pchat; do
   if [[ -f "$BIN_DIR/$bin" ]]; then
     rm -f "$BIN_DIR/$bin"
     echo "[uninstall] removed $BIN_DIR/$bin"

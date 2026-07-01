@@ -15,6 +15,7 @@ import (
 	"github.com/p-chat/pchat/internal/server"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/upgrade"
 )
 
 // newTestServer is duplicated in httpcli tests; we duplicate to
@@ -30,16 +31,17 @@ func newWebServer(t *testing.T) *httptest.Server {
 		t.Fatalf("load: %v", err)
 	}
 	llmClient, _ := llm.NewClient(&cfg.LLM)
-	styleMgr, _ := style.NewManager(config.PromptDir())
 	store, _ := memory.OpenAt(dir+"/test.db", 50)
 	t.Cleanup(func() { store.Close() })
+	upgrade.SeedForTesting(store.DB())
+	styleMgr, _ := style.NewManager(store.DB())
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
 
 	// Use an absolute path so the test is cwd-independent.
 	absWeb, _ := filepath.Abs("../../web")
-	return httptest.NewServer(server.NewWithStaticDir(cfg, agt, store, styleMgr, absWeb).Engine())
+	return httptest.NewServer(server.NewWithStaticDir(cfg, agt, store, styleMgr, absWeb, nil).Engine())
 }
 
 func TestWebGUI_IndexPage(t *testing.T) {

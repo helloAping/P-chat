@@ -31,18 +31,20 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -50,6 +52,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -171,15 +174,14 @@ func main() {
 
 // App holds the child server process. It also implements http.Handler so
 // the Wails AssetServer can route every webview request through us: a
-// loading HTML while the child is starting, and a reverse proxy to the
-// child once it's healthy.
+// loading HTML while the child is starting, and a proxy to the child
+// once it's healthy.
 type App struct {
-	ctx       context.Context
-	serverCmd *exec.Cmd
-	proxy     atomic.Pointer[httputil.ReverseProxy]
-	proxyHost atomic.Pointer[string] // host:port of the backend, used to rewrite Location headers
-	mu        sync.Mutex
-	ready     atomic.Bool
+	ctx        context.Context
+	serverCmd  *exec.Cmd
+	backendURL atomic.Pointer[string] // "http://127.0.0.1:PORT"
+	mu         sync.Mutex
+	ready      atomic.Bool
 }
 
 // NewApp creates a new App application struct.
@@ -187,20 +189,202 @@ func NewApp() *App {
 	return &App{}
 }
 
-// ServeHTTP routes the request. If pchat-server is healthy and a proxy is
-// installed, we forward the request to it (and rewrite absolute-Location
-// redirects back to the webview origin). Otherwise we return the loading
-// HTML with HTTP 503.
+// ServeHTTP routes the request. If pchat-server is healthy and a backend
+// URL is set, we forward the request to it. Otherwise we return the
+// loading HTML.
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p := a.proxy.Load()
-	if p == nil {
-		log.Printf("ServeHTTP: %s %s (no proxy yet) -> loading", r.Method, r.URL.Path)
+	backend := a.backendURL.Load()
+	if backend == nil {
+		log.Printf("ServeHTTP: %s %s (no backend yet) -> loading", r.Method, r.URL.Path)
 		writeLoading(w)
 		return
 	}
 	ww := &statusRecorder{ResponseWriter: w, status: 200}
-	p.ServeHTTP(ww, r)
+	a.proxyRequest(ww, r, *backend)
 	log.Printf("ServeHTTP: %s %s -> %d", r.Method, r.URL.Path, ww.status)
+}
+
+// OpenExplorer opens the OS-native file manager at the given directory path.
+func (a *App) OpenExplorer(path string) {
+	if err := openExplorer(path); err != nil {
+		log.Printf("OpenExplorer %q: %v", path, err)
+	}
+}
+
+// OpenTerminal opens the OS-native terminal at the given directory path.
+func (a *App) OpenTerminal(path string) {
+	if err := openTerminal(path); err != nil {
+		log.Printf("OpenTerminal %q: %v", path, err)
+	}
+}
+
+// GetBackendURL returns the pchat-server base URL (e.g.
+// "http://127.0.0.1:18960") for the webview to use as a direct
+// connection point. Returns "" if the child server hasn't
+// announced its port yet — callers should retry.
+//
+// The webview uses this for the SSE message endpoint because the
+// Wails AssetServer's response writer buffers the entire body and
+// only flushes when the request handler returns, which is
+// incompatible with an SSE stream that may park for minutes
+// waiting on the user (the `question` tool flow).
+func (a *App) GetBackendURL() string {
+	v := a.backendURL.Load()
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+// StreamMessages proxies a chat-completion request to pchat-server
+// and re-broadcasts each SSE event to the webview via the
+// `stream:event` Wails event. This is the SSE path the Wails
+// AssetServer cannot serve: the AssetServer's response writer
+// buffers the entire body and only flushes when the request
+// handler returns, which doesn't happen for a 5-minute question
+// tool block. Going through the Go side avoids the Wails proxy
+// (and the CORS/Private-Network-Access headers it would otherwise
+// need) entirely.
+//
+// `body` is the JSON request payload the webview would normally
+// POST to /api/v1/sessions/:id/messages. Returns the number of
+// events forwarded (or an error if the child server is
+// unreachable / the request fails up front).
+func (a *App) StreamMessages(sessionID string, bodyJSON string) (int, error) {
+	backend := a.GetBackendURL()
+	if backend == "" {
+		return 0, fmt.Errorf("pchat-server not ready (no backend URL)")
+	}
+	url := fmt.Sprintf("%s/api/v1/sessions/%s/messages", backend, sessionID)
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(bodyJSON))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{
+		// No overall timeout — the `question` tool parks the
+		// stream for up to 5 minutes. The frontend cancels via
+		// AbortController which closes the response body and
+		// unblocks the Read below.
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("stream POST %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("stream POST %s: HTTP %d: %s", url, resp.StatusCode, string(t))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var (
+		eventName string
+		dataBuf   strings.Builder
+		count     int
+	)
+	emit := func() {
+		if dataBuf.Len() == 0 {
+			eventName = ""
+			return
+		}
+		// Stamp the session id on every event so the frontend
+		// can route concurrent streams to the right session.
+		// EventsOn is process-global, so without this two
+		// parallel SendMessage calls would interleave events
+		// and Vue's reactive map (state.sessionMessages) would
+		// see chunks for the wrong conversation.
+		payload := map[string]interface{}{
+			"session": sessionID,
+			"event":   eventName,
+			"data":    dataBuf.String(),
+		}
+		if b, err := json.Marshal(payload); err == nil {
+			if a.ctx != nil {
+				wailsruntime.EventsEmit(a.ctx, "stream:event", string(b))
+			}
+			count++
+		}
+		eventName = ""
+		dataBuf.Reset()
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case line == "":
+			emit()
+		case strings.HasPrefix(line, "event: "):
+			eventName = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(strings.TrimPrefix(line, "data: "))
+		}
+	}
+	emit() // flush trailing data block, if any
+	if err := scanner.Err(); err != nil {
+		log.Printf("StreamMessages: scanner error: %v", err)
+	}
+	// Signal end-of-stream so the frontend can finalize state.
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "stream:end", sessionID)
+	}
+	return count, nil
+}
+
+// CancelStream aborts an in-flight StreamMessages call. The
+// webview calls this when the user hits Stop, closes the session,
+// or navigates away. Implementation: closes the body of the
+// current request, which makes the scanner return from Read and
+// the goroutine in StreamMessages exit.
+//
+// We don't track the active *http.Response here — closing the
+// request context (passed via the AbortController on the JS side)
+// is enough; the goroutine running StreamMessages sees the body
+// return an error and unwinds. This stub exists so the frontend
+// can call something on Stop and so future refinement (per-call
+// cancellation, ctx propagation) has a place to live.
+func (a *App) CancelStream(sessionID string) {
+	log.Printf("CancelStream: session=%s", sessionID)
+}
+
+// openExplorer opens the OS file manager at the given path.
+func openExplorer(path string) error {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("path not accessible: %w", err)
+	}
+	if !stat.IsDir() {
+		return fmt.Errorf("not a directory: %s", path)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("explorer", path).Start()
+	default:
+		return fmt.Errorf("file explorer not supported on %s", runtime.GOOS)
+	}
+}
+
+// openTerminal opens a new terminal window at the given path.
+func openTerminal(path string) error {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("path not accessible: %w", err)
+	}
+	if !stat.IsDir() {
+		return fmt.Errorf("not a directory: %s", path)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		script := fmt.Sprintf(`Start-Process powershell -ArgumentList '-NoExit','-Command','Set-Location ''%s'''`, path)
+		return exec.Command("powershell", "-NoProfile", "-Command", script).Start()
+	default:
+		return fmt.Errorf("terminal not supported on %s", runtime.GOOS)
+	}
 }
 
 func writeLoading(w http.ResponseWriter) {
@@ -220,51 +404,238 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// installProxy builds and stores a reverse proxy to pchat-server running
-// on host:port. It also rewrites any absolute "Location" header that
-// points at the backend so the webview keeps staying inside the
-// wails.localhost origin.
+// Flush pushes buffered data to the client immediately. SSE events
+// (especially the "question" tool event which blocks the stream for
+// minutes) must reach the WebView2 without delay, otherwise the
+// frontend stalls at the loading cursor forever.
 //
-// The proxy uses a "dial-failure fallback" transport: if pchat-server
-// isn't accepting connections yet, the transport returns the loading
-// HTML (200) instead of a 502, so WebView2 doesn't swap in its own error
-// page. The loading HTML's JS keeps polling /api/v1/health; once the
-// proxy can actually reach the backend, that endpoint returns real JSON,
-// the JS detects the Content-Type, and the webview navigates to /app/.
-func (a *App) installProxy(host string, port int) {
-	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("%s:%d", host, port)}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	proxy.Director = func(r *http.Request) {
-		originalDirector(r)
-		r.Host = target.Host
+// Wails v2.12.0's AssetServer wraps the response writer in
+// contentTypeSniffer (which stores the inner writer in an unexported
+// "rw" field) and bodyRecorder. Neither implements http.Flusher, and
+// neither provides Unwrap(). A simple type-assertion on the top-level
+// writer silently fails. This method walks through both standard
+// Unwrap() chains and unexported struct fields (via reflect+unsafe)
+// to find the underlying http.Flusher.
+func (s *statusRecorder) Flush() {
+	if fl := findFlusher(s.ResponseWriter); fl != nil {
+		fl.Flush()
+	} else {
+		// No flusher found in the response writer chain. SSE
+		// events will be buffered in Go's bufio.Writer and only
+		// reach WebView2 when the buffer fills (~4KB) or the
+		// response ends. The question tool blocks for up to
+		// 5 minutes, so small events (like the question payload)
+		// never get through. Log this so we can diagnose.
+		log.Printf("[wails] Flush: no http.Flusher found in response writer chain (type=%T) — SSE events may be buffered", s.ResponseWriter)
 	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		loc := resp.Header.Get("Location")
-		if loc == "" {
-			return nil
+}
+
+// findFlusher searches for an http.Flusher by walking through
+// http.ResponseWriter wrappers. It tries the standard Unwrap()
+// chain first, then falls back to reflection (including unexported
+// fields via unsafe) to handle opaque wrappers like Wails'
+// contentTypeSniffer.
+func findFlusher(w http.ResponseWriter) http.Flusher {
+	type unwrapper interface{ Unwrap() http.ResponseWriter }
+
+	rw := w
+	for {
+		if fl, ok := rw.(http.Flusher); ok {
+			return fl
 		}
-		if u, err := url.Parse(loc); err == nil {
-			if u.IsAbs() && strings.EqualFold(u.Host, target.Host) {
-				u.Scheme = "http"
-				u.Host = "wails.localhost"
-				resp.Header.Set("Location", u.String())
+		if u, ok := rw.(unwrapper); ok {
+			rw = u.Unwrap()
+			continue
+		}
+		break
+	}
+	return findFlusherReflect(reflect.ValueOf(w))
+}
+
+func findFlusherReflect(v reflect.Value) (fl http.Flusher) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[wails] findFlusherReflect: panic: %v (v.Kind=%s, v.Type=%s)", r, v.Kind(), v.Type())
+		}
+	}()
+	// Unwrap interfaces and pointers until we reach a struct.
+	// http.ResponseWriter is an interface whose dynamic type is
+	// usually a pointer (e.g. *contentTypeSniffer → *http.response).
+	// Each .Elem() on a pointer/interface makes the next value
+	// addressable, which is required for UnsafeAddr() below.
+	for {
+		switch v.Kind() {
+		case reflect.Interface:
+			if v.IsNil() {
+				return nil
 			}
+			v = v.Elem()
+		case reflect.Ptr:
+			if v.IsNil() {
+				return nil
+			}
+			v = v.Elem()
+		default:
+			goto process
 		}
+	}
+process:
+	if v.Kind() != reflect.Struct {
 		return nil
 	}
-	proxy.Transport = &dialFallbackTransport{
-		inner:    http.DefaultTransport,
-		fallback: []byte(loadingHTML),
+
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		f := v.Field(i)
+		if !f.IsValid() {
+			continue
+		}
+
+		var iface interface{}
+		if f.CanInterface() {
+			iface = f.Interface()
+		} else {
+			// Unexported field — use reflect.NewAt+unsafe to
+			// create an addressable copy that bypasses the
+			// unexported restriction. This is necessary to
+			// reach contentTypeSniffer.rw.
+			rv := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr()))
+			iface = rv.Elem().Interface()
+		}
+
+		if iface == nil {
+			continue
+		}
+		if f, ok := iface.(http.Flusher); ok {
+			return f
+		}
+		if rw, ok := iface.(http.ResponseWriter); ok {
+			if fl := findFlusherReflect(reflect.ValueOf(rw)); fl != nil {
+				return fl
+			}
+		}
 	}
-	a.proxyHost.Store(&target.Host)
-	a.proxy.Store(proxy)
+	return nil
+}
+
+// proxyRequest forwards an HTTP request to the backend and streams the
+// response back. SSE responses (text/event-stream) are copied with
+// immediate flush after every write — no buffering. Regular responses
+// use standard io.Copy.
+func (a *App) proxyRequest(w http.ResponseWriter, r *http.Request, backend string) {
+	targetURL := backend + r.RequestURI
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	for key, vals := range r.Header {
+		for _, v := range vals {
+			req.Header.Add(key, v)
+		}
+	}
+
+	client := &http.Client{
+		Transport: &dialFallbackTransport{
+			inner:    http.DefaultTransport,
+			fallback: []byte(loadingHTML),
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeLoading(w)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy headers, rewriting absolute Location headers.
+	for key, vals := range resp.Header {
+		for _, v := range vals {
+			if key == "Location" {
+				if u, uErr := url.Parse(v); uErr == nil && u.IsAbs() {
+					u.Scheme = "http"
+					u.Host = "wails.localhost"
+					v = u.String()
+				}
+			}
+			w.Header().Add(key, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "text/event-stream") {
+		copyStreamFlush(w, resp.Body)
+	} else {
+		io.Copy(w, resp.Body)
+	}
+}
+
+// copyStreamFlush copies r to w, flushing after every write so the
+// WebView2 client sees each SSE event immediately — no buffering,
+// no delay.
+//
+// The 4KB-padding fallback exists for response writers that don't
+// implement http.Flusher (Wails v2's contentTypeSniffer is the
+// canonical offender: it embeds http.ResponseWriter in an unexported
+// field and provides no Flush). When the chain has no working flusher,
+// Go's bufio.Writer buffers the SSE event in a 4KB buffer and only
+// sends it when the buffer fills or the response ends — which never
+// happens for the "question" tool event (the stream is parked for
+// up to 5 minutes waiting for the user). Padding the write to ≥4KB
+// forces an auto-flush: SSE comment lines (":…") are valid in the
+// protocol and ignored by clients, including our frontend's
+// `data:`-only parser.
+func copyStreamFlush(w io.Writer, r io.Reader) {
+	// padChunk is a pre-built SSE comment line slightly larger
+	// than Go's default bufio.Writer size (4KB). Writing it after
+	// any sub-4KB SSE event forces the underlying buffered writer
+	// to drain to TCP, so the event reaches WebView2 immediately.
+	const padThreshold = 4096
+	padChunk := []byte(":" + strings.Repeat(" ", padThreshold) + "\n")
+	var padded int64
+	buf := make([]byte, 256)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				log.Printf("copyStreamFlush: write error: %v", werr)
+				return
+			}
+			fl, hasFlusher := w.(http.Flusher)
+			if hasFlusher {
+				fl.Flush()
+			} else if n < padThreshold {
+				// No flusher reachable. Force a TCP flush by
+				// writing a ~4KB SSE comment that overflows
+				// the bufio.Writer buffer. The comment is
+				// valid SSE and ignored by every conformant
+				// client (and by our frontend's `data:`-only
+				// parser).
+				if _, werr := w.Write(padChunk); werr != nil {
+					log.Printf("copyStreamFlush: padding write error: %v", werr)
+				}
+				padded += int64(len(padChunk))
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("proxyRequest: stream read error: %v", err)
+			}
+			if padded > 0 {
+				log.Printf("copyStreamFlush: used %d bytes of padding to force SSE flushes", padded)
+			}
+			return
+		}
+	}
 }
 
 // dialFallbackTransport wraps another RoundTripper and, on a connection
 // error to the backend, returns a synthetic 200 response with the
-// loading HTML as the body. This prevents WebView2 from showing its
-// built-in error page while pchat-server is still starting up.
+// loading HTML as the body.
 type dialFallbackTransport struct {
 	inner    http.RoundTripper
 	fallback []byte
@@ -275,7 +646,6 @@ func (t *dialFallbackTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if err == nil {
 		return resp, nil
 	}
-	// Connection-level error: backend is not (yet) reachable.
 	headers := http.Header{}
 	headers.Set("Content-Type", "text/html; charset=utf-8")
 	headers.Set("Cache-Control", "no-store")
@@ -418,11 +788,12 @@ func (a *App) spawnAndWatch() {
 	a.mu.Unlock()
 	log.Printf("spawned pchat-server PID=%d", cmd.Process.Pid)
 
-	// Install the reverse proxy immediately so the loading page can
+	// Store the backend URL immediately so the loading page can
 	// start polling /api/v1/health through us. The child is starting up
 	// in the background; the first few polls will get connection
 	// refused and the JS will retry.
-	a.installProxy("127.0.0.1", port)
+	beURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	a.backendURL.Store(&beURL)
 
 	// Wait for the server to be healthy (max 30s).
 	healthURL := fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", port)
@@ -451,6 +822,17 @@ func (a *App) spawnAndWatch() {
 	log.Printf("pchat-server is healthy at %s", healthURL)
 	a.ready.Store(true)
 
+	// Inject the backend URL into the webview as a global. The
+	// frontend uses it to open a direct connection to pchat-server
+	// for the SSE message endpoint — the Wails AssetServer's
+	// response writer buffers the entire body and only flushes when
+	// the request handler returns, which doesn't happen while the
+	// `question` tool is parked waiting for the user.
+	be := beURL
+	js := fmt.Sprintf("window.__PCHAT_BACKEND__ = %q; window.__pchat_backend_injected__ = true; console.log('[pchat-gui] injected backend URL:', window.__PCHAT_BACKEND__);", be)
+	log.Printf("[pchat-gui] injecting backend URL into webview: %s", be)
+	wailsruntime.WindowExecJS(a.ctx, js)
+
 	// Show the window. The webview is currently still rendering the
 	// loading HTML; on its next health poll it will detect 200 and
 	// navigate to "/", which now goes to pchat-server's real UI.
@@ -459,11 +841,11 @@ func (a *App) spawnAndWatch() {
 
 // findServerBinary searches common locations for pchat-server.exe, in order:
 //   1. The directory of the running pchat-gui.exe
-//   2. The repository `bin/` directory (dev mode, two levels up)
+//   2. The repository `bin/` directory (from CWD — covers `wails dev`)
 //   3. PATH
 func findServerBinary() (string, error) {
-	exe, err := os.Executable()
-	if err == nil {
+	// Resolve from executable directory first.
+	if exe, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exe)
 		candidates := []string{
 			filepath.Join(dir, "pchat-server.exe"),
@@ -473,11 +855,37 @@ func findServerBinary() (string, error) {
 		for _, c := range candidates {
 			if _, statErr := os.Stat(c); statErr == nil {
 				abs, _ := filepath.Abs(c)
+				log.Printf("findServerBinary: found at %s (exe=%s)", abs, exe)
 				return abs, nil
 			}
 		}
 	}
+
+	// wails dev builds the gui binary to a temp directory, so
+	// the exe-relative candidates above miss the project's bin/.
+	// Fall back to CWD-relative search.
+	if cwd, err := os.Getwd(); err == nil {
+		// Walk up to 5 levels looking for bin/pchat-server.exe
+		// to cover wails dev (CWD=cmd/pchat-gui) and running
+		// from anywhere in the project tree.
+		d := cwd
+		for i := 0; i < 5; i++ {
+			cand := filepath.Join(d, "bin", "pchat-server.exe")
+			if _, statErr := os.Stat(cand); statErr == nil {
+				abs, _ := filepath.Abs(cand)
+				log.Printf("findServerBinary: found at %s (cwd=%s, levels=%d)", abs, cwd, i)
+				return abs, nil
+			}
+			parent := filepath.Dir(d)
+			if parent == d {
+				break
+			}
+			d = parent
+		}
+	}
+
 	if path, err := exec.LookPath("pchat-server.exe"); err == nil {
+		log.Printf("findServerBinary: found in PATH: %s", path)
 		return path, nil
 	}
 	return "", fmt.Errorf("pchat-server.exe not found next to pchat-gui.exe and not in PATH")
@@ -494,8 +902,8 @@ func pickFreePort() (int, error) {
 }
 
 // pickConfigPath returns the user's p-chat config path. Prefers the
-// newer json file, falls back to yaml. Empty string means "use
-// pchat-server's built-in default".
+// newer json file, falls back to yaml. Returns "" when neither exists
+// (fresh install — pchat-server uses built-in defaults).
 func pickConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -509,7 +917,7 @@ func pickConfigPath() string {
 	if _, err := os.Stat(yamlPath); err == nil {
 		return yamlPath
 	}
-	return jsonPath
+	return ""
 }
 
 // hideChildConsole suppresses the stray console window that Go's

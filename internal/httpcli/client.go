@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 )
 
 // Client talks to pchat-server over HTTP. All methods are safe for
@@ -36,12 +35,13 @@ type Client struct {
 }
 
 // NewClient builds a client targeting the given base URL (e.g.
-// "http://127.0.0.1:8960"). A 30s timeout covers the slowest SSE
-// stream (long LLM responses).
+// "http://127.0.0.1:8960"). No timeout is set on the HTTP client —
+// SSE streams for long agent runs can last minutes; the caller
+// controls cancellation via context.
 func NewClient(base string) *Client {
 	return &Client{
 		base: strings.TrimRight(base, "/"),
-		http: &http.Client{Timeout: 30 * time.Second},
+		http: &http.Client{Timeout: 0},
 	}
 }
 
@@ -86,6 +86,9 @@ type StreamEvent struct {
 	// Error fields
 	Error      string `json:"error,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
+
+	// Question event (LLM asks user a question)
+	QuestionJSON string `json:"question_json,omitempty"`
 }
 
 // ProviderInfo mirrors the providers endpoint payload.
@@ -368,6 +371,15 @@ func (c *Client) DisplayModel(provider string) string {
 	return models[0].DisplayName
 }
 
+// SubmitQuestionResponse sends the user's answer to a pending
+// question back to the server so the agent can continue.
+func (c *Client) SubmitQuestionResponse(ctx context.Context, sessionID string, answers map[string]string) error {
+	body := map[string]interface{}{
+		"answers": answers,
+	}
+	return c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/question-response", body, nil)
+}
+
 // Flush is a no-op for the HTTP client; the server persists data
 // in its own SQLite store.
 func (c *Client) Flush() error { return nil }
@@ -398,3 +410,45 @@ func (c *Client) SetCfgProviders(ps []ProviderInfo) {
 
 // Internal state.
 func (c *Client) cfgProv() []ProviderInfo { return c.cfgProviders }
+
+// ====================================================================
+// Rollback API
+// ====================================================================
+
+// RollbackResult is the server response for a rollback request.
+type RollbackResult struct {
+	DeletedCount    int       `json:"deleted_count"`
+	DeletedMessages []Message `json:"deleted_messages"`
+}
+
+// RollbackMessages deletes the message with beforeID and all later
+// messages in the session. Returns the deleted messages for undo.
+func (c *Client) RollbackMessages(ctx context.Context, sessionID string, beforeID int64) (*RollbackResult, error) {
+	body := struct {
+		BeforeID int64 `json:"before_id"`
+	}{BeforeID: beforeID}
+	var result RollbackResult
+	if err := c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/rollback", body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// UndoRollbackMessages restores previously-deleted messages.
+func (c *Client) UndoRollbackMessages(ctx context.Context, sessionID string, messages []Message) error {
+	body := struct {
+		Messages []Message `json:"messages"`
+	}{Messages: messages}
+	return c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/rollback/undo", body, nil)
+}
+
+// ForkSession creates a new session containing all messages up to and
+// including beforeID from the source session.
+func (c *Client) ForkSession(ctx context.Context, sessionID string, beforeID int64) (*Session, error) {
+	body := map[string]int64{"before_id": beforeID}
+	var s Session
+	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/sessions/"+sessionID+"/fork", body, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}

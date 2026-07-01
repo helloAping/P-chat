@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Install agent tool symlinks pointing to .agents/AGENTS.md.
+# Install agent tool directory symlinks pointing to .agents/.
 #
-# Creates:
-#   .opencode/AGENTS.md  -> ./.agents/AGENTS.md
-#   .codex/AGENTS.md     -> ./.agents/AGENTS.md
-#   .claude/CLAUDE.md    -> ./.agents/AGENTS.md
+# Creates directory-level symlinks so all tools share the entire
+# .agents/ tree (AGENTS.md + docs/ + scripts/):
+#
+#   .opencode  ->  .agents/    (opencode reads .opencode/AGENTS.md)
+#   .codex     ->  .agents/    (codex reads .codex/AGENTS.md)
+#   .claude    ->  .agents/    (claude reads .claude/CLAUDE.md)
 #
 # Usage: bash .agents/scripts/install.sh [--force] [--dry-run]
 #
-# On Windows, the bash that ships with Git for Windows (MSYS) does
-# NOT create real Windows symlinks by default — it creates "Git
-# symlinks" that PowerShell and the Windows shell cannot follow.
-# We force native symlinks by exporting MSYS=winsymlinks:native so
-# `ln -s` produces a real Windows reparse point that any process
-# (including pchat-gui, opencode, and the PowerShell install
-# script) can resolve.
+# On Windows (MSYS/Git Bash), native symlinks are forced via
+# MSYS=winsymlinks:native so that PowerShell and the Windows
+# shell can resolve them.  Directory symlinks on Windows use
+# `mklink /J` (Junction) which does not require admin rights.
 
 set -euo pipefail
 export MSYS=${MSYS:-winsymlinks:native}
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$( cd "$SCRIPT_DIR/../.." && pwd )"
-CANONICAL="$REPO_ROOT/.agents/AGENTS.md"
+AGENTS_DIR="$REPO_ROOT/.agents"
+CANONICAL="$AGENTS_DIR/AGENTS.md"
 
 FORCE=0
 DRY_RUN=0
@@ -39,107 +39,115 @@ if [ ! -f "$CANONICAL" ]; then
     exit 1
 fi
 
-# Each tool's expected location -> target relative to the link's
-# parent directory.
-install_link() {
-    local link_abs="$1"
-    local rel_target="$2"
-    local link_rel="${link_abs#$REPO_ROOT/}"
+# Ensure .agents/CLAUDE.md exists for claude.
+CLAUDE_FILE="$AGENTS_DIR/CLAUDE.md"
+if [ ! -f "$CLAUDE_FILE" ]; then
+    cp "$CANONICAL" "$CLAUDE_FILE"
+    echo "  Created $CLAUDE_FILE (copy of AGENTS.md for claude)"
+fi
+
+# Directory-level symlink: remove old target, create link.
+install_dir_link() {
+    local link_path="$1"      # absolute: .opencode
+    local link_rel="${link_path#$REPO_ROOT/}"
+    local target_abs="$AGENTS_DIR"
 
     if [ "$DRY_RUN" = "1" ]; then
-        echo "  [dry-run] $link_rel  ->  $rel_target"
+        echo "  [dry-run] $link_rel  ->  .agents/"
         return
     fi
 
-    mkdir -p "$(dirname "$link_abs")"
-
-    # If the link already exists, decide what to do.
-    if [ -L "$link_abs" ]; then
+    # Remove existing target if replacing.
+    if [ -L "$link_path" ]; then
         local existing
-        existing=$(readlink "$link_abs")
-        if [ "$existing" = "$rel_target" ]; then
-            echo "  [ok]      $link_rel (already points to $rel_target)"
+        existing=$(readlink "$link_path")
+        if [ "$existing" = "$target_abs" ]; then
+            echo "  [ok]      $link_rel (already points to .agents/)"
             return
         fi
         if [ "$FORCE" = "1" ]; then
-            rm -f "$link_abs"
+            rm -rf "$link_path"
         else
-            echo "  [skip]    $link_rel already a symlink (target=$existing, want=$rel_target). Use --force to replace."
+            echo "  [skip]    $link_rel already a symlink (target=$existing). Use --force."
             return
         fi
-    elif [ -e "$link_abs" ]; then
+    elif [ -e "$link_path" ]; then
         if [ "$FORCE" = "1" ]; then
-            rm -rf "$link_abs"
+            rm -rf "$link_path"
         else
-            echo "  [skip]    $link_rel is a real file/dir. Use --force to replace."
+            echo "  [skip]    $link_rel exists. Use --force to replace."
             return
         fi
     fi
 
-    if ln -s "$rel_target" "$link_abs" 2>/dev/null; then
-        echo "  [linked]  $link_rel  ->  $rel_target"
-    elif [ -f "$rel_target" ] && command -v cmd.exe >/dev/null 2>&1; then
-        # Fallback: use Windows mklink through cmd. This is
-        # only needed in very old or restricted environments
-        # where `ln -s` (even with MSYS=winsymlinks:native)
-        # cannot create a symlink.
-        if cmd.exe //c "mklink \"$link_abs\" \"$rel_target\"" >/dev/null 2>&1; then
-            echo "  [linked]  $link_rel  ->  $rel_target  (via mklink)"
+    # Try native ln -s first.
+    if ln -s "$target_abs" "$link_path" 2>/dev/null; then
+        echo "  [linked]  $link_rel  ->  .agents/"
+    elif command -v cmd.exe >/dev/null 2>&1; then
+        # Windows fallback: mklink /J (Junction, no admin needed).
+        if cmd.exe //c "mklink /J \"$link_path\" \"$target_abs\"" >/dev/null 2>&1; then
+            echo "  [junction] $link_rel  ->  .agents/"
+        elif cmd.exe //c "mklink /D \"$link_path\" \".agents\"" >/dev/null 2>&1; then
+            echo "  [symlink]  $link_rel  ->  .agents/"
         else
-            # Final fallback: copy the file. Future edits to
-            # the canonical won't propagate; the user will
-            # need to re-run this script to sync.
-            cp "$rel_target" "$link_abs"
-            echo "  [copied]  $link_rel  <-  $rel_target  (no symlink: permission denied)"
+            # Last resort: copy files.
+            mkdir -p "$link_path"
+            cp -r "$target_abs"/* "$link_path/" 2>/dev/null || true
+            echo "  [copied]   $link_rel  <-  .agents/  (no symlink available)"
         fi
     else
-        # Non-Windows: no cmd.exe. Just copy.
-        cp "$rel_target" "$link_abs"
-        echo "  [copied]  $link_rel  <-  $rel_target  (no symlink: ln -s failed)"
+        # Unix but ln -s failed: copy.
+        mkdir -p "$link_path"
+        cp -r "$target_abs"/* "$link_path/" 2>/dev/null || true
+        echo "  [copied]   $link_rel  <-  .agents/  (ln -s failed)"
     fi
 }
 
 echo ""
-echo "Installing agent tool symlinks (canonical: $CANONICAL)"
+echo "Installing agent tool directory links -> .agents/"
 echo "Repo root: $REPO_ROOT"
 echo ""
 
-install_link "$REPO_ROOT/.opencode/AGENTS.md" "../.agents/AGENTS.md"
-install_link "$REPO_ROOT/.codex/AGENTS.md"    "../.agents/AGENTS.md"
-install_link "$REPO_ROOT/.claude/CLAUDE.md"   "../.agents/AGENTS.md"
+install_dir_link "$REPO_ROOT/.opencode"
+install_dir_link "$REPO_ROOT/.codex"
+install_dir_link "$REPO_ROOT/.claude"
 
-# If the root AGENTS.md is the project-init stub (template text
-# "在此描述你的项目"), replace it with a symlink so all paths
-# lead to the same canonical file.
+# .p-chat has local config content; sync AGENTS.md only.
+PCHAT_DIR="$REPO_ROOT/.p-chat"
+if [ -d "$PCHAT_DIR" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  [dry-run] .p-chat/AGENTS.md  <-  .agents/AGENTS.md"
+    else
+        cp "$CANONICAL" "$PCHAT_DIR/AGENTS.md"
+        echo "  [copied]  .p-chat/AGENTS.md  <-  .agents/AGENTS.md  (file level, .p-chat has local config)"
+    fi
+fi
+
+# Root AGENTS.md stub replacement.
 ROOT_AGENTS="$REPO_ROOT/AGENTS.md"
 if [ -e "$ROOT_AGENTS" ] && [ ! -L "$ROOT_AGENTS" ]; then
     if grep -q "在此描述你的项目" "$ROOT_AGENTS" 2>/dev/null; then
-        rel_root="../.agents/AGENTS.md"
         if [ "$DRY_RUN" = "1" ]; then
-            echo "  [dry-run] AGENTS.md (root)  ->  $rel_root  (would replace stub)"
+            echo "  [dry-run] AGENTS.md (root) would be replaced"
         else
             rm -f "$ROOT_AGENTS"
-            if ln -s "$rel_root" "$ROOT_AGENTS" 2>/dev/null; then
-                echo "  [linked]  AGENTS.md (root)  ->  $rel_root  (was a stub)"
-            elif command -v cmd.exe >/dev/null 2>&1; then
-                if cmd.exe //c "mklink \"$ROOT_AGENTS\" \"$rel_root\"" >/dev/null 2>&1; then
-                    echo "  [linked]  AGENTS.md (root)  ->  $rel_root  (via mklink)"
-                else
-                    cp "$rel_root" "$ROOT_AGENTS"
-                    echo "  [copied]  AGENTS.md (root)  <-  $rel_root  (no symlink)"
-                fi
+            if ln -s ".agents/AGENTS.md" "$ROOT_AGENTS" 2>/dev/null; then
+                echo "  [linked]  AGENTS.md (root)  ->  .agents/AGENTS.md"
             else
-                cp "$rel_root" "$ROOT_AGENTS"
-                echo "  [copied]  AGENTS.md (root)  <-  $rel_root  (no symlink)"
+                cp "$CANONICAL" "$ROOT_AGENTS"
+                echo "  [copied]  AGENTS.md (root)  <-  .agents/AGENTS.md"
             fi
         fi
     else
-        echo "  [skip]    AGENTS.md (root) is non-trivial content; not touching it."
+        echo "  [skip]    AGENTS.md (root) is non-trivial; not touching it."
     fi
 elif [ -L "$ROOT_AGENTS" ]; then
     echo "  [ok]      AGENTS.md (root) is already a symlink"
 fi
 
 echo ""
-echo "Done. Agent tools will now read .agents/AGENTS.md."
-echo "Edit .agents/AGENTS.md to update the canonical spec for all tools."
+echo "Done. Agent tools will now read .agents/ content via:"
+echo "  .opencode/AGENTS.md  -> .agents/AGENTS.md"
+echo "  .codex/AGENTS.md     -> .agents/AGENTS.md"
+echo "  .claude/CLAUDE.md    -> .agents/CLAUDE.md"
+echo "  .opencode/docs/      -> .agents/docs/"
