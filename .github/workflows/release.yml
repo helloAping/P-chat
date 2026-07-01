@@ -33,24 +33,31 @@ jobs:
           mkdir -p cmd/pchat-server/web
           cp -rf web/index.html web/assets cmd/pchat-server/web/
 
-      - name: Build Go binaries (cross-compile)
+      - name: Build & package (Windows)
         run: |
           TAG=${GITHUB_REF#refs/tags/}
+          mkdir -p "bin/${TAG}/web"
 
-          # Windows
           GOOS=windows GOARCH=amd64 go build -o "bin/${TAG}/pchat.exe" ./cmd/pchat
           GOOS=windows GOARCH=amd64 go build -o "bin/${TAG}/pchat-server.exe" ./cmd/pchat-server
-          cp -rf web/ "bin/${TAG}/web/"
-          cd bin && zip -r "../${TAG}-windows-amd64.zip" "${TAG}" && cd ..
+          cp -rf web/index.html web/assets "bin/${TAG}/web/"
 
-          # Linux
-          rm -f "bin/${TAG}/pchat.exe" "bin/${TAG}/pchat-server.exe" || true
+          cd bin && zip -r "../${TAG}-windows-amd64.zip" "${TAG}"
+
+      - name: Build & package (Linux)
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          mkdir -p "bin/${TAG}/web"
+
           GOOS=linux GOARCH=amd64 go build -o "bin/${TAG}/pchat" ./cmd/pchat
           GOOS=linux GOARCH=amd64 go build -o "bin/${TAG}/pchat-server" ./cmd/pchat-server
-          cd bin && tar czf "../${TAG}-linux-amd64.tar.gz" "${TAG}" && cd ..
+          cp -rf web/index.html web/assets "bin/${TAG}/web/"
+
+          cd bin && tar czf "../${TAG}-linux-amd64.tar.gz" "${TAG}"
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             *-windows-amd64.zip
             *-linux-amd64.tar.gz
+          generate_release_notes: false
