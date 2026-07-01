@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+    branches:
+      - feat_更新
 
 permissions:
   contents: write
@@ -32,7 +34,7 @@ jobs:
 
       - name: Build Linux binaries
         run: |
-          $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
+          $tag = if ($env:GITHUB_REF -match 'refs/tags/(.+)') { $matches[1] } else { 'test' }
           mkdir "bin/$tag-linux" -Force
 
           $env:GOOS = "linux"; $env:GOARCH = "amd64"
@@ -42,7 +44,8 @@ jobs:
           Copy-Item -Recurse "web/" "bin/$tag-linux/web/"
           cd bin; tar czf "../$tag-linux-amd64.tar.gz" "$tag-linux"
 
-      - name: Upload to release
+      - name: Upload to release (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |

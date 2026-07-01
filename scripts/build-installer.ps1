@@ -46,6 +46,7 @@ foreach ($f in @($guiExe, $serverExe, $cliExe)) {
 }
 
 # --- copy assets ---
+if (-not (Test-Path -LiteralPath $assets)) { New-Item -ItemType Directory -Path $assets -Force | Out-Null }
 Write-Host "[build-installer] Copy binaries -> $assets"
 Copy-Item -LiteralPath $guiExe    -Destination "$assets\pchat-gui.exe"    -Force
 Copy-Item -LiteralPath $serverExe -Destination "$assets\pchat-server.exe" -Force
