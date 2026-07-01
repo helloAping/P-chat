@@ -1,6 +1,6 @@
 # Frontend 模块（Vue 3 前端）
 
-> **位置**：`cmd/pchat-gui/frontend/src/`  
+> **位置**：`frontend/src/`  
 > **技术栈**：Vue 3 + Vite + Pinia + Naive UI + marked  
 > **后端通信**：HTTP REST (JSON) + SSE (Server-Sent Events)
 

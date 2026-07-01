@@ -10,9 +10,9 @@ vars:
 tasks:
   build:frontend:
     desc: 编译 Vue 前端 (Vite SPA)，输出到 web/ 并同步到 embed 目录
-    dir: cmd\pchat-gui\frontend
+    dir: frontend
     cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\..\scripts\clean-frontend-output.ps1"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\clean-frontend-output.ps1"
       - cmd: npm install
         ignore_error: true
       - npm run build
@@ -21,7 +21,7 @@ tasks:
       # build:all's `deps:` list is wrong: Task runs sibling deps
       # in parallel by default, so the sync can race ahead of
       # clean-frontend-output.ps1 and copy an empty tree.
-      - powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\..\scripts\sync-web.ps1"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\sync-web.ps1"
     # Intentionally no `sources:` / `generates:` — we always
     # rebuild. The user's complaint was that the SPA shipped
     # stale assets because the file-mtime check missed a
@@ -84,7 +84,7 @@ tasks:
 
   build:gui:npm:
     desc: 桌面端 — 仅刷新前端依赖（首次构建前需要）
-    dir: cmd\pchat-gui\frontend
+    dir: frontend
     cmds:
       - npm install
 

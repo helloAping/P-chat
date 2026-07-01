@@ -133,7 +133,7 @@ func TestMigration_V3_Bootstrap(t *testing.T) { ... }    // 已有数据的旧 D
 □ 2. 如有 Schema 变更，新增迁移定义在 allMigrations 末尾
 □ 3. 迁移测试通过：go test ./internal/memory/... -run TestMigration
 □ 4. 全量测试通过：go test ./...
-□ 5. 前端构建通过：cd cmd/pchat-gui/frontend && npm run build
+□ 5. 前端构建通过：cd frontend && npm run build
 □ 6. task build 成功，version 命令输出正确版本号
 □ 7. git tag v{version} && git push --tags
 ```

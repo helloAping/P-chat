@@ -226,7 +226,7 @@ web/assets/
 # `wailsjs/runtime/` is the Wails runtime helpers shipped as a node
 # package (declared in wailsjs/runtime/package.json) and IS
 # committed.
-cmd/pchat-gui/frontend/wailsjs/go/
+frontend/wailsjs/go/
 # Wails build/ dir contains the compiled `pchat-gui.exe` plus a
 # generated `windows/info.json` / `windows/wails.exe.manifest` /
 # `appicon.png`. We keep the assets (icons, manifest) and ignore

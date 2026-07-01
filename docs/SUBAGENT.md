@@ -681,9 +681,9 @@ adopt because they don't fit P-Chat's architecture:
 | `internal/agent/agent.go:323-393` | `ChatStreamChunk` with new `SubAgentType/Color/Model/TaskID` fields |
 | `internal/agent/parts.go:124-220` | `partsAccumulator` sub-agent start/ok/err handling + metadata backfill |
 | `cmd/pchat-server/main.go:92-135` | Sub-agent registry build + `task` tool registration |
-| `cmd/pchat-gui/frontend/src/components/SubAgentCard.vue` | Card UI (v2: agent name + color + model + task_id copy) |
-| `cmd/pchat-gui/frontend/src/stores/chat.ts:569-619` | `findOrCreateSubAgent` + `backfillSubAgentMetadata` |
-| `cmd/pchat-gui/frontend/src/api/client.ts:125-145` | `SubAgentPart` TS type with new fields |
+| `frontend/src/components/SubAgentCard.vue` | Card UI (v2: agent name + color + model + task_id copy) |
+| `frontend/src/stores/chat.ts:569-619` | `findOrCreateSubAgent` + `backfillSubAgentMetadata` |
+| `frontend/src/api/client.ts:125-145` | `SubAgentPart` TS type with new fields |
 | `internal/cli/progress.go:127-235` | `handleSubAgentEvent` (CLI rendering) |
 | `internal/server/handler.go:412-428` | `StreamEvent` with new sub-agent fields |
 | `internal/server/handler.go:1481-1484` | `chunkToEvent` field pass-through |

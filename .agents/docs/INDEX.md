@@ -54,7 +54,7 @@ P-Chat 项目
 │       ├── httpcli/  → CLI SSE 客户端
 │       └── serverproc/ → 服务器进程生命周期
 │
-└── cmd/pchat-gui/frontend/src/       → 请读 [frontend.md](frontend.md)
+└── frontend/src/       → 请读 [frontend.md](frontend.md)
     ├── api/client.ts     → HTTP + SSE 客户端
     ├── stores/chat.ts    → Pinia 状态管理
     └── components/       → Vue 组件

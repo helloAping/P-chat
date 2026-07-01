@@ -3,6 +3,7 @@
   "name": "pchat-gui",
   "outputfilename": "pchat-gui",
   "frontend:dist:dir": "../../web",
+  "frontend:dir": "../../frontend",
   "frontend:dev:url": "http://localhost:5173/app",
   "ldflags": "-H windowsgui -s -w",
   "author": {

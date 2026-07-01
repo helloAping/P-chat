@@ -2,7 +2,7 @@
 //
 // The assistant message is rendered to the user as a flat list of
 // "parts" (text + thinking + tool calls + sub-agents) in stream
-// order. The client (cmd/pchat-gui/frontend) mirrors this in
+// order. The client (frontend/src/) mirrors this in
 // src/api/client.ts:MessagePart, and the server's wire type
 // (internal/server/handler.go:StreamEvent) flattens the per-part
 // events back out for streaming.

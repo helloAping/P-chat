@@ -132,12 +132,12 @@ P-chat/
 │       ├── main.go      # 拉起 pchat-server 子进程 + WebView2 窗口
 │       ├── install.ps1  # 安装脚本（开始菜单 + 注册表卸载项）
 │       ├── uninstall.ps1
-│       ├── frontend/    # Vue 3 + Vite + Naive UI SPA
-│       │   └── src/
-│       │       ├── api/client.ts     # HTTP/SSE 客户端
-│       │       ├── stores/chat.ts    # Pinia 会话状态
-│       │       └── components/       # 18 个 Vue 组件
 │       └── build/       # Wails 产物
+├── frontend/            # Vue 3 + Vite + Naive UI SPA
+│   └── src/
+│       ├── api/client.ts     # HTTP/SSE 客户端
+│       ├── stores/chat.ts    # Pinia 会话状态
+│       └── components/       # 18 个 Vue 组件
 ├── internal/
 │   ├── agent/           # Agent 核心
 │   ├── agents/          # AGENTS.md 加载

@@ -3,7 +3,7 @@ import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 import { readFileSync } from 'node:fs'
 
-const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../wails.json', import.meta.url)), 'utf-8'))
+const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../cmd/pchat-gui/wails.json', import.meta.url)), 'utf-8'))
 const APP_VERSION = pkg.info?.productVersion || '0.1.0'
 const GITHUB_REPO = 'helloAping/P-chat'
 
@@ -29,7 +29,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: fileURLToPath(new URL('../../../web', import.meta.url)),
+    outDir: fileURLToPath(new URL('../web', import.meta.url)),
     emptyOutDir: false,
     assetsDir: 'assets',
     sourcemap: false,

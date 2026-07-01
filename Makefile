@@ -22,7 +22,7 @@ POWERSHELL ?= powershell
 # --- Build targets ---
 
 build-frontend:
-	cd cmd/pchat-gui/frontend && $(NPM) install && $(NPM) run build
+	cd frontend && $(NPM) install && $(NPM) run build
 
 build-server:
 	$(GO) build -o bin/pchat-server ./cmd/pchat-server

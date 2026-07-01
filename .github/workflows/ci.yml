@@ -22,7 +22,7 @@ jobs:
 
       - name: Build frontend
         run: |
-          cd cmd/pchat-gui/frontend
+          cd frontend
           npm ci
           npm run build
 

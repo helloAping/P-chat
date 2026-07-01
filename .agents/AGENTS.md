@@ -240,7 +240,7 @@ parser 三层 fallback：
 - Vue 3 `<script setup lang="ts">` 单文件组件
 - 状态管理：`src/stores/chat.ts`（Pinia）
 - CSS：scoped + CSS variables（`--accent` / `--bg-2`），**禁止硬编码颜色**
-- 提交前：`cd cmd/pchat-gui/frontend && npx vue-tsc -b && npm run build`
+- 提交前：`cd frontend && npx vue-tsc -b && npm run build`
 
 ### 2.4 命名
 
@@ -301,7 +301,7 @@ curl http://localhost:xxxxx/api/v1/version
 
 ```powershell
 go test -count=1 ./...                          # 所有 Go 测试
-cd cmd/pchat-gui/frontend
+cd frontend
 npx vue-tsc -b                                  # TS 类型检查
 npm run build                                   # 前端 bundle
 ```
@@ -348,7 +348,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | ReAct 主循环 | `internal/agent/agent.go:900-1510` `ChatWithTools()` |
 | 工具派发 + forwarder | `internal/agent/agent.go:1150-1471` |
 | parts 累加器 | `internal/agent/parts.go` |
-| 流式事件分发 | `frontend/src/stores/chat.ts:828-1103` `appendStreamEvent()` |
+| 流式事件分发 | `frontendstores/chat.ts:828-1103` `appendStreamEvent()` |
 | 后端 SSE 事件映射 | `internal/server/handler.go:1495-1613` `chunkToEvent()` |
 | 子 agent runner | `internal/subagent/subagent.go:511-832` `Run()` |
 | 子 agent 事件转发 | `internal/subagent/subagent.go:837-842` `tryForward()` |
