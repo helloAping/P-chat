@@ -30,8 +30,22 @@ jobs:
       - name: task build:all
         run: task build:all
 
+      - name: Build Linux binaries
+        run: |
+          $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
+          mkdir "bin/$tag-linux" -Force
+
+          $env:GOOS = "linux"; $env:GOARCH = "amd64"
+          go build -o "bin/$tag-linux/pchat" ./cmd/pchat
+          go build -o "bin/$tag-linux/pchat-server" ./cmd/pchat-server
+
+          Copy-Item -Recurse "web/" "bin/$tag-linux/web/"
+          cd bin; tar czf "../$tag-linux-amd64.tar.gz" "$tag-linux"
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: bin/pchat-setup-v*.exe
+          files: |
+            bin/pchat-setup-v*.exe
+            *-linux-amd64.tar.gz
           generate_release_notes: false
