@@ -1,96 +1,85 @@
-name: release
+name: Release
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    tags:
+      - 'v*'
 
 jobs:
   build:
-    name: build (${{ matrix.goos }}-${{ matrix.goarch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            ext: ""
-            archive: tar.gz
-          - goos: linux
-            goarch: arm64
-            ext: ""
-            archive: tar.gz
-          - goos: darwin
-            goarch: amd64
-            ext: ""
-            archive: tar.gz
-          - goos: darwin
-            goarch: arm64
-            ext: ""
-            archive: tar.gz
-          - goos: windows
-            goarch: amd64
-            ext: ".exe"
-            archive: zip
-
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [windows, linux]
+        goarch: [amd64]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
-          cache: true
+          go-version: '1.21'
 
-      - name: Build pchat
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
+      - name: Sync web to embed dir
+        run: |
+          mkdir -p cmd/pchat-server/web
+          cp -rf web/index.html web/assets cmd/pchat-server/web/
+
+      - name: Build Go binaries
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
         run: |
-          mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o dist/pchat${{ matrix.ext }} ./cmd/pchat
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          go build -o "bin/pchat-server${ext}" ./cmd/pchat-server
+          go build -o "bin/pchat${ext}" ./cmd/pchat
 
-      - name: Build pchat-server
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+      - name: Package archives
+        shell: bash
         run: |
-          go build -trimpath -ldflags "-s -w" -o dist/pchat-server${{ matrix.ext }} ./cmd/pchat-server
+          OS=${{ matrix.goos }}
+          TAG=${GITHUB_REF#refs/tags/}
+          DIST_DIR="dist"
 
-      - name: Package
-        working-directory: dist
-        run: |
-          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            tar -czf pchat-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
-              pchat${{ matrix.ext }} pchat-server${{ matrix.ext }}
+          mkdir -p "${DIST_DIR}/${TAG}-${OS}-amd64"
+
+          # binaries
+          if [ "$OS" = "windows" ]; then
+            cp bin/pchat.exe "${DIST_DIR}/${TAG}-${OS}-amd64/"
+            cp bin/pchat-server.exe "${DIST_DIR}/${TAG}-${OS}-amd64/"
           else
-            zip pchat-${{ matrix.goos }}-${{ matrix.goarch }}.zip \
-              pchat${{ matrix.ext }} pchat-server${{ matrix.ext }}
+            cp bin/pchat "${DIST_DIR}/${TAG}-${OS}-amd64/"
+            cp bin/pchat-server "${DIST_DIR}/${TAG}-${OS}-amd64/"
           fi
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pchat-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/pchat-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }}
+          # web assets (shared)
+          cp -rf web/ "${DIST_DIR}/${TAG}-${OS}-amd64/web/"
 
-  release:
-    name: release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
+          # archive
+          if [ "$OS" = "windows" ]; then
+            cd "${DIST_DIR}" && zip -r "${TAG}-${OS}-amd64.zip" "${TAG}-${OS}-amd64"
+          else
+            cd "${DIST_DIR}" && tar czf "${TAG}-${OS}-amd64.tar.gz" "${TAG}-${OS}-amd64"
+          fi
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+          # rename for upload
+          if [ "$OS" = "windows" ]; then
+            echo "ARCHIVE=${DIST_DIR}/${TAG}-windows-amd64.zip" >> $GITHUB_ENV
+          else
+            echo "ARCHIVE=${DIST_DIR}/${TAG}-linux-amd64.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: ${{ env.ARCHIVE }}
           generate_release_notes: true
-          fail_on_unmatched_files: true
