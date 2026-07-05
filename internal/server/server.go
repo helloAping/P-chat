@@ -184,6 +184,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/knowledge/bases/:name/scan", h.ScanKnowledgeBase)
 		api.DELETE("/knowledge/bases/:name/scan", h.CancelScan)
 		api.GET("/knowledge/bases/:name/scan/status", h.ScanStatus)
+		api.GET("/knowledge/bases/:name/sections", h.ListSections)
+		api.POST("/knowledge/bases/:name/sections", h.AddSection)
+		api.GET("/knowledge/bases/:name/sections/:id", h.GetSection)
+		api.PUT("/knowledge/bases/:name/sections/:id", h.UpdateSection)
+		api.DELETE("/knowledge/bases/:name/sections/:id", h.DeleteSection)
 		api.POST("/knowledge/search", h.SearchKnowledge)
 	}
 

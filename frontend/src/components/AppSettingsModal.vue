@@ -982,6 +982,15 @@ const scanningKBs = ref<Set<string>>(new Set())
 const kbScanStatus = ref<Map<string, { current: number; total: number; chunks: number; done: boolean; error?: string }>>(new Map())
 let kbScanTimers: Record<string, ReturnType<typeof setInterval>> = {}
 
+const kbSections = ref<any[]>([])
+const kbSectionsLoading = ref(false)
+const newSectionTitle = ref('')
+const newSectionContent = ref('')
+const newSectionSource = ref('')
+const showAddSectionForm = ref(false)
+const sectionDetailVisible = ref(false)
+const sectionDetailData = ref<{ id: number; title: string; content: string; source: string } | null>(null)
+
 async function refreshKB() {
   try {
     const cfg = await api.getKnowledgeConfig()
@@ -1088,6 +1097,66 @@ function onUpdateKBField(name: string, field: string, value: any) {
     bumpKBConfigVersion()
   }).catch(e => message.error(`更新失败: ${e.message}`))
 }
+
+async function loadKBSections(name: string) {
+  if (!name) { kbSections.value = []; return }
+  kbSectionsLoading.value = true
+  try {
+    const res = await api.listKnowledgeSections(name)
+    kbSections.value = res.sections || []
+  } catch { kbSections.value = [] }
+  finally { kbSectionsLoading.value = false }
+}
+
+function openSectionDetail(id: number) {
+  const s = kbSections.value.find((x: any) => x.id === id)
+  if (s) {
+    sectionDetailData.value = { id: s.id, title: s.title, content: s.content, source: s.source }
+    sectionDetailVisible.value = true
+  }
+}
+
+function extractCardPreview(content: string): string {
+  if (!content) return ''
+  const overview = content.split('\n').find((l: string) => l.startsWith('内容概览：') || l.startsWith('内容概览:'))
+  if (overview) return overview.replace(/^内容概览[：:]\s*/, '')
+  return content.slice(0, 120) + (content.length > 120 ? '...' : '')
+}
+
+async function onDeleteSection(id: number, e?: Event) {
+  if (!kbSelected.value) return
+  try {
+    await api.deleteKnowledgeSection(kbSelected.value.name, id)
+    kbSections.value = kbSections.value.filter((s: any) => s.id !== id)
+    if (sectionDetailData.value?.id === id) {
+      sectionDetailVisible.value = false
+      sectionDetailData.value = null
+    }
+    bumpKBConfigVersion()
+  } catch (e: any) { message.error(`删除失败: ${e.message}`) }
+}
+
+async function onAddSection() {
+  if (!kbSelected.value || !newSectionTitle.value.trim()) return
+  try {
+    await api.addKnowledgeSection(kbSelected.value.name, {
+      title: newSectionTitle.value.trim(),
+      content: newSectionContent.value,
+      source: newSectionSource.value.trim() || '_manual_',
+    })
+    newSectionTitle.value = ''
+    newSectionContent.value = ''
+    newSectionSource.value = ''
+    await loadKBSections(kbSelected.value.name)
+    bumpKBConfigVersion()
+    showAddSectionForm.value = false
+    message.success('已添加')
+  } catch (e: any) { message.error(`添加失败: ${e.message}`) }
+}
+
+watch(kbSelectedName, (name) => {
+  loadKBSections(name || '')
+})
 
 const mediaTypeOptions = [
   { label: '图片 (.png .jpg .gif .webp .bmp)', value: 'image' },
@@ -1668,102 +1737,162 @@ function kbModelSupportsVision(scanModel: string) {
             <div v-if="!kbSelected" class="muted empty-hint">← 选择左侧的知识库</div>
             <template v-else>
               <div class="detail-section kb-detail-scroll">
-                <div class="detail-section-head">
-                  <h3 class="section-title">{{ kbSelected.name }}</h3>
+                <!-- Header -->
+                <div class="kb-header">
+                  <div class="kb-header-left">
+                    <h3 class="section-title">{{ kbSelected.name }}</h3>
+                    <NTag :type="kbSelected.enabled ? 'success' : 'default'" size="tiny" :bordered="false">{{ kbSelected.enabled ? '启用' : '禁用' }}</NTag>
+                    <span class="muted" style="font-size:11px">{{ kbSelected.doc_count || 0 }} 条索引</span>
+                  </div>
                   <NSpace size="small">
-                    <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name)">
-                      {{ scanningKBs.has(kbSelected.name) ? '扫描中...' : '开始扫描' }}
+                    <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name) || !kbSelected.scan_model">
+                      {{ scanningKBs.has(kbSelected.name) ? '扫描中...' : '扫描' }}
+                    </NButton>
                     </NButton>
                     <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>
                   </NSpace>
                 </div>
-                <div class="detail-form">
-                  <NSpace vertical size="small">
-                    <!-- Basic info -->
-                    <div class="form-row">
-                      <span class="form-label">名称</span>
-                      <span class="form-val">{{ kbSelected.name }}</span>
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">路径</span>
-                      <span class="form-val path">{{ kbSelected.path }}</span>
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">启用</span>
-                      <NSwitch :value="kbSelected.enabled" @update:value="(v: boolean) => onToggleKBSwitch(kbSelected!.name, v)" />
-                    </div>
-
-                    <!-- Divider -->
-                    <div class="section-subtitle">AI 扫描设置</div>
-
-                    <div class="form-row">
-                      <span class="form-label">扫描模型</span>
-                      <NSelect
-                        :value="kbSelected.scan_model || ''"
-                        :options="kbModelOptions"
-                        size="small"
-                        placeholder="选择模型（空=仅文本）"
-                        style="flex:1"
-                        @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'scan_model', v)"
-                      />
-                    </div>
-                    <div v-if="kbSelected.scan_model" class="form-hint">
-                      <span v-if="kbModelSupportsVision(kbSelected.scan_model)" style="color:var(--accent)">视觉模型 — 可处理图片/视频/PDF</span>
-                      <span v-else style="color:var(--text-4)">纯文本模型</span>
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">媒体类型</span>
-                      <NSelect
-                        :value="kbSelected.scan_media_types || []"
-                        :options="mediaTypeOptions"
-                        size="small"
-                        multiple
-                        placeholder="选择可 AI 处理的媒体类型"
-                        style="flex:1"
-                        @update:value="(v: string[]) => onUpdateKBField(kbSelected!.name, 'scan_media_types', v)"
-                      />
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">自动扫描</span>
-                      <NSwitch :value="kbSelected.auto_scan" @update:value="(v: boolean) => onUpdateKBField(kbSelected!.name, 'auto_scan', v)" />
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">排除模式</span>
-                      <NInput
-                        :value="(kbSelected.exclude_patterns || []).join(', ')"
-                        size="small"
-                        placeholder="glob 模式，逗号分隔"
-                        style="flex:1"
-                        @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'exclude_patterns', v.split(',').map(s => s.trim()).filter(Boolean))"
-                      />
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">最大文件 (MB)</span>
-                      <NInputNumber
-                        :value="kbSelected.max_file_size ? kbSelected.max_file_size / 1048576 : 5"
-                        :min="1"
-                        :step="1"
-                        size="small"
-                        style="flex:1"
-                        @update:value="(v: number | null) => onUpdateKBField(kbSelected!.name, 'max_file_size', (v || 5) * 1048576)"
-                      />
-                    </div>
-                  </NSpace>
-                </div>
 
                 <!-- Scan progress -->
-                <div v-if="kbSelected.doc_count && !scanningKBs.has(kbSelected.name)" class="form-row muted" style="padding-top:10px;border-top:1px solid var(--border-2);margin-top:6px">
-                  已索引 {{ kbSelected.doc_count }} sections
-                </div>
                 <div v-if="kbScanStatus.has(kbSelected.name)" class="scan-progress">
                   <div class="scan-info">
                     <span>{{ scanLabel(kbSelected.name) }}</span>
-                    <span v-if="kbScanStatus.get(kbSelected.name)?.error" style="color:var(--warn);font-size:12px">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
+                    <span v-if="kbScanStatus.get(kbSelected.name)?.error" style="color:var(--warn);font-size:11px">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
                   </div>
                   <div v-if="!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error" class="scan-bar">
                     <div class="scan-bar-fill" :style="{ width: kbScanStatus.get(kbSelected.name)!.total > 0 ? ((kbScanStatus.get(kbSelected.name)!.current / kbScanStatus.get(kbSelected.name)!.total) * 100) + '%' : '0%' }"></div>
                   </div>
                 </div>
+
+                <!-- Basic config card -->
+                <div class="kb-config-card">
+                  <div class="kb-config-row">
+                    <span class="kb-config-label">路径</span>
+                    <span class="kb-config-val path">{{ kbSelected.path }}</span>
+                  </div>
+                  <div class="kb-config-row">
+                    <span class="kb-config-label">状态</span>
+                    <NSwitch size="small" :value="kbSelected.enabled" @update:value="(v: boolean) => onToggleKBSwitch(kbSelected!.name, v)" />
+                  </div>
+                </div>
+
+                <!-- AI scan settings card -->
+                <details class="kb-config-card" style="cursor:pointer">
+                  <summary class="kb-config-summary">AI 扫描设置</summary>
+                  <div class="kb-config-body">
+                    <div class="kb-config-row">
+                      <span class="kb-config-label">模型</span>
+                      <NSelect
+                        :value="kbSelected.scan_model || ''"
+                        :options="kbModelOptions"
+                        size="small"
+                        placeholder="无（仅文本解析）"
+                        style="flex:1"
+                        @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'scan_model', v)"
+                      />
+                    </div>
+                    <div v-if="kbSelected.scan_model" class="kb-config-hint">
+                      <span v-if="kbModelSupportsVision(kbSelected.scan_model)" style="color:var(--accent)">视觉模型 — 可处理图片/视频/PDF</span>
+                      <span v-else style="color:var(--text-4)">纯文本模型 — 仅处理文本</span>
+                    </div>
+                    <div class="kb-config-row">
+                      <span class="kb-config-label">媒体类型</span>
+                      <NSelect
+                        :value="kbSelected.scan_media_types || []"
+                        :options="mediaTypeOptions"
+                        size="small"
+                        multiple
+                        placeholder="选择可 AI 处理的媒体"
+                        style="flex:1"
+                        @update:value="(v: string[]) => onUpdateKBField(kbSelected!.name, 'scan_media_types', v)"
+                      />
+                    </div>
+                    <div class="kb-config-row">
+                      <span class="kb-config-label">自动扫描</span>
+                      <NSwitch size="small" :value="kbSelected.auto_scan" @update:value="(v: boolean) => onUpdateKBField(kbSelected!.name, 'auto_scan', v)" />
+                      <span class="muted" style="font-size:10px;margin-left:4px">启动时自动扫描变更</span>
+                    </div>
+                    <div class="kb-config-row">
+                      <span class="kb-config-label">排除模式</span>
+                      <NInput
+                        :value="(kbSelected.exclude_patterns || []).join(', ')"
+                        size="tiny"
+                        placeholder="*.log, *.tmp"
+                        style="flex:1"
+                        @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'exclude_patterns', v.split(',').map(s => s.trim()).filter(Boolean))"
+                      />
+                    </div>
+                    <div class="kb-config-row">
+                      <span class="kb-config-label">文件上限</span>
+                      <NInputNumber
+                        :value="kbSelected.max_file_size ? kbSelected.max_file_size / 1048576 : 5"
+                        :min="1" :step="1"
+                        size="tiny"
+                        style="width:80px"
+                        @update:value="(v: number | null) => onUpdateKBField(kbSelected!.name, 'max_file_size', (v || 5) * 1048576)"
+                      />
+                      <span class="muted" style="font-size:10px;margin-left:4px">MB</span>
+                    </div>
+                  </div>
+                </details>
+
+                <!-- Sections cards -->
+                <div style="display:flex;align-items:center;justify-content:space-between;margin:16px 0 8px">
+                  <span style="font-size:13px;font-weight:600">索引内容</span>
+                  <NButton size="tiny" quaternary @click="showAddSectionForm = !showAddSectionForm">{{ showAddSectionForm ? '收起' : '+ 添加条目' }}</NButton>
+                </div>
+
+                <!-- Add section form (collapsible) -->
+                <div v-if="showAddSectionForm" class="kb-config-card" style="margin-bottom:8px">
+                  <NInput v-model:value="newSectionTitle" size="tiny" placeholder="标题 *" style="margin-bottom:6px" />
+                  <NInput v-model:value="newSectionContent" type="textarea" size="tiny" placeholder="内容" :autosize="{ minRows: 2, maxRows: 4 }" style="margin-bottom:6px" />
+                  <NInput v-model:value="newSectionSource" size="tiny" placeholder="来源（可选）" />
+                  <NButton size="tiny" type="primary" @click="onAddSection" :disabled="!newSectionTitle.trim()" style="margin-top:8px;width:100%">添加</NButton>
+                </div>
+
+                <!-- Sections loading / empty -->
+                <div v-if="kbSectionsLoading" class="muted" style="padding:16px;text-align:center">加载中...</div>
+                <div v-else-if="kbSections.length === 0 && !showAddSectionForm" class="muted" style="padding:16px;text-align:center">（暂无索引内容，请先扫描或手动添加）</div>
+
+                <!-- Section cards grid -->
+                <div v-if="kbSections.length > 0" class="kb-cards-grid">
+                  <div v-for="s in kbSections" :key="s.id" class="kb-card" @click="openSectionDetail(s.id)">
+                    <div class="kb-card-header">
+                      <div class="kb-card-title">{{ s.title }}</div>
+                      <NTag v-if="s.heading" size="tiny" :bordered="false" type="info">{{ s.heading }}</NTag>
+                    </div>
+                    <div class="kb-card-preview">
+                      {{ extractCardPreview(s.content) }}
+                    </div>
+                    <div class="kb-card-footer">
+                      <span class="kb-card-source">{{ s.source }}</span>
+                      <NPopconfirm @positive-click="onDeleteSection(s.id, $event)" positive-text="删除" negative-text="取消" placement="left-start">
+                        <template #trigger>
+                          <NButton size="tiny" quaternary type="error" @click.stop>✕</NButton>
+                        </template>
+                        确定删除「{{ s.title }}」？
+                      </NPopconfirm>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Section detail modal -->
+                <NModal v-model:show="sectionDetailVisible" preset="card" :title="sectionDetailData?.title || '条目详情'" style="width:600px;max-height:80vh">
+                  <template v-if="sectionDetailData">
+                    <div style="margin-bottom:6px;font-size:11px;color:var(--text-4)">来源：{{ sectionDetailData.source }}</div>
+                    <pre class="kb-detail-pre">{{ sectionDetailData.content }}</pre>
+                    <div style="display:flex;justify-content:flex-end;margin-top:12px;gap:8px">
+                      <NButton size="small" @click="sectionDetailVisible = false">关闭</NButton>
+                      <NPopconfirm @positive-click="onDeleteSection(sectionDetailData.id, $event)" positive-text="确认删除" negative-text="取消">
+                        <template #trigger>
+                          <NButton size="small" type="error">删除</NButton>
+                        </template>
+                        确定删除「{{ sectionDetailData.title }}」？不可撤销。
+                      </NPopconfirm>
+                    </div>
+                  </template>
+                </NModal>
+
               </div>
             </template>
           </div>
@@ -2125,8 +2254,71 @@ code {
 .scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; }
 .scan-bar-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
 .scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
-.scan-info { display: flex; gap: 12px; align-items: center; font-size: 13px; }
-.scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; }
-.scan-bar-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
-.scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
+
+/* ---- Knowledge Base Cards ---- */
+.kb-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.kb-header-left { display: flex; align-items: center; gap: 8px; }
+
+.kb-config-card {
+  border: 1px solid var(--border-2); border-radius: 6px;
+  background: var(--bg-1); padding: 10px 12px; margin-bottom: 8px;
+}
+.kb-config-summary {
+  font-size: 12px; font-weight: 600; color: var(--text-2);
+  user-select: none;
+}
+.kb-config-body { margin-top: 8px; }
+.kb-config-row {
+  display: flex; align-items: center; gap: 8px; padding: 4px 0;
+}
+.kb-config-label {
+  font-size: 11px; color: var(--text-3); width: 65px; flex-shrink: 0;
+}
+.kb-config-val { font-size: 12px; color: var(--text-2); }
+.kb-config-val.path { word-break: break-all; font-family: ui-monospace, monospace; font-size: 11px; }
+.kb-config-hint { font-size: 11px; color: var(--text-4); padding: 0 0 4px 73px; }
+
+/* Section cards grid */
+.kb-cards-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px;
+}
+.kb-card {
+  border: 1px solid var(--border-2); border-radius: 6px;
+  background: var(--bg-1); padding: 10px;
+  cursor: pointer; transition: border-color 0.15s;
+  display: flex; flex-direction: column;
+  aspect-ratio: 1 / 1; min-height: 140px; overflow: hidden;
+}
+.kb-card:hover { border-color: var(--accent); }
+
+.kb-card-header {
+  flex-shrink: 0; margin-bottom: 4px;
+}
+.kb-card-title {
+  font-size: 12px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+  -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  line-height: 1.3;
+}
+.kb-card-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: auto; padding-top: 6px; flex-shrink: 0;
+}
+.kb-card-source {
+  font-size: 9px; color: var(--text-4); white-space: nowrap; max-width: 120px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.kb-card-preview {
+  font-size: 10px; color: var(--text-3); margin-top: 6px;
+  line-height: 1.4; flex: 1; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+}
+.kb-detail-pre {
+  margin: 0; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  max-height: 60vh; overflow-y: auto; font-family: ui-monospace, monospace;
+  background: var(--bg-2); padding: 12px; border-radius: 6px; line-height: 1.5;
+}
 </style>

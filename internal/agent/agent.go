@@ -805,7 +805,16 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 				sb.WriteString(fmt.Sprintf("  %s\n", s.Source))
 				currentSource = s.Source
 			}
-			sb.WriteString(fmt.Sprintf("    · %s\n", s.Title))
+			indent := ""
+			if s.Heading != "" {
+				indent = "  "
+			}
+			summary := extractOverview(s.Content)
+			line := fmt.Sprintf("%s· %s", indent, s.Title)
+			if summary != "" {
+				line += fmt.Sprintf(" — %s", summary)
+			}
+			sb.WriteString(fmt.Sprintf("    %s\n", line))
 			count++
 
 			if sb.Len() > 3000 {
@@ -834,6 +843,16 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 	a.kbIndexCacheKey = kbBase
 	a.kbIndexCacheTime = nowUnix
 	return result
+}
+
+func extractOverview(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "内容概览：") || strings.HasPrefix(line, "内容概览:") {
+			return strings.TrimPrefix(strings.TrimPrefix(line, "内容概览："), "内容概览:")
+		}
+	}
+	return ""
 }
 
 // Reload forces the next call to rebuild the static system prompt

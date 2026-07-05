@@ -1,34 +1,8 @@
 package tool
 
-import (
-	"fmt"
+import "github.com/p-chat/pchat/internal/knowledge"
 
-	"github.com/ledongthuc/pdf"
-)
-
-// readPdf extracts the plain text content from a .pdf file.
+// readPdf extracts plain text from a PDF file.
 func readPdf(path string) (string, error) {
-	f, r, err := pdf.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("open pdf: %w", err)
-	}
-	defer f.Close()
-
-	var result string
-	for pageNum := 1; pageNum <= r.NumPage(); pageNum++ {
-		p := r.Page(pageNum)
-		if p.V.IsNull() {
-			continue
-		}
-		text, err := p.GetPlainText(nil)
-		if err != nil {
-			result += fmt.Sprintf("\n[page %d error: %v]\n", pageNum, err)
-			continue
-		}
-		result += text
-		if pageNum < r.NumPage() {
-			result += "\n\n"
-		}
-	}
-	return result, nil
+	return knowledge.ExtractPDFText(path)
 }

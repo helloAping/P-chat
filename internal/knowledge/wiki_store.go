@@ -277,6 +277,79 @@ func (ws *WikiStore) AppendSections(ctx context.Context, sections []WikiSection)
 	return tx.Commit()
 }
 
+// GetSection returns a single section by its primary key.
+func (ws *WikiStore) GetSection(ctx context.Context, id int64) (*WikiSection, error) {
+	var s WikiSection
+	var heading sql.NullString
+	err := ws.db.QueryRowContext(ctx,
+		`SELECT id, title, content, source, base, heading FROM wiki_sections WHERE id = ?`, id).
+		Scan(&s.ID, &s.Title, &s.Content, &s.Source, &s.Base, &heading)
+	if err != nil {
+		return nil, err
+	}
+	s.Heading = heading.String
+	return &s, nil
+}
+
+// DeleteSection removes a single section and its FTS entry by id.
+func (ws *WikiStore) DeleteSection(ctx context.Context, id int64) error {
+	tx, err := ws.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM wiki_fts WHERE rowid = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM wiki_sections WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// InsertSection inserts a single section and returns its id.
+func (ws *WikiStore) InsertSection(ctx context.Context, s WikiSection) (int64, error) {
+	tx, err := ws.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO wiki_sections (title, content, source, base, heading) VALUES (?,?,?,?,?)`,
+		s.Title, s.Content, s.Source, s.Base, s.Heading)
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO wiki_fts (rowid, title, content, source) VALUES (?,?,?,?)`,
+		id, s.Title, s.Content, s.Source); err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
+}
+
+// UpdateSection updates the title and content of a section and its FTS entry.
+func (ws *WikiStore) UpdateSection(ctx context.Context, id int64, title, content string) error {
+	tx, err := ws.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE wiki_sections SET title = ?, content = ? WHERE id = ?`, title, content, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE wiki_fts SET title = ?, content = ? WHERE rowid = ?`, title, content, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // SearchFTS does a full-text search across titles and returns ranked results.
 // Falls back to LIKE if FTS5 returns nothing.
 func (ws *WikiStore) SearchFTS(ctx context.Context, query string, topK int) ([]WikiSection, error) {

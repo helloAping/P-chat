@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -331,6 +332,204 @@ func (h *Handler) CancelScan(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "scan cancelled"})
 }
 
+// ListSections GET /api/v1/knowledge/bases/:name/sections
+func (h *Handler) ListSections(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	var base config.KnowledgeBase
+	found := false
+	for _, b := range h.cfg.Knowledge.Bases {
+		if b.Name == name {
+			base = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
+		return
+	}
+
+	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	sections, err := store.ListBase(c.Request.Context(), base.Name)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"sections": sections})
+}
+
+// GetSection GET /api/v1/knowledge/bases/:name/sections/:id
+func (h *Handler) GetSection(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	name := c.Param("name")
+	var base config.KnowledgeBase
+	found := false
+	for _, b := range h.cfg.Knowledge.Bases {
+		if b.Name == name {
+			base = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
+		return
+	}
+	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	section, err := store.GetSection(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "section not found"})
+		return
+	}
+	c.JSON(http.StatusOK, section)
+}
+
+// AddSection POST /api/v1/knowledge/bases/:name/sections
+func (h *Handler) AddSection(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	var base config.KnowledgeBase
+	found := false
+	for _, b := range h.cfg.Knowledge.Bases {
+		if b.Name == name {
+			base = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
+		return
+	}
+	var req struct {
+		Title   string `json:"title"`
+		Content string `json:"content"`
+		Source  string `json:"source"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Title == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "title is required"})
+		return
+	}
+	if req.Source == "" {
+		req.Source = "_manual_"
+	}
+
+	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := store.InsertSection(c.Request.Context(), knowledge.WikiSection{
+		Title:   req.Title,
+		Content: req.Content,
+		Source:  req.Source,
+		Base:    name,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"id": id, "ok": true})
+}
+
+// UpdateSection PUT /api/v1/knowledge/bases/:name/sections/:id
+func (h *Handler) UpdateSection(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	name := c.Param("name")
+	var base config.KnowledgeBase
+	found := false
+	for _, b := range h.cfg.Knowledge.Bases {
+		if b.Name == name {
+			base = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
+		return
+	}
+	var req struct {
+		Title   string `json:"title"`
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	if err := store.UpdateSection(c.Request.Context(), id, req.Title, req.Content); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// DeleteSection DELETE /api/v1/knowledge/bases/:name/sections/:id
+func (h *Handler) DeleteSection(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	name := c.Param("name")
+	var base config.KnowledgeBase
+	found := false
+	for _, b := range h.cfg.Knowledge.Bases {
+		if b.Name == name {
+			base = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
+		return
+	}
+	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	if err := store.DeleteSection(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 // SearchKnowledge POST /api/v1/knowledge/search
 func (h *Handler) SearchKnowledge(c *gin.Context) {
 	if h.cfg == nil {
@@ -642,20 +841,21 @@ func (h *Handler) describeMediaFile(ctx context.Context, base *config.KnowledgeB
 	return desc, nil
 }
 
-// summarizeText sends raw text content through the configured LLM for
-// structured summarization. Uses SHA256 caching to avoid re-processing.
-func (h *Handler) summarizeText(ctx context.Context, base *config.KnowledgeBase, source, content string) (string, error) {
+// buildIndexEntry sends a heading node's aggregated content to the LLM
+// and returns the formatted 3-line index entry (概览+关键词+搜索匹配).
+// Uses SHA256 caching on the aggregated content to avoid duplicate calls.
+func (h *Handler) buildIndexEntry(ctx context.Context, base *config.KnowledgeBase, title, parentTitle, aggregatedContent string) (string, error) {
 	if base.ScanModel == "" || h.agent == nil {
-		return content, nil // no model configured, pass through raw content
+		return "", fmt.Errorf("no scan model configured")
 	}
 	parts := strings.SplitN(base.ScanModel, "/", 2)
 	if len(parts) != 2 {
-		return content, nil
+		return "", fmt.Errorf("invalid scan_model format")
 	}
 	provider, model := parts[0], parts[1]
 
 	hsh := sha256.New()
-	hsh.Write([]byte(content))
+	hsh.Write([]byte(title + aggregatedContent))
 	sum := fmt.Sprintf("%x", hsh.Sum(nil))
 
 	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
@@ -665,35 +865,53 @@ func (h *Handler) summarizeText(ctx context.Context, base *config.KnowledgeBase,
 		}
 	}
 
-	prompt := fmt.Sprintf(
-		"You are a knowledge archivist. Summarize the following document section for a searchable knowledge base. Extract key facts, definitions, and concepts. Keep the summary concise but complete. Write in the original language. Source: %s\n\n%s",
-		source, content,
-	)
+	userPrompt := knowledge.BuildIndexPrompt(title, parentTitle, aggregatedContent)
 	msgs := []llm.ChatMessage{
-		{Role: "system", Type: "text", Content: "You are a precise knowledge archivist. Output only the summary, no prefixes or explanations."},
-		{Role: "user", Type: "text", Content: prompt},
+		{Role: "system", Type: "text", Content: indexerSystemPrompt},
+		{Role: "user", Type: "text", Content: userPrompt},
 	}
 
 	ch := h.agent.LLM().ChatStreamCM(ctx, provider, model, msgs, nil, llm.ChatOptions{})
 	var sb strings.Builder
 	for chunk := range ch {
 		if chunk.Err != nil {
-			return content, nil // fallback to raw content on error
+			return aggregatedContent, nil
 		}
 		if chunk.Done {
 			break
 		}
 		sb.WriteString(chunk.Content)
 	}
-	desc := strings.TrimSpace(sb.String())
-	if desc == "" {
-		return content, nil
+	raw := strings.TrimSpace(sb.String())
+	if raw == "" {
+		return aggregatedContent, nil
 	}
 
-	if store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path); err == nil {
-		_ = store.CacheMediaDescription(ctx, sum, desc)
+	parsed := knowledge.ParseIndexEntry(raw)
+	if parsed == nil {
+		return raw, nil
 	}
-	return desc, nil
+	result := knowledge.FormatIndexEntry(parsed)
+	if result == "" {
+		return aggregatedContent, nil
+	}
+
+	if store, err2 := knowledge.GetOrOpenWikiStore(base.Name, base.Path); err2 == nil {
+		_ = store.CacheMediaDescription(ctx, sum, result)
+	}
+	return result, nil
+}
+
+// indexerSystemPrompt is loaded once from prompts/knowledge_indexer.md.
+var indexerSystemPrompt = loadIndexerPrompt()
+
+func loadIndexerPrompt() string {
+	data, err := os.ReadFile("prompts/knowledge_indexer.md")
+	if err != nil {
+		log.Printf("[kb] load indexer prompt: %v", err)
+		return "You are a knowledge-base indexing assistant. Output format: 内容概览：...\\n关键词：...\\n搜索匹配：..."
+	}
+	return string(data)
 }
 
 // wikiScan walks a directory, parses all indexable files into wiki
@@ -810,9 +1028,9 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 			return nil
 		}
 
-		sections, parseErr := knowledge.ParseWikiFile(path, rel, 3)
-		if parseErr != nil {
-			log.Printf("[scan] skip %s: parse: %v", rel, parseErr)
+		text, readErr := knowledge.ReadFileText(path)
+		if readErr != nil {
+			log.Printf("[scan] skip %s: read: %v", rel, readErr)
 			processed++
 			if progress != nil {
 				progress(processed, totalFiles)
@@ -820,19 +1038,57 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 			return nil
 		}
 
-		for i := range sections {
-			sections[i].Base = baseName
-		}
-		// Summarize via LLM if scan model configured.
-		if base.ScanModel != "" {
-			for i := range sections {
-				summary, err := h.summarizeText(ctx, base, rel, sections[i].Content)
-				if err != nil {
-					log.Printf("[scan] summarize %s: %v", rel, err)
-				} else {
-					sections[i].Content = summary
+		// Build heading tree from file text.
+		roots := knowledge.BuildHeadingTree(text, 3)
+		var sections []knowledge.WikiSection
+
+		// Generate LLM-indexed entries for every node with content.
+		knowledge.WalkHeadingTree(roots, func(node *knowledge.HeadingNode) {
+			if !node.HasContent() {
+				return
+			}
+			heading := ""
+			if node.Parent != nil {
+				heading = node.Parent.Title
+			}
+
+			aggregated := node.AggregatedContent()
+			content := aggregated // fallback if LLM fails
+			if base.ScanModel != "" && h.agent != nil {
+				if indexed, err := h.buildIndexEntry(ctx, base, node.Title, heading, aggregated); err == nil && indexed != "" {
+					content = indexed
+				} else if err != nil {
+					log.Printf("[scan] index %s/%s: %v", rel, node.Title, err)
 				}
 			}
+
+			sections = append(sections, knowledge.WikiSection{
+				Title:   node.Title,
+				Content: content,
+				Source:  rel,
+				Base:    baseName,
+				Heading: heading,
+			})
+		})
+
+		if len(sections) == 0 {
+			// Fallback: no headings found → treat whole file as single entry.
+			content := text
+			if base.ScanModel != "" && h.agent != nil {
+				if indexed, err := h.buildIndexEntry(ctx, base, rel, "", text); err == nil && indexed != "" {
+					content = indexed
+				}
+			}
+			title := rel
+			if idx := strings.LastIndex(rel, "/"); idx >= 0 {
+				title = rel[idx+1:]
+			}
+			sections = []knowledge.WikiSection{{
+				Title:   title,
+				Content: content,
+				Source:  rel,
+				Base:    baseName,
+			}}
 		}
 		if err := store.ReplaceSource(ctx, baseName, rel, sections); err != nil {
 			log.Printf("[scan] replace %s: %v", rel, err)

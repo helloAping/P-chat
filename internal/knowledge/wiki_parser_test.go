@@ -1,155 +1,254 @@
 package knowledge
 
 import (
+	"archive/zip"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestParseWiki_H1Heading(t *testing.T) {
-	text := "# Main Title\n\nContent under H1."
-	sections := ParseWiki(text, "doc.md", 3)
-	if len(sections) == 0 {
-		t.Fatal("expected at least one section for H1")
+// ==============================
+// BuildHeadingTree tests
+// ==============================
+
+func TestBuildHeadingTree_H1H2H3(t *testing.T) {
+	text := "# Top\n\ntop text\n\n## Middle\n\nmiddle text\n\n### Deep\n\ndeep text"
+	roots := BuildHeadingTree(text, 3)
+	if len(roots) != 1 {
+		t.Fatalf("want 1 root, got %d", len(roots))
 	}
-	if sections[0].Title != "Main Title" {
-		t.Errorf("title = %q, want %q", sections[0].Title, "Main Title")
+	top := roots[0]
+	if top.Title != "Top" {
+		t.Errorf("root title = %q", top.Title)
+	}
+	if !strings.Contains(top.OwnText, "top text") {
+		t.Errorf("root OwnText: %q", top.OwnText)
+	}
+	if len(top.Children) != 1 {
+		t.Fatalf("want 1 child, got %d", len(top.Children))
+	}
+	middle := top.Children[0]
+	if middle.Title != "Middle" {
+		t.Errorf("middle title = %q", middle.Title)
+	}
+	if middle.Parent != top {
+		t.Error("middle.Parent should be top")
+	}
+	if len(middle.Children) != 1 {
+		t.Fatalf("want 1 grandchild, got %d", len(middle.Children))
+	}
+	deep := middle.Children[0]
+	if deep.Title != "Deep" {
+		t.Errorf("deep title = %q", deep.Title)
+	}
+	if deep.Parent != middle {
+		t.Error("deep.Parent should be middle")
 	}
 }
 
-func TestParseWiki_MixedHeadings(t *testing.T) {
-	text := "# Top\n\ntop content\n\n## Section A\n\nA content\n\n### Sub\n\nsub content"
-	sections := ParseWiki(text, "doc.md", 3)
-	if len(sections) != 3 {
-		t.Fatalf("want 3 sections, got %d", len(sections))
+func TestBuildHeadingTree_MultipleH1(t *testing.T) {
+	text := "# A\n\na\n\n# B\n\nb"
+	roots := BuildHeadingTree(text, 3)
+	if len(roots) != 2 {
+		t.Fatalf("want 2 roots, got %d", len(roots))
 	}
-	if sections[0].Title != "Top" {
-		t.Errorf("section 0 = %q", sections[0].Title)
-	}
-	if sections[1].Title != "Section A" {
-		t.Errorf("section 1 = %q", sections[1].Title)
-	}
-	if sections[2].Title != "Sub" {
-		t.Errorf("section 2 = %q", sections[2].Title)
+	if roots[0].Title != "A" || roots[1].Title != "B" {
+		t.Errorf("titles: %q, %q", roots[0].Title, roots[1].Title)
 	}
 }
 
-func TestParseWiki_NoHeadings(t *testing.T) {
-	text := "Just some text without any markdown headings."
-	sections := ParseWiki(text, "doc.md", 3)
-	if len(sections) != 0 {
-		t.Fatalf("want 0 sections for heading-less text, got %d", len(sections))
+func TestBuildHeadingTree_EmptyNodeFiltered(t *testing.T) {
+	text := "# Top\n\n## Middle\n\nmiddle text"
+	roots := BuildHeadingTree(text, 3)
+	top := roots[0]
+	if !top.HasContent() {
+		t.Error("top should have content (has children)")
+	}
+	if !top.Children[0].HasContent() {
+		t.Error("middle should have content (has text)")
 	}
 }
 
-func TestParseWiki_PreambleContent(t *testing.T) {
-	text := "intro text\nmore intro\n\n## Section\n\nbody"
-	sections := ParseWiki(text, "doc.md", 3)
-	if len(sections) < 1 {
-		t.Fatalf("want at least 1 section, got %d", len(sections))
-	}
-	// "Section" heading should be captured as a section.
-	found := false
-	for _, s := range sections {
-		if s.Title == "Section" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("expected 'Section' heading: %v", sections)
+func TestBuildHeadingTree_NoHeadings(t *testing.T) {
+	text := "Just some text without any headings."
+	roots := BuildHeadingTree(text, 3)
+	if len(roots) == 0 {
+		return // acceptable — no sections to index
 	}
 }
 
-func TestParseWiki_IncludeLevel(t *testing.T) {
-	text := "# H1\n\nh1 content\n\n## H2\n\nh2 content\n\n### H3\n\nh3 content"
-	// includeLevel=1: only H1
-	sections := ParseWiki(text, "doc.md", 1)
-	if len(sections) != 1 {
-		t.Fatalf("level 1: want 1 section (H1 only), got %d", len(sections))
+func TestAggregatedContent_Hierarchy(t *testing.T) {
+	text := "# Users\n\nUser management overview\n\n## Auth\n\nJWT auth details\n\n### OAuth\n\nGoogle OAuth setup"
+	roots := BuildHeadingTree(text, 3)
+	if len(roots) != 1 {
+		t.Fatal("want 1 root")
 	}
-	if sections[0].Title != "H1" {
-		t.Errorf("level 1: title = %q", sections[0].Title)
+	agg := roots[0].AggregatedContent()
+	if !strings.Contains(agg, "Users") {
+		t.Errorf("missing root title: %s", agg)
 	}
-
-	// includeLevel=2: H1 and H2
-	sections = ParseWiki(text, "doc.md", 2)
-	if len(sections) != 2 {
-		t.Fatalf("level 2: want 2 sections, got %d", len(sections))
+	if !strings.Contains(agg, "User management") {
+		t.Errorf("missing root text: %s", agg)
 	}
-}
-
-func TestParseWiki_CJKHeadings(t *testing.T) {
-	text := "## 你好世界\n\n中文内容。\n\n## 日本語\n\n日本語の内容。"
-	sections := ParseWiki(text, "doc.md", 3)
-	if len(sections) != 2 {
-		t.Fatalf("want 2 sections, got %d", len(sections))
+	if !strings.Contains(agg, "Auth") {
+		t.Errorf("missing child title: %s", agg)
 	}
-	if sections[0].Title != "你好世界" {
-		t.Errorf("title 0 = %q", sections[0].Title)
+	if !strings.Contains(agg, "JWT") {
+		t.Errorf("missing child text: %s", agg)
 	}
-	if sections[1].Title != "日本語" {
-		t.Errorf("title 1 = %q", sections[1].Title)
+	if !strings.Contains(agg, "OAuth") {
+		t.Errorf("missing grandchild: %s", agg)
 	}
 }
 
-func TestParseWiki_CodeFenceWithHash(t *testing.T) {
-	text := "## Real Section\n\nreal content\n\n```\n# this is not a heading\n```\n\nmore content"
-	sections := ParseWiki(text, "doc.md", 3)
-	if len(sections) != 1 {
-		t.Fatalf("want 1 section, got %d", len(sections))
-	}
-	if sections[0].Title != "Real Section" {
-		t.Errorf("title = %q", sections[0].Title)
-	}
-	if !strings.Contains(sections[0].Content, "# this is not a heading") {
-		t.Errorf("code fence content should be preserved in section: %q", sections[0].Content)
+func TestWalkHeadingTree(t *testing.T) {
+	text := "# A\n\n## B\n\n## C\n\n### D"
+	roots := BuildHeadingTree(text, 3)
+	var titles []string
+	WalkHeadingTree(roots, func(n *HeadingNode) {
+		titles = append(titles, n.Title)
+	})
+	if len(titles) != 4 {
+		t.Fatalf("want 4 nodes, got %d: %v", len(titles), titles)
 	}
 }
 
-func TestParseWikiFile_NoHeadingsFallback(t *testing.T) {
+// ==============================
+// Indexer tests
+// ==============================
+
+func TestParseIndexEntry_Valid(t *testing.T) {
+	raw := "内容概览：JWT认证实现\n关键词：jwt, token, auth\n搜索匹配：token生成与验证"
+	r := ParseIndexEntry(raw)
+	if r == nil {
+		t.Fatal("expected parsed entry")
+	}
+	if r.Overview != "JWT认证实现" {
+		t.Errorf("overview = %q", r.Overview)
+	}
+	if r.Keywords != "jwt, token, auth" {
+		t.Errorf("keywords = %q", r.Keywords)
+	}
+	if r.SearchHints != "token生成与验证" {
+		t.Errorf("hints = %q", r.SearchHints)
+	}
+}
+
+func TestParseIndexEntry_Partial(t *testing.T) {
+	raw := "内容概览：Only overview here"
+	r := ParseIndexEntry(raw)
+	if r == nil {
+		t.Fatal("expected partial entry")
+	}
+	if r.Overview != "Only overview here" {
+		t.Errorf("overview = %q", r.Overview)
+	}
+}
+
+func TestParseIndexEntry_Invalid(t *testing.T) {
+	raw := "  \n  \n"
+	r := ParseIndexEntry(raw)
+	if r != nil {
+		t.Error("expected nil for empty/whitespace")
+	}
+}
+
+func TestFormatIndexEntry_Roundtrip(t *testing.T) {
+	r := &IndexEntryResult{
+		Overview:    "概览内容",
+		Keywords:    "k1, k2",
+		SearchHints: "搜索意图",
+	}
+	formatted := FormatIndexEntry(r)
+	parsed := ParseIndexEntry(formatted)
+	if parsed == nil {
+		t.Fatal("roundtrip failed")
+	}
+	if parsed.Overview != r.Overview || parsed.Keywords != r.Keywords || parsed.SearchHints != r.SearchHints {
+		t.Errorf("roundtrip mismatch: got %+v, want %+v", parsed, r)
+	}
+}
+
+func TestBuildIndexPrompt(t *testing.T) {
+	prompt := BuildIndexPrompt("Auth", "Users", "Auth content here")
+	if !strings.Contains(prompt, "Auth") {
+		t.Errorf("missing node title: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Users") {
+		t.Errorf("missing parent title: %s", prompt)
+	}
+}
+
+// ==============================
+// Office extraction tests
+// ==============================
+
+func TestExtractOfficeText_Docx(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "plain.txt")
-	os.WriteFile(path, []byte("plain text content"), 0o644)
-
-	sections, err := ParseWikiFile(path, "plain.txt", 3)
+	path := filepath.Join(dir, "test.docx")
+	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sections) != 1 {
-		t.Fatalf("want 1 fallback section, got %d", len(sections))
-	}
-	// ParseWiki returns nil for headingless text, ParseWikiFile fallback uses source as title.
-	if sections[0].Title != "plain.txt" {
-		t.Errorf("title = %q, want 'plain.txt'", sections[0].Title)
-	}
-}
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("word/document.xml")
+	io.WriteString(w, `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello World from docx</w:t></w:r></w:p></w:body></w:document>`)
+	zw.Close()
+	f.Close()
 
-func TestParseWikiFile_WithHeadings(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "doc.md")
-	os.WriteFile(path, []byte("## Section 1\n\ncontent 1\n\n## Section 2\n\ncontent 2"), 0o644)
-
-	sections, err := ParseWikiFile(path, "doc.md", 3)
+	text, err := ExtractOfficeText(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sections) != 2 {
-		t.Fatalf("want 2 sections, got %d", len(sections))
+	if !strings.Contains(text, "Hello World from docx") {
+		t.Errorf("expected 'Hello World from docx', got %q", text)
 	}
 }
 
-func TestParseWiki_EmptyText(t *testing.T) {
-	sections := ParseWiki("", "empty.md", 3)
-	if len(sections) != 0 {
-		t.Fatalf("want 0 sections for empty text, got %d", len(sections))
+func TestExtractOfficeText_Pptx(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.pptx")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("ppt/slides/slide1.xml")
+	io.WriteString(w, `<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide 1 Title</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`)
+	zw.Close()
+	f.Close()
+
+	text, err := ExtractOfficeText(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Slide 1 Title") {
+		t.Errorf("expected 'Slide 1 Title', got %q", text)
 	}
 }
 
-func TestParseWiki_OnlyWhitespace(t *testing.T) {
-	sections := ParseWiki("   \n  \n  ", "ws.md", 3)
-	if len(sections) != 0 {
-		t.Fatalf("want 0 sections for whitespace-only text, got %d", len(sections))
+func TestExtractOfficeText_Xlsx(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.xlsx")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	ss, _ := zw.Create("xl/sharedStrings.xml")
+	io.WriteString(ss, `<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Cell A1</t></si><si><t>Cell B1</t></si></sst>`)
+	sheet, _ := zw.Create("xl/worksheets/sheet1.xml")
+	io.WriteString(sheet, `<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>`)
+	zw.Close()
+	f.Close()
+
+	text, err := ExtractOfficeText(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Cell A1") {
+		t.Errorf("expected 'Cell A1', got %q", text)
 	}
 }

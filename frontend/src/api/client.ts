@@ -1117,3 +1117,26 @@ export const searchKnowledge = (query: string, topK?: number) =>
   )
 
 // (removed: getAvailableEmbedders — vector embedding system deprecated)
+
+// Knowledge section management
+export const listKnowledgeSections = (baseName: string) =>
+  jsonFetch<{ sections: Array<{ id: number; title: string; content: string; source: string; base: string }> }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections`,
+  )
+
+export const getKnowledgeSection = (baseName: string, id: number) =>
+  jsonFetch<{ id: number; title: string; content: string; source: string; base: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections/${id}`,
+  )
+
+export const addKnowledgeSection = (baseName: string, body: { title: string; content: string; source: string }) =>
+  jsonFetch<{ id: number; ok: boolean }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections`,
+    { method: 'POST', body: JSON.stringify(body) },
+  )
+
+export const deleteKnowledgeSection = (baseName: string, id: number) =>
+  jsonFetch<{ ok: boolean }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections/${id}`,
+    { method: 'DELETE' },
+  )

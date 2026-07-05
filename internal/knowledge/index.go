@@ -25,6 +25,11 @@ var IndexableExtensions = map[string]bool{
 		// Other text
 		".csv": true, ".tsv": true, ".log": true, ".diff": true, ".patch": true,
 		".proto": true, ".graphql": true, ".gql": true, ".tf": true,
+		// PDF (text extraction, not vision-based)
+		".pdf": true,
+		// Office documents (ZIP+XML text extraction, zero deps)
+		".docx": true, ".docm": true, ".xlsx": true, ".xlsm": true,
+		".pptx": true, ".pptm": true,
 	}
 
 type SearchResult struct {

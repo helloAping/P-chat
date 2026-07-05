@@ -166,10 +166,42 @@ func makeWikiIndexHandler(cfg *config.Config) ToolHandler {
 				fmt.Fprintf(&b, "### %s\n", s.Source)
 				currentSource = s.Source
 			}
-			fmt.Fprintf(&b, "  - %s\n", s.Title)
+			indent := ""
+			if s.Heading != "" {
+				indent = "··" // indent sub-items
+			}
+			kw := extractKeywords(s.Content)
+			line := fmt.Sprintf("%s- %s", indent, s.Title)
+			if kw != "" {
+				line += fmt.Sprintf(" ← %s", kw)
+			}
+			fmt.Fprintf(&b, "  %s\n", line)
+
+			// Show sub-items under their parent if they share the same source.
+			for _, sub := range all {
+				if sub.Heading == s.Title && sub.Source == s.Source {
+					subKw := extractKeywords(sub.Content)
+					subLine := fmt.Sprintf("    - %s", sub.Title)
+					if subKw != "" {
+						subLine += fmt.Sprintf(" ← %s", subKw)
+					}
+					fmt.Fprintf(&b, "  %s\n", subLine)
+				}
+			}
 		}
 		return &CallResult{Content: b.String()}, nil
 	}
+}
+
+// extractKeywords parses the "关键词：" line from a formatted index entry.
+func extractKeywords(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "关键词：") || strings.HasPrefix(line, "关键词:") {
+			return strings.TrimPrefix(strings.TrimPrefix(line, "关键词："), "关键词:")
+		}
+	}
+	return ""
 }
 
 // resolveBases resolves a base name to KnowledgeBase entries.
