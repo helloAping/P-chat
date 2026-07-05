@@ -308,9 +308,10 @@ type MCPServerConfig struct {
 // KnowledgeConfig controls the wiki-based knowledge base system.
 // Uses SQLite FTS5 for full-text search; no vector embeddings required.
 type KnowledgeConfig struct {
-	Enabled   bool            `json:"enabled"`
-	AutoIndex bool            `json:"auto_index"`
-	Bases     []KnowledgeBase `json:"bases,omitempty"`
+	Enabled     bool            `json:"enabled"`
+	AutoIndex   bool            `json:"auto_index"`
+	Bases       []KnowledgeBase `json:"bases,omitempty"`
+	Initialized bool            `json:"initialized,omitempty"`
 }
 
 // KnowledgeBase defines a local directory to scan into the wiki index.

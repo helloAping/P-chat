@@ -114,7 +114,9 @@ func makeWikiIndexHandler(cfg *config.Config) ToolHandler {
 	return func(ctx context.Context, argsRaw json.RawMessage) (*CallResult, error) {
 		var a wikiIndexArgs
 		if argsRaw != nil {
-			json.Unmarshal(argsRaw, &a)
+			if err := json.Unmarshal(argsRaw, &a); err != nil {
+				return &CallResult{Content: "参数错误: " + err.Error(), IsError: true}, nil
+			}
 		}
 		kc := cfg.Knowledge
 		if !kc.Enabled {
@@ -153,7 +155,7 @@ func makeWikiIndexHandler(cfg *config.Config) ToolHandler {
 		}
 
 		if len(all) == 0 {
-			return &CallResult{Content: "(知识库为空，尚未扫描)", IsError: true}, nil
+			return &CallResult{Content: "(知识库为空，尚未扫描)"}, nil
 		}
 
 		var b strings.Builder

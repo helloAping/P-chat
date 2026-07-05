@@ -74,6 +74,11 @@ type Agent struct {
 	// session, so the LLM's prefix cache hits on it.
 	staticPrompt   string
 	staticPromptID string // signature used to detect when to rebuild
+
+	// KB index cache — rebuild only on Reload() or after 60s TTL.
+	kbIndexCache     string
+	kbIndexCacheKey  string // base name used to build the cache
+	kbIndexCacheTime int64  // unix timestamp of last build
 }
 
 // SetChatOptions overrides the per-request sampling parameters
@@ -741,8 +746,15 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 // When KBBase is "__all__", all enabled bases are listed. When it's a
 // specific name, only that base's index is shown. If the base has no
 // sections, a placeholder is returned. The output is truncated at 3000
-// characters to avoid prompt explosion.
-func buildKBIndex(cfg *config.Config, kbBase string) string {
+// characters to avoid prompt explosion. Results are cached for 60s to
+// avoid repeated full-DB scans per message turn.
+func (a *Agent) buildKBIndex(kbBase string) string {
+	nowUnix := time.Now().Unix()
+	if a.kbIndexCache != "" && a.kbIndexCacheKey == kbBase && (nowUnix-a.kbIndexCacheTime) < 60 {
+		return a.kbIndexCache
+	}
+
+	cfg := a.cfg
 	kc := cfg.Knowledge
 	var bases []config.KnowledgeBase
 	if kbBase == "__all__" {
@@ -760,7 +772,11 @@ func buildKBIndex(cfg *config.Config, kbBase string) string {
 		}
 	}
 	if len(bases) == 0 {
-		return "\n[Knowledge Base]\n(no enabled bases configured)\n"
+		result := "\n[Knowledge Base]\n(no enabled bases configured)\n"
+		a.kbIndexCache = result
+		a.kbIndexCacheKey = kbBase
+		a.kbIndexCacheTime = nowUnix
+		return result
 	}
 
 	var sb strings.Builder
@@ -795,17 +811,29 @@ func buildKBIndex(cfg *config.Config, kbBase string) string {
 			if sb.Len() > 3000 {
 				sb.WriteString(fmt.Sprintf("\n  ...(%d more sections omitted)\n", len(sections)-count))
 				sb.WriteString("\nTools: wiki_lookup(title) — search and retrieve section content.\n       grep(pattern) — line search within base files.\n")
-				return sb.String()
+				result := sb.String()
+				a.kbIndexCache = result
+				a.kbIndexCacheKey = kbBase
+				a.kbIndexCacheTime = nowUnix
+				return result
 			}
 		}
 	}
 	if sb.Len() == 0 {
-		return "\n[Knowledge Base]\n(index empty — run a scan first)\n"
+		result := "\n[Knowledge Base]\n(index empty — run a scan first)\n"
+		a.kbIndexCache = result
+		a.kbIndexCacheKey = kbBase
+		a.kbIndexCacheTime = nowUnix
+		return result
 	}
 
 	sb.WriteString("\nTools: wiki_lookup(title) — search and retrieve section content.\n")
 	sb.WriteString("       grep(pattern) — line search within base files.\n")
-	return sb.String()
+	result := sb.String()
+	a.kbIndexCache = result
+	a.kbIndexCacheKey = kbBase
+	a.kbIndexCacheTime = nowUnix
+	return result
 }
 
 // Reload forces the next call to rebuild the static system prompt
@@ -817,6 +845,9 @@ func (a *Agent) Reload() {
 	a.rules = rulesList
 	a.staticPrompt = ""
 	a.staticPromptID = ""
+	a.kbIndexCache = ""
+	a.kbIndexCacheKey = ""
+	a.kbIndexCacheTime = 0
 }
 
 // StaticPromptInfo exposes the current static-prompt cache key for testing.
@@ -1049,7 +1080,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 		// Inject knowledge base context + index.
 		if req.KBBase != "" && req.KBBase != "__off__" {
-			kbIndex := buildKBIndex(a.cfg, req.KBBase)
+			kbIndex := a.buildKBIndex(req.KBBase)
 			systemPrompt += kbIndex
 		}
 		// Sub-agent prompt override. When the sub-agent runner

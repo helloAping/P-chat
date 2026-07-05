@@ -81,6 +81,7 @@ func makeGrepHandler(cfg *config.Config) ToolHandler {
 // grepKnowledgeBases searches knowledge-base files for lines matching
 // pattern (case-insensitive). Returns file:line results.
 // If baseName is non-empty and not "__all__", searches only that base.
+// Respects each base's ExcludePatterns to skip matching paths.
 func grepKnowledgeBases(cfg *config.Config, baseName, pattern string, maxResults int) []knowledge.SearchResult {
 	if pattern == "" || maxResults <= 0 {
 		return nil
@@ -101,8 +102,11 @@ func grepKnowledgeBases(cfg *config.Config, baseName, pattern string, maxResults
 			continue
 		}
 		_ = filepath.Walk(absPath, func(path string, info os.FileInfo, walkErr error) error {
-			if walkErr != nil || info == nil || info.IsDir() {
-				name := filepath.Base(path)
+			if walkErr != nil || info == nil {
+				return nil
+			}
+			if info.IsDir() {
+				name := info.Name()
 				if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
 					return filepath.SkipDir
 				}
@@ -114,11 +118,22 @@ func grepKnowledgeBases(cfg *config.Config, baseName, pattern string, maxResults
 			if info.Size() > 5*1024*1024 {
 				return nil
 			}
+			// Check base-level exclude patterns.
+			if len(base.ExcludePatterns) > 0 {
+				rel, err := filepath.Rel(absPath, path)
+				if err == nil {
+					for _, pat := range base.ExcludePatterns {
+						matched, _ := filepath.Match(pat, rel)
+						if matched {
+							return nil
+						}
+					}
+				}
+			}
 			f, err := os.Open(path)
 			if err != nil {
 				return nil
 			}
-			defer f.Close()
 
 			scanner := bufio.NewScanner(f)
 			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -133,10 +148,12 @@ func grepKnowledgeBases(cfg *config.Config, baseName, pattern string, maxResults
 						Rank:       len(out) + 1,
 					})
 					if len(out) >= maxResults {
+						f.Close()
 						return filepath.SkipAll
 					}
 				}
 			}
+			f.Close()
 			return nil
 		})
 		if len(out) >= maxResults {

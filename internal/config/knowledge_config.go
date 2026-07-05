@@ -2,19 +2,30 @@ package config
 
 import "fmt"
 
-// UpdateKnowledgeConfig merges a partial KnowledgeConfig blob (from a JSON
-// PATCH body) into the persisted config. The patch is applied selectively:
-// only non-zero/defined fields overwrite the existing value. The modified
-// config is saved atomically to ~/.p-chat/config.json.
-func UpdateKnowledgeConfig(patch KnowledgeConfig) (*KnowledgeConfig, error) {
+// KnowledgeConfigPatch is a partial update for KnowledgeConfig.
+// Bool fields use pointers so "not sent" (nil) ≠ "false".
+type KnowledgeConfigPatch struct {
+	Enabled   *bool            `json:"enabled,omitempty"`
+	AutoIndex *bool            `json:"auto_index,omitempty"`
+	Bases     []KnowledgeBase  `json:"bases,omitempty"`
+}
+
+// UpdateKnowledgeConfig merges a partial KnowledgeConfigPatch into the
+// persisted config. Only fields explicitly sent in the JSON body overwrite
+// the existing value. The modified config is saved to ~/.p-chat/config.json.
+func UpdateKnowledgeConfig(patch KnowledgeConfigPatch) (*KnowledgeConfig, error) {
 	cfg, err := Load("")
 	if err != nil {
 		return nil, err
 	}
 
 	kc := &cfg.Knowledge
-	kc.Enabled = patch.Enabled
-	kc.AutoIndex = patch.AutoIndex
+	if patch.Enabled != nil {
+		kc.Enabled = *patch.Enabled
+	}
+	if patch.AutoIndex != nil {
+		kc.AutoIndex = *patch.AutoIndex
+	}
 	if len(patch.Bases) > 0 {
 		kc.Bases = patch.Bases
 	}

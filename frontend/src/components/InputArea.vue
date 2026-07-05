@@ -161,6 +161,8 @@ async function loadKBases() {
   try { kbBases.value = await api.getKnowledgeBases() } catch {}
 }
 
+watch(() => state.kbConfigVersion, () => { loadKBases() })
+
 // CmdSpec is imported from CommandPalette.vue
 
 const commandList = ref<CmdSpec[]>([])

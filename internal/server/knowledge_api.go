@@ -120,7 +120,7 @@ func (h *Handler) UpdateKnowledgeConfig(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
-	var patch config.KnowledgeConfig
+	var patch config.KnowledgeConfigPatch
 	if err := c.ShouldBindJSON(&patch); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
@@ -279,7 +279,19 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 	}
 	v, ok := scanJobs.Load(name)
 	if !ok {
-		c.JSON(http.StatusOK, scanProgressResp{Done: false})
+		// No active scan — return current section count from wiki store.
+		resp := scanProgressResp{Done: false}
+		for _, b := range h.cfg.Knowledge.Bases {
+			if b.Name == name {
+				store, err := knowledge.GetOrOpenWikiStore(b.Name, b.Path)
+				if err == nil {
+					sections, _ := store.ListBase(context.Background(), b.Name)
+					resp.Chunks = len(sections)
+				}
+				break
+			}
+		}
+		c.JSON(http.StatusOK, resp)
 		return
 	}
 	j := v.(*scanJob)
@@ -291,9 +303,9 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 		errMsg := strings.TrimPrefix(j.status, "error: ")
 		c.JSON(http.StatusOK, scanProgressResp{Error: errMsg, Done: true})
 	} else {
-		msg := "鎵弿涓?.."
+		msg := "扫描中..."
 		if j.status == "counting" {
-			msg = "姝ｅ湪缁熻鏂囦欢..."
+			msg = "正在统计文件..."
 		}
 		c.JSON(http.StatusOK, scanProgressResp{Current: j.current, Total: j.total, Chunks: j.chunks, Message: msg})
 	}
@@ -308,7 +320,7 @@ func (h *Handler) CancelScan(c *gin.Context) {
 	}
 	v, ok := scanJobs.Load(name)
 	if !ok {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "message": "濞屸剝婀佹潻娑滎攽娑擃厾娈戦幍顐ｅ伎"})
+		c.JSON(http.StatusOK, gin.H{"ok": true, "message": "没有正在进行的扫描"})
 		return
 	}
 	j := v.(*scanJob)
@@ -457,17 +469,19 @@ func (h *Handler) startScanJob(name string) error {
 	}
 
 	kc := h.cfg.Knowledge
-	if !kc.Enabled || !base.Enabled {
+	needsReload := false
+	if !kc.Enabled {
 		kc.Enabled = true
+		needsReload = true
+	}
+	if !base.Enabled {
 		base.Enabled = true
+		needsReload = true
+	}
+	if needsReload {
 		h.cfg.Knowledge = kc
-		if err := config.NewManager().SaveGlobal(h.cfg); err != nil {
-			log.Printf("[scan %s] auto-enable save: %v", name, err)
-		} else {
-			config.Load("")
-			h.reloadAfterConfigChange()
-			log.Printf("[scan %s] auto-enabled", name)
-		}
+		h.reloadAfterConfigChange()
+		log.Printf("[scan %s] auto-enabled knowledge base temporarily for scan (not persisted to config)", name)
 	}
 
 	basePath, err := filepath.Abs(base.Path)
@@ -495,7 +509,7 @@ func (h *Handler) startScanJob(name string) error {
 			return
 		}
 
-		fileCount, sectionCount, err := h.wikiScan(ctx, store, base, basePath, name, func(current, total int) {
+		fileCount, sectionCount, mediaFiles, err := h.wikiScan(ctx, store, base, basePath, name, func(current, total int) {
 			job.current = current
 			job.total = total
 			job.status = "running"
@@ -506,19 +520,50 @@ func (h *Handler) startScanJob(name string) error {
 			return
 		}
 
-		// Media scan: only if ScanModel is configured and scan has media types.
-		if base.ScanModel != "" && len(base.ScanMediaTypes) > 0 && h.agent != nil {
-			log.Printf("[scan %s] media scanning with model %s (types: %v)", name, base.ScanModel, base.ScanMediaTypes)
-			mediaChunks, mediaErr := h.mediaScan(ctx, store, base, basePath, name, func(current, total int) {
-				job.current = fileCount + current
-				job.total = fileCount + total
+		// Process media files collected during the wikiScan walk.
+		if len(mediaFiles) > 0 && h.agent != nil {
+			log.Printf("[scan %s] processing %d media files with model %s", name, len(mediaFiles), base.ScanModel)
+			var sections []knowledge.WikiSection
+			for i, path := range mediaFiles {
+				select {
+				case <-ctx.Done():
+					break
+				default:
+				}
+				ext := strings.ToLower(filepath.Ext(path))
+				mt := knowledge.IsMediaFile(ext, base.ScanMediaTypes)
+				if mt == "" {
+					continue
+				}
+				desc, err := h.describeMediaFile(ctx, base, path, mt)
+				if err != nil {
+					log.Printf("[scan %s] media %s: %v", name, path, err)
+					continue
+				}
+				rel, _ := filepath.Rel(basePath, path)
+				sections = append(sections, knowledge.WikiSection{
+					Title:   filepath.ToSlash(rel),
+					Content: desc,
+					Source:  filepath.ToSlash(rel),
+					Base:    name,
+				})
+				if len(sections) >= 50 {
+					if err := store.AppendSections(ctx, sections); err != nil {
+						log.Printf("[scan %s] append media: %v", name, err)
+					}
+					sectionCount += len(sections)
+					sections = nil
+				}
+				job.current = fileCount + i + 1
+				job.total = fileCount + len(mediaFiles)
 				job.status = "media"
-			})
-			if mediaErr != nil {
-				log.Printf("[scan %s] media scan: %v", name, mediaErr)
-				// Don't fail the whole scan; text is already indexed.
 			}
-			sectionCount += mediaChunks
+			if len(sections) > 0 {
+				if err := store.AppendSections(ctx, sections); err != nil {
+					log.Printf("[scan %s] append media: %v", name, err)
+				}
+				sectionCount += len(sections)
+			}
 		}
 
 		job.status = fmt.Sprintf("ok: %d sections", sectionCount)
@@ -651,21 +696,24 @@ func (h *Handler) summarizeText(ctx context.Context, base *config.KnowledgeBase,
 	return desc, nil
 }
 
-// wikiScan walks a directory and parses all indexable files into wiki
-// sections, storing them via the WikiStore. Returns (fileCount, sectionCount).
+// wikiScan walks a directory, parses all indexable files into wiki
+// sections and collects media file paths for downstream processing.
+// Returns (fileCount, sectionCount, mediaFiles, error).
 // When base.ScanModel is set, each section is summarized by LLM before storage.
-func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string, progress func(current, total int)) (int, int, error) {
+func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string, progress func(current, total int)) (int, int, []string, error) {
 	if _, err := os.Stat(dir); err != nil {
-		return 0, 0, fmt.Errorf("stat %s: %w", dir, err)
+		return 0, 0, nil, fmt.Errorf("stat %s: %w", dir, err)
 	}
 	dir, err := filepath.Abs(dir)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 
-	// Phase 1: count files.
-	var totalFiles int
-	filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
+	wantMedia := base.ScanModel != "" && len(base.ScanMediaTypes) > 0
+
+	// Phase 1: count files (text + media).
+	var totalFiles, mediaCount int
+	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -677,19 +725,29 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
-		if !knowledge.IndexableExtensions[ext] {
-			return nil
+		if knowledge.IndexableExtensions[ext] {
+			totalFiles++
+		} else if wantMedia && knowledge.IsMediaFile(ext, base.ScanMediaTypes) != "" {
+			mediaCount++
 		}
-		totalFiles++
 		return nil
 	})
+	if walkErr != nil {
+		log.Printf("[scan %s] counting phase walk error: %v", baseName, walkErr)
+	}
 
-	log.Printf("[scan %s] found %d indexable files", baseName, totalFiles)
+	log.Printf("[scan %s] found %d indexable files + %d media files", baseName, totalFiles, mediaCount)
 	var processed, totalSections, skipped int
 	currentSources := make(map[string]bool)
+	var mediaFiles []string
 
-	// Phase 2: parse each file into wiki sections (skip unchanged via mtime).
-	filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
+	mediaMaxSize := base.MaxFileSize
+	if mediaMaxSize <= 0 {
+		mediaMaxSize = 5 * 1024 * 1024
+	}
+
+	// Phase 2: parse text + collect media (single walk).
+	walkPhase2Err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("scan cancelled after %d/%d files", processed, totalFiles)
@@ -707,6 +765,10 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 		}
 		ext := strings.ToLower(filepath.Ext(path))
 		if !knowledge.IndexableExtensions[ext] {
+			// Collect media files during this walk.
+			if wantMedia && knowledge.IsMediaFile(ext, base.ScanMediaTypes) != "" && info.Size() <= mediaMaxSize {
+				mediaFiles = append(mediaFiles, path)
+			}
 			return nil
 		}
 		sizeLimit := int64(5 * 1024 * 1024)
@@ -720,6 +782,21 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
+
+		// Check base-level exclude patterns.
+		if len(base.ExcludePatterns) > 0 {
+			skip := false
+			for _, pat := range base.ExcludePatterns {
+				if matched, _ := filepath.Match(pat, rel); matched {
+					skip = true
+					break
+				}
+			}
+			if skip {
+				return nil
+			}
+		}
+
 		currentSources[rel] = true
 
 		// Check mtime for incremental skip.
@@ -769,6 +846,9 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 		log.Printf("[scan %d/%d] %s -> %d sections", processed, totalFiles, rel, len(sections))
 		return nil
 	})
+	if walkPhase2Err != nil {
+		log.Printf("[scan %s] phase 2 walk error: %v", baseName, walkPhase2Err)
+	}
 
 	if skipped > 0 {
 		log.Printf("[scan %s] skipped %d unchanged files", baseName, skipped)
@@ -780,7 +860,7 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 	}
 
 	log.Printf("[scan %s] indexed %d sections (+%d skipped) in %d files", baseName, totalSections, skipped, processed)
-	return processed, totalSections, nil
+	return processed, totalSections, mediaFiles, nil
 }
 
 // mediaScan walks the directory for media files (images/video/audio/pdf) and
@@ -900,7 +980,6 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 			if err != nil {
 				return nil
 			}
-			defer f.Close()
 
 			scanner := bufio.NewScanner(f)
 			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -914,10 +993,12 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 						Content: scanner.Text(),
 					})
 					if len(out) >= maxResults {
+						f.Close()
 						return filepath.SkipAll
 					}
 				}
 			}
+			f.Close()
 			return nil
 		})
 		if len(out) >= maxResults {

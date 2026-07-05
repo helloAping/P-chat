@@ -21,13 +21,13 @@
 // actually changed, mirroring the backend's "non-empty means
 // write, otherwise leave alone" contract.
 
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
   NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NTooltip, NIcon, NPopover, useMessage,
 } from 'naive-ui'
 import * as api from '../api/client'
-import { loadProviders, loadSessions } from '../stores/chat'
+import { loadProviders, loadSessions, bumpKBConfigVersion } from '../stores/chat'
 import type { Session } from '../api/client'
 
 const message = useMessage()
@@ -632,6 +632,12 @@ async function onDeleteStyle(id: string) {
 
 function close() { (window as any).closeAppSettings?.() }
 
+onBeforeUnmount(() => {
+  for (const timer of Object.values(kbScanTimers)) {
+    clearInterval(timer as number)
+  }
+})
+
 // --- Archive state ---
 const archivedSessions = ref<Session[]>([])
 const loadingArchived = ref(false)
@@ -1004,11 +1010,11 @@ async function refreshKBModels() {
 }
 
 async function onToggleKBEnabled(v: boolean) {
-  try { await api.updateKnowledgeConfig({ enabled: v }); kbEnabled.value = v } catch (e: any) { message.error(`切换失败: ${e.message}`) }
+  try { await api.updateKnowledgeConfig({ enabled: v }); kbEnabled.value = v; bumpKBConfigVersion() } catch (e: any) { message.error(`切换失败: ${e.message}`) }
 }
 
 async function onToggleKBAutoIndex(v: boolean) {
-  try { await api.updateKnowledgeConfig({ auto_index: v }); kbAutoIndex.value = v } catch (e: any) { message.error(`切换失败: ${e.message}`) }
+  try { await api.updateKnowledgeConfig({ auto_index: v }); kbAutoIndex.value = v; bumpKBConfigVersion() } catch (e: any) { message.error(`切换失败: ${e.message}`) }
 }
 
 async function onAddKB() {
@@ -1020,11 +1026,12 @@ async function onAddKB() {
     newKBName.value = ''; newKBPath.value = ''
     await refreshKB()
     kbSelectedName.value = kbBases.value[kbBases.value.length - 1]?.name ?? null
+    bumpKBConfigVersion()
   } catch (e: any) { message.error(`添加失败: ${e.message}`) }
 }
 
 async function onDeleteKB(name: string) {
-  try { await api.removeKnowledgeBase(name); message.success('已删除'); await refreshKB() } catch (e: any) { message.error(`删除失败: ${e.message}`) }
+  try { await api.removeKnowledgeBase(name); message.success('已删除'); await refreshKB(); bumpKBConfigVersion() } catch (e: any) { message.error(`删除失败: ${e.message}`) }
 }
 
 async function onScanKB(name: string) {
@@ -1046,6 +1053,7 @@ function pollScan(name: string) {
         scanningKBs.value = new Set([...scanningKBs.value].filter(n => n !== name))
         delete kbScanTimers[name]
         await refreshKB()
+        bumpKBConfigVersion()
       }
     } catch { clearInterval(timer); scanningKBs.value.delete(name); delete kbScanTimers[name] }
   }, 800)
@@ -1067,6 +1075,7 @@ function onToggleKBSwitch(name: string, enabled: boolean) {
   const updated = { ...kbBases.value[idx], enabled }
   api.updateKnowledgeConfig({ bases: kbBases.value.map((b, i) => i === idx ? updated : b) }).then(() => {
     kbBases.value[idx] = updated
+    bumpKBConfigVersion()
   }).catch(e => message.error(`更新失败: ${e.message}`))
 }
 
@@ -1076,6 +1085,7 @@ function onUpdateKBField(name: string, field: string, value: any) {
   const updated = { ...kbBases.value[idx], [field]: value }
   api.updateKnowledgeConfig({ bases: kbBases.value.map((b, i) => i === idx ? updated : b) }).then(() => {
     kbBases.value[idx] = updated
+    bumpKBConfigVersion()
   }).catch(e => message.error(`更新失败: ${e.message}`))
 }
 
@@ -1635,7 +1645,12 @@ function kbModelSupportsVision(scanModel: string) {
                 <div class="provider-item-head">
                   <NTag v-if="b.enabled" type="success" size="tiny" :bordered="false">启用</NTag>
                   <strong class="provider-item-name">{{ b.name }}</strong>
-                  <NButton size="tiny" quaternary type="error" @click.stop="onDeleteKB(b.name)" class="provider-del-btn">✕</NButton>
+                  <NPopconfirm @positive-click="onDeleteKB(b.name)" positive-text="删除" negative-text="取消">
+                    <template #trigger>
+                      <NButton size="tiny" quaternary type="error" @click.stop class="provider-del-btn">✕</NButton>
+                    </template>
+                    确定删除知识库「{{ b.name }}」？此操作不可撤销。
+                  </NPopconfirm>
                 </div>
                 <div class="provider-item-sub">
                   <span class="muted">{{ b.path }}</span>

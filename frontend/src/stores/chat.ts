@@ -62,6 +62,7 @@ export const state = reactive({
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
   sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
+  kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
   // sessionWorking is the per-session "is the LLM mid-turn"
   // flag, derived from the `session_status` SSE event. The
@@ -114,6 +115,10 @@ export const currentSessionWorking = computed(() =>
 export function clearSessionTodos(id: string) {
   if (!id) return
   state.sessionTodos[id] = []
+}
+
+export function bumpKBConfigVersion() {
+  state.kbConfigVersion++
 }
 
 export const activeProjectName = computed(() => {

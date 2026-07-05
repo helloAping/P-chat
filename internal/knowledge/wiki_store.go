@@ -126,23 +126,13 @@ func (ws *WikiStore) RemoveStaleSources(ctx context.Context, base string, curren
 	defer tx.Rollback()
 
 	for _, src := range stale {
-		// Get section IDs to remove from FTS.
-		idRows, err := tx.QueryContext(ctx,
-			`SELECT id FROM wiki_sections WHERE base = ? AND source = ?`, base, src)
-		if err != nil {
-			continue
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
-		var ids []int64
-		for idRows.Next() {
-			var id int64
-			idRows.Scan(&id)
-			ids = append(ids, id)
-		}
-		idRows.Close()
-
-		for _, id := range ids {
-			tx.ExecContext(ctx, `DELETE FROM wiki_fts WHERE rowid = ?`, id)
-		}
+		tx.ExecContext(ctx,
+			`DELETE FROM wiki_fts WHERE rowid IN (SELECT id FROM wiki_sections WHERE base = ? AND source = ?)`, base, src)
 		tx.ExecContext(ctx, `DELETE FROM wiki_sections WHERE base = ? AND source = ?`, base, src)
 		tx.ExecContext(ctx, `DELETE FROM file_mtimes WHERE base = ? AND source = ?`, base, src)
 	}
@@ -185,10 +175,11 @@ func (ws *WikiStore) ReplaceBase(ctx context.Context, base string, sections []Wi
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM wiki_sections WHERE base = ?`, base); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM wiki_fts WHERE rowid IN (SELECT id FROM wiki_sections WHERE base = ?)`, base); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM wiki_fts`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM wiki_sections WHERE base = ?`, base); err != nil {
 		return err
 	}
 
@@ -204,16 +195,9 @@ func (ws *WikiStore) ReplaceSource(ctx context.Context, base, source string, sec
 	}
 	defer tx.Rollback()
 
-	// Remove old FTS entries for this source.
-	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM wiki_sections WHERE base = ? AND source = ?`, base, source)
-	if err == nil {
-		for rows.Next() {
-			var id int64
-			rows.Scan(&id)
-			tx.ExecContext(ctx, `DELETE FROM wiki_fts WHERE rowid = ?`, id)
-		}
-		rows.Close()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM wiki_fts WHERE rowid IN (SELECT id FROM wiki_sections WHERE base = ? AND source = ?)`, base, source); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM wiki_sections WHERE base = ? AND source = ?`, base, source); err != nil {
@@ -233,7 +217,7 @@ func insertSectionsTx(ctx context.Context, tx *sql.Tx, base string, sections []W
 	defer insertSection.Close()
 
 	insertFTS, err := tx.PrepareContext(ctx,
-		`INSERT INTO wiki_fts (title, content, source) VALUES (?,?,?)`)
+		`INSERT INTO wiki_fts (rowid, title, content, source) VALUES (?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -244,9 +228,11 @@ func insertSectionsTx(ctx context.Context, tx *sql.Tx, base string, sections []W
 		if err != nil {
 			return err
 		}
-		id, _ := res.LastInsertId()
-		_ = id
-		if _, err := insertFTS.ExecContext(ctx, s.Title, s.Content, s.Source); err != nil {
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		if _, err := insertFTS.ExecContext(ctx, id, s.Title, s.Content, s.Source); err != nil {
 			return err
 		}
 	}
@@ -269,17 +255,22 @@ func (ws *WikiStore) AppendSections(ctx context.Context, sections []WikiSection)
 	defer insertSection.Close()
 
 	insertFTS, err := tx.PrepareContext(ctx,
-		`INSERT INTO wiki_fts (title, content, source) VALUES (?,?,?)`)
+		`INSERT INTO wiki_fts (rowid, title, content, source) VALUES (?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer insertFTS.Close()
 
 	for _, s := range sections {
-		if _, err := insertSection.ExecContext(ctx, s.Title, s.Content, s.Source, s.Base, s.Heading); err != nil {
+		res, err := insertSection.ExecContext(ctx, s.Title, s.Content, s.Source, s.Base, s.Heading)
+		if err != nil {
 			return err
 		}
-		if _, err := insertFTS.ExecContext(ctx, s.Title, s.Content, s.Source); err != nil {
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		if _, err := insertFTS.ExecContext(ctx, id, s.Title, s.Content, s.Source); err != nil {
 			return err
 		}
 	}
@@ -313,6 +304,8 @@ func (ws *WikiStore) SearchFTS(ctx context.Context, query string, topK int) ([]W
 		if err == nil && len(sections) > 0 {
 			return sections, nil
 		}
+		// nil error + 0 results = no match, try next strategy.
+		// non-nil error = real DB issue, try LIKE fallback.
 	}
 
 	// Strategy 4: LIKE fallback on title
@@ -323,8 +316,21 @@ func (ws *WikiStore) SearchFTS(ctx context.Context, query string, topK int) ([]W
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	return scanSections(rows)
+	sections, _ := scanSections(rows)
+	rows.Close()
+	if len(sections) == 0 {
+		// Strategy 5: LIKE fallback on content
+		rows2, err := ws.db.QueryContext(ctx,
+			`SELECT id, title, content, source, base, heading FROM wiki_sections
+			 WHERE content LIKE ? ORDER BY title LIMIT ?`,
+			"%"+query+"%", topK)
+		if err != nil {
+			return nil, err
+		}
+		defer rows2.Close()
+		return scanSections(rows2)
+	}
+	return sections, nil
 }
 
 func (ws *WikiStore) ftsSearch(ctx context.Context, ftsQuery string, topK int) ([]WikiSection, error) {
@@ -340,20 +346,18 @@ func (ws *WikiStore) ftsSearch(ctx context.Context, ftsQuery string, topK int) (
 	if err != nil {
 		return nil, err
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no fts results")
-	}
 	return out, nil
 }
 
 // ListBase returns all section titles for a base (or all bases if base is empty).
+// When base is empty the result is capped at 5000 rows to avoid unbounded memory use.
 func (ws *WikiStore) ListBase(ctx context.Context, base string) ([]WikiSection, error) {
 	var rows *sql.Rows
 	var err error
 	if base == "" {
 		rows, err = ws.db.QueryContext(ctx,
 			`SELECT id, title, content, source, base, heading
-			 FROM wiki_sections ORDER BY source, id`)
+			 FROM wiki_sections ORDER BY source, id LIMIT 5000`)
 	} else {
 		rows, err = ws.db.QueryContext(ctx,
 			`SELECT id, title, content, source, base, heading
@@ -472,32 +476,38 @@ func escapeFTS(s string) string {
 	return `"` + s + `"`
 }
 
-// wikiStoreMu guards the singleton cache.
+// wikiStoreCache stores per-(dir,name) wiki store instances.
+var wikiStoreCache sync.Map
 var wikiStoreMu sync.Mutex
-var wikiStoreSingleton *WikiStore
 
-// GetOrOpenWikiStore returns a cached singleton wiki store for the given
-// base. The store is created once on first access and reused.
+// GetOrOpenWikiStore returns a cached wiki store keyed by (dir, name).
+// Each unique combination gets its own SQLite database.
 func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) {
+	key := dir + "/" + name
+	if ws, ok := wikiStoreCache.Load(key); ok {
+		return ws.(*WikiStore), nil
+	}
 	wikiStoreMu.Lock()
 	defer wikiStoreMu.Unlock()
-	if wikiStoreSingleton != nil {
-		return wikiStoreSingleton, nil
+	// Double-check after acquiring lock.
+	if ws, ok := wikiStoreCache.Load(key); ok {
+		return ws.(*WikiStore), nil
 	}
 	ws, err := NewWikiStore(name, dir)
 	if err != nil {
 		return nil, err
 	}
-	wikiStoreSingleton = ws
+	wikiStoreCache.Store(key, ws)
 	return ws, nil
 }
 
-// CloseWikiStore closes and resets the singleton wiki store.
+// CloseWikiStore closes all cached wiki stores.
 func CloseWikiStore() {
 	wikiStoreMu.Lock()
 	defer wikiStoreMu.Unlock()
-	if wikiStoreSingleton != nil {
-		wikiStoreSingleton.Close()
-		wikiStoreSingleton = nil
-	}
+	wikiStoreCache.Range(func(key, value interface{}) bool {
+		value.(*WikiStore).Close()
+		return true
+	})
+	wikiStoreCache = sync.Map{}
 }
