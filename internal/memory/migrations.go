@@ -107,6 +107,12 @@ CREATE TABLE IF NOT EXISTS styles (
 );`,
 		Down: `DROP TABLE IF EXISTS styles`,
 	},
+	{
+		Version: 4,
+		Name:    "add_vector_store",
+		Up:      `ALTER TABLE conversations ADD COLUMN vector_store TEXT NOT NULL DEFAULT ''`,
+		Down:    `ALTER TABLE conversations DROP COLUMN vector_store`,
+	},
 }
 
 // 在 migrations 表和可变 Schema 之前必须创建

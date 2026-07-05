@@ -27,7 +27,7 @@ type Server struct {
 func (s *Server) Engine() *gin.Engine { return s.engine }
 
 // Handler returns the request handler so tests (and embedders)
-// can call helpers that aren't bound to an HTTP route — e.g.
+// can call helpers that aren't bound to an HTTP route 鈥?e.g.
 // sessionToResponse or the per-session meta resolvers. Stable
 // public API; safe to call from outside this package.
 func (s *Server) Handler() *Handler { return s.handler }
@@ -173,6 +173,18 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.DELETE("/mcp/servers/:name", h.RemoveMCPServer)
 		api.POST("/mcp/servers/:name/restart", h.RestartMCPServer)
 		api.PATCH("/mcp/global", h.SetMCPGlobal)
+
+		// Knowledge
+		api.GET("/knowledge/config", h.GetKnowledgeConfig)
+		api.PATCH("/knowledge/config", h.UpdateKnowledgeConfig)
+		api.GET("/knowledge/models", h.GetKnowledgeModels)
+		api.GET("/knowledge/bases", h.ListKnowledgeBases)
+		api.POST("/knowledge/bases", h.AddKnowledgeBase)
+		api.DELETE("/knowledge/bases/:name", h.RemoveKnowledgeBase)
+		api.POST("/knowledge/bases/:name/scan", h.ScanKnowledgeBase)
+		api.DELETE("/knowledge/bases/:name/scan", h.CancelScan)
+		api.GET("/knowledge/bases/:name/scan/status", h.ScanStatus)
+		api.POST("/knowledge/search", h.SearchKnowledge)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the
@@ -202,7 +214,7 @@ func (s *Server) RunAt(addr string) error {
 // this bypass for the streaming /api/v1/sessions/:id/messages SSE
 // endpoint because the Wails AssetServer's response writer buffers
 // the entire body and only sends it when the request handler
-// returns — useless for an SSE stream that parks for minutes
+// returns 鈥?useless for an SSE stream that parks for minutes
 // waiting on the user (the `question` tool flow).
 //
 // Same-origin browser clients (origin == backend address) are

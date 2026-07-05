@@ -70,6 +70,8 @@ export interface Session {
   plan_mode?: boolean
   permission_level?: string
   reasoning_effort?: string
+  vector_store?: string
+  knowledge_base?: string
 }
 
 export interface Attachment {
@@ -240,6 +242,8 @@ export interface UpdateSessionMetaResponse {
   plan_mode?: boolean
   permission_level?: string
   reasoning_effort?: string
+  vector_store?: string
+  knowledge_base?: string
   created_at?: number
   updated_at?: number
 }
@@ -324,7 +328,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string }>,
+  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -1031,3 +1035,85 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   offEvent()
   offEnd()
 }
+
+// ---- Knowledge API ----
+
+export interface KnowledgeConfig {
+  enabled: boolean
+  auto_index: boolean
+  bases: KnowledgeBaseItem[]
+}
+
+export interface KnowledgeBaseItem {
+  name: string
+  path: string
+  file_types?: string[]
+  enabled: boolean
+  scan_model?: string
+  scan_media_types?: string[]
+  auto_scan?: boolean
+  exclude_patterns?: string[]
+  max_file_size?: number
+  status?: string
+  doc_count?: number
+}
+
+export const getKnowledgeConfig = () =>
+  jsonFetch<KnowledgeConfig>('/api/v1/knowledge/config')
+
+export const updateKnowledgeConfig = (patch: Partial<KnowledgeConfig>) =>
+  jsonFetch<KnowledgeConfig>('/api/v1/knowledge/config', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })
+
+export interface KnowledgeModel {
+  provider: string
+  model: string
+  supports_vision: boolean
+}
+
+export const listKnowledgeModels = () =>
+  jsonFetch<KnowledgeModel[]>('/api/v1/knowledge/models')
+
+export const getKnowledgeBases = () =>
+  jsonFetch<KnowledgeBaseItem[]>('/api/v1/knowledge/bases')
+
+export const addKnowledgeBase = (base: KnowledgeBaseItem) =>
+  jsonFetch<{ ok: boolean }>('/api/v1/knowledge/bases', {
+    method: 'POST',
+    body: JSON.stringify(base),
+  })
+
+export const removeKnowledgeBase = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/knowledge/bases/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  })
+
+export const scanKnowledgeBase = (name: string) =>
+  jsonFetch<{ ok: boolean; message?: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(name)}/scan`,
+    { method: 'POST' },
+  )
+
+export const getScanStatus = (name: string) =>
+  jsonFetch<{ chunks: number; done: boolean; error?: string; current: number; total: number; message?: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(name)}/scan/status`,
+  )
+
+export const cancelScan = (name: string) =>
+  jsonFetch<{ ok: boolean; message?: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(name)}/scan`,
+    { method: 'DELETE' },
+  )
+
+export const searchKnowledge = (query: string, topK?: number) =>
+  jsonFetch<{ query: string; results: Array<{ source: string; content: string; similarity: number; rank: number }> }>(
+    '/api/v1/knowledge/search',
+    {
+      method: 'POST',
+      body: JSON.stringify({ query, top_k: topK || 5 }),
+    },
+  )
+
+// (removed: getAvailableEmbedders — vector embedding system deprecated)

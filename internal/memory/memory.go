@@ -25,12 +25,13 @@ import (
 
 // Conversation is a logical chat session.
 type Conversation struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Metadata  string    `json:"metadata,omitempty"`
-	Archived  bool      `json:"archived"`
+	ID          string    `json:"id"`
+	Title       string    `json:"title,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Metadata    string    `json:"metadata,omitempty"`
+	Archived    bool      `json:"archived"`
+	VectorStore string    `json:"vector_store,omitempty"`
 }
 
 // Message is one entry in a conversation's history.
@@ -897,7 +898,7 @@ func (s *Store) SetCurrent(id string) error {
 // ListConversations returns all conversations ordered by updated_at desc.
 func (s *Store) ListConversations() []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`)
+	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`)
 	if err != nil {
 		return nil
 	}
@@ -907,7 +908,7 @@ func (s *Store) ListConversations() []Conversation {
 		var c Conversation
 		var created, updated int64
 		var archived int
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore); err != nil {
 			return out
 		}
 		c.CreatedAt = time.Unix(created, 0)
@@ -965,9 +966,9 @@ func (s *Store) GetConversation(id string) (Conversation, error) {
 	var created, updated int64
 	var archived int
 	err := s.db.QueryRow(
-		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE id = ?`,
+		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE id = ?`,
 		id,
-	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived)
+	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore)
 	if err != nil {
 		return Conversation{}, err
 	}
@@ -980,6 +981,12 @@ func (s *Store) GetConversation(id string) (Conversation, error) {
 // ArchiveConversation marks a conversation as archived.
 func (s *Store) ArchiveConversation(id string) error {
 	_, err := s.db.Exec(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`, time.Now().Unix(), id)
+	return err
+}
+
+// SetConversationVectorStore sets the vector store binding for a session.
+func (s *Store) SetConversationVectorStore(id, vectorStore string) error {
+	_, err := s.db.Exec(`UPDATE conversations SET vector_store = ? WHERE id = ?`, vectorStore, id)
 	return err
 }
 
@@ -1007,7 +1014,7 @@ func (s *Store) ArchiveByProjectPath(projectPath string) (int, error) {
 // ListArchivedConversations returns all archived conversations.
 func (s *Store) ListArchivedConversations() []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`)
+	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`)
 	if err != nil {
 		return nil
 	}
@@ -1017,7 +1024,7 @@ func (s *Store) ListArchivedConversations() []Conversation {
 		var c Conversation
 		var created, updated int64
 		var archived int
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore); err != nil {
 			return out
 		}
 		c.CreatedAt = time.Unix(created, 0)

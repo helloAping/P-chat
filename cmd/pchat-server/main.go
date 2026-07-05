@@ -101,6 +101,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
+	if cfg.Knowledge.Enabled {
+		tool.RegisterGrep(toolReg, cfg)
+		tool.RegisterWiki(toolReg, cfg)
+	}
 
 	// Build the sub-agent catalog. Three sources, in priority
 	// order (last wins):
@@ -208,6 +212,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, staticFS, mcpMgr)
+
+	// Auto-index knowledge bases on startup (if enabled).
+	srv.Handler().AutoIndexKnowledgeBases()
 
 	// PCHAT_PORT overrides the configured port. This is how the
 	// parent process (pchat / pchat-gui) tells us which ephemeral

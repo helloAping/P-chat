@@ -147,7 +147,7 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'archive' | 'skills' | 'mcp'>('providers')
+const tab = ref<'providers' | 'styles' | 'archive' | 'skills' | 'mcp' | 'knowledge'>('providers')
 
 // --- Provider state ---
 const providers = ref<api.ProviderInfo[]>([])
@@ -224,6 +224,9 @@ watch(tab, (v) => {
     refreshRepos()
   } else if (v === 'mcp') {
     refreshMCP()
+  } else if (v === 'knowledge') {
+    refreshKB()
+    refreshKBModels()
   }
 })
 
@@ -958,8 +961,150 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
     default: return 'default'
   }
 }
-</script>
 
+// --- Knowledge Base state ---
+const kbEnabled = ref(false)
+const kbAutoIndex = ref(false)
+const kbBases = ref<api.KnowledgeBaseItem[]>([])
+const kbSelectedName = ref<string | null>(null)
+const kbSelected = computed(() => kbBases.value.find(b => b.name === kbSelectedName.value) || null)
+const showAddKB = ref(false)
+const newKBName = ref('')
+const newKBPath = ref('')
+const kbModels = ref<api.KnowledgeModel[]>([])
+const scanningKBs = ref<Set<string>>(new Set())
+const kbScanStatus = ref<Map<string, { current: number; total: number; chunks: number; done: boolean; error?: string }>>(new Map())
+let kbScanTimers: Record<string, ReturnType<typeof setInterval>> = {}
+
+async function refreshKB() {
+  try {
+    const cfg = await api.getKnowledgeConfig()
+    kbEnabled.value = cfg.enabled
+    kbAutoIndex.value = cfg.auto_index
+    kbBases.value = cfg.bases || []
+    if (!kbSelectedName.value && kbBases.value.length > 0) {
+      kbSelectedName.value = kbBases.value[0].name
+    } else if (kbSelectedName.value && !kbBases.value.find(b => b.name === kbSelectedName.value)) {
+      kbSelectedName.value = kbBases.value[0]?.name ?? null
+    }
+    // Resume polling for any bases currently scanning.
+    for (const b of kbBases.value) {
+      if (b.status === 'scanning') {
+        scanningKBs.value = new Set(scanningKBs.value).add(b.name)
+        pollScan(b.name)
+      }
+    }
+  } catch (e: any) {
+    message.error(`加载知识库配置失败: ${e.message}`)
+  }
+}
+
+async function refreshKBModels() {
+  try { kbModels.value = await api.listKnowledgeModels() || [] } catch {}
+}
+
+async function onToggleKBEnabled(v: boolean) {
+  try { await api.updateKnowledgeConfig({ enabled: v }); kbEnabled.value = v } catch (e: any) { message.error(`切换失败: ${e.message}`) }
+}
+
+async function onToggleKBAutoIndex(v: boolean) {
+  try { await api.updateKnowledgeConfig({ auto_index: v }); kbAutoIndex.value = v } catch (e: any) { message.error(`切换失败: ${e.message}`) }
+}
+
+async function onAddKB() {
+  if (!newKBName.value.trim() || !newKBPath.value.trim()) { message.warning('名称和路径为必填'); return }
+  try {
+    await api.addKnowledgeBase({ name: newKBName.value.trim(), path: newKBPath.value.trim(), enabled: true, file_types: [], scan_model: '', scan_media_types: [], exclude_patterns: [], max_file_size: 0 })
+    message.success('已添加')
+    showAddKB.value = false
+    newKBName.value = ''; newKBPath.value = ''
+    await refreshKB()
+    kbSelectedName.value = kbBases.value[kbBases.value.length - 1]?.name ?? null
+  } catch (e: any) { message.error(`添加失败: ${e.message}`) }
+}
+
+async function onDeleteKB(name: string) {
+  try { await api.removeKnowledgeBase(name); message.success('已删除'); await refreshKB() } catch (e: any) { message.error(`删除失败: ${e.message}`) }
+}
+
+async function onScanKB(name: string) {
+  try {
+    await api.scanKnowledgeBase(name)
+    scanningKBs.value = new Set(scanningKBs.value).add(name)
+    kbScanStatus.value.set(name, { current: 0, total: 0, chunks: 0, done: false })
+    pollScan(name)
+  } catch (e: any) { message.error(`扫描失败: ${e.message}`) }
+}
+
+function pollScan(name: string) {
+  const timer = setInterval(async () => {
+    try {
+      const s = await api.getScanStatus(name)
+      kbScanStatus.value.set(name, { current: s.current, total: s.total, chunks: s.chunks, done: s.done, error: s.error })
+      if (s.done) {
+        clearInterval(timer)
+        scanningKBs.value = new Set([...scanningKBs.value].filter(n => n !== name))
+        delete kbScanTimers[name]
+        await refreshKB()
+      }
+    } catch { clearInterval(timer); scanningKBs.value.delete(name); delete kbScanTimers[name] }
+  }, 800)
+  kbScanTimers[name] = timer
+}
+
+async function onCancelScan(name: string) {
+  try {
+    await api.cancelScan(name)
+    clearInterval(kbScanTimers[name])
+    delete kbScanTimers[name]
+    scanningKBs.value = new Set([...scanningKBs.value].filter(n => n !== name))
+  } catch (e: any) { message.error(`取消失败: ${e.message}`) }
+}
+
+function onToggleKBSwitch(name: string, enabled: boolean) {
+  const idx = kbBases.value.findIndex(b => b.name === name)
+  if (idx < 0) return
+  const updated = { ...kbBases.value[idx], enabled }
+  api.updateKnowledgeConfig({ bases: kbBases.value.map((b, i) => i === idx ? updated : b) }).then(() => {
+    kbBases.value[idx] = updated
+  }).catch(e => message.error(`更新失败: ${e.message}`))
+}
+
+function onUpdateKBField(name: string, field: string, value: any) {
+  const idx = kbBases.value.findIndex(b => b.name === name)
+  if (idx < 0) return
+  const updated = { ...kbBases.value[idx], [field]: value }
+  api.updateKnowledgeConfig({ bases: kbBases.value.map((b, i) => i === idx ? updated : b) }).then(() => {
+    kbBases.value[idx] = updated
+  }).catch(e => message.error(`更新失败: ${e.message}`))
+}
+
+const mediaTypeOptions = [
+  { label: '图片 (.png .jpg .gif .webp .bmp)', value: 'image' },
+  { label: '视频 (.mp4 .mov .webm .avi)', value: 'video' },
+  { label: '音频 (.mp3 .wav .ogg .m4a)', value: 'audio' },
+  { label: '文档 (.pdf)', value: 'pdf' },
+]
+
+const kbModelOptions = computed(() => [
+  { label: '纯文本解析（推荐，零 API 消耗）', value: '' },
+  ...kbModels.value.map(m => ({ label: `${m.provider} / ${m.model}${m.supports_vision ? ' 👁' : ''}`, value: `${m.provider}/${m.model}` })),
+])
+
+function scanLabel(name: string) {
+  const s = kbScanStatus.value.get(name)
+  if (!s) return '开始扫描'
+  if (s.error) return '扫描失败'
+  if (s.done) return `✓ ${s.chunks} sections`
+  return `扫描中 ${s.current}/${s.total}`
+}
+
+function kbModelSupportsVision(scanModel: string) {
+  const parts = scanModel.split('/')
+  if (parts.length !== 2) return false
+  return kbModels.value.find(m => m.provider === parts[0] && m.model === parts[1])?.supports_vision || false
+}
+</script>
 <template>
   <NModal :show="true" @update:show="close" preset="card" title="应用设置" style="width: 920px; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column">
     <NTabs v-model:value="tab" type="line" animated style="flex: 1; min-height: 0; display: flex; flex-direction: column">
@@ -1461,6 +1606,154 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
           </div>
         </div>
       </NTabPane>
+
+      <NTabPane name="knowledge" tab="知识库" style="flex: 1; min-height: 0; overflow: auto">
+        <div class="providers-split">
+          <!-- Left: KB list -->
+          <div class="provider-list">
+            <div class="provider-list-header">
+              <span class="list-title">知识库 ({{ kbBases.length }})</span>
+              <NButton size="tiny" type="primary" ghost @click="showAddKB = !showAddKB">
+                {{ showAddKB ? '取消' : '+ 新增' }}
+              </NButton>
+            </div>
+            <div v-if="showAddKB" class="add-form">
+              <NSpace vertical size="small">
+                <NInput v-model:value="newKBName" placeholder="名称" size="tiny" />
+                <NInput v-model:value="newKBPath" placeholder="路径" size="tiny" />
+                <NButton type="primary" size="tiny" @click="onAddKB">提交</NButton>
+              </NSpace>
+            </div>
+            <div class="provider-items">
+              <div
+                v-for="b in kbBases"
+                :key="b.name"
+                class="provider-item"
+                :class="{ active: b.name === kbSelectedName }"
+                @click="kbSelectedName = b.name"
+              >
+                <div class="provider-item-head">
+                  <NTag v-if="b.enabled" type="success" size="tiny" :bordered="false">启用</NTag>
+                  <strong class="provider-item-name">{{ b.name }}</strong>
+                  <NButton size="tiny" quaternary type="error" @click.stop="onDeleteKB(b.name)" class="provider-del-btn">✕</NButton>
+                </div>
+                <div class="provider-item-sub">
+                  <span class="muted">{{ b.path }}</span>
+                  <span v-if="b.status === 'scanning' || scanningKBs.has(b.name)" style="font-size:10px;color:var(--accent)"> 扫描中</span>
+                  <span v-else-if="b.status === 'ok' && b.doc_count" style="font-size:10px;color:var(--text-3)"> · {{ b.doc_count }} sections</span>
+                  <span v-else-if="b.status === 'error'" style="font-size:10px;color:var(--warn)"> · 错误</span>
+                </div>
+              </div>
+              <div v-if="kbBases.length === 0" class="muted empty-hint">还没有知识库</div>
+            </div>
+          </div>
+
+          <!-- Right: detail pane -->
+          <div class="provider-detail">
+            <div v-if="!kbSelected" class="muted empty-hint">← 选择左侧的知识库</div>
+            <template v-else>
+              <div class="detail-section kb-detail-scroll">
+                <div class="detail-section-head">
+                  <h3 class="section-title">{{ kbSelected.name }}</h3>
+                  <NSpace size="small">
+                    <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name)">
+                      {{ scanningKBs.has(kbSelected.name) ? '扫描中...' : '开始扫描' }}
+                    </NButton>
+                    <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>
+                  </NSpace>
+                </div>
+                <div class="detail-form">
+                  <NSpace vertical size="small">
+                    <!-- Basic info -->
+                    <div class="form-row">
+                      <span class="form-label">名称</span>
+                      <span class="form-val">{{ kbSelected.name }}</span>
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">路径</span>
+                      <span class="form-val path">{{ kbSelected.path }}</span>
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">启用</span>
+                      <NSwitch :value="kbSelected.enabled" @update:value="(v: boolean) => onToggleKBSwitch(kbSelected!.name, v)" />
+                    </div>
+
+                    <!-- Divider -->
+                    <div class="section-subtitle">AI 扫描设置</div>
+
+                    <div class="form-row">
+                      <span class="form-label">扫描模型</span>
+                      <NSelect
+                        :value="kbSelected.scan_model || ''"
+                        :options="kbModelOptions"
+                        size="small"
+                        placeholder="选择模型（空=仅文本）"
+                        style="flex:1"
+                        @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'scan_model', v)"
+                      />
+                    </div>
+                    <div v-if="kbSelected.scan_model" class="form-hint">
+                      <span v-if="kbModelSupportsVision(kbSelected.scan_model)" style="color:var(--accent)">视觉模型 — 可处理图片/视频/PDF</span>
+                      <span v-else style="color:var(--text-4)">纯文本模型</span>
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">媒体类型</span>
+                      <NSelect
+                        :value="kbSelected.scan_media_types || []"
+                        :options="mediaTypeOptions"
+                        size="small"
+                        multiple
+                        placeholder="选择可 AI 处理的媒体类型"
+                        style="flex:1"
+                        @update:value="(v: string[]) => onUpdateKBField(kbSelected!.name, 'scan_media_types', v)"
+                      />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">自动扫描</span>
+                      <NSwitch :value="kbSelected.auto_scan" @update:value="(v: boolean) => onUpdateKBField(kbSelected!.name, 'auto_scan', v)" />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">排除模式</span>
+                      <NInput
+                        :value="(kbSelected.exclude_patterns || []).join(', ')"
+                        size="small"
+                        placeholder="glob 模式，逗号分隔"
+                        style="flex:1"
+                        @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'exclude_patterns', v.split(',').map(s => s.trim()).filter(Boolean))"
+                      />
+                    </div>
+                    <div class="form-row">
+                      <span class="form-label">最大文件 (MB)</span>
+                      <NInputNumber
+                        :value="kbSelected.max_file_size ? kbSelected.max_file_size / 1048576 : 5"
+                        :min="1"
+                        :step="1"
+                        size="small"
+                        style="flex:1"
+                        @update:value="(v: number | null) => onUpdateKBField(kbSelected!.name, 'max_file_size', (v || 5) * 1048576)"
+                      />
+                    </div>
+                  </NSpace>
+                </div>
+
+                <!-- Scan progress -->
+                <div v-if="kbSelected.doc_count && !scanningKBs.has(kbSelected.name)" class="form-row muted" style="padding-top:10px;border-top:1px solid var(--border-2);margin-top:6px">
+                  已索引 {{ kbSelected.doc_count }} sections
+                </div>
+                <div v-if="kbScanStatus.has(kbSelected.name)" class="scan-progress">
+                  <div class="scan-info">
+                    <span>{{ scanLabel(kbSelected.name) }}</span>
+                    <span v-if="kbScanStatus.get(kbSelected.name)?.error" style="color:var(--warn);font-size:12px">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
+                  </div>
+                  <div v-if="!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error" class="scan-bar">
+                    <div class="scan-bar-fill" :style="{ width: kbScanStatus.get(kbSelected.name)!.total > 0 ? ((kbScanStatus.get(kbSelected.name)!.current / kbScanStatus.get(kbSelected.name)!.total) * 100) + '%' : '0%' }"></div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </NTabPane>
     </NTabs>
 
     <!-- Confirmation: permanent delete from archive -->
@@ -1556,7 +1849,7 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
   border-radius: 6px;
   background: var(--bg-2);
   display: flex; flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
 }
 .detail-section {
   border-bottom: 1px solid var(--border-2);
@@ -1803,4 +2096,22 @@ code {
 .upstream-id { flex: 1; font-family: ui-monospace, monospace; font-size: 12.5px; }
 .upstream-owner { color: var(--text-4); font-size: 11px; }
 .upstream-item.added { opacity: 0.6; }
+/* ---- Knowledge Base ---- */
+.kb-detail-scroll { flex: 1; overflow-y: auto; }
+.section-subtitle {
+  font-size: 11px; font-weight: 700; color: var(--text-3); text-transform: uppercase;
+  letter-spacing: 0.5px; padding: 8px 0 2px; border-top: 1px solid var(--border-2); margin-top: 4px;
+}
+.form-val { font-size: 13px; color: var(--text-2); padding: 4px 0; }
+.form-val.path { word-break: break-all; line-height: 1.4; font-size: 12px; }
+.form-hint { font-size: 11px; color: var(--text-3); padding: 0 0 0 6px; }
+.scan-progress { padding: 8px 0; }
+.scan-info { display: flex; gap: 12px; align-items: center; font-size: 13px; }
+.scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; }
+.scan-bar-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
+.scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
+.scan-info { display: flex; gap: 12px; align-items: center; font-size: 13px; }
+.scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; }
+.scan-bar-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
+.scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
 </style>

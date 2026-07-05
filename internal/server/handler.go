@@ -48,6 +48,7 @@ type sessionMeta struct {
 	ProjectPath     string // project root directory, "" = global
 	PlanMode        bool   // plan mode (no tools, single turn)
 	PermissionLevel string // "ask" | "auto" | "full"
+	KnowledgeBase   string // "" = off, "__all__" = all bases, or a specific base name
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -61,6 +62,7 @@ type sessionMetaBlob struct {
 	ProjectPath     string `json:"project_path,omitempty"`
 	PlanMode        bool   `json:"plan_mode,omitempty"`
 	PermissionLevel string `json:"permission_level,omitempty"`
+	KnowledgeBase   string `json:"knowledge_base,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Handler {
@@ -109,7 +111,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	if h.store == nil {
 		return
 	}
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
 		// Non-fatal: in-memory map already updated, request still
 		// works for this session. The next setSessionMeta call
@@ -139,6 +141,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.ProjectPath = blob.ProjectPath
 				m.PlanMode = blob.PlanMode
 				m.PermissionLevel = blob.PermissionLevel
+				m.KnowledgeBase = blob.KnowledgeBase
 			}
 		}
 	}
@@ -190,7 +193,7 @@ func (h *Handler) setSessionMetaProjectPath(id, projectPath string) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 }
@@ -280,6 +283,12 @@ type UpdateSessionMetaRequest struct {
 	// PermissionLevel sets the sandbox permission level for this session.
 	// Values: "ask", "auto", "full". Omit to leave unchanged.
 	PermissionLevel *string `json:"permission_level,omitempty"`
+	// VectorStore sets the knowledge base vector store for this session.
+	// Empty string resets to the global default.
+	VectorStore *string `json:"vector_store,omitempty"`
+	// KnowledgeBase selects a knowledge base. "" / "__off__" = off,
+	// "__all__" = all bases, or a specific base name.
+	KnowledgeBase *string `json:"knowledge_base,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -296,7 +305,9 @@ type SessionResponse struct {
 	PlanMode    bool   `json:"plan_mode,omitempty"`
 	PermissionLevel string `json:"permission_level,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	CreatedAt   int64  `json:"created_at"`
+	VectorStore    string `json:"vector_store,omitempty"`
+	KnowledgeBase  string `json:"knowledge_base,omitempty"`
+	CreatedAt      int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 }
 
@@ -1177,7 +1188,27 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
+			_ = h.store.UpdateConversationMeta(id, string(blob))
+		}
+	}
+
+	// Handle vector_store as a first-class conversation column.
+	if req.VectorStore != nil {
+		if h.store != nil {
+			_ = h.store.SetConversationVectorStore(id, *req.VectorStore)
+		}
+	}
+
+	// Handle knowledge_base
+	if req.KnowledgeBase != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.KnowledgeBase = *req.KnowledgeBase
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		if h.store != nil {
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 			_ = h.store.UpdateConversationMeta(id, string(blob))
 		}
 	}
@@ -1628,6 +1659,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		SkillContext:      req.SkillContext,
 		PlanMode:          meta.PlanMode,
 		PermissionLevel:   meta.PermissionLevel,
+		KBBase:            meta.KnowledgeBase,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -1853,6 +1885,8 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		PlanMode:    m.PlanMode,
 		PermissionLevel: m.PermissionLevel,
 		ReasoningEffort: m.ReasoningEffort,
+		VectorStore:    cv.VectorStore,
+		KnowledgeBase:  m.KnowledgeBase,
 		CreatedAt:   cv.CreatedAt.Unix(),
 		UpdatedAt:   cv.UpdatedAt.Unix(),
 	}
@@ -1922,7 +1956,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
@@ -2058,7 +2092,7 @@ func (h *Handler) ExecutePlan(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: false, PermissionLevel: m.PermissionLevel})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: false, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 

@@ -357,13 +357,9 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 		if p.Name != providerName {
 			continue
 		}
-		// Legacy single-model form: migrate the legacy entry
-		// into Models so the rest of the function can treat it
-		// uniformly.
 		if len(p.Models) == 0 && p.Model != "" {
 			p.Models = []ModelConfig{{Name: p.Model, Default: true}}
 		}
-		// After migration, the model must be in p.Models.
 		idx := -1
 		for j := range p.Models {
 			if p.Models[j].Name == modelName {
@@ -453,3 +449,5 @@ func SetModelCapabilities(providerName, modelName string, caps Capabilities) err
 	}
 	return fmt.Errorf("provider %q not found", providerName)
 }
+
+// (removed: SetModelIsEmbedding, SetModelEmbedProtocol — vector embedding system deprecated)

@@ -18,14 +18,15 @@ import (
 // been removed. The loader still accepts a legacy config.yaml as
 // a one-shot migration source — see Load.
 type Config struct {
-	Server   ServerConfig   `json:"server"`
-	LLM      LLMConfig      `json:"llm"`
-	Style    StyleConfig    `json:"style"`
-	Tools    ToolsConfig    `json:"tools"`
-	Memory   MemoryConfig   `json:"memory"`
-	Sandbox  SandboxConfig  `json:"sandbox"`
-	SubAgent SubAgentConfig `json:"subagent"`
-	MCP      MCPConfig      `json:"mcp"`
+	Server    ServerConfig    `json:"server"`
+	LLM       LLMConfig       `json:"llm"`
+	Style     StyleConfig     `json:"style"`
+	Tools     ToolsConfig     `json:"tools"`
+	Memory    MemoryConfig    `json:"memory"`
+	Sandbox   SandboxConfig   `json:"sandbox"`
+	SubAgent  SubAgentConfig  `json:"subagent"`
+	MCP       MCPConfig       `json:"mcp"`
+	Knowledge KnowledgeConfig `json:"knowledge"`
 }
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
@@ -304,6 +305,31 @@ type MCPServerConfig struct {
 	Timeout string            `json:"timeout,omitempty"`
 }
 
+// KnowledgeConfig controls the wiki-based knowledge base system.
+// Uses SQLite FTS5 for full-text search; no vector embeddings required.
+type KnowledgeConfig struct {
+	Enabled   bool            `json:"enabled"`
+	AutoIndex bool            `json:"auto_index"`
+	Bases     []KnowledgeBase `json:"bases,omitempty"`
+}
+
+// KnowledgeBase defines a local directory to scan into the wiki index.
+// Text files are parsed zero-cost via wiki parser. Media files (image/video/
+// audio/pdf) require an AI model selected via ScanModel.
+type KnowledgeBase struct {
+	Name      string   `json:"name"`
+	Path      string   `json:"path"`
+	Enabled   bool     `json:"enabled"`
+	FileTypes []string `json:"file_types,omitempty"`
+
+	// ScanModel is "{provider}/{model}" for AI media processing, or "" for text-only.
+	ScanModel      string   `json:"scan_model"`
+	ScanMediaTypes []string `json:"scan_media_types"` // "image","video","audio","pdf"
+	AutoScan       bool     `json:"auto_scan"`
+	ExcludePatterns []string `json:"exclude_patterns"`
+	MaxFileSize    int64    `json:"max_file_size"` // 0 = default (5MB)
+}
+
 type MemoryConfig struct {
 	Enabled    bool `json:"enabled"`
 	MaxHistory int  `json:"max_history"`
@@ -439,6 +465,8 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 		}
 	}
 
+	migrateKnowledgeDefaults(cfg)
+
 	return cfg, nil
 }
 
@@ -499,6 +527,10 @@ func Default() *Config {
 		},
 		MCP: MCPConfig{
 			Enabled: false,
+		},
+		Knowledge: KnowledgeConfig{
+			Enabled:   false,
+			AutoIndex: false,
 		},
 	}
 }

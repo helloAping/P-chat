@@ -133,6 +133,34 @@ function onToggleMute() {
   mute.value = notifyManager.mute
 }
 
+// --- knowledge base selector ---
+const kbBases = ref<api.KnowledgeBaseItem[]>([])
+const kbOptions = computed(() => [
+  { label: '知识库 · 不使用', value: '__off__' },
+  { label: '知识库 · 全部', value: '__all__' },
+  ...kbBases.value.filter(b => b.enabled).map(b => ({ label: `知识库 · ${b.name}`, value: b.name })),
+])
+const kbBase = computed({
+  get: () => {
+    if (!state.currentID) return '__off__'
+    return state.sessionMeta[state.currentID]?.knowledge_base || '__off__'
+  },
+  set: async (val: string) => {
+    if (!state.currentID) return
+    try {
+      await api.updateSessionMeta(state.currentID, { knowledge_base: val })
+      state.sessionMeta[state.currentID] = {
+        ...state.sessionMeta[state.currentID],
+        knowledge_base: val,
+      }
+    } catch {}
+  },
+})
+
+async function loadKBases() {
+  try { kbBases.value = await api.getKnowledgeBases() } catch {}
+}
+
 // CmdSpec is imported from CommandPalette.vue
 
 const commandList = ref<CmdSpec[]>([])
@@ -805,12 +833,8 @@ const styleOptions = ref<{ label: string; value: string }[]>([])
 
 async function loadConfig() {
   try {
-    // Providers live in the store so other components (the
-    // chat NSelect, the AppSettingsModal) all read from one
-    // source of truth. loadProviders() is idempotent.
     await loadProviders()
-    // Styles are still local to this component; only the
-    // chat input shows them.
+    loadKBases()
     const st = await api.getStyles()
     styleOptions.value = (st.styles || []).map((x: any) => ({
       label: x.label || x.id,
@@ -995,6 +1019,15 @@ onMounted(() => {
           @click="togglePlanMode"
           title="切换计划/构建模式"
         >{{ planMode ? '📋 计划' : '🔨 构建' }}</NButton>
+        <NSelect
+          v-model:value="kbBase"
+          :options="kbOptions"
+          size="small"
+          :disabled="!state.currentID"
+          class="picker picker-perm"
+          title="选择知识库"
+          placeholder="知识库"
+        />
         <NSelect
           v-model:value="permissionLevel"
           :options="permissionOptions"

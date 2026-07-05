@@ -811,3 +811,67 @@ func TestUpdateProvider_NotFound(t *testing.T) {
 		t.Fatal("expected not-found error")
 	}
 }
+
+func TestKnowledgeConfig_Defaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Knowledge.Enabled {
+		t.Error("knowledge should be disabled by default")
+	}
+	if cfg.Knowledge.AutoIndex {
+		t.Error("auto_index should be false by default")
+	}
+	if len(cfg.Knowledge.Bases) != 0 {
+		t.Errorf("expected 0 default knowledge bases, got %d", len(cfg.Knowledge.Bases))
+	}
+}
+
+func TestKnowledgeConfig_MigrationOldJSON(t *testing.T) {
+	oldJSON := `{"llm":{"default":"cs","providers":[{"name":"cs","protocol":"openai","base_url":"http://x","api_key":"k","model":"m"}]}}`
+	var cfg Config
+	if err := json.Unmarshal([]byte(oldJSON), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	migrateKnowledgeDefaults(&cfg)
+
+	if cfg.Knowledge.Enabled {
+		t.Error("migration should leave knowledge disabled")
+	}
+	if cfg.Knowledge.AutoIndex {
+		t.Error("migration should leave auto_index false")
+	}
+}
+
+func TestKnowledgeConfig_MigrationPreservesExisting(t *testing.T) {
+	existingJSON := `{"llm":{"default":"cs"},"knowledge":{"enabled":true}}`
+	var cfg Config
+	if err := json.Unmarshal([]byte(existingJSON), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	migrateKnowledgeDefaults(&cfg)
+
+	if !cfg.Knowledge.Enabled {
+		t.Error("Enabled should still be true")
+	}
+}
+
+func TestKnowledgeConfig_LoadOldConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	oldJSON := `{"llm":{"default":"cs","providers":[{"name":"cs","protocol":"openai","base_url":"http://x","api_key":"k","model":"m"}]}}`
+	if err := osWriteFile(filepath.Join(dir, ".p-chat", "config.json"), oldJSON); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Knowledge.Enabled {
+		t.Error("knowledge should be disabled after loading old config")
+	}
+	if cfg.LLM.Default != "cs" {
+		t.Errorf("llm.default should be 'cs', got %q", cfg.LLM.Default)
+	}
+}

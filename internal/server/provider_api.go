@@ -74,10 +74,7 @@ type UpdateModelRequest struct {
 	Description      string `json:"description"`
 	MaxTokensContext int    `json:"max_tokens_context"`
 	MaxTokensOutput  int    `json:"max_tokens_output"`
-	// ClearAll, when true, empties display_name/description and
-	// zeroes max_tokens_* in the persisted model. The model is
-	// still kept in the provider.
-	ClearAll bool `json:"clear_all,omitempty"`
+	ClearAll         bool   `json:"clear_all,omitempty"`
 }
 
 // UpdateModel PUT /api/v1/providers/:name/models/:model

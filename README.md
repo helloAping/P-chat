@@ -2,204 +2,191 @@
 
 **对话式 AI Agent · 三种人格 · 四端同源（CLI / HTTP / 桌面端 / 移动端）**
 
+P-Chat 是一个**本地优先的 AI 编程助手**。核心特色：完全本地化运行（无云端依赖）+ 结构化消息流（text + thinking + tool calls + sub-agents）+ 多 LLM 协议兼容（OpenAI / Anthropic）。
+
+---
+
+## 功能特性
+
+| 特性 | 说明 |
+|------|------|
+| **四端同源** | CLI、HTTP Server、桌面端 (Wails v2)、Web 浏览器共享同一套后端和前端代码 |
+| **三种人格** | 可爱风 (PiPi)、古风 (MoYan)、科技风 (NEXUS)，支持自定义扩展 |
+| **多 LLM 协议** | OpenAI 兼容协议 + Anthropic 原生协议，支持 OpenAI / DeepSeek / Claude / Ollama / 通义千问 / 智谱等 |
+| **会话记忆** | SQLite 持久化对话历史，支持上下文压缩、归档/恢复、消息回滚 |
+| **知识库** | 本地/远程向量库，语义检索，53 种文件格式索引，对话级绑定 |
+| **工具系统** | 内置 9 个工具（Shell 执行、文件读写、Web 获取、PDF/DOCX 解析、子代理等） |
+| **知识检索** | `recall` 工具按需查询知识库，LLM 自主决定何时需要查文档/代码 |
+| **子代理系统** | `task` 工具启动独立子代理，并行执行复杂子任务 (explore / general / plan) |
+| **安全沙箱** | 命令/文件访问控制，三级审批 (ask / auto / full)，支持对话级权限 |
+| **项目系统** | 多项目目录注册，对话按项目隔离，项目级 AGENTS.md + rules + skills |
+| **Plan/Build 模式** | 计划和构建双模式，计划模式下 LLM 先出方案再执行 |
+| **思考过程展示** | 可折叠的 reasoning/thinking 面板，DeepSeek / Claude 推理过程可视化 |
+| **MCP 协议** | Model Context Protocol 服务器集成（配置中） |
+| **技能系统** | 可安装的 SKILL.md 技能包，全局 + 项目双层级加载 |
+| **规则系统** | Markdown 规则文件，注入 System Prompt 控制 LLM 行为 |
+| **应用打包** | 一键打包 Windows 安装包（开始菜单 + 卸载项）+ Linux 安装脚本 |
+
+---
+
 ## 快速开始
 
-### 1. 配置
+### 前置准备
 
-首次运行会自动创建 `~/.p-chat/` 目录结构：
+1. 下载或编译对应二进制
+2. 配置 API Key（参考下方 [LLM 配置](#llm-协议支持)）
 
-```bash
-# 编辑配置文件（新版 JSON，旧版 YAML 仍兼容）
-~/.p-chat/config.json
+### 方式一：桌面端 (推荐新用户)
 
-# 填入你的 API Key
+```powershell
+# Windows — 编译并安装
+task package:gui; task install:gui
+# 从开始菜单启动「P-Chat」
+
+# Linux
+task package:gui:linux
+cd build/bin && ./install.sh
 ```
 
-### 2. 运行 CLI
+桌面端启动时自动拉起后台 server，关窗自动杀子进程，无需手动管理。
 
-```bash
-# 默认科技风
-pchat.exe
-
-# 指定风格
-pchat.exe --style cute
-pchat.exe --style guofeng
-
-# 指定 LLM 提供商
-pchat.exe --provider ollama
-```
-
-### 3. 运行 HTTP Server
+### 方式二：浏览器访问
 
 ```bash
 pchat-server.exe
-# → http://127.0.0.1:8960/api/v1/health
+# 打开浏览器访问 http://127.0.0.1:8960/app/index.html
 ```
 
-### 4. 运行桌面端 (Wails v2)
-
-**Windows:**
-
-```powershell
-# 一次性打包出所有产物
-task package:gui
-
-# 装到 %LOCALAPPDATA%\Programs\P-Chat\（带开始菜单快捷方式 + 卸载项）
-task install:gui
-
-# 启动
-"%LOCALAPPDATA%\Programs\P-Chat\pchat-gui.exe"
-
-# 卸载
-task uninstall:gui
-```
-
-**Linux:**
+### 方式三：CLI 终端
 
 ```bash
-# 打包（Wails GUI 必须在 Linux 上编译）
-task package:gui:linux
-# 或者：make package-linux
-
-# 安装到 ~/.local/bin/（含 .desktop 快捷方式）
-cd build/bin && ./install.sh
-
-# 系统级安装
-cd build/bin && sudo ./install.sh --prefix /usr/local
-
-# 便携模式（不安到系统目录）
-cd build/bin && ./install.sh --portable
-
-# 卸载
-~/.local/share/pchat/uninstall.sh
-# 同时删除 ~/.p-chat/ 数据
-~/.local/share/pchat/uninstall.sh --remove-data
+pchat.exe                  # 默认科技风
+pchat.exe --style cute     # 可爱风
+pchat.exe --style guofeng  # 古风
+pchat.exe --provider ollama # 指定提供器
 ```
 
-桌面端架构：`pchat-gui` 启动时拉起 `pchat-server`（同目录子进程，端口随机），等后端就绪后 webview 自动跳转到 `http://127.0.0.1:<port>/app/index.html` —— 跟浏览器打开 `pchat web` 是同一份 `web/index.html`，所以功能 1:1 一致。关窗自动杀子进程。
+---
 
-### 5. 编译
+## GUI 使用指南
+
+### 整体布局
+
+```
+┌─────────┬──────────────────────────────────────────┐
+│ 侧边栏   │                                          │
+│          │          消息列表 (MessageBubble)         │
+│ ┌──────┐ │                                          │
+│ │ 项目1 │ │  LLM: 你好，有什么可以帮你？             │
+│ │ 项目2 │ │  ┌─ read_file ✓ 完成 0.3s ─┐           │
+│ │       │ │  │  参数: {"path":"..."}   │           │
+│ ├──────┤ │  │  结果: package main...   │           │
+│ │ 会话1 │ │  └─────────────────────────┘           │
+│ │ 会话2 │ │  已读取文件内容。                       │
+│ │ 会话3 │ │                                          │
+│ │ + 新  │ │                                          │
+│ └──────┘ │                                          │
+│          ├──────────────────────────────────────────┤
+│          │ [模型] [推理] [计划/构建] [权限] [向量库] [🔊] │
+│          │ [___________________________________]  ➤ │
+│          │ Enter 发送  Shift+Enter 换行  Esc 停止     │
+└─────────┴──────────────────────────────────────────┘
+```
+
+### 项目与会话
+
+- **侧边栏项目**：点击「添加项目」注册本地目录，对话自动绑定项目上下文
+- **侧边栏会话**：每个项目下有独立的会话列表，支持重命名、归档、恢复
+- **搜索 (Ctrl+P)**：跨会话全文搜索历史消息
+- **消息回滚**：点击某条 AI 消息可撤回之后的所有消息并恢复对话
+
+### 输入区域
+
+| 控件 | 说明 |
+|------|------|
+| 模型选择器 | 按提供商分组列出所有模型，⭐ 标记默认模型 |
+| 推理等级 | off / low / medium / high / max，控制 LLM 思考深度 |
+| 计划/构建 | 切换 Plan/Build 模式。计划模式让 LLM 先出方案不执行 |
+| 权限级别 | 🔒 始终询问 / 🔓 替我审批 / 🔑 完全访问，控制沙箱行为 |
+| 向量库 | 选择当前对话使用的知识库向量库（不使用 / 默认 / 指定） |
+| 附件 | 支持拖拽上传图片、音频、PDF、文本文件等 |
+
+### 应用设置 (⚙)
+
+点击右上角齿轮图标打开设置面板，包含以下 Tab：
+
+| Tab | 功能 |
+|-----|------|
+| LLM 提供商 | 添加/编辑/删除 LLM 提供器，管理多模型，设置默认模型，标记模型能力 (vision/thinking) |
+| MCP 服务器 | 配置 Model Context Protocol 服务器 |
+| 技能 | 安装/卸载/搜索技能包 |
+| 归档 | 查看和恢复已归档会话，永久删除 |
+| 知识库 | 配置知识库系统（详见下方 [知识库](#知识库-knowledge-base)） |
+
+### 斜杠命令
+
+输入框以 `/` 开头可触发命令：
+
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示帮助 |
+| `/skills` | 列出技能 |
+| `/rules` | 列出规则 |
+| `/agents` | 查看 AGENTS.md |
+| `/tools` | 列出工具 |
+| `/recall <query>` | 手动知识检索 |
+| `/clear` | 清屏 |
+
+---
+
+## 配置与定制
+
+### 配置优先级
+
+后加载覆盖先加载：
+
+1. 代码内置默认值
+2. `~/.p-chat/config.json`（全局；旧版 `config.yaml` 自动迁移）
+3. `.p-chat/config.json`（项目级）
+4. `--config` 参数指定（最高）
+
+### config.json 结构
+
+```json
+{
+  "llm": { "default": "openai", "providers": [...] },
+  "server": { "host": "127.0.0.1", "port": 8960 },
+  "style": { "default": "tech" },
+  "memory": { "max_history": -1 },
+  "sandbox": { "exec_dangerous_patterns": "...", "write_protected_paths": "..." },
+  "knowledge": { "enabled": false, "embedder": {...}, "vector_stores": [...], "bases": [...] }
+}
+```
+
+### AGENTS.md
+
+Agent 行为指令文件，支持两级注入 System Prompt：
 
 ```bash
-task build          # CLI + Server
-task build:gui      # 桌面端 (Wails v2)
-task package:gui    # 全部打包到 bin\
+~/.p-chat/AGENTS.md    # 全局，对所有项目生效
+./AGENTS.md             # 项目级，仅对当前项目生效
 ```
 
-## 目录结构
+### Skills 技能系统
 
-### 全局配置 (`~/.p-chat/`)
-
-```
-~/.p-chat/
-├── config.json         # 主配置（LLM、Server、Memory 等；旧版 config.yaml 仍兼容）
-├── AGENTS.md           # 全局 Agent 指令
-├── skills/             # 全局技能
-│   └── code-review/
-│       └── SKILL.md
-├── rules/              # 全局规则
-│   └── code-style.md
-├── prompts/            # 风格提示词
-│   ├── cute.md
-│   ├── guofeng.md
-│   └── tech.md
-├── memory/             # 记忆存储
-│   └── conversations.json
-└── tools/              # 自定义工具
-```
-
-### 项目配置 (`.p-chat/`)
-
-```
-.p-chat/
-├── config.json         # 项目配置（覆盖全局）
-├── AGENTS.md           # 项目级 Agent 指令
-├── skills/             # 项目级技能
-│   └── my-skill/
-│       └── SKILL.md
-└── rules/              # 项目级规则
-    └── project-rules.md
-```
-
-### 项目根目录
-
-```
-P-chat/
-├── cmd/
-│   ├── pchat/           # CLI 入口
-│   ├── pchat-server/    # HTTP Server 入口
-│   └── pchat-gui/       # 桌面端 (Wails v2)
-│       ├── main.go      # 拉起 pchat-server 子进程 + WebView2 窗口
-│       ├── install.ps1  # 安装脚本（开始菜单 + 注册表卸载项）
-│       ├── uninstall.ps1
-│       └── build/       # Wails 产物
-├── frontend/            # Vue 3 + Vite + Naive UI SPA
-│   └── src/
-│       ├── api/client.ts     # HTTP/SSE 客户端
-│       ├── stores/chat.ts    # Pinia 会话状态
-│       └── components/       # 18 个 Vue 组件
-├── internal/
-│   ├── agent/           # Agent 核心
-│   ├── agents/          # AGENTS.md 加载
-│   ├── config/          # 配置加载
-│   ├── llm/             # LLM 客户端
-│   ├── memory/          # 记忆模块
-│   ├── paths/           # 路径解析
-│   ├── rules/           # 规则加载
-│   ├── server/          # HTTP Server
-│   ├── serverproc/      # 子进程拉起 + 健康等待
-│   ├── skill/           # 技能加载
-│   ├── style/           # 风格管理
-│   └── tool/            # 内置工具
-├── prompts/             # 本地风格提示词
-├── configs/             # 示例配置
-├── scripts/             # 打包 + 冒烟测试脚本
-├── web/                 # Web UI 入口（桌面端和 pchat web 共用）
-├── go.mod
-├── Taskfile.yml
-└── README.md
-```
-
-## 配置优先级
-
-配置加载顺序（后加载覆盖先加载）：
-
-1. 默认值（代码内置）
-2. `~/.p-chat/config.json`（全局配置；旧版 `config.yaml` 仍兼容，自动迁移）
-3. `.p-chat/config.json`（项目配置）
-4. `--config` 参数指定的文件（最高优先级）
-
-## 风格人格
-
-| 风格 | 名称 | 关键词 | 启动参数 |
-|------|------|--------|---------|
-| 可爱风 | 小P (PiPi) | 软萌、颜文字、治愈 | `--style cute` |
-| 古风 | 墨言 (MoYan) | 雅致、引经据典、谦辞 | `--style guofeng` |
-| 科技风 | NEXUS (零号) | 冷静、结构化、高效 | `--style tech` |
-
-## AGENTS.md
-
-AGENTS.md 是 Agent 的行为指令文件，支持两层：
-
-- `~/.p-chat/AGENTS.md`：全局指令，对所有项目生效
-- `./AGENTS.md`：项目级指令，仅对当前项目生效
-
-两者会合并注入到 System Prompt 中。
-
-## Skills 技能系统
-
-每个技能是一个目录，包含 `SKILL.md` 文件：
+每个技能是一个目录，包含 `SKILL.md` 和可选的资源文件：
 
 ```
 ~/.p-chat/skills/code-review/
-└── SKILL.md
+├── SKILL.md
+└── checklist.md
 ```
 
-SKILL.md 的第一行非空非标题文本会被提取为技能描述。
+在 GUI 的技能 Tab 中可安装/搜索/卸载技能包。
 
-## Rules 规则系统
+### Rules 规则系统
 
-规则是 `.md` 文件，存放在 `rules/` 目录：
+Markdown 规则文件，存放在 `rules/` 目录，全部拼接注入 System Prompt：
 
 ```
 ~/.p-chat/rules/
@@ -207,7 +194,39 @@ SKILL.md 的第一行非空非标题文本会被提取为技能描述。
 └── security.md
 ```
 
-所有规则文件内容会拼接后注入到 System Prompt 中。
+### 风格人格
+
+| 风格 | 名称 | 特性 | CLI 参数 |
+|------|------|------|---------|
+| 可爱风 | 小P (PiPi) | 软萌、颜文字、治愈 | `--style cute` |
+| 古风 | 墨言 (MoYan) | 雅致、引经据典、谦辞 | `--style guofeng` |
+| 科技风 | NEXUS (零号) | 冷静、结构化、高效 | `--style tech` |
+
+---
+
+## 知识库 (Knowledge Base)
+
+本地优先的文档语义检索系统。通过向量嵌入将代码/文档/配置文件转化为可检索的知识片段。
+
+> 完整使用指南：[docs/knowledge.md](docs/knowledge.md)
+
+### 配置流程
+
+1. 应用设置 → 知识库 Tab → 打开「启用知识库」
+2. 配置嵌入模型（选择提供 embedding 模型的供应商）
+3. 添加向量库（本地 `local` 开箱即用，也支持 Qdrant/Chroma/Pinecone 等远程库）
+4. 添加知识库目录 → 点「扫描」后台索引
+5. 在对话输入区底部选择要用的向量库
+
+### LLM 如何使用
+
+LLM 通过 `recall` 工具按需检索。当 LLM 不确定某条信息、需要查代码/文档、或想引用历史时，自动调用 recall。你也可以直接在消息中说"查一下知识库中关于 XXX 的内容"引导 LLM 检索。
+
+### 支持格式
+
+文档 (.md .txt .rst)、代码 (.go .ts .py .java .rs 等 40+ 种)、配置 (.json .yaml .toml .xml)、Web (.html .css .scss) 等共 53 种。详见 [docs/knowledge.md](docs/knowledge.md#支持的文件格式53-种)。
+
+---
 
 ## CLI 命令
 
@@ -216,22 +235,24 @@ SKILL.md 的第一行非空非标题文本会被提取为技能描述。
 | `/help` | 显示帮助信息 |
 | `/style [name]` | 切换/查看风格 |
 | `/model [provider]` | 切换/查看模型 |
+| `/recall <query>` | 手动知识检索 |
 | `/clear` | 清屏 |
 | `/skills` | 列出已安装技能 |
 | `/rules` | 列出已加载规则 |
 | `/agents` | 查看 AGENTS.md |
 | `/tools` | 列出可用工具 |
-| `/init` | 初始化 .p-chat/ |
+| `/projects` | 列出项目目录 |
+| `/init` | 初始化当前目录的 .p-chat/ |
 | `/quit` | 退出 |
+
+---
 
 ## LLM 协议支持
 
-支持两种 API 协议：
-
-| 协议 | 说明 | 适用提供商 |
-|------|------|-----------|
-| `openai` | OpenAI 兼容协议 | OpenAI, DeepSeek, Ollama, 通义千问, 智谱等 |
-| `anthropic` | Anthropic 原生协议 | Claude (Anthropic) |
+| 协议 | 适用 |
+|------|------|
+| `openai` (OpenAI 兼容) | OpenAI、DeepSeek、Ollama、通义千问、智谱、百川 等 |
+| `anthropic` (原生) | Claude (Anthropic) |
 
 ### 配置示例
 
@@ -264,107 +285,147 @@ llm:
       model: "llama3"
 ```
 
+---
+
 ## HTTP API
 
-所有端点都在 `/api/v1/` 下。
-
-### 核心
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/health` | 健康检查 |
-| GET/POST/PATCH/DELETE | `/styles` / `/:id` | 风格 CRUD（identity + soul） |
-| GET/POST/PATCH/DELETE | `/providers` / `/:name` | 供应商管理 |
-| POST/PUT/DELETE | `/providers/:name/models` / `/:model` | 模型 CRUD |
-| POST | `/providers/:name/models/:model/default` | 设默认模型 |
-| PATCH | `/providers/:name/models/:model/capabilities` | 模型能力标记（vision/thinking） |
+所有接口在 `/api/v1/` 下。
 
 ### 会话
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET/POST | `/sessions` | 列出/创建（支持 `?project_path=` 过滤） |
-| GET/PATCH/DELETE | `/sessions/:id` | 获取/更新元数据/归档 |
+| GET/POST | `/sessions` | 列出/创建会话 |
+| GET/PATCH/DELETE | `/sessions/:id` | 获取/更新/归档 |
 | GET | `/sessions/:id/messages` | 历史消息 |
-| POST | `/sessions/:id/messages` | **发送消息（SSE 流式响应）** |
-| POST | `/sessions/:id/compress` | 压缩对话 |
-| PATCH | `/sessions/:id/reasoning-effort` | 设置思考深度 |
-| POST | `/sessions/:id/system-message` | 自定义 system prompt |
+| POST | `/sessions/:id/messages` | **发送消息 (SSE 流式)** |
+| POST | `/sessions/:id/compress` | 压缩历史 |
+| PATCH | `/sessions/:id/reasoning-effort` | 调整推理深度 |
 | DELETE | `/sessions/:id/messages` | 清空会话 |
+| POST | `/sessions/:id/rollback` | 回滚消息 |
 
-### 归档
+### 知识库
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/sessions/:id/archive` | 软删除 |
-| POST | `/sessions/:id/unarchive` | 恢复 |
-| GET | `/sessions/archived` | 列出已归档 |
-| DELETE | `/sessions/:id/permanent` | 永久删除 |
-
-### 项目
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET/POST/DELETE | `/projects` | 列出/添加/移除项目目录 |
-| POST | `/dialog/folder` | 打开原生文件夹选择对话框 |
-
-### 技能
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/skills` | 列出已安装技能 |
-| POST | `/skills/install` | 安装技能 |
-| DELETE | `/skills/:name` | 卸载技能 |
-| GET | `/skills/search?q=` | 搜索技能仓库 |
+| GET/PATCH | `/knowledge/config` | 配置读写 |
+| GET/POST | `/knowledge/stores` | 向量库管理 |
+| DELETE | `/knowledge/stores/:name` | 删除向量库 |
+| POST | `/knowledge/stores/:name/test` | 测试连接 |
+| GET/POST | `/knowledge/bases` | 知识库管理 |
+| DELETE | `/knowledge/bases/:name` | 删除知识库 |
+| POST | `/knowledge/bases/:name/scan` | 扫描索引（异步） |
+| GET | `/knowledge/bases/:name/scan/status` | 查询扫描进度 |
+| POST | `/knowledge/search` | 语义搜索 |
+| GET | `/knowledge/embedders` | 可用嵌入模型 |
 
 ### 其他
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/uploads` | 文件上传（multipart） |
-| GET | `/uploads/:id` | 获取已上传文件 |
-| GET | `/commands` | 列出斜杠命令 |
-| POST | `/commands/:name` | 执行斜杠命令 |
+| GET/POST/PATCH/DELETE | `/styles` | 风格 CRUD |
+| GET/POST/PATCH/DELETE | `/providers` | 提供器管理 |
+| GET/POST/DELETE | `/projects` | 项目目录管理 |
+| GET/POST/DELETE | `/skills` | 技能管理 |
+| GET | `/commands` | 斜杠命令列表 |
+| POST | `/uploads` | 文件上传 |
+| POST | `/mcp/servers` | MCP 服务器管理 |
 
-### POST /api/v1/sessions/:id/messages (SSE)
+### SSE 消息发送
 
-```json
-{
-  "message": "你好",
-  "style": "cute",
-  "provider": "openai",
-  "model": "gpt-4o",
-  "attachments": []
-}
+```bash
+POST /api/v1/sessions/:id/messages
+Content-Type: application/json
+
+{"message": "你好", "provider": "openai", "model": "gpt-4o"}
 ```
 
-响应 (SSE):
+响应 (SSE 事件流)：
 
 ```
+data: {"type":"content","content":"你好"}
 data: {"type":"thinking","thinking":"我需要分析用户的问题..."}
-data: {"type":"phase","step":"analyzing","message":"分析问题..."}
-data: {"type":"content","content":"你好呀"}
-data: {"type":"tool","tool_name":"read_file","tool_args":"{}","tool_status":"start"}
+data: {"type":"tool","tool_name":"read_file","tool_status":"start"}
 data: {"type":"tool","tool_name":"read_file","tool_status":"ok","tool_result":"..."}
-data: {"type":"content","content":"！"}
+data: {"type":"phase","step":"sub_agent","message":"正在启动子代理..."}
 data: {"type":"done","tokens_in":123,"tokens_out":456,"elapsed":"2.3s"}
 ```
 
-## 开发任务
+SSE 事件类型：`content` | `thinking` | `tool` | `phase` | `error` | `done` | `question` | `tool_confirm`
+
+---
+
+## 项目结构
+
+```
+P-chat/
+├── cmd/pchat/          # CLI 入口
+├── cmd/pchat-server/   # HTTP Server
+├── cmd/pchat-gui/      # Wails 桌面端
+├── frontend/src/       # Vue 3 SPA
+│   ├── api/client.ts        # HTTP/SSE 客户端
+│   ├── stores/chat.ts       # Pinia 状态管理
+│   └── components/           # Vue 组件
+├── internal/
+│   ├── agent/          # ReAct 主循环
+│   ├── knowledge/      # 向量库、嵌入、索引
+│   ├── recall/         # 知识召回引擎
+│   ├── llm/            # LLM 客户端 (SSE parser)
+│   ├── memory/         # SQLite 持久化
+│   ├── config/         # 配置管理
+│   ├── server/         # HTTP 路由 + SSE
+│   ├── tool/           # 工具注册 + 内置工具
+│   ├── subagent/       # 子代理系统
+│   ├── skill/          # 技能加载
+│   ├── rules/          # 规则加载
+│   ├── style/          # 人格风格
+│   ├── sandbox/        # 命令/文件安全
+│   ├── mcp/            # MCP 协议
+│   └── project/        # 项目管理
+├── docs/knowledge.md   # 知识库详细文档
+├── prompts/            # 风格提示词
+├── configs/            # 配置模板
+└── scripts/            # 打包脚本
+```
+
+---
+
+## 开发
+
+### 编译
+
+```bash
+task build:all       # CLI + Server + 前端
+task build:gui       # 桌面端 (Wails v2)
+task package:gui     # 完整打包
+```
+
+### 测试
+
+```bash
+go test -count=1 ./...   # Go 测试
+cd frontend && npx vue-tsc -b  # TS 类型检查
+```
+
+### 调试日志
+
+`~/.p-chat/server-debug.log` 记录了所有 LLM 请求和 SSE 事件。
+
+---
+
+## 路线图
 
 - [x] 项目脚手架
 - [x] 三种风格提示词
 - [x] CLI 交互
 - [x] HTTP Server
-- [x] 多模型支持 (OpenAI 兼容协议)
 - [x] 会话记忆 (SQLite)
-- [x] 内置工具 (文件/Shell/子代理)
-- [x] AGENTS.md 支持
-- [x] Skills 技能系统
-- [x] Rules 规则系统
+- [x] 内置工具 (9 个)
+- [x] AGENTS.md / Skills / Rules
 - [x] Wails v2 桌面端
-- [x] Vue 3 + Vite + Naive UI 前端
-- [x] SSE 流式渲染（逐事件 flush、打字机效果）
-- [x] 思考过程展示（可折叠面板）
-- [x] 项目系统（多项目目录注册）
-- [x] 会话归档/恢复
-- [x] 技能安装/搜索（GUI）
-- [x] Plan/Build 模式切换
-- [x] 供应商多模型（per-provider models）
-- [ ] MCP 工具协议集成
-- [ ] 本地 LLM (Ollama) 深度集成
-- [ ] 代码沙箱 (Docker)
+- [x] Vue 3 前端 + SSE 流式渲染
+- [x] 思考过程可折叠面板
+- [x] 项目系统 + 会话归档
+- [x] Plan/Build 模式
+- [x] 多模型 + 模型能力标记
+- [x] 知识库系统（向量库 + 语义检索 + 对话级绑定）
+- [x] 消息回滚
+- [ ] MCP 工具协议完整集成
+- [ ] Docker 代码沙箱

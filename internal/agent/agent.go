@@ -34,6 +34,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/p-chat/pchat/internal/agents"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
@@ -313,6 +314,9 @@ type ChatRequest struct {
 	// After MaxRounds the loop stops and the user can continue
 	// with a follow-up message.
 	MaxRounds int `json:"max_rounds,omitempty"`
+	// KBBase selects the knowledge base for this session.
+	// "" = off, "__all__" = all bases, or a specific base name.
+	KBBase string `json:"kb_base,omitempty"`
 	// PromptOv, when non-empty, REPLACES the agent's normal
 	// system prompt (style + AGENTS + rules + skills) for this
 	// turn. Used by the sub-agent runner to install a
@@ -549,23 +553,43 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		// is added by the CLI at startup; here we just remind the
 		// model to use it.
 		hasRecall := false
+		hasGrep := false
+		hasWiki := false
 		hasQuestion := false
 		hasTodoWrite := false
 		for _, t := range a.tools.List() {
 			switch t.Name {
 			case "recall":
 				hasRecall = true
+			case "grep":
+				hasGrep = true
+			case "wiki_lookup":
+				hasWiki = true
 			case "question":
 				hasQuestion = true
 			case "todo_write":
 				hasTodoWrite = true
 			}
 		}
+		if hasWiki {
+			sb.WriteString("\n\n---\n\n## Using wiki_lookup\n\n" +
+				"使用 `wiki_lookup(title=\"...\")` 按标题检索知识库结构化条目。\n" +
+				"适用场景：查阅文档特定章节、获取已知条目的完整内容。\n" +
+				"支持模糊匹配，不需要输入精确标题。\n" +
+				"先用 `wiki_index` 浏览知识库目录确认有哪些条目，再按需检索。\n")
+		}
 		if hasRecall {
 			sb.WriteString("\n\n---\n\n## Using recall\n\n" +
 				"当你不确定某条信息、需要查代码/文档、或想引用历史对话时，\n" +
 				"先用 `recall(query=\"...\")` 工具查一下知识库/历史。\n" +
 				"不要凭印象编造 API 名称、文件路径、函数签名。\n")
+		}
+		if hasGrep {
+			sb.WriteString("\n\n---\n\n## Using grep\n\n" +
+				"使用 `grep(pattern=\"...\")` 在知识库文件中精确搜索关键词。\n" +
+				"适用场景：找特定函数名、变量名、类名、配置项、或任何精确文本。\n" +
+				"recall 适合语义概念搜索，grep 适合精确字符串定位。\n" +
+				"两者可结合使用：先用 recall 理解上下文，再用 grep 精确定位。\n")
 		}
 		if hasTodoWrite {
 			sb.WriteString("\n\n---\n\n## Task Planning with todo_write\n\n" +
@@ -711,6 +735,77 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	a.staticPrompt = prompt
 	a.staticPromptID = sig
 	return prompt, sig, nil
+}
+
+// buildKBIndex builds the Knowledge Base section of the system prompt.
+// When KBBase is "__all__", all enabled bases are listed. When it's a
+// specific name, only that base's index is shown. If the base has no
+// sections, a placeholder is returned. The output is truncated at 3000
+// characters to avoid prompt explosion.
+func buildKBIndex(cfg *config.Config, kbBase string) string {
+	kc := cfg.Knowledge
+	var bases []config.KnowledgeBase
+	if kbBase == "__all__" {
+		for _, b := range kc.Bases {
+			if b.Enabled {
+				bases = append(bases, b)
+			}
+		}
+	} else {
+		for _, b := range kc.Bases {
+			if b.Name == kbBase && b.Enabled {
+				bases = append(bases, b)
+				break
+			}
+		}
+	}
+	if len(bases) == 0 {
+		return "\n[Knowledge Base]\n(no enabled bases configured)\n"
+	}
+
+	var sb strings.Builder
+
+	for _, base := range bases {
+		store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+		if err != nil {
+			continue
+		}
+		sections, err := store.ListBase(context.Background(), "")
+		if err != nil || len(sections) == 0 {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("\n[Knowledge Base: %s]\n", base.Name))
+		sb.WriteString(fmt.Sprintf("Path: %s\n", base.Path))
+		sb.WriteString(fmt.Sprintf("Index (%d sections):\n", len(sections)))
+		sb.WriteString("(Use wiki_lookup(title) to retrieve full content)\n\n")
+
+		currentSource := ""
+		count := 0
+		for _, s := range sections {
+			if s.Source != currentSource {
+				if count > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(fmt.Sprintf("  %s\n", s.Source))
+				currentSource = s.Source
+			}
+			sb.WriteString(fmt.Sprintf("    · %s\n", s.Title))
+			count++
+
+			if sb.Len() > 3000 {
+				sb.WriteString(fmt.Sprintf("\n  ...(%d more sections omitted)\n", len(sections)-count))
+				sb.WriteString("\nTools: wiki_lookup(title) — search and retrieve section content.\n       grep(pattern) — line search within base files.\n")
+				return sb.String()
+			}
+		}
+	}
+	if sb.Len() == 0 {
+		return "\n[Knowledge Base]\n(index empty — run a scan first)\n"
+	}
+
+	sb.WriteString("\nTools: wiki_lookup(title) — search and retrieve section content.\n")
+	sb.WriteString("       grep(pattern) — line search within base files.\n")
+	return sb.String()
 }
 
 // Reload forces the next call to rebuild the static system prompt
@@ -923,6 +1018,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 		ch <- ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."}
 		availableTools := a.tools.List()
+		// Remove wiki/grep tools when knowledge base is off.
+		if req.KBBase == "" || req.KBBase == "__off__" {
+			filtered := make([]tool.Tool, 0, len(availableTools))
+			for _, t := range availableTools {
+				if t.Name == "wiki_lookup" || t.Name == "wiki_index" || t.Name == "grep" {
+					continue
+				}
+				filtered = append(filtered, t)
+			}
+			availableTools = filtered
+		}
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -940,6 +1046,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if err != nil {
 			ch <- ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true}
 			return
+		}
+		// Inject knowledge base context + index.
+		if req.KBBase != "" && req.KBBase != "__off__" {
+			kbIndex := buildKBIndex(a.cfg, req.KBBase)
+			systemPrompt += kbIndex
 		}
 		// Sub-agent prompt override. When the sub-agent runner
 		// supplies a prompt (from the agent's own prompt or the

@@ -61,7 +61,7 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string }>,
+  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
   sessionTodos: {} as Record<string, TodoItem[]>,
   // sessionWorking is the per-session "is the LLM mid-turn"
   // flag, derived from the `session_status` SSE event. The
@@ -137,6 +137,8 @@ export const currentMeta = computed(() => {
     provider: def?.provider || '',
     model: def?.model || '',
     title: '',
+    vector_store: '',
+    knowledge_base: '',
   }
 })
 
@@ -282,6 +284,8 @@ export async function switchSession(id: string) {
       plan_mode: s.plan_mode || false,
       permission_level: s.permission_level || 'ask',
       reasoning_effort: s.reasoning_effort || 'off',
+      vector_store: s.vector_store || '',
+      knowledge_base: s.knowledge_base || '',
     }
   }
   // Load per-session todos.
@@ -454,6 +458,8 @@ export async function renameSession(id: string, title: string) {
       model: resp.model ?? state.sessionMeta[id].model,
       permission_level: resp.permission_level ?? state.sessionMeta[id].permission_level,
       reasoning_effort: resp.reasoning_effort ?? state.sessionMeta[id].reasoning_effort,
+      vector_store: resp.vector_store ?? state.sessionMeta[id].vector_store,
+      knowledge_base: resp.knowledge_base ?? state.sessionMeta[id].knowledge_base,
     }
   }
 }

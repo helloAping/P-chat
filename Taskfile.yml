@@ -8,8 +8,15 @@ vars:
     sh: powershell -NoProfile -Command "try { (git rev-parse --short HEAD).Trim() } catch { '' }"
 
 tasks:
+  sync:version:
+    desc: 读取 VERSION 文件，同步写入 wails.json + install.ps1
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync-version.ps1
+    silent: false
+
   build:frontend:
     desc: 编译 Vue 前端 (Vite SPA)，输出到 web/ 并同步到 embed 目录
+    deps: [sync:version]
     dir: frontend
     cmds:
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\clean-frontend-output.ps1"
