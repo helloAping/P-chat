@@ -928,36 +928,61 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     case 'tool': {
-      // Sub-agent tools render inside the sub-agent card;
-      // parent tools render at the top level. Either way
-      // they're appended to the matching part list.
       const parts = sub ? sub.parts : m.parts!
       if (!ev.tool_name) break
       if (ev.tool_status === 'start') {
-        // Push a new tool part for this call. If the
-        // last part is already an unfinished tool with
-        // the same name, reuse it (defensive — usually
-        // there's a clear "start" then "ok" pair).
-        const last = parts[parts.length - 1]
-        if (last && last.kind === 'tool' && last.status === 'start' && last.name === ev.tool_name) {
-          last.args = ev.tool_args
+        // When tool_id is present, use it as the unique key
+        // and never reuse the last part (two calls to the
+        // same tool name are distinct). For legacy streams
+        // without tool_id, fall back to name-based reuse.
+        if (ev.tool_id) {
+          if (parts.length > 0) {
+            const last = parts[parts.length - 1]
+            if (last.kind === 'tool' && last.status === 'start' && last.tool_id === ev.tool_id) {
+              last.args = ev.tool_args
+            } else {
+              parts.push({
+                kind: 'tool',
+                id: ev.tool_name,
+                tool_id: ev.tool_id,
+                name: ev.tool_name,
+                args: ev.tool_args,
+                status: 'start',
+              })
+            }
+          } else {
+            parts.push({
+              kind: 'tool',
+              id: ev.tool_name,
+              tool_id: ev.tool_id,
+              name: ev.tool_name,
+              args: ev.tool_args,
+              status: 'start',
+            })
+          }
         } else {
-          parts.push({
-            kind: 'tool',
-            id: ev.tool_name,
-            name: ev.tool_name,
-            args: ev.tool_args,
-            status: 'start',
-          })
+          const last = parts[parts.length - 1]
+          if (last && last.kind === 'tool' && last.status === 'start' && last.name === ev.tool_name) {
+            last.args = ev.tool_args
+          } else {
+            parts.push({
+              kind: 'tool',
+              id: ev.tool_name,
+              name: ev.tool_name,
+              args: ev.tool_args,
+              status: 'start',
+            })
+          }
         }
       } else {
-        // 'ok' / 'warn' / 'error' — find the matching
-        // tool part (most recent unfished one with the
-        // same name) and update it.
+        // 'ok' / 'warn' / 'error' — exact match by tool_id,
+        // fall back to name for legacy streams.
         let found = false
         for (let i = parts.length - 1; i >= 0; i--) {
           const p = parts[i]
-          if (p.kind === 'tool' && p.name === ev.tool_name && p.status === 'start') {
+          if (p.kind !== 'tool' || p.status !== 'start') continue
+          if ((ev.tool_id && p.tool_id === ev.tool_id) ||
+              (!ev.tool_id && p.name === ev.tool_name)) {
             p.status = (ev.tool_status as any) || 'ok'
             p.result = ev.tool_result
             p.error = ev.tool_error
@@ -968,11 +993,10 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           }
         }
         if (!found) {
-          // No matching start event — just append a
-          // completed tool part.
           parts.push({
             kind: 'tool',
             id: ev.tool_name,
+            tool_id: ev.tool_id,
             name: ev.tool_name,
             args: ev.tool_args,
             status: (ev.tool_status as any) || 'ok',

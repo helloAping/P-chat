@@ -35,6 +35,8 @@ import { state } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import SubAgentCard from './SubAgentCard.vue'
+import QuestionTable from './QuestionTable.vue'
+import ExecOutputCard from './ExecOutputCard.vue'
 import TypedText from './TypedText.vue'
 import {
   copyImageToClipboard, copyText, downloadBlob, downloadFromUrl,
@@ -88,10 +90,8 @@ function isLiveThinkingPart(idx: number, kind: string, parts: MessagePart[] | un
   return false
 }
 
-// The role check is unchanged: tool messages are not
-// rendered as bubbles; they live inside the assistant
-// message as ToolCallCard parts.
-const isSystem = computed(() => props.message.role === 'system')
+// The role check: system messages get a special icon.
+const isSystem = computed(() => (props.message.msg_type ?? 0) === 0 && props.message.role === 'system')
 
 // For user / system messages, the markdown pipeline
 // renders the whole `content` string. For assistant
@@ -463,9 +463,17 @@ const showVisionWarn = computed(() =>
           <span class="warn-hint">切换到支持视觉的模型（如 gpt-4o / claude-3.5+）后重新发送</span>
         </div>
 
-        <!-- User / system / tool: markdown of `content` -->
+        <!-- Command output: terminal-style panel -->
+        <ExecOutputCard
+          v-if="(message.msg_type ?? 0) === 5"
+          :content="message.content"
+          :command="message.name"
+          :elapsed="message.elapsed"
+        />
+
+        <!-- User / system: markdown of `content` -->
         <div
-          v-if="message.role === 'user' || message.role === 'system' || message.role === 'tool'"
+          v-if="(message.msg_type ?? 0) === 0 && message.role !== 'assistant'"
           ref="mdBodyEl"
           class="md-body"
           v-html="userHtml"
@@ -475,16 +483,8 @@ const showVisionWarn = computed(() =>
         <!-- Assistant: parts-driven render.
              Falls back to markdown of `content` for
              messages loaded from history (no parts
-             were persisted server-side).
-             The trailing text/thinking part of an
-             actively-streaming message renders through
-             `TypedText` / `ThinkingBlock` (with the
-             blinking caret on the text part) so the
-             user sees the SSE stream arrive in real
-             time. All other parts — earlier text in
-             the same turn, post-stream text, tools,
-             sub-agents — render statically. -->
-        <template v-if="message.role === 'assistant'">
+             were persisted server-side). -->
+        <template v-if="(message.msg_type ?? 0) === 0 && message.role === 'assistant'">
           <!-- Live status bar during streaming -->
           <div v-if="statusLines.length" class="stream-status">
             <div v-for="(line, i) in statusLines" :key="i" class="status-line">{{ line }}</div>
@@ -498,6 +498,7 @@ const showVisionWarn = computed(() =>
               />
               <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
               <SubAgentCard v-else-if="p.kind === 'sub_agent'" :part="p" />
+              <QuestionTable v-else-if="p.kind === 'question'" :part="p" />
               <TypedText
                 v-else-if="p.kind === 'text' && isLiveTextPart(i, p.kind, message.parts)"
                 :text="p.text || ''"

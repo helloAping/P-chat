@@ -398,8 +398,9 @@ type ChatStreamChunk struct {
 	Step     string `json:"step,omitempty"`
 	Duration string `json:"duration,omitempty"`
 
-	ToolName    string `json:"tool_name,omitempty"`
-	ToolArgs    string `json:"tool_args,omitempty"`
+	ToolID   string `json:"tool_id,omitempty"`
+	ToolName string `json:"tool_name,omitempty"`
+	ToolArgs string `json:"tool_args,omitempty"`
 	ToolResult  string `json:"tool_result,omitempty"`
 	// ToolResultFull is the untruncated tool result. ToolResult
 	// above is a 300-char preview suitable for human display;
@@ -1535,7 +1536,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if len(argsPreview) > 200 {
 					argsPreview = argsPreview[:200] + "..."
 				}
-				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
+				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
 				partsAcc.update(startChunk)
 				ch <- startChunk
 			}
@@ -1732,7 +1733,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							}
 						}
 					}
+					// Persist question before blocking for user input.
+					if tc.Name == "question" && a.store != nil {
+						persistQuestion(req.SessionID, a.store, string(argsRaw))
+					}
 					result, err := handler(toolCtx, argsRaw)
+					// Persist answer after user responds.
+					if tc.Name == "question" && result != nil && a.store != nil {
+						persistQuestionAnswer(req.SessionID, a.store, result.Content)
+					}
 					outcomes[i] = toolOutcome{
 						idx:     i,
 						tc:      tc,
@@ -1768,7 +1777,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					} else if o.err != nil {
 						errMsg = o.err.Error()
 					}
-					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolID: tc.ID, ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(errChunk)
 					ch <- errChunk
 					toolMsg := llm.ChatMessage{
@@ -1800,11 +1809,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 				if result.IsError {
 					roundAnyToolErrored = true
-					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(warnChunk)
 					ch <- warnChunk
 				} else {
-					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					// For tools whose result the frontend needs to
 					// *parse* (todo_write), also send the untruncated
 					// payload. Truncated newlines → spaces and the 300
@@ -2004,6 +2013,39 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 		}
 	}
 	store.AddChatMessageWithMetaTo(convID, msg, meta)
+}
+
+// persistQuestion stores the question tool's arguments as a
+// msg_type=6 message so the question table is visible in
+// session history after reload.
+func persistQuestion(convID string, store *memory.Store, questionsJSON string) {
+	if store == nil || questionsJSON == "" {
+		return
+	}
+	msg := llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		MsgType:     llm.MsgTypeQuestion,
+		SubmitToLLM: 1,
+		Content:     questionsJSON,
+	}
+	store.AddChatMessageTo(convID, msg)
+}
+
+// persistQuestionAnswer stores the user's question answers as a
+// msg_type=6 message, paired with the preceding question message.
+func persistQuestionAnswer(convID string, store *memory.Store, answersJSON string) {
+	if store == nil || answersJSON == "" {
+		return
+	}
+	msg := llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		MsgType:     llm.MsgTypeQuestion,
+		SubmitToLLM: 1,
+		Content:     answersJSON,
+	}
+	store.AddChatMessageTo(convID, msg)
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction

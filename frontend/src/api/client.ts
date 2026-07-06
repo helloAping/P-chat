@@ -108,17 +108,10 @@ export type MessagePart =
   | { kind: 'thinking'; text: string; streaming?: boolean }
   | {
       kind: 'tool'
-      // The tool call's stable id, e.g. "read_file".
-      // For non-native calls parsed out of markdown, the
-      // id is undefined and the call is keyed by index.
       id?: string
+      tool_id?: string
       name: string
-      // JSON-encoded arguments string. Empty until the
-      // call's args have been parsed.
       args?: string
-      // 'start' | 'ok' | 'warn' | 'error'. Defaults to
-      // 'start' on creation; updated when the matching
-      // 'tool' event arrives.
       status: 'start' | 'ok' | 'warn' | 'error'
       result?: string
       error?: string
@@ -126,42 +119,21 @@ export type MessagePart =
     }
   | {
       kind: 'sub_agent'
-      // The sub-agent's task description. Acts as the
-      // card's primary label and the unique key (no id
-      // on the wire).
       task: string
-      // 'start' | 'ok' | 'err'.
       status: 'start' | 'ok' | 'err'
-      // The sub-agent's own message stream — same
-      // MessagePart union, recursively nested. (We don't
-      // actually recurse in practice; sub-agents cannot
-      // spawn sub-agents. The type just allows it.)
       parts: MessagePart[]
       elapsed?: string
-      // The agent's name (e.g. "explore", "plan",
-      // "general-purpose", or a custom agent from
-      // .p-chat/agent/*.md). Surfaced in the card header.
       agentType?: string
-      // The agent's accent color ("#RRGGBB" or CSS color
-      // name). Tints the card border + badge.
       agentColor?: string
-      // The model the sub-agent is using (e.g.
-      // "gpt-4o-mini"). Shown as a small chip when set.
       agentModel?: string
-      // The resume-by-id key. Surfaced as a monospace
-      // badge in the footer; click to copy.
       taskId?: string
-      // The agent's one-line "when to use" hint from the
-      // registry. Surfaced as a hover tooltip on the
-      // agent-name badge so the user can read the full
-      // hint without expanding the card body.
       agentDescription?: string
-      // The reason the sub-agent failed. Only set when
-      // status === 'err'. Surfaced as a tooltip on the
-      // "失败" status so the user can see *why* without
-      // expanding the card body. Empty for soft-fail
-      // (content produced) and for ok status.
       failureReason?: string
+    }
+  | {
+      kind: 'question'
+      text: string       // questions JSON
+      name?: string      // answers JSON (when answered)
     }
 
 export type SubAgentPart = Extract<MessagePart, { kind: 'sub_agent' }>
@@ -178,6 +150,7 @@ export interface TodoItem {
 export interface Message {
   id?: number
   role: 'user' | 'assistant' | 'tool' | 'system'
+  msg_type?: number
   // For user / system messages this is the text body.
   // For assistant messages, prefer `parts` — but `content`
   // is kept in sync as a denormalized cache so the
@@ -873,6 +846,7 @@ export interface StreamEvent {
   // client appends it to the trailing thinking part of the
   // assistant message.
   thinking?: string
+  tool_id?: string
   tool_name?: string
   tool_status?: string
   tool_result?: string
