@@ -693,7 +693,7 @@ async function send() {
   // mutation happens in the onEvent callback below.
   startStream(id, ctrl)
   try {
-    await api.streamMessages(id, {
+    await api.streamMessagesRetry(id, {
       message: text,
       provider: meta.provider,
       model: meta.model,

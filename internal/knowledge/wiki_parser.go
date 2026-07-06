@@ -128,7 +128,14 @@ func BuildHeadingTree(text string, includeLevel int) []*HeadingNode {
 	}
 	flushLeaf()
 
-	// Strip preamble placeholder if it has no content and there are real headings.
+	// Strip preamble placeholder — if the only root is a _preamble_ node
+	// (no real headings), return nil so caller uses the fallback path.
+	if len(roots) == 1 && roots[0].Level == 0 && len(roots[0].Children) == 0 {
+		// If preamble has text, keep it as a single synthetic root.
+		if strings.TrimSpace(roots[0].OwnText) == "" {
+			return nil
+		}
+	}
 	if len(roots) > 1 {
 		filtered := make([]*HeadingNode, 0, len(roots))
 		for _, r := range roots {

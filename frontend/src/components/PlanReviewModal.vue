@@ -30,7 +30,7 @@ async function approve(planOverride?: string) {
     const r = await api.listMessages(id.value, { limit: 200 })
     state.sessionMessages[id.value] = r.messages
     // Submit the continuation message to trigger actual execution.
-    await api.streamMessages(id.value, {
+    await api.streamMessagesRetry(id.value, {
       message: '请按计划执行',
       style: state.sessionMeta[id.value]?.style || 'tech',
       onEvent: (ev) => appendStreamEvent(id.value, ev),

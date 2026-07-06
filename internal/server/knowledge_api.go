@@ -874,6 +874,11 @@ func (h *Handler) buildIndexEntry(ctx context.Context, base *config.KnowledgeBas
 	ch := h.agent.LLM().ChatStreamCM(ctx, provider, model, msgs, nil, llm.ChatOptions{})
 	var sb strings.Builder
 	for chunk := range ch {
+		select {
+		case <-ctx.Done():
+			return aggregatedContent, ctx.Err()
+		default:
+		}
 		if chunk.Err != nil {
 			return aggregatedContent, nil
 		}
@@ -902,16 +907,29 @@ func (h *Handler) buildIndexEntry(ctx context.Context, base *config.KnowledgeBas
 	return result, nil
 }
 
-// indexerSystemPrompt is loaded once from prompts/knowledge_indexer.md.
-var indexerSystemPrompt = loadIndexerPrompt()
+// indexerSystemPrompt is the LLM system instruction for knowledge indexing.
+const indexerSystemPrompt = `You are a knowledge-base indexing assistant. Given a document section with its full context (including all sub-sections), produce a searchable index entry.
 
-func loadIndexerPrompt() string {
-	data, err := os.ReadFile("prompts/knowledge_indexer.md")
-	if err != nil {
-		log.Printf("[kb] load indexer prompt: %v", err)
-		return "You are a knowledge-base indexing assistant. Output format: 内容概览：...\\n关键词：...\\n搜索匹配：..."
+## Output Format (exactly 3 lines, no extra text):
+
+内容概览：<100 characters summarizing the core content of this section and its subsections>
+关键词：<5-15 comma-separated keywords, mix of Chinese and English>
+搜索匹配：<one sentence describing what search intents should match this entry, 30 chars max>
+
+## Rules
+
+1. "内容概览" must be a single concise sentence covering the main topic.
+2. "关键词" must include both technical terms and user-facing search terms.
+3. "搜索匹配" must describe the search intent, not repeat the title.
+4. Write in the language of the source document.
+5. Do NOT output JSON, markdown code blocks, or any extra formatting. Plain text only.
+6. Do NOT prefix with "Output:" or any other label.`
+
+func truncateContent(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
-	return string(data)
+	return s[:max] + "..."
 }
 
 // wikiScan walks a directory, parses all indexable files into wiki
@@ -965,6 +983,10 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 	}
 
 	// Phase 2: parse text + collect media (single walk).
+	// Fire initial progress so the frontend shows 0/N immediately.
+	if progress != nil {
+		progress(0, totalFiles)
+	}
 	walkPhase2Err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
 		select {
 		case <-ctx.Done():
@@ -1042,34 +1064,37 @@ func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base
 		roots := knowledge.BuildHeadingTree(text, 3)
 		var sections []knowledge.WikiSection
 
-		// Generate LLM-indexed entries for every node with content.
-		knowledge.WalkHeadingTree(roots, func(node *knowledge.HeadingNode) {
-			if !node.HasContent() {
-				return
-			}
-			heading := ""
-			if node.Parent != nil {
-				heading = node.Parent.Title
-			}
-
-			aggregated := node.AggregatedContent()
-			content := aggregated // fallback if LLM fails
-			if base.ScanModel != "" && h.agent != nil {
-				if indexed, err := h.buildIndexEntry(ctx, base, node.Title, heading, aggregated); err == nil && indexed != "" {
-					content = indexed
-				} else if err != nil {
-					log.Printf("[scan] index %s/%s: %v", rel, node.Title, err)
+		if len(roots) > 0 {
+			// Generate LLM-indexed entries for every node with content.
+			knowledge.WalkHeadingTree(roots, func(node *knowledge.HeadingNode) {
+				if !node.HasContent() {
+					return
 				}
-			}
+				heading := ""
+				if node.Parent != nil {
+					heading = node.Parent.Title
+				}
 
-			sections = append(sections, knowledge.WikiSection{
-				Title:   node.Title,
-				Content: content,
-				Source:  rel,
-				Base:    baseName,
-				Heading: heading,
+				aggregated := node.AggregatedContent()
+				content := aggregated
+				if base.ScanModel != "" && h.agent != nil {
+					if indexed, err := h.buildIndexEntry(ctx, base, node.Title, heading, aggregated); err == nil && indexed != "" {
+						content = indexed
+					} else if err != nil {
+						log.Printf("[scan] index %s/%s: %v", rel, node.Title, err)
+						content = truncateContent(aggregated, 500)
+					}
+				}
+
+				sections = append(sections, knowledge.WikiSection{
+					Title:   node.Title,
+					Content: content,
+					Source:  rel,
+					Base:    baseName,
+					Heading: heading,
+				})
 			})
-		})
+		}
 
 		if len(sections) == 0 {
 			// Fallback: no headings found → treat whole file as single entry.

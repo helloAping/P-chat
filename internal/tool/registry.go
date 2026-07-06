@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -111,6 +112,7 @@ func resolveToProjectRoot(ctx context.Context, p string) string {
 }
 
 type Registry struct {
+	mu    sync.RWMutex
 	tools map[string]ToolHandler
 	meta  map[string]Tool
 }
@@ -125,16 +127,22 @@ func NewRegistry() *Registry {
 }
 
 func (r *Registry) Register(t Tool, h ToolHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.tools[t.Name] = h
 	r.meta[t.Name] = t
 }
 
 func (r *Registry) Unregister(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	delete(r.tools, name)
 	delete(r.meta, name)
 }
 
 func (r *Registry) Get(name string) (ToolHandler, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	h, ok := r.tools[name]
 	return h, ok
 }
@@ -143,6 +151,8 @@ func (r *Registry) Get(name string) (ToolHandler, bool) {
 // you need both the description and the handler (e.g. to clone a registry
 // without a specific tool).
 func (r *Registry) Lookup(name string) (Tool, ToolHandler, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	h, hok := r.tools[name]
 	t, tok := r.meta[name]
 	if !hok || !tok {
@@ -153,6 +163,8 @@ func (r *Registry) Lookup(name string) (Tool, ToolHandler, bool) {
 
 // Names returns the registered tool names in sorted order.
 func (r *Registry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.meta))
 	for name := range r.meta {
 		names = append(names, name)
@@ -162,6 +174,8 @@ func (r *Registry) Names() []string {
 }
 
 func (r *Registry) List() []Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	tools := make([]Tool, 0, len(r.meta))
 	for _, t := range r.meta {
 		tools = append(tools, t)
@@ -361,7 +375,43 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 		cmd.Dir = root
 	}
 
-	out, err := cmd.CombinedOutput()
+	// PowerShell on Windows: bypass cmd /C to avoid:
+	// 1. cmd.exe intercepting pipes (|) inside -Command "..."
+	// 2. GBK output encoding (PowerShell 5.1 default on zh-CN)
+	//
+	// Original: powershell -NoProfile -Command "Get-Content ... | Select-Object ..."
+	//   → cmd /C strips outer quotes → | interpreted by cmd.exe → parser error
+	//
+	// Fix: run powershell.exe directly with [Console]::OutputEncoding = UTF-8.
+	if runtime.GOOS == "windows" {
+		trimmed := strings.TrimSpace(a.Command)
+		isPS := strings.HasPrefix(trimmed, "powershell") || strings.HasPrefix(trimmed, "pwsh")
+		if isPS {
+			// Parse: powershell|pwsh [flags] -Command <script>
+			psExe := "powershell.exe"
+			if strings.HasPrefix(trimmed, "pwsh") {
+				psExe = "pwsh.exe"
+			}
+			if idx := strings.IndexByte(trimmed, ' '); idx >= 0 {
+				remaining := strings.TrimSpace(trimmed[idx:])
+				cmdIdx := strings.Index(remaining, "-Command ")
+				if cmdIdx >= 0 {
+					flags := strings.TrimSpace(remaining[:cmdIdx])
+					script := strings.TrimSpace(remaining[cmdIdx+9:])
+					if (strings.HasPrefix(script, "\"") && strings.HasSuffix(script, "\"")) ||
+						(strings.HasPrefix(script, "'") && strings.HasSuffix(script, "'")) {
+						script = script[1 : len(script)-1]
+					}
+					script = fmt.Sprintf("[Console]::OutputEncoding = [Text.Encoding]::UTF8; %s", script)
+					args := append([]string{}, strings.Fields(flags)...)
+					args = append(args, "-Command", script)
+					cmd = exec.CommandContext(ctx, psExe, args...)
+				}
+			}
+		}
+	}
+
+	out, err := readLimitedOutput(cmd)
 	if err != nil {
 		content := strings.TrimRight(string(out), "\r\n")
 		if content != "" {
@@ -387,6 +437,38 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 		return &CallResult{Content: content, IsError: true}, nil
 	}
 	return &CallResult{Content: string(out)}, nil
+}
+
+const maxExecReadSize = 256 * 1024
+
+// readLimitedOutput captures stdout+stderr with a hard byte cap
+// to prevent memory exhaustion if the LLM runs an unbounded
+// command (e.g. `cat /dev/zero`).
+func readLimitedOutput(cmd *exec.Cmd) ([]byte, error) {
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 2)
+	readPipe := func(r io.Reader) {
+		data, err := io.ReadAll(io.LimitReader(r, maxExecReadSize))
+		ch <- result{data, err}
+	}
+	go readPipe(stdout)
+	go readPipe(stderr)
+
+	r1, r2 := <-ch, <-ch
+	waitErr := cmd.Wait()
+	out := append(r1.data, r2.data...)
+	if waitErr != nil && r1.err == nil && r2.err == nil {
+		return out, waitErr
+	}
+	return out, nil
 }
 
 // commandReferencesUploadFile scans a shell command for tokens

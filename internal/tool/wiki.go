@@ -19,6 +19,7 @@ type wikiLookupArgs struct {
 type wikiIndexArgs struct {
 	Source string `json:"source,omitempty"`
 	Base   string `json:"base,omitempty"`
+	Query  string `json:"query,omitempty"`
 }
 
 // RegisterWiki registers wiki_lookup and wiki_index tools.
@@ -40,10 +41,11 @@ func RegisterWiki(r *Registry, cfg *config.Config) {
 
 	r.Register(Tool{
 		Name:        "wiki_index",
-		Description: "列出知识库的全部条目目录，或指定文件的章节列表。base 参数指定知识库名称。",
+		Description: "列出知识库条目目录，支持按关键词过滤。base 参数指定知识库名称。query 参数提供关键词过滤（如不提供则列出全部）。禁止反复调用 — 一次调用即可获取所需条目的标题列表。",
 		Parameters: ObjectSchema(map[string]any{
 			"source": StringProp("可选，指定文件名（如 AGENTS.md）只列出该文件的章节，留空列出全部"),
 			"base":   StringProp("知识库名称（可选，留空使用当前会话选定的知识库）"),
+			"query":  StringProp("可选，按关键词过滤条目（如 \"配置\"、\"API\"），与 wiki_lookup 的 title 参数不同，query 只过滤标题列表"),
 		}, nil),
 	}, makeWikiIndexHandler(cfg))
 }
@@ -137,11 +139,19 @@ func makeWikiIndexHandler(cfg *config.Config) ToolHandler {
 			if err != nil {
 				continue
 			}
-			sections, err := store.ListBase(ctx, "")
-			if err != nil {
-				continue
+			if a.Query != "" {
+				results, err := store.SearchFTS(ctx, a.Query, 100)
+				if err != nil {
+					continue
+				}
+				all = append(all, results...)
+			} else {
+				sections, err := store.ListBase(ctx, "")
+				if err != nil {
+					continue
+				}
+				all = append(all, sections...)
 			}
-			all = append(all, sections...)
 		}
 
 		if a.Source != "" {
@@ -155,20 +165,38 @@ func makeWikiIndexHandler(cfg *config.Config) ToolHandler {
 		}
 
 		if len(all) == 0 {
+			if a.Query != "" {
+				return &CallResult{Content: fmt.Sprintf("(未找到与 \"%s\" 相关的条目)", a.Query)}, nil
+			}
 			return &CallResult{Content: "(知识库为空，尚未扫描)"}, nil
 		}
 
 		var b strings.Builder
-		fmt.Fprintf(&b, "## Wiki Index (%d sections)\n\n", len(all))
+		if a.Query != "" {
+			fmt.Fprintf(&b, "## Wiki Index (query: \"%s\", %d sections)\n\n", a.Query, len(all))
+		} else {
+			fmt.Fprintf(&b, "## Wiki Index (%d sections)\n\n", len(all))
+		}
 		currentSource := ""
-		for _, s := range all {
+		printed := make(map[int]bool)
+		const softLimit = 5000
+		shown := 0
+		truncated := false
+		for i, s := range all {
+			if printed[i] {
+				continue
+			}
 			if s.Source != currentSource {
+				if b.Len() > softLimit {
+					truncated = true
+					break
+				}
 				fmt.Fprintf(&b, "### %s\n", s.Source)
 				currentSource = s.Source
 			}
 			indent := ""
 			if s.Heading != "" {
-				indent = "··" // indent sub-items
+				indent = "··"
 			}
 			kw := extractKeywords(s.Content)
 			line := fmt.Sprintf("%s- %s", indent, s.Title)
@@ -176,9 +204,13 @@ func makeWikiIndexHandler(cfg *config.Config) ToolHandler {
 				line += fmt.Sprintf(" ← %s", kw)
 			}
 			fmt.Fprintf(&b, "  %s\n", line)
+			shown++
 
-			// Show sub-items under their parent if they share the same source.
-			for _, sub := range all {
+			for j := i + 1; j < len(all); j++ {
+				sub := all[j]
+				if printed[j] {
+					continue
+				}
 				if sub.Heading == s.Title && sub.Source == s.Source {
 					subKw := extractKeywords(sub.Content)
 					subLine := fmt.Sprintf("    - %s", sub.Title)
@@ -186,8 +218,12 @@ func makeWikiIndexHandler(cfg *config.Config) ToolHandler {
 						subLine += fmt.Sprintf(" ← %s", subKw)
 					}
 					fmt.Fprintf(&b, "  %s\n", subLine)
+					printed[j] = true
 				}
 			}
+		}
+		if truncated {
+			fmt.Fprintf(&b, "\n*(截断 — 共 %d 条，显示 %d 条。用 wiki_lookup(title) 检索特定条目，或用 wiki_index(query=\"关键词\") 缩小范围)*\n", len(all), shown)
 		}
 		return &CallResult{Content: b.String()}, nil
 	}

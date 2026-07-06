@@ -79,6 +79,12 @@ type Agent struct {
 	kbIndexCache     string
 	kbIndexCacheKey  string // base name used to build the cache
 	kbIndexCacheTime int64  // unix timestamp of last build
+
+	// summarizer, when non-nil, enables auto-compression.
+	summarizer *memory.Summarizer
+
+	// subAgentSem limits concurrent sub-agent launches. nil = unlimited.
+	subAgentSem chan struct{}
 }
 
 // SetChatOptions overrides the per-request sampling parameters
@@ -153,6 +159,21 @@ func New(cfg *config.Config, llmClient *llm.Client, styleMgr *style.Manager, sto
 // SendMessageRequest.Attachments may be non-empty).
 func (a *Agent) SetAttachmentResolver(r AttachmentResolver) {
 	a.attach = r
+}
+
+// SetSummarizer wires the summarizer for auto-compression support.
+func (a *Agent) SetSummarizer(sm *memory.Summarizer) {
+	a.summarizer = sm
+}
+
+// SetSubAgentConcurrency limits the number of concurrently executing
+// sub-agent task calls. max <= 0 means unlimited (default).
+func (a *Agent) SetSubAgentConcurrency(max int) {
+	if max > 0 {
+		a.subAgentSem = make(chan struct{}, max)
+	} else {
+		a.subAgentSem = nil
+	}
 }
 
 // protocolFor returns the configured protocol ("openai" /
@@ -577,11 +598,19 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 			}
 		}
 		if hasWiki {
-			sb.WriteString("\n\n---\n\n## Using wiki_lookup\n\n" +
-				"使用 `wiki_lookup(title=\"...\")` 按标题检索知识库结构化条目。\n" +
-				"适用场景：查阅文档特定章节、获取已知条目的完整内容。\n" +
-				"支持模糊匹配，不需要输入精确标题。\n" +
-				"先用 `wiki_index` 浏览知识库目录确认有哪些条目，再按需检索。\n")
+			sb.WriteString("\n\n---\n\n## Using Knowledge Base (wiki_lookup / wiki_index)\n\n" +
+				"**何时必须查询知识库：**\n" +
+				"- 用户询问项目相关概念、设计、架构、配置、API、流程等任何专业问题时，**优先查询知识库**，而非仅凭训练数据回答。\n" +
+				"- 系统提示中已包含知识库索引概览；如果索引中有相关条目，直接使用 wiki_lookup 检索。\n" +
+				"\n**工具使用规则：**\n" +
+				"- `wiki_index` — 仅用于**初次**浏览知识库结构，**最多调用 1 次**。如果入口过多，用 query 参数过滤（如 query=\"配置\"）。\n" +
+				"- `wiki_lookup(title=\"...\")` — 按标题检索完整内容。支持模糊匹配。收到 wiki_index 结果后，**直接用 wiki_lookup 获取感兴趣条目**。\n" +
+				"  - 如果一次 wiki_lookup 找到的信息不够，用不同 title 再查一次 — **不要**再回头调 wiki_index。\n" +
+				"  - 禁止用 wiki_index 来「搜索」内容 — wiki_index 只是目录，内容搜索用 wiki_lookup。\n" +
+				"\n**标准流程：**\n" +
+				"1. wiki_index(query=\"关键词\") → 获取相关条目标题列表（仅 1 次）\n" +
+				"2. wiki_lookup(title=\"条目标题\") → 获取完整内容（可多次，不同标题）\n" +
+				"3. 信息足够后直接回答 → 不需要再调用任何 wiki 工具\n")
 		}
 		if hasRecall {
 			sb.WriteString("\n\n---\n\n## Using recall\n\n" +
@@ -1172,6 +1201,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// call tools and is forced to give a text summary.
 		// See opencode's `runner/max-steps.ts:1-16`.
 		maxRounds := MaxRoundsDefault
+		// Per-request override (takes priority).
+		if req.MaxRounds > 0 {
+			maxRounds = req.MaxRounds
+		} else if a.cfg != nil && a.cfg.Limits.MaxRounds > 0 {
+			maxRounds = a.cfg.Limits.MaxRounds
+		}
 		if req.PlanMode {
 			var planTools []llm.ToolDef
 			for _, t := range toolDefs {
@@ -1209,11 +1244,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// with a "stuck" event rather than letting the LLM
 		// hammer the same failing call forever.
 		var (
-			stuckStreak   int
-			prevToolSig   string
-			prevErrored   bool
+			stuckStreak          int
+			prevToolSig          string
+			prevErrored          bool
+			wikiIndexCalls       int
+			sameToolErrName      string
+			sameToolErrCount     int
+			nearLimitWarningSent bool
 		)
 		const stuckThreshold = 3
+		const wikiIndexMaxCalls = 2
+		const sameToolErrMax = 4
 
 		for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
 			roundStart := time.Now()
@@ -1242,6 +1283,36 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// summary. See opencode's `runner/max-steps.ts:1-16`
 			// and `llm.ts:197-209`.
 			isLastRound := maxRounds > 0 && round >= maxRounds
+
+			// Pre-limit warning: when within 10 rounds of the
+			// cap, inject a gentle heads-up so the LLM can wrap
+			// up gracefully instead of being cut off abruptly.
+			// Only injected once — the flag ensures no spam.
+			if !nearLimitWarningSent && maxRounds > 10 && round >= maxRounds-10 && !isLastRound {
+				nearLimitWarningSent = true
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("注意：当前会话轮次即将达到上限（%d 轮，剩余约 %d 轮）。请开始收尾当前任务，优先完成最关键的未完成工作，避免开启需要多轮的新子任务。", maxRounds, maxRounds-round),
+				})
+				ch <- ChatStreamChunk{
+					Phase:    "llm",
+					Step:     "near-limit",
+					Message:  fmt.Sprintf("轮次接近上限（剩余 %d 轮），提醒 LLM 收尾", maxRounds-round),
+					Round:    roundNum,
+					MaxRound: maxRounds,
+				}
+			}
+
+			// Auto-compact before LLM call (skip on last round).
+			// If the context exceeds the token budget, compress
+			// and rebuild the system prompt so the provider call
+			// doesn't fail with a 413. On the last round tools
+			// are disabled anyway so compact isn't worth it.
+			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds) {
+				continue
+			}
+
 			roundMsgs := msgs
 			roundTools := toolDefs
 			if isLastRound {
@@ -1255,28 +1326,54 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				ch <- ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds}
 			}
 
-			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, normalizeToolResults(roundMsgs), roundTools, opts)
-			for chunk := range stream {
-				if chunk.Err != nil {
-					classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
-					errMsg, errSuggestion, errKind := chunk.Err.Error(), "", ""
-					if apiErr, ok := classified.(*llm.APIError); ok {
-						errMsg = apiErr.Message
-						errSuggestion = apiErr.Suggestion
-						errKind = apiErr.Kind.String()
-					}
+			// LLM stream with retry for recoverable errors
+			// (rate_limit, server_error, network, timeout).
+			const maxLLMRetries = 3
+			var retryableErr error
+			att:
+			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
+				if attempt > 1 {
+					backoff := time.Duration(attempt*attempt) * time.Second
 					ch <- ChatStreamChunk{
-						Phase:      "llm",
-						Error:      errMsg,
-						Suggestion: errSuggestion,
-						ErrorKind:  errKind,
-						Done:       true,
+						Phase:    "llm",
+						Step:     "retry",
+						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt, maxLLMRetries),
+						Round:    roundNum,
+						MaxRound: maxRounds,
 					}
-					return
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
 				}
-				if chunk.Done {
-					break
-				}
+
+				stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, normalizeToolResults(roundMsgs), roundTools, opts)
+				for chunk := range stream {
+					if chunk.Err != nil {
+						classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
+						errMsg, errSuggestion, errKind := chunk.Err.Error(), "", ""
+						if apiErr, ok := classified.(*llm.APIError); ok {
+							errMsg = apiErr.Message
+							errSuggestion = apiErr.Suggestion
+							errKind = apiErr.Kind.String()
+							if isRetryable(apiErr.Kind) && attempt < maxLLMRetries {
+								retryableErr = chunk.Err
+								break // break inner stream loop, retry outer
+							}
+						}
+						ch <- ChatStreamChunk{
+							Phase:      "llm",
+							Error:      errMsg,
+							Suggestion: errSuggestion,
+							ErrorKind:  errKind,
+							Done:       true,
+						}
+						return
+					}
+					if chunk.Done {
+						break att // success — break outer loop too
+					}
 				if chunk.TokensIn > 0 || chunk.TokensOut > 0 {
 					if chunk.TokensIn > totalIn {
 						totalIn = chunk.TokensIn
@@ -1310,7 +1407,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 					existing.ArgsJSON += tcd.ArgsJSON
 				}
+				} // inner for chunk
+			} // outer for attempt (retry loop)
+
+			// If we exhausted retries without success, surface the last error.
+			if retryableErr != nil {
+				ch <- ChatStreamChunk{
+					Phase: "llm",
+					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", maxLLMRetries, retryableErr),
+					Done:  true,
+				}
+				return
 			}
+
 			for _, t := range argsAccum {
 				toolCalls = append(toolCalls, *t)
 			}
@@ -1391,16 +1500,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				return
 			}
 
-			// Context window warning: count only meaningful
-			// messages (exclude tool_call/tool_result metadata).
-			meaningful := countMeaningfulMessages(msgs)
-			if meaningful > 120 {
+			// Auto-compact: estimate token budget before the
+			// next LLM turn. If the total estimated tokens
+			// exceed the usable context window, compress the
+			// oldest messages and continue. Mirrors opencode's
+			// `compactIfNeeded()` + Claude Code's auto-compact.
+			if a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds) {
 				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
-				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条有效消息，接近上限，已自动停止。建议执行 /compress 压缩历史后继续。", meaningful), Round: roundNum, MaxRound: maxRounds}
-				ch <- ChatStreamChunk{Done: true}
-				return
-			} else if meaningful > 80 {
-				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条有效消息，建议在完成当前任务后执行 /compress 压缩历史。", meaningful), Round: roundNum, MaxRound: maxRounds}
+				continue
 			}
 
 			ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds}
@@ -1517,6 +1624,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					defer wg.Done()
 					defer cancel()
 					defer close(eventCh)
+
+					// Sub-agent concurrency gate: if the
+					// semaphore is set, only N task calls
+					// can run in parallel. Other tools are
+					// not limited.
+					if tc.Name == "task" && a.subAgentSem != nil {
+						select {
+						case a.subAgentSem <- struct{}{}:
+							defer func() { <-a.subAgentSem }()
+						case <-ctx.Done():
+							return
+						}
+					}
 
 					handler, ok := a.tools.Get(tc.Name)
 					if !ok {
@@ -1711,7 +1831,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// user-facing error messages.
 				llmContent = fmt.Sprintf("Tool %s returned an error: %s", tc.Name, result.Content)
 			} else {
-				llmContent = truncateToolResult(tc.Name, result.Content)
+				llmContent = a.truncateToolResult(tc.Name, result.Content)
 			}
 				toolMsg := llm.ChatMessage{
 					Role:      llm.RoleTool,
@@ -1759,6 +1879,67 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				ch <- ChatStreamChunk{Done: true}
 				return
 			}
+
+			// wiki_index frequency guard: after N calls,
+			// inject a system message telling the LLM to
+			// stop listing the index and use wiki_lookup
+			// for precise retrieval.
+			for _, tc := range toolCalls {
+				if tc.Name == "wiki_index" {
+					wikiIndexCalls++
+				}
+			}
+			if wikiIndexCalls > wikiIndexMaxCalls {
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("你已调用 wiki_index %d 次，已达上限。禁止再次调用 wiki_index。请直接使用 wiki_lookup(title=\"条目标题\") 检索具体条目的完整内容，或直接基于已有信息回答用户。", wikiIndexCalls),
+				})
+				ch <- ChatStreamChunk{
+					Phase:   "limit",
+					Step:    "wiki-index-limit",
+					Message: fmt.Sprintf("wiki_index 已调用 %d 次，超过上限。改用 wiki_lookup 检索。", wikiIndexCalls),
+					Round:   roundNum,
+				}
+			}
+
+			// Same-tool-name error counter: if a single tool
+			// errors N times in a row (even with different
+			// args — the stuck-loop guard only catches
+			// identical-args loops), inject a system message
+			// telling the LLM to stop retrying.
+			if roundAnyToolErrored && len(toolCalls) == 1 {
+				name := toolCalls[0].Name
+				if name == sameToolErrName {
+					sameToolErrCount++
+				} else {
+					sameToolErrName = name
+					sameToolErrCount = 1
+				}
+			} else {
+				sameToolErrName = ""
+				sameToolErrCount = 0
+			}
+			if sameToolErrCount >= sameToolErrMax {
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("工具 `%s` 已连续失败 %d 次。不要重试 — 改用其他方式完成任务（如 read_file、list_files、或 task 子代理）。", sameToolErrName, sameToolErrCount),
+				})
+				ch <- ChatStreamChunk{
+					Phase:   "limit",
+					Step:    "same-tool-err-limit",
+					Message: fmt.Sprintf("%s 已连续失败 %d 次，改用其他方式。", sameToolErrName, sameToolErrCount),
+					Round:   roundNum,
+				}
+				sameToolErrCount = 0
+			}
+
+			// Tool result pruning: remove old tool output content
+			// after N rounds to keep the context lean. Protects
+			// the most recent rounds so the LLM still sees
+			// immediately-relevant results.
+			pruneOldToolResults(msgs, roundNum, 15)
 		}
 
 		if maxRounds > 0 {
@@ -1797,19 +1978,6 @@ func normalizeToolResults(msgs []llm.ChatMessage) []llm.ChatMessage {
 		out = append(out, m)
 	}
 	return out
-}
-
-// countMeaningfulMessages counts messages that contribute to the
-// context window (excludes tool_call/tool_result metadata rows).
-func countMeaningfulMessages(msgs []llm.ChatMessage) int {
-	n := 0
-	for _, m := range msgs {
-		if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
-			continue
-		}
-		n++
-	}
-	return n
 }
 
 func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int) {
@@ -1870,6 +2038,87 @@ func availableToolNames(tools []tool.Tool) string {
 // hammering the same failing call. Returns "" if there are
 // no tool calls (a "no progress" round is not a stuck round —
 // the LLM may have answered with text).
+// tryAutoCompact checks the message list's estimated token count
+// against the usable context window. If exceeded and a summarizer is
+// available, it compresses the oldest messages, backfills the summary
+// into the system prompt, emits a status chunk, and returns true
+// ("caller should continue to the next round"). Returns false when no
+// compaction is needed or no summarizer is wired.
+func (a *Agent) tryAutoCompact(
+	ctx context.Context,
+	msgs *[]llm.ChatMessage,
+	req ChatRequest,
+	ch chan<- ChatStreamChunk,
+	roundNum, maxRounds int,
+) bool {
+	if a.summarizer == nil || a.store == nil || req.SessionID == "" {
+		return false
+	}
+	total := llm.EstimateTokensMessages(*msgs)
+	ctxWindow := a.llm.ContextWindow(req.Provider, req.Model)
+	buf := llm.AutoCompactBuffer
+	if a.cfg != nil && a.cfg.Limits.AutoCompactBuffer > 0 {
+		buf = a.cfg.Limits.AutoCompactBuffer
+	}
+	if !llm.ShouldCompactWithBuf(total, ctxWindow, buf) {
+		return false
+	}
+
+	ch <- ChatStreamChunk{
+		Phase:    "compact",
+		Step:     "auto-compact",
+		Message:  fmt.Sprintf("上下文接近上限 (≈%d / %d tokens)，自动压缩历史…", total, llm.UsableContextWithBuf(ctxWindow, buf)+buf),
+		Round:    roundNum,
+		MaxRound: maxRounds,
+	}
+
+	ok, summary, err := a.summarizer.Compress(ctx, req.SessionID)
+	if err != nil || !ok {
+		ch <- ChatStreamChunk{
+			Phase:   "compact",
+			Step:    "auto-compact-fail",
+			Message: fmt.Sprintf("自动压缩失败: %v", err),
+			Round:   roundNum,
+			MaxRound: maxRounds,
+		}
+		return false
+	}
+
+	ch <- ChatStreamChunk{
+		Phase:   "compact",
+		Step:    "auto-compact-ok",
+		Message: "上下文已压缩，继续执行…",
+		Round:   roundNum,
+		MaxRound: maxRounds,
+	}
+
+	// Backfill: reload messages after compression point and
+	// append the summary to the system prompt.
+	lastComp := a.store.LastCompressedIDFor(req.SessionID)
+	if lastComp > 0 {
+		hist, _, _ := a.store.GetChatMessagesAfterIDFor(req.SessionID, 200, lastComp)
+		compSum := a.store.CompressedSummaryFor(req.SessionID)
+
+		newMsgs := make([]llm.ChatMessage, 0, len(hist)+2)
+		// Keep the system prompt (first message).
+		newMsgs = append(newMsgs, (*msgs)[0])
+		if compSum != "" {
+			newMsgs[0].Content += "\n\n[前文摘要]\n" + compSum
+		}
+		// Append messages from DB (after compression point).
+		for _, m := range hist {
+			if m.Role == llm.RoleSystem || m.Type == llm.TypeToolCall {
+				continue
+			}
+			newMsgs = append(newMsgs, m)
+		}
+		*msgs = newMsgs
+	}
+
+	_ = summary
+	return true
+}
+
 func toolCallSignature(calls []nativeToolCall) string {
 	if len(calls) == 0 {
 		return ""
@@ -1907,7 +2156,7 @@ func toolCallSignature(calls []nativeToolCall) string {
 // tool blocks, and the model is forced into text-only mode).
 const MaxStepsPrompt = `CRITICAL - MAXIMUM STEPS REACHED
 
-The maximum number of steps allowed for this task has been reached. Tools are disabled for this turn. Respond with text only.
+The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.
 
 STRICT REQUIREMENTS:
 1. Do NOT make any tool calls (no reads, writes, edits, searches, or any other tools)
@@ -1922,12 +2171,12 @@ Response must include:
 
 Respond in the same language as the conversation. Any attempt to use tools is a critical violation. Respond with text ONLY.`
 
-// MaxRoundsDefault is the implicit per-session cap when the
-// caller does not specify maxRounds (build mode). Prevents
-// infinite loops in the rare case where the LLM keeps
-// retrying the same failing tool call. The /compress slash
-// command is the user's escape hatch once the cap fires.
-const MaxRoundsDefault = 30
+// MaxRoundsDefault is the safety-net per-session cap (build mode).
+// At 300 rounds this is a last-resort guard against infinite loops;
+// normal conversations are limited by the auto-compaction token budget,
+// not by round count. When the cap fires the LLM responds with
+// MaxStepsPrompt and the user can continue with a follow-up message.
+const MaxRoundsDefault = 300
 
 const (
 	// Tool result caps keep the LLM context and SQLite
@@ -1949,8 +2198,23 @@ const (
 	maxToolResultDefault = 6000
 )
 
-func truncateToolResult(name string, content string) string {
-	if len(content) <= maxToolResultDefault {
+func (a *Agent) truncateToolResult(name string, content string) string {
+	execCap := maxToolResultExec
+	readCap := maxToolResultRead
+	defaultCap := maxToolResultDefault
+	if a.cfg != nil {
+		if a.cfg.Limits.ToolResultExecCap > 0 {
+			execCap = a.cfg.Limits.ToolResultExecCap
+		}
+		if a.cfg.Limits.ToolResultReadCap > 0 {
+			readCap = a.cfg.Limits.ToolResultReadCap
+		}
+		if a.cfg.Limits.ToolResultDefaultCap > 0 {
+			defaultCap = a.cfg.Limits.ToolResultDefaultCap
+		}
+	}
+
+	if len(content) <= defaultCap {
 		return content
 	}
 
@@ -1958,12 +2222,12 @@ func truncateToolResult(name string, content string) string {
 	keepHead := true
 	switch name {
 	case "exec_command", "bash", "shell":
-		cap_ = maxToolResultExec
+		cap_ = execCap
 		keepHead = false
 	case "read_file", "list_files", "recall":
-		cap_ = maxToolResultRead
+		cap_ = readCap
 	default:
-		cap_ = maxToolResultDefault
+		cap_ = defaultCap
 	}
 
 	if len(content) <= cap_ {
@@ -2105,4 +2369,49 @@ func redactPhantomErrors(s string) (string, bool) {
 	}
 	out := phantomVisionErrorRe.ReplaceAllString(s, phantomVisionErrorReplacement)
 	return out, out != s
+}
+
+// isRetryable returns true for API error kinds that are transient and
+// warrant a retry with backoff.
+func isRetryable(kind llm.ErrorKind) bool {
+	switch kind {
+	case llm.KindRateLimit, llm.KindServer, llm.KindNetwork, llm.KindTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+const pruneAfterRounds = 15
+
+// pruneOldToolResults scans the message list backward and marks tool
+// results older than `keepRounds` as pruned. Each assistant+tool block
+// counts as one round. Recent tool results are left intact so the LLM
+// retains immediately-relevant context. Mirrors opencode's
+// PRUNE_PROTECT / PRUNE_MINIMUM pattern.
+func pruneOldToolResults(msgs []llm.ChatMessage, currentRound, keepRounds int) {
+	if len(msgs) == 0 || currentRound <= keepRounds {
+		return
+	}
+	// Count backward to find the round cutoff.
+	pruneBefore := currentRound - keepRounds
+	roundCount := 0
+	cutoff := len(msgs) - 1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := &msgs[i]
+		if m.Role == llm.RoleAssistant && m.Type == llm.TypeText {
+			roundCount++
+			if roundCount >= pruneBefore {
+				cutoff = i
+				break
+			}
+		}
+	}
+	// Prune tool results before the cutoff.
+	for i := 0; i < cutoff; i++ {
+		m := &msgs[i]
+		if m.Type == llm.TypeToolResult && m.Content != "" && !strings.HasPrefix(m.Content, "[pruned]") {
+			m.Content = "[pruned]"
+		}
+	}
 }

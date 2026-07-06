@@ -27,6 +27,33 @@ type Config struct {
 	SubAgent  SubAgentConfig  `json:"subagent"`
 	MCP       MCPConfig       `json:"mcp"`
 	Knowledge KnowledgeConfig `json:"knowledge"`
+	Limits    LimitsConfig    `json:"limits"`
+}
+
+// LimitsConfig controls resource caps for the agent loop.
+type LimitsConfig struct {
+	// AutoCompactBuffer is the token headroom reserved before
+	// auto-compression triggers. Default 20000.
+	AutoCompactBuffer int `json:"auto_compact_buffer"`
+	// ToolResultExecCap is the max output chars fed to the LLM
+	// from exec_command. Default 4000.
+	ToolResultExecCap int `json:"tool_result_exec_cap"`
+	// ToolResultReadCap is the max output chars from read_file.
+	// Default 8000.
+	ToolResultReadCap int `json:"tool_result_read_cap"`
+	// ToolResultDefaultCap is the max output chars for all other
+	// tools. Default 6000.
+	ToolResultDefaultCap int `json:"tool_result_default_cap"`
+	// PruneAfterRounds marks tool results older than this many
+	// rounds as [pruned]. Default 15. 0 = disable pruning.
+	PruneAfterRounds int `json:"prune_after_rounds"`
+	// MaxRounds overrides the agent's built-in safety-net round cap.
+	// Default 300. 0 = unlimited.
+	MaxRounds int `json:"max_rounds"`
+	// MaxStoredMessages caps the SQLite messages table. When set,
+	// messages beyond this count per conversation are deleted oldest-
+	// first. 0 = unlimited (default).
+	MaxStoredMessages int `json:"max_stored_messages"`
 }
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.

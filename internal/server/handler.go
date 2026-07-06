@@ -1677,6 +1677,11 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	c.Writer.Flush()
 
 	c.Stream(func(w io.Writer) bool {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[sse] panic in stream writer: %v", r)
+			}
+		}()
 		chunk, ok := <-stream
 		if !ok {
 			return false

@@ -1036,6 +1036,24 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   offEnd()
 }
 
+// streamWithRetry wraps streamMessages with up to 2 reconnect
+// attempts on stream failure (network errors, server restart).
+// Aborted streams and user-initiated stops are not retried.
+export async function streamMessagesRetry(sessionId: string, opts: SendOptions): Promise<void> {
+  const maxRetries = 2
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await streamMessages(sessionId, opts)
+      return
+    } catch (e: any) {
+      if (opts.signal?.aborted) return
+      if (attempt >= maxRetries) throw e
+      console.warn(`[stream] attempt ${attempt + 1} failed, retrying in ${(attempt + 1) * 2}s…`, e?.message || e)
+      await new Promise<void>(r => setTimeout(r, (attempt + 1) * 2000))
+    }
+  }
+}
+
 // ---- Knowledge API ----
 
 export interface KnowledgeConfig {

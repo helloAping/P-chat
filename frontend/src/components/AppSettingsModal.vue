@@ -984,10 +984,6 @@ let kbScanTimers: Record<string, ReturnType<typeof setInterval>> = {}
 
 const kbSections = ref<any[]>([])
 const kbSectionsLoading = ref(false)
-const newSectionTitle = ref('')
-const newSectionContent = ref('')
-const newSectionSource = ref('')
-const showAddSectionForm = ref(false)
 const sectionDetailVisible = ref(false)
 const sectionDetailData = ref<{ id: number; title: string; content: string; source: string } | null>(null)
 
@@ -996,7 +992,8 @@ async function refreshKB() {
     const cfg = await api.getKnowledgeConfig()
     kbEnabled.value = cfg.enabled
     kbAutoIndex.value = cfg.auto_index
-    kbBases.value = cfg.bases || []
+    // Use getKnowledgeBases for status-enriched base list.
+    kbBases.value = await api.getKnowledgeBases()
     if (!kbSelectedName.value && kbBases.value.length > 0) {
       kbSelectedName.value = kbBases.value[0].name
     } else if (kbSelectedName.value && !kbBases.value.find(b => b.name === kbSelectedName.value)) {
@@ -1134,24 +1131,6 @@ async function onDeleteSection(id: number, e?: Event) {
     }
     bumpKBConfigVersion()
   } catch (e: any) { message.error(`删除失败: ${e.message}`) }
-}
-
-async function onAddSection() {
-  if (!kbSelected.value || !newSectionTitle.value.trim()) return
-  try {
-    await api.addKnowledgeSection(kbSelected.value.name, {
-      title: newSectionTitle.value.trim(),
-      content: newSectionContent.value,
-      source: newSectionSource.value.trim() || '_manual_',
-    })
-    newSectionTitle.value = ''
-    newSectionContent.value = ''
-    newSectionSource.value = ''
-    await loadKBSections(kbSelected.value.name)
-    bumpKBConfigVersion()
-    showAddSectionForm.value = false
-    message.success('已添加')
-  } catch (e: any) { message.error(`添加失败: ${e.message}`) }
 }
 
 watch(kbSelectedName, (name) => {
@@ -1748,7 +1727,6 @@ function kbModelSupportsVision(scanModel: string) {
                     <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name) || !kbSelected.scan_model">
                       {{ scanningKBs.has(kbSelected.name) ? '扫描中...' : '扫描' }}
                     </NButton>
-                    </NButton>
                     <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>
                   </NSpace>
                 </div>
@@ -1839,20 +1817,11 @@ function kbModelSupportsVision(scanModel: string) {
                 <!-- Sections cards -->
                 <div style="display:flex;align-items:center;justify-content:space-between;margin:16px 0 8px">
                   <span style="font-size:13px;font-weight:600">索引内容</span>
-                  <NButton size="tiny" quaternary @click="showAddSectionForm = !showAddSectionForm">{{ showAddSectionForm ? '收起' : '+ 添加条目' }}</NButton>
-                </div>
-
-                <!-- Add section form (collapsible) -->
-                <div v-if="showAddSectionForm" class="kb-config-card" style="margin-bottom:8px">
-                  <NInput v-model:value="newSectionTitle" size="tiny" placeholder="标题 *" style="margin-bottom:6px" />
-                  <NInput v-model:value="newSectionContent" type="textarea" size="tiny" placeholder="内容" :autosize="{ minRows: 2, maxRows: 4 }" style="margin-bottom:6px" />
-                  <NInput v-model:value="newSectionSource" size="tiny" placeholder="来源（可选）" />
-                  <NButton size="tiny" type="primary" @click="onAddSection" :disabled="!newSectionTitle.trim()" style="margin-top:8px;width:100%">添加</NButton>
                 </div>
 
                 <!-- Sections loading / empty -->
                 <div v-if="kbSectionsLoading" class="muted" style="padding:16px;text-align:center">加载中...</div>
-                <div v-else-if="kbSections.length === 0 && !showAddSectionForm" class="muted" style="padding:16px;text-align:center">（暂无索引内容，请先扫描或手动添加）</div>
+                <div v-else-if="kbSections.length === 0" class="muted" style="padding:16px;text-align:center">（暂无索引内容，请先扫描）</div>
 
                 <!-- Section cards grid -->
                 <div v-if="kbSections.length > 0" class="kb-cards-grid">
