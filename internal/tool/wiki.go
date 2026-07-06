@@ -11,43 +11,74 @@ import (
 )
 
 type wikiLookupArgs struct {
-	Title string `json:"title"`
-	TopK  int    `json:"top_k,omitempty"`
-	Base  string `json:"base,omitempty"` // base name, "__all__", or "" = current session base
-}
-
-type wikiIndexArgs struct {
-	Source string `json:"source,omitempty"`
-	Base   string `json:"base,omitempty"`
 	Query  string `json:"query,omitempty"`
+	Base   string `json:"base,omitempty"`
+	Expand bool   `json:"expand,omitempty"`
+	Level  int    `json:"level,omitempty"`
+	Page   int    `json:"page,omitempty"`
+	Size   int    `json:"size,omitempty"`
 }
 
-// RegisterWiki registers wiki_lookup and wiki_index tools.
+type wikiListArgs struct {
+	ParentID int `json:"parent_id"`
+	Page     int `json:"page,omitempty"`
+	Size     int `json:"size,omitempty"`
+}
+
+// RegisterWiki registers wiki_lookup and wiki_list tools.
 func RegisterWiki(r *Registry, cfg *config.Config) {
 	r.Register(Tool{
 		Name: "wiki_lookup",
-		Description: "从知识库中按标题检索结构化条目。base 参数指定知识库名称（留空=当前知识库，__all__=全部）。输入近似标题即可，支持模糊匹配。",
+		Description: "检索知识库，支持按关键词、标题或概览搜索，支持分页。query=空 浏览文件目录；query=关键词 搜索匹配条目；expand=true 同时返回正文。" +
+			"默认每页 20 条，按关联度降序排列。",
 		Parameters: ObjectSchema(map[string]any{
-			"title": StringProp("要检索的条目标题（可近似，支持模糊匹配）"),
-			"top_k": map[string]any{
-				"type":        "integer",
-				"description": "返回结果数，默认 5",
-				"minimum":     1,
-				"maximum":     10,
+			"query": StringProp("搜索词（可选，留空=浏览所有文件目录；输入关键词=搜索匹配的标题、关键词或概览）"),
+			"base":  StringProp("知识库名称（可选，留空或 __all__=全部）"),
+			"expand": map[string]any{
+				"type":        "boolean",
+				"description": "是否同时返回正文内容（默认 false）",
 			},
-			"base": StringProp("知识库名称（可选，留空使用当前会话选定的知识库，__all__ 搜索全部）"),
-		}, []string{"title"}),
+			"level": map[string]any{
+				"type":        "integer",
+				"description": "限定层级: 0=自动, 2=仅文件级, 3=仅章节级（默认 0）",
+				"minimum":     0,
+				"maximum":     3,
+			},
+			"page": map[string]any{
+				"type":        "integer",
+				"description": "页码，从 1 开始（默认 1）",
+				"minimum":     1,
+			},
+			"size": map[string]any{
+				"type":        "integer",
+				"description": "每页条数（默认 20，上限 50）",
+				"minimum":     1,
+				"maximum":     50,
+			},
+		}, nil),
 	}, makeWikiLookupHandler(cfg))
 
 	r.Register(Tool{
-		Name:        "wiki_index",
-		Description: "列出知识库条目目录，支持按关键词过滤。base 参数指定知识库名称。query 参数提供关键词过滤（如不提供则列出全部）。禁止反复调用 — 一次调用即可获取所需条目的标题列表。",
+		Name:        "wiki_list",
+		Description: "列出指定节点下的子节点列表。用于浏览某个文件内的所有章节，或展开查看某个章节的内容片段。",
 		Parameters: ObjectSchema(map[string]any{
-			"source": StringProp("可选，指定文件名（如 AGENTS.md）只列出该文件的章节，留空列出全部"),
-			"base":   StringProp("知识库名称（可选，留空使用当前会话选定的知识库）"),
-			"query":  StringProp("可选，按关键词过滤条目（如 \"配置\"、\"API\"），与 wiki_lookup 的 title 参数不同，query 只过滤标题列表"),
-		}, nil),
-	}, makeWikiIndexHandler(cfg))
+			"parent_id": map[string]any{
+				"type":        "integer",
+				"description": "父节点 id（L1=1 列出所有文件，L2 节点的 id 列出该文件所有章节）",
+			},
+			"page": map[string]any{
+				"type":        "integer",
+				"description": "页码（默认 1）",
+				"minimum":     1,
+			},
+			"size": map[string]any{
+				"type":        "integer",
+				"description": "每页条数（默认 50，上限 100）",
+				"minimum":     1,
+				"maximum":     100,
+			},
+		}, []string{"parent_id"}),
+	}, makeWikiListHandler(cfg))
 }
 
 func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
@@ -56,11 +87,11 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 		if err := json.Unmarshal(argsRaw, &a); err != nil {
 			return &CallResult{Content: "参数错误: " + err.Error(), IsError: true}, nil
 		}
-		if a.Title == "" {
-			return &CallResult{Content: "title 不能为空", IsError: true}, nil
+		if a.Page <= 0 {
+			a.Page = 1
 		}
-		if a.TopK <= 0 {
-			a.TopK = 5
+		if a.Size <= 0 || a.Size > 50 {
+			a.Size = 20
 		}
 
 		kc := cfg.Knowledge
@@ -73,7 +104,8 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			return &CallResult{Content: "知识库未配置或不可用", IsError: true}, nil
 		}
 
-		var all []knowledge.WikiSection
+		// Collect results across all selected bases.
+		var merged *knowledge.IndexSearchResult
 		for _, base := range basesToSearch {
 			if !base.Enabled {
 				continue
@@ -82,166 +114,140 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			if err != nil {
 				continue
 			}
-			results, err := store.SearchFTS(ctx, a.Title, a.TopK)
+			res, err := store.LookupSearch(ctx, a.Query, base.Name, a.Expand, a.Level, a.Page, a.Size)
 			if err != nil {
 				continue
 			}
-			all = append(all, results...)
-			if len(all) >= a.TopK {
-				break
-			}
-		}
-		if len(all) > a.TopK {
-			all = all[:a.TopK]
-		}
-
-		if len(all) == 0 {
-			return &CallResult{Content: fmt.Sprintf("(未找到与 \"%s\" 相关的条目)", a.Title)}, nil
-		}
-
-		var b strings.Builder
-		fmt.Fprintf(&b, "## wiki_lookup: \"%s\" (%d results)\n\n", a.Title, len(all))
-		for _, r := range all {
-			content := r.Content
-			if len(content) > 800 {
-				content = content[:800] + "\n...(truncated)"
-			}
-			fmt.Fprintf(&b, "### %s\n*Source: %s*\n\n%s\n\n", r.Title, r.Source, content)
-		}
-		return &CallResult{Content: b.String()}, nil
-	}
-}
-
-func makeWikiIndexHandler(cfg *config.Config) ToolHandler {
-	return func(ctx context.Context, argsRaw json.RawMessage) (*CallResult, error) {
-		var a wikiIndexArgs
-		if argsRaw != nil {
-			if err := json.Unmarshal(argsRaw, &a); err != nil {
-				return &CallResult{Content: "参数错误: " + err.Error(), IsError: true}, nil
-			}
-		}
-		kc := cfg.Knowledge
-		if !kc.Enabled {
-			return &CallResult{Content: "知识库未启用", IsError: true}, nil
-		}
-
-		basesToSearch := resolveBases(kc, a.Base)
-		if len(basesToSearch) == 0 {
-			return &CallResult{Content: "知识库未配置或不可用", IsError: true}, nil
-		}
-
-		var all []knowledge.WikiSection
-		for _, base := range basesToSearch {
-			if !base.Enabled {
-				continue
-			}
-			store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
-			if err != nil {
-				continue
-			}
-			if a.Query != "" {
-				results, err := store.SearchFTS(ctx, a.Query, 100)
-				if err != nil {
-					continue
-				}
-				all = append(all, results...)
+			if merged == nil {
+				merged = res
 			} else {
-				sections, err := store.ListBase(ctx, "")
-				if err != nil {
-					continue
-				}
-				all = append(all, sections...)
+				merged.Total += res.Total
+				merged.HasMore = merged.HasMore || res.HasMore
+				merged.Items = append(merged.Items, res.Items...)
 			}
 		}
-
-		if a.Source != "" {
-			var filtered []knowledge.WikiSection
-			for _, s := range all {
-				if strings.Contains(s.Source, a.Source) {
-					filtered = append(filtered, s)
-				}
-			}
-			all = filtered
-		}
-
-		if len(all) == 0 {
-			if a.Query != "" {
-				return &CallResult{Content: fmt.Sprintf("(未找到与 \"%s\" 相关的条目)", a.Query)}, nil
-			}
+		if merged == nil || merged.Total == 0 {
 			return &CallResult{Content: "(知识库为空，尚未扫描)"}, nil
 		}
 
 		var b strings.Builder
-		if a.Query != "" {
-			fmt.Fprintf(&b, "## Wiki Index (query: \"%s\", %d sections)\n\n", a.Query, len(all))
+		if a.Query == "" {
+			fmt.Fprintf(&b, "## Wiki Directory (%d files, page %d/%d)\n\n", merged.Total, merged.Page, (merged.Total+merged.Size-1)/merged.Size)
 		} else {
-			fmt.Fprintf(&b, "## Wiki Index (%d sections)\n\n", len(all))
+			fmt.Fprintf(&b, "## wiki_lookup: \"%s\" (%d results, page %d)\n\n", a.Query, merged.Total, merged.Page)
 		}
-		currentSource := ""
-		printed := make(map[int]bool)
-		const softLimit = 5000
-		shown := 0
-		truncated := false
-		for i, s := range all {
-			if printed[i] {
-				continue
+		for _, it := range merged.Items {
+			if it.Parent != nil {
+				fmt.Fprintf(&b, "### %s / %s\n", it.Parent.Title, it.Title)
+			} else {
+				fmt.Fprintf(&b, "### %s\n", it.Title)
 			}
-			if s.Source != currentSource {
-				if b.Len() > softLimit {
-					truncated = true
-					break
+			if it.Keywords != "" {
+				fmt.Fprintf(&b, "*关键词: %s*\n", it.Keywords)
+			}
+			if it.Overview != "" {
+				overview := it.Overview
+				if len(overview) > 500 {
+					overview = overview[:500] + "..."
 				}
-				fmt.Fprintf(&b, "### %s\n", s.Source)
-				currentSource = s.Source
+				fmt.Fprintf(&b, "%s\n", overview)
 			}
-			indent := ""
-			if s.Heading != "" {
-				indent = "··"
+			if it.Rank > 0 {
+				fmt.Fprintf(&b, "*(relevance: %.2f)*\n", it.Rank)
 			}
-			kw := extractKeywords(s.Content)
-			line := fmt.Sprintf("%s- %s", indent, s.Title)
-			if kw != "" {
-				line += fmt.Sprintf(" ← %s", kw)
-			}
-			fmt.Fprintf(&b, "  %s\n", line)
-			shown++
-
-			for j := i + 1; j < len(all); j++ {
-				sub := all[j]
-				if printed[j] {
-					continue
-				}
-				if sub.Heading == s.Title && sub.Source == s.Source {
-					subKw := extractKeywords(sub.Content)
-					subLine := fmt.Sprintf("    - %s", sub.Title)
-					if subKw != "" {
-						subLine += fmt.Sprintf(" ← %s", subKw)
+			if len(it.Children) > 0 {
+				b.WriteString("\n")
+				for _, c := range it.Children {
+					content := c.Content
+					if len(content) > 800 {
+						content = content[:800] + "\n...(truncated)"
 					}
-					fmt.Fprintf(&b, "  %s\n", subLine)
-					printed[j] = true
+					fmt.Fprintf(&b, "> %s\n\n", strings.ReplaceAll(content, "\n", "\n> "))
 				}
 			}
+			b.WriteString("\n")
 		}
-		if truncated {
-			fmt.Fprintf(&b, "\n*(截断 — 共 %d 条，显示 %d 条。用 wiki_lookup(title) 检索特定条目，或用 wiki_index(query=\"关键词\") 缩小范围)*\n", len(all), shown)
+		if merged.HasMore {
+			fmt.Fprintf(&b, "*(共 %d 条，继续翻页请用 page=%d)*\n", merged.Total, merged.Page+1)
 		}
 		return &CallResult{Content: b.String()}, nil
 	}
 }
 
-// extractKeywords parses the "关键词：" line from a formatted index entry.
-func extractKeywords(content string) string {
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "关键词：") || strings.HasPrefix(line, "关键词:") {
-			return strings.TrimPrefix(strings.TrimPrefix(line, "关键词："), "关键词:")
+func makeWikiListHandler(cfg *config.Config) ToolHandler {
+	return func(ctx context.Context, argsRaw json.RawMessage) (*CallResult, error) {
+		var a wikiListArgs
+		if err := json.Unmarshal(argsRaw, &a); err != nil {
+			return &CallResult{Content: "参数错误: " + err.Error(), IsError: true}, nil
 		}
+		if a.ParentID <= 0 {
+			return &CallResult{Content: "parent_id 必填", IsError: true}, nil
+		}
+		if a.Page <= 0 {
+			a.Page = 1
+		}
+		if a.Size <= 0 || a.Size > 100 {
+			a.Size = 50
+		}
+
+		kc := cfg.Knowledge
+		if !kc.Enabled {
+			return &CallResult{Content: "知识库未启用", IsError: true}, nil
+		}
+
+		// Search across all enabled bases.
+		var merged *knowledge.IndexSearchResult
+		for _, base := range kc.Bases {
+			if !base.Enabled {
+				continue
+			}
+			store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+			if err != nil {
+				continue
+			}
+			res, err := store.ListChildren(ctx, a.ParentID, a.Page, a.Size)
+			if err != nil {
+				continue
+			}
+			if res.Total == 0 {
+				continue
+			}
+			if merged == nil {
+				merged = res
+			} else {
+				merged.Total += res.Total
+				merged.HasMore = merged.HasMore || res.HasMore
+				merged.Items = append(merged.Items, res.Items...)
+			}
+		}
+		if merged == nil || merged.Total == 0 {
+			return &CallResult{Content: "(无子节点)"}, nil
+		}
+
+		var b strings.Builder
+		fmt.Fprintf(&b, "## Children of node %d (%d items)\n\n", a.ParentID, merged.Total)
+		for _, it := range merged.Items {
+			fmt.Fprintf(&b, "- **%s**", it.Title)
+			if it.Keywords != "" {
+				fmt.Fprintf(&b, " ← %s", it.Keywords)
+			}
+			if it.Overview != "" {
+				overview := it.Overview
+				if len(overview) > 200 {
+					overview = overview[:200] + "..."
+				}
+				fmt.Fprintf(&b, " — %s", overview)
+			}
+			fmt.Fprintf(&b, " *(id=%d, source=%s)*\n", it.ID, it.Source)
+		}
+		if merged.HasMore {
+			fmt.Fprintf(&b, "\n*(共 %d 条，继续翻页 page=%d)*\n", merged.Total, merged.Page+1)
+		}
+		return &CallResult{Content: b.String()}, nil
 	}
-	return ""
 }
 
 // resolveBases resolves a base name to KnowledgeBase entries.
-// "" = all enabled bases, "__all__" = all enabled, name = single match.
 func resolveBases(kc config.KnowledgeConfig, name string) []config.KnowledgeBase {
 	if name == "" || name == "__all__" {
 		var out []config.KnowledgeBase

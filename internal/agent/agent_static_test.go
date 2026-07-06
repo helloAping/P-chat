@@ -23,7 +23,7 @@ func TestBuildStaticSystemPrompt_CacheHit(t *testing.T) {
 	agt := New(cfg, llmClient, styleMgr, store, tools)
 
 	// First call: cache miss, builds the prompt.
-	p1, sig1, err := agt.buildStaticSystemPrompt(style.Tech, nil, "")
+	p1, sig1, err := 	agt.buildStaticSystemPrompt(style.Tech, nil, "", false)
 	if err != nil {
 		t.Fatalf("first build: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestBuildStaticSystemPrompt_CacheHit(t *testing.T) {
 	}
 
 	// Second call with the same args: cache hit (same sig).
-	p2, sig2, err := agt.buildStaticSystemPrompt(style.Tech, nil, "")
+	p2, sig2, err := 	agt.buildStaticSystemPrompt(style.Tech, nil, "", false)
 	if err != nil {
 		t.Fatalf("second build: %v", err)
 	}
@@ -55,8 +55,8 @@ func TestBuildStaticSystemPrompt_DifferentStyle(t *testing.T) {
 
 	agt := New(cfg, llmClient, styleMgr, store, tools)
 
-	p1, _, _ := agt.buildStaticSystemPrompt(style.Tech, nil, "")
-	p2, _, _ := agt.buildStaticSystemPrompt(style.Cute, nil, "")
+	p1, _, _ := 	agt.buildStaticSystemPrompt(style.Tech, nil, "", false)
+	p2, _, _ := 	agt.buildStaticSystemPrompt(style.Cute, nil, "", false)
 
 	if p1 == p2 {
 		t.Error("different styles should produce different prompts")
@@ -79,8 +79,8 @@ func TestBuildStaticSystemPrompt_DifferentTools(t *testing.T) {
 		{Name: "x", Description: "x"},
 	})
 
-	_, sig1, _ := agt.buildStaticSystemPrompt(style.Tech, nil, "")
-	_, sig2, _ := agt.buildStaticSystemPrompt(style.Tech, openAITools, "")
+	_, sig1, _ := 	agt.buildStaticSystemPrompt(style.Tech, nil, "", false)
+	_, sig2, _ := 	agt.buildStaticSystemPrompt(style.Tech, openAITools, "", false)
 	if sig1 == sig2 {
 		t.Error("different tool sets should produce different sigs")
 	}
@@ -107,7 +107,7 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	upgrade.SeedForTesting(store1.DB())
 	styleMgr, _ := style.NewManager(store1.DB())
 	a1 := New(cfgZh, llmClient, styleMgr, store1, tools)
-	pZh, _, _ := a1.buildStaticSystemPrompt(style.Tech, nil, "")
+	pZh, _, _ := a1.buildStaticSystemPrompt(style.Tech, nil, "", false)
 	if !contains(pZh, "简体中文") {
 		t.Error("Chinese language hint missing")
 	}
@@ -115,7 +115,7 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	store2, _ := memory.OpenAt(":memory:", 50)
 	defer store2.Close()
 	a2 := New(cfgEn, llmClient, styleMgr, store2, tools)
-	pEn, _, _ := a2.buildStaticSystemPrompt(style.Tech, nil, "")
+	pEn, _, _ := a2.buildStaticSystemPrompt(style.Tech, nil, "", false)
 	if !contains(pEn, "English") {
 		t.Error("English language hint missing")
 	}
@@ -127,7 +127,7 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	store3, _ := memory.OpenAt(":memory:", 50)
 	defer store3.Close()
 	a3 := New(cfgAuto, llmClient, styleMgr, store3, tools)
-	pAuto, _, _ := a3.buildStaticSystemPrompt(style.Tech, nil, "")
+	pAuto, _, _ := a3.buildStaticSystemPrompt(style.Tech, nil, "", false)
 	if !contains(pAuto, "same language as the conversation") {
 		t.Error("opencode-style language hint missing for auto mode")
 	}
@@ -151,7 +151,7 @@ func TestBuildStaticSystemPrompt_NoFabricatedErrorInstruction(t *testing.T) {
 	upgrade.SeedForTesting(store.DB())
 	styleMgr, _ := style.NewManager(store.DB())
 	a := New(cfg, llmClient, styleMgr, store, tools)
-	p, _, _ := a.buildStaticSystemPrompt(style.Tech, nil, "")
+	p, _, _ := a.buildStaticSystemPrompt(style.Tech, nil, "", false)
 	if contains(p, "更不要伪造") {
 		t.Error("prompt still contains the fabricated-error warning text; the LLM was echoing it back")
 	}

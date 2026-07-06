@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -104,6 +105,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if cfg.Knowledge.Enabled {
 		tool.RegisterGrep(toolReg, cfg)
 		tool.RegisterWiki(toolReg, cfg)
+		// Migrate legacy wiki_sections → three-level index_nodes.
+		var bases []knowledge.BaseRef
+		for _, b := range cfg.Knowledge.Bases {
+			bases = append(bases, knowledge.BaseRef{Name: b.Name, Path: b.Path, Enabled: b.Enabled})
+		}
+		knowledge.EnsureMigrated(bases)
 	}
 
 	// Build the sub-agent catalog. Three sources, in priority

@@ -719,6 +719,12 @@ func (h *Handler) startScanJob(name string) error {
 			return
 		}
 
+		// Build three-level index (L1/L2/L3/C) for prompt injection and search.
+		_, _, idxErr := h.indexScan(ctx, store, base, basePath, name)
+		if idxErr != nil {
+			log.Printf("[scan %s] index build: %v", name, idxErr)
+		}
+
 		// Process media files collected during the wikiScan walk.
 		if len(mediaFiles) > 0 && h.agent != nil {
 			log.Printf("[scan %s] processing %d media files with model %s", name, len(mediaFiles), base.ScanModel)
@@ -1287,4 +1293,264 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 		}
 	}
 	return out
+}
+
+// ── Three-level index scan pipeline ──
+// indexScan walks the base directory and generates L1/L2/L3 index nodes
+// plus ContentNode leaves for FTS5 searching and prompt injection.
+
+func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string) (int, int, error) {
+	if _, err := os.Stat(dir); err != nil {
+		return 0, 0, fmt.Errorf("stat %s: %w", dir, err)
+	}
+	dir, _ = filepath.Abs(dir)
+
+	// Phase 1: walk → collect L3 nodes + contents per file.
+	type fileData struct {
+		source   string
+		kind     string
+		nodes    []knowledge.IndexNode
+		contents []knowledge.ContentNode
+	}
+	var files []fileData
+	totalL3 := 0
+
+	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			name := info.Name()
+			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		kind := "text"
+		if knowledge.IsMediaFile(ext, []string{}) != "" {
+			return nil // Media handled separately.
+		}
+		if !knowledge.IndexableExtensions[ext] {
+			return nil
+		}
+		if info.Size() > 5*1024*1024 {
+			return nil
+		}
+		rel, _ := filepath.Rel(dir, path)
+		rel = filepath.ToSlash(rel)
+
+		text, readErr := knowledge.ReadFileText(path)
+		if readErr != nil {
+			return nil
+		}
+
+		// Build heading tree → L3 nodes.
+		roots := knowledge.BuildHeadingTree(text, 3)
+		var nodes []knowledge.IndexNode
+		var contents []knowledge.ContentNode
+		seq := 0
+		var walkNodes func([]*knowledge.HeadingNode)
+		walkNodes = func(list []*knowledge.HeadingNode) {
+			for _, node := range list {
+				if !node.HasContent() {
+					walkNodes(node.Children)
+					continue
+				}
+				aggregated := node.AggregatedContent()
+				title := node.Title
+				overview := truncateText(aggregated, 500)
+				keywords := ""
+				// If scan model is configured, generate keywords + overview via LLM.
+				if base.ScanModel != "" && h.agent != nil {
+					if idx, e := h.buildIndexEntry(ctx, base, node.Title, "", aggregated); e == nil && idx != "" {
+						keywords, overview = parseKWAndOverview(idx)
+					}
+				}
+				nodes = append(nodes, knowledge.IndexNode{
+					Level:     3,
+					Source:    rel,
+					Kind:      kind,
+					SortOrder: seq,
+					Title:     title,
+					Keywords:  keywords,
+					Overview:  overview,
+				})
+				seq++
+				// Content leaf.
+				content := truncateText(aggregated, 3000)
+				contents = append(contents, knowledge.ContentNode{
+					Content:     content,
+					ContentType: "text",
+					SortOrder:   0,
+				})
+				walkNodes(node.Children)
+			}
+		}
+		walkNodes(roots)
+
+		// Fallback: no headings → whole file as one L3.
+		if len(nodes) == 0 && text != "" {
+			title := rel
+			if idx := strings.LastIndex(rel, "/"); idx >= 0 {
+				title = rel[idx+1:]
+			}
+			overview := truncateText(text, 500)
+			nodes = append(nodes, knowledge.IndexNode{
+				Level:     3,
+				Source:    rel,
+				Kind:      kind,
+				SortOrder: 0,
+				Title:     title,
+				Keywords:  "",
+				Overview:  overview,
+			})
+			contents = append(contents, knowledge.ContentNode{
+				Content:     truncateText(text, 3000),
+				ContentType: "text",
+				SortOrder:   0,
+			})
+		}
+
+		if len(nodes) > 0 {
+			files = append(files, fileData{source: rel, kind: kind, nodes: nodes, contents: contents})
+			totalL3 += len(nodes)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		log.Printf("[index-scan %s] walk error: %v", baseName, walkErr)
+	}
+
+	// Phase 2: aggregate L2 per file.
+	l2Nodes := make([]knowledge.IndexNode, 0, len(files))
+	for fi, fd := range files {
+		titles := make([]string, 0, len(fd.nodes))
+		for _, n := range fd.nodes {
+			titles = append(titles, n.Title)
+		}
+		// Use filename as L2 title.
+		title := fd.source
+		if idx := strings.LastIndex(fd.source, "/"); idx >= 0 {
+			title = fd.source[idx+1:]
+		}
+		overview := fmt.Sprintf("%s (%d chapters)", title, len(fd.nodes))
+		// Aggregate L3 info into L2 overview line.
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("· %s — 关键词: %s — %s — %d 章节",
+			title, "", overview, len(fd.nodes)))
+		for _, n := range fd.nodes {
+			if len(n.Overview) > 0 {
+				sb.WriteString(" | " + n.Title)
+				break
+			}
+		}
+		l2Node := knowledge.IndexNode{
+			ParentID:  1, // Will be set to real L1 ID after insert.
+			Level:     2,
+			Source:    fd.source,
+			Kind:      fd.kind,
+			SortOrder: fi,
+			Title:     title,
+			Keywords:  "",
+			Overview:  sb.String(),
+		}
+		l2Nodes = append(l2Nodes, l2Node)
+	}
+
+	// Phase 3: place L1 node.
+	l1Overview := buildL1Overview(l2Nodes)
+	l1Node := knowledge.IndexNode{
+		ParentID:  0,
+		Base:      baseName,
+		Level:     1,
+		Title:     baseName,
+		Keywords:  "",
+		Overview:  l1Overview,
+		SortOrder: 0,
+	}
+
+	// Phase 4: assign IDs and write.
+	nextID := 1
+	l1Node.ID = nextID
+	nextID++
+	for i := range l2Nodes {
+		l2Nodes[i].ID = nextID
+		l2Nodes[i].ParentID = l1Node.ID
+		l2Nodes[i].Base = baseName
+		nextID++
+	}
+	var allContents []knowledge.ContentNode
+	for fi, fd := range files {
+		l2ID := l2Nodes[fi].ID
+		for i := range fd.nodes {
+			fd.nodes[i].ID = nextID
+			fd.nodes[i].ParentID = l2ID
+			fd.nodes[i].Base = baseName
+			nextID++
+		}
+		for i := range fd.contents {
+			fd.contents[i].NodeID = fd.nodes[i].ID
+		}
+		allContents = append(allContents, fd.contents...)
+	}
+	allL3s := make([]knowledge.IndexNode, 0, totalL3)
+	for _, fd := range files {
+		allL3s = append(allL3s, fd.nodes...)
+	}
+
+	allNodes := make([]knowledge.IndexNode, 0, 1+len(l2Nodes)+len(allL3s))
+	allNodes = append(allNodes, l1Node)
+	allNodes = append(allNodes, l2Nodes...)
+	allNodes = append(allNodes, allL3s...)
+
+	if err := store.ReplaceBaseNodes(ctx, baseName, allNodes, allContents); err != nil {
+		return 0, 0, fmt.Errorf("write index: %w", err)
+	}
+
+	log.Printf("[index-scan %s] indexed %d files → L1 + %d L2 + %d L3 + %d contents",
+		baseName, len(files), len(l2Nodes), len(allL3s), len(allContents))
+	return len(l2Nodes), len(allL3s), nil
+}
+
+func buildL1Overview(l2Nodes []knowledge.IndexNode) string {
+	if len(l2Nodes) == 0 {
+		return "[Knowledge Base]\n(no files indexed)\n"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[Knowledge Base] (%d files)\n", len(l2Nodes)))
+	count := 0
+	for _, l2 := range l2Nodes {
+		if sb.Len() > 2000 {
+			sb.WriteString(fmt.Sprintf("  ...(+%d files omitted)\n", len(l2Nodes)-count))
+			break
+		}
+		sb.WriteString(fmt.Sprintf("· %s\n", l2.Overview))
+		count++
+	}
+	return sb.String()
+}
+
+func parseKWAndOverview(indexed string) (keywords, overview string) {
+	// Parse "关键词: a, b, c" and "摘要: ..." from LLM output.
+	for _, line := range strings.Split(indexed, "\n") {
+		line = strings.TrimSpace(line)
+		if (strings.HasPrefix(line, "关键词：") || strings.HasPrefix(line, "关键词:")) && keywords == "" {
+			keywords = strings.TrimSpace(line[strings.IndexRune(line, ':')+1:])
+		}
+		if (strings.HasPrefix(line, "摘要：") || strings.HasPrefix(line, "摘要:")) && overview == "" {
+			overview = strings.TrimSpace(line[strings.IndexRune(line, ':')+1:])
+		}
+	}
+	if overview == "" {
+		overview = truncateText(indexed, 500)
+	}
+	return
+}
+
+func truncateText(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
 }

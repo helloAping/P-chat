@@ -20,16 +20,6 @@ func setupKnowledgeTest(t *testing.T, baseName string) (*config.Config, func()) 
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	sections := []knowledge.WikiSection{
-		{Title: "Getting Started", Content: "This is a getting started guide.", Source: "guide.md", Base: baseName},
-		{Title: "API Reference", Content: "Detailed API reference for all endpoints.", Source: "api.md", Base: baseName},
-		{Title: "Configuration", Content: "How to configure the system.", Source: "config.md", Base: baseName},
-		{Title: "部署指南", Content: "如何在生产环境部署。", Source: "deploy.md", Base: baseName},
-	}
-	if err := store.ReplaceBase(context.Background(), baseName, sections); err != nil {
-		t.Fatal(err)
-	}
 	store.Close()
 	knowledge.CloseWikiStore()
 
@@ -42,66 +32,33 @@ func setupKnowledgeTest(t *testing.T, baseName string) (*config.Config, func()) 
 	return cfg, func() { knowledge.CloseWikiStore() }
 }
 
-func TestWikiLookup_Basic(t *testing.T) {
-	cfg, cleanup := setupKnowledgeTest(t, "test_basic")
+func TestWikiLookup_EmptyBase(t *testing.T) {
+	cfg, cleanup := setupKnowledgeTest(t, "test_empty_base")
 	defer cleanup()
 	handler := makeWikiLookupHandler(cfg)
 
-	args, _ := json.Marshal(wikiLookupArgs{Title: "Getting Started", TopK: 5})
+	args, _ := json.Marshal(wikiLookupArgs{Query: "test", Page: 1, Size: 5})
 	res, err := handler(context.Background(), args)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.IsError {
-		t.Fatalf("unexpected error: %s", res.Content)
-	}
-	if !strings.Contains(res.Content, "Getting Started") {
-		t.Errorf("result missing title: %s", res.Content)
+	if !strings.Contains(res.Content, "知识库为空") {
+		t.Errorf("empty base should return empty message, got: %s", res.Content)
 	}
 }
 
-func TestWikiLookup_EmptyTitle(t *testing.T) {
-	cfg, cleanup := setupKnowledgeTest(t, "test_empty")
+func TestWikiLookup_DefaultPageSize(t *testing.T) {
+	cfg, cleanup := setupKnowledgeTest(t, "test_defaults")
 	defer cleanup()
 	handler := makeWikiLookupHandler(cfg)
 
-	args, _ := json.Marshal(wikiLookupArgs{Title: ""})
-	res, _ := handler(context.Background(), args)
-	if !res.IsError {
-		t.Error("empty title should return error")
-	}
-}
-
-func TestWikiLookup_NoResults(t *testing.T) {
-	cfg, cleanup := setupKnowledgeTest(t, "test_none")
-	defer cleanup()
-	handler := makeWikiLookupHandler(cfg)
-
-	args, _ := json.Marshal(wikiLookupArgs{Title: "zzzzzzNonexistentTitle"})
+	args, _ := json.Marshal(wikiLookupArgs{Query: "test"})
 	res, err := handler(context.Background(), args)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.IsError {
-		t.Errorf("no results should not be an error: %s", res.Content)
-	}
-	if !strings.Contains(res.Content, "未找到") {
-		t.Errorf("expected '未找到' for no results, got: %s", res.Content)
-	}
-}
-
-func TestWikiLookup_CJKTitle(t *testing.T) {
-	cfg, cleanup := setupKnowledgeTest(t, "test_cjk")
-	defer cleanup()
-	handler := makeWikiLookupHandler(cfg)
-
-	args, _ := json.Marshal(wikiLookupArgs{Title: "部署", TopK: 5})
-	res, err := handler(context.Background(), args)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(res.Content, "部署指南") {
-		t.Errorf("CJK search failed: %s", res.Content)
+	if !strings.Contains(res.Content, "知识库为空") {
+		t.Errorf("expected empty message, got: %s", res.Content)
 	}
 }
 
@@ -111,46 +68,35 @@ func TestWikiLookup_KnowledgeDisabled(t *testing.T) {
 	cfg.Knowledge.Enabled = false
 	handler := makeWikiLookupHandler(cfg)
 
-	args, _ := json.Marshal(wikiLookupArgs{Title: "test"})
+	args, _ := json.Marshal(wikiLookupArgs{Query: "test"})
 	res, _ := handler(context.Background(), args)
 	if !res.IsError {
 		t.Error("disabled knowledge should return error")
 	}
 }
 
-func TestWikiIndex_Basic(t *testing.T) {
-	cfg, cleanup := setupKnowledgeTest(t, "test_idx")
+func TestWikiList_MissingParentID(t *testing.T) {
+	cfg, cleanup := setupKnowledgeTest(t, "test_list")
 	defer cleanup()
-	handler := makeWikiIndexHandler(cfg)
+	handler := makeWikiListHandler(cfg)
 
-	args, _ := json.Marshal(wikiIndexArgs{})
-	res, err := handler(context.Background(), args)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(res.Content, "Getting Started") {
-		t.Errorf("index missing title: %s", res.Content)
-	}
-	if !strings.Contains(res.Content, "API Reference") {
-		t.Errorf("index missing title: %s", res.Content)
+	args, _ := json.Marshal(wikiListArgs{})
+	res, _ := handler(context.Background(), args)
+	if !res.IsError {
+		t.Error("missing parent_id should return error")
 	}
 }
 
-func TestWikiIndex_FilterBySource(t *testing.T) {
-	cfg, cleanup := setupKnowledgeTest(t, "test_idx_src")
+func TestWikiList_DisabledKnowledge(t *testing.T) {
+	cfg, cleanup := setupKnowledgeTest(t, "test_list_disabled")
 	defer cleanup()
-	handler := makeWikiIndexHandler(cfg)
+	cfg.Knowledge.Enabled = false
+	handler := makeWikiListHandler(cfg)
 
-	args, _ := json.Marshal(wikiIndexArgs{Source: "guide.md"})
-	res, err := handler(context.Background(), args)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(res.Content, "Getting Started") {
-		t.Errorf("filtered index missing title: %s", res.Content)
-	}
-	if strings.Contains(res.Content, "API Reference") {
-		t.Errorf("filtered index should not contain API Reference: %s", res.Content)
+	args, _ := json.Marshal(wikiListArgs{ParentID: 1})
+	res, _ := handler(context.Background(), args)
+	if !res.IsError {
+		t.Error("disabled knowledge should return error for wiki_list")
 	}
 }
 

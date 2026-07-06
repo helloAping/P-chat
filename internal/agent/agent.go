@@ -517,7 +517,7 @@ type ChatStreamChunk struct {
 // between rounds within a chat, AND between chats within a session. The
 // only thing that should change in this string is the underlying files
 // (AGENTS.md, rules, skills) or the chosen style.
-func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, projectRoot string) (string, string, error) {
+func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, projectRoot string, kbEnabled bool) (string, string, error) {
 	toolNames := make([]string, 0, len(toolDefs))
 	for _, t := range toolDefs {
 		toolNames = append(toolNames, t.Name)
@@ -525,6 +525,13 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	lang := ""
 	if a.cfg != nil {
 		lang = a.cfg.LLM.Output.Language
+	}
+	// Include kbEnabled in the signature so cached prompts that
+	// include wiki/grep instructions are not reused when KB is
+	// toggled off mid-conversation.
+	sigKB := "kb:0"
+	if kbEnabled {
+		sigKB = "kb:1"
 	}
 	sig := strings.Join([]string{
 		string(s),
@@ -534,6 +541,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		strings.Join(toolNames, ","),
 		lang,
 		projectRoot,
+		sigKB,
 	}, "|")
 	if sig == a.staticPromptID && a.staticPrompt != "" {
 		return a.staticPrompt, sig, nil
@@ -598,20 +606,21 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 				hasTodoWrite = true
 			}
 		}
-		if hasWiki {
-			sb.WriteString("\n\n---\n\n## Using Knowledge Base (wiki_lookup / wiki_index)\n\n" +
+		if hasWiki && kbEnabled {
+			sb.WriteString("\n\n---\n\n## Using Knowledge Base (wiki_lookup / wiki_list)\n\n" +
 				"**何时必须查询知识库：**\n" +
 				"- 用户询问项目相关概念、设计、架构、配置、API、流程等任何专业问题时，**优先查询知识库**，而非仅凭训练数据回答。\n" +
-				"- 系统提示中已包含知识库索引概览；如果索引中有相关条目，直接使用 wiki_lookup 检索。\n" +
+				"- 系统提示中已包含知识库索引概览（一级索引），根据概览定位相关文件后再检索。\n" +
 				"\n**工具使用规则：**\n" +
-				"- `wiki_index` — 仅用于**初次**浏览知识库结构，**最多调用 1 次**。如果入口过多，用 query 参数过滤（如 query=\"配置\"）。\n" +
-				"- `wiki_lookup(title=\"...\")` — 按标题检索完整内容。支持模糊匹配。收到 wiki_index 结果后，**直接用 wiki_lookup 获取感兴趣条目**。\n" +
-				"  - 如果一次 wiki_lookup 找到的信息不够，用不同 title 再查一次 — **不要**再回头调 wiki_index。\n" +
-				"  - 禁止用 wiki_index 来「搜索」内容 — wiki_index 只是目录，内容搜索用 wiki_lookup。\n" +
+				"- `wiki_lookup(query=\"\")` — 查询为空时，返回知识库中所有文件目录（L2 列表），按关联度排序。默认每页 20 条，可用 page 翻页。\n" +
+				"- `wiki_lookup(query=\"关键词\")` — 按关键词、标题或概览搜索条目，返回匹配的 L3 章节节点及其所属文件（L2 父节点）。\n" +
+				"- `wiki_lookup(query=\"...\", expand=true)` — 同时返回匹配条目的完整正文内容。\n" +
+				"- `wiki_list(parent_id=N)` — 列出父节点 N 下的所有子节点。L1（id=1）列出所有文件；L2 节点列出该文件所有章节。\n" +
 				"\n**标准流程：**\n" +
-				"1. wiki_index(query=\"关键词\") → 获取相关条目标题列表（仅 1 次）\n" +
-				"2. wiki_lookup(title=\"条目标题\") → 获取完整内容（可多次，不同标题）\n" +
-				"3. 信息足够后直接回答 → 不需要再调用任何 wiki 工具\n")
+				"1. 先看系统提示中的一级索引概览，找到可能相关的文件（L2）。\n" +
+				"2. 用 wiki_lookup 搜索关键词或浏览目录定位目标文件/章节。\n" +
+				"3. 用 wiki_lookup(query=\"...\", expand=true) 获取完整内容。\n" +
+				"4. 信息足够后直接回答 → 不需要再调用任何 wiki 工具。\n")
 		}
 		if hasRecall {
 			sb.WriteString("\n\n---\n\n## Using recall\n\n" +
@@ -778,14 +787,14 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 // sections, a placeholder is returned. The output is truncated at 3000
 // characters to avoid prompt explosion. Results are cached for 60s to
 // avoid repeated full-DB scans per message turn.
+// Uses the L1 overview from the three-level index tree.
 func (a *Agent) buildKBIndex(kbBase string) string {
 	nowUnix := time.Now().Unix()
 	if a.kbIndexCache != "" && a.kbIndexCacheKey == kbBase && (nowUnix-a.kbIndexCacheTime) < 60 {
 		return a.kbIndexCache
 	}
 
-	cfg := a.cfg
-	kc := cfg.Knowledge
+	kc := a.cfg.Knowledge
 	var bases []config.KnowledgeBase
 	if kbBase == "__all__" {
 		for _, b := range kc.Bases {
@@ -810,54 +819,19 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 	}
 
 	var sb strings.Builder
-
 	for _, base := range bases {
 		store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
 		if err != nil {
 			continue
 		}
-		sections, err := store.ListBase(context.Background(), "")
-		if err != nil || len(sections) == 0 {
+		overview, err := store.GetL1Overview(context.Background(), base.Name)
+		if err != nil || overview == "" {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("\n[Knowledge Base: %s]\n", base.Name))
-		sb.WriteString(fmt.Sprintf("Path: %s\n", base.Path))
-		sb.WriteString(fmt.Sprintf("Index (%d sections):\n", len(sections)))
-		sb.WriteString("(Use wiki_lookup(title) to retrieve full content)\n\n")
-
-		currentSource := ""
-		count := 0
-		for _, s := range sections {
-			if s.Source != currentSource {
-				if count > 0 {
-					sb.WriteString("\n")
-				}
-				sb.WriteString(fmt.Sprintf("  %s\n", s.Source))
-				currentSource = s.Source
-			}
-			indent := ""
-			if s.Heading != "" {
-				indent = "  "
-			}
-			summary := extractOverview(s.Content)
-			line := fmt.Sprintf("%s· %s", indent, s.Title)
-			if summary != "" {
-				line += fmt.Sprintf(" — %s", summary)
-			}
-			sb.WriteString(fmt.Sprintf("    %s\n", line))
-			count++
-
-			if sb.Len() > 3000 {
-				sb.WriteString(fmt.Sprintf("\n  ...(%d more sections omitted)\n", len(sections)-count))
-				sb.WriteString("\nTools: wiki_lookup(title) — search and retrieve section content.\n       grep(pattern) — line search within base files.\n")
-				result := sb.String()
-				a.kbIndexCache = result
-				a.kbIndexCacheKey = kbBase
-				a.kbIndexCacheTime = nowUnix
-				return result
-			}
-		}
+		// overview is pre-formatted by the scan pipeline as the L1 prompt content.
+		sb.WriteString(overview)
 	}
+
 	if sb.Len() == 0 {
 		result := "\n[Knowledge Base]\n(index empty — run a scan first)\n"
 		a.kbIndexCache = result
@@ -866,23 +840,14 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 		return result
 	}
 
-	sb.WriteString("\nTools: wiki_lookup(title) — search and retrieve section content.\n")
-	sb.WriteString("       grep(pattern) — line search within base files.\n")
+	// Append tool usage footer.
+	sb.WriteString("\n\n使用 wiki_lookup(query, page, size) 检索，默认 20 条/页。")
+	sb.WriteString("query=空 浏览目录；query=关键词 搜索匹配；expand=true 获取全文。")
 	result := sb.String()
 	a.kbIndexCache = result
 	a.kbIndexCacheKey = kbBase
 	a.kbIndexCacheTime = nowUnix
 	return result
-}
-
-func extractOverview(content string) string {
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "内容概览：") || strings.HasPrefix(line, "内容概览:") {
-			return strings.TrimPrefix(strings.TrimPrefix(line, "内容概览："), "内容概览:")
-		}
-	}
-	return ""
 }
 
 // Reload forces the next call to rebuild the static system prompt
@@ -1098,11 +1063,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 		ch <- ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."}
 		availableTools := a.tools.List()
-		// Remove wiki/grep tools when knowledge base is off.
-		if req.KBBase == "" || req.KBBase == "__off__" {
+		// Remove wiki tools when knowledge base is off. grep is a
+		// general-purpose search tool and remains available.
+		kbEnabled := req.KBBase != "" && req.KBBase != "__off__"
+		if !kbEnabled {
 			filtered := make([]tool.Tool, 0, len(availableTools))
 			for _, t := range availableTools {
-				if t.Name == "wiki_lookup" || t.Name == "wiki_index" || t.Name == "grep" {
+				if t.Name == "wiki_lookup" || t.Name == "wiki_list" {
 					continue
 				}
 				filtered = append(filtered, t)
@@ -1122,13 +1089,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		ch <- ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."}
-		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, req.ProjectRoot)
+		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, req.ProjectRoot, kbEnabled)
 		if err != nil {
 			ch <- ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true}
 			return
 		}
 		// Inject knowledge base context + index.
-		if req.KBBase != "" && req.KBBase != "__off__" {
+		if kbEnabled {
 			kbIndex := a.buildKBIndex(req.KBBase)
 			systemPrompt += kbIndex
 		}
@@ -1161,7 +1128,20 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		msgs := []llm.ChatMessage{
 			{Role: llm.RoleSystem, Type: llm.TypeText, Content: systemPrompt},
 		}
-		msgs = append(msgs, req.Messages...)
+		// When knowledge base is off, strip wiki-related messages
+		// (tool calls + results) from history so the LLM doesn't
+		// learn about wiki tools from previous turns
+		// and try to call them via text-format tool_call blocks.
+		if kbEnabled {
+			msgs = append(msgs, req.Messages...)
+		} else {
+			for _, m := range req.Messages {
+				if m.ToolName == "wiki_lookup" || m.ToolName == "wiki_list" {
+					continue
+				}
+				msgs = append(msgs, m)
+			}
+		}
 
 		// Expand any user-uploaded attachments into separate
 		// ChatMessage entries (text msg + image/file msgs).
@@ -1248,13 +1228,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			stuckStreak          int
 			prevToolSig          string
 			prevErrored          bool
-			wikiIndexCalls       int
 			sameToolErrName      string
 			sameToolErrCount     int
 			nearLimitWarningSent bool
 		)
 		const stuckThreshold = 3
-		const wikiIndexMaxCalls = 2
 		const sameToolErrMax = 4
 
 		for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
@@ -1651,6 +1629,24 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						return
 					}
 
+					// Refuse wiki/grep tools when knowledge base is
+					// disabled for this session. The tools may still
+					// be registered globally (KB enabled at startup)
+					// but are blocked at dispatch time so the LLM
+					// cannot call them via text-format tool_call
+					// blocks even if they appear in conversation
+					// history from a previous KB-enabled turn.
+					if !kbEnabled && (tc.Name == "wiki_lookup" || tc.Name == "wiki_list") {
+						errMsg := fmt.Sprintf("error: knowledge base is disabled for this session — enable it in settings to use %s", tc.Name)
+						outcomes[i] = toolOutcome{
+							idx:    i,
+							tc:     tc,
+							result: &tool.CallResult{Content: errMsg, IsError: true},
+							err:    fmt.Errorf("kb disabled"),
+						}
+						return
+					}
+
 					toolStart := time.Now()
 					argsRaw := json.RawMessage(tc.ArgsJSON)
 					if len(argsRaw) == 0 {
@@ -1887,29 +1883,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				ch <- ChatStreamChunk{Done: true}
 				return
-			}
-
-			// wiki_index frequency guard: after N calls,
-			// inject a system message telling the LLM to
-			// stop listing the index and use wiki_lookup
-			// for precise retrieval.
-			for _, tc := range toolCalls {
-				if tc.Name == "wiki_index" {
-					wikiIndexCalls++
-				}
-			}
-			if wikiIndexCalls > wikiIndexMaxCalls {
-				msgs = append(msgs, llm.ChatMessage{
-					Role:    llm.RoleSystem,
-					Type:    llm.TypeText,
-					Content: fmt.Sprintf("你已调用 wiki_index %d 次，已达上限。禁止再次调用 wiki_index。请直接使用 wiki_lookup(title=\"条目标题\") 检索具体条目的完整内容，或直接基于已有信息回答用户。", wikiIndexCalls),
-				})
-				ch <- ChatStreamChunk{
-					Phase:   "limit",
-					Step:    "wiki-index-limit",
-					Message: fmt.Sprintf("wiki_index 已调用 %d 次，超过上限。改用 wiki_lookup 检索。", wikiIndexCalls),
-					Round:   roundNum,
-				}
 			}
 
 			// Same-tool-name error counter: if a single tool
