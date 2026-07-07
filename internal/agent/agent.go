@@ -790,7 +790,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 // Uses the L1 overview from the three-level index tree.
 func (a *Agent) buildKBIndex(kbBase string) string {
 	nowUnix := time.Now().Unix()
-	if a.kbIndexCache != "" && a.kbIndexCacheKey == kbBase && (nowUnix-a.kbIndexCacheTime) < 60 {
+	if a.kbIndexCache != "" && a.kbIndexCacheKey == kbBase && (nowUnix-a.kbIndexCacheTime) < 30 {
 		return a.kbIndexCache
 	}
 
@@ -1439,18 +1439,26 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			ch <- ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT}
 		}
 
-			// Build the assistant message for the conversation.
-			// Emit as a single text ChatMessage (tool calls are
-			// separate messages appended below).
-			assistantMsg := llm.ChatMessage{
-				Role:    llm.RoleAssistant,
-				Type:    llm.TypeText,
-				Content: fullContent,
-			}
-			msgs = append(msgs, assistantMsg)
+		// Build the assistant message for the conversation.
+		// Emit as a single text ChatMessage (tool calls are
+		// separate messages appended below).
+		assistantMsg := llm.ChatMessage{
+			Role:    llm.RoleAssistant,
+			Type:    llm.TypeText,
+			Content: fullContent,
+		}
+		msgs = append(msgs, assistantMsg)
 
-			// Persist assistant message later — after tool
-			// results are in partsAcc (see end of this round).
+		// After the first LLM call, strip image base64 from
+		// attachments so subsequent rounds don't re-send
+		// expensive (~330K tokens/MB) image data. The LLM has
+		// already processed the image; a text marker suffices.
+		if roundNum == 1 {
+			stripImageContent(msgs)
+		}
+
+		// Persist assistant message later — after tool
+		// results are in partsAcc (see end of this round).
 
 			// Append tool_call messages for each tool call.
 			for _, tc := range toolCalls {
@@ -1681,8 +1689,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							var decision tool.SandboxDecision
 							var reason string
 							if tc.Name == "exec_command" {
-								decision = a.sandbox.CheckExecDecision(tc.ArgsJSON)
-								reason = a.sandbox.MatchedPattern(tc.ArgsJSON)
+								var ea struct{ Command string `json:"command"` }
+								json.Unmarshal([]byte(tc.ArgsJSON), &ea)
+								command := ea.Command
+								if command == "" {
+									command = tc.ArgsJSON
+								}
+								decision = a.sandbox.CheckExecDecision(command)
+								reason = a.sandbox.MatchedPattern(command)
 							} else {
 								var wa struct{ Path string `json:"path"` }
 								json.Unmarshal([]byte(tc.ArgsJSON), &wa)
@@ -1921,7 +1935,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// after N rounds to keep the context lean. Protects
 			// the most recent rounds so the LLM still sees
 			// immediately-relevant results.
-			pruneOldToolResults(msgs, roundNum, 15)
+			pr := pruneAfterRounds
+			if a.cfg != nil && a.cfg.Limits.PruneAfterRounds > 0 {
+				pr = a.cfg.Limits.PruneAfterRounds
+			}
+			pruneOldToolResults(msgs, roundNum, pr)
 		}
 
 		if maxRounds > 0 {
@@ -2096,6 +2114,22 @@ func (a *Agent) tryAutoCompact(
 			Round:   roundNum,
 			MaxRound: maxRounds,
 		}
+		// Fallback: hard-truncate the message list so the LLM
+		// call doesn't fail with a 413. Drop oldest non-system
+		// messages to stay within the usable context window.
+		usable := llm.UsableContextWithBuf(ctxWindow, buf)
+		if usable > 0 {
+			truncateToFit(msgs, usable)
+			ch <- ChatStreamChunk{
+				Phase:    "compact",
+				Step:     "auto-compact-fallback",
+				Message:  fmt.Sprintf("压缩失败，已截断上下文至 ≈%d tokens", llm.EstimateTokensMessages(*msgs)),
+				Round:    roundNum,
+				MaxRound: maxRounds,
+			}
+			_ = summary
+			return true
+		}
 		return false
 	}
 
@@ -2111,7 +2145,7 @@ func (a *Agent) tryAutoCompact(
 	// append the summary to the system prompt.
 	lastComp := a.store.LastCompressedIDFor(req.SessionID)
 	if lastComp > 0 {
-		hist, _, _ := a.store.GetChatMessagesAfterIDFor(req.SessionID, 200, lastComp)
+		hist, _, _ := a.store.GetChatMessagesAfterIDFor(req.SessionID, 0, lastComp)
 		compSum := a.store.CompressedSummaryFor(req.SessionID)
 
 		newMsgs := make([]llm.ChatMessage, 0, len(hist)+2)
@@ -2122,7 +2156,7 @@ func (a *Agent) tryAutoCompact(
 		}
 		// Append messages from DB (after compression point).
 		for _, m := range hist {
-			if m.Role == llm.RoleSystem || m.Type == llm.TypeToolCall {
+			if m.Role == llm.RoleSystem {
 				continue
 			}
 			newMsgs = append(newMsgs, m)
@@ -2428,5 +2462,45 @@ func pruneOldToolResults(msgs []llm.ChatMessage, currentRound, keepRounds int) {
 		if m.Type == llm.TypeToolResult && m.Content != "" && !strings.HasPrefix(m.Content, "[pruned]") {
 			m.Content = "[pruned]"
 		}
+	}
+}
+
+// stripImageContent replaces base64 image payloads in msgs with
+// a text marker. The LLM has already processed the image on the
+// first round; subsequent rounds don't need the raw bytes.
+func stripImageContent(msgs []llm.ChatMessage) {
+	for i := range msgs {
+		if msgs[i].Type == llm.TypeImage && msgs[i].Content != "" {
+			msgs[i].Content = fmt.Sprintf("[image: %s (%s) — 已在首轮展示]",
+				msgs[i].Name, msgs[i].MimeType)
+		}
+	}
+}
+
+// truncateToFit drops the oldest non-system messages from the slice
+// until the total estimated tokens fit within usable. Messages are
+// removed from the front (after msgs[0]) so the most recent context
+// is preserved.
+func truncateToFit(msgs *[]llm.ChatMessage, usable int) {
+	if len(*msgs) <= 1 {
+		return
+	}
+	sysMsg := (*msgs)[0]
+	rest := (*msgs)[1:]
+	if total := llm.EstimateTokensMessages(rest); total <= usable {
+		return
+	}
+	// Walk backward from the end, keeping messages that fit.
+	end := len(rest) - 1
+	for end >= 0 {
+		if llm.EstimateTokensMessages(rest[:end+1]) <= usable {
+			break
+		}
+		end--
+	}
+	if end < 0 {
+		*msgs = []llm.ChatMessage{sysMsg, rest[len(rest)-1]}
+	} else {
+		*msgs = append([]llm.ChatMessage{sysMsg}, rest[end:]...)
 	}
 }

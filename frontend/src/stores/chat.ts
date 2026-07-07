@@ -76,7 +76,7 @@ export const state = reactive({
   // while the user is viewing another session, so the global
   // flag had to go.
   pendingQuestion: {} as Record<string, { questions: QuestionItem[]; resolve: (answers: Record<string, string>) => void }>,
-  pendingConfirm: {} as Record<string, { toolName: string; args: string; reason: string; resolve: (approved: boolean) => void }>,
+  pendingConfirm: {} as Record<string, Array<{ toolName: string; args: string; reason: string; resolve: (approved: boolean) => void }>>,
   pendingPlanText: {} as Record<string, string>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
@@ -221,8 +221,8 @@ export async function setActiveProject(path: string) {
     pq.resolve({})
     delete state.pendingQuestion[id]
   }
-  for (const [id, pc] of Object.entries(state.pendingConfirm)) {
-    pc.resolve(false)
+  for (const [id, items] of Object.entries(state.pendingConfirm)) {
+    for (const pc of items) pc.resolve(false)
     delete state.pendingConfirm[id]
   }
   for (const [id, s] of Object.entries(state.streaming)) {
@@ -428,8 +428,9 @@ export async function deleteSessionById(id: string) {
     state.pendingQuestion[id].resolve({})  // unblock any awaiter
     delete state.pendingQuestion[id]
   }
-  if (state.pendingConfirm[id]) {
-    state.pendingConfirm[id].resolve(false)
+  const cfms = state.pendingConfirm[id]
+  if (cfms && cfms.length > 0) {
+    for (const pc of cfms) pc.resolve(false)
     delete state.pendingConfirm[id]
   }
   if (state.streaming[id]) {
@@ -1160,16 +1161,16 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         try {
           const cfm = JSON.parse(ev.tool_confirm_json) as { tool_name: string; args: string; reason: string }
           new Promise<boolean>((resolve) => {
-            state.pendingConfirm[id] = {
+            if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
+            state.pendingConfirm[id].push({
               toolName: cfm.tool_name,
               args: cfm.args,
               reason: cfm.reason,
               resolve,
-            }
+            })
           }).then((approved) => {
             submitConfirmResponseInner(id, approved)
           })
-          // 提示音 + 系统通知：请求确认
           notifyManager.play('confirm')
           notifyManager.notify('沙箱请求', `批准 ${cfm.tool_name}?`)
         } catch { /* ignore */ }
@@ -1305,14 +1306,11 @@ async function submitConfirmResponseInner(id: string, approved: boolean) {
 }
 
 export function submitToolConfirm(approved: boolean) {
-  // Same multi-session reasoning as submitQuestionAnswer:
-  // the confirm belongs to whichever session requested it.
-  for (const [sid, pc] of Object.entries(state.pendingConfirm)) {
-    if (pc) {
-      const id = sid
-      delete state.pendingConfirm[id]
+  for (const [sid, items] of Object.entries(state.pendingConfirm)) {
+    if (items && items.length > 0) {
+      const pc = items.shift()!
+      if (items.length === 0) delete state.pendingConfirm[sid]
       pc.resolve(approved)
-      submitConfirmResponseInner(id, approved)
       return
     }
   }
@@ -1349,9 +1347,10 @@ export function isSessionStreaming(id: string): boolean {
 export const currentPendingQuestion = computed(() =>
   state.pendingQuestion[state.currentID] || null,
 )
-export const currentPendingConfirm = computed(() =>
-  state.pendingConfirm[state.currentID] || null,
-)
+export const currentPendingConfirm = computed(() => {
+  const list = state.pendingConfirm[state.currentID]
+  return list && list.length > 0 ? list[0] : null
+})
 
 // currentAttachments returns the staged attachments for the
 // session the user is currently viewing. Per-session storage
