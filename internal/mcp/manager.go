@@ -275,7 +275,8 @@ func (m *Manager) runServer(ctx context.Context, name string) {
 
 	retries := 0
 	maxRetries := 5
-	retryDelay := 3 * time.Second
+	baseDelay := 3 * time.Second
+	maxDelay := 60 * time.Second
 
 	for {
 		if retries > 0 {
@@ -309,10 +310,18 @@ func (m *Manager) runServer(ctx context.Context, name string) {
 			return
 		}
 
+		// Exponential backoff: 3s, 6s, 12s, 24s, capped at 60s.
+		// Previously a fixed 3s delay meant a briefly-flaky
+		// server that needed ~10s to recover would hit
+		// maxRetries and trip into the permanent error state.
+		delay := baseDelay * (1 << (retries - 1))
+		if delay > maxDelay {
+			delay = maxDelay
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(retryDelay):
+		case <-time.After(delay):
 		}
 	}
 }

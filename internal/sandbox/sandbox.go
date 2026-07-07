@@ -78,6 +78,14 @@ func New(cfg config.SandboxConfig) (*Sandbox, error) {
 	}
 
 	// Resolve protected paths to absolute form when possible.
+	// requireMode is the policy applied when a pattern matches:
+	//   "never"    — block the call (default for unconfigured systems
+	//                that should fail-closed; the name "never" reflects
+	//                "never let the dangerous command run")
+	//   "always"   — always ask the user to confirm
+	//   "confirm"  — same as "always" (alias for clarity in config)
+	//   "dangerous" — alias for "never" (kept for backwards-compat with
+	//                pre-1.0 configs that used this name)
 	for _, p := range cfg.WriteProtectedPaths {
 		if p == "" {
 			continue
@@ -124,14 +132,15 @@ func (s *Sandbox) CheckExec(command string) Decision {
 		return Allow
 	}
 	// A pattern matched. Decide based on RequireConfirm.
+	//   "never" / "dangerous" — block the call (fail-closed)
+	//   "always" / "confirm" — ask the user to confirm
 	switch s.requireMode {
-	case "never":
+	case "never", "dangerous":
 		return Block
-	case "always":
+	case "always", "confirm":
 		return Confirm
-	case "confirm":
-		return Confirm
-	default: // "dangerous"
+	default:
+		// Unknown mode: fail-closed.
 		return Block
 	}
 }

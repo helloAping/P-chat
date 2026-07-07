@@ -909,6 +909,15 @@ func fileSig(info os.FileInfo) string {
 	if info == nil {
 		return "absent"
 	}
+	// mtime+size is fast but fragile: a user can `touch -t` to
+	// backdate the mtime and the cache wouldn't refresh.
+	// Including the inode (on POSIX) and a content hash would
+	// be more robust, but reading the file at every prompt
+	// build is too expensive. We use mtime+size as a fast
+	// path; the rules hot-reload watcher (see
+	// internal/rules.Watch) explicitly invalidates the cache
+	// when it detects a change, so mtime preservation attacks
+	// don't affect hot-reload users.
 	return fmt.Sprintf("%d_%d", info.Size(), info.ModTime().UnixNano())
 }
 
@@ -1744,9 +1753,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 									if sid, ok := tctx.Value(tool.SessionIDKey{}).(string); ok {
 										sessionID = sid
 									}
+									// Blocking send with a small timeout. The
+									// previous `default:` silently dropped
+									// the confirm event when the consumer
+									// was slow, and the user was left
+									// waiting for a UI that never
+									// appeared. If the consumer is gone
+									// (ctx cancelled), bail out.
 									select {
 									case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(cfm)}:
-									default:
+									case <-time.After(5 * time.Second):
+										log.Printf("[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", sessionID)
+									case <-toolCtx.Done():
+										return
 									}
 									approved, cfmErr := tool.WaitForConfirm(toolCtx, sessionID, cfm)
 									if cfmErr != nil || !approved {

@@ -28,7 +28,14 @@ type Client struct {
 	// `/provider` don't have to round-trip for every command.
 	mu              sync.Mutex
 	currentProvider string
-	currentStyle   string
+	currentStyle    string
+	// currentModel is the model the user selected for the
+	// current provider (via SetModel). The server doesn't
+	// expose a dedicated set-model endpoint, so this is a
+	// client-side cache so DisplayModel / ProviderModel
+	// return the right name. When empty, ProviderModel
+	// returns the provider's default model.
+	currentModel string
 
 	// Local cache of providers, populated by SetCfgProviders.
 	// Used by SetModel / DisplayModel / ModelsFor which the server
@@ -358,10 +365,18 @@ func (c *Client) CurrentProvider() string   { return c.currentProvider }
 func (c *Client) SetCurrentProvider(p string) { c.currentProvider = p }
 
 func (c *Client) ProviderModel() string {
-	if c.currentProvider == "" {
+	c.mu.Lock()
+	provider := c.currentProvider
+	model := c.currentModel
+	c.mu.Unlock()
+	if provider == "" {
 		return ""
 	}
-	models, _ := c.ModelsFor(c.currentProvider)
+	// If SetModel was called, honour that selection.
+	if model != "" {
+		return model
+	}
+	models, _ := c.ModelsFor(provider)
 	for _, m := range models {
 		if m.Default {
 			return m.Name
@@ -384,7 +399,10 @@ func (c *Client) SetModel(provider, model string) error {
 	}
 	for _, m := range models {
 		if m.Name == model {
+			c.mu.Lock()
 			c.currentProvider = provider
+			c.currentModel = model
+			c.mu.Unlock()
 			return nil
 		}
 	}

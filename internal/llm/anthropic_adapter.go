@@ -246,6 +246,12 @@ func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 // trailing "\r" so CRLF transport works. Returns the line
 // (without trailing newline) or an error.
 func readSSELine(r *bufio.Reader) (string, error) {
+	// Cap a single SSE line at 4 MiB. A misbehaving proxy or a
+	// reasoning block that exceeds the bufio buffer size
+	// (default 64 KiB, we set 1 MiB) would otherwise grow this
+	// buffer without bound. Returning a stream error is the
+	// safer outcome than OOMing the process.
+	const maxLine = 4 << 20
 	var buf bytes.Buffer
 	for {
 		chunk, err := r.ReadBytes('\n')
@@ -256,6 +262,9 @@ func readSSELine(r *bufio.Reader) (string, error) {
 			}
 			if len(line) > 0 && line[len(line)-1] == '\r' {
 				line = line[:len(line)-1]
+			}
+			if buf.Len()+len(line) > maxLine {
+				return "", fmt.Errorf("SSE line exceeds %d bytes (truncated or misbehaving server)", maxLine)
 			}
 			buf.Write(line)
 		}

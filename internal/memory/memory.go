@@ -691,6 +691,12 @@ func (s *Store) Flush() error {
 
 	tx, err := s.db.Begin()
 	if err != nil {
+		// Put the pending messages back so a transient
+		// error doesn't lose user data. The next Flush
+		// attempt will retry.
+		s.pendingMu.Lock()
+		s.pendingWrites = append(pending, s.pendingWrites...)
+		s.pendingMu.Unlock()
 		return err
 	}
 	stmt, err := tx.Prepare(
@@ -698,12 +704,21 @@ func (s *Store) Flush() error {
 	)
 	if err != nil {
 		_ = tx.Rollback()
+		s.pendingMu.Lock()
+		s.pendingWrites = append(pending, s.pendingWrites...)
+		s.pendingMu.Unlock()
 		return err
 	}
 	defer stmt.Close()
 	for _, m := range pending {
 		if _, err := stmt.Exec(m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM); err != nil {
 			_ = tx.Rollback()
+			// Put pending back so a per-message insert error
+			// (e.g. constraint violation on bad data) doesn't
+			// silently drop the rest of the batch.
+			s.pendingMu.Lock()
+			s.pendingWrites = append(pending, s.pendingWrites...)
+			s.pendingMu.Unlock()
 			return err
 		}
 	}

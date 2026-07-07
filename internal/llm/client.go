@@ -97,10 +97,16 @@ type Client struct {
 }
 
 func NewClient(cfg *config.LLMConfig) (*Client, error) {
+	// Copy the providers slice so the caller can mutate
+	// cfg.Providers after NewClient returns without affecting
+	// us. The slice header is a value, but the underlying
+	// array is shared. A long-lived server with config
+	// hot-reload would otherwise see inconsistent results.
+	modelsCopy := append([]config.ProviderConfig(nil), cfg.Providers...)
 	c := &Client{
 		providers: make(map[string]*providerEntry),
 		default_:  cfg.Default,
-		cfgModels: cfg.Providers,
+		cfgModels: modelsCopy,
 	}
 
 	if err := c.init(cfg); err != nil {

@@ -12,9 +12,14 @@ import (
 )
 
 type Rule struct {
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	Path    string `json:"path"`
+	Name     string `json:"name"`
+	Content  string `json:"content"`
+	Path     string `json:"path"`
+	// IsGlobal is true for rules loaded from the global
+	// (~/.p-chat/rules) directory, false for rules from the
+	// project directory. Set by LoadAll; not exported in the
+	// JSON shape so the on-disk structure is unchanged.
+	IsGlobal bool `json:"-"`
 }
 
 // LoadAll loads rules from both global and project directories.
@@ -25,20 +30,31 @@ func LoadAll() ([]Rule, error) {
 
 	// Load global rules
 	globalRules, _ := loadFromDir(paths.GlobalRulesDir())
-	rules = append(rules, globalRules...)
+	for _, r := range globalRules {
+		r.IsGlobal = true
+		rules = append(rules, r)
+	}
 
 	// Load project rules (appended)
 	projectRules, _ := loadFromDir(paths.ProjectRulesDir())
-	rules = append(rules, projectRules...)
+	for _, r := range projectRules {
+		r.IsGlobal = false
+		rules = append(rules, r)
+	}
 
-	// Sort by source (global < project) then by name for a stable, byte-
-	// identical output across calls. The LLM's prefix cache keys on byte
-	// equality, so non-deterministic order causes cache misses.
+	// Sort by IsGlobal (global < project) then by name for a
+	// stable, byte-identical output across calls. The LLM's
+	// prefix cache keys on byte equality, so non-deterministic
+	// order causes cache misses.
+	//
+	// The previous version used strings.Contains(Path, "global")
+	// which was fragile (a user-named directory containing
+	// "global" would be mis-categorised). The explicit
+	// IsGlobal field is set by loadFromDir based on which
+	// directory the rule was loaded from.
 	sort.SliceStable(rules, func(i, j int) bool {
-		gi := strings.Contains(rules[i].Path, "global")
-		gj := strings.Contains(rules[j].Path, "global")
-		if gi != gj {
-			return gi
+		if rules[i].IsGlobal != rules[j].IsGlobal {
+			return rules[i].IsGlobal
 		}
 		return rules[i].Name < rules[j].Name
 	})
