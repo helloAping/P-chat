@@ -657,6 +657,9 @@ func (h *Handler) startScanJob(name string) error {
 		})
 		if idxErr != nil {
 			job.status = fmt.Sprintf("error: %v", idxErr)
+			if strings.Contains(idxErr.Error(), "delete") && strings.Contains(idxErr.Error(), "re-scan") {
+				job.status += " | 恢复：删除 wiki.db 后重新扫描即可重建索引"
+			}
 			log.Printf("[scan %s] index scan: %v", name, idxErr)
 			return
 		}

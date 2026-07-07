@@ -1050,7 +1050,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		//      doesn't die. Sends a final Error chunk.
 		defer func() {
 			defer func() { _ = recover() }() // guard "send on closed"
-			sendOrDrop(ctx, ch, ChatStreamChunk{SessionStatus: "idle"})
+			select {
+			case ch <- ChatStreamChunk{SessionStatus: "idle"}:
+			case <-time.After(2 * time.Second):
+			}
 		}()
 		defer func() {
 			if r := recover(); r != nil {
