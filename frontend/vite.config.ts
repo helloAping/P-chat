@@ -3,8 +3,8 @@ import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 import { readFileSync } from 'node:fs'
 
-const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../cmd/pchat-gui/wails.json', import.meta.url)), 'utf-8'))
-const APP_VERSION = pkg.info?.productVersion || '0.1.0'
+const VERSION = readFileSync(fileURLToPath(new URL('../VERSION', import.meta.url)), 'utf-8').trim()
+const APP_VERSION = VERSION || '0.1.0'
 const GITHUB_REPO = 'helloAping/P-chat'
 
 // Vite config for the P-Chat SPA. Output goes to the repo-root

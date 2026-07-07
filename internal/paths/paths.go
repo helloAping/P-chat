@@ -101,6 +101,11 @@ func KnowledgeDir() string {
 	return filepath.Join(GlobalDir(), "knowledge")
 }
 
+// VectorsDir returns ~/.p-chat/vectors/ (local vector store files)
+func VectorsDir() string {
+	return filepath.Join(GlobalDir(), "vectors")
+}
+
 // UploadsDir returns ~/.p-chat/uploads/ (file uploads)
 func UploadsDir() string {
 	return filepath.Join(GlobalDir(), "uploads")

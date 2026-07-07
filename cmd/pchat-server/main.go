@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -101,6 +102,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
+	if cfg.Knowledge.Enabled {
+		tool.RegisterGrep(toolReg, cfg)
+		tool.RegisterWiki(toolReg, cfg)
+		// Migrate legacy wiki_sections → three-level index_nodes.
+		var bases []knowledge.BaseRef
+		for _, b := range cfg.Knowledge.Bases {
+			bases = append(bases, knowledge.BaseRef{Name: b.Name, Path: b.Path, Enabled: b.Enabled})
+		}
+		knowledge.EnsureMigrated(bases)
+	}
 
 	// Build the sub-agent catalog. Three sources, in priority
 	// order (last wins):
@@ -208,6 +219,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, staticFS, mcpMgr)
+
+	// Auto-index knowledge bases on startup (if enabled).
+	srv.Handler().AutoIndexKnowledgeBases()
 
 	// PCHAT_PORT overrides the configured port. This is how the
 	// parent process (pchat / pchat-gui) tells us which ephemeral

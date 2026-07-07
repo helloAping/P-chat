@@ -1,9 +1,14 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
@@ -20,6 +25,7 @@ type Server struct {
 	styleMgr *style.Manager
 	engine   *gin.Engine
 	handler  *Handler
+	srv      *http.Server
 }
 
 // Engine returns the underlying gin.Engine so tests (or embedders)
@@ -27,7 +33,7 @@ type Server struct {
 func (s *Server) Engine() *gin.Engine { return s.engine }
 
 // Handler returns the request handler so tests (and embedders)
-// can call helpers that aren't bound to an HTTP route — e.g.
+// can call helpers that aren't bound to an HTTP route 鈥?e.g.
 // sessionToResponse or the per-session meta resolvers. Stable
 // public API; safe to call from outside this package.
 func (s *Server) Handler() *Handler { return s.handler }
@@ -77,10 +83,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 
 	h := NewHandler(agt, cfg, store, styleMgr, mcpMgr)
 
-	// Wire the summarizer so /compress works.
+	// Wire the summarizer so /compress and auto-compact work.
 	if lc := agt.LLM(); lc != nil && cfg.LLM.Default != "" {
 		sm := memory.NewSummarizer(store, lc, cfg.LLM.Default, 50)
 		h.SetSummarizer(sm)
+		agt.SetSummarizer(sm)
 	}
 
 	api := r.Group("/api/v1")
@@ -106,6 +113,10 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/providers/:name/models/:model/default", h.SetDefaultModel)
 		api.PATCH("/providers/:name/models/:model/capabilities", h.SetCapabilities)
 		api.GET("/providers/:name/upstream-models", h.FetchUpstreamModels)
+
+		// System config
+		api.GET("/config", h.GetSystemConfig)
+		api.PATCH("/config", h.UpdateSystemConfig)
 
 		// Uploads
 		api.POST("/uploads", h.Upload)
@@ -173,6 +184,22 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.DELETE("/mcp/servers/:name", h.RemoveMCPServer)
 		api.POST("/mcp/servers/:name/restart", h.RestartMCPServer)
 		api.PATCH("/mcp/global", h.SetMCPGlobal)
+
+		// Knowledge
+		api.GET("/knowledge/config", h.GetKnowledgeConfig)
+		api.PATCH("/knowledge/config", h.UpdateKnowledgeConfig)
+		api.GET("/knowledge/models", h.GetKnowledgeModels)
+		api.GET("/knowledge/bases", h.ListKnowledgeBases)
+		api.POST("/knowledge/bases", h.AddKnowledgeBase)
+		api.DELETE("/knowledge/bases/:name", h.RemoveKnowledgeBase)
+		api.POST("/knowledge/bases/:name/scan", h.ScanKnowledgeBase)
+		api.DELETE("/knowledge/bases/:name/scan", h.CancelScan)
+		api.DELETE("/knowledge/bases/:name/clear", h.ClearKnowledgeBase)
+		api.GET("/knowledge/bases/:name/scan/status", h.ScanStatus)
+		api.GET("/knowledge/bases/:name/nodes", h.ListNodes)
+		api.GET("/knowledge/bases/:name/nodes/:id/content", h.GetNodeContent)
+		api.DELETE("/knowledge/bases/:name/nodes/:id", h.DeleteNode)
+		api.POST("/knowledge/search", h.SearchKnowledge)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the
@@ -186,14 +213,55 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 
 func (s *Server) Run() error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
-	return s.engine.Run(addr)
+	return s.RunAt(addr)
 }
 
-// RunAt binds to the given listen address (e.g. "127.0.0.1:18960").
-// Used by pchat-server when the parent process supplies a port via
-// the PCHAT_PORT env var.
 func (s *Server) RunAt(addr string) error {
-	return s.engine.Run(addr)
+	s.srv = &http.Server{
+		Addr:    addr,
+		Handler: s.engine,
+	}
+	return s.srv.ListenAndServe()
+}
+
+// RunWithGracefulShutdown starts the server and blocks until a
+// shutdown signal (SIGINT/SIGTERM) is received. On signal, it
+// drains active connections for up to 30s, then exits.
+func (s *Server) RunWithGracefulShutdown(addr string) error {
+	s.srv = &http.Server{
+		Addr:    addr,
+		Handler: s.engine,
+	}
+
+	idleConnsClosed := make(chan struct{})
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		log.Println("[server] shutdown signal received, draining connections...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.Shutdown(ctx); err != nil {
+			log.Printf("[server] shutdown error: %v", err)
+		}
+		close(idleConnsClosed)
+	}()
+
+	if err := s.srv.ListenAndServe(); err != http.ErrServerClosed {
+		return err
+	}
+	<-idleConnsClosed
+	log.Println("[server] graceful shutdown complete")
+	return nil
+}
+
+// Shutdown gracefully shuts down the server, draining active
+// connections. The context deadline caps the total drain time.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.srv != nil {
+		return s.srv.Shutdown(ctx)
+	}
+	return nil
 }
 
 // corsMiddleware adds the headers Chromium/WebView2 needs to allow
@@ -202,7 +270,7 @@ func (s *Server) RunAt(addr string) error {
 // this bypass for the streaming /api/v1/sessions/:id/messages SSE
 // endpoint because the Wails AssetServer's response writer buffers
 // the entire body and only sends it when the request handler
-// returns — useless for an SSE stream that parks for minutes
+// returns 鈥?useless for an SSE stream that parks for minutes
 // waiting on the user (the `question` tool flow).
 //
 // Same-origin browser clients (origin == backend address) are

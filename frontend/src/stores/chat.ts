@@ -61,7 +61,8 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string }>,
+  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
+  kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
   // sessionWorking is the per-session "is the LLM mid-turn"
   // flag, derived from the `session_status` SSE event. The
@@ -75,7 +76,7 @@ export const state = reactive({
   // while the user is viewing another session, so the global
   // flag had to go.
   pendingQuestion: {} as Record<string, { questions: QuestionItem[]; resolve: (answers: Record<string, string>) => void }>,
-  pendingConfirm: {} as Record<string, { toolName: string; args: string; reason: string; resolve: (approved: boolean) => void }>,
+  pendingConfirm: {} as Record<string, Array<{ toolName: string; args: string; reason: string; resolve: (approved: boolean) => void }>>,
   pendingPlanText: {} as Record<string, string>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
@@ -116,6 +117,10 @@ export function clearSessionTodos(id: string) {
   state.sessionTodos[id] = []
 }
 
+export function bumpKBConfigVersion() {
+  state.kbConfigVersion++
+}
+
 export const activeProjectName = computed(() => {
   if (!state.activeProjectPath) return '全局'
   const p = state.projects.find(p => p.path === state.activeProjectPath)
@@ -137,6 +142,8 @@ export const currentMeta = computed(() => {
     provider: def?.provider || '',
     model: def?.model || '',
     title: '',
+    vector_store: '',
+    knowledge_base: '',
   }
 })
 
@@ -214,8 +221,8 @@ export async function setActiveProject(path: string) {
     pq.resolve({})
     delete state.pendingQuestion[id]
   }
-  for (const [id, pc] of Object.entries(state.pendingConfirm)) {
-    pc.resolve(false)
+  for (const [id, items] of Object.entries(state.pendingConfirm)) {
+    for (const pc of items) pc.resolve(false)
     delete state.pendingConfirm[id]
   }
   for (const [id, s] of Object.entries(state.streaming)) {
@@ -282,6 +289,8 @@ export async function switchSession(id: string) {
       plan_mode: s.plan_mode || false,
       permission_level: s.permission_level || 'ask',
       reasoning_effort: s.reasoning_effort || 'off',
+      vector_store: s.vector_store || '',
+      knowledge_base: s.knowledge_base || '',
     }
   }
   // Load per-session todos.
@@ -419,8 +428,9 @@ export async function deleteSessionById(id: string) {
     state.pendingQuestion[id].resolve({})  // unblock any awaiter
     delete state.pendingQuestion[id]
   }
-  if (state.pendingConfirm[id]) {
-    state.pendingConfirm[id].resolve(false)
+  const cfms = state.pendingConfirm[id]
+  if (cfms && cfms.length > 0) {
+    for (const pc of cfms) pc.resolve(false)
     delete state.pendingConfirm[id]
   }
   if (state.streaming[id]) {
@@ -454,6 +464,8 @@ export async function renameSession(id: string, title: string) {
       model: resp.model ?? state.sessionMeta[id].model,
       permission_level: resp.permission_level ?? state.sessionMeta[id].permission_level,
       reasoning_effort: resp.reasoning_effort ?? state.sessionMeta[id].reasoning_effort,
+      vector_store: resp.vector_store ?? state.sessionMeta[id].vector_store,
+      knowledge_base: resp.knowledge_base ?? state.sessionMeta[id].knowledge_base,
     }
   }
 }
@@ -917,36 +929,61 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     case 'tool': {
-      // Sub-agent tools render inside the sub-agent card;
-      // parent tools render at the top level. Either way
-      // they're appended to the matching part list.
       const parts = sub ? sub.parts : m.parts!
       if (!ev.tool_name) break
       if (ev.tool_status === 'start') {
-        // Push a new tool part for this call. If the
-        // last part is already an unfinished tool with
-        // the same name, reuse it (defensive — usually
-        // there's a clear "start" then "ok" pair).
-        const last = parts[parts.length - 1]
-        if (last && last.kind === 'tool' && last.status === 'start' && last.name === ev.tool_name) {
-          last.args = ev.tool_args
+        // When tool_id is present, use it as the unique key
+        // and never reuse the last part (two calls to the
+        // same tool name are distinct). For legacy streams
+        // without tool_id, fall back to name-based reuse.
+        if (ev.tool_id) {
+          if (parts.length > 0) {
+            const last = parts[parts.length - 1]
+            if (last.kind === 'tool' && last.status === 'start' && last.tool_id === ev.tool_id) {
+              last.args = ev.tool_args
+            } else {
+              parts.push({
+                kind: 'tool',
+                id: ev.tool_name,
+                tool_id: ev.tool_id,
+                name: ev.tool_name,
+                args: ev.tool_args,
+                status: 'start',
+              })
+            }
+          } else {
+            parts.push({
+              kind: 'tool',
+              id: ev.tool_name,
+              tool_id: ev.tool_id,
+              name: ev.tool_name,
+              args: ev.tool_args,
+              status: 'start',
+            })
+          }
         } else {
-          parts.push({
-            kind: 'tool',
-            id: ev.tool_name,
-            name: ev.tool_name,
-            args: ev.tool_args,
-            status: 'start',
-          })
+          const last = parts[parts.length - 1]
+          if (last && last.kind === 'tool' && last.status === 'start' && last.name === ev.tool_name) {
+            last.args = ev.tool_args
+          } else {
+            parts.push({
+              kind: 'tool',
+              id: ev.tool_name,
+              name: ev.tool_name,
+              args: ev.tool_args,
+              status: 'start',
+            })
+          }
         }
       } else {
-        // 'ok' / 'warn' / 'error' — find the matching
-        // tool part (most recent unfished one with the
-        // same name) and update it.
+        // 'ok' / 'warn' / 'error' — exact match by tool_id,
+        // fall back to name for legacy streams.
         let found = false
         for (let i = parts.length - 1; i >= 0; i--) {
           const p = parts[i]
-          if (p.kind === 'tool' && p.name === ev.tool_name && p.status === 'start') {
+          if (p.kind !== 'tool' || p.status !== 'start') continue
+          if ((ev.tool_id && p.tool_id === ev.tool_id) ||
+              (!ev.tool_id && p.name === ev.tool_name)) {
             p.status = (ev.tool_status as any) || 'ok'
             p.result = ev.tool_result
             p.error = ev.tool_error
@@ -957,11 +994,10 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           }
         }
         if (!found) {
-          // No matching start event — just append a
-          // completed tool part.
           parts.push({
             kind: 'tool',
             id: ev.tool_name,
+            tool_id: ev.tool_id,
             name: ev.tool_name,
             args: ev.tool_args,
             status: (ev.tool_status as any) || 'ok',
@@ -1125,16 +1161,16 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         try {
           const cfm = JSON.parse(ev.tool_confirm_json) as { tool_name: string; args: string; reason: string }
           new Promise<boolean>((resolve) => {
-            state.pendingConfirm[id] = {
+            if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
+            state.pendingConfirm[id].push({
               toolName: cfm.tool_name,
               args: cfm.args,
               reason: cfm.reason,
               resolve,
-            }
+            })
           }).then((approved) => {
             submitConfirmResponseInner(id, approved)
           })
-          // 提示音 + 系统通知：请求确认
           notifyManager.play('confirm')
           notifyManager.notify('沙箱请求', `批准 ${cfm.tool_name}?`)
         } catch { /* ignore */ }
@@ -1270,14 +1306,11 @@ async function submitConfirmResponseInner(id: string, approved: boolean) {
 }
 
 export function submitToolConfirm(approved: boolean) {
-  // Same multi-session reasoning as submitQuestionAnswer:
-  // the confirm belongs to whichever session requested it.
-  for (const [sid, pc] of Object.entries(state.pendingConfirm)) {
-    if (pc) {
-      const id = sid
-      delete state.pendingConfirm[id]
+  for (const [sid, items] of Object.entries(state.pendingConfirm)) {
+    if (items && items.length > 0) {
+      const pc = items.shift()!
+      if (items.length === 0) delete state.pendingConfirm[sid]
       pc.resolve(approved)
-      submitConfirmResponseInner(id, approved)
       return
     }
   }
@@ -1314,9 +1347,10 @@ export function isSessionStreaming(id: string): boolean {
 export const currentPendingQuestion = computed(() =>
   state.pendingQuestion[state.currentID] || null,
 )
-export const currentPendingConfirm = computed(() =>
-  state.pendingConfirm[state.currentID] || null,
-)
+export const currentPendingConfirm = computed(() => {
+  const list = state.pendingConfirm[state.currentID]
+  return list && list.length > 0 ? list[0] : null
+})
 
 // currentAttachments returns the staged attachments for the
 // session the user is currently viewing. Per-session storage

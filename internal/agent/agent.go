@@ -34,6 +34,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/p-chat/pchat/internal/agents"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
@@ -73,6 +74,17 @@ type Agent struct {
 	// session, so the LLM's prefix cache hits on it.
 	staticPrompt   string
 	staticPromptID string // signature used to detect when to rebuild
+
+	// KB index cache — rebuild only on Reload() or after 60s TTL.
+	kbIndexCache     string
+	kbIndexCacheKey  string // base name used to build the cache
+	kbIndexCacheTime int64  // unix timestamp of last build
+
+	// summarizer, when non-nil, enables auto-compression.
+	summarizer *memory.Summarizer
+
+	// subAgentSem limits concurrent sub-agent launches. nil = unlimited.
+	subAgentSem chan struct{}
 }
 
 // SetChatOptions overrides the per-request sampling parameters
@@ -147,6 +159,21 @@ func New(cfg *config.Config, llmClient *llm.Client, styleMgr *style.Manager, sto
 // SendMessageRequest.Attachments may be non-empty).
 func (a *Agent) SetAttachmentResolver(r AttachmentResolver) {
 	a.attach = r
+}
+
+// SetSummarizer wires the summarizer for auto-compression support.
+func (a *Agent) SetSummarizer(sm *memory.Summarizer) {
+	a.summarizer = sm
+}
+
+// SetSubAgentConcurrency limits the number of concurrently executing
+// sub-agent task calls. max <= 0 means unlimited (default).
+func (a *Agent) SetSubAgentConcurrency(max int) {
+	if max > 0 {
+		a.subAgentSem = make(chan struct{}, max)
+	} else {
+		a.subAgentSem = nil
+	}
 }
 
 // protocolFor returns the configured protocol ("openai" /
@@ -313,6 +340,9 @@ type ChatRequest struct {
 	// After MaxRounds the loop stops and the user can continue
 	// with a follow-up message.
 	MaxRounds int `json:"max_rounds,omitempty"`
+	// KBBase selects the knowledge base for this session.
+	// "" = off, "__all__" = all bases, or a specific base name.
+	KBBase string `json:"kb_base,omitempty"`
 	// PromptOv, when non-empty, REPLACES the agent's normal
 	// system prompt (style + AGENTS + rules + skills) for this
 	// turn. Used by the sub-agent runner to install a
@@ -368,8 +398,9 @@ type ChatStreamChunk struct {
 	Step     string `json:"step,omitempty"`
 	Duration string `json:"duration,omitempty"`
 
-	ToolName    string `json:"tool_name,omitempty"`
-	ToolArgs    string `json:"tool_args,omitempty"`
+	ToolID   string `json:"tool_id,omitempty"`
+	ToolName string `json:"tool_name,omitempty"`
+	ToolArgs string `json:"tool_args,omitempty"`
 	ToolResult  string `json:"tool_result,omitempty"`
 	// ToolResultFull is the untruncated tool result. ToolResult
 	// above is a 300-char preview suitable for human display;
@@ -486,7 +517,7 @@ type ChatStreamChunk struct {
 // between rounds within a chat, AND between chats within a session. The
 // only thing that should change in this string is the underlying files
 // (AGENTS.md, rules, skills) or the chosen style.
-func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, projectRoot string) (string, string, error) {
+func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, projectRoot string, kbEnabled bool) (string, string, error) {
 	toolNames := make([]string, 0, len(toolDefs))
 	for _, t := range toolDefs {
 		toolNames = append(toolNames, t.Name)
@@ -494,6 +525,13 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	lang := ""
 	if a.cfg != nil {
 		lang = a.cfg.LLM.Output.Language
+	}
+	// Include kbEnabled in the signature so cached prompts that
+	// include wiki/grep instructions are not reused when KB is
+	// toggled off mid-conversation.
+	sigKB := "kb:0"
+	if kbEnabled {
+		sigKB = "kb:1"
 	}
 	sig := strings.Join([]string{
 		string(s),
@@ -503,6 +541,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		strings.Join(toolNames, ","),
 		lang,
 		projectRoot,
+		sigKB,
 	}, "|")
 	if sig == a.staticPromptID && a.staticPrompt != "" {
 		return a.staticPrompt, sig, nil
@@ -549,23 +588,52 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		// is added by the CLI at startup; here we just remind the
 		// model to use it.
 		hasRecall := false
+		hasGrep := false
+		hasWiki := false
 		hasQuestion := false
 		hasTodoWrite := false
 		for _, t := range a.tools.List() {
 			switch t.Name {
 			case "recall":
 				hasRecall = true
+			case "grep":
+				hasGrep = true
+			case "wiki_lookup":
+				hasWiki = true
 			case "question":
 				hasQuestion = true
 			case "todo_write":
 				hasTodoWrite = true
 			}
 		}
+		if hasWiki && kbEnabled {
+			sb.WriteString("\n\n---\n\n## Using Knowledge Base (wiki_lookup / wiki_list)\n\n" +
+				"**何时必须查询知识库：**\n" +
+				"- 用户询问项目相关概念、设计、架构、配置、API、流程等任何专业问题时，**优先查询知识库**，而非仅凭训练数据回答。\n" +
+				"- 系统提示中已包含知识库索引概览（一级索引），根据概览定位相关文件后再检索。\n" +
+				"\n**工具使用规则：**\n" +
+				"- `wiki_lookup(query=\"\")` — 查询为空时，返回知识库中所有文件目录（L2 列表），按关联度排序。默认每页 20 条，可用 page 翻页。\n" +
+				"- `wiki_lookup(query=\"关键词\")` — 按关键词、标题或概览搜索条目，返回匹配的 L3 章节节点及其所属文件（L2 父节点）。\n" +
+				"- `wiki_lookup(query=\"...\", expand=true)` — 同时返回匹配条目的完整正文内容。\n" +
+				"- `wiki_list(parent_id=N)` — 列出父节点 N 下的所有子节点。L1（id=1）列出所有文件；L2 节点列出该文件所有章节。\n" +
+				"\n**标准流程：**\n" +
+				"1. 先看系统提示中的一级索引概览，找到可能相关的文件（L2）。\n" +
+				"2. 用 wiki_lookup 搜索关键词或浏览目录定位目标文件/章节。\n" +
+				"3. 用 wiki_lookup(query=\"...\", expand=true) 获取完整内容。\n" +
+				"4. 信息足够后直接回答 → 不需要再调用任何 wiki 工具。\n")
+		}
 		if hasRecall {
 			sb.WriteString("\n\n---\n\n## Using recall\n\n" +
 				"当你不确定某条信息、需要查代码/文档、或想引用历史对话时，\n" +
 				"先用 `recall(query=\"...\")` 工具查一下知识库/历史。\n" +
 				"不要凭印象编造 API 名称、文件路径、函数签名。\n")
+		}
+		if hasGrep {
+			sb.WriteString("\n\n---\n\n## Using grep\n\n" +
+				"使用 `grep(pattern=\"...\")` 在知识库文件中精确搜索关键词。\n" +
+				"适用场景：找特定函数名、变量名、类名、配置项、或任何精确文本。\n" +
+				"recall 适合语义概念搜索，grep 适合精确字符串定位。\n" +
+				"两者可结合使用：先用 recall 理解上下文，再用 grep 精确定位。\n")
 		}
 		if hasTodoWrite {
 			sb.WriteString("\n\n---\n\n## Task Planning with todo_write\n\n" +
@@ -713,6 +781,75 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	return prompt, sig, nil
 }
 
+// buildKBIndex builds the Knowledge Base section of the system prompt.
+// When KBBase is "__all__", all enabled bases are listed. When it's a
+// specific name, only that base's index is shown. If the base has no
+// sections, a placeholder is returned. The output is truncated at 3000
+// characters to avoid prompt explosion. Results are cached for 60s to
+// avoid repeated full-DB scans per message turn.
+// Uses the L1 overview from the three-level index tree.
+func (a *Agent) buildKBIndex(kbBase string) string {
+	nowUnix := time.Now().Unix()
+	if a.kbIndexCache != "" && a.kbIndexCacheKey == kbBase && (nowUnix-a.kbIndexCacheTime) < 30 {
+		return a.kbIndexCache
+	}
+
+	kc := a.cfg.Knowledge
+	var bases []config.KnowledgeBase
+	if kbBase == "__all__" {
+		for _, b := range kc.Bases {
+			if b.Enabled {
+				bases = append(bases, b)
+			}
+		}
+	} else {
+		for _, b := range kc.Bases {
+			if b.Name == kbBase && b.Enabled {
+				bases = append(bases, b)
+				break
+			}
+		}
+	}
+	if len(bases) == 0 {
+		result := "\n[Knowledge Base]\n(no enabled bases configured)\n"
+		a.kbIndexCache = result
+		a.kbIndexCacheKey = kbBase
+		a.kbIndexCacheTime = nowUnix
+		return result
+	}
+
+	var sb strings.Builder
+	for _, base := range bases {
+		store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+		if err != nil {
+			continue
+		}
+		overview, err := store.GetL1Overview(context.Background(), base.Name)
+		if err != nil || overview == "" {
+			continue
+		}
+		// overview is pre-formatted by the scan pipeline as the L1 prompt content.
+		sb.WriteString(overview)
+	}
+
+	if sb.Len() == 0 {
+		result := "\n[Knowledge Base]\n(index empty — run a scan first)\n"
+		a.kbIndexCache = result
+		a.kbIndexCacheKey = kbBase
+		a.kbIndexCacheTime = nowUnix
+		return result
+	}
+
+	// Append tool usage footer.
+	sb.WriteString("\n\n使用 wiki_lookup(query, page, size) 检索，默认 20 条/页。")
+	sb.WriteString("query=空 浏览目录；query=关键词 搜索匹配；expand=true 获取全文。")
+	result := sb.String()
+	a.kbIndexCache = result
+	a.kbIndexCacheKey = kbBase
+	a.kbIndexCacheTime = nowUnix
+	return result
+}
+
 // Reload forces the next call to rebuild the static system prompt
 // (e.g. after the user changes AGENTS.md or installs a new skill).
 func (a *Agent) Reload() {
@@ -722,6 +859,9 @@ func (a *Agent) Reload() {
 	a.rules = rulesList
 	a.staticPrompt = ""
 	a.staticPromptID = ""
+	a.kbIndexCache = ""
+	a.kbIndexCacheKey = ""
+	a.kbIndexCacheTime = 0
 }
 
 // StaticPromptInfo exposes the current static-prompt cache key for testing.
@@ -923,6 +1063,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 		ch <- ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."}
 		availableTools := a.tools.List()
+		// Remove wiki tools when knowledge base is off. grep is a
+		// general-purpose search tool and remains available.
+		kbEnabled := req.KBBase != "" && req.KBBase != "__off__"
+		if !kbEnabled {
+			filtered := make([]tool.Tool, 0, len(availableTools))
+			for _, t := range availableTools {
+				if t.Name == "wiki_lookup" || t.Name == "wiki_list" {
+					continue
+				}
+				filtered = append(filtered, t)
+			}
+			availableTools = filtered
+		}
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -936,10 +1089,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		ch <- ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."}
-		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, req.ProjectRoot)
+		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, req.ProjectRoot, kbEnabled)
 		if err != nil {
 			ch <- ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true}
 			return
+		}
+		// Inject knowledge base context + index.
+		if kbEnabled {
+			kbIndex := a.buildKBIndex(req.KBBase)
+			systemPrompt += kbIndex
 		}
 		// Sub-agent prompt override. When the sub-agent runner
 		// supplies a prompt (from the agent's own prompt or the
@@ -970,7 +1128,20 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		msgs := []llm.ChatMessage{
 			{Role: llm.RoleSystem, Type: llm.TypeText, Content: systemPrompt},
 		}
-		msgs = append(msgs, req.Messages...)
+		// When knowledge base is off, strip wiki-related messages
+		// (tool calls + results) from history so the LLM doesn't
+		// learn about wiki tools from previous turns
+		// and try to call them via text-format tool_call blocks.
+		if kbEnabled {
+			msgs = append(msgs, req.Messages...)
+		} else {
+			for _, m := range req.Messages {
+				if m.ToolName == "wiki_lookup" || m.ToolName == "wiki_list" {
+					continue
+				}
+				msgs = append(msgs, m)
+			}
+		}
 
 		// Expand any user-uploaded attachments into separate
 		// ChatMessage entries (text msg + image/file msgs).
@@ -1011,6 +1182,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// call tools and is forced to give a text summary.
 		// See opencode's `runner/max-steps.ts:1-16`.
 		maxRounds := MaxRoundsDefault
+		// Per-request override (takes priority).
+		if req.MaxRounds > 0 {
+			maxRounds = req.MaxRounds
+		} else if a.cfg != nil && a.cfg.Limits.MaxRounds > 0 {
+			maxRounds = a.cfg.Limits.MaxRounds
+		}
 		if req.PlanMode {
 			var planTools []llm.ToolDef
 			for _, t := range toolDefs {
@@ -1048,11 +1225,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// with a "stuck" event rather than letting the LLM
 		// hammer the same failing call forever.
 		var (
-			stuckStreak   int
-			prevToolSig   string
-			prevErrored   bool
+			stuckStreak          int
+			prevToolSig          string
+			prevErrored          bool
+			sameToolErrName      string
+			sameToolErrCount     int
+			nearLimitWarningSent bool
 		)
 		const stuckThreshold = 3
+		const sameToolErrMax = 4
 
 		for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
 			roundStart := time.Now()
@@ -1081,6 +1262,36 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// summary. See opencode's `runner/max-steps.ts:1-16`
 			// and `llm.ts:197-209`.
 			isLastRound := maxRounds > 0 && round >= maxRounds
+
+			// Pre-limit warning: when within 10 rounds of the
+			// cap, inject a gentle heads-up so the LLM can wrap
+			// up gracefully instead of being cut off abruptly.
+			// Only injected once — the flag ensures no spam.
+			if !nearLimitWarningSent && maxRounds > 10 && round >= maxRounds-10 && !isLastRound {
+				nearLimitWarningSent = true
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("注意：当前会话轮次即将达到上限（%d 轮，剩余约 %d 轮）。请开始收尾当前任务，优先完成最关键的未完成工作，避免开启需要多轮的新子任务。", maxRounds, maxRounds-round),
+				})
+				ch <- ChatStreamChunk{
+					Phase:    "llm",
+					Step:     "near-limit",
+					Message:  fmt.Sprintf("轮次接近上限（剩余 %d 轮），提醒 LLM 收尾", maxRounds-round),
+					Round:    roundNum,
+					MaxRound: maxRounds,
+				}
+			}
+
+			// Auto-compact before LLM call (skip on last round).
+			// If the context exceeds the token budget, compress
+			// and rebuild the system prompt so the provider call
+			// doesn't fail with a 413. On the last round tools
+			// are disabled anyway so compact isn't worth it.
+			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds) {
+				continue
+			}
+
 			roundMsgs := msgs
 			roundTools := toolDefs
 			if isLastRound {
@@ -1094,28 +1305,54 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				ch <- ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds}
 			}
 
-			stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, normalizeToolResults(roundMsgs), roundTools, opts)
-			for chunk := range stream {
-				if chunk.Err != nil {
-					classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
-					errMsg, errSuggestion, errKind := chunk.Err.Error(), "", ""
-					if apiErr, ok := classified.(*llm.APIError); ok {
-						errMsg = apiErr.Message
-						errSuggestion = apiErr.Suggestion
-						errKind = apiErr.Kind.String()
-					}
+			// LLM stream with retry for recoverable errors
+			// (rate_limit, server_error, network, timeout).
+			const maxLLMRetries = 3
+			var retryableErr error
+			att:
+			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
+				if attempt > 1 {
+					backoff := time.Duration(attempt*attempt) * time.Second
 					ch <- ChatStreamChunk{
-						Phase:      "llm",
-						Error:      errMsg,
-						Suggestion: errSuggestion,
-						ErrorKind:  errKind,
-						Done:       true,
+						Phase:    "llm",
+						Step:     "retry",
+						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt, maxLLMRetries),
+						Round:    roundNum,
+						MaxRound: maxRounds,
 					}
-					return
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
 				}
-				if chunk.Done {
-					break
-				}
+
+				stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, normalizeToolResults(roundMsgs), roundTools, opts)
+				for chunk := range stream {
+					if chunk.Err != nil {
+						classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
+						errMsg, errSuggestion, errKind := chunk.Err.Error(), "", ""
+						if apiErr, ok := classified.(*llm.APIError); ok {
+							errMsg = apiErr.Message
+							errSuggestion = apiErr.Suggestion
+							errKind = apiErr.Kind.String()
+							if isRetryable(apiErr.Kind) && attempt < maxLLMRetries {
+								retryableErr = chunk.Err
+								break // break inner stream loop, retry outer
+							}
+						}
+						ch <- ChatStreamChunk{
+							Phase:      "llm",
+							Error:      errMsg,
+							Suggestion: errSuggestion,
+							ErrorKind:  errKind,
+							Done:       true,
+						}
+						return
+					}
+					if chunk.Done {
+						break att // success — break outer loop too
+					}
 				if chunk.TokensIn > 0 || chunk.TokensOut > 0 {
 					if chunk.TokensIn > totalIn {
 						totalIn = chunk.TokensIn
@@ -1149,7 +1386,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 					existing.ArgsJSON += tcd.ArgsJSON
 				}
+				} // inner for chunk
+			} // outer for attempt (retry loop)
+
+			// If we exhausted retries without success, surface the last error.
+			if retryableErr != nil {
+				ch <- ChatStreamChunk{
+					Phase: "llm",
+					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", maxLLMRetries, retryableErr),
+					Done:  true,
+				}
+				return
 			}
+
 			for _, t := range argsAccum {
 				toolCalls = append(toolCalls, *t)
 			}
@@ -1190,18 +1439,26 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			ch <- ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT}
 		}
 
-			// Build the assistant message for the conversation.
-			// Emit as a single text ChatMessage (tool calls are
-			// separate messages appended below).
-			assistantMsg := llm.ChatMessage{
-				Role:    llm.RoleAssistant,
-				Type:    llm.TypeText,
-				Content: fullContent,
-			}
-			msgs = append(msgs, assistantMsg)
+		// Build the assistant message for the conversation.
+		// Emit as a single text ChatMessage (tool calls are
+		// separate messages appended below).
+		assistantMsg := llm.ChatMessage{
+			Role:    llm.RoleAssistant,
+			Type:    llm.TypeText,
+			Content: fullContent,
+		}
+		msgs = append(msgs, assistantMsg)
 
-			// Persist assistant message later — after tool
-			// results are in partsAcc (see end of this round).
+		// After the first LLM call, strip image base64 from
+		// attachments so subsequent rounds don't re-send
+		// expensive (~330K tokens/MB) image data. The LLM has
+		// already processed the image; a text marker suffices.
+		if roundNum == 1 {
+			stripImageContent(msgs)
+		}
+
+		// Persist assistant message later — after tool
+		// results are in partsAcc (see end of this round).
 
 			// Append tool_call messages for each tool call.
 			for _, tc := range toolCalls {
@@ -1230,16 +1487,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				return
 			}
 
-			// Context window warning: count only meaningful
-			// messages (exclude tool_call/tool_result metadata).
-			meaningful := countMeaningfulMessages(msgs)
-			if meaningful > 120 {
+			// Auto-compact: estimate token budget before the
+			// next LLM turn. If the total estimated tokens
+			// exceed the usable context window, compress the
+			// oldest messages and continue. Mirrors opencode's
+			// `compactIfNeeded()` + Claude Code's auto-compact.
+			if a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds) {
 				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
-				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条有效消息，接近上限，已自动停止。建议执行 /compress 压缩历史后继续。", meaningful), Round: roundNum, MaxRound: maxRounds}
-				ch <- ChatStreamChunk{Done: true}
-				return
-			} else if meaningful > 80 {
-				ch <- ChatStreamChunk{Phase: "context_warn", Step: "context-warn", Message: fmt.Sprintf("上下文已达 %d 条有效消息，建议在完成当前任务后执行 /compress 压缩历史。", meaningful), Round: roundNum, MaxRound: maxRounds}
+				continue
 			}
 
 			ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds}
@@ -1267,7 +1522,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if len(argsPreview) > 200 {
 					argsPreview = argsPreview[:200] + "..."
 				}
-				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
+				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
 				partsAcc.update(startChunk)
 				ch <- startChunk
 			}
@@ -1357,6 +1612,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					defer cancel()
 					defer close(eventCh)
 
+					// Sub-agent concurrency gate: if the
+					// semaphore is set, only N task calls
+					// can run in parallel. Other tools are
+					// not limited.
+					if tc.Name == "task" && a.subAgentSem != nil {
+						select {
+						case a.subAgentSem <- struct{}{}:
+							defer func() { <-a.subAgentSem }()
+						case <-ctx.Done():
+							return
+						}
+					}
+
 					handler, ok := a.tools.Get(tc.Name)
 					if !ok {
 						errMsg := fmt.Sprintf("error: tool %q not found (available: %s)", tc.Name, availableToolNames(availableTools))
@@ -1365,6 +1633,24 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							tc:     tc,
 							result: &tool.CallResult{Content: errMsg, IsError: true},
 							err:    fmt.Errorf("not found"),
+						}
+						return
+					}
+
+					// Refuse wiki/grep tools when knowledge base is
+					// disabled for this session. The tools may still
+					// be registered globally (KB enabled at startup)
+					// but are blocked at dispatch time so the LLM
+					// cannot call them via text-format tool_call
+					// blocks even if they appear in conversation
+					// history from a previous KB-enabled turn.
+					if !kbEnabled && (tc.Name == "wiki_lookup" || tc.Name == "wiki_list") {
+						errMsg := fmt.Sprintf("error: knowledge base is disabled for this session — enable it in settings to use %s", tc.Name)
+						outcomes[i] = toolOutcome{
+							idx:    i,
+							tc:     tc,
+							result: &tool.CallResult{Content: errMsg, IsError: true},
+							err:    fmt.Errorf("kb disabled"),
 						}
 						return
 					}
@@ -1403,8 +1689,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							var decision tool.SandboxDecision
 							var reason string
 							if tc.Name == "exec_command" {
-								decision = a.sandbox.CheckExecDecision(tc.ArgsJSON)
-								reason = a.sandbox.MatchedPattern(tc.ArgsJSON)
+								var ea struct{ Command string `json:"command"` }
+								json.Unmarshal([]byte(tc.ArgsJSON), &ea)
+								command := ea.Command
+								if command == "" {
+									command = tc.ArgsJSON
+								}
+								decision = a.sandbox.CheckExecDecision(command)
+								reason = a.sandbox.MatchedPattern(command)
 							} else {
 								var wa struct{ Path string `json:"path"` }
 								json.Unmarshal([]byte(tc.ArgsJSON), &wa)
@@ -1451,7 +1743,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							}
 						}
 					}
+					// Persist question before blocking for user input.
+					if tc.Name == "question" && a.store != nil {
+						persistQuestion(req.SessionID, a.store, string(argsRaw))
+					}
 					result, err := handler(toolCtx, argsRaw)
+					// Persist answer after user responds.
+					if tc.Name == "question" && result != nil && a.store != nil {
+						persistQuestionAnswer(req.SessionID, a.store, result.Content)
+					}
 					outcomes[i] = toolOutcome{
 						idx:     i,
 						tc:      tc,
@@ -1487,7 +1787,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					} else if o.err != nil {
 						errMsg = o.err.Error()
 					}
-					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolID: tc.ID, ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(errChunk)
 					ch <- errChunk
 					toolMsg := llm.ChatMessage{
@@ -1519,11 +1819,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 				if result.IsError {
 					roundAnyToolErrored = true
-					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(warnChunk)
 					ch <- warnChunk
 				} else {
-					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					// For tools whose result the frontend needs to
 					// *parse* (todo_write), also send the untruncated
 					// payload. Truncated newlines → spaces and the 300
@@ -1550,7 +1850,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// user-facing error messages.
 				llmContent = fmt.Sprintf("Tool %s returned an error: %s", tc.Name, result.Content)
 			} else {
-				llmContent = truncateToolResult(tc.Name, result.Content)
+				llmContent = a.truncateToolResult(tc.Name, result.Content)
 			}
 				toolMsg := llm.ChatMessage{
 					Role:      llm.RoleTool,
@@ -1598,6 +1898,48 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				ch <- ChatStreamChunk{Done: true}
 				return
 			}
+
+			// Same-tool-name error counter: if a single tool
+			// errors N times in a row (even with different
+			// args — the stuck-loop guard only catches
+			// identical-args loops), inject a system message
+			// telling the LLM to stop retrying.
+			if roundAnyToolErrored && len(toolCalls) == 1 {
+				name := toolCalls[0].Name
+				if name == sameToolErrName {
+					sameToolErrCount++
+				} else {
+					sameToolErrName = name
+					sameToolErrCount = 1
+				}
+			} else {
+				sameToolErrName = ""
+				sameToolErrCount = 0
+			}
+			if sameToolErrCount >= sameToolErrMax {
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("工具 `%s` 已连续失败 %d 次。不要重试 — 改用其他方式完成任务（如 read_file、list_files、或 task 子代理）。", sameToolErrName, sameToolErrCount),
+				})
+				ch <- ChatStreamChunk{
+					Phase:   "limit",
+					Step:    "same-tool-err-limit",
+					Message: fmt.Sprintf("%s 已连续失败 %d 次，改用其他方式。", sameToolErrName, sameToolErrCount),
+					Round:   roundNum,
+				}
+				sameToolErrCount = 0
+			}
+
+			// Tool result pruning: remove old tool output content
+			// after N rounds to keep the context lean. Protects
+			// the most recent rounds so the LLM still sees
+			// immediately-relevant results.
+			pr := pruneAfterRounds
+			if a.cfg != nil && a.cfg.Limits.PruneAfterRounds > 0 {
+				pr = a.cfg.Limits.PruneAfterRounds
+			}
+			pruneOldToolResults(msgs, roundNum, pr)
 		}
 
 		if maxRounds > 0 {
@@ -1638,19 +1980,6 @@ func normalizeToolResults(msgs []llm.ChatMessage) []llm.ChatMessage {
 	return out
 }
 
-// countMeaningfulMessages counts messages that contribute to the
-// context window (excludes tool_call/tool_result metadata rows).
-func countMeaningfulMessages(msgs []llm.ChatMessage) int {
-	n := 0
-	for _, m := range msgs {
-		if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
-			continue
-		}
-		n++
-	}
-	return n
-}
-
 func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int) {
 	if store == nil {
 		return
@@ -1675,6 +2004,39 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 		}
 	}
 	store.AddChatMessageWithMetaTo(convID, msg, meta)
+}
+
+// persistQuestion stores the question tool's arguments as a
+// msg_type=6 message so the question table is visible in
+// session history after reload.
+func persistQuestion(convID string, store *memory.Store, questionsJSON string) {
+	if store == nil || questionsJSON == "" {
+		return
+	}
+	msg := llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		MsgType:     llm.MsgTypeQuestion,
+		SubmitToLLM: 1,
+		Content:     questionsJSON,
+	}
+	store.AddChatMessageTo(convID, msg)
+}
+
+// persistQuestionAnswer stores the user's question answers as a
+// msg_type=6 message, paired with the preceding question message.
+func persistQuestionAnswer(convID string, store *memory.Store, answersJSON string) {
+	if store == nil || answersJSON == "" {
+		return
+	}
+	msg := llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		MsgType:     llm.MsgTypeQuestion,
+		SubmitToLLM: 1,
+		Content:     answersJSON,
+	}
+	store.AddChatMessageTo(convID, msg)
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction
@@ -1709,6 +2071,103 @@ func availableToolNames(tools []tool.Tool) string {
 // hammering the same failing call. Returns "" if there are
 // no tool calls (a "no progress" round is not a stuck round —
 // the LLM may have answered with text).
+// tryAutoCompact checks the message list's estimated token count
+// against the usable context window. If exceeded and a summarizer is
+// available, it compresses the oldest messages, backfills the summary
+// into the system prompt, emits a status chunk, and returns true
+// ("caller should continue to the next round"). Returns false when no
+// compaction is needed or no summarizer is wired.
+func (a *Agent) tryAutoCompact(
+	ctx context.Context,
+	msgs *[]llm.ChatMessage,
+	req ChatRequest,
+	ch chan<- ChatStreamChunk,
+	roundNum, maxRounds int,
+) bool {
+	if a.summarizer == nil || a.store == nil || req.SessionID == "" {
+		return false
+	}
+	total := llm.EstimateTokensMessages(*msgs)
+	ctxWindow := a.llm.ContextWindow(req.Provider, req.Model)
+	buf := llm.AutoCompactBuffer
+	if a.cfg != nil && a.cfg.Limits.AutoCompactBuffer > 0 {
+		buf = a.cfg.Limits.AutoCompactBuffer
+	}
+	if !llm.ShouldCompactWithBuf(total, ctxWindow, buf) {
+		return false
+	}
+
+	ch <- ChatStreamChunk{
+		Phase:    "compact",
+		Step:     "auto-compact",
+		Message:  fmt.Sprintf("上下文接近上限 (≈%d / %d tokens)，自动压缩历史…", total, llm.UsableContextWithBuf(ctxWindow, buf)+buf),
+		Round:    roundNum,
+		MaxRound: maxRounds,
+	}
+
+	ok, summary, err := a.summarizer.Compress(ctx, req.SessionID)
+	if err != nil || !ok {
+		ch <- ChatStreamChunk{
+			Phase:   "compact",
+			Step:    "auto-compact-fail",
+			Message: fmt.Sprintf("自动压缩失败: %v", err),
+			Round:   roundNum,
+			MaxRound: maxRounds,
+		}
+		// Fallback: hard-truncate the message list so the LLM
+		// call doesn't fail with a 413. Drop oldest non-system
+		// messages to stay within the usable context window.
+		usable := llm.UsableContextWithBuf(ctxWindow, buf)
+		if usable > 0 {
+			truncateToFit(msgs, usable)
+			ch <- ChatStreamChunk{
+				Phase:    "compact",
+				Step:     "auto-compact-fallback",
+				Message:  fmt.Sprintf("压缩失败，已截断上下文至 ≈%d tokens", llm.EstimateTokensMessages(*msgs)),
+				Round:    roundNum,
+				MaxRound: maxRounds,
+			}
+			_ = summary
+			return true
+		}
+		return false
+	}
+
+	ch <- ChatStreamChunk{
+		Phase:   "compact",
+		Step:    "auto-compact-ok",
+		Message: "上下文已压缩，继续执行…",
+		Round:   roundNum,
+		MaxRound: maxRounds,
+	}
+
+	// Backfill: reload messages after compression point and
+	// append the summary to the system prompt.
+	lastComp := a.store.LastCompressedIDFor(req.SessionID)
+	if lastComp > 0 {
+		hist, _, _ := a.store.GetChatMessagesAfterIDFor(req.SessionID, 0, lastComp)
+		compSum := a.store.CompressedSummaryFor(req.SessionID)
+
+		newMsgs := make([]llm.ChatMessage, 0, len(hist)+2)
+		// Keep the system prompt (first message).
+		newMsgs = append(newMsgs, (*msgs)[0])
+		if compSum != "" {
+			newMsgs[0].Content += "\n\n[前文摘要]\n" + compSum
+		}
+		// Append messages from DB (after compression point).
+		for _, m := range hist {
+			if m.Role == llm.RoleSystem {
+				continue
+			}
+			newMsgs = append(newMsgs, m)
+		}
+		*msgs = newMsgs
+	}
+
+	_ = summary
+	return true
+}
+
 func toolCallSignature(calls []nativeToolCall) string {
 	if len(calls) == 0 {
 		return ""
@@ -1746,7 +2205,7 @@ func toolCallSignature(calls []nativeToolCall) string {
 // tool blocks, and the model is forced into text-only mode).
 const MaxStepsPrompt = `CRITICAL - MAXIMUM STEPS REACHED
 
-The maximum number of steps allowed for this task has been reached. Tools are disabled for this turn. Respond with text only.
+The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.
 
 STRICT REQUIREMENTS:
 1. Do NOT make any tool calls (no reads, writes, edits, searches, or any other tools)
@@ -1761,12 +2220,12 @@ Response must include:
 
 Respond in the same language as the conversation. Any attempt to use tools is a critical violation. Respond with text ONLY.`
 
-// MaxRoundsDefault is the implicit per-session cap when the
-// caller does not specify maxRounds (build mode). Prevents
-// infinite loops in the rare case where the LLM keeps
-// retrying the same failing tool call. The /compress slash
-// command is the user's escape hatch once the cap fires.
-const MaxRoundsDefault = 30
+// MaxRoundsDefault is the safety-net per-session cap (build mode).
+// At 300 rounds this is a last-resort guard against infinite loops;
+// normal conversations are limited by the auto-compaction token budget,
+// not by round count. When the cap fires the LLM responds with
+// MaxStepsPrompt and the user can continue with a follow-up message.
+const MaxRoundsDefault = 300
 
 const (
 	// Tool result caps keep the LLM context and SQLite
@@ -1788,8 +2247,23 @@ const (
 	maxToolResultDefault = 6000
 )
 
-func truncateToolResult(name string, content string) string {
-	if len(content) <= maxToolResultDefault {
+func (a *Agent) truncateToolResult(name string, content string) string {
+	execCap := maxToolResultExec
+	readCap := maxToolResultRead
+	defaultCap := maxToolResultDefault
+	if a.cfg != nil {
+		if a.cfg.Limits.ToolResultExecCap > 0 {
+			execCap = a.cfg.Limits.ToolResultExecCap
+		}
+		if a.cfg.Limits.ToolResultReadCap > 0 {
+			readCap = a.cfg.Limits.ToolResultReadCap
+		}
+		if a.cfg.Limits.ToolResultDefaultCap > 0 {
+			defaultCap = a.cfg.Limits.ToolResultDefaultCap
+		}
+	}
+
+	if len(content) <= defaultCap {
 		return content
 	}
 
@@ -1797,12 +2271,12 @@ func truncateToolResult(name string, content string) string {
 	keepHead := true
 	switch name {
 	case "exec_command", "bash", "shell":
-		cap_ = maxToolResultExec
+		cap_ = execCap
 		keepHead = false
 	case "read_file", "list_files", "recall":
-		cap_ = maxToolResultRead
+		cap_ = readCap
 	default:
-		cap_ = maxToolResultDefault
+		cap_ = defaultCap
 	}
 
 	if len(content) <= cap_ {
@@ -1944,4 +2418,89 @@ func redactPhantomErrors(s string) (string, bool) {
 	}
 	out := phantomVisionErrorRe.ReplaceAllString(s, phantomVisionErrorReplacement)
 	return out, out != s
+}
+
+// isRetryable returns true for API error kinds that are transient and
+// warrant a retry with backoff.
+func isRetryable(kind llm.ErrorKind) bool {
+	switch kind {
+	case llm.KindRateLimit, llm.KindServer, llm.KindNetwork, llm.KindTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+const pruneAfterRounds = 15
+
+// pruneOldToolResults scans the message list backward and marks tool
+// results older than `keepRounds` as pruned. Each assistant+tool block
+// counts as one round. Recent tool results are left intact so the LLM
+// retains immediately-relevant context. Mirrors opencode's
+// PRUNE_PROTECT / PRUNE_MINIMUM pattern.
+func pruneOldToolResults(msgs []llm.ChatMessage, currentRound, keepRounds int) {
+	if len(msgs) == 0 || currentRound <= keepRounds {
+		return
+	}
+	// Count backward to find the round cutoff.
+	pruneBefore := currentRound - keepRounds
+	roundCount := 0
+	cutoff := len(msgs) - 1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := &msgs[i]
+		if m.Role == llm.RoleAssistant && m.Type == llm.TypeText {
+			roundCount++
+			if roundCount >= pruneBefore {
+				cutoff = i
+				break
+			}
+		}
+	}
+	// Prune tool results before the cutoff.
+	for i := 0; i < cutoff; i++ {
+		m := &msgs[i]
+		if m.Type == llm.TypeToolResult && m.Content != "" && !strings.HasPrefix(m.Content, "[pruned]") {
+			m.Content = "[pruned]"
+		}
+	}
+}
+
+// stripImageContent replaces base64 image payloads in msgs with
+// a text marker. The LLM has already processed the image on the
+// first round; subsequent rounds don't need the raw bytes.
+func stripImageContent(msgs []llm.ChatMessage) {
+	for i := range msgs {
+		if msgs[i].Type == llm.TypeImage && msgs[i].Content != "" {
+			msgs[i].Content = fmt.Sprintf("[image: %s (%s) — 已在首轮展示]",
+				msgs[i].Name, msgs[i].MimeType)
+		}
+	}
+}
+
+// truncateToFit drops the oldest non-system messages from the slice
+// until the total estimated tokens fit within usable. Messages are
+// removed from the front (after msgs[0]) so the most recent context
+// is preserved.
+func truncateToFit(msgs *[]llm.ChatMessage, usable int) {
+	if len(*msgs) <= 1 {
+		return
+	}
+	sysMsg := (*msgs)[0]
+	rest := (*msgs)[1:]
+	if total := llm.EstimateTokensMessages(rest); total <= usable {
+		return
+	}
+	// Walk backward from the end, keeping messages that fit.
+	end := len(rest) - 1
+	for end >= 0 {
+		if llm.EstimateTokensMessages(rest[:end+1]) <= usable {
+			break
+		}
+		end--
+	}
+	if end < 0 {
+		*msgs = []llm.ChatMessage{sysMsg, rest[len(rest)-1]}
+	} else {
+		*msgs = append([]llm.ChatMessage{sysMsg}, rest[end:]...)
+	}
 }

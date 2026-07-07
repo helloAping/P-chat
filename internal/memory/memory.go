@@ -25,12 +25,13 @@ import (
 
 // Conversation is a logical chat session.
 type Conversation struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Metadata  string    `json:"metadata,omitempty"`
-	Archived  bool      `json:"archived"`
+	ID          string    `json:"id"`
+	Title       string    `json:"title,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Metadata    string    `json:"metadata,omitempty"`
+	Archived    bool      `json:"archived"`
+	VectorStore string    `json:"vector_store,omitempty"`
 }
 
 // Message is one entry in a conversation's history.
@@ -42,6 +43,8 @@ type Message struct {
 	Tokens         int       `json:"tokens,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	Metadata       string    `json:"metadata,omitempty"`
+	MsgType        int       `json:"msg_type,omitempty"`
+	SubmitToLLM    int       `json:"submit_to_llm,omitempty"`
 }
 
 // Summary records an LLM-generated compression of a range of messages.
@@ -318,6 +321,8 @@ func (s *Store) AddChatMessageTo(convID string, msg llm.ChatMessage) {
 		Content:        msg.Content,
 		CreatedAt:      time.Now(),
 		Metadata:       string(b),
+		MsgType:        msg.MsgType,
+		SubmitToLLM:    msg.SubmitToLLM,
 	})
 	full := len(s.pendingWrites) >= s.maxPending
 	s.pendingMu.Unlock()
@@ -349,6 +354,8 @@ func (s *Store) AddChatMessageWithMetaTo(convID string, msg llm.ChatMessage, ext
 		Content:        msg.Content,
 		CreatedAt:      time.Now(),
 		Metadata:       string(b),
+		MsgType:        msg.MsgType,
+		SubmitToLLM:    msg.SubmitToLLM,
 	})
 	full := len(s.pendingWrites) >= s.maxPending
 	s.pendingMu.Unlock()
@@ -454,14 +461,14 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 	)
 	if beforeID > 0 {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at FROM messages
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
 			 WHERE conversation_id = ? AND id < ?
 			 ORDER BY id DESC LIMIT ?`,
 			convID, beforeID, limitOrHuge(limit),
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at FROM messages
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
 			 WHERE conversation_id = ?
 			 ORDER BY id DESC LIMIT ?`,
 			convID, limitOrHuge(limit),
@@ -485,15 +492,16 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 			role, content         string
 			metaStr               sql.NullString
 			created               int64
+			msgType, submitToLLM  int
 		)
-		if err := rows.Scan(&id, &role, &content, &metaStr, &created); err != nil {
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM); err != nil {
 			break
 		}
 		meta := ""
 		if metaStr.Valid {
 			meta = metaStr.String
 		}
-		msgs := decodeChatMessages(role, content, meta)
+		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
 			rev = append(rev, row{id: id, msg: m, meta: meta, created: created})
 		}
@@ -543,10 +551,13 @@ func encodeChatMeta(msg llm.ChatMessage) map[string]string {
 // decodeChatMessages decodes one row from the messages table into
 // one or more ChatMessage values. Handles both new format (type key)
 // and legacy format (multi_content / tool_calls / tool_call_id).
-func decodeChatMessages(role, content string, metaStr string) []llm.ChatMessage {
+// dbMsgType and dbSubmitToLLM come from the dedicated columns (0 when
+// not yet backfilled); the function falls back to metadata inference
+// when they are zero.
+func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbSubmitToLLM int) []llm.ChatMessage {
 	if metaStr == "" || metaStr == "{}" {
 		if content != "" {
-			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content}}
+			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1}}
 		}
 		return nil
 	}
@@ -554,23 +565,26 @@ func decodeChatMessages(role, content string, metaStr string) []llm.ChatMessage 
 	var meta map[string]string
 	if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
 		if content != "" {
-			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content}}
+			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1}}
 		}
 		return nil
 	}
 
 	// New format: metadata has a "type" key.
 	if t, ok := meta["type"]; ok && t != "" {
+		mt, sl := resolveMsgType(t, meta["tool_name"], dbMsgType, dbSubmitToLLM)
 		return []llm.ChatMessage{{
-			Role:      role,
-			Type:      t,
-			Content:   content,
-			Name:      meta["name"],
-			MimeType:  meta["mime_type"],
-			ToolID:    meta["tool_id"],
-			ToolName:  meta["tool_name"],
-			ToolInput: meta["tool_input"],
-			ToolError: meta["tool_error"] == "true",
+			Role:        role,
+			Type:        t,
+			Content:     content,
+			Name:        meta["name"],
+			MimeType:    meta["mime_type"],
+			ToolID:      meta["tool_id"],
+			ToolName:    meta["tool_name"],
+			ToolInput:   meta["tool_input"],
+			ToolError:   meta["tool_error"] == "true",
+			MsgType:     mt,
+			SubmitToLLM: sl,
 		}}
 	}
 
@@ -583,21 +597,23 @@ func decodeChatMessages(role, content string, metaStr string) []llm.ChatMessage 
 				switch p.Type {
 				case "text":
 					if p.Text != "" {
-						msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: p.Text})
+						msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: p.Text, MsgType: llm.MsgTypeText, SubmitToLLM: 1})
 					}
 				case "image_url":
 					if p.ImageURL != nil {
 						data := extractBase64FromDataURL(p.ImageURL.URL)
 						msgs = append(msgs, llm.ChatMessage{
-							Role:    role,
-							Type:    llm.TypeImage,
-							Content: data,
+							Role:        role,
+							Type:        llm.TypeImage,
+							Content:     data,
+							MsgType:     llm.MsgTypeImage,
+							SubmitToLLM: 1,
 						})
 					}
 				}
 			}
 			if len(msgs) == 0 && content != "" {
-				msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: content})
+				msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1})
 			}
 			return msgs
 		}
@@ -609,15 +625,17 @@ func decodeChatMessages(role, content string, metaStr string) []llm.ChatMessage 
 		if err := json.Unmarshal([]byte(tcJSON), &tcs); err == nil {
 			var msgs []llm.ChatMessage
 			if content != "" {
-				msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: content})
+				msgs = append(msgs, llm.ChatMessage{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1})
 			}
 			for _, tc := range tcs {
 				msgs = append(msgs, llm.ChatMessage{
-					Role:      role,
-					Type:      llm.TypeToolCall,
-					ToolID:    tc.ID,
-					ToolName:  tc.Function.Name,
-					ToolInput: tc.Function.Arguments,
+					Role:        role,
+					Type:        llm.TypeToolCall,
+					ToolID:      tc.ID,
+					ToolName:    tc.Function.Name,
+					ToolInput:   tc.Function.Arguments,
+					MsgType:     llm.MsgTypeTool,
+					SubmitToLLM: 1,
 				})
 			}
 			return msgs
@@ -626,20 +644,38 @@ func decodeChatMessages(role, content string, metaStr string) []llm.ChatMessage 
 
 	// Legacy format: tool_call_id → tool_result message.
 	if tcID, ok := meta["tool_call_id"]; ok && tcID != "" {
+		mt, sl := resolveMsgType("tool_result", meta["tool_name"], dbMsgType, dbSubmitToLLM)
 		return []llm.ChatMessage{{
-			Role:     llm.RoleTool,
-			Type:     llm.TypeToolResult,
-			Content:  content,
-			ToolID:   tcID,
-			ToolName: meta["tool_name"],
+			Role:        llm.RoleTool,
+			Type:        llm.TypeToolResult,
+			Content:     content,
+			ToolID:      tcID,
+			ToolName:    meta["tool_name"],
+			MsgType:     mt,
+			SubmitToLLM: sl,
 		}}
 	}
 
 	// Fallback.
 	if content != "" {
-		return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content}}
+		return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1}}
 	}
 	return nil
+}
+
+// resolveMsgType picks the correct MsgType / SubmitToLLM for a decoded
+// message. Prefer the dedicated DB columns when populated; otherwise
+// infer from the legacy Type string + tool_name.
+func resolveMsgType(legacyType, toolName string, dbMsgType, dbSubmitToLLM int) (int, int) {
+	if dbMsgType != 0 || dbSubmitToLLM != 0 {
+		mt := dbMsgType
+		sl := dbSubmitToLLM
+		if mt == 0 {
+			mt = llm.MsgTypeText
+		}
+		return mt, sl
+	}
+	return llm.MsgTypeForLegacy(legacyType, toolName)
 }
 func (s *Store) Flush() error {
 	s.pendingMu.Lock()
@@ -658,7 +694,7 @@ func (s *Store) Flush() error {
 		return err
 	}
 	stmt, err := tx.Prepare(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		_ = tx.Rollback()
@@ -666,7 +702,7 @@ func (s *Store) Flush() error {
 	}
 	defer stmt.Close()
 	for _, m := range pending {
-		if _, err := stmt.Exec(m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(), m.Metadata); err != nil {
+		if _, err := stmt.Exec(m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -897,7 +933,7 @@ func (s *Store) SetCurrent(id string) error {
 // ListConversations returns all conversations ordered by updated_at desc.
 func (s *Store) ListConversations() []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`)
+	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`)
 	if err != nil {
 		return nil
 	}
@@ -907,7 +943,7 @@ func (s *Store) ListConversations() []Conversation {
 		var c Conversation
 		var created, updated int64
 		var archived int
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore); err != nil {
 			return out
 		}
 		c.CreatedAt = time.Unix(created, 0)
@@ -965,9 +1001,9 @@ func (s *Store) GetConversation(id string) (Conversation, error) {
 	var created, updated int64
 	var archived int
 	err := s.db.QueryRow(
-		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE id = ?`,
+		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE id = ?`,
 		id,
-	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived)
+	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore)
 	if err != nil {
 		return Conversation{}, err
 	}
@@ -980,6 +1016,12 @@ func (s *Store) GetConversation(id string) (Conversation, error) {
 // ArchiveConversation marks a conversation as archived.
 func (s *Store) ArchiveConversation(id string) error {
 	_, err := s.db.Exec(`UPDATE conversations SET archived = 1, updated_at = ? WHERE id = ?`, time.Now().Unix(), id)
+	return err
+}
+
+// SetConversationVectorStore sets the vector store binding for a session.
+func (s *Store) SetConversationVectorStore(id, vectorStore string) error {
+	_, err := s.db.Exec(`UPDATE conversations SET vector_store = ? WHERE id = ?`, vectorStore, id)
 	return err
 }
 
@@ -1007,7 +1049,7 @@ func (s *Store) ArchiveByProjectPath(projectPath string) (int, error) {
 // ListArchivedConversations returns all archived conversations.
 func (s *Store) ListArchivedConversations() []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`)
+	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`)
 	if err != nil {
 		return nil
 	}
@@ -1017,7 +1059,7 @@ func (s *Store) ListArchivedConversations() []Conversation {
 		var c Conversation
 		var created, updated int64
 		var archived int
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore); err != nil {
 			return out
 		}
 		c.CreatedAt = time.Unix(created, 0)
@@ -1090,7 +1132,7 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	// With SetMaxOpenConns(1) the single connection is held while
 	// rows is open; a tx.Begin() would deadlock waiting for it.
 	rows, err := s.db.Query(
-		`SELECT role, content, metadata, created_at FROM messages
+		`SELECT role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
 		 WHERE conversation_id = ? AND id <= ? ORDER BY id ASC`,
 		sourceConvID, beforeID,
 	)
@@ -1099,14 +1141,15 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	}
 
 	type row struct {
-		role, content, meta string
-		created             int64
+		role, content, meta         string
+		created                     int64
+		msgType, submitToLLM        int
 	}
 	var msgs []row
 	for rows.Next() {
 		var r row
 		var metaStr sql.NullString
-		if err := rows.Scan(&r.role, &r.content, &metaStr, &r.created); err != nil {
+		if err := rows.Scan(&r.role, &r.content, &metaStr, &r.created, &r.msgType, &r.submitToLLM); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -1140,7 +1183,7 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	}()
 
 	stmt, err := tx.Prepare(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return nil, err
@@ -1148,7 +1191,7 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	defer stmt.Close()
 
 	for _, r := range msgs {
-		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta); err != nil {
+		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta, r.msgType, r.submitToLLM); err != nil {
 			return nil, err
 		}
 	}
@@ -1370,7 +1413,7 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 		return nil, nil, nil
 	}
 	rows, err := s.db.Query(
-		`SELECT id, role, content, metadata, created_at FROM messages
+		`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
 		 WHERE conversation_id = ? AND id > ?
 		 ORDER BY id DESC LIMIT ?`,
 		convID, afterID, limitOrHuge(limit),
@@ -1386,21 +1429,22 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 		created int64
 	}
 	var rev []row
-	for rows.Next() {
-		var (
-			id                    int64
-			role, content         string
-			metaStr               sql.NullString
-			created               int64
-		)
-		if err := rows.Scan(&id, &role, &content, &metaStr, &created); err != nil {
-			break
-		}
-		meta := ""
-		if metaStr.Valid {
-			meta = metaStr.String
-		}
-		msgs := decodeChatMessages(role, content, meta)
+		for rows.Next() {
+			var (
+				id                    int64
+				role, content         string
+				metaStr               sql.NullString
+				created               int64
+				msgType, submitToLLM  int
+			)
+			if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM); err != nil {
+				break
+			}
+			meta := ""
+			if metaStr.Valid {
+				meta = metaStr.String
+			}
+			msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
 			rev = append(rev, row{msg: m, meta: meta, created: created})
 		}

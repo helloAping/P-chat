@@ -18,14 +18,42 @@ import (
 // been removed. The loader still accepts a legacy config.yaml as
 // a one-shot migration source — see Load.
 type Config struct {
-	Server   ServerConfig   `json:"server"`
-	LLM      LLMConfig      `json:"llm"`
-	Style    StyleConfig    `json:"style"`
-	Tools    ToolsConfig    `json:"tools"`
-	Memory   MemoryConfig   `json:"memory"`
-	Sandbox  SandboxConfig  `json:"sandbox"`
-	SubAgent SubAgentConfig `json:"subagent"`
-	MCP      MCPConfig      `json:"mcp"`
+	Server    ServerConfig    `json:"server"`
+	LLM       LLMConfig       `json:"llm"`
+	Style     StyleConfig     `json:"style"`
+	Tools     ToolsConfig     `json:"tools"`
+	Memory    MemoryConfig    `json:"memory"`
+	Sandbox   SandboxConfig   `json:"sandbox"`
+	SubAgent  SubAgentConfig  `json:"subagent"`
+	MCP       MCPConfig       `json:"mcp"`
+	Knowledge KnowledgeConfig `json:"knowledge"`
+	Limits    LimitsConfig    `json:"limits"`
+}
+
+// LimitsConfig controls resource caps for the agent loop.
+type LimitsConfig struct {
+	// AutoCompactBuffer is the token headroom reserved before
+	// auto-compression triggers. Default 20000.
+	AutoCompactBuffer int `json:"auto_compact_buffer"`
+	// ToolResultExecCap is the max output chars fed to the LLM
+	// from exec_command. Default 4000.
+	ToolResultExecCap int `json:"tool_result_exec_cap"`
+	// ToolResultReadCap is the max output chars from read_file.
+	// Default 8000.
+	ToolResultReadCap int `json:"tool_result_read_cap"`
+	// ToolResultDefaultCap is the max output chars for all other
+	// tools. Default 6000.
+	ToolResultDefaultCap int `json:"tool_result_default_cap"`
+	// PruneAfterRounds marks tool results older than this many
+	// rounds as [pruned]. Default 15. 0 = disable pruning.
+	PruneAfterRounds int `json:"prune_after_rounds"`
+	// MaxRounds overrides the agent's built-in safety-net round cap.
+	// Default 300. 0 = unlimited.
+	MaxRounds int `json:"max_rounds"`
+	// MaxStoredMessages caps the SQLite messages table. When set,
+	// messages beyond this count per conversation are deleted oldest-
+	// first. 0 = unlimited (default).
+	MaxStoredMessages int `json:"max_stored_messages"`
 }
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
@@ -304,6 +332,32 @@ type MCPServerConfig struct {
 	Timeout string            `json:"timeout,omitempty"`
 }
 
+// KnowledgeConfig controls the wiki-based knowledge base system.
+// Uses SQLite FTS5 for full-text search; no vector embeddings required.
+type KnowledgeConfig struct {
+	Enabled     bool            `json:"enabled"`
+	AutoIndex   bool            `json:"auto_index"`
+	Bases       []KnowledgeBase `json:"bases,omitempty"`
+	Initialized bool            `json:"initialized,omitempty"`
+}
+
+// KnowledgeBase defines a local directory to scan into the wiki index.
+// Text files are parsed zero-cost via wiki parser. Media files (image/video/
+// audio/pdf) require an AI model selected via ScanModel.
+type KnowledgeBase struct {
+	Name      string   `json:"name"`
+	Path      string   `json:"path"`
+	Enabled   bool     `json:"enabled"`
+	FileTypes []string `json:"file_types,omitempty"`
+
+	// ScanModel is "{provider}/{model}" for AI media processing, or "" for text-only.
+	ScanModel      string   `json:"scan_model"`
+	ScanMediaTypes []string `json:"scan_media_types"` // "image","video","audio","pdf"
+	AutoScan       bool     `json:"auto_scan"`
+	ExcludePatterns []string `json:"exclude_patterns"`
+	MaxFileSize    int64    `json:"max_file_size"` // 0 = default (5MB)
+}
+
 type MemoryConfig struct {
 	Enabled    bool `json:"enabled"`
 	MaxHistory int  `json:"max_history"`
@@ -439,6 +493,8 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 		}
 	}
 
+	migrateKnowledgeDefaults(cfg)
+
 	return cfg, nil
 }
 
@@ -483,7 +539,7 @@ func Default() *Config {
 		},
 		Memory: MemoryConfig{
 			Enabled:    true,
-			MaxHistory: 50,
+			MaxHistory: 0,
 		},
 		Sandbox: SandboxConfig{
 			Enabled:             true,
@@ -496,9 +552,16 @@ func Default() *Config {
 			// Default safety stance: deny exec_command in sub-agents.
 			// Users can override by setting allowed_tools explicitly.
 			DeniedTools: []string{"exec_command"},
+			// Enable result caching by default so repeated sub-agent
+			// tasks (e.g. searching the same file) hit the cache.
+			CacheTTL: "10m",
 		},
 		MCP: MCPConfig{
 			Enabled: false,
+		},
+		Knowledge: KnowledgeConfig{
+			Enabled:   false,
+			AutoIndex: false,
 		},
 	}
 }

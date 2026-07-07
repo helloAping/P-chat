@@ -70,6 +70,8 @@ export interface Session {
   plan_mode?: boolean
   permission_level?: string
   reasoning_effort?: string
+  vector_store?: string
+  knowledge_base?: string
 }
 
 export interface Attachment {
@@ -106,17 +108,10 @@ export type MessagePart =
   | { kind: 'thinking'; text: string; streaming?: boolean }
   | {
       kind: 'tool'
-      // The tool call's stable id, e.g. "read_file".
-      // For non-native calls parsed out of markdown, the
-      // id is undefined and the call is keyed by index.
       id?: string
+      tool_id?: string
       name: string
-      // JSON-encoded arguments string. Empty until the
-      // call's args have been parsed.
       args?: string
-      // 'start' | 'ok' | 'warn' | 'error'. Defaults to
-      // 'start' on creation; updated when the matching
-      // 'tool' event arrives.
       status: 'start' | 'ok' | 'warn' | 'error'
       result?: string
       error?: string
@@ -124,42 +119,21 @@ export type MessagePart =
     }
   | {
       kind: 'sub_agent'
-      // The sub-agent's task description. Acts as the
-      // card's primary label and the unique key (no id
-      // on the wire).
       task: string
-      // 'start' | 'ok' | 'err'.
       status: 'start' | 'ok' | 'err'
-      // The sub-agent's own message stream — same
-      // MessagePart union, recursively nested. (We don't
-      // actually recurse in practice; sub-agents cannot
-      // spawn sub-agents. The type just allows it.)
       parts: MessagePart[]
       elapsed?: string
-      // The agent's name (e.g. "explore", "plan",
-      // "general-purpose", or a custom agent from
-      // .p-chat/agent/*.md). Surfaced in the card header.
       agentType?: string
-      // The agent's accent color ("#RRGGBB" or CSS color
-      // name). Tints the card border + badge.
       agentColor?: string
-      // The model the sub-agent is using (e.g.
-      // "gpt-4o-mini"). Shown as a small chip when set.
       agentModel?: string
-      // The resume-by-id key. Surfaced as a monospace
-      // badge in the footer; click to copy.
       taskId?: string
-      // The agent's one-line "when to use" hint from the
-      // registry. Surfaced as a hover tooltip on the
-      // agent-name badge so the user can read the full
-      // hint without expanding the card body.
       agentDescription?: string
-      // The reason the sub-agent failed. Only set when
-      // status === 'err'. Surfaced as a tooltip on the
-      // "失败" status so the user can see *why* without
-      // expanding the card body. Empty for soft-fail
-      // (content produced) and for ok status.
       failureReason?: string
+    }
+  | {
+      kind: 'question'
+      text: string       // questions JSON
+      name?: string      // answers JSON (when answered)
     }
 
 export type SubAgentPart = Extract<MessagePart, { kind: 'sub_agent' }>
@@ -176,6 +150,7 @@ export interface TodoItem {
 export interface Message {
   id?: number
   role: 'user' | 'assistant' | 'tool' | 'system'
+  msg_type?: number
   // For user / system messages this is the text body.
   // For assistant messages, prefer `parts` — but `content`
   // is kept in sync as a denormalized cache so the
@@ -240,6 +215,8 @@ export interface UpdateSessionMetaResponse {
   plan_mode?: boolean
   permission_level?: string
   reasoning_effort?: string
+  vector_store?: string
+  knowledge_base?: string
   created_at?: number
   updated_at?: number
 }
@@ -324,7 +301,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string }>,
+  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -869,6 +846,7 @@ export interface StreamEvent {
   // client appends it to the trailing thinking part of the
   // assistant message.
   thinking?: string
+  tool_id?: string
   tool_name?: string
   tool_status?: string
   tool_result?: string
@@ -1031,3 +1009,201 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   offEvent()
   offEnd()
 }
+
+// streamWithRetry wraps streamMessages with up to 2 reconnect
+// attempts on stream failure (network errors, server restart).
+// Aborted streams and user-initiated stops are not retried.
+export async function streamMessagesRetry(sessionId: string, opts: SendOptions): Promise<void> {
+  const maxRetries = 2
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await streamMessages(sessionId, opts)
+      return
+    } catch (e: any) {
+      if (opts.signal?.aborted) return
+      if (attempt >= maxRetries) throw e
+      console.warn(`[stream] attempt ${attempt + 1} failed, retrying in ${(attempt + 1) * 2}s…`, e?.message || e)
+      await new Promise<void>(r => setTimeout(r, (attempt + 1) * 2000))
+    }
+  }
+}
+
+// ---- Knowledge API ----
+
+export interface KnowledgeConfig {
+  enabled: boolean
+  auto_index: boolean
+  bases: KnowledgeBaseItem[]
+}
+
+export interface KnowledgeBaseItem {
+  name: string
+  path: string
+  file_types?: string[]
+  enabled: boolean
+  scan_model?: string
+  scan_media_types?: string[]
+  auto_scan?: boolean
+  exclude_patterns?: string[]
+  max_file_size?: number
+  status?: string
+  doc_count?: number
+}
+
+export const getKnowledgeConfig = () =>
+  jsonFetch<KnowledgeConfig>('/api/v1/knowledge/config')
+
+export const updateKnowledgeConfig = (patch: Partial<KnowledgeConfig>) =>
+  jsonFetch<KnowledgeConfig>('/api/v1/knowledge/config', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })
+
+export interface KnowledgeModel {
+  provider: string
+  model: string
+  supports_vision: boolean
+}
+
+export const listKnowledgeModels = () =>
+  jsonFetch<KnowledgeModel[]>('/api/v1/knowledge/models')
+
+export const getKnowledgeBases = () =>
+  jsonFetch<KnowledgeBaseItem[]>('/api/v1/knowledge/bases')
+
+export const addKnowledgeBase = (base: KnowledgeBaseItem) =>
+  jsonFetch<{ ok: boolean }>('/api/v1/knowledge/bases', {
+    method: 'POST',
+    body: JSON.stringify(base),
+  })
+
+export const removeKnowledgeBase = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/knowledge/bases/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  })
+
+export const scanKnowledgeBase = (name: string) =>
+  jsonFetch<{ ok: boolean; message?: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(name)}/scan`,
+    { method: 'POST' },
+  )
+
+export const getScanStatus = (name: string) =>
+  jsonFetch<{ chunks: number; done: boolean; error?: string; current: number; total: number; message?: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(name)}/scan/status`,
+  )
+
+export const cancelScan = (name: string) =>
+  jsonFetch<{ ok: boolean; message?: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(name)}/scan`,
+    { method: 'DELETE' },
+  )
+
+export const clearKnowledgeBase = (name: string) =>
+  jsonFetch<{ ok: boolean; message?: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(name)}/clear`,
+    { method: 'DELETE' },
+  )
+
+export const searchKnowledge = (query: string, topK?: number) =>
+  jsonFetch<{ query: string; results: Array<{ source: string; content: string; similarity: number; rank: number }> }>(
+    '/api/v1/knowledge/search',
+    {
+      method: 'POST',
+      body: JSON.stringify({ query, top_k: topK || 5 }),
+    },
+  )
+
+// (removed: getAvailableEmbedders — vector embedding system deprecated)
+
+// Knowledge section management
+export const listKnowledgeSections = (baseName: string) =>
+  jsonFetch<{ sections: Array<{ id: number; title: string; content: string; source: string; base: string }> }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections`,
+  )
+
+export const getKnowledgeSection = (baseName: string, id: number) =>
+  jsonFetch<{ id: number; title: string; content: string; source: string; base: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections/${id}`,
+  )
+
+export const addKnowledgeSection = (baseName: string, body: { title: string; content: string; source: string }) =>
+  jsonFetch<{ id: number; ok: boolean }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections`,
+    { method: 'POST', body: JSON.stringify(body) },
+  )
+
+export const deleteKnowledgeSection = (baseName: string, id: number) =>
+  jsonFetch<{ ok: boolean }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections/${id}`,
+    { method: 'DELETE' },
+  )
+
+// Knowledge index nodes (three-level tree)
+export interface NodeTreeItem {
+  id: number
+  parent_id: number
+  level: number
+  title: string
+  keywords: string
+  overview: string
+  source: string
+  kind: string
+  child_count: number
+  content_count: number
+}
+
+export interface NodeContentItem {
+  id: number
+  node_id: number
+  content: string
+  content_type: string
+  sort_order: number
+}
+
+export const listKnowledgeNodes = (baseName: string) =>
+  jsonFetch<{ nodes: NodeTreeItem[] }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/nodes`,
+  )
+
+export const getNodeContent = (baseName: string, nodeId: number) =>
+  jsonFetch<{ contents: NodeContentItem[] }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/nodes/${nodeId}/content`,
+  )
+
+export const deleteKnowledgeNode = (baseName: string, nodeId: number) =>
+  jsonFetch<{ ok: boolean }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/nodes/${nodeId}`,
+    { method: 'DELETE' },
+  )
+
+// ---- System Config API ----
+
+export interface LimitsConfig {
+  auto_compact_buffer: number
+  tool_result_exec_cap: number
+  tool_result_read_cap: number
+  tool_result_default_cap: number
+  prune_after_rounds: number
+  max_rounds: number
+  max_stored_messages: number
+}
+
+export interface SubAgentConfig {
+  cache_ttl: string
+  timeout: string
+}
+
+export interface SystemConfig {
+  limits: LimitsConfig
+  sub_agent: SubAgentConfig
+}
+
+export const getSystemConfig = () =>
+  jsonFetch<SystemConfig>('/api/v1/config')
+
+export const updateSystemConfig = (patch: Record<string, unknown>) =>
+  jsonFetch<SystemConfig>('/api/v1/config', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })

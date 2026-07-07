@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -526,7 +527,14 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 }
 
 // Run implements Runner.
-func (d *Default) Run(ctx context.Context, req Request) (Result, error) {
+func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("subagent panic: %v", r)
+			log.Printf("[subagent] panic recovered: %v\n%s", r, string(debug.Stack()))
+		}
+	}()
+
 	// Resolve defaults from the parent.
 	s := req.Style
 	if s == "" {
@@ -656,9 +664,16 @@ func (d *Default) Run(ctx context.Context, req Request) (Result, error) {
 	}
 
 	// Fresh in-memory store; no shared history with the parent.
-	store, _ := memory.Open(20)
+	store, _ := memory.Open(100)
 
 	subAgent := agent.New(d.Cfg, d.LLM, d.StyleMgr, store, subTools)
+
+	// Wire auto-compaction for sub-agents so they can handle
+	// large contexts without hitting round / token limits.
+	if d.LLM != nil && prov != "" {
+		sm := memory.NewSummarizer(store, d.LLM, prov, 50)
+		subAgent.SetSummarizer(sm)
+	}
 
 	// Resolve the model string. Order of priority:
 	//   1. Per-request model override (Args.Model)
@@ -676,11 +691,12 @@ func (d *Default) Run(ctx context.Context, req Request) (Result, error) {
 	chatReq := agent.ChatRequest{
 		Style:         s,
 		Provider:      prov,
-		Model:         chatModel, // model name only (no provider prefix); provider comes from Provider
+		Model:         chatModel,
 		PromptOv:      promptOv,
 		SubagentType:  subType,
 		SubagentColor: color,
 		SubagentTaskID: req.TaskID,
+		SessionID:     "subagent-" + subType + "-" + req.TaskID,
 		Messages: []llm.ChatMessage{
 			{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Description},
 		},

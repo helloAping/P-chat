@@ -21,13 +21,13 @@
 // actually changed, mirroring the backend's "non-empty means
 // write, otherwise leave alone" contract.
 
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
-  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NTooltip, NIcon, NPopover, useMessage,
+  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree, useMessage,
 } from 'naive-ui'
 import * as api from '../api/client'
-import { loadProviders, loadSessions } from '../stores/chat'
+import { loadProviders, loadSessions, bumpKBConfigVersion } from '../stores/chat'
 import type { Session } from '../api/client'
 
 const message = useMessage()
@@ -147,7 +147,7 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'archive' | 'skills' | 'mcp'>('providers')
+const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge'>('providers')
 
 // --- Provider state ---
 const providers = ref<api.ProviderInfo[]>([])
@@ -212,6 +212,78 @@ const newStylePrompt = ref('')
 const newStyleMemory = ref('')
 const isEdit = ref(false)
 
+// --- System config state ---
+const sysLimits = ref<api.LimitsConfig>({
+  auto_compact_buffer: 20000,
+  tool_result_exec_cap: 4000,
+  tool_result_read_cap: 8000,
+  tool_result_default_cap: 6000,
+  prune_after_rounds: 15,
+  max_rounds: 300,
+  max_stored_messages: 0,
+})
+const sysSubAgent = ref<api.SubAgentConfig>({
+  cache_ttl: '',
+  timeout: '',
+})
+const sysDirty = ref(false)
+const sysSaving = ref(false)
+
+async function loadSystemConfig() {
+  try {
+    const sc = await api.getSystemConfig()
+    sysLimits.value = sc.limits
+    sysSubAgent.value = sc.sub_agent
+    sysDirty.value = false
+  } catch { /* ignore */ }
+}
+
+function markSysDirty() { sysDirty.value = true }
+
+async function saveSystemConfig() {
+  sysSaving.value = true
+  try {
+    const patch: Record<string, unknown> = {}
+    const limits: Record<string, unknown> = {}
+    const sa: Record<string, unknown> = {}
+
+    limits.auto_compact_buffer = sysLimits.value.auto_compact_buffer
+    limits.tool_result_exec_cap = sysLimits.value.tool_result_exec_cap
+    limits.tool_result_read_cap = sysLimits.value.tool_result_read_cap
+    limits.tool_result_default_cap = sysLimits.value.tool_result_default_cap
+    limits.prune_after_rounds = sysLimits.value.prune_after_rounds
+    limits.max_rounds = sysLimits.value.max_rounds
+    limits.max_stored_messages = sysLimits.value.max_stored_messages
+    patch.limits = limits
+
+    sa.cache_ttl = sysSubAgent.value.cache_ttl
+    sa.timeout = sysSubAgent.value.timeout
+    patch.sub_agent = sa
+
+    await api.updateSystemConfig(patch)
+    sysDirty.value = false
+    message.success('系统配置已保存')
+  } catch (e: any) {
+    message.error('保存失败: ' + (e?.message || e))
+  } finally {
+    sysSaving.value = false
+  }
+}
+
+function resetSystemConfig() {
+  sysLimits.value = {
+    auto_compact_buffer: 20000,
+    tool_result_exec_cap: 4000,
+    tool_result_read_cap: 8000,
+    tool_result_default_cap: 6000,
+    prune_after_rounds: 15,
+    max_rounds: 300,
+    max_stored_messages: 0,
+  }
+  sysSubAgent.value = { cache_ttl: '', timeout: '' }
+  sysDirty.value = true
+}
+
 onMounted(async () => {
   await refresh()
 })
@@ -224,6 +296,11 @@ watch(tab, (v) => {
     refreshRepos()
   } else if (v === 'mcp') {
     refreshMCP()
+  } else if (v === 'knowledge') {
+    refreshKB()
+    refreshKBModels()
+  } else if (v === 'system') {
+    loadSystemConfig()
   }
 })
 
@@ -629,6 +706,12 @@ async function onDeleteStyle(id: string) {
 
 function close() { (window as any).closeAppSettings?.() }
 
+onBeforeUnmount(() => {
+  for (const timer of Object.values(kbScanTimers)) {
+    clearInterval(timer as number)
+  }
+})
+
 // --- Archive state ---
 const archivedSessions = ref<Session[]>([])
 const loadingArchived = ref(false)
@@ -958,8 +1041,350 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
     default: return 'default'
   }
 }
-</script>
 
+// --- Knowledge Base state ---
+const kbEnabled = ref(false)
+const kbAutoIndex = ref(false)
+const kbBases = ref<api.KnowledgeBaseItem[]>([])
+const kbSelectedName = ref<string | null>(null)
+const kbSelected = computed(() => kbBases.value.find(b => b.name === kbSelectedName.value) || null)
+const showAddKB = ref(false)
+const newKBName = ref('')
+const newKBPath = ref('')
+const kbModels = ref<api.KnowledgeModel[]>([])
+const scanningKBs = ref<Set<string>>(new Set())
+const kbScanStatus = ref<Map<string, { current: number; total: number; chunks: number; done: boolean; error?: string }>>(new Map())
+let kbScanTimers: Record<string, ReturnType<typeof setInterval>> = {}
+
+// Three-level index nodes tree view
+const kbNodes = ref<api.NodeTreeItem[]>([])
+const kbNodesLoading = ref(false)
+const kbNodeFilter = ref('')
+
+const kbSelectedNodeKeys = ref<string[]>([])
+const kbExpandedNodeKeys = ref<string[]>([])
+const kbActiveNode = ref<api.NodeTreeItem | null>(null)
+const kbActiveNodeContent = ref<api.NodeContentItem[]>([])
+const kbActiveChildId = ref<number | null>(null)
+
+const l1Node = computed(() => kbNodes.value.find(n => n.level === 1) || null)
+const l2Nodes = computed(() => kbNodes.value.filter(n => n.level === 2))
+
+function getChildren(parentId: number) {
+  return kbNodes.value.filter(n => n.parent_id === parentId && n.level === 3)
+}
+
+const kbActiveChildren = computed(() => {
+  if (!kbActiveNode.value || kbActiveNode.value.level !== 2) return []
+  return getChildren(kbActiveNode.value.id)
+})
+
+interface TreeNode {
+  key: string
+  label: string
+  level: number
+  nodeData: api.NodeTreeItem
+  children?: TreeNode[]
+  isLeaf?: boolean
+}
+
+const kbTreeNodeData = computed<any[]>(() => {
+  const nodes = kbNodes.value
+  if (nodes.length === 0) return []
+
+  const l1 = nodes.find(n => n.level === 1)
+  if (!l1) return []
+
+  function buildChildren(parentId: number): TreeNode[] {
+    return nodes
+      .filter(n => n.parent_id === parentId && n.level > 1)
+      .sort((a, b) => a.title.localeCompare(b.title))
+      .map(n => {
+        const grandchildren = nodes.filter(gc => gc.parent_id === n.id && gc.level === 3)
+        return {
+          key: `node-${n.id}`,
+          label: n.title,
+          level: n.level,
+          nodeData: n,
+          isLeaf: grandchildren.length === 0,
+          children: grandchildren.length > 0
+            ? grandchildren.map(gc => ({
+                key: `node-${gc.id}`,
+                label: gc.title || '(无标题)',
+                level: gc.level,
+                nodeData: gc,
+                isLeaf: true,
+              }))
+            : undefined,
+        }
+      })
+  }
+
+  return [{
+    key: `node-${l1.id}`,
+    label: l1.title,
+    level: l1.level,
+    nodeData: l1,
+    children: buildChildren(l1.id),
+  }]
+})
+
+function nodeIcon(level: number) {
+  return level === 1 ? '📋' : level === 2 ? '📄' : '§'
+}
+
+function renderTreeLabel({ option }: any) {
+  const n = option.nodeData as api.NodeTreeItem
+  if (n.level === 1) {
+    return h('span', { class: 'kb-tree-label l1' }, [h('span', { class: 'kb-tree-icon' }, '📋'), n.title])
+  }
+  if (n.level === 2) {
+    return h('span', { class: 'kb-tree-label l2' }, [
+      h('span', { class: 'kb-tree-icon' }, '📄'),
+      h('span', { class: 'kb-tree-label-text' }, n.title),
+      n.kind ? h('span', { class: 'kb-tree-label-tag' }, n.kind) : null,
+      n.child_count > 0 ? h('span', { class: 'kb-tree-label-cnt' }, `${n.child_count}`) : null,
+    ])
+  }
+  return h('span', { class: 'kb-tree-label l3' }, [
+    h('span', { class: 'kb-tree-icon' }, '§'),
+    h('span', { class: 'kb-tree-label-text' }, n.title || '(无标题)'),
+    n.content_count > 0 ? h('span', { class: 'kb-tree-label-cnt' }, `${n.content_count}`) : null,
+  ])
+}
+
+function renderTreeSuffix({ option }: any) {
+  const n = option.nodeData as api.NodeTreeItem
+  if (n.level <= 1) return null
+  return h(NPopconfirm, {
+    positiveText: '删除',
+    negativeText: '取消',
+    placement: 'left-start',
+    onPositiveClick: (e: Event) => { e.stopPropagation(); onDeleteNode(n.id) },
+  }, {
+    trigger: () => h(NButton, { size: 'tiny', quaternary: true, type: 'error', onClick: (e: Event) => e.stopPropagation() }, { default: () => '🗑' }),
+    default: () => `确定删除「${n.title}」${n.level === 2 ? '及其所有章节和内容' : '及其内容'}？`,
+  })
+}
+
+async function refreshKB() {
+  try {
+    const cfg = await api.getKnowledgeConfig()
+    kbEnabled.value = cfg.enabled
+    kbAutoIndex.value = cfg.auto_index
+    kbBases.value = await api.getKnowledgeBases()
+    if (!kbSelectedName.value && kbBases.value.length > 0) {
+      kbSelectedName.value = kbBases.value[0].name
+    } else if (kbSelectedName.value && !kbBases.value.find(b => b.name === kbSelectedName.value)) {
+      kbSelectedName.value = kbBases.value[0]?.name ?? null
+    }
+    for (const b of kbBases.value) {
+      if (b.status === 'scanning') {
+        scanningKBs.value = new Set(scanningKBs.value).add(b.name)
+        pollScan(b.name)
+      }
+    }
+  } catch (e: any) {
+    message.error(`加载知识库配置失败: ${e.message}`)
+  }
+}
+
+async function refreshKBModels() {
+  try { kbModels.value = await api.listKnowledgeModels() || [] } catch {}
+}
+
+async function onToggleKBEnabled(v: boolean) {
+  try { await api.updateKnowledgeConfig({ enabled: v }); kbEnabled.value = v; bumpKBConfigVersion() } catch (e: any) { message.error(`切换失败: ${e.message}`) }
+}
+
+async function onToggleKBAutoIndex(v: boolean) {
+  try { await api.updateKnowledgeConfig({ auto_index: v }); kbAutoIndex.value = v; bumpKBConfigVersion() } catch (e: any) { message.error(`切换失败: ${e.message}`) }
+}
+
+async function onAddKB() {
+  if (!newKBName.value.trim() || !newKBPath.value.trim()) { message.warning('名称和路径为必填'); return }
+  try {
+    await api.addKnowledgeBase({ name: newKBName.value.trim(), path: newKBPath.value.trim(), enabled: true, file_types: [], scan_model: '', scan_media_types: [], exclude_patterns: [], max_file_size: 0 })
+    message.success('已添加')
+    showAddKB.value = false
+    newKBName.value = ''; newKBPath.value = ''
+    await refreshKB()
+    kbSelectedName.value = kbBases.value[kbBases.value.length - 1]?.name ?? null
+    bumpKBConfigVersion()
+  } catch (e: any) { message.error(`添加失败: ${e.message}`) }
+}
+
+async function onDeleteKB(name: string) {
+  try { await api.removeKnowledgeBase(name); message.success('已删除'); await refreshKB(); bumpKBConfigVersion() } catch (e: any) { message.error(`删除失败: ${e.message}`) }
+}
+
+async function onScanKB(name: string) {
+  try {
+    await api.scanKnowledgeBase(name)
+    scanningKBs.value = new Set(scanningKBs.value).add(name)
+    kbScanStatus.value.set(name, { current: 0, total: 0, chunks: 0, done: false })
+    pollScan(name)
+  } catch (e: any) { message.error(`扫描失败: ${e.message}`) }
+}
+
+function pollScan(name: string) {
+  const timer = setInterval(async () => {
+    try {
+      const s = await api.getScanStatus(name)
+      kbScanStatus.value.set(name, { current: s.current, total: s.total, chunks: s.chunks, done: s.done, error: s.error })
+      if (s.done) {
+        clearInterval(timer)
+        scanningKBs.value = new Set([...scanningKBs.value].filter(n => n !== name))
+        delete kbScanTimers[name]
+        await refreshKB()
+        bumpKBConfigVersion()
+      }
+    } catch { clearInterval(timer); scanningKBs.value.delete(name); delete kbScanTimers[name] }
+  }, 800)
+  kbScanTimers[name] = timer
+}
+
+async function onCancelScan(name: string) {
+  try {
+    await api.cancelScan(name)
+    clearInterval(kbScanTimers[name])
+    delete kbScanTimers[name]
+    scanningKBs.value = new Set([...scanningKBs.value].filter(n => n !== name))
+  } catch (e: any) { message.error(`取消失败: ${e.message}`) }
+}
+
+async function onClearKB(name: string) {
+  try {
+    await api.clearKnowledgeBase(name)
+    message.success('已清除')
+    kbScanStatus.value.delete(name)
+    kbActiveNode.value = null
+    kbActiveNodeContent.value = []
+    await refreshKB()
+    bumpKBConfigVersion()
+  } catch (e: any) { message.error(`清除失败: ${e.message}`) }
+}
+
+function onToggleKBSwitch(name: string, enabled: boolean) {
+  const idx = kbBases.value.findIndex(b => b.name === name)
+  if (idx < 0) return
+  const updated = { ...kbBases.value[idx], enabled }
+  api.updateKnowledgeConfig({ bases: kbBases.value.map((b, i) => i === idx ? updated : b) }).then(() => {
+    kbBases.value[idx] = updated
+    bumpKBConfigVersion()
+  }).catch(e => message.error(`更新失败: ${e.message}`))
+}
+
+function onUpdateKBField(name: string, field: string, value: any) {
+  const idx = kbBases.value.findIndex(b => b.name === name)
+  if (idx < 0) return
+  const updated = { ...kbBases.value[idx], [field]: value }
+  api.updateKnowledgeConfig({ bases: kbBases.value.map((b, i) => i === idx ? updated : b) }).then(() => {
+    kbBases.value[idx] = updated
+    bumpKBConfigVersion()
+  }).catch(e => message.error(`更新失败: ${e.message}`))
+}
+
+async function loadKBNodes(name: string) {
+  if (!name) { kbNodes.value = []; kbActiveNode.value = null; return }
+  kbNodesLoading.value = true
+  try {
+    const res = await api.listKnowledgeNodes(name)
+    kbNodes.value = res.nodes || []
+    if (kbNodes.value.length > 0) {
+      const allIds = kbNodes.value.map(n => `node-${n.id}`)
+      const l1 = kbNodes.value.find(n => n.level === 1)
+      const sel = l1 ? [`node-${l1.id}`] : []
+      kbExpandedNodeKeys.value = allIds
+      kbSelectedNodeKeys.value = sel
+      if (l1) await selectNode(l1, name)
+    }
+  } catch { kbNodes.value = [] }
+  finally { kbNodesLoading.value = false }
+}
+
+async function selectNode(node: api.NodeTreeItem, baseName: string) {
+  kbActiveNode.value = node
+  kbActiveChildId.value = null
+  if (node.level > 1 && node.content_count > 0) {
+    try {
+      const r = await api.getNodeContent(baseName, node.id)
+      kbActiveNodeContent.value = r.contents || []
+    } catch { kbActiveNodeContent.value = [] }
+  } else {
+    kbActiveNodeContent.value = []
+  }
+}
+
+function selectChildNode(child: api.NodeTreeItem) {
+  kbActiveChildId.value = child.id
+  if (!kbSelected.value) return
+  selectNode(child, kbSelected.value.name)
+}
+
+async function onTreeNodeSelect(keys: string[]) {
+  if (keys.length === 0) return
+  kbSelectedNodeKeys.value = keys
+  const key = keys[0]
+  const id = parseInt(key.replace('node-', ''), 10)
+  const node = kbNodes.value.find(n => n.id === id)
+  if (node && kbSelected.value) {
+    await selectNode(node, kbSelected.value.name)
+  }
+}
+
+function onTreeNodeExpand(keys: string[]) {
+  kbExpandedNodeKeys.value = keys
+}
+
+async function onDeleteNode(nodeId: number) {
+  if (!kbSelected.value) return
+  try {
+    await api.deleteKnowledgeNode(kbSelected.value.name, nodeId)
+    message.success('已删除')
+    if (kbActiveNode.value?.id === nodeId) {
+      kbActiveNode.value = null
+      kbActiveNodeContent.value = []
+    }
+    await loadKBNodes(kbSelected.value.name)
+    await refreshKB()
+    bumpKBConfigVersion()
+  } catch (e: any) { message.error(`删除失败: ${e.message}`) }
+}
+
+watch(kbSelectedName, (name) => {
+  kbActiveNode.value = null
+  kbActiveNodeContent.value = []
+  kbNodeFilter.value = ''
+  loadKBNodes(name || '')
+})
+
+const mediaTypeOptions = [
+  { label: '图片 (.png .jpg .gif .webp .bmp)', value: 'image' },
+  { label: '视频 (.mp4 .mov .webm .avi)', value: 'video' },
+  { label: '音频 (.mp3 .wav .ogg .m4a)', value: 'audio' },
+  { label: '文档 (.pdf)', value: 'pdf' },
+]
+
+const kbModelOptions = computed(() => [
+  { label: '纯文本解析（推荐，零 API 消耗）', value: '' },
+  ...kbModels.value.map(m => ({ label: `${m.provider} / ${m.model}${m.supports_vision ? ' 👁' : ''}`, value: `${m.provider}/${m.model}` })),
+])
+
+function scanLabel(name: string) {
+  const s = kbScanStatus.value.get(name)
+  if (!s) return '开始扫描'
+  if (s.error) return '扫描失败'
+  if (s.done) return `✓ ${s.chunks} sections`
+  return `扫描中 ${s.current}/${s.total}`
+}
+
+function kbModelSupportsVision(scanModel: string) {
+  const parts = scanModel.split('/')
+  if (parts.length !== 2) return false
+  return kbModels.value.find(m => m.provider === parts[0] && m.model === parts[1])?.supports_vision || false
+}
+</script>
 <template>
   <NModal :show="true" @update:show="close" preset="card" title="应用设置" style="width: 920px; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column">
     <NTabs v-model:value="tab" type="line" animated style="flex: 1; min-height: 0; display: flex; flex-direction: column">
@@ -1297,6 +1722,81 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
         </div>
       </NTabPane>
 
+      <NTabPane name="system" tab="系统配置">
+        <div class="system-config-shell">
+          <div class="system-config-scroll">
+            <div class="system-config-body">
+              <NCollapse class="sys-collapse" :default-expanded-names="['context', 'agent', 'subagent']">
+                <NCollapseItem title="上下文管理" name="context">
+                  <div class="sys-form-grid">
+                    <div class="sys-form-row">
+                      <span class="sys-label">历史消息加载条数</span>
+                      <NInputNumber v-model:value="sysLimits.max_stored_messages" :min="0" :step="10" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">0 = 按模型上下文自动计算</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">自动压缩缓冲区</span>
+                      <NInputNumber v-model:value="sysLimits.auto_compact_buffer" :min="0" :step="1024" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">tokens，默认 20000</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">工具结果截断轮次</span>
+                      <NInputNumber v-model:value="sysLimits.prune_after_rounds" :min="0" :step="5" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">轮后内容置 [pruned]，0 = 禁用</span>
+                    </div>
+                  </div>
+                </NCollapseItem>
+
+                <NCollapseItem title="Agent 执行限制" name="agent">
+                  <div class="sys-form-grid">
+                    <div class="sys-form-row">
+                      <span class="sys-label">最大回合数</span>
+                      <NInputNumber v-model:value="sysLimits.max_rounds" :min="0" :step="10" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">0 = 不限制，默认 300</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">exec_command 截断</span>
+                      <NInputNumber v-model:value="sysLimits.tool_result_exec_cap" :min="0" :step="512" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">bytes，默认 4000</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">read_file 截断</span>
+                      <NInputNumber v-model:value="sysLimits.tool_result_read_cap" :min="0" :step="512" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">bytes，默认 8000</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">默认截断</span>
+                      <NInputNumber v-model:value="sysLimits.tool_result_default_cap" :min="0" :step="512" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">bytes，默认 6000（含子代理/task 结果）</span>
+                    </div>
+                  </div>
+                </NCollapseItem>
+
+                <NCollapseItem title="子代理" name="subagent">
+                  <div class="sys-form-grid">
+                    <div class="sys-form-row">
+                      <span class="sys-label">结果缓存 TTL</span>
+                      <NInput v-model:value="sysSubAgent.cache_ttl" size="small" placeholder="例如: 10m" style="width:140px" @update:value="markSysDirty" />
+                      <span class="sys-hint">留空 = 禁用缓存</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">超时时间</span>
+                      <NInput v-model:value="sysSubAgent.timeout" size="small" placeholder="例如: 5m" style="width:140px" @update:value="markSysDirty" />
+                      <span class="sys-hint">留空 = 默认 5 分钟</span>
+                    </div>
+                  </div>
+                </NCollapseItem>
+              </NCollapse>
+            </div>
+          </div>
+
+          <div class="sys-actions">
+            <NButton size="small" @click="resetSystemConfig">恢复默认</NButton>
+            <NButton size="small" type="primary" :disabled="!sysDirty" :loading="sysSaving" @click="saveSystemConfig">保存</NButton>
+          </div>
+        </div>
+      </NTabPane>
+
       <NTabPane name="archive" tab="归档" style="flex: 1; min-height: 0; overflow: auto">
         <div v-if="!archivedSessions.length && !loadingArchived" class="empty-hint">
           暂无归档对话
@@ -1461,6 +1961,293 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
           </div>
         </div>
       </NTabPane>
+
+      <NTabPane name="knowledge" tab="知识库" style="flex: 1; min-height: 0; overflow: auto">
+        <div class="providers-split">
+          <!-- Left: KB list -->
+          <div class="provider-list">
+            <div class="provider-list-header">
+              <span class="list-title">知识库 ({{ kbBases.length }})</span>
+              <NButton size="tiny" type="primary" ghost @click="showAddKB = !showAddKB">
+                {{ showAddKB ? '取消' : '+ 新增' }}
+              </NButton>
+            </div>
+            <div v-if="showAddKB" class="add-form">
+              <NSpace vertical size="small">
+                <NInput v-model:value="newKBName" placeholder="名称" size="tiny" />
+                <NInput v-model:value="newKBPath" placeholder="路径" size="tiny" />
+                <NButton type="primary" size="tiny" @click="onAddKB">提交</NButton>
+              </NSpace>
+            </div>
+            <div class="provider-items">
+              <div
+                v-for="b in kbBases"
+                :key="b.name"
+                class="provider-item"
+                :class="{ active: b.name === kbSelectedName }"
+                @click="kbSelectedName = b.name"
+              >
+                <div class="provider-item-head">
+                  <NTag v-if="b.enabled" type="success" size="tiny" :bordered="false">启用</NTag>
+                  <strong class="provider-item-name">{{ b.name }}</strong>
+                  <NPopconfirm @positive-click="onDeleteKB(b.name)" positive-text="删除" negative-text="取消">
+                    <template #trigger>
+                      <NButton size="tiny" quaternary type="error" @click.stop class="provider-del-btn">✕</NButton>
+                    </template>
+                    确定删除知识库「{{ b.name }}」？此操作不可撤销。
+                  </NPopconfirm>
+                </div>
+                <div class="provider-item-sub">
+                  <span class="muted">{{ b.path }}</span>
+                  <span v-if="b.status === 'scanning' || scanningKBs.has(b.name)" style="font-size:10px;color:var(--accent)"> 扫描中</span>
+                  <span v-else-if="b.status === 'ok' && b.doc_count" style="font-size:10px;color:var(--text-3)"> · {{ b.doc_count }} sections</span>
+                  <span v-else-if="b.status === 'error'" style="font-size:10px;color:var(--warn)"> · 错误</span>
+                </div>
+              </div>
+              <div v-if="kbBases.length === 0" class="muted empty-hint">还没有知识库</div>
+            </div>
+          </div>
+
+          <!-- Right: detail pane -->
+          <div class="provider-detail">
+            <div v-if="!kbSelected" class="muted empty-hint">← 选择左侧的知识库</div>
+            <template v-else>
+              <div class="detail-section kb-detail-scroll">
+                <!-- Header -->
+                <div class="kb-header">
+                  <div class="kb-header-left">
+                    <h3 class="section-title">{{ kbSelected.name }}</h3>
+                    <NTag :type="kbSelected.enabled ? 'success' : 'default'" size="tiny" :bordered="false">{{ kbSelected.enabled ? '启用' : '禁用' }}</NTag>
+                    <span class="muted" style="font-size:11px">{{ kbSelected.doc_count || 0 }} 条索引</span>
+                  </div>
+                  <NSpace size="small">
+                    <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name) || !kbSelected.scan_model">
+                      {{ scanningKBs.has(kbSelected.name) ? '扫描中...' : '扫描' }}
+                    </NButton>
+                    <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>
+                    <NPopconfirm @positive-click="onClearKB(kbSelected.name)" positive-text="确定清除" negative-text="取消" placement="left-start">
+                      <template #trigger>
+                        <NButton size="small" type="error" ghost :disabled="scanningKBs.has(kbSelected.name)">清除</NButton>
+                      </template>
+                      确定清除知识库「{{ kbSelected.name }}」的所有扫描数据？此操作不可撤销。
+                    </NPopconfirm>
+                  </NSpace>
+                </div>
+
+                <!-- Scan progress -->
+                <div v-if="kbScanStatus.has(kbSelected.name)" class="scan-progress">
+                  <div class="scan-info">
+                    <span>{{ scanLabel(kbSelected.name) }}</span>
+                    <span v-if="kbScanStatus.get(kbSelected.name)?.error" style="color:var(--warn);font-size:11px">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
+                  </div>
+                  <div v-if="!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error" style="display:flex;align-items:center">
+                    <div class="scan-bar">
+                      <div class="scan-bar-fill" :style="{ width: kbScanStatus.get(kbSelected.name)!.total > 0 ? ((kbScanStatus.get(kbSelected.name)!.current / kbScanStatus.get(kbSelected.name)!.total) * 100) + '%' : '0%' }"></div>
+                    </div>
+                    <span class="scan-bar-pct">{{ kbScanStatus.get(kbSelected.name)!.total > 0 ? Math.round((kbScanStatus.get(kbSelected.name)!.current / kbScanStatus.get(kbSelected.name)!.total) * 100) : 0 }}%</span>
+                  </div>
+                </div>
+
+                <!-- AI Scan Settings -->
+                <NCollapse class="kb-collapse-card">
+                  <NCollapseItem title="AI 扫描设置" name="scan">
+                    <div class="kb-settings-grid">
+                      <div class="kb-settings-row">
+                        <div class="kb-settings-card">
+                          <div class="kb-settings-card-title">解析引擎</div>
+                          <div class="kb-config-row">
+                            <span class="kb-config-label">模型</span>
+                            <NSelect
+                              :value="kbSelected.scan_model || ''"
+                              :options="kbModelOptions"
+                              size="small"
+                              placeholder="纯文本解析"
+                              style="flex:1"
+                              @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'scan_model', v)"
+                            />
+                          </div>
+                          <div v-if="kbSelected.scan_model" class="kb-config-hint">
+                            <span v-if="kbModelSupportsVision(kbSelected.scan_model)" class="kb-hint-accent">视觉模型 — 可处理图片/视频/PDF</span>
+                            <span v-else class="kb-hint-muted">纯文本模型 — 仅处理文本</span>
+                          </div>
+                          <div class="kb-config-row">
+                            <span class="kb-config-label">媒体类型</span>
+                            <NSelect
+                              :value="kbSelected.scan_media_types || []"
+                              :options="mediaTypeOptions"
+                              size="small"
+                              multiple
+                              placeholder="选择可 AI 处理的媒体"
+                              style="flex:1"
+                              @update:value="(v: string[]) => onUpdateKBField(kbSelected!.name, 'scan_media_types', v)"
+                            />
+                          </div>
+                        </div>
+                        <div class="kb-settings-card">
+                          <div class="kb-settings-card-title">自动化</div>
+                          <div class="kb-config-row">
+                            <span class="kb-config-label">自动扫描</span>
+                            <NSwitch size="small" :value="kbSelected.auto_scan" @update:value="(v: boolean) => onUpdateKBField(kbSelected!.name, 'auto_scan', v)" />
+                          </div>
+                          <div class="kb-config-hint">启动时自动扫描变更</div>
+                          <div class="kb-config-row">
+                            <span class="kb-config-label">排除模式</span>
+                            <NInput
+                              :value="(kbSelected.exclude_patterns || []).join(', ')"
+                              size="small"
+                              placeholder="*.log, *.tmp"
+                              style="flex:1"
+                              @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'exclude_patterns', v.split(',').map(s => s.trim()).filter(Boolean))"
+                            />
+                          </div>
+                          <div class="kb-config-row">
+                            <span class="kb-config-label">文件上限</span>
+                            <NInputNumber
+                              :value="kbSelected.max_file_size ? kbSelected.max_file_size / 1048576 : 5"
+                              :min="1" :step="1"
+                              size="small"
+                              style="width:80px"
+                              @update:value="(v: number | null) => onUpdateKBField(kbSelected!.name, 'max_file_size', (v || 5) * 1048576)"
+                            />
+                            <span class="kb-unit">MB</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="kb-settings-card">
+                        <div class="kb-settings-card-title">存储</div>
+                        <div class="kb-config-row">
+                          <span class="kb-config-label">路径</span>
+                          <span class="kb-config-val path">{{ kbSelected.path }}</span>
+                        </div>
+                        <div class="kb-config-row">
+                          <span class="kb-config-label">状态</span>
+                          <NSwitch size="small" :value="kbSelected.enabled" @update:value="(v: boolean) => onToggleKBSwitch(kbSelected!.name, v)" />
+                        </div>
+                      </div>
+                    </div>
+                  </NCollapseItem>
+                </NCollapse>
+
+                <!-- Tree + Detail split -->
+                <div class="kb-tree-panel">
+                  <div class="kb-tree-left">
+                    <div class="kb-tree-toolbar">
+                      <NInput v-model:value="kbNodeFilter" placeholder="筛选节点..." size="tiny" clearable style="flex:1" />
+                      <NButton size="tiny" quaternary @click="loadKBNodes(kbSelected!.name)" title="刷新">↻</NButton>
+                    </div>
+                    <div class="kb-tree-scroll">
+                      <div v-if="kbNodesLoading" class="muted" style="padding:16px;text-align:center">加载中...</div>
+                      <NTree
+                        v-else-if="kbTreeNodeData.length > 0"
+                        :data="kbTreeNodeData"
+                        :selected-keys="kbSelectedNodeKeys"
+                        :expanded-keys="kbExpandedNodeKeys"
+                        :pattern="kbNodeFilter"
+                        block-node
+                        selectable
+                        :render-label="renderTreeLabel"
+                        :render-suffix="renderTreeSuffix"
+                        @update:selected-keys="onTreeNodeSelect"
+                        @update:expanded-keys="onTreeNodeExpand"
+                        virtual-scroll
+                        style="max-height:100%"
+                      />
+                      <div v-else class="muted" style="padding:16px;text-align:center;font-size:11px">（暂无索引节点，请先扫描）</div>
+                    </div>
+                  </div>
+
+                  <div class="kb-tree-right">
+                    <div v-if="!kbActiveNode" class="muted" style="padding:24px;text-align:center;font-size:12px">选择左侧节点查看详情</div>
+                    <template v-else>
+                      <div class="kb-node-detail">
+                        <div class="kb-node-detail-header">
+                          <div class="kb-node-detail-title">
+                            <span class="kb-node-icon">{{ nodeIcon(kbActiveNode.level) }}</span>
+                            <span class="kb-node-title-text">{{ kbActiveNode.title }}</span>
+                          </div>
+                          <NSpace size="small">
+                            <NTag v-if="kbActiveNode.kind" size="tiny" :bordered="false">{{ kbActiveNode.kind }}</NTag>
+                            <NPopconfirm
+                              v-if="kbActiveNode.level > 1"
+                              @positive-click="onDeleteNode(kbActiveNode.id)"
+                              positive-text="删除"
+                              negative-text="取消"
+                              placement="left-start"
+                            >
+                              <template #trigger>
+                                <NButton size="tiny" quaternary type="error">🗑</NButton>
+                              </template>
+                              确定删除「{{ kbActiveNode.title }}」{{ kbActiveNode.level === 2 ? '及其所有章节和内容' : '及其内容' }}？
+                            </NPopconfirm>
+                          </NSpace>
+                        </div>
+                        <div v-if="kbActiveNode.source" class="kb-node-meta">
+                          <span class="kb-node-meta-label">来源</span>
+                          <span class="kb-node-meta-val">{{ kbActiveNode.source }}</span>
+                        </div>
+                        <div v-if="kbActiveNode.keywords" class="kb-node-meta">
+                          <span class="kb-node-meta-label">关键词</span>
+                          <span class="kb-node-meta-val">{{ kbActiveNode.keywords }}</span>
+                        </div>
+                        <div v-if="kbActiveNode.level === 1" class="kb-node-stats">
+                          <div class="kb-stat-item">
+                            <span class="kb-stat-num">{{ l2Nodes.length }}</span>
+                            <span class="kb-stat-label">文件</span>
+                          </div>
+                          <div class="kb-stat-item">
+                            <span class="kb-stat-num">{{ kbNodes.filter(n => n.level === 3).length }}</span>
+                            <span class="kb-stat-label">章节</span>
+                          </div>
+                          <div class="kb-stat-item">
+                            <span class="kb-stat-num">{{ kbSelected.doc_count || 0 }}</span>
+                            <span class="kb-stat-label">索引</span>
+                          </div>
+                        </div>
+                        <div v-if="kbActiveNode.overview" class="kb-node-section">
+                          <div class="kb-node-section-title">概览</div>
+                          <div class="kb-node-overview">{{ kbActiveNode.overview }}</div>
+                        </div>
+                        <div v-if="kbActiveNode.level > 1 && kbActiveNodeContent.length > 0" class="kb-node-section">
+                          <div class="kb-node-section-title">内容块 ({{ kbActiveNodeContent.length }})</div>
+                          <div v-for="c in kbActiveNodeContent" :key="'c-' + c.id" class="kb-node-content-block">
+                            <pre class="kb-tree-pre">{{ c.content }}</pre>
+                          </div>
+                        </div>
+                        <div v-if="kbActiveNode.level === 2 && kbActiveChildren.length > 0" class="kb-node-section">
+                          <div class="kb-node-section-title">章节 ({{ kbActiveChildren.length }})</div>
+                          <div
+                            v-for="ch in kbActiveChildren"
+                            :key="ch.id"
+                            class="kb-node-child-row"
+                            :class="{ active: kbActiveChildId === ch.id }"
+                            @click="selectChildNode(ch)"
+                          >
+                            <span class="kb-node-child-icon">§</span>
+                            <span class="kb-node-child-title">{{ ch.title || '(无标题)' }}</span>
+                            <span v-if="ch.content_count > 0" class="kb-node-child-meta">{{ ch.content_count }} 块</span>
+                            <NPopconfirm
+                              @positive-click="onDeleteNode(ch.id)"
+                              positive-text="删除"
+                              negative-text="取消"
+                              placement="left-start"
+                              @click.stop
+                            >
+                              <template #trigger>
+                                <NButton size="tiny" quaternary type="error" @click.stop>🗑</NButton>
+                              </template>
+                              确定删除「{{ ch.title }}」及其内容？
+                            </NPopconfirm>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </NTabPane>
     </NTabs>
 
     <!-- Confirmation: permanent delete from archive -->
@@ -1487,12 +2274,6 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
         </div>
       </div>
     </NModal>
-
-    <template #footer>
-      <NSpace justify="end">
-        <NButton @click="close">关闭</NButton>
-      </NSpace>
-    </template>
   </NModal>
 </template>
 
@@ -1556,7 +2337,7 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
   border-radius: 6px;
   background: var(--bg-2);
   display: flex; flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
 }
 .detail-section {
   border-bottom: 1px solid var(--border-2);
@@ -1803,4 +2584,195 @@ code {
 .upstream-id { flex: 1; font-family: ui-monospace, monospace; font-size: 12.5px; }
 .upstream-owner { color: var(--text-4); font-size: 11px; }
 .upstream-item.added { opacity: 0.6; }
+/* ---- Knowledge Base ---- */
+.kb-detail-scroll { flex: 1; overflow-y: auto; }
+.scan-progress { padding: 8px 0; }
+.scan-info { display: flex; gap: 12px; align-items: center; font-size: 13px; }
+.scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; flex: 1; }
+.scan-bar-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
+.scan-bar-pct { font-size: 10px; color: var(--text-4); margin-left: 6px; white-space: nowrap; }
+.scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
+
+/* ---- Knowledge Base Cards ---- */
+.kb-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.kb-header-left { display: flex; align-items: center; gap: 8px; }
+
+.kb-collapse-card {
+  border: 1px solid var(--border-2);
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+.kb-config-row {
+  display: flex; align-items: center; gap: 10px; padding: 3px 0;
+}
+.kb-config-label {
+  font-size: 12px; color: var(--text-3); width: 56px; flex-shrink: 0;
+  line-height: 1.4;
+}
+.kb-config-val { font-size: 12px; color: var(--text-2); }
+.kb-config-val.path { word-break: break-all; font-family: ui-monospace, monospace; font-size: 11.5px; }
+.kb-config-hint { font-size: 11px; color: var(--text-4); padding: 1px 0 3px 66px; line-height: 1.4; }
+.kb-hint-accent { color: var(--accent); }
+.kb-hint-muted { color: var(--text-4); }
+.kb-unit { font-size: 11px; color: var(--text-4); margin-left: 4px; }
+
+/* AI scan settings layout */
+.kb-settings-grid { margin-top: 2px; }
+.kb-settings-row {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  margin-bottom: 10px;
+}
+.kb-settings-card {
+  border: 1px solid var(--border-2);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--bg-2);
+}
+.kb-settings-card-title {
+  font-size: 12px; font-weight: 600; color: var(--text-1);
+  margin-bottom: 6px;
+}
+
+/* Tree panel split layout */
+.kb-tree-panel {
+  display: flex; gap: 0; min-height: 300px; max-height: 400px;
+  border: 1px solid var(--border-2); border-radius: 6px;
+  overflow: hidden;
+}
+.kb-tree-left {
+  width: 260px; flex-shrink: 0; display: flex; flex-direction: column;
+  border-right: 1px solid var(--border-2); background: var(--bg-2);
+}
+.kb-tree-right {
+  flex: 1; min-width: 0; overflow-y: auto;
+  background: var(--bg-1);
+}
+.kb-tree-toolbar {
+  display: flex; align-items: center; gap: 4px;
+  padding: 6px 8px; border-bottom: 1px solid var(--border-2);
+}
+.kb-tree-scroll { flex: 1; overflow-y: auto; padding: 4px 0; }
+
+/* Tree node label styles */
+.kb-tree-label {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; min-width: 0;
+}
+.kb-tree-label.l1 { font-weight: 600; }
+.kb-tree-label.l2 { }
+.kb-tree-label.l3 { font-size: 11.5px; color: var(--text-2); }
+.kb-tree-icon { flex-shrink: 0; font-size: 12px; }
+.kb-tree-label-text {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kb-tree-label-tag {
+  font-size: 9px; color: var(--text-4); background: var(--bg-3);
+  padding: 0 4px; border-radius: 3px; flex-shrink: 0;
+}
+.kb-tree-label-cnt {
+  font-size: 10px; color: var(--text-4); flex-shrink: 0;
+}
+
+/* Node detail panel */
+.kb-node-detail { padding: 12px; }
+.kb-node-detail-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 8px; margin-bottom: 8px;
+}
+.kb-node-detail-title {
+  display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;
+}
+.kb-node-icon { flex-shrink: 0; font-size: 16px; }
+.kb-node-title-text {
+  font-size: 13px; font-weight: 600; line-height: 1.3;
+}
+.kb-node-meta {
+  display: flex; gap: 8px; font-size: 11px; padding: 2px 0;
+}
+.kb-node-meta-label { color: var(--text-4); flex-shrink: 0; }
+.kb-node-meta-val {
+  color: var(--text-2); word-break: break-all;
+  font-family: ui-monospace, monospace; font-size: 10.5px;
+}
+
+/* Statistics cards */
+.kb-node-stats {
+  display: flex; gap: 12px; padding: 10px 0; margin: 8px 0;
+  border-top: 1px solid var(--border-2);
+  border-bottom: 1px solid var(--border-2);
+}
+.kb-stat-item { text-align: center; min-width: 50px; }
+.kb-stat-num { display: block; font-size: 18px; font-weight: 700; color: var(--accent); }
+.kb-stat-label { font-size: 10px; color: var(--text-4); }
+
+/* Sections in detail */
+.kb-node-section { margin-top: 10px; }
+.kb-node-section-title {
+  font-size: 11px; font-weight: 600; color: var(--text-3);
+  margin-bottom: 6px;
+}
+.kb-node-overview {
+  font-size: 12px; color: var(--text-2); white-space: pre-wrap;
+  line-height: 1.5; background: var(--bg-2); padding: 8px 10px;
+  border-radius: 4px;
+}
+.kb-node-content-block { margin-bottom: 6px; }
+
+/* Child rows in L2 detail */
+.kb-node-child-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px; border-radius: 4px; cursor: pointer;
+  transition: background 0.15s;
+}
+.kb-node-child-row:hover { background: var(--bg-3); }
+.kb-node-child-row.active { background: var(--bg-3); }
+.kb-node-child-icon { font-size: 11px; color: var(--text-4); flex-shrink: 0; }
+.kb-node-child-title {
+  flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; min-width: 0;
+}
+.kb-node-child-meta { font-size: 10px; color: var(--text-4); flex-shrink: 0; }
+
+/* Content pre blocks */
+.kb-tree-pre {
+  margin: 0; padding: 6px 8px; background: var(--bg-3); border-radius: 4px;
+  font-size: 10.5px; line-height: 1.4; white-space: pre-wrap; word-break: break-word;
+  max-height: 120px; overflow-y: auto; font-family: ui-monospace, monospace;
+}
+
+/* System config tab */
+.system-config-shell {
+  height: 58vh;
+  display: flex; flex-direction: column;
+}
+.system-config-scroll {
+  flex: 1; min-height: 0; overflow-y: auto;
+}
+.system-config-body {
+  padding: 4px 0;
+}
+.sys-collapse {
+  border: 1px solid var(--border-2);
+  border-radius: 6px;
+}
+.sys-form-grid {
+  display: flex; flex-direction: column; gap: 2px;
+}
+.sys-form-row {
+  display: flex; align-items: center; gap: 8px; padding: 3px 0;
+}
+.sys-label {
+  font-size: 12px; color: var(--text-2); width: 130px; flex-shrink: 0;
+  line-height: 1.4;
+}
+.sys-hint {
+  font-size: 11px; color: var(--text-4); flex: 1; line-height: 1.4;
+}
+.sys-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 10px 0 0;
+}
 </style>

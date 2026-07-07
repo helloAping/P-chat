@@ -1,9 +1,12 @@
 package config
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
 )
@@ -40,6 +43,41 @@ func (m *Manager) SaveProject(cfg *Config) error {
 
 func (m *Manager) writeConfig(path string, cfg *Config) error {
 	return writeConfigJSON(path, cfg)
+}
+
+// WatchGlobal polls the global config file every `interval` seconds.
+// When the mtime changes, it reloads config and calls onReload(cfg).
+// Returns when ctx is cancelled.
+func (m *Manager) WatchGlobal(ctx context.Context, interval time.Duration, onReload func(*Config)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var lastMod time.Time
+	if fi, err := os.Stat(m.globalPath); err == nil {
+		lastMod = fi.ModTime()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fi, err := os.Stat(m.globalPath)
+			if err != nil {
+				continue
+			}
+			if fi.ModTime().After(lastMod) {
+				lastMod = fi.ModTime()
+				cfg, err := Load("")
+				if err != nil {
+					log.Printf("[config] reload failed: %v", err)
+					continue
+				}
+				log.Printf("[config] detected file change, reloaded")
+				onReload(cfg)
+			}
+		}
+	}
 }
 
 // AddProvider adds a new provider to the global config. If a
@@ -357,13 +395,9 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 		if p.Name != providerName {
 			continue
 		}
-		// Legacy single-model form: migrate the legacy entry
-		// into Models so the rest of the function can treat it
-		// uniformly.
 		if len(p.Models) == 0 && p.Model != "" {
 			p.Models = []ModelConfig{{Name: p.Model, Default: true}}
 		}
-		// After migration, the model must be in p.Models.
 		idx := -1
 		for j := range p.Models {
 			if p.Models[j].Name == modelName {
@@ -453,3 +487,5 @@ func SetModelCapabilities(providerName, modelName string, caps Capabilities) err
 	}
 	return fmt.Errorf("provider %q not found", providerName)
 }
+
+// (removed: SetModelIsEmbedding, SetModelEmbedProtocol — vector embedding system deprecated)

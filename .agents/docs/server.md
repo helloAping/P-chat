@@ -15,6 +15,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 | `server.go` | Gin 引擎构建、路由注册、CORS 中间件 | `New()`, `NewWithStaticFS()`, `corsMiddleware()` |
 | `handler.go` | 所有 API handler 实现（~2130行） | `SendMessage()`, `ListMessages()`, `chunkToEvent()` 等 |
 | `handler_test.go` | Handler 单元测试 | |
+| `knowledge_api.go` | 知识库 CRUD + 扫描管道 + 三层索引 | `ListSections`, `ListNodes`, `GetNodeContent`, `ClearKnowledgeBase`, `indexScan` |
 | `provider_api.go` | Provider/Model CRUD + 上游模型查询 | |
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
@@ -97,6 +98,27 @@ Chunk 字段检查顺序（优先级从高到低）:
 - 消息通过 `memory.Store.AddChatMessageTo()` 持久化
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
+
+### 7. 知识库 API
+
+`knowledge_api.go` 提供完整的知识库生命周期管理：
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/knowledge/config` | GET/PATCH | 配置读写 |
+| `/knowledge/bases` | GET/POST/DELETE | 知识库 CRUD |
+| `/knowledge/bases/:name/scan` | POST/DELETE | 启动/取消扫描 |
+| `/knowledge/bases/:name/scan/status` | GET | 扫描进度轮询 |
+| `/knowledge/bases/:name/clear` | DELETE | 清除所有扫描数据 |
+| `/knowledge/bases/:name/sections` | GET/POST | 旧表条目管理 |
+| `/knowledge/bases/:name/sections/:id` | GET/DELETE | 单个条目 |
+| `/knowledge/bases/:name/nodes` | GET | 三层索引节点列表（树视图数据源） |
+| `/knowledge/bases/:name/nodes/:id/content` | GET | 节点内容块 |
+| `/knowledge/search` | POST | 跨库搜索 |
+
+`clear` 端点执行后自动调用 `agent.Reload()` 刷新 L1 overview 缓存。
+
+`nodes` 端点返回扁平 `NodeTreeItem[]`（含 `parent_id` / `child_count` / `content_count`），前端据此构建三层树视图。
 
 ## 修改指南
 

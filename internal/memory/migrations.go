@@ -107,6 +107,67 @@ CREATE TABLE IF NOT EXISTS styles (
 );`,
 		Down: `DROP TABLE IF EXISTS styles`,
 	},
+	{
+		Version: 4,
+		Name:    "add_vector_store",
+		Up:      `ALTER TABLE conversations ADD COLUMN vector_store TEXT NOT NULL DEFAULT ''`,
+		Down:    `ALTER TABLE conversations DROP COLUMN vector_store`,
+	},
+	{
+		Version: 5,
+		Name:    "add_msg_type_columns",
+		Up: `
+ALTER TABLE messages ADD COLUMN msg_type       INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN submit_to_llm   INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_messages_llm ON messages(conversation_id, submit_to_llm, id);`,
+		Down: `
+DROP INDEX IF EXISTS idx_messages_llm;
+ALTER TABLE messages DROP COLUMN submit_to_llm;
+ALTER TABLE messages DROP COLUMN msg_type;`,
+	},
+	{
+		Version: 6,
+		Name:    "backfill_msg_type",
+		Up: `
+-- text messages (user / assistant): msg_type=0, submit_to_llm=1
+UPDATE messages SET msg_type=0, submit_to_llm=1
+ WHERE (metadata LIKE '%"type":"text"%' OR metadata NOT LIKE '%"type":"%')
+   AND (role='user' OR role='assistant');
+
+-- system messages: msg_type=0, submit_to_llm=0
+UPDATE messages SET msg_type=0, submit_to_llm=0
+ WHERE (metadata LIKE '%"type":"text"%' OR metadata NOT LIKE '%"type":"%')
+   AND role='system';
+
+-- image: msg_type=1, submit_to_llm=1
+UPDATE messages SET msg_type=1, submit_to_llm=1
+ WHERE metadata LIKE '%"type":"image"%';
+
+-- audio: msg_type=2, submit_to_llm=1
+UPDATE messages SET msg_type=2, submit_to_llm=1
+ WHERE metadata LIKE '%"type":"audio"%';
+
+-- video: msg_type=3, submit_to_llm=1
+UPDATE messages SET msg_type=3, submit_to_llm=1
+ WHERE metadata LIKE '%"type":"video"%';
+
+-- tool_call: msg_type=4, submit_to_llm=1
+UPDATE messages SET msg_type=4, submit_to_llm=1
+ WHERE metadata LIKE '%"type":"tool_call"%';
+
+-- tool_result for exec_command: msg_type=5, submit_to_llm=0
+UPDATE messages SET msg_type=5, submit_to_llm=0
+ WHERE metadata LIKE '%"type":"tool_result"%' AND metadata LIKE '%"tool_name":"exec_command"%';
+
+-- tool_result (other tools): msg_type=4, submit_to_llm=1
+UPDATE messages SET msg_type=4, submit_to_llm=1
+ WHERE metadata LIKE '%"type":"tool_result"%' AND metadata NOT LIKE '%"tool_name":"exec_command"%';
+
+-- thinking: msg_type=0, submit_to_llm=0
+UPDATE messages SET msg_type=0, submit_to_llm=0
+ WHERE metadata LIKE '%"type":"thinking"%';`,
+		Down: `UPDATE messages SET msg_type=0, submit_to_llm=1;`,
+	},
 }
 
 // 在 migrations 表和可变 Schema 之前必须创建

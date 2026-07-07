@@ -37,6 +37,9 @@ type Handler struct {
 	mcpMgr     *mcp.Manager
 
 	metaMu sync.Mutex
+	// sessionLocks serialises concurrent SendMessage calls per
+	// session to prevent interleaved message writes.
+	sessionLocks sync.Map // string → struct{}
 	meta   map[string]sessionMeta
 }
 
@@ -48,6 +51,7 @@ type sessionMeta struct {
 	ProjectPath     string // project root directory, "" = global
 	PlanMode        bool   // plan mode (no tools, single turn)
 	PermissionLevel string // "ask" | "auto" | "full"
+	KnowledgeBase   string // "" = off, "__all__" = all bases, or a specific base name
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -61,6 +65,7 @@ type sessionMetaBlob struct {
 	ProjectPath     string `json:"project_path,omitempty"`
 	PlanMode        bool   `json:"plan_mode,omitempty"`
 	PermissionLevel string `json:"permission_level,omitempty"`
+	KnowledgeBase   string `json:"knowledge_base,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Handler {
@@ -109,7 +114,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 	if h.store == nil {
 		return
 	}
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
 		// Non-fatal: in-memory map already updated, request still
 		// works for this session. The next setSessionMeta call
@@ -139,6 +144,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.ProjectPath = blob.ProjectPath
 				m.PlanMode = blob.PlanMode
 				m.PermissionLevel = blob.PermissionLevel
+				m.KnowledgeBase = blob.KnowledgeBase
 			}
 		}
 	}
@@ -190,7 +196,7 @@ func (h *Handler) setSessionMetaProjectPath(id, projectPath string) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 }
@@ -280,6 +286,12 @@ type UpdateSessionMetaRequest struct {
 	// PermissionLevel sets the sandbox permission level for this session.
 	// Values: "ask", "auto", "full". Omit to leave unchanged.
 	PermissionLevel *string `json:"permission_level,omitempty"`
+	// VectorStore sets the knowledge base vector store for this session.
+	// Empty string resets to the global default.
+	VectorStore *string `json:"vector_store,omitempty"`
+	// KnowledgeBase selects a knowledge base. "" / "__off__" = off,
+	// "__all__" = all bases, or a specific base name.
+	KnowledgeBase *string `json:"knowledge_base,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -296,7 +308,9 @@ type SessionResponse struct {
 	PlanMode    bool   `json:"plan_mode,omitempty"`
 	PermissionLevel string `json:"permission_level,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	CreatedAt   int64  `json:"created_at"`
+	VectorStore    string `json:"vector_store,omitempty"`
+	KnowledgeBase  string `json:"knowledge_base,omitempty"`
+	CreatedAt      int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 }
 
@@ -305,6 +319,7 @@ type SessionResponse struct {
 type MessageResponse struct {
 	ID         int64  `json:"id"`
 	Role       string `json:"role"`
+	MsgType    int    `json:"msg_type"`
 	Content    string `json:"content"`
 	CreatedAt  int64  `json:"created_at"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
@@ -345,6 +360,7 @@ type MessagePart struct {
 	Elapsed   string        `json:"elapsed,omitempty"`
 	Task      string        `json:"task,omitempty"`
 	Parts     []MessagePart `json:"parts,omitempty"`
+	ToolID    string        `json:"tool_id,omitempty"`
 }
 
 // AttachmentPart is a single part of a multi-content message,
@@ -386,7 +402,8 @@ type StreamEvent struct {
 	Message  string `json:"message,omitempty"`
 
 	// Tool fields — Type "tool".
-	ToolName    string `json:"tool_name,omitempty"`
+	ToolID   string `json:"tool_id,omitempty"`
+	ToolName string `json:"tool_name,omitempty"`
 	ToolStatus  string `json:"tool_status,omitempty"`
 	ToolResult  string `json:"tool_result,omitempty"`
 	// ToolResultFull is the untruncated tool result for tools
@@ -1177,7 +1194,27 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
+			_ = h.store.UpdateConversationMeta(id, string(blob))
+		}
+	}
+
+	// Handle vector_store as a first-class conversation column.
+	if req.VectorStore != nil {
+		if h.store != nil {
+			_ = h.store.SetConversationVectorStore(id, *req.VectorStore)
+		}
+	}
+
+	// Handle knowledge_base
+	if req.KnowledgeBase != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.KnowledgeBase = *req.KnowledgeBase
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		if h.store != nil {
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 			_ = h.store.UpdateConversationMeta(id, string(blob))
 		}
 	}
@@ -1234,7 +1271,7 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	queryLimit := parseIntQuery(c, "limit", 0)
 
 	meta := h.ensureMetaLoaded(id)
-	contextCap := contextLevelLimit(meta.ReasoningEffort)
+	contextCap := h.contextMessageLimit(meta.Provider, meta.Model)
 
 	// Effective limit: explicit query param wins; otherwise
 	// the context-window cap (keeps the same default the old
@@ -1270,11 +1307,139 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		hasMore = h.store.HasOlderMessages(id, oldestID)
 	}
 
+	// Pair consecutive question/answer messages (msg_type=6)
+	// into a single message before the main assistant merge.
+	// This ensures each question+answer pair renders as one
+	// table card embedded in the assistant message flow.
+	out = pairQuestionMessages(out)
+
+	// Merge consecutive assistant messages that belong to the
+	// same user turn. During live streaming the frontend
+	// accumulates all ReAct-round outputs into a single message
+	// bubble; this merge reconstructs that same single-bubble
+	// view on reload so the user doesn't see each round as an
+	// independent message.
+	out = mergeConsecutiveAssistant(out)
+
 	c.JSON(http.StatusOK, gin.H{
 		"messages":  out,
 		"has_more":  hasMore,
 		"oldest_id": oldestID,
 	})
+}
+
+// pairQuestionMessages scans for consecutive msg_type=6 messages
+// (question + answer) and merges each pair into a single
+// MessageResponse with a question part in the Parts array. The
+// paired message carries the questions JSON and the answers JSON
+// so the frontend QuestionTable can render the table card.
+func pairQuestionMessages(msgs []MessageResponse) []MessageResponse {
+	if len(msgs) <= 1 {
+		return msgs
+	}
+	out := make([]MessageResponse, 0, len(msgs))
+	i := 0
+	for i < len(msgs) {
+		msg := msgs[i]
+		if msg.MsgType != llm.MsgTypeQuestion || i+1 >= len(msgs) || msgs[i+1].MsgType != llm.MsgTypeQuestion {
+			out = append(out, msg)
+			i++
+			continue
+		}
+		question := msg
+		answer := msgs[i+1]
+		i += 2
+
+		// Merge question+answer into one message.
+		parts := []MessagePart{{
+			Kind: "question",
+			Text: question.Content,
+			Name: answer.Content,
+		}}
+		merged := MessageResponse{
+			ID:        question.ID,
+			Role:      question.Role,
+			MsgType:   llm.MsgTypeQuestion,
+			Content:   question.Content,
+			CreatedAt: question.CreatedAt,
+			Parts:     parts,
+		}
+		out = append(out, merged)
+	}
+	return out
+}
+
+// mergeConsecutiveAssistant collapses runs of consecutive
+// assistant messages into a single message. In the database,
+// each ReAct round produces its own assistant row (plus
+// intermediate tool_call / tool_result rows which are filtered
+// out by buildMessageResponse). After filtering, consecutive
+// assistant messages belong to the same user turn and should
+// render as one bubble — matching what the user saw during
+// live streaming.
+func mergeConsecutiveAssistant(msgs []MessageResponse) []MessageResponse {
+	if len(msgs) <= 1 {
+		return msgs
+	}
+	merged := make([]MessageResponse, 0, len(msgs))
+	i := 0
+	for i < len(msgs) {
+		msg := msgs[i]
+		if msg.Role != "assistant" || i+1 >= len(msgs) || msgs[i+1].Role != "assistant" {
+			merged = append(merged, msg)
+			i++
+			continue
+		}
+		run := []MessageResponse{msg}
+		i++
+		for i < len(msgs) && msgs[i].Role == "assistant" {
+			run = append(run, msgs[i])
+			i++
+		}
+		merged = append(merged, mergeAssistantRun(run))
+	}
+	return merged
+}
+
+// mergeAssistantRun merges a slice of consecutive assistant
+// messages (from the same user turn) into a single message.
+// All structural parts (thinking, tool, sub_agent) from every
+// message are preserved in order, interleaved with their
+// round's text. Consecutive text parts are concatenated so the
+// frontend's parts-driven render path keeps a consistent shape.
+func mergeAssistantRun(run []MessageResponse) MessageResponse {
+	if len(run) == 1 {
+		return run[0]
+	}
+	base := run[0]
+	var parts []MessagePart
+
+	for _, m := range run {
+		for _, p := range m.Parts {
+			switch p.Kind {
+			case "text", "thinking":
+				// Merge consecutive text / thinking parts.
+				if len(parts) > 0 && parts[len(parts)-1].Kind == p.Kind {
+					parts[len(parts)-1].Text += "\n" + p.Text
+				} else {
+					parts = append(parts, p)
+				}
+			default:
+				parts = append(parts, p)
+			}
+		}
+	}
+
+	var contents []string
+	for _, p := range parts {
+		if p.Kind == "text" {
+			contents = append(contents, p.Text)
+		}
+	}
+
+	base.Parts = parts
+	base.Content = strings.Join(contents, "\n")
+	return base
 }
 
 // buildMessageResponse shapes one ChatMessage row into the
@@ -1292,6 +1457,7 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 	resp := MessageResponse{
 		ID:        rowID,
 		Role:      m.Role,
+		MsgType:   m.MsgType,
 		Content:   m.Content,
 		CreatedAt: created,
 		Name:      m.Name,
@@ -1323,6 +1489,16 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 		resp.ToolCallID = m.ToolID
 	}
 
+	// Command messages (msg_type=5: exec_command output).
+	// Extract the shell command from ToolInput so the
+	// frontend ExecOutputCard can label the terminal panel
+	// with the command that was executed.
+	if m.MsgType == llm.MsgTypeCommand && m.ToolInput != "" {
+		if cmd := parseCommandFromToolInput(m.ToolInput); cmd != "" {
+			resp.Name = cmd
+		}
+	}
+
 	// Restore assistant parts from metadata.
 	if i < len(metas) && metas[i] != "" {
 		if parts := decodePartsFromMeta(metas[i], m.Content); len(parts) > 0 {
@@ -1339,7 +1515,11 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 	// main assistant message's Parts — the separate rows
 	// are only for DB reconstruction and cause blank
 	// bubbles if returned to the frontend.
-	if m.Type == llm.TypeToolCall || m.Type == llm.TypeToolResult {
+	// Command messages (msg_type=5) are also filtered:
+	// exec_command results already appear in the parts
+	// as ToolCallCard entries — returning them as
+	// independent bubbles would duplicate the display.
+	if m.MsgType == llm.MsgTypeTool || m.MsgType == llm.MsgTypeCommand {
 		return nil
 	}
 
@@ -1461,14 +1641,36 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 	return "", "text", "text/plain"
 }
 
+// parseCommandFromToolInput extracts the "command" field from a
+// tool input JSON like {"command":"dir","timeout":30}. Returns
+// the command string or "" on parse failure.
+func parseCommandFromToolInput(raw string) string {
+	var v struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal([]byte(raw), &v); err == nil && v.Command != "" {
+		return v.Command
+	}
+	return ""
+}
+
 // decodePartsFromMeta pulls the assistant message's `parts`
-// (thinking + tool + sub-agent) out of the raw metadata string
-// and the message content.
+// (thinking + text + tool + sub-agent) out of the raw
+// metadata string and the message content.
 //
-// Storage format:
-//   - meta["thinking"]  → raw thinking text (not JSON-encoded)
-//   - meta["parts"]     → only structural parts (tool + sub_agent)
-//   - content           → text part on reload (not duplicated in meta)
+// Storage format (two versions, auto-detected):
+//
+//   New (v2) — meta["parts"] is a full snapshot of the parts
+//   accumulator, including text and thinking in stream order.
+//   When the JSON contains any text or thinking part it is
+//   returned as-is — the interleaved order the user saw during
+//   streaming is preserved exactly.
+//
+//   Old (v1) — meta["parts"] contains only structural parts
+//   (tool + sub_agent). Thinking is stored as a raw string in
+//   meta["thinking"]; text comes from the `content` column.
+//   The rebuild appends thinking first, then structural parts,
+//   then a trailing text part from `content`.
 //
 // Returns nil when the row has no parts — that's the legacy
 // path where the assistant message is just plain text, and the
@@ -1485,14 +1687,26 @@ func decodePartsFromMeta(meta string, content string) []MessagePart {
 		return nil
 	}
 
+	// 1. Try the new (v2) full-snapshot format first.
+	//    When meta["parts"] already contains text or thinking
+	//    parts, the array is self-contained and needs no
+	//    rebuilding.
+	if raw, ok := blob["parts"]; ok && raw != "" {
+		var full []MessagePart
+		if err := json.Unmarshal([]byte(raw), &full); err == nil && hasTextOrThinking(full) {
+			return full
+		}
+	}
+
+	// 2. Old (v1) format: rebuild from separate fields.
 	var parts []MessagePart
 
-	// 1. Thinking — stored as raw string (no double-encode).
+	// Thinking — stored as raw string (no double-encode).
 	if t, ok := blob["thinking"]; ok && t != "" {
 		parts = append(parts, MessagePart{Kind: "thinking", Text: t})
 	}
 
-	// 2. Structural parts (tool + sub_agent) — JSON blob.
+	// Structural parts (tool + sub_agent) — JSON blob.
 	if raw, ok := blob["parts"]; ok && raw != "" {
 		var structural []MessagePart
 		if err := json.Unmarshal([]byte(raw), &structural); err == nil {
@@ -1500,15 +1714,27 @@ func decodePartsFromMeta(meta string, content string) []MessagePart {
 		}
 	}
 
-	// 3. Text — from content (not stored in meta).
-	// Always append so the frontend's parts path has a text
-	// slot even when the LLM round ended with tool-only output.
+	// Text — from content (not stored in meta).
 	parts = append(parts, MessagePart{Kind: "text", Text: content})
 
 	if len(parts) == 0 {
 		return nil
 	}
 	return parts
+}
+
+// hasTextOrThinking reports whether a parts array contains at
+// least one part whose kind is "text" or "thinking". Used to
+// distinguish the new full-snapshot format (which includes
+// these kinds inline) from the old structural-only format
+// (which only stores tool / sub_agent parts).
+func hasTextOrThinking(parts []MessagePart) bool {
+	for _, p := range parts {
+		if p.Kind == "text" || p.Kind == "thinking" {
+			return true
+		}
+	}
+	return false
 }
 
 // SendMessage is the main streaming endpoint. It accepts a user
@@ -1581,30 +1807,37 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// sending an empty body is fine.
 	h.setSessionMeta(id, string(s), provider, model)
 
+	// Serialise concurrent SendMessage calls on the same session
+	// so message writes don't interleave and corrupt history.
+	if _, loaded := h.sessionLocks.LoadOrStore(id, struct{}{}); loaded {
+		c.JSON(http.StatusConflict, gin.H{"error": "a message is already being processed for this session"})
+		return
+	}
+	defer h.sessionLocks.Delete(id)
+
 	// Build messages: history after last compression + new user message.
 	// Messages older than the compressed range are replaced by the
 	// CompressedSummary field on the ChatRequest. All reads go through
 	// the per-session variants so concurrent SendMessage calls on
 	// different sessions don't race.
 	meta := h.ensureMetaLoaded(id)
-	limit := contextLevelLimit(meta.ReasoningEffort)
 	lastComp := h.store.LastCompressedIDFor(id)
 	var histMsgs []llm.ChatMessage
 	var compSummary string
 	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, limit, lastComp)
+		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, 0, lastComp)
 		compSummary = h.store.CompressedSummaryFor(id)
 	} else {
-		histMsgs = h.store.GetChatMessagesFor(id, limit)
+		histMsgs = h.store.GetChatMessagesFor(id, 0)
 	}
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
-		if m.Role == llm.RoleSystem || m.Type == llm.TypeImage || m.Type == llm.TypeToolCall {
+		if m.SubmitToLLM == 0 {
 			continue
 		}
 		// Tool results → User role so providers don't reject
 		// orphaned 'tool' messages without preceding tool_calls.
-		if m.Type == llm.TypeToolResult {
+		if m.MsgType == llm.MsgTypeTool && m.Role == llm.RoleTool {
 			m.Role = llm.RoleUser
 		}
 		msgs = append(msgs, m)
@@ -1628,6 +1861,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		SkillContext:      req.SkillContext,
 		PlanMode:          meta.PlanMode,
 		PermissionLevel:   meta.PermissionLevel,
+		KBBase:            meta.KnowledgeBase,
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -1645,6 +1879,11 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	c.Writer.Flush()
 
 	c.Stream(func(w io.Writer) bool {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[sse] panic in stream writer: %v", r)
+			}
+		}()
 		chunk, ok := <-stream
 		if !ok {
 			return false
@@ -1758,6 +1997,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 	}
 	if chunk.ToolName != "" {
 		ev.Type = "tool"
+		ev.ToolID = chunk.ToolID
 		ev.ToolName = chunk.ToolName
 		ev.ToolArgs = chunk.ToolArgs
 		ev.ToolResult = chunk.ToolResult
@@ -1853,6 +2093,8 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		PlanMode:    m.PlanMode,
 		PermissionLevel: m.PermissionLevel,
 		ReasoningEffort: m.ReasoningEffort,
+		VectorStore:    cv.VectorStore,
+		KnowledgeBase:  m.KnowledgeBase,
 		CreatedAt:   cv.CreatedAt.Unix(),
 		UpdatedAt:   cv.UpdatedAt.Unix(),
 	}
@@ -1922,7 +2164,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel})
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
@@ -2058,7 +2300,7 @@ func (h *Handler) ExecutePlan(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: false, PermissionLevel: m.PermissionLevel})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: false, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 
@@ -2139,9 +2381,29 @@ func (h *Handler) RemoveProject(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"projects": out})
 }
 
-// contextLevelLimit returns the default message fetch limit.
-func contextLevelLimit(level string) int {
-	return 50
+// contextMessageLimit returns the message fetch limit for the given
+// provider/model pair, scaled to the model's configured context window.
+// When LimitsConfig.MaxStoredMessages is set (> 0) it takes precedence.
+// Otherwise the limit is max(50, contextWindow / 2000), capped at 1000.
+func (h *Handler) contextMessageLimit(provider, model string) int {
+	if h.cfg != nil && h.cfg.Limits.MaxStoredMessages > 0 {
+		return h.cfg.Limits.MaxStoredMessages
+	}
+	ctxWin := 0
+	if h.agent != nil && provider != "" && model != "" {
+		ctxWin = h.agent.LLM().ContextWindow(provider, model)
+	}
+	if ctxWin <= 0 {
+		ctxWin = llm.DefaultContextWindow
+	}
+	limit := ctxWin / 2000
+	if limit < 50 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	return limit
 }
 
 // reloadAfterConfigChange re-reads the on-disk config, rebuilds the

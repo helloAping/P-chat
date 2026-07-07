@@ -26,9 +26,10 @@ package agent
 //
 // 并发安全：自有 mutex，主 LLM 流循环和 per-tool forwarder 同时写入。
 //
-// 持久化：snapshotStructural() 只保留 tool + sub_agent part → meta["parts"] JSON。
-//   text 和 thinking 不从快照写入 DB，而是在 GET /messages 时从 content 和
-//   meta["thinking"] 字段还原（见 handler.go decodePartsFromMeta）。
+// 持久化：snapshotStructural() 完整序列化 parts 数组（包含 text + thinking +
+//   tool + sub_agent）→ meta["parts"] JSON。消息重载时 decodePartsFromMeta
+//   自动识别新旧格式：新格式直接反序列化还原完整顺序，旧格式从 content /
+//   meta["thinking"] 单独字段重组（向后兼容）。
 //
 // 修改指南 → docs/modules/agent.md
 
@@ -62,6 +63,7 @@ type MessagePart struct {
 	Elapsed  string        `json:"elapsed,omitempty"`
 	Task     string        `json:"task,omitempty"`
 	Parts    []MessagePart `json:"parts,omitempty"`
+	ToolID   string        `json:"tool_id,omitempty"`
 	// AgentType is the sub-agent's registered name
 	// ("explore", "plan", "general-purpose", or a custom
 	// agent from .p-chat/agent/*.md). Set on sub_agent
@@ -83,6 +85,33 @@ type MessagePart struct {
 	// header so the user can read the full hint without
 	// expanding the body.
 	AgentDescription string `json:"agent_description,omitempty"`
+}
+
+// Part kind numeric constants for dispatch.
+const (
+	PartKindText      = 0
+	PartKindThinking  = 1
+	PartKindTool      = 2
+	PartKindSubAgent  = 3
+	PartKindQuestion  = 4
+)
+
+// PartKindMap maps numeric part kind to its string representation.
+var PartKindMap = map[int]string{
+	PartKindText:     "text",
+	PartKindThinking: "thinking",
+	PartKindTool:     "tool",
+	PartKindSubAgent: "sub_agent",
+	PartKindQuestion: "question",
+}
+
+// PartKindStr maps string part kind to its numeric representation.
+var PartKindStr = map[string]int{
+	"text":      PartKindText,
+	"thinking":  PartKindThinking,
+	"tool":      PartKindTool,
+	"sub_agent": PartKindSubAgent,
+	"question":  PartKindQuestion,
 }
 
 // nativeToolCall is the parsed form of a tool call, whether it
@@ -265,11 +294,25 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		parts := a.activeParts()
 		status := toolStatusFromStep(c.Step, c.ToolError)
 		if status == "start" {
-			// If the trailing part is already an unfished
-			// tool with the same name, just refresh its
-			// args (the LLM may stream the final args
-			// after the initial "start" event).
-			if i := len(parts) - 1; i >= 0 && parts[i].Kind == "tool" && parts[i].Name == c.ToolName && parts[i].Status == "start" {
+			// When a ToolID is present, avoid clobbering an
+			// earlier same-name start part — the ID is the
+			// unique key. For ID-less streams (old clients),
+			// fall back to the legacy name-based check.
+			if c.ToolID != "" {
+				if i := len(parts) - 1; i >= 0 &&
+					parts[i].Kind == "tool" &&
+					parts[i].ToolID == c.ToolID &&
+					parts[i].Status == "start" {
+					if c.ToolArgs != "" {
+						parts[i].Args = c.ToolArgs
+					}
+					a.setActiveParts(parts)
+					return
+				}
+			} else if i := len(parts) - 1; i >= 0 &&
+				parts[i].Kind == "tool" &&
+				parts[i].Name == c.ToolName &&
+				parts[i].Status == "start" {
 				if c.ToolArgs != "" {
 					parts[i].Args = c.ToolArgs
 				}
@@ -281,15 +324,20 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 				Name:   c.ToolName,
 				Args:   c.ToolArgs,
 				Status: "start",
+				ToolID: c.ToolID,
 			})
 			a.setActiveParts(parts)
 			return
 		}
-		// ok / warn / error — find the matching unfished tool
-		// and stamp the result.
+		// ok / warn / error — exact match by ID, fallback to
+		// name for legacy streams.
 		for i := len(parts) - 1; i >= 0; i-- {
 			p := parts[i]
-			if p.Kind == "tool" && p.Name == c.ToolName && p.Status == "start" {
+			if p.Kind != "tool" || p.Status != "start" {
+				continue
+			}
+			if c.ToolID != "" && p.ToolID == c.ToolID ||
+				c.ToolID == "" && p.Name == c.ToolName {
 				p.Status = status
 				p.Result = c.ToolResult
 				p.Error = c.ToolError
@@ -313,6 +361,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			Result:  c.ToolResult,
 			Error:   c.ToolError,
 			Elapsed: c.ToolElapsed,
+			ToolID:  c.ToolID,
 		})
 		a.setActiveParts(parts)
 		return
@@ -407,27 +456,23 @@ func (a *partsAccumulator) snapshot() []MessagePart {
 // structural parts (tool + sub_agent), dropping top-level
 // text and thinking. Sub-agent nested parts (including their
 // inner text and thinking) are preserved.
+// snapshotStructural returns a deep copy of the accumulator's parts
+// array — including text and thinking parts in their original stream
+// order. The caller (persistAssistant) stores it as JSON in
+// messages.metadata under the "parts" key.
 //
-// The top-level text is already in the message's Content
-// column, and thinking is stored as a raw string in
-// meta["thinking"]. Storing them again in the parts JSON
-// would be pure duplication; this function removes the
-// redundancy while keeping the UI-critical tool cards and
-// sub-agent cards intact.
+// On reload, decodePartsFromMeta detects the format: when the JSON
+// contains text or thinking parts it's used as-is (preserving the
+// interleaved order the user saw during streaming); when it contains
+// only tool / sub_agent parts, the legacy rebuild path kicks in
+// (thinking from meta["thinking"], text from the content column).
 func snapshotStructural(a *partsAccumulator) []MessagePart {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	structural := make([]MessagePart, 0, len(a.parts))
-	for _, p := range a.parts {
-		if p.Kind == "text" || p.Kind == "thinking" {
-			continue
-		}
-		structural = append(structural, p)
-	}
-	if len(structural) == 0 {
+	if len(a.parts) == 0 {
 		return nil
 	}
-	b, _ := json.Marshal(structural)
+	b, _ := json.Marshal(a.parts)
 	var out []MessagePart
 	_ = json.Unmarshal(b, &out)
 	return out
