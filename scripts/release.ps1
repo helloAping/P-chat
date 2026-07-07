@@ -38,6 +38,7 @@ $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath (Split-Path $PSScriptRoot -Parent)
 
 # ── 1. Read VERSION ──────────────────────────────────────────
+if (-not (Test-Path VERSION)) { throw "VERSION file not found in current directory" }
 $version = (Get-Content VERSION -Raw).Trim()
 if (-not $version) { throw "VERSION file is empty" }
 $tag = "v$version"
@@ -50,8 +51,16 @@ Write-Host "┌─ Release: $tag" -ForegroundColor Cyan
 Write-Host "├─ Branch: $branch" -ForegroundColor Gray
 Write-Host "├─ VERSION: $version" -ForegroundColor Gray
 Write-Host "├─ Changed files:" -ForegroundColor Gray
-if ($changed) { Write-Host "│  $changed" -ForegroundColor Yellow }
+if ($changed) {
+  Write-Host "│  $changed" -ForegroundColor Yellow
+  if ($SkipSync) {
+    Write-Host "│  WARNING: -SkipSync with dirty tree — uncommitted files will be included in the release commit." -ForegroundColor Yellow
+  }
+}
 else           { Write-Host "│  (clean)" -ForegroundColor Green }
+
+$remoteTag = git ls-remote --tags origin "$tag" 2>$null
+if ($remoteTag) { throw "Tag '$tag' already exists on remote. Delete it first: git push --delete origin $tag" }
 
 # ── 3. Confirmation ─────────────────────────────────────────
 Write-Host "└─ Steps: sync:version → commit → tag → push" -ForegroundColor Gray
@@ -86,10 +95,11 @@ Write-Host "`n→ git tag $tag" -ForegroundColor Cyan
 git tag -a "$tag" -m "$Message"
 if ($LASTEXITCODE -ne 0) { throw "tag failed" }
 
-Write-Host "`n→ git push && git push --tags" -ForegroundColor Cyan
-git push
-if ($LASTEXITCODE -ne 0) { throw "push failed" }
-git push --tags
+Write-Host "`n→ git push origin HEAD && git push origin $tag" -ForegroundColor Cyan
+git push origin HEAD
+if ($LASTEXITCODE -ne 0) { throw "push branch failed" }
+git push origin $tag
+if ($LASTEXITCODE -ne 0) { throw "push tag failed" }
 
 Write-Host @"
 

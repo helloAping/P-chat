@@ -29,13 +29,14 @@ jobs:
         shell: bash
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
-          echo "version=$TAG" >> $GITHUB_OUTPUT
 
           if [[ "$TAG" == *-rc* ]]; then
             echo "is_rc=true" >> $GITHUB_OUTPUT
           else
             echo "is_rc=false" >> $GITHUB_OUTPUT
           fi
+          TAG="${TAG%-release}"
+          echo "version=$TAG" >> $GITHUB_OUTPUT
 
           # Generate changelog from commits since last stable tag.
           LAST_TAG=$(git tag --sort=-creatordate | grep -E '^v.*-release$' | grep -v "$TAG" | head -1)
@@ -45,6 +46,10 @@ jobs:
             LOG=$(git log --pretty=format:'- %s (%h)' -20 2>/dev/null)
           fi
           LOG=$(echo "$LOG" | head -50)
+          COUNT=$(echo "$LOG" | wc -l)
+          if [ "$COUNT" -gt 50 ]; then
+            echo "::warning::Changelog truncated from $COUNT to 50 entries"
+          fi
           {
             echo 'changelog<<EOF'
             echo "$LOG"
@@ -86,11 +91,13 @@ jobs:
           Set-Content -Path VERSION -Value "${{ needs.version.outputs.version }}" -NoNewline
           Write-Host "VERSION = ${{ needs.version.outputs.version }}"
 
-      - name: Build all + package
+      - name: Build all
         shell: cmd
-        run: |
-          task build:all
-          task package:gui
+        run: task build:all
+
+      - name: Package GUI
+        shell: pwsh
+        run: .\scripts\package-gui.ps1
 
       - name: Generate Windows checksums
         shell: pwsh
@@ -212,7 +219,10 @@ jobs:
 
   release:
     needs: [version, build-windows, build-linux]
-    if: always() && needs.version.result == 'success'
+    if: |
+      !failure() &&
+      needs.version.result == 'success' &&
+      needs.build-windows.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
