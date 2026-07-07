@@ -2046,6 +2046,14 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.Thinking = chunk.ThinkingRewrite
 		return ev
 	}
+	// SessionStatus events carry lifecycle signals ("busy" /
+	// "idle") so the frontend can drive the TodoPanel state
+	// machine. Must be checked BEFORE Phase because the chunk
+	// may also carry a Phase field.
+	if chunk.SessionStatus != "" {
+		ev.Type = "session_status"
+		return ev
+	}
 	// Other phase events (system, memory, plan, sub-agent
 	// start/ok/err) — surface as "phase" with the original
 	// Phase/Step/Message fields. Sub-agent lifecycle events

@@ -147,17 +147,14 @@ export const currentMeta = computed(() => {
   }
 })
 
-// Global phantom scrub. Walks every message in every
-// session whenever the messages map changes. The
-// per-part scrub in `appendTextPart` catches the common
-// case, but a stored phantom from a pre-fix version
-// (or a phantom injected through a path we haven't
-// audited) would still be visible until the user
-// reloads. This deep watcher makes the scrub a
-// no-op-when-clean, side-effect-when-dirty background
-// job that runs on every reactive change. Performance
-// is fine in practice (sessions have <100 messages,
-// each with <20 parts, the regex is cheap).
+// Global phantom scrub. Walks newly-added messages on
+// session change to catch stored phantoms from pre-fix
+// versions or phantom injections through unaudited paths.
+// The per-part scrub in `appendTextPart` handles the
+// streaming path; the `done` handler does a final pass.
+// We track per-session message counts and only scrub
+// unseen messages — avoiding the O(all_messages) deep
+// walk on every SSE tick that `deep: true` incurred.
 //
 // We scrub in place — the `m.parts` arrays are
 // reactive so the Vue components re-render
@@ -165,18 +162,29 @@ export const currentMeta = computed(() => {
 // actually changes a value, to avoid spurious
 // reactive triggers.
 watch(
-  () => state.sessionMessages,
-  (sessions) => {
-    if (!sessions) return
+  () => {
+    const counts: Record<string, number> = {}
+    const sessions = state.sessionMessages
+    if (!sessions) return counts
     for (const id in sessions) {
-      const msgs = sessions[id]
+      counts[id] = sessions[id]?.length ?? 0
+    }
+    return counts
+  },
+  (counts, oldCounts) => {
+    if (!counts || !oldCounts) return
+    for (const id in counts) {
+      const newLen = counts[id]
+      const oldLen = oldCounts[id] ?? 0
+      if (newLen <= oldLen) continue
+      const msgs = state.sessionMessages[id]
       if (!msgs) continue
-      for (const m of msgs) {
-        scrubMessagePhantoms(m)
+      for (let i = oldLen; i < newLen; i++) {
+        scrubMessagePhantoms(msgs[i])
       }
     }
   },
-  { deep: true },
+  { immediate: true },
 )
 
 // --- Session management ---
@@ -1276,24 +1284,15 @@ export function endStream(id: string) {
 }
 
 export function submitQuestionAnswer(answers: Record<string, string>) {
-  // Always answer the question that belongs to the *session
-  // that asked it* — not whatever session the user happens to
-  // be viewing. The sessionID is captured in the question
-  // event's key; we just look it up here.
-  for (const [sid, pq] of Object.entries(state.pendingQuestion)) {
-    if (pq) {
-      const id = sid
-      delete state.pendingQuestion[id]
-      // Resolve the Promise so the LLM continues.
-      pq.resolve(answers)
-      // POST the answer to the server so the blocked tool handler
-      // receives it and the agent loop continues.
-      api.submitQuestionResponse(id, {
-        questions: pq.questions,
-        answers,
-      })
-      return
-    }
+  const pq = state.pendingQuestion[state.currentID]
+  if (pq) {
+    const id = state.currentID
+    delete state.pendingQuestion[id]
+    pq.resolve(answers)
+    api.submitQuestionResponse(id, {
+      questions: pq.questions,
+      answers,
+    })
   }
 }
 
@@ -1306,13 +1305,11 @@ async function submitConfirmResponseInner(id: string, approved: boolean) {
 }
 
 export function submitToolConfirm(approved: boolean) {
-  for (const [sid, items] of Object.entries(state.pendingConfirm)) {
-    if (items && items.length > 0) {
-      const pc = items.shift()!
-      if (items.length === 0) delete state.pendingConfirm[sid]
-      pc.resolve(approved)
-      return
-    }
+  const items = state.pendingConfirm[state.currentID]
+  if (items && items.length > 0) {
+    const pc = items.shift()!
+    if (items.length === 0) delete state.pendingConfirm[state.currentID]
+    pc.resolve(approved)
   }
 }
 
