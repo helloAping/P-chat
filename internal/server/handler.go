@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2546,6 +2547,27 @@ func (h *Handler) AddMCPServer(c *gin.Context) {
 	}
 	if body.Type == "sse" && body.URL == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required for SSE transport"})
+		return
+	}
+	// Reject shell-interpreter invocations that could run arbitrary
+	// commands. The MCP manager execs the command verbatim; if the
+	// caller wants to run a shell pipeline they should bundle it
+	// into a script with its own shebang/permissions.
+	if body.Command != "" {
+		base := filepath.Base(strings.ToLower(body.Command))
+		switch base {
+		case "cmd", "cmd.exe", "sh", "bash", "zsh", "fish", "powershell", "powershell.exe", "pwsh", "csh", "tcsh", "ksh":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "command must be a direct executable, not a shell interpreter; bundle your script and invoke it directly"})
+			return
+		}
+	}
+	// Cap env and args to prevent resource abuse.
+	if len(body.Args) > 64 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "args must be 64 or fewer entries"})
+		return
+	}
+	if len(body.Env) > 64 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "env must be 64 or fewer entries"})
 		return
 	}
 

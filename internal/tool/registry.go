@@ -608,6 +608,20 @@ func isInUploadDir(p string) bool {
 	if p == "" {
 		return false
 	}
+	// Expand leading ~ to user home so the absolute-path check
+	// below catches ~/.p-chat/uploads/secret.png. Without this,
+	// the LLM could read upload files via the shell escape hatch
+	// by using the home-prefixed path (which would otherwise be
+	// treated as a bare token, not an absolute path).
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if p == "~" {
+				p = home
+			} else if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, "~\\") {
+				p = filepath.Join(home, p[2:])
+			}
+		}
+	}
 	upDir := filepath.Clean(paths.GlobalDir() + string(filepath.Separator) + "uploads")
 
 	// 1. Absolute path that lives under the upload dir.
@@ -656,6 +670,16 @@ func handleReadDocx(ctx context.Context, args json.RawMessage) (*CallResult, err
 	if a.Path == "" {
 		return &CallResult{Content: "path is required", IsError: true}, nil
 	}
+	a.Path = resolveToProjectRoot(ctx, a.Path)
+	if isInUploadDir(a.Path) {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_UPLOAD_DIR: read blocked — %s is inside the chat upload directory. "+
+					"Uploaded files are already inlined in the user message; do NOT call "+
+					"read_docx on them.", a.Path),
+			IsError: true,
+		}, nil
+	}
 	text, err := readDocx(a.Path)
 	if err != nil {
 		return &CallResult{Content: err.Error(), IsError: true}, nil
@@ -671,6 +695,16 @@ func handleReadPdf(ctx context.Context, args json.RawMessage) (*CallResult, erro
 	}
 	if a.Path == "" {
 		return &CallResult{Content: "path is required", IsError: true}, nil
+	}
+	a.Path = resolveToProjectRoot(ctx, a.Path)
+	if isInUploadDir(a.Path) {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_UPLOAD_DIR: read blocked — %s is inside the chat upload directory. "+
+					"Uploaded files are already inlined in the user message; do NOT call "+
+					"read_pdf on them.", a.Path),
+			IsError: true,
+		}, nil
 	}
 	text, err := readPdf(a.Path)
 	if err != nil {

@@ -35,7 +35,11 @@ func WaitForConfirm(ctx context.Context, sessionID string, req ConfirmRequest) (
 		list := confirmChs[sessionID]
 		for i, c := range list {
 			if c == ch {
-				confirmChs[sessionID] = append(list[:i], list[i+1:]...)
+				// Copy to avoid slice aliasing (same as SubmitConfirm).
+				newList := make([]chan ConfirmResponse, 0, len(list)-1)
+				newList = append(newList, list[:i]...)
+				newList = append(newList, list[i+1:]...)
+				confirmChs[sessionID] = newList
 				break
 			}
 		}
@@ -63,7 +67,12 @@ func SubmitConfirm(sessionID string, approved bool) bool {
 		return false
 	}
 	ch := list[0]
-	confirmChs[sessionID] = list[1:]
+	// Copy the tail into a fresh slice so a concurrent
+	// WaitForConfirm append cannot write into the slot we
+	// just released via list[1:] (slice aliasing bug).
+	rest := make([]chan ConfirmResponse, len(list)-1)
+	copy(rest, list[1:])
+	confirmChs[sessionID] = rest
 	if len(confirmChs[sessionID]) == 0 {
 		delete(confirmChs, sessionID)
 	}

@@ -502,15 +502,43 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 // Manager and the migration path. Errors are returned so the caller
 // can decide whether to surface them (Manager surfaces, migration
 // swallows).
+//
+// The write is atomic: marshal to a sibling temp file, fsync, then
+// rename over the destination. A crash mid-write leaves the
+// original config intact instead of producing a truncated/
+// unparseable file.
 func writeConfigJSON(path string, cfg *Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	return os.WriteFile(path, data, 0o644)
+	tmp, err := os.CreateTemp(dir, ".config-tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Best-effort cleanup if rename was never reached.
+		if _, statErr := os.Stat(tmpName); statErr == nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func Default() *Config {

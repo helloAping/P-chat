@@ -60,9 +60,12 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 	ch := make(chan QuestionResponse, 1)
 
 	questionMu.Lock()
-	if old, ok := questionChs[sessionID]; ok {
-		close(old)
-	}
+	// If a previous question is still pending for this session,
+	// just overwrite the map entry — do NOT close the old
+	// channel. Closing while SubmitAnswer may still hold a
+	// reference and write to it would cause a panic.
+	// The old goroutine will return via its 5-minute timeout
+	// (or ctx cancel) and the old channel is then GC'd.
 	questionChs[sessionID] = ch
 	questionMu.Unlock()
 

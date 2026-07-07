@@ -121,7 +121,39 @@ func writeFile(path string, data []byte) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	// Cap to 10 MiB so a prompt-injection cannot fill the disk
+	// in a single write_file call. Anything bigger should be
+	// written via exec_command (heredoc / split).
+	const maxWrite = 10 << 20
+	if len(data) > maxWrite {
+		return fmt.Errorf("write size %d bytes exceeds cap of %d bytes; use exec_command to write large files in chunks", len(data), maxWrite)
+	}
+	// Atomic write: write to a sibling temp file then rename.
+	// A crash mid-write leaves the original file intact instead
+	// of producing a truncated/broken file on disk.
+	tmp, err := os.CreateTemp(dir, ".write-tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Best-effort cleanup on any error path.
+		if _, statErr := os.Stat(tmpName); statErr == nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func listDir(path string) (string, error) {

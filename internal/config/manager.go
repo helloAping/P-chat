@@ -428,8 +428,17 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 				m.MaxTokensOutput = patch.MaxTokensOutput
 			}
 		}
-		// Capabilities is always replaced (it's a struct value).
-		m.Capabilities = patch.Capabilities
+		// Capabilities is only replaced when the patch actually
+		// carries a non-zero value. The HTTP PATCH API never
+		// sends Capabilities, so without this guard every
+		// DisplayName/Description edit would wipe out the
+		// model's per-model capabilities (vision, thinking,
+		// tool-use, etc.). If a future caller needs to clear
+		// Capabilities, they can use clearAll and a separate
+		// reset endpoint.
+		if patch.Capabilities != (Capabilities{}) {
+			m.Capabilities = patch.Capabilities
+		}
 		cfg.LLM.Providers[i] = p
 		mgr := NewManager()
 		if err := mgr.SaveGlobal(cfg); err != nil {
