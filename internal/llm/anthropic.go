@@ -319,13 +319,27 @@ func (c *AnthropicClient) handleStreamEvent(eventType, dataJSON string, ch chan<
 				}
 			}
 		}
-	case "message_stop":
-		ch <- StreamChunk{Done: true}
 	case "message_delta":
 		var delta anthropicMessageDelta
 		if err := json.Unmarshal([]byte(dataJSON), &delta); err == nil {
-			ch <- StreamChunk{TokensOut: delta.Usage.OutputTokens}
+			// Anthropic sends the usage in message_delta
+			// (which arrives AFTER message_stop in some
+			// implementations). To avoid racing the
+			// message_stop's Done=true (which closes the
+			// consumer loop and discards the token count),
+			// we include Done=true here as well. The
+			// agent loop is idempotent on Done and just
+			// updates the max.
+			ch <- StreamChunk{
+				TokensOut: delta.Usage.OutputTokens,
+				Done:      true,
+			}
 		}
+	case "message_stop":
+		// If we got message_stop without a preceding
+		// message_delta (e.g. the proxy collapsed them),
+		// still emit Done so the consumer doesn't hang.
+		ch <- StreamChunk{Done: true}
 	case "error":
 		var errResp struct {
 			Type    string `json:"type"`

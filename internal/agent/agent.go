@@ -1719,10 +1719,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							if decision == tool.SandboxConfirm {
 								if permLevel == tool.PermissionAuto {
 									// Auto-approve: skip confirm modal,
-									// emit a brief notification event instead.
+									// emit a brief system notification
+									// instead. Use Phase (not Content)
+									// so the message isn't persisted into
+									// the assistant turn's text — on
+									// reload the user would otherwise see
+									// "🔓 [自动通过]" mixed in with the
+									// LLM's actual reply.
 									select {
 									case eventCh <- ChatStreamChunk{
-										Content: fmt.Sprintf("🔓 [自动通过] %s", tc.Name),
+										Phase:   "system",
+										Message: fmt.Sprintf("🔓 [自动通过] %s", tc.Name),
 									}:
 									default:
 									}
@@ -2277,10 +2284,6 @@ func (a *Agent) truncateToolResult(name string, content string) string {
 		}
 	}
 
-	if len(content) <= defaultCap {
-		return content
-	}
-
 	var cap_ int
 	keepHead := true
 	switch name {
@@ -2293,6 +2296,13 @@ func (a *Agent) truncateToolResult(name string, content string) string {
 		cap_ = defaultCap
 	}
 
+	// The previous version had a `len(content) <= defaultCap`
+	// short-circuit here, which incorrectly skipped truncation
+	// for exec_command when execCap < defaultCap. For example,
+	// with defaultCap=6000 and execCap=4000, an exec result
+	// of 5000 bytes would pass the early return and be sent
+	// to the LLM untruncated (exceeding the configured
+	// exec_cap). Always go through the per-name cap check.
 	if len(content) <= cap_ {
 		return content
 	}

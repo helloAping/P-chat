@@ -418,7 +418,15 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			line, err := reader.ReadBytes('\n')
 			if err != nil {
 				if errors.Is(err, io.EOF) {
-					ch <- StreamChunk{Done: true}
+					// EOF after a successful [DONE] (or after
+					// the proxy simply closing the connection):
+					// don't emit another Done. The agent loop
+					// already saw the prior Done and broke
+					// out. Sending a second Done would (a) be
+					// wasted channel capacity, and (b) re-enter
+					// the retry-state-cleanup path. The channel
+					// close below signals end-of-stream to the
+					// consumer.
 					log.Printf("[llm/%s/%s] stream ended: chunks=%d parsed=%d content=%d thinking=%d parse_errs=%d",
 						p.name, model, rawChunks, rawChunks-parseFailures, contentChars, thinkingChars, parseFailures)
 					return
@@ -960,6 +968,15 @@ func walkForField(v any, names []string, path string, depth, maxDepth, maxResult
 		for _, name := range names {
 			if val, ok := t[name]; ok {
 				if s, ok := val.(string); ok && s != "" {
+					// Cap returned string at 4 MiB. A misbehaving
+					// proxy could emit a single 1 GB string here,
+					// which would otherwise flow into the model's
+					// context (wasting tokens) or OOM the agent.
+					// The upper layer is responsible for further
+					// truncation / summarisation if needed.
+					if len(s) > 4<<20 {
+						s = s[:4<<20]
+					}
 					return s, path + "." + name
 				}
 			}

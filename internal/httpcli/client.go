@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Client talks to pchat-server over HTTP. All methods are safe for
@@ -38,10 +40,31 @@ type Client struct {
 // "http://127.0.0.1:8960"). No timeout is set on the HTTP client —
 // SSE streams for long agent runs can last minutes; the caller
 // controls cancellation via context.
+//
+// The HTTP client uses a tuned transport with keep-alive
+// connection pooling. The default http.DefaultTransport has
+// MaxIdleConnsPerHost=2, which forces a new TCP connection for
+// almost every request to the same backend. For a CLI that
+// makes many requests to pchat-server (e.g. switching
+// providers, listing models, polling status), this is slow and
+// burns sockets. We bump the per-host pool to 20 and add
+// IdleConnTimeout so connections eventually close.
 func NewClient(base string) *Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	return &Client{
 		base: strings.TrimRight(base, "/"),
-		http: &http.Client{Timeout: 0},
+		http: &http.Client{Timeout: 0, Transport: transport},
 	}
 }
 
@@ -305,7 +328,9 @@ func (c *Client) ListProviders(ctx context.Context) ([]ProviderInfo, error) {
 	}
 	// Cache so SetModel / DisplayModel can answer without a
 	// round-trip.
+	c.mu.Lock()
 	c.cfgProviders = resp.Providers
+	c.mu.Unlock()
 	return resp.Providers, nil
 }
 
@@ -397,7 +422,10 @@ func (c *Client) Flush() error { return nil }
 func (c *Client) ModelsFor(provider string) ([]Model, bool) {
 	// For now the client doesn't have a per-provider model endpoint;
 	// synthesize a single-model entry from what we know.
-	for _, p := range c.cfgProviders {
+	c.mu.Lock()
+	providers := c.cfgProviders
+	c.mu.Unlock()
+	for _, p := range providers {
 		if p.Name == provider {
 			if p.Model != "" {
 				return []Model{{Name: p.Model, Default: true}}, true
@@ -413,7 +441,9 @@ func (c *Client) ModelsFor(provider string) ([]Model, bool) {
 // lookups locally. The HTTP REPL reads this from the
 // /api/v1/providers endpoint.
 func (c *Client) SetCfgProviders(ps []ProviderInfo) {
+	c.mu.Lock()
 	c.cfgProviders = ps
+	c.mu.Unlock()
 }
 
 // Internal state.
