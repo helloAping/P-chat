@@ -29,7 +29,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/QuestionModal.vue` | 多选问题对话框 | |
 | `components/ImageLightbox.vue` | 全屏图片查看器 | |
 | `components/LoadingDots.vue` | 子代理加载指示器 | |
-| `components/AppSettingsModal.vue` | Provider/Model/Style 管理 | |
+| `components/AppSettingsModal.vue` | Provider/Model/Style/知识库管理 | 左右分栏 + KB 三层树视图 + NCollapse |
 
 ## 核心概念
 
@@ -112,6 +112,29 @@ if (ev.sub_agent && ev.sub_agent_task) {
 - `PHANTOM_RE` 正则匹配
 - 在文本增量追加时实时过滤
 - 在 Done 事件时全量扫描
+
+### 8. 知识库三层树视图
+
+`AppSettingsModal.vue` 知识库 Tab 新增三层索引树视图：
+
+```
+API: GET /api/v1/knowledge/bases/:name/nodes → NodeTreeItem[]
+      GET /api/v1/knowledge/bases/:name/nodes/:id/content → NodeContentItem[]
+
+渲染层次:
+  L1 概览卡片 → kb-config-card (base overview)
+  L2 文件节点 → 可点击行，箭头旋转动画
+    ├── 展开 → 加载 children (getChildren(pid)) + 内容块 (getNodeContent)
+    └── L3 章节节点 → title + overview + content_count
+          └── 内容块 → <pre> 代码段
+
+状态管理:
+  kbNodes: NodeTreeItem[]       — 扁平节点列表
+  kbExpandedNodes: Set<number>  — 已展开的节点 ID
+  kbNodeContents: Map<number, NodeContentItem[]> — 节点内容缓存
+```
+
+原始条目卡片 (`wiki_sections`) 保留在树视图下方作为向后兼容层。
 
 ## 修改指南
 

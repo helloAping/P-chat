@@ -1099,6 +1099,12 @@ export const cancelScan = (name: string) =>
     { method: 'DELETE' },
   )
 
+export const clearKnowledgeBase = (name: string) =>
+  jsonFetch<{ ok: boolean; message?: string }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(name)}/clear`,
+    { method: 'DELETE' },
+  )
+
 export const searchKnowledge = (query: string, topK?: number) =>
   jsonFetch<{ query: string; results: Array<{ source: string; content: string; similarity: number; rank: number }> }>(
     '/api/v1/knowledge/search',
@@ -1132,3 +1138,72 @@ export const deleteKnowledgeSection = (baseName: string, id: number) =>
     `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/sections/${id}`,
     { method: 'DELETE' },
   )
+
+// Knowledge index nodes (three-level tree)
+export interface NodeTreeItem {
+  id: number
+  parent_id: number
+  level: number
+  title: string
+  keywords: string
+  overview: string
+  source: string
+  kind: string
+  child_count: number
+  content_count: number
+}
+
+export interface NodeContentItem {
+  id: number
+  node_id: number
+  content: string
+  content_type: string
+  sort_order: number
+}
+
+export const listKnowledgeNodes = (baseName: string) =>
+  jsonFetch<{ nodes: NodeTreeItem[] }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/nodes`,
+  )
+
+export const getNodeContent = (baseName: string, nodeId: number) =>
+  jsonFetch<{ contents: NodeContentItem[] }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/nodes/${nodeId}/content`,
+  )
+
+export const deleteKnowledgeNode = (baseName: string, nodeId: number) =>
+  jsonFetch<{ ok: boolean }>(
+    `/api/v1/knowledge/bases/${encodeURIComponent(baseName)}/nodes/${nodeId}`,
+    { method: 'DELETE' },
+  )
+
+// ---- System Config API ----
+
+export interface LimitsConfig {
+  auto_compact_buffer: number
+  tool_result_exec_cap: number
+  tool_result_read_cap: number
+  tool_result_default_cap: number
+  prune_after_rounds: number
+  max_rounds: number
+  max_stored_messages: number
+}
+
+export interface SubAgentConfig {
+  cache_ttl: string
+  timeout: string
+}
+
+export interface SystemConfig {
+  limits: LimitsConfig
+  sub_agent: SubAgentConfig
+}
+
+export const getSystemConfig = () =>
+  jsonFetch<SystemConfig>('/api/v1/config')
+
+export const updateSystemConfig = (patch: Record<string, unknown>) =>
+  jsonFetch<SystemConfig>('/api/v1/config', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })

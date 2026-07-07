@@ -37,6 +37,9 @@ type Handler struct {
 	mcpMgr     *mcp.Manager
 
 	metaMu sync.Mutex
+	// sessionLocks serialises concurrent SendMessage calls per
+	// session to prevent interleaved message writes.
+	sessionLocks sync.Map // string → struct{}
 	meta   map[string]sessionMeta
 }
 
@@ -1268,7 +1271,7 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	queryLimit := parseIntQuery(c, "limit", 0)
 
 	meta := h.ensureMetaLoaded(id)
-	contextCap := contextLevelLimit(meta.ReasoningEffort)
+	contextCap := h.contextMessageLimit(meta.Provider, meta.Model)
 
 	// Effective limit: explicit query param wins; otherwise
 	// the context-window cap (keeps the same default the old
@@ -1804,21 +1807,28 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// sending an empty body is fine.
 	h.setSessionMeta(id, string(s), provider, model)
 
+	// Serialise concurrent SendMessage calls on the same session
+	// so message writes don't interleave and corrupt history.
+	if _, loaded := h.sessionLocks.LoadOrStore(id, struct{}{}); loaded {
+		c.JSON(http.StatusConflict, gin.H{"error": "a message is already being processed for this session"})
+		return
+	}
+	defer h.sessionLocks.Delete(id)
+
 	// Build messages: history after last compression + new user message.
 	// Messages older than the compressed range are replaced by the
 	// CompressedSummary field on the ChatRequest. All reads go through
 	// the per-session variants so concurrent SendMessage calls on
 	// different sessions don't race.
 	meta := h.ensureMetaLoaded(id)
-	limit := contextLevelLimit(meta.ReasoningEffort)
 	lastComp := h.store.LastCompressedIDFor(id)
 	var histMsgs []llm.ChatMessage
 	var compSummary string
 	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, limit, lastComp)
+		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, 0, lastComp)
 		compSummary = h.store.CompressedSummaryFor(id)
 	} else {
-		histMsgs = h.store.GetChatMessagesFor(id, limit)
+		histMsgs = h.store.GetChatMessagesFor(id, 0)
 	}
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
@@ -2371,9 +2381,29 @@ func (h *Handler) RemoveProject(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"projects": out})
 }
 
-// contextLevelLimit returns the default message fetch limit.
-func contextLevelLimit(level string) int {
-	return 50
+// contextMessageLimit returns the message fetch limit for the given
+// provider/model pair, scaled to the model's configured context window.
+// When LimitsConfig.MaxStoredMessages is set (> 0) it takes precedence.
+// Otherwise the limit is max(50, contextWindow / 2000), capped at 1000.
+func (h *Handler) contextMessageLimit(provider, model string) int {
+	if h.cfg != nil && h.cfg.Limits.MaxStoredMessages > 0 {
+		return h.cfg.Limits.MaxStoredMessages
+	}
+	ctxWin := 0
+	if h.agent != nil && provider != "" && model != "" {
+		ctxWin = h.agent.LLM().ContextWindow(provider, model)
+	}
+	if ctxWin <= 0 {
+		ctxWin = llm.DefaultContextWindow
+	}
+	limit := ctxWin / 2000
+	if limit < 50 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	return limit
 }
 
 // reloadAfterConfigChange re-reads the on-disk config, rebuilds the

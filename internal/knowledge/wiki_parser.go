@@ -10,8 +10,7 @@ import (
 var headingRe = regexp.MustCompile(`^(#{1,3})\s+(.+)$`)
 
 // ==============================
-// HeadingNode — 层级标题树
-// ==============================
+// HeadingNode �?层级标题�?// ==============================
 
 // HeadingNode represents a markdown heading and its content subtree.
 type HeadingNode struct {
@@ -40,19 +39,19 @@ func (n *HeadingNode) AggregatedContent() string {
 		b.WriteString("\n")
 	}
 	for _, child := range n.Children {
-		b.WriteString("\n子主题: ")
+		b.WriteString("\n子主�? ")
 		b.WriteString(child.Title)
 		if strings.TrimSpace(child.OwnText) != "" {
-			b.WriteString(" — ")
+			b.WriteString(" �?")
 			b.WriteString(strings.TrimSpace(child.OwnText))
 		}
 		b.WriteString("\n")
 		// Recurse into grandchildren.
 		for _, gc := range child.Children {
-			b.WriteString("  子主题: ")
+			b.WriteString("  子主�? ")
 			b.WriteString(gc.Title)
 			if strings.TrimSpace(gc.OwnText) != "" {
-				b.WriteString(" — ")
+				b.WriteString(" �?")
 				b.WriteString(strings.TrimSpace(gc.OwnText))
 			}
 			b.WriteString("\n")
@@ -119,7 +118,7 @@ func BuildHeadingTree(text string, includeLevel int) []*HeadingNode {
 		if leaf != nil {
 			leaf.OwnText += line + "\n"
 		} else if !preambleDone {
-			// Preamble text before any heading — attach to a synthetic root.
+			// Preamble text before any heading �?attach to a synthetic root.
 			if len(roots) == 0 {
 				roots = append(roots, &HeadingNode{Title: "_preamble_", Level: 0, OwnText: ""})
 			}
@@ -128,7 +127,7 @@ func BuildHeadingTree(text string, includeLevel int) []*HeadingNode {
 	}
 	flushLeaf()
 
-	// Strip preamble placeholder — if the only root is a _preamble_ node
+	// Strip preamble placeholder �?if the only root is a _preamble_ node
 	// (no real headings), return nil so caller uses the fallback path.
 	if len(roots) == 1 && roots[0].Level == 0 && len(roots[0].Children) == 0 {
 		// If preamble has text, keep it as a single synthetic root.
@@ -173,108 +172,6 @@ func WalkHeadingTree(roots []*HeadingNode, fn func(*HeadingNode)) {
 	for _, r := range roots {
 		walk(r)
 	}
-}
-
-// ==============================
-// Legacy flat parser (kept for CLI kb.go scanDir compatibility)
-// ==============================
-
-// ParseWiki splits text into sections by markdown headings.
-// includeLevel controls max heading depth: 1=H1 only, 2=H1-H2, 3=H1-H3 (default).
-func ParseWiki(text, source string, includeLevel int) []WikiSection {
-	if includeLevel <= 0 {
-		includeLevel = 3
-	}
-
-	var sections []WikiSection
-	var currentTitle string
-	var currentContent strings.Builder
-	preambleDone := false
-
-	flushCurrent := func() {
-		body := strings.TrimSpace(currentContent.String())
-		if currentTitle != "" && body != "" {
-			sections = append(sections, WikiSection{
-				Title:   currentTitle,
-				Content: body,
-				Source:  source,
-			})
-		}
-		currentContent.Reset()
-	}
-
-	inFence := false
-	for _, line := range strings.Split(text, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
-			inFence = !inFence
-		}
-
-		m := headingRe.FindStringSubmatch(line)
-		if m != nil && !inFence {
-			level := len(m[1])
-			if level <= includeLevel {
-				flushCurrent()
-				if !preambleDone && currentContent.Len() == 0 {
-					preambleDone = true
-				}
-				preambleDone = true
-				currentTitle = strings.TrimSpace(m[2])
-				continue
-			}
-		}
-		if currentTitle != "" {
-			currentContent.WriteString(line + "\n")
-		}
-	}
-
-	flushCurrent()
-	return sections
-}
-
-// ParseWikiFile reads and parses a file for wiki indexing. PDF and
-// Office documents have their text extracted first. Falls back to
-// single-section mode if no headings found.
-func ParseWikiFile(path, source string, includeLevel int) ([]WikiSection, error) {
-	ext := strings.ToLower("")
-	if dot := strings.LastIndex(path, "."); dot >= 0 {
-		ext = strings.ToLower(path[dot:])
-	}
-
-	var text string
-	switch {
-	case ext == ".pdf":
-		extracted, err := ExtractPDFText(path)
-		if err != nil {
-			return nil, err
-		}
-		text = extracted
-	case ext == ".docx" || ext == ".docm" || ext == ".xlsx" || ext == ".xlsm" || ext == ".pptx" || ext == ".pptm":
-		extracted, err := ExtractOfficeText(path)
-		if err != nil {
-			return nil, err
-		}
-		text = extracted
-	default:
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-		text = string(data)
-	}
-	sections := ParseWiki(text, source, includeLevel)
-	if len(sections) == 0 {
-		title := source
-		if idx := strings.LastIndex(source, "/"); idx >= 0 {
-			title = source[idx+1:]
-		}
-		sections = []WikiSection{{
-			Title:   title,
-			Content: strings.TrimSpace(text),
-			Source:  source,
-		}}
-	}
-	return sections, nil
 }
 
 // ReadFileText reads a file and returns its text content, dispatching

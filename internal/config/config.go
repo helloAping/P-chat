@@ -539,7 +539,7 @@ func Default() *Config {
 		},
 		Memory: MemoryConfig{
 			Enabled:    true,
-			MaxHistory: 50,
+			MaxHistory: 0,
 		},
 		Sandbox: SandboxConfig{
 			Enabled:             true,
@@ -552,6 +552,9 @@ func Default() *Config {
 			// Default safety stance: deny exec_command in sub-agents.
 			// Users can override by setting allowed_tools explicitly.
 			DeniedTools: []string{"exec_command"},
+			// Enable result caching by default so repeated sub-agent
+			// tasks (e.g. searching the same file) hit the cache.
+			CacheTTL: "10m",
 		},
 		MCP: MCPConfig{
 			Enabled: false,

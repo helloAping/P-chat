@@ -114,6 +114,10 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.PATCH("/providers/:name/models/:model/capabilities", h.SetCapabilities)
 		api.GET("/providers/:name/upstream-models", h.FetchUpstreamModels)
 
+		// System config
+		api.GET("/config", h.GetSystemConfig)
+		api.PATCH("/config", h.UpdateSystemConfig)
+
 		// Uploads
 		api.POST("/uploads", h.Upload)
 		api.GET("/uploads/:id", h.GetUpload)
@@ -190,12 +194,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.DELETE("/knowledge/bases/:name", h.RemoveKnowledgeBase)
 		api.POST("/knowledge/bases/:name/scan", h.ScanKnowledgeBase)
 		api.DELETE("/knowledge/bases/:name/scan", h.CancelScan)
+		api.DELETE("/knowledge/bases/:name/clear", h.ClearKnowledgeBase)
 		api.GET("/knowledge/bases/:name/scan/status", h.ScanStatus)
-		api.GET("/knowledge/bases/:name/sections", h.ListSections)
-		api.POST("/knowledge/bases/:name/sections", h.AddSection)
-		api.GET("/knowledge/bases/:name/sections/:id", h.GetSection)
-		api.PUT("/knowledge/bases/:name/sections/:id", h.UpdateSection)
-		api.DELETE("/knowledge/bases/:name/sections/:id", h.DeleteSection)
+		api.GET("/knowledge/bases/:name/nodes", h.ListNodes)
+		api.GET("/knowledge/bases/:name/nodes/:id/content", h.GetNodeContent)
+		api.DELETE("/knowledge/bases/:name/nodes/:id", h.DeleteNode)
 		api.POST("/knowledge/search", h.SearchKnowledge)
 	}
 

@@ -16,6 +16,8 @@
 | **修改数据库 Schema** | [**versioning.md**](versioning.md) | memory.md |
 | **发布新版本** | [**versioning.md**](versioning.md) | — |
 | 修改配置管理（providers/models） | [config.md](config.md) | llm.md |
+| 修改知识库系统（扫描/搜索/三层索引） | [knowledge.md](knowledge.md) | server.md, tool.md, frontend.md |
+| 修改版本升级流程 | [upgrade.md](upgrade.md) | knowledge.md |
 | 修改 CLI 终端界面 (REPL) | [cli.md](cli.md) | server.md, agent.md |
 | 修改沙箱/安全检查 | [infrastructure.md](infrastructure.md) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |

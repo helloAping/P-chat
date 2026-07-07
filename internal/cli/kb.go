@@ -32,8 +32,7 @@ func (m *KBManager) Views() []KBView {
 		v := KBView{Path: b.Path}
 		store, err := knowledge.GetOrOpenWikiStore(b.Name, b.Path)
 		if err == nil {
-			sections, _ := store.ListBase(context.Background(), b.Name)
-			v.Files = len(sections)
+			v.Files = store.CountNodes(context.Background(), b.Name)
 		}
 		if b.Enabled {
 			v.Size = 1
@@ -106,8 +105,8 @@ func (m *KBManager) ScanStats() (added, updated int, err error) {
 		if storeErr != nil {
 			continue
 		}
-		sections, _ := store.ListBase(context.Background(), b.Name)
-		added += len(sections)
+		count := store.CountNodes(context.Background(), b.Name)
+		added += count
 	}
 	return added, 0, nil
 }
@@ -139,27 +138,134 @@ func (m *KBManager) Scan(name string) error {
 
 	for _, base := range bases {
 		log.Printf("[kb scan] scanning %s (%s)...", base.Name, base.Path)
+
 		store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
 		if err != nil {
 			return fmt.Errorf("open wiki store %s: %w", base.Name, err)
 		}
-		files, sections, err := scanDir(context.Background(), store, base.Path, base.Name)
-		if err != nil {
-			return fmt.Errorf("scan %s: %w", base.Name, err)
+
+		// Count files first for progress.
+		relFiles := countRelIndexableFiles(base.Path)
+		log.Printf("[kb scan] %s: %d indexable files", base.Name, len(relFiles))
+
+		// Walk and build index_nodes.
+		var allNodes []knowledge.IndexNode
+		var allContents []knowledge.ContentNode
+		for i, rel := range relFiles {
+			absPath := filepath.Join(base.Path, rel)
+			text, readErr := knowledge.ReadFileText(absPath)
+			if readErr != nil {
+				log.Printf("[kb scan] %s: read error for %s: %v", base.Name, rel, readErr)
+				continue
+			}
+
+			roots := knowledge.BuildHeadingTree(text, 3)
+			seq := 0
+			var walkNodes func([]*knowledge.HeadingNode)
+			walkNodes = func(list []*knowledge.HeadingNode) {
+				for _, node := range list {
+					if !node.HasContent() {
+						walkNodes(node.Children)
+						continue
+					}
+					aggregated := node.AggregatedContent()
+					allNodes = append(allNodes, knowledge.IndexNode{
+						Level:     3,
+						Source:    rel,
+						Kind:      "text",
+						SortOrder: seq,
+						Title:     node.Title,
+						Overview:  knowledge.TruncateText(aggregated, 500),
+					})
+					seq++
+					allContents = append(allContents, knowledge.ContentNode{
+						Content:     knowledge.TruncateText(aggregated, 3000),
+						ContentType: "text",
+						SortOrder:   0,
+					})
+					walkNodes(node.Children)
+				}
+			}
+			walkNodes(roots)
+
+			// Fallback: whole file as one node.
+			if seq == 0 && text != "" {
+				title := rel
+				if idx := strings.LastIndex(rel, "/"); idx >= 0 {
+					title = rel[idx+1:]
+				}
+				allNodes = append(allNodes, knowledge.IndexNode{
+					Level:     3,
+					Source:    rel,
+					Kind:      "text",
+					SortOrder: 0,
+					Title:     title,
+					Overview:  knowledge.TruncateText(text, 500),
+				})
+				allContents = append(allContents, knowledge.ContentNode{
+					Content:     knowledge.TruncateText(text, 3000),
+					ContentType: "text",
+					SortOrder:   0,
+				})
+			}
+
+			if (i+1)%10 == 0 {
+				log.Printf("[kb scan] %s: %d/%d files", base.Name, i+1, len(relFiles))
+			}
 		}
-		log.Printf("[kb scan] %s: %d sections in %d files", base.Name, sections, files)
+
+		// Assign IDs and assemble L1/L2/L3 hierarchy.
+		nodeID := 1
+		l1 := knowledge.IndexNode{ID: nodeID, Level: 1, Base: base.Name, Title: base.Name, Source: base.Path}
+		nodeID++
+
+		seenFiles := map[string]int{}
+		var nodes []knowledge.IndexNode
+		nodes = append(nodes, l1)
+		for _, n := range allNodes {
+			fid, ok := seenFiles[n.Source]
+			if !ok {
+				fid = nodeID
+				seenFiles[n.Source] = fid
+				nodes = append(nodes, knowledge.IndexNode{
+					ID:       fid,
+					ParentID: l1.ID,
+					Level:    2,
+					Base:     base.Name,
+					Source:   n.Source,
+					Kind:     "text",
+					Title:    n.Source,
+				})
+				nodeID++
+			}
+			n.ID = nodeID
+			n.ParentID = fid
+			n.Base = base.Name
+			nodeID++
+			nodes = append(nodes, n)
+		}
+		for i := range allContents {
+			allContents[i].NodeID = allNodes[i].ID
+		}
+
+		if err := store.ReplaceBaseNodes(context.Background(), base.Name, nodes, allContents); err != nil {
+			return fmt.Errorf("store %s: %w", base.Name, err)
+		}
+
+		l2Count := len(seenFiles)
+		l3Count := len(allNodes)
+		log.Printf("[kb scan] %s: %d L2 files, %d L3 sections", base.Name, l2Count, l3Count)
 	}
 	return nil
 }
 
-// scanDir walks a directory, parses text files into wiki sections,
-// and stores them. Returns (fileCount, sectionCount, error).
-func scanDir(ctx context.Context, store *knowledge.WikiStore, dir, baseName string) (int, int, error) {
-	var processed, totalSections int
-	currentSources := make(map[string]bool)
 
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
+
+// countRelIndexableFiles walks a directory and returns relative paths of indexable files.
+func countRelIndexableFiles(dir string) []string {
+	var files []string
+	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
 			return nil
 		}
 		if info.IsDir() {
@@ -169,42 +275,15 @@ func scanDir(ctx context.Context, store *knowledge.WikiStore, dir, baseName stri
 			}
 			return nil
 		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if !knowledge.IndexableExtensions[ext] {
-			return nil
-		}
 		if info.Size() > 5*1024*1024 {
 			return nil
 		}
-
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return nil
+		ext := strings.ToLower(filepath.Ext(p))
+		if knowledge.IndexableExtensions[ext] {
+			rel, _ := filepath.Rel(dir, p)
+			files = append(files, filepath.ToSlash(rel))
 		}
-		rel = filepath.ToSlash(rel)
-		currentSources[rel] = true
-
-		sections, parseErr := knowledge.ParseWikiFile(path, rel, 3)
-		if parseErr != nil {
-			return nil
-		}
-		for i := range sections {
-			sections[i].Base = baseName
-		}
-		if err := store.ReplaceSource(ctx, baseName, rel, sections); err != nil {
-			log.Printf("[kb scan] replace %s: %v", rel, err)
-		}
-		store.SetFileMtime(ctx, baseName, rel, info.ModTime().Unix())
-		totalSections += len(sections)
-		processed++
 		return nil
 	})
-	if err != nil {
-		return 0, 0, err
-	}
-
-	if err := store.RemoveStaleSources(ctx, baseName, currentSources); err != nil {
-		log.Printf("[kb scan] stale cleanup %s: %v", baseName, err)
-	}
-	return processed, totalSections, nil
+	return files
 }

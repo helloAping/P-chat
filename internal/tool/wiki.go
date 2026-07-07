@@ -105,7 +105,9 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 		}
 
 		// Collect results across all selected bases.
-		var merged *knowledge.IndexSearchResult
+		// Query each base with a large window to merge + re-rank across bases.
+		var allItems []knowledge.IndexSearchItem
+		total := 0
 		for _, base := range basesToSearch {
 			if !base.Enabled {
 				continue
@@ -114,29 +116,43 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			if err != nil {
 				continue
 			}
-			res, err := store.LookupSearch(ctx, a.Query, base.Name, a.Expand, a.Level, a.Page, a.Size)
+			res, err := store.LookupSearch(ctx, a.Query, base.Name, a.Expand, a.Level, 1, 200)
 			if err != nil {
 				continue
 			}
-			if merged == nil {
-				merged = res
-			} else {
-				merged.Total += res.Total
-				merged.HasMore = merged.HasMore || res.HasMore
-				merged.Items = append(merged.Items, res.Items...)
-			}
+			allItems = append(allItems, res.Items...)
+			total += res.Total
 		}
-		if merged == nil || merged.Total == 0 {
+		if total == 0 {
 			return &CallResult{Content: "(知识库为空，尚未扫描)"}, nil
 		}
 
+		// Re-rank across bases: merge sort by rank descending.
+		for i := 1; i < len(allItems); i++ {
+			for j := i; j > 0 && allItems[j].Rank > allItems[j-1].Rank; j-- {
+				allItems[j], allItems[j-1] = allItems[j-1], allItems[j]
+			}
+		}
+
+		// Paginate the merged+re-ranked results.
+		start := (a.Page - 1) * a.Size
+		end := start + a.Size
+		if start >= len(allItems) {
+			start = len(allItems)
+		}
+		if end > len(allItems) {
+			end = len(allItems)
+		}
+		mergedItems := allItems[start:end]
+		hasMore := (a.Page * a.Size) < total
+
 		var b strings.Builder
 		if a.Query == "" {
-			fmt.Fprintf(&b, "## Wiki Directory (%d files, page %d/%d)\n\n", merged.Total, merged.Page, (merged.Total+merged.Size-1)/merged.Size)
+			fmt.Fprintf(&b, "## Wiki Directory (%d files, page %d)\n\n", total, a.Page)
 		} else {
-			fmt.Fprintf(&b, "## wiki_lookup: \"%s\" (%d results, page %d)\n\n", a.Query, merged.Total, merged.Page)
+			fmt.Fprintf(&b, "## wiki_lookup: \"%s\" (%d results, page %d)\n\n", a.Query, total, a.Page)
 		}
-		for _, it := range merged.Items {
+		for _, it := range mergedItems {
 			if it.Parent != nil {
 				fmt.Fprintf(&b, "### %s / %s\n", it.Parent.Title, it.Title)
 			} else {
@@ -167,8 +183,8 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			}
 			b.WriteString("\n")
 		}
-		if merged.HasMore {
-			fmt.Fprintf(&b, "*(共 %d 条，继续翻页请用 page=%d)*\n", merged.Total, merged.Page+1)
+		if hasMore {
+			fmt.Fprintf(&b, "*(共 %d 条，继续翻页请用 page=%d)*\n", total, a.Page+1)
 		}
 		return &CallResult{Content: b.String()}, nil
 	}

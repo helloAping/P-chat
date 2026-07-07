@@ -286,8 +286,7 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 			if b.Name == name {
 				store, err := knowledge.GetOrOpenWikiStore(b.Name, b.Path)
 				if err == nil {
-					sections, _ := store.ListBase(context.Background(), b.Name)
-					resp.Chunks = len(sections)
+					resp.Chunks = store.CountNodes(context.Background(), b.Name)
 				}
 				break
 			}
@@ -297,9 +296,7 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 	}
 	j := v.(*scanJob)
 	if strings.HasPrefix(j.status, "ok: ") {
-		var chunks int
-		fmt.Sscanf(j.status, "ok: %d chunks", &chunks)
-		c.JSON(http.StatusOK, scanProgressResp{Chunks: chunks, Current: j.current, Total: j.total, Done: true})
+		c.JSON(http.StatusOK, scanProgressResp{Chunks: j.chunks, Current: j.current, Total: j.total, Done: true})
 	} else if strings.HasPrefix(j.status, "error: ") {
 		errMsg := strings.TrimPrefix(j.status, "error: ")
 		c.JSON(http.StatusOK, scanProgressResp{Error: errMsg, Done: true})
@@ -332,8 +329,8 @@ func (h *Handler) CancelScan(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "scan cancelled"})
 }
 
-// ListSections GET /api/v1/knowledge/bases/:name/sections
-func (h *Handler) ListSections(c *gin.Context) {
+// ClearKnowledgeBase DELETE /api/v1/knowledge/bases/:name/clear
+func (h *Handler) ClearKnowledgeBase(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
@@ -358,50 +355,15 @@ func (h *Handler) ListSections(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
-	sections, err := store.ListBase(c.Request.Context(), base.Name)
-	if err != nil {
+	if err := store.ClearBase(c.Request.Context(), base.Name); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"sections": sections})
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// GetSection GET /api/v1/knowledge/bases/:name/sections/:id
-func (h *Handler) GetSection(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
-		return
-	}
-	name := c.Param("name")
-	var base config.KnowledgeBase
-	found := false
-	for _, b := range h.cfg.Knowledge.Bases {
-		if b.Name == name {
-			base = b
-			found = true
-			break
-		}
-	}
-	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
-		return
-	}
-	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
-	}
-	section, err := store.GetSection(c.Request.Context(), id)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "section not found"})
-		return
-	}
-	c.JSON(http.StatusOK, section)
-}
-
-// AddSection POST /api/v1/knowledge/bases/:name/sections
-func (h *Handler) AddSection(c *gin.Context) {
+// ListNodes GET /api/v1/knowledge/bases/:name/nodes
+func (h *Handler) ListNodes(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
@@ -420,86 +382,23 @@ func (h *Handler) AddSection(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
 		return
 	}
-	var req struct {
-		Title   string `json:"title"`
-		Content string `json:"content"`
-		Source  string `json:"source"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if req.Title == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "title is required"})
-		return
-	}
-	if req.Source == "" {
-		req.Source = "_manual_"
-	}
 
 	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
-	id, err := store.InsertSection(c.Request.Context(), knowledge.WikiSection{
-		Title:   req.Title,
-		Content: req.Content,
-		Source:  req.Source,
-		Base:    name,
-	})
+	nodes, err := store.ListNodes(c.Request.Context(), base.Name)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"id": id, "ok": true})
+	c.JSON(http.StatusOK, gin.H{"nodes": nodes})
 }
 
-// UpdateSection PUT /api/v1/knowledge/bases/:name/sections/:id
-func (h *Handler) UpdateSection(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
-		return
-	}
-	name := c.Param("name")
-	var base config.KnowledgeBase
-	found := false
-	for _, b := range h.cfg.Knowledge.Bases {
-		if b.Name == name {
-			base = b
-			found = true
-			break
-		}
-	}
-	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
-		return
-	}
-	var req struct {
-		Title   string `json:"title"`
-		Content string `json:"content"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
-	}
-	if err := store.UpdateSection(c.Request.Context(), id, req.Title, req.Content); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
-}
-
-// DeleteSection DELETE /api/v1/knowledge/bases/:name/sections/:id
-func (h *Handler) DeleteSection(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+// GetNodeContent GET /api/v1/knowledge/bases/:name/nodes/:id/content
+func (h *Handler) GetNodeContent(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
 		return
@@ -523,12 +422,52 @@ func (h *Handler) DeleteSection(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
-	if err := store.DeleteSection(c.Request.Context(), id); err != nil {
+	contents, err := store.GetNodeContent(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node content not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"contents": contents})
+}
+
+// DeleteNode DELETE /api/v1/knowledge/bases/:name/nodes/:id
+func (h *Handler) DeleteNode(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	name := c.Param("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	var base config.KnowledgeBase
+	found := false
+	for _, b := range h.cfg.Knowledge.Bases {
+		if b.Name == name {
+			base = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "base not found"})
+		return
+	}
+	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	if err := store.DeleteNode(c.Request.Context(), id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
+
+// SearchKnowledge POST /api/v1/knowledge/search
 
 // SearchKnowledge POST /api/v1/knowledge/search
 func (h *Handler) SearchKnowledge(c *gin.Context) {
@@ -573,23 +512,24 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		Similarity float64 `json:"similarity"`
 		Rank       int     `json:"rank"`
 	}
-	seen := map[string]bool{}
 	var out []resultItem
-
-	// Wiki FTS5 search.
-	sections, err := store.SearchFTS(ctx, req.Query, req.TopK)
+	res, err := store.LookupSearch(ctx, req.Query, base.Name, true, 0, 1, req.TopK)
 	if err == nil {
-		for _, s := range sections {
-			key := s.Source
-			if seen[key] {
-				continue
+		for _, it := range res.Items {
+			content := it.Overview
+			if len(it.Children) > 0 {
+				for _, c := range it.Children {
+					content += "\n" + c.Content
+				}
 			}
-			seen[key] = true
+			if content == "" {
+				content = it.Title
+			}
 			out = append(out, resultItem{
-				Source:     s.Source,
-				Content:    s.Content,
-				Similarity: 1.0,
-				Rank:       len(out) + 1,
+				Source:     it.Source,
+				Content:    content,
+				Similarity: it.Rank,
+				Rank:       len(out),
 			})
 		}
 	}
@@ -597,12 +537,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 	// Grep actual files.
 	if req.Grep != "" {
 		for _, gr := range grepKB(h.cfg, req.Grep, req.TopK) {
-			key := gr.Path
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			out = append(out, resultItem{
+						out = append(out, resultItem{
 				Source:     fmt.Sprintf("%s:%d", gr.Path, gr.Line),
 				Content:    gr.Content,
 				Similarity: 1.0,
@@ -708,74 +643,29 @@ func (h *Handler) startScanJob(name string) error {
 			return
 		}
 
-		fileCount, sectionCount, mediaFiles, err := h.wikiScan(ctx, store, base, basePath, name, func(current, total int) {
+		fileCount := countIndexableFiles(basePath, base.ExcludePatterns)
+		job.total = fileCount
+		job.current = 0
+		job.status = "running"
+
+		if fileCount == 0 {
+			log.Printf("[scan %s] no indexable files found in %s", name, basePath)
+		}
+
+		l2Count, l3Count, idxErr := h.indexScan(ctx, store, base, basePath, name, func(current int) {
 			job.current = current
-			job.total = total
-			job.status = "running"
 		})
-		if err != nil {
-			job.status = fmt.Sprintf("error: %v", err)
-			log.Printf("[scan %s] wiki scan: %v", name, err)
+		if idxErr != nil {
+			job.status = fmt.Sprintf("error: %v", idxErr)
+			log.Printf("[scan %s] index scan: %v", name, idxErr)
 			return
 		}
 
-		// Build three-level index (L1/L2/L3/C) for prompt injection and search.
-		_, _, idxErr := h.indexScan(ctx, store, base, basePath, name)
-		if idxErr != nil {
-			log.Printf("[scan %s] index build: %v", name, idxErr)
-		}
-
-		// Process media files collected during the wikiScan walk.
-		if len(mediaFiles) > 0 && h.agent != nil {
-			log.Printf("[scan %s] processing %d media files with model %s", name, len(mediaFiles), base.ScanModel)
-			var sections []knowledge.WikiSection
-			for i, path := range mediaFiles {
-				select {
-				case <-ctx.Done():
-					break
-				default:
-				}
-				ext := strings.ToLower(filepath.Ext(path))
-				mt := knowledge.IsMediaFile(ext, base.ScanMediaTypes)
-				if mt == "" {
-					continue
-				}
-				desc, err := h.describeMediaFile(ctx, base, path, mt)
-				if err != nil {
-					log.Printf("[scan %s] media %s: %v", name, path, err)
-					continue
-				}
-				rel, _ := filepath.Rel(basePath, path)
-				sections = append(sections, knowledge.WikiSection{
-					Title:   filepath.ToSlash(rel),
-					Content: desc,
-					Source:  filepath.ToSlash(rel),
-					Base:    name,
-				})
-				if len(sections) >= 50 {
-					if err := store.AppendSections(ctx, sections); err != nil {
-						log.Printf("[scan %s] append media: %v", name, err)
-					}
-					sectionCount += len(sections)
-					sections = nil
-				}
-				job.current = fileCount + i + 1
-				job.total = fileCount + len(mediaFiles)
-				job.status = "media"
-			}
-			if len(sections) > 0 {
-				if err := store.AppendSections(ctx, sections); err != nil {
-					log.Printf("[scan %s] append media: %v", name, err)
-				}
-				sectionCount += len(sections)
-			}
-		}
-
-		job.status = fmt.Sprintf("ok: %d sections", sectionCount)
+		job.status = fmt.Sprintf("ok: %d L2 files, %d L3 sections", l2Count, l3Count)
 		job.total = fileCount
 		job.current = fileCount
-		job.chunks = sectionCount
-		log.Printf("[scan %s] done: %d sections in %d files", name, sectionCount, fileCount)
+		job.chunks = l3Count
+		log.Printf("[scan %s] done: %d L2 files, %d L3 sections", name, l2Count, l3Count)
 	}()
 	return nil
 }
@@ -938,368 +828,18 @@ func truncateContent(s string, max int) string {
 	return s[:max] + "..."
 }
 
-// wikiScan walks a directory, parses all indexable files into wiki
-// sections and collects media file paths for downstream processing.
-// Returns (fileCount, sectionCount, mediaFiles, error).
-// When base.ScanModel is set, each section is summarized by LLM before storage.
-func (h *Handler) wikiScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string, progress func(current, total int)) (int, int, []string, error) {
-	if _, err := os.Stat(dir); err != nil {
-		return 0, 0, nil, fmt.Errorf("stat %s: %w", dir, err)
-	}
-	dir, err := filepath.Abs(dir)
-	if err != nil {
-		return 0, 0, nil, err
-	}
 
-	wantMedia := base.ScanModel != "" && len(base.ScanMediaTypes) > 0
-
-	// Phase 1: count files (text + media).
-	var totalFiles, mediaCount int
-	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if info.IsDir() {
-			name := info.Name()
-			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if knowledge.IndexableExtensions[ext] {
-			totalFiles++
-		} else if wantMedia && knowledge.IsMediaFile(ext, base.ScanMediaTypes) != "" {
-			mediaCount++
-		}
-		return nil
-	})
-	if walkErr != nil {
-		log.Printf("[scan %s] counting phase walk error: %v", baseName, walkErr)
-	}
-
-	log.Printf("[scan %s] found %d indexable files + %d media files", baseName, totalFiles, mediaCount)
-	var processed, totalSections, skipped int
-	currentSources := make(map[string]bool)
-	var mediaFiles []string
-
-	mediaMaxSize := base.MaxFileSize
-	if mediaMaxSize <= 0 {
-		mediaMaxSize = 5 * 1024 * 1024
-	}
-
-	// Phase 2: parse text + collect media (single walk).
-	// Fire initial progress so the frontend shows 0/N immediately.
-	if progress != nil {
-		progress(0, totalFiles)
-	}
-	walkPhase2Err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("scan cancelled after %d/%d files", processed, totalFiles)
-		default:
-		}
-		if walkErr != nil {
-			return walkErr
-		}
-		if info.IsDir() {
-			name := info.Name()
-			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if !knowledge.IndexableExtensions[ext] {
-			// Collect media files during this walk.
-			if wantMedia && knowledge.IsMediaFile(ext, base.ScanMediaTypes) != "" && info.Size() <= mediaMaxSize {
-				mediaFiles = append(mediaFiles, path)
-			}
-			return nil
-		}
-		sizeLimit := int64(5 * 1024 * 1024)
-		if info.Size() > sizeLimit {
-			return nil
-		}
-
-		rel, rErr := filepath.Rel(dir, path)
-		if rErr != nil {
-			log.Printf("[scan] skip %s: %v", path, rErr)
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-
-		// Check base-level exclude patterns.
-		if len(base.ExcludePatterns) > 0 {
-			skip := false
-			for _, pat := range base.ExcludePatterns {
-				if matched, _ := filepath.Match(pat, rel); matched {
-					skip = true
-					break
-				}
-			}
-			if skip {
-				return nil
-			}
-		}
-
-		currentSources[rel] = true
-
-		// Check mtime for incremental skip.
-		storedMtime, _ := store.GetFileMtime(ctx, baseName, rel)
-		if storedMtime > 0 && storedMtime == info.ModTime().Unix() {
-			skipped++
-			processed++
-			if progress != nil {
-				progress(processed, totalFiles)
-			}
-			return nil
-		}
-
-		text, readErr := knowledge.ReadFileText(path)
-		if readErr != nil {
-			log.Printf("[scan] skip %s: read: %v", rel, readErr)
-			processed++
-			if progress != nil {
-				progress(processed, totalFiles)
-			}
-			return nil
-		}
-
-		// Build heading tree from file text.
-		roots := knowledge.BuildHeadingTree(text, 3)
-		var sections []knowledge.WikiSection
-
-		if len(roots) > 0 {
-			// Generate LLM-indexed entries for every node with content.
-			knowledge.WalkHeadingTree(roots, func(node *knowledge.HeadingNode) {
-				if !node.HasContent() {
-					return
-				}
-				heading := ""
-				if node.Parent != nil {
-					heading = node.Parent.Title
-				}
-
-				aggregated := node.AggregatedContent()
-				content := aggregated
-				if base.ScanModel != "" && h.agent != nil {
-					if indexed, err := h.buildIndexEntry(ctx, base, node.Title, heading, aggregated); err == nil && indexed != "" {
-						content = indexed
-					} else if err != nil {
-						log.Printf("[scan] index %s/%s: %v", rel, node.Title, err)
-						content = truncateContent(aggregated, 500)
-					}
-				}
-
-				sections = append(sections, knowledge.WikiSection{
-					Title:   node.Title,
-					Content: content,
-					Source:  rel,
-					Base:    baseName,
-					Heading: heading,
-				})
-			})
-		}
-
-		if len(sections) == 0 {
-			// Fallback: no headings found → treat whole file as single entry.
-			content := text
-			if base.ScanModel != "" && h.agent != nil {
-				if indexed, err := h.buildIndexEntry(ctx, base, rel, "", text); err == nil && indexed != "" {
-					content = indexed
-				}
-			}
-			title := rel
-			if idx := strings.LastIndex(rel, "/"); idx >= 0 {
-				title = rel[idx+1:]
-			}
-			sections = []knowledge.WikiSection{{
-				Title:   title,
-				Content: content,
-				Source:  rel,
-				Base:    baseName,
-			}}
-		}
-		if err := store.ReplaceSource(ctx, baseName, rel, sections); err != nil {
-			log.Printf("[scan] replace %s: %v", rel, err)
-		}
-		_ = store.SetFileMtime(ctx, baseName, rel, info.ModTime().Unix())
-		totalSections += len(sections)
-		processed++
-		if progress != nil {
-			progress(processed, totalFiles)
-		}
-		log.Printf("[scan %d/%d] %s -> %d sections", processed, totalFiles, rel, len(sections))
-		return nil
-	})
-	if walkPhase2Err != nil {
-		log.Printf("[scan %s] phase 2 walk error: %v", baseName, walkPhase2Err)
-	}
-
-	if skipped > 0 {
-		log.Printf("[scan %s] skipped %d unchanged files", baseName, skipped)
-	}
-
-	// Clean up stale sources (files deleted since last scan).
-	if err := store.RemoveStaleSources(ctx, baseName, currentSources); err != nil {
-		log.Printf("[scan %s] stale cleanup: %v", baseName, err)
-	}
-
-	log.Printf("[scan %s] indexed %d sections (+%d skipped) in %d files", baseName, totalSections, skipped, processed)
-	return processed, totalSections, mediaFiles, nil
-}
 
 // mediaScan walks the directory for media files (images/video/audio/pdf) and
 // uses the configured LLM to describe each file. Results are added to the wiki
 // store as sections keyed by relative path. Returns number of media sections indexed.
-func (h *Handler) mediaScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string, progress func(current, total int)) (int, error) {
-	var mediaFiles []string
-	filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil || info.IsDir() {
-			name := info.Name()
-			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if mt := knowledge.IsMediaFile(ext, base.ScanMediaTypes); mt != "" {
-			maxSize := base.MaxFileSize
-			if maxSize <= 0 {
-				maxSize = 5 * 1024 * 1024
-			}
-			if info.Size() <= maxSize {
-				mediaFiles = append(mediaFiles, path)
-			}
-		}
-		return nil
-	})
 
-	if len(mediaFiles) == 0 {
-		return 0, nil
-	}
-	log.Printf("[scan %s] found %d media files", baseName, len(mediaFiles))
-
-	var sections []knowledge.WikiSection
-	for i, path := range mediaFiles {
-		select {
-		case <-ctx.Done():
-			return len(sections), ctx.Err()
-		default:
-		}
-
-		ext := strings.ToLower(filepath.Ext(path))
-		mt := knowledge.IsMediaFile(ext, base.ScanMediaTypes)
-		rel, _ := filepath.Rel(dir, path)
-		rel = filepath.ToSlash(rel)
-
-		desc, err := h.describeMediaFile(ctx, base, path, mt)
-		if err != nil {
-			log.Printf("[scan media %d/%d] %s: %v", i+1, len(mediaFiles), rel, err)
-			if progress != nil {
-				progress(i+1, len(mediaFiles))
-			}
-			continue
-		}
-
-		section := knowledge.WikiSection{
-			Title:   filepath.Base(path),
-			Content: desc,
-			Source:  rel,
-			Base:    baseName,
-		}
-		sections = append(sections, section)
-		if progress != nil {
-			progress(i+1, len(mediaFiles))
-		}
-		log.Printf("[scan media %d/%d] %s → %d chars", i+1, len(mediaFiles), rel, len(desc))
-	}
-
-	if len(sections) > 0 {
-		if err := store.AppendSections(ctx, sections); err != nil {
-			return len(sections), fmt.Errorf("append media sections: %w", err)
-		}
-	}
-	return len(sections), nil
-}
-
-// grepResult is a single match from a knowledge-base file grep.
-type grepResult struct {
-	Path    string `json:"path"`
-	Line    int    `json:"line"`
-	Content string `json:"content"`
-}
-
-// grepKB searches the configured knowledge-base directories for lines
-// containing pattern (case-insensitive substring match). Returns up to
-// maxResults matches, newest files first.
-func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
-	if pattern == "" || maxResults <= 0 {
-		return nil
-	}
-	patternLower := strings.ToLower(pattern)
-	var out []grepResult
-	kc := cfg.Knowledge
-	for _, base := range kc.Bases {
-		if !base.Enabled {
-			continue
-		}
-		absPath, err := filepath.Abs(base.Path)
-		if err != nil {
-			continue
-		}
-		_ = filepath.Walk(absPath, func(path string, info os.FileInfo, walkErr error) error {
-			if walkErr != nil || info == nil || info.IsDir() {
-				name := filepath.Base(path)
-				if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if !knowledge.IndexableExtensions[strings.ToLower(filepath.Ext(path))] {
-				return nil
-			}
-			if info.Size() > 5*1024*1024 {
-				return nil
-			}
-			f, err := os.Open(path)
-			if err != nil {
-				return nil
-			}
-
-			scanner := bufio.NewScanner(f)
-			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-			lineNo := 0
-			for scanner.Scan() {
-				lineNo++
-				if strings.Contains(strings.ToLower(scanner.Text()), patternLower) {
-					out = append(out, grepResult{
-						Path:    path,
-						Line:    lineNo,
-						Content: scanner.Text(),
-					})
-					if len(out) >= maxResults {
-						f.Close()
-						return filepath.SkipAll
-					}
-				}
-			}
-			f.Close()
-			return nil
-		})
-		if len(out) >= maxResults {
-			break
-		}
-	}
-	return out
-}
 
 // ── Three-level index scan pipeline ──
 // indexScan walks the base directory and generates L1/L2/L3 index nodes
 // plus ContentNode leaves for FTS5 searching and prompt injection.
 
-func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string) (int, int, error) {
+func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string, progress func(current int)) (int, int, error) {
 	if _, err := os.Stat(dir); err != nil {
 		return 0, 0, fmt.Errorf("stat %s: %w", dir, err)
 	}
@@ -1415,6 +955,9 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 		if len(nodes) > 0 {
 			files = append(files, fileData{source: rel, kind: kind, nodes: nodes, contents: contents})
 			totalL3 += len(nodes)
+		}
+		if progress != nil {
+			progress(len(files))
 		}
 		return nil
 	})
@@ -1546,6 +1089,97 @@ func parseKWAndOverview(indexed string) (keywords, overview string) {
 		overview = truncateText(indexed, 500)
 	}
 	return
+}
+
+// countIndexableFiles walks a directory and counts files eligible for indexing.
+func countIndexableFiles(dir string, excludePatterns []string) int {
+	count := 0
+	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			n := info.Name()
+			if strings.HasPrefix(n, ".") || n == "node_modules" || n == "vendor" || n == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.Size() > 5*1024*1024 {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(p))
+		if knowledge.IndexableExtensions[ext] {
+			rel, _ := filepath.Rel(dir, p)
+			for _, pat := range excludePatterns {
+				if matched, _ := filepath.Match(pat, rel); matched {
+					return nil
+				}
+			}
+			count++
+		}
+		return nil
+	})
+	return count
+}
+
+type grepResult struct {
+	Path    string `json:"path"`
+	Line    int    `json:"line"`
+	Content string `json:"content"`
+}
+
+func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
+	if pattern == "" || maxResults <= 0 {
+		return nil
+	}
+	patternLower := strings.ToLower(pattern)
+	var out []grepResult
+	kc := cfg.Knowledge
+	for _, base := range kc.Bases {
+		if !base.Enabled {
+			continue
+		}
+		absPath, err := filepath.Abs(base.Path)
+		if err != nil {
+			continue
+		}
+		filepath.Walk(absPath, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil || info == nil || info.IsDir() {
+				n := filepath.Base(path)
+				if strings.HasPrefix(n, ".") || n == "node_modules" || n == "vendor" || n == ".git" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !knowledge.IndexableExtensions[strings.ToLower(filepath.Ext(path))] {
+				return nil
+			}
+			if info.Size() > 5*1024*1024 {
+				return nil
+			}
+			f, err := os.Open(path)
+			if err != nil {
+				return nil
+			}
+			defer f.Close()
+			scanner := bufio.NewScanner(f)
+			lineNum := 0
+			for scanner.Scan() && len(out) < maxResults {
+				lineNum++
+				if strings.Contains(strings.ToLower(scanner.Text()), patternLower) {
+					rel, _ := filepath.Rel(absPath, path)
+					out = append(out, grepResult{
+						Path:    rel,
+						Line:    lineNum,
+						Content: scanner.Text(),
+					})
+				}
+			}
+			return nil
+		})
+	}
+	return out
 }
 
 func truncateText(s string, max int) string {
