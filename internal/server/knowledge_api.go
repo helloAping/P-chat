@@ -498,13 +498,6 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		return
 	}
 
-	base := kc.Bases[0]
-	store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("open wiki store: %v", err)})
-		return
-	}
-
 	ctx := c.Request.Context()
 	type resultItem struct {
 		Source     string  `json:"source"`
@@ -513,9 +506,29 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		Rank       int     `json:"rank"`
 	}
 	var out []resultItem
-	res, err := store.LookupSearch(ctx, req.Query, base.Name, true, 0, 1, req.TopK)
-	if err == nil {
+	// Search ALL configured bases (not just Bases[0]). For each
+	// base, take up to req.TopK matches, then merge and re-truncate
+	// to req.TopK so a multi-base search returns the best hits
+	// overall rather than silently dropping everything past the
+	// first base.
+	for _, base := range kc.Bases {
+		if len(out) >= req.TopK {
+			break
+		}
+		store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
+		if err != nil {
+			log.Printf("[search] open wiki store %q: %v", base.Name, err)
+			continue
+		}
+		res, err := store.LookupSearch(ctx, req.Query, base.Name, true, 0, 1, req.TopK)
+		if err != nil {
+			log.Printf("[search] lookup in %q: %v", base.Name, err)
+			continue
+		}
 		for _, it := range res.Items {
+			if len(out) >= req.TopK {
+				break
+			}
 			content := it.Overview
 			if len(it.Children) > 0 {
 				for _, c := range it.Children {
@@ -537,7 +550,10 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 	// Grep actual files.
 	if req.Grep != "" {
 		for _, gr := range grepKB(h.cfg, req.Grep, req.TopK) {
-						out = append(out, resultItem{
+			if len(out) >= req.TopK {
+				break
+			}
+			out = append(out, resultItem{
 				Source:     fmt.Sprintf("%s:%d", gr.Path, gr.Line),
 				Content:    gr.Content,
 				Similarity: 1.0,

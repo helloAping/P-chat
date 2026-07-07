@@ -788,7 +788,10 @@ func (h *Handler) ListSessions(c *gin.Context) {
 	}
 	projectPath := c.Query("project_path")
 	hasProjectParam := c.Request.URL.Query().Has("project_path")
-	convs := h.store.ListConversations()
+	// Cap the list at 200 to bound the response size for users
+	// with thousands of sessions. The SPA can paginate via
+	// future ?before_id/limit params if it needs more.
+	convs := h.store.ListConversationsLimit(200)
 	out := make([]SessionResponse, 0, len(convs))
 	for _, conv := range convs {
 		resp := h.sessionToResponse(conv)
@@ -1758,9 +1761,29 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		return
 	}
 
+	// Cap the request body so a malicious client cannot OOM the
+	// server by posting a multi-GB JSON. 10 MiB is generous: a
+	// 1 MiB message + a few inline base64 image attachments
+	// easily fits; anything larger should be sent as a /upload
+	// reference, not inlined.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 10<<20)
+
 	var req SendMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Defensive: also cap the parsed Message field in case the
+	// body limit is bypassed by a proxy.
+	const maxMessageLen = 1 << 20 // 1 MiB
+	if len(req.Message) > maxMessageLen {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error": fmt.Sprintf("message too long: %d bytes (max %d); split into multiple turns or attach a file reference", len(req.Message), maxMessageLen),
+		})
+		return
+	}
+	if len(req.Attachments) > 16 {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many attachments: %d (max 16)", len(req.Attachments))})
 		return
 	}
 
@@ -2498,7 +2521,7 @@ func (h *Handler) ListArchived(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
 		return
 	}
-	convs := h.store.ListArchivedConversations()
+	convs := h.store.ListArchivedConversationsLimit(200)
 	out := make([]SessionResponse, 0, len(convs))
 	for _, conv := range convs {
 		out = append(out, h.sessionToResponse(conv))

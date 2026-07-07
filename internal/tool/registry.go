@@ -383,30 +383,45 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	//   → cmd /C strips outer quotes → | interpreted by cmd.exe → parser error
 	//
 	// Fix: run powershell.exe directly with [Console]::OutputEncoding = UTF-8.
+	//
+	// Detection: scan ALL tokens for powershell|pwsh, not just the
+	// first one. The LLM can bypass the prefix-only check by writing
+	// "cmd /C powershell ..." or prepending whitespace, which would
+	// otherwise fall through to `cmd /C powershell -Command "..."`
+	// where cmd.exe misinterprets the inner quotes/pipes.
 	if runtime.GOOS == "windows" {
 		trimmed := strings.TrimSpace(a.Command)
-		isPS := strings.HasPrefix(trimmed, "powershell") || strings.HasPrefix(trimmed, "pwsh")
-		if isPS {
-			// Parse: powershell|pwsh [flags] -Command <script>
-			psExe := "powershell.exe"
-			if strings.HasPrefix(trimmed, "pwsh") {
-				psExe = "pwsh.exe"
+		tokens := strings.Fields(trimmed)
+		var psIdx int = -1
+		var psExe string
+		for i, t := range tokens {
+			base := strings.ToLower(strings.TrimRight(t, ".exe"))
+			if base == "powershell" || base == "pwsh" {
+				psIdx = i
+				psExe = base + ".exe"
+				break
 			}
-			if idx := strings.IndexByte(trimmed, ' '); idx >= 0 {
-				remaining := strings.TrimSpace(trimmed[idx:])
-				cmdIdx := strings.Index(remaining, "-Command ")
-				if cmdIdx >= 0 {
-					flags := strings.TrimSpace(remaining[:cmdIdx])
-					script := strings.TrimSpace(remaining[cmdIdx+9:])
-					if (strings.HasPrefix(script, "\"") && strings.HasSuffix(script, "\"")) ||
-						(strings.HasPrefix(script, "'") && strings.HasSuffix(script, "'")) {
-						script = script[1 : len(script)-1]
-					}
-					script = fmt.Sprintf("[Console]::OutputEncoding = [Text.Encoding]::UTF8; %s", script)
-					args := append([]string{}, strings.Fields(flags)...)
-					args = append(args, "-Command", script)
-					cmd = exec.CommandContext(ctx, psExe, args...)
+		}
+		if psIdx >= 0 {
+			// Find -Command <script> after psIdx.
+			cmdIdx := -1
+			for j := psIdx + 1; j < len(tokens)-1; j++ {
+				if strings.EqualFold(tokens[j], "-Command") || strings.EqualFold(tokens[j], "-c") {
+					cmdIdx = j
+					break
 				}
+			}
+			if cmdIdx >= 0 && cmdIdx+1 < len(tokens) {
+				flags := strings.Join(tokens[psIdx+1:cmdIdx], " ")
+				script := strings.Join(tokens[cmdIdx+1:], " ")
+				if (strings.HasPrefix(script, "\"") && strings.HasSuffix(script, "\"")) ||
+					(strings.HasPrefix(script, "'") && strings.HasSuffix(script, "'")) {
+					script = script[1 : len(script)-1]
+				}
+				script = fmt.Sprintf("[Console]::OutputEncoding = [Text.Encoding]::UTF8; %s", script)
+				args := append([]string{}, strings.Fields(flags)...)
+				args = append(args, "-Command", script)
+				cmd = exec.CommandContext(ctx, psExe, args...)
 			}
 		}
 	}
@@ -465,8 +480,20 @@ func readLimitedOutput(cmd *exec.Cmd) ([]byte, error) {
 	r1, r2 := <-ch, <-ch
 	waitErr := cmd.Wait()
 	out := append(r1.data, r2.data...)
-	if waitErr != nil && r1.err == nil && r2.err == nil {
-		return out, waitErr
+
+	// Surface every error. The previous code only returned
+	// waitErr when there was no read error — meaning a read
+	// error during a successful process was silently dropped
+	// (the user would see partial output with no warning).
+	switch {
+	case waitErr != nil:
+		// Include any concurrent read errors so the user can
+		// tell whether output was truncated by I/O failure.
+		return out, fmt.Errorf("%w (stdout read: %v, stderr read: %v)", waitErr, r1.err, r2.err)
+	case r1.err != nil:
+		return out, fmt.Errorf("stdout read error: %w", r1.err)
+	case r2.err != nil:
+		return out, fmt.Errorf("stderr read error: %w", r2.err)
 	}
 	return out, nil
 }
@@ -782,9 +809,42 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 	}
 
 	cType := strings.ToLower(resp.Header.Get("Content-Type"))
-	isHTTPError := resp.StatusCode >= 400
-	if strings.HasPrefix(cType, "application/json") || isHTTPError {
-		return &CallResult{Content: statusPrefix + string(body)}, nil
+	// Detect binary content and refuse to return raw bytes to the
+	// LLM (they poison the model's context and waste tokens).
+	// Text-like content types: text/*, application/json, *+json,
+	// application/xml, application/x-www-form-urlencoded,
+	// application/javascript, empty.
+	isBinaryCT := false
+	if cType != "" && !strings.HasPrefix(cType, "text/") &&
+		!strings.HasPrefix(cType, "application/json") &&
+		!strings.HasPrefix(cType, "application/xml") &&
+		!strings.HasPrefix(cType, "application/javascript") &&
+		!strings.HasPrefix(cType, "application/x-www-form-urlencoded") &&
+		!strings.HasSuffix(cType, "+json") && !strings.HasSuffix(cType, "+xml") {
+		isBinaryCT = true
+	}
+	// Sniff first 512 bytes for NUL bytes (binary marker).
+	if !isBinaryCT {
+		end := 512
+		if len(body) < end {
+			end = len(body)
+		}
+		for _, b := range body[:end] {
+			if b == 0 {
+				isBinaryCT = true
+				break
+			}
+		}
+	}
+	if isBinaryCT {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_BINARY: response is binary content (Content-Type: %q, %d bytes); "+
+					"web_fetch only returns text to the LLM. If you need the raw bytes, "+
+					"download via exec_command (curl/Invoke-WebRequest) and write to disk.",
+				resp.Header.Get("Content-Type"), len(body)),
+			IsError: true,
+		}, nil
 	}
 
 	return &CallResult{Content: statusPrefix + string(body)}, nil

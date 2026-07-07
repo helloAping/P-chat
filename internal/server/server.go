@@ -69,6 +69,13 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	}
 	r := gin.New()
 	r.Use(gin.Recovery())
+	// Cap ALL request bodies at 25 MiB so a malicious client
+	// cannot OOM the server by posting a multi-GB JSON. The
+	// upload endpoint has its own larger cap (it streams files)
+	// and re-applies MaxBytesReader before this middleware sees
+	// the route. Handlers that need a smaller cap (e.g.
+	// SendMessage) layer their own MaxBytesReader on top.
+	r.Use(maxBodyMiddleware(25 << 20))
 
 	// CORS: pchat-server is normally hit same-origin (browser at
 	// http://127.0.0.1:PORT, server at the same URL). The Wails
@@ -315,6 +322,20 @@ func corsMiddleware() gin.HandlerFunc {
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
+		}
+		c.Next()
+	}
+}
+
+// maxBodyMiddleware caps the request body size for every
+// request. Handlers that need a smaller cap (e.g. SendMessage)
+// layer their own MaxBytesReader on top — Go's http package
+// respects nested MaxBytesReader and will return the smallest
+// limit.
+func maxBodyMiddleware(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request != nil && c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 		}
 		c.Next()
 	}

@@ -714,6 +714,26 @@ func (s *Store) Flush() error {
 		_ = tx.Rollback()
 		return err
 	}
+	// The previous line only updated pending[0]'s conversation.
+	// If a batch contains messages from multiple sessions (each
+	// AddMessageTo may append to the same pending slice), the
+	// other sessions' updated_at would be stale, causing the
+	// session picker to show them in the wrong order. Update
+	// every distinct session in the batch.
+	seen := map[string]struct{}{pending[0].ConversationID: {}}
+	for _, m := range pending {
+		if _, ok := seen[m.ConversationID]; ok {
+			continue
+		}
+		seen[m.ConversationID] = struct{}{}
+		if _, err := tx.Exec(
+			`UPDATE conversations SET updated_at = ? WHERE id = ?`,
+			time.Now().Unix(), m.ConversationID,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -932,8 +952,20 @@ func (s *Store) SetCurrent(id string) error {
 
 // ListConversations returns all conversations ordered by updated_at desc.
 func (s *Store) ListConversations() []Conversation {
+	return s.ListConversationsLimit(0)
+}
+
+// ListConversationsLimit returns up to `limit` active (non-archived)
+// conversations, ordered by updated_at DESC. limit <= 0 means
+// "no cap" (used by legacy callers / tests). The handler-layer
+// pagination passes limit=200 to bound the response size.
+func (s *Store) ListConversationsLimit(limit int) []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`)
+	q := `SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := s.db.Query(q)
 	if err != nil {
 		return nil
 	}
@@ -1048,8 +1080,19 @@ func (s *Store) ArchiveByProjectPath(projectPath string) (int, error) {
 
 // ListArchivedConversations returns all archived conversations.
 func (s *Store) ListArchivedConversations() []Conversation {
+	return s.ListArchivedConversationsLimit(0)
+}
+
+// ListArchivedConversationsLimit returns up to `limit` archived
+// conversations, ordered by updated_at DESC. limit <= 0 means
+// "no cap" (legacy callers / tests).
+func (s *Store) ListArchivedConversationsLimit(limit int) []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`)
+	q := `SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := s.db.Query(q)
 	if err != nil {
 		return nil
 	}
@@ -1636,75 +1679,93 @@ type ConversationTokenStats struct {
 
 // TokenStats scans messages metadata for assistant messages with
 // tokens_in / tokens_out keys and aggregates per conversation.
+//
+// Two queries (instead of a single correlated subquery that ran
+// once per row → O(N²)): one to gather per-conversation metadata
+// (title, updated_at, msg_count) and one to gather per-message
+// token data. Both run in O(N) over the messages table.
 func (s *Store) TokenStats() []ConversationTokenStats {
 	_ = s.Flush()
-	rows, err := s.db.Query(`
-		SELECT m.conversation_id,
-			   COALESCE(c.title, ''),
-			   m.metadata,
-			   c.updated_at,
-			   (SELECT COUNT(*) FROM messages m2 WHERE m2.conversation_id = m.conversation_id) AS msg_count
-		FROM messages m
-		JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
-		WHERE m.role = 'assistant' AND m.metadata IS NOT NULL AND m.metadata != ''
-	`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
 
-	type convAgg struct {
+	type convMeta struct {
 		Title     string
-		TokensIn  int
-		TokensOut int
-		MsgCount  int
 		UpdatedAt int64
+		MsgCount  int
 	}
-	agg := make(map[string]*convAgg)
-
-	for rows.Next() {
-		var convID, title, metaStr string
-		var updatedAt int64
-		var msgCount int
-		if err := rows.Scan(&convID, &title, &metaStr, &updatedAt, &msgCount); err != nil {
-			break
-		}
-		e, ok := agg[convID]
-		if !ok {
-			e = &convAgg{Title: title, UpdatedAt: updatedAt}
-			agg[convID] = e
-		}
-		// Take the max msg_count across multiple rows for the same conv.
-		if msgCount > e.MsgCount {
-			e.MsgCount = msgCount
-		}
-
-		// Parse tokens from metadata JSON.
-		var meta map[string]string
-		if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
-			continue
-		}
-		if t, ok := meta["tokens_in"]; ok {
-			if v, err := strconv.Atoi(t); err == nil {
-				e.TokensIn += v
+	// Query 1: per-conversation metadata + msg_count via GROUP BY.
+	meta := make(map[string]*convMeta)
+	rows, err := s.db.Query(`
+		SELECT c.id, COALESCE(c.title, ''), c.updated_at,
+		       (SELECT COUNT(*) FROM messages m2 WHERE m2.conversation_id = c.id) AS msg_count
+		FROM conversations c
+		WHERE c.archived = 0
+	`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id, title string
+			var updatedAt int64
+			var msgCount int
+			if err := rows.Scan(&id, &title, &updatedAt, &msgCount); err == nil {
+				meta[id] = &convMeta{Title: title, UpdatedAt: updatedAt, MsgCount: msgCount}
 			}
 		}
-		if t, ok := meta["tokens_out"]; ok {
-			if v, err := strconv.Atoi(t); err == nil {
-				e.TokensOut += v
+	}
+
+	// Query 2: per-message token data (O(N) scan, no correlated subquery).
+	type tokenAgg struct {
+		TokensIn  int
+		TokensOut int
+	}
+	tokens := make(map[string]*tokenAgg)
+	rows2, err := s.db.Query(`
+		SELECT m.conversation_id, m.metadata
+		FROM messages m
+		WHERE m.role = 'assistant' AND m.metadata IS NOT NULL AND m.metadata != ''
+	`)
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var convID, metaStr string
+			if err := rows2.Scan(&convID, &metaStr); err != nil {
+				continue
+			}
+			var m map[string]string
+			if err := json.Unmarshal([]byte(metaStr), &m); err != nil {
+				continue
+			}
+			e, ok := tokens[convID]
+			if !ok {
+				e = &tokenAgg{}
+				tokens[convID] = e
+			}
+			if t, ok := m["tokens_in"]; ok {
+				if v, err := strconv.Atoi(t); err == nil {
+					e.TokensIn += v
+				}
+			}
+			if t, ok := m["tokens_out"]; ok {
+				if v, err := strconv.Atoi(t); err == nil {
+					e.TokensOut += v
+				}
 			}
 		}
 	}
 
 	var out []ConversationTokenStats
-	for convID, e := range agg {
+	for convID, m := range meta {
+		t := tokens[convID]
+		tin, tout := 0, 0
+		if t != nil {
+			tin, tout = t.TokensIn, t.TokensOut
+		}
 		out = append(out, ConversationTokenStats{
 			ConversationID:    convID,
-			ConversationTitle: e.Title,
-			TokensIn:          e.TokensIn,
-			TokensOut:         e.TokensOut,
-			MsgCount:          e.MsgCount,
-			UpdatedAt:         e.UpdatedAt,
+			ConversationTitle: m.Title,
+			TokensIn:          tin,
+			TokensOut:         tout,
+			MsgCount:          m.MsgCount,
+			UpdatedAt:         m.UpdatedAt,
 		})
 	}
 	// Sort by updated_at desc.
