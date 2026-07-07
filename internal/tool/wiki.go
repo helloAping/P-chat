@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/config"
@@ -127,12 +128,13 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			return &CallResult{Content: "(知识库为空，尚未扫描)"}, nil
 		}
 
-		// Re-rank across bases: merge sort by rank descending.
-		for i := 1; i < len(allItems); i++ {
-			for j := i; j > 0 && allItems[j].Rank > allItems[j-1].Rank; j-- {
-				allItems[j], allItems[j-1] = allItems[j-1], allItems[j]
-			}
-		}
+		// Re-rank across bases: sort by rank descending. Use
+		// sort.Slice (O(n log n)) instead of the previous
+		// insertion sort (O(n²)). For 1000+ items the previous
+		// version was the dominant cost of wiki_lookup.
+		sort.Slice(allItems, func(i, j int) bool {
+			return allItems[i].Rank > allItems[j].Rank
+		})
 
 		// Paginate the merged+re-ranked results.
 		start := (a.Page - 1) * a.Size
@@ -232,13 +234,24 @@ func makeWikiListHandler(cfg *config.Config) ToolHandler {
 				merged = res
 			} else {
 				merged.Total += res.Total
-				merged.HasMore = merged.HasMore || res.HasMore
+				// HasMore across multiple bases: there are more
+				// items to show if the union of all bases'
+				// remaining items > 0. Using OR on each base's
+				// HasMore was correct in the single-base case
+				// but under-reports in the multi-base case
+				// (e.g. base A has 30 items no more, base B has
+				// 30 items with more → merged is 60 items with
+				// more in B but A says no more; user wouldn't
+				// paginate).
 				merged.Items = append(merged.Items, res.Items...)
 			}
 		}
 		if merged == nil || merged.Total == 0 {
 			return &CallResult{Content: "(无子节点)"}, nil
 		}
+		// Recompute HasMore based on the merged view: there are
+		// more items if the merged total exceeds what we showed.
+		merged.HasMore = merged.Total > len(merged.Items)
 
 		var b strings.Builder
 		fmt.Fprintf(&b, "## Children of node %d (%d items)\n\n", a.ParentID, merged.Total)

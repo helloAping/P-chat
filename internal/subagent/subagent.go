@@ -155,6 +155,12 @@ type Cache struct {
 	stores atomic.Int64
 }
 
+// defaultCacheMaxEntries caps the cache size. A long-running
+// process that issues many distinct sub-agent tasks would
+// otherwise grow this map without bound. When the cap is
+// reached, the oldest entry (by storedAt) is evicted.
+const defaultCacheMaxEntries = 256
+
 type cacheEntry struct {
 	result   Result
 	storedAt time.Time
@@ -170,6 +176,27 @@ func NewCache(ttl time.Duration) *Cache {
 	return &Cache{
 		ttl:     ttl,
 		entries: make(map[string]cacheEntry),
+	}
+}
+
+// evictOldest drops the entry with the oldest storedAt under
+// the lock. Caller must hold c.mu.
+func (c *Cache) evictOldest() {
+	if len(c.entries) == 0 {
+		return
+	}
+	var oldestKey string
+	var oldestAt time.Time
+	first := true
+	for k, e := range c.entries {
+		if first || e.storedAt.Before(oldestAt) {
+			oldestKey = k
+			oldestAt = e.storedAt
+			first = false
+		}
+	}
+	if oldestKey != "" {
+		delete(c.entries, oldestKey)
 	}
 }
 
@@ -218,6 +245,9 @@ func (c *Cache) Put(description string, s style.Style, provider string, r Result
 		result:   r,
 		storedAt: time.Now(),
 	}
+	if len(c.entries) > defaultCacheMaxEntries {
+		c.evictOldest()
+	}
 	c.mu.Unlock()
 	c.stores.Add(1)
 }
@@ -257,6 +287,9 @@ func (c *Cache) PutByKey(key string, r Result) {
 	c.entries[key] = cacheEntry{
 		result:   r,
 		storedAt: time.Now(),
+	}
+	if len(c.entries) > defaultCacheMaxEntries {
+		c.evictOldest()
 	}
 	c.mu.Unlock()
 	c.stores.Add(1)

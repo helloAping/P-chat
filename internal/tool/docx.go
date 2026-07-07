@@ -33,6 +33,11 @@ func readDocx(path string) (string, error) {
 
 // parseDocxXML streams the document.xml and collects all <w:t>
 // text content. Paragraph boundaries become newlines.
+//
+// If the XML stream ends mid-parse (truncated/corrupt docx), the
+// partial text is returned along with a warning instead of being
+// silently lost. The caller can surface the warning to the LLM
+// so it knows the text may be incomplete.
 func parseDocxXML(r io.Reader) (string, error) {
 	decoder := xml.NewDecoder(r)
 	var (
@@ -45,6 +50,11 @@ func parseDocxXML(r io.Reader) (string, error) {
 		if err != nil {
 			if err == io.EOF {
 				break
+			}
+			// Partial text: return what we have plus a warning.
+			text := strings.TrimSpace(sb.String())
+			if text != "" {
+				return text + "\n\n[warning: document.xml ended mid-parse, text may be truncated: " + err.Error() + "]", nil
 			}
 			return "", fmt.Errorf("parse document.xml: %w", err)
 		}

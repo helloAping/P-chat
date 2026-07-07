@@ -1050,9 +1050,15 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         if (ev.sub_agent_model && !sub.agentModel) sub.agentModel = ev.sub_agent_model
       }
       // Surface phase messages as a live status bar.
+      // Cap at 20 entries to bound memory for long-running
+      // sessions that emit many phase events. Older entries
+      // are dropped first; the live status bar only shows the
+      // tail anyway.
       if (ev.message) {
         if (!m._statusText) (m as any)._statusText = []
-        ;(m as any)._statusText.push(ev.message)
+        const arr: string[] = (m as any)._statusText
+        arr.push(ev.message)
+        if (arr.length > 20) arr.shift()
       }
       break
     case 'session_status':
@@ -1083,6 +1089,11 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.elapsed) m.elapsed = ev.elapsed
       if (ev.provider) m.provider = ev.provider
       if (ev.model) m.model = ev.model
+      // Free the per-message live-status array. The stream
+      // is over; the live status bar is no longer shown.
+      // Without this, _statusText would stay around for
+      // the lifetime of the message in the in-memory map.
+      delete (m as any)._statusText
       // Mark all open thinking parts as no longer streaming.
       walkParts(m.parts!, (p) => {
         if (p.kind === 'thinking' && p.streaming) p.streaming = false

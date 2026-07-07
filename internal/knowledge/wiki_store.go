@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // ── Three-level index node types ──
@@ -620,6 +621,23 @@ func (ws *WikiStore) CountNodes(ctx context.Context, base string) int {
 var wikiStoreCache sync.Map
 var wikiStoreMu sync.Mutex
 
+// maxWikiStoreCache caps the number of cached wiki stores. A
+// pathological config (e.g. many knowledge bases, or one base
+// whose path changes per request) could otherwise leak
+// SQLite connections over a long-running process. When the
+// cap is reached, the oldest entry (by insertion order, via
+// insertion-order tracking in wikiStoreOrder) is closed and
+// evicted.
+const maxWikiStoreCache = 64
+
+// wikiStoreOrder tracks insertion order for LRU eviction. We
+// use a counter rather than time to keep the eviction logic
+// allocation-free in the hot path.
+var (
+	wikiStoreCounter atomic.Uint64
+	wikiStoreOrder   = make(map[string]uint64) // key -> insertion seq
+)
+
 // GetOrOpenWikiStore returns a cached wiki store keyed by (dir, name).
 // Each unique combination gets its own SQLite database.
 func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) {
@@ -637,6 +655,33 @@ func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) {
 		return nil, err
 	}
 	wikiStoreCache.Store(key, ws)
+	wikiStoreOrder[key] = wikiStoreCounter.Add(1)
+	// Evict the oldest entry if we're over the cap. We close
+	// its SQLite DB so the underlying file handle is freed.
+	if len(wikiStoreOrder) > maxWikiStoreCache {
+		var oldestKey string
+		var oldestSeq uint64 = ^uint64(0)
+		for k, seq := range wikiStoreOrder {
+			if k == key {
+				continue
+			}
+			if seq < oldestSeq {
+				oldestKey = k
+				oldestSeq = seq
+			}
+		}
+		if oldestKey != "" {
+			// Capture the value before deleting so we can
+			// close the underlying SQLite DB after eviction.
+			if v, ok := wikiStoreCache.Load(oldestKey); ok {
+				wikiStoreCache.Delete(oldestKey)
+				delete(wikiStoreOrder, oldestKey)
+				_ = v.(*WikiStore).Close()
+			} else {
+				delete(wikiStoreOrder, oldestKey)
+			}
+		}
+	}
 	return ws, nil
 }
 

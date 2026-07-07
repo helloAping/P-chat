@@ -29,6 +29,36 @@
 //     bubble as soon as they hit send.
 import { computed, nextTick, useTemplateRef, watch } from 'vue'
 import { marked } from 'marked'
+
+// Markdown render cache. The MessageBubble template previously
+// called `marked.parse(p.text || '')` on every render — for
+// long sessions with many static text parts, this is a major
+// source of jank because marked.parse is O(text length) and
+// Vue re-evaluates the v-html expression any time any reactive
+// dep in the component ticks. Cache by text content; cap the
+// cache at 256 entries to bound memory for very long sessions.
+//
+// LRU-ish: a Map preserves insertion order, so we can pop the
+// oldest entry when over the cap.
+const MD_CACHE_MAX = 256
+const mdCache = new Map<string, string>()
+function renderMd(text: string): string {
+  if (!text) return ''
+  const cached = mdCache.get(text)
+  if (cached !== undefined) {
+    // Touch: move to end of Map to mark as recently used.
+    mdCache.delete(text)
+    mdCache.set(text, cached)
+    return cached
+  }
+  const html = marked.parse(text, { async: false, breaks: true }) as string
+  mdCache.set(text, html)
+  if (mdCache.size > MD_CACHE_MAX) {
+    const oldest = mdCache.keys().next().value
+    if (oldest !== undefined) mdCache.delete(oldest)
+  }
+  return html
+}
 import { useMessage } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import { state } from '../stores/chat'
@@ -102,10 +132,7 @@ const isSystem = computed(() => (props.message.msg_type ?? 0) === 0 && props.mes
 // fallback is important.)
 const assistantHtml = computed(() => '')
 
-const userHtml = computed(() => {
-  const md = marked.parse(props.message.content || '', { async: false, breaks: true })
-  return md as string
-})
+const userHtml = computed(() => renderMd(props.message.content || ''))
 
 // Attachments (images / files) — only used by user
 // messages today, but kept general.
@@ -508,7 +535,7 @@ const showVisionWarn = computed(() =>
                 v-else-if="p.kind === 'text'"
                 ref="mdBodyEl"
                 class="md-body"
-                v-html="marked.parse(p.text || '', { async: false, breaks: true })"
+                v-html="renderMd(p.text || '')"
                 @click="onCodeClick"
               />
             </template>

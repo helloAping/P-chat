@@ -220,6 +220,14 @@ func (c *Client) DeleteSession(ctx context.Context, id string) error {
 	return c.doJSON(ctx, "DELETE", "/api/v1/sessions/"+id, nil, nil)
 }
 
+// ClearMessages empties the messages of a session without
+// changing the session ID. Use this instead of DeleteSession
+// when the user wants to start a fresh thread but keep the
+// session row (so external refs stay stable).
+func (c *Client) ClearMessages(ctx context.Context, id string) error {
+	return c.doJSON(ctx, "DELETE", "/api/v1/sessions/"+id+"/messages", nil, nil)
+}
+
 func (c *Client) ListMessages(ctx context.Context, id string) ([]Message, error) {
 	var resp struct {
 		Messages []Message `json:"messages"`
