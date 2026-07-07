@@ -265,7 +265,7 @@ func (s *Store) migrateTo(targetVersion int) error {
 
 	// 执行备份
 	if s.dbPath != "" {
-		if err := backupDB(s.dbPath); err != nil {
+		if err := backupDB(s.db, s.dbPath); err != nil {
 			// 备份失败不阻塞迁移，但记录
 			fmt.Printf("pchat: db backup failed: %v\n", err)
 		}
@@ -286,19 +286,25 @@ func (s *Store) migrateTo(targetVersion int) error {
 }
 
 // backupDB copies the SQLite database file (and WAL/shm siblings) to
-// <dbPath>.backup-<timestamp>. The original database is checkpointed
-// first so the file-copy is self-contained. Errors are non-fatal.
-func backupDB(dbPath string) error {
-	// Force WAL checkpoint so the main file is self-contained.
-	wdb, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)")
-	if err != nil {
-		return fmt.Errorf("backup open: %w", err)
-	}
-	if _, err := wdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		wdb.Close()
+// <dbPath>.backup-<timestamp>. The existing connection is
+// checkpointed first so the file-copy is self-contained.
+// Errors are non-fatal.
+//
+// IMPORTANT: the caller must hold s.mu so no other goroutine is
+// writing to the DB while we copy. Opening a separate
+// connection (as the previous version did) is racy: a
+// concurrent writer on the main connection may have a
+// transaction in-flight that the second connection can't see,
+// and closing the second connection can leave the WAL file
+// un-truncated.
+func backupDB(db *sql.DB, dbPath string) error {
+	// Force WAL checkpoint on the SAME connection that the
+	// application is using, so the checkpoint is consistent
+	// with the caller's view of the database. The caller
+	// holds s.mu so no concurrent writer can interleave.
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		return fmt.Errorf("wal_checkpoint: %w", err)
 	}
-	wdb.Close()
 
 	backupPath := dbPath + ".backup-" + time.Now().Format("20060102-150405")
 	src, err := os.Open(dbPath)

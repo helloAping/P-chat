@@ -93,7 +93,19 @@ async function copyTaskId() {
 // `start` state for more than `STUCK_TIMEOUT_MS` we
 // force-close it as `err` from the client. The user can
 // still read whatever text the sub-agent did produce.
-const STUCK_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
+// STUCK_TIMEOUT_MS is a last-resort client-side safety net
+// for when the server never sends the sub-agent close event
+// (e.g. server crash mid-run). The server's actual hard
+// timeout is 5 minutes (subagent.go:652 and
+// internal/config SubAgent.TimeoutDuration, default 5m). We
+// use 6 minutes here so the client never force-closes BEFORE
+// the server's natural close event lands — otherwise the
+// client would mark the sub-agent as failed even when the
+// server actually completed successfully. If the server
+// timeout is configured differently, the user's server
+// already enforces it; this client-side timer is purely a
+// backstop.
+const STUCK_TIMEOUT_MS = 6 * 60 * 1000 // 6 minutes
 watch(
   () => props.part.status,
   (s, prev) => {

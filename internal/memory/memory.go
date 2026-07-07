@@ -1586,6 +1586,11 @@ func newConvID() string {
 // SearchMessages performs a simple LIKE-based full-text search
 // across messages in all active (non-archived) conversations.
 // Returns up to `limit` results sorted by created_at desc.
+//
+// User input is escaped so that LIKE metacharacters (`%`, `_`)
+// in the search query don't behave as wildcards. A search for
+// "100%" matches the literal substring "100%", not "100" +
+// anything.
 func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	_ = s.Flush()
 	if q == "" {
@@ -1595,15 +1600,19 @@ func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	if q == "" {
 		return nil
 	}
+	// Escape LIKE metacharacters: backslash, percent, underscore.
+	// SQLite uses `\` as the ESCAPE char by default, so we prefix
+	// each metachar with `\`.
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
 
 	rows, err := s.db.Query(
 		`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at
 		 FROM messages m
 		 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
-		 WHERE m.content LIKE ?
+		 WHERE m.content LIKE ? ESCAPE '\'
 		 ORDER BY m.created_at DESC
 		 LIMIT ?`,
-		"%"+q+"%", limitOrHuge(limit),
+		"%"+escaped+"%", limitOrHuge(limit),
 	)
 	if err != nil {
 		return nil

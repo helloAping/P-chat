@@ -421,19 +421,55 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 // chunkToEvent so the accumulator and the wire format agree on
 // the status string for a given step. Keep the two in lockstep
 // if you ever touch this.
+//
+// The step format is "call-<n>-<status>" (e.g. "call-1-ok",
+// "call-1-err", "call-1-warn"). We parse the trailing status
+// segment instead of substring-matching "ok" / "err" so a future
+// status name like "bookkeeping" or "trigger" can't accidentally
+// match. Empty / unparseable step → "start".
 func toolStatusFromStep(step, errMsg string) string {
-	switch {
-	case errMsg != "":
+	if errMsg != "" {
 		return "error"
-	case strings.Contains(step, "ok"):
-		return "ok"
-	case strings.Contains(step, "warn"):
-		return "warn"
-	case strings.Contains(step, "err"):
-		return "error"
-	default:
+	}
+	status := parseStepStatus(step)
+	if status == "" {
 		return "start"
 	}
+	return status
+}
+
+// parseStepStatus extracts the trailing status segment from a
+// step like "call-1-ok" → "ok". Returns "" for malformed input
+// (the caller falls back to "start").
+func parseStepStatus(step string) string {
+	// Expected: "call-N-status" or "call-N-status-...".
+	// We split on '-' and use the last non-empty segment.
+	idx := strings.LastIndex(step, "-")
+	if idx < 0 || idx+1 >= len(step) {
+		return ""
+	}
+	candidate := step[idx+1:]
+	switch candidate {
+	case "ok", "warn", "err", "error", "start":
+		return canonicalStatus(candidate)
+	}
+	return ""
+}
+
+// canonicalStatus normalises the few valid status names so the
+// accumulator and the wire format agree ("err" → "error").
+func canonicalStatus(s string) string {
+	switch s {
+	case "ok":
+		return "ok"
+	case "warn":
+		return "warn"
+	case "err", "error":
+		return "error"
+	case "start":
+		return "start"
+	}
+	return s
 }
 
 // snapshot returns a deep-enough copy of the parts for

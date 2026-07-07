@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -95,6 +96,26 @@ func AddProvider(p ProviderConfig) error {
 	for _, existing := range cfg.LLM.Providers {
 		if existing.Name == p.Name {
 			return fmt.Errorf("provider %q already exists; use a different name (or remove the existing one first)", p.Name)
+		}
+	}
+	// Validate the protocol. UpdateProvider validates (line
+	// 235-241) but AddProvider did not — a provider added with
+	// `protocol: "garbage"` would persist to disk and only fail
+	// when a real LLM call is made.
+	if p.Protocol != "" {
+		switch p.Protocol {
+		case "openai", "anthropic":
+			// ok
+		default:
+			return fmt.Errorf("invalid protocol %q (allowed: openai, anthropic)", p.Protocol)
+		}
+	}
+	// Validate the BaseURL is parseable so a typo doesn't get
+	// silently persisted and surface as a confusing error at
+	// the first LLM call.
+	if p.BaseURL != "" {
+		if _, err := url.Parse(p.BaseURL); err != nil {
+			return fmt.Errorf("invalid base_url %q: %w", p.BaseURL, err)
 		}
 	}
 	cfg.LLM.Providers = append(cfg.LLM.Providers, p)

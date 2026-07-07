@@ -2170,6 +2170,17 @@ func cmdHistory(ctx cliContext, args string) error {
 			color.Red("  用法: /history forget <id>")
 			return nil
 		}
+		// Confirm before destructive delete — a typo'd id from
+		// terminal history can permanently delete a session.
+		// Use raw read since we may be in raw mode (watchEsc).
+		fmt.Printf("  确认删除会话 %s? 输入 yes 确认: ", id)
+		reader := bufio.NewReader(os.Stdin)
+		ans, _ := reader.ReadString('\n')
+		ans = strings.TrimSpace(strings.ToLower(ans))
+		if ans != "yes" && ans != "y" {
+			color.HiBlack("  已取消")
+			return nil
+		}
 		if err := ctx.DeleteSession(context.Background(), id); err != nil {
 			color.Red("  ✗ %v", err)
 			return nil

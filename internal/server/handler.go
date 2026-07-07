@@ -819,7 +819,24 @@ func (h *Handler) SearchMessages(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "query parameter 'q' is required"})
 		return
 	}
+	// Cap the query length and limit. A user-supplied 10KB
+	// string of `%` wildcards in a single search can be a
+	// denial-of-service vector — SQLite's LIKE is O(N) and
+	// pathological patterns can drive the query to take
+	// seconds. Combined with the missing `limit` cap (e.g.
+	// `?limit=1000000` would be honored), this is a resource
+	// amplification concern.
+	if len(q) > 256 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "query 'q' is too long (max 256 chars)"})
+		return
+	}
 	limit := parseIntQuery(c, "limit", 20)
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
 	results := h.store.SearchMessages(q, limit)
 	if results == nil {
 		results = []memory.SearchResult{}
@@ -1965,6 +1982,33 @@ func (h *Handler) SendMessage(c *gin.Context) {
 // 事件全部带有 sub_agent=true 标记，前端能正确路由到嵌套 SubAgentCard。
 //
 // 修改指南 → docs/modules/server.md
+// toolStatusFromChunkStep mirrors toolStatusFromStep in
+// internal/agent/parts.go so the wire format and the
+// accumulator agree on the status string. Parse the trailing
+// segment of "call-N-status" instead of substring-matching
+// "ok" / "err" so a future status name can't accidentally
+// match.
+func toolStatusFromChunkStep(step, errMsg string) string {
+	if errMsg != "" {
+		return "error"
+	}
+	idx := strings.LastIndex(step, "-")
+	if idx < 0 || idx+1 >= len(step) {
+		return "start"
+	}
+	switch step[idx+1:] {
+	case "ok":
+		return "ok"
+	case "warn":
+		return "warn"
+	case "err", "error":
+		return "error"
+	case "start":
+		return "start"
+	}
+	return "start"
+}
+
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {
 	ev := StreamEvent{
 		Phase:          chunk.Phase,
@@ -2028,16 +2072,11 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolResultFull = chunk.ToolResultFull
 		ev.ToolError = chunk.ToolError
 		ev.ToolElapsed = chunk.ToolElapsed
-		switch {
-		case strings.Contains(chunk.Step, "ok"):
-			ev.ToolStatus = "ok"
-		case strings.Contains(chunk.Step, "warn"):
-			ev.ToolStatus = "warn"
-		case strings.Contains(chunk.Step, "err"):
-			ev.ToolStatus = "error"
-		default:
-			ev.ToolStatus = "start"
-		}
+		// Status: parse the trailing segment of "call-N-status"
+		// rather than substring-matching "ok" / "err" so a future
+		// status name can't accidentally match. See
+		// internal/agent/parts.go for the canonical parser.
+		ev.ToolStatus = toolStatusFromChunkStep(chunk.Step, chunk.ToolError)
 		return ev
 	}
 	if chunk.Thinking != "" {

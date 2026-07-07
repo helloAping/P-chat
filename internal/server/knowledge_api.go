@@ -1181,7 +1181,13 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 			if err != nil {
 				return nil
 			}
-			defer f.Close()
+			// Close explicitly here, NOT via defer. The previous
+			// code used `defer f.Close()` inside the Walk
+			// callback — defer runs when the OUTER function
+			// (grepKB) returns, not when the walk step
+			// finishes. A knowledge base with 10,000 files
+			// would exhaust file descriptors before grepKB
+			// returned.
 			scanner := bufio.NewScanner(f)
 			lineNum := 0
 			for scanner.Scan() && len(out) < maxResults {
@@ -1195,6 +1201,7 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 					})
 				}
 			}
+			f.Close()
 			return nil
 		})
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/style"
 )
 
@@ -26,6 +27,11 @@ type Server struct {
 	engine   *gin.Engine
 	handler  *Handler
 	srv      *http.Server
+
+	// rulesWatchStop stops the file watcher that polls the
+	// rules directories for changes. Started in
+	// NewWithStaticFS, stopped in Shutdown.
+	rulesWatchStop func()
 }
 
 // Engine returns the underlying gin.Engine so tests (or embedders)
@@ -215,7 +221,19 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		r.StaticFS("/app", staticFS)
 	}
 
-	return &Server{cfg: cfg, agent: agt, store: store, styleMgr: styleMgr, engine: r, handler: h}
+	s := &Server{cfg: cfg, agent: agt, store: store, styleMgr: styleMgr, engine: r, handler: h}
+	// Hot-reload rules when the user edits files in the rules
+	// directories. The agent's Reload() re-reads AGENTS.md,
+	// rules, and skills and rebuilds the cached system prompt.
+	// Polling (every 5s) is used instead of fsnotify because it
+	// works uniformly across Windows/macOS/Linux without
+	// additional dependencies.
+	s.rulesWatchStop = rules.Watch(func() {
+		if agt != nil {
+			agt.Reload()
+		}
+	}, 5*time.Second)
+	return s
 }
 
 func (s *Server) Run() error {
@@ -265,6 +283,9 @@ func (s *Server) RunWithGracefulShutdown(addr string) error {
 // Shutdown gracefully shuts down the server, draining active
 // connections. The context deadline caps the total drain time.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.rulesWatchStop != nil {
+		s.rulesWatchStop()
+	}
 	if s.srv != nil {
 		return s.srv.Shutdown(ctx)
 	}
