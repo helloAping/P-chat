@@ -219,6 +219,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/knowledge/bases/:name/nodes/:id/content", h.GetNodeContent)
 		api.DELETE("/knowledge/bases/:name/nodes/:id", h.DeleteNode)
 		api.POST("/knowledge/search", h.SearchKnowledge)
+
+		// Web search settings
+		api.GET("/settings/web_search", h.GetWebSearchSettings)
+		api.PUT("/settings/web_search", h.UpdateWebSearchSettings)
+		api.POST("/settings/web_search/test", h.TestWebSearchConnection)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the

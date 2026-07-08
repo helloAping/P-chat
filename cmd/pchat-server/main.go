@@ -111,8 +111,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// (the UpdateConfig handler calls SetGlobal again with
 	// the refreshed config).
 	search.SetGlobal(search.BuildProvider(cfg.Search))
+	search.SetQuotaLimit(cfg.Search.DailyQuota)
 	if cfg.Search.Enabled {
-		log.Printf("[search] web_search enabled, provider=%s", search.Global().Name())
+		log.Printf("[search] web_search enabled, provider=%s, daily_quota=%d",
+			search.Global().Name(), cfg.Search.DailyQuota)
 	} else {
 		log.Printf("[search] web_search disabled (no provider configured)")
 	}

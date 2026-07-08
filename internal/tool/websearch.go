@@ -115,6 +115,19 @@ func handleWebSearch(ctx context.Context, args json.RawMessage) (*CallResult, er
 		}, nil
 	}
 
+	// Enforce the daily cap BEFORE the network call so a
+	// flooded quota doesn't cost us any provider-side
+	// billing. The test-connection endpoint calls
+	// search.Global() directly and bypasses this — tests
+	// are not real searches.
+	ok, _ := search.Quota().CheckAndIncrement()
+	if !ok {
+		return &CallResult{
+			Content: search.ErrQuota.Error(),
+			IsError: true,
+		}, nil
+	}
+
 	results, err := provider.Search(ctx, search.Query{
 		Query:       a.Query,
 		MaxResults:  a.MaxResults,

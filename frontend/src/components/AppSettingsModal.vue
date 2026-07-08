@@ -29,6 +29,7 @@ import {
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion } from '../stores/chat'
 import type { Session } from '../api/client'
+import WebSearchSettings from './WebSearchSettings.vue'
 
 const message = useMessage()
 
@@ -2247,6 +2248,10 @@ function kbModelSupportsVision(scanModel: string) {
             </template>
           </div>
         </div>
+      </NTabPane>
+
+      <NTabPane name="websearch" tab="网络搜索" style="flex: 1; min-height: 0; overflow: auto">
+        <WebSearchSettings />
       </NTabPane>
     </NTabs>
 

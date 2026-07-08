@@ -410,6 +410,14 @@ type SearchConfig struct {
 	// its own deadline so a stuck search can't block a turn
 	// indefinitely.
 	RequestTimeout time.Duration `json:"request_timeout,omitempty"`
+
+	// DailyQuota caps the number of searches the local
+	// process will dispatch per UTC day. 0 = unlimited.
+	// Enforced by internal/search.QuotaTracker; the
+	// counter resets at 00:00 UTC and is *not* persisted
+	// across server restarts (a deliberate choice — quota
+	// is a soft budget, not a billing boundary).
+	DailyQuota int `json:"daily_quota,omitempty"`
 }
 
 // SandboxConfig controls which actions LLM-driven tools can take

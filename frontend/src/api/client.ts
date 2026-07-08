@@ -1207,3 +1207,58 @@ export const updateSystemConfig = (patch: Record<string, unknown>) =>
     method: 'PATCH',
     body: JSON.stringify(patch),
   })
+
+// ---- Web search settings ----
+
+export interface WebSearchSettings {
+  enabled: boolean
+  provider: string
+  // `has_key` is true when the server has a key stored; the
+  // actual key is never returned. To replace, send a new
+  // `api_key` in the PUT body; to delete, set
+  // `clear_api_key: true`.
+  has_key: boolean
+  base_url?: string
+  path?: string
+  topic?: string
+  daily_quota: number
+  request_timeout: string
+  used_today: number
+  resets_at: string // ISO 8601
+}
+
+export const getWebSearchSettings = () =>
+  jsonFetch<WebSearchSettings>('/api/v1/settings/web_search')
+
+export interface UpdateWebSearchRequest {
+  enabled?: boolean
+  provider?: string
+  // When set, the server stores this as the new API key.
+  // An empty string is treated as "no change" — use
+  // `clear_api_key: true` to actually delete the key.
+  api_key?: string
+  clear_api_key?: boolean
+  base_url?: string
+  path?: string
+  topic?: string
+  daily_quota?: number
+  request_timeout?: string
+}
+
+export const updateWebSearchSettings = (patch: UpdateWebSearchRequest) =>
+  jsonFetch<WebSearchSettings>('/api/v1/settings/web_search', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  })
+
+// Test the provider connection without consuming the daily
+// quota. Returns { ok: true, provider, result_count } on
+// success, or { ok: false, error } on failure.
+export const testWebSearchConnection = () =>
+  jsonFetch<{ ok: boolean; provider?: string; result_count?: number; error?: string }>(
+    '/api/v1/settings/web_search/test',
+    { method: 'POST' },
+  )
+
+
+

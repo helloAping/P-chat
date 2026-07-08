@@ -140,6 +140,10 @@ func TestHandleWebSearch_DisabledProviderReturnsEDisabled(t *testing.T) {
 	defer search.SetGlobal(search.DisabledProvider{})
 	search.SetGlobal(search.DisabledProvider{})
 
+	// DisabledProvider returns BEFORE the quota check (the
+	// check is gated behind `provider != nil`), so the
+	// quota counter is untouched. We don't need to reset
+	// it.
 	res, _ := handleWebSearch(context.Background(), []byte(`{"query":"go http"}`))
 	if !res.IsError {
 		t.Fatalf("expected error from disabled provider, got: %+v", res)
@@ -154,6 +158,9 @@ func TestHandleWebSearch_NoResultsIsNotError(t *testing.T) {
 	// — just an empty result message.
 	defer search.SetGlobal(search.DisabledProvider{})
 	search.SetGlobal(stubSearchProvider{results: nil})
+	// Reset the quota tracker so a previous test's count
+	// doesn't bleed into this one.
+	resetQuota()
 
 	res, _ := handleWebSearch(context.Background(), []byte(`{"query":"x"}`))
 	if res.IsError {
@@ -170,6 +177,7 @@ func TestHandleWebSearch_FormatsResults(t *testing.T) {
 		{Title: "A", URL: "https://a.com", Snippet: "alpha"},
 		{Title: "B", URL: "https://b.com", Snippet: "beta", PublishedAt: "2025-01-01"},
 	}})
+	resetQuota()
 
 	res, _ := handleWebSearch(context.Background(), []byte(`{"query":"test"}`))
 	if res.IsError {
@@ -180,6 +188,40 @@ func TestHandleWebSearch_FormatsResults(t *testing.T) {
 			t.Errorf("Content missing %q:\n%s", want, res.Content)
 		}
 	}
+}
+
+func TestHandleWebSearch_QuotaExhausted(t *testing.T) {
+	defer search.SetGlobal(search.DisabledProvider{})
+	search.SetGlobal(stubSearchProvider{results: []search.Result{
+		{Title: "x", URL: "https://e.com", Snippet: "ok"},
+	}})
+	resetQuota()
+	// Set a tight cap and drain it.
+	search.SetQuotaLimit(1)
+	defer search.SetQuotaLimit(0)
+	// First call consumes the only slot.
+	_, _ = handleWebSearch(context.Background(), []byte(`{"query":"first"}`))
+	// Second call should be denied before the stub is hit.
+	res, _ := handleWebSearch(context.Background(), []byte(`{"query":"second"}`))
+	if !res.IsError {
+		t.Fatalf("expected quota error, got: %+v", res)
+	}
+	if !strings.Contains(res.Content, "E_QUOTA") {
+		t.Errorf("Content = %q, want E_QUOTA", res.Content)
+	}
+}
+
+// resetQuota resets the in-process tracker to "0 used, unlimited".
+// Individual tests call this before exercising the handler so a
+// sibling test's residue doesn't deny their calls.
+//
+// We can't easily zero the counter (it's locked), but we can
+// force a day-rollover by waiting for the next UTC day — not
+// practical in a unit test. Instead we simply *guarantee* a
+// high-enough limit for the rest of the test suite. Tests that
+// need a *tight* cap call SetQuotaLimit themselves.
+func resetQuota() {
+	search.SetQuotaLimit(0)
 }
 
 func TestHandleWebSearch_SentinelsArePropagated(t *testing.T) {
