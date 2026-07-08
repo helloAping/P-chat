@@ -683,6 +683,8 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		sb.WriteString("- List directory → `list_files` (NOT `ls` / `dir`)\n")
 		sb.WriteString("- System commands → `exec_command` (NOT `bash` / `sh` / `powershell`)\n")
 		sb.WriteString("- Search file contents → `exec_command` with shell search commands\n")
+		sb.WriteString("- Search the web → `web_search` (returns title+url+snippet; chain with `web_fetch` for full content)\n")
+		sb.WriteString("- Fetch a URL → `web_fetch` (NOT `curl` / `Invoke-WebRequest`)\n")
 		sb.WriteString("- Manage tasks → `todo_write`\n")
 		sb.WriteString("- Ask user → `question`\n")
 

@@ -357,6 +357,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 系统 prompt 拼装 | `internal/agent/agent.go:820-876` |
 | 配置加载 | `internal/config/config.go` |
 | 数据库 CRUD | `internal/memory/memory.go` |
+| `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
 
 ---
 

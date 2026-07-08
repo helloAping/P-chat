@@ -28,6 +28,7 @@ type Config struct {
 	MCP       MCPConfig       `json:"mcp"`
 	Knowledge KnowledgeConfig `json:"knowledge"`
 	Limits    LimitsConfig    `json:"limits"`
+	Search    SearchConfig    `json:"search"`
 }
 
 // LimitsConfig controls resource caps for the agent loop.
@@ -363,6 +364,54 @@ type MemoryConfig struct {
 	MaxHistory int  `json:"max_history"`
 }
 
+// SearchConfig configures the `web_search` tool.
+//
+// The tool is registered only when Enabled=true AND a usable
+// API key + provider is configured. When disabled, the
+// `web_search` tool is invisible to the LLM (handled at
+// RegisterBuiltin time) so the agent doesn't waste a turn
+// discovering the feature is off.
+//
+// Provider selects the backend implementation:
+//
+//   - "tavily" (default): https://api.tavily.com/search, requires APIKey
+//   - "openai_compat": any HTTP endpoint that accepts
+//     `{query, max_results, ...}` and returns
+//     `{results: [{title, url, snippet}, ...]}`; requires BaseURL
+type SearchConfig struct {
+	// Enabled is the master switch. When false, the `web_search`
+	// tool is not registered and the LLM cannot call it.
+	Enabled bool `json:"enabled"`
+
+	// Provider selects the backend. Empty string = "tavily".
+	Provider string `json:"provider,omitempty"`
+
+	// APIKey is the provider's auth token. Not used by
+	// self-hosted providers that don't require auth.
+	APIKey string `json:"api_key,omitempty"`
+
+	// BaseURL overrides the provider's default endpoint.
+	//   - "tavily": leave empty (defaults to https://api.tavily.com)
+	//   - "openai_compat": required (e.g. "https://s.jina.ai")
+	BaseURL string `json:"base_url,omitempty"`
+
+	// Path overrides the request path appended to BaseURL.
+	// Defaults to "/search". Useful for proxies that mount
+	// search at a non-standard path.
+	Path string `json:"path,omitempty"`
+
+	// Topic restricts the search corpus for providers that
+	// support it (currently "tavily" only). Valid values:
+	// "general" (default), "news", "finance".
+	Topic string `json:"topic,omitempty"`
+
+	// RequestTimeout is the per-search HTTP timeout. Zero
+	// (or negative) means 20s. The agent loop also enforces
+	// its own deadline so a stuck search can't block a turn
+	// indefinitely.
+	RequestTimeout time.Duration `json:"request_timeout,omitempty"`
+}
+
 // SandboxConfig controls which actions LLM-driven tools can take
 // without explicit user confirmation.
 type SandboxConfig struct {
@@ -590,6 +639,11 @@ func Default() *Config {
 		Knowledge: KnowledgeConfig{
 			Enabled:   false,
 			AutoIndex: false,
+		},
+		Search: SearchConfig{
+			Enabled:        false,
+			Provider:       "tavily",
+			RequestTimeout: 20 * time.Second,
 		},
 	}
 }

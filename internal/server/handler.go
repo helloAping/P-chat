@@ -22,6 +22,7 @@ import (
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/project"
+	"github.com/p-chat/pchat/internal/search"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/version"
@@ -2513,6 +2514,10 @@ func (h *Handler) reloadAfterConfigChange() {
 		return
 	}
 	h.cfg.Store(cfg)
+	// Hot-swap the search provider so changes to web_search
+	// (enable, key, provider) take effect on the very next
+	// tool call without a server restart.
+	search.SetGlobal(search.BuildProvider(cfg.Search))
 	if h.agent == nil {
 		return
 	}

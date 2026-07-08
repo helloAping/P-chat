@@ -20,6 +20,7 @@ import (
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/sandbox"
+	"github.com/p-chat/pchat/internal/search"
 	"github.com/p-chat/pchat/internal/server"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
@@ -102,6 +103,19 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
+	tool.RegisterWebSearch(toolReg, cfg.Search)
+	// Build the search provider and install it as the
+	// process-global. The tool handler reads it via
+	// search.Global() on every call, so we update it here
+	// AND whenever the user saves new web_search settings
+	// (the UpdateConfig handler calls SetGlobal again with
+	// the refreshed config).
+	search.SetGlobal(search.BuildProvider(cfg.Search))
+	if cfg.Search.Enabled {
+		log.Printf("[search] web_search enabled, provider=%s", search.Global().Name())
+	} else {
+		log.Printf("[search] web_search disabled (no provider configured)")
+	}
 	if cfg.Knowledge.Enabled {
 		tool.RegisterGrep(toolReg, cfg)
 		tool.RegisterWiki(toolReg, cfg)
