@@ -246,7 +246,23 @@ func expandHome(p string) string {
 }
 
 // isPathUnder returns true if path equals or is contained within dir.
+// Both paths are resolved through any symlinks before comparison
+// so an attacker cannot bypass the sandbox by writing through a
+// symlink that points outside the allowed tree. A user-created
+// ~/.p-chat/secret -> /etc would otherwise let writes via
+// ~/.p-chat/secret/passwd slip through the textual-path check
+// even though /etc is in the protected-dirs list.
 func isPathUnder(path, dir string) bool {
+	// Resolve symlinks where possible. If resolution fails
+	// (e.g. the target doesn't exist yet for a write), fall
+	// back to the textual path so the check still produces
+	// a result.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	path = filepath.Clean(path)
 	dir = filepath.Clean(dir)
 	if path == dir {

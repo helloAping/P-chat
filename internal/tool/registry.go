@@ -762,6 +762,30 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 	if strings.HasPrefix(lower, "http://127.") || strings.HasPrefix(lower, "http://localhost") || strings.HasPrefix(lower, "http://0.0.0.0") {
 		return &CallResult{Content: "E_PROTO: fetching from loopback addresses is not allowed for security", IsError: true}, nil
 	}
+	// IPv6 loopback and IPv4-mapped IPv6 loopback. The
+	// string-level checks above only catch ASCII forms.
+	if strings.HasPrefix(lower, "http://[::1]") || strings.HasPrefix(lower, "http://[::ffff:127.") || strings.HasPrefix(lower, "http://[0:0:0:0:0:0:0:1]") {
+		return &CallResult{Content: "E_PROTO: fetching from IPv6 loopback is not allowed for security", IsError: true}, nil
+	}
+	// Link-local (169.254/16) — used by cloud-instance
+	// metadata services like http://169.254.169.254 (AWS,
+	// GCP, Azure). Without this check the LLM can exfiltrate
+	// instance metadata and short-lived credentials.
+	if strings.HasPrefix(lower, "http://169.254.") {
+		return &CallResult{Content: "E_PROTO: fetching from link-local addresses is not allowed for security", IsError: true}, nil
+	}
+	// RFC1918 private ranges. Block only the http:// scheme
+	// to avoid breaking intentional https:// access to
+	// internal services (some users do this).
+	if strings.HasPrefix(lower, "http://10.") || strings.HasPrefix(lower, "http://192.168.") {
+		return &CallResult{Content: "E_PROTO: fetching from RFC1918 private addresses via http is not allowed", IsError: true}, nil
+	}
+	if strings.HasPrefix(lower, "http://172.16.") || strings.HasPrefix(lower, "http://172.17.") ||
+		strings.HasPrefix(lower, "http://172.18.") || strings.HasPrefix(lower, "http://172.19.") ||
+		strings.HasPrefix(lower, "http://172.2") || strings.HasPrefix(lower, "http://172.30.") ||
+		strings.HasPrefix(lower, "http://172.31.") {
+		return &CallResult{Content: "E_PROTO: fetching from RFC1918 private addresses via http is not allowed", IsError: true}, nil
+	}
 
 	method := "GET"
 	if a.Method != "" {

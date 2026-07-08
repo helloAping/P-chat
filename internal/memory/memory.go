@@ -70,6 +70,7 @@ type SearchResult struct {
 type Store struct {
 	db         *sql.DB
 	dbPath     string // filesystem path, set by OpenAt (empty for in-memory)
+	closed     atomic.Bool // set by Close; readers reject when true
 	mu         sync.Mutex
 	currentID  string
 	maxHistory int
@@ -149,7 +150,18 @@ func OpenAt(dbPath string, maxHistory int) (*Store, error) {
 
 // Close flushes pending writes and closes the database.
 func (s *Store) Close() error {
+	// Idempotent: double-Close should be safe (the underlying
+	// sql.DB returns an error on double-Close which we swallow).
+	if s.closed.Swap(true) {
+		return nil
+	}
 	s.flushOnce.Do(func() { close(s.stopCh) })
+	// Flush after the closed flag is set so any in-flight
+	// AddMessage that races with Close writes its pending
+	// message into the closed store — at that point the DB is
+	// still open, so the write succeeds. Future AddMessage
+	// calls would be after Close and would observe the closed
+	// flag if we add such a check.
 	if err := s.Flush(); err != nil {
 		return err
 	}

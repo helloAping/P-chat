@@ -2611,6 +2611,22 @@ func (h *Handler) AddMCPServer(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required for SSE transport"})
 		return
 	}
+	// For stdio transports, require the command to be an
+	// absolute path that points to an existing executable.
+	// Without this, a typo (e.g. "pyhton" instead of "python")
+	// would only fail when the user tries to use the MCP server,
+	// with a confusing exec error. Catching it at config time
+	// produces a clearer error.
+	if body.Command != "" {
+		if !filepath.IsAbs(body.Command) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "command must be an absolute path; the MCP server runs without a shell"})
+			return
+		}
+		if info, err := os.Stat(body.Command); err != nil || info.IsDir() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("command %q is not an executable file: %v", body.Command, err)})
+			return
+		}
+	}
 	// Reject shell-interpreter invocations that could run arbitrary
 	// commands. The MCP manager execs the command verbatim; if the
 	// caller wants to run a shell pipeline they should bundle it

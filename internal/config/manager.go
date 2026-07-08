@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -92,6 +93,16 @@ func AddProvider(p ProviderConfig) error {
 	cfg, err := Load("")
 	if err != nil {
 		return err
+	}
+	// Validate name. A blank name would create a provider
+	// that can't be referenced, and a name with whitespace or
+	// path separators breaks CLI parsing and the env-var
+	// convention used by the agent.
+	if p.Name == "" {
+		return fmt.Errorf("provider name is required")
+	}
+	if strings.ContainsAny(p.Name, " \t/\\") || strings.ContainsRune(p.Name, 0) {
+		return fmt.Errorf("provider name %q contains invalid characters (no whitespace, path separators, or NUL)", p.Name)
 	}
 	for _, existing := range cfg.LLM.Providers {
 		if existing.Name == p.Name {
@@ -287,6 +298,12 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 	cfg, err := Load("")
 	if err != nil {
 		return nil, err
+	}
+	if m.Name == "" {
+		return nil, fmt.Errorf("model name is required")
+	}
+	if strings.ContainsAny(m.Name, " \t/\\") || strings.ContainsRune(m.Name, 0) {
+		return nil, fmt.Errorf("model name %q contains invalid characters (no whitespace, path separators, or NUL)", m.Name)
 	}
 	for i, p := range cfg.LLM.Providers {
 		if p.Name != providerName {
