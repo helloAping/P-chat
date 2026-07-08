@@ -68,7 +68,11 @@ func (m *Manager) SetGlobalEnabled(on bool) {
 	defer m.mu.Unlock()
 	m.globalOn = on
 	if !on {
-		for name := range m.servers {
+		for name, srv := range m.servers {
+			// Unregister the server's tools before stopping,
+			// so the LLM doesn't see dangling tool names
+			// pointing at a stopped transport.
+			m.unregisterTools(srv)
 			m.stopLocked(name)
 		}
 	} else {

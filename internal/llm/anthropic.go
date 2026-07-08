@@ -280,6 +280,16 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 }
 
 func (c *AnthropicClient) handleStreamEvent(eventType, dataJSON string, ch chan<- StreamChunk) {
+	// Strip NUL bytes before any json.Unmarshal. A misbehaving
+	// proxy occasionally injects U+0000 (often a padding
+	// artifact from C-string interop) into the data payload.
+	// Strict JSON disallows raw NUL in strings; some parsers
+	// tolerate them, but a leaked NUL in a later text chunk
+	// would be passed to the model as a real character and
+	// confuse downstream display. We strip all NULs.
+	if strings.IndexByte(dataJSON, 0) >= 0 {
+		dataJSON = strings.ReplaceAll(dataJSON, "\x00", "")
+	}
 	switch eventType {
 	case "content_block_start":
 		// Track the kind of content block by index. Anthropic

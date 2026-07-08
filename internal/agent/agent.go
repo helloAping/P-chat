@@ -58,6 +58,11 @@ type Agent struct {
 
 	// bypassOnce, when true, makes the NEXT tool call skip the
 	// sandbox check (set by /unsafe once). Reset after the call.
+	// Swap(false) is atomic, so a panic between the swap and
+	// the actual tool call consumes the bypass without using
+	// it — the user will need to re-issue /unsafe. This is the
+	// correct trade-off (better to err on the side of an extra
+	// prompt than to leak the bypass across turns).
 	bypassOnce atomic.Bool
 
 	// subagentRegistry, if non-nil, is published to the tool

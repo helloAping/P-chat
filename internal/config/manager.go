@@ -254,6 +254,10 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 	// Handle rename first because every subsequent field
 	// check needs to look at the new name.
 	if patch.Name != "" && patch.Name != oldName {
+		// Validate the new name same as AddProvider.
+		if strings.ContainsAny(patch.Name, " \t/\\") || strings.ContainsRune(patch.Name, 0) {
+			return nil, fmt.Errorf("provider name %q contains invalid characters (no whitespace, path separators, or NUL)", patch.Name)
+		}
 		for _, other := range cfg.LLM.Providers {
 			if other.Name == patch.Name {
 				return nil, fmt.Errorf("provider %q already exists", patch.Name)
@@ -273,6 +277,10 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		}
 	}
 	if patch.BaseURL != "" {
+		// Validate BaseURL is parseable, same as AddProvider.
+		if _, err := url.Parse(patch.BaseURL); err != nil {
+			return nil, fmt.Errorf("invalid base_url %q: %w", patch.BaseURL, err)
+		}
 		p.BaseURL = patch.BaseURL
 	}
 	if patch.ClearAPIKey {
@@ -310,6 +318,12 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 			continue
 		}
 		// Migrate legacy single-model form to multi-model.
+		// Reject the case where the new model name equals the
+		// legacy single-model name — that would create a
+		// duplicate entry.
+		if len(p.Models) == 0 && p.Model != "" && p.Model == m.Name {
+			return nil, fmt.Errorf("model %q already exists as the legacy single-model form for provider %q", m.Name, providerName)
+		}
 		if len(p.Models) == 0 && p.Model != "" && p.Model != m.Name {
 			p.Models = []ModelConfig{{Name: p.Model, Default: true}}
 		}
@@ -367,6 +381,11 @@ func RemoveModel(providerName, modelName string) error {
 		if wasDefault && len(p.Models) > 0 {
 			p.Models[0].Default = true
 		}
+		// If the provider is the global default, we now have a
+		// no-default state. Setting model="" would be
+		// confusing, so leave p.Model alone and let the
+		// caller explicitly choose. The agent falls back to
+		// the first model on the next send.
 		cfg.LLM.Providers[i] = p
 		mgr := NewManager()
 		return mgr.SaveGlobal(cfg)
