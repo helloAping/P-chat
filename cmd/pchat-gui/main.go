@@ -58,8 +58,6 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
-
-	"github.com/p-chat/pchat/internal/paths"
 )
 
 // loadingHTML is served by the AssetServer handler while pchat-server is
@@ -769,11 +767,11 @@ func (a *App) spawnAndWatch() {
 	// Forward both PCHAT_PORT and PCHAT_HOME so the child
 	// server binds to the port we picked AND uses the same
 	// home directory as the GUI (a sibling of the GUI binary
-	// when running from bin/ or dev-bin/ — see internal/paths
+	// when running from bin/ or dev-bin/ — see homepath.go
 	// for the resolution rules).
 	cmd.Env = append(os.Environ(),
 		"PCHAT_PORT="+strconv.Itoa(port),
-		"PCHAT_HOME="+paths.GlobalDir(),
+		"PCHAT_HOME="+resolveHomeDir(),
 	)
 	// pchat-gui is a WINDOWS_GUI subsystem binary, but Go's
 	// os/exec still allocates a fresh console for child processes
@@ -916,7 +914,9 @@ func pickFreePort() (int, error) {
 // neither exists (fresh install — pchat-server uses built-in
 // defaults).
 //
-// The home directory itself is decided by internal/paths:
+// The home directory itself is decided by resolveHomeDir() in
+// homepath.go — the GUI is its own Go module so it can't
+// import internal/paths from the root module.
 //   - $PCHAT_HOME if set
 //   - sibling of this binary if it lives in bin/ or dev-bin/
 //   - $HOME/.p-chat fallback
@@ -925,15 +925,7 @@ func pickFreePort() (int, error) {
 // it picks up is bin/.p-chat/config.json — fully isolated
 // from the user's real ~/.p-chat.
 func pickConfigPath() string {
-	jsonPath := paths.GlobalConfig()
-	yamlPath := paths.GlobalConfigYAML()
-	if _, err := os.Stat(jsonPath); err == nil {
-		return jsonPath
-	}
-	if _, err := os.Stat(yamlPath); err == nil {
-		return yamlPath
-	}
-	return ""
+	return resolveConfigPath()
 }
 
 // hideChildConsole suppresses the stray console window that Go's
