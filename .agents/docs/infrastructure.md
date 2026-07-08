@@ -114,11 +114,17 @@ RAG (检索增强生成) 实现：
 ## Paths 路径解析
 
 **位置**：`internal/paths/`  
-**文件**：`paths.go`
+**文件**：`paths.go`、`devhome.go`
 
-- `~/.p-chat/` 路径解析
-- 跨平台路径处理
-- 全局目录、数据库、上传目录等
+- 解析全局 P-Chat home 目录（`~/.p-chat/` 及其子目录）
+- 跨平台路径处理（`filepath`）
+- **dev/prod 隔离（`devhome.go`）**：`GlobalDir()` 解析顺序：
+  1. `PCHAT_HOME` 环境变量（最高优先级，手动覆盖）
+  2. 二进制文件在 `bin/` 或 `dev-bin/` 子目录 → 用 `<parent>/.p-chat/`（隔离本地测试）
+  3. 兜底：`~/.p-chat/`
+- `ResolveStrategy()` 返回当前选用的策略字符串，启动日志会打印它
+- 缓存到 `atomic.Pointer[resolved]`（首次解析后）；测试用 `SetExecutableForTest` / `SetHomeForTest` 注入
+- `EnsureGlobal()` 在解析到的目录下创建所有子目录（skills / rules / prompts / memory / tools / knowledge / uploads）
 
 ## HTTP 客户端 (CLI)
 

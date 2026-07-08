@@ -10,10 +10,30 @@ const (
 	ProjectDirName = ".p-chat"
 )
 
-// GlobalDir returns ~/.p-chat
+// GlobalDir returns the active global P-Chat home directory.
+//
+// Resolution (highest priority first):
+//  1. PCHAT_HOME env var — explicit operator override.
+//  2. Sibling of the running binary: if the binary lives in
+//     a "bin" or "dev-bin" subdirectory, use <parent>/.p-chat
+//     so a local build doesn't touch the user's real config.
+//  3. $HOME/.p-chat — the original behaviour, used by
+//     installed / release builds.
+//
+// The choice is cached for the process lifetime; to inspect
+// which strategy picked the path, call ResolveStrategy().
+//
+// Why this matters: prior to this change, every local
+// `bin/pchat-server.exe` run read and wrote the user's
+// real `~/.p-chat/`, so a developer's broken / corrupted
+// test config could blow away their actual setup. The
+// sibling rule means `bin/pchat-server.exe` and
+// `dev-bin/pchat-server.exe` each get their own isolated
+// `.p-chat` next to the binary, while installed builds
+// (which live in e.g. `C:\Program Files\pchat\pchat-server.exe`)
+// keep using `%USERPROFILE%\.p-chat`.
 func GlobalDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, GlobalDirName)
+	return resolveHome().dir
 }
 
 // ProjectDir returns .p-chat in the current working directory

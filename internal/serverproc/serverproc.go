@@ -11,10 +11,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/p-chat/pchat/internal/paths"
 )
 
 // Server wraps a pchat-server subprocess.
@@ -68,29 +69,34 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 
 	args := []string{"--config", opts.ConfigPath}
 	if opts.ConfigPath == "" {
-		// Resolve the user's default config so the child can find it.
-		// pchat config moved from yaml to json in 0.10; we try
-		// json first, then fall back to yaml for older installs.
-		if home, _ := os.UserHomeDir(); home != "" {
-			jsonPath := filepath.Join(home, ".p-chat", "config.json")
-			yamlPath := filepath.Join(home, ".p-chat", "config.yaml")
-			switch {
-			case fileExists(jsonPath):
-				args = []string{"--config", jsonPath}
-			case fileExists(yamlPath):
-				args = []string{"--config", yamlPath}
-			default:
-				// Neither file exists yet — fresh install.
-				// Don't pass --config so pchat-server uses its
-				// built-in defaults. The config file will be
-				// created on first save.
-				args = nil
-			}
+		// Resolve the active home directory so the child can
+		// find its config. pchat config moved from yaml to
+		// json in 0.10; we try json first, then fall back to
+		// yaml for older installs. The home dir itself is
+		// decided by internal/paths (env var / sibling of
+		// the binary / $HOME fallback) so a `bin/pchat-server`
+		// dev run gets its own .p-chat next to the binary.
+		jsonPath := paths.GlobalConfig()
+		yamlPath := paths.GlobalConfigYAML()
+		switch {
+		case fileExists(jsonPath):
+			args = []string{"--config", jsonPath}
+		case fileExists(yamlPath):
+			args = []string{"--config", yamlPath}
+		default:
+			// Neither file exists yet — fresh install.
+			// Don't pass --config so pchat-server uses its
+			// built-in defaults. The config file will be
+			// created on first save.
+			args = nil
 		}
 	}
 
 	cmd := exec.CommandContext(ctx, opts.ServerBin, args...)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PCHAT_PORT=%d", port))
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("PCHAT_PORT=%d", port),
+		"PCHAT_HOME="+paths.GlobalDir(),
+	)
 	if opts.WebDir != "" {
 		cmd.Env = append(cmd.Env, "PCHAT_WEB_DIR="+opts.WebDir)
 	}

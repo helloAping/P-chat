@@ -249,6 +249,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, port)
 	fmt.Printf("P-Chat Server 启动于 http://%s\n", addr)
 	log.Printf("pchat-server version=%s question-tracing=enabled", version.FullString())
+	// Surface the active home dir + the strategy that picked
+	// it. The user can grep this in bin/pchat-server.log to
+	// verify dev/prod isolation is set up the way they expect.
+	log.Printf("home dir: %s (strategy: %s)", paths.GlobalDir(), paths.ResolveStrategy())
 	return srv.RunAt(addr)
 }
 
