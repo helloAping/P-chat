@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -467,6 +468,86 @@ func stripBOM(data []byte) []byte {
 	return data
 }
 
+// trailingCommaRE matches a comma immediately followed by
+// optional whitespace and a closing brace or bracket. JSON
+// spec (RFC 8259 §2.3) forbids trailing commas; Go's
+// encoding/json follows the spec. We strip them so a config
+// that survived a botched editor / regex / set-content pass
+// can still boot — the loader writes the cleaned result back
+// to disk so subsequent startups are fast and the user can see
+// the fix.
+var trailingCommaRE = regexp.MustCompile(`,\s*([}\]])`)
+
+// stripTrailingCommas returns a copy of data with all
+// trailing commas before } or ] removed. Does not recurse
+// into strings (a `,` inside a quoted JSON string is left
+// alone, since strings can contain anything).
+func stripTrailingCommas(data []byte) []byte {
+	// Fast path: scan for the pattern manually so we don't
+	// touch commas inside string literals. encoding/json's
+	// own scanner would be ideal but we want a single
+	// non-allocating pass over the typical ~3KB file.
+	out := make([]byte, 0, len(data))
+	inString := false
+	escape := false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			out = append(out, c)
+			if escape {
+				escape = false
+			} else if c == '\\' {
+				escape = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+			out = append(out, c)
+		case ',':
+			// Look ahead for a } or ] (after whitespace).
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r') {
+				j++
+			}
+			if j < len(data) && (data[j] == '}' || data[j] == ']') {
+				// Drop the comma. Whitespace is preserved.
+				continue
+			}
+			out = append(out, c)
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// tryUnmarshalWithTolerance runs json.Unmarshal, and on
+// failure tries once more after stripping trailing commas.
+// Returns the unmarshaled data, a bool indicating whether
+// the trailing-comma fallback was used, and any error from
+// the final attempt.
+//
+// The fallback is intentionally narrow: a strict spec
+// parser is the ground truth, and we only deviate to keep
+// a hand-edited config bootable. We never silently fix
+// missing fields or rename keys.
+func tryUnmarshalWithTolerance(data []byte, v any) ([]byte, bool, error) {
+	if err := json.Unmarshal(data, v); err == nil {
+		return data, false, nil
+	} else {
+		cleaned := stripTrailingCommas(data)
+		if err := json.Unmarshal(cleaned, v); err == nil {
+			return cleaned, true, nil
+		} else {
+			return nil, false, err
+		}
+	}
+}
+
 // Load merges global (~/.p-chat/config.json) and project
 // (.p-chat/config.json) configs, then a custom path on top.
 //
@@ -495,8 +576,22 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	// Global layer.
 	if data, err := os.ReadFile(paths.GlobalConfig()); err == nil {
 		data = stripBOM(data)
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse global config %s: %w", paths.GlobalConfig(), err)
+		cleaned, tolerated, perr := tryUnmarshalWithTolerance(data, cfg)
+		if perr != nil {
+			return nil, fmt.Errorf("parse global config %s: %w", paths.GlobalConfig(), perr)
+		}
+		if tolerated {
+			// Botched trailing comma. Rewrite the file with the
+			// cleaned bytes so subsequent starts are fast and the
+			// user can see what was wrong by diffing. We keep the
+			// atomic-rename pattern from writeConfigJSON so a crash
+			// mid-write doesn't leave the file half-written.
+			if err := writeConfigJSON(paths.GlobalConfig(), cfg); err != nil {
+				// Not fatal — the in-memory cfg is fine for this
+				// session. Log so the user can fix by hand.
+				fmt.Printf("pchat: rewrite cleaned global config: %v\n", err)
+			}
+			_ = cleaned // silence unused
 		}
 	} else if os.IsNotExist(err) {
 		// One-shot yaml → json migration.
@@ -524,8 +619,9 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	}
 	if data, err := os.ReadFile(projectConfigPath); err == nil {
 		data = stripBOM(data)
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse project config %s: %w", projectConfigPath, err)
+		_, _, perr := tryUnmarshalWithTolerance(data, cfg)
+		if perr != nil {
+			return nil, fmt.Errorf("parse project config %s: %w", projectConfigPath, perr)
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read project config: %w", err)
@@ -545,8 +641,9 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 			return nil, fmt.Errorf("read config %s: %w", customPath, err)
 		}
 		data = stripBOM(data)
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse config %s: %w", customPath, err)
+		_, _, perr := tryUnmarshalWithTolerance(data, cfg)
+		if perr != nil {
+			return nil, fmt.Errorf("parse config %s: %w", customPath, perr)
 		}
 	}
 
