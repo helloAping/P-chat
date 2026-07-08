@@ -178,11 +178,11 @@ func (h *Handler) runInfoCommand(name, args string) (string, error) {
 	case "provider":
 		// /provider shows the active provider's URL/key.
 		// We don't expose the API key in plain text —mask it.
-		if h.cfg == nil {
+		if h.getCfg() == nil {
 			return "(config not loaded)", nil
 		}
-		active := h.cfg.LLM.Default
-		for _, p := range h.cfg.LLM.Providers {
+		active := h.getCfg().LLM.Default
+		for _, p := range h.getCfg().LLM.Providers {
 			if p.Name == active {
 				key := "(已设置)"
 				if p.APIKey == "" {

@@ -100,11 +100,11 @@ func baseFromResp(r knowledgeBaseResponse) config.KnowledgeBase {
 
 // GetKnowledgeConfig GET /api/v1/knowledge/config
 func (h *Handler) GetKnowledgeConfig(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
-	kc := h.cfg.Knowledge
+	kc := h.getCfg().Knowledge
 	resp := knowledgeConfigResponse{
 		Enabled:   kc.Enabled,
 		AutoIndex: kc.AutoIndex,
@@ -117,7 +117,7 @@ func (h *Handler) GetKnowledgeConfig(c *gin.Context) {
 
 // UpdateKnowledgeConfig PATCH /api/v1/knowledge/config
 func (h *Handler) UpdateKnowledgeConfig(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -145,20 +145,22 @@ func (h *Handler) UpdateKnowledgeConfig(c *gin.Context) {
 // GetKnowledgeModels GET /api/v1/knowledge/models
 // Returns all available models across all providers for knowledge-base scanning.
 func (h *Handler) GetKnowledgeModels(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
 	type modelItem struct {
 		Provider       string `json:"provider"`
+		Protocol       string `json:"protocol,omitempty"`
 		Model          string `json:"model"`
 		SupportsVision bool   `json:"supports_vision"`
 	}
 	var out []modelItem
-	for _, p := range h.cfg.LLM.Providers {
+	for _, p := range h.getCfg().LLM.Providers {
 		for _, m := range p.AllModels() {
 			out = append(out, modelItem{
 				Provider:       p.Name,
+				Protocol:       p.GetProtocol(),
 				Model:          m.Name,
 				SupportsVision: m.Capabilities.SupportsVision,
 			})
@@ -172,12 +174,12 @@ func (h *Handler) GetKnowledgeModels(c *gin.Context) {
 
 // ListKnowledgeBases GET /api/v1/knowledge/bases
 func (h *Handler) ListKnowledgeBases(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
-	out := make([]knowledgeBaseResponse, 0, len(h.cfg.Knowledge.Bases))
-	for _, b := range h.cfg.Knowledge.Bases {
+	out := make([]knowledgeBaseResponse, 0, len(h.getCfg().Knowledge.Bases))
+	for _, b := range h.getCfg().Knowledge.Bases {
 		resp := baseToResp(b)
 		// Enrich with scan job status.
 		if v, ok := scanJobs.Load(b.Name); ok {
@@ -198,7 +200,7 @@ func (h *Handler) ListKnowledgeBases(c *gin.Context) {
 
 // AddKnowledgeBase POST /api/v1/knowledge/bases
 func (h *Handler) AddKnowledgeBase(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -228,7 +230,7 @@ func (h *Handler) AddKnowledgeBase(c *gin.Context) {
 
 // RemoveKnowledgeBase DELETE /api/v1/knowledge/bases/:name
 func (h *Handler) RemoveKnowledgeBase(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -247,7 +249,7 @@ func (h *Handler) RemoveKnowledgeBase(c *gin.Context) {
 
 // ScanKnowledgeBase POST /api/v1/knowledge/bases/:name/scan
 func (h *Handler) ScanKnowledgeBase(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -282,7 +284,7 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 	if !ok {
 		// No active scan — return current section count from wiki store.
 		resp := scanProgressResp{Done: false}
-		for _, b := range h.cfg.Knowledge.Bases {
+		for _, b := range h.getCfg().Knowledge.Bases {
 			if b.Name == name {
 				store, err := knowledge.GetOrOpenWikiStore(b.Name, b.Path)
 				if err == nil {
@@ -338,7 +340,7 @@ func (h *Handler) ClearKnowledgeBase(c *gin.Context) {
 	}
 	var base config.KnowledgeBase
 	found := false
-	for _, b := range h.cfg.Knowledge.Bases {
+	for _, b := range h.getCfg().Knowledge.Bases {
 		if b.Name == name {
 			base = b
 			found = true
@@ -371,7 +373,7 @@ func (h *Handler) ListNodes(c *gin.Context) {
 	}
 	var base config.KnowledgeBase
 	found := false
-	for _, b := range h.cfg.Knowledge.Bases {
+	for _, b := range h.getCfg().Knowledge.Bases {
 		if b.Name == name {
 			base = b
 			found = true
@@ -406,7 +408,7 @@ func (h *Handler) GetNodeContent(c *gin.Context) {
 	name := c.Param("name")
 	var base config.KnowledgeBase
 	found := false
-	for _, b := range h.cfg.Knowledge.Bases {
+	for _, b := range h.getCfg().Knowledge.Bases {
 		if b.Name == name {
 			base = b
 			found = true
@@ -444,7 +446,7 @@ func (h *Handler) DeleteNode(c *gin.Context) {
 	}
 	var base config.KnowledgeBase
 	found := false
-	for _, b := range h.cfg.Knowledge.Bases {
+	for _, b := range h.getCfg().Knowledge.Bases {
 		if b.Name == name {
 			base = b
 			found = true
@@ -471,7 +473,7 @@ func (h *Handler) DeleteNode(c *gin.Context) {
 
 // SearchKnowledge POST /api/v1/knowledge/search
 func (h *Handler) SearchKnowledge(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -492,7 +494,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		req.TopK = 5
 	}
 
-	kc := h.cfg.Knowledge
+	kc := h.getCfg().Knowledge
 	if !kc.Enabled || len(kc.Bases) == 0 {
 		c.JSON(http.StatusOK, gin.H{"query": req.Query, "results": []interface{}{}})
 		return
@@ -549,7 +551,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 
 	// Grep actual files.
 	if req.Grep != "" {
-		for _, gr := range grepKB(h.cfg, req.Grep, req.TopK) {
+		for _, gr := range grepKB(h.getCfg(), req.Grep, req.TopK) {
 			if len(out) >= req.TopK {
 				break
 			}
@@ -574,10 +576,10 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 // knowledge base when Knowledge.AutoIndex is true. Safe to call even if
 // the feature is disabled or no bases are configured.
 func (h *Handler) AutoIndexKnowledgeBases() {
-	if h.cfg == nil || !h.cfg.Knowledge.AutoIndex || !h.cfg.Knowledge.Enabled {
+	if h.getCfg() == nil || !h.getCfg().Knowledge.AutoIndex || !h.getCfg().Knowledge.Enabled {
 		return
 	}
-	kc := h.cfg.Knowledge
+	kc := h.getCfg().Knowledge
 	for _, base := range kc.Bases {
 		if !base.Enabled {
 			continue
@@ -608,9 +610,9 @@ func (h *Handler) startScanJob(name string) error {
 	}
 
 	var base *config.KnowledgeBase
-	for i := range h.cfg.Knowledge.Bases {
-		if h.cfg.Knowledge.Bases[i].Name == name {
-			base = &h.cfg.Knowledge.Bases[i]
+	for i := range h.getCfg().Knowledge.Bases {
+		if h.getCfg().Knowledge.Bases[i].Name == name {
+			base = &h.getCfg().Knowledge.Bases[i]
 			break
 		}
 	}
@@ -618,7 +620,7 @@ func (h *Handler) startScanJob(name string) error {
 		return fmt.Errorf("knowledge base %q not found", name)
 	}
 
-	kc := h.cfg.Knowledge
+	kc := h.getCfg().Knowledge
 	needsReload := false
 	if !kc.Enabled {
 		kc.Enabled = true
@@ -629,7 +631,7 @@ func (h *Handler) startScanJob(name string) error {
 		needsReload = true
 	}
 	if needsReload {
-		h.cfg.Knowledge = kc
+		h.getCfg().Knowledge = kc
 		h.reloadAfterConfigChange()
 		log.Printf("[scan %s] auto-enabled knowledge base temporarily for scan (not persisted to config)", name)
 	}

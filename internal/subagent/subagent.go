@@ -923,8 +923,12 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 // subagent runner can scrub its own Result.Content
 // without taking a dependency on the agent package's
 // unexported helper. Same shape, same replacement.
+//
+// Multiple alternates catch the various phrasings different
+// models use — see phantomVisionErrorRe in agent.go for the
+// rationale. Keep in sync.
 var phantomScrubRe = regexp.MustCompile(
-	`(?is)Cannot read[\s\S]{0,400}?Inform the user\.?`,
+	`(?is)(?:Cannot|Unable to|Failed to|cannot|unable to) (?:read|view|process)[\s\S]{0,400}?[Ii]nform the user\.?`,
 )
 const phantomScrubReplacement = "（当前模型不支持读取图片。请在「设置 → 提供商/模型」中切换到支持视觉的模型（如 claude-3、gpt-4o、gemini-1.5、qwen-vl、doubao-1.5-vision-pro 等）后重新发送。）"
 

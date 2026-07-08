@@ -24,7 +24,7 @@ type AddProviderRequest struct {
 // A name collision returns 409 Conflict (not 500) so the
 // web UI can show a clear "already exists" message.
 func (h *Handler) AddProvider(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -56,12 +56,12 @@ func (h *Handler) AddProvider(c *gin.Context) {
 
 // DeleteProvider DELETE /api/v1/providers/:name
 func (h *Handler) DeleteProvider(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
 	name := c.Param("name")
-	if name == h.cfg.LLM.Default {
+	if name == h.getCfg().LLM.Default {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能删除当前默认 provider"})
 		return
 	}
@@ -103,7 +103,7 @@ type UpdateProviderRequest struct {
 // On success the response body is the updated ProviderFull so
 // the UI can re-render without a follow-up GET.
 func (h *Handler) UpdateProvider(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -146,7 +146,7 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		Protocol:  updated.GetProtocol(),
 		BaseURL:   updated.BaseURL,
 		APIKey:    updated.APIKey,
-		IsDefault: updated.Name == h.cfg.LLM.Default,
+		IsDefault: updated.Name == h.getCfg().LLM.Default,
 		Models:    updated.AllModels(),
 		Model:     updated.EffectiveModel(),
 	})
@@ -157,7 +157,7 @@ type SetDefaultProviderRequest struct{}
 
 // SetDefaultProvider POST /api/v1/providers/:name/default
 func (h *Handler) SetDefaultProvider(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -181,7 +181,7 @@ type AddModelRequest struct {
 
 // AddModel POST /api/v1/providers/:name/models
 func (h *Handler) AddModel(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -207,7 +207,7 @@ func (h *Handler) AddModel(c *gin.Context) {
 
 // DeleteModel DELETE /api/v1/providers/:name/models/:model
 func (h *Handler) DeleteModel(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -223,7 +223,7 @@ func (h *Handler) DeleteModel(c *gin.Context) {
 
 // SetDefaultModel POST /api/v1/providers/:name/models/:model/default
 func (h *Handler) SetDefaultModel(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}

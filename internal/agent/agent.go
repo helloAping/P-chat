@@ -2424,11 +2424,21 @@ func cleanMarkdownToolCalls(content string) string {
 // legitimate phantom but small enough that a multi-paragraph
 // response that happens to mention both trigger phrases won't
 // be nuked wholesale.
-// words) so a multi-paragraph assistant reply that *mentions*
-// the phrase "Cannot read ... Inform the user" in passing
-// (e.g. quoting documentation) doesn't get redacted wholesale.
+// phantomVisionErrorRe mirrors the regex used to strip Claude-style
+// "Cannot read image.png ... Inform the user." phantoms that
+// DeepSeek-trained models parrot when they encounter vision
+// attachments they can't actually decode. The cap on distance
+// (400 chars) distinguishes a phantom from a legitimate
+// "I can't read this" diagnostic in a longer response.
+//
+// Multiple alternates catch the various phrasings different
+// models use: "Cannot read" (Claude), "Unable to read" /
+// "Failed to read" (some proxies), "I cannot view" / "I can't
+// view" (OpenAI-flavoured). The trailing "Inform the user" is
+// what really identifies a phantom — real diagnostic messages
+// don't end that way.
 var phantomVisionErrorRe = regexp.MustCompile(
-	`(?is)Cannot read[\s\S]{0,400}?Inform the user\.?`,
+	`(?is)(?:Cannot|Unable to|Failed to|cannot|unable to) (?:read|view|process)[\s\S]{0,400}?[Ii]nform the user\.?`,
 )
 
 // phantomVisionErrorReplacement is the clean user-facing message

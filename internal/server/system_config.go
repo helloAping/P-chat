@@ -41,15 +41,15 @@ func limitsToResp(l config.LimitsConfig) limitsResponse {
 
 // GetSystemConfig GET /api/v1/config
 func (h *Handler) GetSystemConfig(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
 	resp := systemConfigResponse{
-		Limits: limitsToResp(h.cfg.Limits),
+		Limits: limitsToResp(h.getCfg().Limits),
 		SubAgent: subAgentResponse{
-			CacheTTL: h.cfg.SubAgent.CacheTTL,
-			Timeout:  h.cfg.SubAgent.Timeout,
+			CacheTTL: h.getCfg().SubAgent.CacheTTL,
+			Timeout:  h.getCfg().SubAgent.Timeout,
 		},
 	}
 	c.JSON(http.StatusOK, resp)
@@ -57,7 +57,7 @@ func (h *Handler) GetSystemConfig(c *gin.Context) {
 
 // UpdateSystemConfig PATCH /api/v1/config
 func (h *Handler) UpdateSystemConfig(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}

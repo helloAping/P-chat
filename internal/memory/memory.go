@@ -168,6 +168,17 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Ping verifies the underlying SQLite connection is alive.
+// Used by the /health endpoint to surface "DB wedged" as a
+// 503 to load balancers rather than serving traffic that
+// will fail at the next query. Cheap (a single SELECT 1).
+func (s *Store) Ping() error {
+	if s.closed.Load() {
+		return fmt.Errorf("store closed")
+	}
+	return s.db.Ping()
+}
+
 func ensureDir() error {
 	// Use MkdirAll on the DB path's parent.
 	dir := paths.MemoryDir()

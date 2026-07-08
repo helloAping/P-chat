@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -31,7 +32,7 @@ import (
 // sessions survive across requests.
 type Handler struct {
 	agent      *agent.Agent
-	cfg        *config.Config
+	cfg        atomic.Pointer[config.Config]
 	store      *memory.Store
 	styleMgr   *style.Manager
 	summarizer *memory.Summarizer
@@ -72,12 +73,12 @@ type sessionMetaBlob struct {
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Handler {
 	h := &Handler{
 		agent:    a,
-		cfg:      cfg,
 		store:    store,
 		styleMgr: styleMgr,
 		mcpMgr:   mcpMgr,
 		meta:     make(map[string]sessionMeta),
 	}
+	h.cfg.Store(cfg)
 	// Wire the upload resolver so the agent can read attached
 	// files by their upload id. The resolver lives in the agent
 	// (not the handler) because attachment expansion happens
@@ -85,6 +86,15 @@ func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMg
 	// handed the request to the agent.
 	a.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
 	return h
+}
+
+// getCfg returns the current config snapshot. Safe for
+// concurrent use; the underlying atomic.Pointer gives every
+// reader a consistent pointer to a specific Config value.
+// Replaces the previous direct `h.cfg` field access, which
+// was a data race with reloadAfterConfigChange.
+func (h *Handler) getCfg() *config.Config {
+	return h.cfg.Load()
 }
 
 // setSessionMeta updates the in-memory cache and, when any field
@@ -164,7 +174,7 @@ func (h *Handler) sessionProvider(id string) string {
 		return p
 	}
 	// Fall back to the configured default
-	return h.cfg.LLM.Default
+	return h.getCfg().LLM.Default
 }
 
 // sessionModel returns the per-session model name, falling back to
@@ -175,7 +185,7 @@ func (h *Handler) sessionModel(id, provider string) string {
 	if m.Model != "" {
 		return m.Model
 	}
-	for _, p := range h.cfg.LLM.Providers {
+	for _, p := range h.getCfg().LLM.Providers {
 		if p.Name == provider {
 			return p.EffectiveModel()
 		}
@@ -204,7 +214,7 @@ func (h *Handler) setSessionMetaProjectPath(id, projectPath string) {
 
 // validProvider returns true if name is a configured provider.
 func (h *Handler) validProvider(name string) bool {
-	for _, p := range h.cfg.LLM.Providers {
+	for _, p := range h.getCfg().LLM.Providers {
 		if p.Name == name {
 			return true
 		}
@@ -216,7 +226,7 @@ func (h *Handler) validProvider(name string) bool {
 // (configured models list) OR is the provider's single-model
 // legacy form (ProviderConfig.Model).
 func (h *Handler) validModel(provider, name string) bool {
-	for _, p := range h.cfg.LLM.Providers {
+	for _, p := range h.getCfg().LLM.Providers {
 		if p.Name != provider {
 			continue
 		}
@@ -520,6 +530,19 @@ type StreamEvent struct {
 // --- Health / metadata ---
 
 func (h *Handler) Health(c *gin.Context) {
+	// Probe the memory store so a load balancer or
+	// orchestrator sees unhealthy if the DB is wedged.
+	// A simple ping is enough; we don't care about
+	// business state.
+	if h.store != nil {
+		if err := h.store.Ping(); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status": "degraded",
+				"error":  "store ping failed: " + err.Error(),
+			})
+			return
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
@@ -759,7 +782,7 @@ func (h *Handler) Providers(c *gin.Context) {
 	}
 
 	providers := []providerInfo{}
-	for _, p := range h.cfg.LLM.Providers {
+	for _, p := range h.getCfg().LLM.Providers {
 		raw := p.AllModels()
 		ms := make([]modelInfo, 0, len(raw))
 		for _, m := range raw {
@@ -772,7 +795,7 @@ func (h *Handler) Providers(c *gin.Context) {
 			Name:      p.Name,
 			Model:     p.EffectiveModel(),
 			Protocol:  p.GetProtocol(),
-			IsDefault: p.Name == h.cfg.LLM.Default,
+			IsDefault: p.Name == h.getCfg().LLM.Default,
 			Models:    ms,
 		})
 	}
@@ -884,7 +907,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	// (deleted) provider/model.
 	provider := req.Provider
 	if provider == "" {
-		provider = h.cfg.LLM.Default
+		provider = h.getCfg().LLM.Default
 	}
 	if !h.validProvider(provider) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unknown provider %q", provider)})
@@ -892,7 +915,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 	model := req.Model
 	if model == "" {
-		for _, p := range h.cfg.LLM.Providers {
+		for _, p := range h.getCfg().LLM.Providers {
 			if p.Name == provider {
 				model = p.EffectiveModel()
 				break
@@ -1814,7 +1837,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		s = style.Style(h.sessionStyle(id))
 	}
 	if s == "" {
-		if def := style.Style(h.cfg.Style.Default); def != "" {
+		if def := style.Style(h.getCfg().Style.Default); def != "" {
 			s = def
 		} else {
 			s = style.Tech
@@ -2143,11 +2166,11 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 	m := h.ensureMetaLoaded(cv.ID)
 	provider := m.Provider
 	if provider == "" {
-		provider = h.cfg.LLM.Default
+		provider = h.getCfg().LLM.Default
 	}
 	model := m.Model
 	if model == "" {
-		for _, p := range h.cfg.LLM.Providers {
+		for _, p := range h.getCfg().LLM.Providers {
 			if p.Name == provider {
 				model = p.EffectiveModel()
 				break
@@ -2457,8 +2480,8 @@ func (h *Handler) RemoveProject(c *gin.Context) {
 // When LimitsConfig.MaxStoredMessages is set (> 0) it takes precedence.
 // Otherwise the limit is max(50, contextWindow / 2000), capped at 1000.
 func (h *Handler) contextMessageLimit(provider, model string) int {
-	if h.cfg != nil && h.cfg.Limits.MaxStoredMessages > 0 {
-		return h.cfg.Limits.MaxStoredMessages
+	if h.getCfg() != nil && h.getCfg().Limits.MaxStoredMessages > 0 {
+		return h.getCfg().Limits.MaxStoredMessages
 	}
 	ctxWin := 0
 	if h.agent != nil && provider != "" && model != "" {
@@ -2482,14 +2505,14 @@ func (h *Handler) contextMessageLimit(provider, model string) int {
 // config-mutating handler (AddProvider, SetCapabilities, ...) so the
 // changes take effect on the next request.
 func (h *Handler) reloadAfterConfigChange() {
-	if h.cfg == nil {
+	if h.cfg.Load() == nil {
 		return
 	}
 	cfg, err := config.Load("")
 	if err != nil {
 		return
 	}
-	h.cfg = cfg
+	h.cfg.Store(cfg)
 	if h.agent == nil {
 		return
 	}
@@ -2751,10 +2774,10 @@ func (h *Handler) persistMCPServers() {
 			Timeout: timeoutStr,
 		})
 	}
-	h.cfg.MCP.Servers = servers
-	h.cfg.MCP.Enabled = h.mcpMgr.GlobalEnabled()
+	h.getCfg().MCP.Servers = servers
+	h.getCfg().MCP.Enabled = h.mcpMgr.GlobalEnabled()
 	if mgr := config.NewManager(); mgr != nil {
-		if err := mgr.SaveGlobal(h.cfg); err != nil {
+		if err := mgr.SaveGlobal(h.getCfg()); err != nil {
 			log.Printf("[mcp] persist config: %v", err)
 		}
 	}
