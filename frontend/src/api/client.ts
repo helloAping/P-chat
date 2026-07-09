@@ -134,12 +134,20 @@ export type MessagePart =
       kind: 'question'
       text: string       // questions JSON
       name?: string      // answers JSON (when answered)
+      // Lifecycle: "open" = the LLM is waiting for the user
+      // to pick; "ok" = user has answered (Name carries the
+      // answers JSON); "error" = round ended without an
+      // answer (timeout / cancel). Defaults to "open" when
+      // the part is loaded from older history that didn't
+      // persist the field.
+      question_status?: 'open' | 'ok' | 'error'
     }
 
 export type SubAgentPart = Extract<MessagePart, { kind: 'sub_agent' }>
 export type ToolPart = Extract<MessagePart, { kind: 'tool' }>
 export type TextPart = Extract<MessagePart, { kind: 'text' }>
 export type ThinkingPart = Extract<MessagePart, { kind: 'thinking' }>
+export type QuestionPart = Extract<MessagePart, { kind: 'question' }>
 
 export interface TodoItem {
   id: string
@@ -943,8 +951,48 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   // Network Access friction from the wails.localhost origin and
   // times out. The Go binding is a direct in-process call — no
   // CORS, no buffering beyond the standard chunked transfer.
-  const { StreamMessages, CancelStream } = await import('../../wailsjs/go/main/App')
-  const { EventsOn, EventsOff } = await import('../../wailsjs/runtime/runtime')
+  //
+  // Browser fallback: when the Wails runtime isn't available
+  // (e.g. dev server with PCHAT_WEB_DIR pointing at web/, or a
+  // user opening the app in a plain browser tab to smoke-test
+  // the question modal), EventsOn's stub ends up calling
+  // `window.runtime.EventsOnMultiple(...)` which throws
+  // "Cannot read properties of undefined (reading
+  // 'EventsOnMultiple')" the moment it runs. The Wails
+  // shim defines the function but its body is a hard runtime
+  // dereference — so checking `typeof === 'function'` is a
+  // false positive. We probe by *calling* the function with
+  // a no-op handler; if it throws, the runtime is unavailable
+  // and we fall back to direct fetch() against the same-origin
+  // backend. The browser preview path is good enough for
+  // visual testing (pchat-server's c.Stream flushes after
+  // every event, so the SSE body streams live without the
+  // Wails-side buffering that motivated the original Go
+  // binding).
+  let hasWails = false
+  try {
+    const wailsRuntime = await import('../../wailsjs/runtime/runtime')
+    const wailsApp = await import('../../wailsjs/go/main/App')
+    // Probe EventsOn: if `window.runtime` is undefined, the
+    // call throws synchronously and we land in catch.
+    wailsRuntime.EventsOn('__pchat_probe__', () => {})
+    // Also confirm StreamMessages is callable; some Wails
+    // builds export a stub that throws on call.
+    if (typeof wailsApp.StreamMessages === 'function') {
+      hasWails = true
+    }
+  } catch {
+    hasWails = false
+  }
+
+  if (!hasWails) {
+    return streamMessagesViaFetch(sessionId, opts)
+  }
+
+  const wailsRuntime = await import('../../wailsjs/runtime/runtime')
+  const wailsApp = await import('../../wailsjs/go/main/App')
+  const { EventsOn, EventsOff } = wailsRuntime
+  const { StreamMessages, CancelStream } = wailsApp
 
   const body = JSON.stringify({
     message: opts.message,
@@ -1008,6 +1056,86 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   }
   offEvent()
   offEnd()
+}
+
+// streamMessagesViaFetch is the same-origin fetch() fallback used
+// when the Wails runtime is unavailable. The server's handler.go
+// streaming endpoint emits `data: <json>\n\n` per event and
+// flushes after every event, so the body streams live without
+// buffering (this is the exact constraint that motivated the
+// Wails binding originally; pchat-server's c.Stream + Flusher
+// honors it on the server side).
+//
+// We parse the SSE envelope locally and forward each event
+// payload to opts.onEvent the same way the Wails path does, so
+// the chat store's appendStreamEvent handler is unchanged. No
+// session id wrapping is needed here (the server is the one
+// originating the stream for this request, so the events
+// already belong to this session).
+async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Promise<void> {
+  const base = directBackendURL()
+  const url = `${base}/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`
+  const body = JSON.stringify({
+    message: opts.message,
+    provider: opts.provider,
+    model: opts.model,
+    style: opts.style,
+    attachments: opts.attachments,
+    skill_context: opts.skill_context || '',
+  })
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    body,
+    signal: opts.signal,
+  })
+  if (!resp.ok || !resp.body) {
+    throw new Error(`stream: HTTP ${resp.status}: ${resp.statusText}`)
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buf = ''
+  let dataBuf = ''
+  let done = false
+
+  while (!done) {
+    const r = await reader.read()
+    done = r.done
+    if (r.value) {
+      buf += decoder.decode(r.value, { stream: true })
+    }
+    // Drain complete `data: ...\n\n` blocks from the buffer.
+    let nl: number
+    while ((nl = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, nl)
+      buf = buf.slice(nl + 2)
+      // Parse the block — gather every `data: …` line.
+      dataBuf = ''
+      for (const line of block.split('\n')) {
+        if (line.startsWith('data:')) {
+          if (dataBuf.length > 0) dataBuf += '\n'
+          dataBuf += line.slice(5).trimStart()
+        }
+      }
+      const data = dataBuf.trim()
+      if (!data || data === '[DONE]') continue
+      let ev: StreamEvent
+      try { ev = JSON.parse(data) as StreamEvent } catch {
+        console.warn('SSE parse error', 'raw:', data.slice(0, 200))
+        continue
+      }
+      try {
+        opts.onEvent(ev)
+      } catch (inner) {
+        console.warn('[stream] event handler threw, continuing:', inner)
+      }
+    }
+  }
 }
 
 // streamWithRetry wraps streamMessages with up to 2 reconnect
