@@ -103,4 +103,6 @@ export {
   XCircle,
   AlertCircle,
   Triangle,
+  ShieldAlert,
+  ShieldCheck,
 } from 'lucide-vue-next'

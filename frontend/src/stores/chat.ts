@@ -86,7 +86,18 @@ export const state = reactive({
   // while the user is viewing another session, so the global
   // flag had to go.
   pendingQuestion: {} as Record<string, { questions: QuestionItem[] }>,
-  pendingConfirm: {} as Record<string, Array<{ toolName: string; args: string; reason: string; resolve: (approved: boolean) => void }>>,
+  pendingConfirm: {} as Record<string, Array<{
+  toolName: string
+  args: string
+  reason: string
+  // 2026-07: extended ConfirmRequest fields. All optional
+  // for backward-compat with old server versions that
+  // don't emit them.
+  resolvedPath?: string
+  pathClass?: string
+  riskLevel?: string
+  resolve: (approved: boolean) => void
+}>>,
   pendingPlanText: {} as Record<string, string>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
@@ -1458,13 +1469,27 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
     case 'tool_confirm':
       if (ev.tool_confirm_json) {
         try {
-          const cfm = JSON.parse(ev.tool_confirm_json) as { tool_name: string; args: string; reason: string }
+          // 2026-07: the server now emits more fields on
+          // the confirm payload. We parse the optional
+          // ones defensively so an older server that
+          // doesn't send them still works.
+          const cfm = JSON.parse(ev.tool_confirm_json) as {
+            tool_name: string
+            args: string
+            reason: string
+            resolved_path?: string
+            path_class?: string
+            risk_level?: string
+          }
           new Promise<boolean>((resolve) => {
             if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
             state.pendingConfirm[id].push({
               toolName: cfm.tool_name,
               args: cfm.args,
               reason: cfm.reason,
+              resolvedPath: cfm.resolved_path,
+              pathClass: cfm.path_class,
+              riskLevel: cfm.risk_level,
               resolve,
             })
           }).then((approved) => {

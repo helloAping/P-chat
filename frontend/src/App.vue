@@ -11,7 +11,7 @@
 
 import { computed, onMounted, ref, watch } from 'vue'
 import {
-  NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider, NModal, NButton, NSpace,
+  NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
   darkTheme, lightTheme, useOsTheme,
   type GlobalTheme,
 } from 'naive-ui'
@@ -22,7 +22,8 @@ import AppSettingsModal from './components/AppSettingsModal.vue'
 import ImageLightbox from './components/ImageLightbox.vue'
 import PlanReviewModal from './components/PlanReviewModal.vue'
 import QuestionModal from './components/QuestionModal.vue'
-import { state, loadSessions, loadProviders, loadProjects, submitToolConfirm, currentPendingConfirm, currentPendingQuestion } from './stores/chat'
+import ToolConfirmModal from './components/ToolConfirmModal.vue'
+import { state, loadSessions, loadProviders, loadProjects, currentPendingQuestion } from './stores/chat'
 
 const showAppSettings = ref(false)
 
@@ -169,31 +170,9 @@ onMounted(async () => {
               v-if="showAppSettings"
               v-model:show="showAppSettings"
             />
-            <NModal
-              :show="!!currentPendingConfirm"
-              preset="card"
-              title="确认工具调用"
-              style="width: 440px"
-              :closable="false"
-              :mask-closable="false"
-            >
-              <div style="display:flex;flex-direction:column;gap:12px">
-                <p style="margin:0">
-                  沙箱检测到敏感操作：
-                  <strong>{{ currentPendingConfirm?.toolName }}</strong>
-                </p>
-                <pre style="margin:0;padding:8px;background:var(--bg-2);border-radius:4px;font-size:12px;max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-all">{{ currentPendingConfirm?.args }}</pre>
-                <p v-if="currentPendingConfirm?.reason" style="margin:0;font-size:12px;color:var(--warn)">
-                  匹配规则：{{ currentPendingConfirm?.reason }}
-                </p>
-                <NSpace justify="end">
-                  <NButton @click="submitToolConfirm(false)">拒绝</NButton>
-                  <NButton type="primary" @click="submitToolConfirm(true)">允许执行</NButton>
-                </NSpace>
-              </div>
-              </NModal>
-              <PlanReviewModal />
-              <QuestionModal />
+            <ToolConfirmModal />
+            <PlanReviewModal />
+            <QuestionModal />
             </div>
         </NNotificationProvider>
       </NDialogProvider>
