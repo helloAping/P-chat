@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -93,6 +94,33 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 		return QuestionResponse{}, ctx.Err()
 	case resp := <-ch:
 		log.Printf("[question] received answer (session=%s, %d answers)", sessionID, len(resp.Answers))
+		// Emit a second question event with the result-with-
+		// answers shape so the agent's partsAccumulator can
+		// flip the trailing open question part in place to
+		// status="ok" + Name=answers. Without this, the part
+		// stays at status="open" + Name="" in the persisted
+		// snapshot, so a session reload shows "等待回答" with
+		// no highlighted picks — even though the user did
+		// answer. The frontend's `submitQuestionAnswer` does
+		// the same in the live session's in-memory state, but
+		// it cannot reach the server-side partsAcc; this
+		// second sendFn closes the round-trip.
+		//
+		// Skipped when the user submitted with zero answers
+		// (e.g. SubmitAnswer called with an empty map) — in
+		// that case the trailing open question part is left
+		// as "open" on purpose, matching the live UI which
+		// also shows "等待回答" until something is selected.
+		//
+		// The partsAcc recognises the {"questions":...,
+		// "answers":...} shape and updates the trailing open
+		// question part in place. See
+		// internal/agent/parts.go:471-541.
+		if sendFn != nil && len(resp.Answers) > 0 {
+			data, _ := json.Marshal(resp)
+			log.Printf("[question] sending answers to eventCh (session=%s, %d answers)", sessionID, len(resp.Answers))
+			sendFn(string(data))
+		}
 		return resp, nil
 	case <-time.After(5 * time.Minute):
 		log.Printf("[question] timeout (session=%s)", sessionID)
@@ -109,12 +137,33 @@ func SubmitAnswer(sessionID string, resp QuestionResponse) bool {
 	if !ok {
 		return false
 	}
+	// Diagnostic: log the actual answer keys so a future
+	// key-mismatch bug (the modal sending question text
+	// instead of header) is immediately visible. The LLM
+	// reads answers by header (Anthropic contract), so
+	// any key not matching a question's `header` is a
+	// silent failure that makes the LLM think the user
+	// did not answer and re-ask the question — a loop.
+	if len(resp.Answers) == 0 {
+		log.Printf("[question] WARNING SubmitAnswer: 0 answers (session=%s) — LLM will treat as \"user did not answer\" and may loop", sessionID)
+	} else {
+		log.Printf("[question] SubmitAnswer keys=%v (session=%s)", sortedKeys(resp.Answers), sessionID)
+	}
 	select {
 	case ch <- resp:
 		return true
 	default:
 		return false
 	}
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func handleQuestion(ctx context.Context, argsRaw json.RawMessage) (*CallResult, error) {
