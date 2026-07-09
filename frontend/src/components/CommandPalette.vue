@@ -119,8 +119,8 @@ const filtered = computed(() => {
   flex-shrink: 0;
 }
 .cmd-group.group-skill {
-  background: rgba(99,139,248,0.15);
-  color: #638bf8;
+  background: var(--brand-50);
+  color: var(--brand-500);
   font-weight: 500;
 }
 </style>

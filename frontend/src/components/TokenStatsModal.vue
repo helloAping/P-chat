@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { NModal, NScrollbar, NSpin, NButton, NCard, useMessage } from 'naive-ui'
+import { ArrowDown, ArrowUp } from './icons'
 import * as api from '../api/client'
 import type { TokenStat } from '../api/client'
 
@@ -73,7 +74,7 @@ onMounted(loadStats)
             <div class="stat-title">{{ s.conversation_title || '(无标题)' }}</div>
             <div class="stat-meta">
               <span>消息 {{ s.msg_count }} 条</span>
-              <span>{{ fmtTokens(s.tokens_in) }}↓ / {{ fmtTokens(s.tokens_out) }}↑</span>
+              <span>{{ fmtTokens(s.tokens_in) }}<ArrowDown :size="11" /> / {{ fmtTokens(s.tokens_out) }}<ArrowUp :size="11" /></span>
               <span class="stat-time">{{ formatTime(s.updated_at) }}</span>
             </div>
           </div>

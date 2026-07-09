@@ -295,3 +295,8 @@ dev-bin/.p-chat/
 # Hand-edited config backups left behind by the trailing-comma
 # recovery pass (see internal/config/config.go).
 *.fixedbak
+
+# MCP Playwright caches local browser state and DOM snapshots
+# here while a session is live. We don't commit it; users
+# regenerate it on each /playwright-mcp run.
+.playwright-mcp/

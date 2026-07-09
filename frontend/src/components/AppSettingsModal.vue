@@ -26,12 +26,31 @@ import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
   NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree, useMessage,
 } from 'naive-ui'
+import {
+  X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash,
+  Cpu, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe,
+} from './icons'
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion } from '../stores/chat'
 import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
+import AppSettingsLayout from './AppSettingsLayout.vue'
 
 const message = useMessage()
+
+// Two-way bind for the modal's open/close state. App.vue
+// passes `show` and listens to `update:show` so toggling the
+// X close button (or pressing Esc) actually unmounts the
+// component via App.vue's v-if. Before PR #8, this emit
+// wasn't declared at all, so clicking X did nothing visible
+// until the user navigated away and back.
+const emit = defineEmits<{
+  (e: 'update:show', v: boolean): void
+}>()
+
+function close() {
+  emit('update:show', false)
+}
 
 // ---- 风格样例模板 ----
 const EXAMPLE_SCENARIOS = ['编程', '日常工作', '角色扮演'] as const
@@ -148,7 +167,33 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge'>('providers')
+const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch'>('providers')
+
+// Modal visibility (v-model). The default is `true` so that
+// when App.vue mounts this component (it only mounts when
+// `showAppSettings` is true), the layout is visible without
+// an extra tick. When the user closes the X, the layout
+// emits `update:show=false` and the parent re-renders with
+// the new value.
+const show = ref(true)
+
+// settingsTabs feeds AppSettingsLayout's left nav. The order
+// here is also the visual order in the nav. Each entry binds
+// a tab name (the same name used in NTabPane) to a lucide
+// icon + label. Adding a new settings section means adding
+// a tab here, a NTabPane below, and the corresponding
+// content — the rest of the layout picks it up
+// automatically.
+const settingsTabs = [
+  { name: 'providers', label: 'LLM 提供商',  icon: Cpu,      description: 'API key 与模型管理' },
+  { name: 'styles',    label: '风格',          icon: Palette,  description: '人格与记忆模板' },
+  { name: 'system',    label: '系统',          icon: SettingsIcon, description: '限额、子代理、行为' },
+  { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话' },
+  { name: 'skills',    label: '技能',          icon: Wrench,   description: '可加载的技能包' },
+  { name: 'mcp',       label: 'MCP',           icon: Terminal, description: 'Model Context Protocol 服务器' },
+  { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索' },
+  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商' },
+]
 
 // --- Provider state ---
 const providers = ref<api.ProviderInfo[]>([])
@@ -705,8 +750,6 @@ async function onDeleteStyle(id: string) {
   }
 }
 
-function close() { (window as any).closeAppSettings?.() }
-
 onBeforeUnmount(() => {
   for (const timer of Object.values(kbScanTimers)) {
     clearInterval(timer as number)
@@ -1131,24 +1174,27 @@ const kbTreeNodeData = computed<any[]>(() => {
 })
 
 function nodeIcon(level: number) {
-  return level === 1 ? '📋' : level === 2 ? '📄' : '§'
+  if (level === 1) return Clipboard
+  if (level === 2) return File
+  return Hash
 }
 
 function renderTreeLabel({ option }: any) {
   const n = option.nodeData as api.NodeTreeItem
+  const Icon = nodeIcon(n.level)
   if (n.level === 1) {
-    return h('span', { class: 'kb-tree-label l1' }, [h('span', { class: 'kb-tree-icon' }, '📋'), n.title])
+    return h('span', { class: 'kb-tree-label l1' }, [h(Icon, { size: 14, class: 'kb-tree-icon' }), n.title])
   }
   if (n.level === 2) {
     return h('span', { class: 'kb-tree-label l2' }, [
-      h('span', { class: 'kb-tree-icon' }, '📄'),
+      h(Icon, { size: 14, class: 'kb-tree-icon' }),
       h('span', { class: 'kb-tree-label-text' }, n.title),
       n.kind ? h('span', { class: 'kb-tree-label-tag' }, n.kind) : null,
       n.child_count > 0 ? h('span', { class: 'kb-tree-label-cnt' }, `${n.child_count}`) : null,
     ])
   }
   return h('span', { class: 'kb-tree-label l3' }, [
-    h('span', { class: 'kb-tree-icon' }, '§'),
+    h(Icon, { size: 14, class: 'kb-tree-icon' }),
     h('span', { class: 'kb-tree-label-text' }, n.title || '(无标题)'),
     n.content_count > 0 ? h('span', { class: 'kb-tree-label-cnt' }, `${n.content_count}`) : null,
   ])
@@ -1163,7 +1209,9 @@ function renderTreeSuffix({ option }: any) {
     placement: 'left-start',
     onPositiveClick: (e: Event) => { e.stopPropagation(); onDeleteNode(n.id) },
   }, {
-    trigger: () => h(NButton, { size: 'tiny', quaternary: true, type: 'error', onClick: (e: Event) => e.stopPropagation() }, { default: () => '🗑' }),
+    trigger: () => h(NButton, { size: 'tiny', quaternary: true, type: 'error', onClick: (e: Event) => e.stopPropagation() }, {
+      default: () => h(Trash2, { size: 12 }),
+    }),
     default: () => `确定删除「${n.title}」${n.level === 2 ? '及其所有章节和内容' : '及其内容'}？`,
   })
 }
@@ -1369,7 +1417,10 @@ const mediaTypeOptions = [
 
 const kbModelOptions = computed(() => [
   { label: '纯文本解析（推荐，零 API 消耗）', value: '' },
-  ...kbModels.value.map(m => ({ label: `${m.provider} / ${m.model}${m.supports_vision ? ' 👁' : ''}`, value: `${m.provider}/${m.model}` })),
+  ...kbModels.value.map(m => {
+    const suffix = m.supports_vision ? ' · 视觉' : ''
+    return { label: `${m.provider} / ${m.model}${suffix}`, value: `${m.provider}/${m.model}` }
+  }),
 ])
 
 function scanLabel(name: string) {
@@ -1387,8 +1438,29 @@ function kbModelSupportsVision(scanModel: string) {
 }
 </script>
 <template>
-  <NModal :show="true" @update:show="close" preset="card" title="应用设置" style="width: 920px; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column">
-    <NTabs v-model:value="tab" type="line" animated style="flex: 1; min-height: 0; display: flex; flex-direction: column">
+  <!-- AppSettingsLayout (PR #8) provides the new shell:
+       200px left nav + sticky header + content area. The
+       old top-tab NTabs is kept INSIDE the layout slot
+       purely as a content container — its tab bar is hidden
+       via the .settings-no-bar class on the wrapper, and
+       the nav column drives the active pane via the same
+       `tab` ref both v-models share. show is v-modeled to
+       App.vue so closing the X actually unmounts the
+       component (rather than just hiding the layout). -->
+  <AppSettingsLayout
+    v-model:show="show"
+    v-model:current="tab"
+    :tabs="settingsTabs"
+    title="应用设置"
+    @close="close"
+  >
+    <NTabs
+      v-model:value="tab"
+      type="line"
+      animated
+      class="settings-no-bar"
+      style="flex: 1; min-height: 0; display: flex; flex-direction: column;"
+    >
       <NTabPane name="providers" tab="LLM 提供商" style="flex: 1; min-height: 0; overflow: auto">
         <div class="providers-split">
           <!-- Left: provider list -->
@@ -1427,7 +1499,9 @@ function kbModelSupportsVision(scanModel: string) {
                     negative-text="取消"
                   >
                     <template #trigger>
-                      <NButton size="tiny" quaternary type="error" @click.stop title="删除供应商" class="provider-del-btn">✕</NButton>
+                      <NButton size="tiny" quaternary type="error" @click.stop title="删除供应商" class="provider-del-btn">
+                        <X :size="12" />
+                      </NButton>
                     </template>
                     确定删除 "{{ p.name }}" 及其下所有模型？
                   </NPopconfirm>
@@ -1437,120 +1511,149 @@ function kbModelSupportsVision(scanModel: string) {
                   <span class="muted">{{ p.models?.length || 0 }} 模型</span>
                 </div>
               </div>
-              <div v-if="providers.length === 0" class="muted empty-hint">还没有 provider</div>
+              <div v-if="providers.length === 0" class="settings-empty">还没有 provider</div>
             </div>
           </div>
 
           <!-- Right: detail pane -->
           <div class="provider-detail">
-            <div v-if="!selected" class="muted empty-hint">← 选择左侧的 provider</div>
+            <div v-if="!selected" class="settings-empty">← 选择左侧的 provider</div>
             <template v-else>
-              <!-- Basic info form -->
-              <div class="detail-section">
-                <div class="detail-section-head">
-                  <h3 class="section-title">基本信息</h3>
-                  <NSpace>
+              <!-- Basic info form. PR #9: refactored to use
+                   the unified .settings-section +
+                   .settings-form pattern. The old
+                   .detail-section / .detail-form / NSpace
+                   wrappers produced inconsistent spacing;
+                   the new classes give 14px row gap, 6px
+                   label-to-input gap, and a 1px border under
+                   the section header. -->
+              <div class="settings-section">
+                <div class="settings-section-header">
+                  <h3 class="settings-section-title">基本信息</h3>
+                  <div class="settings-form-actions">
+                    <NButton size="small" @click="hydrateEditForm(selected.name)" :disabled="dirty.size === 0">重置</NButton>
                     <NButton size="small" @click="onSaveProvider" type="primary" :disabled="dirty.size === 0">
                       保存
                     </NButton>
-                    <NButton size="small" @click="hydrateEditForm(selected.name)" :disabled="dirty.size === 0">重置</NButton>
-                  </NSpace>
+                  </div>
                 </div>
-                <div class="detail-form">
-                  <NSpace vertical size="small">
-                    <div class="form-row">
-                      <span class="form-label">名称</span>
-                      <NInput
-                        v-model:value="editName"
-                        size="small"
-                        :status="dirty.has('name') && editName.trim() === selected.name ? 'warning' : undefined"
-                        @update:value="markDirty('name')"
-                      />
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">协议</span>
-                      <NSelect
-                        v-model:value="editProtocol"
-                        :options="protocolOptions"
-                        size="small"
-                        @update:value="markDirty('protocol')"
-                      />
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">Base URL</span>
-                      <NInput
-                        v-model:value="editBaseURL"
-                        size="small"
-                        placeholder="https://api.openai.com/v1"
-                        @update:value="markDirty('base_url')"
-                      />
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">API Key</span>
-                      <NInput
-                        v-model:value="editAPIKey"
-                        size="small"
-                        type="password"
-                        show-password-on="click"
-                        placeholder="sk-..."
-                        @update:value="markDirty('api_key')"
-                      />
-                    </div>
-                    <div class="form-row">
-                      <span class="form-label">设为默认</span>
+                <p class="settings-section-description">
+                  提供商的基础信息。点击「保存」将修改持久化到本地数据库。
+                </p>
+                <div class="settings-form">
+                  <div class="settings-form-row">
+                    <label class="settings-form-label">名称</label>
+                    <NInput
+                      v-model:value="editName"
+                      size="small"
+                      :status="dirty.has('name') && editName.trim() === selected.name ? 'warning' : undefined"
+                      @update:value="markDirty('name')"
+                    />
+                    <span class="settings-form-hint">本地唯一标识，新建后不可改</span>
+                  </div>
+                  <div class="settings-form-row">
+                    <label class="settings-form-label">协议</label>
+                    <NSelect
+                      v-model:value="editProtocol"
+                      :options="protocolOptions"
+                      size="small"
+                      @update:value="markDirty('protocol')"
+                    />
+                    <span class="settings-form-hint">OpenAI 兼容 / Anthropic / 自定义</span>
+                  </div>
+                  <div class="settings-form-row">
+                    <label class="settings-form-label">Base URL</label>
+                    <NInput
+                      v-model:value="editBaseURL"
+                      size="small"
+                      placeholder="https://api.openai.com/v1"
+                      @update:value="markDirty('base_url')"
+                    />
+                    <span class="settings-form-hint">API endpoint，OpenAI 兼容服务可填自有地址</span>
+                  </div>
+                  <div class="settings-form-row">
+                    <label class="settings-form-label">API Key</label>
+                    <NInput
+                      v-model:value="editAPIKey"
+                      size="small"
+                      type="password"
+                      show-password-on="click"
+                      placeholder="sk-..."
+                      @update:value="markDirty('api_key')"
+                    />
+                    <span class="settings-form-hint">留空保留原值，点击眼睛图标可临时显示</span>
+                  </div>
+                  <div class="settings-form-row">
+                    <div class="settings-form-toggle">
                       <NSwitch
                         :value="editIsDefault"
                         :disabled="selected.is_default"
                         @update:value="(v: boolean) => { editIsDefault = v; markDirty('is_default') }"
                       />
-                      <span v-if="selected.is_default" class="muted form-hint">当前已是默认</span>
+                      <label class="settings-form-label" for="provider-default-switch">设为默认</label>
                     </div>
-                  </NSpace>
+                    <span v-if="selected.is_default" class="settings-form-hint">当前已是默认</span>
+                    <span v-else class="settings-form-hint">未选 provider 时使用第一个可用的</span>
+                  </div>
                 </div>
               </div>
 
               <!-- Model table -->
-              <div class="detail-section">
-                <div class="detail-section-head">
-                  <h3 class="section-title">模型 ({{ selected.models?.length || 0 }})</h3>
-                  <NSpace size="small">
-                    <NButton size="small" type="primary" ghost @click="onShowAddModel">
-                      {{ showAddModel ? '取消' : '+ 添加模型' }}
-                    </NButton>
+              <!-- Model table. PR #9: same .settings-section
+                   treatment as the basic info form. The
+                   add-model form is wrapped in a
+                   .settings-card so it visually separates
+                   from the existing model list below it. -->
+              <div class="settings-section">
+                <div class="settings-section-header">
+                  <h3 class="settings-section-title">模型 ({{ selected.models?.length || 0 }})</h3>
+                  <div class="settings-form-actions">
                     <NButton size="small" @click="onFetchUpstreamModels" :loading="fetchingUpstream">
                       获取模型
                     </NButton>
-                  </NSpace>
+                    <NButton size="small" type="primary" ghost @click="onShowAddModel">
+                      {{ showAddModel ? '取消' : '+ 添加模型' }}
+                    </NButton>
+                  </div>
                 </div>
-                <div v-if="showAddModel" class="add-form">
-                  <NSpace vertical size="small">
-                    <div v-if="editingModelName" class="muted form-hint">编辑模型: <code>{{ editingModelName }}</code></div>
-                    <NInput
-                      v-model:value="editModelName"
-                      :disabled="!!editingModelName"
-                      placeholder="模型 ID (例: gpt-4o-mini)"
-                      size="small"
-                    />
-                    <NInput v-model:value="editModelDisplay" placeholder="显示名 (例: GPT-4o mini)" size="small" />
-                    <div class="form-row">
-                      <span class="form-label">上下文 (tokens)</span>
-                      <NInputNumber v-model:value="editModelCtx" :min="0" :step="1024" placeholder="例: 128000" size="small" style="flex: 1" />
+                <div v-if="showAddModel" class="settings-card">
+                  <div class="settings-form">
+                    <div v-if="editingModelName" class="settings-form-hint">编辑模型: <code>{{ editingModelName }}</code></div>
+                    <div class="settings-form-row">
+                      <label class="settings-form-label">模型 ID</label>
+                      <NInput
+                        v-model:value="editModelName"
+                        :disabled="!!editingModelName"
+                        placeholder="例: gpt-4o-mini"
+                        size="small"
+                      />
                     </div>
-                    <div class="form-row">
-                      <span class="form-label">最大输出 (tokens)</span>
-                      <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="例: 4096" size="small" style="flex: 1" />
+                    <div class="settings-form-row">
+                      <label class="settings-form-label">显示名</label>
+                      <NInput v-model:value="editModelDisplay" placeholder="例: GPT-4o mini" size="small" />
                     </div>
-                    <div class="form-row">
-                      <span class="form-label">支持视觉</span>
-                      <NSwitch v-model:value="editModelVision" />
+                    <div class="settings-form-row">
+                      <label class="settings-form-label">上下文 (tokens)</label>
+                      <NInputNumber v-model:value="editModelCtx" :min="0" :step="1024" placeholder="例: 128000" size="small" />
                     </div>
-                    <NSpace>
+                    <div class="settings-form-row">
+                      <label class="settings-form-label">最大输出 (tokens)</label>
+                      <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="例: 4096" size="small" />
+                    </div>
+                    <div class="settings-form-row">
+                      <div class="settings-form-toggle">
+                        <NSwitch v-model:value="editModelVision" />
+                        <label class="settings-form-label" for="model-vision-switch">支持视觉输入</label>
+                      </div>
+                      <span class="settings-form-hint">开启后用户可发送图片附件</span>
+                    </div>
+                    <div class="settings-form-actions">
+                      <NButton size="small" @click="onCancelEditModel">取消</NButton>
                       <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">
                         {{ editingModelName ? '保存修改' : '添加模型' }}
                       </NButton>
-                      <NButton size="small" @click="onCancelEditModel">取消</NButton>
-                    </NSpace>
-                  </NSpace>
+                    </div>
+                  </div>
                 </div>
                 <div v-if="selected.models && selected.models.length" class="model-list">
                   <div
@@ -1570,18 +1673,24 @@ function kbModelSupportsVision(scanModel: string) {
                       <span v-if="m.max_tokens_output" class="model-meta-item">输出 {{ m.max_tokens_output }}</span>
                     </div>
                     <div class="model-card-actions">
-                      <NButton size="tiny" quaternary @click="onEditModel(m)" title="编辑">✎</NButton>
-                      <NButton v-if="!m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认">★</NButton>
-                      <NPopconfirm @positive-click="onDeleteModel(m.name)" positive-text="删除" negative-text="取消">
+                      <NButton size="tiny" quaternary @click="onEditModel(m)" title="编辑" aria-label="编辑">
+                        <Pencil :size="12" />
+                      </NButton>
+                      <NButton v-if="!m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认" aria-label="设为默认">
+                        <Star :size="12" />
+                      </NButton>
+                        <NPopconfirm @positive-click="onDeleteModel(m.name)" positive-text="删除" negative-text="取消">
                         <template #trigger>
-                          <NButton size="tiny" quaternary type="error" title="删除">✕</NButton>
+                          <NButton size="tiny" quaternary type="error" title="删除" aria-label="删除">
+                            <X :size="12" />
+                          </NButton>
                         </template>
                         确定删除模型 "{{ m.name }}"？
                       </NPopconfirm>
                     </div>
                   </div>
                 </div>
-                <div v-else class="muted empty-hint">还没有模型。点击「+ 添加模型」配置。</div>
+                <div v-else class="settings-empty">还没有模型。点击「+ 添加模型」配置。</div>
               </div>
             </template>
           </div>
@@ -1614,7 +1723,24 @@ function kbModelSupportsVision(scanModel: string) {
 
       <NTabPane name="styles" tab="风格配置">
         <div class="styles-tab-body">
-          <h3 class="section-title">已配置的风格</h3>
+          <!-- PR #9: section header now uses the unified
+               .settings-section pattern. Action buttons
+               (新增风格) live in the right-aligned
+               .settings-form-actions slot. -->
+          <div class="settings-section">
+            <div class="settings-section-header">
+              <h3 class="settings-section-title">已配置的风格</h3>
+              <div class="settings-form-actions">
+                <NButton size="small" type="primary" ghost
+                  @click="() => { showAddStyle = !showAddStyle; if (showAddStyle) resetNewStyle() }">
+                  {{ showAddStyle ? '取消' : '+ 新增风格' }}
+                </NButton>
+              </div>
+            </div>
+            <p class="settings-section-description">
+              风格定义 LLM 的人设与记忆。内置风格不可编辑，可复制后创建自定义版本。
+            </p>
+          </div>
           <div class="style-grid">
             <div v-for="s in styles" :key="s.id" class="style-card">
               <div class="style-card-top">
@@ -1642,10 +1768,7 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
           </div>
 
-          <NButton size="small" style="margin-top:12px"
-            @click="() => { showAddStyle = !showAddStyle; if (showAddStyle) resetNewStyle() }" type="primary" ghost>
-            {{ showAddStyle ? '取消' : '+ 新增风格' }}
-          </NButton>
+          <!-- 旧的「+ 新增风格」按钮已迁到上方 section header (PR #9) -->
 
           <!-- ---- 编辑/新增表单 ---- -->
           <div v-if="showAddStyle" class="style-editor">
@@ -1727,6 +1850,18 @@ function kbModelSupportsVision(scanModel: string) {
         <div class="system-config-shell">
           <div class="system-config-scroll">
             <div class="system-config-body">
+              <!-- PR #9: top-level section header for the
+                   system config. The inner NCollapse groups
+                   still use the existing .sys-* class names
+                   for backward compat. -->
+              <div class="settings-section">
+                <div class="settings-section-header">
+                  <h3 class="settings-section-title">系统行为</h3>
+                  <p class="settings-section-description" style="margin: 0; flex: 1">
+                    上下文、Agent 循环、子代理的全局行为。修改后点击右下「保存」生效。
+                  </p>
+                </div>
+              </div>
               <NCollapse class="sys-collapse" :default-expanded-names="['context', 'agent', 'subagent']">
                 <NCollapseItem title="上下文管理" name="context">
                   <div class="sys-form-grid">
@@ -1885,79 +2020,145 @@ function kbModelSupportsVision(scanModel: string) {
       </NTabPane>
 
       <NTabPane name="mcp" tab="MCP" style="flex: 1; min-height: 0; overflow: auto">
-        <div style="display:flex;flex-direction:column;gap:16px;padding:4px 0">
-          <!-- Global toggle -->
-          <div style="display:flex;align-items:center;justify-content:space-between">
-            <span style="font-weight:600">启用 MCP</span>
-            <NSwitch :value="mcpGlobalEnabled" @update:value="onToggleMCPGlobal" />
-          </div>
-
-          <!-- Server list -->
-          <div style="display:flex;flex-direction:column;gap:8px">
-            <div style="display:flex;align-items:center;justify-content:space-between">
-              <span style="font-size:13px;color:var(--text-3)">服务器</span>
-              <NButton size="tiny" quaternary @click="showAddMCP = !showAddMCP">
+        <!-- PR #9 follow-up: refactored to the unified
+             .settings-section + .settings-form pattern. The
+             old version had a single flex column with hard-coded
+             inline styles, inconsistent typography, and a tight
+             add-form. The new version mirrors the system tab
+             rhythm: 14px row gap, 12.5px label, 11.5px hint,
+             dividers between rows, and a single section header
+             explaining the feature. -->
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <h3 class="settings-section-title">MCP 服务器</h3>
+            <div class="settings-form-actions">
+              <NButton size="small" type="primary" ghost @click="showAddMCP = !showAddMCP">
                 {{ showAddMCP ? '取消' : '+ 添加' }}
               </NButton>
             </div>
-
-            <!-- Add form -->
-            <div v-if="showAddMCP" style="display:flex;flex-direction:column;gap:8px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-2)">
-              <div style="display:flex;gap:8px">
-                <NButton size="tiny" :type="newMCPType === 'stdio' ? 'primary' : 'default'" @click="newMCPType = 'stdio'">
-                  Stdio
-                </NButton>
-                <NButton size="tiny" :type="newMCPType === 'sse' ? 'primary' : 'default'" @click="newMCPType = 'sse'">
-                  SSE
-                </NButton>
-              </div>
-              <NInput v-model:value="newMCPName" placeholder="名称 (如 playwright)" size="small" />
-              <template v-if="newMCPType === 'stdio'">
-                <NInput v-model:value="newMCPCommand" placeholder="命令 (如 npx)" size="small" />
-                <NInput v-model:value="newMCPArgs" placeholder="参数 (空格分隔，如 -y @anthropic/mcp-server-playwright)" size="small" />
-                <NInput v-model:value="newMCPEnv" placeholder='环境变量 (JSON 格式)' size="small" />
-              </template>
-              <template v-else>
-                <NInput v-model:value="newMCPUrl" placeholder="SSE URL (如 http://localhost:3001/mcp)" size="small" />
-              </template>
-              <div style="display:flex;align-items:center;gap:8px">
-                <span style="font-size:12px">启动</span>
-                <NSwitch v-model:value="newMCPEnabled" size="small" />
-              </div>
-              <NButton type="primary" size="small" @click="onAddMCPServer" style="align-self:flex-start">添加</NButton>
+          </div>
+          <p class="settings-section-description">
+            MCP (Model Context Protocol) 让 LLM 通过标准化的 JSON-RPC 访问外部工具和资源。
+            关闭后 LLM 完全看不到 MCP 注册的工具。
+          </p>
+          <div class="settings-form-row">
+            <div class="settings-form-toggle">
+              <NSwitch :value="mcpGlobalEnabled" @update:value="onToggleMCPGlobal" size="small" />
+              <label class="settings-form-label" for="mcp-global-switch">全局启用 MCP</label>
             </div>
+            <span class="settings-form-hint">关闭后所有 MCP 服务器都不会被加载</span>
+          </div>
+        </div>
 
-            <!-- Server rows -->
-            <div v-if="!mcpServers.length && !showAddMCP" style="padding:20px;text-align:center;color:var(--text-4);font-size:13px">
-              暂无 MCP 服务器，点击 "+ 添加" 开始
-            </div>
-            <div
-              v-for="s in mcpServers"
-              :key="s.name"
-              style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border:1px solid var(--border);border-radius:6px"
-            >
-              <div style="display:flex;flex-direction:column;gap:2px;min-width:0">
-                <span style="font-weight:500">{{ s.name }}</span>
-                <div style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-3)">
-                  <NTag :type="mcpStateType(s.state)" size="tiny" :bordered="false">{{ mcpStateLabel(s.state) }}</NTag>
-                  <span>{{ s.tool_count }} 个工具</span>
-                  <span v-if="s.error" style="color:var(--error)">{{ s.error }}</span>
+        <!-- Server list section. The list of configured
+             servers is rendered as .settings-card items,
+             matching the visual weight of the providers tab
+             model list. -->
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <h3 class="settings-section-title">已配置 ({{ mcpServers.length }})</h3>
+          </div>
+          <div v-if="!mcpServers.length && !showAddMCP" class="settings-empty">
+            暂无 MCP 服务器，点击「+ 添加」开始配置
+          </div>
+
+          <!-- Add form. Wrapped in .settings-card so it
+               visually separates from the server list. -->
+          <div v-if="showAddMCP" class="settings-card">
+            <div class="settings-form">
+              <!-- Transport selector as inline radio-style
+                   buttons. The two buttons (Stdio / SSE) live
+                   in a 4px-gap row, matching the .settings-form
+                   rhythm. -->
+              <div class="settings-form-row">
+                <label class="settings-form-label">传输方式</label>
+                <div style="display: flex; gap: 6px;">
+                  <NButton
+                    size="small"
+                    :type="newMCPType === 'stdio' ? 'primary' : 'default'"
+                    @click="newMCPType = 'stdio'"
+                  >
+                    Stdio
+                  </NButton>
+                  <NButton
+                    size="small"
+                    :type="newMCPType === 'sse' ? 'primary' : 'default'"
+                    @click="newMCPType = 'sse'"
+                  >
+                    SSE
+                  </NButton>
                 </div>
               </div>
-              <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
-                <NSwitch
-                  :value="s.state === 'running' || s.state === 'starting'"
-                  @update:value="(v: boolean) => onToggleMCPServer(s.name, v)"
-                  size="small"
-                />
-                <NButton size="tiny" quaternary @click="onRestartMCPServer(s.name)" title="重启">↻</NButton>
-                <NPopconfirm @positive-click="onRemoveMCPServer(s.name)">
-                  <template #trigger>
-                    <NButton size="tiny" quaternary style="color:var(--warn)">×</NButton>
-                  </template>
-                  确定删除 "{{ s.name }}"？
-                </NPopconfirm>
+              <div class="settings-form-row">
+                <label class="settings-form-label">名称</label>
+                <NInput v-model:value="newMCPName" placeholder="如：playwright" size="small" style="max-width: 320px" />
               </div>
+              <template v-if="newMCPType === 'stdio'">
+                <div class="settings-form-row">
+                  <label class="settings-form-label">命令</label>
+                  <NInput v-model:value="newMCPCommand" placeholder="如：npx" size="small" style="max-width: 320px" />
+                </div>
+                <div class="settings-form-row">
+                  <label class="settings-form-label">参数</label>
+                  <NInput v-model:value="newMCPArgs" placeholder="空格分隔，如 -y @anthropic/mcp-server-playwright" size="small" style="max-width: 480px" />
+                </div>
+                <div class="settings-form-row">
+                  <label class="settings-form-label">环境变量</label>
+                  <NInput v-model:value="newMCPEnv" placeholder='JSON 格式，如 {"API_KEY": "xxx"}' size="small" style="max-width: 480px" />
+                </div>
+              </template>
+              <template v-else>
+                <div class="settings-form-row">
+                  <label class="settings-form-label">SSE URL</label>
+                  <NInput v-model:value="newMCPUrl" placeholder="如：http://localhost:3001/mcp" size="small" style="max-width: 480px" />
+                </div>
+              </template>
+              <div class="settings-form-row">
+                <div class="settings-form-toggle">
+                  <NSwitch v-model:value="newMCPEnabled" size="small" />
+                  <label class="settings-form-label" for="mcp-autostart-switch">添加后立即启动</label>
+                </div>
+              </div>
+              <div class="settings-form-actions">
+                <NButton size="small" @click="showAddMCP = false">取消</NButton>
+                <NButton type="primary" size="small" @click="onAddMCPServer">添加服务器</NButton>
+              </div>
+            </div>
+          </div>
+
+          <!-- Configured server rows. .settings-card provides
+               the bordered card; .server-row is the row
+               layout inside. -->
+          <div
+            v-for="s in mcpServers"
+            :key="s.name"
+            class="settings-card server-row"
+          >
+            <div class="server-row-main">
+              <div class="server-row-name">{{ s.name }}</div>
+              <div class="server-row-meta">
+                <NTag :type="mcpStateType(s.state)" size="tiny" :bordered="false">{{ mcpStateLabel(s.state) }}</NTag>
+                <span class="server-row-count">{{ s.tool_count }} 个工具</span>
+                <span v-if="s.error" class="server-row-error">{{ s.error }}</span>
+              </div>
+            </div>
+            <div class="server-row-actions">
+              <NSwitch
+                :value="s.state === 'running' || s.state === 'starting'"
+                @update:value="(v: boolean) => onToggleMCPServer(s.name, v)"
+                size="small"
+              />
+              <NButton size="tiny" quaternary @click="onRestartMCPServer(s.name)" title="重启" aria-label="重启">
+                <RotateCw :size="12" />
+              </NButton>
+              <NPopconfirm @positive-click="onRemoveMCPServer(s.name)">
+                <template #trigger>
+                  <NButton size="tiny" quaternary title="删除" aria-label="删除">
+                    <X :size="12" />
+                  </NButton>
+                </template>
+                确定删除 "{{ s.name }}"？
+              </NPopconfirm>
             </div>
           </div>
         </div>
@@ -1993,7 +2194,9 @@ function kbModelSupportsVision(scanModel: string) {
                   <strong class="provider-item-name">{{ b.name }}</strong>
                   <NPopconfirm @positive-click="onDeleteKB(b.name)" positive-text="删除" negative-text="取消">
                     <template #trigger>
-                      <NButton size="tiny" quaternary type="error" @click.stop class="provider-del-btn">✕</NButton>
+                      <NButton size="tiny" quaternary type="error" @click.stop class="provider-del-btn">
+                        <X :size="12" />
+                      </NButton>
                     </template>
                     确定删除知识库「{{ b.name }}」？此操作不可撤销。
                   </NPopconfirm>
@@ -2134,7 +2337,9 @@ function kbModelSupportsVision(scanModel: string) {
                   <div class="kb-tree-left">
                     <div class="kb-tree-toolbar">
                       <NInput v-model:value="kbNodeFilter" placeholder="筛选节点..." size="tiny" clearable style="flex:1" />
-                      <NButton size="tiny" quaternary @click="loadKBNodes(kbSelected!.name)" title="刷新">↻</NButton>
+                      <NButton size="tiny" quaternary @click="loadKBNodes(kbSelected!.name)" title="刷新" aria-label="刷新">
+                        <RotateCw :size="12" />
+                      </NButton>
                     </div>
                     <div class="kb-tree-scroll">
                       <div v-if="kbNodesLoading" class="muted" style="padding:16px;text-align:center">加载中...</div>
@@ -2176,7 +2381,9 @@ function kbModelSupportsVision(scanModel: string) {
                               placement="left-start"
                             >
                               <template #trigger>
-                                <NButton size="tiny" quaternary type="error">🗑</NButton>
+                                <NButton size="tiny" quaternary type="error" title="删除" aria-label="删除">
+                                  <Trash2 :size="12" />
+                                </NButton>
                               </template>
                               确定删除「{{ kbActiveNode.title }}」{{ kbActiveNode.level === 2 ? '及其所有章节和内容' : '及其内容' }}？
                             </NPopconfirm>
@@ -2234,7 +2441,9 @@ function kbModelSupportsVision(scanModel: string) {
                               @click.stop
                             >
                               <template #trigger>
-                                <NButton size="tiny" quaternary type="error" @click.stop>🗑</NButton>
+                                <NButton size="tiny" quaternary type="error" @click.stop title="删除" aria-label="删除">
+                                  <Trash2 :size="12" />
+                                </NButton>
                               </template>
                               确定删除「{{ ch.title }}」及其内容？
                             </NPopconfirm>
@@ -2254,44 +2463,363 @@ function kbModelSupportsVision(scanModel: string) {
         <WebSearchSettings />
       </NTabPane>
     </NTabs>
+  </AppSettingsLayout>
 
-    <!-- Confirmation: permanent delete from archive -->
-    <NModal v-model:show="showConfirmPermDelete" preset="card" title="确认永久删除" style="width: 360px">
-      <div class="confirm-body">
-        <p>确定要永久删除此会话吗？此操作不可撤销。</p>
-        <div class="confirm-actions">
-          <NButton size="small" @click="showConfirmPermDelete = false">取消</NButton>
-          <NButton size="small" type="error" @click="confirmPermDelete">永久删除</NButton>
-        </div>
+  <!-- Inner confirmation modals — teleported to body by
+       NModal, so they sit on top of the settings dialog
+       regardless of where they're declared in the
+       template. Sibling of AppSettingsLayout (multi-root
+       template) — they're conceptually owned by the
+       settings dialog but rendered on top of everything. -->
+  <NModal v-model:show="showConfirmPermDelete" preset="card" title="确认永久删除" style="width: 360px">
+    <div class="confirm-body">
+      <p>确定要永久删除此会话吗？此操作不可撤销。</p>
+      <div class="confirm-actions">
+        <NButton size="small" @click="showConfirmPermDelete = false">取消</NButton>
+        <NButton size="small" type="error" @click="confirmPermDelete">永久删除</NButton>
       </div>
-    </NModal>
+    </div>
+  </NModal>
 
-    <!-- Add skill repo -->
-    <NModal v-model:show="showAddRepo" preset="card" title="添加技能仓库" style="width: 420px">
-      <div class="add-project-form">
-        <label>仓库名称</label>
-        <NInput v-model:value="newRepoName" placeholder="例如：我的技能仓库" />
-        <label style="margin-top: 12px">GitHub 地址</label>
-        <NInput v-model:value="newRepoUrl" placeholder="例如：https://github.com/user/repo" />
-        <div class="project-actions">
-          <NButton size="small" @click="showAddRepo = false">取消</NButton>
-          <NButton size="small" type="primary" @click="onAddRepo">添加</NButton>
-        </div>
+  <NModal v-model:show="showAddRepo" preset="card" title="添加技能仓库" style="width: 420px">
+    <div class="add-project-form">
+      <label>仓库名称</label>
+      <NInput v-model:value="newRepoName" placeholder="例如：我的技能仓库" />
+      <label style="margin-top: 12px">GitHub 地址</label>
+      <NInput v-model:value="newRepoUrl" placeholder="例如：https://github.com/user/repo" />
+      <div class="project-actions">
+        <NButton size="small" @click="showAddRepo = false">取消</NButton>
+        <NButton size="small" type="primary" @click="onAddRepo">添加</NButton>
       </div>
-    </NModal>
+    </div>
   </NModal>
 </template>
 
 <style scoped>
-.section-title { margin: 0; font-size: 13px; font-weight: 600; }
+/* =================================================================
+ * Settings design system (PR #9)
+ * =================================================================
+ * Replaces the ad-hoc inline styles that accumulated in earlier
+ * versions with a small set of semantic classes. The goal is
+ * consistent visual rhythm across all tabs:
+ *
+ *   - Typography scale:  14 (section title) / 12.5 (label) /
+ *                         11.5 (hint) / 13 (body) px
+ *   - Spacing scale:      4 / 6 / 8 / 12 / 16 / 24 / 28 px
+ *   - Color usage:        text-primary for body, text-secondary
+ *                         for labels, text-tertiary for hints;
+ *                         never hardcode the colors.
+ *   - Form pattern:       label above input (vertical, NOT
+ *                         side-by-side), with a hint text
+ *                         optional below.
+ *   - Action pattern:     buttons right-aligned in their own
+ *                         row, separated from the form.
+ * ================================================================= */
+
+/* --- Tab content wrapper ------------------------------------------
+ * Every tab's content goes inside .settings-tab-content. The
+ * 28px horizontal / 24px vertical padding is the consistent
+ * inner gutter across all tabs — was previously inconsistent
+ * (some tabs had 0, others had 16/20/24 inline). */
+.settings-tab-content {
+  padding: 24px 28px;
+  max-width: 920px;
+}
+
+/* --- Section ------------------------------------------------------
+ * A logical group inside a tab (e.g. "基本信息", "模型").
+ * Sections stack vertically with 24px between them and a
+ * subtle bottom border on the header. */
+.settings-section {
+  margin-bottom: 24px;
+  /* 20px outer padding so the form fields don't touch the
+   * edge of the parent card (provider-detail etc.) — this
+   * is the margin the form used to be missing, which made
+   * labels and inputs feel glued to the left/right
+   * borders. */
+  padding: 4px 0;
+}
+.settings-section:last-child {
+  margin-bottom: 0;
+}
+.settings-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.settings-section-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+  letter-spacing: -0.005em;
+  line-height: 1.3;
+}
+.settings-section-description {
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+  line-height: 1.55;
+  margin: -4px 0 14px;
+}
+
+/* --- Form ---------------------------------------------------------
+ * A form is a vertical stack of form rows. 18px gap gives each
+ * field clear visual separation — too tight and the form reads
+ * as one block, too loose and the eye loses the grouping.
+ * 18px is the sweet spot for Chinese labels at 13px. */
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.settings-form-row {
+  display: flex;
+  flex-direction: column;
+  /* 8px between the label and its input — enough to make
+   * the grouping obvious without floating the label
+   * awkwardly far from the control it describes. */
+  gap: 8px;
+}
+/* Horizontal variant: label and control on the same row. Use
+ * for short controls like switches where stacking would waste
+ * vertical space. The label sits next to the control rather
+ * than above it. */
+.settings-form-row--inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+/* In inline rows the label is a sibling of the control (not a
+ * stacked caption), so we drop the heavy-weight treatment that
+ * the column-form label needs. */
+.settings-form-row--inline .settings-form-label {
+  font-weight: 500;
+  margin: 0;
+  cursor: pointer;
+  user-select: none;
+}
+.settings-form-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  line-height: 1.3;
+  display: block;
+}
+.settings-form-hint {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+  /* A small top margin so the hint feels like a continuation of
+   * the field above it rather than a new paragraph — connects
+   * the help text to its input visually. */
+  margin-top: 1px;
+}
+.settings-form-hint--error {
+  color: var(--error-500);
+}
+/* Wrapper for switch-style controls in a stacked row. The switch
+ * sits on its own line, label is right next to it, and the hint
+ * spans the row below — matches the visual rhythm of a stacked
+ * field while keeping the switch's tap target inline. */
+.settings-form-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* --- Action row ---------------------------------------------------
+ * Buttons in their own row, right-aligned. Use when a form
+ * needs a save/reset/submit pair at the bottom. The 8px gap
+ * between buttons matches the sidebar / input bar. */
+.settings-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  justify-content: flex-end;
+}
+.settings-form-actions--left {
+  justify-content: flex-start;
+}
+.settings-form-actions--between {
+  justify-content: space-between;
+}
+
+/* --- Card ---------------------------------------------------------
+ * A bordered card that groups related items (a list of
+ * providers, a list of skills, a list of MCP servers). The
+ * 1px border + 8px radius + 12px padding matches the visual
+ * weight of a normal surface but draws the eye to its
+ * contents as a unit. */
+.settings-card {
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+}
+.settings-card + .settings-card {
+  margin-top: 8px;
+}
+.settings-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  gap: 8px;
+}
+.settings-card-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-card-meta {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+
+/* --- Muted text helper --------------------------------------------
+ * Use sparingly. The new design prefers .settings-form-hint
+ * for form-related help text. .muted is the older catch-all
+ * kept for one-off grey text. */
+.muted { color: var(--text-tertiary); font-size: 12px; }
+
+/* --- Empty state helper ------------------------------------------
+ * Centered grey text for "no items yet" messages. */
+.settings-empty {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 12.5px;
+  background: var(--surface-1);
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+/* --- Hide the NTabs top bar (unchanged from PR #8) --------------
+ * The new AppSettingsLayout provides a left vertical nav that
+ * drives the active tab. The NTabPanes themselves are still
+ * rendered (and animated) so transitions stay smooth; we
+ * just don't want the top tab strip to take up vertical
+ * space. */
+.settings-no-bar :deep(.n-tabs-nav) {
+  display: none !important;
+}
+.settings-no-bar :deep(.n-tabs-pane-wrapper) {
+  flex: 1;
+  min-height: 0;
+}
+/* PR #9: every tab pane gets the same outer padding so the
+ * left/right gutters are consistent across tabs. Tabs that
+ * need extra spacing (e.g. providers, with a 2-column
+ * inner split) can override with their own wrapper — the
+ * 24px/28px gutter is a baseline, not a hard rule. */
+.settings-no-bar :deep(.n-tab-pane) {
+  padding: 0 !important;
+}
+.settings-no-bar :deep(.n-tab-pane) > * {
+  /* Direct children of the pane get the standard gutter
+   * unless they opt out (with .full-bleed or similar). */
+  padding: 24px 28px;
+  max-width: 100%;
+}
+
+/* --- MCP server row (used inside the MCP tab's .settings-card
+ * list). Each card holds a left-aligned name + meta column
+ * and a right-aligned actions cluster. The actions cluster
+ * uses a 6px gap to match the rest of the settings rhythm. */
+.server-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.server-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.server-row-name {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text-primary);
+  letter-spacing: -0.003em;
+}
+.server-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  flex-wrap: wrap;
+}
+.server-row-count {
+  font-variant-numeric: tabular-nums;
+}
+.server-row-error {
+  color: var(--error-500);
+  font-size: 11.5px;
+  /* Truncate long error messages so a 2-line error doesn't
+   * push the actions cluster down. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 280px;
+}
+.server-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* --- Legacy aliases (kept for backward compat during migration)
+ * Most existing code uses .section-title / .form-row /
+ * .form-label. These map to the new system so the migration
+ * can be done tab by tab. */
+.section-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.form-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.form-hint {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
 
 /* Providers tab — left/right split */
 .providers-split {
   display: grid;
   grid-template-columns: 240px 1fr;
   gap: 12px;
-  height: 60vh;
-  min-height: 480px;
+  /* No fixed height. The grid sizes to its content; if
+   * content overflows, the parent .n-tab-pane (which has
+   * overflow: auto via AppSettingsLayout's content area)
+   * provides the scroll. The 60vh / 480px min was
+   * creating a visible empty band at the bottom of the
+   * settings dialog when the actual content (form +
+   * model list) was shorter than 60vh. */
 }
 .provider-list {
   border: 1px solid var(--border-2);
@@ -2343,6 +2871,14 @@ function kbModelSupportsVision(scanModel: string) {
   background: var(--bg-2);
   display: flex; flex-direction: column;
   overflow-y: auto;
+  /* Outer padding so form fields don't sit on the border.
+   * The basic info / model sections use .settings-section
+   * which adds its own internal padding, so this is the
+   * main visual buffer between the card edge and any
+   * direct children. 16px is the standard settings-card
+   * padding (matches .settings-card in line ~2615). */
+  padding: 16px 18px;
+  gap: 4px;
 }
 .detail-section {
   border-bottom: 1px solid var(--border-2);
@@ -2374,37 +2910,43 @@ function kbModelSupportsVision(scanModel: string) {
 .model-card {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--bg-3);
-  border: 1px solid var(--border-2);
-  font-size: 12.5px;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  font-size: 13px;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.model-card:hover {
+  border-color: var(--border-default);
 }
 .model-card.is-default {
-  border-color: var(--success);
-  background: color-mix(in srgb, var(--success) 6%, var(--bg-3));
+  border-color: var(--success-500);
+  background: var(--success-50);
 }
 .model-card-top {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   min-width: 140px;
   flex-shrink: 0;
 }
 .model-card-name {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
   font-weight: 500;
+  color: var(--text-primary);
 }
 .model-card-meta {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   flex: 1;
   min-width: 0;
-  color: var(--text-3);
+  color: var(--text-tertiary);
   font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
 .model-meta-item {
   white-space: nowrap;
@@ -2413,15 +2955,16 @@ function kbModelSupportsVision(scanModel: string) {
 }
 .model-card-actions {
   display: flex;
-  gap: 2px;
+  gap: 4px;
   flex-shrink: 0;
 }
 .model-id {
-  background: var(--bg-3);
+  background: var(--surface-2);
   padding: 1px 6px;
   border-radius: 3px;
-  font-family: ui-monospace, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
+  color: var(--text-secondary);
 }
 
 .muted { color: var(--text-3); font-size: 12px; }
@@ -2666,10 +3209,11 @@ code {
   display: inline-flex; align-items: center; gap: 4px;
   font-size: 12px; min-width: 0;
 }
-.kb-tree-label.l1 { font-weight: 600; }
-.kb-tree-label.l2 { }
-.kb-tree-label.l3 { font-size: 11.5px; color: var(--text-2); }
-.kb-tree-icon { flex-shrink: 0; font-size: 12px; }
+.kb-tree-label.l1 { font-weight: 600; color: var(--text-primary); }
+.kb-tree-label.l2 { color: var(--text-secondary); }
+.kb-tree-label.l3 { font-size: 11.5px; color: var(--text-secondary); }
+.kb-tree-icon { flex-shrink: 0; color: var(--text-tertiary); }
+.kb-tree-label.l1 .kb-tree-icon { color: var(--brand-500); }
 .kb-tree-label-text {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -2748,36 +3292,146 @@ code {
   max-height: 120px; overflow-y: auto; font-family: ui-monospace, monospace;
 }
 
-/* System config tab */
+/* System config tab.
+ *
+ * PR #9 follow-up: refactored for the unified form rhythm.
+ * The previous version forced a `height: 58vh` on the shell
+ * to give the NCollapse groups room to breathe, but that
+ * caused a visible empty band at the bottom of the settings
+ * dialog when the content (3 NCollapse groups) was shorter
+ * than 58vh. The fix: drop the fixed height, let the
+ * NTabPane size naturally, and put the vertical breathing
+ * room into the form rows + gap between NCollapse items
+ * instead. Now the dialog fills the available space only
+ * to the extent the content needs, and the scrollbar
+ * appears only when content actually overflows.
+ */
 .system-config-shell {
-  height: 58vh;
-  display: flex; flex-direction: column;
+  /* No fixed height — let the NTabPane's flex sizing
+   * determine the height. The NTabPane already has
+   * `flex: 1; min-height: 0` so this fills the available
+   * layout dialog height. */
+  display: flex;
+  flex-direction: column;
 }
 .system-config-scroll {
-  flex: 1; min-height: 0; overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 .system-config-body {
   padding: 4px 0;
 }
+
+/* Outer wrapper around the 3 NCollapse groups. Gap gives
+ * 16px between groups (matching the standard form-row
+ * gap) so they feel like distinct sections rather than
+ * one glued-together block. */
 .sys-collapse {
-  border: 1px solid var(--border-2);
-  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  /* NCollapse itself has its own internal margin; we
+   * tighten it to 0 so our .sys-collapse + {margin-top}
+   * below is the only vertical rhythm. */
+  --n-collapse-item-margin: 0;
+  /* 16px between groups. */
+  margin-bottom: 16px;
 }
+.sys-collapse:last-child {
+  margin-bottom: 0;
+}
+
+/* NCollapse title row. The default has minimal padding
+ * (12px 16px) which makes the title look cramped against
+ * the border. Bump to 14px/18px to match our spacing
+ * scale. Also tighten the title font to 13px medium
+ * (instead of the default 14px) so it matches the
+ * .settings-section-title rhythm. */
+.sys-collapse :deep(.n-collapse-item__header-main) {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+.sys-collapse :deep(.n-collapse-item) {
+  /* Header padding: more horizontal, more vertical. */
+}
+.sys-collapse :deep(.n-collapse-item__header) {
+  padding: 12px 18px;
+  border-color: var(--border-subtle);
+}
+.sys-collapse :deep(.n-collapse-item .n-collapse-item__content-inner) {
+  /* Inner content area: 18px horizontal to align with the
+   * header, 18px vertical for breathing room. The default
+   * NCollapse is 16px which feels tight next to our 14px
+   * form-label font. */
+  padding: 16px 18px 18px;
+}
+
+/* Form grid + row inside the NCollapse items. PR #9
+ * follow-up: 10px vertical padding per row, 16px row gap,
+ * upgraded typography. Previously rows were crammed with
+ * only 3px padding + 2px row gap, which made the
+ * configuration dense and hard to scan. */
 .sys-form-grid {
-  display: flex; flex-direction: column; gap: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;  /* extra padding via .sys-form-row vertical handles the rest */
 }
 .sys-form-row {
-  display: flex; align-items: center; gap: 8px; padding: 3px 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  /* Subtle divider between rows. The first row in each
+   * group drops the top border via :first-child. */
+  border-top: 1px solid var(--border-subtle);
+}
+.sys-form-row:first-child {
+  border-top: none;
+  padding-top: 4px;
+}
+.sys-form-row:last-child {
+  padding-bottom: 4px;
 }
 .sys-label {
-  font-size: 12px; color: var(--text-2); width: 130px; flex-shrink: 0;
+  /* Widened from 130px to 150px so longer Chinese labels
+   * ("自动压缩缓冲区", "工具结果截断轮次") don't wrap. */
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  width: 160px;
+  flex-shrink: 0;
   line-height: 1.4;
+  letter-spacing: -0.003em;
 }
 .sys-hint {
-  font-size: 11px; color: var(--text-4); flex: 1; line-height: 1.4;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  flex: 1;
+  line-height: 1.5;
+  /* Keep the hint on the same line as the input for
+   * compact rows, but allow wrap if the message is
+   * long (e.g. "bytes，默认 6000（含子代理/task 结果）") */
+  white-space: normal;
+  min-width: 0;
 }
+
 .sys-actions {
-  display: flex; justify-content: flex-end; gap: 8px;
-  padding: 10px 0 0;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 16px 0 8px;
+  /* Subtle top border to separate from the content. */
+  border-top: 1px solid var(--border-subtle);
+  margin-top: 8px;
+}
+
+/* NCollapse arrow icon color — default is a hard
+ * `--text-3`; we soften it to `--text-tertiary` for
+ * visual consistency. */
+.sys-collapse :deep(.n-collapse-item__header .n-base-icon) {
+  color: var(--text-tertiary);
 }
 </style>

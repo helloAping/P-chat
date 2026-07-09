@@ -12,6 +12,7 @@
 | 修改工具（新增/删除/修改行为） | [tool.md](tool.md) | agent.md, sandbox.md |
 | 修改子代理系统 | [subagent.md](subagent.md) | agent.md, tool.md |
 | 修改前端界面、Vue 组件、pinia store | [frontend.md](frontend.md) | server.md |
+| **修改样式/设计 token/视觉规范** | [**frontend-design.md**](frontend-design.md) | frontend.md |
 | 修改数据库/消息持久化 | [memory.md](memory.md) | config.md |
 | **修改数据库 Schema** | [**versioning.md**](versioning.md) | memory.md |
 | **发布新版本** | [**versioning.md**](versioning.md) | — |
@@ -57,6 +58,7 @@ P-Chat 项目
 │       └── serverproc/ → 服务器进程生命周期
 │
 └── frontend/src/       → 请读 [frontend.md](frontend.md)
+    │                       设计 token / 组件样式规则 → [frontend-design.md](frontend-design.md)
     ├── api/client.ts     → HTTP + SSE 客户端
     ├── stores/chat.ts    → Pinia 状态管理
     └── components/       → Vue 组件

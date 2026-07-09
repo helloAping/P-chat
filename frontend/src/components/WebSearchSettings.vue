@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { Check } from './icons'
+
 // Web-search settings panel.
 //
 // Rendered as a tab in AppSettingsModal. The component owns
@@ -305,7 +307,12 @@ onMounted(loadSettings)
               :disabled="form.clearKey"
               @click="form.clearKey = !form.clearKey"
             >
-              {{ form.clearKey ? '✓ 将删除' : '删除 Key' }}
+              <template v-if="form.clearKey">
+                <Check :size="12" /> 将删除
+              </template>
+              <template v-else>
+                删除 Key
+              </template>
             </NButton>
             <div class="form-hint">
               在 <a href="https://app.tavily.com/home" target="_blank" rel="noopener">app.tavily.com</a> 获取
@@ -355,7 +362,12 @@ onMounted(loadSettings)
               :disabled="form.clearKey"
               @click="form.clearKey = !form.clearKey"
             >
-              {{ form.clearKey ? '✓ 将删除' : '删除 Key' }}
+              <template v-if="form.clearKey">
+                <Check :size="12" /> 将删除
+              </template>
+              <template v-else>
+                删除 Key
+              </template>
             </NButton>
           </div>
         </div>
@@ -410,86 +422,183 @@ onMounted(loadSettings)
 </template>
 
 <style scoped>
+/* =================================================================
+ * WebSearch settings — PR #9 follow-up
+ * =================================================================
+ * Refactored to match the unified design system used by the
+ * other settings tabs:
+ *
+ *   - No fixed height (was `height: 58vh`, removed — it
+ *     caused a visible empty band at the bottom of the
+ *     dialog when the form was shorter than 58vh).
+ *   - Form rows use the same 8px vertical padding + 1px
+ *     divider rhythm as the system tab.
+ *   - Old --text-2 / --text-3 / --text-4 tokens (which are
+ *     now aliases for the canonical --text-secondary /
+ *     --text-tertiary) updated to the new names.
+ *   - Status card uses the same bordered + 12px/14px
+ *     padding as the .settings-card class.
+ * ================================================================= */
+
 .websearch-shell {
-  display: flex; flex-direction: column; gap: 12px;
-  padding: 4px 0;
-  height: 58vh;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  /* No fixed height — let the NTabPane's flex sizing
+   * determine the height. */
 }
 
 /* ---- Status card (read-only summary) ---- */
 .status-card {
-  display: flex; flex-direction: column; gap: 6px;
-  padding: 12px 14px;
-  border: 1px solid var(--border-2);
-  border-radius: 8px;
-  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
 }
 .status-row {
-  display: flex; align-items: center; gap: 12px;
-  font-size: 12.5px;
-  min-height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  /* Subtle divider between rows. */
+  padding: 4px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.status-row:first-child {
+  border-top: none;
+  padding-top: 0;
 }
 .status-label {
-  width: 80px; flex-shrink: 0;
-  color: var(--text-3);
-  font-size: 12px;
+  width: 96px;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 500;
 }
 .status-val {
-  color: var(--text-1);
+  color: var(--text-primary);
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
-.quota-cell { flex: 1; display: flex; align-items: center; gap: 8px; }
-.quota-text { font-variant-numeric: tabular-nums; }
+.quota-cell {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.quota-text {
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  min-width: 160px;
+}
 .quota-bar {
-  flex: 1; height: 4px;
+  flex: 1;
+  height: 4px;
   border-radius: 2px;
-  background: var(--bg-3);
+  background: var(--surface-2);
   overflow: hidden;
-  max-width: 200px;
+  max-width: 280px;
 }
 .quota-bar-fill {
   height: 100%;
-  background: var(--accent);
+  background: var(--brand-500);
   transition: width 0.2s ease;
 }
 
-/* ---- Form ---- */
+/* ---- Form (NCollapse wrapper) ----
+ * The form-collapse NCollapse groups the three NCollapseItems
+ * (基本设置 / 凭据 / 配额与超时). Same surface-1 + 1px
+ * border treatment as the system tab's .sys-collapse. */
 .form-collapse {
-  flex: 1; min-height: 0; overflow-y: auto;
-  border: 1px solid var(--border-2);
-  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  --n-collapse-item-margin: 0;
 }
+.form-collapse :deep(.n-collapse-item__header) {
+  padding: 12px 18px;
+  border-color: var(--border-subtle);
+}
+.form-collapse :deep(.n-collapse-item__header-main) {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+.form-collapse :deep(.n-collapse-item .n-collapse-item__content-inner) {
+  padding: 16px 18px 18px;
+}
+
+/* ---- Form grid + row (PR #9 follow-up) ----
+ * Same pattern as the system tab: 8px vertical padding per
+ * row, 1px border-top divider (except the first row), 12.5px
+ * label, 11.5px hint, 12px column gap. The 110px label
+ * width is wide enough for the longer Chinese labels
+ * (Tavily 专用, 请求超时). */
 .form-grid {
-  display: flex; flex-direction: column; gap: 2px;
-  padding: 2px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 .form-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.form-row:first-child {
+  border-top: none;
+  padding-top: 4px;
+}
+.form-row:last-child {
+  padding-bottom: 4px;
 }
 .form-label {
-  font-size: 12px; color: var(--text-2);
-  width: 110px; flex-shrink: 0;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  width: 110px;
+  flex-shrink: 0;
   line-height: 1.4;
+  letter-spacing: -0.003em;
 }
 .form-hint {
-  font-size: 11px; color: var(--text-4);
-  flex: 1; line-height: 1.4;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  flex: 1;
+  line-height: 1.5;
+  white-space: normal;
+  min-width: 0;
 }
-.form-hint a { color: var(--accent); text-decoration: none; }
-.form-hint a:hover { text-decoration: underline; }
+.form-hint a {
+  color: var(--brand-500);
+  text-decoration: none;
+}
+.form-hint a:hover {
+  text-decoration: underline;
+}
 
 /* ---- Action bar ---- */
 .action-bar {
-  display: flex; justify-content: flex-end; gap: 8px;
-  padding: 4px 0 0;
-  border-top: 1px solid var(--border-2);
-  padding-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
   flex-shrink: 0;
 }
 
 .loading-hint {
   padding: 40px;
   text-align: center;
-  color: var(--text-3);
+  color: var(--text-tertiary);
+  font-size: 13px;
 }
 </style>

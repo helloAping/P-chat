@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { NScrollbar, NInput } from 'naive-ui'
+import { ChevronRight } from './icons'
 import {
   currentTodos,
   currentSessionWorking,
@@ -228,7 +229,7 @@ function toggleExpand() {
     }"
   >
     <div class="todo-dock-header" @click="toggleExpand" :title="expanded ? '点击收起' : '点击展开'">
-      <span class="todo-dock-caret" :class="{ 'todo-dock-caret--open': expanded }">▸</span>
+      <ChevronRight :size="12" class="todo-dock-caret" :class="{ 'todo-dock-caret--open': expanded }" />
       <span v-if="active" class="todo-dock-active">
         <span v-if="active.status === 'in_progress'" class="todo-dock-pulse" aria-hidden="true" />
         <span class="todo-dock-active-text">{{ active.content }}</span>
@@ -373,11 +374,9 @@ function toggleExpand() {
   background: var(--bg-3, rgba(255, 255, 255, 0.04));
 }
 .todo-dock-caret {
-  font-size: 11px;
-  color: var(--text-3);
-  transition: transform 0.15s ease;
-  display: inline-block;
-  width: 12px;
+  color: var(--text-tertiary);
+  transition: transform var(--dur-fast) var(--ease-out);
+  display: inline-flex;
   flex-shrink: 0;
 }
 .todo-dock-caret--open {
@@ -407,7 +406,7 @@ function toggleExpand() {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #f0a020;
+  background: var(--warn-500);
   flex-shrink: 0;
   animation: todo-pulse 1.2s ease-in-out infinite;
 }
@@ -472,10 +471,10 @@ function toggleExpand() {
 .todo-row-mark svg {
   display: block;
 }
-.todo-row-mark--pending { color: var(--text-3); }
-.todo-row-mark--in_progress { color: #f0a020; }
-.todo-row-mark--done { color: #18a058; }
-.todo-row-mark--cancelled { color: #999; }
+.todo-row-mark--pending { color: var(--text-tertiary); }
+.todo-row-mark--in_progress { color: var(--warn-500); }
+.todo-row-mark--done { color: var(--success-500); }
+.todo-row-mark--cancelled { color: var(--text-quaternary); }
 /* Row hover must NOT trigger any mark change. We override the
    generic .todo-row:hover background that lights up other
    affordances so the mark itself stays inert. */
@@ -512,16 +511,16 @@ function toggleExpand() {
   color: var(--text-3);
 }
 .todo-row-status--in_progress {
-  background: rgba(240, 160, 32, 0.18);
-  color: #f0a020;
+  background: var(--warn-50);
+  color: var(--warn-500);
 }
 .todo-row-status--done {
-  background: rgba(24, 160, 88, 0.18);
-  color: #18a058;
+  background: var(--success-50);
+  color: var(--success-500);
 }
 .todo-row-status--cancelled {
-  background: rgba(153, 153, 153, 0.18);
-  color: #999;
+  background: var(--surface-3);
+  color: var(--text-quaternary);
 }
 .todo-row-remove {
   /* legacy: removal action was user-driven, now LLM-driven

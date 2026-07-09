@@ -12,7 +12,7 @@
   },
   "info": {
     "productName": "P-Chat",
-    "productVersion": "1.0.3-test",
+    "productVersion": "1.0.4-test",
     "comments": "P-Chat desktop app (Wails v2 + pchat-server.exe child process)"
   }
 }

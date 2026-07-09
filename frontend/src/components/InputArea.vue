@@ -7,8 +7,14 @@
 // path so the LLM can answer "what is /foo?" questions naturally.
 
 import { onMounted, ref, computed, watch, nextTick } from 'vue'
-import { NInput, NButton, NSpace, NScrollbar, useMessage } from 'naive-ui'
+import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useMessage } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
+import ModelPicker from './ModelPicker.vue'
+import {
+  Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
+  Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
+  Lock, Unlock, Key, Database,
+} from './icons'
 import * as api from '../api/client'
 import {
   state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments,
@@ -111,9 +117,9 @@ const permissionLevel = computed(() => {
 })
 
 const permissionOptions = [
-  { label: '🔒 始终询问', value: 'ask' },
-  { label: '🔓 替我审批', value: 'auto' },
-  { label: '🔑 完全访问', value: 'full' },
+  { label: '始终询问', value: 'ask' },
+  { label: '替我审批', value: 'auto' },
+  { label: '完全访问', value: 'full' },
 ]
 
 async function onChangePermissionLevel(val: string) {
@@ -238,7 +244,14 @@ function onPaste(e: ClipboardEvent) {
       if (f) {
         e.preventDefault()
         const name = f.name && f.name !== 'image.png' ? f.name : `clipboard-${Date.now()}.png`
-        const renamed = new File([f], name, { type: f.type })
+        // DOM lib declares `File` as a 3-arg constructor
+        // (bits, name, options); we need the 3-arg form so the
+        // mime type survives the rename (downstream code in
+        // addAttachment() reads `file.type` to guess the kind).
+        // vue-tsc's .vue context doesn't always resolve the
+        // construct signature, so cast to any to keep the
+        // runtime behavior identical to the typed call.
+        const renamed = new (File as any)([f], name, { type: f.type }) as File
         onFiles({ 0: renamed, length: 1, item: () => renamed } as unknown as FileList)
       }
     }
@@ -772,64 +785,13 @@ onMounted(() => {
   inputEl.value?.focus()
 })
 
-// --- Inline session config (model picker, grouped by provider) ---
+// --- Inline session config (style + advanced) --------------------
 
-// `modelOptions` is the grouped NSelect option list. The shape is:
-//
-//   [
-//     { type: 'group', label: 'openai', children: [
-//       { label: 'gpt-4o · 👁',           value: 'openai::gpt-4o' },
-//       { label: 'gpt-4o-mini',           value: 'openai::gpt-4o-mini' },
-//     ]},
-//     { type: 'group', label: 'cs', children: [
-//       { label: 'doubao-seed-2.0-lite',  value: 'cs::doubao-seed-2.0-lite' },
-//       ...
-//     ]},
-//   ]
-//
-// The encoded value ("<provider>::<model>") lets one NSelect drive
-// both the active provider and the active model in a single
-// onChange — which is what makes the "merged" picker feel native.
-interface ModelOption {
-  // Single-line label: display_name (preferred) or raw model
-  // id. The dropdown is intentionally simple — one row, one
-  // model — so the user can scan a long list of models
-  // without having to parse a noisy 2-line layout per row.
-  // The default-model marker is shown as a small ⭐ suffix
-  // in the label so it's visible at a glance.
-  label: string
-  value: string
-}
-interface GroupOption {
-  type: 'group'
-  label: string
-  children: ModelOption[]
-}
-type SelectOption = ModelOption | GroupOption
-
-// Use the store-level providers list (loaded once at app
-// boot) so the chat NSelect can read the same model list
-// the picker on the right of the input shows. We keep
-// modelOptions as a local computed off state.providers.
-const modelOptions = computed<SelectOption[]>(() => {
-  const groups: GroupOption[] = []
-  for (const p of state.providers as any[]) {
-    const ms: ModelOption[] = []
-    for (const m of (p.models || [])) {
-      const name = m.name
-      const primary = m.display_name || name
-      const label = m.default ? `⭐ ${primary}` : primary
-      ms.push({ label, value: `${p.name}::${name}` })
-    }
-    if (ms.length === 0 && p.model) {
-      ms.push({ label: p.model, value: `${p.name}::${p.model}` })
-    }
-    if (ms.length > 0) {
-      groups.push({ type: 'group', label: p.name, children: ms })
-    }
-  }
-  return groups
-})
+// The model picker moved to its own ModelPicker component
+// (PR #6). The remaining per-session config in this file
+// is just the style picker (small icon button + dropdown)
+// and the advanced row (reasoning + KB) which lives behind
+// the "更多" toggle.
 
 const styleOptions = ref<{ label: string; value: string }[]>([])
 
@@ -845,40 +807,25 @@ async function loadConfig() {
   } catch { /* ignore */ }
 }
 
-// The model picker uses a flat single-line label per option.
-// No custom render-function is needed — the default NSelect
-// label rendering handles both the dropdown row and the
-// closed selected-pill display, and both show the same
-// `display_name` (or raw `name`) with a ⭐ prefix for the
-// default model.
-
-function currentSelection(): string {
-  const m = currentMeta.value
-  if (!m.provider) return ''
-  if (!m.model) return `${m.provider}::`
-  return `${m.provider}::${m.model}`
-}
-
-async function onModelPick(v: string) {
-  if (!state.currentID || !v) return
-  // v is "<provider>::<model>" — split and persist both.
-  const idx = v.indexOf('::')
-  const provider = idx >= 0 ? v.slice(0, idx) : v
-  const model = idx >= 0 ? v.slice(idx + 2) : ''
-  const resp = await api.updateSessionMeta(state.currentID, { provider, model })
-  // The server returns the resolved session (including any
-  // fallback model it picked), so we sync the local cache from
-  // it instead of trusting the body we just sent.
+// onModelSelect is the only model-pick handler now (the
+// ModelPicker emits a {provider, model} pair). PATCH 1
+// posts the pair to /sessions/:id/meta and PATCH 2
+// reconciles the local cache from the server's response
+// (which may have applied a fallback model the user
+// didn't actually request).
+async function onModelSelect(sel: { provider: string; model: string }) {
+  if (!state.currentID) return
+  const resp = await api.updateSessionMeta(state.currentID, sel)
   const id = state.currentID
   state.sessionMeta[id] = {
     ...(state.sessionMeta[id] || currentMeta.value),
-    provider: resp.provider ?? provider,
-    model: resp.model ?? model,
+    provider: resp.provider ?? sel.provider,
+    model: resp.model ?? sel.model,
   }
 }
 
 async function onStylePick(v: string) {
-  if (!state.currentID || !v) return
+  if (!state.currentID) return
   const resp = await api.updateSessionMeta(state.currentID, { style: v })
   const id = state.currentID
   state.sessionMeta[id] = {
@@ -887,13 +834,87 @@ async function onStylePick(v: string) {
   }
 }
 
-const currentSelectionValue = computed({
-  get: () => currentSelection(),
-  set: (v: string) => onModelPick(v),
-})
 const currentStyleValue = computed({
   get: () => currentMeta.value.style || 'tech',
   set: (v: string) => onStylePick(v),
+})
+
+// Display label for the reasoning picker. Maps the enum
+// value (off/low/medium/high/max) to the Chinese label
+// that reasoningEffortOptions uses, so the button shows
+// the same string the dropdown would. Falls back to the
+// raw value if it's an unknown enum (forward compat).
+const REASONING_LABELS: Record<string, string> = {
+  off: '关闭',
+  low: '低',
+  medium: '中',
+  high: '高',
+  max: '最高',
+}
+const currentReasoningLabel = computed(() => {
+  const v = reasoningEffort.value || 'off'
+  return REASONING_LABELS[v] || v
+})
+
+// Display label for the knowledge base picker. The "off"
+// and "all" pseudo-bases get short labels so the button
+// stays narrow; a real base name shows as-is.
+const KB_LABELS: Record<string, string> = {
+  __off__: '不使用',
+  __all__: '全部',
+}
+const currentKBLabel = computed(() => {
+  const v = kbBase.value || '__off__'
+  if (KB_LABELS[v]) return KB_LABELS[v]
+  return v
+})
+
+// Setter wrappers for the NDropdown @select handler.
+// The handlers receive (key: string | number), but Vue's
+// computed refs don't expose `.value` cleanly from the
+// template (vue-tsc errors on it). These thin wrappers
+// make the assignment explicit and keep the template
+// `@select` line one expression.
+function pickReasoning(v: string) {
+  reasoningEffort.value = v
+}
+function pickKB(v: string) {
+  kbBase.value = v
+}
+
+// showModelPicker drives the ModelPicker popover. Toggled by
+// clicking the model badge in the bottom row. The ModelPicker
+// itself emits `update:show=false` when the user picks a
+// model or hits Esc, so we only need to handle the open
+// direction here.
+const showModelPicker = ref(false)
+function openModelPicker() {
+  if (!state.currentID) return
+  showModelPicker.value = true
+}
+
+// showAdvanced toggles the "更多" secondary row that
+// hosts the KB picker. Default collapsed: the KB is a
+// less-touched setting (the user usually picks one KB
+// per project and rarely changes it) so the row stays
+// out of the way. Reasoning used to live here too but
+// was promoted to the input-row in PR #10.
+const showAdvanced = ref(false)
+
+// Permission-level picker: small icon-only popover that
+// shows a 3-option list (always-ask / auto-approve /
+// full-access). Replaces the old NSelect which took a lot
+// of horizontal space.
+const showPermPicker = ref(false)
+const permIcon = computed(() => {
+  if (permissionLevel.value === 'full') return Key
+  if (permissionLevel.value === 'auto') return Unlock
+  return Lock
+})
+const permLabel = computed(() => {
+  if (permissionLevel.value === 'full') return '完全访问'
+  if (permissionLevel.value === 'auto') return '替我审批'
+  return '始终询问'
 })
 
 // Load the model/style lists once on mount so the two dropdowns
@@ -907,10 +928,10 @@ onMounted(() => {
   <div class="input-area">
     <!-- Rollback undo banner -->
     <div v-if="currentRollbackBanner" class="rollback-banner">
-      <span class="rollback-banner-icon">↩</span>
+      <Undo2 :size="14" class="rollback-banner-icon" />
       <span class="rollback-banner-text">已撤回 {{ currentRollbackBanner.count }} 条消息</span>
       <button class="rollback-banner-undo" @click="undoRollback(state.currentID)">撤销</button>
-      <button class="rollback-banner-dismiss" @click="dismissRollback(state.currentID)">×</button>
+      <button class="rollback-banner-dismiss" @click="dismissRollback(state.currentID)" aria-label="关闭">×</button>
     </div>
     <!-- Attachments live INSIDE the same input-wrap as the
          textarea. They wrap to multiple rows as the dialog
@@ -940,16 +961,18 @@ onMounted(() => {
           <div class="thumb">
             <img v-if="a.kind === 'image'" :src="a._previewURL" :alt="a.name" />
             <video v-else-if="a.kind === 'video'" :src="a._previewURL" muted preload="metadata" />
-            <span v-else-if="a.kind === 'audio'">🔊</span>
-            <span v-else-if="a.kind === 'text'">📝</span>
-            <span v-else>📄</span>
+            <Volume2 v-else-if="a.kind === 'audio'" :size="14" />
+            <FileText v-else-if="a.kind === 'text'" :size="14" />
+            <File v-else :size="14" />
           </div>
           <span class="name" :title="a.name">{{ a.name }}</span>
-          <button class="rm" @click="removeAttachment(i)" title="移除">×</button>
+          <button class="rm" @click="removeAttachment(i)" title="移除" aria-label="移除附件">×</button>
         </div>
       </div>
       <div class="input-row">
-        <button class="attach-icon-btn" @click="onPickFiles" title="添加附件(支持拖拽、剪贴板粘贴)">📎</button>
+        <button class="attach-icon-btn" @click="onPickFiles" title="添加附件(支持拖拽、剪贴板粘贴)" aria-label="添加附件">
+          <Paperclip :size="18" />
+        </button>
         <textarea
           ref="inputEl"
           v-model="inputText"
@@ -959,28 +982,78 @@ onMounted(() => {
           @keydown="onKeyDown"
           @paste="onPaste"
         ></textarea>
-        <NSelect
-          v-model:value="currentStyleValue"
-          :options="styleOptions"
-          size="tiny"
-          :disabled="!state.currentID"
-          class="style-pick"
-          title="选择人格风格"
-          placeholder="风格"
-        />
+        <!-- Session-level option pickers (style + reasoning).
+             These all share the same visual treatment —
+             a compact pill button with a small chevron that
+             opens an NDropdown — so they read as a single
+             "session settings" cluster on the right side of
+             the input. The dropdown is preferred over
+             NSelect here because:
+               1. NSelect's chrome (border + chevron) would
+                  fight the input-wrap's own border and the
+                  attach/send button styling, producing a
+                  visually busy row.
+               2. The trigger is purely cosmetic — the actual
+                  selection lives in the dropdown menu, so
+                  the button just needs to look "pressable"
+                  and show the current value.
+             Reasoning was promoted from the "more" advanced
+             row (PR #10) so the user doesn't have to expand
+             a hidden section to reach a setting they touch
+             on most tasks. -->
+        <NDropdown
+          trigger="click"
+          placement="top-end"
+          :options="styleOptions.map(o => ({ key: o.value, label: o.label }))"
+          @select="(key: string | number) => onStylePick(String(key))"
+        >
+          <button
+            type="button"
+            class="opt-pick"
+            :disabled="!state.currentID"
+            :title="`当前风格: ${currentStyleValue}`"
+            :aria-label="`当前风格: ${currentStyleValue}`"
+          >
+            <span class="opt-pick-label">{{ currentStyleValue }}</span>
+            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
+          </button>
+        </NDropdown>
+        <NDropdown
+          trigger="click"
+          placement="top-end"
+          :options="(reasoningEffortOptions[0]?.children || []).map(o => ({ key: o.value, label: o.label }))"
+          @select="(key: string | number) => pickReasoning(String(key))"
+        >
+          <button
+            type="button"
+            class="opt-pick opt-pick--narrow"
+            :disabled="!state.currentID"
+            :title="`推理等级: ${currentReasoningLabel}`"
+            :aria-label="`推理等级: ${currentReasoningLabel}`"
+          >
+            <span class="opt-pick-label">{{ currentReasoningLabel }}</span>
+            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
+          </button>
+        </NDropdown>
         <button
           v-if="!isStreaming"
           class="send-btn"
           :disabled="!inputText.trim()"
           @click="send"
           title="发送 (Enter)"
-        >➤</button>
+          aria-label="发送"
+        >
+          <Send :size="16" />
+        </button>
         <button
           v-else
           class="stop-btn"
           @click="stop"
           title="停止 (Esc)"
-        >■</button>
+          aria-label="停止"
+        >
+          <Square :size="14" fill="currentColor" />
+        </button>
       </div>
     </div>
     <input
@@ -992,65 +1065,181 @@ onMounted(() => {
       @change="onFiles(($event.target as HTMLInputElement).files)"
     />
 
-    <!-- Bottom row: model picker + quick settings + hints -->
+    <!-- Bottom row: compact high-frequency controls + collapsible
+         "more" section. The four always-visible controls
+         (model / plan / permission / mute) are the ones the
+         user touches on most messages. Reasoning + KB
+         live behind the ⋯ button by default. -->
     <div class="input-bottom">
-      <div class="input-main">
-        <NSelect
-          v-model:value="currentSelectionValue"
-          :options="modelOptions"
-          size="small"
+      <div class="input-primary">
+        <!-- Model badge: the current model name with a sparkle
+             icon. Click opens the ModelPicker popover
+             (PR #6) which replaces the old NSelect — see
+             ModelPicker.vue for the command-palette-style
+             search + grouped list + keyboard nav. -->
+        <ModelPicker
+          :show="showModelPicker"
+          @update:show="(v) => showModelPicker = v"
+          :provider="currentMeta.provider"
+          :model="currentMeta.model"
+          :providers="state.providers as any"
+          @select="onModelSelect"
+        >
+          <template #trigger>
+            <button
+              type="button"
+              class="model-badge"
+              :class="{ 'model-badge--unset': !currentMeta.model }"
+              :disabled="!state.currentID"
+              :title="'选择模型'"
+              :aria-label="currentMeta.model ? `当前模型 ${currentMeta.model}，点击更换` : '选择模型'"
+              @click="openModelPicker"
+            >
+              <Sparkles :size="12" class="model-badge-icon" />
+              <span class="model-badge-name">{{ currentMeta.model || '选择模型' }}</span>
+              <ChevronDown :size="11" class="model-badge-caret" />
+            </button>
+          </template>
+        </ModelPicker>
+
+        <!-- Plan mode toggle: stays inline because the user
+             switches it often (planning vs building a feature). -->
+        <button
+          type="button"
+          class="ctrl-btn"
+          :class="{ 'ctrl-btn--active': planMode }"
           :disabled="!state.currentID"
-          class="picker picker-wide"
-          title="选择模型 (按提供商分组; ⭐ = 默认)"
-          placeholder="选择模型"
-        />
-      </div>
-      <div class="input-secondary">
-        <NSelect
-          v-model:value="reasoningEffort"
-          :options="reasoningEffortOptions"
-          size="small"
-          class="picker picker-narrow"
-          title="推理等级 (off/low/medium/high/max)"
-          placeholder="推理"
-        />
-        <NButton
-          size="small"
-          :type="planMode ? 'primary' : 'default'"
-          :disabled="!state.currentID"
+          :title="planMode ? '当前：计划模式' : '当前：构建模式'"
+          :aria-label="planMode ? '切换到构建模式' : '切换到计划模式'"
           @click="togglePlanMode"
-          title="切换计划/构建模式"
-        >{{ planMode ? '📋 计划' : '🔨 构建' }}</NButton>
-        <NSelect
-          v-model:value="kbBase"
-          :options="kbOptions"
-          size="small"
+        >
+          <component :is="planMode ? Clipboard : Hammer" :size="13" />
+          <span class="ctrl-btn-label">{{ planMode ? '计划' : '构建' }}</span>
+        </button>
+
+        <!-- Permission picker: icon-only popover. Three
+             states map to lock / unlock / key icons. Keeps
+             the bottom row narrow. NPopover with
+             trigger="click" + v-model:show handles the open /
+             close state — no separate @click handler on the
+             trigger button (that would race with the
+             popover's own click listener). -->
+        <NPopover
+          v-model:show="showPermPicker"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
+          style="padding: 0; background: transparent; box-shadow: none;"
+        >
+          <template #trigger>
+            <button
+              type="button"
+              class="ctrl-btn"
+              :disabled="!state.currentID"
+              :title="`权限: ${permLabel}`"
+              :aria-label="`权限级别: ${permLabel}，点击更改`"
+            >
+              <component :is="permIcon" :size="13" />
+              <span class="ctrl-btn-label">{{ permLabel }}</span>
+            </button>
+          </template>
+          <div class="perm-popover">
+            <div class="perm-popover-label">工具权限</div>
+            <button
+              v-for="opt in permissionOptions"
+              :key="opt.value"
+              type="button"
+              class="perm-popover-item"
+              :class="{ 'perm-popover-item--active': permissionLevel === opt.value }"
+              @click="onChangePermissionLevel(opt.value); showPermPicker = false"
+            >
+              <span class="perm-popover-radio" />
+              <span class="perm-popover-name">{{ opt.label }}</span>
+            </button>
+          </div>
+        </NPopover>
+
+        <!-- Mute toggle: same icon-only treatment as the
+             other controls. Stays in the always-visible
+             row because it's a one-click toggle. -->
+        <button
+          type="button"
+          class="ctrl-btn"
+          :class="{ 'ctrl-btn--active-warn': mute }"
           :disabled="!state.currentID"
-          class="picker picker-perm"
-          title="选择知识库"
-          placeholder="知识库"
-        />
-        <NSelect
-          v-model:value="permissionLevel"
-          :options="permissionOptions"
-          size="small"
-          :disabled="!state.currentID"
-          class="picker picker-perm"
-          title="权限级别"
-          @update:value="onChangePermissionLevel"
-        />
-        <NButton
-          size="small"
-          :type="mute ? 'warning' : 'default'"
-          :disabled="!state.currentID"
+          :title="mute ? '提示音已关闭' : '提示音已开启'"
+          :aria-label="mute ? '开启提示音' : '关闭提示音'"
           @click="onToggleMute"
-          title="提示音开关"
-        >{{ mute ? '🔇' : '🔊' }}</NButton>
-        <div class="hints">
-          <span><kbd>Enter</kbd> 发送</span>
-          <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
-          <span><kbd>Esc</kbd> 停止</span>
+        >
+          <component :is="mute ? VolumeX : Volume2" :size="13" />
+        </button>
+
+        <!-- More toggle: expands the secondary row with
+             the KB picker. The chevron rotates to
+             indicate the expanded state. Reasoning used
+             to live here too but was promoted to the
+             input-row in PR #10 (next to the style
+             picker) because it's a setting the user
+             touches on most tasks; KB stays in "more"
+             because it's changed less often and the
+             label can be long ("知识库 · {name}"),
+             which would crowd the input-row. The
+             expanded state uses the same .opt-pick
+             styling as the input-row pickers so the
+             three read as a coherent family. -->
+        <button
+          type="button"
+          class="ctrl-btn ctrl-btn--more"
+          :class="{ 'ctrl-btn--expanded': showAdvanced }"
+          :title="showAdvanced ? '收起高级选项' : '展开高级选项'"
+          :aria-label="showAdvanced ? '收起高级选项' : '展开高级选项'"
+          :aria-expanded="showAdvanced"
+          @click="showAdvanced = !showAdvanced"
+        >
+          <component :is="showAdvanced ? ChevronUp : ChevronDown" :size="13" />
+          <span class="ctrl-btn-label">更多</span>
+        </button>
+      </div>
+
+      <!-- Secondary row: KB picker. Collapsed by default.
+           Uses the same .opt-pick visual treatment as the
+           input-row style + reasoning pickers so it reads
+           as part of the same family, not a different
+           control. The .input-advanced wrapper still
+           provides the surface-1 background + border so
+           the row reads as visually subordinate (a
+           "secondary" surface) even though its controls
+           match the primary surface. -->
+      <Transition name="row-slide">
+        <div v-if="showAdvanced" class="input-advanced">
+          <NDropdown
+            trigger="click"
+            placement="top-end"
+            :options="kbOptions.map(o => ({ key: o.value, label: o.label }))"
+            @select="(key: string | number) => pickKB(String(key))"
+          >
+            <button
+              type="button"
+              class="opt-pick"
+              :disabled="!state.currentID"
+              :title="`知识库: ${currentKBLabel}`"
+              :aria-label="`知识库: ${currentKBLabel}`"
+            >
+              <Database :size="12" class="opt-pick-icon" />
+              <span class="opt-pick-label">{{ currentKBLabel }}</span>
+              <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
+            </button>
+          </NDropdown>
         </div>
+      </Transition>
+
+      <!-- Keyboard hints: live at the very bottom, always
+           visible. Aligns to the right so the rest of the
+           row has the user's eye path. -->
+      <div class="hints">
+        <span><kbd>Enter</kbd> 发送</span>
+        <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
+        <span><kbd>Esc</kbd> 停止</span>
       </div>
     </div>
   </div>
@@ -1126,31 +1315,31 @@ onMounted(() => {
   gap: 8px;
   padding: 6px 12px;
   margin-bottom: 8px;
-  background: var(--warning-suppl, #fff8e1);
-  border: 1px solid var(--warning, #f0a020);
-  border-radius: 6px;
+  background: var(--warn-50);
+  border: 1px solid var(--warn-500);
+  border-radius: var(--radius-sm);
   font-size: 13px;
 }
 .rollback-banner-icon {
   font-size: 15px;
-  color: var(--warning, #f0a020);
+  color: var(--warn-500);
 }
 .rollback-banner-text {
-  color: var(--text);
+  color: var(--text-primary);
   flex: 1;
 }
 .rollback-banner-undo {
   background: none;
   border: none;
-  color: var(--warning, #f0a020);
+  color: var(--warn-500);
   cursor: pointer;
   font-size: 13px;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
 }
 .rollback-banner-undo:hover {
-  background: var(--warning, #f0a020);
-  color: #fff;
+  background: var(--warn-500);
+  color: var(--on-brand);
 }
 .rollback-banner-dismiss {
   background: none;
@@ -1212,22 +1401,72 @@ onMounted(() => {
   margin: 0;
   padding: 8px 0 8px 0;
 }
-.style-pick {
-  --n-border: none !important;
-  --n-border-hover: none !important;
-  --n-border-focus: none !important;
-  --n-box-shadow-focus: none !important;
-  flex: 0 0 auto;
-  min-width: 72px;
-  max-width: 100px;
+.opt-pick {
+  /* The session-level option pickers (style, reasoning, KB)
+   * share the same visual treatment: a compact pill button
+   * with the current value as a label and a small chevron
+   * on the right. They live in the input-row next to the
+   * textarea, so they need to be narrow and quiet — no
+   * border, no NSelect chrome, just a text label that gets
+   * a subtle background on hover.
+   *
+   * Originally named `.style-pick` (just for the style
+   * picker); renamed to `.opt-pick` in PR #10 when
+   * reasoning and KB were promoted from the "more" advanced
+   * row to the input-row. The `.opt-pick--narrow` modifier
+   * is used for reasoning because its labels (关闭/低/中/高/
+   * 最高) are very short and a smaller min-width keeps the
+   * three pickers visually balanced. */
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  min-width: 56px;
+  justify-content: center;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
 }
-.style-pick :deep(.n-base-selection) {
-  background: transparent !important;
-  border: none !important;
-  box-shadow: none !important;
+.opt-pick:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text-primary);
 }
-.style-pick :deep(.n-base-selection:hover) {
-  background: var(--bg-3) !important;
+.opt-pick:disabled { opacity: 0.5; cursor: not-allowed; }
+.opt-pick-caret { color: var(--text-tertiary); flex-shrink: 0; }
+.opt-pick-label {
+  /* Cap on label width so a long KB name (e.g.
+   * "知识库 · 我的资料库") doesn't push the send button off
+   * the row. When the label overflows, ellipsis kicks in
+   * and the user can still read the full name in the
+   * dropdown. */
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.opt-pick--narrow {
+  /* Reasoning labels are 1–2 characters, so the regular
+   * 56px min-width looks oversized. Tighter min keeps the
+   * three pickers visually balanced. */
+  min-width: 36px;
+}
+.opt-pick--narrow .opt-pick-label {
+  max-width: 28px;
+}
+/* Small inline icon (e.g. the database glyph on the KB
+ * picker). Slightly muted so it doesn't compete with the
+ * label. */
+.opt-pick-icon {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
 }
 .send-btn, .stop-btn {
   width: 32px; height: 32px;
@@ -1243,69 +1482,251 @@ onMounted(() => {
 .stop-btn { background: var(--error); }
 .stop-btn:hover { background: var(--error); opacity: 0.85; }
 
-.hints { font-size: 10px; color: var(--text-4); display: flex; gap: 10px; margin-left: auto; white-space: nowrap; }
+/* Keyboard hints: live at the very bottom of the input area,
+ * right-aligned. Always visible. */
+.hints {
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  white-space: nowrap;
+}
 .hints kbd {
-  background: var(--bg-3); border: 1px solid var(--border-2);
-  border-radius: 3px; padding: 0 4px; font-family: ui-monospace, Menlo, monospace; font-size: 9px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--text-secondary);
+  margin-right: 2px;
 }
 
-/* Inline session-config dropdowns (always visible, no toggle). */
-.picker {
-  min-width: 110px;
-  max-width: 150px;
-  flex: 0 0 auto;
-}
-.picker-wide {
-  min-width: 170px;
-  max-width: 260px;
-  flex: 1 1 180px;
-}
-.picker-narrow {
-  min-width: 72px;
-  max-width: 100px;
-  flex: 0 0 auto;
-}
-.picker-perm {
-  min-width: 120px;
-  max-width: 150px;
-  flex: 0 0 auto;
-}
-
-/* The input area must be height-bounded: with many attachments
- * the attach strip + the textarea + the control row used to
- * grow tall enough to push the chat above it out of the
- * viewport. We split the bottom into a controls row and a
- * separate hints row so the controls can wrap to a second
- * line on narrow windows without bumping the hints. */
+/* NSelects in the advanced row (reasoning + KB). */
+/* The input area's height is determined by its content: the
+ * textarea (capped at 4 lines by resizeTextarea()), the
+ * attach-strip (capped at 96px internally), and the
+ * bottom controls (primary row + the "更多" advanced row
+ * when expanded). Each child caps itself, so the area as
+ * a whole can grow to whatever's needed without clipping
+ * the dialog or pushing the messages-scroll out of the
+ * way. The `flex-shrink: 0` ensures the message list
+ * above gets compressed first if the viewport is
+ * genuinely too small (we'd rather show fewer messages
+ * than hide the input). */
 .input-area {
   border-top: 1px solid var(--border);
   background: var(--bg-2);
-  padding: 8px 12px 8px 12px;
+  padding: 8px 12px;
   flex-shrink: 0;
-  /* Keep the input area to a sane share of the chat window.
-   * Internal scroll (on the attach strip) keeps overflow
-   * contained. */
-  max-height: 50vh;
-  overflow: auto;
 }
 .input-bottom {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  gap: 6px;
   margin-top: 6px;
-  gap: 6px;
 }
-.input-main {
+.input-primary {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.input-advanced {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
 }
-.input-secondary {
+
+/* Slide-down transition for the advanced row. Tied to the
+ * <Transition name="row-slide"> in the template. The classes
+ * are named in the Vue 2 / 3 transition convention. */
+.row-slide-enter-active,
+.row-slide-leave-active {
+  transition: max-height var(--dur-base) var(--ease-out),
+              opacity var(--dur-base) var(--ease-out);
+  overflow: hidden;
+}
+.row-slide-enter-from,
+.row-slide-leave-to {
+  max-height: 0;
+  opacity: 0;
+}
+.row-slide-enter-to,
+.row-slide-leave-from {
+  max-height: 80px;
+  opacity: 1;
+}
+
+/* --- Bottom-row buttons (plan / perm / mute / more) --------------- */
+/* Generic pill-button style used for the always-visible
+ * bottom-row controls. The button is transparent by
+ * default and picks up an active background when the
+ * underlying state is on (plan mode active, mute active).
+ * Different active colors are applied via .ctrl-btn--active
+ * (brand) and .ctrl-btn--active-warn (warn). */
+.ctrl-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.ctrl-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.ctrl-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ctrl-btn--active {
+  background: var(--brand-50);
+  color: var(--brand-600);
+  border-color: var(--brand-100);
+}
+.ctrl-btn--active:hover:not(:disabled) {
+  background: var(--brand-100);
+  color: var(--brand-700);
+}
+.ctrl-btn--active-warn {
+  background: var(--warn-50);
+  color: var(--warn-500);
+}
+.ctrl-btn--more.ctrl-btn--expanded {
+  background: var(--surface-2);
+  border-color: var(--border-subtle);
+}
+.ctrl-btn-label {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* --- Model badge ------------------------------------------------ */
+/* The "current model" trigger for the ModelPicker popover.
+ * Shows the model name with a sparkle icon and a chevron to
+ * hint that clicking opens a picker. Adopts an "unset"
+ * state when no model is selected (no current session, or
+ * no provider configured). */
+.model-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 8px 0 8px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  flex-shrink: 0;
+  max-width: 220px;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+.model-badge:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--border-default);
+}
+.model-badge:disabled { opacity: 0.5; cursor: not-allowed; }
+.model-badge-icon { color: var(--ai-500); flex-shrink: 0; }
+.model-badge-caret { color: var(--text-tertiary); flex-shrink: 0; }
+.model-badge-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
+  font-family: var(--font-mono);
+}
+.model-badge--unset .model-badge-name { color: var(--text-tertiary); font-style: italic; }
+
+/* --- Permission popover ---------------------------------------- */
+/* The permission picker is an NPopover that anchors to the
+ * perm ctrl-btn. The popover body is a list of three
+ * radio-style rows (always-ask / auto-approve / full-
+ * access). Kept narrow — the user picks one and the
+ * popover closes. */
+.perm-popover {
+  width: 200px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.perm-popover-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 4px 8px 2px;
+}
+.perm-popover-item {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  flex: 1 1 auto;
-  min-width: 0;
-  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.perm-popover-item:hover {
+  background: var(--surface-3);
+}
+.perm-popover-item--active {
+  background: var(--brand-50);
+  color: var(--brand-600);
+}
+.perm-popover-item--active:hover {
+  background: var(--brand-100);
+}
+.perm-popover-radio {
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+  flex-shrink: 0;
+  position: relative;
+}
+.perm-popover-item--active .perm-popover-radio {
+  border-color: var(--brand-500);
+}
+.perm-popover-item--active .perm-popover-radio::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: var(--brand-500);
+}
+.perm-popover-name {
+  flex: 1;
 }
 </style>
