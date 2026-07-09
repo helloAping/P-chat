@@ -1758,23 +1758,20 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						// If the sandbox returns Confirm, pause and
 						// wait for user approval before executing
 						// (unless permission level is "auto").
-						if tc.Name == "exec_command" || tc.Name == "write_file" {
-							var decision tool.SandboxDecision
-							var reason string
-							if tc.Name == "exec_command" {
-								var ea struct{ Command string `json:"command"` }
-								json.Unmarshal([]byte(tc.ArgsJSON), &ea)
-								command := ea.Command
-								if command == "" {
-									command = tc.ArgsJSON
-								}
-								decision = a.sandbox.CheckExecDecision(command)
-								reason = a.sandbox.MatchedPattern(command)
-							} else {
-								var wa struct{ Path string `json:"path"` }
-								json.Unmarshal([]byte(tc.ArgsJSON), &wa)
-								decision = a.sandbox.CheckWriteDecision(wa.Path)
-							}
+						//
+						// 2026-07: the confirm branch now covers all
+						// I/O-bearing tools (exec_command, write_file,
+						// read_file, read_docx, read_pdf, list_files)
+						// — the read tools went through unchanged
+						// before, which let an LLM that had a write
+						// confirm approved follow up with read_file on
+						// /etc/passwd. The path-class check (project /
+						// global / external) drives the Confirm vs
+						// Allow decision via CheckReadDecision /
+						// CheckWriteDecision.
+						cfmTarget, ok := confirmTargetFor(tc.Name, tc.ArgsJSON, req.ProjectRoot, a.sandbox)
+						if ok {
+							decision, reason, resolvedPath := cfmTarget.Decision, cfmTarget.Reason, cfmTarget.ResolvedPath
 							if decision == tool.SandboxConfirm {
 								if permLevel == tool.PermissionAuto {
 									// Auto-approve: skip confirm modal,
@@ -1795,9 +1792,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 								} else {
 									// Normal confirm flow.
 									cfm := tool.ConfirmRequest{
-										ToolName: tc.Name,
-										Args:     tc.ArgsJSON,
-										Reason:   reason,
+										ToolName:     tc.Name,
+										Args:         tc.ArgsJSON,
+										Reason:       reason,
+										ResolvedPath: resolvedPath,
+										PathClass:    cfmTarget.PathClass,
+										RiskLevel:    cfmTarget.RiskLevel,
 									}
 									var sessionID string
 									if sid, ok := tctx.Value(tool.SessionIDKey{}).(string); ok {

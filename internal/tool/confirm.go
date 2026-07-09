@@ -12,6 +12,23 @@ type ConfirmRequest struct {
 	ToolName string `json:"tool_name"`
 	Args     string `json:"args"`
 	Reason   string `json:"reason"`
+	// ResolvedPath is the absolute path the LLM will actually
+	// touch (post resolveToProjectRoot, post `..` cleanup).
+	// Surfaced in the modal so the user can SEE the real target
+	// even when the LLM passed a relative or traversal form.
+	ResolvedPath string `json:"resolved_path,omitempty"`
+	// PathClass is one of "project", "global", "external",
+	// "protected", "allowed". Drives the modal's path-class
+	// label and the colour of the "this is outside the project"
+	// warning. Empty means the tool isn't path-bearing
+	// (exec_command) and the modal omits the chip.
+	PathClass string `json:"path_class,omitempty"`
+	// RiskLevel is one of "low", "medium", "high". Drives the
+	// button colour and modal title. "high" for writes and
+	// arbitrary-exec, "low" for reads. Phase 1 uses a static
+	// mapping; Phase 2 will derive it from the matched
+	// dangerous-pattern severity.
+	RiskLevel string `json:"risk_level,omitempty"`
 }
 
 type ConfirmResponse struct {
