@@ -97,16 +97,25 @@ function onRollback() {
   // Rollback is destructive — the user loses the message
   // and everything after it. Require a double-click: the
   // first click puts the button into `pending` for 3
-  // seconds and shows a "再点一次确认" hint; the second
-  // click during that window actually fires the emit.
-  // After 3s of inactivity, the pending state auto-
-  // restores so the next accidental hover doesn't carry
-  // the "armed" state.
+  // seconds and shows a visible "撤回? 3s" countdown in
+  // the button; the second click during that window
+  // actually fires the emit. After 3s of inactivity, the
+  // pending state auto-restores so the next accidental
+  // hover doesn't carry the "armed" state.
+  //
+  // The countdown was added on 2026-07-09 in response to
+  // user feedback: the old design relied on a 1px color
+  // swap + 6% scale pulse + browser title text, none of
+  // which clearly communicated that a SECOND click was
+  // required. The inline countdown text in the button is
+  // unmissable.
   if (isAction('rollback', 'pending')) {
+    stopRollbackCountdown()
     emit('rollback')
     return
   }
   setActionState('rollback', 'pending', 3000)
+  startRollbackCountdown(3000)
 }
 function onFork() {
   pulseAction('fork')
@@ -162,6 +171,50 @@ function setActionState(key: string, next: ActionState, autoMs = 0) {
     }, autoMs)
   }
 }
+
+// --- Rollback countdown ---------------------------------------
+//
+// Visual companion to the rollback `pending` state. The setTimeout
+// inside setActionState() handles the auto-restore; this pair
+// drives a per-second numeric label (3 → 2 → 1) inside the
+// button so the user can SEE that a second click is required.
+//
+// We tick via setInterval rather than chained setTimeout so the
+// countdown is robust to focus-loss throttling (browsers clamp
+// chained setTimeouts on background tabs to ~1Hz; setInterval
+// stays accurate at 1Hz on its own).
+const rollbackCountdown = ref(0)
+let rollbackCountdownTimer: ReturnType<typeof setInterval> | null = null
+
+function startRollbackCountdown(ms: number) {
+  stopRollbackCountdown()
+  // Round up to whole seconds so the first tick reads "3" not
+  // "3.x" — a fractional label looks broken.
+  rollbackCountdown.value = Math.max(1, Math.ceil(ms / 1000))
+  rollbackCountdownTimer = setInterval(() => {
+    rollbackCountdown.value = Math.max(0, rollbackCountdown.value - 1)
+    if (rollbackCountdown.value <= 0) {
+      stopRollbackCountdown()
+    }
+  }, 1000)
+}
+
+function stopRollbackCountdown() {
+  if (rollbackCountdownTimer) {
+    clearInterval(rollbackCountdownTimer)
+    rollbackCountdownTimer = null
+  }
+  rollbackCountdown.value = 0
+}
+
+// Belt-and-braces: if the component unmounts while a rollback
+// is pending, stop ticking so the label doesn't leak into the
+// next message's bubble. onBeforeUnmount fires before the DOM
+// is destroyed; the interval handle is captured by closure.
+import { onBeforeUnmount } from 'vue'
+onBeforeUnmount(() => {
+  stopRollbackCountdown()
+})
 
 function pulseAction(key: string) {
   // Short tactile pulse: re-triggers the press animation
@@ -807,8 +860,8 @@ const canRollback = computed(() =>
             type="button"
             class="bubble-action-btn bubble-action-rollback"
             :class="{ 'is-pending': isAction('rollback', 'pending') }"
-            :title="isAction('rollback', 'pending') ? '再点一次确认撤回' : '撤回此消息及之后的回复'"
-            :aria-label="isAction('rollback', 'pending') ? '再点一次确认撤回' : '撤回消息'"
+            :title="isAction('rollback', 'pending') ? `再点一次确认撤回（${rollbackCountdown}s）` : '撤回此消息及之后的回复'"
+            :aria-label="isAction('rollback', 'pending') ? `再点一次确认撤回，${rollbackCountdown} 秒后取消` : '撤回消息'"
             @click="onRollback"
           >
             <component
@@ -817,6 +870,11 @@ const canRollback = computed(() =>
               :key="`rollback-${pulseKey}`"
               class="bubble-action-icon"
             />
+            <span
+              v-if="isAction('rollback', 'pending')"
+              class="bubble-action-countdown"
+              aria-hidden="true"
+            >{{ rollbackCountdown }}s</span>
           </button>
           <button
             type="button"
@@ -848,6 +906,15 @@ const canRollback = computed(() =>
    * canvas width minus a 16px gutter. */
   max-width: 100%;
   position: relative;
+  /* Each message sits in its own stacking context so the
+   * action toolbar (z-index 50 inside .msg) cannot bleed
+   * out and overlap the action bar of the next message
+   * above it in the scroll viewport. Without this, a
+   * hover-induced opacity transition on the topmost
+   * visible message's toolbar would briefly paint on
+   * top of the message immediately above during the
+   * transition. */
+  z-index: 1;
 }
 .msg.user { flex-direction: row-reverse; }
 .msg.system { padding-left: 16px; padding-right: 16px; }
@@ -1005,7 +1072,14 @@ const canRollback = computed(() =>
   transform: translateY(2px);
   transition: opacity var(--dur-fast) var(--ease-out),
               transform var(--dur-fast) var(--ease-out);
-  z-index: 5;
+  /* z-index raised from 5 to 50 in 2026-07-09 to keep the
+   * action bar above Naive UI's tooltip layer (~60) and
+   * the chat window's stream-status bar that recently
+   * started using a sticky positioning context. The
+   * .msg parent (z-index 1) ensures this is scoped to the
+   * current message and does not bleed into adjacent
+   * messages. */
+  z-index: 50;
   /* Light blur under the pill so it sits on top of the
    * message content cleanly when overlapping. */
   backdrop-filter: blur(4px);
@@ -1078,6 +1152,14 @@ const canRollback = computed(() =>
   color: var(--warn-500);
   box-shadow: inset 0 0 0 1px var(--warn-500);
   animation: bubble-action-pending 1.1s var(--ease-in-out, ease-in-out) infinite;
+  /* Widen the button while pending so the "3s" / "2s" / "1s"
+   * label has room. Without this the label would either
+   * overflow the 26px hit area or get clipped by adjacent
+   * button borders. We add the extra width only to the
+   * pending button so the idle state stays compact. */
+  width: auto;
+  padding: 0 6px 0 4px;
+  gap: 2px;
 }
 .bubble-action-rollback.is-pending:hover {
   background: var(--warn-50);
@@ -1092,6 +1174,22 @@ const canRollback = computed(() =>
  * re-fire the keyframe. */
 .bubble-action-pulse:active {
   animation: bubble-action-pulse 220ms var(--ease-out, ease-out);
+}
+
+/* Rollback countdown label. Renders inside the pending
+ * rollback button so the user sees "撤回? 3s" → "2s" →
+ * "1s" and knows a second click is required. The label
+ * uses the warn color (inherited from .is-pending) and
+ * a tabular-nums font-feature so the digits don't
+ * jitter as the width changes between single and
+ * double digits. */
+.bubble-action-countdown {
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  pointer-events: none;
 }
 
 @keyframes bubble-action-feedback {
