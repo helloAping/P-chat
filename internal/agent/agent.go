@@ -788,6 +788,19 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	return prompt, sig, nil
 }
 
+// appendWorkingDirectoryBlock returns the "## Working Directory"
+// section text, formatted exactly as buildStaticSystemPrompt emits
+// it. Exposed as a function so the sub-agent prompt re-append path
+// (which fires AFTER buildStaticSystemPrompt has been overridden by
+// PromptOv) stays in lock-step with the main-agent wording — any
+// drift between the two will confuse the LLM.
+func appendWorkingDirectoryBlock(projectRoot string) string {
+	return fmt.Sprintf("\n\n---\n\n## Working Directory\n\n"+
+		"Your working directory is fixed at `%s`. exec_command runs here automatically "+
+		"(the work_dir argument is ignored). read_file and write_file resolve relative "+
+		"paths against this directory.\n", projectRoot)
+}
+
 // buildKBIndex builds the Knowledge Base section of the system prompt.
 // When KBBase is "__all__", all enabled bases are listed. When it's a
 // specific name, only that base's index is shown. If the base has no
@@ -1136,6 +1149,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// any user context that was in flight.
 		if req.PromptOv != "" {
 			systemPrompt = req.PromptOv
+		}
+		// Re-append the "Working Directory" section when a
+		// sub-agent overrides the system prompt. The main
+		// agent gets this from buildStaticSystemPrompt above
+		// (conditional on projectRoot != ""), but the override
+		// above wipes the cached prefix, so sub-agents would
+		// otherwise have no idea what directory exec_command
+		// and read_file are anchored to. Mirrors the wording
+		// in buildStaticSystemPrompt so the LLM sees a
+		// consistent instruction in both contexts.
+		if req.ProjectRoot != "" {
+			systemPrompt += appendWorkingDirectoryBlock(req.ProjectRoot)
 		}
 		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))})
 

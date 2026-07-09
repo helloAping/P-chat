@@ -57,6 +57,13 @@ type Request struct {
 	Style          style.Style
 	Provider       string
 	TaskID         string
+	// ProjectRoot is the session's working directory. The
+	// sub-agent runner reads it from the parent ctx (see
+	// tool.ProjectRootFromCtx) and passes it down to the
+	// child ChatRequest so file/command tools resolve
+	// relative paths against the same base the user set
+	// for the session.
+	ProjectRoot string
 }
 
 // Result is what the runner returns. Content is the final assistant text
@@ -492,6 +499,15 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 			runner.ParentProviderModel = pm
 		}
 
+		// Inherit the session's project root (working directory).
+		// Without this, the sub-agent's tool calls (exec_command,
+		// read_file, write_file, list_files) resolve relative paths
+		// against the server's startup CWD instead of the user's
+		// selected project directory — which is the silent bug
+		// that drove the 2026-07 "tool runs in the wrong folder"
+		// report.
+		projectRoot := tool.ProjectRootFromCtx(ctx)
+
 		res, err := runner.Run(ctx, Request{
 			Description:     a.Description,
 			SubagentType:    strings.TrimSpace(a.SubagentType),
@@ -500,6 +516,7 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 			Style:           style.Style(strings.ToLower(strings.TrimSpace(a.Style))),
 			Provider:        strings.TrimSpace(a.Provider),
 			TaskID:          strings.TrimSpace(a.TaskID),
+			ProjectRoot:     projectRoot,
 		})
 		if err != nil {
 			return &tool.CallResult{
@@ -721,19 +738,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		chatModel = prov
 	}
 
-	chatReq := agent.ChatRequest{
-		Style:         s,
-		Provider:      prov,
-		Model:         chatModel,
-		PromptOv:      promptOv,
-		SubagentType:  subType,
-		SubagentColor: color,
-		SubagentTaskID: req.TaskID,
-		SessionID:     "subagent-" + subType + "-" + req.TaskID,
-		Messages: []llm.ChatMessage{
-			{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Description},
-		},
-	}
+	chatReq := buildSubAgentChatRequest(req, s, prov, chatModel, promptOv, subType, color)
 
 	start := time.Now()
 	stream := subAgent.ChatWithTools(runCtx, chatReq)
@@ -949,4 +954,30 @@ func redactPhantomErrorsServer(s string) string {
 		return s
 	}
 	return phantomScrubRe.ReplaceAllString(s, phantomScrubReplacement)
+}
+
+// buildSubAgentChatRequest assembles the ChatRequest the sub-agent
+// runner hands to agent.ChatWithTools. Extracted from Default.Run
+// so the field wiring (notably ProjectRoot, which silently dropped
+// pre-2026-07 fix) can be unit-tested without spinning up a real
+// agent + LLM stack.
+func buildSubAgentChatRequest(
+	req Request,
+	s style.Style,
+	prov, chatModel, promptOv, subType, color string,
+) agent.ChatRequest {
+	return agent.ChatRequest{
+		Style:          s,
+		Provider:       prov,
+		Model:          chatModel,
+		PromptOv:       promptOv,
+		SubagentType:   subType,
+		SubagentColor:  color,
+		SubagentTaskID: req.TaskID,
+		ProjectRoot:    req.ProjectRoot,
+		SessionID:      "subagent-" + subType + "-" + req.TaskID,
+		Messages: []llm.ChatMessage{
+			{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Description},
+		},
+	}
 }

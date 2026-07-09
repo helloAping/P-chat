@@ -97,6 +97,13 @@ func projectRootFromCtx(ctx context.Context) string {
 	return ""
 }
 
+// ProjectRootFromCtx is the public accessor so packages outside
+// tool (notably subagent) can read the project root that the main
+// agent stored in ctx. Returns "" if no root was set.
+func ProjectRootFromCtx(ctx context.Context) string {
+	return projectRootFromCtx(ctx)
+}
+
 // resolveToProjectRoot resolves a path to an absolute path.
 // If the path is relative, it is resolved against the project
 // root from the context. If the path is already absolute or no
