@@ -1356,7 +1356,25 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 				}
 
-				stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, normalizeToolResults(roundMsgs), roundTools, opts)
+				// Only mangle the tool_call/tool_result pairing for
+				// protocols that need it (legacy: a handful of
+				// OpenAI-compatible proxies that validate the
+				// pairing and reject mixed tool_call + tool_result
+				// rounds). For standard openai and anthropic the
+				// LLM needs to see the pairing so it can recognise
+				// the user answer and stop looping — without it,
+				// the LLM interprets the tool result as a user
+				// message and dutifully re-asks via the question
+				// tool, which is exactly the bug we hit with
+				// `cs` (Doubao) and `mimo-v2.5` in 2026-07-09.
+				//
+				// See needsNormalizedToolResults for the
+				// provider list.
+				msgsForLLM := roundMsgs
+				if needsNormalizedToolResults(req.Provider) {
+					msgsForLLM = normalizeToolResults(roundMsgs)
+				}
+				stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
 				for chunk := range stream {
 					if chunk.Err != nil {
 						classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
@@ -1790,15 +1808,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							}
 						}
 					}
-					// Persist question before blocking for user input.
-					if tc.Name == "question" && a.store != nil {
-						persistQuestion(req.SessionID, a.store, string(argsRaw))
-					}
+					// Question persistence: handled entirely
+					// via the parts accumulator (partsAcc
+					// converts the question event into a
+					// `question` part and the answer event
+					// updates it in place). The whole
+					// interaction lives inside the
+					// assistant message's persisted parts
+					// snapshot — no separate DB rows, no
+					// pairQuestionMessages on reload.
+					// The handler still BLOCKS here for the
+					// user to answer (the result carries
+					// {"questions":..., "answers":...}).
 					result, err := handler(toolCtx, argsRaw)
-					// Persist answer after user responds.
-					if tc.Name == "question" && result != nil && a.store != nil {
-						persistQuestionAnswer(req.SessionID, a.store, result.Content)
-					}
 					outcomes[i] = toolOutcome{
 						idx:     i,
 						tc:      tc,
@@ -1844,6 +1866,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						ToolID:    tc.ID,
 						ToolName:  tc.Name,
 						ToolError: true,
+						// See comment on the success path for
+						// why MsgType must be set explicitly.
+						MsgType: llm.MsgTypeTool,
 					}
 					msgs = append(msgs, toolMsg)
 					if a.store != nil {
@@ -1906,6 +1931,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					ToolID:    tc.ID,
 					ToolName:  tc.Name,
 					ToolError: result.IsError,
+					// MsgType must be set so the read path
+					// (buildMessageResponse in handler.go)
+					// can drop standalone tool_result rows.
+					// Without it, the row's msg_type column
+					// defaults to 0 (msg_type for plain
+					// text), the `if m.MsgType ==
+					// llm.MsgTypeTool` filter never fires,
+					// and the tool's raw JSON Content (e.g.
+					// the question tool's `{questions,
+					// answers}` payload) leaks into the
+					// chat as a free-floating text bubble.
+					// Surfaces after rollback/undo because
+					// the in-memory splice restores the
+					// unfiltered row.
+					MsgType: llm.MsgTypeTool,
 				}
 				msgs = append(msgs, toolMsg)
 				if a.store != nil {
@@ -2008,11 +2048,60 @@ func formatElapsed(d time.Duration) string {
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
+// needsNormalizedToolResults reports whether the named provider
+// needs the legacy `normalizeToolResults` transformation before
+// messages are sent to the LLM.
+//
+// History: an earlier version of this code applied the normalize
+// transformation globally to every provider, on the theory that a
+// handful of OpenAI-compatible proxies validate the
+// tool_call/tool_result pairing and reject mixed rounds. The cost
+// was that standard openai / anthropic LLMs lost the
+// tool_call/tool_result pairing in their context, which broke the
+// `question` tool flow: the LLM no longer saw its own tool_call,
+// interpreted the tool result as a user message, and re-asked via
+// the question tool — a loop. The bug surfaced in 2026-07-09
+// against the `cs` provider (Doubao proxy → mimo-v2.5).
+//
+// The fix is to apply normalize only to the providers that
+// actually need it. Currently no provider on the active list does,
+// so this returns false for every known name; the legacy code path
+// is preserved as a fall-back for the day a quirky proxy shows up.
+// Add a provider name here (or a `Protocol` value via the config
+// field below) to opt in.
+//
+// Note: this intentionally keys on the provider NAME, not the
+// `Protocol` field. The protocol only tells us the wire format
+// (openai / anthropic) — both support tool_call/tool_result pairs
+// correctly. The "needing normalize" attribute is a per-provider
+// quirk, not a protocol attribute.
+func needsNormalizedToolResults(providerName string) bool {
+	switch providerName {
+	// Add provider names here that have been verified to need
+	// the legacy flatten-tool-results treatment. Examples
+	// (none currently active):
+	//
+	//   case "some-quirky-proxy":
+	//       return true
+	default:
+		return false
+	}
+}
+
 // normalizeToolResults removes TypeToolCall metadata rows and
 // converts TypeToolResult messages to User role. This way providers
-// that validate tool_call/tool_result pairing (DeepSeek, etc.) see
-// normal user-assistant-user conversation, and the LLM still sees
-// tool results as part of the ongoing dialogue.
+// that validate tool_call/tool_result pairing (some OpenAI-
+// compatible proxies) see normal user-assistant-user conversation,
+// and the LLM still sees tool results as part of the ongoing
+// dialogue.
+//
+// WARNING: this transformation BREAKS the question tool flow on
+// standard OpenAI / Anthropic models. The LLM needs the
+// tool_call/tool_result pairing to recognise that the user has
+// answered; flattening the result into a user message makes the
+// LLM interpret the JSON as a user statement and re-ask the
+// question (infinite loop). Apply only via
+// needsNormalizedToolResults — never globally.
 func normalizeToolResults(msgs []llm.ChatMessage) []llm.ChatMessage {
 	out := make([]llm.ChatMessage, 0, len(msgs))
 	for _, m := range msgs {
@@ -2035,6 +2124,21 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 		"role":   msg.Role,
 		"reason": "assistant",
 	}
+	// `thinking` is the v1 metadata key. It's redundant
+	// with the v2 path below (snapshotStructural includes
+	// thinking parts in the meta["parts"] blob), but the
+	// server's decodePartsFromMeta v1 fallback still
+	// reads `meta["thinking"]` to rebuild a thinking
+	// part when the parts blob is structural-only. Older
+	// rows that were persisted before the v2 parts
+	// snapshot landed in the agent (commit 8a16a69) have
+	// `meta["thinking"]` populated and a structural-only
+	// parts blob (or none at all) — the v1 fallback is
+	// what makes their reload view correct. Keep the
+	// write; without it, a session that started under v1
+	// and continued under v2 could lose thinking on
+	// reload if any intermediate change re-emits the row
+	// through the structural-only path.
 	if fullThinking != "" {
 		meta["thinking"] = fullThinking
 	}
@@ -2051,39 +2155,6 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 		}
 	}
 	store.AddChatMessageWithMetaTo(convID, msg, meta)
-}
-
-// persistQuestion stores the question tool's arguments as a
-// msg_type=6 message so the question table is visible in
-// session history after reload.
-func persistQuestion(convID string, store *memory.Store, questionsJSON string) {
-	if store == nil || questionsJSON == "" {
-		return
-	}
-	msg := llm.ChatMessage{
-		Role:        llm.RoleAssistant,
-		Type:        llm.TypeText,
-		MsgType:     llm.MsgTypeQuestion,
-		SubmitToLLM: 1,
-		Content:     questionsJSON,
-	}
-	store.AddChatMessageTo(convID, msg)
-}
-
-// persistQuestionAnswer stores the user's question answers as a
-// msg_type=6 message, paired with the preceding question message.
-func persistQuestionAnswer(convID string, store *memory.Store, answersJSON string) {
-	if store == nil || answersJSON == "" {
-		return
-	}
-	msg := llm.ChatMessage{
-		Role:        llm.RoleUser,
-		Type:        llm.TypeText,
-		MsgType:     llm.MsgTypeQuestion,
-		SubmitToLLM: 1,
-		Content:     answersJSON,
-	}
-	store.AddChatMessageTo(convID, msg)
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction
