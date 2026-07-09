@@ -449,6 +449,16 @@ type SandboxConfig struct {
 	// MaxCommandLength caps the size of a single exec_command. Default
 	// 4096 bytes.
 	MaxCommandLength int `json:"max_command_length,omitempty"`
+
+	// ExtraAllowedPaths is the per-user whitelist (Phase 2 UI
+	// in 2026-07). Paths here get the same policy as the
+	// project root (reads: Allow; writes: Allow) regardless
+	// of projectRoot — a deliberate "open this directory up"
+	// gesture. The "~" prefix expands to the user's home.
+	//
+	// Phase 1 ships the plumbing; the UI to manage the list
+	// is Phase 2.
+	ExtraAllowedPaths []string `json:"extra_allowed_paths,omitempty"`
 }
 
 // utf8BOM is the byte order mark some Windows editors (Notepad,

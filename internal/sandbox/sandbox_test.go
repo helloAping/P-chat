@@ -97,7 +97,7 @@ func TestCheckExec_NeverMode(t *testing.T) {
 
 func TestCheckWrite_Disabled(t *testing.T) {
 	s, _ := New(config.SandboxConfig{Enabled: false})
-	if d := s.CheckWrite("/etc/passwd"); d != Allow {
+	if d := s.CheckWrite("/etc/passwd", ""); d != Allow {
 		t.Errorf("disabled should allow, got %v", d)
 	}
 }
@@ -125,14 +125,26 @@ func TestCheckWrite_ProtectedPaths(t *testing.T) {
 		// which sandbox to use
 		s *Sandbox
 	}{
-		{safe, Allow, "temp dir should be allowed", s},
+		// 2026-07: "temp dir" is no longer expected to be Allow
+		// — without a projectRoot the sandbox returns Confirm
+		// for any non-protected path (the "global mode" policy).
+		// The test used to assert Allow under the 2-state model;
+		// under the 3-state model the right answer is Confirm,
+		// and the user's modal will pop up to authorise the
+		// write. The protected assertions below still hold.
+		{safe, Confirm, "temp dir without project = confirm (global mode)", s},
 		{protected + "/file.txt", Block, "protected directory via absolute path", s2},
 		{protected, Block, "protected dir itself", s2},
 		{protected + "/sub/dir/x.go", Block, "deeply nested under protected dir", s2},
 	}
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
-			got := c.s.CheckWrite(c.path)
+			// Use "" projectRoot so the path-class check
+			// falls into the "external" bucket (any non-
+			// protected path is confirm). The protected
+			// assertion still holds because protected
+			// wins over path-class.
+			got := c.s.CheckWrite(c.path, "")
 			if got != c.expected {
 				t.Errorf("CheckWrite(%q) = %v, want %v", c.path, got, c.expected)
 			}
@@ -150,7 +162,7 @@ func TestCheckWrite_HomeExpansion(t *testing.T) {
 		WriteProtectedPaths: []string{"~/.ssh/"},
 	}
 	s, _ := New(cfg)
-	if d := s.CheckWrite("~/.ssh/id_rsa"); d != Block {
+	if d := s.CheckWrite("~/.ssh/id_rsa", ""); d != Block {
 		t.Errorf("~/.ssh/id_rsa should be blocked, got %v", d)
 	}
 }
