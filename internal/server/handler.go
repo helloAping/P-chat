@@ -360,6 +360,34 @@ type MessageResponse struct {
 // MessagePart is one block of a structured assistant message.
 // Wire shape is identical to the client-side MessagePart so the
 // web UI can drop it directly into its `message.parts` array.
+//
+// Field JSON tags are split in two:
+//
+//   * The structural fields (Kind / Text / Status / etc.) use
+//     the wire format directly — both server and frontend
+//     agree on snake_case for these (the frontend's TS type
+//     uses snake_case here, mirroring the server's wire).
+//
+//   * The sub-agent metadata fields (AgentType / AgentColor /
+//     AgentModel / TaskID / AgentDescription) use snake_case
+//     JSON tags to match the storage format the agent writes
+//     to meta["parts"] (see internal/agent/parts.go). A
+//     custom MarshalJSON below re-emits them in camelCase on
+//     the wire to match the frontend's TypeScript MessagePart
+//     type (client.ts:121-132), which uses camelCase for
+//     these fields. Without the custom marshal, the
+//     snake_case keys would arrive at the frontend with no
+//     matching TS property and the SubAgentCard would render
+//     without its header label / accent color / model chip /
+//     task_id badge / description tooltip on session reload.
+//
+// QuestionStatus is the odd one out: it's part of the
+// question card, where the frontend type uses snake_case
+// (client.ts:143), so its JSON tag here is also snake_case.
+// Go's encoding/json silently drops unknown fields on
+// unmarshal, so a struct that omitted any of these fields
+// would lose the data across a save → load round-trip and
+// the corresponding card would render stale.
 type MessagePart struct {
 	Kind      string        `json:"kind"`
 	Text      string        `json:"text,omitempty"`
@@ -373,6 +401,79 @@ type MessagePart struct {
 	Task      string        `json:"task,omitempty"`
 	Parts     []MessagePart `json:"parts,omitempty"`
 	ToolID    string        `json:"tool_id,omitempty"`
+	// Question part lifecycle ("open" / "ok" / "error").
+	// Snake_case to match the frontend's TS type.
+	QuestionStatus string `json:"question_status,omitempty"`
+	// Sub-agent metadata. Snake_case to match storage;
+	// MarshalJSON below re-emits as camelCase on the wire.
+	AgentType        string `json:"agent_type,omitempty"`
+	AgentColor       string `json:"agent_color,omitempty"`
+	AgentModel       string `json:"agent_model,omitempty"`
+	TaskID           string `json:"task_id,omitempty"`
+	AgentDescription string `json:"agent_description,omitempty"`
+}
+
+// messagePartWire is the on-the-wire shape of MessagePart,
+// used by MarshalJSON to translate the snake_case storage
+// fields into the camelCase keys the frontend's TypeScript
+// MessagePart type expects. Keeping this private + inline
+// avoids polluting the rest of the package with a second
+// near-identical type — the conversion is mechanical, so
+// making it explicit in one method is more readable than
+// scattering field copies across callers.
+type messagePartWire struct {
+	Kind      string        `json:"kind"`
+	Text      string        `json:"text,omitempty"`
+	Streaming bool          `json:"streaming,omitempty"`
+	Name      string        `json:"name,omitempty"`
+	Args      string        `json:"args,omitempty"`
+	Status    string        `json:"status,omitempty"`
+	Result    string        `json:"result,omitempty"`
+	Error     string        `json:"error,omitempty"`
+	Elapsed   string        `json:"elapsed,omitempty"`
+	Task      string        `json:"task,omitempty"`
+	Parts     []MessagePart `json:"parts,omitempty"`
+	ToolID    string        `json:"tool_id,omitempty"`
+	// QuestionStatus stays snake_case — see MessagePart
+	// doc comment.
+	QuestionStatus string `json:"question_status,omitempty"`
+	// Sub-agent metadata, camelCase wire format.
+	AgentType        string `json:"agentType,omitempty"`
+	AgentColor       string `json:"agentColor,omitempty"`
+	AgentModel       string `json:"agentModel,omitempty"`
+	TaskID           string `json:"taskId,omitempty"`
+	AgentDescription string `json:"agentDescription,omitempty"`
+}
+
+// MarshalJSON emits the wire format for MessagePart. The
+// structural fields pass through with their declared tags;
+// the sub-agent metadata fields are re-emitted in camelCase
+// to match the frontend's TypeScript MessagePart type (see
+// MessagePart doc comment for why the storage side uses
+// snake_case but the wire side uses camelCase for these
+// fields).
+func (p MessagePart) MarshalJSON() ([]byte, error) {
+	w := messagePartWire{
+		Kind:             p.Kind,
+		Text:             p.Text,
+		Streaming:        p.Streaming,
+		Name:             p.Name,
+		Args:             p.Args,
+		Status:           p.Status,
+		Result:           p.Result,
+		Error:            p.Error,
+		Elapsed:          p.Elapsed,
+		Task:             p.Task,
+		Parts:            p.Parts,
+		ToolID:           p.ToolID,
+		QuestionStatus:   p.QuestionStatus,
+		AgentType:        p.AgentType,
+		AgentColor:       p.AgentColor,
+		AgentModel:       p.AgentModel,
+		TaskID:           p.TaskID,
+		AgentDescription: p.AgentDescription,
+	}
+	return json.Marshal(w)
 }
 
 // AttachmentPart is a single part of a multi-content message,
@@ -1011,6 +1112,29 @@ func (h *Handler) ClearSessionMessages(c *gin.Context) {
 // RollbackMessages POST /api/v1/sessions/:id/rollback
 // Deletes the message with the given id and all messages after it.
 // Returns the deleted messages so the client can undo.
+//
+// The deleted messages are returned in the same wire shape as
+// ListMessages (`MessageResponse`, with `parts` decoded from
+// `metadata`) — NOT the raw `memory.Message` shape. Without
+// this, the frontend's undoRollback splices the messages back
+// into its in-memory array but each message has `parts =
+// undefined` (only `metadata` as a raw JSON string, which the
+// Message type doesn't read). MessageBubble.vue then falls back
+// to plain-text rendering of `content`, silently dropping the
+// thinking block, tool call cards, sub-agent cards, and
+// question cards that the user had before rolling back. The
+// undo "restores the messages" but visually the structural
+// formatting is gone — see the bug report from 2026-07-09.
+//
+// buildMessageResponse filters out tool_call / tool_result /
+// exec_command rows (their data is already embedded in the
+// parent assistant message's `parts` array — exactly what
+// the parts-driven render path consumes). `deleted_count` is
+// therefore the count of items the frontend splices back via
+// `msgs.splice(fromIndex, 0, ...deleted_messages)`, which
+// matches the count of items it had originally removed via
+// `msgs.splice(messageIndex)` (the in-memory array was loaded
+// through the same filter).
 func (h *Handler) RollbackMessages(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
@@ -1031,10 +1155,78 @@ func (h *Handler) RollbackMessages(c *gin.Context) {
 		return
 	}
 
+	// Build parallel slices for buildMessageResponse (same
+	// shape as the loop in ListMessages that does the same
+	// transformation for a paged read).
+	metas := make([]string, len(deleted))
+	createds := make([]int64, len(deleted))
+	rowIDs := make([]int64, len(deleted))
+	for i, m := range deleted {
+		metas[i] = m.Metadata
+		createds[i] = m.CreatedAt.Unix()
+		rowIDs[i] = m.ID
+	}
+
+	deletedResp := make([]MessageResponse, 0, len(deleted))
+	for i, m := range deleted {
+		// buildMessageResponse takes llm.ChatMessage, not
+		// memory.Message. Convert via a small inline helper
+		// — the new-format metadata keys map 1:1 to the
+		// ChatMessage fields, and the legacy multi_content
+		// expansion that decodeChatMessages does is NOT
+		// what we want here (one DB row should produce
+		// one MessageResponse, not several).
+		cm := memoryMessageToChatMessage(m)
+		if resp := buildMessageResponse(cm, metas, createds, i, rowIDs[i]); resp != nil {
+			deletedResp = append(deletedResp, *resp)
+		}
+	}
+
+	// Collapse consecutive assistant rows into a single
+	// message — the same merge ListMessages does on read. The
+	// agent's persistAssistant writes one row per ReAct
+	// round, so without this the rollback response would
+	// hand back N separate "assistant" messages and the
+	// frontend would render them as N separate bubbles on
+	// undo. The user would then see a turn that was
+	// originally one bubble split into N pieces, breaking
+	// the visual continuity they had before rolling back.
+	deletedResp = mergeConsecutiveAssistant(deletedResp)
+
 	c.JSON(http.StatusOK, gin.H{
-		"deleted_count":    len(deleted),
-		"deleted_messages": deleted,
+		"deleted_count":    len(deletedResp),
+		"deleted_messages": deletedResp,
 	})
+}
+
+// memoryMessageToChatMessage converts a memory.Message row into
+// the protocol-agnostic llm.ChatMessage shape that
+// buildMessageResponse consumes. Only the new-format metadata
+// keys (type / name / mime_type / tool_* / tool_error) are
+// mapped; legacy multi_content / tool_calls arrays are
+// intentionally left un-expanded because the rollback path
+// wants one row → one response (the agent's streaming path
+// already expanded them into a single message's parts).
+func memoryMessageToChatMessage(m memory.Message) llm.ChatMessage {
+	cm := llm.ChatMessage{
+		Role:        m.Role,
+		Content:     m.Content,
+		MsgType:     m.MsgType,
+		SubmitToLLM: m.SubmitToLLM,
+	}
+	if m.Metadata != "" {
+		var meta map[string]string
+		if err := json.Unmarshal([]byte(m.Metadata), &meta); err == nil {
+			cm.Name = meta["name"]
+			cm.Type = meta["type"]
+			cm.MimeType = meta["mime_type"]
+			cm.ToolID = meta["tool_id"]
+			cm.ToolName = meta["tool_name"]
+			cm.ToolInput = meta["tool_input"]
+			cm.ToolError = meta["tool_error"] == "true"
+		}
+	}
+	return cm
 }
 
 // ForkSession POST /api/v1/sessions/:id/fork
@@ -1071,6 +1263,28 @@ func (h *Handler) ForkSession(c *gin.Context) {
 
 // UndoRollback POST /api/v1/sessions/:id/rollback/undo
 // Restores previously-deleted messages.
+//
+// The wire format is `[]MessageResponse` (same shape as
+// ListMessages / RollbackMessages return), NOT
+// `[]memory.Message`. The previous version of this handler
+// expected `[]memory.Message`, but after the RollbackMessages
+// wire-format fix the frontend's undo payload is
+// `[]MessageResponse` — and parsing that into
+// `[]memory.Message` fails with a 400 on `time.Time`
+// (memory.Message.CreatedAt is time.Time, expects RFC3339
+// string, but MessageResponse.CreatedAt is int64 Unix).
+// The user-visible symptom was: rollback worked, but
+// clicking 撤销 did nothing — the request 400'd before the
+// frontend's msgs.splice ever ran.
+//
+// The conversion here is the inverse of buildMessageResponse:
+// re-serialize `parts` + `thinking` + content into the
+// `metadata` JSON string the store wants, and convert
+// `created_at` (Unix int64) → `time.Time`. Without this,
+// even if the parse succeeded the restored rows would have
+// `metadata = ""` and the next reload would show the
+// assistant messages as plain text (no thinking / tool /
+// sub-agent cards).
 func (h *Handler) UndoRollback(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
@@ -1078,28 +1292,76 @@ func (h *Handler) UndoRollback(c *gin.Context) {
 	}
 	id := c.Param("id")
 	var req struct {
-		Messages []memory.Message `json:"messages"`
+		Messages []MessageResponse `json:"messages"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Override conversation_id from the URL to prevent cross-session
-	// injection.
-	for i := range req.Messages {
-		req.Messages[i].ConversationID = id
+	// Convert wire → storage. See the doc comment above
+	// for why each field is what it is.
+	restored := make([]memory.Message, 0, len(req.Messages))
+	for _, r := range req.Messages {
+		m := memory.Message{
+			ID:             r.ID,
+			ConversationID: id, // override from URL, defense-in-depth
+			Role:           r.Role,
+			Content:        r.Content,
+			MsgType:        r.MsgType,
+			SubmitToLLM:    1, // restored messages rejoin the LLM context
+			CreatedAt:      time.Unix(r.CreatedAt, 0),
+			Metadata:       encodeMessageResponseMeta(r),
+		}
+		restored = append(restored, m)
 	}
 
-	if err := h.store.RestoreMessages(req.Messages); err != nil {
+	if err := h.store.RestoreMessages(restored); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"ok":             true,
-		"restored_count": len(req.Messages),
+		"restored_count": len(restored),
 	})
+}
+
+// encodeMessageResponseMeta reconstructs the `metadata` JSON
+// string the store wants, given a wire-shape MessageResponse.
+// This is the inverse of decodePartsFromMeta: the parts
+// array is serialized back to a JSON string and stored in
+// `meta["parts"]` (the same double-encoding the agent uses
+// when writing via snapshotStructural).
+//
+// We always write the v2 full-snapshot format regardless of
+// what the original was: a MessageResponse built from
+// decodePartsFromMeta always carries the decoded parts in
+// `Parts`, including the text part that was previously
+// derived from `content`. So `meta["parts"]` round-trips
+// losslessly for both v1-original (now upgraded to v2) and
+// v2-original messages.
+//
+// Note: MessageResponse has no `Thinking` field — thinking
+// is always inside `Parts` as `{kind: "thinking", ...}`.
+// The agent's snapshotStructural writes the whole parts
+// array into meta["parts"] verbatim, and decodePartsFromMeta
+// returns it as-is when the array contains text or thinking
+// (the v2 fast path). Re-serializing that array here keeps
+// the shape identical.
+func encodeMessageResponseMeta(r MessageResponse) string {
+	if len(r.Parts) == 0 {
+		return ""
+	}
+	partsJSON, err := json.Marshal(r.Parts)
+	if err != nil {
+		return ""
+	}
+	meta := map[string]string{
+		"parts": string(partsJSON),
+	}
+	b, _ := json.Marshal(meta)
+	return string(b)
 }
 
 func (h *Handler) RenameSession(c *gin.Context) {
@@ -1352,11 +1614,15 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		hasMore = h.store.HasOlderMessages(id, oldestID)
 	}
 
-	// Pair consecutive question/answer messages (msg_type=6)
-	// into a single message before the main assistant merge.
-	// This ensures each question+answer pair renders as one
-	// table card embedded in the assistant message flow.
-	out = pairQuestionMessages(out)
+	// Question/answer persistence was simplified: instead of
+	// separate msg_type=6 rows (which required a pairing pass
+	// here), the question tool now lives as a `kind:"question"`
+	// part inside the assistant message's persisted parts
+	// snapshot. Reload reads parts straight from
+	// meta["parts"] (see decodePartsFromMeta); no pairing
+	// step is needed. Question parts round-trip through the
+	// question tool's tool_call/tool_result row (msg_type=4),
+	// which buildMessageResponse already filters out below.
 
 	// Merge consecutive assistant messages that belong to the
 	// same user turn. During live streaming the frontend
@@ -1371,47 +1637,6 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		"has_more":  hasMore,
 		"oldest_id": oldestID,
 	})
-}
-
-// pairQuestionMessages scans for consecutive msg_type=6 messages
-// (question + answer) and merges each pair into a single
-// MessageResponse with a question part in the Parts array. The
-// paired message carries the questions JSON and the answers JSON
-// so the frontend QuestionTable can render the table card.
-func pairQuestionMessages(msgs []MessageResponse) []MessageResponse {
-	if len(msgs) <= 1 {
-		return msgs
-	}
-	out := make([]MessageResponse, 0, len(msgs))
-	i := 0
-	for i < len(msgs) {
-		msg := msgs[i]
-		if msg.MsgType != llm.MsgTypeQuestion || i+1 >= len(msgs) || msgs[i+1].MsgType != llm.MsgTypeQuestion {
-			out = append(out, msg)
-			i++
-			continue
-		}
-		question := msg
-		answer := msgs[i+1]
-		i += 2
-
-		// Merge question+answer into one message.
-		parts := []MessagePart{{
-			Kind: "question",
-			Text: question.Content,
-			Name: answer.Content,
-		}}
-		merged := MessageResponse{
-			ID:        question.ID,
-			Role:      question.Role,
-			MsgType:   llm.MsgTypeQuestion,
-			Content:   question.Content,
-			CreatedAt: question.CreatedAt,
-			Parts:     parts,
-		}
-		out = append(out, merged)
-	}
-	return out
 }
 
 // mergeConsecutiveAssistant collapses runs of consecutive
@@ -1475,15 +1700,17 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 		}
 	}
 
-	var contents []string
-	for _, p := range parts {
-		if p.Kind == "text" {
-			contents = append(contents, p.Text)
-		}
-	}
-
 	base.Parts = parts
-	base.Content = strings.Join(contents, "\n")
+	// `base.Content` is intentionally NOT regenerated from
+	// parts. The MessageBubble component (frontend/src/components/
+	// MessageBubble.vue) renders assistant messages off
+	// `message.parts` exclusively, so the joined-Content
+	// projection was dead — and it would have been wrong
+	// anyway: multi-round text joined with "\n" doesn't
+	// match the live-streaming view (where each round's
+	// text is its own part with its own styling), so
+	// recomputing Content here would diverge from the
+	// user-visible streaming bubble.
 	return base
 }
 
@@ -1534,15 +1761,14 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 		resp.ToolCallID = m.ToolID
 	}
 
-	// Command messages (msg_type=5: exec_command output).
-	// Extract the shell command from ToolInput so the
-	// frontend ExecOutputCard can label the terminal panel
-	// with the command that was executed.
-	if m.MsgType == llm.MsgTypeCommand && m.ToolInput != "" {
-		if cmd := parseCommandFromToolInput(m.ToolInput); cmd != "" {
-			resp.Name = cmd
-		}
-	}
+	// Note: command extraction (msg_type=5 / exec_command output)
+	// USED to set resp.Name here, but the row is dropped by the
+	// MsgTypeTool/MsgTypeCommand filter at the bottom of this
+	// function, so the assignment was dead code. The frontend's
+	// ExecOutputCard now reads the command from the persisted
+	// tool part's `args` field (see MessageBubble.vue routing for
+	// tool kind:tool parts), so the reload path is correct
+	// without any post-filter mutation of resp.Name.
 
 	// Restore assistant parts from metadata.
 	if i < len(metas) && metas[i] != "" {
@@ -1697,6 +1923,48 @@ func parseCommandFromToolInput(raw string) string {
 		return v.Command
 	}
 	return ""
+}
+
+// buildLLMMessages turns a session's stored history into the
+// message slice fed to the LLM. Two responsibilities:
+//
+//  1. Filter out display-only rows (SubmitToLLM == 0): the
+//     system prompt, thinking blocks, raw exec_command output,
+//     etc. — anything the user sees in the chat but the LLM
+//     doesn't need in its context.
+//
+//  2. Rewrite `task` tool results from role=tool to role=user.
+//     The `task` tool is the sub-agent system entry point.
+//     The PARENT agent issues the task call (so the parent
+//     sees its own tool_call), but the sub-agent's response
+//     arrives as a tool_result on the PARENT's message
+//     stream. From the parent's LLM perspective, the
+//     tool_call id never appears in the LLM context — only
+//     the result does — and a bare `role: tool` orphan
+//     would be rejected by some providers. The historical
+//     workaround (commit 51039e2) flipped ALL tool_results
+//     to `role: user`, but that's wrong for the main
+//     tool loop: read_file / write_file / exec_command /
+//     todo_write / question results all need to stay as
+//     `role: tool` so the LLM can match them against the
+//     tool_call that produced them.
+//
+//     The fix scopes the rewrite to `task` results only.
+//     `m.ToolName` is populated on the result row when the
+//     agent writes the tool_result message (see
+//     internal/agent/agent.go toolMsg construction).
+func buildLLMMessages(histMsgs []llm.ChatMessage) []llm.ChatMessage {
+	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
+	for _, m := range histMsgs {
+		if m.SubmitToLLM == 0 {
+			continue
+		}
+		if m.MsgType == llm.MsgTypeTool && m.Role == llm.RoleTool && m.ToolName == "task" {
+			m.Role = llm.RoleUser
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs
 }
 
 // decodePartsFromMeta pulls the assistant message's `parts`
@@ -1895,18 +2163,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	} else {
 		histMsgs = h.store.GetChatMessagesFor(id, 0)
 	}
-	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
-	for _, m := range histMsgs {
-		if m.SubmitToLLM == 0 {
-			continue
-		}
-		// Tool results → User role so providers don't reject
-		// orphaned 'tool' messages without preceding tool_calls.
-		if m.MsgType == llm.MsgTypeTool && m.Role == llm.RoleTool {
-			m.Role = llm.RoleUser
-		}
-		msgs = append(msgs, m)
-	}
+	msgs := buildLLMMessages(histMsgs)
 	msgs = append(msgs, llm.ChatMessage{
 		Role:    llm.RoleUser,
 		Type:    llm.TypeText,

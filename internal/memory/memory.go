@@ -577,11 +577,35 @@ func encodeChatMeta(msg llm.ChatMessage) map[string]string {
 // dbMsgType and dbSubmitToLLM come from the dedicated columns (0 when
 // not yet backfilled); the function falls back to metadata inference
 // when they are zero.
+//
+// The v2 (current) agent write path stores assistant messages as
+// `meta["parts"] = "<json string of []MessagePart>"` with an empty
+// `content` column — the canonical snapshot format written by
+// partsAcc.snapshotStructural. Earlier code only handled the
+// `meta["type"]` (new-format-with-type-key) and the legacy
+// `multi_content` / `tool_calls` shapes, so v2 rows were silently
+// dropped on read. That made `GetChatMessagesWithMeta*` lose
+// every assistant message in the LLM context the moment the agent
+// started persisting parts, which is exactly the point at which
+// the LLM context starts mattering (multi-round tool flows,
+// question cards, sub-agents). The v2 branch added below
+// reconstructs a single ChatMessage with Type=TypeText and the
+// `content` carried over from the row; the full parts array is
+// not needed for LLM context (the LLM only sees text + tool calls
+// + tool results), and the wire UI re-derives the parts via
+// decodePartsFromMeta on the ListMessages path. This keeps the
+// LLM context complete without changing the wire shape.
 func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbSubmitToLLM int) []llm.ChatMessage {
 	if metaStr == "" || metaStr == "{}" {
 		if content != "" {
 			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1}}
 		}
+		// Empty content + empty metadata: there's literally
+		// no message here (shouldn't happen in practice, but
+		// guard rather than panic). Returning nil makes the
+		// row invisible to the LLM — same as before this
+		// fix, but now scoped to the truly-empty case
+		// instead of swallowing the v2 format.
 		return nil
 	}
 
@@ -593,7 +617,51 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 		return nil
 	}
 
-	// New format: metadata has a "type" key.
+	// v2 (current) format: the agent's snapshotStructural
+	// writes `meta["parts"] = "<json of []MessagePart>"` with
+	// the content column holding the denormalized text body.
+	// The content column might be empty for a question-only
+	// assistant turn; the parts blob is the source of truth.
+	// Reconstruct a single text message so the LLM still sees
+	// this turn in its history.
+	if raw, ok := meta["parts"]; ok && raw != "" {
+		// Prefer the row's content column (denormalized
+		// cache) when it has text. Fall back to extracting
+		// the text part from the parts blob. Both are fine
+		// for the LLM.
+		text := content
+		if text == "" {
+			text = extractTextFromPartsBlob(raw)
+		}
+		// Even when the text is empty (a turn whose only
+		// payload is a question card with no prose), the LLM
+		// still needs to see *something* so it remembers
+		// the question. Emit a single text-typed message
+		// with empty content rather than dropping the row.
+		// The downstream tool_result will carry the user's
+		// answer.
+		mt := llm.MsgTypeText
+		sl := 1
+		if dbMsgType != 0 {
+			mt = dbMsgType
+		}
+		if dbSubmitToLLM != 0 {
+			sl = dbSubmitToLLM
+		}
+		return []llm.ChatMessage{{
+			Role:        role,
+			Type:        llm.TypeText,
+			Content:     text,
+			MsgType:     mt,
+			SubmitToLLM: sl,
+		}}
+	}
+
+	// New format with explicit type key (rare — the v2
+	// snapshotStructural path is the dominant one; this
+	// branch is for messages written via the explicit
+	// `type` key, e.g. the question card's standalone
+	// roundtrip if any future writer uses that key).
 	if t, ok := meta["type"]; ok && t != "" {
 		mt, sl := resolveMsgType(t, meta["tool_name"], dbMsgType, dbSubmitToLLM)
 		return []llm.ChatMessage{{
@@ -699,6 +767,36 @@ func resolveMsgType(legacyType, toolName string, dbMsgType, dbSubmitToLLM int) (
 		return mt, sl
 	}
 	return llm.MsgTypeForLegacy(legacyType, toolName)
+}
+
+// extractTextFromPartsBlob parses a v2 `meta["parts"]` JSON
+// string and concatenates the `text` fields of every part
+// with kind="text" in their original order. Returns "" if
+// the blob is malformed or contains no text parts. Used as
+// a fallback when the row's `content` column is empty (a
+// turn whose only payload is a question card or a tool
+// call with no prose). The LLM doesn't strictly need the
+// text — the tool_result carries the user's answer — but
+// it does need a placeholder so the message survives the
+// read path and the LLM context stays complete.
+func extractTextFromPartsBlob(raw string) string {
+	var parts []struct {
+		Kind string `json:"kind"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parts); err != nil {
+		return ""
+	}
+	var out string
+	for _, p := range parts {
+		if p.Kind == "text" && p.Text != "" {
+			if out != "" {
+				out += "\n"
+			}
+			out += p.Text
+		}
+	}
+	return out
 }
 func (s *Store) Flush() error {
 	s.pendingMu.Lock()
@@ -1322,8 +1420,19 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 	_ = s.Flush()
 
 	// Snapshot the rows before deleting.
+	//
+	// msg_type and submit_to_llm are part of the snapshot
+	// on purpose: the rollback handler converts each row
+	// through buildMessageResponse, which uses MsgType to
+	// filter out standalone tool_call / tool_result /
+	// exec_command rows (their data is already embedded
+	// in the parent assistant message's parts). Without
+	// these columns, the filter would never fire and the
+	// rollback would return tool rows as empty assistant
+	// bubbles, then the frontend would splice them back
+	// as zero-content messages on undo.
 	rows, err := s.db.Query(
-		`SELECT id, conversation_id, role, content, tokens, created_at, metadata
+		`SELECT id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm
 		 FROM messages WHERE conversation_id = ? AND id >= ? ORDER BY id`,
 		conversationID, fromID,
 	)
@@ -1336,7 +1445,7 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 	for rows.Next() {
 		var m Message
 		var created int64
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata, &m.MsgType, &m.SubmitToLLM); err != nil {
 			return deleted, err
 		}
 		m.CreatedAt = time.Unix(created, 0)

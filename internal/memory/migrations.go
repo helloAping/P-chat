@@ -168,9 +168,44 @@ UPDATE messages SET msg_type=0, submit_to_llm=0
  WHERE metadata LIKE '%"type":"thinking"%';`,
 		Down: `UPDATE messages SET msg_type=0, submit_to_llm=1;`,
 	},
+	{
+		// Migration 7: strip the `streaming` flag from
+		// every persisted parts blob. The flag is a live-UI
+		// signal only (drives the "思考中…" spinner /
+		// caret while the LLM is still emitting) and must
+		// not survive into reload — the persisted state
+		// is always the *final* state of the round, so a
+		// `streaming:true` on a persisted thinking block
+		// would render the spinner on a thought the user
+		// already saw the LLM finish (visible after a
+		// rollback/undo too, because the rollback re-emits
+		// whatever was in meta["parts"] verbatim).
+		//
+		// Going forward, `snapshotStructural` clears
+		// `Streaming` on every part before serializing
+		// (internal/agent/parts.go), so new rows won't
+		// carry the field. This migration cleans up the
+		// historical data — 2026-07-09 incident where
+		// after-undo render was stuck on "思考中".
+		//
+		// `json_remove` is the right tool: it strips the
+		// key by JSON path regardless of the surrounding
+		// document shape. The `IS NOT NULL` guard skips
+		// rows that don't have the key (e.g. legacy
+		// `metadata=""` rows, tool_call rows) and rows
+		// where metadata is malformed JSON (json_extract
+		// returns NULL for both). No data loss either way.
+		Version: 7,
+		Name:    "strip_streaming_flag",
+		Up: `
+UPDATE messages
+SET metadata = json_remove(metadata, '$.streaming')
+WHERE json_extract(metadata, '$.streaming') IS NOT NULL;`,
+		Down: `-- no down — Streaming=false is a no-op after
+-- the fix, and flipping it back to true would re-introduce
+-- the original bug. A re-run of the up is safe.`,
+	},
 }
-
-// 在 migrations 表和可变 Schema 之前必须创建
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INTEGER PRIMARY KEY,
     name       TEXT NOT NULL,
