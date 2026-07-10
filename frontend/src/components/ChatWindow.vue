@@ -135,7 +135,7 @@ async function handleFork(index: number) {
         >加载更早的消息…</div>
         <MessageBubble
           v-for="(m, i) in currentMessages"
-          :key="i"
+          :key="m.id ?? `tmp-${i}-${(m.content || '').length}-${m.role}`"
           :message="m"
           :streaming="isStreaming && i === currentMessages.length - 1 && m.role === 'assistant'"
           @rollback="handleRollback(i)"

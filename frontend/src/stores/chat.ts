@@ -272,6 +272,30 @@ export async function setActiveProject(path: string) {
 // (loaded by loadMoreMessages) use the same size.
 const initialHistoryLimit = 50
 
+// dedupMessagesById folds a freshly-loaded page into the
+// existing in-memory list, dropping any rows whose `id` we
+// already have. Newer entries (from `incoming`) win on id
+// collision so a re-fetch picks up server-side state changes
+// (e.g. the redactor rewrote `content` on the same row).
+// The merged result is sorted ascending by id so the
+// oldest-first invariant holds for the renderer.
+//
+// Idempotency: a stale local state from before the server
+// cursor fix, or a future server bug that returns the same
+// page twice in a row, is collapsed silently. The user
+// never sees the duplicate.
+function dedupMessagesById(existing: Message[], incoming: Message[]): Message[] {
+  if (incoming.length === 0) return existing
+  const byId = new Map<number, Message>()
+  for (const m of existing) {
+    if (m.id != null) byId.set(m.id, m)
+  }
+  for (const m of incoming) {
+    if (m.id != null) byId.set(m.id, m)
+  }
+  return Array.from(byId.values()).sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
+}
+
 export async function switchSession(id: string) {
   state.currentID = id
   if (!state.sessionMessages[id]) {
@@ -291,7 +315,13 @@ export async function switchSession(id: string) {
     for (const m of r.messages) {
       if (m.parts) scrubMessagePhantoms(m)
     }
-    state.sessionMessages[id] = r.messages
+    // Defensive dedup: if a future server bug ever returns
+    // an overlapping page on the very first load, the user
+    // won't see the duplicate bubble. The server's cursor
+    // fix (handler.go: oldestID=rowIDs[0]) eliminates the
+    // most common trigger but dedup here is the
+    // belt-and-braces guarantee.
+    state.sessionMessages[id] = dedupMessagesById([], r.messages)
     state.sessionPaging[id] = {
       oldestId: r.oldest_id,
       hasMore: r.has_more,
@@ -359,11 +389,17 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
     if (r.messages.length > 0) {
       // Prepend the new (older) page to the front of the
       // existing message list. The server returns messages
-      // oldest-first within the page, so concatenation in
-      // the order [older..., existing...] preserves the
-      // global oldest-first ordering.
+      // oldest-first within the page. We dedup by `id`
+      // (dedupMessagesById also sorts ascending) so an
+      // overlapping page — e.g. the pre-2026-07-10 server
+      // cursor bug where oldest_id was the page's max id
+      // and the next page overlapped by all-but-one row —
+      // doesn't add visible duplicates. The server-side fix
+      // (handler.go: rowIDs[0]) makes the overlap empty;
+      // this client dedup is the safety net for any future
+      // regression.
       const existing = state.sessionMessages[id] || []
-      state.sessionMessages[id] = [...r.messages, ...existing]
+      state.sessionMessages[id] = dedupMessagesById(existing, r.messages)
     }
     paging.oldestId = r.oldest_id
     paging.hasMore = r.has_more
