@@ -12,7 +12,7 @@ Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用
 
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
-| `agent.go` | ReAct 循环、LLM 调用编排、工具派发、事件流控制 | `ChatWithTools()`, `Agent` |
+| `agent.go` | ReAct 循环、LLM 调用编排、工具派发、事件流控制 | `ChatWithTools()`, `Agent`, `ReloadWithRootIfChanged()` |
 | `parts.go` | 助手消息的结构化 parts 累加器（thinking/tool/sub_agent） | `partsAccumulator`, `snapshotStructural()` |
 | `attachment.go` | 用户附件（图片/文件）扩展为 ChatMessage | `AttachmentResolver` |
 
@@ -95,6 +95,15 @@ forwarder goroutine:
 ### 6. 卡死循环保护
 
 `toolCallSignature()` 计算每轮工具调用的稳定签名。若连续 3 轮相同的工具调用都失败 → 判定卡死 → 自动停止。
+
+### 7. 项目根感知的内容加载 (2026-07)
+
+`Agent.lastProjectRoot` 字段追踪当前 skills / rules 加载时锚定的项目根。`ReloadWithRootIfChanged(root)` 在 `buildStaticSystemPrompt` 入口被调用：
+
+- 相同 root：no-op，static-prompt cache 命中
+- 不同 root（切项目 / 新 session）：重新加载 skills + rules，失效 cache
+
+没有这个机制，Wails GUI server 的 CWD 跟用户项目无关，project-level skills / rules 永远不会被加载（`LoadAll()` 用 `os.Getwd()`，已修复为 `LoadAllWithRoot(root)`）。
 
 ## 修改指南
 
