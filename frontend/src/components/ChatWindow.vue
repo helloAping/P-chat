@@ -97,6 +97,25 @@ async function handleFork(index: number) {
     message.error('创建分支对话失败')
   }
 }
+
+// messageKey produces a stable Vue :key for a message in the
+// v-for list. We prefer seq (the per-conversation logical
+// position, stable across rollback/undo) and fall back to
+// id (the physical row id) for older messages that haven't
+// been backfilled. The trailing `i` + content fingerprint is
+// a last-resort fallback for any pre-id streaming message
+// (only relevant during the first few ms of a user turn
+// before the server returns the row id).
+//
+// The fallback content fingerprint is needed so a streaming
+// message whose id changes mid-turn (e.g. id is filled in
+// after the first SSE event) doesn't trigger Vue to
+// unmount+remount the bubble on every event.
+function messageKey(m: any, i: number): string | number {
+  if (m.seq != null && m.seq > 0) return m.seq
+  if (m.id != null) return `id-${m.id}`
+  return `tmp-${i}-${(m.content || '').length}-${m.role}`
+}
 </script>
 
 <template>
@@ -135,7 +154,7 @@ async function handleFork(index: number) {
         >加载更早的消息…</div>
         <MessageBubble
           v-for="(m, i) in currentMessages"
-          :key="m.id ?? `tmp-${i}-${(m.content || '').length}-${m.role}`"
+          :key="messageKey(m, i)"
           :message="m"
           :streaming="isStreaming && i === currentMessages.length - 1 && m.role === 'assistant'"
           @rollback="handleRollback(i)"

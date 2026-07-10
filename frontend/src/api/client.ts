@@ -157,6 +157,18 @@ export interface TodoItem {
 
 export interface Message {
   id?: number
+  // Per-conversation logical position. The new stable
+  // identity for any cross-render / cross-rollback
+  // reference: Vue :key, pagination cursor, undo
+  // payload. `id` is the SQLite row id (AUTOINCREMENT,
+  // never reused — so it changes after a rollback/undo
+  // round-trip). `seq` is the per-conversation position
+  // 1..N within a session and survives rollback/undo.
+  // The frontend prefers `seq` for any identity that
+  // must survive a rollback. Older messages loaded
+  // from a pre-seq database have `seq = 0` — the
+  // dedup/key paths fall back to `id` in that case.
+  seq?: number
   role: 'user' | 'assistant' | 'tool' | 'system'
   msg_type?: number
   // For user / system messages this is the text body.
@@ -198,6 +210,11 @@ export interface Message {
   // Live status text during streaming (populated by
   // appendStreamEvent from phase events).
   _statusText?: string[]
+  // Whether the row should be included when building the
+  // LLM conversation context. 0=display-only (thinking,
+  // raw command output), 1=context. Carried through
+  // rollback/undo so the value survives a round-trip.
+  submit_to_llm?: number
 }
 
 export interface SessionMeta {
@@ -486,11 +503,18 @@ export const setMCPGlobal = (enabled: boolean) =>
 // --- Messages ---
 
 // PageOpts controls infinite-scroll history loading.
-// beforeId: the lowest row id from the previous page; pass 0
-//   (or omit) for the most recent page.
-// limit: page size. The server applies the per-session context
-//   cap when 0 is passed.
+// beforeSeq: the lowest seq from the previous page; preferred
+//   cursor (stable across rollback/undo). Pass 0 to get the
+//   most recent page.
+// beforeId: legacy id-based cursor. Kept for back-compat
+//   with older server versions. Becomes stale after a
+//   rollback/undo because the SQLite id is never reused.
+// limit: page size. The server applies the per-session
+//   context cap when 0 is passed.
+//
+// If both beforeSeq and beforeId are set, beforeSeq wins.
 export interface PageOpts {
+  beforeSeq?: number
   beforeId?: number
   limit?: number
 }
@@ -498,18 +522,25 @@ export interface PageOpts {
 export interface ListMessagesResult {
   messages: Message[]
   has_more: boolean
-  // The id to pass as `beforeId` on the next page request.
-  // Always the smallest row id in `messages`. 0 when the
-  // returned page is empty.
+  // oldest_seq: the lowest seq in `messages` (preferred
+  // cursor). Pass as `beforeSeq` on the next page request.
+  // Always 0 when the returned page is empty.
+  oldest_seq: number
+  // oldest_id: legacy id-based cursor. Kept for back-compat.
+  // Always the smallest row id in `messages`; 0 when empty.
   oldest_id: number
 }
 
 // listMessages fetches a page of session history. Omit
 // `opts` to get the full history (first open after reload —
 // the server applies the context-window cap automatically).
+// When opts.beforeSeq is set the server uses the seq-based
+// SQL filter; when only opts.beforeId is set, it uses the
+// id-based filter (legacy).
 export const listMessages = (id: string, opts?: PageOpts) => {
   const q = new URLSearchParams()
-  if (opts?.beforeId && opts.beforeId > 0) q.set('before_id', String(opts.beforeId))
+  if (opts?.beforeSeq && opts.beforeSeq > 0) q.set('before_seq', String(opts.beforeSeq))
+  else if (opts?.beforeId && opts.beforeId > 0) q.set('before_id', String(opts.beforeId))
   if (opts?.limit && opts.limit > 0) q.set('limit', String(opts.limit))
   const qs = q.toString()
   return jsonFetch<ListMessagesResult>(

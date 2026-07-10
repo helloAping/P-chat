@@ -49,11 +49,15 @@ export const state = reactive({
     asstContent: string
   }>,
   // Per-session history-paging cursor. The first page
-  // (loaded by switchSession) sets oldestId to the id of the
-  // last (oldest) message in the page; subsequent pages are
-  // fetched with before_id=oldestId. When hasMore is false,
-  // the user has scrolled to the start of the conversation.
+  // (loaded by switchSession) sets oldestSeq/oldestId to
+  // the corresponding cursor from the response; subsequent
+  // pages are fetched with before_seq=oldestSeq (preferred,
+  // stable across rollback/undo) or before_id=oldestId
+  // (legacy, only for older server versions that don't
+  // emit oldest_seq). When hasMore is false, the user
+  // has scrolled to the start of the conversation.
   sessionPaging: {} as Record<string, {
+    oldestSeq: number
     oldestId: number
     hasMore: boolean
     loading: boolean
@@ -272,28 +276,34 @@ export async function setActiveProject(path: string) {
 // (loaded by loadMoreMessages) use the same size.
 const initialHistoryLimit = 50
 
-// dedupMessagesById folds a freshly-loaded page into the
-// existing in-memory list, dropping any rows whose `id` we
-// already have. Newer entries (from `incoming`) win on id
-// collision so a re-fetch picks up server-side state changes
+// dedupMessagesByKey folds a freshly-loaded page into the
+// existing in-memory list, dropping any rows we already
+// have. The dedup key is `seq` when available (the new
+// stable per-conversation identity) and `id` as a
+// fallback for older messages / pre-seq DBs.
+//
+// Newer entries (from `incoming`) win on key collision
+// so a re-fetch picks up server-side state changes
 // (e.g. the redactor rewrote `content` on the same row).
-// The merged result is sorted ascending by id so the
-// oldest-first invariant holds for the renderer.
+// The merged result is sorted ascending by seq (or id
+// when seq is 0) so the oldest-first invariant holds for
+// the renderer.
 //
 // Idempotency: a stale local state from before the server
 // cursor fix, or a future server bug that returns the same
 // page twice in a row, is collapsed silently. The user
 // never sees the duplicate.
-function dedupMessagesById(existing: Message[], incoming: Message[]): Message[] {
+function dedupMessagesByKey(existing: Message[], incoming: Message[]): Message[] {
   if (incoming.length === 0) return existing
-  const byId = new Map<number, Message>()
+  const byKey = new Map<number, Message>()
+  const keyOf = (m: Message): number => (m.seq != null && m.seq > 0) ? m.seq : -(m.id ?? 0)
   for (const m of existing) {
-    if (m.id != null) byId.set(m.id, m)
+    byKey.set(keyOf(m), m)
   }
   for (const m of incoming) {
-    if (m.id != null) byId.set(m.id, m)
+    byKey.set(keyOf(m), m)
   }
-  return Array.from(byId.values()).sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
+  return Array.from(byKey.values()).sort((a, b) => keyOf(a) - keyOf(b))
 }
 
 export async function switchSession(id: string) {
@@ -321,8 +331,13 @@ export async function switchSession(id: string) {
     // fix (handler.go: oldestID=rowIDs[0]) eliminates the
     // most common trigger but dedup here is the
     // belt-and-braces guarantee.
-    state.sessionMessages[id] = dedupMessagesById([], r.messages)
+    state.sessionMessages[id] = dedupMessagesByKey([], r.messages)
     state.sessionPaging[id] = {
+      // Prefer the seq-based cursor (stable across
+      // rollback/undo). Fall back to the legacy id-based
+      // cursor when the server is older and didn't return
+      // oldest_seq.
+      oldestSeq: r.oldest_seq ?? 0,
       oldestId: r.oldest_id,
       hasMore: r.has_more,
       loading: false,
@@ -382,25 +397,36 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
   if (!paging || !paging.hasMore || paging.loading) return false
   paging.loading = true
   try {
-    const r = await api.listMessages(id, {
-      beforeId: paging.oldestId,
-      limit: initialHistoryLimit,
-    })
+    // Prefer the seq-based cursor when the server
+    // returned it. Fall back to the id-based cursor for
+    // older servers that only emit oldest_id. The seq
+    // cursor is stable across rollback/undo — a
+    // scroll-in-progress survives an undo, which the
+    // id cursor could not guarantee (the restored
+    // messages have new ids).
+    const opts: api.PageOpts = { limit: initialHistoryLimit }
+    if (paging.oldestSeq > 0) {
+      opts.beforeSeq = paging.oldestSeq
+    } else if (paging.oldestId > 0) {
+      opts.beforeId = paging.oldestId
+    }
+    const r = await api.listMessages(id, opts)
     if (r.messages.length > 0) {
       // Prepend the new (older) page to the front of the
       // existing message list. The server returns messages
-      // oldest-first within the page. We dedup by `id`
-      // (dedupMessagesById also sorts ascending) so an
-      // overlapping page — e.g. the pre-2026-07-10 server
-      // cursor bug where oldest_id was the page's max id
-      // and the next page overlapped by all-but-one row —
-      // doesn't add visible duplicates. The server-side fix
+      // oldest-first within the page. We dedup by seq
+      // (or id fallback) and re-sort so an overlapping
+      // page — e.g. the pre-2026-07-10 server cursor bug
+      // where oldest_id was the page's max id and the
+      // next page overlapped by all-but-one row — doesn't
+      // add visible duplicates. The server-side fix
       // (handler.go: rowIDs[0]) makes the overlap empty;
-      // this client dedup is the safety net for any future
-      // regression.
+      // this client dedup is the safety net for any
+      // future regression.
       const existing = state.sessionMessages[id] || []
-      state.sessionMessages[id] = dedupMessagesById(existing, r.messages)
+      state.sessionMessages[id] = dedupMessagesByKey(existing, r.messages)
     }
+    paging.oldestSeq = r.oldest_seq ?? paging.oldestSeq
     paging.oldestId = r.oldest_id
     paging.hasMore = r.has_more
     return r.has_more
