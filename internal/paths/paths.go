@@ -157,6 +157,20 @@ func ProjectAgentsWithRoot(root string) string {
 	return filepath.Join(root, "AGENTS.md")
 }
 
+// ProjectPChatAgentsWithRoot returns <root>/.p-chat/AGENTS.md —
+// the "project-level .p-chat" AGENTS.md location. This is the
+// secondary project-level slot used by the 2026-07 OR loader
+// (see internal/agents.LoadAllWithRoot). The primary
+// project-level slot is ProjectAgentsWithRoot (the bare root
+// AGENTS.md); this one is the fallback that P-Chat's own
+// install script populates with a copy of the canonical
+// .agents/AGENTS.md so projects always have a starter
+// project-level instruction file even when the user has
+// not authored a custom one at the project root.
+func ProjectPChatAgentsWithRoot(root string) string {
+	return filepath.Join(root, ProjectDirName, "AGENTS.md")
+}
+
 func ProjectSkillsDirWithRoot(root string) string {
 	return filepath.Join(root, ProjectDirName, "skills")
 }

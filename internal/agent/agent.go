@@ -900,8 +900,14 @@ func agentsSignature() string {
 func agentsSignatureWithRoot(root string) string {
 	g, _ := os.Stat(paths.GlobalAgents())
 	if root != "" {
-		p, _ := os.Stat(paths.ProjectAgentsWithRoot(root))
-		return fileSig(g) + "|" + fileSig(p) + "|" + root
+		// 2026-07: include both project-level slots
+		// (root AGENTS.md and .p-chat/AGENTS.md) in the
+		// sig so the cache invalidates when either changes.
+		// The OR loader only reads one of them per call,
+		// but both must be tracked for cache stability.
+		p1, _ := os.Stat(paths.ProjectAgentsWithRoot(root))
+		p2, _ := os.Stat(paths.ProjectPChatAgentsWithRoot(root))
+		return fileSig(g) + "|" + fileSig(p1) + "|" + fileSig(p2) + "|" + root
 	}
 	p, _ := os.Stat(paths.ProjectAgents())
 	return fileSig(g) + "|" + fileSig(p)
