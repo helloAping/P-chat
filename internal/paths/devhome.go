@@ -13,9 +13,17 @@ import (
 type resolveStrategy string
 
 const (
-	// StrategyEnvVar: PCHAT_HOME env var was set and non-empty.
-	// Highest priority — explicit operator override.
-	StrategyEnvVar resolveStrategy = "PCHAT_HOME env var"
+	// StrategyEnvVar: PCHAT_DATA_HOME env var was set and
+	// non-empty. Highest priority — explicit data-dir override
+	// from the operator.
+	//
+	// NB: this used to be PCHAT_HOME, but PCHAT_HOME is now
+	// owned by install.ps1 as the *install* dir (used in
+	// PATH as %PCHAT_HOME%). Conflating the two caused
+	// memory/config to land in the install directory on
+	// any machine that had run install.ps1 -AddToPath.
+	// PCHAT_DATA_HOME is the data-dir override from now on.
+	StrategyEnvVar resolveStrategy = "PCHAT_DATA_HOME env var"
 
 	// StrategyDevBin: the running binary lives in a
 	// "bin" or "dev-bin" subdirectory; we use the sibling
@@ -33,7 +41,7 @@ const (
 // devBinNames are the directory names that trigger sibling
 // resolution. The list is deliberately tiny — a project using
 // "build/" or "out/" should still resolve to ~/.p-chat unless
-// the user opts in via PCHAT_HOME.
+// the user opts in via PCHAT_DATA_HOME.
 var devBinNames = map[string]bool{
 	"bin":     true,
 	"dev-bin": true,
@@ -48,7 +56,7 @@ type resolved struct {
 	strategy resolveStrategy
 }
 
-// homeOverride, when set, replaces the value of $PCHAT_HOME.
+// homeOverride, when set, replaces the value of $PCHAT_DATA_HOME.
 // Used by tests so they can verify the env-var path without
 // polluting the real environment.
 var homeOverride atomic.Pointer[string]
@@ -61,7 +69,8 @@ var execOverride atomic.Pointer[string]
 // that picked it.
 //
 // Order of precedence (highest first):
-//  1. PCHAT_HOME env var (or homeOverride in tests).
+//  1. PCHAT_DATA_HOME env var (or homeOverride in tests).
+//     This is the operator's explicit data-dir override.
 //  2. Sibling: if os.Executable() lives in a "bin" or
 //     "dev-bin" directory, use <parent>/.p-chat/.
 //  3. $HOME/.p-chat (the original behaviour).
@@ -74,10 +83,17 @@ var execOverride atomic.Pointer[string]
 // read + one filepath parse per GlobalDir() call, which is
 // nanoseconds — well under the cost of the file I/O that
 // every caller (Load, EnsureGlobal, etc.) does on top.
+//
+// PCHAT_HOME is NOT consulted here. PCHAT_HOME is the
+// install root (set by install.ps1 -AddToPath, used in PATH
+// as %PCHAT_HOME%). Treating it as a data-dir override
+// caused installs to write memory/config under the install
+// directory — see internal/upgrade stepV3toV4 for the
+// one-time migration that fixes existing installs.
 func resolveHome() resolved {
 	// Tier 1: env var. Always re-read so t.Setenv in tests
 	// takes effect without a manual cache reset.
-	if h := readEnvOrOverride("PCHAT_HOME", &homeOverride); h != "" {
+	if h := readEnvOrOverride("PCHAT_DATA_HOME", &homeOverride); h != "" {
 		return resolved{dir: h, strategy: StrategyEnvVar}
 	}
 
@@ -160,7 +176,7 @@ func SetExecutableForTest(path string) {
 	execOverride.Store(&path)
 }
 
-// SetHomeForTest is the test-only hook for the PCHAT_HOME
+// SetHomeForTest is the test-only hook for the PCHAT_DATA_HOME
 // path. Same semantics as SetExecutableForTest.
 func SetHomeForTest(path string) {
 	if path == "" {

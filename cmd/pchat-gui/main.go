@@ -770,7 +770,14 @@ func (a *App) spawnAndWatch() {
 	// for the resolution rules).
 	cmd.Env = append(os.Environ(),
 		"PCHAT_PORT="+strconv.Itoa(port),
-		"PCHAT_HOME="+resolveHomeDir(),
+		// PCHAT_DATA_HOME (not PCHAT_HOME) — PCHAT_HOME is
+		// the install root set by install.ps1 -AddToPath.
+		// Reading it for the data dir would cause memory /
+		// config to land in the install directory. Pass
+		// the resolved data dir explicitly so the child
+		// server agrees with us regardless of what the
+		// user's PCHAT_HOME happens to be.
+		"PCHAT_DATA_HOME="+resolveHomeDir(),
 	)
 	// pchat-gui is a WINDOWS_GUI subsystem binary, but Go's
 	// os/exec still allocates a fresh console for child processes
@@ -916,13 +923,18 @@ func pickFreePort() (int, error) {
 // The home directory itself is decided by resolveHomeDir() in
 // homepath.go — the GUI is its own Go module so it can't
 // import internal/paths from the root module.
-//   - $PCHAT_HOME if set
+//   - $PCHAT_DATA_HOME if set
 //   - sibling of this binary if it lives in bin/ or dev-bin/
 //   - $HOME/.p-chat fallback
 //
 // When the GUI is launched from bin/pchat-gui.exe, the config
 // it picks up is bin/.p-chat/config.json — fully isolated
 // from the user's real ~/.p-chat.
+//
+// Note: PCHAT_HOME is NOT consulted. PCHAT_HOME is the install
+// root (used in PATH as %PCHAT_HOME%) and must never be the
+// data dir, otherwise installs with -AddToPath write their
+// memory under the install directory.
 func pickConfigPath() string {
 	return resolveConfigPath()
 }

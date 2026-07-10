@@ -29,8 +29,10 @@ type Server struct {
 type Options struct {
 	// Port to bind the server on. 0 = pick a free port automatically.
 	Port int
-	// ConfigPath is the path passed as --config. Empty = default
-	// ~/.p-chat/config.yaml.
+	// ConfigPath is the path passed as --config. Empty = use
+	// the data dir's config.json (preferred) or config.yaml
+	// (legacy); both are decided by internal/paths via the
+	// PCHAT_DATA_HOME / sibling / $HOME fallback chain.
 	ConfigPath string
 	// ServerBin is the path to the pchat-server binary. Required.
 	ServerBin string
@@ -90,21 +92,27 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 			// created on first save.
 			args = nil
 		}
+		// Note: the data dir itself is decided by internal/paths
+		// (PCHAT_DATA_HOME / sibling / $HOME fallback). The GUI
+		// explicitly passes PCHAT_DATA_HOME = <resolved dir> on
+		// the child env, so the child sees the same data dir
+		// we did.
 	}
 
 	cmd := exec.CommandContext(ctx, opts.ServerBin, args...)
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("PCHAT_PORT=%d", port),
-		"PCHAT_HOME="+paths.GlobalDir(),
+		// PCHAT_DATA_HOME (not PCHAT_HOME) — PCHAT_HOME is the
+		// install root set by install.ps1 -AddToPath. Reading
+		// it for the data dir would cause memory / config to
+		// land in the install directory. Pass the resolved
+		// data dir explicitly so the child server agrees with
+		// us regardless of the user's PCHAT_HOME value.
+		"PCHAT_DATA_HOME="+paths.GlobalDir(),
 	)
 	if opts.WebDir != "" {
 		cmd.Env = append(cmd.Env, "PCHAT_WEB_DIR="+opts.WebDir)
 	}
-	// PCHAT_PORT is informational; the real port comes from --config.
-	// We also set the listen address via env so the child binds to
-	// the port we picked. (pchat-server reads PCHAT_PORT to override
-	// the configured port — see cmd/pchat-server/main.go for the
-	// corresponding code.)
 	cmd.Stderr = opts.Stderr
 	cmd.Stdout = opts.Stdout
 	if err := cmd.Start(); err != nil {

@@ -71,7 +71,7 @@ func TestResolveHome_SiblingDevBin(t *testing.T) {
 func TestResolveHome_EnvVarBeatsSibling(t *testing.T) {
 	tmp := t.TempDir()
 	// Both env-var override AND a bin/-style exec path set.
-	// PCHAT_HOME must win.
+	// PCHAT_DATA_HOME must win.
 	withTestOverrides(t, filepath.Join(tmp, "bin", "pchat.exe"), tmp)
 	if s := ResolveStrategy(); s != StrategyEnvVar {
 		t.Errorf("strategy = %q, want %q", s, StrategyEnvVar)
@@ -101,6 +101,56 @@ func TestResolveHome_EmptyExecFallsThrough(t *testing.T) {
 	want := filepath.Join(home, GlobalDirName)
 	if got := GlobalDir(); got != want {
 		t.Errorf("GlobalDir() = %q, want %q", got, want)
+	}
+}
+
+// TestResolveHome_PCHAT_HOME_IsInstallNotData is the regression
+// test for the install-dir-as-data-dir bug.
+//
+// install.ps1 -AddToPath writes PCHAT_HOME = <install dir> as
+// a user env var. PCHAT_HOME used to be read here as the data
+// dir, which meant every install with -AddToPath got their
+// memory + config written under the install directory
+// (e.g. D:\develop\pchat\memory\) instead of under the
+// user's $HOME/.p-chat.
+//
+// PCHAT_HOME is now exclusively the install root (used in
+// PATH as %PCHAT_HOME%). Data-dir override is PCHAT_DATA_HOME.
+// This test pins the new contract: even if PCHAT_HOME is set,
+// it MUST NOT influence the data dir.
+func TestResolveHome_PCHAT_HOME_IsInstallNotData(t *testing.T) {
+	// Simulate the post-install environment: PCHAT_HOME is
+	// the install dir, no PCHAT_DATA_HOME override.
+	installDir := filepath.Join(t.TempDir(), "P-Chat")
+	t.Setenv("PCHAT_HOME", installDir)
+	// Make sure PCHAT_DATA_HOME is empty for this process.
+	oldData, hadData := os.LookupEnv("PCHAT_DATA_HOME")
+	if hadData {
+		t.Setenv("PCHAT_DATA_HOME", "")
+	}
+	_ = oldData
+
+	// Also force HOME to a clean temp so we can assert the
+	// fallback was the user's $HOME, not the install dir.
+	homeTmp := t.TempDir()
+	t.Setenv("USERPROFILE", homeTmp)
+	t.Setenv("HOME", homeTmp)
+
+	// Without the fix, GlobalDir() would return installDir
+	// (PCHAT_HOME) and the user's real ~/.p-chat/ would be
+	// bypassed.
+	got := GlobalDir()
+	want := filepath.Join(homeTmp, GlobalDirName)
+	if got == installDir {
+		t.Errorf("BUG REGRESSION: GlobalDir() = install dir %q — "+
+			"PCHAT_HOME (install root) leaked into data-dir resolution", got)
+	}
+	if got != want {
+		t.Errorf("GlobalDir() = %q, want %q (user home fallback)", got, want)
+	}
+	if s := ResolveStrategy(); s != StrategyHome {
+		t.Errorf("strategy = %q, want %q (PCHAT_HOME must not count as data override)",
+			s, StrategyHome)
 	}
 }
 
