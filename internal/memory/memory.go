@@ -37,6 +37,17 @@ type Conversation struct {
 // Message is one entry in a conversation's history.
 type Message struct {
 	ID             int64     `json:"id"`
+	// Seq is the per-conversation logical position
+	// (1..N within a session). Unlike `id` (a global
+	// AUTOINCREMENT that's never reused), seq survives
+	// rollback/undo: the undo path INSERTs restored rows
+	// with their caller-supplied seq, so a restored
+	// message has the same identity it had before the
+	// rollback. The pagination cursor and the rollback
+	// anchor both use seq in preference to id. See
+	// migration 8 (add_message_seq) for the schema
+	// addition and backfill strategy.
+	Seq            int64     `json:"seq,omitempty"`
 	ConversationID string    `json:"conversation_id"`
 	Role           string    `json:"role"`
 	Content        string    `json:"content"`

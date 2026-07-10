@@ -74,11 +74,23 @@ func TestMigration_StripStreamingFlag(t *testing.T) {
 			}
 
 			// Plant a "v6-era" row: delete the v7 entry
-			// from the migrations table to simulate the
-			// pre-upgrade state, then insert a row with
-			// `streaming` baked into the metadata.
+			// (and any later version) from the migrations
+			// table to simulate the pre-upgrade state,
+			// then insert a row with `streaming` baked
+			// into the metadata. Newer migrations (e.g.
+			// v8 add_message_seq) must be removed from
+			// the table too — the migration runner skips
+			// any version <= MAX(version) and would
+			// otherwise leave v7 un-applied because v8
+			// is recorded as the latest. The actual v8
+			// column on the messages table can stay (its
+			// migration is the schema-side effect we don't
+			// need to undo for this test) — the
+			// plant-then-migrateTo(7) shape is the
+			// canonical "test a specific historical
+			// migration" pattern.
 			if _, err := s.db.Exec(
-				`DELETE FROM schema_migrations WHERE version = 7`,
+				`DELETE FROM schema_migrations WHERE version >= 7`,
 			); err != nil {
 				t.Fatalf("downgrade schema_migrations: %v", err)
 			}
@@ -97,11 +109,12 @@ func TestMigration_StripStreamingFlag(t *testing.T) {
 				t.Fatalf("pre-migration: planted row should contain streaming, got %s", pre[0])
 			}
 
-			// Re-run migrations. The system will re-apply
-			// v7 (and only v7), which should strip the
-			// streaming key.
-			if err := s.Migrate(); err != nil {
-				t.Fatalf("Migrate: %v", err)
+			// Re-run only v7. migrateTo(7) is bounded
+			// by targetVersion so the runner won't try
+			// to re-apply v8 against a DB that already
+			// has the seq column.
+			if err := s.migrateTo(7); err != nil {
+				t.Fatalf("migrateTo(7): %v", err)
 			}
 
 			post := readAllMeta(t, s)

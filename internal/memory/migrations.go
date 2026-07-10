@@ -205,6 +205,66 @@ WHERE json_extract(metadata, '$.streaming') IS NOT NULL;`,
 -- the fix, and flipping it back to true would re-introduce
 -- the original bug. A re-run of the up is safe.`,
 	},
+	{
+		// Migration 8: add an immutable per-conversation
+		// sequence number (`seq`) to every message.
+		//
+		// Why a separate column instead of reusing `id`?
+		// `id` is a SQLite AUTOINCREMENT, so it
+		// monotonically grows across the whole database
+		// and is **never reused** — a rollback/undo pair
+		// leaves the conversation with *new* ids for the
+		// restored messages, breaking any client-side
+		// reference to the original id (Vue's :key,
+		// rollback cursor, undo payload, etc.). The
+		// pagination cursor (handler.go: ListMessages
+		// `oldest_id`) and the rollback anchor
+		// (POST /rollback body `before_id`) are both
+		// exposed in the API; if those become unstable
+		// after undo, the frontend gets stuck rows that
+		// no longer map to anything in the DB.
+		//
+		// `seq` is per-conversation (each session has
+		// its own 1..N counter) and assigned at insert
+		// time. Rollback/undo preserves the original
+		// seqs by INSERTing restored rows with their
+		// caller-supplied seq, so a restored message
+		// has the same identity it had before the
+		// rollback. The pagination cursor switches to
+		// `seq` so a paginated scroll survives an undo
+		// mid-scroll.
+		//
+		// Backfill: assign seq in id-order within each
+		// conversation. SQLite's correlated UPDATE
+		// computes the row number per (conversation_id,
+		// id) partition and writes it to seq. The
+		// COALESCE on the per-row count handles the
+		// subquery returning 0 for the very first row
+		// (no rows with strictly smaller id in the
+		// same conversation).
+		//
+		// The idx_messages_conv_seq index supports the
+		// new `WHERE conversation_id = ? AND seq < ?`
+		// pagination predicate and the seq-based
+		// `MAX(seq) + 1` next-seq lookup during
+		// insert.
+		Version: 8,
+		Name:    "add_message_seq",
+		Up: `
+ALTER TABLE messages ADD COLUMN seq INTEGER;
+
+UPDATE messages
+SET seq = (
+    SELECT COUNT(*) FROM messages m2
+    WHERE m2.conversation_id = messages.conversation_id
+      AND m2.id <= messages.id
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);`,
+		Down: `
+DROP INDEX IF EXISTS idx_messages_conv_seq;
+ALTER TABLE messages DROP COLUMN seq;`,
+	},
 }
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INTEGER PRIMARY KEY,
