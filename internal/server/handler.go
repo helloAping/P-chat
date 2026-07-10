@@ -1607,7 +1607,25 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		oldestID int64
 	)
 	if len(rowIDs) > 0 {
-		oldestID = rowIDs[len(rowIDs)-1]
+		// `rowIDs` is parallel to `msgs` and is oldest-first
+		// (we reversed the SQL DESC order), so rowIDs[0] is
+		// the smallest id in this page (the "oldest"
+		// message) and rowIDs[len-1] is the largest (the
+		// "newest" message). The pagination cursor is
+		// "fetch the next older page", so we report the
+		// smallest id here; the client's next request is
+		// `?before_id=<oldestID>` and the SQL predicate
+		// `id < ?` then naturally targets everything
+		// strictly older than that row. The previous code
+		// returned rowIDs[len-1] (the newest id) which
+		// caused every page to overlap with the previous
+		// one by all-but-one row and `has_more` to stay
+		// `true` forever — the infinite-scroll history
+		// loader would re-fetch the same messages and
+		// append them to the in-memory list, producing
+		// visible duplicate bubbles (see handler
+		// CursorTest for the regression lock).
+		oldestID = rowIDs[0]
 		// `has_more` = "is there at least one row older
 		// than the oldest one we returned?". Cheap: a single
 		// indexed COUNT/EXISTS query.
