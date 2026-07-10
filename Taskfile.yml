@@ -61,7 +61,14 @@ tasks:
     deps: [build:frontend]
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -platform windows/amd64 -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
+      # Resolve wails CLI: `go install` puts it under
+      # $(go env GOPATH)/bin which isn't always in $PATH.
+      # scripts/find-wails.ps1 searches the common locations
+      # and prints the dir to prepend. We do this once per
+      # task so a Taskfile invocation in any shell finds
+      # wails without requiring the user to set up their
+      # $PATH manually.
+      - cmd: powershell -NoProfile -Command "$dir = & '..\..\scripts\find-wails.ps1'; if (-not $dir) { Write-Error 'wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@latest' ; exit 1 }; $env:PATH = \"$dir;$env:PATH\"; wails build -platform windows/amd64 -ldflags \"-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}\" -s"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -73,7 +80,7 @@ tasks:
     deps: [build:frontend]
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -platform linux/amd64 -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
+      - cmd: powershell -NoProfile -Command "$dir = & '..\..\scripts\find-wails.ps1'; if (-not $dir) { Write-Error 'wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@latest' ; exit 1 }; $env:PATH = \"$dir;$env:PATH\"; wails build -platform linux/amd64 -ldflags \"-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}\" -s"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -143,7 +150,7 @@ tasks:
     desc: 启动桌面端 (开发模式)
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails dev
+      - cmd: powershell -NoProfile -Command "$dir = & '..\..\scripts\find-wails.ps1'; if (-not $dir) { Write-Error 'wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@latest' ; exit 1 }; $env:PATH = \"$dir;$env:PATH\"; wails dev"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -163,7 +170,7 @@ tasks:
     internal: true
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -debug -s
+      - cmd: powershell -NoProfile -Command "$dir = & '..\..\scripts\find-wails.ps1'; if (-not $dir) { Write-Error 'wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@latest' ; exit 1 }; $env:PATH = \"$dir;$env:PATH\"; wails build -debug -s"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
