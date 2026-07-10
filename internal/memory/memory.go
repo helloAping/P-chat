@@ -773,20 +773,29 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 		// with empty content rather than dropping the row.
 		// The downstream tool_result will carry the user's
 		// answer.
+		//
+		// submit_to_llm: trust the column value directly.
+		// The column is NOT NULL DEFAULT 1 (migration 5 +
+		// backfill), so every row has an explicit value
+		// and we can read it verbatim. The pre-fix code
+		// had `sl := 1; if dbSubmitToLLM != 0 { sl = dbSubmitToLLM }`
+		// which silently overrode a deliberate 0 (e.g.
+		// thinking rows, exec_command tool_result rows)
+		// with the default 1, leaking display-only content
+		// into the LLM context on the next read. The C5
+		// commit's rollback round-trip relies on this
+		// (an undone thinking row must round-trip with
+		// submit_to_llm=0, not 1).
 		mt := llm.MsgTypeText
-		sl := 1
 		if dbMsgType != 0 {
 			mt = dbMsgType
-		}
-		if dbSubmitToLLM != 0 {
-			sl = dbSubmitToLLM
 		}
 		return []llm.ChatMessage{{
 			Role:        role,
 			Type:        llm.TypeText,
 			Content:     text,
 			MsgType:     mt,
-			SubmitToLLM: sl,
+			SubmitToLLM: dbSubmitToLLM,
 		}}
 	}
 
@@ -888,18 +897,36 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 }
 
 // resolveMsgType picks the correct MsgType / SubmitToLLM for a decoded
-// message. Prefer the dedicated DB columns when populated; otherwise
-// infer from the legacy Type string + tool_name.
+// message. The dedicated DB columns (msg_type, submit_to_llm) are
+// the source of truth: every row has explicit values because
+// migration 5 added the columns as NOT NULL DEFAULT 1 and the
+// backfill (migration 6) re-stamped every existing row. The
+// legacy Type-string + tool_name inference is the fallback for
+// pre-migration-5 rows that somehow have empty columns (none
+// should exist, but the safety net stays).
+//
+// Pre-fix the "prefer columns" branch was gated on either
+// column being non-zero, which meant a thinking row
+// (msg_type=0, submit_to_llm=0) fell through to the legacy
+// inference and decoded as a normal text row, leaking the
+// thinking text into the LLM context. The C5 commit's
+// rollback round-trip relies on this NOT happening.
 func resolveMsgType(legacyType, toolName string, dbMsgType, dbSubmitToLLM int) (int, int) {
-	if dbMsgType != 0 || dbSubmitToLLM != 0 {
-		mt := dbMsgType
-		sl := dbSubmitToLLM
-		if mt == 0 {
-			mt = llm.MsgTypeText
-		}
-		return mt, sl
+	// If the row's columns look uninitialized (both zero AND
+	// no legacy type key), fall back to the legacy inference
+	// — this only happens for hand-crafted test fixtures or
+	// pre-migration DBs, not real production data.
+	if dbMsgType == 0 && dbSubmitToLLM == 0 && legacyType == "" {
+		return llm.MsgTypeForLegacy(legacyType, toolName)
 	}
-	return llm.MsgTypeForLegacy(legacyType, toolName)
+	// Trust the columns. The msg_type column may be 0 for
+	// text rows (which is the enum's zero value); map that
+	// to MsgTypeText explicitly.
+	mt := dbMsgType
+	if mt == 0 {
+		mt = llm.MsgTypeText
+	}
+	return mt, dbSubmitToLLM
 }
 
 // extractTextFromPartsBlob parses a v2 `meta["parts"]` JSON
@@ -1613,8 +1640,17 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 	// rollback would return tool rows as empty assistant
 	// bubbles, then the frontend would splice them back
 	// as zero-content messages on undo.
+	//
+	// seq is part of the snapshot for the same reason:
+	// the new seq-based cursor relies on every row having
+	// a valid seq. RestoreMessages must reuse the original
+	// seq, otherwise the restored row's seq would collide
+	// with whatever MAX(seq)+1 looks like at undo time and
+	// (a) the cursor would skip the row on the next page
+	// request, (b) two rows in the same conversation
+	// could end up with the same seq.
 	rows, err := s.db.Query(
-		`SELECT id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm
+		`SELECT id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm, seq
 		 FROM messages WHERE conversation_id = ? AND id >= ? ORDER BY id`,
 		conversationID, fromID,
 	)
@@ -1627,8 +1663,12 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 	for rows.Next() {
 		var m Message
 		var created int64
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata, &m.MsgType, &m.SubmitToLLM); err != nil {
+		var seq sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata, &m.MsgType, &m.SubmitToLLM, &seq); err != nil {
 			return deleted, err
+		}
+		if seq.Valid {
+			m.Seq = seq.Int64
 		}
 		m.CreatedAt = time.Unix(created, 0)
 		deleted = append(deleted, m)
@@ -1651,9 +1691,29 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 }
 
 // RestoreMessages inserts previously-deleted messages back into the
-// messages table with their original ids. This is the inverse of
-// DeleteMessagesFrom. Callers should only restore messages that were
-// previously returned by DeleteMessagesFrom.
+// messages table with their original ids and seqs. This is the
+// inverse of DeleteMessagesFrom. Callers should only restore
+// messages that were previously returned by DeleteMessagesFrom.
+//
+// The pre-fix code only restored id/conversation_id/role/content/
+// tokens/created_at/metadata — three fields were silently
+// dropped on every undo:
+//   - msg_type     → restored rows defaulted to 0 (MsgTypeText)
+//   - submit_to_llm → restored rows defaulted to 1 (the original
+//                     intent was the opposite for some categories,
+//                     e.g. thinking is submit_to_llm=0 and
+//                     tool_result for exec_command is also 0)
+//   - seq          → restored rows got NULL seq, breaking the
+//                    new seq-based cursor (migration 8)
+//
+// Now we restore all of them. The caller (handler
+// UndoRollback) populates these from the MessageResponse
+// payload, which is the wire shape that already carries the
+// server-decoded values. Without this, after-undo rows
+// would have wrong content-shape (e.g. tool rows reading
+// as text, thinking rows reading as assistant text) AND
+// the seq-based cursor would skip them (NULL seq doesn't
+// match `seq < ?` unless we make the SQL null-safe).
 func (s *Store) RestoreMessages(messages []Message) error {
 	if len(messages) == 0 {
 		return nil
@@ -1665,8 +1725,8 @@ func (s *Store) RestoreMessages(messages []Message) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(
-		`INSERT OR REPLACE INTO messages(id, conversation_id, role, content, tokens, created_at, metadata)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO messages(id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return err
@@ -1674,7 +1734,10 @@ func (s *Store) RestoreMessages(messages []Message) error {
 	defer stmt.Close()
 
 	for _, m := range messages {
-		if _, err := stmt.Exec(m.ID, m.ConversationID, m.Role, m.Content, m.Tokens, m.CreatedAt.Unix(), m.Metadata); err != nil {
+		if _, err := stmt.Exec(
+			m.ID, m.ConversationID, m.Role, m.Content, m.Tokens,
+			m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM, m.Seq,
+		); err != nil {
 			return err
 		}
 	}

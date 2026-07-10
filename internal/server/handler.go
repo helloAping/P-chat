@@ -345,6 +345,12 @@ type MessageResponse struct {
 	CreatedAt  int64  `json:"created_at"`
 	ToolCallID string `json:"tool_call_id,omitempty"`
 	Name       string `json:"name,omitempty"`
+	// SubmitToLLM is the round-tripped value the agent
+	// used to decide whether to include this row in the
+	// LLM context. Restored on undo (was hard-coded to
+	// 1 pre-fix, which leaked thinking/tool rows back
+	// into the LLM context).
+	SubmitToLLM int `json:"submit_to_llm,omitempty"`
 	// Provider / Model that produced the assistant's reply, when
 	// known. Populated only for messages tagged at request time;
 	// the legacy single-conversation flow leaves them empty.
@@ -1316,13 +1322,44 @@ func (h *Handler) UndoRollback(c *gin.Context) {
 	for _, r := range req.Messages {
 		m := memory.Message{
 			ID:             r.ID,
+			// Seq is preserved from the rollback's
+			// deleted_messages so the restored row
+			// keeps the same per-conversation
+			// position it had before the rollback.
+			// Without this, the new seq-based cursor
+			// (migration 8) would skip the row on
+			// the next page request — the original
+			// (deleted) row was at seq=N, but the
+			// restored row would get whatever
+			// MAX(seq)+1 looks like at undo time,
+			// and any cursor at seq=N would miss it.
+			Seq:            r.Seq,
 			ConversationID: id, // override from URL, defense-in-depth
 			Role:           r.Role,
 			Content:        r.Content,
 			MsgType:        r.MsgType,
-			SubmitToLLM:    1, // restored messages rejoin the LLM context
-			CreatedAt:      time.Unix(r.CreatedAt, 0),
-			Metadata:       encodeMessageResponseMeta(r),
+			// submit_to_llm is preserved from the
+			// rollback's deleted_messages, NOT
+			// hard-coded to 1. Pre-fix this was
+			// always 1, which meant that an undone
+			// thinking row (originally
+			// submit_to_llm=0) was re-inserted as
+			// a normal assistant row, sending its
+			// chain-of-thought back into the LLM
+			// context. The thinking text was the
+			// exact content the user already saw —
+			// the LLM would then echo it back as
+			// the next "answer". The same applied
+			// to tool_result rows for exec_command
+			// (submit_to_llm=0) — the raw command
+			// output would re-enter the LLM
+			// context as if it were user content.
+			// Carrying the original value through
+			// the rollback/undo round-trip fixes
+			// the leak.
+			SubmitToLLM: r.SubmitToLLM,
+			CreatedAt:   time.Unix(r.CreatedAt, 0),
+			Metadata:    encodeMessageResponseMeta(r),
 		}
 		restored = append(restored, m)
 	}
@@ -1794,13 +1831,14 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 		created = createds[i]
 	}
 	resp := MessageResponse{
-		ID:        rowID,
-		Seq:       seq,
-		Role:      m.Role,
-		MsgType:   m.MsgType,
-		Content:   m.Content,
-		CreatedAt: created,
-		Name:      m.Name,
+		ID:          rowID,
+		Seq:         seq,
+		Role:        m.Role,
+		MsgType:     m.MsgType,
+		Content:     m.Content,
+		CreatedAt:   created,
+		Name:        m.Name,
+		SubmitToLLM: m.SubmitToLLM,
 	}
 
 	// Media messages (image / audio / video): compute a data
