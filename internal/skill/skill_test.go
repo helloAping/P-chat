@@ -164,3 +164,118 @@ func TestBuildSkillContext_StableAcrossCalls(t *testing.T) {
 		t.Error("BuildSkillContext not stable")
 	}
 }
+
+// --- 2026-07 project-aware loader tests ----------------------
+//
+// Pre-2026-07 LoadAll() walked paths.ProjectSkillsDir() which
+// was rooted at os.Getwd() — broken for the Wails GUI server
+// whose CWD is unrelated to the user's project. LoadAllWithRoot
+// fixes this by accepting the session's projectRoot and walking
+// paths.ProjectSkillsDirWithRoot(root) instead.
+
+// TestLoadAllWithRoot_ProjectWinsOverGlobal verifies the
+// merge semantics: a project-level skill with the same name
+// as a global skill replaces the global content (project
+// overrides).
+func TestLoadAllWithRoot_ProjectWinsOverGlobal(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("HOME", tmp)
+	root := t.TempDir()
+
+	// Global "alpha" with content A
+	writeSkill(t, filepath.Join(tmp, ".p-chat", "skills"), "alpha")
+	if err := os.WriteFile(
+		filepath.Join(tmp, ".p-chat", "skills", "alpha", "SKILL.md"),
+		[]byte("# alpha\n\nGlobal content.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Project "alpha" with content B
+	writeSkill(t, filepath.Join(root, ".p-chat", "skills"), "alpha")
+	if err := os.WriteFile(
+		filepath.Join(root, ".p-chat", "skills", "alpha", "SKILL.md"),
+		[]byte("# alpha\n\nProject content.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LoadAllWithRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 dedup'd skill, got %d", len(got))
+	}
+	if !strings.Contains(got[0].Content, "Project content") {
+		t.Errorf("project should override global; got %q", got[0].Content)
+	}
+}
+
+// TestLoadAllWithRoot_ProjectRootIgnoresServerCWD is the
+// 2026-07 P1 regression test: a project skill under a
+// DIFFERENT directory than the server CWD must still be
+// picked up. Pre-2026-07 LoadAll() used os.Getwd() so a
+// Wails GUI server (whose CWD is unrelated to the user's
+// project) would skip the project slot entirely.
+func TestLoadAllWithRoot_ProjectRootIgnoresServerCWD(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("HOME", tmp)
+	root := t.TempDir()
+
+	// Save and restore CWD so the test demonstrates the
+	// old "use os.Getwd()" approach would have missed the
+	// project skill. We chdir to a third directory that
+	// has no project skill; only the explicit root param
+	// finds it.
+	oldCwd, _ := os.Getwd()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldCwd) })
+
+	writeSkill(t, filepath.Join(root, ".p-chat", "skills"), "project-only")
+
+	got, err := LoadAllWithRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "project-only" {
+		t.Errorf("expected 1 skill 'project-only', got %+v", got)
+	}
+}
+
+// TestLoadAllWithRoot_EmptyRootSkipsProjectSlot locks the
+// "no project pinned" branch: root == "" means the project
+// slot is skipped (matches the global-mode UX where the
+// user explicitly opted out of project scoping).
+func TestLoadAllWithRoot_EmptyRootSkipsProjectSlot(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("HOME", tmp)
+	root := t.TempDir()
+
+	// Project skill under root — must NOT be picked up
+	// when LoadAllWithRoot is called with "".
+	writeSkill(t, filepath.Join(root, ".p-chat", "skills"), "project-only")
+	// Global skill — must be picked up.
+	writeSkill(t, filepath.Join(tmp, ".p-chat", "skills"), "global-only")
+
+	got, err := LoadAllWithRoot("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range got {
+		if s.Name == "project-only" {
+			t.Errorf("empty root should skip project slot; got %+v", got)
+		}
+	}
+	foundGlobal := false
+	for _, s := range got {
+		if s.Name == "global-only" {
+			foundGlobal = true
+		}
+	}
+	if !foundGlobal {
+		t.Errorf("expected global-only with empty root, got %+v", got)
+	}
+}

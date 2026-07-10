@@ -90,6 +90,20 @@ type Agent struct {
 
 	// subAgentSem limits concurrent sub-agent launches. nil = unlimited.
 	subAgentSem chan struct{}
+
+	// lastProjectRoot is the projectRoot the current skills /
+	// rules slice was loaded against. Compared by string in
+	// ReloadWithRootIfChanged to skip the re-load when the
+	// user sends a follow-up message in the same session
+	// (root doesn't change between turns of one session).
+	// 2026-07: prior to this field, switching projectRoot
+	// mid-session did not reload project-level skills or
+	// rules — they were loaded once at agent construction
+	// (New) and only reloaded by Reload() (which the rules
+	// watcher triggers on mtime change of the CWD-based
+	// rules dir). The field lets buildStaticSystemPrompt
+	// detect a project switch and invalidate the cache.
+	lastProjectRoot string
 }
 
 // SetChatOptions overrides the per-request sampling parameters
@@ -523,6 +537,15 @@ type ChatStreamChunk struct {
 // only thing that should change in this string is the underlying files
 // (AGENTS.md, rules, skills) or the chosen style.
 func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, projectRoot string, kbEnabled bool) (string, string, error) {
+	// 2026-07: if the session's projectRoot has changed
+	// since the last call (user switched projects
+	// mid-session, or this is the first turn of a new
+	// session), reload skills and rules from the new
+	// root. The static-prompt cache is invalidated by
+	// ReloadWithRootIfChanged when the root differs, so the
+	// sig-comparison below always finds a miss and rebuilds
+	// the prompt with the new project's skills + rules.
+	a.ReloadWithRootIfChanged(projectRoot)
 	toolNames := make([]string, 0, len(toolDefs))
 	for _, t := range toolDefs {
 		toolNames = append(toolNames, t.Name)
@@ -873,8 +896,8 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 // Reload forces the next call to rebuild the static system prompt
 // (e.g. after the user changes AGENTS.md or installs a new skill).
 func (a *Agent) Reload() {
-	skills, _ := skill.LoadAll()
-	rulesList, _ := rules.LoadAll()
+	skills, _ := skill.LoadAllWithRoot(a.lastProjectRoot)
+	rulesList, _ := rules.LoadAllWithRoot(a.lastProjectRoot)
 	a.skills = skills
 	a.rules = rulesList
 	a.staticPrompt = ""
@@ -882,6 +905,35 @@ func (a *Agent) Reload() {
 	a.kbIndexCache = ""
 	a.kbIndexCacheKey = ""
 	a.kbIndexCacheTime = 0
+}
+
+// ReloadWithRootIfChanged reloads skills / rules from the new
+// projectRoot if it differs from the last one we loaded
+// against. 2026-07: called from buildStaticSystemPrompt so
+// switching projectRoot mid-session picks up the new
+// project's skills + rules + the AGENTS.md OR loader
+// automatically re-selects.  The static-prompt cache is
+// invalidated when the root changes, but not when it
+// matches — same-session follow-up messages hit the prefix
+// cache as before.
+//
+// Pre-2026-07 the projectRoot never entered the loader
+// path: skills and rules were loaded once at agent
+// construction (using os.Getwd() inside the loaders), and
+// only the rules.Watch mtime-poll reloaded them. The Wails
+// GUI server's CWD is unrelated to the user's project, so
+// project-level skills / rules never actually loaded.
+func (a *Agent) ReloadWithRootIfChanged(root string) {
+	if root == a.lastProjectRoot {
+		return
+	}
+	a.lastProjectRoot = root
+	skills, _ := skill.LoadAllWithRoot(root)
+	rulesList, _ := rules.LoadAllWithRoot(root)
+	a.skills = skills
+	a.rules = rulesList
+	a.staticPrompt = ""
+	a.staticPromptID = ""
 }
 
 // StaticPromptInfo exposes the current static-prompt cache key for testing.

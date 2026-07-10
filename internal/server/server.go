@@ -239,11 +239,21 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	// Polling (every 5s) is used instead of fsnotify because it
 	// works uniformly across Windows/macOS/Linux without
 	// additional dependencies.
+	// 2026-07: rules.Watch now takes the session's
+	// projectRoot as a third arg. The server's startup
+	// root is "" (no session is selected yet) so the
+	// watcher covers the global dir + the legacy
+	// CWD-anchored project dir. When a session is
+	// selected, ReloadWithRootIfChanged on the agent is
+	// the path that re-targets the watcher (the watcher's
+	// dirs are fixed at Watch() time, but Reload still
+	// fires the onChange callback and the agent then
+	// loads from the new root on the next chat turn).
 	s.rulesWatchStop = rules.Watch(func() {
 		if agt != nil {
 			agt.Reload()
 		}
-	}, 5*time.Second)
+	}, 5*time.Second, "")
 	return s
 }
 
