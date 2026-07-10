@@ -70,7 +70,7 @@ func TestRollbackUndo_RoundTrip(t *testing.T) {
 	}
 
 	// Get the assistant message's id for the rollback anchor.
-	_, _, _, rowIDs := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	_, _, _, rowIDs, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	if len(rowIDs) < 4 {
 		t.Fatalf("setup: want 4 rows, got %d", len(rowIDs))
 	}
@@ -143,7 +143,7 @@ func TestRollbackUndo_RoundTrip(t *testing.T) {
 	// doesn't carry it). The RestoreMessages insert then
 	// writes metadata="" into the DB, losing the parts.
 	// Post-fix the round-trip should be lossless.
-	msgs, metas, _, ids := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	msgs, metas, _, ids, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	if len(msgs) != 4 {
 		t.Fatalf("after undo: want 4 messages, got %d", len(msgs))
 	}

@@ -447,6 +447,24 @@ func (s *Store) HasOlderMessages(convID string, oldestID int64) bool {
 	return exists
 }
 
+// HasOlderMessagesBySeq is the seq-based counterpart of
+// HasOlderMessages. The seq cursor is stable across
+// rollback+undo (per-conversation, never reused), so the
+// seq-based check is the right one for the new cursor.
+// Backed by the idx_messages_conv_seq index, so it's the
+// same cost as the id-based check.
+func (s *Store) HasOlderMessagesBySeq(convID string, oldestSeq int64) bool {
+	if convID == "" || oldestSeq <= 0 {
+		return false
+	}
+	var exists bool
+	_ = s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ? AND seq < ?)`,
+		convID, oldestSeq,
+	).Scan(&exists)
+	return exists
+}
+
 // GetChatMessagesWithMeta returns ChatMessage history alongside
 // raw metadata strings and creation timestamps.
 func (s *Store) GetChatMessagesWithMeta() ([]llm.ChatMessage, []string, []int64) {
@@ -462,7 +480,7 @@ func (s *Store) GetChatMessagesWithMetaN(limit int) ([]llm.ChatMessage, []string
 // GetChatMessagesWithMetaFor is the multi-session-safe variant.
 // Pass the conversation id explicitly; empty id returns nil.
 func (s *Store) GetChatMessagesWithMetaFor(convID string, limit int) ([]llm.ChatMessage, []string, []int64) {
-	msgs, metas, createds, _ := s.GetChatMessagesWithMetaPage(convID, 0, limit)
+	msgs, metas, createds, _, _ := s.GetChatMessagesWithMetaPage(convID, 0, limit)
 	return msgs, metas, createds
 }
 
@@ -477,12 +495,15 @@ func (s *Store) GetChatMessagesWithMetaFor(convID string, limit int) ([]llm.Chat
 // limit (e.g. 50) so the response is bounded.
 //
 // The fourth return value is the list of SQLite row ids
-// (parallel to msgs / metas / createds). The frontend uses
-// them as the `before_id` cursor for the next page request.
-func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64) {
+// (parallel to msgs / metas / createds / seqs). The fifth is
+// the per-conversation seq — the API exposes both for
+// backwards compat: id is kept for the legacy `before_id`
+// cursor while seq is the new stable cursor (see migration
+// 8 add_message_seq for the rationale).
+func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64, []int64) {
 	_ = s.Flush()
 	if convID == "" {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 
 	// Two query shapes: with and without the beforeID filter.
@@ -495,21 +516,21 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 	)
 	if beforeID > 0 {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
 			 WHERE conversation_id = ? AND id < ?
 			 ORDER BY id DESC LIMIT ?`,
 			convID, beforeID, limitOrHuge(limit),
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
 			 WHERE conversation_id = ?
 			 ORDER BY id DESC LIMIT ?`,
 			convID, limitOrHuge(limit),
 		)
 	}
 	if err != nil {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	defer rows.Close()
 
@@ -518,6 +539,7 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 		msg     llm.ChatMessage
 		meta    string
 		created int64
+		seq     int64
 	}
 	var rev []row
 	for rows.Next() {
@@ -527,17 +549,22 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 			metaStr               sql.NullString
 			created               int64
 			msgType, submitToLLM  int
+			seq                   sql.NullInt64
 		)
-		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM); err != nil {
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq); err != nil {
 			break
 		}
 		meta := ""
 		if metaStr.Valid {
 			meta = metaStr.String
 		}
+		seqVal := int64(0)
+		if seq.Valid {
+			seqVal = seq.Int64
+		}
 		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
-			rev = append(rev, row{id: id, msg: m, meta: meta, created: created})
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal})
 		}
 	}
 	n := len(rev)
@@ -545,13 +572,108 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 	metas := make([]string, n)
 	createds := make([]int64, n)
 	ids := make([]int64, n)
+	seqs := make([]int64, n)
 	for i := 0; i < n; i++ {
 		out[i] = rev[n-1-i].msg
 		metas[i] = rev[n-1-i].meta
 		createds[i] = rev[n-1-i].created
 		ids[i] = rev[n-1-i].id
+		seqs[i] = rev[n-1-i].seq
 	}
-	return out, metas, createds, ids
+	return out, metas, createds, ids, seqs
+}
+
+// GetChatMessagesWithMetaPageBySeq is the seq-based
+// counterpart of GetChatMessagesWithMetaPage. It returns
+// rows with `seq < beforeSeq` in the same conversation.
+//
+// Why a separate method: the id-based cursor becomes stale
+// after a rollback+undo (restored rows have new ids). The
+// seq-based cursor is stable (seq is per-conversation and
+// never reused), so the API exposes it as the preferred
+// cursor going forward. The id-based method stays for
+// legacy clients.
+//
+// Both methods share the same in-memory layout (parallel
+// slices, oldest-first order). The SQL is just `seq < ?`
+// instead of `id < ?`, indexed by idx_messages_conv_seq
+// (migration 8).
+func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64, []int64) {
+	_ = s.Flush()
+	if convID == "" {
+		return nil, nil, nil, nil, nil
+	}
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if beforeSeq > 0 {
+		rows, err = s.db.Query(
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
+			 WHERE conversation_id = ? AND seq < ?
+			 ORDER BY seq DESC LIMIT ?`,
+			convID, beforeSeq, limitOrHuge(limit),
+		)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
+			 WHERE conversation_id = ?
+			 ORDER BY seq DESC LIMIT ?`,
+			convID, limitOrHuge(limit),
+		)
+	}
+	if err != nil {
+		return nil, nil, nil, nil, nil
+	}
+	defer rows.Close()
+
+	type row struct {
+		id      int64
+		msg     llm.ChatMessage
+		meta    string
+		created int64
+		seq     int64
+	}
+	var rev []row
+	for rows.Next() {
+		var (
+			id                    int64
+			role, content         string
+			metaStr               sql.NullString
+			created               int64
+			msgType, submitToLLM  int
+			seq                   sql.NullInt64
+		)
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq); err != nil {
+			break
+		}
+		meta := ""
+		if metaStr.Valid {
+			meta = metaStr.String
+		}
+		seqVal := int64(0)
+		if seq.Valid {
+			seqVal = seq.Int64
+		}
+		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
+		for _, m := range msgs {
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal})
+		}
+	}
+	n := len(rev)
+	out := make([]llm.ChatMessage, n)
+	metas := make([]string, n)
+	createds := make([]int64, n)
+	ids := make([]int64, n)
+	seqs := make([]int64, n)
+	for i := 0; i < n; i++ {
+		out[i] = rev[n-1-i].msg
+		metas[i] = rev[n-1-i].meta
+		createds[i] = rev[n-1-i].created
+		ids[i] = rev[n-1-i].id
+		seqs[i] = rev[n-1-i].seq
+	}
+	return out, metas, createds, ids, seqs
 }
 
 // encodeChatMeta builds the canonical metadata map for a
@@ -832,7 +954,8 @@ func (s *Store) Flush() error {
 		return err
 	}
 	stmt, err := tx.Prepare(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		_ = tx.Rollback()
@@ -842,8 +965,50 @@ func (s *Store) Flush() error {
 		return err
 	}
 	defer stmt.Close()
+
+	// Assign per-conversation seqs in a single pass.
+	// For each conversation in the batch, look up the
+	// current MAX(seq) once, then stamp pending rows
+	// with seq+1, seq+2, ... in the order they were
+	// queued. The lookup uses the same index
+	// (idx_messages_conv_seq) that the new cursor
+	// pagination uses.
+	//
+	// The pending slice may contain multiple
+	// conversations (different SendMessage goroutines
+	// can interleave on s.pendingWrites). Grouping by
+	// convID first means each MAX(seq) is queried once
+	// per conversation rather than once per row.
+	convMax := map[string]int64{}
 	for _, m := range pending {
-		if _, err := stmt.Exec(m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM); err != nil {
+		var maxSeq sql.NullInt64
+		if err := tx.QueryRow(
+			`SELECT MAX(seq) FROM messages WHERE conversation_id = ?`,
+			m.ConversationID,
+		).Scan(&maxSeq); err != nil {
+			_ = tx.Rollback()
+			s.pendingMu.Lock()
+			s.pendingWrites = append(pending, s.pendingWrites...)
+			s.pendingMu.Unlock()
+			return err
+		}
+		base := int64(0)
+		if maxSeq.Valid {
+			base = maxSeq.Int64
+		}
+		convMax[m.ConversationID] = base
+	}
+	// Second pass: write rows, stamping the per-conv counter.
+	convCur := map[string]int64{}
+	for _, m := range pending {
+		base := convMax[m.ConversationID]
+		cur := convCur[m.ConversationID]
+		next := base + cur + 1
+		convCur[m.ConversationID] = cur + 1
+		if _, err := stmt.Exec(
+			m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(),
+			m.Metadata, m.MsgType, m.SubmitToLLM, next,
+		); err != nil {
 			_ = tx.Rollback()
 			// Put pending back so a per-message insert error
 			// (e.g. constraint violation on bad data) doesn't
@@ -1373,15 +1538,21 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	}()
 
 	stmt, err := tx.Prepare(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer stmt.Close()
 
-	for _, r := range msgs {
-		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta, r.msgType, r.submitToLLM); err != nil {
+	// The fork's per-conversation seq counter starts at
+	// 1 (the new conversation has no prior history).
+	// Walking the source msgs in id-ASC order (already
+	// guaranteed by the SELECT above) means we can
+	// stamp seq=i+1 for the i-th row — no MAX(seq)
+	// lookup needed.
+	for i, r := range msgs {
+		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta, r.msgType, r.submitToLLM, int64(i+1)); err != nil {
 			return nil, err
 		}
 	}

@@ -75,7 +75,7 @@ func TestRollbackMessages_ReturnsDecodedParts(t *testing.T) {
 	// id to capture both).
 	// Use the assistant message's id so the rollback
 	// captures only the assistant row.
-	_, _, _, rowIDs := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	_, _, _, rowIDs, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	if len(rowIDs) < 2 {
 		t.Fatalf("setup: want >= 2 rows, got %d", len(rowIDs))
 	}
@@ -208,7 +208,7 @@ func TestRollbackMessages_FiltersStandaloneToolRows(t *testing.T) {
 
 	// Rollback to the second message's id (the user msg) —
 	// that captures the assistant + the two standalone rows.
-	_, _, _, rowIDs := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	_, _, _, rowIDs, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	beforeID := rowIDs[1]
 
 	body, _ := json.Marshal(map[string]any{"before_id": beforeID})

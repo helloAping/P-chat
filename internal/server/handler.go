@@ -330,6 +330,15 @@ type SessionResponse struct {
 // conversation history.
 type MessageResponse struct {
 	ID         int64  `json:"id"`
+	// Seq is the per-conversation logical position. Unlike
+	// `id` (a global AUTOINCREMENT that's never reused), seq
+	// survives rollback+undo and is the new stable cursor
+	// for the pagination API. Clients should prefer seq over
+	// id for any identity that needs to survive a rollback
+	// (Vue :key, undo payload, infinite-scroll cursor). The
+	// id field is kept for back-compat with clients built
+	// before the seq field was added.
+	Seq        int64  `json:"seq"`
 	Role       string `json:"role"`
 	MsgType    int    `json:"msg_type"`
 	Content    string `json:"content"`
@@ -1161,10 +1170,12 @@ func (h *Handler) RollbackMessages(c *gin.Context) {
 	metas := make([]string, len(deleted))
 	createds := make([]int64, len(deleted))
 	rowIDs := make([]int64, len(deleted))
+	seqs := make([]int64, len(deleted))
 	for i, m := range deleted {
 		metas[i] = m.Metadata
 		createds[i] = m.CreatedAt.Unix()
 		rowIDs[i] = m.ID
+		seqs[i] = m.Seq
 	}
 
 	deletedResp := make([]MessageResponse, 0, len(deleted))
@@ -1177,7 +1188,7 @@ func (h *Handler) RollbackMessages(c *gin.Context) {
 		// what we want here (one DB row should produce
 		// one MessageResponse, not several).
 		cm := memoryMessageToChatMessage(m)
-		if resp := buildMessageResponse(cm, metas, createds, i, rowIDs[i]); resp != nil {
+		if resp := buildMessageResponse(cm, metas, createds, i, rowIDs[i], seqs[i]); resp != nil {
 			deletedResp = append(deletedResp, *resp)
 		}
 	}
@@ -1559,22 +1570,31 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	}
 
 	// Pagination:
+	//   ?before_seq=N — return only messages with seq < N
+	//                    (preferred; survives rollback/undo
+	//                     because seq is per-conversation and
+	//                     never reused)
 	//   ?before_id=N  — return only messages with id < N
+	//                    (legacy cursor; kept for back-compat
+	//                     with older clients. BUG: id is
+	//                     AUTOINCREMENT, so a rollback+undo
+	//                     leaves the page with new ids and
+	//                     the cursor becomes stale. Use
+	//                     before_seq when possible.)
 	//   ?limit=K      — cap the result at K rows
 	//
-	// When neither is set the response is the full history,
-	// which is the right thing for the first switch into a
-	// session that the frontend has never seen (e.g. after
-	// app reload). When both are set, the frontend is
-	// asking for the next page of older history — typical
-	// infinite-scroll-triggered request.
-	//
-	// The `has_more` flag is computed by checking whether the
-	// conversation still has rows older than the oldest one
-	// we just returned. We avoid returning the full count
-	// (which would let the client show "1,234 messages" in
-	// the UI later) to keep the payload small.
+	// When neither `before_*` is set the response is the
+	// full (limited) history, which is the right thing for
+	// the first switch into a session the frontend has
+	// never seen (e.g. after app reload).
+	beforeSeq := parseInt64Query(c, "before_seq", 0)
 	beforeID := parseInt64Query(c, "before_id", 0)
+	if beforeSeq == 0 && beforeID != 0 {
+		// Legacy client sent only before_id. The cursor is
+		// still the id-based one, so we keep using the id
+		// SQL filter and the id-based has_more check.
+		// Newer clients send before_seq and we prefer that.
+	}
 	queryLimit := parseIntQuery(c, "limit", 0)
 
 	meta := h.ensureMetaLoaded(id)
@@ -1588,7 +1608,25 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		limit = contextCap
 	}
 
-	msgs, metas, createds, rowIDs := h.store.GetChatMessagesWithMetaPage(id, beforeID, limit)
+	// We dispatch to the seq- or id-based query based on
+	// which cursor the client sent. Newer clients send
+	// `before_seq` and get the seq-aware filter
+	// (stable across rollback+undo); older clients send
+	// `before_id` and get the id-aware filter. When
+	// neither is set, both code paths issue the
+	// unfiltered "give me the latest N rows" query.
+	var (
+		msgs    []llm.ChatMessage
+		metas   []string
+		createds []int64
+		rowIDs  []int64
+		seqs    []int64
+	)
+	if beforeSeq > 0 {
+		msgs, metas, createds, rowIDs, seqs = h.store.GetChatMessagesWithMetaPageBySeq(id, beforeSeq, limit)
+	} else {
+		msgs, metas, createds, rowIDs, seqs = h.store.GetChatMessagesWithMetaPage(id, beforeID, limit)
+	}
 	out := make([]MessageResponse, 0, len(msgs))
 	// rowIDs[i] is the SQLite row id for msgs[i]. We pair them
 	// in buildMessageResponse so the client can use the lowest
@@ -1596,7 +1634,7 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// rowIDs is in DESC order (matches the row order), so
 	// rowIDs[len-1] is the smallest id (oldest returned row).
 	for i, m := range msgs {
-		resp := buildMessageResponse(m, metas, createds, i, rowIDs[i])
+		resp := buildMessageResponse(m, metas, createds, i, rowIDs[i], seqs[i])
 		if resp != nil {
 			out = append(out, *resp)
 		}
@@ -1604,7 +1642,8 @@ func (h *Handler) ListMessages(c *gin.Context) {
 
 	var (
 		hasMore   = false
-		oldestID int64
+		oldestID  int64
+		oldestSeq int64
 	)
 	if len(rowIDs) > 0 {
 		// `rowIDs` is parallel to `msgs` and is oldest-first
@@ -1626,10 +1665,17 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		// visible duplicate bubbles (see handler
 		// CursorTest for the regression lock).
 		oldestID = rowIDs[0]
+		oldestSeq = seqs[0]
 		// `has_more` = "is there at least one row older
 		// than the oldest one we returned?". Cheap: a single
-		// indexed COUNT/EXISTS query.
-		hasMore = h.store.HasOlderMessages(id, oldestID)
+		// indexed COUNT/EXISTS query. We use the seq-based
+		// check when possible (matches the new cursor) and
+		// fall back to the id-based one for legacy clients.
+		if beforeSeq > 0 {
+			hasMore = h.store.HasOlderMessagesBySeq(id, oldestSeq)
+		} else {
+			hasMore = h.store.HasOlderMessages(id, oldestID)
+		}
 	}
 
 	// Question/answer persistence was simplified: instead of
@@ -1651,9 +1697,10 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	out = mergeConsecutiveAssistant(out)
 
 	c.JSON(http.StatusOK, gin.H{
-		"messages":  out,
-		"has_more":  hasMore,
-		"oldest_id": oldestID,
+		"messages":   out,
+		"has_more":   hasMore,
+		"oldest_id":  oldestID,
+		"oldest_seq": oldestSeq,
 	})
 }
 
@@ -1738,14 +1785,17 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 // reconstructed into the assistant message's Parts; image
 // rows are surfaced as Attachments). rowID is the SQLite row
 // id, propagated so the client can use it as the
-// `before_id` cursor for the next page request.
-func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64) *MessageResponse {
+// `before_id` cursor for the next page request. seq is the
+// per-conversation logical position, propagated for the new
+// seq-based cursor (stable across rollback+undo).
+func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64, seq int64) *MessageResponse {
 	created := time.Now().Unix()
 	if i < len(createds) && createds[i] != 0 {
 		created = createds[i]
 	}
 	resp := MessageResponse{
 		ID:        rowID,
+		Seq:       seq,
 		Role:      m.Role,
 		MsgType:   m.MsgType,
 		Content:   m.Content,
