@@ -61,7 +61,14 @@ tasks:
     deps: [build:frontend]
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -platform windows/amd64 -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
+      # wails-build.ps1 locates the wails CLI in the standard
+      # GOPATH/bin locations and prepends it to $PATH before
+      # invoking `wails build`. We keep the wails call out
+      # of the Taskfile because the long PowerShell command
+      # with embedded ": " characters broke YAML's plain-
+      # scalar parser (see scripts/wails-build.ps1 for the
+      # full rationale).
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "windows/amd64" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -73,7 +80,7 @@ tasks:
     deps: [build:frontend]
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -platform linux/amd64 -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "linux/amd64" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -143,7 +150,7 @@ tasks:
     desc: 启动桌面端 (开发模式)
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails dev
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-dev.ps1" dev
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -163,7 +170,7 @@ tasks:
     internal: true
     dir: cmd\pchat-gui
     cmds:
-      - cmd: wails build -debug -s
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-dev.ps1" build-debug
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto

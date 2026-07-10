@@ -50,7 +50,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -928,25 +927,12 @@ func pickConfigPath() string {
 	return resolveConfigPath()
 }
 
-// hideChildConsole suppresses the stray console window that Go's
-// os/exec allocates for child processes on Windows even when the
-// parent is a WINDOWS_GUI subsystem binary. Without this every
-// launch of pchat-server.exe would flash a black console at the
-// user. The same helper is a no-op on non-Windows platforms where
-// there is no console window to suppress.
-//
-// We use the raw CREATE_NO_WINDOW (0x08000000) creation flag
-// rather than the windows-specific SysProcAttr.HideWindow so the
-// syscall struct stays portable. See
-// https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
-const createNoWindow = 0x08000000
-
-func hideChildConsole(cmd *exec.Cmd) {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.CreationFlags |= createNoWindow
-}
+// hideChildConsole is implemented per-platform in
+// hide_child_console_windows.go (sets CREATE_NO_WINDOW so the
+// WINDOWS_GUI-subsystem pchat-gui doesn't pop a console for
+// pchat-server.exe) and hide_child_console_other.go (no-op
+// stub — Linux/macOS GUI processes don't have a stray console
+// window to suppress). Splitting by //go:build tag keeps the
+// Windows-only syscall.SysProcAttr.CreationFlags field out of
+// the non-Windows translation unit, which would otherwise fail
+// to compile with `CreationFlags undefined` on Linux/macOS.
