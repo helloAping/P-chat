@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -92,9 +94,39 @@ func AddProvider(p ProviderConfig) error {
 	if err != nil {
 		return err
 	}
+	// Validate name. A blank name would create a provider
+	// that can't be referenced, and a name with whitespace or
+	// path separators breaks CLI parsing and the env-var
+	// convention used by the agent.
+	if p.Name == "" {
+		return fmt.Errorf("provider name is required")
+	}
+	if strings.ContainsAny(p.Name, " \t/\\") || strings.ContainsRune(p.Name, 0) {
+		return fmt.Errorf("provider name %q contains invalid characters (no whitespace, path separators, or NUL)", p.Name)
+	}
 	for _, existing := range cfg.LLM.Providers {
 		if existing.Name == p.Name {
 			return fmt.Errorf("provider %q already exists; use a different name (or remove the existing one first)", p.Name)
+		}
+	}
+	// Validate the protocol. UpdateProvider validates (line
+	// 235-241) but AddProvider did not — a provider added with
+	// `protocol: "garbage"` would persist to disk and only fail
+	// when a real LLM call is made.
+	if p.Protocol != "" {
+		switch p.Protocol {
+		case "openai", "anthropic":
+			// ok
+		default:
+			return fmt.Errorf("invalid protocol %q (allowed: openai, anthropic)", p.Protocol)
+		}
+	}
+	// Validate the BaseURL is parseable so a typo doesn't get
+	// silently persisted and surface as a confusing error at
+	// the first LLM call.
+	if p.BaseURL != "" {
+		if _, err := url.Parse(p.BaseURL); err != nil {
+			return fmt.Errorf("invalid base_url %q: %w", p.BaseURL, err)
 		}
 	}
 	cfg.LLM.Providers = append(cfg.LLM.Providers, p)
@@ -222,6 +254,10 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 	// Handle rename first because every subsequent field
 	// check needs to look at the new name.
 	if patch.Name != "" && patch.Name != oldName {
+		// Validate the new name same as AddProvider.
+		if strings.ContainsAny(patch.Name, " \t/\\") || strings.ContainsRune(patch.Name, 0) {
+			return nil, fmt.Errorf("provider name %q contains invalid characters (no whitespace, path separators, or NUL)", patch.Name)
+		}
 		for _, other := range cfg.LLM.Providers {
 			if other.Name == patch.Name {
 				return nil, fmt.Errorf("provider %q already exists", patch.Name)
@@ -241,6 +277,10 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		}
 	}
 	if patch.BaseURL != "" {
+		// Validate BaseURL is parseable, same as AddProvider.
+		if _, err := url.Parse(patch.BaseURL); err != nil {
+			return nil, fmt.Errorf("invalid base_url %q: %w", patch.BaseURL, err)
+		}
 		p.BaseURL = patch.BaseURL
 	}
 	if patch.ClearAPIKey {
@@ -267,11 +307,23 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	if m.Name == "" {
+		return nil, fmt.Errorf("model name is required")
+	}
+	if strings.ContainsAny(m.Name, " \t/\\") || strings.ContainsRune(m.Name, 0) {
+		return nil, fmt.Errorf("model name %q contains invalid characters (no whitespace, path separators, or NUL)", m.Name)
+	}
 	for i, p := range cfg.LLM.Providers {
 		if p.Name != providerName {
 			continue
 		}
 		// Migrate legacy single-model form to multi-model.
+		// Reject the case where the new model name equals the
+		// legacy single-model name — that would create a
+		// duplicate entry.
+		if len(p.Models) == 0 && p.Model != "" && p.Model == m.Name {
+			return nil, fmt.Errorf("model %q already exists as the legacy single-model form for provider %q", m.Name, providerName)
+		}
 		if len(p.Models) == 0 && p.Model != "" && p.Model != m.Name {
 			p.Models = []ModelConfig{{Name: p.Model, Default: true}}
 		}
@@ -329,6 +381,11 @@ func RemoveModel(providerName, modelName string) error {
 		if wasDefault && len(p.Models) > 0 {
 			p.Models[0].Default = true
 		}
+		// If the provider is the global default, we now have a
+		// no-default state. Setting model="" would be
+		// confusing, so leave p.Model alone and let the
+		// caller explicitly choose. The agent falls back to
+		// the first model on the next send.
 		cfg.LLM.Providers[i] = p
 		mgr := NewManager()
 		return mgr.SaveGlobal(cfg)
@@ -428,8 +485,17 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 				m.MaxTokensOutput = patch.MaxTokensOutput
 			}
 		}
-		// Capabilities is always replaced (it's a struct value).
-		m.Capabilities = patch.Capabilities
+		// Capabilities is only replaced when the patch actually
+		// carries a non-zero value. The HTTP PATCH API never
+		// sends Capabilities, so without this guard every
+		// DisplayName/Description edit would wipe out the
+		// model's per-model capabilities (vision, thinking,
+		// tool-use, etc.). If a future caller needs to clear
+		// Capabilities, they can use clearAll and a separate
+		// reset endpoint.
+		if patch.Capabilities != (Capabilities{}) {
+			m.Capabilities = patch.Capabilities
+		}
 		cfg.LLM.Providers[i] = p
 		mgr := NewManager()
 		if err := mgr.SaveGlobal(cfg); err != nil {

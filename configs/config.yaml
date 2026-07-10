@@ -111,3 +111,28 @@ subagent:
   #   - "read_file"
   #   - "write_file"
   #   - "list_files"
+
+# Web search tool. The `web_search` tool is registered
+# only when `enabled: true` AND a usable API key is set;
+# otherwise the LLM cannot see the tool (no "feature not
+# available" error to waste a turn on).
+#
+# Provider "tavily" (default) — https://tavily.com — 1000
+# free searches/month. Get a key at
+# https://app.tavily.com/home.
+#
+# Provider "openai_compat" — any HTTP endpoint that accepts
+# JSON {query, max_results, ...} and returns
+# {results: [{title, url, snippet}, ...]}. Examples:
+#   - jina.ai/reader search  (base_url: https://s.jina.ai)
+#   - bocha / kagi / searxng proxies
+# base_url must be https://, except http://localhost or
+# http://127.0.0.1 for self-hosted proxies.
+search:
+  enabled: false              # master switch; default off
+  provider: "tavily"          # "tavily" | "openai_compat"
+  api_key: ""                 # tavily key, or openai_compat bearer
+  # base_url: "https://s.jina.ai"   # required when provider=openai_compat
+  # path: "/search"                  # override request path
+  # topic: "general"                 # tavily only: "general" | "news" | "finance"
+  request_timeout: "20s"

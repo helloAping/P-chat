@@ -17,23 +17,110 @@ func TestPartsAccumulator_Text(t *testing.T) {
 }
 
 func TestPartsAccumulator_ThinkingThenText(t *testing.T) {
+	// The thinking part is Streaming=true WHILE only-thinking
+	// deltas arrive. The first content delta flips it to
+	// Streaming=false — that's the "thinking block is done"
+	// signal, and it's why a multi-round tool flow doesn't
+	// leave every prior round's thinking part stuck in
+	// streaming. (Before 2026-07-09 the flip only happened
+	// on `c.Done`, which is emitted once per conversation,
+	// not per round — so a second round's start was hiding
+	// behind a still-streaming first-round thinking part.)
 	acc := newPartsAccumulator()
 	acc.update(ChatStreamChunk{Thinking: "let me "})
 	acc.update(ChatStreamChunk{Thinking: "think..."})
-	acc.update(ChatStreamChunk{Content: "answer"})
 
 	parts := acc.snapshot()
+	if len(parts) != 1 || parts[0].Kind != "thinking" || parts[0].Text != "let me think..." {
+		t.Fatalf("after only thinking deltas: want single thinking part 'let me think...', got %+v", parts)
+	}
+	if !parts[0].Streaming {
+		t.Error("thinking part should be streaming=true while only thinking deltas arrive")
+	}
+
+	acc.update(ChatStreamChunk{Content: "answer"})
+
+	parts = acc.snapshot()
 	if len(parts) != 2 {
-		t.Fatalf("want 2 parts, got %d", len(parts))
+		t.Fatalf("after content delta: want 2 parts, got %d", len(parts))
 	}
 	if parts[0].Kind != "thinking" || parts[0].Text != "let me think..." {
 		t.Errorf("thinking part wrong: %+v", parts[0])
 	}
-	if !parts[0].Streaming {
-		t.Error("thinking part should be marked streaming=true while deltas arrive")
+	if parts[0].Streaming {
+		t.Error("first content delta must flip trailing thinking to Streaming=false (bug fix 2026-07-09)")
 	}
 	if parts[1].Kind != "text" || parts[1].Text != "answer" {
 		t.Errorf("text part wrong: %+v", parts[1])
+	}
+}
+
+// TestPartsAccumulator_ContentFlipsStreamingThinking locks
+// in the multi-round bug fix: a content delta that follows a
+// thinking delta must immediately flip the trailing thinking
+// part to Streaming=false. Without this, the LLM's
+// "still-typing" indicator on the thinking block stays lit
+// for the entire rest of the conversation (until `c.Done`,
+// which is only emitted once at the end of the whole flow),
+// making the user see every prior round's thinking block as
+// "still in progress" — exactly the bug reported in
+// 2026-07-09 ("一直在思考中 没办法修改状态").
+//
+// The previous test covers the basic thinking→content case;
+// this one specifically verifies the streaming flag on the
+// thinking part flips, plus the multi-round scenario where
+// a second tool call's thinking should not retroactively
+// leave the first round's thinking stuck.
+func TestPartsAccumulator_ContentFlipsStreamingThinking(t *testing.T) {
+	acc := newPartsAccumulator()
+	// Round 1: thinking then content
+	acc.update(ChatStreamChunk{Thinking: "first round think"})
+	if !acc.snapshot()[0].Streaming {
+		t.Fatal("round 1 thinking should be streaming after the first delta")
+	}
+	acc.update(ChatStreamChunk{Content: "first round answer"})
+	parts := acc.snapshot()
+	if parts[0].Streaming {
+		t.Error("round 1: content delta must flip thinking to streaming=false")
+	}
+
+	// Tool call. Thinking part is still streaming=false.
+	acc.update(ChatStreamChunk{ToolName: "read_file", ToolArgs: `{"path":"x"}`})
+	acc.update(ChatStreamChunk{Phase: "tool", Step: "call-1-ok", ToolName: "read_file", ToolResult: "data", ToolElapsed: "5ms"})
+	parts = acc.snapshot()
+	if parts[0].Streaming {
+		t.Error("after tool call: thinking should still be streaming=false (only content deltas flip it)")
+	}
+
+	// Round 2: another thinking + content cycle. The first
+	// round's thinking part must remain streaming=false
+	// (the flip is one-way per part). A new thinking part
+	// is created for round 2.
+	acc.update(ChatStreamChunk{Thinking: "second round think"})
+	parts = acc.snapshot()
+	if parts[0].Streaming {
+		t.Error("round 1's thinking part must NOT be flipped back to streaming=true by a later round")
+	}
+	// The new round 2 thinking is its own part.
+	round2Idx := -1
+	for i, p := range parts {
+		if i > 0 && p.Kind == "thinking" && p.Text == "second round think" {
+			round2Idx = i
+		}
+	}
+	if round2Idx < 0 {
+		t.Fatalf("round 2 thinking part not found: %+v", parts)
+	}
+	if !parts[round2Idx].Streaming {
+		t.Error("round 2's new thinking part should be streaming=true")
+	}
+	acc.update(ChatStreamChunk{Content: "second round answer"})
+	parts = acc.snapshot()
+	if parts[round2Idx].Streaming {
+		t.Error("round 2: content delta must flip its thinking to streaming=false")
+	}
+	if parts[0].Streaming {
+		t.Error("round 1's thinking part must stay streaming=false after round 2's content")
 	}
 }
 

@@ -60,7 +60,7 @@ func makeGrepHandler(cfg *config.Config) ToolHandler {
 			return &CallResult{Content: "知识库未启用", IsError: true}, nil
 		}
 
-		results := grepKnowledgeBases(cfg, a.Base, a.Pattern, a.TopK)
+		results := grepKnowledgeBases(ctx, cfg, a.Base, a.Pattern, a.TopK)
 		if len(results) == 0 {
 			return &CallResult{Content: fmt.Sprintf("(在知识库中未找到包含 \"%s\" 的文件)", a.Pattern)}, nil
 		}
@@ -82,7 +82,7 @@ func makeGrepHandler(cfg *config.Config) ToolHandler {
 // pattern (case-insensitive). Returns file:line results.
 // If baseName is non-empty and not "__all__", searches only that base.
 // Respects each base's ExcludePatterns to skip matching paths.
-func grepKnowledgeBases(cfg *config.Config, baseName, pattern string, maxResults int) []knowledge.SearchResult {
+func grepKnowledgeBases(ctx context.Context, cfg *config.Config, baseName, pattern string, maxResults int) []knowledge.SearchResult {
 	if pattern == "" || maxResults <= 0 {
 		return nil
 	}
@@ -96,12 +96,20 @@ func grepKnowledgeBases(cfg *config.Config, baseName, pattern string, maxResults
 	var out []knowledge.SearchResult
 
 	for _, base := range bases {
+		// Allow cancellation between bases.
+		if err := ctx.Err(); err != nil {
+			break
+		}
 		absPath, err := filepath.Abs(base.Path)
 		if err != nil {
 			log.Printf("[grep] abs path %s: %v", base.Path, err)
 			continue
 		}
 		_ = filepath.Walk(absPath, func(path string, info os.FileInfo, walkErr error) error {
+			// Allow cancellation between files.
+			if ctx.Err() != nil {
+				return filepath.SkipAll
+			}
 			if walkErr != nil || info == nil {
 				return nil
 			}
@@ -139,6 +147,11 @@ func grepKnowledgeBases(cfg *config.Config, baseName, pattern string, maxResults
 			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 			lineNo := 0
 			for scanner.Scan() {
+				// Allow cancellation every 64 lines (amortised).
+				if lineNo%64 == 0 && ctx.Err() != nil {
+					f.Close()
+					return filepath.SkipAll
+				}
 				lineNo++
 				if strings.Contains(strings.ToLower(scanner.Text()), patternLower) {
 					out = append(out, knowledge.SearchResult{

@@ -49,7 +49,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | Schema 迁移 / 版本发布 | [`.agents/docs/versioning.md`](docs/versioning.md) |
 | 配置管理 | [`.agents/docs/config.md`](docs/config.md) |
 | CLI 终端 | [`.agents/docs/cli.md`](docs/cli.md) |
-| Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) |
+| Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) | |
+| **前端样式 / 设计 token** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md) | |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
 | 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
 | 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
@@ -94,6 +95,7 @@ D:\develop\project\P-chat\
 │   │   ├── config.md           #   配置管理
 │   │   ├── cli.md              #   CLI REPL
 │   │   ├── frontend.md         #   Vue 3 前端
+│   │   ├── frontend-design.md  #   设计 token + 组件样式规则 + 约束
 │   │   └── infrastructure.md   #   基础设施模块
 │   └── scripts/
 │       ├── install.ps1         # Windows 安装脚本
@@ -357,6 +359,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 系统 prompt 拼装 | `internal/agent/agent.go:820-876` |
 | 配置加载 | `internal/config/config.go` |
 | 数据库 CRUD | `internal/memory/memory.go` |
+| `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
 
 ---
 

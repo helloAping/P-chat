@@ -168,9 +168,104 @@ UPDATE messages SET msg_type=0, submit_to_llm=0
  WHERE metadata LIKE '%"type":"thinking"%';`,
 		Down: `UPDATE messages SET msg_type=0, submit_to_llm=1;`,
 	},
-}
+	{
+		// Migration 7: strip the `streaming` flag from
+		// every persisted parts blob. The flag is a live-UI
+		// signal only (drives the "思考中…" spinner /
+		// caret while the LLM is still emitting) and must
+		// not survive into reload — the persisted state
+		// is always the *final* state of the round, so a
+		// `streaming:true` on a persisted thinking block
+		// would render the spinner on a thought the user
+		// already saw the LLM finish (visible after a
+		// rollback/undo too, because the rollback re-emits
+		// whatever was in meta["parts"] verbatim).
+		//
+		// Going forward, `snapshotStructural` clears
+		// `Streaming` on every part before serializing
+		// (internal/agent/parts.go), so new rows won't
+		// carry the field. This migration cleans up the
+		// historical data — 2026-07-09 incident where
+		// after-undo render was stuck on "思考中".
+		//
+		// `json_remove` is the right tool: it strips the
+		// key by JSON path regardless of the surrounding
+		// document shape. The `IS NOT NULL` guard skips
+		// rows that don't have the key (e.g. legacy
+		// `metadata=""` rows, tool_call rows) and rows
+		// where metadata is malformed JSON (json_extract
+		// returns NULL for both). No data loss either way.
+		Version: 7,
+		Name:    "strip_streaming_flag",
+		Up: `
+UPDATE messages
+SET metadata = json_remove(metadata, '$.streaming')
+WHERE json_extract(metadata, '$.streaming') IS NOT NULL;`,
+		Down: `-- no down — Streaming=false is a no-op after
+-- the fix, and flipping it back to true would re-introduce
+-- the original bug. A re-run of the up is safe.`,
+	},
+	{
+		// Migration 8: add an immutable per-conversation
+		// sequence number (`seq`) to every message.
+		//
+		// Why a separate column instead of reusing `id`?
+		// `id` is a SQLite AUTOINCREMENT, so it
+		// monotonically grows across the whole database
+		// and is **never reused** — a rollback/undo pair
+		// leaves the conversation with *new* ids for the
+		// restored messages, breaking any client-side
+		// reference to the original id (Vue's :key,
+		// rollback cursor, undo payload, etc.). The
+		// pagination cursor (handler.go: ListMessages
+		// `oldest_id`) and the rollback anchor
+		// (POST /rollback body `before_id`) are both
+		// exposed in the API; if those become unstable
+		// after undo, the frontend gets stuck rows that
+		// no longer map to anything in the DB.
+		//
+		// `seq` is per-conversation (each session has
+		// its own 1..N counter) and assigned at insert
+		// time. Rollback/undo preserves the original
+		// seqs by INSERTing restored rows with their
+		// caller-supplied seq, so a restored message
+		// has the same identity it had before the
+		// rollback. The pagination cursor switches to
+		// `seq` so a paginated scroll survives an undo
+		// mid-scroll.
+		//
+		// Backfill: assign seq in id-order within each
+		// conversation. SQLite's correlated UPDATE
+		// computes the row number per (conversation_id,
+		// id) partition and writes it to seq. The
+		// COALESCE on the per-row count handles the
+		// subquery returning 0 for the very first row
+		// (no rows with strictly smaller id in the
+		// same conversation).
+		//
+		// The idx_messages_conv_seq index supports the
+		// new `WHERE conversation_id = ? AND seq < ?`
+		// pagination predicate and the seq-based
+		// `MAX(seq) + 1` next-seq lookup during
+		// insert.
+		Version: 8,
+		Name:    "add_message_seq",
+		Up: `
+ALTER TABLE messages ADD COLUMN seq INTEGER;
 
-// 在 migrations 表和可变 Schema 之前必须创建
+UPDATE messages
+SET seq = (
+    SELECT COUNT(*) FROM messages m2
+    WHERE m2.conversation_id = messages.conversation_id
+      AND m2.id <= messages.id
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);`,
+		Down: `
+DROP INDEX IF EXISTS idx_messages_conv_seq;
+ALTER TABLE messages DROP COLUMN seq;`,
+	},
+}
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INTEGER PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -265,7 +360,7 @@ func (s *Store) migrateTo(targetVersion int) error {
 
 	// 执行备份
 	if s.dbPath != "" {
-		if err := backupDB(s.dbPath); err != nil {
+		if err := backupDB(s.db, s.dbPath); err != nil {
 			// 备份失败不阻塞迁移，但记录
 			fmt.Printf("pchat: db backup failed: %v\n", err)
 		}
@@ -286,19 +381,25 @@ func (s *Store) migrateTo(targetVersion int) error {
 }
 
 // backupDB copies the SQLite database file (and WAL/shm siblings) to
-// <dbPath>.backup-<timestamp>. The original database is checkpointed
-// first so the file-copy is self-contained. Errors are non-fatal.
-func backupDB(dbPath string) error {
-	// Force WAL checkpoint so the main file is self-contained.
-	wdb, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)")
-	if err != nil {
-		return fmt.Errorf("backup open: %w", err)
-	}
-	if _, err := wdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		wdb.Close()
+// <dbPath>.backup-<timestamp>. The existing connection is
+// checkpointed first so the file-copy is self-contained.
+// Errors are non-fatal.
+//
+// IMPORTANT: the caller must hold s.mu so no other goroutine is
+// writing to the DB while we copy. Opening a separate
+// connection (as the previous version did) is racy: a
+// concurrent writer on the main connection may have a
+// transaction in-flight that the second connection can't see,
+// and closing the second connection can leave the WAL file
+// un-truncated.
+func backupDB(db *sql.DB, dbPath string) error {
+	// Force WAL checkpoint on the SAME connection that the
+	// application is using, so the checkpoint is consistent
+	// with the caller's view of the database. The caller
+	// holds s.mu so no concurrent writer can interleave.
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		return fmt.Errorf("wal_checkpoint: %w", err)
 	}
-	wdb.Close()
 
 	backupPath := dbPath + ".backup-" + time.Now().Format("20060102-150405")
 	src, err := os.Open(dbPath)

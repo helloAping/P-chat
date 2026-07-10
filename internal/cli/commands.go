@@ -1614,12 +1614,17 @@ func cmdClear(ctx cliContext, args string) error {
 		fmt.Print("\033[2J\033[H")
 		return nil
 	}
-	if err := ctx.DeleteSession(context.Background(), convID); err != nil {
+	// Use ClearMessages (not DeleteSession) so the session ID
+	// is preserved. DeleteSession deletes the entire row and
+	// creates a new one, which silently changes the session ID
+	// and breaks any external references (URLs, scripts, the
+	// /sessions list, etc.). This was inconsistent with the
+	// HTTP API's DELETE /api/v1/sessions/:id/messages which
+	// preserves the session row.
+	if err := ctx.ClearMessages(context.Background(), convID); err != nil {
 		color.Red("  ✗ 清空失败: %v", err)
 		return nil
 	}
-	// DeleteSession creates a new empty current session in the
-	// backend, so the next user message starts a fresh thread.
 	fmt.Print("\033[2J\033[H")
 	color.Green("  ✓ 已清空当前对话 (%s) 的所有消息", convID)
 	fmt.Println()
@@ -2163,6 +2168,17 @@ func cmdHistory(ctx cliContext, args string) error {
 		id := strings.TrimSpace(rest)
 		if id == "" {
 			color.Red("  用法: /history forget <id>")
+			return nil
+		}
+		// Confirm before destructive delete — a typo'd id from
+		// terminal history can permanently delete a session.
+		// Use raw read since we may be in raw mode (watchEsc).
+		fmt.Printf("  确认删除会话 %s? 输入 yes 确认: ", id)
+		reader := bufio.NewReader(os.Stdin)
+		ans, _ := reader.ReadString('\n')
+		ans = strings.TrimSpace(strings.ToLower(ans))
+		if ans != "yes" && ans != "y" {
+			color.HiBlack("  已取消")
 			return nil
 		}
 		if err := ctx.DeleteSession(context.Background(), id); err != nil {

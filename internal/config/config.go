@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -28,6 +29,7 @@ type Config struct {
 	MCP       MCPConfig       `json:"mcp"`
 	Knowledge KnowledgeConfig `json:"knowledge"`
 	Limits    LimitsConfig    `json:"limits"`
+	Search    SearchConfig    `json:"search"`
 }
 
 // LimitsConfig controls resource caps for the agent loop.
@@ -363,6 +365,62 @@ type MemoryConfig struct {
 	MaxHistory int  `json:"max_history"`
 }
 
+// SearchConfig configures the `web_search` tool.
+//
+// The tool is registered only when Enabled=true AND a usable
+// API key + provider is configured. When disabled, the
+// `web_search` tool is invisible to the LLM (handled at
+// RegisterBuiltin time) so the agent doesn't waste a turn
+// discovering the feature is off.
+//
+// Provider selects the backend implementation:
+//
+//   - "tavily" (default): https://api.tavily.com/search, requires APIKey
+//   - "openai_compat": any HTTP endpoint that accepts
+//     `{query, max_results, ...}` and returns
+//     `{results: [{title, url, snippet}, ...]}`; requires BaseURL
+type SearchConfig struct {
+	// Enabled is the master switch. When false, the `web_search`
+	// tool is not registered and the LLM cannot call it.
+	Enabled bool `json:"enabled"`
+
+	// Provider selects the backend. Empty string = "tavily".
+	Provider string `json:"provider,omitempty"`
+
+	// APIKey is the provider's auth token. Not used by
+	// self-hosted providers that don't require auth.
+	APIKey string `json:"api_key,omitempty"`
+
+	// BaseURL overrides the provider's default endpoint.
+	//   - "tavily": leave empty (defaults to https://api.tavily.com)
+	//   - "openai_compat": required (e.g. "https://s.jina.ai")
+	BaseURL string `json:"base_url,omitempty"`
+
+	// Path overrides the request path appended to BaseURL.
+	// Defaults to "/search". Useful for proxies that mount
+	// search at a non-standard path.
+	Path string `json:"path,omitempty"`
+
+	// Topic restricts the search corpus for providers that
+	// support it (currently "tavily" only). Valid values:
+	// "general" (default), "news", "finance".
+	Topic string `json:"topic,omitempty"`
+
+	// RequestTimeout is the per-search HTTP timeout. Zero
+	// (or negative) means 20s. The agent loop also enforces
+	// its own deadline so a stuck search can't block a turn
+	// indefinitely.
+	RequestTimeout time.Duration `json:"request_timeout,omitempty"`
+
+	// DailyQuota caps the number of searches the local
+	// process will dispatch per UTC day. 0 = unlimited.
+	// Enforced by internal/search.QuotaTracker; the
+	// counter resets at 00:00 UTC and is *not* persisted
+	// across server restarts (a deliberate choice — quota
+	// is a soft budget, not a billing boundary).
+	DailyQuota int `json:"daily_quota,omitempty"`
+}
+
 // SandboxConfig controls which actions LLM-driven tools can take
 // without explicit user confirmation.
 type SandboxConfig struct {
@@ -391,6 +449,16 @@ type SandboxConfig struct {
 	// MaxCommandLength caps the size of a single exec_command. Default
 	// 4096 bytes.
 	MaxCommandLength int `json:"max_command_length,omitempty"`
+
+	// ExtraAllowedPaths is the per-user whitelist (Phase 2 UI
+	// in 2026-07). Paths here get the same policy as the
+	// project root (reads: Allow; writes: Allow) regardless
+	// of projectRoot — a deliberate "open this directory up"
+	// gesture. The "~" prefix expands to the user's home.
+	//
+	// Phase 1 ships the plumbing; the UI to manage the list
+	// is Phase 2.
+	ExtraAllowedPaths []string `json:"extra_allowed_paths,omitempty"`
 }
 
 // utf8BOM is the byte order mark some Windows editors (Notepad,
@@ -408,6 +476,86 @@ func stripBOM(data []byte) []byte {
 		return data[3:]
 	}
 	return data
+}
+
+// trailingCommaRE matches a comma immediately followed by
+// optional whitespace and a closing brace or bracket. JSON
+// spec (RFC 8259 §2.3) forbids trailing commas; Go's
+// encoding/json follows the spec. We strip them so a config
+// that survived a botched editor / regex / set-content pass
+// can still boot — the loader writes the cleaned result back
+// to disk so subsequent startups are fast and the user can see
+// the fix.
+var trailingCommaRE = regexp.MustCompile(`,\s*([}\]])`)
+
+// stripTrailingCommas returns a copy of data with all
+// trailing commas before } or ] removed. Does not recurse
+// into strings (a `,` inside a quoted JSON string is left
+// alone, since strings can contain anything).
+func stripTrailingCommas(data []byte) []byte {
+	// Fast path: scan for the pattern manually so we don't
+	// touch commas inside string literals. encoding/json's
+	// own scanner would be ideal but we want a single
+	// non-allocating pass over the typical ~3KB file.
+	out := make([]byte, 0, len(data))
+	inString := false
+	escape := false
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			out = append(out, c)
+			if escape {
+				escape = false
+			} else if c == '\\' {
+				escape = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+			out = append(out, c)
+		case ',':
+			// Look ahead for a } or ] (after whitespace).
+			j := i + 1
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r') {
+				j++
+			}
+			if j < len(data) && (data[j] == '}' || data[j] == ']') {
+				// Drop the comma. Whitespace is preserved.
+				continue
+			}
+			out = append(out, c)
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// tryUnmarshalWithTolerance runs json.Unmarshal, and on
+// failure tries once more after stripping trailing commas.
+// Returns the unmarshaled data, a bool indicating whether
+// the trailing-comma fallback was used, and any error from
+// the final attempt.
+//
+// The fallback is intentionally narrow: a strict spec
+// parser is the ground truth, and we only deviate to keep
+// a hand-edited config bootable. We never silently fix
+// missing fields or rename keys.
+func tryUnmarshalWithTolerance(data []byte, v any) ([]byte, bool, error) {
+	if err := json.Unmarshal(data, v); err == nil {
+		return data, false, nil
+	} else {
+		cleaned := stripTrailingCommas(data)
+		if err := json.Unmarshal(cleaned, v); err == nil {
+			return cleaned, true, nil
+		} else {
+			return nil, false, err
+		}
+	}
 }
 
 // Load merges global (~/.p-chat/config.json) and project
@@ -438,8 +586,22 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	// Global layer.
 	if data, err := os.ReadFile(paths.GlobalConfig()); err == nil {
 		data = stripBOM(data)
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse global config %s: %w", paths.GlobalConfig(), err)
+		cleaned, tolerated, perr := tryUnmarshalWithTolerance(data, cfg)
+		if perr != nil {
+			return nil, fmt.Errorf("parse global config %s: %w", paths.GlobalConfig(), perr)
+		}
+		if tolerated {
+			// Botched trailing comma. Rewrite the file with the
+			// cleaned bytes so subsequent starts are fast and the
+			// user can see what was wrong by diffing. We keep the
+			// atomic-rename pattern from writeConfigJSON so a crash
+			// mid-write doesn't leave the file half-written.
+			if err := writeConfigJSON(paths.GlobalConfig(), cfg); err != nil {
+				// Not fatal — the in-memory cfg is fine for this
+				// session. Log so the user can fix by hand.
+				fmt.Printf("pchat: rewrite cleaned global config: %v\n", err)
+			}
+			_ = cleaned // silence unused
 		}
 	} else if os.IsNotExist(err) {
 		// One-shot yaml → json migration.
@@ -467,8 +629,9 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	}
 	if data, err := os.ReadFile(projectConfigPath); err == nil {
 		data = stripBOM(data)
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse project config %s: %w", projectConfigPath, err)
+		_, _, perr := tryUnmarshalWithTolerance(data, cfg)
+		if perr != nil {
+			return nil, fmt.Errorf("parse project config %s: %w", projectConfigPath, perr)
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read project config: %w", err)
@@ -488,8 +651,9 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 			return nil, fmt.Errorf("read config %s: %w", customPath, err)
 		}
 		data = stripBOM(data)
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse config %s: %w", customPath, err)
+		_, _, perr := tryUnmarshalWithTolerance(data, cfg)
+		if perr != nil {
+			return nil, fmt.Errorf("parse config %s: %w", customPath, perr)
 		}
 	}
 
@@ -502,15 +666,43 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 // Manager and the migration path. Errors are returned so the caller
 // can decide whether to surface them (Manager surfaces, migration
 // swallows).
+//
+// The write is atomic: marshal to a sibling temp file, fsync, then
+// rename over the destination. A crash mid-write leaves the
+// original config intact instead of producing a truncated/
+// unparseable file.
 func writeConfigJSON(path string, cfg *Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	return os.WriteFile(path, data, 0o644)
+	tmp, err := os.CreateTemp(dir, ".config-tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Best-effort cleanup if rename was never reached.
+		if _, statErr := os.Stat(tmpName); statErr == nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func Default() *Config {
@@ -562,6 +754,11 @@ func Default() *Config {
 		Knowledge: KnowledgeConfig{
 			Enabled:   false,
 			AutoIndex: false,
+		},
+		Search: SearchConfig{
+			Enabled:        false,
+			Provider:       "tavily",
+			RequestTimeout: 20 * time.Second,
 		},
 	}
 }

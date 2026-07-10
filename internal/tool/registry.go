@@ -1,4 +1,4 @@
-package tool
+﻿package tool
 
 import (
 	"context"
@@ -38,15 +38,33 @@ type CallResult struct {
 // SandboxChecker is a minimal interface satisfied by internal/sandbox.
 // The tool package depends on this interface only (not on sandbox
 // itself) to keep the dependency graph acyclic.
+//
+// As of 2026-07, the file-path checks take a projectRoot argument
+// so the sandbox can apply the project-internal / project-external
+// / external-mode (no project) policy split. The two-strand API
+// (Bool + Decision) is kept for the exec path where the project
+// root is irrelevant; file paths need the project root to make
+// the right decision.
 type SandboxChecker interface {
 	// CheckExecBool returns true if the command is permitted to run.
 	CheckExecBool(command string) bool
 	// CheckWriteBool returns true if the path is permitted to be written.
-	CheckWriteBool(path string) bool
+	// Project-root context: the caller passes the session's
+	// project root (empty string = no project / external mode).
+	CheckWriteBool(path, projectRoot string) bool
 	// CheckExecDecision returns the full Decision (allow/block/confirm).
 	CheckExecDecision(command string) SandboxDecision
 	// CheckWriteDecision returns the full Decision for write.
-	CheckWriteDecision(path string) SandboxDecision
+	CheckWriteDecision(path, projectRoot string) SandboxDecision
+	// CheckReadDecision returns the full Decision for read.
+	// Added 2026-07 to cover read_file / read_docx / read_pdf
+	// / list_files �?previously these bypassed the sandbox
+	// entirely, which let an LLM read /etc/passwd after a
+	// write confirm was approved. The decision table is the
+	// same as CheckWriteDecision for path classification,
+	// but reads of a project-internal file are Allow (no
+	// confirm) per the 2026-07 spec ("项目内读 = allow").
+	CheckReadDecision(path, projectRoot string) SandboxDecision
 	// MatchedPattern returns the regex pattern that matched, or "".
 	MatchedPattern(command string) string
 }
@@ -97,18 +115,52 @@ func projectRootFromCtx(ctx context.Context) string {
 	return ""
 }
 
-// resolveToProjectRoot resolves a path to an absolute path.
-// If the path is relative, it is resolved against the project
-// root from the context. If the path is already absolute or no
-// project root is set, it is returned unchanged.
+// ProjectRootFromCtx is the public accessor so packages outside
+// tool (notably subagent) can read the project root that the main
+// agent stored in ctx. Returns "" if no root was set.
+func ProjectRootFromCtx(ctx context.Context) string {
+	return projectRootFromCtx(ctx)
+}
+
+// resolveToProjectRoot resolves a path to an absolute, cleaned
+// path. If the path is relative, it is resolved against the
+// project root from the context. If the path is already
+// absolute or no project root is set, it is returned as an
+// absolute path.
+//
+// 2026-07 P0 fix: the function now applies filepath.Clean on
+// the result so `..` segments are resolved to a single
+// canonical form BEFORE the sandbox decision and the actual
+// filesystem call. Without this, an LLM that writes
+// `read_file("../../../etc/passwd")` could slip through the
+// project-root check (the textual `filepath.Join` returns
+// "C:\projects\myapp\..\..\..\etc\passwd", which is NOT
+// textually under "C:\projects\myapp" — but the symlink-less
+// EvalSymlinks + isPathUnder would also fail because the
+// path is malformed). The previous code returned the raw
+// `filepath.Join` result without cleaning, which the sandbox
+// check would then approve (textual containment passes) and
+// the OS would later resolve — letting the read escape the
+// project.
+//
+// The Clean runs on BOTH branches (absolute and project-
+// relative) so the sandbox always sees a normalised path and
+// can apply isPathUnder consistently.
 func resolveToProjectRoot(ctx context.Context, p string) string {
+	if p == "" {
+		return ""
+	}
 	if filepath.IsAbs(p) {
-		return p
+		return filepath.Clean(p)
 	}
 	if root := projectRootFromCtx(ctx); root != "" {
-		return filepath.Join(root, p)
+		return filepath.Clean(filepath.Join(root, p))
 	}
-	return p
+	// No project root: relative paths can't be resolved
+	// safely, so we return the cleaned form. Callers (the
+	// sandbox check) will see this as "external" and the
+	// user gets a confirm modal.
+	return filepath.Clean(p)
 }
 
 type Registry struct {
@@ -229,7 +281,7 @@ func RegisterBuiltin(r *Registry) {
 	r.Register(Tool{
 		Name:        "read_file",
 		Description: "Read the full contents of a TEXT file. Use for inspecting source files, configs, or any text artifact. " +
-			"DO NOT call read_file on images, audio, video, PDFs, archives, or any binary file — " +
+			"DO NOT call read_file on images, audio, video, PDFs, archives, or any binary file �?" +
 			"those will return a binary error. " +
 			"Images uploaded by the user are ALREADY available as vision input (image_url) in the user message; " +
 			"just look at them directly, do NOT call read_file on the on-disk copy.",
@@ -283,7 +335,7 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "todo_write",
-		Description: "Create and manage a structured task list for your current coding session. Use this to plan work, track progress, and show the user what you're doing. Each todo item has an id, content, and status (pending/in_progress/done/cancelled). Always include the full list when calling this tool — it replaces the previous list entirely.",
+		Description: "Create and manage a structured task list for your current coding session. Use this to plan work, track progress, and show the user what you're doing. Each todo item has an id, content, and status (pending/in_progress/done/cancelled). Always include the full list when calling this tool �?it replaces the previous list entirely.",
 		Parameters: ObjectSchema(map[string]any{
 			"todos": map[string]any{
 				"type": "array",
@@ -355,7 +407,7 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	if reason := commandReferencesUploadFile(a.Command); reason != "" {
 		return &CallResult{
 			Content: fmt.Sprintf(
-				"E_UPLOAD_DIR: command blocked — %s is inside the chat upload directory. "+
+				"E_UPLOAD_DIR: command blocked �?%s is inside the chat upload directory. "+
 					"Uploaded files are already inlined in the user message as vision/image "+
 					"content; do NOT shell out to read them. Just respond based on the "+
 					"attachment you already received.", reason),
@@ -380,33 +432,48 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	// 2. GBK output encoding (PowerShell 5.1 default on zh-CN)
 	//
 	// Original: powershell -NoProfile -Command "Get-Content ... | Select-Object ..."
-	//   → cmd /C strips outer quotes → | interpreted by cmd.exe → parser error
+	//   �?cmd /C strips outer quotes �?| interpreted by cmd.exe �?parser error
 	//
 	// Fix: run powershell.exe directly with [Console]::OutputEncoding = UTF-8.
+	//
+	// Detection: scan ALL tokens for powershell|pwsh, not just the
+	// first one. The LLM can bypass the prefix-only check by writing
+	// "cmd /C powershell ..." or prepending whitespace, which would
+	// otherwise fall through to `cmd /C powershell -Command "..."`
+	// where cmd.exe misinterprets the inner quotes/pipes.
 	if runtime.GOOS == "windows" {
 		trimmed := strings.TrimSpace(a.Command)
-		isPS := strings.HasPrefix(trimmed, "powershell") || strings.HasPrefix(trimmed, "pwsh")
-		if isPS {
-			// Parse: powershell|pwsh [flags] -Command <script>
-			psExe := "powershell.exe"
-			if strings.HasPrefix(trimmed, "pwsh") {
-				psExe = "pwsh.exe"
+		tokens := strings.Fields(trimmed)
+		var psIdx int = -1
+		var psExe string
+		for i, t := range tokens {
+			base := strings.ToLower(strings.TrimRight(t, ".exe"))
+			if base == "powershell" || base == "pwsh" {
+				psIdx = i
+				psExe = base + ".exe"
+				break
 			}
-			if idx := strings.IndexByte(trimmed, ' '); idx >= 0 {
-				remaining := strings.TrimSpace(trimmed[idx:])
-				cmdIdx := strings.Index(remaining, "-Command ")
-				if cmdIdx >= 0 {
-					flags := strings.TrimSpace(remaining[:cmdIdx])
-					script := strings.TrimSpace(remaining[cmdIdx+9:])
-					if (strings.HasPrefix(script, "\"") && strings.HasSuffix(script, "\"")) ||
-						(strings.HasPrefix(script, "'") && strings.HasSuffix(script, "'")) {
-						script = script[1 : len(script)-1]
-					}
-					script = fmt.Sprintf("[Console]::OutputEncoding = [Text.Encoding]::UTF8; %s", script)
-					args := append([]string{}, strings.Fields(flags)...)
-					args = append(args, "-Command", script)
-					cmd = exec.CommandContext(ctx, psExe, args...)
+		}
+		if psIdx >= 0 {
+			// Find -Command <script> after psIdx.
+			cmdIdx := -1
+			for j := psIdx + 1; j < len(tokens)-1; j++ {
+				if strings.EqualFold(tokens[j], "-Command") || strings.EqualFold(tokens[j], "-c") {
+					cmdIdx = j
+					break
 				}
+			}
+			if cmdIdx >= 0 && cmdIdx+1 < len(tokens) {
+				flags := strings.Join(tokens[psIdx+1:cmdIdx], " ")
+				script := strings.Join(tokens[cmdIdx+1:], " ")
+				if (strings.HasPrefix(script, "\"") && strings.HasSuffix(script, "\"")) ||
+					(strings.HasPrefix(script, "'") && strings.HasSuffix(script, "'")) {
+					script = script[1 : len(script)-1]
+				}
+				script = fmt.Sprintf("[Console]::OutputEncoding = [Text.Encoding]::UTF8; %s", script)
+				args := append([]string{}, strings.Fields(flags)...)
+				args = append(args, "-Command", script)
+				cmd = exec.CommandContext(ctx, psExe, args...)
 			}
 		}
 	}
@@ -427,7 +494,7 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 			case strings.Contains(err.Error(), "is not recognized"):
 				content += "\nHint: This command doesn't exist on Windows. Use findstr (not grep), dir (not ls), type (not cat), or pwsh -NoProfile -Command \"...\" for PowerShell scripts."
 			case strings.Contains(err.Error(), "The system cannot find the file"):
-				content += "\nHint: The executable was not found. Check the command name — on Windows the available commands are: dir, findstr, type, copy, move, del, mkdir, cd, set, pwsh."
+				content += "\nHint: The executable was not found. Check the command name �?on Windows the available commands are: dir, findstr, type, copy, move, del, mkdir, cd, set, pwsh."
 			}
 		} else {
 			if strings.Contains(err.Error(), "executable file not found") || strings.Contains(err.Error(), "command not found") {
@@ -465,8 +532,20 @@ func readLimitedOutput(cmd *exec.Cmd) ([]byte, error) {
 	r1, r2 := <-ch, <-ch
 	waitErr := cmd.Wait()
 	out := append(r1.data, r2.data...)
-	if waitErr != nil && r1.err == nil && r2.err == nil {
-		return out, waitErr
+
+	// Surface every error. The previous code only returned
+	// waitErr when there was no read error �?meaning a read
+	// error during a successful process was silently dropped
+	// (the user would see partial output with no warning).
+	switch {
+	case waitErr != nil:
+		// Include any concurrent read errors so the user can
+		// tell whether output was truncated by I/O failure.
+		return out, fmt.Errorf("%w (stdout read: %v, stderr read: %v)", waitErr, r1.err, r2.err)
+	case r1.err != nil:
+		return out, fmt.Errorf("stdout read error: %w", r1.err)
+	case r2.err != nil:
+		return out, fmt.Errorf("stderr read error: %w", r2.err)
 	}
 	return out, nil
 }
@@ -508,6 +587,23 @@ func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 	}
 	a.Path = resolveToProjectRoot(ctx, a.Path)
 
+	// Sandbox check (2026-07): previously read_file bypassed
+	// the sandbox entirely, so an LLM that had a write
+	// confirm approved could follow up with read_file on
+	// /etc/passwd. The agent.go confirm branch runs the
+	// CheckReadDecision BEFORE we get here and only allows
+	// the call to proceed if the decision is Allow or the
+	// user clicked confirm. Inside the handler we still
+	// call CheckReadDecision for a second layer (the agent
+	// can race the sandbox injection if a user clicks
+	// "bypass" mid-flight).
+	if sb := sandboxFromCtx(ctx); sb != nil && sb.CheckReadDecision(a.Path, projectRootFromCtx(ctx)) == SandboxBlock {
+		return &CallResult{
+			Content: fmt.Sprintf("E_SANDBOX: read blocked by sandbox policy\n  path: %s\n  tip: this path is in the protected list; remove it from sandbox.write_protected_paths if you really mean it", a.Path),
+			IsError: true,
+		}, nil
+	}
+
 	// Block access to the upload directory. Uploaded files are
 	// images/audio/etc. that the user already attached to the
 	// chat as vision/audio content; reading them back from disk
@@ -516,7 +612,7 @@ func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 	if isInUploadDir(a.Path) {
 		return &CallResult{
 			Content: fmt.Sprintf(
-				"E_UPLOAD_DIR: read blocked — %s is inside the chat upload directory. "+
+				"E_UPLOAD_DIR: read blocked �?%s is inside the chat upload directory. "+
 					"Uploaded files are already inlined in the user message as vision/image "+
 					"content; do NOT call read_file on them. Just respond based on the "+
 					"attachment you already received.", a.Path),
@@ -558,7 +654,14 @@ func handleWriteFile(ctx context.Context, args json.RawMessage) (*CallResult, er
 	}
 	a.Path = resolveToProjectRoot(ctx, a.Path)
 
-	if sb := sandboxFromCtx(ctx); sb != nil && !sb.CheckWriteBool(a.Path) {
+	// 2026-07: CheckWriteBool now takes the project root so
+	// the sandbox can apply the project-internal / global /
+	// external path-class table. The agent.go confirm branch
+	// runs CheckWriteDecision FIRST and pops the confirm
+	// modal; the second layer here is a defence-in-depth
+	// guard in case the agent skipped the confirm (e.g.
+	// /unsafe once). We treat Block as a hard fail.
+	if sb := sandboxFromCtx(ctx); sb != nil && sb.CheckWriteDecision(a.Path, projectRootFromCtx(ctx)) == SandboxBlock {
 		return &CallResult{
 			Content: fmt.Sprintf("E_SANDBOX: write blocked by sandbox policy\n  path: %s\n  tip: this path is in the protected list; remove it from sandbox.write_protected_paths if you really mean it", a.Path),
 			IsError: true,
@@ -585,6 +688,18 @@ func handleListFiles(ctx context.Context, args json.RawMessage) (*CallResult, er
 	}
 	a.Path = resolveToProjectRoot(ctx, a.Path)
 
+	// 2026-07: list_files also goes through the read path-class
+	// table (it's a read of directory entries, not a file read
+	// in the strict sense, but the same authorisation policy
+	// applies �?a project-internal listing is Allow, anything
+	// else confirms).
+	if sb := sandboxFromCtx(ctx); sb != nil && sb.CheckReadDecision(a.Path, projectRootFromCtx(ctx)) == SandboxBlock {
+		return &CallResult{
+			Content: fmt.Sprintf("E_SANDBOX: list blocked by sandbox policy\n  path: %s", a.Path),
+			IsError: true,
+		}, nil
+	}
+
 	entries, err := listDir(a.Path)
 	if err != nil {
 		return &CallResult{Content: err.Error(), IsError: true}, nil
@@ -608,6 +723,20 @@ func isInUploadDir(p string) bool {
 	if p == "" {
 		return false
 	}
+	// Expand leading ~ to user home so the absolute-path check
+	// below catches ~/.p-chat/uploads/secret.png. Without this,
+	// the LLM could read upload files via the shell escape hatch
+	// by using the home-prefixed path (which would otherwise be
+	// treated as a bare token, not an absolute path).
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if p == "~" {
+				p = home
+			} else if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, "~\\") {
+				p = filepath.Join(home, p[2:])
+			}
+		}
+	}
 	upDir := filepath.Clean(paths.GlobalDir() + string(filepath.Separator) + "uploads")
 
 	// 1. Absolute path that lives under the upload dir.
@@ -615,7 +744,7 @@ func isInUploadDir(p string) bool {
 		return strings.HasPrefix(filepath.Clean(p), upDir)
 	}
 
-	// 2. Bare filename ("image.png", "foo/bar.png", etc.) — match
+	// 2. Bare filename ("image.png", "foo/bar.png", etc.) �?match
 	//    against the on-disk uploads directory listing. If a file
 	//    with the same name was uploaded, reject.
 	//    We strip any leading "./" and trim to the base name to
@@ -635,7 +764,7 @@ func isInUploadDir(p string) bool {
 		}
 	}
 
-	// 3. Path contains a separator — try resolving it relative
+	// 3. Path contains a separator �?try resolving it relative
 	//    to the upload dir. If it lands inside, reject.
 	if strings.Contains(p, string(filepath.Separator)) {
 		tryPath := filepath.Join(upDir, cleaned)
@@ -656,6 +785,22 @@ func handleReadDocx(ctx context.Context, args json.RawMessage) (*CallResult, err
 	if a.Path == "" {
 		return &CallResult{Content: "path is required", IsError: true}, nil
 	}
+	a.Path = resolveToProjectRoot(ctx, a.Path)
+	if sb := sandboxFromCtx(ctx); sb != nil && sb.CheckReadDecision(a.Path, projectRootFromCtx(ctx)) == SandboxBlock {
+		return &CallResult{
+			Content: fmt.Sprintf("E_SANDBOX: read_docx blocked by sandbox policy\n  path: %s", a.Path),
+			IsError: true,
+		}, nil
+	}
+	if isInUploadDir(a.Path) {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_UPLOAD_DIR: read blocked �?%s is inside the chat upload directory. "+
+					"Uploaded files are already inlined in the user message; do NOT call "+
+					"read_docx on them.", a.Path),
+			IsError: true,
+		}, nil
+	}
 	text, err := readDocx(a.Path)
 	if err != nil {
 		return &CallResult{Content: err.Error(), IsError: true}, nil
@@ -671,6 +816,22 @@ func handleReadPdf(ctx context.Context, args json.RawMessage) (*CallResult, erro
 	}
 	if a.Path == "" {
 		return &CallResult{Content: "path is required", IsError: true}, nil
+	}
+	a.Path = resolveToProjectRoot(ctx, a.Path)
+	if sb := sandboxFromCtx(ctx); sb != nil && sb.CheckReadDecision(a.Path, projectRootFromCtx(ctx)) == SandboxBlock {
+		return &CallResult{
+			Content: fmt.Sprintf("E_SANDBOX: read_pdf blocked by sandbox policy\n  path: %s", a.Path),
+			IsError: true,
+		}, nil
+	}
+	if isInUploadDir(a.Path) {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_UPLOAD_DIR: read blocked �?%s is inside the chat upload directory. "+
+					"Uploaded files are already inlined in the user message; do NOT call "+
+					"read_pdf on them.", a.Path),
+			IsError: true,
+		}, nil
 	}
 	text, err := readPdf(a.Path)
 	if err != nil {
@@ -700,6 +861,30 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 	}
 	if strings.HasPrefix(lower, "http://127.") || strings.HasPrefix(lower, "http://localhost") || strings.HasPrefix(lower, "http://0.0.0.0") {
 		return &CallResult{Content: "E_PROTO: fetching from loopback addresses is not allowed for security", IsError: true}, nil
+	}
+	// IPv6 loopback and IPv4-mapped IPv6 loopback. The
+	// string-level checks above only catch ASCII forms.
+	if strings.HasPrefix(lower, "http://[::1]") || strings.HasPrefix(lower, "http://[::ffff:127.") || strings.HasPrefix(lower, "http://[0:0:0:0:0:0:0:1]") {
+		return &CallResult{Content: "E_PROTO: fetching from IPv6 loopback is not allowed for security", IsError: true}, nil
+	}
+	// Link-local (169.254/16) �?used by cloud-instance
+	// metadata services like http://169.254.169.254 (AWS,
+	// GCP, Azure). Without this check the LLM can exfiltrate
+	// instance metadata and short-lived credentials.
+	if strings.HasPrefix(lower, "http://169.254.") {
+		return &CallResult{Content: "E_PROTO: fetching from link-local addresses is not allowed for security", IsError: true}, nil
+	}
+	// RFC1918 private ranges. Block only the http:// scheme
+	// to avoid breaking intentional https:// access to
+	// internal services (some users do this).
+	if strings.HasPrefix(lower, "http://10.") || strings.HasPrefix(lower, "http://192.168.") {
+		return &CallResult{Content: "E_PROTO: fetching from RFC1918 private addresses via http is not allowed", IsError: true}, nil
+	}
+	if strings.HasPrefix(lower, "http://172.16.") || strings.HasPrefix(lower, "http://172.17.") ||
+		strings.HasPrefix(lower, "http://172.18.") || strings.HasPrefix(lower, "http://172.19.") ||
+		strings.HasPrefix(lower, "http://172.2") || strings.HasPrefix(lower, "http://172.30.") ||
+		strings.HasPrefix(lower, "http://172.31.") {
+		return &CallResult{Content: "E_PROTO: fetching from RFC1918 private addresses via http is not allowed", IsError: true}, nil
 	}
 
 	method := "GET"
@@ -748,9 +933,42 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 	}
 
 	cType := strings.ToLower(resp.Header.Get("Content-Type"))
-	isHTTPError := resp.StatusCode >= 400
-	if strings.HasPrefix(cType, "application/json") || isHTTPError {
-		return &CallResult{Content: statusPrefix + string(body)}, nil
+	// Detect binary content and refuse to return raw bytes to the
+	// LLM (they poison the model's context and waste tokens).
+	// Text-like content types: text/*, application/json, *+json,
+	// application/xml, application/x-www-form-urlencoded,
+	// application/javascript, empty.
+	isBinaryCT := false
+	if cType != "" && !strings.HasPrefix(cType, "text/") &&
+		!strings.HasPrefix(cType, "application/json") &&
+		!strings.HasPrefix(cType, "application/xml") &&
+		!strings.HasPrefix(cType, "application/javascript") &&
+		!strings.HasPrefix(cType, "application/x-www-form-urlencoded") &&
+		!strings.HasSuffix(cType, "+json") && !strings.HasSuffix(cType, "+xml") {
+		isBinaryCT = true
+	}
+	// Sniff first 512 bytes for NUL bytes (binary marker).
+	if !isBinaryCT {
+		end := 512
+		if len(body) < end {
+			end = len(body)
+		}
+		for _, b := range body[:end] {
+			if b == 0 {
+				isBinaryCT = true
+				break
+			}
+		}
+	}
+	if isBinaryCT {
+		return &CallResult{
+			Content: fmt.Sprintf(
+				"E_BINARY: response is binary content (Content-Type: %q, %d bytes); "+
+					"web_fetch only returns text to the LLM. If you need the raw bytes, "+
+					"download via exec_command (curl/Invoke-WebRequest) and write to disk.",
+				resp.Header.Get("Content-Type"), len(body)),
+			IsError: true,
+		}, nil
 	}
 
 	return &CallResult{Content: statusPrefix + string(body)}, nil

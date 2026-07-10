@@ -43,6 +43,14 @@ func RunInit() error {
 		os.WriteFile(configPath, []byte(defaultConfig), 0o644)
 	}
 
+	// 2026-07: create BOTH the root-level AGENTS.md and
+	// the project-level .p-chat/AGENTS.md. The root
+	// AGENTS.md is the primary project slot (per the
+	// 3-path OR loader); the .p-chat/AGENTS.md is the
+	// fallback that P-Chat's own install script populates
+	// so the project always has a starter instructions
+	// file even if the user hasn't authored one at the
+	// root.
 	agentsPath := filepath.Join(cwd, "AGENTS.md")
 	if _, err := os.Stat(agentsPath); os.IsNotExist(err) {
 		defaultAgents := `# Project Agent Instructions
@@ -62,12 +70,39 @@ func RunInit() error {
 		os.WriteFile(agentsPath, []byte(defaultAgents), 0o644)
 	}
 
+	// .p-chat/AGENTS.md: secondary project-level slot.
+	// Start with a stub that points the user to the root
+	// AGENTS.md; they can either edit this file directly
+	// (more specific instructions override the root) or
+	// delete it to fall through to the root.
+	pchatAgentsPath := filepath.Join(pchatDir, "AGENTS.md")
+	if _, err := os.Stat(pchatAgentsPath); os.IsNotExist(err) {
+		stub := `# Project .p-chat/ AGENTS.md
+
+This file is a project-level AGENTS.md slot. The 2026-07
+OR loader prefers <root>/AGENTS.md over this file, so the
+root file is the primary place for project instructions.
+
+Edit this file only when you need to OVERRIDE specific
+parts of the root AGENTS.md. Delete it to fall through
+to <root>/AGENTS.md.
+
+Loading order (first hit wins):
+  1. <root>/AGENTS.md           (project root, primary)
+  2. <root>/.p-chat/AGENTS.md   (this file, fallback)
+  3. ~/.p-chat/AGENTS.md        (global, last resort)
+`
+		os.WriteFile(pchatAgentsPath, []byte(stub), 0o644)
+	}
+
 	color.Green("  ✓ 已初始化 .p-chat/ 目录结构")
 	fmt.Printf("    %s/\n", pchatDir)
 	fmt.Println("    ├── config.yaml")
+	fmt.Println("    ├── AGENTS.md     (项目级 .p-chat/AGENTS.md，2026-07 fallback slot)")
 	fmt.Println("    ├── skills/")
 	fmt.Println("    └── rules/")
-	fmt.Printf("    %s\n", agentsPath)
+	fmt.Printf("    %s  (项目级 root AGENTS.md，2026-07 primary slot)\n", agentsPath)
+	color.HiBlack("  AGENTS.md 加载顺序: <root>/AGENTS.md -> <root>/.p-chat/AGENTS.md -> ~/.p-chat/AGENTS.md")
 	return nil
 }
 

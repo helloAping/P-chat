@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // ── Three-level index node types ──
@@ -87,6 +88,12 @@ func NewWikiStore(name, dir string) (*WikiStore, error) {
 	if err := ws.migrate(); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if err := ws.checkIntegrity(); err != nil {
+		log.Printf("[knowledge] wiki store %q integrity warning: %v — attempting repair", name, err)
+		if repErr := ws.repairIndexFTS(context.Background()); repErr != nil {
+			log.Printf("[knowledge] wiki store %q repair failed: %v — the index will be rebuilt on next scan", name, repErr)
+		}
 	}
 	return ws, nil
 }
@@ -238,7 +245,7 @@ func (ws *WikiStore) ReplaceBaseNodes(ctx context.Context, base string, nodes []
 	if err != nil && isFTS5Corrupt(err) {
 		if repErr := ws.repairIndexFTS(ctx); repErr != nil {
 			log.Printf("[knowledge] repair index_fts failed: %v", repErr)
-			return fmt.Errorf("%w (repair also failed: %v)", err, repErr)
+			return fmt.Errorf("index is corrupted and auto-repair failed — delete %s and re-scan: %w", filepath.Join(ws.dir, "wiki.db"), repErr)
 		}
 		log.Printf("[knowledge] repaired index_fts, retrying ReplaceBaseNodes")
 		err = ws.replaceBaseNodesInternal(ctx, base, nodes, contents)
@@ -283,7 +290,7 @@ func (ws *WikiStore) ReplaceSourceNodes(ctx context.Context, base, source string
 	if err != nil && isFTS5Corrupt(err) {
 		if repErr := ws.repairIndexFTS(ctx); repErr != nil {
 			log.Printf("[knowledge] repair index_fts failed: %v", repErr)
-			return fmt.Errorf("%w (repair also failed: %v)", err, repErr)
+			return fmt.Errorf("index is corrupted and auto-repair failed — delete %s and re-scan: %w", filepath.Join(ws.dir, "wiki.db"), repErr)
 		}
 		log.Printf("[knowledge] repaired index_fts, retrying ReplaceSourceNodes for %s", source)
 		err = ws.replaceSourceNodesInternal(ctx, base, source, nodes, contents)
@@ -418,6 +425,31 @@ func (ws *WikiStore) deleteNodeInternal(ctx context.Context, nodeID int) error {
 	return tx.Commit()
 }
 
+// checkIntegrity runs PRAGMA integrity_check on the database and
+// returns an error if corruption is detected. The caller should
+// attempt a repair (repairIndexFTS) and retry.
+func (ws *WikiStore) checkIntegrity() error {
+	rows, err := ws.db.Query(`PRAGMA integrity_check`)
+	if err != nil {
+		return fmt.Errorf("integrity_check failed: %w", err)
+	}
+	defer rows.Close()
+	var msgs []string
+	for rows.Next() {
+		var msg string
+		if err := rows.Scan(&msg); err != nil {
+			return fmt.Errorf("scan integrity result: %w", err)
+		}
+		if msg != "ok" {
+			msgs = append(msgs, msg)
+		}
+	}
+	if len(msgs) > 0 {
+		return fmt.Errorf("integrity_check: %s", strings.Join(msgs, "; "))
+	}
+	return nil
+}
+
 // isFTS5Corrupt returns true when err indicates an FTS5 virtual table
 // corruption (SQLITE_CORRUPT_VTAB 267).
 func isFTS5Corrupt(err error) bool {
@@ -440,6 +472,31 @@ func (ws *WikiStore) repairIndexFTS(ctx context.Context) error {
 
 	// Strategy 2: drop triggers, drop+recreate the virtual table, rebuild.
 	log.Printf("[knowledge] repairIndexFTS: in-place rebuild failed, trying drop+recreate")
+	if err := ws.rebuildFTSFromScratch(ctx); err == nil {
+		log.Printf("[knowledge] repairIndexFTS: drop+recreate succeeded")
+		return nil
+	}
+
+	// Strategy 3: the database file itself may be damaged at the
+	// page level. Run VACUUM to rebuild the entire DB file into
+	// a clean copy, then retry drop+recreate.
+	log.Printf("[knowledge] repairIndexFTS: drop+recreate failed, trying VACUUM + recreate")
+	if _, err := ws.db.ExecContext(ctx, `VACUUM`); err != nil {
+		log.Printf("[knowledge] repairIndexFTS: VACUUM failed: %v", err)
+		return fmt.Errorf("index_fts is corrupted and all repair strategies failed — delete wiki.db and re-scan to rebuild: %w", err)
+	}
+	if err := ws.rebuildFTSFromScratch(ctx); err != nil {
+		log.Printf("[knowledge] repairIndexFTS: recreate after VACUUM failed: %v", err)
+		return fmt.Errorf("index_fts is corrupted and all repair strategies failed (after VACUUM) — delete wiki.db and re-scan to rebuild: %w", err)
+	}
+	log.Printf("[knowledge] repairIndexFTS: VACUUM + recreate succeeded")
+	return nil
+}
+
+// rebuildFTSFromScratch drops the existing index_fts table and
+// triggers, then recreates everything and triggers a rebuild from
+// the content table. Used by repairIndexFTS strategies 2 and 3.
+func (ws *WikiStore) rebuildFTSFromScratch(ctx context.Context) error {
 	for _, stmt := range []string{
 		`DROP TRIGGER IF EXISTS fts_ins`,
 		`DROP TRIGGER IF EXISTS fts_del`,
@@ -467,7 +524,6 @@ func (ws *WikiStore) repairIndexFTS(ctx context.Context) error {
 		`INSERT INTO index_fts(index_fts) VALUES('rebuild')`); err != nil {
 		return fmt.Errorf("rebuild index_fts: %w", err)
 	}
-	log.Printf("[knowledge] repairIndexFTS: drop+recreate succeeded")
 	return nil
 }
 
@@ -565,6 +621,23 @@ func (ws *WikiStore) CountNodes(ctx context.Context, base string) int {
 var wikiStoreCache sync.Map
 var wikiStoreMu sync.Mutex
 
+// maxWikiStoreCache caps the number of cached wiki stores. A
+// pathological config (e.g. many knowledge bases, or one base
+// whose path changes per request) could otherwise leak
+// SQLite connections over a long-running process. When the
+// cap is reached, the oldest entry (by insertion order, via
+// insertion-order tracking in wikiStoreOrder) is closed and
+// evicted.
+const maxWikiStoreCache = 64
+
+// wikiStoreOrder tracks insertion order for LRU eviction. We
+// use a counter rather than time to keep the eviction logic
+// allocation-free in the hot path.
+var (
+	wikiStoreCounter atomic.Uint64
+	wikiStoreOrder   = make(map[string]uint64) // key -> insertion seq
+)
+
 // GetOrOpenWikiStore returns a cached wiki store keyed by (dir, name).
 // Each unique combination gets its own SQLite database.
 func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) {
@@ -582,6 +655,33 @@ func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) {
 		return nil, err
 	}
 	wikiStoreCache.Store(key, ws)
+	wikiStoreOrder[key] = wikiStoreCounter.Add(1)
+	// Evict the oldest entry if we're over the cap. We close
+	// its SQLite DB so the underlying file handle is freed.
+	if len(wikiStoreOrder) > maxWikiStoreCache {
+		var oldestKey string
+		var oldestSeq uint64 = ^uint64(0)
+		for k, seq := range wikiStoreOrder {
+			if k == key {
+				continue
+			}
+			if seq < oldestSeq {
+				oldestKey = k
+				oldestSeq = seq
+			}
+		}
+		if oldestKey != "" {
+			// Capture the value before deleting so we can
+			// close the underlying SQLite DB after eviction.
+			if v, ok := wikiStoreCache.Load(oldestKey); ok {
+				wikiStoreCache.Delete(oldestKey)
+				delete(wikiStoreOrder, oldestKey)
+				_ = v.(*WikiStore).Close()
+			} else {
+				delete(wikiStoreOrder, oldestKey)
+			}
+		}
+	}
 	return ws, nil
 }
 

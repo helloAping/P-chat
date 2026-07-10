@@ -372,7 +372,7 @@ func TestStore_GetChatMessagesWithMetaPage(t *testing.T) {
 	_ = s.Flush()
 
 	// Page 1: latest 2, no cursor.
-	msgs, _, _, ids := s.GetChatMessagesWithMetaPage(cid, 0, 2)
+	msgs, _, _, ids, seqs := s.GetChatMessagesWithMetaPage(cid, 0, 2)
 	if len(msgs) != 2 {
 		t.Fatalf("page 1: want 2 msgs, got %d", len(msgs))
 	}
@@ -385,11 +385,17 @@ func TestStore_GetChatMessagesWithMetaPage(t *testing.T) {
 	if ids[0] != 4 {
 		t.Errorf("page 1: oldest id should be 4, got %d", ids[0])
 	}
+	// seqs are per-conversation starting at 1, so for the
+	// 5 messages added in order, page 1 (msg-3, msg-4) has
+	// seqs 4, 5.
+	if seqs[0] != 4 || seqs[1] != 5 {
+		t.Errorf("page 1: seqs = %v, want [4, 5]", seqs)
+	}
 
 	// Page 2: before id 4 (the oldest of page 1), next 2 →
 	// eligible ids are {1, 2, 3}; SQL returns [3, 2]; we
 	// reverse to [msg-1, msg-2] (ids 2, 3).
-	msgs2, _, _, ids2 := s.GetChatMessagesWithMetaPage(cid, 4, 2)
+	msgs2, _, _, ids2, seqs2 := s.GetChatMessagesWithMetaPage(cid, 4, 2)
 	if len(msgs2) != 2 {
 		t.Fatalf("page 2: want 2 msgs, got %d", len(msgs2))
 	}
@@ -398,6 +404,9 @@ func TestStore_GetChatMessagesWithMetaPage(t *testing.T) {
 	}
 	if ids2[0] != 2 {
 		t.Errorf("page 2: oldest id should be 2, got %d", ids2[0])
+	}
+	if seqs2[0] != 2 || seqs2[1] != 3 {
+		t.Errorf("page 2: seqs = %v, want [2, 3]", seqs2)
 	}
 
 	// has_more for the original oldest row (id 1) → false.

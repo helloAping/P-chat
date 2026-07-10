@@ -1,6 +1,7 @@
-package tool
+﻿package tool
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,7 +34,7 @@ func setupGrepTest(t *testing.T) *config.Config {
 
 func TestGrepKnowledgeBases_Basic(t *testing.T) {
 	cfg := setupGrepTest(t)
-	results := grepKnowledgeBases(cfg, "", "Installation", 10)
+	results := grepKnowledgeBases(context.Background(), cfg, "", "Installation", 10)
 	if len(results) == 0 {
 		t.Fatal("expected results for 'Installation'")
 	}
@@ -44,7 +45,7 @@ func TestGrepKnowledgeBases_Basic(t *testing.T) {
 
 func TestGrepKnowledgeBases_CaseInsensitive(t *testing.T) {
 	cfg := setupGrepTest(t)
-	results := grepKnowledgeBases(cfg, "", "installation", 10)
+	results := grepKnowledgeBases(context.Background(), cfg, "", "installation", 10)
 	if len(results) == 0 {
 		t.Fatal("case-insensitive search failed")
 	}
@@ -52,7 +53,7 @@ func TestGrepKnowledgeBases_CaseInsensitive(t *testing.T) {
 
 func TestGrepKnowledgeBases_NoResults(t *testing.T) {
 	cfg := setupGrepTest(t)
-	results := grepKnowledgeBases(cfg, "", "zzzzzzznonexistent", 10)
+	results := grepKnowledgeBases(context.Background(), cfg, "", "zzzzzzznonexistent", 10)
 	if len(results) != 0 {
 		t.Errorf("want 0 results, got %d", len(results))
 	}
@@ -60,7 +61,7 @@ func TestGrepKnowledgeBases_NoResults(t *testing.T) {
 
 func TestGrepKnowledgeBases_TopKLimit(t *testing.T) {
 	cfg := setupGrepTest(t)
-	results := grepKnowledgeBases(cfg, "", "project", 1)
+	results := grepKnowledgeBases(context.Background(), cfg, "", "project", 1)
 	if len(results) > 1 {
 		t.Errorf("topK=1 should return at most 1 result, got %d", len(results))
 	}
@@ -68,7 +69,7 @@ func TestGrepKnowledgeBases_TopKLimit(t *testing.T) {
 
 func TestGrepKnowledgeBases_LargeFileSkipped(t *testing.T) {
 	cfg := setupGrepTest(t)
-	results := grepKnowledgeBases(cfg, "", "a", 100)
+	results := grepKnowledgeBases(context.Background(), cfg, "", "a", 100)
 	// The large.txt file (6MB) should be skipped; no results from it.
 	for _, r := range results {
 		if strings.Contains(r.Source, "large.txt") {
@@ -89,7 +90,7 @@ func TestGrepKnowledgeBases_ExcludePattern(t *testing.T) {
 		},
 	}}
 
-	results := grepKnowledgeBases(cfg, "", "hello", 10)
+	results := grepKnowledgeBases(context.Background(), cfg, "", "hello", 10)
 	for _, r := range results {
 		if strings.Contains(r.Source, "skip.log") {
 			t.Errorf("excluded file should not appear: %s", r.Source)
@@ -114,7 +115,7 @@ func TestGrepKnowledgeBases_SpecificBase(t *testing.T) {
 		},
 	}}
 
-	results := grepKnowledgeBases(cfg, "base1", "unique", 10)
+	results := grepKnowledgeBases(context.Background(), cfg, "base1", "unique", 10)
 	if len(results) == 0 {
 		t.Fatal("expected results from base1")
 	}

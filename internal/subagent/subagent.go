@@ -57,6 +57,13 @@ type Request struct {
 	Style          style.Style
 	Provider       string
 	TaskID         string
+	// ProjectRoot is the session's working directory. The
+	// sub-agent runner reads it from the parent ctx (see
+	// tool.ProjectRootFromCtx) and passes it down to the
+	// child ChatRequest so file/command tools resolve
+	// relative paths against the same base the user set
+	// for the session.
+	ProjectRoot string
 }
 
 // Result is what the runner returns. Content is the final assistant text
@@ -155,6 +162,12 @@ type Cache struct {
 	stores atomic.Int64
 }
 
+// defaultCacheMaxEntries caps the cache size. A long-running
+// process that issues many distinct sub-agent tasks would
+// otherwise grow this map without bound. When the cap is
+// reached, the oldest entry (by storedAt) is evicted.
+const defaultCacheMaxEntries = 256
+
 type cacheEntry struct {
 	result   Result
 	storedAt time.Time
@@ -170,6 +183,27 @@ func NewCache(ttl time.Duration) *Cache {
 	return &Cache{
 		ttl:     ttl,
 		entries: make(map[string]cacheEntry),
+	}
+}
+
+// evictOldest drops the entry with the oldest storedAt under
+// the lock. Caller must hold c.mu.
+func (c *Cache) evictOldest() {
+	if len(c.entries) == 0 {
+		return
+	}
+	var oldestKey string
+	var oldestAt time.Time
+	first := true
+	for k, e := range c.entries {
+		if first || e.storedAt.Before(oldestAt) {
+			oldestKey = k
+			oldestAt = e.storedAt
+			first = false
+		}
+	}
+	if oldestKey != "" {
+		delete(c.entries, oldestKey)
 	}
 }
 
@@ -218,6 +252,9 @@ func (c *Cache) Put(description string, s style.Style, provider string, r Result
 		result:   r,
 		storedAt: time.Now(),
 	}
+	if len(c.entries) > defaultCacheMaxEntries {
+		c.evictOldest()
+	}
 	c.mu.Unlock()
 	c.stores.Add(1)
 }
@@ -257,6 +294,9 @@ func (c *Cache) PutByKey(key string, r Result) {
 	c.entries[key] = cacheEntry{
 		result:   r,
 		storedAt: time.Now(),
+	}
+	if len(c.entries) > defaultCacheMaxEntries {
+		c.evictOldest()
 	}
 	c.mu.Unlock()
 	c.stores.Add(1)
@@ -459,6 +499,15 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 			runner.ParentProviderModel = pm
 		}
 
+		// Inherit the session's project root (working directory).
+		// Without this, the sub-agent's tool calls (exec_command,
+		// read_file, write_file, list_files) resolve relative paths
+		// against the server's startup CWD instead of the user's
+		// selected project directory — which is the silent bug
+		// that drove the 2026-07 "tool runs in the wrong folder"
+		// report.
+		projectRoot := tool.ProjectRootFromCtx(ctx)
+
 		res, err := runner.Run(ctx, Request{
 			Description:     a.Description,
 			SubagentType:    strings.TrimSpace(a.SubagentType),
@@ -467,6 +516,7 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 			Style:           style.Style(strings.ToLower(strings.TrimSpace(a.Style))),
 			Provider:        strings.TrimSpace(a.Provider),
 			TaskID:          strings.TrimSpace(a.TaskID),
+			ProjectRoot:     projectRoot,
 		})
 		if err != nil {
 			return &tool.CallResult{
@@ -688,19 +738,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		chatModel = prov
 	}
 
-	chatReq := agent.ChatRequest{
-		Style:         s,
-		Provider:      prov,
-		Model:         chatModel,
-		PromptOv:      promptOv,
-		SubagentType:  subType,
-		SubagentColor: color,
-		SubagentTaskID: req.TaskID,
-		SessionID:     "subagent-" + subType + "-" + req.TaskID,
-		Messages: []llm.ChatMessage{
-			{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Description},
-		},
-	}
+	chatReq := buildSubAgentChatRequest(req, s, prov, chatModel, promptOv, subType, color)
 
 	start := time.Now()
 	stream := subAgent.ChatWithTools(runCtx, chatReq)
@@ -890,8 +928,12 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 // subagent runner can scrub its own Result.Content
 // without taking a dependency on the agent package's
 // unexported helper. Same shape, same replacement.
+//
+// Multiple alternates catch the various phrasings different
+// models use — see phantomVisionErrorRe in agent.go for the
+// rationale. Keep in sync.
 var phantomScrubRe = regexp.MustCompile(
-	`(?is)Cannot read[\s\S]{0,400}?Inform the user\.?`,
+	`(?is)(?:Cannot|Unable to|Failed to|cannot|unable to) (?:read|view|process)[\s\S]{0,400}?[Ii]nform the user\.?`,
 )
 const phantomScrubReplacement = "（当前模型不支持读取图片。请在「设置 → 提供商/模型」中切换到支持视觉的模型（如 claude-3、gpt-4o、gemini-1.5、qwen-vl、doubao-1.5-vision-pro 等）后重新发送。）"
 
@@ -912,4 +954,30 @@ func redactPhantomErrorsServer(s string) string {
 		return s
 	}
 	return phantomScrubRe.ReplaceAllString(s, phantomScrubReplacement)
+}
+
+// buildSubAgentChatRequest assembles the ChatRequest the sub-agent
+// runner hands to agent.ChatWithTools. Extracted from Default.Run
+// so the field wiring (notably ProjectRoot, which silently dropped
+// pre-2026-07 fix) can be unit-tested without spinning up a real
+// agent + LLM stack.
+func buildSubAgentChatRequest(
+	req Request,
+	s style.Style,
+	prov, chatModel, promptOv, subType, color string,
+) agent.ChatRequest {
+	return agent.ChatRequest{
+		Style:          s,
+		Provider:       prov,
+		Model:          chatModel,
+		PromptOv:       promptOv,
+		SubagentType:   subType,
+		SubagentColor:  color,
+		SubagentTaskID: req.TaskID,
+		ProjectRoot:    req.ProjectRoot,
+		SessionID:      "subagent-" + subType + "-" + req.TaskID,
+		Messages: []llm.ChatMessage{
+			{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Description},
+		},
+	}
 }

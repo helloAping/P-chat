@@ -1,115 +1,276 @@
-/* Global styles for the P-Chat Vue frontend. Most UI is rendered
- * through Naive UI components, which carry their own theming.
- * This file holds the design tokens, layout shell, scrollbar
- * tweaks, and a few utility classes the components reuse.
+/* =========================================================================
+ * P-Chat Design Tokens & Global Styles
+ * =========================================================================
+ * Single source of truth for color, type, spacing, radius, shadow, and
+ * motion. Every component reads from semantic vars (--surface-*,
+ * --text-*, --brand-*, --ai-*, etc.) — never raw hex.
  *
- * Design tokens are split into semantic variables
- * (--bg, --bg-2, --text, --accent, --warn, ...) and component
- * code MUST consume the semantic ones, not raw hex. The two
- * theme variants (dark / light) override the semantic vars
- * via a `data-theme` attribute on the document root.
- */
+ * Two theme variants: dark (default) and light. Themes swap via the
+ * `data-theme` attribute on <html>, which the App.vue theme toggle
+ * sets. All component code reads semantic tokens, so theme changes
+ * cascade without per-component changes.
+ *
+ * Backward compat: legacy tokens (--bg, --bg-2, --accent, --text-2,
+ * --border, --error, etc.) are kept as aliases of the new tokens.
+ * PR #1 of the UI refresh adds the new tokens; subsequent PRs migrate
+ * components to consume them directly.
+ * ========================================================================= */
 
+/* --- 1. Inter Variable Font (locally bundled) -----------------------------
+ * Single variable-axis woff2 covers weights 100-900 with full Latin +
+ * Latin-Ext glyph coverage. CJK glyphs fall through to the system stack
+ * (PingFang SC / Microsoft YaHei) which is already present on all
+ * supported OSes. The woff2 file is ~344KB and gets gzipped to ~280KB
+ * by the static-file server.
+ */
+@font-face {
+  font-family: "InterVariable";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("./assets/fonts/InterVariable.woff2") format("woff2-variations"),
+       url("./assets/fonts/InterVariable.woff2") format("woff2");
+}
+
+/* --- 2. Dark theme (default) -------------------------------------------- */
 :root,
 :root[data-theme="dark"] {
-  /* Surfaces — from back-most to front-most */
-  --bg:        #0f1115;
-  --bg-2:      #1a1d24;
-  --bg-3:      #252830;
-  --bg-input:  #1a1d24;
+  /* 2.1 Surfaces — back-most to front-most */
+  --surface-0:        #0B0D12;
+  --surface-1:        #14171F;
+  --surface-2:        #1C1F29;
+  --surface-3:        #262A36;
+  --surface-input:    #1C1F29;
+  --surface-overlay:  rgba(11, 13, 18, 0.72);
 
-  /* Text */
-  --text:      #e6e6e6;
-  --text-2:    #b0b3ba;
-  --text-3:    #8a8d95;
-  --text-4:    #5a5d65;
+  /* 2.2 Text */
+  --text-primary:     #F4F5F7;
+  --text-secondary:   #A8ADBA;
+  --text-tertiary:    #6B7180;
+  --text-quaternary:  #4A4F5C;
 
-  /* Borders */
-  --border:    #2a2d35;
-  --border-2:  #3a3d45;
+  /* 2.3 Borders */
+  --border-subtle:    rgba(255, 255, 255, 0.06);
+  --border-default:   rgba(255, 255, 255, 0.10);
+  --border-strong:    rgba(255, 255, 255, 0.16);
 
-  /* Brand accent — drives the primary CTA, the active item
-     highlight, the streaming dot, and the model-row "is
-     default" tint. Single source of truth. */
-  --accent:        #4a4dff;
-  --accent-2:      #7a7dff;
-  --accent-soft:   rgba(74, 77, 255, 0.12);
-  --accent-border: rgba(74, 77, 255, 0.35);
+  /* 2.4 Brand — drives primary CTA, active item highlight, streaming
+   * dot, and the Naive UI primaryColor (read via getComputedStyle in
+   * App.vue). Same value as the legacy --accent so the existing
+   * brand identity carries through unchanged. */
+  --brand-50:         rgba(74, 77, 255, 0.12);
+  --brand-100:        rgba(74, 77, 255, 0.22);
+  --brand-500:        #4A4DFF;
+  --brand-600:        #3D3FE0;
+  --brand-700:        #3033BF;
 
-  /* Status colors */
-  --error:        #e55;
-  --error-soft:   rgba(238, 85, 85, 0.14);
-  --success:      #5a5;
-  --success-soft: rgba(85, 170, 85, 0.16);
-  --warn:         #ea5;
-  --warn-soft:    rgba(234, 170, 85, 0.16);
+  /* 2.5 AI — assistant identity. Purple so Assistant messages have a
+   * visual identity distinct from the blue brand. Not yet consumed
+   * by components in PR #1; introduced now so PR #5 (MessageBubble
+   * refactor) can wire it in. */
+  --ai-50:            rgba(124, 91, 255, 0.10);
+  --ai-100:           rgba(124, 91, 255, 0.20);
+  --ai-500:           #7C5BFF;
+  --ai-600:           #6347E5;
 
-  /* Translucent on-message-button background (used inside
-     assistant bubbles where the bg is --accent). */
-  --on-accent:    #ffffff;
+  /* 2.6 Status */
+  --success-50:       rgba(85, 170, 85, 0.16);
+  --success-500:      #5AAE5A;
+  --warn-50:          rgba(234, 170, 85, 0.16);
+  --warn-500:         #EAAA55;
+  --error-50:         rgba(238, 85, 85, 0.14);
+  --error-500:        #EE5555;
+
+  /* 2.6b Provider brand colors. The dot/badge next to a
+   * provider in the TopBar and ModelPicker uses these.
+   * Dark theme picks the deeper, more saturated brand hues
+   * so the dot reads against surface-0. Light theme keeps
+   * the same hues (they read on white) — no contrast
+   * inversion needed. */
+  --provider-anthropic:           #D97757;
+  --provider-openai:               #10A37F;
+  --provider-openai-compatible:    #7C5BFF;
+  --provider-default:              #6B7180;
+
+  /* 2.7 On-color — text/icons rendered on top of brand surfaces */
+  --on-brand:         #FFFFFF;
+  --on-accent:        #FFFFFF; /* legacy alias */
+
+  /* 2.8 Spacing — 4-pt scale */
+  --space-1:          4px;
+  --space-2:          8px;
+  --space-3:          12px;
+  --space-4:          16px;
+  --space-5:          20px;
+  --space-6:          24px;
+  --space-7:          32px;
+  --space-8:          40px;
+
+  /* 2.9 Radius */
+  --radius-sm:        6px;
+  --radius-md:        10px;
+  --radius-lg:        14px;
+  --radius-xl:        20px;
+  --radius-pill:      9999px;
+
+  /* 2.10 Shadow */
+  --shadow-sm:        0 1px 2px rgba(0, 0, 0, 0.20);
+  --shadow-md:        0 4px 12px rgba(0, 0, 0, 0.28);
+  --shadow-lg:        0 12px 32px rgba(0, 0, 0, 0.36);
+
+  /* 2.11 Motion */
+  --ease-out:         cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out:      cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast:         120ms;
+  --dur-base:         200ms;
+  --dur-slow:         320ms;
 
   color-scheme: dark;
 }
 
+/* --- 3. Light theme ------------------------------------------------------ */
 :root[data-theme="light"] {
-  --bg:        #fafbfc;
-  --bg-2:      #f0f2f5;
-  --bg-3:      #e6e9ee;
-  --bg-input:  #ffffff;
+  --surface-0:        #FFFFFF;
+  --surface-1:        #F7F8FA;
+  --surface-2:        #EEF0F4;
+  --surface-3:        #E2E5EB;
+  --surface-input:    #FFFFFF;
+  --surface-overlay:  rgba(255, 255, 255, 0.72);
 
-  --text:      #1a1d24;
-  --text-2:    #4a4d55;
-  --text-3:    #6a6d75;
-  --text-4:    #9a9da5;
+  --text-primary:     #0F1115;
+  --text-secondary:   #4A4F5C;
+  --text-tertiary:    #797F8C;
+  --text-quaternary:  #9CA1AC;
 
-  --border:    #d8dbe0;
-  --border-2:  #c8cbd0;
+  --border-subtle:    rgba(0, 0, 0, 0.04);
+  --border-default:   rgba(0, 0, 0, 0.10);
+  --border-strong:    rgba(0, 0, 0, 0.16);
 
-  --accent:        #4042e6;
-  --accent-2:      #5a5cff;
-  --accent-soft:   rgba(64, 66, 230, 0.10);
-  --accent-border: rgba(64, 66, 230, 0.30);
+  --brand-50:         rgba(64, 66, 230, 0.10);
+  --brand-100:        rgba(64, 66, 230, 0.20);
+  --brand-500:        #4042E6;
+  --brand-600:        #3033BF;
+  --brand-700:        #2528A0;
 
-  --error:        #d33;
-  --error-soft:   rgba(221, 51, 51, 0.10);
-  --success:      #2a7a2a;
-  --success-soft: rgba(42, 122, 42, 0.12);
-  --warn:         #c97a00;
-  --warn-soft:    rgba(201, 122, 0, 0.14);
+  --ai-50:            rgba(91, 61, 187, 0.08);
+  --ai-100:           rgba(91, 61, 187, 0.16);
+  --ai-500:           #5B3DDB;
+  --ai-600:           #4A2EBF;
 
-  --on-accent:    #ffffff;
+  --shadow-sm:        0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md:        0 4px 12px rgba(0, 0, 0, 0.10);
+  --shadow-lg:        0 12px 32px rgba(0, 0, 0, 0.16);
 
   color-scheme: light;
 }
 
+/* --- 4. Font stacks (theme-independent) ---------------------------------- */
+:root {
+  --font-sans: "InterVariable", "Inter", -apple-system, BlinkMacSystemFont,
+               "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo,
+               Consolas, monospace;
+  --font-display: "InterVariable", "Inter", system-ui, sans-serif;
+}
+
+/* --- 5. Legacy aliases (backward compat for components written before
+ *      the v1 design system) --------------------------------------------- */
+:root,
+:root[data-theme="dark"],
+:root[data-theme="light"] {
+  --bg:        var(--surface-0);
+  --bg-2:      var(--surface-1);
+  --bg-3:      var(--surface-2);
+  --bg-4:      var(--surface-3);
+  --text:      var(--text-primary);
+  --text-1:    var(--text-primary);
+  --text-2:    var(--text-secondary);
+  --text-3:    var(--text-tertiary);
+  --text-4:    var(--text-quaternary);
+  --border:    var(--border-default);
+  --border-2:  var(--border-strong);
+  --accent:    var(--brand-500);
+  --accent-2:  var(--brand-600);
+  --accent-soft:   var(--brand-50);
+  --accent-border: var(--brand-100);
+  --error:     var(--error-500);
+  --error-soft: var(--error-50);
+  --success:   var(--success-500);
+  --success-soft: var(--success-50);
+  --warn:      var(--warn-500);
+  --warn-soft: var(--warn-50);
+  --warning:   var(--warn-500);       /* legacy name used by MessageBubble */
+  --warning-suppl: var(--warn-50);
+  --bg-input:  var(--surface-input);
+
+  /* Provider brand colors stay constant across themes
+   * (they read on both surface-0 dark and surface-0 light). */
+  --provider-anthropic:        #D97757;
+  --provider-openai:            #10A37F;
+  --provider-openai-compatible: #7C5BFF;
+  --provider-default:           #6B7180;
+}
+
+/* --- 6. Base elements --------------------------------------------------- */
 html, body, #app {
   margin: 0; padding: 0;
   height: 100%; width: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
   font-size: 14px;
+  line-height: 1.55;
   overflow: hidden;
+  /* font-feature-settings nudges Inter to use its more refined
+   * OpenType alternates: tabular numerals, ligatures, and the
+   * single-storey 'a' / 'g' (where supported). Helps the
+   * UI read as designed across the app. */
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01", "tnum";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 * { box-sizing: border-box; }
 
-/* Scrollbar */
+/* --- 7. Scrollbar (thinner, refined) ------------------------------------ */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: var(--text-4); }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--text-quaternary); background-clip: padding-box; }
 
-/* Markdown body for assistant messages */
+/* --- 8. Focus ring (consistent across the app) -------------------------- */
+:focus-visible {
+  outline: 2px solid var(--brand-500);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* --- 9. Reduced motion ------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* --- 10. Markdown body for assistant messages (existing styles) -------- */
 .md-body { line-height: 1.6; }
 .md-body p { margin: 0 0 8px 0; }
 .md-body p:last-child { margin-bottom: 0; }
-.md-body code { background: var(--bg-3); padding: 2px 6px; border-radius: 3px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.9em; }
-.md-body pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow-x: auto; }
+.md-body code { background: var(--surface-2); padding: 2px 6px; border-radius: 3px; font-family: var(--font-mono); font-size: 0.9em; }
+.md-body pre { background: var(--surface-0); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; overflow-x: auto; }
 .md-body pre code { background: none; padding: 0; }
-.md-body a { color: var(--accent-2); }
+.md-body a { color: var(--brand-600); }
+.md-body a:hover { color: var(--brand-500); }
 .md-body ul, .md-body ol { padding-left: 24px; }
-.md-body blockquote { border-left: 3px solid var(--border-2); padding-left: 12px; color: var(--text-2); margin: 8px 0; }
+.md-body blockquote { border-left: 3px solid var(--border-strong); padding-left: 12px; color: var(--text-secondary); margin: 8px 0; }
 
 /* Tables */
 .md-body table {
@@ -118,67 +279,67 @@ html, body, #app {
   margin: 10px 0;
   font-size: 13px;
 }
-.md-body thead { border-bottom: 2px solid var(--border-2); }
+.md-body thead { border-bottom: 2px solid var(--border-strong); }
 .md-body th {
   text-align: left;
   padding: 8px 12px;
   font-weight: 600;
-  color: var(--text-2);
-  background: var(--bg-2);
+  color: var(--text-secondary);
+  background: var(--surface-1);
 }
-.md-body th:first-child { border-radius: 6px 0 0 0; }
-.md-body th:last-child { border-radius: 0 6px 0 0; }
+.md-body th:first-child { border-radius: var(--radius-sm) 0 0 0; }
+.md-body th:last-child { border-radius: 0 var(--radius-sm) 0 0; }
 .md-body td {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
 .md-body tr:last-child td { border-bottom: none; }
-.md-body tr:nth-child(even) td { background: var(--bg-2); }
+.md-body tr:nth-child(even) td { background: var(--surface-1); }
 
 /* Headings */
-.md-body h1 { font-size: 1.4em; font-weight: 700; margin: 16px 0 10px; color: var(--text); }
-.md-body h2 { font-size: 1.25em; font-weight: 600; margin: 14px 0 8px; color: var(--text); }
-.md-body h3 { font-size: 1.1em; font-weight: 600; margin: 12px 0 6px; color: var(--text-2); }
-.md-body h4 { font-size: 1em; font-weight: 600; margin: 10px 0 6px; color: var(--text-2); }
+.md-body h1 { font-size: 1.4em; font-weight: 700; margin: 16px 0 10px; color: var(--text-primary); letter-spacing: -0.01em; }
+.md-body h2 { font-size: 1.25em; font-weight: 600; margin: 14px 0 8px; color: var(--text-primary); letter-spacing: -0.005em; }
+.md-body h3 { font-size: 1.1em; font-weight: 600; margin: 12px 0 6px; color: var(--text-secondary); }
+.md-body h4 { font-size: 1em; font-weight: 600; margin: 10px 0 6px; color: var(--text-secondary); }
 
 /* Horizontal rule */
 .md-body hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
 
 /* Images */
-.md-body img { max-width: 100%; border-radius: 6px; }
+.md-body img { max-width: 100%; border-radius: var(--radius-md); }
 
 /* Inline emphasis */
-.md-body strong { color: var(--text); }
-.md-body em { color: var(--text-2); }
+.md-body strong { color: var(--text-primary); font-weight: 600; }
+.md-body em { color: var(--text-secondary); }
 
-/* Command output (rendered as HTML inside system messages) */
+/* --- 11. Command output (slash command system messages) ---------------- */
 .cmd-help, .cmd-providers, .cmd-models, .cmd-styles, .cmd-skills, .cmd-config { font-size: 13px; }
 .cmd-group { margin-bottom: 12px; }
-.cmd-group-label { font-size: 11px; font-weight: 600; color: var(--text-3); text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
+.cmd-group-label { font-size: 11px; font-weight: 600; color: var(--text-tertiary); text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
 .cmd-row { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; }
-.cmd-name { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--accent-2); background: var(--bg-3); padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
-.cmd-desc { color: var(--text-2); }
-.cmd-info { color: var(--text-3); font-size: 12.5px; padding: 4px 0; }
+.cmd-name { font-family: var(--font-mono); font-size: 11.5px; color: var(--brand-600); background: var(--surface-2); padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+.cmd-desc { color: var(--text-secondary); }
+.cmd-info { color: var(--text-tertiary); font-size: 12.5px; padding: 4px 0; }
 .cmd-card {
   display: flex; flex-direction: column; gap: 2px;
   padding: 8px 10px; margin-bottom: 4px;
-  border-radius: 6px;
-  background: var(--bg-3); border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2); border: 1px solid var(--border-strong);
 }
 .cmd-card-head { display: flex; align-items: center; gap: 6px; font-size: 13px; }
-.cmd-card-meta { font-size: 11.5px; color: var(--text-3); }
+.cmd-card-meta { font-size: 11.5px; color: var(--text-tertiary); }
 .cmd-section { margin-bottom: 10px; }
-.cmd-section-label { font-size: 11px; font-weight: 600; color: var(--text-3); margin-bottom: 4px; }
+.cmd-section-label { font-size: 11px; font-weight: 600; color: var(--text-tertiary); margin-bottom: 4px; }
 .cmd-item {
   padding: 3px 4px; font-size: 12px;
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
 }
-.cmd-muted { font-size: 11px; color: var(--text-3); }
+.cmd-muted { font-size: 11px; color: var(--text-tertiary); }
 .cmd-tag {
   display: inline-block; font-size: 10px; padding: 0 5px; border-radius: 3px;
   line-height: 18px; font-weight: 500;
 }
-.cmd-tag.tag-def { background: var(--success-soft); color: var(--success); }
-.cmd-tag.tag-prot { background: var(--bg-2); color: var(--text-2); }
-.cmd-tag.tag-vis { background: var(--accent-soft); color: var(--accent-2); }
+.cmd-tag.tag-def { background: var(--success-50); color: var(--success-500); }
+.cmd-tag.tag-prot { background: var(--surface-1); color: var(--text-secondary); }
+.cmd-tag.tag-vis { background: var(--brand-50); color: var(--brand-600); }

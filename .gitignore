@@ -283,3 +283,20 @@ cmd/pchat-installer/assets/
 /pchat-installer.exe
 # Dev build output (task build:dev).
 dev-bin/
+# -----------------------------------------------------------------------------
+# Per-binary .p-chat data (sibling-of-binary isolation)
+# -----------------------------------------------------------------------------
+# A `bin/<exe>` or `dev-bin/<exe>` run creates `.p-chat/` next
+# to itself (see internal/paths/devhome.go). The .p-chat
+# pattern above already covers the top-level project case, but
+# the *nested* variant needs an explicit rule to be obvious.
+bin/.p-chat/
+dev-bin/.p-chat/
+# Hand-edited config backups left behind by the trailing-comma
+# recovery pass (see internal/config/config.go).
+*.fixedbak
+
+# MCP Playwright caches local browser state and DOM snapshots
+# here while a session is live. We don't commit it; users
+# regenerate it on each /playwright-mcp run.
+.playwright-mcp/

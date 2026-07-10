@@ -1,55 +1,272 @@
 name: Release
 
+# Trigger only on version tags.
+# Draft release is created — review manually then Publish.
+# If CI fails before Publish: delete Draft + delete tag, fix, re-tag.
+# If already Published and buggy: bump version (1.0.6 → 1.0.7).
 on:
   push:
     tags:
-      - 'v*'
-    branches:
-      - feat_更新
-  workflow_dispatch:
+      - 'v*-release'
+      - 'v*-rc*'
 
 permissions:
   contents: write
 
 jobs:
-  release:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      is_rc: ${{ steps.ver.outputs.is_rc }}
+      changelog: ${{ steps.ver.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: ver
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+
+          if [[ "$TAG" == *-rc* ]]; then
+            echo "is_rc=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_rc=false" >> $GITHUB_OUTPUT
+          fi
+          TAG="${TAG%-release}"
+          echo "version=$TAG" >> $GITHUB_OUTPUT
+
+          # Generate changelog from commits since last stable tag.
+          LAST_TAG=$(git tag --sort=-creatordate | grep -E '^v.*-release$' | grep -v "$TAG" | head -1)
+          if [ -n "$LAST_TAG" ]; then
+            LOG=$(git log --pretty=format:'- %s (%h)' "${LAST_TAG}..HEAD" 2>/dev/null)
+          else
+            LOG=$(git log --pretty=format:'- %s (%h)' -20 2>/dev/null)
+          fi
+          LOG=$(echo "$LOG" | head -50)
+          COUNT=$(echo "$LOG" | wc -l)
+          if [ "$COUNT" -gt 50 ]; then
+            echo "::warning::Changelog truncated from $COUNT to 50 entries"
+          fi
+          {
+            echo 'changelog<<EOF'
+            echo "$LOG"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+  build-windows:
+    needs: version
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.21.13'
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22'
 
-      - name: Install tools
+      - name: Install Task
+        run: go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: Restore Go cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\go\pkg\mod
+            ~\AppData\Local\go-build
+          key: win-${{ hashFiles('go.sum') }}
+          restore-keys: win-
+
+      - name: Sync version from tag
+        shell: pwsh
         run: |
-          go install github.com/go-task/task/v3/cmd/task@latest
-          go install github.com/wailsapp/wails/v2/cmd/wails@latest
+          Set-Content -Path VERSION -Value "${{ needs.version.outputs.version }}" -NoNewline
+          Write-Host "VERSION = ${{ needs.version.outputs.version }}"
 
-      - name: task build:all
+      - name: Build all
+        shell: cmd
         run: task build:all
 
-      - name: Build Linux binaries
+      - name: Package GUI
+        shell: pwsh
+        run: .\scripts\package-gui.ps1
+
+      - name: Generate Windows checksums
+        shell: pwsh
         run: |
-          $tag = if ($env:GITHUB_REF -match 'refs/tags/(.+)') { $matches[1] } else { 'test' }
-          mkdir "bin/$tag-linux" -Force
+          $out = "bin\checksums-windows.txt"
+          "" | Set-Content $out
+          @('pchat.exe','pchat-server.exe','pchat-gui.exe') | ForEach-Object {
+            $h = Get-FileHash "bin\$_" -Algorithm SHA256
+            Add-Content $out "$($h.Hash)  $_"
+            Write-Host "$($h.Hash)  $_"
+          }
+          $setup = Get-ChildItem bin/pchat-setup-v*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($setup) {
+            $h = Get-FileHash $setup.FullName -Algorithm SHA256
+            Add-Content $out "$($h.Hash)  $($setup.Name)"
+          }
 
-          $env:GOOS = "linux"; $env:GOARCH = "amd64"
-          go build -o "bin/$tag-linux/pchat" ./cmd/pchat
-          go build -o "bin/$tag-linux/pchat-server" ./cmd/pchat-server
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: |
+            bin/pchat.exe
+            bin/pchat-server.exe
+            bin/pchat-gui.exe
+            bin/pchat-setup-v*.exe
+            bin/checksums-windows.txt
 
-          Copy-Item -Recurse "web/" "bin/$tag-linux/web/"
-          cd bin; tar czf "../$tag-linux-amd64.tar.gz" "$tag-linux"
+  build-linux:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.13'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Task
+        run: go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Install Wails Linux deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgtk-3-dev libwebkit2gtk-4.1-dev 2>/dev/null || \
+          sudo apt-get install -y -qq libgtk-3-dev libwebkit2gtk-4.0-dev 2>/dev/null || \
+          echo "WARNING: webkit2gtk not found, GUI build will be skipped"
+
+      - name: Restore Go cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: linux-${{ hashFiles('go.sum') }}
+          restore-keys: linux-
+
+      - name: Write VERSION
+        run: printf '%s' "${{ needs.version.outputs.version }}" > VERSION
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Sync web to embed dir
+        run: |
+          rm -rf cmd/pchat-server/web
+          mkdir -p cmd/pchat-server/web
+          rsync -av --delete web/ cmd/pchat-server/web/
+
+      - name: Build Linux server
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags "\
+            -X github.com/p-chat/pchat/internal/version.Version=${{ needs.version.outputs.version }} \
+            -X github.com/p-chat/pchat/internal/version.GitCommit=$(git rev-parse --short HEAD)" \
+            -o bin/pchat-server-linux ./cmd/pchat-server
+
+      - name: Build Linux GUI
+        working-directory: cmd/pchat-gui
+        run: |
+          wails build -platform linux/amd64 \
+            -ldflags "\
+            -X github.com/p-chat/pchat/internal/version.Version=${{ needs.version.outputs.version }} \
+            -X github.com/p-chat/pchat/internal/version.GitCommit=$(git rev-parse --short HEAD)" \
+            -s
+
+      - name: Generate Linux checksums
+        run: |
+          sha256sum bin/pchat-server-linux > bin/checksums-linux.txt
+          if [ -f cmd/pchat-gui/build/bin/pchat-gui ]; then
+            sha256sum cmd/pchat-gui/build/bin/pchat-gui >> bin/checksums-linux.txt
+          fi
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+            bin/pchat-server-linux
+            cmd/pchat-gui/build/bin/pchat-gui
+            bin/checksums-linux.txt
+
+  release:
+    needs: [version, build-windows, build-linux]
+    if: |
+      !failure() &&
+      needs.version.result == 'success' &&
+      needs.build-windows.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-flat
+
+      - name: Flatten to single directory
+        run: |
+          mkdir -p _release
+          find release-flat -type f | while read f; do
+            cp "$f" "_release/$(basename "$f")"
+          done
+          rm -rf release-flat
+          ls -lah _release/
+
+      - name: Merge checksums
+        run: |
+          cd _release
+          cat checksums-windows.txt checksums-linux.txt 2>/dev/null | sort > SHA256SUM.txt
+          cat SHA256SUM.txt
+
+      - name: Create Draft Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            bin/pchat-setup-v*.exe
-            *-linux-amd64.tar.gz
-          generate_release_notes: false
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: true
+          prerelease: ${{ needs.version.outputs.is_rc }}
+          files: _release/*
+          body: |
+            ## P-Chat ${{ github.ref_name }}
+
+            ${{ needs.version.outputs.changelog }}
+
+            ---
+
+            ### Windows
+            - **pchat-setup-v${{ needs.version.outputs.version }}.exe** — 一键安装（推荐）
+            - pchat.exe / pchat-server.exe / pchat-gui.exe — 手动部署
+
+            ### Linux
+            - pchat-server-linux — 独立 server
+            - pchat-gui — 桌面端
+
+            ### 校验
+            参见 **SHA256SUM.txt**

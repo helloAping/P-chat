@@ -30,6 +30,16 @@ export interface PendingAttachment {
   _dataURL?: string
 }
 
+// Expose state on window for in-browser debugging
+// (pchat-gui hides this via a build-time flag — we don't
+// strip it because the chat store is already globally
+// accessible through the Vue devtools anyway).
+if (typeof window !== 'undefined') {
+  ;(window as any).__pchatDebug = {
+    get state() { return state },
+  }
+}
+
 export const state = reactive({
   sessions: [] as Session[],
   currentID: '' as string,
@@ -39,11 +49,15 @@ export const state = reactive({
     asstContent: string
   }>,
   // Per-session history-paging cursor. The first page
-  // (loaded by switchSession) sets oldestId to the id of the
-  // last (oldest) message in the page; subsequent pages are
-  // fetched with before_id=oldestId. When hasMore is false,
-  // the user has scrolled to the start of the conversation.
+  // (loaded by switchSession) sets oldestSeq/oldestId to
+  // the corresponding cursor from the response; subsequent
+  // pages are fetched with before_seq=oldestSeq (preferred,
+  // stable across rollback/undo) or before_id=oldestId
+  // (legacy, only for older server versions that don't
+  // emit oldest_seq). When hasMore is false, the user
+  // has scrolled to the start of the conversation.
   sessionPaging: {} as Record<string, {
+    oldestSeq: number
     oldestId: number
     hasMore: boolean
     loading: boolean
@@ -75,8 +89,19 @@ export const state = reactive({
   // session id. Background sessions may have a question open
   // while the user is viewing another session, so the global
   // flag had to go.
-  pendingQuestion: {} as Record<string, { questions: QuestionItem[]; resolve: (answers: Record<string, string>) => void }>,
-  pendingConfirm: {} as Record<string, Array<{ toolName: string; args: string; reason: string; resolve: (approved: boolean) => void }>>,
+  pendingQuestion: {} as Record<string, { questions: QuestionItem[] }>,
+  pendingConfirm: {} as Record<string, Array<{
+  toolName: string
+  args: string
+  reason: string
+  // 2026-07: extended ConfirmRequest fields. All optional
+  // for backward-compat with old server versions that
+  // don't emit them.
+  resolvedPath?: string
+  pathClass?: string
+  riskLevel?: string
+  resolve: (approved: boolean) => void
+}>>,
   pendingPlanText: {} as Record<string, string>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
@@ -147,17 +172,14 @@ export const currentMeta = computed(() => {
   }
 })
 
-// Global phantom scrub. Walks every message in every
-// session whenever the messages map changes. The
-// per-part scrub in `appendTextPart` catches the common
-// case, but a stored phantom from a pre-fix version
-// (or a phantom injected through a path we haven't
-// audited) would still be visible until the user
-// reloads. This deep watcher makes the scrub a
-// no-op-when-clean, side-effect-when-dirty background
-// job that runs on every reactive change. Performance
-// is fine in practice (sessions have <100 messages,
-// each with <20 parts, the regex is cheap).
+// Global phantom scrub. Walks newly-added messages on
+// session change to catch stored phantoms from pre-fix
+// versions or phantom injections through unaudited paths.
+// The per-part scrub in `appendTextPart` handles the
+// streaming path; the `done` handler does a final pass.
+// We track per-session message counts and only scrub
+// unseen messages — avoiding the O(all_messages) deep
+// walk on every SSE tick that `deep: true` incurred.
 //
 // We scrub in place — the `m.parts` arrays are
 // reactive so the Vue components re-render
@@ -165,18 +187,29 @@ export const currentMeta = computed(() => {
 // actually changes a value, to avoid spurious
 // reactive triggers.
 watch(
-  () => state.sessionMessages,
-  (sessions) => {
-    if (!sessions) return
+  () => {
+    const counts: Record<string, number> = {}
+    const sessions = state.sessionMessages
+    if (!sessions) return counts
     for (const id in sessions) {
-      const msgs = sessions[id]
+      counts[id] = sessions[id]?.length ?? 0
+    }
+    return counts
+  },
+  (counts, oldCounts) => {
+    if (!counts || !oldCounts) return
+    for (const id in counts) {
+      const newLen = counts[id]
+      const oldLen = oldCounts[id] ?? 0
+      if (newLen <= oldLen) continue
+      const msgs = state.sessionMessages[id]
       if (!msgs) continue
-      for (const m of msgs) {
-        scrubMessagePhantoms(m)
+      for (let i = oldLen; i < newLen; i++) {
+        scrubMessagePhantoms(msgs[i])
       }
     }
   },
-  { deep: true },
+  { immediate: true },
 )
 
 // --- Session management ---
@@ -210,15 +243,19 @@ export async function setActiveProject(path: string) {
   // Revoke blob URLs for any staged attachments in the
   // sessions we're discarding, then drop the maps entirely.
   // Question / confirm dialogs keyed to those sessions get
-  // resolved with no-op values so any awaiters unblock.
+  // cleared so any awaiters unblock. (We no longer carry
+  // a Promise resolve on pendingQuestion — answers are sent
+  // to the server synchronously through api.submitQuestionResponse,
+  // so there's nothing to resolve here. We just drop the
+  // entries so a subsequent switchSession doesn't see stale
+  // modal data for a session that no longer exists.)
   for (const arr of Object.values(state.pendingAttachments)) {
     for (const a of arr) {
       if (a._blobURL) URL.revokeObjectURL(a._blobURL)
     }
   }
   state.pendingAttachments = {}
-  for (const [id, pq] of Object.entries(state.pendingQuestion)) {
-    pq.resolve({})
+  for (const id of Object.keys(state.pendingQuestion)) {
     delete state.pendingQuestion[id]
   }
   for (const [id, items] of Object.entries(state.pendingConfirm)) {
@@ -239,6 +276,36 @@ export async function setActiveProject(path: string) {
 // (loaded by loadMoreMessages) use the same size.
 const initialHistoryLimit = 50
 
+// dedupMessagesByKey folds a freshly-loaded page into the
+// existing in-memory list, dropping any rows we already
+// have. The dedup key is `seq` when available (the new
+// stable per-conversation identity) and `id` as a
+// fallback for older messages / pre-seq DBs.
+//
+// Newer entries (from `incoming`) win on key collision
+// so a re-fetch picks up server-side state changes
+// (e.g. the redactor rewrote `content` on the same row).
+// The merged result is sorted ascending by seq (or id
+// when seq is 0) so the oldest-first invariant holds for
+// the renderer.
+//
+// Idempotency: a stale local state from before the server
+// cursor fix, or a future server bug that returns the same
+// page twice in a row, is collapsed silently. The user
+// never sees the duplicate.
+function dedupMessagesByKey(existing: Message[], incoming: Message[]): Message[] {
+  if (incoming.length === 0) return existing
+  const byKey = new Map<number, Message>()
+  const keyOf = (m: Message): number => (m.seq != null && m.seq > 0) ? m.seq : -(m.id ?? 0)
+  for (const m of existing) {
+    byKey.set(keyOf(m), m)
+  }
+  for (const m of incoming) {
+    byKey.set(keyOf(m), m)
+  }
+  return Array.from(byKey.values()).sort((a, b) => keyOf(a) - keyOf(b))
+}
+
 export async function switchSession(id: string) {
   state.currentID = id
   if (!state.sessionMessages[id]) {
@@ -258,8 +325,19 @@ export async function switchSession(id: string) {
     for (const m of r.messages) {
       if (m.parts) scrubMessagePhantoms(m)
     }
-    state.sessionMessages[id] = r.messages
+    // Defensive dedup: if a future server bug ever returns
+    // an overlapping page on the very first load, the user
+    // won't see the duplicate bubble. The server's cursor
+    // fix (handler.go: oldestID=rowIDs[0]) eliminates the
+    // most common trigger but dedup here is the
+    // belt-and-braces guarantee.
+    state.sessionMessages[id] = dedupMessagesByKey([], r.messages)
     state.sessionPaging[id] = {
+      // Prefer the seq-based cursor (stable across
+      // rollback/undo). Fall back to the legacy id-based
+      // cursor when the server is older and didn't return
+      // oldest_seq.
+      oldestSeq: r.oldest_seq ?? 0,
       oldestId: r.oldest_id,
       hasMore: r.has_more,
       loading: false,
@@ -319,19 +397,36 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
   if (!paging || !paging.hasMore || paging.loading) return false
   paging.loading = true
   try {
-    const r = await api.listMessages(id, {
-      beforeId: paging.oldestId,
-      limit: initialHistoryLimit,
-    })
+    // Prefer the seq-based cursor when the server
+    // returned it. Fall back to the id-based cursor for
+    // older servers that only emit oldest_id. The seq
+    // cursor is stable across rollback/undo — a
+    // scroll-in-progress survives an undo, which the
+    // id cursor could not guarantee (the restored
+    // messages have new ids).
+    const opts: api.PageOpts = { limit: initialHistoryLimit }
+    if (paging.oldestSeq > 0) {
+      opts.beforeSeq = paging.oldestSeq
+    } else if (paging.oldestId > 0) {
+      opts.beforeId = paging.oldestId
+    }
+    const r = await api.listMessages(id, opts)
     if (r.messages.length > 0) {
       // Prepend the new (older) page to the front of the
       // existing message list. The server returns messages
-      // oldest-first within the page, so concatenation in
-      // the order [older..., existing...] preserves the
-      // global oldest-first ordering.
+      // oldest-first within the page. We dedup by seq
+      // (or id fallback) and re-sort so an overlapping
+      // page — e.g. the pre-2026-07-10 server cursor bug
+      // where oldest_id was the page's max id and the
+      // next page overlapped by all-but-one row — doesn't
+      // add visible duplicates. The server-side fix
+      // (handler.go: rowIDs[0]) makes the overlap empty;
+      // this client dedup is the safety net for any
+      // future regression.
       const existing = state.sessionMessages[id] || []
-      state.sessionMessages[id] = [...r.messages, ...existing]
+      state.sessionMessages[id] = dedupMessagesByKey(existing, r.messages)
     }
+    paging.oldestSeq = r.oldest_seq ?? paging.oldestSeq
     paging.oldestId = r.oldest_id
     paging.hasMore = r.has_more
     return r.has_more
@@ -424,10 +519,7 @@ export async function deleteSessionById(id: string) {
     if (a._blobURL) URL.revokeObjectURL(a._blobURL)
   }
   delete state.pendingAttachments[id]
-  if (state.pendingQuestion[id]) {
-    state.pendingQuestion[id].resolve({})  // unblock any awaiter
-    delete state.pendingQuestion[id]
-  }
+  delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
     for (const pc of cfms) pc.resolve(false)
@@ -626,6 +718,86 @@ function findOrCreateLastAssistant(id: string): Message {
   return m
 }
 
+// findTrailingOpenQuestion walks the trailing assistant
+// message's parts from the end and returns the first
+// question part with `question_status === 'open'` (or
+// unset, which is treated as "open" for legacy data).
+// Returns null if there isn't one.
+//
+// Used by the question SSE handler: when the tool result
+// comes back with `answers` filled in, we update the
+// existing question part in place rather than appending a
+// duplicate.
+function findTrailingOpenQuestion(id: string): any | null {
+  const msgs = state.sessionMessages[id]
+  if (!msgs || msgs.length === 0) return null
+  const m = msgs[msgs.length - 1]
+  if (!m || m.role !== 'assistant' || !m.parts) return null
+  return findOpenQuestionInParts(m.parts)
+}
+
+// findOpenQuestionInParts is the part-array-only
+// counterpart of findTrailingOpenQuestion. Used by the
+// question handler for sub-agent flows where the trailing
+// part list is `sub.parts`, not the parent message's parts.
+function findOpenQuestionInParts(parts: MessagePart[] | undefined): any | null {
+  if (!parts) return null
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p: any = parts[i]
+    if (p.kind !== 'question') continue
+    if (!p.question_status || p.question_status === 'open') return p
+  }
+  return null
+}
+
+// updateQuestionStatusInParts walks `parts` from the end
+// and stamps every still-open question part with the
+// provided answer map + status. Used by the question
+// tool's result event (which carries the full
+// `{questions, answers}` payload) so the QuestionTable
+// in the chat can render the user's picks highlighted.
+//
+// The mapping uses the `header` field as the key — that
+// is what the question tool's answer side (`answers` map)
+// keys against. Question parts that have no matching
+// answer in the map (e.g. the LLM added a question mid-
+// stream that the user never saw) are left alone so we
+// don't accidentally mark a phantom answer.
+function updateQuestionStatusInParts(
+  parts: MessagePart[],
+  answers: Record<string, string>,
+  status: 'ok' | 'error',
+): number {
+  let updated = 0
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p: any = parts[i]
+    if (p.kind !== 'question') continue
+    if (p.question_status && p.question_status !== 'open') continue
+    // Match by header (the question tool keys answers by
+    // header, not by full question text). If a part has no
+    // match, leave it alone — it might be a stale or
+    // out-of-band question.
+    let matched = false
+    if (p.text) {
+      try {
+        const payload = JSON.parse(p.text)
+        const qs = payload?.questions || []
+        for (const q of qs) {
+          if (q && q.header && Object.prototype.hasOwnProperty.call(answers, q.header)) {
+            matched = true
+            break
+          }
+        }
+      } catch { /* malformed text, skip */ }
+    }
+    if (!matched) continue
+    p.name = JSON.stringify(answers)
+    p.question_status = status
+    updated++
+  }
+  return updated
+}
+
 // findOrCreateSubAgent locates the trailing sub_agent
 // part matching `task` inside an assistant message,
 // creating it if missing. Sub-agents are not nested
@@ -725,24 +897,52 @@ function appendToSubAgent(
 // the Vue render pass.
 //
 // Matches: "Cannot read <anything-up-to-400-chars> Inform the
-// user." (case-insensitive, dotall).
-const PHANTOM_RE = /Cannot read[\s\S]{0,400}?Inform the user\.?/i
+// user." (case-insensitive, dotall, GLOBAL). The `g` flag is
+// critical: the LLM can emit the phantom multiple times in a
+// single text part (e.g. after a stuck retry loop) and the user
+// used to see the first one replaced while 2+ raw phantoms
+// leaked through. With `g` every match in the string is
+// replaced in a single pass.
+const PHANTOM_RE = /Cannot read[\s\S]{0,400}?Inform the user\.?/gi
 const PHANTOM_REPLACEMENT =
   '（当前模型不支持读取图片。请在「设置 → 提供商/模型」中切换到支持视觉的模型后重新发送。）'
+
+// Secondary pattern: the LLM sometimes paraphrases the phantom
+// as "This model does not support <X>" without ever saying
+// "Cannot read" — usually when reporting an unsupported
+// capability to the user. Caught by the same redactor so the
+// user doesn't see a half-formed version of the original
+// message.
+const PHANTOM_RE_ALT = /This model does not support[\s\S]{0,200}?\./gi
 
 /** Returns true if `s` contains a phantom error pattern. */
 function containsPhantomError(s: string): boolean {
   if (!s) return false
-  return PHANTOM_RE.test(s)
+  // Reset lastIndex on the global regex before testing —
+  // PHANTOM_RE has the `g` flag, and `RegExp.test()` is
+  // stateful: after a successful match, lastIndex is
+  // updated and the next test() call resumes from there.
+  // Without this reset, repeated calls with different
+  // strings would alternate between true/false depending
+  // on whether the last test advanced past the input's
+  // length. Use exec + reset for a stateless check.
+  const m = PHANTOM_RE.exec(s)
+  PHANTOM_RE.lastIndex = 0
+  return m !== null
 }
 
 /** Replaces every phantom-error match in `s` with the
  *  user-facing Chinese message. Returns the (possibly
- *  unchanged) string. */
+ *  unchanged) string. Both patterns are applied globally
+ *  (the `g` flag on each regex) so multiple occurrences in
+ *  the same chunk are all replaced — the previous
+ *  non-global version only caught the first one, which is
+ *  how a stuck LLM retry loop would leak 2-3 raw phantoms
+ *  through per turn. */
 function scrubPhantomError(s: string): string {
   if (!s) return s
   if (!containsPhantomError(s)) return s
-  return s.replace(PHANTOM_RE, PHANTOM_REPLACEMENT)
+  return s.replace(PHANTOM_RE, PHANTOM_REPLACEMENT).replace(PHANTOM_RE_ALT, PHANTOM_REPLACEMENT)
 }
 
 /** Walks a message and every nested part, scrubbing any
@@ -782,7 +982,7 @@ function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null
   //
   //  1. scrub the incoming delta (catches the case where
   //     a single delta *is* the phantom).
-  //  2. AFTER appending, check the last ~600 chars of the
+  //  2. AFTER appending, check the last ~1500 chars of the
   //     trailing text part. This catches the case where
   //     the phantom is split across multiple deltas
   //     (e.g. "Cannot read" arrives in delta N, and
@@ -790,29 +990,48 @@ function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null
   //     per-delta scrub misses it, but the buffer
   //     catches it once both pieces are assembled).
   //
+  // The buffer was raised from 600 → 1500 chars to catch
+  // multi-phantom bursts: a stuck LLM retry loop can emit
+  // "ERROR: ... Inform the user." three times in a row,
+  // each separated by ~400 chars of boilerplate ("Let me
+  // try again. "). With a 600-char buffer only the last
+  // phantom would be caught, leaking the first two.
+  //
   // We append the raw delta first (so the user sees
-  // text streaming in real time), then scrub the last
-  // 600 chars. The scrub is synchronous so Vue's next
+  // text streaming in real time), then scrub the buffer
+  // globally. The scrub is synchronous so Vue's next
   // tick won't render the phantom.
   if (parts.length === 0 || parts[parts.length - 1].kind !== 'text') {
     parts.push({ kind: 'text', text: scrubPhantomError(delta) })
   } else {
     const last = parts[parts.length - 1] as any
     last.text = (last.text || '') + delta
-    // Buffer-based scrub for split phantoms.
-    const buf = last.text.length > 600 ? last.text.slice(-600) : last.text
-    const m = PHANTOM_RE.exec(buf)
-    if (m) {
-      const matchStartInBuf = m.index
-      const matchEndInBuf = m.index + m[0].length
-      const totalLen = last.text.length
-      const bufStartInText = totalLen - buf.length
-      const absStart = bufStartInText + matchStartInBuf
-      const absEnd = bufStartInText + matchEndInBuf
-      last.text = last.text.slice(0, absStart) + PHANTOM_REPLACEMENT + last.text.slice(absEnd)
+    // Buffer-based scrub for split phantoms. Use the
+    // scrub helper (which is already global) on the buffer
+    // so all matches in the visible window are caught in
+    // one pass, instead of stopping at the first match.
+    const buf = last.text.length > 1500 ? last.text.slice(-1500) : last.text
+    if (containsPhantomError(buf)) {
+      const scrubbedBuf = scrubPhantomError(buf)
+      if (scrubbedBuf !== buf) {
+        last.text = last.text.slice(0, last.text.length - buf.length) + scrubbedBuf
+      }
     }
   }
-  m.content += scrubPhantomError(delta)
+  // `m.content` is intentionally NOT updated from the
+  // delta. The MessageBubble component renders assistant
+  // messages off `message.parts` exclusively (see
+  // MessageBubble.vue:601-623), and reload brings the
+  // parts back from the server's `meta["parts"]` blob —
+  // so the live-streaming `m.content` is never read by
+  // the UI. Maintaining it here would be a no-op that
+  // costs a `scrubPhantomError` regex per chunk. The
+  // legacy code path that DID read `m.content` (the
+  // v-else-if "message.content" markdown fallback) only
+  // fires when `message.parts` is empty, which never
+  // happens for messages that have ever streamed
+  // through appendTextPart (parts is always seeded
+  // before the first content event).
 }
 
 function appendThinkingPart(m: Message, delta: string, target?: MessagePart[] | null) {
@@ -888,14 +1107,39 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // before any content deltas), create one. The replacement
       // is a full rewrite — the stream is already over by the
       // time the redactor runs, so no streaming flag is needed.
+      //
+      // Multi-round note: when the agent loop runs several
+      // rounds in a single response, each round's text lives
+      // in its own text part. The backend's per-round
+      // `redactPhantomErrors` only cleans the current round,
+      // so earlier rounds' phantoms (if any slipped through
+      // the per-delta scrub) would still be visible. We walk
+      // every text/thinking part in the message and run
+      // scrubPhantomError on each — cheap (regex only runs
+      // when containsPhantomError returns true) and closes
+      // the multi-phantom leak that was producing 3 raw
+      // errors in a single user-facing bubble.
       if (!ev.content) break
       const cleanedContent = scrubPhantomError(ev.content)
       const parts = sub ? sub.parts : m.parts!
+      // Apply the explicit rewrite to the trailing text part.
       const last = parts[parts.length - 1]
       if (last && last.kind === 'text') {
         last.text = cleanedContent
       } else {
         parts.push({ kind: 'text', text: cleanedContent })
+      }
+      // Defensive: re-scrub every text/thinking part in the
+      // message in case earlier rounds slipped a phantom
+      // past the per-delta scrub.
+      for (const p of parts) {
+        if (p.kind === 'text' && p.text) {
+          const c = scrubPhantomError(p.text)
+          if (c !== p.text) p.text = c
+        } else if (p.kind === 'thinking' && p.text) {
+          const c = scrubPhantomError(p.text)
+          if (c !== p.text) p.text = c
+        }
       }
       break
     }
@@ -1006,6 +1250,56 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             elapsed: ev.tool_elapsed,
           })
         }
+        // Question tool answer carry-through: the question
+        // tool returns `{questions, answers}` JSON via the
+        // tool result, NOT via the question event (the
+        // question event is only fired for the prompt).
+        // Mirror the answers onto the trailing open question
+        // part so the QuestionTable in the chat shows the
+        // user's picks highlighted. Without this the question
+        // card would sit there as "等待回答" forever (the live
+        // message has no way to know the user answered
+        // until the server emits a content_rewrite or the
+        // page is reloaded).
+        //
+        // The match is "trailing open question part" because
+        // the question tool always pairs with a question
+        // event that pushed an open part into the same parts
+        // list (main or sub-agent). Multi-question turns are
+        // handled by updateQuestionStatusInParts walking
+        // back through all open question parts and assigning
+        // the answer map by header — the question tool's
+        // result is the FULL answer set across all questions
+        // in the call.
+        //
+        // CRITICAL: the question tool's answers sit at the
+        // END of the result JSON (after questions + options),
+        // and the server truncates `tool_result` to 300
+        // chars (see agent.go:1860-1864). A 4-option question
+        // already blows past 300 chars on its own, so the
+        // `answers` map almost always falls off the end of
+        // the truncated preview. We must use the untruncated
+        // `tool_result_full` (see client.ts:861-867) — it
+        // carries the full payload with answers intact. Fall
+        // back to tool_result only if the full payload is
+        // missing (older server versions that don't emit it).
+        if (ev.tool_name === 'question') {
+          const raw = ev.tool_result_full || ev.tool_result
+          if (raw) {
+            const targetParts = sub ? sub.parts : m.parts
+            if (targetParts) {
+              try {
+                const payload = JSON.parse(raw) as { questions?: any[]; answers?: Record<string, string> }
+                if (payload && payload.answers && Object.keys(payload.answers).length > 0) {
+                  updateQuestionStatusInParts(targetParts, payload.answers, 'ok')
+                }
+              } catch {
+                // Malformed result — leave the question part
+                // alone; it will be re-decoded on reload.
+              }
+            }
+          }
+        }
       }
       // Sync todo list from todo_write tool results. Prefer
       // the untruncated tool_result_full (newlines intact, no
@@ -1042,9 +1336,15 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         if (ev.sub_agent_model && !sub.agentModel) sub.agentModel = ev.sub_agent_model
       }
       // Surface phase messages as a live status bar.
+      // Cap at 20 entries to bound memory for long-running
+      // sessions that emit many phase events. Older entries
+      // are dropped first; the live status bar only shows the
+      // tail anyway.
       if (ev.message) {
         if (!m._statusText) (m as any)._statusText = []
-        ;(m as any)._statusText.push(ev.message)
+        const arr: string[] = (m as any)._statusText
+        arr.push(ev.message)
+        if (arr.length > 20) arr.shift()
       }
       break
     case 'session_status':
@@ -1075,6 +1375,11 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.elapsed) m.elapsed = ev.elapsed
       if (ev.provider) m.provider = ev.provider
       if (ev.model) m.model = ev.model
+      // Free the per-message live-status array. The stream
+      // is over; the live status bar is no longer shown.
+      // Without this, _statusText would stay around for
+      // the lifetime of the message in the in-memory map.
+      delete (m as any)._statusText
       // Mark all open thinking parts as no longer streaming.
       walkParts(m.parts!, (p) => {
         if (p.kind === 'thinking' && p.streaming) p.streaming = false
@@ -1131,41 +1436,122 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     case 'question':
-      // LLM is asking the user a question. Parse the
-      // question JSON and surface it via QuestionModal.
-      // Keyed by session id so a background session's
-      // question doesn't appear (or get answered) on the
-      // session the user happens to be viewing.
-      console.log('[chat] received question event, question_json length:', ev.question_json?.length ?? 0)
-      if (ev.question_json) {
-        try {
-          const questions: QuestionItem[] = JSON.parse(ev.question_json)
-          console.log('[chat] parsed %d questions', questions.length)
-          // Create a Promise that resolves when the user answers.
-          const answerPromise = new Promise<Record<string, string>>((resolve) => {
-            state.pendingQuestion[id] = { questions, resolve }
-          })
-          // 提示音 + 系统通知：LLM 提问
+      // The LLM is asking the user a question. Two emit
+      // shapes from the server (see internal/tool/question.go
+      // WaitForAnswer + agent.go's partsAcc.update for the
+      // gory details):
+      //
+      //   Prompt (before user answers):
+      //     sendFn(json.Marshal(questions))  →  "[{...},{...}]"  (array)
+      //
+      //   Result (after user answers, re-sent with
+      //   answers filled in via QuestionResponse):
+      //     sendFn(json.Marshal(QuestionResponse))  →
+      //     '{"questions":[{...}], "answers":{...}}'  (object)
+      //
+      // We normalise both shapes to { questions, answers }
+      // and store the question part's `text` field in the
+      // canonical {questions:[...]} object shape so
+      // QuestionTable.vue's `JSON.parse(text)?.questions`
+      // keeps working on reload.
+      if (!ev.question_json) {
+        console.warn('[chat] question event with no question_json')
+        break
+      }
+      try {
+        const raw = JSON.parse(ev.question_json) as
+          | QuestionItem[]
+          | { questions?: QuestionItem[]; answers?: Record<string, string> }
+        const isObject = raw && typeof raw === 'object' && !Array.isArray(raw)
+        const payload = isObject
+          ? { questions: (raw as any).questions || [], answers: (raw as any).answers }
+          : { questions: raw as QuestionItem[], answers: undefined }
+        const partText = JSON.stringify({ questions: payload.questions })
+        const hasAnswers = !!(payload.answers && Object.keys(payload.answers).length > 0)
+
+        // The question part lives in the trailing
+        // assistant message (the `m` returned by
+        // findOrCreateLastAssistant at the top of
+        // appendStreamEvent). If the question came from a
+        // sub-agent, we ALSO push it into the sub-agent's
+        // parts so the question card sits next to the
+        // sub-agent's other output. Either way the modal
+        // pops — sub-agent questions still need a user
+        // answer to unblock the tool call, and the
+        // submitQuestionAnswer posts to api.submitQuestionResponse
+        // keyed by sessionId, so the answer routes back to
+        // whichever question is pending on that session.
+        const targetParts = sub ? sub.parts : m.parts
+
+        if (hasAnswers) {
+          // ── Result-with-answers: update the trailing
+          // open question part in place. Don't pop the
+          // modal — submitQuestionAnswer() already
+          // resolved the user's intent and dismissed
+          // it.
+          const tail = sub
+            ? findOpenQuestionInParts(sub.parts)
+            : findTrailingOpenQuestion(id)
+          if (tail) {
+            tail.text = partText
+            tail.name = JSON.stringify(payload.answers)
+            tail.question_status = 'ok'
+          }
+        } else {
+          // ── Question prompt: push a new question part
+          // (status = "open") and surface the modal. We
+          // always assign a FRESH object so Vue's
+          // computed `currentPendingQuestion` re-evaluates
+          // even if an earlier pendingQuestion for the
+          // same session had an identical-shaped payload
+          // (a fresh object reference forces the
+          // computed to produce a new value).
+          if (targetParts) {
+            targetParts.push({
+              kind: 'question',
+              text: partText,
+              question_status: 'open',
+            } as any)
+          }
+          // Surface the modal regardless of sub-agent —
+          // sub-agent questions are still interactive.
+          // The modal is keyed off state.currentID, so a
+          // question from a background session won't pop
+          // the modal on the foreground view.
+          state.pendingQuestion[id] = {
+            questions: payload.questions || [],
+          }
           notifyManager.play('question')
           notifyManager.notify('P-Chat', '向您提问')
-          // The answer will be submitted via submitQuestionAnswer().
-        } catch {
-          console.error('[question] failed to parse question_json:', ev.question_json?.slice(0, 200))
         }
-      } else {
-        console.warn('[chat] question event with no question_json')
+      } catch (e) {
+        console.error('[question] failed to parse question_json:', ev.question_json?.slice(0, 200), e)
       }
       break
     case 'tool_confirm':
       if (ev.tool_confirm_json) {
         try {
-          const cfm = JSON.parse(ev.tool_confirm_json) as { tool_name: string; args: string; reason: string }
+          // 2026-07: the server now emits more fields on
+          // the confirm payload. We parse the optional
+          // ones defensively so an older server that
+          // doesn't send them still works.
+          const cfm = JSON.parse(ev.tool_confirm_json) as {
+            tool_name: string
+            args: string
+            reason: string
+            resolved_path?: string
+            path_class?: string
+            risk_level?: string
+          }
           new Promise<boolean>((resolve) => {
             if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
             state.pendingConfirm[id].push({
               toolName: cfm.tool_name,
               args: cfm.args,
               reason: cfm.reason,
+              resolvedPath: cfm.resolved_path,
+              pathClass: cfm.path_class,
+              riskLevel: cfm.risk_level,
               resolve,
             })
           }).then((approved) => {
@@ -1276,24 +1662,33 @@ export function endStream(id: string) {
 }
 
 export function submitQuestionAnswer(answers: Record<string, string>) {
-  // Always answer the question that belongs to the *session
-  // that asked it* — not whatever session the user happens to
-  // be viewing. The sessionID is captured in the question
-  // event's key; we just look it up here.
-  for (const [sid, pq] of Object.entries(state.pendingQuestion)) {
-    if (pq) {
-      const id = sid
-      delete state.pendingQuestion[id]
-      // Resolve the Promise so the LLM continues.
-      pq.resolve(answers)
-      // POST the answer to the server so the blocked tool handler
-      // receives it and the agent loop continues.
-      api.submitQuestionResponse(id, {
-        questions: pq.questions,
-        answers,
-      })
-      return
+  const pq = state.pendingQuestion[state.currentID]
+  if (pq) {
+    const id = state.currentID
+    delete state.pendingQuestion[id]
+    // Update the trailing open question part in the chat
+    // immediately so the user sees their picks highlighted
+    // the moment they submit. The tool result event will
+    // (eventually) re-stamp the same part, but waiting for
+    // it is racy in pchat-gui: the question event and the
+    // tool result event can race, and the tool result can
+    // even be dropped if the SSE stream is interrupted. By
+    // stamping here, the chat UI is correct the instant the
+    // modal closes, regardless of what happens downstream.
+    const msgs = state.sessionMessages[id]
+    if (msgs) {
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i]
+        if (m.role === 'assistant' && m.parts) {
+          updateQuestionStatusInParts(m.parts, answers, 'ok')
+          break
+        }
+      }
     }
+    api.submitQuestionResponse(id, {
+      questions: pq.questions,
+      answers,
+    })
   }
 }
 
@@ -1306,13 +1701,11 @@ async function submitConfirmResponseInner(id: string, approved: boolean) {
 }
 
 export function submitToolConfirm(approved: boolean) {
-  for (const [sid, items] of Object.entries(state.pendingConfirm)) {
-    if (items && items.length > 0) {
-      const pc = items.shift()!
-      if (items.length === 0) delete state.pendingConfirm[sid]
-      pc.resolve(approved)
-      return
-    }
+  const items = state.pendingConfirm[state.currentID]
+  if (items && items.length > 0) {
+    const pc = items.shift()!
+    if (items.length === 0) delete state.pendingConfirm[state.currentID]
+    pc.resolve(approved)
   }
 }
 

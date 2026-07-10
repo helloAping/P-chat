@@ -134,12 +134,20 @@ export type MessagePart =
       kind: 'question'
       text: string       // questions JSON
       name?: string      // answers JSON (when answered)
+      // Lifecycle: "open" = the LLM is waiting for the user
+      // to pick; "ok" = user has answered (Name carries the
+      // answers JSON); "error" = round ended without an
+      // answer (timeout / cancel). Defaults to "open" when
+      // the part is loaded from older history that didn't
+      // persist the field.
+      question_status?: 'open' | 'ok' | 'error'
     }
 
 export type SubAgentPart = Extract<MessagePart, { kind: 'sub_agent' }>
 export type ToolPart = Extract<MessagePart, { kind: 'tool' }>
 export type TextPart = Extract<MessagePart, { kind: 'text' }>
 export type ThinkingPart = Extract<MessagePart, { kind: 'thinking' }>
+export type QuestionPart = Extract<MessagePart, { kind: 'question' }>
 
 export interface TodoItem {
   id: string
@@ -149,6 +157,18 @@ export interface TodoItem {
 
 export interface Message {
   id?: number
+  // Per-conversation logical position. The new stable
+  // identity for any cross-render / cross-rollback
+  // reference: Vue :key, pagination cursor, undo
+  // payload. `id` is the SQLite row id (AUTOINCREMENT,
+  // never reused — so it changes after a rollback/undo
+  // round-trip). `seq` is the per-conversation position
+  // 1..N within a session and survives rollback/undo.
+  // The frontend prefers `seq` for any identity that
+  // must survive a rollback. Older messages loaded
+  // from a pre-seq database have `seq = 0` — the
+  // dedup/key paths fall back to `id` in that case.
+  seq?: number
   role: 'user' | 'assistant' | 'tool' | 'system'
   msg_type?: number
   // For user / system messages this is the text body.
@@ -190,6 +210,11 @@ export interface Message {
   // Live status text during streaming (populated by
   // appendStreamEvent from phase events).
   _statusText?: string[]
+  // Whether the row should be included when building the
+  // LLM conversation context. 0=display-only (thinking,
+  // raw command output), 1=context. Carried through
+  // rollback/undo so the value survives a round-trip.
+  submit_to_llm?: number
 }
 
 export interface SessionMeta {
@@ -478,11 +503,18 @@ export const setMCPGlobal = (enabled: boolean) =>
 // --- Messages ---
 
 // PageOpts controls infinite-scroll history loading.
-// beforeId: the lowest row id from the previous page; pass 0
-//   (or omit) for the most recent page.
-// limit: page size. The server applies the per-session context
-//   cap when 0 is passed.
+// beforeSeq: the lowest seq from the previous page; preferred
+//   cursor (stable across rollback/undo). Pass 0 to get the
+//   most recent page.
+// beforeId: legacy id-based cursor. Kept for back-compat
+//   with older server versions. Becomes stale after a
+//   rollback/undo because the SQLite id is never reused.
+// limit: page size. The server applies the per-session
+//   context cap when 0 is passed.
+//
+// If both beforeSeq and beforeId are set, beforeSeq wins.
 export interface PageOpts {
+  beforeSeq?: number
   beforeId?: number
   limit?: number
 }
@@ -490,18 +522,25 @@ export interface PageOpts {
 export interface ListMessagesResult {
   messages: Message[]
   has_more: boolean
-  // The id to pass as `beforeId` on the next page request.
-  // Always the smallest row id in `messages`. 0 when the
-  // returned page is empty.
+  // oldest_seq: the lowest seq in `messages` (preferred
+  // cursor). Pass as `beforeSeq` on the next page request.
+  // Always 0 when the returned page is empty.
+  oldest_seq: number
+  // oldest_id: legacy id-based cursor. Kept for back-compat.
+  // Always the smallest row id in `messages`; 0 when empty.
   oldest_id: number
 }
 
 // listMessages fetches a page of session history. Omit
 // `opts` to get the full history (first open after reload —
 // the server applies the context-window cap automatically).
+// When opts.beforeSeq is set the server uses the seq-based
+// SQL filter; when only opts.beforeId is set, it uses the
+// id-based filter (legacy).
 export const listMessages = (id: string, opts?: PageOpts) => {
   const q = new URLSearchParams()
-  if (opts?.beforeId && opts.beforeId > 0) q.set('before_id', String(opts.beforeId))
+  if (opts?.beforeSeq && opts.beforeSeq > 0) q.set('before_seq', String(opts.beforeSeq))
+  else if (opts?.beforeId && opts.beforeId > 0) q.set('before_id', String(opts.beforeId))
   if (opts?.limit && opts.limit > 0) q.set('limit', String(opts.limit))
   const qs = q.toString()
   return jsonFetch<ListMessagesResult>(
@@ -943,8 +982,48 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   // Network Access friction from the wails.localhost origin and
   // times out. The Go binding is a direct in-process call — no
   // CORS, no buffering beyond the standard chunked transfer.
-  const { StreamMessages, CancelStream } = await import('../../wailsjs/go/main/App')
-  const { EventsOn, EventsOff } = await import('../../wailsjs/runtime/runtime')
+  //
+  // Browser fallback: when the Wails runtime isn't available
+  // (e.g. dev server with PCHAT_WEB_DIR pointing at web/, or a
+  // user opening the app in a plain browser tab to smoke-test
+  // the question modal), EventsOn's stub ends up calling
+  // `window.runtime.EventsOnMultiple(...)` which throws
+  // "Cannot read properties of undefined (reading
+  // 'EventsOnMultiple')" the moment it runs. The Wails
+  // shim defines the function but its body is a hard runtime
+  // dereference — so checking `typeof === 'function'` is a
+  // false positive. We probe by *calling* the function with
+  // a no-op handler; if it throws, the runtime is unavailable
+  // and we fall back to direct fetch() against the same-origin
+  // backend. The browser preview path is good enough for
+  // visual testing (pchat-server's c.Stream flushes after
+  // every event, so the SSE body streams live without the
+  // Wails-side buffering that motivated the original Go
+  // binding).
+  let hasWails = false
+  try {
+    const wailsRuntime = await import('../../wailsjs/runtime/runtime')
+    const wailsApp = await import('../../wailsjs/go/main/App')
+    // Probe EventsOn: if `window.runtime` is undefined, the
+    // call throws synchronously and we land in catch.
+    wailsRuntime.EventsOn('__pchat_probe__', () => {})
+    // Also confirm StreamMessages is callable; some Wails
+    // builds export a stub that throws on call.
+    if (typeof wailsApp.StreamMessages === 'function') {
+      hasWails = true
+    }
+  } catch {
+    hasWails = false
+  }
+
+  if (!hasWails) {
+    return streamMessagesViaFetch(sessionId, opts)
+  }
+
+  const wailsRuntime = await import('../../wailsjs/runtime/runtime')
+  const wailsApp = await import('../../wailsjs/go/main/App')
+  const { EventsOn, EventsOff } = wailsRuntime
+  const { StreamMessages, CancelStream } = wailsApp
 
   const body = JSON.stringify({
     message: opts.message,
@@ -1008,6 +1087,86 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   }
   offEvent()
   offEnd()
+}
+
+// streamMessagesViaFetch is the same-origin fetch() fallback used
+// when the Wails runtime is unavailable. The server's handler.go
+// streaming endpoint emits `data: <json>\n\n` per event and
+// flushes after every event, so the body streams live without
+// buffering (this is the exact constraint that motivated the
+// Wails binding originally; pchat-server's c.Stream + Flusher
+// honors it on the server side).
+//
+// We parse the SSE envelope locally and forward each event
+// payload to opts.onEvent the same way the Wails path does, so
+// the chat store's appendStreamEvent handler is unchanged. No
+// session id wrapping is needed here (the server is the one
+// originating the stream for this request, so the events
+// already belong to this session).
+async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Promise<void> {
+  const base = directBackendURL()
+  const url = `${base}/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`
+  const body = JSON.stringify({
+    message: opts.message,
+    provider: opts.provider,
+    model: opts.model,
+    style: opts.style,
+    attachments: opts.attachments,
+    skill_context: opts.skill_context || '',
+  })
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    body,
+    signal: opts.signal,
+  })
+  if (!resp.ok || !resp.body) {
+    throw new Error(`stream: HTTP ${resp.status}: ${resp.statusText}`)
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buf = ''
+  let dataBuf = ''
+  let done = false
+
+  while (!done) {
+    const r = await reader.read()
+    done = r.done
+    if (r.value) {
+      buf += decoder.decode(r.value, { stream: true })
+    }
+    // Drain complete `data: ...\n\n` blocks from the buffer.
+    let nl: number
+    while ((nl = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, nl)
+      buf = buf.slice(nl + 2)
+      // Parse the block — gather every `data: …` line.
+      dataBuf = ''
+      for (const line of block.split('\n')) {
+        if (line.startsWith('data:')) {
+          if (dataBuf.length > 0) dataBuf += '\n'
+          dataBuf += line.slice(5).trimStart()
+        }
+      }
+      const data = dataBuf.trim()
+      if (!data || data === '[DONE]') continue
+      let ev: StreamEvent
+      try { ev = JSON.parse(data) as StreamEvent } catch {
+        console.warn('SSE parse error', 'raw:', data.slice(0, 200))
+        continue
+      }
+      try {
+        opts.onEvent(ev)
+      } catch (inner) {
+        console.warn('[stream] event handler threw, continuing:', inner)
+      }
+    }
+  }
 }
 
 // streamWithRetry wraps streamMessages with up to 2 reconnect
@@ -1207,3 +1366,58 @@ export const updateSystemConfig = (patch: Record<string, unknown>) =>
     method: 'PATCH',
     body: JSON.stringify(patch),
   })
+
+// ---- Web search settings ----
+
+export interface WebSearchSettings {
+  enabled: boolean
+  provider: string
+  // `has_key` is true when the server has a key stored; the
+  // actual key is never returned. To replace, send a new
+  // `api_key` in the PUT body; to delete, set
+  // `clear_api_key: true`.
+  has_key: boolean
+  base_url?: string
+  path?: string
+  topic?: string
+  daily_quota: number
+  request_timeout: string
+  used_today: number
+  resets_at: string // ISO 8601
+}
+
+export const getWebSearchSettings = () =>
+  jsonFetch<WebSearchSettings>('/api/v1/settings/web_search')
+
+export interface UpdateWebSearchRequest {
+  enabled?: boolean
+  provider?: string
+  // When set, the server stores this as the new API key.
+  // An empty string is treated as "no change" — use
+  // `clear_api_key: true` to actually delete the key.
+  api_key?: string
+  clear_api_key?: boolean
+  base_url?: string
+  path?: string
+  topic?: string
+  daily_quota?: number
+  request_timeout?: string
+}
+
+export const updateWebSearchSettings = (patch: UpdateWebSearchRequest) =>
+  jsonFetch<WebSearchSettings>('/api/v1/settings/web_search', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  })
+
+// Test the provider connection without consuming the daily
+// quota. Returns { ok: true, provider, result_count } on
+// success, or { ok: false, error } on failure.
+export const testWebSearchConnection = () =>
+  jsonFetch<{ ok: boolean; provider?: string; result_count?: number; error?: string }>(
+    '/api/v1/settings/web_search/test',
+    { method: 'POST' },
+  )
+
+
+

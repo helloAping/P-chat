@@ -37,6 +37,17 @@ type Conversation struct {
 // Message is one entry in a conversation's history.
 type Message struct {
 	ID             int64     `json:"id"`
+	// Seq is the per-conversation logical position
+	// (1..N within a session). Unlike `id` (a global
+	// AUTOINCREMENT that's never reused), seq survives
+	// rollback/undo: the undo path INSERTs restored rows
+	// with their caller-supplied seq, so a restored
+	// message has the same identity it had before the
+	// rollback. The pagination cursor and the rollback
+	// anchor both use seq in preference to id. See
+	// migration 8 (add_message_seq) for the schema
+	// addition and backfill strategy.
+	Seq            int64     `json:"seq,omitempty"`
 	ConversationID string    `json:"conversation_id"`
 	Role           string    `json:"role"`
 	Content        string    `json:"content"`
@@ -70,6 +81,7 @@ type SearchResult struct {
 type Store struct {
 	db         *sql.DB
 	dbPath     string // filesystem path, set by OpenAt (empty for in-memory)
+	closed     atomic.Bool // set by Close; readers reject when true
 	mu         sync.Mutex
 	currentID  string
 	maxHistory int
@@ -149,11 +161,33 @@ func OpenAt(dbPath string, maxHistory int) (*Store, error) {
 
 // Close flushes pending writes and closes the database.
 func (s *Store) Close() error {
+	// Idempotent: double-Close should be safe (the underlying
+	// sql.DB returns an error on double-Close which we swallow).
+	if s.closed.Swap(true) {
+		return nil
+	}
 	s.flushOnce.Do(func() { close(s.stopCh) })
+	// Flush after the closed flag is set so any in-flight
+	// AddMessage that races with Close writes its pending
+	// message into the closed store — at that point the DB is
+	// still open, so the write succeeds. Future AddMessage
+	// calls would be after Close and would observe the closed
+	// flag if we add such a check.
 	if err := s.Flush(); err != nil {
 		return err
 	}
 	return s.db.Close()
+}
+
+// Ping verifies the underlying SQLite connection is alive.
+// Used by the /health endpoint to surface "DB wedged" as a
+// 503 to load balancers rather than serving traffic that
+// will fail at the next query. Cheap (a single SELECT 1).
+func (s *Store) Ping() error {
+	if s.closed.Load() {
+		return fmt.Errorf("store closed")
+	}
+	return s.db.Ping()
 }
 
 func ensureDir() error {
@@ -413,6 +447,24 @@ func (s *Store) HasOlderMessages(convID string, oldestID int64) bool {
 	return exists
 }
 
+// HasOlderMessagesBySeq is the seq-based counterpart of
+// HasOlderMessages. The seq cursor is stable across
+// rollback+undo (per-conversation, never reused), so the
+// seq-based check is the right one for the new cursor.
+// Backed by the idx_messages_conv_seq index, so it's the
+// same cost as the id-based check.
+func (s *Store) HasOlderMessagesBySeq(convID string, oldestSeq int64) bool {
+	if convID == "" || oldestSeq <= 0 {
+		return false
+	}
+	var exists bool
+	_ = s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ? AND seq < ?)`,
+		convID, oldestSeq,
+	).Scan(&exists)
+	return exists
+}
+
 // GetChatMessagesWithMeta returns ChatMessage history alongside
 // raw metadata strings and creation timestamps.
 func (s *Store) GetChatMessagesWithMeta() ([]llm.ChatMessage, []string, []int64) {
@@ -428,7 +480,7 @@ func (s *Store) GetChatMessagesWithMetaN(limit int) ([]llm.ChatMessage, []string
 // GetChatMessagesWithMetaFor is the multi-session-safe variant.
 // Pass the conversation id explicitly; empty id returns nil.
 func (s *Store) GetChatMessagesWithMetaFor(convID string, limit int) ([]llm.ChatMessage, []string, []int64) {
-	msgs, metas, createds, _ := s.GetChatMessagesWithMetaPage(convID, 0, limit)
+	msgs, metas, createds, _, _ := s.GetChatMessagesWithMetaPage(convID, 0, limit)
 	return msgs, metas, createds
 }
 
@@ -443,12 +495,15 @@ func (s *Store) GetChatMessagesWithMetaFor(convID string, limit int) ([]llm.Chat
 // limit (e.g. 50) so the response is bounded.
 //
 // The fourth return value is the list of SQLite row ids
-// (parallel to msgs / metas / createds). The frontend uses
-// them as the `before_id` cursor for the next page request.
-func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64) {
+// (parallel to msgs / metas / createds / seqs). The fifth is
+// the per-conversation seq — the API exposes both for
+// backwards compat: id is kept for the legacy `before_id`
+// cursor while seq is the new stable cursor (see migration
+// 8 add_message_seq for the rationale).
+func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64, []int64) {
 	_ = s.Flush()
 	if convID == "" {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 
 	// Two query shapes: with and without the beforeID filter.
@@ -461,21 +516,21 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 	)
 	if beforeID > 0 {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
 			 WHERE conversation_id = ? AND id < ?
 			 ORDER BY id DESC LIMIT ?`,
 			convID, beforeID, limitOrHuge(limit),
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
 			 WHERE conversation_id = ?
 			 ORDER BY id DESC LIMIT ?`,
 			convID, limitOrHuge(limit),
 		)
 	}
 	if err != nil {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	defer rows.Close()
 
@@ -484,6 +539,7 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 		msg     llm.ChatMessage
 		meta    string
 		created int64
+		seq     int64
 	}
 	var rev []row
 	for rows.Next() {
@@ -493,17 +549,22 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 			metaStr               sql.NullString
 			created               int64
 			msgType, submitToLLM  int
+			seq                   sql.NullInt64
 		)
-		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM); err != nil {
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq); err != nil {
 			break
 		}
 		meta := ""
 		if metaStr.Valid {
 			meta = metaStr.String
 		}
+		seqVal := int64(0)
+		if seq.Valid {
+			seqVal = seq.Int64
+		}
 		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
-			rev = append(rev, row{id: id, msg: m, meta: meta, created: created})
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal})
 		}
 	}
 	n := len(rev)
@@ -511,13 +572,108 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 	metas := make([]string, n)
 	createds := make([]int64, n)
 	ids := make([]int64, n)
+	seqs := make([]int64, n)
 	for i := 0; i < n; i++ {
 		out[i] = rev[n-1-i].msg
 		metas[i] = rev[n-1-i].meta
 		createds[i] = rev[n-1-i].created
 		ids[i] = rev[n-1-i].id
+		seqs[i] = rev[n-1-i].seq
 	}
-	return out, metas, createds, ids
+	return out, metas, createds, ids, seqs
+}
+
+// GetChatMessagesWithMetaPageBySeq is the seq-based
+// counterpart of GetChatMessagesWithMetaPage. It returns
+// rows with `seq < beforeSeq` in the same conversation.
+//
+// Why a separate method: the id-based cursor becomes stale
+// after a rollback+undo (restored rows have new ids). The
+// seq-based cursor is stable (seq is per-conversation and
+// never reused), so the API exposes it as the preferred
+// cursor going forward. The id-based method stays for
+// legacy clients.
+//
+// Both methods share the same in-memory layout (parallel
+// slices, oldest-first order). The SQL is just `seq < ?`
+// instead of `id < ?`, indexed by idx_messages_conv_seq
+// (migration 8).
+func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64, []int64) {
+	_ = s.Flush()
+	if convID == "" {
+		return nil, nil, nil, nil, nil
+	}
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if beforeSeq > 0 {
+		rows, err = s.db.Query(
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
+			 WHERE conversation_id = ? AND seq < ?
+			 ORDER BY seq DESC LIMIT ?`,
+			convID, beforeSeq, limitOrHuge(limit),
+		)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
+			 WHERE conversation_id = ?
+			 ORDER BY seq DESC LIMIT ?`,
+			convID, limitOrHuge(limit),
+		)
+	}
+	if err != nil {
+		return nil, nil, nil, nil, nil
+	}
+	defer rows.Close()
+
+	type row struct {
+		id      int64
+		msg     llm.ChatMessage
+		meta    string
+		created int64
+		seq     int64
+	}
+	var rev []row
+	for rows.Next() {
+		var (
+			id                    int64
+			role, content         string
+			metaStr               sql.NullString
+			created               int64
+			msgType, submitToLLM  int
+			seq                   sql.NullInt64
+		)
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq); err != nil {
+			break
+		}
+		meta := ""
+		if metaStr.Valid {
+			meta = metaStr.String
+		}
+		seqVal := int64(0)
+		if seq.Valid {
+			seqVal = seq.Int64
+		}
+		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
+		for _, m := range msgs {
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal})
+		}
+	}
+	n := len(rev)
+	out := make([]llm.ChatMessage, n)
+	metas := make([]string, n)
+	createds := make([]int64, n)
+	ids := make([]int64, n)
+	seqs := make([]int64, n)
+	for i := 0; i < n; i++ {
+		out[i] = rev[n-1-i].msg
+		metas[i] = rev[n-1-i].meta
+		createds[i] = rev[n-1-i].created
+		ids[i] = rev[n-1-i].id
+		seqs[i] = rev[n-1-i].seq
+	}
+	return out, metas, createds, ids, seqs
 }
 
 // encodeChatMeta builds the canonical metadata map for a
@@ -554,11 +710,35 @@ func encodeChatMeta(msg llm.ChatMessage) map[string]string {
 // dbMsgType and dbSubmitToLLM come from the dedicated columns (0 when
 // not yet backfilled); the function falls back to metadata inference
 // when they are zero.
+//
+// The v2 (current) agent write path stores assistant messages as
+// `meta["parts"] = "<json string of []MessagePart>"` with an empty
+// `content` column — the canonical snapshot format written by
+// partsAcc.snapshotStructural. Earlier code only handled the
+// `meta["type"]` (new-format-with-type-key) and the legacy
+// `multi_content` / `tool_calls` shapes, so v2 rows were silently
+// dropped on read. That made `GetChatMessagesWithMeta*` lose
+// every assistant message in the LLM context the moment the agent
+// started persisting parts, which is exactly the point at which
+// the LLM context starts mattering (multi-round tool flows,
+// question cards, sub-agents). The v2 branch added below
+// reconstructs a single ChatMessage with Type=TypeText and the
+// `content` carried over from the row; the full parts array is
+// not needed for LLM context (the LLM only sees text + tool calls
+// + tool results), and the wire UI re-derives the parts via
+// decodePartsFromMeta on the ListMessages path. This keeps the
+// LLM context complete without changing the wire shape.
 func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbSubmitToLLM int) []llm.ChatMessage {
 	if metaStr == "" || metaStr == "{}" {
 		if content != "" {
 			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1}}
 		}
+		// Empty content + empty metadata: there's literally
+		// no message here (shouldn't happen in practice, but
+		// guard rather than panic). Returning nil makes the
+		// row invisible to the LLM — same as before this
+		// fix, but now scoped to the truly-empty case
+		// instead of swallowing the v2 format.
 		return nil
 	}
 
@@ -570,7 +750,60 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 		return nil
 	}
 
-	// New format: metadata has a "type" key.
+	// v2 (current) format: the agent's snapshotStructural
+	// writes `meta["parts"] = "<json of []MessagePart>"` with
+	// the content column holding the denormalized text body.
+	// The content column might be empty for a question-only
+	// assistant turn; the parts blob is the source of truth.
+	// Reconstruct a single text message so the LLM still sees
+	// this turn in its history.
+	if raw, ok := meta["parts"]; ok && raw != "" {
+		// Prefer the row's content column (denormalized
+		// cache) when it has text. Fall back to extracting
+		// the text part from the parts blob. Both are fine
+		// for the LLM.
+		text := content
+		if text == "" {
+			text = extractTextFromPartsBlob(raw)
+		}
+		// Even when the text is empty (a turn whose only
+		// payload is a question card with no prose), the LLM
+		// still needs to see *something* so it remembers
+		// the question. Emit a single text-typed message
+		// with empty content rather than dropping the row.
+		// The downstream tool_result will carry the user's
+		// answer.
+		//
+		// submit_to_llm: trust the column value directly.
+		// The column is NOT NULL DEFAULT 1 (migration 5 +
+		// backfill), so every row has an explicit value
+		// and we can read it verbatim. The pre-fix code
+		// had `sl := 1; if dbSubmitToLLM != 0 { sl = dbSubmitToLLM }`
+		// which silently overrode a deliberate 0 (e.g.
+		// thinking rows, exec_command tool_result rows)
+		// with the default 1, leaking display-only content
+		// into the LLM context on the next read. The C5
+		// commit's rollback round-trip relies on this
+		// (an undone thinking row must round-trip with
+		// submit_to_llm=0, not 1).
+		mt := llm.MsgTypeText
+		if dbMsgType != 0 {
+			mt = dbMsgType
+		}
+		return []llm.ChatMessage{{
+			Role:        role,
+			Type:        llm.TypeText,
+			Content:     text,
+			MsgType:     mt,
+			SubmitToLLM: dbSubmitToLLM,
+		}}
+	}
+
+	// New format with explicit type key (rare — the v2
+	// snapshotStructural path is the dominant one; this
+	// branch is for messages written via the explicit
+	// `type` key, e.g. the question card's standalone
+	// roundtrip if any future writer uses that key).
 	if t, ok := meta["type"]; ok && t != "" {
 		mt, sl := resolveMsgType(t, meta["tool_name"], dbMsgType, dbSubmitToLLM)
 		return []llm.ChatMessage{{
@@ -664,18 +897,66 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 }
 
 // resolveMsgType picks the correct MsgType / SubmitToLLM for a decoded
-// message. Prefer the dedicated DB columns when populated; otherwise
-// infer from the legacy Type string + tool_name.
+// message. The dedicated DB columns (msg_type, submit_to_llm) are
+// the source of truth: every row has explicit values because
+// migration 5 added the columns as NOT NULL DEFAULT 1 and the
+// backfill (migration 6) re-stamped every existing row. The
+// legacy Type-string + tool_name inference is the fallback for
+// pre-migration-5 rows that somehow have empty columns (none
+// should exist, but the safety net stays).
+//
+// Pre-fix the "prefer columns" branch was gated on either
+// column being non-zero, which meant a thinking row
+// (msg_type=0, submit_to_llm=0) fell through to the legacy
+// inference and decoded as a normal text row, leaking the
+// thinking text into the LLM context. The C5 commit's
+// rollback round-trip relies on this NOT happening.
 func resolveMsgType(legacyType, toolName string, dbMsgType, dbSubmitToLLM int) (int, int) {
-	if dbMsgType != 0 || dbSubmitToLLM != 0 {
-		mt := dbMsgType
-		sl := dbSubmitToLLM
-		if mt == 0 {
-			mt = llm.MsgTypeText
-		}
-		return mt, sl
+	// If the row's columns look uninitialized (both zero AND
+	// no legacy type key), fall back to the legacy inference
+	// — this only happens for hand-crafted test fixtures or
+	// pre-migration DBs, not real production data.
+	if dbMsgType == 0 && dbSubmitToLLM == 0 && legacyType == "" {
+		return llm.MsgTypeForLegacy(legacyType, toolName)
 	}
-	return llm.MsgTypeForLegacy(legacyType, toolName)
+	// Trust the columns. The msg_type column may be 0 for
+	// text rows (which is the enum's zero value); map that
+	// to MsgTypeText explicitly.
+	mt := dbMsgType
+	if mt == 0 {
+		mt = llm.MsgTypeText
+	}
+	return mt, dbSubmitToLLM
+}
+
+// extractTextFromPartsBlob parses a v2 `meta["parts"]` JSON
+// string and concatenates the `text` fields of every part
+// with kind="text" in their original order. Returns "" if
+// the blob is malformed or contains no text parts. Used as
+// a fallback when the row's `content` column is empty (a
+// turn whose only payload is a question card or a tool
+// call with no prose). The LLM doesn't strictly need the
+// text — the tool_result carries the user's answer — but
+// it does need a placeholder so the message survives the
+// read path and the LLM context stays complete.
+func extractTextFromPartsBlob(raw string) string {
+	var parts []struct {
+		Kind string `json:"kind"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parts); err != nil {
+		return ""
+	}
+	var out string
+	for _, p := range parts {
+		if p.Kind == "text" && p.Text != "" {
+			if out != "" {
+				out += "\n"
+			}
+			out += p.Text
+		}
+	}
+	return out
 }
 func (s *Store) Flush() error {
 	s.pendingMu.Lock()
@@ -691,19 +972,77 @@ func (s *Store) Flush() error {
 
 	tx, err := s.db.Begin()
 	if err != nil {
+		// Put the pending messages back so a transient
+		// error doesn't lose user data. The next Flush
+		// attempt will retry.
+		s.pendingMu.Lock()
+		s.pendingWrites = append(pending, s.pendingWrites...)
+		s.pendingMu.Unlock()
 		return err
 	}
 	stmt, err := tx.Prepare(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		_ = tx.Rollback()
+		s.pendingMu.Lock()
+		s.pendingWrites = append(pending, s.pendingWrites...)
+		s.pendingMu.Unlock()
 		return err
 	}
 	defer stmt.Close()
+
+	// Assign per-conversation seqs in a single pass.
+	// For each conversation in the batch, look up the
+	// current MAX(seq) once, then stamp pending rows
+	// with seq+1, seq+2, ... in the order they were
+	// queued. The lookup uses the same index
+	// (idx_messages_conv_seq) that the new cursor
+	// pagination uses.
+	//
+	// The pending slice may contain multiple
+	// conversations (different SendMessage goroutines
+	// can interleave on s.pendingWrites). Grouping by
+	// convID first means each MAX(seq) is queried once
+	// per conversation rather than once per row.
+	convMax := map[string]int64{}
 	for _, m := range pending {
-		if _, err := stmt.Exec(m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM); err != nil {
+		var maxSeq sql.NullInt64
+		if err := tx.QueryRow(
+			`SELECT MAX(seq) FROM messages WHERE conversation_id = ?`,
+			m.ConversationID,
+		).Scan(&maxSeq); err != nil {
 			_ = tx.Rollback()
+			s.pendingMu.Lock()
+			s.pendingWrites = append(pending, s.pendingWrites...)
+			s.pendingMu.Unlock()
+			return err
+		}
+		base := int64(0)
+		if maxSeq.Valid {
+			base = maxSeq.Int64
+		}
+		convMax[m.ConversationID] = base
+	}
+	// Second pass: write rows, stamping the per-conv counter.
+	convCur := map[string]int64{}
+	for _, m := range pending {
+		base := convMax[m.ConversationID]
+		cur := convCur[m.ConversationID]
+		next := base + cur + 1
+		convCur[m.ConversationID] = cur + 1
+		if _, err := stmt.Exec(
+			m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(),
+			m.Metadata, m.MsgType, m.SubmitToLLM, next,
+		); err != nil {
+			_ = tx.Rollback()
+			// Put pending back so a per-message insert error
+			// (e.g. constraint violation on bad data) doesn't
+			// silently drop the rest of the batch.
+			s.pendingMu.Lock()
+			s.pendingWrites = append(pending, s.pendingWrites...)
+			s.pendingMu.Unlock()
 			return err
 		}
 	}
@@ -713,6 +1052,26 @@ func (s *Store) Flush() error {
 	); err != nil {
 		_ = tx.Rollback()
 		return err
+	}
+	// The previous line only updated pending[0]'s conversation.
+	// If a batch contains messages from multiple sessions (each
+	// AddMessageTo may append to the same pending slice), the
+	// other sessions' updated_at would be stale, causing the
+	// session picker to show them in the wrong order. Update
+	// every distinct session in the batch.
+	seen := map[string]struct{}{pending[0].ConversationID: {}}
+	for _, m := range pending {
+		if _, ok := seen[m.ConversationID]; ok {
+			continue
+		}
+		seen[m.ConversationID] = struct{}{}
+		if _, err := tx.Exec(
+			`UPDATE conversations SET updated_at = ? WHERE id = ?`,
+			time.Now().Unix(), m.ConversationID,
+		); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -932,8 +1291,20 @@ func (s *Store) SetCurrent(id string) error {
 
 // ListConversations returns all conversations ordered by updated_at desc.
 func (s *Store) ListConversations() []Conversation {
+	return s.ListConversationsLimit(0)
+}
+
+// ListConversationsLimit returns up to `limit` active (non-archived)
+// conversations, ordered by updated_at DESC. limit <= 0 means
+// "no cap" (used by legacy callers / tests). The handler-layer
+// pagination passes limit=200 to bound the response size.
+func (s *Store) ListConversationsLimit(limit int) []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`)
+	q := `SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := s.db.Query(q)
 	if err != nil {
 		return nil
 	}
@@ -1048,8 +1419,19 @@ func (s *Store) ArchiveByProjectPath(projectPath string) (int, error) {
 
 // ListArchivedConversations returns all archived conversations.
 func (s *Store) ListArchivedConversations() []Conversation {
+	return s.ListArchivedConversationsLimit(0)
+}
+
+// ListArchivedConversationsLimit returns up to `limit` archived
+// conversations, ordered by updated_at DESC. limit <= 0 means
+// "no cap" (legacy callers / tests).
+func (s *Store) ListArchivedConversationsLimit(limit int) []Conversation {
 	_ = s.Flush()
-	rows, err := s.db.Query(`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`)
+	q := `SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := s.db.Query(q)
 	if err != nil {
 		return nil
 	}
@@ -1183,15 +1565,21 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	}()
 
 	stmt, err := tx.Prepare(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer stmt.Close()
 
-	for _, r := range msgs {
-		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta, r.msgType, r.submitToLLM); err != nil {
+	// The fork's per-conversation seq counter starts at
+	// 1 (the new conversation has no prior history).
+	// Walking the source msgs in id-ASC order (already
+	// guaranteed by the SELECT above) means we can
+	// stamp seq=i+1 for the i-th row — no MAX(seq)
+	// lookup needed.
+	for i, r := range msgs {
+		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta, r.msgType, r.submitToLLM, int64(i+1)); err != nil {
 			return nil, err
 		}
 	}
@@ -1241,8 +1629,28 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 	_ = s.Flush()
 
 	// Snapshot the rows before deleting.
+	//
+	// msg_type and submit_to_llm are part of the snapshot
+	// on purpose: the rollback handler converts each row
+	// through buildMessageResponse, which uses MsgType to
+	// filter out standalone tool_call / tool_result /
+	// exec_command rows (their data is already embedded
+	// in the parent assistant message's parts). Without
+	// these columns, the filter would never fire and the
+	// rollback would return tool rows as empty assistant
+	// bubbles, then the frontend would splice them back
+	// as zero-content messages on undo.
+	//
+	// seq is part of the snapshot for the same reason:
+	// the new seq-based cursor relies on every row having
+	// a valid seq. RestoreMessages must reuse the original
+	// seq, otherwise the restored row's seq would collide
+	// with whatever MAX(seq)+1 looks like at undo time and
+	// (a) the cursor would skip the row on the next page
+	// request, (b) two rows in the same conversation
+	// could end up with the same seq.
 	rows, err := s.db.Query(
-		`SELECT id, conversation_id, role, content, tokens, created_at, metadata
+		`SELECT id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm, seq
 		 FROM messages WHERE conversation_id = ? AND id >= ? ORDER BY id`,
 		conversationID, fromID,
 	)
@@ -1255,8 +1663,12 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 	for rows.Next() {
 		var m Message
 		var created int64
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata); err != nil {
+		var seq sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata, &m.MsgType, &m.SubmitToLLM, &seq); err != nil {
 			return deleted, err
+		}
+		if seq.Valid {
+			m.Seq = seq.Int64
 		}
 		m.CreatedAt = time.Unix(created, 0)
 		deleted = append(deleted, m)
@@ -1279,9 +1691,29 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 }
 
 // RestoreMessages inserts previously-deleted messages back into the
-// messages table with their original ids. This is the inverse of
-// DeleteMessagesFrom. Callers should only restore messages that were
-// previously returned by DeleteMessagesFrom.
+// messages table with their original ids and seqs. This is the
+// inverse of DeleteMessagesFrom. Callers should only restore
+// messages that were previously returned by DeleteMessagesFrom.
+//
+// The pre-fix code only restored id/conversation_id/role/content/
+// tokens/created_at/metadata — three fields were silently
+// dropped on every undo:
+//   - msg_type     → restored rows defaulted to 0 (MsgTypeText)
+//   - submit_to_llm → restored rows defaulted to 1 (the original
+//                     intent was the opposite for some categories,
+//                     e.g. thinking is submit_to_llm=0 and
+//                     tool_result for exec_command is also 0)
+//   - seq          → restored rows got NULL seq, breaking the
+//                    new seq-based cursor (migration 8)
+//
+// Now we restore all of them. The caller (handler
+// UndoRollback) populates these from the MessageResponse
+// payload, which is the wire shape that already carries the
+// server-decoded values. Without this, after-undo rows
+// would have wrong content-shape (e.g. tool rows reading
+// as text, thinking rows reading as assistant text) AND
+// the seq-based cursor would skip them (NULL seq doesn't
+// match `seq < ?` unless we make the SQL null-safe).
 func (s *Store) RestoreMessages(messages []Message) error {
 	if len(messages) == 0 {
 		return nil
@@ -1293,8 +1725,8 @@ func (s *Store) RestoreMessages(messages []Message) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(
-		`INSERT OR REPLACE INTO messages(id, conversation_id, role, content, tokens, created_at, metadata)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO messages(id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return err
@@ -1302,7 +1734,10 @@ func (s *Store) RestoreMessages(messages []Message) error {
 	defer stmt.Close()
 
 	for _, m := range messages {
-		if _, err := stmt.Exec(m.ID, m.ConversationID, m.Role, m.Content, m.Tokens, m.CreatedAt.Unix(), m.Metadata); err != nil {
+		if _, err := stmt.Exec(
+			m.ID, m.ConversationID, m.Role, m.Content, m.Tokens,
+			m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM, m.Seq,
+		); err != nil {
 			return err
 		}
 	}
@@ -1543,6 +1978,11 @@ func newConvID() string {
 // SearchMessages performs a simple LIKE-based full-text search
 // across messages in all active (non-archived) conversations.
 // Returns up to `limit` results sorted by created_at desc.
+//
+// User input is escaped so that LIKE metacharacters (`%`, `_`)
+// in the search query don't behave as wildcards. A search for
+// "100%" matches the literal substring "100%", not "100" +
+// anything.
 func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	_ = s.Flush()
 	if q == "" {
@@ -1552,15 +1992,19 @@ func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	if q == "" {
 		return nil
 	}
+	// Escape LIKE metacharacters: backslash, percent, underscore.
+	// SQLite uses `\` as the ESCAPE char by default, so we prefix
+	// each metachar with `\`.
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
 
 	rows, err := s.db.Query(
 		`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at
 		 FROM messages m
 		 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
-		 WHERE m.content LIKE ?
+		 WHERE m.content LIKE ? ESCAPE '\'
 		 ORDER BY m.created_at DESC
 		 LIMIT ?`,
-		"%"+q+"%", limitOrHuge(limit),
+		"%"+escaped+"%", limitOrHuge(limit),
 	)
 	if err != nil {
 		return nil
@@ -1636,75 +2080,93 @@ type ConversationTokenStats struct {
 
 // TokenStats scans messages metadata for assistant messages with
 // tokens_in / tokens_out keys and aggregates per conversation.
+//
+// Two queries (instead of a single correlated subquery that ran
+// once per row → O(N²)): one to gather per-conversation metadata
+// (title, updated_at, msg_count) and one to gather per-message
+// token data. Both run in O(N) over the messages table.
 func (s *Store) TokenStats() []ConversationTokenStats {
 	_ = s.Flush()
-	rows, err := s.db.Query(`
-		SELECT m.conversation_id,
-			   COALESCE(c.title, ''),
-			   m.metadata,
-			   c.updated_at,
-			   (SELECT COUNT(*) FROM messages m2 WHERE m2.conversation_id = m.conversation_id) AS msg_count
-		FROM messages m
-		JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
-		WHERE m.role = 'assistant' AND m.metadata IS NOT NULL AND m.metadata != ''
-	`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
 
-	type convAgg struct {
+	type convMeta struct {
 		Title     string
-		TokensIn  int
-		TokensOut int
-		MsgCount  int
 		UpdatedAt int64
+		MsgCount  int
 	}
-	agg := make(map[string]*convAgg)
-
-	for rows.Next() {
-		var convID, title, metaStr string
-		var updatedAt int64
-		var msgCount int
-		if err := rows.Scan(&convID, &title, &metaStr, &updatedAt, &msgCount); err != nil {
-			break
-		}
-		e, ok := agg[convID]
-		if !ok {
-			e = &convAgg{Title: title, UpdatedAt: updatedAt}
-			agg[convID] = e
-		}
-		// Take the max msg_count across multiple rows for the same conv.
-		if msgCount > e.MsgCount {
-			e.MsgCount = msgCount
-		}
-
-		// Parse tokens from metadata JSON.
-		var meta map[string]string
-		if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
-			continue
-		}
-		if t, ok := meta["tokens_in"]; ok {
-			if v, err := strconv.Atoi(t); err == nil {
-				e.TokensIn += v
+	// Query 1: per-conversation metadata + msg_count via GROUP BY.
+	meta := make(map[string]*convMeta)
+	rows, err := s.db.Query(`
+		SELECT c.id, COALESCE(c.title, ''), c.updated_at,
+		       (SELECT COUNT(*) FROM messages m2 WHERE m2.conversation_id = c.id) AS msg_count
+		FROM conversations c
+		WHERE c.archived = 0
+	`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id, title string
+			var updatedAt int64
+			var msgCount int
+			if err := rows.Scan(&id, &title, &updatedAt, &msgCount); err == nil {
+				meta[id] = &convMeta{Title: title, UpdatedAt: updatedAt, MsgCount: msgCount}
 			}
 		}
-		if t, ok := meta["tokens_out"]; ok {
-			if v, err := strconv.Atoi(t); err == nil {
-				e.TokensOut += v
+	}
+
+	// Query 2: per-message token data (O(N) scan, no correlated subquery).
+	type tokenAgg struct {
+		TokensIn  int
+		TokensOut int
+	}
+	tokens := make(map[string]*tokenAgg)
+	rows2, err := s.db.Query(`
+		SELECT m.conversation_id, m.metadata
+		FROM messages m
+		WHERE m.role = 'assistant' AND m.metadata IS NOT NULL AND m.metadata != ''
+	`)
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var convID, metaStr string
+			if err := rows2.Scan(&convID, &metaStr); err != nil {
+				continue
+			}
+			var m map[string]string
+			if err := json.Unmarshal([]byte(metaStr), &m); err != nil {
+				continue
+			}
+			e, ok := tokens[convID]
+			if !ok {
+				e = &tokenAgg{}
+				tokens[convID] = e
+			}
+			if t, ok := m["tokens_in"]; ok {
+				if v, err := strconv.Atoi(t); err == nil {
+					e.TokensIn += v
+				}
+			}
+			if t, ok := m["tokens_out"]; ok {
+				if v, err := strconv.Atoi(t); err == nil {
+					e.TokensOut += v
+				}
 			}
 		}
 	}
 
 	var out []ConversationTokenStats
-	for convID, e := range agg {
+	for convID, m := range meta {
+		t := tokens[convID]
+		tin, tout := 0, 0
+		if t != nil {
+			tin, tout = t.TokensIn, t.TokensOut
+		}
 		out = append(out, ConversationTokenStats{
 			ConversationID:    convID,
-			ConversationTitle: e.Title,
-			TokensIn:          e.TokensIn,
-			TokensOut:         e.TokensOut,
-			MsgCount:          e.MsgCount,
-			UpdatedAt:         e.UpdatedAt,
+			ConversationTitle: m.Title,
+			TokensIn:          tin,
+			TokensOut:         tout,
+			MsgCount:          m.MsgCount,
+			UpdatedAt:         m.UpdatedAt,
 		})
 	}
 	// Sort by updated_at desc.

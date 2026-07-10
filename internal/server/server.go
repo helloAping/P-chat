@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/style"
 )
 
@@ -26,6 +30,11 @@ type Server struct {
 	engine   *gin.Engine
 	handler  *Handler
 	srv      *http.Server
+
+	// rulesWatchStop stops the file watcher that polls the
+	// rules directories for changes. Started in
+	// NewWithStaticFS, stopped in Shutdown.
+	rulesWatchStop func()
 }
 
 // Engine returns the underlying gin.Engine so tests (or embedders)
@@ -69,6 +78,16 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	}
 	r := gin.New()
 	r.Use(gin.Recovery())
+	// Cap ALL request bodies at 25 MiB so a malicious client
+	// cannot OOM the server by posting a multi-GB JSON. The
+	// upload endpoint has its own larger cap (it streams files)
+	// and re-applies MaxBytesReader before this middleware sees
+	// the route. Handlers that need a smaller cap (e.g.
+	// SendMessage) layer their own MaxBytesReader on top.
+	r.Use(maxBodyMiddleware(25 << 20))
+	// Per-IP rate limit. 10 req/s sustained, burst 20.
+	// Generous for human use; rejects runaway clients.
+	r.Use(rateLimitMiddleware())
 
 	// CORS: pchat-server is normally hit same-origin (browser at
 	// http://127.0.0.1:PORT, server at the same URL). The Wails
@@ -200,6 +219,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/knowledge/bases/:name/nodes/:id/content", h.GetNodeContent)
 		api.DELETE("/knowledge/bases/:name/nodes/:id", h.DeleteNode)
 		api.POST("/knowledge/search", h.SearchKnowledge)
+
+		// Web search settings
+		api.GET("/settings/web_search", h.GetWebSearchSettings)
+		api.PUT("/settings/web_search", h.UpdateWebSearchSettings)
+		api.POST("/settings/web_search/test", h.TestWebSearchConnection)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the
@@ -208,7 +232,29 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		r.StaticFS("/app", staticFS)
 	}
 
-	return &Server{cfg: cfg, agent: agt, store: store, styleMgr: styleMgr, engine: r, handler: h}
+	s := &Server{cfg: cfg, agent: agt, store: store, styleMgr: styleMgr, engine: r, handler: h}
+	// Hot-reload rules when the user edits files in the rules
+	// directories. The agent's Reload() re-reads AGENTS.md,
+	// rules, and skills and rebuilds the cached system prompt.
+	// Polling (every 5s) is used instead of fsnotify because it
+	// works uniformly across Windows/macOS/Linux without
+	// additional dependencies.
+	// 2026-07: rules.Watch now takes the session's
+	// projectRoot as a third arg. The server's startup
+	// root is "" (no session is selected yet) so the
+	// watcher covers the global dir + the legacy
+	// CWD-anchored project dir. When a session is
+	// selected, ReloadWithRootIfChanged on the agent is
+	// the path that re-targets the watcher (the watcher's
+	// dirs are fixed at Watch() time, but Reload still
+	// fires the onChange callback and the agent then
+	// loads from the new root on the next chat turn).
+	s.rulesWatchStop = rules.Watch(func() {
+		if agt != nil {
+			agt.Reload()
+		}
+	}, 5*time.Second, "")
+	return s
 }
 
 func (s *Server) Run() error {
@@ -258,10 +304,45 @@ func (s *Server) RunWithGracefulShutdown(addr string) error {
 // Shutdown gracefully shuts down the server, draining active
 // connections. The context deadline caps the total drain time.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.rulesWatchStop != nil {
+		s.rulesWatchStop()
+	}
 	if s.srv != nil {
 		return s.srv.Shutdown(ctx)
 	}
 	return nil
+}
+
+// isAllowedCORSOrigin returns true if the request origin is
+// permitted to access this backend. We allow:
+//   - the Wails webview origin (http://wails.localhost)
+//   - any localhost / 127.0.0.1 / [::1] origin on the same
+//     loopback (so users can run the frontend in a separate
+//     dev server hitting the production backend)
+//   - any same-origin request (Origin == Host header)
+// Anything else is rejected — the previous "*"-with-no-credentials
+// form was spec-compliant but allowed a malicious page on the
+// same network to fetch our endpoints on behalf of the user.
+func isAllowedCORSOrigin(origin, host string) bool {
+	if origin == "" {
+		return true // no Origin header: non-browser client, allow
+	}
+	// Same-origin: Origin must match the Host header. This is
+	// the strictest case and the most common in production.
+	if origin == host {
+		return true
+	}
+	// Wails webview.
+	if origin == "http://wails.localhost" || origin == "https://wails.localhost" {
+		return true
+	}
+	// Loopback on any port (localhost / 127.0.0.1 / [::1]).
+	for _, base := range []string{"http://localhost", "http://127.0.0.1", "http://[::1]"} {
+		if origin == base || strings.HasPrefix(origin, base+":") {
+			return true
+		}
+	}
+	return false
 }
 
 // corsMiddleware adds the headers Chromium/WebView2 needs to allow
@@ -270,15 +351,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // this bypass for the streaming /api/v1/sessions/:id/messages SSE
 // endpoint because the Wails AssetServer's response writer buffers
 // the entire body and only sends it when the request handler
-// returns 鈥?useless for an SSE stream that parks for minutes
+// returns — useless for an SSE stream that parks for minutes
 // waiting on the user (the `question` tool flow).
 //
-// Same-origin browser clients (origin == backend address) are
-// unaffected: the wildcard "*" origin header is the spec-compliant
-// response for "no credentialed cross-origin", and we don't send
-// Access-Control-Allow-Credentials. The 127.0.0.1 listen address
-// already prevents WAN access, so a permissive CORS policy is safe
-// in practice.
+// The previous implementation reflected any Origin back. We now
+// only allow Wails, loopback, and same-origin; everything else
+// is rejected with a 403.
 //
 // We also handle Chromium's Private Network Access (PNA) check.
 // The Wails origin is treated as a "public" origin by Chromium,
@@ -291,6 +369,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
+		host := c.Request.Host
+		if !isAllowedCORSOrigin(origin, host) {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
 		// Same-origin requests send Origin too; reflect it back so
 		// credentialed clients stay on a strict allow-list. For
 		// cross-origin (wails.localhost) we echo the origin as well,
@@ -314,6 +397,114 @@ func corsMiddleware() gin.HandlerFunc {
 		// Preflight: short-circuit and let the request through.
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+// maxBodyMiddleware caps the request body size for every
+// request. Handlers that need a smaller cap (e.g. SendMessage)
+// layer their own MaxBytesReader on top — Go's http package
+// respects nested MaxBytesReader and will return the smallest
+// limit.
+func maxBodyMiddleware(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request != nil && c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		}
+		c.Next()
+	}
+}
+
+// rateLimiter is a simple per-IP token bucket. It exists to
+// make a misbehaving client (or a malicious local script) fail
+// fast on the connection-handling layer rather than spinning
+// up goroutines for every request. Tune `rate` and `burst` to
+// match real usage; pchat's CLI does at most a few requests
+// per second even during heavy use.
+type rateLimiter struct {
+	mu       sync.Mutex
+	rate     float64 // tokens per second
+	burst    float64
+	tokens   map[string]float64
+	lastFill map[string]time.Time
+}
+
+func newRateLimiter(rate, burst float64) *rateLimiter {
+	return &rateLimiter{
+		rate:     rate,
+		burst:    burst,
+		tokens:   make(map[string]float64),
+		lastFill: make(map[string]time.Time),
+	}
+}
+
+// allow returns true if the IP is within the burst and refills
+// tokens based on elapsed time. Entries older than 10 minutes
+// are evicted lazily to bound memory.
+func (r *rateLimiter) allow(ip string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	last, ok := r.lastFill[ip]
+	if !ok {
+		r.tokens[ip] = r.burst
+		r.lastFill[ip] = now
+		last = now
+	}
+	elapsed := now.Sub(last).Seconds()
+	r.tokens[ip] = r.tokens[ip] + elapsed*r.rate
+	if r.tokens[ip] > r.burst {
+		r.tokens[ip] = r.burst
+	}
+	r.lastFill[ip] = now
+	if r.tokens[ip] < 1 {
+		return false
+	}
+	r.tokens[ip]--
+	return true
+}
+
+// evictExpired drops entries idle for longer than maxIdle.
+// Called occasionally from the middleware to keep the map
+// small for long-running servers.
+func (r *rateLimiter) evictExpired(maxIdle time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cutoff := time.Now().Add(-maxIdle)
+	for ip, t := range r.lastFill {
+		if t.Before(cutoff) {
+			delete(r.lastFill, ip)
+			delete(r.tokens, ip)
+		}
+	}
+}
+
+// rateLimitMiddleware rejects (with 429) requests from IPs that
+// exceed the per-second budget. A 10 req/s burst with 20 burst
+// capacity is generous for human use and the CLI; a script
+// spamming at 100 req/s will start to be rejected within a
+// second.
+func rateLimitMiddleware() gin.HandlerFunc {
+	rl := newRateLimiter(10, 20)
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			rl.evictExpired(10 * time.Minute)
+		}
+	}()
+	return func(c *gin.Context) {
+		ip, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+		if err != nil {
+			ip = c.Request.RemoteAddr
+		}
+		if !rl.allow(ip) {
+			c.Header("Retry-After", "1")
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "rate limit exceeded; slow down",
+			})
 			return
 		}
 		c.Next()

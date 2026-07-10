@@ -20,7 +20,35 @@ type Skill struct {
 // LoadAll loads skills from both global and project directories.
 // Project skills override global skills with the same name.
 // Output is sorted by name for deterministic ordering (LLM cache stability).
+//
+// Deprecated: use LoadAllWithRoot so the project-level
+// directory is resolved against the session's projectRoot
+// rather than the server's CWD. LoadAll is preserved for
+// the CLI commands (pchat skills list) that run before any
+// session is selected.
 func LoadAll() ([]Skill, error) {
+	return LoadAllWithRoot("")
+}
+
+// LoadAllWithRoot is the 2026-07 project-aware loader.
+//
+// Merge policy (AND, project overrides global on name
+// collision):
+//   - global:  ~/.p-chat/skills/
+//   - project: <root>/.p-chat/skills/   (per session root)
+//
+// When root is empty (no project pinned, e.g. CLI startup
+// before any session is selected), the project slot is
+// skipped and only the global slot is consulted. The
+// pre-2026-07 LoadAll delegated to paths.ProjectSkillsDir()
+// which used os.Getwd() — that meant a Wails GUI session
+// (whose server CWD is unrelated to the user's project)
+// never picked up project-level skills. The new code uses
+// paths.ProjectSkillsDirWithRoot(root) which is the
+// session-driven equivalent.
+//
+// Output is sorted by name for byte-stable prompt assembly.
+func LoadAllWithRoot(root string) ([]Skill, error) {
 	skillMap := make(map[string]Skill)
 
 	// Load global skills
@@ -31,11 +59,20 @@ func LoadAll() ([]Skill, error) {
 		}
 	}
 
-	// Load project skills (override global)
-	projectSkills, err := loadFromDir(paths.ProjectSkillsDir())
-	if err == nil {
-		for _, s := range projectSkills {
-			skillMap[s.Name] = s
+	// Load project skills (override global). Use
+	// ProjectSkillsDirWithRoot so the path is anchored
+	// to the session's projectRoot, not the server's
+	// CWD. The previous LoadAll called ProjectSkillsDir()
+	// (= <cwd>/.p-chat/skills) which only worked when the
+	// user happened to launch the CLI from inside the
+	// project — broken for the Wails GUI where the server
+	// process CWD is unrelated to the user's project.
+	if root != "" {
+		projectSkills, err := loadFromDir(paths.ProjectSkillsDirWithRoot(root))
+		if err == nil {
+			for _, s := range projectSkills {
+				skillMap[s.Name] = s
+			}
 		}
 	}
 

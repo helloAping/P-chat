@@ -20,7 +20,7 @@ type ChatMessage struct {
 
 	// ── new classification fields (v2 message model) ──
 	// MsgType is the numeric content-type enum (0=text 1=image
-	// 2=video 3=audio 4=tool 5=command 6=question). Replaces
+	// 2=video 3=audio 4=tool 5=command). Replaces
 	// string-based Type for filtering and rendering dispatch.
 	MsgType int `json:"msg_type,omitempty"`
 	// SubmitToLLM controls whether this message is included when
@@ -70,13 +70,12 @@ const (
 // ── MsgType constants (numeric, v2 message model) ──
 
 const (
-	MsgTypeText     = 0 // text (user / assistant / system prose)
-	MsgTypeImage    = 1 // image attachment
-	MsgTypeVideo    = 2 // video attachment
-	MsgTypeAudio    = 3 // audio attachment
-	MsgTypeTool     = 4 // tool call / tool result (LLM context only, not rendered)
-	MsgTypeCommand  = 5 // exec_command raw output (display-only, terminal panel)
-	MsgTypeQuestion = 6 // LLM question + user answer (table card)
+	MsgTypeText    = 0 // text (user / assistant / system prose)
+	MsgTypeImage   = 1 // image attachment
+	MsgTypeVideo   = 2 // video attachment
+	MsgTypeAudio   = 3 // audio attachment
+	MsgTypeTool    = 4 // tool call / tool result (LLM context only, not rendered)
+	MsgTypeCommand = 5 // exec_command raw output (display-only, terminal panel)
 )
 
 // MsgTypeForLegacy maps a legacy string Type to the numeric MsgType.

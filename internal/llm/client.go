@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/config"
@@ -97,10 +98,16 @@ type Client struct {
 }
 
 func NewClient(cfg *config.LLMConfig) (*Client, error) {
+	// Copy the providers slice so the caller can mutate
+	// cfg.Providers after NewClient returns without affecting
+	// us. The slice header is a value, but the underlying
+	// array is shared. A long-lived server with config
+	// hot-reload would otherwise see inconsistent results.
+	modelsCopy := append([]config.ProviderConfig(nil), cfg.Providers...)
 	c := &Client{
 		providers: make(map[string]*providerEntry),
 		default_:  cfg.Default,
-		cfgModels: cfg.Providers,
+		cfgModels: modelsCopy,
 	}
 
 	if err := c.init(cfg); err != nil {
@@ -418,9 +425,23 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			line, err := reader.ReadBytes('\n')
 			if err != nil {
 				if errors.Is(err, io.EOF) {
-					ch <- StreamChunk{Done: true}
-					log.Printf("[llm/%s/%s] stream ended: chunks=%d parsed=%d content=%d thinking=%d parse_errs=%d",
-						p.name, model, rawChunks, rawChunks-parseFailures, contentChars, thinkingChars, parseFailures)
+					// EOF after a successful [DONE] (or after
+					// the proxy simply closing the connection):
+					// don't emit another Done. The agent loop
+					// already saw the prior Done and broke
+					// out. Sending a second Done would (a) be
+					// wasted channel capacity, and (b) re-enter
+					// the retry-state-cleanup path. The channel
+					// close below signals end-of-stream to the
+					// consumer. Always log parse_errs (real
+					// signal of upstream breakage), but gate
+					// the per-stream summary on a debug knob
+					// so a normal session doesn't fill the
+					// log.
+					if parseFailures > 0 || os.Getenv("PC_LLM_DEBUG") == "1" {
+						log.Printf("[llm/%s/%s] stream ended: chunks=%d parsed=%d content=%d thinking=%d parse_errs=%d",
+							p.name, model, rawChunks, rawChunks-parseFailures, contentChars, thinkingChars, parseFailures)
+					}
 					return
 				}
 				ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
@@ -933,7 +954,14 @@ func extractContent(payload []byte) (string, string) {
 	if err := json.Unmarshal(payload, &v); err != nil {
 		return "", ""
 	}
-	return walkForField(v, contentCandidateNames, "", 0, 8, 10)
+	if got, p := walkForField(v, contentCandidateNames, "", 0, 8, 10); got != "" {
+		return got, p
+	}
+	// Walker failed — log the payload shape so a misbehaving
+	// proxy can be debugged. Truncate to 512 bytes to avoid
+	// log spam.
+	log.Printf("[llm] extractContent: walker found no match in payload (first 512 bytes): %s", truncateForLog(payload, 512))
+	return "", ""
 }
 
 func extractThinking(payload []byte) (string, string) {
@@ -941,7 +969,24 @@ func extractThinking(payload []byte) (string, string) {
 	if err := json.Unmarshal(payload, &v); err != nil {
 		return "", ""
 	}
-	return walkForField(v, thinkingCandidateNames, "", 0, 8, 10)
+	if got, p := walkForField(v, thinkingCandidateNames, "", 0, 8, 10); got != "" {
+		return got, p
+	}
+	// Same diagnostic as extractContent: when no thinking
+	// field is found, log the payload shape. The vast majority
+	// of streams don't carry thinking at all, so the log is
+	// gated on a debug knob.
+	if os.Getenv("PC_LLM_DEBUG") == "1" {
+		log.Printf("[llm] extractThinking: walker found no match in payload (first 512 bytes): %s", truncateForLog(payload, 512))
+	}
+	return "", ""
+}
+
+func truncateForLog(b []byte, max int) string {
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "...(truncated)"
 }
 
 func walkForField(v any, names []string, path string, depth, maxDepth, maxResults int) (string, string) {
@@ -960,6 +1005,15 @@ func walkForField(v any, names []string, path string, depth, maxDepth, maxResult
 		for _, name := range names {
 			if val, ok := t[name]; ok {
 				if s, ok := val.(string); ok && s != "" {
+					// Cap returned string at 4 MiB. A misbehaving
+					// proxy could emit a single 1 GB string here,
+					// which would otherwise flow into the model's
+					// context (wasting tokens) or OOM the agent.
+					// The upper layer is responsible for further
+					// truncation / summarisation if needed.
+					if len(s) > 4<<20 {
+						s = s[:4<<20]
+					}
 					return s, path + "." + name
 				}
 			}

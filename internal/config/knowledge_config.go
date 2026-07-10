@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // KnowledgeConfigPatch is a partial update for KnowledgeConfig.
 // Bool fields use pointers so "not sent" (nil) ≠ "false".
@@ -44,6 +47,18 @@ func AddKnowledgeBaseRecord(base KnowledgeBase) error {
 	cfg, err := Load("")
 	if err != nil {
 		return err
+	}
+	// Validate name. A blank name would create a base that
+	// can't be referenced, and a name with path separators
+	// or NUL bytes would break the SQLite filename convention.
+	if base.Name == "" {
+		return fmt.Errorf("knowledge base name is required")
+	}
+	if strings.ContainsAny(base.Name, `/\`+"`") || strings.ContainsRune(base.Name, 0) {
+		return fmt.Errorf("knowledge base name %q contains invalid characters (no path separators or NUL)", base.Name)
+	}
+	if base.Path == "" {
+		return fmt.Errorf("knowledge base path is required")
 	}
 	for _, b := range cfg.Knowledge.Bases {
 		if b.Name == base.Name {

@@ -44,6 +44,10 @@ type cliContext interface {
 	NewSession(ctx context.Context, opts httpcli.CreateSessionOpts) (*httpcli.Session, error)
 	RenameSession(ctx context.Context, id, title string) error
 	DeleteSession(ctx context.Context, id string) error
+	// ClearMessages empties the messages of the current session
+	// without changing the session ID. Preserves the session row
+	// in the DB so refs and history stay stable.
+	ClearMessages(ctx context.Context, id string) error
 	CurrentMessageCount() int
 	SubmitQuestionAnswer(ctx context.Context, sessionID string, answers map[string]string) error
 
@@ -304,6 +308,10 @@ func (c *localContext) RenameSession(ctx context.Context, id, title string) erro
 
 func (c *localContext) DeleteSession(ctx context.Context, id string) error {
 	return c.r.store.DeleteConversation(id)
+}
+
+func (c *localContext) ClearMessages(ctx context.Context, id string) error {
+	return c.r.store.ClearMessages(id)
 }
 
 func (c *localContext) CurrentMessageCount() int {
@@ -885,6 +893,9 @@ func (c *httpContext) RenameSession(ctx context.Context, id, title string) error
 }
 func (c *httpContext) DeleteSession(ctx context.Context, id string) error {
 	return c.c.DeleteSession(ctx, id)
+}
+func (c *httpContext) ClearMessages(ctx context.Context, id string) error {
+	return c.c.ClearMessages(ctx, id)
 }
 func (c *httpContext) CurrentMessageCount() int { return 0 }
 

@@ -58,6 +58,11 @@ type Agent struct {
 
 	// bypassOnce, when true, makes the NEXT tool call skip the
 	// sandbox check (set by /unsafe once). Reset after the call.
+	// Swap(false) is atomic, so a panic between the swap and
+	// the actual tool call consumes the bypass without using
+	// it — the user will need to re-issue /unsafe. This is the
+	// correct trade-off (better to err on the side of an extra
+	// prompt than to leak the bypass across turns).
 	bypassOnce atomic.Bool
 
 	// subagentRegistry, if non-nil, is published to the tool
@@ -85,6 +90,20 @@ type Agent struct {
 
 	// subAgentSem limits concurrent sub-agent launches. nil = unlimited.
 	subAgentSem chan struct{}
+
+	// lastProjectRoot is the projectRoot the current skills /
+	// rules slice was loaded against. Compared by string in
+	// ReloadWithRootIfChanged to skip the re-load when the
+	// user sends a follow-up message in the same session
+	// (root doesn't change between turns of one session).
+	// 2026-07: prior to this field, switching projectRoot
+	// mid-session did not reload project-level skills or
+	// rules — they were loaded once at agent construction
+	// (New) and only reloaded by Reload() (which the rules
+	// watcher triggers on mtime change of the CWD-based
+	// rules dir). The field lets buildStaticSystemPrompt
+	// detect a project switch and invalidate the cache.
+	lastProjectRoot string
 }
 
 // SetChatOptions overrides the per-request sampling parameters
@@ -518,6 +537,15 @@ type ChatStreamChunk struct {
 // only thing that should change in this string is the underlying files
 // (AGENTS.md, rules, skills) or the chosen style.
 func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, projectRoot string, kbEnabled bool) (string, string, error) {
+	// 2026-07: if the session's projectRoot has changed
+	// since the last call (user switched projects
+	// mid-session, or this is the first turn of a new
+	// session), reload skills and rules from the new
+	// root. The static-prompt cache is invalidated by
+	// ReloadWithRootIfChanged when the root differs, so the
+	// sig-comparison below always finds a miss and rebuilds
+	// the prompt with the new project's skills + rules.
+	a.ReloadWithRootIfChanged(projectRoot)
 	toolNames := make([]string, 0, len(toolDefs))
 	for _, t := range toolDefs {
 		toolNames = append(toolNames, t.Name)
@@ -678,6 +706,8 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		sb.WriteString("- List directory → `list_files` (NOT `ls` / `dir`)\n")
 		sb.WriteString("- System commands → `exec_command` (NOT `bash` / `sh` / `powershell`)\n")
 		sb.WriteString("- Search file contents → `exec_command` with shell search commands\n")
+		sb.WriteString("- Search the web → `web_search` (returns title+url+snippet; chain with `web_fetch` for full content)\n")
+		sb.WriteString("- Fetch a URL → `web_fetch` (NOT `curl` / `Invoke-WebRequest`)\n")
 		sb.WriteString("- Manage tasks → `todo_write`\n")
 		sb.WriteString("- Ask user → `question`\n")
 
@@ -781,6 +811,19 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 	return prompt, sig, nil
 }
 
+// appendWorkingDirectoryBlock returns the "## Working Directory"
+// section text, formatted exactly as buildStaticSystemPrompt emits
+// it. Exposed as a function so the sub-agent prompt re-append path
+// (which fires AFTER buildStaticSystemPrompt has been overridden by
+// PromptOv) stays in lock-step with the main-agent wording — any
+// drift between the two will confuse the LLM.
+func appendWorkingDirectoryBlock(projectRoot string) string {
+	return fmt.Sprintf("\n\n---\n\n## Working Directory\n\n"+
+		"Your working directory is fixed at `%s`. exec_command runs here automatically "+
+		"(the work_dir argument is ignored). read_file and write_file resolve relative "+
+		"paths against this directory.\n", projectRoot)
+}
+
 // buildKBIndex builds the Knowledge Base section of the system prompt.
 // When KBBase is "__all__", all enabled bases are listed. When it's a
 // specific name, only that base's index is shown. If the base has no
@@ -853,8 +896,8 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 // Reload forces the next call to rebuild the static system prompt
 // (e.g. after the user changes AGENTS.md or installs a new skill).
 func (a *Agent) Reload() {
-	skills, _ := skill.LoadAll()
-	rulesList, _ := rules.LoadAll()
+	skills, _ := skill.LoadAllWithRoot(a.lastProjectRoot)
+	rulesList, _ := rules.LoadAllWithRoot(a.lastProjectRoot)
 	a.skills = skills
 	a.rules = rulesList
 	a.staticPrompt = ""
@@ -862,6 +905,35 @@ func (a *Agent) Reload() {
 	a.kbIndexCache = ""
 	a.kbIndexCacheKey = ""
 	a.kbIndexCacheTime = 0
+}
+
+// ReloadWithRootIfChanged reloads skills / rules from the new
+// projectRoot if it differs from the last one we loaded
+// against. 2026-07: called from buildStaticSystemPrompt so
+// switching projectRoot mid-session picks up the new
+// project's skills + rules + the AGENTS.md OR loader
+// automatically re-selects.  The static-prompt cache is
+// invalidated when the root changes, but not when it
+// matches — same-session follow-up messages hit the prefix
+// cache as before.
+//
+// Pre-2026-07 the projectRoot never entered the loader
+// path: skills and rules were loaded once at agent
+// construction (using os.Getwd() inside the loaders), and
+// only the rules.Watch mtime-poll reloaded them. The Wails
+// GUI server's CWD is unrelated to the user's project, so
+// project-level skills / rules never actually loaded.
+func (a *Agent) ReloadWithRootIfChanged(root string) {
+	if root == a.lastProjectRoot {
+		return
+	}
+	a.lastProjectRoot = root
+	skills, _ := skill.LoadAllWithRoot(root)
+	rulesList, _ := rules.LoadAllWithRoot(root)
+	a.skills = skills
+	a.rules = rulesList
+	a.staticPrompt = ""
+	a.staticPromptID = ""
 }
 
 // StaticPromptInfo exposes the current static-prompt cache key for testing.
@@ -880,8 +952,14 @@ func agentsSignature() string {
 func agentsSignatureWithRoot(root string) string {
 	g, _ := os.Stat(paths.GlobalAgents())
 	if root != "" {
-		p, _ := os.Stat(paths.ProjectAgentsWithRoot(root))
-		return fileSig(g) + "|" + fileSig(p) + "|" + root
+		// 2026-07: include both project-level slots
+		// (root AGENTS.md and .p-chat/AGENTS.md) in the
+		// sig so the cache invalidates when either changes.
+		// The OR loader only reads one of them per call,
+		// but both must be tracked for cache stability.
+		p1, _ := os.Stat(paths.ProjectAgentsWithRoot(root))
+		p2, _ := os.Stat(paths.ProjectPChatAgentsWithRoot(root))
+		return fileSig(g) + "|" + fileSig(p1) + "|" + fileSig(p2) + "|" + root
 	}
 	p, _ := os.Stat(paths.ProjectAgents())
 	return fileSig(g) + "|" + fileSig(p)
@@ -909,6 +987,15 @@ func fileSig(info os.FileInfo) string {
 	if info == nil {
 		return "absent"
 	}
+	// mtime+size is fast but fragile: a user can `touch -t` to
+	// backdate the mtime and the cache wouldn't refresh.
+	// Including the inode (on POSIX) and a content hash would
+	// be more robust, but reading the file at every prompt
+	// build is too expensive. We use mtime+size as a fast
+	// path; the rules hot-reload watcher (see
+	// internal/rules.Watch) explicitly invalidates the cache
+	// when it detects a change, so mtime preservation attacks
+	// don't affect hot-reload users.
 	return fmt.Sprintf("%d_%d", info.Size(), info.ModTime().UnixNano())
 }
 
@@ -1010,6 +1097,16 @@ func (a *Agent) ChatStream(ctx context.Context, req ChatRequest) <-chan ChatStre
 	return a.ChatWithTools(ctx, req)
 }
 
+// sendOrDrop attempts to send a chunk to ch. If ctx is cancelled,
+// the chunk is silently dropped so the producer can exit cleanly
+// rather than blocking forever on a consumer that has disconnected.
+func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, chunk ChatStreamChunk) {
+	select {
+	case ch <- chunk:
+	case <-ctx.Done():
+	}
+}
+
 // ChatWithTools performs a ReAct-style loop: send messages to the LLM with
 // available tools, execute any tool calls, and feed results back to the LLM
 // until it gives a final answer.
@@ -1040,16 +1137,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		//      doesn't die. Sends a final Error chunk.
 		defer func() {
 			defer func() { _ = recover() }() // guard "send on closed"
-			ch <- ChatStreamChunk{SessionStatus: "idle"}
+			select {
+			case ch <- ChatStreamChunk{SessionStatus: "idle"}:
+			case <-time.After(2 * time.Second):
+			}
 		}()
 		defer func() {
 			if r := recover(); r != nil {
 				stack := debug.Stack()
-				ch <- ChatStreamChunk{
+				sendOrDrop(ctx, ch, ChatStreamChunk{
 					Phase: "system",
 					Error: fmt.Sprintf("panic in agent: %v\n\n%s", r, stack),
 					Done:  true,
-				}
+				})
 			}
 		}()
 		// Announce the start of the turn. The frontend uses this
@@ -1058,10 +1158,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// this signal the UI has no way to tell "the LLM is
 		// mid-turn, don't clear stale todos" from "the LLM
 		// finished and forgot to clear them".
-		ch <- ChatStreamChunk{SessionStatus: "busy"}
+		sendOrDrop(ctx, ch, ChatStreamChunk{SessionStatus: "busy"})
 		start := time.Now()
 
-		ch <- ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."}
+		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
 		availableTools := a.tools.List()
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
@@ -1082,16 +1182,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			for _, t := range availableTools {
 				names = append(names, t.Name)
 			}
-			ch <- ChatStreamChunk{Phase: "tools", Step: "tools", Message: fmt.Sprintf("可用工具 (%d): %s", len(availableTools), strings.Join(names, ", "))}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tools", Step: "tools", Message: fmt.Sprintf("可用工具 (%d): %s", len(availableTools), strings.Join(names, ", "))})
 		} else {
-			ch <- ChatStreamChunk{Phase: "tools", Step: "tools", Message: "未注册任何工具"}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tools", Step: "tools", Message: "未注册任何工具"})
 			toolDefs = nil
 		}
 
-		ch <- ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."}
+		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."})
 		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, req.ProjectRoot, kbEnabled)
 		if err != nil {
-			ch <- ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true})
 			return
 		}
 		// Inject knowledge base context + index.
@@ -1108,7 +1208,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if req.PromptOv != "" {
 			systemPrompt = req.PromptOv
 		}
-		ch <- ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))}
+		// Re-append the "Working Directory" section when a
+		// sub-agent overrides the system prompt. The main
+		// agent gets this from buildStaticSystemPrompt above
+		// (conditional on projectRoot != ""), but the override
+		// above wipes the cached prefix, so sub-agents would
+		// otherwise have no idea what directory exec_command
+		// and read_file are anchored to. Mirrors the wording
+		// in buildStaticSystemPrompt so the LLM sees a
+		// consistent instruction in both contexts.
+		if req.ProjectRoot != "" {
+			systemPrompt += appendWorkingDirectoryBlock(req.ProjectRoot)
+		}
+		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))})
 
 		// Append compressed summary if provided (from /compress).
 		if req.CompressedSummary != "" {
@@ -1149,11 +1261,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			protocol := a.protocolFor(req.Provider)
 			vision := func() bool { return a.modelSupportsVision(req.Provider, req.Model) }
 			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision)
-			ch <- ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))})
 		}
 
 		if a.store != nil {
-			ch <- ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入消息到记忆")}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入消息到记忆")})
 			// Persist all user-facing messages (including
 			// image attachments as separate rows). Use the
 			// per-session variant so concurrent streams on
@@ -1207,9 +1319,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				"4. 风险 / 依赖 / 边界\n" +
 				"用户审阅后切换回构建模式执行。\n"
 			maxRounds = 1
-			ch <- ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (可用 todo_write / question，最多单轮)"}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (可用 todo_write / question，最多单轮)"})
 		} else {
-			ch <- ChatStreamChunk{Phase: "plan", Step: "plan", Message: fmt.Sprintf("构建模式 — LLM 自主决定何时终止 (上限 %d 轮)", maxRounds)}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "plan", Step: "plan", Message: fmt.Sprintf("构建模式 — LLM 自主决定何时终止 (上限 %d 轮)", maxRounds)})
 		}
 
 		var totalIn, totalOut int
@@ -1240,7 +1352,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			roundNum := round
 			partsAcc = newPartsAccumulator()
 
-			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds})
 
 			var (
 				fullContent         string
@@ -1274,13 +1386,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Type:    llm.TypeText,
 					Content: fmt.Sprintf("注意：当前会话轮次即将达到上限（%d 轮，剩余约 %d 轮）。请开始收尾当前任务，优先完成最关键的未完成工作，避免开启需要多轮的新子任务。", maxRounds, maxRounds-round),
 				})
-				ch <- ChatStreamChunk{
+				sendOrDrop(ctx, ch, ChatStreamChunk{
 					Phase:    "llm",
 					Step:     "near-limit",
 					Message:  fmt.Sprintf("轮次接近上限（剩余 %d 轮），提醒 LLM 收尾", maxRounds-round),
 					Round:    roundNum,
 					MaxRound: maxRounds,
-				}
+				})
 			}
 
 			// Auto-compact before LLM call (skip on last round).
@@ -1302,7 +1414,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Type:    llm.TypeText,
 					Content: MaxStepsPrompt,
 				})
-				ch <- ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds}
+				sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds})
 			}
 
 			// LLM stream with retry for recoverable errors
@@ -1313,13 +1425,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
 				if attempt > 1 {
 					backoff := time.Duration(attempt*attempt) * time.Second
-					ch <- ChatStreamChunk{
+					sendOrDrop(ctx, ch, ChatStreamChunk{
 						Phase:    "llm",
 						Step:     "retry",
 						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt, maxLLMRetries),
 						Round:    roundNum,
 						MaxRound: maxRounds,
-					}
+					})
 					select {
 					case <-ctx.Done():
 						return
@@ -1327,7 +1439,25 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 				}
 
-				stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, normalizeToolResults(roundMsgs), roundTools, opts)
+				// Only mangle the tool_call/tool_result pairing for
+				// protocols that need it (legacy: a handful of
+				// OpenAI-compatible proxies that validate the
+				// pairing and reject mixed tool_call + tool_result
+				// rounds). For standard openai and anthropic the
+				// LLM needs to see the pairing so it can recognise
+				// the user answer and stop looping — without it,
+				// the LLM interprets the tool result as a user
+				// message and dutifully re-asks via the question
+				// tool, which is exactly the bug we hit with
+				// `cs` (Doubao) and `mimo-v2.5` in 2026-07-09.
+				//
+				// See needsNormalizedToolResults for the
+				// provider list.
+				msgsForLLM := roundMsgs
+				if needsNormalizedToolResults(req.Provider) {
+					msgsForLLM = normalizeToolResults(roundMsgs)
+				}
+				stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
 				for chunk := range stream {
 					if chunk.Err != nil {
 						classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
@@ -1341,16 +1471,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 								break // break inner stream loop, retry outer
 							}
 						}
-						ch <- ChatStreamChunk{
+						sendOrDrop(ctx, ch, ChatStreamChunk{
 							Phase:      "llm",
 							Error:      errMsg,
 							Suggestion: errSuggestion,
 							ErrorKind:  errKind,
 							Done:       true,
-						}
+						})
 						return
 					}
 					if chunk.Done {
+						retryableErr = nil
 						break att // success — break outer loop too
 					}
 				if chunk.TokensIn > 0 || chunk.TokensOut > 0 {
@@ -1364,12 +1495,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if chunk.Content != "" {
 					fullContent += chunk.Content
 					partsAcc.update(ChatStreamChunk{Content: chunk.Content})
-					ch <- ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut}
+					sendOrDrop(ctx, ch, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
 				}
 				if chunk.Thinking != "" {
 					fullThinking += chunk.Thinking
 					partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
-					ch <- ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut}
+					sendOrDrop(ctx, ch, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
 				}
 				if chunk.ToolCallDelta != nil {
 					tcd := chunk.ToolCallDelta
@@ -1391,11 +1522,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			// If we exhausted retries without success, surface the last error.
 			if retryableErr != nil {
-				ch <- ChatStreamChunk{
+				sendOrDrop(ctx, ch, ChatStreamChunk{
 					Phase: "llm",
 					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", maxLLMRetries, retryableErr),
 					Done:  true,
-				}
+				})
 				return
 			}
 
@@ -1403,7 +1534,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				toolCalls = append(toolCalls, *t)
 			}
 
-			ch <- ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 
 		if len(toolCalls) == 0 {
 			toolCalls = parseMarkdownToolCalls(fullContent)
@@ -1432,11 +1563,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// phantom needs to be stripped there too.
 		if redacted, changed := redactPhantomErrors(fullContent); changed {
 			fullContent = redacted
-			ch <- ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted})
 		}
 		if redactedT, changedT := redactPhantomErrors(fullThinking); changedT {
 			fullThinking = redactedT
-			ch <- ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT})
 		}
 
 		// Build the assistant message for the conversation.
@@ -1482,8 +1613,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			if len(toolCalls) == 0 {
 				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
-				ch <- ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
-				ch <- ChatStreamChunk{Done: true}
+				sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+				sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
 				return
 			}
 
@@ -1497,7 +1628,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				continue
 			}
 
-			ch <- ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds})
 
 			// Run tool calls in parallel when the LLM emitted more than one.
 			// Each call gets its own per-tool timeout derived from the parent
@@ -1524,7 +1655,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
 				partsAcc.update(startChunk)
-				ch <- startChunk
+				sendOrDrop(ctx, ch, startChunk)
 			}
 
 			// Each tool call gets its own event channel. The agent loop
@@ -1600,7 +1731,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							log.Printf("[forwarder] got question event (%d bytes)", len(ev.QuestionJSON))
 						}
 						partsAcc.update(ev)
-						ch <- ev
+						sendOrDrop(ctx, ch, ev)
 						if ev.QuestionJSON != "" {
 							log.Printf("[forwarder] forwarded question event to main ch")
 						}
@@ -1685,47 +1816,64 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						// If the sandbox returns Confirm, pause and
 						// wait for user approval before executing
 						// (unless permission level is "auto").
-						if tc.Name == "exec_command" || tc.Name == "write_file" {
-							var decision tool.SandboxDecision
-							var reason string
-							if tc.Name == "exec_command" {
-								var ea struct{ Command string `json:"command"` }
-								json.Unmarshal([]byte(tc.ArgsJSON), &ea)
-								command := ea.Command
-								if command == "" {
-									command = tc.ArgsJSON
-								}
-								decision = a.sandbox.CheckExecDecision(command)
-								reason = a.sandbox.MatchedPattern(command)
-							} else {
-								var wa struct{ Path string `json:"path"` }
-								json.Unmarshal([]byte(tc.ArgsJSON), &wa)
-								decision = a.sandbox.CheckWriteDecision(wa.Path)
-							}
+						//
+						// 2026-07: the confirm branch now covers all
+						// I/O-bearing tools (exec_command, write_file,
+						// read_file, read_docx, read_pdf, list_files)
+						// — the read tools went through unchanged
+						// before, which let an LLM that had a write
+						// confirm approved follow up with read_file on
+						// /etc/passwd. The path-class check (project /
+						// global / external) drives the Confirm vs
+						// Allow decision via CheckReadDecision /
+						// CheckWriteDecision.
+						cfmTarget, ok := confirmTargetFor(tc.Name, tc.ArgsJSON, req.ProjectRoot, a.sandbox)
+						if ok {
+							decision, reason, resolvedPath := cfmTarget.Decision, cfmTarget.Reason, cfmTarget.ResolvedPath
 							if decision == tool.SandboxConfirm {
 								if permLevel == tool.PermissionAuto {
 									// Auto-approve: skip confirm modal,
-									// emit a brief notification event instead.
+									// emit a brief system notification
+									// instead. Use Phase (not Content)
+									// so the message isn't persisted into
+									// the assistant turn's text — on
+									// reload the user would otherwise see
+									// "🔓 [自动通过]" mixed in with the
+									// LLM's actual reply.
 									select {
 									case eventCh <- ChatStreamChunk{
-										Content: fmt.Sprintf("🔓 [自动通过] %s", tc.Name),
+										Phase:   "system",
+										Message: fmt.Sprintf("🔓 [自动通过] %s", tc.Name),
 									}:
 									default:
 									}
 								} else {
 									// Normal confirm flow.
 									cfm := tool.ConfirmRequest{
-										ToolName: tc.Name,
-										Args:     tc.ArgsJSON,
-										Reason:   reason,
+										ToolName:     tc.Name,
+										Args:         tc.ArgsJSON,
+										Reason:       reason,
+										ResolvedPath: resolvedPath,
+										PathClass:    cfmTarget.PathClass,
+										RiskLevel:    cfmTarget.RiskLevel,
 									}
 									var sessionID string
 									if sid, ok := tctx.Value(tool.SessionIDKey{}).(string); ok {
 										sessionID = sid
 									}
+									// Blocking send with a small timeout. The
+									// previous `default:` silently dropped
+									// the confirm event when the consumer
+									// was slow, and the user was left
+									// waiting for a UI that never
+									// appeared. If the consumer is gone
+									// (ctx cancelled), bail out.
 									select {
 									case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(cfm)}:
-									default:
+									case <-time.After(5 * time.Second):
+										log.Printf("[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", sessionID)
+									case <-toolCtx.Done():
+										return
 									}
 									approved, cfmErr := tool.WaitForConfirm(toolCtx, sessionID, cfm)
 									if cfmErr != nil || !approved {
@@ -1743,15 +1891,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							}
 						}
 					}
-					// Persist question before blocking for user input.
-					if tc.Name == "question" && a.store != nil {
-						persistQuestion(req.SessionID, a.store, string(argsRaw))
-					}
+					// Question persistence: handled entirely
+					// via the parts accumulator (partsAcc
+					// converts the question event into a
+					// `question` part and the answer event
+					// updates it in place). The whole
+					// interaction lives inside the
+					// assistant message's persisted parts
+					// snapshot — no separate DB rows, no
+					// pairQuestionMessages on reload.
+					// The handler still BLOCKS here for the
+					// user to answer (the result carries
+					// {"questions":..., "answers":...}).
 					result, err := handler(toolCtx, argsRaw)
-					// Persist answer after user responds.
-					if tc.Name == "question" && result != nil && a.store != nil {
-						persistQuestionAnswer(req.SessionID, a.store, result.Content)
-					}
 					outcomes[i] = toolOutcome{
 						idx:     i,
 						tc:      tc,
@@ -1789,7 +1941,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolID: tc.ID, ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(errChunk)
-					ch <- errChunk
+					sendOrDrop(ctx, ch, errChunk)
 					toolMsg := llm.ChatMessage{
 						Role:      llm.RoleTool,
 						Type:      llm.TypeToolResult,
@@ -1797,6 +1949,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						ToolID:    tc.ID,
 						ToolName:  tc.Name,
 						ToolError: true,
+						// See comment on the success path for
+						// why MsgType must be set explicitly.
+						MsgType: llm.MsgTypeTool,
 					}
 					msgs = append(msgs, toolMsg)
 					if a.store != nil {
@@ -1821,7 +1976,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					roundAnyToolErrored = true
 					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(warnChunk)
-					ch <- warnChunk
+					sendOrDrop(ctx, ch, warnChunk)
 				} else {
 					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					// For tools whose result the frontend needs to
@@ -1834,7 +1989,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						okChunk.ToolResultFull = result.Content
 					}
 					partsAcc.update(okChunk)
-					ch <- okChunk
+					sendOrDrop(ctx, ch, okChunk)
 				}
 
 			llmContent := result.Content
@@ -1859,6 +2014,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					ToolID:    tc.ID,
 					ToolName:  tc.Name,
 					ToolError: result.IsError,
+					// MsgType must be set so the read path
+					// (buildMessageResponse in handler.go)
+					// can drop standalone tool_result rows.
+					// Without it, the row's msg_type column
+					// defaults to 0 (msg_type for plain
+					// text), the `if m.MsgType ==
+					// llm.MsgTypeTool` filter never fires,
+					// and the tool's raw JSON Content (e.g.
+					// the question tool's `{questions,
+					// answers}` payload) leaks into the
+					// chat as a free-floating text bubble.
+					// Surfaces after rollback/undo because
+					// the in-memory splice restores the
+					// unfiltered row.
+					MsgType: llm.MsgTypeTool,
 				}
 				msgs = append(msgs, toolMsg)
 				if a.store != nil {
@@ -1887,15 +2057,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			prevToolSig = curSig
 			prevErrored = curErrored
 			if stuckStreak >= stuckThreshold {
-				ch <- ChatStreamChunk{
+				sendOrDrop(ctx, ch, ChatStreamChunk{
 					Phase:   "stuck",
 					Step:    "stuck-loop",
 					Message: fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
 					Round:   roundNum,
 					MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
-				}
-				ch <- ChatStreamChunk{Done: true}
+				})
+				sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
 				return
 			}
 
@@ -1922,12 +2092,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Type:    llm.TypeText,
 					Content: fmt.Sprintf("工具 `%s` 已连续失败 %d 次。不要重试 — 改用其他方式完成任务（如 read_file、list_files、或 task 子代理）。", sameToolErrName, sameToolErrCount),
 				})
-				ch <- ChatStreamChunk{
+				sendOrDrop(ctx, ch, ChatStreamChunk{
 					Phase:   "limit",
 					Step:    "same-tool-err-limit",
 					Message: fmt.Sprintf("%s 已连续失败 %d 次，改用其他方式。", sameToolErrName, sameToolErrCount),
 					Round:   roundNum,
-				}
+				})
 				sameToolErrCount = 0
 			}
 
@@ -1943,9 +2113,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		if maxRounds > 0 {
-			ch <- ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut}
+			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 		}
-		ch <- ChatStreamChunk{Done: true}
+		sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
 	}()
 
 	return ch
@@ -1961,11 +2131,60 @@ func formatElapsed(d time.Duration) string {
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
+// needsNormalizedToolResults reports whether the named provider
+// needs the legacy `normalizeToolResults` transformation before
+// messages are sent to the LLM.
+//
+// History: an earlier version of this code applied the normalize
+// transformation globally to every provider, on the theory that a
+// handful of OpenAI-compatible proxies validate the
+// tool_call/tool_result pairing and reject mixed rounds. The cost
+// was that standard openai / anthropic LLMs lost the
+// tool_call/tool_result pairing in their context, which broke the
+// `question` tool flow: the LLM no longer saw its own tool_call,
+// interpreted the tool result as a user message, and re-asked via
+// the question tool — a loop. The bug surfaced in 2026-07-09
+// against the `cs` provider (Doubao proxy → mimo-v2.5).
+//
+// The fix is to apply normalize only to the providers that
+// actually need it. Currently no provider on the active list does,
+// so this returns false for every known name; the legacy code path
+// is preserved as a fall-back for the day a quirky proxy shows up.
+// Add a provider name here (or a `Protocol` value via the config
+// field below) to opt in.
+//
+// Note: this intentionally keys on the provider NAME, not the
+// `Protocol` field. The protocol only tells us the wire format
+// (openai / anthropic) — both support tool_call/tool_result pairs
+// correctly. The "needing normalize" attribute is a per-provider
+// quirk, not a protocol attribute.
+func needsNormalizedToolResults(providerName string) bool {
+	switch providerName {
+	// Add provider names here that have been verified to need
+	// the legacy flatten-tool-results treatment. Examples
+	// (none currently active):
+	//
+	//   case "some-quirky-proxy":
+	//       return true
+	default:
+		return false
+	}
+}
+
 // normalizeToolResults removes TypeToolCall metadata rows and
 // converts TypeToolResult messages to User role. This way providers
-// that validate tool_call/tool_result pairing (DeepSeek, etc.) see
-// normal user-assistant-user conversation, and the LLM still sees
-// tool results as part of the ongoing dialogue.
+// that validate tool_call/tool_result pairing (some OpenAI-
+// compatible proxies) see normal user-assistant-user conversation,
+// and the LLM still sees tool results as part of the ongoing
+// dialogue.
+//
+// WARNING: this transformation BREAKS the question tool flow on
+// standard OpenAI / Anthropic models. The LLM needs the
+// tool_call/tool_result pairing to recognise that the user has
+// answered; flattening the result into a user message makes the
+// LLM interpret the JSON as a user statement and re-ask the
+// question (infinite loop). Apply only via
+// needsNormalizedToolResults — never globally.
 func normalizeToolResults(msgs []llm.ChatMessage) []llm.ChatMessage {
 	out := make([]llm.ChatMessage, 0, len(msgs))
 	for _, m := range msgs {
@@ -1988,6 +2207,21 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 		"role":   msg.Role,
 		"reason": "assistant",
 	}
+	// `thinking` is the v1 metadata key. It's redundant
+	// with the v2 path below (snapshotStructural includes
+	// thinking parts in the meta["parts"] blob), but the
+	// server's decodePartsFromMeta v1 fallback still
+	// reads `meta["thinking"]` to rebuild a thinking
+	// part when the parts blob is structural-only. Older
+	// rows that were persisted before the v2 parts
+	// snapshot landed in the agent (commit 8a16a69) have
+	// `meta["thinking"]` populated and a structural-only
+	// parts blob (or none at all) — the v1 fallback is
+	// what makes their reload view correct. Keep the
+	// write; without it, a session that started under v1
+	// and continued under v2 could lose thinking on
+	// reload if any intermediate change re-emits the row
+	// through the structural-only path.
 	if fullThinking != "" {
 		meta["thinking"] = fullThinking
 	}
@@ -2004,39 +2238,6 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 		}
 	}
 	store.AddChatMessageWithMetaTo(convID, msg, meta)
-}
-
-// persistQuestion stores the question tool's arguments as a
-// msg_type=6 message so the question table is visible in
-// session history after reload.
-func persistQuestion(convID string, store *memory.Store, questionsJSON string) {
-	if store == nil || questionsJSON == "" {
-		return
-	}
-	msg := llm.ChatMessage{
-		Role:        llm.RoleAssistant,
-		Type:        llm.TypeText,
-		MsgType:     llm.MsgTypeQuestion,
-		SubmitToLLM: 1,
-		Content:     questionsJSON,
-	}
-	store.AddChatMessageTo(convID, msg)
-}
-
-// persistQuestionAnswer stores the user's question answers as a
-// msg_type=6 message, paired with the preceding question message.
-func persistQuestionAnswer(convID string, store *memory.Store, answersJSON string) {
-	if store == nil || answersJSON == "" {
-		return
-	}
-	msg := llm.ChatMessage{
-		Role:        llm.RoleUser,
-		Type:        llm.TypeText,
-		MsgType:     llm.MsgTypeQuestion,
-		SubmitToLLM: 1,
-		Content:     answersJSON,
-	}
-	store.AddChatMessageTo(convID, msg)
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction
@@ -2097,49 +2298,49 @@ func (a *Agent) tryAutoCompact(
 		return false
 	}
 
-	ch <- ChatStreamChunk{
+	sendOrDrop(ctx, ch, ChatStreamChunk{
 		Phase:    "compact",
 		Step:     "auto-compact",
 		Message:  fmt.Sprintf("上下文接近上限 (≈%d / %d tokens)，自动压缩历史…", total, llm.UsableContextWithBuf(ctxWindow, buf)+buf),
 		Round:    roundNum,
 		MaxRound: maxRounds,
-	}
+	})
 
 	ok, summary, err := a.summarizer.Compress(ctx, req.SessionID)
 	if err != nil || !ok {
-		ch <- ChatStreamChunk{
+		sendOrDrop(ctx, ch, ChatStreamChunk{
 			Phase:   "compact",
 			Step:    "auto-compact-fail",
 			Message: fmt.Sprintf("自动压缩失败: %v", err),
 			Round:   roundNum,
 			MaxRound: maxRounds,
-		}
+		})
 		// Fallback: hard-truncate the message list so the LLM
 		// call doesn't fail with a 413. Drop oldest non-system
 		// messages to stay within the usable context window.
 		usable := llm.UsableContextWithBuf(ctxWindow, buf)
 		if usable > 0 {
 			truncateToFit(msgs, usable)
-			ch <- ChatStreamChunk{
+			sendOrDrop(ctx, ch, ChatStreamChunk{
 				Phase:    "compact",
 				Step:     "auto-compact-fallback",
 				Message:  fmt.Sprintf("压缩失败，已截断上下文至 ≈%d tokens", llm.EstimateTokensMessages(*msgs)),
 				Round:    roundNum,
 				MaxRound: maxRounds,
-			}
+			})
 			_ = summary
 			return true
 		}
 		return false
 	}
 
-	ch <- ChatStreamChunk{
+	sendOrDrop(ctx, ch, ChatStreamChunk{
 		Phase:   "compact",
 		Step:    "auto-compact-ok",
 		Message: "上下文已压缩，继续执行…",
 		Round:   roundNum,
 		MaxRound: maxRounds,
-	}
+	})
 
 	// Backfill: reload messages after compression point and
 	// append the summary to the system prompt.
@@ -2263,10 +2464,6 @@ func (a *Agent) truncateToolResult(name string, content string) string {
 		}
 	}
 
-	if len(content) <= defaultCap {
-		return content
-	}
-
 	var cap_ int
 	keepHead := true
 	switch name {
@@ -2279,6 +2476,13 @@ func (a *Agent) truncateToolResult(name string, content string) string {
 		cap_ = defaultCap
 	}
 
+	// The previous version had a `len(content) <= defaultCap`
+	// short-circuit here, which incorrectly skipped truncation
+	// for exec_command when execCap < defaultCap. For example,
+	// with defaultCap=6000 and execCap=4000, an exec result
+	// of 5000 bytes would pass the early return and be sent
+	// to the LLM untruncated (exceeding the configured
+	// exec_cap). Always go through the per-name cap check.
 	if len(content) <= cap_ {
 		return content
 	}
@@ -2381,11 +2585,21 @@ func cleanMarkdownToolCalls(content string) string {
 // legitimate phantom but small enough that a multi-paragraph
 // response that happens to mention both trigger phrases won't
 // be nuked wholesale.
-// words) so a multi-paragraph assistant reply that *mentions*
-// the phrase "Cannot read ... Inform the user" in passing
-// (e.g. quoting documentation) doesn't get redacted wholesale.
+// phantomVisionErrorRe mirrors the regex used to strip Claude-style
+// "Cannot read image.png ... Inform the user." phantoms that
+// DeepSeek-trained models parrot when they encounter vision
+// attachments they can't actually decode. The cap on distance
+// (400 chars) distinguishes a phantom from a legitimate
+// "I can't read this" diagnostic in a longer response.
+//
+// Multiple alternates catch the various phrasings different
+// models use: "Cannot read" (Claude), "Unable to read" /
+// "Failed to read" (some proxies), "I cannot view" / "I can't
+// view" (OpenAI-flavoured). The trailing "Inform the user" is
+// what really identifies a phantom — real diagnostic messages
+// don't end that way.
 var phantomVisionErrorRe = regexp.MustCompile(
-	`(?is)Cannot read[\s\S]{0,400}?Inform the user\.?`,
+	`(?is)(?:Cannot|Unable to|Failed to|cannot|unable to) (?:read|view|process)[\s\S]{0,400}?[Ii]nform the user\.?`,
 )
 
 // phantomVisionErrorReplacement is the clean user-facing message

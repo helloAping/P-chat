@@ -46,6 +46,8 @@ import (
 //   - "thinking"  — model reasoning / chain-of-thought (Text + Streaming)
 //   - "tool"      — a single tool call (Name, Args, Status, Result, ...)
 //   - "sub_agent" — a nested sub-agent run (Task, Status, Parts)
+//   - "question"  — a user-facing question card (Text=questions JSON,
+//                   Name=answers JSON after the user picks)
 //
 // The JSON tags are the wire format. Anything not appropriate for
 // a given Kind is left at the zero value and is dropped by
@@ -85,6 +87,14 @@ type MessagePart struct {
 	// header so the user can read the full hint without
 	// expanding the body.
 	AgentDescription string `json:"agent_description,omitempty"`
+	// QuestionStatus tracks the question part's lifecycle.
+	// "open"   — question just emitted, user hasn't answered.
+	// "ok"     — user picked an option(s); Name carries the
+	//            answers JSON.
+	// "error"  — question timed out or was cancelled.
+	// Defaults to empty (caller should treat as "open" if
+	// missing — old persisted data without the field).
+	QuestionStatus string `json:"question_status,omitempty"`
 }
 
 // Part kind numeric constants for dispatch.
@@ -166,6 +176,39 @@ func lastIndexOfKind(parts []MessagePart, kind string) int {
 		}
 	}
 	return -1
+}
+
+// firstNonWS returns the first non-whitespace byte of s,
+// or 0 if s is empty / all-whitespace. Used to peek at
+// whether a JSON payload is an array (prompt) or object
+// (result-with-answers) without paying for a full parse
+// up front. We tolerate leading whitespace because the
+// tool pipeline sometimes wraps events with extra spaces.
+func firstNonWS(s string) byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			return c
+		}
+	}
+	return 0
+}
+
+// mustMarshalRaw marshals a []json.RawMessage into a
+// single raw JSON array, falling back to `null` on error
+// (the caller treats both as "no questions"). The
+// error-swallow is intentional — a corrupted question
+// payload should still surface a card to the user
+// rather than crashing the whole stream.
+func mustMarshalRaw(rr []json.RawMessage) json.RawMessage {
+	if rr == nil {
+		return json.RawMessage("null")
+	}
+	out, err := json.Marshal(rr)
+	if err != nil {
+		return json.RawMessage("null")
+	}
+	return out
 }
 
 // activeSubParts returns the inner parts list of the active
@@ -367,13 +410,26 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		return
 	}
 
-	// Thinking delta: append to the trailing thinking part of
-	// the active (sub-agent or top-level) parts list.
+	// Thinking delta: append to the trailing *still-
+	// streaming* thinking part of the active (sub-agent or
+	// top-level) parts list.
+	//
+	// The `Streaming` guard is important: if the LLM has
+	// already moved on to content (which flips the prior
+	// thinking part to Streaming=false in the branch
+	// below), a later thinking delta must start a fresh
+	// part, not retroactively reopen the closed one and
+	// splice round-N+1's reasoning into round-N's block.
+	// Without this guard, a multi-round tool flow would
+	// concatenate every round's thinking into one giant
+	// blob and re-flip the flag to "still typing" — the
+	// same stuck-streaming bug that the content-delta
+	// fix below addresses from the other side. Both
+	// guards need to be present.
 	if c.Thinking != "" {
 		parts := a.activeParts()
-		if i := lastIndexOfKind(parts, "thinking"); i >= 0 {
+		if i := lastIndexOfKind(parts, "thinking"); i >= 0 && parts[i].Streaming {
 			parts[i].Text += c.Thinking
-			parts[i].Streaming = true
 		} else {
 			parts = append(parts, MessagePart{
 				Kind:      "thinking",
@@ -387,8 +443,33 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 
 	// Content delta: append to the trailing text part of the
 	// active (sub-agent or top-level) parts list.
+	//
+	// Before appending, flip the trailing Streaming=true
+	// thinking part to false. The LLM transitioning from
+	// thinking to writing content is the natural "this
+	// thinking block is done" signal. Without this, the
+	// thinking part stays at Streaming=true for the entire
+	// rest of the conversation — c.Done is only emitted
+	// once per conversation (agent.go:1534/1967/2017), not
+	// per round, so a multi-round tool flow would render
+	// every prior round's thinking block as a still-typing
+	// indicator. The frontend reads the Streaming flag
+	// to decide whether to show a blinking caret / loading
+	// dot; a stuck "true" reads as "the LLM is still
+	// thinking" forever, which is exactly the bug reported
+	// in 2026-07-09.
+	//
+	// Only the *trailing* thinking part is flipped — a
+	// future thinking delta would start a new part
+	// naturally (lastIndexOfKind picks the most recent),
+	// and the appended-to-OLD-part behaviour for a
+	// mid-content thinking delta is the pre-existing
+	// quirk (the spec doesn't define interleaving).
 	if c.Content != "" {
 		parts := a.activeParts()
+		if i := lastIndexOfKind(parts, "thinking"); i >= 0 && parts[i].Streaming {
+			parts[i].Streaming = false
+		}
 		if i := lastIndexOfKind(parts, "text"); i >= 0 {
 			parts[i].Text += c.Content
 		} else {
@@ -401,16 +482,125 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		return
 	}
 
+	// Question event: a new `question` part is opened with
+	// the questions JSON in Text and QuestionStatus="open".
+	// When the user picks an answer, the question tool's
+	// result JSON ({"questions":[...], "answers":{...}})
+	// comes back through the same QuestionJSON channel —
+	// we then update the trailing open question part in
+	// place: parse out the answers map, store it in Name
+	// (the existing QuestionTable.vue contract), and flip
+	// QuestionStatus to "ok". This keeps the question
+	// card visible in the assistant message with the
+	// user's picks highlighted, and survives a session
+	// reload because the part is part of the persisted
+	// parts snapshot (snapshotStructural in persistAssistant).
+	//
+	// The server emits the question JSON in two shapes
+	// (depending on lifecycle stage):
+	//   prompt:  "[{...},{...}]"  (raw question array)
+	//   result:  '{"questions":[{...}],"answers":{...}}'  (object)
+	// We detect which shape came in by peeking at the
+	// first non-whitespace byte ('[' vs '{') and parse
+	// accordingly. Both shapes get normalised to the
+	// canonical `{questions:[...]}` form when stored in
+	// part.Text so QuestionTable.vue's reload decode
+	// (`JSON.parse(text)?.questions`) is happy.
+	if c.QuestionJSON != "" {
+		// First, try to parse the result-with-answers
+		// shape. If `answers` is present, this is the
+		// post-user-answer payload and we update the
+		// trailing open question part in place.
+		var resultPayload struct {
+			Questions []json.RawMessage `json:"questions"`
+			Answers   map[string]string  `json:"answers"`
+		}
+		if err := json.Unmarshal([]byte(c.QuestionJSON), &resultPayload); err == nil &&
+			len(resultPayload.Answers) > 0 {
+			parts := a.activeParts()
+			if i := lastIndexOfKind(parts, "question"); i >= 0 {
+				tail := parts[i]
+				if tail.QuestionStatus == "" || tail.QuestionStatus == "open" {
+					ans, _ := json.Marshal(resultPayload.Answers)
+					// Always store Text in the canonical
+					// {questions:[...]} shape so the
+					// reload decoder doesn't need to
+					// guess.
+					if len(resultPayload.Questions) > 0 {
+						// The questions array is still
+						// raw messages; re-marshal the
+						// whole shape we want.
+						qs, _ := json.Marshal(map[string]json.RawMessage{
+							"questions": mustMarshalRaw(resultPayload.Questions),
+						})
+						tail.Text = string(qs)
+					}
+					tail.Name = string(ans)
+					tail.QuestionStatus = "ok"
+					parts[i] = tail
+					a.setActiveParts(parts)
+					return
+				}
+			}
+		}
+
+		// Otherwise: open a fresh question part. Re-shape
+		// the incoming JSON into the canonical
+		// {questions:[...]} form. We do this by parsing
+		// as either an array (prompt) or an object, then
+		// re-marshaling the questions array into the
+		// canonical envelope. Reload paths therefore see
+		// one shape only.
+		var questionsArr []json.RawMessage
+		if first := firstNonWS(c.QuestionJSON); first == '[' {
+			if err := json.Unmarshal([]byte(c.QuestionJSON), &questionsArr); err != nil {
+				// Malformed — fall through and store raw.
+				questionsArr = nil
+			}
+		} else {
+			// Object shape (server bug, but be defensive).
+			var obj struct {
+				Questions []json.RawMessage `json:"questions"`
+			}
+			_ = json.Unmarshal([]byte(c.QuestionJSON), &obj)
+			questionsArr = obj.Questions
+		}
+		canonical, _ := json.Marshal(map[string]json.RawMessage{
+			"questions": mustMarshalRaw(questionsArr),
+		})
+		parts := a.activeParts()
+		parts = append(parts, MessagePart{
+			Kind:           "question",
+			Text:           string(canonical),
+			QuestionStatus: "open",
+		})
+		a.setActiveParts(parts)
+		return
+	}
+
 	// Final "done" event: clear the streaming flag on any open
-	// thinking parts (the assistant is done reasoning).
+	// thinking parts (the assistant is done reasoning). Also
+	// close any still-open question parts (status="open") as
+	// "error" — the round ended without the user answering,
+	// so the persisted part should not look like it's still
+	// waiting for input. (A user-answered question already
+	// flipped to "ok" via the QuestionJSON path above.)
 	if c.Done {
 		for i := range a.parts {
 			if a.parts[i].Kind == "thinking" && a.parts[i].Streaming {
 				a.parts[i].Streaming = false
 			}
+			if a.parts[i].Kind == "question" &&
+				(a.parts[i].QuestionStatus == "" || a.parts[i].QuestionStatus == "open") {
+				a.parts[i].QuestionStatus = "error"
+			}
 			for j := range a.parts[i].Parts {
 				if a.parts[i].Parts[j].Kind == "thinking" && a.parts[i].Parts[j].Streaming {
 					a.parts[i].Parts[j].Streaming = false
+				}
+				if a.parts[i].Parts[j].Kind == "question" &&
+					(a.parts[i].Parts[j].QuestionStatus == "" || a.parts[i].Parts[j].QuestionStatus == "open") {
+					a.parts[i].Parts[j].QuestionStatus = "error"
 				}
 			}
 		}
@@ -421,19 +611,55 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 // chunkToEvent so the accumulator and the wire format agree on
 // the status string for a given step. Keep the two in lockstep
 // if you ever touch this.
+//
+// The step format is "call-<n>-<status>" (e.g. "call-1-ok",
+// "call-1-err", "call-1-warn"). We parse the trailing status
+// segment instead of substring-matching "ok" / "err" so a future
+// status name like "bookkeeping" or "trigger" can't accidentally
+// match. Empty / unparseable step → "start".
 func toolStatusFromStep(step, errMsg string) string {
-	switch {
-	case errMsg != "":
+	if errMsg != "" {
 		return "error"
-	case strings.Contains(step, "ok"):
-		return "ok"
-	case strings.Contains(step, "warn"):
-		return "warn"
-	case strings.Contains(step, "err"):
-		return "error"
-	default:
+	}
+	status := parseStepStatus(step)
+	if status == "" {
 		return "start"
 	}
+	return status
+}
+
+// parseStepStatus extracts the trailing status segment from a
+// step like "call-1-ok" → "ok". Returns "" for malformed input
+// (the caller falls back to "start").
+func parseStepStatus(step string) string {
+	// Expected: "call-N-status" or "call-N-status-...".
+	// We split on '-' and use the last non-empty segment.
+	idx := strings.LastIndex(step, "-")
+	if idx < 0 || idx+1 >= len(step) {
+		return ""
+	}
+	candidate := step[idx+1:]
+	switch candidate {
+	case "ok", "warn", "err", "error", "start":
+		return canonicalStatus(candidate)
+	}
+	return ""
+}
+
+// canonicalStatus normalises the few valid status names so the
+// accumulator and the wire format agree ("err" → "error").
+func canonicalStatus(s string) string {
+	switch s {
+	case "ok":
+		return "ok"
+	case "warn":
+		return "warn"
+	case "err", "error":
+		return "error"
+	case "start":
+		return "start"
+	}
+	return s
 }
 
 // snapshot returns a deep-enough copy of the parts for
@@ -452,10 +678,6 @@ func (a *partsAccumulator) snapshot() []MessagePart {
 	return out
 }
 
-// snapshotStructural returns a deep copy of only the
-// structural parts (tool + sub_agent), dropping top-level
-// text and thinking. Sub-agent nested parts (including their
-// inner text and thinking) are preserved.
 // snapshotStructural returns a deep copy of the accumulator's parts
 // array — including text and thinking parts in their original stream
 // order. The caller (persistAssistant) stores it as JSON in
@@ -466,14 +688,47 @@ func (a *partsAccumulator) snapshot() []MessagePart {
 // interleaved order the user saw during streaming); when it contains
 // only tool / sub_agent parts, the legacy rebuild path kicks in
 // (thinking from meta["thinking"], text from the content column).
+//
+// The `Streaming` flag is force-cleared on every part before
+// serializing. The persisted state is the FINAL state of the
+// conversation (or the round), so a part is never "in progress"
+// on reload — that's a live-UI concern only. Without this
+// strip, a thinking part that was `Streaming: true` at the
+// moment of persist (e.g. round N's last chunk was a thinking
+// delta, and the persist happens before round N+1's content
+// delta flips it to false) would round-trip back to the
+// frontend with `streaming: true`, rendering the "思考中…"
+// spinner on a thought the user already saw the LLM finish.
+// This showed up in 2026-07-09 after a rollback/undo: the
+// in-memory UI was consistent (all thinking parts done) but
+// the rollback's wire format replayed the stale streaming
+// flag.
 func snapshotStructural(a *partsAccumulator) []MessagePart {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if len(a.parts) == 0 {
 		return nil
 	}
+	// Deep-copy via JSON round-trip, then force-clear the
+	// Streaming flag on every part (including nested sub-agent
+	// inner parts). The persisted state is the final state;
+	// streaming is a live-UI signal only.
 	b, _ := json.Marshal(a.parts)
 	var out []MessagePart
 	_ = json.Unmarshal(b, &out)
+	clearStreamingFlag(&out)
 	return out
+}
+
+// clearStreamingFlag recursively resets Streaming=false on
+// every part. Used by snapshotStructural to ensure the
+// persisted parts blob never carries a stale "in progress"
+// flag into a session reload.
+func clearStreamingFlag(parts *[]MessagePart) {
+	for i := range *parts {
+		(*parts)[i].Streaming = false
+		if len((*parts)[i].Parts) > 0 {
+			clearStreamingFlag(&(*parts)[i].Parts)
+		}
+	}
 }

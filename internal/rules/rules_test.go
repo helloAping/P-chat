@@ -162,3 +162,96 @@ func TestBuildRulesContext_StableAcrossCalls(t *testing.T) {
 		t.Errorf("BuildRulesContext not stable:\n%s\n---\n%s", a, b)
 	}
 }
+
+// --- 2026-07 project-aware loader tests ----------------------
+
+// TestLoadAllWithRoot_ProjectRootIgnoresServerCWD is the
+// 2026-07 P1.5 regression test: project rules under a
+// DIFFERENT directory than the server CWD must still be
+// picked up. Pre-2026-07 LoadAll() used os.Getwd() so a
+// Wails GUI server (whose CWD is unrelated to the user's
+// project) would skip the project slot entirely.
+func TestLoadAllWithRoot_ProjectRootIgnoresServerCWD(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("HOME", tmp)
+	root := t.TempDir()
+
+	// Save and restore CWD to a third directory that has
+	// no project rules; only the explicit root param
+	// finds the project-level rule.
+	oldCwd, _ := os.Getwd()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldCwd) })
+
+	writeRule(t, filepath.Join(root, ".p-chat", "rules"), "project-only.md", "project content")
+
+	got, err := LoadAllWithRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(got))
+	}
+	if got[0].Name != "project-only" {
+		t.Errorf("expected 'project-only', got %q", got[0].Name)
+	}
+	if got[0].IsGlobal {
+		t.Errorf("expected IsGlobal=false for project-level rule, got true")
+	}
+}
+
+// TestLoadAllWithRoot_BothLoaded is the merge test: global
+// + project rules are both loaded (AND policy). Pre-2026-07
+// the merge was based on os.Getwd() so it didn't work for
+// Wails; post-fix, the project slot is anchored to the
+// session's projectRoot.
+func TestLoadAllWithRoot_BothLoaded(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("HOME", tmp)
+	root := t.TempDir()
+
+	writeRule(t, filepath.Join(tmp, ".p-chat", "rules"), "global-rule.md", "global content")
+	writeRule(t, filepath.Join(root, ".p-chat", "rules"), "project-rule.md", "project content")
+
+	got, err := LoadAllWithRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rules (global + project), got %d", len(got))
+	}
+	// Global first, then project (per sort by IsGlobal).
+	if !got[0].IsGlobal {
+		t.Errorf("first rule should be global, got IsGlobal=false")
+	}
+	if got[1].IsGlobal {
+		t.Errorf("second rule should be project, got IsGlobal=true")
+	}
+}
+
+// TestLoadAllWithRoot_EmptyRootSkipsProjectSlot locks the
+// "no project pinned" branch: root == "" means the project
+// slot is skipped.
+func TestLoadAllWithRoot_EmptyRootSkipsProjectSlot(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("HOME", tmp)
+	root := t.TempDir()
+
+	writeRule(t, filepath.Join(root, ".p-chat", "rules"), "project-only.md", "x")
+	writeRule(t, filepath.Join(tmp, ".p-chat", "rules"), "global-only.md", "y")
+
+	got, err := LoadAllWithRoot("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range got {
+		if r.Name == "project-only" {
+			t.Errorf("empty root should skip project slot, got %+v", got)
+		}
+	}
+}

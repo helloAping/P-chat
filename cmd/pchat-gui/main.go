@@ -764,7 +764,15 @@ func (a *App) spawnAndWatch() {
 		args = append(args, "--config", cfg)
 	}
 	cmd := exec.Command(bin, args...)
-	cmd.Env = append(os.Environ(), "PCHAT_PORT="+strconv.Itoa(port))
+	// Forward both PCHAT_PORT and PCHAT_HOME so the child
+	// server binds to the port we picked AND uses the same
+	// home directory as the GUI (a sibling of the GUI binary
+	// when running from bin/ or dev-bin/ — see homepath.go
+	// for the resolution rules).
+	cmd.Env = append(os.Environ(),
+		"PCHAT_PORT="+strconv.Itoa(port),
+		"PCHAT_HOME="+resolveHomeDir(),
+	)
 	// pchat-gui is a WINDOWS_GUI subsystem binary, but Go's
 	// os/exec still allocates a fresh console for child processes
 	// unless we set CREATE_NO_WINDOW explicitly. Without this, every
@@ -901,23 +909,23 @@ func pickFreePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-// pickConfigPath returns the user's p-chat config path. Prefers the
-// newer json file, falls back to yaml. Returns "" when neither exists
-// (fresh install — pchat-server uses built-in defaults).
+// pickConfigPath returns the active p-chat config path. Prefers
+// the newer json file, falls back to yaml. Returns "" when
+// neither exists (fresh install — pchat-server uses built-in
+// defaults).
+//
+// The home directory itself is decided by resolveHomeDir() in
+// homepath.go — the GUI is its own Go module so it can't
+// import internal/paths from the root module.
+//   - $PCHAT_HOME if set
+//   - sibling of this binary if it lives in bin/ or dev-bin/
+//   - $HOME/.p-chat fallback
+//
+// When the GUI is launched from bin/pchat-gui.exe, the config
+// it picks up is bin/.p-chat/config.json — fully isolated
+// from the user's real ~/.p-chat.
 func pickConfigPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return ""
-	}
-	jsonPath := filepath.Join(home, ".p-chat", "config.json")
-	yamlPath := filepath.Join(home, ".p-chat", "config.yaml")
-	if _, err := os.Stat(jsonPath); err == nil {
-		return jsonPath
-	}
-	if _, err := os.Stat(yamlPath); err == nil {
-		return yamlPath
-	}
-	return ""
+	return resolveConfigPath()
 }
 
 // hideChildConsole suppresses the stray console window that Go's

@@ -3,6 +3,7 @@ import { ref, computed, watch } from 'vue'
 import { NModal, NButton, NRadio, NCheckbox, NSpace, NTag, NScrollbar, NInput } from 'naive-ui'
 import { state, submitQuestionAnswer, currentPendingQuestion } from '../stores/chat'
 import type { QuestionItem } from '../api/client'
+import { MessageSquare } from './icons'
 
 const currentIndex = ref(0)
 const answers = ref<Record<string, string>>({})
@@ -106,15 +107,35 @@ function submit() {
   const all: Record<string, string> = {}
   for (const q of questions.value) {
     const key = q.question
+    let v = ''
     if (q.multi_select) {
-      const selected = (multiAnswers.value[key] || []).map(v =>
-        v === OTHER_LABEL ? (customInputs.value[key] || '其他') : v
+      const selected = (multiAnswers.value[key] || []).map(v2 =>
+        v2 === OTHER_LABEL ? (customInputs.value[key] || '其他') : v2
       )
-      all[key] = selected.join(', ')
+      v = selected.join(', ')
     } else {
-      const v = answers.value[key] || ''
-      all[key] = v === OTHER_LABEL ? (customInputs.value[key] || '其他') : v
+      const raw = answers.value[key] || ''
+      v = raw === OTHER_LABEL ? (customInputs.value[key] || '其他') : raw
     }
+    // Skip questions the user did not actually answer
+    // (defensive — canProceed() should already block the
+    // submit button in that case, but multi-step flows
+    // can race if the user navigates back and clears a
+    // previous selection).
+    if (!v) continue
+    // Use `q.header` as the wire key, NOT `q.question`.
+    // The server-side `tool.QuestionResponse.Answers` is
+    // a flat map keyed by `header` (the Anthropic API
+    // convention the LLM is trained on). The chat store's
+    // in-place updater `updateQuestionStatusInParts`
+    // also matches by `q.header`. Keying by question
+    // text would cause the LLM to receive answers it
+    // cannot map back to questions, and the question
+    // part in the chat to remain in "等待回答" forever.
+    // A duplicate `header` would be a server-side bug;
+    // a duplicate `question` text is common (LLM often
+    // reuses boilerplate), so header is the safer key.
+    all[q.header] = v
   }
   submitQuestionAnswer(all)
 }
@@ -141,9 +162,15 @@ const displayOptions = computed(() => {
     preset="card"
     :closable="false"
     :mask-closable="false"
-    title="💬 LLM 的提问"
+    title="LLM 的提问"
     style="max-width: 560px"
   >
+    <template #header>
+      <div class="qmodal-header">
+        <MessageSquare :size="18" class="qmodal-header-icon" />
+        <span>LLM 的提问</span>
+      </div>
+    </template>
     <div class="qnav">
       <NTag
         v-for="(q, i) in questions"
@@ -208,6 +235,14 @@ const displayOptions = computed(() => {
 </template>
 
 <style scoped>
+.qmodal-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+.qmodal-header-icon { color: var(--brand-500); }
 .qnav {
   display: flex;
   gap: 6px;

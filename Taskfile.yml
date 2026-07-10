@@ -242,3 +242,13 @@ tasks:
       - Remove-Item -Recurse -Force dev-bin -ErrorAction SilentlyContinue
       - Remove-Item -Recurse -Force cmd\pchat-gui\build\bin -ErrorAction SilentlyContinue
       - Remove-Item -Recurse -Force web\assets -ErrorAction SilentlyContinue
+
+  release:run:
+    desc: 本地打 tag 触发 CI Draft Release（交互式，会询问确认）
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release.ps1
+
+  release:dryrun:
+    desc: 预览 release:run 会做什么（不实际修改）
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release.ps1 -DryRun

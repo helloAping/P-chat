@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onBeforeUnmount } from 'vue'
-import { NScrollbar, NSpin, NSpace, NButton, NInput, NTooltip, useMessage, NIcon } from 'naive-ui'
+import { NSpin, useMessage } from 'naive-ui'
+import { MessageSquare } from './icons'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
-import QuestionPanel from './QuestionPanel.vue'
+// QuestionPanel removed in 2026-07-09 — it duplicated
+// QuestionModal's state (answers, multiAnswers) and created a
+// race where the user could submit via the inline panel while
+// the modal still showed "open" (or vice versa). The modal
+// in App.vue is the single source of truth for question UI.
 import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession } from '../stores/chat'
-import * as api from '../api/client'
 
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
@@ -28,10 +32,7 @@ function scrollToBottom() {
   })
 }
 
-// onScroll is bound to the NScrollbar's underlying
-// scrollable element (Naive UI's NScrollbar ref points to
-// the outer wrapper, but the actual scroll listener must
-// attach to the inner .n-scrollbar-container). When the user
+// onScroll is bound to the messages container. When the user
 // scrolls within ~80px of the top, we kick off the next
 // page load — but only if has_more is true.
 async function onScroll(e: Event) {
@@ -63,34 +64,15 @@ watch(() => currentMessages.value.length, (newLen, oldLen) => {
 watch(() => currentMessages.value, () => scrollToBottom(), { deep: true })
 watch(() => state.currentID, () => scrollToBottom())
 
-onMounted(async () => {
+onMounted(() => {
   scrollToBottom()
-  // Attach the scroll listener to the actual scrollable
-  // element. NScrollbar's :native-scrollbar="false" path
-  // wraps the content in a custom scrollbar; the inner
-  // container is what receives scroll events.
-  await nextTick()
-  const scroller = messagesEl.value?.querySelector('.n-scrollbar-container') as HTMLElement | null
-  if (scroller) {
-    scroller.addEventListener('scroll', onScroll, { passive: true })
-    ;(messagesEl.value as any).__scroller = scroller
-  }
 })
 
 onBeforeUnmount(() => {
-  const scroller = (messagesEl.value as any)?.__scroller as HTMLElement | undefined
-  if (scroller) scroller.removeEventListener('scroll', onScroll)
+  // No custom scroll listener to remove — onScroll is bound
+  // by Vue's @scroll on the template element, which Vue
+  // auto-cleans on unmount.
 })
-
-async function onOpenExplorer() {
-  if (!state.activeProjectPath) return
-  try { await api.openExplorer(state.activeProjectPath) } catch { /* ignore */ }
-}
-
-async function onOpenTerminal() {
-  if (!state.activeProjectPath) return
-  try { await api.openTerminal(state.activeProjectPath) } catch { /* ignore */ }
-}
 
 function handleRollback(index: number) {
   if (!state.currentID) return
@@ -115,23 +97,54 @@ async function handleFork(index: number) {
     message.error('创建分支对话失败')
   }
 }
+
+// messageKey produces a stable Vue :key for a message in the
+// v-for list. We prefer seq (the per-conversation logical
+// position, stable across rollback/undo) and fall back to
+// id (the physical row id) for older messages that haven't
+// been backfilled. The trailing `i` + content fingerprint is
+// a last-resort fallback for any pre-id streaming message
+// (only relevant during the first few ms of a user turn
+// before the server returns the row id).
+//
+// The fallback content fingerprint is needed so a streaming
+// message whose id changes mid-turn (e.g. id is filled in
+// after the first SSE event) doesn't trigger Vue to
+// unmount+remount the bubble on every event.
+function messageKey(m: any, i: number): string | number {
+  if (m.seq != null && m.seq > 0) return m.seq
+  if (m.id != null) return `id-${m.id}`
+  return `tmp-${i}-${(m.content || '').length}-${m.role}`
+}
 </script>
 
 <template>
   <main class="chat-main">
-    <div class="chat-header">
-      <div class="header-title">
-        {{ state.sessions.find(s => s.id === state.currentID)?.title || 'P-Chat' }}
-      </div>
-      <div v-if="state.activeProjectPath" class="header-actions">
-        <NButton size="tiny" quaternary @click="onOpenExplorer" title="打开资源管理器">📂</NButton>
-        <NButton size="tiny" quaternary @click="onOpenTerminal" title="打开终端">🖥</NButton>
-      </div>
-    </div>
-    <NScrollbar ref="messagesEl" class="messages-scroll" :native-scrollbar="false">
+    <!-- Plain scrollable container. We don't use NScrollbar
+         here because its :native-scrollbar="false" path wraps
+         the content in a custom-scrollbar div that conflicts
+         with the parent flex layout: the inner
+         .n-scrollbar-container gets its height from the slot
+         content, not the parent, so it can't reliably fill
+         the available space — the input area below used to
+         drift up and overlap the message list. A plain
+         `overflow-y: auto` on a flex: 1 / min-height: 0
+         container is the most reliable pattern for this
+         layout: the browser's native scrollbar works in
+         every rendering mode (no race with NScrollbar's
+         scroll-listener attach in onMounted) and the input
+         below stays pinned to the bottom of the viewport
+         even when the message list is short. -->
+    <div
+      ref="messagesEl"
+      class="messages-scroll"
+      @scroll="onScroll"
+    >
       <div class="messages">
         <div v-if="currentMessages.length === 0" class="empty">
-          <div class="empty-icon">💬</div>
+          <div class="empty-icon">
+            <MessageSquare :size="48" />
+          </div>
           <div class="empty-title">开始一个新对话吧</div>
           <div class="empty-hint">输入 /help 查看可用命令 · 拖入或粘贴文件可作为附件</div>
         </div>
@@ -141,15 +154,14 @@ async function handleFork(index: number) {
         >加载更早的消息…</div>
         <MessageBubble
           v-for="(m, i) in currentMessages"
-          :key="i"
+          :key="messageKey(m, i)"
           :message="m"
           :streaming="isStreaming && i === currentMessages.length - 1 && m.role === 'assistant'"
           @rollback="handleRollback(i)"
           @fork="handleFork(i)"
         />
       </div>
-    </NScrollbar>
-    <QuestionPanel />
+    </div>
     <TodoPanel />
     <InputArea />
   </main>
@@ -162,23 +174,59 @@ async function handleFork(index: number) {
   flex-direction: column;
   background: var(--bg);
   min-width: 0;
+  /* `height: 0` here is the magic ingredient that makes the
+   * messages-scroll child actually shrink when the viewport
+   * is short. Without it the flex parent can grow to fit its
+   * tallest child and the input-area gets pushed off the
+   * bottom. With it, flex children with min-height: 0 can
+   * shrink below their content size and the input-area
+   * below is guaranteed to stay at the bottom. */
+  min-height: 0;
+  overflow: hidden;
 }
-.chat-header {
-  height: 48px;
-  padding: 0 16px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-2);
-  flex-shrink: 0;
+.messages-scroll {
+  /* `flex: 1` makes the message list grow to fill the space
+   * above the input. `min-height: 0` lets it shrink below
+   * its content size (required for overflow to work in a
+   * flex column). `overflow-y: auto` gives the browser a
+   * native scrollbar when the message list overflows.
+   * `position: relative` so the input area's floating UI
+   * (e.g. the model picker, command palette) can anchor to
+   * it as a positioning context if needed in the future. */
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: relative;
+  /* Pretty scrollbar: thin in Chromium / WebKit, falls
+   * back to the default in Firefox. Keeps the message list
+   * from being eaten by a chunky native scrollbar on
+   * Windows. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-default) transparent;
 }
-.header-title { font-weight: 500; font-size: 14px; }
-.header-actions { display: flex; align-items: center; gap: 2px; }
-.messages-scroll { flex: 1; min-height: 0; }
+.messages-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.messages-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.messages-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 4px;
+}
+.messages-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--text-quaternary);
+}
 .messages {
+  /* No min-height: 100% here — that breaks overflow because
+   * the parent doesn't have a defined height for it to
+   * resolve against. The empty state is vertically centred
+   * via flex on `.empty` so the page still looks balanced
+   * when there are no messages. */
   padding: 12px 0;
-  min-height: 100%;
+  display: flex;
+  flex-direction: column;
 }
 .history-loading {
   text-align: center;
@@ -198,7 +246,7 @@ async function handleFork(index: number) {
   padding-top: 120px;
   text-align: center;
 }
-.empty-icon { font-size: 48px; }
+.empty-icon { font-size: 48px; color: var(--text-quaternary); display: inline-flex; }
 .empty-title { font-size: 15px; color: var(--text-2); }
 .empty-hint { font-size: 12px; color: var(--text-4); }
 </style>

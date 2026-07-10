@@ -41,10 +41,12 @@
 **文件**：`skill.go`
 
 管理可安装的 Skill 定义：
-- `LoadAll()` — 加载安装的 skills
+- `LoadAllWithRoot(root)` — 加载全局 + `<root>/.p-chat/skills` 的 skills（**2026-07 项目根感知**）
+- `LoadAll()` — 旧接口，等价于 `LoadAllWithRoot("")`（向后兼容 CLI 命令）
 - `Install(repoURL)` — 从 GitHub 安装
 - `Delete(name)` — 卸载
 - Skill 内容被注入到系统提示词
+- 合并策略：全局 + 项目都加载，项目同名覆盖全局
 
 ## Style 风格管理
 
@@ -81,18 +83,36 @@
 **位置**：`internal/agents/`  
 **文件**：`agents.go`
 
-- 加载全局 `AGENTS.md` 和项目级 `<project>/AGENTS.md`
-- 内容合并到系统提示词
-- `LoadAllWithRoot(root)` — 从指定根目录加载
+**2026-07 加载顺序（OR 策略，第一个命中的胜出）**：
+
+1. `<root>/AGENTS.md` — 项目根（**主路径**，最高优先级）
+2. `<root>/.p-chat/AGENTS.md` — 项目级 .p-chat（fallback，install 脚本同步位置）
+3. `~/.p-chat/AGENTS.md` — 全局（项目级都没有时兜底）
+
+段标题区分：
+- 命中 #1 → `### Project (root)`
+- 命中 #2 → `### Project (.p-chat)`
+- 命中 #3 → `### Global`
+
+API：
+- `LoadAllWithRoot(root)` — 主入口
+- `LoadAll()` — 等价于 `LoadAllWithRoot("")`（无 project 模式，CLI 启动用）
+- `agentsSignatureWithRoot(root)` (agent.go) — 把 3 个路径的 mtime 都编入 sig，任何一个变化都失效 static-prompt cache
+
+**与 Skill/Rule 的策略区别**：
+- AGENTS.md：OR（项目级优先，单一来源，避免冲突指令）
+- Skill / Rule：AND（项目级 + 全局级都加载，能力可叠加）
 
 ## Rules 规则监听
 
 **位置**：`internal/rules/`  
 **文件**：`rules.go`
 
-- 监听 `.rules/` 目录的规则文件
+- 加载 `~/.p-chat/rules/*.md` 和 `<root>/.p-chat/rules/*.md` 的规则文件
 - 规则内容注入系统提示词
-- 支持项目级和全局规则
+- **2026-07 项目根感知**：`LoadAllWithRoot(root)` / `LoadAll()`（向后兼容）
+- `Watch(onChange, pollInterval, root)` — 监听 mtime 变化，**root 参数**指定项目级 dir
+- 合并策略：全局 + 项目都加载，全局排前项目排后（IsGlobal 标记）
 
 ## Knowledge 知识检索
 
@@ -114,11 +134,17 @@ RAG (检索增强生成) 实现：
 ## Paths 路径解析
 
 **位置**：`internal/paths/`  
-**文件**：`paths.go`
+**文件**：`paths.go`、`devhome.go`
 
-- `~/.p-chat/` 路径解析
-- 跨平台路径处理
-- 全局目录、数据库、上传目录等
+- 解析全局 P-Chat home 目录（`~/.p-chat/` 及其子目录）
+- 跨平台路径处理（`filepath`）
+- **dev/prod 隔离（`devhome.go`）**：`GlobalDir()` 解析顺序：
+  1. `PCHAT_HOME` 环境变量（最高优先级，手动覆盖）
+  2. 二进制文件在 `bin/` 或 `dev-bin/` 子目录 → 用 `<parent>/.p-chat/`（隔离本地测试）
+  3. 兜底：`~/.p-chat/`
+- `ResolveStrategy()` 返回当前选用的策略字符串，启动日志会打印它
+- 缓存到 `atomic.Pointer[resolved]`（首次解析后）；测试用 `SetExecutableForTest` / `SetHomeForTest` 注入
+- `EnsureGlobal()` 在解析到的目录下创建所有子目录（skills / rules / prompts / memory / tools / knowledge / uploads）
 
 ## HTTP 客户端 (CLI)
 

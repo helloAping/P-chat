@@ -11,16 +11,21 @@ import (
 type stubSandbox struct {
 	execAllowed  bool
 	writeAllowed bool
+	readAllowed  bool
 }
 
 func (s *stubSandbox) CheckExecBool(_ string) bool  { return s.execAllowed }
-func (s *stubSandbox) CheckWriteBool(_ string) bool { return s.writeAllowed }
+func (s *stubSandbox) CheckWriteBool(_ string, _ string) bool { return s.writeAllowed }
 func (s *stubSandbox) CheckExecDecision(_ string) SandboxDecision {
 	if s.execAllowed { return SandboxAllow }
 	return SandboxBlock
 }
-func (s *stubSandbox) CheckWriteDecision(_ string) SandboxDecision {
+func (s *stubSandbox) CheckWriteDecision(_ string, _ string) SandboxDecision {
 	if s.writeAllowed { return SandboxAllow }
+	return SandboxBlock
+}
+func (s *stubSandbox) CheckReadDecision(_ string, _ string) SandboxDecision {
+	if s.readAllowed { return SandboxAllow }
 	return SandboxBlock
 }
 func (s *stubSandbox) MatchedPattern(_ string) string { return "" }

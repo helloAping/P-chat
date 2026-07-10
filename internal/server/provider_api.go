@@ -36,12 +36,12 @@ type ProviderFull struct {
 // provider, including every model and its per-model configuration
 // (max_tokens_context, max_tokens_output, display_name, capabilities).
 func (h *Handler) GetProvider(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
 	name := c.Param("name")
-	for _, p := range h.cfg.LLM.Providers {
+	for _, p := range h.getCfg().LLM.Providers {
 		if p.Name != name {
 			continue
 		}
@@ -51,7 +51,7 @@ func (h *Handler) GetProvider(c *gin.Context) {
 			Protocol:  p.GetProtocol(),
 			BaseURL:   p.BaseURL,
 			APIKey:    p.APIKey,
-			IsDefault: p.Name == h.cfg.LLM.Default,
+			IsDefault: p.Name == h.getCfg().LLM.Default,
 			Models:    models,
 			Model:     p.EffectiveModel(),
 		})
@@ -84,7 +84,7 @@ type UpdateModelRequest struct {
 // delete-and-recreate to rename). Writes to
 // ~/.p-chat/config.json and reloads the in-memory LLM client.
 func (h *Handler) UpdateModel(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -132,7 +132,7 @@ type SetCapabilitiesRequest struct {
 // Replaces the model entry's Capabilities block. Writes to
 // ~/.p-chat/config.json and reloads the in-memory LLM client.
 func (h *Handler) SetCapabilities(c *gin.Context) {
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
@@ -181,15 +181,15 @@ type UpstreamModelsItem struct {
 // and returns the model list so the user can pick which to add.
 func (h *Handler) FetchUpstreamModels(c *gin.Context) {
 	name := c.Param("name")
-	if h.cfg == nil {
+	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
 
 	var provider *config.ProviderConfig
-	for i := range h.cfg.LLM.Providers {
-		if h.cfg.LLM.Providers[i].Name == name {
-			provider = &h.cfg.LLM.Providers[i]
+	for i := range h.getCfg().LLM.Providers {
+		if h.getCfg().LLM.Providers[i].Name == name {
+			provider = &h.getCfg().LLM.Providers[i]
 			break
 		}
 	}
