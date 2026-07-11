@@ -1813,7 +1813,7 @@ func cmdFork(ctx cliContext, args string) error {
 // text (no tool calls). After the plan is shown, the user can:
 //   y / Enter  - approve and execute the plan
 //   n          - cancel
-//   e          - edit the plan before executing (TODO)
+//   e          - edit the plan before executing (未实现)
 // The plan is NOT saved to the conversation memory until the user
 // explicitly approves.
 //

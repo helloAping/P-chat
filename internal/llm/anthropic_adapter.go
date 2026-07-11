@@ -212,6 +212,19 @@ func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 		var eventType string
 		for {
 			line, err := readSSELine(reader)
+			// On EOF, process the trailing line (if any)
+			// before closing. This lets a transport cut
+			// mid-event still surface whatever data was
+			// already buffered — better to show partial
+			// content than silently drop it.
+			if line != "" {
+				if strings.HasPrefix(line, "event: ") {
+					eventType = strings.TrimPrefix(line, "event: ")
+				} else if strings.HasPrefix(line, "data: ") {
+					dataJSON := strings.TrimPrefix(line, "data: ")
+					a.handleStreamEvent(eventType, dataJSON, ch)
+				}
+			}
 			if err != nil {
 				if err != io.EOF {
 					ch <- StreamChunk{Err: err}
