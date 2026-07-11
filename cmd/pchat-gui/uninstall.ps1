@@ -4,6 +4,15 @@
 #   .\uninstall.ps1                 # removes the default install
 #   .\uninstall.ps1 -InstallDir C:\P-Chat
 #   .\uninstall.ps1 -RemoveData     # also delete ~/.p-chat/
+#
+# This script only cleans the INSTALL side: binaries, Start Menu
+# shortcuts, registry entry, and the PCHAT_HOME env var (when it
+# still points at this install). It does NOT touch the data
+# directory (memory / config / skills / …) — that lives under
+# ~/.p-chat/ by default, or wherever PCHAT_DATA_HOME points, and
+# is removed only when -RemoveData is passed. See
+# install.ps1 for the PCHAT_HOME (install root) vs
+# PCHAT_DATA_HOME (data dir) distinction.
 
 [CmdletBinding()]
 param(

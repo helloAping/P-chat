@@ -17,6 +17,22 @@
 # directory only requires updating PCHAT_HOME — the PATH entry
 # references the variable and follows it automatically.
 #
+# IMPORTANT: PCHAT_HOME is the INSTALL root (used only for
+# PATH resolution). It is NOT the data directory (memory /
+# config / skills / …). The data directory is resolved by the
+# binary itself: PCHAT_DATA_HOME env var > sibling of binary
+# (bin/dev-bin) > $HOME/.p-chat. install.ps1 never touches
+# PCHAT_DATA_HOME — let the binary decide. See
+# internal/paths/devhome.go for the full resolution chain.
+#
+# Old confusion (fixed in V4): PCHAT_HOME used to be
+# conflated as both install root AND data-dir override. This
+# meant that any install with -AddToPath wrote memory + config
+# under the install directory (e.g. D:\develop\pchat\memory\)
+# instead of under the user's $HOME/.p-chat. The V3→V4 upgrade
+# step (stepV3toV4 in internal/upgrade/steps.go) rescues
+# existing data stranded at <PCHAT_HOME>/memory/.
+#
 # Re-install detection: PCHAT_HOME is the source of truth.
 # If PCHAT_HOME is set, install.ps1 installs into that
 # directory (creating it if needed), overwriting the
