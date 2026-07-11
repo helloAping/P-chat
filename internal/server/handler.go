@@ -2018,19 +2018,6 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 	return "", "text", "text/plain"
 }
 
-// parseCommandFromToolInput extracts the "command" field from a
-// tool input JSON like {"command":"dir","timeout":30}. Returns
-// the command string or "" on parse failure.
-func parseCommandFromToolInput(raw string) string {
-	var v struct {
-		Command string `json:"command"`
-	}
-	if err := json.Unmarshal([]byte(raw), &v); err == nil && v.Command != "" {
-		return v.Command
-	}
-	return ""
-}
-
 // buildLLMMessages turns a session's stored history into the
 // message slice fed to the LLM. Two responsibilities:
 //

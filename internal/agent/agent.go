@@ -1326,16 +1326,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 		var totalIn, totalOut int
 
-		// Stuck-loop guard. opencode's TODO comment in
-		// `llm.ts:54` notes "Bound provider retries and
-		// repeated identical tool calls" as unchecked work.
-		// We implement a simple version: track the signature
-		// of the (sorted) tool calls in each round, plus
-		// whether the round ended in tool errors. If the
-		// signature repeats for StuckThreshold consecutive
-		// rounds AND the last round errored, we break out
-		// with a "stuck" event rather than letting the LLM
-		// hammer the same failing call forever.
+		// Stuck-loop guard. Track the signature of the (sorted)
+		// tool calls in each round, plus whether the round ended
+		// in tool errors. If the signature repeats for
+		// StuckThreshold consecutive rounds AND the last round
+		// errored, we break out with a "stuck" event rather than
+		// letting the LLM hammer the same failing call forever.
 		var (
 			stuckStreak          int
 			prevToolSig          string
