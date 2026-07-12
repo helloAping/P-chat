@@ -80,17 +80,17 @@ import {
   extensionForMime, fetchAsBlob,
 } from '../utils/clipboard'
 
+const dialog = useDialog()
+
 const props = defineProps<{ message: Message; streaming?: boolean }>()
 const emit = defineEmits<{
   rollback: []
   fork: []
   /** Inline-edit a user message and re-send. */
-  edit: []
 }>()
 
 function onRollback() {
-  const d = useDialog()
-  d.warning({
+  dialog.warning({
     title: '确认撤回',
     content: '确定撤回此消息及之后的所有回复？此操作可撤销。',
     positiveText: '确认撤回',
@@ -103,10 +103,6 @@ function onRollback() {
 function onFork() {
   pulseAction('fork')
   emit('fork')
-}
-function onEdit() {
-  pulseAction('edit')
-  emit('edit')
 }
 
 // --- Action-button interaction state machine ---------------------
@@ -522,15 +518,8 @@ const showAssistantHeader = computed(() =>
 
 // Action-bar visibility:
 //   - copy:   always available (copies the visible text)
-//   - edit:   user only, not the trailing message while
-//   - edit:   user only, not the trailing message while
-//             streaming (we don't let the user edit a
-//             message that's still being sent)
 //   - fork:   user only (PR #2 feature, kept)
 //   - more:   reserved for future (model switch, etc.)
-const canEdit = computed(() =>
-  props.message.role === 'user' && !props.streaming
-)
 const canFork = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
@@ -757,17 +746,6 @@ const canRollback = computed(() =>
           >
             <Check v-if="isAction('copy', 'feedback')" :size="13" :key="`copy-ok-${pulseKey}`" class="bubble-action-icon" />
             <Clipboard v-else :size="13" :key="`copy-idle-${pulseKey}`" class="bubble-action-icon" />
-          </button>
-          <button
-            v-if="canEdit"
-            type="button"
-            class="bubble-action-btn bubble-action-pulse"
-            :key="`edit-${pulseKey}`"
-            title="编辑并重新发送"
-            aria-label="编辑消息"
-            @click="onEdit"
-          >
-            <Pencil :size="13" class="bubble-action-icon" />
           </button>
           <button
             v-if="canFork"
@@ -1054,7 +1032,7 @@ const canRollback = computed(() =>
   background: var(--warn-50);
   color: var(--warn-500);
 }
-/* Press pulse for fork / edit: a tiny scale
+/* Press pulse for fork: a tiny scale
  * bump that re-triggers on every :key bump from the
  * pulseKey ref. CSS animations don't restart on the
  * same element, so we rely on Vue's :key swap (handled
