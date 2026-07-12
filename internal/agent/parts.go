@@ -87,6 +87,11 @@ type MessagePart struct {
 	// header so the user can read the full hint without
 	// expanding the body.
 	AgentDescription string `json:"agent_description,omitempty"`
+	// FailureReason explains why the sub-agent failed. Set on
+	// the close event ("err") so the card can show the reason
+	// after a session reload. Persisted in meta["parts"] via
+	// snapshotStructural; lost before this field existed.
+	FailureReason string `json:"failure_reason,omitempty"`
 	// QuestionStatus tracks the question part's lifecycle.
 	// "open"   — question just emitted, user hasn't answered.
 	// "ok"     — user picked an option(s); Name carries the
