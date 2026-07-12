@@ -32,7 +32,7 @@ import { marked } from 'marked'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
-  ArrowDown, ArrowUp, RotateCcw, Pencil, MoreHorizontal, Sparkles,
+  ArrowDown, ArrowUp, Pencil, MoreHorizontal, Sparkles,
   Check, Loader2, XCircle,
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
@@ -84,11 +84,6 @@ const props = defineProps<{ message: Message; streaming?: boolean }>()
 const emit = defineEmits<{
   rollback: []
   fork: []
-  /** Re-issue the same prompt to the LLM (assistant only).
-   * The parent ChatWindow wires this to a `regenerate`
-   * action that resets the trailing assistant message
-   * and re-streams it. */
-  regenerate: []
   /** Inline-edit a user message and re-send. */
   edit: []
 }>()
@@ -108,10 +103,6 @@ function onRollback() {
 function onFork() {
   pulseAction('fork')
   emit('fork')
-}
-function onRegenerate() {
-  pulseAction('regen')
-  emit('regenerate')
 }
 function onEdit() {
   pulseAction('edit')
@@ -166,7 +157,7 @@ onBeforeUnmount(() => {
 
 function pulseAction(key: string) {
   // Short tactile pulse: re-triggers the press animation
-  // without changing the icon. Used for regen / fork /
+  // without changing the icon. Used for fork /
   // edit — these are synchronous emits whose feedback is
   // the immediate downstream UI change (e.g. streaming
   // restart), not a visible icon swap.
@@ -531,15 +522,12 @@ const showAssistantHeader = computed(() =>
 
 // Action-bar visibility:
 //   - copy:   always available (copies the visible text)
-//   - regen:  assistant only, not while streaming
+//   - edit:   user only, not the trailing message while
 //   - edit:   user only, not the trailing message while
 //             streaming (we don't let the user edit a
 //             message that's still being sent)
 //   - fork:   user only (PR #2 feature, kept)
 //   - more:   reserved for future (model switch, etc.)
-const canRegenerate = computed(() =>
-  props.message.role === 'assistant' && !props.streaming
-)
 const canEdit = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
@@ -769,17 +757,6 @@ const canRollback = computed(() =>
           >
             <Check v-if="isAction('copy', 'feedback')" :size="13" :key="`copy-ok-${pulseKey}`" class="bubble-action-icon" />
             <Clipboard v-else :size="13" :key="`copy-idle-${pulseKey}`" class="bubble-action-icon" />
-          </button>
-          <button
-            v-if="canRegenerate"
-            type="button"
-            class="bubble-action-btn bubble-action-pulse"
-            :key="`regen-${pulseKey}`"
-            title="重新生成回答"
-            aria-label="重新生成"
-            @click="onRegenerate"
-          >
-            <RotateCcw :size="13" class="bubble-action-icon" />
           </button>
           <button
             v-if="canEdit"
@@ -1077,7 +1054,7 @@ const canRollback = computed(() =>
   background: var(--warn-50);
   color: var(--warn-500);
 }
-/* Press pulse for regen / fork / edit: a tiny scale
+/* Press pulse for fork / edit: a tiny scale
  * bump that re-triggers on every :key bump from the
  * pulseKey ref. CSS animations don't restart on the
  * same element, so we rely on Vue's :key swap (handled
