@@ -1775,10 +1775,11 @@ func mergeConsecutiveAssistant(msgs []MessageResponse) []MessageResponse {
 
 // mergeAssistantRun merges a slice of consecutive assistant
 // messages (from the same user turn) into a single message.
-// All structural parts (thinking, tool, sub_agent) from every
-// message are preserved in order, interleaved with their
-// round's text. Consecutive text parts are concatenated so the
-// frontend's parts-driven render path keeps a consistent shape.
+// Each message's parts are appended in round order, preserving
+// the interleaved sequence (text → tool → sub_agent → text → …)
+// that the frontend's parts-driven render path expects. Without
+// this the relaoded conversation loses the round structure and
+// shows all text first, then all tools below.
 func mergeAssistantRun(run []MessageResponse) MessageResponse {
 	if len(run) == 1 {
 		return run[0]
@@ -1787,19 +1788,7 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 	var parts []MessagePart
 
 	for _, m := range run {
-		for _, p := range m.Parts {
-			switch p.Kind {
-			case "text", "thinking":
-				// Merge consecutive text / thinking parts.
-				if len(parts) > 0 && parts[len(parts)-1].Kind == p.Kind {
-					parts[len(parts)-1].Text += "\n" + p.Text
-				} else {
-					parts = append(parts, p)
-				}
-			default:
-				parts = append(parts, p)
-			}
-		}
+		parts = append(parts, m.Parts...)
 	}
 
 	base.Parts = parts
