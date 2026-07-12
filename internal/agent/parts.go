@@ -578,6 +578,38 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		return
 	}
 
+	// ContentRewrite: replace the trailing text part in-place
+	// with the rewritten version. The post-stream redactor
+	// (agent.go) emits this AFTER the stream ends to sanitize
+	// phantom errors; without this branch, snapshotStructural
+	// would persist the un-sanitized text and the phantom would
+	// reappear on session reload (the frontend's scrubbing in
+	// switchSession is a secondary defense, not the primary).
+	if c.ContentRewrite != "" {
+		parts := a.activeParts()
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i].Kind == "text" {
+				parts[i].Text = c.ContentRewrite
+				break
+			}
+		}
+		a.setActiveParts(parts)
+		return
+	}
+
+	// ThinkingRewrite: same pattern for the thinking block.
+	if c.ThinkingRewrite != "" {
+		parts := a.activeParts()
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i].Kind == "thinking" {
+				parts[i].Text = c.ThinkingRewrite
+				break
+			}
+		}
+		a.setActiveParts(parts)
+		return
+	}
+
 	// Final "done" event: clear the streaming flag on any open
 	// thinking parts (the assistant is done reasoning). Also
 	// close any still-open question parts (status="open") as
