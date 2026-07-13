@@ -1570,9 +1570,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Emit as a single text ChatMessage (tool calls are
 		// separate messages appended below).
 		assistantMsg := llm.ChatMessage{
-			Role:    llm.RoleAssistant,
-			Type:    llm.TypeText,
-			Content: fullContent,
+			Role:        llm.RoleAssistant,
+			Type:        llm.TypeText,
+			Content:     fullContent,
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
 		}
 		msgs = append(msgs, assistantMsg)
 
@@ -1594,11 +1596,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					id = "call_" + uuid.NewString()
 				}
 				tcm := llm.ChatMessage{
-					Role:      llm.RoleAssistant,
-					Type:      llm.TypeToolCall,
-					ToolID:    id,
-					ToolName:  tc.Name,
-					ToolInput: tc.ArgsJSON,
+					Role:        llm.RoleAssistant,
+					Type:        llm.TypeToolCall,
+					ToolID:      id,
+					ToolName:    tc.Name,
+					ToolInput:   tc.ArgsJSON,
+					MsgType:     llm.MsgTypeTool,
+					SubmitToLLM: 1,
 				}
 				msgs = append(msgs, tcm)
 				if a.store != nil {
@@ -1947,7 +1951,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						ToolError: true,
 						// See comment on the success path for
 						// why MsgType must be set explicitly.
-						MsgType: llm.MsgTypeTool,
+						MsgType:     llm.MsgTypeTool,
+						SubmitToLLM: 1,
 					}
 					msgs = append(msgs, toolMsg)
 					if a.store != nil {
@@ -2024,7 +2029,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// Surfaces after rollback/undo because
 					// the in-memory splice restores the
 					// unfiltered row.
-					MsgType: llm.MsgTypeTool,
+					MsgType:     llm.MsgTypeTool,
+					SubmitToLLM: 1,
 				}
 				msgs = append(msgs, toolMsg)
 				if a.store != nil {

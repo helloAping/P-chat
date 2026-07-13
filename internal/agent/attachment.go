@@ -138,15 +138,19 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 			}
 			if wrote {
 				result = append(result, llm.ChatMessage{
-					Role:    llm.RoleUser,
-					Type:    llm.TypeText,
-					Content: fmt.Sprintf("文件已保存到工作区: %s (%d 字节)。使用 %s 工具读取全文。", path, len(data), tool),
+					Role:        llm.RoleUser,
+					Type:        llm.TypeText,
+					Content:     fmt.Sprintf("文件已保存到工作区: %s (%d 字节)。使用 %s 工具读取全文。", path, len(data), tool),
+					MsgType:     llm.MsgTypeText,
+					SubmitToLLM: 1,
 				})
 			} else {
 				result = append(result, llm.ChatMessage{
-					Role:    llm.RoleUser,
-					Type:    llm.TypeText,
-					Content: fmt.Sprintf("(收到文件: %s, %d 字节, %s — 无法保存到工作区)", a.Name, len(data), ext),
+					Role:        llm.RoleUser,
+					Type:        llm.TypeText,
+					Content:     fmt.Sprintf("(收到文件: %s, %d 字节, %s — 无法保存到工作区)", a.Name, len(data), ext),
+					MsgType:     llm.MsgTypeText,
+					SubmitToLLM: 1,
 				})
 			}
 			continue
@@ -156,61 +160,60 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 		case "image":
 			mime := imageMIME(a.Name, a.MIME)
 			if visionCapable != nil && !visionCapable() {
-				// Neutral factual marker. The phrasing is deliberately
-				// bland — it tells the LLM the bytes are unavailable
-				// without priming it to produce a Claude-style
-				// "Cannot read image.png ... Inform the user." phantom.
-				// The post-stream redactor in agent.go (redactPhantomErrors)
-				// still catches any phantom the model emits despite this
-				// neutral wording.
 				result = append(result, llm.ChatMessage{
-					Role:    llm.RoleUser,
-					Type:    llm.TypeText,
-					Content: fmt.Sprintf("[%s: %d bytes — 当前模型不支持视觉输入，图片已上传但未发送]", a.Name, len(data)),
+					Role:        llm.RoleUser,
+					Type:        llm.TypeText,
+					Content:     fmt.Sprintf("[%s: %d bytes — 当前模型不支持视觉输入，图片已上传但未发送]", a.Name, len(data)),
+					MsgType:     llm.MsgTypeText,
+					SubmitToLLM: 1,
 				})
 				continue
 			}
 			result = append(result, llm.ChatMessage{
-				Role:     llm.RoleUser,
-				Type:     llm.TypeImage,
-				Content:  base64.StdEncoding.EncodeToString(data),
-				Name:     a.Name,
-				MimeType: mime,
+				Role:        llm.RoleUser,
+				Type:        llm.TypeImage,
+				Content:     base64.StdEncoding.EncodeToString(data),
+				Name:        a.Name,
+				MimeType:    mime,
+				MsgType:     llm.MsgTypeImage,
+				SubmitToLLM: 1,
 			})
 		case "audio":
 			result = append(result, llm.ChatMessage{
-				Role:    llm.RoleUser,
-				Type:    llm.TypeText,
-				Content: fmt.Sprintf("(attached audio: %s, %d bytes, MIME=%s)", a.Name, len(data), a.MIME),
+				Role:        llm.RoleUser,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("(attached audio: %s, %d bytes, MIME=%s)", a.Name, len(data), a.MIME),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
 			})
 		case "video":
-			// No LLM adapter today accepts a video input block
-			// inline. The bytes are uploaded and rendered in
-			// the chat bubble as a <video> element so the
-			// user can preview them; the model just gets a
-			// metadata marker so it knows something was
-			// attached.
 			result = append(result, llm.ChatMessage{
-				Role:    llm.RoleUser,
-				Type:    llm.TypeText,
-				Content: fmt.Sprintf("(attached video: %s, %d bytes, MIME=%s)", a.Name, len(data), a.MIME),
+				Role:        llm.RoleUser,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("(attached video: %s, %d bytes, MIME=%s)", a.Name, len(data), a.MIME),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
 			})
 		case "text":
-			const maxInlineText = 8 << 10 // 8 KB
+			const maxInlineText = 8 << 10
 			if len(data) <= maxInlineText {
 				body := string(data)
 				result = append(result, llm.ChatMessage{
-					Role:    llm.RoleUser,
-					Type:    llm.TypeText,
-					Content: fmt.Sprintf("--- %s ---\n%s", a.Name, body),
+					Role:        llm.RoleUser,
+					Type:        llm.TypeText,
+					Content:     fmt.Sprintf("--- %s ---\n%s", a.Name, body),
+					MsgType:     llm.MsgTypeText,
+					SubmitToLLM: 1,
 				})
 			} else {
 				path, wrote := saveToWorkspace(a.Name, data)
 				if wrote {
 					result = append(result, llm.ChatMessage{
-						Role:    llm.RoleUser,
-						Type:    llm.TypeText,
-						Content: fmt.Sprintf("文件已保存到工作区: %s (%d 字符, %d 字节)。使用 read_file 工具读取全文。", path, len(data), len(data)),
+						Role:        llm.RoleUser,
+						Type:        llm.TypeText,
+						Content:     fmt.Sprintf("文件已保存到工作区: %s (%d 字符, %d 字节)。使用 read_file 工具读取全文。", path, len(data), len(data)),
+						MsgType:     llm.MsgTypeText,
+						SubmitToLLM: 1,
 					})
 				} else {
 					body := string(data)
@@ -219,17 +222,21 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 						body = body[:maxTextDump] + "\n... (truncated)"
 					}
 					result = append(result, llm.ChatMessage{
-						Role:    llm.RoleUser,
-						Type:    llm.TypeText,
-						Content: fmt.Sprintf("--- %s ---\n%s", a.Name, body),
+						Role:        llm.RoleUser,
+						Type:        llm.TypeText,
+						Content:     fmt.Sprintf("--- %s ---\n%s", a.Name, body),
+						MsgType:     llm.MsgTypeText,
+						SubmitToLLM: 1,
 					})
 				}
 			}
 		default:
 			result = append(result, llm.ChatMessage{
-				Role:    llm.RoleUser,
-				Type:    llm.TypeText,
-				Content: fmt.Sprintf("(attached file: %s, %d bytes, kind=%s)", a.Name, len(data), a.Kind),
+				Role:        llm.RoleUser,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("(attached file: %s, %d bytes, kind=%s)", a.Name, len(data), a.Kind),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
 			})
 		}
 	}

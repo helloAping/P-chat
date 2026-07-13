@@ -2247,9 +2247,11 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	}
 	msgs := buildLLMMessages(histMsgs)
 	msgs = append(msgs, llm.ChatMessage{
-		Role:    llm.RoleUser,
-		Type:    llm.TypeText,
-		Content: req.Message,
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     req.Message,
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
 	})
 
 	chatReq := agent.ChatRequest{
@@ -2628,9 +2630,11 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 		return
 	}
 	h.store.AddChatMessageTo(id, llm.ChatMessage{
-		Role:    llm.RoleSystem,
-		Type:    llm.TypeText,
-		Content: body.Content,
+		Role:        llm.RoleSystem,
+		Type:        llm.TypeText,
+		Content:     body.Content,
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
 	})
 	h.store.Flush()
 	c.JSON(http.StatusCreated, gin.H{"ok": true})
@@ -2721,9 +2725,11 @@ func (h *Handler) ExecutePlan(c *gin.Context) {
 	}
 
 	h.store.AddChatMessageTo(id, llm.ChatMessage{
-		Role:    llm.RoleAssistant,
-		Type:    llm.TypeText,
-		Content: body.PlanText,
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     body.PlanText,
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
 	})
 	h.store.Flush()
 
