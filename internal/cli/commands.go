@@ -274,11 +274,13 @@ func init() {
 			Name: "/debug", Description: "显示调试信息 (缓存命中率等)",
 			Usage: "/debug [topic]",
 			Args: "无参  - 默认显示 sub-agent 缓存统计\n" +
-				"      cache - 同无参 (sub-agent 缓存: 条目/命中/未命中/存储/命中率)\n" +
-				"      memory - (TODO) 显示记忆库统计",
+				"      cache    - 同无参 (sub-agent 缓存: 条目/命中/未命中/存储/命中率)\n" +
+				"      sessions - 显示会话存储统计 (会话数 / 当前会话 / 消息数)\n" +
+				"      memory   - 同 sessions (旧名兼容)",
 			Examples: []string{
 				"/debug",
 				"/debug cache",
+				"/debug sessions",
 			},
 			Handler: cmdDebug,
 		},
@@ -1811,7 +1813,7 @@ func cmdFork(ctx cliContext, args string) error {
 // text (no tool calls). After the plan is shown, the user can:
 //   y / Enter  - approve and execute the plan
 //   n          - cancel
-//   e          - edit the plan before executing (TODO)
+//   e          - edit the plan before executing (未实现)
 // The plan is NOT saved to the conversation memory until the user
 // explicitly approves.
 //
@@ -1861,7 +1863,7 @@ func cmdExport(ctx cliContext, args string) error {
 	}
 	lc := asLocalContext(ctx)
 	if lc.r.store == nil {
-		color.HiBlack("  (记忆未启用)")
+		color.HiBlack("  (会话存储未启用)")
 		return nil
 	}
 
@@ -2302,10 +2304,13 @@ func cmdDebug(ctx cliContext, args string) error {
 		printMemoryStats(ctx)
 	case "cache":
 		printCacheStats(ctx)
-	case "memory":
+	case "memory", "sessions":
+		// "memory" is the legacy alias. The actual data is the
+		// SQLite session/message store, not LLM long-term recall,
+		// so the canonical name is now "sessions".
 		printMemoryStats(ctx)
 	default:
-		color.HiBlack("    可用主题: cache | memory")
+		color.HiBlack("    可用主题: cache | sessions | memory")
 	}
 	fmt.Println()
 	return nil
@@ -2339,11 +2344,11 @@ func printCacheStats(ctx cliContext) {
 func printMemoryStats(ctx cliContext) {
 	convs, msgs, current, ok := ctx.MemoryStats()
 	if !ok {
-		color.HiBlack("    (记忆未启用 / HTTP 模式)")
+		color.HiBlack("    (会话存储统计仅在 CLI 本地模式可用)")
 		fmt.Println()
 		return
 	}
-	color.Cyan("    记忆库")
+	color.Cyan("    会话存储 (SQLite)")
 	fmt.Println()
 	fmt.Printf("      会话数:    %d\n", convs)
 	if current != "" {

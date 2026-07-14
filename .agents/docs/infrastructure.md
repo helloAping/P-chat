@@ -139,11 +139,13 @@ RAG (检索增强生成) 实现：
 - 解析全局 P-Chat home 目录（`~/.p-chat/` 及其子目录）
 - 跨平台路径处理（`filepath`）
 - **dev/prod 隔离（`devhome.go`）**：`GlobalDir()` 解析顺序：
-  1. `PCHAT_HOME` 环境变量（最高优先级，手动覆盖）
+  1. `PCHAT_DATA_HOME` 环境变量（最高优先级，手动覆盖 **数据目录**）
   2. 二进制文件在 `bin/` 或 `dev-bin/` 子目录 → 用 `<parent>/.p-chat/`（隔离本地测试）
   3. 兜底：`~/.p-chat/`
+- **`PCHAT_HOME` 不再影响数据目录**：它是 `install.ps1 -AddToPath` 写的安装根（在 PATH 里用作 `%PCHAT_HOME%`），以前和 `PCHAT_DATA_HOME` 混用导致"装在 `D:\develop\pchat` 的用户把记忆存到了 `D:\develop\pchat\memory\`"。详见 `internal/upgrade` 的 `stepV3toV4`（V3→V4 自动把安装目录下的 memory 迁到 `~/.p-chat/memory/`）
 - `ResolveStrategy()` 返回当前选用的策略字符串，启动日志会打印它
-- 缓存到 `atomic.Pointer[resolved]`（首次解析后）；测试用 `SetExecutableForTest` / `SetHomeForTest` 注入
+- 每次调用重新读 env + `os.Executable()`（无缓存，测试用 `t.Setenv` 无需手动失效）
+- 测试用 `SetExecutableForTest` / `SetHomeForTest` 注入
 - `EnsureGlobal()` 在解析到的目录下创建所有子目录（skills / rules / prompts / memory / tools / knowledge / uploads）
 
 ## HTTP 客户端 (CLI)

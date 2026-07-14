@@ -32,7 +32,7 @@ import { marked } from 'marked'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
-  ArrowDown, ArrowUp, RotateCcw, Pencil, MoreHorizontal, Sparkles,
+  ArrowDown, ArrowUp, Pencil, MoreHorizontal, Sparkles,
   Check, Loader2, XCircle,
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
@@ -66,7 +66,7 @@ function renderMd(text: string): string {
   }
   return html
 }
-import { useMessage } from 'naive-ui'
+import { useMessage, useDialog } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import { state } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
@@ -80,54 +80,29 @@ import {
   extensionForMime, fetchAsBlob,
 } from '../utils/clipboard'
 
+const dialog = useDialog()
+
 const props = defineProps<{ message: Message; streaming?: boolean }>()
 const emit = defineEmits<{
   rollback: []
   fork: []
-  /** Re-issue the same prompt to the LLM (assistant only).
-   * The parent ChatWindow wires this to a `regenerate`
-   * action that resets the trailing assistant message
-   * and re-streams it. */
-  regenerate: []
   /** Inline-edit a user message and re-send. */
-  edit: []
 }>()
 
 function onRollback() {
-  // Rollback is destructive — the user loses the message
-  // and everything after it. Require a double-click: the
-  // first click puts the button into `pending` for 3
-  // seconds and shows a visible "撤回? 3s" countdown in
-  // the button; the second click during that window
-  // actually fires the emit. After 3s of inactivity, the
-  // pending state auto-restores so the next accidental
-  // hover doesn't carry the "armed" state.
-  //
-  // The countdown was added on 2026-07-09 in response to
-  // user feedback: the old design relied on a 1px color
-  // swap + 6% scale pulse + browser title text, none of
-  // which clearly communicated that a SECOND click was
-  // required. The inline countdown text in the button is
-  // unmissable.
-  if (isAction('rollback', 'pending')) {
-    stopRollbackCountdown()
-    emit('rollback')
-    return
-  }
-  setActionState('rollback', 'pending', 3000)
-  startRollbackCountdown(3000)
+  dialog.warning({
+    title: '确认撤回',
+    content: '确定撤回此消息及之后的所有回复？此操作可撤销。',
+    positiveText: '确认撤回',
+    negativeText: '取消',
+    onPositiveClick: () => {
+      emit('rollback')
+    },
+  })
 }
 function onFork() {
   pulseAction('fork')
   emit('fork')
-}
-function onRegenerate() {
-  pulseAction('regen')
-  emit('regenerate')
-}
-function onEdit() {
-  pulseAction('edit')
-  emit('edit')
 }
 
 // --- Action-button interaction state machine ---------------------
@@ -172,53 +147,13 @@ function setActionState(key: string, next: ActionState, autoMs = 0) {
   }
 }
 
-// --- Rollback countdown ---------------------------------------
-//
-// Visual companion to the rollback `pending` state. The setTimeout
-// inside setActionState() handles the auto-restore; this pair
-// drives a per-second numeric label (3 → 2 → 1) inside the
-// button so the user can SEE that a second click is required.
-//
-// We tick via setInterval rather than chained setTimeout so the
-// countdown is robust to focus-loss throttling (browsers clamp
-// chained setTimeouts on background tabs to ~1Hz; setInterval
-// stays accurate at 1Hz on its own).
-const rollbackCountdown = ref(0)
-let rollbackCountdownTimer: ReturnType<typeof setInterval> | null = null
-
-function startRollbackCountdown(ms: number) {
-  stopRollbackCountdown()
-  // Round up to whole seconds so the first tick reads "3" not
-  // "3.x" — a fractional label looks broken.
-  rollbackCountdown.value = Math.max(1, Math.ceil(ms / 1000))
-  rollbackCountdownTimer = setInterval(() => {
-    rollbackCountdown.value = Math.max(0, rollbackCountdown.value - 1)
-    if (rollbackCountdown.value <= 0) {
-      stopRollbackCountdown()
-    }
-  }, 1000)
-}
-
-function stopRollbackCountdown() {
-  if (rollbackCountdownTimer) {
-    clearInterval(rollbackCountdownTimer)
-    rollbackCountdownTimer = null
-  }
-  rollbackCountdown.value = 0
-}
-
-// Belt-and-braces: if the component unmounts while a rollback
-// is pending, stop ticking so the label doesn't leak into the
-// next message's bubble. onBeforeUnmount fires before the DOM
-// is destroyed; the interval handle is captured by closure.
 import { onBeforeUnmount } from 'vue'
 onBeforeUnmount(() => {
-  stopRollbackCountdown()
 })
 
 function pulseAction(key: string) {
   // Short tactile pulse: re-triggers the press animation
-  // without changing the icon. Used for regen / fork /
+  // without changing the icon. Used for fork /
   // edit — these are synchronous emits whose feedback is
   // the immediate downstream UI change (e.g. streaming
   // restart), not a visible icon swap.
@@ -583,18 +518,8 @@ const showAssistantHeader = computed(() =>
 
 // Action-bar visibility:
 //   - copy:   always available (copies the visible text)
-//   - regen:  assistant only, not while streaming
-//   - edit:   user only, not the trailing message while
-//             streaming (we don't let the user edit a
-//             message that's still being sent)
 //   - fork:   user only (PR #2 feature, kept)
 //   - more:   reserved for future (model switch, etc.)
-const canRegenerate = computed(() =>
-  props.message.role === 'assistant' && !props.streaming
-)
-const canEdit = computed(() =>
-  props.message.role === 'user' && !props.streaming
-)
 const canFork = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
@@ -823,28 +748,6 @@ const canRollback = computed(() =>
             <Clipboard v-else :size="13" :key="`copy-idle-${pulseKey}`" class="bubble-action-icon" />
           </button>
           <button
-            v-if="canRegenerate"
-            type="button"
-            class="bubble-action-btn bubble-action-pulse"
-            :key="`regen-${pulseKey}`"
-            title="重新生成回答"
-            aria-label="重新生成"
-            @click="onRegenerate"
-          >
-            <RotateCcw :size="13" class="bubble-action-icon" />
-          </button>
-          <button
-            v-if="canEdit"
-            type="button"
-            class="bubble-action-btn bubble-action-pulse"
-            :key="`edit-${pulseKey}`"
-            title="编辑并重新发送"
-            aria-label="编辑消息"
-            @click="onEdit"
-          >
-            <Pencil :size="13" class="bubble-action-icon" />
-          </button>
-          <button
             v-if="canFork"
             type="button"
             class="bubble-action-btn bubble-action-pulse"
@@ -859,22 +762,11 @@ const canRollback = computed(() =>
             v-if="canRollback"
             type="button"
             class="bubble-action-btn bubble-action-rollback"
-            :class="{ 'is-pending': isAction('rollback', 'pending') }"
-            :title="isAction('rollback', 'pending') ? `再点一次确认撤回（${rollbackCountdown}s）` : '撤回此消息及之后的回复'"
-            :aria-label="isAction('rollback', 'pending') ? `再点一次确认撤回，${rollbackCountdown} 秒后取消` : '撤回消息'"
+            title="撤回此消息及之后的回复"
+            aria-label="撤回消息"
             @click="onRollback"
           >
-            <component
-              :is="isAction('rollback', 'pending') ? XCircle : Undo2"
-              :size="13"
-              :key="`rollback-${pulseKey}`"
-              class="bubble-action-icon"
-            />
-            <span
-              v-if="isAction('rollback', 'pending')"
-              class="bubble-action-countdown"
-              aria-hidden="true"
-            >{{ rollbackCountdown }}s</span>
+            <Undo2 :size="13" class="bubble-action-icon" />
           </button>
           <button
             type="button"
@@ -1136,37 +1028,11 @@ const canRollback = computed(() =>
   background: var(--success-50);
   color: var(--success-500);
 }
-.bubble-action-rollback {
-  /* Rollback's "armed" pending state: warn red
-   * background + red icon. A slow pulse on the icon
-   * draws the eye to the button so the user notices
-   * the 3s window before auto-restore. */
-  position: relative;
-}
 .bubble-action-rollback:hover {
   background: var(--warn-50);
   color: var(--warn-500);
 }
-.bubble-action-rollback.is-pending {
-  background: var(--warn-50);
-  color: var(--warn-500);
-  box-shadow: inset 0 0 0 1px var(--warn-500);
-  animation: bubble-action-pending 1.1s var(--ease-in-out, ease-in-out) infinite;
-  /* Widen the button while pending so the "3s" / "2s" / "1s"
-   * label has room. Without this the label would either
-   * overflow the 26px hit area or get clipped by adjacent
-   * button borders. We add the extra width only to the
-   * pending button so the idle state stays compact. */
-  width: auto;
-  padding: 0 6px 0 4px;
-  gap: 2px;
-}
-.bubble-action-rollback.is-pending:hover {
-  background: var(--warn-50);
-  color: var(--warn-500);
-  box-shadow: inset 0 0 0 1px var(--warn-500);
-}
-/* Press pulse for regen / fork / edit: a tiny scale
+/* Press pulse for fork: a tiny scale
  * bump that re-triggers on every :key bump from the
  * pulseKey ref. CSS animations don't restart on the
  * same element, so we rely on Vue's :key swap (handled

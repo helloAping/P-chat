@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
@@ -38,6 +39,14 @@ type Handler struct {
 	styleMgr   *style.Manager
 	summarizer *memory.Summarizer
 	mcpMgr     *mcp.Manager
+	browserMgr *browser.Manager
+
+	// listenAddr is the actual address the HTTP server is bound to
+	// (e.g. "127.0.0.1:14712"). Set once at startup by the server.
+	// Used by the browser extension UI to construct a real WS URL.
+	// Safe to read without a mutex — written synchronously before
+	// any HTTP handler runs, never mutated afterwards.
+	listenAddr string
 
 	metaMu sync.Mutex
 	// sessionLocks serialises concurrent SendMessage calls per
@@ -1775,10 +1784,11 @@ func mergeConsecutiveAssistant(msgs []MessageResponse) []MessageResponse {
 
 // mergeAssistantRun merges a slice of consecutive assistant
 // messages (from the same user turn) into a single message.
-// All structural parts (thinking, tool, sub_agent) from every
-// message are preserved in order, interleaved with their
-// round's text. Consecutive text parts are concatenated so the
-// frontend's parts-driven render path keeps a consistent shape.
+// Each message's parts are appended in round order, preserving
+// the interleaved sequence (text → tool → sub_agent → text → …)
+// that the frontend's parts-driven render path expects. Without
+// this the relaoded conversation loses the round structure and
+// shows all text first, then all tools below.
 func mergeAssistantRun(run []MessageResponse) MessageResponse {
 	if len(run) == 1 {
 		return run[0]
@@ -1787,19 +1797,7 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 	var parts []MessagePart
 
 	for _, m := range run {
-		for _, p := range m.Parts {
-			switch p.Kind {
-			case "text", "thinking":
-				// Merge consecutive text / thinking parts.
-				if len(parts) > 0 && parts[len(parts)-1].Kind == p.Kind {
-					parts[len(parts)-1].Text += "\n" + p.Text
-				} else {
-					parts = append(parts, p)
-				}
-			default:
-				parts = append(parts, p)
-			}
-		}
+		parts = append(parts, m.Parts...)
 	}
 
 	base.Parts = parts
@@ -2016,19 +2014,6 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 		}
 	}
 	return "", "text", "text/plain"
-}
-
-// parseCommandFromToolInput extracts the "command" field from a
-// tool input JSON like {"command":"dir","timeout":30}. Returns
-// the command string or "" on parse failure.
-func parseCommandFromToolInput(raw string) string {
-	var v struct {
-		Command string `json:"command"`
-	}
-	if err := json.Unmarshal([]byte(raw), &v); err == nil && v.Command != "" {
-		return v.Command
-	}
-	return ""
 }
 
 // buildLLMMessages turns a session's stored history into the
@@ -2271,9 +2256,11 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	}
 	msgs := buildLLMMessages(histMsgs)
 	msgs = append(msgs, llm.ChatMessage{
-		Role:    llm.RoleUser,
-		Type:    llm.TypeText,
-		Content: req.Message,
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     req.Message,
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
 	})
 
 	chatReq := agent.ChatRequest{
@@ -2578,6 +2565,19 @@ func (h *Handler) SetSummarizer(sm *memory.Summarizer) {
 	h.summarizer = sm
 }
 
+// SetBrowserManager wires the browser control manager for WebSocket
+// and REST endpoints. Pass nil to disable browser control endpoints.
+func (h *Handler) SetBrowserManager(bm *browser.Manager) {
+	h.browserMgr = bm
+}
+
+// SetListenAddr records the real listen address so the browser
+// extension UI can display the correct WebSocket URL. Must be
+// called before Run/RunAt starts accepting connections.
+func (h *Handler) SetListenAddr(addr string) {
+	h.listenAddr = addr
+}
+
 // CompressConversation compresses the current conversation's history.
 // POST /api/v1/sessions/:id/compress
 func (h *Handler) CompressConversation(c *gin.Context) {
@@ -2652,9 +2652,11 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 		return
 	}
 	h.store.AddChatMessageTo(id, llm.ChatMessage{
-		Role:    llm.RoleSystem,
-		Type:    llm.TypeText,
-		Content: body.Content,
+		Role:        llm.RoleSystem,
+		Type:        llm.TypeText,
+		Content:     body.Content,
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
 	})
 	h.store.Flush()
 	c.JSON(http.StatusCreated, gin.H{"ok": true})
@@ -2745,9 +2747,11 @@ func (h *Handler) ExecutePlan(c *gin.Context) {
 	}
 
 	h.store.AddChatMessageTo(id, llm.ChatMessage{
-		Role:    llm.RoleAssistant,
-		Type:    llm.TypeText,
-		Content: body.PlanText,
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     body.PlanText,
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
 	})
 	h.store.Flush()
 

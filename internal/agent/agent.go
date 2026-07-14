@@ -536,7 +536,7 @@ type ChatStreamChunk struct {
 // between rounds within a chat, AND between chats within a session. The
 // only thing that should change in this string is the underlying files
 // (AGENTS.md, rules, skills) or the chosen style.
-func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, projectRoot string, kbEnabled bool) (string, string, error) {
+func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, availableTools []tool.Tool, projectRoot string, kbEnabled bool) (string, string, error) {
 	// 2026-07: if the session's projectRoot has changed
 	// since the last call (user switched projects
 	// mid-session, or this is the first turn of a new
@@ -610,7 +610,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 
 	// 5. Tool hint — stable per session (tools don't change at runtime).
 	if len(toolDefs) > 0 {
-		sb.WriteString(buildToolHint(a.tools.List()))
+		sb.WriteString(buildToolHint(availableTools))
 		// Encourage the LLM to consult its knowledge base before
 		// answering questions it might not know. The `recall` tool
 		// is added by the CLI at startup; here we just remind the
@@ -620,7 +620,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		hasWiki := false
 		hasQuestion := false
 		hasTodoWrite := false
-		for _, t := range a.tools.List() {
+		for _, t := range availableTools {
 			switch t.Name {
 			case "recall":
 				hasRecall = true
@@ -693,7 +693,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		sb.WriteString("You have access to these tools. Call ONLY the tools in this list.\n\n")
 		sb.WriteString("| Tool | What it does |\n")
 		sb.WriteString("|------|-------------|\n")
-		for _, t := range a.tools.List() {
+		for _, t := range availableTools {
 			desc := t.Description
 			if idx := strings.Index(desc, "."); idx > 0 {
 				desc = desc[:idx]
@@ -752,16 +752,41 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, p
 		sb.WriteString("1. Read the error message carefully — identify the root cause\n")
 		sb.WriteString("2. Try an alternative approach using different tools or parameters\n")
 		sb.WriteString("3. After 3 consecutive failures on the same task, use `question` to ask the user for guidance\n")
-		sb.WriteString("4. A tool failure does NOT mean the task is impossible — keep going\n\n")
+		sb.WriteString("4. A tool failure does NOT mean the task is impossible — keep going\n")
+		sb.WriteString("5. NEVER end a turn with only a status summary after a tool error — always propose or attempt the next step\n\n")
 		sb.WriteString("Operation → fallback mapping (when the primary approach fails):\n")
 		sb.WriteString("- `read_file` path not found → try `list_files` to discover the correct path\n")
 		sb.WriteString("- Command not found in `exec_command` → check the Platform section for available commands\n")
 		sb.WriteString("- File too large for `read_file` → use `exec_command` with `type` or `findstr` to grep specific lines\n")
-		sb.WriteString("- Tool not found error → re-read the Available Tools table; use only listed tools\n\n")
+		sb.WriteString("- Tool not found error → re-read the Available Tools table; use only listed tools\n")
+		sb.WriteString("- `browser_*` connection error (\"connection closed\", \"browser extension has disconnected\") → ")
+		sb.WriteString("the extension may reconnect. Retry once; if it fails again, tell the user the browser extension disconnected ")
+		sb.WriteString("and ask whether to wait, re-establish the connection, or continue without browser tools\n")
+		sb.WriteString("- `browser_screenshot` captures the viewport and the picture is automatically delivered as a " +
+			"follow-up image message so you can see it directly (requires vision). If the picture doesn't appear or the " +
+			"model doesn't support vision, fall back to `browser_snapshot` (text-based, no image payload)\n")
+		sb.WriteString("- `browser_snapshot` returns too few elements (e.g. SPA page where content is dynamic divs, not interactive elements) → ")
+		sb.WriteString("use `browser_extract` to get all visible rendered text content\n")
+		sb.WriteString("- Reading page content on a SPA / JavaScript-heavy site → ")
+		sb.WriteString("`browser_extract` is preferred over `browser_snapshot` + `browser_screenshot` because it extracts the full ")
+		sb.WriteString("JavaScript-rendered text without requiring vision capabilities\n")
+		sb.WriteString("- `browser_*` returns \"not found\" listing it as available → the tool was unregistered mid-turn due to browser disconnect. ")
+		sb.WriteString("Do NOT retry browser_* tools; use `web_fetch` for HTTP content or text-based tools for other data\n\n")
+		sb.WriteString("## Anti-Repetition\n\n")
+		sb.WriteString("When the user repeats a question or instruction, always reason fresh: ")
+		sb.WriteString("do NOT echo or copy your previous response. The available tool set may have changed since your last turn ")
+		sb.WriteString("(tools can be dynamically registered or unregistered mid-conversation). ")
+		sb.WriteString("Always check the Available Tools table first, then re-evaluate your options. ")
+		sb.WriteString("Repeating an identical reply is a bug — if the same question is asked twice, the user wants a DIFFERENT answer, ")
+		sb.WriteString("not the same one.\n\n")
 		sb.WriteString("Only stop when:\n")
-		sb.WriteString("- The task is truly complete\n")
+		sb.WriteString("- The task is truly complete and you have delivered the final result to the user\n")
 		sb.WriteString("- The user explicitly says to stop\n")
-		sb.WriteString("- All reasonable approaches have been exhausted (and you explain why to the user)\n")
+		sb.WriteString("- All reasonable approaches have been exhausted (and you explain why to the user)\n\n")
+		sb.WriteString("IMPORTANT: A tool error — especially a transient one like a connection error — ")
+		sb.WriteString("is NOT a valid reason to end the turn. If the original task cannot proceed, ")
+		sb.WriteString("explicitly tell the user what happened and propose concrete next steps. ")
+		sb.WriteString("Do NOT silently output a summary and stop without a text response.\n")
 
 		// Remind the LLM that uploaded images arrive as vision
 		// input in the user message (image_url content parts),
@@ -1189,7 +1214,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."})
-		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, req.ProjectRoot, kbEnabled)
+		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, availableTools, req.ProjectRoot, kbEnabled)
 		if err != nil {
 			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true})
 			return
@@ -1326,16 +1351,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 		var totalIn, totalOut int
 
-		// Stuck-loop guard. opencode's TODO comment in
-		// `llm.ts:54` notes "Bound provider retries and
-		// repeated identical tool calls" as unchecked work.
-		// We implement a simple version: track the signature
-		// of the (sorted) tool calls in each round, plus
-		// whether the round ended in tool errors. If the
-		// signature repeats for StuckThreshold consecutive
-		// rounds AND the last round errored, we break out
-		// with a "stuck" event rather than letting the LLM
-		// hammer the same failing call forever.
+		// Stuck-loop guard. Track the signature of the (sorted)
+		// tool calls in each round, plus whether the round ended
+		// in tool errors. If the signature repeats for
+		// StuckThreshold consecutive rounds AND the last round
+		// errored, we break out with a "stuck" event rather than
+		// letting the LLM hammer the same failing call forever.
 		var (
 			stuckStreak          int
 			prevToolSig          string
@@ -1346,6 +1367,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		)
 		const stuckThreshold = 3
 		const sameToolErrMax = 4
+
+		// Strip base64 image payloads from history so that stale
+		// browser screenshots (pre-handler-fix) and user-uploaded
+		// images don't bloat this run's context window. New tool
+		// results from this run already have metadata-only Content
+		// (see browser/tools.go makeHandler), so this is a one-time
+		// sweep for legacy data only.
+		stripImageContent(msgs)
 
 		for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
 			roundStart := time.Now()
@@ -1574,19 +1603,22 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Emit as a single text ChatMessage (tool calls are
 		// separate messages appended below).
 		assistantMsg := llm.ChatMessage{
-			Role:    llm.RoleAssistant,
-			Type:    llm.TypeText,
-			Content: fullContent,
+			Role:        llm.RoleAssistant,
+			Type:        llm.TypeText,
+			Content:     fullContent,
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
 		}
 		msgs = append(msgs, assistantMsg)
 
-		// After the first LLM call, strip image base64 from
-		// attachments so subsequent rounds don't re-send
-		// expensive (~330K tokens/MB) image data. The LLM has
-		// already processed the image; a text marker suffices.
-		if roundNum == 1 {
-			stripImageContent(msgs)
-		}
+		// After each LLM call, strip base64 image payloads from
+		// the message list. This is idempotent: already-stripped
+		// markers are not "data:image/..." so they pass through
+		// unchanged. The initial stripImageContent at the start
+		// of the round loop handles legacy history; this per-round
+		// sweep catches any images added by ExpandAttachmentsCM
+		// or other mechanisms in this run.
+		stripImageContent(msgs)
 
 		// Persist assistant message later — after tool
 		// results are in partsAcc (see end of this round).
@@ -1598,11 +1630,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					id = "call_" + uuid.NewString()
 				}
 				tcm := llm.ChatMessage{
-					Role:      llm.RoleAssistant,
-					Type:      llm.TypeToolCall,
-					ToolID:    id,
-					ToolName:  tc.Name,
-					ToolInput: tc.ArgsJSON,
+					Role:        llm.RoleAssistant,
+					Type:        llm.TypeToolCall,
+					ToolID:      id,
+					ToolName:    tc.Name,
+					ToolInput:   tc.ArgsJSON,
+					MsgType:     llm.MsgTypeTool,
+					SubmitToLLM: 1,
 				}
 				msgs = append(msgs, tcm)
 				if a.store != nil {
@@ -1624,8 +1658,27 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// oldest messages and continue. Mirrors opencode's
 			// `compactIfNeeded()` + Claude Code's auto-compact.
 			if a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds) {
-				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
-				continue
+				// Re-append tool_call messages — they may have
+				// been absorbed by compression, but the tool
+				// execution below still needs them in msgs for
+				// OpenAI/Anthropic protocol pairing.
+				for _, tc := range toolCalls {
+					msgs = append(msgs, llm.ChatMessage{
+						Role:        llm.RoleAssistant,
+						Type:        llm.TypeToolCall,
+						ToolID:      tc.ID,
+						ToolName:    tc.Name,
+						ToolInput:   tc.ArgsJSON,
+						MsgType:     llm.MsgTypeTool,
+						SubmitToLLM: 1,
+					})
+				}
+				// Fall through to tool execution (line 2095
+				// persists the assistant message after tool
+				// results are captured). Do NOT continue —
+				// skipping tool execution leaves orphaned
+				// tool_calls in history and the ReAct loop
+				// stalls.
 			}
 
 			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds})
@@ -1758,7 +1811,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 					handler, ok := a.tools.Get(tc.Name)
 					if !ok {
-						errMsg := fmt.Sprintf("error: tool %q not found (available: %s)", tc.Name, availableToolNames(availableTools))
+						errMsg := fmt.Sprintf("error: tool %q not found (available: %s)", tc.Name, availableToolNames(a.tools.List()))
+						// Browser tools may have been unregistered at runtime.
+						// Provide a clearer message when all browser_ tools are gone.
+						if strings.HasPrefix(tc.Name, "browser_") {
+							hasAnyBrowser := false
+							for _, n := range a.tools.Names() {
+								if strings.HasPrefix(n, "browser_") {
+									hasAnyBrowser = true
+									break
+								}
+							}
+							if !hasAnyBrowser {
+								errMsg = fmt.Sprintf("error: tool %q has been unregistered — the browser extension (P-chat Browser) has disconnected. All browser_* tools are no longer available. Do NOT attempt to retry this tool.", tc.Name)
+							}
+						}
 						outcomes[i] = toolOutcome{
 							idx:    i,
 							tc:     tc,
@@ -1933,6 +2000,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 
 				if o.err != nil || o.result == nil {
+					roundAnyToolErrored = true
 					errMsg := "unknown error"
 					if o.result != nil {
 						errMsg = o.result.Content
@@ -1951,7 +2019,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						ToolError: true,
 						// See comment on the success path for
 						// why MsgType must be set explicitly.
-						MsgType: llm.MsgTypeTool,
+						MsgType:     llm.MsgTypeTool,
+						SubmitToLLM: 1,
 					}
 					msgs = append(msgs, toolMsg)
 					if a.store != nil {
@@ -1985,7 +2054,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// char cap both corrupt JSON. The frontend uses
 					// ToolResultFull in preference to ToolResult when
 					// present.
-					if tc.Name == "todo_write" || tc.Name == "question" {
+					//
+					// Tools that set RawFull (e.g. browser_screenshot)
+					// carry large payloads (base64) that must NOT enter
+					// the LLM context. RawFull is frontend-only.
+					if result.RawFull != "" {
+						okChunk.ToolResultFull = result.RawFull
+					} else if tc.Name == "todo_write" || tc.Name == "question" {
 						okChunk.ToolResultFull = result.Content
 					}
 					partsAcc.update(okChunk)
@@ -2028,11 +2103,52 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// Surfaces after rollback/undo because
 					// the in-memory splice restores the
 					// unfiltered row.
-					MsgType: llm.MsgTypeTool,
+					MsgType:     llm.MsgTypeTool,
+					SubmitToLLM: 1,
 				}
 				msgs = append(msgs, toolMsg)
 				if a.store != nil {
 					a.store.AddChatMessageTo(req.SessionID, toolMsg)
+				}
+			}
+			// Inject vision images: after all tool_result messages
+			// have been appended, collect any tool that produced
+			// an image payload (e.g. browser_screenshot) and
+			// append them as separate role=user, type=image
+			// ChatMessages. The LLM then receives the images as
+			// proper vision inputs (image_url / image blocks) in
+			// the next round, instead of seeing a text placeholder
+			// in the tool_result. This mirrors how user-uploaded
+			// attachments are handled via ExpandAttachmentsCM.
+			//
+			// Each image is persisted as its own row so it
+			// survives reload / rollback and appears as a
+			// standalone image bubble in the chat history. The
+			// base64 is stripped by stripImageContent() at the
+			// start of subsequent rounds to keep the context
+			// window lean.
+			//
+			// When the model doesn't support vision, skip the
+			// injection entirely — the tool_result's text
+			// placeholder is all the LLM will see.
+			visionCapable := a.modelSupportsVision(req.Provider, req.Model)
+			for _, o := range outcomes {
+				if o.result == nil || o.result.Image == nil || !visionCapable {
+					continue
+				}
+				img := o.result.Image
+				imgMsg := llm.ChatMessage{
+					Role:        llm.RoleUser,
+					Type:        llm.TypeImage,
+					Content:     img.Data,
+					MimeType:    img.MIMEType,
+					Name:        img.Name,
+					MsgType:     llm.MsgTypeImage,
+					SubmitToLLM: 1,
+				}
+				msgs = append(msgs, imgMsg)
+				if a.store != nil {
+					a.store.AddChatMessageTo(req.SessionID, imgMsg)
 				}
 			}
 			// Persist assistant message now that tool
@@ -2684,11 +2800,30 @@ func pruneOldToolResults(msgs []llm.ChatMessage, currentRound, keepRounds int) {
 // first round; subsequent rounds don't need the raw bytes.
 func stripImageContent(msgs []llm.ChatMessage) {
 	for i := range msgs {
+		// Image attachments (user uploads via attachment expansion).
 		if msgs[i].Type == llm.TypeImage && msgs[i].Content != "" {
 			msgs[i].Content = fmt.Sprintf("[image: %s (%s) — 已在首轮展示]",
 				msgs[i].Name, msgs[i].MimeType)
 		}
+		// Browser screenshots: tool results containing base64 image
+		// data (either raw "data:image/..." prefix or JSON wrapper
+		// {"image": "data:image/..."}). Strip to save tokens on
+		// subsequent rounds.
+		if msgs[i].Content != "" && len(msgs[i].Content) > 22 {
+			c := msgs[i].Content
+			if strings.HasPrefix(c, "data:image/") {
+				msgs[i].Content = "[截图 — 已在首轮展示，节省 tokens]"
+			} else if strings.Contains(c[:minLen(len(c), 256)], `"data:image/`) {
+				msgs[i].Content = `{"image": "[截图已省略]"}`
+			}
+		}
 	}
+}
+
+// minLen returns the smaller of a and b.
+func minLen(a, b int) int {
+	if a < b { return a }
+	return b
 }
 
 // truncateToFit drops the oldest non-system messages from the slice

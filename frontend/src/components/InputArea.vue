@@ -689,6 +689,31 @@ async function send() {
   // renders correctly without waiting for the next history
   // fetch.
   state.sessionMessages[id].push({ role: 'user', content: text, attachments: bubbleAttachments.length ? bubbleAttachments : undefined })
+  // Convert inline base64 data: URLs on user-sent image
+  // attachments into blob: URLs. The base64 payload has
+  // already been shipped to the server via the
+  // `inlineAttachments` wire path (a separate Array that
+  // owns the same string references until the stream
+  // completes), but the message bubble renders from
+  // `bubbleAttachments` — swapping those to blob URLs
+  // here means the reactive state holds only a short
+  // blob: reference going forward, not a multi-hundred-KB
+  // base64 string. The Blob itself stays alive via the
+  // `pendingAttachments` `_dataURL` until `clearAttachments`
+  // runs in the finally block below.
+  for (const att of bubbleAttachments) {
+    if (att.url?.startsWith('data:image/')) {
+      try {
+        const commaIdx = att.url.indexOf(',')
+        const b64 = att.url.slice(commaIdx + 1)
+        const mime = att.url.slice(5, commaIdx)
+        const byteChars = atob(b64)
+        const bytes = new Uint8Array(byteChars.length)
+        for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
+        att.url = URL.createObjectURL(new Blob([bytes], { type: mime }))
+      } catch { /* keep original data URL */ }
+    }
+  }
   if (!meta.title) {
     api.renameSession(id, text.slice(0, 40)).then(() => {
       const s = state.sessions.find(s => s.id === id)

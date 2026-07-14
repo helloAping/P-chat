@@ -30,6 +30,15 @@ func TestFindServerBinary_FindsSibling(t *testing.T) {
 }
 
 func TestFindServerBinary_NotFound(t *testing.T) {
+	// findServerBinary walks CWD up to 5 levels looking for
+	// bin/pchat-server.exe (dev-mode fallback). If the test binary
+	// runs from inside the project tree, the walk will find it and
+	// defeat the "not found" probe. Chdir to a temp dir so the walk
+	// has no chance of finding a matching file.
+	cwd, _ := os.Getwd()
+	os.Chdir(t.TempDir())
+	defer os.Chdir(cwd)
+
 	t.Setenv("PATH", t.TempDir())
 	if _, err := findServerBinary(); err == nil {
 		t.Fatal("expected error when pchat-server.exe is not in PATH or beside the binary")
@@ -57,9 +66,10 @@ func TestPickConfigPath_PrefersJSON(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("HOME", home)
 
-	// Neither file: should still return a path (json by default).
-	if p := pickConfigPath(); !strings.HasSuffix(p, "config.json") {
-		t.Fatalf("expected config.json default, got %q", p)
+	// Neither file: should return "" (fresh install — pchat-server
+	// uses built-in defaults; see pickConfigPath godoc).
+	if p := pickConfigPath(); p != "" {
+		t.Fatalf("expected empty string for fresh install, got %q", p)
 	}
 
 	// Both files: prefer json.

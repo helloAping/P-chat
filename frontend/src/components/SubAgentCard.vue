@@ -191,6 +191,7 @@ onBeforeUnmount(() => {
           :default-open="false"
         />
         <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
+        <QuestionTable v-else-if="p.kind === 'question'" :part="p" />
         <div v-else-if="p.kind === 'text'" class="sub-text" v-html="renderSubText(p.text)" />
       </template>
       <!-- task_id footer: stable identifier the LLM can pass back

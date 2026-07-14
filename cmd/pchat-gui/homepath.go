@@ -20,13 +20,23 @@ import (
 // lightest weight fix.
 //
 // Resolution order (highest priority first):
-//  1. PCHAT_HOME env var — explicit operator override.
+//  1. PCHAT_DATA_HOME env var — explicit operator override
+//     of the data dir (memory / config / …).
 //  2. Sibling: if this binary lives in bin/ or dev-bin/,
 //     use <parent>/.p-chat/ so a dev build doesn't touch
 //     the user's real ~/.p-chat.
 //  3. $HOME/.p-chat fallback (the original behaviour).
+//
+// PCHAT_HOME is NOT consulted. PCHAT_HOME is the install
+// root (set by install.ps1 -AddToPath, used in PATH as
+// %PCHAT_HOME%). Reading it for the data dir used to cause
+// memory / config to land in the install directory; that
+// bug was fixed in lock-step with internal/paths and the
+// install / uninstall scripts. See internal/upgrade
+// stepV3toV4 for the data migration that rescues existing
+// installs.
 func resolveHomeDir() string {
-	if h := os.Getenv("PCHAT_HOME"); h != "" {
+	if h := os.Getenv("PCHAT_DATA_HOME"); h != "" {
 		return h
 	}
 	if exe, err := os.Executable(); err == nil {

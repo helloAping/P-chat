@@ -1419,5 +1419,29 @@ export const testWebSearchConnection = () =>
     { method: 'POST' },
   )
 
+// ---- Browser control ----
 
+export interface BrowserInfo {
+  id: string
+  name: string
+  connected_at: string
+}
 
+export interface BrowserStatus {
+  enabled: boolean
+  count: number
+  http_url?: string
+  ws_url?: string
+}
+
+export const listBrowsers = () =>
+  jsonFetch<{ browsers: BrowserInfo[]; count: number }>('/api/v1/browser/list')
+
+export const getBrowserStatus = () =>
+  jsonFetch<BrowserStatus>('/api/v1/browser/status')
+
+export const updateBrowserConfig = (enabled: boolean) =>
+  jsonFetch<{ ok: boolean; enabled: boolean }>('/api/v1/browser/config', {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  })

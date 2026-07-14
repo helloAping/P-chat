@@ -7,12 +7,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -23,14 +25,23 @@ type Server struct {
 	Cmd     *exec.Cmd
 	BaseURL string // http://127.0.0.1:NNNN
 	Port    int
+
+	// Auto-restart bookkeeping. All fields below are guarded by
+	// mu and only relevant when opts.MaxRestarts > 0.
+	mu           sync.Mutex
+	stopped      bool // set by Stop() to suppress restart
+	restartCount int
+	opts         Options
 }
 
 // Options configures a server launch.
 type Options struct {
 	// Port to bind the server on. 0 = pick a free port automatically.
 	Port int
-	// ConfigPath is the path passed as --config. Empty = default
-	// ~/.p-chat/config.yaml.
+	// ConfigPath is the path passed as --config. Empty = use
+	// the data dir's config.json (preferred) or config.yaml
+	// (legacy); both are decided by internal/paths via the
+	// PCHAT_DATA_HOME / sibling / $HOME fallback chain.
 	ConfigPath string
 	// ServerBin is the path to the pchat-server binary. Required.
 	ServerBin string
@@ -43,6 +54,15 @@ type Options struct {
 	WebDir string
 	// PingTimeout caps how long we wait for the server to be ready.
 	PingTimeout time.Duration
+	// MaxRestarts is the maximum number of times to relaunch
+	// the server if it exits unexpectedly after becoming healthy.
+	// 0 (default) = no auto-restart, preserves the original
+	// behaviour. Each restart waits RestartBackOff before
+	// relaunching. Stop() always suppresses the restart loop.
+	MaxRestarts int
+	// RestartBackOff is the delay between an unexpected exit
+	// and the next launch attempt. Zero defaults to 5s.
+	RestartBackOff time.Duration
 }
 
 // Start launches pchat-server (if ServerBin is set) and blocks until
@@ -90,21 +110,27 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 			// created on first save.
 			args = nil
 		}
+		// Note: the data dir itself is decided by internal/paths
+		// (PCHAT_DATA_HOME / sibling / $HOME fallback). The GUI
+		// explicitly passes PCHAT_DATA_HOME = <resolved dir> on
+		// the child env, so the child sees the same data dir
+		// we did.
 	}
 
 	cmd := exec.CommandContext(ctx, opts.ServerBin, args...)
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("PCHAT_PORT=%d", port),
-		"PCHAT_HOME="+paths.GlobalDir(),
+		// PCHAT_DATA_HOME (not PCHAT_HOME) — PCHAT_HOME is the
+		// install root set by install.ps1 -AddToPath. Reading
+		// it for the data dir would cause memory / config to
+		// land in the install directory. Pass the resolved
+		// data dir explicitly so the child server agrees with
+		// us regardless of the user's PCHAT_HOME value.
+		"PCHAT_DATA_HOME="+paths.GlobalDir(),
 	)
 	if opts.WebDir != "" {
 		cmd.Env = append(cmd.Env, "PCHAT_WEB_DIR="+opts.WebDir)
 	}
-	// PCHAT_PORT is informational; the real port comes from --config.
-	// We also set the listen address via env so the child binds to
-	// the port we picked. (pchat-server reads PCHAT_PORT to override
-	// the configured port — see cmd/pchat-server/main.go for the
-	// corresponding code.)
 	cmd.Stderr = opts.Stderr
 	cmd.Stdout = opts.Stdout
 	if err := cmd.Start(); err != nil {
@@ -115,11 +141,24 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 		Cmd:     cmd,
 		BaseURL: fmt.Sprintf("http://127.0.0.1:%d", port),
 		Port:    port,
+		opts:    opts,
 	}
 	if err := srv.waitReady(ctx, opts.PingTimeout); err != nil {
 		_ = cmd.Process.Kill()
 		return nil, err
 	}
+
+	// Launch auto-restart watcher if enabled. The goroutine
+	// blocks on cmd.Wait() and, if Stop() hasn't been called,
+	// relaunches the server up to opts.MaxRestarts times with
+	// a back-off in between.
+	if opts.MaxRestarts > 0 {
+		srv.mu.Lock()
+		srv.restartCount = 0
+		srv.mu.Unlock()
+		go srv.watchAndRestart(ctx)
+	}
+
 	return srv, nil
 }
 
@@ -155,12 +194,17 @@ func (s *Server) waitReady(ctx context.Context, timeout time.Duration) error {
 	}
 }
 
-// Stop terminates the subprocess gracefully (SIGTERM on Unix,
-// taskkill on Windows). Falls back to Kill after a short timeout.
+// Stop tells the restart watcher (if any) that the shutdown is
+// intentional, then terminates the subprocess. After Stop returns
+// the watcher goroutine will exit without relaunching.
 func (s *Server) Stop() {
 	if s == nil || s.Cmd == nil || s.Cmd.Process == nil {
 		return
 	}
+	s.mu.Lock()
+	s.stopped = true
+	s.mu.Unlock()
+
 	_ = s.Cmd.Process.Signal(terminateSignal())
 	done := make(chan struct{})
 	go func() {
@@ -174,6 +218,91 @@ func (s *Server) Stop() {
 		_ = s.Cmd.Process.Kill()
 		<-done
 	}
+}
+
+// watchAndRestart blocks on Cmd.Wait(). If the exit was not
+// intentional (Stop() not called), it relaunches the server
+// up to opts.MaxRestarts times with RestartBackOff between
+// attempts. The loop exits when Stop() is called, max restarts
+// exhausted, or a relaunch fails.
+func (s *Server) watchAndRestart(ctx context.Context) {
+	backOff := s.opts.RestartBackOff
+	if backOff <= 0 {
+		backOff = 5 * time.Second
+	}
+	_ = s.Cmd.Wait()
+
+	for {
+		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			return
+		}
+		if s.restartCount >= s.opts.MaxRestarts {
+			s.mu.Unlock()
+			log.Printf("[serverproc] max restarts (%d) reached, giving up", s.opts.MaxRestarts)
+			return
+		}
+		s.restartCount++
+		count := s.restartCount
+		s.mu.Unlock()
+
+		log.Printf("[serverproc] restarting pchat-server (attempt %d/%d) in %v",
+			count, s.opts.MaxRestarts, backOff)
+		time.Sleep(backOff)
+
+		cmd := s.buildCommand(ctx)
+		if err := cmd.Start(); err != nil {
+			log.Printf("[serverproc] restart %d: start failed: %v", count, err)
+			continue
+		}
+		old := s.Cmd
+		s.mu.Lock()
+		s.Cmd = cmd
+		s.mu.Unlock()
+
+		if err := s.waitReady(ctx, s.opts.PingTimeout); err != nil {
+			log.Printf("[serverproc] restart %d: health check failed: %v", count, err)
+			_ = cmd.Process.Kill()
+			s.mu.Lock()
+			s.Cmd = old
+			s.mu.Unlock()
+			continue
+		}
+
+		log.Printf("[serverproc] restart %d succeeded (PID=%d)", count, cmd.Process.Pid)
+		_ = cmd.Wait()
+	}
+}
+
+// buildCommand constructs an exec.Cmd from the saved opts,
+// reusing the already-assigned port. Meant for restart watcher.
+func (s *Server) buildCommand(ctx context.Context) *exec.Cmd {
+	opts := s.opts
+	args := []string{"--config", opts.ConfigPath}
+	if opts.ConfigPath == "" {
+		jsonPath := paths.GlobalConfig()
+		yamlPath := paths.GlobalConfigYAML()
+		switch {
+		case fileExists(jsonPath):
+			args = []string{"--config", jsonPath}
+		case fileExists(yamlPath):
+			args = []string{"--config", yamlPath}
+		default:
+			args = nil
+		}
+	}
+	cmd := exec.CommandContext(ctx, opts.ServerBin, args...)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("PCHAT_PORT=%d", s.Port),
+		"PCHAT_DATA_HOME="+paths.GlobalDir(),
+	)
+	if opts.WebDir != "" {
+		cmd.Env = append(cmd.Env, "PCHAT_WEB_DIR="+opts.WebDir)
+	}
+	cmd.Stderr = opts.Stderr
+	cmd.Stdout = opts.Stdout
+	return cmd
 }
 
 // terminateSignal returns SIGTERM on Unix, os.Kill on Windows

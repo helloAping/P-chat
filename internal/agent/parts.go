@@ -87,6 +87,11 @@ type MessagePart struct {
 	// header so the user can read the full hint without
 	// expanding the body.
 	AgentDescription string `json:"agent_description,omitempty"`
+	// FailureReason explains why the sub-agent failed. Set on
+	// the close event ("err") so the card can show the reason
+	// after a session reload. Persisted in meta["parts"] via
+	// snapshotStructural; lost before this field existed.
+	FailureReason string `json:"failure_reason,omitempty"`
 	// QuestionStatus tracks the question part's lifecycle.
 	// "open"   — question just emitted, user hasn't answered.
 	// "ok"     — user picked an option(s); Name carries the
@@ -574,6 +579,38 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			Text:           string(canonical),
 			QuestionStatus: "open",
 		})
+		a.setActiveParts(parts)
+		return
+	}
+
+	// ContentRewrite: replace the trailing text part in-place
+	// with the rewritten version. The post-stream redactor
+	// (agent.go) emits this AFTER the stream ends to sanitize
+	// phantom errors; without this branch, snapshotStructural
+	// would persist the un-sanitized text and the phantom would
+	// reappear on session reload (the frontend's scrubbing in
+	// switchSession is a secondary defense, not the primary).
+	if c.ContentRewrite != "" {
+		parts := a.activeParts()
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i].Kind == "text" {
+				parts[i].Text = c.ContentRewrite
+				break
+			}
+		}
+		a.setActiveParts(parts)
+		return
+	}
+
+	// ThinkingRewrite: same pattern for the thinking block.
+	if c.ThinkingRewrite != "" {
+		parts := a.activeParts()
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i].Kind == "thinking" {
+				parts[i].Text = c.ThinkingRewrite
+				break
+			}
+		}
 		a.setActiveParts(parts)
 		return
 	}

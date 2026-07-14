@@ -31,6 +31,7 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 	if sm == nil || sm.store == nil || sm.llm == nil {
 		return false, "", nil
 	}
+	_ = sm.store.Flush()
 	rows, err := sm.store.db.Query(
 		`SELECT id FROM messages WHERE conversation_id = ? ORDER BY id ASC`,
 		convID,
@@ -77,34 +78,49 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 	if len(toSummarize) == 0 {
 		return false, "", nil
 	}
-	// Summarize ALL unsummarized messages (explicit /compress).
-	// Cap at 100 to avoid excessive prompt length.
-	rangeIDs := toSummarize
-	if len(rangeIDs) > 100 {
-		rangeIDs = rangeIDs[:100]
-	}
-	startID, endID := rangeIDs[0], rangeIDs[len(rangeIDs)-1]
-
-	texts := make([]string, 0, len(rangeIDs))
-	for _, id := range rangeIDs {
-		var role, content string
-		if err := sm.store.db.QueryRow(
-			`SELECT role, content FROM messages WHERE id = ?`, id,
-		).Scan(&role, &content); err == nil {
-			t := role + ": " + truncateStr(content, 200)
-			texts = append(texts, t)
+	// Summarize ALL unsummarized messages in batches of up to 100
+	// (each batch becomes one LLM summarization call capped at ~200
+	// chars per message × 100 messages = ~20K chars prompt, safely
+	// within the summarizer model's context). The loop runs until
+	// every uncompressed message has been covered, preventing the
+	// ReAct loop from re-entering auto-compact on every round.
+	var allSummaries []string
+	for len(toSummarize) > 0 {
+		batch := toSummarize
+		if len(batch) > 100 {
+			batch = batch[:100]
 		}
-	}
-	joined := strings.Join(texts, "\n")
+		startID, endID := batch[0], batch[len(batch)-1]
 
-	summary, err := sm.summarize(ctx, joined)
-	if err != nil {
-		return false, "", err
+		texts := make([]string, 0, len(batch))
+		for _, id := range batch {
+			var role, content string
+			if err := sm.store.db.QueryRow(
+				`SELECT role, content FROM messages WHERE id = ?`, id,
+			).Scan(&role, &content); err == nil {
+				t := role + ": " + truncateStr(content, 200)
+				texts = append(texts, t)
+			}
+		}
+		joined := strings.Join(texts, "\n")
+
+		summary, err := sm.summarize(ctx, joined)
+		if err != nil {
+			if len(allSummaries) == 0 {
+				return false, "", err
+			}
+			return true, strings.Join(allSummaries, "\n"), err
+		}
+		if err := sm.store.SaveSummary(convID, startID, endID, summary); err != nil {
+			if len(allSummaries) == 0 {
+				return false, summary, err
+			}
+			return true, strings.Join(allSummaries, "\n"), err
+		}
+		allSummaries = append(allSummaries, summary)
+		toSummarize = toSummarize[len(batch):]
 	}
-	if err := sm.store.SaveSummary(convID, startID, endID, summary); err != nil {
-		return false, summary, err
-	}
-	return true, summary, nil
+	return true, strings.Join(allSummaries, "\n"), nil
 }
 
 // MaybeSummarize checks if the current conversation has grown past the

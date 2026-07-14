@@ -29,6 +29,7 @@ tasks:
       # in parallel by default, so the sync can race ahead of
       # clean-frontend-output.ps1 and copy an empty tree.
       - powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\sync-web.ps1"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\sync-browser-ext.ps1" -OutDir cmd\pchat-server
     # Intentionally no `sources:` / `generates:` — we always
     # rebuild. The user's complaint was that the SPA shipped
     # stale assets because the file-mtime check missed a
@@ -54,6 +55,7 @@ tasks:
     cmds:
       - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat.exe ./cmd/pchat
       - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server.exe ./cmd/pchat-server
+      - powershell -NoProfile -Command "Copy-Item -Force cmd\pchat-server\browser-extension.zip bin\browser-extension.zip"
     silent: false
 
   build:gui:
@@ -86,12 +88,58 @@ tasks:
           GOTOOLCHAIN: auto
     silent: false
 
+  build:gui:macos:
+    desc: 编译 macOS 桌面端 (Wails v2) — 需要在 macOS 主机上运行
+    deps: [build:frontend]
+    dir: cmd\pchat-gui
+    cmds:
+      # Wails v2 does not support cross-compile to macOS — Apple's
+      # toolchain is required. Skip with a clear message on non-macOS
+      # hosts so `build:all` doesn't surface a cryptic linker error
+      # when run from Windows/Linux CI.
+      - cmd: powershell -NoProfile -Command "if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { Write-Host '[skip] pchat-gui macOS build requires macOS host. Run this on a Mac or in a macOS CI runner.' -ForegroundColor Yellow; exit 0 }"
+      - cmd: wails build -platform darwin/universal -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
+        env:
+          GOPROXY: '{{.GOPROXY}}'
+          GOTOOLCHAIN: auto
+    silent: false
+
   build:server:linux:
     desc: 交叉编译 Linux Server 二进制
     cmds:
       - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-linux ./cmd/pchat-server
         env:
           GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+    silent: false
+
+  build:server:macos:
+    desc: 交叉编译 macOS Server 二进制 (amd64)
+    cmds:
+      - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-darwin-amd64 ./cmd/pchat-server
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: 0
+    silent: false
+
+  build:cli:linux:
+    desc: 交叉编译 Linux CLI 二进制
+    cmds:
+      - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-linux ./cmd/pchat
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+    silent: false
+
+  build:cli:macos:
+    desc: 交叉编译 macOS CLI 二进制 (amd64)
+    cmds:
+      - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-darwin-amd64 ./cmd/pchat
+        env:
+          GOOS: darwin
           GOARCH: amd64
           CGO_ENABLED: 0
     silent: false
@@ -112,11 +160,21 @@ tasks:
     silent: false
 
   build:all:
-    desc: 同时编译 CLI / Server / 桌面端 / 安装器
+    desc: 同时编译 CLI / Server / 桌面端 / 安装器（含 Linux/macOS GUI 安装包 best-effort）
     cmds:
       - task: build
       - task: build:gui
       - task: build:setup
+      # Linux GUI package: best-effort. Skips with warning on non-Linux
+      # hosts, or on Windows when the Wails Linux cross-compile toolchain
+      # isn't installed (CGO + GTK + webkit2gtk-4.0). Run on a Linux
+      # host or a CI runner with the deps for a real build.
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -Task "package:gui:linux" -Platform "linux/amd64"
+      # macOS GUI package: only runs on macOS hosts (Wails v2 cannot
+      # cross-compile to darwin from Windows/Linux). Wrapper exits 0
+      # with a skip message on any other OS so the aggregate task
+      # keeps going.
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -RequiredOS darwin -Task "package:gui:macos" -Platform "darwin/universal"
 
   package:gui:
     desc: 把桌面端打包到 bin\（含前端 SPA + pchat-server.exe + install/uninstall 脚本）
@@ -127,13 +185,42 @@ tasks:
     silent: false
 
   package:gui:linux:
-    desc: 打包 Linux 安装包到 build/bin/
+    desc: 打包 Linux 安装包到 build/bin/（含 Linux server/CLI 二进制，非 Windows .exe）
+    deps: [build:server:linux, build:cli:linux]
     cmds:
       - task: build:frontend
+      # Wails v2 does not support Windows→Linux cross-compile. The
+      # build step is best-effort: when it fails (or is run on
+      # Windows without a CGO+GTK+webkit toolchain) we still ship
+      # the rest of the bundle (server + CLI + SPA + scripts). The
+      # user can build pchat-gui on a Linux host or via a Linux CI
+      # runner and drop it into build/bin/ before installing.
       - task: build:gui:linux
-      - powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -LiteralPath 'bin\pchat-server.exe' -Destination 'build\bin\pchat-server' -Force; if (-not (Test-Path 'build\bin\pchat-server')) { throw 'server binary not found' }"
-      - powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Path 'build\bin\web' -Force | Out-Null; Copy-Item -Path 'web\*' -Destination 'build\bin\web\' -Recurse -Force"
-      - powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -LiteralPath 'scripts\install-linux.sh' -Destination 'build\bin\install.sh' -Force; Copy-Item -LiteralPath 'scripts\uninstall-linux.sh' -Destination 'build\bin\uninstall.sh' -Force"
+        ignore_error: true
+      # The actual assembly lives in a dedicated script. The
+      # equivalent inline PowerShell trips on `:` in warning
+      # messages (Task's YAML key-value parser interprets
+      # "WARNING:" as a mapping key); a script sidesteps YAML
+      # quoting entirely.
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/package-gui-linux.ps1"
+    silent: false
+
+  package:gui:macos:
+    desc: 打包 macOS 安装包到 build/bin/pchat-gui-macos/ — 需要在 macOS 主机上运行
+    deps: [build:server:macos, build:cli:macos]
+    cmds:
+      # Wails v2 cannot cross-compile to darwin from Windows/Linux.
+      # Skip with a clear message on non-macOS hosts; the actual
+      # packaging step below runs only on macOS.
+      - cmd: powershell -NoProfile -Command "if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { Write-Host '[skip] pchat-gui macOS package requires macOS host. Run this on a Mac or in a macOS CI runner.' -ForegroundColor Yellow; exit 0 }"
+      - task: build:frontend
+      - task: build:gui:macos
+        ignore_error: true
+      # Only run the bundle assembly on macOS — the script does
+      # `cp` / `chmod` on the .app, server, and CLI, and the .app
+      # only exists if build:gui:macos succeeded above. The script
+      # itself guards against missing inputs.
+      - cmd: bash "scripts/package-gui-macos.sh"
     silent: false
 
   cli:
@@ -162,6 +249,7 @@ tasks:
       - powershell -NoProfile -Command "New-Item -ItemType Directory -Path dev-bin -Force | Out-Null"
       - go build -o dev-bin/pchat-server.exe ./cmd/pchat-server
       - go build -o dev-bin/pchat.exe ./cmd/pchat
+      - powershell -NoProfile -Command "Copy-Item -Force cmd\pchat-server\browser-extension.zip dev-bin\browser-extension.zip"
       - task: build:dev:gui
       - powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name 'pchat-gui' -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name 'pchat-server' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 500"
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\dev-bin\pchat-gui.exe'"
@@ -253,9 +341,14 @@ tasks:
   release:run:
     desc: 本地打 tag 触发 CI Draft Release（交互式，会询问确认）
     cmds:
-      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release.ps1
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/release.ps1"
 
   release:dryrun:
     desc: 预览 release:run 会做什么（不实际修改）
     cmds:
-      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release.ps1 -DryRun
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/release.ps1" -DryRun
+
+  package:browser-ext:
+    desc: 打包浏览器控制扩展为 ZIP (输出到 bin/browser-extension.zip)
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/package-browser-ext.ps1"

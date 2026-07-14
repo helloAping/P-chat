@@ -26,10 +26,17 @@ const (
 	V2 AppVersion = 2
 
 	// V3 — styles migrated to SQLite (styles table), built-in
-	// prompts embedded in the binary. Current version.
+	// prompts embedded in the binary.
 	V3 AppVersion = 3
+
+	// V4 — PCHAT_HOME split into PCHAT_HOME (install root,
+	// used in PATH) + PCHAT_DATA_HOME (data dir override).
+	// stepV3toV4 rescues any memory / config that the old
+	// code wrote under the install directory on machines
+	// that had run install.ps1 -AddToPath.
+	V4 AppVersion = 4
 
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V3
+	Current AppVersion = V4
 )

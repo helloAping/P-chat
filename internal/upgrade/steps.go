@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/p-chat/pchat/internal/paths"
 )
 
 //go:embed prompts/*.md
@@ -26,6 +28,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V0: stepV0toV1,
 	V1: stepV1toV2,
 	V2: stepV2toV3,
+	V3: stepV3toV4,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -262,4 +265,153 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// ---- V3 → V4 ----
+//
+// Background. Before V4, internal/paths/devhome.go treated
+// PCHAT_HOME as the data dir. install.ps1 -AddToPath writes
+// PCHAT_HOME = <install dir> as a user env var. Result: any
+// install with -AddToPath had memory + config written under
+// the install directory, not under the user's $HOME/.p-chat.
+//
+// V4 fixes the resolution (PCHAT_HOME is now exclusively the
+// install root; data dir override is PCHAT_DATA_HOME). But
+// existing installs have data stranded at
+// <PCHAT_HOME>/memory/. This step rescues it.
+//
+// Behaviour:
+//
+//   - No PCHAT_HOME set → nothing to do (the bug never bit
+//     this user; their data is already at ~/.p-chat/).
+//   - PCHAT_HOME set, <PCHAT_HOME>/memory/ empty / missing
+//     → nothing to do (clean install, or they wiped it).
+//   - PCHAT_HOME set, <PCHAT_HOME>/memory/ has data,
+//     ~/.p-chat/memory/ empty → move the directory across.
+//     Idempotent: on a re-run, source will be gone so the
+//     step is a no-op.
+//   - PCHAT_HOME set, BOTH have data → CONFLICT. Don't touch
+//     either side. Log a warning with the exact paths so the
+//     user can manually consolidate (typically: keep the
+//     larger / more-recent one, delete the other).
+//
+// The step is intentionally best-effort: it logs and
+// returns nil on the conflict path, so a botched install
+// doesn't prevent the rest of the upgrade from running.
+func stepV3toV4(_ *sql.DB) error {
+	log.Print("[upgrade] V3 → V4: rescue install-dir data into ~/.p-chat/")
+
+	installDir := strings.TrimSpace(os.Getenv("PCHAT_HOME"))
+	if installDir == "" {
+		log.Print("[upgrade] V3→V4: PCHAT_HOME not set, nothing to migrate")
+		return nil
+	}
+
+	// Defensive: some Windows shells leave the env var with
+	// trailing whitespace or a stray quote. Resolve to an
+	// absolute, cleaned-up path before using.
+	installDir = filepath.Clean(installDir)
+	if !filepath.IsAbs(installDir) {
+		// install.ps1 always writes an absolute path; if we
+		// got a relative one something's off, but don't
+		// refuse to start over it — just skip the migration
+		// and log so the user knows.
+		log.Printf("[upgrade] V3→V4: PCHAT_HOME=%q is not absolute, skipping migration", installDir)
+		return nil
+	}
+
+	src := filepath.Join(installDir, "memory")
+	dst := paths.MemoryDir() // = ~/.p-chat/memory/ under the new resolution
+
+	// Idempotency: if the source is already gone, we either
+	// already ran this step or the install was always clean.
+	// Either way, nothing to do.
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		log.Printf("[upgrade] V3→V4: source %s does not exist, nothing to migrate", src)
+		return nil
+	}
+
+	// Conflict: both locations have data. Don't clobber.
+	// Use store.db as the existence probe — it's the
+	// canonical "the user has data here" signal. (WAL/SHM
+	// may exist as zero-byte stragglers from a previous
+	// open connection; not interesting on their own.)
+	dstDB := filepath.Join(dst, "store.db")
+	if _, err := os.Stat(dstDB); err == nil {
+		log.Printf("[upgrade] V3→V4: CONFLICT — both %s and %s have a SQLite store.db. "+
+			"Keeping both; please consolidate manually (e.g. inspect with sqlite3 and "+
+			"delete the smaller / older one).", src, dst)
+		return nil
+	}
+
+	// Move the entire memory/ directory: store.db + .wal +
+	// .shm + any .backup-* snapshots. os.Rename on the
+	// directory itself is atomic on the same volume (the
+	// usual case — both dirs are on the system drive) and
+	// fast for large stores.
+	//
+	// Cross-volume fallback: when the install dir lives on
+	// a different drive than HOME (e.g. install on D:\,
+	// user home on C:\), os.Rename returns
+	// ERROR_NOT_SAME_DEVICE / EXDEV. We then copy the
+	// tree and remove the source.
+	if err := os.Rename(src, dst); err != nil {
+		log.Printf("[upgrade] V3→V4: rename %s → %s failed (%v), "+
+			"trying copy+delete (cross-volume fallback)", src, dst, err)
+
+		if err := copyDir(src, dst); err != nil {
+			log.Printf("[upgrade] V3→V4: copy %s → %s also failed: %v. "+
+				"Data is still at the install dir; you can copy it manually to %s.",
+				src, dst, err, dst)
+			// Clean up any partial dest so next run doesn't
+			// hit the CONFLICT probe with a broken store.db.
+			os.RemoveAll(dst)
+			return nil
+		}
+		if err := os.RemoveAll(src); err != nil {
+			log.Printf("[upgrade] V3→V4: copied to %s but could not remove source %s: %v (non-fatal)",
+				dst, src, err)
+		}
+		log.Printf("[upgrade] V3→V4: copied %s → %s (cross-volume)", src, dst)
+		return nil
+	}
+
+	log.Printf("[upgrade] V3→V4: moved %s → %s (install-dir memory rescued into user home)", src, dst)
+	return nil
+}
+
+// copyDir recursively copies src into dst. Used as the
+// cross-volume fallback for stepV3toV4 when os.Rename
+// fails with EXDEV / ERROR_NOT_SAME_DEVICE.
+func copyDir(src, dst string) error {
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dst, err)
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("readdir %s: %w", src, err)
+	}
+	for _, e := range entries {
+		srcPath := filepath.Join(src, e.Name())
+		dstPath := filepath.Join(dst, e.Name())
+		if e.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+		data, err := os.ReadFile(srcPath)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", srcPath, err)
+		}
+		fi, err := os.Stat(srcPath)
+		mode := os.FileMode(0o644)
+		if err == nil {
+			mode = fi.Mode()
+		}
+		if err := os.WriteFile(dstPath, data, mode); err != nil {
+			return fmt.Errorf("write %s: %w", dstPath, err)
+		}
+	}
+	return nil
 }

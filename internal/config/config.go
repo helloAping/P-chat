@@ -30,6 +30,7 @@ type Config struct {
 	Knowledge KnowledgeConfig `json:"knowledge"`
 	Limits    LimitsConfig    `json:"limits"`
 	Search    SearchConfig    `json:"search"`
+	Browser   BrowserConfig   `json:"browser"`
 }
 
 // LimitsConfig controls resource caps for the agent loop.
@@ -421,6 +422,30 @@ type SearchConfig struct {
 	DailyQuota int `json:"daily_quota,omitempty"`
 }
 
+// BrowserConfig controls the browser-control feature. When
+// Enabled=true, the server accepts WebSocket connections from
+// Chrome extensions and exposes browser_* tools to the LLM.
+// When Enabled=false, the WebSocket endpoint returns 403 and
+// browser tools are invisible to the LLM.
+type BrowserConfig struct {
+	// Enabled is the master switch.
+	Enabled bool `json:"enabled"`
+
+	// ScreenshotQuality is the JPEG quality for browser_screenshot
+	// requests (1-100). Default 80.
+	ScreenshotQuality int `json:"screenshot_quality,omitempty"`
+
+	// MaxScreenshotsInHistory caps how many screenshot bytes are
+	// retained in conversation history before being stripped to
+	// "[creenshot omitted]". Default 3.
+	MaxScreenshotsInHistory int `json:"max_screenshots_in_history,omitempty"`
+
+	// AllowEvalWrite permits browser_evaluate to execute JS that
+	// writes to the page (fetch, postMessage, etc.). When false
+	// (default), only read-only expressions are allowed.
+	AllowEvalWrite bool `json:"allow_eval_write,omitempty"`
+}
+
 // SandboxConfig controls which actions LLM-driven tools can take
 // without explicit user confirmation.
 type SandboxConfig struct {
@@ -759,6 +784,11 @@ func Default() *Config {
 			Enabled:        false,
 			Provider:       "tavily",
 			RequestTimeout: 20 * time.Second,
+		},
+		Browser: BrowserConfig{
+			Enabled:                 false,
+			ScreenshotQuality:       80,
+			MaxScreenshotsInHistory: 3,
 		},
 	}
 }
