@@ -21,10 +21,6 @@ const statusLabel = computed(() => {
   }
 })
 
-// Status icon component. Returns the lucide component reference
-// so the template can render it via <component :is="...">.
-// 'start' is a spinning Loader2; the other three are static
-// status glyphs.
 const statusIcon = computed(() => {
   switch (props.part.status) {
     case 'start': return Loader2
@@ -35,12 +31,31 @@ const statusIcon = computed(() => {
   }
 })
 
-// Pretty-print the args JSON. If parsing fails, fall
-// back to the raw string.
 const argsPretty = computed(() => {
   const a = props.part.args
   if (!a) return ''
   try { return JSON.stringify(JSON.parse(a), null, 2) } catch { return a }
+})
+
+// Detect browser screenshot data in the result. The
+// extension returns images either as a raw data: URL
+// (legacy pre-blob conversion) or as
+// `{image: "data:image/jpeg;base64,..."}` JSON.
+// After the store's convertAndStripScreenshots runs,
+// these become `blob:` URLs which the browser <img>
+// handles natively with the same `:src` binding.
+const screenshotURL = computed(() => {
+  const r = props.part.result
+  if (!r) return ''
+  if (r.startsWith('data:image/') || r.startsWith('blob:')) return r
+  try {
+    const obj = JSON.parse(r)
+    if (typeof obj.image === 'string') {
+      const img = obj.image as string
+      if (img.startsWith('data:image/') || img.startsWith('blob:')) return img
+    }
+  } catch { /* not JSON */ }
+  return ''
 })
 </script>
 
@@ -62,7 +77,8 @@ const argsPretty = computed(() => {
       </div>
       <div v-if="part.result" class="tool-result">
         <div class="tool-section-label">结果</div>
-        <pre>{{ part.result }}</pre>
+        <img v-if="screenshotURL" :src="screenshotURL" class="tool-screenshot" loading="lazy" />
+        <pre v-else>{{ part.result }}</pre>
       </div>
       <div v-if="part.error" class="tool-error">
         <div class="tool-section-label">错误</div>
@@ -171,5 +187,18 @@ const argsPretty = computed(() => {
   color: var(--error-500);
   border-color: var(--error-500);
   background: var(--error-50);
+}
+.tool-screenshot {
+  display: block;
+  max-width: 100%;
+  max-height: 400px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  margin-top: 4px;
+  cursor: pointer;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.tool-screenshot:hover {
+  transform: scale(1.02);
 }
 </style>

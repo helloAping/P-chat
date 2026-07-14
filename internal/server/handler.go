@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
@@ -38,6 +39,14 @@ type Handler struct {
 	styleMgr   *style.Manager
 	summarizer *memory.Summarizer
 	mcpMgr     *mcp.Manager
+	browserMgr *browser.Manager
+
+	// listenAddr is the actual address the HTTP server is bound to
+	// (e.g. "127.0.0.1:14712"). Set once at startup by the server.
+	// Used by the browser extension UI to construct a real WS URL.
+	// Safe to read without a mutex — written synchronously before
+	// any HTTP handler runs, never mutated afterwards.
+	listenAddr string
 
 	metaMu sync.Mutex
 	// sessionLocks serialises concurrent SendMessage calls per
@@ -2554,6 +2563,19 @@ func ParseLimit(c *gin.Context, def int) int {
 // SetSummarizer wires the summarizer for compress support.
 func (h *Handler) SetSummarizer(sm *memory.Summarizer) {
 	h.summarizer = sm
+}
+
+// SetBrowserManager wires the browser control manager for WebSocket
+// and REST endpoints. Pass nil to disable browser control endpoints.
+func (h *Handler) SetBrowserManager(bm *browser.Manager) {
+	h.browserMgr = bm
+}
+
+// SetListenAddr records the real listen address so the browser
+// extension UI can display the correct WebSocket URL. Must be
+// called before Run/RunAt starts accepting connections.
+func (h *Handler) SetListenAddr(addr string) {
+	h.listenAddr = addr
 }
 
 // CompressConversation compresses the current conversation's history.

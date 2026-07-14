@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { NSpin, useMessage } from 'naive-ui'
-import { MessageSquare } from './icons'
+import { ArrowDown, MessageSquare } from './icons'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
@@ -10,7 +10,7 @@ import TodoPanel from './TodoPanel.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler } from '../stores/chat'
 
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
@@ -24,6 +24,29 @@ const wasAtTop = ref(false)
 const prevScrollHeight = ref(0)
 const prevScrollTop = ref(0)
 
+// Sticky-bottom: track whether the user is "at the bottom"
+// (within SCROLL_BOTTOM_THRESHOLD pixels of the bottom edge).
+// New content only auto-scrolls when this is true; when the
+// user has scrolled up to read history, the viewport stays
+// put and a "jump to bottom" button invites them back. The
+// old code always scrolled to bottom on any message change,
+// which yanked the user away from history the moment any
+// SSE event landed, and worse, snapped them to the bottom
+// whenever they scrolled to the top to load more history
+// (loadMoreMessages → prepend → deep watcher → scrollToBottom).
+const SCROLL_BOTTOM_THRESHOLD = 200
+const isAtBottom = ref(true)
+const showJumpToBottom = computed(() => !isAtBottom.value)
+
+function updateScrollPosition(el: HTMLElement) {
+  // scrollTop + clientHeight is the bottom edge of the
+  // visible viewport; if it sits within THRESHOLD of
+  // scrollHeight the user is "at the bottom". < 0 (overscroll
+  // bounce) is clamped to 0.
+  const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+  isAtBottom.value = distFromBottom < SCROLL_BOTTOM_THRESHOLD
+}
+
 function scrollToBottom() {
   nextTick(() => {
     if (messagesEl.value) {
@@ -32,12 +55,25 @@ function scrollToBottom() {
   })
 }
 
-// onScroll is bound to the messages container. When the user
-// scrolls within ~80px of the top, we kick off the next
-// page load — but only if has_more is true.
+// jumpToBottom is wired to the floating button. We mark
+// isAtBottom=true BEFORE scrolling so the deep watcher
+// (which gates on isAtBottom) takes over follow-scrolling
+// for any in-flight streaming chunks — otherwise the smooth
+// scroll would race with each new chunk's auto-scroll and
+// the user would see a stuttering animation.
+function jumpToBottom() {
+  isAtBottom.value = true
+  scrollToBottom()
+}
+
+// onScroll is bound to the messages container. Two jobs:
+//   1. Refresh isAtBottom so the button can show/hide.
+//   2. When the user scrolls within ~80px of the top, kick
+//      off the next page load (loadMoreMessages).
 async function onScroll(e: Event) {
   if (!state.currentID) return
   const target = e.target as HTMLElement
+  updateScrollPosition(target)
   if (target.scrollTop < 80) {
     wasAtTop.value = true
     prevScrollHeight.value = target.scrollHeight
@@ -46,29 +82,70 @@ async function onScroll(e: Event) {
   }
 }
 
-// Restore the user's view after a history page has been
-// prepended. We hold the scrollTop constant by setting it
-// to (oldScrollTop + (newHeight - oldHeight)) — same
-// technique GitHub uses for its issue list.
+// Length watcher: handles appends (user sent a message) and
+// prepends (loadMoreMessages prepended an older page). The
+// wasAtTop branch preserves the user's reading position; the
+// isAtBottom branch is the sticky-bottom follow; the
+// "scrolled up" branch is intentionally a no-op so the user
+// can keep reading whatever they were looking at.
 watch(() => currentMessages.value.length, (newLen, oldLen) => {
-  if (!wasAtTop.value || newLen <= (oldLen || 0)) return
-  nextTick(() => {
-    if (!messagesEl.value) return
-    const el = messagesEl.value
-    const heightDelta = el.scrollHeight - prevScrollHeight.value
-    el.scrollTop = prevScrollTop.value + heightDelta
-    wasAtTop.value = false
-  })
+  if (newLen <= (oldLen || 0)) return
+  if (wasAtTop.value) {
+    nextTick(() => {
+      if (!messagesEl.value) return
+      const el = messagesEl.value
+      const heightDelta = el.scrollHeight - prevScrollHeight.value
+      el.scrollTop = prevScrollTop.value + heightDelta
+      wasAtTop.value = false
+    })
+    return
+  }
+  if (isAtBottom.value) {
+    nextTick(() => scrollToBottom())
+  }
 })
 
-watch(() => currentMessages.value, () => scrollToBottom(), { deep: true })
-watch(() => state.currentID, () => scrollToBottom())
+// Deep watcher: handles streaming content changes (text deltas,
+// thinking deltas, tool updates). The length doesn't change
+// during streaming, so the length watcher above doesn't fire.
+// We only auto-scroll when the user is at the bottom — if
+// they've scrolled up to read history, leave the viewport
+// alone and let the jump-to-bottom button pull them back.
+watch(
+  () => currentMessages.value,
+  () => {
+    if (isAtBottom.value) {
+      nextTick(() => scrollToBottom())
+    }
+  },
+  { deep: true }
+)
+
+watch(() => state.currentID, () => {
+  // A new session is a fresh slate: assume the user wants to
+  // land on the latest message.
+  isAtBottom.value = true
+  nextTick(() => scrollToBottom())
+})
 
 onMounted(() => {
   scrollToBottom()
+  // Bridge Naive UI's useMessage() to the chat store. The store
+  // can't call useMessage() itself (no component context), so it
+  // publishes errors here and we surface them as toasts. Without
+  // this, store-side errors like "rollback failed: id not set"
+  // would only appear in the console and the user would see a
+  // dialog that closes without effect.
+  setUIMessageHandler((m) => {
+    if (m.kind === 'error') message.error(m.text)
+    else message.info(m.text)
+  })
 })
 
 onBeforeUnmount(() => {
+  // Unregister so the store doesn't keep a reference to a torn-
+  // down component's message instance.
+  setUIMessageHandler(null)
   // No custom scroll listener to remove — onScroll is bound
   // by Vue's @scroll on the template element, which Vue
   // auto-cleans on unmount.
@@ -164,6 +241,23 @@ function messageKey(m: any, i: number): string | number {
     </div>
     <TodoPanel />
     <InputArea />
+    <!-- Floating "jump to latest" button. Shown when the user
+         has scrolled up away from the bottom; clicking it
+         smooth-scrolls back to the latest message. Sits
+         absolutely above the input/todo area so it doesn't
+         shift the message list when it appears or hides. -->
+    <Transition name="jump-btn">
+      <button
+        v-if="showJumpToBottom"
+        class="jump-to-bottom"
+        type="button"
+        aria-label="跳到最新消息"
+        title="跳到最新消息"
+        @click="jumpToBottom"
+      >
+        <ArrowDown :size="18" />
+      </button>
+    </Transition>
   </main>
 </template>
 
@@ -183,6 +277,11 @@ function messageKey(m: any, i: number): string | number {
    * below is guaranteed to stay at the bottom. */
   min-height: 0;
   overflow: hidden;
+  /* Anchor for the absolutely-positioned jump-to-bottom
+   * button. Without this, the button would position itself
+   * against the nearest other positioned ancestor and could
+   * drift outside the chat column. */
+  position: relative;
 }
 .messages-scroll {
   /* `flex: 1` makes the message list grow to fill the space
@@ -249,4 +348,50 @@ function messageKey(m: any, i: number): string | number {
 .empty-icon { font-size: 48px; color: var(--text-quaternary); display: inline-flex; }
 .empty-title { font-size: 15px; color: var(--text-2); }
 .empty-hint { font-size: 12px; color: var(--text-4); }
+
+/* Floating "jump to latest" button. Anchored to .chat-main's
+ * right edge, hovering above the input area. The 130px bottom
+ * clears the collapsed TodoPanel (36px) + the typical input
+ * area (~82px) + a small visual margin. When the rollback
+ * banner is showing or advanced inputs are expanded the input
+ * area grows and the button visually sits a bit closer to the
+ * top edge of the input — acceptable trade-off vs. measuring
+ * the input height from JS. */
+.jump-to-bottom {
+  position: absolute;
+  right: 16px;
+  bottom: 130px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--bg-2);
+  border: 1px solid var(--border-default);
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  z-index: 10;
+  transition: background 0.15s var(--ease-out, ease), color 0.15s var(--ease-out, ease), transform 0.15s var(--ease-out, ease);
+}
+.jump-to-bottom:hover {
+  background: var(--bg-3);
+  color: var(--text-1);
+  transform: translateY(-1px);
+}
+.jump-to-bottom:active {
+  transform: translateY(0);
+}
+/* Fade in from below when the user first scrolls up, fade out
+ * when they scroll back to the bottom. */
+.jump-btn-enter-active,
+.jump-btn-leave-active {
+  transition: opacity 0.2s var(--ease-out, ease), transform 0.2s var(--ease-out, ease);
+}
+.jump-btn-enter-from,
+.jump-btn-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
+}
 </style>

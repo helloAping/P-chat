@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -42,10 +43,16 @@ type Server struct {
 func (s *Server) Engine() *gin.Engine { return s.engine }
 
 // Handler returns the request handler so tests (and embedders)
-// can call helpers that aren't bound to an HTTP route 鈥?e.g.
+// can call helpers that aren't bound to an HTTP route — e.g.
 // sessionToResponse or the per-session meta resolvers. Stable
 // public API; safe to call from outside this package.
 func (s *Server) Handler() *Handler { return s.handler }
+
+// SetBrowserManager wires the browser control subsystem into the
+// server. Call this after New() and before Run().
+func (s *Server) SetBrowserManager(bm *browser.Manager) {
+	s.handler.SetBrowserManager(bm)
+}
 
 // New builds the HTTP server. The store is used for session/message
 // persistence. The agent is used for chat calls. The web frontend is
@@ -224,6 +231,13 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/settings/web_search", h.GetWebSearchSettings)
 		api.PUT("/settings/web_search", h.UpdateWebSearchSettings)
 		api.POST("/settings/web_search/test", h.TestWebSearchConnection)
+
+		// Browser control
+		api.GET("/browser/status", h.BrowserStatus)
+		api.GET("/browser/list", h.BrowserList)
+		api.POST("/browser/config", h.UpdateBrowserConfig)
+		api.GET("/browser/extension", h.BrowserExtensionDownload)
+		api.GET("/browser/ws", h.BrowserWebSocket)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the
@@ -368,6 +382,17 @@ func isAllowedCORSOrigin(origin, host string) bool {
 // times out.
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// WebSocket upgrade requests (e.g. from browser extensions)
+		// bypass the CORS origin check. The WebSocket protocol is
+		// not subject to same-origin policy in the same way as HTTP
+		// — the server-side origin check would block all
+		// chrome-extension:// origins. We detect the upgrade by
+		// the presence of the Upgrade header.
+		if strings.EqualFold(c.GetHeader("Upgrade"), "websocket") {
+			c.Next()
+			return
+		}
+
 		origin := c.GetHeader("Origin")
 		host := c.Request.Host
 		if !isAllowedCORSOrigin(origin, host) {

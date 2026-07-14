@@ -214,6 +214,38 @@ watch(
 
 // --- Session management ---
 
+// Max loaded sessions kept in the in-memory cache. When a
+// new session is loaded, the one that was touched longest
+// ago (and is not the current session) is evicted. This
+// caps the number of messages + screenshot blob URLs that
+// can accumulate across session switches within the same
+// project. 4 keeps the "most recent + 3 others" pattern
+// typical of a user switching between a handful of active
+// conversations — enough to avoid the cost of reloading
+// history on every switch, small enough to bound memory.
+const MAX_LOADED_SESSIONS = 4
+const _loadedSessions: Record<string, number> = {}
+let _loadedSeq = 0
+
+function markSessionHot(id: string) {
+  if (!id) return
+  _loadedSessions[id] = ++_loadedSeq
+}
+
+function evictColdSessions() {
+  const keys = Object.keys(_loadedSessions)
+  if (keys.length <= MAX_LOADED_SESSIONS) return
+  keys.sort((a, b) => _loadedSessions[a] - _loadedSessions[b])
+  const toEvict = keys.length - MAX_LOADED_SESSIONS
+  for (let i = 0; i < toEvict; i++) {
+    const sid = keys[i]
+    if (sid === state.currentID) continue
+    revokeSessionBlobUrls(sid)
+    delete state.sessionMessages[sid]
+    delete _loadedSessions[sid]
+  }
+}
+
 export async function loadSessions() {
   const { sessions } = await api.listSessions(state.activeProjectPath)
   state.sessions = sessions
@@ -235,7 +267,19 @@ export async function setActiveProject(path: string) {
   state.activeProjectPath = path
   state.currentID = ''
   state.sessions = []
+  // Revoke screenshot blob URLs for ALL sessions currently
+  // cached in the store before wiping it. Otherwise those
+  // blob URLs accumulate in WebView2 until page reload.
+  for (const sid of Object.keys(state.sessionMessages)) {
+    revokeSessionBlobUrls(sid)
+  }
   state.sessionMessages = {}
+  // Reset the LRU heat map along with the messages map —
+  // stale entries would trigger a no-op eviction of sessions
+  // that no longer exist on the next switch.
+  for (const k of Object.keys(_loadedSessions)) {
+    delete _loadedSessions[k]
+  }
   state.sessionMeta = {}
   state.sessionTodos = {}
   state.sessionWorking = {}
@@ -342,7 +386,17 @@ export async function switchSession(id: string) {
       hasMore: r.has_more,
       loading: false,
     }
+    // Convert any base64 screenshot data in the newly
+    // loaded history into blob URLs, then strip old ones
+    // so the session opens with a bounded memory footprint.
+    convertAndStripScreenshots(id)
   }
+  // Mark this session as most-recently-used so evictCold
+  // keeps it in memory. Eviction runs here because a
+  // switch is the highest-frequency trigger for "new
+  // loaded session + one to evict".
+  markSessionHot(id)
+  evictColdSessions()
   // Hydrate per-session meta. The server's SessionResponse
   // (GET /api/v1/sessions) already resolves style/provider/model
   // through the per-session override → global default chain
@@ -425,6 +479,10 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
       // future regression.
       const existing = state.sessionMessages[id] || []
       state.sessionMessages[id] = dedupMessagesByKey(existing, r.messages)
+      // Older pages may contain base64 screenshots persisted
+      // by pre-blob-URL versions. Convert them + enforce
+      // the global cap so scroll-up doesn't grow memory.
+      convertAndStripScreenshots(id)
     }
     paging.oldestSeq = r.oldest_seq ?? paging.oldestSeq
     paging.oldestId = r.oldest_id
@@ -506,7 +564,12 @@ export async function createSession(): Promise<string> {
 export async function deleteSessionById(id: string) {
   await api.archiveSession(id)
   state.sessions = state.sessions.filter(s => s.id !== id)
+  // Revoke all screenshot blob URLs owned by this session
+  // before clearing the messages, otherwise those URLs
+  // remain referenced until the next page reload.
+  revokeSessionBlobUrls(id)
   delete state.sessionMessages[id]
+  delete _loadedSessions[id]
   delete state.sessionMeta[id]
   delete state.sessionTodos[id]
   delete state.sessionWorking[id]
@@ -660,6 +723,159 @@ export function clearAttachments() {
     if (a._blobURL) URL.revokeObjectURL(a._blobURL)
   }
   state.pendingAttachments[id] = []
+}
+
+// --- Blob URL helpers ---
+//
+// Browser screenshot tool results arrive as large base64
+// data: URLs (~200–500 KB each). Storing them directly in
+// the reactive Vue store keeps a giant decoded bitmap in
+// WebView2's DOM / decoded-image cache and eventually
+// crashes the renderer. We convert every screenshot to a
+// blob: URL up front so:
+//   1. The base64 string lives only inside the Blob, not in
+//      the reactive map.
+//   2. The <img> in ToolCallCard uses a blob URL that
+//      Chromium can GC independently of the JS heap.
+//   3. Session-level revocation is a simple walkParts over
+//      the messages map rather than hunting for data URLs.
+function dataUrlToBlobUrl(input: string | undefined): string | undefined {
+  if (!input || !input.startsWith('data:image/')) return input
+  try {
+    const commaIdx = input.indexOf(',')
+    const b64 = input.slice(commaIdx + 1)
+    const mime = input.slice(5, commaIdx)
+    const byteChars = atob(b64)
+    const bytes = new Uint8Array(byteChars.length)
+    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
+    return URL.createObjectURL(new Blob([bytes], { type: mime }))
+  } catch {
+    return input
+  }
+}
+
+// convertAndStripScreenshots walks ALL messages in the given
+// session, (1) converts any residual base64 screenshot data
+// URLs into blob: URLs (this happens on the very first load
+// of a history that was persisted with raw base64), and
+// (2) strips all but the last `keep` screenshot results —
+// globally across the session, not per message — to cap the
+// number of live blob URLs / decoded bitmaps.
+//
+// This is the SINGLE point of entry for screenshot memory
+// management. Called from:
+//   - switchSession (after history load)
+//   - loadMoreMessages (after page load)
+//   - the 'done' SSE event (after stream end)
+const MAX_PRESERVED_SCREENSHOTS = 3
+const PLACEHOLDER_SCREENSHOT = '[截图已省略]'
+
+function isScreenshotResult(r: string | undefined): boolean {
+  if (!r) return false
+  if (r.startsWith('data:image/') || r.startsWith('blob:')) return true
+  try {
+    const obj = JSON.parse(r)
+    if (typeof obj.image === 'string' &&
+        ((obj.image as string).startsWith('data:image/') || (obj.image as string).startsWith('blob:'))) {
+      return true
+    }
+  } catch { /* not JSON */ }
+  return false
+}
+
+export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERVED_SCREENSHOTS) {
+  const msgs = state.sessionMessages[sessionId]
+  if (!msgs) return
+  const screenshotTargets: (ToolPart | MessageAttachment)[] = []
+  const isB64 = (u: string | undefined): u is string => !!u && u.startsWith('data:image/')
+  const isBlob = (u: string | undefined): u is string => !!u && u.startsWith('blob:')
+  for (const m of msgs) {
+    if (m.parts) {
+      walkParts(m.parts, (p) => {
+        if (p.kind !== 'tool' || !p.result) return
+        const r = p.result as string
+        if (isB64(r)) {
+          p.result = dataUrlToBlobUrl(r)
+        } else {
+          try {
+            const obj = JSON.parse(r)
+            if (typeof obj.image === 'string' && isB64(obj.image as string)) {
+              obj.image = dataUrlToBlobUrl(obj.image as string)
+              p.result = JSON.stringify(obj)
+            } else if (typeof obj.image === 'string' && obj.image === PLACEHOLDER_SCREENSHOT) {
+              return
+            }
+          } catch { /* not JSON */ }
+        }
+        if (isScreenshotResult(p.result)) screenshotTargets.push(p)
+      })
+    }
+    // Handle image attachments (user-uploaded images and
+    // history-reloaded messages). These come back from
+    // SQLite as 'data:image/jpeg;base64,...' URLs and sit
+    // in the Vue reactive store as ~250 KB strings until
+    // converted. Convert to blob: URLs so they're
+    // independently managed by the browser and reclaimable.
+    if (m.attachments) {
+      for (const att of m.attachments) {
+        if (!isB64(att.url) && !isBlob(att.url)) continue
+        if (isB64(att.url)) {
+          att.url = dataUrlToBlobUrl(att.url)
+        }
+        if (isBlob(att.url)) screenshotTargets.push(att)
+      }
+    }
+  }
+  const stripCount = Math.max(0, screenshotTargets.length - keep)
+  for (let i = 0; i < stripCount; i++) {
+    const t = screenshotTargets[i]
+    if ('kind' in t) {
+      // ToolPart — replace the result payload with the
+      // placeholder so the card still renders.
+      (t as ToolPart).result = PLACEHOLDER_SCREENSHOT
+    } else {
+      // MessageAttachment — revoke the blob and replace the
+      // URL with the placeholder so the image no longer
+      // occupies browser memory.
+      const att = t as MessageAttachment
+      if (isBlob(att.url)) URL.revokeObjectURL(att.url!)
+      att.url = PLACEHOLDER_SCREENSHOT
+    }
+  }
+}
+
+// revokeSessionBlobUrls frees every blob: URL owned by
+// the given session. Must be called before the session's
+// messages leave the in-memory store — i.e. on session
+// eviction (LRU), deletion, or project switch — otherwise
+// the browser accumulates blob URLs until the page is
+// reloaded.
+function revokeSessionBlobUrls(sessionId: string) {
+  const msgs = state.sessionMessages[sessionId]
+  if (msgs) {
+    for (const m of msgs) {
+      if (!m.parts) continue
+      walkParts(m.parts, (p) => {
+        if (p.kind !== 'tool') return
+        const r = p.result
+        if (typeof r === 'string' && r.startsWith('blob:')) {
+          URL.revokeObjectURL(r)
+          return
+        }
+        try {
+          const obj = JSON.parse(r as string)
+          if (typeof obj.image === 'string' && obj.image.startsWith('blob:')) {
+            URL.revokeObjectURL(obj.image as string)
+          }
+        } catch { /* not JSON */ }
+      })
+      if (m.attachments) {
+        for (const att of m.attachments) {
+          if (att.url?.startsWith('blob:')) URL.revokeObjectURL(att.url)
+        }
+      }
+    }
+  }
 }
 
 // --- Streaming ---
@@ -1229,7 +1445,10 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           if ((ev.tool_id && p.tool_id === ev.tool_id) ||
               (!ev.tool_id && p.name === ev.tool_name)) {
             p.status = (ev.tool_status as any) || 'ok'
-            p.result = ev.tool_result
+            // Convert screenshot base64 data URLs to blob URLs
+            // before storing, so the reactive map never sees the
+            // raw base64 payload (~200–500 KB per screenshot).
+            p.result = dataUrlToBlobUrl(ev.tool_result_full || ev.tool_result)
             p.error = ev.tool_error
             p.elapsed = ev.tool_elapsed
             if (ev.tool_args) p.args = ev.tool_args
@@ -1245,7 +1464,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             name: ev.tool_name,
             args: ev.tool_args,
             status: (ev.tool_status as any) || 'ok',
-            result: ev.tool_result,
+            result: dataUrlToBlobUrl(ev.tool_result_full || ev.tool_result),
             error: ev.tool_error,
             elapsed: ev.tool_elapsed,
           })
@@ -1404,6 +1623,12 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // the LLM produced AFTER the redactor's
       // content_rewrite event was processed).
       scrubMessagePhantoms(m)
+      // scrubMessagePhantoms(m) is already called above.
+      // Global screenshot memory management: convert any
+      // base64 screenshot data URLs accumulated in the stream
+      // to blob URLs, and strip all but the last few across
+      // the entire session. See convertAndStripScreenshots().
+      convertAndStripScreenshots(id)
       // Stamp the server-assigned row id on the user message
       // that started this turn and on the assistant reply so
       // fork/rollback can target either.
@@ -1770,18 +1995,84 @@ export const currentPendingInput = computed(() =>
 // messages) from the session. It calls the server API, saves the
 // deleted messages for undo, and auto-fills the input with the
 // last rolled-back user message.
+//
+// id wait: the user message that triggered the current turn has
+// its row id (`user_message_id`) stamped onto the local copy only
+// when the SSE `done` event lands — see appendStreamEvent, which
+// walks the trailing user message and sets `msgs[i].id`. Until
+// that event arrives (i.e. while the LLM is still streaming, or
+// in the brief window after the stream ends before the final
+// chunk reaches us), the local `id` is `undefined` and the
+// rollback endpoint would reject `before_id <= 0`. We poll for
+// the id with a short timeout before giving up; in practice the
+// `done` event usually lands within ~100ms, so the user almost
+// never sees the wait. The previous behaviour was a silent
+// `return` here, which made the dialog close but did nothing —
+// the user reported "点击撤销按钮弹出了二次确认，但是二次确认框
+// 点击确定后撤回不生效" because they had no idea the rollback
+// was dropped on the floor.
+const ROLLBACK_ID_WAIT_MS = 3000
+const ROLLBACK_ID_POLL_MS = 50
+
+async function waitForMessageId(msg: Message, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms
+  while (!msg.id && Date.now() < deadline) {
+    await new Promise<void>(r => setTimeout(r, ROLLBACK_ID_POLL_MS))
+  }
+  return !!msg.id
+}
+
+// Tiny bus for the chat store to surface user-visible errors.
+// Naive UI's useMessage() requires a component context, so the
+// store can't call it directly. ChatWindow registers a handler
+// once on mount; the store invokes it whenever rollback fails
+// for a reason the user should know about.
+type UIMessage = { kind: 'error' | 'info'; text: string }
+let _uiMessageHandler: ((m: UIMessage) => void) | null = null
+export function setUIMessageHandler(fn: ((m: UIMessage) => void) | null) {
+  _uiMessageHandler = fn
+}
+function uiError(text: string) {
+  console.error(text)
+  _uiMessageHandler?.({ kind: 'error', text })
+}
+
 export async function rollbackTo(sessionId: string, messageIndex: number) {
   const msgs = state.sessionMessages[sessionId]
   if (!msgs) return
   const msg = msgs[messageIndex]
-  if (!msg?.id) return
+  if (!msg) {
+    uiError('撤回失败：消息不存在')
+    return
+  }
+  // Wait for the server-assigned row id if the user message is
+  // still in the "row id pending" state (freshly sent during the
+  // current turn). Without this wait, the rollback endpoint
+  // rejects the call with 400 ("before_id is required and must be
+  // > 0") and the UI does nothing — see the comment block above.
+  if (!msg.id) {
+    const got = await waitForMessageId(msg, ROLLBACK_ID_WAIT_MS)
+    if (!got) {
+      uiError('撤回失败：消息尚未完成发送，请稍后再试')
+      return
+    }
+  }
 
   // If currently streaming, abort first.
   if (state.streaming[sessionId]) {
     stopStream(sessionId)
   }
 
-  const result = await api.rollbackMessages(sessionId, msg.id)
+  let result
+  try {
+    result = await api.rollbackMessages(sessionId, msg.id!)
+  } catch (e: any) {
+    // Network / server error: surface it instead of silently
+    // dropping the request. The user would otherwise see the
+    // dialog close and no messages disappear, with no clue why.
+    uiError(`撤回失败：${e?.message || e}`)
+    return
+  }
 
   state.rollbackUndo[sessionId] = {
     messages: result.deleted_messages,

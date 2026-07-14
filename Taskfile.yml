@@ -29,6 +29,7 @@ tasks:
       # in parallel by default, so the sync can race ahead of
       # clean-frontend-output.ps1 and copy an empty tree.
       - powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\sync-web.ps1"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "..\scripts\sync-browser-ext.ps1" -OutDir cmd\pchat-server
     # Intentionally no `sources:` / `generates:` — we always
     # rebuild. The user's complaint was that the SPA shipped
     # stale assets because the file-mtime check missed a
@@ -54,6 +55,7 @@ tasks:
     cmds:
       - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat.exe ./cmd/pchat
       - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server.exe ./cmd/pchat-server
+      - powershell -NoProfile -Command "Copy-Item -Force cmd\pchat-server\browser-extension.zip bin\browser-extension.zip"
     silent: false
 
   build:gui:
@@ -162,6 +164,7 @@ tasks:
       - powershell -NoProfile -Command "New-Item -ItemType Directory -Path dev-bin -Force | Out-Null"
       - go build -o dev-bin/pchat-server.exe ./cmd/pchat-server
       - go build -o dev-bin/pchat.exe ./cmd/pchat
+      - powershell -NoProfile -Command "Copy-Item -Force cmd\pchat-server\browser-extension.zip dev-bin\browser-extension.zip"
       - task: build:dev:gui
       - powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name 'pchat-gui' -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name 'pchat-server' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 500"
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\dev-bin\pchat-gui.exe'"
@@ -259,3 +262,8 @@ tasks:
     desc: 预览 release:run 会做什么（不实际修改）
     cmds:
       - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release.ps1 -DryRun
+
+  package:browser-ext:
+    desc: 打包浏览器控制扩展为 ZIP (输出到 bin/browser-extension.zip)
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package-browser-ext.ps1

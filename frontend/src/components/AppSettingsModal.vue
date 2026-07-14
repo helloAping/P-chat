@@ -21,14 +21,14 @@
 // actually changed, mirroring the backend's "non-empty means
 // write, otherwise leave alone" contract.
 
-import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
   NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree, useMessage,
 } from 'naive-ui'
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash,
-  Cpu, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe,
+  Cpu, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
 } from './icons'
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion } from '../stores/chat'
@@ -167,7 +167,7 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch'>('providers')
+const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser'>('providers')
 
 // Modal visibility (v-model). The default is `true` so that
 // when App.vue mounts this component (it only mounts when
@@ -193,6 +193,7 @@ const settingsTabs = [
   { name: 'mcp',       label: 'MCP',           icon: Terminal, description: 'Model Context Protocol 服务器' },
   { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索' },
   { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商' },
+  { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制' },
 ]
 
 // --- Provider state ---
@@ -347,6 +348,9 @@ watch(tab, (v) => {
     refreshKBModels()
   } else if (v === 'system') {
     loadSystemConfig()
+  } else if (v === 'browser') {
+    refreshBrowser()
+    startBrowserPolling()
   }
 })
 
@@ -1085,6 +1089,95 @@ function mcpStateType(s: api.MCPServerInfo['state']): 'success' | 'warning' | 'e
     default: return 'default'
   }
 }
+
+// --- Browser Control ---
+const browserEnabled = ref(false)
+const browserList = ref<api.BrowserInfo[]>([])
+const browserWSURL = ref('')
+const browserHTTPURL = ref('')
+let browserPollTimer: ReturnType<typeof setInterval> | null = null
+
+async function refreshBrowser() {
+  try {
+    const [status, list] = await Promise.all([api.getBrowserStatus(), api.listBrowsers()])
+    browserEnabled.value = status.enabled
+    browserList.value = list.browsers || []
+    browserWSURL.value = status.ws_url || ''
+    browserHTTPURL.value = status.http_url || ''
+  } catch (e: any) {
+    // Browser endpoints may not be initialised yet; swallow.
+  }
+}
+
+async function onToggleBrowser(v: boolean) {
+  try {
+    await api.updateBrowserConfig(v)
+    browserEnabled.value = v
+  } catch (e: any) {
+    message.error(`切换浏览器控制失败: ${e.message}`)
+  }
+}
+
+function copyBrowserURL() {
+  const url = browserHTTPURL.value
+  if (!url) return
+  // Wails WebView2 does not support navigator.clipboard API —
+  // fall back to document.execCommand('copy') with a textarea.
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    navigator.clipboard.writeText(url).then(() => {
+      message.success('服务器地址已复制到剪贴板')
+    }).catch(() => fallbackCopy(url))
+  } else {
+    fallbackCopy(url)
+  }
+}
+
+function fallbackCopy(text: string) {
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.left = '-9999px'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    if (ok) {
+      message.success('服务器地址已复制到剪贴板')
+    } else {
+      throw new Error('execCommand copy failed')
+    }
+  } catch {
+    // Last resort: select the visible <code> element
+    const codeEls = document.querySelectorAll('.browser-server-url-box code')
+    if (codeEls.length > 0) {
+      const range = document.createRange()
+      range.selectNodeContents(codeEls[0])
+      const sel = window.getSelection()
+      sel?.removeAllRanges()
+      sel?.addRange(range)
+      message.info('请手动 Ctrl+C 复制选中的地址')
+    } else {
+      message.error('复制失败，请手动选择地址复制')
+    }
+  }
+}
+
+function startBrowserPolling() {
+  if (browserPollTimer) return
+  browserPollTimer = setInterval(() => {
+    if (tab.value === 'browser') refreshBrowser()
+    else { stopBrowserPolling() }
+  }, 3000)
+}
+
+function stopBrowserPolling() {
+  if (browserPollTimer) { clearInterval(browserPollTimer); browserPollTimer = null }
+}
+
+onUnmounted(() => stopBrowserPolling())
 
 // --- Knowledge Base state ---
 const kbEnabled = ref(false)
@@ -2462,6 +2555,85 @@ function kbModelSupportsVision(scanModel: string) {
       <NTabPane name="websearch" tab="网络搜索" style="flex: 1; min-height: 0; overflow: auto">
         <WebSearchSettings />
       </NTabPane>
+
+      <NTabPane name="browser" tab="浏览器" style="flex: 1; min-height: 0; overflow: auto">
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <h3 class="settings-section-title">浏览器控制</h3>
+          </div>
+          <p class="settings-section-description">
+            通过浏览器扩展让 LLM 直接控制网页：导航、点击、输入、截图、提取内容。
+            关闭后所有 browser_* 工具不可用。
+          </p>
+          <div class="settings-form-row">
+            <div class="settings-form-toggle">
+              <NSwitch :value="browserEnabled" @update:value="onToggleBrowser" size="small" />
+              <label class="settings-form-label">启用浏览器控制</label>
+            </div>
+            <span class="settings-form-hint">需安装 Chrome 扩展才能实际使用</span>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <h3 class="settings-section-title">已连接浏览器 ({{ browserList.length }})</h3>
+          </div>
+          <div v-if="!browserList.length" class="settings-empty">
+            暂无连接的浏览器，请先安装扩展
+          </div>
+          <div
+            v-for="b in browserList"
+            :key="b.id"
+            class="settings-card server-row"
+          >
+            <div class="server-row-main">
+              <div class="server-row-name">{{ b.name || b.id }}</div>
+              <div class="server-row-meta">
+                <NTag type="success" size="tiny" :bordered="false">已连接</NTag>
+                <span class="server-row-count">{{ b.connected_at }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-header">
+            <h3 class="settings-section-title">安装扩展</h3>
+            <div class="settings-form-actions">
+              <NButton size="small" type="primary" ghost tag="a" href="/api/v1/browser/extension" download>
+                下载扩展包
+              </NButton>
+            </div>
+          </div>
+          <div class="settings-section-description" style="margin-bottom: 0;">
+            <ol style="padding-left: 18px; line-height: 1.7; margin: 0;">
+              <li>
+                <a href="/api/v1/browser/extension" download class="browser-ext-download-link">
+                  下载浏览器扩展 zip
+                </a>
+                并解压到本地任意目录
+              </li>
+              <li>Chrome 打开 <code>chrome://extensions</code></li>
+              <li>右上角开启「开发者模式」</li>
+              <li>点击「加载已解包扩展」，选择解压目录</li>
+              <li>
+                在扩展弹窗「服务器」输入框粘贴以下地址：
+                <div class="browser-server-url-box">
+                  <code>{{ browserHTTPURL || 'http://127.0.0.1:8960' }}</code>
+                  <NButton
+                    size="tiny" quaternary
+                    @click="copyBrowserURL"
+                    :disabled="!browserHTTPURL"
+                    title="复制"
+                  >
+                    复制
+                  </NButton>
+                </div>
+              </li>
+            </ol>
+          </div>
+        </div>
+      </NTabPane>
     </NTabs>
   </AppSettingsLayout>
 
@@ -3433,5 +3605,28 @@ code {
  * visual consistency. */
 .sys-collapse :deep(.n-collapse-item__header .n-base-icon) {
   color: var(--text-tertiary);
+}
+
+.browser-ext-download-link {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.browser-ext-download-link:hover {
+  opacity: 0.8;
+}
+.browser-server-url-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 4px 8px;
+  background: var(--surface-2, #1e1e1e);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.browser-server-url-box code {
+  color: var(--accent);
+  user-select: all;
 }
 </style>

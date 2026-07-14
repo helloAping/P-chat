@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
@@ -32,6 +33,9 @@ import (
 
 //go:embed all:web
 var embeddedWebRaw embed.FS
+
+//go:embed browser-extension.zip
+var embeddedBrowserExtZip []byte
 
 var cfgFile string
 
@@ -236,6 +240,15 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, staticFS, mcpMgr)
 
+	// Initialize browser control manager (enabled via config).
+	browserMgr := browser.NewManager(cfg.Browser, toolReg)
+	browserMgr.Start()
+	defer browserMgr.Stop()
+	srv.SetBrowserManager(browserMgr)
+
+	// Expose embedded browser extension zip for download.
+	server.BrowserExtZip = embeddedBrowserExtZip
+
 	// Auto-index knowledge bases on startup (if enabled).
 	srv.Handler().AutoIndexKnowledgeBases()
 
@@ -253,6 +266,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// it. The user can grep this in bin/pchat-server.log to
 	// verify dev/prod isolation is set up the way they expect.
 	log.Printf("home dir: %s (strategy: %s)", paths.GlobalDir(), paths.ResolveStrategy())
+	// Tell the handler the real address so the browser extension
+	// UI can display the correct WebSocket URL — critical when
+	// pchat-gui assigns a dynamic port via PCHAT_PORT.
+	srv.Handler().SetListenAddr(addr)
 	return srv.RunAt(addr)
 }
 

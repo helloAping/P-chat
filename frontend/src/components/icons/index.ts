@@ -105,4 +105,5 @@ export {
   Triangle,
   ShieldAlert,
   ShieldCheck,
+  Monitor,
 } from 'lucide-vue-next'

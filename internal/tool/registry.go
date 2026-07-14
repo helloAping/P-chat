@@ -30,9 +30,33 @@ type CallRequest struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+// CallResultImage carries a vision-capable image produced by a tool
+// handler (e.g. browser_screenshot). The agent injects this as a
+// separate role=user, type=image ChatMessage after the tool_result so
+// the LLM can analyse it as a proper vision input. The tool_result
+// itself carries only a short text placeholder like "[截图已截取]".
+//
+// Data is raw base64 (no "data:" prefix). MIMEType is e.g. "image/jpeg".
+type CallResultImage struct {
+	Data     string `json:"data"`
+	MIMEType string `json:"mime_type"`
+	Name     string `json:"name"` // display name, e.g. "browser-screenshot.jpg"
+}
+
 type CallResult struct {
 	Content string `json:"content"`
 	IsError bool   `json:"is_error"`
+	// RawFull, when set, carries the untruncated raw payload for the
+	// frontend (via ToolResultFull on the SSE event). It never reaches
+	// the LLM — the LLM only sees Content. Used by tools whose full
+	// output is expensive (e.g. browser_screenshot base64).
+	RawFull string `json:"raw_full,omitempty"`
+	// Image, when set, carries a vision-capable image the agent
+	// should inject as a separate ChatMessage (role=user, type=image).
+	// The LLM sees it as a proper vision input via the OpenAI /
+	// Anthropic image_url or image blocks, not as text inside the
+	// tool_result.
+	Image *CallResultImage `json:"image,omitempty"`
 }
 
 // SandboxChecker is a minimal interface satisfied by internal/sandbox.
