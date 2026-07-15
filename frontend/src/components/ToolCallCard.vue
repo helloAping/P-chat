@@ -134,6 +134,23 @@ const argsPretty = computed(() => {
   try { return JSON.stringify(JSON.parse(a), null, 2) } catch { return a }
 })
 
+// P2-4: a dry-run call is signalled by a `dry_run: true`
+// arg. The handler returns a preview string starting
+// with "[dry-run] would …" without actually executing
+// anything. We surface that distinction as a small
+// chip on the card header so the user can tell at a
+// glance that the tool was inspected but not run.
+const isDryRun = computed(() => {
+  const a = props.part.args
+  if (!a) return false
+  try {
+    const parsed = JSON.parse(a)
+    return !!parsed?.dry_run
+  } catch {
+    return false
+  }
+})
+
 // Detect browser screenshot data in the result. The
 // extension returns images either as a raw data: URL
 // (legacy pre-blob conversion) or as
@@ -182,6 +199,7 @@ async function copyResult() {
         <component :is="statusIcon" v-if="statusIcon" :size="11" :class="part.status === 'start' ? 'spin' : ''" />
       </span>
       <span class="tool-name">{{ part.name }}</span>
+      <span v-if="isDryRun" class="tool-dry-run" title="仅预览,未实际执行">dry-run</span>
       <span class="tool-status">{{ statusLabel }}</span>
       <span class="tool-elapsed" v-if="part.elapsed">{{ part.elapsed }}</span>
       <span
@@ -279,6 +297,24 @@ async function copyResult() {
   font-size: 11px;
   margin-left: 4px;
   font-variant-numeric: tabular-nums;
+}
+/* P2-4 dry-run chip. Pill-shaped, brand-50
+ * background so it reads as "informational" — the
+ * user should know this tool was NOT executed. The
+ * chip is on the header next to the tool name so
+ * it's visible at a glance even when the body is
+ * collapsed. */
+.tool-dry-run {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--brand-50);
+  color: var(--brand-600);
+  font-size: 10.5px;
+  font-weight: 500;
+  margin-left: 4px;
+  flex-shrink: 0;
 }
 .tool-caret { margin-left: auto; color: var(--text-tertiary); flex-shrink: 0; }
 
