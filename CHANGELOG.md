@@ -642,3 +642,79 @@ Assistant 消息用 `parts[]` 数组替代纯文本 content：
 - 无新依赖 —— 全用 Go 标准库 + 现有 uuid 库
 - 向后兼容 —— 旧会话（没有 `auto_continue` 字段）默认 `true`，行为符合"启用 auto-continue"的预期
 - API 变化 —— `PATCH /api/v1/sessions/:id` 新增 `auto_continue` 字段；`SessionResponse` 包含 `auto_continue` 字段
+
+---
+
+### v1.0.7 — 流式 / 渲染 / 工具调用增强
+
+第二轮"功能 + UX"优化，5 个独立可交付项。
+
+#### 用户可见功能
+
+| 项 | 体验提升 |
+| --- | --- |
+| **P0-1 流式中断恢复** | SSE 断开时自动从服务端拉取已入库的 assistant parts，merge 到 trailing bubble，UI 顶部 3s 弹"已恢复 N 条消息"banner |
+| **P1-1 工具结果折叠** | 长 result（>= 200 字符 OR >= 4 换行）默认折叠；点 header 展开，状态写 localStorage 持久化；折叠态下 header 的 📋 复制按钮可点 |
+| **P1-2 子 agent 实时进度** | SubAgentCard header 加 `part.parts.length` 计数 chip，running 时高亮 sub-accent 色 |
+| **P1-3 重新生成按钮** | trailing assistant 消息底部加"重答"按钮，物理截断 user 消息之后的行，重跑 agent loop |
+| **P3-1 事件 seq** | 每个 SSE 事件带 per-stream 单调递增 seq，以标准 SSE `id:` 头输出；dev tools / curl 调试更清晰 |
+
+#### Bug 修复
+
+- **P3-1 测试 race**：`TestSendOrDrop_CtxCancelDropsChunk` 在有 reader 的情况下 select 可能选 `ch <- chunk` 而非 `<-ctx.Done()`，让 cancelled 上下文仍发送 chunk。改为不启动 reader，确保走 cancel 路径
+
+#### 重构
+
+- **`sendOrDrop` 签名升级**：`sendOrDrop(ctx, ch, chunk)` → `sendOrDrop(ctx, ch, nextSeq func() uint64, chunk)`，用 closure 捕获 counter，避免在 41 个 call site 传 `&counter`
+- **`respondSSE` helper 抽出**：SendMessage 和 Regenerate 共享 SSE 写循环（设 header + 写 `data: ...\nid: N\n\n` + 强制 Flush）
+
+#### 周边优化
+
+- **SSE 协议扩展**：每个事件多写一行 `id: <N>`（标准 SSE 事件 ID）；前端 fetch 路径解析 `id:` 行写入 `ev.seq`；dev 模式 console.debug + 单调性检查
+- **新服务端端点**：`GET /api/v1/sessions/:id/snapshot?after_seq=N`（P0-1）；`POST /api/v1/sessions/:id/regenerate`（P1-3）
+- **新 store helper**：`GetAssistantMessagesAfterSeq`（P0-1 SQL 查询）、`ValidateUserMessageID`（P1-3 严格校验）、`recoverMissingParts` action（P0-1 fingerprint 去重 merge）、`regenerateMessage` action（P1-3 弹 bubble + 重 stream）
+
+#### 测试
+
+- `internal/agent/agent_seq_test.go`（新）— 3 个用例：StampsMonotonicSeq / NilNextSeqPreservesSeq / CtxCancelDropsChunk
+- `internal/server/handler_snapshot_test.go`（新）— 3 个用例：AfterSeqFilter / AfterSeqSkipsEarlier / EmptySession
+- `internal/server/handler_regenerate_test.go`（新）— 3 个用例：TruncatesAfterUserMessage / RejectsNonUserMessage / RejectsMissingID
+
+前端未做单元测试（项目暂无 vitest），改为：
+- `vue-tsc -b` + `npm run build` 通过
+- 浏览器手动验证
+
+#### 改动统计
+
+```
+docs/plans/round2-stream-and-render-plan.md    +326 (新)
+internal/agent/agent.go                         +120 -47
+internal/agent/agent_seq_test.go                +115 (新)
+internal/memory/memory.go                       +98
+internal/server/handler.go                      +243 -30
+internal/server/handler_snapshot_test.go        +174 (新)
+internal/server/handler_regenerate_test.go      +206 (新)
+internal/server/server.go                       +11
+frontend/src/api/client.ts                      +127
+frontend/src/components/ChatWindow.vue          +55
+frontend/src/components/InputArea.vue           +15
+frontend/src/components/MessageBubble.vue       +85
+frontend/src/components/PlanReviewModal.vue     +8
+frontend/src/components/SubAgentCard.vue        +34
+frontend/src/components/ToolCallCard.vue        +164
+frontend/src/stores/chat.ts                     +177
+.agents/docs/agent.md                           +30
+.agents/docs/frontend.md                        +50
+.agents/docs/memory.md                          +12
+.agents/docs/server.md                          +12
+CHANGELOG.md                                    +60
+```
+
+#### 升级说明
+
+- 无 schema 迁移
+- 无新依赖
+- 向后兼容：
+  - 旧 client 不发 `user_message_id` 给 `/regenerate` 也会返回 400（已有端点，无破坏）
+  - 旧 client 不解析 `id:` 行也能正常工作（`ev.seq` 为 undefined，UI 不渲染）
+  - P0-1 recovery 是 best-effort（snapshot 失败仅 console.warn，不影响主流程）

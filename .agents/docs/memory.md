@@ -99,6 +99,14 @@ embeddings: chunk_id, model, vector, dim, created_at
 
 `Open()` 首次打开时自动迁移旧的 JSON 文件格式到 SQLite。
 
+### Round 2 新增 API (2026-07-15)
+
+| 方法 | 用途 |
+| --- | --- |
+| `GetAssistantMessagesAfterSeq(convID, afterSeq)` | **P0-1**：返回 `seq > afterSeq` 的 assistant 消息（oldest first），含 metadata blob |
+| `ValidateUserMessageID(convID, msgID)` | **P1-3**：严格校验 row 是 user role + 属于会话；P1-3 regen 的安全网 |
+| `DeleteMessagesFrom(convID, fromID)` | **P1-3 复用**：物理截断 `id >= fromID` 的行（原本用于 rollback，regen 复用但不放 undo buffer） |
+
 ## 修改指南
 
 ### 要修改数据库 Schema

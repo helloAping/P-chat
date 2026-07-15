@@ -71,6 +71,35 @@ if req.AutoContinue && autoContinueCount < MaxAutoContinue {
 - 配套 P1-1（Plan B）在系统 prompt 加"完成契约"规则，让 LLM 习惯性地把 todo 列表维护到最终状态再退出
 - 配套 P2-1：注入 same-tool-err-limit 时同时重置 stuck-streak，避免互相打架
 
+#### P3-1 per-stream monotonic sequence (2026-07-15, round 2)
+
+`ChatStreamChunk.Seq` (`agent.go:397`) is a `uint64` counter that
+the agent stamps on every emitted chunk via `sendOrDrop` (the
+helper takes a `nextSeq func() uint64` closure so callers don't
+thread `&counter` through 40+ call sites). The counter is
+created in `ChatWithTools` and resets to 0 at the start of every
+stream.
+
+Surfaced on the wire in two ways:
+
+- The JSON field `ev.seq` (handler.go `chunkToEvent`).
+- The standard SSE `id: <n>` frame line emitted after every
+  `data: <json>` line, parsed by both the browser's native
+  EventSource reconnection logic and our fetch-path parser
+  (client.ts `streamMessagesViaFetch`).
+
+Sub-agent chunks forwarded into the parent stream do NOT
+increment the parent's counter — they break the parent's
+monotonic sequence intentionally because the sub-agent has
+its own counter. The seq field is still set (to the parent's
+last counter value at forwarding time) but the gap is normal.
+
+Used by:
+- Dev / curl debugging (every event has a stable position)
+- P0-1 stream-drop recovery (seq is the resume cursor; the
+  snapshot endpoint takes after_seq and returns rows with
+  seq > cursor)
+
 ### 2. 工具执行的并行派发 (`agent.go:1185-1471`)
 
 每个工具调用在独立 goroutine 中执行，通过 **per-tool eventCh** (cap 64) 与父级通信：

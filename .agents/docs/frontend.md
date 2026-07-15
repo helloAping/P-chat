@@ -138,6 +138,40 @@ API: GET /api/v1/knowledge/bases/:name/nodes → NodeTreeItem[]
 
 原始条目卡片 (`wiki_sections`) 保留在树视图下方作为向后兼容层。
 
+### 9. Round 2 增强 (2026-07-15)
+
+#### P1-1 工具结果折叠
+
+`ToolCallCard.vue` 自动折叠 `result.length >= 200` OR `>= 4 个换行`
+的结果（shell / wiki_search / 长 file 读）。短 result 保持展开。
+用户点击 header 切换状态，状态写到 `localStorage` 持久化
+（key = `pchat.toolFold.<name>.<tool_id[:12]>`）。折叠态下
+header 的 📋 复制按钮可点（stopPropagation 防 toggle）。
+
+#### P1-2 子 agent 实时进度
+
+`SubAgentCard.vue` header 加 `part.parts.length` 计数 chip
+（pill 样式），running 时切到 sub-accent 色。后端 `tryForward`
+本身就是逐 chunk 转发，前端只是把"看不到进度"的问题修了。
+
+#### P0-1 流式中断恢复
+
+`streamMessagesViaFetch` 和 Wails 路径的 stream catch
+边界都触发 `opts.onStreamDrop({ lastSeq, reason })`。
+`recoverMissingParts` action：
+1. 调 `getSessionSnapshot(sessionId, lastSeq)` 拿增量
+2. 用 fingerprint (tool_id / text 前 40 字符) 去重 merge 到 trailing bubble
+3. 触发 3s 的 `RecoveryBanner`（"已恢复 N 条消息"）
+
+不在用户主动 abort 时触发（`signal.aborted` 短路）。
+
+#### P1-3 重新生成按钮
+
+`MessageBubble.vue` trailing assistant 消息加"重答"按钮。
+`regenerateMessage` action：弹掉本地 trailing bubble → 调
+`api.streamRegenerate` → 走正常 stream 路径。auto-continue
+从 0 重新计数（算新 stream）。
+
 ## 修改指南
 
 ### 要添加新的 SSE 事件类型

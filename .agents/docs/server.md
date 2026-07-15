@@ -88,6 +88,8 @@ Chunk 字段检查顺序（优先级从高到低）:
 
 - `ListMessages` (GET) — 分页返回历史消息，含 `parts` 解码
 - `SendMessage` (POST) — 发送 + SSE 流
+- `SnapshotRecovery` (GET) — **P0-1**：断线恢复用的增量快照
+- `Regenerate` (POST) — **P1-3**：物理截断 user 消息之后的行后重跑
 - `CompressConversation` — LLM 压缩历史
 - `SetReasoningEffort` — 设置 DeepSeek/OpenAI 思考深度
 - `SaveSystemMessage` — 保存自定义系统提示词
@@ -98,6 +100,34 @@ Chunk 字段检查顺序（优先级从高到低）:
 - 消息通过 `memory.Store.AddChatMessageTo()` 持久化
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
+
+### 6. P0-1 / P1-3 增量端点 (round 2, 2026-07-15)
+
+#### SnapshotRecovery (P0-1)
+
+`GET /api/v1/sessions/:id/snapshot?after_seq=N` — 返回所有
+`seq > N` 的 assistant 消息 (oldest first)，含完整 metadata
+blob (持久化 parts[])。响应 `{ messages, next_seq }`。
+
+- 前端在 SSE 流意外断开时调此端点补齐 trailing assistant bubble
+- 不重发 LLM 调用，不增加费用，只补"已入库但没传到前端"的内容
+- 客户端用 fingerprint (tool_id / text 前 40 字符) 去重
+
+#### Regenerate (P1-3)
+
+`POST /api/v1/sessions/:id/regenerate` body `{ user_message_id }` —
+物理截断 `id > user_message_id` 的行，复用 `respondSSE` 重新
+跑 agent loop。`user_message_id` 必须是 user role (`ValidateUserMessageID` 严格校验)。
+
+- 不放 undo buffer（regen 是正常流，不是破坏性操作）
+- 不接受 style/model 覆盖（保持与上轮一致，避免意外切换）
+- 共享 `sessionLocks` 防并发 regen
+
+#### respondSSE helper
+
+SendMessage 和 Regenerate 共享的 SSE 写循环：
+设 header + 写 `data: <json>\nid: <N>\n\n`（P3-1 顺序）+ 强制 Flush。
+新增 SSE 端点应复用此函数，避免重复实现。
 
 ### 7. 知识库 API
 
