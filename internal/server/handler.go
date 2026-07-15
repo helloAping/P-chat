@@ -1877,6 +1877,191 @@ func (h *Handler) SnapshotRecovery(c *gin.Context) {
 	})
 }
 
+// ContextMessage is one entry in the P2-3 inspector's
+// per-message breakdown. Distinct from MessageResponse
+// because the inspector only needs a small subset of
+// fields (role + tokens + preview + is_tool_result);
+// shipping the full MessageResponse (with its
+// possibly-large parts[] JSON) would balloon the
+// payload and slow down the drawer's render.
+type ContextMessage struct {
+	// Role is "user" / "assistant" / "tool" /
+	// "system". The frontend uses this to colour-
+	// code the row.
+	Role string `json:"role"`
+	// Tokens is the estimate for this single message
+	// (content + small per-message overhead). Rounded
+	// for display, but the underlying computation is
+	// the same `llm.EstimateTokens` the agent uses to
+	// decide when to compress.
+	Tokens int `json:"tokens"`
+	// Preview is a 100-char head of the message text
+	// for the UI list. Tool results truncate more
+	// aggressively (40 chars) because the front of a
+	// tool result is often a JSON header.
+	Preview string `json:"preview"`
+	// IsToolResult is true for role="tool" rows AND
+	// for assistant message parts that came from a
+	// tool (sub-agent text often describes a tool's
+	// output). The drawer uses this to render a
+	// distinct "tool" background.
+	IsToolResult bool `json:"is_tool_result"`
+	// IsCompressed is true for the synthetic summary
+	// message that tryAutoCompact wrote to the system
+	// prompt (replaces a chunk of older history). The
+	// drawer shows a small "已压缩" badge on these so
+	// the user understands why the message list is
+	// shorter than they remember.
+	IsCompressed bool `json:"is_compressed,omitempty"`
+}
+
+// ContextInspectorResponse is the wire shape of
+// GET /api/v1/sessions/:id/context. Returns a quick
+// snapshot of the current conversation's footprint so
+// the chat UI can render the "上下文" tab/drawer.
+type ContextInspectorResponse struct {
+	SessionID         string           `json:"session_id"`
+	Provider          string           `json:"provider"`
+	Model             string           `json:"model"`
+	ContextWindow     int              `json:"context_window"`
+	EstimatedTokens   int              `json:"estimated_tokens"`
+	UsableTokens      int              `json:"usable_tokens"`
+	UtilizationPct    float64          `json:"utilization_pct"`
+	CompressedSummary string           `json:"compressed_summary,omitempty"`
+	Messages          []ContextMessage `json:"messages"`
+}
+
+// ContextInspector (P2-3) returns a quick breakdown
+// of the conversation footprint: per-message token
+// estimate, total vs context window, compressed
+// summary (if any). The response is small enough to
+// load on every session switch — the messages list
+// is bounded by the same contextMessageLimit that
+// ListMessages uses, so a 200-message session
+// produces a ~10 KB response (no full parts[] payload).
+//
+// Token counts are estimates (see internal/llm/
+// token_count.go). The display labels every number
+// as "估算" so users don't get confused when an exact
+// tokenizer (had we shipped one) disagrees by ±20%.
+func (h *Handler) ContextInspector(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	if _, err := h.store.GetConversation(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	meta := h.ensureMetaLoaded(id)
+	provider := meta.Provider
+	if provider == "" {
+		provider = h.getCfg().LLM.Default
+	}
+	model := meta.Model
+	if model == "" {
+		for _, p := range h.getCfg().LLM.Providers {
+			if p.Name == provider {
+				model = p.EffectiveModel()
+				break
+			}
+		}
+	}
+
+	// Build the LLM-bound message list the same way
+	// SendMessage does: history after the compressed
+	// range + the synthetic CompressedSummary. The
+	// token count we report is what the LLM actually
+	// sees on the next turn.
+	lastComp := h.store.LastCompressedIDFor(id)
+	var histMsgs []llm.ChatMessage
+	var compSummary string
+	if lastComp > 0 {
+		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, 0, lastComp)
+		compSummary = h.store.CompressedSummaryFor(id)
+	} else {
+		histMsgs = h.store.GetChatMessagesFor(id, 0)
+	}
+	boundMsgs := buildLLMMessages(histMsgs)
+	if compSummary != "" {
+		// Mirror how the system prompt pre-pends the
+		// summary — the bound message list does NOT
+		// include it directly (it's prepended via the
+		// system prompt), but it does consume tokens
+		// from the context window. Add it to the
+		// estimate so the inspector reports a number
+		// consistent with the actual LLM-bound payload.
+		boundMsgs = append(boundMsgs, llm.ChatMessage{
+			Role:    "system",
+			Content: "[compressed summary]\n" + compSummary,
+		})
+	}
+
+	// Per-message breakdown for the UI list. We use
+	// the RAW (un-bound) messages here so each row
+	// corresponds to a single database row the user
+	// can mentally map. The token count is the
+	// `EstimateTokens` of the content (no per-
+	// message overhead at the row level — that
+	// overhead is rolled into the total below).
+	const previewMax = 100
+	out := make([]ContextMessage, 0, len(histMsgs))
+	for _, m := range histMsgs {
+		preview := m.Content
+		if len(preview) > previewMax {
+			preview = preview[:previewMax] + "…"
+		}
+		// Tool rows that are pure JSON get a tighter
+		// preview — the first 40 chars of a tool
+		// result is usually {"ok":true,"data":...}
+		// which is more noise than signal at the
+		// top of the list. (We still keep the full
+		// token estimate below.)
+		if m.Role == "tool" {
+			if len(m.Content) > 40 {
+				preview = m.Content[:40] + "…"
+			}
+		}
+		out = append(out, ContextMessage{
+			Role:         m.Role,
+			Tokens:       llm.EstimateTokens(m.Content),
+			Preview:      preview,
+			IsToolResult: m.Role == "tool",
+		})
+	}
+
+	// Total estimate matches what the agent uses
+	// internally to decide when to compact, so the
+	// drawer's utilisation bar lines up with the
+	// agent's "context_warn" phase events.
+	totalEstimate := llm.EstimateTokensMessages(boundMsgs)
+	cw := h.agent.LLM().ContextWindow(provider, model)
+	if cw <= 0 {
+		cw = llm.DefaultContextWindow
+	}
+	usable := llm.UsableContextWithBuf(cw, llm.AutoCompactBuffer)
+	utilPct := 0.0
+	if usable > 0 {
+		utilPct = float64(totalEstimate) / float64(usable) * 100.0
+		if utilPct > 999.9 {
+			utilPct = 999.9
+		}
+	}
+
+	c.JSON(http.StatusOK, ContextInspectorResponse{
+		SessionID:         id,
+		Provider:          provider,
+		Model:             model,
+		ContextWindow:     cw,
+		EstimatedTokens:   totalEstimate,
+		UsableTokens:      usable,
+		UtilizationPct:    utilPct,
+		CompressedSummary: compSummary,
+		Messages:          out,
+	})
+}
+
 // mergeConsecutiveAssistant collapses runs of consecutive
 // assistant messages into a single message. In the database,
 // each ReAct round produces its own assistant row (plus

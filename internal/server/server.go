@@ -174,6 +174,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// first, with the full metadata blob (which carries
 		// the persisted parts[]). See handler.go:SnapshotRecovery.
 		api.GET("/sessions/:id/snapshot", h.SnapshotRecovery)
+		// P2-3: context inspector — returns per-message
+		// token breakdown + total vs context window +
+		// compressed summary. Powers the "上下文" drawer
+		// in the chat UI. See handler.go:ContextInspector.
+		api.GET("/sessions/:id/context", h.ContextInspector)
 		// P1-3: regenerate the assistant reply for a given
 		// user message. Physically deletes everything after
 		// that user message in the conversation, then re-runs
