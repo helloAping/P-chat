@@ -343,3 +343,40 @@ html, body, #app {
 .cmd-tag.tag-def { background: var(--success-50); color: var(--success-500); }
 .cmd-tag.tag-prot { background: var(--surface-1); color: var(--text-secondary); }
 .cmd-tag.tag-vis { background: var(--brand-50); color: var(--brand-600); }
+
+/* =========================================================================
+ * P2-2 highlight.js theme
+ * =========================================================================
+ * Loaded at the bottom of the global stylesheet so it
+ * overrides any default code-block colors that come
+ * earlier. We pick github-dark (the canonical dark GitHub
+ * palette) for a baseline that matches the P-Chat dark
+ * surface. The .hljs class is what highlight.js stamps
+ * on every <code> element it processes, so all our
+ * scoped overrides live under that namespace.
+ *
+ * The theme CSS is imported as a side-effect here rather
+ * than from main.ts so the order of CSS rules stays
+ * predictable: the design-token layer above defines the
+ * surface / text variables, this layer uses them, and
+ * anything below can override us per-component.
+ */
+@import 'highlight.js/styles/github-dark.css';
+
+pre code.hljs {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
+/* Tighten line height inside highlighted code so wrapped
+ * lines sit close together — the default 1.5 makes short
+ * snippets look airy. */
+pre code.hljs .hljs-line,
+pre code.hljs {
+  line-height: 1.45;
+}
+/* Slight padding around the entire <pre> so the highlight
+ * background doesn't kiss the card border. */
+pre {
+  padding: 8px 10px;
+}
