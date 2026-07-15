@@ -10,7 +10,7 @@ import TodoPanel from './TodoPanel.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner } from '../stores/chat'
 
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
@@ -197,6 +197,23 @@ function messageKey(m: any, i: number): string | number {
 
 <template>
   <main class="chat-main">
+    <!-- P0-1: transient banner shown when the recovery
+         flow successfully merged server-side parts into
+         the trailing assistant message. currentRecoveryBanner
+         auto-clears after 3s (driven by the chat store). -->
+    <Transition name="recovery-banner">
+      <div
+        v-if="currentRecoveryBanner"
+        class="recovery-banner"
+        :key="currentRecoveryBanner.shownAt"
+      >
+        <span class="recovery-icon">📥</span>
+        <span class="recovery-text">
+          已恢复 {{ currentRecoveryBanner.recovered }} 条消息
+        </span>
+        <span class="recovery-reason">{{ currentRecoveryBanner.reason }}</span>
+      </div>
+    </Transition>
     <!-- Plain scrollable container. We don't use NScrollbar
          here because its :native-scrollbar="false" path wraps
          the content in a custom-scrollbar div that conflicts
@@ -262,6 +279,42 @@ function messageKey(m: any, i: number): string | number {
 </template>
 
 <style scoped>
+/* P0-1 recovery banner. Sits at the top of the chat
+ * main area and animates in/out via Vue's <Transition>.
+ * Uses brand accent for the icon and a soft surface
+ * background so it reads as "informational" rather
+ * than "error". */
+.recovery-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.recovery-icon { font-size: 14px; }
+.recovery-text { color: var(--text-primary); font-weight: 500; }
+.recovery-reason {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.recovery-banner-enter-from {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+.recovery-banner-leave-to {
+  opacity: 0;
+}
+.recovery-banner-enter-active,
+.recovery-banner-leave-active {
+  transition: opacity 200ms var(--ease-out, ease),
+              transform 200ms var(--ease-out, ease);
+}
 .chat-main {
   flex: 1;
   display: flex;

@@ -676,6 +676,74 @@ func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64,
 	return out, metas, createds, ids, seqs
 }
 
+// GetAssistantMessagesAfterSeq is the P0-1 recovery query.
+// Returns assistant messages with seq > afterSeq, in
+// oldest-first order, with the full metadata blob
+// (containing the persisted parts[]). It's deliberately
+// separate from the paging methods because the use case
+// is fundamentally different: P0-1 wants the *delta* since
+// a known cursor, not "the N oldest before a position".
+//
+// The role filter is hard-coded to "assistant" because
+// the only thing the recovery flow needs is the streaming
+// assistant content (parts); user / system / tool rows are
+// committed synchronously on send and either landed or
+// didn't — they don't need a re-pull.
+//
+// Returns parallel slices: msgs (decoded chat message
+// scalar fields), metas (raw metadata JSON), createds
+// (unix seconds), seqs. id is omitted because the
+// recovery flow doesn't need it; add it back if a
+// future caller does.
+func (s *Store) GetAssistantMessagesAfterSeq(convID string, afterSeq int64) ([]llm.ChatMessage, []string, []int64, []int64) {
+	_ = s.Flush()
+	if convID == "" {
+		return nil, nil, nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT role, content, metadata, created_at, seq FROM messages
+		 WHERE conversation_id = ? AND seq > ? AND role = 'assistant'
+		 ORDER BY seq ASC`,
+		convID, afterSeq,
+	)
+	if err != nil {
+		return nil, nil, nil, nil
+	}
+	defer rows.Close()
+
+	var out []llm.ChatMessage
+	var metas []string
+	var createds []int64
+	var seqsOut []int64
+	for rows.Next() {
+		var (
+			role, content string
+			metaStr       sql.NullString
+			created       int64
+			seq           sql.NullInt64
+		)
+		if err := rows.Scan(&role, &content, &metaStr, &created, &seq); err != nil {
+			break
+		}
+		meta := ""
+		if metaStr.Valid {
+			meta = metaStr.String
+		}
+		seqVal := int64(0)
+		if seq.Valid {
+			seqVal = seq.Int64
+		}
+		msgs := decodeChatMessages(role, content, meta, 0, 1)
+		for _, m := range msgs {
+			out = append(out, m)
+			metas = append(metas, meta)
+			createds = append(createds, created)
+			seqsOut = append(seqsOut, seqVal)
+		}
+	}
+	return out, metas, createds, seqsOut
+}
+
 // encodeChatMeta builds the canonical metadata map for a
 // ChatMessage.
 func encodeChatMeta(msg llm.ChatMessage) map[string]string {

@@ -111,6 +111,18 @@ export const state = reactive({
   rollbackUndo: {} as Record<string, { messages: Message[]; fromIndex: number } | null>,
   // Pending text to fill into the input area after a rollback.
   pendingInput: {} as Record<string, string>,
+  // P0-1: transient banner shown for ~3s when the
+  // recoverMissingParts flow successfully merged
+  // server-side parts into the trailing assistant
+  // bubble. ChatWindow watches this and renders the
+  // <RecoveryBanner> pill. Null when no banner is
+  // active.
+  recoveryBanner: null as null | {
+    sessionId: string
+    recovered: number
+    reason: string
+    shownAt: number
+  },
 })
 
 export const currentMessages = computed(() =>
@@ -120,6 +132,16 @@ export const currentMessages = computed(() =>
 export const currentTodos = computed(() =>
   state.sessionTodos[state.currentID] || [],
 )
+
+// currentRecoveryBanner is the P0-1 banner payload for
+// the active session. Null when no banner is active or
+// when the banner belongs to a different session.
+export const currentRecoveryBanner = computed(() => {
+  const b = state.recoveryBanner
+  if (!b) return null
+  if (b.sessionId !== state.currentID) return null
+  return b
+})
 
 // currentSessionWorking — true while the LLM is mid-turn
 // for the current session. The TodoPanel state machine
@@ -1847,6 +1869,161 @@ function assembleTextContent(parts: MessagePart[] | undefined): string {
   })
   return out
 }
+
+// recoverMissingParts is the P0-1 entry point. Called
+// from InputArea.vue's streamMessagesRetry onStreamDrop
+// callback when the SSE stream dies mid-turn. It:
+//
+//   1. Calls getSessionSnapshot(sessionId, afterSeq) to
+//      pull the assistant messages that landed in the DB
+//      while the stream was alive.
+//   2. Walks the returned messages and merges their
+//      parts[] into the trailing assistant bubble by
+//      tool_id / part-text dedup (so we never double a
+//      part the local store already has).
+//   3. Shows a RecoveryBanner ("已恢复 N 条消息") for 3
+//      seconds so the user knows the gap was repaired.
+//
+// The function is fire-and-forget from the call site; it
+// never throws. On any failure (network, parse, missing
+// session) it logs and returns. The next send already
+// gets a fresh stream so the gap is "self-healing" — the
+// recovery is just a UX nicety.
+//
+// `lastSeq` is the per-stream seq the client observed
+// when the stream dropped (-1 if unknown, e.g. Wails
+// path). The snapshot endpoint takes the seq cursor and
+// returns rows with seq > cursor. Pass 0 to mean "no
+// cursor" — the server will return all assistant rows,
+// which is the safe default when the cursor is unknown.
+export async function recoverMissingParts(
+  sessionId: string,
+  lastSeq: number,
+  reason: string,
+): Promise<void> {
+  if (!sessionId) return
+  if (state.streaming[sessionId]) {
+    // Still streaming per local state — the drop is a
+    // transient reconnect, not a real failure. Skip.
+    return
+  }
+  const afterSeq = lastSeq >= 0 ? lastSeq : 0
+  let snap: api.SnapshotRecovery
+  try {
+    snap = await api.getSessionSnapshot(sessionId, afterSeq)
+  } catch (e: any) {
+    console.warn('[recovery] snapshot fetch failed:', e?.message || e)
+    return
+  }
+  if (!snap.messages || snap.messages.length === 0) {
+    // No new assistant rows landed. Nothing to merge.
+    return
+  }
+
+  const msgs = state.sessionMessages[sessionId]
+  if (!msgs || msgs.length === 0) {
+    // No local message list — the session was switched
+    // out between drop and recovery. Bail; the next
+    // switchSession / list-load will pick up the rows.
+    return
+  }
+
+  // Find the trailing assistant message — that's the
+  // bubble that was being streamed. The DB may have
+  // MULTIPLE new assistant rows (one per ReAct round),
+  // but locally the chat store merges them into a
+  // single bubble, so the strategy is: take the LAST
+  // returned assistant message's parts and merge them
+  // into the trailing local bubble. Earlier rounds'
+  // parts are already present (they were streamed live
+  // before the drop), so the local bubble should
+  // already reflect them.
+  const last = snap.messages[snap.messages.length - 1]
+  if (!last.parts || last.parts.length === 0) {
+    return
+  }
+
+  const trailing = findTrailingAssistant(sessionId)
+  if (!trailing) {
+    return
+  }
+  // Build a set of "already-present" fingerprints from
+  // the local trailing bubble, then add any returned
+  // part whose fingerprint is new. Fingerprint =
+  // `${kind}:${tool_id || name || first 40 chars of
+  // text}`. This is best-effort: if the LLM produced
+  // identical text in two parts (rare), the second
+  // would be dedup'd. That's an acceptable trade for
+  // never double-painting.
+  const localFP = new Set<string>()
+  const fp = (p: any): string => {
+    if (p.kind === 'tool') return `tool:${p.tool_id || p.id || p.name || ''}`
+    if (p.kind === 'text') return `text:${(p.text || '').slice(0, 40)}`
+    if (p.kind === 'thinking') return `think:${(p.text || '').slice(0, 40)}`
+    if (p.kind === 'sub_agent') return `sub:${p.task || ''}`
+    if (p.kind === 'question') return `q:${(p.text || '').slice(0, 40)}`
+    return `${p.kind || '?'}:${JSON.stringify(p).slice(0, 60)}`
+  }
+  walkParts(trailing.parts || [], p => localFP.add(fp(p)))
+
+  let merged = 0
+  for (const p of last.parts as any[]) {
+    const key = fp(p)
+    if (localFP.has(key)) continue
+    if (!trailing.parts) trailing.parts = []
+    trailing.parts.push(p)
+    localFP.add(key)
+    merged++
+  }
+  if (merged > 0) {
+    // Refresh the cached content string from parts so
+    // the markdown body matches.
+    trailing.content = assembleTextContent(trailing.parts || [])
+    showRecoveryBanner(sessionId, merged, reason)
+  }
+}
+
+// showRecoveryBanner flips a transient state flag for
+// 3 seconds. The ChatWindow watches the flag and
+// renders the actual <RecoveryBanner> pill.
+function showRecoveryBanner(sessionId: string, recovered: number, reason: string) {
+  state.recoveryBanner = {
+    sessionId,
+    recovered,
+    reason: reason || 'stream dropped',
+    shownAt: Date.now(),
+  }
+  setTimeout(() => {
+    if (state.recoveryBanner && state.recoveryBanner.shownAt === state.recoveryBanner.shownAt) {
+      state.recoveryBanner = null
+    }
+  }, 3000)
+}
+
+// findTrailingAssistant returns the trailing
+// assistant message in the local sessionMessages list,
+// or null when there are no messages / the trailing
+// message is not an assistant. Used by the P0-1
+// recovery flow to know which bubble to merge parts
+// into. The find-or-create variant already exists at
+// line 948 (used by appendStreamEvent) — this version
+// is strictly the "look up, don't create" path so the
+// recovery flow can detect a missing trailing
+// assistant (e.g. the user switched sessions mid-drop).
+function findTrailingAssistant(sessionId: string) {
+  const msgs = state.sessionMessages[sessionId]
+  if (!msgs || msgs.length === 0) return null
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant') return msgs[i]
+  }
+  return null
+}
+
+// partsToContentString removed in P0-1: the equivalent
+// helper already exists as assembleTextContent (which
+// handles the same parts[] → markdown string shape, with
+// sub_agent nesting). The recovery flow now calls
+// assembleTextContent directly.
 
 export function clearPendingPlan(id: string) {
   delete state.pendingPlanText[id]

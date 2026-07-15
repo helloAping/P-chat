@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { NModal, NButton, NInput, NSpace, useMessage } from 'naive-ui'
-import { state, switchSession, getPendingPlanText, clearPendingPlan, appendStreamEvent } from '../stores/chat'
+import { state, switchSession, getPendingPlanText, clearPendingPlan, appendStreamEvent, recoverMissingParts } from '../stores/chat'
 import * as api from '../api/client'
 
 const message = useMessage()
@@ -33,6 +33,12 @@ async function approve(planOverride?: string) {
     await api.streamMessagesRetry(id.value, {
       message: '请按计划执行',
       style: state.sessionMeta[id.value]?.style || 'tech',
+      onStreamDrop: ({ lastSeq, reason }) => {
+        // P0-1: same recovery flow as the main input
+        // path. The plan-execution stream can also drop
+        // mid-turn; merge whatever landed via snapshot.
+        recoverMissingParts(id.value, lastSeq, reason).catch(() => {})
+      },
       onEvent: (ev) => appendStreamEvent(id.value, ev),
     })
   } catch (e: any) {

@@ -22,6 +22,7 @@ import {
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
+  recoverMissingParts,
 } from '../stores/chat'
 import { notifyManager } from '../utils/notify'
 
@@ -739,6 +740,20 @@ async function send() {
       attachments: inlineAttachments,
       signal: ctrl.signal,
       skill_context: pendingSkillContext || undefined,
+      // P0-1: when the SSE stream dies mid-turn, call
+      // the snapshot endpoint to recover whatever
+      // assistant content already landed. The recovery
+      // flow is fire-and-forget from this call site; the
+      // chat store mutates the trailing message
+      // directly. NOT triggered on user abort (the stop
+      // button sets signal.aborted; the underlying
+      // fetch is then cancelled and the drop callback
+      // is short-circuited in client.ts).
+      onStreamDrop: ({ lastSeq, reason }) => {
+        recoverMissingParts(id, lastSeq, reason).catch((err) => {
+          console.warn('[stream] recovery failed:', err)
+        })
+      },
       onEvent: (ev) => {
         pendingSkillContext = ''
         // Surface top-level errors (auth, network) as

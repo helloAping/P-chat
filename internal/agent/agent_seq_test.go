@@ -85,31 +85,42 @@ func TestSendOrDrop_CtxCancelDropsChunk(t *testing.T) {
 	next := func() uint64 { return seq.Add(1) - 1 }
 
 	// Pre-fill the buffer so the next send would block.
+	// IMPORTANT: do NOT start a reader on ch after this
+	// point — if a reader is waiting, sendOrDrop's select
+	// may pick `ch <- chunk` over `<-ctx.Done()` (both
+	// are ready when the buffer is full and a reader
+	// waits), which would let the chunk land. With no
+	// reader and a full buffer, the send is the only
+	// blocking branch; ctx.Done() is the only ready
+	// branch, so the cancellation path is deterministic.
 	ch <- ChatStreamChunk{Content: "buffered"}
 	cancel()
 
-	// Should NOT block (ctx is cancelled).
+	// Should NOT block (ctx is cancelled, no reader).
 	done := make(chan struct{})
 	go func() {
 		sendOrDrop(ctx, ch, next, ChatStreamChunk{Content: "dropped"})
 		close(done)
 	}()
 
-	// Drain the buffered chunk first to confirm the dropped
-	// one never lands. Then wait briefly for the call to
-	// return. We bound the wait with a 1s timer so a
-	// regression that breaks the cancellation path is loud.
-	<-ch
+	// Wait for the call to return. We bound the wait with
+	// a 1s timer so a regression that breaks the
+	// cancellation path is loud.
 	select {
 	case <-done:
-		// Good — call returned promptly.
+		// Good — call returned promptly via the ctx.Done
+		// branch of the select.
 	case <-time.After(1 * time.Second):
 		t.Fatal("sendOrDrop blocked despite cancelled ctx")
 	}
-	// Channel should now be empty.
+	// Channel still holds the pre-filled "buffered" chunk.
+	// The "dropped" chunk must not have landed.
 	select {
 	case leftover := <-ch:
-		t.Errorf("expected empty channel, got chunk with content=%q", leftover.Content)
+		if leftover.Content == "dropped" {
+			t.Errorf("sendOrDrop sent the chunk despite cancelled ctx: content=%q", leftover.Content)
+		}
 	default:
+		t.Errorf("expected the pre-filled 'buffered' chunk to remain, got empty channel")
 	}
 }

@@ -866,6 +866,14 @@ export interface SendOptions {
   attachments?: InlineAttachment[]
   signal?: AbortSignal
   onEvent: (ev: StreamEvent) => void
+  // P0-1: called when the SSE stream drops mid-turn so
+  // the chat store can trigger the snapshot recovery
+  // flow (see getSessionSnapshot). The store passes the
+  // last seen seq; the recovery flow calls the snapshot
+  // endpoint with that cursor and merges the returned
+  // parts into the trailing assistant message. NOT
+  // called on user-initiated aborts (signal.aborted).
+  onStreamDrop?: (info: { lastSeq: number; reason: string }) => void
   skill_context?: string
 }
 
@@ -1099,6 +1107,19 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
     offEvent()
     offEnd()
     if (opts.signal?.aborted) return
+    // P0-1: Wails path drop. The fetch-path's
+    // onStreamDrop fires inside streamMessagesViaFetch;
+    // here in the Wails path we fire it at the catch
+    // boundary. lastSeq is unknown (Wails doesn't
+    // surface the per-event seq in the binding args),
+    // so we pass -1; the recovery flow treats -1 as
+    // "no cursor" and re-fetches all assistant rows
+    // newer than the trailing user message.
+    if (opts.onStreamDrop) {
+      try {
+        opts.onStreamDrop({ lastSeq: -1, reason: e?.message || 'wails stream failed' })
+      } catch { /* ignore */ }
+    }
     throw new Error(`stream: ${e?.message || e}`)
   }
   offEvent()
@@ -1141,6 +1162,17 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
     signal: opts.signal,
   })
   if (!resp.ok || !resp.body) {
+    // Network-level failure (no body, no body stream).
+    // P0-1: surface as a stream drop so the chat store
+    // can call the snapshot endpoint to recover whatever
+    // assistant content already landed. Skip when the
+    // user-initiated abort fired (signal.aborted) — the
+    // drop callback is reserved for unexpected failures.
+    if (!opts.signal?.aborted && opts.onStreamDrop) {
+      try {
+        opts.onStreamDrop({ lastSeq: -1, reason: `HTTP ${resp.status}` })
+      } catch { /* drop callback must not break the throw chain */ }
+    }
     throw new Error(`stream: HTTP ${resp.status}: ${resp.statusText}`)
   }
 
@@ -1152,7 +1184,23 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
   let done = false
 
   while (!done) {
-    const r = await reader.read()
+    let r: ReadableStreamReadResult<Uint8Array>
+    try {
+      r = await reader.read()
+    } catch (e: any) {
+      // P0-1: the body stream died mid-flight (server
+      // crashed, network blip, reverse-proxy timeout).
+      // Surface as a drop event so the chat store can
+      // call the snapshot endpoint. Skip on user abort
+      // (the stop button sets signal.aborted before
+      // tearing the request down).
+      if (!opts.signal?.aborted && opts.onStreamDrop) {
+        try {
+          opts.onStreamDrop({ lastSeq, reason: e?.message || 'read failed' })
+        } catch { /* drop callback must not break the throw chain */ }
+      }
+      throw new Error(`stream: ${e?.message || e}`)
+    }
     done = r.done
     if (r.value) {
       buf += decoder.decode(r.value, { stream: true })
@@ -1228,6 +1276,30 @@ export async function streamMessagesRetry(sessionId: string, opts: SendOptions):
     }
   }
 }
+
+// ---- Knowledge API ----
+
+// ---- P0-1 recovery ----
+
+// SnapshotRecovery is the wire shape of the
+// GET /sessions/:id/snapshot endpoint used by the
+// frontend after a dropped SSE stream. Returns the
+// delta of assistant messages with seq > after_seq,
+// oldest first, plus a `next_seq` cursor the client
+// can use for follow-up calls. See
+// docs/plans/round2-stream-and-render-plan.md §2 P0-1.
+export interface SnapshotRecovery {
+  messages: Message[]
+  next_seq: number
+}
+
+export const getSessionSnapshot = (
+  sessionId: string,
+  afterSeq: number,
+): Promise<SnapshotRecovery> =>
+  jsonFetch<SnapshotRecovery>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/snapshot?after_seq=${afterSeq}`,
+  )
 
 // ---- Knowledge API ----
 

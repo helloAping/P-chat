@@ -1811,6 +1811,72 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	})
 }
 
+// SnapshotRecovery (P0-1) returns the delta of assistant
+// messages with seq > after_seq, oldest first, with the
+// full metadata blob (carrying the persisted parts[]).
+// The frontend uses this after a dropped SSE stream to
+// rebuild the trailing assistant message that was being
+// streamed when the network failed.
+//
+// Why a separate endpoint instead of ListMessages? Two
+// reasons:
+//   1. ListMessages returns the full history with
+//      pagination cursors; the recovery flow wants a
+//      "delta since cursor" pattern and the response
+//      shape is much simpler (no has_more / oldest_*).
+//   2. ListMessages applies mergeConsecutiveAssistant +
+//      buildMessageResponse decoding, which is the wrong
+//      shape for a partial stream. The recovery flow
+//      just wants the raw row data so it can decide how
+//      to merge it with whatever parts the local Pinia
+//      store already accumulated.
+//
+// Query:
+//   ?after_seq=N   — return rows with seq > N (default 0)
+//
+// Response:
+//   { "messages": [MessageResponse...],
+//     "next_seq":  <highest seq returned, 0 if none> }
+func (h *Handler) SnapshotRecovery(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	if _, err := h.store.GetConversation(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	afterSeq := parseInt64Query(c, "after_seq", 0)
+	if afterSeq < 0 {
+		afterSeq = 0
+	}
+
+	msgs, metas, createds, seqs := h.store.GetAssistantMessagesAfterSeq(id, afterSeq)
+
+	out := make([]MessageResponse, 0, len(msgs))
+	for i, m := range msgs {
+		// We pass rowID=0 (we don't have it from this
+		// query) — the recovery flow doesn't need the
+		// SQLite row id, only the seq cursor. The created
+		// time comes from createds[i] (parallel to msgs).
+		resp := buildMessageResponse(m, metas, createds, i, 0, seqs[i])
+		if resp != nil {
+			out = append(out, *resp)
+		}
+	}
+
+	nextSeq := int64(0)
+	if len(seqs) > 0 {
+		nextSeq = seqs[len(seqs)-1]
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"messages": out,
+		"next_seq": nextSeq,
+	})
+}
+
 // mergeConsecutiveAssistant collapses runs of consecutive
 // assistant messages into a single message. In the database,
 // each ReAct round produces its own assistant row (plus

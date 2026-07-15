@@ -168,6 +168,12 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// Messages
 		api.GET("/sessions/:id/messages", h.ListMessages)
 		api.POST("/sessions/:id/messages", h.SendMessage)
+		// P0-1: snapshot endpoint used by the frontend to
+		// recover from a dropped SSE stream. Returns all
+		// assistant messages with seq > after_seq, oldest
+		// first, with the full metadata blob (which carries
+		// the persisted parts[]). See handler.go:SnapshotRecovery.
+		api.GET("/sessions/:id/snapshot", h.SnapshotRecovery)
 		api.POST("/sessions/:id/compress", h.CompressConversation)
 		api.PATCH("/sessions/:id/reasoning-effort", h.SetReasoningEffort)
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)
