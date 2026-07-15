@@ -23,6 +23,7 @@
 | 修改沙箱/安全检查 | [infrastructure.md](infrastructure.md) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
+| **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |
 
 ## 模块总览
 

@@ -567,3 +567,78 @@ Assistant 消息用 `parts[]` 数组替代纯文本 content：
 - **SSE flush**：`X-Accel-Buffering: no` + `c.Writer.Flush()`
 - **Blinking caret placeholder**：流式开始时渲染前显示闪烁光标，替代 LoadingDots
 - **供应商多模型**：per-provider `models` 列表，`capabilities` 标记(thinking_effort/supports_vision)
+
+---
+
+### v1.0.6 — 对话连续性 + 工具调用加固
+
+#### 用户可见
+
+- **P0-3 auto-continue（任务连续性守卫）**：todo 列表还有未完成项时，LLM 自然结束不再立即退出，而是自动注入 user 风格"未完成"提示并续接，最多 3 次。新增 CLI 命令 `/auto-continue on|off`（别名 `/ac`），per-session 持久化。详见 [`docs/auto-continue.md`](docs/auto-continue.md) 和 [实现计划](docs/plans/auto-continue-plan.md)。
+- 状态栏自动续行用 `--accent` 颜色 + 加粗显示（`.status-line-auto-continue` class），跟普通 phase 事件区分开。
+- Web/桌面端可通过 `PATCH /api/v1/sessions/:id` 切换 `auto_continue` 字段（默认 true）。
+
+#### Bug 修复
+
+- **Anthropic SSE parser 双重派发**：原版每行 SSE 数据被处理两次（event 之前 + 之后各一次），导致 content/thinking delta 翻倍。改用单 dispatch 路径（`internal/llm/anthropic_adapter.go` `ParseStream`），`anthropic_stream_test.go` 中 4 个之前挂的 case（LongDataLine / MultiEvent / CRLFTransport / MissingMessageStop）全部转绿。
+- **HTTP 模式沙箱控制静默 no-op**：`httpContext.SetSandbox` 和 `BypassSandboxOnce` 之前是 silent no-op（CLI 调 `/unsafe on` 走 HTTP 没任何反馈）。改为"响亮的 no-op"——发 `color.Yellow` 警告 + 解释。`RebuildSandbox` 仍返回 `*ErrUnsupported` 让调用方走 `isUnsupported()` 分支。`TestHTTPContext_SandboxNoOp` 锁住行为。
+
+#### 重构与清理
+
+- **拆 `buildStaticSystemPrompt` (298 行)**：分成 9 个 helper（`buildStyleBlock` + `buildToolHintBlock` + 5 sub-helper + `buildWorkingDirBlock` + `buildLanguageBlock`）。orchestrator 从 298 行降到 61 行。byte-identical 输出，所有现有 `TestBuildStaticSystemPrompt_*` 测试通过。
+- **`interface{}` → `any` 清理**：12 个文件 25 处（`internal/{browser,llm,mcp,recall,knowledge,httpcli,server}`），对齐项目 CLAUDE.md 规则。机械替换，`grep -rn "interface{}" internal/` → 0 命中。
+
+#### 周边优化
+
+- **P1-2**：`tryAutoCompact` 调用顺序：移到 tool_call append **之前**，删除原 re-append 兜底块。compact 不再跟新 append 的 tool_call 赛跑。
+- **P2-1**：`sameToolErrCount` 注入"改用其他方式"消息时，**同时**重置 `stuckStreak` / `prevToolSig` / `prevErrored`（抽 `resetGuardCounters()` + `resetSameToolErr()` helper）。避免两守卫互相打架导致 stuck-loop 抢先退出而 LLM 看不到"改用其他方式"提示。
+- **P2-2**：`MaxStepsPrompt` 拆 `MaxStepsPromptEN` / `MaxStepsPromptZH`，由 `pickMaxStepsPrompt(lang)` 按 `a.cfg.LLM.Output.Language` 选择。修复中英用户拿到全英文 prompt + "respond in the same language as the conversation" 自我矛盾的 bug。
+- **P2-3**：工具调用 ID 唯一性校验（`normalizeToolCallIDs()` helper）：空 ID 或同轮重复 ID 全部重新生成 `call_<uuid>`，保留下游依赖的格式。防止 LLM 漏给 / 重复给 ID 导致 SQLite UNIQUE 报错或 tool_call/tool_result 配对错乱。
+- **P3-1**：`SessionStatus: "busy"` 延后到系统提示 ready 后再发。原版在工具加载前就发，UI 显示 100-500ms 假 busy。
+
+#### 测试
+
+- 新增 14 个测试 case（`agent_auto_continue_test.go`）：
+  - `TestSessionPendingTodos_*` (2)
+  - `TestBuildAutoContinuePrompt_*` (3)
+  - `TestMaxAutoContinue_Is3`
+  - `TestChatRequest_AutoContinueJSONTag`
+  - `TestPickMaxStepsPrompt_LanguageSelection` (5 cases)
+  - `TestNormalizeToolCallIDs` (5 subtests)
+- `TestBuildStaticSystemPrompt_TodoContractPromptPresent`：锁住 P1-1 提示新增
+- `TestHTTPContext_SandboxNoOp`：锁住 HTTP 沙箱 no-op 行为
+- `tool.Registry.RegisterForTest` helper：测试用 no-op handler 注册工具
+- **4 个之前挂的 Anthropic SSE 测试** 全部转绿
+
+#### 改动统计
+
+```
+25 files changed, 1857 insertions(+), 355 deletions(-)
+
+新增文件:
+  docs/plans/auto-continue-plan.md
+  internal/agent/agent_auto_continue_test.go
+
+主战场:
+  internal/agent/agent.go          +876/-244
+  internal/cli/commands.go         +78
+  internal/cli/context.go          +98
+  internal/server/handler.go       +55
+  internal/httpcli/client.go       +45
+  internal/tool/registry.go        +13
+  internal/llm/anthropic_adapter.go +59/-25
+
+文档:
+  .agents/CLAUDE.md (= .claude/CLAUDE.md)  +38
+  .agents/docs/agent.md                     +26
+  .agents/docs/INDEX.md                     +1
+  docs/auto-continue.md                     +158 (新)
+  README.md                                 +1
+```
+
+#### 升级说明
+
+- 无 schema 迁移 —— `auto_continue` 复用 `conversations.metadata` JSON blob，跟其他 per-session 字段共存
+- 无新依赖 —— 全用 Go 标准库 + 现有 uuid 库
+- 向后兼容 —— 旧会话（没有 `auto_continue` 字段）默认 `true`，行为符合"启用 auto-continue"的预期
+- API 变化 —— `PATCH /api/v1/sessions/:id` 新增 `auto_continue` 字段；`SessionResponse` 包含 `auto_continue` 字段
