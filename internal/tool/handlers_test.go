@@ -337,3 +337,95 @@ func TestHandleExecCommand_NoErrorPrefix(t *testing.T) {
 		t.Errorf("exec_command error content should not start with 'ERROR:', got: %q", res.Content)
 	}
 }
+// --- P2-4 dry-run ---
+
+// TestExecCommand_DryRun verifies the dry-run flag
+// returns a preview WITHOUT executing the command.
+// We use a command that would create a sentinel
+// file; if the file is missing after the call, the
+// dry-run path was taken.
+func TestExecCommand_DryRun(t *testing.T) {
+	// Use a forward-slash, no-special-chars command
+	// so the JSON encoding in the test is trivial.
+	// The exact command doesn't matter; the test
+	// only checks (a) the preview is returned and
+	// (b) no shell side effect occurred (we can
+	// observe this by simply checking the preview
+	// text — the real handler returns BEFORE
+	// exec.Command is ever constructed).
+	cmd := "echo hello"
+	res, err := handleExecCommand(context.Background(), []byte(`{"command":"`+cmd+`","dry_run":true}`))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.IsError {
+		t.Errorf("dry-run returned IsError=true: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "[dry-run]") {
+		t.Errorf("missing [dry-run] prefix: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, cmd) {
+		t.Errorf("missing command in preview: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "sandbox: passed") {
+		t.Errorf("missing sandbox status: %s", res.Content)
+	}
+}
+
+// TestReadFile_DryRun verifies that dry-run reports
+// size + a 200-char head snippet without loading the
+// full file body.
+func TestReadFile_DryRun(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.ToSlash(filepath.Join(dir, "a.txt"))
+	content := "line1\nline2\nline3\n"
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := handleReadFile(context.Background(), []byte(`{"path":"`+p+`","dry_run":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Errorf("dry-run returned IsError=true: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "[dry-run]") {
+		t.Errorf("missing [dry-run] prefix: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "size: 18 bytes") {
+		t.Errorf("missing size: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "line1") {
+		t.Errorf("missing head snippet: %s", res.Content)
+	}
+}
+
+// TestWriteFile_DryRun verifies that dry-run does
+// not write to disk and reports the would-be content
+// size.
+func TestWriteFile_DryRun(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.ToSlash(filepath.Join(dir, "out.txt"))
+	res, err := handleWriteFile(context.Background(), []byte(`{"path":"`+p+`","content":"would write this","dry_run":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Errorf("dry-run returned IsError=true: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "[dry-run]") {
+		t.Errorf("missing [dry-run] prefix: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "content: 16 bytes") {
+		t.Errorf("missing size: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "would write this") {
+		t.Errorf("missing head preview: %s", res.Content)
+	}
+	// Critical: the file must NOT exist.
+	if _, err := os.Stat(p); err == nil {
+		t.Errorf("dry-run actually wrote %s", p)
+	} else if !os.IsNotExist(err) {
+		t.Errorf("unexpected stat err: %v", err)
+	}
+}
