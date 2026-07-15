@@ -175,6 +175,19 @@ onBeforeUnmount(() => {
       >{{ agentLabel }}</span>
       <span class="sub-task">{{ part.task }}</span>
       <span v-if="part.agentModel" class="sub-model" :title="'model: ' + part.agentModel">{{ part.agentModel }}</span>
+      <!-- P1-2 live event counter. Shows the running parts
+           count so the user sees the sub-agent making
+           progress in real time (was previously only
+           visible when the user expanded the body and
+           even then no count). Counts text + thinking +
+           tool + question parts — same array the body
+           iterates over, so the chip is always in sync
+           with what's rendered. -->
+      <span
+        v-if="part.parts.length > 0 || part.status === 'start'"
+        class="sub-parts-count"
+        :title="'已发出 ' + part.parts.length + ' 个 part'"
+      >{{ part.parts.length }}</span>
       <span
         class="sub-status"
         :title="part.status === 'err' && part.failureReason ? part.failureReason : statusLabel()"
@@ -314,6 +327,27 @@ onBeforeUnmount(() => {
   font-size: 11px;
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
+}
+/* P1-2 live event counter. Pill-shaped chip that lights
+ * up while the sub-agent is running so the user sees
+ * progress even when the body is collapsed. Style mirrors
+ * the existing status / elapsed chips but with a subtle
+ * brand tint when running. */
+.sub-parts-count {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-3, rgba(0, 0, 0, 0.05));
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  transition: background var(--dur-fast, 120ms) var(--ease-out, ease);
+}
+.sub-header.running .sub-parts-count {
+  background: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 16%, var(--surface-2));
+  color: var(--sub-accent, var(--brand-500));
 }
 .sub-caret { color: var(--text-tertiary); flex-shrink: 0; display: inline-flex; }
 
