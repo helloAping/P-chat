@@ -5,6 +5,30 @@
 
 const BASE = '' // same origin; pchat-server serves both UI and API
 
+// mintTraceId returns a fresh P3-3 trace id (8-char hex with
+// the "T-" prefix) for outbound requests. The id flows as the
+// `X-Trace-Id` request header and is adopted by the server as
+// the correlation id for that turn. Crypto.getRandomValues is
+// widely supported in all browsers P-Chat targets (Chromium
+// 2015+, Firefox 21+, Safari 3.1+), so we don't need a
+// polyfill.
+function mintTraceId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(4)
+    crypto.getRandomValues(bytes)
+    let hex = ''
+    for (let i = 0; i < bytes.length; i++) {
+      hex += bytes[i].toString(16).padStart(2, '0')
+    }
+    return 'T-' + hex
+  }
+  // crypto.getRandomValues missing — should never happen in
+  // the supported browser set, but fall back to Math.random so
+  // the request still goes through (the id just won't be
+  // cryptographically strong).
+  return 'T-' + Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0')
+}
+
 // directBackendURL returns the pchat-server base URL for the
 // streaming endpoint. In the Wails desktop app the webview
 // normally talks to the server through the AssetServer proxy, but
@@ -214,6 +238,15 @@ export interface Message {
   // ignored, even after the toast disappears. Only
   // meaningful on role==="user".
   visionUnsupported?: boolean
+  // traceId is the P3-3 end-to-end correlation id
+  // (e.g. "T-9f3c4a2b") for the assistant turn that
+  // produced this message. The chat store tags the
+  // trailing assistant message with the id when an error
+  // event arrives; the MessageBubble renders a
+  // "复制 trace id" button on the error part so the
+  // user can paste it into a support ticket. Only set
+  // on assistant messages that have seen an error event.
+  traceId?: string
   // Live status text during streaming (populated by
   // appendStreamEvent from phase events).
   _statusText?: string[]
@@ -988,6 +1021,15 @@ export interface StreamEvent {
   // parent's monotonic sequence — the seq field is still set,
   // but the gap is intentional.
   seq?: number
+  // trace_id is the P3-3 end-to-end correlation id
+  // (e.g. "T-9f3c4a2b"). The server's traceIDMiddleware
+  // mints one per request (or adopts the client-supplied
+  // one) and the agent stamps it on every emitted chunk.
+  // The MessageBubble renders a "复制 trace id" button on
+  // error events so support can ask the user to paste it
+  // when reporting a bug — paired with the same id the
+  // server logs in server-debug.log.
+  trace_id?: string
 }
 
 export async function submitConfirmResponse(sessionId: string, approved: boolean): Promise<void> {
@@ -1049,6 +1091,14 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   const { EventsOn, EventsOff } = wailsRuntime
   const { StreamMessages, CancelStream } = wailsApp
 
+  // P3-3: mint the trace id client-side and inline it in the
+  // body so the Wails Go binding can extract it and forward
+  // as the X-Trace-Id header. The fetch path sets the header
+  // directly; this path has to round-trip through the body
+  // because the Wails binding doesn't accept arbitrary
+  // request headers.
+  const traceId = mintTraceId()
+
   const body = JSON.stringify({
     message: opts.message,
     provider: opts.provider,
@@ -1056,6 +1106,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
     style: opts.style,
     attachments: opts.attachments,
     skill_context: opts.skill_context || '',
+    trace_id: traceId,
   })
 
   const flush = () => new Promise<void>(r => setTimeout(r, 0))
@@ -1151,12 +1202,21 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
     attachments: opts.attachments,
     skill_context: opts.skill_context || '',
   })
+  // P3-3: mint a trace id on the client so the server adopts
+  // it as the correlation id for this turn (rather than
+  // generating its own). The id flows in the X-Trace-Id
+  // request header and is echoed on the response and on
+  // every SSE event's `trace_id` field — the MessageBubble
+  // surfaces it on error bubbles so support can ask the
+  // user to paste it.
+  const traceId = mintTraceId()
 
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
+      'X-Trace-Id': traceId,
     },
     body,
     signal: opts.signal,

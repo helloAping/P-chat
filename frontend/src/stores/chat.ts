@@ -1834,6 +1834,15 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.error_kind === 'vision_unsupported') {
         markVisionUnsupported(id)
       }
+      // P3-3: stash the trace id on the trailing assistant
+      // message so the MessageBubble can render the
+      // "复制 trace id" button. The id is the same one the
+      // server logged on its side — when a user reports a
+      // bug they can paste it back and we can grep
+      // server-debug.log without ambiguity.
+      if (ev.trace_id) {
+        m.traceId = ev.trace_id
+      }
       // 提示音：对话出错
       notifyManager.play('error')
       break

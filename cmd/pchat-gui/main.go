@@ -217,6 +217,25 @@ func (a *App) OpenTerminal(path string) {
 	}
 }
 
+// extractTraceID pulls the optional `trace_id` field out of a
+// /sessions/:id/messages body JSON. The Wails binding can't add
+// arbitrary request headers from JS, so the webview inlines the
+// id in the body and we extract it here to set as the X-Trace-Id
+// request header. Returns "" on parse failure or missing field
+// — best-effort, never errors.
+func extractTraceID(bodyJSON string) string {
+	if bodyJSON == "" {
+		return ""
+	}
+	var probe struct {
+		TraceID string `json:"trace_id"`
+	}
+	if err := json.Unmarshal([]byte(bodyJSON), &probe); err != nil {
+		return ""
+	}
+	return probe.TraceID
+}
+
 // GetBackendURL returns the pchat-server base URL (e.g.
 // "http://127.0.0.1:18960") for the webview to use as a direct
 // connection point. Returns "" if the child server hasn't
@@ -261,6 +280,15 @@ func (a *App) StreamMessages(sessionID string, bodyJSON string) (int, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
+	// P3-3: pull the trace id out of the body JSON and forward
+	// it as the X-Trace-Id header. The Wails binding can't add
+	// arbitrary request headers from JS, so the frontend
+	// includes the id in the body instead and we extract it
+	// here. Best-effort: malformed JSON / missing field just
+	// means the server mints its own id (no request fails).
+	if tid := extractTraceID(bodyJSON); tid != "" {
+		req.Header.Set("X-Trace-Id", tid)
+	}
 
 	client := &http.Client{
 		// No overall timeout — the `question` tool parks the

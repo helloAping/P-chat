@@ -42,6 +42,7 @@ import (
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/trace"
 )
 
 type Agent struct {
@@ -392,6 +393,14 @@ type ChatRequest struct {
 	// SubagentTaskID is the resume-by-id key. Empty for
 	// ad-hoc runs. Populated from Args.TaskID.
 	SubagentTaskID string `json:"subagent_task_id,omitempty"`
+	// TraceID is the P3-3 end-to-end correlation id for this
+	// chat turn. The HTTP server's traceIDMiddleware mints one
+	// per request (or adopts a client-supplied one) and stamps
+	// it on the request context; SendMessage copies the
+	// context value into this field so the agent loop can
+	// stamp every emitted chunk without re-reading ctx. Empty
+	// when running outside the HTTP path (e.g. CLI REPL, tests).
+	TraceID string `json:"trace_id,omitempty"`
 }
 
 type ChatStreamChunk struct {
@@ -512,6 +521,15 @@ type ChatStreamChunk struct {
 	// content) reports the actual error message from
 	// the underlying chunk.
 	SubAgentFailureReason string `json:"sub_agent_failure_reason,omitempty"`
+
+	// TraceID is the P3-3 correlation id (e.g. "T-9f3c4a2b")
+	// stamped on every chunk by sendOrDrop from the request
+	// context. The frontend surfaces it on error bubbles via
+	// the "复制 trace id" button; the server uses it in
+	// `X-Trace-Id` response headers and as a log-line prefix.
+	// Empty when the request didn't carry one (CLI, tests,
+	// direct embedding).
+	TraceID string `json:"trace_id,omitempty"`
 
 	// Question fields — when the question tool emits a
 	// question event, QuestionJSON carries the serialized
@@ -1213,6 +1231,15 @@ func (a *Agent) ChatStream(ctx context.Context, req ChatRequest) <-chan ChatStre
 // parent stream, which intentionally break the parent's monotonic
 // sequence).
 //
+// P3-3 trace id propagation: every chunk also gets its TraceID
+// field populated from the request context (via
+// trace.FromContext), so all downstream layers — SSE event JSON,
+// log lines in the tool handler, X-Trace-Id on the response header
+// — see the same id without callers having to set it on every
+// chunk construction. If the chunk already carries a non-empty
+// TraceID (e.g. a sub-agent chunk that the parent already
+// stamped), we leave it alone.
+//
 // We pass a closure rather than a *atomic.Uint64 directly so callers
 // don't have to thread `&counter` through 40+ call sites — the
 // closure captures the local counter variable by reference. The
@@ -1221,6 +1248,11 @@ func (a *Agent) ChatStream(ctx context.Context, req ChatRequest) <-chan ChatStre
 func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, chunk ChatStreamChunk) {
 	if nextSeq != nil {
 		chunk.Seq = nextSeq()
+	}
+	if chunk.TraceID == "" {
+		if tid := trace.FromContext(ctx); tid != "" {
+			chunk.TraceID = tid
+		}
 	}
 	select {
 	case ch <- chunk:
@@ -1233,6 +1265,24 @@ func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() u
 // until it gives a final answer.
 func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatStreamChunk {
 	ch := make(chan ChatStreamChunk, 64)
+
+	// P3-3: pull the trace id from req.TraceID first (the
+	// SendMessage handler copies it from c.Request.Context()),
+	// then fall back to whatever the request context already
+	// carries (the traceIDMiddleware on the server side does
+	// this for the SSE endpoints). Either way, we re-inject
+	// the id under trace.ctxKey so every descendant
+	// goroutine — tool forwarders, sub-agent runners, the
+	// LLM stream reader — reads the same id via
+	// trace.FromContext without having to thread it through
+	// their own signatures.
+	if req.TraceID != "" {
+		ctx = trace.WithID(ctx, req.TraceID)
+	} else if tid := trace.FromContext(ctx); tid != "" {
+		// ensure the value is set under our key even if the
+		// caller passed it via a different layer (defensive)
+		ctx = trace.WithID(ctx, tid)
+	}
 
 	// Per-stream monotonic counter for P3-1. sendOrDrop
 	// stamps each emitted chunk's Seq with nextSeq() (0, 1,
@@ -1929,13 +1979,23 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if req.ProjectRoot != "" {
 					tctx = tool.WithProjectRoot(tctx, req.ProjectRoot)
 				}
+				// P3-3: propagate the trace id so tool handlers
+				// can prefix their log lines with it. The id
+				// is already on the request context (set by
+				// traceIDMiddleware upstream and re-injected
+				// at the top of ChatWithTools); this call
+				// installs it under tool.traceKey for the
+				// handler's TraceIDFromCtx accessor.
+				if tid := trace.FromContext(ctx); tid != "" {
+					tctx = tool.WithTraceID(tctx, tid)
+				}
 				// Inject event sender so the question tool can
 				// emit "question" events through the SSE stream.
 				tctx = tool.WithEventSender(tctx, func(jsonData string) {
 					select {
 					case eventCh <- ChatStreamChunk{QuestionJSON: jsonData}:
 					case <-time.After(2 * time.Second):
-						log.Printf("[question] dropped event (channel full for 2s)")
+						log.Printf("%s[question] dropped event (channel full for 2s)", trace.LogPrefix(tctx))
 					}
 				})
 				tctx, cancel := context.WithTimeout(tctx, 5*time.Minute)
@@ -1946,7 +2006,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					defer close(fwd.done)
 					defer func() {
 						if r := recover(); r != nil {
-							log.Printf("[forwarder] panic: %v", r)
+							log.Printf("%s[forwarder] panic: %v", trace.LogPrefix(tctx), r)
 						}
 					}()
 					for ev := range eventCh {
@@ -2114,7 +2174,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 									select {
 									case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(cfm)}:
 									case <-time.After(5 * time.Second):
-										log.Printf("[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", sessionID)
+										log.Printf("%s[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", trace.LogPrefix(toolCtx), sessionID)
 									case <-toolCtx.Done():
 										return
 									}

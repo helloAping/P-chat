@@ -508,6 +508,31 @@ const showVisionWarn = computed(() =>
   props.message.role === 'user' && props.message.visionUnsupported === true,
 )
 
+// traceIdChip is the P3-3 surface for the correlation id.
+// We only render the chip on an assistant message that has
+// been tagged by the chat store (which happens when an
+// error event arrives), so normal successful turns don't
+// show noise.
+const traceIdChip = computed(() => {
+  if (props.message.role !== 'assistant') return ''
+  return props.message.traceId || ''
+})
+
+// copyTraceId writes the trace id to the system clipboard
+// and fires a one-off toast. Called from the chip's click
+// handler so the user can paste the id into a support
+// ticket — paired with the same id the server logs in
+// server-debug.log.
+async function copyTraceId() {
+  const id = traceIdChip.value
+  if (!id) return
+  if (await copyText(id)) {
+    toast.success('已复制 trace id')
+  } else {
+    toast.error('复制失败')
+  }
+}
+
 // showAssistantHeader — the small "Assistant · Claude 3.5
 // · 2.3s" line that sits above the assistant's body. Only
 // shown for assistant messages; user messages get a
@@ -704,6 +729,24 @@ async function onRegenerate() {
             <span class="warn-text">图片未处理：当前模型不支持图片输入</span>
             <span class="warn-hint">切换到支持视觉的模型（如 gpt-4o / claude-3.5+）后重新发送</span>
           </div>
+
+          <!-- P3-3: trace id chip. Only rendered on
+               assistant messages that the chat store has
+               tagged with a `traceId` (set when the error
+               event arrives). Click to copy the id to the
+               clipboard so the user can paste it into a
+               bug report — server-debug.log uses the same
+               id for greppability. -->
+          <button
+            v-if="traceIdChip"
+            type="button"
+            class="trace-id-chip"
+            :title="'点击复制 trace id'"
+            @click="copyTraceId"
+          >
+            <Clipboard :size="12" />
+            <span class="trace-id-text">{{ traceIdChip }}</span>
+          </button>
 
           <!-- Command output: terminal-style panel -->
           <ExecOutputCard
@@ -1314,6 +1357,35 @@ async function onRegenerate() {
 .status-line-auto-continue {
   color: var(--accent);
   font-weight: 600;
+}
+
+/* P3-3: trace id chip. Small monospace button under the
+   message body so the user can copy the correlation id
+   when reporting an error. Subtle visual treatment —
+   not an alert, not a warning — so successful turns
+   don't carry any UI debt. */
+.trace-id-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text-2);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.trace-id-chip:hover {
+  background: var(--bg-3, var(--bg-2));
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.trace-id-text {
+  letter-spacing: 0.02em;
 }
 </style>
 

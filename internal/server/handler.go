@@ -26,6 +26,7 @@ import (
 	"github.com/p-chat/pchat/internal/search"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/trace"
 	"github.com/p-chat/pchat/internal/version"
 )
 
@@ -695,6 +696,14 @@ type StreamEvent struct {
 	// it as a resume cursor. See P3-1 in
 	// docs/plans/round2-stream-and-render-plan.md.
 	Seq uint64 `json:"seq,omitempty"`
+	// TraceID is the P3-3 end-to-end correlation id
+	// (e.g. "T-9f3c4a2b") the agent stamps on every chunk.
+	// Mirrored on the response as the `X-Trace-Id` header
+	// (see respondSSE) so curl users can grep the
+	// server-debug log with the same id. The frontend
+	// surfaces it on error bubbles via the "复制 trace id"
+	// button so support can ask the user to paste it.
+	TraceID string `json:"trace_id,omitempty"`
 }
 
 // --- Health / metadata ---
@@ -2590,6 +2599,13 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		PermissionLevel:   meta.PermissionLevel,
 		KBBase:            meta.KnowledgeBase,
 		AutoContinue:      h.sessionAutoContinue(id),
+		// P3-3: copy the trace id off the request context
+		// so the agent loop can stamp every emitted chunk
+		// without re-reading ctx. The traceIDMiddleware on
+		// the server has already minted one (or adopted
+		// the client-supplied one) and put it under
+		// trace.ctxKey.
+		TraceID: trace.FromContext(c.Request.Context()),
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -2610,6 +2626,17 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 	c.Header("X-Session-ID", sessionID)
 	c.Header("X-Provider", provider)
 	c.Header("X-Model", model)
+	// P3-3: echo the trace id from the request context so
+	// curl users can grep server-debug.log with the same
+	// id they see in the response. The middleware already
+	// set this header on the *outgoing* response, but a
+	// second set here is harmless and self-documenting —
+	// any future caller of respondSSE that bypassed the
+	// middleware (e.g. a unit test) still gets the right
+	// header.
+	if tid := trace.FromContext(c.Request.Context()); tid != "" {
+		c.Header("X-Trace-Id", tid)
+	}
 	c.Writer.Flush()
 
 	c.Stream(func(w io.Writer) bool {
@@ -2821,6 +2848,7 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		PermissionLevel:   meta.PermissionLevel,
 		KBBase:            meta.KnowledgeBase,
 		AutoContinue:      h.sessionAutoContinue(id),
+		TraceID:           trace.FromContext(c.Request.Context()),
 	}
 
 	// Same session-locks pattern as SendMessage so a
@@ -2861,6 +2889,14 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		// it as a resume cursor. See P3-1 in
 		// docs/plans/round2-stream-and-render-plan.md.
 		Seq: chunk.Seq,
+		// TraceID is the P3-3 end-to-end correlation id
+		// (e.g. "T-9f3c4a2b") stamped on every chunk by
+		// agent.sendOrDrop from the request context.
+		// Surfaced on the wire so the frontend can render
+		// it on error bubbles (the "复制 trace id" button
+		// on the error chip) and so curl users can copy it
+		// straight from the JSON payload.
+		TraceID: chunk.TraceID,
 		// Elapsed carries the duration the server stamped on the
 		// chunk. The agent sets it on the final "done" chunk AND
 		// on every sub_agent_* lifecycle close event (so the

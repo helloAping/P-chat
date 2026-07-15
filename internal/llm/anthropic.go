@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/p-chat/pchat/internal/trace"
 )
 
 const (
@@ -231,6 +233,15 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-api-key", c.apiKey)
 		req.Header.Set("anthropic-version", anthropicVersion)
+		// P3-3: forward the trace id on every Anthropic
+		// request. The upstream API ignores unknown headers
+		// (Anthropic specifically doesn't echo them back),
+		// but the value lands in our outbound log lines so
+		// "anthropic http 529 at 18:42" is greppable
+		// alongside the rest of the request.
+		if tid := trace.FromContext(ctx); tid != "" {
+			req.Header.Set("X-Trace-Id", tid)
+		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {

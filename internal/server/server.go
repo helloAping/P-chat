@@ -21,6 +21,7 @@ import (
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/trace"
 )
 
 type Server struct {
@@ -106,6 +107,18 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	// permits that one cross-origin case without weakening the
 	// default same-origin policy.
 	r.Use(corsMiddleware())
+
+	// P3-3: trace id propagation. Reads the optional
+	// `X-Trace-Id` request header (the browser or Wails
+	// runtime may mint one to correlate with their own
+	// logs); otherwise mints a fresh 8-char hex id
+	// (T-xxxxxxxx). The id is attached to the request
+	// context under trace.ctxKey and to the response
+	// headers so the client always sees the same value
+	// the server stamped on every log line. Downstream
+	// code (agent, LLM, tool handlers) pulls it from
+	// ctx via trace.FromContext.
+	r.Use(traceIDMiddleware())
 
 	h := NewHandler(agt, cfg, store, styleMgr, mcpMgr)
 
@@ -426,7 +439,7 @@ func corsMiddleware() gin.HandlerFunc {
 			c.Header("Access-Control-Allow-Origin", "*")
 		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Trace-Id")
 		c.Header("Access-Control-Max-Age", "600")
 		// Private Network Access (Chromium 94+). The Wails origin
 		// is a "public" origin and 127.0.0.1 is private; without
@@ -454,6 +467,37 @@ func maxBodyMiddleware(maxBytes int64) gin.HandlerFunc {
 		if c.Request != nil && c.Request.Body != nil {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 		}
+		c.Next()
+	}
+}
+
+// traceIDMiddleware is the P3-3 entry point for the trace id.
+// Behaviour:
+//
+//  1. Read the optional `X-Trace-Id` request header. The browser
+//     or Wails runtime may mint one to correlate with their own
+//     client-side logs; if so, we adopt it as-is.
+//  2. If the header is missing or empty, mint a fresh id via
+//     trace.NewID() (8-char hex, "T-" prefix).
+//  3. Stash the id on the request context via trace.WithID so
+//     every downstream handler / goroutine can read it with
+//     trace.FromContext.
+//  4. Echo the id back as `X-Trace-Id` on the response so the
+//     client can confirm which id the server attached.
+//
+// The middleware never blocks the request: it only adds context
+// values and response headers. If minting fails (essentially
+// impossible — crypto/rand doesn't fail on supported platforms)
+// the request still proceeds without a trace id.
+func traceIDMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tid := c.GetHeader("X-Trace-Id")
+		if tid == "" {
+			tid = trace.NewID()
+		}
+		c.Set("trace_id", tid)
+		c.Header("X-Trace-Id", tid)
+		c.Request = c.Request.WithContext(trace.WithID(c.Request.Context(), tid))
 		c.Next()
 	}
 }

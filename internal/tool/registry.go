@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -119,6 +120,35 @@ func sandboxFromCtx(ctx context.Context) SandboxChecker {
 		return v
 	}
 	return nil
+}
+
+// traceKey is the P3-3 mirror of sandboxKey: stores the
+// per-request trace id under an unexported context key so tool
+// handlers can prefix their log lines with it (e.g.
+// `log.Printf("[%s] [tool/exec_command] start", tid, …)`).
+type traceKey struct{}
+
+// WithTraceID returns a child context carrying the given trace id.
+// Empty id is a no-op so callers don't have to guard against
+// "is the middleware on?".
+func WithTraceID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, traceKey{}, id)
+}
+
+// TraceIDFromCtx extracts the trace id from ctx, or "" if none
+// is set. Callers can safely pass the result straight into a
+// log.Printf prefix or response header.
+func TraceIDFromCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(traceKey{}).(string); ok {
+		return v
+	}
+	return ""
 }
 
 type projectRootKey struct{}
@@ -454,6 +484,11 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	if a.Command == "" {
 		return &CallResult{Content: "command is required", IsError: true}, nil
 	}
+	// P3-3: trace id is on ctx via WithTraceID; prefix the
+	// log line so a sandbox rejection / exec failure can be
+	// correlated with the SSE event that triggered the call
+	// (and the user's report).
+	log.Printf("%s[tool/exec_command] start cmd=%q dry_run=%t", TraceIDFromCtx(ctx), a.Command, a.DryRun)
 
 	if sb := sandboxFromCtx(ctx); sb != nil && !sb.CheckExecBool(a.Command) {
 		return &CallResult{
