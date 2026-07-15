@@ -42,7 +42,7 @@ type ChatMessage struct {
 	ToolError bool   `json:"tool_error,omitempty"` // true when tool_result.Content carries an error
 
 	// ── extension ──
-	Meta map[string]interface{} `json:"meta,omitempty"` // arbitrary extension data
+	Meta map[string]any `json:"meta,omitempty"` // arbitrary extension data
 }
 
 // ── Role constants ──

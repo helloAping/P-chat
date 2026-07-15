@@ -198,6 +198,19 @@ func init() {
 			Handler: cmdUnsafe,
 		},
 		{
+			Name: "/auto-continue", Aliases: []string{"/ac"}, Description: "控制 P0-3 自动续 LLM 守卫 (todo 未完成时)",
+			Usage: "/auto-continue [on|off]",
+			Args: "on       - 启用: LLM 退出但 todo 未完成时,自动注入续提示 (默认)\n" +
+				"      off      - 关闭: 严格按 LLM 自然结束处理\n" +
+				"      无参     - 显示当前状态",
+			Examples: []string{
+				"/auto-continue",
+				"/ac on",
+				"/ac off",
+			},
+			Handler: cmdAutoContinue,
+		},
+		{
 			Name: "/expand", Aliases: []string{"/x"}, Description: "展开上次的工具调用完整结果",
 			Usage: "/expand [编号|last]",
 			Args: "无参   - 列出所有缓存的工具结果 (最多 20 条, 编号 + 一行摘要)\n" +
@@ -1908,6 +1921,71 @@ func cmdUnsafe(ctx cliContext, args string) error {
 		color.HiBlack("    /unsafe once  下次调用跳过沙箱")
 		color.HiBlack("    /unsafe on    禁用沙箱（到 /unsafe off）")
 		color.HiBlack("    /unsafe off   重新启用沙箱")
+		fmt.Println()
+	}
+	return nil
+}
+
+// cmdAutoContinue toggles the P0-3 "todo-incomplete → re-prompt
+// LLM" guard. The flag is per-session and persisted via
+// PATCH /sessions/:id. Unlike /unsafe (which is local-only
+// because the sandbox is shared process state), this works
+// the same in HTTP and local mode — the agent reads the
+// per-session flag from chatReq.AutoContinue.
+func cmdAutoContinue(ctx cliContext, args string) error {
+	arg := strings.TrimSpace(strings.ToLower(args))
+	sid := ctx.GetCurrentSessionID()
+	if sid == "" {
+		color.HiBlack("  (没有当前会话)")
+		return nil
+	}
+
+	switch arg {
+	case "on", "enable":
+		on := true
+		if _, err := ctx.PatchSession(context.Background(), sid, httpcli.SessionPatchOpts{AutoContinue: &on}); err != nil {
+			color.Red("  ✗ 启用失败: %v", err)
+			return nil
+		}
+		color.Green("  ✓ auto-continue 已启用 (LLM 退出但 todo 未完成时自动续)")
+	case "off", "disable":
+		off := false
+		if _, err := ctx.PatchSession(context.Background(), sid, httpcli.SessionPatchOpts{AutoContinue: &off}); err != nil {
+			color.Red("  ✗ 关闭失败: %v", err)
+			return nil
+		}
+		color.Yellow("  ⚠ auto-continue 已关闭 (严格按 LLM 自然结束处理)")
+	default:
+		// Status display: read the current value from
+		// ListSessions. The interface has ListSessions on
+		// both backends; GetSession is not yet exposed
+		// (and would only be needed for this single
+		// status read). Finding the matching session is
+		// O(n) but n is small in practice.
+		sessions, err := ctx.ListSessions(context.Background())
+		if err != nil {
+			color.HiBlack("  (无法读取会话状态: %v)", err)
+			return nil
+		}
+		var current *httpcli.Session
+		for i := range sessions {
+			if sessions[i].ID == sid {
+				current = &sessions[i]
+				break
+			}
+		}
+		fmt.Println()
+		color.Cyan("  auto-continue 状态")
+		fmt.Println("  ─────────────────────────────────────")
+		if current == nil {
+			color.HiBlack("    当前会话不在列表中 — 默认启用")
+		} else if current.AutoContinue {
+			color.Green("    当前: 启用")
+		} else {
+			color.Yellow("    当前: 关闭")
+		}
+		color.HiBlack("    /auto-continue on   启用 (默认)")
+		color.HiBlack("    /auto-continue off  关闭")
 		fmt.Println()
 	}
 	return nil

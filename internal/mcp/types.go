@@ -11,7 +11,7 @@ type JSONRPCRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
 	ID      int         `json:"id"`
 	Method  string      `json:"method"`
-	Params  interface{} `json:"params,omitempty"`
+	Params  any `json:"params,omitempty"`
 }
 
 type JSONRPCResponse struct {
@@ -28,7 +28,7 @@ type JSONRPCError struct {
 
 type InitializeRequest struct {
 	ProtocolVersion string                 `json:"protocolVersion"`
-	Capabilities    map[string]interface{} `json:"capabilities"`
+	Capabilities    map[string]any `json:"capabilities"`
 	ClientInfo      ClientInfo             `json:"clientInfo"`
 }
 
@@ -39,7 +39,7 @@ type ClientInfo struct {
 
 type InitializeResult struct {
 	ProtocolVersion string                 `json:"protocolVersion"`
-	Capabilities    map[string]interface{} `json:"capabilities"`
+	Capabilities    map[string]any `json:"capabilities"`
 	ServerInfo      MCPServerInfo          `json:"serverInfo"`
 }
 

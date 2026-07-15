@@ -72,6 +72,13 @@ export interface Session {
   reasoning_effort?: string
   vector_store?: string
   knowledge_base?: string
+  // auto_continue (P0-3): when true, the agent auto-re-prompts
+  // the LLM if it exits with no tool calls but the todo list
+  // still has pending / in_progress items. Default true. The
+  // server returns the resolved value (so a missing field on
+  // the wire reads back as `true` here). The /auto-continue
+  // slash command toggles this per session.
+  auto_continue?: boolean
 }
 
 export interface Attachment {
@@ -326,7 +333,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string }>,
+  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',

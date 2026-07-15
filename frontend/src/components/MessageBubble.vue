@@ -667,7 +667,7 @@ const canRollback = computed(() =>
           <template v-if="(message.msg_type ?? 0) === 0 && message.role === 'assistant'">
             <!-- Live status bar during streaming -->
             <div v-if="statusLines.length" class="stream-status">
-              <div v-for="(line, i) in statusLines" :key="i" class="status-line">{{ line }}</div>
+              <div v-for="(line, i) in statusLines" :key="i" :class="['status-line', { 'status-line-auto-continue': line.includes('自动续 LLM') }]">{{ line }}</div>
             </div>
             <template v-if="message.parts && message.parts.length">
               <template v-for="(p, i) in message.parts" :key="i">
@@ -1221,6 +1221,16 @@ const canRollback = computed(() =>
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* P0-3 auto-continue: highlight the status line so the
+ * user notices that the agent re-prompted itself rather
+ * than the LLM actually finishing. Triggers when the
+ * line contains "自动续 LLM" (the message we emit from
+ * agent.go ChatWithTools when the todo-incomplete
+ * guard fires). */
+.status-line-auto-continue {
+  color: var(--accent);
+  font-weight: 600;
 }
 </style>
 

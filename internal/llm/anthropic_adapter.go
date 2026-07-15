@@ -68,7 +68,7 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			if inputJSON == nil {
 				inputJSON = json.RawMessage("{}")
 			}
-			toolUseBlock := map[string]interface{}{
+			toolUseBlock := map[string]any{
 				"type":  "tool_use",
 				"id":    msg.ToolID,
 				"name":  msg.ToolName,
@@ -84,7 +84,7 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			if msg.ToolError {
 				content = "error: " + msg.Content
 			}
-			block := map[string]interface{}{
+			block := map[string]any{
 				"type":         "tool_result",
 				"tool_use_id":  msg.ToolID,
 				"content":      content,
@@ -102,9 +102,9 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 
 		case TypeImage:
 			// Build an image block with base64 source.
-			block := map[string]interface{}{
+			block := map[string]any{
 				"type": "image",
-				"source": map[string]interface{}{
+				"source": map[string]any{
 					"type":       "base64",
 					"media_type": msg.MimeType,
 					"data":       msg.Content,
@@ -212,19 +212,29 @@ func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 		var eventType string
 		for {
 			line, err := readSSELine(reader)
-			// On EOF, process the trailing line (if any)
-			// before closing. This lets a transport cut
-			// mid-event still surface whatever data was
-			// already buffered — better to show partial
-			// content than silently drop it.
+			// Single dispatch path. The previous version
+			// processed each line twice (once before the
+			// err check, once after), which doubled every
+			// content/thinking delta and broke the
+			// long-line, multi-event, CRLF, and
+			// missing-message-stop tests in
+			// anthropic_stream_test.go.
 			if line != "" {
-				if strings.HasPrefix(line, "event: ") {
+				switch {
+				case strings.HasPrefix(line, "event: "):
 					eventType = strings.TrimPrefix(line, "event: ")
-				} else if strings.HasPrefix(line, "data: ") {
-					dataJSON := strings.TrimPrefix(line, "data: ")
-					a.handleStreamEvent(eventType, dataJSON, ch)
+				case strings.HasPrefix(line, "data: "):
+					a.handleStreamEvent(eventType, strings.TrimPrefix(line, "data: "), ch)
+					// Comment lines (": something"), id lines,
+					// or unknown fields fall through and are
+					// ignored on the next iteration.
 				}
 			}
+			// EOF handling: process the trailing line (if
+			// any) before closing. This lets a transport
+			// cut mid-event still surface whatever data was
+			// already buffered — better to show partial
+			// content than silently drop it.
 			if err != nil {
 				if err != io.EOF {
 					ch <- StreamChunk{Err: err}
@@ -232,23 +242,12 @@ func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				return
 			}
 			if line == "" {
-				// Blank line = end of SSE event. Reset and
-				// continue. The data was already dispatched
-				// when we read the "data: " line.
+				// Blank line = end of SSE event. Reset
+				// eventType for the next event. The data
+				// was already dispatched when we read the
+				// "data: " line above.
 				eventType = ""
-				continue
 			}
-			if strings.HasPrefix(line, "event: ") {
-				eventType = strings.TrimPrefix(line, "event: ")
-				continue
-			}
-			if strings.HasPrefix(line, "data: ") {
-				dataJSON := strings.TrimPrefix(line, "data: ")
-				a.handleStreamEvent(eventType, dataJSON, ch)
-				continue
-			}
-			// Comment lines (": something"), id lines, or
-			// unknown fields — ignore.
 		}
 	}()
 
@@ -367,12 +366,12 @@ func anthropicRole(role string) string {
 
 // --- Anthropic wire types ---
 
-// anthropicBlockFromMap converts a map[string]interface{} to an
+// anthropicBlockFromMap converts a map[string]any to an
 // anthropicContentBlock by JSON-encoding the map into the known
 // struct shape. Extra fields (tool_use id, input, source metadata)
 // that the struct doesn't have are stored in the raw form and
 // serialised back via a custom marshal step.
-func anthropicBlockFromMap(m map[string]interface{}) anthropicContentBlock {
+func anthropicBlockFromMap(m map[string]any) anthropicContentBlock {
 	b, _ := json.Marshal(m)
 	var block anthropicContentBlock
 	json.Unmarshal(b, &block)

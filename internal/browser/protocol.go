@@ -35,7 +35,7 @@ type Request struct {
 	JSONRPC string      `json:"jsonrpc"`
 	ID      int64       `json:"id"`
 	Method  string      `json:"method"`
-	Params  interface{} `json:"params,omitempty"`
+	Params  any `json:"params,omitempty"`
 }
 
 // Response is a JSON-RPC 2.0 response sent from extension to server.
@@ -115,7 +115,7 @@ func (c *BrowserClient) Done() <-chan struct{} { return c.done }
 // until a response arrives or the context expires. The timeout
 // parameter controls the per-request WebSocket write deadline; the
 // call itself respects ctx.
-func (c *BrowserClient) SendCommand(ctx context.Context, method string, params interface{}, timeout time.Duration) (*Response, error) {
+func (c *BrowserClient) SendCommand(ctx context.Context, method string, params any, timeout time.Duration) (*Response, error) {
 	c.mu.Lock()
 	c.seq++
 	id := c.seq

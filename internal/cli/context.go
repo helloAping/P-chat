@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -44,6 +45,12 @@ type cliContext interface {
 	NewSession(ctx context.Context, opts httpcli.CreateSessionOpts) (*httpcli.Session, error)
 	RenameSession(ctx context.Context, id, title string) error
 	DeleteSession(ctx context.Context, id string) error
+	// PatchSession sends a partial update to the session's
+	// metadata. Used by /auto-continue (P0-3) to toggle the
+	// per-session auto-continue flag without a full reload.
+	// Returns the refreshed Session so callers can show the
+	// new state.
+	PatchSession(ctx context.Context, id string, opts httpcli.SessionPatchOpts) (*httpcli.Session, error)
 	// ClearMessages empties the messages of the current session
 	// without changing the session ID. Preserves the session row
 	// in the DB so refs and history stay stable.
@@ -118,10 +125,16 @@ type cliContext interface {
 	SetToolsEnabled(on bool)
 
 	// === Sandbox ===
+	// SetSandbox toggles the sandbox on/off for subsequent tool
+	// calls. Local REPL applies it in-process; HTTP mode warns
+	// and ignores (see httpContext.SetSandbox).
 	SetSandbox(enabled bool)
+	// BypassSandboxOnce makes the next single tool call skip the
+	// sandbox check. Local REPL applies it in-process; HTTP mode
+	// warns and ignores.
 	BypassSandboxOnce()
 	// RebuildSandbox re-creates the sandbox from the current config
-	// (used by /unsafe off). HTTP mode is a no-op.
+	// (used by /unsafe off). HTTP mode returns ErrUnsupported.
 	RebuildSandbox() error
 
 	// === Tool result cache (for /expand) ===
@@ -308,6 +321,59 @@ func (c *localContext) RenameSession(ctx context.Context, id, title string) erro
 
 func (c *localContext) DeleteSession(ctx context.Context, id string) error {
 	return c.r.store.DeleteConversation(id)
+}
+
+// PatchSession is the local-mode counterpart of the HTTP
+// PatchSession. The CLI toggles per-session flags
+// (currently just auto_continue) directly through the
+// in-memory REPL config + SQLite blob. The HTTP PATCH path
+// already handles persistence; here we just write the
+// metadata blob and return the refreshed session.
+func (c *localContext) PatchSession(ctx context.Context, id string, opts httpcli.SessionPatchOpts) (*httpcli.Session, error) {
+	conv, err := c.r.store.GetConversation(id)
+	if err != nil {
+		return nil, err
+	}
+	// Encode just the auto_continue field for now — it's
+	// the only PatchSession consumer in this build. Future
+	// flags can extend the blob shape.
+	if opts.AutoContinue != nil {
+		// Read-modify-write the metadata blob so we
+		// don't lose existing fields.
+		var blob map[string]any
+		if conv.Metadata != "" {
+			_ = json.Unmarshal([]byte(conv.Metadata), &blob)
+		}
+		if blob == nil {
+			blob = map[string]any{}
+		}
+		blob["auto_continue"] = *opts.AutoContinue
+		encoded, _ := json.Marshal(blob)
+		if err := c.r.store.UpdateConversationMeta(id, string(encoded)); err != nil {
+			return nil, err
+		}
+	}
+	// Re-read to return the fresh state.
+	conv, err = c.r.store.GetConversation(id)
+	if err != nil {
+		return nil, err
+	}
+	// Decode the blob to surface auto_continue.
+	var blob map[string]any
+	if conv.Metadata != "" {
+		_ = json.Unmarshal([]byte(conv.Metadata), &blob)
+	}
+	autoOn := true // default
+	if v, ok := blob["auto_continue"].(bool); ok {
+		autoOn = v
+	}
+	return &httpcli.Session{
+		ID:           conv.ID,
+		Title:        conv.Title,
+		CreatedAt:    conv.CreatedAt.Unix(),
+		UpdatedAt:    conv.UpdatedAt.Unix(),
+		AutoContinue: autoOn,
+	}, nil
 }
 
 func (c *localContext) ClearMessages(ctx context.Context, id string) error {
@@ -891,6 +957,14 @@ func (c *httpContext) NewSession(ctx context.Context, opts httpcli.CreateSession
 func (c *httpContext) RenameSession(ctx context.Context, id, title string) error {
 	return c.c.RenameSession(ctx, id, title)
 }
+
+// PatchSession forwards a partial-update PATCH to the
+// server. Used by /auto-continue (P0-3) and any future
+// per-session toggle that needs to flip a single flag
+// without spawning a full reload.
+func (c *httpContext) PatchSession(ctx context.Context, id string, opts httpcli.SessionPatchOpts) (*httpcli.Session, error) {
+	return c.c.PatchSession(ctx, id, opts)
+}
 func (c *httpContext) DeleteSession(ctx context.Context, id string) error {
 	return c.c.DeleteSession(ctx, id)
 }
@@ -970,8 +1044,26 @@ func (c *httpContext) ListTools() []ToolView     { return nil }
 func (c *httpContext) ToolsEnabled() bool        { return true }
 func (c *httpContext) SetToolsEnabled(on bool)   {}
 
-func (c *httpContext) SetSandbox(bool)             { /* TODO: not supported over HTTP yet */ }
-func (c *httpContext) BypassSandboxOnce()         {}
+// httpContext sandbox methods are deliberate no-ops with a
+// visible warning. The server's sandbox is configured at process
+// startup (cmd/pchat-server/main.go) and shared by all sessions
+// that talk to it, so toggling it from one CLI client would
+// silently change the security posture for every other client
+// connected to the same server. Rather than implementing that
+// (or wiring an HTTP endpoint that doesn't exist), we surface a
+// clear "ignored" message and let the caller know that the
+// /unsafe slash command is local-REPL-only.
+//
+// RebuildSandbox is the only one that returns an error: it's
+// called from the same /unsafe flow and cliContext callers can
+// branch on ErrUnsupported to render a localized message.
+func (c *httpContext) SetSandbox(enabled bool) {
+	_ = enabled
+	color.Yellow("  ⚠ /unsafe 仅在本地 REPL 可用（HTTP 模式忽略此设置）")
+}
+func (c *httpContext) BypassSandboxOnce() {
+	color.Yellow("  ⚠ /unsafe 仅在本地 REPL 可用（HTTP 模式忽略此设置）")
+}
 func (c *httpContext) RebuildSandbox() error       { return c.unsupported("RebuildSandbox") }
 
 func (c *httpContext) ExpandList() []ToolResultView                { return nil }

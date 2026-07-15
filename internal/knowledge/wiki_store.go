@@ -403,7 +403,7 @@ func (ws *WikiStore) deleteNodeInternal(ctx context.Context, nodeID int) error {
 	allIDs = append(allIDs, nodeID)
 
 	placeholders := make([]string, len(allIDs))
-	args := make([]interface{}, len(allIDs))
+	args := make([]any, len(allIDs))
 	for i, id := range allIDs {
 		placeholders[i] = "?"
 		args[i] = id
@@ -689,7 +689,7 @@ func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) {
 func CloseWikiStore() {
 	wikiStoreMu.Lock()
 	defer wikiStoreMu.Unlock()
-	wikiStoreCache.Range(func(key, value interface{}) bool {
+	wikiStoreCache.Range(func(key, value any) bool {
 		value.(*WikiStore).Close()
 		return true
 	})
@@ -844,7 +844,7 @@ func (ws *WikiStore) LookupSearch(ctx context.Context, query, base string, expan
 
 func (ws *WikiStore) browseL2(ctx context.Context, base string, level, page, size int) (*IndexSearchResult, error) {
 	baseCond := ``
-	args := []interface{}{}
+	args := []any{}
 	if base != "" && base != "__all__" {
 		baseCond = `AND base = ?`
 		args = append(args, base)
@@ -992,7 +992,7 @@ func (ws *WikiStore) runFTSQuery(ctx context.Context, hits []searchHit, seen *ma
 	ftsQ := ftsExpr(escapeFTS5(query))
 	sql := strings.ReplaceAll(sqlTmpl, `{:base}`, baseWhere)
 
-	var args []interface{}
+	var args []any
 	args = append(args, ftsQ)
 	if baseWhere != "" {
 		args = append(args, baseArg)
@@ -1042,7 +1042,7 @@ func escapeFTS5(q string) string {
 }
 
 func (ws *WikiStore) addContentLikeHits(ctx context.Context, hits []searchHit, seen *map[int]bool, query, baseWhere, baseArg string, weight float64) []searchHit {
-	var args []interface{}
+	var args []any
 	args = append(args, "%"+query+"%")
 	if baseWhere != "" && baseArg != "" {
 		args = append(args, baseArg)

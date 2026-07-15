@@ -77,10 +77,18 @@ func NewClient(base string) *Client {
 
 // Session mirrors server.SessionResponse.
 type Session struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Style        string `json:"style,omitempty"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+	// AutoContinue mirrors the server's P0-3 flag (default
+	// true). The CLI uses it to display the current
+	// auto-continue state next to /auto-continue's status
+	// output and to remember the user's last choice.
+	AutoContinue bool `json:"auto_continue"`
 }
 
 // Message mirrors server.MessageResponse.
@@ -244,6 +252,33 @@ func (c *Client) RenameSession(ctx context.Context, id, title string) error {
 		Title string `json:"title"`
 	}{Title: title}
 	return c.doJSON(ctx, "PATCH", "/api/v1/sessions/"+id, body, nil)
+}
+
+// SessionPatchOpts is the JSON body for the PATCH /sessions/:id
+// endpoint. All fields are pointers so callers can send partial
+// updates — see internal/server/handler.go UpdateSessionMeta
+// for the server-side semantics. The CLI uses this to toggle
+// per-session flags like AutoContinue without touching the
+// other session metadata.
+type SessionPatchOpts struct {
+	Style         *string `json:"style,omitempty"`
+	Provider      *string `json:"provider,omitempty"`
+	Model         *string `json:"model,omitempty"`
+	Permission    *string `json:"permission_level,omitempty"`
+	KnowledgeBase *string `json:"knowledge_base,omitempty"`
+	AutoContinue  *bool   `json:"auto_continue,omitempty"`
+}
+
+// PatchSession sends a partial update to the session metadata
+// and returns the refreshed SessionResponse. The CLI uses it
+// for toggles like /auto-continue that change a single flag
+// without spawning a full reload.
+func (c *Client) PatchSession(ctx context.Context, id string, opts SessionPatchOpts) (*Session, error) {
+	var s Session
+	if err := c.doJSON(ctx, "PATCH", "/api/v1/sessions/"+id, opts, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
 }
 
 func (c *Client) DeleteSession(ctx context.Context, id string) error {
@@ -425,7 +460,7 @@ func (c *Client) DisplayModel(provider string) string {
 // SubmitQuestionResponse sends the user's answer to a pending
 // question back to the server so the agent can continue.
 func (c *Client) SubmitQuestionResponse(ctx context.Context, sessionID string, answers map[string]string) error {
-	body := map[string]interface{}{
+	body := map[string]any{
 		"answers": answers,
 	}
 	return c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/question-response", body, nil)

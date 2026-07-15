@@ -122,6 +122,39 @@ func TestIsUnsupported_TrueForHTTPStub(t *testing.T) {
 	}
 }
 
+// TestHTTPContext_SandboxNoOp locks in the deliberate no-op +
+// visible-warning behavior of the HTTP context's sandbox methods.
+// The previous implementation silently swallowed the call (just
+// `func (c *httpContext) SetSandbox(bool) {}`), which was a
+// silently-fail-open footgun: a CLI connected to a remote
+// pchat-server would print "✓ 沙箱已禁用" and then keep enforcing
+// the sandbox unchanged. These tests guard the new behavior:
+//   - SetSandbox / BypassSandboxOnce must not panic and must not
+//     mutate the context's "c" client (which is nil in the test).
+//   - RebuildSandbox must return *ErrUnsupported so callers can
+//     branch on isUnsupported() and render a localized message
+//     instead of crashing.
+func TestHTTPContext_SandboxNoOp(t *testing.T) {
+	httpCtx := &httpContext{c: nil, style: "cute", prov: "openai"}
+
+	// These must be safe to call repeatedly without panicking.
+	// We don't assert on the warning text (color.Yellow writes
+	// to the global stdout and would race with parallel tests);
+	// the contract is "don't crash, don't change state".
+	httpCtx.SetSandbox(true)
+	httpCtx.SetSandbox(false)
+	httpCtx.BypassSandboxOnce()
+	httpCtx.BypassSandboxOnce()
+
+	// RebuildSandbox returns ErrUnsupported so /unsafe off can
+	// render the standard "unsupported in HTTP mode" message.
+	if err := httpCtx.RebuildSandbox(); err == nil {
+		t.Fatal("httpContext.RebuildSandbox should error")
+	} else if !isUnsupported(err) {
+		t.Errorf("httpContext.RebuildSandbox err = %v, want ErrUnsupported", err)
+	}
+}
+
 // TestLocalContext_ListProviders confirms ListProviders returns the
 // same providers the on-disk config has.
 func TestLocalContext_ListProviders(t *testing.T) {

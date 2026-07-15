@@ -209,6 +209,19 @@ func (r *Registry) Register(t Tool, h ToolHandler) {
 	r.meta[t.Name] = t
 }
 
+// RegisterForTest registers a tool with a no-op handler. Tests
+// use it to populate the registry when exercising prompt-
+// building code paths that gate hint sections on tool
+// presence (e.g. the "todo_write" section in the static
+// system prompt). The real handler is wired by RegisterBuiltin
+// at production startup; tests don't need it because they
+// only exercise the meta side.
+func (r *Registry) RegisterForTest(t Tool) {
+	r.Register(t, func(ctx context.Context, args json.RawMessage) (*CallResult, error) {
+		return &CallResult{Content: "{}"}, nil
+	})
+}
+
 func (r *Registry) Unregister(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -77,7 +77,7 @@ func TestToolSchemas_ValidJSON(t *testing.T) {
 		}
 		// Parameters should be valid JSON if present.
 		if len(d.Parameters) > 0 {
-			var v interface{}
+			var v any
 			if err := json.Unmarshal(d.Parameters, &v); err != nil {
 				t.Errorf("tool %q has invalid Parameters JSON: %v", d.Name, err)
 			}

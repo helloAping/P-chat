@@ -64,6 +64,12 @@ type sessionMeta struct {
 	PlanMode        bool   // plan mode (no tools, single turn)
 	PermissionLevel string // "ask" | "auto" | "full"
 	KnowledgeBase   string // "" = off, "__all__" = all bases, or a specific base name
+	// AutoContinue is a pointer so we can distinguish "user
+	// never set" (nil → default true) from "user explicitly
+	// disabled" (*bool == false). The P0-3 auto-continue
+	// guard in agent.ChatWithTools reads through
+	// sessionAutoContinue() which applies the default.
+	AutoContinue *bool
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -78,6 +84,10 @@ type sessionMetaBlob struct {
 	PlanMode        bool   `json:"plan_mode,omitempty"`
 	PermissionLevel string `json:"permission_level,omitempty"`
 	KnowledgeBase   string `json:"knowledge_base,omitempty"`
+	// AutoContinue mirrors sessionMeta.AutoContinue. Pointer
+	// so JSON omits it when never set, instead of
+	// round-tripping "false" as if the user had disabled it.
+	AutoContinue *bool `json:"auto_continue,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Handler {
@@ -166,6 +176,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.PlanMode = blob.PlanMode
 				m.PermissionLevel = blob.PermissionLevel
 				m.KnowledgeBase = blob.KnowledgeBase
+				m.AutoContinue = blob.AutoContinue
 			}
 		}
 	}
@@ -176,6 +187,20 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 func (h *Handler) sessionStyle(id string) string {
 	m := h.ensureMetaLoaded(id)
 	return m.Style
+}
+
+// sessionAutoContinue returns the P0-3 auto-continue flag for
+// the session, defaulting to true (the feature is opt-out).
+// A nil pointer means the user has never set the flag, which
+// we treat as "use the default"; a non-nil pointer sticks at
+// whatever the user last chose. See sessionMeta.AutoContinue
+// for the rationale.
+func (h *Handler) sessionAutoContinue(id string) bool {
+	m := h.ensureMetaLoaded(id)
+	if m.AutoContinue == nil {
+		return true
+	}
+	return *m.AutoContinue
 }
 
 func (h *Handler) sessionProvider(id string) string {
@@ -313,6 +338,12 @@ type UpdateSessionMetaRequest struct {
 	// KnowledgeBase selects a knowledge base. "" / "__off__" = off,
 	// "__all__" = all bases, or a specific base name.
 	KnowledgeBase *string `json:"knowledge_base,omitempty"`
+	// AutoContinue toggles the P0-3 "todo-incomplete → re-prompt
+	// LLM" guard. Pointer so the absence of the field is
+	// distinct from `false`: when omitted, the per-session
+	// setting is left unchanged; when present, it overrides
+	// whatever was there before (including the default-true).
+	AutoContinue *bool `json:"auto_continue,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -333,6 +364,11 @@ type SessionResponse struct {
 	KnowledgeBase  string `json:"knowledge_base,omitempty"`
 	CreatedAt      int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
+	// AutoContinue is the P0-3 "todo-incomplete → re-prompt
+	// LLM" guard toggle, default true. Surface so the UI can
+	// show a status pill ("auto-continue on/off") next to the
+	// todo panel.
+	AutoContinue bool `json:"auto_continue"`
 }
 
 // MessageResponse is the JSON form of a single message in a
@@ -1583,6 +1619,23 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		}
 	}
 
+	// Handle auto_continue (P0-3). Pointer semantics: nil
+	// means "leave the per-session setting alone" (default
+	// true), non-nil means "set it to this value explicitly".
+	// The next chatReq construction reads through
+	// sessionAutoContinue() which applies the default.
+	if req.AutoContinue != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.AutoContinue = req.AutoContinue
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		if h.store != nil {
+			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase, AutoContinue: m.AutoContinue})
+			_ = h.store.UpdateConversationMeta(id, string(blob))
+		}
+	}
+
 	// Re-read so the response reflects the on-disk truth.
 	cv, err = h.store.GetConversation(id)
 	if err != nil {
@@ -2277,6 +2330,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		PlanMode:          meta.PlanMode,
 		PermissionLevel:   meta.PermissionLevel,
 		KBBase:            meta.KnowledgeBase,
+		AutoContinue:      h.sessionAutoContinue(id),
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
@@ -2540,6 +2594,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		ReasoningEffort: m.ReasoningEffort,
 		VectorStore:    cv.VectorStore,
 		KnowledgeBase:  m.KnowledgeBase,
+		AutoContinue:   h.sessionAutoContinue(cv.ID),
 		CreatedAt:   cv.CreatedAt.Unix(),
 		UpdatedAt:   cv.UpdatedAt.Unix(),
 	}

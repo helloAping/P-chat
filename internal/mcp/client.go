@@ -45,7 +45,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 		Method:  "initialize",
 		Params: InitializeRequest{
 			ProtocolVersion: protocolVersion,
-			Capabilities:    map[string]interface{}{},
+			Capabilities:    map[string]any{},
 			ClientInfo: ClientInfo{
 				Name:    "pchat",
 				Version: "1.0.0",
