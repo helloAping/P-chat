@@ -718,3 +718,83 @@ CHANGELOG.md                                    +60
   - 旧 client 不发 `user_message_id` 给 `/regenerate` 也会返回 400（已有端点，无破坏）
   - 旧 client 不解析 `id:` 行也能正常工作（`ev.seq` 为 undefined，UI 不渲染）
   - P0-1 recovery 是 best-effort（snapshot 失败仅 console.warn，不影响主流程）
+
+---
+
+### v1.0.8 — 代码高亮 + 上下文检查器 + 工具 dry-run
+
+第三轮"功能 + UX"优化，3 个独立可交付项。
+
+#### 用户可见功能
+
+| 项 | 体验提升 |
+| --- | --- |
+| **P2-2 代码高亮** | 代码块按语言带 syntax 颜色（14 个主流语言：ts/js/py/go/rs/java/json/yaml/bash/sql/xml/css/md + 常见别名）；未识别语言 fallback 到自动检测不 crash |
+| **P2-3 上下文检查器** | TopBar 加 📊 按钮，右侧滑出抽屉：context window 利用率进度条（> 60% 黄，> 80% 红）+ per-message token 列表 + compressed summary 折叠块 |
+| **P2-4 工具 dry-run** | `exec_command` / `read_file` / `write_file` 加 `dry_run: true` 参数；UI 用 prompt "干跑 X" 触发，ToolCallCard 显示 `dry-run` chip 标明是预览未执行 |
+
+#### Bug 修复
+
+- 无
+
+#### 重构
+
+- **`sendOrDrop` 用 closure** 替代 `*atomic.Uint64` 传参（避免 41 处 call site 改签名）— 上一轮已做
+- **`marked-highlight` 扩展** 替代 `marked` 内置 `highlight` 选项（v12 移除）
+
+#### 周边优化
+
+- **vite alias + dedupe**：`marked` / `marked-highlight` 强制解析到 frontend/node_modules，npm hoisting 不会引入重复实例
+- **highlight.js 自定义主题**：`@import 'highlight.js/styles/github-dark.css'` + `.hljs { background: transparent }` 保留 P-Chat 暗色表面
+- **ContextMessage 精简结构**：inspector 只返 role/tokens/preview/is_tool_result，**不带 parts[]**（响应小 10x）
+
+#### 依赖
+
+- 新增 `marked-highlight@^2.2.4`（dev 依赖，~5KB）
+- 已有的 `highlight.js@^11.9.0` 首次被实际使用
+
+#### 测试
+
+- `internal/server/handler_context_test.go`（新）— 3 个用例：EmptySession / BasicCounting / ToolResultFlagged
+- `internal/tool/handlers_test.go`（append）— 3 个用例：TestExecCommand_DryRun / TestReadFile_DryRun / TestWriteFile_DryRun
+
+前端未做单元测试（项目暂无 vitest 基础设施）：
+- `vue-tsc -b` + `npm run build` 通过
+- 浏览器手动验证高亮 + 抽屉 + dry-run chip
+
+#### 改动统计
+
+```
+docs/plans/round3-syntax-and-branching-plan.md    +326 (新)
+internal/agent/agent_seq_test.go                    +115 (新, round 2)
+internal/server/handler.go                          +185
+internal/server/handler_context_test.go             +181 (新)
+internal/server/handler_snapshot_test.go            +174 (新, round 2)
+internal/server/handler_regenerate_test.go           +206 (新, round 2)
+internal/server/server.go                            +5
+internal/tool/registry.go                           +127
+internal/tool/handlers_test.go                      +94
+frontend/src/api/client.ts                          +40
+frontend/src/components/ChatWindow.vue              +8
+frontend/src/components/ContextInspectorDrawer.vue  +247 (新)
+frontend/src/components/ToolCallCard.vue            +36
+frontend/src/components/ToolConfirmModal.vue        +18
+frontend/src/components/TopBar.vue                   +22
+frontend/src/main.ts                                +88
+frontend/src/stores/chat.ts                         +65
+frontend/src/style.css                              +30
+frontend/vite.config.ts                             +12
+frontend/package.json                               +1 (marked-highlight)
+.agents/docs/frontend.md                            +30
+.agents/docs/server.md                              +18
+.agents/docs/tool.md                                +30
+CHANGELOG.md                                        +70
+```
+
+#### 升级说明
+
+- 无 schema 迁移
+- 无破坏性 API 变化（新端点 + 新工具字段，老 client 不感知）
+- dry_run 字段对老 client 透明（默认 false = 原行为）
+- context inspector 是只读 GET，零副作用
+- 代码高亮：旧 client 仍可工作（marked 仍能 parse，只是没颜色）

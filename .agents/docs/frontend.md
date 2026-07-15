@@ -172,6 +172,42 @@ header 的 📋 复制按钮可点（stopPropagation 防 toggle）。
 `api.streamRegenerate` → 走正常 stream 路径。auto-continue
 从 0 重新计数（算新 stream）。
 
+### 10. Round 3 增强 (2026-07-15)
+
+#### P2-2 代码高亮
+
+`main.ts` 注册 14 个常用语言（ts/js/py/go/rs/java/json/yaml/bash/sql/xml/css/md），
+用 `marked-highlight` 扩展把 highlight.js 接到 `Marked` instance。
+MessageBubble 的 `marked.parse(...)` 通过全局 mirror 自动获得高亮。
+`style.css` 末尾 `@import 'highlight.js/styles/github-dark.css'` +
+自定义 `.hljs { background: transparent }`（保留 P-Chat 表面色）。
+
+`vite.config.ts` 加 `marked` / `marked-highlight` alias + dedupe 避免 npm
+hoisting 让 marked-highlight 解析到根 node_modules。
+
+#### P2-3 上下文检查器
+
+`ContextInspectorDrawer.vue`：NDrawer 右侧滑出，顶部 NProgress 显示
+context window 利用率（> 60% 黄，> 80% 红，与 tryAutoCompact 阈值一致），
+中部 per-message 列表（role badge + token 数 + preview），底部 NCollapse
+显示 compressed summary。
+
+`chat.ts`：`state.contextInspector` 字段 (open/loading/error/data) +
+`openContextInspector` / `closeContextInspector` / `loadContextInspector` actions。
+重开刷新（in-flight 跳过 spinner）。
+
+`TopBar.vue` 加 `BarChart3` 按钮触发 `openContextInspector(state.currentID)`。
+`ChatWindow.vue` 挂载 Drawer 组件。
+
+#### P2-4 工具 dry-run
+
+`ToolCallCard.vue` 检测 `args.dry_run === true` 显示 `dry-run` pill chip
+(brand-50 背景)。折叠态可见，告知用户"这个工具是预览未实际执行"。
+
+UX 决策：`ToolConfirmModal` 不加"先干跑一次"按钮（避免新增 server 端点 /
+复杂状态机）。改用 prompt 触发：用户打"干跑 shell_command X" → LLM 自加
+`dry_run: true` → ToolCallCard 显示 chip。
+
 ## 修改指南
 
 ### 要添加新的 SSE 事件类型

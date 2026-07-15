@@ -129,6 +129,17 @@ SendMessage 和 Regenerate 共享的 SSE 写循环：
 设 header + 写 `data: <json>\nid: <N>\n\n`（P3-1 顺序）+ 强制 Flush。
 新增 SSE 端点应复用此函数，避免重复实现。
 
+#### ContextInspector (P2-3)
+
+`GET /api/v1/sessions/:id/context` — 返回 `{session_id, provider, model,
+context_window, estimated_tokens, usable_tokens, utilization_pct,
+compressed_summary, messages:[{role, tokens, preview, is_tool_result}]}`。
+
+- 复用 `buildLLMMessages` + `llm.EstimateTokensMessages` 拿 LLM-bound token 估算
+- compSummary 加成 system 消息（与 prompt 拼接方式一致）
+- 利用率 = estimated / usable * 100，颜色阈值 60%/80% 跟 tryAutoCompact 一致
+- 响应小（~10KB for 200 messages），不带 parts[]
+
 ### 7. 知识库 API
 
 `knowledge_api.go` 提供完整的知识库生命周期管理：

@@ -90,6 +90,28 @@ type SandboxChecker interface {
 
 `todo_write` 的工具结果通过 `PersistTodos` 持久化到 SQLite。`GET /sessions/:id/todos` 可在服务器重启后重新加载。
 
+### 7. dry_run 模式 (P2-4, 2026-07-15)
+
+`exec_command` / `read_file` / `write_file` 三个工具的 schema 加了
+`dry_run: bool` 字段（默认 false）。当设为 true：
+
+- `exec_command`：跳过 `exec.CommandContext`，返回
+  `[dry-run] would execute: <cmd>` 预览（仍走 sandbox + upload-dir 检查）
+- `read_file`：`os.Stat` 拿 size / mode / modified，附 200 字节 head
+  预览（文件 > 1MB 跳过 head），不调用 `readFileForTool`
+- `write_file`：报 content 大小 + 现有文件 (if any) 状态 + 200 字节
+  head，不调用 `writeFile`
+
+**安全**：dry_run 走相同 sandbox / upload-dir 校验，无法 bypass。
+LLM 调 tool 必然经过 handler，前端直接调也受 sandbox 保护。
+
+**触发方式**（v1）：
+- LLM 自加 `dry_run: true`（用户 prompt "干跑 X"）
+- 不在 `ToolConfirmModal` 加"先干跑"按钮（避免新增 server 端点 / 状态机）
+
+**前端展示**：`ToolCallCard` header 检测 `args.dry_run === true` 显示
+`dry-run` pill chip（brand-50 背景），折叠态可见。
+
 ## 修改指南
 
 ### 要添加新工具
