@@ -2063,6 +2063,93 @@ export function endStream(id: string) {
   delete state.streaming[id]
 }
 
+// regenerateMessage is the P1-3 entry point. The
+// MessageBubble calls this when the user clicks "↻
+// 重新生成" on an assistant bubble. The flow:
+//
+//   1. Locate the user message that precedes the target
+//      assistant bubble (the regen target is the
+//      user message — the server deletes everything
+//      after it).
+//   2. Pop the trailing assistant message from the
+//      local list. The server will stream a new one
+//      back live, and a stale local bubble would
+//      conflict with the parts the chat store
+//      appends from the SSE stream.
+//   3. Call api.streamRegenerate. The server
+//      physically truncates the DB rows and re-runs
+//      the agent loop. The SSE events arrive on
+//      opts.onEvent and are routed through
+//      appendStreamEvent just like a normal send.
+//
+// The function is intentionally NOT re-entrant: the
+// chat store's `state.streaming[id]` flag prevents
+// two regen calls on the same session from running
+// in parallel (same guard the InputArea send path
+// uses).
+export async function regenerateMessage(
+  sessionId: string,
+  userMessageId: number,
+): Promise<void> {
+  if (!sessionId || !userMessageId) return
+  if (state.streaming[sessionId]) {
+    // Another stream is already running for this
+    // session. Bail — the user can retry once the
+    // current stream finishes.
+    return
+  }
+  const msgs = state.sessionMessages[sessionId]
+  if (!msgs) return
+
+  // Pop the trailing assistant message (if any). The
+  // server is about to delete it server-side; we
+  // delete it locally too so the new stream can
+  // rebuild the bubble from scratch.
+  // We only pop if the last message is an assistant —
+  // if the user clicked regen on a bubble that's
+  // already in a different position, bail.
+  const last = msgs[msgs.length - 1]
+  if (last && last.role === 'assistant') {
+    msgs.pop()
+  } else {
+    // Trailing message is a user / system message —
+    // nothing to pop. The regen endpoint will still
+    // work (it deletes from user_message_id+1
+    // onwards and the user prompt drives the new
+    // reply).
+  }
+
+  // Start a fresh stream slot so the chat store
+  // treats this as a live turn (enables the
+  // streaming spinner, prevents concurrent regen).
+  const ctrl = new AbortController()
+  state.streaming[sessionId] = { ctrl, asstContent: '' }
+  // Pre-create the trailing assistant bubble so the
+  // placeholder is reachable — appendStreamEvent
+  // relies on this for content / thinking deltas.
+  msgs.push({ role: 'assistant', content: '', parts: [] })
+
+  const meta = state.sessionMeta[sessionId] || ({} as any)
+  try {
+    await api.streamRegenerate(sessionId, userMessageId, {
+      provider: meta.provider,
+      model: meta.model,
+      style: meta.style,
+      signal: ctrl.signal,
+      // P0-1: same recovery path on stream drop. The
+      // server has already truncated the rows, so
+      // the snapshot returns the freshly-rebuilt
+      // assistant message parts.
+      onStreamDrop: ({ lastSeq, reason }) => {
+        recoverMissingParts(sessionId, lastSeq, reason).catch(() => {})
+      },
+      onEvent: (ev) => appendStreamEvent(sessionId, ev),
+    })
+  } finally {
+    endStream(sessionId)
+  }
+}
+
 export function submitQuestionAnswer(answers: Record<string, string>) {
   const pq = state.pendingQuestion[state.currentID]
   if (pq) {

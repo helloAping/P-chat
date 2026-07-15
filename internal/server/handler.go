@@ -2408,17 +2408,23 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	}
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
+	h.respondSSE(c, stream, id, provider, model)
+}
 
+// respondSSE writes a chat stream to the response. Used
+// by both SendMessage and the P1-3 Regenerate endpoint —
+// both paths produce an `agent.ChatStreamChunk` channel
+// and need the same SSE envelope (data + id, flush
+// per-frame, done-handling). Keep this the only place
+// that knows how an internal chunk becomes wire bytes.
+func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk, sessionID, provider, model string) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
-	c.Header("X-Session-ID", id)
+	c.Header("X-Session-ID", sessionID)
 	c.Header("X-Provider", provider)
 	c.Header("X-Model", model)
-
-	// Flush headers immediately so the browser knows this is
-	// a streaming response (not waiting for full body).
 	c.Writer.Flush()
 
 	c.Stream(func(w io.Writer) bool {
@@ -2433,10 +2439,10 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		}
 		ev := chunkToEvent(chunk, provider, model)
 		if chunk.Done {
-			if uid := h.store.GetLastUserMessageID(id); uid > 0 {
+			if uid := h.store.GetLastUserMessageID(sessionID); uid > 0 {
 				ev.UserMessageID = uid
 			}
-			if lid := h.store.GetLastMessageID(id); lid > 0 {
+			if lid := h.store.GetLastMessageID(sessionID); lid > 0 {
 				ev.LastMessageID = lid
 			}
 		}
@@ -2444,28 +2450,11 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
 		}
 		data, _ := json.Marshal(ev)
-		// P3-1: emit the standard SSE `id:` line so the
-		// browser's EventSource and our fetch-path parser
-		// can attribute events to a stable per-stream
-		// position. Done in the same fmt.Fprintf as the
-		// `data:` payload so a single syscall writes the
-		// whole frame. Zero (the first chunk's seq) is
-		// suppressed as 0 to avoid "id: 0\nid: 0\n"
-		// bookkeeping noise on the first event; non-zero
-		// seqs are written verbatim.
-		//
-		// The \n\n terminator stays at the end so the
-		// existing `data: ...\n\n` parser path is
-		// unchanged. Final frame is `data: ...\nid: N\n\n`.
+		// P3-1: data + id frame, see SendMessage for the
+		// rationale.
 		if _, err := fmt.Fprintf(w, "data: %s\nid: %d\n\n", data, ev.Seq); err != nil {
 			return false
 		}
-		// Flush after every event so the client sees it
-		// immediately, even when the next event is far
-		// away (e.g. the question tool blocks waiting
-		// for user input). Gin's stream writer already
-		// calls Flush(), but belt-and-suspenders for
-		// reverse-proxy scenarios (Wails desktop GUI).
 		if fl, ok := c.Writer.(http.Flusher); ok {
 			fl.Flush()
 		}
@@ -2522,6 +2511,144 @@ func toolStatusFromChunkStep(step, errMsg string) string {
 		return "start"
 	}
 	return "start"
+}
+
+// RegenerateRequest is the body of POST
+// /api/v1/sessions/:id/regenerate. The user_message_id
+// is the SQLite row id of the user message whose
+// assistant reply should be re-produced. The handler
+// physically deletes every message with id > user_message_id
+// in the same conversation, then re-runs the agent loop
+// from scratch (the user message itself stays).
+//
+// Why physical delete (not soft-mark): the chat store
+// reads back the conversation as a single source of
+// truth. Soft marks would surface as "ghost" rows in
+// the assistant message list until something explicitly
+// reaped them, and the per-session meta's
+// last_message_id pointer would also need to roll back
+// to the right value. The existing rollback code path
+// already does the same physical delete + meta rewrite
+// (DeleteMessagesFrom), and we don't put the result on
+// the undo stack because regen is a normal flow, not
+// a destructive op.
+type RegenerateRequest struct {
+	UserMessageID int64 `json:"user_message_id" binding:"required"`
+}
+
+// Regenerate re-runs the agent loop for the assistant
+// reply of a given user message. The user message itself
+// is preserved; everything after it in the conversation
+// is deleted. See RegenerateRequest for the rationale on
+// physical delete vs soft mark.
+func (h *Handler) Regenerate(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	if _, err := h.store.GetConversation(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	var req RegenerateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.UserMessageID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_message_id must be > 0"})
+		return
+	}
+
+	// Validate: the row must exist, must belong to this
+	// session, and must be a user message. Without the
+	// role check, a malicious / buggy client could pass
+	// the id of an assistant message and the agent loop
+	// would re-run with no user prompt at all.
+	if err := h.store.ValidateUserMessageID(id, req.UserMessageID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Physical delete: from the user message id, every
+	// later row in the same conversation is removed.
+	// DeleteMessagesFrom returns the deleted rows but
+	// regen doesn't put them on the undo stack — the
+	// user can re-send to get them back if they want.
+	// last_message_id is rewritten by DeleteMessagesFrom
+	// via the conversations metadata update path.
+	if _, err := h.store.DeleteMessagesFrom(id, req.UserMessageID+1); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "truncate failed: " + err.Error()})
+		return
+	}
+
+	// Resolve style / provider / model the same way
+	// SendMessage does (body override > per-session >
+	// config default). The RegenerateRequest body is
+	// intentionally minimal — we don't let the client
+	// change style / model on regen to keep the diff
+	// small and avoid surprising model swaps. Future
+	// iterations could accept overrides here.
+	styleStr := h.sessionStyle(id)
+	if styleStr == "" {
+		styleStr = string(style.Tech)
+	}
+	if def := style.Style(h.getCfg().Style.Default); def != "" && styleStr == "" {
+		styleStr = string(def)
+	}
+	provider := h.sessionProvider(id)
+	if provider == "" {
+		provider = h.getCfg().LLM.Default
+	}
+	model := h.sessionModel(id, provider)
+
+	meta := h.ensureMetaLoaded(id)
+	lastComp := h.store.LastCompressedIDFor(id)
+	var histMsgs []llm.ChatMessage
+	var compSummary string
+	if lastComp > 0 {
+		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, 0, lastComp)
+		compSummary = h.store.CompressedSummaryFor(id)
+	} else {
+		histMsgs = h.store.GetChatMessagesFor(id, 0)
+	}
+	// Note: the user message at UserMessageID is still in
+	// histMsgs (we deleted from id+1 onwards). The agent
+	// loop sees it as the latest message and continues
+	// from there — the user prompt drives the new reply.
+	// We do NOT append a fresh user message; the prompt
+	// already lives in the conversation.
+	msgs := buildLLMMessages(histMsgs)
+
+	chatReq := agent.ChatRequest{
+		Style:             style.Style(styleStr),
+		Provider:          provider,
+		Model:             model,
+		Messages:          msgs,
+		ReasoningEffort:   meta.ReasoningEffort,
+		CompressedSummary: compSummary,
+		SessionID:         id,
+		ProjectRoot:       meta.ProjectPath,
+		SkillContext:      "",
+		PlanMode:          meta.PlanMode,
+		PermissionLevel:   meta.PermissionLevel,
+		KBBase:            meta.KnowledgeBase,
+		AutoContinue:      h.sessionAutoContinue(id),
+	}
+
+	// Same session-locks pattern as SendMessage so a
+	// concurrent regen + send on the same session can't
+	// interleave writes.
+	if _, loaded := h.sessionLocks.LoadOrStore(id, struct{}{}); loaded {
+		c.JSON(http.StatusConflict, gin.H{"error": "a message is already being processed for this session"})
+		return
+	}
+	defer h.sessionLocks.Delete(id)
+
+	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
+	h.respondSSE(c, stream, id, provider, model)
 }
 
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {

@@ -174,6 +174,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// first, with the full metadata blob (which carries
 		// the persisted parts[]). See handler.go:SnapshotRecovery.
 		api.GET("/sessions/:id/snapshot", h.SnapshotRecovery)
+		// P1-3: regenerate the assistant reply for a given
+		// user message. Physically deletes everything after
+		// that user message in the conversation, then re-runs
+		// the agent loop. See handler.go:Regenerate.
+		api.POST("/sessions/:id/regenerate", h.Regenerate)
 		api.POST("/sessions/:id/compress", h.CompressConversation)
 		api.PATCH("/sessions/:id/reasoning-effort", h.SetReasoningEffort)
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)

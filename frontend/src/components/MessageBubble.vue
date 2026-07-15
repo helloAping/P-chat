@@ -68,7 +68,7 @@ function renderMd(text: string): string {
 }
 import { useMessage, useDialog } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
-import { state } from '../stores/chat'
+import { state, regenerateMessage } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import SubAgentCard from './SubAgentCard.vue'
@@ -520,12 +520,74 @@ const showAssistantHeader = computed(() =>
 //   - copy:   always available (copies the visible text)
 //   - fork:   user only (PR #2 feature, kept)
 //   - more:   reserved for future (model switch, etc.)
+//   - regenerate: trailing assistant message only (P1-3)
 const canFork = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
 const canRollback = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
+// P1-3: regenerate is only meaningful on the trailing
+// assistant message — regenerating an older reply would
+// leave newer messages in an inconsistent state (the
+// server truncates from the user_message_id+1, which
+// would clobber everything newer). We use `isLast` as
+// a proxy for "trailing" because MessageBubble doesn't
+// have a direct trailing-message prop.
+const isLast = computed(() => {
+  const sid = state.currentID
+  const msgs = state.sessionMessages[sid]
+  if (!msgs || msgs.length === 0) return false
+  return msgs[msgs.length - 1] === props.message
+})
+const canRegenerate = computed(() =>
+  props.message.role === 'assistant' && isLast.value && !props.streaming
+)
+// regenerating is true while the streamRegenerate call
+// is in flight; we lock the button to prevent double-
+// clicks and show a spinner instead of the static icon.
+const regenerating = ref(false)
+async function onRegenerate() {
+  if (regenerating.value) return
+  // Find the user message that precedes this assistant
+  // bubble. Walk back through the local message list
+  // until we find a role='user' row; that's the regen
+  // target. The server will delete everything after it
+  // and re-run the agent loop.
+  const sid = state.currentID
+  const msgs = state.sessionMessages[sid]
+  if (!msgs) return
+  let userMessageId = 0
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m.role === 'user' && m.id) {
+      userMessageId = m.id
+      break
+    }
+  }
+  if (!userMessageId) {
+    // Fallback: the user message id may not be set on
+    // older rows. The server's regen endpoint requires
+    // an id, so we can't proceed without one. The
+    // button is only shown on the trailing assistant
+    // bubble, which in practice always has a user
+    // message in front of it. If the id is missing,
+    // something deeper is wrong (e.g. the message was
+    // loaded from a pre-id schema); bail silently.
+    return
+  }
+  regenerating.value = true
+  try {
+    await regenerateMessage(sid, userMessageId)
+  } catch (e: any) {
+    // surface the error so the user knows regen failed;
+    // the chat store will have already moved on (the
+    // trailing placeholder may be empty).
+    console.warn('[regen] failed:', e?.message || e)
+  } finally {
+    regenerating.value = false
+  }
+}
 </script>
 
 <template>
@@ -767,6 +829,27 @@ const canRollback = computed(() =>
             @click="onRollback"
           >
             <Undo2 :size="13" class="bubble-action-icon" />
+          </button>
+          <!-- P1-3 regenerate. Only shown on the trailing
+               assistant message (we don't allow re-running
+               a reply that's no longer the latest one).
+               Click pops the local bubble, calls the
+               /regenerate endpoint, and re-streams the new
+               reply through the regular chat store path.
+               Uses the existing Loader2 icon (spinning
+               during the regen) to avoid pulling in a new
+               icon dependency. -->
+          <button
+            v-if="canRegenerate"
+            type="button"
+            class="bubble-action-btn bubble-action-regenerate"
+            :disabled="regenerating"
+            title="重新生成回复"
+            aria-label="重新生成回复"
+            @click="onRegenerate"
+          >
+            <Loader2 :size="13" :class="regenerating ? 'bubble-action-icon spin' : 'bubble-action-icon'" />
+            <span v-if="!regenerating" class="bubble-action-text">重答</span>
           </button>
           <button
             type="button"

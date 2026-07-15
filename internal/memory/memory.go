@@ -1677,6 +1677,36 @@ func (s *Store) GetLastUserMessageID(convID string) int64 {
 	return id
 }
 
+// ValidateUserMessageID is the P1-3 guard used by the
+// Regenerate endpoint. Returns nil when msgID exists in
+// convID AND has role='user'. Returns a descriptive error
+// otherwise so the handler can pass it straight back to
+// the client (gin.H{"error": err.Error()}). The check is
+// deliberately strict — a regenerate of an assistant
+// message id (mistake or malice) would leave the agent
+// loop running with no user prompt to drive it.
+func (s *Store) ValidateUserMessageID(convID string, msgID int64) error {
+	_ = s.Flush()
+	if msgID <= 0 {
+		return fmt.Errorf("user_message_id must be > 0, got %d", msgID)
+	}
+	var role string
+	err := s.db.QueryRow(
+		`SELECT role FROM messages WHERE conversation_id = ? AND id = ?`,
+		convID, msgID,
+	).Scan(&role)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("message id %d not found in session %s", msgID, convID)
+	}
+	if err != nil {
+		return err
+	}
+	if role != "user" {
+		return fmt.Errorf("message id %d has role %q, want \"user\"", msgID, role)
+	}
+	return nil
+}
+
 // GetLastMessageID returns the highest SQLite row id for the given
 // session (the most recently inserted message of any role). Returns
 // 0 when the session has no messages.

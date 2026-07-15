@@ -1301,6 +1301,96 @@ export const getSessionSnapshot = (
     `/api/v1/sessions/${encodeURIComponent(sessionId)}/snapshot?after_seq=${afterSeq}`,
   )
 
+// ---- P1-3 regenerate ----
+
+// streamRegenerate is the P1-3 entry point. Posts to
+// /api/v1/sessions/:id/regenerate with the
+// user_message_id, then drives opts.onEvent from the
+// SSE response. The server physically deletes every
+// message with id > user_message_id in the
+// conversation, then re-runs the agent loop. Same
+// shape as streamMessages; we duplicate the SSE
+// parsing because the URL is different. The two
+// functions are kept in sync by hand (small enough
+// surface to be manageable).
+//
+// The caller is responsible for clearing the trailing
+// assistant message from the local state BEFORE calling
+// this — the new server-side assistant will be streamed
+// in live, and a stale local bubble would conflict.
+export async function streamRegenerate(
+  sessionId: string,
+  userMessageId: number,
+  opts: Omit<SendOptions, 'message'>,
+): Promise<void> {
+  const base = directBackendURL()
+  const url = `${base}/api/v1/sessions/${encodeURIComponent(sessionId)}/regenerate`
+  const body = JSON.stringify({ user_message_id: userMessageId })
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body,
+    signal: opts.signal,
+  })
+  if (!resp.ok || !resp.body) {
+    throw new Error(`regenerate: HTTP ${resp.status}: ${resp.statusText}`)
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buf = ''
+  let dataBuf = ''
+  let lastSeq = -1
+  let done = false
+
+  while (!done) {
+    let r: ReadableStreamReadResult<Uint8Array>
+    try { r = await reader.read() }
+    catch (e: any) {
+      if (!opts.signal?.aborted && opts.onStreamDrop) {
+        try { opts.onStreamDrop({ lastSeq, reason: e?.message || 'read failed' }) } catch { /* */ }
+      }
+      throw new Error(`regenerate stream: ${e?.message || e}`)
+    }
+    done = r.done
+    if (r.value) buf += decoder.decode(r.value, { stream: true })
+
+    let nl: number
+    while ((nl = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, nl)
+      buf = buf.slice(nl + 2)
+      dataBuf = ''
+      let frameSeq: number | undefined
+      for (const line of block.split('\n')) {
+        if (line.startsWith('data:')) {
+          if (dataBuf.length > 0) dataBuf += '\n'
+          dataBuf += line.slice(5).trimStart()
+        } else if (line.startsWith('id:')) {
+          const raw = line.slice(3).trim()
+          const n = Number(raw)
+          if (raw && Number.isFinite(n)) frameSeq = n
+        }
+      }
+      const data = dataBuf.trim()
+      if (!data || data === '[DONE]') continue
+      let ev: StreamEvent
+      try { ev = JSON.parse(data) as StreamEvent } catch {
+        console.warn('regenerate SSE parse error', 'raw:', data.slice(0, 200))
+        continue
+      }
+      if (frameSeq !== undefined) ev.seq = frameSeq
+      if (import.meta.env.DEV && typeof ev.seq === 'number') {
+        if (ev.seq <= lastSeq) console.warn(`[regen] non-monotonic seq: prev=${lastSeq} now=${ev.seq}`)
+        lastSeq = ev.seq
+      }
+      try { opts.onEvent(ev) } catch (inner) {
+        console.warn('[regen] event handler threw, continuing:', inner)
+      }
+    }
+  }
+}
+
 // ---- Knowledge API ----
 
 export interface KnowledgeConfig {
