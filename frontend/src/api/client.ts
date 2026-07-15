@@ -1391,6 +1391,46 @@ export async function streamRegenerate(
   }
 }
 
+// ---- P2-3 context inspector ----
+
+// ContextMessage is one row of the inspector's
+// per-message breakdown. Distinct from `Message` (the
+// full chat row) because the inspector only needs a
+// preview + token count + role tag — no parts[], no
+// attachments, no metadata. See
+// docs/plans/round3-syntax-and-branching-plan.md §4.
+export interface ContextMessage {
+  role: 'user' | 'assistant' | 'tool' | 'system' | string
+  tokens: number
+  preview: string
+  is_tool_result: boolean
+  is_compressed?: boolean
+}
+
+// ContextInspector is the wire shape of
+// GET /api/v1/sessions/:id/context. Powers the
+// "上下文" drawer in the chat UI. Token counts are
+// estimates (the wire says so implicitly — the
+// numbers are not from a real LLM tokenizer).
+export interface ContextInspector {
+  session_id: string
+  provider: string
+  model: string
+  context_window: number
+  estimated_tokens: number
+  usable_tokens: number
+  utilization_pct: number
+  compressed_summary?: string
+  messages: ContextMessage[]
+}
+
+export const getSessionContext = (
+  sessionId: string,
+): Promise<ContextInspector> =>
+  jsonFetch<ContextInspector>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/context`,
+  )
+
 // ---- Knowledge API ----
 
 export interface KnowledgeConfig {

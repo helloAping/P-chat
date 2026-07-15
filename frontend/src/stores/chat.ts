@@ -123,6 +123,17 @@ export const state = reactive({
     reason: string
     shownAt: number
   },
+  // P2-3: context inspector drawer state. When non-null
+  // the drawer is open with this payload. Loading and
+  // error states are tracked separately so the drawer
+  // can show a spinner / retry button without losing
+  // its open/close state across reloads.
+  contextInspector: null as null | {
+    open: boolean
+    loading: boolean
+    error: string | null
+    data: api.ContextInspector | null
+  },
 })
 
 export const currentMessages = computed(() =>
@@ -2046,6 +2057,60 @@ export function appendSystemMessage(text: string) {
   // /compress / /status slash commands could echo one if
   // a prior turn failed).
   state.sessionMessages[cid].push({ role: 'system', content: scrubPhantomError(text) })
+}
+
+// --- P2-3 context inspector ---
+
+// openContextInspector opens the drawer and kicks off
+// the fetch. Re-opening while a previous load is
+// in-flight is a no-op (the in-flight promise is
+// allowed to complete). Re-opening after a successful
+// load also refetches — the user may have sent new
+// messages since the last open and the inspector
+// should reflect the current state.
+export function openContextInspector(sessionId: string) {
+  if (!sessionId) return
+  const cur = state.contextInspector
+  state.contextInspector = {
+    open: true,
+    loading: !cur?.data, // skip the spinner on refresh
+    error: null,
+    data: cur?.data ?? null,
+  }
+  void loadContextInspector(sessionId)
+}
+
+// closeContextInspector is purely UI state — the
+// cached data is kept so re-opening is instant. The
+// caller (drawer's "×" button) toggles `open` only;
+// the next open will refresh.
+export function closeContextInspector() {
+  if (!state.contextInspector) return
+  state.contextInspector = { ...state.contextInspector, open: false }
+}
+
+// loadContextInspector pulls the per-message token
+// breakdown + utilisation for the active session.
+// Errors land in `state.contextInspector.error` so the
+// drawer can show a retry button without losing the
+// open/close state.
+export async function loadContextInspector(sessionId: string): Promise<void> {
+  if (!state.contextInspector) {
+    state.contextInspector = { open: true, loading: true, error: null, data: null }
+  } else {
+    state.contextInspector.loading = true
+    state.contextInspector.error = null
+  }
+  try {
+    const data = await api.getSessionContext(sessionId)
+    if (!state.contextInspector) return // closed mid-load
+    state.contextInspector.data = data
+    state.contextInspector.loading = false
+  } catch (e: any) {
+    if (!state.contextInspector) return
+    state.contextInspector.error = e?.message || 'load failed'
+    state.contextInspector.loading = false
+  }
 }
 
 export function endStream(id: string) {

@@ -3,6 +3,7 @@ import { ref, nextTick, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { NSpin, useMessage } from 'naive-ui'
 import { ArrowDown, MessageSquare } from './icons'
 import MessageBubble from './MessageBubble.vue'
+import ContextInspectorDrawer from './ContextInspectorDrawer.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
 // QuestionPanel removed in 2026-07-09 — it duplicated
@@ -214,6 +215,13 @@ function messageKey(m: any, i: number): string | number {
         <span class="recovery-reason">{{ currentRecoveryBanner.reason }}</span>
       </div>
     </Transition>
+    <!-- P2-3: context inspector drawer. The drawer is
+         always mounted; visibility is bound to the
+         `state.contextInspector.open` flag so the
+         parent doesn't have to track it. The button
+         that opens it lives in TopBar; this template
+         just renders the panel. -->
+    <ContextInspectorDrawer />
     <!-- Plain scrollable container. We don't use NScrollbar
          here because its :native-scrollbar="false" path wraps
          the content in a custom-scrollbar div that conflicts
