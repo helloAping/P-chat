@@ -687,6 +687,14 @@ type StreamEvent struct {
 	// classified. The UI uses "vision_unsupported" to
 	// render a special chip on the offending user message.
 	ErrorKind string `json:"error_kind,omitempty"`
+	// Seq is the per-stream monotonic counter the agent
+	// stamps on every chunk (0, 1, 2, …). Surfaced on the
+	// wire both as a JSON field AND as the standard SSE
+	// `id:` line so the browser's native EventSource
+	// reconnection logic and our fetch-path parser can use
+	// it as a resume cursor. See P3-1 in
+	// docs/plans/round2-stream-and-render-plan.md.
+	Seq uint64 `json:"seq,omitempty"`
 }
 
 // --- Health / metadata ---
@@ -2370,7 +2378,20 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
 		}
 		data, _ := json.Marshal(ev)
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		// P3-1: emit the standard SSE `id:` line so the
+		// browser's EventSource and our fetch-path parser
+		// can attribute events to a stable per-stream
+		// position. Done in the same fmt.Fprintf as the
+		// `data:` payload so a single syscall writes the
+		// whole frame. Zero (the first chunk's seq) is
+		// suppressed as 0 to avoid "id: 0\nid: 0\n"
+		// bookkeeping noise on the first event; non-zero
+		// seqs are written verbatim.
+		//
+		// The \n\n terminator stays at the end so the
+		// existing `data: ...\n\n` parser path is
+		// unchanged. Final frame is `data: ...\nid: N\n\n`.
+		if _, err := fmt.Fprintf(w, "data: %s\nid: %d\n\n", data, ev.Seq); err != nil {
 			return false
 		}
 		// Flush after every event so the client sees it
@@ -2455,6 +2476,13 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		SubAgentFailureReason: chunk.SubAgentFailureReason,
 		ThinkingRewrite: chunk.ThinkingRewrite,
 		SessionStatus:  chunk.SessionStatus,
+		// Seq is the per-stream monotonic counter stamped by
+		// agent.sendOrDrop. Surfaced on the wire so the
+		// frontend (and curl) can debug reorder / drop
+		// issues — and so the P0-1 recovery flow can use
+		// it as a resume cursor. See P3-1 in
+		// docs/plans/round2-stream-and-render-plan.md.
+		Seq: chunk.Seq,
 		// Elapsed carries the duration the server stamped on the
 		// chunk. The agent sets it on the final "done" chunk AND
 		// on every sub_agent_* lifecycle close event (so the

@@ -971,6 +971,15 @@ export interface StreamEvent {
   // last_message_id is the highest row id in this session
   // (typically the assistant reply just produced).
   last_message_id?: number
+  // seq is the per-stream monotonic counter (0, 1, 2, …) the
+  // server stamps on every chunk and surfaces as the standard
+  // SSE `id:` line. Stable for the lifetime of one stream; not
+  // stable across streams. Used for debugging (dev tools
+  // console) and as the cursor for P0-1 recovery. Sub-agent
+  // chunks forwarded into the parent stream may break the
+  // parent's monotonic sequence — the seq field is still set,
+  // but the gap is intentional.
+  seq?: number
 }
 
 export async function submitConfirmResponse(sessionId: string, approved: boolean): Promise<void> {
@@ -1139,6 +1148,7 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
   const decoder = new TextDecoder('utf-8')
   let buf = ''
   let dataBuf = ''
+  let lastSeq = -1
   let done = false
 
   while (!done) {
@@ -1147,17 +1157,30 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
     if (r.value) {
       buf += decoder.decode(r.value, { stream: true })
     }
-    // Drain complete `data: ...\n\n` blocks from the buffer.
+    // Drain complete `data: ...\nid: N\n\n` blocks from the buffer.
+    // The server emits two-line frames (data + id) per P3-1;
+    // `id:` is the standard SSE event ID we parse into ev.seq.
     let nl: number
     while ((nl = buf.indexOf('\n\n')) >= 0) {
       const block = buf.slice(0, nl)
       buf = buf.slice(nl + 2)
-      // Parse the block — gather every `data: …` line.
+      // Parse the block — gather every `data: …` line into the
+      // payload buffer, and remember the most recent `id: N` line
+      // (server emits at most one per frame).
       dataBuf = ''
+      let frameSeq: number | undefined
       for (const line of block.split('\n')) {
         if (line.startsWith('data:')) {
           if (dataBuf.length > 0) dataBuf += '\n'
           dataBuf += line.slice(5).trimStart()
+        } else if (line.startsWith('id:')) {
+          // Standard SSE event ID line. Trim and parse; tolerate
+          // missing / non-numeric gracefully (P3-1 server always
+          // sends a number, but a legacy / proxy that strips the
+          // `id:` line must not break the parser).
+          const raw = line.slice(3).trim()
+          const n = Number(raw)
+          if (raw && Number.isFinite(n)) frameSeq = n
         }
       }
       const data = dataBuf.trim()
@@ -1166,6 +1189,18 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
       try { ev = JSON.parse(data) as StreamEvent } catch {
         console.warn('SSE parse error', 'raw:', data.slice(0, 200))
         continue
+      }
+      // Fall back to the frame's id-line when the payload's
+      // seq field is missing (defensive — server always sets
+      // both). Cross-check monotonicity in dev mode so a server
+      // regression that re-uses a seq is loud, not silent.
+      if (frameSeq !== undefined) ev.seq = frameSeq
+      if (import.meta.env.DEV && typeof ev.seq === 'number') {
+        if (ev.seq <= lastSeq) {
+          console.warn(`[stream] non-monotonic seq: prev=${lastSeq} now=${ev.seq} type=${ev.type}`)
+        }
+        lastSeq = ev.seq
+        console.debug(`[stream] seq=${ev.seq} type=${ev.type} ${ev.sub_agent ? `sub=${ev.sub_agent_task ?? ''}` : ''}`)
       }
       try {
         opts.onEvent(ev)

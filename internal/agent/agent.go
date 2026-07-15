@@ -395,6 +395,16 @@ type ChatRequest struct {
 }
 
 type ChatStreamChunk struct {
+	// Seq is the per-stream monotonic counter (0, 1, 2, …)
+	// assigned by sendOrDrop. Stable for the lifetime of one
+	// ChatStream call; NOT stable across streams. Surfaced on
+	// the wire as the standard SSE `id:` line by handler.go so
+	// the frontend (and curl) can attribute logs / events to a
+	// specific position. Sub-agent chunks forwarded into the
+	// parent stream do NOT carry a parent seq — they break the
+	// monotonic sequence intentionally because the sub-agent has
+	// its own counter.
+	Seq uint64 `json:"seq,omitempty"`
 	Content string `json:"content"`
 	// Thinking carries a delta of the model's reasoning /
 	// chain-of-thought text. Only populated by LLM clients
@@ -1192,7 +1202,26 @@ func (a *Agent) ChatStream(ctx context.Context, req ChatRequest) <-chan ChatStre
 // sendOrDrop attempts to send a chunk to ch. If ctx is cancelled,
 // the chunk is silently dropped so the producer can exit cleanly
 // rather than blocking forever on a consumer that has disconnected.
-func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, chunk ChatStreamChunk) {
+//
+// When nextSeq is non-nil, the chunk's Seq field is stamped with
+// the value returned by nextSeq() BEFORE the send. This gives every
+// stream a stable, debuggable per-stream order that the SSE handler
+// forwards as the standard `id:` line — see P3-1 in
+// docs/plans/round2-stream-and-render-plan.md. Pass nil from paths
+// that don't want seq (legacy callers, tests that don't assert
+// order, and — critically — sub-agent chunks forwarded through the
+// parent stream, which intentionally break the parent's monotonic
+// sequence).
+//
+// We pass a closure rather than a *atomic.Uint64 directly so callers
+// don't have to thread `&counter` through 40+ call sites — the
+// closure captures the local counter variable by reference. The
+// returned value is whatever the closure yields, typically
+// `seqCounter.Add(1) - 1` for the standard 0,1,2,… sequence.
+func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, chunk ChatStreamChunk) {
+	if nextSeq != nil {
+		chunk.Seq = nextSeq()
+	}
 	select {
 	case ch <- chunk:
 	case <-ctx.Done():
@@ -1204,6 +1233,18 @@ func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, chunk ChatStream
 // until it gives a final answer.
 func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatStreamChunk {
 	ch := make(chan ChatStreamChunk, 64)
+
+	// Per-stream monotonic counter for P3-1. sendOrDrop
+	// stamps each emitted chunk's Seq with nextSeq() (0, 1,
+	// 2, …). Surfaced on the wire as the SSE `id:` line by
+	// handler.go so the frontend (and curl) can debug
+	// reorder / drop issues. Sub-agent chunks forwarded
+	// through the parent stream do NOT increment this
+	// counter — the parent chunk they replace is dropped
+	// before reaching sendOrDrop, which leaves intentional
+	// gaps in the parent's sequence.
+	var seqCounter atomic.Uint64
+	nextSeq := func() uint64 { return seqCounter.Add(1) - 1 }
 
 	go func() {
 		defer close(ch)
@@ -1237,7 +1278,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		defer func() {
 			if r := recover(); r != nil {
 				stack := debug.Stack()
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase: "system",
 					Error: fmt.Sprintf("panic in agent: %v\n\n%s", r, stack),
 					Done:  true,
@@ -1261,7 +1302,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// means to the user.
 		start := time.Now()
 
-		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
 		availableTools := a.tools.List()
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
@@ -1282,16 +1323,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			for _, t := range availableTools {
 				names = append(names, t.Name)
 			}
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tools", Step: "tools", Message: fmt.Sprintf("可用工具 (%d): %s", len(availableTools), strings.Join(names, ", "))})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "tools", Step: "tools", Message: fmt.Sprintf("可用工具 (%d): %s", len(availableTools), strings.Join(names, ", "))})
 		} else {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tools", Step: "tools", Message: "未注册任何工具"})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "tools", Step: "tools", Message: "未注册任何工具"})
 			toolDefs = nil
 		}
 
-		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."})
 		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, availableTools, req.ProjectRoot, kbEnabled)
 		if err != nil {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true})
 			return
 		}
 		// Inject knowledge base context + index.
@@ -1320,13 +1361,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if req.ProjectRoot != "" {
 			systemPrompt += appendWorkingDirectoryBlock(req.ProjectRoot)
 		}
-		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))})
 		// P3-1: announce "busy" now that the system prompt
 		// is assembled and the first LLM call is imminent.
 		// The matching "idle" still fires from the
 		// outermost defer, so the UI gets a correct
 		// busy→idle envelope on every exit path.
-		sendOrDrop(ctx, ch, ChatStreamChunk{SessionStatus: "busy"})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{SessionStatus: "busy"})
 
 		// Append compressed summary if provided (from /compress).
 		if req.CompressedSummary != "" {
@@ -1367,11 +1408,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			protocol := a.protocolFor(req.Provider)
 			vision := func() bool { return a.modelSupportsVision(req.Provider, req.Model) }
 			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision)
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))})
 		}
 
 		if a.store != nil {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入消息到记忆")})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入消息到记忆")})
 			// Persist all user-facing messages (including
 			// image attachments as separate rows). Use the
 			// per-session variant so concurrent streams on
@@ -1425,9 +1466,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				"4. 风险 / 依赖 / 边界\n" +
 				"用户审阅后切换回构建模式执行。\n"
 			maxRounds = 1
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (可用 todo_write / question，最多单轮)"})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (可用 todo_write / question，最多单轮)"})
 		} else {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "plan", Step: "plan", Message: fmt.Sprintf("构建模式 — LLM 自主决定何时终止 (上限 %d 轮)", maxRounds)})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "plan", Step: "plan", Message: fmt.Sprintf("构建模式 — LLM 自主决定何时终止 (上限 %d 轮)", maxRounds)})
 		}
 
 		var totalIn, totalOut int
@@ -1469,7 +1510,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			roundNum := round
 			partsAcc = newPartsAccumulator()
 
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds})
 
 			var (
 				fullContent         string
@@ -1503,7 +1544,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Type:    llm.TypeText,
 					Content: fmt.Sprintf("注意：当前会话轮次即将达到上限（%d 轮，剩余约 %d 轮）。请开始收尾当前任务，优先完成最关键的未完成工作，避免开启需要多轮的新子任务。", maxRounds, maxRounds-round),
 				})
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase:    "llm",
 					Step:     "near-limit",
 					Message:  fmt.Sprintf("轮次接近上限（剩余 %d 轮），提醒 LLM 收尾", maxRounds-round),
@@ -1517,7 +1558,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// and rebuild the system prompt so the provider call
 			// doesn't fail with a 413. On the last round tools
 			// are disabled anyway so compact isn't worth it.
-			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds) {
+			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, ch, nextSeq, roundNum, maxRounds) {
 				continue
 			}
 
@@ -1539,7 +1580,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Type:    llm.TypeText,
 					Content: pickMaxStepsPrompt(maxStepsLang),
 				})
-				sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds})
 			}
 
 			// LLM stream with retry for recoverable errors
@@ -1550,7 +1591,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
 				if attempt > 1 {
 					backoff := time.Duration(attempt*attempt) * time.Second
-					sendOrDrop(ctx, ch, ChatStreamChunk{
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 						Phase:    "llm",
 						Step:     "retry",
 						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt, maxLLMRetries),
@@ -1596,7 +1637,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 								break // break inner stream loop, retry outer
 							}
 						}
-						sendOrDrop(ctx, ch, ChatStreamChunk{
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 							Phase:      "llm",
 							Error:      errMsg,
 							Suggestion: errSuggestion,
@@ -1620,12 +1661,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if chunk.Content != "" {
 					fullContent += chunk.Content
 					partsAcc.update(ChatStreamChunk{Content: chunk.Content})
-					sendOrDrop(ctx, ch, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
 				}
 				if chunk.Thinking != "" {
 					fullThinking += chunk.Thinking
 					partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
-					sendOrDrop(ctx, ch, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
 				}
 				if chunk.ToolCallDelta != nil {
 					tcd := chunk.ToolCallDelta
@@ -1647,7 +1688,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			// If we exhausted retries without success, surface the last error.
 			if retryableErr != nil {
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase: "llm",
 					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", maxLLMRetries, retryableErr),
 					Done:  true,
@@ -1659,7 +1700,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				toolCalls = append(toolCalls, *t)
 			}
 
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 
 		if len(toolCalls) == 0 {
 			toolCalls = parseMarkdownToolCalls(fullContent)
@@ -1688,11 +1729,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// phantom needs to be stripped there too.
 		if redacted, changed := redactPhantomErrors(fullContent); changed {
 			fullContent = redacted
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted})
 		}
 		if redactedT, changedT := redactPhantomErrors(fullThinking); changedT {
 			fullThinking = redactedT
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT})
 		}
 
 		// Build the assistant message for the conversation.
@@ -1736,7 +1777,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// execution would leak orphan tool_calls into
 			// the next round's history. Fall through to
 			// the tool execution block below.
-			a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds)
+			a.tryAutoCompact(ctx, &msgs, req, ch, nextSeq, roundNum, maxRounds)
 
 			// Append tool_call messages for each tool call.
 			//
@@ -1795,7 +1836,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							Type:    llm.TypeText,
 							Content: buildAutoContinuePrompt(list),
 						})
-						sendOrDrop(ctx, ch, ChatStreamChunk{
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 							Phase:    "auto-continue",
 							Step:     "todo-incomplete",
 							Message:  fmt.Sprintf("⚠ 检测到 %d 项未完成 todo，自动续 LLM (第 %d/%d 次)", pending, autoContinueCount, MaxAutoContinue),
@@ -1806,8 +1847,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 				}
 				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
-				sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
-				sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 				return
 			}
 
@@ -1816,7 +1857,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// re-append loop here. The two are merged into
 			// the single call above the tool_call append.
 
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds})
 
 			// Run tool calls in parallel when the LLM emitted more than one.
 			// Each call gets its own per-tool timeout derived from the parent
@@ -1843,7 +1884,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
 				partsAcc.update(startChunk)
-				sendOrDrop(ctx, ch, startChunk)
+				sendOrDrop(ctx, ch, nextSeq, startChunk)
 			}
 
 			// Each tool call gets its own event channel. The agent loop
@@ -1919,7 +1960,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							log.Printf("[forwarder] got question event (%d bytes)", len(ev.QuestionJSON))
 						}
 						partsAcc.update(ev)
-						sendOrDrop(ctx, ch, ev)
+						sendOrDrop(ctx, ch, nextSeq, ev)
 						if ev.QuestionJSON != "" {
 							log.Printf("[forwarder] forwarded question event to main ch")
 						}
@@ -2144,7 +2185,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolID: tc.ID, ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(errChunk)
-					sendOrDrop(ctx, ch, errChunk)
+					sendOrDrop(ctx, ch, nextSeq, errChunk)
 					toolMsg := llm.ChatMessage{
 						Role:      llm.RoleTool,
 						Type:      llm.TypeToolResult,
@@ -2180,7 +2221,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					roundAnyToolErrored = true
 					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(warnChunk)
-					sendOrDrop(ctx, ch, warnChunk)
+					sendOrDrop(ctx, ch, nextSeq, warnChunk)
 				} else {
 					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					// For tools whose result the frontend needs to
@@ -2199,7 +2240,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						okChunk.ToolResultFull = result.Content
 					}
 					partsAcc.update(okChunk)
-					sendOrDrop(ctx, ch, okChunk)
+					sendOrDrop(ctx, ch, nextSeq, okChunk)
 				}
 
 			llmContent := result.Content
@@ -2308,7 +2349,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			prevToolSig = curSig
 			prevErrored = curErrored
 			if stuckStreak >= stuckThreshold {
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase:   "stuck",
 					Step:    "stuck-loop",
 					Message: fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
@@ -2316,7 +2357,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
 				})
-				sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 				return
 			}
 
@@ -2363,7 +2404,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Type:    llm.TypeText,
 					Content: systemMsg,
 				})
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase:   "limit",
 					Step:    "same-tool-err-limit",
 					Message: statusMsg,
@@ -2383,9 +2424,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		if maxRounds > 0 {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 		}
-		sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 	}()
 
 	return ch
@@ -2591,6 +2632,7 @@ func (a *Agent) tryAutoCompact(
 	msgs *[]llm.ChatMessage,
 	req ChatRequest,
 	ch chan<- ChatStreamChunk,
+	nextSeq func() uint64,
 	roundNum, maxRounds int,
 ) bool {
 	if a.summarizer == nil || a.store == nil || req.SessionID == "" {
@@ -2606,7 +2648,7 @@ func (a *Agent) tryAutoCompact(
 		return false
 	}
 
-	sendOrDrop(ctx, ch, ChatStreamChunk{
+	sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 		Phase:    "compact",
 		Step:     "auto-compact",
 		Message:  fmt.Sprintf("上下文接近上限 (≈%d / %d tokens)，自动压缩历史…", total, llm.UsableContextWithBuf(ctxWindow, buf)+buf),
@@ -2616,7 +2658,7 @@ func (a *Agent) tryAutoCompact(
 
 	ok, summary, err := a.summarizer.Compress(ctx, req.SessionID)
 	if err != nil || !ok {
-		sendOrDrop(ctx, ch, ChatStreamChunk{
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 			Phase:   "compact",
 			Step:    "auto-compact-fail",
 			Message: fmt.Sprintf("自动压缩失败: %v", err),
@@ -2629,7 +2671,7 @@ func (a *Agent) tryAutoCompact(
 		usable := llm.UsableContextWithBuf(ctxWindow, buf)
 		if usable > 0 {
 			truncateToFit(msgs, usable)
-			sendOrDrop(ctx, ch, ChatStreamChunk{
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 				Phase:    "compact",
 				Step:     "auto-compact-fallback",
 				Message:  fmt.Sprintf("压缩失败，已截断上下文至 ≈%d tokens", llm.EstimateTokensMessages(*msgs)),
@@ -2642,7 +2684,7 @@ func (a *Agent) tryAutoCompact(
 		return false
 	}
 
-	sendOrDrop(ctx, ch, ChatStreamChunk{
+	sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 		Phase:   "compact",
 		Step:    "auto-compact-ok",
 		Message: "上下文已压缩，继续执行…",
