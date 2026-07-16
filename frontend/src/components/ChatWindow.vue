@@ -4,6 +4,7 @@ import { NSpin, useMessage } from 'naive-ui'
 import { ArrowDown, MessageSquare } from './icons'
 import MessageBubble from './MessageBubble.vue'
 import ContextInspectorDrawer from './ContextInspectorDrawer.vue'
+import RaceView from './RaceView.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
 // QuestionPanel removed in 2026-07-09 — it duplicated
@@ -222,6 +223,13 @@ function messageKey(m: any, i: number): string | number {
          that opens it lives in TopBar; this template
          just renders the panel. -->
     <ContextInspectorDrawer />
+    <!-- P2-5: race view. Replaces the single-pane
+         MessageList while a multi-LLM comparison is in
+         progress. The race state lives in
+         state.race (chat store); when null, the normal
+         single-pane messages-scroll renders below. -->
+    <RaceView v-if="state.race" />
+
     <!-- Plain scrollable container. We don't use NScrollbar
          here because its :native-scrollbar="false" path wraps
          the content in a custom-scrollbar div that conflicts
@@ -238,6 +246,7 @@ function messageKey(m: any, i: number): string | number {
          below stays pinned to the bottom of the viewport
          even when the message list is short. -->
     <div
+      v-if="!state.race"
       ref="messagesEl"
       class="messages-scroll"
       @scroll="onScroll"

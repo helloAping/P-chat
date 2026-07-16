@@ -134,6 +134,44 @@ export const state = reactive({
     error: string | null
     data: api.ContextInspector | null
   },
+  // P2-5: race mode state. When `race` is non-null,
+  // ChatWindow swaps the single MessageList for a
+  // RaceView that shows N panes streaming in parallel.
+  // The state is intentionally flat (not nested under
+  // a session id) because a race is per-user-action, not
+  // per-conversation — the user fires one race at a
+  // time, picks a winner, and the UI reverts to single-
+  // pane mode.
+  //
+  //   panes[i].paneId == the forked session's convId.
+  //   We fork the baseline BEFORE the trailing user
+  //   message so each pane's session has the same
+  //   history up to that point, then we send the same
+  //   user prompt to each pane with a different
+  //   (provider, model). The user picks one, and we
+  //   promote the winner to the new main session via
+  //   forkSession(winnerConvId, lastId).
+  race: null as null | {
+    id: string
+    baseSessionId: string
+    prompt: string
+    // Each pane tracks its own status + AbortController
+    // for the in-flight stream. paneId is the convId of
+    // the forked session.
+    panes: Array<{
+      paneId: string
+      provider: string
+      model: string
+      status: 'pending' | 'streaming' | 'complete' | 'error' | 'cancelled'
+      error?: string
+      ctrl: AbortController | null
+    }>
+    // Race lifecycle. "complete" is sticky — the user
+    // has to pick a winner (or cancel) to clear it.
+    status: 'pending' | 'streaming' | 'complete' | 'cancelled'
+    winnerPaneId: string | null
+    startedAt: number
+  },
 })
 
 export const currentMessages = computed(() =>
@@ -2458,4 +2496,214 @@ export async function forkSession(sourceId: string, messageIndex: number) {
 
   state.sessions.unshift(session)
   await switchSession(session.id)
+}
+
+// --- P2-5 race mode (multi-LLM parallel comparison) ---
+//
+// A "race" is a single user prompt fired at N (provider,
+// model) pairs in parallel. Each pair runs in its own
+// forked session so the underlying stores stay clean —
+// the same baseline, N independent answer trees. The user
+// picks the winning pane, and we promote that pane's
+// session to the new main line via forkSession(winner,
+// lastId).
+//
+// All race logic is client-side. The server's existing
+// ForkSession + SendMessage endpoints do the heavy
+// lifting; this file is the orchestrator that:
+//   1. forks N sessions in parallel
+//   2. sends the prompt to each
+//   3. routes SSE events into per-pane message lists
+//   4. presents a winner picker
+//   5. promotes the winner via the existing fork path
+
+// RaceCandidate is one (provider, model) pair the user
+// picked for the race. Up to 3 in v1 (matches the plan).
+export interface RaceCandidate {
+  provider: string
+  model: string
+}
+
+// startRace is the public entry point. Splits into the
+// orchestration steps described above. Returns the race
+// id so the caller can correlate async updates. Most
+// callers will simply watch state.race for status
+// changes — the id is mostly for debugging.
+export async function startRace(opts: {
+  baseSessionId: string
+  prompt: string
+  candidates: RaceCandidate[]
+  attachments?: any[]
+  skillContext?: string
+}): Promise<string> {
+  if (state.race && state.race.status === 'streaming') {
+    // Refuse to start a second race while the first is
+    // still streaming. The plan calls for a single
+    // active race; queuing would complicate the UI
+    // (modal stacking, abort plumbing) without
+    // obvious user value. Caller should `cancelRace()`
+    // first if they really want a fresh one.
+    throw new Error('a race is already in progress')
+  }
+  const raceId = 'race-' + Date.now().toString(36)
+  state.race = {
+    id: raceId,
+    baseSessionId: opts.baseSessionId,
+    prompt: opts.prompt,
+    panes: opts.candidates.map((c) => ({
+      paneId: '',
+      provider: c.provider,
+      model: c.model,
+      status: 'pending' as const,
+      ctrl: null,
+    })),
+    status: 'pending',
+    winnerPaneId: null,
+    startedAt: Date.now(),
+  }
+
+  // Step 1: fork the baseline into N copies. The
+  // fork-point is the trailing user message — we need
+  // each pane to share the same history UP TO the user's
+  // prompt, then receive the prompt independently. If
+  // there's no trailing user message (the user typed
+  // before the previous answer was sent), fork at -1
+  // (server treats as "all messages" copy).
+  const lastUserId = lastUserMessageId(opts.baseSessionId)
+  let forks: { id: string }[]
+  try {
+    forks = await Promise.all(
+      opts.candidates.map(() => api.forkSession(opts.baseSessionId, lastUserId || -1)),
+    )
+  } catch (e: any) {
+    // Fork failed — drop the race and re-throw so the
+    // caller can surface a toast.
+    state.race = null
+    throw new Error(`fork failed: ${e?.message || e}`)
+  }
+  // Attach the new convIds back onto the panes. Done
+  // serially after the parallel fork; cheap and keeps
+  // the loop body obvious.
+  state.race.panes.forEach((p, i) => { p.paneId = forks[i].id })
+  state.race.status = 'streaming'
+  // Refresh the local session list so the new panes
+  // show up in the sidebar if the user later picks
+  // one as the new main session.
+  await loadSessions()
+  // Pre-load each pane's history so the panes have
+  // something to display the moment the stream starts.
+  // Without this, the pane shows an empty bubble until
+  // the first SSE event lands.
+  for (const pane of state.race.panes) {
+    if (!pane.paneId) continue
+    try {
+      const r = await api.listMessages(pane.paneId, { limit: 50 })
+      state.sessionMessages[pane.paneId] = r.messages
+    } catch (e) {
+      // Non-fatal: the pane just shows an empty list
+      // until the first event lands.
+      console.warn('[race] pre-load history failed:', e)
+    }
+  }
+
+  // Step 2: send the prompt to each pane in parallel.
+  // Each pane gets its own AbortController so the
+  // user can cancel individual streams (or the whole
+  // race via cancelRace below).
+  await Promise.all(
+    state.race.panes.map(async (pane) => {
+      const ctrl = new AbortController()
+      pane.ctrl = ctrl
+      pane.status = 'streaming'
+      try {
+        await api.streamMessages(pane.paneId, {
+          message: opts.prompt,
+          provider: pane.provider,
+          model: pane.model,
+          attachments: opts.attachments,
+          skill_context: opts.skillContext,
+          signal: ctrl.signal,
+          onEvent: (ev) => appendStreamEvent(pane.paneId, ev),
+        })
+        // streamMessages resolves on done — mark the
+        // pane complete. Only set the race status if
+        // every pane has finished (the .every() check
+        // below).
+        pane.status = 'complete'
+      } catch (e: any) {
+        if (e?.name === 'AbortError' || ctrl.signal.aborted) {
+          pane.status = 'cancelled'
+        } else {
+          pane.status = 'error'
+          pane.error = e?.message || String(e)
+        }
+      } finally {
+        endStream(pane.paneId)
+      }
+    }),
+  )
+
+  // Step 3: stamp the race itself as complete. The
+  // user picks the winner next; cancelRace or
+  // pickWinner clears state.race.
+  if (state.race) {
+    state.race.status = 'complete'
+  }
+  return raceId
+}
+
+// cancelRace aborts every in-flight pane stream and
+// clears the race state. Safe to call multiple times
+// (no-op when state.race is null).
+export function cancelRace() {
+  if (!state.race) return
+  for (const pane of state.race.panes) {
+    if (pane.ctrl && pane.status === 'streaming') {
+      pane.ctrl.abort()
+      pane.status = 'cancelled'
+    }
+  }
+  state.race = null
+}
+
+// pickWinner promotes the chosen pane to the new main
+// session. Implementation: fork the winner's session at
+// its last message (so the new session ends on the
+// winner's full reply), then switch to it. The loser's
+// sessions stay in the sidebar as orphaned history —
+// the user can re-open any of them as a regular session.
+export async function pickWinner(paneConvId: string) {
+  if (!state.race) return
+  const pane = state.race.panes.find((p) => p.paneId === paneConvId)
+  if (!pane) return
+  state.race.winnerPaneId = paneConvId
+  // Find the trailing message id on the winner so the
+  // fork includes the complete reply.
+  const msgs = state.sessionMessages[paneConvId] || []
+  const lastId = msgs.length > 0 ? (msgs[msgs.length - 1].id || -1) : -1
+  try {
+    const session = await api.forkSession(paneConvId, lastId)
+    state.sessions.unshift(session)
+    // Drop the race state before switching so the
+    // ChatWindow re-renders to single-pane mode.
+    state.race = null
+    await switchSession(session.id)
+  } catch (e) {
+    console.error('[race] pickWinner fork failed:', e)
+    throw e
+  }
+}
+
+// lastUserMessageId is a small helper for the race
+// fork-point logic. Returns the row id of the trailing
+// user message in the given session, or 0 if there is
+// none. Pulled out of startRace so tests can target it
+// directly.
+function lastUserMessageId(sessionId: string): number {
+  const msgs = state.sessionMessages[sessionId]
+  if (!msgs) return 0
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'user' && msgs[i].id) return msgs[i].id as number
+  }
+  return 0
 }
