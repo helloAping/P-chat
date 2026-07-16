@@ -158,6 +158,40 @@ forwarder goroutine:
 
 没有这个机制，Wails GUI server 的 CWD 跟用户项目无关，project-level skills / rules 永远不会被加载（`LoadAll()` 用 `os.Getwd()`，已修复为 `LoadAllWithRoot(root)`）。
 
+### 8. 端到端 trace id 注入 (P3-3, 2026-07-16)
+
+`ChatRequest.TraceID` 字段 + `ChatStreamChunk.TraceID` 字段 +
+`sendOrDrop` 自动从 ctx 读 trace id 写每个 chunk：
+
+- `ChatWithTools` 入口：`req.TraceID`（handler 塞的）或 ctx 已有
+  → `trace.WithID(ctx, id)` 重新注入
+- `sendOrDrop`：从 ctx 读 → `chunk.TraceID`，避免 40+ call site
+  显式赋值
+- 工具派发：`tctx = tool.WithTraceID(tctx, tid)`，工具 handler
+  用 `tool.TraceIDFromCtx(ctx)` 拿
+- LLM client：`openaiStream` / `AnthropicClient.ChatStream`
+  在 `http.NewRequestWithContext` 后设 `X-Trace-Id` header
+  （虽然 LLM 不会回，但能 grep 我们送出的请求）
+
+详见 [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md)。
+
+### 9. Dynamic 工具 sandbox 决策 (P3-2, 2026-07-16)
+
+`confirm_target.go` switch 加 `default:` 分支：当工具名不匹配
+已知 6 个 built-in 时，查 `dynamic.LookupSpec(name)`。如果 spec
+存在，`decisionFromSandbox(spec.Sandbox.Exec, toolName)` 转
+`SandboxDecision`：
+
+| spec.Sandbox.Exec | SandboxDecision | 行为 |
+| --- | --- | --- |
+| `allow` | `SandboxAllow` | 直接执行，无弹窗 |
+| `deny` | `SandboxBlock` | 返回 E_SANDBOX 错误 |
+| `confirm` | `SandboxConfirm` | 弹现有 confirm modal |
+
+dynamic spec 走 `dynamic.SetSpecs(all)` 在 watcher 每次 reload
+后发布，agent loop 读的是进程全局表。避开在 40+ 层的 agent
+函数链多收 Registry 参数。
+
 ## 修改指南
 
 ### 要改 LLM 调用流程

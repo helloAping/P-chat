@@ -208,6 +208,54 @@ UX 决策：`ToolConfirmModal` 不加"先干跑一次"按钮（避免新增 serv
 复杂状态机）。改用 prompt 触发：用户打"干跑 shell_command X" → LLM 自加
 `dry_run: true` → ToolCallCard 显示 chip。
 
+#### P3-3 trace id 复制按钮
+
+`MessageBubble.vue` 检测 `message.traceId`（chat store 在 error
+事件触发时塞到 trailing assistant message）显示 `.trace-id-chip`
+按钮。点击调 `copyText(id)` 复制到剪贴板 + toast 提示"已复制"。
+
+`client.ts` 增 `mintTraceId()` 8 字符 hex (T-xxxxxxxx)，fetch
+路径设 `X-Trace-Id` header，Wails 路径把 `trace_id` 塞 body 由
+Go binding `extractTraceID` 提取。详见 [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md)。
+
+#### P3-2 工具列表抽屉
+
+`ToolListDrawer.vue`：NDrawer 右侧滑出，分内置 / 自定义两段。
+自定义工具带 "自定义" badge + "查看源码" 展开显示 YAML 路径
+（提示用户在编辑器中编辑）。TopBar 加 `Wrench` 按钮触发。
+
+`api/client.ts` 增 `listTools()` + `Tool` 类型（`dynamic` flag +
+`source` 路径）。`chat.ts` 无状态（按需 fetch）—— 工具列表是
+per-server 不 per-session。
+
+#### P2-5 多 LLM race mode
+
+`InputArea.vue` 加"单线/对比"模式切换（`NRadioGroup`）+ 3 个
+`(provider, model)` NSelect 候选（`raceCandidates`）。race
+模式时 textarea + 发送按钮 disabled（避免 race 中途发新消息）。
+
+`chat.ts` 增 `state.race` + `startRace()` / `cancelRace()` /
+`pickWinner(paneId)` actions。A 模式 = 纯前端 orchestrator：
+
+1. `startRace` 并发 `api.forkSession(baseId, lastUserId)` N 次
+2. 预加载每个 pane 的 history
+3. 并发 `api.streamMessages(paneId, ...)` N 次（每个独立
+   AbortController）
+4. SSE 事件路由到 `state.sessionMessages[paneId]`
+5. race 完成时 `state.race.status = 'complete'`，RaceView 显示
+   "🏆 选这个" 按钮
+6. `pickWinner(paneId)` → `forkSession(paneId, lastId)` →
+   `switchSession(newId)`，清 race state
+
+`RaceView.vue`：CSS grid `repeat(N, 1fr)`，< 720px 自动单列。
+每 pane 是独立 MessageList（共用 `MessageBubble` 组件），底部
+footer 渲染 "🏆" 按钮。
+
+`ChatWindow.vue` 加 `<RaceView v-if="state.race" />`，single-pane
+`<div class="messages-scroll">` 加 `v-if="!state.race"`。
+
+详见 [P2-5 设计](../../docs/plans/round4-trace-and-extensibility-plan.md)。
+
 ## 修改指南
 
 ### 要添加新的 SSE 事件类型

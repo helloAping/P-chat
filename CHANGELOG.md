@@ -798,3 +798,106 @@ CHANGELOG.md                                        +70
 - dry_run 字段对老 client 透明（默认 false = 原行为）
 - context inspector 是只读 GET，零副作用
 - 代码高亮：旧 client 仍可工作（marked 仍能 parse，只是没颜色）
+
+---
+
+### v1.0.9 — 端到端可观测性 + 平台可扩展性
+
+第四轮"可观测性 + 扩展性"优化，3 个独立可交付项。
+
+#### 用户可见功能
+
+| 项 | 体验提升 |
+| --- | --- |
+| **P3-3 端到端 trace id** | 每次 SSE 会话自动生成 8 字符 hex trace id (`T-xxxxxxxx`)，贯穿 HTTP → agent → LLM → tool handler → log → SSE event；报错时错误气泡显示"复制 trace id"按钮，点一下贴到剪贴板。开发者 grep `server-debug.log` 即可定位 |
+| **P3-2 工具 hot-reload** | 用户在 `~/.p-chat/tools/foo.yaml` 写工具定义（exec / http / echo 三种 template），5s polling watcher 自动 register，无需重启；TopBar 新增 🔧 按钮打开工具列表抽屉，自定义工具带"自定义"badge + "查看源码"展开显示 YAML 路径 |
+| **P2-5 多 LLM race mode (A 模式)** | InputArea 加"单线/对比"模式切换；race 模式选 3 个 (provider, model) 对并发发问，3 个 LLM 同步跑，UI 分 3 pane 显示（CSS grid，< 720px 自动单列）；结束后每 pane 一个"🏆 选这个"按钮；点 winner → fork 它的 session 为新主线 |
+
+#### Bug 修复
+
+- 无
+
+#### 重构
+
+- **`tool.Registry.sources` map**：新增来源追踪字段。`RegisterWithSource(t, h, source)` 让 P3-2 watcher 记录 YAML 路径；`SourceFile(name)` 供 GET /api/v1/tools 端点区分 dynamic vs built-in
+- **`tool.Registry` 构造签名升级**：`New` / `NewWithStaticDir` / `NewWithStaticFS` 增 `toolReg *tool.Registry` 参数；`cmd/pchat-server/main.go` 同步更新
+- **`dynamic.SetSpecs` / `LookupSpec` 进程全局表**：watcher 每次 reload 发布 spec 快照；agent 的 `confirmTargetFor` default 分支读 spec.Sandbox.Exec 决定 SandboxDecision。避开在 agent loop 多收一个 Registry 参数
+
+#### 周边优化
+
+- **P3-3 CORS allow-headers**：加 `X-Trace-Id` 让浏览器 cross-origin fetch 不被预检拒绝
+- **P3-3 Wails 路径兼容**：`StreamMessages` Go binding 从请求 body 抽 `trace_id` 字段并设 `X-Trace-Id` header（绕过 Wails binding 不能加任意 header 的限制）
+- **P3-3 log.Printf 前缀**：`trace.LogPrefix(ctx)` 返回 `[T-xxx] ` 或 `""`；主要 log 行（LLM client / forwarder / tool handler）已加前缀
+- **P3-2 sandbox 决策**：dynamic tool 走 `decisionFromSandbox(spec.Sandbox.Exec, toolName)` → allow / deny / confirm
+- **P3-2 模板渲染**：`{{.args.foo}}` / `{{.config.api_key}}` 走 `text/template`，missingkey=zero 让缺字段渲染 `<no value>` 不报错
+- **P3-2 per-tool config**：`config.json` 写 `dynamic.<name>.config: {api_key: ...}` → 模板用 `{{.config.api_key}}` 引用
+- **P2-5 race orchestrator**：A 模式 = 纯前端，复用现有 ForkSession + SendMessage；每个 pane 独立 AbortController，cancelRace 一次 abort 全部
+
+#### 依赖
+
+- `gopkg.in/yaml.v3 v3.0.1`（已存在，被 dynamic 解析器复用）
+- `lucide-vue-next` 新增 `RefreshCw` / `Wrench` / `Trophy` / `FileCode` 图标
+
+#### 测试
+
+`internal/trace/trace_test.go`（新）— 5 个 case：NewID_Format / NewID_Unique / WithID_FromContext / WithID_EmptyIsNoop / FromContext_NilCtx
+
+`internal/server/handler_trace_test.go`（新）— 4 个 case：TraceID_GeneratedWhenMissing / TraceID_HeaderPassthrough / TraceID_DistinctPerRequest / TraceID_AllowsHeaderInCORS
+
+`internal/tool/dynamic/dynamic_test.go`（新）— 8 个 case：ParseSpec_Exec / ParseSpec_HTTP / ParseSpec_Echo / ParseSpec_MissingFields (9 sub) / Render_ArgsAndConfig / Render_MissingKeyIsZero / BuildDynamicHandler_Echo / BuildDynamicHandler_UnknownType / Watcher_AddRemove / Watcher_MalformedYAMLDoesNotPoison / Watcher_EditIsDetected
+
+`internal/server/handler_tools_test.go`（新）— 2 个 case：ListTools_Builtins / ListTools_Dynamic
+
+#### 改动统计
+
+```
+docs/plans/round4-trace-and-extensibility-plan.md    +857 (新)
+internal/trace/trace.go                               +104 (新)
+internal/trace/trace_test.go                          +79 (新)
+internal/server/handler_trace_test.go                 +106 (新)
+internal/server/handler_tools_test.go                 +88 (新)
+internal/server/tool_api.go                           +88 (新)
+internal/tool/dynamic/dynamic.go                      +52 (新)
+internal/tool/dynamic/dynamic_test.go                 +331 (新)
+internal/tool/dynamic/echo.go                         +27 (新)
+internal/tool/dynamic/exec.go                         +80 (新)
+internal/tool/dynamic/http.go                         +108 (新)
+internal/tool/dynamic/parse.go                        +211 (新)
+internal/tool/dynamic/render.go                       +53 (新)
+internal/tool/dynamic/watcher.go                      +180 (新)
+internal/tool/registry.go                             +41
+internal/agent/agent.go                               +30
+internal/agent/confirm_target.go                      +52
+internal/config/config.go                             +13
+internal/llm/anthropic.go                             +9
+internal/llm/client.go                                +25
+internal/server/handler.go                            +38
+internal/server/server.go                             +95
+internal/server/handler_test.go                       +8
+internal/server/web_test.go                           +2
+internal/httpcli/client_test.go                       +2
+cmd/pchat-server/main.go                              +2
+cmd/pchat-gui/main.go                                 +30
+frontend/src/api/client.ts                            +52
+frontend/src/components/ChatWindow.vue                +11
+frontend/src/components/InputArea.vue                 +180
+frontend/src/components/MessageBubble.vue             +50
+frontend/src/components/RaceView.vue                  +241 (新)
+frontend/src/components/ToolListDrawer.vue            +248 (新)
+frontend/src/components/TopBar.vue                    +38
+frontend/src/stores/chat.ts                           +250
+```
+
+#### 升级说明
+
+- 无 schema 迁移
+- 无破坏性 API 变化：
+  - `X-Trace-Id` 头可选；老 client 不发也正常（后端生成）
+  - `GET /api/v1/tools` 是新端点，老 client 无感知
+  - race mode 是新模式切换，老 client 默认走 single 不变
+  - `chatReq.TraceID` 字段可选；老 client 不发时 agent ctx 也不会注入
+- 新增 `Config.Dynamic` 字段（`map[string]map[string]any`）—— 老 config 缺这字段零迁移成本
+- 新增 `tool.Registry.sources` map（built-in 工具永远不写）—— 对外 API 行为不变
+- P3-2 YAML 错误隔离：单个坏 YAML 只 log warn，不影响其他 dynamic / built-in 工具
+- 向后兼容：旧 client 不发 `X-Trace-Id` 也可工作，错误气泡的 trace chip 仅在用户带 id 时显示
+
