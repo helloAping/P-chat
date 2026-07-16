@@ -1451,6 +1451,30 @@ export async function streamRegenerate(
   }
 }
 
+// ---- P3-2 dynamic tools ----
+
+// Tool is one row of the GET /api/v1/tools response. The
+// `dynamic` flag distinguishes user-defined tools
+// (loaded from ~/.p-chat/tools/*.yaml) from the
+// built-ins; `source` is the YAML path so the
+// ToolListDrawer can show a "view source" link.
+export interface Tool {
+  name: string
+  description: string
+  parameters?: any
+  dynamic: boolean
+  source?: string
+}
+
+// listTools fetches the current tool registry. Used by
+// the ToolListDrawer; the chat store calls it on mount
+// and after every agent Reload (which the server fires
+// when a dynamic YAML is added / changed / deleted).
+export async function listTools(): Promise<Tool[]> {
+  const res = await jsonFetch<{ tools: Tool[] }>('/api/v1/tools', { method: 'GET' })
+  return res?.tools || []
+}
+
 // ---- P2-3 context inspector ----
 
 // ContextMessage is one row of the inspector's

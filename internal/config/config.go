@@ -31,6 +31,14 @@ type Config struct {
 	Limits    LimitsConfig    `json:"limits"`
 	Search    SearchConfig    `json:"search"`
 	Browser   BrowserConfig   `json:"browser"`
+	// Dynamic is the P3-2 per-tool config table. The
+	// user writes `dynamic.<tool_name>.config: {…}`
+	// in their config.json and the dynamic tool's
+	// templates can reference it as
+	// `{{.config.<key>}}`. Nil = no overrides
+	// (the most common case for users who don't have
+	// any custom tools).
+	Dynamic map[string]map[string]any `json:"dynamic,omitempty"`
 }
 
 // LimitsConfig controls resource caps for the agent loop.

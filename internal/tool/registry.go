@@ -221,14 +221,21 @@ type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]ToolHandler
 	meta  map[string]Tool
+	// sources tracks the on-disk origin of each tool. The
+	// P3-2 dynamic watcher populates this so the
+	// GET /api/v1/tools endpoint can badge user-defined
+	// tools differently from built-ins. Empty for
+	// built-ins (their entries are never written).
+	sources map[string]string
 }
 
 type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, error)
 
 func NewRegistry() *Registry {
 	return &Registry{
-		tools: make(map[string]ToolHandler),
-		meta:  make(map[string]Tool),
+		tools:   make(map[string]ToolHandler),
+		meta:    make(map[string]Tool),
+		sources: make(map[string]string),
 	}
 }
 
@@ -237,6 +244,21 @@ func (r *Registry) Register(t Tool, h ToolHandler) {
 	defer r.mu.Unlock()
 	r.tools[t.Name] = h
 	r.meta[t.Name] = t
+}
+
+// RegisterWithSource is the P3-2 dynamic-watcher's
+// Register variant. Records the YAML path under
+// `sources[name]` so the GET /api/v1/tools endpoint can
+// flag this tool as user-defined and surface the source
+// path in the UI. Built-in registration uses plain
+// Register, which leaves the source entry empty.
+func (r *Registry) RegisterWithSource(t Tool, h ToolHandler, source string) {
+	r.Register(t, h)
+	if source != "" {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.sources[t.Name] = source
+	}
 }
 
 // RegisterForTest registers a tool with a no-op handler. Tests
@@ -257,6 +279,18 @@ func (r *Registry) Unregister(name string) {
 	defer r.mu.Unlock()
 	delete(r.tools, name)
 	delete(r.meta, name)
+	delete(r.sources, name)
+}
+
+// SourceFile returns the YAML path the dynamic watcher
+// registered the named tool from, plus an ok flag. The
+// P3-2 GET /api/v1/tools endpoint uses it to badge
+// user-defined tools differently from the built-ins.
+func (r *Registry) SourceFile(name string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	src, ok := r.sources[name]
+	return src, ok
 }
 
 func (r *Registry) Get(name string) (ToolHandler, bool) {

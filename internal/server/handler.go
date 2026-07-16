@@ -41,6 +41,11 @@ type Handler struct {
 	summarizer *memory.Summarizer
 	mcpMgr     *mcp.Manager
 	browserMgr *browser.Manager
+	// toolReg is the P3-2 shared tool registry. The
+	// dynamic-tool watcher in server.go writes here; the
+	// GET /api/v1/tools endpoint reads from here. May be
+	// nil in tests that don't need tool listing.
+	toolReg *tool.Registry
 
 	// listenAddr is the actual address the HTTP server is bound to
 	// (e.g. "127.0.0.1:14712"). Set once at startup by the server.
@@ -91,11 +96,12 @@ type sessionMetaBlob struct {
 	AutoContinue *bool `json:"auto_continue,omitempty"`
 }
 
-func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Handler {
+func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager) *Handler {
 	h := &Handler{
 		agent:    a,
 		store:    store,
 		styleMgr: styleMgr,
+		toolReg:  toolReg,
 		mcpMgr:   mcpMgr,
 		meta:     make(map[string]sessionMeta),
 	}

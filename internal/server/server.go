@@ -19,8 +19,11 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/tool/dynamic"
 	"github.com/p-chat/pchat/internal/trace"
 )
 
@@ -37,6 +40,9 @@ type Server struct {
 	// rules directories for changes. Started in
 	// NewWithStaticFS, stopped in Shutdown.
 	rulesWatchStop func()
+	// dynamicWatchStop stops the P3-2 dynamic tool
+	// watcher. Same shape as rulesWatchStop.
+	dynamicWatchStop func()
 }
 
 // Engine returns the underlying gin.Engine so tests (or embedders)
@@ -58,8 +64,10 @@ func (s *Server) SetBrowserManager(bm *browser.Manager) {
 // New builds the HTTP server. The store is used for session/message
 // persistence. The agent is used for chat calls. The web frontend is
 // served from an embedded filesystem so the binary is self-contained.
-func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Server {
-	return NewWithStaticFS(cfg, agt, store, styleMgr, nil, mcpMgr)
+// The tool registry is exposed so the P3-2 dynamic tool watcher
+// can register / unregister user-defined tools at runtime.
+func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager) *Server {
+	return NewWithStaticFS(cfg, agt, store, styleMgr, toolReg, nil, mcpMgr)
 }
 
 // NewWithStaticDir is like New but lets the caller pick where the
@@ -67,18 +75,18 @@ func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *st
 // parent process, which sets PCHAT_WEB_DIR to the absolute path of the
 // web/ output. Pass an empty string to skip static serving entirely
 // (useful for tests that don't ship the frontend).
-func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, staticDir string, mcpMgr *mcp.Manager) *Server {
+func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, staticDir string, mcpMgr *mcp.Manager) *Server {
 	if staticDir == "" {
-		return NewWithStaticFS(cfg, agt, store, styleMgr, nil, mcpMgr)
+		return NewWithStaticFS(cfg, agt, store, styleMgr, toolReg, nil, mcpMgr)
 	}
-	return NewWithStaticFS(cfg, agt, store, styleMgr, http.Dir(staticDir), mcpMgr)
+	return NewWithStaticFS(cfg, agt, store, styleMgr, toolReg, http.Dir(staticDir), mcpMgr)
 }
 
 // NewWithStaticFS is the lowest-level constructor: it accepts an
 // http.FileSystem directly. Pass nil to skip static serving. In
 // production pchat-server passes http.FS(embeddedWebFS) so the
 // frontend ships inside the binary and works from any CWD.
-func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, staticFS http.FileSystem, mcpMgr *mcp.Manager) *Server {
+func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, staticFS http.FileSystem, mcpMgr *mcp.Manager) *Server {
 	if os.Getenv("PC_HTTP_DEBUG") == "1" {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -120,7 +128,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	// ctx via trace.FromContext.
 	r.Use(traceIDMiddleware())
 
-	h := NewHandler(agt, cfg, store, styleMgr, mcpMgr)
+	h := NewHandler(agt, cfg, store, styleMgr, toolReg, mcpMgr)
 
 	// Wire the summarizer so /compress and auto-compact work.
 	if lc := agt.LLM(); lc != nil && cfg.LLM.Default != "" {
@@ -164,6 +172,12 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// Slash commands
 		api.GET("/commands", h.ListCommands)
 		api.POST("/commands/:name", h.RunCommand)
+
+		// P3-2: list all currently registered tools. The
+		// response includes both the static built-ins
+		// (registered at startup) and any dynamic tools
+		// the user has dropped in ~/.p-chat/tools/.
+		api.GET("/tools", h.ListTools)
 
 		// Sessions
 		api.GET("/sessions", h.ListSessions)
@@ -297,6 +311,46 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 			agt.Reload()
 		}
 	}, 5*time.Second, "")
+
+	// P3-2: dynamic tool hot-reload. Watches
+	// ~/.p-chat/tools/*.yaml and re-registers the
+	// tool.Registry on add/change/delete. The 5s
+	// polling interval mirrors the rules watcher; using
+	// fsnotify is intentionally avoided for Windows
+	// compatibility (CLAUDE.md §4.4). The agent's Reload
+	// fires on every change so the "Available Tools"
+	// table in the system prompt is rebuilt — without
+	// that, a newly-registered tool wouldn't appear in
+	// the LLM's context until the next restart.
+	// toolReg may be nil in tests that bypass tool
+	// registration; skip the watcher in that case.
+	if toolReg != nil {
+		dynStop, dynErr := dynamic.Watch(context.Background(), toolReg, paths.ToolsDir(), func(name string) map[string]any {
+			// Look up per-tool config from the global
+			// config. The user writes
+			// `dynamic.<name>.config: {api_key: ...}` and
+			// the templates reference `{{.config.api_key}}`.
+			if cfg == nil {
+				return nil
+			}
+			if cfg.Dynamic == nil {
+				return nil
+			}
+			return cfg.Dynamic[name]
+		}, 5*time.Second, func() {
+			if agt != nil {
+				agt.Reload()
+			}
+		})
+		if dynErr != nil {
+			// Non-fatal: a fresh install may not have
+			// the tools dir yet. We log and move on; the
+			// next tick will re-attempt.
+			log.Printf("[server] WARN: dynamic tool watcher failed to start: %v", dynErr)
+		} else {
+			s.dynamicWatchStop = dynStop
+		}
+	}
 	return s
 }
 
@@ -349,6 +403,9 @@ func (s *Server) RunWithGracefulShutdown(addr string) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.rulesWatchStop != nil {
 		s.rulesWatchStop()
+	}
+	if s.dynamicWatchStop != nil {
+		s.dynamicWatchStop()
 	}
 	if s.srv != nil {
 		return s.srv.Shutdown(ctx)

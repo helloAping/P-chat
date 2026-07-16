@@ -108,7 +108,7 @@ func newTestServerWithConfig(t *testing.T, jsonBody string) (*Server, *config.Co
 	tool.RegisterBuiltin(tools)
 
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	return New(cfg, agt, store, styleMgr, nil), cfg
+	return New(cfg, agt, store, styleMgr, tools, nil), cfg
 }
 
 // ====================================================================
@@ -1068,7 +1068,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := 	New(cfg, agt, store, styleMgr, nil)
+	srv1 := 	New(cfg, agt, store, styleMgr, tools, nil)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro"}`)
 	if err := store.Close(); err != nil {
@@ -1087,7 +1087,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	tools2 := tool.NewRegistry()
 	tool.RegisterBuiltin(tools2)
 	agt2 := agent.New(cfg, llmClient2, styleMgr2, store2, tools2)
-	srv2 := New(cfg, agt2, store2, styleMgr2, nil)
+	srv2 := New(cfg, agt2, store2, styleMgr2, tools2, nil)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil)
@@ -1160,7 +1160,7 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := 	New(cfg, agt, store, styleMgr, nil)
+	srv1 := 	New(cfg, agt, store, styleMgr, tools, nil)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro","style":"tech"}`)
 
@@ -1218,7 +1218,7 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	tools2 := tool.NewRegistry()
 	tool.RegisterBuiltin(tools2)
 	agt2 := agent.New(cfg, llmClient2, styleMgr2, store2, tools2)
-	srv2 := New(cfg, agt2, store2, styleMgr2, nil)
+	srv2 := New(cfg, agt2, store2, styleMgr2, tools2, nil)
 
 	wg := httptest.NewRecorder()
 	srv2.engine.ServeHTTP(wg, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
