@@ -7,7 +7,7 @@
 // path so the LLM can answer "what is /foo?" questions naturally.
 
 import { onMounted, ref, computed, watch, nextTick } from 'vue'
-import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, NSelect, NRadioGroup, NRadioButton, useMessage } from 'naive-ui'
+import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useMessage } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
@@ -23,7 +23,6 @@ import {
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
   recoverMissingParts,
-  startRace,
 } from '../stores/chat'
 import { notifyManager } from '../utils/notify'
 
@@ -67,61 +66,6 @@ const sending = ref(false)
 const showSessionConfig = ref(false)
 const message = useMessage()
 
-// P2-5: race mode toggle. `single` (default) uses the
-// normal one-LLM send path; `race` opens the 3-candidate
-// picker below the input. While a race is streaming the
-// input + send button are disabled — a second send
-// during an in-flight race is explicitly rejected by
-// startRace() so the UI just mirrors the same state.
-const sendMode = ref<'single' | 'race'>('single')
-const isRaceActive = computed(() => !!state.race && state.race.status === 'streaming')
-const inputDisabled = computed(() => isRaceActive.value)
-
-// raceCandidates are the 3 (provider, model) pairs the
-// race will fire. We default them to the current
-// session's picker values, padded with the first two
-// other providers/models if the user has fewer than 3
-// selected. Re-initialised whenever the user changes
-// the picker so the race stays in sync with their last
-// choice.
-interface RaceSlot { provider: string; model: string }
-const raceCandidates = ref<RaceSlot[]>([{ provider: '', model: '' }, { provider: '', model: '' }, { provider: '', model: '' }])
-function syncRaceCandidates() {
-  // Pick the current session's (provider, model) plus
-  // the first two distinct providers from the loaded
-  // list. This gives a useful 3-up default without
-  // requiring the user to configure anything.
-  const cur = state.sessionMeta[state.currentID]
-  const fallbackProvider = state.providers[0]
-  const slots: RaceSlot[] = []
-  if (cur?.provider) {
-    slots.push({ provider: cur.provider, model: cur.model || '' })
-  }
-  for (const p of state.providers) {
-    if (slots.length >= 3) break
-    if (p.name === cur?.provider) continue
-    const firstModel = p.models?.[0]?.name || ''
-    slots.push({ provider: p.name, model: firstModel })
-  }
-  while (slots.length < 3) {
-    slots.push({ provider: fallbackProvider?.name || '', model: fallbackProvider?.models?.[0]?.name || '' })
-  }
-  raceCandidates.value = slots
-}
-watch(() => state.currentID, () => { if (sendMode.value === 'race') syncRaceCandidates() })
-watch(() => state.providers.length, () => { if (sendMode.value === 'race') syncRaceCandidates() })
-
-// On switch to race mode, sync once.
-watch(sendMode, (m) => { if (m === 'race') syncRaceCandidates() })
-
-// availableModelsFor returns the list of model names
-// for the given provider. Pulled from the same
-// provider list the ModelPicker uses, so the dropdown
-// stays in sync.
-function availableModelsFor(providerName: string) {
-  const p = state.providers.find((x: any) => x.name === providerName)
-  return (p?.models || []).map((m: any) => m.name)
-}
 const fileInput = ref<HTMLInputElement | null>(null)
 const reasoningEffort = computed({
   get: () => {
@@ -783,33 +727,6 @@ async function send() {
   // 首次用户交互时解锁 Web Audio（浏览器自动播放策略要求）
   notifyManager.unlock()
 
-  // P2-5: race mode short-circuit. If the user has the
-  // mode toggle set to "对比", hand the prompt off to
-  // the chat store's startRace and bail out — startRace
-  // does the fork + parallel send + winner plumbing;
-  // we don't need any of the single-pane send path
-  // here. The store's startRace throws if a race is
-  // already in flight; the user-facing message is more
-  // useful than a silent no-op.
-  if (sendMode.value === 'race') {
-    try {
-      await startRace({
-        baseSessionId: id,
-        prompt: text,
-        candidates: raceCandidates.value
-          .filter(s => s.provider && s.model)
-          .slice(0, 3),
-        attachments: inlineAttachments,
-        skillContext: pendingSkillContext || undefined,
-      })
-    } catch (e: any) {
-      message.error(e?.message || '启动 race 失败')
-      // Re-stage the text so the user doesn't lose it.
-      inputText.value = text
-    }
-    return
-  }
-
   sending.value = true
   const ctrl = new AbortController()
   // Install the placeholder assistant message immediately so
@@ -1059,53 +976,6 @@ onMounted(() => {
       <button class="rollback-banner-dismiss" @click="dismissRollback(state.currentID)" aria-label="关闭">×</button>
     </div>
 
-    <!-- P2-5: mode toggle. Single = the normal one-LLM
-         send. Race = open the candidate picker below
-         the input; the next send fires the same prompt
-         at up to 3 (provider, model) pairs in parallel.
-         Sits in its own row above the input-wrap so
-         it's visible whether the input has content
-         or not. -->
-    <div class="send-mode">
-      <NRadioGroup v-model:value="sendMode" size="small">
-        <NRadioButton value="single">单线</NRadioButton>
-        <NRadioButton value="race">对比</NRadioButton>
-      </NRadioGroup>
-      <span v-if="sendMode === 'race'" class="send-mode-hint">
-        下一个 prompt 会并发发给 3 个 (provider, model) →
-        选一个作为新主线
-      </span>
-    </div>
-
-    <!-- P2-5: race candidate picker. Only rendered in
-         race mode. Three (provider, model) slots; the
-         user can swap any of them via the dropdowns.
-         Disabled while a race is in flight (the same
-         pane will be needed for the next attempt). -->
-    <div v-if="sendMode === 'race'" class="race-picker">
-      <div
-        v-for="(slot, i) in raceCandidates"
-        :key="i"
-        class="race-slot"
-      >
-        <span class="race-slot-label">#{{ i + 1 }}</span>
-        <NSelect
-          v-model:value="slot.provider"
-          :options="state.providers.map((p: any) => ({ label: p.name, value: p.name }))"
-          size="small"
-          :disabled="isRaceActive"
-          placeholder="provider"
-          @update:value="(v: string) => { slot.provider = v; slot.model = availableModelsFor(v)[0] || '' }"
-        />
-        <NSelect
-          v-model:value="slot.model"
-          :options="availableModelsFor(slot.provider).map((m: string) => ({ label: m, value: m }))"
-          size="small"
-          :disabled="isRaceActive || !slot.provider"
-          placeholder="model"
-        />
-      </div>
-    </div>
     <!-- Attachments live INSIDE the same input-wrap as the
          textarea. They wrap to multiple rows as the dialog
          width changes; we don't use a horizontal scrollbar
@@ -1151,8 +1021,7 @@ onMounted(() => {
           v-model="inputText"
           class="textarea"
           rows="1"
-          :disabled="inputDisabled"
-          :placeholder="isRaceActive ? 'race 进行中,等待选 winner' : (isSlashLine() ? '输入 / 后跟命令 (例如 /help)' : '输入消息，Enter 发送，Shift+Enter 换行，Esc 停止，/ 前缀是命令')"
+          :placeholder="isSlashLine() ? '输入 / 后跟命令 (例如 /help)' : '输入消息，Enter 发送，Shift+Enter 换行，Esc 停止，/ 前缀是命令'"
           @keydown="onKeyDown"
           @paste="onPaste"
         ></textarea>
@@ -1212,9 +1081,9 @@ onMounted(() => {
         <button
           v-if="!isStreaming"
           class="send-btn"
-          :disabled="!inputText.trim() || isRaceActive"
+          :disabled="!inputText.trim()"
           @click="send"
-          :title="isRaceActive ? 'race 进行中' : (sendMode === 'race' ? '同时发给 3 个模型 (Enter)' : '发送 (Enter)')"
+          title="发送 (Enter)"
           aria-label="发送"
         >
           <Send :size="16" />
@@ -1526,55 +1395,6 @@ onMounted(() => {
 }
 .rollback-banner-dismiss:hover {
   color: var(--text);
-}
-
-/* P2-5: send mode toggle row. Sits above the input
- * wrap so the user can switch single ↔ race without
- * disturbing whatever they've typed. The hint text
- * is muted so it doesn't compete with the toggle
- * itself. */
-.send-mode {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0 4px 6px 4px;
-}
-.send-mode-hint {
-  font-size: 11px;
-  color: var(--text-3, var(--text-2));
-  opacity: 0.75;
-}
-
-/* P2-5: race candidate picker. Three (provider,
- * model) slot rows under the input area, only shown
- * when the user is in race mode. Each slot is its
- * own flex row with a numeric label so the user
- * can quickly tell which pane is which. The
- * background contrast against the input-wrap is
- * subtle — the picker is "of the input", not a
- * separate concern. */
-.race-picker {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin: 0 0 8px 0;
-  padding: 8px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-2);
-}
-.race-slot {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.race-slot-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-2);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  min-width: 22px;
-  text-align: center;
 }
 
 /* The dialog "box": textarea + optional attach strip share a

@@ -26,7 +26,6 @@
 | **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |
 | **P3-3 端到端 trace id** | [trace 包](../../internal/trace/trace.go) | [server.md](server.md) §8, [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
 | **P3-2 工具 hot-reload** | [tool.md](tool.md) §8 | [P3-2 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
-| **P2-5 多 LLM race mode** | [frontend.md](frontend.md) §P2-5 | [P2-5 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
 
 ## 模块总览
 
