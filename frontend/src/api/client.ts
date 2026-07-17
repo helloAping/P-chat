@@ -255,6 +255,28 @@ export interface Message {
   // raw command output), 1=context. Carried through
   // rollback/undo so the value survives a round-trip.
   submit_to_llm?: number
+  // P1-4 regen history. RegenGroupID is the string form
+  // of the user message id that prompted this assistant
+  // reply — same value across every sibling in the
+  // regen group. Empty for non-assistant rows and for
+  // pre-migration-9 assistant rows that have never been
+  // regen'd. The frontend reads this to associate an
+  // archived reply with its parent user message (the
+  // "上一版回答" chip + the pager's user-message
+  // preview). For ListMessages responses (the main
+  // timeline), the value is always empty because
+  // archived siblings are SQL-filtered out; the
+  // /replies endpoint surfaces the full sibling set
+  // with the value populated.
+  regen_group_id?: string
+  // P1-4 visibility flag. False = active reply (default,
+  // the row that shows in the main timeline); true =
+  // an older regenerated sibling that lives in the
+  // same group but is hidden from the main timeline.
+  // The ◀ N/M ▶ pager reads this to compute the active
+  // index and to render archived siblings on demand.
+  // Always false on rows returned by ListMessages.
+  is_archived?: boolean
 }
 
 export interface SessionMeta {
@@ -888,6 +910,19 @@ export interface InlineAttachment {
 
 export interface SendOptions {
   message: string
+  // client_msg_id is a client-generated integer assigned at
+  // send time. The frontend stamps it onto the local Message
+  // (msg.id) immediately and sends it to the backend, which
+  // uses it as the SQLite row id for this turn's user message.
+  // Because the id is set BEFORE the LLM call, rollback and
+  // regenerate both work even when the SSE `done` event never
+  // arrives (network error mid-stream, LLM 5xx, quota
+  // exhausted, etc.) — the user no longer sees "撤回失败：消息
+  // 尚未完成发送" because the row id is always known.
+  // Format: a 13-16 digit integer (ms-epoch × 1000 + random),
+  // guaranteed unique across the lifetime of the app and well
+  // outside the SQLite AUTOINCREMENT range.
+  client_msg_id?: number
   provider?: string
   model?: string
   style?: string
@@ -1196,6 +1231,14 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
   const url = `${base}/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`
   const body = JSON.stringify({
     message: opts.message,
+    // client_msg_id is the integer the frontend minted at
+    // send time and stamped onto the local Message as
+    // `msg.id`. The backend uses it as the SQLite row id
+    // for this turn's user message, so rollback/regen
+    // always have a valid id to target — even when the
+    // SSE `done` event never lands (LLM error, network
+    // drop, quota exhausted, etc.).
+    client_msg_id: opts.client_msg_id,
     provider: opts.provider,
     model: opts.model,
     style: opts.style,
@@ -1449,6 +1492,92 @@ export async function streamRegenerate(
       }
     }
   }
+}
+
+// ---- P1-4 regen history ----
+
+// UserMessageSummary is the wire shape of the parent
+// user message carried in the RepliesResponse. The
+// frontend renders the "上一版回答" chip and the
+// pager's user-message preview directly from this
+// payload — no second round-trip needed to look up
+// the user message.
+//
+// content_preview is the first 80 chars of the user
+// content (server-truncated). The preview is what the
+// pager shows: `◀ 2/3 · "请帮我..." ▶`.
+// content is the full text — only used in the rare
+// "open in side panel" view; not rendered inline.
+export interface UserMessageSummary {
+  id: number
+  role: 'user' | 'system'
+  content: string
+  content_preview: string
+  created_at: number
+}
+
+// RepliesResponse is the body of
+// GET /api/v1/sessions/:id/messages/:user_msg_id/replies.
+// Returns the full regen group (active + archived) plus
+// the user-message summary the UI needs to render the
+// pager / chip without a second round-trip.
+//
+// active_reply_id is 0 when no row in the group is
+// active (transient state, e.g. the brief window
+// between ArchiveSiblings and the agent's new insert
+// during a regen). The frontend should fall back to
+// "no pager" in that case.
+export interface RepliesResponse {
+  user_message: UserMessageSummary
+  replies: Message[]
+  active_reply_id: number
+}
+
+// listReplies fetches the full regen group for a given
+// user message id. The store calls this on demand the
+// first time the user hovers a paginated bubble (so
+// most bubbles never pay the cost) and refreshes the
+// cache when a regen completes (the new sibling is the
+// active row and the previous active is now archived).
+//
+// Errors:
+//   - 404: session or user message not found
+//   - 200 + replies: []  when the user message has no
+//     regen history (legacy single-shot row). The
+//     frontend treats this as "no pager" — the
+//     bubble stays in the single-reply shape.
+export async function listReplies(
+  sessionId: string,
+  userMsgId: number,
+): Promise<RepliesResponse> {
+  return jsonFetch<RepliesResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${userMsgId}/replies`,
+  )
+}
+
+// activateReply makes replyId the active reply in the
+// regen group rooted at userMsgId. The store calls
+// this when the user clicks ◀/▶ on the bubble's pager
+// to view a different historical reply.
+//
+// Errors:
+//   - 400: reply_id / user_message_id invalid, or the
+//     reply isn't in the user message's regen group
+//     (server response includes a descriptive error
+//     string the frontend surfaces in a toast).
+//   - 404: session / reply / user message not found
+export async function activateReply(
+  sessionId: string,
+  userMsgId: number,
+  replyId: number,
+): Promise<RepliesResponse> {
+  return jsonFetch<RepliesResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${replyId}/activate`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ user_message_id: userMsgId }),
+    },
+  )
 }
 
 // ---- P3-2 dynamic tools ----

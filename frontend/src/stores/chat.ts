@@ -134,6 +134,30 @@ export const state = reactive({
     error: string | null
     data: api.ContextInspector | null
   },
+  // P1-4: per-session, per-user-message regen sibling
+  // cache. Keyed by [sessionId][userMsgId] = the full
+  // RepliesResponse from GET .../replies. Loaded on
+  // demand the first time the user hovers a paginated
+  // bubble (so the common single-shot case never pays
+  // the fetch cost) and refreshed when a regen
+  // completes or the user clicks ◀/▶.
+  //
+  // The cache is per-session because forks and project
+  // switches invalidate every session's data; the
+  // existing session-eviction paths already clear
+  // sessionMessages and friends, so this map piggybacks
+  // on the same lifecycle.
+  sessionReplies: {} as Record<string, Record<string, api.RepliesResponse>>,
+  // P1-4: per-session user-message summary cache. Keyed
+  // by [sessionId][userMsgId] = UserMessageSummary. Same
+  // lazy-load / evict lifecycle as sessionReplies. We
+  // keep a separate map (rather than just reading from
+  // sessionMessages) because the user message might be
+  // on a page the client hasn't loaded yet (the
+  // infinite-scroll loader fetches 50 messages at a
+  // time, and a paginated bubble's user message could
+  // be on an older page).
+  sessionUserMsgs: {} as Record<string, Record<string, api.UserMessageSummary>>,
 })
 
 export const currentMessages = computed(() =>
@@ -275,6 +299,13 @@ function evictColdSessions() {
     if (sid === state.currentID) continue
     revokeSessionBlobUrls(sid)
     delete state.sessionMessages[sid]
+    // P1-4: drop the per-session regen cache too. The
+    // server-side replies survive (they're keyed by
+    // user message ids in the DB), but the local
+    // user-message summaries and sibling lists are
+    // stale the moment the session is evicted.
+    delete state.sessionReplies[sid]
+    delete state.sessionUserMsgs[sid]
     delete _loadedSessions[sid]
   }
 }
@@ -317,6 +348,12 @@ export async function setActiveProject(path: string) {
   state.sessionTodos = {}
   state.sessionWorking = {}
   state.sessionPaging = {}
+  // P1-4: clear the per-session regen caches. All
+  // sessions in the previous project are being
+  // discarded; their per-user-message summaries and
+  // sibling lists are stale.
+  state.sessionReplies = {}
+  state.sessionUserMsgs = {}
   // Revoke blob URLs for any staged attachments in the
   // sessions we're discarding, then drop the maps entirely.
   // Question / confirm dialogs keyed to those sessions get
@@ -607,6 +644,11 @@ export async function deleteSessionById(id: string) {
   delete state.sessionTodos[id]
   delete state.sessionWorking[id]
   delete state.sessionPaging[id]
+  // P1-4: drop the per-session regen caches too. The
+  // session is being archived; its replies and
+  // user-message summaries are no longer reachable.
+  delete state.sessionReplies[id]
+  delete state.sessionUserMsgs[id]
   // Per-session state must also be torn down so a session with
   // the same id later (after createSession) doesn't see the
   // previous session's staged attachments or stale question /
@@ -2139,22 +2181,30 @@ export function endStream(id: string) {
 
 // regenerateMessage is the P1-3 entry point. The
 // MessageBubble calls this when the user clicks "↻
-// 重新生成" on an assistant bubble. The flow:
+// 重新生成" on an assistant bubble. The P1-4 flow:
 //
 //   1. Locate the user message that precedes the target
 //      assistant bubble (the regen target is the
-//      user message — the server deletes everything
-//      after it).
-//   2. Pop the trailing assistant message from the
-//      local list. The server will stream a new one
-//      back live, and a stale local bubble would
-//      conflict with the parts the chat store
-//      appends from the SSE stream.
-//   3. Call api.streamRegenerate. The server
-//      physically truncates the DB rows and re-runs
-//      the agent loop. The SSE events arrive on
-//      opts.onEvent and are routed through
-//      appendStreamEvent just like a normal send.
+//      user message — the server archives every
+//      sibling in the regen group and re-runs the
+//      agent loop).
+//   2. Mark the trailing assistant message as
+//      `is_archived = true` LOCALLY (optimistic; the
+//      server will also archive it on its side once
+//      ArchiveSiblings runs). The message stays in
+//      sessionMessages[sessionId] — the P1-4 main
+//      timeline SQL no longer filters it out server-
+//      side, and the bubble's "上一版回答" chip + ◀
+//      N/M ▶ pager will pick it up once the
+//      regen completes and the new sibling lands.
+//      We don't pop the row (P1-3 behaviour) because
+//      the user can now navigate to it via the pager.
+//   3. Call api.streamRegenerate. The server archives
+//      siblings server-side, then re-runs the agent
+//      loop. The SSE events arrive on opts.onEvent
+//      and are routed through appendStreamEvent just
+//      like a normal send. The new assistant row
+//      streams into the pre-created bubble placeholder.
 //
 // The function is intentionally NOT re-entrant: the
 // chat store's `state.streaming[id]` flag prevents
@@ -2175,22 +2225,30 @@ export async function regenerateMessage(
   const msgs = state.sessionMessages[sessionId]
   if (!msgs) return
 
-  // Pop the trailing assistant message (if any). The
-  // server is about to delete it server-side; we
-  // delete it locally too so the new stream can
-  // rebuild the bubble from scratch.
-  // We only pop if the last message is an assistant —
-  // if the user clicked regen on a bubble that's
-  // already in a different position, bail.
+  // P1-4: optimistically mark the trailing assistant
+  // message as archived so the UI shows the bubble
+  // as "上一版回答" the moment the regen starts. The
+  // server's ArchiveSiblings call is authoritative
+  // and lands first (before the SSE stream), so by
+  // the time the new sibling is appended the local
+  // state and the DB agree. We mutate the message in
+  // place; Vue's reactive map picks up the change
+  // and re-renders the bubble with is_archived=true
+  // (which the template branches on for the chip +
+  // pager UI).
+  //
+  // We don't pop the row (P1-3 behaviour) because
+  // the user can now navigate to it via the pager.
   const last = msgs[msgs.length - 1]
   if (last && last.role === 'assistant') {
-    msgs.pop()
+    last.is_archived = true
+    last.regen_group_id = String(userMessageId)
   } else {
     // Trailing message is a user / system message —
-    // nothing to pop. The regen endpoint will still
-    // work (it deletes from user_message_id+1
-    // onwards and the user prompt drives the new
-    // reply).
+    // nothing to archive locally. The regen endpoint
+    // will still work: it archives every existing
+    // sibling in the user message's regen group, and
+    // the user prompt drives the new reply.
   }
 
   // Start a fresh stream slot so the chat store
@@ -2201,7 +2259,28 @@ export async function regenerateMessage(
   // Pre-create the trailing assistant bubble so the
   // placeholder is reachable — appendStreamEvent
   // relies on this for content / thinking deltas.
-  msgs.push({ role: 'assistant', content: '', parts: [] })
+  // The new row's regen_group_id is set optimistically
+  // here too (matches what the server's persistAssistant
+  // will stamp) so the bubble can render the pager
+  // without a server round-trip once the stream
+  // completes.
+  msgs.push({
+    role: 'assistant',
+    content: '',
+    parts: [],
+    is_archived: false,
+    regen_group_id: String(userMessageId),
+  })
+
+  // Invalidate the replies cache for this user message:
+  // the regen just changed the sibling set (one new
+  // active, one archived). The next ◀/▶ hover will
+  // re-fetch. We don't refresh eagerly because the
+  // stream is still in flight — the regen_group_id
+  // is stable, but the row ids change.
+  if (state.sessionReplies[sessionId]) {
+    delete state.sessionReplies[sessionId][String(userMessageId)]
+  }
 
   const meta = state.sessionMeta[sessionId] || ({} as any)
   try {
@@ -2211,8 +2290,8 @@ export async function regenerateMessage(
       style: meta.style,
       signal: ctrl.signal,
       // P0-1: same recovery path on stream drop. The
-      // server has already truncated the rows, so
-      // the snapshot returns the freshly-rebuilt
+      // server has already archived the old siblings,
+      // so the snapshot returns the freshly-built
       // assistant message parts.
       onStreamDrop: ({ lastSeq, reason }) => {
         recoverMissingParts(sessionId, lastSeq, reason).catch(() => {})
@@ -2221,6 +2300,114 @@ export async function regenerateMessage(
     })
   } finally {
     endStream(sessionId)
+  }
+}
+
+// P1-4: fetch the full regen group for a user message.
+// Lazy-loaded by MessageBubble the first time the user
+// hovers a paginated bubble (so the common single-shot
+// case never pays the fetch cost). The result is cached
+// in state.sessionReplies[sessionId][userMsgId] until
+// the user does something that invalidates it (a regen,
+// a switchSession, a delete).
+//
+// On error: surfaces the toast via the same _uiMessageHandler
+// rollback uses. The caller (MessageBubble) treats
+// undefined as "no pager" and renders the single-reply
+// shape.
+export async function fetchReplies(
+  sessionId: string,
+  userMsgId: number,
+): Promise<api.RepliesResponse | null> {
+  if (!sessionId || !userMsgId) return null
+  // Cache hit. Skip the round-trip — the cache is
+  // invalidated by regen / switchSession / delete,
+  // not by passive reads.
+  const cached = state.sessionReplies[sessionId]?.[String(userMsgId)]
+  if (cached) return cached
+  try {
+    const r = await api.listReplies(sessionId, userMsgId)
+    if (!state.sessionReplies[sessionId]) {
+      state.sessionReplies[sessionId] = {}
+    }
+    state.sessionReplies[sessionId][String(userMsgId)] = r
+    // Mirror the user_message summary into the dedicated
+    // cache so the chip / anchor-FAB paths can read it
+    // without walking the full replies payload.
+    if (!state.sessionUserMsgs[sessionId]) {
+      state.sessionUserMsgs[sessionId] = {}
+    }
+    state.sessionUserMsgs[sessionId][String(userMsgId)] = r.user_message
+    return r
+  } catch (e: any) {
+    // 404 means the user message has no regen history
+    // (single-shot legacy row). Surface as "no pager"
+    // by returning null — the bubble stays in the
+    // single-reply shape. Other errors go to the toast.
+    if (e?.status === 404 || /not found/i.test(String(e?.message || e))) {
+      return null
+    }
+    _uiMessageHandler?.({ kind: 'error', text: `获取历史回复失败：${e?.message || e}` })
+    return null
+  }
+}
+
+// P1-4: switch which reply is the active one in a regen
+// group. Called from MessageBubble when the user clicks
+// ◀/▶ on the bubble's pager. After the server
+// ActivateSibling runs, the local store mutates each
+// affected message's is_archived flag in place (the
+// new active flips to false; every other sibling in
+// the group flips to true). The cached replies payload
+// is replaced with the server's response so the next
+// render uses the fresh active_reply_id.
+//
+// `messages` lookup is a linear scan per call — fine
+// because regen groups are bounded at 20 (MaxRegenPerGroup
+// on the server). When the cap is hit the chat history
+// is already O(20) per user message, so an O(N×M) walk
+// is dominated by the (small) N, not the (potentially
+// very large) M.
+export async function activateReply(
+  sessionId: string,
+  userMsgId: number,
+  replyId: number,
+): Promise<boolean> {
+  if (!sessionId || !userMsgId || !replyId) return false
+  try {
+    const r = await api.activateReply(sessionId, userMsgId, replyId)
+    // Update the cache so the next ◀/▶ hover reads
+    // the fresh active_reply_id without a round-trip.
+    if (!state.sessionReplies[sessionId]) {
+      state.sessionReplies[sessionId] = {}
+    }
+    state.sessionReplies[sessionId][String(userMsgId)] = r
+    if (!state.sessionUserMsgs[sessionId]) {
+      state.sessionUserMsgs[sessionId] = {}
+    }
+    state.sessionUserMsgs[sessionId][String(userMsgId)] = r.user_message
+    // Apply the new active/archived flags to the local
+    // message list. Every row in the server's replies
+    // payload has its is_archived value mirrored onto
+    // the matching local message (matched by id). The
+    // server is the source of truth for the visibility
+    // flag, so we don't try to compute it ourselves.
+    const msgs = state.sessionMessages[sessionId]
+    if (msgs) {
+      for (const reply of r.replies) {
+        if (reply.id == null) continue
+        for (const m of msgs) {
+          if (m.id === reply.id) {
+            m.is_archived = !!reply.is_archived
+            break
+          }
+        }
+      }
+    }
+    return true
+  } catch (e: any) {
+    _uiMessageHandler?.({ kind: 'error', text: `切换回复失败：${e?.message || e}` })
+    return false
   }
 }
 
@@ -2334,31 +2521,16 @@ export const currentPendingInput = computed(() =>
 // deleted messages for undo, and auto-fills the input with the
 // last rolled-back user message.
 //
-// id wait: the user message that triggered the current turn has
-// its row id (`user_message_id`) stamped onto the local copy only
-// when the SSE `done` event lands — see appendStreamEvent, which
-// walks the trailing user message and sets `msgs[i].id`. Until
-// that event arrives (i.e. while the LLM is still streaming, or
-// in the brief window after the stream ends before the final
-// chunk reaches us), the local `id` is `undefined` and the
-// rollback endpoint would reject `before_id <= 0`. We poll for
-// the id with a short timeout before giving up; in practice the
-// `done` event usually lands within ~100ms, so the user almost
-// never sees the wait. The previous behaviour was a silent
-// `return` here, which made the dialog close but did nothing —
-// the user reported "点击撤销按钮弹出了二次确认，但是二次确认框
-// 点击确定后撤回不生效" because they had no idea the rollback
-// was dropped on the floor.
-const ROLLBACK_ID_WAIT_MS = 3000
-const ROLLBACK_ID_POLL_MS = 50
-
-async function waitForMessageId(msg: Message, ms: number): Promise<boolean> {
-  const deadline = Date.now() + ms
-  while (!msg.id && Date.now() < deadline) {
-    await new Promise<void>(r => setTimeout(r, ROLLBACK_ID_POLL_MS))
-  }
-  return !!msg.id
-}
+// The user message's row id (`msg.id`) is minted at send time
+// (see InputArea.vue's send() → Date.now()*1000 + random) and
+// stamped onto the local Message BEFORE the SSE call. The
+// backend adopts the same id as the SQLite row id. As a result
+// rollback always has a valid id to target — even when the
+// stream ends in an `error` event (no `done`, no
+// `user_message_id`) or the connection drops before any event
+// lands. The previous waitForMessageId / 3-second timeout
+// dance was only there to bridge the gap between "user clicks
+// send" and "done event lands" and is no longer needed.
 
 // Tiny bus for the chat store to surface user-visible errors.
 // Naive UI's useMessage() requires a component context, so the
@@ -2383,17 +2555,16 @@ export async function rollbackTo(sessionId: string, messageIndex: number) {
     uiError('撤回失败：消息不存在')
     return
   }
-  // Wait for the server-assigned row id if the user message is
-  // still in the "row id pending" state (freshly sent during the
-  // current turn). Without this wait, the rollback endpoint
-  // rejects the call with 400 ("before_id is required and must be
-  // > 0") and the UI does nothing — see the comment block above.
+  // msg.id is set at send time (see InputArea.vue send()), so
+  // for newly-sent messages this branch is never taken. The
+  // only path that lands here is a rollback against an
+  // older message loaded from the DB pre-id schema, which
+  // is exceedingly rare (the id has been on every message
+  // since the very first migration). Surface a clear error
+  // if it ever happens instead of silently failing.
   if (!msg.id) {
-    const got = await waitForMessageId(msg, ROLLBACK_ID_WAIT_MS)
-    if (!got) {
-      uiError('撤回失败：消息尚未完成发送，请稍后再试')
-      return
-    }
+    uiError('撤回失败：消息缺少 ID，请刷新后重试')
+    return
   }
 
   // If currently streaming, abort first.
@@ -2403,7 +2574,7 @@ export async function rollbackTo(sessionId: string, messageIndex: number) {
 
   let result
   try {
-    result = await api.rollbackMessages(sessionId, msg.id!)
+    result = await api.rollbackMessages(sessionId, msg.id)
   } catch (e: any) {
     // Network / server error: surface it instead of silently
     // dropping the request. The user would otherwise see the
