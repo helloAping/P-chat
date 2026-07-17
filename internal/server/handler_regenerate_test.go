@@ -1,8 +1,8 @@
-// P1-3 Regenerate endpoint tests. Verifies the
-// physical-delete + re-run shape: the user message is
-// preserved, every later row in the conversation is
-// removed, and the agent loop runs again to produce a
-// fresh assistant reply.
+// P1-4 Regenerate endpoint tests. Verifies the
+// soft-archive + re-run shape: the user message is
+// preserved, the existing assistant sibling is
+// archived (NOT hard-deleted as in P1-3), and a fresh
+// assistant row lands with the same regen_group_id.
 package server
 
 import (
@@ -17,17 +17,27 @@ import (
 	"github.com/p-chat/pchat/internal/llm"
 )
 
-// TestRegenerate_TruncatesAfterUserMessage verifies the
-// happy path: 1 user + 1 assistant → regen → assistant
-// row is gone, user row survives, and a new assistant
-// row appears in the response.
+// TestRegenerate_ArchivesOldReply verifies the P1-4
+// happy path: 1 user + 1 assistant → regen → the old
+// assistant row is archived (NOT in the main list, but
+// still in the messages table for the ◀ N/M ▶ pager),
+// the user row survives, and a new assistant row
+// appears as the active reply.
 //
 // We don't drive the full SSE stream (that would need a
 // mock LLM and a longer test). Instead we confirm the
-// truncate side-effect via ListMessages AFTER the
-// regenerate, which is the user-visible outcome the
-// frontend relies on.
-func TestRegenerate_TruncatesAfterUserMessage(t *testing.T) {
+// archive side-effect via ListMessages AFTER the
+// regenerate: the main list should NOT show the original
+// "hello" content (because is_archived = 1 filters it
+// out), and the user row's content survives.
+//
+// The test inserts the assistant row with the
+// regen_group_id of the user message so the regen
+// handler's ArchiveSiblings call actually has a target
+// to archive — without that, the legacy AddMessage
+// path leaves regen_group_id NULL and the regen
+// handler has nothing to archive.
+func TestRegenerate_ArchivesOldReply(t *testing.T) {
 	s, _ := newTestServer(t)
 	store := s.store
 	convID, err := store.NewConversation()
@@ -39,17 +49,32 @@ func TestRegenerate_TruncatesAfterUserMessage(t *testing.T) {
 	}
 
 	// Insert a user message and an assistant reply.
+	// The assistant row is written with regen_group_id =
+	// strconv(userID) so the regen handler can find and
+	// archive it. This mirrors what the agent's
+	// persistAssistant does for production traffic.
 	store.AddMessage(llm.Message{Role: "user", Content: "hi"})
-	store.AddMessage(llm.Message{Role: "assistant", Content: "hello"})
 	if err := store.Flush(); err != nil {
 		t.Fatal(err)
 	}
-
-	// Find the user message id.
 	userID := store.GetLastUserMessageID(convID)
 	if userID <= 0 {
 		t.Fatalf("expected user message id > 0, got %d", userID)
 	}
+	// Use the P1-4 helper so the row is correctly tagged
+	// with the user message's id as regen_group_id.
+	store.AddChatMessageWithMetaToRegen(convID,
+		llm.ChatMessage{Role: "assistant", Content: "hello"},
+		map[string]string{"role": "assistant"},
+		strconv.FormatInt(userID, 10),
+		false,
+	)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Find the user message id (already looked up above
+	// to set regen_group_id on the assistant row).
 
 	// Call regenerate. The agent loop won't be able to
 	// reach a real LLM (the test config has an invalid

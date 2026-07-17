@@ -206,11 +206,27 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// compressed summary. Powers the "上下文" drawer
 		// in the chat UI. See handler.go:ContextInspector.
 		api.GET("/sessions/:id/context", h.ContextInspector)
-		// P1-3: regenerate the assistant reply for a given
-		// user message. Physically deletes everything after
-		// that user message in the conversation, then re-runs
-		// the agent loop. See handler.go:Regenerate.
+		// P1-3 / P1-4: regenerate the assistant reply for a
+		// given user message. P1-3 physically deleted
+		// everything after that user message; P1-4
+		// soft-archives (is_archived=1) so the user can
+		// paginate back to previous replies via the
+		// /replies endpoint and the bubble's ◀ N/M ▶
+		// pager. See handler.go:Regenerate.
 		api.POST("/sessions/:id/regenerate", h.Regenerate)
+		// P1-4: list all sibling replies (active + archived)
+		// in the regen group for a given user message. The
+		// response includes the user message summary (id +
+		// truncated content) so the frontend can render the
+		// "上一版回答" chip and the pager preview without a
+		// second round-trip. See handler.go:ListRegenReplies.
+		api.GET("/sessions/:id/messages/:user_msg_id/replies", h.ListRegenReplies)
+		// P1-4: switch which reply is the active one in a
+		// regen group. The body carries the user_message_id
+		// (used to compute group_id and validate the reply
+		// actually belongs to that group). See
+		// handler.go:ActivateRegenReply.
+		api.POST("/sessions/:id/messages/:reply_id/activate", h.ActivateRegenReply)
 		api.POST("/sessions/:id/compress", h.CompressConversation)
 		api.PATCH("/sessions/:id/reasoning-effort", h.SetReasoningEffort)
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)

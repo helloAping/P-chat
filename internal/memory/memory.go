@@ -56,6 +56,28 @@ type Message struct {
 	Metadata       string    `json:"metadata,omitempty"`
 	MsgType        int       `json:"msg_type,omitempty"`
 	SubmitToLLM    int       `json:"submit_to_llm,omitempty"`
+	// RegenGroupID is the SQLite row id of the user message
+	// that triggered this assistant reply, stringified to
+	// keep the field optional. Same value across every
+	// sibling in a regenerate group (one user prompt can
+	// produce many assistant replies). Nil/empty for
+	// non-assistant rows and for pre-migration-9 assistant
+	// rows that have never been regen'd.
+	//
+	// See migration 9 (regen_history) for the schema
+	// addition and backfill, and store.go's
+	// ArchiveSiblings / ListSiblings / ActivateSibling
+	// for the group-management API.
+	RegenGroupID *string `json:"regen_group_id,omitempty"`
+	// IsArchived is the visibility flag the UI uses to
+	// pick which sibling to show. 0 = the active reply
+	// (default, what ListMessages returns); 1 = an older
+	// regenerated sibling that lives in the same group
+	// but is hidden from the main timeline. The user
+	// can paginate to archived siblings via the
+	// bubble's ◀ N/M ▶ pager or the new
+	// GET .../replies endpoint.
+	IsArchived bool `json:"is_archived"`
 }
 
 // Summary records an LLM-generated compression of a range of messages.
@@ -375,14 +397,82 @@ func (s *Store) AddChatMessageWithMeta(msg llm.ChatMessage, extraMeta map[string
 }
 
 // AddChatMessageWithMetaTo is the multi-session-safe variant.
+// Internally delegates to AddChatMessageWithMetaToRegen with
+// empty regenGroupID and isArchived=false — the P1-4 regen-
+// history fields are NULL/0 for any non-regen write, so
+// legacy callers (agent's SendMessage path, sub-agents,
+// test fixtures) get the same single-shot behaviour
+// without a signature change.
 func (s *Store) AddChatMessageWithMetaTo(convID string, msg llm.ChatMessage, extraMeta map[string]string) {
+	s.AddChatMessageWithMetaToRegen(convID, msg, extraMeta, "", false)
+}
+
+// AddChatMessageWithMetaToRegen is the P1-4 regen-aware
+// variant of AddChatMessageWithMetaTo. regenGroupID is the
+// string form of the user message id that this assistant
+// row is replying to (empty for non-regen writes; the new
+// row's regen_group_id column will be NULL). isArchived
+// controls the new row's visibility flag — false for the
+// active regen sibling, true for the archived path
+// (ArchiveSiblings uses a direct UPDATE, not this method,
+// so the false branch is the only one used in practice).
+//
+// P1-4 callers:
+//   - agent.persistAssistant uses
+//     AddChatMessageWithMetaToRegen(req.SessionID, msg, meta,
+//     req.RegenGroupID, false) when persisting the agent
+//     loop's final assistant row. Non-empty RegenGroupID
+//     marks the row as a new sibling in that regen group.
+func (s *Store) AddChatMessageWithMetaToRegen(convID string, msg llm.ChatMessage, extraMeta map[string]string, regenGroupID string, isArchived bool) {
 	m := encodeChatMeta(msg)
 	for k, v := range extraMeta {
 		m[k] = v
 	}
 	b, _ := json.Marshal(m)
+	var rgPtr *string
+	if regenGroupID != "" {
+		rg := regenGroupID
+		rgPtr = &rg
+	}
 	s.pendingMu.Lock()
 	s.pendingWrites = append(s.pendingWrites, Message{
+		ConversationID: convID,
+		Role:           msg.Role,
+		Content:        msg.Content,
+		CreatedAt:      time.Now(),
+		Metadata:       string(b),
+		MsgType:        msg.MsgType,
+		SubmitToLLM:    msg.SubmitToLLM,
+		RegenGroupID:   rgPtr,
+		IsArchived:     isArchived,
+	})
+	full := len(s.pendingWrites) >= s.maxPending
+	s.pendingMu.Unlock()
+	if full {
+		_ = s.Flush()
+	}
+}
+
+// AddChatMessageToWithID is like AddChatMessageTo but persists the
+// row with an explicit rowID instead of letting SQLite AUTOINCREMENT
+// pick one. Used by the agent when the frontend has pre-minted a
+// client_msg_id at send time (see SendMessageRequest.ClientMsgID) —
+// the row id on disk and the msg.id on the client end up identical,
+// so rollback and regenerate have a valid target from the moment
+// the user clicks send, without having to wait for the SSE `done`
+// event to broadcast the server-assigned id back.
+//
+// rowID == 0 falls back to the autoincrement path (the same
+// behaviour as AddChatMessageTo) so callers can pass through
+// the request's optional field without an extra branch.
+func (s *Store) AddChatMessageToWithID(convID string, msg llm.ChatMessage, rowID int64) {
+	meta := encodeChatMeta(msg)
+	b, _ := json.Marshal(meta)
+	s.pendingMu.Lock()
+	s.pendingWrites = append(s.pendingWrites, Message{
+		// 0 here means "let AUTOINCREMENT pick" in Flush;
+		// any positive value is inserted verbatim.
+		ID:             rowID,
 		ConversationID: convID,
 		Role:           msg.Role,
 		Content:        msg.Content,
@@ -419,29 +509,33 @@ func (s *Store) GetChatMessagesFor(convID string, limit int) []llm.ChatMessage {
 	return msgs
 }
 
-// CountChatMessages returns the total number of messages in
-// convID. Used by the history-paging endpoint to decide
-// whether there are older messages to load.
+// CountChatMessages returns the total number of *active*
+// (is_archived = 0) messages in convID. Used by the
+// history-paging endpoint to decide whether there are
+// older messages to load. The P1-4 visibility filter is
+// applied so the count matches what the main timeline
+// actually shows — archived regen siblings don't count.
 func (s *Store) CountChatMessages(convID string) int {
 	if convID == "" {
 		return 0
 	}
 	var n int
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE conversation_id = ?`, convID).Scan(&n)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND is_archived = 0`, convID).Scan(&n)
 	return n
 }
 
 // HasOlderMessages reports whether convID has at least one
-// message with id < oldestID. Used by the paged
-// ListMessages handler to set `has_more` without loading
-// the whole history. Cheap: a single indexed EXISTS query.
+// active (is_archived = 0) message with id < oldestID.
+// Used by the paged ListMessages handler to set `has_more`
+// without loading the whole history. Cheap: a single
+// indexed EXISTS query.
 func (s *Store) HasOlderMessages(convID string, oldestID int64) bool {
 	if convID == "" || oldestID <= 0 {
 		return false
 	}
 	var exists bool
 	_ = s.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ? AND id < ?)`,
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ? AND id < ? AND is_archived = 0)`,
 		convID, oldestID,
 	).Scan(&exists)
 	return exists
@@ -459,7 +553,7 @@ func (s *Store) HasOlderMessagesBySeq(convID string, oldestSeq int64) bool {
 	}
 	var exists bool
 	_ = s.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ? AND seq < ?)`,
+		`SELECT EXISTS(SELECT 1 FROM messages WHERE conversation_id = ? AND seq < ? AND is_archived = 0)`,
 		convID, oldestSeq,
 	).Scan(&exists)
 	return exists
@@ -480,7 +574,7 @@ func (s *Store) GetChatMessagesWithMetaN(limit int) ([]llm.ChatMessage, []string
 // GetChatMessagesWithMetaFor is the multi-session-safe variant.
 // Pass the conversation id explicitly; empty id returns nil.
 func (s *Store) GetChatMessagesWithMetaFor(convID string, limit int) ([]llm.ChatMessage, []string, []int64) {
-	msgs, metas, createds, _, _ := s.GetChatMessagesWithMetaPage(convID, 0, limit)
+	msgs, metas, createds, _, _, _, _ := s.GetChatMessagesWithMetaPage(convID, 0, limit)
 	return msgs, metas, createds
 }
 
@@ -500,46 +594,65 @@ func (s *Store) GetChatMessagesWithMetaFor(convID string, limit int) ([]llm.Chat
 // backwards compat: id is kept for the legacy `before_id`
 // cursor while seq is the new stable cursor (see migration
 // 8 add_message_seq for the rationale).
-func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64, []int64) {
+//
+// The sixth and seventh returns carry the P1-4 regen
+// history fields: regen_group_id (string form of the user
+// message id, empty when the row has no group) and
+// is_archived (the visibility flag — 1 = hidden from the
+// main timeline). The main SELECT applies `is_archived = 0`
+// so archived siblings never appear here; the caller still
+// gets the flag value (always false on this path) for
+// downstream consistency with the seq-paged counterpart.
+func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64, []int64, []string, []bool) {
 	_ = s.Flush()
 	if convID == "" {
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil, nil
 	}
 
 	// Two query shapes: with and without the beforeID filter.
 	// We could use a single query with "id < ? OR ? = 0" but
 	// keeping the predicates narrow helps the SQLite planner
 	// and keeps the EXPLAIN QUERY PLAN output readable.
+	//
+	// `is_archived = 0` is the P1-4 visibility filter: the
+	// main timeline only shows the active reply per regen
+	// group. Archived siblings live in the messages table
+	// for the ◀ N/M ▶ pager but are hidden from this
+	// SELECT. The idx_messages_conv_seq index already covers
+	// (conversation_id, id) ordering; the is_archived=0
+	// check is a per-row filter, not a table scan.
 	var (
 		rows *sql.Rows
 		err  error
 	)
 	if beforeID > 0 {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
-			 WHERE conversation_id = ? AND id < ?
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq, regen_group_id, is_archived FROM messages
+			 WHERE conversation_id = ? AND id < ? AND is_archived = 0
 			 ORDER BY id DESC LIMIT ?`,
 			convID, beforeID, limitOrHuge(limit),
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
-			 WHERE conversation_id = ?
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq, regen_group_id, is_archived FROM messages
+			 WHERE conversation_id = ? AND is_archived = 0
 			 ORDER BY id DESC LIMIT ?`,
 			convID, limitOrHuge(limit),
 		)
 	}
 	if err != nil {
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil, nil
 	}
 	defer rows.Close()
 
 	type row struct {
-		id      int64
-		msg     llm.ChatMessage
-		meta    string
-		created int64
-		seq     int64
+		id           int64
+		msg          llm.ChatMessage
+		meta         string
+		created      int64
+		seq          int64
+		regenGroupID string
+		isArchived   bool
 	}
 	var rev []row
 	for rows.Next() {
@@ -550,8 +663,10 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 			created               int64
 			msgType, submitToLLM  int
 			seq                   sql.NullInt64
+			regenGroup            sql.NullString
+			isArchived            int
 		)
-		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq); err != nil {
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq, &regenGroup, &isArchived); err != nil {
 			break
 		}
 		meta := ""
@@ -562,9 +677,13 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 		if seq.Valid {
 			seqVal = seq.Int64
 		}
+		rg := ""
+		if regenGroup.Valid {
+			rg = regenGroup.String
+		}
 		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
-			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal})
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal, regenGroupID: rg, isArchived: isArchived == 1})
 		}
 	}
 	n := len(rev)
@@ -573,14 +692,18 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 	createds := make([]int64, n)
 	ids := make([]int64, n)
 	seqs := make([]int64, n)
+	regenGroupIDs := make([]string, n)
+	isArchiveds := make([]bool, n)
 	for i := 0; i < n; i++ {
 		out[i] = rev[n-1-i].msg
 		metas[i] = rev[n-1-i].meta
 		createds[i] = rev[n-1-i].created
 		ids[i] = rev[n-1-i].id
 		seqs[i] = rev[n-1-i].seq
+		regenGroupIDs[i] = rev[n-1-i].regenGroupID
+		isArchiveds[i] = rev[n-1-i].isArchived
 	}
-	return out, metas, createds, ids, seqs
+	return out, metas, createds, ids, seqs, regenGroupIDs, isArchiveds
 }
 
 // GetChatMessagesWithMetaPageBySeq is the seq-based
@@ -597,11 +720,13 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 // Both methods share the same in-memory layout (parallel
 // slices, oldest-first order). The SQL is just `seq < ?`
 // instead of `id < ?`, indexed by idx_messages_conv_seq
-// (migration 8).
-func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64, []int64) {
+// (migration 8). P1-4 adds the is_archived=0 filter and
+// the regen_group_id / is_archived return slices (see
+// GetChatMessagesWithMetaPage for the rationale).
+func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64, limit int) ([]llm.ChatMessage, []string, []int64, []int64, []int64, []string, []bool) {
 	_ = s.Flush()
 	if convID == "" {
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil, nil
 	}
 	var (
 		rows *sql.Rows
@@ -609,30 +734,32 @@ func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64,
 	)
 	if beforeSeq > 0 {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
-			 WHERE conversation_id = ? AND seq < ?
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq, regen_group_id, is_archived FROM messages
+			 WHERE conversation_id = ? AND seq < ? AND is_archived = 0
 			 ORDER BY seq DESC LIMIT ?`,
 			convID, beforeSeq, limitOrHuge(limit),
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq FROM messages
-			 WHERE conversation_id = ?
+			`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq, regen_group_id, is_archived FROM messages
+			 WHERE conversation_id = ? AND is_archived = 0
 			 ORDER BY seq DESC LIMIT ?`,
 			convID, limitOrHuge(limit),
 		)
 	}
 	if err != nil {
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil, nil
 	}
 	defer rows.Close()
 
 	type row struct {
-		id      int64
-		msg     llm.ChatMessage
-		meta    string
-		created int64
-		seq     int64
+		id           int64
+		msg          llm.ChatMessage
+		meta         string
+		created      int64
+		seq          int64
+		regenGroupID string
+		isArchived   bool
 	}
 	var rev []row
 	for rows.Next() {
@@ -643,8 +770,10 @@ func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64,
 			created               int64
 			msgType, submitToLLM  int
 			seq                   sql.NullInt64
+			regenGroup            sql.NullString
+			isArchived            int
 		)
-		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq); err != nil {
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq, &regenGroup, &isArchived); err != nil {
 			break
 		}
 		meta := ""
@@ -655,9 +784,13 @@ func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64,
 		if seq.Valid {
 			seqVal = seq.Int64
 		}
+		rg := ""
+		if regenGroup.Valid {
+			rg = regenGroup.String
+		}
 		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
-			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal})
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal, regenGroupID: rg, isArchived: isArchived == 1})
 		}
 	}
 	n := len(rev)
@@ -666,14 +799,18 @@ func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64,
 	createds := make([]int64, n)
 	ids := make([]int64, n)
 	seqs := make([]int64, n)
+	regenGroupIDs := make([]string, n)
+	isArchiveds := make([]bool, n)
 	for i := 0; i < n; i++ {
 		out[i] = rev[n-1-i].msg
 		metas[i] = rev[n-1-i].meta
 		createds[i] = rev[n-1-i].created
 		ids[i] = rev[n-1-i].id
 		seqs[i] = rev[n-1-i].seq
+		regenGroupIDs[i] = rev[n-1-i].regenGroupID
+		isArchiveds[i] = rev[n-1-i].isArchived
 	}
-	return out, metas, createds, ids, seqs
+	return out, metas, createds, ids, seqs, regenGroupIDs, isArchiveds
 }
 
 // GetAssistantMessagesAfterSeq is the P0-1 recovery query.
@@ -1048,9 +1185,23 @@ func (s *Store) Flush() error {
 		s.pendingMu.Unlock()
 		return err
 	}
+	// Note the explicit `id` column. `INSERT OR IGNORE` lets
+	// us mix two write modes in the same batch:
+	//   - m.ID == 0  → pass NULL → SQLite AUTOINCREMENT picks
+	//                  the next id (legacy path, used for
+	//                  assistant / tool_result / question rows).
+	//   - m.ID > 0   → pass m.ID verbatim → the row lands at
+	//                  the caller-minted id (used when the
+	//                  frontend has pre-minted a client_msg_id
+	//                  at send time; see AddChatMessageToWithID).
+	// The OR IGNORE clause means a duplicate explicit id is
+	// silently dropped instead of aborting the whole batch —
+	// vanishingly unlikely in practice (Date.now() × 1000 +
+	// random gives 13-16 digits of entropy) but cheap to be
+	// defensive about.
 	stmt, err := tx.Prepare(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO messages(id, conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq, regen_group_id, is_archived)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		_ = tx.Rollback()
@@ -1100,9 +1251,31 @@ func (s *Store) Flush() error {
 		cur := convCur[m.ConversationID]
 		next := base + cur + 1
 		convCur[m.ConversationID] = cur + 1
+		// idArg: NULL for autoincrement (m.ID == 0), explicit
+		// m.ID otherwise. The INSERT OR IGNORE above handles
+		// both shapes and the rare duplicate-id case.
+		var idArg sql.NullInt64
+		if m.ID > 0 {
+			idArg = sql.NullInt64{Int64: m.ID, Valid: true}
+		}
+		// regenGroupArg: NULL for legacy / non-regen writes;
+		// the explicit regen_group_id string for regen siblings.
+		// isArchived: 0 for the active write, 1 for siblings
+		// archived by ArchiveSiblings (rare in this path — the
+		// archive step happens in a separate UPDATE, see
+		// ArchiveSiblings in store.go).
+		var regenGroupArg sql.NullString
+		if m.RegenGroupID != nil && *m.RegenGroupID != "" {
+			regenGroupArg = sql.NullString{String: *m.RegenGroupID, Valid: true}
+		}
+		isArchived := 0
+		if m.IsArchived {
+			isArchived = 1
+		}
 		if _, err := stmt.Exec(
-			m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(),
+			idArg, m.ConversationID, m.Role, m.Content, m.CreatedAt.Unix(),
 			m.Metadata, m.MsgType, m.SubmitToLLM, next,
+			regenGroupArg, isArchived,
 		); err != nil {
 			_ = tx.Rollback()
 			// Put pending back so a per-message insert error
@@ -1582,7 +1755,7 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	// With SetMaxOpenConns(1) the single connection is held while
 	// rows is open; a tx.Begin() would deadlock waiting for it.
 	rows, err := s.db.Query(
-		`SELECT role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
+		`SELECT role, content, metadata, created_at, msg_type, submit_to_llm, is_archived FROM messages
 		 WHERE conversation_id = ? AND id <= ? ORDER BY id ASC`,
 		sourceConvID, beforeID,
 	)
@@ -1594,12 +1767,23 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 		role, content, meta         string
 		created                     int64
 		msgType, submitToLLM        int
+		// isArchived at fork source. We do NOT copy the
+		// regen_group_id from the source: a fork is its own
+		// conversation with its own regenerate history
+		// (user-confirmed scope: "fork 出去新会话一切从 0
+		// 开始"). The only thing we need to preserve per-row
+		// is the visibility flag — if the user forked at a
+		// point where the active reply was the 2nd regen
+		// sibling, the new conversation must show the same
+		// content as the active one (and the user can
+		// regen from there to get fresh history).
+		isArchived int
 	}
 	var msgs []row
 	for rows.Next() {
 		var r row
 		var metaStr sql.NullString
-		if err := rows.Scan(&r.role, &r.content, &metaStr, &r.created, &r.msgType, &r.submitToLLM); err != nil {
+		if err := rows.Scan(&r.role, &r.content, &metaStr, &r.created, &r.msgType, &r.submitToLLM, &r.isArchived); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -1633,7 +1817,7 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	}()
 
 	stmt, err := tx.Prepare(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq, is_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return nil, err
@@ -1645,9 +1829,12 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	// Walking the source msgs in id-ASC order (already
 	// guaranteed by the SELECT above) means we can
 	// stamp seq=i+1 for the i-th row — no MAX(seq)
-	// lookup needed.
+	// lookup needed. regen_group_id is always NULL on
+	// the fork: the new conversation has no regenerate
+	// history of its own (any regen the user does from
+	// here is a fresh group).
 	for i, r := range msgs {
-		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta, r.msgType, r.submitToLLM, int64(i+1)); err != nil {
+		if _, err := stmt.Exec(newID, r.role, r.content, r.created, r.meta, r.msgType, r.submitToLLM, int64(i+1), r.isArchived); err != nil {
 			return nil, err
 		}
 	}
@@ -1720,6 +1907,293 @@ func (s *Store) GetLastMessageID(convID string) int64 {
 	return id
 }
 
+// MaxRegenPerGroup caps the number of sibling replies a single
+// user prompt can accumulate via regenerate. Once a group has
+// `MaxRegenPerGroup` rows, ArchiveSiblings deletes the oldest
+// archived sibling in the same transaction so the group never
+// grows unbounded. 20 was chosen by the user during planning —
+// large enough that no real user hits it, small enough that
+// the archive SELECT cost stays O(20) per regen.
+const MaxRegenPerGroup = 20
+
+// ArchiveSiblings marks every row in the regen group (active +
+// archived) as archived except the one with id == keepActiveID,
+// which becomes the new active. Called from the Regenerate
+// handler just before re-running the agent loop: the user has
+// asked for a fresh answer, so the previously-active reply
+// (and any other siblings) move out of the main timeline.
+//
+// The 20-row cap is enforced in the same transaction: if the
+// group would exceed MaxRegenPerGroup after this archive pass,
+// the oldest archived siblings are hard-deleted until the
+// group fits the cap. The active row is never deleted by the
+// cap — even a 1-active + 19-archived group is within the
+// cap and stays untouched.
+//
+// groupID is the string form of the user message's row id
+// (the same value the agent loop stamps on the new
+// assistant reply's regen_group_id column). Empty groupID is
+// rejected — the caller must know which user message is
+// being regenerated.
+//
+// Returns the number of rows hard-deleted by the cap (0 when
+// the group was already within the cap). Useful for tests
+// and the cap-recovery telemetry.
+func (s *Store) ArchiveSiblings(convID, groupID string, keepActiveID int64) (deleted int, err error) {
+	_ = s.Flush()
+	if convID == "" {
+		return 0, fmt.Errorf("ArchiveSiblings: empty convID")
+	}
+	if groupID == "" {
+		return 0, fmt.Errorf("ArchiveSiblings: empty groupID")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	// 1. Mark every group row as archived except keepActiveID.
+	//    `is_archived = CASE WHEN id = ? THEN 0 ELSE 1 END`
+	//    is a single statement that runs once instead of N
+	//    individual UPDATEs. The idx_messages_conv_group
+	//    index covers the (convID, groupID) filter.
+	if _, err := tx.Exec(
+		`UPDATE messages
+		 SET is_archived = CASE WHEN id = ? THEN 0 ELSE 1 END
+		 WHERE conversation_id = ? AND regen_group_id = ?`,
+		keepActiveID, convID, groupID,
+	); err != nil {
+		return 0, fmt.Errorf("archive siblings: %w", err)
+	}
+
+	// 2. Enforce MaxRegenPerGroup in the same transaction.
+	//    Count the (active + archived) rows in the group; if
+	//    over the cap, hard-delete the oldest archived rows
+	//    by id ASC. The active row is never touched — the
+	//    cap protects storage, not the visible reply.
+	//
+	//    The cap is computed as `MaxRegenPerGroup - 1`
+	//    because the regen flow inserts a new assistant row
+	//    AFTER ArchiveSiblings returns. Without the -1, the
+	//    group would be at MaxRegenPerGroup after ArchiveSiblings
+	//    and at MaxRegenPerGroup+1 after the insert. Leaving
+	//    a one-row buffer keeps the post-insert count exactly
+	//    at the cap.
+	var n int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM messages
+		 WHERE conversation_id = ? AND regen_group_id = ?`,
+		convID, groupID,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count group: %w", err)
+	}
+	capLimit := MaxRegenPerGroup - 1
+	if capLimit < 1 {
+		capLimit = 1
+	}
+	if n > capLimit {
+		excess := n - capLimit
+		// Hard-delete the `excess` oldest archived rows. ORDER
+		// BY id ASC picks the oldest by insertion time (id is
+		// AUTOINCREMENT, monotonically increasing per session).
+		// The `is_archived = 1` guard is defensive: even though
+		// we just archived every non-keepActiveID row, a future
+		// caller might have a keepActiveID == 0 path that
+		// archives everything; we still want to delete
+		// archived-only rows.
+		res, err := tx.Exec(
+			`DELETE FROM messages
+			 WHERE id IN (
+			     SELECT id FROM messages
+			     WHERE conversation_id = ? AND regen_group_id = ?
+			       AND is_archived = 1
+			     ORDER BY id ASC
+			     LIMIT ?
+			 )`,
+			convID, groupID, excess,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("cap delete: %w", err)
+		}
+		if affected, _ := res.RowsAffected(); affected > 0 {
+			deleted = int(affected)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+	return deleted, nil
+}
+
+// ListSiblings returns every row in the regen group (active +
+// archived), oldest-first by id. Used by the
+// GET /sessions/:id/messages/:user_msg_id/replies endpoint
+// to build the bubble's ◀ N/M ▶ pager. The P1-4 visibility
+// filter is NOT applied — the caller wants the full sibling
+// set, archived or not, so the user can paginate to any
+// historical reply.
+//
+// groupID is the string form of the user message's row id
+// (same convention as ArchiveSiblings).
+//
+// Returns parallel slices mirroring the rest of the store's
+// "with meta" API: msgs (decoded ChatMessage), metas (raw
+// metadata JSON), createds (Unix timestamps), ids (SQLite
+// row ids), seqs (per-conversation logical position).
+// is_archived and regen_group_id are returned for the UI
+// pager to compute the active index.
+func (s *Store) ListSiblings(convID, groupID string) ([]llm.ChatMessage, []string, []int64, []int64, []int64, []bool, []string) {
+	_ = s.Flush()
+	if convID == "" || groupID == "" {
+		return nil, nil, nil, nil, nil, nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm, seq, regen_group_id, is_archived
+		 FROM messages
+		 WHERE conversation_id = ? AND regen_group_id = ?
+		 ORDER BY id ASC`,
+		convID, groupID,
+	)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, nil
+	}
+	defer rows.Close()
+
+	type row struct {
+		id           int64
+		msg          llm.ChatMessage
+		meta         string
+		created      int64
+		seq          int64
+		regenGroupID string
+		isArchived   bool
+	}
+	var rev []row
+	for rows.Next() {
+		var (
+			id                    int64
+			role, content         string
+			metaStr               sql.NullString
+			created               int64
+			msgType, submitToLLM  int
+			seq                   sql.NullInt64
+			regenGroup            sql.NullString
+			isArchived            int
+		)
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq, &regenGroup, &isArchived); err != nil {
+			break
+		}
+		meta := ""
+		if metaStr.Valid {
+			meta = metaStr.String
+		}
+		seqVal := int64(0)
+		if seq.Valid {
+			seqVal = seq.Int64
+		}
+		rg := ""
+		if regenGroup.Valid {
+			rg = regenGroup.String
+		}
+		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
+		for _, m := range msgs {
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created, seq: seqVal, regenGroupID: rg, isArchived: isArchived == 1})
+		}
+	}
+	n := len(rev)
+	out := make([]llm.ChatMessage, n)
+	metas := make([]string, n)
+	createds := make([]int64, n)
+	ids := make([]int64, n)
+	seqs := make([]int64, n)
+	isArchiveds := make([]bool, n)
+	regenGroupIDs := make([]string, n)
+	for i := 0; i < n; i++ {
+		out[i] = rev[i].msg
+		metas[i] = rev[i].meta
+		createds[i] = rev[i].created
+		ids[i] = rev[i].id
+		seqs[i] = rev[i].seq
+		isArchiveds[i] = rev[i].isArchived
+		regenGroupIDs[i] = rev[i].regenGroupID
+	}
+	return out, metas, createds, ids, seqs, isArchiveds, regenGroupIDs
+}
+
+// ActivateSibling makes the row identified by activeID the
+// group's only active reply, archiving every other row in
+// the same group. Used by the POST .../activate endpoint
+// when the user clicks ◀/▶ on the bubble's pager to view
+// a different historical reply.
+//
+// `activeID` MUST belong to the group identified by groupID;
+// the function verifies this and returns an error if not.
+// The check prevents a malicious client from activating an
+// arbitrary row from a different group / conversation.
+//
+// Returns nil on success. The caller (handler) is
+// responsible for re-querying the active row's content
+// (or the full sibling set) to send back to the client —
+// this function only updates the visibility flag.
+func (s *Store) ActivateSibling(convID, groupID string, activeID int64) error {
+	_ = s.Flush()
+	if convID == "" || groupID == "" {
+		return fmt.Errorf("ActivateSibling: empty convID or groupID")
+	}
+	if activeID <= 0 {
+		return fmt.Errorf("ActivateSibling: activeID must be > 0")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Verify the target row belongs to the right group /
+	// conversation. Two queries because the CASE expression
+	// in the UPDATE below doesn't error on a missing row
+	// (the WHERE convID=AND group=AND id= would match zero
+	// rows, no error, but the side effect of "every other
+	// row archived" would still fire — and that's wrong if
+	// activeID is a row from a different group).
+	var (
+		rowConv     string
+		rowGroup    sql.NullString
+	)
+	err := s.db.QueryRow(
+		`SELECT conversation_id, regen_group_id FROM messages WHERE id = ?`,
+		activeID,
+	).Scan(&rowConv, &rowGroup)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("ActivateSibling: message id %d not found", activeID)
+	}
+	if err != nil {
+		return err
+	}
+	if rowConv != convID {
+		return fmt.Errorf("ActivateSibling: message id %d belongs to a different conversation", activeID)
+	}
+	if !rowGroup.Valid || rowGroup.String != groupID {
+		return fmt.Errorf("ActivateSibling: message id %d is not in group %q", activeID, groupID)
+	}
+
+	// One statement does both halves: target → active, every
+	// other row in the group → archived. The CASE picks the
+	// right value per row. The (convID, groupID) WHERE keeps
+	// the scope tight (no accidental effect on rows from
+	// other groups even if a future refactor passes the
+	// wrong activeID past the guard above).
+	_, err = s.db.Exec(
+		`UPDATE messages
+		 SET is_archived = CASE WHEN id = ? THEN 0 ELSE 1 END
+		 WHERE conversation_id = ? AND regen_group_id = ?`,
+		activeID, convID, groupID,
+	)
+	return err
+}
+
 // DeleteMessagesFrom deletes all messages with id >= fromID in the
 // given conversation and returns the deleted messages so the caller
 // can undo the operation with RestoreMessages.
@@ -1747,8 +2221,15 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 	// (a) the cursor would skip the row on the next page
 	// request, (b) two rows in the same conversation
 	// could end up with the same seq.
+	//
+	// regen_group_id and is_archived are part of the
+	// snapshot so an undo restores the full regen
+	// history — if the user rolled back a turn that had
+	// 3 regen siblings, undoing must bring back all 3
+	// in their original active/archived state, not
+	// collapse them to a single active row.
 	rows, err := s.db.Query(
-		`SELECT id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm, seq
+		`SELECT id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm, seq, regen_group_id, is_archived
 		 FROM messages WHERE conversation_id = ? AND id >= ? ORDER BY id`,
 		conversationID, fromID,
 	)
@@ -1762,11 +2243,16 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 		var m Message
 		var created int64
 		var seq sql.NullInt64
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata, &m.MsgType, &m.SubmitToLLM, &seq); err != nil {
+		var regenGroup sql.NullString
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Tokens, &created, &m.Metadata, &m.MsgType, &m.SubmitToLLM, &seq, &regenGroup, &m.IsArchived); err != nil {
 			return deleted, err
 		}
 		if seq.Valid {
 			m.Seq = seq.Int64
+		}
+		if regenGroup.Valid {
+			rg := regenGroup.String
+			m.RegenGroupID = &rg
 		}
 		m.CreatedAt = time.Unix(created, 0)
 		deleted = append(deleted, m)
@@ -1823,8 +2309,8 @@ func (s *Store) RestoreMessages(messages []Message) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(
-		`INSERT OR REPLACE INTO messages(id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm, seq)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO messages(id, conversation_id, role, content, tokens, created_at, metadata, msg_type, submit_to_llm, seq, regen_group_id, is_archived)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return err
@@ -1832,9 +2318,18 @@ func (s *Store) RestoreMessages(messages []Message) error {
 	defer stmt.Close()
 
 	for _, m := range messages {
+		var regenGroupArg sql.NullString
+		if m.RegenGroupID != nil && *m.RegenGroupID != "" {
+			regenGroupArg = sql.NullString{String: *m.RegenGroupID, Valid: true}
+		}
+		isArchived := 0
+		if m.IsArchived {
+			isArchived = 1
+		}
 		if _, err := stmt.Exec(
 			m.ID, m.ConversationID, m.Role, m.Content, m.Tokens,
 			m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM, m.Seq,
+			regenGroupArg, isArchived,
 		); err != nil {
 			return err
 		}

@@ -80,7 +80,7 @@ func TestRollbackUndo_QuestionPartRoundTrip(t *testing.T) {
 	// Rollback to the OLDEST row. GetChatMessagesWithMetaPage
 	// returns ids in ASC order (see the function's
 	// rev[n-1-i] flip), so rowIDs[0] is the oldest.
-	_, _, _, rowIDs, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	_, _, _, rowIDs, _, _, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	if len(rowIDs) < 3 {
 		t.Fatalf("setup: want 3 rows, got %d", len(rowIDs))
 	}
@@ -166,7 +166,7 @@ func TestRollbackUndo_QuestionPartRoundTrip(t *testing.T) {
 
 	// Step 3: read the DB back, confirm the question part's
 	// question_status and name survived.
-	msgs, metas, _, _, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	msgs, metas, _, _, _, _, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	if len(msgs) != 3 {
 		t.Fatalf("after undo: want 3 messages, got %d", len(msgs))
 	}

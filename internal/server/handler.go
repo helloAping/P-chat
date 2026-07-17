@@ -297,6 +297,17 @@ type SendMessageRequest struct {
 	// values mean "no change".
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
+	// ClientMsgID is the integer the frontend minted at send time
+	// (Date.now() × 1000 + random) and stamped on the local user
+	// message as `msg.id`. When non-zero, the agent inserts this
+	// turn's user row with this explicit id, so rollback and
+	// regenerate always have a valid id to target — even when
+	// the LLM call fails before the SSE `done` event would
+	// otherwise broadcast `user_message_id` back. Format: a
+	// 13-16 digit integer, well outside the SQLite AUTOINCREMENT
+	// range (1, 2, 3, …), so it can't collide with anything
+	// autoincrement produces for later assistant rows.
+	ClientMsgID int64 `json:"client_msg_id,omitempty"`
 	// Attachments are the files the user attached to this turn.
 	// The new SPA path sends the bytes inline in `Data` (a data:
 	// URL for binaries, raw text for text files). The legacy
@@ -422,6 +433,28 @@ type MessageResponse struct {
 	// the user saw during streaming. Without this, thinking
 	// blocks and tool cards vanish on every reopen.
 	Parts []MessagePart `json:"parts,omitempty"`
+	// RegenGroupID is the SQLite row id (stringified) of the
+	// user message that triggered this assistant reply.
+	// Same value across every sibling in a regen group. Empty
+	// for non-assistant rows and for pre-migration-9 assistant
+	// rows that have never been regen'd. The frontend uses
+	// this to associate an archived reply with its parent
+	// user message (e.g. for the "上一版回答" chip + pager
+	// "回复 '请帮我...'" preview).
+	RegenGroupID string `json:"regen_group_id,omitempty"`
+	// IsArchived is the visibility flag the UI uses to
+	// pick which sibling to show. 0 = the active reply
+	// (default, what ListMessages returns); 1 = an older
+	// regenerated sibling that lives in the same group
+	// but is hidden from the main timeline. The
+	// ◀ N/M ▶ pager reads this to compute the active
+	// index and to render archived siblings on demand.
+	// Always false on rows returned by ListMessages
+	// (the SQL filters archived rows out) — the field
+	// is exposed so a future endpoint that needs to
+	// surface archived rows (e.g. the /replies endpoint)
+	// can do so without a separate schema.
+	IsArchived bool `json:"is_archived"`
 }
 
 // MessagePart is one block of a structured assistant message.
@@ -1245,11 +1278,17 @@ func (h *Handler) RollbackMessages(c *gin.Context) {
 	createds := make([]int64, len(deleted))
 	rowIDs := make([]int64, len(deleted))
 	seqs := make([]int64, len(deleted))
+	regenGroupIDs := make([]string, len(deleted))
+	isArchiveds := make([]bool, len(deleted))
 	for i, m := range deleted {
 		metas[i] = m.Metadata
 		createds[i] = m.CreatedAt.Unix()
 		rowIDs[i] = m.ID
 		seqs[i] = m.Seq
+		if m.RegenGroupID != nil {
+			regenGroupIDs[i] = *m.RegenGroupID
+		}
+		isArchiveds[i] = m.IsArchived
 	}
 
 	deletedResp := make([]MessageResponse, 0, len(deleted))
@@ -1262,7 +1301,7 @@ func (h *Handler) RollbackMessages(c *gin.Context) {
 		// what we want here (one DB row should produce
 		// one MessageResponse, not several).
 		cm := memoryMessageToChatMessage(m)
-		if resp := buildMessageResponse(cm, metas, createds, i, rowIDs[i], seqs[i]); resp != nil {
+		if resp := buildMessageResponse(cm, metas, createds, i, rowIDs[i], seqs[i], regenGroupIDs[i], isArchiveds[i]); resp != nil {
 			deletedResp = append(deletedResp, *resp)
 		}
 	}
@@ -1738,16 +1777,18 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// neither is set, both code paths issue the
 	// unfiltered "give me the latest N rows" query.
 	var (
-		msgs    []llm.ChatMessage
-		metas   []string
-		createds []int64
-		rowIDs  []int64
-		seqs    []int64
+		msgs           []llm.ChatMessage
+		metas          []string
+		createds       []int64
+		rowIDs         []int64
+		seqs           []int64
+		regenGroupIDs  []string
+		isArchiveds    []bool
 	)
 	if beforeSeq > 0 {
-		msgs, metas, createds, rowIDs, seqs = h.store.GetChatMessagesWithMetaPageBySeq(id, beforeSeq, limit)
+		msgs, metas, createds, rowIDs, seqs, regenGroupIDs, isArchiveds = h.store.GetChatMessagesWithMetaPageBySeq(id, beforeSeq, limit)
 	} else {
-		msgs, metas, createds, rowIDs, seqs = h.store.GetChatMessagesWithMetaPage(id, beforeID, limit)
+		msgs, metas, createds, rowIDs, seqs, regenGroupIDs, isArchiveds = h.store.GetChatMessagesWithMetaPage(id, beforeID, limit)
 	}
 	out := make([]MessageResponse, 0, len(msgs))
 	// rowIDs[i] is the SQLite row id for msgs[i]. We pair them
@@ -1756,7 +1797,7 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// rowIDs is in DESC order (matches the row order), so
 	// rowIDs[len-1] is the smallest id (oldest returned row).
 	for i, m := range msgs {
-		resp := buildMessageResponse(m, metas, createds, i, rowIDs[i], seqs[i])
+		resp := buildMessageResponse(m, metas, createds, i, rowIDs[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
 		if resp != nil {
 			out = append(out, *resp)
 		}
@@ -1875,7 +1916,7 @@ func (h *Handler) SnapshotRecovery(c *gin.Context) {
 		// query) — the recovery flow doesn't need the
 		// SQLite row id, only the seq cursor. The created
 		// time comes from createds[i] (parallel to msgs).
-		resp := buildMessageResponse(m, metas, createds, i, 0, seqs[i])
+		resp := buildMessageResponse(m, metas, createds, i, 0, seqs[i], "", false)
 		if resp != nil {
 			out = append(out, *resp)
 		}
@@ -2150,20 +2191,31 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 // `before_id` cursor for the next page request. seq is the
 // per-conversation logical position, propagated for the new
 // seq-based cursor (stable across rollback+undo).
-func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64, seq int64) *MessageResponse {
+//
+// regenGroupID / isArchived are the P1-4 regen-history
+// fields, propagated as-is so the frontend can drive the
+// ◀ N/M ▶ pager and the "上一版回答" chip. The main
+// ListMessages SQL filters archived rows out, so the values
+// here are always (empty, false) on that path; the
+// /replies endpoint (a future addition in P1-4 commit 2)
+// surfaces the full sibling set including the
+// (groupID, true) rows.
+func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64, seq int64, regenGroupID string, isArchived bool) *MessageResponse {
 	created := time.Now().Unix()
 	if i < len(createds) && createds[i] != 0 {
 		created = createds[i]
 	}
 	resp := MessageResponse{
-		ID:          rowID,
-		Seq:         seq,
-		Role:        m.Role,
-		MsgType:     m.MsgType,
-		Content:     m.Content,
-		CreatedAt:   created,
-		Name:        m.Name,
-		SubmitToLLM: m.SubmitToLLM,
+		ID:           rowID,
+		Seq:          seq,
+		Role:         m.Role,
+		MsgType:      m.MsgType,
+		Content:      m.Content,
+		CreatedAt:    created,
+		Name:         m.Name,
+		SubmitToLLM:  m.SubmitToLLM,
+		RegenGroupID: regenGroupID,
+		IsArchived:   isArchived,
 	}
 
 	// Media messages (image / audio / video): compute a data
@@ -2596,6 +2648,13 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		Model:             model,
 		Messages:          msgs,
 		Attachments:       req.Attachments,
+		// Forward the frontend's client-minted row id. The
+		// agent uses it as the explicit SQLite row id for
+		// this turn's user message, so rollback/regen
+		// have a valid target even when the LLM call
+		// fails before the SSE `done` event lands. See
+		// the comment on SendMessageRequest.ClientMsgID.
+		ClientMsgID:       req.ClientMsgID,
 		ReasoningEffort:   meta.ReasoningEffort,
 		CompressedSummary: compSummary,
 		SessionID:         id,
@@ -2756,9 +2815,10 @@ type RegenerateRequest struct {
 
 // Regenerate re-runs the agent loop for the assistant
 // reply of a given user message. The user message itself
-// is preserved; everything after it in the conversation
-// is deleted. See RegenerateRequest for the rationale on
-// physical delete vs soft mark.
+// is preserved; every existing assistant sibling in the
+// regen group is soft-archived (P1-4) instead of hard-
+// deleted (P1-3), and the new reply becomes the active
+// row. See RegenerateRequest for the rationale.
 func (h *Handler) Regenerate(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
@@ -2790,15 +2850,20 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		return
 	}
 
-	// Physical delete: from the user message id, every
-	// later row in the same conversation is removed.
-	// DeleteMessagesFrom returns the deleted rows but
-	// regen doesn't put them on the undo stack — the
-	// user can re-send to get them back if they want.
-	// last_message_id is rewritten by DeleteMessagesFrom
-	// via the conversations metadata update path.
-	if _, err := h.store.DeleteMessagesFrom(id, req.UserMessageID+1); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "truncate failed: " + err.Error()})
+	// P1-4: soft-archive every existing sibling in this
+	// regen group. The new assistant message (created by
+	// the agent loop below) will be the new active row.
+	// keepActiveID = 0 means "no row stays active" —
+	// every group row is archived, and the upcoming
+	// agent-loop insert becomes the lone active row.
+	//
+	// groupID is the string form of the user message id.
+	// The agent loop reads ChatRequest.RegenGroupID and
+	// stamps it on the new assistant row's
+	// messages.regen_group_id column.
+	groupID := strconv.FormatInt(req.UserMessageID, 10)
+	if _, err := h.store.ArchiveSiblings(id, groupID, 0); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "archive siblings failed: " + err.Error()})
 		return
 	}
 
@@ -2833,11 +2898,20 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		histMsgs = h.store.GetChatMessagesFor(id, 0)
 	}
 	// Note: the user message at UserMessageID is still in
-	// histMsgs (we deleted from id+1 onwards). The agent
-	// loop sees it as the latest message and continues
-	// from there — the user prompt drives the new reply.
-	// We do NOT append a fresh user message; the prompt
-	// already lives in the conversation.
+	// histMsgs (we only archived sibling assistant rows).
+	// The agent loop sees it as the latest message and
+	// continues from there — the user prompt drives the
+	// new reply. We do NOT append a fresh user message;
+	// the prompt already lives in the conversation.
+	//
+	// The archived siblings are excluded by the
+	// is_archived = 0 filter in
+	// GetChatMessagesFor -> GetChatMessagesWithMetaPage
+	// so they don't leak into the LLM context. The
+	// regen'd LLM gets a clean history (the user prompt
+	// + every earlier turn that wasn't regenerated),
+	// exactly as the user expects from a "give me a
+	// different answer" action.
 	msgs := buildLLMMessages(histMsgs)
 
 	chatReq := agent.ChatRequest{
@@ -2854,6 +2928,11 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		PermissionLevel:   meta.PermissionLevel,
 		KBBase:            meta.KnowledgeBase,
 		AutoContinue:      h.sessionAutoContinue(id),
+		// P1-4: the agent loop reads this and stamps the
+		// new assistant row's regen_group_id, joining the
+		// user message's regen group. Empty for normal
+		// (non-regen) SendMessage requests.
+		RegenGroupID:      groupID,
 		TraceID:           trace.FromContext(c.Request.Context()),
 	}
 
@@ -2868,6 +2947,259 @@ func (h *Handler) Regenerate(c *gin.Context) {
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
 	h.respondSSE(c, stream, id, provider, model)
+}
+
+// UserMessageSummary is the wire shape of the parent user
+// message carried in the ListRegenReplies response. We
+// include it so the frontend can render the bubble's
+// "上一版回答" chip and the pager's user-message preview
+// (e.g. `◀ 2/3 · "请帮我..." ▶`) without a second
+// round-trip. content_preview is the first 80 chars of
+// content — long enough to be useful, short enough to keep
+// the response payload under a few KB even for sessions
+// with hundreds of regen groups.
+type UserMessageSummary struct {
+	ID             int64  `json:"id"`
+	Role           string `json:"role"`
+	Content        string `json:"content"`
+	ContentPreview string `json:"content_preview"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
+// RepliesResponse is the JSON body of
+// GET /api/v1/sessions/:id/messages/:user_msg_id/replies.
+// Returns the full regen group (active + archived) plus
+// the user-message summary the UI needs to render the
+// pager / chip without a second round-trip.
+type RepliesResponse struct {
+	UserMessage    UserMessageSummary `json:"user_message"`
+	Replies        []MessageResponse  `json:"replies"`
+	ActiveReplyID  int64              `json:"active_reply_id"`
+}
+
+// userMessagePreviewLength is the truncation length for
+// UserMessageSummary.ContentPreview. Long enough to be
+// meaningful ("请帮我写一个 todo 工具..."), short enough
+// to keep the response small. 80 chars is the same
+// limit the project's docs use for the assistant's
+// tool-call args preview.
+const userMessagePreviewLength = 80
+
+// ListRegenReplies returns the full sibling set for the
+// regen group rooted at :user_msg_id, oldest-first by
+// SQLite id. The response includes a UserMessageSummary
+// so the frontend has enough context to render the
+// bubble's ◀ N/M ▶ pager + the "上一版回答" chip's
+// user-message preview without a second round-trip.
+//
+// Errors:
+//   - 404: session or user message not found
+//   - 400: user_msg_id is not a valid integer
+//   - 200 + replies: []  when the user message exists
+//     but has no regen history (legacy single-shot row,
+//     regen_group_id is NULL on the only assistant).
+//     The frontend treats this as "no pager" — the
+//     bubble stays in the single-reply shape.
+func (h *Handler) ListRegenReplies(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	convID := c.Param("id")
+	if _, err := h.store.GetConversation(convID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	userMsgID, err := strconv.ParseInt(c.Param("user_msg_id"), 10, 64)
+	if err != nil || userMsgID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_msg_id must be a positive integer"})
+		return
+	}
+
+	// Load the user message summary. If it's missing or
+	// not a user message, return 404 — the endpoint is
+	// only meaningful for actual user messages.
+	summary, err := h.loadUserMessageSummary(convID, userMsgID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Load the full sibling set via the store helper.
+	// regen_group_id is the string form of the user
+	// message id (the same convention ArchiveSiblings
+	// and ActivateSibling use).
+	groupID := strconv.FormatInt(userMsgID, 10)
+	_, metas, createds, ids, seqs, isArchiveds, regenGroupIDs := h.store.ListSiblings(convID, groupID)
+
+	// Build the parallel responses. ListSiblings is
+	// oldest-first by id; the frontend can render
+	// ◀ older ... N/M ... newer ▶ with active_idx
+	// = replies.findIndex(!is_archived).
+	out := make([]MessageResponse, 0, len(ids))
+	var activeID int64
+	for i := range ids {
+		cm := llm.ChatMessage{
+			Role:    "assistant",
+			Content: "",
+		}
+		// decode via buildMessageResponse so the wire
+		// shape matches ListMessages exactly (parts
+		// decoded, attachments reconstructed, etc.).
+		resp := buildMessageResponse(cm, metas, createds, i, ids[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
+		if resp == nil {
+			continue
+		}
+		out = append(out, *resp)
+		if !isArchiveds[i] {
+			activeID = ids[i]
+		}
+	}
+
+	c.JSON(http.StatusOK, RepliesResponse{
+		UserMessage:   *summary,
+		Replies:       out,
+		ActiveReplyID: activeID,
+	})
+}
+
+// loadUserMessageSummary reads one user message and shapes
+// it as UserMessageSummary. Returns an error when the row
+// doesn't exist, isn't in the conversation, or isn't a
+// user role — the caller maps the error to 404.
+func (h *Handler) loadUserMessageSummary(convID string, msgID int64) (*UserMessageSummary, error) {
+	_ = h.store.Flush()
+	// Single-row read. We don't need a paging method —
+	// loadUserMessageSummary is called only on demand
+	// (the first time the user hovers a paginated bubble
+	// or paginates), not on every list.
+	var (
+		role     string
+		content  string
+		created  int64
+	)
+	err := h.store.DB().QueryRow(
+		`SELECT role, content, created_at FROM messages
+		 WHERE conversation_id = ? AND id = ?`,
+		convID, msgID,
+	).Scan(&role, &content, &created)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("message id %d not found in session %s", msgID, convID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if role != "user" {
+		return nil, fmt.Errorf("message id %d has role %q, want \"user\"", msgID, role)
+	}
+	preview := content
+	if len(preview) > userMessagePreviewLength {
+		preview = preview[:userMessagePreviewLength] + "…"
+	}
+	return &UserMessageSummary{
+		ID:             msgID,
+		Role:           role,
+		Content:        content,
+		ContentPreview: preview,
+		CreatedAt:      created,
+	}, nil
+}
+
+// ActivateRegenReplyRequest is the body of
+// POST /api/v1/sessions/:id/messages/:reply_id/activate.
+// user_message_id is required so the handler can
+// compute the regen group_id and validate the reply
+// actually belongs to that group (a malicious /
+// buggy client could otherwise activate any reply
+// from any conversation).
+type ActivateRegenReplyRequest struct {
+	UserMessageID int64 `json:"user_message_id" binding:"required"`
+}
+
+// ActivateRegenReply makes :reply_id the active reply in
+// its regen group, archiving every other sibling. The
+// caller is the frontend's ◀ N/M ▶ pager when the user
+// picks a different historical reply to view.
+//
+// On success, returns the new full sibling set (in the
+// same shape as ListRegenReplies) so the frontend can
+// re-render the bubble + pager in one round-trip.
+//
+// Errors:
+//   - 404: session / reply / user message not found
+//   - 400: reply_id / user_message_id invalid, or the
+//     reply isn't in the user message's regen group
+//   - 503: store unavailable
+func (h *Handler) ActivateRegenReply(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	convID := c.Param("id")
+	if _, err := h.store.GetConversation(convID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	replyID, err := strconv.ParseInt(c.Param("reply_id"), 10, 64)
+	if err != nil || replyID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "reply_id must be a positive integer"})
+		return
+	}
+	var req ActivateRegenReplyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.UserMessageID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_message_id must be > 0"})
+		return
+	}
+
+	// Compute the group_id and delegate the activation
+	// to the store. The store verifies the reply belongs
+	// to this group / conversation and returns a
+	// descriptive error on mismatch (mapped to 400 by
+	// the handler below).
+	groupID := strconv.FormatInt(req.UserMessageID, 10)
+	if err := h.store.ActivateSibling(convID, groupID, replyID); err != nil {
+		// Validation errors (group / conversation
+		// mismatch) get 400. The store's error
+		// messages already name the offending id, so we
+		// pass them through verbatim — the client
+		// can surface them in the toast.
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Re-list the sibling set so the client gets the
+	// fresh active_reply_id + every reply's current
+	// is_archived flag in one round-trip. The user
+	// doesn't need a second fetch to update the pager.
+	summary, err := h.loadUserMessageSummary(convID, req.UserMessageID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	_, metas, createds, ids, seqs, isArchiveds, regenGroupIDs := h.store.ListSiblings(convID, groupID)
+	out := make([]MessageResponse, 0, len(ids))
+	var activeID int64
+	for i := range ids {
+		cm := llm.ChatMessage{Role: "assistant"}
+		resp := buildMessageResponse(cm, metas, createds, i, ids[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
+		if resp == nil {
+			continue
+		}
+		out = append(out, *resp)
+		if !isArchiveds[i] {
+			activeID = ids[i]
+		}
+	}
+
+	c.JSON(http.StatusOK, RepliesResponse{
+		UserMessage:   *summary,
+		Replies:       out,
+		ActiveReplyID: activeID,
+	})
 }
 
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {

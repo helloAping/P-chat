@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -330,6 +331,17 @@ type ChatRequest struct {
 	// entries (text + image/file) before being sent to the LLM.
 	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// ClientMsgID, when non-zero, is the row id the frontend
+	// minted at send time (Date.now() × 1000 + random, well
+	// outside SQLite's AUTOINCREMENT range). The agent uses
+	// it as the explicit row id when persisting this turn's
+	// user message so rollback/regenerate have a valid id
+	// to target from the moment the user clicks send — the
+	// SSE `done` event is no longer the gating factor.
+	// Zero means "let the store autoincrement as usual"
+	// (the legacy path used by tests, the CLI, and any
+	// non-SPA caller that doesn't pre-mint an id).
+	ClientMsgID int64 `json:"client_msg_id,omitempty"`
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools.
 	PlanMode bool `json:"plan_mode,omitempty"`
@@ -356,6 +368,16 @@ type ChatRequest struct {
 	// PermissionLevel overrides the sandbox confirm behaviour for
 	// this session. Values: "ask", "auto", "full". Default "ask".
 	PermissionLevel string `json:"permission_level,omitempty"`
+	// RegenGroupID is the P1-4 regen-history tag. When
+	// non-empty, the agent loop stamps the new assistant
+	// message's regen_group_id column with this value so
+	// it joins the user message's regen group. The
+	// Regenerate handler sets this to
+	// strconv.FormatInt(req.UserMessageID, 10); the
+	// SendMessage handler leaves it empty (the resulting
+	// assistant message has regen_group_id = NULL, the
+	// legacy single-shot behaviour).
+	RegenGroupID string `json:"regen_group_id,omitempty"`
 	// MaxRounds caps the ReAct tool-use loop. 0 means default (50).
 	// After MaxRounds the loop stops and the user can continue
 	// with a follow-up message.
@@ -1452,6 +1474,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 		}
 
+		// NOTE: image base64 payloads are intentionally kept
+		// intact in msgs. Earlier code stripped them with a
+		// text-marker placeholder after the LLM call to save
+		// tokens, but that placeholder was being applied BEFORE
+		// the LLM saw the image (call-order bug), producing an
+		// invalid `data:image/png;base64,[image: ...]` URL and
+		// causing the upstream API to reject the request with a
+		// parameter error. We now keep the base64 verbatim so
+		// the LLM actually receives the image. Token budget is
+		// managed by tryAutoCompact instead.
+
 		// Expand any user-uploaded attachments into separate
 		// ChatMessage entries (text msg + image/file msgs).
 		if len(req.Attachments) > 0 && a.attach != nil {
@@ -1468,8 +1501,29 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// per-session variant so concurrent streams on
 			// different sessions don't race on the global
 			// currentID.
+			//
+			// The first user message in the batch carries the
+			// explicit id minted by the frontend (req.ClientMsgID).
+			// We pin it to the row's id on disk so the local
+			// msg.id and the SQLite row id match exactly, giving
+			// rollback/regen a valid target even when the LLM
+			// call fails before the SSE `done` event lands.
+			// All other rows in the same batch (subsequent
+			// text/image attachments, the agent's own scratch
+			// messages) use AUTOINCREMENT as before.
+			pinnedUserID := req.ClientMsgID
 			for _, m := range msgs {
 				if m.Role == llm.RoleSystem {
+					continue
+				}
+				if pinnedUserID > 0 && m.Role == llm.RoleUser {
+					a.store.AddChatMessageToWithID(req.SessionID, m, pinnedUserID)
+					// Only the first user message gets the
+					// pinned id; if the agent later synthesises
+					// another user message in this same stream
+					// (e.g. P0-3 auto-continue reminder), let
+					// it autoincrement as usual.
+					pinnedUserID = 0
 					continue
 				}
 				a.store.AddChatMessageTo(req.SessionID, m)
@@ -1546,14 +1600,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		)
 		const stuckThreshold = 3
 		const sameToolErrMax = 4
-
-		// Strip base64 image payloads from history so that stale
-		// browser screenshots (pre-handler-fix) and user-uploaded
-		// images don't bloat this run's context window. New tool
-		// results from this run already have metadata-only Content
-		// (see browser/tools.go makeHandler), so this is a one-time
-		// sweep for legacy data only.
-		stripImageContent(msgs)
 
 		for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
 			roundStart := time.Now()
@@ -1798,14 +1844,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 		msgs = append(msgs, assistantMsg)
 
-		// After each LLM call, strip base64 image payloads from
-		// the message list. This is idempotent: already-stripped
-		// markers are not "data:image/..." so they pass through
-		// unchanged. The initial stripImageContent at the start
-		// of the round loop handles legacy history; this per-round
-		// sweep catches any images added by ExpandAttachmentsCM
-		// or other mechanisms in this run.
-		stripImageContent(msgs)
+		// NOTE: per-round stripImageContent sweep removed.
+		// Image base64 is preserved verbatim in msgs so the LLM
+		// always receives the actual image on every round (and
+		// across tool-call follow-ups within the same turn).
+		// Token budget for repeated tool rounds is handled by
+		// tryAutoCompact.
 
 		// Persist assistant message later — after tool
 		// results are in partsAcc (see end of this round).
@@ -1896,7 +1940,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						continue
 					}
 				}
-				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
+				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 				return
@@ -2360,9 +2404,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// Each image is persisted as its own row so it
 			// survives reload / rollback and appears as a
 			// standalone image bubble in the chat history. The
-			// base64 is stripped by stripImageContent() at the
-			// start of subsequent rounds to keep the context
-			// window lean.
+			// base64 is kept verbatim in the LLM context so the
+			// model can still see the image on every round; the
+			// overall context size is managed by tryAutoCompact.
 			//
 			// When the model doesn't support vision, skip the
 			// injection entirely — the tool_result's text
@@ -2389,7 +2433,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 			// Persist assistant message now that tool
 			// results are captured in partsAcc.
-			persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
+			persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
 
 			// Stuck-loop guard. Compute a stable signature of
 			// this round's tool calls and whether any errored.
@@ -2608,9 +2652,26 @@ func normalizeToolResults(msgs []llm.ChatMessage) []llm.ChatMessage {
 	return out
 }
 
-func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int) {
+func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int, regenGroupID string) {
 	if store == nil {
 		return
+	}
+	// P1-4: every assistant row needs a regen_group_id so
+	// a later "重答" click can find the regen group and
+	// archive the existing siblings. The Regenerate
+	// handler sets req.RegenGroupID explicitly; the
+	// SendMessage handler does NOT (the assistant's
+	// triggering user message id isn't known until the
+	// agent inserts it). In the SendMessage path, fall
+	// back to the most recent user message in the
+	// conversation — that's the row that prompted this
+	// reply by definition. The lookup is a single
+	// indexed MAX(id) query (see
+	// memory.GetLastUserMessageID).
+	if regenGroupID == "" {
+		if uid := store.GetLastUserMessageID(convID); uid > 0 {
+			regenGroupID = strconv.FormatInt(uid, 10)
+		}
 	}
 	meta := map[string]string{
 		"role":   msg.Role,
@@ -2646,7 +2707,7 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 			meta["parts"] = string(pj)
 		}
 	}
-	store.AddChatMessageWithMetaTo(convID, msg, meta)
+	store.AddChatMessageWithMetaToRegen(convID, msg, meta, regenGroupID, false)
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction
@@ -3201,36 +3262,13 @@ func pruneOldToolResults(msgs []llm.ChatMessage, currentRound, keepRounds int) {
 	}
 }
 
-// stripImageContent replaces base64 image payloads in msgs with
-// a text marker. The LLM has already processed the image on the
-// first round; subsequent rounds don't need the raw bytes.
-func stripImageContent(msgs []llm.ChatMessage) {
-	for i := range msgs {
-		// Image attachments (user uploads via attachment expansion).
-		if msgs[i].Type == llm.TypeImage && msgs[i].Content != "" {
-			msgs[i].Content = fmt.Sprintf("[image: %s (%s) — 已在首轮展示]",
-				msgs[i].Name, msgs[i].MimeType)
-		}
-		// Browser screenshots: tool results containing base64 image
-		// data (either raw "data:image/..." prefix or JSON wrapper
-		// {"image": "data:image/..."}). Strip to save tokens on
-		// subsequent rounds.
-		if msgs[i].Content != "" && len(msgs[i].Content) > 22 {
-			c := msgs[i].Content
-			if strings.HasPrefix(c, "data:image/") {
-				msgs[i].Content = "[截图 — 已在首轮展示，节省 tokens]"
-			} else if strings.Contains(c[:minLen(len(c), 256)], `"data:image/`) {
-				msgs[i].Content = `{"image": "[截图已省略]"}`
-			}
-		}
-	}
-}
-
-// minLen returns the smaller of a and b.
-func minLen(a, b int) int {
-	if a < b { return a }
-	return b
-}
+// stripImageContent was removed: image base64 payloads are
+// preserved verbatim in msgs so the LLM always receives the
+// actual image (the previous version replaced them with a
+// text-marker placeholder that broke the OpenAI image_url wire
+// format, causing the upstream API to reject the request with
+// a parameter error). Token budget for repeated tool rounds is
+// now handled solely by tryAutoCompact.
 
 // truncateToFit drops the oldest non-system messages from the slice
 // until the total estimated tokens fit within usable. Messages are

@@ -265,6 +265,69 @@ CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, se
 DROP INDEX IF EXISTS idx_messages_conv_seq;
 ALTER TABLE messages DROP COLUMN seq;`,
 	},
+	{
+		// Migration 9: regenerate history (P1-4).
+		//
+		// Two new columns on messages:
+		//   - regen_group_id TEXT  — the SQLite row id of the
+		//     user message that triggered this assistant reply,
+		//     stored as TEXT to keep the field optional. NULL
+		//     means "this is a single-shot reply" (the legacy
+		//     behaviour, equivalent to having no regen history).
+		//   - is_archived   INTEGER NOT NULL DEFAULT 0 —
+		//     0 = the reply that should show in the main
+		//     timeline; 1 = an older regenerated sibling that
+		//     the user can paginate to via the bubble's
+		//     ◀ N/M ▶ pager. The main ListMessages query
+		//     adds `WHERE is_archived = 0`; the new
+		//     GET .../replies endpoint skips the filter.
+		//
+		// The idx_messages_conv_group index supports
+		// ListSiblings(convID, groupID) and the per-group
+		// UPDATE in ArchiveSiblings / ActivateSibling.
+		//
+		// Backfill: for every existing assistant message,
+		// regen_group_id is set to the row id of the
+		// nearest preceding user message in the same
+		// conversation. The NOT EXISTS subquery picks the
+		// "closest" user message (no other user between
+		// them). The role='assistant' guard skips the
+		// backfill for user / tool / system rows.
+		//
+		// Pre-migration-9 rows have regen_group_id = NULL
+		// and is_archived = 0, so the API treats them as
+		// the single canonical reply and the UI never
+		// shows a pager. The user can still regen a
+		// pre-migration turn to get a new group with
+		// regen_group_id = user_message_id.
+		Version: 9,
+		Name:    "regen_history",
+		Up: `
+ALTER TABLE messages ADD COLUMN regen_group_id TEXT;
+ALTER TABLE messages ADD COLUMN is_archived   INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_messages_conv_group
+  ON messages(conversation_id, regen_group_id, seq);
+
+UPDATE messages
+SET regen_group_id = (
+    SELECT prev.id FROM messages prev
+    WHERE prev.conversation_id = messages.conversation_id
+      AND prev.role = 'user'
+      AND prev.id < messages.id
+      AND NOT EXISTS (
+        SELECT 1 FROM messages mid
+        WHERE mid.conversation_id = messages.conversation_id
+          AND mid.role = 'user'
+          AND mid.id > prev.id AND mid.id < messages.id
+      )
+)
+WHERE role = 'assistant' AND regen_group_id IS NULL;`,
+		Down: `
+DROP INDEX IF EXISTS idx_messages_conv_group;
+ALTER TABLE messages DROP COLUMN is_archived;
+ALTER TABLE messages DROP COLUMN regen_group_id;`,
+	},
 }
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INTEGER PRIMARY KEY,

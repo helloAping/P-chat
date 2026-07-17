@@ -46,7 +46,7 @@ func TestSnapshotRecovery_AfterSeqFilter(t *testing.T) {
 	// meaningful "after_seq" cursor. The test is robust
 	// to insertion order / seq numbering because we read
 	// the rows back first.
-	_, _, _, _, seqs := store.GetChatMessagesWithMetaPage(convID, 0, 10)
+	_, _, _, _, seqs, _, _ := store.GetChatMessagesWithMetaPage(convID, 0, 10)
 	// seqs are in oldest-first order after the helper reverses.
 	// We want "after seq of the second assistant row" — but
 	// we don't know which index is assistant. So instead
@@ -106,7 +106,7 @@ func TestSnapshotRecovery_AfterSeqSkipsEarlier(t *testing.T) {
 	}
 
 	// Pull the seqs and pick the middle one as the cursor.
-	_, _, _, _, seqs := store.GetChatMessagesWithMetaPage(convID, 0, 10)
+	_, _, _, _, seqs, _, _ := store.GetChatMessagesWithMetaPage(convID, 0, 10)
 	if len(seqs) < 3 {
 		t.Fatalf("expected 3 seqs, got %d", len(seqs))
 	}
