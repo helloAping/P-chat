@@ -46,6 +46,15 @@ func NewOpenAIAdapter(baseURL, apiKey, providerName string) *OpenAIAdapter {
 //	tool_result  → {role: tool, content: "...", tool_call_id: "..."}
 //	thinking     → skipped (agent-internal)
 //	audio, file  → text marker
+//
+// Parallel tool_calls (and assistant text immediately followed by
+// tool_call) are merged into a single assistant message. Emitting
+// them as separate assistant messages violates the OpenAI chat
+// completions schema — strict upstreams (e.g. api-convert.08ms.cn
+// → Console Go) reject the request with "Upstream request failed"
+// / code=invalid_request_error. This was the 2026-07-17
+// regression where the model emitted 2 parallel list_files calls
+// and the next round was rejected. P2-3.
 func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens int, tools []ToolDef, system string, temperature float32, topP float32) (*ProtocolRequest, error) {
 	openaiMsgs := make([]openai.ChatCompletionMessage, 0, len(messages)+1)
 
@@ -70,6 +79,25 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 		pending = nil
 	}
 
+	// lastAssistantIdx points to the most recently appended
+	// assistant message (or -1). Consecutive TypeToolCall entries
+	// AND assistant text followed by tool_calls are folded into
+	// that message, so the wire shape becomes
+	//   {role:assistant, content: "...", tool_calls: [tc1, tc2]}
+	// instead of three back-to-back assistant messages. Any
+	// non-mergeable type (TypeToolResult, TypeImage, default,
+	// user role) invalidates the pointer.
+	lastAssistantIdx := -1
+	lastAssistant := func() *openai.ChatCompletionMessage {
+		if lastAssistantIdx < 0 || lastAssistantIdx >= len(openaiMsgs) {
+			return nil
+		}
+		if openaiMsgs[lastAssistantIdx].Role != openai.ChatMessageRoleAssistant {
+			return nil
+		}
+		return &openaiMsgs[lastAssistantIdx]
+	}
+
 	for i := 0; i < len(messages); i++ {
 		msg := messages[i]
 
@@ -79,20 +107,31 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 
 		case TypeToolCall:
 			flushPending()
-			openaiMsgs = append(openaiMsgs, openai.ChatCompletionMessage{
-				Role: openai.ChatMessageRoleAssistant,
-				ToolCalls: []openai.ToolCall{{
-					ID:   msg.ToolID,
-					Type: openai.ToolTypeFunction,
-					Function: openai.FunctionCall{
-						Name:      msg.ToolName,
-						Arguments: msg.ToolInput,
-					},
-				}},
-			})
+			tc := openai.ToolCall{
+				ID:   msg.ToolID,
+				Type: openai.ToolTypeFunction,
+				Function: openai.FunctionCall{
+					Name:      msg.ToolName,
+					Arguments: msg.ToolInput,
+				},
+			}
+			if la := lastAssistant(); la != nil {
+				// Fold into the previous assistant message so
+				// parallel tool_calls land in one tool_calls
+				// array. The text reply (if any) is preserved
+				// on `la.Content`.
+				la.ToolCalls = append(la.ToolCalls, tc)
+			} else {
+				openaiMsgs = append(openaiMsgs, openai.ChatCompletionMessage{
+					Role:      openai.ChatMessageRoleAssistant,
+					ToolCalls: []openai.ToolCall{tc},
+				})
+				lastAssistantIdx = len(openaiMsgs) - 1
+			}
 
 		case TypeToolResult:
 			flushPending()
+			lastAssistantIdx = -1
 			content := msg.Content
 			if msg.ToolError {
 				content = fmt.Sprintf("error: %s\n工具 %s 执行失败。请分析错误原因后调整方案并重试；反复失败请告知用户。", msg.Content, msg.ToolName)
@@ -105,6 +144,8 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 			})
 
 		case TypeImage:
+			flushPending()
+			lastAssistantIdx = -1
 			part := openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeImageURL,
 				ImageURL: &openai.ChatMessageImageURL{
@@ -123,16 +164,17 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 
 		case TypeText:
 			role := openaiChatRole(msg.Role)
-			if pending != nil && pending.Role == role {
-				pending.MultiContent = append(pending.MultiContent, openai.ChatMessagePart{
-					Type: openai.ChatMessagePartTypeText,
-					Text: msg.Content,
-				})
-			} else {
-				flushPending()
-				if role == openai.ChatMessageRoleUser {
-					// User text: start a pending message so
-					// a follow-up image can merge in.
+			if role == openai.ChatMessageRoleUser {
+				// User text uses the existing pending path so
+				// that a follow-up image can merge in.
+				lastAssistantIdx = -1
+				if pending != nil && pending.Role == role {
+					pending.MultiContent = append(pending.MultiContent, openai.ChatMessagePart{
+						Type: openai.ChatMessagePartTypeText,
+						Text: msg.Content,
+					})
+				} else {
+					flushPending()
 					pending = &openai.ChatCompletionMessage{
 						Role: role,
 						MultiContent: []openai.ChatMessagePart{{
@@ -140,17 +182,40 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 							Text: msg.Content,
 						}},
 					}
-				} else {
-					// Assistant/tool: emit directly.
-					openaiMsgs = append(openaiMsgs, openai.ChatCompletionMessage{
-						Role:    role,
-						Content: msg.Content,
-					})
 				}
+				continue
+			}
+
+			// Assistant / tool text. Tool-role text is unusual
+			// but allowed by the protocol; we treat it as a
+			// non-mergeable standalone entry.
+			flushPending()
+			if role == openai.ChatMessageRoleAssistant {
+				if la := lastAssistant(); la != nil && la.Content == "" {
+					// No content yet on the previous assistant
+					// message — fill it. This is the
+					// "text + tool_call" merge: the agent
+					// produced a TypeText(assistant) first and
+					// then a TypeToolCall (or vice versa) in the
+					// same round, and both belong on the same
+					// wire message.
+					la.Content = msg.Content
+					continue
+				}
+			}
+			openaiMsgs = append(openaiMsgs, openai.ChatCompletionMessage{
+				Role:    role,
+				Content: msg.Content,
+			})
+			if role == openai.ChatMessageRoleAssistant {
+				lastAssistantIdx = len(openaiMsgs) - 1
+			} else {
+				lastAssistantIdx = -1
 			}
 
 		default: // TypeAudio, TypeFile, or empty (plain message)
 			flushPending()
+			lastAssistantIdx = -1
 			role := openaiChatRole(msg.Role)
 			content := msg.Content
 			switch msg.Type {

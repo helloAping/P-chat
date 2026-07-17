@@ -294,6 +294,7 @@ npm run build                                   # 前端 bundle
 | 前端路由错 | `MessageBubble.vue` `parts` 数组 |
 | Wails 启动失败 | `bin/pchat-server.log` |
 | Anthropic 协议不工作 | `internal/llm/anthropic.go:130-260` |
+| 上游 "Upstream request failed" | 大概率是 `openai_adapter.go` 并行 tool_call 没合并；先看 `internal/llm/openai_adapter_test.go` 的回归测试是否还过 |
 
 ---
 
@@ -334,6 +335,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 子 agent 事件转发 | `internal/subagent/subagent.go` `tryForward()` |
 | OpenAI SSE parser | `internal/llm/client.go` |
 | Anthropic SSE parser | `internal/llm/anthropic.go` + `anthropic_adapter.go` |
+| **P2-3 并行 tool_call 合并** | `internal/llm/openai_adapter.go::Build` (lastAssistantIdx) + `internal/llm/anthropic_adapter.go::Build` (lastAssistantIdx + lastUserResultIdx) + 对应 `*_test.go` 回归测试 |
 | 系统 prompt 拼装 | `internal/agent/agent.go` `buildStaticSystemPrompt()` + 9 个 helper |
 | 配置加载 | `internal/config/config.go` |
 | 数据库 CRUD | `internal/memory/memory.go` |

@@ -43,8 +43,48 @@ func NewAnthropicAdapter(baseURL, apiKey, providerName string) *AnthropicAdapter
 //	thinking     → skipped (agent-internal)
 //	system role  → extracted to top-level system field
 //	audio, file  → text marker
+//
+// Consecutive assistant-role entries (text + tool_call(s)) are
+// merged into a single assistant message whose content is an
+// array of blocks. This matches Anthropic's wire format and
+// avoids the per-message overhead of separate assistant entries
+// for parallel tool_use. P2-3 (sister fix to the OpenAI adapter
+// for the 2026-07-17 parallel-tool-call upstream rejection).
 func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens int, tools []ToolDef, system string, temperature float32, topP float32) (*ProtocolRequest, error) {
 	var anthropicMsgs []anthropicMessage
+
+	// lastAssistantIdx points to the most recently appended
+	// assistant message. Consecutive assistant text blocks and
+	// tool_use blocks are folded into that message's content
+	// array. Any non-mergeable type (TypeToolResult, TypeImage,
+	// non-assistant role) invalidates the pointer.
+	//
+	// lastUserResultIdx plays the same role for TypeToolResult
+	// blocks: consecutive tool_results from parallel tool_calls
+	// land in a single user message whose content array carries
+	// every tool_result block. The Anthropic protocol accepts
+	// both shapes; merging keeps the wire form compact and
+	// matches what Claude expects to see.
+	lastAssistantIdx := -1
+	lastUserResultIdx := -1
+	lastAssistant := func() *anthropicMessage {
+		if lastAssistantIdx < 0 || lastAssistantIdx >= len(anthropicMsgs) {
+			return nil
+		}
+		if anthropicMsgs[lastAssistantIdx].Role != "assistant" {
+			return nil
+		}
+		return &anthropicMsgs[lastAssistantIdx]
+	}
+	lastUserResult := func() *anthropicMessage {
+		if lastUserResultIdx < 0 || lastUserResultIdx >= len(anthropicMsgs) {
+			return nil
+		}
+		if anthropicMsgs[lastUserResultIdx].Role != "user" {
+			return nil
+		}
+		return &anthropicMsgs[lastUserResultIdx]
+	}
 
 	for _, msg := range messages {
 		// System role messages accumulate into the top-level
@@ -63,7 +103,13 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 
 		case TypeToolCall:
 			// Map tool_call into an Anthropic tool_use block
-			// inside an assistant role message.
+			// inside an assistant role message. Parallel
+			// tool_calls append to the previous assistant
+			// content array instead of starting a new
+			// message. A tool_call always starts a new
+			// assistant turn, so the user-side merge pointer
+			// (lastUserResultIdx) is invalidated.
+			lastUserResultIdx = -1
 			inputJSON := json.RawMessage(msg.ToolInput)
 			if inputJSON == nil {
 				inputJSON = json.RawMessage("{}")
@@ -74,23 +120,38 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 				"name":  msg.ToolName,
 				"input": inputJSON,
 			}
-			anthropicMsgs = append(anthropicMsgs, anthropicMessage{
-				Role:    "assistant",
-				Content: anthropicBlocksRaw{anthropicBlockFromMap(toolUseBlock)},
-			})
+			if la := lastAssistant(); la != nil {
+				la.Content = append(la.Content, anthropicBlockFromMap(toolUseBlock))
+			} else {
+				anthropicMsgs = append(anthropicMsgs, anthropicMessage{
+					Role:    "assistant",
+					Content: anthropicBlocksRaw{anthropicBlockFromMap(toolUseBlock)},
+				})
+				lastAssistantIdx = len(anthropicMsgs) - 1
+			}
 
 		case TypeToolResult:
+			// tool_result lives under role=user in Anthropic's
+			// protocol, so this always breaks the assistant
+			// merge. Consecutive tool_results from parallel
+			// tool_calls are folded into the same user
+			// message.
+			lastAssistantIdx = -1
 			content := msg.Content
 			if msg.ToolError {
 				content = "error: " + msg.Content
 			}
 			block := map[string]any{
-				"type":         "tool_result",
-				"tool_use_id":  msg.ToolID,
-				"content":      content,
+				"type":        "tool_result",
+				"tool_use_id": msg.ToolID,
+				"content":     content,
 			}
 			if msg.ToolError {
 				block["is_error"] = true
+			}
+			if lr := lastUserResult(); lr != nil {
+				lr.Content = append(lr.Content, anthropicBlockFromMap(block))
+				continue
 			}
 			// Anthropic requires tool_result messages to have
 			// role "user" (the protocol doesn't have a separate
@@ -99,8 +160,11 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 				Role:    "user",
 				Content: anthropicBlocksRaw{anthropicBlockFromMap(block)},
 			})
+			lastUserResultIdx = len(anthropicMsgs) - 1
 
 		case TypeImage:
+			lastAssistantIdx = -1
+			lastUserResultIdx = -1
 			// Build an image block with base64 source.
 			block := map[string]any{
 				"type": "image",
@@ -117,16 +181,41 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 
 		case TypeText:
 			role := anthropicRole(msg.Role)
-			if msg.Content != "" {
-				anthropicMsgs = append(anthropicMsgs, anthropicMessage{
-					Role:    role,
-					Content: anthropicBlocksRaw{{Type: "text", Text: msg.Content}},
-				})
+			if msg.Content == "" {
+				continue
+			}
+			if role == "assistant" {
+				if la := lastAssistant(); la != nil {
+					// Fold into the previous assistant
+					// message's content array so the wire
+					// shape is [text, tool_use, tool_use]
+					// in one assistant message.
+					la.Content = append(la.Content, anthropicContentBlock{
+						Type: "text", Text: msg.Content,
+					})
+					continue
+				}
+			} else {
+				// User / non-assistant text starts a new
+				// turn — invalidate the merge pointer.
+				lastAssistantIdx = -1
+				lastUserResultIdx = -1
+			}
+			anthropicMsgs = append(anthropicMsgs, anthropicMessage{
+				Role:    role,
+				Content: anthropicBlocksRaw{{Type: "text", Text: msg.Content}},
+			})
+			if role == "assistant" {
+				lastAssistantIdx = len(anthropicMsgs) - 1
+			} else {
+				lastUserResultIdx = -1
 			}
 
 		default:
 			// TypeAudio, TypeFile, or empty — emit as text
 			// marker.
+			lastAssistantIdx = -1
+			lastUserResultIdx = -1
 			role := anthropicRole(msg.Role)
 			content := msg.Content
 			switch msg.Type {
