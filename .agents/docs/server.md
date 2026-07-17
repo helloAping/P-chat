@@ -12,7 +12,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
-| `server.go` | Gin 引擎构建、路由注册、CORS 中间件 | `New()`, `NewWithStaticFS()`, `corsMiddleware()` |
+| `server.go` | Gin 引擎构建、路由注册、CORS 中间件 + trace id middleware | `New()`, `NewWithStaticFS()`, `corsMiddleware()`, `traceIDMiddleware()` |
 | `handler.go` | 所有 API handler 实现（~2130行） | `SendMessage()`, `ListMessages()`, `chunkToEvent()` 等 |
 | `handler_test.go` | Handler 单元测试 | |
 | `knowledge_api.go` | 知识库 CRUD + 扫描管道 + 三层索引 | `ListSections`, `ListNodes`, `GetNodeContent`, `ClearKnowledgeBase`, `indexScan` |
@@ -20,6 +20,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
 | `command_api.go` | 斜杠命令执行 | |
+| `tool_api.go` | P3-2 工具列表端点 | `ListTools()` |
 | `upload.go` | 文件上传/下载 | |
 | `dialog.go` | 本地文件选择对话框 | |
 | `helpers.go` | 辅助函数 | |
@@ -88,6 +89,8 @@ Chunk 字段检查顺序（优先级从高到低）:
 
 - `ListMessages` (GET) — 分页返回历史消息，含 `parts` 解码
 - `SendMessage` (POST) — 发送 + SSE 流
+- `SnapshotRecovery` (GET) — **P0-1**：断线恢复用的增量快照
+- `Regenerate` (POST) — **P1-3**：物理截断 user 消息之后的行后重跑
 - `CompressConversation` — LLM 压缩历史
 - `SetReasoningEffort` — 设置 DeepSeek/OpenAI 思考深度
 - `SaveSystemMessage` — 保存自定义系统提示词
@@ -98,6 +101,45 @@ Chunk 字段检查顺序（优先级从高到低）:
 - 消息通过 `memory.Store.AddChatMessageTo()` 持久化
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
+
+### 6. P0-1 / P1-3 增量端点 (round 2, 2026-07-15)
+
+#### SnapshotRecovery (P0-1)
+
+`GET /api/v1/sessions/:id/snapshot?after_seq=N` — 返回所有
+`seq > N` 的 assistant 消息 (oldest first)，含完整 metadata
+blob (持久化 parts[])。响应 `{ messages, next_seq }`。
+
+- 前端在 SSE 流意外断开时调此端点补齐 trailing assistant bubble
+- 不重发 LLM 调用，不增加费用，只补"已入库但没传到前端"的内容
+- 客户端用 fingerprint (tool_id / text 前 40 字符) 去重
+
+#### Regenerate (P1-3)
+
+`POST /api/v1/sessions/:id/regenerate` body `{ user_message_id }` —
+物理截断 `id > user_message_id` 的行，复用 `respondSSE` 重新
+跑 agent loop。`user_message_id` 必须是 user role (`ValidateUserMessageID` 严格校验)。
+
+- 不放 undo buffer（regen 是正常流，不是破坏性操作）
+- 不接受 style/model 覆盖（保持与上轮一致，避免意外切换）
+- 共享 `sessionLocks` 防并发 regen
+
+#### respondSSE helper
+
+SendMessage 和 Regenerate 共享的 SSE 写循环：
+设 header + 写 `data: <json>\nid: <N>\n\n`（P3-1 顺序）+ 强制 Flush。
+新增 SSE 端点应复用此函数，避免重复实现。
+
+#### ContextInspector (P2-3)
+
+`GET /api/v1/sessions/:id/context` — 返回 `{session_id, provider, model,
+context_window, estimated_tokens, usable_tokens, utilization_pct,
+compressed_summary, messages:[{role, tokens, preview, is_tool_result}]}`。
+
+- 复用 `buildLLMMessages` + `llm.EstimateTokensMessages` 拿 LLM-bound token 估算
+- compSummary 加成 system 消息（与 prompt 拼接方式一致）
+- 利用率 = estimated / usable * 100，颜色阈值 60%/80% 跟 tryAutoCompact 一致
+- 响应小（~10KB for 200 messages），不带 parts[]
 
 ### 7. 知识库 API
 
@@ -119,6 +161,67 @@ Chunk 字段检查顺序（优先级从高到低）:
 `clear` 端点执行后自动调用 `agent.Reload()` 刷新 L1 overview 缓存。
 
 `nodes` 端点返回扁平 `NodeTreeItem[]`（含 `parent_id` / `child_count` / `content_count`），前端据此构建三层树视图。
+
+### 8. 端到端 trace id (P3-3, 2026-07-16)
+
+每次 SSE 会话自动生成 8 字符 hex trace id (`T-xxxxxxxx`)，
+贯穿整个请求生命周期。详见 [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md)。
+
+**流程**：
+```
+HTTP request (X-Trace-Id 头可选)
+  → traceIDMiddleware: 读 header 或 mint
+    → trace.WithID(ctx, id) + c.Header("X-Trace-Id", id)
+      → agent.ChatWithTools 读 req.TraceID → ctx 注入
+        → sendOrDrop 从 ctx 读 → chunk.TraceID
+          → chunkToEvent 复制 → ev.TraceID → SSE JSON event
+            → 前端错误气泡 "复制 trace id" 按钮
+```
+
+**Package**：`internal/trace` 提供 `NewID()` / `WithID(ctx, id)` /
+`FromContext(ctx)` / `LogPrefix(ctx)` 四个核心函数。
+
+**Wails 路径兼容**：`cmd/pchat-gui/main.go` `extractTraceID` 从
+请求 body 抽 `trace_id` 字段并设 `X-Trace-Id` header（绕过 Wails
+binding 不能加任意 header 的限制）。前端 `client.ts` 在 Wails
+路径把 `trace_id` 塞 body。
+
+**CORS**：`Access-Control-Allow-Headers` 含 `X-Trace-Id`（浏览器
+预检通过）。
+
+**Log 前缀**：`trace.LogPrefix(ctx)` 返回 `[T-xxxxxxxx] ` 或 `""`。
+主要 log 行（LLM client / forwarder / tool handler）已加。
+
+**测试**：`handler_trace_test.go` 4 个 case：
+header 透传 / 缺失生成 / 互不重复 / CORS 允许。
+
+### 9. 工具列表 API (P3-2, 2026-07-16)
+
+`GET /api/v1/tools` 返回 `[]ToolInfo`：
+```json
+{
+  "tools": [
+    {
+      "name": "exec_command",
+      "description": "执行 shell 命令",
+      "parameters": {...},
+      "dynamic": false
+    },
+    {
+      "name": "greet",
+      "description": "向用户问好",
+      "parameters": {...},
+      "dynamic": true,
+      "source": "/home/u/.p-chat/tools/greet.yaml"
+    }
+  ]
+}
+```
+
+- `dynamic=true` 的工具由 P3-2 watcher 从 `~/.p-chat/tools/*.yaml` 加载
+- `source` 是 YAML 绝对路径（前端 `ToolListDrawer` 显示"查看源码"）
+- 顺序：built-in (alphabetical) → dynamic (alphabetical)
+- 前端缓存路径：直接读 `state.tools` 或调 `api.listTools()`
 
 ## 修改指南
 

@@ -68,7 +68,7 @@ func TestRollbackUndo_PreservesSeqAndSubmitToLLM(t *testing.T) {
 
 	// Snapshot the assistant row's id and seq so we can
 	// verify they're preserved across the round-trip.
-	_, _, _, rowIDs, seqs := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	_, _, _, rowIDs, seqs, _, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	if len(rowIDs) < 2 {
 		t.Fatalf("setup: want 2 rows, got %d", len(rowIDs))
 	}
@@ -135,7 +135,7 @@ func TestRollbackUndo_PreservesSeqAndSubmitToLLM(t *testing.T) {
 
 	// Re-read the conversation and check the assistant
 	// row's seq + submit_to_llm survived the round-trip.
-	msgs, metas, _, ids, seqsAfter := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	msgs, metas, _, ids, seqsAfter, _, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	if len(msgs) != 2 {
 		t.Fatalf("after undo: want 2 msgs, got %d", len(msgs))
 	}

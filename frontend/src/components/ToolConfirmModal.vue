@@ -137,6 +137,24 @@ const argsPreview = computed(() => {
     <template #footer>
       <NSpace justify="end">
         <NButton @click="submitToolConfirm(false)">拒绝</NButton>
+        <!-- P2-4 dry-run UX note: we deliberately do
+             NOT add a "先干跑" button here. The confirm
+             modal is a yes/no gate for an EXECUTION
+             that the agent already committed to; adding
+             a third path would require either a new
+             server endpoint (re-running the tool out
+             of band) or a complex state machine to
+             re-submit the original LLM turn with
+             dry_run=true. Instead the user invokes
+             dry-run through a regular prompt: "干跑
+             shell_command X" — the LLM calls the
+             tool with dry_run=true in args, and the
+             ToolCallCard surfaces a "dry-run" chip
+             so the user can tell at a glance the
+             tool was NOT executed. The path from
+             "this looks dangerous" → "let me see
+             what it would do" is one prompt away
+             and doesn't require new server surface. -->
         <NButton type="primary" @click="submitToolConfirm(true)">允许一次</NButton>
       </NSpace>
     </template>

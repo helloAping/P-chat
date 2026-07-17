@@ -23,6 +23,9 @@
 | 修改沙箱/安全检查 | [infrastructure.md](infrastructure.md) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
+| **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |
+| **P3-3 端到端 trace id** | [trace 包](../../internal/trace/trace.go) | [server.md](server.md) §8, [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
+| **P3-2 工具 hot-reload** | [tool.md](tool.md) §8 | [P3-2 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
 
 ## 模块总览
 
@@ -55,7 +58,9 @@ P-Chat 项目
 │       ├── recall/   → 记忆召回增强
 │       ├── paths/    → ~/.p-chat 路径解析
 │       ├── httpcli/  → CLI SSE 客户端
-│       └── serverproc/ → 服务器进程生命周期
+│       ├── serverproc/ → 服务器进程生命周期
+│       ├── trace/    → P3-3 端到端 trace id
+│       └── tool/dynamic/ → P3-2 动态工具 hot-reload
 │
 └── frontend/src/       → 请读 [frontend.md](frontend.md)
     │                       设计 token / 组件样式规则 → [frontend-design.md](frontend-design.md)

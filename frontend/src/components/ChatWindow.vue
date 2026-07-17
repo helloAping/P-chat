@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { NSpin, useMessage } from 'naive-ui'
-import { ArrowDown, MessageSquare } from './icons'
+import { ArrowDown, ArrowUp, MessageSquare } from './icons'
 import MessageBubble from './MessageBubble.vue'
+import ContextInspectorDrawer from './ContextInspectorDrawer.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
 // QuestionPanel removed in 2026-07-09 — it duplicated
@@ -10,7 +11,7 @@ import TodoPanel from './TodoPanel.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner } from '../stores/chat'
 
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
@@ -38,13 +39,136 @@ const SCROLL_BOTTOM_THRESHOLD = 200
 const isAtBottom = ref(true)
 const showJumpToBottom = computed(() => !isAtBottom.value)
 
+// P1-4: 锚定 FAB (jump-to-user-message) state.
+//
+// distanceFromBottom is the raw pixel distance (positive
+// when scrolled up). The anchor FAB shows when this
+// exceeds ANCHOR_THRESHOLD (50px) — far enough that the
+// user has clearly moved away from the latest message,
+// but not so far that the existing SCROLL_BOTTOM_THRESHOLD
+// (200px, used for the jump-to-bottom button) is also
+// redundant. The 50px value is the user's "redundancy
+// threshold" — at <= 50px the user can scroll back
+// themselves and a button would be noise.
+//
+// visibleMsgIds is the set of message ids currently in
+// the viewport. Recomputed on every scroll event via
+// querySelectorAll('[data-msg-id]'); the Set construction
+// is O(visible_messages), not O(all_messages), so even
+// very long sessions (1000s of messages) only pay for
+// what's actually on screen. We pair distanceFromBottom
+// with hasArchivedInView to decide whether the anchor
+// FAB should render — the user must BOTH be scrolled
+// up AND have an archived (◀ N/M ▶ paginated) reply
+// in the viewport for the FAB to make sense.
+const ANCHOR_THRESHOLD = 50
+const distanceFromBottom = ref(0)
+const visibleMsgIds = ref<Set<number>>(new Set())
+
+const hasArchivedInView = computed(() => {
+  const ids = visibleMsgIds.value
+  if (ids.size === 0) return false
+  // Linear scan over the session messages looking for
+  // an archived (is_archived=true) row whose id is in
+  // the visible set. O(N) over all session messages;
+  // fine for sessions under a few hundred rows (the
+  // common case). For very long sessions the dedup
+  // in loadReplies keeps the per-bubble cost O(visible)
+  // — we could later maintain a precomputed Set of
+  // archived ids if profiling shows this is hot.
+  const sid = state.currentID
+  const msgs = sid ? state.sessionMessages[sid] : undefined
+  if (!msgs) return false
+  for (const m of msgs) {
+    if (m.is_archived && m.id != null && ids.has(m.id)) return true
+  }
+  return false
+})
+
+const showAnchorFAB = computed(() =>
+  distanceFromBottom.value > ANCHOR_THRESHOLD && hasArchivedInView.value
+)
+
 function updateScrollPosition(el: HTMLElement) {
   // scrollTop + clientHeight is the bottom edge of the
   // visible viewport; if it sits within THRESHOLD of
   // scrollHeight the user is "at the bottom". < 0 (overscroll
   // bounce) is clamped to 0.
   const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+  distanceFromBottom.value = distFromBottom
   isAtBottom.value = distFromBottom < SCROLL_BOTTOM_THRESHOLD
+  // P1-4: refresh the visible-msg set on every scroll
+  // event. O(visible) — no full DOM walk, no expensive
+  // selectors. The data-msg-id attribute is set on
+  // every MessageBubble's root element so we can map
+  // DOM nodes back to message ids without maintaining
+  // a side index.
+  const newSet = new Set<number>()
+  const nodes = el.querySelectorAll('[data-msg-id]')
+  const viewportTop = 0
+  const viewportBottom = el.clientHeight
+  nodes.forEach((node) => {
+    const rect = (node as HTMLElement).getBoundingClientRect()
+    // Skip nodes that are completely above or below
+    // the viewport (rare with the CSS layout but
+    // possible for huge bubbles). This keeps the set
+    // truly "visible" rather than "in the DOM".
+    if (rect.bottom <= viewportTop || rect.top >= viewportBottom) return
+    const idAttr = node.getAttribute('data-msg-id')
+    if (idAttr) {
+      const n = Number(idAttr)
+      if (Number.isFinite(n) && n > 0) newSet.add(n)
+    }
+  })
+  visibleMsgIds.value = newSet
+}
+
+// scrollToUserMsg scrolls the user message associated
+// with the currently-visible archived reply back into
+// the viewport. Used by the P1-4 锚定 FAB.
+//
+// Algorithm:
+//   1. Find the first archived (is_archived=true) message
+//      id in the visible-msg set.
+//   2. Read its regen_group_id (= user message id).
+//   3. DOM-query `[data-msg-id="<user>"]`.
+//   4. If the user message is currently visible, do
+//      nothing (the user can see the context already).
+//   5. Otherwise scrollIntoView({block: 'center'}).
+//
+// We pick the FIRST archived sibling (not "the
+// most-recently-toggled one") because the anchor FAB is
+// a generic helper — any archived reply the user is
+// currently looking at should be backed by a visible
+// user message.
+function scrollToUserMsg() {
+  const sid = state.currentID
+  const msgs = sid ? state.sessionMessages[sid] : undefined
+  if (!msgs) return
+  let userMsgId: number | null = null
+  for (const id of visibleMsgIds.value) {
+    const m = msgs.find((x) => x.id === id)
+    if (m && m.is_archived && m.regen_group_id) {
+      userMsgId = Number(m.regen_group_id)
+      break
+    }
+  }
+  if (!userMsgId || !Number.isFinite(userMsgId) || userMsgId <= 0) return
+  const el = messagesEl.value?.querySelector(
+    `[data-msg-id="${userMsgId}"]`,
+  ) as HTMLElement | null
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  // Skip the scroll if the user message is already in
+  // the viewport. The FAB's visible-button check is
+  // coarse (it just looks for any archived reply in
+  // view), so this fine-grained check is what keeps
+  // the click from being a no-op for the user.
+  const elTop = rect.top
+  const elBottom = rect.bottom
+  const viewportHeight = window.innerHeight || 0
+  if (elTop >= 0 && elBottom <= viewportHeight) return
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 function scrollToBottom() {
@@ -197,6 +321,31 @@ function messageKey(m: any, i: number): string | number {
 
 <template>
   <main class="chat-main">
+    <!-- P0-1: transient banner shown when the recovery
+         flow successfully merged server-side parts into
+         the trailing assistant message. currentRecoveryBanner
+         auto-clears after 3s (driven by the chat store). -->
+    <Transition name="recovery-banner">
+      <div
+        v-if="currentRecoveryBanner"
+        class="recovery-banner"
+        :key="currentRecoveryBanner.shownAt"
+      >
+        <span class="recovery-icon">📥</span>
+        <span class="recovery-text">
+          已恢复 {{ currentRecoveryBanner.recovered }} 条消息
+        </span>
+        <span class="recovery-reason">{{ currentRecoveryBanner.reason }}</span>
+      </div>
+    </Transition>
+    <!-- P2-3: context inspector drawer. The drawer is
+         always mounted; visibility is bound to the
+         `state.contextInspector.open` flag so the
+         parent doesn't have to track it. The button
+         that opens it lives in TopBar; this template
+         just renders the panel. -->
+    <ContextInspectorDrawer />
+
     <!-- Plain scrollable container. We don't use NScrollbar
          here because its :native-scrollbar="false" path wraps
          the content in a custom-scrollbar div that conflicts
@@ -241,6 +390,27 @@ function messageKey(m: any, i: number): string | number {
     </div>
     <TodoPanel />
     <InputArea />
+    <!-- P1-4: 锚定 FAB (jump-to-user-message). Shown
+         when the user is scrolled up beyond the 50px
+         "redundancy threshold" AND has an archived
+         (◀ N/M ▶ paginated) reply in the viewport. The
+         button sits stacked above the jump-to-bottom
+         button (bottom: 64px) so the two never
+         overlap. Click scrolls the user message of
+         the first archived reply in view back into
+         the viewport — see scrollToUserMsg. -->
+    <Transition name="anchor-btn">
+      <button
+        v-if="showAnchorFAB"
+        class="anchor-fab"
+        type="button"
+        aria-label="跳到用户消息"
+        title="跳到用户消息"
+        @click="scrollToUserMsg"
+      >
+        <ArrowUp :size="16" />
+      </button>
+    </Transition>
     <!-- Floating "jump to latest" button. Shown when the user
          has scrolled up away from the bottom; clicking it
          smooth-scrolls back to the latest message. Sits
@@ -262,6 +432,42 @@ function messageKey(m: any, i: number): string | number {
 </template>
 
 <style scoped>
+/* P0-1 recovery banner. Sits at the top of the chat
+ * main area and animates in/out via Vue's <Transition>.
+ * Uses brand accent for the icon and a soft surface
+ * background so it reads as "informational" rather
+ * than "error". */
+.recovery-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.recovery-icon { font-size: 14px; }
+.recovery-text { color: var(--text-primary); font-weight: 500; }
+.recovery-reason {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.recovery-banner-enter-from {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+.recovery-banner-leave-to {
+  opacity: 0;
+}
+.recovery-banner-enter-active,
+.recovery-banner-leave-active {
+  transition: opacity 200ms var(--ease-out, ease),
+              transform 200ms var(--ease-out, ease);
+}
 .chat-main {
   flex: 1;
   display: flex;
@@ -391,6 +597,57 @@ function messageKey(m: any, i: number): string | number {
 }
 .jump-btn-enter-from,
 .jump-btn-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+/* P1-4: 锚定 FAB. Sits stacked above the jump-to-bottom
+ * button (bottom: 178px) so the two never overlap. Same
+ * size + shape + surface as the jump-to-bottom button
+ * (visually consistent floating-button row) but uses
+ * ArrowUp — pointing up to "the user message that
+ * prompted this archived reply". The brand-tinted
+ * background is the P1-4 visual hook (matches the
+ * pager's color story). The brand-50 surface is subtle
+ * enough to not compete with the message content but
+ * distinct enough that the user notices the button
+ * appeared. */
+.anchor-fab {
+  position: absolute;
+  right: 16px;
+  bottom: 178px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--brand-50);
+  border: 1px solid var(--brand-100);
+  color: var(--brand-700);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  z-index: 10;
+  transition: background 0.15s var(--ease-out, ease), color 0.15s var(--ease-out, ease), transform 0.15s var(--ease-out, ease);
+}
+.anchor-fab:hover {
+  background: var(--brand-100);
+  color: var(--brand-800);
+  transform: translateY(-1px);
+}
+.anchor-fab:active {
+  transform: translateY(0);
+}
+.anchor-fab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.anchor-btn-enter-active,
+.anchor-btn-leave-active {
+  transition: opacity 0.2s var(--ease-out, ease), transform 0.2s var(--ease-out, ease);
+}
+.anchor-btn-enter-from,
+.anchor-btn-leave-to {
   opacity: 0;
   transform: translateY(8px);
 }

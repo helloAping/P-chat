@@ -138,6 +138,96 @@ API: GET /api/v1/knowledge/bases/:name/nodes → NodeTreeItem[]
 
 原始条目卡片 (`wiki_sections`) 保留在树视图下方作为向后兼容层。
 
+### 9. Round 2 增强 (2026-07-15)
+
+#### P1-1 工具结果折叠
+
+`ToolCallCard.vue` 自动折叠 `result.length >= 200` OR `>= 4 个换行`
+的结果（shell / wiki_search / 长 file 读）。短 result 保持展开。
+用户点击 header 切换状态，状态写到 `localStorage` 持久化
+（key = `pchat.toolFold.<name>.<tool_id[:12]>`）。折叠态下
+header 的 📋 复制按钮可点（stopPropagation 防 toggle）。
+
+#### P1-2 子 agent 实时进度
+
+`SubAgentCard.vue` header 加 `part.parts.length` 计数 chip
+（pill 样式），running 时切到 sub-accent 色。后端 `tryForward`
+本身就是逐 chunk 转发，前端只是把"看不到进度"的问题修了。
+
+#### P0-1 流式中断恢复
+
+`streamMessagesViaFetch` 和 Wails 路径的 stream catch
+边界都触发 `opts.onStreamDrop({ lastSeq, reason })`。
+`recoverMissingParts` action：
+1. 调 `getSessionSnapshot(sessionId, lastSeq)` 拿增量
+2. 用 fingerprint (tool_id / text 前 40 字符) 去重 merge 到 trailing bubble
+3. 触发 3s 的 `RecoveryBanner`（"已恢复 N 条消息"）
+
+不在用户主动 abort 时触发（`signal.aborted` 短路）。
+
+#### P1-3 重新生成按钮
+
+`MessageBubble.vue` trailing assistant 消息加"重答"按钮。
+`regenerateMessage` action：弹掉本地 trailing bubble → 调
+`api.streamRegenerate` → 走正常 stream 路径。auto-continue
+从 0 重新计数（算新 stream）。
+
+### 10. Round 3 增强 (2026-07-15)
+
+#### P2-2 代码高亮
+
+`main.ts` 注册 14 个常用语言（ts/js/py/go/rs/java/json/yaml/bash/sql/xml/css/md），
+用 `marked-highlight` 扩展把 highlight.js 接到 `Marked` instance。
+MessageBubble 的 `marked.parse(...)` 通过全局 mirror 自动获得高亮。
+`style.css` 末尾 `@import 'highlight.js/styles/github-dark.css'` +
+自定义 `.hljs { background: transparent }`（保留 P-Chat 表面色）。
+
+`vite.config.ts` 加 `marked` / `marked-highlight` alias + dedupe 避免 npm
+hoisting 让 marked-highlight 解析到根 node_modules。
+
+#### P2-3 上下文检查器
+
+`ContextInspectorDrawer.vue`：NDrawer 右侧滑出，顶部 NProgress 显示
+context window 利用率（> 60% 黄，> 80% 红，与 tryAutoCompact 阈值一致），
+中部 per-message 列表（role badge + token 数 + preview），底部 NCollapse
+显示 compressed summary。
+
+`chat.ts`：`state.contextInspector` 字段 (open/loading/error/data) +
+`openContextInspector` / `closeContextInspector` / `loadContextInspector` actions。
+重开刷新（in-flight 跳过 spinner）。
+
+`TopBar.vue` 加 `BarChart3` 按钮触发 `openContextInspector(state.currentID)`。
+`ChatWindow.vue` 挂载 Drawer 组件。
+
+#### P2-4 工具 dry-run
+
+`ToolCallCard.vue` 检测 `args.dry_run === true` 显示 `dry-run` pill chip
+(brand-50 背景)。折叠态可见，告知用户"这个工具是预览未实际执行"。
+
+UX 决策：`ToolConfirmModal` 不加"先干跑一次"按钮（避免新增 server 端点 /
+复杂状态机）。改用 prompt 触发：用户打"干跑 shell_command X" → LLM 自加
+`dry_run: true` → ToolCallCard 显示 chip。
+
+#### P3-3 trace id 复制按钮
+
+`MessageBubble.vue` 检测 `message.traceId`（chat store 在 error
+事件触发时塞到 trailing assistant message）显示 `.trace-id-chip`
+按钮。点击调 `copyText(id)` 复制到剪贴板 + toast 提示"已复制"。
+
+`client.ts` 增 `mintTraceId()` 8 字符 hex (T-xxxxxxxx)，fetch
+路径设 `X-Trace-Id` header，Wails 路径把 `trace_id` 塞 body 由
+Go binding `extractTraceID` 提取。详见 [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md)。
+
+#### P3-2 工具列表抽屉
+
+`ToolListDrawer.vue`：NDrawer 右侧滑出，分内置 / 自定义两段。
+自定义工具带 "自定义" badge + "查看源码" 展开显示 YAML 路径
+（提示用户在编辑器中编辑）。TopBar 加 `Wrench` 按钮触发。
+
+`api/client.ts` 增 `listTools()` + `Tool` 类型（`dynamic` flag +
+`source` 路径）。`chat.ts` 无状态（按需 fetch）—— 工具列表是
+per-server 不 per-session。
+
 ## 修改指南
 
 ### 要添加新的 SSE 事件类型

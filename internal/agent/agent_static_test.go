@@ -160,6 +160,37 @@ func TestBuildStaticSystemPrompt_NoFabricatedErrorInstruction(t *testing.T) {
 	}
 }
 
+// TestBuildStaticSystemPrompt_TodoContractPromptPresent
+// guards the P1-1 (Plan B) addition to the todo_write hint
+// section. The new rule ("完成契约: ...必须先调用 todo_write")
+// is the textual contract that backs P0-3's auto-continue
+// guard — Plan A prompts the LLM when the contract is
+// broken, but Plan B teaches the LLM to keep the contract.
+// If the rule is accidentally removed the auto-continue
+// becomes the only defence and the LLM may learn to fake
+// todo updates to satisfy it.
+func TestBuildStaticSystemPrompt_TodoContractPromptPresent(t *testing.T) {
+	cfg, _ := config.Load("")
+	llmClient, _ := llm.NewClient(&cfg.LLM)
+	tools := tool.NewRegistry()
+	store, _ := memory.OpenAt(":memory:", 50)
+	defer store.Close()
+	upgrade.SeedForTesting(store.DB())
+	styleMgr, _ := style.NewManager(store.DB())
+	a := New(cfg, llmClient, styleMgr, store, tools)
+
+	// Register a synthetic tool named "todo_write" so the
+	// hint section is emitted (it's gated on tool presence).
+	tools.RegisterForTest(tool.Tool{Name: "todo_write", Description: "test stub."})
+	p, _, _ := a.buildStaticSystemPrompt(style.Tech, nil, tools.List(), "", false)
+	if !contains(p, "完成契约") {
+		t.Error("todo_write hint section missing the P1-1 '完成契约' rule — see docs/plans/auto-continue-plan.md")
+	}
+	if !contains(p, "todo_write") {
+		t.Error("todo_write hint section missing the todo_write tool reference")
+	}
+}
+
 // TestVisionHeuristic covers the new deny-by-default
 // vision-capability check. Vision-capable models return true;
 // known text-only models (deepseek-chat, gpt-3.5-turbo, etc.)

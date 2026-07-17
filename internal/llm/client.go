@@ -15,6 +15,7 @@ import (
 
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/trace"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -381,6 +382,15 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		httpReq.Header.Set("Accept", "text/event-stream")
 		httpReq.Header.Set("Cache-Control", "no-cache")
 		httpReq.Header.Set("Connection", "keep-alive")
+		// P3-3: forward the trace id on every outbound LLM
+		// request. The third-party API (OpenAI / proxy) won't
+		// echo it back, but our own logs on the way out and on
+		// the response-error path will share the same id —
+		// making "request to upstream timed out at 18:42"
+		// greppable end-to-end.
+		if tid := trace.FromContext(ctx); tid != "" {
+			httpReq.Header.Set("X-Trace-Id", tid)
+		}
 		if p.apiKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 		}
@@ -439,8 +449,8 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 					// so a normal session doesn't fill the
 					// log.
 					if parseFailures > 0 || os.Getenv("PC_LLM_DEBUG") == "1" {
-						log.Printf("[llm/%s/%s] stream ended: chunks=%d parsed=%d content=%d thinking=%d parse_errs=%d",
-							p.name, model, rawChunks, rawChunks-parseFailures, contentChars, thinkingChars, parseFailures)
+						log.Printf("%s[llm/%s/%s] stream ended: chunks=%d parsed=%d content=%d thinking=%d parse_errs=%d",
+							trace.LogPrefix(ctx), p.name, model, rawChunks, rawChunks-parseFailures, contentChars, thinkingChars, parseFailures)
 					}
 					return
 				}
@@ -459,8 +469,8 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			payload := bytes.TrimPrefix(line, []byte("data: "))
 			if bytes.Equal(payload, []byte("[DONE]")) {
 				ch <- StreamChunk{Done: true}
-				log.Printf("[llm/%s/%s] stream ended at [DONE]: chunks=%d content=%d thinking=%d parse_errs=%d",
-					p.name, model, rawChunks, contentChars, thinkingChars, parseFailures)
+				log.Printf("%s[llm/%s/%s] stream ended at [DONE]: chunks=%d content=%d thinking=%d parse_errs=%d",
+					trace.LogPrefix(ctx), p.name, model, rawChunks, contentChars, thinkingChars, parseFailures)
 				return
 			}
 			rawChunks++
@@ -468,7 +478,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 				// Dump the first few raw chunks verbatim so
 				// the field names are visible in the server
 				// log when debugging a misbehaving proxy.
-				log.Printf("[llm/%s/%s] raw chunk #%d: %s", p.name, model, rawChunks, string(payload))
+				log.Printf("%s[llm/%s/%s] raw chunk #%d: %s", trace.LogPrefix(ctx), p.name, model, rawChunks, string(payload))
 			}
 			var r openaiStreamResponse
 			if err := json.Unmarshal(payload, &r); err != nil {
@@ -477,7 +487,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 				// reconnects).
 				parseFailures++
 				if parseFailures <= 3 {
-					log.Printf("[llm/%s/%s] parse error on chunk #%d: %v payload=%s", p.name, model, rawChunks, err, string(payload))
+					log.Printf("%s[llm/%s/%s] parse error on chunk #%d: %v payload=%s", trace.LogPrefix(ctx), p.name, model, rawChunks, err, string(payload))
 				}
 				continue
 			}
@@ -492,7 +502,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			// assistant reply that is actually a
 			// provider rate-limit / auth error.
 			if proxyErr := extractProxyError(payload); proxyErr != "" {
-				log.Printf("[llm/%s/%s] proxy error chunk: %s", p.name, model, proxyErr)
+				log.Printf("%s[llm/%s/%s] proxy error chunk: %s", trace.LogPrefix(ctx), p.name, model, proxyErr)
 				ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("openai proxy error: %s", proxyErr))}
 				return
 			}
@@ -580,7 +590,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 				}
 			}
 			if rawChunks == 1 && choiceCount == 0 {
-				log.Printf("[llm/%s/%s] first chunk had no choices (top-level keys: %v)", p.name, model, topLevelKeys(payload))
+				log.Printf("%s[llm/%s/%s] first chunk had no choices (top-level keys: %v)", trace.LogPrefix(ctx), p.name, model, topLevelKeys(payload))
 			}
 		}
 	}()

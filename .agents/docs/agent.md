@@ -40,12 +40,65 @@ for round := 1; maxRounds==0 || round<=maxRounds; round++ {
 
 | 条件 | 阶段 | 行为 |
 |---|---|---|
-| `len(toolCalls) == 0` | `done` | LLM 自然完成 |
+| `len(toolCalls) == 0` + todo 全 done | `done` | LLM 自然完成 |
+| `len(toolCalls) == 0` + todo 未完成 + `autoContinueCount < 3` | `auto-continue` | **P0-3**：注入 user 提示，循环续 |
+| `len(toolCalls) == 0` + todo 未完成 + `autoContinueCount >= 3` | `done` | 兜底退出，不再续 |
 | `meaningful > 80` | `context_warn` | 仅警告 |
 | `meaningful > 120` | `context_warn` | 自动停止，建议 /compress |
 | `ctx.Err() != nil` | (错误路径) | 用户取消 |
 | `maxRounds` 达到 | `limit` | 强制停止 |
 | `stuckStreak >= 3` | `stuck` | 连续 3 轮相同失败工具调用 |
+
+#### P0-3 自动续 LLM 守卫 (2026-07-15)
+
+LLM 经常在"执行完一项 todo 但没更新 todo 列表"或"想接着做下一项但发了文本而非工具调用"时退出 ReAct 循环。旧版本就此 `Done: true` 退出，用户必须手动打字"继续"。
+
+P0-3 在 `len(toolCalls) == 0` 出口前加守卫：
+
+```go
+if req.AutoContinue && autoContinueCount < MaxAutoContinue {
+    if pending, list := sessionPendingTodos(req.SessionID); len(list) > 0 {
+        // 注入 user 风格的"未完成 todo"提示，重入循环
+        msgs = append(msgs, llm.ChatMessage{Role: llm.RoleUser, ...})
+        continue
+    }
+}
+```
+
+要点：
+- `MaxAutoContinue = 3`：多了 LLM 学会偷懒，少了不够用
+- per-session 开关：`ChatRequest.AutoContinue`，CLI 用 `/auto-continue on|off` 切换
+- 配套 P1-1（Plan B）在系统 prompt 加"完成契约"规则，让 LLM 习惯性地把 todo 列表维护到最终状态再退出
+- 配套 P2-1：注入 same-tool-err-limit 时同时重置 stuck-streak，避免互相打架
+
+#### P3-1 per-stream monotonic sequence (2026-07-15, round 2)
+
+`ChatStreamChunk.Seq` (`agent.go:397`) is a `uint64` counter that
+the agent stamps on every emitted chunk via `sendOrDrop` (the
+helper takes a `nextSeq func() uint64` closure so callers don't
+thread `&counter` through 40+ call sites). The counter is
+created in `ChatWithTools` and resets to 0 at the start of every
+stream.
+
+Surfaced on the wire in two ways:
+
+- The JSON field `ev.seq` (handler.go `chunkToEvent`).
+- The standard SSE `id: <n>` frame line emitted after every
+  `data: <json>` line, parsed by both the browser's native
+  EventSource reconnection logic and our fetch-path parser
+  (client.ts `streamMessagesViaFetch`).
+
+Sub-agent chunks forwarded into the parent stream do NOT
+increment the parent's counter — they break the parent's
+monotonic sequence intentionally because the sub-agent has
+its own counter. The seq field is still set (to the parent's
+last counter value at forwarding time) but the gap is normal.
+
+Used by:
+- Dev / curl debugging (every event has a stable position)
+- P0-1 stream-drop recovery (seq is the resume cursor; the
+  snapshot endpoint takes after_seq and returns rows with
+  seq > cursor)
 
 ### 2. 工具执行的并行派发 (`agent.go:1185-1471`)
 
@@ -104,6 +157,40 @@ forwarder goroutine:
 - 不同 root（切项目 / 新 session）：重新加载 skills + rules，失效 cache
 
 没有这个机制，Wails GUI server 的 CWD 跟用户项目无关，project-level skills / rules 永远不会被加载（`LoadAll()` 用 `os.Getwd()`，已修复为 `LoadAllWithRoot(root)`）。
+
+### 8. 端到端 trace id 注入 (P3-3, 2026-07-16)
+
+`ChatRequest.TraceID` 字段 + `ChatStreamChunk.TraceID` 字段 +
+`sendOrDrop` 自动从 ctx 读 trace id 写每个 chunk：
+
+- `ChatWithTools` 入口：`req.TraceID`（handler 塞的）或 ctx 已有
+  → `trace.WithID(ctx, id)` 重新注入
+- `sendOrDrop`：从 ctx 读 → `chunk.TraceID`，避免 40+ call site
+  显式赋值
+- 工具派发：`tctx = tool.WithTraceID(tctx, tid)`，工具 handler
+  用 `tool.TraceIDFromCtx(ctx)` 拿
+- LLM client：`openaiStream` / `AnthropicClient.ChatStream`
+  在 `http.NewRequestWithContext` 后设 `X-Trace-Id` header
+  （虽然 LLM 不会回，但能 grep 我们送出的请求）
+
+详见 [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md)。
+
+### 9. Dynamic 工具 sandbox 决策 (P3-2, 2026-07-16)
+
+`confirm_target.go` switch 加 `default:` 分支：当工具名不匹配
+已知 6 个 built-in 时，查 `dynamic.LookupSpec(name)`。如果 spec
+存在，`decisionFromSandbox(spec.Sandbox.Exec, toolName)` 转
+`SandboxDecision`：
+
+| spec.Sandbox.Exec | SandboxDecision | 行为 |
+| --- | --- | --- |
+| `allow` | `SandboxAllow` | 直接执行，无弹窗 |
+| `deny` | `SandboxBlock` | 返回 E_SANDBOX 错误 |
+| `confirm` | `SandboxConfirm` | 弹现有 confirm modal |
+
+dynamic spec 走 `dynamic.SetSpecs(all)` 在 watcher 每次 reload
+后发布，agent loop 读的是进程全局表。避开在 40+ 层的 agent
+函数链多收 Registry 参数。
 
 ## 修改指南
 

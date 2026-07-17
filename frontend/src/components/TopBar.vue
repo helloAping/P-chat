@@ -22,12 +22,13 @@
  * concept (it's a local app). The right section will fill in as
  * those become real.
  */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { NButton, NTooltip } from 'naive-ui'
-import { state, currentMeta } from '../stores/chat'
+import { state, currentMeta, openContextInspector } from '../stores/chat'
 import * as api from '../api/client'
 import BrandLogo from './BrandLogo.vue'
-import { FolderOpen, Terminal, PanelLeftClose, PanelLeftOpen, Sparkles } from './icons'
+import ToolListDrawer from './ToolListDrawer.vue'
+import { FolderOpen, Terminal, PanelLeftClose, PanelLeftOpen, Sparkles, BarChart3, Wrench } from './icons'
 
 const props = defineProps<{
   /** Whether the sidebar is currently collapsed. Two-way bound. */
@@ -92,6 +93,11 @@ async function openTerminal() {
   if (!state.activeProjectPath) return
   try { await api.openTerminal(state.activeProjectPath) } catch { /* ignore */ }
 }
+
+// showToolList toggles the P3-2 ToolListDrawer.
+// Kept local (not in the chat store) because the tool
+// list is per-server, not per-session.
+const showToolList = ref(false)
 function toggleSidebar() { emit('toggle-sidebar') }
 </script>
 
@@ -144,6 +150,43 @@ function toggleSidebar() { emit('toggle-sidebar') }
 
     <!-- Right section: model badge + project actions. -->
     <div class="topbar-right">
+      <!-- P2-3: context inspector trigger. The drawer
+           itself lives in ChatWindow (so it overlays
+           the chat area, not the top bar). Clicking
+           this button opens it AND kicks off the
+           fetch in one go. -->
+      <NTooltip>
+        <template #trigger>
+          <NButton
+            size="tiny"
+            quaternary
+            aria-label="查看上下文占用"
+            @click="openContextInspector(state.currentID)"
+          >
+            <BarChart3 :size="16" />
+          </NButton>
+        </template>
+        上下文占用
+      </NTooltip>
+      <!-- P3-2: tool list trigger. Opens the drawer
+           that lists every tool the LLM can call —
+           built-ins plus the user's dynamic YAML
+           tools. Sits next to the context inspector
+           because both are "what's the agent doing
+           right now?" affordances. -->
+      <NTooltip>
+        <template #trigger>
+          <NButton
+            size="tiny"
+            quaternary
+            aria-label="查看工具列表"
+            @click="showToolList = true"
+          >
+            <Wrench :size="16" />
+          </NButton>
+        </template>
+        工具列表
+      </NTooltip>
       <div class="model-badge" :title="`提供商: ${providerLabel || '未选择'}`">
         <span class="model-dot" :style="{ background: providerColor }" aria-hidden="true" />
         <Sparkles :size="13" class="model-badge-icon" />
@@ -178,6 +221,14 @@ function toggleSidebar() { emit('toggle-sidebar') }
         </NTooltip>
       </template>
     </div>
+
+    <!-- P3-2: tool list drawer. Rendered at the
+         top-bar level (not in ChatWindow) so it's
+         available even on screens that don't have
+         an active session — the user might want to
+         browse their tool list before picking a
+         session. -->
+    <ToolListDrawer v-model:show="showToolList" />
   </header>
 </template>
 

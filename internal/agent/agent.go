@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,7 @@ import (
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/trace"
 )
 
 type Agent struct {
@@ -329,6 +331,17 @@ type ChatRequest struct {
 	// entries (text + image/file) before being sent to the LLM.
 	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// ClientMsgID, when non-zero, is the row id the frontend
+	// minted at send time (Date.now() × 1000 + random, well
+	// outside SQLite's AUTOINCREMENT range). The agent uses
+	// it as the explicit row id when persisting this turn's
+	// user message so rollback/regenerate have a valid id
+	// to target from the moment the user clicks send — the
+	// SSE `done` event is no longer the gating factor.
+	// Zero means "let the store autoincrement as usual"
+	// (the legacy path used by tests, the CLI, and any
+	// non-SPA caller that doesn't pre-mint an id).
+	ClientMsgID int64 `json:"client_msg_id,omitempty"`
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools.
 	PlanMode bool `json:"plan_mode,omitempty"`
@@ -355,6 +368,16 @@ type ChatRequest struct {
 	// PermissionLevel overrides the sandbox confirm behaviour for
 	// this session. Values: "ask", "auto", "full". Default "ask".
 	PermissionLevel string `json:"permission_level,omitempty"`
+	// RegenGroupID is the P1-4 regen-history tag. When
+	// non-empty, the agent loop stamps the new assistant
+	// message's regen_group_id column with this value so
+	// it joins the user message's regen group. The
+	// Regenerate handler sets this to
+	// strconv.FormatInt(req.UserMessageID, 10); the
+	// SendMessage handler leaves it empty (the resulting
+	// assistant message has regen_group_id = NULL, the
+	// legacy single-shot behaviour).
+	RegenGroupID string `json:"regen_group_id,omitempty"`
 	// MaxRounds caps the ReAct tool-use loop. 0 means default (50).
 	// After MaxRounds the loop stops and the user can continue
 	// with a follow-up message.
@@ -362,6 +385,15 @@ type ChatRequest struct {
 	// KBBase selects the knowledge base for this session.
 	// "" = off, "__all__" = all bases, or a specific base name.
 	KBBase string `json:"kb_base,omitempty"`
+	// AutoContinue controls the "todo-incomplete → re-prompt LLM"
+	// guard (P0-3, see agent.go ChatWithTools). When true (the
+	// default on the server), if the LLM emits a no-tool-call
+	// response but the todo list still has pending or
+	// in_progress items, the agent injects a user-style reminder
+	// listing the unfinished todos and re-enters the loop, up
+	// to MaxAutoContinue times. Set false (via /auto-continue
+	// off) to disable per session.
+	AutoContinue bool `json:"auto_continue,omitempty"`
 	// PromptOv, when non-empty, REPLACES the agent's normal
 	// system prompt (style + AGENTS + rules + skills) for this
 	// turn. Used by the sub-agent runner to install a
@@ -383,9 +415,27 @@ type ChatRequest struct {
 	// SubagentTaskID is the resume-by-id key. Empty for
 	// ad-hoc runs. Populated from Args.TaskID.
 	SubagentTaskID string `json:"subagent_task_id,omitempty"`
+	// TraceID is the P3-3 end-to-end correlation id for this
+	// chat turn. The HTTP server's traceIDMiddleware mints one
+	// per request (or adopts a client-supplied one) and stamps
+	// it on the request context; SendMessage copies the
+	// context value into this field so the agent loop can
+	// stamp every emitted chunk without re-reading ctx. Empty
+	// when running outside the HTTP path (e.g. CLI REPL, tests).
+	TraceID string `json:"trace_id,omitempty"`
 }
 
 type ChatStreamChunk struct {
+	// Seq is the per-stream monotonic counter (0, 1, 2, …)
+	// assigned by sendOrDrop. Stable for the lifetime of one
+	// ChatStream call; NOT stable across streams. Surfaced on
+	// the wire as the standard SSE `id:` line by handler.go so
+	// the frontend (and curl) can attribute logs / events to a
+	// specific position. Sub-agent chunks forwarded into the
+	// parent stream do NOT carry a parent seq — they break the
+	// monotonic sequence intentionally because the sub-agent has
+	// its own counter.
+	Seq uint64 `json:"seq,omitempty"`
 	Content string `json:"content"`
 	// Thinking carries a delta of the model's reasoning /
 	// chain-of-thought text. Only populated by LLM clients
@@ -494,6 +544,15 @@ type ChatStreamChunk struct {
 	// the underlying chunk.
 	SubAgentFailureReason string `json:"sub_agent_failure_reason,omitempty"`
 
+	// TraceID is the P3-3 correlation id (e.g. "T-9f3c4a2b")
+	// stamped on every chunk by sendOrDrop from the request
+	// context. The frontend surfaces it on error bubbles via
+	// the "复制 trace id" button; the server uses it in
+	// `X-Trace-Id` response headers and as a log-line prefix.
+	// Empty when the request didn't carry one (CLI, tests,
+	// direct embedding).
+	TraceID string `json:"trace_id,omitempty"`
+
 	// Question fields — when the question tool emits a
 	// question event, QuestionJSON carries the serialized
 	// question payload (JSON array of Question objects).
@@ -575,265 +634,323 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, a
 		return a.staticPrompt, sig, nil
 	}
 
+	// Each helper below returns a fully-prefixed section
+	// (header + trailing "\n---\n\n" or "\n\n---\n\n" or empty
+	// when the section doesn't apply). The orchestrator stays
+	// a flat list so the order and the byte-exact output are
+	// easy to verify.
 	var sb strings.Builder
-
-	// 1. Style (identity + soul) — short, stable per session.
-	// Graceful fallback: if the requested style isn't registered
-	// (e.g. legacy config still says "default", or a user-defined
-	// style was deleted), fall back to "tech" (the built-in
-	// absolute default) rather than failing the entire turn.
-	// Logging the fallback keeps the misconfiguration visible.
-	stylePrompt, err := a.styleMgr.GetSystemPrompt(s)
+	styleBlock, err := a.buildStyleBlock(s)
 	if err != nil {
-		log.Printf("[agent] style %q not found (%v) — falling back to %q", s, err, style.Tech)
-		stylePrompt, err = a.styleMgr.GetSystemPrompt(style.Tech)
-		if err != nil {
-			// Last-resort: tech must be a built-in. If even
-			// this fails, the style manager is broken.
-			return "", sig, fmt.Errorf("style fallback failed: %w", err)
-		}
+		return "", sig, err
 	}
-	sb.WriteString(stylePrompt)
-	sb.WriteString("\n\n---\n\n")
-
-	// 2. AGENTS instructions — stable until files change.
-	sb.WriteString(agents.LoadAllWithRoot(projectRoot))
-	sb.WriteString("\n---\n\n")
-
-	// 3. Rules — stable until files change.
-	sb.WriteString(rules.BuildRulesContext(a.rules))
-	sb.WriteString("\n---\n\n")
-
-	// 4. Skills — stable until files change.
-	sb.WriteString(skill.BuildSkillContext(a.skills))
-	sb.WriteString("\n---\n\n")
-
-	// 5. Tool hint — stable per session (tools don't change at runtime).
-	if len(toolDefs) > 0 {
-		sb.WriteString(buildToolHint(availableTools))
-		// Encourage the LLM to consult its knowledge base before
-		// answering questions it might not know. The `recall` tool
-		// is added by the CLI at startup; here we just remind the
-		// model to use it.
-		hasRecall := false
-		hasGrep := false
-		hasWiki := false
-		hasQuestion := false
-		hasTodoWrite := false
-		for _, t := range availableTools {
-			switch t.Name {
-			case "recall":
-				hasRecall = true
-			case "grep":
-				hasGrep = true
-			case "wiki_lookup":
-				hasWiki = true
-			case "question":
-				hasQuestion = true
-			case "todo_write":
-				hasTodoWrite = true
-			}
-		}
-		if hasWiki && kbEnabled {
-			sb.WriteString("\n\n---\n\n## Using Knowledge Base (wiki_lookup / wiki_list)\n\n" +
-				"**何时必须查询知识库：**\n" +
-				"- 用户询问项目相关概念、设计、架构、配置、API、流程等任何专业问题时，**优先查询知识库**，而非仅凭训练数据回答。\n" +
-				"- 系统提示中已包含知识库索引概览（一级索引），根据概览定位相关文件后再检索。\n" +
-				"\n**工具使用规则：**\n" +
-				"- `wiki_lookup(query=\"\")` — 查询为空时，返回知识库中所有文件目录（L2 列表），按关联度排序。默认每页 20 条，可用 page 翻页。\n" +
-				"- `wiki_lookup(query=\"关键词\")` — 按关键词、标题或概览搜索条目，返回匹配的 L3 章节节点及其所属文件（L2 父节点）。\n" +
-				"- `wiki_lookup(query=\"...\", expand=true)` — 同时返回匹配条目的完整正文内容。\n" +
-				"- `wiki_list(parent_id=N)` — 列出父节点 N 下的所有子节点。L1（id=1）列出所有文件；L2 节点列出该文件所有章节。\n" +
-				"\n**标准流程：**\n" +
-				"1. 先看系统提示中的一级索引概览，找到可能相关的文件（L2）。\n" +
-				"2. 用 wiki_lookup 搜索关键词或浏览目录定位目标文件/章节。\n" +
-				"3. 用 wiki_lookup(query=\"...\", expand=true) 获取完整内容。\n" +
-				"4. 信息足够后直接回答 → 不需要再调用任何 wiki 工具。\n")
-		}
-		if hasRecall {
-			sb.WriteString("\n\n---\n\n## Using recall\n\n" +
-				"当你不确定某条信息、需要查代码/文档、或想引用历史对话时，\n" +
-				"先用 `recall(query=\"...\")` 工具查一下知识库/历史。\n" +
-				"不要凭印象编造 API 名称、文件路径、函数签名。\n")
-		}
-		if hasGrep {
-			sb.WriteString("\n\n---\n\n## Using grep\n\n" +
-				"使用 `grep(pattern=\"...\")` 在知识库文件中精确搜索关键词。\n" +
-				"适用场景：找特定函数名、变量名、类名、配置项、或任何精确文本。\n" +
-				"recall 适合语义概念搜索，grep 适合精确字符串定位。\n" +
-				"两者可结合使用：先用 recall 理解上下文，再用 grep 精确定位。\n")
-		}
-		if hasTodoWrite {
-			sb.WriteString("\n\n---\n\n## Task Planning with todo_write\n\n" +
-				"使用 `todo_write` 工具创建和管理结构化任务列表。\n" +
-				"何时使用：复杂多步骤任务（3+ 步）、用户明确要求、收到新指令后、开始或完成工作时。\n" +
-				"规则：\n" +
-				"- 始终包含完整列表（替换式，非追加式）\n" +
-				"- 同时只能有一个任务处于 in_progress\n" +
-				"- 完成任务后立即标记为 done（不要批量标记）\n" +
-				"- 如果测试失败、实现不完整或错误未解决，不要标记为 done\n" +
-				"- 状态: pending（待处理）、in_progress（进行中）、done（已完成）、cancelled（已取消）\n")
-		}
-		if hasQuestion {
-			sb.WriteString("\n\n---\n\n## Asking the User (question tool)\n\n" +
-				"当你需要用户决策、明确需求或在执行前确认计划时，使用 `question` 工具。\n" +
-				"何时使用：\n" +
-				"- 需求不明确，有多个可行的技术方案\n" +
-				"- 需要用户选择工具、框架或架构\n" +
-				"- 在执行前需要用户确认关键决策\n" +
-				"- 用户指令模糊，需要澄清\n" +
-				"最多一次提 4 个问题，每个问题 2-4 个选项。\n" +
-				"不要在简单/琐碎的事务上使用（如「我能开始吗？」）。\n")
-		}
-
-		// opcode-style tool catalog: explicitly list every
-		// available tool so the LLM does NOT hallucinate
-		// non-existent tools (e.g. grep, bash, find).
-		sb.WriteString("\n\n---\n\n## Available Tools\n\n")
-		sb.WriteString("You have access to these tools. Call ONLY the tools in this list.\n\n")
-		sb.WriteString("| Tool | What it does |\n")
-		sb.WriteString("|------|-------------|\n")
-		for _, t := range availableTools {
-			desc := t.Description
-			if idx := strings.Index(desc, "."); idx > 0 {
-				desc = desc[:idx]
-			}
-			sb.WriteString(fmt.Sprintf("| `%s` | %s |\n", t.Name, desc))
-		}
-		sb.WriteString("\nOperation → correct tool mapping:\n")
-		sb.WriteString("- Read a file → `read_file` (NOT `cat` / `type` / `head` / `tail`)\n")
-		sb.WriteString("- Write a file → `write_file` (NOT `echo >` / `cat >`)\n")
-		sb.WriteString("- List directory → `list_files` (NOT `ls` / `dir`)\n")
-		sb.WriteString("- System commands → `exec_command` (NOT `bash` / `sh` / `powershell`)\n")
-		sb.WriteString("- Search file contents → `exec_command` with shell search commands\n")
-		sb.WriteString("- Search the web → `web_search` (returns title+url+snippet; chain with `web_fetch` for full content)\n")
-		sb.WriteString("- Fetch a URL → `web_fetch` (NOT `curl` / `Invoke-WebRequest`)\n")
-		sb.WriteString("- Manage tasks → `todo_write`\n")
-		sb.WriteString("- Ask user → `question`\n")
-
-		// opcode-style platform awareness (see opencode's
-		// shell/prompt.ts): tell the LLM what OS and shell
-		// it is running under so it knows which commands
-		// are available and which are NOT.
-		sb.WriteString("\n\n---\n\n## Platform\n\n")
-		sb.WriteString(fmt.Sprintf("Platform: %s\n", runtime.GOOS))
-		if runtime.GOOS == "windows" {
-			sb.WriteString("Shell for exec_command: cmd.exe /C <command>\n")
-			sb.WriteString("Chain commands: `&` (always run next) or `&&` (only if previous succeeded).\n\n")
-			sb.WriteString("Available built-in commands:\n")
-			sb.WriteString("  dir       — list directory contents (NOT ls)\n")
-			sb.WriteString("  type      — print file content (NOT cat)\n")
-			sb.WriteString("  findstr   — search text in files (NOT grep / rg)\n")
-			sb.WriteString("  echo      — print text\n")
-			sb.WriteString("  copy      — copy files (NOT cp)\n")
-			sb.WriteString("  move      — move / rename files (NOT mv)\n")
-			sb.WriteString("  del / rd  — delete files / dirs (NOT rm)\n")
-			sb.WriteString("  mkdir     — create directory\n")
-			sb.WriteString("  cd        — change directory (prefer using work_dir parameter)\n")
-			sb.WriteString("  set       — set / show environment variables (NOT export)\n")
-			sb.WriteString("\nCommands that do NOT exist on Windows (never call these):\n")
-			sb.WriteString("  grep, rg, ls, bash, sh, find, cp, mv, rm, cat, chmod, sudo\n")
-			sb.WriteString("\nPowerShell is available via: pwsh -NoProfile -Command \"...\"\n")
-		} else {
-			sb.WriteString("Shell for exec_command: /bin/sh -c <command>\n")
-			sb.WriteString("Standard Unix tools are available (grep, ls, cat, find, etc.).\n")
-		}
-
-		// System-level continuity instructions (style-agnostic).
-		// The LLM tends to give up after a few tool failures if
-		// not explicitly told to persist. opencode's beast mode
-		// prompt drives persistence; we inject a condensed
-		// version as a system-level section that applies across
-		// all personality styles.
-		sb.WriteString("\n\n---\n\n## Conversation Continuity\n\n")
-		sb.WriteString("You are in a continuous conversation loop with tool access. ")
-		sb.WriteString("Your goal is to complete the task, not merely report status.\n\n")
-		sb.WriteString("When a tool call fails:\n")
-		sb.WriteString("1. Read the error message carefully — identify the root cause\n")
-		sb.WriteString("2. Try an alternative approach using different tools or parameters\n")
-		sb.WriteString("3. After 3 consecutive failures on the same task, use `question` to ask the user for guidance\n")
-		sb.WriteString("4. A tool failure does NOT mean the task is impossible — keep going\n")
-		sb.WriteString("5. NEVER end a turn with only a status summary after a tool error — always propose or attempt the next step\n\n")
-		sb.WriteString("Operation → fallback mapping (when the primary approach fails):\n")
-		sb.WriteString("- `read_file` path not found → try `list_files` to discover the correct path\n")
-		sb.WriteString("- Command not found in `exec_command` → check the Platform section for available commands\n")
-		sb.WriteString("- File too large for `read_file` → use `exec_command` with `type` or `findstr` to grep specific lines\n")
-		sb.WriteString("- Tool not found error → re-read the Available Tools table; use only listed tools\n")
-		sb.WriteString("- `browser_*` connection error (\"connection closed\", \"browser extension has disconnected\") → ")
-		sb.WriteString("the extension may reconnect. Retry once; if it fails again, tell the user the browser extension disconnected ")
-		sb.WriteString("and ask whether to wait, re-establish the connection, or continue without browser tools\n")
-		sb.WriteString("- `browser_screenshot` captures the viewport and the picture is automatically delivered as a " +
-			"follow-up image message so you can see it directly (requires vision). If the picture doesn't appear or the " +
-			"model doesn't support vision, fall back to `browser_snapshot` (text-based, no image payload)\n")
-		sb.WriteString("- `browser_snapshot` returns too few elements (e.g. SPA page where content is dynamic divs, not interactive elements) → ")
-		sb.WriteString("use `browser_extract` to get all visible rendered text content\n")
-		sb.WriteString("- Reading page content on a SPA / JavaScript-heavy site → ")
-		sb.WriteString("`browser_extract` is preferred over `browser_snapshot` + `browser_screenshot` because it extracts the full ")
-		sb.WriteString("JavaScript-rendered text without requiring vision capabilities\n")
-		sb.WriteString("- `browser_*` returns \"not found\" listing it as available → the tool was unregistered mid-turn due to browser disconnect. ")
-		sb.WriteString("Do NOT retry browser_* tools; use `web_fetch` for HTTP content or text-based tools for other data\n\n")
-		sb.WriteString("## Anti-Repetition\n\n")
-		sb.WriteString("When the user repeats a question or instruction, always reason fresh: ")
-		sb.WriteString("do NOT echo or copy your previous response. The available tool set may have changed since your last turn ")
-		sb.WriteString("(tools can be dynamically registered or unregistered mid-conversation). ")
-		sb.WriteString("Always check the Available Tools table first, then re-evaluate your options. ")
-		sb.WriteString("Repeating an identical reply is a bug — if the same question is asked twice, the user wants a DIFFERENT answer, ")
-		sb.WriteString("not the same one.\n\n")
-		sb.WriteString("Only stop when:\n")
-		sb.WriteString("- The task is truly complete and you have delivered the final result to the user\n")
-		sb.WriteString("- The user explicitly says to stop\n")
-		sb.WriteString("- All reasonable approaches have been exhausted (and you explain why to the user)\n\n")
-		sb.WriteString("IMPORTANT: A tool error — especially a transient one like a connection error — ")
-		sb.WriteString("is NOT a valid reason to end the turn. If the original task cannot proceed, ")
-		sb.WriteString("explicitly tell the user what happened and propose concrete next steps. ")
-		sb.WriteString("Do NOT silently output a summary and stop without a text response.\n")
-
-		// Remind the LLM that uploaded images arrive as vision
-		// input in the user message (image_url content parts),
-		// NOT as files on disk.
-		sb.WriteString("\n\n---\n\n## Uploaded Attachments\n\n" +
-			"User-uploaded images and files are sent directly inside the user message — " +
-			"images as image_url content parts (data URLs), text files as inline blocks. " +
-			"You can see them. Just answer based on their content.\n\n" +
-			"Do not call read_file on an uploaded image: it lives on disk as a temporary " +
-			"file, and read_file only handles text. If read_file returns a binary error, " +
-			"that is read_file's limitation, not a problem with the attachment — the image " +
-			"was already delivered to you through the user message. " +
-			"Respond in the same language as the conversation.\n")
-	}
-
-	// 6. Project root — tells the LLM which directory to use
-	// as CWD for exec_command and file operations.
-	if projectRoot != "" {
-		sb.WriteString(fmt.Sprintf("\n\n---\n\n## Working Directory\n\n"+
-			"Your working directory is fixed at `%s`. exec_command runs here automatically "+
-			"(the work_dir argument is ignored). read_file and write_file resolve relative "+
-			"paths against this directory.\n", projectRoot))
-	}
-
-	// 7. Output language hint — also part of the cacheable prefix
-	// because changing it forces a full re-build anyway.
-	//
-	// opencode's PROMPT_COMPACTION uses a single line: "Respond
-	// in the same language as the conversation." That's the
-	// natural default — the LLM already follows the user's
-	// language. We keep the explicit per-style override for
-	// users who want a fixed language regardless of the
-	// conversation.
-	if lang == "zh" {
-		sb.WriteString("\n---\n\n## 输出语言\n\n请用简体中文回答用户的问题。\n")
-	} else if lang == "en" {
-		sb.WriteString("\n---\n\n## Output Language\n\nPlease answer in English.\n")
-	} else if lang == "auto" || lang == "" {
-		// Default: follow the conversation's language. This
-		// is the opencode rule.
-		sb.WriteString("\n\n---\n\n## Output Language\n\nRespond in the same language as the conversation.\n")
-	}
+	sb.WriteString(styleBlock)
+	sb.WriteString(agents.LoadAllWithRoot(projectRoot) + "\n---\n\n")
+	sb.WriteString(rules.BuildRulesContext(a.rules) + "\n---\n\n")
+	sb.WriteString(skill.BuildSkillContext(a.skills) + "\n---\n\n")
+	sb.WriteString(buildToolHintBlock(availableTools, kbEnabled))
+	sb.WriteString(buildWorkingDirBlock(projectRoot))
+	sb.WriteString(buildLanguageBlock(lang))
 
 	prompt := sb.String()
 	a.staticPrompt = prompt
 	a.staticPromptID = sig
 	return prompt, sig, nil
+}
+
+// buildStyleBlock returns section 1 (style identity + soul) plus
+// the trailing separator. Graceful fallback: if the requested
+// style isn't registered (legacy "default" string, deleted
+// user-defined style, etc.) we fall back to "tech" rather than
+// failing the turn. The misconfiguration is logged so it stays
+// visible in the server log.
+//
+// If even the tech fallback fails, the style manager is
+// broken — we propagate the error so the caller fails the
+// turn rather than emitting a degraded prompt. (Earlier
+// versions emitted an empty section; that was misleading
+// because the LLM would proceed with no identity at all.)
+func (a *Agent) buildStyleBlock(s style.Style) (string, error) {
+	stylePrompt, err := a.styleMgr.GetSystemPrompt(s)
+	if err != nil {
+		log.Printf("[agent] style %q not found (%v) — falling back to %q", s, err, style.Tech)
+		stylePrompt, err = a.styleMgr.GetSystemPrompt(style.Tech)
+		if err != nil {
+			return "", fmt.Errorf("style fallback failed: %w", err)
+		}
+	}
+	return stylePrompt + "\n\n---\n\n", nil
+}
+
+// buildToolHintBlock returns section 5 (the big one). It is a
+// composite of 5 sub-blocks: tool-specific hints (recall/grep/
+// wiki/question/todo_write), available-tools table, platform
+// section, conversation continuity, and uploaded attachments.
+// Returns "" when no tools are available, matching the original
+// `if len(toolDefs) > 0` guard.
+func buildToolHintBlock(availableTools []tool.Tool, kbEnabled bool) string {
+	if len(availableTools) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(buildToolHint(availableTools))
+	sb.WriteString(buildToolSpecificHints(availableTools, kbEnabled))
+	sb.WriteString(buildAvailableToolsSection(availableTools))
+	sb.WriteString(buildPlatformSection())
+	sb.WriteString(buildConversationContinuitySection())
+	sb.WriteString(buildAttachmentsSection())
+	return sb.String()
+}
+
+// buildToolSpecificHints emits per-tool guidance (recall, grep,
+// wiki, question, todo_write). Only sections for tools the LLM
+// actually has access to are emitted.
+func buildToolSpecificHints(availableTools []tool.Tool, kbEnabled bool) string {
+	hasRecall, hasGrep, hasWiki, hasQuestion, hasTodoWrite := false, false, false, false, false
+	for _, t := range availableTools {
+		switch t.Name {
+		case "recall":
+			hasRecall = true
+		case "grep":
+			hasGrep = true
+		case "wiki_lookup":
+			hasWiki = true
+		case "question":
+			hasQuestion = true
+		case "todo_write":
+			hasTodoWrite = true
+		}
+	}
+	var sb strings.Builder
+	if hasWiki && kbEnabled {
+		sb.WriteString("\n\n---\n\n## Using Knowledge Base (wiki_lookup / wiki_list)\n\n" +
+			"**何时必须查询知识库：**\n" +
+			"- 用户询问项目相关概念、设计、架构、配置、API、流程等任何专业问题时，**优先查询知识库**，而非仅凭训练数据回答。\n" +
+			"- 系统提示中已包含知识库索引概览（一级索引），根据概览定位相关文件后再检索。\n" +
+			"\n**工具使用规则：**\n" +
+			"- `wiki_lookup(query=\"\")` — 查询为空时，返回知识库中所有文件目录（L2 列表），按关联度排序。默认每页 20 条，可用 page 翻页。\n" +
+			"- `wiki_lookup(query=\"关键词\")` — 按关键词、标题或概览搜索条目，返回匹配的 L3 章节节点及其所属文件（L2 父节点）。\n" +
+			"- `wiki_lookup(query=\"...\", expand=true)` — 同时返回匹配条目的完整正文内容。\n" +
+			"- `wiki_list(parent_id=N)` — 列出父节点 N 下的所有子节点。L1（id=1）列出所有文件；L2 节点列出该文件所有章节。\n" +
+			"\n**标准流程：**\n" +
+			"1. 先看系统提示中的一级索引概览，找到可能相关的文件（L2）。\n" +
+			"2. 用 wiki_lookup 搜索关键词或浏览目录定位目标文件/章节。\n" +
+			"3. 用 wiki_lookup(query=\"...\", expand=true) 获取完整内容。\n" +
+			"4. 信息足够后直接回答 → 不需要再调用任何 wiki 工具。\n")
+	}
+	if hasRecall {
+		sb.WriteString("\n\n---\n\n## Using recall\n\n" +
+			"当你不确定某条信息、需要查代码/文档、或想引用历史对话时，\n" +
+			"先用 `recall(query=\"...\")` 工具查一下知识库/历史。\n" +
+			"不要凭印象编造 API 名称、文件路径、函数签名。\n")
+	}
+	if hasGrep {
+		sb.WriteString("\n\n---\n\n## Using grep\n\n" +
+			"使用 `grep(pattern=\"...\")` 在知识库文件中精确搜索关键词。\n" +
+			"适用场景：找特定函数名、变量名、类名、配置项、或任何精确文本。\n" +
+			"recall 适合语义概念搜索，grep 适合精确字符串定位。\n" +
+			"两者可结合使用：先用 recall 理解上下文，再用 grep 精确定位。\n")
+	}
+	if hasTodoWrite {
+		sb.WriteString("\n\n---\n\n## Task Planning with todo_write\n\n" +
+			"使用 `todo_write` 工具创建和管理结构化任务列表。\n" +
+			"何时使用：复杂多步骤任务（3+ 步）、用户明确要求、收到新指令后、开始或完成工作时。\n" +
+			"规则：\n" +
+			"- 始终包含完整列表（替换式，非追加式）\n" +
+			"- 同时只能有一个任务处于 in_progress\n" +
+			"- 完成任务后立即标记为 done（不要批量标记）\n" +
+			"- 如果测试失败、实现不完整或错误未解决，不要标记为 done\n" +
+			"- 状态: pending（待处理）、in_progress（进行中）、done（已完成）、cancelled（已取消）\n" +
+			// P1-1 (Plan B): the LLM often exits the ReAct loop
+			// with a "ready to continue" text block instead of
+			// the next tool_call. Plan A (P0-3) auto-re-prompts
+			// when the todo list still has unfinished items, but
+			// the cleanest fix is for the LLM to update the
+			// todo list BEFORE it tries to exit. This rule makes
+			// that contract explicit. Per-session opt-out via
+			// ChatRequest.AutoContinue (P0-3) — the auto-prompt
+			// is a backstop, not a substitute.
+			"- **完成契约**：在你结束当前回合前（停止调用工具、只发文本总结），**必须**先调用 `todo_write` 把列表更新到最终状态——所有已完成项标 `done`，无法完成的项标 `cancelled`。如果列表里还有 `pending` 或 `in_progress`，说明任务没做完，你应该继续调用工具而不是发总结。\n")
+	}
+	if hasQuestion {
+		sb.WriteString("\n\n---\n\n## Asking the User (question tool)\n\n" +
+			"当你需要用户决策、明确需求或在执行前确认计划时，使用 `question` 工具。\n" +
+			"何时使用：\n" +
+			"- 需求不明确，有多个可行的技术方案\n" +
+			"- 需要用户选择工具、框架或架构\n" +
+			"- 在执行前需要用户确认关键决策\n" +
+			"- 用户指令模糊，需要澄清\n" +
+			"最多一次提 4 个问题，每个问题 2-4 个选项。\n" +
+			"不要在简单/琐碎的事务上使用（如「我能开始吗？」）。\n")
+	}
+	return sb.String()
+}
+
+// buildAvailableToolsSection emits the "Available Tools" markdown
+// table and the opcode-style operation→tool mapping. Listing
+// every available tool explicitly prevents the LLM from
+// hallucinating non-existent tools (e.g. grep, bash, find).
+func buildAvailableToolsSection(availableTools []tool.Tool) string {
+	var sb strings.Builder
+	sb.WriteString("\n\n---\n\n## Available Tools\n\n")
+	sb.WriteString("You have access to these tools. Call ONLY the tools in this list.\n\n")
+	sb.WriteString("| Tool | What it does |\n")
+	sb.WriteString("|------|-------------|\n")
+	for _, t := range availableTools {
+		desc := t.Description
+		if idx := strings.Index(desc, "."); idx > 0 {
+			desc = desc[:idx]
+		}
+		sb.WriteString(fmt.Sprintf("| `%s` | %s |\n", t.Name, desc))
+	}
+	sb.WriteString("\nOperation → correct tool mapping:\n")
+	sb.WriteString("- Read a file → `read_file` (NOT `cat` / `type` / `head` / `tail`)\n")
+	sb.WriteString("- Write a file → `write_file` (NOT `echo >` / `cat >`)\n")
+	sb.WriteString("- List directory → `list_files` (NOT `ls` / `dir`)\n")
+	sb.WriteString("- System commands → `exec_command` (NOT `bash` / `sh` / `powershell`)\n")
+	sb.WriteString("- Search file contents → `exec_command` with shell search commands\n")
+	sb.WriteString("- Search the web → `web_search` (returns title+url+snippet; chain with `web_fetch` for full content)\n")
+	sb.WriteString("- Fetch a URL → `web_fetch` (NOT `curl` / `Invoke-WebRequest`)\n")
+	sb.WriteString("- Manage tasks → `todo_write`\n")
+	sb.WriteString("- Ask user → `question`\n")
+	return sb.String()
+}
+
+// buildPlatformSection emits OS-specific command-availability
+// guidance. See opencode's shell/prompt.ts for the original
+// design; the Windows branch is the more thorough one because
+// cmd.exe's command set differs most from POSIX expectations.
+func buildPlatformSection() string {
+	var sb strings.Builder
+	sb.WriteString("\n\n---\n\n## Platform\n\n")
+	sb.WriteString(fmt.Sprintf("Platform: %s\n", runtime.GOOS))
+	if runtime.GOOS == "windows" {
+		sb.WriteString("Shell for exec_command: cmd.exe /C <command>\n")
+		sb.WriteString("Chain commands: `&` (always run next) or `&&` (only if previous succeeded).\n\n")
+		sb.WriteString("Available built-in commands:\n")
+		sb.WriteString("  dir       — list directory contents (NOT ls)\n")
+		sb.WriteString("  type      — print file content (NOT cat)\n")
+		sb.WriteString("  findstr   — search text in files (NOT grep / rg)\n")
+		sb.WriteString("  echo      — print text\n")
+		sb.WriteString("  copy      — copy files (NOT cp)\n")
+		sb.WriteString("  move      — move / rename files (NOT mv)\n")
+		sb.WriteString("  del / rd  — delete files / dirs (NOT rm)\n")
+		sb.WriteString("  mkdir     — create directory\n")
+		sb.WriteString("  cd        — change directory (prefer using work_dir parameter)\n")
+		sb.WriteString("  set       — set / show environment variables (NOT export)\n")
+		sb.WriteString("\nCommands that do NOT exist on Windows (never call these):\n")
+		sb.WriteString("  grep, rg, ls, bash, sh, find, cp, mv, rm, cat, chmod, sudo\n")
+		sb.WriteString("\nPowerShell is available via: pwsh -NoProfile -Command \"...\"\n")
+	} else {
+		sb.WriteString("Shell for exec_command: /bin/sh -c <command>\n")
+		sb.WriteString("Standard Unix tools are available (grep, ls, cat, find, etc.).\n")
+	}
+	return sb.String()
+}
+
+// buildConversationContinuitySection emits style-agnostic
+// persistence / anti-repetition / tool-failure-fallback guidance.
+// opencode's "beast mode" prompt drives persistence; this is a
+// condensed version applied at the system level so it works
+// across all personality styles.
+func buildConversationContinuitySection() string {
+	var sb strings.Builder
+	sb.WriteString("\n\n---\n\n## Conversation Continuity\n\n")
+	sb.WriteString("You are in a continuous conversation loop with tool access. ")
+	sb.WriteString("Your goal is to complete the task, not merely report status.\n\n")
+	sb.WriteString("When a tool call fails:\n")
+	sb.WriteString("1. Read the error message carefully — identify the root cause\n")
+	sb.WriteString("2. Try an alternative approach using different tools or parameters\n")
+	sb.WriteString("3. After 3 consecutive failures on the same task, use `question` to ask the user for guidance\n")
+	sb.WriteString("4. A tool failure does NOT mean the task is impossible — keep going\n")
+	sb.WriteString("5. NEVER end a turn with only a status summary after a tool error — always propose or attempt the next step\n\n")
+	sb.WriteString("Operation → fallback mapping (when the primary approach fails):\n")
+	sb.WriteString("- `read_file` path not found → try `list_files` to discover the correct path\n")
+	sb.WriteString("- Command not found in `exec_command` → check the Platform section for available commands\n")
+	sb.WriteString("- File too large for `read_file` → use `exec_command` with `type` or `findstr` to grep specific lines\n")
+	sb.WriteString("- Tool not found error → re-read the Available Tools table; use only listed tools\n")
+	sb.WriteString("- `browser_*` connection error (\"connection closed\", \"browser extension has disconnected\") → ")
+	sb.WriteString("the extension may reconnect. Retry once; if it fails again, tell the user the browser extension disconnected ")
+	sb.WriteString("and ask whether to wait, re-establish the connection, or continue without browser tools\n")
+	sb.WriteString("- `browser_screenshot` captures the viewport and the picture is automatically delivered as a " +
+		"follow-up image message so you can see it directly (requires vision). If the picture doesn't appear or the " +
+		"model doesn't support vision, fall back to `browser_snapshot` (text-based, no image payload)\n")
+	sb.WriteString("- `browser_snapshot` returns too few elements (e.g. SPA page where content is dynamic divs, not interactive elements) → ")
+	sb.WriteString("use `browser_extract` to get all visible rendered text content\n")
+	sb.WriteString("- Reading page content on a SPA / JavaScript-heavy site → ")
+	sb.WriteString("`browser_extract` is preferred over `browser_snapshot` + `browser_screenshot` because it extracts the full ")
+	sb.WriteString("JavaScript-rendered text without requiring vision capabilities\n")
+	sb.WriteString("- `browser_*` returns \"not found\" listing it as available → the tool was unregistered mid-turn due to browser disconnect. ")
+	sb.WriteString("Do NOT retry browser_* tools; use `web_fetch` for HTTP content or text-based tools for other data\n\n")
+	sb.WriteString("## Anti-Repetition\n\n")
+	sb.WriteString("When the user repeats a question or instruction, always reason fresh: ")
+	sb.WriteString("do NOT echo or copy your previous response. The available tool set may have changed since your last turn ")
+	sb.WriteString("(tools can be dynamically registered or unregistered mid-conversation). ")
+	sb.WriteString("Always check the Available Tools table first, then re-evaluate your options. ")
+	sb.WriteString("Repeating an identical reply is a bug — if the same question is asked twice, the user wants a DIFFERENT answer, ")
+	sb.WriteString("not the same one.\n\n")
+	sb.WriteString("Only stop when:\n")
+	sb.WriteString("- The task is truly complete and you have delivered the final result to the user\n")
+	sb.WriteString("- The user explicitly says to stop\n")
+	sb.WriteString("- All reasonable approaches have been exhausted (and you explain why to the user)\n\n")
+	sb.WriteString("IMPORTANT: A tool error — especially a transient one like a connection error — ")
+	sb.WriteString("is NOT a valid reason to end the turn. If the original task cannot proceed, ")
+	sb.WriteString("explicitly tell the user what happened and propose concrete next steps. ")
+	sb.WriteString("Do NOT silently output a summary and stop without a text response.\n")
+	return sb.String()
+}
+
+// buildAttachmentsSection reminds the LLM that uploaded images
+// arrive as vision input in the user message (image_url content
+// parts), NOT as files on disk. The phrasing is deliberately
+// positive and language-neutral — earlier versions literally
+// primed the LLM with "ERROR: ... Inform the user" by name and
+// the model echoed that exact phrasing back to users.
+func buildAttachmentsSection() string {
+	return "\n\n---\n\n## Uploaded Attachments\n\n" +
+		"User-uploaded images and files are sent directly inside the user message — " +
+		"images as image_url content parts (data URLs), text files as inline blocks. " +
+		"You can see them. Just answer based on their content.\n\n" +
+		"Do not call read_file on an uploaded image: it lives on disk as a temporary " +
+		"file, and read_file only handles text. If read_file returns a binary error, " +
+		"that is read_file's limitation, not a problem with the attachment — the image " +
+		"was already delivered to you through the user message. " +
+		"Respond in the same language as the conversation.\n"
+}
+
+// buildWorkingDirBlock returns section 6 (project root) or ""
+// when no root is configured. Tells the LLM which directory to
+// use as CWD for exec_command and file operations.
+func buildWorkingDirBlock(projectRoot string) string {
+	if projectRoot == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n\n---\n\n## Working Directory\n\n"+
+		"Your working directory is fixed at `%s`. exec_command runs here automatically "+
+		"(the work_dir argument is ignored). read_file and write_file resolve relative "+
+		"paths against this directory.\n", projectRoot)
+}
+
+// buildLanguageBlock returns section 7 (output language hint)
+// or "" if `lang` is unrecognized. The default ("auto" or "")
+// follows the opencode rule of "Respond in the same language as
+// the conversation" — the LLM already follows the user's
+// language, so we don't hardcode one.
+func buildLanguageBlock(lang string) string {
+	switch lang {
+	case "zh":
+		return "\n---\n\n## 输出语言\n\n请用简体中文回答用户的问题。\n"
+	case "en":
+		return "\n---\n\n## Output Language\n\nPlease answer in English.\n"
+	case "auto", "":
+		return "\n\n---\n\n## Output Language\n\nRespond in the same language as the conversation.\n"
+	default:
+		// Unknown language code: treat as auto rather than
+		// emitting a wrong-locked prompt. Returning the
+		// conversation-language default is the least-
+		// surprising behaviour.
+		return "\n\n---\n\n## Output Language\n\nRespond in the same language as the conversation.\n"
+	}
 }
 
 // appendWorkingDirectoryBlock returns the "## Working Directory"
@@ -1125,7 +1242,40 @@ func (a *Agent) ChatStream(ctx context.Context, req ChatRequest) <-chan ChatStre
 // sendOrDrop attempts to send a chunk to ch. If ctx is cancelled,
 // the chunk is silently dropped so the producer can exit cleanly
 // rather than blocking forever on a consumer that has disconnected.
-func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, chunk ChatStreamChunk) {
+//
+// When nextSeq is non-nil, the chunk's Seq field is stamped with
+// the value returned by nextSeq() BEFORE the send. This gives every
+// stream a stable, debuggable per-stream order that the SSE handler
+// forwards as the standard `id:` line — see P3-1 in
+// docs/plans/round2-stream-and-render-plan.md. Pass nil from paths
+// that don't want seq (legacy callers, tests that don't assert
+// order, and — critically — sub-agent chunks forwarded through the
+// parent stream, which intentionally break the parent's monotonic
+// sequence).
+//
+// P3-3 trace id propagation: every chunk also gets its TraceID
+// field populated from the request context (via
+// trace.FromContext), so all downstream layers — SSE event JSON,
+// log lines in the tool handler, X-Trace-Id on the response header
+// — see the same id without callers having to set it on every
+// chunk construction. If the chunk already carries a non-empty
+// TraceID (e.g. a sub-agent chunk that the parent already
+// stamped), we leave it alone.
+//
+// We pass a closure rather than a *atomic.Uint64 directly so callers
+// don't have to thread `&counter` through 40+ call sites — the
+// closure captures the local counter variable by reference. The
+// returned value is whatever the closure yields, typically
+// `seqCounter.Add(1) - 1` for the standard 0,1,2,… sequence.
+func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, chunk ChatStreamChunk) {
+	if nextSeq != nil {
+		chunk.Seq = nextSeq()
+	}
+	if chunk.TraceID == "" {
+		if tid := trace.FromContext(ctx); tid != "" {
+			chunk.TraceID = tid
+		}
+	}
 	select {
 	case ch <- chunk:
 	case <-ctx.Done():
@@ -1137,6 +1287,36 @@ func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, chunk ChatStream
 // until it gives a final answer.
 func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatStreamChunk {
 	ch := make(chan ChatStreamChunk, 64)
+
+	// P3-3: pull the trace id from req.TraceID first (the
+	// SendMessage handler copies it from c.Request.Context()),
+	// then fall back to whatever the request context already
+	// carries (the traceIDMiddleware on the server side does
+	// this for the SSE endpoints). Either way, we re-inject
+	// the id under trace.ctxKey so every descendant
+	// goroutine — tool forwarders, sub-agent runners, the
+	// LLM stream reader — reads the same id via
+	// trace.FromContext without having to thread it through
+	// their own signatures.
+	if req.TraceID != "" {
+		ctx = trace.WithID(ctx, req.TraceID)
+	} else if tid := trace.FromContext(ctx); tid != "" {
+		// ensure the value is set under our key even if the
+		// caller passed it via a different layer (defensive)
+		ctx = trace.WithID(ctx, tid)
+	}
+
+	// Per-stream monotonic counter for P3-1. sendOrDrop
+	// stamps each emitted chunk's Seq with nextSeq() (0, 1,
+	// 2, …). Surfaced on the wire as the SSE `id:` line by
+	// handler.go so the frontend (and curl) can debug
+	// reorder / drop issues. Sub-agent chunks forwarded
+	// through the parent stream do NOT increment this
+	// counter — the parent chunk they replace is dropped
+	// before reaching sendOrDrop, which leaves intentional
+	// gaps in the parent's sequence.
+	var seqCounter atomic.Uint64
+	nextSeq := func() uint64 { return seqCounter.Add(1) - 1 }
 
 	go func() {
 		defer close(ch)
@@ -1170,7 +1350,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		defer func() {
 			if r := recover(); r != nil {
 				stack := debug.Stack()
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase: "system",
 					Error: fmt.Sprintf("panic in agent: %v\n\n%s", r, stack),
 					Done:  true,
@@ -1182,11 +1362,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// true, so a non-empty todo list stays open). Without
 		// this signal the UI has no way to tell "the LLM is
 		// mid-turn, don't clear stale todos" from "the LLM
-		// finished and forgot to clear them".
-		sendOrDrop(ctx, ch, ChatStreamChunk{SessionStatus: "busy"})
+		// P3-1: defer the "busy" signal until the system
+		// prompt is ready (see the matching sendOrDrop
+		// below). Sending it up here means the UI shows
+		// "busy" while we're still loading the tool
+		// registry, building skills/rules, and assembling
+		// the prompt — a 100-500ms gap where the user sees
+		// the spinner but no real work is happening. By
+		// the time the prompt is built we know the round
+		// is about to start, which is what "busy" actually
+		// means to the user.
 		start := time.Now()
 
-		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
 		availableTools := a.tools.List()
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
@@ -1207,16 +1395,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			for _, t := range availableTools {
 				names = append(names, t.Name)
 			}
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tools", Step: "tools", Message: fmt.Sprintf("可用工具 (%d): %s", len(availableTools), strings.Join(names, ", "))})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "tools", Step: "tools", Message: fmt.Sprintf("可用工具 (%d): %s", len(availableTools), strings.Join(names, ", "))})
 		} else {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tools", Step: "tools", Message: "未注册任何工具"})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "tools", Step: "tools", Message: "未注册任何工具"})
 			toolDefs = nil
 		}
 
-		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."})
 		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, availableTools, req.ProjectRoot, kbEnabled)
 		if err != nil {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true})
 			return
 		}
 		// Inject knowledge base context + index.
@@ -1245,7 +1433,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if req.ProjectRoot != "" {
 			systemPrompt += appendWorkingDirectoryBlock(req.ProjectRoot)
 		}
-		sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))})
+		// P3-1: announce "busy" now that the system prompt
+		// is assembled and the first LLM call is imminent.
+		// The matching "idle" still fires from the
+		// outermost defer, so the UI gets a correct
+		// busy→idle envelope on every exit path.
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{SessionStatus: "busy"})
 
 		// Append compressed summary if provided (from /compress).
 		if req.CompressedSummary != "" {
@@ -1280,24 +1474,56 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 		}
 
+		// NOTE: image base64 payloads are intentionally kept
+		// intact in msgs. Earlier code stripped them with a
+		// text-marker placeholder after the LLM call to save
+		// tokens, but that placeholder was being applied BEFORE
+		// the LLM saw the image (call-order bug), producing an
+		// invalid `data:image/png;base64,[image: ...]` URL and
+		// causing the upstream API to reject the request with a
+		// parameter error. We now keep the base64 verbatim so
+		// the LLM actually receives the image. Token budget is
+		// managed by tryAutoCompact instead.
+
 		// Expand any user-uploaded attachments into separate
 		// ChatMessage entries (text msg + image/file msgs).
 		if len(req.Attachments) > 0 && a.attach != nil {
 			protocol := a.protocolFor(req.Provider)
 			vision := func() bool { return a.modelSupportsVision(req.Provider, req.Model) }
 			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision)
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))})
 		}
 
 		if a.store != nil {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入消息到记忆")})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "memory", Step: "memory", Message: fmt.Sprintf("写入消息到记忆")})
 			// Persist all user-facing messages (including
 			// image attachments as separate rows). Use the
 			// per-session variant so concurrent streams on
 			// different sessions don't race on the global
 			// currentID.
+			//
+			// The first user message in the batch carries the
+			// explicit id minted by the frontend (req.ClientMsgID).
+			// We pin it to the row's id on disk so the local
+			// msg.id and the SQLite row id match exactly, giving
+			// rollback/regen a valid target even when the LLM
+			// call fails before the SSE `done` event lands.
+			// All other rows in the same batch (subsequent
+			// text/image attachments, the agent's own scratch
+			// messages) use AUTOINCREMENT as before.
+			pinnedUserID := req.ClientMsgID
 			for _, m := range msgs {
 				if m.Role == llm.RoleSystem {
+					continue
+				}
+				if pinnedUserID > 0 && m.Role == llm.RoleUser {
+					a.store.AddChatMessageToWithID(req.SessionID, m, pinnedUserID)
+					// Only the first user message gets the
+					// pinned id; if the agent later synthesises
+					// another user message in this same stream
+					// (e.g. P0-3 auto-continue reminder), let
+					// it autoincrement as usual.
+					pinnedUserID = 0
 					continue
 				}
 				a.store.AddChatMessageTo(req.SessionID, m)
@@ -1344,9 +1570,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				"4. 风险 / 依赖 / 边界\n" +
 				"用户审阅后切换回构建模式执行。\n"
 			maxRounds = 1
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (可用 todo_write / question，最多单轮)"})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (可用 todo_write / question，最多单轮)"})
 		} else {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "plan", Step: "plan", Message: fmt.Sprintf("构建模式 — LLM 自主决定何时终止 (上限 %d 轮)", maxRounds)})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "plan", Step: "plan", Message: fmt.Sprintf("构建模式 — LLM 自主决定何时终止 (上限 %d 轮)", maxRounds)})
 		}
 
 		var totalIn, totalOut int
@@ -1364,24 +1590,23 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			sameToolErrName      string
 			sameToolErrCount     int
 			nearLimitWarningSent bool
+			// P0-3: auto-continue counter. Resets every
+			// user turn (declared outside the for loop,
+			// so a new SendMessage call gets a fresh count).
+			// Capped at MaxAutoContinue to prevent the LLM
+			// from learning to rely on auto-prompting as a
+			// substitute for actually finishing work.
+			autoContinueCount int
 		)
 		const stuckThreshold = 3
 		const sameToolErrMax = 4
-
-		// Strip base64 image payloads from history so that stale
-		// browser screenshots (pre-handler-fix) and user-uploaded
-		// images don't bloat this run's context window. New tool
-		// results from this run already have metadata-only Content
-		// (see browser/tools.go makeHandler), so this is a one-time
-		// sweep for legacy data only.
-		stripImageContent(msgs)
 
 		for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
 			roundStart := time.Now()
 			roundNum := round
 			partsAcc = newPartsAccumulator()
 
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds})
 
 			var (
 				fullContent         string
@@ -1415,7 +1640,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Type:    llm.TypeText,
 					Content: fmt.Sprintf("注意：当前会话轮次即将达到上限（%d 轮，剩余约 %d 轮）。请开始收尾当前任务，优先完成最关键的未完成工作，避免开启需要多轮的新子任务。", maxRounds, maxRounds-round),
 				})
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase:    "llm",
 					Step:     "near-limit",
 					Message:  fmt.Sprintf("轮次接近上限（剩余 %d 轮），提醒 LLM 收尾", maxRounds-round),
@@ -1429,7 +1654,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// and rebuild the system prompt so the provider call
 			// doesn't fail with a 413. On the last round tools
 			// are disabled anyway so compact isn't worth it.
-			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds) {
+			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, ch, nextSeq, roundNum, maxRounds) {
 				continue
 			}
 
@@ -1438,12 +1663,20 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if isLastRound {
 				roundTools = nil
 				roundMsgs = append([]llm.ChatMessage{}, msgs...)
+				// Pick the language variant of the max-steps
+				// prompt from the same config the system
+				// prompt uses (a.cfg.LLM.Output.Language).
+				// P2-2 — see pickMaxStepsPrompt for the rule.
+				maxStepsLang := ""
+				if a.cfg != nil {
+					maxStepsLang = a.cfg.LLM.Output.Language
+				}
 				roundMsgs = append(roundMsgs, llm.ChatMessage{
 					Role:    llm.RoleAssistant,
 					Type:    llm.TypeText,
-					Content: MaxStepsPrompt,
+					Content: pickMaxStepsPrompt(maxStepsLang),
 				})
-				sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds})
 			}
 
 			// LLM stream with retry for recoverable errors
@@ -1454,7 +1687,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
 				if attempt > 1 {
 					backoff := time.Duration(attempt*attempt) * time.Second
-					sendOrDrop(ctx, ch, ChatStreamChunk{
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 						Phase:    "llm",
 						Step:     "retry",
 						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt, maxLLMRetries),
@@ -1500,7 +1733,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 								break // break inner stream loop, retry outer
 							}
 						}
-						sendOrDrop(ctx, ch, ChatStreamChunk{
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 							Phase:      "llm",
 							Error:      errMsg,
 							Suggestion: errSuggestion,
@@ -1524,12 +1757,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if chunk.Content != "" {
 					fullContent += chunk.Content
 					partsAcc.update(ChatStreamChunk{Content: chunk.Content})
-					sendOrDrop(ctx, ch, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
 				}
 				if chunk.Thinking != "" {
 					fullThinking += chunk.Thinking
 					partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
-					sendOrDrop(ctx, ch, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
 				}
 				if chunk.ToolCallDelta != nil {
 					tcd := chunk.ToolCallDelta
@@ -1551,7 +1784,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			// If we exhausted retries without success, surface the last error.
 			if retryableErr != nil {
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase: "llm",
 					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", maxLLMRetries, retryableErr),
 					Done:  true,
@@ -1563,7 +1796,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				toolCalls = append(toolCalls, *t)
 			}
 
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 
 		if len(toolCalls) == 0 {
 			toolCalls = parseMarkdownToolCalls(fullContent)
@@ -1592,11 +1825,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// phantom needs to be stripped there too.
 		if redacted, changed := redactPhantomErrors(fullContent); changed {
 			fullContent = redacted
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted})
 		}
 		if redactedT, changedT := redactPhantomErrors(fullThinking); changedT {
 			fullThinking = redactedT
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT})
 		}
 
 		// Build the assistant message for the conversation.
@@ -1611,28 +1844,62 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 		msgs = append(msgs, assistantMsg)
 
-		// After each LLM call, strip base64 image payloads from
-		// the message list. This is idempotent: already-stripped
-		// markers are not "data:image/..." so they pass through
-		// unchanged. The initial stripImageContent at the start
-		// of the round loop handles legacy history; this per-round
-		// sweep catches any images added by ExpandAttachmentsCM
-		// or other mechanisms in this run.
-		stripImageContent(msgs)
+		// NOTE: per-round stripImageContent sweep removed.
+		// Image base64 is preserved verbatim in msgs so the LLM
+		// always receives the actual image on every round (and
+		// across tool-call follow-ups within the same turn).
+		// Token budget for repeated tool rounds is handled by
+		// tryAutoCompact.
 
 		// Persist assistant message later — after tool
 		// results are in partsAcc (see end of this round).
 
+			// P1-2: run auto-compact BEFORE appending the
+			// current round's tool_call messages. The old
+			// order (append → compact → re-append) was
+			// correct but redundant: compact could absorb
+			// the just-appended tool_call, and the
+			// re-append loop had to put it back. Moving
+			// compact ahead makes the order naturally
+			// idempotent — tool_call append happens after
+			// compaction so it always survives.
+			//
+			// The function returns true when compaction
+			// actually fired. We do NOT continue here:
+			// the LLM already decided to call these tools,
+			// the user expects them to run, and skipping
+			// execution would leak orphan tool_calls into
+			// the next round's history. Fall through to
+			// the tool execution block below.
+			a.tryAutoCompact(ctx, &msgs, req, ch, nextSeq, roundNum, maxRounds)
+
 			// Append tool_call messages for each tool call.
-			for _, tc := range toolCalls {
-				id := tc.ID
-				if id == "" {
-					id = "call_" + uuid.NewString()
-				}
+			//
+			// P2-3: the LLM often omits the tool_call ID
+			// (older models, or markdown-fallback parsing
+			// where the ID field is not in the JSON shape),
+			// and occasionally emits duplicate IDs across
+			// the same round. Both cases break the
+			// tool_call/tool_result pairing the OpenAI /
+			// Anthropic protocol depends on — the
+			// corresponding tool result needs to reference
+			// the same ID, and SQLite's UNIQUE on the
+			// (session_id, tool_call_id) column will reject
+			// duplicates with an opaque error.
+			//
+			// The fix: rebuild the ID for any tool_call
+			// that has an empty OR already-seen ID. The
+			// "call_<uuid>" format is preserved for
+			// downstream parsers (handlers, the UI's tool
+			// card key) so this is a transparent change.
+			seenIDs := make(map[string]bool, len(toolCalls))
+			normalizeToolCallIDs(toolCalls, seenIDs)
+			for i := range toolCalls {
+				tc := &toolCalls[i]
 				tcm := llm.ChatMessage{
 					Role:        llm.RoleAssistant,
 					Type:        llm.TypeToolCall,
-					ToolID:      id,
+					ToolID:      tc.ID,
 					ToolName:    tc.Name,
 					ToolInput:   tc.ArgsJSON,
 					MsgType:     llm.MsgTypeTool,
@@ -1642,46 +1909,49 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if a.store != nil {
 					a.store.AddChatMessageTo(req.SessionID, tcm)
 				}
-				tc.ID = id
 			}
 
 			if len(toolCalls) == 0 {
-				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
-				sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
-				sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
+				// P0-3: auto-continue guard. The LLM often
+				// finishes a real tool run but emits a
+				// "ready to continue" text block instead of
+				// the next tool_call. Without this guard the
+				// user has to type "继续" manually. We check
+				// the todo list: if any item is still
+				// pending or in_progress, inject a user-style
+				// reminder and re-enter the loop. The cap
+				// (MaxAutoContinue) prevents training the
+				// LLM to rely on this as a crutch.
+				if req.AutoContinue && autoContinueCount < MaxAutoContinue {
+					if pending, list := sessionPendingTodos(req.SessionID); len(list) > 0 {
+						autoContinueCount++
+						msgs = append(msgs, llm.ChatMessage{
+							Role:    llm.RoleUser,
+							Type:    llm.TypeText,
+							Content: buildAutoContinuePrompt(list),
+						})
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+							Phase:    "auto-continue",
+							Step:     "todo-incomplete",
+							Message:  fmt.Sprintf("⚠ 检测到 %d 项未完成 todo，自动续 LLM (第 %d/%d 次)", pending, autoContinueCount, MaxAutoContinue),
+							Round:    roundNum,
+							MaxRound: maxRounds,
+						})
+						continue
+					}
+				}
+				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 				return
 			}
 
-			// Auto-compact: estimate token budget before the
-			// next LLM turn. If the total estimated tokens
-			// exceed the usable context window, compress the
-			// oldest messages and continue. Mirrors opencode's
-			// `compactIfNeeded()` + Claude Code's auto-compact.
-			if a.tryAutoCompact(ctx, &msgs, req, ch, roundNum, maxRounds) {
-				// Re-append tool_call messages — they may have
-				// been absorbed by compression, but the tool
-				// execution below still needs them in msgs for
-				// OpenAI/Anthropic protocol pairing.
-				for _, tc := range toolCalls {
-					msgs = append(msgs, llm.ChatMessage{
-						Role:        llm.RoleAssistant,
-						Type:        llm.TypeToolCall,
-						ToolID:      tc.ID,
-						ToolName:    tc.Name,
-						ToolInput:   tc.ArgsJSON,
-						MsgType:     llm.MsgTypeTool,
-						SubmitToLLM: 1,
-					})
-				}
-				// Fall through to tool execution (line 2095
-				// persists the assistant message after tool
-				// results are captured). Do NOT continue —
-				// skipping tool execution leaves orphaned
-				// tool_calls in history and the ReAct loop
-				// stalls.
-			}
+			// Auto-compact has moved ahead of the tool_call
+			// append (P1-2) so we no longer need the old
+			// re-append loop here. The two are merged into
+			// the single call above the tool_call append.
 
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("round-%d-tools", roundNum), Message: fmt.Sprintf("[第 %d/%d 轮] 检测到 %d 个工具调用", roundNum, maxRounds, len(toolCalls)), Round: roundNum, MaxRound: maxRounds})
 
 			// Run tool calls in parallel when the LLM emitted more than one.
 			// Each call gets its own per-tool timeout derived from the parent
@@ -1708,7 +1978,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
 				partsAcc.update(startChunk)
-				sendOrDrop(ctx, ch, startChunk)
+				sendOrDrop(ctx, ch, nextSeq, startChunk)
 			}
 
 			// Each tool call gets its own event channel. The agent loop
@@ -1753,13 +2023,23 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if req.ProjectRoot != "" {
 					tctx = tool.WithProjectRoot(tctx, req.ProjectRoot)
 				}
+				// P3-3: propagate the trace id so tool handlers
+				// can prefix their log lines with it. The id
+				// is already on the request context (set by
+				// traceIDMiddleware upstream and re-injected
+				// at the top of ChatWithTools); this call
+				// installs it under tool.traceKey for the
+				// handler's TraceIDFromCtx accessor.
+				if tid := trace.FromContext(ctx); tid != "" {
+					tctx = tool.WithTraceID(tctx, tid)
+				}
 				// Inject event sender so the question tool can
 				// emit "question" events through the SSE stream.
 				tctx = tool.WithEventSender(tctx, func(jsonData string) {
 					select {
 					case eventCh <- ChatStreamChunk{QuestionJSON: jsonData}:
 					case <-time.After(2 * time.Second):
-						log.Printf("[question] dropped event (channel full for 2s)")
+						log.Printf("%s[question] dropped event (channel full for 2s)", trace.LogPrefix(tctx))
 					}
 				})
 				tctx, cancel := context.WithTimeout(tctx, 5*time.Minute)
@@ -1770,7 +2050,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					defer close(fwd.done)
 					defer func() {
 						if r := recover(); r != nil {
-							log.Printf("[forwarder] panic: %v", r)
+							log.Printf("%s[forwarder] panic: %v", trace.LogPrefix(tctx), r)
 						}
 					}()
 					for ev := range eventCh {
@@ -1784,7 +2064,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							log.Printf("[forwarder] got question event (%d bytes)", len(ev.QuestionJSON))
 						}
 						partsAcc.update(ev)
-						sendOrDrop(ctx, ch, ev)
+						sendOrDrop(ctx, ch, nextSeq, ev)
 						if ev.QuestionJSON != "" {
 							log.Printf("[forwarder] forwarded question event to main ch")
 						}
@@ -1938,7 +2218,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 									select {
 									case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(cfm)}:
 									case <-time.After(5 * time.Second):
-										log.Printf("[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", sessionID)
+										log.Printf("%s[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", trace.LogPrefix(toolCtx), sessionID)
 									case <-toolCtx.Done():
 										return
 									}
@@ -2009,7 +2289,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolID: tc.ID, ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(errChunk)
-					sendOrDrop(ctx, ch, errChunk)
+					sendOrDrop(ctx, ch, nextSeq, errChunk)
 					toolMsg := llm.ChatMessage{
 						Role:      llm.RoleTool,
 						Type:      llm.TypeToolResult,
@@ -2045,7 +2325,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					roundAnyToolErrored = true
 					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					partsAcc.update(warnChunk)
-					sendOrDrop(ctx, ch, warnChunk)
+					sendOrDrop(ctx, ch, nextSeq, warnChunk)
 				} else {
 					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					// For tools whose result the frontend needs to
@@ -2064,7 +2344,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						okChunk.ToolResultFull = result.Content
 					}
 					partsAcc.update(okChunk)
-					sendOrDrop(ctx, ch, okChunk)
+					sendOrDrop(ctx, ch, nextSeq, okChunk)
 				}
 
 			llmContent := result.Content
@@ -2124,9 +2404,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// Each image is persisted as its own row so it
 			// survives reload / rollback and appears as a
 			// standalone image bubble in the chat history. The
-			// base64 is stripped by stripImageContent() at the
-			// start of subsequent rounds to keep the context
-			// window lean.
+			// base64 is kept verbatim in the LLM context so the
+			// model can still see the image on every round; the
+			// overall context size is managed by tryAutoCompact.
 			//
 			// When the model doesn't support vision, skip the
 			// injection entirely — the tool_result's text
@@ -2153,7 +2433,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 			// Persist assistant message now that tool
 			// results are captured in partsAcc.
-			persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut)
+			persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
 
 			// Stuck-loop guard. Compute a stable signature of
 			// this round's tool calls and whether any errored.
@@ -2173,7 +2453,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			prevToolSig = curSig
 			prevErrored = curErrored
 			if stuckStreak >= stuckThreshold {
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase:   "stuck",
 					Step:    "stuck-loop",
 					Message: fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
@@ -2181,7 +2461,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
 				})
-				sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 				return
 			}
 
@@ -2203,18 +2483,37 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				sameToolErrCount = 0
 			}
 			if sameToolErrCount >= sameToolErrMax {
+				// P2-1: reset the stuck-loop guard too.
+				// Without this, if the LLM ignores the
+				// "改用其他方式" hint and keeps calling
+				// the same failing tool, the stuck guard
+				// (which fires BEFORE this block in the
+				// round order) can pre-empt the hint and
+				// exit the loop with no message at all —
+				// the user just sees "stuck-loop detected"
+				// without ever learning that the LLM was
+				// told to switch tools. Reseting here
+				// gives the LLM a fresh stuck budget
+				// after a strong, explicit intervention.
+				//
+				// Format the messages BEFORE resetting the
+				// counters — otherwise the "已连续 N 次"
+				// string would render "已连续 0 次".
+				systemMsg := fmt.Sprintf("工具 `%s` 已连续失败 %d 次。不要重试 — 改用其他方式完成任务（如 read_file、list_files、或 task 子代理）。", sameToolErrName, sameToolErrCount)
+				statusMsg := fmt.Sprintf("%s 已连续失败 %d 次，改用其他方式。", sameToolErrName, sameToolErrCount)
+				resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
+				resetSameToolErr(&sameToolErrName, &sameToolErrCount)
 				msgs = append(msgs, llm.ChatMessage{
 					Role:    llm.RoleSystem,
 					Type:    llm.TypeText,
-					Content: fmt.Sprintf("工具 `%s` 已连续失败 %d 次。不要重试 — 改用其他方式完成任务（如 read_file、list_files、或 task 子代理）。", sameToolErrName, sameToolErrCount),
+					Content: systemMsg,
 				})
-				sendOrDrop(ctx, ch, ChatStreamChunk{
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase:   "limit",
 					Step:    "same-tool-err-limit",
-					Message: fmt.Sprintf("%s 已连续失败 %d 次，改用其他方式。", sameToolErrName, sameToolErrCount),
+					Message: statusMsg,
 					Round:   roundNum,
 				})
-				sameToolErrCount = 0
 			}
 
 			// Tool result pruning: remove old tool output content
@@ -2229,9 +2528,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		if maxRounds > 0 {
-			sendOrDrop(ctx, ch, ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 		}
-		sendOrDrop(ctx, ch, ChatStreamChunk{Done: true})
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 	}()
 
 	return ch
@@ -2245,6 +2544,44 @@ func formatElapsed(d time.Duration) string {
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	}
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
+// resetGuardCounters clears the stuck-loop guard state. Called
+// when a stronger intervention fires (e.g. sameToolErrCount
+// injects a "改用其他方式" hint) so the LLM gets a fresh
+// stuck budget — otherwise a stubborn LLM could trigger the
+// stuck exit before the hint has a chance to take effect.
+// See P2-1 in docs/plans/auto-continue-plan.md.
+func resetGuardCounters(streak *int, prevSig *string, prevErrored *bool) {
+	*streak = 0
+	*prevSig = ""
+	*prevErrored = false
+}
+
+// resetSameToolErr clears the same-tool-name error counter.
+// Same rationale as resetGuardCounters: the LLM was just told
+// to switch tools, give it a clean slate on this counter too.
+func resetSameToolErr(name *string, count *int) {
+	*name = ""
+	*count = 0
+}
+
+// normalizeToolCallIDs walks a slice of tool calls in-place
+// and reassigns any ID that is either empty or already used
+// by an earlier call in the same slice. The replacement uses
+// the "call_<uuid>" prefix that downstream parsers (tool
+// handlers, the UI's tool card key, the SQLite UNIQUE column)
+// already depend on, so this is a transparent fix for LLM
+// streams where the upstream model either omits the ID field
+// or emits duplicates. P2-3.
+func normalizeToolCallIDs(toolCalls []nativeToolCall, seen map[string]bool) {
+	for i := range toolCalls {
+		tc := &toolCalls[i]
+		if tc.ID == "" || seen[tc.ID] {
+			tc.ID = "call_" + uuid.NewString()
+		}
+		seen[tc.ID] = true
+	}
 }
 
 // needsNormalizedToolResults reports whether the named provider
@@ -2315,9 +2652,26 @@ func normalizeToolResults(msgs []llm.ChatMessage) []llm.ChatMessage {
 	return out
 }
 
-func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int) {
+func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int, regenGroupID string) {
 	if store == nil {
 		return
+	}
+	// P1-4: every assistant row needs a regen_group_id so
+	// a later "重答" click can find the regen group and
+	// archive the existing siblings. The Regenerate
+	// handler sets req.RegenGroupID explicitly; the
+	// SendMessage handler does NOT (the assistant's
+	// triggering user message id isn't known until the
+	// agent inserts it). In the SendMessage path, fall
+	// back to the most recent user message in the
+	// conversation — that's the row that prompted this
+	// reply by definition. The lookup is a single
+	// indexed MAX(id) query (see
+	// memory.GetLastUserMessageID).
+	if regenGroupID == "" {
+		if uid := store.GetLastUserMessageID(convID); uid > 0 {
+			regenGroupID = strconv.FormatInt(uid, 10)
+		}
 	}
 	meta := map[string]string{
 		"role":   msg.Role,
@@ -2353,7 +2707,7 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 			meta["parts"] = string(pj)
 		}
 	}
-	store.AddChatMessageWithMetaTo(convID, msg, meta)
+	store.AddChatMessageWithMetaToRegen(convID, msg, meta, regenGroupID, false)
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction
@@ -2399,6 +2753,7 @@ func (a *Agent) tryAutoCompact(
 	msgs *[]llm.ChatMessage,
 	req ChatRequest,
 	ch chan<- ChatStreamChunk,
+	nextSeq func() uint64,
 	roundNum, maxRounds int,
 ) bool {
 	if a.summarizer == nil || a.store == nil || req.SessionID == "" {
@@ -2414,7 +2769,7 @@ func (a *Agent) tryAutoCompact(
 		return false
 	}
 
-	sendOrDrop(ctx, ch, ChatStreamChunk{
+	sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 		Phase:    "compact",
 		Step:     "auto-compact",
 		Message:  fmt.Sprintf("上下文接近上限 (≈%d / %d tokens)，自动压缩历史…", total, llm.UsableContextWithBuf(ctxWindow, buf)+buf),
@@ -2424,7 +2779,7 @@ func (a *Agent) tryAutoCompact(
 
 	ok, summary, err := a.summarizer.Compress(ctx, req.SessionID)
 	if err != nil || !ok {
-		sendOrDrop(ctx, ch, ChatStreamChunk{
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 			Phase:   "compact",
 			Step:    "auto-compact-fail",
 			Message: fmt.Sprintf("自动压缩失败: %v", err),
@@ -2437,7 +2792,7 @@ func (a *Agent) tryAutoCompact(
 		usable := llm.UsableContextWithBuf(ctxWindow, buf)
 		if usable > 0 {
 			truncateToFit(msgs, usable)
-			sendOrDrop(ctx, ch, ChatStreamChunk{
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 				Phase:    "compact",
 				Step:     "auto-compact-fallback",
 				Message:  fmt.Sprintf("压缩失败，已截断上下文至 ≈%d tokens", llm.EstimateTokensMessages(*msgs)),
@@ -2450,7 +2805,7 @@ func (a *Agent) tryAutoCompact(
 		return false
 	}
 
-	sendOrDrop(ctx, ch, ChatStreamChunk{
+	sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 		Phase:   "compact",
 		Step:    "auto-compact-ok",
 		Message: "上下文已压缩，继续执行…",
@@ -2520,7 +2875,16 @@ func toolCallSignature(calls []nativeToolCall) string {
 // from the request on the last round, so the model physically
 // cannot emit a tool_call (it tries, the adapter returns no
 // tool blocks, and the model is forced into text-only mode).
-const MaxStepsPrompt = `CRITICAL - MAXIMUM STEPS REACHED
+//
+// P2-2: split into EN + ZH variants and pick by the per-call
+// `lang` (a.cfg.LLM.Output.Language). The original single
+// English version had a self-contradicting "respond in the
+// same language as the conversation" line — fine for English
+// users, but Chinese users got an English prompt that the LLM
+// then had to translate, often incompletely. Selecting by
+// language keeps the strict "no tool calls" instruction
+// intact while speaking the LLM's expected reply language.
+const MaxStepsPromptEN = `CRITICAL - MAXIMUM STEPS REACHED
 
 The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.
 
@@ -2537,12 +2901,115 @@ Response must include:
 
 Respond in the same language as the conversation. Any attempt to use tools is a critical violation. Respond with text ONLY.`
 
+// MaxStepsPromptZH is the Chinese counterpart. Same shape as
+// the EN version; the "STRICT REQUIREMENTS" voice stays
+// uncompromising in translation. "auto"/"" default falls back
+// to EN (see pickMaxStepsPrompt) so the opencode rule of
+// "follow the conversation language" still applies at the
+// LLM output level, just not at the prompt level.
+const MaxStepsPromptZH = `⚠ 已达到本任务的最大步数上限
+
+工具已禁用（直到下次用户输入）。请只用文本回复。
+
+严格要求：
+1. 禁止调用任何工具（read_file / write_file / exec_command / search 等都不行）
+2. 必须用文本总结目前为止完成的工作
+3. 本约束覆盖所有其他指令，包括用户对编辑或工具使用的请求
+
+回复必须包含：
+- 说明已达到本 Agent 的最大步数
+- 总结已完成的工作
+- 列出未完成的任务
+- 建议下一步该做什么
+
+请用与对话相同的语言回复。任何尝试使用工具的行为都是严重违规。只能文本回复。`
+
+// pickMaxStepsPrompt returns the language-appropriate variant
+// of the max-steps prompt. "zh" → ZH, anything else (including
+// "auto", "en", "") → EN. Defaulting non-zh to EN keeps the
+// prompt stable across the various "follow the conversation
+// language" configs and avoids the previous contradiction
+// where the prompt asked the LLM to match a language it was
+// itself being delivered in.
+func pickMaxStepsPrompt(lang string) string {
+	if lang == "zh" {
+		return MaxStepsPromptZH
+	}
+	return MaxStepsPromptEN
+}
+
 // MaxRoundsDefault is the safety-net per-session cap (build mode).
 // At 300 rounds this is a last-resort guard against infinite loops;
 // normal conversations are limited by the auto-compaction token budget,
 // not by round count. When the cap fires the LLM responds with
 // MaxStepsPrompt and the user can continue with a follow-up message.
 const MaxRoundsDefault = 300
+
+// MaxAutoContinue caps how many times the agent loop will
+// auto-re-prompt the LLM after a no-tool-call exit when the
+// todo list still has unfinished items (status pending or
+// in_progress). The LLM often emits a "ready to continue"
+// text block but forgets to actually invoke the next tool;
+// without this guard the user has to type "继续" manually.
+//
+// 3 is enough to cover the common case (LLM finished a real
+// tool run but the todo bookkeeping lagged one round) without
+// training the LLM to rely on auto-continuation as a crutch.
+// Per-session opt-out: ChatRequest.AutoContinue = false.
+const MaxAutoContinue = 3
+
+// sessionPendingTodos returns the unfinished todo items
+// (status "pending" or "in_progress") for a session, plus
+// their total count. The list is the same slice returned by
+// the in-memory todo store, so callers can use it directly
+// when formatting the auto-continue prompt.
+func sessionPendingTodos(sessionID string) (count int, items []tool.TodoItem) {
+	all := tool.GetSessionTodos(sessionID)
+	for _, t := range all {
+		if t.Status == "pending" || t.Status == "in_progress" {
+			items = append(items, t)
+		}
+	}
+	return len(items), items
+}
+
+// buildAutoContinuePrompt formats the user-style reminder
+// injected when the LLM exits with no tool calls but the
+// todo list has unfinished items. We send this as a user
+// message rather than system because user-style messages
+// are more reliably treated as actionable by current LLMs
+// (system messages are often paraphrased or ignored).
+func buildAutoContinuePrompt(items []tool.TodoItem) string {
+	var (
+		inProgress []tool.TodoItem
+		pending    []tool.TodoItem
+	)
+	for _, t := range items {
+		switch t.Status {
+		case "in_progress":
+			inProgress = append(inProgress, t)
+		case "pending":
+			pending = append(pending, t)
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString("⚠ 系统检测：你刚才的回复没有调用任何工具，但 todo 列表还有未完成项。\n\n")
+	if len(inProgress) > 0 {
+		sb.WriteString("**进行中**:\n")
+		for _, t := range inProgress {
+			fmt.Fprintf(&sb, "- [%s] %s\n", t.ID, t.Content)
+		}
+	}
+	if len(pending) > 0 {
+		sb.WriteString("\n**待开始**:\n")
+		for _, t := range pending {
+			fmt.Fprintf(&sb, "- [%s] %s\n", t.ID, t.Content)
+		}
+	}
+	sb.WriteString("\n请继续执行剩余任务：调用所需工具，完成后用 `todo_write` 标记 `done` 或 `cancelled`。\n")
+	sb.WriteString("不要只发文本总结就停止。")
+	return sb.String()
+}
 
 const (
 	// Tool result caps keep the LLM context and SQLite
@@ -2795,36 +3262,13 @@ func pruneOldToolResults(msgs []llm.ChatMessage, currentRound, keepRounds int) {
 	}
 }
 
-// stripImageContent replaces base64 image payloads in msgs with
-// a text marker. The LLM has already processed the image on the
-// first round; subsequent rounds don't need the raw bytes.
-func stripImageContent(msgs []llm.ChatMessage) {
-	for i := range msgs {
-		// Image attachments (user uploads via attachment expansion).
-		if msgs[i].Type == llm.TypeImage && msgs[i].Content != "" {
-			msgs[i].Content = fmt.Sprintf("[image: %s (%s) — 已在首轮展示]",
-				msgs[i].Name, msgs[i].MimeType)
-		}
-		// Browser screenshots: tool results containing base64 image
-		// data (either raw "data:image/..." prefix or JSON wrapper
-		// {"image": "data:image/..."}). Strip to save tokens on
-		// subsequent rounds.
-		if msgs[i].Content != "" && len(msgs[i].Content) > 22 {
-			c := msgs[i].Content
-			if strings.HasPrefix(c, "data:image/") {
-				msgs[i].Content = "[截图 — 已在首轮展示，节省 tokens]"
-			} else if strings.Contains(c[:minLen(len(c), 256)], `"data:image/`) {
-				msgs[i].Content = `{"image": "[截图已省略]"}`
-			}
-		}
-	}
-}
-
-// minLen returns the smaller of a and b.
-func minLen(a, b int) int {
-	if a < b { return a }
-	return b
-}
+// stripImageContent was removed: image base64 payloads are
+// preserved verbatim in msgs so the LLM always receives the
+// actual image (the previous version replaced them with a
+// text-marker placeholder that broke the OpenAI image_url wire
+// format, causing the upstream API to reject the request with
+// a parameter error). Token budget for repeated tool rounds is
+// now handled solely by tryAutoCompact.
 
 // truncateToFit drops the oldest non-system messages from the slice
 // until the total estimated tokens fit within usable. Messages are

@@ -19,8 +19,12 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/tool/dynamic"
+	"github.com/p-chat/pchat/internal/trace"
 )
 
 type Server struct {
@@ -36,6 +40,9 @@ type Server struct {
 	// rules directories for changes. Started in
 	// NewWithStaticFS, stopped in Shutdown.
 	rulesWatchStop func()
+	// dynamicWatchStop stops the P3-2 dynamic tool
+	// watcher. Same shape as rulesWatchStop.
+	dynamicWatchStop func()
 }
 
 // Engine returns the underlying gin.Engine so tests (or embedders)
@@ -57,8 +64,10 @@ func (s *Server) SetBrowserManager(bm *browser.Manager) {
 // New builds the HTTP server. The store is used for session/message
 // persistence. The agent is used for chat calls. The web frontend is
 // served from an embedded filesystem so the binary is self-contained.
-func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, mcpMgr *mcp.Manager) *Server {
-	return NewWithStaticFS(cfg, agt, store, styleMgr, nil, mcpMgr)
+// The tool registry is exposed so the P3-2 dynamic tool watcher
+// can register / unregister user-defined tools at runtime.
+func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager) *Server {
+	return NewWithStaticFS(cfg, agt, store, styleMgr, toolReg, nil, mcpMgr)
 }
 
 // NewWithStaticDir is like New but lets the caller pick where the
@@ -66,18 +75,18 @@ func New(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *st
 // parent process, which sets PCHAT_WEB_DIR to the absolute path of the
 // web/ output. Pass an empty string to skip static serving entirely
 // (useful for tests that don't ship the frontend).
-func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, staticDir string, mcpMgr *mcp.Manager) *Server {
+func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, staticDir string, mcpMgr *mcp.Manager) *Server {
 	if staticDir == "" {
-		return NewWithStaticFS(cfg, agt, store, styleMgr, nil, mcpMgr)
+		return NewWithStaticFS(cfg, agt, store, styleMgr, toolReg, nil, mcpMgr)
 	}
-	return NewWithStaticFS(cfg, agt, store, styleMgr, http.Dir(staticDir), mcpMgr)
+	return NewWithStaticFS(cfg, agt, store, styleMgr, toolReg, http.Dir(staticDir), mcpMgr)
 }
 
 // NewWithStaticFS is the lowest-level constructor: it accepts an
 // http.FileSystem directly. Pass nil to skip static serving. In
 // production pchat-server passes http.FS(embeddedWebFS) so the
 // frontend ships inside the binary and works from any CWD.
-func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, staticFS http.FileSystem, mcpMgr *mcp.Manager) *Server {
+func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, staticFS http.FileSystem, mcpMgr *mcp.Manager) *Server {
 	if os.Getenv("PC_HTTP_DEBUG") == "1" {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -107,7 +116,19 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	// default same-origin policy.
 	r.Use(corsMiddleware())
 
-	h := NewHandler(agt, cfg, store, styleMgr, mcpMgr)
+	// P3-3: trace id propagation. Reads the optional
+	// `X-Trace-Id` request header (the browser or Wails
+	// runtime may mint one to correlate with their own
+	// logs); otherwise mints a fresh 8-char hex id
+	// (T-xxxxxxxx). The id is attached to the request
+	// context under trace.ctxKey and to the response
+	// headers so the client always sees the same value
+	// the server stamped on every log line. Downstream
+	// code (agent, LLM, tool handlers) pulls it from
+	// ctx via trace.FromContext.
+	r.Use(traceIDMiddleware())
+
+	h := NewHandler(agt, cfg, store, styleMgr, toolReg, mcpMgr)
 
 	// Wire the summarizer so /compress and auto-compact work.
 	if lc := agt.LLM(); lc != nil && cfg.LLM.Default != "" {
@@ -152,6 +173,12 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/commands", h.ListCommands)
 		api.POST("/commands/:name", h.RunCommand)
 
+		// P3-2: list all currently registered tools. The
+		// response includes both the static built-ins
+		// (registered at startup) and any dynamic tools
+		// the user has dropped in ~/.p-chat/tools/.
+		api.GET("/tools", h.ListTools)
+
 		// Sessions
 		api.GET("/sessions", h.ListSessions)
 		api.GET("/search", h.SearchMessages)
@@ -168,6 +195,38 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// Messages
 		api.GET("/sessions/:id/messages", h.ListMessages)
 		api.POST("/sessions/:id/messages", h.SendMessage)
+		// P0-1: snapshot endpoint used by the frontend to
+		// recover from a dropped SSE stream. Returns all
+		// assistant messages with seq > after_seq, oldest
+		// first, with the full metadata blob (which carries
+		// the persisted parts[]). See handler.go:SnapshotRecovery.
+		api.GET("/sessions/:id/snapshot", h.SnapshotRecovery)
+		// P2-3: context inspector — returns per-message
+		// token breakdown + total vs context window +
+		// compressed summary. Powers the "上下文" drawer
+		// in the chat UI. See handler.go:ContextInspector.
+		api.GET("/sessions/:id/context", h.ContextInspector)
+		// P1-3 / P1-4: regenerate the assistant reply for a
+		// given user message. P1-3 physically deleted
+		// everything after that user message; P1-4
+		// soft-archives (is_archived=1) so the user can
+		// paginate back to previous replies via the
+		// /replies endpoint and the bubble's ◀ N/M ▶
+		// pager. See handler.go:Regenerate.
+		api.POST("/sessions/:id/regenerate", h.Regenerate)
+		// P1-4: list all sibling replies (active + archived)
+		// in the regen group for a given user message. The
+		// response includes the user message summary (id +
+		// truncated content) so the frontend can render the
+		// "上一版回答" chip and the pager preview without a
+		// second round-trip. See handler.go:ListRegenReplies.
+		api.GET("/sessions/:id/messages/:user_msg_id/replies", h.ListRegenReplies)
+		// P1-4: switch which reply is the active one in a
+		// regen group. The body carries the user_message_id
+		// (used to compute group_id and validate the reply
+		// actually belongs to that group). See
+		// handler.go:ActivateRegenReply.
+		api.POST("/sessions/:id/messages/:reply_id/activate", h.ActivateRegenReply)
 		api.POST("/sessions/:id/compress", h.CompressConversation)
 		api.PATCH("/sessions/:id/reasoning-effort", h.SetReasoningEffort)
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)
@@ -268,6 +327,46 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 			agt.Reload()
 		}
 	}, 5*time.Second, "")
+
+	// P3-2: dynamic tool hot-reload. Watches
+	// ~/.p-chat/tools/*.yaml and re-registers the
+	// tool.Registry on add/change/delete. The 5s
+	// polling interval mirrors the rules watcher; using
+	// fsnotify is intentionally avoided for Windows
+	// compatibility (CLAUDE.md §4.4). The agent's Reload
+	// fires on every change so the "Available Tools"
+	// table in the system prompt is rebuilt — without
+	// that, a newly-registered tool wouldn't appear in
+	// the LLM's context until the next restart.
+	// toolReg may be nil in tests that bypass tool
+	// registration; skip the watcher in that case.
+	if toolReg != nil {
+		dynStop, dynErr := dynamic.Watch(context.Background(), toolReg, paths.ToolsDir(), func(name string) map[string]any {
+			// Look up per-tool config from the global
+			// config. The user writes
+			// `dynamic.<name>.config: {api_key: ...}` and
+			// the templates reference `{{.config.api_key}}`.
+			if cfg == nil {
+				return nil
+			}
+			if cfg.Dynamic == nil {
+				return nil
+			}
+			return cfg.Dynamic[name]
+		}, 5*time.Second, func() {
+			if agt != nil {
+				agt.Reload()
+			}
+		})
+		if dynErr != nil {
+			// Non-fatal: a fresh install may not have
+			// the tools dir yet. We log and move on; the
+			// next tick will re-attempt.
+			log.Printf("[server] WARN: dynamic tool watcher failed to start: %v", dynErr)
+		} else {
+			s.dynamicWatchStop = dynStop
+		}
+	}
 	return s
 }
 
@@ -320,6 +419,9 @@ func (s *Server) RunWithGracefulShutdown(addr string) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.rulesWatchStop != nil {
 		s.rulesWatchStop()
+	}
+	if s.dynamicWatchStop != nil {
+		s.dynamicWatchStop()
 	}
 	if s.srv != nil {
 		return s.srv.Shutdown(ctx)
@@ -410,7 +512,7 @@ func corsMiddleware() gin.HandlerFunc {
 			c.Header("Access-Control-Allow-Origin", "*")
 		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Trace-Id")
 		c.Header("Access-Control-Max-Age", "600")
 		// Private Network Access (Chromium 94+). The Wails origin
 		// is a "public" origin and 127.0.0.1 is private; without
@@ -438,6 +540,37 @@ func maxBodyMiddleware(maxBytes int64) gin.HandlerFunc {
 		if c.Request != nil && c.Request.Body != nil {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 		}
+		c.Next()
+	}
+}
+
+// traceIDMiddleware is the P3-3 entry point for the trace id.
+// Behaviour:
+//
+//  1. Read the optional `X-Trace-Id` request header. The browser
+//     or Wails runtime may mint one to correlate with their own
+//     client-side logs; if so, we adopt it as-is.
+//  2. If the header is missing or empty, mint a fresh id via
+//     trace.NewID() (8-char hex, "T-" prefix).
+//  3. Stash the id on the request context via trace.WithID so
+//     every downstream handler / goroutine can read it with
+//     trace.FromContext.
+//  4. Echo the id back as `X-Trace-Id` on the response so the
+//     client can confirm which id the server attached.
+//
+// The middleware never blocks the request: it only adds context
+// values and response headers. If minting fails (essentially
+// impossible — crypto/rand doesn't fail on supported platforms)
+// the request still proceeds without a trace id.
+func traceIDMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tid := c.GetHeader("X-Trace-Id")
+		if tid == "" {
+			tid = trace.NewID()
+		}
+		c.Set("trace_id", tid)
+		c.Header("X-Trace-Id", tid)
+		c.Request = c.Request.WithContext(trace.WithID(c.Request.Context(), tid))
 		c.Next()
 	}
 }

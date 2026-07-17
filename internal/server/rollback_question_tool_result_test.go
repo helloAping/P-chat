@@ -82,7 +82,7 @@ func TestRollbackMessages_QuestionToolResultIsFiltered(t *testing.T) {
 	}
 
 	// Rollback captures all 4 rows.
-	_, _, _, rowIDs, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
+	_, _, _, rowIDs, _, _, _ := store.GetChatMessagesWithMetaPage(store.CurrentConversationID(), 0, 0)
 	if len(rowIDs) < 4 {
 		t.Fatalf("setup: want 4 rows, got %d", len(rowIDs))
 	}

@@ -567,3 +567,337 @@ Assistant 消息用 `parts[]` 数组替代纯文本 content：
 - **SSE flush**：`X-Accel-Buffering: no` + `c.Writer.Flush()`
 - **Blinking caret placeholder**：流式开始时渲染前显示闪烁光标，替代 LoadingDots
 - **供应商多模型**：per-provider `models` 列表，`capabilities` 标记(thinking_effort/supports_vision)
+
+---
+
+### v1.0.6 — 对话连续性 + 工具调用加固
+
+#### 用户可见
+
+- **P0-3 auto-continue（任务连续性守卫）**：todo 列表还有未完成项时，LLM 自然结束不再立即退出，而是自动注入 user 风格"未完成"提示并续接，最多 3 次。新增 CLI 命令 `/auto-continue on|off`（别名 `/ac`），per-session 持久化。详见 [`docs/auto-continue.md`](docs/auto-continue.md) 和 [实现计划](docs/plans/auto-continue-plan.md)。
+- 状态栏自动续行用 `--accent` 颜色 + 加粗显示（`.status-line-auto-continue` class），跟普通 phase 事件区分开。
+- Web/桌面端可通过 `PATCH /api/v1/sessions/:id` 切换 `auto_continue` 字段（默认 true）。
+
+#### Bug 修复
+
+- **Anthropic SSE parser 双重派发**：原版每行 SSE 数据被处理两次（event 之前 + 之后各一次），导致 content/thinking delta 翻倍。改用单 dispatch 路径（`internal/llm/anthropic_adapter.go` `ParseStream`），`anthropic_stream_test.go` 中 4 个之前挂的 case（LongDataLine / MultiEvent / CRLFTransport / MissingMessageStop）全部转绿。
+- **HTTP 模式沙箱控制静默 no-op**：`httpContext.SetSandbox` 和 `BypassSandboxOnce` 之前是 silent no-op（CLI 调 `/unsafe on` 走 HTTP 没任何反馈）。改为"响亮的 no-op"——发 `color.Yellow` 警告 + 解释。`RebuildSandbox` 仍返回 `*ErrUnsupported` 让调用方走 `isUnsupported()` 分支。`TestHTTPContext_SandboxNoOp` 锁住行为。
+
+#### 重构与清理
+
+- **拆 `buildStaticSystemPrompt` (298 行)**：分成 9 个 helper（`buildStyleBlock` + `buildToolHintBlock` + 5 sub-helper + `buildWorkingDirBlock` + `buildLanguageBlock`）。orchestrator 从 298 行降到 61 行。byte-identical 输出，所有现有 `TestBuildStaticSystemPrompt_*` 测试通过。
+- **`interface{}` → `any` 清理**：12 个文件 25 处（`internal/{browser,llm,mcp,recall,knowledge,httpcli,server}`），对齐项目 CLAUDE.md 规则。机械替换，`grep -rn "interface{}" internal/` → 0 命中。
+
+#### 周边优化
+
+- **P1-2**：`tryAutoCompact` 调用顺序：移到 tool_call append **之前**，删除原 re-append 兜底块。compact 不再跟新 append 的 tool_call 赛跑。
+- **P2-1**：`sameToolErrCount` 注入"改用其他方式"消息时，**同时**重置 `stuckStreak` / `prevToolSig` / `prevErrored`（抽 `resetGuardCounters()` + `resetSameToolErr()` helper）。避免两守卫互相打架导致 stuck-loop 抢先退出而 LLM 看不到"改用其他方式"提示。
+- **P2-2**：`MaxStepsPrompt` 拆 `MaxStepsPromptEN` / `MaxStepsPromptZH`，由 `pickMaxStepsPrompt(lang)` 按 `a.cfg.LLM.Output.Language` 选择。修复中英用户拿到全英文 prompt + "respond in the same language as the conversation" 自我矛盾的 bug。
+- **P2-3**：工具调用 ID 唯一性校验（`normalizeToolCallIDs()` helper）：空 ID 或同轮重复 ID 全部重新生成 `call_<uuid>`，保留下游依赖的格式。防止 LLM 漏给 / 重复给 ID 导致 SQLite UNIQUE 报错或 tool_call/tool_result 配对错乱。
+- **P3-1**：`SessionStatus: "busy"` 延后到系统提示 ready 后再发。原版在工具加载前就发，UI 显示 100-500ms 假 busy。
+
+#### 测试
+
+- 新增 14 个测试 case（`agent_auto_continue_test.go`）：
+  - `TestSessionPendingTodos_*` (2)
+  - `TestBuildAutoContinuePrompt_*` (3)
+  - `TestMaxAutoContinue_Is3`
+  - `TestChatRequest_AutoContinueJSONTag`
+  - `TestPickMaxStepsPrompt_LanguageSelection` (5 cases)
+  - `TestNormalizeToolCallIDs` (5 subtests)
+- `TestBuildStaticSystemPrompt_TodoContractPromptPresent`：锁住 P1-1 提示新增
+- `TestHTTPContext_SandboxNoOp`：锁住 HTTP 沙箱 no-op 行为
+- `tool.Registry.RegisterForTest` helper：测试用 no-op handler 注册工具
+- **4 个之前挂的 Anthropic SSE 测试** 全部转绿
+
+#### 改动统计
+
+```
+25 files changed, 1857 insertions(+), 355 deletions(-)
+
+新增文件:
+  docs/plans/auto-continue-plan.md
+  internal/agent/agent_auto_continue_test.go
+
+主战场:
+  internal/agent/agent.go          +876/-244
+  internal/cli/commands.go         +78
+  internal/cli/context.go          +98
+  internal/server/handler.go       +55
+  internal/httpcli/client.go       +45
+  internal/tool/registry.go        +13
+  internal/llm/anthropic_adapter.go +59/-25
+
+文档:
+  .agents/CLAUDE.md (= .claude/CLAUDE.md)  +38
+  .agents/docs/agent.md                     +26
+  .agents/docs/INDEX.md                     +1
+  docs/auto-continue.md                     +158 (新)
+  README.md                                 +1
+```
+
+#### 升级说明
+
+- 无 schema 迁移 —— `auto_continue` 复用 `conversations.metadata` JSON blob，跟其他 per-session 字段共存
+- 无新依赖 —— 全用 Go 标准库 + 现有 uuid 库
+- 向后兼容 —— 旧会话（没有 `auto_continue` 字段）默认 `true`，行为符合"启用 auto-continue"的预期
+- API 变化 —— `PATCH /api/v1/sessions/:id` 新增 `auto_continue` 字段；`SessionResponse` 包含 `auto_continue` 字段
+
+---
+
+### v1.0.7 — 流式 / 渲染 / 工具调用增强
+
+第二轮"功能 + UX"优化，5 个独立可交付项。
+
+#### 用户可见功能
+
+| 项 | 体验提升 |
+| --- | --- |
+| **P0-1 流式中断恢复** | SSE 断开时自动从服务端拉取已入库的 assistant parts，merge 到 trailing bubble，UI 顶部 3s 弹"已恢复 N 条消息"banner |
+| **P1-1 工具结果折叠** | 长 result（>= 200 字符 OR >= 4 换行）默认折叠；点 header 展开，状态写 localStorage 持久化；折叠态下 header 的 📋 复制按钮可点 |
+| **P1-2 子 agent 实时进度** | SubAgentCard header 加 `part.parts.length` 计数 chip，running 时高亮 sub-accent 色 |
+| **P1-3 重新生成按钮** | trailing assistant 消息底部加"重答"按钮，物理截断 user 消息之后的行，重跑 agent loop |
+| **P3-1 事件 seq** | 每个 SSE 事件带 per-stream 单调递增 seq，以标准 SSE `id:` 头输出；dev tools / curl 调试更清晰 |
+
+#### Bug 修复
+
+- **P3-1 测试 race**：`TestSendOrDrop_CtxCancelDropsChunk` 在有 reader 的情况下 select 可能选 `ch <- chunk` 而非 `<-ctx.Done()`，让 cancelled 上下文仍发送 chunk。改为不启动 reader，确保走 cancel 路径
+
+#### 重构
+
+- **`sendOrDrop` 签名升级**：`sendOrDrop(ctx, ch, chunk)` → `sendOrDrop(ctx, ch, nextSeq func() uint64, chunk)`，用 closure 捕获 counter，避免在 41 个 call site 传 `&counter`
+- **`respondSSE` helper 抽出**：SendMessage 和 Regenerate 共享 SSE 写循环（设 header + 写 `data: ...\nid: N\n\n` + 强制 Flush）
+
+#### 周边优化
+
+- **SSE 协议扩展**：每个事件多写一行 `id: <N>`（标准 SSE 事件 ID）；前端 fetch 路径解析 `id:` 行写入 `ev.seq`；dev 模式 console.debug + 单调性检查
+- **新服务端端点**：`GET /api/v1/sessions/:id/snapshot?after_seq=N`（P0-1）；`POST /api/v1/sessions/:id/regenerate`（P1-3）
+- **新 store helper**：`GetAssistantMessagesAfterSeq`（P0-1 SQL 查询）、`ValidateUserMessageID`（P1-3 严格校验）、`recoverMissingParts` action（P0-1 fingerprint 去重 merge）、`regenerateMessage` action（P1-3 弹 bubble + 重 stream）
+
+#### 测试
+
+- `internal/agent/agent_seq_test.go`（新）— 3 个用例：StampsMonotonicSeq / NilNextSeqPreservesSeq / CtxCancelDropsChunk
+- `internal/server/handler_snapshot_test.go`（新）— 3 个用例：AfterSeqFilter / AfterSeqSkipsEarlier / EmptySession
+- `internal/server/handler_regenerate_test.go`（新）— 3 个用例：TruncatesAfterUserMessage / RejectsNonUserMessage / RejectsMissingID
+
+前端未做单元测试（项目暂无 vitest），改为：
+- `vue-tsc -b` + `npm run build` 通过
+- 浏览器手动验证
+
+#### 改动统计
+
+```
+docs/plans/round2-stream-and-render-plan.md    +326 (新)
+internal/agent/agent.go                         +120 -47
+internal/agent/agent_seq_test.go                +115 (新)
+internal/memory/memory.go                       +98
+internal/server/handler.go                      +243 -30
+internal/server/handler_snapshot_test.go        +174 (新)
+internal/server/handler_regenerate_test.go      +206 (新)
+internal/server/server.go                       +11
+frontend/src/api/client.ts                      +127
+frontend/src/components/ChatWindow.vue          +55
+frontend/src/components/InputArea.vue           +15
+frontend/src/components/MessageBubble.vue       +85
+frontend/src/components/PlanReviewModal.vue     +8
+frontend/src/components/SubAgentCard.vue        +34
+frontend/src/components/ToolCallCard.vue        +164
+frontend/src/stores/chat.ts                     +177
+.agents/docs/agent.md                           +30
+.agents/docs/frontend.md                        +50
+.agents/docs/memory.md                          +12
+.agents/docs/server.md                          +12
+CHANGELOG.md                                    +60
+```
+
+#### 升级说明
+
+- 无 schema 迁移
+- 无新依赖
+- 向后兼容：
+  - 旧 client 不发 `user_message_id` 给 `/regenerate` 也会返回 400（已有端点，无破坏）
+  - 旧 client 不解析 `id:` 行也能正常工作（`ev.seq` 为 undefined，UI 不渲染）
+  - P0-1 recovery 是 best-effort（snapshot 失败仅 console.warn，不影响主流程）
+
+---
+
+### v1.0.8 — 代码高亮 + 上下文检查器 + 工具 dry-run
+
+第三轮"功能 + UX"优化，3 个独立可交付项。
+
+#### 用户可见功能
+
+| 项 | 体验提升 |
+| --- | --- |
+| **P2-2 代码高亮** | 代码块按语言带 syntax 颜色（14 个主流语言：ts/js/py/go/rs/java/json/yaml/bash/sql/xml/css/md + 常见别名）；未识别语言 fallback 到自动检测不 crash |
+| **P2-3 上下文检查器** | TopBar 加 📊 按钮，右侧滑出抽屉：context window 利用率进度条（> 60% 黄，> 80% 红）+ per-message token 列表 + compressed summary 折叠块 |
+| **P2-4 工具 dry-run** | `exec_command` / `read_file` / `write_file` 加 `dry_run: true` 参数；UI 用 prompt "干跑 X" 触发，ToolCallCard 显示 `dry-run` chip 标明是预览未执行 |
+
+#### Bug 修复
+
+- 无
+
+#### 重构
+
+- **`sendOrDrop` 用 closure** 替代 `*atomic.Uint64` 传参（避免 41 处 call site 改签名）— 上一轮已做
+- **`marked-highlight` 扩展** 替代 `marked` 内置 `highlight` 选项（v12 移除）
+
+#### 周边优化
+
+- **vite alias + dedupe**：`marked` / `marked-highlight` 强制解析到 frontend/node_modules，npm hoisting 不会引入重复实例
+- **highlight.js 自定义主题**：`@import 'highlight.js/styles/github-dark.css'` + `.hljs { background: transparent }` 保留 P-Chat 暗色表面
+- **ContextMessage 精简结构**：inspector 只返 role/tokens/preview/is_tool_result，**不带 parts[]**（响应小 10x）
+
+#### 依赖
+
+- 新增 `marked-highlight@^2.2.4`（dev 依赖，~5KB）
+- 已有的 `highlight.js@^11.9.0` 首次被实际使用
+
+#### 测试
+
+- `internal/server/handler_context_test.go`（新）— 3 个用例：EmptySession / BasicCounting / ToolResultFlagged
+- `internal/tool/handlers_test.go`（append）— 3 个用例：TestExecCommand_DryRun / TestReadFile_DryRun / TestWriteFile_DryRun
+
+前端未做单元测试（项目暂无 vitest 基础设施）：
+- `vue-tsc -b` + `npm run build` 通过
+- 浏览器手动验证高亮 + 抽屉 + dry-run chip
+
+#### 改动统计
+
+```
+docs/plans/round3-syntax-and-branching-plan.md    +326 (新)
+internal/agent/agent_seq_test.go                    +115 (新, round 2)
+internal/server/handler.go                          +185
+internal/server/handler_context_test.go             +181 (新)
+internal/server/handler_snapshot_test.go            +174 (新, round 2)
+internal/server/handler_regenerate_test.go           +206 (新, round 2)
+internal/server/server.go                            +5
+internal/tool/registry.go                           +127
+internal/tool/handlers_test.go                      +94
+frontend/src/api/client.ts                          +40
+frontend/src/components/ChatWindow.vue              +8
+frontend/src/components/ContextInspectorDrawer.vue  +247 (新)
+frontend/src/components/ToolCallCard.vue            +36
+frontend/src/components/ToolConfirmModal.vue        +18
+frontend/src/components/TopBar.vue                   +22
+frontend/src/main.ts                                +88
+frontend/src/stores/chat.ts                         +65
+frontend/src/style.css                              +30
+frontend/vite.config.ts                             +12
+frontend/package.json                               +1 (marked-highlight)
+.agents/docs/frontend.md                            +30
+.agents/docs/server.md                              +18
+.agents/docs/tool.md                                +30
+CHANGELOG.md                                        +70
+```
+
+#### 升级说明
+
+- 无 schema 迁移
+- 无破坏性 API 变化（新端点 + 新工具字段，老 client 不感知）
+- dry_run 字段对老 client 透明（默认 false = 原行为）
+- context inspector 是只读 GET，零副作用
+- 代码高亮：旧 client 仍可工作（marked 仍能 parse，只是没颜色）
+
+---
+
+### v1.0.9 — 端到端可观测性 + 平台可扩展性
+
+第四轮"可观测性 + 扩展性"优化，3 个独立可交付项。
+
+#### 用户可见功能
+
+| 项 | 体验提升 |
+| --- | --- |
+| **P3-3 端到端 trace id** | 每次 SSE 会话自动生成 8 字符 hex trace id (`T-xxxxxxxx`)，贯穿 HTTP → agent → LLM → tool handler → log → SSE event；报错时错误气泡显示"复制 trace id"按钮，点一下贴到剪贴板。开发者 grep `server-debug.log` 即可定位 |
+| **P3-2 工具 hot-reload** | 用户在 `~/.p-chat/tools/foo.yaml` 写工具定义（exec / http / echo 三种 template），5s polling watcher 自动 register，无需重启；TopBar 新增 🔧 按钮打开工具列表抽屉，自定义工具带"自定义"badge + "查看源码"展开显示 YAML 路径 |
+| **P2-5 多 LLM race mode (A 模式)** | InputArea 加"单线/对比"模式切换；race 模式选 3 个 (provider, model) 对并发发问，3 个 LLM 同步跑，UI 分 3 pane 显示（CSS grid，< 720px 自动单列）；结束后每 pane 一个"🏆 选这个"按钮；点 winner → fork 它的 session 为新主线 |
+
+#### Bug 修复
+
+- 无
+
+#### 重构
+
+- **`tool.Registry.sources` map**：新增来源追踪字段。`RegisterWithSource(t, h, source)` 让 P3-2 watcher 记录 YAML 路径；`SourceFile(name)` 供 GET /api/v1/tools 端点区分 dynamic vs built-in
+- **`tool.Registry` 构造签名升级**：`New` / `NewWithStaticDir` / `NewWithStaticFS` 增 `toolReg *tool.Registry` 参数；`cmd/pchat-server/main.go` 同步更新
+- **`dynamic.SetSpecs` / `LookupSpec` 进程全局表**：watcher 每次 reload 发布 spec 快照；agent 的 `confirmTargetFor` default 分支读 spec.Sandbox.Exec 决定 SandboxDecision。避开在 agent loop 多收一个 Registry 参数
+
+#### 周边优化
+
+- **P3-3 CORS allow-headers**：加 `X-Trace-Id` 让浏览器 cross-origin fetch 不被预检拒绝
+- **P3-3 Wails 路径兼容**：`StreamMessages` Go binding 从请求 body 抽 `trace_id` 字段并设 `X-Trace-Id` header（绕过 Wails binding 不能加任意 header 的限制）
+- **P3-3 log.Printf 前缀**：`trace.LogPrefix(ctx)` 返回 `[T-xxx] ` 或 `""`；主要 log 行（LLM client / forwarder / tool handler）已加前缀
+- **P3-2 sandbox 决策**：dynamic tool 走 `decisionFromSandbox(spec.Sandbox.Exec, toolName)` → allow / deny / confirm
+- **P3-2 模板渲染**：`{{.args.foo}}` / `{{.config.api_key}}` 走 `text/template`，missingkey=zero 让缺字段渲染 `<no value>` 不报错
+- **P3-2 per-tool config**：`config.json` 写 `dynamic.<name>.config: {api_key: ...}` → 模板用 `{{.config.api_key}}` 引用
+- **P2-5 race orchestrator**：A 模式 = 纯前端，复用现有 ForkSession + SendMessage；每个 pane 独立 AbortController，cancelRace 一次 abort 全部
+
+#### 依赖
+
+- `gopkg.in/yaml.v3 v3.0.1`（已存在，被 dynamic 解析器复用）
+- `lucide-vue-next` 新增 `RefreshCw` / `Wrench` / `Trophy` / `FileCode` 图标
+
+#### 测试
+
+`internal/trace/trace_test.go`（新）— 5 个 case：NewID_Format / NewID_Unique / WithID_FromContext / WithID_EmptyIsNoop / FromContext_NilCtx
+
+`internal/server/handler_trace_test.go`（新）— 4 个 case：TraceID_GeneratedWhenMissing / TraceID_HeaderPassthrough / TraceID_DistinctPerRequest / TraceID_AllowsHeaderInCORS
+
+`internal/tool/dynamic/dynamic_test.go`（新）— 8 个 case：ParseSpec_Exec / ParseSpec_HTTP / ParseSpec_Echo / ParseSpec_MissingFields (9 sub) / Render_ArgsAndConfig / Render_MissingKeyIsZero / BuildDynamicHandler_Echo / BuildDynamicHandler_UnknownType / Watcher_AddRemove / Watcher_MalformedYAMLDoesNotPoison / Watcher_EditIsDetected
+
+`internal/server/handler_tools_test.go`（新）— 2 个 case：ListTools_Builtins / ListTools_Dynamic
+
+#### 改动统计
+
+```
+docs/plans/round4-trace-and-extensibility-plan.md    +857 (新)
+internal/trace/trace.go                               +104 (新)
+internal/trace/trace_test.go                          +79 (新)
+internal/server/handler_trace_test.go                 +106 (新)
+internal/server/handler_tools_test.go                 +88 (新)
+internal/server/tool_api.go                           +88 (新)
+internal/tool/dynamic/dynamic.go                      +52 (新)
+internal/tool/dynamic/dynamic_test.go                 +331 (新)
+internal/tool/dynamic/echo.go                         +27 (新)
+internal/tool/dynamic/exec.go                         +80 (新)
+internal/tool/dynamic/http.go                         +108 (新)
+internal/tool/dynamic/parse.go                        +211 (新)
+internal/tool/dynamic/render.go                       +53 (新)
+internal/tool/dynamic/watcher.go                      +180 (新)
+internal/tool/registry.go                             +41
+internal/agent/agent.go                               +30
+internal/agent/confirm_target.go                      +52
+internal/config/config.go                             +13
+internal/llm/anthropic.go                             +9
+internal/llm/client.go                                +25
+internal/server/handler.go                            +38
+internal/server/server.go                             +95
+internal/server/handler_test.go                       +8
+internal/server/web_test.go                           +2
+internal/httpcli/client_test.go                       +2
+cmd/pchat-server/main.go                              +2
+cmd/pchat-gui/main.go                                 +30
+frontend/src/api/client.ts                            +52
+frontend/src/components/ChatWindow.vue                +11
+frontend/src/components/InputArea.vue                 +180
+frontend/src/components/MessageBubble.vue             +50
+frontend/src/components/RaceView.vue                  +241 (新)
+frontend/src/components/ToolListDrawer.vue            +248 (新)
+frontend/src/components/TopBar.vue                    +38
+frontend/src/stores/chat.ts                           +250
+```
+
+#### 升级说明
+
+- 无 schema 迁移
+- 无破坏性 API 变化：
+  - `X-Trace-Id` 头可选；老 client 不发也正常（后端生成）
+  - `GET /api/v1/tools` 是新端点，老 client 无感知
+  - race mode 是新模式切换，老 client 默认走 single 不变
+  - `chatReq.TraceID` 字段可选；老 client 不发时 agent ctx 也不会注入
+- 新增 `Config.Dynamic` 字段（`map[string]map[string]any`）—— 老 config 缺这字段零迁移成本
+- 新增 `tool.Registry.sources` map（built-in 工具永远不写）—— 对外 API 行为不变
+- P3-2 YAML 错误隔离：单个坏 YAML 只 log warn，不影响其他 dynamic / built-in 工具
+- 向后兼容：旧 client 不发 `X-Trace-Id` 也可工作，错误气泡的 trace chip 仅在用户带 id 时显示
+

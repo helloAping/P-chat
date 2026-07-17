@@ -221,7 +221,7 @@ func buildHandlers(hub *BridgeHub) []tool.ToolHandler {
 // verbatim to the LLM.
 func makeHandler(hub *BridgeHub, method string) tool.ToolHandler {
 	return func(ctx context.Context, args json.RawMessage) (*tool.CallResult, error) {
-		var params map[string]interface{}
+		var params map[string]any
 		if len(args) > 0 {
 			if err := json.Unmarshal(args, &params); err != nil {
 				return &tool.CallResult{
@@ -230,7 +230,7 @@ func makeHandler(hub *BridgeHub, method string) tool.ToolHandler {
 				}, nil
 			}
 		} else {
-			params = make(map[string]interface{})
+			params = make(map[string]any)
 		}
 
 		browserID, _ := params["browser_id"].(string)

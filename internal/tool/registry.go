@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -121,6 +122,35 @@ func sandboxFromCtx(ctx context.Context) SandboxChecker {
 	return nil
 }
 
+// traceKey is the P3-3 mirror of sandboxKey: stores the
+// per-request trace id under an unexported context key so tool
+// handlers can prefix their log lines with it (e.g.
+// `log.Printf("[%s] [tool/exec_command] start", tid, …)`).
+type traceKey struct{}
+
+// WithTraceID returns a child context carrying the given trace id.
+// Empty id is a no-op so callers don't have to guard against
+// "is the middleware on?".
+func WithTraceID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, traceKey{}, id)
+}
+
+// TraceIDFromCtx extracts the trace id from ctx, or "" if none
+// is set. Callers can safely pass the result straight into a
+// log.Printf prefix or response header.
+func TraceIDFromCtx(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(traceKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 type projectRootKey struct{}
 
 // WithProjectRoot stores the session's project root directory in ctx.
@@ -191,14 +221,21 @@ type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]ToolHandler
 	meta  map[string]Tool
+	// sources tracks the on-disk origin of each tool. The
+	// P3-2 dynamic watcher populates this so the
+	// GET /api/v1/tools endpoint can badge user-defined
+	// tools differently from built-ins. Empty for
+	// built-ins (their entries are never written).
+	sources map[string]string
 }
 
 type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, error)
 
 func NewRegistry() *Registry {
 	return &Registry{
-		tools: make(map[string]ToolHandler),
-		meta:  make(map[string]Tool),
+		tools:   make(map[string]ToolHandler),
+		meta:    make(map[string]Tool),
+		sources: make(map[string]string),
 	}
 }
 
@@ -209,11 +246,51 @@ func (r *Registry) Register(t Tool, h ToolHandler) {
 	r.meta[t.Name] = t
 }
 
+// RegisterWithSource is the P3-2 dynamic-watcher's
+// Register variant. Records the YAML path under
+// `sources[name]` so the GET /api/v1/tools endpoint can
+// flag this tool as user-defined and surface the source
+// path in the UI. Built-in registration uses plain
+// Register, which leaves the source entry empty.
+func (r *Registry) RegisterWithSource(t Tool, h ToolHandler, source string) {
+	r.Register(t, h)
+	if source != "" {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.sources[t.Name] = source
+	}
+}
+
+// RegisterForTest registers a tool with a no-op handler. Tests
+// use it to populate the registry when exercising prompt-
+// building code paths that gate hint sections on tool
+// presence (e.g. the "todo_write" section in the static
+// system prompt). The real handler is wired by RegisterBuiltin
+// at production startup; tests don't need it because they
+// only exercise the meta side.
+func (r *Registry) RegisterForTest(t Tool) {
+	r.Register(t, func(ctx context.Context, args json.RawMessage) (*CallResult, error) {
+		return &CallResult{Content: "{}"}, nil
+	})
+}
+
 func (r *Registry) Unregister(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.tools, name)
 	delete(r.meta, name)
+	delete(r.sources, name)
+}
+
+// SourceFile returns the YAML path the dynamic watcher
+// registered the named tool from, plus an ok flag. The
+// P3-2 GET /api/v1/tools endpoint uses it to badge
+// user-defined tools differently from the built-ins.
+func (r *Registry) SourceFile(name string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	src, ok := r.sources[name]
+	return src, ok
 }
 
 func (r *Registry) Get(name string) (ToolHandler, bool) {
@@ -283,6 +360,18 @@ func StringProp(description string) map[string]any {
 	}
 }
 
+// BoolProp is a small JSON-Schema fragment for a boolean
+// parameter. Used by the P2-4 dry-run flag on
+// exec_command / read_file / write_file. Default is
+// false (real execution), so existing LLM prompts that
+// don't set it continue to work as before.
+func BoolProp(description string) map[string]any {
+	return map[string]any{
+		"type":        "boolean",
+		"description": description,
+	}
+}
+
 func StringEnumProp(description string, values ...string) map[string]any {
 	return map[string]any{
 		"type":        "string",
@@ -299,6 +388,14 @@ func RegisterBuiltin(r *Registry) {
 		Parameters: ObjectSchema(map[string]any{
 			"command":   StringProp("The shell command to execute (cmd.exe syntax on Windows)"),
 			"work_dir":  StringProp("Optional working directory for the command"),
+			// P2-4: dry-run flag. When true the tool
+			// runs the sandbox check + a "would
+			// execute" preview, but does NOT actually
+			// exec. The LLM is expected to pass this
+			// when the user says "试一下" / "preview";
+			// the front-end "干跑" button also sets
+			// it on a direct call.
+			"dry_run": BoolProp("If true, return a preview of what would execute without actually running the command. Sandbox check still applies."),
 		}, []string{"command"}),
 	}, handleExecCommand)
 
@@ -310,7 +407,8 @@ func RegisterBuiltin(r *Registry) {
 			"Images uploaded by the user are ALREADY available as vision input (image_url) in the user message; " +
 			"just look at them directly, do NOT call read_file on the on-disk copy.",
 		Parameters: ObjectSchema(map[string]any{
-			"path": StringProp("Absolute or relative path to the file"),
+			"path":    StringProp("Absolute or relative path to the file"),
+			"dry_run": BoolProp("If true, return file size + first 200 chars without reading the full body."),
 		}, []string{"path"}),
 	}, handleReadFile)
 
@@ -320,6 +418,7 @@ func RegisterBuiltin(r *Registry) {
 		Parameters: ObjectSchema(map[string]any{
 			"path":    StringProp("Absolute or relative path to the file"),
 			"content": StringProp("The full text content to write to the file"),
+			"dry_run": BoolProp("If true, return content size + first 200 chars without writing to disk."),
 		}, []string{"path", "content"}),
 	}, handleWriteFile)
 
@@ -402,6 +501,13 @@ func RegisterBuiltin(r *Registry) {
 type execArgs struct {
 	Command string `json:"command"`
 	WorkDir string `json:"work_dir,omitempty"`
+	// DryRun (P2-4): when true the tool runs the
+	// sandbox check but does NOT execute the command.
+	// Returns a "would execute" preview instead so
+	// the user / LLM can see what would happen.
+	// Always safe to flip on — it just makes the
+	// tool a strict subset of its real behaviour.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, error) {
@@ -412,6 +518,11 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	if a.Command == "" {
 		return &CallResult{Content: "command is required", IsError: true}, nil
 	}
+	// P3-3: trace id is on ctx via WithTraceID; prefix the
+	// log line so a sandbox rejection / exec failure can be
+	// correlated with the SSE event that triggered the call
+	// (and the user's report).
+	log.Printf("%s[tool/exec_command] start cmd=%q dry_run=%t", TraceIDFromCtx(ctx), a.Command, a.DryRun)
 
 	if sb := sandboxFromCtx(ctx); sb != nil && !sb.CheckExecBool(a.Command) {
 		return &CallResult{
@@ -437,6 +548,31 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 					"attachment you already received.", reason),
 			IsError: true,
 		}, nil
+	}
+
+	// P2-4 dry-run: at this point both sandbox and
+	// upload-dir guards have accepted the command, so
+	// it's safe to report what would happen. We
+	// resolve the work_dir the same way as the real
+	// path (so the preview matches the eventual cwd),
+	// then return a structured preview the LLM can
+	// reason about. IsError=false so the tool result
+	// is treated as a normal completion (the preview
+	// text is the content, the LLM reads it and
+	// decides whether to retry with dry_run=false).
+	if a.DryRun {
+		workDir := a.WorkDir
+		if !filepath.IsAbs(workDir) && workDir != "" && projectRootFromCtx(ctx) != "" {
+			workDir = filepath.Join(projectRootFromCtx(ctx), workDir)
+		} else if workDir == "" {
+			workDir = projectRootFromCtx(ctx)
+		}
+		preview := fmt.Sprintf(
+			"[dry-run] would execute: %s\nwork_dir: %s\nsandbox: passed\nupload-dir: passed\n\n"+
+				"(no command was actually run; remove dry_run or set it to false to execute)",
+			a.Command, workDir,
+		)
+		return &CallResult{Content: preview}, nil
 	}
 
 	cmd := exec.CommandContext(ctx, "cmd", "/C", a.Command)
@@ -599,6 +735,13 @@ func commandReferencesUploadFile(cmd string) string {
 
 type readFileArgs struct {
 	Path string `json:"path"`
+	// DryRun (P2-4): when true the tool reports the
+	// file's size / line count / first 200 chars
+	// without reading the full body. Useful when the
+	// LLM / user wants to know "is this file small
+	// enough to read in full" without paying the
+	// I/O cost of pulling megabytes of content.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, error) {
@@ -644,6 +787,38 @@ func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 		}, nil
 	}
 
+	// P2-4 dry-run: stat the file and return a
+	// size + first-200-chars preview without slurping
+	// the whole body. Useful when the LLM just wants
+	// to know "is this 30 lines or 30000 lines".
+	// Stays on the same sandbox / upload-dir guards
+	// so a dry-run can never reveal protected
+	// content.
+	if a.DryRun {
+		info, err := os.Stat(a.Path)
+		if err != nil {
+			return &CallResult{Content: "stat failed: " + err.Error(), IsError: true}, nil
+		}
+		preview := fmt.Sprintf(
+			"[dry-run] would read: %s\nsize: %d bytes\nmode: %s\nmodified: %s",
+			a.Path, info.Size(), info.Mode(), info.ModTime().Format(time.RFC3339),
+		)
+		// Best-effort head snippet. If the file is
+		// binary or huge, the snippet may be useless
+		// but the size line above is always useful.
+		if info.Size() > 0 && info.Size() < (1<<20) {
+			if f, ferr := os.Open(a.Path); ferr == nil {
+				defer f.Close()
+				buf := make([]byte, 200)
+				n, _ := f.Read(buf)
+				if n > 0 {
+					preview += fmt.Sprintf("\n\nfirst %d bytes:\n%s", n, string(buf[:n]))
+				}
+			}
+		}
+		return &CallResult{Content: preview}, nil
+	}
+
 	data, err := readFileForTool(a.Path)
 	if err != nil {
 		// Binary files get a clearer message than the bare
@@ -666,6 +841,12 @@ func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 type writeFileArgs struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+	// DryRun (P2-4): when true the tool reports the
+	// size of the proposed content + first 200 chars
+	// without writing to disk. The existing file (if
+	// any) is left untouched. Lets the LLM / user
+	// sanity-check the payload before committing.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 func handleWriteFile(ctx context.Context, args json.RawMessage) (*CallResult, error) {
@@ -690,6 +871,32 @@ func handleWriteFile(ctx context.Context, args json.RawMessage) (*CallResult, er
 			Content: fmt.Sprintf("E_SANDBOX: write blocked by sandbox policy\n  path: %s\n  tip: this path is in the protected list; remove it from sandbox.write_protected_paths if you really mean it", a.Path),
 			IsError: true,
 		}, nil
+	}
+
+	// P2-4 dry-run: report the size + a 200-char
+	// preview of the proposed content without
+	// touching disk. The existing file (if any) is
+	// left alone. We stat the destination so the
+	// preview can mention "would overwrite existing
+	// 1234-byte file" — useful signal to the LLM
+	// before committing.
+	if a.DryRun {
+		preview := fmt.Sprintf(
+			"[dry-run] would write: %s\ncontent: %d bytes\n",
+			a.Path, len(a.Content),
+		)
+		if info, err := os.Stat(a.Path); err == nil {
+			preview += fmt.Sprintf("existing: %d bytes, modified %s\n",
+				info.Size(), info.ModTime().Format(time.RFC3339))
+		} else {
+			preview += "existing: (none, would create)\n"
+		}
+		head := a.Content
+		if len(head) > 200 {
+			head = head[:200] + "..."
+		}
+		preview += "\nfirst 200 chars of content:\n" + head
+		return &CallResult{Content: preview}, nil
 	}
 
 	if err := writeFile(a.Path, []byte(a.Content)); err != nil {

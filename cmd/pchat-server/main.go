@@ -238,7 +238,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if wd := serverproc.WebDirFromEnv(); wd != "" {
 		staticFS = http.Dir(wd)
 	}
-	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, staticFS, mcpMgr)
+	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
 
 	// Initialize browser control manager (enabled via config).
 	browserMgr := browser.NewManager(cfg.Browser, toolReg)

@@ -106,4 +106,5 @@ export {
   ShieldAlert,
   ShieldCheck,
   Monitor,
+  CornerDownLeft,
 } from 'lucide-vue-next'

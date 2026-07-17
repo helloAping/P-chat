@@ -33,7 +33,7 @@ import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
   ArrowDown, ArrowUp, Pencil, MoreHorizontal, Sparkles,
-  Check, Loader2, XCircle,
+  Check, Loader2, XCircle, CornerDownLeft,
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
 
@@ -68,7 +68,8 @@ function renderMd(text: string): string {
 }
 import { useMessage, useDialog } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
-import { state } from '../stores/chat'
+import * as api from '../api/client'
+import { state, regenerateMessage, fetchReplies, activateReply } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import SubAgentCard from './SubAgentCard.vue'
@@ -508,6 +509,31 @@ const showVisionWarn = computed(() =>
   props.message.role === 'user' && props.message.visionUnsupported === true,
 )
 
+// traceIdChip is the P3-3 surface for the correlation id.
+// We only render the chip on an assistant message that has
+// been tagged by the chat store (which happens when an
+// error event arrives), so normal successful turns don't
+// show noise.
+const traceIdChip = computed(() => {
+  if (props.message.role !== 'assistant') return ''
+  return props.message.traceId || ''
+})
+
+// copyTraceId writes the trace id to the system clipboard
+// and fires a one-off toast. Called from the chip's click
+// handler so the user can paste the id into a support
+// ticket — paired with the same id the server logs in
+// server-debug.log.
+async function copyTraceId() {
+  const id = traceIdChip.value
+  if (!id) return
+  if (await copyText(id)) {
+    toast.success('已复制 trace id')
+  } else {
+    toast.error('复制失败')
+  }
+}
+
 // showAssistantHeader — the small "Assistant · Claude 3.5
 // · 2.3s" line that sits above the assistant's body. Only
 // shown for assistant messages; user messages get a
@@ -520,16 +546,243 @@ const showAssistantHeader = computed(() =>
 //   - copy:   always available (copies the visible text)
 //   - fork:   user only (PR #2 feature, kept)
 //   - more:   reserved for future (model switch, etc.)
+//   - regenerate: trailing assistant message only (P1-3)
 const canFork = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
 const canRollback = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
+// P1-3: regenerate is only meaningful on the trailing
+// assistant message — regenerating an older reply would
+// leave newer messages in an inconsistent state (the
+// server truncates from the user_message_id+1, which
+// would clobber everything newer). We use `isLast` as
+// a proxy for "trailing" because MessageBubble doesn't
+// have a direct trailing-message prop.
+const isLast = computed(() => {
+  const sid = state.currentID
+  const msgs = state.sessionMessages[sid]
+  if (!msgs || msgs.length === 0) return false
+  return msgs[msgs.length - 1] === props.message
+})
+const canRegenerate = computed(() =>
+  props.message.role === 'assistant' && isLast.value && !props.streaming
+)
+// P1-4: regen siblings are loaded on demand the first
+// time the user hovers a paginated bubble. The fetch
+// is debounced via a per-bubble ref so rapid hover
+// events don't stampede the API.
+//
+// replies is the full RepliesResponse from the server
+// (active + archived + the user message summary). It
+// stays empty for the common single-shot case — the
+// computed replySiblings short-circuits to [] until
+// the first hover triggers the fetch.
+const replies = ref<api.RepliesResponse | null>(null)
+const repliesLoading = ref(false)
+let repliesFetchToken = 0
+
+// loadReplies kicks off the on-demand fetch. Idempotent:
+// a second call while the first is in flight returns the
+// same promise (no double-fetch). After completion the
+// result is cached on the bubble-local `replies` ref AND
+// on the global state.sessionReplies / sessionUserMsgs
+// caches (so the chip / anchor-FAB paths can read it
+// without re-walking the full replies payload).
+async function loadReplies() {
+  if (repliesLoading.value || replies.value) return
+  if (!props.message.regen_group_id) return
+  const sid = state.currentID
+  const userMsgId = Number(props.message.regen_group_id)
+  if (!sid || !userMsgId) return
+  repliesLoading.value = true
+  const myToken = ++repliesFetchToken
+  try {
+    const r = await fetchReplies(sid, userMsgId)
+    // Guard against a stale fetch: if the user has
+    // clicked ◀/▶ (which bumps repliesFetchToken via
+    // activateReply) while this fetch was in flight,
+    // drop the late result.
+    if (myToken !== repliesFetchToken) return
+    replies.value = r
+  } finally {
+    repliesLoading.value = false
+  }
+}
+
+// replySiblings is the local view of the sibling set,
+// oldest-first. Returns [] when no regen history exists
+// or the fetch hasn't completed yet — the pager UI is
+// gated on `replySiblings.length > 1` so the empty case
+// is invisible to the user.
+const replySiblings = computed(() => replies.value?.replies || [])
+
+// activeIdx is the index in replySiblings of the row
+// that is currently visible (is_archived = false). The
+// pager uses this for the N/M position and to disable
+// ◀/▶ at the boundaries.
+const activeIdx = computed(() => {
+  const sibs = replySiblings.value
+  for (let i = 0; i < sibs.length; i++) {
+    if (!sibs[i].is_archived) return i
+  }
+  // No active row (transient state during a regen) —
+  // fall back to "newest" so the pager still shows a
+  // meaningful N/M rather than 0/0.
+  return Math.max(0, sibs.length - 1)
+})
+
+// userMsgPreview is the user-message summary text used
+// in the pager (`◀ 2/3 · "请帮我..." ▶`) and the
+// "上一版回答" chip's anchor. Falls back to the
+// cached sessionUserMsgs entry (in case the user
+// navigates ◀/▶ before loadReplies completes) and to
+// the empty string when nothing is known yet.
+const userMsgPreview = computed(() => {
+  if (replies.value?.user_message?.content_preview) {
+    return replies.value.user_message.content_preview
+  }
+  const sid = state.currentID
+  const userMsgId = Number(props.message.regen_group_id)
+  if (!sid || !userMsgId) return ''
+  return state.sessionUserMsgs[sid]?.[String(userMsgId)]?.content_preview || ''
+})
+
+// truncatedPreview: the pager's inline preview is
+// capped at 12 chars (so `◀ 2/3 · "请帮我写一个 todo" ▶`
+// doesn't overflow on a 720px chat column). Falls back
+// to the empty string when no preview is available.
+const truncatedPreview = computed(() => {
+  const p = userMsgPreview.value
+  if (!p) return ''
+  return p.length > 12 ? p.slice(0, 12) + '…' : p
+})
+
+// onPrevReply / onNextReply: ◀/▶ click handlers. Both
+// call the global activateReply action which talks to
+// the server and mutates the local state. We compute
+// the target row from the current sibling set + active
+// index — the server response carries the fresh
+// active_reply_id and full siblings, which the store
+// mirrors onto the bubble's `replies` ref via the
+// fetchReplies cache invalidation on regen (so a
+// subsequent loadReplies sees the new set).
+async function onPrevReply() {
+  if (activeIdx.value <= 0) return
+  const sid = state.currentID
+  const userMsgId = Number(props.message.regen_group_id)
+  const target = replySiblings.value[activeIdx.value - 1]
+  if (!sid || !userMsgId || target.id == null) return
+  await activateReply(sid, userMsgId, target.id)
+  // Bump the fetch token so any in-flight loadReplies
+  // drops its late result. The store just wrote the
+  // fresh RepliesResponse into the cache, so the next
+  // loadReplies picks it up via the cache hit.
+  repliesFetchToken++
+  // Refresh the local `replies` ref from the store
+  // cache so the UI re-renders with the new active
+  // row without an extra round-trip.
+  replies.value = state.sessionReplies[sid]?.[String(userMsgId)] || null
+}
+
+async function onNextReply() {
+  if (activeIdx.value >= replySiblings.value.length - 1) return
+  const sid = state.currentID
+  const userMsgId = Number(props.message.regen_group_id)
+  const target = replySiblings.value[activeIdx.value + 1]
+  if (!sid || !userMsgId || target.id == null) return
+  await activateReply(sid, userMsgId, target.id)
+  repliesFetchToken++
+  replies.value = state.sessionReplies[sid]?.[String(userMsgId)] || null
+}
+
+// P1-4 lazy-load: the pager is rendered with the
+// current `replies` ref (which is empty for the first
+// render). Trigger the fetch on mouseenter so the
+// first hover pre-populates the cache; subsequent
+// ◀/▶ clicks use the cache directly.
+function onPagerHover() {
+  if (!replies.value && !repliesLoading.value) {
+    loadReplies()
+  }
+}
+
+// regenerating is true while the streamRegenerate call
+// is in flight; we lock the button to prevent double-
+// clicks and show a spinner instead of the static icon.
+const regenerating = ref(false)
+async function onRegenerate() {
+  if (regenerating.value) return
+  // P1-4: 二次确认 via Naive UI dialog. The user has
+  // to explicitly approve the regen — it is the most
+  // destructive routine action in the chat (every
+  // prior answer in the regen group will be archived
+  // — only reversible by switching sessions and
+  // re-loading). The dialog copy mirrors the
+  // rollback dialog's tone.
+  const userMsgId = findPrecedingUserMessageId()
+  if (!userMsgId) return
+  dialog.warning({
+    title: '重新生成回答？',
+    content: '当前回答将被归档为历史版本，可通过消息下方的分页条左右查看。',
+    positiveText: '确认重答',
+    negativeText: '取消',
+    onPositiveClick: () => {
+      // Fire-and-forget: the actual stream lives in
+      // the store action below. The dialog promise
+      // resolves on click; we don't await the
+      // stream so the user can keep interacting
+      // with the chat (the new assistant bubble
+      // appears as the stream lands).
+      void doRegenerate(userMsgId)
+    },
+  })
+}
+
+async function doRegenerate(userMessageId: number) {
+  if (regenerating.value) return
+  regenerating.value = true
+  try {
+    await regenerateMessage(state.currentID, userMessageId)
+  } catch (e: any) {
+    console.warn('[regen] failed:', e?.message || e)
+  } finally {
+    regenerating.value = false
+  }
+}
+
+// findPrecedingUserMessageId walks back through the
+// session's message list and returns the id of the
+// nearest preceding user message. The regen target
+// is the user message — the server archives every
+// assistant sibling in that user message's regen
+// group and re-runs the agent loop. Returns 0 when no
+// such user message exists (legacy pre-id schema);
+// the caller bails in that case.
+function findPrecedingUserMessageId(): number {
+  const sid = state.currentID
+  const msgs = state.sessionMessages[sid]
+  if (!msgs) return 0
+  // Find the index of this message in the local list.
+  // The regen button only appears on the trailing
+  // assistant message, so the user message is the
+  // one immediately before it. We still walk back
+  // through all preceding messages for safety (in
+  // case the bubble is somehow rendered off-trailing).
+  const myIdx = msgs.findIndex((m) => m === props.message || m.id === props.message.id)
+  if (myIdx < 0) return 0
+  for (let i = myIdx - 1; i >= 0; i--) {
+    if (msgs[i].role === 'user' && msgs[i].id) {
+      return msgs[i].id as number
+    }
+  }
+  return 0
+}
 </script>
 
 <template>
-  <div class="msg" :class="[message.role, { streaming }]">
+  <div class="msg" :class="[message.role, { streaming }]" :data-msg-id="message.id">
     <!-- Avatar: 32px circle that identifies the role. The
          system role doesn't show an avatar — instead it
          uses a left accent bar to mark itself. -->
@@ -643,6 +896,24 @@ const canRollback = computed(() =>
             <span class="warn-hint">切换到支持视觉的模型（如 gpt-4o / claude-3.5+）后重新发送</span>
           </div>
 
+          <!-- P3-3: trace id chip. Only rendered on
+               assistant messages that the chat store has
+               tagged with a `traceId` (set when the error
+               event arrives). Click to copy the id to the
+               clipboard so the user can paste it into a
+               bug report — server-debug.log uses the same
+               id for greppability. -->
+          <button
+            v-if="traceIdChip"
+            type="button"
+            class="trace-id-chip"
+            :title="'点击复制 trace id'"
+            @click="copyTraceId"
+          >
+            <Clipboard :size="12" />
+            <span class="trace-id-text">{{ traceIdChip }}</span>
+          </button>
+
           <!-- Command output: terminal-style panel -->
           <ExecOutputCard
             v-if="(message.msg_type ?? 0) === 5"
@@ -667,7 +938,7 @@ const canRollback = computed(() =>
           <template v-if="(message.msg_type ?? 0) === 0 && message.role === 'assistant'">
             <!-- Live status bar during streaming -->
             <div v-if="statusLines.length" class="stream-status">
-              <div v-for="(line, i) in statusLines" :key="i" class="status-line">{{ line }}</div>
+              <div v-for="(line, i) in statusLines" :key="i" :class="['status-line', { 'status-line-auto-continue': line.includes('自动续 LLM') }]">{{ line }}</div>
             </div>
             <template v-if="message.parts && message.parts.length">
               <template v-for="(p, i) in message.parts" :key="i">
@@ -713,6 +984,18 @@ const canRollback = computed(() =>
             />
           </template>
 
+          <!-- P1-4: 上一版回答 chip. Only on archived
+               assistant rows — the active row sits
+               directly under its user message, so adding
+               the chip would be redundant. User-message
+               preview lives in the pager below, not the
+               chip, so the chip itself stays at 2 tokens
+               (icon + label) and never crowds the bubble. -->
+          <div v-if="message.role === 'assistant' && message.is_archived" class="bubble-archived-chip">
+            <CornerDownLeft :size="12" />
+            <span class="bubble-archived-label">上一版回答</span>
+          </div>
+
           <!-- Footer for assistant: tokens / elapsed -->
           <div v-if="hasTokens" class="msg-meta">
             <span v-if="message.tokens_in || message.tokens_out" class="msg-meta-tokens">
@@ -720,6 +1003,41 @@ const canRollback = computed(() =>
             </span>
             <span v-if="message.elapsed" class="msg-elapsed">· {{ message.elapsed }}</span>
             <span v-if="message.model" class="msg-model">· {{ message.model }}</span>
+          </div>
+
+          <!-- P1-4: ◀ N/M ▶ reply pager. Gated on
+               replySiblings.length > 1 so the common
+               single-shot case renders nothing here.
+               Lazy-load: loadReplies fires on the first
+               mouseenter, so the first render is free;
+               only paginated bubbles pay the fetch
+               cost. The user-message preview is inlined
+               in the pager (e.g. `◀ 2/3 · "请帮我..." ▶`)
+               so the user always knows which user
+               message the sibling set belongs to. -->
+          <div
+            v-if="message.role === 'assistant' && replySiblings.length > 1"
+            class="bubble-reply-pager"
+            @mouseenter="onPagerHover"
+          >
+            <button
+              type="button"
+              class="bubble-reply-pager-btn"
+              :disabled="activeIdx === 0"
+              title="更早的回复"
+              aria-label="更早的回复"
+              @click="onPrevReply"
+            >◀</button>
+            <span class="bubble-reply-pager-pos">{{ activeIdx + 1 }}/{{ replySiblings.length }}</span>
+            <span v-if="truncatedPreview" class="bubble-reply-pager-context">· "{{ truncatedPreview }}"</span>
+            <button
+              type="button"
+              class="bubble-reply-pager-btn"
+              :disabled="activeIdx >= replySiblings.length - 1"
+              title="更新的回复"
+              aria-label="更新的回复"
+              @click="onNextReply"
+            >▶</button>
           </div>
         </div>
 
@@ -767,6 +1085,35 @@ const canRollback = computed(() =>
             @click="onRollback"
           >
             <Undo2 :size="13" class="bubble-action-icon" />
+          </button>
+          <!-- P1-3 regenerate. Only shown on the trailing
+               assistant message (we don't allow re-running
+               a reply that's no longer the latest one).
+               Click pops the local bubble, calls the
+               /regenerate endpoint, and re-streams the new
+               reply through the regular chat store path.
+
+               Visual states (see .bubble-action-regenerate
+               + .bubble-action-regenerate--busy in <style>):
+                 - idle: pill shape, brand-coloured surface,
+                   icon + "重答" text (auto-sized to content).
+                 - busy: collapses to a 26×24 icon square with
+                   a transparent surface, so the spinner
+                   doesn't draw the eye away from the
+                   streaming reply. Width transitions smoothly
+                   via the existing --dur-fast easing. -->
+          <button
+            v-if="canRegenerate"
+            type="button"
+            class="bubble-action-btn bubble-action-regenerate"
+            :class="{ 'bubble-action-regenerate--busy': regenerating }"
+            :disabled="regenerating"
+            title="重新生成回复"
+            aria-label="重新生成回复"
+            @click="onRegenerate"
+          >
+            <Loader2 :size="13" :class="regenerating ? 'bubble-action-icon bubble-action-icon--spin' : 'bubble-action-icon'" />
+            <span v-if="!regenerating" class="bubble-action-text">重答</span>
           </button>
           <button
             type="button"
@@ -1032,6 +1379,68 @@ const canRollback = computed(() =>
   background: var(--warn-50);
   color: var(--warn-500);
 }
+
+/* Regenerate is the only "primary action" in the toolbar —
+ * the other buttons are icon-only utilities. To mark it as
+ * the affordance the user is most likely to want next, it
+ * gets a brand-coloured surface in the idle state. The
+ * width: auto / padding: 0 8px / gap: 4px makes the pill
+ * snug around "重答" + icon, and the min-width: 26px keeps
+ * it from collapsing to nothing if the text is ever
+ * localised to a wider string. The "transition: width"
+ * line is what makes the pill shrink smoothly back to a
+ * 26×24 square when it goes busy. */
+.bubble-action-btn.bubble-action-regenerate {
+  width: auto;
+  min-width: 26px;
+  height: 24px;
+  padding: 0 8px;
+  gap: 4px;
+  background: var(--brand-50);
+  color: var(--brand-600);
+  border: 1px solid var(--brand-100);
+  font-size: 12px;
+  font-weight: 500;
+  transition: width var(--dur-fast) var(--ease-out, ease-out),
+              padding var(--dur-fast) var(--ease-out, ease-out),
+              background var(--dur-fast) var(--ease-out, ease-out),
+              color var(--dur-fast) var(--ease-out, ease-out),
+              border-color var(--dur-fast) var(--ease-out, ease-out),
+              transform var(--dur-fast) var(--ease-out, ease-out);
+}
+.bubble-action-btn.bubble-action-regenerate:hover {
+  background: var(--brand-100);
+  color: var(--brand-700);
+  border-color: var(--brand-200);
+}
+.bubble-action-btn.bubble-action-regenerate--busy {
+  /* Collapse to the same 26×24 square the other icon-only
+   * buttons use, but keep the surface transparent so the
+   * spinner blends in rather than competing with the
+   * streaming reply. */
+  width: 26px;
+  padding: 0;
+  background: transparent;
+  color: var(--text-tertiary);
+  border-color: transparent;
+  gap: 0;
+}
+.bubble-action-btn.bubble-action-regenerate--busy:hover {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.bubble-action-text {
+  line-height: 1;
+  /* Tiny slide+fade when the text reappears after a regen
+   * completes — matches the icon's own fade-in
+   * (bubble-action-icon-in) so the icon+text come back as
+   * a single unit rather than the text popping in late. */
+  animation: bubble-action-text-in 140ms var(--ease-out, ease-out);
+}
+@keyframes bubble-action-text-in {
+  from { opacity: 0; transform: translateX(-2px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
 /* Press pulse for fork: a tiny scale
  * bump that re-triggers on every :key bump from the
  * pulseKey ref. CSS animations don't restart on the
@@ -1084,6 +1493,22 @@ const canRollback = computed(() =>
 @keyframes bubble-action-icon-in {
   from { opacity: 0; transform: scale(0.7); }
   to   { opacity: 1; transform: scale(1.0); }
+}
+
+/* Regenerate's busy state spins the Loader2 icon. The
+ * bare `.spin` class that the previous code referenced
+ * was only defined in ThinkingBlock.vue's scoped CSS,
+ * so it silently did nothing here. Defining the modifier
+ * locally keeps the regenerate spinner self-contained
+ * — the keyframe name is also namespaced so we don't
+ * conflict with the (also-scoped) thinking-spin
+ * definition in ThinkingBlock.vue. */
+.bubble-action-icon--spin {
+  animation: bubble-action-icon-spin 1.1s linear infinite;
+}
+@keyframes bubble-action-icon-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
 
 /* --- Attachments, code blocks, vision-warn ---------------------- */
@@ -1192,6 +1617,121 @@ const canRollback = computed(() =>
 .vision-warn .warn-text { color: var(--text-primary); font-weight: 500; }
 .vision-warn .warn-hint { color: var(--text-tertiary); font-size: 11px; }
 
+/* --- P1-4 regen-history UI: 上一版回答 chip + reply pager ----- */
+
+/* The chip sits at the very top of the bubble body
+ * (above the assistant header's normal flow? No — below
+ * the header, above the parts). For an archived
+ * (is_archived=true) row the chip is the user's anchor
+ * to "this isn't the latest answer". Two tokens:
+ * icon + label, deliberately tight so it doesn't
+ * compete with the bubble body for visual weight. The
+ * user-message preview lives in the pager (not the
+ * chip) so the chip itself never crowds long user
+ * content. */
+.bubble-archived-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+  padding: 2px 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  user-select: none;
+  align-self: flex-start;
+}
+.bubble-archived-label {
+  color: var(--text-secondary);
+  font-weight: 500;
+  letter-spacing: 0.2px;
+}
+
+/* The reply pager: ◀ N/M · "preview" ▶ pill. Brand-tinted
+ * to match the rest of the assistant's color story. The
+ * user-message preview is inlined so the user can
+ * identify the sibling set at a glance (the chip
+ * doesn't carry the preview to keep it small). ◀/▶
+ * are 16×16 round buttons; the position text uses
+ * tabular-nums so the width doesn't jitter between
+ * single- and double-digit positions. */
+.bubble-reply-pager {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 6px;
+  padding: 2px 4px;
+  background: var(--brand-50);
+  border: 1px solid var(--brand-100);
+  border-radius: 10px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--brand-700);
+  user-select: none;
+  align-self: flex-start;
+  max-width: 100%;
+  /* P1-4 lazy-load: a tiny slide-in when the pager first
+   * mounts so the user notices it appeared (most
+   * bubbles never had a pager before). Subtle — 8px
+   * over 140ms — and uses the same --dur-fast easing
+   * as the rest of the toolbar. */
+  animation: bubble-reply-pager-in 140ms var(--ease-out, ease-out);
+}
+.bubble-reply-pager-btn {
+  border: none;
+  background: transparent;
+  color: inherit;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1;
+  transition: background var(--dur-fast) var(--ease-out, ease-out),
+              color var(--dur-fast) var(--ease-out, ease-out);
+}
+.bubble-reply-pager-btn:hover:not(:disabled) {
+  background: var(--brand-100);
+  color: var(--brand-800);
+}
+.bubble-reply-pager-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.bubble-reply-pager-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.bubble-reply-pager-pos {
+  min-width: 28px;
+  text-align: center;
+  font-weight: 500;
+  padding: 0 2px;
+}
+.bubble-reply-pager-context {
+  /* User-message preview in the pager. Truncated at
+   * 12 chars by the truncatedPreview computed; the
+   * title attribute on the parent button (or a
+   * future tooltip) could surface the full text. */
+  color: var(--brand-600);
+  font-style: italic;
+  margin: 0 4px 0 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+@keyframes bubble-reply-pager-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 /* --- Streaming + meta -------------------------------------------- */
 .msg.streaming .bubble { animation: pulse 1.5s infinite; }
 
@@ -1221,6 +1761,45 @@ const canRollback = computed(() =>
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* P0-3 auto-continue: highlight the status line so the
+ * user notices that the agent re-prompted itself rather
+ * than the LLM actually finishing. Triggers when the
+ * line contains "自动续 LLM" (the message we emit from
+ * agent.go ChatWithTools when the todo-incomplete
+ * guard fires). */
+.status-line-auto-continue {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* P3-3: trace id chip. Small monospace button under the
+   message body so the user can copy the correlation id
+   when reporting an error. Subtle visual treatment —
+   not an alert, not a warning — so successful turns
+   don't carry any UI debt. */
+.trace-id-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text-2);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.trace-id-chip:hover {
+  background: var(--bg-3, var(--bg-2));
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.trace-id-text {
+  letter-spacing: 0.02em;
 }
 </style>
 

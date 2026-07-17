@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/tool/dynamic"
 )
 
 // confirmTargetFor is the 2026-07 refactor of the tool-confirm
@@ -128,6 +129,25 @@ func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfi
 			PathClass:    classForPath(resolved, projectRoot),
 			RiskLevel:    "low",
 		}, true
+	default:
+		// P3-2: dynamic tools. The sandbox decision comes
+		// from the user's YAML `sandbox.exec` field, not
+		// from a regex match. We look up the spec by
+		// name; if it's not in the dynamic registry we
+		// fall through (ok=false) so the agent treats the
+		// tool as unconfirmed and runs the handler
+		// directly. The path is computed lazily — we don't
+		// have it for arbitrary dynamic tools that take
+		// non-path arguments, so the resolved-path /
+		// path-class fields stay empty.
+		if spec, ok := dynamic.LookupSpec(toolName); ok {
+			decision, reason, risk := decisionFromSandbox(spec.Sandbox.Exec, toolName)
+			return confirmTarget{
+				Decision:  decision,
+				Reason:    reason,
+				RiskLevel: risk,
+			}, true
+		}
 	}
 	// Tools the sandbox doesn't cover (question, todo, recall,
 	// task, web_search, web_fetch in this Phase 1 — web_fetch
@@ -212,4 +232,37 @@ func classForWorkDir(workDir, projectRoot string) string {
 		return classForPath(projectRoot, projectRoot)
 	}
 	return classForPath(workDir, projectRoot)
+}
+
+// decisionFromSandbox converts a P3-2 dynamic tool's
+// `sandbox.exec` field into a real SandboxDecision plus a
+// reason string and risk level. Used by the dynamic
+// branch of confirmTargetFor above.
+//
+//   - "allow"   → Allow (no confirm modal)
+//   - "deny"    → Block (the tool call is rejected with a
+//                 tool result; the user can see the
+//                 "blocked by sandbox policy" message)
+//   - "confirm" → Confirm (the existing modal opens)
+//   - anything else (defensive) → Confirm, fail-safe
+//
+// The risk level is "high" for exec-type tools (they can
+// run arbitrary shell), "medium" for http (network
+// exfiltration is possible but bounded by the YAML), and
+// "low" for echo (no side effect). Pass the tool name
+// (not the spec) so we can keep this helper pure — the
+// spec's Template.Type lives on the caller's stack frame.
+func decisionFromSandbox(sandboxExec, toolName string) (tool.SandboxDecision, string, string) {
+	reason := fmt.Sprintf("dynamic tool %q", toolName)
+	switch sandboxExec {
+	case "allow":
+		return tool.SandboxAllow, reason, "low"
+	case "deny":
+		return tool.SandboxBlock, reason + ": blocked by sandbox policy", "high"
+	case "confirm":
+		return tool.SandboxConfirm, reason, "medium"
+	}
+	// Unknown value (shouldn't happen — ParseSpec
+	// validates) → fail-safe to confirm.
+	return tool.SandboxConfirm, reason, "medium"
 }

@@ -16,6 +16,17 @@
  * components to consume them directly.
  * ========================================================================= */
 
+/* --- 0. highlight.js theme ----------------------------------------------
+ * MUST come before every other CSS rule (per the CSS @import spec) so
+ * the parser doesn't drop it with a vite:css warning. The theme is
+ * loaded as a side-effect rather than from main.ts to keep the order
+ * of CSS rules predictable: the design-token layer below defines the
+ * surface / text variables, this layer uses them, and our
+ * `.hljs` namespace overrides below tweak the GitHub-dark baseline
+ * (background: transparent + monospace font) for the P-Chat surface.
+ */
+@import 'highlight.js/styles/github-dark.css';
+
 /* --- 1. Inter Variable Font (locally bundled) -----------------------------
  * Single variable-axis woff2 covers weights 100-900 with full Latin +
  * Latin-Ext glyph coverage. CJK glyphs fall through to the system stack
@@ -343,3 +354,37 @@ html, body, #app {
 .cmd-tag.tag-def { background: var(--success-50); color: var(--success-500); }
 .cmd-tag.tag-prot { background: var(--surface-1); color: var(--text-secondary); }
 .cmd-tag.tag-vis { background: var(--brand-50); color: var(--brand-600); }
+
+/* =========================================================================
+ * P2-2 highlight.js theme overrides
+ * =========================================================================
+ * The actual @import for highlight.js's github-dark stylesheet
+ * is at the top of this file (per the CSS @import spec, it
+ * must precede all other rules — vite:css warns otherwise).
+ * The block below tweaks the GitHub-dark baseline to match
+ * the P-Chat dark surface: transparent background so the
+ * surrounding code block owns the visual frame, and a
+ * monospace font that defers to our design tokens.
+ *
+ * The .hljs class is what highlight.js stamps on every
+ * <code> element it processes, so all our scoped overrides
+ * live under that namespace.
+ */
+
+pre code.hljs {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
+/* Tighten line height inside highlighted code so wrapped
+ * lines sit close together — the default 1.5 makes short
+ * snippets look airy. */
+pre code.hljs .hljs-line,
+pre code.hljs {
+  line-height: 1.45;
+}
+/* Slight padding around the entire <pre> so the highlight
+ * background doesn't kiss the card border. */
+pre {
+  padding: 8px 10px;
+}

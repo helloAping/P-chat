@@ -5,6 +5,30 @@
 
 const BASE = '' // same origin; pchat-server serves both UI and API
 
+// mintTraceId returns a fresh P3-3 trace id (8-char hex with
+// the "T-" prefix) for outbound requests. The id flows as the
+// `X-Trace-Id` request header and is adopted by the server as
+// the correlation id for that turn. Crypto.getRandomValues is
+// widely supported in all browsers P-Chat targets (Chromium
+// 2015+, Firefox 21+, Safari 3.1+), so we don't need a
+// polyfill.
+function mintTraceId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(4)
+    crypto.getRandomValues(bytes)
+    let hex = ''
+    for (let i = 0; i < bytes.length; i++) {
+      hex += bytes[i].toString(16).padStart(2, '0')
+    }
+    return 'T-' + hex
+  }
+  // crypto.getRandomValues missing — should never happen in
+  // the supported browser set, but fall back to Math.random so
+  // the request still goes through (the id just won't be
+  // cryptographically strong).
+  return 'T-' + Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0')
+}
+
 // directBackendURL returns the pchat-server base URL for the
 // streaming endpoint. In the Wails desktop app the webview
 // normally talks to the server through the AssetServer proxy, but
@@ -72,6 +96,13 @@ export interface Session {
   reasoning_effort?: string
   vector_store?: string
   knowledge_base?: string
+  // auto_continue (P0-3): when true, the agent auto-re-prompts
+  // the LLM if it exits with no tool calls but the todo list
+  // still has pending / in_progress items. Default true. The
+  // server returns the resolved value (so a missing field on
+  // the wire reads back as `true` here). The /auto-continue
+  // slash command toggles this per session.
+  auto_continue?: boolean
 }
 
 export interface Attachment {
@@ -207,6 +238,15 @@ export interface Message {
   // ignored, even after the toast disappears. Only
   // meaningful on role==="user".
   visionUnsupported?: boolean
+  // traceId is the P3-3 end-to-end correlation id
+  // (e.g. "T-9f3c4a2b") for the assistant turn that
+  // produced this message. The chat store tags the
+  // trailing assistant message with the id when an error
+  // event arrives; the MessageBubble renders a
+  // "复制 trace id" button on the error part so the
+  // user can paste it into a support ticket. Only set
+  // on assistant messages that have seen an error event.
+  traceId?: string
   // Live status text during streaming (populated by
   // appendStreamEvent from phase events).
   _statusText?: string[]
@@ -215,6 +255,28 @@ export interface Message {
   // raw command output), 1=context. Carried through
   // rollback/undo so the value survives a round-trip.
   submit_to_llm?: number
+  // P1-4 regen history. RegenGroupID is the string form
+  // of the user message id that prompted this assistant
+  // reply — same value across every sibling in the
+  // regen group. Empty for non-assistant rows and for
+  // pre-migration-9 assistant rows that have never been
+  // regen'd. The frontend reads this to associate an
+  // archived reply with its parent user message (the
+  // "上一版回答" chip + the pager's user-message
+  // preview). For ListMessages responses (the main
+  // timeline), the value is always empty because
+  // archived siblings are SQL-filtered out; the
+  // /replies endpoint surfaces the full sibling set
+  // with the value populated.
+  regen_group_id?: string
+  // P1-4 visibility flag. False = active reply (default,
+  // the row that shows in the main timeline); true =
+  // an older regenerated sibling that lives in the
+  // same group but is hidden from the main timeline.
+  // The ◀ N/M ▶ pager reads this to compute the active
+  // index and to render archived siblings on demand.
+  // Always false on rows returned by ListMessages.
+  is_archived?: boolean
 }
 
 export interface SessionMeta {
@@ -326,7 +388,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string }>,
+  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -848,6 +910,19 @@ export interface InlineAttachment {
 
 export interface SendOptions {
   message: string
+  // client_msg_id is a client-generated integer assigned at
+  // send time. The frontend stamps it onto the local Message
+  // (msg.id) immediately and sends it to the backend, which
+  // uses it as the SQLite row id for this turn's user message.
+  // Because the id is set BEFORE the LLM call, rollback and
+  // regenerate both work even when the SSE `done` event never
+  // arrives (network error mid-stream, LLM 5xx, quota
+  // exhausted, etc.) — the user no longer sees "撤回失败：消息
+  // 尚未完成发送" because the row id is always known.
+  // Format: a 13-16 digit integer (ms-epoch × 1000 + random),
+  // guaranteed unique across the lifetime of the app and well
+  // outside the SQLite AUTOINCREMENT range.
+  client_msg_id?: number
   provider?: string
   model?: string
   style?: string
@@ -859,6 +934,14 @@ export interface SendOptions {
   attachments?: InlineAttachment[]
   signal?: AbortSignal
   onEvent: (ev: StreamEvent) => void
+  // P0-1: called when the SSE stream drops mid-turn so
+  // the chat store can trigger the snapshot recovery
+  // flow (see getSessionSnapshot). The store passes the
+  // last seen seq; the recovery flow calls the snapshot
+  // endpoint with that cursor and merges the returned
+  // parts into the trailing assistant message. NOT
+  // called on user-initiated aborts (signal.aborted).
+  onStreamDrop?: (info: { lastSeq: number; reason: string }) => void
   skill_context?: string
 }
 
@@ -964,6 +1047,24 @@ export interface StreamEvent {
   // last_message_id is the highest row id in this session
   // (typically the assistant reply just produced).
   last_message_id?: number
+  // seq is the per-stream monotonic counter (0, 1, 2, …) the
+  // server stamps on every chunk and surfaces as the standard
+  // SSE `id:` line. Stable for the lifetime of one stream; not
+  // stable across streams. Used for debugging (dev tools
+  // console) and as the cursor for P0-1 recovery. Sub-agent
+  // chunks forwarded into the parent stream may break the
+  // parent's monotonic sequence — the seq field is still set,
+  // but the gap is intentional.
+  seq?: number
+  // trace_id is the P3-3 end-to-end correlation id
+  // (e.g. "T-9f3c4a2b"). The server's traceIDMiddleware
+  // mints one per request (or adopts the client-supplied
+  // one) and the agent stamps it on every emitted chunk.
+  // The MessageBubble renders a "复制 trace id" button on
+  // error events so support can ask the user to paste it
+  // when reporting a bug — paired with the same id the
+  // server logs in server-debug.log.
+  trace_id?: string
 }
 
 export async function submitConfirmResponse(sessionId: string, approved: boolean): Promise<void> {
@@ -1025,6 +1126,14 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   const { EventsOn, EventsOff } = wailsRuntime
   const { StreamMessages, CancelStream } = wailsApp
 
+  // P3-3: mint the trace id client-side and inline it in the
+  // body so the Wails Go binding can extract it and forward
+  // as the X-Trace-Id header. The fetch path sets the header
+  // directly; this path has to round-trip through the body
+  // because the Wails binding doesn't accept arbitrary
+  // request headers.
+  const traceId = mintTraceId()
+
   const body = JSON.stringify({
     message: opts.message,
     provider: opts.provider,
@@ -1032,6 +1141,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
     style: opts.style,
     attachments: opts.attachments,
     skill_context: opts.skill_context || '',
+    trace_id: traceId,
   })
 
   const flush = () => new Promise<void>(r => setTimeout(r, 0))
@@ -1083,6 +1193,19 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
     offEvent()
     offEnd()
     if (opts.signal?.aborted) return
+    // P0-1: Wails path drop. The fetch-path's
+    // onStreamDrop fires inside streamMessagesViaFetch;
+    // here in the Wails path we fire it at the catch
+    // boundary. lastSeq is unknown (Wails doesn't
+    // surface the per-event seq in the binding args),
+    // so we pass -1; the recovery flow treats -1 as
+    // "no cursor" and re-fetches all assistant rows
+    // newer than the trailing user message.
+    if (opts.onStreamDrop) {
+      try {
+        opts.onStreamDrop({ lastSeq: -1, reason: e?.message || 'wails stream failed' })
+      } catch { /* ignore */ }
+    }
     throw new Error(`stream: ${e?.message || e}`)
   }
   offEvent()
@@ -1108,23 +1231,51 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
   const url = `${base}/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`
   const body = JSON.stringify({
     message: opts.message,
+    // client_msg_id is the integer the frontend minted at
+    // send time and stamped onto the local Message as
+    // `msg.id`. The backend uses it as the SQLite row id
+    // for this turn's user message, so rollback/regen
+    // always have a valid id to target — even when the
+    // SSE `done` event never lands (LLM error, network
+    // drop, quota exhausted, etc.).
+    client_msg_id: opts.client_msg_id,
     provider: opts.provider,
     model: opts.model,
     style: opts.style,
     attachments: opts.attachments,
     skill_context: opts.skill_context || '',
   })
+  // P3-3: mint a trace id on the client so the server adopts
+  // it as the correlation id for this turn (rather than
+  // generating its own). The id flows in the X-Trace-Id
+  // request header and is echoed on the response and on
+  // every SSE event's `trace_id` field — the MessageBubble
+  // surfaces it on error bubbles so support can ask the
+  // user to paste it.
+  const traceId = mintTraceId()
 
   const resp = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
+      'X-Trace-Id': traceId,
     },
     body,
     signal: opts.signal,
   })
   if (!resp.ok || !resp.body) {
+    // Network-level failure (no body, no body stream).
+    // P0-1: surface as a stream drop so the chat store
+    // can call the snapshot endpoint to recover whatever
+    // assistant content already landed. Skip when the
+    // user-initiated abort fired (signal.aborted) — the
+    // drop callback is reserved for unexpected failures.
+    if (!opts.signal?.aborted && opts.onStreamDrop) {
+      try {
+        opts.onStreamDrop({ lastSeq: -1, reason: `HTTP ${resp.status}` })
+      } catch { /* drop callback must not break the throw chain */ }
+    }
     throw new Error(`stream: HTTP ${resp.status}: ${resp.statusText}`)
   }
 
@@ -1132,25 +1283,55 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
   const decoder = new TextDecoder('utf-8')
   let buf = ''
   let dataBuf = ''
+  let lastSeq = -1
   let done = false
 
   while (!done) {
-    const r = await reader.read()
+    let r: ReadableStreamReadResult<Uint8Array>
+    try {
+      r = await reader.read()
+    } catch (e: any) {
+      // P0-1: the body stream died mid-flight (server
+      // crashed, network blip, reverse-proxy timeout).
+      // Surface as a drop event so the chat store can
+      // call the snapshot endpoint. Skip on user abort
+      // (the stop button sets signal.aborted before
+      // tearing the request down).
+      if (!opts.signal?.aborted && opts.onStreamDrop) {
+        try {
+          opts.onStreamDrop({ lastSeq, reason: e?.message || 'read failed' })
+        } catch { /* drop callback must not break the throw chain */ }
+      }
+      throw new Error(`stream: ${e?.message || e}`)
+    }
     done = r.done
     if (r.value) {
       buf += decoder.decode(r.value, { stream: true })
     }
-    // Drain complete `data: ...\n\n` blocks from the buffer.
+    // Drain complete `data: ...\nid: N\n\n` blocks from the buffer.
+    // The server emits two-line frames (data + id) per P3-1;
+    // `id:` is the standard SSE event ID we parse into ev.seq.
     let nl: number
     while ((nl = buf.indexOf('\n\n')) >= 0) {
       const block = buf.slice(0, nl)
       buf = buf.slice(nl + 2)
-      // Parse the block — gather every `data: …` line.
+      // Parse the block — gather every `data: …` line into the
+      // payload buffer, and remember the most recent `id: N` line
+      // (server emits at most one per frame).
       dataBuf = ''
+      let frameSeq: number | undefined
       for (const line of block.split('\n')) {
         if (line.startsWith('data:')) {
           if (dataBuf.length > 0) dataBuf += '\n'
           dataBuf += line.slice(5).trimStart()
+        } else if (line.startsWith('id:')) {
+          // Standard SSE event ID line. Trim and parse; tolerate
+          // missing / non-numeric gracefully (P3-1 server always
+          // sends a number, but a legacy / proxy that strips the
+          // `id:` line must not break the parser).
+          const raw = line.slice(3).trim()
+          const n = Number(raw)
+          if (raw && Number.isFinite(n)) frameSeq = n
         }
       }
       const data = dataBuf.trim()
@@ -1159,6 +1340,18 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
       try { ev = JSON.parse(data) as StreamEvent } catch {
         console.warn('SSE parse error', 'raw:', data.slice(0, 200))
         continue
+      }
+      // Fall back to the frame's id-line when the payload's
+      // seq field is missing (defensive — server always sets
+      // both). Cross-check monotonicity in dev mode so a server
+      // regression that re-uses a seq is loud, not silent.
+      if (frameSeq !== undefined) ev.seq = frameSeq
+      if (import.meta.env.DEV && typeof ev.seq === 'number') {
+        if (ev.seq <= lastSeq) {
+          console.warn(`[stream] non-monotonic seq: prev=${lastSeq} now=${ev.seq} type=${ev.type}`)
+        }
+        lastSeq = ev.seq
+        console.debug(`[stream] seq=${ev.seq} type=${ev.type} ${ev.sub_agent ? `sub=${ev.sub_agent_task ?? ''}` : ''}`)
       }
       try {
         opts.onEvent(ev)
@@ -1186,6 +1379,270 @@ export async function streamMessagesRetry(sessionId: string, opts: SendOptions):
     }
   }
 }
+
+// ---- Knowledge API ----
+
+// ---- P0-1 recovery ----
+
+// SnapshotRecovery is the wire shape of the
+// GET /sessions/:id/snapshot endpoint used by the
+// frontend after a dropped SSE stream. Returns the
+// delta of assistant messages with seq > after_seq,
+// oldest first, plus a `next_seq` cursor the client
+// can use for follow-up calls. See
+// docs/plans/round2-stream-and-render-plan.md §2 P0-1.
+export interface SnapshotRecovery {
+  messages: Message[]
+  next_seq: number
+}
+
+export const getSessionSnapshot = (
+  sessionId: string,
+  afterSeq: number,
+): Promise<SnapshotRecovery> =>
+  jsonFetch<SnapshotRecovery>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/snapshot?after_seq=${afterSeq}`,
+  )
+
+// ---- P1-3 regenerate ----
+
+// streamRegenerate is the P1-3 entry point. Posts to
+// /api/v1/sessions/:id/regenerate with the
+// user_message_id, then drives opts.onEvent from the
+// SSE response. The server physically deletes every
+// message with id > user_message_id in the
+// conversation, then re-runs the agent loop. Same
+// shape as streamMessages; we duplicate the SSE
+// parsing because the URL is different. The two
+// functions are kept in sync by hand (small enough
+// surface to be manageable).
+//
+// The caller is responsible for clearing the trailing
+// assistant message from the local state BEFORE calling
+// this — the new server-side assistant will be streamed
+// in live, and a stale local bubble would conflict.
+export async function streamRegenerate(
+  sessionId: string,
+  userMessageId: number,
+  opts: Omit<SendOptions, 'message'>,
+): Promise<void> {
+  const base = directBackendURL()
+  const url = `${base}/api/v1/sessions/${encodeURIComponent(sessionId)}/regenerate`
+  const body = JSON.stringify({ user_message_id: userMessageId })
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body,
+    signal: opts.signal,
+  })
+  if (!resp.ok || !resp.body) {
+    throw new Error(`regenerate: HTTP ${resp.status}: ${resp.statusText}`)
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buf = ''
+  let dataBuf = ''
+  let lastSeq = -1
+  let done = false
+
+  while (!done) {
+    let r: ReadableStreamReadResult<Uint8Array>
+    try { r = await reader.read() }
+    catch (e: any) {
+      if (!opts.signal?.aborted && opts.onStreamDrop) {
+        try { opts.onStreamDrop({ lastSeq, reason: e?.message || 'read failed' }) } catch { /* */ }
+      }
+      throw new Error(`regenerate stream: ${e?.message || e}`)
+    }
+    done = r.done
+    if (r.value) buf += decoder.decode(r.value, { stream: true })
+
+    let nl: number
+    while ((nl = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, nl)
+      buf = buf.slice(nl + 2)
+      dataBuf = ''
+      let frameSeq: number | undefined
+      for (const line of block.split('\n')) {
+        if (line.startsWith('data:')) {
+          if (dataBuf.length > 0) dataBuf += '\n'
+          dataBuf += line.slice(5).trimStart()
+        } else if (line.startsWith('id:')) {
+          const raw = line.slice(3).trim()
+          const n = Number(raw)
+          if (raw && Number.isFinite(n)) frameSeq = n
+        }
+      }
+      const data = dataBuf.trim()
+      if (!data || data === '[DONE]') continue
+      let ev: StreamEvent
+      try { ev = JSON.parse(data) as StreamEvent } catch {
+        console.warn('regenerate SSE parse error', 'raw:', data.slice(0, 200))
+        continue
+      }
+      if (frameSeq !== undefined) ev.seq = frameSeq
+      if (import.meta.env.DEV && typeof ev.seq === 'number') {
+        if (ev.seq <= lastSeq) console.warn(`[regen] non-monotonic seq: prev=${lastSeq} now=${ev.seq}`)
+        lastSeq = ev.seq
+      }
+      try { opts.onEvent(ev) } catch (inner) {
+        console.warn('[regen] event handler threw, continuing:', inner)
+      }
+    }
+  }
+}
+
+// ---- P1-4 regen history ----
+
+// UserMessageSummary is the wire shape of the parent
+// user message carried in the RepliesResponse. The
+// frontend renders the "上一版回答" chip and the
+// pager's user-message preview directly from this
+// payload — no second round-trip needed to look up
+// the user message.
+//
+// content_preview is the first 80 chars of the user
+// content (server-truncated). The preview is what the
+// pager shows: `◀ 2/3 · "请帮我..." ▶`.
+// content is the full text — only used in the rare
+// "open in side panel" view; not rendered inline.
+export interface UserMessageSummary {
+  id: number
+  role: 'user' | 'system'
+  content: string
+  content_preview: string
+  created_at: number
+}
+
+// RepliesResponse is the body of
+// GET /api/v1/sessions/:id/messages/:user_msg_id/replies.
+// Returns the full regen group (active + archived) plus
+// the user-message summary the UI needs to render the
+// pager / chip without a second round-trip.
+//
+// active_reply_id is 0 when no row in the group is
+// active (transient state, e.g. the brief window
+// between ArchiveSiblings and the agent's new insert
+// during a regen). The frontend should fall back to
+// "no pager" in that case.
+export interface RepliesResponse {
+  user_message: UserMessageSummary
+  replies: Message[]
+  active_reply_id: number
+}
+
+// listReplies fetches the full regen group for a given
+// user message id. The store calls this on demand the
+// first time the user hovers a paginated bubble (so
+// most bubbles never pay the cost) and refreshes the
+// cache when a regen completes (the new sibling is the
+// active row and the previous active is now archived).
+//
+// Errors:
+//   - 404: session or user message not found
+//   - 200 + replies: []  when the user message has no
+//     regen history (legacy single-shot row). The
+//     frontend treats this as "no pager" — the
+//     bubble stays in the single-reply shape.
+export async function listReplies(
+  sessionId: string,
+  userMsgId: number,
+): Promise<RepliesResponse> {
+  return jsonFetch<RepliesResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${userMsgId}/replies`,
+  )
+}
+
+// activateReply makes replyId the active reply in the
+// regen group rooted at userMsgId. The store calls
+// this when the user clicks ◀/▶ on the bubble's pager
+// to view a different historical reply.
+//
+// Errors:
+//   - 400: reply_id / user_message_id invalid, or the
+//     reply isn't in the user message's regen group
+//     (server response includes a descriptive error
+//     string the frontend surfaces in a toast).
+//   - 404: session / reply / user message not found
+export async function activateReply(
+  sessionId: string,
+  userMsgId: number,
+  replyId: number,
+): Promise<RepliesResponse> {
+  return jsonFetch<RepliesResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${replyId}/activate`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ user_message_id: userMsgId }),
+    },
+  )
+}
+
+// ---- P3-2 dynamic tools ----
+
+// Tool is one row of the GET /api/v1/tools response. The
+// `dynamic` flag distinguishes user-defined tools
+// (loaded from ~/.p-chat/tools/*.yaml) from the
+// built-ins; `source` is the YAML path so the
+// ToolListDrawer can show a "view source" link.
+export interface Tool {
+  name: string
+  description: string
+  parameters?: any
+  dynamic: boolean
+  source?: string
+}
+
+// listTools fetches the current tool registry. Used by
+// the ToolListDrawer; the chat store calls it on mount
+// and after every agent Reload (which the server fires
+// when a dynamic YAML is added / changed / deleted).
+export async function listTools(): Promise<Tool[]> {
+  const res = await jsonFetch<{ tools: Tool[] }>('/api/v1/tools', { method: 'GET' })
+  return res?.tools || []
+}
+
+// ---- P2-3 context inspector ----
+
+// ContextMessage is one row of the inspector's
+// per-message breakdown. Distinct from `Message` (the
+// full chat row) because the inspector only needs a
+// preview + token count + role tag — no parts[], no
+// attachments, no metadata. See
+// docs/plans/round3-syntax-and-branching-plan.md §4.
+export interface ContextMessage {
+  role: 'user' | 'assistant' | 'tool' | 'system' | string
+  tokens: number
+  preview: string
+  is_tool_result: boolean
+  is_compressed?: boolean
+}
+
+// ContextInspector is the wire shape of
+// GET /api/v1/sessions/:id/context. Powers the
+// "上下文" drawer in the chat UI. Token counts are
+// estimates (the wire says so implicitly — the
+// numbers are not from a real LLM tokenizer).
+export interface ContextInspector {
+  session_id: string
+  provider: string
+  model: string
+  context_window: number
+  estimated_tokens: number
+  usable_tokens: number
+  utilization_pct: number
+  compressed_summary?: string
+  messages: ContextMessage[]
+}
+
+export const getSessionContext = (
+  sessionId: string,
+): Promise<ContextInspector> =>
+  jsonFetch<ContextInspector>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/context`,
+  )
 
 // ---- Knowledge API ----
 

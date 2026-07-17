@@ -496,7 +496,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 
 	kc := h.getCfg().Knowledge
 	if !kc.Enabled || len(kc.Bases) == 0 {
-		c.JSON(http.StatusOK, gin.H{"query": req.Query, "results": []interface{}{}})
+		c.JSON(http.StatusOK, gin.H{"query": req.Query, "results": []any{}})
 		return
 	}
 

@@ -121,7 +121,7 @@ func (h *BridgeHub) Unregister(id string) {
 
 // SendCommand routes a command to the specified browser. If browserID
 // is empty, the first available client is used (default browser).
-func (h *BridgeHub) SendCommand(ctx context.Context, browserID string, method string, params interface{}, timeout time.Duration) (*Response, error) {
+func (h *BridgeHub) SendCommand(ctx context.Context, browserID string, method string, params any, timeout time.Duration) (*Response, error) {
 	c, err := h.getClient(browserID)
 	if err != nil {
 		return nil, err

@@ -169,11 +169,22 @@ type MessagePart =
               → tool handler → subagent           (subagent/*)
           → chunkToEvent(ev) → type mapping      (server/handler.go)
           → SSE: "data: {...}\n\n"               (server/handler.go)
+      → 主循环出口 #1（len(toolCalls)==0）：
+          → P0-3 auto-continue 守卫：检查 todo 列表
+            → 有 pending/in_progress 项 + AutoContinue=true + count<3
+              → 注入 user 风格"未完成"提示 → continue 重入
+              → 发 SSE Phase="auto-continue" Step="todo-incomplete"
+            → 否则正常 persistAssistant + Done: true
       → 前端 appendStreamEvent()                  (frontend/stores/chat.ts)
         → 路由到 parts (text/thinking/tool/sub_agent)
+        → status bar 显示 "⚠ 自动续 LLM (第 N/M 次)"  (auto-continue 阶段)
         → Vue 响应式 → DOM 渲染
     → memory.Store 持久化                          (memory/*)
 ```
+
+#### P0-3 自动续 LLM (2026-07-15)
+
+新加的 `Phase="auto-continue"` 阶段表示 agent 在 LLM 自然退出但 todo 未完成时自动注入续提示并重入循环。详见 [`.agents/docs/agent.md`](docs/agent.md) §1 退出条件表。
 
 ### 1.3 SSE 协议
 
@@ -184,11 +195,14 @@ Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（
 | `content` | LLM 文本 delta | `content` |
 | `thinking` | reasoning delta | `thinking` |
 | `tool` | 工具调用生命周期 | `tool_name`, `tool_status`, `tool_result`, `tool_args`, `tool_elapsed` |
-| `phase` | sub-agent lifecycle / system status | `phase`, `sub_agent_status` |
+| `phase` | sub-agent lifecycle / system status / **P0-3 auto-continue** | `phase`, `sub_agent_status` |
 | `error` | LLM/transport error | `error`, `error_kind` |
 | `done` | 流结束 | `tokens_in`, `tokens_out`, `elapsed` |
 | `question` | LLM 向用户提问 | `question_json` |
 | `tool_confirm` | 沙箱确认请求 | `tool_confirm_json` |
+| `session_status` | 回合生命周期 | `session_status` (`busy` / `idle` / `retry`) |
+
+P0-3 auto-continue 通过 `phase` 事件发出，phase 字符串为 `"auto-continue"`、step 字符串为 `"todo-incomplete"`、`message` 字段包含 `自动续 LLM (第 N/3 次)`。前端 `MessageBubble.vue` 的 `.status-line-auto-continue` class 会高亮该行。
 
 ### 1.4 子 agent 系统
 
@@ -311,18 +325,22 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 
 | 想改 | 看 |
 | --- | --- |
-| ReAct 主循环 | `internal/agent/agent.go:900-1510` `ChatWithTools()` |
-| 工具派发 + forwarder | `internal/agent/agent.go:1150-1471` |
+| ReAct 主循环 | `internal/agent/agent.go` `ChatWithTools()` |
+| 工具派发 + forwarder | `internal/agent/agent.go` 工具派发段 |
 | parts 累加器 | `internal/agent/parts.go` |
-| 流式事件分发 | `frontend/src/stores/chat.ts:828-1103` `appendStreamEvent()` |
-| 后端 SSE 事件映射 | `internal/server/handler.go:1495-1613` `chunkToEvent()` |
-| 子 agent runner | `internal/subagent/subagent.go:511-832` `Run()` |
-| 子 agent 事件转发 | `internal/subagent/subagent.go:837-842` `tryForward()` |
-| OpenAI SSE parser | `internal/llm/client.go:235-440` |
-| Anthropic SSE parser | `internal/llm/anthropic.go:130-260` |
-| 系统 prompt 拼装 | `internal/agent/agent.go:820-876` |
+| 流式事件分发 | `frontend/src/stores/chat.ts` `appendStreamEvent()` |
+| 后端 SSE 事件映射 | `internal/server/handler.go` `chunkToEvent()` |
+| 子 agent runner | `internal/subagent/subagent.go` `Run()` |
+| 子 agent 事件转发 | `internal/subagent/subagent.go` `tryForward()` |
+| OpenAI SSE parser | `internal/llm/client.go` |
+| Anthropic SSE parser | `internal/llm/anthropic.go` + `anthropic_adapter.go` |
+| 系统 prompt 拼装 | `internal/agent/agent.go` `buildStaticSystemPrompt()` + 9 个 helper |
 | 配置加载 | `internal/config/config.go` |
 | 数据库 CRUD | `internal/memory/memory.go` |
+| **P0-3 auto-continue 守卫** | `internal/agent/agent.go` `sessionPendingTodos()` + `buildAutoContinuePrompt()` + ChatRequest.AutoContinue |
+| todo 系统 | `internal/tool/todo.go` |
+| CLI `/auto-continue` 命令 | `internal/cli/commands.go` `cmdAutoContinue()` |
+| per-session meta 持久化 | `internal/server/handler.go` `sessionMeta` / `sessionMetaBlob` / `UpdateSessionMeta` |
 
 ---
 
