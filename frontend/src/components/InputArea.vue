@@ -237,27 +237,90 @@ async function onFiles(files: FileList | null) {
   if (fileInput.value) fileInput.value.value = ''
 }
 
-function onPaste(e: ClipboardEvent) {
-  const items = e.clipboardData?.items
-  if (!items) return
-  for (const it of Array.from(items)) {
-    if (it.kind === 'file' && it.type.startsWith('image/')) {
-      const f = it.getAsFile()
-      if (f) {
-        e.preventDefault()
-        const name = f.name && f.name !== 'image.png' ? f.name : `clipboard-${Date.now()}.png`
-        // DOM lib declares `File` as a 3-arg constructor
-        // (bits, name, options); we need the 3-arg form so the
-        // mime type survives the rename (downstream code in
-        // addAttachment() reads `file.type` to guess the kind).
-        // vue-tsc's .vue context doesn't always resolve the
-        // construct signature, so cast to any to keep the
-        // runtime behavior identical to the typed call.
-        const renamed = new (File as any)([f], name, { type: f.type }) as File
-        onFiles({ 0: renamed, length: 1, item: () => renamed } as unknown as FileList)
-      }
-    }
+// Build a friendly name for a clipboard file item. Chromium
+// hands image screenshots back as File{name: 'image.png'} —
+// a generic placeholder that would collide if the user
+// pastes twice in a row. Real files copied from Explorer
+// keep their original name. The rare empty-name case (e.g.
+// files dragged into a copy-paste flow that loses the name)
+// gets a generic timestamp + extension so downstream code
+// can still infer a kind via guessKind(file.type, ...).
+//
+// The 3-arg File constructor (bits, name, options) lets us
+// preserve the mime type through the rename. The naive
+// `new File(...)` shadows against the locally-imported
+// `File` icon component (see the `./icons` import at the
+// top of this file), which is a Vue component, not the DOM
+// constructor — so it throws "File is not a constructor"
+// at runtime. We grab the DOM constructor off window
+// explicitly to dodge the shadow. (This bug was present in
+// the original onPaste too — every screenshot paste hit it,
+// which is why the "添加附件(支持拖拽、剪贴板粘贴)"
+// promise on the paperclip button was never actually
+// honoured before this fix.)
+function renameClipboardFile(f: File): File {
+  let name = f.name
+  if (!name || name === 'image.png') {
+    const ts = Date.now()
+    const ext = f.type.split('/')[1] || ''
+    name = name === 'image.png'
+      ? `clipboard-${ts}.png`
+      : (ext ? `clipboard-${ts}.${ext}` : `clipboard-${ts}`)
   }
+  const GlobalFile = (typeof window !== 'undefined' ? window.File : globalThis.File) as any
+  return new GlobalFile([f], name, { type: f.type }) as File
+}
+
+function onPaste(e: ClipboardEvent) {
+  const cd = e.clipboardData
+  if (!cd) return
+  // Collect every file item from the clipboard, not just
+  // images. The previous version filtered on
+  // `type.startsWith('image/')`, which meant PDFs/text/
+  // audio copied from Explorer either got their file path
+  // dropped into the textarea (Chrome's default for a
+  // file paste on a non-input target) or were silently
+  // dropped — neither matches the "添加附件(支持拖拽、
+  // 剪贴板粘贴)" promise on the paperclip button.
+  //
+  // Text items (`kind === 'string'`) are intentionally
+  // skipped so the default text-paste path still feeds
+  // the textarea.
+  const files: File[] = []
+  for (let i = 0; i < cd.items.length; i++) {
+    const it = cd.items[i]
+    if (it.kind !== 'file') continue
+    const f = it.getAsFile()
+    if (!f) continue
+    files.push(renameClipboardFile(f))
+  }
+  if (files.length === 0) return
+  e.preventDefault()
+  // addAttachment() pushes the placeholder to the store
+  // synchronously, so the chip below the textarea appears
+  // the moment this function returns — the upload +
+  // readAsDataURL work happens in the background. Going
+  // through addAttachment directly (instead of building a
+  // synthetic FileList for onFiles()) keeps the call chain
+  // one frame shorter, which matters because the chip's
+  // appearance is the user's primary feedback that "the
+  // paste worked". Also avoids the synthetic FileList +
+  // Array.from round-trip — that path is fine, but the
+  // direct call is more obviously correct.
+  for (const f of files) {
+    addAttachment(f).catch((err: any) => {
+      message.error(`上传失败: ${err.message}`)
+    })
+  }
+  // Toast the user. The chip below the textarea is the
+  // primary indicator, but a screenshot paste is easy to
+  // miss if the user's eye is on the textarea. The toast
+  // names the first two files and rolls the rest up into
+  // "等 N 个" so a 10-file paste doesn't render a 500-char
+  // message.
+  const preview = files.slice(0, 2).map(f => f.name).join(', ')
+  const more = files.length > 2 ? ` 等 ${files.length} 个` : ''
+  message.success(`已添加附件: ${preview}${more}`, { duration: 1800 })
 }
 
 // --- Slash command palette ---
@@ -687,10 +750,27 @@ async function send() {
     }
   }
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
-  // Push the user message WITH attachments so the bubble
-  // renders correctly without waiting for the next history
-  // fetch.
-  state.sessionMessages[id].push({ role: 'user', content: text, attachments: bubbleAttachments.length ? bubbleAttachments : undefined })
+  // Mint a row id for this user message at send time so
+  // rollback and regenerate always have a valid `msg.id`
+  // to target — even when the SSE `done` event never
+  // arrives (LLM error, network drop, quota exhausted).
+  // Format: Date.now() × 1000 + a 0..999 random suffix.
+  // The combined 13-16 digit integer sits well outside
+  // the SQLite AUTOINCREMENT range (1, 2, 3, …), so the
+  // backend can insert it as the explicit row id without
+  // colliding with anything autoincrement produces for
+  // assistant messages later in the same session.
+  const clientMsgId = Date.now() * 1000 + Math.floor(Math.random() * 1000)
+  // Push the user message WITH id + attachments so the
+  // bubble renders correctly without waiting for the
+  // next history fetch, and so rollback can target the
+  // exact row from the moment the message is sent.
+  state.sessionMessages[id].push({
+    id: clientMsgId,
+    role: 'user',
+    content: text,
+    attachments: bubbleAttachments.length ? bubbleAttachments : undefined,
+  })
   // Convert inline base64 data: URLs on user-sent image
   // attachments into blob: URLs. The base64 payload has
   // already been shipped to the server via the
@@ -736,6 +816,14 @@ async function send() {
   try {
     await api.streamMessagesRetry(id, {
       message: text,
+      // The integer id minted above (and stamped on the
+      // local Message as `msg.id`) is shipped to the
+      // backend as `client_msg_id` so the server inserts
+      // this turn's user row with our id, not a fresh
+      // autoincrement. That keeps the local msg.id and
+      // the SQLite row id in lockstep, so rollback and
+      // regenerate work the instant the user clicks them.
+      client_msg_id: clientMsgId,
       provider: meta.provider,
       model: meta.model,
       style: meta.style,
@@ -977,13 +1065,13 @@ onMounted(() => {
     </div>
 
     <!-- Attachments live INSIDE the same input-wrap as the
-         textarea. They wrap to multiple rows as the dialog
-         width changes; we don't use a horizontal scrollbar
-         because wrap gives a more predictable layout and
-         removes the "list floating above the dialog with a big
-         gap" the user reported. The wrap inherits the wrap's
-         padding so the chips look "stitched on" to the dialog
-         rather than free-floating. -->
+         textarea but BELOW the input-row, so a pasted image
+         appears right under the user's cursor rather than
+         being pushed up above the textarea (where it can
+         scroll out of view on a short viewport). The dashed
+         top border on the strip acts as a visual separator
+         so the two regions read as "type → attach → controls"
+         instead of one undifferentiated blob. -->
     <div
       class="input-wrap"
       :class="{
@@ -994,24 +1082,6 @@ onMounted(() => {
       @dragleave="onDragLeave"
       @drop="onDrop"
     >
-      <div v-if="currentAttachments.length > 0" class="attach-strip">
-        <div
-          v-for="(a, i) in currentAttachments"
-          :key="i"
-          class="attach-chip"
-          :class="{ uploading: a._uploading, error: a._error }"
-        >
-          <div class="thumb">
-            <img v-if="a.kind === 'image'" :src="a._previewURL" :alt="a.name" />
-            <video v-else-if="a.kind === 'video'" :src="a._previewURL" muted preload="metadata" />
-            <Volume2 v-else-if="a.kind === 'audio'" :size="14" />
-            <FileText v-else-if="a.kind === 'text'" :size="14" />
-            <File v-else :size="14" />
-          </div>
-          <span class="name" :title="a.name">{{ a.name }}</span>
-          <button class="rm" @click="removeAttachment(i)" title="移除" aria-label="移除附件">×</button>
-        </div>
-      </div>
       <div class="input-row">
         <button class="attach-icon-btn" @click="onPickFiles" title="添加附件(支持拖拽、剪贴板粘贴)" aria-label="添加附件">
           <Paperclip :size="18" />
@@ -1097,6 +1167,24 @@ onMounted(() => {
         >
           <Square :size="14" fill="currentColor" />
         </button>
+      </div>
+      <div v-if="currentAttachments.length > 0" class="attach-strip">
+        <div
+          v-for="(a, i) in currentAttachments"
+          :key="i"
+          class="attach-chip"
+          :class="{ uploading: a._uploading, error: a._error }"
+        >
+          <div class="thumb">
+            <img v-if="a.kind === 'image'" :src="a._previewURL" :alt="a.name" />
+            <video v-else-if="a.kind === 'video'" :src="a._previewURL" muted preload="metadata" />
+            <Volume2 v-else-if="a.kind === 'audio'" :size="18" />
+            <FileText v-else-if="a.kind === 'text'" :size="18" />
+            <File v-else :size="18" />
+          </div>
+          <span class="name" :title="a.name">{{ a.name }}</span>
+          <button class="rm" @click="removeAttachment(i)" title="移除" aria-label="移除附件">×</button>
+        </div>
       </div>
     </div>
     <input
@@ -1304,52 +1392,78 @@ onMounted(() => {
  * textarea so the chips appear "stitched" to the dialog with
  * no visible gap. Chips wrap to multiple rows as the dialog
  * width changes; the parent container grows to fit. */
+/* The strip is rendered BELOW the input-row (see the
+ * template comment), so its top edge meets the
+ * textarea/button row instead of the input-wrap's top
+ * border. The dashed top border is the visual separator
+ * that hints at the parent/child relationship: type →
+ * attach → controls reads as three regions, not one
+ * undifferentiated blob. Larger max-height than the old
+ * "above the input" version because the strip is no
+ * longer competing with the textarea for vertical space. */
 .attach-strip {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  /* Small padding so the chips don't touch the box's top
-   * border. The bottom padding is provided by the textarea
-   * margin so the strip feels joined to it. */
-  padding: 6px 0 4px 0;
-  /* Hard cap on the vertical area the chips can occupy. When
-   * this is exceeded the wrap scrolls rather than pushing the
-   * whole input area out of the viewport. */
-  max-height: 96px;
+  gap: 6px;
+  padding: 6px 0 2px 0;
+  border-top: 1px dashed var(--border-subtle);
+  margin-top: 4px;
+  max-height: 160px;
   overflow-y: auto;
   overflow-x: hidden;
   align-content: flex-start;
+  /* Smooth height transition when chips appear/disappear.
+   * The chip-appear keyframe on individual chips is the
+   * primary feedback; this just makes the wrap itself
+   * glide rather than pop. */
+  transition: max-height 0.2s var(--ease-out);
 }
 .attach-chip {
-  display: inline-flex; align-items: center; gap: 4px;
+  display: inline-flex; align-items: center; gap: 6px;
   background: var(--bg-3);
   border: 1px solid var(--border-2);
-  border-radius: 6px;
-  padding: 2px 4px 2px 4px;
+  border-radius: 8px;
+  padding: 4px 6px 4px 4px;
   font-size: 12px;
   flex: 0 0 auto;
   max-width: 100%;
   min-width: 0;
+  /* fade-in: a chip that just appeared (e.g. from a paste)
+   * animates in from slightly above + a touch of scale.
+   * translateY direction is "from above" so the chip looks
+   * like it dropped in from the input above it — coherent
+   * with the new "below the input" position. */
+  animation: chip-appear 0.22s var(--ease-out);
+  transition: border-color 0.15s, background 0.15s;
 }
-.attach-chip.uploading { opacity: 0.6; }
+.attach-chip:hover {
+  border-color: var(--accent);
+  background: var(--bg-2);
+}
+.attach-chip.uploading { opacity: 0.7; }
 .attach-chip.error { border-color: var(--error); }
 .thumb {
-  width: 22px; height: 22px;
+  width: 40px; height: 40px;
   background: var(--bg-2);
-  border-radius: 4px;
+  border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
   overflow: hidden;
-  font-size: 14px;
+  font-size: 18px;
   flex-shrink: 0;
 }
-.thumb img { width: 100%; height: 100%; object-fit: cover; }
-.name { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; }
+.name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rm {
   background: none; border: none; color: var(--text-3);
-  cursor: pointer; padding: 0 4px; font-size: 14px; line-height: 1;
+  cursor: pointer; padding: 0 4px; font-size: 16px; line-height: 1;
   flex-shrink: 0;
 }
 .rm:hover { color: var(--error); }
+
+@keyframes chip-appear {
+  from { opacity: 0; transform: translateY(-4px) scale(0.95); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
 
 /* Rollback undo banner */
 .rollback-banner {
