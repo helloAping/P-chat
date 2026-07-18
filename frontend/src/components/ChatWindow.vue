@@ -13,6 +13,11 @@ import TodoPanel from './TodoPanel.vue'
 // in App.vue is the single source of truth for question UI.
 import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner } from '../stores/chat'
 
+// isRecoveringCurrent mirrors state.isRecovering[currentID].
+// Watched reactively by the recovery-in-progress banner
+// template below.
+const isRecoveringCurrent = computed(() => !!state.isRecovering[state.currentID])
+
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
 
@@ -338,6 +343,22 @@ function messageKey(m: any, i: number): string | number {
         <span class="recovery-reason">{{ currentRecoveryBanner.reason }}</span>
       </div>
     </Transition>
+    <!-- P0-1: in-progress banner. Shown the moment the
+         onStreamDrop callback fires and the
+         recoverMissingParts async work starts; cleared
+         when the snapshot fetch resolves (whether or
+         not any parts actually merged). Distinct from
+         the success banner above so the user knows the
+         system is doing work, not hung. -->
+    <Transition name="recovery-banner">
+      <div
+        v-if="isRecoveringCurrent && !currentRecoveryBanner"
+        class="recovery-banner recovery-banner--pending"
+      >
+        <span class="recovery-icon">⚡</span>
+        <span class="recovery-text">正在补齐未送达消息…</span>
+      </div>
+    </Transition>
     <!-- P2-3: context inspector drawer. The drawer is
          always mounted; visibility is bound to the
          `state.contextInspector.open` flag so the
@@ -447,6 +468,22 @@ function messageKey(m: any, i: number): string | number {
   font-size: 12.5px;
   color: var(--text-secondary);
   flex-shrink: 0;
+}
+/* P0-1 in-progress variant: subtle pulse + warmer hue so
+   the user can tell this is "system is doing work",
+   not "system finished and recovered 0 messages" (which
+   the success banner above also covers). */
+.recovery-banner--pending {
+  background: var(--surface-2);
+  border-bottom-color: var(--accent, #4a90e2);
+}
+.recovery-banner--pending .recovery-icon {
+  animation: recovery-pulse 1.4s ease-in-out infinite;
+  display: inline-block;
+}
+@keyframes recovery-pulse {
+  0%, 100% { opacity: 0.5; transform: scale(0.95); }
+  50%      { opacity: 1.0; transform: scale(1.05); }
 }
 .recovery-icon { font-size: 14px; }
 .recovery-text { color: var(--text-primary); font-weight: 500; }

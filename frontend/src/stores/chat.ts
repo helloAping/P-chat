@@ -129,6 +129,14 @@ export const state = reactive({
     reason: string
     shownAt: number
   },
+  // P0-1: is the recoverMissingParts flow currently
+  // running? Set true at the start of recoverMissingParts
+  // and false again when the snapshot fetch resolves
+  // (either with merged parts or no-op). The ChatWindow
+  // shows a small spinner-style banner ("⚡ 正在补齐
+  // 未送达消息…") while this is true so the user knows
+  // the system is doing work, not hanging.
+  isRecovering: {} as Record<string, boolean>,
   // P2-3: context inspector drawer state. When non-null
   // the drawer is open with this payload. Loading and
   // error states are tracked separately so the drawer
@@ -1989,16 +1997,22 @@ export async function recoverMissingParts(
     // transient reconnect, not a real failure. Skip.
     return
   }
+  // P0-1: flip the "recovering" flag so the UI can show
+  // a spinner-style banner. We clear it in the finally
+  // block below so it always resets, even on error.
+  state.isRecovering[sessionId] = true
   const afterSeq = lastSeq >= 0 ? lastSeq : 0
   let snap: api.SnapshotRecovery
   try {
     snap = await api.getSessionSnapshot(sessionId, afterSeq)
   } catch (e: any) {
     console.warn('[recovery] snapshot fetch failed:', e?.message || e)
+    state.isRecovering[sessionId] = false
     return
   }
   if (!snap.messages || snap.messages.length === 0) {
     // No new assistant rows landed. Nothing to merge.
+    state.isRecovering[sessionId] = false
     return
   }
 
@@ -2063,6 +2077,7 @@ export async function recoverMissingParts(
     trailing.content = assembleTextContent(trailing.parts || [])
     showRecoveryBanner(sessionId, merged, reason)
   }
+  state.isRecovering[sessionId] = false
 }
 
 // showRecoveryBanner flips a transient state flag for
