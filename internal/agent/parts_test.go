@@ -276,8 +276,8 @@ func TestPartsAccumulator_ToolStatusFromStep(t *testing.T) {
 		{"call-1", "", "start"},
 	}
 	for _, c := range cases {
-		if got := toolStatusFromStep(c.step, c.errMsg); got != c.want {
-			t.Errorf("toolStatusFromStep(%q, %q) = %q, want %q", c.step, c.errMsg, got, c.want)
+		if got := ToolStatusFromStep(c.step, c.errMsg); got != c.want {
+			t.Errorf("ToolStatusFromStep(%q, %q) = %q, want %q", c.step, c.errMsg, got, c.want)
 		}
 	}
 }

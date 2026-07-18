@@ -4,37 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/p-chat/pchat/internal/agent"
 )
 
-// toolStatusFromChunkStep mirrors toolStatusFromStep in
-// internal/agent/parts.go so the wire format and the
-// accumulator agree on the status string. Parse the trailing
-// segment of "call-N-status" instead of substring-matching
-// "ok" / "err" so a future status name can't accidentally
-// match.
-func toolStatusFromChunkStep(step, errMsg string) string {
-	if errMsg != "" {
-		return "error"
-	}
-	idx := strings.LastIndex(step, "-")
-	if idx < 0 || idx+1 >= len(step) {
-		return "start"
-	}
-	switch step[idx+1:] {
-	case "ok":
-		return "ok"
-	case "warn":
-		return "warn"
-	case "err", "error":
-		return "error"
-	case "start":
-		return "start"
-	}
-	return "start"
-}
+// toolStatusFromChunkStep was the server-side mirror of
+// internal/agent.toolStatusFromStep. Removed in T06 — both
+// the parts accumulator and the wire mapper now call
+// agent.ToolStatusFromStep so the two stay in lockstep.
 
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {
 	ev := StreamEvent{
@@ -117,8 +94,9 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		// Status: parse the trailing segment of "call-N-status"
 		// rather than substring-matching "ok" / "err" so a future
 		// status name can't accidentally match. See
-		// internal/agent/parts.go for the canonical parser.
-		ev.ToolStatus = toolStatusFromChunkStep(chunk.Step, chunk.ToolError)
+		// internal/agent/parts.go::ToolStatusFromStep for the
+		// single source of truth.
+		ev.ToolStatus = agent.ToolStatusFromStep(chunk.Step, chunk.ToolError)
 		return ev
 	}
 	if chunk.Thinking != "" {
