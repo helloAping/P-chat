@@ -47,10 +47,11 @@ import type { SearchResult } from '../api/client'
 import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
 import BrandLogo from './BrandLogo.vue'
+import { exportMessages, suggestFilename, type ExportFormat } from '../utils/export'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff,
-  ChevronDown, ChevronRight, Circle, MessageSquare,
+  ChevronDown, ChevronRight, Circle, MessageSquare, Download as DownloadIcon,
 } from './icons'
 
 const APP_VERSION = __APP_VERSION__
@@ -279,6 +280,22 @@ function sessionMenuOptions(id: string) {
     },
     { type: 'divider' as const, key: 'd' },
     {
+      key: 'export-md',
+      label: '导出 Markdown',
+      icon: () => h(DownloadIcon, { size: 14 }),
+    },
+    {
+      key: 'export-json',
+      label: '导出 JSON',
+      icon: () => h(DownloadIcon, { size: 14 }),
+    },
+    {
+      key: 'export-html',
+      label: '导出 HTML',
+      icon: () => h(DownloadIcon, { size: 14 }),
+    },
+    { type: 'divider' as const, key: 'd2' },
+    {
       key: 'delete',
       label: '归档',
       icon: () => h(XIcon, { size: 14 }),
@@ -297,6 +314,59 @@ function onSessionMenu(key: string, id: string) {
       onDelete(id, new MouseEvent('click'))
       break
     }
+    case 'export-md':
+    case 'export-json':
+    case 'export-html': {
+      const fmt = key.slice('export-'.length) as ExportFormat
+      doExport(id, fmt)
+      break
+    }
+  }
+}
+
+// downloadSession fetches the full message list for `id` and
+// triggers a browser download in the chosen format. We pull
+// from the API (not the in-memory store) so the export
+// reflects the persisted truth, including messages the
+// current render hasn't loaded yet.
+//
+// Format / size guards:
+//   * sessions with > 5k messages show a confirmation toast
+//     first — exporting tens of MB of HTML synchronously on
+//     the main thread will jank the UI.
+//   * the actual download uses a transient <a download> link
+//     + URL.createObjectURL, the standard SPA pattern.
+async function doExport(id: string, format: ExportFormat) {
+  try {
+    const result = await api.listMessages(id)
+    const messages = result.messages
+    if (!messages || messages.length === 0) {
+      message.warning('该会话没有消息可导出')
+      return
+    }
+    if (messages.length > 5000) {
+      message.warning(`消息数较多 (${messages.length}), 导出可能需要几秒...`)
+    }
+    const title = state.sessions.find(s => s.id === id)?.title ?? ''
+    const body = exportMessages(messages, format, title)
+    const filename = suggestFilename(title, format)
+    const mime =
+      format === 'html' ? 'text/html' :
+      format === 'json' ? 'application/json' :
+      'text/markdown'
+    const blob = new Blob([body], { type: `${mime};charset=utf-8` })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    message.success(`已导出 ${filename}`)
+  } catch (e) {
+    console.error('[export] failed:', e)
+    message.error('导出失败: ' + (e instanceof Error ? e.message : String(e)))
   }
 }
 
