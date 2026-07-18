@@ -107,6 +107,12 @@ export const state = reactive({
   showSettings: false,
   projects: [] as ProjectItem[],
   activeProjectPath: '' as string,
+  // P3-3: current session's trace id. Minted server-side on
+  // POST /messages and mirrored on every SSE event. The
+  // TopBar reads this so users can copy the id to the
+  // clipboard without scrolling to the error chip. Cleared
+  // when the user switches sessions.
+  currentTraceId: '' as string,
   // Rollback undo buffer — only the most recent rollback per session.
   rollbackUndo: {} as Record<string, { messages: Message[]; fromIndex: number } | null>,
   // Pending text to fill into the input area after a rollback.
@@ -422,6 +428,11 @@ function dedupMessagesByKey(existing: Message[], incoming: Message[]): Message[]
 
 export async function switchSession(id: string) {
   state.currentID = id
+  // P3-3: clear the previous session's trace id so the
+  // TopBar tooltip doesn't show a stale id from a session
+  // the user is no longer looking at. The next event of
+  // the new session will repopulate it.
+  state.currentTraceId = ''
   if (!state.sessionMessages[id]) {
     // First visit to this session: load the most recent page
     // only. Older pages are fetched on-demand by
@@ -1367,6 +1378,15 @@ function appendThinkingPart(m: Message, delta: string, target?: MessagePart[] | 
 //
 // 修改指南 → docs/modules/frontend.md
 export function appendStreamEvent(id: string, ev: api.StreamEvent) {
+  // P3-3: stamp the trace id on the state so the TopBar
+  // can render + copy it. Only the first event of a turn
+  // matters (subsequent events carry the same id); we
+  // overwrite unconditionally so a sub-agent run that
+  // reuses the parent's stream still keeps the parent's
+  // id visible.
+  if (ev.trace_id) {
+    state.currentTraceId = ev.trace_id
+  }
   const m = findOrCreateLastAssistant(id)
   if (!m.parts) m.parts = []
 

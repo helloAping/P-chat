@@ -23,12 +23,13 @@
  * those become real.
  */
 import { computed, ref } from 'vue'
-import { NButton, NTooltip } from 'naive-ui'
+import { NButton, NTooltip, useMessage } from 'naive-ui'
 import { state, currentMeta, openContextInspector } from '../stores/chat'
 import * as api from '../api/client'
 import BrandLogo from './BrandLogo.vue'
 import ToolListDrawer from './ToolListDrawer.vue'
-import { FolderOpen, Terminal, PanelLeftClose, PanelLeftOpen, Sparkles, BarChart3, Wrench } from './icons'
+import { FolderOpen, Terminal, PanelLeftClose, PanelLeftOpen, Sparkles, BarChart3, Wrench, Hash } from './icons'
+import { copyText } from '../utils/clipboard'
 
 const props = defineProps<{
   /** Whether the sidebar is currently collapsed. Two-way bound. */
@@ -98,6 +99,36 @@ async function openTerminal() {
 // Kept local (not in the chat store) because the tool
 // list is per-server, not per-session.
 const showToolList = ref(false)
+const message = useMessage()
+
+// currentTraceId: the P3-3 end-to-end correlation id for the
+// active turn. Minted server-side on POST /messages, mirrored
+// on every SSE event's `trace_id` field, and rendered in the
+// "trace" tooltip + one-click copy button in the TopBar so
+// users reporting bugs can paste it without having to scroll
+// to the error chip. Falls back to the X-Trace-Id response
+// header (also minted server-side) when the SSE stream has
+// not produced any events yet.
+//
+// We don't try to aggregate across multiple in-flight
+// sessions; this is the trace for whatever the user is
+// looking at right now, which is also the trace they'd
+// paste when reporting "this went wrong".
+const currentTraceId = computed(() => state.currentTraceId || '')
+
+async function copyTrace() {
+  const id = currentTraceId.value
+  if (!id) {
+    message.info('当前没有 trace id（最近一次请求尚未产生事件）')
+    return
+  }
+  const ok = await copyText(id)
+  if (ok) {
+    message.success(`已复制 trace id: ${id}`)
+  } else {
+    message.error('复制失败，请手动选择')
+  }
+}
 function toggleSidebar() { emit('toggle-sidebar') }
 </script>
 
@@ -167,6 +198,25 @@ function toggleSidebar() { emit('toggle-sidebar') }
           </NButton>
         </template>
         上下文占用
+      </NTooltip>
+      <!-- P3-3: global trace id. Clicking copies the
+           current session's correlation id to the
+           clipboard so users reporting a bug can
+           paste it into the issue without scrolling
+           to the error chip. Tooltip shows the id
+           (or a hint when no stream is in flight). -->
+      <NTooltip>
+        <template #trigger>
+          <NButton
+            size="tiny"
+            quaternary
+            :aria-label="currentTraceId ? `复制 trace id ${currentTraceId}` : '当前无 trace id'"
+            @click="copyTrace"
+          >
+            <Hash :size="16" />
+          </NButton>
+        </template>
+        {{ currentTraceId ? `trace: ${currentTraceId}` : '当前无 trace id' }}
       </NTooltip>
       <!-- P3-2: tool list trigger. Opens the drawer
            that lists every tool the LLM can call —
