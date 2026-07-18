@@ -3,6 +3,8 @@
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
 
+import { consumeSSEStream, decodeStreamEvent, emitStreamEvent } from './sse'
+
 const BASE = '' // same origin; pchat-server serves both UI and API
 
 // mintTraceId returns a fresh P3-3 trace id (8-char hex with
@@ -1155,9 +1157,8 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
       // events would land in session A's message list.
       if (wrap.session && wrap.session !== sessionId) return
       if (wrap.event && wrap.event !== 'message' && wrap.event !== '') return
-      const data = (wrap.data || '').trim()
-      if (!data || data === '[DONE]') return
-      const ev = JSON.parse(data) as StreamEvent
+      const ev = decodeStreamEvent(wrap.data || '', 'stream')
+      if (!ev) return
       // Wrap the dispatch in its own try/catch. The handler mutates
       // Vue reactive state, which can synchronously run a render
       // flush; if any Naive UI internals (popover, tooltip, NMessage
@@ -1166,11 +1167,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
       // Vue scheduler and surfaces in the console as
       // "P.querySelectorAll is not a function" — with no other
       // recovery. We log and continue, so the next event still lands.
-      try {
-        opts.onEvent(ev)
-      } catch (inner) {
-        console.warn('[stream] event handler threw, continuing:', inner)
-      }
+      emitStreamEvent(ev, 'stream', opts.onEvent)
     } catch (e) {
       console.warn('SSE parse error', e, 'raw:', (raw || '').slice(0, 200))
     }
@@ -1279,87 +1276,13 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
     throw new Error(`stream: HTTP ${resp.status}: ${resp.statusText}`)
   }
 
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buf = ''
-  let dataBuf = ''
-  let lastSeq = -1
-  let done = false
-
-  while (!done) {
-    let r: ReadableStreamReadResult<Uint8Array>
-    try {
-      r = await reader.read()
-    } catch (e: any) {
-      // P0-1: the body stream died mid-flight (server
-      // crashed, network blip, reverse-proxy timeout).
-      // Surface as a drop event so the chat store can
-      // call the snapshot endpoint. Skip on user abort
-      // (the stop button sets signal.aborted before
-      // tearing the request down).
-      if (!opts.signal?.aborted && opts.onStreamDrop) {
-        try {
-          opts.onStreamDrop({ lastSeq, reason: e?.message || 'read failed' })
-        } catch { /* drop callback must not break the throw chain */ }
-      }
-      throw new Error(`stream: ${e?.message || e}`)
-    }
-    done = r.done
-    if (r.value) {
-      buf += decoder.decode(r.value, { stream: true })
-    }
-    // Drain complete `data: ...\nid: N\n\n` blocks from the buffer.
-    // The server emits two-line frames (data + id) per P3-1;
-    // `id:` is the standard SSE event ID we parse into ev.seq.
-    let nl: number
-    while ((nl = buf.indexOf('\n\n')) >= 0) {
-      const block = buf.slice(0, nl)
-      buf = buf.slice(nl + 2)
-      // Parse the block — gather every `data: …` line into the
-      // payload buffer, and remember the most recent `id: N` line
-      // (server emits at most one per frame).
-      dataBuf = ''
-      let frameSeq: number | undefined
-      for (const line of block.split('\n')) {
-        if (line.startsWith('data:')) {
-          if (dataBuf.length > 0) dataBuf += '\n'
-          dataBuf += line.slice(5).trimStart()
-        } else if (line.startsWith('id:')) {
-          // Standard SSE event ID line. Trim and parse; tolerate
-          // missing / non-numeric gracefully (P3-1 server always
-          // sends a number, but a legacy / proxy that strips the
-          // `id:` line must not break the parser).
-          const raw = line.slice(3).trim()
-          const n = Number(raw)
-          if (raw && Number.isFinite(n)) frameSeq = n
-        }
-      }
-      const data = dataBuf.trim()
-      if (!data || data === '[DONE]') continue
-      let ev: StreamEvent
-      try { ev = JSON.parse(data) as StreamEvent } catch {
-        console.warn('SSE parse error', 'raw:', data.slice(0, 200))
-        continue
-      }
-      // Fall back to the frame's id-line when the payload's
-      // seq field is missing (defensive — server always sets
-      // both). Cross-check monotonicity in dev mode so a server
-      // regression that re-uses a seq is loud, not silent.
-      if (frameSeq !== undefined) ev.seq = frameSeq
-      if (import.meta.env.DEV && typeof ev.seq === 'number') {
-        if (ev.seq <= lastSeq) {
-          console.warn(`[stream] non-monotonic seq: prev=${lastSeq} now=${ev.seq} type=${ev.type}`)
-        }
-        lastSeq = ev.seq
-        console.debug(`[stream] seq=${ev.seq} type=${ev.type} ${ev.sub_agent ? `sub=${ev.sub_agent_task ?? ''}` : ''}`)
-      }
-      try {
-        opts.onEvent(ev)
-      } catch (inner) {
-        console.warn('[stream] event handler threw, continuing:', inner)
-      }
-    }
-  }
+  await consumeSSEStream({
+    reader: resp.body.getReader(),
+    signal: opts.signal,
+    label: 'stream',
+    onEvent: opts.onEvent,
+    onStreamDrop: opts.onStreamDrop,
+  })
 }
 
 // streamWithRetry wraps streamMessages with up to 2 reconnect
@@ -1440,58 +1363,13 @@ export async function streamRegenerate(
     throw new Error(`regenerate: HTTP ${resp.status}: ${resp.statusText}`)
   }
 
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buf = ''
-  let dataBuf = ''
-  let lastSeq = -1
-  let done = false
-
-  while (!done) {
-    let r: ReadableStreamReadResult<Uint8Array>
-    try { r = await reader.read() }
-    catch (e: any) {
-      if (!opts.signal?.aborted && opts.onStreamDrop) {
-        try { opts.onStreamDrop({ lastSeq, reason: e?.message || 'read failed' }) } catch { /* */ }
-      }
-      throw new Error(`regenerate stream: ${e?.message || e}`)
-    }
-    done = r.done
-    if (r.value) buf += decoder.decode(r.value, { stream: true })
-
-    let nl: number
-    while ((nl = buf.indexOf('\n\n')) >= 0) {
-      const block = buf.slice(0, nl)
-      buf = buf.slice(nl + 2)
-      dataBuf = ''
-      let frameSeq: number | undefined
-      for (const line of block.split('\n')) {
-        if (line.startsWith('data:')) {
-          if (dataBuf.length > 0) dataBuf += '\n'
-          dataBuf += line.slice(5).trimStart()
-        } else if (line.startsWith('id:')) {
-          const raw = line.slice(3).trim()
-          const n = Number(raw)
-          if (raw && Number.isFinite(n)) frameSeq = n
-        }
-      }
-      const data = dataBuf.trim()
-      if (!data || data === '[DONE]') continue
-      let ev: StreamEvent
-      try { ev = JSON.parse(data) as StreamEvent } catch {
-        console.warn('regenerate SSE parse error', 'raw:', data.slice(0, 200))
-        continue
-      }
-      if (frameSeq !== undefined) ev.seq = frameSeq
-      if (import.meta.env.DEV && typeof ev.seq === 'number') {
-        if (ev.seq <= lastSeq) console.warn(`[regen] non-monotonic seq: prev=${lastSeq} now=${ev.seq}`)
-        lastSeq = ev.seq
-      }
-      try { opts.onEvent(ev) } catch (inner) {
-        console.warn('[regen] event handler threw, continuing:', inner)
-      }
-    }
-  }
+  await consumeSSEStream({
+    reader: resp.body.getReader(),
+    signal: opts.signal,
+    label: 'regen',
+    onEvent: opts.onEvent,
+    onStreamDrop: opts.onStreamDrop,
+  })
 }
 
 // ---- P1-4 regen history ----
