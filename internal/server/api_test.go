@@ -1,4 +1,4 @@
-﻿package server_test
+package server_test
 
 import (
 	"bytes"
