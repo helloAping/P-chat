@@ -27,6 +27,14 @@ import (
 
 type REPL struct {
 	ctx cliContext // primary context (HTTP mode)
+	// runCtx is the long-lived context the REPL was
+	// started with. Passed down to background operations
+	// (recall search, snapshot fetch, etc.) so a SIGINT
+	// (or any other cancellation) propagates and aborts
+	// in-flight work. Defaults to context.Background() so
+	// callers that don't pass one still get a working
+	// (uncancellable) context — better than nil-deref.
+	runCtx context.Context
 
 	cfg      *config.Config
 	agent    *agent.Agent
@@ -52,12 +60,23 @@ type REPL struct {
 func NewREPL(ctx cliContext, cfg *config.Config, s style.Style, provider string) *REPL {
 	return &REPL{
 		ctx:          ctx,
+		runCtx:       context.Background(),
 		cfg:          cfg,
 		style:        s,
 		provider:     provider,
 		useTools:     true,
 		rollbackUndo: make(map[string][]httpcli.Message),
 	}
+}
+
+// SetRunContext replaces the long-lived context used for
+// background operations (recall, snapshot, etc.). Call this
+// from main() before Run() so SIGINT propagates.
+func (r *REPL) SetRunContext(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	r.runCtx = ctx
 }
 
 // SetSubAgentCache attaches a cache instance for the subagent package.

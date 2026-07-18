@@ -822,7 +822,17 @@ func (c *localContext) Recall(ctx context.Context, query string, topK int) error
 	if c.r.recallEngine == nil {
 		return &ErrUnsupported{Op: "Recall"}
 	}
-	return c.r.recallEngine.PrintSearch(ctx, query, topK)
+	// Prefer the caller's ctx (so the command can be
+	// cancelled by a SIGINT propagated to the call site),
+	// fall back to the REPL's runCtx, then Background.
+	effective := ctx
+	if effective == nil {
+		effective = c.r.runCtx
+	}
+	if effective == nil {
+		effective = context.Background()
+	}
+	return c.r.recallEngine.PrintSearch(effective, query, topK)
 }
 
 func (c *localContext) InitProject(dir string) error {

@@ -15,6 +15,7 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/internal/recall"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/version"
@@ -182,6 +183,27 @@ func runREPL(cmd *cobra.Command, args []string) error {
 
 	cliCtx := cli.NewHTTPContext(httpClient, string(s), prov, curSess)
 	repl := cli.NewREPL(cliCtx, cfg, s, prov)
+	// T13: propagate the long-lived ctx so SIGINT cancels
+	// in-flight recall/snapshot operations instead of
+	// leaving them to finish after the user hits Ctrl+C.
+	repl.SetRunContext(ctx)
+
+	// T13: wire up the recall engine. We open a read-only
+	// handle on the first enabled knowledge base so /recall
+	// actually searches (the engine is a no-op stub until
+	// this is set). The wiki.db lives under the base's
+	// directory per knowledge.NewWikiStore's contract.
+	if cfg.Knowledge.Enabled {
+		for _, base := range cfg.Knowledge.Bases {
+			if !base.Enabled || base.Path == "" {
+				continue
+			}
+			eng := recall.NewEngine(base.Name, base.Path, os.Stdout)
+			repl.SetRecallEngine(eng)
+			dim.Printf("  recall: 已挂载知识库 %q (%s)\n", base.Name, base.Path)
+			break
+		}
+	}
 
 	// Run REPL in a goroutine; listen for SIGINT in the main goroutine
 	// so we can cleanly stop the server on Ctrl+C.
