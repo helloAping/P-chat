@@ -1,0 +1,68 @@
+# =============================================================================
+# P-Chat .editorconfig
+# =============================================================================
+# Pairs with .gitattributes to lock down formatting on every developer's
+# editor. Most modern IDEs (VS Code, GoLand, IntelliJ, Sublime) read this
+# file automatically. .gitattributes handles line-endings at the git layer;
+# this file handles in-editor defaults.
+# =============================================================================
+
+root = true
+
+# -----------------------------------------------------------------------------
+# Default for every text file
+# -----------------------------------------------------------------------------
+[*]
+charset                  = utf-8
+end_of_line              = lf
+insert_final_newline     = true
+trim_trailing_whitespace = true
+indent_style             = space
+indent_size              = 2
+
+
+# -----------------------------------------------------------------------------
+# Go: tabs are the language spec; don't strip "trailing whitespace" inside
+# block comments (godoc uses it for indentation in examples).
+# -----------------------------------------------------------------------------
+[*.go]
+indent_style             = tab
+indent_size              = 4
+trim_trailing_whitespace = false
+
+
+# -----------------------------------------------------------------------------
+# Markdown / YAML: preserve trailing whitespace (Markdown line breaks use
+# two-space line endings; YAML anchors benefit from stable spacing).
+# -----------------------------------------------------------------------------
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{yml,yaml}]
+trim_trailing_whitespace = false
+indent_size              = 2
+
+
+# -----------------------------------------------------------------------------
+# Frontend: TypeScript and Vue 3 SFCs use 2-space indent per the existing
+# style (see frontend/src/style.css and every .vue file in src/components).
+# -----------------------------------------------------------------------------
+[*.{ts,tsx,js,jsx,vue,css,scss,html}]
+indent_size = 2
+
+
+# -----------------------------------------------------------------------------
+# Makefiles REQUIRE tabs for recipe lines — overriding indent_style here
+# keeps `gofmt` / IDEs from replacing them with spaces and breaking the
+# build with "missing separator" errors.
+# -----------------------------------------------------------------------------
+[Makefile]
+indent_style = tab
+
+
+# -----------------------------------------------------------------------------
+# Windows-only shell scripts: keep CRLF on disk so cmd / PowerShell parse
+# them correctly when double-clicked (matches .gitattributes).
+# -----------------------------------------------------------------------------
+[*.{ps1,bat,cmd}]
+end_of_line = crlf
