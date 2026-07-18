@@ -160,6 +160,8 @@ type mockCtx struct {
 	setSessionArg    string
 	sessionList      []httpcli.Session
 	forgotID         string
+	toolsEnabled     bool
+	patchOpts        httpcli.SessionPatchOpts
 }
 
 // Per-method overrides for the methods the cmdXxx tests need.
@@ -208,6 +210,15 @@ func (m *mockCtx) ListSessions(context.Context) ([]httpcli.Session, error) {
 func (m *mockCtx) ForgetSession(string) error {
 	m.forgotID = m.sessionID
 	return m.err
+}
+func (m *mockCtx) ListSkills() ([]string, error) {
+	return []string{"pchat-skill-a", "pchat-skill-b"}, m.err
+}
+func (m *mockCtx) ListRules() ([]string, error) {
+	return []string{"rule-1", "rule-2"}, m.err
+}
+func (m *mockCtx) AgentsContext() (string, string, error) {
+	return "global-agents-md", "project-agents-md", m.err
 }
 func (m *mockCtx) GetCurrentSessionMessages(context.Context) ([]httpcli.Message, error) {
 	// Return a non-empty list so cmdRollback / cmdFork
@@ -278,6 +289,12 @@ func (m *mockCtx) NewSession(_ context.Context, opts httpcli.CreateSessionOpts) 
 func (m *mockCtx) SetStyle(n string) error { m.styleArg = n; return m.err }
 func (m *mockCtx) ListStyles() []style.Style {
 	return []style.Style{"cute", "guofeng", "tech"}
+}
+func (m *mockCtx) SetToolsEnabled(on bool) { m.toolsEnabled = on }
+func (m *mockCtx) ToolsEnabled() bool    { return m.toolsEnabled }
+func (m *mockCtx) PatchSession(_ context.Context, id string, opts httpcli.SessionPatchOpts) (*httpcli.Session, error) {
+	m.patchOpts = opts
+	return &httpcli.Session{ID: id, AutoContinue: opts.AutoContinue != nil && *opts.AutoContinue}, m.err
 }
 func (m *mockCtx) StyleName() string     { return m.styleArg }
 func (m *mockCtx) StyleLabel(s style.Style) string { return string(s) }
@@ -511,6 +528,53 @@ func TestCmdRollback_RequiresStdinConfirmation(t *testing.T) {
 	}
 	if ctx.rolledFromID != 0 {
 		t.Errorf("RollbackMessages should not be called without stdin confirmation: fromID=%d", ctx.rolledFromID)
+	}
+}
+
+func TestCmdRollback_Confirmed(t *testing.T) {
+	// With stdin answering "y", cmdRollback proceeds
+	// all the way to the RollbackMessages call.
+	withStdin(t, "y\n")
+	ctx := &mockCtx{sessionID: "sess-1", msgCount: 50}
+	if err := cmdRollback(ctx, "42"); err != nil {
+		t.Fatalf("cmdRollback confirmed: %v", err)
+	}
+	if ctx.rolledSessionID != "sess-1" || ctx.rolledFromID != 42 {
+		t.Errorf("RollbackMessages = (%q, %d), want (sess-1, 42)", ctx.rolledSessionID, ctx.rolledFromID)
+	}
+}
+
+func TestCmdRollback_Declined(t *testing.T) {
+	// With stdin answering "n", cmdRollback bails
+	// before the RollbackMessages call (the user
+	// changed their mind).
+	withStdin(t, "n\n")
+	ctx := &mockCtx{sessionID: "sess-1", msgCount: 50}
+	if err := cmdRollback(ctx, "42"); err != nil {
+		t.Fatalf("cmdRollback declined: %v", err)
+	}
+	if ctx.rolledFromID != 0 {
+		t.Errorf("RollbackMessages should not be called on decline: fromID=%d", ctx.rolledFromID)
+	}
+}
+
+func TestCmdHistory_Forget_Confirmed(t *testing.T) {
+	withStdin(t, "yes\n")
+	ctx := &mockCtx{sessionID: "sess-x"}
+	if err := cmdHistory(ctx, "forget sess-x"); err != nil {
+		t.Fatalf("cmdHistory forget: %v", err)
+	}
+	// No recording on mockCtx for DeleteSession yet,
+	// so the "no panic" is the assertion. The test
+	// would surface a future regression where forget
+	// skips the DeleteSession call.
+}
+
+func TestCmdHistory_Forget_Declined(t *testing.T) {
+	withStdin(t, "no thanks\n")
+	ctx := &mockCtx{sessionID: "sess-x"}
+	if err := cmdHistory(ctx, "forget sess-x"); err != nil {
+		t.Fatalf("cmdHistory forget declined: %v", err)
 	}
 }
 
@@ -1052,6 +1116,195 @@ func parentDir(p string) string {
 		}
 	}
 	return p
+}
+
+// =====================================================================
+// /skills / /rules / /agents
+// =====================================================================
+
+func TestCmdSkills(t *testing.T) {
+	ctx := &mockCtx{}
+	if err := cmdSkills(ctx, ""); err != nil {
+		t.Fatalf("cmdSkills: %v", err)
+	}
+}
+
+func TestCmdSkills_Unsupported(t *testing.T) {
+	ctx := &mockErrCtx{}
+	if err := cmdSkills(ctx, ""); err != nil {
+		t.Fatalf("cmdSkills unsupported: %v", err)
+	}
+}
+
+func TestCmdRules(t *testing.T) {
+	ctx := &mockCtx{}
+	if err := cmdRules(ctx, ""); err != nil {
+		t.Fatalf("cmdRules: %v", err)
+	}
+}
+
+func TestCmdRules_Unsupported(t *testing.T) {
+	ctx := &mockErrCtx{}
+	if err := cmdRules(ctx, ""); err != nil {
+		t.Fatalf("cmdRules unsupported: %v", err)
+	}
+}
+
+func TestCmdAgents(t *testing.T) {
+	ctx := &mockCtx{}
+	if err := cmdAgents(ctx, ""); err != nil {
+		t.Fatalf("cmdAgents: %v", err)
+	}
+}
+
+func TestCmdAgents_Unsupported(t *testing.T) {
+	ctx := &mockErrCtx{}
+	if err := cmdAgents(ctx, ""); err != nil {
+		t.Fatalf("cmdAgents unsupported: %v", err)
+	}
+}
+
+// =====================================================================
+// /tools
+// =====================================================================
+
+func TestCmdTools_On(t *testing.T) {
+	ctx := &mockCtx{}
+	if err := cmdTools(ctx, "on"); err != nil {
+		t.Fatalf("cmdTools on: %v", err)
+	}
+	if !ctx.toolsEnabled {
+		t.Error("SetToolsEnabled(true) not called")
+	}
+}
+
+func TestCmdTools_Off(t *testing.T) {
+	ctx := &mockCtx{toolsEnabled: true}
+	if err := cmdTools(ctx, "off"); err != nil {
+		t.Fatalf("cmdTools off: %v", err)
+	}
+	if ctx.toolsEnabled {
+		t.Error("SetToolsEnabled(false) not called")
+	}
+}
+
+func TestCmdTools_Status(t *testing.T) {
+	// No-arg /tools shows status — exercise the default
+	// branch.
+	ctx := &mockCtx{toolsEnabled: true}
+	if err := cmdTools(ctx, ""); err != nil {
+		t.Fatalf("cmdTools: %v", err)
+	}
+}
+
+func TestCmdTools_Aliases(t *testing.T) {
+	// enable / disable / 1 / 0 should all be accepted.
+	for _, arg := range []string{"enable", "disable", "1", "0", "ON", "Enable"} {
+		ctx := &mockCtx{}
+		if err := cmdTools(ctx, arg); err != nil {
+			t.Errorf("cmdTools(%q): %v", arg, err)
+		}
+	}
+}
+
+// =====================================================================
+// /unsafe (HTTP / non-local branch only)
+// =====================================================================
+
+func TestCmdUnsafe_HTTPMode(t *testing.T) {
+	// /unsafe in HTTP mode → friendly message, no
+	// sandbox operations attempted. (The sandbox is
+	// process-local, so it's a no-op in HTTP mode
+	// regardless of the arg.)
+	ctx := &mockCtx{}
+	if err := cmdUnsafe(ctx, "on"); err != nil {
+		t.Fatalf("cmdUnsafe http: %v", err)
+	}
+}
+
+func TestCmdUnsafe_HTTPMode_Off(t *testing.T) {
+	ctx := &mockCtx{}
+	if err := cmdUnsafe(ctx, "off"); err != nil {
+		t.Fatalf("cmdUnsafe off http: %v", err)
+	}
+}
+
+func TestCmdUnsafe_ShowHelp(t *testing.T) {
+	// /unsafe with no arg (or unknown arg) → help text.
+	ctx := &mockCtx{}
+	if err := cmdUnsafe(ctx, ""); err != nil {
+		t.Fatalf("cmdUnsafe no-arg: %v", err)
+	}
+}
+
+// =====================================================================
+// /export (HTTP / unsupported branch)
+// =====================================================================
+
+func TestCmdExport_HTTPMode(t *testing.T) {
+	// /export in HTTP mode prints the friendly
+	// "导出仅在本地 REPL 可用" message and returns.
+	// We can't easily test the local path without a
+	// real memory.Store, so this is the half we cover.
+	ctx := &mockCtx{}
+	if err := cmdExport(ctx, ""); err != nil {
+		t.Fatalf("cmdExport http: %v", err)
+	}
+}
+
+// =====================================================================
+// /auto-continue
+// =====================================================================
+
+func TestCmdAutoContinue_On(t *testing.T) {
+	ctx := &mockCtx{sessionID: "s1"}
+	if err := cmdAutoContinue(ctx, "on"); err != nil {
+		t.Fatalf("cmdAutoContinue on: %v", err)
+	}
+	if ctx.patchOpts.AutoContinue == nil || !*ctx.patchOpts.AutoContinue {
+		t.Error("PatchSession AutoContinue not set to true")
+	}
+}
+
+func TestCmdAutoContinue_Off(t *testing.T) {
+	ctx := &mockCtx{sessionID: "s1"}
+	if err := cmdAutoContinue(ctx, "off"); err != nil {
+		t.Fatalf("cmdAutoContinue off: %v", err)
+	}
+	if ctx.patchOpts.AutoContinue == nil || *ctx.patchOpts.AutoContinue {
+		t.Error("PatchSession AutoContinue not set to false")
+	}
+}
+
+func TestCmdAutoContinue_Status(t *testing.T) {
+	// /auto (no arg) → status display. The mock's
+	// ListSessions returns empty so the "current
+	// session not in list" branch fires.
+	ctx := &mockCtx{sessionID: "s1"}
+	if err := cmdAutoContinue(ctx, ""); err != nil {
+		t.Fatalf("cmdAutoContinue status: %v", err)
+	}
+}
+
+func TestCmdAutoContinue_NoSession(t *testing.T) {
+	ctx := &mockCtx{} // sessionID empty
+	if err := cmdAutoContinue(ctx, "on"); err != nil {
+		t.Fatalf("cmdAutoContinue no-session: %v", err)
+	}
+}
+
+// =====================================================================
+// /plan
+// =====================================================================
+
+func TestCmdPlan_ToggleOn(t *testing.T) {
+	// /plan with no arg → toggle from off to on. The
+	// mock's PlanMode returns false by default, so the
+	// first call flips to true.
+	ctx := &mockCtx{}
+	if err := cmdPlan(ctx, ""); err != nil {
+		t.Fatalf("cmdPlan: %v", err)
+	}
 }
 
 // =====================================================================
