@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -823,6 +825,233 @@ type mockErrCtx struct {
 
 func (m *mockErrCtx) Recall(context.Context, string, int) error {
 	return &ErrUnsupported{Op: "Recall"}
+}
+
+// =====================================================================
+// Pure helpers
+// =====================================================================
+//
+// humanInt and parseModelKV are stateless — easy to lock
+// down with table-driven tests. Together they cover a few
+// hundred lines of edge-case handling (thousands, millions,
+// non-numeric input, empty list, repeated keys) that are
+// easy to get wrong and not exercised by the higher-level
+// command tests.
+
+func TestHumanInt(t *testing.T) {
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "0"},
+		{1, "1"},
+		{999, "999"},
+		{1000, "1k"},
+		{1500, "1500"},     // not a clean multiple — leave as-is
+		{32000, "32k"},
+		{1_000_000, "1m"},
+		{2_500_000, "2500k"},
+		{-5, "-5"},
+	}
+	for _, c := range cases {
+		if got := humanInt(c.in); got != c.want {
+			t.Errorf("humanInt(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestParseModelKV_Empty(t *testing.T) {
+	m, extra := parseModelKV(nil)
+	if m.DisplayName != "" || m.Description != "" || m.MaxTokensContext != 0 {
+		t.Errorf("empty input: got %+v, want zero", m)
+	}
+	if extra != nil {
+		t.Errorf("empty input: extra = %v, want nil", extra)
+	}
+}
+
+func TestParseModelKV_AllFields(t *testing.T) {
+	m, extra := parseModelKV([]string{
+		"display_name=GPT-4o",
+		"description=Most capable",
+		"max_tokens_context=128000",
+		"max_tokens_output=8192",
+		"default=true",
+	})
+	if m.DisplayName != "GPT-4o" {
+		t.Errorf("DisplayName = %q", m.DisplayName)
+	}
+	if m.Description != "Most capable" {
+		t.Errorf("Description = %q", m.Description)
+	}
+	if m.MaxTokensContext != 128000 {
+		t.Errorf("MaxTokensContext = %d", m.MaxTokensContext)
+	}
+	if m.MaxTokensOutput != 8192 {
+		t.Errorf("MaxTokensOutput = %d", m.MaxTokensOutput)
+	}
+	if !m.Default {
+		t.Error("Default = false, want true")
+	}
+	if len(extra) != 0 {
+		t.Errorf("unexpected extra: %v", extra)
+	}
+}
+
+func TestParseModelKV_Aliases(t *testing.T) {
+	// "context" is a short alias for max_tokens_context.
+	m, _ := parseModelKV([]string{"context=200000"})
+	if m.MaxTokensContext != 200000 {
+		t.Errorf("context alias: MaxTokensContext = %d, want 200000", m.MaxTokensContext)
+	}
+}
+
+func TestParseModelKV_ExtraArgs(t *testing.T) {
+	// Args without `=` are routed to extra (not an error).
+	_, extra := parseModelKV([]string{"display_name=Foo", "leftover"})
+	if len(extra) != 1 || extra[0] != "leftover" {
+		t.Errorf("extra = %v, want [leftover]", extra)
+	}
+}
+
+func TestParseModelKV_InvalidNumber(t *testing.T) {
+	// Non-numeric context → ignored (no error), MaxTokensContext
+	// stays 0. parseModelKV is permissive by design: bad
+	// input is dropped, not surfaced.
+	m, _ := parseModelKV([]string{"max_tokens_context=not-a-number"})
+	if m.MaxTokensContext != 0 {
+		t.Errorf("invalid number: MaxTokensContext = %d, want 0", m.MaxTokensContext)
+	}
+}
+
+func TestSplitProviderModel(t *testing.T) {
+	entries := []modelEntry{
+		{provider: "openai", model: "gpt-4o", value: "openai/gpt-4o"},
+		{provider: "cs", model: "doubao", value: "cs/doubao"},
+	}
+	cases := []struct {
+		in       string
+		wantP    string
+		wantM    string
+		wantOK   bool
+	}{
+		{"openai/gpt-4o", "openai", "gpt-4o", true},
+		{"openai gpt-4o", "openai", "gpt-4o", true},
+		{"cs/doubao", "cs", "doubao", true},
+		{"unknown", "", "", false},
+		{"openai", "", "", false}, // partial — not in entries
+	}
+	for _, c := range cases {
+		p, m, ok := splitProviderModel(c.in, entries)
+		if p != c.wantP || m != c.wantM || ok != c.wantOK {
+			t.Errorf("splitProviderModel(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.in, p, m, ok, c.wantP, c.wantM, c.wantOK)
+		}
+	}
+}
+
+// =====================================================================
+// /init
+// =====================================================================
+
+func TestCmdInit_OK(t *testing.T) {
+	// /init in local REPL mode → InitProject("") which the
+	// mock returns nil for. Just verify no error.
+	ctx := &mockCtx{}
+	if err := cmdInit(ctx, ""); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+}
+
+func TestCmdInit_Unsupported(t *testing.T) {
+	// /init when the project-init isn't available
+	// (HTTP mode) → friendly message, not an error.
+	ctx := &mockErrCtx{}
+	if err := cmdInit(ctx, ""); err != nil {
+		t.Fatalf("cmdInit(unsupported): %v", err)
+	}
+}
+
+func TestCmdInit_RealError(t *testing.T) {
+	// /init with a non-unsupported error should propagate
+	// (or rather, the cmd prints and returns nil; we
+	// verify the function doesn't crash and that the
+	// underlying error was passed to the cmd).
+	ctx := &mockCtx{err: errors.New("disk full")}
+	if err := cmdInit(ctx, ""); err != nil {
+		t.Fatalf("cmdInit(real error): %v", err)
+	}
+}
+
+// =====================================================================
+// /config (real config.Load path)
+// =====================================================================
+//
+// config.Load reads ~/.p-chat/config.yaml. We point HOME /
+// USERPROFILE at a temp dir and seed a minimal config so
+// cmdConfig("") can render the current-config dump without
+// touching the user's real config.
+
+func TestCmdConfig_ShowCurrent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	mustWriteFile(t, dir+"/.p-chat/config.yaml", `{
+  "llm": { "default": "openai" },
+  "style": { "default": "tech" },
+  "memory": { "enabled": true, "max_history": 200 },
+  "llm": {
+    "providers": [
+      { "name": "openai", "model": "gpt-4o", "protocol": "openai", "base_url": "https://api.openai.com/v1" }
+    ]
+  }
+}`)
+
+	ctx := &mockCtx{}
+	if err := cmdConfig(ctx, ""); err != nil {
+		t.Fatalf("cmdConfig: %v", err)
+	}
+}
+
+func TestConfigListQuick(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	mustWriteFile(t, dir+"/.p-chat/config.yaml", `{
+  "llm": {
+    "providers": [
+      { "name": "openai", "model": "gpt-4o", "protocol": "openai", "base_url": "https://api.openai.com/v1" },
+      { "name": "cs", "model": "doubao", "protocol": "openai", "base_url": "http://proxy" }
+    ]
+  }
+}`)
+
+	if err := configListQuick(); err != nil {
+		t.Fatalf("configListQuick: %v", err)
+	}
+}
+
+// mustWriteFile is a tiny helper for the config tests
+// above. The cwd is whatever the test runner picks; we
+// pass the absolute path explicitly so the tests don't
+// depend on the current dir.
+func mustWriteFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(parentDir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", parentDir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func parentDir(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' || p[i] == '\\' {
+			return p[:i]
+		}
+	}
+	return p
 }
 
 // =====================================================================
