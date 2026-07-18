@@ -219,7 +219,27 @@ const phantomVisionErrorReplacement = "（当前模型不支持读取图片。�
 
 func redactPhantomErrors(s string) (string, bool) {
 	lc := strings.ToLower(s)
-	if !strings.Contains(lc, "cannot read") || !strings.Contains(lc, "inform the user") {
+	// Fast-path: skip the regex entirely when none of the
+	// alternation verbs or the trailing trigger phrase
+	// appear. "inform the user" is the load-bearing
+	// signal — every regex alternate ends with that
+	// phrase, so its absence is a definitive "no phantom".
+	if !strings.Contains(lc, "inform the user") {
+		return s, false
+	}
+	// Cheap verb check (any of the alternation verbs)
+	// before the full regex. Saves the expensive dotall
+	// match on long responses that happen to mention
+	// "inform the user" in a non-phantom context.
+	if !strings.Contains(lc, "cannot read") &&
+		!strings.Contains(lc, "unable to read") &&
+		!strings.Contains(lc, "failed to read") &&
+		!strings.Contains(lc, "cannot view") &&
+		!strings.Contains(lc, "unable to view") &&
+		!strings.Contains(lc, "failed to view") &&
+		!strings.Contains(lc, "cannot process") &&
+		!strings.Contains(lc, "unable to process") &&
+		!strings.Contains(lc, "failed to process") {
 		return s, false
 	}
 	if !phantomVisionErrorRe.MatchString(s) {
