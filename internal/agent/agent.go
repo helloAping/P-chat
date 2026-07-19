@@ -236,18 +236,31 @@ func (a *Agent) modelSupportsVision(providerName, modelName string) bool {
 		}
 		for _, m := range p.Models {
 			if m.Name == modelName {
-				// Explicit opt-out: capabilities.supports_vision = false.
-				// Capabilities is a struct (not a pointer), so an absent
-				// value zero-fills the field; the only way to land in
-				// the `return false` branch is to have explicitly set
-				// supports_vision: false in the config (or via the
-				// model editor in the UI).
-				if !m.Capabilities.SupportsVision {
-					return false
-				}
 				// Explicit opt-in: capabilities.supports_vision = true.
 				// The user has confirmed this model handles images.
-				return true
+				if m.Capabilities.SupportsVision {
+					return true
+				}
+				// "No opinion" (capabilities: {} or capabilities
+				// absent) keeps the permissive behaviour: ask the
+				// heuristic, then fall through to the LLM-API error
+				// path if the model actually can't accept images.
+				// That error is then caught by ClassifyAPIError →
+				// KindVisionUnsupported and surfaced to the user as
+				// a clear, actionable warning chip on their message.
+				//
+				// (Capabilities is a struct, not a pointer, so its
+				// zero value reads as false here; that is the same
+				// as "no opinion", NOT an explicit opt-out. The
+				// previous code's `!SupportsVision ⇒ deny` therefore
+				// silently denied vision for every model whose
+				// capabilities block was empty — i.e. essentially
+				// every user-added model — and the user saw a
+				// text-placeholder instead of their image even when
+				// the upstream model supports vision fine. See
+				// handler_regenerate_test.go:TestModelSupportsVision_*
+				// for the regression tests.)
+				return visionCapableByHeuristic(providerName, modelName)
 			}
 		}
 		// Provider found, model not in the configured list. Don't
@@ -286,6 +299,13 @@ func visionCapableByHeuristic(providerName, modelName string) bool {
 		"llava", "llama-3.2-vision", "llama-3.3",
 		"minimax-m3", "minimax-vl",
 		"pixtral", "paligemma",
+		// DeepSeek V4 — vision-capable (multimodal). The V2/V3
+		// chat models are text-only and live in the deny list
+		// below; V4's "flash" and "lite" variants ship with
+		// vision. Listed before the deny-list check so a config
+		// without capabilities.supports_vision still gets
+		// vision when the model name matches.
+		"deepseek-v4-flash", "deepseek-v4-lite", "deepseek-v4",
 	}
 	for _, p := range visionPrefixes {
 		if strings.HasPrefix(m, p) {
@@ -1066,9 +1086,27 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// All other rows in the same batch (subsequent
 			// text/image attachments, the agent's own scratch
 			// messages) use AUTOINCREMENT as before.
+			//
+			// P1-4 regen path: req.Messages is the history
+			// loaded from the DB by regen.go (user text +
+			// image rows that were already persisted on the
+			// original send). Re-persisting those rows would
+			// create duplicate rows that grow on every regen
+			// round — the LLM context would see 2 copies, then
+			// 3, etc. Skip the history prefix and only persist
+			// the new tail (messages the agent loop produced
+			// after the initial LLM context was assembled, e.g.
+			// P0-3 auto-continue reminders and round-2+ tool
+			// scratch rows).
+			isRegen := req.RegenGroupID != ""
+			histEnd := 1 + len(req.Messages) // msgs[0] is system, msgs[1:1+histLen] is the loaded history
 			pinnedUserID := req.ClientMsgID
-			for _, m := range msgs {
+			for i, m := range msgs {
 				if m.Role == llm.RoleSystem {
+					continue
+				}
+				if isRegen && i >= 1 && i < histEnd {
+					// History row — already in DB. Skip.
 					continue
 				}
 				if pinnedUserID > 0 && m.Role == llm.RoleUser {

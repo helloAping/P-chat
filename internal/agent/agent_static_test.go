@@ -212,6 +212,15 @@ func TestVisionHeuristic(t *testing.T) {
 		{"gemini-1.5-pro", true},
 		{"gemini-2-flash", true},
 		{"qwen2.5-vl-72b", true},
+		// DeepSeek V4 — vision-capable; V2/V3 stay text-only.
+		// Regression: deepseek-v4-flash used to fall through to
+		// the conservative default (false) because V2/V3 were
+		// in the deny list and V4 wasn't in either list, so the
+		// user's image was getting replaced with a text
+		// placeholder instead of being sent to the LLM.
+		{"deepseek-v4-flash", true},
+		{"deepseek-v4-lite", true},
+		{"deepseek-v4", true},
 		// Text-only
 		{"deepseek-chat", false},
 		{"deepseek-reasoner", false},
@@ -226,6 +235,91 @@ func TestVisionHeuristic(t *testing.T) {
 		got := visionCapableByHeuristic("any", c.model)
 		if got != c.want {
 			t.Errorf("visionCapableByHeuristic(%q) = %v, want %v", c.model, got, c.want)
+		}
+	}
+}
+
+// TestModelSupportsVision_Config exercises Agent.modelSupportsVision
+// end-to-end against a synthetic config. Locks down the regression
+// where `capabilities: {}` (no `supports_vision` field) was being
+// treated as "explicit opt-out" because Capabilities is a struct
+// (not a pointer) and `!SupportsVision` matched the zero value.
+// The old behaviour silently demoted every user-added model to
+// "no vision", which surfaced in production as:
+//
+//   - SendMessage: ExpandAttachmentsCM replaced the user's
+//     image bytes with a "[name: N bytes — 当前模型不支持
+//     视觉输入，图片已上传但未发送]" text placeholder, so
+//     the LLM saw no image at all
+//   - Regenerate: same path, same symptom
+//
+// The fix is "permissive by default" — no opinion falls through
+// to the heuristic, only an explicit `supports_vision: true`
+// short-circuits to allow. Combined with adding `deepseek-v4*`
+// to the vision prefix list, this restores vision for ollama/
+// deepseek-v4-flash and other "modern" multimodal models the
+// user adds via the model editor.
+func TestModelSupportsVision_Config(t *testing.T) {
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Providers: []config.ProviderConfig{
+				{
+					Name:     "ollama",
+					Protocol: "openai",
+					Models: []config.ModelConfig{
+						// Regression target: the user reported
+						// "deepseek-v4-flash can't see images"
+						// because the config had `capabilities: {}`.
+						{Name: "deepseek-v4-flash", Default: true, Capabilities: config.Capabilities{}},
+						// Explicit opt-in still works.
+						{Name: "mimo-v2.5", Capabilities: config.Capabilities{SupportsVision: true}},
+						// Explicit opt-in via the same empty block
+						// but a separate config block — make sure
+						// the new permissive-default logic also
+						// forwards to the heuristic for models the
+						// heuristic does NOT recognise as vision
+						// (e.g. an unknown local ollama name).
+						{Name: "llama3-text-only", Capabilities: config.Capabilities{}},
+					},
+				},
+			},
+		},
+	}
+	a := &Agent{cfg: cfg}
+
+	cases := []struct {
+		provider, model string
+		want            bool
+	}{
+		// Regression: empty capabilities + heuristic match → true.
+		// Used to return false because the old code did
+		// `if !SupportsVision { return false }` before any
+		// heuristic call. Now falls through to the heuristic
+		// which recognises "deepseek-v4-flash" via the new
+		// visionPrefixes entry.
+		{"ollama", "deepseek-v4-flash", true},
+		// Explicit opt-in: untouched by the fix.
+		{"ollama", "mimo-v2.5", true},
+		// Empty capabilities + heuristic does NOT match → false.
+		// ("llama3-text-only" is a synthetic name that the
+		// heuristic will not recognise as vision-capable.)
+		{"ollama", "llama3-text-only", false},
+		// Empty capabilities + heuristic textOnly match → false.
+		{"ollama", "deepseek-v3", false},
+		// Provider found, model not in the configured list →
+		// still consults the heuristic. This is the path
+		// "user added a new model in the UI, hasn't run a
+		// config save yet, server uses heuristic".
+		{"ollama", "gpt-4o", true},
+		{"ollama", "gpt-3.5-turbo", false},
+		// Provider not in config at all → heuristic.
+		{"some-unknown-provider", "claude-sonnet-4-5", true},
+		{"some-unknown-provider", "deepseek-chat", false},
+	}
+	for _, c := range cases {
+		got := a.modelSupportsVision(c.provider, c.model)
+		if got != c.want {
+			t.Errorf("modelSupportsVision(%q, %q) = %v, want %v", c.provider, c.model, got, c.want)
 		}
 	}
 }
