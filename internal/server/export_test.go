@@ -2,6 +2,8 @@ package server
 
 import (
 	"net/http/httptest"
+	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -219,5 +221,99 @@ func TestExportSession_AttachmentsInlined(t *testing.T) {
 	// text intact.
 	if !strings.Contains(body, "data:image/png;base64,") {
 		t.Errorf("expected the inline image URL to survive, got:\n%s", body)
+	}
+}
+
+// ====================================================================
+// Filename encoding (RFC 5987 / 6266)
+// ====================================================================
+
+// TestExportSession_Filename_UnicodeTitle is the
+// regression lock for the "MD filename is garbled"
+// bug. The server must emit a Content-Disposition
+// header where:
+//   - the plain `filename="..."` parameter is
+//     pure ASCII (the session id + timestamp), so
+//     it round-trips through every HTTP client
+//   - the `filename*=UTF-8''...` parameter carries
+//     the human-readable title percent-encoded per
+//     RFC 5987, so browsers that honour the spec
+//     (all of them) use the Unicode form
+//
+// Without this, the user sees "pchat-?-20260719.md"
+// in their download dialog because the server pushed
+// raw Chinese bytes into the ASCII parameter.
+func TestExportSession_Filename_UnicodeTitle(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	// Create a session with a non-ASCII title.
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.RenameConversation(store.CurrentConversationID(), "调试记录 🛠")
+	_ = store.Flush()
+	sid := store.CurrentConversationID()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+sid+"/export?format=md", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	cd := w.Header().Get("Content-Disposition")
+	// Plain `filename="..."` must be pure ASCII.
+	plain := regexp.MustCompile(`filename="([^"]+)"`).FindStringSubmatch(cd)
+	if plain == nil {
+		t.Fatalf("missing plain filename in %q", cd)
+	}
+	for _, c := range plain[1] {
+		if c > 0x7f {
+			t.Errorf("plain filename has non-ASCII char %q in %q", c, plain[1])
+		}
+	}
+	if !strings.HasPrefix(plain[1], "pchat-"+sid+"-") {
+		t.Errorf("plain filename should be built from session id, got %q", plain[1])
+	}
+	// `filename*=UTF-8''...` must be present and
+	// percent-encoded (no raw Chinese bytes).
+	ext := regexp.MustCompile(`filename\*=UTF-8''([^;]+)`).FindStringSubmatch(cd)
+	if ext == nil {
+		t.Fatalf("missing filename* in %q", cd)
+	}
+	// Decoded form should contain the title.
+	decoded, err := url.QueryUnescape(ext[1])
+	if err != nil {
+		t.Fatalf("filename* not properly percent-encoded: %v (%q)", err, ext[1])
+	}
+	if !strings.Contains(decoded, "调试记录") {
+		t.Errorf("decoded filename* should contain the title, got %q", decoded)
+	}
+}
+
+func TestExportSession_Filename_PlainASCIIOnly(t *testing.T) {
+	// Title with only ASCII characters — both
+	// parameters should agree, no special
+	// encoding required.
+	s, _ := newTestServer(t)
+	store := s.store
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.RenameConversation(store.CurrentConversationID(), "Project discussion")
+	_ = store.Flush()
+	sid := store.CurrentConversationID()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+sid+"/export?format=md", nil)
+	s.engine.ServeHTTP(w, req)
+
+	cd := w.Header().Get("Content-Disposition")
+	plain := regexp.MustCompile(`filename="([^"]+)"`).FindStringSubmatch(cd)
+	if plain == nil {
+		t.Fatalf("missing plain filename in %q", cd)
+	}
+	if !strings.Contains(plain[1], "Project-discussion") {
+		t.Errorf("plain filename should include the title, got %q", plain[1])
 	}
 }

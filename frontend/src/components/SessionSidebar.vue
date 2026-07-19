@@ -417,15 +417,35 @@ async function doExport(id: string, format: ExportFormat) {
 }
 
 // parseContentDispositionFilename pulls a usable
-// filename out of a Content-Disposition header. We
-// honour the plain `filename="..."` form (the server
-// always sets it; the `filename*=UTF-8''…` parameter
-// is for the rare client that needs Unicode). Returns
-// the empty string on any parse failure.
+// filename out of a Content-Disposition header. Order
+// of preference (per RFC 6266 / 5987):
+//   1. `filename*=UTF-8''<percent-encoded>` — the
+//      Unicode-aware form. Decoded, this is the
+//      human-readable title. Browsers honour this in
+//      preference to the plain `filename=` parameter.
+//   2. `filename="..."` — always ASCII (the server
+//      builds this from the session id). Safe
+//      fallback for HTTP clients that don't decode
+//      `filename*`.
+// Returns the empty string on any parse failure — the
+// caller falls back to the client-side suggestion.
 function parseContentDispositionFilename(cd: string): string {
   if (!cd) return ''
-  const m = /filename="([^"]+)"/.exec(cd)
-  return m ? m[1] : ''
+  // Try the RFC 5987 form first. The charset is
+  // hard-coded to UTF-8 because that's the only
+  // value the server emits.
+  const ext = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(cd)
+  if (ext) {
+    try {
+      const decoded = decodeURIComponent(ext[1])
+      if (decoded) return decoded
+    } catch {
+      // Malformed percent-encoding — fall through
+      // to the plain form.
+    }
+  }
+  const plain = /filename="([^"]+)"/.exec(cd)
+  return plain ? plain[1] : ''
 }
 
 // ---------------------------------------------------------------------------

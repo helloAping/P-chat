@@ -19,6 +19,7 @@ package export
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/memory"
@@ -221,6 +222,14 @@ func ResultBlockToMarkdown(s, indent string) string {
 	if strings.HasPrefix(s, "data:image/") {
 		return fmt.Sprintf("%s![tool result](%s)\n\n", indent, s)
 	}
+	// A raw PNG signature (iVBORw0KGgo) is a
+	// common LLM-fingerprint: many models copy the
+	// base64 payload verbatim without the data:
+	// prefix when echoing a tool result. Wrap it
+	// so the markdown viewer can render it.
+	if isRawPNGPayload(s) {
+		return fmt.Sprintf("%s![tool result](data:image/png;base64,%s)\n\n", indent, s)
+	}
 	if IsJSON(s) {
 		return fmt.Sprintf("%s```json\n%s%s\n%s```\n\n", indent, indent, s, indent)
 	}
@@ -254,6 +263,87 @@ func IsJSON(s string) bool {
 	}
 	var v any
 	return json.Unmarshal([]byte(t), &v) == nil
+}
+
+// isRawPNGPayload is a cheap heuristic for the
+// "LLM echoed a PNG without the data: prefix" case: a
+// long string that starts with the PNG base64 magic
+// bytes (\x89PNG = iVBORw0KGgo) and is at least
+// 100 chars of base64 alphabet. False positives are
+// rare because the magic prefix is unambiguous — no
+// other common file format starts with those eight
+// characters.
+func isRawPNGPayload(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 100 {
+		return false
+	}
+	if !strings.HasPrefix(s, "iVBORw0KGgo") {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') {
+			return false
+		}
+	}
+	return true
+}
+
+// dataURLRegex matches a `data:image/<mime>;base64,<payload>`
+// substring inside a longer text. The character class
+// for the MIME is conservative (a-z, 0-9, +, -, .) so
+// `image/svg+xml` and `image/x-icon` both match.
+// Payload is the standard base64 alphabet.
+var dataURLRegex = regexp.MustCompile(`data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+`)
+
+// ExtractDataURLsFromContent finds every data:image/...
+// URL embedded in the content string and returns the
+// cleaned content (with the URLs removed) plus a list
+// of memory.Attachment entries to render alongside the
+// regular attachments. The cleaned content preserves
+// surrounding text so a message that read "看这张图
+// data:image/png;base64,..." still reads as "看这张图
+// " after the URL is lifted out.
+//
+// This is the fix for the "image shows as base64 string"
+// bug: when the LLM pastes a screenshot into its
+// response as inline text (instead of returning it via
+// a tool / attachment), the URL was previously dumped
+// verbatim into the markdown body. Now the exporter
+// recognises the pattern, lifts the URL out, and
+// renders it as a proper markdown image.
+func ExtractDataURLsFromContent(content string) (string, []memory.Attachment) {
+	matches := dataURLRegex.FindAllString(content, -1)
+	if len(matches) == 0 {
+		return content, nil
+	}
+	atts := make([]memory.Attachment, 0, len(matches))
+	for i, url := range matches {
+		mime := "image/png"
+		// Parse the MIME out of the data URL header
+		// (e.g. "data:image/jpeg;base64,..." →
+		// "image/jpeg"). Falls back to image/png
+		// when the header is malformed.
+		if colon := strings.Index(url, ":"); colon > 0 {
+			if semi := strings.Index(url[colon:], ";"); semi > 0 {
+				mime = url[colon+1 : colon+semi]
+			}
+		}
+		atts = append(atts, memory.Attachment{
+			Type: "image_url",
+			URL:  url,
+			Name: fmt.Sprintf("inline-%d", i+1),
+			Mime: mime,
+		})
+	}
+	cleaned := dataURLRegex.ReplaceAllString(content, "")
+	// Tidy up: collapse runs of whitespace left
+	// behind when a long URL is removed, so the
+	// reader doesn't see a 20-space gap in the
+	// prose.
+	cleaned = strings.TrimSpace(cleaned)
+	return cleaned, atts
 }
 
 // LooksLikeCode is the simple heuristic the markdown
@@ -324,9 +414,26 @@ func ToMarkdown(conv *memory.Conversation, msgs []memory.MessageFull) string {
 		m := mf.Msg
 		roleIcon := roleEmoji(m.Role)
 		fmt.Fprintf(&b, "## %s %s · msg #%d\n\n", roleIcon, titleCase(m.Role), i+1)
+		// Pre-extract any data:image/... URLs that
+		// snuck into the content text (the LLM
+		// sometimes pastes a screenshot as a
+		// string instead of returning it through a
+		// tool). They're lifted out of the body
+		// and rendered alongside the regular
+		// attachments so the reader sees an image
+		// instead of a 100KB base64 blob.
+		contentText, inlineAtts := ExtractDataURLsFromContent(m.Content)
 		// Attachments first (so the reader sees the
 		// upload before the question / response that
-		// references it).
+		// references it). Inline attachments (those
+		// extracted from the content) come BEFORE
+		// the structured multi_content attachments
+		// because the LLM typically dumps a
+		// screenshot at the end of its reply, after
+		// the prose.
+		for _, att := range inlineAtts {
+			b.WriteString(AttachmentToMarkdown(att))
+		}
 		for _, att := range mf.Attachments {
 			b.WriteString(AttachmentToMarkdown(att))
 		}
@@ -343,10 +450,10 @@ func ToMarkdown(conv *memory.Conversation, msgs []memory.MessageFull) string {
 				// the parts blob is
 				// unparseable — better to emit
 				// *something* than nothing.
-				b.WriteString(renderBody(m.Content))
+				b.WriteString(renderBody(contentText))
 			}
 		} else {
-			b.WriteString(renderBody(m.Content))
+			b.WriteString(renderBody(contentText))
 		}
 		if m.Name != "" {
 			fmt.Fprintf(&b, "*tool: `%s`*\n\n", m.Name)

@@ -105,10 +105,23 @@ func (h *Handler) ExportSession(c *gin.Context) {
 		return
 	}
 
-	filename := exportFilename(conv, ext)
+	// Two filenames: the plain `filename="..."` is
+	// always ASCII (built from the session id +
+	// timestamp) so it round-trips through every
+	// HTTP client and OS file dialog without
+	// mangling. The `filename*=UTF-8''...` carries
+	// the human-readable title for browsers that
+	// honour RFC 5987 (all of them since ~2015);
+	// they prefer the encoded form when both are
+	// present, so the user gets a nicely named
+	// file. The frontend parses `filename*` first
+	// and falls back to `filename=`.
+	asciiName := asciiFilename(conv, ext)
+	unicodeName := unicodeFilename(conv, ext)
 	c.Header("Content-Type", mime)
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`,
-		filename, export.URLEncodeFilename(filename)))
+	c.Header("Content-Disposition",
+		fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`,
+			asciiName, export.URLEncodeFilename(unicodeName)))
 	c.Header("Content-Length", fmt.Sprintf("%d", len(body)))
 	c.String(http.StatusOK, body)
 }
@@ -127,13 +140,31 @@ func parseExportFormat(s string) (export.Format, error) {
 	}
 }
 
-// exportFilename produces a safe filename for the
-// Content-Disposition header. Mirrors the CLI's
-// defaultExportFilename (pchat-<id>-<date>.<ext>) but
-// sanitises the title for filesystem-unsafe characters
-// and falls back to the session id when the title is
-// empty.
-func exportFilename(conv *memory.Conversation, ext string) string {
+// asciiFilename produces the safe ASCII filename used
+// for the plain `filename="..."` Content-Disposition
+// parameter. The stem is the sanitised title when it's
+// pure ASCII, otherwise it falls back to the session id
+// (always ASCII). The parameter must contain no
+// non-ASCII bytes — some HTTP stacks (older curl, some
+// embedded clients) mangle anything outside ASCII in
+// the plain parameter.
+func asciiFilename(conv *memory.Conversation, ext string) string {
+	ts := time.Now().Format("20060102-150405")
+	stem := asciiStem(conv)
+	return fmt.Sprintf("pchat-%s-%s.%s", stem, ts, ext)
+}
+
+// unicodeFilename produces the human-readable filename
+// (session title + timestamp) for the
+// `filename*=UTF-8''...` parameter. The title is
+// sanitised (filesystem-unsafe characters replaced)
+// and capped at 60 chars so a pathological 5KB title
+// doesn't blow up the header. The whole filename is
+// percent-encoded by the caller before it lands in
+// the wire header, so any UTF-8 character is safe to
+// emit here.
+func unicodeFilename(conv *memory.Conversation, ext string) string {
+	ts := time.Now().Format("20060102-150405")
 	stem := conv.Title
 	if stem == "" {
 		stem = conv.ID
@@ -142,8 +173,41 @@ func exportFilename(conv *memory.Conversation, ext string) string {
 		stem = stem[:60]
 	}
 	safe := export.SanitizeFilename(stem)
-	ts := time.Now().Format("20060102-150405")
 	return fmt.Sprintf("pchat-%s-%s.%s", safe, ts, ext)
+}
+
+// asciiStem is the stem used for the plain
+// `filename="..."` parameter. It returns the
+// sanitised title when every byte is printable ASCII
+// (i.e. the user can actually see it in their
+// download dialog), otherwise the session id (also
+// ASCII, always unique).
+func asciiStem(conv *memory.Conversation) string {
+	title := conv.Title
+	if title == "" {
+		return conv.ID
+	}
+	if len(title) > 60 {
+		title = title[:60]
+	}
+	safe := export.SanitizeFilename(title)
+	if isAllASCII(safe) && safe != "" {
+		return safe
+	}
+	return conv.ID
+}
+
+// isAllASCII reports whether s contains only printable
+// ASCII (no high bytes, no control characters).
+// Anything outside 0x20-0x7e is rejected, including the
+// common UTF-8 sequences for Chinese / emoji / etc.
+func isAllASCII(s string) bool {
+	for _, c := range s {
+		if c < 0x20 || c > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // Ensure filepath is referenced (so goimports doesn't
