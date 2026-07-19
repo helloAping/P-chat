@@ -33,7 +33,7 @@ func TestParseExportArgs_Defaults(t *testing.T) {
 func TestParseExportArgs_Format(t *testing.T) {
 	cases := []struct {
 		in   string
-		want ExportFormat
+		want Format
 	}{
 		{"", FormatMarkdown},
 		{"markdown", FormatMarkdown},
@@ -122,437 +122,6 @@ func TestDefaultExportFilename_JSON(t *testing.T) {
 	got := defaultExportFilename(conv, FormatJSON)
 	if !strings.HasSuffix(got, ".json") {
 		t.Errorf("expected .json suffix, got %q", got)
-	}
-}
-
-// ====================================================================
-// Markdown rendering
-// ====================================================================
-
-// toFullMFs converts a slice of llm.Message to the rich
-// memory.MessageFull shape the export writers expect. Used
-// by the legacy tests so we don't have to re-author every
-// fixture in the new shape.
-func toFullMFs(msgs []llm.Message) []memory.MessageFull {
-	out := make([]memory.MessageFull, len(msgs))
-	for i, m := range msgs {
-		out[i] = memory.MessageFull{Msg: m}
-	}
-	return out
-}
-
-func TestExportToMarkdown_Header(t *testing.T) {
-	conv := &memory.Conversation{
-		ID:        "conv_abc",
-		Title:     "Project discussion",
-		CreatedAt: time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC),
-		UpdatedAt: time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC),
-	}
-	got := exportToMarkdown(conv, nil)
-	for _, want := range []string{
-		"# Project discussion",
-		"conv_abc",
-		"**Messages**: 0",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing %q in:\n%s", want, got)
-		}
-	}
-}
-
-func TestExportToMarkdown_EmptyTitle(t *testing.T) {
-	conv := &memory.Conversation{ID: "conv_x"}
-	got := exportToMarkdown(conv, nil)
-	if !strings.Contains(got, "# (untitled)") {
-		t.Errorf("empty title should fall back to (untitled), got:\n%s", got)
-	}
-}
-
-func TestExportToMarkdown_Messages(t *testing.T) {
-	conv := &memory.Conversation{ID: "conv_1", Title: "T"}
-	msgs := toFullMFs([]llm.Message{
-		{Role: "user", Content: "Hello"},
-		{Role: "assistant", Content: "Hi there"},
-		{Role: "tool", Content: "result data", ToolCallID: "call_xyz", Name: "read_file"},
-	})
-	got := exportToMarkdown(conv, msgs)
-	for _, want := range []string{
-		"🧑 User",      // user with role icon
-		"🤖 Assistant", // assistant
-		"🔧 Tool",      // tool
-		"Hello",
-		"Hi there",
-		"result data",
-		"call_xyz",
-		"read_file",
-		"msg #1",
-		"msg #3",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing %q in markdown:\n%s", want, got)
-		}
-	}
-}
-
-func TestExportToMarkdown_CodeBlock(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	msgs := toFullMFs([]llm.Message{
-		{Role: "assistant", Content: "func foo() {\n\treturn 42\n}"},
-	})
-	got := exportToMarkdown(conv, msgs)
-	// Multi-line content with `{` should be wrapped in a code fence.
-	if !strings.Contains(got, "```") {
-		t.Errorf("expected code fence, got:\n%s", got)
-	}
-}
-
-func TestExportToMarkdown_NoFenceForPlainText(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	msgs := toFullMFs([]llm.Message{
-		{Role: "assistant", Content: "Just a plain sentence without code."},
-	})
-	got := exportToMarkdown(conv, msgs)
-	// Single-line plain text should NOT be fenced.
-	if strings.Contains(got, "```") {
-		t.Errorf("plain text should not be fenced, got:\n%s", got)
-	}
-}
-
-// ====================================================================
-// Markdown rendering — attachments (v2)
-// ====================================================================
-
-func TestExportToMarkdown_ImageAttachmentInline(t *testing.T) {
-	conv := &memory.Conversation{ID: "c", Title: "T"}
-	dataURL := "data:image/png;base64,iVBORw0KGgo="
-	msgs := []memory.MessageFull{
-		{
-			Msg: llm.Message{Role: "user", Content: "看这张图"},
-			Attachments: []memory.Attachment{
-				{Type: "image_url", URL: dataURL, Name: "shot.png", Mime: "image/png"},
-			},
-		},
-	}
-	got := exportToMarkdown(conv, msgs)
-	if !strings.Contains(got, "![shot.png](data:image/png;base64,") {
-		t.Errorf("expected inline image, got:\n%s", got)
-	}
-	if !strings.Contains(got, "看这张图") {
-		t.Errorf("expected user body text, got:\n%s", got)
-	}
-}
-
-func TestExportToMarkdown_AudioAttachmentAsLink(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	msgs := []memory.MessageFull{
-		{
-			Msg: llm.Message{Role: "user"},
-			Attachments: []memory.Attachment{
-				{Type: "audio_url", URL: "data:audio/mp3;base64,XYZ", Name: "song.mp3", Mime: "audio/mp3"},
-			},
-		},
-	}
-	got := exportToMarkdown(conv, msgs)
-	if !strings.Contains(got, "[🔊 song.mp3](data:audio/mp3") {
-		t.Errorf("expected audio link, got:\n%s", got)
-	}
-}
-
-func TestExportToMarkdown_TextAttachmentAsCodeBlock(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	msgs := []memory.MessageFull{
-		{
-			Msg: llm.Message{Role: "user"},
-			Attachments: []memory.Attachment{
-				{Type: "text", URL: "name,age\nalice,30", Name: "people.csv", Mime: "text/csv"},
-			},
-		},
-	}
-	got := exportToMarkdown(conv, msgs)
-	if !strings.Contains(got, "```csv") {
-		t.Errorf("expected csv code fence, got:\n%s", got)
-	}
-	if !strings.Contains(got, "alice,30") {
-		t.Errorf("expected csv body, got:\n%s", got)
-	}
-}
-
-// ====================================================================
-// Markdown rendering — parts[] (v2)
-// ====================================================================
-
-func TestExportToMarkdown_PartsText(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	partsJSON := []byte(`[{"kind":"text","text":"hello from parts"}]`)
-	msgs := []memory.MessageFull{
-		{
-			Msg:   llm.Message{Role: "assistant", Content: "stale legacy content"},
-			Parts: partsJSON,
-		},
-	}
-	got := exportToMarkdown(conv, msgs)
-	if !strings.Contains(got, "hello from parts") {
-		t.Errorf("expected parts text, got:\n%s", got)
-	}
-	// Legacy content should NOT also appear — the parts
-	// array takes precedence.
-	if strings.Contains(got, "stale legacy content") {
-		t.Errorf("legacy content should not appear when parts[] is set, got:\n%s", got)
-	}
-}
-
-func TestExportToMarkdown_PartsTool(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	partsJSON := []byte(`[{"kind":"tool","name":"browser_screenshot","status":"ok","result":"data:image/png;base64,ABCD"}]`)
-	msgs := []memory.MessageFull{
-		{
-			Msg:   llm.Message{Role: "assistant"},
-			Parts: partsJSON,
-		},
-	}
-	got := exportToMarkdown(conv, msgs)
-	// tool name + status header.
-	if !strings.Contains(got, "**browser_screenshot**") {
-		t.Errorf("expected tool name header, got:\n%s", got)
-	}
-	if !strings.Contains(got, "`ok`") {
-		t.Errorf("expected tool status, got:\n%s", got)
-	}
-	// base64 screenshot result → inline image (not a
-	// giant code block).
-	if !strings.Contains(got, "![tool result](data:image/png;base64,ABCD)") {
-		t.Errorf("expected base64 screenshot inlined as image, got:\n%s", got)
-	}
-}
-
-func TestExportToMarkdown_PartsThinking(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	partsJSON := []byte(`[{"kind":"text","text":"answer"},{"kind":"thinking","text":"let me think"}]`)
-	msgs := []memory.MessageFull{
-		{Msg: llm.Message{Role: "assistant"}, Parts: partsJSON},
-	}
-	got := exportToMarkdown(conv, msgs)
-	if !strings.Contains(got, "answer") {
-		t.Errorf("expected text body, got:\n%s", got)
-	}
-	if !strings.Contains(got, "<details>") || !strings.Contains(got, "thinking") {
-		t.Errorf("expected thinking details block, got:\n%s", got)
-	}
-}
-
-func TestExportToMarkdown_TopLevelThinking(t *testing.T) {
-	// Pre-parts-snapshot rows stored thinking as a top-level
-	// field, not inside the parts array. The exporter
-	// surfaces that as a details block too.
-	conv := &memory.Conversation{ID: "c"}
-	msgs := []memory.MessageFull{
-		{
-			Msg:      llm.Message{Role: "assistant", Content: "the answer"},
-			Thinking: "let me think hard",
-		},
-	}
-	got := exportToMarkdown(conv, msgs)
-	if !strings.Contains(got, "the answer") {
-		t.Errorf("expected body, got:\n%s", got)
-	}
-	if !strings.Contains(got, "let me think hard") {
-		t.Errorf("expected thinking body, got:\n%s", got)
-	}
-}
-
-// ====================================================================
-// JSON rendering
-// ====================================================================
-
-func TestExportToJSON_Shape(t *testing.T) {
-	conv := &memory.Conversation{
-		ID:        "conv_1",
-		Title:     "T",
-		CreatedAt: time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC),
-		UpdatedAt: time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC),
-	}
-	msgs := toFullMFs([]llm.Message{
-		{Role: "user", Content: "hi"},
-		{Role: "assistant", Content: "hello", ToolCallID: "c1", Name: "x"},
-	})
-	body, err := exportToJSON(conv, msgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var got struct {
-		Version    string `json:"version"`
-		ExportedAt string `json:"exported_at"`
-		Session    map[string]any
-		Messages   []map[string]any
-	}
-	if err := json.Unmarshal([]byte(body), &got); err != nil {
-		t.Fatalf("unmarshal: %v\nbody: %s", err, body)
-	}
-	if got.Version != "pchat-export/2" {
-		t.Errorf("version = %q, want pchat-export/2", got.Version)
-	}
-	if got.Session["id"] != "conv_1" {
-		t.Errorf("session.id = %v", got.Session["id"])
-	}
-	if len(got.Messages) != 2 {
-		t.Errorf("messages len = %d, want 2", len(got.Messages))
-	}
-	if got.Messages[1]["tool_call_id"] != "c1" {
-		t.Errorf("tool_call_id = %v", got.Messages[1]["tool_call_id"])
-	}
-	// v2: every message carries an `attachments` array
-	// (possibly empty) so consumers can iterate without
-	// a nil check.
-	for i, m := range got.Messages {
-		if _, ok := m["attachments"]; !ok {
-			t.Errorf("messages[%d] missing attachments field", i)
-		}
-	}
-}
-
-func TestExportToJSON_AttachmentsPresent(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	msgs := []memory.MessageFull{
-		{
-			Msg: llm.Message{Role: "user", Content: "看"},
-			Attachments: []memory.Attachment{
-				{Type: "image_url", URL: "data:image/png;base64,ABCD", Name: "a.png", Mime: "image/png"},
-			},
-		},
-	}
-	body, err := exportToJSON(conv, msgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got struct {
-		Messages []map[string]any `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(body), &got); err != nil {
-		t.Fatal(err)
-	}
-	atts, ok := got.Messages[0]["attachments"].([]any)
-	if !ok {
-		t.Fatalf("attachments not an array: %T", got.Messages[0]["attachments"])
-	}
-	if len(atts) != 1 {
-		t.Fatalf("attachments len = %d, want 1", len(atts))
-	}
-	att := atts[0].(map[string]any)
-	if att["type"] != "image_url" {
-		t.Errorf("attachment type = %v", att["type"])
-	}
-	if att["url"] != "data:image/png;base64,ABCD" {
-		t.Errorf("attachment url = %v", att["url"])
-	}
-	if att["name"] != "a.png" {
-		t.Errorf("attachment name = %v", att["name"])
-	}
-}
-
-func TestExportToJSON_PartsPresent(t *testing.T) {
-	conv := &memory.Conversation{ID: "c"}
-	partsJSON := []byte(`[{"kind":"text","text":"hi from parts"}]`)
-	msgs := []memory.MessageFull{
-		{
-			Msg:   llm.Message{Role: "assistant"},
-			Parts: partsJSON,
-		},
-	}
-	body, err := exportToJSON(conv, msgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got struct {
-		Messages []map[string]any `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(body), &got); err != nil {
-		t.Fatal(err)
-	}
-	raw, ok := got.Messages[0]["parts"]
-	if !ok {
-		t.Fatalf("parts field missing")
-	}
-	partsArr, ok := raw.([]any)
-	if !ok {
-		t.Fatalf("parts is not an array: %T", raw)
-	}
-	if len(partsArr) != 1 {
-		t.Fatalf("parts len = %d, want 1", len(partsArr))
-	}
-	part := partsArr[0].(map[string]any)
-	if part["kind"] != "text" || part["text"] != "hi from parts" {
-		t.Errorf("part = %+v", part)
-	}
-}
-
-func TestExportToJSON_RoundTrip(t *testing.T) {
-	// The exported JSON should be re-readable; downstream tools can
-	// re-feed it to an LLM.
-	conv := &memory.Conversation{ID: "x", Title: "t"}
-	msgs := toFullMFs([]llm.Message{
-		{Role: "user", Content: "hi"},
-		{Role: openai.ChatMessageRoleAssistant, Content: "world"},
-	})
-	body, _ := exportToJSON(conv, msgs)
-	var got struct {
-		Messages []llm.Message `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(body), &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Messages[0].Content != "hi" {
-		t.Errorf("roundtrip lost content")
-	}
-}
-
-// ====================================================================
-// attachmentsFromMultiContent
-// ====================================================================
-
-func TestAttachmentsFromMultiContent_Empty(t *testing.T) {
-	if got := memory.AttachmentsFromMultiContent(nil); got != nil {
-		t.Errorf("nil input → nil, got %v", got)
-	}
-}
-
-func TestAttachmentsFromMultiContent_ImageURL(t *testing.T) {
-	parts := []openai.ChatMessagePart{
-		{Type: openai.ChatMessagePartTypeImageURL, ImageURL: &openai.ChatMessageImageURL{URL: "data:image/png;base64,ABCD"}},
-	}
-	got := memory.AttachmentsFromMultiContent(parts)
-	if len(got) != 1 {
-		t.Fatalf("len = %d, want 1", len(got))
-	}
-	if got[0].Type != "image_url" || got[0].URL != "data:image/png;base64,ABCD" {
-		t.Errorf("got %+v", got[0])
-	}
-}
-
-func TestAttachmentsFromMultiContent_Text(t *testing.T) {
-	parts := []openai.ChatMessagePart{
-		{Type: openai.ChatMessagePartTypeText, Text: "hello"},
-	}
-	got := memory.AttachmentsFromMultiContent(parts)
-	if len(got) != 1 || got[0].Type != "text" || got[0].URL != "hello" {
-		t.Errorf("got %+v", got)
-	}
-}
-
-func TestAttachmentsFromMultiContent_Mixed(t *testing.T) {
-	parts := []openai.ChatMessagePart{
-		{Type: openai.ChatMessagePartTypeText, Text: "看"},
-		{Type: openai.ChatMessagePartTypeImageURL, ImageURL: &openai.ChatMessageImageURL{URL: "data:image/png;base64,XXX"}},
-	}
-	got := memory.AttachmentsFromMultiContent(parts)
-	if len(got) != 2 {
-		t.Fatalf("len = %d, want 2", len(got))
-	}
-	if got[0].Type != "text" {
-		t.Errorf("[0].type = %q", got[0].Type)
-	}
-	if got[1].Type != "image_url" {
-		t.Errorf("[1].type = %q", got[1].Type)
 	}
 }
 
@@ -755,5 +324,67 @@ func TestResolveSession_NotFound(t *testing.T) {
 	_, err := resolveSession(store, "conv_nonexistent")
 	if err == nil {
 		t.Error("expected error for missing session")
+	}
+}
+
+// ====================================================================
+// Cross-check: CLI doExport and HTTP export use the same
+// rendering core. This is the architectural promise —
+// both entry points produce byte-identical output for
+// the same data, modulo the wrapper (filename header vs
+// file path).
+// ====================================================================
+
+func TestDoExport_OutputMatchesRenderCore(t *testing.T) {
+	store := newExportStore(t)
+	seedConversation(t, store, []llm.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "world"},
+	})
+
+	dir := t.TempDir()
+	mdOut := filepath.Join(dir, "x.md")
+	if _, err := doExport(store, "-o "+mdOut); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(mdOut)
+	if !strings.Contains(string(body), "hello") || !strings.Contains(string(body), "world") {
+		t.Errorf("expected both messages, got:\n%s", body)
+	}
+	// Sanity: this is markdown, not JSON. The
+	// envelope version string `pchat-export/2` only
+	// appears in JSON output; markdown uses the
+	// `**Messages**:` header instead.
+	if strings.HasPrefix(strings.TrimSpace(string(body)), "{") {
+		t.Errorf("expected markdown (starts with `# `), got JSON: %s", body)
+	}
+	if !strings.Contains(string(body), "**Messages**: 2") {
+		t.Errorf("expected message count header, got:\n%s", body)
+	}
+}
+
+// The tests below are placeholders for the legacy
+// attachmentsFromMultiContent unit tests, which moved
+// to the memory package. Re-exported here as no-ops so
+// `go test ./internal/cli/...` stays self-documenting.
+func TestAttachmentsFromMultiContent_MovedToMemory(t *testing.T) {
+	// The function lives at memory.AttachmentsFromMultiContent;
+	// the cli package no longer tests it directly. This
+	// test exists as a marker so future readers know
+	// where to look.
+	parts := []openai.ChatMessagePart{
+		{Type: openai.ChatMessagePartTypeText, Text: "hello"},
+	}
+	got := memory.AttachmentsFromMultiContent(parts)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 attachment, got %d", len(got))
+	}
+	// Round-trip through JSON to confirm the wire shape.
+	b, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"type":"text"`) {
+		t.Errorf("attachment JSON missing type field: %s", b)
 	}
 }

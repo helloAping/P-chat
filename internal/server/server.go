@@ -206,6 +206,16 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// compressed summary. Powers the "上下文" drawer
 		// in the chat UI. See handler.go:ContextInspector.
 		api.GET("/sessions/:id/context", h.ContextInspector)
+		// Export — render the full session to markdown
+		// or JSON. The handler reads the rich row shape
+		// straight from the memory store (so the output
+		// is always self-contained — no in-memory
+		// attachment URLs to break) and returns the file
+		// body with Content-Disposition: attachment.
+		// The frontend just downloads from this URL;
+		// rendering happens server-side. See
+		// handler.go:ExportSession.
+		api.GET("/sessions/:id/export", h.ExportSession)
 		// P1-3 / P1-4: regenerate the assistant reply for a
 		// given user message. P1-3 physically deleted
 		// everything after that user message; P1-4

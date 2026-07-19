@@ -1777,6 +1777,132 @@ func AttachmentsFromMultiContent(parts []openai.ChatMessagePart) []Attachment {
 	return out
 }
 
+// GetMessagesFullByID is the per-session equivalent of
+// GetMessagesFull: it reads the same rich row shape
+// (parts + attachments + thinking) for a specific
+// conversation id, without touching the store's
+// currentID. The HTTP /export endpoint uses this so
+// concurrent exports of different sessions don't fight
+// over the global current, and so a single export can't
+// silently switch the user's active session out from
+// under them.
+//
+// Returns nil when the session id is empty or unknown —
+// matching GetMessagesFull's nil-on-missing convention so
+// callers can branch on len() rather than an error.
+//
+// The implementation is a near-copy of GetMessagesFull
+// with the WHERE-clause parameter pulled from the
+// argument instead of s.currentID. The two are kept
+// separate on purpose: GetMessagesFull is the hot path
+// the REPL hits per keystroke, GetMessagesFullByID is
+// the cold path hit once per export. Forcing them
+// through one method would either add a branch on
+// every REPL call or thread a "skip-current" flag
+// through call sites that don't need it.
+func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
+	if sessionID == "" {
+		return nil
+	}
+	_ = s.Flush()
+
+	limit := s.maxHistory
+	rows, err := s.db.Query(
+		`SELECT id, role, content, metadata, created_at FROM messages
+		 WHERE conversation_id = ?
+		 ORDER BY id ASC`,
+		sessionID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	type row struct {
+		msg  llm.Message
+		meta string
+		cre  int64
+	}
+	var rowsList []row
+	for rows.Next() {
+		var (
+			id        int64
+			role, content string
+			metadata  sql.NullString
+			created   int64
+		)
+		if err := rows.Scan(&id, &role, &content, &metadata, &created); err != nil {
+			break
+		}
+		m := llm.Message{Role: role, Content: content}
+		metaStr := ""
+		if metadata.Valid {
+			metaStr = metadata.String
+		}
+		if metaStr != "" {
+			var meta map[string]string
+			if json.Unmarshal([]byte(metaStr), &meta) == nil {
+				if v, ok := meta["tool_call_id"]; ok {
+					m.ToolCallID = v
+				}
+				if v, ok := meta["name"]; ok {
+					m.Name = v
+				}
+				if v, ok := meta["tool_calls"]; ok && v != "" {
+					var tcs []openai.ToolCall
+					if json.Unmarshal([]byte(v), &tcs) == nil {
+						m.ToolCalls = tcs
+					}
+				}
+				if v, ok := meta["multi_content"]; ok && v != "" {
+					var parts []openai.ChatMessagePart
+					if json.Unmarshal([]byte(v), &parts) == nil {
+						m.MultiContent = parts
+					}
+				}
+			}
+		}
+		rowsList = append(rowsList, row{msg: m, meta: metaStr, cre: created})
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+
+	// Apply maxHistory cap from the *end* of the
+	// ASC-ordered result, matching the REPL path's
+	// semantics: a very long session exports the most
+	// recent N messages, not a random middle slice.
+	if limit > 0 && len(rowsList) > limit {
+		rowsList = rowsList[len(rowsList)-limit:]
+	}
+
+	out := make([]MessageFull, len(rowsList))
+	for i, r := range rowsList {
+		out[i] = MessageFull{
+			Msg:       r.msg,
+			CreatedAt: r.cre,
+		}
+		if r.meta == "" {
+			continue
+		}
+		var meta map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(r.meta), &meta); err != nil {
+			continue
+		}
+		if v, ok := meta["parts"]; ok && len(v) > 0 && string(v) != "null" {
+			out[i].Parts = v
+		}
+		if v, ok := meta["thinking"]; ok {
+			var thinkingText string
+			if json.Unmarshal(v, &thinkingText) == nil {
+				out[i].Thinking = thinkingText
+			}
+		}
+		out[i].Attachments = AttachmentsFromMultiContent(out[i].Msg.MultiContent)
+	}
+	return out
+}
+
 // SetCurrent switches the active conversation.
 func (s *Store) SetCurrent(id string) error {
 	_ = s.Flush()

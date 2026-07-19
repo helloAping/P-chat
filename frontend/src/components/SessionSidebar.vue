@@ -47,7 +47,7 @@ import type { SearchResult } from '../api/client'
 import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
 import BrandLogo from './BrandLogo.vue'
-import { exportMessages, suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
+import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff,
@@ -319,44 +319,51 @@ function onSessionMenu(key: string, id: string) {
   }
 }
 
-// downloadSession fetches the full message list for `id` and
-// triggers a browser download in the chosen format. We pull
-// from the API (not the in-memory store) so the export
-// reflects the persisted truth, including messages the
-// current render hasn't loaded yet.
+// downloadSession triggers a server-side export. The
+// rendering lives in pchat-server (internal/export +
+// internal/server.ExportSession) and reads straight
+// from the memory store, so the output is always
+// self-contained — no in-memory blob: URLs to break,
+// no dependency on what the SPA happens to have in
+// memory. The frontend just downloads the response.
 //
 // Format / size guards:
 //   * sessions with > 5k messages show a confirmation
-//     dialog — exporting tens of MB of markdown synchronously
-//     (with attachment data: URLs inlined) on the main
-//     thread will jank the UI. The dialog uses
-//     `useDialog().warning` so the user explicitly approves.
-//   * filename collisions are deduplicated (-2, -3, …) by
-//     probing the suggested path against an in-memory set
-//     of filenames we've already offered this session. We
-//     can't enumerate the user's downloads folder, so we
-//     just guard against the rapid double-click case where
-//     two exports would otherwise write the same name.
-//   * the actual download uses a transient <a download> link
-//     + URL.createObjectURL, the standard SPA pattern.
+//     dialog — exporting tens of MB of markdown
+//     synchronously (with attachment data: URLs inlined)
+//     on the main thread will jank the UI. The dialog
+//     uses `useDialog().warning` so the user explicitly
+//     approves.
+//   * filename collisions are deduplicated (-2, -3, …)
+//     by probing the suggested name against an in-memory
+//     set of filenames we've already offered this
+//     session. We can't enumerate the user's downloads
+//     folder, so we just guard against the rapid
+//     double-click case where two exports would
+//     otherwise write the same name.
+//   * the actual download uses a transient <a download>
+//     link + URL.createObjectURL, the standard SPA
+//     pattern.
 
-// Module-level dedup cache. Reset on page reload; that's
-// fine — the worst case is one overwritten file across
-// reloads, and the user can rename in their downloads
-// folder.
+// Module-level dedup cache. Reset on page reload;
+// that's fine — the worst case is one overwritten file
+// across reloads, and the user can rename in their
+// downloads folder.
 const recentlyExported = new Set<string>()
-//     + URL.createObjectURL, the standard SPA pattern.
+
 async function doExport(id: string, format: ExportFormat) {
   try {
+    // Pre-flight: ask the API for the message count so
+    // the 5k guard can fire BEFORE we burn a server-side
+    // render. listMessages returns 200 + empty array for
+    // a brand-new session, which is fine to export (the
+    // server writes a header-only file in that case).
     const result = await api.listMessages(id)
-    const messages = result.messages
-    if (!messages || messages.length === 0) {
+    const messages = result.messages || []
+    if (messages.length === 0) {
       message.warning('该会话没有消息可导出')
       return
     }
-    // 5k-message guard. Wrapped in a confirmation dialog
-    // so the user can cancel before the export starts
-    // building a multi-MB body string.
     if (messages.length > 5000) {
       const proceed = await new Promise<boolean>((resolve) => {
         dialog.warning({
@@ -372,26 +379,28 @@ async function doExport(id: string, format: ExportFormat) {
       if (!proceed) return
     }
     const title = state.sessions.find(s => s.id === id)?.title ?? ''
-    // exportMessages is now async — it has to resolve
-    // blob: attachment URLs to data: URLs before the
-    // formatters can run. We surface a warning when the
-    // resolution fails (the body will still be emitted,
-    // just with original URLs).
-    const body = await exportMessages(messages, format, title)
-    const baseFilename = suggestFilename(title, format)
-    // Browser downloads go to the user's chosen folder
-    // and overwrite silently if a name clashes. We can't
-    // pre-check, so we just dedup against ourselves:
-    // a rapid second click of "导出" within the same
-    // second would otherwise overwrite. We use a
-    // weakSet-style cache (in-memory, lost on reload) —
-    // good enough for the common case.
+    // The server is the source of truth: it reads from
+    // the store, renders to markdown/JSON, and returns
+    // the file with Content-Disposition. The browser
+    // just downloads.
+    const fmtQuery = format === 'json' ? 'json' : 'md'
+    const resp = await fetch(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`, {
+      method: 'GET',
+    })
+    if (!resp.ok) {
+      const t = await resp.text()
+      throw new Error(`HTTP ${resp.status}: ${t}`)
+    }
+    const blob = await resp.blob()
+    // Prefer the server's Content-Disposition filename
+    // (it knows the session id + title + timestamp) but
+    // fall back to the client-side suggestion if the
+    // header is missing for any reason.
+    const cd = resp.headers.get('Content-Disposition') || ''
+    const serverName = parseContentDispositionFilename(cd)
+    const baseFilename = serverName || suggestFilename(title, format)
     const filename = dedupeFilename(baseFilename, (p) => recentlyExported.has(p))
     recentlyExported.add(filename)
-    const mime =
-      format === 'json' ? 'application/json' :
-      'text/markdown'
-    const blob = new Blob([body], { type: `${mime};charset=utf-8` })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -405,6 +414,18 @@ async function doExport(id: string, format: ExportFormat) {
     console.error('[export] failed:', e)
     message.error('导出失败: ' + (e instanceof Error ? e.message : String(e)))
   }
+}
+
+// parseContentDispositionFilename pulls a usable
+// filename out of a Content-Disposition header. We
+// honour the plain `filename="..."` form (the server
+// always sets it; the `filename*=UTF-8''…` parameter
+// is for the rare client that needs Unicode). Returns
+// the empty string on any parse failure.
+function parseContentDispositionFilename(cd: string): string {
+  if (!cd) return ''
+  const m = /filename="([^"]+)"/.exec(cd)
+  return m ? m[1] : ''
 }
 
 // ---------------------------------------------------------------------------
