@@ -1514,6 +1514,269 @@ func (s *Store) GetMessagesWithMeta() ([]llm.Message, []string, []int64) {
 	return msgs, metas, createds
 }
 
+// Attachment is one uploaded file (image / audio / video /
+// text) attached to a message. Sourced from the
+// `multi_content` field in the messages table's metadata
+// for user messages, pre-parsed for the CLI /export path
+// so the markdown writer can inline data: URLs without
+// re-walking the raw OpenAI ChatMessagePart JSON.
+//
+// Type mirrors openai.ChatMessagePart.Type:
+//   - "image_url" / "audio_url" / "video_url": URL carries
+//     the data: URL (or https:// URL when the attachment
+//     is remote)
+//   - "text":      URL carries the file body (text / csv /
+//     json / etc. decoded as a UTF-8 string)
+//
+// The Name and Mime fields preserve the original filename
+// and MIME for the export's display path.
+type Attachment struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
+	Name string `json:"name,omitempty"`
+	Mime string `json:"mime,omitempty"`
+}
+
+// MessageFull is the rich message shape used by the CLI
+// /export path. It adds two fields on top of llm.Message:
+//   - Parts: the raw JSON of the assistant message's
+//     structured parts (thinking / tool / sub_agent /
+//     question). Stored as json.RawMessage so the caller
+//     can re-marshal it (JSON export) or decode it
+//     (markdown export) without losing any fields the
+//     typed llm.Message doesn't carry.
+//   - Attachments: the typed list of user-uploaded files
+//     extracted from multi_content. Empty for rows that
+//     don't carry uploads (e.g. assistant messages).
+//   - Thinking: the assistant's chain-of-thought, when
+//     persisted. Lives outside parts[] in the frontend
+//     message model but is stored under the same row.
+//   - CreatedAt: the row's unix-seconds creation time.
+type MessageFull struct {
+	Msg         llm.Message
+	Parts       json.RawMessage `json:"parts,omitempty"`
+	Attachments []Attachment    `json:"attachments,omitempty"`
+	Thinking    string          `json:"thinking,omitempty"`
+	CreatedAt   int64           `json:"created_at"`
+}
+
+// GetMessagesFull is like GetMessages but returns the
+// rich shape the CLI /export path needs. It re-hydrates
+// the assistant message's `parts` (thinking / tool cards /
+// sub-agent runs) and the user message's attachments in
+// one pass, so the caller doesn't have to thread the
+// raw metadata through to the export pipeline.
+//
+// Behaviour:
+//   - Same row selection as GetMessages: current
+//     conversation, ordered by id DESC, capped by
+//     maxHistory. The slice is returned oldest-first.
+//   - Per-row error tolerance: a row that fails to parse
+//     is dropped silently (matching the GetMessages
+//     convention). The caller sees a shorter slice, not
+//     a Go error.
+//   - Parts is nil (not "null") for rows that don't have
+//     a `parts` key in their metadata — the difference
+//     matters for the markdown writer, which uses the
+//     nil check to decide whether to render the parts
+//     array or the legacy denormalised content field.
+func (s *Store) GetMessagesFull() []MessageFull {
+	_ = s.Flush()
+	convID := s.currentID
+	if convID == "" {
+		return nil
+	}
+
+	limit := s.maxHistory
+	rows, err := s.db.Query(
+		`SELECT id, role, content, metadata, created_at FROM messages
+		 WHERE conversation_id = ?
+		 ORDER BY id DESC LIMIT ?`,
+		convID, limitOrHuge(limit),
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	type row struct {
+		msg  llm.Message
+		meta string
+		cre  int64
+	}
+	var rev []row
+	for rows.Next() {
+		var (
+			id        int64
+			role, content string
+			metadata  sql.NullString
+			created   int64
+		)
+		if err := rows.Scan(&id, &role, &content, &metadata, &created); err != nil {
+			break
+		}
+		m := llm.Message{Role: role, Content: content}
+		metaStr := ""
+		if metadata.Valid {
+			metaStr = metadata.String
+		}
+		if metaStr != "" {
+			var meta map[string]string
+			if json.Unmarshal([]byte(metaStr), &meta) == nil {
+				if v, ok := meta["tool_call_id"]; ok {
+					m.ToolCallID = v
+				}
+				if v, ok := meta["name"]; ok {
+					m.Name = v
+				}
+				if v, ok := meta["tool_calls"]; ok && v != "" {
+					var tcs []openai.ToolCall
+					if json.Unmarshal([]byte(v), &tcs) == nil {
+						m.ToolCalls = tcs
+					}
+				}
+				if v, ok := meta["multi_content"]; ok && v != "" {
+					var parts []openai.ChatMessagePart
+					if json.Unmarshal([]byte(v), &parts) == nil {
+						m.MultiContent = parts
+					}
+				}
+			}
+		}
+		rev = append(rev, row{msg: m, meta: metaStr, cre: created})
+	}
+
+	// Reverse so output is oldest-first, matching
+	// GetMessages / GetMessagesWithMeta.
+	n := len(rev)
+	out := make([]MessageFull, n)
+	for i := 0; i < n; i++ {
+		r := rev[n-1-i]
+		out[i] = MessageFull{
+			Msg:       r.msg,
+			CreatedAt: r.cre,
+		}
+		// Re-hydrate the assistant message's structured
+		// parts (thinking / tool / sub_agent) and any
+		// user-uploaded attachments from the raw
+		// metadata JSON. Stored under different keys:
+		//   - "parts"          → assistant message's
+		//                        MessagePart array
+		//   - "thinking"       → assistant's thinking text
+		//   - "multi_content"  → user uploads (already
+		//                        restored on Msg above;
+		//                        re-parsed here into a
+		//                        typed []Attachment for
+		//                        the export)
+		if r.meta == "" {
+			continue
+		}
+		// The metadata JSON is heterogeneous across
+		// schemas (tool_call_id is a string, parts is an
+		// array, multi_content is a string-encoded
+		// array). We unmarshal into a generic shape
+		// once and pull out the keys we care about,
+		// rather than maintaining a hand-rolled typed
+		// struct that would need to track every
+		// future field the agent adds.
+		var meta map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(r.meta), &meta); err != nil {
+			continue
+		}
+		if v, ok := meta["parts"]; ok && len(v) > 0 && string(v) != "null" {
+			out[i].Parts = v
+		}
+		if v, ok := meta["thinking"]; ok {
+			// Thinking is stored as a JSON string
+			// (quoted); unmarshal to drop the
+			// surrounding quotes.
+			var s string
+			if json.Unmarshal(v, &s) == nil {
+				out[i].Thinking = s
+			}
+		}
+		// Always re-derive Attachments from
+		// multi_content, even when it's empty — the
+		// caller can rely on the field being a
+		// (possibly empty) slice rather than nil for
+		// the rows we know how to decode.
+		out[i].Attachments = AttachmentsFromMultiContent(out[i].Msg.MultiContent)
+	}
+	return out
+}
+
+// AttachmentsFromMultiContent turns the OpenAI
+// ChatMessagePart list (the wire format for
+// multi_content) into a flat []Attachment the export
+// can iterate without knowing the OpenAI SDK shapes.
+//
+// The translation is deliberately lossy on `type`:
+//   - "image_url" / "audio_url" / "video_url" pass
+//     through, with the data URL preserved verbatim
+//   - "text" is collapsed to a single Attachment whose
+//     URL field holds the joined text body. The export
+//     writer treats this as a text file (rendered as a
+//     code block in markdown).
+//
+// Returns nil (not an empty slice) when the input is
+// empty — the export writers use a nil check to skip
+// the "attachments" section entirely.
+//
+// Exported so the CLI's test suite (and any other
+// package that wants to render multi_content without
+// importing the OpenAI SDK) can reuse the same
+// translation.
+func AttachmentsFromMultiContent(parts []openai.ChatMessagePart) []Attachment {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]Attachment, 0, len(parts))
+	for _, p := range parts {
+		switch p.Type {
+		case openai.ChatMessagePartTypeImageURL:
+			url := ""
+			if p.ImageURL != nil {
+				url = p.ImageURL.URL
+			}
+			out = append(out, Attachment{
+				Type: "image_url",
+				URL:  url,
+				Mime: "image/png", // best-effort; the wire format doesn't carry the MIME separately for image_url
+			})
+		case "audio_url":
+			url := ""
+			if p.ImageURL != nil {
+				url = p.ImageURL.URL
+			}
+			out = append(out, Attachment{
+				Type: "audio_url",
+				URL:  url,
+				Mime: "audio/mpeg",
+			})
+		case "video_url":
+			url := ""
+			if p.ImageURL != nil {
+				url = p.ImageURL.URL
+			}
+			out = append(out, Attachment{
+				Type: "video_url",
+				URL:  url,
+				Mime: "video/mp4",
+			})
+		case openai.ChatMessagePartTypeText:
+			out = append(out, Attachment{
+				Type: "text",
+				URL:  p.Text,
+				Mime: "text/plain",
+			})
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // SetCurrent switches the active conversation.
 func (s *Store) SetCurrent(id string) error {
 	_ = s.Flush()

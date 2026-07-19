@@ -33,7 +33,7 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NTag, NSpin, NDropdown, useMessage } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
 import { h } from 'vue'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
@@ -47,7 +47,7 @@ import type { SearchResult } from '../api/client'
 import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
 import BrandLogo from './BrandLogo.vue'
-import { exportMessages, suggestFilename, type ExportFormat } from '../utils/export'
+import { exportMessages, suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff,
@@ -63,6 +63,7 @@ const themeName = defineModel<'dark' | 'light'>('themeName', { default: 'dark' }
 const showTokenStats = ref(false)
 
 const message = useMessage()
+const dialog = useDialog()
 const showAddProject = ref(false)
 const newProjectName = ref('')
 const newProjectPath = ref('')
@@ -289,11 +290,6 @@ function sessionMenuOptions(id: string) {
       label: '导出 JSON',
       icon: () => h(DownloadIcon, { size: 14 }),
     },
-    {
-      key: 'export-html',
-      label: '导出 HTML',
-      icon: () => h(DownloadIcon, { size: 14 }),
-    },
     { type: 'divider' as const, key: 'd2' },
     {
       key: 'delete',
@@ -315,8 +311,7 @@ function onSessionMenu(key: string, id: string) {
       break
     }
     case 'export-md':
-    case 'export-json':
-    case 'export-html': {
+    case 'export-json': {
       const fmt = key.slice('export-'.length) as ExportFormat
       doExport(id, fmt)
       break
@@ -331,10 +326,25 @@ function onSessionMenu(key: string, id: string) {
 // current render hasn't loaded yet.
 //
 // Format / size guards:
-//   * sessions with > 5k messages show a confirmation toast
-//     first — exporting tens of MB of HTML synchronously on
-//     the main thread will jank the UI.
+//   * sessions with > 5k messages show a confirmation
+//     dialog — exporting tens of MB of markdown synchronously
+//     (with attachment data: URLs inlined) on the main
+//     thread will jank the UI. The dialog uses
+//     `useDialog().warning` so the user explicitly approves.
+//   * filename collisions are deduplicated (-2, -3, …) by
+//     probing the suggested path against an in-memory set
+//     of filenames we've already offered this session. We
+//     can't enumerate the user's downloads folder, so we
+//     just guard against the rapid double-click case where
+//     two exports would otherwise write the same name.
 //   * the actual download uses a transient <a download> link
+//     + URL.createObjectURL, the standard SPA pattern.
+
+// Module-level dedup cache. Reset on page reload; that's
+// fine — the worst case is one overwritten file across
+// reloads, and the user can rename in their downloads
+// folder.
+const recentlyExported = new Set<string>()
 //     + URL.createObjectURL, the standard SPA pattern.
 async function doExport(id: string, format: ExportFormat) {
   try {
@@ -344,14 +354,41 @@ async function doExport(id: string, format: ExportFormat) {
       message.warning('该会话没有消息可导出')
       return
     }
+    // 5k-message guard. Wrapped in a confirmation dialog
+    // so the user can cancel before the export starts
+    // building a multi-MB body string.
     if (messages.length > 5000) {
-      message.warning(`消息数较多 (${messages.length}), 导出可能需要几秒...`)
+      const proceed = await new Promise<boolean>((resolve) => {
+        dialog.warning({
+          title: '会话较大',
+          content: `该会话有 ${messages.length} 条消息,导出可能需要数秒并产生较大的文件。继续?`,
+          positiveText: '继续导出',
+          negativeText: '取消',
+          onPositiveClick: () => resolve(true),
+          onNegativeClick: () => resolve(false),
+          onClose: () => resolve(false),
+        })
+      })
+      if (!proceed) return
     }
     const title = state.sessions.find(s => s.id === id)?.title ?? ''
-    const body = exportMessages(messages, format, title)
-    const filename = suggestFilename(title, format)
+    // exportMessages is now async — it has to resolve
+    // blob: attachment URLs to data: URLs before the
+    // formatters can run. We surface a warning when the
+    // resolution fails (the body will still be emitted,
+    // just with original URLs).
+    const body = await exportMessages(messages, format, title)
+    const baseFilename = suggestFilename(title, format)
+    // Browser downloads go to the user's chosen folder
+    // and overwrite silently if a name clashes. We can't
+    // pre-check, so we just dedup against ourselves:
+    // a rapid second click of "导出" within the same
+    // second would otherwise overwrite. We use a
+    // weakSet-style cache (in-memory, lost on reload) —
+    // good enough for the common case.
+    const filename = dedupeFilename(baseFilename, (p) => recentlyExported.has(p))
+    recentlyExported.add(filename)
     const mime =
-      format === 'html' ? 'text/html' :
       format === 'json' ? 'application/json' :
       'text/markdown'
     const blob = new Blob([body], { type: `${mime};charset=utf-8` })
