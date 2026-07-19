@@ -2,6 +2,7 @@ package export
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1105,5 +1106,261 @@ func TestToMarkdown_BareBase64LiftedFromContent(t *testing.T) {
 	}
 	if !strings.Contains(got, "结束") {
 		t.Errorf("prose suffix should be preserved, got:\n%s", got)
+	}
+}
+
+// ====================================================================
+// JSON envelope — content / parts extraction
+//
+// The JSON export used to leave the message body
+// untouched, so a screenshot the LLM echoed as inline
+// base64 (Case 2) or a tool result the agent persisted
+// to parts[].result (Case 3) both surfaced in the
+// envelope as a 100KB wall of `data:image/png;base64,XX…`
+// with no `type` / `kind` / `attachment_kinds` info
+// to tell the consumer "this is an image". The tests
+// below lock the fix: every base64 image payload,
+// regardless of where it hides, ends up in
+// `attachments[]` with `type: "image_url"` /
+// `kind: "image"`, and the `attachment_kinds` /
+// `attachment_count` summary fields reflect it.
+// ====================================================================
+
+// TestToJSON_LiftedFromContent_DataURL covers the
+// "LLM echoed a data:image/...;base64,..." URL in
+// Msg.Content case. The envelope must surface it as
+// an attachment and clean the body.
+func TestToJSON_LiftedFromContent_DataURL(t *testing.T) {
+	conv := &memory.Conversation{ID: "c"}
+	dataURL := "data:image/png;base64," + validPNGPayload
+	msgs := toFullMFs([]llm.Message{
+		{Role: "user", Content: "看 " + dataURL + " 完毕"},
+	})
+	body, err := ToJSON(conv, msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 1 {
+		t.Fatalf("messages len = %d, want 1", len(got.Messages))
+	}
+	// Content is cleaned — the data: URL is gone.
+	if strings.Contains(got.Messages[0]["content"].(string), dataURL) {
+		t.Errorf("data: URL should be lifted out of content, got %q",
+			got.Messages[0]["content"])
+	}
+	// The data: URL appears as an attachment.
+	atts, _ := got.Messages[0]["attachments"].([]any)
+	if len(atts) != 1 {
+		t.Fatalf("attachments len = %d, want 1", len(atts))
+	}
+	att := atts[0].(map[string]any)
+	if att["type"] != "image_url" {
+		t.Errorf("attachment type = %v, want image_url", att["type"])
+	}
+	if att["kind"] != "image" {
+		t.Errorf("attachment kind = %v, want image", att["kind"])
+	}
+	if att["url"] != dataURL {
+		t.Errorf("attachment url mismatch")
+	}
+	// Summary fields reflect the lifted image.
+	if kinds, _ := got.Messages[0]["attachment_kinds"].([]any); len(kinds) != 1 || kinds[0] != "image" {
+		t.Errorf("attachment_kinds = %v, want [image]", got.Messages[0]["attachment_kinds"])
+	}
+	if c, _ := got.Messages[0]["attachment_count"].(float64); c != 1 {
+		t.Errorf("attachment_count = %v, want 1", got.Messages[0]["attachment_count"])
+	}
+	// Surrounding prose is preserved.
+	if !strings.Contains(got.Messages[0]["content"].(string), "看 ") {
+		t.Errorf("prose prefix should be preserved, got %q",
+			got.Messages[0]["content"])
+	}
+	if !strings.Contains(got.Messages[0]["content"].(string), " 完毕") {
+		t.Errorf("prose suffix should be preserved, got %q",
+			got.Messages[0]["content"])
+	}
+}
+
+// TestToJSON_LiftedFromContent_BareBase64 covers the
+// "LLM echoed a bare base64 PNG in Msg.Content" case
+// (the data: header was dropped). Same expectations
+// as the data: URL test, but the input is the
+// payload-only form.
+func TestToJSON_LiftedFromContent_BareBase64(t *testing.T) {
+	conv := &memory.Conversation{ID: "c"}
+	in := "这是截图\n" + validPNGPayload + "\n结束"
+	msgs := toFullMFs([]llm.Message{
+		{Role: "assistant", Content: in},
+	})
+	body, err := ToJSON(conv, msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got.Messages[0]["content"].(string), validPNGPayload) {
+		t.Errorf("bare payload should be lifted out of content, got %q",
+			got.Messages[0]["content"])
+	}
+	atts, _ := got.Messages[0]["attachments"].([]any)
+	if len(atts) != 1 {
+		t.Fatalf("attachments len = %d, want 1", len(atts))
+	}
+	att := atts[0].(map[string]any)
+	if att["kind"] != "image" {
+		t.Errorf("attachment kind = %v, want image", att["kind"])
+	}
+	want := "data:image/png;base64," + validPNGPayload
+	if att["url"] != want {
+		t.Errorf("attachment url mismatch:\n got %q\nwant %q", att["url"], want)
+	}
+}
+
+// TestToJSON_LiftedFromToolResult covers the
+// "browser_screenshot returned a data: URL" case.
+// The image lives in parts[].result, not in
+// content — the consumer wouldn't otherwise know
+// it's an image. The exporter must surface it in
+// attachments[] with the right type/kind, while
+// preserving parts[] verbatim (the raw tool
+// result is sometimes consumed by tool-aware
+// tooling).
+func TestToJSON_LiftedFromToolResult(t *testing.T) {
+	conv := &memory.Conversation{ID: "c"}
+	dataURL := "data:image/jpeg;base64,/9j/" + strings.Repeat("A", 110)
+	partsJSON := []byte(fmt.Sprintf(`[{"kind":"tool","name":"browser_screenshot","status":"ok","result":%q}]`, dataURL))
+	msgs := []memory.MessageFull{
+		{
+			Msg:   llm.Message{Role: "assistant", Content: "这是截图"},
+			Parts: partsJSON,
+		},
+	}
+	body, err := ToJSON(conv, msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	// parts[] is preserved verbatim — the raw
+	// result string is still accessible.
+	rawParts, ok := got.Messages[0]["parts"].([]any)
+	if !ok || len(rawParts) != 1 {
+		t.Fatalf("parts[] missing or wrong shape: %+v", got.Messages[0]["parts"])
+	}
+	// The summary fields reflect the lifted image.
+	if kinds, _ := got.Messages[0]["attachment_kinds"].([]any); len(kinds) != 1 || kinds[0] != "image" {
+		t.Errorf("attachment_kinds = %v, want [image]", got.Messages[0]["attachment_kinds"])
+	}
+	if c, _ := got.Messages[0]["attachment_count"].(float64); c != 1 {
+		t.Errorf("attachment_count = %v, want 1", got.Messages[0]["attachment_count"])
+	}
+	// The attachment carries the right metadata.
+	atts, _ := got.Messages[0]["attachments"].([]any)
+	if len(atts) != 1 {
+		t.Fatalf("attachments len = %d, want 1", len(atts))
+	}
+	att := atts[0].(map[string]any)
+	if att["kind"] != "image" {
+		t.Errorf("attachment kind = %v, want image", att["kind"])
+	}
+	if att["type"] != "image_url" {
+		t.Errorf("attachment type = %v, want image_url", att["type"])
+	}
+}
+
+// TestToJSON_ContentPreservedForProse ensures the
+// extraction only runs when there's actually an
+// image to lift. Plain text passes through with no
+// spurious attachment entry.
+func TestToJSON_ContentPreservedForProse(t *testing.T) {
+	conv := &memory.Conversation{ID: "c"}
+	msgs := toFullMFs([]llm.Message{
+		{Role: "user", Content: "just a question"},
+		{Role: "assistant", Content: "this is the answer"},
+	})
+	body, err := ToJSON(conv, msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range got.Messages {
+		if atts, _ := m["attachments"].([]any); len(atts) != 0 {
+			t.Errorf("msg[%d] plain text should have no attachments, got %v", i, atts)
+		}
+		if c, _ := m["attachment_count"].(float64); c != 0 {
+			t.Errorf("msg[%d] attachment_count = %v, want 0", i, m["attachment_count"])
+		}
+	}
+	if got.Messages[0]["content"] != "just a question" {
+		t.Errorf("user content modified: %q", got.Messages[0]["content"])
+	}
+	if got.Messages[1]["content"] != "this is the answer" {
+		t.Errorf("assistant content modified: %q", got.Messages[1]["content"])
+	}
+}
+
+// TestToJSON_CombinedSources checks the case where
+// a single message has BOTH a structured multi_content
+// attachment AND a data: URL echoed in content. Both
+// end up in `attachments[]`; the summary counts both.
+func TestToJSON_CombinedSources(t *testing.T) {
+	conv := &memory.Conversation{ID: "c"}
+	dataURL := "data:image/png;base64," + validPNGPayload
+	msgs := []memory.MessageFull{
+		{
+			Msg: llm.Message{
+				Role:    "user",
+				Content: "看 " + dataURL,
+			},
+			Attachments: []memory.Attachment{
+				{
+					Type: "image_url", Kind: "image",
+					URL: "data:image/png;base64,STRUCTURED",
+					Name: "structured.png", Mime: "image/png",
+				},
+			},
+		},
+	}
+	body, err := ToJSON(conv, msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	// attachments: 1 extracted + 1 structured = 2
+	atts, _ := got.Messages[0]["attachments"].([]any)
+	if len(atts) != 2 {
+		t.Fatalf("attachments len = %d, want 2", len(atts))
+	}
+	if c, _ := got.Messages[0]["attachment_count"].(float64); c != 2 {
+		t.Errorf("attachment_count = %v, want 2", got.Messages[0]["attachment_count"])
+	}
+	// Both kinds are 'image' but dedup'd to one
+	// entry in the summary array.
+	if kinds, _ := got.Messages[0]["attachment_kinds"].([]any); len(kinds) != 1 || kinds[0] != "image" {
+		t.Errorf("attachment_kinds = %v, want [image] (dedup'd)", got.Messages[0]["attachment_kinds"])
 	}
 }

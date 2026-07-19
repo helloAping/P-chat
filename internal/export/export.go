@@ -333,6 +333,7 @@ func ExtractDataURLsFromContent(content string) (string, []memory.Attachment) {
 		}
 		atts = append(atts, memory.Attachment{
 			Type: "image_url",
+			Kind: "image",
 			URL:  url,
 			Name: fmt.Sprintf("inline-%d", i+1),
 			Mime: mime,
@@ -465,6 +466,7 @@ func ExtractRawBase64Images(content string) (string, []memory.Attachment) {
 			mime := sniffImageMime(trimmed)
 			atts = append(atts, memory.Attachment{
 				Type: "image_url",
+				Kind: "image",
 				URL:  "data:" + mime + ";base64," + trimmed,
 				Name: fmt.Sprintf("raw-%d", i+1),
 				Mime: mime,
@@ -501,6 +503,127 @@ func defaultStr(s, dflt string) string {
 		return dflt
 	}
 	return s
+}
+
+// extractFromToolResult scans a tool-call part's result
+// string for image data (data: URLs and bare base64)
+// and returns the attachments it found. The result
+// string itself is NOT modified — the caller decides
+// whether to mutate the part (the markdown writer
+// rewrites; the JSON writer preserves the raw part).
+//
+// Why this exists: the browser_screenshot tool (and
+// any other tool that returns an image) puts the
+// base64 / data: URL in `parts[].result`, NOT in
+// `parts[].attachments` (there is no such field) and
+// NOT in `Msg.Content`. Without this scan, the JSON
+// export would carry the data in a part-result string
+// with no type info — the user would see a base64
+// wall and no way to know it's a picture.
+func extractFromToolResult(result string) []memory.Attachment {
+	if result == "" {
+		return nil
+	}
+	// The result might be a single image or a JSON
+	// envelope. Try data: URL first (the common
+	// shape from browser_screenshot), then fall
+	// back to bare-base64 line scan.
+	cleaned, atts := ExtractDataURLsFromContent(result)
+	if len(atts) > 0 {
+		return atts
+	}
+	// If the result is a JSON envelope, the image
+	// is usually under {"image": "data:..."} or
+	// similar — but those are not common in the
+	// current tool set, so we don't unpack JSON
+	// here. Bare base64 in a single-line result
+	// is also unusual; skip if so.
+	if strings.Contains(cleaned, "\n") {
+		_, rawAtts := ExtractRawBase64Images(cleaned)
+		if len(rawAtts) > 0 {
+			return rawAtts
+		}
+	}
+	return nil
+}
+
+// extractContentAttachments runs every extractor on
+// the message's content + parts and returns the
+// combined list of image attachments it found, plus
+// the cleaned content (with images lifted out). The
+// cleaned content is the `Msg.Content` value the
+// exporter should render / serialise — the original
+// is never exposed once extraction runs.
+//
+// Used by both ToMarkdown and ToJSON so the two
+// formats agree on what counts as an image:
+//   - data: URLs in content (ExtractDataURLsFromContent)
+//   - bare base64 lines in content (ExtractRawBase64Images)
+//   - data: URLs / bare base64 in parts[].result
+//     (extractFromToolResult)
+//
+// The structured `mf.Attachments` (from multi_content)
+// is appended LAST so the per-attachment `type` /
+// `kind` / `mime` set by the store's extraction path
+// take precedence over what we infer from the URL
+// prefix — a multi_content image_url entry was already
+// classified at storage time.
+func extractContentAttachments(mf memory.MessageFull) (string, []memory.Attachment) {
+	cleaned, atts := ExtractDataURLsFromContent(mf.Msg.Content)
+	cleaned, rawAtts := ExtractRawBase64Images(cleaned)
+	atts = append(atts, rawAtts...)
+
+	// Walk parts[] for tool results that carry
+	// inline image data. We only touch the result
+	// string of `kind: "tool"` parts (sub-agents
+	// get their own walk; their tool calls are
+	// nested under their own parts[].result).
+	if len(mf.Parts) > 0 {
+		var parts []MessagePart
+		if err := json.Unmarshal(mf.Parts, &parts); err == nil {
+			for _, p := range parts {
+				if p.Kind == "tool" {
+					toolAtts := extractFromToolResult(p.Result)
+					atts = append(atts, toolAtts...)
+				}
+				// Sub-agents: recurse into the nested
+				// parts array so a sub-agent's tool
+				// result images are also lifted.
+				if p.Kind == "sub_agent" {
+					toolAtts := extractFromNestedParts(p.Parts)
+					atts = append(atts, toolAtts...)
+				}
+			}
+		}
+	}
+
+	// Append the structured attachments last
+	// (multi_content path) so the writer can rely
+	// on the order: extracted → structured. The
+	// summary fields don't care about order, so
+	// this is purely a presentation preference.
+	atts = append(atts, mf.Attachments...)
+	return cleaned, atts
+}
+
+// extractFromNestedParts walks a sub_agent's nested
+// parts for tool-result images, the same way the
+// top-level walk does. Exported as a separate helper
+// for the same recursive-pattern reason
+// `extractContentAttachments` is its own function:
+// the call site is a sub-agent boundary, not the
+// main message.
+func extractFromNestedParts(parts []MessagePart) []memory.Attachment {
+	var out []memory.Attachment
+	for _, p := range parts {
+		if p.Kind == "tool" {
+			out = append(out, extractFromToolResult(p.Result)...)
+		}
+		if p.Kind == "sub_agent" {
+			out = append(out, extractFromNestedParts(p.Parts)...)
+		}
+	}
+	return out
 }
 
 // renderBody applies the same "wrap code in a fence"
@@ -548,36 +671,27 @@ func ToMarkdown(conv *memory.Conversation, msgs []memory.MessageFull) string {
 		m := mf.Msg
 		roleIcon := roleEmoji(m.Role)
 		fmt.Fprintf(&b, "## %s %s · msg #%d\n\n", roleIcon, titleCase(m.Role), i+1)
-		// Pre-extract any data:image/... URLs that
-		// snuck into the content text (the LLM
-		// sometimes pastes a screenshot as a
-		// string instead of returning it through a
-		// tool). They're lifted out of the body
-		// and rendered alongside the regular
-		// attachments so the reader sees an image
-		// instead of a 100KB base64 blob.
-		contentText, inlineAtts := ExtractDataURLsFromContent(m.Content)
-		// Also lift any BARE base64 image payloads
-		// (no `data:` URL wrapper) — the LLM
-		// sometimes drops the header when echoing
-		// a screenshot. The line-based scan
-		// prevents false positives on
-		// base64-encoded text / tokens in the
-		// middle of prose.
-		contentText, rawAtts := ExtractRawBase64Images(contentText)
-		inlineAtts = append(inlineAtts, rawAtts...)
+		// Run the shared content + parts extraction
+		// (data: URLs in content, bare base64 lines
+		// in content, and tool-result images in
+		// parts[]). `contentText` is the cleaned
+		// body with image payloads lifted out;
+		// `attachments` is the combined list we
+		// render below. Doing this in one place
+		// keeps the markdown and JSON exports
+		// consistent — they both apply the same
+		// "what counts as an image" rules.
+		contentText, attachments := extractContentAttachments(mf)
 		// Attachments first (so the reader sees the
 		// upload before the question / response that
-		// references it). Inline attachments (those
-		// extracted from the content) come BEFORE
+		// references it). Extracted-from-content
+		// attachments (returned first by
+		// extractContentAttachments) come BEFORE
 		// the structured multi_content attachments
 		// because the LLM typically dumps a
 		// screenshot at the end of its reply, after
 		// the prose.
-		for _, att := range inlineAtts {
-			b.WriteString(AttachmentToMarkdown(att))
-		}
-		for _, att := range mf.Attachments {
+		for _, att := range attachments {
 			b.WriteString(AttachmentToMarkdown(att))
 		}
 		// Parts (assistant) when present; legacy
@@ -867,15 +981,27 @@ func ToJSON(conv *memory.Conversation, msgs []memory.MessageFull) (string, error
 	}
 	for i, mf := range msgs {
 		m := mf.Msg
+		// Apply the shared content extractor: data:
+		// URLs in content, bare base64 lines in
+		// content, and tool-result images in parts
+		// all become attachments with type/kind.
+		// The `content` field in the JSON is the
+		// CLEANED text (base64 lifted out) so
+		// downstream tooling never has to deal with
+		// a 100KB image string sitting inline. The
+		// `parts` field preserves the raw shape for
+		// anyone who needs the original tool result
+		// verbatim.
+		cleanedContent, attachments := extractContentAttachments(mf)
 		out := jsonMessage{
 			Index:       i + 1,
 			Role:        m.Role,
-			Content:     m.Content,
+			Content:     cleanedContent,
 			Thinking:    mf.Thinking,
 			ToolCallID:  m.ToolCallID,
 			Name:        m.Name,
 			CreatedAt:   mf.CreatedAt,
-			Attachments: mf.Attachments,
+			Attachments: attachments,
 		}
 		// Empty (or JSON null) parts get serialised as
 		// "null" without the omitempty guard — the
@@ -894,7 +1020,11 @@ func ToJSON(conv *memory.Conversation, msgs []memory.MessageFull) (string, error
 		// Per-message attachment summary: dedup'd
 		// kinds + total count. Both are always
 		// emitted (no omitempty) so consumers can
-		// rely on the field's presence.
+		// rely on the field's presence. The summary
+		// reflects the COMBINED list (extracted +
+		// structured) — every image in the message,
+		// regardless of where it came from, shows up
+		// here.
 		out.AttachmentKinds = summaryKinds(out.Attachments)
 		out.AttachmentCount = len(out.Attachments)
 		env.Messages = append(env.Messages, out)
