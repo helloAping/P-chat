@@ -387,4 +387,48 @@ func TestAttachmentsFromMultiContent_MovedToMemory(t *testing.T) {
 	if !strings.Contains(string(b), `"type":"text"`) {
 		t.Errorf("attachment JSON missing type field: %s", b)
 	}
+	if !strings.Contains(string(b), `"kind":"text"`) {
+		t.Errorf("attachment JSON missing kind field: %s", b)
+	}
+}
+
+// TestAttachmentsFromMultiContent_KindAllTypes covers
+// the "JSON message should be tagged with attachment
+// type" user-reported gap. Every wire-format type
+// must produce a non-empty `Kind` on the resulting
+// Attachment so a JSON consumer that reads `kind`
+// (without having to know the OpenAI wire format)
+// can still tell images from audio from text. The
+// `Type` field is preserved for back-compat.
+func TestAttachmentsFromMultiContent_KindAllTypes(t *testing.T) {
+	cases := []struct {
+		wire     openai.ChatMessagePartType
+		wantKind string
+		wantType openai.ChatMessagePartType
+	}{
+		{openai.ChatMessagePartTypeImageURL, "image", openai.ChatMessagePartTypeImageURL},
+		{openai.ChatMessagePartTypeText, "text", openai.ChatMessagePartTypeText},
+		{"audio_url", "audio", "audio_url"},
+		{"video_url", "video", "video_url"},
+	}
+	for _, c := range cases {
+		t.Run(string(c.wire), func(t *testing.T) {
+			var parts []openai.ChatMessagePart
+			if c.wire == openai.ChatMessagePartTypeText {
+				parts = []openai.ChatMessagePart{{Type: c.wire, Text: "x"}}
+			} else {
+				parts = []openai.ChatMessagePart{{Type: c.wire, ImageURL: &openai.ChatMessageImageURL{URL: "data:"}}}
+			}
+			got := memory.AttachmentsFromMultiContent(parts)
+			if len(got) != 1 {
+				t.Fatalf("len = %d, want 1", len(got))
+			}
+			if got[0].Kind != c.wantKind {
+				t.Errorf("Kind = %q, want %q", got[0].Kind, c.wantKind)
+			}
+			if got[0].Type != string(c.wantType) {
+				t.Errorf("Type = %q, want %q (wire format preserved)", got[0].Type, c.wantType)
+			}
+		})
+	}
 }

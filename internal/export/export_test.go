@@ -303,7 +303,7 @@ func TestToJSON_AttachmentsPresent(t *testing.T) {
 		{
 			Msg: llm.Message{Role: "user", Content: "看"},
 			Attachments: []memory.Attachment{
-				{Type: "image_url", URL: "data:image/png;base64,ABCD", Name: "a.png", Mime: "image/png"},
+				{Type: "image_url", Kind: "image", URL: "data:image/png;base64,ABCD", Name: "a.png", Mime: "image/png"},
 			},
 		},
 	}
@@ -326,13 +326,147 @@ func TestToJSON_AttachmentsPresent(t *testing.T) {
 	}
 	att := atts[0].(map[string]any)
 	if att["type"] != "image_url" {
-		t.Errorf("attachment type = %v", att["type"])
+		t.Errorf("attachment type = %v, want image_url", att["type"])
+	}
+	if att["kind"] != "image" {
+		t.Errorf("attachment kind = %v, want image", att["kind"])
 	}
 	if att["url"] != "data:image/png;base64,ABCD" {
 		t.Errorf("attachment url = %v", att["url"])
 	}
 	if att["name"] != "a.png" {
 		t.Errorf("attachment name = %v", att["name"])
+	}
+}
+
+// TestToJSON_AttachmentKindsSummary is the regression
+// lock for the "messages with attachments should be
+// tagged with type" user report. Every message now
+// carries two new fields at the top level:
+//   - attachment_kinds: sorted, deduplicated list
+//     of the per-attachment `kind` values
+//   - attachment_count: len(attachments)
+// Both are always emitted (even when zero) so a
+// consumer doesn't have to nil-check before reading.
+func TestToJSON_AttachmentKindsSummary(t *testing.T) {
+	conv := &memory.Conversation{ID: "c"}
+	msgs := []memory.MessageFull{
+		{
+			Msg: llm.Message{Role: "user", Content: "single image"},
+			Attachments: []memory.Attachment{
+				{Type: "image_url", Kind: "image", URL: "data:image/png;base64,X", Name: "a.png", Mime: "image/png"},
+			},
+		},
+		{
+			Msg: llm.Message{Role: "user", Content: "multiple kinds"},
+			Attachments: []memory.Attachment{
+				{Type: "image_url", Kind: "image", URL: "data:image/png;base64,X", Name: "a.png", Mime: "image/png"},
+				{Type: "audio_url", Kind: "audio", URL: "data:audio/mp3;base64,Y", Name: "b.mp3", Mime: "audio/mpeg"},
+				{Type: "text", Kind: "text", URL: "hello", Name: "c.txt", Mime: "text/plain"},
+			},
+		},
+		{
+			Msg: llm.Message{Role: "assistant", Content: "no attachments"},
+		},
+	}
+	body, err := ToJSON(conv, msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	// First message: one image → kinds=["image"], count=1
+	if kinds, _ := got.Messages[0]["attachment_kinds"].([]any); len(kinds) != 1 || kinds[0] != "image" {
+		t.Errorf("msg[0] attachment_kinds = %v, want [image]", got.Messages[0]["attachment_kinds"])
+	}
+	if c, _ := got.Messages[0]["attachment_count"].(float64); c != 1 {
+		t.Errorf("msg[0] attachment_count = %v, want 1", got.Messages[0]["attachment_count"])
+	}
+	// Second message: dedup'd + sorted. image/text/audio
+	// → ["audio", "image", "text"] (alphabetical).
+	if kinds, _ := got.Messages[1]["attachment_kinds"].([]any); len(kinds) != 3 ||
+		kinds[0] != "audio" || kinds[1] != "image" || kinds[2] != "text" {
+		t.Errorf("msg[1] attachment_kinds = %v, want [audio image text] (sorted, dedup'd)", got.Messages[1]["attachment_kinds"])
+	}
+	if c, _ := got.Messages[1]["attachment_count"].(float64); c != 3 {
+		t.Errorf("msg[1] attachment_count = %v, want 3", got.Messages[1]["attachment_count"])
+	}
+	// Third message: no attachments. Both fields
+	// still present (empty array + 0).
+	kinds, _ := got.Messages[2]["attachment_kinds"].([]any)
+	if kinds == nil {
+		t.Errorf("msg[2] attachment_kinds should be empty array, not null: %v", got.Messages[2]["attachment_kinds"])
+	}
+	if len(kinds) != 0 {
+		t.Errorf("msg[2] attachment_kinds = %v, want []", kinds)
+	}
+	if c, _ := got.Messages[2]["attachment_count"].(float64); c != 0 {
+		t.Errorf("msg[2] attachment_count = %v, want 0", got.Messages[2]["attachment_count"])
+	}
+}
+
+// TestSummaryKinds_DedupAndSort is the targeted
+// regression for the dedup + sort invariants — when
+// the message has three image attachments the
+// summary should read `["image"]`, not
+// `["image", "image", "image"]`; when it has mixed
+// kinds the result is alphabetical.
+func TestSummaryKinds_DedupAndSort(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []memory.Attachment
+		want []string
+	}{
+		{"empty", nil, []string{}},
+		{"single", []memory.Attachment{{Kind: "image"}}, []string{"image"}},
+		{"dup-same", []memory.Attachment{
+			{Kind: "image"}, {Kind: "image"}, {Kind: "image"},
+		}, []string{"image"}},
+		{"mixed-sorted", []memory.Attachment{
+			{Kind: "video"}, {Kind: "image"}, {Kind: "audio"}, {Kind: "image"}, {Kind: "text"},
+		}, []string{"audio", "image", "text", "video"}},
+		{"fallback-from-wire-type", []memory.Attachment{
+			{Type: "image_url"}, // no Kind set
+		}, []string{"image"}},
+		{"unknown-wire-type", []memory.Attachment{
+			{Type: "wat"},
+		}, []string{"file"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := summaryKinds(c.in)
+			if len(got) != len(c.want) {
+				t.Fatalf("len = %d, want %d (got %v, want %v)", len(got), len(c.want), got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestKindFromWireType covers the type→kind mapping
+// used as a fallback when an Attachment predates the
+// Kind field (older rows / hand-crafted fixtures).
+func TestKindFromWireType(t *testing.T) {
+	cases := map[string]string{
+		"image_url": "image",
+		"audio_url": "audio",
+		"video_url": "video",
+		"text":      "text",
+		"":          "file",
+		"wat":       "file",
+	}
+	for in, want := range cases {
+		if got := kindFromWireType(in); got != want {
+			t.Errorf("kindFromWireType(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

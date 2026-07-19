@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/p-chat/pchat/internal/llm"
+	openai "github.com/sashabaranov/go-openai"
 )
 
 // ====================================================================
@@ -177,6 +179,87 @@ func TestExportSession_EmptySession(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "**Messages**: 0") {
 		t.Errorf("expected empty-session header, got: %s", w.Body.String())
+	}
+}
+
+// TestExportSession_JSON_AttachmentKindTags is the
+// end-to-end regression for the user-reported "JSON
+// file with attachments should be tagged with type"
+// bug. Every message in the JSON envelope now
+// carries:
+//   - attachment_kinds: sorted, dedup'd array of the
+//     per-attachment kind values
+//   - attachment_count: total count
+// and every individual attachment carries a `kind`
+// field (in addition to the existing `type` /
+// `url` / `name` / `mime`).
+func TestExportSession_JSON_AttachmentKindTags(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	// Manually build a row with attachments via
+	// the underlying openai ChatMessagePart wire
+	// format. We use AddChatMessageWithMetaTo
+	// (not AddMessage) so the metadata blob
+	// gets the multi_content key the export reads
+	// back.
+	openaiImport := openai.ChatMessagePart{Type: "image_url", ImageURL: &openai.ChatMessageImageURL{URL: "data:image/png;base64,ABCD"}}
+	mcJSON, _ := json.Marshal([]openai.ChatMessagePart{openaiImport})
+	sid := store.CurrentConversationID()
+	store.AddChatMessageWithMetaTo(sid, llm.ChatMessage{
+		Role: llm.RoleUser, Content: "看图", MsgType: 0,
+	}, map[string]string{"multi_content": string(mcJSON)})
+	// Second message with no attachments — the
+	// summary fields must still appear (empty
+	// array + 0 count).
+	store.AddMessage(llm.Message{Role: "assistant", Content: "这是回复"})
+	_ = store.Flush()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+sid+"/export?format=json", nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(got.Messages))
+	}
+	// First message: 1 image attachment.
+	kinds, _ := got.Messages[0]["attachment_kinds"].([]any)
+	if len(kinds) != 1 || kinds[0] != "image" {
+		t.Errorf("msg[0] attachment_kinds = %v, want [image]", got.Messages[0]["attachment_kinds"])
+	}
+	if c, _ := got.Messages[0]["attachment_count"].(float64); c != 1 {
+		t.Errorf("msg[0] attachment_count = %v, want 1", got.Messages[0]["attachment_count"])
+	}
+	atts, _ := got.Messages[0]["attachments"].([]any)
+	if len(atts) != 1 {
+		t.Fatalf("msg[0] attachments len = %d, want 1", len(atts))
+	}
+	att := atts[0].(map[string]any)
+	if att["type"] != "image_url" {
+		t.Errorf("attachment type = %v, want image_url (wire format preserved)", att["type"])
+	}
+	if att["kind"] != "image" {
+		t.Errorf("attachment kind = %v, want image (human-readable category)", att["kind"])
+	}
+	// Second message: no attachments. Both summary
+	// fields still present, set to zero values.
+	if kinds, _ := got.Messages[1]["attachment_kinds"].([]any); kinds == nil {
+		t.Errorf("msg[1] attachment_kinds should be [] not null")
+	} else if len(kinds) != 0 {
+		t.Errorf("msg[1] attachment_kinds = %v, want []", kinds)
+	}
+	if c, _ := got.Messages[1]["attachment_count"].(float64); c != 0 {
+		t.Errorf("msg[1] attachment_count = %v, want 0", got.Messages[1]["attachment_count"])
 	}
 }
 

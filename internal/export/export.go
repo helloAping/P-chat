@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/memory"
@@ -750,17 +751,102 @@ type jsonEnvelope struct {
 // jsonMessage is the per-row shape inside the envelope.
 // The Parts field carries the raw assistant `parts` JSON
 // when present; Attachments carries the typed attachment
-// list (always present, may be empty).
+// list (always present, may be empty). The two
+// summary fields (AttachmentKinds, AttachmentCount)
+// let a downstream consumer read the message-level
+// "what kind of attachments does this message have"
+// in O(1) — they previously had to walk
+// `attachments[].type` for every message.
+//
+// AttachmentKinds is a deduplicated, sorted array of
+// the per-attachment `kind` values ("image" / "audio"
+// / "video" / "text" / "file"). Always present (never
+// null) so consumers can iterate without a nil check;
+// empty when the message has no attachments. Same
+// length-cap rule as the existing `attachments` field:
+// omitted via `omitempty` only when there's nothing to
+// say (i.e. the message has zero attachments AND no
+// part-attached content).
 type jsonMessage struct {
-	Index       int                 `json:"index"`
-	Role        string              `json:"role"`
-	Content     string              `json:"content"`
-	Thinking    string              `json:"thinking,omitempty"`
-	Parts       json.RawMessage     `json:"parts,omitempty"`
-	Attachments []memory.Attachment `json:"attachments"`
-	ToolCallID  string              `json:"tool_call_id,omitempty"`
-	Name        string              `json:"name,omitempty"`
-	CreatedAt   int64               `json:"created_at,omitempty"`
+	Index            int                 `json:"index"`
+	Role             string              `json:"role"`
+	Content          string              `json:"content"`
+	Thinking         string              `json:"thinking,omitempty"`
+	Parts            json.RawMessage     `json:"parts,omitempty"`
+	Attachments      []memory.Attachment `json:"attachments"`
+	// AttachmentKinds is the dedup'd, sorted list of
+	// attachment kinds ("image" / "audio" / "video"
+	// / "text" / "file") for this message. Always
+	// serialised as an array (possibly empty) so
+	// consumers don't have to nil-check it. We
+	// explicitly want an empty array over a missing
+	// key here — "no attachments" is information.
+	AttachmentKinds []string `json:"attachment_kinds"`
+	// AttachmentCount is len(Attachments). Exposed
+	// separately so a count-only consumer doesn't
+	// have to decode the full array.
+	AttachmentCount int `json:"attachment_count"`
+	ToolCallID      string `json:"tool_call_id,omitempty"`
+	Name            string `json:"name,omitempty"`
+	CreatedAt       int64  `json:"created_at,omitempty"`
+}
+
+// summaryKinds returns the deduplicated, sorted list
+// of attachment kinds for a message. Empty input →
+// empty slice (so the JSON encoder emits "[]" rather
+// than "null"). Duplicates are removed because a
+// message with three image attachments should show
+// `["image"]` not `["image", "image", "image"]` — the
+// array answers "what kinds are present", not "how
+// many of each".
+func summaryKinds(atts []memory.Attachment) []string {
+	if len(atts) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(atts))
+	for _, a := range atts {
+		kind := a.Kind
+		if kind == "" {
+			// Fall back to the wire type for
+			// older rows that predate the Kind
+			// field. The mapping is the same
+			// one we use at extraction time
+			// (image_url → image, etc.).
+			kind = kindFromWireType(a.Type)
+		}
+		if kind == "" {
+			continue
+		}
+		seen[kind] = struct{}{}
+	}
+	if len(seen) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// kindFromWireType maps the OpenAI ChatMessagePart.Type
+// to the human-readable kind. The mapping is
+// duplicated here (rather than imported from
+// memory.AttachmentsFromMultiContent) to keep the
+// export package free of an OpenAI SDK import.
+func kindFromWireType(wire string) string {
+	switch wire {
+	case "image_url":
+		return "image"
+	case "audio_url":
+		return "audio"
+	case "video_url":
+		return "video"
+	case "text":
+		return "text"
+	}
+	return "file"
 }
 
 // ToJSON serializes the conversation as JSON. The schema
@@ -805,6 +891,12 @@ func ToJSON(conv *memory.Conversation, msgs []memory.MessageFull) (string, error
 		if out.Attachments == nil {
 			out.Attachments = []memory.Attachment{}
 		}
+		// Per-message attachment summary: dedup'd
+		// kinds + total count. Both are always
+		// emitted (no omitempty) so consumers can
+		// rely on the field's presence.
+		out.AttachmentKinds = summaryKinds(out.Attachments)
+		out.AttachmentCount = len(out.Attachments)
 		env.Messages = append(env.Messages, out)
 	}
 	b, err := json.MarshalIndent(env, "", "  ")

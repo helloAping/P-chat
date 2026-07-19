@@ -1521,17 +1521,27 @@ func (s *Store) GetMessagesWithMeta() ([]llm.Message, []string, []int64) {
 // so the markdown writer can inline data: URLs without
 // re-walking the raw OpenAI ChatMessagePart JSON.
 //
-// Type mirrors openai.ChatMessagePart.Type:
+// Type mirrors openai.ChatMessagePart.Type (the OpenAI
+// wire format, kept verbatim for back-compat with any
+// downstream consumer that already knows it):
 //   - "image_url" / "audio_url" / "video_url": URL carries
 //     the data: URL (or https:// URL when the attachment
 //     is remote)
 //   - "text":      URL carries the file body (text / csv /
 //     json / etc. decoded as a UTF-8 string)
 //
+// Kind is the human-readable category derived from Type.
+// It's the same value space the frontend's
+// InlineAttachment.kind uses (so a JS consumer
+// rendering the JSON doesn't have to translate the
+// OpenAI wire format itself):
+//   - "image" / "audio" / "video" / "text" / "file"
+//
 // The Name and Mime fields preserve the original filename
 // and MIME for the export's display path.
 type Attachment struct {
 	Type string `json:"type"`
+	Kind string `json:"kind,omitempty"`
 	URL  string `json:"url"`
 	Name string `json:"name,omitempty"`
 	Mime string `json:"mime,omitempty"`
@@ -1718,6 +1728,15 @@ func (s *Store) GetMessagesFull() []MessageFull {
 //     writer treats this as a text file (rendered as a
 //     code block in markdown).
 //
+// Each entry also gets a `Kind` (the human-readable
+// category: image / audio / video / text / file),
+// which the export's JSON envelope surfaces at the
+// message level as a deduped `attachment_kinds` array.
+// Without this, downstream JSON consumers had to look
+// inside every `attachments[].type` to learn what kind
+// of attachment a message carries — fine for one
+// message, painful for a thousand.
+//
 // Returns nil (not an empty slice) when the input is
 // empty — the export writers use a nil check to skip
 // the "attachments" section entirely.
@@ -1740,6 +1759,7 @@ func AttachmentsFromMultiContent(parts []openai.ChatMessagePart) []Attachment {
 			}
 			out = append(out, Attachment{
 				Type: "image_url",
+				Kind: "image",
 				URL:  url,
 				Mime: "image/png", // best-effort; the wire format doesn't carry the MIME separately for image_url
 			})
@@ -1750,6 +1770,7 @@ func AttachmentsFromMultiContent(parts []openai.ChatMessagePart) []Attachment {
 			}
 			out = append(out, Attachment{
 				Type: "audio_url",
+				Kind: "audio",
 				URL:  url,
 				Mime: "audio/mpeg",
 			})
@@ -1760,12 +1781,14 @@ func AttachmentsFromMultiContent(parts []openai.ChatMessagePart) []Attachment {
 			}
 			out = append(out, Attachment{
 				Type: "video_url",
+				Kind: "video",
 				URL:  url,
 				Mime: "video/mp4",
 			})
 		case openai.ChatMessagePartTypeText:
 			out = append(out, Attachment{
 				Type: "text",
+				Kind: "text",
 				URL:  p.Text,
 				Mime: "text/plain",
 			})
