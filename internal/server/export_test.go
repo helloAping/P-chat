@@ -276,10 +276,23 @@ func TestExportSession_Filename_UnicodeTitle(t *testing.T) {
 		t.Errorf("plain filename should be built from session id, got %q", plain[1])
 	}
 	// `filename*=UTF-8''...` must be present and
-	// percent-encoded (no raw Chinese bytes).
+	// the value portion must be **byte-stable
+	// ASCII** (RFC 5987 requires percent-encoding;
+	// raw UTF-8 bytes are illegal in this
+	// parameter and WebView2 mangles them). The
+	// previous test only checked that
+	// url.QueryUnescape round-tripped the value,
+	// which passes for raw UTF-8 too — that
+	// test was the reason the bug shipped.
 	ext := regexp.MustCompile(`filename\*=UTF-8''([^;]+)`).FindStringSubmatch(cd)
 	if ext == nil {
 		t.Fatalf("missing filename* in %q", cd)
+	}
+	for i := 0; i < len(ext[1]); i++ {
+		if ext[1][i] > 0x7f {
+			t.Errorf("filename* has non-ASCII byte 0x%02X at %d in %q (raw UTF-8 not allowed per RFC 5987)",
+				ext[1][i], i, ext[1])
+		}
 	}
 	// Decoded form should contain the title.
 	decoded, err := url.QueryUnescape(ext[1])
@@ -288,6 +301,9 @@ func TestExportSession_Filename_UnicodeTitle(t *testing.T) {
 	}
 	if !strings.Contains(decoded, "调试记录") {
 		t.Errorf("decoded filename* should contain the title, got %q", decoded)
+	}
+	if !strings.Contains(decoded, "🛠") {
+		t.Errorf("decoded filename* should contain the emoji, got %q", decoded)
 	}
 }
 

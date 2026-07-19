@@ -346,6 +346,139 @@ func ExtractDataURLsFromContent(content string) (string, []memory.Attachment) {
 	return cleaned, atts
 }
 
+// imageMagicPrefixes maps the base64-encoded magic
+// bytes of the four image formats the LLM most often
+// echoes into its reply text. PNG / JPEG / GIF / WebP
+// all have unambiguous 3-8 byte signatures that
+// survive the round-trip to base64 unchanged; the
+// probability of a random base64 string matching
+// any of these is small enough (~1/64^3 for JPEG) to
+// make false positives in ordinary text negligible.
+var imageMagicPrefixes = []struct {
+	prefix string
+	mime   string
+}{
+	{"iVBORw0KGgo", "image/png"},  // \x89PNG\r\n\x1a\n
+	{"/9j/", "image/jpeg"},        // \xff\xd8\xff
+	{"R0lGOD", "image/gif"},       // GIF87a / GIF89a
+	{"UklGR", "image/webp"},       // RIFF....WEBP
+}
+
+// isRawImagePayload reports whether s is a bare
+// base64-encoded image (no `data:` URL wrapper) of a
+// known image format. Used by extractRawBase64Images
+// to detect the common LLM-quirk where a model
+// echoes a screenshot's base64 payload verbatim into
+// its reply, dropping the `data:image/...;base64,`
+// header. False-positive guard: every byte must be
+// in the base64 alphabet (no spaces, punctuation, or
+// other text), and the string must be long enough
+// (~100 chars) to be a real image rather than a hash
+// or a short token.
+func isRawImagePayload(s string) bool {
+	if len(s) < 100 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'A' && c <= 'Z') ||
+			(c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') ||
+			c == '+' || c == '/' || c == '=') {
+			return false
+		}
+	}
+	for _, p := range imageMagicPrefixes {
+		if strings.HasPrefix(s, p.prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// sniffImageMime returns the MIME type matching a
+// bare-base64 image payload's leading magic bytes.
+// Defaults to image/png when the magic doesn't match
+// any known format (the caller has already verified
+// isRawImagePayload returned true, so this branch
+// only fires on future format additions).
+func sniffImageMime(s string) string {
+	for _, p := range imageMagicPrefixes {
+		if strings.HasPrefix(s, p.prefix) {
+			return p.mime
+		}
+	}
+	return "image/png"
+}
+
+// ExtractRawBase64Images finds lines in content that
+// consist of a bare base64 image payload (no `data:`
+// URL wrapper) and returns the content with those
+// lines removed plus a list of image attachments
+// synthesised from them.
+//
+// The LLM-quirk this fixes: many models echo a
+// screenshot's base64 bytes verbatim into the reply
+// text, dropping the `data:image/png;base64,` header
+// that ExtractDataURLsFromContent looks for. The
+// result is a 50-200 KB blob of pure base64 sitting
+// in the assistant's `Msg.Content`, which used to be
+// dumped as a code block in the export. The reader
+// saw a 100KB wall of `iVBORw0KGgoAAAANSUhEUg…` and
+// no picture.
+//
+// Heuristic:
+//   - Split content by newlines, examine each line
+//     independently (so a code-block base64 in the
+//     middle of prose is left alone — only a line
+//     that IS the base64 payload gets lifted).
+//   - The line, after trim, must be pure base64
+//     alphabet (no surrounding text, no spaces, no
+//     punctuation) — this is the false-positive guard.
+//   - The line must be ≥ 100 chars and start with a
+//     known image magic prefix.
+//
+// What this does NOT do (and why):
+//   - Inline base64 mixed with prose (e.g. "这是图片
+//     iVBORw0KGgoAAA…") is left as text. The LLM
+//     usually puts images on their own line, so the
+//     line-based scan catches the common case. Adding
+//     a regex with word boundaries would catch more
+//     but raise the false-positive rate on
+//     base64-encoded config / token strings; we'd
+//     rather miss an inline image than garble a hash.
+func ExtractRawBase64Images(content string) (string, []memory.Attachment) {
+	if content == "" {
+		return content, nil
+	}
+	lines := strings.Split(content, "\n")
+	kept := make([]string, 0, len(lines))
+	var atts []memory.Attachment
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			kept = append(kept, line)
+			continue
+		}
+		if isRawImagePayload(trimmed) {
+			mime := sniffImageMime(trimmed)
+			atts = append(atts, memory.Attachment{
+				Type: "image_url",
+				URL:  "data:" + mime + ";base64," + trimmed,
+				Name: fmt.Sprintf("raw-%d", i+1),
+				Mime: mime,
+			})
+			// Drop the line from the body.
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if len(atts) == 0 {
+		return content, nil
+	}
+	return strings.Join(kept, "\n"), atts
+}
+
 // LooksLikeCode is the simple heuristic the markdown
 // renderer uses to decide whether to fence a body in
 // a generic code block. Multi-line + at least one of
@@ -423,6 +556,15 @@ func ToMarkdown(conv *memory.Conversation, msgs []memory.MessageFull) string {
 		// attachments so the reader sees an image
 		// instead of a 100KB base64 blob.
 		contentText, inlineAtts := ExtractDataURLsFromContent(m.Content)
+		// Also lift any BARE base64 image payloads
+		// (no `data:` URL wrapper) — the LLM
+		// sometimes drops the header when echoing
+		// a screenshot. The line-based scan
+		// prevents false positives on
+		// base64-encoded text / tokens in the
+		// middle of prose.
+		contentText, rawAtts := ExtractRawBase64Images(contentText)
+		inlineAtts = append(inlineAtts, rawAtts...)
 		// Attachments first (so the reader sees the
 		// upload before the question / response that
 		// references it). Inline attachments (those
@@ -529,22 +671,60 @@ func SanitizeFilename(s string) string {
 	return string(cleaned)
 }
 
-// URLEncodeFilename encodes a filename per RFC 5987 so
-// non-ASCII titles (e.g. "调试记录") survive the
-// Content-Disposition header on browsers that fall back
-// to the filename* parameter.
+// URLEncodeFilename encodes a filename per RFC 5987
+// for the `filename*=UTF-8''…` Content-Disposition
+// parameter. Per spec the value MUST be percent-encoded
+// (raw UTF-8 bytes are not legal in this parameter,
+// and some HTTP stacks — notably WebView2 in the
+// Wails desktop app — will mangle them into `?` or
+// other replacement characters).
+//
+// The "safe" set that passes through unescaped is the
+// RFC 5987 `attr-char` set: ASCII alphanumeric plus
+// `! # $ & + - . ^ _ ` | } ~`. We use the conservative
+// RFC 3986 unreserved set (alphanumeric + `- . _`) —
+// enough for typical filenames, and the rest of the
+// special characters can break out of a header value
+// anyway.
+//
+// The previous implementation (write the rune
+// directly when r >= 0x80) shipped raw UTF-8 bytes for
+// Chinese / emoji titles. The end-to-end test passed
+// because Go's `url.QueryUnescape` tolerates the raw
+// bytes, but WebView2 does not — the user saw a
+// garbled download name. This rewrite iterates byte
+// by byte and percent-encodes anything outside the
+// safe set, including the multi-byte UTF-8
+// representation of non-ASCII runes.
 func URLEncodeFilename(s string) string {
 	var b strings.Builder
+	b.Grow(len(s))
 	for _, r := range s {
-		if r >= 0x80 || r == '-' || r == '.' || r == '_' || (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
-			b.WriteRune(r)
-			continue
-		}
-		for _, b2 := range []byte(string(r)) {
-			fmt.Fprintf(&b, "%%%02X", b2)
+		// Decode the rune to its UTF-8 bytes; we
+		// percent-encode per byte, not per rune, so
+		// `调` (U+8C03, E8 B0 83 in UTF-8) becomes
+		// %E8%B0%83.
+		utf8 := []byte(string(r))
+		for _, c := range utf8 {
+			if isUnreserved(c) {
+				b.WriteByte(c)
+			} else {
+				fmt.Fprintf(&b, "%%%02X", c)
+			}
 		}
 	}
 	return b.String()
+}
+
+// isUnreserved reports whether b is in the RFC 3986
+// unreserved set: ASCII alphanumeric + `- . _`. These
+// are the only bytes that survive percent-encoding in
+// the `filename*=UTF-8''…` value per RFC 5987 §3.2.
+func isUnreserved(b byte) bool {
+	return (b >= '0' && b <= '9') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		b == '-' || b == '.' || b == '_'
 }
 
 // ====================================================================

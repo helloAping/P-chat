@@ -728,3 +728,248 @@ func TestIsRawPNGPayload(t *testing.T) {
 		t.Error("non-base64 string should not be detected")
 	}
 }
+
+// ====================================================================
+// URLEncodeFilename — RFC 5987 percent-encoding
+// ====================================================================
+
+// TestURLEncodeFilename_ASCIIOnly is the regression
+// lock for the "filename garbled in WebView2" bug.
+// The output must contain ONLY ASCII bytes (the
+// percent-encoding result); raw UTF-8 bytes for
+// Chinese / emoji / accented chars are illegal in the
+// `filename*=UTF-8''…` parameter per RFC 5987, and
+// WebView2 specifically mangles them. The previous
+// implementation wrote the rune's UTF-8 bytes through
+// when r >= 0x80, so the test that previously
+// "passed" by url.QueryUnescape-decoding the result
+// didn't actually catch the bug — the encoded form
+// was never a valid RFC 5987 value to begin with.
+func TestURLEncodeFilename_ASCIIOnly(t *testing.T) {
+	cases := []string{
+		"plain-ascii",
+		"调试记录",                  // Chinese
+		"déjà vu",                  // French accents
+		"emoji 🛠",                 // Emoji
+		"mixed 调试 .md",           // Mixed
+		"a/b\\c",                   // Unsafe chars
+		"",                         // Empty
+		"x",                        // Single byte
+	}
+	for _, in := range cases {
+		got := URLEncodeFilename(in)
+		for i := 0; i < len(got); i++ {
+			if got[i] > 0x7f {
+				t.Errorf("URLEncodeFilename(%q) has non-ASCII byte 0x%02X at %d in %q",
+					in, got[i], i, got)
+			}
+		}
+	}
+}
+
+func TestURLEncodeFilename_KnownValues(t *testing.T) {
+	// Spot-check the actual encoding output. These
+	// values are the test fixtures used in the
+	// WebView2 bug report; if any of them change,
+	// the wire format changes and downstream
+	// consumers (browsers, Wails) need to be
+	// re-verified.
+	cases := []struct{ in, want string }{
+		{"hello", "hello"},
+		{"a-b_c.d", "a-b_c.d"},
+		{" ", "%20"},
+		{"调试", "%E8%B0%83%E8%AF%95"},
+		{"é", "%C3%A9"},
+		{"🛠", "%F0%9F%9B%A0"},
+	}
+	for _, c := range cases {
+		if got := URLEncodeFilename(c.in); got != c.want {
+			t.Errorf("URLEncodeFilename(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestURLEncodeFilename_PassthroughSafeChars verifies
+// the safe set is exactly the RFC 3986 unreserved
+// characters (alphanumeric + `- . _`); everything
+// else is percent-encoded. We don't allow the
+// `attr-char` set (RFC 5987's superset including
+// `! # $ & + ^ ` | } ~`) because those characters
+// can break out of HTTP header values when
+// concatenated with surrounding syntax.
+func TestURLEncodeFilename_PassthroughSafeChars(t *testing.T) {
+	safe := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._"
+	if got := URLEncodeFilename(safe); got != safe {
+		t.Errorf("safe chars should pass through, got %q", got)
+	}
+}
+
+// ====================================================================
+// ExtractRawBase64Images — bare-base64 image extraction
+// ====================================================================
+
+// validPNGPayload is a fixed test fixture: a run
+// of valid base64 starting with the PNG magic bytes
+// (iVBORw0KGgo = \x89PNG\r\n\x1a\n). The total
+// length is well above the 100-char threshold
+// `isRawImagePayload` requires. We pad with extra
+// `AAAA` blocks rather than random data so the test
+// output stays byte-stable across runs.
+var validPNGPayload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==AAAA"
+var validJPEGMagic = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAr/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AL+AB//Z"
+var validGIFMagic = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+var validWEBPMagic = "UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA/v3AgAA" + strings.Repeat("A", 80)
+
+func TestExtractRawBase64Images_None(t *testing.T) {
+	in := "no images here, just prose"
+	cleaned, atts := ExtractRawBase64Images(in)
+	if cleaned != in {
+		t.Errorf("no-image content should pass through, got %q", cleaned)
+	}
+	if len(atts) != 0 {
+		t.Errorf("no images → empty atts, got %v", atts)
+	}
+}
+
+func TestExtractRawBase64Images_PNG(t *testing.T) {
+	in := "这是截图\n" + validPNGPayload + "\n完毕"
+	cleaned, atts := ExtractRawBase64Images(in)
+	if len(atts) != 1 {
+		t.Fatalf("expected 1 attachment, got %d", len(atts))
+	}
+	if atts[0].Type != "image_url" {
+		t.Errorf("type = %q, want image_url", atts[0].Type)
+	}
+	if atts[0].Mime != "image/png" {
+		t.Errorf("mime = %q, want image/png", atts[0].Mime)
+	}
+	if !strings.HasPrefix(atts[0].URL, "data:image/png;base64,") {
+		t.Errorf("URL should be data: form, got %q", atts[0].URL)
+	}
+	if strings.Contains(cleaned, validPNGPayload) {
+		t.Errorf("raw payload should be lifted out, got %q", cleaned)
+	}
+	if !strings.Contains(cleaned, "这是截图") || !strings.Contains(cleaned, "完毕") {
+		t.Errorf("surrounding prose should be preserved, got %q", cleaned)
+	}
+}
+
+func TestExtractRawBase64Images_AllFormats(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		mime    string
+	}{
+		{"png", validPNGPayload, "image/png"},
+		{"jpeg", validJPEGMagic, "image/jpeg"},
+		{"gif", validGIFMagic, "image/gif"},
+		{"webp", validWEBPMagic, "image/webp"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, atts := ExtractRawBase64Images("header\n" + c.payload + "\nfooter")
+			if len(atts) != 1 {
+				t.Fatalf("expected 1 attachment, got %d", len(atts))
+			}
+			if atts[0].Mime != c.mime {
+				t.Errorf("mime = %q, want %q", atts[0].Mime, c.mime)
+			}
+		})
+	}
+}
+
+func TestExtractRawBase64Images_NotAloneOnLine(t *testing.T) {
+	// Inline base64 mixed with prose should NOT be
+	// lifted — false-positive guard for short
+	// base64-looking tokens embedded in text.
+	in := "看这张图 " + validPNGPayload + " 完毕"
+	cleaned, atts := ExtractRawBase64Images(in)
+	if len(atts) != 0 {
+		t.Errorf("inline base64 should not be lifted, got %d attachments", len(atts))
+	}
+	if cleaned != in {
+		t.Errorf("content should pass through unchanged, got %q", cleaned)
+	}
+}
+
+func TestExtractRawBase64Images_TooShort(t *testing.T) {
+	// A short base64 string that happens to start
+	// with PNG magic must NOT be lifted. (Most
+	// "image" tokens in a hash chain or token are
+	// < 100 chars.)
+	short := "iVBORw0KGgoAAAA" // 16 chars
+	_, atts := ExtractRawBase64Images("prefix\n" + short + "\nsuffix")
+	if len(atts) != 0 {
+		t.Errorf("short base64 should not be lifted, got %d attachments", len(atts))
+	}
+}
+
+func TestExtractRawBase64Images_NotBase64Alphabet(t *testing.T) {
+	// A 200-char string starting with PNG magic but
+	// containing a non-base64 char should be left
+	// alone — the line-scan guard rejects the whole
+	// line.
+	bad := "iVBORw0KGgoAAA!@#$%^&*()_+AAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+	if isRawImagePayload(bad) {
+		t.Error("non-base64 chars in payload should reject the line")
+	}
+}
+
+func TestExtractRawBase64Images_HashOrToken(t *testing.T) {
+	// A long base64 string that does NOT start
+	// with an image magic byte (e.g. a hash, a
+	// token) should be left alone.
+	hash := strings.Repeat("A", 200)
+	_, atts := ExtractRawBase64Images(hash)
+	if len(atts) != 0 {
+		t.Errorf("long non-image base64 should not be lifted, got %d", len(atts))
+	}
+}
+
+// TestToMarkdown_BareBase64LiftedFromContent is the
+// end-to-end regression for the user-reported "image
+// shows as base64 string with no data: prefix" bug.
+// The assistant's Msg.Content contains a bare PNG
+// payload (the LLM dropped the data: header). The
+// exporter must lift it out and render an
+// `![…](data:image/png;base64,…)` markdown image.
+func TestToMarkdown_BareBase64LiftedFromContent(t *testing.T) {
+	conv := &memory.Conversation{ID: "c", Title: "T"}
+	// Prose on its own line, payload on the next
+	// line, prose again. We avoid `:` etc. in the
+	// surrounding text so renderBody doesn't fence
+	// the whole block in a code fence (which would
+	// defeat the test of "the payload renders as
+	// an image").
+	in := "看这张图\n" + validPNGPayload + "\n结束"
+	msgs := toFullMFs([]llm.Message{
+		{Role: "assistant", Content: in},
+	})
+	got := ToMarkdown(conv, msgs)
+	// Must contain the data: URL wrapping the
+	// payload — that's the markdown image syntax
+	// the exporter produces. The exact attachment
+	// name ("raw-N" for the line number) is
+	// internal; the user-visible contract is that
+	// the PNG renders as an image, not as a
+	// 100-char base64 wall.
+	want := "data:image/png;base64," + validPNGPayload
+	if !strings.Contains(got, want) {
+		t.Errorf("expected bare PNG inlined as data: URL, got:\n%s", got)
+	}
+	// The bare base64 must not appear outside image
+	// syntax anywhere in the output. We do a
+	// rough check by removing any matched image
+	// lines and asserting the payload doesn't
+	// reappear as a code-fence body.
+	if strings.Contains(got, "\n"+validPNGPayload+"\n") {
+		t.Errorf("raw payload should not survive as standalone line, got:\n%s", got)
+	}
+	// Surrounding prose should still be present.
+	if !strings.Contains(got, "看这张图") {
+		t.Errorf("prose prefix should be preserved, got:\n%s", got)
+	}
+	if !strings.Contains(got, "结束") {
+		t.Errorf("prose suffix should be preserved, got:\n%s", got)
+	}
+}
