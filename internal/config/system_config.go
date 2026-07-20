@@ -19,11 +19,17 @@ type SubAgentConfigPatch struct {
 	Timeout  *string `json:"timeout,omitempty"`
 }
 
+// WorkModeConfigPatch is a partial update for WorkModeConfig.
+type WorkModeConfigPatch struct {
+	Default *WorkMode `json:"default,omitempty"`
+}
+
 // SystemConfigPatch is a partial update for system-level config
-// (limits + subagent).
+// (limits + subagent + work_mode).
 type SystemConfigPatch struct {
 	Limits   *LimitsConfigPatch   `json:"limits,omitempty"`
 	SubAgent *SubAgentConfigPatch `json:"sub_agent,omitempty"`
+	WorkMode *WorkModeConfigPatch `json:"work_mode,omitempty"`
 }
 
 // UpdateSystemConfig merges a SystemConfigPatch into the persisted config.
@@ -38,6 +44,9 @@ func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
 	}
 	if patch.SubAgent != nil {
 		mergeSubAgent(&cfg.SubAgent, patch.SubAgent)
+	}
+	if patch.WorkMode != nil {
+		mergeWorkMode(&cfg.WorkMode, patch.WorkMode)
 	}
 
 	mgr := NewManager()
@@ -77,5 +86,11 @@ func mergeSubAgent(s *SubAgentConfig, p *SubAgentConfigPatch) {
 	}
 	if p.Timeout != nil {
 		s.Timeout = *p.Timeout
+	}
+}
+
+func mergeWorkMode(w *WorkModeConfig, p *WorkModeConfigPatch) {
+	if p.Default != nil {
+		w.Default = p.Default.Normalize()
 	}
 }

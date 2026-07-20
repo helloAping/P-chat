@@ -22,9 +22,14 @@ type subAgentResponse struct {
 	Timeout  string `json:"timeout"`
 }
 
+type workModeResponse struct {
+	Default string `json:"default"`
+}
+
 type systemConfigResponse struct {
 	Limits   limitsResponse   `json:"limits"`
 	SubAgent subAgentResponse `json:"sub_agent"`
+	WorkMode workModeResponse `json:"work_mode"`
 }
 
 func limitsToResp(l config.LimitsConfig) limitsResponse {
@@ -51,6 +56,9 @@ func (h *Handler) GetSystemConfig(c *gin.Context) {
 			CacheTTL: h.getCfg().SubAgent.CacheTTL,
 			Timeout:  h.getCfg().SubAgent.Timeout,
 		},
+		WorkMode: workModeResponse{
+			Default: string(h.getCfg().WorkMode.Default.Normalize()),
+		},
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -75,6 +83,7 @@ func (h *Handler) UpdateSystemConfig(c *gin.Context) {
 	resp := systemConfigResponse{
 		Limits:   limitsToResp(updated.Limits),
 		SubAgent: subAgentResponse{CacheTTL: updated.SubAgent.CacheTTL, Timeout: updated.SubAgent.Timeout},
+		WorkMode: workModeResponse{Default: string(updated.WorkMode.Default.Normalize())},
 	}
 	c.JSON(http.StatusOK, resp)
 }

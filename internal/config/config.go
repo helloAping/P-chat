@@ -22,6 +22,7 @@ type Config struct {
 	Server    ServerConfig    `json:"server"`
 	LLM       LLMConfig       `json:"llm"`
 	Style     StyleConfig     `json:"style"`
+	WorkMode  WorkModeConfig  `json:"work_mode"`
 	Tools     ToolsConfig     `json:"tools"`
 	Memory    MemoryConfig    `json:"memory"`
 	Sandbox   SandboxConfig   `json:"sandbox"`
@@ -186,7 +187,7 @@ type ProviderConfig struct {
 	Type     string        `json:"type,omitempty"`     // alias for Protocol (backward compat)
 	BaseURL  string        `json:"base_url"`
 	APIKey   string        `json:"api_key"`
-	Model    string        `json:"model,omitempty"`     // legacy: single model
+	Model    string        `json:"model,omitempty"` // legacy: single model
 	Models   []ModelConfig `json:"models,omitempty"`
 }
 
@@ -316,6 +317,46 @@ type StyleConfig struct {
 	Default string `json:"default"`
 }
 
+// WorkMode is the user's task focus. It is orthogonal to
+// style.Style: style controls how the assistant speaks, while
+// WorkMode controls what kind of work it prioritizes.
+type WorkMode string
+
+const (
+	// WorkModeCoding biases the assistant toward code reading,
+	// editing, debugging, commands, git, tests, and review.
+	WorkModeCoding WorkMode = "coding"
+	// WorkModeDaily biases the assistant toward documents, email,
+	// summaries, knowledge lookup, planning, and office work.
+	WorkModeDaily WorkMode = "daily"
+)
+
+// Normalize returns a safe WorkMode. Empty or unknown values fall
+// back to coding so existing installs keep the programming-agent
+// behaviour they had before work_mode existed.
+func (w WorkMode) Normalize() WorkMode {
+	switch w {
+	case WorkModeCoding, WorkModeDaily:
+		return w
+	default:
+		return WorkModeCoding
+	}
+}
+
+// IsValid reports whether w is one of the built-in work modes.
+func (w WorkMode) IsValid() bool {
+	switch w {
+	case WorkModeCoding, WorkModeDaily:
+		return true
+	default:
+		return false
+	}
+}
+
+type WorkModeConfig struct {
+	Default WorkMode `json:"default"`
+}
+
 type ToolsConfig struct {
 	Enabled []string           `json:"enabled"`
 	Servers []ToolServerConfig `json:"servers"`
@@ -334,11 +375,11 @@ type MCPConfig struct {
 
 type MCPServerConfig struct {
 	Name    string            `json:"name"`
-	Type    string            `json:"type,omitempty"`   // "stdio" (default) | "sse"
+	Type    string            `json:"type,omitempty"` // "stdio" (default) | "sse"
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
 	Env     map[string]string `json:"env,omitempty"`
-	URL     string            `json:"url,omitempty"`    // for SSE transport
+	URL     string            `json:"url,omitempty"` // for SSE transport
 	Enabled bool              `json:"enabled"`
 	Timeout string            `json:"timeout,omitempty"`
 }
@@ -362,11 +403,11 @@ type KnowledgeBase struct {
 	FileTypes []string `json:"file_types,omitempty"`
 
 	// ScanModel is "{provider}/{model}" for AI media processing, or "" for text-only.
-	ScanModel      string   `json:"scan_model"`
-	ScanMediaTypes []string `json:"scan_media_types"` // "image","video","audio","pdf"
-	AutoScan       bool     `json:"auto_scan"`
+	ScanModel       string   `json:"scan_model"`
+	ScanMediaTypes  []string `json:"scan_media_types"` // "image","video","audio","pdf"
+	AutoScan        bool     `json:"auto_scan"`
 	ExcludePatterns []string `json:"exclude_patterns"`
-	MaxFileSize    int64    `json:"max_file_size"` // 0 = default (5MB)
+	MaxFileSize     int64    `json:"max_file_size"` // 0 = default (5MB)
 }
 
 type MemoryConfig struct {
@@ -691,6 +732,7 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	}
 
 	migrateKnowledgeDefaults(cfg)
+	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
 
 	return cfg, nil
 }
@@ -759,6 +801,9 @@ func Default() *Config {
 		Style: StyleConfig{
 			Default: "tech",
 		},
+		WorkMode: WorkModeConfig{
+			Default: WorkModeCoding,
+		},
 		Tools: ToolsConfig{
 			Enabled: []string{"fs-tool", "shell-tool"},
 		},
@@ -767,10 +812,10 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Sandbox: SandboxConfig{
-			Enabled:             true,
-			RequireConfirm:      "dangerous",
-			MaxCommandLength:    4096,
-			WriteProtectedPaths: defaultWriteProtectedPaths(),
+			Enabled:               true,
+			RequireConfirm:        "dangerous",
+			MaxCommandLength:      4096,
+			WriteProtectedPaths:   defaultWriteProtectedPaths(),
 			ExecDangerousPatterns: defaultDangerousPatterns(),
 		},
 		SubAgent: SubAgentConfig{
@@ -835,23 +880,23 @@ func defaultWriteProtectedPaths() []string {
 // flag a shell command as potentially destructive.
 func defaultDangerousPatterns() []string {
 	return []string{
-		`\brm\s+(-[a-zA-Z]*[rfRF]+\s+)+/`,       // rm -rf /
-		`\brm\s+-rf\s+~`,                          // rm -rf ~
-		`\bmkfs\.`,                                 // mkfs.ext4 etc.
-		`\bdd\s+.*\bof=/dev/(sd|nvme|hd)`,         // dd to disk
-		`\bcurl\s+.*\|\s*(sudo\s+)?sh`,            // curl|sh
-		`\bwget\s+.*\|\s*(sudo\s+)?sh`,            // wget|sh
-		`\b(sh|bash)\s+<\(\s*curl`,                 // process substitution
-		`\bchmod\s+-R\s+777\s+/`,                   // chmod 777 /
-		`\bchown\s+-R\s+.*\s+/`,                    // chown /
-		`:(){\s*:\|:&\s*};:`,                       // fork bomb
-		`\bshutdown\b`,                            // shutdown
-		`\breboot\b`,                              // reboot
-		`\bpoweroff\b`,                            // poweroff
-		`\bhalt\b`,                                // halt
-		`\bmkfs\b.*\s+/dev/`,                      // format a device
-		`>\s*/dev/sd`,                             // redirect to disk
-		`\bnc\s+-l\s+-p\s+\d+`,                    // netcat listener
-		`\beval\s+.*\$\(`,                          // eval + command substitution
+		`\brm\s+(-[a-zA-Z]*[rfRF]+\s+)+/`, // rm -rf /
+		`\brm\s+-rf\s+~`,                  // rm -rf ~
+		`\bmkfs\.`,                        // mkfs.ext4 etc.
+		`\bdd\s+.*\bof=/dev/(sd|nvme|hd)`, // dd to disk
+		`\bcurl\s+.*\|\s*(sudo\s+)?sh`,    // curl|sh
+		`\bwget\s+.*\|\s*(sudo\s+)?sh`,    // wget|sh
+		`\b(sh|bash)\s+<\(\s*curl`,        // process substitution
+		`\bchmod\s+-R\s+777\s+/`,          // chmod 777 /
+		`\bchown\s+-R\s+.*\s+/`,           // chown /
+		`:(){\s*:\|:&\s*};:`,              // fork bomb
+		`\bshutdown\b`,                    // shutdown
+		`\breboot\b`,                      // reboot
+		`\bpoweroff\b`,                    // poweroff
+		`\bhalt\b`,                        // halt
+		`\bmkfs\b.*\s+/dev/`,              // format a device
+		`>\s*/dev/sd`,                     // redirect to disk
+		`\bnc\s+-l\s+-p\s+\d+`,            // netcat listener
+		`\beval\s+.*\$\(`,                 // eval + command substitution
 	}
 }

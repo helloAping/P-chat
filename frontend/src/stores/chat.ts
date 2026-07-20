@@ -75,7 +75,8 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
+  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
+  globalWorkMode: 'coding' as string,
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
   // sessionWorking is the per-session "is the LLM mid-turn"
@@ -235,6 +236,7 @@ export const currentMeta = computed(() => {
   const def = state.defaultModel
   return {
     style: 'tech',
+    workMode: state.globalWorkMode || 'coding',
     provider: def?.provider || '',
     model: def?.model || '',
     title: '',
@@ -504,6 +506,7 @@ export async function switchSession(id: string) {
   if (s) {
     state.sessionMeta[id] = {
       style:     s.style || 'tech',
+      workMode:  s.work_mode || state.globalWorkMode || 'coding',
       provider:  s.provider || '',
       model:     s.model || '',
       title:     s.title || '',
@@ -701,6 +704,7 @@ export async function renameSession(id: string, title: string) {
   if (s) {
     s.title = resp.title ?? title
     s.style = resp.style ?? s.style
+    s.work_mode = resp.work_mode ?? s.work_mode
     s.provider = resp.provider ?? s.provider
     s.model = resp.model ?? s.model
   }
@@ -709,6 +713,7 @@ export async function renameSession(id: string, title: string) {
       ...state.sessionMeta[id],
       title: resp.title ?? title,
       style: resp.style ?? state.sessionMeta[id].style,
+      workMode: resp.work_mode ?? state.sessionMeta[id].workMode,
       provider: resp.provider ?? state.sessionMeta[id].provider,
       model: resp.model ?? state.sessionMeta[id].model,
       permission_level: resp.permission_level ?? state.sessionMeta[id].permission_level,

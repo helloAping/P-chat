@@ -157,6 +157,9 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 
 	h.setSessionMeta(id, req.Style, provider, model)
+	if req.WorkMode != "" {
+		h.setSessionMetaWorkMode(id, req.WorkMode)
+	}
 	// Store project path if provided.
 	if req.ProjectPath != "" {
 		h.setSessionMetaProjectPath(id, req.ProjectPath)
@@ -390,6 +393,7 @@ func (h *Handler) ForkSession(c *gin.Context) {
 
 	srcMeta := h.ensureMetaLoaded(id)
 	h.setSessionMeta(conv.ID, srcMeta.Style, srcMeta.Provider, srcMeta.Model)
+	h.setSessionMetaWorkMode(conv.ID, srcMeta.WorkMode)
 	if srcMeta.ProjectPath != "" {
 		h.setSessionMetaProjectPath(conv.ID, srcMeta.ProjectPath)
 	}
@@ -440,7 +444,7 @@ func (h *Handler) UndoRollback(c *gin.Context) {
 	restored := make([]memory.Message, 0, len(req.Messages))
 	for _, r := range req.Messages {
 		m := memory.Message{
-			ID:             r.ID,
+			ID: r.ID,
 			// Seq is preserved from the rollback's
 			// deleted_messages so the restored row
 			// keeps the same per-conversation
@@ -654,6 +658,9 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		}
 	}
 	h.setSessionMeta(id, deref(req.Style), provider, deref(req.Model))
+	if req.WorkMode != nil {
+		h.setSessionMetaWorkMode(id, *req.WorkMode)
+	}
 
 	// Handle permission level separately — validate and write directly.
 	if req.PermissionLevel != nil {
@@ -667,10 +674,7 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		m.PermissionLevel = level
 		h.meta[id] = m
 		h.metaMu.Unlock()
-		if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
-			_ = h.store.UpdateConversationMeta(id, string(blob))
-		}
+		h.persistSessionMeta(id, m)
 	}
 
 	// Handle vector_store as a first-class conversation column.
@@ -687,10 +691,7 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		m.KnowledgeBase = *req.KnowledgeBase
 		h.meta[id] = m
 		h.metaMu.Unlock()
-		if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
-			_ = h.store.UpdateConversationMeta(id, string(blob))
-		}
+		h.persistSessionMeta(id, m)
 	}
 
 	// Handle auto_continue (P0-3). Pointer semantics: nil
@@ -704,10 +705,7 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		m.AutoContinue = req.AutoContinue
 		h.meta[id] = m
 		h.metaMu.Unlock()
-		if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase, AutoContinue: m.AutoContinue})
-			_ = h.store.UpdateConversationMeta(id, string(blob))
-		}
+		h.persistSessionMeta(id, m)
 	}
 
 	// Re-read so the response reflects the on-disk truth.
@@ -727,7 +725,6 @@ func deref(s *string) string {
 }
 
 // --- Messages ---
-
 
 func (h *Handler) ArchiveSession(c *gin.Context) {
 	id := c.Param("id")

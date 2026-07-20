@@ -20,6 +20,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/trace"
@@ -101,10 +102,18 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		model = req.Model
 	}
 
+	workMode := h.sessionWorkMode(id)
+	if req.WorkMode != "" {
+		workMode = config.WorkMode(req.WorkMode).Normalize()
+	}
+
 	// Persist whichever fields the caller actually changed. The
 	// setSessionMeta helper is a no-op when nothing differs, so
 	// sending an empty body is fine.
 	h.setSessionMeta(id, string(s), provider, model)
+	if req.WorkMode != "" {
+		h.setSessionMetaWorkMode(id, string(workMode))
+	}
 
 	// Serialise concurrent SendMessage calls on the same session
 	// so message writes don't interleave and corrupt history.
@@ -139,11 +148,12 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	})
 
 	chatReq := agent.ChatRequest{
-		Style:             s,
-		Provider:          provider,
-		Model:             model,
-		Messages:          msgs,
-		Attachments:       req.Attachments,
+		Style:       s,
+		WorkMode:    workMode,
+		Provider:    provider,
+		Model:       model,
+		Messages:    msgs,
+		Attachments: req.Attachments,
 		// Forward the frontend's client-minted row id. The
 		// agent uses it as the explicit SQLite row id for
 		// this turn's user message, so rollback/regen
@@ -291,9 +301,9 @@ func (h *Handler) loadUserMessageSummary(convID string, msgID int64) (*UserMessa
 	// (the first time the user hovers a paginated bubble
 	// or paginates), not on every list.
 	var (
-		role     string
-		content  string
-		created  int64
+		role    string
+		content string
+		created int64
 	)
 	err := h.store.DB().QueryRow(
 		`SELECT role, content, created_at FROM messages

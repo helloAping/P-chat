@@ -24,14 +24,15 @@
 import { computed, h, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
-  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree, useMessage,
+  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree,
+  NRadioGroup, NRadioButton, useMessage,
 } from 'naive-ui'
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash,
   Cpu, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
 } from './icons'
 import * as api from '../api/client'
-import { loadProviders, loadSessions, bumpKBConfigVersion } from '../stores/chat'
+import { loadProviders, loadSessions, bumpKBConfigVersion, state as chatState } from '../stores/chat'
 import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
@@ -273,6 +274,7 @@ const sysSubAgent = ref<api.SubAgentConfig>({
   cache_ttl: '',
   timeout: '',
 })
+const sysWorkMode = ref('coding')
 const sysDirty = ref(false)
 const sysSaving = ref(false)
 
@@ -281,6 +283,8 @@ async function loadSystemConfig() {
     const sc = await api.getSystemConfig()
     sysLimits.value = sc.limits
     sysSubAgent.value = sc.sub_agent
+    sysWorkMode.value = sc.work_mode?.default || 'coding'
+    chatState.globalWorkMode = sysWorkMode.value
     sysDirty.value = false
   } catch { /* ignore */ }
 }
@@ -306,8 +310,10 @@ async function saveSystemConfig() {
     sa.cache_ttl = sysSubAgent.value.cache_ttl
     sa.timeout = sysSubAgent.value.timeout
     patch.sub_agent = sa
+    patch.work_mode = { default: sysWorkMode.value }
 
-    await api.updateSystemConfig(patch)
+    const updated = await api.updateSystemConfig(patch)
+    chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
     sysDirty.value = false
     message.success('系统配置已保存')
   } catch (e: any) {
@@ -328,6 +334,7 @@ function resetSystemConfig() {
     max_stored_messages: 0,
   }
   sysSubAgent.value = { cache_ttl: '', timeout: '' }
+  sysWorkMode.value = 'coding'
   sysDirty.value = true
 }
 
@@ -1955,7 +1962,20 @@ function kbModelSupportsVision(scanModel: string) {
                   </p>
                 </div>
               </div>
-              <NCollapse class="sys-collapse" :default-expanded-names="['context', 'agent', 'subagent']">
+              <NCollapse class="sys-collapse" :default-expanded-names="['work-mode', 'context', 'agent', 'subagent']">
+                <NCollapseItem title="工作模式" name="work-mode">
+                  <div class="sys-form-grid">
+                    <div class="sys-form-row">
+                      <span class="sys-label">新会话默认侧重点</span>
+                      <NRadioGroup v-model:value="sysWorkMode" size="small" @update:value="markSysDirty">
+                        <NRadioButton value="coding">编码</NRadioButton>
+                        <NRadioButton value="daily">日常工作</NRadioButton>
+                      </NRadioGroup>
+                      <span class="sys-hint">风格只决定怎么说；工作模式决定优先处理哪类任务。</span>
+                    </div>
+                  </div>
+                </NCollapseItem>
+
                 <NCollapseItem title="上下文管理" name="context">
                   <div class="sys-form-grid">
                     <div class="sys-form-row">

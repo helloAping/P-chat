@@ -116,6 +116,7 @@ func (h *Handler) Regenerate(c *gin.Context) {
 
 	chatReq := agent.ChatRequest{
 		Style:             style.Style(styleStr),
+		WorkMode:          h.sessionWorkMode(id),
 		Provider:          provider,
 		Model:             model,
 		Messages:          msgs,
@@ -132,8 +133,8 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		// new assistant row's regen_group_id, joining the
 		// user message's regen group. Empty for normal
 		// (non-regen) SendMessage requests.
-		RegenGroupID:      groupID,
-		TraceID:           trace.FromContext(c.Request.Context()),
+		RegenGroupID: groupID,
+		TraceID:      trace.FromContext(c.Request.Context()),
 	}
 
 	// Same session-locks pattern as SendMessage so a
@@ -172,9 +173,9 @@ type UserMessageSummary struct {
 // the user-message summary the UI needs to render the
 // pager / chip without a second round-trip.
 type RepliesResponse struct {
-	UserMessage    UserMessageSummary `json:"user_message"`
-	Replies        []MessageResponse  `json:"replies"`
-	ActiveReplyID  int64              `json:"active_reply_id"`
+	UserMessage   UserMessageSummary `json:"user_message"`
+	Replies       []MessageResponse  `json:"replies"`
+	ActiveReplyID int64              `json:"active_reply_id"`
 }
 
 // userMessagePreviewLength is the truncation length for

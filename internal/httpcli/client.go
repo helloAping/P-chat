@@ -29,6 +29,7 @@ type Client struct {
 	mu              sync.Mutex
 	currentProvider string
 	currentStyle    string
+	currentWorkMode string
 	// currentModel is the model the user selected for the
 	// current provider (via SetModel). The server doesn't
 	// expose a dedicated set-model endpoint, so this is a
@@ -77,13 +78,14 @@ func NewClient(base string) *Client {
 
 // Session mirrors server.SessionResponse.
 type Session struct {
-	ID           string `json:"id"`
-	Title        string `json:"title"`
-	Provider     string `json:"provider,omitempty"`
-	Model        string `json:"model,omitempty"`
-	Style        string `json:"style,omitempty"`
-	CreatedAt    int64  `json:"created_at"`
-	UpdatedAt    int64  `json:"updated_at"`
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Style     string `json:"style,omitempty"`
+	WorkMode  string `json:"work_mode,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
 	// AutoContinue mirrors the server's P0-3 flag (default
 	// true). The CLI uses it to display the current
 	// auto-continue state next to /auto-continue's status
@@ -235,6 +237,7 @@ func (c *Client) GetSession(ctx context.Context, id string) (*Session, error) {
 
 type CreateSessionOpts struct {
 	Style    string `json:"style,omitempty"`
+	WorkMode string `json:"work_mode,omitempty"`
 	Provider string `json:"provider,omitempty"`
 	Title    string `json:"title,omitempty"`
 }
@@ -262,6 +265,7 @@ func (c *Client) RenameSession(ctx context.Context, id, title string) error {
 // other session metadata.
 type SessionPatchOpts struct {
 	Style         *string `json:"style,omitempty"`
+	WorkMode      *string `json:"work_mode,omitempty"`
 	Provider      *string `json:"provider,omitempty"`
 	Model         *string `json:"model,omitempty"`
 	Permission    *string `json:"permission_level,omitempty"`
@@ -305,8 +309,9 @@ func (c *Client) ListMessages(ctx context.Context, id string) ([]Message, error)
 
 // SendMessageOptions configures a chat call.
 type SendMessageOptions struct {
-	Message string `json:"message" binding:"required"`
-	Style   string `json:"style,omitempty"`
+	Message  string `json:"message" binding:"required"`
+	Style    string `json:"style,omitempty"`
+	WorkMode string `json:"work_mode,omitempty"`
 }
 
 // SendMessage streams the LLM response back via SSE. Each event
@@ -396,8 +401,10 @@ func (c *Client) ListStyles(ctx context.Context) ([]StyleInfo, error) {
 // currentProvider is the provider name the most recent operation
 // was on. The client uses it to answer ProviderName() / DisplayModel()
 // without round-tripping the server.
-func (c *Client) CurrentProvider() string   { return c.currentProvider }
+func (c *Client) CurrentProvider() string     { return c.currentProvider }
 func (c *Client) SetCurrentProvider(p string) { c.currentProvider = p }
+func (c *Client) CurrentWorkMode() string     { return c.currentWorkMode }
+func (c *Client) SetCurrentWorkMode(m string) { c.currentWorkMode = m }
 
 func (c *Client) ProviderModel() string {
 	c.mu.Lock()

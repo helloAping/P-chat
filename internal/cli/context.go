@@ -120,6 +120,9 @@ type cliContext interface {
 	ListStyles() []style.Style
 	StyleName() string
 	SetStyle(name string) error
+	ListModes() []config.WorkMode
+	ModeName() string
+	SetMode(name string) error
 	ListTools() []ToolView
 	ToolsEnabled() bool
 	SetToolsEnabled(on bool)
@@ -481,8 +484,8 @@ func (c *localContext) ListProviderModels(ctx context.Context, provider string) 
 	return nil, nil
 }
 
-func (c *localContext) GetCurrentProvider() string  { return c.r.provider }
-func (c *localContext) GetCurrentModel() string     { return c.r.llm.GetModel(c.r.provider) }
+func (c *localContext) GetCurrentProvider() string { return c.r.provider }
+func (c *localContext) GetCurrentModel() string    { return c.r.llm.GetModel(c.r.provider) }
 func (c *localContext) GetProviderProtocol(p string) string {
 	for _, pp := range c.r.cfg.LLM.Providers {
 		if pp.Name == p {
@@ -497,9 +500,9 @@ func (c *localContext) SetCurrentProvider(name string) error {
 	return nil
 }
 
-func (c *localContext) SetModel(p, m string) error    { return c.r.llm.SetModel(p, m) }
-func (c *localContext) HasProvider(n string) bool     { return c.r.llm.HasProvider(n) }
-func (c *localContext) DisplayModel(p string) string  { return c.r.llm.DisplayModel(p) }
+func (c *localContext) SetModel(p, m string) error   { return c.r.llm.SetModel(p, m) }
+func (c *localContext) HasProvider(n string) bool    { return c.r.llm.HasProvider(n) }
+func (c *localContext) DisplayModel(p string) string { return c.r.llm.DisplayModel(p) }
 
 func (c *localContext) ProviderConfig(name string) (ProviderConfigView, error) {
 	for _, p := range c.r.cfg.LLM.Providers {
@@ -671,8 +674,8 @@ func (c *localContext) ChatStream(ctx context.Context, req agent.ChatRequest) (<
 }
 
 func (c *localContext) StyleLabel(s style.Style) string { return c.r.styleMgr.DisplayLabel(s) }
-func (c *localContext) ListStyles() []style.Style        { return c.r.styleMgr.List() }
-func (c *localContext) StyleName() string                 { return string(c.r.style) }
+func (c *localContext) ListStyles() []style.Style       { return c.r.styleMgr.List() }
+func (c *localContext) StyleName() string               { return string(c.r.style) }
 
 func (c *localContext) SetStyle(name string) error {
 	s, err := style.ParseStyle(name)
@@ -680,6 +683,23 @@ func (c *localContext) SetStyle(name string) error {
 		return err
 	}
 	c.r.style = s
+	return nil
+}
+
+func (c *localContext) ListModes() []config.WorkMode {
+	return []config.WorkMode{config.WorkModeCoding, config.WorkModeDaily}
+}
+
+func (c *localContext) ModeName() string {
+	return string(c.r.mode.Normalize())
+}
+
+func (c *localContext) SetMode(name string) error {
+	wm := config.WorkMode(name)
+	if !wm.IsValid() {
+		return fmt.Errorf("unknown work mode: %s", name)
+	}
+	c.r.mode = wm
 	return nil
 }
 
@@ -698,7 +718,7 @@ func (c *localContext) ListTools() []ToolView {
 	return out
 }
 
-func (c *localContext) ToolsEnabled() bool     { return c.r.useTools }
+func (c *localContext) ToolsEnabled() bool      { return c.r.useTools }
 func (c *localContext) SetToolsEnabled(on bool) { c.r.useTools = on }
 
 func (c *localContext) SubAgentStats() (entries, hits, misses, stores int, hitRatio float64, ok bool) {
@@ -891,6 +911,7 @@ func (c *localContext) Flush() error { return c.r.store.Flush() }
 type httpContext struct {
 	c       *httpcli.Client
 	style   string
+	mode    string
 	prov    string
 	curSess string
 
@@ -899,10 +920,11 @@ type httpContext struct {
 
 // NewHTTPContext creates a cliContext backed by an httpcli.Client.
 // All operations go through the pchat-server REST API.
-func NewHTTPContext(c *httpcli.Client, style, provider, sessionID string) cliContext {
+func NewHTTPContext(c *httpcli.Client, style, mode, provider, sessionID string) cliContext {
 	return &httpContext{
 		c:       c,
 		style:   style,
+		mode:    string(config.WorkMode(mode).Normalize()),
 		prov:    provider,
 		curSess: sessionID,
 	}
@@ -927,26 +949,34 @@ func (c *httpContext) ListProviderModels(ctx context.Context, provider string) (
 	return out, nil
 }
 
-func (c *httpContext) GetCurrentProvider() string  { return c.prov }
-func (c *httpContext) GetCurrentModel() string     { return c.c.ProviderModel() }
+func (c *httpContext) GetCurrentProvider() string          { return c.prov }
+func (c *httpContext) GetCurrentModel() string             { return c.c.ProviderModel() }
 func (c *httpContext) GetProviderProtocol(p string) string { return "" }
 func (c *httpContext) SetCurrentProvider(name string) error {
 	c.prov = name
 	return nil
 }
-func (c *httpContext) SetModel(p, m string) error  { return c.c.SetModel(p, m) }
-func (c *httpContext) HasProvider(n string) bool   { return true }
+func (c *httpContext) SetModel(p, m string) error   { return c.c.SetModel(p, m) }
+func (c *httpContext) HasProvider(n string) bool    { return true }
 func (c *httpContext) DisplayModel(p string) string { return c.c.DisplayModel(p) }
 func (c *httpContext) ProviderConfig(name string) (ProviderConfigView, error) {
 	return ProviderConfigView{}, c.unsupported("ProviderConfig")
 }
-func (c *httpContext) AddProvider(p ProviderConfigInput) error    { return c.unsupported("AddProvider") }
-func (c *httpContext) RemoveProvider(name string) error           { return c.unsupported("RemoveProvider") }
-func (c *httpContext) SetProviderAPIKey(name, key string) error  { return c.unsupported("SetProviderAPIKey") }
-func (c *httpContext) SetDefaultProvider(name string) error      { return c.unsupported("SetDefaultProvider") }
-func (c *httpContext) AddModel(p, n, d, dd string) error         { return c.unsupported("AddModel") }
-func (c *httpContext) AddModelFull(p string, m config.ModelConfig) error { return c.unsupported("AddModelFull") }
-func (c *httpContext) UpdateModel(p, n string, patch config.ModelConfig) error { return c.unsupported("UpdateModel") }
+func (c *httpContext) AddProvider(p ProviderConfigInput) error { return c.unsupported("AddProvider") }
+func (c *httpContext) RemoveProvider(name string) error        { return c.unsupported("RemoveProvider") }
+func (c *httpContext) SetProviderAPIKey(name, key string) error {
+	return c.unsupported("SetProviderAPIKey")
+}
+func (c *httpContext) SetDefaultProvider(name string) error {
+	return c.unsupported("SetDefaultProvider")
+}
+func (c *httpContext) AddModel(p, n, d, dd string) error { return c.unsupported("AddModel") }
+func (c *httpContext) AddModelFull(p string, m config.ModelConfig) error {
+	return c.unsupported("AddModelFull")
+}
+func (c *httpContext) UpdateModel(p, n string, patch config.ModelConfig) error {
+	return c.unsupported("UpdateModel")
+}
 func (c *httpContext) RemoveModel(p, n string) error              { return c.unsupported("RemoveModel") }
 func (c *httpContext) SetDefaultModel(p, n string) error          { return c.unsupported("SetDefaultModel") }
 func (c *httpContext) ListAllModels(provider string) []ModelView  { return nil }
@@ -956,8 +986,8 @@ func (c *httpContext) ReloadConfig() error                        { return c.uns
 func (c *httpContext) ListSessions(ctx context.Context) ([]httpcli.Session, error) {
 	return c.c.ListSessions(ctx)
 }
-func (c *httpContext) GetCurrentSessionID() string         { return c.curSess }
-func (c *httpContext) SetCurrentSession(id string) error   { c.curSess = id; return nil }
+func (c *httpContext) GetCurrentSessionID() string       { return c.curSess }
+func (c *httpContext) SetCurrentSession(id string) error { c.curSess = id; return nil }
 func (c *httpContext) GetCurrentSessionMessages(ctx context.Context) ([]httpcli.Message, error) {
 	return c.c.ListMessages(ctx, c.curSess)
 }
@@ -1023,8 +1053,9 @@ func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) 
 	go func() {
 		defer close(out)
 		opts := httpcli.SendMessageOptions{
-			Message: lastUserContent(req.Messages),
-			Style:   string(req.Style),
+			Message:  lastUserContent(req.Messages),
+			Style:    string(req.Style),
+			WorkMode: string(req.WorkMode),
 		}
 		err := c.c.SendMessage(ctx, c.curSess, opts, func(ev httpcli.StreamEvent) {
 			out <- httpEventToChunk(ev)
@@ -1048,11 +1079,34 @@ func (c *httpContext) StyleLabel(s style.Style) string { return s.DisplayName() 
 func (c *httpContext) ListStyles() []style.Style {
 	return []style.Style{style.Cute, style.Guofeng, style.Tech}
 }
-func (c *httpContext) StyleName() string         { return c.style }
-func (c *httpContext) SetStyle(name string) error { c.style = name; return nil }
-func (c *httpContext) ListTools() []ToolView     { return nil }
-func (c *httpContext) ToolsEnabled() bool        { return true }
-func (c *httpContext) SetToolsEnabled(on bool)   {}
+func (c *httpContext) StyleName() string { return c.style }
+func (c *httpContext) SetStyle(name string) error {
+	if _, err := style.ParseStyle(name); err != nil {
+		return err
+	}
+	c.style = name
+	return nil
+}
+func (c *httpContext) ListModes() []config.WorkMode {
+	return []config.WorkMode{config.WorkModeCoding, config.WorkModeDaily}
+}
+func (c *httpContext) ModeName() string {
+	if c.mode == "" {
+		return string(config.WorkModeCoding)
+	}
+	return string(config.WorkMode(c.mode).Normalize())
+}
+func (c *httpContext) SetMode(name string) error {
+	wm := config.WorkMode(name)
+	if !wm.IsValid() {
+		return fmt.Errorf("unknown work mode: %s", name)
+	}
+	c.mode = string(wm)
+	return nil
+}
+func (c *httpContext) ListTools() []ToolView   { return nil }
+func (c *httpContext) ToolsEnabled() bool      { return true }
+func (c *httpContext) SetToolsEnabled(on bool) {}
 
 // httpContext sandbox methods are deliberate no-ops with a
 // visible warning. The server's sandbox is configured at process
@@ -1074,11 +1128,11 @@ func (c *httpContext) SetSandbox(enabled bool) {
 func (c *httpContext) BypassSandboxOnce() {
 	color.Yellow("  ⚠ /unsafe 仅在本地 REPL 可用（HTTP 模式忽略此设置）")
 }
-func (c *httpContext) RebuildSandbox() error       { return c.unsupported("RebuildSandbox") }
+func (c *httpContext) RebuildSandbox() error { return c.unsupported("RebuildSandbox") }
 
-func (c *httpContext) ExpandList() []ToolResultView                { return nil }
+func (c *httpContext) ExpandList() []ToolResultView                 { return nil }
 func (c *httpContext) ExpandByIndex(idx int) (ToolResultView, bool) { return ToolResultView{}, false }
-func (c *httpContext) ExpandLast() (ToolResultView, bool)          { return ToolResultView{}, false }
+func (c *httpContext) ExpandLast() (ToolResultView, bool)           { return ToolResultView{}, false }
 
 func (c *httpContext) SubAgentStats() (int, int, int, int, float64, bool) {
 	return 0, 0, 0, 0, 0, false
@@ -1089,16 +1143,16 @@ func (c *httpContext) MemoryStats() (int, int, string, bool) {
 
 func (c *httpContext) Flush() error { return c.c.Flush() }
 
-func (c *httpContext) ListKBs() ([]KBView, error)        { return nil, c.unsupported("ListKBs") }
-func (c *httpContext) AddKB(path string) error          { return c.unsupported("AddKB") }
-func (c *httpContext) RemoveKB(path string) error       { return c.unsupported("RemoveKB") }
-func (c *httpContext) ScanKBs() (int, int, error)       { return 0, 0, c.unsupported("ScanKBs") }
+func (c *httpContext) ListKBs() ([]KBView, error) { return nil, c.unsupported("ListKBs") }
+func (c *httpContext) AddKB(path string) error    { return c.unsupported("AddKB") }
+func (c *httpContext) RemoveKB(path string) error { return c.unsupported("RemoveKB") }
+func (c *httpContext) ScanKBs() (int, int, error) { return 0, 0, c.unsupported("ScanKBs") }
 func (c *httpContext) Recall(ctx context.Context, query string, topK int) error {
 	return c.unsupported("Recall")
 }
-func (c *httpContext) InitProject(dir string) error     { return c.unsupported("InitProject") }
-func (c *httpContext) ListSkills() ([]string, error)    { return nil, c.unsupported("ListSkills") }
-func (c *httpContext) ListRules() ([]string, error)     { return nil, c.unsupported("ListRules") }
+func (c *httpContext) InitProject(dir string) error  { return c.unsupported("InitProject") }
+func (c *httpContext) ListSkills() ([]string, error) { return nil, c.unsupported("ListSkills") }
+func (c *httpContext) ListRules() ([]string, error)  { return nil, c.unsupported("ListRules") }
 func (c *httpContext) AgentsContext() (string, string, error) {
 	return "", "", c.unsupported("AgentsContext")
 }
@@ -1213,6 +1267,7 @@ func runLocalPlan(ctx cliContext, args string) error {
 	// Plan mode disables tools and limits to 1 round (handled in agent).
 	req := agent.ChatRequest{
 		Style:    r.style,
+		WorkMode: r.mode.Normalize(),
 		Provider: r.provider,
 		Messages: msgs,
 		PlanMode: true,
@@ -1310,6 +1365,7 @@ func runLocalExecutePlan(ctx cliContext, msgs []llm.ChatMessage, plan, provModel
 
 	planReq := agent.ChatRequest{
 		Style:    r.style,
+		WorkMode: r.mode.Normalize(),
 		Provider: r.provider,
 		Messages: append(msgs, llm.ChatMessage{
 			Role:    llm.RoleAssistant,

@@ -47,11 +47,12 @@ type Handler struct {
 	// sessionLocks serialises concurrent SendMessage calls per
 	// session to prevent interleaved message writes.
 	sessionLocks sync.Map // string → struct{}
-	meta   map[string]sessionMeta
+	meta         map[string]sessionMeta
 }
 
 type sessionMeta struct {
 	Style           string
+	WorkMode        string
 	Provider        string
 	Model           string
 	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
@@ -72,6 +73,7 @@ type sessionMeta struct {
 // the web side can pass them straight back to the PATCH endpoint.
 type sessionMetaBlob struct {
 	Style           string `json:"style,omitempty"`
+	WorkMode        string `json:"work_mode,omitempty"`
 	Provider        string `json:"provider,omitempty"`
 	Model           string `json:"model,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
@@ -102,6 +104,29 @@ func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMg
 	// handed the request to the agent.
 	a.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
 	return h
+}
+
+func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
+	return sessionMetaBlob{
+		Style:           m.Style,
+		WorkMode:        m.WorkMode,
+		Provider:        m.Provider,
+		Model:           m.Model,
+		ReasoningEffort: m.ReasoningEffort,
+		ProjectPath:     m.ProjectPath,
+		PlanMode:        m.PlanMode,
+		PermissionLevel: m.PermissionLevel,
+		KnowledgeBase:   m.KnowledgeBase,
+		AutoContinue:    m.AutoContinue,
+	}
+}
+
+func (h *Handler) persistSessionMeta(id string, m sessionMeta) {
+	if h.store == nil {
+		return
+	}
+	blob, _ := json.Marshal(sessionMetaToBlob(m))
+	_ = h.store.UpdateConversationMeta(id, string(blob))
 }
 
 // getCfg returns the current config snapshot. Safe for
@@ -138,16 +163,7 @@ func (h *Handler) setSessionMeta(id, style, provider, model string) {
 		return
 	}
 	h.meta[id] = m
-	if h.store == nil {
-		return
-	}
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
-	if err := h.store.UpdateConversationMeta(id, string(blob)); err != nil {
-		// Non-fatal: in-memory map already updated, request still
-		// works for this session. The next setSessionMeta call
-		// will retry the write.
-		return
-	}
+	h.persistSessionMeta(id, m)
 }
 
 // ensureMetaLoaded re-hydrates the in-memory meta map for `id`
@@ -165,6 +181,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 			var blob sessionMetaBlob
 			if json.Unmarshal([]byte(cv.Metadata), &blob) == nil {
 				m.Style = blob.Style
+				m.WorkMode = blob.WorkMode
 				m.Provider = blob.Provider
 				m.Model = blob.Model
 				m.ReasoningEffort = blob.ReasoningEffort
@@ -183,6 +200,14 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 func (h *Handler) sessionStyle(id string) string {
 	m := h.ensureMetaLoaded(id)
 	return m.Style
+}
+
+func (h *Handler) sessionWorkMode(id string) config.WorkMode {
+	m := h.ensureMetaLoaded(id)
+	if m.WorkMode != "" {
+		return config.WorkMode(m.WorkMode).Normalize()
+	}
+	return h.getCfg().WorkMode.Default.Normalize()
 }
 
 // sessionAutoContinue returns the P0-3 auto-continue flag for
@@ -238,9 +263,19 @@ func (h *Handler) setSessionMetaProjectPath(id, projectPath string) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
-		_ = h.store.UpdateConversationMeta(id, string(blob))
+		h.persistSessionMeta(id, m)
 	}
+}
+
+// setSessionMetaWorkMode updates just the work_mode field.
+func (h *Handler) setSessionMetaWorkMode(id, wm string) {
+	mode := config.WorkMode(wm).Normalize()
+	h.metaMu.Lock()
+	m := h.meta[id]
+	m.WorkMode = string(mode)
+	h.meta[id] = m
+	h.metaMu.Unlock()
+	h.persistSessionMeta(id, m)
 }
 
 // validProvider returns true if name is a configured provider.
@@ -278,8 +313,9 @@ func (h *Handler) validModel(provider, name string) bool {
 
 // SendMessageRequest is the body of POST /sessions/:id/messages.
 type SendMessageRequest struct {
-	Message string `json:"message" binding:"required"`
-	Style   string `json:"style,omitempty"`
+	Message  string `json:"message" binding:"required"`
+	Style    string `json:"style,omitempty"`
+	WorkMode string `json:"work_mode,omitempty"`
 	// Provider / Model, when set, override the per-session defaults
 	// for this turn. They are also written back to the per-session
 	// meta so subsequent turns keep using the new model. Empty
@@ -315,6 +351,7 @@ type SendMessageRequest struct {
 // CreateSessionRequest is the body of POST /sessions.
 type CreateSessionRequest struct {
 	Style       string `json:"style,omitempty"`
+	WorkMode    string `json:"work_mode,omitempty"`
 	Provider    string `json:"provider,omitempty"`
 	Model       string `json:"model,omitempty"`
 	Title       string `json:"title,omitempty"`
@@ -336,6 +373,7 @@ type UpdateSessionMetaRequest struct {
 	Provider *string `json:"provider,omitempty"`
 	Model    *string `json:"model,omitempty"`
 	Style    *string `json:"style,omitempty"`
+	WorkMode *string `json:"work_mode,omitempty"`
 	// PermissionLevel sets the sandbox permission level for this session.
 	// Values: "ask", "auto", "full". Omit to leave unchanged.
 	PermissionLevel *string `json:"permission_level,omitempty"`
@@ -358,19 +396,20 @@ type UpdateSessionMetaRequest struct {
 // (resolved from the in-memory + on-disk meta blob, with the
 // process default for unset fields).
 type SessionResponse struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Provider    string `json:"provider,omitempty"`
-	Model       string `json:"model,omitempty"`
-	Style       string `json:"style,omitempty"`
-	ProjectPath string `json:"project_path,omitempty"`
-	PlanMode    bool   `json:"plan_mode,omitempty"`
+	ID              string `json:"id"`
+	Title           string `json:"title"`
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
+	Style           string `json:"style,omitempty"`
+	WorkMode        string `json:"work_mode,omitempty"`
+	ProjectPath     string `json:"project_path,omitempty"`
+	PlanMode        bool   `json:"plan_mode,omitempty"`
 	PermissionLevel string `json:"permission_level,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	VectorStore    string `json:"vector_store,omitempty"`
-	KnowledgeBase  string `json:"knowledge_base,omitempty"`
-	CreatedAt      int64  `json:"created_at"`
-	UpdatedAt   int64  `json:"updated_at"`
+	VectorStore     string `json:"vector_store,omitempty"`
+	KnowledgeBase   string `json:"knowledge_base,omitempty"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
 	// AutoContinue is the P0-3 "todo-incomplete → re-prompt
 	// LLM" guard toggle, default true. Surface so the UI can
 	// show a status pill ("auto-continue on/off") next to the
@@ -381,7 +420,7 @@ type SessionResponse struct {
 // MessageResponse is the JSON form of a single message in a
 // conversation history.
 type MessageResponse struct {
-	ID         int64  `json:"id"`
+	ID int64 `json:"id"`
 	// Seq is the per-conversation logical position. Unlike
 	// `id` (a global AUTOINCREMENT that's never reused), seq
 	// survives rollback+undo and is the new stable cursor
@@ -569,12 +608,12 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 // suitable for the frontend to render. Mirrors the OpenAI
 // ChatMessagePart shape but is scoped to what the UI needs.
 type AttachmentPart struct {
-	Type     string `json:"type"`               // "image_url" | "text"
-	URL      string `json:"url,omitempty"`       // data URL for images
-	Text     string `json:"text,omitempty"`      // text body for text parts
-	Name     string `json:"name,omitempty"`     // original filename, for display
-	MIME     string `json:"mime,omitempty"`     // MIME type
-	Kind     string `json:"kind,omitempty"`     // image / audio / text / file
+	Type string `json:"type"`           // "image_url" | "text"
+	URL  string `json:"url,omitempty"`  // data URL for images
+	Text string `json:"text,omitempty"` // text body for text parts
+	Name string `json:"name,omitempty"` // original filename, for display
+	MIME string `json:"mime,omitempty"` // MIME type
+	Kind string `json:"kind,omitempty"` // image / audio / text / file
 }
 
 // StreamEvent is one chunk of a Server-Sent Events stream from
@@ -604,10 +643,10 @@ type StreamEvent struct {
 	Message  string `json:"message,omitempty"`
 
 	// Tool fields — Type "tool".
-	ToolID   string `json:"tool_id,omitempty"`
-	ToolName string `json:"tool_name,omitempty"`
-	ToolStatus  string `json:"tool_status,omitempty"`
-	ToolResult  string `json:"tool_result,omitempty"`
+	ToolID     string `json:"tool_id,omitempty"`
+	ToolName   string `json:"tool_name,omitempty"`
+	ToolStatus string `json:"tool_status,omitempty"`
+	ToolResult string `json:"tool_result,omitempty"`
 	// ToolResultFull is the untruncated tool result for tools
 	// whose output the frontend needs to parse (todo_write).
 	// ToolResult is a 300-char preview for display; ToolResultFull
@@ -673,11 +712,11 @@ type StreamEvent struct {
 	SubAgentFailureReason string `json:"sub_agent_failure_reason,omitempty"`
 
 	// Done fields
-	TokensIn      int    `json:"tokens_in,omitempty"`
-	TokensOut     int    `json:"tokens_out,omitempty"`
-	Elapsed       string `json:"elapsed,omitempty"`
-	Provider      string `json:"provider,omitempty"`
-	Model         string `json:"model,omitempty"`
+	TokensIn  int    `json:"tokens_in,omitempty"`
+	TokensOut int    `json:"tokens_out,omitempty"`
+	Elapsed   string `json:"elapsed,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model,omitempty"`
 	// UserMessageID is the SQLite row id of the user message
 	// that started this turn. Set only on the "done" event so
 	// the frontend can stamp it on the local Message for fork.

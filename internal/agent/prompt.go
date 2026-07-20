@@ -27,7 +27,7 @@ import (
 	"github.com/p-chat/pchat/internal/tool"
 )
 
-func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, availableTools []tool.Tool, projectRoot string, kbEnabled bool) (string, string, error) {
+func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolDefs []llm.ToolDef, availableTools []tool.Tool, projectRoot string, kbEnabled bool) (string, string, error) {
 	// 2026-07: if the session's projectRoot has changed
 	// since the last call (user switched projects
 	// mid-session, or this is the first turn of a new
@@ -45,6 +45,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, a
 	if a.cfg != nil {
 		lang = a.cfg.LLM.Output.Language
 	}
+	wm = wm.Normalize()
 	// Include kbEnabled in the signature so cached prompts that
 	// include wiki/grep instructions are not reused when KB is
 	// toggled off mid-conversation.
@@ -54,6 +55,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, a
 	}
 	sig := strings.Join([]string{
 		string(s),
+		string(wm),
 		agentsSignatureWithRoot(projectRoot),
 		rulesSignature(a.rules),
 		skillSignature(a.skills),
@@ -77,6 +79,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, a
 		return "", sig, err
 	}
 	sb.WriteString(styleBlock)
+	sb.WriteString(buildWorkModeBlock(wm))
 	sb.WriteString(agents.LoadAllWithRoot(projectRoot) + "\n---\n\n")
 	sb.WriteString(rules.BuildRulesContext(a.rules) + "\n---\n\n")
 	sb.WriteString(skill.BuildSkillContext(a.skills) + "\n---\n\n")
@@ -103,6 +106,9 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, toolDefs []llm.ToolDef, a
 // versions emitted an empty section; that was misleading
 // because the LLM would proceed with no identity at all.)
 func (a *Agent) buildStyleBlock(s style.Style) (string, error) {
+	if s.IsOff() {
+		return "", nil
+	}
 	stylePrompt, err := a.styleMgr.GetSystemPrompt(s)
 	if err != nil {
 		log.Printf("[agent] style %q not found (%v) — falling back to %q", s, err, style.Tech)
@@ -112,6 +118,37 @@ func (a *Agent) buildStyleBlock(s style.Style) (string, error) {
 		}
 	}
 	return stylePrompt + "\n\n---\n\n", nil
+}
+
+// buildWorkModeBlock returns the "## Working Mode" section that
+// primes the LLM with the user's chosen task focus.
+//
+//   - "daily": documents, email, reports, summaries, planning,
+//     translation, knowledge lookup, and general office work.
+//   - "coding": code reading/writing, debugging, tests, shell,
+//     git, refactors, and code review.
+//
+// Empty or unknown values fall back to "coding" so sessions that
+// pre-date this field keep behaving like a programming assistant.
+func buildWorkModeBlock(wm config.WorkMode) string {
+	switch wm.Normalize() {
+	case config.WorkModeDaily:
+		return "\n\n---\n\n## Working Mode: 日常工作 (daily)\n\n" +
+			"你当前是「日常工作」模式。该模式下，你的主要职责是帮助用户处理非编码类任务。\n\n" +
+			"- **核心场景**：撰写和润色文档、邮件、报告、会议纪要、待办清单；翻译、摘要、改写；信息检索与知识问答；数据整理、表格/CSV 分析、计划与排期辅助。\n" +
+			"- **首选工具**：`read_file` / `write_file` 读写本地文档；`wiki_lookup` / `wiki_list` 优先回答项目、团队、产品、流程相关问题；`recall` / `grep` 查询历史与本地资料；`web_search` / `web_fetch` 联网检索；`todo_write` 维护多步骤任务。\n" +
+			"- **慎用工具**：非必要时不要调用 `exec_command`；除非用户明确要求，不主动修改代码文件。\n" +
+			"- **回复习惯**：关键结论放前面；文档类输出优先给 Markdown 草稿；信息不确定时标注「待确认」并说明需要哪些输入。\n"
+	case config.WorkModeCoding:
+		return "\n\n---\n\n## Working Mode: 编码 (coding)\n\n" +
+			"你当前是「编码」模式。该模式下，你的主要职责是帮助用户完成编程类任务。\n\n" +
+			"- **核心场景**：阅读和理解代码、定位 bug、实现新功能、重构、写测试、运行命令验证、git 操作、code review。\n" +
+			"- **首选工具**：`read_file` / `write_file` / `edit_file` 读写源码；`exec_command` 运行测试、构建、git、grep、ls 等 shell 命令；`list_files` 探索目录；`grep` / `recall` 在代码库中精确定位；需要理解既有架构约定时使用 `wiki_lookup`。\n" +
+			"- **慎用工具**：`web_search` 仅在用户明确要求联网或本地查不到时使用。\n" +
+			"- **回复习惯**：先给结论或方案，再给解释；修改前先读上下文；改完说明验证结果；涉及破坏性操作时必须二次确认。\n"
+	default:
+		return ""
+	}
 }
 
 // buildToolHintBlock returns section 5 (the big one). It is a

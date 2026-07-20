@@ -33,7 +33,7 @@ type mockBase struct{}
 func (mockBase) ListSessions(context.Context) ([]httpcli.Session, error) {
 	return nil, nil
 }
-func (mockBase) GetCurrentSessionID() string { return "" }
+func (mockBase) GetCurrentSessionID() string    { return "" }
 func (mockBase) SetCurrentSession(string) error { return nil }
 func (mockBase) GetCurrentSessionMessages(context.Context) ([]httpcli.Message, error) {
 	return nil, nil
@@ -47,7 +47,7 @@ func (mockBase) PatchSession(context.Context, string, httpcli.SessionPatchOpts) 
 	return nil, nil
 }
 func (mockBase) ClearMessages(context.Context, string) error { return nil }
-func (mockBase) CurrentMessageCount() int                     { return 0 }
+func (mockBase) CurrentMessageCount() int                    { return 0 }
 func (mockBase) SubmitQuestionAnswer(context.Context, string, map[string]string) error {
 	return nil
 }
@@ -55,9 +55,9 @@ func (mockBase) RollbackMessages(context.Context, string, int64) ([]httpcli.Mess
 	return nil, nil
 }
 func (mockBase) UndoRollback(context.Context, string, []httpcli.Message) error { return nil }
-func (mockBase) SaveRollbackUndo(string, []httpcli.Message)                 {}
-func (mockBase) GetRollbackUndo(string) []httpcli.Message                    { return nil }
-func (mockBase) ClearRollbackUndo(string)                                    {}
+func (mockBase) SaveRollbackUndo(string, []httpcli.Message)                    {}
+func (mockBase) GetRollbackUndo(string) []httpcli.Message                      { return nil }
+func (mockBase) ClearRollbackUndo(string)                                      {}
 func (mockBase) ForkSession(context.Context, string, int64) (*httpcli.Session, error) {
 	return nil, nil
 }
@@ -65,26 +65,26 @@ func (mockBase) ListProviders(context.Context) ([]httpcli.ProviderInfo, error) {
 func (mockBase) ListProviderModels(context.Context, string) ([]httpcli.Model, error) {
 	return nil, nil
 }
-func (mockBase) GetCurrentProvider() string                              { return "" }
-func (mockBase) SetCurrentProvider(string) error                          { return nil }
-func (mockBase) GetCurrentModel() string                                 { return "" }
-func (mockBase) GetProviderProtocol(string) string                        { return "" }
-func (mockBase) SetModel(string, string) error                           { return nil }
-func (mockBase) HasProvider(string) bool                                 { return false }
-func (mockBase) DisplayModel(string) string                              { return "" }
-func (mockBase) ProviderConfig(string) (ProviderConfigView, error)      { return ProviderConfigView{}, nil }
-func (mockBase) AddProvider(ProviderConfigInput) error                   { return nil }
-func (mockBase) RemoveProvider(string) error                             { return nil }
-func (mockBase) SetProviderAPIKey(string, string) error                  { return nil }
-func (mockBase) SetDefaultProvider(string) error                         { return nil }
-func (mockBase) AddModel(string, string, string, string) error           { return nil }
-func (mockBase) AddModelFull(string, config.ModelConfig) error           { return nil }
-func (mockBase) UpdateModel(string, string, config.ModelConfig) error    { return nil }
-func (mockBase) RemoveModel(string, string) error                        { return nil }
-func (mockBase) SetDefaultModel(string, string) error                    { return nil }
-func (mockBase) ListAllModels(string) []ModelView                        { return nil }
-func (mockBase) GetModelSettings(string, string) ModelSettings           { return ModelSettings{} }
-func (mockBase) ReloadConfig() error                                     { return nil }
+func (mockBase) GetCurrentProvider() string                           { return "" }
+func (mockBase) SetCurrentProvider(string) error                      { return nil }
+func (mockBase) GetCurrentModel() string                              { return "" }
+func (mockBase) GetProviderProtocol(string) string                    { return "" }
+func (mockBase) SetModel(string, string) error                        { return nil }
+func (mockBase) HasProvider(string) bool                              { return false }
+func (mockBase) DisplayModel(string) string                           { return "" }
+func (mockBase) ProviderConfig(string) (ProviderConfigView, error)    { return ProviderConfigView{}, nil }
+func (mockBase) AddProvider(ProviderConfigInput) error                { return nil }
+func (mockBase) RemoveProvider(string) error                          { return nil }
+func (mockBase) SetProviderAPIKey(string, string) error               { return nil }
+func (mockBase) SetDefaultProvider(string) error                      { return nil }
+func (mockBase) AddModel(string, string, string, string) error        { return nil }
+func (mockBase) AddModelFull(string, config.ModelConfig) error        { return nil }
+func (mockBase) UpdateModel(string, string, config.ModelConfig) error { return nil }
+func (mockBase) RemoveModel(string, string) error                     { return nil }
+func (mockBase) SetDefaultModel(string, string) error                 { return nil }
+func (mockBase) ListAllModels(string) []ModelView                     { return nil }
+func (mockBase) GetModelSettings(string, string) ModelSettings        { return ModelSettings{} }
+func (mockBase) ReloadConfig() error                                  { return nil }
 func (mockBase) ChatWithTools(context.Context, agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
 	return nil, nil
 }
@@ -92,16 +92,19 @@ func (mockBase) ChatStream(context.Context, agent.ChatRequest) (<-chan agent.Cha
 	return nil, nil
 }
 func (mockBase) StyleLabel(style.Style) string { return "" }
-func (mockBase) ListStyles() []style.Style      { return nil }
-func (mockBase) StyleName() string              { return "" }
-func (mockBase) SetStyle(string) error          { return nil }
-func (mockBase) ListTools() []ToolView          { return nil }
-func (mockBase) ToolsEnabled() bool             { return false }
-func (mockBase) SetToolsEnabled(bool)           {}
-func (mockBase) SetSandbox(bool)                {}
-func (mockBase) BypassSandboxOnce()             {}
-func (mockBase) RebuildSandbox() error          { return nil }
-func (mockBase) ExpandList() []ToolResultView   { return nil }
+func (mockBase) ListStyles() []style.Style     { return nil }
+func (mockBase) StyleName() string             { return "" }
+func (mockBase) SetStyle(string) error         { return nil }
+func (mockBase) ListModes() []config.WorkMode  { return nil }
+func (mockBase) ModeName() string              { return "" }
+func (mockBase) SetMode(string) error          { return nil }
+func (mockBase) ListTools() []ToolView         { return nil }
+func (mockBase) ToolsEnabled() bool            { return false }
+func (mockBase) SetToolsEnabled(bool)          {}
+func (mockBase) SetSandbox(bool)               {}
+func (mockBase) BypassSandboxOnce()            {}
+func (mockBase) RebuildSandbox() error         { return nil }
+func (mockBase) ExpandList() []ToolResultView  { return nil }
 func (mockBase) ExpandByIndex(int) (ToolResultView, bool) {
 	return ToolResultView{}, false
 }
@@ -111,17 +114,17 @@ func (mockBase) ExpandLast() (ToolResultView, bool) {
 func (mockBase) SubAgentStats() (int, int, int, int, float64, bool) {
 	return 0, 0, 0, 0, 0, false
 }
-func (mockBase) MemoryStats() (int, int, string, bool) { return 0, 0, "", false }
-func (mockBase) Flush() error                           { return nil }
-func (mockBase) ListKBs() ([]KBView, error)             { return nil, nil }
-func (mockBase) AddKB(string) error                     { return nil }
-func (mockBase) RemoveKB(string) error                  { return nil }
-func (mockBase) ScanKBs() (int, int, error)             { return 0, 0, nil }
+func (mockBase) MemoryStats() (int, int, string, bool)     { return 0, 0, "", false }
+func (mockBase) Flush() error                              { return nil }
+func (mockBase) ListKBs() ([]KBView, error)                { return nil, nil }
+func (mockBase) AddKB(string) error                        { return nil }
+func (mockBase) RemoveKB(string) error                     { return nil }
+func (mockBase) ScanKBs() (int, int, error)                { return 0, 0, nil }
 func (mockBase) Recall(context.Context, string, int) error { return nil }
-func (mockBase) InitProject(string) error               { return nil }
-func (mockBase) ListSkills() ([]string, error)          { return nil, nil }
-func (mockBase) ListRules() ([]string, error)           { return nil, nil }
-func (mockBase) AgentsContext() (string, string, error) { return "", "", nil }
+func (mockBase) InitProject(string) error                  { return nil }
+func (mockBase) ListSkills() ([]string, error)             { return nil, nil }
+func (mockBase) ListRules() ([]string, error)              { return nil, nil }
+func (mockBase) AgentsContext() (string, string, error)    { return "", "", nil }
 
 // modelConfigShim is the real type used by cliContext's
 // AddModelFull / UpdateModel methods. The actual type
@@ -143,6 +146,7 @@ type mockCtx struct {
 	setProvArg  string
 	title       string
 	styleArg    string
+	modeArg     string
 	autoArg     string
 	err         error
 
@@ -290,13 +294,23 @@ func (m *mockCtx) SetStyle(n string) error { m.styleArg = n; return m.err }
 func (m *mockCtx) ListStyles() []style.Style {
 	return []style.Style{"cute", "guofeng", "tech"}
 }
+func (m *mockCtx) SetMode(n string) error { m.modeArg = n; return m.err }
+func (m *mockCtx) ModeName() string {
+	if m.modeArg == "" {
+		return "coding"
+	}
+	return m.modeArg
+}
+func (m *mockCtx) ListModes() []config.WorkMode {
+	return []config.WorkMode{config.WorkModeCoding, config.WorkModeDaily}
+}
 func (m *mockCtx) SetToolsEnabled(on bool) { m.toolsEnabled = on }
-func (m *mockCtx) ToolsEnabled() bool    { return m.toolsEnabled }
+func (m *mockCtx) ToolsEnabled() bool      { return m.toolsEnabled }
 func (m *mockCtx) PatchSession(_ context.Context, id string, opts httpcli.SessionPatchOpts) (*httpcli.Session, error) {
 	m.patchOpts = opts
 	return &httpcli.Session{ID: id, AutoContinue: opts.AutoContinue != nil && *opts.AutoContinue}, m.err
 }
-func (m *mockCtx) StyleName() string     { return m.styleArg }
+func (m *mockCtx) StyleName() string               { return m.styleArg }
 func (m *mockCtx) StyleLabel(s style.Style) string { return string(s) }
 
 // =====================================================================
@@ -911,7 +925,7 @@ func TestHumanInt(t *testing.T) {
 		{1, "1"},
 		{999, "999"},
 		{1000, "1k"},
-		{1500, "1500"},     // not a clean multiple — leave as-is
+		{1500, "1500"}, // not a clean multiple — leave as-is
 		{32000, "32k"},
 		{1_000_000, "1m"},
 		{2_500_000, "2500k"},
@@ -994,10 +1008,10 @@ func TestSplitProviderModel(t *testing.T) {
 		{provider: "cs", model: "doubao", value: "cs/doubao"},
 	}
 	cases := []struct {
-		in       string
-		wantP    string
-		wantM    string
-		wantOK   bool
+		in     string
+		wantP  string
+		wantM  string
+		wantOK bool
 	}{
 		{"openai/gpt-4o", "openai", "gpt-4o", true},
 		{"openai gpt-4o", "openai", "gpt-4o", true},

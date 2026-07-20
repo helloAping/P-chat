@@ -25,6 +25,33 @@ func TestSubAgentConfig_Defaults(t *testing.T) {
 	}
 }
 
+func TestWorkModeNormalize(t *testing.T) {
+	cases := []struct {
+		in   WorkMode
+		want WorkMode
+	}{
+		{"", WorkModeCoding},
+		{WorkModeCoding, WorkModeCoding},
+		{WorkModeDaily, WorkModeDaily},
+		{"bogus", WorkModeCoding},
+		{"DAILY", WorkModeCoding},
+	}
+	for _, tc := range cases {
+		if got := tc.in.Normalize(); got != tc.want {
+			t.Errorf("WorkMode(%q).Normalize() = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if !WorkModeCoding.IsValid() || !WorkModeDaily.IsValid() {
+		t.Fatal("built-in work modes should be valid")
+	}
+	if WorkMode("").IsValid() || WorkMode("bogus").IsValid() {
+		t.Fatal("empty/bogus work modes should be invalid")
+	}
+	if got := Default().WorkMode.Default; got != WorkModeCoding {
+		t.Fatalf("Default().WorkMode.Default = %q, want %q", got, WorkModeCoding)
+	}
+}
+
 func TestSubAgentConfig_Whitelist(t *testing.T) {
 	c := &SubAgentConfig{
 		AllowedTools: []string{"read_file", "list_files"},
@@ -571,7 +598,7 @@ func osWriteFile(path, content string) error {
 // jsonMarshal / jsonUnmarshal are thin wrappers so the
 // TestModelConfig_JSONRoundTrip test can verify the field tags
 // without depending on the implementation file.
-func jsonMarshal(v any) ([]byte, error)    { return json.Marshal(v) }
+func jsonMarshal(v any) ([]byte, error)      { return json.Marshal(v) }
 func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
 // contains is a tiny helper around strings.Contains.

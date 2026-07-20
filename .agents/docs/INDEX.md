@@ -13,6 +13,8 @@
 | 修改子代理系统 | [subagent.md](subagent.md) | agent.md, tool.md |
 | 修改前端界面、Vue 组件、pinia store | [frontend.md](frontend.md) | server.md |
 | **修改样式/设计 token/视觉规范** | [**frontend-design.md**](frontend-design.md) | frontend.md |
+| 修改工作模式 `work_mode`（coding/daily 侧重点） | [config.md](config.md) | agent.md, server.md, frontend.md, cli.md |
+| 修改说话风格 `style` 或风格记忆 | [agent.md](agent.md) | frontend.md, config.md |
 | 修改数据库/消息持久化 | [memory.md](memory.md) | config.md |
 | **修改数据库 Schema** | [**versioning.md**](versioning.md) | memory.md |
 | **发布新版本** | [**versioning.md**](versioning.md) | — |

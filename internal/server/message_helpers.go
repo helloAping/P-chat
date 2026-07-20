@@ -85,13 +85,13 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// neither is set, both code paths issue the
 	// unfiltered "give me the latest N rows" query.
 	var (
-		msgs           []llm.ChatMessage
-		metas          []string
-		createds       []int64
-		rowIDs         []int64
-		seqs           []int64
-		regenGroupIDs  []string
-		isArchiveds    []bool
+		msgs          []llm.ChatMessage
+		metas         []string
+		createds      []int64
+		rowIDs        []int64
+		seqs          []int64
+		regenGroupIDs []string
+		isArchiveds   []bool
 	)
 	if beforeSeq > 0 {
 		msgs, metas, createds, rowIDs, seqs, regenGroupIDs, isArchiveds = h.store.GetChatMessagesWithMetaPageBySeq(id, beforeSeq, limit)
@@ -870,20 +870,21 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		}
 	}
 	return SessionResponse{
-		ID:          cv.ID,
-		Title:       cv.Title,
-		Provider:    provider,
-		Model:       model,
-		Style:       m.Style,
-		ProjectPath: m.ProjectPath,
-		PlanMode:    m.PlanMode,
+		ID:              cv.ID,
+		Title:           cv.Title,
+		Provider:        provider,
+		Model:           model,
+		Style:           m.Style,
+		WorkMode:        string(h.sessionWorkMode(cv.ID)),
+		ProjectPath:     m.ProjectPath,
+		PlanMode:        m.PlanMode,
 		PermissionLevel: m.PermissionLevel,
 		ReasoningEffort: m.ReasoningEffort,
-		VectorStore:    cv.VectorStore,
-		KnowledgeBase:  m.KnowledgeBase,
-		AutoContinue:   h.sessionAutoContinue(cv.ID),
-		CreatedAt:   cv.CreatedAt.Unix(),
-		UpdatedAt:   cv.UpdatedAt.Unix(),
+		VectorStore:     cv.VectorStore,
+		KnowledgeBase:   m.KnowledgeBase,
+		AutoContinue:    h.sessionAutoContinue(cv.ID),
+		CreatedAt:       cv.CreatedAt.Unix(),
+		UpdatedAt:       cv.UpdatedAt.Unix(),
 	}
 }
 

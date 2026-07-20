@@ -90,6 +90,7 @@ export interface Session {
   // no override, in which case the client falls back to
   // "tech" / "" / "" as a safe default for the UI.
   style?: string
+  work_mode?: string
   provider?: string
   model?: string
   project_path?: string
@@ -285,6 +286,7 @@ export interface SessionMeta {
   id: string
   title: string
   style: string
+  work_mode: string
   provider: string
   model: string
   project_path?: string
@@ -299,6 +301,7 @@ export interface UpdateSessionMetaResponse {
   id?: string
   title?: string
   style?: string
+  work_mode?: string
   provider?: string
   model?: string
   plan_mode?: boolean
@@ -373,10 +376,10 @@ export const listSessions = (projectPath: string) =>
 export const getSession = (id: string) =>
   jsonFetch<Session>(`/api/v1/sessions/${encodeURIComponent(id)}`)
 
-export const createSession = (projectPath?: string) =>
+export const createSession = (projectPath?: string, workMode?: string) =>
   jsonFetch<{ id: string }>(
     '/api/v1/sessions',
-    { method: 'POST', body: JSON.stringify({ project_path: projectPath || '' }) },
+    { method: 'POST', body: JSON.stringify({ project_path: projectPath || '', work_mode: workMode || '' }) },
   )
 
 export const deleteSession = (id: string) =>
@@ -390,7 +393,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -928,6 +931,7 @@ export interface SendOptions {
   provider?: string
   model?: string
   style?: string
+  workMode?: string
   // Inline attachments carry the bytes up front so the message
   // is self-contained: the chat bubble shows the image
   // immediately, the backend doesn't need to re-read the file
@@ -1141,6 +1145,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
     provider: opts.provider,
     model: opts.model,
     style: opts.style,
+    work_mode: opts.workMode,
     attachments: opts.attachments,
     skill_context: opts.skill_context || '',
     trace_id: traceId,
@@ -1239,6 +1244,7 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
     provider: opts.provider,
     model: opts.model,
     style: opts.style,
+    work_mode: opts.workMode,
     attachments: opts.attachments,
     skill_context: opts.skill_context || '',
   })
@@ -1688,9 +1694,14 @@ export interface SubAgentConfig {
   timeout: string
 }
 
+export interface WorkModeConfig {
+  default: string
+}
+
 export interface SystemConfig {
   limits: LimitsConfig
   sub_agent: SubAgentConfig
+  work_mode: WorkModeConfig
 }
 
 export const getSystemConfig = () =>

@@ -50,9 +50,9 @@ type Agent struct {
 	cfg      *config.Config
 	skills   []skill.Skill
 	rules    []rules.Rule
-	sandbox  tool.SandboxChecker    // optional; nil disables sandbox enforcement
-	options  llm.ChatOptions        // per-request sampling; populated from cfg
-	attach   AttachmentResolver     // optional; turns Attachment IDs into file paths for upload expansion
+	sandbox  tool.SandboxChecker // optional; nil disables sandbox enforcement
+	options  llm.ChatOptions     // per-request sampling; populated from cfg
+	attach   AttachmentResolver  // optional; turns Attachment IDs into file paths for upload expansion
 
 	// bypassOnce, when true, makes the NEXT tool call skip the
 	// sandbox check (set by /unsafe once). Reset after the call.
@@ -115,6 +115,9 @@ func (a *Agent) SetChatOptions(opts llm.ChatOptions) {
 // Memory 存储在数据库 styles.memory 列，是用户自定义的背景知识，
 // 动态注入到每轮对话末尾。
 func (a *Agent) getStyleMemory(s style.Style) string {
+	if s.IsOff() {
+		return ""
+	}
 	if a.styleMgr == nil {
 		return ""
 	}
@@ -339,6 +342,7 @@ func visionCapableByHeuristic(providerName, modelName string) bool {
 
 type ChatRequest struct {
 	Style    style.Style       `json:"style"`
+	WorkMode config.WorkMode   `json:"work_mode,omitempty"`
 	Messages []llm.ChatMessage `json:"messages"`
 	Provider string            `json:"provider,omitempty"`
 	Model    string            `json:"model,omitempty"`
@@ -451,7 +455,7 @@ type ChatStreamChunk struct {
 	// parent stream do NOT carry a parent seq — they break the
 	// monotonic sequence intentionally because the sub-agent has
 	// its own counter.
-	Seq uint64 `json:"seq,omitempty"`
+	Seq     uint64 `json:"seq,omitempty"`
 	Content string `json:"content"`
 	// Thinking carries a delta of the model's reasoning /
 	// chain-of-thought text. Only populated by LLM clients
@@ -483,10 +487,10 @@ type ChatStreamChunk struct {
 	Step     string `json:"step,omitempty"`
 	Duration string `json:"duration,omitempty"`
 
-	ToolID   string `json:"tool_id,omitempty"`
-	ToolName string `json:"tool_name,omitempty"`
-	ToolArgs string `json:"tool_args,omitempty"`
-	ToolResult  string `json:"tool_result,omitempty"`
+	ToolID     string `json:"tool_id,omitempty"`
+	ToolName   string `json:"tool_name,omitempty"`
+	ToolArgs   string `json:"tool_args,omitempty"`
+	ToolResult string `json:"tool_result,omitempty"`
 	// ToolResultFull is the untruncated tool result. ToolResult
 	// above is a 300-char preview suitable for human display;
 	// ToolResultFull is the full payload for tools whose results
@@ -976,8 +980,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			toolDefs = nil
 		}
 
+		wm := req.WorkMode
+		if wm == "" && a.cfg != nil {
+			wm = a.cfg.WorkMode.Default
+		}
+		wm = wm.Normalize()
+
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-system", Message: "合并风格 / AGENTS.md / 规则 / 技能..."})
-		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, toolDefs, availableTools, req.ProjectRoot, kbEnabled)
+		systemPrompt, _, err := a.buildStaticSystemPrompt(req.Style, wm, toolDefs, availableTools, req.ProjectRoot, kbEnabled)
 		if err != nil {
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true})
 			return
@@ -1276,7 +1286,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// (rate_limit, server_error, network, timeout).
 			const maxLLMRetries = 3
 			var retryableErr error
-			att:
+		att:
 			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
 				if attempt > 1 {
 					backoff := time.Duration(attempt*attempt) * time.Second
@@ -1339,39 +1349,39 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						retryableErr = nil
 						break att // success — break outer loop too
 					}
-				if chunk.TokensIn > 0 || chunk.TokensOut > 0 {
-					if chunk.TokensIn > totalIn {
-						totalIn = chunk.TokensIn
+					if chunk.TokensIn > 0 || chunk.TokensOut > 0 {
+						if chunk.TokensIn > totalIn {
+							totalIn = chunk.TokensIn
+						}
+						if chunk.TokensOut > totalOut {
+							totalOut = chunk.TokensOut
+						}
 					}
-					if chunk.TokensOut > totalOut {
-						totalOut = chunk.TokensOut
+					if chunk.Content != "" {
+						fullContent += chunk.Content
+						partsAcc.update(ChatStreamChunk{Content: chunk.Content})
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
 					}
-				}
-				if chunk.Content != "" {
-					fullContent += chunk.Content
-					partsAcc.update(ChatStreamChunk{Content: chunk.Content})
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
-				}
-				if chunk.Thinking != "" {
-					fullThinking += chunk.Thinking
-					partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
-				}
-				if chunk.ToolCallDelta != nil {
-					tcd := chunk.ToolCallDelta
-					existing, ok := argsAccum[tcd.Index]
-					if !ok {
-						existing = &nativeToolCall{ID: tcd.ID, Name: tcd.Name}
-						argsAccum[tcd.Index] = existing
+					if chunk.Thinking != "" {
+						fullThinking += chunk.Thinking
+						partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
 					}
-					if tcd.ID != "" {
-						existing.ID = tcd.ID
+					if chunk.ToolCallDelta != nil {
+						tcd := chunk.ToolCallDelta
+						existing, ok := argsAccum[tcd.Index]
+						if !ok {
+							existing = &nativeToolCall{ID: tcd.ID, Name: tcd.Name}
+							argsAccum[tcd.Index] = existing
+						}
+						if tcd.ID != "" {
+							existing.ID = tcd.ID
+						}
+						if tcd.Name != "" {
+							existing.Name = tcd.Name
+						}
+						existing.ArgsJSON += tcd.ArgsJSON
 					}
-					if tcd.Name != "" {
-						existing.Name = tcd.Name
-					}
-					existing.ArgsJSON += tcd.ArgsJSON
-				}
 				} // inner for chunk
 			} // outer for attempt (retry loop)
 
@@ -1391,61 +1401,61 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 
-		if len(toolCalls) == 0 {
-			toolCalls = parseMarkdownToolCalls(fullContent)
-		}
-		// When tool calls are present (native or markdown), strip
-		// markdown tool_call blocks from the text content so the
-		// user doesn't see both raw tool blocks AND tool cards.
-		if len(toolCalls) > 0 {
-			fullContent = cleanMarkdownToolCalls(fullContent)
-		}
+			if len(toolCalls) == 0 {
+				toolCalls = parseMarkdownToolCalls(fullContent)
+			}
+			// When tool calls are present (native or markdown), strip
+			// markdown tool_call blocks from the text content so the
+			// user doesn't see both raw tool blocks AND tool cards.
+			if len(toolCalls) > 0 {
+				fullContent = cleanMarkdownToolCalls(fullContent)
+			}
 
-		// Post-stream redactor: catch phantom "ERROR: Cannot read
-		// image.png ... Inform the user." style responses that
-		// DeepSeek-trained models parrot when they see the
-		// vision-denier marker. We can't fully prevent the model
-		// from producing this text (it appears in training data
-		// as a Claude response), so we filter it AFTER the stream
-		// ends and emit a content_rewrite event so the UI replaces
-		// what the user already saw.
-		//
-		// Redact in BOTH fullContent (text response) and
-		// fullThinking (chain-of-thought). The phantom appears
-		// in training data and the model sometimes emits it in
-		// the thinking block instead of the text response —
-		// the user sees thinking as a collapsible panel so the
-		// phantom needs to be stripped there too.
-		if redacted, changed := redactPhantomErrors(fullContent); changed {
-			fullContent = redacted
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted})
-		}
-		if redactedT, changedT := redactPhantomErrors(fullThinking); changedT {
-			fullThinking = redactedT
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT})
-		}
+			// Post-stream redactor: catch phantom "ERROR: Cannot read
+			// image.png ... Inform the user." style responses that
+			// DeepSeek-trained models parrot when they see the
+			// vision-denier marker. We can't fully prevent the model
+			// from producing this text (it appears in training data
+			// as a Claude response), so we filter it AFTER the stream
+			// ends and emit a content_rewrite event so the UI replaces
+			// what the user already saw.
+			//
+			// Redact in BOTH fullContent (text response) and
+			// fullThinking (chain-of-thought). The phantom appears
+			// in training data and the model sometimes emits it in
+			// the thinking block instead of the text response —
+			// the user sees thinking as a collapsible panel so the
+			// phantom needs to be stripped there too.
+			if redacted, changed := redactPhantomErrors(fullContent); changed {
+				fullContent = redacted
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "redact", Message: "(已替换 LLM 编造的图片错误消息)", ContentRewrite: redacted})
+			}
+			if redactedT, changedT := redactPhantomErrors(fullThinking); changedT {
+				fullThinking = redactedT
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "redact-thinking", Message: "(已替换 LLM 编造的图片错误消息)", ThinkingRewrite: redactedT})
+			}
 
-		// Build the assistant message for the conversation.
-		// Emit as a single text ChatMessage (tool calls are
-		// separate messages appended below).
-		assistantMsg := llm.ChatMessage{
-			Role:        llm.RoleAssistant,
-			Type:        llm.TypeText,
-			Content:     fullContent,
-			MsgType:     llm.MsgTypeText,
-			SubmitToLLM: 1,
-		}
-		msgs = append(msgs, assistantMsg)
+			// Build the assistant message for the conversation.
+			// Emit as a single text ChatMessage (tool calls are
+			// separate messages appended below).
+			assistantMsg := llm.ChatMessage{
+				Role:        llm.RoleAssistant,
+				Type:        llm.TypeText,
+				Content:     fullContent,
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
+			}
+			msgs = append(msgs, assistantMsg)
 
-		// NOTE: per-round stripImageContent sweep removed.
-		// Image base64 is preserved verbatim in msgs so the LLM
-		// always receives the actual image on every round (and
-		// across tool-call follow-ups within the same turn).
-		// Token budget for repeated tool rounds is handled by
-		// tryAutoCompact.
+			// NOTE: per-round stripImageContent sweep removed.
+			// Image base64 is preserved verbatim in msgs so the LLM
+			// always receives the actual image on every round (and
+			// across tool-call follow-ups within the same turn).
+			// Token budget for repeated tool rounds is handled by
+			// tryAutoCompact.
 
-		// Persist assistant message later — after tool
-		// results are in partsAcc (see end of this round).
+			// Persist assistant message later — after tool
+			// results are in partsAcc (see end of this round).
 
 			// P1-2: run auto-compact BEFORE appending the
 			// current round's tool_call messages. The old
@@ -1940,21 +1950,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					sendOrDrop(ctx, ch, nextSeq, okChunk)
 				}
 
-			llmContent := result.Content
-			if result.IsError {
-				// The structured IsError flag on the
-				// ChatMessage is what tells the LLM this
-				// is an error; the content is the
-				// diagnostic text. Keep it terse and
-				// factual — opencode-style. Don't
-				// hand-hold the model with "请分析错误
-				// 原因后调整方案并重试" boilerplate,
-				// and never instruct it to fabricate
-				// user-facing error messages.
-				llmContent = fmt.Sprintf("Tool %s returned an error: %s", tc.Name, result.Content)
-			} else {
-				llmContent = a.truncateToolResult(tc.Name, result.Content)
-			}
+				llmContent := result.Content
+				if result.IsError {
+					// The structured IsError flag on the
+					// ChatMessage is what tells the LLM this
+					// is an error; the content is the
+					// diagnostic text. Keep it terse and
+					// factual — opencode-style. Don't
+					// hand-hold the model with "请分析错误
+					// 原因后调整方案并重试" boilerplate,
+					// and never instruct it to fabricate
+					// user-facing error messages.
+					llmContent = fmt.Sprintf("Tool %s returned an error: %s", tc.Name, result.Content)
+				} else {
+					llmContent = a.truncateToolResult(tc.Name, result.Content)
+				}
 				toolMsg := llm.ChatMessage{
 					Role:      llm.RoleTool,
 					Type:      llm.TypeToolResult,
@@ -2047,10 +2057,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			prevErrored = curErrored
 			if stuckStreak >= stuckThreshold {
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-					Phase:   "stuck",
-					Step:    "stuck-loop",
-					Message: fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
-					Round:   roundNum,
+					Phase:    "stuck",
+					Step:     "stuck-loop",
+					Message:  fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
+					Round:    roundNum,
 					MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
 				})
@@ -2257,10 +2267,10 @@ func (a *Agent) tryAutoCompact(
 	ok, summary, err := a.summarizer.Compress(ctx, req.SessionID)
 	if err != nil || !ok {
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-			Phase:   "compact",
-			Step:    "auto-compact-fail",
-			Message: fmt.Sprintf("自动压缩失败: %v", err),
-			Round:   roundNum,
+			Phase:    "compact",
+			Step:     "auto-compact-fail",
+			Message:  fmt.Sprintf("自动压缩失败: %v", err),
+			Round:    roundNum,
 			MaxRound: maxRounds,
 		})
 		// Fallback: hard-truncate the message list so the LLM
@@ -2283,10 +2293,10 @@ func (a *Agent) tryAutoCompact(
 	}
 
 	sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-		Phase:   "compact",
-		Step:    "auto-compact-ok",
-		Message: "上下文已压缩，继续执行…",
-		Round:   roundNum,
+		Phase:    "compact",
+		Step:     "auto-compact-ok",
+		Message:  "上下文已压缩，继续执行…",
+		Round:    roundNum,
 		MaxRound: maxRounds,
 	})
 

@@ -29,6 +29,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V1: stepV1toV2,
 	V2: stepV2toV3,
 	V3: stepV3toV4,
+	V4: stepV4toV5,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -413,5 +414,12 @@ func copyDir(src, dst string) error {
 			return fmt.Errorf("write %s: %w", dstPath, err)
 		}
 	}
+	return nil
+}
+
+// ---- V4 → V5 ----
+
+func stepV4toV5(_ *sql.DB) error {
+	log.Print("[upgrade] V4 → V5: add work_mode config metadata (noop)")
 	return nil
 }

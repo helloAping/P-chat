@@ -102,6 +102,8 @@ if (ev.sub_agent && ev.sub_agent_task) {
 核心状态：
 - `currentID` — 当前活动会话 ID
 - `sessionMessages[id]` — 消息列表
+- `sessionMeta[id].style` / `sessionMeta[id].workMode` — 单会话说话风格与工作侧重点；`style=off` 表示关闭风格 prompt 和风格记忆注入
+- `globalWorkMode` — `/api/v1/config.work_mode.default` 的前端缓存，新建/旧会话无覆盖时回落使用
 - `streaming[id]` — 是否正在流式传输
 - `sessionWorking[id]` — 是否忙碌（TodoPanel 控制）
 - `sessionTodos[id]` — 待办列表
