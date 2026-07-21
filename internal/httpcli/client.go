@@ -45,7 +45,7 @@ type Client struct {
 }
 
 // NewClient builds a client targeting the given base URL (e.g.
-// "http://127.0.0.1:8960"). No timeout is set on the HTTP client —
+// "http://127.0.0.1:15150"). No timeout is set on the HTTP client —
 // SSE streams for long agent runs can last minutes; the caller
 // controls cancellation via context.
 //

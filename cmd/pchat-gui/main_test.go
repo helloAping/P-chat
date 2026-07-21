@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,7 +47,42 @@ func TestFindServerBinary_NotFound(t *testing.T) {
 	}
 }
 
-func TestPickFreePort_Unique(t *testing.T) {
+func TestPickPreferredPort_FirstPreferredWhenAvailable(t *testing.T) {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", preferredPortStart))
+	if err != nil {
+		t.Skipf("preferred port %d is already occupied: %v", preferredPortStart, err)
+	}
+	_ = l.Close()
+
+	port, err := pickPreferredPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port != preferredPortStart {
+		t.Fatalf("pickPreferredPort() = %d, want %d", port, preferredPortStart)
+	}
+}
+
+func TestPickPreferredPort_SkipsOccupiedPreferredPorts(t *testing.T) {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", preferredPortStart))
+	if err != nil {
+		t.Skipf("preferred port %d is already occupied: %v", preferredPortStart, err)
+	}
+	defer l.Close()
+
+	port, err := pickPreferredPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port == preferredPortStart {
+		t.Fatalf("pickPreferredPort() reused occupied port %d", preferredPortStart)
+	}
+	if port < preferredPortStart || port > preferredPortEnd {
+		t.Fatalf("pickPreferredPort() = %d, want next port in %d-%d", port, preferredPortStart+1, preferredPortEnd)
+	}
+}
+
+func TestPickFreePort_Valid(t *testing.T) {
 	p1, err := pickFreePort()
 	if err != nil {
 		t.Fatal(err)

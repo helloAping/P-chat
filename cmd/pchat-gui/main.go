@@ -2,8 +2,8 @@
 //
 // Architecture:
 //   - This is a Wails v2 app that opens a WebView2 window.
-//   - On startup, it spawns pchat-server.exe as a child process on a free
-//     port on 127.0.0.1.
+//   - On startup, it spawns pchat-server.exe as a child process on a
+//     stable preferred port on 127.0.0.1, falling back only if needed.
 //   - The webview serves ALL content from a reverse proxy: when the user
 //     navigates to http://wails.localhost/..., we forward the request to
 //     http://127.0.0.1:<port>/... (pchat-server). This keeps the webview
@@ -767,8 +767,8 @@ func (a *App) beforeClose(ctx context.Context) bool {
 
 // ---------- server spawning ----------
 
-// spawnAndWatch locates pchat-server.exe, picks a free port, starts it as
-// a child process, installs the reverse proxy, waits for it to be
+// spawnAndWatch locates pchat-server.exe, picks a preferred port, starts it
+// as a child process, installs the reverse proxy, waits for it to be
 // healthy, and finally shows the window.
 func (a *App) spawnAndWatch() {
 	bin, err := findServerBinary()
@@ -777,9 +777,9 @@ func (a *App) spawnAndWatch() {
 		return
 	}
 
-	port, err := pickFreePort()
+	port, err := pickPreferredPort()
 	if err != nil {
-		log.Printf("pickFreePort: %v", err)
+		log.Printf("pickPreferredPort: %v", err)
 		return
 	}
 	log.Printf("picked port %d", port)
@@ -933,7 +933,24 @@ func findServerBinary() (string, error) {
 	return "", fmt.Errorf("pchat-server.exe not found next to pchat-gui.exe and not in PATH")
 }
 
-// pickFreePort asks the OS for a free TCP port.
+const (
+	preferredPortStart = 15150
+	preferredPortEnd   = 15159
+)
+
+// pickPreferredPort returns the first available port in P-Chat's stable
+// local range, falling back to an OS-assigned port only if the range is full.
+func pickPreferredPort() (int, error) {
+	for port := preferredPortStart; port <= preferredPortEnd; port++ {
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			_ = l.Close()
+			return port, nil
+		}
+	}
+	return pickFreePort()
+}
+
 func pickFreePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

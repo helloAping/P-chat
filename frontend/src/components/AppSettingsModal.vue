@@ -698,6 +698,11 @@ function resetNewStyle() {
   editingStyle.value = null
 }
 
+function openNewStyleEditor() {
+  resetNewStyle()
+  showAddStyle.value = true
+}
+
 async function onCreateStyle() {
   if (!newStyleId.value.trim()) {
     message.warning('风格 id 为必填')
@@ -945,6 +950,11 @@ async function onDeleteSkill(name: string) {
   }
 }
 function closeStyleEditor() { showAddStyle.value = false; resetNewStyle() }
+
+function onStyleEditorVisibleChange(v: boolean) {
+  if (!v) closeStyleEditor()
+  else showAddStyle.value = true
+}
 
 function formatArchiveTime(ts: number): string {
   const d = new Date(ts * 1000)
@@ -1559,7 +1569,6 @@ function kbModelSupportsVision(scanModel: string) {
       type="line"
       animated
       class="settings-no-bar"
-      style="flex: 1; min-height: 0; display: flex; flex-direction: column;"
     >
       <NTabPane name="providers" tab="LLM 提供商" style="flex: 1; min-height: 0; overflow: auto">
         <div class="providers-split">
@@ -1832,8 +1841,8 @@ function kbModelSupportsVision(scanModel: string) {
               <h3 class="settings-section-title">已配置的风格</h3>
               <div class="settings-form-actions">
                 <NButton size="small" type="primary" ghost
-                  @click="() => { showAddStyle = !showAddStyle; if (showAddStyle) resetNewStyle() }">
-                  {{ showAddStyle ? '取消' : '+ 新增风格' }}
+                  @click="openNewStyleEditor">
+                  + 新增风格
                 </NButton>
               </div>
             </div>
@@ -1869,80 +1878,6 @@ function kbModelSupportsVision(scanModel: string) {
           </div>
 
           <!-- 旧的「+ 新增风格」按钮已迁到上方 section header (PR #9) -->
-
-          <!-- ---- 编辑/新增表单 ---- -->
-          <div v-if="showAddStyle" class="style-editor">
-            <div class="editor-header">
-              <span>{{ isEdit ? '编辑风格' : '新增风格' }}</span>
-            </div>
-
-            <!-- 元数据行 -->
-            <div class="editor-meta">
-              <div class="meta-item">
-                <label>ID</label>
-                <NInput v-model:value="newStyleId" placeholder="英文/数字/下划线，如 warm" size="small" :disabled="isEdit"
-                  :status="idConflict ? 'error' : undefined" />
-                <span class="meta-hint" :class="{ 'meta-hint-err': idConflict }">
-                  {{ idConflict ? '该 ID 已被占用' : '纯英文+数字+下划线，唯一标识，不可重复' }}
-                </span>
-              </div>
-              <div class="meta-item">
-                <label>显示名称</label>
-                <NInput v-model:value="newStyleLabel" placeholder="如：温暖" size="small" />
-              </div>
-            </div>
-
-            <!-- 内容区：Prompt -->
-            <div class="editor-content">
-              <div class="editor-col" style="flex: 1">
-                <div class="field-head">
-                  Prompt<span class="field-hint">— 人设 + 性格 + 说话风格 + 表达模板</span>
-                  <NPopover trigger="hover" placement="bottom" style="max-width:440px">
-                    <template #trigger><span class="help-badge">?</span></template>
-                    <div class="example-card">
-                      <div class="example-scenes">
-                        <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
-                          :type="exampleActiveScene.prompt === sc ? 'primary' : 'default'"
-                          @click="exampleActiveScene.prompt = sc">{{ sc }}</NButton>
-                      </div>
-                      <pre class="example-content">{{ EXAMPLE_TEMPLATES.prompt[exampleActiveScene.prompt] }}</pre>
-                      <NButton size="tiny" type="primary" ghost block @click="fillExample('prompt')">填入此样例</NButton>
-                    </div>
-                  </NPopover>
-                </div>
-                <NInput v-model:value="newStylePrompt" placeholder="人设 + 性格 + 说话风格 + 表达模板，支持 markdown"
-                  type="textarea" :rows="12" size="small" class="editor-textarea" />
-              </div>
-            </div>
-
-            <!-- 记忆：全宽 -->
-            <div class="editor-memory">
-              <div class="field-head">
-                记忆 (Memory)<span class="field-hint">— 定义「我记得的事情」</span>
-                <NPopover trigger="hover" placement="bottom" style="max-width:440px">
-                  <template #trigger><span class="help-badge">?</span></template>
-                  <div class="example-card">
-                    <div class="example-scenes">
-                      <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
-                        :type="exampleActiveScene.memory === sc ? 'primary' : 'default'"
-                        @click="exampleActiveScene.memory = sc">{{ sc }}</NButton>
-                    </div>
-                    <pre class="example-content">{{ EXAMPLE_TEMPLATES.memory[exampleActiveScene.memory] }}</pre>
-                    <NButton size="tiny" type="primary" ghost block @click="fillExample('memory')">填入此样例</NButton>
-                  </div>
-                </NPopover>
-              </div>
-              <NInput v-model:value="newStyleMemory" placeholder="背景资料、项目信息、用户偏好，每行一条"
-                type="textarea" :rows="4" size="small" class="editor-textarea" />
-            </div>
-
-            <div class="editor-actions">
-              <NButton size="small" @click="closeStyleEditor">取消</NButton>
-              <NButton type="primary" size="small" @click="isEdit ? onUpdateStyle() : onCreateStyle()">
-                {{ isEdit ? '保存修改' : '创建风格' }}
-              </NButton>
-            </div>
-          </div>
         </div>
       </NTabPane>
 
@@ -2639,7 +2574,7 @@ function kbModelSupportsVision(scanModel: string) {
               <li>
                 在扩展弹窗「服务器」输入框粘贴以下地址：
                 <div class="browser-server-url-box">
-                  <code>{{ browserHTTPURL || 'http://127.0.0.1:8960' }}</code>
+                  <code>{{ browserHTTPURL || 'http://127.0.0.1:15150' }}</code>
                   <NButton
                     size="tiny" quaternary
                     @click="copyBrowserURL"
@@ -2656,6 +2591,96 @@ function kbModelSupportsVision(scanModel: string) {
       </NTabPane>
     </NTabs>
   </AppSettingsLayout>
+
+  <NModal
+    :show="showAddStyle"
+    :mask-closable="false"
+    :auto-focus="false"
+    :z-index="2600"
+    :mask-style="{ backdropFilter: 'blur(8px)', background: 'rgba(0, 0, 0, 0.42)' }"
+    class="style-editor-modal"
+    @update:show="onStyleEditorVisibleChange"
+  >
+    <div class="style-editor-dialog" role="dialog" aria-modal="true" :aria-label="isEdit ? '编辑风格' : '新增风格'">
+      <div class="style-editor-head">
+        <div class="style-editor-title-block">
+          <div class="style-editor-title">{{ isEdit ? '编辑风格' : '新增风格' }}</div>
+          <div class="style-editor-subtitle">
+            {{ isEdit ? `正在编辑 ${newStyleId || '未命名风格'}` : '创建新的说话风格和对应记忆' }}
+          </div>
+        </div>
+        <button class="style-editor-close" type="button" aria-label="关闭风格编辑" title="关闭" @click="closeStyleEditor">
+          <X :size="18" />
+        </button>
+      </div>
+
+      <div class="style-editor-scroll">
+        <div class="editor-meta">
+          <div class="meta-item">
+            <label>ID</label>
+            <NInput v-model:value="newStyleId" placeholder="英文/数字/下划线，如 warm" size="small" :disabled="isEdit"
+              :status="idConflict ? 'error' : undefined" />
+            <span class="meta-hint" :class="{ 'meta-hint-err': idConflict }">
+              {{ idConflict ? '该 ID 已被占用' : '纯英文+数字+下划线，唯一标识，不可重复' }}
+            </span>
+          </div>
+          <div class="meta-item">
+            <label>显示名称</label>
+            <NInput v-model:value="newStyleLabel" placeholder="如：温暖" size="small" />
+          </div>
+        </div>
+
+        <div class="editor-content">
+          <div class="editor-col">
+            <div class="field-head">
+              Prompt<span class="field-hint">— 人设 + 性格 + 说话风格 + 表达模板</span>
+              <NPopover trigger="hover" placement="bottom" style="max-width:440px">
+                <template #trigger><span class="help-badge">?</span></template>
+                <div class="example-card">
+                  <div class="example-scenes">
+                    <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
+                      :type="exampleActiveScene.prompt === sc ? 'primary' : 'default'"
+                      @click="exampleActiveScene.prompt = sc">{{ sc }}</NButton>
+                  </div>
+                  <pre class="example-content">{{ EXAMPLE_TEMPLATES.prompt[exampleActiveScene.prompt] }}</pre>
+                  <NButton size="tiny" type="primary" ghost block @click="fillExample('prompt')">填入此样例</NButton>
+                </div>
+              </NPopover>
+            </div>
+            <NInput v-model:value="newStylePrompt" placeholder="人设 + 性格 + 说话风格 + 表达模板，支持 markdown"
+              type="textarea" :rows="15" size="small" class="editor-textarea" />
+          </div>
+        </div>
+
+        <div class="editor-memory">
+          <div class="field-head">
+            记忆 (Memory)<span class="field-hint">— 定义「我记得的事情」</span>
+            <NPopover trigger="hover" placement="bottom" style="max-width:440px">
+              <template #trigger><span class="help-badge">?</span></template>
+              <div class="example-card">
+                <div class="example-scenes">
+                  <NButton v-for="sc in EXAMPLE_SCENARIOS" :key="sc" size="tiny"
+                    :type="exampleActiveScene.memory === sc ? 'primary' : 'default'"
+                    @click="exampleActiveScene.memory = sc">{{ sc }}</NButton>
+                </div>
+                <pre class="example-content">{{ EXAMPLE_TEMPLATES.memory[exampleActiveScene.memory] }}</pre>
+                <NButton size="tiny" type="primary" ghost block @click="fillExample('memory')">填入此样例</NButton>
+              </div>
+            </NPopover>
+          </div>
+          <NInput v-model:value="newStyleMemory" placeholder="背景资料、项目信息、用户偏好，每行一条"
+            type="textarea" :rows="6" size="small" class="editor-textarea" />
+        </div>
+      </div>
+
+      <div class="editor-actions">
+        <NButton size="small" @click="closeStyleEditor">取消</NButton>
+        <NButton type="primary" size="small" :disabled="idConflict" @click="isEdit ? onUpdateStyle() : onCreateStyle()">
+          {{ isEdit ? '保存修改' : '创建风格' }}
+        </NButton>
+      </div>
+    </div>
+  </NModal>
 
   <!-- Inner confirmation modals — teleported to body by
        NModal, so they sit on top of the settings dialog
@@ -2904,9 +2929,19 @@ function kbModelSupportsVision(scanModel: string) {
 .settings-no-bar :deep(.n-tabs-nav) {
   display: none !important;
 }
+.settings-no-bar {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 .settings-no-bar :deep(.n-tabs-pane-wrapper) {
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 /* PR #9: every tab pane gets the same outer padding so the
  * left/right gutters are consistent across tabs. Tabs that
@@ -2914,13 +2949,18 @@ function kbModelSupportsVision(scanModel: string) {
  * inner split) can override with their own wrapper — the
  * 24px/28px gutter is a baseline, not a hard rule. */
 .settings-no-bar :deep(.n-tab-pane) {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
   padding: 0 !important;
+  box-sizing: border-box;
 }
 .settings-no-bar :deep(.n-tab-pane) > * {
   /* Direct children of the pane get the standard gutter
    * unless they opt out (with .full-bleed or similar). */
   padding: 24px 28px;
   max-width: 100%;
+  box-sizing: border-box;
 }
 
 /* --- MCP server row (used inside the MCP tab's .settings-card
@@ -3169,8 +3209,8 @@ function kbModelSupportsVision(scanModel: string) {
   border-radius: 6px;
 }
 .styles-tab-body {
-  max-height: calc(80vh - 160px);
-  overflow: auto;
+  min-height: 100%;
+  overflow: visible;
 }
 /* ---- 风格卡片网格 ---- */
 .style-grid {
@@ -3198,18 +3238,75 @@ function kbModelSupportsVision(scanModel: string) {
   display: flex; gap: 4px; margin-top: 4px;
   border-top: 1px solid var(--border-2); padding-top: 10px;
 }
-/* ---- 风格编辑器 ---- */
-.style-editor {
-  margin-top: 14px;
-  background: var(--bg-3);
-  border: 1px solid var(--border-2);
-  border-radius: 8px;
-  padding: 16px 20px;
-  display: flex; flex-direction: column; gap: 14px;
+/* ---- 风格编辑器弹窗 ---- */
+.style-editor-dialog {
+  width: min(920px, calc(100vw - 48px));
+  max-height: min(84vh, 760px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
 }
-.editor-header {
-  font-size: 15px; font-weight: 700;
-  padding-bottom: 10px; border-bottom: 1px solid var(--border-2);
+.style-editor-head {
+  min-height: 64px;
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  flex-shrink: 0;
+}
+.style-editor-title-block {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.style-editor-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.25;
+}
+.style-editor-subtitle {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.style-editor-close {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.style-editor-close:hover {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.style-editor-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--surface-0);
 }
 .editor-meta { display: flex; gap: 16px; }
 .meta-item { flex: 1; display: flex; flex-direction: column; gap: 4px; }
@@ -3220,7 +3317,15 @@ function kbModelSupportsVision(scanModel: string) {
 .editor-col { flex: 1; display: flex; flex-direction: column; gap: 6px; }
 .editor-memory { display: flex; flex-direction: column; gap: 6px; }
 .editor-textarea { flex: 1; }
-.editor-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 6px; }
+.editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px 14px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  flex-shrink: 0;
+}
 /* ---- 旧样式保留 ---- */
 .field-head {
   font-size: 13px; font-weight: 600; color: var(--text-1);

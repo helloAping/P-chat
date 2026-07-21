@@ -4,7 +4,7 @@
 // commands, forwards them to chrome.tabs or content.js, and
 // returns structured results.
 
-const DEFAULT_SERVER = 'ws://127.0.0.1:8960/api/v1/browser/ws';
+const DEFAULT_SERVER = 'ws://127.0.0.1:15150/api/v1/browser/ws';
 const RECONNECT_BASE_MS = 3000;
 const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_INTERVAL_MS = 30000;
@@ -33,9 +33,9 @@ dbg('Service worker started');
 // popup) into proper WebSocket URLs. Also appends /api/v1/browser/ws
 // if the path is missing. Supports:
 //
-//   http://127.0.0.1:8960            → ws://127.0.0.1:8960/api/v1/browser/ws
-//   http://127.0.0.1:8960/api/v1/... → ws://127.0.0.1:8960/api/v1/browser/ws
-//   ws://127.0.0.1:8960/api/v1/...   → (unchanged)
+//   http://127.0.0.1:15150            → ws://127.0.0.1:15150/api/v1/browser/ws
+//   http://127.0.0.1:15150/api/v1/... → ws://127.0.0.1:15150/api/v1/browser/ws
+//   ws://127.0.0.1:15150/api/v1/...   → (unchanged)
 function normalizeServerURL(raw) {
   try {
     const url = new URL(raw);

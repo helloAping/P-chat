@@ -784,7 +784,7 @@ func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Host: "127.0.0.1",
-			Port: 8960,
+			Port: 15150,
 		},
 		LLM: LLMConfig{
 			Default: "ollama",

@@ -119,7 +119,7 @@
 
   <div class="row">
     <label>服务器</label>
-    <input type="text" id="server-url" placeholder="http://127.0.0.1:8960" value="">
+    <input type="text" id="server-url" placeholder="http://127.0.0.1:15150" value="">
   </div>
   <div class="actions">
     <button id="save-btn" class="primary">保存并连接</button>
@@ -128,8 +128,8 @@
   </div>
 
   <div class="hint">
-    填入 P-Chat 服务器地址（如 <code>http://127.0.0.1:8960</code>），扩展会自动转换为 WebSocket 连接。
-    点击「自动探测」可扫描常见端口。
+    填入 P-Chat 服务器地址（如 <code>http://127.0.0.1:15150</code>），扩展会自动转换为 WebSocket 连接。
+    点击「自动探测」会优先扫描 P-Chat 端口 15150-15159，并兼容旧端口。
   </div>
   <script src="popup.js"></script>
 </body>

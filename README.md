@@ -61,7 +61,7 @@ cd build/bin && ./install.sh
 
 ```bash
 pchat-server.exe
-# 打开浏览器访问 http://127.0.0.1:8960/app/index.html
+# 打开浏览器访问 http://127.0.0.1:15150/app/index.html
 ```
 
 ### 方式三：CLI 终端
@@ -162,7 +162,7 @@ pchat.exe --provider ollama # 指定提供器
 ```json
 {
   "llm": { "default": "openai", "providers": [...] },
-  "server": { "host": "127.0.0.1", "port": 8960 },
+  "server": { "host": "127.0.0.1", "port": 15150 },
   "style": { "default": "tech" },
   "memory": { "max_history": -1 },
   "sandbox": { "exec_dangerous_patterns": "...", "write_protected_paths": "..." },

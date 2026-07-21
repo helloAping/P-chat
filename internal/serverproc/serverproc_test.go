@@ -2,6 +2,8 @@ package serverproc
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -40,9 +42,9 @@ func TestStop_NilSafe(t *testing.T) {
 
 func TestPortFromEnv(t *testing.T) {
 	cases := map[string]int{
-		"":         0,
-		"0":        0, // strconv.Atoi returns 0; we don't treat as "not set"
-		"18960":    18960,
+		"":          0,
+		"0":         0, // strconv.Atoi returns 0; we don't treat as "not set"
+		"18960":     18960,
 		"not a num": 0,
 	}
 	for input, want := range cases {
@@ -55,16 +57,51 @@ func TestPortFromEnv(t *testing.T) {
 
 func TestWebDirFromEnv(t *testing.T) {
 	cases := map[string]string{
-		"":                            "",
-		"web":                         "web",
-		`C:\Users\me\src\p-chat\web`:  `C:\Users\me\src\p-chat\web`,
-		"/home/me/p-chat/web":         "/home/me/p-chat/web",
+		"":                           "",
+		"web":                        "web",
+		`C:\Users\me\src\p-chat\web`: `C:\Users\me\src\p-chat\web`,
+		"/home/me/p-chat/web":        "/home/me/p-chat/web",
 	}
 	for input, want := range cases {
 		t.Setenv("PCHAT_WEB_DIR", input)
 		if got := WebDirFromEnv(); got != want {
 			t.Errorf("WebDirFromEnv(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestPickPreferredPort_FirstPreferredWhenAvailable(t *testing.T) {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", PreferredPortStart))
+	if err != nil {
+		t.Skipf("preferred port %d is already occupied: %v", PreferredPortStart, err)
+	}
+	_ = l.Close()
+
+	port, err := PickPreferredPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port != PreferredPortStart {
+		t.Fatalf("PickPreferredPort() = %d, want %d", port, PreferredPortStart)
+	}
+}
+
+func TestPickPreferredPort_SkipsOccupiedPreferredPorts(t *testing.T) {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", PreferredPortStart))
+	if err != nil {
+		t.Skipf("preferred port %d is already occupied: %v", PreferredPortStart, err)
+	}
+	defer l.Close()
+
+	port, err := PickPreferredPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port == PreferredPortStart {
+		t.Fatalf("PickPreferredPort() reused occupied port %d", PreferredPortStart)
+	}
+	if port < PreferredPortStart || port > PreferredPortEnd {
+		t.Fatalf("PickPreferredPort() = %d, want next port in %d-%d", port, PreferredPortStart+1, PreferredPortEnd)
 	}
 }
 

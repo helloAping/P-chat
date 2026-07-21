@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,7 +35,8 @@ type Server struct {
 
 // Options configures a server launch.
 type Options struct {
-	// Port to bind the server on. 0 = pick a free port automatically.
+	// Port to bind the server on. 0 = pick from P-Chat's preferred
+	// local range (15150-15159), falling back to an OS-assigned port.
 	Port int
 	// ConfigPath is the path passed as --config. Empty = use
 	// the data dir's config.json (preferred) or config.yaml
@@ -78,13 +78,11 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 
 	port := opts.Port
 	if port == 0 {
-		// Pick a free port: bind to :0, read the port, close.
-		l, err := net.Listen("tcp", "127.0.0.1:0")
+		var err error
+		port, err = PickPreferredPort()
 		if err != nil {
 			return nil, fmt.Errorf("pick free port: %w", err)
 		}
-		port = l.Addr().(*net.TCPAddr).Port
-		_ = l.Close()
 	}
 
 	args := []string{"--config", opts.ConfigPath}

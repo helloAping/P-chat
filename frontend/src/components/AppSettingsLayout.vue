@@ -22,7 +22,7 @@
  *   │  [nav3]  │                                          │
  *   │  ...     │                                          │
  *   │          │                                          │
- *   │  200px   │  flex: 1 (scrolls)                       │
+ *   │  200px   │  flex: 1 (active pane scrolls)           │
  *   └──────────┴─────────────────────────────────────────┘
  *
  * The nav column holds the tab list. The right column holds
@@ -344,11 +344,17 @@ function isActive(name: string) {
   white-space: nowrap;
 }
 
-/* Content column — fills remaining space, scrolls */
+/* Content column — fills the remaining space.
+ * The active settings pane owns vertical scrolling. Keeping
+ * this shell overflow-hidden avoids nested scroll containers
+ * and prevents short tabs from leaving a dead-looking blank
+ * band below their content. */
 .settings-content {
   flex: 1;
+  display: flex;
+  min-height: 0;
   min-width: 0;
-  overflow: auto;
+  overflow: hidden;
   padding: 0;
   background: var(--surface-0);
 }
