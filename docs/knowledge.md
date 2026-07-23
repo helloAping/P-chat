@@ -1,6 +1,6 @@
 # 知识库使用指南
 
-P-Chat 知识库是一个**本地优先的文档语义检索系统**。它通过向量嵌入（embedding）技术将你的代码、文档、配置文件转化为可语义搜索的知识片段，LLM 可以在对话中直接检索和引用。
+P-Chat 知识库是一个**本地优先的文档检索系统**。当前检索基于 SQLite FTS5 + 路径/文件名/标题/正文混合召回，LLM 可以在对话中直接检索和引用。
 
 ---
 
@@ -10,41 +10,15 @@ P-Chat 知识库是一个**本地优先的文档语义检索系统**。它通过
 
 打开「应用设置」→「知识库」Tab → 打开「启用知识库」开关。
 
-### 2. 配置嵌入模型
-
-在「嵌入模型」区域选择一个供应商和模型。推荐使用以下模型：
-
-| 供应商 | 模型 | 维度 | 适用场景 |
-|--------|------|------|---------|
-| OpenAI | `text-embedding-3-small` | 1536 | 通用，性价比高 |
-| OpenAI | `text-embedding-3-large` | 3072 | 高精度需求的代码/技术文档 |
-| 本地 Ollama | `nomic-embed-text` | 768 | 完全离线，无需 API Key |
-
-> 提示：供应商下拉会从你已配置的 LLM 提供商中自动筛选包含 `embedding` 关键字的模型。
-
-### 3. 添加向量库
-
-向量库是存储嵌入向量的后端。支持两种类型：
-
-**本地向量库**（推荐首次使用）：
-- 驱动：`local`
-- 存储路径：`~/.p-chat/vectors/<名称>/`
-- 零依赖，开箱即用，适合个人使用
-
-**远程向量库**（团队共享场景）：
-- Qdrant、Milvus、Chroma、Weaviate、Pinecone
-- 配置 URL / Host:Port / Collection 名称即可
-
-### 4. 添加知识库并扫描
+### 2. 添加知识库并扫描
 
 点击「知识库」区域的「+ 添加」按钮，填入：
-- **名称**：给知识库起个名字（如 "项目文档"）
+- **名称**：给知识库起个名字（如 `项目文档`）
 - **路径**：要索引的目录绝对路径
-- **向量库**：选择上一步创建的向量库
 
-点击「确认添加」后，点「扫描」开始索引。扫描完成后会显示索引到的文档片段数量。
+点击「确认添加」后，点「扫描」开始索引。扫描完成后会显示索引到的文档/章节数量。
 
-### 5. 在对话中使用
+### 3. 在对话中使用
 
 在聊天输入框底部，点击「向量库」下拉选择器选择一个向量库。之后 LLM 在需要时会自动调用 `recall` 工具检索知识库。
 
@@ -244,3 +218,72 @@ LLM 在以下情况下会自动调用 recall：
 1. 供应商的 `base_url` 指向正确的端点
 2. 模型名在 `/v1/embeddings` 端点可用
 3. API Key 有权限调用 embedding API
+
+
+## 多知识库合并重排 (KB-01)
+
+`POST /api/v1/knowledge/search` 与 `wiki_lookup` 在多库场景下：
+
+1. 对每个启用的知识库分别 `LookupSearch`（不再 early-stop）
+2. 为每条结果打上 `base` 标签
+3. 按库内 max 归一化 score，再全局排序
+4. 按 `source+title` 去重（路径大小写/分隔符不敏感）
+5. 截断到 topK / 分页窗口
+
+实现：`internal/knowledge/merge.go` 的 `MergeAndRerank` / `TagBase`。
+响应字段新增 `base`、`title`。
+
+
+## 混合检索 (KB-02)
+
+`LookupSearch` 会并行收集多类候选，然后用 RRF（Reciprocal Rank Fusion）融合：
+
+1. 路径 / 文件名 / 标题 substring 命中（适合 `config.go`、函数名、配置 key）
+2. FTS5 title / keywords / overview / L2 文件节点前缀匹配
+3. 正文 `LIKE` 命中（补精确术语）
+
+返回结果新增：
+
+- `match_type`: `path | filename | title | keywords | overview | l2 | content`
+- `base`: 来源知识库（KB-01）
+- `rank`: 融合后的相关性分数
+
+`wiki_lookup` 会在工具结果中显示 `来源库` 与 `命中`；`POST /api/v1/knowledge/search` 也会返回 `base` / `title` / `match_type`。
+
+
+## 查询改写与分解 (KB-03)
+
+搜索入口会先调用 `knowledge.PlanQueries(query)`，规则型派生 2-5 个 query：
+
+- 原始 query
+- 反引号中的术语（如 `work_mode`）
+- 路径型 token（如 `internal/config/config.go`）
+- 函数/配置 key/文件名等 symbol token（如 `LoadConfig`）
+- 较长中文/英文关键词
+
+每个派生 query 都会独立 `LookupSearch`，再复用 KB-01 `MergeAndRerank` 去重、归一化、全局排序。结果新增 `query` 字段，表示这条命中来自哪个原始或派生查询。
+
+
+## 引用可解释性 (KB-04)
+
+知识库搜索结果会附带结构化 `citation` 与短文本 `explanation`：
+
+- `base` / `source` / `title` / `parent_title`: 来源库与定位
+- `query`: 命中该结果的原始或派生查询
+- `match_type`: `path | filename | title | keywords | overview | l2 | content`
+- `score`: 融合后的相关性分数
+- `explanation`: 可直接展示给用户的命中说明
+
+`wiki_lookup` 工具结果会显示来源库、命中类型、匹配查询和解释；`POST /api/v1/knowledge/search` 返回同样的结构化字段，前端类型为 `KnowledgeCitation`。
+
+
+## 增量扫描优化 (KB-05)
+
+扫描知识库时会按文件 `mtime` 进行增量处理：
+
+- 未变文件：跳过，计入 `skipped`
+- 新增/变更文件：只替换该 source 的 L2/L3/contents，计入 `changed`
+- 已删除文件：从索引和 `file_mtimes` 清理，计入 `deleted`
+- 读取失败文件：计入 `failed`，扫描继续
+
+`GET /api/v1/knowledge/bases/:name/scan/status` 新增 `changed`、`skipped`、`deleted`、`failed` 字段，GUI 可展示二次扫描是否真正跳过未变文件。

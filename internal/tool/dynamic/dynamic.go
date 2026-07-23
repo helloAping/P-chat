@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -38,6 +41,68 @@ func BuildDynamicHandler(spec Spec) tool.ToolHandler {
 	}
 }
 
+// Preview renders a dynamic tool's template without performing the
+// side-effect. It powers the DT-02 GUI trial panel: users can confirm
+// the final command / URL / echo text before choosing a real run.
+func Preview(spec Spec, args json.RawMessage) (*tool.CallResult, error) {
+	var argMap map[string]any
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &argMap); err != nil {
+			return &tool.CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
+		}
+	}
+	rc := RenderCtx{Args: argMap, Config: spec.Config}
+	switch spec.Template.Type {
+	case "exec":
+		cmd, err := render(spec.Template.Command, rc)
+		if err != nil {
+			return &tool.CallResult{Content: "template render: " + err.Error(), IsError: true}, nil
+		}
+		return &tool.CallResult{Content: fmt.Sprintf("[dry-run] would execute dynamic tool %q\ncommand: %s\ntimeout: %s\n\n(no command was actually run)", spec.Name, cmd, spec.Template.Timeout.Std())}, nil
+	case "http":
+		urlStr, err := render(spec.Template.URL, rc)
+		if err != nil {
+			return &tool.CallResult{Content: "url render: " + err.Error(), IsError: true}, nil
+		}
+		body, err := render(spec.Template.Body, rc)
+		if err != nil {
+			return &tool.CallResult{Content: "body render: " + err.Error(), IsError: true}, nil
+		}
+		method := strings.ToUpper(strings.TrimSpace(spec.Template.Method))
+		if method == "" {
+			method = "GET"
+		}
+		headers := make([]string, 0, len(spec.Template.Headers))
+		for k, v := range spec.Template.Headers {
+			rendered, rerr := render(v, rc)
+			if rerr != nil {
+				return &tool.CallResult{Content: fmt.Sprintf("header %q render: %v", k, rerr), IsError: true}, nil
+			}
+			if rendered != "" {
+				headers = append(headers, k+": <set>")
+			}
+		}
+		sort.Strings(headers)
+		content := fmt.Sprintf("[dry-run] would request dynamic tool %q\nmethod: %s\nurl: %s\ntimeout: %s", spec.Name, method, urlStr, spec.Template.Timeout.Std())
+		if len(headers) > 0 {
+			content += "\nheaders:\n  " + strings.Join(headers, "\n  ")
+		}
+		if body != "" {
+			content += "\nbody:\n" + body
+		}
+		content += "\n\n(no HTTP request was sent)"
+		return &tool.CallResult{Content: content}, nil
+	case "echo":
+		rendered, err := render(spec.Template.Text, rc)
+		if err != nil {
+			return &tool.CallResult{Content: "template render: " + err.Error(), IsError: true}, nil
+		}
+		return &tool.CallResult{Content: fmt.Sprintf("[dry-run] would return dynamic tool %q\n%s", spec.Name, rendered)}, nil
+	default:
+		return &tool.CallResult{Content: fmt.Sprintf("unknown dynamic template.type %q", spec.Template.Type), IsError: true}, nil
+	}
+}
+
 // AsTool converts a Spec into the tool.Tool value the
 // tool.Registry.Register call expects. The handler side is
 // the one BuildDynamicHandler returned; this function only
@@ -66,29 +131,136 @@ func (s Spec) AsTool() tool.Tool {
 // pattern-fit.
 var (
 	specsMu sync.RWMutex
-	specs   = map[string]Spec{}
+	specs   = map[string]map[string]Spec{}
+
+	diagnosticsMu sync.RWMutex
+	diagnostics   = map[string]map[string]LoadDiagnostic{}
 )
 
-// SetSpecs atomically replaces the entire spec table. The
-// watcher calls this on every reload so the agent's
-// confirmTargetFor sees the same set of tools the
-// tool.Registry has. Read-conflicts with the agent loop
-// are safe because we copy-on-write.
-func SetSpecs(all map[string]Spec) {
-	specsMu.Lock()
-	defer specsMu.Unlock()
-	specs = make(map[string]Spec, len(all))
-	for k, v := range all {
-		specs[k] = v
-	}
+// LoadDiagnostic is one row of dynamic-tool loader state.
+// It includes both valid and invalid YAML files so the GUI can
+// explain why a custom tool did not appear in the registry.
+type LoadDiagnostic struct {
+	Source      string    `json:"source"`
+	Name        string    `json:"name,omitempty"`
+	Status      string    `json:"status"` // loaded | error
+	Error       string    `json:"error,omitempty"`
+	Scope       string    `json:"scope,omitempty"`
+	ProjectRoot string    `json:"project_root,omitempty"`
+	ModTime     time.Time `json:"-"`
+	ModAt       string    `json:"mod_at,omitempty"`
 }
 
-// LookupSpec returns the spec for the given tool name plus
-// an ok flag. Used by the agent's confirmTargetFor to
-// resolve a dynamic tool's sandbox policy at confirm time.
+func scopeKey(scope tool.ToolOriginScope, projectRoot string) string {
+	return string(scope) + "\x00" + projectRoot
+}
+
+func formatDiagnostic(d LoadDiagnostic, scope tool.ToolOriginScope, projectRoot string) LoadDiagnostic {
+	if !d.ModTime.IsZero() {
+		d.ModAt = d.ModTime.Format(time.RFC3339)
+	}
+	if d.Scope == "" {
+		d.Scope = string(scope)
+	}
+	if d.ProjectRoot == "" {
+		d.ProjectRoot = projectRoot
+	}
+	return d
+}
+
+// SetSpecs atomically replaces the global dynamic spec table. It is kept as a
+// compatibility wrapper for tests and the global watcher.
+func SetSpecs(all map[string]Spec) {
+	SetSpecsForRoot(tool.ToolOriginGlobal, "", all)
+}
+
+// SetSpecsForRoot replaces the dynamic spec table for one origin scope.
+func SetSpecsForRoot(scope tool.ToolOriginScope, projectRoot string, all map[string]Spec) {
+	specsMu.Lock()
+	defer specsMu.Unlock()
+	key := scopeKey(scope, projectRoot)
+	if len(all) == 0 {
+		delete(specs, key)
+		return
+	}
+	copyMap := make(map[string]Spec, len(all))
+	for k, v := range all {
+		copyMap[k] = v
+	}
+	specs[key] = copyMap
+}
+
+// SetDiagnostics atomically replaces the global loader diagnostics table.
+func SetDiagnostics(all map[string]LoadDiagnostic) {
+	SetDiagnosticsForRoot(tool.ToolOriginGlobal, "", all)
+}
+
+// SetDiagnosticsForRoot replaces the loader diagnostics table for one origin scope.
+func SetDiagnosticsForRoot(scope tool.ToolOriginScope, projectRoot string, all map[string]LoadDiagnostic) {
+	diagnosticsMu.Lock()
+	defer diagnosticsMu.Unlock()
+	key := scopeKey(scope, projectRoot)
+	if len(all) == 0 {
+		delete(diagnostics, key)
+		return
+	}
+	copyMap := make(map[string]LoadDiagnostic, len(all))
+	for k, v := range all {
+		copyMap[k] = formatDiagnostic(v, scope, projectRoot)
+	}
+	diagnostics[key] = copyMap
+}
+
+// DiagnosticsSnapshot returns the global loader diagnostics in a stable order.
+func DiagnosticsSnapshot() []LoadDiagnostic {
+	return DiagnosticsSnapshotForRoot("")
+}
+
+// DiagnosticsSnapshotForRoot returns global diagnostics plus the current
+// project's diagnostics. Other projects stay hidden from this session view.
+func DiagnosticsSnapshotForRoot(projectRoot string) []LoadDiagnostic {
+	diagnosticsMu.RLock()
+	defer diagnosticsMu.RUnlock()
+	out := []LoadDiagnostic{}
+	appendScope := func(scope tool.ToolOriginScope, root string) {
+		for _, d := range diagnostics[scopeKey(scope, root)] {
+			out = append(out, d)
+		}
+	}
+	appendScope(tool.ToolOriginGlobal, "")
+	if projectRoot != "" {
+		appendScope(tool.ToolOriginProject, projectRoot)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Status != out[j].Status {
+			return out[i].Status == "error"
+		}
+		if out[i].Scope != out[j].Scope {
+			return out[i].Scope < out[j].Scope
+		}
+		return out[i].Source < out[j].Source
+	})
+	return out
+}
+
+// LookupSpec returns the global spec for the given tool name plus an ok flag.
 func LookupSpec(name string) (Spec, bool) {
+	return LookupSpecForRoot(name, "")
+}
+
+// LookupSpecForRoot resolves a dynamic spec in the same order the tool registry
+// resolves handlers: project tools override global tools for that session.
+func LookupSpecForRoot(name, projectRoot string) (Spec, bool) {
 	specsMu.RLock()
 	defer specsMu.RUnlock()
-	s, ok := specs[name]
+	if projectRoot != "" {
+		if m := specs[scopeKey(tool.ToolOriginProject, projectRoot)]; m != nil {
+			if s, ok := m[name]; ok {
+				return s, true
+			}
+		}
+	}
+	m := specs[scopeKey(tool.ToolOriginGlobal, "")]
+	s, ok := m[name]
 	return s, ok
 }

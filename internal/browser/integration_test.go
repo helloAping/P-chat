@@ -74,7 +74,7 @@ func TestWebSocket_FullRoundTrip(t *testing.T) {
 			return
 		}
 
-		client := NewBrowserClient(id, hello.BrowserName, conn)
+		client := NewBrowserClient(id, hello.BrowserName, conn, hello)
 
 		// Start pump so the client can receive responses.
 		go client.StartReadPump(ctx)

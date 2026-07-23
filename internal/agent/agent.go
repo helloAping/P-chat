@@ -39,6 +39,7 @@ import (
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/tool/dynamic"
 	"github.com/p-chat/pchat/internal/trace"
 )
 
@@ -130,6 +131,27 @@ func (a *Agent) getStyleMemory(s style.Style) string {
 // dangerous operations. Pass nil to disable sandboxing.
 func (a *Agent) SetSandbox(s tool.SandboxChecker) {
 	a.sandbox = s
+}
+
+func (a *Agent) loadProjectDynamicTools(projectRoot string) {
+	if projectRoot == "" || a.tools == nil {
+		return
+	}
+	dir := paths.ProjectToolsDirWithRoot(projectRoot)
+	entries, specs, diagnostics, err := dynamic.LoadSnapshot(dir, func(name string) map[string]any {
+		if a.cfg == nil || a.cfg.Dynamic == nil {
+			return nil
+		}
+		return a.cfg.Dynamic[name]
+	})
+	if err != nil {
+		log.Printf("[dynamic] project tools scan warning: %v", err)
+		return
+	}
+	origin := tool.ToolOrigin{Scope: tool.ToolOriginProject, ProjectRoot: projectRoot}
+	a.tools.SetDynamicSnapshot(origin, entries)
+	dynamic.SetSpecsForRoot(tool.ToolOriginProject, projectRoot, specs)
+	dynamic.SetDiagnosticsForRoot(tool.ToolOriginProject, projectRoot, diagnostics)
 }
 
 func (a *Agent) LLM() *llm.Client { return a.llm }
@@ -954,7 +976,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		start := time.Now()
 
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
-		availableTools := a.tools.List()
+		a.loadProjectDynamicTools(req.ProjectRoot)
+		availableTools := a.tools.ListForProject(req.ProjectRoot)
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
 		kbEnabled := req.KBBase != "" && req.KBBase != "__off__"
@@ -1645,6 +1668,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						log.Printf("%s[question] dropped event (channel full for 2s)", trace.LogPrefix(tctx))
 					}
 				})
+				// BR-04: browser_* (and other self-gating tools) emit
+				// tool_confirm through this emitter. Always installed —
+				// independent of sandboxActive — because browser policy
+				// lives in the tool handler, not confirmTargetFor.
+				tctx = tool.WithConfirmEmitter(tctx, func(req tool.ConfirmRequest) {
+					select {
+					case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(req)}:
+					case <-time.After(5 * time.Second):
+						log.Printf("%s[agent] WARN: browser confirm emit timed out after 5s", trace.LogPrefix(tctx))
+					case <-tctx.Done():
+					}
+				})
 				tctx, cancel := context.WithTimeout(tctx, 5*time.Minute)
 
 				fwd := forwarder{done: make(chan struct{})}
@@ -1692,14 +1727,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						}
 					}
 
-					handler, ok := a.tools.Get(tc.Name)
+					handler, ok := a.tools.GetForProject(tc.Name, req.ProjectRoot)
 					if !ok {
-						errMsg := fmt.Sprintf("error: tool %q not found (available: %s)", tc.Name, availableToolNames(a.tools.List()))
+						errMsg := fmt.Sprintf("error: tool %q not found (available: %s)", tc.Name, availableToolNames(a.tools.ListForProject(req.ProjectRoot)))
 						// Browser tools may have been unregistered at runtime.
 						// Provide a clearer message when all browser_ tools are gone.
 						if strings.HasPrefix(tc.Name, "browser_") {
 							hasAnyBrowser := false
-							for _, n := range a.tools.Names() {
+							for _, n := range a.tools.NamesForProject(req.ProjectRoot) {
 								if strings.HasPrefix(n, "browser_") {
 									hasAnyBrowser = true
 									break
@@ -1758,9 +1793,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						permLevel = tool.PermissionAsk
 					}
 					bypass := a.bypassOnce.Swap(false)
+					// /unsafe once → treat this single call as
+					// permission=full so browser_* confirm gates
+					// (BR-04 RequireConfirm) and path sandbox
+					// share the same bypass semantics.
+					if bypass {
+						toolCtx = tool.WithPermissionLevel(tctx, tool.PermissionFull)
+						permLevel = tool.PermissionFull
+					}
 					sandboxActive := a.sandbox != nil && !bypass && permLevel != tool.PermissionFull
 					if sandboxActive {
-						toolCtx = tool.WithSandbox(tctx, a.sandbox)
+						toolCtx = tool.WithSandbox(toolCtx, a.sandbox)
 
 						// Confirm-check for dangerous tools.
 						// If the sandbox returns Confirm, pause and

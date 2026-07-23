@@ -49,11 +49,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | Schema 迁移 / 版本发布 | [`.agents/docs/versioning.md`](docs/versioning.md) |
 | 配置管理 | [`.agents/docs/config.md`](docs/config.md) |
 | CLI 终端 | [`.agents/docs/cli.md`](docs/cli.md) |
-| Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) | |
-| **前端样式 / 设计 token** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md) | |
+| Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) |
+| **前端样式 / 设计 token** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md) |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
 | 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
 | 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
+| 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](../README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
 
 **模块文档位置**：`.agents/docs/` 目录下，每个模块一个 `.md` 文件。
 

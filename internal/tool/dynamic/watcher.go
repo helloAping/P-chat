@@ -2,6 +2,7 @@ package dynamic
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -58,7 +59,6 @@ func Watch(ctx context.Context, reg *tool.Registry, dir string, lookup ConfigLoo
 			return func() {}, err
 		}
 	}
-
 	// Per-file last-seen mtime. Keyed by absolute path so
 	// two different dirs (project vs global) don't collide.
 	state := map[string]time.Time{}
@@ -66,7 +66,6 @@ func Watch(ctx context.Context, reg *tool.Registry, dir string, lookup ConfigLoo
 	// unregister the right name.
 	nameToPath := map[string]string{}
 	var mu sync.Mutex
-
 	// Prime: load whatever's already on disk so the
 	// restart-after-edit case picks up edits made while
 	// the server was down.
@@ -76,7 +75,6 @@ func Watch(ctx context.Context, reg *tool.Registry, dir string, lookup ConfigLoo
 	if onChange != nil {
 		onChange()
 	}
-
 	stopped := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -122,7 +120,9 @@ func scanOnce(reg *tool.Registry, dir string, lookup ConfigLookup, state map[str
 	// LookupSpec table at the end so the agent's
 	// confirmTargetFor sees an atomic snapshot (no
 	// half-registered tools).
+	liveEntries := map[string]tool.ToolEntryHandler{}
 	liveSpecs := map[string]Spec{}
+	liveDiagnostics := map[string]LoadDiagnostic{}
 	seen := map[string]bool{}
 	for _, e := range entries {
 		if e.IsDir() {
@@ -150,9 +150,17 @@ func scanOnce(reg *tool.Registry, dir string, lookup ConfigLookup, state map[str
 			spec, perr := loadSpec(full, info.ModTime(), lookup)
 			if perr != nil {
 				log.Printf("[dynamic] skip %s: %v", filepath.Base(full), perr)
+				liveDiagnostics[full] = LoadDiagnostic{
+					Source:  full,
+					Status:  "error",
+					Error:   perr.Error(),
+					ModTime: mt,
+				}
 				continue
 			}
-			liveSpecs[spec.Name] = spec
+			if !addLoadedSpec(liveEntries, liveSpecs, liveDiagnostics, spec, full, mt) {
+				continue
+			}
 			continue
 		}
 		// Re-load: either new file, or the mtime moved.
@@ -160,12 +168,15 @@ func scanOnce(reg *tool.Registry, dir string, lookup ConfigLookup, state map[str
 		// (if any) before re-registering, so a half-baked
 		// edit can't leave the LLM calling a stale
 		// handler.
-		if prevName, ok := nameToPath[full]; ok {
-			reg.Unregister(prevName)
-		}
 		spec, perr := loadSpec(full, info.ModTime(), lookup)
 		if perr != nil {
 			log.Printf("[dynamic] skip %s: %v", filepath.Base(full), perr)
+			liveDiagnostics[full] = LoadDiagnostic{
+				Source:  full,
+				Status:  "error",
+				Error:   perr.Error(),
+				ModTime: mt,
+			}
 			// Don't update state for a failed parse — a
 			// later edit that fixes the YAML should still
 			// be detected.
@@ -175,17 +186,17 @@ func scanOnce(reg *tool.Registry, dir string, lookup ConfigLookup, state map[str
 		// unconditionally so the user gets immediate
 		// feedback that the edit "took". The Unregister
 		// above already cleared the old name.
-		reg.RegisterWithSource(spec.AsTool(), BuildDynamicHandler(spec), spec.Source)
 		state[full] = mt
 		nameToPath[full] = spec.Name
-		liveSpecs[spec.Name] = spec
+		if !addLoadedSpec(liveEntries, liveSpecs, liveDiagnostics, spec, full, mt) {
+			continue
+		}
 		log.Printf("[dynamic] registered %q from %s (source=%s)", spec.Name, filepath.Base(full), full)
 	}
 	// Deletions: a file we knew about that's no longer
 	// in `seen` should be unregistered.
 	for path, name := range nameToPath {
 		if !seen[path] {
-			reg.Unregister(name)
 			delete(state, path)
 			delete(nameToPath, path)
 			log.Printf("[dynamic] unregistered %q (file removed)", name)
@@ -196,8 +207,68 @@ func scanOnce(reg *tool.Registry, dir string, lookup ConfigLookup, state map[str
 	// when liveSpecs is empty, the previous table is
 	// replaced so a deleted tool can't keep prompting
 	// from a stale confirm.
+	reg.SetDynamicSnapshot(tool.ToolOrigin{Scope: tool.ToolOriginGlobal}, liveEntries)
 	SetSpecs(liveSpecs)
+	SetDiagnostics(liveDiagnostics)
 	return nil
+}
+
+// LoadSnapshot scans one tools directory and returns parsed dynamic tools,
+// specs, and diagnostics without mutating process-global state. Callers choose
+// whether the snapshot belongs to the global or project scope.
+func LoadSnapshot(dir string, lookup ConfigLookup) (map[string]tool.ToolEntryHandler, map[string]Spec, map[string]LoadDiagnostic, error) {
+	entries := map[string]tool.ToolEntryHandler{}
+	liveSpecs := map[string]Spec{}
+	liveDiagnostics := map[string]LoadDiagnostic{}
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return entries, liveSpecs, liveDiagnostics, nil
+		}
+		return nil, nil, nil, err
+	}
+	for _, e := range files {
+		if e.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(e.Name(), ".yaml") && !strings.HasSuffix(e.Name(), ".yml") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		mt := info.ModTime()
+		spec, perr := loadSpec(full, mt, lookup)
+		if perr != nil {
+			liveDiagnostics[full] = LoadDiagnostic{Source: full, Status: "error", Error: perr.Error(), ModTime: mt}
+			continue
+		}
+		addLoadedSpec(entries, liveSpecs, liveDiagnostics, spec, full, mt)
+	}
+	return entries, liveSpecs, liveDiagnostics, nil
+}
+
+func addLoadedSpec(entries map[string]tool.ToolEntryHandler, specs map[string]Spec, diagnostics map[string]LoadDiagnostic, spec Spec, source string, mt time.Time) bool {
+	if prev, exists := specs[spec.Name]; exists {
+		msg := fmt.Sprintf("duplicate dynamic tool name %q also defined in %s", spec.Name, prev.Source)
+		diagnostics[source] = LoadDiagnostic{Source: source, Name: spec.Name, Status: "error", Error: msg, ModTime: mt}
+		if prev.Source != "" {
+			diagnostics[prev.Source] = LoadDiagnostic{Source: prev.Source, Name: spec.Name, Status: "error", Error: msg, ModTime: prev.ModTime}
+		}
+		delete(entries, spec.Name)
+		delete(specs, spec.Name)
+		return false
+	}
+	entries[spec.Name] = tool.ToolEntryHandler{
+		Tool:    spec.AsTool(),
+		Handler: BuildDynamicHandler(spec),
+		Origin:  tool.ToolOrigin{Source: spec.Source},
+	}
+	specs[spec.Name] = spec
+	diagnostics[source] = LoadDiagnostic{Source: source, Name: spec.Name, Status: "loaded", ModTime: mt}
+	return true
 }
 
 // loadSpec reads the YAML file at `path` and returns the

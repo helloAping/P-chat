@@ -91,7 +91,9 @@ func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfi
 			RiskLevel: "high", // exec_command is always "high" — it's arbitrary code
 		}, true
 	case "write_file":
-		var wa struct{ Path string `json:"path"` }
+		var wa struct {
+			Path string `json:"path"`
+		}
 		_ = json.Unmarshal([]byte(argsJSON), &wa)
 		resolved := resolveForConfirm(wa.Path, projectRoot)
 		decision := sb.CheckWriteDecision(resolved, projectRoot)
@@ -103,7 +105,9 @@ func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfi
 			RiskLevel:    "high", // writes mutate user data
 		}, true
 	case "read_file", "read_docx", "read_pdf":
-		var ra struct{ Path string `json:"path"` }
+		var ra struct {
+			Path string `json:"path"`
+		}
 		_ = json.Unmarshal([]byte(argsJSON), &ra)
 		resolved := resolveForConfirm(ra.Path, projectRoot)
 		decision := sb.CheckReadDecision(resolved, projectRoot)
@@ -115,7 +119,9 @@ func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfi
 			RiskLevel:    "low", // reads don't mutate
 		}, true
 	case "list_files":
-		var la struct{ Path string `json:"path"` }
+		var la struct {
+			Path string `json:"path"`
+		}
 		_ = json.Unmarshal([]byte(argsJSON), &la)
 		if la.Path == "" {
 			la.Path = "."
@@ -140,7 +146,7 @@ func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfi
 		// have it for arbitrary dynamic tools that take
 		// non-path arguments, so the resolved-path /
 		// path-class fields stay empty.
-		if spec, ok := dynamic.LookupSpec(toolName); ok {
+		if spec, ok := dynamic.LookupSpecForRoot(toolName, projectRoot); ok {
 			decision, reason, risk := decisionFromSandbox(spec.Sandbox.Exec, toolName)
 			return confirmTarget{
 				Decision:  decision,
@@ -241,8 +247,8 @@ func classForWorkDir(workDir, projectRoot string) string {
 //
 //   - "allow"   → Allow (no confirm modal)
 //   - "deny"    → Block (the tool call is rejected with a
-//                 tool result; the user can see the
-//                 "blocked by sandbox policy" message)
+//     tool result; the user can see the
+//     "blocked by sandbox policy" message)
 //   - "confirm" → Confirm (the existing modal opens)
 //   - anything else (defensive) → Confirm, fail-safe
 //

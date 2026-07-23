@@ -184,25 +184,28 @@ sandbox:
 - `deny` → `SandboxBlock`（返回 E_SANDBOX 错误）
 - `confirm` → `SandboxConfirm`（弹确认 modal）
 
-**Watcher 行为**：
-- 5s polling（镜像 `internal/rules`）
-- 新文件 → parse → Register
-- 文件 mtime 变化 → Unregister + Re-register
-- 文件删除 → Unregister
-- 单个 YAML 解析失败 → log warn + 跳过（不影响其他工具）
+**Watcher / 项目级目录行为**：
+- 全局 `~/.p-chat/tools/*.yaml` 仍由 5s polling watcher 热加载。
+- 当前会话绑定项目时，`<project>/.p-chat/tools/*.yaml` 会按需扫描并合成到该会话工具视图。
+- 项目工具同名覆盖全局动态工具；离开项目或切换到其他项目时不会泄漏。
+- 文件删除以 scope snapshot 替换实现，不用裸 `Unregister(name)` 删除同名全局工具。
+- 单个 YAML 解析失败 → log warn + 跳过（不影响其他工具），同时写入 dynamic diagnostics 快照供 GUI 展示。
 
 **Process-global spec table**：
-`dynamic.SetSpecs(all)` 在每次 reload 后发布当前 spec 快照；
-`dynamic.LookupSpec(name)` 供 `confirm_target.go` 读 spec.Sandbox.Exec。
-避开在 agent loop 多收一个 Registry 参数。
+`dynamic.SetSpecsForRoot(scope, projectRoot, all)` 按作用域发布 spec 快照；
+`dynamic.LookupSpecForRoot(name, projectRoot)` 供 `confirm_target.go` 读 spec.Sandbox.Exec，解析顺序为项目 → 全局。
+兼容 wrapper `SetSpecs` / `LookupSpec` 表示全局视图。
 
-**API 暴露**：`GET /api/v1/tools` 返回 `[]ToolInfo`（含 `dynamic` flag
-+ `source` YAML 路径），前端 `ToolListDrawer` 渲染。
+**API 暴露**：
+- `GET /api/v1/tools` 返回全局视图；`GET /api/v1/tools?session_id=<id>` 返回该会话项目合成视图。
+- `tools[]` 含 `dynamic` flag、`scope` (`builtin|global|project`)、`source` YAML 路径和可选 `project_root`，前端 `ToolListDrawer` 渲染为内置 / 全局自定义 / 项目自定义。
+- `diagnostics[]` 含每个动态 YAML 的 `source`、`scope`、`project_root`、`status`、`error`、`mod_at`，解析失败时在工具列表抽屉顶部展示。
+- `POST /api/v1/tools/:name/trial` 支持同样的 `?session_id=<id>`，确保试运行的是 GUI 当前看到的项目覆盖版本。body 为 `{ arguments, dry_run }`；`dry_run=true` 调 `dynamic.Preview` 渲染命令 / URL / echo 文本但不执行；`dry_run=false` 调当前 registry handler，返回 `{ status, result, elapsed }` 给 GUI 最近结果面板。
 
 **限制（v1）**：
 - 无 trust-level / signature 校验（用户自管 `~/.p-chat/`）
-- 无项目级 `tools/` 目录（仅全局）
-- 不做 schema 自动校验（依赖 YAML `parameters` 字段）
+- 项目级工具目录只在会话绑定项目时按需扫描，暂不做独立项目 watcher。
+- 当前校验覆盖必填字段、template 类型、template 必要字段、sandbox 枚举、parameters 顶层对象；GUI 参数表单覆盖 string / number / boolean / enum 的基础输入，尚未做完整 JSON Schema 语义校验或复杂对象参数表单生成。
 
 ## 相关模块
 

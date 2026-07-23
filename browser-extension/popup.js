@@ -54,7 +54,11 @@ async function refreshStatus() {
       statusEl.textContent = '未知';
       return;
     }
-    if (resp.connected) {
+    if (resp.updateRequired) {
+      statusEl.textContent = resp.updateMessage || '扩展需要更新，请重新下载';
+      statusRow.className = 'row status-reconnecting';
+      if (resp.browserID) browserIDEl.textContent = resp.browserID;
+    } else if (resp.connected) {
       statusEl.textContent = '已连接';
       statusRow.className = 'row status-connected';
       if (resp.browserID) browserIDEl.textContent = resp.browserID;

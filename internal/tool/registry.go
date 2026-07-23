@@ -217,6 +217,31 @@ func resolveToProjectRoot(ctx context.Context, p string) string {
 	return filepath.Clean(p)
 }
 
+type ToolOriginScope string
+
+const (
+	ToolOriginBuiltin ToolOriginScope = "builtin"
+	ToolOriginGlobal  ToolOriginScope = "global"
+	ToolOriginProject ToolOriginScope = "project"
+)
+
+type ToolOrigin struct {
+	Scope       ToolOriginScope `json:"scope"`
+	Source      string          `json:"source,omitempty"`
+	ProjectRoot string          `json:"project_root,omitempty"`
+}
+
+type ToolEntry struct {
+	Tool
+	Origin ToolOrigin
+}
+
+type dynamicToolEntry struct {
+	tool    Tool
+	handler ToolHandler
+	origin  ToolOrigin
+}
+
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]ToolHandler
@@ -227,15 +252,22 @@ type Registry struct {
 	// tools differently from built-ins. Empty for
 	// built-ins (their entries are never written).
 	sources map[string]string
+
+	// dynamicEntries stores dynamic tools by origin scope. The
+	// effective view is resolved per projectRoot so project-level
+	// tools can override global tools without mutating the built-in
+	// registry or leaking into other sessions.
+	dynamicEntries map[string]dynamicToolEntry
 }
 
 type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, error)
 
 func NewRegistry() *Registry {
 	return &Registry{
-		tools:   make(map[string]ToolHandler),
-		meta:    make(map[string]Tool),
-		sources: make(map[string]string),
+		tools:          make(map[string]ToolHandler),
+		meta:           make(map[string]Tool),
+		sources:        make(map[string]string),
+		dynamicEntries: make(map[string]dynamicToolEntry),
 	}
 }
 
@@ -246,19 +278,92 @@ func (r *Registry) Register(t Tool, h ToolHandler) {
 	r.meta[t.Name] = t
 }
 
-// RegisterWithSource is the P3-2 dynamic-watcher's
-// Register variant. Records the YAML path under
-// `sources[name]` so the GET /api/v1/tools endpoint can
-// flag this tool as user-defined and surface the source
-// path in the UI. Built-in registration uses plain
-// Register, which leaves the source entry empty.
+// RegisterWithSource is the compatibility wrapper for global dynamic tools.
+// New project-aware code should prefer SetDynamicSnapshot so unregisters stay
+// isolated to one origin scope.
 func (r *Registry) RegisterWithSource(t Tool, h ToolHandler, source string) {
-	r.Register(t, h)
-	if source != "" {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		r.sources[t.Name] = source
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	origin := ToolOrigin{Scope: ToolOriginGlobal, Source: source}
+	r.dynamicEntries[dynamicKey(origin, t.Name)] = dynamicToolEntry{tool: t, handler: h, origin: origin}
+	r.rebuildLegacyDynamicLocked()
+}
+
+// ToolEntryHandler is one dynamic tool plus the handler generated from its spec.
+type ToolEntryHandler struct {
+	Tool    Tool
+	Handler ToolHandler
+	Origin  ToolOrigin
+}
+
+func dynamicKey(origin ToolOrigin, name string) string {
+	return string(origin.Scope) + "\x00" + origin.ProjectRoot + "\x00" + name
+}
+
+func sameOrigin(a, b ToolOrigin) bool {
+	return a.Scope == b.Scope && a.ProjectRoot == b.ProjectRoot
+}
+
+// SetDynamicSnapshot replaces every dynamic tool for one origin scope. Project
+// snapshots are independent from global snapshots, so deleting a project YAML
+// naturally falls back to a global tool with the same name.
+func (r *Registry) SetDynamicSnapshot(origin ToolOrigin, entries map[string]ToolEntryHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, entry := range r.dynamicEntries {
+		if sameOrigin(entry.origin, origin) {
+			delete(r.dynamicEntries, key)
+		}
 	}
+	for name, entry := range entries {
+		entry.Origin.Scope = origin.Scope
+		entry.Origin.ProjectRoot = origin.ProjectRoot
+		if entry.Origin.Source == "" {
+			entry.Origin.Source = entry.Tool.Name
+		}
+		r.dynamicEntries[dynamicKey(entry.Origin, name)] = dynamicToolEntry{tool: entry.Tool, handler: entry.Handler, origin: entry.Origin}
+	}
+	r.rebuildLegacyDynamicLocked()
+}
+
+// ClearDynamicSnapshot removes all dynamic tools for one origin scope.
+func (r *Registry) ClearDynamicSnapshot(origin ToolOrigin) {
+	r.SetDynamicSnapshot(origin, nil)
+}
+
+func (r *Registry) rebuildLegacyDynamicLocked() {
+	for name, src := range r.sources {
+		if src != "" {
+			delete(r.tools, name)
+			delete(r.meta, name)
+			delete(r.sources, name)
+		}
+	}
+	for _, entry := range r.effectiveDynamicLocked("") {
+		if entry.origin.Scope != ToolOriginGlobal {
+			continue
+		}
+		r.tools[entry.tool.Name] = entry.handler
+		r.meta[entry.tool.Name] = entry.tool
+		r.sources[entry.tool.Name] = entry.origin.Source
+	}
+}
+
+func (r *Registry) effectiveDynamicLocked(projectRoot string) map[string]dynamicToolEntry {
+	out := map[string]dynamicToolEntry{}
+	for _, entry := range r.dynamicEntries {
+		if entry.origin.Scope == ToolOriginGlobal {
+			out[entry.tool.Name] = entry
+		}
+	}
+	if projectRoot != "" {
+		for _, entry := range r.dynamicEntries {
+			if entry.origin.Scope == ToolOriginProject && entry.origin.ProjectRoot == projectRoot {
+				out[entry.tool.Name] = entry
+			}
+		}
+	}
+	return out
 }
 
 // RegisterForTest registers a tool with a no-op handler. Tests
@@ -280,6 +385,11 @@ func (r *Registry) Unregister(name string) {
 	delete(r.tools, name)
 	delete(r.meta, name)
 	delete(r.sources, name)
+	for key, entry := range r.dynamicEntries {
+		if entry.tool.Name == name && entry.origin.Scope == ToolOriginGlobal {
+			delete(r.dynamicEntries, key)
+		}
+	}
 }
 
 // SourceFile returns the YAML path the dynamic watcher
@@ -294,8 +404,17 @@ func (r *Registry) SourceFile(name string) (string, bool) {
 }
 
 func (r *Registry) Get(name string) (ToolHandler, bool) {
+	return r.GetForProject(name, "")
+}
+
+func (r *Registry) GetForProject(name, projectRoot string) (ToolHandler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if projectRoot != "" {
+		if entry, ok := r.effectiveDynamicLocked(projectRoot)[name]; ok {
+			return entry.handler, true
+		}
+	}
 	h, ok := r.tools[name]
 	return h, ok
 }
@@ -304,8 +423,17 @@ func (r *Registry) Get(name string) (ToolHandler, bool) {
 // you need both the description and the handler (e.g. to clone a registry
 // without a specific tool).
 func (r *Registry) Lookup(name string) (Tool, ToolHandler, bool) {
+	return r.LookupForProject(name, "")
+}
+
+func (r *Registry) LookupForProject(name, projectRoot string) (Tool, ToolHandler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if projectRoot != "" {
+		if entry, ok := r.effectiveDynamicLocked(projectRoot)[name]; ok {
+			return entry.tool, entry.handler, true
+		}
+	}
 	h, hok := r.tools[name]
 	t, tok := r.meta[name]
 	if !hok || !tok {
@@ -316,28 +444,78 @@ func (r *Registry) Lookup(name string) (Tool, ToolHandler, bool) {
 
 // Names returns the registered tool names in sorted order.
 func (r *Registry) Names() []string {
+	return r.NamesForProject("")
+}
+
+func (r *Registry) NamesForProject(projectRoot string) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	seen := make(map[string]bool, len(r.meta))
 	names := make([]string, 0, len(r.meta))
 	for name := range r.meta {
+		seen[name] = true
 		names = append(names, name)
+	}
+	for name := range r.effectiveDynamicLocked(projectRoot) {
+		if !seen[name] {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	return names
 }
 
 func (r *Registry) List() []Tool {
+	return r.ListForProject("")
+}
+
+func (r *Registry) ListForProject(projectRoot string) []Tool {
+	entries := r.ListEntriesForProject(projectRoot)
+	tools := make([]Tool, 0, len(entries))
+	for _, entry := range entries {
+		tools = append(tools, entry.Tool)
+	}
+	return tools
+}
+
+func (r *Registry) ListEntriesForProject(projectRoot string) []ToolEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	tools := make([]Tool, 0, len(r.meta))
-	for _, t := range r.meta {
+	byName := make(map[string]ToolEntry, len(r.meta))
+	for name, t := range r.meta {
+		origin := ToolOrigin{Scope: ToolOriginBuiltin}
+		if src, ok := r.sources[name]; ok && src != "" {
+			origin = ToolOrigin{Scope: ToolOriginGlobal, Source: src}
+		}
+		byName[name] = ToolEntry{Tool: t, Origin: origin}
+	}
+	for name, entry := range r.effectiveDynamicLocked(projectRoot) {
+		byName[name] = ToolEntry{Tool: entry.tool, Origin: entry.origin}
+	}
+	tools := make([]ToolEntry, 0, len(byName))
+	for _, t := range byName {
 		tools = append(tools, t)
 	}
-	// Sort by name for byte-stable output (LLM cache stability).
 	sort.Slice(tools, func(i, j int) bool {
+		if tools[i].Origin.Scope != tools[j].Origin.Scope {
+			return scopeRank(tools[i].Origin.Scope) < scopeRank(tools[j].Origin.Scope)
+		}
 		return tools[i].Name < tools[j].Name
 	})
 	return tools
+}
+
+func scopeRank(scope ToolOriginScope) int {
+	switch scope {
+	case ToolOriginBuiltin:
+		return 0
+	case ToolOriginGlobal:
+		return 1
+	case ToolOriginProject:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // ObjectSchema is a helper to build a JSON-schema-like parameter object.
@@ -386,8 +564,8 @@ func RegisterBuiltin(r *Registry) {
 		Name:        "exec_command",
 		Description: "Execute a shell command on the local system. Returns stdout+stderr combined. Use for running scripts, system operations, and one-off commands.",
 		Parameters: ObjectSchema(map[string]any{
-			"command":   StringProp("The shell command to execute (cmd.exe syntax on Windows)"),
-			"work_dir":  StringProp("Optional working directory for the command"),
+			"command":  StringProp("The shell command to execute (cmd.exe syntax on Windows)"),
+			"work_dir": StringProp("Optional working directory for the command"),
 			// P2-4: dry-run flag. When true the tool
 			// runs the sandbox check + a "would
 			// execute" preview, but does NOT actually
@@ -400,7 +578,7 @@ func RegisterBuiltin(r *Registry) {
 	}, handleExecCommand)
 
 	r.Register(Tool{
-		Name:        "read_file",
+		Name: "read_file",
 		Description: "Read the full contents of a TEXT file. Use for inspecting source files, configs, or any text artifact. " +
 			"DO NOT call read_file on images, audio, video, PDFs, archives, or any binary file �?" +
 			"those will return a binary error. " +

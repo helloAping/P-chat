@@ -197,7 +197,7 @@ header 透传 / 缺失生成 / 互不重复 / CORS 允许。
 
 ### 9. 工具列表 API (P3-2, 2026-07-16)
 
-`GET /api/v1/tools` 返回 `[]ToolInfo`：
+`GET /api/v1/tools` 返回 `[]ToolInfo`；可加 `?session_id=<id>` 获取当前会话项目合成视图：
 ```json
 {
   "tools": [
@@ -205,23 +205,68 @@ header 透传 / 缺失生成 / 互不重复 / CORS 允许。
       "name": "exec_command",
       "description": "执行 shell 命令",
       "parameters": {...},
-      "dynamic": false
+      "dynamic": false,
+      "scope": "builtin"
     },
     {
       "name": "greet",
       "description": "向用户问好",
       "parameters": {...},
       "dynamic": true,
+      "scope": "global",
       "source": "/home/u/.p-chat/tools/greet.yaml"
+    },
+    {
+      "name": "project_greet",
+      "description": "项目内问好",
+      "parameters": {...},
+      "dynamic": true,
+      "scope": "project",
+      "source": "/repo/.p-chat/tools/project_greet.yaml",
+      "project_root": "/repo"
     }
   ]
 }
 ```
 
-- `dynamic=true` 的工具由 P3-2 watcher 从 `~/.p-chat/tools/*.yaml` 加载
-- `source` 是 YAML 绝对路径（前端 `ToolListDrawer` 显示"查看源码"）
-- 顺序：built-in (alphabetical) → dynamic (alphabetical)
-- 前端缓存路径：直接读 `state.tools` 或调 `api.listTools()`
+- `scope=builtin|global|project` 标记工具来源；项目工具只在绑定该项目的 session 视图中出现
+- 项目工具同名覆盖全局动态工具，响应只返回当前有效版本
+- `diagnostics[]` 同样带 `scope/project_root`，只返回全局 + 当前项目的加载诊断
+- `POST /api/v1/tools/:name/trial?session_id=<id>` 与工具列表使用同一项目视图，dry-run / real-run 都会调用当前有效版本
+- 前端缓存路径：直接读 `state.tools` 或调 `api.listToolsDetailed(sessionId)`
+
+### 10. 浏览器控制状态 API
+
+`GET /api/v1/browser/status` 返回浏览器控制总状态：`enabled`、`count`、
+`http_url`、`ws_url`、`expected_protocol_version`、`last_error`。
+
+`GET /api/v1/browser/list` 返回已连接浏览器列表：除 `id`、`name`、
+`connected_at` 外，还包含 `tabs_count`、`active_tab_id/title/url`、
+`extension_version`、`protocol_version`、`protocol_compatible`、
+`update_required`、`update_message`、`last_seen_at`、`last_error`。
+GUI 浏览器 Tab 用这些字段做连接诊断、控制目标摘要和扩展更新提示。
+
+`GET /api/v1/browser/:id/tabs` 向扩展查询当前标签页列表，并刷新服务端缓存的
+preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
+（含 `id/index/title/url/active/preferred`）。
+
+`POST /api/v1/browser/:id/active-tab` 设置控制目标标签页，body 为
+`{ "tab_id": number }` 或 `{ "index": number }`，内部调用 `browser/tabs`
+的 `select` 动作，再返回最新 tabs 列表。
+
+### 11. 浏览器工具权限（BR-04）
+
+`browser_*` 工具在 handler 内按 `BrowserConfig` 决策（见 `internal/browser/policy.go`）：
+
+- `require_confirm`: `never` | `dangerous`(默认) | `always`
+- `allowed_hosts` / `blocked_hosts` / `sensitive_hosts`：域名模式（支持 `*.example.com`）
+- 高风险动作（type / file_upload / evaluate）与敏感域触发 `tool_confirm` SSE
+- 确认复用 `tool.RequireConfirm` + `ToolConfirmModal`（`path_class=browser`，`resolved_path`=页面 URL）
+- 会话权限 `full` / `/unsafe once` 跳过确认；`blocked_hosts` 仍硬拦截
+
+### 12. 浏览器 E2E（BR-05）
+
+`go test ./internal/browser -run E2E`：模拟扩展夹具覆盖连接、导航/点击/输入/截图、断线重连、策略拦截与 Manager 动态注册。不依赖真实 Chrome。
 
 ## 修改指南
 

@@ -30,24 +30,32 @@ type scanJob struct {
 	current   int // files processed
 	total     int // total files found
 	chunks    int // chunks indexed
+	changed   int
+	skipped   int
+	deleted   int
+	failed    int
 	cancel    context.CancelFunc
 }
 
 type scanProgressResp struct {
-	Chunks   int    `json:"chunks"`
-	Done     bool   `json:"done"`
-	Error    string `json:"error,omitempty"`
-	Current  int    `json:"current"`
-	Total    int    `json:"total"`
-	Message  string `json:"message,omitempty"`
+	Chunks  int    `json:"chunks"`
+	Done    bool   `json:"done"`
+	Error   string `json:"error,omitempty"`
+	Current int    `json:"current"`
+	Total   int    `json:"total"`
+	Changed int    `json:"changed,omitempty"`
+	Skipped int    `json:"skipped,omitempty"`
+	Deleted int    `json:"deleted,omitempty"`
+	Failed  int    `json:"failed,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // ---- Request / response types ----
 
 type knowledgeConfigResponse struct {
-	Enabled   bool                     `json:"enabled"`
-	AutoIndex bool                     `json:"auto_index"`
-	Bases     []knowledgeBaseResponse  `json:"bases"`
+	Enabled   bool                    `json:"enabled"`
+	AutoIndex bool                    `json:"auto_index"`
+	Bases     []knowledgeBaseResponse `json:"bases"`
 }
 
 type knowledgeBaseResponse struct {
@@ -297,17 +305,28 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 		return
 	}
 	j := v.(*scanJob)
+	resp := scanProgressResp{
+		Chunks:  j.chunks,
+		Current: j.current,
+		Total:   j.total,
+		Changed: j.changed,
+		Skipped: j.skipped,
+		Deleted: j.deleted,
+		Failed:  j.failed,
+	}
 	if strings.HasPrefix(j.status, "ok: ") {
-		c.JSON(http.StatusOK, scanProgressResp{Chunks: j.chunks, Current: j.current, Total: j.total, Done: true})
+		resp.Done = true
+		c.JSON(http.StatusOK, resp)
 	} else if strings.HasPrefix(j.status, "error: ") {
-		errMsg := strings.TrimPrefix(j.status, "error: ")
-		c.JSON(http.StatusOK, scanProgressResp{Error: errMsg, Done: true})
+		resp.Error = strings.TrimPrefix(j.status, "error: ")
+		resp.Done = true
+		c.JSON(http.StatusOK, resp)
 	} else {
-		msg := "扫描中..."
+		resp.Message = "扫描中..."
 		if j.status == "counting" {
-			msg = "正在统计文件..."
+			resp.Message = "正在统计文件..."
 		}
-		c.JSON(http.StatusOK, scanProgressResp{Current: j.current, Total: j.total, Chunks: j.chunks, Message: msg})
+		c.JSON(http.StatusOK, resp)
 	}
 }
 
@@ -470,17 +489,23 @@ func (h *Handler) DeleteNode(c *gin.Context) {
 }
 
 // SearchKnowledge POST /api/v1/knowledge/search
-
-// SearchKnowledge POST /api/v1/knowledge/search
+//
+// KB-01: searches every enabled base, tags each hit with its base name,
+// normalises scores per-base, dedupes identical fragments, and returns
+// a globally re-ranked top-k list. The early-exit that previously
+// stopped after the first base filled topK is gone — every base is
+// always queried so a strong match in base N is not drowned by
+// weak matches in base 1.
 func (h *Handler) SearchKnowledge(c *gin.Context) {
 	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
 	}
 	var req struct {
-		Query string `json:"query"`
-		TopK  int    `json:"top_k"`
-		Grep  string `json:"grep"`
+		Query string   `json:"query"`
+		TopK  int      `json:"top_k"`
+		Grep  string   `json:"grep"`
+		Bases []string `json:"bases"` // optional subset; empty = all enabled
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
@@ -502,64 +527,122 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	type resultItem struct {
-		Source     string  `json:"source"`
-		Content    string  `json:"content"`
-		Similarity float64 `json:"similarity"`
-		Rank       int     `json:"rank"`
+		Source      string             `json:"source"`
+		Content     string             `json:"content"`
+		Similarity  float64            `json:"similarity"`
+		Rank        int                `json:"rank"`
+		Base        string             `json:"base,omitempty"`
+		Title       string             `json:"title,omitempty"`
+		MatchType   string             `json:"match_type,omitempty"`
+		Query       string             `json:"query,omitempty"`
+		Explanation string             `json:"explanation,omitempty"`
+		Citation    knowledge.Citation `json:"citation"`
 	}
-	var out []resultItem
-	// Search ALL configured bases (not just Bases[0]). For each
-	// base, take up to req.TopK matches, then merge and re-truncate
-	// to req.TopK so a multi-base search returns the best hits
-	// overall rather than silently dropping everything past the
-	// first base.
+
+	// Resolve which bases to search.
+	want := map[string]bool{}
+	for _, n := range req.Bases {
+		if n != "" {
+			want[n] = true
+		}
+	}
+	plan := knowledge.PlanQueries(req.Query)
+	queries := plan.Queries
+	if len(queries) == 0 {
+		queries = []string{req.Query}
+	}
+	var candidates []knowledge.IndexSearchItem
+	// Per-base window: fetch more than TopK so merge has headroom
+	// after normalisation + dedupe. Cap at 50 (LookupSearch max).
+	perBase := req.TopK * 3
+	if perBase < 20 {
+		perBase = 20
+	}
+	if perBase > 50 {
+		perBase = 50
+	}
 	for _, base := range kc.Bases {
-		if len(out) >= req.TopK {
-			break
+		if !base.Enabled {
+			continue
+		}
+		if len(want) > 0 && !want[base.Name] {
+			continue
 		}
 		store, err := knowledge.GetOrOpenWikiStore(base.Name, base.Path)
 		if err != nil {
 			log.Printf("[search] open wiki store %q: %v", base.Name, err)
 			continue
 		}
-		res, err := store.LookupSearch(ctx, req.Query, base.Name, true, 0, 1, req.TopK)
-		if err != nil {
-			log.Printf("[search] lookup in %q: %v", base.Name, err)
-			continue
-		}
-		for _, it := range res.Items {
-			if len(out) >= req.TopK {
-				break
+		for _, q := range queries {
+			res, err := store.LookupSearch(ctx, q, base.Name, true, 0, 1, perBase)
+			if err != nil {
+				log.Printf("[search] lookup in %q: %v", base.Name, err)
+				continue
 			}
-			content := it.Overview
-			if len(it.Children) > 0 {
-				for _, c := range it.Children {
-					content += "\n" + c.Content
+			if res == nil {
+				continue
+			}
+			items := knowledge.TagBase(res.Items, base.Name)
+			for i := range items {
+				if items[i].Query == "" {
+					items[i].Query = q
 				}
 			}
-			if content == "" {
-				content = it.Title
-			}
-			out = append(out, resultItem{
-				Source:     it.Source,
-				Content:    content,
-				Similarity: it.Rank,
-				Rank:       len(out),
-			})
+			candidates = append(candidates, items...)
 		}
 	}
 
-	// Grep actual files.
+	merged := knowledge.MergeAndRerank(candidates, knowledge.MergeOptions{TopK: req.TopK})
+
+	out := make([]resultItem, 0, len(merged))
+	for i, it := range merged {
+		content := it.Overview
+		if len(it.Children) > 0 {
+			for _, child := range it.Children {
+				content += "\n" + child.Content
+			}
+		}
+		if content == "" {
+			content = it.Title
+		}
+		citation := knowledge.BuildCitation(it)
+		out = append(out, resultItem{
+			Source:      it.Source,
+			Content:     content,
+			Similarity:  it.Rank,
+			Rank:        i + 1,
+			Base:        it.Base,
+			Title:       it.Title,
+			MatchType:   it.MatchType,
+			Query:       it.Query,
+			Explanation: citation.Explanation,
+			Citation:    citation,
+		})
+	}
+
+	// Grep actual files (appended after ranked hits, not re-ranked).
 	if req.Grep != "" {
 		for _, gr := range grepKB(h.getCfg(), req.Grep, req.TopK) {
 			if len(out) >= req.TopK {
 				break
 			}
+			source := fmt.Sprintf("%s:%d", gr.Path, gr.Line)
+			citation := knowledge.Citation{
+				Source:      source,
+				Query:       req.Grep,
+				MatchType:   knowledge.MatchContent,
+				Score:       1.0,
+				Explanation: fmt.Sprintf("%s 命中 grep 查询 %q。", source, req.Grep),
+			}
 			out = append(out, resultItem{
-				Source:     fmt.Sprintf("%s:%d", gr.Path, gr.Line),
-				Content:    gr.Content,
-				Similarity: 1.0,
-				Rank:       len(out) + 1,
+				Source:      source,
+				Content:     gr.Content,
+				Similarity:  1.0,
+				Rank:        len(out) + 1,
+				MatchType:   knowledge.MatchContent,
+				Query:       req.Grep,
+				Explanation: citation.Explanation,
+				Citation:    citation,
 			})
 		}
 	}
@@ -567,7 +650,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 	if len(out) > req.TopK {
 		out = out[:req.TopK]
 	}
-	c.JSON(http.StatusOK, gin.H{"query": req.Query, "results": out})
+	c.JSON(http.StatusOK, gin.H{"query": req.Query, "queries": plan.Queries, "results": out})
 }
 
 // (removed: GetEmbedders — vector embedding system deprecated)
@@ -670,9 +753,13 @@ func (h *Handler) startScanJob(name string) error {
 			log.Printf("[scan %s] no indexable files found in %s", name, basePath)
 		}
 
-		l2Count, l3Count, idxErr := h.indexScan(ctx, store, base, basePath, name, func(current int) {
+		stats, idxErr := h.indexScan(ctx, store, base, basePath, name, func(current int) {
 			job.current = current
 		})
+		job.changed = stats.Changed
+		job.skipped = stats.Skipped
+		job.deleted = stats.Deleted
+		job.failed = stats.Failed
 		if idxErr != nil {
 			job.status = fmt.Sprintf("error: %v", idxErr)
 			if strings.Contains(idxErr.Error(), "delete") && strings.Contains(idxErr.Error(), "re-scan") {
@@ -682,11 +769,15 @@ func (h *Handler) startScanJob(name string) error {
 			return
 		}
 
-		job.status = fmt.Sprintf("ok: %d L2 files, %d L3 sections", l2Count, l3Count)
+		job.status = fmt.Sprintf("ok: %d changed, %d skipped, %d deleted, %d failed, %d L3 sections", stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L3)
 		job.total = fileCount
 		job.current = fileCount
-		job.chunks = l3Count
-		log.Printf("[scan %s] done: %d L2 files, %d L3 sections", name, l2Count, l3Count)
+		job.chunks = stats.L3
+		job.changed = stats.Changed
+		job.skipped = stats.Skipped
+		job.deleted = stats.Deleted
+		job.failed = stats.Failed
+		log.Printf("[scan %s] done: changed=%d skipped=%d deleted=%d failed=%d L2=%d L3=%d", name, stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L2, stats.L3)
 	}()
 	return nil
 }
@@ -849,36 +940,45 @@ func truncateContent(s string, max int) string {
 	return s[:max] + "..."
 }
 
-
-
 // mediaScan walks the directory for media files (images/video/audio/pdf) and
 // uses the configured LLM to describe each file. Results are added to the wiki
 // store as sections keyed by relative path. Returns number of media sections indexed.
 
-
 // ── Three-level index scan pipeline ──
+type indexScanStats struct {
+	L2      int
+	L3      int
+	Changed int
+	Skipped int
+	Deleted int
+	Failed  int
+}
+
 // indexScan walks the base directory and generates L1/L2/L3 index nodes
 // plus ContentNode leaves for FTS5 searching and prompt injection.
 
-func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string, progress func(current int)) (int, int, error) {
+func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, base *config.KnowledgeBase, dir, baseName string, progress func(current int)) (indexScanStats, error) {
 	if _, err := os.Stat(dir); err != nil {
-		return 0, 0, fmt.Errorf("stat %s: %w", dir, err)
+		return indexScanStats{}, fmt.Errorf("stat %s: %w", dir, err)
 	}
 	dir, _ = filepath.Abs(dir)
 
-	// Phase 1: walk → collect L3 nodes + contents per file.
 	type fileData struct {
 		source   string
 		kind     string
+		mtime    int64
 		nodes    []knowledge.IndexNode
 		contents []knowledge.ContentNode
 	}
+
+	stats := indexScanStats{}
+	currentSources := map[string]bool{}
 	var files []fileData
-	totalL3 := 0
 
 	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			stats.Failed++
+			return nil
 		}
 		if info.IsDir() {
 			name := info.Name()
@@ -890,23 +990,32 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 		ext := strings.ToLower(filepath.Ext(path))
 		kind := "text"
 		if knowledge.IsMediaFile(ext, []string{}) != "" {
-			return nil // Media handled separately.
-		}
-		if !knowledge.IndexableExtensions[ext] {
 			return nil
 		}
-		if info.Size() > 5*1024*1024 {
+		if !knowledge.IndexableExtensions[ext] || info.Size() > 5*1024*1024 {
 			return nil
 		}
 		rel, _ := filepath.Rel(dir, path)
 		rel = filepath.ToSlash(rel)
-
-		text, readErr := knowledge.ReadFileText(path)
-		if readErr != nil {
+		currentSources[rel] = true
+		mtime := info.ModTime().UnixNano()
+		if prev, err := store.GetFileMtime(ctx, baseName, rel); err == nil && prev == mtime {
+			stats.Skipped++
+			if progress != nil {
+				progress(stats.Changed + stats.Skipped + stats.Failed)
+			}
 			return nil
 		}
 
-		// Build heading tree → L3 nodes.
+		text, readErr := knowledge.ReadFileText(path)
+		if readErr != nil {
+			stats.Failed++
+			if progress != nil {
+				progress(stats.Changed + stats.Skipped + stats.Failed)
+			}
+			return nil
+		}
+
 		roots := knowledge.BuildHeadingTree(text, 3)
 		var nodes []knowledge.IndexNode
 		var contents []knowledge.ContentNode
@@ -922,63 +1031,33 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 				title := node.Title
 				overview := truncateText(aggregated, 500)
 				keywords := ""
-				// If scan model is configured, generate keywords + overview via LLM.
 				if base.ScanModel != "" && h.agent != nil {
 					if idx, e := h.buildIndexEntry(ctx, base, node.Title, "", aggregated); e == nil && idx != "" {
 						keywords, overview = parseKWAndOverview(idx)
 					}
 				}
-				nodes = append(nodes, knowledge.IndexNode{
-					Level:     3,
-					Source:    rel,
-					Kind:      kind,
-					SortOrder: seq,
-					Title:     title,
-					Keywords:  keywords,
-					Overview:  overview,
-				})
+				nodes = append(nodes, knowledge.IndexNode{Level: 3, Source: rel, Kind: kind, SortOrder: seq, Title: title, Keywords: keywords, Overview: overview})
 				seq++
-				// Content leaf.
-				content := truncateText(aggregated, 3000)
-				contents = append(contents, knowledge.ContentNode{
-					Content:     content,
-					ContentType: "text",
-					SortOrder:   0,
-				})
+				contents = append(contents, knowledge.ContentNode{Content: truncateText(aggregated, 3000), ContentType: "text", SortOrder: 0})
 				walkNodes(node.Children)
 			}
 		}
 		walkNodes(roots)
 
-		// Fallback: no headings → whole file as one L3.
 		if len(nodes) == 0 && text != "" {
 			title := rel
 			if idx := strings.LastIndex(rel, "/"); idx >= 0 {
 				title = rel[idx+1:]
 			}
-			overview := truncateText(text, 500)
-			nodes = append(nodes, knowledge.IndexNode{
-				Level:     3,
-				Source:    rel,
-				Kind:      kind,
-				SortOrder: 0,
-				Title:     title,
-				Keywords:  "",
-				Overview:  overview,
-			})
-			contents = append(contents, knowledge.ContentNode{
-				Content:     truncateText(text, 3000),
-				ContentType: "text",
-				SortOrder:   0,
-			})
+			nodes = append(nodes, knowledge.IndexNode{Level: 3, Source: rel, Kind: kind, SortOrder: 0, Title: title, Overview: truncateText(text, 500)})
+			contents = append(contents, knowledge.ContentNode{Content: truncateText(text, 3000), ContentType: "text", SortOrder: 0})
 		}
-
 		if len(nodes) > 0 {
-			files = append(files, fileData{source: rel, kind: kind, nodes: nodes, contents: contents})
-			totalL3 += len(nodes)
+			files = append(files, fileData{source: rel, kind: kind, mtime: mtime, nodes: nodes, contents: contents})
+			stats.Changed++
 		}
 		if progress != nil {
-			progress(len(files))
+			progress(stats.Changed + stats.Skipped + stats.Failed)
 		}
 		return nil
 	})
@@ -986,95 +1065,57 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 		log.Printf("[index-scan %s] walk error: %v", baseName, walkErr)
 	}
 
-	// Phase 2: aggregate L2 per file.
-	l2Nodes := make([]knowledge.IndexNode, 0, len(files))
 	for fi, fd := range files {
-		titles := make([]string, 0, len(fd.nodes))
-		for _, n := range fd.nodes {
-			titles = append(titles, n.Title)
-		}
-		// Use filename as L2 title.
 		title := fd.source
 		if idx := strings.LastIndex(fd.source, "/"); idx >= 0 {
 			title = fd.source[idx+1:]
 		}
 		overview := fmt.Sprintf("%s (%d chapters)", title, len(fd.nodes))
-		// Aggregate L3 info into L2 overview line.
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("· %s — 关键词: %s — %s — %d 章节",
-			title, "", overview, len(fd.nodes)))
+		sb.WriteString(fmt.Sprintf("· %s — 关键词: %s — %s — %d 章节", title, "", overview, len(fd.nodes)))
 		for _, n := range fd.nodes {
 			if len(n.Overview) > 0 {
 				sb.WriteString(" | " + n.Title)
 				break
 			}
 		}
-		l2Node := knowledge.IndexNode{
-			ParentID:  1, // Will be set to real L1 ID after insert.
-			Level:     2,
-			Source:    fd.source,
-			Kind:      fd.kind,
-			SortOrder: fi,
-			Title:     title,
-			Keywords:  "",
-			Overview:  sb.String(),
+		l2 := knowledge.IndexNode{Level: 2, Source: fd.source, Kind: fd.kind, SortOrder: fi, Title: title, Overview: sb.String()}
+		if err := store.ReplaceSourceNodes(ctx, baseName, fd.source, []knowledge.IndexNode{l2}, fd.nodes, fd.contents); err != nil {
+			stats.Failed++
+			log.Printf("[index-scan %s] replace source %s: %v", baseName, fd.source, err)
+			continue
 		}
-		l2Nodes = append(l2Nodes, l2Node)
+		_ = store.SetFileMtime(ctx, baseName, fd.source, fd.mtime)
 	}
-
-	// Phase 3: place L1 node.
-	l1Overview := buildL1Overview(l2Nodes)
-	l1Node := knowledge.IndexNode{
-		ParentID:  0,
-		Base:      baseName,
-		Level:     1,
-		Title:     baseName,
-		Keywords:  "",
-		Overview:  l1Overview,
-		SortOrder: 0,
+	deleted, staleErr := store.RemoveStaleSourceNodes(ctx, baseName, currentSources)
+	if staleErr != nil {
+		return stats, fmt.Errorf("remove stale sources: %w", staleErr)
 	}
-
-	// Phase 4: assign IDs and write.
-	nextID := 1
-	l1Node.ID = nextID
-	nextID++
-	for i := range l2Nodes {
-		l2Nodes[i].ID = nextID
-		l2Nodes[i].ParentID = l1Node.ID
-		l2Nodes[i].Base = baseName
-		nextID++
-	}
-	var allContents []knowledge.ContentNode
-	for fi, fd := range files {
-		l2ID := l2Nodes[fi].ID
-		for i := range fd.nodes {
-			fd.nodes[i].ID = nextID
-			fd.nodes[i].ParentID = l2ID
-			fd.nodes[i].Base = baseName
-			nextID++
+	stats.Deleted = deleted
+	if nodes, err := store.ListNodes(ctx, baseName); err == nil {
+		stats.L2, stats.L3 = countIndexedLevels(nodes)
+	} else {
+		stats.L2 = len(files)
+		for _, fd := range files {
+			stats.L3 += len(fd.nodes)
 		}
-		for i := range fd.contents {
-			fd.contents[i].NodeID = fd.nodes[i].ID
+	}
+
+	log.Printf("[index-scan %s] incremental: changed=%d skipped=%d deleted=%d failed=%d L2=%d L3=%d",
+		baseName, stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L2, stats.L3)
+	return stats, nil
+}
+
+func countIndexedLevels(nodes []knowledge.NodeTreeItem) (l2, l3 int) {
+	for _, n := range nodes {
+		switch n.Level {
+		case 2:
+			l2++
+		case 3:
+			l3++
 		}
-		allContents = append(allContents, fd.contents...)
 	}
-	allL3s := make([]knowledge.IndexNode, 0, totalL3)
-	for _, fd := range files {
-		allL3s = append(allL3s, fd.nodes...)
-	}
-
-	allNodes := make([]knowledge.IndexNode, 0, 1+len(l2Nodes)+len(allL3s))
-	allNodes = append(allNodes, l1Node)
-	allNodes = append(allNodes, l2Nodes...)
-	allNodes = append(allNodes, allL3s...)
-
-	if err := store.ReplaceBaseNodes(ctx, baseName, allNodes, allContents); err != nil {
-		return 0, 0, fmt.Errorf("write index: %w", err)
-	}
-
-	log.Printf("[index-scan %s] indexed %d files → L1 + %d L2 + %d L3 + %d contents",
-		baseName, len(files), len(l2Nodes), len(allL3s), len(allContents))
-	return len(l2Nodes), len(allL3s), nil
+	return l2, l3
 }
 
 func buildL1Overview(l2Nodes []knowledge.IndexNode) string {

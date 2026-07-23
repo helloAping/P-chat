@@ -96,8 +96,9 @@ async function openTerminal() {
 }
 
 // showToolList toggles the P3-2 ToolListDrawer.
-// Kept local (not in the chat store) because the tool
-// list is per-server, not per-session.
+// Kept local (not in the chat store); the drawer fetches a
+// session-scoped tool view when it opens so project tools follow
+// the active conversation.
 const showToolList = ref(false)
 const message = useMessage()
 

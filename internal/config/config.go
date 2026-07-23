@@ -493,6 +493,27 @@ type BrowserConfig struct {
 	// writes to the page (fetch, postMessage, etc.). When false
 	// (default), only read-only expressions are allowed.
 	AllowEvalWrite bool `json:"allow_eval_write,omitempty"`
+
+	// RequireConfirm (BR-04) controls when browser_* tools wait for
+	// user approval. Allowed values:
+	//   "never"     - never ask (still honour BlockedHosts)
+	//   "dangerous" - ask for mutating / sensitive-domain ops (default)
+	//   "always"    - ask for every browser tool call
+	RequireConfirm string `json:"require_confirm,omitempty"`
+
+	// AllowedHosts are host patterns that auto-allow even mutating
+	// tools under "dangerous" mode (e.g. "localhost", "*.example.com").
+	// Matching is case-insensitive; leading "*." matches subdomains.
+	AllowedHosts []string `json:"allowed_hosts,omitempty"`
+
+	// BlockedHosts are host patterns that always reject browser tools
+	// (hard block, no confirm override).
+	BlockedHosts []string `json:"blocked_hosts,omitempty"`
+
+	// SensitiveHosts force a confirm prompt even for otherwise low-risk
+	// ops (snapshot / extract / navigate) under "dangerous" mode.
+	// Useful for banks, SSO, admin consoles, etc.
+	SensitiveHosts []string `json:"sensitive_hosts,omitempty"`
 }
 
 // SandboxConfig controls which actions LLM-driven tools can take
@@ -842,6 +863,16 @@ func Default() *Config {
 			Enabled:                 false,
 			ScreenshotQuality:       80,
 			MaxScreenshotsInHistory: 3,
+			RequireConfirm:          "dangerous",
+			// Conservative defaults: empty allowlist; a few common
+			// sensitive host patterns so form-fill / click on login
+			// pages always surface a confirm modal.
+			SensitiveHosts: []string{
+				"accounts.google.com",
+				"login.microsoftonline.com",
+				"*.alipay.com",
+				"*.paypal.com",
+			},
 		},
 	}
 }

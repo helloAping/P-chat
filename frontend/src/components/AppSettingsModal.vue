@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 // App-level (software) settings. Split into two tabs by user request:
 //
 //   1. LLM 提供商 — provider / model / API key CRUD
@@ -1112,7 +1112,22 @@ const browserEnabled = ref(false)
 const browserList = ref<api.BrowserInfo[]>([])
 const browserWSURL = ref('')
 const browserHTTPURL = ref('')
+const browserLastError = ref('')
+const browserLastErrorAt = ref('')
+const browserExpectedProtocol = ref('')
+const browserTabsById = ref<Record<string, api.BrowserTabInfo[]>>({})
+const browserTabsLoading = ref<Record<string, boolean>>({})
+const browserActiveSetting = ref<Record<string, boolean>>({})
 let browserPollTimer: ReturnType<typeof setInterval> | null = null
+
+const browserDiagnosticRows = computed(() => [
+  { label: 'HTTP 地址', value: browserHTTPURL.value || '未上报' },
+  { label: 'WebSocket 地址', value: browserWSURL.value || '未上报' },
+  { label: '已连接数量', value: String(browserList.value.length) },
+  { label: '期望协议', value: browserExpectedProtocol.value || '未上报' },
+  { label: '最近错误', value: browserLastError.value || '暂无' },
+])
+const browserUpdateRequired = computed(() => browserList.value.filter(b => b.update_required).length)
 
 async function refreshBrowser() {
   try {
@@ -1121,8 +1136,73 @@ async function refreshBrowser() {
     browserList.value = list.browsers || []
     browserWSURL.value = status.ws_url || ''
     browserHTTPURL.value = status.http_url || ''
+    browserExpectedProtocol.value = status.expected_protocol_version || ''
+    browserLastError.value = status.last_error || ''
+    browserLastErrorAt.value = status.last_error_at || ''
+    // Refresh tab lists for each connected browser (best-effort).
+    for (const b of browserList.value) {
+      void refreshBrowserTabs(b.id, false)
+    }
   } catch (e: any) {
     // Browser endpoints may not be initialised yet; swallow.
+  }
+}
+
+async function refreshBrowserTabs(browserId: string, showError = true) {
+  if (!browserId) return
+  browserTabsLoading.value = { ...browserTabsLoading.value, [browserId]: true }
+  try {
+    const result = await api.listBrowserTabs(browserId)
+    browserTabsById.value = {
+      ...browserTabsById.value,
+      [browserId]: result.tabs || [],
+    }
+  } catch (e: any) {
+    if (showError) {
+      message.error(`加载标签页失败: ${e.message || e}`)
+    }
+  } finally {
+    browserTabsLoading.value = { ...browserTabsLoading.value, [browserId]: false }
+  }
+}
+
+async function onSetActiveBrowserTab(browserId: string, tabId: number) {
+  if (!browserId || !tabId) return
+  browserActiveSetting.value = { ...browserActiveSetting.value, [browserId]: true }
+  try {
+    const result = await api.setBrowserActiveTab(browserId, { tab_id: tabId })
+    browserTabsById.value = {
+      ...browserTabsById.value,
+      [browserId]: result.tabs || [],
+    }
+    // Keep browserList summary in sync with preferred target.
+    const preferred = (result.tabs || []).find(t => t.preferred) || (result.tabs || []).find(t => t.id === tabId)
+    browserList.value = browserList.value.map(b => {
+      if (b.id !== browserId) return b
+      return {
+        ...b,
+        active_tab_id: preferred?.id ?? tabId,
+        active_tab_title: preferred?.title || b.active_tab_title,
+        active_tab_url: preferred?.url || b.active_tab_url,
+        tabs_count: (result.tabs || []).length || b.tabs_count,
+      }
+    })
+    message.success('已设置控制目标标签页')
+  } catch (e: any) {
+    message.error(`设置控制目标失败: ${e.message || e}`)
+  } finally {
+    browserActiveSetting.value = { ...browserActiveSetting.value, [browserId]: false }
+  }
+}
+
+function shortURL(url?: string) {
+  if (!url) return ''
+  try {
+    const u = new URL(url)
+    const path = u.pathname === '/' ? '' : u.pathname
+    return `${u.host}${path}`.slice(0, 64)
+  } catch {
+    return url.slice(0, 64)
   }
 }
 
@@ -2533,19 +2613,107 @@ function kbModelSupportsVision(scanModel: string) {
           <div class="settings-section-header">
             <h3 class="settings-section-title">已连接浏览器 ({{ browserList.length }})</h3>
           </div>
+          <div class="browser-diagnostics">
+            <div
+              v-for="row in browserDiagnosticRows"
+              :key="row.label"
+              class="browser-diagnostic-item"
+            >
+              <span class="browser-diagnostic-label">{{ row.label }}</span>
+              <code
+                v-if="row.label.includes('地址')"
+                class="browser-diagnostic-value"
+              >{{ row.value }}</code>
+              <span
+                v-else
+                class="browser-diagnostic-value"
+                :class="{ 'is-error': row.label === '最近错误' && browserLastError }"
+              >{{ row.value }}</span>
+            </div>
+            <div v-if="browserLastErrorAt" class="browser-diagnostic-note">
+              最近错误时间：{{ browserLastErrorAt }}
+            </div>
+          </div>
           <div v-if="!browserList.length" class="settings-empty">
             暂无连接的浏览器，请先安装扩展
+          </div>
+          <div v-else-if="browserUpdateRequired > 0" class="browser-update-box">
+            <div class="browser-update-title">
+              有 {{ browserUpdateRequired }} 个浏览器扩展需要更新
+            </div>
+            <div class="browser-update-desc">
+              下载最新扩展包后，在 Chrome / Edge 扩展管理页重新加载已解包扩展。
+            </div>
+            <NButton size="tiny" type="warning" ghost tag="a" href="/api/v1/browser/extension" download>
+              下载最新扩展
+            </NButton>
           </div>
           <div
             v-for="b in browserList"
             :key="b.id"
-            class="settings-card server-row"
+            class="settings-card server-row browser-conn-card"
           >
             <div class="server-row-main">
               <div class="server-row-name">{{ b.name || b.id }}</div>
               <div class="server-row-meta">
                 <NTag type="success" size="tiny" :bordered="false">已连接</NTag>
+                <NTag
+                  :type="b.update_required ? 'warning' : 'success'"
+                  size="tiny"
+                  :bordered="false"
+                >
+                  {{ b.update_required ? '需更新扩展' : '协议兼容' }}
+                </NTag>
                 <span class="server-row-count">{{ b.connected_at }}</span>
+                <span class="server-row-count">tab: {{ b.tabs_count ?? 0 }}</span>
+                <span class="server-row-count">扩展: {{ b.extension_version || '未上报' }}</span>
+                <span class="server-row-count">协议: {{ b.protocol_version || '未上报' }}</span>
+                <span class="server-row-count">最后活跃: {{ b.last_seen_at || '未上报' }}</span>
+                <span v-if="b.active_tab_title || b.active_tab_url" class="server-row-count">
+                  控制目标: {{ b.active_tab_title || shortURL(b.active_tab_url) }}
+                </span>
+                <span v-if="b.update_message" class="server-row-error">{{ b.update_message }}</span>
+                <span v-if="b.last_error" class="server-row-error">{{ b.last_error }}</span>
+              </div>
+            </div>
+            <div class="browser-tabs-panel">
+              <div class="browser-tabs-head">
+                <span class="browser-tabs-title">标签页</span>
+                <NButton
+                  size="tiny"
+                  quaternary
+                  :loading="!!browserTabsLoading[b.id]"
+                  @click="refreshBrowserTabs(b.id)"
+                >
+                  刷新
+                </NButton>
+              </div>
+              <div v-if="!(browserTabsById[b.id] || []).length" class="browser-tabs-empty">
+                {{ browserTabsLoading[b.id] ? '加载中…' : '暂无标签页（扩展未上报或协议过旧）' }}
+              </div>
+              <div
+                v-for="t in (browserTabsById[b.id] || [])"
+                :key="`${b.id}-${t.id}`"
+                class="browser-tab-row"
+                :class="{ 'is-preferred': t.preferred }"
+              >
+                <div class="browser-tab-main">
+                  <div class="browser-tab-title">
+                    <NTag v-if="t.preferred" type="primary" size="tiny" :bordered="false">控制目标</NTag>
+                    <NTag v-else-if="t.active" size="tiny" :bordered="false">浏览器前台</NTag>
+                    <span>{{ t.title || '(无标题)' }}</span>
+                  </div>
+                  <div class="browser-tab-url">{{ shortURL(t.url) || t.url }}</div>
+                </div>
+                <NButton
+                  size="tiny"
+                  :type="t.preferred ? 'primary' : 'default'"
+                  :disabled="t.preferred"
+                  :loading="!!browserActiveSetting[b.id]"
+                  @click="onSetActiveBrowserTab(b.id, t.id)"
+                >
+                  {{ t.preferred ? '当前目标' : '设为控制目标' }}
+                </NButton>
               </div>
             </div>
           </div>
@@ -3753,5 +3921,123 @@ code {
 .browser-server-url-box code {
   color: var(--accent);
   user-select: all;
+}
+.browser-diagnostics {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.browser-diagnostic-item {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.browser-diagnostic-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.browser-diagnostic-value {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-all;
+}
+.browser-diagnostic-value.is-error {
+  color: var(--danger, #dc2626);
+}
+
+.browser-conn-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.browser-tabs-panel {
+  border-top: 1px solid var(--border, rgba(255,255,255,0.08));
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.browser-tabs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.browser-tabs-title {
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.85;
+}
+.browser-tabs-empty {
+  font-size: 12px;
+  opacity: 0.6;
+  padding: 4px 0;
+}
+.browser-tab-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-2, rgba(255,255,255,0.03));
+}
+.browser-tab-row.is-preferred {
+  outline: 1px solid var(--accent, #5b8cff);
+  background: color-mix(in srgb, var(--accent, #5b8cff) 10%, transparent);
+}
+.browser-tab-main {
+  min-width: 0;
+  flex: 1;
+}
+.browser-tab-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  line-height: 1.3;
+}
+.browser-tab-title > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-tab-url {
+  margin-top: 2px;
+  font-size: 11px;
+  opacity: 0.65;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-diagnostic-note {
+  grid-column: 1 / -1;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.browser-update-box {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--warning-bg, rgba(245, 158, 11, 0.1));
+  border: 1px solid var(--warning-border, rgba(245, 158, 11, 0.35));
+  border-radius: var(--radius-md);
+}
+.browser-update-title {
+  color: var(--warning-text, #b45309);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.browser-update-desc {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
 }
 </style>

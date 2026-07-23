@@ -22,6 +22,7 @@ type Manager struct {
 	mu       sync.Mutex
 	hub      *BridgeHub
 	registry *tool.Registry
+	policy   PolicyConfig
 	enabled  bool
 	started  bool
 }
@@ -33,8 +34,25 @@ func NewManager(cfg config.BrowserConfig, registry *tool.Registry) *Manager {
 	return &Manager{
 		hub:      hub,
 		registry: registry,
+		policy:   PolicyFromConfig(cfg),
 		enabled:  cfg.Enabled,
 	}
+}
+
+// SetPolicy replaces the BR-04 permission rules (e.g. after a
+// config hot-reload). Safe to call while tools are registered —
+// the next tool call reads the latest policy under the lock.
+func (m *Manager) SetPolicy(cfg config.BrowserConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.policy = PolicyFromConfig(cfg)
+}
+
+// Policy returns a copy of the current permission rules.
+func (m *Manager) Policy() PolicyConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.policy
 }
 
 // Hub returns the underlying BridgeHub, used by the WebSocket
@@ -54,7 +72,7 @@ func (m *Manager) Start() {
 
 	m.hub.SetOnToolsChange(func(hasConnections bool) {
 		if hasConnections {
-			RegisterBrowserTools(m.registry, m.hub)
+			RegisterBrowserTools(m.registry, m.hub, m.Policy)
 			log.Println("[browser] registered browser tools (connection arrived)")
 		} else {
 			UnregisterBrowserTools(m.registry)
@@ -92,7 +110,7 @@ func (m *Manager) SetEnabled(on bool) {
 		UnregisterBrowserTools(m.registry)
 		log.Println("[browser] disabled: browser tools unregistered")
 	} else if m.hub.HasConnections() {
-		RegisterBrowserTools(m.registry, m.hub)
+		RegisterBrowserTools(m.registry, m.hub, m.Policy)
 		log.Println("[browser] enabled: browser tools re-registered (connections present)")
 	}
 }

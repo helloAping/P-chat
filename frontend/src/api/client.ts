@@ -1,4 +1,4 @@
-// Lightweight HTTP client for the pchat-server API.
+﻿// Lightweight HTTP client for the pchat-server API.
 // All requests are JSON unless noted. The streaming endpoint
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
@@ -1467,25 +1467,70 @@ export async function activateReply(
 // ---- P3-2 dynamic tools ----
 
 // Tool is one row of the GET /api/v1/tools response. The
-// `dynamic` flag distinguishes user-defined tools
-// (loaded from ~/.p-chat/tools/*.yaml) from the
-// built-ins; `source` is the YAML path so the
-// ToolListDrawer can show a "view source" link.
+// `dynamic` flag distinguishes YAML-backed tools from built-ins;
+// `scope` tells the drawer whether the YAML came from the global
+// or current project tools directory.
 export interface Tool {
   name: string
   description: string
   parameters?: any
   dynamic: boolean
+  scope?: 'builtin' | 'global' | 'project' | string
   source?: string
+  project_root?: string
+}
+
+export interface ToolLoadDiagnostic {
+  source: string
+  name?: string
+  status: 'loaded' | 'error' | string
+  error?: string
+  scope?: 'global' | 'project' | string
+  project_root?: string
+  mod_at?: string
+}
+
+export interface ToolListResponse {
+  tools: Tool[]
+  diagnostics: ToolLoadDiagnostic[]
+}
+
+export interface ToolTrialResponse {
+  name: string
+  args: string
+  dry_run: boolean
+  status: 'ok' | 'error' | string
+  result: string
+  error?: string
+  elapsed: string
 }
 
 // listTools fetches the current tool registry. Used by
 // the ToolListDrawer; the chat store calls it on mount
 // and after every agent Reload (which the server fires
 // when a dynamic YAML is added / changed / deleted).
+function toolsQuery(sessionId?: string) {
+  return sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
+}
+
 export async function listTools(): Promise<Tool[]> {
-  const res = await jsonFetch<{ tools: Tool[] }>('/api/v1/tools', { method: 'GET' })
+  const res = await jsonFetch<ToolListResponse>('/api/v1/tools', { method: 'GET' })
   return res?.tools || []
+}
+
+export async function listToolsDetailed(sessionId?: string): Promise<ToolListResponse> {
+  const res = await jsonFetch<ToolListResponse>(`/api/v1/tools${toolsQuery(sessionId)}`, { method: 'GET' })
+  return {
+    tools: res?.tools || [],
+    diagnostics: res?.diagnostics || [],
+  }
+}
+
+export async function trialTool(name: string, argumentsValue: Record<string, any>, dryRun: boolean, sessionId?: string): Promise<ToolTrialResponse> {
+  return jsonFetch<ToolTrialResponse>(`/api/v1/tools/${encodeURIComponent(name)}/trial${toolsQuery(sessionId)}`, {
+    method: 'POST',
+    body: JSON.stringify({ arguments: argumentsValue || {}, dry_run: dryRun }),
+  })
 }
 
 // ---- P2-3 context inspector ----
@@ -1589,7 +1634,7 @@ export const scanKnowledgeBase = (name: string) =>
   )
 
 export const getScanStatus = (name: string) =>
-  jsonFetch<{ chunks: number; done: boolean; error?: string; current: number; total: number; message?: string }>(
+  jsonFetch<{ chunks: number; done: boolean; error?: string; current: number; total: number; changed?: number; skipped?: number; deleted?: number; failed?: number; message?: string }>(
     `/api/v1/knowledge/bases/${encodeURIComponent(name)}/scan/status`,
   )
 
@@ -1605,12 +1650,43 @@ export const clearKnowledgeBase = (name: string) =>
     { method: 'DELETE' },
   )
 
-export const searchKnowledge = (query: string, topK?: number) =>
-  jsonFetch<{ query: string; results: Array<{ source: string; content: string; similarity: number; rank: number }> }>(
+export interface KnowledgeCitation {
+  base?: string
+  source?: string
+  title?: string
+  parent_title?: string
+  level?: number
+  kind?: string
+  query?: string
+  match_type?: string
+  score?: number
+  explanation?: string
+}
+
+export interface KnowledgeSearchResult {
+  source: string
+  content: string
+  similarity: number
+  rank: number
+  /** KB-01: originating knowledge base name */
+  base?: string
+  title?: string
+  /** KB-02: why this hit matched (path|filename|title|keywords|overview|l2|content) */
+  match_type?: string
+  /** KB-03: original or derived query that surfaced this hit */
+  query?: string
+  /** KB-04: human-readable provenance summary */
+  explanation?: string
+  /** KB-04: structured provenance metadata */
+  citation?: KnowledgeCitation
+}
+
+export const searchKnowledge = (query: string, topK?: number, bases?: string[]) =>
+  jsonFetch<{ query: string; queries?: string[]; results: KnowledgeSearchResult[] }>(
     '/api/v1/knowledge/search',
     {
       method: 'POST',
-      body: JSON.stringify({ query, top_k: topK || 5 }),
+      body: JSON.stringify({ query, top_k: topK || 5, bases: bases || undefined }),
     },
   )
 
@@ -1771,6 +1847,33 @@ export interface BrowserInfo {
   id: string
   name: string
   connected_at: string
+  tabs_count?: number
+  active_tab_id?: number
+  active_tab_title?: string
+  active_tab_url?: string
+  extension_version?: string
+  protocol_version?: string
+  protocol_compatible: boolean
+  update_required: boolean
+  update_message?: string
+  last_seen_at?: string
+  last_error?: string
+  last_error_at?: string
+}
+
+export interface BrowserTabInfo {
+  id: number
+  index: number
+  window_id?: number
+  title: string
+  url: string
+  active: boolean
+  preferred: boolean
+}
+
+export interface BrowserTabsResult {
+  preferred_tab_id?: number | null
+  tabs: BrowserTabInfo[]
 }
 
 export interface BrowserStatus {
@@ -1778,6 +1881,9 @@ export interface BrowserStatus {
   count: number
   http_url?: string
   ws_url?: string
+  expected_protocol_version?: string
+  last_error?: string
+  last_error_at?: string
 }
 
 export const listBrowsers = () =>
@@ -1790,4 +1896,13 @@ export const updateBrowserConfig = (enabled: boolean) =>
   jsonFetch<{ ok: boolean; enabled: boolean }>('/api/v1/browser/config', {
     method: 'POST',
     body: JSON.stringify({ enabled }),
+  })
+
+export const listBrowserTabs = (browserId: string) =>
+  jsonFetch<BrowserTabsResult>(`/api/v1/browser/${encodeURIComponent(browserId)}/tabs`)
+
+export const setBrowserActiveTab = (browserId: string, body: { tab_id?: number; index?: number }) =>
+  jsonFetch<BrowserTabsResult>(`/api/v1/browser/${encodeURIComponent(browserId)}/active-tab`, {
+    method: 'POST',
+    body: JSON.stringify(body),
   })

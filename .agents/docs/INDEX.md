@@ -25,6 +25,8 @@
 | 修改沙箱/安全检查 | [infrastructure.md](infrastructure.md) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
+| 回答用户“agent 功能怎么用 / GUI 怎么操作” | [../../README.md](../../README.md)「GUI 操作入口速查 / 常见问题」 | agent.md, tool.md, frontend.md |
+| 查看当前项目现状与可做事项 | [../../docs/feature-opportunities.md](../../docs/feature-opportunities.md) | — |
 | **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |
 | **P3-3 端到端 trace id** | [trace 包](../../internal/trace/trace.go) | [server.md](server.md) §8, [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
 | **P3-2 工具 hot-reload** | [tool.md](tool.md) §8 | [P3-2 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |

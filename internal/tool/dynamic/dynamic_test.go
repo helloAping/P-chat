@@ -104,6 +104,48 @@ template:
 	}
 }
 
+func TestParseSpec_ParametersYAMLObject(t *testing.T) {
+	src := []byte(`
+name: greet
+description: "schema test"
+parameters:
+  type: object
+  properties:
+    name:
+      type: string
+  required: [name]
+template:
+  type: echo
+  text: "hello"
+`)
+	spec, err := ParseSpec(src)
+	if err != nil {
+		t.Fatalf("ParseSpec: %v", err)
+	}
+	if !strings.Contains(string(spec.Parameters), `"required":["name"]`) {
+		t.Fatalf("Parameters = %s, want compiled JSON schema", string(spec.Parameters))
+	}
+}
+
+func TestParseSpec_ParametersJSONBlock(t *testing.T) {
+	src := []byte(`
+name: greet
+description: "schema test"
+parameters: |
+  {"type":"object","properties":{"name":{"type":"string"}}}
+template:
+  type: echo
+  text: "hello"
+`)
+	spec, err := ParseSpec(src)
+	if err != nil {
+		t.Fatalf("ParseSpec: %v", err)
+	}
+	if !strings.Contains(string(spec.Parameters), `"properties"`) {
+		t.Fatalf("Parameters = %s, want JSON schema block", string(spec.Parameters))
+	}
+}
+
 // TestParseSpec_MissingFields exercises the validation
 // rules. Each call should fail with a specific error.
 func TestParseSpec_MissingFields(t *testing.T) {
@@ -205,6 +247,29 @@ parameters: |
 				t.Errorf("error = %q, want substring %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+func TestPreview_ExecDoesNotRunCommand(t *testing.T) {
+	spec, err := ParseSpec([]byte(`
+name: greet
+description: "preview"
+template:
+  type: exec
+  command: "echo Hello {{.args.name}}"
+`))
+	if err != nil {
+		t.Fatalf("ParseSpec: %v", err)
+	}
+	res, err := Preview(spec, []byte(`{"name":"Ada"}`))
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("Preview IsError=true: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "[dry-run]") || !strings.Contains(res.Content, "echo Hello Ada") {
+		t.Fatalf("preview content = %q, want dry-run rendered command", res.Content)
 	}
 }
 
@@ -390,6 +455,69 @@ template: { type: echo, text: x }
 	if _, ok := reg.Get("bad"); ok {
 		t.Error("malformed tool was registered (should have been skipped)")
 	}
+	waitFor(t, 2*time.Second, func() bool {
+		for _, d := range DiagnosticsSnapshot() {
+			if strings.HasSuffix(d.Source, "bad.yaml") && d.Status == "error" && strings.Contains(d.Error, "name is required") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestWatcher_DiagnosticsRecoverAfterFix verifies the GUI-facing
+// diagnostics snapshot changes from error to loaded when the user
+// fixes a YAML file.
+func TestWatcher_DiagnosticsRecoverAfterFix(t *testing.T) {
+	dir := t.TempDir()
+	reg := tool.NewRegistry()
+	lookup := func(name string) map[string]any { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop, err := Watch(ctx, reg, dir, lookup, 50*time.Millisecond, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	yamlPath := filepath.Join(dir, "flip.yaml")
+	if err := os.WriteFile(yamlPath, []byte(`
+description: "broken"
+template: { type: echo, text: x }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		for _, d := range DiagnosticsSnapshot() {
+			if d.Source == yamlPath && d.Status == "error" {
+				return true
+			}
+		}
+		return false
+	})
+
+	time.Sleep(20 * time.Millisecond)
+	if err := os.WriteFile(yamlPath, []byte(`
+name: flip
+description: "fixed"
+template:
+  type: echo
+  text: "ok"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		for _, d := range DiagnosticsSnapshot() {
+			if d.Source == yamlPath && d.Status == "loaded" && d.Name == "flip" {
+				return true
+			}
+		}
+		return false
+	})
+	if _, ok := reg.Get("flip"); !ok {
+		t.Fatal("fixed dynamic tool was not registered")
+	}
 }
 
 // TestWatcher_EditIsDetected: editing a YAML (changing
@@ -450,6 +578,48 @@ template:
 	}
 	if !strings.Contains(res.Content, "second") {
 		t.Errorf("Content = %q, want to contain 'second' (re-registration didn't pick up new text)", res.Content)
+	}
+}
+
+func TestLoadSnapshot_DuplicateNamesAreDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.yaml"), []byte(`
+name: dup
+description: "first"
+template:
+  type: echo
+  text: "a"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.yaml"), []byte(`
+name: dup
+description: "second"
+template:
+  type: echo
+  text: "b"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, specs, diagnostics, err := LoadSnapshot(dir, nil)
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+	if _, ok := entries["dup"]; ok {
+		t.Fatal("duplicate tool was registered; want both files reported as diagnostics")
+	}
+	if _, ok := specs["dup"]; ok {
+		t.Fatal("duplicate spec was published; want both files reported as diagnostics")
+	}
+	errors := 0
+	for _, d := range diagnostics {
+		if d.Name == "dup" && d.Status == "error" && strings.Contains(d.Error, "duplicate dynamic tool name") {
+			errors++
+		}
+	}
+	if errors != 2 {
+		t.Fatalf("diagnostics = %+v, want two duplicate-name errors", diagnostics)
 	}
 }
 

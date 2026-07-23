@@ -178,6 +178,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// (registered at startup) and any dynamic tools
 		// the user has dropped in ~/.p-chat/tools/.
 		api.GET("/tools", h.ListTools)
+		api.POST("/tools/:name/trial", h.TrialTool)
 
 		// Sessions
 		api.GET("/sessions", h.ListSessions)
@@ -304,6 +305,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// Browser control
 		api.GET("/browser/status", h.BrowserStatus)
 		api.GET("/browser/list", h.BrowserList)
+		api.GET("/browser/:id/tabs", h.BrowserTabs)
+		api.POST("/browser/:id/active-tab", h.BrowserSetActiveTab)
 		api.POST("/browser/config", h.UpdateBrowserConfig)
 		api.GET("/browser/extension", h.BrowserExtensionDownload)
 		api.GET("/browser/ws", h.BrowserWebSocket)
@@ -446,6 +449,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 //     loopback (so users can run the frontend in a separate
 //     dev server hitting the production backend)
 //   - any same-origin request (Origin == Host header)
+//
 // Anything else is rejected — the previous "*"-with-no-credentials
 // form was spec-compliant but allowed a malicious page on the
 // same network to fetch our endpoints on behalf of the user.

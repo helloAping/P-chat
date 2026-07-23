@@ -20,13 +20,13 @@ type IndexNode struct {
 	ID        int    `json:"id"`
 	ParentID  int    `json:"parent_id"`
 	Base      string `json:"base"`
-	Level     int    `json:"level"`      // 1=root, 2=file, 3=section
-	Source    string `json:"source"`     // file path (L2/L3)
-	Kind      string `json:"kind"`       // text|image|pdf|audio|video
+	Level     int    `json:"level"`  // 1=root, 2=file, 3=section
+	Source    string `json:"source"` // file path (L2/L3)
+	Kind      string `json:"kind"`   // text|image|pdf|audio|video
 	SortOrder int    `json:"sort_order"`
 	Title     string `json:"title"`
-	Keywords  string `json:"keywords"`   // comma-separated
-	Overview  string `json:"overview"`   // 1-3 sentence summary
+	Keywords  string `json:"keywords"` // comma-separated
+	Overview  string `json:"overview"` // 1-3 sentence summary
 }
 
 // ContentNode is a leaf content block attached to an L3 IndexNode.
@@ -40,25 +40,36 @@ type ContentNode struct {
 
 // IndexSearchResult is the returned payload for pageable wiki_lookup results.
 type IndexSearchResult struct {
-	Total   int              `json:"total"`
-	Page    int              `json:"page"`
-	Size    int              `json:"size"`
-	HasMore bool             `json:"has_more"`
+	Total   int               `json:"total"`
+	Page    int               `json:"page"`
+	Size    int               `json:"size"`
+	HasMore bool              `json:"has_more"`
 	Items   []IndexSearchItem `json:"items"`
 }
 
 // IndexSearchItem wraps an IndexNode with optional children and parent.
 type IndexSearchItem struct {
-	ID       int            `json:"id"`
-	Level    int            `json:"level"`
-	Title    string         `json:"title"`
-	Keywords string         `json:"keywords"`
-	Overview string         `json:"overview"`
-	Source   string         `json:"source"`
-	Kind     string         `json:"kind"`
-	Rank     float64        `json:"rank,omitempty"`
-	Parent   *NodeRef       `json:"parent,omitempty"`
-	Children []ContentNode  `json:"children,omitempty"`
+	ID       int    `json:"id"`
+	Level    int    `json:"level"`
+	Title    string `json:"title"`
+	Keywords string `json:"keywords"`
+	Overview string `json:"overview"`
+	Source   string `json:"source"`
+	Kind     string `json:"kind"`
+	// Base is the knowledge-base name this hit came from.
+	// Required for multi-base merge (KB-01); empty for single-base
+	// callers that have not stamped it yet.
+	Base string `json:"base,omitempty"`
+	// Rank is the relevance score. After MergeAndRerank it is the
+	// cross-base normalised score in [0, 1] (higher = better).
+	Rank float64 `json:"rank,omitempty"`
+	// MatchType is the primary hit reason (KB-02 hybrid retrieval):
+	// path | filename | title | keywords | overview | l2 | content.
+	MatchType string `json:"match_type,omitempty"`
+	// Query is the original or derived query that surfaced this hit (KB-03).
+	Query    string        `json:"query,omitempty"`
+	Parent   *NodeRef      `json:"parent,omitempty"`
+	Children []ContentNode `json:"children,omitempty"`
 }
 
 // NodeRef is a lightweight reference to a parent node.
@@ -285,30 +296,26 @@ func (ws *WikiStore) replaceBaseNodesInternal(ctx context.Context, base string, 
 
 // ReplaceSourceNodes deletes all nodes for a single source within a base,
 // then inserts the new set. Used by incremental scanning.
-func (ws *WikiStore) ReplaceSourceNodes(ctx context.Context, base, source string, nodes []IndexNode, contents []ContentNode) error {
-	err := ws.replaceSourceNodesInternal(ctx, base, source, nodes, contents)
+func (ws *WikiStore) ReplaceSourceNodes(ctx context.Context, base, source string, l2Nodes, l3Nodes []IndexNode, contents []ContentNode) error {
+	err := ws.replaceSourceNodesInternal(ctx, base, source, l2Nodes, l3Nodes, contents)
 	if err != nil && isFTS5Corrupt(err) {
 		if repErr := ws.repairIndexFTS(ctx); repErr != nil {
 			log.Printf("[knowledge] repair index_fts failed: %v", repErr)
 			return fmt.Errorf("index is corrupted and auto-repair failed — delete %s and re-scan: %w", filepath.Join(ws.dir, "wiki.db"), repErr)
 		}
 		log.Printf("[knowledge] repaired index_fts, retrying ReplaceSourceNodes for %s", source)
-		err = ws.replaceSourceNodesInternal(ctx, base, source, nodes, contents)
+		err = ws.replaceSourceNodesInternal(ctx, base, source, l2Nodes, l3Nodes, contents)
 	}
 	return err
 }
 
-func (ws *WikiStore) replaceSourceNodesInternal(ctx context.Context, base, source string, nodes []IndexNode, contents []ContentNode) error {
+func (ws *WikiStore) replaceSourceNodesInternal(ctx context.Context, base, source string, l2Nodes, l3Nodes []IndexNode, contents []ContentNode) error {
 	tx, err := ws.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM index_fts WHERE rowid IN (SELECT id FROM index_nodes WHERE base = ? AND source = ?)`, base, source); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM contents WHERE node_id IN (SELECT id FROM index_nodes WHERE base = ? AND source = ?)`, base, source); err != nil {
 		return err
@@ -318,7 +325,47 @@ func (ws *WikiStore) replaceSourceNodesInternal(ctx context.Context, base, sourc
 		return err
 	}
 
-	if err := insertNodesTx(ctx, tx, nodes); err != nil {
+	var l1ID int
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM index_nodes WHERE base = ? AND level = 1 LIMIT 1`, base).Scan(&l1ID); err != nil {
+		if err != sql.ErrNoRows {
+			return err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) + 1 FROM index_nodes`).Scan(&l1ID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO index_nodes (id, parent_id, base, level, source, kind, sort_order, title, keywords, overview) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			l1ID, 0, base, 1, "", "", 0, base, "", "[Knowledge Base]"); err != nil {
+			return err
+		}
+	}
+	if len(l2Nodes) != 1 {
+		return fmt.Errorf("replace source %s: expected 1 L2 node, got %d", source, len(l2Nodes))
+	}
+	var nextID int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) + 1 FROM index_nodes`).Scan(&nextID); err != nil {
+		return err
+	}
+	l2 := l2Nodes[0]
+	l2.ID = nextID
+	l2.ParentID = l1ID
+	l2.Base = base
+	nextID++
+	if err := insertNodesTx(ctx, tx, []IndexNode{l2}); err != nil {
+		return err
+	}
+	for i := range l3Nodes {
+		l3Nodes[i].ID = nextID
+		l3Nodes[i].ParentID = l2.ID
+		l3Nodes[i].Base = base
+		nextID++
+	}
+	for i := range contents {
+		if i < len(l3Nodes) {
+			contents[i].NodeID = l3Nodes[i].ID
+		}
+	}
+	if err := insertNodesTx(ctx, tx, l3Nodes); err != nil {
 		return err
 	}
 	if err := insertContentsTx(ctx, tx, contents); err != nil {
@@ -889,61 +936,44 @@ func (ws *WikiStore) browseL2(ctx context.Context, base string, level, page, siz
 }
 
 func (ws *WikiStore) rankedSearch(ctx context.Context, query, base string, level int, expand bool, page, size int) (*IndexSearchResult, error) {
-	seen := make(map[int]bool)
-	var hits []searchHit
-
 	baseWhere := `AND n.base = ?`
 	baseArg := base
 	if base == "" || base == "__all__" {
 		baseWhere = ``
 	}
 
-	// Strategy 1: L3.title FTS5 prefix match (weight 1.0).
-	hits = ws.runFTSQuery(ctx, hits, &seen, query, baseWhere, baseArg, weightTitle,
-		`SELECT n.id, n.level, n.title, n.keywords, n.overview, n.source, n.kind,
-		        n.parent_id, p.title, bm25(index_fts)
-		 FROM index_fts
-		 JOIN index_nodes n ON index_fts.rowid = n.id
-		 LEFT JOIN index_nodes p ON n.parent_id = p.id
-		 WHERE index_fts MATCH ? AND n.level = 3 {:base} ORDER BY rank LIMIT ?`,
-		func(q string) string { return fmt.Sprintf(`title:%s*`, q) })
+	// KB-02 hybrid retrieval: each strategy builds its own ranked list,
+	// then Reciprocal Rank Fusion merges them. Lexical path/title lists
+	// catch exact file names and config keys that pure FTS prefix match
+	// often misses in code repositories.
+	ftsSQL := `SELECT n.id, n.level, n.title, n.keywords, n.overview, n.source, n.kind,
+	                  n.parent_id, p.title, bm25(index_fts)
+	           FROM index_fts
+	           JOIN index_nodes n ON index_fts.rowid = n.id
+	           LEFT JOIN index_nodes p ON n.parent_id = p.id
+	           WHERE index_fts MATCH ? AND n.level = %d {:base} ORDER BY rank LIMIT ?`
 
-	// Strategy 2: L3.keywords FTS5 prefix match (weight 0.8).
-	hits = ws.runFTSQuery(ctx, hits, &seen, query, baseWhere, baseArg, weightKeyword,
-		`SELECT n.id, n.level, n.title, n.keywords, n.overview, n.source, n.kind,
-		        n.parent_id, p.title, bm25(index_fts)
-		 FROM index_fts
-		 JOIN index_nodes n ON index_fts.rowid = n.id
-		 LEFT JOIN index_nodes p ON n.parent_id = p.id
-		 WHERE index_fts MATCH ? AND n.level = 3 {:base} ORDER BY rank LIMIT ?`,
-		func(q string) string { return fmt.Sprintf(`keywords:%s*`, q) })
-
-	// Strategy 3: L3.overview FTS5 prefix match (weight 0.6).
-	hits = ws.runFTSQuery(ctx, hits, &seen, query, baseWhere, baseArg, weightOvervw,
-		`SELECT n.id, n.level, n.title, n.keywords, n.overview, n.source, n.kind,
-		        n.parent_id, p.title, bm25(index_fts)
-		 FROM index_fts
-		 JOIN index_nodes n ON index_fts.rowid = n.id
-		 LEFT JOIN index_nodes p ON n.parent_id = p.id
-		 WHERE index_fts MATCH ? AND n.level = 3 {:base} ORDER BY rank LIMIT ?`,
-		func(q string) string { return fmt.Sprintf(`overview:%s*`, q) })
-
-	// Strategy 4: L2 FTS5 match (weight 0.4).
-	hits = ws.runFTSQuery(ctx, hits, &seen, query, baseWhere, baseArg, weightL2,
-		`SELECT n.id, n.level, n.title, n.keywords, n.overview, n.source, n.kind,
-		        n.parent_id, p.title, bm25(index_fts)
-		 FROM index_fts
-		 JOIN index_nodes n ON index_fts.rowid = n.id
-		 LEFT JOIN index_nodes p ON n.parent_id = p.id
-		 WHERE index_fts MATCH ? AND n.level = 2 {:base} ORDER BY rank LIMIT ?`,
-		func(q string) string { return fmt.Sprintf(`%s*`, q) })
-
-	// Strategy 5: contents.content LIKE fallback (weight 0.2).
-	if len(hits) == 0 {
-		hits = ws.addContentLikeHits(ctx, hits, &seen, query, baseWhere, baseArg, weightContent)
+	lists := [][]searchHit{
+		// Lexical path / filename / title (exact-term bias).
+		ws.lexicalPathHits(ctx, query, baseWhere, baseArg),
+		// FTS strategies.
+		ws.collectFTSList(ctx, query, baseWhere, baseArg, weightTitle, MatchTitle,
+			fmt.Sprintf(ftsSQL, 3),
+			func(q string) string { return fmt.Sprintf(`title:%s*`, q) }),
+		ws.collectFTSList(ctx, query, baseWhere, baseArg, weightKeyword, MatchKeywords,
+			fmt.Sprintf(ftsSQL, 3),
+			func(q string) string { return fmt.Sprintf(`keywords:%s*`, q) }),
+		ws.collectFTSList(ctx, query, baseWhere, baseArg, weightOvervw, MatchOverview,
+			fmt.Sprintf(ftsSQL, 3),
+			func(q string) string { return fmt.Sprintf(`overview:%s*`, q) }),
+		ws.collectFTSList(ctx, query, baseWhere, baseArg, weightL2, MatchL2,
+			fmt.Sprintf(ftsSQL, 2),
+			func(q string) string { return fmt.Sprintf(`%s*`, q) }),
+		// Content LIKE always contributes (not only empty-fallback).
+		ws.collectContentLikeList(ctx, query, baseWhere, baseArg),
 	}
 
-	sortHitsByRank(hits)
+	hits := fuseRRF(lists)
 
 	total := len(hits)
 	if total == 0 {
@@ -963,8 +993,12 @@ func (ws *WikiStore) rankedSearch(ctx context.Context, query, base string, level
 	items := make([]IndexSearchItem, len(pageItems))
 	for i, h := range pageItems {
 		items[i] = h.item
-		if h.ftsRank > 0 {
-			items[i].Rank = (h.ftsRank / (h.ftsRank + 1.0)) * h.weight
+		if items[i].Query == "" {
+			items[i].Query = query
+		}
+		// Rank already set by fuseRRF to the RRF score.
+		if items[i].Rank == 0 && h.ftsRank > 0 {
+			items[i].Rank = h.ftsRank
 		}
 	}
 
@@ -1175,11 +1209,11 @@ func (ws *WikiStore) ClearBase(ctx context.Context, base string) error {
 }
 
 // RemoveStaleSourceNodes removes nodes + contents for sources not in currentSources.
-func (ws *WikiStore) RemoveStaleSourceNodes(ctx context.Context, base string, currentSources map[string]bool) error {
+func (ws *WikiStore) RemoveStaleSourceNodes(ctx context.Context, base string, currentSources map[string]bool) (int, error) {
 	rows, err := ws.db.QueryContext(ctx,
 		`SELECT DISTINCT source FROM index_nodes WHERE base = ? AND level = 2`, base)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer rows.Close()
 
@@ -1194,28 +1228,36 @@ func (ws *WikiStore) RemoveStaleSourceNodes(ctx context.Context, base string, cu
 		}
 	}
 	if len(stale) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	tx, err := ws.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 
 	for _, src := range stale {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		default:
 		}
-		tx.ExecContext(ctx,
-			`DELETE FROM index_fts WHERE rowid IN (SELECT id FROM index_nodes WHERE base = ? AND source = ?)`, base, src)
-		tx.ExecContext(ctx,
-			`DELETE FROM contents WHERE node_id IN (SELECT id FROM index_nodes WHERE base = ? AND source = ?)`, base, src)
-		tx.ExecContext(ctx, `DELETE FROM index_nodes WHERE base = ? AND source = ?`, base, src)
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM contents WHERE node_id IN (SELECT id FROM index_nodes WHERE base = ? AND source = ?)`, base, src); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM index_nodes WHERE base = ? AND source = ?`, base, src); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM file_mtimes WHERE base = ? AND source = ?`, base, src); err != nil {
+			return 0, err
+		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(stale), nil
 }
 
 // ── Data migration from legacy wiki_sections ──
@@ -1238,9 +1280,9 @@ func (ws *WikiStore) MigrateBaseToIndex(ctx context.Context, base string) (int, 
 	defer rows.Close()
 
 	type section struct {
-		wikiSectionID int
+		wikiSectionID          int
 		title, content, source string
-		heading sql.NullString
+		heading                sql.NullString
 	}
 	type sourceGroup struct {
 		source   string
