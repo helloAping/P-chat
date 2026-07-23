@@ -52,6 +52,33 @@ func TestWorkModeNormalize(t *testing.T) {
 	}
 }
 
+func TestCloseBehaviorNormalize(t *testing.T) {
+	cases := []struct {
+		in   CloseBehavior
+		want CloseBehavior
+	}{
+		{"", CloseBehaviorExit},
+		{CloseBehaviorExit, CloseBehaviorExit},
+		{CloseBehaviorTray, CloseBehaviorTray},
+		{"bogus", CloseBehaviorExit},
+		{"TRAY", CloseBehaviorExit},
+	}
+	for _, tc := range cases {
+		if got := tc.in.Normalize(); got != tc.want {
+			t.Errorf("CloseBehavior(%q).Normalize() = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if !CloseBehaviorExit.IsValid() || !CloseBehaviorTray.IsValid() {
+		t.Fatal("built-in close behaviors should be valid")
+	}
+	if CloseBehavior("").IsValid() || CloseBehavior("bogus").IsValid() {
+		t.Fatal("empty/bogus close behaviors should be invalid")
+	}
+	if got := Default().UI.CloseBehavior; got != CloseBehaviorExit {
+		t.Fatalf("Default().UI.CloseBehavior = %q, want %q", got, CloseBehaviorExit)
+	}
+}
+
 func TestSubAgentConfig_Whitelist(t *testing.T) {
 	c := &SubAgentConfig{
 		AllowedTools: []string{"read_file", "list_files"},
@@ -532,6 +559,28 @@ func TestLoad_NoConfigFallsBackToDefault(t *testing.T) {
 	}
 	if cfg.Server.Host != "127.0.0.1" {
 		t.Errorf("default server.host = %q, want 127.0.0.1", cfg.Server.Host)
+	}
+	if cfg.UI.CloseBehavior != CloseBehaviorExit {
+		t.Errorf("default ui.close_behavior = %q, want %q", cfg.UI.CloseBehavior, CloseBehaviorExit)
+	}
+}
+
+func TestLoad_NormalizesCloseBehavior(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	initial := `{"ui":{"close_behavior":"bogus"}}`
+	if err := osWriteFile(filepath.Join(dir, ".p-chat", "config.json"), initial); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UI.CloseBehavior != CloseBehaviorExit {
+		t.Errorf("invalid close_behavior should normalize to exit, got %q", cfg.UI.CloseBehavior)
 	}
 }
 

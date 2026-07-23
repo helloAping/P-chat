@@ -1774,10 +1774,15 @@ export interface WorkModeConfig {
   default: string
 }
 
+export interface UIConfig {
+  close_behavior: 'exit' | 'tray' | string
+}
+
 export interface SystemConfig {
   limits: LimitsConfig
   sub_agent: SubAgentConfig
   work_mode: WorkModeConfig
+  ui: UIConfig
 }
 
 export const getSystemConfig = () =>

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -128,4 +129,72 @@ func TestPickConfigPath_PrefersJSON(t *testing.T) {
 	if p := pickConfigPath(); !strings.HasSuffix(p, "config.yaml") {
 		t.Fatalf("expected config.yaml fallback, got %q", p)
 	}
+}
+
+func TestNormalizeCloseBehavior(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", closeBehaviorExit},
+		{closeBehaviorExit, closeBehaviorExit},
+		{closeBehaviorTray, closeBehaviorTray},
+		{"bogus", closeBehaviorExit},
+	}
+	for _, tc := range cases {
+		if got := normalizeCloseBehavior(tc.in); got != tc.want {
+			t.Fatalf("normalizeCloseBehavior(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestShouldPreventClose(t *testing.T) {
+	if !shouldPreventClose(false, closeBehaviorTray) {
+		t.Fatal("tray close behavior should prevent window close")
+	}
+	if shouldPreventClose(false, closeBehaviorExit) {
+		t.Fatal("exit close behavior should not prevent window close")
+	}
+	if shouldPreventClose(true, closeBehaviorTray) {
+		t.Fatal("quitting should allow the application to close")
+	}
+}
+
+func TestReadCloseBehavior_JSONAndYAML(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".p-chat")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(jsonPath, []byte(`{"ui":{"close_behavior":"tray"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readCloseBehavior(); got != closeBehaviorTray {
+		t.Fatalf("JSON close behavior = %q, want tray", got)
+	}
+
+	if err := os.Remove(jsonPath); err != nil {
+		t.Fatal(err)
+	}
+	yaml := []byte("ui:\n  close_behavior: \"tray\" # keep alive\n")
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), yaml, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readCloseBehavior(); got != closeBehaviorTray {
+		t.Fatalf("YAML close behavior = %q, want tray", got)
+	}
+}
+
+func TestStopServer_NoProcessIsIdempotent(t *testing.T) {
+	app := NewApp()
+	app.stopServer()
+	app.stopServer()
+
+	app.serverCmd = &exec.Cmd{}
+	app.stopServer()
+	app.stopServer()
 }

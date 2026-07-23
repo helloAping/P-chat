@@ -351,6 +351,89 @@ func TestCommands_ListAndRun(t *testing.T) {
 	}
 }
 
+func TestSystemConfig_UICloseBehavior(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	r, err := http.Get(srv.URL + "/api/v1/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", r.StatusCode)
+	}
+	var got struct {
+		UI struct {
+			CloseBehavior string `json:"close_behavior"`
+		} `json:"ui"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.UI.CloseBehavior != "exit" {
+		t.Fatalf("default close_behavior = %q, want exit", got.UI.CloseBehavior)
+	}
+
+	req, _ := http.NewRequest(http.MethodPatch, srv.URL+"/api/v1/config", strings.NewReader(`{"ui":{"close_behavior":"tray"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	pr, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Body.Close()
+	if pr.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(pr.Body)
+		t.Fatalf("PATCH status = %d, want 200; body = %s", pr.StatusCode, body)
+	}
+	var patched struct {
+		UI struct {
+			CloseBehavior string `json:"close_behavior"`
+		} `json:"ui"`
+	}
+	if err := json.NewDecoder(pr.Body).Decode(&patched); err != nil {
+		t.Fatal(err)
+	}
+	if patched.UI.CloseBehavior != "tray" {
+		t.Fatalf("patched close_behavior = %q, want tray", patched.UI.CloseBehavior)
+	}
+
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UI.CloseBehavior != config.CloseBehaviorTray {
+		t.Fatalf("persisted close_behavior = %q, want tray", cfg.UI.CloseBehavior)
+	}
+}
+
+func TestSystemConfig_UICloseBehaviorInvalidFallsBack(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPatch, srv.URL+"/api/v1/config", strings.NewReader(`{"ui":{"close_behavior":"bogus"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200", r.StatusCode)
+	}
+	var got struct {
+		UI struct {
+			CloseBehavior string `json:"close_behavior"`
+		} `json:"ui"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.UI.CloseBehavior != "exit" {
+		t.Fatalf("invalid close_behavior should normalize to exit, got %q", got.UI.CloseBehavior)
+	}
+}
+
 // Helper: not actually used by the tests but kept for parity.
 var _ = fmt.Sprintf
 

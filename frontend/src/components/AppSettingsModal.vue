@@ -275,8 +275,13 @@ const sysSubAgent = ref<api.SubAgentConfig>({
   timeout: '',
 })
 const sysWorkMode = ref('coding')
+const sysCloseBehavior = ref<'exit' | 'tray'>('exit')
 const sysDirty = ref(false)
 const sysSaving = ref(false)
+
+function normalizeCloseBehavior(v?: string): 'exit' | 'tray' {
+  return v === 'tray' ? 'tray' : 'exit'
+}
 
 async function loadSystemConfig() {
   try {
@@ -284,6 +289,7 @@ async function loadSystemConfig() {
     sysLimits.value = sc.limits
     sysSubAgent.value = sc.sub_agent
     sysWorkMode.value = sc.work_mode?.default || 'coding'
+    sysCloseBehavior.value = normalizeCloseBehavior(sc.ui?.close_behavior)
     chatState.globalWorkMode = sysWorkMode.value
     sysDirty.value = false
   } catch { /* ignore */ }
@@ -311,9 +317,11 @@ async function saveSystemConfig() {
     sa.timeout = sysSubAgent.value.timeout
     patch.sub_agent = sa
     patch.work_mode = { default: sysWorkMode.value }
+    patch.ui = { close_behavior: sysCloseBehavior.value }
 
     const updated = await api.updateSystemConfig(patch)
     chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
+    sysCloseBehavior.value = normalizeCloseBehavior(updated.ui?.close_behavior)
     sysDirty.value = false
     message.success('系统配置已保存')
   } catch (e: any) {
@@ -335,6 +343,7 @@ function resetSystemConfig() {
   }
   sysSubAgent.value = { cache_ttl: '', timeout: '' }
   sysWorkMode.value = 'coding'
+  sysCloseBehavior.value = 'exit'
   sysDirty.value = true
 }
 
@@ -1977,7 +1986,7 @@ function kbModelSupportsVision(scanModel: string) {
                   </p>
                 </div>
               </div>
-              <NCollapse class="sys-collapse" :default-expanded-names="['work-mode', 'context', 'agent', 'subagent']">
+              <NCollapse class="sys-collapse" :default-expanded-names="['work-mode', 'window', 'context', 'agent', 'subagent']">
                 <NCollapseItem title="工作模式" name="work-mode">
                   <div class="sys-form-grid">
                     <div class="sys-form-row">
@@ -1987,6 +1996,19 @@ function kbModelSupportsVision(scanModel: string) {
                         <NRadioButton value="daily">日常工作</NRadioButton>
                       </NRadioGroup>
                       <span class="sys-hint">风格只决定怎么说；工作模式决定优先处理哪类任务。</span>
+                    </div>
+                  </div>
+                </NCollapseItem>
+
+                <NCollapseItem title="窗口行为" name="window">
+                  <div class="sys-form-grid">
+                    <div class="sys-form-row">
+                      <span class="sys-label">关闭窗口时</span>
+                      <NRadioGroup v-model:value="sysCloseBehavior" size="small" @update:value="markSysDirty">
+                        <NRadioButton value="exit">退出 P-Chat</NRadioButton>
+                        <NRadioButton value="tray">最小化到通知区域</NRadioButton>
+                      </NRadioGroup>
+                      <span class="sys-hint">托盘模式下，服务会继续在后台运行。</span>
                     </div>
                   </div>
                 </NCollapseItem>

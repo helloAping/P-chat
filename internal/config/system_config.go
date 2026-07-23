@@ -24,12 +24,18 @@ type WorkModeConfigPatch struct {
 	Default *WorkMode `json:"default,omitempty"`
 }
 
+// UIConfigPatch is a partial update for UIConfig.
+type UIConfigPatch struct {
+	CloseBehavior *CloseBehavior `json:"close_behavior,omitempty"`
+}
+
 // SystemConfigPatch is a partial update for system-level config
-// (limits + subagent + work_mode).
+// (limits + subagent + work_mode + ui).
 type SystemConfigPatch struct {
 	Limits   *LimitsConfigPatch   `json:"limits,omitempty"`
 	SubAgent *SubAgentConfigPatch `json:"sub_agent,omitempty"`
 	WorkMode *WorkModeConfigPatch `json:"work_mode,omitempty"`
+	UI       *UIConfigPatch       `json:"ui,omitempty"`
 }
 
 // UpdateSystemConfig merges a SystemConfigPatch into the persisted config.
@@ -47,6 +53,9 @@ func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
 	}
 	if patch.WorkMode != nil {
 		mergeWorkMode(&cfg.WorkMode, patch.WorkMode)
+	}
+	if patch.UI != nil {
+		mergeUI(&cfg.UI, patch.UI)
 	}
 
 	mgr := NewManager()
@@ -92,5 +101,11 @@ func mergeSubAgent(s *SubAgentConfig, p *SubAgentConfigPatch) {
 func mergeWorkMode(w *WorkModeConfig, p *WorkModeConfigPatch) {
 	if p.Default != nil {
 		w.Default = p.Default.Normalize()
+	}
+}
+
+func mergeUI(u *UIConfig, p *UIConfigPatch) {
+	if p.CloseBehavior != nil {
+		u.CloseBehavior = p.CloseBehavior.Normalize()
 	}
 }

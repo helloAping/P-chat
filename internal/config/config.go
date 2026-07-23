@@ -22,6 +22,7 @@ type Config struct {
 	Server    ServerConfig    `json:"server"`
 	LLM       LLMConfig       `json:"llm"`
 	Style     StyleConfig     `json:"style"`
+	UI        UIConfig        `json:"ui"`
 	WorkMode  WorkModeConfig  `json:"work_mode"`
 	Tools     ToolsConfig     `json:"tools"`
 	Memory    MemoryConfig    `json:"memory"`
@@ -315,6 +316,43 @@ func (p ProviderConfig) DisplayModel() string {
 
 type StyleConfig struct {
 	Default string `json:"default"`
+}
+
+// CloseBehavior controls what the desktop GUI does when the user
+// clicks the window close button.
+type CloseBehavior string
+
+const (
+	// CloseBehaviorExit keeps the legacy behaviour: close exits P-Chat.
+	CloseBehaviorExit CloseBehavior = "exit"
+	// CloseBehaviorTray hides the window while keeping the GUI and server alive.
+	CloseBehaviorTray CloseBehavior = "tray"
+)
+
+// Normalize returns a safe CloseBehavior. Empty or unknown values fall
+// back to exit so existing installs keep the previous close behaviour.
+func (b CloseBehavior) Normalize() CloseBehavior {
+	switch b {
+	case CloseBehaviorExit, CloseBehaviorTray:
+		return b
+	default:
+		return CloseBehaviorExit
+	}
+}
+
+// IsValid reports whether b is one of the built-in close behaviours.
+func (b CloseBehavior) IsValid() bool {
+	switch b {
+	case CloseBehaviorExit, CloseBehaviorTray:
+		return true
+	default:
+		return false
+	}
+}
+
+// UIConfig controls desktop/web UI behaviour.
+type UIConfig struct {
+	CloseBehavior CloseBehavior `json:"close_behavior,omitempty"`
 }
 
 // WorkMode is the user's task focus. It is orthogonal to
@@ -753,6 +791,7 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	}
 
 	migrateKnowledgeDefaults(cfg)
+	cfg.UI.CloseBehavior = cfg.UI.CloseBehavior.Normalize()
 	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
 
 	return cfg, nil
@@ -821,6 +860,9 @@ func Default() *Config {
 		},
 		Style: StyleConfig{
 			Default: "tech",
+		},
+		UI: UIConfig{
+			CloseBehavior: CloseBehaviorExit,
 		},
 		WorkMode: WorkModeConfig{
 			Default: WorkModeCoding,
