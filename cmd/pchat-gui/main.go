@@ -778,15 +778,23 @@ func primaryScreenSize(ctx context.Context) (int, int, bool) {
 }
 
 // beforeClose is called when the user closes the window.
-// beforeClose 根据配置决定隐藏到托盘还是真正退出。
+// beforeClose 在窗口关闭时询问用户收缩到托盘还是真正退出。
 func (a *App) beforeClose(ctx context.Context) bool {
 	log.Printf("OnBeforeClose called")
-	if shouldPreventClose(a.quitting.Load(), readCloseBehavior()) && a.tray != nil && a.tray.ready() {
+	action := closeActionForWindowClose(a.quitting.Load(), a.tray != nil && a.tray.ready(), "")
+	if action == closeActionPrompt {
+		action = a.promptCloseAction()
+	}
+	switch action {
+	case closeActionTray:
 		a.hideMainWindow()
 		return true
+	case closeActionCancel:
+		return true
+	default:
+		a.stopServer()
+		return false
 	}
-	a.stopServer()
-	return false
 }
 
 // stopServer stops the pchat-server child started by this GUI.
@@ -831,6 +839,31 @@ func (a *App) hideMainWindow() {
 		return
 	}
 	wailsruntime.WindowHide(a.ctx)
+}
+
+// promptCloseAction asks whether the close button should hide or quit.
+// promptCloseAction 询问窗口关闭按钮是收缩到托盘还是真正退出。
+func (a *App) promptCloseAction() closeAction {
+	if a.ctx == nil {
+		return closeActionExit
+	}
+	defaultButton := closeChoiceExit
+	if normalizeCloseBehavior(readCloseBehavior()) == closeBehaviorTray {
+		defaultButton = closeChoiceTray
+	}
+	choice, err := wailsruntime.MessageDialog(a.ctx, wailsruntime.MessageDialogOptions{
+		Type:          wailsruntime.QuestionDialog,
+		Title:         "退出 P-Chat？",
+		Message:       "要将 P-Chat 收缩到通知区域继续后台运行，还是直接关闭并停止服务？",
+		Buttons:       []string{closeChoiceTray, closeChoiceExit, closeChoiceCancel},
+		DefaultButton: defaultButton,
+		CancelButton:  closeChoiceCancel,
+	})
+	if err != nil {
+		log.Printf("promptCloseAction: %v", err)
+		return closeActionCancel
+	}
+	return closeActionForChoice(choice)
 }
 
 // quitApp performs a real application exit from the tray menu.

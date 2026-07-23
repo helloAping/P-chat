@@ -31,19 +31,18 @@ const (
 	wmCommand     = 0x0111
 	wmClose       = 0x0010
 	wmDestroy     = 0x0002
+	wmNull        = 0x0000
 	wmLButtonUp   = 0x0202
 	wmLButtonDbl  = 0x0203
+	wmRButtonDown = 0x0204
 	wmRButtonUp   = 0x0205
 	wmContextMenu = 0x007B
 
-	nimAdd        = 0x00000000
-	nimDelete     = 0x00000002
-	nimSetVersion = 0x00000004
-	nifMessage    = 0x00000001
-	nifIcon       = 0x00000002
-	nifTip        = 0x00000004
-
-	notifyIconVersion4 = 4
+	nimAdd     = 0x00000000
+	nimDelete  = 0x00000002
+	nifMessage = 0x00000001
+	nifIcon    = 0x00000002
+	nifTip     = 0x00000004
 
 	imageIcon      = 1
 	lrLoadFromFile = 0x00000010
@@ -145,6 +144,14 @@ type notifyIconData struct {
 	HBalloonIcon     windows.Handle
 }
 
+type trayCallbackAction int
+
+const (
+	trayCallbackIgnore trayCallbackAction = iota
+	trayCallbackOpen
+	trayCallbackMenu
+)
+
 // startTray installs the Windows notification-area icon.
 // startTray 启动 Windows 通知区域图标和右键菜单。
 func startTray(app *App) *trayHandle {
@@ -233,8 +240,6 @@ func (t *trayHandle) addIcon() bool {
 		log.Printf("tray: Shell_NotifyIconW(NIM_ADD) failed: %v", err)
 		return false
 	}
-	nid.TimeoutOrVersion = notifyIconVersion4
-	procShellNotifyIconW.Call(nimSetVersion, uintptr(unsafe.Pointer(&nid)))
 	return true
 }
 
@@ -273,11 +278,11 @@ func trayWindowProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 		}
 	case trayCallbackMsg:
 		if t != nil {
-			switch lparam {
-			case wmLButtonUp, wmLButtonDbl:
+			switch trayCallbackActionFor(lparam) {
+			case trayCallbackOpen:
 				go t.app.showMainWindow()
 				return 0
-			case wmRButtonUp, wmContextMenu:
+			case trayCallbackMenu:
 				t.showMenu()
 				return 0
 			}
@@ -299,6 +304,18 @@ func trayWindowProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	}
 	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wparam, lparam)
 	return ret
+}
+
+func trayCallbackActionFor(lparam uintptr) trayCallbackAction {
+	event := uint32(lparam & 0xffff)
+	switch event {
+	case wmLButtonUp, wmLButtonDbl:
+		return trayCallbackOpen
+	case wmRButtonDown, wmRButtonUp, wmContextMenu:
+		return trayCallbackMenu
+	default:
+		return trayCallbackIgnore
+	}
 }
 
 func (t *trayHandle) showMenu() {
@@ -331,6 +348,7 @@ func (t *trayHandle) showMenu() {
 	if cmd != 0 {
 		t.handleCommand(int(cmd))
 	}
+	procPostMessageW.Call(uintptr(t.hwnd), wmNull, 0, 0)
 }
 
 func (t *trayHandle) handleCommand(command int) {
@@ -384,7 +402,7 @@ func (t *trayHandle) appendRecentSessionsMenu(menu uintptr) {
 			appendTrayMenuItem(submenu, uintptr(cmdTrayRecentBase+i), traySessionMenuLabel(i, session))
 		}
 	}
-	procAppendMenuW.Call(menu, mfPopup, submenu, uintptr(unsafe.Pointer(mustUTF16Ptr("最近对话"))))
+	procAppendMenuW.Call(menu, mfPopup|mfString, submenu, uintptr(unsafe.Pointer(mustUTF16Ptr("最近对话"))))
 }
 
 func (t *trayHandle) setRecentCommands(sessions []traySession) {

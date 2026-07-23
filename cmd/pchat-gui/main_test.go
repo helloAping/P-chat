@@ -164,6 +164,27 @@ func TestShouldPreventClose(t *testing.T) {
 	}
 }
 
+func TestCloseActionForWindowClose_PromptsBeforeExitingWhenTrayReady(t *testing.T) {
+	if got := closeActionForWindowClose(false, true, ""); got != closeActionPrompt {
+		t.Fatalf("window close with tray ready = %q, want prompt", got)
+	}
+	if got := closeActionForWindowClose(false, true, closeChoiceTray); got != closeActionTray {
+		t.Fatalf("tray choice = %q, want tray", got)
+	}
+	if got := closeActionForWindowClose(false, true, closeChoiceExit); got != closeActionExit {
+		t.Fatalf("exit choice = %q, want exit", got)
+	}
+	if got := closeActionForWindowClose(false, true, closeChoiceCancel); got != closeActionCancel {
+		t.Fatalf("cancel choice = %q, want cancel", got)
+	}
+	if got := closeActionForWindowClose(false, false, ""); got != closeActionExit {
+		t.Fatalf("window close without tray = %q, want exit", got)
+	}
+	if got := closeActionForWindowClose(true, true, ""); got != closeActionExit {
+		t.Fatalf("quitting close = %q, want exit", got)
+	}
+}
+
 func TestReadCloseBehavior_JSONAndYAML(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("USERPROFILE", home)

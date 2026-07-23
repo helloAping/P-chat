@@ -9,6 +9,19 @@ import (
 const (
 	closeBehaviorExit = "exit"
 	closeBehaviorTray = "tray"
+
+	closeChoiceTray   = "收缩到托盘"
+	closeChoiceExit   = "直接关闭"
+	closeChoiceCancel = "取消"
+)
+
+type closeAction string
+
+const (
+	closeActionPrompt closeAction = "prompt"
+	closeActionTray   closeAction = "tray"
+	closeActionExit   closeAction = "exit"
+	closeActionCancel closeAction = "cancel"
 )
 
 // normalizeCloseBehavior returns the safe desktop close behaviour.
@@ -29,6 +42,27 @@ func shouldPreventClose(quitting bool, closeBehavior string) bool {
 		return false
 	}
 	return normalizeCloseBehavior(closeBehavior) == closeBehaviorTray
+}
+
+func closeActionForChoice(choice string) closeAction {
+	switch choice {
+	case closeChoiceTray:
+		return closeActionTray
+	case closeChoiceExit:
+		return closeActionExit
+	default:
+		return closeActionCancel
+	}
+}
+
+func closeActionForWindowClose(quitting bool, trayReady bool, choice string) closeAction {
+	if quitting || !trayReady {
+		return closeActionExit
+	}
+	if choice == "" {
+		return closeActionPrompt
+	}
+	return closeActionForChoice(choice)
 }
 
 // readCloseBehavior reads ui.close_behavior from the active config file.
