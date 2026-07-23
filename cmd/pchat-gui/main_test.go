@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,4 +199,55 @@ func TestStopServer_NoProcessIsIdempotent(t *testing.T) {
 	app.serverCmd = &exec.Cmd{}
 	app.stopServer()
 	app.stopServer()
+}
+
+func TestRecentTraySessions_LimitsAndSkipsEmptyIDs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sessions" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"sessions":[
+			{"id":"","title":"skip"},
+			{"id":"s1","title":"one","project_path":"D:/one"},
+			{"id":"s2","title":"two"},
+			{"id":"s3","title":"three"},
+			{"id":"s4","title":"four"},
+			{"id":"s5","title":"five"},
+			{"id":"s6","title":"six"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	app := NewApp()
+	backend := srv.URL
+	app.backendURL.Store(&backend)
+
+	got := app.recentTraySessions()
+	if len(got) != trayRecentSessionLimit {
+		t.Fatalf("recentTraySessions len = %d, want %d", len(got), trayRecentSessionLimit)
+	}
+	if got[0].ID != "s1" || got[0].ProjectPath != "D:/one" {
+		t.Fatalf("first session = %+v, want s1 with project path", got[0])
+	}
+	if got[len(got)-1].ID != "s5" {
+		t.Fatalf("last capped session = %q, want s5", got[len(got)-1].ID)
+	}
+}
+
+func TestTraySessionMenuLabel_TruncatesAndEscapesAmpersand(t *testing.T) {
+	long := traySession{ID: "s1", Title: strings.Repeat("会", traySessionTitleLimit+3)}
+	got := traySessionMenuLabel(1, long)
+	if !strings.HasPrefix(got, "2. ") {
+		t.Fatalf("label prefix = %q, want numbered prefix", got)
+	}
+	if !strings.Contains(got, "…") {
+		t.Fatalf("label should contain ellipsis, got %q", got)
+	}
+
+	withAmpersand := traySession{ID: "s2", Title: "A & B"}
+	got = traySessionMenuLabel(0, withAmpersand)
+	if !strings.Contains(got, "A && B") {
+		t.Fatalf("label should escape ampersand for Win32 menus, got %q", got)
+	}
 }

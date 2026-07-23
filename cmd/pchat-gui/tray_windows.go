@@ -25,6 +25,7 @@ const (
 	cmdTrayNewSession    = 1002
 	cmdTraySessionPicker = 1003
 	cmdTrayQuit          = 1004
+	cmdTrayRecentBase    = 2000
 
 	wmCommand     = 0x0111
 	wmClose       = 0x0010
@@ -48,7 +49,9 @@ const (
 	lrDefaultSize  = 0x00000040
 	idiApplication = 32512
 	mfString       = 0x00000000
+	mfGrayed       = 0x00000001
 	mfSeparator    = 0x00000800
+	mfPopup        = 0x00000010
 	tpmRightButton = 0x00000002
 	tpmReturnCmd   = 0x00000100
 	tpmNonotify    = 0x00000080
@@ -85,11 +88,13 @@ var (
 )
 
 type trayHandle struct {
-	app   *App
-	hwnd  windows.Handle
-	hicon windows.Handle
-	ok    atomic.Bool
-	once  sync.Once
+	app            *App
+	hwnd           windows.Handle
+	hicon          windows.Handle
+	mu             sync.Mutex
+	recentCommands map[int]traySession
+	ok             atomic.Bool
+	once           sync.Once
 }
 
 type point struct {
@@ -301,6 +306,7 @@ func (t *trayHandle) showMenu() {
 	appendTrayMenuItem(menu, cmdTrayOpen, "打开 P-Chat")
 	appendTrayMenuItem(menu, cmdTrayNewSession, "新增对话")
 	appendTrayMenuItem(menu, cmdTraySessionPicker, "打开对话...")
+	t.appendRecentSessionsMenu(menu)
 	procAppendMenuW.Call(menu, mfSeparator, 0, 0)
 	appendTrayMenuItem(menu, cmdTrayQuit, "退出 P-Chat")
 
@@ -341,12 +347,69 @@ func (t *trayHandle) handleCommand(command int) {
 		}()
 	case cmdTrayQuit:
 		go t.app.quitApp()
+	default:
+		if session, ok := t.recentSessionForCommand(command); ok {
+			go func() {
+				t.app.showMainWindow()
+				if t.app.ctx != nil {
+					wailsruntime.EventsEmit(t.app.ctx, "tray:switch-session", map[string]string{
+						"session_id":   session.ID,
+						"project_path": session.ProjectPath,
+					})
+				}
+			}()
+		}
 	}
 }
 
+func (t *trayHandle) appendRecentSessionsMenu(menu uintptr) {
+	sessions := t.app.recentTraySessions()
+	t.setRecentCommands(sessions)
+
+	submenu, _, err := procCreatePopupMenu.Call()
+	if submenu == 0 {
+		log.Printf("tray: CreatePopupMenu(recent) failed: %v", err)
+		return
+	}
+	if len(sessions) == 0 {
+		appendTrayMenuItemWithFlags(submenu, 0, "暂无最近对话", mfString|mfGrayed)
+	} else {
+		for i, session := range sessions {
+			appendTrayMenuItem(submenu, uintptr(cmdTrayRecentBase+i), traySessionMenuLabel(i, session))
+		}
+	}
+	procAppendMenuW.Call(menu, mfPopup, submenu, uintptr(unsafe.Pointer(mustUTF16Ptr("最近对话"))))
+}
+
+func (t *trayHandle) setRecentCommands(sessions []traySession) {
+	commands := make(map[int]traySession, len(sessions))
+	for i, session := range sessions {
+		commands[cmdTrayRecentBase+i] = session
+	}
+	t.mu.Lock()
+	t.recentCommands = commands
+	t.mu.Unlock()
+}
+
+func (t *trayHandle) recentSessionForCommand(command int) (traySession, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	session, ok := t.recentCommands[command]
+	return session, ok
+}
+
 func appendTrayMenuItem(menu uintptr, id uintptr, label string) {
+	appendTrayMenuItemWithFlags(menu, id, label, mfString)
+}
+
+func appendTrayMenuItemWithFlags(menu uintptr, id uintptr, label string, flags uintptr) {
 	ptr, _ := windows.UTF16PtrFromString(label)
-	procAppendMenuW.Call(menu, mfString, id, uintptr(unsafe.Pointer(ptr)))
+	procAppendMenuW.Call(menu, flags, id, uintptr(unsafe.Pointer(ptr)))
+}
+
+func mustUTF16Ptr(s string) *uint16 {
+	ptr, _ := windows.UTF16PtrFromString(s)
+	return ptr
 }
 
 func loadTrayIcon(instance windows.Handle) windows.Handle {

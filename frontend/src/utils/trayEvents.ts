@@ -1,7 +1,8 @@
-import { createSession, switchSession } from '../stores/chat'
+import { createSession, loadSessions, setActiveProject, state, switchSession } from '../stores/chat'
 
 type TraySwitchPayload = {
   session_id?: string
+  project_path?: string
 }
 
 // setupTrayEventListeners wires native tray actions into the Vue store.
@@ -32,7 +33,14 @@ export async function setupTrayEventListeners(): Promise<() => void> {
   on('tray:switch-session', (payload?: TraySwitchPayload) => {
     const id = payload?.session_id
     if (!id) return
-    switchSession(id).catch((e) => console.warn('tray:switch-session failed', e))
+    ;(async () => {
+      if (typeof payload?.project_path === 'string' && payload.project_path !== state.activeProjectPath) {
+        await setActiveProject(payload.project_path)
+      } else {
+        await loadSessions()
+      }
+      await switchSession(id)
+    })().catch((e) => console.warn('tray:switch-session failed', e))
   })
 
   on('tray:show-session-picker', () => {
