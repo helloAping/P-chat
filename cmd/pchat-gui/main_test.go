@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFindServerBinary_FindsSibling(t *testing.T) {
@@ -249,5 +251,32 @@ func TestTraySessionMenuLabel_TruncatesAndEscapesAmpersand(t *testing.T) {
 	got = traySessionMenuLabel(0, withAmpersand)
 	if !strings.Contains(got, "A && B") {
 		t.Fatalf("label should escape ampersand for Win32 menus, got %q", got)
+	}
+}
+
+func TestAcquireSingleInstance_DetectsExistingInstance(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("single-instance mutex is currently Windows-only")
+	}
+	t.Setenv("PCHAT_SINGLE_INSTANCE_MUTEX", fmt.Sprintf(`Local\PChatGuiTest-%d`, time.Now().UnixNano()))
+
+	first, already, err := acquireSingleInstance()
+	if err != nil {
+		t.Fatalf("first acquireSingleInstance: %v", err)
+	}
+	defer first.release()
+	if already {
+		t.Fatal("first acquire should not report an existing instance")
+	}
+
+	second, already, err := acquireSingleInstance()
+	if err != nil {
+		t.Fatalf("second acquireSingleInstance: %v", err)
+	}
+	if second != nil {
+		defer second.release()
+	}
+	if !already {
+		t.Fatal("second acquire should report an existing instance")
 	}
 }

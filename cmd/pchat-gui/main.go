@@ -145,6 +145,17 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("pchat-gui starting; exe=%s", exe)
 
+	instanceLock, alreadyRunning, lockErr := acquireSingleInstance()
+	if lockErr != nil {
+		log.Printf("single instance: lock unavailable, continuing without it: %v", lockErr)
+	} else if alreadyRunning {
+		signaled := signalExistingInstance()
+		log.Printf("single instance: another GUI is already running; signaled=%v", signaled)
+		return
+	} else {
+		defer instanceLock.release()
+	}
+
 	app := NewApp()
 	err := wails.Run(&options.App{
 		Title:             "P-Chat",

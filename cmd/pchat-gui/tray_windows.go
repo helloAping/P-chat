@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	trayWindowClass = "PChatTrayWindow"
-	trayUID         = 1
-	trayCallbackMsg = 0x0400 + 121
+	trayWindowClass       = "PChatTrayWindow"
+	trayUID               = 1
+	trayCallbackMsg       = 0x0400 + 121
+	trayShowMainWindowMsg = 0x0400 + 122
 
 	cmdTrayOpen          = 1001
 	cmdTrayNewSession    = 1002
@@ -265,6 +266,11 @@ func trayWindowProc(hwnd uintptr, msg uint32, wparam, lparam uintptr) uintptr {
 	trayWindowsMu.Unlock()
 
 	switch msg {
+	case trayShowMainWindowMsg:
+		if t != nil {
+			go t.app.showMainWindow()
+			return 0
+		}
 	case trayCallbackMsg:
 		if t != nil {
 			switch lparam {
