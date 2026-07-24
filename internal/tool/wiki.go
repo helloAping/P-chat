@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/config"
@@ -105,10 +104,17 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			return &CallResult{Content: "知识库未配置或不可用", IsError: true}, nil
 		}
 
-		// Collect results across all selected bases.
-		// Query each base with a large window to merge + re-rank across bases.
+		// Collect results across all selected bases (KB-01/KB-03).
+		// Each base is queried for the original query plus derived
+		// sub-queries. MergeAndRerank normalises scores, dedupes,
+		// and produces a global ranking before pagination.
+		plan := knowledge.PlanQueries(a.Query)
+		queries := plan.Queries
+		if a.Query == "" {
+			queries = []string{""}
+		}
 		var allItems []knowledge.IndexSearchItem
-		total := 0
+		rawTotal := 0
 		for _, base := range basesToSearch {
 			if !base.Enabled {
 				continue
@@ -117,48 +123,82 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			if err != nil {
 				continue
 			}
-			res, err := store.LookupSearch(ctx, a.Query, base.Name, a.Expand, a.Level, 1, 200)
-			if err != nil {
-				continue
+			for _, q := range queries {
+				res, err := store.LookupSearch(ctx, q, base.Name, a.Expand, a.Level, 1, 200)
+				if err != nil {
+					continue
+				}
+				items := knowledge.TagBase(res.Items, base.Name)
+				for i := range items {
+					if items[i].Query == "" {
+						items[i].Query = q
+					}
+				}
+				allItems = append(allItems, items...)
+				rawTotal += res.Total
 			}
-			allItems = append(allItems, res.Items...)
-			total += res.Total
 		}
-		if total == 0 {
+		if rawTotal == 0 && len(allItems) == 0 {
 			return &CallResult{Content: "(知识库为空，尚未扫描)"}, nil
 		}
 
-		// Re-rank across bases: sort by rank descending. Use
-		// sort.Slice (O(n log n)) instead of the previous
-		// insertion sort (O(n²)). For 1000+ items the previous
-		// version was the dominant cost of wiki_lookup.
-		sort.Slice(allItems, func(i, j int) bool {
-			return allItems[i].Rank > allItems[j].Rank
-		})
+		// Global merge: keep a generous pool then paginate.
+		// TopK = page*size so deeper pages still see globally-ranked items.
+		pool := a.Page * a.Size
+		if pool < a.Size {
+			pool = a.Size
+		}
+		if pool < 50 {
+			pool = 50
+		}
+		mergedAll := knowledge.MergeAndRerank(allItems, knowledge.MergeOptions{TopK: pool})
+		total := len(mergedAll)
+		if total < rawTotal {
+			// Merge truncates the pool; report at least the pool size
+			// so the LLM knows more may exist beyond this window.
+			total = len(mergedAll)
+		}
 
 		// Paginate the merged+re-ranked results.
 		start := (a.Page - 1) * a.Size
 		end := start + a.Size
-		if start >= len(allItems) {
-			start = len(allItems)
+		if start >= len(mergedAll) {
+			start = len(mergedAll)
 		}
-		if end > len(allItems) {
-			end = len(allItems)
+		if end > len(mergedAll) {
+			end = len(mergedAll)
 		}
-		mergedItems := allItems[start:end]
-		hasMore := (a.Page * a.Size) < total
+		mergedItems := mergedAll[start:end]
+		hasMore := end < len(mergedAll) || rawTotal > len(mergedAll)
 
 		var b strings.Builder
 		if a.Query == "" {
 			fmt.Fprintf(&b, "## Wiki Directory (%d files, page %d)\n\n", total, a.Page)
 		} else {
-			fmt.Fprintf(&b, "## wiki_lookup: \"%s\" (%d results, page %d)\n\n", a.Query, total, a.Page)
+			fmt.Fprintf(&b, "## wiki_lookup: \"%s\" (%d results, page %d)\n", a.Query, total, a.Page)
+			if len(plan.Queries) > 1 {
+				fmt.Fprintf(&b, "*派生查询: %s*\n", strings.Join(plan.Queries[1:], ", "))
+			}
+			b.WriteString("\n")
 		}
 		for _, it := range mergedItems {
 			if it.Parent != nil {
 				fmt.Fprintf(&b, "### %s / %s\n", it.Parent.Title, it.Title)
 			} else {
 				fmt.Fprintf(&b, "### %s\n", it.Title)
+			}
+			if it.Base != "" {
+				fmt.Fprintf(&b, "*来源库: %s*\n", it.Base)
+			}
+			citation := knowledge.BuildCitation(it)
+			if it.MatchType != "" {
+				fmt.Fprintf(&b, "*命中: %s*\n", it.MatchType)
+			}
+			if it.Query != "" && it.Query != a.Query {
+				fmt.Fprintf(&b, "*匹配查询: %s*\n", it.Query)
+			}
+			if citation.Explanation != "" {
+				fmt.Fprintf(&b, "*解释: %s*\n", citation.Explanation)
 			}
 			if it.Keywords != "" {
 				fmt.Fprintf(&b, "*关键词: %s*\n", it.Keywords)

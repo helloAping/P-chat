@@ -33,7 +33,7 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NTag, NSpin, NDropdown, useMessage } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
 import { h } from 'vue'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
@@ -47,10 +47,11 @@ import type { SearchResult } from '../api/client'
 import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
 import BrandLogo from './BrandLogo.vue'
+import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff,
-  ChevronDown, ChevronRight, Circle, MessageSquare,
+  ChevronDown, ChevronRight, Circle, MessageSquare, Download as DownloadIcon,
 } from './icons'
 
 const APP_VERSION = __APP_VERSION__
@@ -62,6 +63,7 @@ const themeName = defineModel<'dark' | 'light'>('themeName', { default: 'dark' }
 const showTokenStats = ref(false)
 
 const message = useMessage()
+const dialog = useDialog()
 const showAddProject = ref(false)
 const newProjectName = ref('')
 const newProjectPath = ref('')
@@ -279,6 +281,17 @@ function sessionMenuOptions(id: string) {
     },
     { type: 'divider' as const, key: 'd' },
     {
+      key: 'export-md',
+      label: '导出 Markdown',
+      icon: () => h(DownloadIcon, { size: 14 }),
+    },
+    {
+      key: 'export-json',
+      label: '导出 JSON',
+      icon: () => h(DownloadIcon, { size: 14 }),
+    },
+    { type: 'divider' as const, key: 'd2' },
+    {
       key: 'delete',
       label: '归档',
       icon: () => h(XIcon, { size: 14 }),
@@ -297,7 +310,142 @@ function onSessionMenu(key: string, id: string) {
       onDelete(id, new MouseEvent('click'))
       break
     }
+    case 'export-md':
+    case 'export-json': {
+      const fmt = key.slice('export-'.length) as ExportFormat
+      doExport(id, fmt)
+      break
+    }
   }
+}
+
+// downloadSession triggers a server-side export. The
+// rendering lives in pchat-server (internal/export +
+// internal/server.ExportSession) and reads straight
+// from the memory store, so the output is always
+// self-contained — no in-memory blob: URLs to break,
+// no dependency on what the SPA happens to have in
+// memory. The frontend just downloads the response.
+//
+// Format / size guards:
+//   * sessions with > 5k messages show a confirmation
+//     dialog — exporting tens of MB of markdown
+//     synchronously (with attachment data: URLs inlined)
+//     on the main thread will jank the UI. The dialog
+//     uses `useDialog().warning` so the user explicitly
+//     approves.
+//   * filename collisions are deduplicated (-2, -3, …)
+//     by probing the suggested name against an in-memory
+//     set of filenames we've already offered this
+//     session. We can't enumerate the user's downloads
+//     folder, so we just guard against the rapid
+//     double-click case where two exports would
+//     otherwise write the same name.
+//   * the actual download uses a transient <a download>
+//     link + URL.createObjectURL, the standard SPA
+//     pattern.
+
+// Module-level dedup cache. Reset on page reload;
+// that's fine — the worst case is one overwritten file
+// across reloads, and the user can rename in their
+// downloads folder.
+const recentlyExported = new Set<string>()
+
+async function doExport(id: string, format: ExportFormat) {
+  try {
+    // Pre-flight: ask the API for the message count so
+    // the 5k guard can fire BEFORE we burn a server-side
+    // render. listMessages returns 200 + empty array for
+    // a brand-new session, which is fine to export (the
+    // server writes a header-only file in that case).
+    const result = await api.listMessages(id)
+    const messages = result.messages || []
+    if (messages.length === 0) {
+      message.warning('该会话没有消息可导出')
+      return
+    }
+    if (messages.length > 5000) {
+      const proceed = await new Promise<boolean>((resolve) => {
+        dialog.warning({
+          title: '会话较大',
+          content: `该会话有 ${messages.length} 条消息,导出可能需要数秒并产生较大的文件。继续?`,
+          positiveText: '继续导出',
+          negativeText: '取消',
+          onPositiveClick: () => resolve(true),
+          onNegativeClick: () => resolve(false),
+          onClose: () => resolve(false),
+        })
+      })
+      if (!proceed) return
+    }
+    const title = state.sessions.find(s => s.id === id)?.title ?? ''
+    // The server is the source of truth: it reads from
+    // the store, renders to markdown/JSON, and returns
+    // the file with Content-Disposition. The browser
+    // just downloads.
+    const fmtQuery = format === 'json' ? 'json' : 'md'
+    const resp = await fetch(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`, {
+      method: 'GET',
+    })
+    if (!resp.ok) {
+      const t = await resp.text()
+      throw new Error(`HTTP ${resp.status}: ${t}`)
+    }
+    const blob = await resp.blob()
+    // Prefer the server's Content-Disposition filename
+    // (it knows the session id + title + timestamp) but
+    // fall back to the client-side suggestion if the
+    // header is missing for any reason.
+    const cd = resp.headers.get('Content-Disposition') || ''
+    const serverName = parseContentDispositionFilename(cd)
+    const baseFilename = serverName || suggestFilename(title, format)
+    const filename = dedupeFilename(baseFilename, (p) => recentlyExported.has(p))
+    recentlyExported.add(filename)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    message.success(`已导出 ${filename}`)
+  } catch (e) {
+    console.error('[export] failed:', e)
+    message.error('导出失败: ' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+// parseContentDispositionFilename pulls a usable
+// filename out of a Content-Disposition header. Order
+// of preference (per RFC 6266 / 5987):
+//   1. `filename*=UTF-8''<percent-encoded>` — the
+//      Unicode-aware form. Decoded, this is the
+//      human-readable title. Browsers honour this in
+//      preference to the plain `filename=` parameter.
+//   2. `filename="..."` — always ASCII (the server
+//      builds this from the session id). Safe
+//      fallback for HTTP clients that don't decode
+//      `filename*`.
+// Returns the empty string on any parse failure — the
+// caller falls back to the client-side suggestion.
+function parseContentDispositionFilename(cd: string): string {
+  if (!cd) return ''
+  // Try the RFC 5987 form first. The charset is
+  // hard-coded to UTF-8 because that's the only
+  // value the server emits.
+  const ext = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(cd)
+  if (ext) {
+    try {
+      const decoded = decodeURIComponent(ext[1])
+      if (decoded) return decoded
+    } catch {
+      // Malformed percent-encoding — fall through
+      // to the plain form.
+    }
+  }
+  const plain = /filename="([^"]+)"/.exec(cd)
+  return plain ? plain[1] : ''
 }
 
 // ---------------------------------------------------------------------------

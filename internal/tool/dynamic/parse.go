@@ -62,16 +62,13 @@ type Spec struct {
 	// terse but specific ("send an SMS to the user" beats
 	// "sends things").
 	Description string `yaml:"description"`
-	// ParametersRaw is the JSON Schema object as a raw
-	// YAML scalar (a string the user wrote, typically
-	// multi-line block-scalar YAML). We accept it as a
-	// string at the YAML layer because json.RawMessage's
-	// UnmarshalYAML rejects anything that doesn't
-	// already look like JSON; we then compile it to
-	// Parameters ourselves in ParseSpec.
-	ParametersRaw string `yaml:"parameters"`
+	// ParametersNode is the JSON Schema object the user wrote
+	// under `parameters:`. It accepts both normal YAML mapping
+	// syntax and a JSON object block scalar; ParseSpec compiles
+	// it to Parameters for the registry.
+	ParametersNode yaml.Node `yaml:"parameters"`
 	// Parameters is the compiled json.RawMessage of
-	// ParametersRaw. Empty when the user didn't supply
+	// ParametersNode. Empty when the user didn't supply
 	// one. The tool.Registry expects this shape; the
 	// AsTool helper copies it through.
 	Parameters json.RawMessage `yaml:"-"`
@@ -182,11 +179,10 @@ func ParseSpec(data []byte) (Spec, error) {
 	// json.RawMessage the rest of the package expects.
 	// Done before Validate so the object-shape check
 	// sees the compiled value.
-	if s.ParametersRaw != "" {
-		raw := []byte(s.ParametersRaw)
-		trimmed := skipWS(raw)
-		if len(trimmed) == 0 || trimmed[0] != '{' {
-			return s, fmt.Errorf("parameters must be a JSON object, got %s...", string(trimmed)[:min(len(trimmed), 16)])
+	if s.ParametersNode.Kind != 0 {
+		raw, err := compileParametersNode(&s.ParametersNode)
+		if err != nil {
+			return s, err
 		}
 		s.Parameters = json.RawMessage(raw)
 	}
@@ -206,6 +202,32 @@ func ParseSpec(data []byte) (Spec, error) {
 		s.Sandbox.Write = "confirm"
 	}
 	return s, nil
+}
+
+func compileParametersNode(n *yaml.Node) ([]byte, error) {
+	if n == nil || n.Kind == 0 {
+		return nil, nil
+	}
+	if n.Kind == yaml.ScalarNode {
+		raw := []byte(n.Value)
+		trimmed := skipWS(raw)
+		if len(trimmed) == 0 || trimmed[0] != '{' {
+			return nil, fmt.Errorf("parameters must be a JSON object, got %s...", string(trimmed)[:min(len(trimmed), 16)])
+		}
+		if !json.Valid(raw) {
+			return nil, fmt.Errorf("parameters must be valid JSON object")
+		}
+		return raw, nil
+	}
+	var v any
+	if err := n.Decode(&v); err != nil {
+		return nil, fmt.Errorf("parameters decode: %w", err)
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("parameters marshal: %w", err)
+	}
+	return raw, nil
 }
 
 // Validate enforces the required-field rules. Called by

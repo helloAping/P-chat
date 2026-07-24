@@ -10,14 +10,15 @@ import (
 	"path/filepath"
 
 	"github.com/fatih/color"
-	"github.com/spf13/cobra"
 	"github.com/p-chat/pchat/internal/cli"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/internal/recall"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/version"
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -67,7 +68,7 @@ var versionCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "配置文件路径")
-	rootCmd.PersistentFlags().StringVarP(&styleStr, "style", "s", "", "默认风格: cute | guofeng | tech")
+	rootCmd.PersistentFlags().StringVarP(&styleStr, "style", "s", "", "默认风格: off | cute | guofeng | tech")
 	rootCmd.PersistentFlags().StringVarP(&provider, "provider", "p", "", "LLM 提供商名)")
 
 	rootCmd.AddCommand(initCmd)
@@ -136,10 +137,10 @@ func runREPL(cmd *cobra.Command, args []string) error {
 	defer signal.Stop(sigCh)
 
 	srv, err := serverproc.Start(ctx, serverproc.Options{
-		ServerBin: bin,
-		Port:      0,
+		ServerBin:  bin,
+		Port:       0,
 		ConfigPath: cfgFile,
-		WebDir:    webDir,
+		WebDir:     webDir,
 	})
 	if err != nil {
 		return fmt.Errorf("start pchat-server: %w", err)
@@ -172,6 +173,7 @@ func runREPL(cmd *cobra.Command, args []string) error {
 	} else {
 		newSess, err := httpClient.CreateSession(context.Background(), httpcli.CreateSessionOpts{
 			Style:    string(s),
+			WorkMode: string(cfg.WorkMode.Default.Normalize()),
 			Provider: prov,
 		})
 		if err != nil {
@@ -180,8 +182,29 @@ func runREPL(cmd *cobra.Command, args []string) error {
 		curSess = newSess.ID
 	}
 
-	cliCtx := cli.NewHTTPContext(httpClient, string(s), prov, curSess)
+	cliCtx := cli.NewHTTPContext(httpClient, string(s), string(cfg.WorkMode.Default.Normalize()), prov, curSess)
 	repl := cli.NewREPL(cliCtx, cfg, s, prov)
+	// T13: propagate the long-lived ctx so SIGINT cancels
+	// in-flight recall/snapshot operations instead of
+	// leaving them to finish after the user hits Ctrl+C.
+	repl.SetRunContext(ctx)
+
+	// T13: wire up the recall engine. We open a read-only
+	// handle on the first enabled knowledge base so /recall
+	// actually searches (the engine is a no-op stub until
+	// this is set). The wiki.db lives under the base's
+	// directory per knowledge.NewWikiStore's contract.
+	if cfg.Knowledge.Enabled {
+		for _, base := range cfg.Knowledge.Bases {
+			if !base.Enabled || base.Path == "" {
+				continue
+			}
+			eng := recall.NewEngine(base.Name, base.Path, os.Stdout)
+			repl.SetRecallEngine(eng)
+			dim.Printf("  recall: 已挂载知识库 %q (%s)\n", base.Name, base.Path)
+			break
+		}
+	}
 
 	// Run REPL in a goroutine; listen for SIGINT in the main goroutine
 	// so we can cleanly stop the server on Ctrl+C.

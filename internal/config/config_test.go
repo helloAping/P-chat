@@ -1,4 +1,4 @@
-﻿package config
+package config
 
 import (
 	"encoding/json"
@@ -22,6 +22,60 @@ func TestSubAgentConfig_Defaults(t *testing.T) {
 	}
 	if c.SubAgent.ToolAllowed("task") {
 		t.Error("task should NEVER be allowed (recursion)")
+	}
+}
+
+func TestWorkModeNormalize(t *testing.T) {
+	cases := []struct {
+		in   WorkMode
+		want WorkMode
+	}{
+		{"", WorkModeCoding},
+		{WorkModeCoding, WorkModeCoding},
+		{WorkModeDaily, WorkModeDaily},
+		{"bogus", WorkModeCoding},
+		{"DAILY", WorkModeCoding},
+	}
+	for _, tc := range cases {
+		if got := tc.in.Normalize(); got != tc.want {
+			t.Errorf("WorkMode(%q).Normalize() = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if !WorkModeCoding.IsValid() || !WorkModeDaily.IsValid() {
+		t.Fatal("built-in work modes should be valid")
+	}
+	if WorkMode("").IsValid() || WorkMode("bogus").IsValid() {
+		t.Fatal("empty/bogus work modes should be invalid")
+	}
+	if got := Default().WorkMode.Default; got != WorkModeCoding {
+		t.Fatalf("Default().WorkMode.Default = %q, want %q", got, WorkModeCoding)
+	}
+}
+
+func TestCloseBehaviorNormalize(t *testing.T) {
+	cases := []struct {
+		in   CloseBehavior
+		want CloseBehavior
+	}{
+		{"", CloseBehaviorExit},
+		{CloseBehaviorExit, CloseBehaviorExit},
+		{CloseBehaviorTray, CloseBehaviorTray},
+		{"bogus", CloseBehaviorExit},
+		{"TRAY", CloseBehaviorExit},
+	}
+	for _, tc := range cases {
+		if got := tc.in.Normalize(); got != tc.want {
+			t.Errorf("CloseBehavior(%q).Normalize() = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if !CloseBehaviorExit.IsValid() || !CloseBehaviorTray.IsValid() {
+		t.Fatal("built-in close behaviors should be valid")
+	}
+	if CloseBehavior("").IsValid() || CloseBehavior("bogus").IsValid() {
+		t.Fatal("empty/bogus close behaviors should be invalid")
+	}
+	if got := Default().UI.CloseBehavior; got != CloseBehaviorExit {
+		t.Fatalf("Default().UI.CloseBehavior = %q, want %q", got, CloseBehaviorExit)
 	}
 }
 
@@ -506,6 +560,28 @@ func TestLoad_NoConfigFallsBackToDefault(t *testing.T) {
 	if cfg.Server.Host != "127.0.0.1" {
 		t.Errorf("default server.host = %q, want 127.0.0.1", cfg.Server.Host)
 	}
+	if cfg.UI.CloseBehavior != CloseBehaviorExit {
+		t.Errorf("default ui.close_behavior = %q, want %q", cfg.UI.CloseBehavior, CloseBehaviorExit)
+	}
+}
+
+func TestLoad_NormalizesCloseBehavior(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	initial := `{"ui":{"close_behavior":"bogus"}}`
+	if err := osWriteFile(filepath.Join(dir, ".p-chat", "config.json"), initial); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UI.CloseBehavior != CloseBehaviorExit {
+		t.Errorf("invalid close_behavior should normalize to exit, got %q", cfg.UI.CloseBehavior)
+	}
 }
 
 func TestProviderConfig_FindModel(t *testing.T) {
@@ -571,7 +647,7 @@ func osWriteFile(path, content string) error {
 // jsonMarshal / jsonUnmarshal are thin wrappers so the
 // TestModelConfig_JSONRoundTrip test can verify the field tags
 // without depending on the implementation file.
-func jsonMarshal(v any) ([]byte, error)    { return json.Marshal(v) }
+func jsonMarshal(v any) ([]byte, error)      { return json.Marshal(v) }
 func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
 // contains is a tiny helper around strings.Contains.

@@ -104,7 +104,7 @@ func TestManager_Stop_UnregistersTools(t *testing.T) {
 	m := NewManager(cfg, reg)
 
 	// Manually register tools (simulating a connection had arrived).
-	RegisterBrowserTools(reg, m.Hub())
+	RegisterBrowserTools(reg, m.Hub(), m.Policy)
 
 	m.Start()
 	defer m.Stop()

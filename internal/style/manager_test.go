@@ -59,6 +59,9 @@ func TestParseStyle(t *testing.T) {
 		want Style
 		err  bool
 	}{
+		{"off", Off, false},
+		{"关闭", Off, false},
+		{"无", Off, false},
 		{"cute", Cute, false},
 		{"Cute", Cute, false},
 		{"小P", Cute, false},

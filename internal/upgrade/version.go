@@ -5,10 +5,10 @@ package upgrade
 // and runs any pending steps in order.
 //
 // ADDING A NEW VERSION:
-//   1. Add a constant for the new version below.
-//   2. Update Current to point to it.
-//   3. Register a step function in steps.go.
-//   4. Bump the version in testdata if needed.
+//  1. Add a constant for the new version below.
+//  2. Update Current to point to it.
+//  3. Register a step function in steps.go.
+//  4. Bump the version in testdata if needed.
 //
 // The version file is a plain-text file at ~/.p-chat/version containing
 // just the integer version number (e.g. "3").
@@ -36,7 +36,12 @@ const (
 	// that had run install.ps1 -AddToPath.
 	V4 AppVersion = 4
 
+	// V5 — work_mode added to config/session metadata. JSON
+	// fields are backward compatible and Normalize() handles
+	// missing values, so no data migration is required.
+	V5 AppVersion = 5
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V4
+	Current AppVersion = V5
 )

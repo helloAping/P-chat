@@ -310,7 +310,10 @@ async function downloadAttachment(a: MessageAttachment) {
 // messageMarkdownText returns a clean text representation
 // of the message: for user messages that's the raw
 // `content`, for assistant messages it's the joined text
-// parts. Attachments and tool calls are skipped.
+   // parts. Attachments and tool calls are skipped here —
+// image attachments are picked up separately by
+// copyEntireMessage so the clipboard can carry both the
+// text and the image bytes via the ClipboardItem API.
 function messageMarkdownText(): string {
   const m = props.message
   if (m.role === 'user' || m.role === 'system' || m.role === 'tool') {
@@ -325,25 +328,151 @@ function messageMarkdownText(): string {
   return m.content || ''
 }
 
+// imageAttachmentsOf returns the image_url attachments
+// of the message with non-empty URLs, type-narrowed so
+// the caller can use `.url` without a null check.
+function imageAttachmentsOf(): Array<MessageAttachment & { url: string }> {
+  return (props.message.attachments || []).filter(
+    (a): a is MessageAttachment & { url: string } =>
+      a.type === 'image_url' && !!a.url,
+  )
+}
+
+// MAX_RICH_IMAGES caps the number of images we pack into
+// a single clipboard write. The ClipboardItem API works
+// with multiple items, but pasting >5 images at once is
+// rarely what the user wants; extras are skipped silently
+// (they can still be downloaded individually via the
+// per-attachment toolbar).
+const MAX_RICH_IMAGES = 5
+
+// tryCopyRich assembles a multi-item clipboard payload
+// (text + N images) and writes it via the ClipboardItem
+// API. Returns true on success, false if the API is
+// unavailable, all image fetches failed, or the write
+// itself rejected. The caller is expected to fall back
+// to text-only copy on false.
+async function tryCopyRich(
+  text: string,
+  images: Array<MessageAttachment & { url: string }>,
+): Promise<boolean> {
+  // ClipboardItem isn't always present in lib.dom
+  // typings — fall back to (window as any), same pattern
+  // as copyImageToClipboard in utils/clipboard.ts.
+  const ClipboardItemCtor =
+    (window as any).ClipboardItem ||
+    (window as { ClipboardItem?: any }).ClipboardItem
+  if (!ClipboardItemCtor || !navigator.clipboard?.write) return false
+
+  try {
+    // Fetch every image in parallel; tolerate per-image
+    // failures (e.g. one of the data URLs is malformed)
+    // by dropping just the broken ones.
+    type Fetched = { att: MessageAttachment & { url: string }; blob: Blob | null }
+    const fetched: Fetched[] = await Promise.all(
+      images.slice(0, MAX_RICH_IMAGES).map(async (a): Promise<Fetched> => {
+        try {
+          return { att: a, blob: await fetchAsBlob(a.url) }
+        } catch {
+          return { att: a, blob: null }
+        }
+      }),
+    )
+    const valid = fetched.filter(
+      (f): f is { att: MessageAttachment & { url: string }; blob: Blob } =>
+        f.blob !== null,
+    )
+    if (valid.length === 0) return false
+
+    // A single ClipboardItem can carry multiple MIME-type
+    // representations of the same logical content. We pack
+    // the text and the *first* image into one item — that's
+    // the most common case (one screenshot plus the user's
+    // caption) and gives the best paste experience in chat
+    // apps that pick the richest representation available.
+    const first = valid[0]
+    const firstPayload: Record<string, Blob> = {}
+    if (text) firstPayload['text/plain'] = new Blob([text], { type: 'text/plain' })
+    firstPayload[first.blob.type || 'image/png'] = first.blob
+    const items: any[] = [new ClipboardItemCtor(firstPayload)]
+
+    // Additional images become their own ClipboardItem
+    // each — paste targets can then pick whichever they
+    // want instead of being forced into a single bundle.
+    for (let i = 1; i < valid.length; i++) {
+      const b = valid[i]
+      items.push(
+        new ClipboardItemCtor({
+          [b.blob.type || 'image/png']: b.blob,
+        }),
+      )
+    }
+
+    // @ts-ignore — write() overload taking a ClipboardItem[]
+    // is missing in some TS lib.dom.d.ts versions.
+    await navigator.clipboard.write(items)
+
+    if (valid.length === 1) {
+      toast.success('已复制文本和图片')
+    } else {
+      toast.success(`已复制文本和 ${valid.length} 张图片`)
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function copyEntireMessage() {
   // Bail out if we're already showing the success state —
   // a second click during the 1.2s feedback window
   // shouldn't cancel the feedback or restart the timer.
   if (isAction('copy', 'feedback')) return
+
   const text = messageMarkdownText()
-  if (!text) {
-    toast.error('消息为空')
+  const images = imageAttachmentsOf()
+
+  // Pure-text path: no images on this message, keep the
+  // original behavior (text-only copy).
+  if (images.length === 0) {
+    if (!text) {
+      toast.error('消息为空')
+      return
+    }
+    const ok = await copyText(text)
+    if (ok) {
+      // Local visual feedback (icon swap → Check, 1.2s).
+      // The toast is kept as a secondary signal but the
+      // icon swap is the primary cue — toasts can race with
+      // the user's mouse movement (the toolbar fades out
+      // on mouseleave), so the icon must be visible at the
+      // moment of click without depending on the toast.
+      setActionState('copy', 'feedback', 1200)
+    } else {
+      toast.error('复制失败')
+    }
     return
   }
-  const ok = await copyText(text)
-  if (ok) {
-    // Local visual feedback (icon swap → Check, 1.2s).
-    // The toast is kept as a secondary signal but the
-    // icon swap is the primary cue — toasts can race with
-    // the user's mouse movement (the toolbar fades out
-    // on mouseleave), so the icon must be visible at the
-    // moment of click without depending on the toast.
+
+  // Rich path: text + one or more images. Falls back to
+  // text-only on any failure so the user always gets at
+  // least the text portion of the message.
+  const rich = await tryCopyRich(text, images)
+  if (rich) {
     setActionState('copy', 'feedback', 1200)
+    return
+  }
+  if (!text) {
+    // Image-only message (no text body) and the rich
+    // copy failed — nothing useful to put on the
+    // clipboard, surface the failure.
+    toast.error('复制失败')
+    return
+  }
+  const textOk = await copyText(text)
+  if (textOk) {
+    setActionState('copy', 'feedback', 1200)
+    toast.info('剪贴板不支持图片，已复制文本')
   } else {
     toast.error('复制失败')
   }

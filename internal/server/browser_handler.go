@@ -41,13 +41,19 @@ func (h *Handler) BrowserStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"enabled": false, "count": 0})
 		return
 	}
+	lastErr, lastErrAt := h.browserMgr.Hub().LastError()
 	out := gin.H{
-		"enabled": h.browserMgr.IsEnabled(),
-		"count":   h.browserMgr.Hub().Count(),
+		"enabled":                   h.browserMgr.IsEnabled(),
+		"count":                     h.browserMgr.Hub().Count(),
+		"expected_protocol_version": browser.ProtocolVersion,
 	}
 	if h.listenAddr != "" {
 		out["http_url"] = "http://" + h.listenAddr
 		out["ws_url"] = "ws://" + h.listenAddr + "/api/v1/browser/ws"
+	}
+	if lastErr != "" {
+		out["last_error"] = lastErr
+		out["last_error_at"] = lastErrAt
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -128,6 +134,7 @@ func (h *Handler) BrowserWebSocket(c *gin.Context) {
 	ctx := c.Request.Context()
 	hi := readHello(ctx, conn)
 	if hi == nil {
+		h.browserMgr.Hub().RecordError("hello timeout or parse failure")
 		_ = conn.Close(websocket.StatusProtocolError, "hello timeout")
 		return
 	}
@@ -138,8 +145,12 @@ func (h *Handler) BrowserWebSocket(c *gin.Context) {
 	}
 
 	helloResp := browser.HelloResponse{
-		Type:      "hello-ok",
-		BrowserID: clientID,
+		Type:                    "hello-ok",
+		BrowserID:               clientID,
+		ProtocolVersion:         hi.ProtocolVersion,
+		ExpectedProtocolVersion: browser.ProtocolVersion,
+		UpdateRequired:          !browser.ProtocolCompatible(hi.ProtocolVersion),
+		UpdateMessage:           browser.UpdateMessage(hi.ProtocolVersion),
 	}
 	wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
 	defer wcancel()
@@ -149,9 +160,9 @@ func (h *Handler) BrowserWebSocket(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[browser] client %s connected (name=%q, tabs=%d)", clientID, hi.BrowserName, hi.TabsCount)
+	log.Printf("[browser] client %s connected (name=%q, tabs=%d, ext=%q, proto=%q)", clientID, hi.BrowserName, hi.TabsCount, hi.ExtensionVersion, hi.ProtocolVersion)
 
-	client := browser.NewBrowserClient(clientID, hi.BrowserName, conn)
+	client := browser.NewBrowserClient(clientID, hi.BrowserName, conn, *hi)
 	defer h.browserMgr.Hub().Unregister(clientID)
 
 	pumpCtx, pumpCancel := context.WithCancel(ctx)
@@ -159,6 +170,9 @@ func (h *Handler) BrowserWebSocket(c *gin.Context) {
 
 	h.browserMgr.Hub().Register(client)
 	client.StartReadPump(pumpCtx)
+	if snap := client.Snapshot(); snap.LastError != "" {
+		h.browserMgr.Hub().RecordError(fmt.Sprintf("%s: %s", clientID, snap.LastError))
+	}
 }
 
 func readHello(ctx context.Context, conn *websocket.Conn) *browser.HelloParams {
@@ -185,4 +199,65 @@ func readHello(ctx context.Context, conn *websocket.Conn) *browser.HelloParams {
 
 	log.Printf("[browser] hello parse error, raw: %s", string(raw))
 	return &browser.HelloParams{BrowserName: "unknown"}
+}
+
+// BrowserTabs lists open tabs for a connected browser.
+// GET /api/v1/browser/:id/tabs
+func (h *Handler) BrowserTabs(c *gin.Context) {
+	if h.browserMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "browser manager not available"})
+		return
+	}
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "browser id required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	result, err := h.browserMgr.Hub().ListTabs(ctx, id)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// BrowserSetActiveTab sets the preferred control target tab.
+// POST /api/v1/browser/:id/active-tab
+// Body: { "tab_id": 123 } or { "index": 0 }
+func (h *Handler) BrowserSetActiveTab(c *gin.Context) {
+	if h.browserMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "browser manager not available"})
+		return
+	}
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "browser id required"})
+		return
+	}
+	var req struct {
+		TabID *int `json:"tab_id"`
+		Index *int `json:"index"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+	tabID := 0
+	if req.TabID != nil {
+		tabID = *req.TabID
+	}
+	if tabID == 0 && req.Index == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tab_id or index is required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	result, err := h.browserMgr.Hub().SetActiveTab(ctx, id, tabID, req.Index)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
 }

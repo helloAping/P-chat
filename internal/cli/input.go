@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/style"
 	"golang.org/x/term"
 )
@@ -16,7 +17,7 @@ import (
 // chat box when the user types `/`.
 //
 // Returns the input string and whether it was a slash command.
-func InputLine(s style.Style, provider string) (string, bool, error) {
+func InputLine(s style.Style, provider string, mode config.WorkMode) (string, bool, error) {
 	fd := int(os.Stdin.Fd())
 
 	// Check if terminal supports raw mode
@@ -35,7 +36,7 @@ func InputLine(s style.Style, provider string) (string, bool, error) {
 	defer term.Restore(fd, oldState)
 
 	// Print prompt
-	printPromptRaw(s, provider)
+	printPromptRaw(s, provider, mode)
 
 	var buf []byte
 	var ghost string // current ghost suggestion (empty = none)
@@ -48,7 +49,7 @@ func InputLine(s style.Style, provider string) (string, bool, error) {
 	showGhost := func() {
 		dim := color.New(color.FgHiBlack)
 		fmt.Print("\r\033[K")
-		printPromptRaw(s, provider)
+		printPromptRaw(s, provider, mode)
 		fmt.Print(string(buf))
 		if ghost != "" && ghostIdx >= 0 && ghostIdx < len(matches) {
 			// Print the suffix of the current match that is not already in buf.
@@ -296,7 +297,7 @@ func getSlashSuggestions(input string) []string {
 	return matches
 }
 
-func printPromptRaw(s style.Style, provider string) {
+func printPromptRaw(s style.Style, provider string, mode config.WorkMode) {
 	var icon string
 	switch s {
 	case style.Cute:
@@ -308,5 +309,5 @@ func printPromptRaw(s style.Style, provider string) {
 	default:
 		icon = "❯"
 	}
-	fmt.Printf("  %s \033[90m[%s]\033[0m ", icon, provider)
+	fmt.Printf("  %s \033[90m[%s mode:%s]\033[0m ", icon, provider, mode.Normalize())
 }

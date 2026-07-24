@@ -55,9 +55,10 @@ func init() {
 			Handler: cmdHelp,
 		},
 		{
-			Name: "/style", Aliases: []string{"/s"}, Description: "切换人格风格 [cute|guofeng|tech]",
-			Usage: "/style [cute|guofeng|tech]",
-			Args: "cute     - 可爱风 (小P, 🐹)\n" +
+			Name: "/style", Aliases: []string{"/s"}, Description: "切换说话风格 [off|cute|guofeng|tech]",
+			Usage: "/style [off|cute|guofeng|tech]",
+			Args: "off      - 关闭风格，不注入人格提示词和风格记忆\n" +
+				"      cute     - 可爱风 (小P)\n" +
 				"      guofeng  - 古风 (墨言, 📜)\n" +
 				"      tech     - 科技风 (NEXUS, ⚡)\n" +
 				"      不带参数 - 显示当前风格 + 列表 + 方向键选",
@@ -67,6 +68,19 @@ func init() {
 				"/style tech",
 			},
 			Handler: cmdStyle,
+		},
+		{
+			Name: "/mode", Description: "切换工作侧重点 [coding|daily]",
+			Usage: "/mode [coding|daily]",
+			Args: "coding   - 编码侧重点：读写代码、调试、测试、命令、git、review\n" +
+				"      daily    - 工作侧重点：文档、邮件、摘要、计划、知识检索、信息整理\n" +
+				"      不带参数 - 显示当前模式与可用模式",
+			Examples: []string{
+				"/mode",
+				"/mode daily",
+				"/mode coding",
+			},
+			Handler: cmdMode,
 		},
 		{
 			Name: "/model", Aliases: []string{"/m"}, Description: "切换或查看当前模型",
@@ -548,6 +562,11 @@ func cmdStyle(ctx cliContext, args string) error {
 		fmt.Println()
 		color.Cyan("  当前风格: %s\n", ctx.StyleLabel(current))
 		fmt.Println("  可用风格:")
+		marker := "  "
+		if style.Off == current {
+			marker = color.GreenString("→ ")
+		}
+		fmt.Printf("    %s%s (%s)\n", marker, string(style.Off), style.Off.DisplayName())
 		for _, s := range ctx.ListStyles() {
 			marker := "  "
 			if string(s) == ctx.StyleName() {
@@ -555,7 +574,7 @@ func cmdStyle(ctx cliContext, args string) error {
 			}
 			fmt.Printf("    %s%s (%s)\n", marker, string(s), ctx.StyleLabel(s))
 		}
-		fmt.Println("\n  用法: /style <cute|guofeng|tech>")
+		fmt.Println("\n  用法: /style <off|cute|guofeng|tech>")
 		return nil
 	}
 
@@ -565,6 +584,34 @@ func cmdStyle(ctx cliContext, args string) error {
 	}
 	newStyle, _ := style.ParseStyle(ctx.StyleName())
 	color.Green("  已切换到: %s (%s)", ctx.StyleName(), ctx.StyleLabel(newStyle))
+	return nil
+}
+
+func cmdMode(ctx cliContext, args string) error {
+	if args == "" {
+		fmt.Println()
+		color.Cyan("  当前工作模式: %s\n", ctx.ModeName())
+		fmt.Println("  可用模式:")
+		for _, wm := range ctx.ListModes() {
+			marker := "  "
+			if string(wm) == ctx.ModeName() {
+				marker = color.GreenString("→ ")
+			}
+			label := "编码侧重点"
+			if wm == config.WorkModeDaily {
+				label = "日常工作侧重点"
+			}
+			fmt.Printf("    %s%s (%s)\n", marker, string(wm), label)
+		}
+		fmt.Println("\n  用法: /mode <coding|daily>")
+		return nil
+	}
+
+	if err := ctx.SetMode(strings.TrimSpace(args)); err != nil {
+		color.Red("  未知工作模式: %s", args)
+		return nil
+	}
+	color.Green("  已切换工作模式: %s", ctx.ModeName())
 	return nil
 }
 
@@ -1272,7 +1319,8 @@ func cmdConfigModel(ctx cliContext, args string) error {
 // what to do with them.
 //
 // Recognized keys:
-//   display_name, description, max_tokens_context, max_tokens_output, default
+//
+//	display_name, description, max_tokens_context, max_tokens_output, default
 func parseModelKV(args []string) (config.ModelConfig, []string) {
 	m := config.ModelConfig{}
 	var extra []string
@@ -1824,9 +1872,11 @@ func cmdFork(ctx cliContext, args string) error {
 
 // cmdPlan asks the LLM to produce a step-by-step plan in plain
 // text (no tool calls). After the plan is shown, the user can:
-//   y / Enter  - approve and execute the plan
-//   n          - cancel
-//   e          - edit the plan before executing (未实现)
+//
+//	y / Enter  - approve and execute the plan
+//	n          - cancel
+//	e          - edit the plan before executing (未实现)
+//
 // The plan is NOT saved to the conversation memory until the user
 // explicitly approves.
 //

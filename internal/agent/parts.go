@@ -340,7 +340,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	// Tool call: start / ok / warn / error.
 	if c.ToolName != "" {
 		parts := a.activeParts()
-		status := toolStatusFromStep(c.Step, c.ToolError)
+		status := ToolStatusFromStep(c.Step, c.ToolError)
 		if status == "start" {
 			// When a ToolID is present, avoid clobbering an
 			// earlier same-name start part — the ID is the
@@ -644,17 +644,23 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	}
 }
 
-// toolStatusFromStep mirrors the switch in server/handler.go:
-// chunkToEvent so the accumulator and the wire format agree on
-// the status string for a given step. Keep the two in lockstep
-// if you ever touch this.
+// ToolStatusFromStep is the single source of truth for mapping a
+// tool-dispatch step (e.g. "call-1-ok") to the wire status string
+// the frontend expects ("ok" / "warn" / "error" / "start").
+//
+// Both the parts accumulator (internal/agent) and the SSE wire
+// mapper (internal/server/stream_adapter) call this so the in-memory
+// part status and the emitted `tool` event stay in lockstep.
 //
 // The step format is "call-<n>-<status>" (e.g. "call-1-ok",
 // "call-1-err", "call-1-warn"). We parse the trailing status
 // segment instead of substring-matching "ok" / "err" so a future
 // status name like "bookkeeping" or "trigger" can't accidentally
 // match. Empty / unparseable step → "start".
-func toolStatusFromStep(step, errMsg string) string {
+//
+// Exported so internal/server can use the same mapping without
+// duplicating the switch (was toolStatusFromChunkStep, removed).
+func ToolStatusFromStep(step, errMsg string) string {
 	if errMsg != "" {
 		return "error"
 	}

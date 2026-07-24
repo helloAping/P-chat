@@ -10,6 +10,8 @@
 
 P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片、问题模态框、设置面板等功能。与 pchat-server 通过同一域名的 `/api/v1/*` 端点通信，SSE 流通过 `fetch()` + `ReadableStream` 消费。
 
+用户向 GUI 操作流程统一写在项目根目录 `README.md` 的「GUI 操作入口速查」和「常见问题」里，例如浏览器控制安装与连接诊断、知识库选择、工作模式切换、风格关闭、工具列表、动态工具 YAML 加载诊断和 trace id 复制。本文件只记录前端实现结构和维护入口。
+
 ## 文件结构
 
 | 路径 | 职责 | 关键导出/组件 |
@@ -102,6 +104,8 @@ if (ev.sub_agent && ev.sub_agent_task) {
 核心状态：
 - `currentID` — 当前活动会话 ID
 - `sessionMessages[id]` — 消息列表
+- `sessionMeta[id].style` / `sessionMeta[id].workMode` — 单会话说话风格与工作侧重点；`style=off` 表示关闭风格 prompt 和风格记忆注入
+- `globalWorkMode` — `/api/v1/config.work_mode.default` 的前端缓存，新建/旧会话无覆盖时回落使用
 - `streaming[id]` — 是否正在流式传输
 - `sessionWorking[id]` — 是否忙碌（TodoPanel 控制）
 - `sessionTodos[id]` — 待办列表
@@ -224,9 +228,31 @@ Go binding `extractTraceID` 提取。详见 [P3-3 设计](../../docs/plans/round
 自定义工具带 "自定义" badge + "查看源码" 展开显示 YAML 路径
 （提示用户在编辑器中编辑）。TopBar 加 `Wrench` 按钮触发。
 
-`api/client.ts` 增 `listTools()` + `Tool` 类型（`dynamic` flag +
-`source` 路径）。`chat.ts` 无状态（按需 fetch）—— 工具列表是
-per-server 不 per-session。
+`api/client.ts` 增 `listTools()` / `listToolsDetailed()` + `Tool` 类型（`dynamic`
+flag + `source` 路径）。`GET /api/v1/tools` 同时返回 `diagnostics[]`，
+`ToolListDrawer.vue` 会把动态工具 YAML 解析失败项显示在"加载诊断"区域。
+`chat.ts` 无状态（按需 fetch）—— 工具列表是 per-server 不 per-session。
+
+#### BR-01 浏览器连接诊断
+
+`AppSettingsModal.vue` 的浏览器 Tab 读取 `getBrowserStatus()` 和
+`listBrowsers()`：显示 HTTP/WS 地址、连接数量、最近错误、tab 数、扩展版本、
+协议版本和最后活跃时间。旧扩展如果未上报版本字段，GUI 显示"未上报"。
+
+#### BR-02 浏览器扩展更新提示
+
+`browser-extension/background.js` 在 hello 握手里上报 `extension_version`
+和 `protocol_version`。服务端通过 `browser.ProtocolVersion` 判断兼容性，
+`listBrowsers()` 返回 `update_required` / `update_message`。浏览器设置 Tab
+在有旧扩展连接时显示"需更新扩展"标签和"下载最新扩展"入口。
+
+
+#### BR-03 多标签页管理
+
+浏览器设置 Tab 通过 `listBrowserTabs()` / `setBrowserActiveTab()` 展示已连接
+浏览器的标签页列表，并允许用户把某一页设为「控制目标」。扩展侧维护
+`preferredTabId`；`browser_*` 工具默认作用到该目标，也可在参数里显式传
+`tab_id` 覆盖。协议版本现为 `3`。
 
 ## 修改指南
 

@@ -8,6 +8,8 @@
 
 Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用循环**。当一个用户消息到达时，Agent 调用 LLM 获取回复 → 解析工具调用 → 执行工具 → 将结果反馈给 LLM → 继续循环，直到 LLM 决定结束或达到轮次上限。
 
+用户向功能说明（比如“auto-continue 怎么开”“work_mode 怎么切”“trace id 在哪复制”）统一放在项目根目录 `README.md` 的「GUI 操作入口速查」和「常见问题」。本模块文档只记录实现细节和维护入口。
+
 ## 文件结构
 
 | 文件 | 职责 | 关键函数/类型 |
@@ -22,7 +24,7 @@ Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用
 
 ```
 for round := 1; maxRounds==0 || round<=maxRounds; round++ {
-    1. 构建系统提示词 (style + AGENTS + rules + skills)
+    1. 构建系统提示词 (style + work_mode + AGENTS + rules + skills)
     2. 规范化消息 (normalizeToolResults — DeepSeek 兼容)
     3. 调用 LLM Stream → 获取内容/思考/工具调用
     4. 解析工具调用 (原生 tool_calls 或 markdown ```tool_call 块)
@@ -140,6 +142,15 @@ forwarder goroutine:
 - 仅暴露 `todo_write` 和 `question` 工具（执行类工具禁用）
 - `maxRounds = 1`（单轮）
 - LLM 生成分步计划 + 待办 + 可选澄清问题
+
+### 4.5 工作模式与说话风格
+
+`style` 和 `work_mode` 是两个正交维度：
+
+- `style` 只表示说话风格，以及该风格对应的记忆内容。`style=off` 时，`buildStyleBlock()` 返回空，`getStyleMemory()` 也返回空。
+- `work_mode` 表示任务侧重点。`coding` 偏向读写代码、调试、测试、构建、git、code review；`daily` 偏向文档、邮件、会议纪要、摘要、知识检索和计划整理。
+- `buildStaticSystemPrompt()` 的静态段拼装顺序是：`buildStyleBlock()` → `buildWorkModeBlock()` → AGENTS.md → rules → skills → tools → working dir → language。
+- 静态 prompt cache 的 signature 包含 `work_mode`，所以单会话切换 coding/daily 会触发新的系统 prompt。
 
 ### 5. DeepSeek 兼容性
 

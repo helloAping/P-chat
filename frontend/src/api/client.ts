@@ -1,7 +1,9 @@
-// Lightweight HTTP client for the pchat-server API.
+﻿// Lightweight HTTP client for the pchat-server API.
 // All requests are JSON unless noted. The streaming endpoint
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
+
+import { consumeSSEStream, decodeStreamEvent, emitStreamEvent } from './sse'
 
 const BASE = '' // same origin; pchat-server serves both UI and API
 
@@ -88,6 +90,7 @@ export interface Session {
   // no override, in which case the client falls back to
   // "tech" / "" / "" as a safe default for the UI.
   style?: string
+  work_mode?: string
   provider?: string
   model?: string
   project_path?: string
@@ -283,6 +286,7 @@ export interface SessionMeta {
   id: string
   title: string
   style: string
+  work_mode: string
   provider: string
   model: string
   project_path?: string
@@ -297,6 +301,7 @@ export interface UpdateSessionMetaResponse {
   id?: string
   title?: string
   style?: string
+  work_mode?: string
   provider?: string
   model?: string
   plan_mode?: boolean
@@ -371,10 +376,10 @@ export const listSessions = (projectPath: string) =>
 export const getSession = (id: string) =>
   jsonFetch<Session>(`/api/v1/sessions/${encodeURIComponent(id)}`)
 
-export const createSession = (projectPath?: string) =>
+export const createSession = (projectPath?: string, workMode?: string) =>
   jsonFetch<{ id: string }>(
     '/api/v1/sessions',
-    { method: 'POST', body: JSON.stringify({ project_path: projectPath || '' }) },
+    { method: 'POST', body: JSON.stringify({ project_path: projectPath || '', work_mode: workMode || '' }) },
   )
 
 export const deleteSession = (id: string) =>
@@ -388,7 +393,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -926,6 +931,7 @@ export interface SendOptions {
   provider?: string
   model?: string
   style?: string
+  workMode?: string
   // Inline attachments carry the bytes up front so the message
   // is self-contained: the chat bubble shows the image
   // immediately, the backend doesn't need to re-read the file
@@ -1139,6 +1145,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
     provider: opts.provider,
     model: opts.model,
     style: opts.style,
+    work_mode: opts.workMode,
     attachments: opts.attachments,
     skill_context: opts.skill_context || '',
     trace_id: traceId,
@@ -1155,9 +1162,8 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
       // events would land in session A's message list.
       if (wrap.session && wrap.session !== sessionId) return
       if (wrap.event && wrap.event !== 'message' && wrap.event !== '') return
-      const data = (wrap.data || '').trim()
-      if (!data || data === '[DONE]') return
-      const ev = JSON.parse(data) as StreamEvent
+      const ev = decodeStreamEvent(wrap.data || '', 'stream')
+      if (!ev) return
       // Wrap the dispatch in its own try/catch. The handler mutates
       // Vue reactive state, which can synchronously run a render
       // flush; if any Naive UI internals (popover, tooltip, NMessage
@@ -1166,11 +1172,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
       // Vue scheduler and surfaces in the console as
       // "P.querySelectorAll is not a function" — with no other
       // recovery. We log and continue, so the next event still lands.
-      try {
-        opts.onEvent(ev)
-      } catch (inner) {
-        console.warn('[stream] event handler threw, continuing:', inner)
-      }
+      emitStreamEvent(ev, 'stream', opts.onEvent)
     } catch (e) {
       console.warn('SSE parse error', e, 'raw:', (raw || '').slice(0, 200))
     }
@@ -1242,6 +1244,7 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
     provider: opts.provider,
     model: opts.model,
     style: opts.style,
+    work_mode: opts.workMode,
     attachments: opts.attachments,
     skill_context: opts.skill_context || '',
   })
@@ -1279,87 +1282,13 @@ async function streamMessagesViaFetch(sessionId: string, opts: SendOptions): Pro
     throw new Error(`stream: HTTP ${resp.status}: ${resp.statusText}`)
   }
 
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buf = ''
-  let dataBuf = ''
-  let lastSeq = -1
-  let done = false
-
-  while (!done) {
-    let r: ReadableStreamReadResult<Uint8Array>
-    try {
-      r = await reader.read()
-    } catch (e: any) {
-      // P0-1: the body stream died mid-flight (server
-      // crashed, network blip, reverse-proxy timeout).
-      // Surface as a drop event so the chat store can
-      // call the snapshot endpoint. Skip on user abort
-      // (the stop button sets signal.aborted before
-      // tearing the request down).
-      if (!opts.signal?.aborted && opts.onStreamDrop) {
-        try {
-          opts.onStreamDrop({ lastSeq, reason: e?.message || 'read failed' })
-        } catch { /* drop callback must not break the throw chain */ }
-      }
-      throw new Error(`stream: ${e?.message || e}`)
-    }
-    done = r.done
-    if (r.value) {
-      buf += decoder.decode(r.value, { stream: true })
-    }
-    // Drain complete `data: ...\nid: N\n\n` blocks from the buffer.
-    // The server emits two-line frames (data + id) per P3-1;
-    // `id:` is the standard SSE event ID we parse into ev.seq.
-    let nl: number
-    while ((nl = buf.indexOf('\n\n')) >= 0) {
-      const block = buf.slice(0, nl)
-      buf = buf.slice(nl + 2)
-      // Parse the block — gather every `data: …` line into the
-      // payload buffer, and remember the most recent `id: N` line
-      // (server emits at most one per frame).
-      dataBuf = ''
-      let frameSeq: number | undefined
-      for (const line of block.split('\n')) {
-        if (line.startsWith('data:')) {
-          if (dataBuf.length > 0) dataBuf += '\n'
-          dataBuf += line.slice(5).trimStart()
-        } else if (line.startsWith('id:')) {
-          // Standard SSE event ID line. Trim and parse; tolerate
-          // missing / non-numeric gracefully (P3-1 server always
-          // sends a number, but a legacy / proxy that strips the
-          // `id:` line must not break the parser).
-          const raw = line.slice(3).trim()
-          const n = Number(raw)
-          if (raw && Number.isFinite(n)) frameSeq = n
-        }
-      }
-      const data = dataBuf.trim()
-      if (!data || data === '[DONE]') continue
-      let ev: StreamEvent
-      try { ev = JSON.parse(data) as StreamEvent } catch {
-        console.warn('SSE parse error', 'raw:', data.slice(0, 200))
-        continue
-      }
-      // Fall back to the frame's id-line when the payload's
-      // seq field is missing (defensive — server always sets
-      // both). Cross-check monotonicity in dev mode so a server
-      // regression that re-uses a seq is loud, not silent.
-      if (frameSeq !== undefined) ev.seq = frameSeq
-      if (import.meta.env.DEV && typeof ev.seq === 'number') {
-        if (ev.seq <= lastSeq) {
-          console.warn(`[stream] non-monotonic seq: prev=${lastSeq} now=${ev.seq} type=${ev.type}`)
-        }
-        lastSeq = ev.seq
-        console.debug(`[stream] seq=${ev.seq} type=${ev.type} ${ev.sub_agent ? `sub=${ev.sub_agent_task ?? ''}` : ''}`)
-      }
-      try {
-        opts.onEvent(ev)
-      } catch (inner) {
-        console.warn('[stream] event handler threw, continuing:', inner)
-      }
-    }
-  }
+  await consumeSSEStream({
+    reader: resp.body.getReader(),
+    signal: opts.signal,
+    label: 'stream',
+    onEvent: opts.onEvent,
+    onStreamDrop: opts.onStreamDrop,
+  })
 }
 
 // streamWithRetry wraps streamMessages with up to 2 reconnect
@@ -1440,58 +1369,13 @@ export async function streamRegenerate(
     throw new Error(`regenerate: HTTP ${resp.status}: ${resp.statusText}`)
   }
 
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buf = ''
-  let dataBuf = ''
-  let lastSeq = -1
-  let done = false
-
-  while (!done) {
-    let r: ReadableStreamReadResult<Uint8Array>
-    try { r = await reader.read() }
-    catch (e: any) {
-      if (!opts.signal?.aborted && opts.onStreamDrop) {
-        try { opts.onStreamDrop({ lastSeq, reason: e?.message || 'read failed' }) } catch { /* */ }
-      }
-      throw new Error(`regenerate stream: ${e?.message || e}`)
-    }
-    done = r.done
-    if (r.value) buf += decoder.decode(r.value, { stream: true })
-
-    let nl: number
-    while ((nl = buf.indexOf('\n\n')) >= 0) {
-      const block = buf.slice(0, nl)
-      buf = buf.slice(nl + 2)
-      dataBuf = ''
-      let frameSeq: number | undefined
-      for (const line of block.split('\n')) {
-        if (line.startsWith('data:')) {
-          if (dataBuf.length > 0) dataBuf += '\n'
-          dataBuf += line.slice(5).trimStart()
-        } else if (line.startsWith('id:')) {
-          const raw = line.slice(3).trim()
-          const n = Number(raw)
-          if (raw && Number.isFinite(n)) frameSeq = n
-        }
-      }
-      const data = dataBuf.trim()
-      if (!data || data === '[DONE]') continue
-      let ev: StreamEvent
-      try { ev = JSON.parse(data) as StreamEvent } catch {
-        console.warn('regenerate SSE parse error', 'raw:', data.slice(0, 200))
-        continue
-      }
-      if (frameSeq !== undefined) ev.seq = frameSeq
-      if (import.meta.env.DEV && typeof ev.seq === 'number') {
-        if (ev.seq <= lastSeq) console.warn(`[regen] non-monotonic seq: prev=${lastSeq} now=${ev.seq}`)
-        lastSeq = ev.seq
-      }
-      try { opts.onEvent(ev) } catch (inner) {
-        console.warn('[regen] event handler threw, continuing:', inner)
-      }
-    }
-  }
+  await consumeSSEStream({
+    reader: resp.body.getReader(),
+    signal: opts.signal,
+    label: 'regen',
+    onEvent: opts.onEvent,
+    onStreamDrop: opts.onStreamDrop,
+  })
 }
 
 // ---- P1-4 regen history ----
@@ -1583,25 +1467,70 @@ export async function activateReply(
 // ---- P3-2 dynamic tools ----
 
 // Tool is one row of the GET /api/v1/tools response. The
-// `dynamic` flag distinguishes user-defined tools
-// (loaded from ~/.p-chat/tools/*.yaml) from the
-// built-ins; `source` is the YAML path so the
-// ToolListDrawer can show a "view source" link.
+// `dynamic` flag distinguishes YAML-backed tools from built-ins;
+// `scope` tells the drawer whether the YAML came from the global
+// or current project tools directory.
 export interface Tool {
   name: string
   description: string
   parameters?: any
   dynamic: boolean
+  scope?: 'builtin' | 'global' | 'project' | string
   source?: string
+  project_root?: string
+}
+
+export interface ToolLoadDiagnostic {
+  source: string
+  name?: string
+  status: 'loaded' | 'error' | string
+  error?: string
+  scope?: 'global' | 'project' | string
+  project_root?: string
+  mod_at?: string
+}
+
+export interface ToolListResponse {
+  tools: Tool[]
+  diagnostics: ToolLoadDiagnostic[]
+}
+
+export interface ToolTrialResponse {
+  name: string
+  args: string
+  dry_run: boolean
+  status: 'ok' | 'error' | string
+  result: string
+  error?: string
+  elapsed: string
 }
 
 // listTools fetches the current tool registry. Used by
 // the ToolListDrawer; the chat store calls it on mount
 // and after every agent Reload (which the server fires
 // when a dynamic YAML is added / changed / deleted).
+function toolsQuery(sessionId?: string) {
+  return sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
+}
+
 export async function listTools(): Promise<Tool[]> {
-  const res = await jsonFetch<{ tools: Tool[] }>('/api/v1/tools', { method: 'GET' })
+  const res = await jsonFetch<ToolListResponse>('/api/v1/tools', { method: 'GET' })
   return res?.tools || []
+}
+
+export async function listToolsDetailed(sessionId?: string): Promise<ToolListResponse> {
+  const res = await jsonFetch<ToolListResponse>(`/api/v1/tools${toolsQuery(sessionId)}`, { method: 'GET' })
+  return {
+    tools: res?.tools || [],
+    diagnostics: res?.diagnostics || [],
+  }
+}
+
+export async function trialTool(name: string, argumentsValue: Record<string, any>, dryRun: boolean, sessionId?: string): Promise<ToolTrialResponse> {
+  return jsonFetch<ToolTrialResponse>(`/api/v1/tools/${encodeURIComponent(name)}/trial${toolsQuery(sessionId)}`, {
+    method: 'POST',
+    body: JSON.stringify({ arguments: argumentsValue || {}, dry_run: dryRun }),
+  })
 }
 
 // ---- P2-3 context inspector ----
@@ -1705,7 +1634,7 @@ export const scanKnowledgeBase = (name: string) =>
   )
 
 export const getScanStatus = (name: string) =>
-  jsonFetch<{ chunks: number; done: boolean; error?: string; current: number; total: number; message?: string }>(
+  jsonFetch<{ chunks: number; done: boolean; error?: string; current: number; total: number; changed?: number; skipped?: number; deleted?: number; failed?: number; message?: string }>(
     `/api/v1/knowledge/bases/${encodeURIComponent(name)}/scan/status`,
   )
 
@@ -1721,12 +1650,43 @@ export const clearKnowledgeBase = (name: string) =>
     { method: 'DELETE' },
   )
 
-export const searchKnowledge = (query: string, topK?: number) =>
-  jsonFetch<{ query: string; results: Array<{ source: string; content: string; similarity: number; rank: number }> }>(
+export interface KnowledgeCitation {
+  base?: string
+  source?: string
+  title?: string
+  parent_title?: string
+  level?: number
+  kind?: string
+  query?: string
+  match_type?: string
+  score?: number
+  explanation?: string
+}
+
+export interface KnowledgeSearchResult {
+  source: string
+  content: string
+  similarity: number
+  rank: number
+  /** KB-01: originating knowledge base name */
+  base?: string
+  title?: string
+  /** KB-02: why this hit matched (path|filename|title|keywords|overview|l2|content) */
+  match_type?: string
+  /** KB-03: original or derived query that surfaced this hit */
+  query?: string
+  /** KB-04: human-readable provenance summary */
+  explanation?: string
+  /** KB-04: structured provenance metadata */
+  citation?: KnowledgeCitation
+}
+
+export const searchKnowledge = (query: string, topK?: number, bases?: string[]) =>
+  jsonFetch<{ query: string; queries?: string[]; results: KnowledgeSearchResult[] }>(
     '/api/v1/knowledge/search',
     {
       method: 'POST',
-      body: JSON.stringify({ query, top_k: topK || 5 }),
+      body: JSON.stringify({ query, top_k: topK || 5, bases: bases || undefined }),
     },
   )
 
@@ -1810,9 +1770,19 @@ export interface SubAgentConfig {
   timeout: string
 }
 
+export interface WorkModeConfig {
+  default: string
+}
+
+export interface UIConfig {
+  close_behavior: 'exit' | 'tray' | string
+}
+
 export interface SystemConfig {
   limits: LimitsConfig
   sub_agent: SubAgentConfig
+  work_mode: WorkModeConfig
+  ui: UIConfig
 }
 
 export const getSystemConfig = () =>
@@ -1882,6 +1852,33 @@ export interface BrowserInfo {
   id: string
   name: string
   connected_at: string
+  tabs_count?: number
+  active_tab_id?: number
+  active_tab_title?: string
+  active_tab_url?: string
+  extension_version?: string
+  protocol_version?: string
+  protocol_compatible: boolean
+  update_required: boolean
+  update_message?: string
+  last_seen_at?: string
+  last_error?: string
+  last_error_at?: string
+}
+
+export interface BrowserTabInfo {
+  id: number
+  index: number
+  window_id?: number
+  title: string
+  url: string
+  active: boolean
+  preferred: boolean
+}
+
+export interface BrowserTabsResult {
+  preferred_tab_id?: number | null
+  tabs: BrowserTabInfo[]
 }
 
 export interface BrowserStatus {
@@ -1889,6 +1886,9 @@ export interface BrowserStatus {
   count: number
   http_url?: string
   ws_url?: string
+  expected_protocol_version?: string
+  last_error?: string
+  last_error_at?: string
 }
 
 export const listBrowsers = () =>
@@ -1901,4 +1901,13 @@ export const updateBrowserConfig = (enabled: boolean) =>
   jsonFetch<{ ok: boolean; enabled: boolean }>('/api/v1/browser/config', {
     method: 'POST',
     body: JSON.stringify({ enabled }),
+  })
+
+export const listBrowserTabs = (browserId: string) =>
+  jsonFetch<BrowserTabsResult>(`/api/v1/browser/${encodeURIComponent(browserId)}/tabs`)
+
+export const setBrowserActiveTab = (browserId: string, body: { tab_id?: number; index?: number }) =>
+  jsonFetch<BrowserTabsResult>(`/api/v1/browser/${encodeURIComponent(browserId)}/active-tab`, {
+    method: 'POST',
+    body: JSON.stringify(body),
   })

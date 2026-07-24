@@ -13,6 +13,7 @@ type yamlRoot struct {
 	Server   yamlServerConfig   `yaml:"server"`
 	LLM      yamlLLMConfig      `yaml:"llm"`
 	Style    yamlStyleConfig    `yaml:"style"`
+	UI       yamlUIConfig       `yaml:"ui"`
 	Tools    yamlToolsConfig    `yaml:"tools"`
 	Memory   yamlMemoryConfig   `yaml:"memory"`
 	Sandbox  yamlSandboxConfig  `yaml:"sandbox"`
@@ -25,12 +26,12 @@ type yamlServerConfig struct {
 }
 
 type yamlLLMConfig struct {
-	Default     string             `yaml:"default"`
-	Providers   []yamlProviderCfg  `yaml:"providers"`
-	Temperature float64            `yaml:"temperature,omitempty"`
-	TopP        float64            `yaml:"top_p,omitempty"`
-	MaxTokens   int                `yaml:"max_tokens,omitempty"`
-	Output      yamlOutputConfig   `yaml:"output"`
+	Default     string            `yaml:"default"`
+	Providers   []yamlProviderCfg `yaml:"providers"`
+	Temperature float64           `yaml:"temperature,omitempty"`
+	TopP        float64           `yaml:"top_p,omitempty"`
+	MaxTokens   int               `yaml:"max_tokens,omitempty"`
+	Output      yamlOutputConfig  `yaml:"output"`
 }
 
 type yamlOutputConfig struct {
@@ -39,13 +40,13 @@ type yamlOutputConfig struct {
 }
 
 type yamlProviderCfg struct {
-	Name     string        `yaml:"name"`
-	Protocol string        `yaml:"protocol"`
-	Type     string        `yaml:"type"`
-	BaseURL  string        `yaml:"base_url"`
-	APIKey   string        `yaml:"api_key"`
-	Model    string        `yaml:"model"`
-	Models   []yamlModel   `yaml:"models,omitempty"`
+	Name     string      `yaml:"name"`
+	Protocol string      `yaml:"protocol"`
+	Type     string      `yaml:"type"`
+	BaseURL  string      `yaml:"base_url"`
+	APIKey   string      `yaml:"api_key"`
+	Model    string      `yaml:"model"`
+	Models   []yamlModel `yaml:"models,omitempty"`
 }
 
 type yamlModel struct {
@@ -67,6 +68,10 @@ type yamlCapability struct {
 
 type yamlStyleConfig struct {
 	Default string `yaml:"default"`
+}
+
+type yamlUIConfig struct {
+	CloseBehavior CloseBehavior `yaml:"close_behavior,omitempty"`
 }
 
 type yamlToolsConfig struct {
@@ -129,6 +134,9 @@ func unmarshalYAML(data []byte, cfg *Config) error {
 		},
 		Style: StyleConfig{
 			Default: y.Style.Default,
+		},
+		UI: UIConfig{
+			CloseBehavior: y.UI.CloseBehavior.Normalize(),
 		},
 		Tools: ToolsConfig{
 			Enabled: y.Tools.Enabled,

@@ -23,7 +23,7 @@ async function init() {
 
 // Auto-detect the server by probing /health on common ports.
 async function detectServer() {
-  const ports = [8960, 14712, 9960, 18960, 8961, 8962];
+  const ports = [15150, 15151, 15152, 15153, 15154, 15155, 15156, 15157, 15158, 15159, 8960, 14712, 9960, 18960, 8961, 8962];
   statusEl.textContent = '探测中…';
   statusRow.className = 'row status-reconnecting';
 
@@ -44,7 +44,7 @@ async function detectServer() {
   }
   statusEl.textContent = '未找到服务器，请手动输入地址';
   statusRow.className = 'row status-disconnected';
-  serverURLEl.value = 'http://127.0.0.1:8960';
+  serverURLEl.value = 'http://127.0.0.1:15150';
 }
 
 async function refreshStatus() {
@@ -54,7 +54,11 @@ async function refreshStatus() {
       statusEl.textContent = '未知';
       return;
     }
-    if (resp.connected) {
+    if (resp.updateRequired) {
+      statusEl.textContent = resp.updateMessage || '扩展需要更新，请重新下载';
+      statusRow.className = 'row status-reconnecting';
+      if (resp.browserID) browserIDEl.textContent = resp.browserID;
+    } else if (resp.connected) {
       statusEl.textContent = '已连接';
       statusRow.className = 'row status-connected';
       if (resp.browserID) browserIDEl.textContent = resp.browserID;
@@ -107,4 +111,3 @@ chrome.runtime.onMessage.addListener((msg) => {
 });
 
 init();
-

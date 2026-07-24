@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/p-chat/pchat/internal/config"
@@ -23,7 +24,7 @@ func TestBuildStaticSystemPrompt_CacheHit(t *testing.T) {
 	agt := New(cfg, llmClient, styleMgr, store, tools)
 
 	// First call: cache miss, builds the prompt.
-	p1, sig1, err := 	agt.buildStaticSystemPrompt(style.Tech, nil, nil, "", false)
+	p1, sig1, err := agt.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
 	if err != nil {
 		t.Fatalf("first build: %v", err)
 	}
@@ -32,7 +33,7 @@ func TestBuildStaticSystemPrompt_CacheHit(t *testing.T) {
 	}
 
 	// Second call with the same args: cache hit (same sig).
-	p2, sig2, err := 	agt.buildStaticSystemPrompt(style.Tech, nil, nil, "", false)
+	p2, sig2, err := agt.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
 	if err != nil {
 		t.Fatalf("second build: %v", err)
 	}
@@ -55,8 +56,8 @@ func TestBuildStaticSystemPrompt_DifferentStyle(t *testing.T) {
 
 	agt := New(cfg, llmClient, styleMgr, store, tools)
 
-	p1, _, _ := 	agt.buildStaticSystemPrompt(style.Tech, nil, nil, "", false)
-	p2, _, _ := 	agt.buildStaticSystemPrompt(style.Cute, nil, nil, "", false)
+	p1, _, _ := agt.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
+	p2, _, _ := agt.buildStaticSystemPrompt(style.Cute, config.WorkModeCoding, nil, nil, "", false)
 
 	if p1 == p2 {
 		t.Error("different styles should produce different prompts")
@@ -79,8 +80,8 @@ func TestBuildStaticSystemPrompt_DifferentTools(t *testing.T) {
 		{Name: "x", Description: "x"},
 	})
 
-	_, sig1, _ := 	agt.buildStaticSystemPrompt(style.Tech, nil, nil, "", false)
-	_, sig2, _ := 	agt.buildStaticSystemPrompt(style.Tech, openAITools, nil, "", false)
+	_, sig1, _ := agt.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
+	_, sig2, _ := agt.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, openAITools, nil, "", false)
 	if sig1 == sig2 {
 		t.Error("different tool sets should produce different sigs")
 	}
@@ -107,7 +108,7 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	upgrade.SeedForTesting(store1.DB())
 	styleMgr, _ := style.NewManager(store1.DB())
 	a1 := New(cfgZh, llmClient, styleMgr, store1, tools)
-	pZh, _, _ := a1.buildStaticSystemPrompt(style.Tech, nil, nil, "", false)
+	pZh, _, _ := a1.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
 	if !contains(pZh, "简体中文") {
 		t.Error("Chinese language hint missing")
 	}
@@ -115,7 +116,7 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	store2, _ := memory.OpenAt(":memory:", 50)
 	defer store2.Close()
 	a2 := New(cfgEn, llmClient, styleMgr, store2, tools)
-	pEn, _, _ := a2.buildStaticSystemPrompt(style.Tech, nil, nil, "", false)
+	pEn, _, _ := a2.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
 	if !contains(pEn, "English") {
 		t.Error("English language hint missing")
 	}
@@ -127,7 +128,7 @@ func TestBuildStaticSystemPrompt_LanguageHint(t *testing.T) {
 	store3, _ := memory.OpenAt(":memory:", 50)
 	defer store3.Close()
 	a3 := New(cfgAuto, llmClient, styleMgr, store3, tools)
-	pAuto, _, _ := a3.buildStaticSystemPrompt(style.Tech, nil, nil, "", false)
+	pAuto, _, _ := a3.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
 	if !contains(pAuto, "same language as the conversation") {
 		t.Error("opencode-style language hint missing for auto mode")
 	}
@@ -151,7 +152,7 @@ func TestBuildStaticSystemPrompt_NoFabricatedErrorInstruction(t *testing.T) {
 	upgrade.SeedForTesting(store.DB())
 	styleMgr, _ := style.NewManager(store.DB())
 	a := New(cfg, llmClient, styleMgr, store, tools)
-	p, _, _ := a.buildStaticSystemPrompt(style.Tech, nil, nil, "", false)
+	p, _, _ := a.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
 	if contains(p, "更不要伪造") {
 		t.Error("prompt still contains the fabricated-error warning text; the LLM was echoing it back")
 	}
@@ -182,12 +183,68 @@ func TestBuildStaticSystemPrompt_TodoContractPromptPresent(t *testing.T) {
 	// Register a synthetic tool named "todo_write" so the
 	// hint section is emitted (it's gated on tool presence).
 	tools.RegisterForTest(tool.Tool{Name: "todo_write", Description: "test stub."})
-	p, _, _ := a.buildStaticSystemPrompt(style.Tech, nil, tools.List(), "", false)
+	p, _, _ := a.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, tools.List(), "", false)
 	if !contains(p, "完成契约") {
 		t.Error("todo_write hint section missing the P1-1 '完成契约' rule — see docs/plans/auto-continue-plan.md")
 	}
 	if !contains(p, "todo_write") {
 		t.Error("todo_write hint section missing the todo_write tool reference")
+	}
+}
+
+func newPromptTestAgent(t *testing.T, lang string) *Agent {
+	t.Helper()
+	cfg := config.Default()
+	cfg.LLM.Output.Language = lang
+	llmClient, _ := llm.NewClient(&cfg.LLM)
+	tools := tool.NewRegistry()
+	store, _ := memory.OpenAt(":memory:", 50)
+	t.Cleanup(func() { _ = store.Close() })
+	upgrade.SeedForTesting(store.DB())
+	styleMgr, _ := style.NewManager(store.DB())
+	return New(cfg, llmClient, styleMgr, store, tools)
+}
+
+func TestBuildStaticSystemPrompt_WorkModeDaily(t *testing.T) {
+	a := newPromptTestAgent(t, "zh")
+	p, _, err := a.buildStaticSystemPrompt(style.Tech, config.WorkModeDaily, nil, tool.NewRegistry().List(), "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(p, "Working Mode: 日常工作") || !strings.Contains(p, "wiki_lookup") {
+		t.Fatalf("daily work mode block missing:\n%s", p)
+	}
+	if strings.Contains(p, "Working Mode: 编码") {
+		t.Fatalf("daily prompt should not include coding block:\n%s", p)
+	}
+}
+
+func TestBuildStaticSystemPrompt_WorkModeSigDiffers(t *testing.T) {
+	a := newPromptTestAgent(t, "zh")
+	_, sigCoding, err := a.buildStaticSystemPrompt(style.Tech, config.WorkModeCoding, nil, nil, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sigDaily, err := a.buildStaticSystemPrompt(style.Tech, config.WorkModeDaily, nil, nil, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sigCoding == sigDaily {
+		t.Fatal("work mode must participate in the static prompt cache signature")
+	}
+}
+
+func TestBuildStaticSystemPrompt_StyleOff(t *testing.T) {
+	a := newPromptTestAgent(t, "zh")
+	p, _, err := a.buildStaticSystemPrompt(style.Off, config.WorkModeCoding, nil, nil, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(p, "NEXUS") || strings.Contains(p, "小P") || strings.Contains(p, "墨言") {
+		t.Fatalf("style=off should not inject a style prompt:\n%s", p)
+	}
+	if !strings.Contains(p, "Working Mode: 编码") {
+		t.Fatalf("style=off should still inject work mode:\n%s", p)
 	}
 }
 
@@ -212,6 +269,15 @@ func TestVisionHeuristic(t *testing.T) {
 		{"gemini-1.5-pro", true},
 		{"gemini-2-flash", true},
 		{"qwen2.5-vl-72b", true},
+		// DeepSeek V4 — vision-capable; V2/V3 stay text-only.
+		// Regression: deepseek-v4-flash used to fall through to
+		// the conservative default (false) because V2/V3 were
+		// in the deny list and V4 wasn't in either list, so the
+		// user's image was getting replaced with a text
+		// placeholder instead of being sent to the LLM.
+		{"deepseek-v4-flash", true},
+		{"deepseek-v4-lite", true},
+		{"deepseek-v4", true},
 		// Text-only
 		{"deepseek-chat", false},
 		{"deepseek-reasoner", false},
@@ -226,6 +292,91 @@ func TestVisionHeuristic(t *testing.T) {
 		got := visionCapableByHeuristic("any", c.model)
 		if got != c.want {
 			t.Errorf("visionCapableByHeuristic(%q) = %v, want %v", c.model, got, c.want)
+		}
+	}
+}
+
+// TestModelSupportsVision_Config exercises Agent.modelSupportsVision
+// end-to-end against a synthetic config. Locks down the regression
+// where `capabilities: {}` (no `supports_vision` field) was being
+// treated as "explicit opt-out" because Capabilities is a struct
+// (not a pointer) and `!SupportsVision` matched the zero value.
+// The old behaviour silently demoted every user-added model to
+// "no vision", which surfaced in production as:
+//
+//   - SendMessage: ExpandAttachmentsCM replaced the user's
+//     image bytes with a "[name: N bytes — 当前模型不支持
+//     视觉输入，图片已上传但未发送]" text placeholder, so
+//     the LLM saw no image at all
+//   - Regenerate: same path, same symptom
+//
+// The fix is "permissive by default" — no opinion falls through
+// to the heuristic, only an explicit `supports_vision: true`
+// short-circuits to allow. Combined with adding `deepseek-v4*`
+// to the vision prefix list, this restores vision for ollama/
+// deepseek-v4-flash and other "modern" multimodal models the
+// user adds via the model editor.
+func TestModelSupportsVision_Config(t *testing.T) {
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Providers: []config.ProviderConfig{
+				{
+					Name:     "ollama",
+					Protocol: "openai",
+					Models: []config.ModelConfig{
+						// Regression target: the user reported
+						// "deepseek-v4-flash can't see images"
+						// because the config had `capabilities: {}`.
+						{Name: "deepseek-v4-flash", Default: true, Capabilities: config.Capabilities{}},
+						// Explicit opt-in still works.
+						{Name: "mimo-v2.5", Capabilities: config.Capabilities{SupportsVision: true}},
+						// Explicit opt-in via the same empty block
+						// but a separate config block — make sure
+						// the new permissive-default logic also
+						// forwards to the heuristic for models the
+						// heuristic does NOT recognise as vision
+						// (e.g. an unknown local ollama name).
+						{Name: "llama3-text-only", Capabilities: config.Capabilities{}},
+					},
+				},
+			},
+		},
+	}
+	a := &Agent{cfg: cfg}
+
+	cases := []struct {
+		provider, model string
+		want            bool
+	}{
+		// Regression: empty capabilities + heuristic match → true.
+		// Used to return false because the old code did
+		// `if !SupportsVision { return false }` before any
+		// heuristic call. Now falls through to the heuristic
+		// which recognises "deepseek-v4-flash" via the new
+		// visionPrefixes entry.
+		{"ollama", "deepseek-v4-flash", true},
+		// Explicit opt-in: untouched by the fix.
+		{"ollama", "mimo-v2.5", true},
+		// Empty capabilities + heuristic does NOT match → false.
+		// ("llama3-text-only" is a synthetic name that the
+		// heuristic will not recognise as vision-capable.)
+		{"ollama", "llama3-text-only", false},
+		// Empty capabilities + heuristic textOnly match → false.
+		{"ollama", "deepseek-v3", false},
+		// Provider found, model not in the configured list →
+		// still consults the heuristic. This is the path
+		// "user added a new model in the UI, hasn't run a
+		// config save yet, server uses heuristic".
+		{"ollama", "gpt-4o", true},
+		{"ollama", "gpt-3.5-turbo", false},
+		// Provider not in config at all → heuristic.
+		{"some-unknown-provider", "claude-sonnet-4-5", true},
+		{"some-unknown-provider", "deepseek-chat", false},
+	}
+	for _, c := range cases {
+		got := a.modelSupportsVision(c.provider, c.model)
+		if got != c.want {
+			t.Errorf("modelSupportsVision(%q, %q) = %v, want %v", c.provider, c.model, got, c.want)
 		}
 	}
 }

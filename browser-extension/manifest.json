@@ -1,7 +1,7 @@
-{
+﻿{
   "manifest_version": 3,
   "name": "P-Chat Browser Bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "让 P-Chat 的 AI 助手控制您的浏览器：导航、点击、输入、截图、提取页面内容",
   "permissions": [
     "activeTab",

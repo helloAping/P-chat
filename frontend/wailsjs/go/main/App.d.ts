@@ -4,6 +4,10 @@ import {http} from '../models';
 
 export function CancelStream(arg1:string):Promise<void>;
 
+export function CancelWindowClose():Promise<void>;
+
+export function ConfirmWindowClose(arg1:string):Promise<void>;
+
 export function GetBackendURL():Promise<string>;
 
 export function OpenExplorer(arg1:string):Promise<void>;

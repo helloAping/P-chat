@@ -1,6 +1,6 @@
 server:
   host: "127.0.0.1"
-  port: 8960
+  port: 15150
 
 llm:
   default: "openai"
@@ -69,6 +69,9 @@ llm:
 
 style:
   default: "tech"
+
+ui:
+  close_behavior: "exit"  # exit | tray
 
 tools:
   enabled:

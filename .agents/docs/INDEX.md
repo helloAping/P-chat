@@ -13,6 +13,8 @@
 | 修改子代理系统 | [subagent.md](subagent.md) | agent.md, tool.md |
 | 修改前端界面、Vue 组件、pinia store | [frontend.md](frontend.md) | server.md |
 | **修改样式/设计 token/视觉规范** | [**frontend-design.md**](frontend-design.md) | frontend.md |
+| 修改工作模式 `work_mode`（coding/daily 侧重点） | [config.md](config.md) | agent.md, server.md, frontend.md, cli.md |
+| 修改说话风格 `style` 或风格记忆 | [agent.md](agent.md) | frontend.md, config.md |
 | 修改数据库/消息持久化 | [memory.md](memory.md) | config.md |
 | **修改数据库 Schema** | [**versioning.md**](versioning.md) | memory.md |
 | **发布新版本** | [**versioning.md**](versioning.md) | — |
@@ -23,6 +25,8 @@
 | 修改沙箱/安全检查 | [infrastructure.md](infrastructure.md) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
+| 回答用户“agent 功能怎么用 / GUI 怎么操作” | [../../README.md](../../README.md)「GUI 操作入口速查 / 常见问题」 | agent.md, tool.md, frontend.md |
+| 查看当前项目现状与可做事项 | [../../docs/feature-opportunities.md](../../docs/feature-opportunities.md) | — |
 | **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |
 | **P3-3 端到端 trace id** | [trace 包](../../internal/trace/trace.go) | [server.md](server.md) §8, [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
 | **P3-2 工具 hot-reload** | [tool.md](tool.md) §8 | [P3-2 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |

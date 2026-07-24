@@ -69,3 +69,19 @@ bash .agents/scripts/install.sh
 ## 修改规范
 
 修改 `.agents/AGENTS.md` 或 `.agents/docs/` 下的文档。所有工具通过目录级符号链接自动读取最新内容。
+
+## 用户功能问答
+
+用户如果问“这个 agent 功能怎么用”或“GUI 上怎么操作”，优先看项目根目录 [`README.md`](../README.md) 的「GUI 操作入口速查」和「常见问题」：
+
+- `auto-continue` 怎么开关
+- `work_mode` 怎么切换
+- `style=off` 怎么关闭风格
+- 工具列表和动态工具怎么看
+- 浏览器控制怎么启用
+- 知识库、工作模式、风格关闭等 GUI 操作流程
+- trace id 怎么复制给开发者
+- 重答历史怎么切换
+- 知识库和 `recall` 怎么使用
+
+模块级实现细节仍以 `.agents/docs/` 为准；README 面向用户使用说明。

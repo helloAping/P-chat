@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# =============================================================================
+# pre-commit — local git hook for P-Chat
+# =============================================================================
+# Installed by scripts/git-hooks/install.ps1. Runs ONE cheap check before
+# every commit:
+#
+#   check-bom.sh --staged   — fail if any staged file starts with UTF-8 BOM
+#
+# Why only this one:
+#   * BOM detection is the only check that's 100% editor-caused, 0% user
+#     intent, and silently broken in some Go-toolchain paths (notably
+#     `go test -cover`). Catching it at commit time prevents CI red.
+#   * go vet / gofmt are left to CI (T03 GitHub Actions). Running them
+#     in a pre-commit hook is slow (5-10s on this repo) and noisy across
+#     Go version mismatches (gofmt 1.21 vs 1.25 disagree on tag alignment).
+#
+# Bypass:  git commit --no-verify   (use sparingly)
+# =============================================================================
+
+set -u
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$repo_root" ]; then
+  echo "[pre-commit] not a git repository; skipping."
+  exit 0
+fi
+
+cd "$repo_root"
+
+# Resolve the script directory so the hook works whether it's been
+# symlinked into .git/hooks/ or copied in place. After the symlink
+# loop, `$hook_src` is an absolute path with no remaining symlinks.
+hook_src="$0"
+while [ -L "$hook_src" ]; do
+  link_dir=$(cd "$(dirname "$hook_src")" && pwd)
+  link_target=$(readlink "$hook_src")
+  case "$link_target" in
+    /*) hook_src="$link_target" ;;
+    *)  hook_src="$link_dir/$link_target" ;;
+  esac
+done
+# `hook_src` is now `<repo>/scripts/git-hooks/pre-commit` (absolute).
+# One level up is `<repo>/scripts/`, which is where check-bom.sh lives.
+scripts_dir=$(cd "$(dirname "$hook_src")/.." && pwd)
+check_bom="$scripts_dir/check-bom.sh"
+
+if [ ! -x "$check_bom" ]; then
+  echo "[pre-commit] WARN: $check_bom not found or not executable; skipping BOM check." >&2
+  exit 0
+fi
+
+echo "[pre-commit] running check-bom.sh --staged ..."
+if ! "$check_bom" --staged; then
+  echo "" >&2
+  echo "[pre-commit] ABORT: BOM detected in staged files." >&2
+  echo "[pre-commit] Strip with:  ./scripts/strip-bom.ps1 -Path <file>" >&2
+  echo "[pre-commit] Or bypass with:  git commit --no-verify" >&2
+  exit 1
+fi
+
+exit 0

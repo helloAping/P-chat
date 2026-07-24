@@ -10,6 +10,7 @@ package browser
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -21,20 +22,66 @@ import (
 
 // BrowserInfo is the serialisable summary exposed via the HTTP API.
 type BrowserInfo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	ConnectedAt string `json:"connected_at"`
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	ConnectedAt        string `json:"connected_at"`
+	TabsCount          int    `json:"tabs_count"`
+	ActiveTabID        int    `json:"active_tab_id,omitempty"`
+	ActiveTabTitle     string `json:"active_tab_title,omitempty"`
+	ActiveTabURL       string `json:"active_tab_url,omitempty"`
+	ExtensionVersion   string `json:"extension_version,omitempty"`
+	ProtocolVersion    string `json:"protocol_version,omitempty"`
+	ProtocolCompatible bool   `json:"protocol_compatible"`
+	UpdateRequired     bool   `json:"update_required"`
+	UpdateMessage      string `json:"update_message,omitempty"`
+	LastSeenAt         string `json:"last_seen_at,omitempty"`
+	LastError          string `json:"last_error,omitempty"`
+	LastErrorAt        string `json:"last_error_at,omitempty"`
+}
+
+// TabInfo is one browser tab reported by the extension.
+type TabInfo struct {
+	ID        int    `json:"id"`
+	Index     int    `json:"index"`
+	WindowID  int    `json:"window_id,omitempty"`
+	Title     string `json:"title"`
+	URL       string `json:"url"`
+	Active    bool   `json:"active"`
+	Preferred bool   `json:"preferred"`
+}
+
+// TabsListResult is the payload returned by browser/tabs action=list.
+type TabsListResult struct {
+	PreferredTabID *int      `json:"preferred_tab_id"`
+	Tabs           []TabInfo `json:"tabs"`
+}
+
+// ClientSnapshot is the browser client's current diagnostic state.
+type ClientSnapshot struct {
+	ID               string
+	Name             string
+	TabsCount        int
+	ActiveTabID      int
+	ActiveTabTitle   string
+	ActiveTabURL     string
+	ExtensionVersion string
+	ProtocolVersion  string
+	LastSeen         time.Time
+	LastError        string
+	LastErrorAt      time.Time
 }
 
 // BridgeHub is the central registry of connected browser clients.
 type BridgeHub struct {
-	mu       sync.RWMutex
-	clients  map[string]*clientEntry
-	enabled  bool
-	regCh    chan *BrowserClient
-	unregCh  chan string // browserID → remove
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	mu          sync.RWMutex
+	clients     map[string]*clientEntry
+	enabled     bool
+	lastError   string
+	lastErrorAt time.Time
+	regCh       chan *BrowserClient
+	unregCh     chan string // browserID → remove
+	stopOnce    sync.Once
+	stopCh      chan struct{}
 
 	// onToolsChange is called whenever the set of active connections
 	// transitions between zero and non-zero (or vice versa), so the
@@ -84,7 +131,9 @@ func (h *BridgeHub) Run() {
 			h.mu.Lock()
 			entry, ok := h.clients[id]
 			if ok {
-				_ = entry.client.conn.Close(websocket.StatusNormalClosure, "unregistered")
+				if entry.client.conn != nil {
+						_ = entry.client.conn.Close(websocket.StatusNormalClosure, "unregistered")
+					}
 				delete(h.clients, id)
 			}
 			// Fire callback if pool became empty.
@@ -111,6 +160,19 @@ func (h *BridgeHub) Register(c *BrowserClient) {
 	}
 }
 
+// RecordError stores the most recent browser-control subsystem error.
+// It is surfaced in /browser/status so the settings page can explain
+// why the extension did not connect.
+func (h *BridgeHub) RecordError(err string) {
+	if err == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastError = err
+	h.lastErrorAt = time.Now()
+}
+
 // Unregister removes a browser client by ID.
 func (h *BridgeHub) Unregister(id string) {
 	select {
@@ -129,19 +191,136 @@ func (h *BridgeHub) SendCommand(ctx context.Context, browserID string, method st
 	return c.SendCommand(ctx, method, params, timeout)
 }
 
+// ListTabs asks the extension for the current tab list and refreshes
+// the client's cached preferred-tab metadata.
+func (h *BridgeHub) ListTabs(ctx context.Context, browserID string) (*TabsListResult, error) {
+	c, err := h.getClient(browserID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.SendCommand(ctx, "browser/tabs", map[string]any{"action": "list"}, defaultCommandTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	var result TabsListResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, fmt.Errorf("decode tabs list: %w", err)
+	}
+	// Refresh cached active tab from preferred or currently-active tab.
+	activeID := 0
+	title, url := "", ""
+	if result.PreferredTabID != nil && *result.PreferredTabID != 0 {
+		activeID = *result.PreferredTabID
+	}
+	for _, t := range result.Tabs {
+		if activeID != 0 && t.ID == activeID {
+			title, url = t.Title, t.URL
+			break
+		}
+		if activeID == 0 && t.Active {
+			activeID = t.ID
+			title, url = t.Title, t.URL
+		}
+	}
+	if activeID != 0 || len(result.Tabs) > 0 {
+		c.SetActiveTabMeta(activeID, title, url, len(result.Tabs))
+	}
+	return &result, nil
+}
+
+// SetActiveTab sets the preferred control target tab for a browser.
+// Prefer tab_id; index is accepted as a fallback for older clients.
+func (h *BridgeHub) SetActiveTab(ctx context.Context, browserID string, tabID int, index *int) (*TabsListResult, error) {
+	c, err := h.getClient(browserID)
+	if err != nil {
+		return nil, err
+	}
+	params := map[string]any{"action": "select"}
+	if tabID != 0 {
+		params["tab_id"] = tabID
+	} else if index != nil {
+		params["index"] = *index
+	} else {
+		return nil, fmt.Errorf("tab_id or index is required")
+	}
+	resp, err := c.SendCommand(ctx, "browser/tabs", params, defaultCommandTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	// Re-list to return full tab state and refresh cache.
+	return h.ListTabs(ctx, browserID)
+}
+
 // List returns information about all currently connected browsers.
 func (h *BridgeHub) List() []BrowserInfo {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	out := make([]BrowserInfo, 0, len(h.clients))
 	for _, e := range h.clients {
-		out = append(out, BrowserInfo{
-			ID:          e.client.ID(),
-			Name:        e.client.Name(),
-			ConnectedAt: e.connectedAt.Format(time.RFC3339),
-		})
+		snap := e.client.Snapshot()
+		info := BrowserInfo{
+			ID:                 snap.ID,
+			Name:               snap.Name,
+			ConnectedAt:        e.connectedAt.Format(time.RFC3339),
+			TabsCount:          snap.TabsCount,
+			ActiveTabID:        snap.ActiveTabID,
+			ActiveTabTitle:     snap.ActiveTabTitle,
+			ActiveTabURL:       snap.ActiveTabURL,
+			ExtensionVersion:   snap.ExtensionVersion,
+			ProtocolVersion:    snap.ProtocolVersion,
+			ProtocolCompatible: ProtocolCompatible(snap.ProtocolVersion),
+		}
+		info.UpdateRequired = !info.ProtocolCompatible
+		info.UpdateMessage = UpdateMessage(snap.ProtocolVersion)
+		if !snap.LastSeen.IsZero() {
+			info.LastSeenAt = snap.LastSeen.Format(time.RFC3339)
+		}
+		if snap.LastError != "" {
+			info.LastError = snap.LastError
+		}
+		if !snap.LastErrorAt.IsZero() {
+			info.LastErrorAt = snap.LastErrorAt.Format(time.RFC3339)
+		}
+		out = append(out, info)
 	}
 	return out
+}
+
+// ProtocolCompatible reports whether a browser extension can safely use
+// the server's current browser-control command protocol.
+func ProtocolCompatible(version string) bool {
+	return version == ProtocolVersion
+}
+
+// UpdateMessage returns a user-facing compatibility hint.
+func UpdateMessage(version string) string {
+	if ProtocolCompatible(version) {
+		return ""
+	}
+	if version == "" {
+		return "浏览器扩展未上报协议版本，请重新下载并安装最新扩展。"
+	}
+	return fmt.Sprintf("浏览器扩展协议版本 %s 与服务端期望版本 %s 不一致，请重新下载并安装最新扩展。", version, ProtocolVersion)
+}
+
+// LastError returns the most recent browser subsystem error.
+func (h *BridgeHub) LastError() (string, string) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.lastError == "" {
+		return "", ""
+	}
+	at := ""
+	if !h.lastErrorAt.IsZero() {
+		at = h.lastErrorAt.Format(time.RFC3339)
+	}
+	return h.lastError, at
 }
 
 // HasConnections reports whether at least one browser is connected.
@@ -223,7 +402,9 @@ func (h *BridgeHub) closeAll() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for id, e := range h.clients {
-		_ = e.client.conn.Close(websocket.StatusNormalClosure, "hub shutdown")
+		if e.client.conn != nil {
+			_ = e.client.conn.Close(websocket.StatusNormalClosure, "hub shutdown")
+		}
 		delete(h.clients, id)
 	}
 	h.fireToolsChange(false)

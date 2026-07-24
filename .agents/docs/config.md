@@ -32,6 +32,7 @@ type Config struct {
     UI     UIConfig     // 前端主题/布局
     Sandbox SandboxConfig // 命令/文件写入保护模式
     SubAgent SubAgentConfig // 子代理超时/工具过滤
+    WorkMode WorkModeConfig // 默认工作侧重点：coding / daily
 }
 ```
 
@@ -51,6 +52,17 @@ LLMConfig 核心字段：
 ### 4. 运行时热重载
 
 `Manager.Reload()` 重新加载配置文件并更新内存中的 Agent `SetLLM()`。
+
+### 5. WorkModeConfig
+
+`work_mode` 是任务侧重点，不是说话风格。它与 `style` 正交：
+
+- `style` 控制“怎么说”和对应的风格记忆注入；可设为 `off`，关闭后不注入风格 prompt，也不注入风格记忆。
+- `work_mode.default` 控制“优先做什么”，目前固定为 `coding` / `daily` 两种。
+- 默认值是 `coding`，保证旧用户升级后仍保持编程助手的行为。
+- `WorkMode.Normalize()` 会把空值或未知值回落到 `coding`；`IsValid()` 只接受 `coding` 和 `daily`。
+
+全局默认通过 `/api/v1/config` 读写；单会话覆盖值存放在 `conversations.metadata.work_mode`。
 
 ## 修改指南
 

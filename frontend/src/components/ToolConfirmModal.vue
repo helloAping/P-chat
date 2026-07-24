@@ -38,6 +38,9 @@ const pathClassMeta = computed(() => {
       return { label: '全局模式', type: 'warning' as const, Icon: FolderOpen }
     case 'protected':
       return { label: '受保护', type: 'error' as const, Icon: Lock }
+    case 'browser':
+      // BR-04: browser_* tools reuse resolvedPath for the page URL.
+      return { label: '浏览器', type: 'warning' as const, Icon: Globe }
     default:
       return null
   }
@@ -106,10 +109,10 @@ const argsPreview = computed(() => {
         </NTag>
       </div>
 
-      <!-- Resolved path (the path the LLM will actually touch,
-           after resolveToProjectRoot + filepath.Clean) -->
+      <!-- Resolved path (file tools) or page URL (browser tools, BR-04).
+           After resolveToProjectRoot + filepath.Clean for file tools. -->
       <div v-if="currentPendingConfirm?.resolvedPath" class="tcm-path">
-        <span class="tcm-label">目标路径</span>
+        <span class="tcm-label">{{ currentPendingConfirm?.pathClass === 'browser' ? '目标页面' : '目标路径' }}</span>
         <code class="tcm-path-value">{{ currentPendingConfirm.resolvedPath }}</code>
       </div>
 

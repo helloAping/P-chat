@@ -1,10 +1,11 @@
-// background.js — P-Chat Browser Bridge Service Worker
+﻿// background.js — P-Chat Browser Bridge Service Worker
 //
 // Connects to the pchat-server via WebSocket, receives JSON-RPC
 // commands, forwards them to chrome.tabs or content.js, and
 // returns structured results.
 
-const DEFAULT_SERVER = 'ws://127.0.0.1:8960/api/v1/browser/ws';
+const DEFAULT_SERVER = 'ws://127.0.0.1:15150/api/v1/browser/ws';
+const PROTOCOL_VERSION = '3';
 const RECONNECT_BASE_MS = 3000;
 const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_INTERVAL_MS = 30000;
@@ -22,7 +23,11 @@ let reconnectTimer = null;
 let heartbeatTimer = null;
 let reconnectAttempts = 0;
 let lastStatusCode = 0; // WebSocket close code of last failure
-let permanentFailure = false; // true when server rejected us (don't auto-reconnect)
+let permanentFailure = false;
+let preferredTabId = null; // server/GUI selected control target tab
+
+let updateRequired = false;
+let updateMessage = '';
 dbg('Service worker started');
 
 // --- Storage helpers ---
@@ -33,9 +38,9 @@ dbg('Service worker started');
 // popup) into proper WebSocket URLs. Also appends /api/v1/browser/ws
 // if the path is missing. Supports:
 //
-//   http://127.0.0.1:8960            → ws://127.0.0.1:8960/api/v1/browser/ws
-//   http://127.0.0.1:8960/api/v1/... → ws://127.0.0.1:8960/api/v1/browser/ws
-//   ws://127.0.0.1:8960/api/v1/...   → (unchanged)
+//   http://127.0.0.1:15150            → ws://127.0.0.1:15150/api/v1/browser/ws
+//   http://127.0.0.1:15150/api/v1/... → ws://127.0.0.1:15150/api/v1/browser/ws
+//   ws://127.0.0.1:15150/api/v1/...   → (unchanged)
 function normalizeServerURL(raw) {
   try {
     const url = new URL(raw);
@@ -127,6 +132,11 @@ async function connect() {
     if (msg.type === 'hello-ok') {
       dbg('Received hello-ok, browser_id:', msg.browser_id);
       await setBrowserID(msg.browser_id);
+      updateRequired = !!msg.update_required;
+      updateMessage = msg.update_message || '';
+      if (updateRequired) {
+        broadcastStatus({ updateRequired, updateMessage });
+      }
       return;
     }
     // JSON-RPC request from server
@@ -208,11 +218,14 @@ function stopHeartbeat() {
 async function sendHello() {
   browserID = await getBrowserID();
   const tabs = await chrome.tabs.query({});
+  const manifest = chrome.runtime.getManifest();
   const msg = {
     method: 'hello',
     params: {
       browser_name: getBrowserName(),
       tabs_count: tabs.length,
+      extension_version: manifest.version || '',
+      protocol_version: PROTOCOL_VERSION,
       id: browserID || '',
     },
   };
@@ -241,7 +254,8 @@ function sendError(id, code, message) {
 // --- Command routing ---
 
 async function handleCommand(method, params) {
-  const tabID = await getActiveTabID();
+  // browser/tabs manages the tab list itself; other commands need a target tab.
+  const tabID = method === 'browser/tabs' ? null : await getTargetTabID(params || {});
   switch (method) {
     case 'browser/navigate':    return cmdNavigate(params, tabID);
     case 'browser/click':       return cmdClick(params, tabID);
@@ -262,10 +276,38 @@ async function handleCommand(method, params) {
   }
 }
 
-async function getActiveTabID() {
+// Resolve which tab browser_* tools should control.
+// Priority: explicit params.tab_id → preferredTabId (GUI/tool selected)
+// → currently active browser tab. If preferred tab was closed, fall back.
+async function getTargetTabID(params) {
+  const explicit = params && params.tab_id != null ? Number(params.tab_id) : null;
+  if (explicit != null && !Number.isNaN(explicit)) {
+    try {
+      await chrome.tabs.get(explicit);
+      preferredTabId = explicit;
+      return explicit;
+    } catch {
+      throw new Error('tab not found: ' + explicit);
+    }
+  }
+
+  if (preferredTabId != null) {
+    try {
+      await chrome.tabs.get(preferredTabId);
+      return preferredTabId;
+    } catch {
+      preferredTabId = null;
+    }
+  }
+
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) throw new Error('no active tab');
+  preferredTabId = tab.id;
   return tab.id;
+}
+
+async function getActiveTabID() {
+  return getTargetTabID({});
 }
 
 // --- Command implementations ---
@@ -376,12 +418,23 @@ async function cmdSnapshot(params, tabID) {
 }
 
 async function cmdScreenshot(params, tabID) {
+  // captureVisibleTab only captures the visible tab of a window.
+  // Activate the preferred/target tab first so multi-tab control is correct.
+  try {
+    const tab = await chrome.tabs.get(tabID);
+    if (!tab.active) {
+      await chrome.tabs.update(tabID, { active: true });
+      await new Promise(r => setTimeout(r, 150));
+    }
+  } catch (e) {
+    throw new Error('screenshot target tab invalid: ' + (e.message || e));
+  }
   const quality = 80;
   const dataUrl = await chrome.tabs.captureVisibleTab(null, {
     format: 'jpeg',
     quality,
   });
-  return { image: dataUrl };
+  return { image: dataUrl, tab_id: tabID };
 }
 
 async function cmdFind(params, tabID) {
@@ -406,41 +459,72 @@ async function cmdTabs(params) {
   const { action } = params;
   switch (action) {
     case 'list': {
-      const tabs = await chrome.tabs.query({ currentWindow: true });
+      const tabs = await chrome.tabs.query({});
+      // Ensure preferred still exists.
+      if (preferredTabId != null) {
+        try { await chrome.tabs.get(preferredTabId); }
+        catch { preferredTabId = null; }
+      }
       return {
+        preferred_tab_id: preferredTabId,
         tabs: tabs.map(t => ({
+          id: t.id,
           index: t.index,
+          window_id: t.windowId,
           title: t.title,
           url: t.url,
           active: t.active,
+          preferred: preferredTabId != null && t.id === preferredTabId,
         })),
       };
     }
     case 'new': {
       const tab = await chrome.tabs.create({ url: params.url || 'about:blank' });
-      return { index: tab.index, id: tab.id };
+      preferredTabId = tab.id;
+      return { index: tab.index, id: tab.id, preferred_tab_id: preferredTabId };
     }
     case 'close': {
-      const idx = params.index;
-      if (idx == null) throw new Error('index is required for close');
-      const tabs = await chrome.tabs.query({ currentWindow: true });
-      const target = tabs.find(t => t.index === idx);
-      if (!target) throw new Error('tab not found at index ' + idx);
-      await chrome.tabs.remove(target.id);
-      return { success: true };
+      const target = await resolveTabFromParams(params);
+      const closedId = target.id;
+      await chrome.tabs.remove(closedId);
+      if (preferredTabId === closedId) preferredTabId = null;
+      return { success: true, closed_id: closedId, preferred_tab_id: preferredTabId };
     }
     case 'select': {
-      const idx = params.index;
-      if (idx == null) throw new Error('index is required for select');
-      const tabs = await chrome.tabs.query({ currentWindow: true });
-      const target = tabs.find(t => t.index === idx);
-      if (!target) throw new Error('tab not found at index ' + idx);
+      const target = await resolveTabFromParams(params);
       await chrome.tabs.update(target.id, { active: true });
-      return { success: true };
+      preferredTabId = target.id;
+      return {
+        success: true,
+        id: target.id,
+        index: target.index,
+        title: target.title,
+        url: target.url,
+        preferred_tab_id: preferredTabId,
+      };
     }
     default:
       throw new Error('unknown tabs action: ' + action);
   }
+}
+
+// Resolve a tab by tab_id, index, or preferred/active fallback.
+async function resolveTabFromParams(params) {
+  if (params.tab_id != null) {
+    const id = Number(params.tab_id);
+    const tab = await chrome.tabs.get(id);
+    if (!tab) throw new Error('tab not found: ' + id);
+    return tab;
+  }
+  if (params.index != null) {
+    const tabs = await chrome.tabs.query({});
+    const target = tabs.find(t => t.index === params.index);
+    if (!target) throw new Error('tab not found at index ' + params.index);
+    return target;
+  }
+  // Default to preferred/active target.
+  const id = await getTargetTabID(params);
+  return await chrome.tabs.get(id);
 }
 
 // --- Content script bridge ---
@@ -475,9 +559,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const response = {
       connected,
       browserID,
+      preferredTabId,
       serverURL: null,
       reconnecting: !connected && !!reconnectTimer,
       disabled: permanentFailure,
+      updateRequired,
+      updateMessage,
       lastStatusCode,
       url: null, // will be filled from storage
     };
@@ -513,6 +600,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+
+// Clear preferred target when the controlled tab is closed.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (preferredTabId === tabId) {
+    preferredTabId = null;
+  }
+});
 // --- Auto-connect on service worker start ---
 // Chrome MV3 wakes the service worker on events; we reconnect on startup.
 connect();

@@ -107,3 +107,65 @@ func MarshalConfirm(req ConfirmRequest) string {
 	data, _ := json.Marshal(req)
 	return string(data)
 }
+
+// confirmEmitterKey stores a function that pushes a ConfirmRequest
+// onto the SSE stream (as ToolConfirmJSON). Browser tools and other
+// non-agent-dispatch confirm gates use this so they can emit the
+// modal without going through confirmTargetFor.
+type confirmEmitterKey struct{}
+
+// WithConfirmEmitter attaches an SSE emitter for ConfirmRequest.
+// The agent sets this before invoking tool handlers so browser_*
+// (and future MCP/dynamic tools that self-gate) can surface the
+// same ToolConfirmModal the path/exec sandbox uses.
+func WithConfirmEmitter(ctx context.Context, emit func(ConfirmRequest)) context.Context {
+	if emit == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, confirmEmitterKey{}, emit)
+}
+
+func confirmEmitterFromCtx(ctx context.Context) func(ConfirmRequest) {
+	if v, ok := ctx.Value(confirmEmitterKey{}).(func(ConfirmRequest)); ok {
+		return v
+	}
+	return nil
+}
+
+// PermissionLevelFromCtx returns the per-session permission level
+// ("ask" / "auto" / "full"), defaulting to PermissionAsk.
+func PermissionLevelFromCtx(ctx context.Context) string {
+	if ctx == nil {
+		return PermissionAsk
+	}
+	if v, ok := ctx.Value(PermissionLevelKey{}).(string); ok && v != "" {
+		return v
+	}
+	return PermissionAsk
+}
+
+// RequireConfirm runs the shared confirm modal flow for tools that
+// self-gate (browser_*, future MCP tools). Behaviour:
+//
+//   - permission "full"  → skip (caller still owns any hard blocks)
+//   - permission "auto"  → skip modal, return approved=true
+//   - no emitter / no session → fail-closed (approved=false) so a
+//     missing wire-up cannot silently open a high-risk tool
+//   - otherwise emit ConfirmRequest and WaitForConfirm
+//
+// Returns (approved, error). error is non-nil on timeout / cancel.
+func RequireConfirm(ctx context.Context, req ConfirmRequest) (bool, error) {
+	level := PermissionLevelFromCtx(ctx)
+	if level == PermissionFull || level == PermissionAuto {
+		return true, nil
+	}
+
+	sid, _ := ctx.Value(SessionIDKey{}).(string)
+	emit := confirmEmitterFromCtx(ctx)
+	if emit == nil || sid == "" {
+		return false, fmt.Errorf("confirm unavailable (session or emitter missing)")
+	}
+
+	emit(req)
+	return WaitForConfirm(ctx, sid, req)
+}

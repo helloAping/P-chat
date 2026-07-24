@@ -2,8 +2,8 @@
 //
 // Architecture:
 //   - This is a Wails v2 app that opens a WebView2 window.
-//   - On startup, it spawns pchat-server.exe as a child process on a free
-//     port on 127.0.0.1.
+//   - On startup, it spawns pchat-server.exe as a child process on a
+//     stable preferred port on 127.0.0.1, falling back only if needed.
 //   - The webview serves ALL content from a reverse proxy: when the user
 //     navigates to http://wails.localhost/..., we forward the request to
 //     http://127.0.0.1:<port>/... (pchat-server). This keeps the webview
@@ -23,11 +23,11 @@
 //
 // Layout at runtime (after install):
 //
-//   %LOCALAPPDATA%\Programs\P-Chat\
-//   鈹溾攢鈹€ pchat-gui.exe        (this binary)
-//   鈹溾攢鈹€ pchat-server.exe     (the HTTP API + web UI)
-//   鈹溾攢鈹€ install.ps1
-//   鈹斺攢鈹€ uninstall.ps1
+//	%LOCALAPPDATA%\Programs\P-Chat\
+//	鈹溾攢鈹€ pchat-gui.exe        (this binary)
+//	鈹溾攢鈹€ pchat-server.exe     (the HTTP API + web UI)
+//	鈹溾攢鈹€ install.ps1
+//	鈹斺攢鈹€ uninstall.ps1
 package main
 
 import (
@@ -145,22 +145,34 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("pchat-gui starting; exe=%s", exe)
 
+	instanceLock, alreadyRunning, lockErr := acquireSingleInstance()
+	if lockErr != nil {
+		log.Printf("single instance: lock unavailable, continuing without it: %v", lockErr)
+	} else if alreadyRunning {
+		signaled := signalExistingInstance()
+		log.Printf("single instance: another GUI is already running; signaled=%v", signaled)
+		return
+	} else {
+		defer instanceLock.release()
+	}
+
 	app := NewApp()
 	err := wails.Run(&options.App{
-		Title:            "P-Chat",
-		Width:            1280,
-		Height:           820,
-		MinWidth:         900,
-		MinHeight:        600,
-		WindowStartState: options.Normal,
-		StartHidden:      true,
+		Title:             "P-Chat",
+		Width:             1280,
+		Height:            820,
+		MinWidth:          900,
+		MinHeight:         600,
+		WindowStartState:  options.Normal,
+		StartHidden:       true,
 		HideWindowOnClose: false,
-		BackgroundColour: &options.RGBA{R: 10, G: 10, B: 10, A: 1},
+		BackgroundColour:  &options.RGBA{R: 10, G: 10, B: 10, A: 1},
 		AssetServer: &assetserver.Options{
 			Handler: app,
 		},
 		OnStartup:     app.startup,
 		OnDomReady:    app.domReady,
+		OnShutdown:    app.shutdown,
 		OnBeforeClose: app.beforeClose,
 		Bind:          []interface{}{app},
 	})
@@ -176,11 +188,15 @@ func main() {
 // loading HTML while the child is starting, and a proxy to the child
 // once it's healthy.
 type App struct {
-	ctx        context.Context
-	serverCmd  *exec.Cmd
-	backendURL atomic.Pointer[string] // "http://127.0.0.1:PORT"
-	mu         sync.Mutex
-	ready      atomic.Bool
+	ctx                context.Context
+	serverCmd          *exec.Cmd
+	backendURL         atomic.Pointer[string] // "http://127.0.0.1:PORT"
+	serverMu           sync.Mutex
+	serverStopped      bool
+	quitting           atomic.Bool
+	closePromptPending atomic.Bool
+	ready              atomic.Bool
+	tray               *trayHandle
 }
 
 // NewApp creates a new App application struct.
@@ -696,7 +712,18 @@ func (t *dialFallbackTransport) RoundTrip(req *http.Request) (*http.Response, er
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	log.Printf("OnStartup called")
+	a.tray = startTray(a)
 	go a.spawnAndWatch()
+}
+
+// shutdown handles process teardown paths that bypass OnBeforeClose.
+// shutdown 兜住绕过窗口关闭钩子的退出路径，确保子进程被清理。
+func (a *App) shutdown(ctx context.Context) {
+	log.Printf("OnShutdown called")
+	a.stopServer()
+	if a.tray != nil {
+		a.tray.stop()
+	}
 }
 
 // domReady is called when the webview's DOM is ready. Wails' default
@@ -751,24 +778,114 @@ func primaryScreenSize(ctx context.Context) (int, int, bool) {
 	return screens[0].Size.Width, screens[0].Size.Height, true
 }
 
-// beforeClose is called when the user closes the window. We kill the
-// child server process so it does not linger after the GUI exits.
+// beforeClose is called when the user closes the window.
+// beforeClose 在窗口关闭时询问用户收缩到托盘还是真正退出。
 func (a *App) beforeClose(ctx context.Context) bool {
 	log.Printf("OnBeforeClose called")
-	a.mu.Lock()
-	cmd := a.serverCmd
-	a.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+	action := closeActionForWindowClose(a.quitting.Load(), a.tray != nil && a.tray.ready())
+	if action == closeActionExit {
+		a.stopServer()
+		return false
 	}
+	if a.requestCloseConfirmation() {
+		return true
+	}
+	a.stopServer()
 	return false
+}
+
+// stopServer stops the pchat-server child started by this GUI.
+// stopServer 只停止当前 GUI 持有的子进程，并且可以重复调用。
+func (a *App) stopServer() {
+	a.serverMu.Lock()
+	if a.serverStopped {
+		a.serverMu.Unlock()
+		return
+	}
+	cmd := a.serverCmd
+	if cmd == nil || cmd.Process == nil {
+		a.serverMu.Unlock()
+		return
+	}
+	a.serverStopped = true
+	a.serverMu.Unlock()
+
+	log.Printf("stopping pchat-server PID=%d", cmd.Process.Pid)
+	if err := cmd.Process.Kill(); err != nil {
+		log.Printf("stopServer: kill PID=%d: %v", cmd.Process.Pid, err)
+	}
+	if _, err := cmd.Process.Wait(); err != nil {
+		log.Printf("stopServer: wait PID=%d: %v", cmd.Process.Pid, err)
+	}
+}
+
+// showMainWindow restores the main Wails window.
+// showMainWindow 从托盘恢复主窗口。
+func (a *App) showMainWindow() {
+	if a.ctx == nil {
+		return
+	}
+	wailsruntime.WindowShow(a.ctx)
+	wailsruntime.WindowUnminimise(a.ctx)
+}
+
+// hideMainWindow hides the main window without stopping the server.
+// hideMainWindow 仅隐藏窗口，后端服务继续运行。
+func (a *App) hideMainWindow() {
+	if a.ctx == nil {
+		return
+	}
+	wailsruntime.WindowHide(a.ctx)
+}
+
+func (a *App) requestCloseConfirmation() bool {
+	if a.ctx == nil {
+		return false
+	}
+	if !a.closePromptPending.CompareAndSwap(false, true) {
+		return true
+	}
+	payload := map[string]interface{}{
+		"default_action": normalizeCloseBehavior(readCloseBehavior()),
+	}
+	wailsruntime.EventsEmit(a.ctx, closeRequestEventName, payload)
+	return true
+}
+
+// ConfirmWindowClose applies the close choice selected in the webview.
+// ConfirmWindowClose 由前端关闭确认弹窗回调，避免在 OnBeforeClose 中弹原生框卡死。
+func (a *App) ConfirmWindowClose(choice string) {
+	a.closePromptPending.Store(false)
+	switch closeActionForCloseRequestChoice(choice) {
+	case closeActionTray:
+		a.hideMainWindow()
+	case closeActionExit:
+		a.quitApp()
+	default:
+		// Cancel and unknown choices leave the window open.
+	}
+}
+
+// CancelWindowClose dismisses a pending webview close confirmation.
+// CancelWindowClose 用于用户取消关闭确认，并允许下一次点击 X 再次弹窗。
+func (a *App) CancelWindowClose() {
+	a.closePromptPending.Store(false)
+}
+
+// quitApp performs a real application exit from the tray menu.
+// quitApp 用于托盘菜单的真正退出路径。
+func (a *App) quitApp() {
+	a.quitting.Store(true)
+	a.stopServer()
+	if a.ctx != nil {
+		wailsruntime.Quit(a.ctx)
+	}
 }
 
 // ---------- server spawning ----------
 
-// spawnAndWatch locates pchat-server.exe, picks a free port, starts it as
-// a child process, installs the reverse proxy, waits for it to be
+// spawnAndWatch locates pchat-server.exe, picks a preferred port, starts it
+// as a child process, installs the reverse proxy, waits for it to be
 // healthy, and finally shows the window.
 func (a *App) spawnAndWatch() {
 	bin, err := findServerBinary()
@@ -777,9 +894,9 @@ func (a *App) spawnAndWatch() {
 		return
 	}
 
-	port, err := pickFreePort()
+	port, err := pickPreferredPort()
 	if err != nil {
-		log.Printf("pickFreePort: %v", err)
+		log.Printf("pickPreferredPort: %v", err)
 		return
 	}
 	log.Printf("picked port %d", port)
@@ -825,9 +942,10 @@ func (a *App) spawnAndWatch() {
 		log.Printf("cmd.Start: %v", err)
 		return
 	}
-	a.mu.Lock()
+	a.serverMu.Lock()
 	a.serverCmd = cmd
-	a.mu.Unlock()
+	a.serverStopped = false
+	a.serverMu.Unlock()
 	log.Printf("spawned pchat-server PID=%d", cmd.Process.Pid)
 
 	// Store the backend URL immediately so the loading page can
@@ -878,13 +996,13 @@ func (a *App) spawnAndWatch() {
 	// Show the window. The webview is currently still rendering the
 	// loading HTML; on its next health poll it will detect 200 and
 	// navigate to "/", which now goes to pchat-server's real UI.
-	wailsruntime.WindowShow(a.ctx)
+	a.showMainWindow()
 }
 
 // findServerBinary searches common locations for pchat-server.exe, in order:
-//   1. The directory of the running pchat-gui.exe
-//   2. The repository `bin/` directory (from CWD — covers `wails dev`)
-//   3. PATH
+//  1. The directory of the running pchat-gui.exe
+//  2. The repository `bin/` directory (from CWD — covers `wails dev`)
+//  3. PATH
 func findServerBinary() (string, error) {
 	// Resolve from executable directory first.
 	if exe, err := os.Executable(); err == nil {
@@ -933,7 +1051,24 @@ func findServerBinary() (string, error) {
 	return "", fmt.Errorf("pchat-server.exe not found next to pchat-gui.exe and not in PATH")
 }
 
-// pickFreePort asks the OS for a free TCP port.
+const (
+	preferredPortStart = 15150
+	preferredPortEnd   = 15159
+)
+
+// pickPreferredPort returns the first available port in P-Chat's stable
+// local range, falling back to an OS-assigned port only if the range is full.
+func pickPreferredPort() (int, error) {
+	for port := preferredPortStart; port <= preferredPortEnd; port++ {
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			_ = l.Close()
+			return port, nil
+		}
+	}
+	return pickFreePort()
+}
+
 func pickFreePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

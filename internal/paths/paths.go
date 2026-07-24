@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	GlobalDirName = ".p-chat"
+	GlobalDirName  = ".p-chat"
 	ProjectDirName = ".p-chat"
 )
 
@@ -180,6 +180,10 @@ func ProjectSkillsDirWithRoot(root string) string {
 
 func ProjectRulesDirWithRoot(root string) string {
 	return filepath.Join(root, ProjectDirName, "rules")
+}
+
+func ProjectToolsDirWithRoot(root string) string {
+	return filepath.Join(root, ProjectDirName, "tools")
 }
 
 func ProjectPromptsDirWithRoot(root string) string {

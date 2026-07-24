@@ -556,7 +556,7 @@ Write-Host "Extension packed: $dst"
 3. Chrome 打开 `chrome://extensions`
 4. 开启"开发者模式"
 5. 点击"加载已解包扩展"，选择解压目录
-6. 扩展弹窗输入 server 地址 `http://localhost:8960`
+6. 扩展弹窗输入 server 地址 `http://localhost:15150`
 
 ## 使用示例
 ...

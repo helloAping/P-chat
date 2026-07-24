@@ -3,6 +3,7 @@ package browser
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewBrowserID_Unique(t *testing.T) {
@@ -56,10 +57,113 @@ func TestHub_Count_Empty(t *testing.T) {
 	}
 }
 
+func TestProtocolCompatibility(t *testing.T) {
+	if !ProtocolCompatible(ProtocolVersion) {
+		t.Fatalf("ProtocolCompatible(%q) = false", ProtocolVersion)
+	}
+	if ProtocolCompatible("") {
+		t.Fatal("empty protocol version should require an update")
+	}
+	if ProtocolCompatible("legacy") {
+		t.Fatal("mismatched protocol version should require an update")
+	}
+	if msg := UpdateMessage(""); !strings.Contains(msg, "未上报协议版本") {
+		t.Fatalf("UpdateMessage(empty) = %q", msg)
+	}
+}
+
+func TestHubList_IncludesProtocolUpdateState(t *testing.T) {
+	hub := NewHub()
+	client := NewBrowserClient("browser-test", "Chrome Test", nil, HelloParams{
+		BrowserName:      "Chrome Test",
+		TabsCount:        2,
+		ExtensionVersion: "1.0.0",
+		ProtocolVersion:  "legacy",
+	})
+	hub.clients[client.ID()] = &clientEntry{
+		client:      client,
+		connectedAt: time.Now(),
+	}
+
+	list := hub.List()
+	if len(list) != 1 {
+		t.Fatalf("List len = %d, want 1", len(list))
+	}
+	got := list[0]
+	if got.TabsCount != 2 {
+		t.Fatalf("TabsCount = %d, want 2", got.TabsCount)
+	}
+	if !got.UpdateRequired {
+		t.Fatal("UpdateRequired = false, want true for mismatched protocol")
+	}
+	if got.ProtocolCompatible {
+		t.Fatal("ProtocolCompatible = true, want false for mismatched protocol")
+	}
+	if !strings.Contains(got.UpdateMessage, ProtocolVersion) {
+		t.Fatalf("UpdateMessage = %q, want expected protocol version", got.UpdateMessage)
+	}
+}
+
 func TestHub_Stop_NoRun(t *testing.T) {
 	hub := NewHub()
 	// Stop without calling Run should not panic.
 	hub.Stop()
 	// Double stop should also not panic (stopOnce).
 	hub.Stop()
+}
+
+func TestBrowserClient_SetActiveTabMeta(t *testing.T) {
+	client := NewBrowserClient("browser-test", "Chrome Test", nil, HelloParams{
+		BrowserName: "Chrome Test",
+		TabsCount:   1,
+	})
+	client.SetActiveTabMeta(42, "Example", "https://example.com", 3)
+	snap := client.Snapshot()
+	if snap.ActiveTabID != 42 {
+		t.Fatalf("ActiveTabID = %d, want 42", snap.ActiveTabID)
+	}
+	if snap.ActiveTabTitle != "Example" {
+		t.Fatalf("ActiveTabTitle = %q", snap.ActiveTabTitle)
+	}
+	if snap.ActiveTabURL != "https://example.com" {
+		t.Fatalf("ActiveTabURL = %q", snap.ActiveTabURL)
+	}
+	if snap.TabsCount != 3 {
+		t.Fatalf("TabsCount = %d, want 3", snap.TabsCount)
+	}
+	if client.ActiveTabID() != 42 {
+		t.Fatalf("ActiveTabID() = %d, want 42", client.ActiveTabID())
+	}
+}
+
+func TestHubList_IncludesActiveTabMeta(t *testing.T) {
+	hub := NewHub()
+	client := NewBrowserClient("browser-test", "Chrome Test", nil, HelloParams{
+		BrowserName:      "Chrome Test",
+		TabsCount:        2,
+		ExtensionVersion: "1.1.0",
+		ProtocolVersion:  ProtocolVersion,
+	})
+	client.SetActiveTabMeta(7, "Docs", "https://docs.example", 4)
+	hub.clients[client.ID()] = &clientEntry{
+		client:      client,
+		connectedAt: time.Now(),
+	}
+	list := hub.List()
+	if len(list) != 1 {
+		t.Fatalf("List len = %d, want 1", len(list))
+	}
+	got := list[0]
+	if got.ActiveTabID != 7 {
+		t.Fatalf("ActiveTabID = %d, want 7", got.ActiveTabID)
+	}
+	if got.ActiveTabTitle != "Docs" {
+		t.Fatalf("ActiveTabTitle = %q", got.ActiveTabTitle)
+	}
+	if got.TabsCount != 4 {
+		t.Fatalf("TabsCount = %d, want 4", got.TabsCount)
+	}
+	if got.UpdateRequired {
+		t.Fatal("UpdateRequired should be false for current protocol")
+	}
 }

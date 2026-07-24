@@ -22,6 +22,8 @@ type Config struct {
 	Server    ServerConfig    `json:"server"`
 	LLM       LLMConfig       `json:"llm"`
 	Style     StyleConfig     `json:"style"`
+	UI        UIConfig        `json:"ui"`
+	WorkMode  WorkModeConfig  `json:"work_mode"`
 	Tools     ToolsConfig     `json:"tools"`
 	Memory    MemoryConfig    `json:"memory"`
 	Sandbox   SandboxConfig   `json:"sandbox"`
@@ -186,7 +188,7 @@ type ProviderConfig struct {
 	Type     string        `json:"type,omitempty"`     // alias for Protocol (backward compat)
 	BaseURL  string        `json:"base_url"`
 	APIKey   string        `json:"api_key"`
-	Model    string        `json:"model,omitempty"`     // legacy: single model
+	Model    string        `json:"model,omitempty"` // legacy: single model
 	Models   []ModelConfig `json:"models,omitempty"`
 }
 
@@ -316,6 +318,83 @@ type StyleConfig struct {
 	Default string `json:"default"`
 }
 
+// CloseBehavior controls what the desktop GUI does when the user
+// clicks the window close button.
+type CloseBehavior string
+
+const (
+	// CloseBehaviorExit keeps the legacy behaviour: close exits P-Chat.
+	CloseBehaviorExit CloseBehavior = "exit"
+	// CloseBehaviorTray hides the window while keeping the GUI and server alive.
+	CloseBehaviorTray CloseBehavior = "tray"
+)
+
+// Normalize returns a safe CloseBehavior. Empty or unknown values fall
+// back to exit so existing installs keep the previous close behaviour.
+func (b CloseBehavior) Normalize() CloseBehavior {
+	switch b {
+	case CloseBehaviorExit, CloseBehaviorTray:
+		return b
+	default:
+		return CloseBehaviorExit
+	}
+}
+
+// IsValid reports whether b is one of the built-in close behaviours.
+func (b CloseBehavior) IsValid() bool {
+	switch b {
+	case CloseBehaviorExit, CloseBehaviorTray:
+		return true
+	default:
+		return false
+	}
+}
+
+// UIConfig controls desktop/web UI behaviour.
+type UIConfig struct {
+	CloseBehavior CloseBehavior `json:"close_behavior,omitempty"`
+}
+
+// WorkMode is the user's task focus. It is orthogonal to
+// style.Style: style controls how the assistant speaks, while
+// WorkMode controls what kind of work it prioritizes.
+type WorkMode string
+
+const (
+	// WorkModeCoding biases the assistant toward code reading,
+	// editing, debugging, commands, git, tests, and review.
+	WorkModeCoding WorkMode = "coding"
+	// WorkModeDaily biases the assistant toward documents, email,
+	// summaries, knowledge lookup, planning, and office work.
+	WorkModeDaily WorkMode = "daily"
+)
+
+// Normalize returns a safe WorkMode. Empty or unknown values fall
+// back to coding so existing installs keep the programming-agent
+// behaviour they had before work_mode existed.
+func (w WorkMode) Normalize() WorkMode {
+	switch w {
+	case WorkModeCoding, WorkModeDaily:
+		return w
+	default:
+		return WorkModeCoding
+	}
+}
+
+// IsValid reports whether w is one of the built-in work modes.
+func (w WorkMode) IsValid() bool {
+	switch w {
+	case WorkModeCoding, WorkModeDaily:
+		return true
+	default:
+		return false
+	}
+}
+
+type WorkModeConfig struct {
+	Default WorkMode `json:"default"`
+}
+
 type ToolsConfig struct {
 	Enabled []string           `json:"enabled"`
 	Servers []ToolServerConfig `json:"servers"`
@@ -334,11 +413,11 @@ type MCPConfig struct {
 
 type MCPServerConfig struct {
 	Name    string            `json:"name"`
-	Type    string            `json:"type,omitempty"`   // "stdio" (default) | "sse"
+	Type    string            `json:"type,omitempty"` // "stdio" (default) | "sse"
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
 	Env     map[string]string `json:"env,omitempty"`
-	URL     string            `json:"url,omitempty"`    // for SSE transport
+	URL     string            `json:"url,omitempty"` // for SSE transport
 	Enabled bool              `json:"enabled"`
 	Timeout string            `json:"timeout,omitempty"`
 }
@@ -362,11 +441,11 @@ type KnowledgeBase struct {
 	FileTypes []string `json:"file_types,omitempty"`
 
 	// ScanModel is "{provider}/{model}" for AI media processing, or "" for text-only.
-	ScanModel      string   `json:"scan_model"`
-	ScanMediaTypes []string `json:"scan_media_types"` // "image","video","audio","pdf"
-	AutoScan       bool     `json:"auto_scan"`
+	ScanModel       string   `json:"scan_model"`
+	ScanMediaTypes  []string `json:"scan_media_types"` // "image","video","audio","pdf"
+	AutoScan        bool     `json:"auto_scan"`
 	ExcludePatterns []string `json:"exclude_patterns"`
-	MaxFileSize    int64    `json:"max_file_size"` // 0 = default (5MB)
+	MaxFileSize     int64    `json:"max_file_size"` // 0 = default (5MB)
 }
 
 type MemoryConfig struct {
@@ -452,6 +531,27 @@ type BrowserConfig struct {
 	// writes to the page (fetch, postMessage, etc.). When false
 	// (default), only read-only expressions are allowed.
 	AllowEvalWrite bool `json:"allow_eval_write,omitempty"`
+
+	// RequireConfirm (BR-04) controls when browser_* tools wait for
+	// user approval. Allowed values:
+	//   "never"     - never ask (still honour BlockedHosts)
+	//   "dangerous" - ask for mutating / sensitive-domain ops (default)
+	//   "always"    - ask for every browser tool call
+	RequireConfirm string `json:"require_confirm,omitempty"`
+
+	// AllowedHosts are host patterns that auto-allow even mutating
+	// tools under "dangerous" mode (e.g. "localhost", "*.example.com").
+	// Matching is case-insensitive; leading "*." matches subdomains.
+	AllowedHosts []string `json:"allowed_hosts,omitempty"`
+
+	// BlockedHosts are host patterns that always reject browser tools
+	// (hard block, no confirm override).
+	BlockedHosts []string `json:"blocked_hosts,omitempty"`
+
+	// SensitiveHosts force a confirm prompt even for otherwise low-risk
+	// ops (snapshot / extract / navigate) under "dangerous" mode.
+	// Useful for banks, SSO, admin consoles, etc.
+	SensitiveHosts []string `json:"sensitive_hosts,omitempty"`
 }
 
 // SandboxConfig controls which actions LLM-driven tools can take
@@ -691,6 +791,8 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	}
 
 	migrateKnowledgeDefaults(cfg)
+	cfg.UI.CloseBehavior = cfg.UI.CloseBehavior.Normalize()
+	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
 
 	return cfg, nil
 }
@@ -742,7 +844,7 @@ func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Host: "127.0.0.1",
-			Port: 8960,
+			Port: 15150,
 		},
 		LLM: LLMConfig{
 			Default: "ollama",
@@ -759,6 +861,12 @@ func Default() *Config {
 		Style: StyleConfig{
 			Default: "tech",
 		},
+		UI: UIConfig{
+			CloseBehavior: CloseBehaviorExit,
+		},
+		WorkMode: WorkModeConfig{
+			Default: WorkModeCoding,
+		},
 		Tools: ToolsConfig{
 			Enabled: []string{"fs-tool", "shell-tool"},
 		},
@@ -767,10 +875,10 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Sandbox: SandboxConfig{
-			Enabled:             true,
-			RequireConfirm:      "dangerous",
-			MaxCommandLength:    4096,
-			WriteProtectedPaths: defaultWriteProtectedPaths(),
+			Enabled:               true,
+			RequireConfirm:        "dangerous",
+			MaxCommandLength:      4096,
+			WriteProtectedPaths:   defaultWriteProtectedPaths(),
 			ExecDangerousPatterns: defaultDangerousPatterns(),
 		},
 		SubAgent: SubAgentConfig{
@@ -797,6 +905,16 @@ func Default() *Config {
 			Enabled:                 false,
 			ScreenshotQuality:       80,
 			MaxScreenshotsInHistory: 3,
+			RequireConfirm:          "dangerous",
+			// Conservative defaults: empty allowlist; a few common
+			// sensitive host patterns so form-fill / click on login
+			// pages always surface a confirm modal.
+			SensitiveHosts: []string{
+				"accounts.google.com",
+				"login.microsoftonline.com",
+				"*.alipay.com",
+				"*.paypal.com",
+			},
 		},
 	}
 }
@@ -835,23 +953,23 @@ func defaultWriteProtectedPaths() []string {
 // flag a shell command as potentially destructive.
 func defaultDangerousPatterns() []string {
 	return []string{
-		`\brm\s+(-[a-zA-Z]*[rfRF]+\s+)+/`,       // rm -rf /
-		`\brm\s+-rf\s+~`,                          // rm -rf ~
-		`\bmkfs\.`,                                 // mkfs.ext4 etc.
-		`\bdd\s+.*\bof=/dev/(sd|nvme|hd)`,         // dd to disk
-		`\bcurl\s+.*\|\s*(sudo\s+)?sh`,            // curl|sh
-		`\bwget\s+.*\|\s*(sudo\s+)?sh`,            // wget|sh
-		`\b(sh|bash)\s+<\(\s*curl`,                 // process substitution
-		`\bchmod\s+-R\s+777\s+/`,                   // chmod 777 /
-		`\bchown\s+-R\s+.*\s+/`,                    // chown /
-		`:(){\s*:\|:&\s*};:`,                       // fork bomb
-		`\bshutdown\b`,                            // shutdown
-		`\breboot\b`,                              // reboot
-		`\bpoweroff\b`,                            // poweroff
-		`\bhalt\b`,                                // halt
-		`\bmkfs\b.*\s+/dev/`,                      // format a device
-		`>\s*/dev/sd`,                             // redirect to disk
-		`\bnc\s+-l\s+-p\s+\d+`,                    // netcat listener
-		`\beval\s+.*\$\(`,                          // eval + command substitution
+		`\brm\s+(-[a-zA-Z]*[rfRF]+\s+)+/`, // rm -rf /
+		`\brm\s+-rf\s+~`,                  // rm -rf ~
+		`\bmkfs\.`,                        // mkfs.ext4 etc.
+		`\bdd\s+.*\bof=/dev/(sd|nvme|hd)`, // dd to disk
+		`\bcurl\s+.*\|\s*(sudo\s+)?sh`,    // curl|sh
+		`\bwget\s+.*\|\s*(sudo\s+)?sh`,    // wget|sh
+		`\b(sh|bash)\s+<\(\s*curl`,        // process substitution
+		`\bchmod\s+-R\s+777\s+/`,          // chmod 777 /
+		`\bchown\s+-R\s+.*\s+/`,           // chown /
+		`:(){\s*:\|:&\s*};:`,              // fork bomb
+		`\bshutdown\b`,                    // shutdown
+		`\breboot\b`,                      // reboot
+		`\bpoweroff\b`,                    // poweroff
+		`\bhalt\b`,                        // halt
+		`\bmkfs\b.*\s+/dev/`,              // format a device
+		`>\s*/dev/sd`,                     // redirect to disk
+		`\bnc\s+-l\s+-p\s+\d+`,            // netcat listener
+		`\beval\s+.*\$\(`,                 // eval + command substitution
 	}
 }

@@ -59,7 +59,7 @@
 │ ┌──────────────┐  ┌──────────────┐  ┌────────────────┐ │
 │ │ wiki_lookup   │  │ wiki_list    │  │ grep           │ │
 │ │ · query/base  │  │ · parent_id  │  │ · pattern/base │ │
-│ │ · 5 策略排序  │  │ · 分页       │  │ · filepath.Walk│ │
+│ │ · hybrid+RRF │  │ · 分页       │  │ · filepath.Walk│ │
 │ └──────┬───────┘  └──────┬───────┘  └────────┬───────┘ │
 └────────┼──────────────────┼──────────────────┼─────────┘
          │                  │                  │
@@ -193,7 +193,7 @@ func (ws *WikiStore) Close() error                         // 关闭连接
 | `MigrateBaseToIndex` | `(ctx, base string) (bool, error)` | 创建 index_nodes/contents/index_fts 表，幂等 |
 | `InsertNode` | `(ctx, *IndexNode) (int64, error)` | 写入节点 → 触发器自动同步 FTS |
 | `InsertContent` | `(ctx, *ContentNode) (int64, error)` | 写入内容块 |
-| `LookupSearch` | `(ctx, query, base string, expand bool, level, page, size int)` | 多策略排序搜索 |
+| `LookupSearch` | `(ctx, query, base string, expand bool, level, page, size int)` | KB-02 hybrid+RRF 搜索，返回 match_type |
 | `ListChildren` | `(ctx, parentID, page, size int)` | 分页列出子节点 |
 | `ListNodes` | `(ctx, base string) ([]NodeTreeItem, error)` | 返回整棵树的扁平列表（含 child_count/content_count） |
 | `GetNodeContent` | `(ctx, nodeID int) ([]ContentNode, error)` | 读取节点的内容块 |
@@ -207,22 +207,19 @@ func (ws *WikiStore) Close() error                         // 关闭连接
 | `GetFileMtime` | `(ctx, base, source string) (int64, error)` | 读取 mtime |
 | `SetFileMtime` | `(ctx, base, source string, mtime int64) error` | 写入 mtime |
 
-### 4.6 LookupSearch — 5 策略排序（★ 新）
+### 4.6 LookupSearch — hybrid + RRF（KB-02）
 
 ```
-权重排序（高→低）:
-  1. title   (权重 1.0) — FTS5 标题精确匹配
-  2. keywords(权重 0.8) — FTS5 关键词匹配
-  3. overview(权重 0.6) — FTS5 摘要匹配
-  4. L2      (权重 0.4) — 命中 L3 section → 回退到 L2 parent
-  5. LIKE    (权重 0.2) — contents LIKE '%query%' 兜底
+候选来源：
+  1. lexicalPathHits: source / filename / title substring
+  2. FTS title / keywords / overview / L2 prefix
+  3. contents.content LIKE
+融合：Reciprocal Rank Fusion (RRF)
+输出：IndexSearchItem.Rank + MatchType(path|filename|title|keywords|overview|l2|content)
 ```
 
-支持多 base 搜索：每个 base 查 page=1/size=200 → 合并 → 跨库 re-rank → 切片返回请求页。
+`KB-01` 多库模式在调用层对每个 base 分别 `LookupSearch`，再 `MergeAndRerank`：按库内 max 归一化、按 `source+title` 去重、全局排序。
 
----
-
-## 5. 配置模型
 
 ### 5.1 KnowledgeBase
 
@@ -366,7 +363,7 @@ var MediaTypeExtensions = map[string][]string{
 
 ```
 参数: query (required), base (optional), expand (bool), level (int), page (int), size (int)
-流程: resolveBases → 遍历 bases → LookupSearch 5策略排序 → 合并 → re-rank → 分页返回
+流程: resolveBases → 遍历 bases → LookupSearch hybrid+RRF → MergeAndRerank → 分页返回
 ```
 
 | 参数 | 默认值 | 最大 | 说明 |
@@ -672,9 +669,13 @@ pchat-server 启动
 | 文件 | 内容 |
 |------|------|
 | `internal/knowledge/wiki_store.go` | WikiStore — SQLite 存储引擎（旧表 + 三层索引 + FTS5 + 触发器） |
+| `internal/knowledge/hybrid.go` | KB-02 hybrid retrieval：lexical + FTS + content LIKE + RRF |
+| `internal/knowledge/query_plan.go` | KB-03 query decomposition：规则型派生查询 |
+| `internal/knowledge/citation.go` | KB-04 citation explainability：结构化来源和解释文本 |
+| `internal/knowledge/merge.go` | KB-01 多库归一化合并、去重、重排 |
 | `internal/knowledge/wiki_parser.go` | Markdown `##`/`###` 解析器 |
 | `internal/knowledge/media_types.go` | 媒体类型→扩展名映射 |
-| `internal/tool/wiki.go` | `wiki_lookup`（5 策略排序）+ `wiki_list` 工具 |
+| `internal/tool/wiki.go` | `wiki_lookup`（hybrid+RRF + 多库合并）+ `wiki_list` 工具 |
 | `internal/tool/grep.go` | `grep` 工具 |
 | `internal/server/knowledge_api.go` | 知识库 CRUD + 扫描管道 + API 端点 + parseKWAndOverview |
 | `internal/server/handler.go` | sessionMeta/KnowledgeBase 流、SSE 映射 |
@@ -694,3 +695,41 @@ pchat-server 启动
 
 - [ ] `wiki_lookup` 多 base search 合并 re-rank 当前按权重排序，可考虑 BM25 归一化
 - [ ] `buildKBIndex` 使用 `context.Background()` 而非传入 ctx — L1 cache 已用 30s TTL 缓解
+
+
+## 查询改写与分解 (KB-03)
+
+搜索入口会先调用 `knowledge.PlanQueries(query)`，规则型派生 2-5 个 query：
+
+- 原始 query
+- 反引号中的术语（如 `work_mode`）
+- 路径型 token（如 `internal/config/config.go`）
+- 函数/配置 key/文件名等 symbol token（如 `LoadConfig`）
+- 较长中文/英文关键词
+
+每个派生 query 都会独立 `LookupSearch`，再复用 KB-01 `MergeAndRerank` 去重、归一化、全局排序。结果新增 `query` 字段，表示这条命中来自哪个原始或派生查询。
+
+
+## 引用可解释性 (KB-04)
+
+知识库搜索结果会附带结构化 `citation` 与短文本 `explanation`：
+
+- `base` / `source` / `title` / `parent_title`: 来源库与定位
+- `query`: 命中该结果的原始或派生查询
+- `match_type`: `path | filename | title | keywords | overview | l2 | content`
+- `score`: 融合后的相关性分数
+- `explanation`: 可直接展示给用户的命中说明
+
+`wiki_lookup` 工具结果会显示来源库、命中类型、匹配查询和解释；`POST /api/v1/knowledge/search` 返回同样的结构化字段，前端类型为 `KnowledgeCitation`。
+
+
+## 增量扫描优化 (KB-05)
+
+扫描知识库时会按文件 `mtime` 进行增量处理：
+
+- 未变文件：跳过，计入 `skipped`
+- 新增/变更文件：只替换该 source 的 L2/L3/contents，计入 `changed`
+- 已删除文件：从索引和 `file_mtimes` 清理，计入 `deleted`
+- 读取失败文件：计入 `failed`，扫描继续
+
+`GET /api/v1/knowledge/bases/:name/scan/status` 新增 `changed`、`skipped`、`deleted`、`failed` 字段，GUI 可展示二次扫描是否真正跳过未变文件。

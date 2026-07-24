@@ -27,6 +27,14 @@ import (
 
 type REPL struct {
 	ctx cliContext // primary context (HTTP mode)
+	// runCtx is the long-lived context the REPL was
+	// started with. Passed down to background operations
+	// (recall search, snapshot fetch, etc.) so a SIGINT
+	// (or any other cancellation) propagates and aborts
+	// in-flight work. Defaults to context.Background() so
+	// callers that don't pass one still get a working
+	// (uncancellable) context — better than nil-deref.
+	runCtx context.Context
 
 	cfg      *config.Config
 	agent    *agent.Agent
@@ -35,6 +43,7 @@ type REPL struct {
 	tools    *tool.Registry
 	store    *memory.Store
 	style    style.Style
+	mode     config.WorkMode
 	provider string
 	useTools bool
 
@@ -52,12 +61,24 @@ type REPL struct {
 func NewREPL(ctx cliContext, cfg *config.Config, s style.Style, provider string) *REPL {
 	return &REPL{
 		ctx:          ctx,
+		runCtx:       context.Background(),
 		cfg:          cfg,
 		style:        s,
+		mode:         cfg.WorkMode.Default.Normalize(),
 		provider:     provider,
 		useTools:     true,
 		rollbackUndo: make(map[string][]httpcli.Message),
 	}
+}
+
+// SetRunContext replaces the long-lived context used for
+// background operations (recall, snapshot, etc.). Call this
+// from main() before Run() so SIGINT propagates.
+func (r *REPL) SetRunContext(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	r.runCtx = ctx
 }
 
 // SetSubAgentCache attaches a cache instance for the subagent package.
@@ -108,7 +129,7 @@ func (r *REPL) Run() error {
 	printWelcomeBanner(label, r.provider, model)
 
 	for {
-		input, isSlash, err := InputLine(r.style, r.provider)
+		input, isSlash, err := InputLine(r.style, r.provider, r.mode)
 		if err != nil {
 			if err.Error() == "interrupted" {
 				continue
@@ -176,6 +197,7 @@ func (r *REPL) readMultiLine(scanner *bufio.Scanner) string {
 func (r *REPL) chat(input string) {
 	req := agent.ChatRequest{
 		Style:    r.style,
+		WorkMode: r.mode.Normalize(),
 		Provider: r.provider,
 		Messages: []llm.ChatMessage{
 			{Role: llm.RoleUser, Type: llm.TypeText, Content: input},
@@ -269,7 +291,7 @@ func printWelcomeBanner(label string, provider string, model string) {
 	fmt.Println()
 }
 
-func printPrompt(s style.Style, provider string) {
+func printPrompt(s style.Style, provider string, mode config.WorkMode) {
 	var icon string
 	switch s {
 	case style.Cute:
@@ -281,7 +303,7 @@ func printPrompt(s style.Style, provider string) {
 	default:
 		icon = "❯"
 	}
-	fmt.Printf("  %s \033[90m[%s]\033[0m ", icon, provider)
+	fmt.Printf("  %s \033[90m[%s mode:%s]\033[0m ", icon, provider, mode.Normalize())
 }
 
 // watchEsc polls stdin in raw mode (non-blocking) while a chat is

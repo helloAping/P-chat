@@ -75,7 +75,8 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
+  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
+  globalWorkMode: 'coding' as string,
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
   // sessionWorking is the per-session "is the LLM mid-turn"
@@ -107,6 +108,12 @@ export const state = reactive({
   showSettings: false,
   projects: [] as ProjectItem[],
   activeProjectPath: '' as string,
+  // P3-3: current session's trace id. Minted server-side on
+  // POST /messages and mirrored on every SSE event. The
+  // TopBar reads this so users can copy the id to the
+  // clipboard without scrolling to the error chip. Cleared
+  // when the user switches sessions.
+  currentTraceId: '' as string,
   // Rollback undo buffer — only the most recent rollback per session.
   rollbackUndo: {} as Record<string, { messages: Message[]; fromIndex: number } | null>,
   // Pending text to fill into the input area after a rollback.
@@ -123,6 +130,14 @@ export const state = reactive({
     reason: string
     shownAt: number
   },
+  // P0-1: is the recoverMissingParts flow currently
+  // running? Set true at the start of recoverMissingParts
+  // and false again when the snapshot fetch resolves
+  // (either with merged parts or no-op). The ChatWindow
+  // shows a small spinner-style banner ("⚡ 正在补齐
+  // 未送达消息…") while this is true so the user knows
+  // the system is doing work, not hanging.
+  isRecovering: {} as Record<string, boolean>,
   // P2-3: context inspector drawer state. When non-null
   // the drawer is open with this payload. Loading and
   // error states are tracked separately so the drawer
@@ -221,6 +236,7 @@ export const currentMeta = computed(() => {
   const def = state.defaultModel
   return {
     style: 'tech',
+    workMode: state.globalWorkMode || 'coding',
     provider: def?.provider || '',
     model: def?.model || '',
     title: '',
@@ -422,6 +438,11 @@ function dedupMessagesByKey(existing: Message[], incoming: Message[]): Message[]
 
 export async function switchSession(id: string) {
   state.currentID = id
+  // P3-3: clear the previous session's trace id so the
+  // TopBar tooltip doesn't show a stale id from a session
+  // the user is no longer looking at. The next event of
+  // the new session will repopulate it.
+  state.currentTraceId = ''
   if (!state.sessionMessages[id]) {
     // First visit to this session: load the most recent page
     // only. Older pages are fetched on-demand by
@@ -485,6 +506,7 @@ export async function switchSession(id: string) {
   if (s) {
     state.sessionMeta[id] = {
       style:     s.style || 'tech',
+      workMode:  s.work_mode || state.globalWorkMode || 'coding',
       provider:  s.provider || '',
       model:     s.model || '',
       title:     s.title || '',
@@ -682,6 +704,7 @@ export async function renameSession(id: string, title: string) {
   if (s) {
     s.title = resp.title ?? title
     s.style = resp.style ?? s.style
+    s.work_mode = resp.work_mode ?? s.work_mode
     s.provider = resp.provider ?? s.provider
     s.model = resp.model ?? s.model
   }
@@ -690,6 +713,7 @@ export async function renameSession(id: string, title: string) {
       ...state.sessionMeta[id],
       title: resp.title ?? title,
       style: resp.style ?? state.sessionMeta[id].style,
+      workMode: resp.work_mode ?? state.sessionMeta[id].workMode,
       provider: resp.provider ?? state.sessionMeta[id].provider,
       model: resp.model ?? state.sessionMeta[id].model,
       permission_level: resp.permission_level ?? state.sessionMeta[id].permission_level,
@@ -1367,6 +1391,15 @@ function appendThinkingPart(m: Message, delta: string, target?: MessagePart[] | 
 //
 // 修改指南 → docs/modules/frontend.md
 export function appendStreamEvent(id: string, ev: api.StreamEvent) {
+  // P3-3: stamp the trace id on the state so the TopBar
+  // can render + copy it. Only the first event of a turn
+  // matters (subsequent events carry the same id); we
+  // overwrite unconditionally so a sub-agent run that
+  // reuses the parent's stream still keeps the parent's
+  // id visible.
+  if (ev.trace_id) {
+    state.currentTraceId = ev.trace_id
+  }
   const m = findOrCreateLastAssistant(id)
   if (!m.parts) m.parts = []
 
@@ -1969,16 +2002,22 @@ export async function recoverMissingParts(
     // transient reconnect, not a real failure. Skip.
     return
   }
+  // P0-1: flip the "recovering" flag so the UI can show
+  // a spinner-style banner. We clear it in the finally
+  // block below so it always resets, even on error.
+  state.isRecovering[sessionId] = true
   const afterSeq = lastSeq >= 0 ? lastSeq : 0
   let snap: api.SnapshotRecovery
   try {
     snap = await api.getSessionSnapshot(sessionId, afterSeq)
   } catch (e: any) {
     console.warn('[recovery] snapshot fetch failed:', e?.message || e)
+    state.isRecovering[sessionId] = false
     return
   }
   if (!snap.messages || snap.messages.length === 0) {
     // No new assistant rows landed. Nothing to merge.
+    state.isRecovering[sessionId] = false
     return
   }
 
@@ -2043,6 +2082,7 @@ export async function recoverMissingParts(
     trailing.content = assembleTextContent(trailing.parts || [])
     showRecoveryBanner(sessionId, merged, reason)
   }
+  state.isRecovering[sessionId] = false
 }
 
 // showRecoveryBanner flips a transient state flag for

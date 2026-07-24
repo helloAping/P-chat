@@ -13,7 +13,7 @@ import ModelPicker from './ModelPicker.vue'
 import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
-  Lock, Unlock, Key, Database,
+  Lock, Unlock, Key, Database, Terminal,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -827,6 +827,7 @@ async function send() {
       provider: meta.provider,
       model: meta.model,
       style: meta.style,
+      workMode: meta.workMode,
       attachments: inlineAttachments,
       signal: ctrl.signal,
       skill_context: pendingSkillContext || undefined,
@@ -924,16 +925,25 @@ onMounted(() => {
 // the "更多" toggle.
 
 const styleOptions = ref<{ label: string; value: string }[]>([])
+const workModeOptions = [
+  { label: '编码 (coding)', value: 'coding' },
+  { label: '日常工作 (daily)', value: 'daily' },
+]
 
 async function loadConfig() {
   try {
     await loadProviders()
     loadKBases()
+    const sc = await api.getSystemConfig()
+    state.globalWorkMode = sc.work_mode?.default || 'coding'
     const st = await api.getStyles()
-    styleOptions.value = (st.styles || []).map((x: any) => ({
-      label: x.label || x.id,
-      value: x.id,
-    }))
+    styleOptions.value = [
+      { label: '关闭', value: 'off' },
+      ...(st.styles || []).map((x: any) => ({
+        label: x.label || x.id,
+        value: x.id,
+      })),
+    ]
   } catch { /* ignore */ }
 }
 
@@ -968,6 +978,36 @@ const currentStyleValue = computed({
   get: () => currentMeta.value.style || 'tech',
   set: (v: string) => onStylePick(v),
 })
+
+const currentStyleLabel = computed(() => {
+  const v = currentStyleValue.value
+  return styleOptions.value.find(o => o.value === v)?.label || v
+})
+
+async function onWorkModePick(v: string) {
+  if (!state.currentID) return
+  const resp = await api.updateSessionMeta(state.currentID, { work_mode: v })
+  const id = state.currentID
+  const mode = resp.work_mode ?? v
+  state.sessionMeta[id] = {
+    ...(state.sessionMeta[id] || currentMeta.value),
+    workMode: mode,
+  }
+  const s = state.sessions.find(s => s.id === id)
+  if (s) s.work_mode = mode
+}
+
+const currentWorkModeValue = computed({
+  get: () => currentMeta.value.workMode || state.globalWorkMode || 'coding',
+  set: (v: string) => onWorkModePick(v),
+})
+
+const currentWorkModeLabel = computed(() =>
+  currentWorkModeValue.value === 'daily' ? '日常' : '编码',
+)
+const workModeIcon = computed(() =>
+  currentWorkModeValue.value === 'daily' ? FileText : Terminal,
+)
 
 // Display label for the reasoning picker. Maps the enum
 // value (off/low/medium/high/max) to the Chinese label
@@ -1124,10 +1164,28 @@ onMounted(() => {
             type="button"
             class="opt-pick"
             :disabled="!state.currentID"
-            :title="`当前风格: ${currentStyleValue}`"
-            :aria-label="`当前风格: ${currentStyleValue}`"
+            :title="`当前风格: ${currentStyleLabel}`"
+            :aria-label="`当前风格: ${currentStyleLabel}`"
           >
-            <span class="opt-pick-label">{{ currentStyleValue }}</span>
+            <span class="opt-pick-label">{{ currentStyleLabel }}</span>
+            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
+          </button>
+        </NDropdown>
+        <NDropdown
+          trigger="click"
+          placement="top-end"
+          :options="workModeOptions.map(o => ({ key: o.value, label: o.label }))"
+          @select="(key: string | number) => onWorkModePick(String(key))"
+        >
+          <button
+            type="button"
+            class="opt-pick opt-pick--narrow"
+            :disabled="!state.currentID"
+            :title="`工作模式: ${currentWorkModeValue}`"
+            :aria-label="`工作模式: ${currentWorkModeValue}`"
+          >
+            <component :is="workModeIcon" :size="12" class="opt-pick-icon" />
+            <span class="opt-pick-label">{{ currentWorkModeLabel }}</span>
             <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
           </button>
         </NDropdown>

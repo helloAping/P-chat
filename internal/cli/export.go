@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,21 +8,25 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/export"
 	"github.com/p-chat/pchat/internal/memory"
 )
 
-// ExportFormat identifies the output format of /export.
-type ExportFormat string
+// Format is the CLI's alias for the export format
+// enum. Re-exported so the existing CLI command
+// registrations and tests don't have to switch the
+// spelling in one shot.
+type Format = export.Format
 
 const (
-	FormatMarkdown ExportFormat = "markdown"
-	FormatJSON     ExportFormat = "json"
+	FormatMarkdown = export.FormatMarkdown
+	FormatJSON     = export.FormatJSON
 )
 
-// exportOpts holds the parsed command-line options for /export.
+// exportOpts holds the parsed command-line options for
+// /export.
 type exportOpts struct {
-	format ExportFormat
+	format export.Format
 	// sessionID is either a specific conversation id, "" (use current),
 	// or "last" (use the most recent conversation).
 	sessionID string
@@ -97,11 +100,11 @@ func resolveSession(store *memory.Store, id string) (*memory.Conversation, error
 	return nil, fmt.Errorf("会话 %s 不存在", id)
 }
 
-// defaultExportFilename produces a sensible filename when the user
-// didn't supply one. Format:
+// defaultExportFilename produces a sensible filename
+// when the user didn't supply one. Format:
 //
 //	pchat-<short-id>-<YYYYMMDD-HHMMSS>.md
-func defaultExportFilename(conv *memory.Conversation, format ExportFormat) string {
+func defaultExportFilename(conv *memory.Conversation, format export.Format) string {
 	ext := "md"
 	if format == FormatJSON {
 		ext = "json"
@@ -114,80 +117,14 @@ func defaultExportFilename(conv *memory.Conversation, format ExportFormat) strin
 	return fmt.Sprintf("pchat-%s-%s.%s", shortID, ts, ext)
 }
 
-// exportToMarkdown renders the conversation as human-readable
-// markdown. The output is byte-stable for a given conversation +
-// style + provider combo (so re-exports produce diff-friendly files).
-func exportToMarkdown(conv *memory.Conversation, msgs []llm.Message) string {
-	var b strings.Builder
-
-	title := conv.Title
-	if title == "" {
-		title = "(untitled)"
-	}
-	fmt.Fprintf(&b, "# %s\n\n", title)
-	fmt.Fprintf(&b, "- **Session ID**: `%s`\n", conv.ID)
-	fmt.Fprintf(&b, "- **Created**: %s\n", conv.CreatedAt.Format(time.RFC3339))
-	fmt.Fprintf(&b, "- **Updated**: %s\n", conv.UpdatedAt.Format(time.RFC3339))
-	fmt.Fprintf(&b, "- **Messages**: %d\n\n", len(msgs))
-	fmt.Fprintln(&b, "---")
-	fmt.Fprintln(&b)
-
-	for i, m := range msgs {
-		roleIcon := roleEmoji(m.Role)
-		fmt.Fprintf(&b, "## %s %s · msg #%d\n\n", roleIcon, titleCase(m.Role), i+1)
-		body := strings.TrimSpace(m.Content)
-		if body != "" {
-			// Triple-backtick code blocks render well in markdown.
-			if looksLikeCode(body) {
-				fmt.Fprintln(&b, "```")
-				fmt.Fprintln(&b, body)
-				fmt.Fprintln(&b, "```")
-			} else {
-				fmt.Fprintln(&b, body)
-			}
-			fmt.Fprintln(&b)
-		}
-		if m.Name != "" {
-			fmt.Fprintf(&b, "*tool: `%s`*\n\n", m.Name)
-		}
-		if m.ToolCallID != "" {
-			fmt.Fprintf(&b, "*tool_call_id: `%s`*\n\n", m.ToolCallID)
-		}
-	}
-	return b.String()
-}
-
-// exportToJSON serializes the conversation as JSON. The schema is
-// stable and machine-readable. The `messages` field is the raw
-// LLM message list (no transformation), so downstream tooling can
-// re-feed it to an LLM directly.
-func exportToJSON(conv *memory.Conversation, msgs []llm.Message) (string, error) {
-	out := struct {
-		Version    string         `json:"version"`
-		ExportedAt string         `json:"exported_at"`
-		Session    map[string]any `json:"session"`
-		Messages   []llm.Message  `json:"messages"`
-	}{
-		Version:    "pchat-export/1",
-		ExportedAt: time.Now().UTC().Format(time.RFC3339),
-		Session: map[string]any{
-			"id":         conv.ID,
-			"title":      conv.Title,
-			"created_at": conv.CreatedAt,
-			"updated_at": conv.UpdatedAt,
-		},
-		Messages: msgs,
-	}
-	b, err := json.MarshalIndent(out, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-// doExport runs the full export pipeline: parse args, resolve session,
-// fetch messages, format, write file. Returns the absolute path of
-// the written file plus a short human summary.
+// doExport runs the full export pipeline: parse args,
+// resolve session, fetch messages, format, write file.
+// Returns the absolute path of the written file plus a
+// short human summary.
+//
+// The actual rendering is delegated to the
+// internal/export package so the CLI and the HTTP
+// /export endpoint produce byte-identical output.
 func doExport(store *memory.Store, args string) (string, error) {
 	opts := parseExportArgs(args)
 
@@ -196,23 +133,21 @@ func doExport(store *memory.Store, args string) (string, error) {
 		return "", err
 	}
 
-	// The Store doesn't expose a "load messages by id" method; we
-	// have to switch the current conversation and read its
-	// history. This is OK for single-process use (REPL or single
-	// client); for multi-process support we'd need a dedicated
-	// ConversationByID() method.
+	// Switch the store's current conversation so
+	// GetMessagesFull reads the right row set. The
+	// switch is restored on exit so the rest of the
+	// REPL session isn't disturbed.
 	prev := store.CurrentConversationID()
 	if err := store.SetCurrent(conv.ID); err != nil {
 		return "", fmt.Errorf("切到会话失败: %w", err)
 	}
 	defer func() {
-		// Best-effort restore of previous current.
 		if prev != "" && prev != conv.ID {
 			_ = store.SetCurrent(prev)
 		}
 	}()
 
-	msgs := store.GetMessages()
+	msgs := store.GetMessagesFull()
 	if len(msgs) == 0 {
 		color.HiBlack("    (会话没有消息, 仍然导出空文件)")
 	}
@@ -220,9 +155,9 @@ func doExport(store *memory.Store, args string) (string, error) {
 	var body string
 	switch opts.format {
 	case FormatMarkdown:
-		body = exportToMarkdown(conv, msgs)
+		body = export.ToMarkdown(conv, msgs)
 	case FormatJSON:
-		body, err = exportToJSON(conv, msgs)
+		body, err = export.ToJSON(conv, msgs)
 		if err != nil {
 			return "", err
 		}
@@ -244,44 +179,4 @@ func doExport(store *memory.Store, args string) (string, error) {
 		return "", fmt.Errorf("写文件失败: %w", err)
 	}
 	return outPath, nil
-}
-
-func roleEmoji(role string) string {
-	switch role {
-	case "user":
-		return "🧑"
-	case "assistant":
-		return "🤖"
-	case "system":
-		return "⚙️"
-	case "tool":
-		return "🔧"
-	default:
-		return "•"
-	}
-}
-
-func titleCase(s string) string {
-	if s == "" {
-		return ""
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
-}
-
-// looksLikeCode returns true when the message content looks like
-// source code (multiple lines, mostly non-text characters, no
-// surrounding punctuation). Used by the markdown exporter to
-// decide whether to wrap the body in a code fence.
-func looksLikeCode(s string) bool {
-	if !strings.Contains(s, "\n") {
-		return false
-	}
-	// Heuristic: at least 2 lines and the content has at least one
-	// of the tell-tale characters (`=`, `(`, `)`, `{`, `;`).
-	for _, c := range []string{"=", "(", "{", ";"} {
-		if strings.Contains(s, c) {
-			return true
-		}
-	}
-	return false
 }

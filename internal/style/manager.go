@@ -10,6 +10,7 @@ import (
 type Style string
 
 const (
+	Off     Style = "off"
 	Cute    Style = "cute"
 	Guofeng Style = "guofeng"
 	Tech    Style = "tech"
@@ -21,12 +22,14 @@ type Section struct {
 }
 
 var styleLabels = map[Style]string{
+	Off:     "关闭",
 	Cute:    "小P (PiPi)",
 	Guofeng: "墨言 (MoYan)",
 	Tech:    "NEXUS (零号)",
 }
 
 var styleDisplayName = map[Style]string{
+	Off:     "关闭风格",
 	Cute:    "可爱风",
 	Guofeng: "古风",
 	Tech:    "科技风",
@@ -37,6 +40,12 @@ func (s Style) DisplayName() string {
 		return name
 	}
 	return string(s)
+}
+
+// IsOff reports whether this style explicitly disables style prompt
+// and style memory injection. It is not a persona stored in the DB.
+func (s Style) IsOff() bool {
+	return s == Off
 }
 
 type Manager struct {
@@ -230,6 +239,8 @@ func normaliseStyleID(s string) string {
 
 func ParseStyle(s string) (Style, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "off", "none", "关闭", "无", "不使用":
+		return Off, nil
 	case "cute", "小p", "可爱", "可爱风":
 		return Cute, nil
 	case "guofeng", "古风", "墨言":
@@ -237,6 +248,6 @@ func ParseStyle(s string) (Style, error) {
 	case "tech", "科技", "科技风", "nexus", "零号":
 		return Tech, nil
 	default:
-		return "", fmt.Errorf("unknown style: %q, available: cute | guofeng | tech", s)
+		return "", fmt.Errorf("unknown style: %q, available: off | cute | guofeng | tech", s)
 	}
 }

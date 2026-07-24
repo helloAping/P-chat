@@ -18,6 +18,8 @@
 | 修改沙箱/安全检查 | [sandbox.md](infrastructure.md#沙箱-sandbox) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
+| 查看 agent 功能使用方式 / GUI 操作流程 | [README.md](../../README.md)「GUI 操作入口速查 / 常见问题」 | agent.md, tool.md, frontend.md |
+| 查看当前项目现状与可做事项 | [feature-opportunities.md](../feature-opportunities.md) | — |
 
 ## 模块总览
 

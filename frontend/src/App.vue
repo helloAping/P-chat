@@ -9,7 +9,7 @@
 // localStorage so the user's preference survives reloads.
 // First run falls back to the OS preference (useOsTheme).
 
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
   darkTheme, lightTheme, useOsTheme,
@@ -23,9 +23,12 @@ import ImageLightbox from './components/ImageLightbox.vue'
 import PlanReviewModal from './components/PlanReviewModal.vue'
 import QuestionModal from './components/QuestionModal.vue'
 import ToolConfirmModal from './components/ToolConfirmModal.vue'
+import CloseConfirmModal from './components/CloseConfirmModal.vue'
 import { state, loadSessions, loadProviders, loadProjects, currentPendingQuestion } from './stores/chat'
+import { setupTrayEventListeners } from './utils/trayEvents'
 
 const showAppSettings = ref(false)
+let cleanupTrayEvents: (() => void) | null = null
 
 // Sidebar collapse state. Persisted in localStorage so the user's
 // preference survives reloads. Toggled by the collapse button in
@@ -144,6 +147,14 @@ onMounted(async () => {
   } catch (e) {
     console.error('init failed', e)
   }
+  cleanupTrayEvents = await setupTrayEventListeners()
+})
+
+onUnmounted(() => {
+  if (cleanupTrayEvents) {
+    cleanupTrayEvents()
+    cleanupTrayEvents = null
+  }
 })
 </script>
 
@@ -173,6 +184,7 @@ onMounted(async () => {
             <ToolConfirmModal />
             <PlanReviewModal />
             <QuestionModal />
+            <CloseConfirmModal />
             </div>
         </NNotificationProvider>
       </NDialogProvider>

@@ -9,7 +9,7 @@ import (
 
 func TestBuildToolDefs_Count(t *testing.T) {
 	defs := buildToolDefs()
-	handlers := buildHandlers(NewHub())
+	handlers := buildHandlers(NewHub(), nil)
 	if len(defs) != len(handlers) {
 		t.Fatalf("defs (%d) and handlers (%d) count mismatch", len(defs), len(handlers))
 	}
@@ -35,7 +35,7 @@ func TestRegisterBrowserTools_AddsToRegistry(t *testing.T) {
 	reg := tool.NewRegistry()
 	hub := NewHub()
 
-	RegisterBrowserTools(reg, hub)
+	RegisterBrowserTools(reg, hub, nil)
 
 	// All browser tools should be in the registry.
 	for _, name := range browserToolNames {
@@ -54,7 +54,7 @@ func TestUnregisterBrowserTools_RemovesFromRegistry(t *testing.T) {
 	reg := tool.NewRegistry()
 	hub := NewHub()
 
-	RegisterBrowserTools(reg, hub)
+	RegisterBrowserTools(reg, hub, nil)
 	UnregisterBrowserTools(reg)
 
 	// No browser tools should remain.
@@ -131,6 +131,30 @@ func TestToolSchemas_RequiredFields(t *testing.T) {
 		}
 		if !found {
 			t.Error("browser_click should have 'ref' in required fields")
+		}
+	}
+}
+
+func TestToolSchemas_IncludeTabID(t *testing.T) {
+	defs := buildToolDefs()
+	need := map[string]bool{
+		"browser_navigate": true,
+		"browser_click":    true,
+		"browser_tabs":     true,
+		"browser_snapshot": true,
+	}
+	for _, d := range defs {
+		if !need[d.Name] {
+			continue
+		}
+		var schema struct {
+			Properties map[string]any `json:"properties"`
+		}
+		if err := json.Unmarshal(d.Parameters, &schema); err != nil {
+			t.Fatalf("%s unmarshal: %v", d.Name, err)
+		}
+		if _, ok := schema.Properties["tab_id"]; !ok {
+			t.Errorf("%s missing tab_id property", d.Name)
 		}
 	}
 }

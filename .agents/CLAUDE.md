@@ -51,6 +51,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
 | 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
+| 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](../README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
 
 **模块文档位置**：`.agents/docs/` 目录下，每个模块一个 `.md` 文件。
 
@@ -331,6 +332,10 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | parts 累加器 | `internal/agent/parts.go` |
 | 流式事件分发 | `frontend/src/stores/chat.ts` `appendStreamEvent()` |
 | 后端 SSE 事件映射 | `internal/server/handler.go` `chunkToEvent()` |
+| 工作模式 `work_mode` 配置 | `internal/config/config.go` `WorkModeConfig` |
+| `work_mode` 提示词段 | `internal/agent/prompt.go` `buildWorkModeBlock()` |
+| `work_mode` per-session 覆盖 | `internal/server/handler.go` `sessionMeta.WorkMode` |
+| CLI `/mode` 命令 | `internal/cli/commands.go` `cmdMode()` |
 | 子 agent runner | `internal/subagent/subagent.go` `Run()` |
 | 子 agent 事件转发 | `internal/subagent/subagent.go` `tryForward()` |
 | OpenAI SSE parser | `internal/llm/client.go` |
