@@ -6,6 +6,14 @@ export function CancelStream(arg1) {
   return window['go']['main']['App']['CancelStream'](arg1);
 }
 
+export function CancelWindowClose() {
+  return window['go']['main']['App']['CancelWindowClose']();
+}
+
+export function ConfirmWindowClose(arg1) {
+  return window['go']['main']['App']['ConfirmWindowClose'](arg1);
+}
+
 export function GetBackendURL() {
   return window['go']['main']['App']['GetBackendURL']();
 }

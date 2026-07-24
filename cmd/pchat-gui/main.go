@@ -188,14 +188,15 @@ func main() {
 // loading HTML while the child is starting, and a proxy to the child
 // once it's healthy.
 type App struct {
-	ctx           context.Context
-	serverCmd     *exec.Cmd
-	backendURL    atomic.Pointer[string] // "http://127.0.0.1:PORT"
-	serverMu      sync.Mutex
-	serverStopped bool
-	quitting      atomic.Bool
-	ready         atomic.Bool
-	tray          *trayHandle
+	ctx                context.Context
+	serverCmd          *exec.Cmd
+	backendURL         atomic.Pointer[string] // "http://127.0.0.1:PORT"
+	serverMu           sync.Mutex
+	serverStopped      bool
+	quitting           atomic.Bool
+	closePromptPending atomic.Bool
+	ready              atomic.Bool
+	tray               *trayHandle
 }
 
 // NewApp creates a new App application struct.
@@ -781,20 +782,16 @@ func primaryScreenSize(ctx context.Context) (int, int, bool) {
 // beforeClose 在窗口关闭时询问用户收缩到托盘还是真正退出。
 func (a *App) beforeClose(ctx context.Context) bool {
 	log.Printf("OnBeforeClose called")
-	action := closeActionForWindowClose(a.quitting.Load(), a.tray != nil && a.tray.ready(), "")
-	if action == closeActionPrompt {
-		action = a.promptCloseAction()
-	}
-	switch action {
-	case closeActionTray:
-		a.hideMainWindow()
-		return true
-	case closeActionCancel:
-		return true
-	default:
+	action := closeActionForWindowClose(a.quitting.Load(), a.tray != nil && a.tray.ready())
+	if action == closeActionExit {
 		a.stopServer()
 		return false
 	}
+	if a.requestCloseConfirmation() {
+		return true
+	}
+	a.stopServer()
+	return false
 }
 
 // stopServer stops the pchat-server child started by this GUI.
@@ -841,29 +838,38 @@ func (a *App) hideMainWindow() {
 	wailsruntime.WindowHide(a.ctx)
 }
 
-// promptCloseAction asks whether the close button should hide or quit.
-// promptCloseAction 询问窗口关闭按钮是收缩到托盘还是真正退出。
-func (a *App) promptCloseAction() closeAction {
+func (a *App) requestCloseConfirmation() bool {
 	if a.ctx == nil {
-		return closeActionExit
+		return false
 	}
-	defaultButton := closeChoiceExit
-	if normalizeCloseBehavior(readCloseBehavior()) == closeBehaviorTray {
-		defaultButton = closeChoiceTray
+	if !a.closePromptPending.CompareAndSwap(false, true) {
+		return true
 	}
-	choice, err := wailsruntime.MessageDialog(a.ctx, wailsruntime.MessageDialogOptions{
-		Type:          wailsruntime.QuestionDialog,
-		Title:         "退出 P-Chat？",
-		Message:       "要将 P-Chat 收缩到通知区域继续后台运行，还是直接关闭并停止服务？",
-		Buttons:       []string{closeChoiceTray, closeChoiceExit, closeChoiceCancel},
-		DefaultButton: defaultButton,
-		CancelButton:  closeChoiceCancel,
-	})
-	if err != nil {
-		log.Printf("promptCloseAction: %v", err)
-		return closeActionCancel
+	payload := map[string]interface{}{
+		"default_action": normalizeCloseBehavior(readCloseBehavior()),
 	}
-	return closeActionForChoice(choice)
+	wailsruntime.EventsEmit(a.ctx, closeRequestEventName, payload)
+	return true
+}
+
+// ConfirmWindowClose applies the close choice selected in the webview.
+// ConfirmWindowClose 由前端关闭确认弹窗回调，避免在 OnBeforeClose 中弹原生框卡死。
+func (a *App) ConfirmWindowClose(choice string) {
+	a.closePromptPending.Store(false)
+	switch closeActionForCloseRequestChoice(choice) {
+	case closeActionTray:
+		a.hideMainWindow()
+	case closeActionExit:
+		a.quitApp()
+	default:
+		// Cancel and unknown choices leave the window open.
+	}
+}
+
+// CancelWindowClose dismisses a pending webview close confirmation.
+// CancelWindowClose 用于用户取消关闭确认，并允许下一次点击 X 再次弹窗。
+func (a *App) CancelWindowClose() {
+	a.closePromptPending.Store(false)
 }
 
 // quitApp performs a real application exit from the tray menu.

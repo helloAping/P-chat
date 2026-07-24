@@ -57,6 +57,8 @@ const props = withDefaults(defineProps<{
   size?: Size
   /** Whether the user can dismiss by clicking the mask. */
   maskClosable?: boolean
+  /** Whether the user can dismiss by pressing Esc. */
+  closeOnEsc?: boolean
   /** Whether to render the X close button in the header. */
   closable?: boolean
   /** Show a thin border at the top in the brand color —
@@ -70,6 +72,7 @@ const props = withDefaults(defineProps<{
 }>(), {
   size: 'md',
   maskClosable: true,
+  closeOnEsc: true,
   closable: true,
   accentTop: false,
   accentVariant: 'warn',
@@ -100,6 +103,7 @@ const sizeMap: Record<Size, number> = {
     :show="show"
     @update:show="(v) => emit('update:show', v)"
     :mask-closable="maskClosable"
+    :close-on-esc="closeOnEsc"
     :show-mask="true"
     preset="card"
     :style="{ width: sizeMap[size] + 'px' }"

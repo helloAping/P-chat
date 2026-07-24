@@ -10,9 +10,10 @@ const (
 	closeBehaviorExit = "exit"
 	closeBehaviorTray = "tray"
 
-	closeChoiceTray   = "收缩到托盘"
-	closeChoiceExit   = "直接关闭"
-	closeChoiceCancel = "取消"
+	closeRequestEventName = "app:close-request"
+	closeChoiceTray       = closeBehaviorTray
+	closeChoiceExit       = closeBehaviorExit
+	closeChoiceCancel     = "cancel"
 )
 
 type closeAction string
@@ -44,25 +45,24 @@ func shouldPreventClose(quitting bool, closeBehavior string) bool {
 	return normalizeCloseBehavior(closeBehavior) == closeBehaviorTray
 }
 
-func closeActionForChoice(choice string) closeAction {
-	switch choice {
+func closeActionForCloseRequestChoice(choice string) closeAction {
+	switch strings.TrimSpace(choice) {
 	case closeChoiceTray:
 		return closeActionTray
 	case closeChoiceExit:
 		return closeActionExit
+	case closeChoiceCancel:
+		return closeActionCancel
 	default:
 		return closeActionCancel
 	}
 }
 
-func closeActionForWindowClose(quitting bool, trayReady bool, choice string) closeAction {
+func closeActionForWindowClose(quitting bool, trayReady bool) closeAction {
 	if quitting || !trayReady {
 		return closeActionExit
 	}
-	if choice == "" {
-		return closeActionPrompt
-	}
-	return closeActionForChoice(choice)
+	return closeActionPrompt
 }
 
 // readCloseBehavior reads ui.close_behavior from the active config file.
