@@ -318,6 +318,55 @@ func TestTavilyProvider_PicksTopic(t *testing.T) {
 	}
 }
 
+// TestTavilyProvider_RealShapeToleratesExtraFields is the
+// regression test for the "decode: json: unknown field query"
+// bug in the test-connection flow. Tavily's real /search
+// response echoes the request back as a top-level `query`
+// field and may include `answer`, `follow_up_questions`,
+// `images`, etc. The decoder must accept all of those and
+// still extract the `results` array. Previously the
+// `DisallowUnknownFields` call would reject the response and
+// the test-connection endpoint would surface a confusing
+// "unknown field" error to the user.
+func TestTavilyProvider_RealShapeToleratesExtraFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Realistic Tavily response: echoes `query`, has an
+		// `answer`, an `images` array, `follow_up_questions`,
+		// and the `results` we care about.
+		_, _ = w.Write([]byte(`{
+			"query": "go http client",
+			"follow_up_questions": null,
+			"answer": null,
+			"images": [],
+			"results": [
+				{
+					"title": "net/http - GoDoc",
+					"url": "https://pkg.go.dev/net/http",
+					"content": "Package http provides HTTP client and server implementations.",
+					"raw_content": null,
+					"score": 0.95,
+					"published_date": "2024-01-15"
+				}
+			],
+			"response_time": 1.23
+		}`))
+	}))
+	defer srv.Close()
+
+	p := &TavilyProvider{APIKey: "k", BaseURL: srv.URL, Timeout: 2 * time.Second}
+	res, err := p.Search(context.Background(), Query{Query: "go http client"})
+	if err != nil {
+		t.Fatalf("Search error: %v", err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("got %d results, want 1", len(res))
+	}
+	if res[0].URL != "https://pkg.go.dev/net/http" {
+		t.Errorf("URL = %q", res[0].URL)
+	}
+}
+
 // ====================================================================
 // OpenAI-compat provider tests
 // ====================================================================
