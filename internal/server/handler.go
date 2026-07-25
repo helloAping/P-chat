@@ -10,6 +10,7 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -30,6 +31,7 @@ type Handler struct {
 	summarizer *memory.Summarizer
 	mcpMgr     *mcp.Manager
 	browserMgr *browser.Manager
+	imGateway  *im.Gateway
 	// toolReg is the P3-2 shared tool registry. The
 	// dynamic-tool watcher in server.go writes here; the
 	// GET /api/v1/tools endpoint reads from here. May be
@@ -491,12 +493,12 @@ type MessageResponse struct {
 //
 // Field JSON tags are split in two:
 //
-//   * The structural fields (Kind / Text / Status / etc.) use
+//   - The structural fields (Kind / Text / Status / etc.) use
 //     the wire format directly — both server and frontend
 //     agree on snake_case for these (the frontend's TS type
 //     uses snake_case here, mirroring the server's wire).
 //
-//   * The sub-agent metadata fields (AgentType / AgentColor /
+//   - The sub-agent metadata fields (AgentType / AgentColor /
 //     AgentModel / TaskID / AgentDescription) use snake_case
 //     JSON tags to match the storage format the agent writes
 //     to meta["parts"] (see internal/agent/parts.go). A
@@ -903,6 +905,12 @@ func (h *Handler) SetSummarizer(sm *memory.Summarizer) {
 // and REST endpoints. Pass nil to disable browser control endpoints.
 func (h *Handler) SetBrowserManager(bm *browser.Manager) {
 	h.browserMgr = bm
+}
+
+// SetIMGateway 挂载 IM Gateway，供 IM REST/SSE 端点使用。
+// SetIMGateway wires the IM Gateway for REST/SSE endpoints.
+func (h *Handler) SetIMGateway(gateway *im.Gateway) {
+	h.imGateway = gateway
 }
 
 // SetListenAddr records the real listen address so the browser

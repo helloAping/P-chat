@@ -33,6 +33,7 @@ type Config struct {
 	Limits    LimitsConfig    `json:"limits"`
 	Search    SearchConfig    `json:"search"`
 	Browser   BrowserConfig   `json:"browser"`
+	IM        IMConfig        `json:"im"`
 	// Dynamic is the P3-2 per-tool config table. The
 	// user writes `dynamic.<tool_name>.config: {…}`
 	// in their config.json and the dynamic tool's
@@ -916,6 +917,7 @@ func Default() *Config {
 				"*.paypal.com",
 			},
 		},
+		IM: DefaultIMConfig(),
 	}
 }
 

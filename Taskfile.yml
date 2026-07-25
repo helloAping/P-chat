@@ -114,6 +114,18 @@ tasks:
           CGO_ENABLED: 0
     silent: false
 
+  build:im_qq:
+    desc: 编译带 QQ IM adapter build tag 的 Server
+    cmds:
+      - go build -tags im_qq -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-im-qq.exe ./cmd/pchat-server
+    silent: false
+
+  build:im_wx:
+    desc: 编译带 QQ + 微信 IM adapter build tag 的 Server
+    cmds:
+      - go build -tags "im_qq im_wx" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-im-wx.exe ./cmd/pchat-server
+    silent: false
+
   build:server:macos:
     desc: 交叉编译 macOS Server 二进制 (amd64)
     cmds:

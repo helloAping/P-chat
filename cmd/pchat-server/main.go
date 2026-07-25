@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -9,12 +10,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
@@ -29,6 +31,7 @@ import (
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
 	"github.com/p-chat/pchat/internal/version"
+	"github.com/spf13/cobra"
 )
 
 //go:embed all:web
@@ -38,6 +41,8 @@ var embeddedWebRaw embed.FS
 var embeddedBrowserExtZip []byte
 
 var cfgFile string
+var imEnable bool
+var imPlatforms string
 
 var rootCmd = &cobra.Command{
 	Use:   "pchat-server",
@@ -48,6 +53,8 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "配置文件路径")
+	rootCmd.PersistentFlags().BoolVar(&imEnable, "im.enable", false, "启用 IM 桥接")
+	rootCmd.PersistentFlags().StringVar(&imPlatforms, "im.platforms", "", "启用的 IM 平台列表，例如 feishu:bot,telegram:polling")
 }
 
 func main() {
@@ -83,6 +90,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	applyIMFlagOverrides(cfg)
 
 	llmClient, err := llm.NewClient(&cfg.LLM)
 	if err != nil {
@@ -240,6 +248,21 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
 
+	imGateway := im.NewGateway(cfg.IM)
+	srv.SetIMGateway(imGateway)
+	if cfg.IM.Enabled {
+		if err := imGateway.Start(context.Background()); err != nil {
+			log.Printf("[im] gateway start failed: %v", err)
+		} else {
+			log.Printf("[im] gateway started")
+		}
+	}
+	defer func() {
+		if err := imGateway.Stop(context.Background()); err != nil {
+			log.Printf("[im] gateway stop failed: %v", err)
+		}
+	}()
+
 	// Initialize browser control manager (enabled via config).
 	browserMgr := browser.NewManager(cfg.Browser, toolReg)
 	browserMgr.Start()
@@ -384,4 +407,46 @@ func defaultProviderName(cfg *config.Config) string {
 		return cfg.LLM.Providers[0].Name
 	}
 	return ""
+}
+
+func applyIMFlagOverrides(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	if imEnable {
+		cfg.IM.Enabled = true
+	}
+	if imPlatforms == "" {
+		cfg.IM.Normalize()
+		return
+	}
+	cfg.IM.Enabled = true
+	for _, raw := range strings.Split(imPlatforms, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		parts := strings.SplitN(raw, ":", 2)
+		platformType := parts[0]
+		variant := ""
+		if len(parts) == 2 {
+			variant = parts[1]
+		}
+		found := false
+		for i := range cfg.IM.Platforms {
+			if cfg.IM.Platforms[i].Type == platformType && cfg.IM.Platforms[i].Variant == variant {
+				cfg.IM.Platforms[i].Enabled = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			cfg.IM.Platforms = append(cfg.IM.Platforms, config.IMPlatformConfig{
+				Type:    platformType,
+				Variant: variant,
+				Enabled: true,
+			})
+		}
+	}
+	cfg.IM.Normalize()
 }
