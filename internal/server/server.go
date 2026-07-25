@@ -325,6 +325,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/im/test", h.TestIMConnection)
 		api.POST("/im/:type/test", h.TestIMConnection)
 		api.GET("/im/events", h.IMEvents)
+		api.POST("/im/feishu/webhook", h.FeishuWebhook)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the

@@ -2,6 +2,7 @@ package im
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -277,6 +278,22 @@ func (g *Gateway) TestConnection(platformType, variant string) TestResult {
 		}
 	}
 	return TestResult{OK: false, Platform: platformType, Variant: variant, Status: "not_configured", Error: "platform not configured"}
+}
+
+// Submit 将规范化入站事件送入 Gateway bus。
+// Submit sends a normalized inbound event into the Gateway bus.
+func (g *Gateway) Submit(ctx context.Context, ev IMEvent) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case g.in <- ev:
+		return nil
+	default:
+		return errors.New("im gateway inbound bus is full")
+	}
 }
 
 // Inbound 返回 Gateway 的入站总线。

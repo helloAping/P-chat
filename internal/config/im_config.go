@@ -160,24 +160,26 @@ type IMFileExtractConfig struct {
 // IMPlatformConfig 是单个平台 adapter 的配置。
 // IMPlatformConfig is the configuration for one platform adapter.
 type IMPlatformConfig struct {
-	Type           string           `json:"type"`
-	Variant        string           `json:"variant,omitempty"`
-	Enabled        bool             `json:"enabled"`
-	Mode           string           `json:"mode,omitempty"`
-	Token          string           `json:"token,omitempty"`
-	AppID          string           `json:"app_id,omitempty"`
-	AppSecret      string           `json:"app_secret,omitempty"`
-	CorpID         string           `json:"corp_id,omitempty"`
-	CorpSecret     string           `json:"corp_secret,omitempty"`
-	AgentID        int              `json:"agent_id,omitempty"`
-	CallbackAESKey string           `json:"callback_aes_key,omitempty"`
-	CallbackToken  string           `json:"callback_token,omitempty"`
-	Endpoint       string           `json:"endpoint,omitempty"`
-	APIKey         string           `json:"api_key,omitempty"`
-	Webhook        IMWebhookConfig  `json:"webhook,omitempty"`
-	Out            IMOutboundConfig `json:"out,omitempty"`
-	AllowedSenders []string         `json:"allowed_senders,omitempty"`
-	Extra          map[string]any   `json:"extra,omitempty"`
+	Type              string           `json:"type"`
+	Variant           string           `json:"variant,omitempty"`
+	Enabled           bool             `json:"enabled"`
+	Mode              string           `json:"mode,omitempty"`
+	Token             string           `json:"token,omitempty"`
+	AppID             string           `json:"app_id,omitempty"`
+	AppSecret         string           `json:"app_secret,omitempty"`
+	VerificationToken string           `json:"verification_token,omitempty"`
+	EncryptKey        string           `json:"encrypt_key,omitempty"`
+	CorpID            string           `json:"corp_id,omitempty"`
+	CorpSecret        string           `json:"corp_secret,omitempty"`
+	AgentID           int              `json:"agent_id,omitempty"`
+	CallbackAESKey    string           `json:"callback_aes_key,omitempty"`
+	CallbackToken     string           `json:"callback_token,omitempty"`
+	Endpoint          string           `json:"endpoint,omitempty"`
+	APIKey            string           `json:"api_key,omitempty"`
+	Webhook           IMWebhookConfig  `json:"webhook,omitempty"`
+	Out               IMOutboundConfig `json:"out,omitempty"`
+	AllowedSenders    []string         `json:"allowed_senders,omitempty"`
+	Extra             map[string]any   `json:"extra,omitempty"`
 }
 
 // IMWebhookConfig 描述平台 webhook 设置。
@@ -255,6 +257,11 @@ func (c *IMConfig) Normalize() {
 			persona.WorkMode = persona.WorkMode.Normalize()
 		}
 		c.Personas[key] = persona
+	}
+	for i := range c.Platforms {
+		if c.Platforms[i].Type == "feishu" && c.Platforms[i].Variant == "" {
+			c.Platforms[i].Variant = "bot"
+		}
 	}
 }
 

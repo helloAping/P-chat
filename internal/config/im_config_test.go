@@ -54,6 +54,12 @@ func TestIMConfigNormalize(t *testing.T) {
 	if cfg.Personas["feishu:*"].WorkMode != "" {
 		t.Fatalf("omitted work_mode = %q, want empty inherit", cfg.Personas["feishu:*"].WorkMode)
 	}
+
+	cfg = IMConfig{Platforms: []IMPlatformConfig{{Type: "feishu", Enabled: true}}}
+	cfg.Normalize()
+	if cfg.Platforms[0].Variant != "bot" {
+		t.Fatalf("feishu variant = %q, want bot", cfg.Platforms[0].Variant)
+	}
 }
 
 func TestUpdateIMConfigPatchPreservesDefaults(t *testing.T) {

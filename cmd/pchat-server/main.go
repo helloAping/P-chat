@@ -17,6 +17,7 @@ import (
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/im"
+	"github.com/p-chat/pchat/internal/im/feishu"
 	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
@@ -249,6 +250,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
 
 	imGateway := im.NewGateway(cfg.IM)
+	registerIMAdapters(imGateway, cfg.IM)
 	srv.SetIMGateway(imGateway)
 	if cfg.IM.Enabled {
 		if err := imGateway.Start(context.Background()); err != nil {
@@ -449,4 +451,23 @@ func applyIMFlagOverrides(cfg *config.Config) {
 		}
 	}
 	cfg.IM.Normalize()
+}
+
+func registerIMAdapters(gateway *im.Gateway, cfg config.IMConfig) {
+	if gateway == nil {
+		return
+	}
+	gateway.RegisterAdapter(feishu.NewAdapter(config.IMPlatformConfig{Type: "feishu", Variant: "bot"}))
+	for _, platform := range cfg.Platforms {
+		if platform.Type != "feishu" {
+			continue
+		}
+		variant := platform.Variant
+		if variant == "" {
+			variant = "bot"
+		}
+		if variant == "bot" {
+			gateway.RegisterAdapter(feishu.NewAdapter(platform))
+		}
+	}
 }
