@@ -458,6 +458,16 @@ func registerIMAdapters(gateway *im.Gateway, cfg config.IMConfig) {
 		return
 	}
 	gateway.RegisterAdapter(feishu.NewAdapter(config.IMPlatformConfig{Type: "feishu", Variant: "bot"}))
+	gateway.RegisterRendererFactory("feishu", func(platform config.IMPlatformConfig) (im.OutboundRenderer, error) {
+		if !platform.Out.UseOpenAPI {
+			return nil, im.ErrOutboundDisabled{
+				Platform: platform.Type,
+				Variant:  platform.Variant,
+				Reason:   "out.use_openapi is false",
+			}
+		}
+		return feishu.NewRenderer(platform, nil), nil
+	})
 	for _, platform := range cfg.Platforms {
 		if platform.Type != "feishu" {
 			continue

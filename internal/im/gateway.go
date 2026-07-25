@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,12 +40,15 @@ type TestResult struct {
 	Error    string `json:"error,omitempty"`
 }
 
-// Gateway 管理所有 IM adapter 的生命周期。
-// Gateway manages the lifecycle of all IM adapters.
+// Gateway 管理所有 IM adapter 和 outbound renderer 的生命周期。
+// Gateway manages the lifecycle of all IM adapters and outbound renderers.
 type Gateway struct {
 	mu        sync.RWMutex
 	cfg       config.IMConfig
 	adapters  map[string]Adapter
+	renderers map[string]OutboundRenderer
+	factories map[string]RendererFactory
+	generated map[string]OutboundRenderer
 	in        chan IMEvent
 	subs      map[chan LifecycleEvent]struct{}
 	ctx       context.Context
@@ -59,11 +63,14 @@ type Gateway struct {
 func NewGateway(cfg config.IMConfig) *Gateway {
 	cfg.Normalize()
 	return &Gateway{
-		cfg:      cfg,
-		adapters: map[string]Adapter{},
-		in:       make(chan IMEvent, 64),
-		subs:     map[chan LifecycleEvent]struct{}{},
-		health:   map[string]HealthStatus{},
+		cfg:       cfg,
+		adapters:  map[string]Adapter{},
+		renderers: map[string]OutboundRenderer{},
+		factories: map[string]RendererFactory{},
+		generated: map[string]OutboundRenderer{},
+		in:        make(chan IMEvent, 64),
+		subs:      map[chan LifecycleEvent]struct{}{},
+		health:    map[string]HealthStatus{},
 	}
 }
 
@@ -84,6 +91,29 @@ func (g *Gateway) RegisterAdapter(adapter Adapter) {
 	}
 }
 
+// RegisterRenderer 注册一个平台出站 renderer。
+// RegisterRenderer registers one platform outbound renderer.
+func (g *Gateway) RegisterRenderer(platform, variant string, renderer OutboundRenderer) {
+	if renderer == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.renderers[adapterKey(platform, variant)] = renderer
+}
+
+// RegisterRendererFactory 注册一个按配置创建 renderer 的工厂。
+// RegisterRendererFactory registers a factory that builds renderers from config.
+func (g *Gateway) RegisterRendererFactory(platform string, factory RendererFactory) {
+	if factory == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.factories[platform] = factory
+	g.generated = map[string]OutboundRenderer{}
+}
+
 // UpdateConfig 更新 Gateway 持有的 IM 配置。
 // UpdateConfig updates the IM config held by the Gateway.
 func (g *Gateway) UpdateConfig(cfg config.IMConfig) {
@@ -92,6 +122,7 @@ func (g *Gateway) UpdateConfig(cfg config.IMConfig) {
 	defer g.mu.Unlock()
 	g.cfg = cfg
 	g.health = map[string]HealthStatus{}
+	g.generated = map[string]OutboundRenderer{}
 }
 
 // Reconfigure 应用新配置并按 enabled 状态重启 Gateway。
@@ -302,6 +333,28 @@ func (g *Gateway) Inbound() chan<- IMEvent {
 	return g.in
 }
 
+// DispatchOutbound 将出站 chunk 派发给对应平台 renderer。
+// DispatchOutbound dispatches an outbound chunk to the matching platform renderer.
+func (g *Gateway) DispatchOutbound(ctx context.Context, chunk IMOutChunk) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	platform, variant := outboundRoute(chunk)
+	g.emit(LifecycleEvent{Type: "outbound_start", Platform: platform, Variant: variant, Message: chunk.Kind})
+
+	renderer, err := g.resolveRenderer(platform, variant)
+	if err != nil {
+		g.emit(LifecycleEvent{Type: "outbound_error", Platform: platform, Variant: variant, Message: chunk.Kind, Error: err.Error()})
+		return err
+	}
+	if err := dispatchToRenderer(ctx, renderer, chunk); err != nil {
+		g.emit(LifecycleEvent{Type: "outbound_error", Platform: platform, Variant: variant, Message: chunk.Kind, Error: err.Error()})
+		return err
+	}
+	g.emit(LifecycleEvent{Type: "outbound_ok", Platform: platform, Variant: variant, Message: chunk.Kind})
+	return nil
+}
+
 // Subscribe 订阅 Gateway 生命周期事件。
 // Subscribe subscribes to Gateway lifecycle events.
 func (g *Gateway) Subscribe(ctx context.Context) <-chan LifecycleEvent {
@@ -320,6 +373,72 @@ func (g *Gateway) Subscribe(ctx context.Context) <-chan LifecycleEvent {
 		g.mu.Unlock()
 	}()
 	return ch
+}
+
+func (g *Gateway) resolveRenderer(platform, variant string) (OutboundRenderer, error) {
+	if platform == "" {
+		return nil, errors.New("im outbound requires platform")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.cfg.Enabled {
+		return nil, errors.New("im gateway disabled")
+	}
+	if renderer := g.rendererByKeyLocked(platform, variant); renderer != nil {
+		return renderer, nil
+	}
+	platformCfg, ok := g.matchPlatformConfigLocked(platform, variant)
+	if !ok {
+		return nil, fmt.Errorf("im platform not configured: %s", adapterKey(platform, variant))
+	}
+	key := adapterKey(platformCfg.Type, platformCfg.Variant)
+	if renderer := g.renderers[key]; renderer != nil {
+		return renderer, nil
+	}
+	if renderer := g.generated[key]; renderer != nil {
+		return renderer, nil
+	}
+	factory := g.factories[platformCfg.Type]
+	if factory == nil {
+		return nil, fmt.Errorf("renderer not registered: %s", adapterKey(platform, variant))
+	}
+	renderer, err := factory(platformCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create outbound renderer: %w", err)
+	}
+	if renderer == nil {
+		return nil, fmt.Errorf("renderer factory returned nil: %s", key)
+	}
+	g.generated[key] = renderer
+	return renderer, nil
+}
+
+func (g *Gateway) rendererByKeyLocked(platform, variant string) OutboundRenderer {
+	keys := []string{adapterKey(platform, variant)}
+	if variant != "" {
+		keys = append(keys, platform)
+	}
+	for _, key := range keys {
+		if renderer := g.renderers[key]; renderer != nil {
+			return renderer
+		}
+		if renderer := g.generated[key]; renderer != nil {
+			return renderer
+		}
+	}
+	return nil
+}
+
+func (g *Gateway) matchPlatformConfigLocked(platform, variant string) (config.IMPlatformConfig, bool) {
+	for _, platformCfg := range g.cfg.Platforms {
+		if platformCfg.Type != platform || !platformCfg.Enabled {
+			continue
+		}
+		if variant == "" || platformCfg.Variant == variant {
+			return platformCfg, true
+		}
+	}
+	return config.IMPlatformConfig{}, false
 }
 
 func (g *Gateway) setHealth(key string, health HealthStatus) {
@@ -352,4 +471,52 @@ func configuredStatus(enabled bool) string {
 		return "configured"
 	}
 	return "disabled"
+}
+
+func outboundRoute(chunk IMOutChunk) (string, string) {
+	platform := chunk.Platform
+	if platform == "" {
+		platform = chunk.Chat.Platform
+	}
+	return platform, chunk.Chat.Variant
+}
+
+func dispatchToRenderer(ctx context.Context, renderer OutboundRenderer, chunk IMOutChunk) error {
+	kind := strings.ToLower(strings.TrimSpace(chunk.Kind))
+	switch kind {
+	case "", "text":
+		if err := enforceRendererTextLimit(renderer, chunk.Text); err != nil {
+			return err
+		}
+		if err := renderer.Send(ctx, chunk); err != nil {
+			return fmt.Errorf("send im outbound: %w", err)
+		}
+		return nil
+	case "edit":
+		if err := enforceRendererTextLimit(renderer, chunk.Text); err != nil {
+			return err
+		}
+		if err := renderer.Edit(ctx, chunk.Chat, chunk.MsgID, chunk); err != nil {
+			return fmt.Errorf("edit im outbound: %w", err)
+		}
+		return nil
+	case "typing":
+		if err := renderer.Typing(ctx, chunk.Chat); err != nil {
+			return fmt.Errorf("send im typing: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported im outbound kind: %s", chunk.Kind)
+	}
+}
+
+func enforceRendererTextLimit(renderer OutboundRenderer, text string) error {
+	maxLen := renderer.MaxTextLen()
+	if maxLen <= 0 {
+		return nil
+	}
+	if len([]rune(text)) > maxLen {
+		return fmt.Errorf("im outbound text exceeds max length %d", maxLen)
+	}
+	return nil
 }
