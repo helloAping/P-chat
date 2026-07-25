@@ -20,7 +20,7 @@
 ### 方式 A — Windows 安装包（推荐新用户）
 
 1. 从 [Releases](../../releases) 下载 `pchat-setup.exe`
-2. 双击运行，弹出目录选择框，选好安装目录
+2. 双击运行，弹出目录选择框，选择或者创建pchat目录
 3. 安装程序会解压 `pchat-gui.exe` / `pchat-server.exe` / `pchat.exe` + `web/`，写入开始菜单和桌面快捷方式
 4. 从开始菜单启动 **P-Chat**
 
