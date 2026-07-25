@@ -272,22 +272,6 @@ LLM 在需要时调用 `recall` 工具按需检索。详见 [docs/knowledge.md](
 | 复制 trace id | 顶栏 `#` 按钮，或错误气泡上的 trace id 按钮 |
 | 重新生成 | assistant 消息底部「重答」按钮，旧版会作为历史版本保留 |
 
-### 斜杠命令
-
-输入框以 `/` 开头：
-
-| 命令 | 说明 |
-| --- | --- |
-| `/help` | 帮助 |
-| `/style [name]` | 切换/查看风格 |
-| `/model [name]` | 切换/查看模型 |
-| `/recall <query>` | 手动知识检索 |
-| `/mode [coding\|daily]` | 工作模式 |
-| `/auto-continue [on\|off]` | 任务未完自动续 LLM |
-| `/clear` | 清屏 |
-| `/skills` `/rules` `/agents` `/tools` | 列出对应项 |
-| `/quit` | 退出 |
-
 ---
 
 ## 浏览器控制
@@ -478,24 +462,6 @@ llm:
 
 ---
 
-## 高级能力
-
-完整指南都在 `docs/` 下，下面只是入口。
-
-| 能力 | 入口 |
-| --- | --- |
-| 浏览器控制（15 个 `browser_*` 工具） | 本 README [浏览器控制](#浏览器控制) 章节 |
-| 知识库 RAG | [docs/knowledge.md](docs/knowledge.md) |
-| 自动续 LLM（todo 未完成不半路停） | [docs/auto-continue.md](docs/auto-continue.md) |
-| 子代理系统 | [docs/SUBAGENT.md](docs/SUBAGENT.md) |
-| SSE 协议 | [docs/sse-wire.md](docs/sse-wire.md) |
-| 工具注册 | [.agents/docs/tool.md](.agents/docs/tool.md) |
-| Agent ReAct 循环 | [.agents/docs/agent.md](.agents/docs/agent.md) |
-| LLM 客户端 | [.agents/docs/llm.md](.agents/docs/llm.md) |
-| HTTP API + SSE | [.agents/docs/server.md](.agents/docs/server.md) |
-
----
-
 ## HTTP API
 
 所有接口在 `/api/v1/` 下，前缀统一。
@@ -614,55 +580,3 @@ cd frontend && npx vue-tsc -b
 `scripts/` 下都是平台无关工具脚本（`clean-frontend-output.ps1` / `sync-web.ps1` / `package-gui.ps1` / `build-installer.ps1` 等）。
 
 ---
-
-## 项目结构
-
-```
-P-chat/
-├── cmd/
-│   ├── pchat/                # CLI 入口 (pchat.exe)
-│   ├── pchat-server/         # 独立 HTTP server + web/
-│   ├── pchat-gui/            # Wails 桌面端
-│   ├── pchat-installer/      # Windows setup.exe
-│   └── pchat-browser-mcp/    # 浏览器扩展桥接
-├── internal/
-│   ├── agent/                # ReAct 主循环
-│   ├── llm/                  # OpenAI / Anthropic 协议
-│   ├── server/               # HTTP 路由 + SSE
-│   ├── tool/                 # 工具注册
-│   ├── subagent/             # 子代理
-│   ├── knowledge/            # 向量库 + 嵌入 + 索引
-│   ├── recall/               # 知识召回
-│   ├── memory/               # SQLite 持久化
-│   ├── config/               # YAML/JSON 配置
-│   ├── style/                # 人格 prompt
-│   ├── skill/                # 技能加载
-│   ├── rules/                # 规则加载
-│   ├── sandbox/              # 命令/文件安全
-│   ├── mcp/                  # MCP 协议
-│   ├── project/              # 项目目录
-│   ├── browser/              # 浏览器控制
-│   ├── search/               # web_search provider
-│   └── ...
-├── frontend/src/             # Vue 3 + Naive UI
-├── docs/                     # 专项文档 + assets/
-├── prompts/                  # 人格 prompt 源
-├── configs/                  # 配置模板
-├── scripts/                  # 平台无关工具脚本
-└── Taskfile.yml              # task build:* / test:* / package:*
-```
-
----
-
-## 路线图
-
-- [x] 项目脚手架 / 三种人格 / CLI / HTTP / 桌面端
-- [x] SQLite 会话记忆 / 9 个内置工具 / AGENTS / Skills / Rules
-- [x] Wails v2 + Vue 3 + SSE
-- [x] 项目系统 + 归档 / Plan-Build 模式
-- [x] 多模型 + vision/thinking 标记
-- [x] 知识库（53 种文件格式 + 多库合并排序）
-- [x] 消息回滚 / 自动续 LLM / 上下文检查器 / 工具 dry-run
-- [x] 浏览器控制（Chrome 扩展 + 域名策略 + 协议自检）
-- [ ] MCP 工具协议完整集成
-- [ ] Docker 代码沙箱
