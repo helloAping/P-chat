@@ -1794,6 +1794,215 @@ export const updateSystemConfig = (patch: Record<string, unknown>) =>
     body: JSON.stringify(patch),
   })
 
+// ---- IM bridge settings ----
+
+export interface IMSessionPolicy {
+  scope: 'per_sender' | 'per_chat' | 'per_thread' | string
+  record_sender: boolean
+  cross_platform: boolean
+}
+
+export interface IMAutoLinkPolicy {
+  enabled: boolean
+  trust: 'manual' | 'high' | 'none' | string
+}
+
+export interface IMAccount {
+  platform: string
+  id: string
+}
+
+export interface IMIdentityLink {
+  principal: string
+  accounts?: IMAccount[]
+}
+
+export interface IMIdentityPolicy {
+  links?: IMIdentityLink[]
+  auto_link: IMAutoLinkPolicy
+}
+
+export interface IMCommandPolicy {
+  prefix: string
+  forward_unknown_to_agent: boolean
+  admin_senders?: string[]
+  require_mention_in_group: boolean
+}
+
+export interface IMRateLimitRule {
+  scope: string
+  key?: string
+  rps: number
+  burst: number
+}
+
+export interface IMPersona {
+  style?: string
+  work_mode?: string
+  model?: string
+  tools_allow?: string[]
+  prompt_inject?: string
+}
+
+export interface IMCronConfig {
+  enabled: boolean
+  jobs?: Array<{
+    id: string
+    schedule: string
+    timezone?: string
+    platform: string
+    chat_id: string
+    prompt: string
+    persona?: string
+  }>
+}
+
+export interface IMFallbackRule {
+  from: { platform: string; chat_id?: string }
+  to: { platform: string; chat_id?: string }
+  trigger: string
+}
+
+export interface IMProviderModelConfig {
+  provider?: string
+  model?: string
+}
+
+export interface IMTTSConfig {
+  provider?: string
+  voice?: string
+  enabled_in?: string[]
+}
+
+export interface IMMediaConfig {
+  stt: IMProviderModelConfig
+  tts: IMTTSConfig
+  vision: { enabled: boolean; max_image_bytes: number }
+  file_extract: { enabled: boolean; max_file_bytes: number; types?: string[] }
+}
+
+export interface IMWebhookConfig {
+  listen?: string
+  path?: string
+}
+
+export interface IMOutboundConfig {
+  use_openapi?: boolean
+  api_base?: string
+}
+
+export interface IMPlatformConfig {
+  type: string
+  variant?: string
+  enabled: boolean
+  mode?: string
+  token?: string
+  app_id?: string
+  app_secret?: string
+  verification_token?: string
+  encrypt_key?: string
+  corp_id?: string
+  corp_secret?: string
+  agent_id?: number
+  callback_aes_key?: string
+  callback_token?: string
+  endpoint?: string
+  api_key?: string
+  webhook?: IMWebhookConfig
+  out?: IMOutboundConfig
+  allowed_senders?: string[]
+  extra?: Record<string, unknown>
+}
+
+export interface IMConfig {
+  enabled: boolean
+  session: IMSessionPolicy
+  identity: IMIdentityPolicy
+  command: IMCommandPolicy
+  rate_limit?: IMRateLimitRule[]
+  audit_log: boolean
+  audit_local_only: boolean
+  tools_allowlist_default?: string[]
+  personas?: Record<string, IMPersona>
+  cron: IMCronConfig
+  fallback?: IMFallbackRule[]
+  media: IMMediaConfig
+  platforms?: IMPlatformConfig[]
+}
+
+export interface IMHealthStatus {
+  platform: string
+  variant?: string
+  enabled: boolean
+  status: string
+  error?: string
+  started_at?: string
+}
+
+export interface IMHealth {
+  enabled: boolean
+  running: boolean
+  platforms: IMHealthStatus[]
+}
+
+export interface IMTestResult {
+  ok: boolean
+  platform: string
+  variant?: string
+  status: string
+  error?: string
+}
+
+export interface IMLifecycleEvent {
+  type?: string
+  seq?: number
+  time?: string
+  platform?: string
+  variant?: string
+  message?: string
+  error?: string
+  [key: string]: unknown
+}
+
+export const getIMConfig = () =>
+  jsonFetch<IMConfig>('/api/v1/im/config')
+
+export const updateIMConfig = (patch: Partial<IMConfig>) =>
+  jsonFetch<IMConfig>('/api/v1/im/config', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })
+
+export const getIMHealth = () =>
+  jsonFetch<IMHealth>('/api/v1/im/health')
+
+export const testIMConnection = (type: string, variant?: string) =>
+  jsonFetch<IMTestResult>(`/api/v1/im/${encodeURIComponent(type)}/test`, {
+    method: 'POST',
+    body: JSON.stringify({ type, variant }),
+  })
+
+export async function streamIMEvents(
+  onEvent: (ev: IMLifecycleEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = await waitForDirectBackend()
+  const resp = await fetch(`${base}/api/v1/im/events`, {
+    method: 'GET',
+    headers: { Accept: 'text/event-stream' },
+    signal,
+  })
+  if (!resp.ok || !resp.body) {
+    throw new Error(`im events: HTTP ${resp.status}: ${resp.statusText}`)
+  }
+  await consumeSSEStream<IMLifecycleEvent>({
+    reader: resp.body.getReader(),
+    signal,
+    label: 'im-events',
+    onEvent,
+  })
+}
+
 // ---- Web search settings ----
 
 export interface WebSearchSettings {

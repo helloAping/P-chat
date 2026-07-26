@@ -30,11 +30,13 @@ import {
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash,
   Cpu, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
+  MessageSquare,
 } from './icons'
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion, state as chatState } from '../stores/chat'
 import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
+import IMSettings from './IMSettings.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
 
 const message = useMessage()
@@ -168,7 +170,7 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser'>('providers')
+const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser' | 'im'>('providers')
 
 // Modal visibility (v-model). The default is `true` so that
 // when App.vue mounts this component (it only mounts when
@@ -195,6 +197,7 @@ const settingsTabs = [
   { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索' },
   { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商' },
   { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制' },
+  { name: 'im',        label: 'IM 桥接',      icon: MessageSquare, description: '飞书 / Telegram / 企微 / QQ / 微信' },
 ]
 
 // --- Provider state ---
@@ -2778,6 +2781,10 @@ function kbModelSupportsVision(scanModel: string) {
             </ol>
           </div>
         </div>
+      </NTabPane>
+
+      <NTabPane name="im" tab="IM 桥接" style="flex: 1; min-height: 0; overflow: auto">
+        <IMSettings />
       </NTabPane>
     </NTabs>
   </AppSettingsLayout>
