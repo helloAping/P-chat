@@ -101,24 +101,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, chunk Chunk) error {
 	kind := strings.ToLower(strings.TrimSpace(chunk.Kind))
 	switch kind {
 	case "", "text":
-		if err := enforceTextLimit(d.renderer, chunk.Text); err != nil {
-			return err
-		}
-		if err := d.renderer.Send(ctx, chunk); err != nil {
-			return fmt.Errorf("send im outbound: %w", err)
-		}
-		return nil
+		return d.sendTextChunks(ctx, chunk)
 	case "edit":
-		if err := enforceTextLimit(d.renderer, chunk.Text); err != nil {
-			return err
-		}
 		if err := d.waitEditTurn(ctx, chunk); err != nil {
 			return err
 		}
-		if err := d.renderer.Edit(ctx, chunk.Chat, chunk.MsgID, chunk); err != nil {
-			return fmt.Errorf("edit im outbound: %w", err)
-		}
-		return nil
+		return d.editTextChunks(ctx, chunk)
 	case "typing":
 		if err := d.renderer.Typing(ctx, chunk.Chat); err != nil {
 			return fmt.Errorf("send im typing: %w", err)
@@ -127,6 +115,45 @@ func (d *Dispatcher) Dispatch(ctx context.Context, chunk Chunk) error {
 	default:
 		return fmt.Errorf("unsupported im outbound kind: %s", chunk.Kind)
 	}
+}
+
+func (d *Dispatcher) sendTextChunks(ctx context.Context, chunk Chunk) error {
+	parts := SplitText(chunk.Text, d.renderer.MaxTextLen())
+	for i, text := range parts {
+		next := chunk
+		next.Kind = "text"
+		next.MsgID = ""
+		next.Text = text
+		next.Parts = nil
+		next.Done = chunk.Done && i == len(parts)-1
+		if err := d.renderer.Send(ctx, next); err != nil {
+			return fmt.Errorf("send im outbound: %w", err)
+		}
+	}
+	return nil
+}
+
+func (d *Dispatcher) editTextChunks(ctx context.Context, chunk Chunk) error {
+	parts := SplitText(chunk.Text, d.renderer.MaxTextLen())
+	first := chunk
+	first.Text = parts[0]
+	first.Parts = nil
+	first.Done = chunk.Done && len(parts) == 1
+	if err := d.renderer.Edit(ctx, first.Chat, first.MsgID, first); err != nil {
+		return fmt.Errorf("edit im outbound: %w", err)
+	}
+	for i, text := range parts[1:] {
+		next := chunk
+		next.Kind = "text"
+		next.MsgID = ""
+		next.Text = text
+		next.Parts = nil
+		next.Done = chunk.Done && i == len(parts[1:])-1
+		if err := d.renderer.Send(ctx, next); err != nil {
+			return fmt.Errorf("send im outbound continuation: %w", err)
+		}
+	}
+	return nil
 }
 
 func (d *Dispatcher) waitEditTurn(ctx context.Context, chunk Chunk) error {
@@ -164,15 +191,4 @@ func editThrottleKey(chunk Chunk) string {
 		return chunk.Chat.Platform + ":" + chunk.Chat.Variant + ":" + chunk.Chat.ChatID + ":" + chunk.MsgID
 	}
 	return chunk.Chat.Platform + ":" + chunk.Chat.Variant + ":" + chunk.Chat.ChatID
-}
-
-func enforceTextLimit(renderer Renderer, text string) error {
-	maxLen := renderer.MaxTextLen()
-	if maxLen <= 0 {
-		return nil
-	}
-	if len([]rune(text)) > maxLen {
-		return fmt.Errorf("im outbound text exceeds max length %d", maxLen)
-	}
-	return nil
 }

@@ -103,12 +103,53 @@ func TestDispatcherWrapsRendererErrors(t *testing.T) {
 	}
 }
 
-func TestDispatcherRejectsTooLongText(t *testing.T) {
+func TestDispatcherSplitsTooLongText(t *testing.T) {
 	dispatcher := NewDispatcher(&fakeRenderer{maxLen: 3})
 
 	err := dispatcher.Dispatch(context.Background(), Chunk{Kind: "text", Text: "xxxx"})
-	if err == nil || !strings.Contains(err.Error(), "exceeds max length 3") {
-		t.Fatalf("error = %v, want max length error", err)
+	if err != nil {
+		t.Fatalf("dispatch split text: %v", err)
+	}
+}
+
+func TestDispatcherSplitsLongTextSends(t *testing.T) {
+	renderer := &fakeRenderer{maxLen: 6}
+	dispatcher := NewDispatcher(renderer)
+
+	err := dispatcher.Dispatch(context.Background(), Chunk{Kind: "text", Text: "alpha\nbeta\ngamma", Parts: []any{"rich"}})
+	if err != nil {
+		t.Fatalf("dispatch split text: %v", err)
+	}
+	if len(renderer.sendChunks) != 3 {
+		t.Fatalf("send calls = %d, want 3 (%+v)", len(renderer.sendChunks), renderer.sendChunks)
+	}
+	want := []string{"alpha\n", "beta\n", "gamma"}
+	for i, text := range want {
+		if renderer.sendChunks[i].Text != text {
+			t.Fatalf("send chunk %d text = %q, want %q", i, renderer.sendChunks[i].Text, text)
+		}
+		if renderer.sendChunks[i].Parts != nil {
+			t.Fatalf("send chunk %d parts = %+v, want nil", i, renderer.sendChunks[i].Parts)
+		}
+	}
+}
+
+func TestDispatcherSplitsLongEditIntoEditThenSends(t *testing.T) {
+	renderer := &fakeRenderer{maxLen: 6}
+	dispatcher := NewDispatcher(renderer)
+
+	err := dispatcher.Dispatch(context.Background(), Chunk{Kind: "edit", MsgID: "om_msg", Text: "alpha\nbeta\ngamma"})
+	if err != nil {
+		t.Fatalf("dispatch split edit: %v", err)
+	}
+	if len(renderer.editChunks) != 1 || renderer.editChunks[0].Text != "alpha\n" {
+		t.Fatalf("edit chunks = %+v, want first alpha newline", renderer.editChunks)
+	}
+	if len(renderer.sendChunks) != 2 {
+		t.Fatalf("send calls = %d, want 2 (%+v)", len(renderer.sendChunks), renderer.sendChunks)
+	}
+	if renderer.sendChunks[0].Text != "beta\n" || renderer.sendChunks[1].Text != "gamma" {
+		t.Fatalf("send chunks = %+v, want beta/gamma", renderer.sendChunks)
 	}
 }
 
