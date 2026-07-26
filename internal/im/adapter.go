@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/im/outbound"
 )
 
 // Adapter 是 IM 平台入站事件适配器。
@@ -19,13 +20,13 @@ type Adapter interface {
 
 // MarkdownDialect 描述平台支持的 Markdown 方言。
 // MarkdownDialect describes the Markdown dialect a platform supports.
-type MarkdownDialect string
+type MarkdownDialect = outbound.MarkdownDialect
 
 const (
-	MarkdownPlain      MarkdownDialect = "plain"
-	MarkdownCommonMark MarkdownDialect = "commonmark"
-	MarkdownTelegramV2 MarkdownDialect = "telegram_v2"
-	MarkdownFeishuPost MarkdownDialect = "feishu_post"
+	MarkdownPlain      MarkdownDialect = outbound.MarkdownPlain
+	MarkdownCommonMark MarkdownDialect = outbound.MarkdownCommonMark
+	MarkdownTelegramV2 MarkdownDialect = outbound.MarkdownTelegramV2
+	MarkdownFeishuPost MarkdownDialect = outbound.MarkdownFeishuPost
 )
 
 // OutboundRenderer 是 IM 平台出站渲染器。
