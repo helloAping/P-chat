@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
-  NButton, NCollapse, NCollapseItem, NInput, NSwitch, NTag, useMessage,
+  NButton, NCollapse, NCollapseItem, NInput, NModal, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import { Bot, Key, MessageSquare, RotateCw } from './icons'
 import * as api from '../api/client'
@@ -21,6 +21,7 @@ const feishuAppSecret = ref('')
 const feishuVerificationToken = ref('')
 const feishuEncryptKey = ref('')
 const qqBotSecret = ref('')
+const showWechatQR = ref(false)
 const platformsText = ref('[]')
 const policiesText = ref('{}')
 let eventAbort: AbortController | null = null
@@ -40,6 +41,11 @@ const healthByKey = computed(() => {
 const feishu = computed(() => findPlatform('feishu'))
 const wechat = computed(() => findPlatform('wechat'))
 const qq = computed(() => findPlatform('qq'))
+const wechatQRSource = computed(() => {
+  const extra = wechat.value?.extra || {}
+  const raw = extra.qr_url || extra.qr_data || extra.qrcode || ''
+  return typeof raw === 'string' ? raw : ''
+})
 
 function platformKey(type: string, variant?: string) {
   return variant ? `${type}:${variant}` : type
@@ -311,7 +317,7 @@ async function connectPlatform(type: 'feishu' | 'wechat' | 'qq') {
   const saved = await saveConfig({ silent: true })
   if (!saved) return
   if (type === 'wechat') {
-    message.info('微信扫码入口已保存，等待扫码通道接入')
+    showWechatQR.value = true
     return
   }
   await testPlatform(platform)
@@ -579,6 +585,44 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </template>
+
+    <NModal
+      v-model:show="showWechatQR"
+      preset="card"
+      title="微信扫码登录"
+      style="width: min(420px, calc(100vw - 32px));"
+      :bordered="false"
+    >
+      <div class="wechat-qr-panel">
+        <div class="wechat-qr-box">
+          <img v-if="wechatQRSource" :src="wechatQRSource" alt="微信登录二维码" />
+          <div v-else class="wechat-qr-placeholder">
+            <MessageSquare :size="40" />
+            <span>等待二维码</span>
+          </div>
+        </div>
+        <div class="wechat-qr-status">
+          <NTag
+            size="small"
+            :type="wechatQRSource ? 'success' : 'warning'"
+            :bordered="false"
+          >
+            {{ wechatQRSource ? '请使用微信扫码' : '扫码通道未接入' }}
+          </NTag>
+          <p>
+            {{ wechatQRSource
+              ? '扫码后保持本窗口打开，连接状态会在上方自动刷新。'
+              : '当前后端尚未返回微信二维码；待微信桥接服务接入后，这里会直接显示二维码。' }}
+          </p>
+        </div>
+      </div>
+      <template #footer>
+        <div class="im-modal-actions">
+          <NButton size="small" @click="showWechatQR = false">关闭</NButton>
+          <NButton size="small" type="primary" ghost @click="refreshAll">刷新状态</NButton>
+        </div>
+      </template>
+    </NModal>
   </div>
 </template>
 
@@ -776,6 +820,56 @@ onBeforeUnmount(() => {
   color: var(--text-tertiary);
   text-align: center;
   font-size: 12.5px;
+}
+.wechat-qr-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+.wechat-qr-box {
+  width: 220px;
+  height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.wechat-qr-box img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #ffffff;
+}
+.wechat-qr-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+.wechat-qr-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+}
+.wechat-qr-status p {
+  margin: 0;
+  max-width: 320px;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.im-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 @media (max-width: 760px) {
   .im-settings {
