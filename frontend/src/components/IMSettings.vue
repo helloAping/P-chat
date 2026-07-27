@@ -16,6 +16,10 @@ const health = ref<api.IMHealth | null>(null)
 const events = ref<api.IMLifecycleEvent[]>([])
 const eventError = ref('')
 const testing = ref<Record<string, boolean>>({})
+const feishuAppID = ref('')
+const feishuAppSecret = ref('')
+const feishuVerificationToken = ref('')
+const feishuEncryptKey = ref('')
 const qqBotSecret = ref('')
 const platformsText = ref('[]')
 const policiesText = ref('{}')
@@ -174,6 +178,11 @@ function syncEditors(cfg: api.IMConfig) {
     media: cfg.media,
   })
   const qqPlatform = (cfg.platforms || []).find(p => p.type === 'qq')
+  const feishuPlatform = (cfg.platforms || []).find(p => p.type === 'feishu')
+  feishuAppID.value = feishuPlatform?.app_id || ''
+  feishuAppSecret.value = feishuPlatform?.app_secret || ''
+  feishuVerificationToken.value = feishuPlatform?.verification_token || ''
+  feishuEncryptKey.value = feishuPlatform?.encrypt_key || ''
   qqBotSecret.value = qqPlatform?.app_secret || qqPlatform?.token || qqPlatform?.api_key || ''
 }
 
@@ -220,6 +229,24 @@ function applyQQSecret(cfg: api.IMConfig) {
   if (!existing) cfg.platforms = [...(cfg.platforms || []), qqPlatform]
 }
 
+function applyFeishuFields(cfg: api.IMConfig) {
+  const existing = (cfg.platforms || []).find(p => p.type === 'feishu')
+  const hasAnyValue = !!(
+    feishuAppID.value.trim() ||
+    feishuAppSecret.value.trim() ||
+    feishuVerificationToken.value.trim() ||
+    feishuEncryptKey.value.trim()
+  )
+  if (!hasAnyValue && !existing) return
+  const feishuPlatform = existing || defaultsFor('feishu')
+  feishuPlatform.app_id = feishuAppID.value.trim()
+  feishuPlatform.app_secret = feishuAppSecret.value
+  feishuPlatform.verification_token = feishuVerificationToken.value
+  feishuPlatform.encrypt_key = feishuEncryptKey.value
+  feishuPlatform.enabled = hasAnyValue || feishuPlatform.enabled
+  if (!existing) cfg.platforms = [...(cfg.platforms || []), feishuPlatform]
+}
+
 async function saveConfig(options: { silent?: boolean } = {}) {
   if (!imConfig.value) return false
   saving.value = true
@@ -238,6 +265,7 @@ async function saveConfig(options: { silent?: boolean } = {}) {
     next.cron = policies.cron || next.cron
     next.fallback = policies.fallback || []
     next.media = policies.media || next.media
+    applyFeishuFields(next)
     applyQQSecret(next)
 
     const updated = normalizeConfig(await api.updateIMConfig(next))
@@ -272,10 +300,20 @@ async function connectPlatform(type: 'feishu' | 'wechat' | 'qq') {
     }
     platform.app_secret = secret
   }
+  if (type === 'feishu') {
+    platform.app_id = feishuAppID.value.trim()
+    platform.app_secret = feishuAppSecret.value
+    platform.verification_token = feishuVerificationToken.value
+    platform.encrypt_key = feishuEncryptKey.value
+  }
   platform.enabled = true
   syncPlatformEditor()
   const saved = await saveConfig({ silent: true })
   if (!saved) return
+  if (type === 'wechat') {
+    message.info('微信扫码入口已保存，等待扫码通道接入')
+    return
+  }
   await testPlatform(platform)
 }
 
@@ -286,12 +324,22 @@ async function testPlatform(p: api.IMPlatformConfig) {
   try {
     const result = await api.testIMConnection(p.type, p.variant)
     if (result.ok) message.success(`${platformName(p.type)} 已就绪`)
-    else message.warning(`${platformName(p.type)} 未就绪: ${result.error || result.status}`)
+    else message.warning(`${platformName(p.type)} 未就绪: ${friendlyStatus(p.type, result.error || result.status)}`)
   } catch (err: any) {
     message.error(`连接检查失败: ${err?.message || err}`)
   } finally {
     testing.value = { ...testing.value, [key]: false }
   }
+}
+
+function friendlyStatus(type: string, raw?: string) {
+  if (!raw) return '请检查连接状态'
+  if (raw.includes('adapter not registered')) {
+    if (type === 'wechat') return '微信扫码通道未接入，请先安装或启动微信桥接服务'
+    if (type === 'feishu') return '飞书长连接通道未接入，请先完成后端飞书 adapter 接入'
+    if (type === 'qq') return 'QQ Bot adapter 未接入，请确认当前构建包含 QQ 支持'
+  }
+  return raw
 }
 
 function platformName(type: string) {
@@ -379,8 +427,8 @@ onBeforeUnmount(() => {
           <div class="im-connect-head">
             <div class="im-connect-icon"><Bot :size="18" /></div>
             <div class="im-connect-title">
-              <strong>飞书 / Hermes</strong>
-              <span>授权连接</span>
+              <strong>飞书</strong>
+              <span>密钥授权连接</span>
             </div>
             <NTag
               size="small"
@@ -398,11 +446,29 @@ onBeforeUnmount(() => {
               :loading="!!testing[platformKey('feishu', feishu?.variant)]"
               @click="connectPlatform('feishu')"
             >
-              连接授权
+              保存并连接
             </NButton>
           </div>
+          <div class="im-field-grid">
+            <label class="im-field">
+              <span>App ID</span>
+              <NInput v-model:value="feishuAppID" size="small" placeholder="cli_xxx" />
+            </label>
+            <label class="im-field">
+              <span>App Secret</span>
+              <NInput v-model:value="feishuAppSecret" size="small" type="password" show-password-on="click" />
+            </label>
+            <label class="im-field">
+              <span>Verification Token</span>
+              <NInput v-model:value="feishuVerificationToken" size="small" type="password" show-password-on="click" />
+            </label>
+            <label class="im-field">
+              <span>Encrypt Key</span>
+              <NInput v-model:value="feishuEncryptKey" size="small" type="password" show-password-on="click" />
+            </label>
+          </div>
           <div v-if="healthFor('feishu', feishu?.variant)?.error" class="im-card-error">
-            {{ healthFor('feishu', feishu?.variant)?.error }}
+            {{ friendlyStatus('feishu', healthFor('feishu', feishu?.variant)?.error) }}
           </div>
         </section>
 
@@ -434,7 +500,7 @@ onBeforeUnmount(() => {
             </NButton>
           </div>
           <div v-if="healthFor('wechat', wechat?.variant)?.error" class="im-card-error">
-            {{ healthFor('wechat', wechat?.variant)?.error }}
+            {{ friendlyStatus('wechat', healthFor('wechat', wechat?.variant)?.error) }}
           </div>
         </section>
 
@@ -471,7 +537,7 @@ onBeforeUnmount(() => {
             </NButton>
           </div>
           <div v-if="healthFor('qq', qq?.variant)?.error" class="im-card-error">
-            {{ healthFor('qq', qq?.variant)?.error }}
+            {{ friendlyStatus('qq', healthFor('qq', qq?.variant)?.error) }}
           </div>
         </section>
       </div>
@@ -637,6 +703,22 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
 }
+.im-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.im-field {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.im-field > span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
 .im-secret-row {
   align-items: stretch;
 }
@@ -707,6 +789,9 @@ onBeforeUnmount(() => {
     justify-content: flex-start;
   }
   .im-connect-grid {
+    grid-template-columns: 1fr;
+  }
+  .im-field-grid {
     grid-template-columns: 1fr;
   }
   .im-event-row {
