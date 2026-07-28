@@ -271,13 +271,22 @@ func TestWeChatQRUnavailableIsUserReadable(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/im/wechat/qr", nil)
 	s.engine.ServeHTTP(w, req)
-	if w.Code != http.StatusFailedDependency {
-		t.Fatalf("status = %d, want 424; body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 	if strings.Contains(w.Body.String(), "HTTP 502") || strings.Contains(w.Body.String(), "dial tcp") {
 		t.Fatalf("response should not expose raw transport error: %s", w.Body.String())
 	}
 	if !strings.Contains(w.Body.String(), "微信扫码服务暂时无法访问") {
 		t.Fatalf("body = %s, want user-readable unavailable message", w.Body.String())
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Status != "unavailable" {
+		t.Fatalf("status body = %q, want unavailable", body.Status)
 	}
 }

@@ -60,6 +60,7 @@ const wechatQRStatusText = computed(() => {
     case 'confirmed': return '微信已连接'
     case 'expired': return '二维码已过期'
     case 'canceled': return '扫码已取消'
+    case 'unavailable': return '扫码服务不可用'
     default: return wechatQRSource.value ? '请使用微信扫码' : '准备二维码'
   }
 })
@@ -71,6 +72,7 @@ const wechatQRHint = computed(() => {
     case 'confirmed': return '微信 Bot 登录态已保存，可继续启用消息收发能力。'
     case 'expired': return '二维码已过期，请点击重新获取。'
     case 'canceled': return '扫码已取消，请重新获取二维码。'
+    case 'unavailable': return wechatQRSession.value?.message || '微信扫码服务暂时无法访问，请检查网络后重试。'
     default: return '点击获取二维码后，使用微信扫码即可连接。'
   }
 })
@@ -360,6 +362,10 @@ async function startWechatQR() {
   try {
     const session = await api.startWeChatQR()
     wechatQRSession.value = session
+    if (session.status === 'unavailable') {
+      wechatQRError.value = session.message || '微信扫码服务暂时无法访问，请检查网络后重试'
+      return
+    }
     scheduleWechatQRPoll(session)
   } catch (err: any) {
     wechatQRSession.value = null
@@ -424,6 +430,10 @@ function friendlyAPIError(err: any) {
     return '微信扫码服务暂时无法访问，请检查网络后重试'
   }
   return raw
+}
+
+function handleWechatQRImageError() {
+  wechatQRError.value = '二维码图片加载失败，请重新获取二维码'
 }
 
 async function testPlatform(p: api.IMPlatformConfig) {
@@ -703,7 +713,7 @@ onBeforeUnmount(() => {
     >
       <div class="wechat-qr-panel">
         <div class="wechat-qr-box">
-          <img v-if="wechatQRSource" :src="wechatQRSource" alt="微信登录二维码" />
+          <img v-if="wechatQRSource" :src="wechatQRSource" alt="微信登录二维码" @error="handleWechatQRImageError" />
           <div v-else class="wechat-qr-placeholder">
             <MessageSquare :size="40" />
             <span>{{ wechatQRLoading ? '正在获取二维码' : '等待微信二维码' }}</span>
@@ -712,7 +722,7 @@ onBeforeUnmount(() => {
         <div class="wechat-qr-status">
           <NTag
             size="small"
-            :type="wechatQRStatus === 'confirmed' ? 'success' : (wechatQRError || wechatQRStatus === 'expired' ? 'error' : 'warning')"
+            :type="wechatQRStatus === 'confirmed' ? 'success' : (wechatQRError || wechatQRStatus === 'expired' || wechatQRStatus === 'unavailable' ? 'error' : 'warning')"
             :bordered="false"
           >
             {{ wechatQRStatusText }}

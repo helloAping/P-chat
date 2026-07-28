@@ -108,6 +108,15 @@ func (h *Handler) StartWeChatQR(c *gin.Context) {
 	ctx := c.Request.Context()
 	session, err := h.wechatQR.Start(ctx, platform)
 	if err != nil {
+		var unavailable im.WeChatQRServiceError
+		if errors.As(err, &unavailable) {
+			c.JSON(http.StatusOK, im.WeChatQRSession{
+				Status:      "unavailable",
+				Message:     unavailable.Error(),
+				PollAfterMS: 0,
+			})
+			return
+		}
 		writeWeChatQRError(c, err)
 		return
 	}
