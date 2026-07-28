@@ -341,9 +341,9 @@ async function testPlatform(p: api.IMPlatformConfig) {
 function friendlyStatus(type: string, raw?: string) {
   if (!raw) return '请检查连接状态'
   if (raw.includes('adapter not registered')) {
-    if (type === 'wechat') return '微信扫码通道未接入，请先安装或启动微信桥接服务'
-    if (type === 'feishu') return '飞书长连接通道未接入，请先完成后端飞书 adapter 接入'
-    if (type === 'qq') return 'QQ Bot adapter 未接入，请确认当前构建包含 QQ 支持'
+    if (type === 'wechat') return '请先启动微信连接服务，然后重新扫码'
+    if (type === 'feishu') return '飞书连接服务未启动，请确认授权信息已填写'
+    if (type === 'qq') return 'QQ Bot 连接服务未启动，请确认密钥已填写'
   }
   return raw
 }
@@ -598,7 +598,7 @@ onBeforeUnmount(() => {
           <img v-if="wechatQRSource" :src="wechatQRSource" alt="微信登录二维码" />
           <div v-else class="wechat-qr-placeholder">
             <MessageSquare :size="40" />
-            <span>等待二维码</span>
+            <span>等待微信二维码</span>
           </div>
         </div>
         <div class="wechat-qr-status">
@@ -607,19 +607,21 @@ onBeforeUnmount(() => {
             :type="wechatQRSource ? 'success' : 'warning'"
             :bordered="false"
           >
-            {{ wechatQRSource ? '请使用微信扫码' : '扫码通道未接入' }}
+            {{ wechatQRSource ? '请使用微信扫码' : '等待连接服务' }}
           </NTag>
           <p>
             {{ wechatQRSource
               ? '扫码后保持本窗口打开，连接状态会在上方自动刷新。'
-              : '当前后端尚未返回微信二维码；待微信桥接服务接入后，这里会直接显示二维码。' }}
+              : '请先启动微信连接服务，然后点击刷新二维码。服务准备好后，二维码会显示在这里。' }}
           </p>
         </div>
       </div>
       <template #footer>
         <div class="im-modal-actions">
           <NButton size="small" @click="showWechatQR = false">关闭</NButton>
-          <NButton size="small" type="primary" ghost @click="refreshAll">刷新状态</NButton>
+          <NButton size="small" type="primary" ghost @click="refreshAll">
+            {{ wechatQRSource ? '刷新状态' : '刷新二维码' }}
+          </NButton>
         </div>
       </template>
     </NModal>
