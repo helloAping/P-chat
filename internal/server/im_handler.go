@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -107,7 +108,7 @@ func (h *Handler) StartWeChatQR(c *gin.Context) {
 	ctx := c.Request.Context()
 	session, err := h.wechatQR.Start(ctx, platform)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		writeWeChatQRError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, session)
@@ -125,7 +126,7 @@ func (h *Handler) PollWeChatQR(c *gin.Context) {
 	}
 	session, cred, err := h.wechatQR.Poll(c.Request.Context(), c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		writeWeChatQRError(c, err)
 		return
 	}
 	if session.Status == "confirmed" && cred.Token != "" {
@@ -247,4 +248,16 @@ func findIMPlatform(cfg config.IMConfig, platformType, fallbackVariant string) c
 		Mode:           "websocket",
 		AllowedSenders: []string{"*"},
 	}
+}
+
+func writeWeChatQRError(c *gin.Context, err error) {
+	var unavailable im.WeChatQRServiceError
+	if errors.As(err, &unavailable) {
+		c.JSON(http.StatusFailedDependency, gin.H{
+			"error": unavailable.Error(),
+			"code":  "wechat_qr_unavailable",
+		})
+		return
+	}
+	c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 }

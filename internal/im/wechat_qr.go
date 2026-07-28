@@ -1,7 +1,6 @@
 package im
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,7 +15,20 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 )
 
-const defaultWeChatQRBaseURL = "https://ilink.qq.com"
+const defaultWeChatQRBaseURL = "https://ilinkai.weixin.qq.com"
+
+// WeChatQRServiceError is returned when the QR service cannot be reached.
+type WeChatQRServiceError struct {
+	Err error
+}
+
+func (e WeChatQRServiceError) Error() string {
+	return "微信扫码服务暂时无法访问，请检查网络后重试"
+}
+
+func (e WeChatQRServiceError) Unwrap() error {
+	return e.Err
+}
 
 // WeChatQRClient starts and polls a WeChat Bot QR login flow.
 type WeChatQRClient struct {
@@ -150,11 +162,10 @@ func (m *WeChatQRManager) clientFor(platform config.IMPlatformConfig) WeChatQRCl
 
 func (c WeChatQRClient) Start(ctx context.Context) (WeChatQRSession, error) {
 	endpoint := strings.TrimRight(c.baseURL(), "/") + "/ilink/bot/get_bot_qrcode?bot_type=3"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return WeChatQRSession{}, err
 	}
-	req.Header.Set("Content-Type", "application/json")
 	var raw map[string]any
 	if err := c.doJSON(req, &raw); err != nil {
 		return WeChatQRSession{}, err
@@ -190,6 +201,7 @@ func (c WeChatQRClient) Poll(ctx context.Context, qrcode string) (WeChatQRSessio
 	if err != nil {
 		return WeChatQRSession{}, WeChatCredential{}, err
 	}
+	req.Header.Set("iLink-App-ClientVersion", "1")
 	var raw map[string]any
 	if err := c.doJSON(req, &raw); err != nil {
 		return WeChatQRSession{}, WeChatCredential{}, err
@@ -236,7 +248,7 @@ func (c WeChatQRClient) doJSON(req *http.Request, out any) error {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return WeChatQRServiceError{Err: err}
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

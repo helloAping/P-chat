@@ -363,7 +363,7 @@ async function startWechatQR() {
     scheduleWechatQRPoll(session)
   } catch (err: any) {
     wechatQRSession.value = null
-    wechatQRError.value = err?.message || String(err)
+    wechatQRError.value = friendlyAPIError(err)
     message.error(`获取微信二维码失败: ${wechatQRError.value}`)
   } finally {
     wechatQRLoading.value = false
@@ -388,7 +388,7 @@ async function pollWechatQR() {
     }
     scheduleWechatQRPoll(session)
   } catch (err: any) {
-    wechatQRError.value = err?.message || String(err)
+    wechatQRError.value = friendlyAPIError(err)
     stopWechatQRPoll()
   }
 }
@@ -407,6 +407,23 @@ function stopWechatQRPoll() {
     clearTimeout(wechatQRTimer)
     wechatQRTimer = null
   }
+}
+
+function friendlyAPIError(err: any) {
+  const raw = err?.message || String(err)
+  const match = raw.match(/HTTP\s+\d+:\s+(\{.*\})$/)
+  if (match) {
+    try {
+      const body = JSON.parse(match[1])
+      if (typeof body?.error === 'string' && body.error) return body.error
+    } catch {
+      // Keep the original message when the server did not return JSON.
+    }
+  }
+  if (raw.includes('wechat_qr_unavailable') || raw.includes('no such host') || raw.includes('dial tcp')) {
+    return '微信扫码服务暂时无法访问，请检查网络后重试'
+  }
+  return raw
 }
 
 async function testPlatform(p: api.IMPlatformConfig) {

@@ -169,8 +169,8 @@ func TestWeChatQRFlowPersistsConfirmedCredential(t *testing.T) {
 		switch r.URL.Path {
 		case "/ilink/bot/get_bot_qrcode":
 			gotStart = true
-			if r.Method != http.MethodPost {
-				t.Fatalf("qr method = %s, want POST", r.Method)
+			if r.Method != http.MethodGet {
+				t.Fatalf("qr method = %s, want GET", r.Method)
 			}
 			if r.URL.Query().Get("bot_type") != "3" {
 				t.Fatalf("bot_type = %q, want 3", r.URL.Query().Get("bot_type"))
@@ -256,5 +256,28 @@ func TestWeChatQRFlowPersistsConfirmedCredential(t *testing.T) {
 	}
 	if body.Platforms[0].Extra["ilink_bot_id"] != "bot-1" {
 		t.Fatalf("extra = %+v, want ilink_bot_id", body.Platforms[0].Extra)
+	}
+}
+
+func TestWeChatQRUnavailableIsUserReadable(t *testing.T) {
+	cfgJSON := strings.Replace(imTestConfigJSON, `"platforms": [
+      { "type": "telegram", "variant": "polling", "enabled": true, "token": "secret-token" }
+    ]`, `"platforms": [
+      { "type": "wechat", "variant": "wechatbot", "enabled": true, "mode": "websocket", "extra": { "qr_base_url": "http://127.0.0.1:1" } }
+    ]`, 1)
+	s, cfg := newTestServerWithConfig(t, cfgJSON)
+	s.SetIMGateway(im.NewGateway(cfg.IM))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/im/wechat/qr", nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusFailedDependency {
+		t.Fatalf("status = %d, want 424; body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "HTTP 502") || strings.Contains(w.Body.String(), "dial tcp") {
+		t.Fatalf("response should not expose raw transport error: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "微信扫码服务暂时无法访问") {
+		t.Fatalf("body = %s, want user-readable unavailable message", w.Body.String())
 	}
 }
