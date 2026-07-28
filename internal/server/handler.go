@@ -32,6 +32,7 @@ type Handler struct {
 	mcpMgr     *mcp.Manager
 	browserMgr *browser.Manager
 	imGateway  *im.Gateway
+	wechatQR   *im.WeChatQRManager
 	// toolReg is the P3-2 shared tool registry. The
 	// dynamic-tool watcher in server.go writes here; the
 	// GET /api/v1/tools endpoint reads from here. May be
@@ -96,6 +97,7 @@ func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMg
 		styleMgr: styleMgr,
 		toolReg:  toolReg,
 		mcpMgr:   mcpMgr,
+		wechatQR: im.NewWeChatQRManager(im.WeChatQRClient{}),
 		meta:     make(map[string]sessionMeta),
 	}
 	h.cfg.Store(cfg)

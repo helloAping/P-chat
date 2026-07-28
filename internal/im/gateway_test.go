@@ -114,6 +114,25 @@ func TestGatewayStartsAndStopsRegisteredAdapter(t *testing.T) {
 	}
 }
 
+func TestGatewayTreatsWeChatTokenAsAuthenticated(t *testing.T) {
+	cfg := config.DefaultIMConfig()
+	cfg.Enabled = true
+	cfg.Platforms = []config.IMPlatformConfig{{Type: "wechat", Variant: "wechatbot", Enabled: true, Token: "wx-token"}}
+	g := NewGateway(cfg)
+
+	if err := g.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	health := g.Health()
+	if len(health.Platforms) != 1 || health.Platforms[0].Status != "authenticated" || health.Platforms[0].Error != "" {
+		t.Fatalf("health = %+v, want authenticated without adapter error", health.Platforms)
+	}
+	result := g.TestConnection("wechat", "wechatbot")
+	if !result.OK || result.Status != "authenticated" {
+		t.Fatalf("test result = %+v, want authenticated ok", result)
+	}
+}
+
 func TestGatewayDrainsInboundBusAndBroadcastsLifecycle(t *testing.T) {
 	cfg := config.DefaultIMConfig()
 	cfg.Enabled = true

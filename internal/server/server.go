@@ -324,6 +324,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.PATCH("/im/config", h.UpdateIMConfig)
 		api.POST("/im/test", h.TestIMConnection)
 		api.POST("/im/:type/test", h.TestIMConnection)
+		api.POST("/im/wechat/qr", h.StartWeChatQR)
+		api.GET("/im/wechat/qr/:id", h.PollWeChatQR)
 		api.GET("/im/events", h.IMEvents)
 		api.POST("/im/feishu/webhook", h.FeishuWebhook)
 	}

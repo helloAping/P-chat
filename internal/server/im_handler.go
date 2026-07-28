@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -92,6 +93,50 @@ func (h *Handler) TestIMConnection(c *gin.Context) {
 	c.JSON(http.StatusOK, h.imGateway.TestConnection(req.Type, req.Variant))
 }
 
+// StartWeChatQR starts a WeChat Bot QR login flow.
+func (h *Handler) StartWeChatQR(c *gin.Context) {
+	cfg := h.getCfg()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
+		return
+	}
+	if h.wechatQR == nil {
+		h.wechatQR = im.NewWeChatQRManager(im.WeChatQRClient{})
+	}
+	platform := findIMPlatform(cfg.IM, "wechat", "wechatbot")
+	ctx := c.Request.Context()
+	session, err := h.wechatQR.Start(ctx, platform)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, session)
+}
+
+// PollWeChatQR polls a WeChat Bot QR login flow and persists credentials once confirmed.
+func (h *Handler) PollWeChatQR(c *gin.Context) {
+	if h.getCfg() == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
+		return
+	}
+	if h.wechatQR == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "wechat qr session not found"})
+		return
+	}
+	session, cred, err := h.wechatQR.Poll(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	if session.Status == "confirmed" && cred.Token != "" {
+		if err := h.persistWeChatCredential(cred); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, session)
+}
+
 // IMEvents 推送 IM Gateway 生命周期事件。
 // IMEvents streams IM Gateway lifecycle events.
 func (h *Handler) IMEvents(c *gin.Context) {
@@ -120,4 +165,86 @@ func (h *Handler) IMEvents(c *gin.Context) {
 			return true
 		}
 	})
+}
+
+func (h *Handler) persistWeChatCredential(cred im.WeChatCredential) error {
+	cfg := h.getCfg()
+	if cfg == nil {
+		return fmt.Errorf("config not available")
+	}
+	next := cfg.IM
+	next.Normalize()
+	next.Enabled = true
+	idx := -1
+	for i := range next.Platforms {
+		if next.Platforms[i].Type == "wechat" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		next.Platforms = append(next.Platforms, config.IMPlatformConfig{
+			Type:    "wechat",
+			Variant: "wechatbot",
+			Mode:    "websocket",
+		})
+		idx = len(next.Platforms) - 1
+	}
+	platform := next.Platforms[idx]
+	platform.Type = "wechat"
+	if platform.Variant == "" {
+		platform.Variant = "wechatbot"
+	}
+	if platform.Mode == "" {
+		platform.Mode = "websocket"
+	}
+	platform.Enabled = true
+	platform.Token = cred.Token
+	if platform.Extra == nil {
+		platform.Extra = map[string]any{}
+	}
+	if cred.BaseURL != "" {
+		platform.Endpoint = cred.BaseURL
+		platform.Extra["base_url"] = cred.BaseURL
+	}
+	if cred.BotID != "" {
+		platform.Extra["ilink_bot_id"] = cred.BotID
+	}
+	if cred.UserID != "" {
+		platform.Extra["ilink_user_id"] = cred.UserID
+	}
+	if cred.Nickname != "" {
+		platform.Extra["nickname"] = cred.Nickname
+	}
+	next.Platforms[idx] = platform
+	updated, err := config.UpdateIMConfig(next)
+	if err != nil {
+		return err
+	}
+	h.reloadAfterConfigChange()
+	if h.imGateway != nil {
+		if err := h.imGateway.Reconfigure(context.Background(), updated.IM); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func findIMPlatform(cfg config.IMConfig, platformType, fallbackVariant string) config.IMPlatformConfig {
+	cfg.Normalize()
+	for _, platform := range cfg.Platforms {
+		if platform.Type == platformType {
+			if platform.Variant == "" {
+				platform.Variant = fallbackVariant
+			}
+			return platform
+		}
+	}
+	return config.IMPlatformConfig{
+		Type:           platformType,
+		Variant:        fallbackVariant,
+		Enabled:        true,
+		Mode:           "websocket",
+		AllowedSenders: []string{"*"},
+	}
 }

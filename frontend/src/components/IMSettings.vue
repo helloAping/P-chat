@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   NButton, NCollapse, NCollapseItem, NInput, NModal, NSwitch, NTag, useMessage,
 } from 'naive-ui'
@@ -22,9 +22,13 @@ const feishuVerificationToken = ref('')
 const feishuEncryptKey = ref('')
 const qqBotSecret = ref('')
 const showWechatQR = ref(false)
+const wechatQRLoading = ref(false)
+const wechatQRSession = ref<api.WeChatQRSession | null>(null)
+const wechatQRError = ref('')
 const platformsText = ref('[]')
 const policiesText = ref('{}')
 let eventAbort: AbortController | null = null
+let wechatQRTimer: ReturnType<typeof setTimeout> | null = null
 
 const enabledPlatforms = computed(() =>
   (imConfig.value?.platforms || []).filter(p => p.enabled).length,
@@ -42,9 +46,33 @@ const feishu = computed(() => findPlatform('feishu'))
 const wechat = computed(() => findPlatform('wechat'))
 const qq = computed(() => findPlatform('qq'))
 const wechatQRSource = computed(() => {
+  const active = wechatQRSession.value?.qr_url || wechatQRSession.value?.qr_data || ''
+  if (typeof active === 'string' && active) return active
   const extra = wechat.value?.extra || {}
   const raw = extra.qr_url || extra.qr_data || extra.qrcode || ''
   return typeof raw === 'string' ? raw : ''
+})
+const wechatQRStatus = computed(() => wechatQRSession.value?.status || (wechatQRSource.value ? 'waiting' : 'idle'))
+const wechatQRStatusText = computed(() => {
+  switch (wechatQRStatus.value) {
+    case 'waiting': return '请使用微信扫码'
+    case 'scanned': return '已扫码，等待手机确认'
+    case 'confirmed': return '微信已连接'
+    case 'expired': return '二维码已过期'
+    case 'canceled': return '扫码已取消'
+    default: return wechatQRSource.value ? '请使用微信扫码' : '准备二维码'
+  }
+})
+const wechatQRHint = computed(() => {
+  if (wechatQRError.value) return wechatQRError.value
+  switch (wechatQRStatus.value) {
+    case 'waiting': return '打开微信扫码登录，扫码后请在手机上确认。'
+    case 'scanned': return '请在手机微信中确认登录，确认后这里会自动完成连接。'
+    case 'confirmed': return '微信 Bot 登录态已保存，可继续启用消息收发能力。'
+    case 'expired': return '二维码已过期，请点击重新获取。'
+    case 'canceled': return '扫码已取消，请重新获取二维码。'
+    default: return '点击获取二维码后，使用微信扫码即可连接。'
+  }
 })
 
 function platformKey(type: string, variant?: string) {
@@ -58,6 +86,7 @@ function healthFor(type: string, variant?: string) {
 function statusLabel(status?: string) {
   switch (status) {
     case 'ok': return '已连接'
+    case 'authenticated': return '已登录'
     case 'registered': return '可用'
     case 'configured': return '已配置'
     case 'disabled': return '未启用'
@@ -70,7 +99,7 @@ function statusLabel(status?: string) {
 }
 
 function statusType(status?: string): 'success' | 'warning' | 'error' | 'default' {
-  if (status === 'ok' || status === 'registered') return 'success'
+  if (status === 'ok' || status === 'registered' || status === 'authenticated') return 'success'
   if (status === 'configured' || status === 'disabled' || status === 'not_configured') return 'warning'
   if (status === 'error' || status === 'unavailable' || status === 'not_implemented') return 'error'
   return 'default'
@@ -317,10 +346,67 @@ async function connectPlatform(type: 'feishu' | 'wechat' | 'qq') {
   const saved = await saveConfig({ silent: true })
   if (!saved) return
   if (type === 'wechat') {
-    showWechatQR.value = true
+    await startWechatQR()
     return
   }
   await testPlatform(platform)
+}
+
+async function startWechatQR() {
+  stopWechatQRPoll()
+  wechatQRLoading.value = true
+  wechatQRError.value = ''
+  showWechatQR.value = true
+  try {
+    const session = await api.startWeChatQR()
+    wechatQRSession.value = session
+    scheduleWechatQRPoll(session)
+  } catch (err: any) {
+    wechatQRSession.value = null
+    wechatQRError.value = err?.message || String(err)
+    message.error(`获取微信二维码失败: ${wechatQRError.value}`)
+  } finally {
+    wechatQRLoading.value = false
+  }
+}
+
+async function pollWechatQR() {
+  const id = wechatQRSession.value?.id
+  if (!id) return
+  try {
+    const session = await api.pollWeChatQR(id)
+    wechatQRSession.value = session
+    if (session.status === 'confirmed') {
+      message.success('微信已连接')
+      await refreshAll()
+      stopWechatQRPoll()
+      return
+    }
+    if (session.status === 'expired' || session.status === 'canceled') {
+      stopWechatQRPoll()
+      return
+    }
+    scheduleWechatQRPoll(session)
+  } catch (err: any) {
+    wechatQRError.value = err?.message || String(err)
+    stopWechatQRPoll()
+  }
+}
+
+function scheduleWechatQRPoll(session: api.WeChatQRSession) {
+  stopWechatQRPoll()
+  if (!session.id || session.status === 'confirmed' || session.status === 'expired' || session.status === 'canceled') return
+  const delay = Math.max(1000, Math.min(session.poll_after_ms || 2000, 5000))
+  wechatQRTimer = setTimeout(() => {
+    void pollWechatQR()
+  }, delay)
+}
+
+function stopWechatQRPoll() {
+  if (wechatQRTimer) {
+    clearTimeout(wechatQRTimer)
+    wechatQRTimer = null
+  }
 }
 
 async function testPlatform(p: api.IMPlatformConfig) {
@@ -380,8 +466,13 @@ onMounted(async () => {
   startEventStream()
 })
 
+watch(showWechatQR, (show) => {
+  if (!show) stopWechatQRPoll()
+})
+
 onBeforeUnmount(() => {
   if (eventAbort) eventAbort.abort()
+  stopWechatQRPoll()
 })
 </script>
 
@@ -499,7 +590,7 @@ onBeforeUnmount(() => {
               size="small"
               type="primary"
               ghost
-              :loading="!!testing[platformKey('wechat', wechat?.variant)]"
+              :loading="wechatQRLoading"
               @click="connectPlatform('wechat')"
             >
               扫码
@@ -598,29 +689,25 @@ onBeforeUnmount(() => {
           <img v-if="wechatQRSource" :src="wechatQRSource" alt="微信登录二维码" />
           <div v-else class="wechat-qr-placeholder">
             <MessageSquare :size="40" />
-            <span>等待微信二维码</span>
+            <span>{{ wechatQRLoading ? '正在获取二维码' : '等待微信二维码' }}</span>
           </div>
         </div>
         <div class="wechat-qr-status">
           <NTag
             size="small"
-            :type="wechatQRSource ? 'success' : 'warning'"
+            :type="wechatQRStatus === 'confirmed' ? 'success' : (wechatQRError || wechatQRStatus === 'expired' ? 'error' : 'warning')"
             :bordered="false"
           >
-            {{ wechatQRSource ? '请使用微信扫码' : '等待连接服务' }}
+            {{ wechatQRStatusText }}
           </NTag>
-          <p>
-            {{ wechatQRSource
-              ? '扫码后保持本窗口打开，连接状态会在上方自动刷新。'
-              : '请先启动微信连接服务，然后点击刷新二维码。服务准备好后，二维码会显示在这里。' }}
-          </p>
+          <p>{{ wechatQRHint }}</p>
         </div>
       </div>
       <template #footer>
         <div class="im-modal-actions">
           <NButton size="small" @click="showWechatQR = false">关闭</NButton>
-          <NButton size="small" type="primary" ghost @click="refreshAll">
-            {{ wechatQRSource ? '刷新状态' : '刷新二维码' }}
+          <NButton size="small" type="primary" ghost :loading="wechatQRLoading" @click="startWechatQR">
+            {{ wechatQRStatus === 'expired' || wechatQRError ? '重新获取' : '刷新二维码' }}
           </NButton>
         </div>
       </template>

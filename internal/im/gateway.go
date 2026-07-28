@@ -175,6 +175,17 @@ func (g *Gateway) Start(ctx context.Context) error {
 		adapter := g.adapters[key]
 		g.mu.RUnlock()
 		if adapter == nil {
+			if isAuthenticatedWeChat(platform) {
+				g.setHealth(key, HealthStatus{
+					Platform:  platform.Type,
+					Variant:   platform.Variant,
+					Enabled:   true,
+					Status:    "authenticated",
+					StartedAt: g.startedAt,
+				})
+				g.emit(LifecycleEvent{Type: "adapter_authenticated", Platform: platform.Type, Variant: platform.Variant})
+				continue
+			}
 			g.setHealth(key, HealthStatus{
 				Platform: platform.Type,
 				Variant:  platform.Variant,
@@ -298,6 +309,14 @@ func (g *Gateway) TestConnection(platformType, variant string) TestResult {
 		}
 		key := adapterKey(platform.Type, platform.Variant)
 		if g.adapters[key] == nil {
+			if isAuthenticatedWeChat(platform) {
+				return TestResult{
+					OK:       true,
+					Platform: platform.Type,
+					Variant:  platform.Variant,
+					Status:   "authenticated",
+				}
+			}
 			return TestResult{
 				OK:       false,
 				Platform: platform.Type,
@@ -488,6 +507,10 @@ func configuredStatus(enabled bool) string {
 		return "configured"
 	}
 	return "disabled"
+}
+
+func isAuthenticatedWeChat(platform config.IMPlatformConfig) bool {
+	return platform.Type == "wechat" && platform.Token != ""
 }
 
 func outboundRoute(chunk IMOutChunk) (string, string) {

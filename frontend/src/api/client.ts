@@ -1953,6 +1953,18 @@ export interface IMTestResult {
   error?: string
 }
 
+export interface WeChatQRSession {
+  id: string
+  status: 'waiting' | 'scanned' | 'confirmed' | 'expired' | 'canceled' | string
+  qrcode?: string
+  qr_data?: string
+  qr_url?: string
+  message?: string
+  expires_at?: string
+  poll_after_ms: number
+  account?: Record<string, string>
+}
+
 export interface IMLifecycleEvent {
   type?: string
   seq?: number
@@ -1981,6 +1993,12 @@ export const testIMConnection = (type: string, variant?: string) =>
     method: 'POST',
     body: JSON.stringify({ type, variant }),
   })
+
+export const startWeChatQR = () =>
+  jsonFetch<WeChatQRSession>('/api/v1/im/wechat/qr', { method: 'POST' })
+
+export const pollWeChatQR = (id: string) =>
+  jsonFetch<WeChatQRSession>(`/api/v1/im/wechat/qr/${encodeURIComponent(id)}`)
 
 export async function streamIMEvents(
   onEvent: (ev: IMLifecycleEvent) => void,
