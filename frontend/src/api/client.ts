@@ -477,6 +477,21 @@ export const openTerminal = async (path: string) => {
   await OpenTerminal(path)
 }
 
+export const openExternalURL = async (url: string) => {
+  const parsed = new URL(url)
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`unsupported url protocol: ${parsed.protocol}`)
+  }
+  try {
+    const { OpenURL } = await import('../../wailsjs/go/main/App')
+    await OpenURL(parsed.href)
+    return
+  } catch (e) {
+    const opened = window.open(parsed.href, '_blank', 'noopener,noreferrer')
+    if (!opened) throw e
+  }
+}
+
 // --- Skills ---
 export interface SkillItem {
   name: string
@@ -1073,10 +1088,12 @@ export interface StreamEvent {
   trace_id?: string
 }
 
-export async function submitConfirmResponse(sessionId: string, approved: boolean): Promise<void> {
+export type ConfirmAction = 'reject' | 'once' | 'always'
+
+export async function submitConfirmResponse(sessionId: string, approved: boolean, action?: ConfirmAction): Promise<void> {
   await jsonFetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/confirm-response`, {
     method: 'POST',
-    body: JSON.stringify({ approved }),
+    body: JSON.stringify({ approved, action }),
   })
 }
 

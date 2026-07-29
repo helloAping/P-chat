@@ -45,18 +45,19 @@ type Attachment struct {
 // IMEvent 是 Gateway 消费的规范化入站事件。
 // IMEvent is the normalized inbound event consumed by the Gateway.
 type IMEvent struct {
-	ID          string          `json:"id"`
-	TraceID     string          `json:"trace_id,omitempty"`
-	Platform    string          `json:"platform"`
-	Variant     string          `json:"variant,omitempty"`
-	Chat        ChatRef         `json:"chat"`
-	Sender      SenderRef       `json:"sender"`
-	Text        string          `json:"text,omitempty"`
-	Mentions    []Mention       `json:"mentions,omitempty"`
-	ReplyTo     *string         `json:"reply_to,omitempty"`
-	Attachments []Attachment    `json:"attachments,omitempty"`
-	Timestamp   time.Time       `json:"timestamp"`
-	Raw         json.RawMessage `json:"raw,omitempty"`
+	ID           string          `json:"id"`
+	TraceID      string          `json:"trace_id,omitempty"`
+	Platform     string          `json:"platform"`
+	Variant      string          `json:"variant,omitempty"`
+	Chat         ChatRef         `json:"chat"`
+	Sender       SenderRef       `json:"sender"`
+	ContextToken string          `json:"context_token,omitempty"`
+	Text         string          `json:"text,omitempty"`
+	Mentions     []Mention       `json:"mentions,omitempty"`
+	ReplyTo      *string         `json:"reply_to,omitempty"`
+	Attachments  []Attachment    `json:"attachments,omitempty"`
+	Timestamp    time.Time       `json:"timestamp"`
+	Raw          json.RawMessage `json:"raw,omitempty"`
 }
 
 // IMOutChunk 是 Gateway 发给平台 renderer 的规范化出站事件。

@@ -38,6 +38,19 @@ type fakeRenderer struct {
 	err        error
 }
 
+type fakeInboundProcessor struct {
+	events chan IMEvent
+	err    error
+}
+
+func (f *fakeInboundProcessor) ProcessIMEvent(ctx context.Context, ev IMEvent) error {
+	select {
+	case f.events <- ev:
+	default:
+	}
+	return f.err
+}
+
 func (f *fakeRenderer) Send(ctx context.Context, chunk IMOutChunk) error {
 	f.sendChunks = append(f.sendChunks, chunk)
 	return f.err
@@ -161,6 +174,38 @@ func TestGatewayDrainsInboundBusAndBroadcastsLifecycle(t *testing.T) {
 	}
 	assertInbound("subA", subA)
 	assertInbound("subB", subB)
+}
+
+func TestGatewayProcessesInboundWithProcessor(t *testing.T) {
+	cfg := config.DefaultIMConfig()
+	cfg.Enabled = true
+	g := NewGateway(cfg)
+	processor := &fakeInboundProcessor{events: make(chan IMEvent, 1)}
+	g.SetInboundProcessor(processor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := g.Subscribe(ctx)
+	if err := g.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	if err := g.Submit(ctx, IMEvent{ID: "wx-1", Platform: "wechat", Variant: "wechatbot", Text: "hello"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if got := waitLifecycleType(t, events, "inbound_received"); got.Message != "wx-1" {
+		t.Fatalf("received event = %+v, want wx-1", got)
+	}
+	waitLifecycleType(t, events, "inbound_processing")
+	waitLifecycleType(t, events, "inbound_ok")
+	select {
+	case got := <-processor.events:
+		if got.Platform != "wechat" || got.Text != "hello" {
+			t.Fatalf("processed event = %+v, want wechat hello", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("processor was not called")
+	}
 }
 
 func TestGatewayDispatchOutboundSendsThroughRegisteredRenderer(t *testing.T) {
@@ -303,5 +348,21 @@ func assertLifecycle(t *testing.T, ch <-chan LifecycleEvent, typ string) Lifecyc
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for %s", typ)
 		return LifecycleEvent{}
+	}
+}
+
+func waitLifecycleType(t *testing.T, ch <-chan LifecycleEvent, typ string) LifecycleEvent {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Type == typ {
+				return ev
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", typ)
+			return LifecycleEvent{}
+		}
 	}
 }

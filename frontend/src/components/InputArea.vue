@@ -22,7 +22,7 @@ import {
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
-  recoverMissingParts,
+  recoverMissingParts, currentPendingConfirm, submitToolConfirm,
 } from '../stores/chat'
 import { notifyManager } from '../utils/notify'
 
@@ -132,7 +132,13 @@ async function onChangePermissionLevel(val: string) {
       ...state.sessionMeta[state.currentID],
       permission_level: val,
     }
-  } catch {}
+    if ((val === 'auto' || val === 'full') && currentPendingConfirm.value) {
+      submitToolConfirm('once')
+      message.info('已按新的权限设置通过当前沙箱请求')
+    }
+  } catch (e: any) {
+    message.error(`权限更新失败：${e?.message || e}`)
+  }
 }
 
 function onToggleMute() {

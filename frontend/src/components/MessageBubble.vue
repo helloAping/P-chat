@@ -548,6 +548,39 @@ async function onCodeClick(e: Event) {
   }
 }
 
+async function onMarkdownClick(e: MouseEvent) {
+  const target = e.target
+  if (target instanceof Element) {
+    const anchor = target.closest<HTMLAnchorElement>('a[href]')
+    if (anchor) {
+      const href = normalizeExternalURL(anchor.getAttribute('href') || '')
+      if (href) {
+        e.preventDefault()
+        e.stopPropagation()
+        try {
+          await api.openExternalURL(href)
+        } catch (err: any) {
+          toast.error(`打开链接失败: ${err?.message || err}`)
+        }
+        return
+      }
+    }
+  }
+  await onCodeClick(e)
+}
+
+function normalizeExternalURL(href: string): string | null {
+  const raw = href.trim()
+  if (!/^https?:\/\//i.test(raw)) return null
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return parsed.href
+  } catch {
+    return null
+  }
+}
+
 // langExt maps common marked.js language class names to
 // their file extension.
 function langExt(lang: string): string {
@@ -1057,7 +1090,7 @@ function findPrecedingUserMessageId(): number {
             ref="mdBodyEl"
             class="md-body"
             v-html="userHtml"
-            @click="onCodeClick"
+            @click="onMarkdownClick"
           />
 
           <!-- Assistant: parts-driven render.
@@ -1089,7 +1122,7 @@ function findPrecedingUserMessageId(): number {
                   ref="mdBodyEl"
                   class="md-body"
                   v-html="renderMd(p.text || '')"
-                  @click="onCodeClick"
+                  @click="onMarkdownClick"
                 />
               </template>
             </template>
@@ -1098,7 +1131,7 @@ function findPrecedingUserMessageId(): number {
                 ref="mdBodyEl"
                 class="md-body"
                 v-html="userHtml"
-                @click="onCodeClick"
+                @click="onMarkdownClick"
               ></div>
             </template>
             <!-- Streaming placeholder: a blinking caret

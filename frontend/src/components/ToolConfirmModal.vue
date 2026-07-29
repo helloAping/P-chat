@@ -1,30 +1,13 @@
 <script setup lang="ts">
-// ToolConfirmModal — sandbox authorisation prompt.
-//
-// Replaces the inline NModal that used to live in App.vue:172.
-// Now the modal is a first-class component (alongside
-// QuestionModal and PlanReviewModal) and renders the new
-// 2026-07 ConfirmRequest fields: path class, resolved path,
-// risk level.
-//
-// Phase 1: 2 buttons (reject / allow once).
-// Phase 2: extends to 4 buttons (allow once / allow path /
-// allow session / reject) per the 2026-07 spec.
-
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { NModal, NButton, NSpace, NTag } from 'naive-ui'
 import {
   ShieldAlert, ShieldCheck, FolderOpen, Folder, Globe, Lock,
 } from './icons'
 import { currentPendingConfirm, submitToolConfirm } from '../stores/chat'
 
-interface Props {}
-defineProps<Props>()
+const argsExpanded = ref(false)
 
-// Path-class label and colour mapping. The 2026-07 spec
-// separates `external` (no project pinned) from `global`
-// (project set, path outside) — the user sees different
-// labels even though both end up as "Confirm".
 const pathClassMeta = computed(() => {
   const cls = currentPendingConfirm.value?.pathClass
   switch (cls) {
@@ -39,16 +22,12 @@ const pathClassMeta = computed(() => {
     case 'protected':
       return { label: '受保护', type: 'error' as const, Icon: Lock }
     case 'browser':
-      // BR-04: browser_* tools reuse resolvedPath for the page URL.
       return { label: '浏览器', type: 'warning' as const, Icon: Globe }
     default:
       return null
   }
 })
 
-// Risk-level colour drives the modal's title icon and the
-// primary button tone. `high` = destructive write / exec /
-// dangerous pattern → red. `low` = read → blue.
 const riskMeta = computed(() => {
   const r = currentPendingConfirm.value?.riskLevel
   switch (r) {
@@ -62,19 +41,11 @@ const riskMeta = computed(() => {
   }
 })
 
-// Title: tool name + short risk label, in the modal header.
 const titleText = computed(() => {
   const tool = currentPendingConfirm.value?.toolName
-  const r = riskMeta.value
-  return tool ? `沙箱请求：${tool}（${r.label}）` : '沙箱请求'
+  return tool ? `沙箱请求：${tool}（${riskMeta.value.label}）` : '沙箱请求'
 })
 
-// Shorten the args blob for the modal body. Long arg JSON
-// (e.g. write_file content) gets a "查看完整" toggle so the
-// user can verify the LLM isn't sneaking in something
-// unexpected.
-import { ref as vueRef } from 'vue'
-const argsExpanded = vueRef(false)
 const argsPreview = computed(() => {
   const args = currentPendingConfirm.value?.args || ''
   if (argsExpanded.value || args.length <= 240) return args
@@ -92,7 +63,6 @@ const argsPreview = computed(() => {
     :mask-closable="false"
   >
     <div class="tcm-body">
-      <!-- Top row: tool + risk + path class chips -->
       <div class="tcm-chips">
         <NTag :type="riskMeta.type" size="small" round>
           <template #icon><component :is="riskMeta.Icon" :size="12" /></template>
@@ -109,14 +79,11 @@ const argsPreview = computed(() => {
         </NTag>
       </div>
 
-      <!-- Resolved path (file tools) or page URL (browser tools, BR-04).
-           After resolveToProjectRoot + filepath.Clean for file tools. -->
       <div v-if="currentPendingConfirm?.resolvedPath" class="tcm-path">
         <span class="tcm-label">{{ currentPendingConfirm?.pathClass === 'browser' ? '目标页面' : '目标路径' }}</span>
         <code class="tcm-path-value">{{ currentPendingConfirm.resolvedPath }}</code>
       </div>
 
-      <!-- Args blob -->
       <div class="tcm-args">
         <span class="tcm-label">参数</span>
         <pre class="tcm-pre">{{ argsPreview }}</pre>
@@ -130,7 +97,6 @@ const argsPreview = computed(() => {
         </button>
       </div>
 
-      <!-- Reason (matched dangerous pattern / work_dir escape / etc.) -->
       <div v-if="currentPendingConfirm?.reason" class="tcm-reason">
         <span class="tcm-label">原因</span>
         <span class="tcm-reason-text">{{ currentPendingConfirm.reason }}</span>
@@ -139,26 +105,9 @@ const argsPreview = computed(() => {
 
     <template #footer>
       <NSpace justify="end">
-        <NButton @click="submitToolConfirm(false)">拒绝</NButton>
-        <!-- P2-4 dry-run UX note: we deliberately do
-             NOT add a "先干跑" button here. The confirm
-             modal is a yes/no gate for an EXECUTION
-             that the agent already committed to; adding
-             a third path would require either a new
-             server endpoint (re-running the tool out
-             of band) or a complex state machine to
-             re-submit the original LLM turn with
-             dry_run=true. Instead the user invokes
-             dry-run through a regular prompt: "干跑
-             shell_command X" — the LLM calls the
-             tool with dry_run=true in args, and the
-             ToolCallCard surfaces a "dry-run" chip
-             so the user can tell at a glance the
-             tool was NOT executed. The path from
-             "this looks dangerous" → "let me see
-             what it would do" is one prompt away
-             and doesn't require new server surface. -->
-        <NButton type="primary" @click="submitToolConfirm(true)">允许一次</NButton>
+        <NButton @click="submitToolConfirm('reject')">拒绝</NButton>
+        <NButton @click="submitToolConfirm('always')">始终允许</NButton>
+        <NButton type="primary" @click="submitToolConfirm('once')">允许一次</NButton>
       </NSpace>
     </template>
   </NModal>

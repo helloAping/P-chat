@@ -1854,31 +1854,41 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 									if sid, ok := tctx.Value(tool.SessionIDKey{}).(string); ok {
 										sessionID = sid
 									}
-									// Blocking send with a small timeout. The
-									// previous `default:` silently dropped
-									// the confirm event when the consumer
-									// was slow, and the user was left
-									// waiting for a UI that never
-									// appeared. If the consumer is gone
-									// (ctx cancelled), bail out.
-									select {
-									case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(cfm)}:
-									case <-time.After(5 * time.Second):
-										log.Printf("%s[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", trace.LogPrefix(toolCtx), sessionID)
-									case <-toolCtx.Done():
-										return
-									}
-									approved, cfmErr := tool.WaitForConfirm(toolCtx, sessionID, cfm)
-									if cfmErr != nil || !approved {
-										outcomes[i] = toolOutcome{
-											idx: i,
-											tc:  tc,
-											result: &tool.CallResult{
-												Content: "工具调用被用户拒绝",
-												IsError: true,
-											},
+									if tool.IsConfirmAllowed(sessionID, cfm) {
+										select {
+										case eventCh <- ChatStreamChunk{
+											Phase:   "system",
+											Message: fmt.Sprintf("[始终允许] %s", tc.Name),
+										}:
+										default:
 										}
-										return
+									} else {
+										// Blocking send with a small timeout. The
+										// previous `default:` silently dropped
+										// the confirm event when the consumer
+										// was slow, and the user was left
+										// waiting for a UI that never
+										// appeared. If the consumer is gone
+										// (ctx cancelled), bail out.
+										select {
+										case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(cfm)}:
+										case <-time.After(5 * time.Second):
+											log.Printf("%s[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", trace.LogPrefix(toolCtx), sessionID)
+										case <-toolCtx.Done():
+											return
+										}
+										approved, cfmErr := tool.WaitForConfirm(toolCtx, sessionID, cfm)
+										if cfmErr != nil || !approved {
+											outcomes[i] = toolOutcome{
+												idx: i,
+												tc:  tc,
+												result: &tool.CallResult{
+													Content: "工具调用被用户拒绝",
+													IsError: true,
+												},
+											}
+											return
+										}
 									}
 								}
 							}

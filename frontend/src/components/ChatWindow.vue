@@ -6,6 +6,7 @@ import MessageBubble from './MessageBubble.vue'
 import ContextInspectorDrawer from './ContextInspectorDrawer.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
+import QuestionModal from './QuestionModal.vue'
 // QuestionPanel removed in 2026-07-09 — it duplicated
 // QuestionModal's state (answers, multiAnswers) and created a
 // race where the user could submit via the inline panel while
@@ -366,6 +367,7 @@ function messageKey(m: any, i: number): string | number {
          that opens it lives in TopBar; this template
          just renders the panel. -->
     <ContextInspectorDrawer />
+    <QuestionModal />
 
     <!-- Plain scrollable container. We don't use NScrollbar
          here because its :native-scrollbar="false" path wraps

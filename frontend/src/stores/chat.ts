@@ -101,7 +101,7 @@ export const state = reactive({
   resolvedPath?: string
   pathClass?: string
   riskLevel?: string
-  resolve: (approved: boolean) => void
+  resolve: (action: api.ConfirmAction) => void
 }>>,
   pendingPlanText: {} as Record<string, string>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
@@ -389,7 +389,7 @@ export async function setActiveProject(path: string) {
     delete state.pendingQuestion[id]
   }
   for (const [id, items] of Object.entries(state.pendingConfirm)) {
-    for (const pc of items) pc.resolve(false)
+    for (const pc of items) pc.resolve('reject')
     delete state.pendingConfirm[id]
   }
   for (const [id, s] of Object.entries(state.streaming)) {
@@ -682,7 +682,7 @@ export async function deleteSessionById(id: string) {
   delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
-    for (const pc of cfms) pc.resolve(false)
+    for (const pc of cfms) pc.resolve('reject')
     delete state.pendingConfirm[id]
   }
   if (state.streaming[id]) {
@@ -1111,6 +1111,25 @@ function updateQuestionStatusInParts(
     updated++
   }
   return updated
+}
+
+function expirePendingQuestion(id: string) {
+  if (!state.pendingQuestion[id]) return
+  delete state.pendingQuestion[id]
+  const msgs = state.sessionMessages[id]
+  if (!msgs) return
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m.role !== 'assistant' || !m.parts) continue
+    let changed = false
+    walkParts(m.parts, (p: any) => {
+      if (p.kind !== 'question') return
+      if (p.question_status && p.question_status !== 'open') return
+      p.question_status = 'error'
+      changed = true
+    })
+    if (changed) return
+  }
 }
 
 // findOrCreateSubAgent locates the trailing sub_agent
@@ -1690,6 +1709,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         state.sessionWorking[id] = true
       } else if (ev.session_status === 'idle') {
         state.sessionWorking[id] = false
+        expirePendingQuestion(id)
       }
       break
     case 'done':
@@ -1876,7 +1896,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             path_class?: string
             risk_level?: string
           }
-          new Promise<boolean>((resolve) => {
+          new Promise<api.ConfirmAction>((resolve) => {
             if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
             state.pendingConfirm[id].push({
               toolName: cfm.tool_name,
@@ -1887,8 +1907,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
               riskLevel: cfm.risk_level,
               resolve,
             })
-          }).then((approved) => {
-            submitConfirmResponseInner(id, approved)
+          }).then((action) => {
+            submitConfirmResponseInner(id, action)
           })
           notifyManager.play('confirm')
           notifyManager.notify('沙箱请求', `批准 ${cfm.tool_name}?`)
@@ -1919,6 +1939,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         m.traceId = ev.trace_id
       }
       // 提示音：对话出错
+      expirePendingQuestion(id)
       notifyManager.play('error')
       break
   }
@@ -2205,6 +2226,7 @@ export async function loadContextInspector(sessionId: string): Promise<void> {
 }
 
 export function endStream(id: string) {
+  expirePendingQuestion(id)
   const msgs = state.sessionMessages[id]
   if (msgs) {
     const last = msgs[msgs.length - 1]
@@ -2482,20 +2504,20 @@ export function submitQuestionAnswer(answers: Record<string, string>) {
   }
 }
 
-async function submitConfirmResponseInner(id: string, approved: boolean) {
+async function submitConfirmResponseInner(id: string, action: api.ConfirmAction) {
   try {
-    await api.submitConfirmResponse(id, approved)
+    await api.submitConfirmResponse(id, action !== 'reject', action)
   } catch {
     // server already unblocked via resolve
   }
 }
 
-export function submitToolConfirm(approved: boolean) {
+export function submitToolConfirm(action: api.ConfirmAction) {
   const items = state.pendingConfirm[state.currentID]
   if (items && items.length > 0) {
     const pc = items.shift()!
     if (items.length === 0) delete state.pendingConfirm[state.currentID]
-    pc.resolve(approved)
+    pc.resolve(action)
   }
 }
 

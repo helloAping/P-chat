@@ -175,7 +175,7 @@ func (c WeChatQRClient) Start(ctx context.Context) (WeChatQRSession, error) {
 		data = raw
 	}
 	qrcode := firstString(data, "qrcode", "qr_code", "code")
-	img := firstString(data, "qrcode_img_content", "qr_url", "qrcode_url", "url")
+	img := normalizeWeChatQRAssetURL(firstString(data, "qrcode_img_content", "qr_url", "qrcode_url", "url"), c.baseURL())
 	qrData := firstString(data, "qr_data", "qrcode_content", "content")
 	if qrcode == "" && qrData == "" && img == "" {
 		return WeChatQRSession{}, errors.New("wechat qr response did not include qrcode")
@@ -331,4 +331,49 @@ func stringFromExtra(extra map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func normalizeWeChatQRAssetURL(raw, baseURL string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, "data:") || strings.HasPrefix(lower, "blob:") {
+		return raw
+	}
+	if looksLikeBase64Image(raw) {
+		return "data:image/png;base64," + raw
+	}
+	if u, err := url.Parse(raw); err == nil && u.IsAbs() {
+		return raw
+	}
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return raw
+	}
+	if strings.HasPrefix(raw, "/") {
+		return base + raw
+	}
+	return base + "/" + raw
+}
+
+func looksLikeBase64Image(raw string) bool {
+	if len(raw) < 128 {
+		return false
+	}
+	prefix := raw
+	if len(prefix) > 16 {
+		prefix = prefix[:16]
+	}
+	switch {
+	case strings.HasPrefix(prefix, "iVBORw0KGgo"):
+		return true
+	case strings.HasPrefix(prefix, "/9j/"):
+		return true
+	case strings.HasPrefix(prefix, "R0lGOD"):
+		return true
+	default:
+		return false
+	}
 }

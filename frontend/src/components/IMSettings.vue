@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  NButton, NCollapse, NCollapseItem, NInput, NModal, NSwitch, NTag, useMessage,
+  NButton, NCollapse, NCollapseItem, NInput, NModal, NQrCode, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import { Bot, Key, MessageSquare, RotateCw } from './icons'
 import * as api from '../api/client'
+import { hasWeChatQRPayload, resolveWeChatQRImageSource, resolveWeChatQRValue } from '../im/wechatQr'
 
 const message = useMessage()
 
@@ -24,6 +25,7 @@ const qqBotSecret = ref('')
 const showWechatQR = ref(false)
 const wechatQRLoading = ref(false)
 const wechatQRSession = ref<api.WeChatQRSession | null>(null)
+const wechatQRImageFailed = ref(false)
 const wechatQRError = ref('')
 const platformsText = ref('[]')
 const policiesText = ref('{}')
@@ -45,14 +47,11 @@ const healthByKey = computed(() => {
 const feishu = computed(() => findPlatform('feishu'))
 const wechat = computed(() => findPlatform('wechat'))
 const qq = computed(() => findPlatform('qq'))
-const wechatQRSource = computed(() => {
-  const active = wechatQRSession.value?.qr_url || wechatQRSession.value?.qr_data || ''
-  if (typeof active === 'string' && active) return active
-  const extra = wechat.value?.extra || {}
-  const raw = extra.qr_url || extra.qr_data || extra.qrcode || ''
-  return typeof raw === 'string' ? raw : ''
-})
-const wechatQRStatus = computed(() => wechatQRSession.value?.status || (wechatQRSource.value ? 'waiting' : 'idle'))
+const wechatQRSource = computed(() => resolveWeChatQRImageSource(wechatQRSession.value))
+const wechatQRValue = computed(() => resolveWeChatQRValue(wechatQRSession.value))
+const wechatQRImageSource = computed(() => wechatQRImageFailed.value ? '' : wechatQRSource.value)
+const wechatQRPayloadAvailable = computed(() => hasWeChatQRPayload(wechatQRSession.value))
+const wechatQRStatus = computed(() => wechatQRSession.value?.status || (wechatQRImageSource.value || wechatQRValue.value ? 'waiting' : 'idle'))
 const wechatQRStatusText = computed(() => {
   switch (wechatQRStatus.value) {
     case 'waiting': return '请使用微信扫码'
@@ -61,11 +60,13 @@ const wechatQRStatusText = computed(() => {
     case 'expired': return '二维码已过期'
     case 'canceled': return '扫码已取消'
     case 'unavailable': return '扫码服务不可用'
-    default: return wechatQRSource.value ? '请使用微信扫码' : '准备二维码'
+    default: return wechatQRImageSource.value || wechatQRValue.value ? '请使用微信扫码' : '准备二维码'
   }
 })
 const wechatQRHint = computed(() => {
   if (wechatQRError.value) return wechatQRError.value
+  if (wechatQRValue.value && !wechatQRSource.value) return '已在本地生成二维码，使用微信扫码即可连接。'
+  if (wechatQRPayloadAvailable.value && !wechatQRSource.value) return '微信返回的二维码内容暂时不可显示，请点击重新获取。'
   switch (wechatQRStatus.value) {
     case 'waiting': return '打开微信扫码登录，扫码后请在手机上确认。'
     case 'scanned': return '请在手机微信中确认登录，确认后这里会自动完成连接。'
@@ -75,6 +76,11 @@ const wechatQRHint = computed(() => {
     case 'unavailable': return wechatQRSession.value?.message || '微信扫码服务暂时无法访问，请检查网络后重试。'
     default: return '点击获取二维码后，使用微信扫码即可连接。'
   }
+})
+const wechatQRPlaceholderText = computed(() => {
+  if (wechatQRLoading.value) return '正在获取二维码'
+  if (wechatQRPayloadAvailable.value && !wechatQRSource.value) return '二维码内容不可用'
+  return '等待微信二维码'
 })
 
 function platformKey(type: string, variant?: string) {
@@ -362,6 +368,7 @@ async function startWechatQR() {
   try {
     const session = await api.startWeChatQR()
     wechatQRSession.value = session
+    wechatQRImageFailed.value = false
     if (session.status === 'unavailable') {
       wechatQRError.value = session.message || '微信扫码服务暂时无法访问，请检查网络后重试'
       return
@@ -433,7 +440,10 @@ function friendlyAPIError(err: any) {
 }
 
 function handleWechatQRImageError() {
-  wechatQRError.value = '二维码图片加载失败，请重新获取二维码'
+  wechatQRImageFailed.value = true
+  if (!wechatQRValue.value) {
+    wechatQRError.value = '二维码图片加载失败，请重新获取二维码'
+  }
 }
 
 async function testPlatform(p: api.IMPlatformConfig) {
@@ -713,10 +723,19 @@ onBeforeUnmount(() => {
     >
       <div class="wechat-qr-panel">
         <div class="wechat-qr-box">
-          <img v-if="wechatQRSource" :src="wechatQRSource" alt="微信登录二维码" @error="handleWechatQRImageError" />
+          <img v-if="wechatQRImageSource" :src="wechatQRImageSource" alt="微信登录二维码" @error="handleWechatQRImageError" />
+          <NQrCode
+            v-else-if="wechatQRValue"
+            class="wechat-qr-local"
+            :value="wechatQRValue"
+            :size="196"
+            :padding="12"
+            type="svg"
+            error-correction-level="M"
+          />
           <div v-else class="wechat-qr-placeholder">
             <MessageSquare :size="40" />
-            <span>{{ wechatQRLoading ? '正在获取二维码' : '等待微信二维码' }}</span>
+            <span>{{ wechatQRPlaceholderText }}</span>
           </div>
         </div>
         <div class="wechat-qr-status">
@@ -959,6 +978,10 @@ onBeforeUnmount(() => {
   height: 100%;
   object-fit: contain;
   background: #ffffff;
+}
+.wechat-qr-local {
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
 }
 .wechat-qr-placeholder {
   display: flex;

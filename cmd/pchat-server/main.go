@@ -252,6 +252,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	imGateway := im.NewGateway(cfg.IM)
 	registerIMAdapters(imGateway, cfg.IM)
 	srv.SetIMGateway(imGateway)
+	imGateway.SetInboundProcessor(srv.Handler())
 	if cfg.IM.Enabled {
 		if err := imGateway.Start(context.Background()); err != nil {
 			log.Printf("[im] gateway start failed: %v", err)
@@ -480,4 +481,5 @@ func registerIMAdapters(gateway *im.Gateway, cfg config.IMConfig) {
 			gateway.RegisterAdapter(feishu.NewAdapter(platform))
 		}
 	}
+	im.RegisterConfiguredWeChatAdapters(gateway, cfg)
 }

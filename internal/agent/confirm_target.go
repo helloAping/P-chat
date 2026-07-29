@@ -57,7 +57,7 @@ type sandboxForConfirm interface {
 // prepended for relative inputs and `..` segments resolved).
 func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfirm) (confirmTarget, bool) {
 	switch toolName {
-	case "exec_command":
+	case "exec_command", "start_process":
 		var ea struct {
 			Command string `json:"command"`
 			WorkDir string `json:"work_dir,omitempty"`

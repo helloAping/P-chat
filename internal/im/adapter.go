@@ -20,6 +20,11 @@ type Adapter interface {
 
 // MarkdownDialect 描述平台支持的 Markdown 方言。
 // MarkdownDialect describes the Markdown dialect a platform supports.
+// InboundProcessor consumes normalized inbound IM messages.
+type InboundProcessor interface {
+	ProcessIMEvent(ctx context.Context, ev IMEvent) error
+}
+
 type MarkdownDialect = outbound.MarkdownDialect
 
 const (

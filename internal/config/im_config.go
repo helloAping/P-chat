@@ -262,6 +262,9 @@ func (c *IMConfig) Normalize() {
 		if c.Platforms[i].Type == "feishu" && c.Platforms[i].Variant == "" {
 			c.Platforms[i].Variant = "bot"
 		}
+		if c.Platforms[i].Type == "wechat" && c.Platforms[i].Variant == "" {
+			c.Platforms[i].Variant = "wechatbot"
+		}
 	}
 }
 

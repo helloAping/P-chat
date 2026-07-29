@@ -562,7 +562,7 @@ func StringEnumProp(description string, values ...string) map[string]any {
 func RegisterBuiltin(r *Registry) {
 	r.Register(Tool{
 		Name:        "exec_command",
-		Description: "Execute a shell command on the local system. Returns stdout+stderr combined. Use for running scripts, system operations, and one-off commands.",
+		Description: "Execute a shell command on the local system. Returns stdout+stderr combined. Use for one-off commands. Long-running dev servers are started in the background and return a process_id.",
 		Parameters: ObjectSchema(map[string]any{
 			"command":  StringProp("The shell command to execute (cmd.exe syntax on Windows)"),
 			"work_dir": StringProp("Optional working directory for the command"),
@@ -573,9 +573,42 @@ func RegisterBuiltin(r *Registry) {
 			// when the user says "试一下" / "preview";
 			// the front-end "干跑" button also sets
 			// it on a direct call.
-			"dry_run": BoolProp("If true, return a preview of what would execute without actually running the command. Sandbox check still applies."),
+			"dry_run":    BoolProp("If true, return a preview of what would execute without actually running the command. Sandbox check still applies."),
+			"background": BoolProp("If true, start the command as a managed background process and return a process_id immediately."),
 		}, []string{"command"}),
 	}, handleExecCommand)
+
+	r.Register(Tool{
+		Name:        "start_process",
+		Description: "Start a long-running local command in the background. Returns a managed process_id. Use for dev servers, watchers, Java services, and Node servers.",
+		Parameters: ObjectSchema(map[string]any{
+			"command":  StringProp("The shell command to execute in the background"),
+			"work_dir": StringProp("Optional working directory for the command"),
+		}, []string{"command"}),
+	}, handleStartProcess)
+
+	r.Register(Tool{
+		Name:        "read_process_output",
+		Description: "Read buffered stdout/stderr from a process started by start_process or a backgrounded exec_command.",
+		Parameters: ObjectSchema(map[string]any{
+			"process_id": StringProp("The managed process id returned by start_process or exec_command"),
+			"max_bytes":  map[string]any{"type": "integer", "description": "Optional maximum bytes to return from the tail of the buffered output"},
+		}, []string{"process_id"}),
+	}, handleReadProcessOutput)
+
+	r.Register(Tool{
+		Name:        "stop_process",
+		Description: "Stop a managed background process previously started by P-Chat.",
+		Parameters: ObjectSchema(map[string]any{
+			"process_id": StringProp("The managed process id to stop"),
+		}, []string{"process_id"}),
+	}, handleStopProcess)
+
+	r.Register(Tool{
+		Name:        "list_processes",
+		Description: "List background processes started and managed by P-Chat in this app session.",
+		Parameters:  ObjectSchema(map[string]any{}, nil),
+	}, handleListProcesses)
 
 	r.Register(Tool{
 		Name: "read_file",
@@ -685,7 +718,8 @@ type execArgs struct {
 	// the user / LLM can see what would happen.
 	// Always safe to flip on — it just makes the
 	// tool a strict subset of its real behaviour.
-	DryRun bool `json:"dry_run,omitempty"`
+	DryRun     bool `json:"dry_run,omitempty"`
+	Background bool `json:"background,omitempty"`
 }
 
 func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, error) {
@@ -753,34 +787,68 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 		return &CallResult{Content: preview}, nil
 	}
 
-	cmd := exec.CommandContext(ctx, "cmd", "/C", a.Command)
-	root := projectRootFromCtx(ctx)
-	if a.WorkDir != "" {
-		if filepath.IsAbs(a.WorkDir) || root == "" {
-			cmd.Dir = a.WorkDir
-		} else {
-			cmd.Dir = filepath.Join(root, a.WorkDir)
-		}
-	} else if root != "" {
-		cmd.Dir = root
+	if a.Background || looksPersistentCommand(a.Command) {
+		return startManagedProcess(ctx, a.Command, a.WorkDir)
 	}
 
-	// PowerShell on Windows: bypass cmd /C to avoid:
-	// 1. cmd.exe intercepting pipes (|) inside -Command "..."
-	// 2. GBK output encoding (PowerShell 5.1 default on zh-CN)
-	//
-	// Original: powershell -NoProfile -Command "Get-Content ... | Select-Object ..."
-	//   �?cmd /C strips outer quotes �?| interpreted by cmd.exe �?parser error
-	//
-	// Fix: run powershell.exe directly with [Console]::OutputEncoding = UTF-8.
-	//
-	// Detection: scan ALL tokens for powershell|pwsh, not just the
-	// first one. The LLM can bypass the prefix-only check by writing
-	// "cmd /C powershell ..." or prepending whitespace, which would
-	// otherwise fall through to `cmd /C powershell -Command "..."`
-	// where cmd.exe misinterprets the inner quotes/pipes.
+	cmd, _ := buildExecCommand(ctx, a.Command, a.WorkDir, projectRootFromCtx(ctx))
+	out, err := readLimitedOutput(cmd)
+	if err != nil {
+		content := strings.TrimRight(string(out), "\r\n")
+		if content != "" {
+			content += "\n"
+		}
+		content += err.Error()
+
+		// opcode-style actionable hints: when a command fails
+		// because it doesn't exist on this platform, tell the
+		// LLM about alternatives so it can recover.
+		if runtime.GOOS == "windows" {
+			switch {
+			case strings.Contains(err.Error(), "is not recognized"):
+				content += "\nHint: This command doesn't exist on Windows. Use findstr (not grep), dir (not ls), type (not cat), or pwsh -NoProfile -Command \"...\" for PowerShell scripts."
+			case strings.Contains(err.Error(), "The system cannot find the file"):
+				content += "\nHint: The executable was not found. Check the command name - on Windows the available commands are: dir, findstr, type, copy, move, del, mkdir, cd, set, pwsh."
+			}
+		} else {
+			if strings.Contains(err.Error(), "executable file not found") || strings.Contains(err.Error(), "command not found") {
+				content += "\nHint: The command was not found. Try installing it or use an alternative."
+			}
+		}
+		return &CallResult{Content: content, IsError: true}, nil
+	}
+	return &CallResult{Content: string(out)}, nil
+}
+
+func buildExecCommand(ctx context.Context, command, workDir, root string) (*exec.Cmd, string) {
+	newCmd := func(name string, args ...string) *exec.Cmd {
+		if ctx == nil {
+			return exec.Command(name, args...)
+		}
+		return exec.CommandContext(ctx, name, args...)
+	}
+	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		trimmed := strings.TrimSpace(a.Command)
+		cmd = newCmd("cmd", "/C", command)
+	} else {
+		cmd = newCmd("sh", "-c", command)
+	}
+	resolvedWorkDir := ""
+	if workDir != "" {
+		if filepath.IsAbs(workDir) || root == "" {
+			resolvedWorkDir = workDir
+		} else {
+			resolvedWorkDir = filepath.Join(root, workDir)
+		}
+	} else if root != "" {
+		resolvedWorkDir = root
+	}
+	if resolvedWorkDir != "" {
+		cmd.Dir = resolvedWorkDir
+	}
+
+	if runtime.GOOS == "windows" {
+		trimmed := strings.TrimSpace(command)
 		tokens := strings.Fields(trimmed)
 		var psIdx int = -1
 		var psExe string
@@ -811,37 +879,14 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 				script = fmt.Sprintf("[Console]::OutputEncoding = [Text.Encoding]::UTF8; %s", script)
 				args := append([]string{}, strings.Fields(flags)...)
 				args = append(args, "-Command", script)
-				cmd = exec.CommandContext(ctx, psExe, args...)
+				cmd = newCmd(psExe, args...)
+				if resolvedWorkDir != "" {
+					cmd.Dir = resolvedWorkDir
+				}
 			}
 		}
 	}
-
-	out, err := readLimitedOutput(cmd)
-	if err != nil {
-		content := strings.TrimRight(string(out), "\r\n")
-		if content != "" {
-			content += "\n"
-		}
-		content += err.Error()
-
-		// opcode-style actionable hints: when a command fails
-		// because it doesn't exist on this platform, tell the
-		// LLM about alternatives so it can recover.
-		if runtime.GOOS == "windows" {
-			switch {
-			case strings.Contains(err.Error(), "is not recognized"):
-				content += "\nHint: This command doesn't exist on Windows. Use findstr (not grep), dir (not ls), type (not cat), or pwsh -NoProfile -Command \"...\" for PowerShell scripts."
-			case strings.Contains(err.Error(), "The system cannot find the file"):
-				content += "\nHint: The executable was not found. Check the command name �?on Windows the available commands are: dir, findstr, type, copy, move, del, mkdir, cd, set, pwsh."
-			}
-		} else {
-			if strings.Contains(err.Error(), "executable file not found") || strings.Contains(err.Error(), "command not found") {
-				content += "\nHint: The command was not found. Try installing it or use an alternative."
-			}
-		}
-		return &CallResult{Content: content, IsError: true}, nil
-	}
-	return &CallResult{Content: string(out)}, nil
+	return cmd, resolvedWorkDir
 }
 
 const maxExecReadSize = 256 * 1024

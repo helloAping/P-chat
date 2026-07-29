@@ -68,6 +68,7 @@ func (h *Handler) UpdateIMConfig(c *gin.Context) {
 	}
 	h.reloadAfterConfigChange()
 	if h.imGateway != nil {
+		im.RegisterConfiguredWeChatAdapters(h.imGateway, updated.IM)
 		if err := h.imGateway.Reconfigure(c.Request.Context(), updated.IM); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -196,7 +197,7 @@ func (h *Handler) persistWeChatCredential(cred im.WeChatCredential) error {
 		next.Platforms = append(next.Platforms, config.IMPlatformConfig{
 			Type:    "wechat",
 			Variant: "wechatbot",
-			Mode:    "websocket",
+			Mode:    "polling",
 		})
 		idx = len(next.Platforms) - 1
 	}
@@ -206,7 +207,7 @@ func (h *Handler) persistWeChatCredential(cred im.WeChatCredential) error {
 		platform.Variant = "wechatbot"
 	}
 	if platform.Mode == "" {
-		platform.Mode = "websocket"
+		platform.Mode = "polling"
 	}
 	platform.Enabled = true
 	platform.Token = cred.Token
@@ -233,6 +234,7 @@ func (h *Handler) persistWeChatCredential(cred im.WeChatCredential) error {
 	}
 	h.reloadAfterConfigChange()
 	if h.imGateway != nil {
+		im.RegisterConfiguredWeChatAdapters(h.imGateway, updated.IM)
 		if err := h.imGateway.Reconfigure(context.Background(), updated.IM); err != nil {
 			return err
 		}
@@ -254,7 +256,7 @@ func findIMPlatform(cfg config.IMConfig, platformType, fallbackVariant string) c
 		Type:           platformType,
 		Variant:        fallbackVariant,
 		Enabled:        true,
-		Mode:           "websocket",
+		Mode:           "polling",
 		AllowedSenders: []string{"*"},
 	}
 }

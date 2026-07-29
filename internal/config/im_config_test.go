@@ -60,6 +60,12 @@ func TestIMConfigNormalize(t *testing.T) {
 	if cfg.Platforms[0].Variant != "bot" {
 		t.Fatalf("feishu variant = %q, want bot", cfg.Platforms[0].Variant)
 	}
+
+	cfg = IMConfig{Platforms: []IMPlatformConfig{{Type: "wechat", Enabled: true}}}
+	cfg.Normalize()
+	if cfg.Platforms[0].Variant != "wechatbot" {
+		t.Fatalf("wechat variant = %q, want wechatbot", cfg.Platforms[0].Variant)
+	}
 }
 
 func TestUpdateIMConfigPatchPreservesDefaults(t *testing.T) {

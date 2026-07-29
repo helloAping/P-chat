@@ -50,6 +50,7 @@ type Gateway struct {
 	factories map[string]RendererFactory
 	generated map[string]OutboundRenderer
 	dispatch  map[string]*outbound.Dispatcher
+	processor InboundProcessor
 	in        chan IMEvent
 	subs      map[chan LifecycleEvent]struct{}
 	ctx       context.Context
@@ -119,6 +120,15 @@ func (g *Gateway) RegisterRendererFactory(platform string, factory RendererFacto
 }
 
 // UpdateConfig 更新 Gateway 持有的 IM 配置。
+// UpdateConfig updates the IM config held by the Gateway.
+// SetInboundProcessor 挂载 IM 入站消息处理器。
+// SetInboundProcessor wires the normalized inbound message processor.
+func (g *Gateway) SetInboundProcessor(processor InboundProcessor) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.processor = processor
+}
+
 // UpdateConfig updates the IM config held by the Gateway.
 func (g *Gateway) UpdateConfig(cfg config.IMConfig) {
 	cfg.Normalize()
@@ -235,8 +245,39 @@ func (g *Gateway) run(ctx context.Context) {
 				Variant:  ev.Variant,
 				Message:  ev.ID,
 			})
+			g.mu.RLock()
+			processor := g.processor
+			g.mu.RUnlock()
+			if processor != nil {
+				go g.processInbound(ctx, processor, ev)
+			}
 		}
 	}
+}
+
+func (g *Gateway) processInbound(ctx context.Context, processor InboundProcessor, ev IMEvent) {
+	g.emit(LifecycleEvent{
+		Type:     "inbound_processing",
+		Platform: ev.Platform,
+		Variant:  ev.Variant,
+		Message:  ev.ID,
+	})
+	if err := processor.ProcessIMEvent(ctx, ev); err != nil {
+		g.emit(LifecycleEvent{
+			Type:     "inbound_error",
+			Platform: ev.Platform,
+			Variant:  ev.Variant,
+			Message:  ev.ID,
+			Error:    err.Error(),
+		})
+		return
+	}
+	g.emit(LifecycleEvent{
+		Type:     "inbound_ok",
+		Platform: ev.Platform,
+		Variant:  ev.Variant,
+		Message:  ev.ID,
+	})
 }
 
 // Stop 停止所有 adapter。

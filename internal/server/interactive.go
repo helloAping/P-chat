@@ -51,7 +51,9 @@ func (h *Handler) CompressConversation(c *gin.Context) {
 
 func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	id := c.Param("id")
-	var req struct{ Level string `json:"level"` }
+	var req struct {
+		Level string `json:"level"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -67,7 +69,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
@@ -84,7 +86,9 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
 		return
 	}
-	var body struct{ Content string `json:"content"` }
+	var body struct {
+		Content string `json:"content"`
+	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -159,13 +163,14 @@ func (h *Handler) QuestionResponse(c *gin.Context) {
 func (h *Handler) ConfirmResponse(c *gin.Context) {
 	id := c.Param("id")
 	var body struct {
-		Approved bool `json:"approved"`
+		Approved bool   `json:"approved"`
+		Action   string `json:"action,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !tool.SubmitConfirm(id, body.Approved) {
+	if !tool.SubmitConfirmResponse(id, tool.ConfirmResponse{Approved: body.Approved, Action: body.Action}) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no pending confirm for this session"})
 		return
 	}

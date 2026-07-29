@@ -39,3 +39,25 @@ func TestWeChatQRStartUsesOpenClawEndpoint(t *testing.T) {
 		t.Fatalf("session = %+v, want qr code and image", session)
 	}
 }
+
+func TestNormalizeWeChatQRAssetURL(t *testing.T) {
+	rawPNG := "iVBORw0KGgo" + strings.Repeat("A", 128)
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "data uri", raw: "data:image/png;base64,abc", want: "data:image/png;base64,abc"},
+		{name: "absolute url", raw: "https://weixin.qq.com/x/abc", want: "https://weixin.qq.com/x/abc"},
+		{name: "absolute path", raw: "/x/abc", want: "https://ilinkai.weixin.qq.com/x/abc"},
+		{name: "relative path", raw: "x/abc", want: "https://ilinkai.weixin.qq.com/x/abc"},
+		{name: "bare png base64", raw: rawPNG, want: "data:image/png;base64," + rawPNG},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeWeChatQRAssetURL(tt.raw, defaultWeChatQRBaseURL); got != tt.want {
+				t.Fatalf("normalizeWeChatQRAssetURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

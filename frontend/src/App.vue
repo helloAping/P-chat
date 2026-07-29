@@ -21,10 +21,9 @@ import TopBar from './components/TopBar.vue'
 import AppSettingsModal from './components/AppSettingsModal.vue'
 import ImageLightbox from './components/ImageLightbox.vue'
 import PlanReviewModal from './components/PlanReviewModal.vue'
-import QuestionModal from './components/QuestionModal.vue'
 import ToolConfirmModal from './components/ToolConfirmModal.vue'
 import CloseConfirmModal from './components/CloseConfirmModal.vue'
-import { state, loadSessions, loadProviders, loadProjects, currentPendingQuestion } from './stores/chat'
+import { loadSessions, loadProviders, loadProjects } from './stores/chat'
 import { setupTrayEventListeners } from './utils/trayEvents'
 
 const showAppSettings = ref(false)
@@ -183,7 +182,6 @@ onUnmounted(() => {
             />
             <ToolConfirmModal />
             <PlanReviewModal />
-            <QuestionModal />
             <CloseConfirmModal />
             </div>
         </NNotificationProvider>

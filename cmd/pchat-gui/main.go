@@ -233,6 +233,13 @@ func (a *App) OpenTerminal(path string) {
 	}
 }
 
+// OpenURL opens an http(s) URL in the user's default browser.
+func (a *App) OpenURL(rawURL string) {
+	if err := openExternalURL(rawURL); err != nil {
+		log.Printf("OpenURL %q: %v", rawURL, err)
+	}
+}
+
 // extractTraceID pulls the optional `trace_id` field out of a
 // /sessions/:id/messages body JSON. The Wails binding can't add
 // arbitrary request headers from JS, so the webview inlines the
@@ -428,6 +435,32 @@ func openTerminal(path string) error {
 	default:
 		return fmt.Errorf("terminal not supported on %s", runtime.GOOS)
 	}
+}
+
+// openExternalURL delegates http(s) links to the OS default browser.
+func openExternalURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported url scheme: %s", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("missing url host")
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
+	case "darwin":
+		cmd = exec.Command("open", rawURL)
+	default:
+		cmd = exec.Command("xdg-open", rawURL)
+	}
+	hideChildConsole(cmd)
+	return cmd.Start()
 }
 
 func writeLoading(w http.ResponseWriter) {

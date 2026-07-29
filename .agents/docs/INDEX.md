@@ -25,6 +25,7 @@
 | 修改沙箱/安全检查 | [infrastructure.md](infrastructure.md) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
+| **修改 IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [**im.md**](im.md) | [server.md](server.md), [config.md](config.md), [agent.md](agent.md), [实现计划](../../docs/plans/im-bridge-plan.md) |
 | 回答用户“agent 功能怎么用 / GUI 怎么操作” | [../../README.md](../../README.md)「GUI 操作入口速查 / 常见问题」 | agent.md, tool.md, frontend.md |
 | 查看当前项目现状与可做事项 | [../../docs/feature-opportunities.md](../../docs/feature-opportunities.md) | — |
 | **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |
@@ -50,6 +51,7 @@ P-Chat 项目
 │   ├── subagent/     → 请读 [subagent.md](subagent.md)
 │   ├── config/       → 请读 [config.md](config.md)
 │   ├── cli/          → 请读 [cli.md](cli.md)
+│   ├── im/           → 请读 [im.md](im.md)   # IM 桥接 Gateway（飞书 / TG / 企微 / QQ / 微信）
 │   └── 其他工具模块   → 请读 [infrastructure.md](infrastructure.md)
 │       ├── sandbox/  → 命令/文件写入安全检查
 │       ├── skill/    → Skill 定义与安装
