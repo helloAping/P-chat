@@ -23,6 +23,8 @@ func pickFolderWindows() (string, error) {
 	// Use PowerShell to open the native .NET FolderBrowserDialog.
 	// The script writes the selected path to stdout; errors go to stderr.
 	script := `
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
 $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
 $dlg.Description = "选择项目目录"

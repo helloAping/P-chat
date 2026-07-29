@@ -67,6 +67,8 @@ const dialog = useDialog()
 const showAddProject = ref(false)
 const newProjectName = ref('')
 const newProjectPath = ref('')
+const projectNameError = ref('')
+const projectPathError = ref('')
 const showConfirmDeleteProject = ref(false)
 const showAbout = ref(false)
 const showRename = ref(false)
@@ -243,6 +245,15 @@ function doSearch() {
 watch(searchQuery, () => {
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(doSearch, 300)
+})
+
+watch(showAddProject, (show) => {
+  if (!show) {
+    newProjectName.value = ''
+    newProjectPath.value = ''
+    projectNameError.value = ''
+    projectPathError.value = ''
+  }
 })
 
 function clearSearch() {
@@ -548,7 +559,7 @@ async function onProjectChange(path: string) {
 }
 
 async function onAddProject() {
-  if (!newProjectName.value.trim() || !newProjectPath.value.trim()) return
+  if (!validateProjectForm()) return
   try {
     await api.addProject(newProjectName.value.trim(), newProjectPath.value.trim())
     await loadProjects()
@@ -557,7 +568,19 @@ async function onAddProject() {
     newProjectName.value = ''
     newProjectPath.value = ''
   } catch (e: any) {
-    message.error(e.message || '添加失败')
+    const raw = e.message || '添加失败'
+    if (raw.includes('already exists')) {
+      projectPathError.value = '该目录已经在项目列表中'
+      message.warning(projectPathError.value)
+    } else if (raw.includes('absolute')) {
+      projectPathError.value = '请输入绝对路径'
+      message.warning(projectPathError.value)
+    } else if (raw.includes('existing directory')) {
+      projectPathError.value = '项目目录不存在或不是文件夹'
+      message.warning(projectPathError.value)
+    } else {
+      message.error(raw)
+    }
   }
 }
 
@@ -566,10 +589,62 @@ async function pickDirectory() {
     const { path } = await api.pickFolder()
     if (path) {
       newProjectPath.value = path
+      projectPathError.value = ''
+      if (!newProjectName.value.trim()) {
+        newProjectName.value = basenameFromPath(path)
+        projectNameError.value = ''
+      }
     }
   } catch (e: any) {
     message.error(e.message || '选取目录失败')
   }
+}
+
+function validateProjectForm() {
+  const name = newProjectName.value.trim()
+  const path = newProjectPath.value.trim()
+  projectNameError.value = ''
+  projectPathError.value = ''
+  if (!name) {
+    projectNameError.value = '项目名称必填'
+  }
+  if (!path) {
+    projectPathError.value = '项目目录必填'
+  } else if (!isAbsolutePath(path)) {
+    projectPathError.value = '请输入绝对路径'
+  } else if (state.projects.some(p => sameProjectPath(p.path, path))) {
+    projectPathError.value = '该目录已经在项目列表中'
+  }
+  if (projectNameError.value || projectPathError.value) {
+    message.warning(projectNameError.value || projectPathError.value)
+    return false
+  }
+  return true
+}
+
+function isAbsolutePath(path: string) {
+  const value = path.trim()
+  return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\') || value.startsWith('/')
+}
+
+function normalizeProjectPath(path: string) {
+  return path.trim().replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase()
+}
+
+function sameProjectPath(a: string, b: string) {
+  return normalizeProjectPath(a) === normalizeProjectPath(b)
+}
+
+function basenameFromPath(path: string) {
+  const parts = path.trim().split(/[\\/]+/).filter(Boolean)
+  return parts[parts.length - 1] || '新项目'
+}
+
+function compactProjectPath(path: string, maxSegments = 3) {
+  const value = path.trim()
+  const parts = value.split(/[\\/]+/).filter(Boolean)
+  if (parts.length <= maxSegments) return value
+  return `...\\${parts.slice(-maxSegments).join('\\')}`
 }
 
 async function onRemoveProject(path: string) {
@@ -589,6 +664,7 @@ const projectOptions = computed<SelectOption[]>(() => [
   {
     label: '全局',
     value: '',
+    path: '',
     renderLabel: (option: SelectOption) =>
       h('span', { class: 'project-option' }, [
         h(Globe, { size: 14, class: 'project-option-icon' }),
@@ -596,12 +672,17 @@ const projectOptions = computed<SelectOption[]>(() => [
       ]),
   },
   ...state.projects.map(p => ({
-    label: p.name,
+    label: `${p.name} · ${compactProjectPath(p.path, 2)}`,
     value: p.path,
+    name: p.name,
+    path: p.path,
     renderLabel: (option: SelectOption) =>
-      h('span', { class: 'project-option' }, [
+      h('span', { class: 'project-option project-option--stacked', title: option.path as string }, [
         h(Folder, { size: 14, class: 'project-option-icon' }),
-        option.label as string,
+        h('span', { class: 'project-option-copy' }, [
+          h('span', { class: 'project-option-name' }, option.name as string),
+          h('span', { class: 'project-option-path' }, option.path as string),
+        ]),
       ]),
   })),
 ])
@@ -825,12 +906,25 @@ onMounted(() => {
     >
       <div class="add-project-form">
         <label>项目名称</label>
-        <NInput v-model:value="newProjectName" placeholder="例如：我的项目" />
+        <NInput
+          v-model:value="newProjectName"
+          placeholder="例如：我的项目"
+          :status="projectNameError ? 'error' : undefined"
+          @update:value="projectNameError = ''"
+        />
+        <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
         <label style="margin-top: 12px">项目目录</label>
         <div class="path-row">
-          <NInput v-model:value="newProjectPath" placeholder="例如：D:\projects\my-app" style="flex:1" />
+          <NInput
+            v-model:value="newProjectPath"
+            placeholder="例如：D:\projects\my-app"
+            style="flex:1"
+            :status="projectPathError ? 'error' : undefined"
+            @update:value="projectPathError = ''"
+          />
           <NButton size="small" @click="pickDirectory" title="选择目录">浏览</NButton>
         </div>
+        <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
       </div>
       <template #footer>
         <NButton size="small" @click="showAddProject = false">取消</NButton>
@@ -1204,6 +1298,12 @@ onMounted(() => {
   font-weight: 500;
 }
 .path-row { display: flex; gap: 8px; align-items: center; }
+.field-error {
+  margin: 5px 0 0;
+  color: var(--error-500);
+  font-size: 12px;
+  line-height: 1.35;
+}
 .about-body { padding: 4px 0; }
 .about-name { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
 .about-version { font-size: 13px; color: var(--text-tertiary); margin: 0 0 12px; }
@@ -1232,9 +1332,40 @@ onMounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 .project-option-icon {
   color: var(--text-tertiary);
   flex-shrink: 0;
+}
+.project-option--stacked {
+  align-items: flex-start;
+  width: 100%;
+}
+.project-option-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.project-option-name {
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-option-path {
+  min-width: 0;
+  max-width: 230px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

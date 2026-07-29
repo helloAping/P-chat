@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/p-chat/pchat/internal/config"
 )
@@ -124,5 +127,71 @@ func TestWeChatAdapterSendUsesPersistedContextToken(t *testing.T) {
 	textItem, _ := item["text_item"].(map[string]any)
 	if textItem["text"] != "reply text" {
 		t.Fatalf("text item = %#v, want reply text", textItem)
+	}
+}
+
+func TestWeChatAdapterPollLoopReadsDataWrappedMessages(t *testing.T) {
+	var updatesCalled bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case wechatNotifyStartPath, wechatNotifyStopPath:
+			_, _ = w.Write([]byte(`{"ret":0}`))
+		case wechatLongPollPath:
+			updatesCalled = true
+			_, _ = w.Write([]byte(`{
+				"ret": 0,
+				"data": {
+					"get_updates_buf": "cursor-1",
+					"msgs": [
+						{
+							"msg": {
+								"msg_id": "m-data-1",
+								"from_user_id": "user-1",
+								"context_token": "ctx-1",
+								"item_list": [
+									{"type": 1, "text_item": {"text": "hello from data wrapper"}}
+								]
+							}
+						}
+					]
+				}
+			}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewWeChatAdapter(config.IMPlatformConfig{
+		Type:     "wechat",
+		Variant:  "wechatbot",
+		Enabled:  true,
+		Token:    "token-1",
+		Endpoint: srv.URL,
+	})
+	adapter.statePath = filepath.Join(t.TempDir(), "wechat-state.json")
+	in := make(chan IMEvent, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := adapter.Start(ctx, in); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer adapter.Stop(context.Background())
+
+	select {
+	case ev := <-in:
+		if ev.ID != "m-data-1" || ev.Text != "hello from data wrapper" || ev.ContextToken != "ctx-1" {
+			t.Fatalf("event = %+v, want data-wrapped message", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for data-wrapped wechat event")
+	}
+	if !updatesCalled {
+		t.Fatal("getupdates was not called")
+	}
+	if _, err := os.Stat(adapter.statePath); err != nil {
+		t.Fatalf("state file should be saved: %v", err)
 	}
 }

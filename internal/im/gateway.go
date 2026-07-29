@@ -319,6 +319,26 @@ func (g *Gateway) Health() GatewayHealth {
 	}
 	for _, platform := range g.cfg.Platforms {
 		key := adapterKey(platform.Type, platform.Variant)
+		if !platform.Enabled {
+			out.Platforms = append(out.Platforms, HealthStatus{
+				Platform: platform.Type,
+				Variant:  platform.Variant,
+				Enabled:  false,
+				Status:   configuredStatus(false),
+			})
+			continue
+		}
+		if adapter := g.adapters[key]; adapter != nil {
+			health := adapter.Health()
+			health.Platform = platform.Type
+			health.Variant = platform.Variant
+			health.Enabled = platform.Enabled
+			if health.Status == "" {
+				health.Status = configuredStatus(platform.Enabled)
+			}
+			out.Platforms = append(out.Platforms, health)
+			continue
+		}
 		if health, ok := g.health[key]; ok {
 			out.Platforms = append(out.Platforms, health)
 			continue

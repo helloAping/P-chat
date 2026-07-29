@@ -139,7 +139,15 @@ func (h *Handler) PollWeChatQR(c *gin.Context) {
 		writeWeChatQRError(c, err)
 		return
 	}
-	if session.Status == "confirmed" && cred.Token != "" {
+	if session.Status == "confirmed" {
+		if cred.Token == "" {
+			session.Status = "confirmed_without_token"
+			if session.Message == "" {
+				session.Message = "微信已确认登录，但服务未返回可保存的连接凭证，请重新扫码或检查微信连接服务"
+			}
+			c.JSON(http.StatusOK, session)
+			return
+		}
 		if err := h.persistWeChatCredential(cred); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return

@@ -57,6 +57,7 @@ const wechatQRStatusText = computed(() => {
     case 'waiting': return '请使用微信扫码'
     case 'scanned': return '已扫码，等待手机确认'
     case 'confirmed': return '微信已连接'
+    case 'confirmed_without_token': return '未保存连接凭证'
     case 'expired': return '二维码已过期'
     case 'canceled': return '扫码已取消'
     case 'unavailable': return '扫码服务不可用'
@@ -71,6 +72,7 @@ const wechatQRHint = computed(() => {
     case 'waiting': return '打开微信扫码登录，扫码后请在手机上确认。'
     case 'scanned': return '请在手机微信中确认登录，确认后这里会自动完成连接。'
     case 'confirmed': return '微信 Bot 登录态已保存，可继续启用消息收发能力。'
+    case 'confirmed_without_token': return wechatQRSession.value?.message || '微信已确认登录，但服务未返回可保存的连接凭证，请重新扫码或检查微信连接服务。'
     case 'expired': return '二维码已过期，请点击重新获取。'
     case 'canceled': return '扫码已取消，请重新获取二维码。'
     case 'unavailable': return wechatQRSession.value?.message || '微信扫码服务暂时无法访问，请检查网络后重试。'
@@ -391,6 +393,12 @@ async function pollWechatQR() {
     wechatQRSession.value = session
     if (session.status === 'confirmed') {
       message.success('微信已连接')
+      await refreshAll()
+      stopWechatQRPoll()
+      return
+    }
+    if (session.status === 'confirmed_without_token') {
+      wechatQRError.value = session.message || '微信已确认登录，但服务未返回可保存的连接凭证'
       await refreshAll()
       stopWechatQRPoll()
       return

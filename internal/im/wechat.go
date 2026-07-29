@@ -330,6 +330,7 @@ func (a *WeChatAdapter) getUpdates(ctx context.Context, cursor string) (wechatUp
 	if err := a.postJSON(ctx, wechatLongPollPath, body, &resp); err != nil {
 		return wechatUpdatesResponse{}, err
 	}
+	resp.normalize()
 	return resp, nil
 }
 
@@ -491,6 +492,46 @@ type wechatUpdatesResponse struct {
 	Cursor   string            `json:"get_updates_buf,omitempty"`
 	Messages []json.RawMessage `json:"msgs,omitempty"`
 	Data     map[string]any    `json:"data,omitempty"`
+}
+
+func (r *wechatUpdatesResponse) normalize() {
+	if r == nil || len(r.Data) == 0 {
+		return
+	}
+	if r.Cursor == "" {
+		r.Cursor = firstString(r.Data, "get_updates_buf", "cursor", "next_cursor")
+	}
+	if r.Ret == 0 {
+		r.Ret = int(firstInt64(r.Data, "ret", "code"))
+	}
+	if r.ErrCode == 0 {
+		r.ErrCode = int(firstInt64(r.Data, "errcode", "error_code"))
+	}
+	if len(r.Messages) == 0 {
+		r.Messages = rawMessagesFromAny(r.Data["msgs"])
+	}
+	if len(r.Messages) == 0 {
+		r.Messages = rawMessagesFromAny(r.Data["messages"])
+	}
+}
+
+func rawMessagesFromAny(value any) []json.RawMessage {
+	switch v := value.(type) {
+	case []json.RawMessage:
+		return v
+	case []any:
+		out := make([]json.RawMessage, 0, len(v))
+		for _, item := range v {
+			raw, err := json.Marshal(item)
+			if err != nil {
+				continue
+			}
+			out = append(out, raw)
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func parseWeChatEvent(raw json.RawMessage, cfg config.IMPlatformConfig) (IMEvent, bool, error) {

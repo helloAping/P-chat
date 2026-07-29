@@ -213,11 +213,27 @@ func (c WeChatQRClient) Poll(ctx context.Context, qrcode string) (WeChatQRSessio
 	status := normalizeWeChatQRStatus(firstString(data, "status", "state", "qrcode_status", "qr_status"))
 	msg := firstString(data, "message", "msg", "errmsg")
 	cred := WeChatCredential{
-		Token:    firstString(data, "bot_token", "token", "access_token"),
+		Token:    firstString(data, "bot_token", "botToken", "bot_access_token", "botAccessToken", "token", "access_token", "accessToken"),
 		BotID:    firstString(data, "ilink_bot_id", "bot_id", "account_id"),
 		UserID:   firstString(data, "ilink_user_id", "user_id"),
 		BaseURL:  firstString(data, "baseurl", "base_url"),
 		Nickname: firstString(data, "nickname", "name"),
+	}
+	if cred.Token == "" {
+		for _, key := range []string{"credential", "credentials", "login_info", "loginInfo", "auth"} {
+			if nested := mapValue(data, key); len(nested) > 0 {
+				cred.Token = firstString(nested, "bot_token", "botToken", "bot_access_token", "botAccessToken", "token", "access_token", "accessToken")
+				if cred.BotID == "" {
+					cred.BotID = firstString(nested, "ilink_bot_id", "bot_id", "account_id")
+				}
+				if cred.UserID == "" {
+					cred.UserID = firstString(nested, "ilink_user_id", "user_id")
+				}
+				if cred.Token != "" {
+					break
+				}
+			}
+		}
 	}
 	if status == "" && cred.Token != "" {
 		status = "confirmed"

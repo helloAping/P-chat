@@ -259,6 +259,65 @@ func TestWeChatQRFlowPersistsConfirmedCredential(t *testing.T) {
 	}
 }
 
+func TestWeChatQRConfirmedWithoutTokenDoesNotPersistCredential(t *testing.T) {
+	ilink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ilink/bot/get_bot_qrcode":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"qrcode":"qr-no-token","qrcode_img_content":"data:image/png;base64,abc"}}`))
+		case "/ilink/bot/get_qrcode_status":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"status":"confirmed","ilink_bot_id":"bot-1"}}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer ilink.Close()
+
+	cfgJSON := strings.Replace(imTestConfigJSON, `"platforms": [
+      { "type": "telegram", "variant": "polling", "enabled": true, "token": "secret-token" }
+    ]`, `"platforms": [
+      { "type": "wechat", "variant": "wechatbot", "enabled": true, "mode": "websocket", "extra": { "qr_base_url": "`+ilink.URL+`" } }
+    ]`, 1)
+	s, cfg := newTestServerWithConfig(t, cfgJSON)
+	s.SetIMGateway(im.NewGateway(cfg.IM))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/im/wechat/qr", nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("start status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var start struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&start); err != nil {
+		t.Fatal(err)
+	}
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "/api/v1/im/wechat/qr/"+start.ID, nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("poll status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var poll struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&poll); err != nil {
+		t.Fatal(err)
+	}
+	if poll.Status != "confirmed_without_token" {
+		t.Fatalf("status = %q, want confirmed_without_token; body=%s", poll.Status, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "/api/v1/im/config", nil)
+	s.engine.ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), `"token"`) && strings.Contains(w.Body.String(), "bot-1") {
+		t.Fatalf("config should not persist incomplete credential: %s", w.Body.String())
+	}
+}
+
 func TestWeChatQRUnavailableIsUserReadable(t *testing.T) {
 	cfgJSON := strings.Replace(imTestConfigJSON, `"platforms": [
       { "type": "telegram", "variant": "polling", "enabled": true, "token": "secret-token" }
