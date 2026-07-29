@@ -14,12 +14,15 @@ import (
 // HealthStatus 描述一个 IM adapter 的健康状态。
 // HealthStatus describes the health of one IM adapter.
 type HealthStatus struct {
-	Platform  string    `json:"platform"`
-	Variant   string    `json:"variant,omitempty"`
-	Enabled   bool      `json:"enabled"`
-	Status    string    `json:"status"`
-	Error     string    `json:"error,omitempty"`
-	StartedAt time.Time `json:"started_at,omitempty"`
+	Platform      string    `json:"platform"`
+	Variant       string    `json:"variant,omitempty"`
+	Enabled       bool      `json:"enabled"`
+	Status        string    `json:"status"`
+	Error         string    `json:"error,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+	StartedAt     time.Time `json:"started_at,omitempty"`
+	LastPollAt    time.Time `json:"last_poll_at,omitempty"`
+	LastInboundAt time.Time `json:"last_inbound_at,omitempty"`
 }
 
 // GatewayHealth 是 Gateway 对外暴露的健康快照。

@@ -3,6 +3,7 @@ package im
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -191,7 +192,43 @@ func TestWeChatAdapterPollLoopReadsDataWrappedMessages(t *testing.T) {
 	if !updatesCalled {
 		t.Fatal("getupdates was not called")
 	}
+	health := adapter.Health()
+	if health.LastPollAt.IsZero() {
+		t.Fatal("last_poll_at should be recorded after polling")
+	}
+	if health.LastInboundAt.IsZero() {
+		t.Fatal("last_inbound_at should be recorded after receiving a message")
+	}
 	if _, err := os.Stat(adapter.statePath); err != nil {
 		t.Fatalf("state file should be saved: %v", err)
+	}
+}
+
+func TestWeChatAdapterHealthSeparatesCurrentAndLastError(t *testing.T) {
+	adapter := NewWeChatAdapter(config.IMPlatformConfig{
+		Type:    "wechat",
+		Variant: "wechatbot",
+		Enabled: true,
+		Token:   "token-1",
+	})
+	adapter.started = true
+	adapter.status = "polling"
+
+	adapter.setError(errors.New("temporary network error"))
+	health := adapter.Health()
+	if health.Error != "temporary network error" || health.LastError != "temporary network error" {
+		t.Fatalf("health after error = %+v, want current and last error", health)
+	}
+
+	adapter.markPollOK()
+	health = adapter.Health()
+	if health.Error != "" {
+		t.Fatalf("current error = %q, want cleared after successful poll", health.Error)
+	}
+	if health.LastError != "temporary network error" {
+		t.Fatalf("last error = %q, want preserved diagnostic", health.LastError)
+	}
+	if health.Status != "polling" {
+		t.Fatalf("status = %q, want polling", health.Status)
 	}
 }

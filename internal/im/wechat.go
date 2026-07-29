@@ -50,15 +50,18 @@ type WeChatAdapter struct {
 	cfg    config.IMPlatformConfig
 	client *http.Client
 
-	mu        sync.RWMutex
-	started   bool
-	startedAt time.Time
-	status    string
-	lastError string
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	state     wechatState
-	statePath string
+	mu            sync.RWMutex
+	started       bool
+	startedAt     time.Time
+	status        string
+	currentError  string
+	lastError     string
+	lastPollAt    time.Time
+	lastInboundAt time.Time
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	state         wechatState
+	statePath     string
 }
 
 // NewWeChatAdapter creates a WeChat Bot adapter.
@@ -128,6 +131,7 @@ func (a *WeChatAdapter) Start(ctx context.Context, in chan<- IMEvent) error {
 	a.started = true
 	a.startedAt = time.Now()
 	a.status = "polling"
+	a.currentError = ""
 	a.lastError = ""
 	a.mu.Unlock()
 
@@ -175,12 +179,15 @@ func (a *WeChatAdapter) Health() HealthStatus {
 		status = "stopped"
 	}
 	return HealthStatus{
-		Platform:  "wechat",
-		Variant:   a.cfg.Variant,
-		Enabled:   a.cfg.Enabled,
-		Status:    status,
-		Error:     a.lastError,
-		StartedAt: a.startedAt,
+		Platform:      "wechat",
+		Variant:       a.cfg.Variant,
+		Enabled:       a.cfg.Enabled,
+		Status:        status,
+		Error:         a.currentError,
+		LastError:     a.lastError,
+		StartedAt:     a.startedAt,
+		LastPollAt:    a.lastPollAt,
+		LastInboundAt: a.lastInboundAt,
 	}
 }
 
@@ -226,6 +233,7 @@ func (a *WeChatAdapter) pollLoop(ctx context.Context, in chan<- IMEvent) {
 		default:
 		}
 
+		a.markPollAttempt()
 		resp, err := a.getUpdates(ctx, cursor)
 		if err != nil {
 			a.setError(err)
@@ -239,6 +247,7 @@ func (a *WeChatAdapter) pollLoop(ctx context.Context, in chan<- IMEvent) {
 			continue
 		}
 		backoff = wechatPollInterval
+		a.markPollOK()
 
 		if resp.Ret == -14 || resp.ErrCode == -14 {
 			a.setError(errors.New(wechatSessionExpiredError))
@@ -266,6 +275,7 @@ func (a *WeChatAdapter) pollLoop(ctx context.Context, in chan<- IMEvent) {
 			case <-ctx.Done():
 				return
 			case in <- ev:
+				a.markInbound()
 			}
 		}
 	}
@@ -444,6 +454,7 @@ func (a *WeChatAdapter) setError(err error) {
 		return
 	}
 	a.mu.Lock()
+	a.currentError = err.Error()
 	a.lastError = err.Error()
 	if !a.started {
 		a.status = "stopped"
@@ -451,6 +462,31 @@ func (a *WeChatAdapter) setError(err error) {
 		a.status = "expired"
 	} else {
 		a.status = "error"
+	}
+	a.mu.Unlock()
+}
+
+func (a *WeChatAdapter) markPollAttempt() {
+	a.mu.Lock()
+	a.lastPollAt = time.Now()
+	a.mu.Unlock()
+}
+
+func (a *WeChatAdapter) markPollOK() {
+	a.mu.Lock()
+	a.currentError = ""
+	if a.started && a.status != "expired" {
+		a.status = "polling"
+	}
+	a.mu.Unlock()
+}
+
+func (a *WeChatAdapter) markInbound() {
+	a.mu.Lock()
+	a.lastInboundAt = time.Now()
+	a.currentError = ""
+	if a.started && a.status != "expired" {
+		a.status = "polling"
 	}
 	a.mu.Unlock()
 }

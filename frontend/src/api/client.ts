@@ -1953,7 +1953,10 @@ export interface IMHealthStatus {
   enabled: boolean
   status: string
   error?: string
+  last_error?: string
   started_at?: string
+  last_poll_at?: string
+  last_inbound_at?: string
 }
 
 export interface IMHealth {

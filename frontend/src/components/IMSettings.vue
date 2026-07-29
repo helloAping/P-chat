@@ -96,12 +96,14 @@ function healthFor(type: string, variant?: string) {
 function statusLabel(status?: string) {
   switch (status) {
     case 'ok': return '已连接'
+    case 'polling': return '轮询中'
     case 'authenticated': return '已登录'
     case 'registered': return '可用'
     case 'configured': return '已配置'
     case 'disabled': return '未启用'
     case 'unavailable': return '未接入'
     case 'error': return '异常'
+    case 'expired': return '登录已过期'
     case 'not_configured': return '未配置'
     case 'not_implemented': return '未接入'
     default: return status || '未连接'
@@ -109,9 +111,9 @@ function statusLabel(status?: string) {
 }
 
 function statusType(status?: string): 'success' | 'warning' | 'error' | 'default' {
-  if (status === 'ok' || status === 'registered' || status === 'authenticated') return 'success'
+  if (status === 'ok' || status === 'registered' || status === 'authenticated' || status === 'polling') return 'success'
   if (status === 'configured' || status === 'disabled' || status === 'not_configured') return 'warning'
-  if (status === 'error' || status === 'unavailable' || status === 'not_implemented') return 'error'
+  if (status === 'error' || status === 'expired' || status === 'unavailable' || status === 'not_implemented') return 'error'
   return 'default'
 }
 
@@ -471,6 +473,7 @@ async function testPlatform(p: api.IMPlatformConfig) {
 
 function friendlyStatus(type: string, raw?: string) {
   if (!raw) return '请检查连接状态'
+  if (type === 'wechat' && raw.includes('session expired')) return '微信登录态已过期，请重新扫码连接'
   if (raw.includes('adapter not registered')) {
     if (type === 'wechat') return '请先启动微信连接服务，然后重新扫码'
     if (type === 'feishu') return '飞书连接服务未启动，请确认授权信息已填写'
@@ -504,6 +507,11 @@ function formatEventTime(t?: string) {
   const d = new Date(t)
   if (Number.isNaN(d.getTime())) return t
   return d.toLocaleTimeString()
+}
+
+function formatHealthTime(t?: string) {
+  if (!t || t.startsWith('0001-')) return '暂无'
+  return formatEventTime(t) || '暂无'
 }
 
 onMounted(async () => {
@@ -643,6 +651,24 @@ onBeforeUnmount(() => {
           </div>
           <div v-if="healthFor('wechat', wechat?.variant)?.error" class="im-card-error">
             {{ friendlyStatus('wechat', healthFor('wechat', wechat?.variant)?.error) }}
+          </div>
+          <div
+            v-else-if="healthFor('wechat', wechat?.variant)?.status === 'expired'"
+            class="im-card-error"
+          >
+            微信登录态已过期，请重新扫码连接。
+          </div>
+          <div class="im-health-grid">
+            <span>最近轮询</span>
+            <strong>{{ formatHealthTime(healthFor('wechat', wechat?.variant)?.last_poll_at) }}</strong>
+            <span>最近入站</span>
+            <strong>{{ formatHealthTime(healthFor('wechat', wechat?.variant)?.last_inbound_at) }}</strong>
+          </div>
+          <div
+            v-if="!healthFor('wechat', wechat?.variant)?.error && healthFor('wechat', wechat?.variant)?.last_error"
+            class="im-card-note"
+          >
+            最近错误: {{ friendlyStatus('wechat', healthFor('wechat', wechat?.variant)?.last_error) }}
           </div>
         </section>
 
@@ -917,6 +943,33 @@ onBeforeUnmount(() => {
   font-size: 11.5px;
   line-height: 1.45;
   word-break: break-word;
+}
+.im-card-note {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+.im-health-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 5px 10px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+}
+.im-health-grid span {
+  color: var(--text-tertiary);
+}
+.im-health-grid strong {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .im-json-field {
   min-width: 0;
