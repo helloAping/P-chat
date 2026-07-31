@@ -261,6 +261,78 @@ html, body, #app {
   border-radius: var(--radius-sm);
 }
 
+/* --- 8b. Floating Menus ------------------------------------------------
+ * Naive UI teleports dropdown/select menus to <body>, so scoped
+ * component rules cannot reliably style them. Keep the shared
+ * floating-menu treatment here so sidebar actions, KB selection,
+ * settings selects, and tool enum selects read as one UI family.
+ */
+.n-dropdown-menu,
+.n-base-select-menu {
+  padding: 5px !important;
+  background: var(--surface-1) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: 8px !important;
+  box-shadow: var(--shadow-lg) !important;
+  color: var(--text-primary) !important;
+}
+
+.n-dropdown-option,
+.n-base-select-option {
+  margin: 1px 0 !important;
+}
+
+.n-dropdown-option .n-dropdown-option-body,
+.n-base-select-option {
+  min-height: 30px !important;
+  padding: 5px 8px !important;
+  border-radius: var(--radius-sm) !important;
+  color: var(--text-secondary) !important;
+  font-size: 12.5px !important;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out) !important;
+}
+
+.n-dropdown-option .n-dropdown-option-body:hover,
+.n-dropdown-option .n-dropdown-option-body--pending,
+.n-base-select-option:hover,
+.n-base-select-option--pending {
+  background: var(--surface-3) !important;
+  color: var(--text-primary) !important;
+}
+
+.n-dropdown-option .n-dropdown-option-body--selected,
+.n-base-select-option--selected {
+  background: var(--brand-50) !important;
+  color: var(--brand-600) !important;
+  font-weight: 600 !important;
+}
+
+.n-dropdown-option .n-dropdown-option-body__prefix,
+.n-dropdown-option .n-dropdown-option-body__suffix,
+.n-base-select-option__check {
+  color: var(--text-tertiary) !important;
+}
+
+.n-dropdown-option .n-dropdown-option-body--selected .n-dropdown-option-body__prefix,
+.n-dropdown-option .n-dropdown-option-body--selected .n-dropdown-option-body__suffix,
+.n-base-select-option--selected .n-base-select-option__check {
+  color: var(--brand-500) !important;
+}
+
+.n-dropdown-divider,
+.n-base-select-menu .n-virtual-list + .n-base-select-menu__action {
+  border-color: var(--border-subtle) !important;
+}
+
+.n-dropdown-menu .n-dropdown-option-body__label,
+.n-base-select-option__content {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* --- 9. Reduced motion ------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

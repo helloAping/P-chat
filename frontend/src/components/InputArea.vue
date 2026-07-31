@@ -155,6 +155,17 @@ const kbOptions = computed(() => [
   { label: '知识库 · 全部', value: '__all__' },
   ...kbBases.value.filter(b => b.enabled).map(b => ({ label: `知识库 · ${b.name}`, value: b.name })),
 ])
+const kbMenuOptions = computed<DropdownOption[]>(() =>
+  kbOptions.value.map((opt) => ({
+    label: opt.value === '__off__'
+      ? '不使用知识库'
+      : opt.value === '__all__'
+        ? '全部知识库'
+        : opt.value,
+    key: opt.value,
+    icon: menuIcon(Database),
+  })),
+)
 const kbBase = computed({
   get: () => {
     if (!state.currentID) return '__off__'
@@ -1564,7 +1575,7 @@ onMounted(() => {
           <NDropdown
             trigger="click"
             placement="top-end"
-            :options="kbOptions.map(o => ({ key: o.value, label: o.label }))"
+            :options="kbMenuOptions"
             @select="(key: string | number) => pickKB(String(key))"
           >
             <button

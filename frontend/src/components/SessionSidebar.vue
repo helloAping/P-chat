@@ -787,7 +787,12 @@ onMounted(() => {
           <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'" aria-label="切换主题">
             <component :is="themeName === 'dark' ? Sun : Moon" :size="16" />
           </NButton>
-          <NDropdown trigger="click" :options="menuOptions" @select="(key) => handleMenuSelect(String(key))">
+          <NDropdown
+            trigger="click"
+            placement="bottom-end"
+            :options="menuOptions"
+            @select="(key) => handleMenuSelect(String(key))"
+          >
             <NButton size="small" quaternary title="更多" aria-label="更多">
               <MoreHorizontal :size="16" />
             </NButton>
@@ -1345,22 +1350,37 @@ onMounted(() => {
 }
 .session-item.active .item-time { color: var(--text-secondary); }
 .item-menu-btn {
-  background: none;
-  border: none;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: 1px solid transparent;
   color: var(--text-tertiary);
   cursor: pointer;
-  padding: 3px 4px;
-  border-radius: 3px;
+  padding: 0;
+  border-radius: var(--radius-sm);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   opacity: 0;
-  transition: opacity var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
 }
-.session-item:hover .item-menu-btn { opacity: 1; }
+.session-item:hover .item-menu-btn,
+.item-menu-btn:focus-visible {
+  opacity: 1;
+}
 .item-menu-btn:hover {
-  background: var(--surface-3);
+  background: var(--surface-2);
+  border-color: var(--border-default);
   color: var(--text-primary);
+}
+.item-menu-btn:active {
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-600);
 }
 
 /* Older-group collapsible toggle. */

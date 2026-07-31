@@ -5,6 +5,7 @@ import { ChevronRight } from './icons'
 import {
   currentTodos,
   currentSessionWorking,
+  currentPendingQuestion,
   state,
   clearSessionTodos,
 } from '../stores/chat'
@@ -26,6 +27,7 @@ const total = computed(() => visibleTodos.value.length)
 const doneCount = computed(() => doneTodos.value.length)
 const progressLabel = computed(() => `${doneCount.value} / ${total.value}`)
 const isLive = computed(() => currentSessionWorking.value)
+const hasPendingQuestion = computed(() => !!currentPendingQuestion.value)
 
 const allDone = computed(() => {
   const list = visibleTodos.value
@@ -56,8 +58,11 @@ function scheduleClose(ms = 1200) {
 }
 
 watch(
-  [() => state.currentID, () => total.value, () => isLive.value, () => allDone.value],
+  [() => state.currentID, () => total.value, () => isLive.value, () => allDone.value, () => hasPendingQuestion.value],
   () => {
+    if (hasPendingQuestion.value) {
+      expanded.value = false
+    }
     const id = state.currentID
     if (!id) {
       dockVisible.value = false
@@ -109,6 +114,10 @@ function statusLabel(status: string): string {
 }
 
 function toggleExpand() {
+  if (hasPendingQuestion.value) {
+    expanded.value = false
+    return
+  }
   expanded.value = !expanded.value
 }
 </script>
@@ -120,6 +129,7 @@ function toggleExpand() {
     :class="{
       'todo-dock--expanded': expanded,
       'todo-dock--closing': closing,
+      'todo-dock--question-pending': hasPendingQuestion,
     }"
   >
     <div class="todo-dock-header" @click="toggleExpand" :title="expanded ? '点击收起' : '点击展开'">
@@ -221,6 +231,12 @@ function toggleExpand() {
 }
 .todo-dock--closing {
   max-height: 36px;
+}
+.todo-dock--question-pending .todo-dock-header {
+  cursor: default;
+}
+.todo-dock--question-pending .todo-dock-caret {
+  opacity: 0.45;
 }
 .todo-dock-header {
   display: flex;
