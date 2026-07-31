@@ -163,6 +163,9 @@ type streamDoneIDs struct {
 func streamEventFromChunk(chunk agent.ChatStreamChunk, provider, model string, ids streamDoneIDs) StreamEvent {
 	ev := chunkToEvent(chunk, provider, model)
 	if chunk.Done {
+		if ev.SessionStatus == "" {
+			ev.SessionStatus = "idle"
+		}
 		if ids.userMessageID > 0 {
 			ev.UserMessageID = ids.userMessageID
 		}

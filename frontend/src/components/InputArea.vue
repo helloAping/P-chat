@@ -6,14 +6,14 @@
 // insensitively. Unknown commands fall through to the normal send
 // path so the LLM can answer "what is /foo?" questions naturally.
 
-import { onMounted, ref, computed, watch, nextTick } from 'vue'
-import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useMessage } from 'naive-ui'
+import { h, onMounted, ref, computed, watch, nextTick } from 'vue'
+import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useMessage, type DropdownOption } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
-  Lock, Unlock, Key, Database, Terminal,
+  Lock, Unlock, Key, Database, Terminal, Copy, Scissors, ClipboardPaste, TextCursorInput,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -25,6 +25,7 @@ import {
   recoverMissingParts, currentPendingConfirm, submitToolConfirm,
 } from '../stores/chat'
 import { notifyManager } from '../utils/notify'
+import { copyText } from '../utils/clipboard'
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const inputText = ref('')
@@ -243,6 +244,19 @@ async function onFiles(files: FileList | null) {
   if (fileInput.value) fileInput.value.value = ''
 }
 
+function openAttachmentPreview(a: { kind: string; _previewURL: string; name: string; _error: boolean }) {
+  if (a._error || !a._previewURL) return
+  if (a.kind === 'image') {
+    state.lightbox = { show: true, src: a._previewURL, alt: a.name, kind: 'image' }
+  } else if (a.kind === 'video') {
+    state.lightbox = { show: true, src: a._previewURL, alt: a.name, kind: 'video' }
+  }
+}
+
+function isPreviewableAttachment(a: { kind: string; _error: boolean; _previewURL: string }) {
+  return !a._error && !!a._previewURL && (a.kind === 'image' || a.kind === 'video')
+}
+
 // Build a friendly name for a clipboard file item. Chromium
 // hands image screenshots back as File{name: 'image.png'} —
 // a generic placeholder that would collide if the user
@@ -327,6 +341,123 @@ function onPaste(e: ClipboardEvent) {
   const preview = files.slice(0, 2).map(f => f.name).join(', ')
   const more = files.length > 2 ? ` 等 ${files.length} 个` : ''
   message.success(`已添加附件: ${preview}${more}`, { duration: 1800 })
+}
+
+const inputContextMenuVisible = ref(false)
+const inputContextMenuX = ref(0)
+const inputContextMenuY = ref(0)
+
+function menuIcon(icon: any) {
+  return () => h(icon, { size: 14 })
+}
+
+const inputContextMenuOptions: DropdownOption[] = [
+  { key: 'copy', label: '复制', icon: menuIcon(Copy) },
+  { key: 'cut', label: '剪切', icon: menuIcon(Scissors) },
+  { key: 'paste', label: '粘贴', icon: menuIcon(ClipboardPaste) },
+  { key: 'select_all', label: '全选', icon: menuIcon(TextCursorInput) },
+]
+
+function inputSelection() {
+  const el = inputEl.value
+  const start = el?.selectionStart ?? 0
+  const end = el?.selectionEnd ?? start
+  return { el, start, end, selected: inputText.value.slice(start, end) }
+}
+
+function setInputSelection(start: number, end = start) {
+  nextTick(() => {
+    const el = inputEl.value
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(start, end)
+    resizeTextarea()
+  })
+}
+
+async function copyInputSelection() {
+  const { selected } = inputSelection()
+  const text = selected || inputText.value
+  if (!text) {
+    message.warning('没有可复制内容')
+    return false
+  }
+  const ok = await copyText(text)
+  if (ok) message.success('复制成功')
+  else message.error('复制失败')
+  return ok
+}
+
+async function cutInputSelection() {
+  const { start, end, selected } = inputSelection()
+  const text = selected || inputText.value
+  if (!text) {
+    message.warning('没有可剪切内容')
+    return
+  }
+  const ok = await copyText(text)
+  if (!ok) {
+    message.error('剪切失败')
+    return
+  }
+  if (selected) {
+    inputText.value = inputText.value.slice(0, start) + inputText.value.slice(end)
+    setInputSelection(start)
+  } else {
+    inputText.value = ''
+    setInputSelection(0)
+  }
+  message.success('剪切成功')
+}
+
+async function pasteIntoInput() {
+  try {
+    const text = await navigator.clipboard?.readText?.()
+    if (!text) {
+      message.warning('剪贴板为空')
+      return
+    }
+    const { start, end } = inputSelection()
+    inputText.value = inputText.value.slice(0, start) + text + inputText.value.slice(end)
+    setInputSelection(start + text.length)
+    message.success('粘贴成功')
+  } catch {
+    message.error('粘贴失败')
+  }
+}
+
+function selectAllInputText() {
+  inputEl.value?.focus()
+  inputEl.value?.select()
+  message.success('全选成功')
+}
+
+function onInputContextMenu(e: MouseEvent) {
+  e.preventDefault()
+  inputContextMenuVisible.value = false
+  nextTick(() => {
+    inputContextMenuX.value = e.clientX
+    inputContextMenuY.value = e.clientY
+    inputContextMenuVisible.value = true
+  })
+}
+
+async function onInputContextMenuSelect(key: string | number) {
+  inputContextMenuVisible.value = false
+  switch (key) {
+    case 'copy':
+      await copyInputSelection()
+      break
+    case 'cut':
+      await cutInputSelection()
+      break
+    case 'paste':
+      await pasteIntoInput()
+      break
+    case 'select_all':
+      selectAllInputText()
+      break
+  }
 }
 
 // --- Slash command palette ---
@@ -819,6 +950,8 @@ async function send() {
   // the three-bouncing-dots spinner is reachable. The actual
   // mutation happens in the onEvent callback below.
   startStream(id, ctrl)
+  let streamSucceeded = false
+  let deferredDrop: { lastSeq: number; reason: string } | null = null
   try {
     await api.streamMessagesRetry(id, {
       message: text,
@@ -847,9 +980,7 @@ async function send() {
       // fetch is then cancelled and the drop callback
       // is short-circuited in client.ts).
       onStreamDrop: ({ lastSeq, reason }) => {
-        recoverMissingParts(id, lastSeq, reason).catch((err) => {
-          console.warn('[stream] recovery failed:', err)
-        })
+        deferredDrop = { lastSeq, reason }
       },
       onEvent: (ev) => {
         pendingSkillContext = ''
@@ -875,6 +1006,7 @@ async function send() {
         appendStreamEvent(id, ev)
       },
     })
+    streamSucceeded = true
   } catch (e: any) {
     if (e.name !== 'AbortError') {
       message.error(`发送失败: ${e.message}`)
@@ -882,6 +1014,12 @@ async function send() {
   } finally {
     endStream(id)
     sending.value = false
+    const drop = deferredDrop as { lastSeq: number; reason: string } | null
+    if (!streamSucceeded && drop && !ctrl.signal.aborted) {
+      recoverMissingParts(id, drop.lastSeq, drop.reason).catch((err) => {
+        console.warn('[stream] recovery failed:', err)
+      })
+    }
   }
 }
 
@@ -1102,6 +1240,16 @@ onMounted(() => {
 
 <template>
   <div class="input-area">
+    <NDropdown
+      trigger="manual"
+      placement="bottom-start"
+      :show="inputContextMenuVisible"
+      :x="inputContextMenuX"
+      :y="inputContextMenuY"
+      :options="inputContextMenuOptions"
+      @select="onInputContextMenuSelect"
+      @clickoutside="inputContextMenuVisible = false"
+    />
     <!-- Rollback undo banner -->
     <div v-if="currentRollbackBanner" class="rollback-banner">
       <Undo2 :size="14" class="rollback-banner-icon" />
@@ -1140,6 +1288,7 @@ onMounted(() => {
           :placeholder="isSlashLine() ? '输入 / 后跟命令 (例如 /help)' : '输入消息，Enter 发送，Shift+Enter 换行，Esc 停止，/ 前缀是命令'"
           @keydown="onKeyDown"
           @paste="onPaste"
+          @contextmenu="onInputContextMenu"
         ></textarea>
         <!-- Session-level option pickers (style + reasoning).
              These all share the same visual treatment —
@@ -1239,7 +1388,12 @@ onMounted(() => {
           class="attach-chip"
           :class="{ uploading: a._uploading, error: a._error }"
         >
-          <div class="thumb">
+          <div
+            class="thumb"
+            :class="{ 'thumb--previewable': isPreviewableAttachment(a) }"
+            :title="isPreviewableAttachment(a) ? '点击预览' : undefined"
+            @click="openAttachmentPreview(a)"
+          >
             <img v-if="a.kind === 'image'" :src="a._previewURL" :alt="a.name" />
             <video v-else-if="a.kind === 'video'" :src="a._previewURL" muted preload="metadata" />
             <Volume2 v-else-if="a.kind === 'audio'" :size="18" />
@@ -1515,6 +1669,7 @@ onMounted(() => {
   font-size: 18px;
   flex-shrink: 0;
 }
+.thumb--previewable { cursor: zoom-in; }
 .thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; }
 .name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rm {

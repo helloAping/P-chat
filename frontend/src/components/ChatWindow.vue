@@ -196,6 +196,15 @@ function jumpToBottom() {
   scrollToBottom()
 }
 
+function locateOpenQuestion() {
+  const el = messagesEl.value?.querySelector('.question-card.status-open') as HTMLElement | null
+  if (!el) {
+    jumpToBottom()
+    return
+  }
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 // onScroll is bound to the messages container. Two jobs:
 //   1. Refresh isAtBottom so the button can show/hide.
 //   2. When the user scrolls within ~80px of the top, kick
@@ -367,7 +376,6 @@ function messageKey(m: any, i: number): string | number {
          that opens it lives in TopBar; this template
          just renders the panel. -->
     <ContextInspectorDrawer />
-    <QuestionModal />
 
     <!-- Plain scrollable container. We don't use NScrollbar
          here because its :native-scrollbar="false" path wraps
@@ -411,6 +419,7 @@ function messageKey(m: any, i: number): string | number {
         />
       </div>
     </div>
+    <QuestionModal @locate-question="locateOpenQuestion" />
     <TodoPanel />
     <InputArea />
     <!-- P1-4: 锚定 FAB (jump-to-user-message). Shown

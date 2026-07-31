@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { NButton, NRadio, NCheckbox, NSpace, NTag, NInput } from 'naive-ui'
+import { NButton, NRadio, NCheckbox, NTag, NInput } from 'naive-ui'
 import { submitQuestionAnswer, currentPendingQuestion } from '../stores/chat'
-import { MessageSquare } from './icons'
+import { ArrowUp, MessageSquare } from './icons'
 
 const CUSTOM_VALUE = '__pchat_custom__'
 
@@ -10,6 +10,7 @@ const currentIndex = ref(0)
 const answers = ref<Record<string, string>>({})
 const multiAnswers = ref<Record<string, string[]>>({})
 const customInputs = ref<Record<string, string>>({})
+const emit = defineEmits<{ (e: 'locate-question'): void }>()
 
 const questions = computed(() => currentPendingQuestion.value?.questions || [])
 const currentQuestion = computed(() => questions.value[currentIndex.value] || null)
@@ -115,11 +116,30 @@ const displayOptions = computed(() => {
 </script>
 
 <template>
-  <div v-if="currentPendingQuestion" class="qmodal-layer">
-    <section class="qmodal-card" role="dialog" aria-modal="true" aria-labelledby="qmodal-title">
+  <Transition name="question-dock">
+    <section
+      v-if="currentPendingQuestion"
+      class="question-dock"
+      role="region"
+      aria-labelledby="qmodal-title"
+    >
       <header class="qmodal-header">
-        <MessageSquare :size="18" class="qmodal-header-icon" />
-        <span id="qmodal-title">LLM 的提问</span>
+        <div class="qmodal-title-wrap">
+          <MessageSquare :size="18" class="qmodal-header-icon" />
+          <div class="qmodal-title-copy">
+            <span id="qmodal-title">LLM 的提问</span>
+            <span class="qmodal-subtitle">回答前仍可滚动查看上方上下文</span>
+          </div>
+        </div>
+        <NButton
+          size="tiny"
+          quaternary
+          title="定位到聊天中的提问"
+          aria-label="定位到聊天中的提问"
+          @click="emit('locate-question')"
+        >
+          <ArrowUp :size="14" />
+        </NButton>
       </header>
 
       <div class="qnav">
@@ -180,53 +200,63 @@ const displayOptions = computed(() => {
       </div>
 
       <footer class="qmodal-footer">
-        <NSpace justify="end">
-          <NButton v-if="currentIndex > 0" @click="prev" size="small">上一步</NButton>
-          <NButton type="primary" @click="next" :disabled="!canProceed()" size="small">
-            {{ isLast ? '提交' : '下一步' }}
-          </NButton>
-        </NSpace>
+        <NButton v-if="currentIndex > 0" @click="prev" size="small">上一步</NButton>
+        <NButton type="primary" @click="next" :disabled="!canProceed()" size="small">
+          {{ isLast ? '提交' : '下一步' }}
+        </NButton>
       </footer>
     </section>
-  </div>
+  </Transition>
 </template>
 
 <style scoped>
-.qmodal-layer {
-  position: absolute;
-  inset: 0;
-  z-index: 30;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-  background: rgba(0, 0, 0, 0.32);
-}
-.qmodal-card {
-  width: min(560px, 100%);
-  max-height: min(680px, calc(100% - 32px));
+.question-dock {
+  flex: 0 0 auto;
+  margin: 0 var(--space-4) var(--space-2);
+  max-height: min(42vh, 420px);
   display: flex;
   flex-direction: column;
-  padding: 18px;
+  padding: var(--space-4);
   background: var(--surface-1);
   border: 1px solid var(--border-default);
-  border-radius: 8px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
 }
 .qmodal-header {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-shrink: 0;
+}
+.qmodal-title-wrap {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.qmodal-title-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   font-size: 16px;
   font-weight: 600;
-  color: var(--text-1);
+  color: var(--text-primary);
 }
 .qmodal-header-icon { color: var(--brand-500); }
+.qmodal-subtitle {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.35;
+}
 .qnav {
   display: flex;
-  gap: 6px;
+  gap: var(--space-2);
   flex-wrap: wrap;
-  margin: 16px 0;
+  margin: var(--space-3) 0;
+  flex-shrink: 0;
 }
 .qnav-tag {
   cursor: pointer;
@@ -236,39 +266,42 @@ const displayOptions = computed(() => {
   opacity: 1;
 }
 .qbody {
-  min-height: 120px;
+  min-height: 0;
   overflow: auto;
+  padding-right: var(--space-1);
 }
 .qtext {
   font-size: 14px;
   font-weight: 600;
-  color: var(--text-1);
-  margin-bottom: 12px;
+  color: var(--text-primary);
+  margin-bottom: var(--space-3);
 }
 .qmulti {
   font-weight: 400;
-  color: var(--text-3);
+  color: var(--text-tertiary);
   font-size: 12px;
 }
 .qopts {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 .qopt {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   cursor: pointer;
-  transition: border-color .15s, background .15s;
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
 }
 .qopt:hover,
 .qopt-sel {
-  border-color: var(--accent);
-  background: var(--bg-2);
+  border-color: var(--brand-500);
+  background: var(--brand-50);
 }
 .qopt-custom-row {
   border-style: dashed;
@@ -285,17 +318,32 @@ const displayOptions = computed(() => {
 .qopt-label {
   font-size: 14px;
   font-weight: 500;
-  color: var(--text-1);
+  color: var(--text-primary);
 }
 .qopt-desc {
   font-size: 12px;
-  color: var(--text-3);
+  color: var(--text-tertiary);
   margin-top: 2px;
 }
 .qopt-custom {
-  margin-top: 8px;
+  margin-top: var(--space-2);
 }
 .qmodal-footer {
-  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  flex-shrink: 0;
+}
+.question-dock-enter-active,
+.question-dock-leave-active {
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+.question-dock-enter-from,
+.question-dock-leave-to {
+  opacity: 0;
+  transform: translateY(var(--space-3));
 }
 </style>

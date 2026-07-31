@@ -108,6 +108,8 @@ export const state = reactive({
   showSettings: false,
   projects: [] as ProjectItem[],
   activeProjectPath: '' as string,
+  projectSessions: {} as Record<string, Session[]>,
+  lastSessionByProject: {} as Record<string, string>,
   // P3-3: current session's trace id. Minted server-side on
   // POST /messages and mirrored on every SSE event. The
   // TopBar reads this so users can copy the id to the
@@ -310,9 +312,10 @@ function evictColdSessions() {
   if (keys.length <= MAX_LOADED_SESSIONS) return
   keys.sort((a, b) => _loadedSessions[a] - _loadedSessions[b])
   const toEvict = keys.length - MAX_LOADED_SESSIONS
-  for (let i = 0; i < toEvict; i++) {
-    const sid = keys[i]
-    if (sid === state.currentID) continue
+  let evicted = 0
+  for (const sid of keys) {
+    if (evicted >= toEvict) break
+    if (sid === state.currentID || state.streaming[sid]) continue
     revokeSessionBlobUrls(sid)
     delete state.sessionMessages[sid]
     // P1-4: drop the per-session regen cache too. The
@@ -323,14 +326,24 @@ function evictColdSessions() {
     delete state.sessionReplies[sid]
     delete state.sessionUserMsgs[sid]
     delete _loadedSessions[sid]
+    evicted += 1
   }
 }
 
 export async function loadSessions() {
-  const { sessions } = await api.listSessions(state.activeProjectPath)
+  const projectPath = state.activeProjectPath
+  const { sessions } = await api.listSessions(projectPath)
+  state.projectSessions[projectPath] = sessions
+  if (state.activeProjectPath !== projectPath) return
   state.sessions = sessions
-  if (!state.currentID && sessions.length > 0) {
-    await switchSession(sessions[0].id)
+  const currentInProject = !!state.currentID && sessions.some(s => s.id === state.currentID)
+  if (!currentInProject) {
+    const last = state.lastSessionByProject[projectPath]
+    const next = sessions.find(s => s.id === last)?.id || sessions[0]?.id || ''
+    state.currentID = ''
+    if (next) await switchSession(next)
+  } else {
+    state.lastSessionByProject[projectPath] = state.currentID
   }
 }
 
@@ -344,58 +357,19 @@ export async function loadProjects() {
 }
 
 export async function setActiveProject(path: string) {
+  const previousProject = state.activeProjectPath
+  if (state.currentID) {
+    state.lastSessionByProject[previousProject] = state.currentID
+  }
   state.activeProjectPath = path
   state.currentID = ''
-  state.sessions = []
-  // Revoke screenshot blob URLs for ALL sessions currently
-  // cached in the store before wiping it. Otherwise those
-  // blob URLs accumulate in WebView2 until page reload.
-  for (const sid of Object.keys(state.sessionMessages)) {
-    revokeSessionBlobUrls(sid)
-  }
-  state.sessionMessages = {}
-  // Reset the LRU heat map along with the messages map —
-  // stale entries would trigger a no-op eviction of sessions
-  // that no longer exist on the next switch.
-  for (const k of Object.keys(_loadedSessions)) {
-    delete _loadedSessions[k]
-  }
-  state.sessionMeta = {}
-  state.sessionTodos = {}
-  state.sessionWorking = {}
-  state.sessionPaging = {}
-  // P1-4: clear the per-session regen caches. All
-  // sessions in the previous project are being
-  // discarded; their per-user-message summaries and
-  // sibling lists are stale.
-  state.sessionReplies = {}
-  state.sessionUserMsgs = {}
-  // Revoke blob URLs for any staged attachments in the
-  // sessions we're discarding, then drop the maps entirely.
-  // Question / confirm dialogs keyed to those sessions get
-  // cleared so any awaiters unblock. (We no longer carry
-  // a Promise resolve on pendingQuestion — answers are sent
-  // to the server synchronously through api.submitQuestionResponse,
-  // so there's nothing to resolve here. We just drop the
-  // entries so a subsequent switchSession doesn't see stale
-  // modal data for a session that no longer exists.)
-  for (const arr of Object.values(state.pendingAttachments)) {
-    for (const a of arr) {
-      if (a._blobURL) URL.revokeObjectURL(a._blobURL)
-    }
-  }
-  state.pendingAttachments = {}
-  for (const id of Object.keys(state.pendingQuestion)) {
-    delete state.pendingQuestion[id]
-  }
-  for (const [id, items] of Object.entries(state.pendingConfirm)) {
-    for (const pc of items) pc.resolve('reject')
-    delete state.pendingConfirm[id]
-  }
-  for (const [id, s] of Object.entries(state.streaming)) {
-    s.ctrl.abort()
-    delete state.streaming[id]
-  }
+  state.currentTraceId = ''
+
+  const cached = state.projectSessions[path] || []
+  state.sessions = cached
+  const last = state.lastSessionByProject[path]
+  const next = cached.find(s => s.id === last)?.id || cached[0]?.id || ''
+  if (next) await switchSession(next)
   await loadSessions()
 }
 
@@ -438,6 +412,7 @@ function dedupMessagesByKey(existing: Message[], incoming: Message[]): Message[]
 
 export async function switchSession(id: string) {
   state.currentID = id
+  state.lastSessionByProject[state.activeProjectPath] = id
   // P3-3: clear the previous session's trace id so the
   // TopBar tooltip doesn't show a stale id from a session
   // the user is no longer looking at. The next event of
@@ -649,6 +624,7 @@ export async function createSession(): Promise<string> {
   // always returns the persisted title), use it; otherwise
   // keep the placeholder.
   state.sessions.unshift(fresh)
+  state.projectSessions[state.activeProjectPath] = state.sessions
   await switchSession(id)
   return id
 }
@@ -656,6 +632,7 @@ export async function createSession(): Promise<string> {
 export async function deleteSessionById(id: string) {
   await api.archiveSession(id)
   state.sessions = state.sessions.filter(s => s.id !== id)
+  state.projectSessions[state.activeProjectPath] = state.sessions
   // Revoke all screenshot blob URLs owned by this session
   // before clearing the messages, otherwise those URLs
   // remain referenced until the next page reload.
@@ -1713,10 +1690,11 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     case 'done':
-      // Final token counts. We don't reset streaming
-      // flags here — that's the consumer's job (the
-      // bubble stops pulsing once isStreaming flips off,
-      // and thinking flags get cleared in endStream).
+      // Final token counts. Treat backend `done` as the
+      // semantic end of the turn even if the HTTP/Wails
+      // transport takes another tick to close.
+      state.sessionWorking[id] = false
+      delete state.streaming[id]
       if (ev.tokens_in != null) m.tokens_in = ev.tokens_in
       if (ev.tokens_out != null) m.tokens_out = ev.tokens_out
       if (ev.elapsed) m.elapsed = ev.elapsed
@@ -2345,6 +2323,8 @@ export async function regenerateMessage(
   }
 
   const meta = state.sessionMeta[sessionId] || ({} as any)
+  let streamSucceeded = false
+  let deferredDrop: { lastSeq: number; reason: string } | null = null
   try {
     await api.streamRegenerate(sessionId, userMessageId, {
       provider: meta.provider,
@@ -2356,12 +2336,17 @@ export async function regenerateMessage(
       // so the snapshot returns the freshly-built
       // assistant message parts.
       onStreamDrop: ({ lastSeq, reason }) => {
-        recoverMissingParts(sessionId, lastSeq, reason).catch(() => {})
+        deferredDrop = { lastSeq, reason }
       },
       onEvent: (ev) => appendStreamEvent(sessionId, ev),
     })
+    streamSucceeded = true
   } finally {
     endStream(sessionId)
+    const drop = deferredDrop as { lastSeq: number; reason: string } | null
+    if (!streamSucceeded && drop && !ctrl.signal.aborted) {
+      recoverMissingParts(sessionId, drop.lastSeq, drop.reason).catch(() => {})
+    }
   }
 }
 
@@ -2507,6 +2492,12 @@ export function submitQuestionAnswer(answers: Record<string, string>) {
 async function submitConfirmResponseInner(id: string, action: api.ConfirmAction) {
   try {
     await api.submitConfirmResponse(id, action !== 'reject', action)
+    if (action === 'always') {
+      state.sessionMeta[id] = {
+        ...state.sessionMeta[id],
+        permission_level: 'full',
+      }
+    }
   } catch {
     // server already unblocked via resolve
   }
@@ -2518,6 +2509,12 @@ export function submitToolConfirm(action: api.ConfirmAction) {
     const pc = items.shift()!
     if (items.length === 0) delete state.pendingConfirm[state.currentID]
     pc.resolve(action)
+    if (action === 'always') {
+      state.sessionMeta[state.currentID] = {
+        ...state.sessionMeta[state.currentID],
+        permission_level: 'full',
+      }
+    }
   }
 }
 
@@ -2634,6 +2631,7 @@ export async function rollbackTo(sessionId: string, messageIndex: number) {
     stopStream(sessionId)
   }
 
+  const localDeleted = msgs.slice(messageIndex)
   let result
   try {
     result = await api.rollbackMessages(sessionId, msg.id)
@@ -2645,14 +2643,22 @@ export async function rollbackTo(sessionId: string, messageIndex: number) {
     return
   }
 
+  const deletedMessages = result.deleted_messages?.length
+    ? result.deleted_messages
+    : (result.deleted_count > 0 ? localDeleted : [])
+  if (!deletedMessages.length) {
+    uiError('撤回失败：没有可撤回的消息')
+    return
+  }
+
   state.rollbackUndo[sessionId] = {
-    messages: result.deleted_messages,
+    messages: deletedMessages,
     fromIndex: messageIndex,
   }
 
   msgs.splice(messageIndex)
 
-  const lastUser = [...result.deleted_messages].reverse().find(m => m.role === 'user')
+  const lastUser = [...deletedMessages].reverse().find(m => m.role === 'user')
   state.pendingInput[sessionId] = lastUser?.content || ''
 }
 

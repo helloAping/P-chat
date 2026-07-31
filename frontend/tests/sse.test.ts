@@ -68,6 +68,45 @@ test('consumeSSEStream handles split frames and skips DONE', async () => {
   ])
 })
 
+test('consumeSSEStream resolves as soon as the semantic done event arrives', async () => {
+  const encoder = new TextEncoder()
+  let reads = 0
+  const events: StreamEventLike[] = []
+  const reader = {
+    async read() {
+      reads += 1
+      if (reads === 1) {
+        return {
+          done: false,
+          value: encoder.encode('data: {"type":"tool","tool_name":"exec_command","tool_status":"ok"}\nid: 1\n\n'),
+        }
+      }
+      if (reads === 2) {
+        return {
+          done: false,
+          value: encoder.encode('data: {"type":"done"}\nid: 2\n\n'),
+        }
+      }
+      return new Promise<ReadableStreamReadResult<Uint8Array>>(() => {})
+    },
+  } as ReadableStreamDefaultReader<Uint8Array>
+
+  await Promise.race([
+    consumeSSEStream({
+      reader,
+      label: 'test',
+      onEvent: event => events.push(event),
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timed out waiting for semantic done')), 50)),
+  ])
+
+  assert.deepEqual(events, [
+    { type: 'tool', tool_name: 'exec_command', tool_status: 'ok', seq: 1 },
+    { type: 'done', seq: 2 },
+  ])
+  assert.equal(reads, 2)
+})
+
 test('consumeSSEStream reports the last observed seq when the stream drops', async () => {
   const encoder = new TextEncoder()
   let reads = 0

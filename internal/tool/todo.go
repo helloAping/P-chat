@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 )
 
@@ -59,6 +60,7 @@ func GetSessionTodos(sessionID string) []TodoItem {
 func SetSessionTodos(sessionID string, todos []TodoItem) {
 	todoMu.Lock()
 	defer todoMu.Unlock()
+	todos = todosForStorage(todos)
 	if len(todos) == 0 {
 		delete(todoMap, sessionID)
 	} else {
@@ -69,6 +71,88 @@ func SetSessionTodos(sessionID string, todos []TodoItem) {
 	// Persist to SQLite if a persistence hook is registered.
 	if PersistTodos != nil {
 		PersistTodos(sessionID, todos)
+	}
+}
+
+func normalizeTodoItems(todos []TodoItem) []TodoItem {
+	if len(todos) == 0 {
+		return nil
+	}
+	out := make([]TodoItem, 0, len(todos))
+	for _, t := range todos {
+		t.Status = normalizeTodoStatus(t.Status)
+		out = append(out, t)
+	}
+	return out
+}
+
+func todosForStorage(todos []TodoItem) []TodoItem {
+	out := normalizeTodoItems(todos)
+	if len(out) == 0 {
+		return nil
+	}
+	allTerminal := true
+	for _, t := range out {
+		if t.Status != "done" && t.Status != "cancelled" {
+			allTerminal = false
+			break
+		}
+	}
+	if allTerminal {
+		return nil
+	}
+	return out
+}
+
+func hasActiveTodos(todos []TodoItem) bool {
+	for _, t := range todos {
+		if t.Status == "pending" || t.Status == "in_progress" {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeTodoStatusOntoPlan(existing, incoming []TodoItem) []TodoItem {
+	if len(existing) == 0 || !hasActiveTodos(existing) {
+		return incoming
+	}
+	byID := make(map[string]TodoItem, len(incoming))
+	byContent := make(map[string]TodoItem, len(incoming))
+	for _, t := range incoming {
+		if t.ID != "" {
+			byID[t.ID] = t
+		}
+		if t.Content != "" {
+			byContent[t.Content] = t
+		}
+	}
+	out := make([]TodoItem, len(existing))
+	for i, t := range existing {
+		out[i] = t
+		if next, ok := byID[t.ID]; ok {
+			out[i].Status = next.Status
+			continue
+		}
+		if next, ok := byContent[t.Content]; ok {
+			out[i].Status = next.Status
+		}
+	}
+	return out
+}
+
+func normalizeTodoStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "done", "completed", "complete":
+		return "done"
+	case "cancelled", "canceled", "cancel":
+		return "cancelled"
+	case "in_progress", "in-progress", "running", "doing":
+		return "in_progress"
+	case "pending", "todo", "":
+		return "pending"
+	default:
+		return "pending"
 	}
 }
 
@@ -88,6 +172,8 @@ func handleTodoWrite(ctx context.Context, argsRaw json.RawMessage) (*CallResult,
 	}
 
 	sid, _ := ctx.Value(SessionIDKey{}).(string)
+	args.Todos = normalizeTodoItems(args.Todos)
+	args.Todos = mergeTodoStatusOntoPlan(GetSessionTodos(sid), args.Todos)
 
 	SetSessionTodos(sid, args.Todos)
 

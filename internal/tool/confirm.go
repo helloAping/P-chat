@@ -48,9 +48,10 @@ type pendingConfirm struct {
 }
 
 var (
-	confirmMu      sync.Mutex
-	confirmChs     = make(map[string][]pendingConfirm)
-	confirmAllowed = make(map[string]map[string]struct{})
+	confirmMu          sync.Mutex
+	confirmChs         = make(map[string][]pendingConfirm)
+	confirmAllowed     = make(map[string]map[string]struct{})
+	sessionPermissions = make(map[string]string)
 )
 
 func WaitForConfirmResponse(ctx context.Context, sessionID string, req ConfirmRequest) (ConfirmResponse, error) {
@@ -153,6 +154,46 @@ func normalizeConfirmResponse(resp ConfirmResponse) ConfirmResponse {
 	return resp
 }
 
+// NormalizePermissionLevel normalises persisted/session permission
+// values into the three supported levels.
+func NormalizePermissionLevel(level string) string {
+	switch level {
+	case PermissionAuto, PermissionFull:
+		return level
+	default:
+		return PermissionAsk
+	}
+}
+
+// SetSessionPermissionLevel publishes a live permission override for
+// a session. It is intentionally process-local: conversations persist
+// the durable value in metadata, while this map lets an already-running
+// tool dispatch observe a GUI permission change immediately.
+func SetSessionPermissionLevel(sessionID, level string) {
+	if sessionID == "" {
+		return
+	}
+	confirmMu.Lock()
+	defer confirmMu.Unlock()
+	if level == "" {
+		delete(sessionPermissions, sessionID)
+		return
+	}
+	level = NormalizePermissionLevel(level)
+	sessionPermissions[sessionID] = level
+}
+
+// SessionPermissionLevel returns the live process-local permission
+// override for a session, or "" when no override is installed.
+func SessionPermissionLevel(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	confirmMu.Lock()
+	defer confirmMu.Unlock()
+	return sessionPermissions[sessionID]
+}
+
 func IsConfirmAllowed(sessionID string, req ConfirmRequest) bool {
 	key := confirmAllowKey(req)
 	if sessionID == "" || key == "" {
@@ -247,8 +288,13 @@ func PermissionLevelFromCtx(ctx context.Context) string {
 	if ctx == nil {
 		return PermissionAsk
 	}
+	if sid, ok := ctx.Value(SessionIDKey{}).(string); ok {
+		if level := SessionPermissionLevel(sid); level != "" {
+			return level
+		}
+	}
 	if v, ok := ctx.Value(PermissionLevelKey{}).(string); ok && v != "" {
-		return v
+		return NormalizePermissionLevel(v)
 	}
 	return PermissionAsk
 }

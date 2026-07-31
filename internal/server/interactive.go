@@ -174,6 +174,9 @@ func (h *Handler) ConfirmResponse(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no pending confirm for this session"})
 		return
 	}
+	if body.Action == tool.ConfirmActionAlways {
+		h.setSessionPermissionLevel(id, tool.PermissionFull)
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

@@ -6,6 +6,26 @@ import (
 	"time"
 )
 
+func TestPermissionLevelFromCtxUsesLiveSessionOverride(t *testing.T) {
+	sessionID := "permission-live-" + time.Now().Format("150405.000000000")
+	ctx := WithSessionID(
+		WithPermissionLevel(context.Background(), PermissionAsk),
+		sessionID,
+	)
+
+	SetSessionPermissionLevel(sessionID, PermissionFull)
+	t.Cleanup(func() { SetSessionPermissionLevel(sessionID, "") })
+
+	if got := PermissionLevelFromCtx(ctx); got != PermissionFull {
+		t.Fatalf("PermissionLevelFromCtx = %q, want %q", got, PermissionFull)
+	}
+
+	SetSessionPermissionLevel(sessionID, PermissionAsk)
+	if got := PermissionLevelFromCtx(WithPermissionLevel(ctx, PermissionFull)); got != PermissionAsk {
+		t.Fatalf("PermissionLevelFromCtx after ask override = %q, want %q", got, PermissionAsk)
+	}
+}
+
 func TestConfirmAlwaysAllowStoresSessionRule(t *testing.T) {
 	sessionID := "confirm-always-" + time.Now().Format("150405.000000000")
 	req := ConfirmRequest{

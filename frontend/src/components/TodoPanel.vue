@@ -34,7 +34,8 @@ const allDone = computed(() => {
 
 function todoState(input: { count: number; done: boolean; live: boolean }): DockState {
   if (input.count === 0) return 'hide'
-  if (!input.live) return 'clear'
+  if (!input.live && input.done) return 'clear'
+  if (!input.live) return 'open'
   if (!input.done) return 'open'
   return 'close'
 }
@@ -95,7 +96,6 @@ const active = computed<TodoItem | undefined>(() => {
   if (list.length === 0) return undefined
   return list.find(t => t.status === 'in_progress')
     ?? list.find(t => t.status === 'pending')
-    ?? [...list].reverse().find(t => t.status === 'completed')
     ?? list[0]
 })
 

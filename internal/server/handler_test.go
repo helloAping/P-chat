@@ -771,8 +771,105 @@ func TestPatchSession_ProviderOnly(t *testing.T) {
 		t.Errorf("Provider = %q, want cs", got.Provider)
 	}
 	// Model resets to cs's default (because we didn't pin one).
-	if got.Model == "" {
-		t.Error("Model should default to cs's EffectiveModel, got empty")
+	if got.Model != "doubao-seed-2.0-lite" {
+		t.Errorf("Model = %q, want doubao-seed-2.0-lite", got.Model)
+	}
+}
+
+func TestPatchSession_PermissionLevelUpdatesLiveToolContext(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, "")
+	t.Cleanup(func() { tool.SetSessionPermissionLevel(sess.ID, "") })
+
+	w := patchSession(t, s, sess.ID, `{"permission_level":"full"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := tool.SessionPermissionLevel(sess.ID); got != tool.PermissionFull {
+		t.Fatalf("live permission = %q, want %q", got, tool.PermissionFull)
+	}
+
+	w = patchSession(t, s, sess.ID, `{"permission_level":"ask"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := tool.SessionPermissionLevel(sess.ID); got != tool.PermissionAsk {
+		t.Fatalf("live permission after ask = %q, want %q", got, tool.PermissionAsk)
+	}
+}
+
+func TestConfirmResponseAlwaysPromotesSessionPermission(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, "")
+	t.Cleanup(func() { tool.SetSessionPermissionLevel(sess.ID, "") })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan tool.ConfirmResponse, 1)
+	go func() {
+		resp, err := tool.WaitForConfirmResponse(ctx, sess.ID, tool.ConfirmRequest{
+			ToolName:  "exec_command",
+			Args:      `{"command":"npm run dev"}`,
+			RiskLevel: "high",
+		})
+		if err != nil {
+			t.Errorf("WaitForConfirmResponse returned error: %v", err)
+			return
+		}
+		done <- resp
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		"POST",
+		"/api/v1/sessions/"+sess.ID+"/confirm-response",
+		bytes.NewBufferString(`{"action":"always"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := tool.SessionPermissionLevel(sess.ID); got != tool.PermissionFull {
+		t.Fatalf("live permission = %q, want %q", got, tool.PermissionFull)
+	}
+
+	select {
+	case resp := <-done:
+		if !resp.Approved || resp.Action != tool.ConfirmActionAlways {
+			t.Fatalf("response = %+v, want approved always", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for confirm response")
+	}
+}
+
+func TestSessionModel_FallsBackWhenCachedModelBelongsToDifferentProvider(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o"}`)
+	h := s.Handler()
+
+	h.metaMu.Lock()
+	meta := h.meta[sess.ID]
+	meta.Provider = "cs"
+	meta.Model = "gpt-4o"
+	h.meta[sess.ID] = meta
+	h.metaMu.Unlock()
+
+	if got := h.sessionModel(sess.ID, "cs"); got != "doubao-seed-2.0-lite" {
+		t.Fatalf("sessionModel = %q, want cs default", got)
+	}
+
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if got.Provider != "cs" || got.Model != "doubao-seed-2.0-lite" {
+		t.Fatalf("response meta = %+v, want provider=cs model=doubao-seed-2.0-lite", got)
 	}
 }
 
@@ -934,7 +1031,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := 	New(cfg, agt, store, styleMgr, tools, nil)
+	srv1 := New(cfg, agt, store, styleMgr, tools, nil)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro"}`)
 	if err := store.Close(); err != nil {
@@ -994,12 +1091,12 @@ func TestDeleteSession_DropsCachedMeta(t *testing.T) {
 // exercise is:
 //
 //  1. PATCH a session with {style:"guofeng"}.
- 	//  2. GET /sessions (the list) reports style=guofeng for that id.
- 	//  3. After a server "restart" (new handler on the same store),
- 	//     GET /sessions/:id still reports style=guofeng — proving
- 	//     the SessionResponse has the resolved value (not the raw
- 	//     metadata blob) and survives the hot-path cache being
- 	//     rebuilt from disk.
+//  2. GET /sessions (the list) reports style=guofeng for that id.
+//  3. After a server "restart" (new handler on the same store),
+//     GET /sessions/:id still reports style=guofeng — proving
+//     the SessionResponse has the resolved value (not the raw
+//     metadata blob) and survives the hot-path cache being
+//     rebuilt from disk.
 func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
@@ -1026,7 +1123,7 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := 	New(cfg, agt, store, styleMgr, tools, nil)
+	srv1 := New(cfg, agt, store, styleMgr, tools, nil)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro","style":"tech"}`)
 

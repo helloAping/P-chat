@@ -112,6 +112,10 @@ export async function consumeSSEStream<T extends StreamEventLike>(
       }
 
       emitStreamEvent(event, options.label, options.onEvent)
+      if (event.type === 'done') {
+        done = true
+        break
+      }
     }
   }
 }

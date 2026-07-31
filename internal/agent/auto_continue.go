@@ -92,6 +92,7 @@ func buildAutoContinuePrompt(items []tool.TodoItem) string {
 		}
 	}
 	sb.WriteString("\n请继续执行剩余任务：调用所需工具，完成后用 `todo_write` 标记 `done` 或 `cancelled`。\n")
+	sb.WriteString("必须沿用上面列出的原 todo ID 和内容，只更新 status，不要创建新的 todo_list。\n")
 	sb.WriteString("不要只发文本总结就停止。")
 	return sb.String()
 }
@@ -115,4 +116,3 @@ const (
 	maxToolResultRead    = 8000 // read_file
 	maxToolResultDefault = 6000
 )
-

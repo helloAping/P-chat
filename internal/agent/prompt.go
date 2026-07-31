@@ -225,7 +225,7 @@ func buildToolSpecificHints(availableTools []tool.Tool, kbEnabled bool) string {
 			"使用 `todo_write` 工具创建和管理结构化任务列表。\n" +
 			"何时使用：复杂多步骤任务（3+ 步）、用户明确要求、收到新指令后、开始或完成工作时。\n" +
 			"规则：\n" +
-			"- 始终包含完整列表（替换式，非追加式）\n" +
+			"- 首次创建时包含完整列表；一旦已有未完成列表，后续只能沿用原任务 ID/内容并更新 status，不要重新生成一份新列表\n" +
 			"- 同时只能有一个任务处于 in_progress\n" +
 			"- 完成任务后立即标记为 done（不要批量标记）\n" +
 			"- 如果测试失败、实现不完整或错误未解决，不要标记为 done\n" +

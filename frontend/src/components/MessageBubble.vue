@@ -27,7 +27,7 @@
 //     shown before the first SSE event arrives, so
 //     the user sees a blinking caret alone in the
 //     bubble as soon as they hit send.
-import { computed, nextTick, ref, useTemplateRef, watch } from 'vue'
+import { computed, h, nextTick, ref, useTemplateRef, watch } from 'vue'
 import { marked } from 'marked'
 import {
   ImageIcon, Volume2, Film, FileText, File,
@@ -66,7 +66,7 @@ function renderMd(text: string): string {
   }
   return html
 }
-import { useMessage, useDialog } from 'naive-ui'
+import { NDropdown, useMessage, useDialog, type DropdownOption } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import * as api from '../api/client'
 import { state, regenerateMessage, fetchReplies, activateReply } from '../stores/chat'
@@ -150,6 +150,11 @@ function setActionState(key: string, next: ActionState, autoMs = 0) {
 
 import { onBeforeUnmount } from 'vue'
 onBeforeUnmount(() => {
+  hideMessageContextMenu()
+  for (const key of Object.keys(actionTimers)) {
+    if (actionTimers[key]) clearTimeout(actionTimers[key]!)
+    actionTimers[key] = null
+  }
 })
 
 function pulseAction(key: string) {
@@ -169,6 +174,37 @@ function isAction(key: string, state: ActionState): boolean {
 // screen. Named `toast` rather than `message` so it
 // doesn't shadow `props.message` (the chat Message).
 const toast = useMessage()
+
+const messageContextMenuVisible = ref(false)
+const messageContextMenuX = ref(0)
+const messageContextMenuY = ref(0)
+const messageContextMenuOptions: DropdownOption[] = [
+  {
+    label: '复制',
+    key: 'copy',
+    icon: () => h(Clipboard, { size: 14 }),
+  },
+]
+
+function hideMessageContextMenu() {
+  messageContextMenuVisible.value = false
+}
+
+async function onMessageContextMenu(e: MouseEvent) {
+  e.preventDefault()
+  messageContextMenuVisible.value = false
+  messageContextMenuX.value = e.clientX
+  messageContextMenuY.value = e.clientY
+  await nextTick()
+  messageContextMenuVisible.value = true
+}
+
+async function onMessageContextMenuSelect(key: string | number) {
+  hideMessageContextMenu()
+  if (key === 'copy') {
+    await copyEntireMessage()
+  }
+}
 
 // isLiveTextPart returns true ONLY for the very last
 // part of an actively-streaming message AND that part
@@ -944,7 +980,22 @@ function findPrecedingUserMessageId(): number {
 </script>
 
 <template>
-  <div class="msg" :class="[message.role, { streaming }]" :data-msg-id="message.id">
+  <div
+    class="msg"
+    :class="[message.role, { streaming }]"
+    :data-msg-id="message.id"
+    @contextmenu="onMessageContextMenu"
+  >
+    <NDropdown
+      trigger="manual"
+      placement="bottom-start"
+      :show="messageContextMenuVisible"
+      :x="messageContextMenuX"
+      :y="messageContextMenuY"
+      :options="messageContextMenuOptions"
+      @select="onMessageContextMenuSelect"
+      @clickoutside="hideMessageContextMenu"
+    />
     <!-- Avatar: 32px circle that identifies the role. The
          system role doesn't show an avatar — instead it
          uses a left accent bar to mark itself. -->

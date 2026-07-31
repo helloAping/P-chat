@@ -1548,8 +1548,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// reminder and re-enter the loop. The cap
 				// (MaxAutoContinue) prevents training the
 				// LLM to rely on this as a crutch.
-				if req.AutoContinue && autoContinueCount < MaxAutoContinue {
-					if pending, list := sessionPendingTodos(req.SessionID); len(list) > 0 {
+				if pending, list := sessionPendingTodos(req.SessionID); len(list) > 0 {
+					if req.AutoContinue && autoContinueCount < MaxAutoContinue {
 						autoContinueCount++
 						msgs = append(msgs, llm.ChatMessage{
 							Role:    llm.RoleUser,
@@ -1565,6 +1565,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						})
 						continue
 					}
+					reason := "auto-continue disabled"
+					if req.AutoContinue {
+						reason = "auto-continue limit reached"
+					}
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:    "todo",
+						Step:     "todo-incomplete-stop",
+						Message:  fmt.Sprintf("仍有 %d 项 todo 未完成，已停止继续自动执行 (%s)。", pending, reason),
+						Round:    roundNum,
+						MaxRound: maxRounds,
+					})
 				}
 				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
@@ -1788,10 +1799,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					//   "auto" — auto-approve confirm decisions
 					//   "ask"  — normal confirm flow (default)
 					toolCtx := tctx
-					permLevel, _ := tctx.Value(tool.PermissionLevelKey{}).(string)
-					if permLevel == "" {
-						permLevel = tool.PermissionAsk
-					}
+					permLevel := tool.PermissionLevelFromCtx(tctx)
 					bypass := a.bypassOnce.Swap(false)
 					// /unsafe once → treat this single call as
 					// permission=full so browser_* confirm gates
@@ -2171,6 +2179,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Round:   roundNum,
 				})
 			}
+
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+				Phase:    "llm",
+				Step:     "tool-results-appended",
+				Message:  "工具结果已回填，继续请求模型...",
+				Round:    roundNum,
+				MaxRound: maxRounds,
+			})
 
 			// Tool result pruning: remove old tool output content
 			// after N rounds to keep the context lean. Protects

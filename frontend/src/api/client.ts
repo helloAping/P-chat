@@ -1159,6 +1159,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
 
   const body = JSON.stringify({
     message: opts.message,
+    client_msg_id: opts.client_msg_id,
     provider: opts.provider,
     model: opts.model,
     style: opts.style,

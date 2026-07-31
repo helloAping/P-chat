@@ -860,15 +860,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 	if provider == "" {
 		provider = h.getCfg().LLM.Default
 	}
-	model := m.Model
-	if model == "" {
-		for _, p := range h.getCfg().LLM.Providers {
-			if p.Name == provider {
-				model = p.EffectiveModel()
-				break
-			}
-		}
-	}
+	model := h.sessionModel(cv.ID, provider)
 	return SessionResponse{
 		ID:              cv.ID,
 		Title:           cv.Title,

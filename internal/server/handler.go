@@ -133,6 +133,17 @@ func (h *Handler) persistSessionMeta(id string, m sessionMeta) {
 	_ = h.store.UpdateConversationMeta(id, string(blob))
 }
 
+func (h *Handler) setSessionPermissionLevel(id, level string) {
+	level = tool.NormalizePermissionLevel(level)
+	h.metaMu.Lock()
+	m := h.meta[id]
+	m.PermissionLevel = level
+	h.meta[id] = m
+	h.metaMu.Unlock()
+	h.persistSessionMeta(id, m)
+	tool.SetSessionPermissionLevel(id, level)
+}
+
 // getCfg returns the current config snapshot. Safe for
 // concurrent use; the underlying atomic.Pointer gives every
 // reader a consistent pointer to a specific Config value.
@@ -239,12 +250,17 @@ func (h *Handler) sessionProvider(id string) string {
 
 // sessionModel returns the per-session model name, falling back to
 // the provider's default model (EffectiveModel) when no override is
-// set. Returns "" if the provider itself is unknown.
+// set or when the cached model no longer belongs to the active
+// provider. Returns "" if the provider itself is unknown.
 func (h *Handler) sessionModel(id, provider string) string {
 	m := h.ensureMetaLoaded(id)
-	if m.Model != "" {
+	if m.Model != "" && h.validModel(provider, m.Model) {
 		return m.Model
 	}
+	return h.defaultModelForProvider(provider)
+}
+
+func (h *Handler) defaultModelForProvider(provider string) string {
 	for _, p := range h.getCfg().LLM.Providers {
 		if p.Name == provider {
 			return p.EffectiveModel()

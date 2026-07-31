@@ -30,9 +30,15 @@ async function approve(planOverride?: string) {
     const r = await api.listMessages(id.value, { limit: 200 })
     state.sessionMessages[id.value] = r.messages
     // Submit the continuation message to trigger actual execution.
+    const meta = state.sessionMeta[id.value] || {}
+    const clientMsgId = Date.now() * 1000 + Math.floor(Math.random() * 1000)
     await api.streamMessagesRetry(id.value, {
       message: '请按计划执行',
-      style: state.sessionMeta[id.value]?.style || 'tech',
+      client_msg_id: clientMsgId,
+      provider: meta.provider,
+      model: meta.model,
+      style: meta.style || 'tech',
+      workMode: meta.workMode,
       onStreamDrop: ({ lastSeq, reason }) => {
         // P0-1: same recovery flow as the main input
         // path. The plan-execution stream can also drop

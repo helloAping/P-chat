@@ -172,6 +172,9 @@ func TestStreamEventFromChunkAddsDoneIDs(t *testing.T) {
 	if ev.UserMessageID != 10 || ev.LastMessageID != 12 {
 		t.Fatalf("ids = (%d,%d), want (10,12)", ev.UserMessageID, ev.LastMessageID)
 	}
+	if ev.SessionStatus != "idle" {
+		t.Fatalf("SessionStatus = %q, want idle", ev.SessionStatus)
+	}
 	if ev.Seq != 7 || ev.Provider != "openai" || ev.Model != "gpt-test" {
 		t.Fatalf("metadata not preserved: %+v", ev)
 	}
