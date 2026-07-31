@@ -237,7 +237,7 @@ export const currentMeta = computed(() => {
   if (m) return m
   const def = state.defaultModel
   return {
-    style: 'tech',
+    style: 'off',
     workMode: state.globalWorkMode || 'coding',
     provider: def?.provider || '',
     model: def?.model || '',
@@ -480,7 +480,7 @@ export async function switchSession(id: string) {
   const s = state.sessions.find(s => s.id === id)
   if (s) {
     state.sessionMeta[id] = {
-      style:     s.style || 'tech',
+      style:     s.style || 'off',
       workMode:  s.work_mode || state.globalWorkMode || 'coding',
       provider:  s.provider || '',
       model:     s.model || '',

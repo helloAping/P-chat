@@ -29,9 +29,9 @@ type StreamChunk struct {
 	// o1 reasoning tokens). Empty for models that don't
 	// emit thinking. Surfaced all the way to the UI as a
 	// collapsible "thinking" block (DeepSeek-style).
-	Thinking string
-	Done     bool
-	Err      error
+	Thinking  string
+	Done      bool
+	Err       error
 	TokensIn  int
 	TokensOut int
 
@@ -54,9 +54,9 @@ type ToolCallDelta struct {
 // Temperature == 0 and TopP == 0 it picks a default; MaxTokens == 0
 // means "no cap".
 type ChatOptions struct {
-	Temperature    float64
-	TopP           float64
-	MaxTokens      int
+	Temperature     float64
+	TopP            float64
+	MaxTokens       int
 	ReasoningEffort string // off|low|medium|high|max; empty means not set
 }
 
@@ -241,6 +241,16 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
 		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
 	}
+	log.Printf("%s[llm] request provider=%s model=%s messages=%d tools=%d estimated_tokens=%d context_window=%d body_bytes=%d",
+		trace.LogPrefix(ctx),
+		p.name,
+		model,
+		len(messages),
+		len(tools),
+		EstimatePromptTokens(messages, tools),
+		normalizedContextWindow(c.ContextWindow(p.name, model)),
+		len(req.Body),
+	)
 
 	// Send the request and return the parsed stream.
 	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
@@ -425,11 +435,11 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		// dump into the issue tracker.
 		reader := bufio.NewReaderSize(resp.Body, 1<<20)
 		var (
-			rawChunks      int
-			parseFailures  int
-			contentChars   int
-			thinkingChars  int
-			choiceCount    int
+			rawChunks     int
+			parseFailures int
+			contentChars  int
+			thinkingChars int
+			choiceCount   int
 		)
 		for {
 			line, err := reader.ReadBytes('\n')
@@ -605,31 +615,31 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 // `ReasoningContent` — that field would be silently dropped
 // by the JSON decoder.
 type openaiStreamResponse struct {
-	ID                string                         `json:"id"`
-	Object            string                         `json:"object"`
-	Created           int64                          `json:"created"`
-	Model             string                         `json:"model"`
-	Choices           []openaiStreamChoice           `json:"choices"`
-	Usage             *openaiStreamUsage             `json:"usage,omitempty"`
-	SystemFingerprint string                         `json:"system_fingerprint,omitempty"`
+	ID                string               `json:"id"`
+	Object            string               `json:"object"`
+	Created           int64                `json:"created"`
+	Model             string               `json:"model"`
+	Choices           []openaiStreamChoice `json:"choices"`
+	Usage             *openaiStreamUsage   `json:"usage,omitempty"`
+	SystemFingerprint string               `json:"system_fingerprint,omitempty"`
 }
 
 type openaiStreamChoice struct {
-	Index        int                       `json:"index"`
-	Delta        openaiStreamChoiceDelta   `json:"delta"`
-	FinishReason *string                   `json:"finish_reason,omitempty"`
+	Index        int                     `json:"index"`
+	Delta        openaiStreamChoiceDelta `json:"delta"`
+	FinishReason *string                 `json:"finish_reason,omitempty"`
 }
 
 type openaiStreamChoiceDelta struct {
-	Role             string                    `json:"role,omitempty"`
-	Content          string                    `json:"content,omitempty"`
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
 	// Text is the legacy /v1/completions field name
 	// (completions API, not chat). Some OpenAI-compatible
 	// proxies that route the chat completions endpoint
 	// through a completions-style backend emit `text`
 	// instead of `content` — we read both and pick whichever
 	// is non-empty.
-	Text             string                    `json:"text,omitempty"`
+	Text string `json:"text,omitempty"`
 	// ReasoningContent is the chain-of-thought / reasoning
 	// delta. Sent by DeepSeek (their `reasoning_content`
 	// field) and by OpenAI o-series models (their
@@ -647,10 +657,10 @@ type openaiStreamFunctionCall struct {
 }
 
 type openaiStreamToolCall struct {
-	Index    int                       `json:"index"`
-	ID       string                    `json:"id"`
-	Type     string                    `json:"type"`
-	Function openaiStreamToolCallFunc  `json:"function"`
+	Index    int                      `json:"index"`
+	ID       string                   `json:"id"`
+	Type     string                   `json:"type"`
+	Function openaiStreamToolCallFunc `json:"function"`
 }
 
 type openaiStreamToolCallFunc struct {
@@ -788,6 +798,15 @@ func (c *Client) ContextWindow(providerName, modelName string) int {
 	return 0
 }
 
+// normalizedContextWindow provides the same conservative fallback used by
+// the agent when a model omits max_tokens_context.
+func normalizedContextWindow(window int) int {
+	if window <= 0 {
+		return DefaultContextWindow
+	}
+	return window
+}
+
 // ModelMaxTokensOutput returns the per-model MaxTokensOutput
 // override, or 0 if the model is unknown / unset. Callers usually
 // fall back to LLMConfig.MaxTokens (the global setting) when
@@ -861,7 +880,9 @@ func topLevelKeys(payload []byte) []string {
 // payload is a normal response.
 //
 // A proxy that returns 200 OK with
-//   {"error": {"message": "...", "type": "...", "code": "..."}}
+//
+//	{"error": {"message": "...", "type": "...", "code": "..."}}
+//
 // is a common OpenAI-compatible pattern for surfacing
 // upstream failures (rate limits, quota exceeded,
 // bad request) without breaking the SSE framing. The
@@ -914,7 +935,9 @@ func extractProxyError(payload []byte) string {
 //
 // Note: `message` is intentionally NOT in the list.
 // A common proxy pattern is
-//   {"error": {"message": "..."}}
+//
+//	{"error": {"message": "..."}}
+//
 // and including `message` as a content candidate
 // would (and did) cause the walker to surface the
 // error message as a fake assistant reply. The

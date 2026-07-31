@@ -68,7 +68,7 @@ llm:
       model: "llama3"
 
 style:
-  default: "tech"
+  default: "off"
 
 ui:
   close_behavior: "exit"  # exit | tray

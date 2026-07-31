@@ -28,22 +28,47 @@ func EstimateTokens(s string) int {
 }
 
 // EstimateTokensMessages returns a rough token estimate for a slice of
-// ChatMessage. It sums the token count of every message's Content plus a
-// small per-message overhead.
+// ChatMessage. It counts the primary content plus protocol-relevant
+// metadata such as tool arguments, attachment names, and MIME types.
 func EstimateTokensMessages(msgs []ChatMessage) int {
 	total := 0
 	for _, m := range msgs {
 		total += EstimateTokens(m.Content)
-		total += 4 // per-message metadata overhead
+		total += EstimateTokens(m.ToolInput)
+		total += EstimateTokens(m.ToolName)
+		total += EstimateTokens(m.ToolID)
+		total += EstimateTokens(m.Name)
+		total += EstimateTokens(m.MimeType)
+		total += 12 // role/type/protocol wrapper overhead
 	}
 	return total
 }
 
+// EstimateTokensTools returns a rough token estimate for the tool schema
+// block sent with a model request. Tool definitions are part of the prompt
+// budget even though they are not ChatMessage rows.
+func EstimateTokensTools(tools []ToolDef) int {
+	total := 0
+	for _, t := range tools {
+		total += EstimateTokens(t.Name)
+		total += EstimateTokens(t.Description)
+		total += EstimateTokens(string(t.Parameters))
+		total += 24 // JSON schema/function wrapper overhead
+	}
+	return total
+}
+
+// EstimatePromptTokens returns a rough estimate of the complete prompt
+// payload: messages plus the tool schema block.
+func EstimatePromptTokens(msgs []ChatMessage, tools []ToolDef) int {
+	return EstimateTokensMessages(msgs) + EstimateTokensTools(tools)
+}
+
 // DefaultContextWindow is used when the model's context length is unknown.
-const DefaultContextWindow = 128_000
+const DefaultContextWindow = 64_000
 
 // maxOutputTokensDefault is the default max output tokens for estimation.
-const maxOutputTokensDefault = 32_000
+const maxOutputTokensDefault = 8_192
 
 // AutoCompactBuffer is the token headroom reserved before triggering
 // auto-compression. Mirrors opencode's 20k buffer.

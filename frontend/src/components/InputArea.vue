@@ -13,7 +13,8 @@ import ModelPicker from './ModelPicker.vue'
 import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
-  Lock, Unlock, Key, Database, Terminal, Copy, Scissors, ClipboardPaste, TextCursorInput,
+  Lock, Unlock, Key, Database, Copy, Scissors, ClipboardPaste, TextCursorInput,
+  Settings,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -1079,7 +1080,9 @@ onMounted(() => {
 // and the advanced row (reasoning + KB) which lives behind
 // the "更多" toggle.
 
-const styleOptions = ref<{ label: string; value: string }[]>([])
+const styleOptions = ref<{ label: string; value: string }[]>([
+  { label: '关闭', value: 'off' },
+])
 const workModeOptions = [
   { label: '编码 (coding)', value: 'coding' },
   { label: '日常工作 (daily)', value: 'daily' },
@@ -1130,7 +1133,7 @@ async function onStylePick(v: string) {
 }
 
 const currentStyleValue = computed({
-  get: () => currentMeta.value.style || 'tech',
+  get: () => currentMeta.value.style || 'off',
   set: (v: string) => onStylePick(v),
 })
 
@@ -1160,10 +1163,6 @@ const currentWorkModeValue = computed({
 const currentWorkModeLabel = computed(() =>
   currentWorkModeValue.value === 'daily' ? '日常' : '编码',
 )
-const workModeIcon = computed(() =>
-  currentWorkModeValue.value === 'daily' ? FileText : Terminal,
-)
-
 // Display label for the reasoning picker. Maps the enum
 // value (off/low/medium/high/max) to the Chinese label
 // that reasoningEffortOptions uses, so the button shows
@@ -1180,6 +1179,10 @@ const currentReasoningLabel = computed(() => {
   const v = reasoningEffort.value || 'off'
   return REASONING_LABELS[v] || v
 })
+
+const sessionConfigSummary = computed(() =>
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 风格${currentStyleLabel.value}`,
+)
 
 // Display label for the knowledge base picker. The "off"
 // and "all" pseudo-bases get short labels so the button
@@ -1301,77 +1304,6 @@ onMounted(() => {
           @paste="onPaste"
           @contextmenu="onInputContextMenu"
         ></textarea>
-        <!-- Session-level option pickers (style + reasoning).
-             These all share the same visual treatment —
-             a compact pill button with a small chevron that
-             opens an NDropdown — so they read as a single
-             "session settings" cluster on the right side of
-             the input. The dropdown is preferred over
-             NSelect here because:
-               1. NSelect's chrome (border + chevron) would
-                  fight the input-wrap's own border and the
-                  attach/send button styling, producing a
-                  visually busy row.
-               2. The trigger is purely cosmetic — the actual
-                  selection lives in the dropdown menu, so
-                  the button just needs to look "pressable"
-                  and show the current value.
-             Reasoning was promoted from the "more" advanced
-             row (PR #10) so the user doesn't have to expand
-             a hidden section to reach a setting they touch
-             on most tasks. -->
-        <NDropdown
-          trigger="click"
-          placement="top-end"
-          :options="styleOptions.map(o => ({ key: o.value, label: o.label }))"
-          @select="(key: string | number) => onStylePick(String(key))"
-        >
-          <button
-            type="button"
-            class="opt-pick"
-            :disabled="!state.currentID"
-            :title="`当前风格: ${currentStyleLabel}`"
-            :aria-label="`当前风格: ${currentStyleLabel}`"
-          >
-            <span class="opt-pick-label">{{ currentStyleLabel }}</span>
-            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
-          </button>
-        </NDropdown>
-        <NDropdown
-          trigger="click"
-          placement="top-end"
-          :options="workModeOptions.map(o => ({ key: o.value, label: o.label }))"
-          @select="(key: string | number) => onWorkModePick(String(key))"
-        >
-          <button
-            type="button"
-            class="opt-pick opt-pick--narrow"
-            :disabled="!state.currentID"
-            :title="`工作模式: ${currentWorkModeValue}`"
-            :aria-label="`工作模式: ${currentWorkModeValue}`"
-          >
-            <component :is="workModeIcon" :size="12" class="opt-pick-icon" />
-            <span class="opt-pick-label">{{ currentWorkModeLabel }}</span>
-            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
-          </button>
-        </NDropdown>
-        <NDropdown
-          trigger="click"
-          placement="top-end"
-          :options="(reasoningEffortOptions[0]?.children || []).map(o => ({ key: o.value, label: o.label }))"
-          @select="(key: string | number) => pickReasoning(String(key))"
-        >
-          <button
-            type="button"
-            class="opt-pick opt-pick--narrow"
-            :disabled="!state.currentID"
-            :title="`推理等级: ${currentReasoningLabel}`"
-            :aria-label="`推理等级: ${currentReasoningLabel}`"
-          >
-            <span class="opt-pick-label">{{ currentReasoningLabel }}</span>
-            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
-          </button>
-        </NDropdown>
         <button
           v-if="!isStreaming"
           class="send-btn"
@@ -1461,6 +1393,82 @@ onMounted(() => {
             </button>
           </template>
         </ModelPicker>
+
+        <NPopover
+          v-model:show="showSessionConfig"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
+          style="padding: 0; background: transparent; box-shadow: none;"
+        >
+          <template #trigger>
+            <button
+              type="button"
+              class="ctrl-btn session-config-trigger"
+              :disabled="!state.currentID"
+              :title="sessionConfigSummary"
+              :aria-label="`会话设置：${sessionConfigSummary}`"
+            >
+              <Settings :size="13" />
+              <span class="ctrl-btn-label">会话设置</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }}</span>
+            </button>
+          </template>
+          <div class="session-config-popover">
+            <div class="session-config-head">
+              <Settings :size="14" />
+              <span>会话设置</span>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">风格</div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in styleOptions"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': currentStyleValue === opt.value }"
+                  @click="onStylePick(opt.value)"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">类型</div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in workModeOptions"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': currentWorkModeValue === opt.value }"
+                  @click="onWorkModePick(opt.value)"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">思考</div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in reasoningEffortOptions[0]?.children || []"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': reasoningEffort === opt.value }"
+                  @click="pickReasoning(opt.value)"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </NPopover>
 
         <!-- Plan mode toggle: stays inline because the user
              switches it often (planning vs building a feature). -->
@@ -2046,6 +2054,88 @@ onMounted(() => {
   font-family: var(--font-mono);
 }
 .model-badge--unset .model-badge-name { color: var(--text-tertiary); font-style: italic; }
+
+/* --- Session config popover ------------------------------------ */
+.session-config-trigger {
+  background: var(--surface-1);
+  border-color: var(--border-subtle);
+  max-width: 260px;
+}
+.session-config-trigger:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--border-default);
+}
+.session-config-summary {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 400;
+  max-width: 128px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-config-popover {
+  width: min(420px, calc(100vw - 32px));
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 8px;
+}
+.session-config-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 6px 8px;
+}
+.session-config-row {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 8px 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+.session-config-label {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 26px;
+}
+.session-config-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.session-config-choice {
+  height: 26px;
+  padding: 0 9px;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.session-config-choice:hover {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.session-config-choice--active {
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-600);
+}
+.session-config-choice--active:hover {
+  background: var(--brand-100);
+  color: var(--brand-700);
+}
 
 /* --- Permission popover ---------------------------------------- */
 /* The permission picker is an NPopover that anchors to the

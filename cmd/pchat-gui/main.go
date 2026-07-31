@@ -192,6 +192,8 @@ type App struct {
 	serverCmd          *exec.Cmd
 	backendURL         atomic.Pointer[string] // "http://127.0.0.1:PORT"
 	serverMu           sync.Mutex
+	streamMu           sync.Mutex
+	activeStreams      map[string]*activeStream
 	serverStopped      bool
 	quitting           atomic.Bool
 	closePromptPending atomic.Bool
@@ -199,9 +201,13 @@ type App struct {
 	tray               *trayHandle
 }
 
+type activeStream struct {
+	cancel context.CancelFunc
+}
+
 // NewApp creates a new App application struct.
 func NewApp() *App {
-	return &App{}
+	return &App{activeStreams: make(map[string]*activeStream)}
 }
 
 // ServeHTTP routes the request. If pchat-server is healthy and a backend
@@ -297,8 +303,13 @@ func (a *App) StreamMessages(sessionID string, bodyJSON string) (int, error) {
 		return 0, fmt.Errorf("pchat-server not ready (no backend URL)")
 	}
 	url := fmt.Sprintf("%s/api/v1/sessions/%s/messages", backend, sessionID)
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(bodyJSON))
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := a.registerStreamCancel(sessionID, cancel)
+	defer a.unregisterStreamCancel(sessionID, stream)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(bodyJSON))
 	if err != nil {
+		cancel()
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -400,6 +411,35 @@ func (a *App) StreamMessages(sessionID string, bodyJSON string) (int, error) {
 // cancellation, ctx propagation) has a place to live.
 func (a *App) CancelStream(sessionID string) {
 	log.Printf("CancelStream: session=%s", sessionID)
+	a.streamMu.Lock()
+	stream := a.activeStreams[sessionID]
+	a.streamMu.Unlock()
+	if stream != nil {
+		stream.cancel()
+	}
+}
+
+func (a *App) registerStreamCancel(sessionID string, cancel context.CancelFunc) *activeStream {
+	a.streamMu.Lock()
+	defer a.streamMu.Unlock()
+	if a.activeStreams == nil {
+		a.activeStreams = make(map[string]*activeStream)
+	}
+	if prev := a.activeStreams[sessionID]; prev != nil {
+		prev.cancel()
+	}
+	stream := &activeStream{cancel: cancel}
+	a.activeStreams[sessionID] = stream
+	return stream
+}
+
+func (a *App) unregisterStreamCancel(sessionID string, stream *activeStream) {
+	a.streamMu.Lock()
+	defer a.streamMu.Unlock()
+	if a.activeStreams[sessionID] == stream {
+		delete(a.activeStreams, sessionID)
+	}
+	stream.cancel()
 }
 
 // openExplorer opens the OS file manager at the given path.

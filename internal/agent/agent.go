@@ -1280,7 +1280,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// and rebuild the system prompt so the provider call
 			// doesn't fail with a 413. On the last round tools
 			// are disabled anyway so compact isn't worth it.
-			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, ch, nextSeq, roundNum, maxRounds) {
+			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, toolDefs, ch, nextSeq, roundNum, maxRounds) {
 				continue
 			}
 
@@ -1305,10 +1305,22 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: "max-steps", Message: "已达到轮次上限 — 强制文本回复（不再调用工具）", Round: roundNum, MaxRound: maxRounds})
 			}
 
+			roundMsgsForLLM, droppedToolMsgs := repairToolMessagePairs(roundMsgs)
+			if droppedToolMsgs > 0 {
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:    "compact",
+					Step:     "tool-pair-repair",
+					Message:  fmt.Sprintf("已清理 %d 条不完整工具上下文，避免上游拒绝请求", droppedToolMsgs),
+					Round:    roundNum,
+					MaxRound: maxRounds,
+				})
+			}
+
 			// LLM stream with retry for recoverable errors
 			// (rate_limit, server_error, network, timeout).
 			const maxLLMRetries = 3
 			var retryableErr error
+			contextRecoveryUsed := false
 		att:
 			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
 				if attempt > 1 {
@@ -1341,9 +1353,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				//
 				// See needsNormalizedToolResults for the
 				// provider list.
-				msgsForLLM := roundMsgs
+				msgsForLLM := roundMsgsForLLM
 				if needsNormalizedToolResults(req.Provider) {
-					msgsForLLM = normalizeToolResults(roundMsgs)
+					msgsForLLM = normalizeToolResults(roundMsgsForLLM)
 				}
 				stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
 				for chunk := range stream {
@@ -1354,6 +1366,24 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							errMsg = apiErr.Message
 							errSuggestion = apiErr.Suggestion
 							errKind = apiErr.Kind.String()
+							if apiErr.Kind == llm.KindBadRequest &&
+								!contextRecoveryUsed &&
+								!isLastRound {
+								before := llm.EstimatePromptTokens(roundMsgsForLLM, roundTools)
+								if shrinkContextForBadRequest(&roundMsgsForLLM, roundTools, a.llm.ContextWindow(req.Provider, req.Model), compactBuffer(a.cfg)) {
+									contextRecoveryUsed = true
+									after := llm.EstimatePromptTokens(roundMsgsForLLM, roundTools)
+									retryableErr = chunk.Err
+									sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+										Phase:    "compact",
+										Step:     "bad-request-recovery",
+										Message:  fmt.Sprintf("上游拒绝了当前请求，已收缩上下文并重试一次（≈%d -> %d tokens）", before, after),
+										Round:    roundNum,
+										MaxRound: maxRounds,
+									})
+									break
+								}
+							}
 							if isRetryable(apiErr.Kind) && attempt < maxLLMRetries {
 								retryableErr = chunk.Err
 								break // break inner stream loop, retry outer
@@ -1497,7 +1527,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// execution would leak orphan tool_calls into
 			// the next round's history. Fall through to
 			// the tool execution block below.
-			a.tryAutoCompact(ctx, &msgs, req, ch, nextSeq, roundNum, maxRounds)
+			a.tryAutoCompact(ctx, &msgs, req, toolDefs, ch, nextSeq, roundNum, maxRounds)
 
 			// Append tool_call messages for each tool call.
 			//
@@ -2308,6 +2338,7 @@ func (a *Agent) tryAutoCompact(
 	ctx context.Context,
 	msgs *[]llm.ChatMessage,
 	req ChatRequest,
+	tools []llm.ToolDef,
 	ch chan<- ChatStreamChunk,
 	nextSeq func() uint64,
 	roundNum, maxRounds int,
@@ -2315,7 +2346,7 @@ func (a *Agent) tryAutoCompact(
 	if a.summarizer == nil || a.store == nil || req.SessionID == "" {
 		return false
 	}
-	total := llm.EstimateTokensMessages(*msgs)
+	total := llm.EstimatePromptTokens(*msgs, tools)
 	ctxWindow := a.llm.ContextWindow(req.Provider, req.Model)
 	buf := llm.AutoCompactBuffer
 	if a.cfg != nil && a.cfg.Limits.AutoCompactBuffer > 0 {
@@ -2345,13 +2376,14 @@ func (a *Agent) tryAutoCompact(
 		// Fallback: hard-truncate the message list so the LLM
 		// call doesn't fail with a 413. Drop oldest non-system
 		// messages to stay within the usable context window.
-		usable := llm.UsableContextWithBuf(ctxWindow, buf)
+		usable := llm.UsableContextWithBuf(ctxWindow, buf) - llm.EstimateTokensTools(tools)
 		if usable > 0 {
 			truncateToFit(msgs, usable)
+			*msgs, _ = repairToolMessagePairs(*msgs)
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 				Phase:    "compact",
 				Step:     "auto-compact-fallback",
-				Message:  fmt.Sprintf("压缩失败，已截断上下文至 ≈%d tokens", llm.EstimateTokensMessages(*msgs)),
+				Message:  fmt.Sprintf("压缩失败，已截断上下文至 ≈%d tokens", llm.EstimatePromptTokens(*msgs, tools)),
 				Round:    roundNum,
 				MaxRound: maxRounds,
 			})
@@ -2392,8 +2424,55 @@ func (a *Agent) tryAutoCompact(
 		*msgs = newMsgs
 	}
 
+	postTotal := llm.EstimatePromptTokens(*msgs, tools)
+	usable := llm.UsableContextWithBuf(ctxWindow, buf)
+	if postTotal > usable {
+		msgBudget := usable - llm.EstimateTokensTools(tools)
+		if msgBudget < usable/4 {
+			msgBudget = usable / 4
+		}
+		truncateToFit(msgs, msgBudget)
+		*msgs, _ = repairToolMessagePairs(*msgs)
+		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+			Phase:    "compact",
+			Step:     "auto-compact-truncate",
+			Message:  fmt.Sprintf("压缩后上下文仍偏大，已二次截断至 ≈%d tokens", llm.EstimatePromptTokens(*msgs, tools)),
+			Round:    roundNum,
+			MaxRound: maxRounds,
+		})
+	}
+
 	_ = summary
 	return true
+}
+
+func compactBuffer(cfg *config.Config) int {
+	if cfg != nil && cfg.Limits.AutoCompactBuffer > 0 {
+		return cfg.Limits.AutoCompactBuffer
+	}
+	return llm.AutoCompactBuffer
+}
+
+// shrinkContextForBadRequest applies a one-shot conservative reduction after
+// a provider rejects the request as malformed. It is deliberately separate
+// from normal auto-compaction because a proxy may reject a payload before its
+// actual token limit is visible to us.
+func shrinkContextForBadRequest(msgs *[]llm.ChatMessage, tools []llm.ToolDef, contextWindow, buffer int) bool {
+	before := llm.EstimatePromptTokens(*msgs, tools)
+	usable := llm.UsableContextWithBuf(contextWindow, buffer)
+	budget := usable - llm.EstimateTokensTools(tools)
+	if budget <= 0 {
+		return false
+	}
+	budget = budget * 3 / 4
+	if budget <= 0 || before <= budget {
+		return false
+	}
+
+	truncateToFit(msgs, budget)
+	repaired, _ := repairToolMessagePairs(*msgs)
+	*msgs = repaired
+	return llm.EstimatePromptTokens(*msgs, tools) < before
 }
 
 func toolCallSignature(calls []nativeToolCall) string {

@@ -88,7 +88,7 @@ export interface Session {
   // in the SessionResponse (see internal/server/handler.go
   // sessionToResponse). These may be empty when the session has
   // no override, in which case the client falls back to
-  // "tech" / "" / "" as a safe default for the UI.
+  // "off" / "" / "" as a safe default for the UI.
   style?: string
   work_mode?: string
   provider?: string
@@ -1205,6 +1205,20 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
     // done. Nothing to do here.
   })
 
+  const cancelWailsStream = () => {
+    try {
+      void CancelStream(sessionId)
+    } catch { /* best-effort cancellation */ }
+  }
+  opts.signal?.addEventListener('abort', cancelWailsStream, { once: true })
+  if (opts.signal?.aborted) {
+    cancelWailsStream()
+    offEvent()
+    offEnd()
+    opts.signal.removeEventListener('abort', cancelWailsStream)
+    return
+  }
+
   try {
     await StreamMessages(sessionId, body)
     // Give the final event a tick to land in the JS event loop.
@@ -1212,6 +1226,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   } catch (e: any) {
     offEvent()
     offEnd()
+    opts.signal?.removeEventListener('abort', cancelWailsStream)
     if (opts.signal?.aborted) return
     // P0-1: Wails path drop. The fetch-path's
     // onStreamDrop fires inside streamMessagesViaFetch;
@@ -1230,6 +1245,7 @@ export async function streamMessages(sessionId: string, opts: SendOptions): Prom
   }
   offEvent()
   offEnd()
+  opts.signal?.removeEventListener('abort', cancelWailsStream)
 }
 
 // streamMessagesViaFetch is the same-origin fetch() fallback used
