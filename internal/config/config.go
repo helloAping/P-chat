@@ -930,8 +930,15 @@ func Default() *Config {
 			ExecDangerousPatterns: defaultDangerousPatterns(),
 		},
 		SubAgent: SubAgentConfig{
-			// Default safety stance: deny exec_command in sub-agents.
-			// Users can override by setting allowed_tools explicitly.
+			// Default safety stance: deny exec_command for sub-agents
+			// that inherit the parent's full tool set (general-purpose,
+			// custom agents with no whitelist). Built-in read-only
+			// agents (explore/plan) list exec_command on their own
+			// whitelist for read-only shell use — that per-agent
+			// whitelist takes priority over this global deny (see
+			// subagent.filterSubAgentTools), and the sandbox still
+			// guards dangerous commands at dispatch time. Users can
+			// override by setting allowed_tools explicitly.
 			DeniedTools: []string{"exec_command"},
 			// Enable result caching by default so repeated sub-agent
 			// tasks (e.g. searching the same file) hit the cache.
