@@ -16,3 +16,10 @@ test('project switch does not abort or delete active streams', () => {
   assert.equal(body.includes('delete state.streaming'), false)
   assert.equal(body.includes('state.streaming ='), false)
 })
+
+test('collapsed top bar brand opens the session navigation', () => {
+  const source = readFileSync(new URL('../src/components/TopBar.vue', import.meta.url), 'utf8')
+
+  assert.match(source, /v-if="props\.collapsed"[\s\S]*?@click="toggleSidebar"/)
+  assert.match(source, /aria-label="打开会话列表"/)
+})

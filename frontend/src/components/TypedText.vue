@@ -16,7 +16,7 @@
 // kept for API compatibility but is no longer used internally
 // — the parent controls lifecycle.
 
-import { ref, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 
 const props = withDefaults(defineProps<{
   text: string
@@ -36,10 +36,11 @@ const update = (t: string) => {
 }
 
 watch(() => props.text, update, { immediate: true })
+onMounted(() => update(props.text))
 </script>
 
 <template>
-  <pre ref="el" class="typed-text">{{ text }}</pre>
+  <pre ref="el" class="typed-text"></pre>
 </template>
 
 <style scoped>

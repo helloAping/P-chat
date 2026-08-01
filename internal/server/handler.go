@@ -69,6 +69,8 @@ type sessionMeta struct {
 	// guard in agent.ChatWithTools reads through
 	// sessionAutoContinue() which applies the default.
 	AutoContinue *bool
+	// TodoLongRunMode is nil when the session inherits the global policy.
+	TodoLongRunMode *config.TodoLongRunMode
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -87,7 +89,8 @@ type sessionMetaBlob struct {
 	// AutoContinue mirrors sessionMeta.AutoContinue. Pointer
 	// so JSON omits it when never set, instead of
 	// round-tripping "false" as if the user had disabled it.
-	AutoContinue *bool `json:"auto_continue,omitempty"`
+	AutoContinue    *bool                   `json:"auto_continue,omitempty"`
+	TodoLongRunMode *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager) *Handler {
@@ -122,6 +125,7 @@ func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
 		PermissionLevel: m.PermissionLevel,
 		KnowledgeBase:   m.KnowledgeBase,
 		AutoContinue:    m.AutoContinue,
+		TodoLongRunMode: m.TodoLongRunMode,
 	}
 }
 
@@ -205,6 +209,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.PermissionLevel = blob.PermissionLevel
 				m.KnowledgeBase = blob.KnowledgeBase
 				m.AutoContinue = blob.AutoContinue
+				m.TodoLongRunMode = blob.TodoLongRunMode
 			}
 		}
 	}
@@ -237,6 +242,16 @@ func (h *Handler) sessionAutoContinue(id string) bool {
 		return true
 	}
 	return *m.AutoContinue
+}
+
+// sessionTodoLongRunMode resolves the session override, then the global
+// default. Normalization keeps older metadata blobs compatible.
+func (h *Handler) sessionTodoLongRunMode(id string) config.TodoLongRunMode {
+	m := h.ensureMetaLoaded(id)
+	if m.TodoLongRunMode != nil {
+		return config.NormalizeTodoLongRunMode(*m.TodoLongRunMode)
+	}
+	return config.NormalizeTodoLongRunMode(h.getCfg().Limits.TodoLongRunMode)
 }
 
 func (h *Handler) sessionProvider(id string) string {
@@ -336,6 +351,9 @@ type SendMessageRequest struct {
 	Message  string `json:"message" binding:"required"`
 	Style    string `json:"style,omitempty"`
 	WorkMode string `json:"work_mode,omitempty"`
+	// TodoMode is "resume", "clear", or "auto". Empty keeps the
+	// backward-compatible auto behavior.
+	TodoMode string `json:"todo_mode,omitempty"`
 	// Provider / Model, when set, override the per-session defaults
 	// for this turn. They are also written back to the per-session
 	// meta so subsequent turns keep using the new model. Empty
@@ -408,7 +426,8 @@ type UpdateSessionMetaRequest struct {
 	// distinct from `false`: when omitted, the per-session
 	// setting is left unchanged; when present, it overrides
 	// whatever was there before (including the default-true).
-	AutoContinue *bool `json:"auto_continue,omitempty"`
+	AutoContinue    *bool                   `json:"auto_continue,omitempty"`
+	TodoLongRunMode *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -434,7 +453,8 @@ type SessionResponse struct {
 	// LLM" guard toggle, default true. Surface so the UI can
 	// show a status pill ("auto-continue on/off") next to the
 	// todo panel.
-	AutoContinue bool `json:"auto_continue"`
+	AutoContinue    bool   `json:"auto_continue"`
+	TodoLongRunMode string `json:"todo_long_run_mode"`
 }
 
 // MessageResponse is the JSON form of a single message in a
@@ -677,6 +697,13 @@ type StreamEvent struct {
 	ToolResultFull string `json:"tool_result_full,omitempty"`
 	ToolError      string `json:"tool_error,omitempty"`
 	ToolElapsed    string `json:"tool_elapsed,omitempty"`
+	// Structured tool result fields supplement the legacy tool_result preview.
+	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
+	ToolSummary      string   `json:"tool_summary,omitempty"`
+	ToolChangedPaths []string `json:"tool_changed_paths,omitempty"`
+	ToolRetryable    bool     `json:"tool_retryable,omitempty"`
+	ToolRequiresUser bool     `json:"tool_requires_user,omitempty"`
+	ToolNextAction   string   `json:"tool_next_action,omitempty"`
 	// ToolArgs is the JSON-encoded arguments string the
 	// tool was called with (best-effort; LLM clients only
 	// surface this once the call is complete, not as a

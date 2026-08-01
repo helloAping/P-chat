@@ -18,6 +18,10 @@ func TestMatchCommand(t *testing.T) {
 		{"/m", "/model", "", true},
 		{"/unknown", "", "", false},
 		{"/style cute", "/style", "cute", true},
+		{"/context", "/context", "", true},
+		{"/ctx conv_x", "/context", "conv_x", true},
+		{"/reason high", "/reasoning", "high", true},
+		{"/regen 42", "/regen", "42", true},
 		{"/s", "/style", "", true},
 		{"", "", "", false},
 	}

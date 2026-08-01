@@ -149,8 +149,42 @@ func tryForward(chunk agent.ChatStreamChunk, onEvent func(agent.ChatStreamChunk)
 	onEvent(chunk)
 }
 
-// Cache stores recent sub-agent results keyed by a hash of
-// (description, style, provider). Safe for concurrent use.
+// newSubAgentStore 为一次子代理运行创建独立的进程内持久化。
+// It must never use memory.Open, which targets the user's global chat
+// database.
+func newSubAgentStore() (*memory.Store, error) {
+	return memory.OpenAt(":memory:", 100)
+}
+
+// subAgentCacheKey 将所有影响子代理执行的输入压缩为稳定缓存 identity。
+// Every execution-affecting field is included so cache hits cannot cross
+// sub-agent type, model, prompt, project, or tool scope.
+func subAgentCacheKey(
+	req Request,
+	s style.Style,
+	provider, subType, model, toolScope string,
+) string {
+	h := sha256.New()
+	for _, value := range []string{
+		req.TaskID,
+		req.Description,
+		string(s),
+		provider,
+		subType,
+		model,
+		req.PromptOverride,
+		req.ProjectRoot,
+		toolScope,
+	} {
+		h.Write([]byte(value))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// Cache 保存以不透明执行 identity 索引的近期子代理结果。
+// Cache stores recent results keyed by an opaque execution identity. Safe for
+// concurrent use.
 type Cache struct {
 	mu      sync.Mutex
 	ttl     time.Duration
@@ -631,18 +665,15 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		}
 	}
 
-	// Cache hit? Key on (task_id, subagent_type, model) when
-	// task_id is provided, else fall back to the legacy
-	// (description, style, provider) key. task_id takes
-	// priority because it is the explicit resume signal.
-	if d.Cache != nil && req.TaskID != "" {
-		cacheKey := req.TaskID + "|" + subType + "|" + modelOv + "|" + string(s) + "|" + prov
-		if hit, ok := d.Cache.GetByKey(cacheKey); ok {
-			return hit, nil
-		}
+	// 在构成缓存 identity 前解析有效模型。
+	// A request override wins, followed by the sub-agent definition and parent
+	// model.
+	chatModel := modelOv
+	if chatModel == "" {
+		chatModel = d.ParentProviderModel
 	}
-	if hit, ok := d.Cache.Get(req.Description, s, prov); ok {
-		return hit, nil
+	if chatModel == "" {
+		chatModel = prov
 	}
 
 	// Emit a single synthetic "start" event for the parent's UI so it
@@ -712,9 +743,31 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 			subTools.Register(tt, hh)
 		}
 	}
+	cacheReq := req
+	cacheReq.PromptOverride = promptOv
+	cacheKey := subAgentCacheKey(
+		cacheReq,
+		s,
+		prov,
+		subType,
+		chatModel,
+		strings.Join(subTools.Names(), "\x00"),
+	)
+	if hit, ok := d.Cache.GetByKey(cacheKey); ok {
+		return hit, nil
+	}
 
-	// Fresh in-memory store; no shared history with the parent.
-	store, _ := memory.Open(100)
+	// 子代理使用进程内 SQLite，不共享父会话历史，也不触碰全局数据库。
+	// Each run owns an ephemeral SQLite store for its full lifetime.
+	store, err := newSubAgentStore()
+	if err != nil {
+		return Result{}, fmt.Errorf("open subagent store: %w", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Printf("[subagent] close ephemeral store: %v", err)
+		}
+	}()
 
 	subAgent := agent.New(d.Cfg, d.LLM, d.StyleMgr, store, subTools)
 
@@ -723,19 +776,6 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 	if d.LLM != nil && prov != "" {
 		sm := memory.NewSummarizer(store, d.LLM, prov, 50)
 		subAgent.SetSummarizer(sm)
-	}
-
-	// Resolve the model string. Order of priority:
-	//   1. Per-request model override (Args.Model)
-	//   2. Per-agent model (Registry entry's Model)
-	//   3. Parent's specific provider/model
-	//   4. Parent's provider name (legacy fallback)
-	chatModel := modelOv
-	if chatModel == "" {
-		chatModel = d.ParentProviderModel
-	}
-	if chatModel == "" {
-		chatModel = prov
 	}
 
 	chatReq := buildSubAgentChatRequest(req, s, prov, chatModel, promptOv, subType, color)
@@ -910,15 +950,9 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		TaskID:        req.TaskID,
 	}
 
-	// Store in cache. task_id path uses a stable key so two
-	// calls with the same task_id return the same result even
-	// if the description wording drifts. The legacy key is
-	// kept for ad-hoc calls.
-	if d.Cache != nil && req.TaskID != "" {
-		cacheKey := req.TaskID + "|" + subType + "|" + modelOv + "|" + string(s) + "|" + prov
-		d.Cache.PutByKey(cacheKey, res)
-	}
-	d.Cache.Put(req.Description, s, prov, res)
+	// 同一个完整执行 identity 才可复用结果，task_id 也不绕过配置隔离。
+	// Reuse results only through the complete execution identity.
+	d.Cache.PutByKey(cacheKey, res)
 	_ = agentKnown // silence linter when agent lookup happens but is unused beyond populating res
 	return res, nil
 }

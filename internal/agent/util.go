@@ -42,6 +42,13 @@ func formatElapsed(d time.Duration) string {
 // See P2-1 in docs/plans/auto-continue-plan.md.
 
 func (a *Agent) truncateToolResult(name string, content string) string {
+	return a.truncateToolResultForProject(name, "", content)
+}
+
+// truncateToolResultForProject applies both the configured output cap and a
+// tool-specific policy cap. The smaller positive value wins, so a dynamic
+// tool can tighten its result budget but cannot bypass the server limit.
+func (a *Agent) truncateToolResultForProject(name, projectRoot, content string) string {
 	execCap := maxToolResultExec
 	readCap := maxToolResultRead
 	defaultCap := maxToolResultDefault
@@ -67,6 +74,13 @@ func (a *Agent) truncateToolResult(name string, content string) string {
 		cap_ = readCap
 	default:
 		cap_ = defaultCap
+	}
+	if a.tools != nil {
+		if meta, _, ok := a.tools.LookupForProject(name, projectRoot); ok {
+			if policyCap := meta.EffectivePolicy().MaxOutputBytes; policyCap > 0 && policyCap < cap_ {
+				cap_ = policyCap
+			}
+		}
 	}
 
 	// The previous version had a `len(content) <= defaultCap`

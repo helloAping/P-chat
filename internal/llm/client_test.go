@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,82 @@ func readAll(ch <-chan StreamChunk) []StreamChunk {
 		out = append(out, c)
 	}
 	return out
+}
+
+func TestChatStreamCM_ResponseHeaderTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	c, err := newTestClient("openai", srv.URL)
+	if err != nil { t.Fatal(err) }
+	c.providers["openai"].responseHeaderTimeout = 100 * time.Millisecond
+	c.providers["openai"].streamIdleTimeout = time.Second
+
+	started := time.Now()
+	chunks := readAll(c.ChatStreamCM(context.Background(), "openai", "test-model", []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "hello"},
+	}, nil, ChatOptions{}))
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("response-header timeout took %s, want under 1s", elapsed)
+	}
+	if len(chunks) != 1 || chunks[0].Err == nil {
+		t.Fatalf("chunks = %#v, want one timeout error", chunks)
+	}
+	assertTimeoutChunk(t, chunks[0])
+}
+
+func TestChatStreamCM_StreamIdleTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if _, err := fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n"); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	c, err := newTestClient("openai", srv.URL)
+	if err != nil { t.Fatal(err) }
+	c.providers["openai"].responseHeaderTimeout = time.Second
+	c.providers["openai"].streamIdleTimeout = 100 * time.Millisecond
+
+	started := time.Now()
+	chunks := readAll(c.ChatStreamCM(context.Background(), "openai", "test-model", []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "hello"},
+	}, nil, ChatOptions{}))
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("idle timeout took %s, want under 1s", elapsed)
+	}
+	if len(chunks) < 2 || chunks[0].Content != "first" {
+		t.Fatalf("chunks = %#v, want initial content before timeout", chunks)
+	}
+	assertTimeoutChunk(t, chunks[len(chunks)-1])
+}
+
+func assertTimeoutChunk(t *testing.T, chunk StreamChunk) {
+	t.Helper()
+	var apiErr *APIError
+	if !errors.As(chunk.Err, &apiErr) || apiErr.Kind != KindTimeout {
+		t.Fatalf("error = %v, want timeout APIError", chunk.Err)
+	}
 }
 
 // TestOpenAIStream_StandardField verifies the parser
@@ -211,6 +288,7 @@ func newTestClient(name, baseURL string) (*Client, error) {
 				model:    "test-model",
 				apiKey:   "test-key",
 				baseURL:  baseURL,
+				adapter:  NewOpenAIAdapter(baseURL, "test-key", name),
 			},
 		},
 		default_: name,

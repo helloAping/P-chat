@@ -139,6 +139,15 @@ func TestMaxAutoContinue_Is3(t *testing.T) {
 	}
 }
 
+func TestResetAutoContinueCountAfterProgress(t *testing.T) {
+	if got := resetAutoContinueCount(2, true); got != 0 {
+		t.Fatalf("successful tool round left auto-continue count at %d, want 0", got)
+	}
+	if got := resetAutoContinueCount(2, false); got != 2 {
+		t.Fatalf("no-progress round changed auto-continue count to %d, want 2", got)
+	}
+}
+
 // TestPickMaxStepsPrompt_LanguageSelection locks the P2-2
 // language split. ZH must go to the Chinese variant; every
 // other value (en, auto, "" — i.e. unset) must go to the

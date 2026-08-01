@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -105,37 +106,70 @@ type Message struct {
 
 // StreamEvent mirrors server.StreamEvent (the SSE chunk format).
 type StreamEvent struct {
-	Type    string `json:"type"`
-	Content string `json:"content,omitempty"`
+	Type     string `json:"type"`
+	Content  string `json:"content,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
 
 	// Phase/tool fields
-	Phase       string `json:"phase,omitempty"`
-	Step        string `json:"step,omitempty"`
-	Msg         string `json:"message,omitempty"`
-	ToolName    string `json:"tool_name,omitempty"`
-	ToolStatus  string `json:"tool_status,omitempty"`
-	ToolResult  string `json:"tool_result,omitempty"`
-	ToolError   string `json:"tool_error,omitempty"`
-	ToolElapsed string `json:"tool_elapsed,omitempty"`
+	Phase            string   `json:"phase,omitempty"`
+	Step             string   `json:"step,omitempty"`
+	Msg              string   `json:"message,omitempty"`
+	ToolID           string   `json:"tool_id,omitempty"`
+	ToolName         string   `json:"tool_name,omitempty"`
+	ToolStatus       string   `json:"tool_status,omitempty"`
+	ToolResult       string   `json:"tool_result,omitempty"`
+	ToolResultFull   string   `json:"tool_result_full,omitempty"`
+	ToolError        string   `json:"tool_error,omitempty"`
+	ToolElapsed      string   `json:"tool_elapsed,omitempty"`
+	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
+	ToolSummary      string   `json:"tool_summary,omitempty"`
+	ToolChangedPaths []string `json:"tool_changed_paths,omitempty"`
+	ToolRetryable    bool     `json:"tool_retryable,omitempty"`
+	ToolRequiresUser bool     `json:"tool_requires_user,omitempty"`
+	ToolNextAction   string   `json:"tool_next_action,omitempty"`
+	ToolArgs         string   `json:"tool_args,omitempty"`
+
+	// 子代理事件与父流交错传输。Sub-agent events are interleaved with the parent stream.
+	SubAgent              bool   `json:"sub_agent,omitempty"`
+	SubAgentTask          string `json:"sub_agent_task,omitempty"`
+	SubAgentStatus        string `json:"sub_agent_status,omitempty"`
+	SubAgentType          string `json:"sub_agent_type,omitempty"`
+	SubAgentColor         string `json:"sub_agent_color,omitempty"`
+	SubAgentModel         string `json:"sub_agent_model,omitempty"`
+	SubAgentTaskID        string `json:"sub_agent_task_id,omitempty"`
+	SubAgentDescription   string `json:"sub_agent_description,omitempty"`
+	SubAgentFailureReason string `json:"sub_agent_failure_reason,omitempty"`
+
+	ContentRewrite  string `json:"content_rewrite,omitempty"`
+	ThinkingRewrite string `json:"thinking_rewrite,omitempty"`
 
 	// Done fields
-	TokensIn  int    `json:"tokens_in,omitempty"`
-	TokensOut int    `json:"tokens_out,omitempty"`
-	Elapsed   string `json:"elapsed,omitempty"`
+	TokensIn      int    `json:"tokens_in,omitempty"`
+	TokensOut     int    `json:"tokens_out,omitempty"`
+	Elapsed       string `json:"elapsed,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Model         string `json:"model,omitempty"`
+	SessionStatus string `json:"session_status,omitempty"`
 
 	// Error fields
 	Error      string `json:"error,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
+	ErrorKind  string `json:"error_kind,omitempty"`
+	Seq        uint64 `json:"seq,omitempty"`
+	TraceID    string `json:"trace_id,omitempty"`
 
 	// Question event (LLM asks user a question)
-	QuestionJSON string `json:"question_json,omitempty"`
+	QuestionJSON    string `json:"question_json,omitempty"`
+	ToolConfirmJSON string `json:"tool_confirm_json,omitempty"`
 }
 
 // ProviderInfo mirrors the providers endpoint payload.
 type ProviderInfo struct {
-	Name     string `json:"name"`
-	Model    string `json:"model"`
-	Protocol string `json:"protocol"`
+	Name      string  `json:"name"`
+	Model     string  `json:"model"`
+	Protocol  string  `json:"protocol"`
+	IsDefault bool    `json:"is_default"`
+	Models    []Model `json:"models"`
 }
 
 // Model mirrors a single model entry returned by the server. We
@@ -149,6 +183,42 @@ type Model struct {
 	Description      string `json:"description,omitempty"`
 	MaxTokensContext int    `json:"max_tokens_context,omitempty"`
 	MaxTokensOutput  int    `json:"max_tokens_output,omitempty"`
+}
+
+// ToolInfo 映射服务端生效工具注册表中的一个条目。ToolInfo mirrors one entry in the server's effective tool registry.
+type ToolInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Dynamic     bool   `json:"dynamic"`
+	Scope       string `json:"scope"`
+}
+
+// CompressResult 映射会话压缩结果。CompressResult mirrors the session compression result.
+type CompressResult struct {
+	Compressed bool   `json:"compressed"`
+	Summary    string `json:"summary"`
+}
+
+// ContextMessage 映射上下文检查中的一条消息。ContextMessage mirrors one context inspector message.
+type ContextMessage struct {
+	Role         string `json:"role"`
+	Tokens       int    `json:"tokens"`
+	Preview      string `json:"preview"`
+	IsToolResult bool   `json:"is_tool_result"`
+	IsCompressed bool   `json:"is_compressed,omitempty"`
+}
+
+// ContextInspector 映射服务端的上下文用量检查结果。ContextInspector mirrors the server context inspector result.
+type ContextInspector struct {
+	SessionID         string           `json:"session_id"`
+	Provider          string           `json:"provider"`
+	Model             string           `json:"model"`
+	ContextWindow     int              `json:"context_window"`
+	EstimatedTokens   int              `json:"estimated_tokens"`
+	UsableTokens      int              `json:"usable_tokens"`
+	UtilizationPct    float64          `json:"utilization_pct"`
+	CompressedSummary string           `json:"compressed_summary,omitempty"`
+	Messages          []ContextMessage `json:"messages"`
 }
 
 // StyleInfo mirrors the styles endpoint payload.
@@ -312,6 +382,8 @@ type SendMessageOptions struct {
 	Message  string `json:"message" binding:"required"`
 	Style    string `json:"style,omitempty"`
 	WorkMode string `json:"work_mode,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
 // SendMessage streams the LLM response back via SSE. Each event
@@ -329,7 +401,27 @@ func (c *Client) SendMessage(ctx context.Context, sessionID string, opts SendMes
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
+	return c.streamSSE(req, onEvent)
+}
 
+// Regenerate 重新生成指定用户消息的回复。Regenerate regenerates the reply for a user message.
+func (c *Client) Regenerate(ctx context.Context, sessionID string, userMessageID int64, onEvent func(StreamEvent)) error {
+	body, err := json.Marshal(struct {
+		UserMessageID int64 `json:"user_message_id"`
+	}{UserMessageID: userMessageID})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", c.base+"/api/v1/sessions/"+sessionID+"/regenerate", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	return c.streamSSE(req, onEvent)
+}
+
+func (c *Client) streamSSE(req *http.Request, onEvent func(StreamEvent)) error {
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
@@ -389,6 +481,45 @@ func (c *Client) ListStyles(ctx context.Context) ([]StyleInfo, error) {
 		return nil, err
 	}
 	return resp.Styles, nil
+}
+
+// ListTools 返回会话可用工具。ListTools returns the tools available to a session.
+// 可选会话决定服务端暴露的项目级动态工具。The optional session selects the project-level dynamic tools that the server exposes.
+func (c *Client) ListTools(ctx context.Context, sessionID string) ([]ToolInfo, error) {
+	path := "/api/v1/tools"
+	if sessionID != "" {
+		path += "?session_id=" + url.QueryEscape(sessionID)
+	}
+	var resp struct {
+		Tools []ToolInfo `json:"tools"`
+	}
+	if err := c.doJSON(ctx, "GET", path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Tools, nil
+}
+
+// CompressSession 请求服务端压缩会话历史。CompressSession requests the server to compact session history.
+func (c *Client) CompressSession(ctx context.Context, sessionID string) (CompressResult, error) {
+	var result CompressResult
+	err := c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/compress", nil, &result)
+	return result, err
+}
+
+// GetSessionContext 返回会话上下文估算。GetSessionContext returns the session context estimate.
+func (c *Client) GetSessionContext(ctx context.Context, sessionID string) (ContextInspector, error) {
+	var result ContextInspector
+	err := c.doJSON(ctx, "GET", "/api/v1/sessions/"+sessionID+"/context", nil, &result)
+	return result, err
+}
+
+// SetReasoningEffort 设置会话推理强度。SetReasoningEffort sets the session reasoning effort.
+func (c *Client) SetReasoningEffort(ctx context.Context, sessionID, level string) (string, error) {
+	var result struct {
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	err := c.doJSON(ctx, "PATCH", "/api/v1/sessions/"+sessionID+"/reasoning-effort", map[string]string{"level": level}, &result)
+	return result.ReasoningEffort, err
 }
 
 // ====================================================================
@@ -473,6 +604,15 @@ func (c *Client) SubmitQuestionResponse(ctx context.Context, sessionID string, a
 	return c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/question-response", body, nil)
 }
 
+// SubmitConfirmResponse 提交工具执行确认。SubmitConfirmResponse submits a tool execution confirmation.
+func (c *Client) SubmitConfirmResponse(ctx context.Context, sessionID string, approved bool, action string) error {
+	body := struct {
+		Approved bool   `json:"approved"`
+		Action   string `json:"action,omitempty"`
+	}{Approved: approved, Action: action}
+	return c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/confirm-response", body, nil)
+}
+
 // Flush is a no-op for the HTTP client; the server persists data
 // in its own SQLite store.
 func (c *Client) Flush() error { return nil }
@@ -480,13 +620,14 @@ func (c *Client) Flush() error { return nil }
 // ModelsFor is exposed for the legacy single-model form. Kept here
 // to keep the public surface of the client package small.
 func (c *Client) ModelsFor(provider string) ([]Model, bool) {
-	// For now the client doesn't have a per-provider model endpoint;
-	// synthesize a single-model entry from what we know.
 	c.mu.Lock()
 	providers := c.cfgProviders
 	c.mu.Unlock()
 	for _, p := range providers {
 		if p.Name == provider {
+			if len(p.Models) > 0 {
+				return p.Models, true
+			}
 			if p.Model != "" {
 				return []Model{{Name: p.Model, Default: true}}, true
 			}

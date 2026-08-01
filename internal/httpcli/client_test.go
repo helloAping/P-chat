@@ -189,6 +189,24 @@ func TestClient_MetadataEndpoints(t *testing.T) {
 	}
 }
 
+func TestClient_ListTools(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	tools, err := NewClient(srv.URL).ListTools(context.Background(), "")
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	if len(tools) == 0 {
+		t.Fatal("expected built-in tools")
+	}
+	for _, tool := range tools {
+		if tool.Name == "" || tool.Description == "" {
+			t.Errorf("incomplete tool entry: %#v", tool)
+		}
+	}
+}
+
 func TestClient_SendMessage_NoRealLLM(t *testing.T) {
 	// We can't easily run a real LLM in a unit test, so we verify
 	// the wire-up: a missing provider returns an error quickly,
@@ -290,6 +308,135 @@ func TestClient_SendMessage_StreamsEvents(t *testing.T) {
 	}
 	if events[3].Type != "done" || events[3].TokensIn != 10 {
 		t.Errorf("event[3] = %+v", events[3])
+	}
+}
+
+func TestClient_SendMessage_PreservesProviderAndModel(t *testing.T) {
+	var got SendMessageOptions
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"done\"}\n\n"))
+	}))
+	defer srv.Close()
+
+	err := NewClient(srv.URL).SendMessage(context.Background(), "conv_x", SendMessageOptions{
+		Message:  "hi",
+		Provider: "openai",
+		Model:    "gpt-4o-mini",
+	}, func(StreamEvent) {})
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if got.Provider != "openai" || got.Model != "gpt-4o-mini" {
+		t.Errorf("selection = %q/%q, want openai/gpt-4o-mini", got.Provider, got.Model)
+	}
+}
+
+func TestClient_ModelsForUsesProviderModelList(t *testing.T) {
+	c := NewClient("http://example.test")
+	c.SetCfgProviders([]ProviderInfo{{
+		Name: "openai",
+		Models: []Model{
+			{Name: "gpt-4o", Default: true},
+			{Name: "gpt-4o-mini", DisplayName: "GPT-4o mini"},
+		},
+	}})
+
+	models, ok := c.ModelsFor("openai")
+	if !ok {
+		t.Fatal("ModelsFor did not find provider")
+	}
+	if len(models) != 2 || models[1].Name != "gpt-4o-mini" {
+		t.Errorf("models = %#v, want complete provider list", models)
+	}
+}
+
+func TestClient_SubmitConfirmResponse(t *testing.T) {
+	var got struct {
+		Approved bool   `json:"approved"`
+		Action   string `json:"action"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sessions/conv_x/confirm-response" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := NewClient(srv.URL).SubmitConfirmResponse(context.Background(), "conv_x", true, "always"); err != nil {
+		t.Fatalf("submit confirmation: %v", err)
+	}
+	if !got.Approved || got.Action != "always" {
+		t.Errorf("confirmation = %#v, want approved always", got)
+	}
+}
+
+func TestClient_SessionMaintenanceEndpoints(t *testing.T) {
+	requests := make([]string, 0, 4)
+	var reasoningBody struct {
+		Level string `json:"level"`
+	}
+	var regenerateBody struct {
+		UserMessageID int64 `json:"user_message_id"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/sessions/conv_x/compress":
+			_, _ = w.Write([]byte(`{"compressed":true,"summary":"short"}`))
+		case "/api/v1/sessions/conv_x/context":
+			_, _ = w.Write([]byte(`{"session_id":"conv_x","provider":"openai","model":"gpt-4o","context_window":128000,"estimated_tokens":12,"usable_tokens":120000,"utilization_pct":0.01,"messages":[{"role":"user","tokens":12,"preview":"hi"}]}`))
+		case "/api/v1/sessions/conv_x/reasoning-effort":
+			if err := json.NewDecoder(r.Body).Decode(&reasoningBody); err != nil {
+				t.Errorf("decode reasoning request: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"reasoning_effort":"high"}`))
+		case "/api/v1/sessions/conv_x/regenerate":
+			if err := json.NewDecoder(r.Body).Decode(&regenerateBody); err != nil {
+				t.Errorf("decode regenerate request: %v", err)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"new reply\"}\n\n"))
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	compressed, err := c.CompressSession(context.Background(), "conv_x")
+	if err != nil || !compressed.Compressed || compressed.Summary != "short" {
+		t.Fatalf("compress = %#v, %v", compressed, err)
+	}
+	info, err := c.GetSessionContext(context.Background(), "conv_x")
+	if err != nil || info.Model != "gpt-4o" || len(info.Messages) != 1 {
+		t.Fatalf("context = %#v, %v", info, err)
+	}
+	level, err := c.SetReasoningEffort(context.Background(), "conv_x", "high")
+	if err != nil || level != "high" {
+		t.Fatalf("reasoning effort = %q, %v", level, err)
+	}
+	if reasoningBody.Level != "high" {
+		t.Errorf("reasoning level = %q, want high", reasoningBody.Level)
+	}
+	var events []StreamEvent
+	if err := c.Regenerate(context.Background(), "conv_x", 42, func(event StreamEvent) { events = append(events, event) }); err != nil {
+		t.Fatalf("regenerate: %v", err)
+	}
+	if len(events) != 1 || events[0].Content != "new reply" {
+		t.Errorf("regen events = %#v", events)
+	}
+	if regenerateBody.UserMessageID != 42 {
+		t.Errorf("regenerate user message id = %d, want 42", regenerateBody.UserMessageID)
+	}
+	if got := strings.Join(requests, ","); got != "POST /api/v1/sessions/conv_x/compress,GET /api/v1/sessions/conv_x/context,PATCH /api/v1/sessions/conv_x/reasoning-effort,POST /api/v1/sessions/conv_x/regenerate" {
+		t.Errorf("requests = %q", got)
 	}
 }
 

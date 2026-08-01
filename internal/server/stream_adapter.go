@@ -91,6 +91,12 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolResultFull = chunk.ToolResultFull
 		ev.ToolError = chunk.ToolError
 		ev.ToolElapsed = chunk.ToolElapsed
+		ev.ToolCallStatus = chunk.ToolCallStatus
+		ev.ToolSummary = chunk.ToolSummary
+		ev.ToolChangedPaths = chunk.ToolChangedPaths
+		ev.ToolRetryable = chunk.ToolRetryable
+		ev.ToolRequiresUser = chunk.ToolRequiresUser
+		ev.ToolNextAction = chunk.ToolNextAction
 		// Status: parse the trailing segment of "call-N-status"
 		// rather than substring-matching "ok" / "err" so a future
 		// status name can't accidentally match. See

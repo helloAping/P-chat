@@ -37,6 +37,25 @@ function toggle() {
   open.value = !open.value
 }
 
+// Sub-agent runs can emit the same dense mix of thoughts and tool
+// cards as the parent. Retain their full data in the message model,
+// while keeping only a bounded tail mounted in the nested card.
+const SUB_PART_RENDER_WINDOW = 80
+const revealedEarlierParts = ref(0)
+const partWindowStart = computed(() => {
+  const total = props.part.parts.length
+  const visible = Math.min(total, SUB_PART_RENDER_WINDOW + revealedEarlierParts.value)
+  return Math.max(0, total - visible)
+})
+const hiddenPartCount = computed(() => partWindowStart.value)
+const visibleParts = computed(() => {
+  const start = partWindowStart.value
+  return props.part.parts.slice(start).map((part, offset) => ({ part, index: start + offset }))
+})
+function showEarlierParts() {
+  revealedEarlierParts.value += SUB_PART_RENDER_WINDOW
+}
+
 // Agent name display: prefer the explicit subagent_type
 // (e.g. "explore", "plan", "general-purpose"), fall back
 // to a generic label when unset.
@@ -126,6 +145,7 @@ function renderSubText(raw: string | undefined): string {
     }[c] as string))
   }
 }
+let stuckTimer: ReturnType<typeof setTimeout> | null = null
 watch(
   () => props.part.status,
   (s, prev) => {
@@ -149,11 +169,11 @@ watch(
         clearTimeout(stuckTimer)
         stuckTimer = null
       }
+      if (!userToggled.value) open.value = false
     }
   },
   { immediate: true },
 )
-let stuckTimer: ReturnType<typeof setTimeout> | null = null
 onBeforeUnmount(() => {
   if (stuckTimer) clearTimeout(stuckTimer)
 })
@@ -197,15 +217,22 @@ onBeforeUnmount(() => {
     </button>
     <div v-if="open" class="sub-body">
       <LoadingDots v-if="part.status === 'start' && part.parts.length === 0" />
-      <template v-for="(p, i) in part.parts" :key="i">
+      <button
+        v-if="hiddenPartCount"
+        type="button"
+        class="sub-part-window-toggle"
+        :title="`展开更早的 ${hiddenPartCount} 条子代理记录`"
+        @click.stop="showEarlierParts"
+      >已折叠 {{ hiddenPartCount }} 条过程记录</button>
+      <template v-for="entry in visibleParts" :key="entry.index">
         <ThinkingBlock
-          v-if="p.kind === 'thinking'"
-          :part="p"
+          v-if="entry.part.kind === 'thinking'"
+          :part="entry.part"
           :default-open="false"
         />
-        <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
-        <QuestionTable v-else-if="p.kind === 'question'" :part="p" />
-        <div v-else-if="p.kind === 'text'" class="sub-text" v-html="renderSubText(p.text)" />
+        <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
+        <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
+        <div v-else-if="entry.part.kind === 'text'" class="sub-text" v-html="renderSubText(entry.part.text)" />
       </template>
       <!-- task_id footer: stable identifier the LLM can pass back
            to resume this run. Click to copy. -->
@@ -357,6 +384,24 @@ onBeforeUnmount(() => {
   margin-left: 4px;
   border-left: 1px solid var(--border-subtle);
   background: var(--surface-1);
+}
+.sub-part-window-toggle {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 5px 8px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.sub-part-window-toggle:hover {
+  border-color: var(--border-default);
+  color: var(--text-secondary);
 }
 /* Inner markdown text — same .md-body class as the parent
  * MessageBubble uses, scoped to this card. Keeps the

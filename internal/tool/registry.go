@@ -24,6 +24,10 @@ type Tool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	// Policy describes execution risk and scheduling defaults. It is optional
+	// so existing dynamic tool definitions remain source-compatible; callers
+	// should use EffectivePolicy when they need a complete policy.
+	Policy *ToolPolicy `json:"policy,omitempty"`
 }
 
 type CallRequest struct {
@@ -47,6 +51,22 @@ type CallResultImage struct {
 type CallResult struct {
 	Content string `json:"content"`
 	IsError bool   `json:"is_error"`
+	// Status is the structured outcome for newer callers. Empty status is
+	// normalized from the legacy IsError flag by Normalize.
+	Status CallStatus `json:"status,omitempty"`
+	// Summary is a short outcome description for newer callers. Content remains
+	// the compatibility payload and may contain the detailed text.
+	Summary string `json:"summary,omitempty"`
+	// ChangedPaths identifies workspace files touched by a successful tool.
+	ChangedPaths []string `json:"changed_paths,omitempty"`
+	// Retryable tells the scheduler whether retrying with the same call shape
+	// can plausibly succeed. It defaults to false for safety.
+	Retryable bool `json:"retryable,omitempty"`
+	// RequiresUser marks an interaction that must wait for user input.
+	RequiresUser bool `json:"requires_user,omitempty"`
+	// NextAction gives the agent a bounded hint for the next phase, without
+	// requiring it to parse free-form Content.
+	NextAction string `json:"next_action,omitempty"`
 	// RawFull, when set, carries the untruncated raw payload for the
 	// frontend (via ToolResultFull on the SSE event). It never reaches
 	// the LLM — the LLM only sees Content. Used by tools whose full
@@ -634,6 +654,18 @@ func RegisterBuiltin(r *Registry) {
 	}, handleWriteFile)
 
 	r.Register(Tool{
+		Name:        "edit_file",
+		Description: "Replace an exact text fragment in a text file. Requires one unique match unless replace_all is true; uses an atomic write and returns the changed path.",
+		Parameters: ObjectSchema(map[string]any{
+			"path":        StringProp("Absolute or relative path to the text file"),
+			"old_text":    StringProp("Exact existing text to replace; include enough surrounding context to make it unique"),
+			"new_text":    StringProp("Replacement text; may be empty to delete the matched text"),
+			"replace_all": BoolProp("If true, replace every match; default false rejects ambiguous matches"),
+			"dry_run":     BoolProp("If true, report the proposed edit without writing the file"),
+		}, []string{"path", "old_text", "new_text"}),
+	}, handleEditFile)
+
+	r.Register(Tool{
 		Name:        "read_docx",
 		Description: "Extract and return the full plain text content from a .docx (Word) file. Use this for reading Word documents uploaded by the user. Returns the document text as a single string.",
 		Parameters: ObjectSchema(map[string]any{
@@ -784,7 +816,7 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 				"(no command was actually run; remove dry_run or set it to false to execute)",
 			a.Command, workDir,
 		)
-		return &CallResult{Content: preview}, nil
+		return &CallResult{Content: preview, Summary: "Dry run: would execute " + a.Command, NextAction: "review"}, nil
 	}
 
 	if a.Background || looksPersistentCommand(a.Command) {
@@ -1119,13 +1151,18 @@ func handleWriteFile(ctx context.Context, args json.RawMessage) (*CallResult, er
 			head = head[:200] + "..."
 		}
 		preview += "\nfirst 200 chars of content:\n" + head
-		return &CallResult{Content: preview}, nil
+		return &CallResult{Content: preview, Summary: "Dry run: would write " + a.Path, NextAction: "review"}, nil
 	}
 
 	if err := writeFile(a.Path, []byte(a.Content)); err != nil {
 		return &CallResult{Content: err.Error(), IsError: true}, nil
 	}
-	return &CallResult{Content: fmt.Sprintf("written %d bytes to %s", len(a.Content), a.Path)}, nil
+	return &CallResult{
+		Content:      fmt.Sprintf("written %d bytes to %s", len(a.Content), a.Path),
+		Summary:      "Wrote file " + a.Path,
+		ChangedPaths: []string{a.Path},
+		NextAction:   "verify",
+	}, nil
 }
 
 type listFilesArgs struct {

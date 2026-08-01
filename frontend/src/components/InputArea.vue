@@ -7,7 +7,7 @@
 // path so the LLM can answer "what is /foo?" questions naturally.
 
 import { h, onMounted, ref, computed, watch, nextTick } from 'vue'
-import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useMessage, type DropdownOption } from 'naive-ui'
+import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
@@ -19,12 +19,13 @@ import {
 import * as api from '../api/client'
 import {
   state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments,
-  isStreaming, startStream, stopStream, appendStreamEvent, endStream,
+  isStreaming,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
-  recoverMissingParts, currentPendingConfirm, submitToolConfirm,
+  currentPendingConfirm, submitToolConfirm,
 } from '../stores/chat'
+import { stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
 import { notifyManager } from '../utils/notify'
 import { copyText } from '../utils/clipboard'
 
@@ -65,8 +66,10 @@ watch(currentPendingInput, (val) => {
 // Also sync after backspace / clear (send resets inputText to '').
 onMounted(() => nextTick(resizeTextarea))
 const sending = ref(false)
+const sendPreflightSessions = new Set<string>()
 const showSessionConfig = ref(false)
 const message = useMessage()
+const dialog = useDialog()
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const reasoningEffort = computed({
@@ -798,9 +801,68 @@ function pushAssistantMessage(sessionId: string, content: string) {
   state.sessionMessages[sessionId].push({ role: 'assistant', content, parts: [] })
 }
 
+function hasUnfinishedTodos(todos: api.TodoItem[]): boolean {
+  return todos.some(todo => todo.status === 'pending' || todo.status === 'in_progress')
+}
+
+type TodoSendPreflightChoice = 'clear' | 'keep' | 'cancel'
+type TodoSendMode = 'auto' | 'resume' | 'clear'
+
+function chooseTodoSendMode(): Promise<TodoSendPreflightChoice> {
+  return new Promise((resolve) => {
+    let settled = false
+    let dialogRef: { destroy: () => void } | null = null
+    const finish = (choice: TodoSendPreflightChoice) => {
+      if (settled) return
+      settled = true
+      resolve(choice)
+      dialogRef?.destroy()
+    }
+    dialogRef = dialog.warning({
+      title: '存在未完成任务',
+      content: '上次任务还有未完成待办。你可以清空旧待办后发送，也可以保留待办继续发送当前消息。',
+      action: () => h(NSpace, { justify: 'end', size: 8 }, () => [
+        h(NButton, { size: 'small', onClick: () => finish('cancel') }, { default: () => '取消发送' }),
+        h(NButton, { size: 'small', secondary: true, onClick: () => finish('keep') }, { default: () => '继续发送不清空' }),
+        h(NButton, { size: 'small', type: 'warning', onClick: () => finish('clear') }, { default: () => '清空并继续' }),
+      ]),
+      onClose: () => finish('cancel'),
+    })
+  })
+}
+
+async function clearUnfinishedTodosBeforeSend(id: string): Promise<TodoSendMode | null> {
+  let todos = state.sessionTodos[id] || []
+  try {
+    const response = await api.getTodos(id)
+    todos = response.todos || []
+    state.sessionTodos[id] = todos
+  } catch {
+    // Fall back to todo_write events already held by the local store.
+  }
+  if (!hasUnfinishedTodos(todos)) return 'auto'
+
+  const todoSendMode = await chooseTodoSendMode()
+  if (todoSendMode === 'cancel') return null
+  if (todoSendMode === 'keep') return 'resume'
+  try {
+    await api.clearTodos(id)
+    state.sessionTodos[id] = []
+    return 'clear'
+  } catch (e: any) {
+    message.error(`清空待办失败：${e?.message || e}`)
+    return null
+  }
+}
+
 async function send() {
   const raw = inputText.value.trim()
   if (!raw) return
+  if (isStreaming.value) {
+    // 当前会话已有流在进行，直接忽略重复发送。
+    // The active session already has a stream; ignore duplicate sends.
+    return
+  }
   // NOTE: we intentionally do NOT gate on `sending.value`
   // here. That ref is local to this InputArea instance, but
   // multiple conversations can stream in parallel. If session
@@ -845,6 +907,23 @@ async function send() {
       inputText.value = ''
       return
     }
+  }
+
+  const preflightSessionID = state.currentID
+  let todoMode: TodoSendMode = 'auto'
+  if (preflightSessionID) {
+    if (sendPreflightSessions.has(preflightSessionID)) return
+    sendPreflightSessions.add(preflightSessionID)
+    let selectedMode: TodoSendMode | null = null
+    try {
+      selectedMode = await clearUnfinishedTodosBeforeSend(preflightSessionID)
+    } finally {
+      sendPreflightSessions.delete(preflightSessionID)
+    }
+    if (!selectedMode) return
+    todoMode = selectedMode
+    // Do not move a message across sessions while the confirmation is open.
+    if (state.currentID !== preflightSessionID) return
   }
 
   const text = inputText.value.trim()
@@ -957,15 +1036,9 @@ async function send() {
   notifyManager.unlock()
 
   sending.value = true
-  const ctrl = new AbortController()
-  // Install the placeholder assistant message immediately so
-  // the three-bouncing-dots spinner is reachable. The actual
-  // mutation happens in the onEvent callback below.
-  startStream(id, ctrl)
-  let streamSucceeded = false
-  let deferredDrop: { lastSeq: number; reason: string } | null = null
   try {
-    await api.streamMessagesRetry(id, {
+    await submitConversationTurn({
+      sessionId: id,
       message: text,
       // The integer id minted above (and stamped on the
       // local Message as `msg.id`) is shipped to the
@@ -974,69 +1047,38 @@ async function send() {
       // autoincrement. That keeps the local msg.id and
       // the SQLite row id in lockstep, so rollback and
       // regenerate work the instant the user clicks them.
-      client_msg_id: clientMsgId,
+      clientMsgID: clientMsgId,
       provider: meta.provider,
       model: meta.model,
       style: meta.style,
       workMode: meta.workMode,
+      todoMode,
       attachments: inlineAttachments,
-      signal: ctrl.signal,
-      skill_context: pendingSkillContext || undefined,
-      // P0-1: when the SSE stream dies mid-turn, call
-      // the snapshot endpoint to recover whatever
-      // assistant content already landed. The recovery
-      // flow is fire-and-forget from this call site; the
-      // chat store mutates the trailing message
-      // directly. NOT triggered on user abort (the stop
-      // button sets signal.aborted; the underlying
-      // fetch is then cancelled and the drop callback
-      // is short-circuited in client.ts).
-      onStreamDrop: ({ lastSeq, reason }) => {
-        deferredDrop = { lastSeq, reason }
-      },
-      onEvent: (ev) => {
+      skillContext: pendingSkillContext || undefined,
+      // 首个流事件到达后，技能上下文已经提交给服务端。
+      // The first stream event confirms the skill context was submitted.
+      onFirstEvent: () => {
         pendingSkillContext = ''
-        // Surface top-level errors (auth, network) as
-        // toast notifications. Per-event errors
-        // (e.g. tool execution failure) flow through
-        // appendStreamEvent and are rendered inline.
-        // Errors with a suggestion get a longer-duration
-        // toast so the user has time to read the fix
-        // hint (especially the vision_unsupported case
-        // where the toast is the first place they see
-        // the actionable advice).
-        if (ev.type === 'error' && ev.error) {
-          if (ev.suggestion) {
-            message.error(`${ev.error}\n${ev.suggestion}`, { duration: 8000 })
-          } else {
-            message.error(ev.error)
-          }
-          // Still call appendStreamEvent so the error text
-          // renders inline in the assistant bubble — the
-          // user sees context for the failure.
+      },
+      onServerError: (event) => {
+        if (event.suggestion) {
+          message.error(`${event.error}\n${event.suggestion}`, { duration: 8000 })
+        } else if (event.error) {
+          message.error(event.error)
         }
-        appendStreamEvent(id, ev)
       },
     })
-    streamSucceeded = true
   } catch (e: any) {
     if (e.name !== 'AbortError') {
       message.error(`发送失败: ${e.message}`)
     }
   } finally {
-    endStream(id)
     sending.value = false
-    const drop = deferredDrop as { lastSeq: number; reason: string } | null
-    if (!streamSucceeded && drop && !ctrl.signal.aborted) {
-      recoverMissingParts(id, drop.lastSeq, drop.reason).catch((err) => {
-        console.warn('[stream] recovery failed:', err)
-      })
-    }
   }
 }
 
 function stop() {
-  if (state.currentID) stopStream(state.currentID)
+  if (state.currentID) stopConversationTurn(state.currentID)
   sending.value = false
 }
 
@@ -1153,6 +1195,33 @@ async function onWorkModePick(v: string) {
   }
   const s = state.sessions.find(s => s.id === id)
   if (s) s.work_mode = mode
+}
+
+const todoLongRunOptions = [
+  { label: '关闭', value: 'off' },
+  { label: '自适应', value: 'adaptive' },
+  { label: '不限轮次', value: 'unlimited' },
+] as const
+
+const todoLongRunMode = computed(() =>
+  state.sessionMeta[state.currentID]?.todo_long_run_mode || 'adaptive',
+)
+
+async function onTodoLongRunPick(v: 'off' | 'adaptive' | 'unlimited') {
+  if (!state.currentID) return
+  try {
+    const resp = await api.updateSessionMeta(state.currentID, { todo_long_run_mode: v })
+    const id = state.currentID
+    const mode = resp.todo_long_run_mode ?? v
+    state.sessionMeta[id] = {
+      ...(state.sessionMeta[id] || currentMeta.value),
+      todo_long_run_mode: mode,
+    }
+    const session = state.sessions.find(s => s.id === id)
+    if (session) session.todo_long_run_mode = mode
+  } catch (e: any) {
+    message.error(`长任务设置失败：${e?.message || e}`)
+  }
 }
 
 const currentWorkModeValue = computed({
@@ -1462,6 +1531,22 @@ onMounted(() => {
                   class="session-config-choice"
                   :class="{ 'session-config-choice--active': reasoningEffort === opt.value }"
                   @click="pickReasoning(opt.value)"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">长任务</div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in todoLongRunOptions"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': todoLongRunMode === opt.value }"
+                  @click="onTodoLongRunPick(opt.value)"
                 >
                   {{ opt.label }}
                 </button>

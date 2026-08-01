@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -176,6 +177,10 @@ func ClassifyAPIError(providerName string, err error) error {
 
 	// Context errors.
 	if errors.Is(err, context.DeadlineExceeded) {
+		return &APIError{Kind: KindTimeout, Message: "请求超时", Cause: err}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return &APIError{Kind: KindTimeout, Message: "请求超时", Cause: err}
 	}
 	if errors.Is(err, context.Canceled) {

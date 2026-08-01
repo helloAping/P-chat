@@ -15,6 +15,40 @@
 
 ---
 
+## 当前进度快照
+
+> 快照日期：2026-07-31。仓库 `VERSION` 当前为 `1.0.8-dev`；`CHANGELOG.md` 已记录到 v1.0.9 的开发项，正式分发版本以 `VERSION` 和 release tag 为准。
+
+P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手形成了比较完整的桌面工作台：
+
+| 模块 | 当前状态 | 说明 |
+| --- | --- | --- |
+| 三端形态 | 已落地 | CLI、独立 HTTP server、Wails 桌面端共用同一套 agent/server 逻辑 |
+| 对话流 | 已落地 | text / thinking / tool / sub-agent parts 结构化渲染，支持 SSE 流式、seq、断线恢复 |
+| Agent 执行 | 已落地 | ReAct 工具循环、并发工具派发、auto-continue、Plan/Build、todo 守卫、stuck-loop 保护 |
+| LLM 协议 | 已落地 | OpenAI 兼容 + Anthropic 原生；自定义 SSE reader 兼容 reasoning / proxy error / 非标准 delta |
+| 项目系统 | 已落地 | 多项目注册，项目级 `AGENTS.md` / rules / skills / tools 注入 |
+| 知识库 | 已落地 | 本地 Wiki/FTS5、三层索引树、混合检索、查询分解、多库重排、增量扫描 |
+| 工具体系 | 已落地 | 内置文件/命令/搜索/文档/问题/todo 工具；动态 YAML 工具支持全局与项目级加载 |
+| 浏览器控制 | 已落地 | Chrome/Edge 扩展连接、真实页面导航/点击/输入/截图、多 tab 目标、域名权限策略 |
+| 可观测性 | 已落地 | 端到端 trace id、上下文检查器、工具列表抽屉、动态工具加载诊断 |
+| IM 桥接 | 骨架进行中 | `internal/im` 后端抽象、飞书部分入站/出站、Gateway/adapter 基础已在代码中；GUI 设置和完整入站 agent 流程仍需推进 |
+| MCP 集成 | 基础可用 / 待增强 | 已有 MCP 管理模块和设置入口，工具协议、权限和诊断体验仍在 backlog |
+| 沙箱增强 | 基础已落地 / 待增强 | 命令/写文件确认与浏览器域名策略已接入；Docker 隔离、策略可视化仍未完成 |
+| 发布体验 | 已落地一部分 | Windows 安装器、Linux/macOS 打包脚本、浏览器扩展打包、版本注入已有；跨平台 GUI 构建仍受 Wails/宿主环境限制 |
+
+更细的“已落地能力 + 后续可做事项”维护在 [`docs/feature-opportunities.md`](docs/feature-opportunities.md)。历史设计方案保留在 [`docs/plans/`](docs/plans/)。
+
+### 下一步优先级
+
+1. **动态工具安全收口**：补动态工具权限分级、禁用/回退机制。
+2. **Agent 执行透明度**：展示 auto-continue 次数、继续原因、最终停止原因，增强子 agent 汇总。
+3. **MCP 完整集成**：让 MCP 工具进入统一工具列表、确认、错误展示和 GUI 诊断。
+4. **沙箱运行环境**：评估 Docker runner、跨平台路径/命令策略一致性。
+5. **文档与发布**：新增 GUI 功能时同步 README FAQ、`.agents/docs/INDEX.md` 和 `docs/feature-opportunities.md`。
+
+---
+
 ## 快速启动
 
 ### 方式 A — Windows 安装包（推荐新用户）
@@ -578,5 +612,19 @@ cd frontend && npx vue-tsc -b
 ```
 
 `scripts/` 下都是平台无关工具脚本（`clean-frontend-output.ps1` / `sync-web.ps1` / `package-gui.ps1` / `build-installer.ps1` 等）。
+
+### 文档维护约定
+
+新增或调整用户可见功能时，同步更新这些文档：
+
+| 文档 | 什么时候改 |
+| --- | --- |
+| `README.md` | 用户入口、GUI 操作步骤、常见问题、当前进度摘要变化 |
+| `docs/feature-opportunities.md` | 功能从待办变为已落地、backlog 优先级变化、废弃历史计划 |
+| `CHANGELOG.md` | 版本交付、升级说明、重要 bug 修复和测试覆盖 |
+| `.agents/docs/*.md` | 模块实现细节、关键文件、测试方式、agent 修改入口 |
+| `.agents/docs/INDEX.md` | 新模块、新功能入口或“想改 X 读什么”路径变化 |
+
+`docs/plans/*.md` 只保留历史设计背景；当前状态以 `README.md` 的快照和 `docs/feature-opportunities.md` 为准。
 
 ---

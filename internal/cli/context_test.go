@@ -94,6 +94,36 @@ func TestCliContext_TypePredicates(t *testing.T) {
 	}
 }
 
+func TestHTTPEventToChunk_PreservesRichStreamFields(t *testing.T) {
+	chunk := httpEventToChunk(httpcli.StreamEvent{
+		Seq:                   7,
+		Thinking:              "reasoning",
+		ToolID:                "call_1",
+		ToolArgs:              `{"path":"a.go"}`,
+		ToolResultFull:        "full result",
+		ToolChangedPaths:      []string{"a.go"},
+		SubAgent:              true,
+		SubAgentTask:          "inspect code",
+		SubAgentType:          "explore",
+		SubAgentFailureReason: "timeout",
+		TraceID:               "T-12345678",
+		ToolConfirmJSON:       `{"action":"edit"}`,
+		ContentRewrite:        "replacement",
+		ThinkingRewrite:       "redacted",
+		SessionStatus:         "busy",
+	})
+
+	if chunk.Seq != 7 || chunk.Thinking != "reasoning" || chunk.ToolID != "call_1" {
+		t.Errorf("basic stream fields were lost: %+v", chunk)
+	}
+	if !chunk.SubAgent || chunk.SubAgentTask != "inspect code" || chunk.SubAgentType != "explore" {
+		t.Errorf("sub-agent fields were lost: %+v", chunk)
+	}
+	if chunk.ToolConfirmJSON == "" || chunk.ContentRewrite != "replacement" || chunk.SessionStatus != "busy" {
+		t.Errorf("rich stream fields were lost: %+v", chunk)
+	}
+}
+
 // TestIsUnsupported_TrueForHTTPStub verifies that the HTTP context
 // returns *ErrUnsupported for the operations the server doesn't
 // implement, and that errors.As picks them up correctly.

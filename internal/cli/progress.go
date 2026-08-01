@@ -15,17 +15,18 @@ import (
 
 // ChatUI renders chat interactions in a clean, Claude-Code-inspired style.
 // The output is composed of:
-//   1. A thinking indicator (spinner) that runs while the LLM is working
-//   2. Compact tool call/result lines (only when tools fire)
-//   3. The LLM response as plain streaming text
-//   4. A final status bar with model, tokens, elapsed
+//  1. A thinking indicator (spinner) that runs while the LLM is working
+//  2. Compact tool call/result lines (only when tools fire)
+//  3. The LLM response as plain streaming text
+//  4. A final status bar with model, tokens, elapsed
 type ChatUI struct {
 	provider string
 	model    string
 
 	// Question support
-	sessionID    string
-	submitAnswer func(sessionID string, answers map[string]string) error
+	sessionID     string
+	submitAnswer  func(sessionID string, answers map[string]string) error
+	submitConfirm func(sessionID string, approved bool, action string) error
 
 	// Spinner state
 	spinner *Spinner
@@ -62,6 +63,12 @@ func NewChatUI(provider, model string) *ChatUI {
 func (u *ChatUI) SetQuestionHandler(sessionID string, submit func(sessionID string, answers map[string]string) error) {
 	u.sessionID = sessionID
 	u.submitAnswer = submit
+}
+
+// SetConfirmHandler 连接工具确认回调。SetConfirmHandler wires up the tool confirmation callback.
+func (u *ChatUI) SetConfirmHandler(sessionID string, submit func(sessionID string, approved bool, action string) error) {
+	u.sessionID = sessionID
+	u.submitConfirm = submit
 }
 
 // Handle processes a single chunk from the agent stream.
@@ -102,6 +109,11 @@ func (u *ChatUI) Handle(chunk agent.ChatStreamChunk) {
 	// Done terminal - actual stream is done, clean up
 	if chunk.Done {
 		u.stopSpinner()
+		return
+	}
+
+	if chunk.ToolConfirmJSON != "" {
+		u.handleToolConfirmEvent(chunk.ToolConfirmJSON)
 		return
 	}
 
@@ -356,13 +368,81 @@ type questionOpt struct {
 }
 
 type cliQuestion struct {
-	Question    string `json:"question"`
-	Header      string `json:"header"`
-	Options     []struct {
+	Question string `json:"question"`
+	Header   string `json:"header"`
+	Options  []struct {
 		Label       string `json:"label"`
 		Description string `json:"description"`
 	} `json:"options"`
 	MultiSelect bool `json:"multi_select,omitempty"`
+}
+
+type cliConfirmRequest struct {
+	ToolName     string `json:"tool_name"`
+	Args         string `json:"args"`
+	Reason       string `json:"reason"`
+	ResolvedPath string `json:"resolved_path,omitempty"`
+	RiskLevel    string `json:"risk_level,omitempty"`
+}
+
+func (u *ChatUI) handleToolConfirmEvent(rawJSON string) {
+	u.stopSpinner()
+	u.ensureLine()
+
+	var req cliConfirmRequest
+	if err := json.Unmarshal([]byte(rawJSON), &req); err != nil {
+		color.Red("  Unable to parse tool confirmation: %v", err)
+		return
+	}
+
+	fmt.Println()
+	color.Yellow("  Tool confirmation required: %s", req.ToolName)
+	if req.Reason != "" {
+		color.HiBlack("  %s", req.Reason)
+	}
+	if req.ResolvedPath != "" {
+		color.HiBlack("  Target: %s", req.ResolvedPath)
+	}
+	if req.Args != "" {
+		color.HiBlack("  Arguments: %s", req.Args)
+	}
+	color.Cyan("  [y] Allow once  [a] Always allow  [n] Reject")
+
+	approved := false
+	action := "reject"
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err == nil {
+		defer term.Restore(fd, oldState)
+		buf := make([]byte, 1)
+		for {
+			n, readErr := os.Stdin.Read(buf)
+			if readErr != nil || n == 0 {
+				break
+			}
+			switch buf[0] {
+			case 'y', 'Y':
+				approved, action = true, "once"
+			case 'a', 'A':
+				approved, action = true, "always"
+			case 'n', 'N', '\r', '\n', 3:
+				approved, action = false, "reject"
+			default:
+				continue
+			}
+			break
+		}
+	} else {
+		color.Yellow("  Non-interactive terminal: tool call rejected")
+	}
+
+	if u.submitConfirm == nil {
+		color.Red("  Tool confirmation handler is unavailable")
+		return
+	}
+	if err := u.submitConfirm(u.sessionID, approved, action); err != nil {
+		color.Red("  Failed to submit tool confirmation: %v", err)
+	}
 }
 
 func (u *ChatUI) handleQuestionEvent(rawJSON string) {

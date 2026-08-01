@@ -6,6 +6,7 @@ import { reactive, ref, computed, watch } from 'vue'
 import * as api from '../api/client'
 import { notifyManager } from '../utils/notify'
 import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
+import { isCurrentStream } from './streamLifecycle'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -48,6 +49,10 @@ export const state = reactive({
     ctrl: AbortController
     asstContent: string
   }>,
+  // Incremented once per applied stream event. ChatWindow watches
+  // this cheap scalar instead of deeply traversing every message
+  // and nested part just to keep the viewport at the bottom.
+  streamRevision: {} as Record<string, number>,
   // Per-session history-paging cursor. The first page
   // (loaded by switchSession) sets oldestSeq/oldestId to
   // the corresponding cursor from the response; subsequent
@@ -75,7 +80,7 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
+  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string; todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited' }>,
   globalWorkMode: 'coding' as string,
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
@@ -441,21 +446,32 @@ export async function switchSession(id: string) {
     // fix (handler.go: oldestID=rowIDs[0]) eliminates the
     // most common trigger but dedup here is the
     // belt-and-braces guarantee.
-    state.sessionMessages[id] = dedupMessagesByKey([], r.messages)
-    state.sessionPaging[id] = {
-      // Prefer the seq-based cursor (stable across
-      // rollback/undo). Fall back to the legacy id-based
-      // cursor when the server is older and didn't return
-      // oldest_seq.
-      oldestSeq: r.oldest_seq ?? 0,
-      oldestId: r.oldest_id,
-      hasMore: r.has_more,
-      loading: false,
+    // The user may send a message while this first history page is
+    // in flight. Preserve the local user message and streaming
+    // placeholder, but still install the fetched history so the
+    // session does not lose its earlier context. The explicit user
+    // id is stable across the optimistic row and SQLite, so the
+    // local copy wins when the server has already persisted it.
+    if (state.currentID === id) {
+      const liveMessages = (state.sessionMessages[id] as Message[] | undefined) ?? []
+      const liveIDs = new Set(liveMessages.map(m => m.id).filter((messageID): messageID is number => messageID != null))
+      const history = dedupMessagesByKey([], r.messages).filter(m => !liveIDs.has(m.id ?? 0))
+      state.sessionMessages[id] = [...history, ...liveMessages]
+      state.sessionPaging[id] = {
+        // Prefer the seq-based cursor (stable across
+        // rollback/undo). Fall back to the legacy id-based
+        // cursor when the server is older and didn't return
+        // oldest_seq.
+        oldestSeq: r.oldest_seq ?? 0,
+        oldestId: r.oldest_id,
+        hasMore: r.has_more,
+        loading: false,
+      }
+      // Convert any base64 screenshot data in the newly
+      // loaded history into blob URLs, then strip old ones
+      // so the session opens with a bounded memory footprint.
+      convertAndStripScreenshots(id)
     }
-    // Convert any base64 screenshot data in the newly
-    // loaded history into blob URLs, then strip old ones
-    // so the session opens with a bounded memory footprint.
-    convertAndStripScreenshots(id)
   }
   // Mark this session as most-recently-used so evictCold
   // keeps it in memory. Eviction runs here because a
@@ -490,6 +506,7 @@ export async function switchSession(id: string) {
       reasoning_effort: s.reasoning_effort || 'off',
       vector_store: s.vector_store || '',
       knowledge_base: s.knowledge_base || '',
+      todo_long_run_mode: s.todo_long_run_mode || 'adaptive',
     }
   }
   // Load per-session todos.
@@ -697,6 +714,7 @@ export async function renameSession(id: string, title: string) {
       reasoning_effort: resp.reasoning_effort ?? state.sessionMeta[id].reasoning_effort,
       vector_store: resp.vector_store ?? state.sessionMeta[id].vector_store,
       knowledge_base: resp.knowledge_base ?? state.sessionMeta[id].knowledge_base,
+      todo_long_run_mode: resp.todo_long_run_mode ?? state.sessionMeta[id].todo_long_run_mode,
     }
   }
 }
@@ -859,6 +877,25 @@ function isScreenshotResult(r: string | undefined): boolean {
   return false
 }
 
+// revokeScreenshotResult releases a live blob URL whether the tool
+// returned it directly or embedded it in a JSON result. Call this
+// before replacing a result with the compact placeholder; otherwise
+// the only reference to the blob URL is lost and WebView cannot free
+// its decoded image memory until the page is reloaded.
+function revokeScreenshotResult(result: string | undefined) {
+  if (!result) return
+  if (result.startsWith('blob:')) {
+    URL.revokeObjectURL(result)
+    return
+  }
+  try {
+    const obj = JSON.parse(result)
+    if (typeof obj.image === 'string' && obj.image.startsWith('blob:')) {
+      URL.revokeObjectURL(obj.image)
+    }
+  } catch { /* not a JSON screenshot result */ }
+}
+
 export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERVED_SCREENSHOTS) {
   const msgs = state.sessionMessages[sessionId]
   if (!msgs) return
@@ -908,7 +945,9 @@ export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERV
     if ('kind' in t) {
       // ToolPart — replace the result payload with the
       // placeholder so the card still renders.
-      (t as ToolPart).result = PLACEHOLDER_SCREENSHOT
+      const tool = t as ToolPart
+      revokeScreenshotResult(tool.result)
+      tool.result = PLACEHOLDER_SCREENSHOT
     } else {
       // MessageAttachment — revoke the blob and replace the
       // URL with the placeholder so the image no longer
@@ -984,13 +1023,20 @@ export function startStream(id: string, ctrl: AbortController) {
   // event — without this, the spinner is unreachable.
   state.sessionMessages[id].push({ role: 'assistant', content: '', parts: [] })
   state.streaming[id] = { ctrl, asstContent: '' }
+  state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
+}
+
+// isActiveStream prevents late events from a cancelled or replaced
+// request from mutating a new trailing assistant message.
+export function isActiveStream(id: string, ctrl: AbortController): boolean {
+  return isCurrentStream(state.streaming[id], ctrl)
 }
 
 export function stopStream(id: string) {
   const s = state.streaming[id]
   if (s) {
     s.ctrl.abort()
-    delete state.streaming[id]
+    endStream(id, s.ctrl)
   }
 }
 
@@ -1287,8 +1333,20 @@ function scrubMessagePhantoms(m: Message) {
   }
 }
 
+// A reasoning part is live only until the next non-thinking event
+// for the same message (or sub-agent) arrives. Leaving historical
+// parts marked streaming keeps every Loader2 animation running for
+// the rest of a long task and makes the conversation visibly flicker.
+function closeTrailingThinking(parts: MessagePart[] | undefined) {
+  const last = parts?.[parts.length - 1]
+  if (last?.kind === 'thinking' && last.streaming) {
+    last.streaming = false
+  }
+}
+
 function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null) {
   const parts = (target ?? m.parts)!
+  closeTrailingThinking(parts)
   // Two-pass scrub:
   //
   //  1. scrub the incoming delta (catches the case where
@@ -1442,6 +1500,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (!ev.content) break
       const cleanedContent = scrubPhantomError(ev.content)
       const parts = sub ? sub.parts : m.parts!
+      closeTrailingThinking(parts)
       // Apply the explicit rewrite to the trailing text part.
       const last = parts[parts.length - 1]
       if (last && last.kind === 'text') {
@@ -1495,6 +1554,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
     case 'tool': {
       const parts = sub ? sub.parts : m.parts!
       if (!ev.tool_name) break
+      closeTrailingThinking(parts)
       if (ev.tool_status === 'start') {
         // When tool_id is present, use it as the unique key
         // and never reuse the last part (two calls to the
@@ -1545,7 +1605,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         let found = false
         for (let i = parts.length - 1; i >= 0; i--) {
           const p = parts[i]
-          if (p.kind !== 'tool' || p.status !== 'start') continue
+          if (p.kind !== 'tool') continue
           if ((ev.tool_id && p.tool_id === ev.tool_id) ||
               (!ev.tool_id && p.name === ev.tool_name)) {
             p.status = (ev.tool_status as any) || 'ok'
@@ -1572,6 +1632,12 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             error: ev.tool_error,
             elapsed: ev.tool_elapsed,
           })
+        }
+        // Enforce the screenshot cap as each image arrives rather
+        // than waiting for `done`; a cancelled task otherwise keeps
+        // every decoded screenshot alive until the page reloads.
+        if (isScreenshotResult(ev.tool_result_full || ev.tool_result)) {
+          convertAndStripScreenshots(id)
         }
         // Question tool answer carry-through: the question
         // tool returns `{questions, answers}` JSON via the
@@ -1655,6 +1721,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.sub_agent_status) {
         if (!sub) break
         sub.status = ev.sub_agent_status as any
+        if (ev.sub_agent_status !== 'start') closeTrailingThinking(sub.parts)
         if (ev.sub_agent_status !== 'start' && ev.elapsed) sub.elapsed = ev.elapsed
         if (ev.sub_agent_model && !sub.agentModel) sub.agentModel = ev.sub_agent_model
       }
@@ -1813,6 +1880,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         // keyed by sessionId, so the answer routes back to
         // whichever question is pending on that session.
         const targetParts = sub ? sub.parts : m.parts
+        closeTrailingThinking(targetParts)
 
         if (hasAnswers) {
           // ── Result-with-answers: update the trailing
@@ -1860,6 +1928,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     case 'tool_confirm':
+      closeTrailingThinking(m.parts)
       if (ev.tool_confirm_json) {
         try {
           // 2026-07: the server now emits more fields on
@@ -1921,6 +1990,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       notifyManager.play('error')
       break
   }
+  state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
 }
 
 // markVisionUnsupported finds the trailing user message in
@@ -2203,7 +2273,11 @@ export async function loadContextInspector(sessionId: string): Promise<void> {
   }
 }
 
-export function endStream(id: string) {
+export function endStream(id: string, ctrl?: AbortController) {
+  // A stopped stream may settle after the user immediately starts
+  // another turn in the same session. Never let that old finally
+  // block clear the replacement stream's state.
+  if (ctrl && state.streaming[id]?.ctrl !== ctrl) return
   expirePendingQuestion(id)
   const msgs = state.sessionMessages[id]
   if (msgs) {
@@ -2216,7 +2290,12 @@ export function endStream(id: string) {
       })
     }
   }
+  // Stopped streams do not receive a `done` event, so perform the
+  // same screenshot convergence here as the normal done path.
+  convertAndStripScreenshots(id)
   delete state.streaming[id]
+  state.sessionWorking[id] = false
+  state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
 }
 
 // regenerateMessage is the P1-3 entry point. The
@@ -2338,11 +2417,13 @@ export async function regenerateMessage(
       onStreamDrop: ({ lastSeq, reason }) => {
         deferredDrop = { lastSeq, reason }
       },
-      onEvent: (ev) => appendStreamEvent(sessionId, ev),
+      onEvent: (ev) => {
+        if (isActiveStream(sessionId, ctrl)) appendStreamEvent(sessionId, ev)
+      },
     })
     streamSucceeded = true
   } finally {
-    endStream(sessionId)
+    endStream(sessionId, ctrl)
     const drop = deferredDrop as { lastSeq: number; reason: string } | null
     if (!streamSucceeded && drop && !ctrl.signal.aborted) {
       recoverMissingParts(sessionId, drop.lastSeq, drop.reason).catch(() => {})

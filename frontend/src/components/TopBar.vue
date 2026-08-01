@@ -157,8 +157,9 @@ function toggleSidebar() { emit('toggle-sidebar') }
         v-if="props.collapsed"
         type="button"
         class="brand"
-        :title="'返回主页'"
-        :aria-label="'返回主页'"
+        title="打开会话列表"
+        aria-label="打开会话列表"
+        @click="toggleSidebar"
       >
         <BrandLogo :size="22" />
         <span class="brand-text">P-Chat</span>

@@ -366,8 +366,13 @@ type ChatRequest struct {
 	Style    style.Style       `json:"style"`
 	WorkMode config.WorkMode   `json:"work_mode,omitempty"`
 	Messages []llm.ChatMessage `json:"messages"`
-	Provider string            `json:"provider,omitempty"`
-	Model    string            `json:"model,omitempty"`
+	// HistoryMessageCount 是已经入库的 Messages 前缀数量。
+	// HistoryMessageCount is the number of leading Messages already in storage.
+	// The agent sends that prefix as LLM context but never persists it again.
+	// Zero keeps direct CLI and sub-agent callers backward-compatible.
+	HistoryMessageCount int    `json:"history_message_count,omitempty"`
+	Provider            string `json:"provider,omitempty"`
+	Model               string `json:"model,omitempty"`
 	// Attachments are file ids the user attached to this turn.
 	// Expanded into the message list as separate ChatMessage
 	// entries (text + image/file) before being sent to the LLM.
@@ -436,6 +441,14 @@ type ChatRequest struct {
 	// to MaxAutoContinue times. Set false (via /auto-continue
 	// off) to disable per session.
 	AutoContinue bool `json:"auto_continue,omitempty"`
+	// TodoLongRunMode resolves the session override for a long-running plan.
+	// Empty uses the process configuration's default.
+	TodoLongRunMode config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	// TodoMode describes how this turn should treat an existing plan.
+	// "resume" enables the mandatory interrupted-task review, "clear"
+	// starts a fresh chain after clearing the old plan, and "auto" keeps
+	// backward-compatible behavior while still enforcing active todos.
+	TodoMode TodoMode `json:"todo_mode,omitempty"`
 	// PromptOv, when non-empty, REPLACES the agent's normal
 	// system prompt (style + AGENTS + rules + skills) for this
 	// turn. Used by the sub-agent runner to install a
@@ -524,6 +537,13 @@ type ChatStreamChunk struct {
 	ToolResultFull string `json:"tool_result_full,omitempty"`
 	ToolError      string `json:"tool_error,omitempty"`
 	ToolElapsed    string `json:"tool_elapsed,omitempty"`
+	// Structured tool result fields supplement the legacy ToolResult preview.
+	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
+	ToolSummary      string   `json:"tool_summary,omitempty"`
+	ToolChangedPaths []string `json:"tool_changed_paths,omitempty"`
+	ToolRetryable    bool     `json:"tool_retryable,omitempty"`
+	ToolRequiresUser bool     `json:"tool_requires_user,omitempty"`
+	ToolNextAction   string   `json:"tool_next_action,omitempty"`
 
 	TokensIn  int `json:"tokens_in,omitempty"`
 	TokensOut int `json:"tokens_out,omitempty"`
@@ -840,6 +860,20 @@ func (a *Agent) ChatStream(ctx context.Context, req ChatRequest) <-chan ChatStre
 	return a.ChatWithTools(ctx, req)
 }
 
+// attachToolResultMetadata copies structured fields to the stream chunk while
+// leaving the legacy text preview intact for older clients.
+func attachToolResultMetadata(chunk *ChatStreamChunk, result *tool.CallResult) {
+	if chunk == nil || result == nil {
+		return
+	}
+	chunk.ToolCallStatus = string(result.Status)
+	chunk.ToolSummary = result.Summary
+	chunk.ToolChangedPaths = append([]string(nil), result.ChangedPaths...)
+	chunk.ToolRetryable = result.Retryable
+	chunk.ToolRequiresUser = result.RequiresUser
+	chunk.ToolNextAction = result.NextAction
+}
+
 // sendOrDrop attempts to send a chunk to ch. If ctx is cancelled,
 // the chunk is silently dropped so the producer can exit cleanly
 // rather than blocking forever on a consumer that has disconnected.
@@ -930,6 +964,27 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// metadata under "parts" so the same view comes back
 		// when the user reopens the session.
 		partsAcc := newPartsAccumulator()
+		todoMode := todoModeFromRequest(req.TodoMode)
+		todoIncompleteSent := false
+		emitTodoIncomplete := func(reason string, round int) {
+			if todoIncompleteSent {
+				return
+			}
+			items := unfinishedTodos(req.SessionID)
+			if len(items) == 0 {
+				return
+			}
+			todoIncompleteSent = true
+			if reason == "" {
+				reason = "stream ended before the active todo list reached a terminal state"
+			}
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+				Phase:   "todo",
+				Step:    "todo-incomplete",
+				Message: fmt.Sprintf("仍有 %d 项 todo 未完成，任务链已保留（%s）。请继续发送以恢复原任务。", len(items), reason),
+				Round:   round,
+			})
+		}
 		// Two defers, registered LIFO so they run in this order
 		// on exit:
 		//   1. send idle — always fires (normal or panic), so
@@ -943,10 +998,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		//      doesn't die. Sends a final Error chunk.
 		defer func() {
 			defer func() { _ = recover() }() // guard "send on closed"
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
 			select {
 			case ch <- ChatStreamChunk{SessionStatus: "idle"}:
-			case <-time.After(2 * time.Second):
+			case <-timer.C:
 			}
+		}()
+		// Every exit path passes through this finalization gate. It is
+		// registered after the idle defer so it runs before the idle event.
+		defer func() {
+			emitTodoIncomplete("agent stopped before todo_write confirmed the remaining work", 0)
 		}()
 		defer func() {
 			if r := recover(); r != nil {
@@ -1062,25 +1124,44 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			systemPrompt += "\n\n---\n\n## 我的上下文\n\n" + styleMemory
 		}
 
-		// Build the message list: system prompt + user messages.
-		// Each message is a separate protocol-agnostic ChatMessage.
+		// 构造系统提示、历史上下文与本轮新消息，并明确标记历史边界。
+		// Keep the history boundary explicit so persistence never rewrites
+		// LLM context into SQLite as fresh rows.
 		msgs := []llm.ChatMessage{
 			{Role: llm.RoleSystem, Type: llm.TypeText, Content: systemPrompt},
 		}
+		// Keep one dynamic todo block inside the first system message. This
+		// survives prompt overrides and auto-compaction without appending a
+		// fresh message on every round.
+		initialTodos := unfinishedTodos(req.SessionID)
+		if todoGuardActive(todoMode, initialTodos) {
+			upsertTodoGuard(&msgs, todoMode, initialTodos, false)
+		}
+		historyCount := req.HistoryMessageCount
+		if historyCount < 0 {
+			historyCount = 0
+		}
+		if historyCount > len(req.Messages) {
+			historyCount = len(req.Messages)
+		}
+		history := req.Messages[:historyCount]
+		newMessages := req.Messages[historyCount:]
 		// When knowledge base is off, strip wiki-related messages
 		// (tool calls + results) from history so the LLM doesn't
 		// learn about wiki tools from previous turns
 		// and try to call them via text-format tool_call blocks.
 		if kbEnabled {
-			msgs = append(msgs, req.Messages...)
+			msgs = append(msgs, history...)
 		} else {
-			for _, m := range req.Messages {
+			for _, m := range history {
 				if m.ToolName == "wiki_lookup" || m.ToolName == "wiki_list" {
 					continue
 				}
 				msgs = append(msgs, m)
 			}
 		}
+		persistStart := len(msgs)
+		msgs = append(msgs, newMessages...)
 
 		// NOTE: image base64 payloads are intentionally kept
 		// intact in msgs. Earlier code stripped them with a
@@ -1120,26 +1201,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// text/image attachments, the agent's own scratch
 			// messages) use AUTOINCREMENT as before.
 			//
-			// P1-4 regen path: req.Messages is the history
-			// loaded from the DB by regen.go (user text +
-			// image rows that were already persisted on the
-			// original send). Re-persisting those rows would
-			// create duplicate rows that grow on every regen
-			// round — the LLM context would see 2 copies, then
-			// 3, etc. Skip the history prefix and only persist
-			// the new tail (messages the agent loop produced
-			// after the initial LLM context was assembled, e.g.
-			// P0-3 auto-continue reminders and round-2+ tool
-			// scratch rows).
-			isRegen := req.RegenGroupID != ""
-			histEnd := 1 + len(req.Messages) // msgs[0] is system, msgs[1:1+histLen] is the loaded history
+			// persistStart 位于保留历史之后，附件在其后展开。
+			// The new user message and every attachment row still persist.
 			pinnedUserID := req.ClientMsgID
 			for i, m := range msgs {
 				if m.Role == llm.RoleSystem {
 					continue
 				}
-				if isRegen && i >= 1 && i < histEnd {
-					// History row — already in DB. Skip.
+				if i < persistStart {
+					// 历史行已在数据库中，跳过以避免重复写入。
+					// This history row is already in storage.
 					continue
 				}
 				if pinnedUserID > 0 && m.Role == llm.RoleUser {
@@ -1174,9 +1245,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Per-request override (takes priority).
 		if req.MaxRounds > 0 {
 			maxRounds = req.MaxRounds
-		} else if a.cfg != nil && a.cfg.Limits.MaxRounds > 0 {
+		} else if a.cfg != nil {
+			// Zero is a deliberate unlimited setting. The default config stores
+			// 300 explicitly, so it is no longer ambiguous with an unset value.
 			maxRounds = a.cfg.Limits.MaxRounds
 		}
+		longRunMode := req.TodoLongRunMode
+		if longRunMode == "" && a.cfg != nil {
+			longRunMode = a.cfg.Limits.TodoLongRunMode
+		}
+		longRunMode = config.NormalizeTodoLongRunMode(longRunMode)
 		if req.PlanMode {
 			var planTools []llm.ToolDef
 			for _, t := range toolDefs {
@@ -1223,23 +1301,35 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// from learning to rely on auto-prompting as a
 			// substitute for actually finishing work.
 			autoContinueCount int
+			// Tracks whether normal work has happened after the most recent
+			// successful todo_write. It stays local to this stream so task
+			// lifecycle bookkeeping cannot retain cancelled sessions.
+			workSinceTodoWrite bool
+			// A todo-only checkpoint is entered when the model tries to end a
+			// work phase without recording that work in the todo list.
+			todoCheckpoint         todoCheckpointState
+			todoCheckpointAttempts int
 		)
 		const stuckThreshold = 3
 		const sameToolErrMax = 4
-
-		for round := 1; maxRounds == 0 || round <= maxRounds; round++ {
+		for round := 1; ; round++ {
 			roundStart := time.Now()
 			roundNum := round
 			partsAcc = newPartsAccumulator()
+			currentTodos := unfinishedTodos(req.SessionID)
+			if todoGuardActive(todoMode, currentTodos) || todoCheckpoint.active() {
+				upsertTodoGuard(&msgs, todoMode, currentTodos, todoCheckpoint.active())
+			}
 
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds})
 
 			var (
-				fullContent         string
-				fullThinking        string
+				fullContentBuilder  strings.Builder
+				fullThinkingBuilder strings.Builder
 				toolCalls           []nativeToolCall
 				argsAccum           = make(map[int]*nativeToolCall)
 				roundAnyToolErrored bool
+				streamBytes         int
 			)
 
 			opts := a.options
@@ -1253,7 +1343,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// cannot call tools and is forced to give a text
 			// summary. See opencode's `runner/max-steps.ts:1-16`
 			// and `llm.ts:197-209`.
-			isLastRound := maxRounds > 0 && round >= maxRounds
+			isLastRound := (req.PlanMode || !longRunMode.AllowsUnlimitedRounds(len(currentTodos) > 0)) && maxRounds > 0 && round >= maxRounds
 
 			// Pre-limit warning: when within 10 rounds of the
 			// cap, inject a gentle heads-up so the LLM can wrap
@@ -1275,17 +1365,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				})
 			}
 
+			roundPhase := toolPhaseForRound(req.PlanMode, todoCheckpoint)
+			roundTools := toolDefsForPhase(toolDefs, roundPhase)
+
 			// Auto-compact before LLM call (skip on last round).
 			// If the context exceeds the token budget, compress
 			// and rebuild the system prompt so the provider call
 			// doesn't fail with a 413. On the last round tools
 			// are disabled anyway so compact isn't worth it.
-			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, toolDefs, ch, nextSeq, roundNum, maxRounds) {
+			if !isLastRound && a.tryAutoCompact(ctx, &msgs, req, roundTools, ch, nextSeq, roundNum, maxRounds) {
 				continue
 			}
 
 			roundMsgs := msgs
-			roundTools := toolDefs
 			if isLastRound {
 				roundTools = nil
 				roundMsgs = append([]llm.ChatMessage{}, msgs...)
@@ -1332,10 +1424,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						Round:    roundNum,
 						MaxRound: maxRounds,
 					})
+					timer := time.NewTimer(backoff)
 					select {
 					case <-ctx.Done():
+						timer.Stop()
 						return
-					case <-time.After(backoff):
+					case <-timer.C:
 					}
 				}
 
@@ -1357,8 +1451,22 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if needsNormalizedToolResults(req.Provider) {
 					msgsForLLM = normalizeToolResults(roundMsgsForLLM)
 				}
-				stream := a.llm.ChatStreamCM(ctx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
-				for chunk := range stream {
+				streamCtx, cancelStream := context.WithCancel(ctx)
+				stream := a.llm.ChatStreamCM(streamCtx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
+				streamOpen := true
+				for streamOpen {
+					var chunk llm.StreamChunk
+					var ok bool
+					select {
+					case <-ctx.Done():
+						cancelStream()
+						return
+					case chunk, ok = <-stream:
+						if !ok {
+							streamOpen = false
+							continue
+						}
+					}
 					if chunk.Err != nil {
 						classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
 						errMsg, errSuggestion, errKind := chunk.Err.Error(), "", ""
@@ -1381,11 +1489,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 										Round:    roundNum,
 										MaxRound: maxRounds,
 									})
+									cancelStream()
 									break
 								}
 							}
 							if isRetryable(apiErr.Kind) && attempt < maxLLMRetries {
 								retryableErr = chunk.Err
+								cancelStream()
 								break // break inner stream loop, retry outer
 							}
 						}
@@ -1396,12 +1506,29 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							ErrorKind:  errKind,
 							Done:       true,
 						})
+						cancelStream()
 						return
 					}
 					if chunk.Done {
 						retryableErr = nil
+						cancelStream()
 						break att // success — break outer loop too
 					}
+					chunkBytes := len(chunk.Content) + len(chunk.Thinking)
+					if chunk.ToolCallDelta != nil {
+						chunkBytes += len(chunk.ToolCallDelta.ID) + len(chunk.ToolCallDelta.Name) + len(chunk.ToolCallDelta.ArgsJSON)
+					}
+					if streamBytes+chunkBytes > MaxStreamBytesPerRound {
+						cancelStream()
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+							Phase:     "llm",
+							Error:     fmt.Sprintf("stream output limit exceeded: maximum %d bytes per round", MaxStreamBytesPerRound),
+							ErrorKind: "resource_limit",
+							Done:      true,
+						})
+						return
+					}
+					streamBytes += chunkBytes
 					if chunk.TokensIn > 0 || chunk.TokensOut > 0 {
 						if chunk.TokensIn > totalIn {
 							totalIn = chunk.TokensIn
@@ -1411,12 +1538,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						}
 					}
 					if chunk.Content != "" {
-						fullContent += chunk.Content
+						fullContentBuilder.WriteString(chunk.Content)
 						partsAcc.update(ChatStreamChunk{Content: chunk.Content})
 						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
 					}
 					if chunk.Thinking != "" {
-						fullThinking += chunk.Thinking
+						fullThinkingBuilder.WriteString(chunk.Thinking)
 						partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
 						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
 					}
@@ -1436,7 +1563,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						existing.ArgsJSON += tcd.ArgsJSON
 					}
 				} // inner for chunk
+				cancelStream()
 			} // outer for attempt (retry loop)
+
+			fullContent := fullContentBuilder.String()
+			fullThinking := fullThinkingBuilder.String()
 
 			// If we exhausted retries without success, surface the last error.
 			if retryableErr != nil {
@@ -1456,6 +1587,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			if len(toolCalls) == 0 {
 				toolCalls = parseMarkdownToolCalls(fullContent)
+			}
+			// The final safety round must not execute a markdown-formatted call
+			// that bypassed the empty native tool list.
+			if isLastRound {
+				toolCalls = nil
 			}
 			// When tool calls are present (native or markdown), strip
 			// markdown tool_call blocks from the text content so the
@@ -1578,8 +1714,39 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// reminder and re-enter the loop. The cap
 				// (MaxAutoContinue) prevents training the
 				// LLM to rely on this as a crutch.
-				if pending, list := sessionPendingTodos(req.SessionID); len(list) > 0 {
-					if req.AutoContinue && autoContinueCount < MaxAutoContinue {
+				pending, list := sessionPendingTodos(req.SessionID)
+				if len(list) > 0 {
+					if todoCheckpoint.active() {
+						todoCheckpointAttempts++
+						if !isLastRound && todoCheckpointAttempts < MaxTodoCheckpointAttempts {
+							sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+								Phase:    "todo",
+								Step:     "todo-checkpoint-retry",
+								Message:  fmt.Sprintf("todo 状态检查未调用 todo_write，重试第 %d/%d 次。", todoCheckpointAttempts+1, MaxTodoCheckpointAttempts),
+								Round:    roundNum,
+								MaxRound: maxRounds,
+							})
+							continue
+						}
+						emitTodoIncomplete("todo_write was not completed during the required state check", roundNum)
+					} else if workSinceTodoWrite && !isLastRound {
+						// Do not checkpoint after every ordinary tool call. A task can
+						// require many reads, edits, and commands before it is actually
+						// complete. The checkpoint belongs at the attempted phase exit.
+						todoCheckpoint = todoCheckpointReview
+						todoCheckpointAttempts = 0
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+							Phase:    "todo",
+							Step:     "todo-checkpoint",
+							Message:  "检测到工作阶段结束但 todo 未更新，进入状态检查。",
+							Round:    roundNum,
+							MaxRound: maxRounds,
+						})
+						continue
+					} else if !isLastRound && autoContinueCount < MaxAutoContinue {
+						// Active todos are always guarded. The session's
+						// auto-continue preference remains useful for ordinary
+						// text-only chats, but cannot bypass an active task chain.
 						autoContinueCount++
 						msgs = append(msgs, llm.ChatMessage{
 							Role:    llm.RoleUser,
@@ -1594,18 +1761,25 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							MaxRound: maxRounds,
 						})
 						continue
+					} else {
+						reason := "todo review limit reached"
+						if req.AutoContinue {
+							reason = "auto-continue limit reached"
+						}
+						emitTodoIncomplete(reason, roundNum)
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+							Phase:    "todo",
+							Step:     "todo-incomplete-stop",
+							Message:  fmt.Sprintf("仍有 %d 项 todo 未完成，已停止继续自动执行 (%s)。", pending, reason),
+							Round:    roundNum,
+							MaxRound: maxRounds,
+						})
 					}
-					reason := "auto-continue disabled"
-					if req.AutoContinue {
-						reason = "auto-continue limit reached"
-					}
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-						Phase:    "todo",
-						Step:     "todo-incomplete-stop",
-						Message:  fmt.Sprintf("仍有 %d 项 todo 未完成，已停止继续自动执行 (%s)。", pending, reason),
-						Round:    roundNum,
-						MaxRound: maxRounds,
-					})
+				}
+				if pending > 0 {
+					persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+					return
 				}
 				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
@@ -1655,6 +1829,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			type forwarder struct{ done chan struct{} }
 			var forwarders []forwarder
 			var wg sync.WaitGroup
+			serialToolCalls := false
+			for _, tc := range toolCalls {
+				meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot)
+				if !ok || !meta.EffectivePolicy().CanRunInParallel() {
+					serialToolCalls = true
+					break
+				}
+			}
+			var serialGate chan struct{}
+			if serialToolCalls {
+				serialGate = make(chan struct{}, 1)
+			}
 			for i, tc := range toolCalls {
 				wg.Add(1)
 
@@ -1684,6 +1870,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
 				}
+				if a.store != nil {
+					// Persist todo writes through the request context so each
+					// agent uses its own store without a process-global callback.
+					tctx = tool.WithTodoPersister(tctx, func(sessionID string, todos []tool.TodoItem) error {
+						stored := make([]memory.TodoItem, len(todos))
+						for i, item := range todos {
+							stored[i] = memory.TodoItem{ID: item.ID, Content: item.Content, Status: item.Status}
+						}
+						return a.store.SaveTodos(sessionID, stored)
+					})
+				}
 				if req.PermissionLevel != "" {
 					tctx = tool.WithPermissionLevel(tctx, req.PermissionLevel)
 				}
@@ -1703,9 +1900,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// Inject event sender so the question tool can
 				// emit "question" events through the SSE stream.
 				tctx = tool.WithEventSender(tctx, func(jsonData string) {
+					timer := time.NewTimer(2 * time.Second)
+					defer timer.Stop()
 					select {
 					case eventCh <- ChatStreamChunk{QuestionJSON: jsonData}:
-					case <-time.After(2 * time.Second):
+					case <-tctx.Done():
+					case <-timer.C:
 						log.Printf("%s[question] dropped event (channel full for 2s)", trace.LogPrefix(tctx))
 					}
 				})
@@ -1714,14 +1914,20 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// independent of sandboxActive — because browser policy
 				// lives in the tool handler, not confirmTargetFor.
 				tctx = tool.WithConfirmEmitter(tctx, func(req tool.ConfirmRequest) {
+					timer := time.NewTimer(5 * time.Second)
+					defer timer.Stop()
 					select {
 					case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(req)}:
-					case <-time.After(5 * time.Second):
+					case <-timer.C:
 						log.Printf("%s[agent] WARN: browser confirm emit timed out after 5s", trace.LogPrefix(tctx))
 					case <-tctx.Done():
 					}
 				})
-				tctx, cancel := context.WithTimeout(tctx, 5*time.Minute)
+				toolTimeout := 5 * time.Minute
+				if meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot); ok {
+					toolTimeout = meta.EffectivePolicy().Timeout()
+				}
+				tctx, cancel := context.WithTimeout(tctx, toolTimeout)
 
 				fwd := forwarder{done: make(chan struct{})}
 				forwarders = append(forwarders, fwd)
@@ -1732,7 +1938,23 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							log.Printf("%s[forwarder] panic: %v", trace.LogPrefix(tctx), r)
 						}
 					}()
-					for ev := range eventCh {
+					for {
+						// Check cancellation before reading another buffered event.
+						// A tool that ignores its context must not keep growing partsAcc
+						// after the user has stopped the turn.
+						if ctx.Err() != nil {
+							return
+						}
+						var ev ChatStreamChunk
+						var ok bool
+						select {
+						case <-ctx.Done():
+							return
+						case ev, ok = <-eventCh:
+							if !ok {
+								return
+							}
+						}
 						// Sub-agent / tool events arrive here
 						// from the per-tool dispatcher. Feed
 						// them into the parts accumulator so
@@ -1754,6 +1976,30 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					defer wg.Done()
 					defer cancel()
 					defer close(eventCh)
+					// Tool definitions are intentionally restricted during a
+					// checkpoint, but markdown-format calls are parsed locally and
+					// can name any tool. Enforce the same allowlist at dispatch so a
+					// model cannot advance the task before recording todo state.
+					if !toolAllowedInPhase(tc.Name, roundPhase) {
+						outcomes[i] = toolOutcome{
+							idx: i,
+							tc:  tc,
+							result: &tool.CallResult{
+								Content: "todo checkpoint only allows todo_write or question",
+								IsError: true,
+							},
+							err: fmt.Errorf("tool %q is not allowed during todo checkpoint", tc.Name),
+						}
+						return
+					}
+					if serialGate != nil {
+						select {
+						case serialGate <- struct{}{}:
+							defer func() { <-serialGate }()
+						case <-ctx.Done():
+							return
+						}
+					}
 
 					// Sub-agent concurrency gate: if the
 					// semaphore is set, only N task calls
@@ -1908,13 +2154,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 										// waiting for a UI that never
 										// appeared. If the consumer is gone
 										// (ctx cancelled), bail out.
+										timer := time.NewTimer(5 * time.Second)
 										select {
 										case eventCh <- ChatStreamChunk{ToolConfirmJSON: tool.MarshalConfirm(cfm)}:
-										case <-time.After(5 * time.Second):
+										case <-timer.C:
 											log.Printf("%s[agent] WARN: ToolConfirmJSON send timed out after 5s; the user may not see the prompt (session=%s)", trace.LogPrefix(toolCtx), sessionID)
 										case <-toolCtx.Done():
+											timer.Stop()
 											return
 										}
+										timer.Stop()
 										approved, cfmErr := tool.WaitForConfirm(toolCtx, sessionID, cfm)
 										if cfmErr != nil || !approved {
 											outcomes[i] = toolOutcome{
@@ -1954,19 +2203,45 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 				}(i, tc)
 			}
-			// Wait for all tool goroutines to finish, then wait for all
-			// forwarders to drain. This ensures per-tool events are
-			// emitted in order before the result events below.
-			wg.Wait()
+			// Wait for all tool goroutines to finish, but release the main
+			// stream immediately on cancellation. Third-party and dynamic
+			// tools are expected to honor ctx, yet one broken handler must
+			// not retain the entire conversation and keep the SSE request
+			// alive until the five-minute tool timeout expires.
+			toolsDone := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(toolsDone)
+			}()
+			select {
+			case <-toolsDone:
+			case <-ctx.Done():
+				return
+			}
+			// All tools completed normally. Drain their final events before
+			// emitting the ordered result chunks below.
 			for _, f := range forwarders {
-				<-f.done
+				select {
+				case <-f.done:
+				case <-ctx.Done():
+					return
+				}
 			}
 
 			// Emit completion events in the original order so the UI shows
 			// results in the same order as the calls.
+			todoWriteSucceeded := false
+			ordinaryWorkCalled := false
+			roundToolSucceeded := false
 			for i := range outcomes {
 				o := &outcomes[i]
 				tc := o.tc
+				if o.result != nil {
+					o.result.Normalize()
+				}
+				if tc.Name != "todo_write" && tc.Name != "question" {
+					ordinaryWorkCalled = true
+				}
 				toolElapsed := formatElapsed(o.elapsed)
 				argsPreview := tc.ArgsJSON
 				if len(argsPreview) > 200 {
@@ -1982,6 +2257,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						errMsg = o.err.Error()
 					}
 					errChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-err", i+1), Message: fmt.Sprintf("     X %s 执行失败 (%s): %s", tc.Name, toolElapsed, errMsg), ToolID: tc.ID, ToolName: tc.Name, ToolError: errMsg, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					errChunk.ToolCallStatus = string(tool.CallStatusError)
+					attachToolResultMetadata(&errChunk, o.result)
 					partsAcc.update(errChunk)
 					sendOrDrop(ctx, ch, nextSeq, errChunk)
 					toolMsg := llm.ChatMessage{
@@ -2015,13 +2292,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					return r
 				}, resultPreview)
 
+				if !result.IsError && tc.Name == "todo_write" {
+					todoWriteSucceeded = true
+				}
+				if !result.IsError {
+					roundToolSucceeded = true
+				}
 				if result.IsError {
 					roundAnyToolErrored = true
 					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					attachToolResultMetadata(&warnChunk, result)
 					partsAcc.update(warnChunk)
 					sendOrDrop(ctx, ch, nextSeq, warnChunk)
 				} else {
 					okChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-ok", i+1), Message: fmt.Sprintf("     ok %s 完成 (%s, %d 字节)", tc.Name, toolElapsed, len(result.Content)), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
+					attachToolResultMetadata(&okChunk, result)
 					// For tools whose result the frontend needs to
 					// *parse* (todo_write), also send the untruncated
 					// payload. Truncated newlines → spaces and the 300
@@ -2054,7 +2339,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// user-facing error messages.
 					llmContent = fmt.Sprintf("Tool %s returned an error: %s", tc.Name, result.Content)
 				} else {
-					llmContent = a.truncateToolResult(tc.Name, result.Content)
+					llmContent = a.truncateToolResultForProject(tc.Name, req.ProjectRoot, result.Content)
 				}
 				toolMsg := llm.ChatMessage{
 					Role:      llm.RoleTool,
@@ -2083,6 +2368,39 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				msgs = append(msgs, toolMsg)
 				if a.store != nil {
 					a.store.AddChatMessageTo(req.SessionID, toolMsg)
+				}
+			}
+			// A successful ordinary-work round is real progress. A todo_write
+			// alone must not reset this budget, otherwise a model can alternate
+			// no-tool replies and no-op state writes forever.
+			autoContinueCount = resetAutoContinueCount(autoContinueCount, ordinaryWorkCalled && roundToolSucceeded)
+			// Record work after a todo write so an attempted text-only finish
+			// can require a status review. Do not enter that review immediately:
+			// one todo item commonly spans several ordinary tool calls.
+			if todoWriteSucceeded {
+				workSinceTodoWrite = ordinaryWorkCalled
+			} else if ordinaryWorkCalled {
+				workSinceTodoWrite = true
+			}
+			questionAnswered := false
+			for _, outcome := range outcomes {
+				if outcome.tc.Name == "question" && outcome.result != nil && !outcome.result.IsError && outcome.err == nil {
+					questionAnswered = true
+					break
+				}
+			}
+			if todoCheckpoint.active() {
+				if nextCheckpoint, advanced := advanceTodoCheckpoint(todoCheckpoint, todoWriteSucceeded, questionAnswered); advanced {
+					todoCheckpoint = nextCheckpoint
+					todoCheckpointAttempts = 0
+				} else {
+					todoCheckpointAttempts++
+					if todoCheckpointAttempts >= MaxTodoCheckpointAttempts {
+						emitTodoIncomplete("todo_write was not completed during the required state check", roundNum)
+						persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+						return
+					}
 				}
 			}
 			// Inject vision images: after all tool_result messages
@@ -2147,6 +2465,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			prevToolSig = curSig
 			prevErrored = curErrored
 			if stuckStreak >= stuckThreshold {
+				emitTodoIncomplete("stuck-loop stopped the agent before the plan was complete", roundNum)
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase:    "stuck",
 					Step:     "stuck-loop",
@@ -2230,6 +2549,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		if maxRounds > 0 {
+			emitTodoIncomplete("max rounds reached before the plan was complete", maxRounds)
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 		}
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})

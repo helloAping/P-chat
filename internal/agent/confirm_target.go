@@ -90,7 +90,7 @@ func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfi
 			PathClass: classForWorkDir(ea.WorkDir, projectRoot),
 			RiskLevel: "high", // exec_command is always "high" — it's arbitrary code
 		}, true
-	case "write_file":
+	case "write_file", "edit_file":
 		var wa struct {
 			Path string `json:"path"`
 		}

@@ -33,21 +33,19 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	}
 	defer h.sessionLocks.Delete(sessionID)
 
-	meta := h.ensureMetaLoaded(sessionID)
-	lastComp := h.store.LastCompressedIDFor(sessionID)
-	var histMsgs []llm.ChatMessage
-	var compSummary string
-	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(sessionID, 0, lastComp)
-		compSummary = h.store.CompressedSummaryFor(sessionID)
-	} else {
-		histMsgs = h.store.GetChatMessagesFor(sessionID, 0)
-	}
-	msgs := buildLLMMessages(histMsgs)
 	text := strings.TrimSpace(ev.Text)
 	if text == "" {
 		return nil
 	}
+	// IM sessions do not pass through the web preflight, so hydrate any
+	// interrupted plan before the agent constructs its guard prompt.
+	h.hydrateSessionTodos(sessionID)
+	meta := h.ensureMetaLoaded(sessionID)
+	provider := h.sessionProvider(sessionID)
+	model := h.sessionModel(sessionID, provider)
+	histMsgs, compSummary := h.loadHistoryForSend(ctx, sessionID, provider, model)
+	msgs := buildLLMMessages(histMsgs)
+	historyMessageCount := len(msgs)
 	msgs = append(msgs, llm.ChatMessage{
 		Role:        llm.RoleUser,
 		Type:        llm.TypeText,
@@ -56,22 +54,22 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 		SubmitToLLM: 1,
 	})
 
-	provider := h.sessionProvider(sessionID)
-	model := h.sessionModel(sessionID, provider)
 	req := agent.ChatRequest{
-		Style:             style.Style(h.sessionStyle(sessionID)),
-		WorkMode:          h.sessionWorkMode(sessionID),
-		Provider:          provider,
-		Model:             model,
-		Messages:          msgs,
-		CompressedSummary: compSummary,
-		SessionID:         sessionID,
-		ProjectRoot:       h.sessionProjectPath(sessionID),
-		ReasoningEffort:   meta.ReasoningEffort,
-		PermissionLevel:   meta.PermissionLevel,
-		KBBase:            meta.KnowledgeBase,
-		AutoContinue:      h.sessionAutoContinue(sessionID),
-		TraceID:           ev.TraceID,
+		Style:               style.Style(h.sessionStyle(sessionID)),
+		WorkMode:            h.sessionWorkMode(sessionID),
+		Provider:            provider,
+		Model:               model,
+		Messages:            msgs,
+		HistoryMessageCount: historyMessageCount,
+		CompressedSummary:   compSummary,
+		SessionID:           sessionID,
+		ProjectRoot:         h.sessionProjectPath(sessionID),
+		ReasoningEffort:     meta.ReasoningEffort,
+		PermissionLevel:     meta.PermissionLevel,
+		KBBase:              meta.KnowledgeBase,
+		AutoContinue:        h.sessionAutoContinue(sessionID),
+		TodoLongRunMode:     h.sessionTodoLongRunMode(sessionID),
+		TraceID:             ev.TraceID,
 	}
 
 	stream := h.agent.ChatStream(ctx, req)

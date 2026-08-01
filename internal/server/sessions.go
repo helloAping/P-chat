@@ -30,8 +30,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 func (h *Handler) ListSessions(c *gin.Context) {
@@ -218,6 +220,10 @@ func (h *Handler) PermanentDeleteSession(c *gin.Context) {
 	h.metaMu.Lock()
 	delete(h.meta, id)
 	h.metaMu.Unlock()
+	// Permanent deletion must also release the process-local todo cache;
+	// otherwise every deleted session would retain its last active plan until
+	// process exit even though the durable rows are gone.
+	tool.SetSessionTodosMemory(id, nil)
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }
 
@@ -699,6 +705,15 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		m.AutoContinue = req.AutoContinue
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
+	if req.TodoLongRunMode != nil {
+		mode := config.NormalizeTodoLongRunMode(*req.TodoLongRunMode)
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.TodoLongRunMode = &mode
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)

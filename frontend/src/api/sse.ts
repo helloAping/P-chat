@@ -59,6 +59,36 @@ export function emitStreamEvent<T extends StreamEventLike>(
   }
 }
 
+export function streamErrorStatus(error: unknown): number | null {
+  const message = String((error as any)?.message ?? error ?? '')
+  const match = message.match(/\bHTTP\s+(\d{3})\b/)
+  if (!match) return null
+  const status = Number(match[1])
+  return Number.isFinite(status) ? status : null
+}
+
+export function shouldRetryStreamError(error: unknown): boolean {
+  return streamErrorStatus(error) !== 409
+}
+
+// abortableDelay waits for retry backoff without outliving a user stop.
+// It returns true when the timer elapsed and false when the signal aborted.
+export function abortableDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false)
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve(true)
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      resolve(false)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 export async function consumeSSEStream<T extends StreamEventLike>(
   options: SSEConsumerOptions<T>,
 ): Promise<void> {
@@ -68,10 +98,13 @@ export async function consumeSSEStream<T extends StreamEventLike>(
   let done = false
 
   while (!done) {
+    if (options.signal?.aborted) return
+
     let result: ReadableStreamReadResult<Uint8Array>
     try {
       result = await options.reader.read()
     } catch (error: any) {
+      if (options.signal?.aborted) return
       const reason = error?.message || 'read failed'
       if (!options.signal?.aborted && options.onStreamDrop) {
         try {
@@ -93,6 +126,7 @@ export async function consumeSSEStream<T extends StreamEventLike>(
     while ((frameEnd = buffer.indexOf('\n\n')) >= 0) {
       const block = buffer.slice(0, frameEnd)
       buffer = buffer.slice(frameEnd + 2)
+      if (options.signal?.aborted) return
       const frame = parseSSEFrame(block)
       const event = decodeStreamEvent<T>(frame.data, options.label, frame.seq)
       if (!event) continue

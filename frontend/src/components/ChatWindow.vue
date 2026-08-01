@@ -177,11 +177,29 @@ function scrollToUserMsg() {
   el.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
-function scrollToBottom() {
-  nextTick(() => {
-    if (messagesEl.value) {
-      messagesEl.value.scrollTo({ top: 99999, behavior: 'smooth' })
-    }
+let scrollFrame: number | null = null
+let pendingSmoothScroll = false
+
+// Coalesce stream-driven follow scrolling to one layout operation
+// per frame. Smooth animation is reserved for an explicit user
+// action; starting one animation for every token causes the visible
+// flashing reported during long tool-heavy tasks.
+function scrollToBottom(smooth = false) {
+  pendingSmoothScroll ||= smooth
+  if (scrollFrame !== null) return
+  scrollFrame = requestAnimationFrame(() => {
+    scrollFrame = null
+    const useSmooth = pendingSmoothScroll
+    pendingSmoothScroll = false
+    nextTick(() => {
+      const el = messagesEl.value
+      if (!el) return
+      if (useSmooth) {
+        el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+      } else {
+        el.scrollTop = el.scrollHeight
+      }
+    })
   })
 }
 
@@ -193,7 +211,7 @@ function scrollToBottom() {
 // the user would see a stuttering animation.
 function jumpToBottom() {
   isAtBottom.value = true
-  scrollToBottom()
+  scrollToBottom(true)
 }
 
 function locateOpenQuestion() {
@@ -240,31 +258,27 @@ watch(() => currentMessages.value.length, (newLen, oldLen) => {
     return
   }
   if (isAtBottom.value) {
-    nextTick(() => scrollToBottom())
+    scrollToBottom()
   }
 })
 
-// Deep watcher: handles streaming content changes (text deltas,
-// thinking deltas, tool updates). The length doesn't change
-// during streaming, so the length watcher above doesn't fire.
-// We only auto-scroll when the user is at the bottom — if
-// they've scrolled up to read history, leave the viewport
-// alone and let the jump-to-bottom button pull them back.
+// streamRevision changes once per applied stream event. Watching it
+// avoids a deep traversal through every message and nested part on
+// each token while preserving sticky-bottom behavior.
 watch(
-  () => currentMessages.value,
+  () => state.streamRevision[state.currentID] || 0,
   () => {
     if (isAtBottom.value) {
-      nextTick(() => scrollToBottom())
+      scrollToBottom()
     }
   },
-  { deep: true }
 )
 
 watch(() => state.currentID, () => {
   // A new session is a fresh slate: assume the user wants to
   // land on the latest message.
   isAtBottom.value = true
-  nextTick(() => scrollToBottom())
+  scrollToBottom()
 })
 
 onMounted(() => {
@@ -285,6 +299,7 @@ onBeforeUnmount(() => {
   // Unregister so the store doesn't keep a reference to a torn-
   // down component's message instance.
   setUIMessageHandler(null)
+  if (scrollFrame !== null) cancelAnimationFrame(scrollFrame)
   // No custom scroll listener to remove — onScroll is bound
   // by Vue's @scroll on the template element, which Vue
   // auto-cleans on unmount.

@@ -14,6 +14,46 @@ func noopHandler(_ context.Context, _ json.RawMessage) (*tool.CallResult, error)
 	return &tool.CallResult{Content: "ok"}, nil
 }
 
+func TestNewSubAgentStore_IsEphemeral(t *testing.T) {
+	store, err := newSubAgentStore()
+	if err != nil {
+		t.Fatalf("newSubAgentStore: %v", err)
+	}
+
+	rows, err := store.DB().Query("PRAGMA database_list")
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("database list: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			seq  int
+			name string
+			path string
+		)
+		if err := rows.Scan(&seq, &name, &path); err != nil {
+			_ = store.Close()
+			t.Fatalf("scan database list: %v", err)
+		}
+		if name == "main" && path != "" {
+			_ = store.Close()
+			t.Fatalf("main database path = %q, want in-memory store", path)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = store.Close()
+		t.Fatalf("iterate database list: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close ephemeral store: %v", err)
+	}
+	if err := store.Ping(); err == nil {
+		t.Fatal("closed ephemeral store is still usable")
+	}
+}
+
 // TestDefault_ExcludesTaskTool verifies the recursion guard.
 func TestDefault_ExcludesTaskTool(t *testing.T) {
 	parent := tool.NewRegistry()

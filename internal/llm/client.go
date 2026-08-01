@@ -12,6 +12,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/tool"
@@ -86,7 +89,18 @@ type providerEntry struct {
 	model     string
 	apiKey    string
 	baseURL   string
+
+	// ResponseHeaderTimeout bounds a stalled request before the server
+	// responds. StreamIdleTimeout only applies after a response is open,
+	// so a long-running response remains valid while it keeps producing data.
+	responseHeaderTimeout time.Duration
+	streamIdleTimeout     time.Duration
 }
+
+const (
+	defaultResponseHeaderTimeout = 60 * time.Second
+	defaultStreamIdleTimeout     = 120 * time.Second
+)
 
 type Client struct {
 	providers map[string]*providerEntry
@@ -96,6 +110,143 @@ type Client struct {
 	// we can answer questions like "what models does provider X
 	// expose?" and "what was the configured default model?".
 	cfgModels []config.ProviderConfig
+}
+
+// streamingHTTPClient creates a client that times out only while waiting for
+// response headers. A total client timeout is unsuitable for SSE because it
+// would terminate a healthy, long-running response.
+func streamingHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
+	client := *NewHTTPClient()
+	client.Timeout = 0
+
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = defaultResponseHeaderTimeout
+	}
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		transport = transport.Clone()
+		transport.ResponseHeaderTimeout = responseHeaderTimeout
+		client.Transport = transport
+	} else if client.Transport == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.ResponseHeaderTimeout = responseHeaderTimeout
+		client.Transport = transport
+	}
+	return &client
+}
+
+// idleTimeoutReader resets its watchdog whenever transport bytes arrive. The
+// watchdog cancels the request context, which closes the underlying response
+// body and unblocks a pending Read without leaving a goroutine behind.
+type idleTimeoutReader struct {
+	r       io.Reader
+	timeout time.Duration
+	cancel  context.CancelFunc
+
+	activity chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	once     sync.Once
+	timedOut atomic.Bool
+}
+
+func newIdleTimeoutReader(r io.Reader, timeout time.Duration, cancel context.CancelFunc) *idleTimeoutReader {
+	if timeout <= 0 {
+		timeout = defaultStreamIdleTimeout
+	}
+	w := &idleTimeoutReader{
+		r:        r,
+		timeout:  timeout,
+		cancel:   cancel,
+		activity: make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	go w.watch()
+	return w
+}
+
+func (w *idleTimeoutReader) watch() {
+	defer close(w.done)
+	timer := time.NewTimer(w.timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-w.stop:
+			return
+		case <-w.activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(w.timeout)
+		case <-timer.C:
+			w.timedOut.Store(true)
+			w.cancel()
+			return
+		}
+	}
+}
+
+func (w *idleTimeoutReader) Read(p []byte) (int, error) {
+	n, err := w.r.Read(p)
+	if n > 0 {
+		select {
+		case w.activity <- struct{}{}:
+		default:
+		}
+	}
+	if err != nil && n == 0 && w.timedOut.Load() {
+		return 0, fmt.Errorf("LLM stream idle for %s: %w", w.timeout, context.DeadlineExceeded)
+	}
+	return n, err
+}
+
+func (w *idleTimeoutReader) Close() error {
+	w.once.Do(func() {
+		close(w.stop)
+		<-w.done
+	})
+	if closer, ok := w.r.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+func streamTimeouts(p *providerEntry) (time.Duration, time.Duration) {
+	headerTimeout := p.responseHeaderTimeout
+	if headerTimeout <= 0 {
+		headerTimeout = defaultResponseHeaderTimeout
+	}
+	idleTimeout := p.streamIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultStreamIdleTimeout
+	}
+	return headerTimeout, idleTimeout
+}
+
+// manageStream owns the response body and maps watchdog cancellation to the
+// normal timeout error path. Its send is cancellation-aware so an abandoned
+// consumer cannot retain the parser or idle watchdog.
+func manageStream(ctx context.Context, cancel context.CancelFunc, provider string, body io.Closer, stream <-chan StreamChunk) <-chan StreamChunk {
+	out := make(chan StreamChunk, 64)
+	go func() {
+		defer close(out)
+		defer cancel()
+		defer body.Close()
+		for chunk := range stream {
+			if chunk.Err != nil {
+				chunk.Err = ClassifyAPIError(provider, chunk.Err)
+			}
+			select {
+			case out <- chunk:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
 }
 
 func NewClient(cfg *config.LLMConfig) (*Client, error) {
@@ -131,11 +282,13 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 
 	for _, p := range cfg.Providers {
 		entry := &providerEntry{
-			name:     p.Name,
-			protocol: p.GetProtocol(),
-			model:    p.EffectiveModel(), // start with the default model
-			apiKey:   p.APIKey,
-			baseURL:  p.BaseURL,
+			name:                  p.Name,
+			protocol:              p.GetProtocol(),
+			model:                 p.EffectiveModel(), // start with the default model
+			apiKey:                p.APIKey,
+			baseURL:               p.BaseURL,
+			responseHeaderTimeout: defaultResponseHeaderTimeout,
+			streamIdleTimeout:     defaultStreamIdleTimeout,
 		}
 
 		switch p.GetProtocol() {
@@ -252,9 +405,14 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 		len(req.Body),
 	)
 
+	// Give this round its own cancellation path. The idle watchdog cancels the
+	// transport while the caller's context stays available to receive the
+	// resulting timeout chunk.
+	streamCtx, cancelStream := context.WithCancel(ctx)
 	// Send the request and return the parsed stream.
-	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
+	httpReq, err := http.NewRequestWithContext(streamCtx, req.Method, req.URL, bytes.NewReader(req.Body))
 	if err != nil {
+		cancelStream()
 		ch := make(chan StreamChunk, 1)
 		ch <- StreamChunk{Err: err}
 		close(ch)
@@ -264,9 +422,11 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 		httpReq.Header.Set(k, v)
 	}
 
-	httpClient := NewHTTPClient()
+	headerTimeout, idleTimeout := streamTimeouts(p)
+	httpClient := streamingHTTPClient(headerTimeout)
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
+		cancelStream()
 		ch := make(chan StreamChunk, 1)
 		ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
 		close(ch)
@@ -275,13 +435,15 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		cancelStream()
 		ch := make(chan StreamChunk, 1)
 		ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(errBody)))}
 		close(ch)
 		return ch
 	}
 
-	return p.adapter.ParseStream(resp.Body)
+	body := newIdleTimeoutReader(resp.Body, idleTimeout, cancelStream)
+	return manageStream(ctx, cancelStream, p.name, body, p.adapter.ParseStream(body))
 }
 
 // ToolsFromRegistryDef builds []ToolDef from the tool registry.
@@ -334,6 +496,8 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 
 	go func() {
 		defer close(ch)
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		defer cancelStream()
 
 		// Per-model overrides win over the supplied opts when set.
 		// (Per-model MaxTokensOutput is non-zero → use it; otherwise
@@ -383,7 +547,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			return
 		}
 		endpoint := strings.TrimRight(p.baseURL, "/") + "/chat/completions"
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			ch <- StreamChunk{Err: fmt.Errorf("build openai request: %w", err)}
 			return
@@ -404,13 +568,15 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		if p.apiKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 		}
-		httpClient := &http.Client{Timeout: 0}
+		headerTimeout, idleTimeout := streamTimeouts(p)
+		httpClient := streamingHTTPClient(headerTimeout)
 		resp, err := httpClient.Do(httpReq)
 		if err != nil {
 			ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
 			return
 		}
-		defer resp.Body.Close()
+		streamBody := newIdleTimeoutReader(resp.Body, idleTimeout, cancelStream)
+		defer streamBody.Close()
 		if resp.StatusCode >= 400 {
 			// Read up to 4 KB of body for the error message.
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -433,7 +599,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		// surface a "0 chars received" line at the end of
 		// the stream and the user can copy the raw chunk
 		// dump into the issue tracker.
-		reader := bufio.NewReaderSize(resp.Body, 1<<20)
+		reader := bufio.NewReaderSize(streamBody, 1<<20)
 		var (
 			rawChunks     int
 			parseFailures int

@@ -875,6 +875,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		VectorStore:     cv.VectorStore,
 		KnowledgeBase:   m.KnowledgeBase,
 		AutoContinue:    h.sessionAutoContinue(cv.ID),
+		TodoLongRunMode: string(h.sessionTodoLongRunMode(cv.ID)),
 		CreatedAt:       cv.CreatedAt.Unix(),
 		UpdatedAt:       cv.UpdatedAt.Unix(),
 	}

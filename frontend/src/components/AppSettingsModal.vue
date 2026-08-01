@@ -271,6 +271,7 @@ const sysLimits = ref<api.LimitsConfig>({
   tool_result_default_cap: 6000,
   prune_after_rounds: 15,
   max_rounds: 300,
+  todo_long_run_mode: 'adaptive',
   max_stored_messages: 0,
 })
 const sysSubAgent = ref<api.SubAgentConfig>({
@@ -313,6 +314,7 @@ async function saveSystemConfig() {
     limits.tool_result_default_cap = sysLimits.value.tool_result_default_cap
     limits.prune_after_rounds = sysLimits.value.prune_after_rounds
     limits.max_rounds = sysLimits.value.max_rounds
+    limits.todo_long_run_mode = sysLimits.value.todo_long_run_mode
     limits.max_stored_messages = sysLimits.value.max_stored_messages
     patch.limits = limits
 
@@ -342,6 +344,7 @@ function resetSystemConfig() {
     tool_result_default_cap: 6000,
     prune_after_rounds: 15,
     max_rounds: 300,
+    todo_long_run_mode: 'adaptive',
     max_stored_messages: 0,
   }
   sysSubAgent.value = { cache_ttl: '', timeout: '' }
@@ -2042,6 +2045,15 @@ function kbModelSupportsVision(scanModel: string) {
                       <span class="sys-label">最大回合数</span>
                       <NInputNumber v-model:value="sysLimits.max_rounds" :min="0" :step="10" size="small" style="width:100px" @update:value="markSysDirty" />
                       <span class="sys-hint">0 = 不限制，默认 300</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">Todo 长任务</span>
+                      <NSelect v-model:value="sysLimits.todo_long_run_mode" :options="[
+                        { label: '关闭', value: 'off' },
+                        { label: '自适应', value: 'adaptive' },
+                        { label: '不限轮次', value: 'unlimited' },
+                      ]" size="small" style="width:120px" @update:value="markSysDirty" />
+                      <span class="sys-hint">自适应仅在存在活动 todo 时超过最大回合数</span>
                     </div>
                     <div class="sys-form-row">
                       <span class="sys-label">exec_command 截断</span>

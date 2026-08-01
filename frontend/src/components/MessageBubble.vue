@@ -48,7 +48,15 @@ import RoleAvatar from './RoleAvatar.vue'
 // LRU-ish: a Map preserves insertion order, so we can pop the
 // oldest entry when over the cap.
 const MD_CACHE_MAX = 256
+const MD_CACHE_MAX_BYTES = 2 * 1024 * 1024
+const MD_CACHE_ENTRY_MAX_BYTES = 64 * 1024
 const mdCache = new Map<string, string>()
+let mdCacheBytes = 0
+function cacheCost(text: string, html: string): number {
+  // JavaScript strings are UTF-16, so this is a conservative
+  // accounting approximation for the cache's retained strings.
+  return (text.length + html.length) * 2
+}
 function renderMd(text: string): string {
   if (!text) return ''
   const cached = mdCache.get(text)
@@ -59,10 +67,15 @@ function renderMd(text: string): string {
     return cached
   }
   const html = marked.parse(text, { async: false, breaks: true }) as string
+  if (cacheCost(text, html) > MD_CACHE_ENTRY_MAX_BYTES) return html
   mdCache.set(text, html)
-  if (mdCache.size > MD_CACHE_MAX) {
+  mdCacheBytes += cacheCost(text, html)
+  while (mdCache.size > MD_CACHE_MAX || mdCacheBytes > MD_CACHE_MAX_BYTES) {
     const oldest = mdCache.keys().next().value
-    if (oldest !== undefined) mdCache.delete(oldest)
+    if (oldest === undefined) break
+    const oldestHTML = mdCache.get(oldest)
+    if (oldestHTML !== undefined) mdCacheBytes -= cacheCost(oldest, oldestHTML)
+    mdCache.delete(oldest)
   }
   return html
 }
@@ -178,6 +191,7 @@ const toast = useMessage()
 const messageContextMenuVisible = ref(false)
 const messageContextMenuX = ref(0)
 const messageContextMenuY = ref(0)
+const messageContextMenuSelection = ref('')
 const messageContextMenuOptions: DropdownOption[] = [
   {
     label: '复制',
@@ -192,6 +206,9 @@ function hideMessageContextMenu() {
 
 async function onMessageContextMenu(e: MouseEvent) {
   e.preventDefault()
+  // 菜单显示后焦点可能改变，先保存当前选区。
+  // Snapshot the selection before the menu can change focus.
+  messageContextMenuSelection.value = window.getSelection()?.toString() ?? ''
   messageContextMenuVisible.value = false
   messageContextMenuX.value = e.clientX
   messageContextMenuY.value = e.clientY
@@ -202,6 +219,12 @@ async function onMessageContextMenu(e: MouseEvent) {
 async function onMessageContextMenuSelect(key: string | number) {
   hideMessageContextMenu()
   if (key === 'copy') {
+    if (messageContextMenuSelection.value) {
+      const ok = await copyText(messageContextMenuSelection.value)
+      if (ok) toast.success('已复制')
+      else toast.error('复制失败')
+      return
+    }
     await copyEntireMessage()
   }
 }
@@ -239,6 +262,28 @@ function isLiveThinkingPart(idx: number, kind: string, parts: MessagePart[] | un
   if (!props.streaming) return false
   if (!parts || parts.length === 0) return false
   return idx === parts.length - 1
+}
+
+// Keep the full part history in Pinia and SQLite, but bound the
+// amount of nested card DOM one long-running assistant message can
+// keep alive. The newest parts always stay visible so live output
+// and the active tool remain in view; earlier records can be added
+// back in small batches on demand.
+const PART_RENDER_WINDOW = 120
+const revealedEarlierParts = ref(0)
+const partWindowStart = computed(() => {
+  const total = props.message.parts?.length || 0
+  const visible = Math.min(total, PART_RENDER_WINDOW + revealedEarlierParts.value)
+  return Math.max(0, total - visible)
+})
+const hiddenPartCount = computed(() => partWindowStart.value)
+const visibleParts = computed(() => {
+  const parts = props.message.parts || []
+  const start = partWindowStart.value
+  return parts.slice(start).map((part, offset) => ({ part, index: start + offset }))
+})
+function showEarlierParts() {
+  revealedEarlierParts.value += PART_RENDER_WINDOW
 }
 
 // The role check: system messages get a special icon.
@@ -1154,25 +1199,34 @@ function findPrecedingUserMessageId(): number {
               <div v-for="(line, i) in statusLines" :key="i" :class="['status-line', { 'status-line-auto-continue': line.includes('自动续 LLM') }]">{{ line }}</div>
             </div>
             <template v-if="message.parts && message.parts.length">
-              <template v-for="(p, i) in message.parts" :key="i">
+              <button
+                v-if="hiddenPartCount"
+                type="button"
+                class="part-window-toggle"
+                :title="`展开更早的 ${hiddenPartCount} 条过程记录`"
+                @click="showEarlierParts"
+              >
+                已折叠 {{ hiddenPartCount }} 条过程记录
+              </button>
+              <template v-for="entry in visibleParts" :key="entry.index">
                 <ThinkingBlock
-                  v-if="p.kind === 'thinking'"
-                  :part="p"
-                  :default-open="isLiveThinkingPart(i, p.kind, message.parts)"
+                  v-if="entry.part.kind === 'thinking'"
+                  :part="entry.part"
+                  :default-open="isLiveThinkingPart(entry.index, entry.part.kind, message.parts)"
                 />
-                <ToolCallCard v-else-if="p.kind === 'tool'" :part="p" />
-                <SubAgentCard v-else-if="p.kind === 'sub_agent'" :part="p" />
-                <QuestionTable v-else-if="p.kind === 'question'" :part="p" />
+                <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
+                <SubAgentCard v-else-if="entry.part.kind === 'sub_agent'" :part="entry.part" />
+                <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
                 <TypedText
-                  v-else-if="p.kind === 'text' && isLiveTextPart(i, p.kind, message.parts)"
-                  :text="p.text || ''"
+                  v-else-if="entry.part.kind === 'text' && isLiveTextPart(entry.index, entry.part.kind, message.parts)"
+                  :text="entry.part.text || ''"
                   :active="true"
                 />
                 <div
-                  v-else-if="p.kind === 'text'"
+                  v-else-if="entry.part.kind === 'text'"
                   ref="mdBodyEl"
                   class="md-body"
-                  v-html="renderMd(p.text || '')"
+                  v-html="renderMd(entry.part.text || '')"
                   @click="onMarkdownClick"
                 />
               </template>
@@ -1493,6 +1547,26 @@ function findPrecedingUserMessageId(): number {
   line-height: 1.4;
 }
 .bubble-body { min-width: 0; flex: 1; color: inherit; }
+
+.part-window-toggle {
+  display: block;
+  width: 100%;
+  margin: 6px 0;
+  padding: 6px 10px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+}
+.part-window-toggle:hover {
+  border-color: var(--border-default);
+  color: var(--text-secondary);
+}
 
 /* Force the markdown body inside a user bubble to inherit
  * the white text color. The default --text-primary would

@@ -80,6 +80,16 @@ type Message struct {
 	IsArchived bool `json:"is_archived"`
 }
 
+// MessageIdentity is the immutable identity needed to validate a caller-
+// supplied message id before starting a new chat turn. The SQLite row id is
+// global, so callers must also check the conversation and role rather than
+// treating a duplicate INSERT OR IGNORE as successful delivery.
+type MessageIdentity struct {
+	ConversationID string
+	Role           string
+	Content        string
+}
+
 // Summary records an LLM-generated compression of a range of messages.
 type Summary struct {
 	ConversationID string    `json:"conversation_id"`
@@ -509,6 +519,31 @@ func (s *Store) AddChatMessageToWithID(convID string, msg llm.ChatMessage, rowID
 	if full {
 		_ = s.Flush()
 	}
+}
+
+// FindMessageIdentity returns the durable row identity for rowID. It flushes
+// buffered writes first so a retry observes the user row accepted by the
+// preceding request instead of starting a second LLM turn.
+func (s *Store) FindMessageIdentity(rowID int64) (MessageIdentity, bool, error) {
+	if rowID <= 0 {
+		return MessageIdentity{}, false, nil
+	}
+	if err := s.Flush(); err != nil {
+		return MessageIdentity{}, false, err
+	}
+
+	var identity MessageIdentity
+	err := s.db.QueryRow(
+		`SELECT conversation_id, role, content FROM messages WHERE id = ?`,
+		rowID,
+	).Scan(&identity.ConversationID, &identity.Role, &identity.Content)
+	if err == sql.ErrNoRows {
+		return MessageIdentity{}, false, nil
+	}
+	if err != nil {
+		return MessageIdentity{}, false, err
+	}
+	return identity, true, nil
 }
 
 // GetChatMessages returns the current conversation's history as

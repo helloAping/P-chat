@@ -83,6 +83,12 @@ memory:
   enabled: true
   max_history: 50
 
+# Agent execution limits. `adaptive` lets an active todo plan continue beyond
+# max_rounds while preserving cancellation, context compaction, and tool-failure guards.
+limits:
+  max_rounds: 300
+  todo_long_run_mode: "adaptive" # "off" | "adaptive" | "unlimited"
+
 sandbox:
   enabled: true
   require_confirm: dangerous   # dangerous | always | never

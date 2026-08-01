@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -130,6 +131,35 @@ func TestHealth(t *testing.T) {
 	}
 	if body["status"] != "ok" {
 		t.Errorf("status = %v, want ok", body["status"])
+	}
+}
+
+func TestClearTodosClearsMemoryAndSQLite(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, err := s.store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tool.SetSessionTodos(sessionID, nil) })
+
+	dbTodos := []memory.TodoItem{{ID: "1", Content: "unfinished", Status: "pending"}}
+	if err := s.store.SaveTodos(sessionID, dbTodos); err != nil {
+		t.Fatal(err)
+	}
+	tool.SetSessionTodos(sessionID, []tool.TodoItem{{ID: "1", Content: "unfinished", Status: "pending"}})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/"+sessionID+"/todos", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got := tool.GetSessionTodos(sessionID); len(got) != 0 {
+		t.Fatalf("in-memory todos = %#v, want empty", got)
+	}
+	if got := s.store.LoadTodos(sessionID); len(got) != 0 {
+		t.Fatalf("persisted todos = %#v, want empty", got)
 	}
 }
 
@@ -539,6 +569,96 @@ func TestSendMessage_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestSendMessage_DuplicateClientMessageIDDoesNotStartAnotherTurn(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const clientMsgID int64 = 1_730_000_000_001_123
+	store.AddChatMessageToWithID(convID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "already accepted",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	}, clientMsgID)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	before := store.CountChatMessages(convID)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/sessions/"+convID+"/messages",
+		bytes.NewBufferString(`{"message":"already accepted","client_msg_id":1730000000001123}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "duplicate_client_message" {
+		t.Fatalf("code = %q, want duplicate_client_message", body.Code)
+	}
+	if got := store.CountChatMessages(convID); got != before {
+		t.Fatalf("message count = %d, want %d; duplicate request must not start a new turn", got, before)
+	}
+}
+
+func TestSendMessage_ClientMessageIDRejectsDifferentPayload(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const clientMsgID int64 = 1_730_000_000_001_124
+	store.AddChatMessageToWithID(convID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "original payload",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	}, clientMsgID)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/sessions/"+convID+"/messages",
+		bytes.NewBufferString(`{"message":"different payload","client_msg_id":1730000000001124}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "client_message_id_conflict" {
+		t.Fatalf("code = %q, want client_message_id_conflict", body.Code)
+	}
+}
+
 func TestSendMessage_NotFound(t *testing.T) {
 	s, _ := newTestServer(t)
 	w := httptest.NewRecorder()
@@ -588,6 +708,43 @@ func TestSendMessage_StreamsSSE(t *testing.T) {
 	// We just want to confirm the request was accepted; with no
 	// real LLM the body will likely be empty.
 	t.Logf("streaming completed; status would be checked via real client")
+}
+
+func TestLoadHistoryForSend_BoundsUncompressedHistory(t *testing.T) {
+	s, cfg := newTestServer(t)
+	s.handler.SetSummarizer(nil)
+	cfg.Limits.MaxStoredMessages = 5
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCurrent(convID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		store.AddChatMessageTo(convID, llm.ChatMessage{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     fmt.Sprintf("msg-%02d", i),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	hist, summary := s.handler.loadHistoryForSend(context.Background(), convID, "cs", "doubao-seed-2.0-lite")
+	if summary != "" {
+		t.Fatalf("summary = %q, want empty when summarizer is unavailable", summary)
+	}
+	if len(hist) != 5 {
+		t.Fatalf("history len = %d, want bounded 5", len(hist))
+	}
+	if hist[0].Content != "msg-07" || hist[len(hist)-1].Content != "msg-11" {
+		t.Fatalf("history range = %q..%q, want latest msg-07..msg-11", hist[0].Content, hist[len(hist)-1].Content)
+	}
 }
 
 // ====================================================================

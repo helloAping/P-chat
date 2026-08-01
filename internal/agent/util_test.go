@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 // =====================================================================
@@ -120,6 +122,23 @@ func TestTruncateToolResult_CfgOverride(t *testing.T) {
 	// Truncation marker is present.
 	if !strings.Contains(got, "[truncated:") {
 		t.Errorf("expected truncation, got: %q", got[:50])
+	}
+}
+
+func TestTruncateToolResultForProjectHonorsToolPolicyCap(t *testing.T) {
+	registry := tool.NewRegistry()
+	registry.Register(tool.Tool{
+		Name: "bounded_tool",
+		Policy: &tool.ToolPolicy{
+			MaxOutputBytes: 50,
+		},
+	}, func(context.Context, json.RawMessage) (*tool.CallResult, error) {
+		return nil, nil
+	})
+	a := &Agent{tools: registry}
+	got := a.truncateToolResultForProject("bounded_tool", "", strings.Repeat("x", 100))
+	if !strings.Contains(got, "[truncated:") {
+		t.Fatalf("policy cap was not applied: %q", got)
 	}
 }
 

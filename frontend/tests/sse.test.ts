@@ -2,12 +2,25 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  abortableDelay,
   consumeSSEStream,
   decodeStreamEvent,
   emitStreamEvent,
   parseSSEFrame,
+  shouldRetryStreamError,
+  streamErrorStatus,
   type StreamEventLike,
 } from '../src/api/sse.ts'
+
+test('abortableDelay resolves immediately when a retry wait is aborted', async () => {
+  const controller = new AbortController()
+  const started = Date.now()
+  const waiting = abortableDelay(2_000, controller.signal)
+  controller.abort()
+
+  assert.equal(await waiting, false)
+  assert.ok(Date.now() - started < 100, 'abort should not wait for the retry timer')
+})
 
 function readerFromChunks(chunks: string[]): ReadableStreamDefaultReader<Uint8Array> {
   const encoder = new TextEncoder()
@@ -47,6 +60,19 @@ test('emitStreamEvent isolates handler errors', () => {
   } finally {
     console.warn = warn
   }
+})
+
+test('HTTP 409 stream conflicts are non-retryable', () => {
+  const conflict = new Error('stream: stream POST http://127.0.0.1/messages: HTTP 409: {"error":"a message is already being processed for this session"}')
+  const badGateway = new Error('stream: HTTP 502: Bad Gateway')
+  const network = new Error('stream stream: network gone')
+
+  assert.equal(streamErrorStatus(conflict), 409)
+  assert.equal(shouldRetryStreamError(conflict), false)
+  assert.equal(streamErrorStatus(badGateway), 502)
+  assert.equal(shouldRetryStreamError(badGateway), true)
+  assert.equal(streamErrorStatus(network), null)
+  assert.equal(shouldRetryStreamError(network), true)
 })
 
 test('consumeSSEStream handles split frames and skips DONE', async () => {
@@ -135,4 +161,24 @@ test('consumeSSEStream reports the last observed seq when the stream drops', asy
   )
 
   assert.deepEqual(drop, { lastSeq: 9, reason: 'network gone' })
+})
+
+test('consumeSSEStream drops buffered events after cancellation', async () => {
+  const controller = new AbortController()
+  const events: StreamEventLike[] = []
+
+  await consumeSSEStream({
+    reader: readerFromChunks([
+      'data: {"type":"content","content":"first"}\nid: 1\n\n'
+        + 'data: {"type":"tool","tool_name":"late"}\nid: 2\n\n',
+    ]),
+    signal: controller.signal,
+    label: 'test',
+    onEvent: event => {
+      events.push(event)
+      controller.abort()
+    },
+  })
+
+  assert.deepEqual(events, [{ type: 'content', content: 'first', seq: 1 }])
 })

@@ -179,6 +179,45 @@ func init() {
 			Handler: cmdClear,
 		},
 		{
+			Name: "/compress", Description: "压缩当前会话的较早历史",
+			Usage: "/compress",
+			Args:  "无参。请求 server 将较早消息整理为摘要，以释放上下文空间。",
+			Examples: []string{
+				"/compress",
+			},
+			Handler: cmdCompress,
+		},
+		{
+			Name: "/context", Aliases: []string{"/ctx"}, Description: "查看会话上下文用量与消息估算",
+			Usage: "/context [session-id]",
+			Args: "无参             - 查看当前会话\n" +
+				"      <session-id>    - 查看指定会话，不切换当前会话",
+			Examples: []string{
+				"/context",
+				"/ctx conv_20260801_001",
+			},
+			Handler: cmdContext,
+		},
+		{
+			Name: "/reasoning", Aliases: []string{"/reason"}, Description: "设置当前会话的推理强度",
+			Usage: "/reasoning <off|low|medium|high|max>",
+			Args:  "off|low|medium|high|max  - 设置下一次请求的推理强度。",
+			Examples: []string{
+				"/reasoning medium",
+				"/reason high",
+			},
+			Handler: cmdReasoning,
+		},
+		{
+			Name: "/regen", Aliases: []string{"/regenerate"}, Description: "重新生成指定用户消息之后的回复",
+			Usage: "/regen <user-message-id>",
+			Args:  "<user-message-id>  - 用户消息的数据库 ID；可通过 /history 或消息记录定位。",
+			Examples: []string{
+				"/regen 42",
+			},
+			Handler: cmdRegen,
+		},
+		{
 			Name: "/export", Aliases: []string{"/save"}, Description: "导出会话到文件 [markdown|json] [id|last] [-o file]",
 			Usage: "/export [format] [session] [-o <file>]",
 			Args: "format     - markdown (默认) 或 json\n" +
@@ -2194,6 +2233,117 @@ func cmdTools(ctx cliContext, args string) error {
 	fmt.Println()
 	color.HiBlack("  使用 /tools on|off 切换工具调用")
 	fmt.Println()
+	return nil
+}
+
+func cmdCompress(ctx cliContext, args string) error {
+	if strings.TrimSpace(args) != "" {
+		color.HiBlack("  用法: /compress")
+		return nil
+	}
+	result, err := ctx.CompressSession(context.Background(), ctx.GetCurrentSessionID())
+	if err != nil {
+		if isUnsupported(err) {
+			color.HiBlack("  (/compress 仅在 HTTP 模式可用)")
+			return nil
+		}
+		color.Red("  ✗ %v", err)
+		return nil
+	}
+	if !result.Compressed {
+		color.HiBlack("  当前会话没有可压缩的历史")
+		return nil
+	}
+	color.Green("  ✓ 已压缩较早历史")
+	if summary := strings.TrimSpace(result.Summary); summary != "" {
+		color.HiBlack("  摘要: %s", summary)
+	}
+	return nil
+}
+
+func cmdContext(ctx cliContext, args string) error {
+	sessionID := strings.TrimSpace(args)
+	if sessionID == "" {
+		sessionID = ctx.GetCurrentSessionID()
+	}
+	info, err := ctx.GetSessionContext(context.Background(), sessionID)
+	if err != nil {
+		if isUnsupported(err) {
+			color.HiBlack("  (/context 仅在 HTTP 模式可用)")
+			return nil
+		}
+		color.Red("  ✗ %v", err)
+		return nil
+	}
+
+	fmt.Println()
+	color.Cyan("  上下文: %s / %s", info.Provider, info.Model)
+	color.HiBlack("  会话: %s", info.SessionID)
+	color.HiBlack("  估算 tokens: %d / %d 可用 (窗口 %d, %.1f%%)", info.EstimatedTokens, info.UsableTokens, info.ContextWindow, info.UtilizationPct)
+	if info.CompressedSummary != "" {
+		color.HiBlack("  已包含压缩摘要")
+	}
+	if len(info.Messages) > 0 {
+		fmt.Println()
+		color.Cyan("  消息 (%d):", len(info.Messages))
+		for _, msg := range info.Messages {
+			preview := strings.ReplaceAll(msg.Preview, "\n", " ")
+			fmt.Printf("    %-10s %6d  %s\n", msg.Role, msg.Tokens, preview)
+		}
+	}
+	return nil
+}
+
+func cmdReasoning(ctx cliContext, args string) error {
+	level := strings.ToLower(strings.TrimSpace(args))
+	valid := map[string]bool{"off": true, "low": true, "medium": true, "high": true, "max": true}
+	if !valid[level] {
+		color.HiBlack("  用法: /reasoning <off|low|medium|high|max>")
+		return nil
+	}
+	actual, err := ctx.SetReasoningEffort(context.Background(), ctx.GetCurrentSessionID(), level)
+	if err != nil {
+		if isUnsupported(err) {
+			color.HiBlack("  (/reasoning 仅在 HTTP 模式可用)")
+			return nil
+		}
+		color.Red("  ✗ %v", err)
+		return nil
+	}
+	color.Green("  ✓ 推理强度已设为: %s", actual)
+	return nil
+}
+
+func cmdRegen(ctx cliContext, args string) error {
+	userMessageID, err := strconv.ParseInt(strings.TrimSpace(args), 10, 64)
+	if err != nil || userMessageID <= 0 {
+		color.HiBlack("  用法: /regen <user-message-id>")
+		return nil
+	}
+
+	streamCtx := context.Background()
+	stream, err := ctx.Regenerate(streamCtx, ctx.GetCurrentSessionID(), userMessageID)
+	if err != nil {
+		if isUnsupported(err) {
+			color.HiBlack("  (/regen 仅在 HTTP 模式可用)")
+			return nil
+		}
+		color.Red("  ✗ %v", err)
+		return nil
+	}
+
+	ui := NewChatUI(ctx.GetCurrentProvider(), ctx.GetCurrentModel())
+	ui.SetQuestionHandler(ctx.GetCurrentSessionID(), func(sessionID string, answers map[string]string) error {
+		return ctx.SubmitQuestionAnswer(streamCtx, sessionID, answers)
+	})
+	ui.SetConfirmHandler(ctx.GetCurrentSessionID(), func(sessionID string, approved bool, action string) error {
+		return ctx.SubmitToolConfirm(streamCtx, sessionID, approved, action)
+	})
+	ui.PrintBannerHeader(fmt.Sprintf("/regen %d", userMessageID))
+	for chunk := range stream {
+		ui.Handle(chunk)
+	}
+	ui.Finish()
 	return nil
 }
 

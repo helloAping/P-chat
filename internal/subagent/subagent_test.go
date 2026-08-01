@@ -67,6 +67,53 @@ func TestCache_DistinguishesInputs(t *testing.T) {
 	}
 }
 
+func TestSubAgentCacheKey_DistinguishesExecutionIdentity(t *testing.T) {
+	base := Request{
+		TaskID:         "task-42",
+		Description:    "inspect the repository",
+		PromptOverride: "focus on tests",
+		ProjectRoot:    "D:/work/repo-a",
+	}
+	key := subAgentCacheKey(base, style.Tech, "openai", "explore", "gpt-4o-mini", "read_file\x00list_files")
+	cache := NewCache(time.Minute)
+	cache.PutByKey(key, Result{Content: "cached result"})
+	if got, ok := cache.GetByKey(key); !ok || got.Content != "cached result" {
+		t.Fatalf("base execution cache result = %#v, hit = %v", got, ok)
+	}
+
+	variants := []struct {
+		name  string
+		req   Request
+		style style.Style
+		prov  string
+		type_ string
+		model string
+		tools string
+	}{
+		{name: "task id", req: Request{TaskID: "task-43", Description: base.Description, PromptOverride: base.PromptOverride, ProjectRoot: base.ProjectRoot}, style: style.Tech, prov: "openai", type_: "explore", model: "gpt-4o-mini", tools: "read_file\x00list_files"},
+		{name: "description", req: Request{TaskID: base.TaskID, Description: "inspect only tests", PromptOverride: base.PromptOverride, ProjectRoot: base.ProjectRoot}, style: style.Tech, prov: "openai", type_: "explore", model: "gpt-4o-mini", tools: "read_file\x00list_files"},
+		{name: "type", req: base, style: style.Tech, prov: "openai", type_: "plan", model: "gpt-4o-mini", tools: "read_file\x00list_files"},
+		{name: "model", req: base, style: style.Tech, prov: "openai", type_: "explore", model: "gpt-4o", tools: "read_file\x00list_files"},
+		{name: "provider", req: base, style: style.Tech, prov: "anthropic", type_: "explore", model: "gpt-4o-mini", tools: "read_file\x00list_files"},
+		{name: "style", req: base, style: style.Cute, prov: "openai", type_: "explore", model: "gpt-4o-mini", tools: "read_file\x00list_files"},
+		{name: "prompt", req: Request{TaskID: base.TaskID, Description: base.Description, PromptOverride: "focus on architecture", ProjectRoot: base.ProjectRoot}, style: style.Tech, prov: "openai", type_: "explore", model: "gpt-4o-mini", tools: "read_file\x00list_files"},
+		{name: "project", req: Request{TaskID: base.TaskID, Description: base.Description, PromptOverride: base.PromptOverride, ProjectRoot: "D:/work/repo-b"}, style: style.Tech, prov: "openai", type_: "explore", model: "gpt-4o-mini", tools: "read_file\x00list_files"},
+		{name: "tools", req: base, style: style.Tech, prov: "openai", type_: "explore", model: "gpt-4o-mini", tools: "read_file"},
+	}
+
+	for _, tc := range variants {
+		t.Run(tc.name, func(t *testing.T) {
+			variantKey := subAgentCacheKey(tc.req, tc.style, tc.prov, tc.type_, tc.model, tc.tools)
+			if variantKey == key {
+				t.Fatal("cache identity matched a different execution")
+			}
+			if _, ok := cache.GetByKey(variantKey); ok {
+				t.Fatal("different execution reused cached result")
+			}
+		})
+	}
+}
+
 func TestCache_StatsCounters(t *testing.T) {
 	c := NewCache(time.Minute)
 	req := Request{Description: "z", Style: style.Tech, Provider: "p"}

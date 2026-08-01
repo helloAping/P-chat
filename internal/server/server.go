@@ -249,6 +249,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.PATCH("/sessions/:id/reasoning-effort", h.SetReasoningEffort)
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)
 		api.GET("/sessions/:id/todos", h.GetTodos)
+		api.DELETE("/sessions/:id/todos", h.ClearTodos)
 		api.POST("/sessions/:id/question-response", h.QuestionResponse)
 		api.POST("/sessions/:id/confirm-response", h.ConfirmResponse)
 		api.POST("/sessions/:id/execute-plan", h.ExecutePlan)

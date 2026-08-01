@@ -64,10 +64,46 @@ type LimitsConfig struct {
 	// MaxRounds overrides the agent's built-in safety-net round cap.
 	// Default 300. 0 = unlimited.
 	MaxRounds int `json:"max_rounds"`
+	// TodoLongRunMode controls whether active todo plans can run beyond
+	// MaxRounds. "adaptive" is the safe default: only active plans bypass the
+	// round cap. "unlimited" is an explicit user opt-in for every turn.
+	TodoLongRunMode TodoLongRunMode `json:"todo_long_run_mode"`
 	// MaxStoredMessages caps the SQLite messages table. When set,
 	// messages beyond this count per conversation are deleted oldest-
 	// first. 0 = unlimited (default).
 	MaxStoredMessages int `json:"max_stored_messages"`
+}
+
+// TodoLongRunMode configures the long-running task policy.
+type TodoLongRunMode string
+
+const (
+	TodoLongRunOff       TodoLongRunMode = "off"
+	TodoLongRunAdaptive  TodoLongRunMode = "adaptive"
+	TodoLongRunUnlimited TodoLongRunMode = "unlimited"
+)
+
+// NormalizeTodoLongRunMode returns the safe adaptive default for unset or
+// unknown values so existing sessions with active todo lists keep running.
+func NormalizeTodoLongRunMode(mode TodoLongRunMode) TodoLongRunMode {
+	switch mode {
+	case TodoLongRunOff, TodoLongRunUnlimited:
+		return mode
+	default:
+		return TodoLongRunAdaptive
+	}
+}
+
+// AllowsUnlimitedRounds reports whether a turn may bypass MaxRounds.
+func (m TodoLongRunMode) AllowsUnlimitedRounds(hasActiveTodos bool) bool {
+	switch NormalizeTodoLongRunMode(m) {
+	case TodoLongRunUnlimited:
+		return true
+	case TodoLongRunAdaptive:
+		return hasActiveTodos
+	default:
+		return false
+	}
 }
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
@@ -874,6 +910,10 @@ func Default() *Config {
 		Memory: MemoryConfig{
 			Enabled:    true,
 			MaxHistory: 0,
+		},
+		Limits: LimitsConfig{
+			MaxRounds:       300,
+			TodoLongRunMode: TodoLongRunAdaptive,
 		},
 		Sandbox: SandboxConfig{
 			Enabled:               true,
