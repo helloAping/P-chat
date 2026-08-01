@@ -389,6 +389,10 @@ func (b CloseBehavior) IsValid() bool {
 
 // UIConfig controls desktop/web UI behaviour.
 type UIConfig struct {
+	// CloseBehavior decides what the GUI does when the user clicks
+	// the window close button. "tray" hides the window and keeps the
+	// GUI + server alive; "exit" quits P-Chat. Default "tray" so a
+	// close keeps the local agent running unless the user opts out.
 	CloseBehavior CloseBehavior `json:"close_behavior,omitempty"`
 }
 
@@ -899,7 +903,10 @@ func Default() *Config {
 			Default: "tech",
 		},
 		UI: UIConfig{
-			CloseBehavior: CloseBehaviorExit,
+			// Default to tray: closing the window keeps the local
+			// agent/server running (驻留后台). Users who want the
+			// legacy behaviour switch to exit in settings.
+			CloseBehavior: CloseBehaviorTray,
 		},
 		WorkMode: WorkModeConfig{
 			Default: WorkModeCoding,

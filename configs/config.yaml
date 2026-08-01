@@ -71,7 +71,7 @@ style:
   default: "off"
 
 ui:
-  close_behavior: "exit"  # exit | tray
+  close_behavior: "tray"  # exit | tray — 默认驻留托盘，关闭窗口时后台继续运行
 
 tools:
   enabled:

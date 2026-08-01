@@ -74,8 +74,8 @@ func TestCloseBehaviorNormalize(t *testing.T) {
 	if CloseBehavior("").IsValid() || CloseBehavior("bogus").IsValid() {
 		t.Fatal("empty/bogus close behaviors should be invalid")
 	}
-	if got := Default().UI.CloseBehavior; got != CloseBehaviorExit {
-		t.Fatalf("Default().UI.CloseBehavior = %q, want %q", got, CloseBehaviorExit)
+	if got := Default().UI.CloseBehavior; got != CloseBehaviorTray {
+		t.Fatalf("Default().UI.CloseBehavior = %q, want %q", got, CloseBehaviorTray)
 	}
 }
 
@@ -560,8 +560,8 @@ func TestLoad_NoConfigFallsBackToDefault(t *testing.T) {
 	if cfg.Server.Host != "127.0.0.1" {
 		t.Errorf("default server.host = %q, want 127.0.0.1", cfg.Server.Host)
 	}
-	if cfg.UI.CloseBehavior != CloseBehaviorExit {
-		t.Errorf("default ui.close_behavior = %q, want %q", cfg.UI.CloseBehavior, CloseBehaviorExit)
+	if cfg.UI.CloseBehavior != CloseBehaviorTray {
+		t.Errorf("default ui.close_behavior = %q, want %q", cfg.UI.CloseBehavior, CloseBehaviorTray)
 	}
 }
 

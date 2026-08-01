@@ -371,8 +371,8 @@ func TestSystemConfig_UICloseBehavior(t *testing.T) {
 	if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 		t.Fatal(err)
 	}
-	if got.UI.CloseBehavior != "exit" {
-		t.Fatalf("default close_behavior = %q, want exit", got.UI.CloseBehavior)
+	if got.UI.CloseBehavior != "tray" {
+		t.Fatalf("default close_behavior = %q, want tray", got.UI.CloseBehavior)
 	}
 
 	req, _ := http.NewRequest(http.MethodPatch, srv.URL+"/api/v1/config", strings.NewReader(`{"ui":{"close_behavior":"tray"}}`))

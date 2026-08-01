@@ -224,6 +224,23 @@ func TestStopServer_NoProcessIsIdempotent(t *testing.T) {
 	app.stopServer()
 }
 
+func TestSetNoMoreConfirm_IsInMemoryFlag(t *testing.T) {
+	app := NewApp()
+	if app.noMoreConfirm.Load() {
+		t.Fatal("noMoreConfirm should start false")
+	}
+	app.SetNoMoreConfirm()
+	if !app.noMoreConfirm.Load() {
+		t.Fatal("noMoreConfirm should be true after SetNoMoreConfirm")
+	}
+	// A fresh App (new process launch) must start with the flag cleared,
+	// so the close-confirm popup comes back after restart.
+	fresh := NewApp()
+	if fresh.noMoreConfirm.Load() {
+		t.Fatal("new process must not inherit noMoreConfirm")
+	}
+}
+
 func TestCancelStreamCancelsInFlightStreamMessages(t *testing.T) {
 	requestCanceled := make(chan struct{})
 	responseStarted := make(chan struct{})

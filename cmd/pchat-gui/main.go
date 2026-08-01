@@ -197,8 +197,14 @@ type App struct {
 	serverStopped      bool
 	quitting           atomic.Bool
 	closePromptPending atomic.Bool
-	ready              atomic.Bool
-	tray               *trayHandle
+	// noMoreConfirm is an in-memory, per-process flag set when the
+	// user checks "不再提醒" on the close-confirm popup. While set,
+	// closing the window goes straight to tray without asking again.
+	// It lives only in RAM — the next process launch starts fresh and
+	// the popup comes back.
+	noMoreConfirm atomic.Bool
+	ready         atomic.Bool
+	tray          *trayHandle
 }
 
 type activeStream struct {
@@ -860,11 +866,28 @@ func (a *App) beforeClose(ctx context.Context) bool {
 		a.stopServer()
 		return false
 	}
+	// "不再提醒"（本次进程内已勾选）且托盘就绪时，跳过确认弹窗
+	// 直接驻留后台。该标志只存在于内存，进程退出后即失效，
+	// 下次启动会重新弹出确认。
+	if a.noMoreConfirm.Load() && a.tray != nil && a.tray.ready() {
+		log.Printf("noMoreConfirm=true — hiding to tray without prompting")
+		a.hideMainWindow()
+		return true
+	}
 	if a.requestCloseConfirmation() {
 		return true
 	}
 	a.stopServer()
 	return false
+}
+
+// SetNoMoreConfirm marks that the user checked "不再提醒" on the
+// close-confirm popup. From then on, closing the window hides to tray
+// without asking again — for this process only. The flag is
+// intentionally not persisted; a fresh launch shows the popup again.
+func (a *App) SetNoMoreConfirm() {
+	log.Printf("SetNoMoreConfirm called")
+	a.noMoreConfirm.Store(true)
 }
 
 // stopServer stops the pchat-server child started by this GUI.

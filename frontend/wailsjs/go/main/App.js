@@ -34,6 +34,10 @@ export function ServeHTTP(arg1, arg2) {
   return window['go']['main']['App']['ServeHTTP'](arg1, arg2);
 }
 
+export function SetNoMoreConfirm() {
+  return window['go']['main']['App']['SetNoMoreConfirm']();
+}
+
 export function StreamMessages(arg1, arg2) {
   return window['go']['main']['App']['StreamMessages'](arg1, arg2);
 }
