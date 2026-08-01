@@ -166,7 +166,12 @@ const displayOptions = computed(() => {
             v-for="opt in displayOptions"
             :key="opt.value"
             class="qopt"
-            :class="{ 'qopt-sel': isSelected(opt.value), 'qopt-custom-row': opt.isCustom }"
+            :class="{
+              'qopt-sel': isSelected(opt.value),
+              'qopt-custom-row': opt.isCustom,
+              'qopt-span': opt.isCustom && isSelected(opt.value),
+            }"
+            :title="opt.description"
             @click="selectOption(opt.value)"
           >
             <NRadio
@@ -180,8 +185,10 @@ const displayOptions = computed(() => {
               class="qopt-check"
             />
             <div class="qopt-body">
-              <div class="qopt-label">{{ opt.label }}</div>
-              <div class="qopt-desc">{{ opt.description }}</div>
+              <div class="qopt-line">
+                <span class="qopt-label">{{ opt.label }}</span>
+                <span v-if="opt.description" class="qopt-desc">{{ opt.description }}</span>
+              </div>
               <div
                 v-if="opt.isCustom && isSelected(opt.value)"
                 class="qopt-custom"
@@ -282,18 +289,19 @@ const displayOptions = computed(() => {
   font-size: 12px;
 }
 .qopts {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr));
   gap: var(--space-2);
 }
 .qopt {
   display: flex;
-  align-items: flex-start;
-  gap: var(--space-3);
-  padding: var(--space-3);
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   cursor: pointer;
+  min-width: 0;
   transition:
     border-color var(--dur-fast) var(--ease-out),
     background var(--dur-fast) var(--ease-out);
@@ -306,24 +314,40 @@ const displayOptions = computed(() => {
 .qopt-custom-row {
   border-style: dashed;
 }
+/* Custom input row spans the full grid width once opened, so the
+   input isn't squashed into a half-width cell. */
+.qopt-span {
+  grid-column: 1 / -1;
+}
 .qopt-radio,
 .qopt-check {
   flex-shrink: 0;
-  margin-top: 1px;
+  margin-top: 0;
 }
 .qopt-body {
   flex: 1;
   min-width: 0;
 }
+.qopt-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
 .qopt-label {
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 500;
   color: var(--text-primary);
+  white-space: nowrap;
 }
 .qopt-desc {
   font-size: 12px;
   color: var(--text-tertiary);
-  margin-top: 2px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .qopt-custom {
   margin-top: var(--space-2);

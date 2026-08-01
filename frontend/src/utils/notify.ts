@@ -62,7 +62,29 @@ function focusWindow() {
 
 // ---- 系统通知 ----
 
+// nowLabel returns the local time label used in the notification
+// title, e.g. "p-chat 14:30".
+function nowLabel(): string {
+  const d = new Date()
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `p-chat ${hh}:${mm}`
+}
+
+// sendNotification shows a system notification. In the Wails desktop
+// app we use the native toast runtime (runtime.SendNotification) so
+// the notification source is the app itself instead of the webview
+// origin ("Wails.localhost"), and the title reads "p-chat HH:mm".
+// Outside Wails (browser preview) we fall back to the Web Notification
+// API.
 function sendNotification(title: string, body: string) {
+  const w = window as any
+  if (w.runtime && typeof w.runtime.SendNotification === 'function') {
+    try {
+      void w.runtime.SendNotification({ title: nowLabel(), body })
+      return
+    } catch { /* fall through to Web Notification */ }
+  }
   if (!('Notification' in window)) return
   const show = () => {
     try {

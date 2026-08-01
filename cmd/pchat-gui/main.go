@@ -792,6 +792,13 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	log.Printf("OnStartup called")
 	a.tray = startTray(a)
+	// Initialise the Windows toast notification service so
+	// runtime.SendNotification from the webview shows the app's own
+	// identity (not the webview origin "Wails.localhost") as the
+	// notification source.
+	if err := wailsruntime.InitializeNotifications(a.ctx); err != nil {
+		log.Printf("InitializeNotifications failed: %v", err)
+	}
 	go a.spawnAndWatch()
 }
 
