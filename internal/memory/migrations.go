@@ -328,6 +328,39 @@ DROP INDEX IF EXISTS idx_messages_conv_group;
 ALTER TABLE messages DROP COLUMN is_archived;
 ALTER TABLE messages DROP COLUMN regen_group_id;`,
 	},
+	{
+		// Migration 10: purge corrupt summary ranges.
+		//
+		// `summaries.range_start`/`range_end` store the *id* of the first
+		// and last message in each compressed batch. Message ids come from
+		// two schemes: the old AUTOINCREMENT counter (small integers,
+		// ~20k-30k) and — once the frontend started minting row ids as
+		// `Date.now()*1000 + rand` — millisecond timestamps (~1.78e15).
+		// A single Compress batch that straddled the boundary wrote a range
+		// whose span is on the order of 10^15.
+		//
+		// Those rows are not just garbage: reading them back re-expanded the
+		// range into an id→bool map inside Compress/MaybeSummarize, which is
+		// O(span) memory — a 1.78e15 span blew the process heap to ~1.1GB and
+		// wedged the SendMessage handler on the affected device (2026-08
+		// "send 你好 → memory spike / conversation stuck" incident). The
+		// range-expansion code path is fixed in summarizer.go (binary search
+		// instead of expansion), but the corrupt rows must go too, so
+		// LastCompressedIDFor (MAX(range_end)) never returns a quadrillion
+		// and the history loader silently drops every post-summary message.
+		//
+		// A legitimate batch is at most 100 messages, and within a single
+		// id scheme 100 consecutive timestamps span at most ~10^8; a span
+		// past 10^12 can only come from a range crossing two schemes, which
+		// cannot describe any real batch. No normal summary is affected.
+		Version: 10,
+		Name:    "purge_corrupt_summary_ranges",
+		Up: `
+DELETE FROM summaries
+ WHERE range_end - range_start + 1 > 1000000000000;`,
+		Down: `-- no down — re-inserting the corrupt ranges would
+-- re-introduce the heap explosion.`,
+	},
 }
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INTEGER PRIMARY KEY,
