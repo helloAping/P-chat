@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -148,6 +149,62 @@ func TestRegenerate_ArchivesOldReply(t *testing.T) {
 	}
 }
 
+// TestRegenerate_BusySessionDoesNotArchiveSiblings 验证会话锁顺序。
+// A conflicting request must return 409 before it changes visible reply
+// history.
+func TestRegenerate_BusySessionDoesNotArchiveSiblings(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCurrent(convID); err != nil {
+		t.Fatal(err)
+	}
+
+	store.AddMessage(llm.Message{Role: "user", Content: "hi"})
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	userID := store.GetLastUserMessageID(convID)
+	if userID <= 0 {
+		t.Fatalf("expected user message id > 0, got %d", userID)
+	}
+	groupID := strconv.FormatInt(userID, 10)
+	store.AddChatMessageWithMetaToRegen(convID,
+		llm.ChatMessage{Role: "assistant", Content: "original reply"},
+		map[string]string{"role": "assistant"},
+		groupID,
+		false,
+	)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟 SendMessage 或另一重答已持有会话，重答必须先发现冲突再归档。
+	// Simulate a SendMessage or Regenerate request that already owns the session.
+	s.handler.sessionLocks.Store(convID, struct{}{})
+	t.Cleanup(func() { s.handler.sessionLocks.Delete(convID) })
+
+	body := `{"user_message_id": ` + strconv.FormatInt(userID, 10) + `}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+convID+"/regenerate", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+	if w.Code != 409 {
+		t.Fatalf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+
+	_, _, _, _, _, archived, _ := store.ListSiblings(convID, groupID)
+	if len(archived) != 1 {
+		t.Fatalf("sibling count = %d, want 1", len(archived))
+	}
+	if archived[0] {
+		t.Fatal("busy regenerate archived the existing reply")
+	}
+}
+
 // TestRegenerate_RejectsNonUserMessage verifies that
 // passing an assistant message id is rejected with 400,
 // not silently treated as a regen target. This guard
@@ -227,5 +284,19 @@ func TestRegenerate_RejectsMissingID(t *testing.T) {
 	s.engine.ServeHTTP(w, req)
 	if w.Code != 400 {
 		t.Errorf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestRegenerate_UsesBoundedHistoryLoader(t *testing.T) {
+	source, err := os.ReadFile("regen.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(source)
+	if !strings.Contains(body, "h.loadHistoryForSend(c.Request.Context(), id, provider, model)") {
+		t.Fatal("Regenerate should use loadHistoryForSend so long histories stay bounded")
+	}
+	if strings.Contains(body, "GetChatMessagesFor(id, 0)") {
+		t.Fatal("Regenerate must not load full unbounded history")
 	}
 }

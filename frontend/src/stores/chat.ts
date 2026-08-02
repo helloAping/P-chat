@@ -6,6 +6,7 @@ import { reactive, ref, computed, watch } from 'vue'
 import * as api from '../api/client'
 import { notifyManager } from '../utils/notify'
 import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
+import { isCurrentStream } from './streamLifecycle'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -48,6 +49,10 @@ export const state = reactive({
     ctrl: AbortController
     asstContent: string
   }>,
+  // Incremented once per applied stream event. ChatWindow watches
+  // this cheap scalar instead of deeply traversing every message
+  // and nested part just to keep the viewport at the bottom.
+  streamRevision: {} as Record<string, number>,
   // Per-session history-paging cursor. The first page
   // (loaded by switchSession) sets oldestSeq/oldestId to
   // the corresponding cursor from the response; subsequent
@@ -75,7 +80,7 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string }>,
+  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string; todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited' }>,
   globalWorkMode: 'coding' as string,
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
@@ -101,13 +106,15 @@ export const state = reactive({
   resolvedPath?: string
   pathClass?: string
   riskLevel?: string
-  resolve: (approved: boolean) => void
+  resolve: (action: api.ConfirmAction) => void
 }>>,
   pendingPlanText: {} as Record<string, string>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
   projects: [] as ProjectItem[],
   activeProjectPath: '' as string,
+  projectSessions: {} as Record<string, Session[]>,
+  lastSessionByProject: {} as Record<string, string>,
   // P3-3: current session's trace id. Minted server-side on
   // POST /messages and mirrored on every SSE event. The
   // TopBar reads this so users can copy the id to the
@@ -235,7 +242,7 @@ export const currentMeta = computed(() => {
   if (m) return m
   const def = state.defaultModel
   return {
-    style: 'tech',
+    style: 'off',
     workMode: state.globalWorkMode || 'coding',
     provider: def?.provider || '',
     model: def?.model || '',
@@ -310,9 +317,10 @@ function evictColdSessions() {
   if (keys.length <= MAX_LOADED_SESSIONS) return
   keys.sort((a, b) => _loadedSessions[a] - _loadedSessions[b])
   const toEvict = keys.length - MAX_LOADED_SESSIONS
-  for (let i = 0; i < toEvict; i++) {
-    const sid = keys[i]
-    if (sid === state.currentID) continue
+  let evicted = 0
+  for (const sid of keys) {
+    if (evicted >= toEvict) break
+    if (sid === state.currentID || state.streaming[sid]) continue
     revokeSessionBlobUrls(sid)
     delete state.sessionMessages[sid]
     // P1-4: drop the per-session regen cache too. The
@@ -323,14 +331,24 @@ function evictColdSessions() {
     delete state.sessionReplies[sid]
     delete state.sessionUserMsgs[sid]
     delete _loadedSessions[sid]
+    evicted += 1
   }
 }
 
 export async function loadSessions() {
-  const { sessions } = await api.listSessions(state.activeProjectPath)
+  const projectPath = state.activeProjectPath
+  const { sessions } = await api.listSessions(projectPath)
+  state.projectSessions[projectPath] = sessions
+  if (state.activeProjectPath !== projectPath) return
   state.sessions = sessions
-  if (!state.currentID && sessions.length > 0) {
-    await switchSession(sessions[0].id)
+  const currentInProject = !!state.currentID && sessions.some(s => s.id === state.currentID)
+  if (!currentInProject) {
+    const last = state.lastSessionByProject[projectPath]
+    const next = sessions.find(s => s.id === last)?.id || sessions[0]?.id || ''
+    state.currentID = ''
+    if (next) await switchSession(next)
+  } else {
+    state.lastSessionByProject[projectPath] = state.currentID
   }
 }
 
@@ -344,58 +362,19 @@ export async function loadProjects() {
 }
 
 export async function setActiveProject(path: string) {
+  const previousProject = state.activeProjectPath
+  if (state.currentID) {
+    state.lastSessionByProject[previousProject] = state.currentID
+  }
   state.activeProjectPath = path
   state.currentID = ''
-  state.sessions = []
-  // Revoke screenshot blob URLs for ALL sessions currently
-  // cached in the store before wiping it. Otherwise those
-  // blob URLs accumulate in WebView2 until page reload.
-  for (const sid of Object.keys(state.sessionMessages)) {
-    revokeSessionBlobUrls(sid)
-  }
-  state.sessionMessages = {}
-  // Reset the LRU heat map along with the messages map —
-  // stale entries would trigger a no-op eviction of sessions
-  // that no longer exist on the next switch.
-  for (const k of Object.keys(_loadedSessions)) {
-    delete _loadedSessions[k]
-  }
-  state.sessionMeta = {}
-  state.sessionTodos = {}
-  state.sessionWorking = {}
-  state.sessionPaging = {}
-  // P1-4: clear the per-session regen caches. All
-  // sessions in the previous project are being
-  // discarded; their per-user-message summaries and
-  // sibling lists are stale.
-  state.sessionReplies = {}
-  state.sessionUserMsgs = {}
-  // Revoke blob URLs for any staged attachments in the
-  // sessions we're discarding, then drop the maps entirely.
-  // Question / confirm dialogs keyed to those sessions get
-  // cleared so any awaiters unblock. (We no longer carry
-  // a Promise resolve on pendingQuestion — answers are sent
-  // to the server synchronously through api.submitQuestionResponse,
-  // so there's nothing to resolve here. We just drop the
-  // entries so a subsequent switchSession doesn't see stale
-  // modal data for a session that no longer exists.)
-  for (const arr of Object.values(state.pendingAttachments)) {
-    for (const a of arr) {
-      if (a._blobURL) URL.revokeObjectURL(a._blobURL)
-    }
-  }
-  state.pendingAttachments = {}
-  for (const id of Object.keys(state.pendingQuestion)) {
-    delete state.pendingQuestion[id]
-  }
-  for (const [id, items] of Object.entries(state.pendingConfirm)) {
-    for (const pc of items) pc.resolve(false)
-    delete state.pendingConfirm[id]
-  }
-  for (const [id, s] of Object.entries(state.streaming)) {
-    s.ctrl.abort()
-    delete state.streaming[id]
-  }
+  state.currentTraceId = ''
+
+  const cached = state.projectSessions[path] || []
+  state.sessions = cached
+  const last = state.lastSessionByProject[path]
+  const next = cached.find(s => s.id === last)?.id || cached[0]?.id || ''
+  if (next) await switchSession(next)
   await loadSessions()
 }
 
@@ -438,6 +417,7 @@ function dedupMessagesByKey(existing: Message[], incoming: Message[]): Message[]
 
 export async function switchSession(id: string) {
   state.currentID = id
+  state.lastSessionByProject[state.activeProjectPath] = id
   // P3-3: clear the previous session's trace id so the
   // TopBar tooltip doesn't show a stale id from a session
   // the user is no longer looking at. The next event of
@@ -466,21 +446,32 @@ export async function switchSession(id: string) {
     // fix (handler.go: oldestID=rowIDs[0]) eliminates the
     // most common trigger but dedup here is the
     // belt-and-braces guarantee.
-    state.sessionMessages[id] = dedupMessagesByKey([], r.messages)
-    state.sessionPaging[id] = {
-      // Prefer the seq-based cursor (stable across
-      // rollback/undo). Fall back to the legacy id-based
-      // cursor when the server is older and didn't return
-      // oldest_seq.
-      oldestSeq: r.oldest_seq ?? 0,
-      oldestId: r.oldest_id,
-      hasMore: r.has_more,
-      loading: false,
+    // The user may send a message while this first history page is
+    // in flight. Preserve the local user message and streaming
+    // placeholder, but still install the fetched history so the
+    // session does not lose its earlier context. The explicit user
+    // id is stable across the optimistic row and SQLite, so the
+    // local copy wins when the server has already persisted it.
+    if (state.currentID === id) {
+      const liveMessages = (state.sessionMessages[id] as Message[] | undefined) ?? []
+      const liveIDs = new Set(liveMessages.map(m => m.id).filter((messageID): messageID is number => messageID != null))
+      const history = dedupMessagesByKey([], r.messages).filter(m => !liveIDs.has(m.id ?? 0))
+      state.sessionMessages[id] = [...history, ...liveMessages]
+      state.sessionPaging[id] = {
+        // Prefer the seq-based cursor (stable across
+        // rollback/undo). Fall back to the legacy id-based
+        // cursor when the server is older and didn't return
+        // oldest_seq.
+        oldestSeq: r.oldest_seq ?? 0,
+        oldestId: r.oldest_id,
+        hasMore: r.has_more,
+        loading: false,
+      }
+      // Convert any base64 screenshot data in the newly
+      // loaded history into blob URLs, then strip old ones
+      // so the session opens with a bounded memory footprint.
+      convertAndStripScreenshots(id)
     }
-    // Convert any base64 screenshot data in the newly
-    // loaded history into blob URLs, then strip old ones
-    // so the session opens with a bounded memory footprint.
-    convertAndStripScreenshots(id)
   }
   // Mark this session as most-recently-used so evictCold
   // keeps it in memory. Eviction runs here because a
@@ -505,7 +496,7 @@ export async function switchSession(id: string) {
   const s = state.sessions.find(s => s.id === id)
   if (s) {
     state.sessionMeta[id] = {
-      style:     s.style || 'tech',
+      style:     s.style || 'off',
       workMode:  s.work_mode || state.globalWorkMode || 'coding',
       provider:  s.provider || '',
       model:     s.model || '',
@@ -515,6 +506,7 @@ export async function switchSession(id: string) {
       reasoning_effort: s.reasoning_effort || 'off',
       vector_store: s.vector_store || '',
       knowledge_base: s.knowledge_base || '',
+      todo_long_run_mode: s.todo_long_run_mode || 'adaptive',
     }
   }
   // Load per-session todos.
@@ -649,6 +641,7 @@ export async function createSession(): Promise<string> {
   // always returns the persisted title), use it; otherwise
   // keep the placeholder.
   state.sessions.unshift(fresh)
+  state.projectSessions[state.activeProjectPath] = state.sessions
   await switchSession(id)
   return id
 }
@@ -656,6 +649,7 @@ export async function createSession(): Promise<string> {
 export async function deleteSessionById(id: string) {
   await api.archiveSession(id)
   state.sessions = state.sessions.filter(s => s.id !== id)
+  state.projectSessions[state.activeProjectPath] = state.sessions
   // Revoke all screenshot blob URLs owned by this session
   // before clearing the messages, otherwise those URLs
   // remain referenced until the next page reload.
@@ -682,7 +676,7 @@ export async function deleteSessionById(id: string) {
   delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
-    for (const pc of cfms) pc.resolve(false)
+    for (const pc of cfms) pc.resolve('reject')
     delete state.pendingConfirm[id]
   }
   if (state.streaming[id]) {
@@ -720,6 +714,7 @@ export async function renameSession(id: string, title: string) {
       reasoning_effort: resp.reasoning_effort ?? state.sessionMeta[id].reasoning_effort,
       vector_store: resp.vector_store ?? state.sessionMeta[id].vector_store,
       knowledge_base: resp.knowledge_base ?? state.sessionMeta[id].knowledge_base,
+      todo_long_run_mode: resp.todo_long_run_mode ?? state.sessionMeta[id].todo_long_run_mode,
     }
   }
 }
@@ -882,6 +877,25 @@ function isScreenshotResult(r: string | undefined): boolean {
   return false
 }
 
+// revokeScreenshotResult releases a live blob URL whether the tool
+// returned it directly or embedded it in a JSON result. Call this
+// before replacing a result with the compact placeholder; otherwise
+// the only reference to the blob URL is lost and WebView cannot free
+// its decoded image memory until the page is reloaded.
+function revokeScreenshotResult(result: string | undefined) {
+  if (!result) return
+  if (result.startsWith('blob:')) {
+    URL.revokeObjectURL(result)
+    return
+  }
+  try {
+    const obj = JSON.parse(result)
+    if (typeof obj.image === 'string' && obj.image.startsWith('blob:')) {
+      URL.revokeObjectURL(obj.image)
+    }
+  } catch { /* not a JSON screenshot result */ }
+}
+
 export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERVED_SCREENSHOTS) {
   const msgs = state.sessionMessages[sessionId]
   if (!msgs) return
@@ -931,7 +945,9 @@ export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERV
     if ('kind' in t) {
       // ToolPart — replace the result payload with the
       // placeholder so the card still renders.
-      (t as ToolPart).result = PLACEHOLDER_SCREENSHOT
+      const tool = t as ToolPart
+      revokeScreenshotResult(tool.result)
+      tool.result = PLACEHOLDER_SCREENSHOT
     } else {
       // MessageAttachment — revoke the blob and replace the
       // URL with the placeholder so the image no longer
@@ -1007,13 +1023,20 @@ export function startStream(id: string, ctrl: AbortController) {
   // event — without this, the spinner is unreachable.
   state.sessionMessages[id].push({ role: 'assistant', content: '', parts: [] })
   state.streaming[id] = { ctrl, asstContent: '' }
+  state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
+}
+
+// isActiveStream prevents late events from a cancelled or replaced
+// request from mutating a new trailing assistant message.
+export function isActiveStream(id: string, ctrl: AbortController): boolean {
+  return isCurrentStream(state.streaming[id], ctrl)
 }
 
 export function stopStream(id: string) {
   const s = state.streaming[id]
   if (s) {
     s.ctrl.abort()
-    delete state.streaming[id]
+    endStream(id, s.ctrl)
   }
 }
 
@@ -1111,6 +1134,25 @@ function updateQuestionStatusInParts(
     updated++
   }
   return updated
+}
+
+function expirePendingQuestion(id: string) {
+  if (!state.pendingQuestion[id]) return
+  delete state.pendingQuestion[id]
+  const msgs = state.sessionMessages[id]
+  if (!msgs) return
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m.role !== 'assistant' || !m.parts) continue
+    let changed = false
+    walkParts(m.parts, (p: any) => {
+      if (p.kind !== 'question') return
+      if (p.question_status && p.question_status !== 'open') return
+      p.question_status = 'error'
+      changed = true
+    })
+    if (changed) return
+  }
 }
 
 // findOrCreateSubAgent locates the trailing sub_agent
@@ -1291,8 +1333,20 @@ function scrubMessagePhantoms(m: Message) {
   }
 }
 
+// A reasoning part is live only until the next non-thinking event
+// for the same message (or sub-agent) arrives. Leaving historical
+// parts marked streaming keeps every Loader2 animation running for
+// the rest of a long task and makes the conversation visibly flicker.
+function closeTrailingThinking(parts: MessagePart[] | undefined) {
+  const last = parts?.[parts.length - 1]
+  if (last?.kind === 'thinking' && last.streaming) {
+    last.streaming = false
+  }
+}
+
 function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null) {
   const parts = (target ?? m.parts)!
+  closeTrailingThinking(parts)
   // Two-pass scrub:
   //
   //  1. scrub the incoming delta (catches the case where
@@ -1446,6 +1500,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (!ev.content) break
       const cleanedContent = scrubPhantomError(ev.content)
       const parts = sub ? sub.parts : m.parts!
+      closeTrailingThinking(parts)
       // Apply the explicit rewrite to the trailing text part.
       const last = parts[parts.length - 1]
       if (last && last.kind === 'text') {
@@ -1499,6 +1554,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
     case 'tool': {
       const parts = sub ? sub.parts : m.parts!
       if (!ev.tool_name) break
+      closeTrailingThinking(parts)
       if (ev.tool_status === 'start') {
         // When tool_id is present, use it as the unique key
         // and never reuse the last part (two calls to the
@@ -1549,7 +1605,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         let found = false
         for (let i = parts.length - 1; i >= 0; i--) {
           const p = parts[i]
-          if (p.kind !== 'tool' || p.status !== 'start') continue
+          if (p.kind !== 'tool') continue
           if ((ev.tool_id && p.tool_id === ev.tool_id) ||
               (!ev.tool_id && p.name === ev.tool_name)) {
             p.status = (ev.tool_status as any) || 'ok'
@@ -1576,6 +1632,12 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             error: ev.tool_error,
             elapsed: ev.tool_elapsed,
           })
+        }
+        // Enforce the screenshot cap as each image arrives rather
+        // than waiting for `done`; a cancelled task otherwise keeps
+        // every decoded screenshot alive until the page reloads.
+        if (isScreenshotResult(ev.tool_result_full || ev.tool_result)) {
+          convertAndStripScreenshots(id)
         }
         // Question tool answer carry-through: the question
         // tool returns `{questions, answers}` JSON via the
@@ -1659,6 +1721,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.sub_agent_status) {
         if (!sub) break
         sub.status = ev.sub_agent_status as any
+        if (ev.sub_agent_status !== 'start') closeTrailingThinking(sub.parts)
         if (ev.sub_agent_status !== 'start' && ev.elapsed) sub.elapsed = ev.elapsed
         if (ev.sub_agent_model && !sub.agentModel) sub.agentModel = ev.sub_agent_model
       }
@@ -1690,13 +1753,15 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         state.sessionWorking[id] = true
       } else if (ev.session_status === 'idle') {
         state.sessionWorking[id] = false
+        expirePendingQuestion(id)
       }
       break
     case 'done':
-      // Final token counts. We don't reset streaming
-      // flags here — that's the consumer's job (the
-      // bubble stops pulsing once isStreaming flips off,
-      // and thinking flags get cleared in endStream).
+      // Final token counts. Treat backend `done` as the
+      // semantic end of the turn even if the HTTP/Wails
+      // transport takes another tick to close.
+      state.sessionWorking[id] = false
+      delete state.streaming[id]
       if (ev.tokens_in != null) m.tokens_in = ev.tokens_in
       if (ev.tokens_out != null) m.tokens_out = ev.tokens_out
       if (ev.elapsed) m.elapsed = ev.elapsed
@@ -1815,6 +1880,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         // keyed by sessionId, so the answer routes back to
         // whichever question is pending on that session.
         const targetParts = sub ? sub.parts : m.parts
+        closeTrailingThinking(targetParts)
 
         if (hasAnswers) {
           // ── Result-with-answers: update the trailing
@@ -1862,6 +1928,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     case 'tool_confirm':
+      closeTrailingThinking(m.parts)
       if (ev.tool_confirm_json) {
         try {
           // 2026-07: the server now emits more fields on
@@ -1876,7 +1943,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             path_class?: string
             risk_level?: string
           }
-          new Promise<boolean>((resolve) => {
+          new Promise<api.ConfirmAction>((resolve) => {
             if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
             state.pendingConfirm[id].push({
               toolName: cfm.tool_name,
@@ -1887,8 +1954,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
               riskLevel: cfm.risk_level,
               resolve,
             })
-          }).then((approved) => {
-            submitConfirmResponseInner(id, approved)
+          }).then((action) => {
+            submitConfirmResponseInner(id, action)
           })
           notifyManager.play('confirm')
           notifyManager.notify('沙箱请求', `批准 ${cfm.tool_name}?`)
@@ -1919,9 +1986,11 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         m.traceId = ev.trace_id
       }
       // 提示音：对话出错
+      expirePendingQuestion(id)
       notifyManager.play('error')
       break
   }
+  state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
 }
 
 // markVisionUnsupported finds the trailing user message in
@@ -2204,7 +2273,12 @@ export async function loadContextInspector(sessionId: string): Promise<void> {
   }
 }
 
-export function endStream(id: string) {
+export function endStream(id: string, ctrl?: AbortController) {
+  // A stopped stream may settle after the user immediately starts
+  // another turn in the same session. Never let that old finally
+  // block clear the replacement stream's state.
+  if (ctrl && state.streaming[id]?.ctrl !== ctrl) return
+  expirePendingQuestion(id)
   const msgs = state.sessionMessages[id]
   if (msgs) {
     const last = msgs[msgs.length - 1]
@@ -2216,7 +2290,12 @@ export function endStream(id: string) {
       })
     }
   }
+  // Stopped streams do not receive a `done` event, so perform the
+  // same screenshot convergence here as the normal done path.
+  convertAndStripScreenshots(id)
   delete state.streaming[id]
+  state.sessionWorking[id] = false
+  state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
 }
 
 // regenerateMessage is the P1-3 entry point. The
@@ -2323,6 +2402,8 @@ export async function regenerateMessage(
   }
 
   const meta = state.sessionMeta[sessionId] || ({} as any)
+  let streamSucceeded = false
+  let deferredDrop: { lastSeq: number; reason: string } | null = null
   try {
     await api.streamRegenerate(sessionId, userMessageId, {
       provider: meta.provider,
@@ -2334,12 +2415,19 @@ export async function regenerateMessage(
       // so the snapshot returns the freshly-built
       // assistant message parts.
       onStreamDrop: ({ lastSeq, reason }) => {
-        recoverMissingParts(sessionId, lastSeq, reason).catch(() => {})
+        deferredDrop = { lastSeq, reason }
       },
-      onEvent: (ev) => appendStreamEvent(sessionId, ev),
+      onEvent: (ev) => {
+        if (isActiveStream(sessionId, ctrl)) appendStreamEvent(sessionId, ev)
+      },
     })
+    streamSucceeded = true
   } finally {
-    endStream(sessionId)
+    endStream(sessionId, ctrl)
+    const drop = deferredDrop as { lastSeq: number; reason: string } | null
+    if (!streamSucceeded && drop && !ctrl.signal.aborted) {
+      recoverMissingParts(sessionId, drop.lastSeq, drop.reason).catch(() => {})
+    }
   }
 }
 
@@ -2482,20 +2570,32 @@ export function submitQuestionAnswer(answers: Record<string, string>) {
   }
 }
 
-async function submitConfirmResponseInner(id: string, approved: boolean) {
+async function submitConfirmResponseInner(id: string, action: api.ConfirmAction) {
   try {
-    await api.submitConfirmResponse(id, approved)
+    await api.submitConfirmResponse(id, action !== 'reject', action)
+    if (action === 'always') {
+      state.sessionMeta[id] = {
+        ...state.sessionMeta[id],
+        permission_level: 'full',
+      }
+    }
   } catch {
     // server already unblocked via resolve
   }
 }
 
-export function submitToolConfirm(approved: boolean) {
+export function submitToolConfirm(action: api.ConfirmAction) {
   const items = state.pendingConfirm[state.currentID]
   if (items && items.length > 0) {
     const pc = items.shift()!
     if (items.length === 0) delete state.pendingConfirm[state.currentID]
-    pc.resolve(approved)
+    pc.resolve(action)
+    if (action === 'always') {
+      state.sessionMeta[state.currentID] = {
+        ...state.sessionMeta[state.currentID],
+        permission_level: 'full',
+      }
+    }
   }
 }
 
@@ -2612,6 +2712,7 @@ export async function rollbackTo(sessionId: string, messageIndex: number) {
     stopStream(sessionId)
   }
 
+  const localDeleted = msgs.slice(messageIndex)
   let result
   try {
     result = await api.rollbackMessages(sessionId, msg.id)
@@ -2623,14 +2724,22 @@ export async function rollbackTo(sessionId: string, messageIndex: number) {
     return
   }
 
+  const deletedMessages = result.deleted_messages?.length
+    ? result.deleted_messages
+    : (result.deleted_count > 0 ? localDeleted : [])
+  if (!deletedMessages.length) {
+    uiError('撤回失败：没有可撤回的消息')
+    return
+  }
+
   state.rollbackUndo[sessionId] = {
-    messages: result.deleted_messages,
+    messages: deletedMessages,
     fromIndex: messageIndex,
   }
 
   msgs.splice(messageIndex)
 
-  const lastUser = [...result.deleted_messages].reverse().find(m => m.role === 'user')
+  const lastUser = [...deletedMessages].reverse().find(m => m.role === 'user')
   state.pendingInput[sessionId] = lastUser?.content || ''
 }
 

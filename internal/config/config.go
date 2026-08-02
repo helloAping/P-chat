@@ -33,6 +33,7 @@ type Config struct {
 	Limits    LimitsConfig    `json:"limits"`
 	Search    SearchConfig    `json:"search"`
 	Browser   BrowserConfig   `json:"browser"`
+	IM        IMConfig        `json:"im"`
 	// Dynamic is the P3-2 per-tool config table. The
 	// user writes `dynamic.<tool_name>.config: {…}`
 	// in their config.json and the dynamic tool's
@@ -63,10 +64,53 @@ type LimitsConfig struct {
 	// MaxRounds overrides the agent's built-in safety-net round cap.
 	// Default 300. 0 = unlimited.
 	MaxRounds int `json:"max_rounds"`
+	// TodoLongRunMode controls whether active todo plans can run beyond
+	// MaxRounds. "adaptive" is the safe default: only active plans bypass the
+	// round cap. "unlimited" is an explicit user opt-in for every turn.
+	TodoLongRunMode TodoLongRunMode `json:"todo_long_run_mode"`
 	// MaxStoredMessages caps the SQLite messages table. When set,
 	// messages beyond this count per conversation are deleted oldest-
 	// first. 0 = unlimited (default).
 	MaxStoredMessages int `json:"max_stored_messages"`
+	// MaxTurnSeconds is the hard wall-clock cap for one agent turn
+	// (SendMessage → done). 0 = disabled. Default 900 (15 min).
+	// This is the backstop for unbounded hangs that escape the
+	// per-tool and LLM-stream timeouts — e.g. an exec_command that
+	// left an orphaned grandchild holding its pipes, or an SSE write
+	// blocked against a dead client connection.
+	MaxTurnSeconds int `json:"max_turn_seconds"`
+}
+
+// TodoLongRunMode configures the long-running task policy.
+type TodoLongRunMode string
+
+const (
+	TodoLongRunOff       TodoLongRunMode = "off"
+	TodoLongRunAdaptive  TodoLongRunMode = "adaptive"
+	TodoLongRunUnlimited TodoLongRunMode = "unlimited"
+)
+
+// NormalizeTodoLongRunMode returns the safe adaptive default for unset or
+// unknown values so existing sessions with active todo lists keep running.
+func NormalizeTodoLongRunMode(mode TodoLongRunMode) TodoLongRunMode {
+	switch mode {
+	case TodoLongRunOff, TodoLongRunUnlimited:
+		return mode
+	default:
+		return TodoLongRunAdaptive
+	}
+}
+
+// AllowsUnlimitedRounds reports whether a turn may bypass MaxRounds.
+func (m TodoLongRunMode) AllowsUnlimitedRounds(hasActiveTodos bool) bool {
+	switch NormalizeTodoLongRunMode(m) {
+	case TodoLongRunUnlimited:
+		return true
+	case TodoLongRunAdaptive:
+		return hasActiveTodos
+	default:
+		return false
+	}
 }
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
@@ -352,6 +396,10 @@ func (b CloseBehavior) IsValid() bool {
 
 // UIConfig controls desktop/web UI behaviour.
 type UIConfig struct {
+	// CloseBehavior decides what the GUI does when the user clicks
+	// the window close button. "tray" hides the window and keeps the
+	// GUI + server alive; "exit" quits P-Chat. Default "tray" so a
+	// close keeps the local agent running unless the user opts out.
 	CloseBehavior CloseBehavior `json:"close_behavior,omitempty"`
 }
 
@@ -862,7 +910,10 @@ func Default() *Config {
 			Default: "tech",
 		},
 		UI: UIConfig{
-			CloseBehavior: CloseBehaviorExit,
+			// Default to tray: closing the window keeps the local
+			// agent/server running (驻留后台). Users who want the
+			// legacy behaviour switch to exit in settings.
+			CloseBehavior: CloseBehaviorTray,
 		},
 		WorkMode: WorkModeConfig{
 			Default: WorkModeCoding,
@@ -874,6 +925,11 @@ func Default() *Config {
 			Enabled:    true,
 			MaxHistory: 0,
 		},
+		Limits: LimitsConfig{
+			MaxRounds:       300,
+			TodoLongRunMode: TodoLongRunAdaptive,
+			MaxTurnSeconds:  900,
+		},
 		Sandbox: SandboxConfig{
 			Enabled:               true,
 			RequireConfirm:        "dangerous",
@@ -882,8 +938,15 @@ func Default() *Config {
 			ExecDangerousPatterns: defaultDangerousPatterns(),
 		},
 		SubAgent: SubAgentConfig{
-			// Default safety stance: deny exec_command in sub-agents.
-			// Users can override by setting allowed_tools explicitly.
+			// Default safety stance: deny exec_command for sub-agents
+			// that inherit the parent's full tool set (general-purpose,
+			// custom agents with no whitelist). Built-in read-only
+			// agents (explore/plan) list exec_command on their own
+			// whitelist for read-only shell use — that per-agent
+			// whitelist takes priority over this global deny (see
+			// subagent.filterSubAgentTools), and the sandbox still
+			// guards dangerous commands at dispatch time. Users can
+			// override by setting allowed_tools explicitly.
 			DeniedTools: []string{"exec_command"},
 			// Enable result caching by default so repeated sub-agent
 			// tasks (e.g. searching the same file) hit the cache.
@@ -916,6 +979,7 @@ func Default() *Config {
 				"*.paypal.com",
 			},
 		},
+		IM: DefaultIMConfig(),
 	}
 }
 

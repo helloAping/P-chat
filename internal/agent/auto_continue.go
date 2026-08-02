@@ -30,6 +30,12 @@ func pickMaxStepsPrompt(lang string) string {
 // MaxStepsPrompt and the user can continue with a follow-up message.
 const MaxRoundsDefault = 300
 
+// MaxStreamBytesPerRound limits the combined text, thinking, and tool-call
+// argument deltas accepted from one upstream LLM round. 正常模型输出远小于 1 MiB；
+// this guard prevents a broken or looping SSE provider from growing the server
+// heap without bound before cancellation reaches the transport.
+const MaxStreamBytesPerRound = 1 << 20
+
 // MaxAutoContinue caps how many times the agent loop will
 // auto-re-prompt the LLM after a no-tool-call exit when the
 // todo list still has unfinished items (status pending or
@@ -42,6 +48,17 @@ const MaxRoundsDefault = 300
 // training the LLM to rely on auto-continuation as a crutch.
 // Per-session opt-out: ChatRequest.AutoContinue = false.
 const MaxAutoContinue = 3
+
+// resetAutoContinueCount clears the no-tool streak after a tool round makes
+// progress. Keeping this as a small pure helper makes the resume invariant
+// explicit and testable: the cap applies to consecutive no-progress rounds,
+// not to the whole user turn.
+func resetAutoContinueCount(count int, roundToolSucceeded bool) int {
+	if roundToolSucceeded {
+		return 0
+	}
+	return count
+}
 
 // sessionPendingTodos returns the unfinished todo items
 // (status "pending" or "in_progress") for a session, plus
@@ -92,6 +109,7 @@ func buildAutoContinuePrompt(items []tool.TodoItem) string {
 		}
 	}
 	sb.WriteString("\n请继续执行剩余任务：调用所需工具，完成后用 `todo_write` 标记 `done` 或 `cancelled`。\n")
+	sb.WriteString("必须沿用上面列出的原 todo ID 和内容，只更新 status，不要创建新的 todo_list。\n")
 	sb.WriteString("不要只发文本总结就停止。")
 	return sb.String()
 }
@@ -115,4 +133,3 @@ const (
 	maxToolResultRead    = 8000 // read_file
 	maxToolResultDefault = 6000
 )
-

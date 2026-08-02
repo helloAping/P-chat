@@ -14,6 +14,10 @@ export function OpenExplorer(arg1:string):Promise<void>;
 
 export function OpenTerminal(arg1:string):Promise<void>;
 
+export function OpenURL(arg1:string):Promise<void>;
+
 export function ServeHTTP(arg1:http.ResponseWriter,arg2:http.Request):Promise<void>;
+
+export function SetNoMoreConfirm():Promise<void>;
 
 export function StreamMessages(arg1:string,arg2:string):Promise<number>;

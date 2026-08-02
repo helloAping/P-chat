@@ -12,11 +12,13 @@ package server
 // Split from handler.go in T04. Behaviour unchanged.
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
@@ -61,6 +63,42 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	if len(req.Attachments) > 16 {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many attachments: %d (max 16)", len(req.Attachments))})
 		return
+	}
+	if req.ClientMsgID < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "client_msg_id must be a positive integer"})
+		return
+	}
+
+	// Serialise all state changes for a session, including the idempotency
+	// lookup below. A retry can arrive after the previous stream completed but
+	// before the caller observed its final SSE frame; it must never start a
+	// second model run for the same client-minted user row.
+	if _, loaded := h.sessionLocks.LoadOrStore(id, struct{}{}); loaded {
+		c.JSON(http.StatusConflict, gin.H{"error": "a message is already being processed for this session"})
+		return
+	}
+	defer h.sessionLocks.Delete(id)
+
+	if req.ClientMsgID > 0 {
+		identity, found, err := h.store.FindMessageIdentity(req.ClientMsgID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("check client message id: %v", err)})
+			return
+		}
+		if found {
+			if identity.ConversationID == id && identity.Role == llm.RoleUser && identity.Content == req.Message {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": "this client message has already been accepted; recover the existing reply instead of resending it",
+					"code":  "duplicate_client_message",
+				})
+				return
+			}
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "client_msg_id is already bound to a different message",
+				"code":  "client_message_id_conflict",
+			})
+			return
+		}
 	}
 
 	// Resolve style: body override → per-session override →
@@ -115,13 +153,18 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		h.setSessionMetaWorkMode(id, string(workMode))
 	}
 
-	// Serialise concurrent SendMessage calls on the same session
-	// so message writes don't interleave and corrupt history.
-	if _, loaded := h.sessionLocks.LoadOrStore(id, struct{}{}); loaded {
-		c.JSON(http.StatusConflict, gin.H{"error": "a message is already being processed for this session"})
-		return
+	// Hydrate the durable plan before the agent builds its prompt. A
+	// resume request must see the interrupted in_progress item even after
+	// a server restart; clear is idempotent because the UI may have already
+	// called DELETE /todos during preflight.
+	todoMode := agent.NormalizeTodoMode(req.TodoMode)
+	h.hydrateSessionTodos(id)
+	if todoMode == agent.TodoModeClear {
+		if err := h.clearSessionTodos(id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 	}
-	defer h.sessionLocks.Delete(id)
 
 	// Build messages: history after last compression + new user message.
 	// Messages older than the compressed range are replaced by the
@@ -129,16 +172,9 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// the per-session variants so concurrent SendMessage calls on
 	// different sessions don't race.
 	meta := h.ensureMetaLoaded(id)
-	lastComp := h.store.LastCompressedIDFor(id)
-	var histMsgs []llm.ChatMessage
-	var compSummary string
-	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, 0, lastComp)
-		compSummary = h.store.CompressedSummaryFor(id)
-	} else {
-		histMsgs = h.store.GetChatMessagesFor(id, 0)
-	}
+	histMsgs, compSummary := h.loadHistoryForSend(c.Request.Context(), id, provider, model)
 	msgs := buildLLMMessages(histMsgs)
+	historyMessageCount := len(msgs)
 	msgs = append(msgs, llm.ChatMessage{
 		Role:        llm.RoleUser,
 		Type:        llm.TypeText,
@@ -148,12 +184,13 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	})
 
 	chatReq := agent.ChatRequest{
-		Style:       s,
-		WorkMode:    workMode,
-		Provider:    provider,
-		Model:       model,
-		Messages:    msgs,
-		Attachments: req.Attachments,
+		Style:               s,
+		WorkMode:            workMode,
+		Provider:            provider,
+		Model:               model,
+		Messages:            msgs,
+		HistoryMessageCount: historyMessageCount,
+		Attachments:         req.Attachments,
 		// Forward the frontend's client-minted row id. The
 		// agent uses it as the explicit SQLite row id for
 		// this turn's user message, so rollback/regen
@@ -170,6 +207,8 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		PermissionLevel:   meta.PermissionLevel,
 		KBBase:            meta.KnowledgeBase,
 		AutoContinue:      h.sessionAutoContinue(id),
+		TodoLongRunMode:   h.sessionTodoLongRunMode(id),
+		TodoMode:          todoMode,
 		// P3-3: copy the trace id off the request context
 		// so the agent loop can stamp every emitted chunk
 		// without re-reading ctx. The traceIDMiddleware on
@@ -179,8 +218,54 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		TraceID: trace.FromContext(c.Request.Context()),
 	}
 
-	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
+	// Hard wall-clock cap for the whole turn. Backstop for hangs that
+	// escape the per-tool / LLM-stream timeouts: an exec_command whose
+	// orphaned grandchild holds the output pipes, or an SSE write
+	// blocked against a dead client connection. When the deadline
+	// fires, ChatWithTools' ctx.Done() path emits an error event and
+	// the session lock is released, so the user is never stuck on a
+	// permanently "busy" session.
+	turnCtx := c.Request.Context()
+	if maxSec := h.getCfg().Limits.MaxTurnSeconds; maxSec > 0 {
+		var cancel context.CancelFunc
+		turnCtx, cancel = context.WithTimeout(turnCtx, time.Duration(maxSec)*time.Second)
+		defer cancel()
+		// Replace the request context so respondSSE can observe the
+		// deadline error and emit a terminal error frame when the
+		// stream closes without a done event.
+		c.Request = c.Request.WithContext(turnCtx)
+	}
+
+	stream := h.agent.ChatStream(turnCtx, chatReq)
 	h.respondSSE(c, stream, id, provider, model)
+}
+
+func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model string) ([]llm.ChatMessage, string) {
+	_ = h.store.Flush()
+	lastComp := h.store.LastCompressedIDFor(id)
+	contextCap := h.contextMessageLimit(provider, model)
+	if contextCap <= 0 {
+		contextCap = 50
+	}
+
+	if h.store.CountChatMessages(id) > contextCap && h.summarizer != nil {
+		if _, _, err := h.summarizer.Compress(ctx, id); err != nil {
+			log.Printf("%s[history] pre-send compact failed: %v", trace.LogPrefix(ctx), err)
+		}
+		lastComp = h.store.LastCompressedIDFor(id)
+	}
+
+	if lastComp > 0 {
+		histMsgs, _, _ := h.store.GetChatMessagesAfterIDFor(id, contextCap, lastComp)
+		return histMsgs, h.store.CompressedSummaryFor(id)
+	}
+
+	limit := 0
+	if h.store.CountChatMessages(id) > contextCap {
+		limit = contextCap
+	}
+	histMsgs := h.store.GetChatMessagesFor(id, limit)
+	return histMsgs, ""
 }
 
 // respondSSE writes a chat stream to the response. Used
@@ -211,6 +296,13 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 	}
 	c.Writer.Flush()
 
+	// Track whether a terminal frame (done / error with Done=true)
+	// was emitted. When the stream closes without one — e.g. the
+	// turn's hard timeout fired and ChatWithTools' ctx.Done() paths
+	// returned silently — emit a terminal error frame so the client
+	// can distinguish "interrupted" from "completed" instead of
+	// treating a truncation as success.
+	terminalEmitted := false
 	c.Stream(func(w io.Writer) bool {
 		defer func() {
 			if r := recover(); r != nil {
@@ -219,6 +311,24 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		}()
 		chunk, ok := <-stream
 		if !ok {
+			// Stream closed without a done event. If the turn was
+			// interrupted by its hard deadline, surface that to the
+			// client as a terminal error frame.
+			if !terminalEmitted {
+				terminalEmitted = true
+				if err := c.Request.Context().Err(); err != nil {
+					ev := streamEventFromChunk(agent.ChatStreamChunk{
+						Error:    fmt.Sprintf("回合超出最长执行时间被终止: %v", err),
+						ErrorKind: "turn_timeout",
+						Done:     true,
+					}, provider, model, streamDoneIDs{})
+					if werr := writeSSEFrame(w, ev); werr == nil {
+						if fl, ok := c.Writer.(http.Flusher); ok {
+							fl.Flush()
+						}
+					}
+				}
+			}
 			return false
 		}
 		var ids streamDoneIDs
@@ -227,6 +337,9 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 			ids.lastMessageID = h.store.GetLastMessageID(sessionID)
 		}
 		ev := streamEventFromChunk(chunk, provider, model, ids)
+		if chunk.Done {
+			terminalEmitted = true
+		}
 		if ev.Type == "question" {
 			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
 		}
@@ -248,15 +361,15 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 //
 // ★ chunkToEvent 是服务端 ChatStreamChunk → 前端 StreamEvent 的映射器。
 // 映射规则（按优先级，更具体的匹配优先）：
-//   1. question JSON 非空     → type:"question"   (问题模态框)
-//   2. tool_confirm JSON 非空 → type:"tool_confirm" (沙箱确认)
-//   3. Error 非空             → type:"error"       (LLM 错误)
-//   4. Done == true           → type:"done"        (★ 终止 SSE)
-//   5. ToolName 非空          → type:"tool"        (工具调用结果)
-//   6. Thinking 非空          → type:"thinking"    (思考增量)
-//   7. Content 非空           → type:"content"     (文本增量)
-//   8. ContentRewrite 非空    → type:"content_rewrite" (后处理文本重写)
-//   9. ThinkingRewrite 非空   → type:"thinking_rewrite"
+//  1. question JSON 非空     → type:"question"   (问题模态框)
+//  2. tool_confirm JSON 非空 → type:"tool_confirm" (沙箱确认)
+//  3. Error 非空             → type:"error"       (LLM 错误)
+//  4. Done == true           → type:"done"        (★ 终止 SSE)
+//  5. ToolName 非空          → type:"tool"        (工具调用结果)
+//  6. Thinking 非空          → type:"thinking"    (思考增量)
+//  7. Content 非空           → type:"content"     (文本增量)
+//  8. ContentRewrite 非空    → type:"content_rewrite" (后处理文本重写)
+//  9. ThinkingRewrite 非空   → type:"thinking_rewrite"
 //  10. Phase 非空             → type:"phase"       (子代理开始/结束 + 系统状态)
 //  11. 其他                   → type:"phase"       (心跳)
 //

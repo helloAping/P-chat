@@ -51,6 +51,21 @@ func (mockBase) CurrentMessageCount() int                    { return 0 }
 func (mockBase) SubmitQuestionAnswer(context.Context, string, map[string]string) error {
 	return nil
 }
+func (mockBase) SubmitToolConfirm(context.Context, string, bool, string) error { return nil }
+func (mockBase) CompressSession(context.Context, string) (httpcli.CompressResult, error) {
+	return httpcli.CompressResult{}, nil
+}
+func (mockBase) GetSessionContext(context.Context, string) (httpcli.ContextInspector, error) {
+	return httpcli.ContextInspector{}, nil
+}
+func (mockBase) SetReasoningEffort(context.Context, string, string) (string, error) {
+	return "", nil
+}
+func (mockBase) Regenerate(context.Context, string, int64) (<-chan agent.ChatStreamChunk, error) {
+	ch := make(chan agent.ChatStreamChunk)
+	close(ch)
+	return ch, nil
+}
 func (mockBase) RollbackMessages(context.Context, string, int64) ([]httpcli.Message, error) {
 	return nil, nil
 }
@@ -151,21 +166,29 @@ type mockCtx struct {
 	err         error
 
 	// Recordings for additional commands.
-	clearedSessionID string
-	rolledFromID     int64
-	rolledSessionID  string
-	forkedSourceID   string
-	forkedBeforeID   int64
-	kbAction         string // "list" | "add" | "remove" | "scan"
-	kbPath           string
-	planSet          bool
-	newSessionOpts   httpcli.CreateSessionOpts
-	undoCalled       bool
-	setSessionArg    string
-	sessionList      []httpcli.Session
-	forgotID         string
-	toolsEnabled     bool
-	patchOpts        httpcli.SessionPatchOpts
+	clearedSessionID   string
+	rolledFromID       int64
+	rolledSessionID    string
+	forkedSourceID     string
+	forkedBeforeID     int64
+	kbAction           string // "list" | "add" | "remove" | "scan"
+	kbPath             string
+	planSet            bool
+	newSessionOpts     httpcli.CreateSessionOpts
+	undoCalled         bool
+	setSessionArg      string
+	sessionList        []httpcli.Session
+	forgotID           string
+	toolsEnabled       bool
+	patchOpts          httpcli.SessionPatchOpts
+	compressSessionID  string
+	contextSessionID   string
+	compressResult     httpcli.CompressResult
+	contextInfo        httpcli.ContextInspector
+	reasoningSessionID string
+	reasoningLevel     string
+	regenSessionID     string
+	regenUserMessageID int64
 }
 
 // Per-method overrides for the methods the cmdXxx tests need.
@@ -309,6 +332,26 @@ func (m *mockCtx) ToolsEnabled() bool      { return m.toolsEnabled }
 func (m *mockCtx) PatchSession(_ context.Context, id string, opts httpcli.SessionPatchOpts) (*httpcli.Session, error) {
 	m.patchOpts = opts
 	return &httpcli.Session{ID: id, AutoContinue: opts.AutoContinue != nil && *opts.AutoContinue}, m.err
+}
+func (m *mockCtx) CompressSession(_ context.Context, id string) (httpcli.CompressResult, error) {
+	m.compressSessionID = id
+	return m.compressResult, m.err
+}
+func (m *mockCtx) GetSessionContext(_ context.Context, id string) (httpcli.ContextInspector, error) {
+	m.contextSessionID = id
+	return m.contextInfo, m.err
+}
+func (m *mockCtx) SetReasoningEffort(_ context.Context, id, level string) (string, error) {
+	m.reasoningSessionID = id
+	m.reasoningLevel = level
+	return level, m.err
+}
+func (m *mockCtx) Regenerate(_ context.Context, sessionID string, userMessageID int64) (<-chan agent.ChatStreamChunk, error) {
+	m.regenSessionID = sessionID
+	m.regenUserMessageID = userMessageID
+	ch := make(chan agent.ChatStreamChunk)
+	close(ch)
+	return ch, m.err
 }
 func (m *mockCtx) StyleName() string               { return m.styleArg }
 func (m *mockCtx) StyleLabel(s style.Style) string { return string(s) }
@@ -1218,6 +1261,46 @@ func TestCmdTools_Aliases(t *testing.T) {
 		if err := cmdTools(ctx, arg); err != nil {
 			t.Errorf("cmdTools(%q): %v", arg, err)
 		}
+	}
+}
+
+func TestCmdCompress_UsesCurrentSession(t *testing.T) {
+	ctx := &mockCtx{sessionID: "conv_current", compressResult: httpcli.CompressResult{Compressed: true, Summary: "summary"}}
+	if err := cmdCompress(ctx, ""); err != nil {
+		t.Fatalf("cmdCompress: %v", err)
+	}
+	if ctx.compressSessionID != "conv_current" {
+		t.Errorf("session = %q, want conv_current", ctx.compressSessionID)
+	}
+}
+
+func TestCmdContext_UsesRequestedSession(t *testing.T) {
+	ctx := &mockCtx{sessionID: "conv_current", contextInfo: httpcli.ContextInspector{SessionID: "conv_other"}}
+	if err := cmdContext(ctx, "conv_other"); err != nil {
+		t.Fatalf("cmdContext: %v", err)
+	}
+	if ctx.contextSessionID != "conv_other" {
+		t.Errorf("session = %q, want conv_other", ctx.contextSessionID)
+	}
+}
+
+func TestCmdReasoning_UsesCurrentSession(t *testing.T) {
+	ctx := &mockCtx{sessionID: "conv_current"}
+	if err := cmdReasoning(ctx, "high"); err != nil {
+		t.Fatalf("cmdReasoning: %v", err)
+	}
+	if ctx.reasoningSessionID != "conv_current" || ctx.reasoningLevel != "high" {
+		t.Errorf("reasoning = %q/%q", ctx.reasoningSessionID, ctx.reasoningLevel)
+	}
+}
+
+func TestCmdRegen_UsesCurrentSession(t *testing.T) {
+	ctx := &mockCtx{sessionID: "conv_current"}
+	if err := cmdRegen(ctx, "42"); err != nil {
+		t.Fatalf("cmdRegen: %v", err)
+	}
+	if ctx.regenSessionID != "conv_current" || ctx.regenUserMessageID != 42 {
+		t.Errorf("regen = %q/%d", ctx.regenSessionID, ctx.regenUserMessageID)
 	}
 }
 

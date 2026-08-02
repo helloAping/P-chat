@@ -41,6 +41,7 @@ func TestEnsureGlobal_CreatesAllSubdirs(t *testing.T) {
 		GlobalPromptsDir(),
 		MemoryDir(),
 		ToolsDir(),
+		WorkspaceDir(),
 	}
 	for _, d := range expected {
 		info, err := os.Stat(d)
@@ -99,6 +100,7 @@ func TestPathConstants(t *testing.T) {
 		"MemoryFile":       {MemoryDir(), "conversations.json"},
 		"KnowledgeDir":     {GlobalDir(), "knowledge"},
 		"ToolsDir":         {GlobalDir(), "tools"},
+		"WorkspaceDir":     {GlobalDir(), "workspace"},
 	}
 	for name, want := range cases {
 		var got string
@@ -129,6 +131,8 @@ func TestPathConstants(t *testing.T) {
 			got = KnowledgeDir()
 		case "ToolsDir":
 			got = ToolsDir()
+		case "WorkspaceDir":
+			got = WorkspaceDir()
 		}
 		if filepath.Base(got) != want.suffix {
 			t.Errorf("%s() = %q, want suffix %q", name, got, want.suffix)

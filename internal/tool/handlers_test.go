@@ -4,8 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
 )
@@ -369,6 +372,40 @@ func TestExecCommand_DryRun(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "sandbox: passed") {
 		t.Errorf("missing sandbox status: %s", res.Content)
+	}
+}
+
+// TestExecCommand_CancelKillsProcessTree is the regression test for the
+// "多轮工具后卡住" hang: exec_command must return promptly when the tool
+// context is cancelled even though the direct child (the cmd/sh wrapper)
+// is NOT the process holding the pipes open. Before the fix,
+// readLimitedOutput blocked forever in io.ReadAll because the orphaned
+// grandchild inherited the stdout/stderr write ends and the tool timeout
+// only killed the wrapper — the unbounded hang behind the 30-minute
+// stuck turns.
+func TestExecCommand_CancelKillsProcessTree(t *testing.T) {
+	// Command that keeps a grandchild alive holding the inherited
+	// pipe write ends while the wrapper exits immediately:
+	//   Windows: cmd /C "ping -t 127.0.0.1" — ping -t never exits
+	//   Unix:    sh -c "yes >/dev/null &"  — backgrounded yes holds
+	//            the sh wrapper's stdout pipe while sh exits.
+	var cmdline string
+	if runtime.GOOS == "windows" {
+		cmdline = `ping -t 127.0.0.1`
+	} else {
+		cmdline = `yes >/dev/null &`
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	res, _ := handleExecCommand(ctx, []byte(`{"command":`+strconv.Quote(cmdline)+`}`))
+
+	// The test itself is the assertion: before the fix this call never
+	// returned (io.ReadAll on the held pipes blocks forever, and the
+	// ctx timeout could not break it). Completing within ~3s proves the
+	// process tree was killed and the pipe readers released.
+	if !res.IsError {
+		t.Logf("exec_command returned (expect error or timeout); content=%q", res.Content)
 	}
 }
 

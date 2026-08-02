@@ -50,6 +50,16 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		return
 	}
 
+	// 在变更回复历史或重建 agent prompt 前持有会话锁。
+	// Own the session before changing reply history or rebuilding the agent
+	// prompt. As with SendMessage, a conflicting request must leave the
+	// existing reply group untouched.
+	if _, loaded := h.sessionLocks.LoadOrStore(id, struct{}{}); loaded {
+		c.JSON(http.StatusConflict, gin.H{"error": "a message is already being processed for this session"})
+		return
+	}
+	defer h.sessionLocks.Delete(id)
+
 	// P1-4: soft-archive every existing sibling in this
 	// regen group. The new assistant message (created by
 	// the agent loop below) will be the new active row.
@@ -87,16 +97,12 @@ func (h *Handler) Regenerate(c *gin.Context) {
 	}
 	model := h.sessionModel(id, provider)
 
+	// Regeneration is another entry point into the agent loop. Keep the
+	// durable todo plan visible after a server restart just as SendMessage
+	// does, so regenerated turns cannot silently skip active work.
+	h.hydrateSessionTodos(id)
 	meta := h.ensureMetaLoaded(id)
-	lastComp := h.store.LastCompressedIDFor(id)
-	var histMsgs []llm.ChatMessage
-	var compSummary string
-	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, 0, lastComp)
-		compSummary = h.store.CompressedSummaryFor(id)
-	} else {
-		histMsgs = h.store.GetChatMessagesFor(id, 0)
-	}
+	histMsgs, compSummary := h.loadHistoryForSend(c.Request.Context(), id, provider, model)
 	// Note: the user message at UserMessageID is still in
 	// histMsgs (we only archived sibling assistant rows).
 	// The agent loop sees it as the latest message and
@@ -115,20 +121,22 @@ func (h *Handler) Regenerate(c *gin.Context) {
 	msgs := buildLLMMessages(histMsgs)
 
 	chatReq := agent.ChatRequest{
-		Style:             style.Style(styleStr),
-		WorkMode:          h.sessionWorkMode(id),
-		Provider:          provider,
-		Model:             model,
-		Messages:          msgs,
-		ReasoningEffort:   meta.ReasoningEffort,
-		CompressedSummary: compSummary,
-		SessionID:         id,
-		ProjectRoot:       meta.ProjectPath,
-		SkillContext:      "",
-		PlanMode:          meta.PlanMode,
-		PermissionLevel:   meta.PermissionLevel,
-		KBBase:            meta.KnowledgeBase,
-		AutoContinue:      h.sessionAutoContinue(id),
+		Style:               style.Style(styleStr),
+		WorkMode:            h.sessionWorkMode(id),
+		Provider:            provider,
+		Model:               model,
+		Messages:            msgs,
+		HistoryMessageCount: len(msgs),
+		ReasoningEffort:     meta.ReasoningEffort,
+		CompressedSummary:   compSummary,
+		SessionID:           id,
+		ProjectRoot:         meta.ProjectPath,
+		SkillContext:        "",
+		PlanMode:            meta.PlanMode,
+		PermissionLevel:     meta.PermissionLevel,
+		KBBase:              meta.KnowledgeBase,
+		AutoContinue:        h.sessionAutoContinue(id),
+		TodoLongRunMode:     h.sessionTodoLongRunMode(id),
 		// P1-4: the agent loop reads this and stamps the
 		// new assistant row's regen_group_id, joining the
 		// user message's regen group. Empty for normal
@@ -136,15 +144,6 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		RegenGroupID: groupID,
 		TraceID:      trace.FromContext(c.Request.Context()),
 	}
-
-	// Same session-locks pattern as SendMessage so a
-	// concurrent regen + send on the same session can't
-	// interleave writes.
-	if _, loaded := h.sessionLocks.LoadOrStore(id, struct{}{}); loaded {
-		c.JSON(http.StatusConflict, gin.H{"error": "a message is already being processed for this session"})
-		return
-	}
-	defer h.sessionLocks.Delete(id)
 
 	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
 	h.respondSSE(c, stream, id, provider, model)

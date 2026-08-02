@@ -211,6 +211,9 @@ func (r *REPL) chat(input string) {
 	ui.SetQuestionHandler(r.ctx.GetCurrentSessionID(), func(sid string, answers map[string]string) error {
 		return r.ctx.SubmitQuestionAnswer(ctx, sid, answers)
 	})
+	ui.SetConfirmHandler(r.ctx.GetCurrentSessionID(), func(sid string, approved bool, action string) error {
+		return r.ctx.SubmitToolConfirm(ctx, sid, approved, action)
+	})
 	ui.PrintBannerHeader(input)
 
 	r.mu.Lock()

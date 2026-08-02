@@ -860,15 +860,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 	if provider == "" {
 		provider = h.getCfg().LLM.Default
 	}
-	model := m.Model
-	if model == "" {
-		for _, p := range h.getCfg().LLM.Providers {
-			if p.Name == provider {
-				model = p.EffectiveModel()
-				break
-			}
-		}
-	}
+	model := h.sessionModel(cv.ID, provider)
 	return SessionResponse{
 		ID:              cv.ID,
 		Title:           cv.Title,
@@ -883,6 +875,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		VectorStore:     cv.VectorStore,
 		KnowledgeBase:   m.KnowledgeBase,
 		AutoContinue:    h.sessionAutoContinue(cv.ID),
+		TodoLongRunMode: string(h.sessionTodoLongRunMode(cv.ID)),
 		CreatedAt:       cv.CreatedAt.Unix(),
 		UpdatedAt:       cv.UpdatedAt.Unix(),
 	}

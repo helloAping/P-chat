@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/llm"
@@ -17,6 +18,16 @@ type Summarizer struct {
 	provider  string
 	triggerAt int // when total messages exceed this, summarize the oldest half
 }
+
+// maxCompressBatches caps how many batches Compress summarizes in a single
+// invocation (each batch is up to 100 messages). A pathological conversation —
+// e.g. the 2026-08 runaway loop that left 2000+ rows in one session — would
+// otherwise trigger 20+ sequential synchronous LLM calls inside the
+// SendMessage handler, blocking the turn and hammering the provider (the
+// "发送继续后 server 卡顿/内存飙升" resume regression). Each call advances
+// the compression point; later Compress invocations (from subsequent messages
+// or in-loop auto-compact) cover the rest.
+const maxCompressBatches = 4
 
 func NewSummarizer(s *Store, l *llm.Client, provider string, triggerAt int) *Summarizer {
 	if triggerAt <= 0 {
@@ -52,40 +63,43 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 		return false, "", nil
 	}
 
-	summarized := map[int64]bool{}
-	srows, _ := sm.store.db.Query(
-		`SELECT range_start, range_end FROM summaries WHERE conversation_id = ?`,
-		convID,
-	)
-	if srows != nil {
-		defer srows.Close()
-		for srows.Next() {
-			var s, e int64
-			if err := srows.Scan(&s, &e); err == nil {
-				for i := s; i <= e; i++ {
-					summarized[i] = true
-				}
-			}
-		}
-	}
+	// Marks message ids covered by an existing summary. Ranges are kept as
+	// (start, end) pairs and matched by binary search — expanding each range
+	// into every integer would be O(span) memory, and a single summary range
+	// spanning two message-id schemes (small autoincrement ids + millisecond
+	// timestamps, e.g. the 2026-08 runaway conversation) has a span on the
+	// order of 10^15, which blew the process heap to GBs inside the
+	// SendMessage handler.
+	summaryRanges := sm.loadSummaryRanges(convID)
+	summarized := func(id int64) bool { return rangeContainsID(summaryRanges, id) }
 
 	toSummarize := []int64{}
 	for _, id := range ids {
-		if !summarized[id] {
+		if !summarized(id) {
 			toSummarize = append(toSummarize, id)
 		}
 	}
 	if len(toSummarize) == 0 {
 		return false, "", nil
 	}
-	// Summarize ALL unsummarized messages in batches of up to 100
-	// (each batch becomes one LLM summarization call capped at ~200
-	// chars per message × 100 messages = ~20K chars prompt, safely
-	// within the summarizer model's context). The loop runs until
-	// every uncompressed message has been covered, preventing the
-	// ReAct loop from re-entering auto-compact on every round.
+	// Summarize up to maxCompressBatches batches per call (each batch is one
+	// LLM summarization call capped at ~200 chars per message × 100 messages
+	// = ~20K chars prompt, safely within the summarizer model's context).
+	// Bounding the batches per invocation keeps a single Compress from firing
+	// 20+ sequential LLM calls on a bloated conversation; the compression
+	// point advances incrementally and is picked up by the next call.
 	var allSummaries []string
-	for len(toSummarize) > 0 {
+	batches := 0
+	for len(toSummarize) > 0 && batches < maxCompressBatches {
+		select {
+		case <-ctx.Done():
+			if len(allSummaries) == 0 {
+				return false, "", ctx.Err()
+			}
+			return true, strings.Join(allSummaries, "\n"), ctx.Err()
+		default:
+		}
+		batches++
 		batch := toSummarize
 		if len(batch) > 100 {
 			batch = batch[:100]
@@ -150,28 +164,15 @@ func (sm *Summarizer) MaybeSummarize(ctx context.Context, convID string) (bool, 
 		return false, nil
 	}
 
-	// Find already-summarized ids.
-	summarized := map[int64]bool{}
-	srows, _ := sm.store.db.Query(
-		`SELECT range_start, range_end FROM summaries WHERE conversation_id = ?`,
-		convID,
-	)
-	if srows != nil {
-		defer srows.Close()
-		for srows.Next() {
-			var s, e int64
-			if err := srows.Scan(&s, &e); err == nil {
-				for i := s; i <= e; i++ {
-					summarized[i] = true
-				}
-			}
-		}
-	}
+	// See Compress for why summarized coverage is tracked as ranges with
+	// binary search instead of an expanded id→bool map.
+	summaryRanges := sm.loadSummaryRanges(convID)
+	summarized := func(id int64) bool { return rangeContainsID(summaryRanges, id) }
 
 	// Pick the oldest non-summarized block (up to half of the message list).
 	toSummarize := []int64{}
 	for _, id := range ids {
-		if !summarized[id] {
+		if !summarized(id) {
 			toSummarize = append(toSummarize, id)
 		}
 	}
@@ -228,4 +229,52 @@ func truncateStr(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// summaryRange is an inclusive [start, end] message-id interval already
+// covered by a stored summary.
+type summaryRange struct{ start, end int64 }
+
+// loadSummaryRanges returns the stored summary intervals for a conversation,
+// sorted by start. The range values come straight from the `summaries` table
+// (startID/endID of each compressed batch), so they may be huge when a batch
+// crossed two message-id schemes — that is fine, we never expand them.
+func (sm *Summarizer) loadSummaryRanges(convID string) []summaryRange {
+	srows, err := sm.store.db.Query(
+		`SELECT range_start, range_end FROM summaries WHERE conversation_id = ?`,
+		convID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer srows.Close()
+	var out []summaryRange
+	for srows.Next() {
+		var s, e int64
+		if err := srows.Scan(&s, &e); err == nil && e >= s {
+			out = append(out, summaryRange{start: s, end: e})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].start < out[j].start })
+	return out
+}
+
+// rangeContainsID reports whether id falls inside any interval. Ranges are
+// sorted by start, so a binary search finds the last range starting at or
+// before id in O(log n), then checks the span in O(1) — never iterating over
+// the numeric distance between start and end.
+func rangeContainsID(ranges []summaryRange, id int64) bool {
+	lo, hi := 0, len(ranges)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if ranges[mid].start <= id {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == 0 {
+		return false
+	}
+	return ranges[lo-1].end >= id
 }

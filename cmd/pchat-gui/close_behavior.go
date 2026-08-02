@@ -90,13 +90,7 @@ func readCloseBehavior() string {
 	return normalizeCloseBehavior(cfg.UI.CloseBehavior)
 }
 
-func stripUTF8BOM(data []byte) []byte {
-	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
-		return data[3:]
-	}
-	return data
-}
-
+// readYAMLCloseBehavior reads the ui.close_behavior field from YAML config.
 func readYAMLCloseBehavior(text string) string {
 	inUI := false
 	for _, raw := range strings.Split(text, "\n") {
@@ -118,4 +112,11 @@ func readYAMLCloseBehavior(text string) string {
 		return strings.Trim(strings.TrimSpace(value), `"'`)
 	}
 	return closeBehaviorExit
+}
+
+func stripUTF8BOM(data []byte) []byte {
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		return data[3:]
+	}
+	return data
 }

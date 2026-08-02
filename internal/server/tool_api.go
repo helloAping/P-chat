@@ -18,8 +18,9 @@ import (
 // the `dynamic` + `source` flags let it badge the user's
 // own tools differently from the built-ins.
 type ToolInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Policy      tool.ToolPolicy `json:"policy"`
 	// Parameters is the JSON Schema object the LLM sees
 	// when deciding whether to call the tool. For
 	// built-ins this comes from tool.Tool.Parameters; for
@@ -69,6 +70,7 @@ func (h *Handler) ListTools(c *gin.Context) {
 		info := ToolInfo{
 			Name:        entry.Name,
 			Description: entry.Description,
+			Policy:      entry.EffectivePolicy(),
 			Parameters:  entry.Parameters,
 			Scope:       string(origin.Scope),
 			Source:      origin.Source,

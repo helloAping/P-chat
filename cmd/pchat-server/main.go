@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -9,17 +10,20 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/im"
+	"github.com/p-chat/pchat/internal/im/feishu"
 	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/internal/rotatelog"
 	"github.com/p-chat/pchat/internal/sandbox"
 	"github.com/p-chat/pchat/internal/search"
 	"github.com/p-chat/pchat/internal/server"
@@ -29,6 +33,7 @@ import (
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
 	"github.com/p-chat/pchat/internal/version"
+	"github.com/spf13/cobra"
 )
 
 //go:embed all:web
@@ -38,6 +43,8 @@ var embeddedWebRaw embed.FS
 var embeddedBrowserExtZip []byte
 
 var cfgFile string
+var imEnable bool
+var imPlatforms string
 
 var rootCmd = &cobra.Command{
 	Use:   "pchat-server",
@@ -48,6 +55,8 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "配置文件路径")
+	rootCmd.PersistentFlags().BoolVar(&imEnable, "im.enable", false, "启用 IM 桥接")
+	rootCmd.PersistentFlags().StringVar(&imPlatforms, "im.platforms", "", "启用的 IM 平台列表，例如 feishu:bot,telegram:polling")
 }
 
 func main() {
@@ -62,7 +71,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("init directories: %w", err)
 	}
 
-	// Mirror the standard log to a file under ~/.p-chat so
+	// Mirror the standard log to a dated file under ~/.p-chat/logs so
 	// the LLM-SSE debug output is easy to find when pchat-server
 	// is launched as a child process (e.g. by pchat-gui) and
 	// stderr is not visible in a terminal. The first few raw
@@ -74,15 +83,19 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// a fix that correctly handles non-standard proxy field
 	// names, we still need a way for the user to inspect what
 	// the proxy actually sent. This log is the answer.
-	if logFile, err := os.OpenFile(filepath.Join(paths.GlobalDir(), "server-debug.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-		log.SetOutput(logFile)
+	//
+	// Logs rotate by date (server-debug-YYYY-MM-DD.log) and old
+	// files beyond the 7-day retention are pruned automatically.
+	if logWriter, logErr := rotatelog.New(filepath.Join(paths.GlobalDir(), "logs"), "server-debug", 7); logErr == nil {
+		log.SetOutput(logWriter)
+		defer logWriter.Close()
 	}
 
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	applyIMFlagOverrides(cfg)
 
 	llmClient, err := llm.NewClient(&cfg.LLM)
 	if err != nil {
@@ -122,8 +135,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	} else {
 		log.Printf("[search] web_search disabled (no provider configured)")
 	}
+	tool.RegisterGrep(toolReg, cfg)
 	if cfg.Knowledge.Enabled {
-		tool.RegisterGrep(toolReg, cfg)
 		tool.RegisterWiki(toolReg, cfg)
 		// Migrate legacy wiki_sections → three-level index_nodes.
 		var bases []knowledge.BaseRef
@@ -239,6 +252,23 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
+
+	imGateway := im.NewGateway(cfg.IM)
+	registerIMAdapters(imGateway, cfg.IM)
+	srv.SetIMGateway(imGateway)
+	imGateway.SetInboundProcessor(srv.Handler())
+	if cfg.IM.Enabled {
+		if err := imGateway.Start(context.Background()); err != nil {
+			log.Printf("[im] gateway start failed: %v", err)
+		} else {
+			log.Printf("[im] gateway started")
+		}
+	}
+	defer func() {
+		if err := imGateway.Stop(context.Background()); err != nil {
+			log.Printf("[im] gateway stop failed: %v", err)
+		}
+	}()
 
 	// Initialize browser control manager (enabled via config).
 	browserMgr := browser.NewManager(cfg.Browser, toolReg)
@@ -384,4 +414,76 @@ func defaultProviderName(cfg *config.Config) string {
 		return cfg.LLM.Providers[0].Name
 	}
 	return ""
+}
+
+func applyIMFlagOverrides(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	if imEnable {
+		cfg.IM.Enabled = true
+	}
+	if imPlatforms == "" {
+		cfg.IM.Normalize()
+		return
+	}
+	cfg.IM.Enabled = true
+	for _, raw := range strings.Split(imPlatforms, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		parts := strings.SplitN(raw, ":", 2)
+		platformType := parts[0]
+		variant := ""
+		if len(parts) == 2 {
+			variant = parts[1]
+		}
+		found := false
+		for i := range cfg.IM.Platforms {
+			if cfg.IM.Platforms[i].Type == platformType && cfg.IM.Platforms[i].Variant == variant {
+				cfg.IM.Platforms[i].Enabled = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			cfg.IM.Platforms = append(cfg.IM.Platforms, config.IMPlatformConfig{
+				Type:    platformType,
+				Variant: variant,
+				Enabled: true,
+			})
+		}
+	}
+	cfg.IM.Normalize()
+}
+
+func registerIMAdapters(gateway *im.Gateway, cfg config.IMConfig) {
+	if gateway == nil {
+		return
+	}
+	gateway.RegisterAdapter(feishu.NewAdapter(config.IMPlatformConfig{Type: "feishu", Variant: "bot"}))
+	gateway.RegisterRendererFactory("feishu", func(platform config.IMPlatformConfig) (im.OutboundRenderer, error) {
+		if !platform.Out.UseOpenAPI {
+			return nil, im.ErrOutboundDisabled{
+				Platform: platform.Type,
+				Variant:  platform.Variant,
+				Reason:   "out.use_openapi is false",
+			}
+		}
+		return feishu.NewRenderer(platform, nil), nil
+	})
+	for _, platform := range cfg.Platforms {
+		if platform.Type != "feishu" {
+			continue
+		}
+		variant := platform.Variant
+		if variant == "" {
+			variant = "bot"
+		}
+		if variant == "bot" {
+			gateway.RegisterAdapter(feishu.NewAdapter(platform))
+		}
+	}
+	im.RegisterConfiguredWeChatAdapters(gateway, cfg)
 }

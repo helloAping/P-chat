@@ -71,6 +71,14 @@ func TestConfirmTargetFor_Table(t *testing.T) {
 			wantClass: "project", wantRisk: "high", wantHasPath: true,
 		},
 		{
+			desc:     "edit_file: project path → confirm",
+			toolName: "edit_file",
+			args:     `{"path":"src/foo.go","old_text":"old","new_text":"new"}`,
+			sb:       &stubSandboxForConfirm{writeDecision: tool.SandboxConfirm},
+			wantOk:   true, wantDecision: tool.SandboxConfirm,
+			wantClass: "project", wantRisk: "high", wantHasPath: true,
+		},
+		{
 			desc:     "read_file: project path → allow",
 			toolName: "read_file",
 			args:     `{"path":"src/foo.go"}`,

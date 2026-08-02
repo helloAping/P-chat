@@ -25,7 +25,7 @@ watch(() => props.defaultOpen, (v) => {
 })
 
 watch(() => props.part.streaming, (v) => {
-  if (!userToggled.value && v) open.value = true
+  if (!userToggled.value) open.value = !!v
 })
 
 function toggle() {
@@ -55,7 +55,7 @@ function toggle() {
       </span>
       <span class="meta" v-if="!part.streaming && part.text">{{ part.text.length }} 字</span>
     </button>
-    <div class="thinking-body" v-show="open">
+    <div v-if="open" class="thinking-body">
       <pre class="thinking-content">{{ part.text }}</pre>
     </div>
   </div>

@@ -29,12 +29,15 @@ import {
 } from 'naive-ui'
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash,
-  Cpu, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
+  Cpu, Activity, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
+  MessageSquare,
 } from './icons'
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion, state as chatState } from '../stores/chat'
 import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
+import IMSettings from './IMSettings.vue'
+import DiagnosticsSettings from './DiagnosticsSettings.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
 
 const message = useMessage()
@@ -168,7 +171,7 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser'>('providers')
+const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser' | 'im' | 'diagnostics'>('providers')
 
 // Modal visibility (v-model). The default is `true` so that
 // when App.vue mounts this component (it only mounts when
@@ -195,6 +198,8 @@ const settingsTabs = [
   { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索' },
   { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商' },
   { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制' },
+  { name: 'im',        label: 'IM 桥接',      icon: MessageSquare, description: '飞书 / Telegram / 企微 / QQ / 微信' },
+  { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照' },
 ]
 
 // --- Provider state ---
@@ -268,6 +273,7 @@ const sysLimits = ref<api.LimitsConfig>({
   tool_result_default_cap: 6000,
   prune_after_rounds: 15,
   max_rounds: 300,
+  todo_long_run_mode: 'adaptive',
   max_stored_messages: 0,
 })
 const sysSubAgent = ref<api.SubAgentConfig>({
@@ -310,6 +316,7 @@ async function saveSystemConfig() {
     limits.tool_result_default_cap = sysLimits.value.tool_result_default_cap
     limits.prune_after_rounds = sysLimits.value.prune_after_rounds
     limits.max_rounds = sysLimits.value.max_rounds
+    limits.todo_long_run_mode = sysLimits.value.todo_long_run_mode
     limits.max_stored_messages = sysLimits.value.max_stored_messages
     patch.limits = limits
 
@@ -339,6 +346,7 @@ function resetSystemConfig() {
     tool_result_default_cap: 6000,
     prune_after_rounds: 15,
     max_rounds: 300,
+    todo_long_run_mode: 'adaptive',
     max_stored_messages: 0,
   }
   sysSubAgent.value = { cache_ttl: '', timeout: '' }
@@ -2041,6 +2049,15 @@ function kbModelSupportsVision(scanModel: string) {
                       <span class="sys-hint">0 = 不限制，默认 300</span>
                     </div>
                     <div class="sys-form-row">
+                      <span class="sys-label">Todo 长任务</span>
+                      <NSelect v-model:value="sysLimits.todo_long_run_mode" :options="[
+                        { label: '关闭', value: 'off' },
+                        { label: '自适应', value: 'adaptive' },
+                        { label: '不限轮次', value: 'unlimited' },
+                      ]" size="small" style="width:120px" @update:value="markSysDirty" />
+                      <span class="sys-hint">自适应仅在存在活动 todo 时超过最大回合数</span>
+                    </div>
+                    <div class="sys-form-row">
                       <span class="sys-label">exec_command 截断</span>
                       <NInputNumber v-model:value="sysLimits.tool_result_exec_cap" :min="0" :step="512" size="small" style="width:100px" @update:value="markSysDirty" />
                       <span class="sys-hint">bytes，默认 4000</span>
@@ -2778,6 +2795,13 @@ function kbModelSupportsVision(scanModel: string) {
             </ol>
           </div>
         </div>
+      </NTabPane>
+
+      <NTabPane name="im" tab="IM 桥接" style="flex: 1; min-height: 0; overflow: auto">
+        <IMSettings />
+      </NTabPane>
+      <NTabPane name="diagnostics" tab="诊断" style="flex: 1; min-height: 0; overflow: auto">
+        <DiagnosticsSettings />
       </NTabPane>
     </NTabs>
   </AppSettingsLayout>

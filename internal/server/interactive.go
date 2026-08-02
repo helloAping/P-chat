@@ -9,7 +9,8 @@ package server
 //   POST /api/v1/sessions/:id/confirm             (ConfirmResponse)
 //   POST /api/v1/sessions/:id/execute-plan        (ExecutePlan)
 //   POST /api/v1/sessions/:id/system-message      (SaveSystemMessage)
-//   GET  /api/v1/sessions/:id/todos               (GetTodos)
+//   GET    /api/v1/sessions/:id/todos             (GetTodos)
+//   DELETE /api/v1/sessions/:id/todos             (ClearTodos)
 //   POST /api/v1/sessions/:id/compress            (CompressConversation)
 //   POST /api/v1/sessions/:id/reasoning-effort    (SetReasoningEffort)
 //
@@ -17,6 +18,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -51,7 +53,9 @@ func (h *Handler) CompressConversation(c *gin.Context) {
 
 func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	id := c.Param("id")
-	var req struct{ Level string `json:"level"` }
+	var req struct {
+		Level string `json:"level"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -67,7 +71,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	if h.store != nil {
-			blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
+		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
 		_ = h.store.UpdateConversationMeta(id, string(blob))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
@@ -84,7 +88,9 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
 		return
 	}
-	var body struct{ Content string `json:"content"` }
+	var body struct {
+		Content string `json:"content"`
+	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -113,24 +119,57 @@ func (h *Handler) SaveSystemMessage(c *gin.Context) {
 
 func (h *Handler) GetTodos(c *gin.Context) {
 	id := c.Param("id")
-	todos := tool.GetSessionTodos(id)
-	// On cold cache (server restart), hydrate from SQLite.
-	if len(todos) == 0 && h.store != nil {
-		dbTodos := h.store.LoadTodos(id)
-		if len(dbTodos) > 0 {
-			toolTodos := make([]tool.TodoItem, len(dbTodos))
-			for i, t := range dbTodos {
-				toolTodos[i] = tool.TodoItem{
-					ID:      t.ID,
-					Content: t.Content,
-					Status:  t.Status,
-				}
-			}
-			tool.SetSessionTodos(id, toolTodos)
-			todos = toolTodos
-		}
-	}
+	todos := h.hydrateSessionTodos(id)
 	c.JSON(http.StatusOK, gin.H{"todos": todos})
+}
+
+func (h *Handler) hydrateSessionTodos(id string) []tool.TodoItem {
+	todos := tool.GetSessionTodos(id)
+	if len(todos) != 0 || h.store == nil {
+		return todos
+	}
+	dbTodos := h.store.LoadTodos(id)
+	if len(dbTodos) == 0 {
+		return todos
+	}
+	toolTodos := make([]tool.TodoItem, len(dbTodos))
+	for i, t := range dbTodos {
+		toolTodos[i] = tool.TodoItem{ID: t.ID, Content: t.Content, Status: t.Status}
+	}
+	tool.SetSessionTodosMemory(id, toolTodos)
+	return toolTodos
+}
+
+func (h *Handler) clearSessionTodos(id string) error {
+	if h.store == nil {
+		return fmt.Errorf("memory store not available")
+	}
+	if err := h.store.SaveTodos(id, nil); err != nil {
+		return err
+	}
+	tool.SetSessionTodosMemory(id, nil)
+	return nil
+}
+
+// ClearTodos discards a session's task list from both the process cache and
+// SQLite. DELETE /api/v1/sessions/:id/todos
+func (h *Handler) ClearTodos(c *gin.Context) {
+	id := c.Param("id")
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	if _, err := h.store.GetConversation(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	// Persist first so a database failure cannot make cleared todos reappear
+	// after a restart.
+	if err := h.clearSessionTodos(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // QuestionResponse receives the user's answer to a pending
@@ -159,15 +198,19 @@ func (h *Handler) QuestionResponse(c *gin.Context) {
 func (h *Handler) ConfirmResponse(c *gin.Context) {
 	id := c.Param("id")
 	var body struct {
-		Approved bool `json:"approved"`
+		Approved bool   `json:"approved"`
+		Action   string `json:"action,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !tool.SubmitConfirm(id, body.Approved) {
+	if !tool.SubmitConfirmResponse(id, tool.ConfirmResponse{Approved: body.Approved, Action: body.Action}) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no pending confirm for this session"})
 		return
+	}
+	if body.Action == tool.ConfirmActionAlways {
+		h.setSessionPermissionLevel(id, tool.PermissionFull)
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

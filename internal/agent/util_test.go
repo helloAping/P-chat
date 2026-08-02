@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 // =====================================================================
@@ -120,6 +122,23 @@ func TestTruncateToolResult_CfgOverride(t *testing.T) {
 	// Truncation marker is present.
 	if !strings.Contains(got, "[truncated:") {
 		t.Errorf("expected truncation, got: %q", got[:50])
+	}
+}
+
+func TestTruncateToolResultForProjectHonorsToolPolicyCap(t *testing.T) {
+	registry := tool.NewRegistry()
+	registry.Register(tool.Tool{
+		Name: "bounded_tool",
+		Policy: &tool.ToolPolicy{
+			MaxOutputBytes: 50,
+		},
+	}, func(context.Context, json.RawMessage) (*tool.CallResult, error) {
+		return nil, nil
+	})
+	a := &Agent{tools: registry}
+	got := a.truncateToolResultForProject("bounded_tool", "", strings.Repeat("x", 100))
+	if !strings.Contains(got, "[truncated:") {
+		t.Fatalf("policy cap was not applied: %q", got)
 	}
 }
 
@@ -473,5 +492,48 @@ func TestTruncateToFit_SingleMessage(t *testing.T) {
 	truncateToFit(&msgs, 0)
 	if len(msgs) != 1 || msgs[0].Content != "only" {
 		t.Errorf("single-msg slice altered: %v", msgs)
+	}
+}
+
+func TestRepairToolMessagePairsDropsOrphans(t *testing.T) {
+	msgs := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "sys"},
+		{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "orphan", Content: "old result"},
+		{Role: llm.RoleAssistant, Type: llm.TypeToolCall, ToolID: "call-1", ToolName: "read_file"},
+		{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "call-1", Content: "ok"},
+		{Role: llm.RoleAssistant, Type: llm.TypeToolCall, ToolID: "dangling", ToolName: "read_file"},
+	}
+
+	repaired, dropped := repairToolMessagePairs(msgs)
+	if dropped != 2 {
+		t.Fatalf("dropped = %d, want 2; repaired=%+v", dropped, repaired)
+	}
+	if len(repaired) != 3 {
+		t.Fatalf("repaired length = %d, want 3; repaired=%+v", len(repaired), repaired)
+	}
+	if repaired[1].ToolID != "call-1" || repaired[2].ToolID != "call-1" {
+		t.Fatalf("valid tool pair was not preserved: %+v", repaired)
+	}
+}
+
+func TestShrinkContextForBadRequest(t *testing.T) {
+	long := strings.Repeat("x", 2000)
+	msgs := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "sys"},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: long},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: long},
+		{Role: llm.RoleAssistant, Type: llm.TypeText, Content: "recent"},
+	}
+	before := llm.EstimatePromptTokens(msgs, nil)
+
+	if !shrinkContextForBadRequest(&msgs, nil, 4096, 1) {
+		t.Fatal("expected bad-request shrink to reduce oversized context")
+	}
+	after := llm.EstimatePromptTokens(msgs, nil)
+	if after >= before {
+		t.Fatalf("estimate did not shrink: before=%d after=%d", before, after)
+	}
+	if msgs[0].Role != llm.RoleSystem || msgs[len(msgs)-1].Content != "recent" {
+		t.Fatalf("system or most recent message was not preserved: %+v", msgs)
 	}
 }

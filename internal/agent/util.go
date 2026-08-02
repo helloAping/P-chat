@@ -42,6 +42,13 @@ func formatElapsed(d time.Duration) string {
 // See P2-1 in docs/plans/auto-continue-plan.md.
 
 func (a *Agent) truncateToolResult(name string, content string) string {
+	return a.truncateToolResultForProject(name, "", content)
+}
+
+// truncateToolResultForProject applies both the configured output cap and a
+// tool-specific policy cap. The smaller positive value wins, so a dynamic
+// tool can tighten its result budget but cannot bypass the server limit.
+func (a *Agent) truncateToolResultForProject(name, projectRoot, content string) string {
 	execCap := maxToolResultExec
 	readCap := maxToolResultRead
 	defaultCap := maxToolResultDefault
@@ -67,6 +74,13 @@ func (a *Agent) truncateToolResult(name string, content string) string {
 		cap_ = readCap
 	default:
 		cap_ = defaultCap
+	}
+	if a.tools != nil {
+		if meta, _, ok := a.tools.LookupForProject(name, projectRoot); ok {
+			if policyCap := meta.EffectivePolicy().MaxOutputBytes; policyCap > 0 && policyCap < cap_ {
+				cap_ = policyCap
+			}
+		}
 	}
 
 	// The previous version had a `len(content) <= defaultCap`
@@ -315,17 +329,74 @@ func truncateToFit(msgs *[]llm.ChatMessage, usable int) {
 	if total := llm.EstimateTokensMessages(rest); total <= usable {
 		return
 	}
-	// Walk backward from the end, keeping messages that fit.
-	end := len(rest) - 1
-	for end >= 0 {
-		if llm.EstimateTokensMessages(rest[:end+1]) <= usable {
-			break
+
+	kept := make([]llm.ChatMessage, 0, len(rest))
+	for i := len(rest) - 1; i >= 0; i-- {
+		candidate := make([]llm.ChatMessage, 0, len(kept)+1)
+		candidate = append(candidate, rest[i])
+		candidate = append(candidate, kept...)
+		if llm.EstimateTokensMessages(candidate) > usable {
+			continue
 		}
-		end--
+		kept = candidate
 	}
-	if end < 0 {
-		*msgs = []llm.ChatMessage{sysMsg, rest[len(rest)-1]}
-	} else {
-		*msgs = append([]llm.ChatMessage{sysMsg}, rest[end:]...)
+	if len(kept) == 0 {
+		kept = []llm.ChatMessage{rest[len(rest)-1]}
 	}
+	*msgs = append([]llm.ChatMessage{sysMsg}, kept...)
+}
+
+// repairToolMessagePairs removes tool messages that cannot form a valid
+// assistant tool_call -> tool_result sequence after history compaction.
+// 压缩或截断后清理孤立工具消息，避免 OpenAI 兼容代理拒绝请求。
+func repairToolMessagePairs(msgs []llm.ChatMessage) ([]llm.ChatMessage, int) {
+	if len(msgs) == 0 {
+		return msgs, 0
+	}
+
+	resultIDs := make(map[string]struct{})
+	for _, msg := range msgs {
+		if msg.Type == llm.TypeToolResult && msg.ToolID != "" {
+			resultIDs[msg.ToolID] = struct{}{}
+		}
+	}
+
+	out := make([]llm.ChatMessage, 0, len(msgs))
+	seenCalls := make(map[string]struct{})
+	dropped := 0
+	for _, msg := range msgs {
+		switch msg.Type {
+		case llm.TypeToolCall:
+			if msg.ToolID == "" {
+				dropped++
+				continue
+			}
+			if _, ok := resultIDs[msg.ToolID]; !ok {
+				dropped++
+				continue
+			}
+			if _, duplicate := seenCalls[msg.ToolID]; duplicate {
+				dropped++
+				continue
+			}
+			seenCalls[msg.ToolID] = struct{}{}
+			out = append(out, msg)
+
+		case llm.TypeToolResult:
+			if msg.ToolID == "" {
+				dropped++
+				continue
+			}
+			if _, ok := seenCalls[msg.ToolID]; !ok {
+				dropped++
+				continue
+			}
+			out = append(out, msg)
+
+		default:
+			out = append(out, msg)
+		}
+	}
+
+	return out, dropped
 }

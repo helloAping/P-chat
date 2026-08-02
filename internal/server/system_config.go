@@ -8,13 +8,14 @@ import (
 )
 
 type limitsResponse struct {
-	AutoCompactBuffer    int `json:"auto_compact_buffer"`
-	ToolResultExecCap    int `json:"tool_result_exec_cap"`
-	ToolResultReadCap    int `json:"tool_result_read_cap"`
-	ToolResultDefaultCap int `json:"tool_result_default_cap"`
-	PruneAfterRounds     int `json:"prune_after_rounds"`
-	MaxRounds            int `json:"max_rounds"`
-	MaxStoredMessages    int `json:"max_stored_messages"`
+	AutoCompactBuffer    int    `json:"auto_compact_buffer"`
+	ToolResultExecCap    int    `json:"tool_result_exec_cap"`
+	ToolResultReadCap    int    `json:"tool_result_read_cap"`
+	ToolResultDefaultCap int    `json:"tool_result_default_cap"`
+	PruneAfterRounds     int    `json:"prune_after_rounds"`
+	MaxRounds            int    `json:"max_rounds"`
+	TodoLongRunMode      string `json:"todo_long_run_mode"`
+	MaxStoredMessages    int    `json:"max_stored_messages"`
 }
 
 type subAgentResponse struct {
@@ -45,6 +46,7 @@ func limitsToResp(l config.LimitsConfig) limitsResponse {
 		ToolResultDefaultCap: l.ToolResultDefaultCap,
 		PruneAfterRounds:     l.PruneAfterRounds,
 		MaxRounds:            l.MaxRounds,
+		TodoLongRunMode:      string(config.NormalizeTodoLongRunMode(l.TodoLongRunMode)),
 		MaxStoredMessages:    l.MaxStoredMessages,
 	}
 }

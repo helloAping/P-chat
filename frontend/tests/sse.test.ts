@@ -2,12 +2,25 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  abortableDelay,
   consumeSSEStream,
   decodeStreamEvent,
   emitStreamEvent,
   parseSSEFrame,
+  shouldRetryStreamError,
+  streamErrorStatus,
   type StreamEventLike,
 } from '../src/api/sse.ts'
+
+test('abortableDelay resolves immediately when a retry wait is aborted', async () => {
+  const controller = new AbortController()
+  const started = Date.now()
+  const waiting = abortableDelay(2_000, controller.signal)
+  controller.abort()
+
+  assert.equal(await waiting, false)
+  assert.ok(Date.now() - started < 100, 'abort should not wait for the retry timer')
+})
 
 function readerFromChunks(chunks: string[]): ReadableStreamDefaultReader<Uint8Array> {
   const encoder = new TextEncoder()
@@ -49,6 +62,19 @@ test('emitStreamEvent isolates handler errors', () => {
   }
 })
 
+test('HTTP 409 stream conflicts are non-retryable', () => {
+  const conflict = new Error('stream: stream POST http://127.0.0.1/messages: HTTP 409: {"error":"a message is already being processed for this session"}')
+  const badGateway = new Error('stream: HTTP 502: Bad Gateway')
+  const network = new Error('stream stream: network gone')
+
+  assert.equal(streamErrorStatus(conflict), 409)
+  assert.equal(shouldRetryStreamError(conflict), false)
+  assert.equal(streamErrorStatus(badGateway), 502)
+  assert.equal(shouldRetryStreamError(badGateway), true)
+  assert.equal(streamErrorStatus(network), null)
+  assert.equal(shouldRetryStreamError(network), true)
+})
+
 test('consumeSSEStream handles split frames and skips DONE', async () => {
   const events: StreamEventLike[] = []
   await consumeSSEStream({
@@ -66,6 +92,45 @@ test('consumeSSEStream handles split frames and skips DONE', async () => {
     { type: 'content', content: 'hello', seq: 1 },
     { type: 'done', seq: 3 },
   ])
+})
+
+test('consumeSSEStream resolves as soon as the semantic done event arrives', async () => {
+  const encoder = new TextEncoder()
+  let reads = 0
+  const events: StreamEventLike[] = []
+  const reader = {
+    async read() {
+      reads += 1
+      if (reads === 1) {
+        return {
+          done: false,
+          value: encoder.encode('data: {"type":"tool","tool_name":"exec_command","tool_status":"ok"}\nid: 1\n\n'),
+        }
+      }
+      if (reads === 2) {
+        return {
+          done: false,
+          value: encoder.encode('data: {"type":"done"}\nid: 2\n\n'),
+        }
+      }
+      return new Promise<ReadableStreamReadResult<Uint8Array>>(() => {})
+    },
+  } as ReadableStreamDefaultReader<Uint8Array>
+
+  await Promise.race([
+    consumeSSEStream({
+      reader,
+      label: 'test',
+      onEvent: event => events.push(event),
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timed out waiting for semantic done')), 50)),
+  ])
+
+  assert.deepEqual(events, [
+    { type: 'tool', tool_name: 'exec_command', tool_status: 'ok', seq: 1 },
+    { type: 'done', seq: 2 },
+  ])
+  assert.equal(reads, 2)
 })
 
 test('consumeSSEStream reports the last observed seq when the stream drops', async () => {
@@ -96,4 +161,24 @@ test('consumeSSEStream reports the last observed seq when the stream drops', asy
   )
 
   assert.deepEqual(drop, { lastSeq: 9, reason: 'network gone' })
+})
+
+test('consumeSSEStream drops buffered events after cancellation', async () => {
+  const controller = new AbortController()
+  const events: StreamEventLike[] = []
+
+  await consumeSSEStream({
+    reader: readerFromChunks([
+      'data: {"type":"content","content":"first"}\nid: 1\n\n'
+        + 'data: {"type":"tool","tool_name":"late"}\nid: 2\n\n',
+    ]),
+    signal: controller.signal,
+    label: 'test',
+    onEvent: event => {
+      events.push(event)
+      controller.abort()
+    },
+  })
+
+  assert.deepEqual(events, [{ type: 'content', content: 'first', seq: 1 }])
 })

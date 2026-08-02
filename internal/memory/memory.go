@@ -17,9 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	openai "github.com/sashabaranov/go-openai"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/paths"
+	openai "github.com/sashabaranov/go-openai"
 	_ "modernc.org/sqlite"
 )
 
@@ -36,7 +36,7 @@ type Conversation struct {
 
 // Message is one entry in a conversation's history.
 type Message struct {
-	ID             int64     `json:"id"`
+	ID int64 `json:"id"`
 	// Seq is the per-conversation logical position
 	// (1..N within a session). Unlike `id` (a global
 	// AUTOINCREMENT that's never reused), seq survives
@@ -80,6 +80,16 @@ type Message struct {
 	IsArchived bool `json:"is_archived"`
 }
 
+// MessageIdentity is the immutable identity needed to validate a caller-
+// supplied message id before starting a new chat turn. The SQLite row id is
+// global, so callers must also check the conversation and role rather than
+// treating a duplicate INSERT OR IGNORE as successful delivery.
+type MessageIdentity struct {
+	ConversationID string
+	Role           string
+	Content        string
+}
+
 // Summary records an LLM-generated compression of a range of messages.
 type Summary struct {
 	ConversationID string    `json:"conversation_id"`
@@ -102,7 +112,7 @@ type SearchResult struct {
 // Store is the central accessor for the SQLite-backed memory database.
 type Store struct {
 	db         *sql.DB
-	dbPath     string // filesystem path, set by OpenAt (empty for in-memory)
+	dbPath     string      // filesystem path, set by OpenAt (empty for in-memory)
 	closed     atomic.Bool // set by Close; readers reject when true
 	mu         sync.Mutex
 	currentID  string
@@ -302,6 +312,29 @@ func (s *Store) NewConversation() (string, error) {
 	return id, nil
 }
 
+// EnsureConversation makes sure a conversation id exists.
+// EnsureConversation creates the row if it is missing and optionally
+// seeds the title without overwriting a non-empty existing title.
+func (s *Store) EnsureConversation(id, title string) error {
+	if id == "" {
+		return fmt.Errorf("conversation id is required")
+	}
+	now := time.Now().Unix()
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO conversations(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+		id, title, now, now,
+	); err != nil {
+		return err
+	}
+	if title != "" {
+		_, _ = s.db.Exec(
+			`UPDATE conversations SET title = CASE WHEN title IS NULL OR title = '' THEN ? ELSE title END, updated_at = ? WHERE id = ?`,
+			title, now, id,
+		)
+	}
+	return nil
+}
+
 // AddMessage records a message in the current conversation. Writes are
 // buffered and flushed asynchronously; call Flush() to force.
 func (s *Store) AddMessage(msg llm.Message) {
@@ -488,6 +521,31 @@ func (s *Store) AddChatMessageToWithID(convID string, msg llm.ChatMessage, rowID
 	}
 }
 
+// FindMessageIdentity returns the durable row identity for rowID. It flushes
+// buffered writes first so a retry observes the user row accepted by the
+// preceding request instead of starting a second LLM turn.
+func (s *Store) FindMessageIdentity(rowID int64) (MessageIdentity, bool, error) {
+	if rowID <= 0 {
+		return MessageIdentity{}, false, nil
+	}
+	if err := s.Flush(); err != nil {
+		return MessageIdentity{}, false, err
+	}
+
+	var identity MessageIdentity
+	err := s.db.QueryRow(
+		`SELECT conversation_id, role, content FROM messages WHERE id = ?`,
+		rowID,
+	).Scan(&identity.ConversationID, &identity.Role, &identity.Content)
+	if err == sql.ErrNoRows {
+		return MessageIdentity{}, false, nil
+	}
+	if err != nil {
+		return MessageIdentity{}, false, err
+	}
+	return identity, true, nil
+}
+
 // GetChatMessages returns the current conversation's history as
 // protocol-agnostic ChatMessage values. It handles both the new
 // metadata format and the legacy format.
@@ -657,14 +715,14 @@ func (s *Store) GetChatMessagesWithMetaPage(convID string, beforeID int64, limit
 	var rev []row
 	for rows.Next() {
 		var (
-			id                    int64
-			role, content         string
-			metaStr               sql.NullString
-			created               int64
-			msgType, submitToLLM  int
-			seq                   sql.NullInt64
-			regenGroup            sql.NullString
-			isArchived            int
+			id                   int64
+			role, content        string
+			metaStr              sql.NullString
+			created              int64
+			msgType, submitToLLM int
+			seq                  sql.NullInt64
+			regenGroup           sql.NullString
+			isArchived           int
 		)
 		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq, &regenGroup, &isArchived); err != nil {
 			break
@@ -764,14 +822,14 @@ func (s *Store) GetChatMessagesWithMetaPageBySeq(convID string, beforeSeq int64,
 	var rev []row
 	for rows.Next() {
 		var (
-			id                    int64
-			role, content         string
-			metaStr               sql.NullString
-			created               int64
-			msgType, submitToLLM  int
-			seq                   sql.NullInt64
-			regenGroup            sql.NullString
-			isArchived            int
+			id                   int64
+			role, content        string
+			metaStr              sql.NullString
+			created              int64
+			msgType, submitToLLM int
+			seq                  sql.NullInt64
+			regenGroup           sql.NullString
+			isArchived           int
 		)
 		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq, &regenGroup, &isArchived); err != nil {
 			break
@@ -1355,9 +1413,9 @@ func (s *Store) GetMessages() []llm.Message {
 	var out []llm.Message
 	for rows.Next() {
 		var (
-			id              int64
-			role, content   string
-			metadata        sql.NullString
+			id            int64
+			role, content string
+			metadata      sql.NullString
 		)
 		if err := rows.Scan(&id, &role, &content, &metadata); err != nil {
 			return out
@@ -1454,17 +1512,17 @@ func (s *Store) GetMessagesWithMeta() ([]llm.Message, []string, []int64) {
 	defer rows.Close()
 
 	type row struct {
-		msg      llm.Message
-		meta     string
-		created  int64
+		msg     llm.Message
+		meta    string
+		created int64
 	}
 	var rev []row
 	for rows.Next() {
 		var (
-			id        int64
+			id            int64
 			role, content string
-			metadata  sql.NullString
-			created   int64
+			metadata      sql.NullString
+			created       int64
 		)
 		if err := rows.Scan(&id, &role, &content, &metadata, &created); err != nil {
 			break
@@ -1617,10 +1675,10 @@ func (s *Store) GetMessagesFull() []MessageFull {
 	var rev []row
 	for rows.Next() {
 		var (
-			id        int64
+			id            int64
 			role, content string
-			metadata  sql.NullString
-			created   int64
+			metadata      sql.NullString
+			created       int64
 		)
 		if err := rows.Scan(&id, &role, &content, &metadata, &created); err != nil {
 			break
@@ -1849,10 +1907,10 @@ func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
 	var rowsList []row
 	for rows.Next() {
 		var (
-			id        int64
+			id            int64
 			role, content string
-			metadata  sql.NullString
-			created   int64
+			metadata      sql.NullString
+			created       int64
 		)
 		if err := rows.Scan(&id, &role, &content, &metadata, &created); err != nil {
 			break
@@ -2176,9 +2234,9 @@ func (s *Store) ForkConversation(sourceConvID string, beforeID int64) (*Conversa
 	}
 
 	type row struct {
-		role, content, meta         string
-		created                     int64
-		msgType, submitToLLM        int
+		role, content, meta  string
+		created              int64
+		msgType, submitToLLM int
 		// isArchived at fork source. We do NOT copy the
 		// regen_group_id from the source: a fork is its own
 		// conversation with its own regenerate history
@@ -2488,14 +2546,14 @@ func (s *Store) ListSiblings(convID, groupID string) ([]llm.ChatMessage, []strin
 	var rev []row
 	for rows.Next() {
 		var (
-			id                    int64
-			role, content         string
-			metaStr               sql.NullString
-			created               int64
-			msgType, submitToLLM  int
-			seq                   sql.NullInt64
-			regenGroup            sql.NullString
-			isArchived            int
+			id                   int64
+			role, content        string
+			metaStr              sql.NullString
+			created              int64
+			msgType, submitToLLM int
+			seq                  sql.NullInt64
+			regenGroup           sql.NullString
+			isArchived           int
 		)
 		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM, &seq, &regenGroup, &isArchived); err != nil {
 			break
@@ -2571,8 +2629,8 @@ func (s *Store) ActivateSibling(convID, groupID string, activeID int64) error {
 	// row archived" would still fire — and that's wrong if
 	// activeID is a row from a different group).
 	var (
-		rowConv     string
-		rowGroup    sql.NullString
+		rowConv  string
+		rowGroup sql.NullString
 	)
 	err := s.db.QueryRow(
 		`SELECT conversation_id, regen_group_id FROM messages WHERE id = ?`,
@@ -2696,11 +2754,11 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 // dropped on every undo:
 //   - msg_type     → restored rows defaulted to 0 (MsgTypeText)
 //   - submit_to_llm → restored rows defaulted to 1 (the original
-//                     intent was the opposite for some categories,
-//                     e.g. thinking is submit_to_llm=0 and
-//                     tool_result for exec_command is also 0)
+//     intent was the opposite for some categories,
+//     e.g. thinking is submit_to_llm=0 and
+//     tool_result for exec_command is also 0)
 //   - seq          → restored rows got NULL seq, breaking the
-//                    new seq-based cursor (migration 8)
+//     new seq-based cursor (migration 8)
 //
 // Now we restore all of them. The caller (handler
 // UndoRollback) populates these from the MessageResponse
@@ -2869,22 +2927,22 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 		created int64
 	}
 	var rev []row
-		for rows.Next() {
-			var (
-				id                    int64
-				role, content         string
-				metaStr               sql.NullString
-				created               int64
-				msgType, submitToLLM  int
-			)
-			if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM); err != nil {
-				break
-			}
-			meta := ""
-			if metaStr.Valid {
-				meta = metaStr.String
-			}
-			msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
+	for rows.Next() {
+		var (
+			id                   int64
+			role, content        string
+			metaStr              sql.NullString
+			created              int64
+			msgType, submitToLLM int
+		)
+		if err := rows.Scan(&id, &role, &content, &metaStr, &created, &msgType, &submitToLLM); err != nil {
+			break
+		}
+		meta := ""
+		if metaStr.Valid {
+			meta = metaStr.String
+		}
+		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
 			rev = append(rev, row{msg: m, meta: meta, created: created})
 		}
@@ -3075,12 +3133,12 @@ func limitOrHuge(n int) int {
 
 // ConversationTokenStats holds aggregated token usage for one conversation.
 type ConversationTokenStats struct {
-	ConversationID    string  `json:"conversation_id"`
-	ConversationTitle string  `json:"conversation_title"`
-	TokensIn          int     `json:"tokens_in"`
-	TokensOut         int     `json:"tokens_out"`
-	MsgCount          int     `json:"msg_count"`
-	UpdatedAt         int64   `json:"updated_at"`
+	ConversationID    string `json:"conversation_id"`
+	ConversationTitle string `json:"conversation_title"`
+	TokensIn          int    `json:"tokens_in"`
+	TokensOut         int    `json:"tokens_out"`
+	MsgCount          int    `json:"msg_count"`
+	UpdatedAt         int64  `json:"updated_at"`
 }
 
 // TokenStats scans messages metadata for assistant messages with

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -130,6 +132,35 @@ func TestHealth(t *testing.T) {
 	}
 	if body["status"] != "ok" {
 		t.Errorf("status = %v, want ok", body["status"])
+	}
+}
+
+func TestClearTodosClearsMemoryAndSQLite(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, err := s.store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tool.SetSessionTodos(sessionID, nil) })
+
+	dbTodos := []memory.TodoItem{{ID: "1", Content: "unfinished", Status: "pending"}}
+	if err := s.store.SaveTodos(sessionID, dbTodos); err != nil {
+		t.Fatal(err)
+	}
+	tool.SetSessionTodos(sessionID, []tool.TodoItem{{ID: "1", Content: "unfinished", Status: "pending"}})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/"+sessionID+"/todos", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got := tool.GetSessionTodos(sessionID); len(got) != 0 {
+		t.Fatalf("in-memory todos = %#v, want empty", got)
+	}
+	if got := s.store.LoadTodos(sessionID); len(got) != 0 {
+		t.Fatalf("persisted todos = %#v, want empty", got)
 	}
 }
 
@@ -539,6 +570,96 @@ func TestSendMessage_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestSendMessage_DuplicateClientMessageIDDoesNotStartAnotherTurn(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const clientMsgID int64 = 1_730_000_000_001_123
+	store.AddChatMessageToWithID(convID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "already accepted",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	}, clientMsgID)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	before := store.CountChatMessages(convID)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/sessions/"+convID+"/messages",
+		bytes.NewBufferString(`{"message":"already accepted","client_msg_id":1730000000001123}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "duplicate_client_message" {
+		t.Fatalf("code = %q, want duplicate_client_message", body.Code)
+	}
+	if got := store.CountChatMessages(convID); got != before {
+		t.Fatalf("message count = %d, want %d; duplicate request must not start a new turn", got, before)
+	}
+}
+
+func TestSendMessage_ClientMessageIDRejectsDifferentPayload(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const clientMsgID int64 = 1_730_000_000_001_124
+	store.AddChatMessageToWithID(convID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "original payload",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	}, clientMsgID)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/sessions/"+convID+"/messages",
+		bytes.NewBufferString(`{"message":"different payload","client_msg_id":1730000000001124}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "client_message_id_conflict" {
+		t.Fatalf("code = %q, want client_message_id_conflict", body.Code)
+	}
+}
+
 func TestSendMessage_NotFound(t *testing.T) {
 	s, _ := newTestServer(t)
 	w := httptest.NewRecorder()
@@ -588,6 +709,122 @@ func TestSendMessage_StreamsSSE(t *testing.T) {
 	// We just want to confirm the request was accepted; with no
 	// real LLM the body will likely be empty.
 	t.Logf("streaming completed; status would be checked via real client")
+}
+
+// TestSendMessage_TurnTimeoutEmitsTerminalError is the regression
+// test for the 30-minute stuck turns: when the upstream LLM hangs
+// (accepts the connection then stalls), the per-turn hard deadline
+// must terminate the SSE stream with a visible error frame instead
+// of closing silently — the client would otherwise treat the
+// truncated stream as a successful turn.
+func TestSendMessage_TurnTimeoutEmitsTerminalError(t *testing.T) {
+	// A listener that accepts the connection and then holds it open
+	// without ever responding — the exact "stalled upstream" shape
+	// behind the 503-then-hang incident in server-debug.log.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				// Read the request headers, then go silent.
+				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				_ = c.SetReadDeadline(time.Time{})
+				<-time.After(30 * time.Second)
+				_ = c.Close()
+			}(conn)
+		}
+	}()
+
+	// Seed a config pointing at the stalled listener with a 2-second
+	// turn cap.
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "http://`+ln.Addr().String()+`/v1"`, 1)
+	var cfgMap map[string]any
+	if err := json.Unmarshal([]byte(cfgJSON), &cfgMap); err != nil {
+		t.Fatal(err)
+	}
+	cfgMap["limits"] = map[string]any{"max_turn_seconds": 2}
+	cfgJSONBytes, err := json.Marshal(cfgMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, cfg := newTestServerWithConfig(t, string(cfgJSONBytes))
+	if cfg.Limits.MaxTurnSeconds != 2 {
+		t.Fatalf("MaxTurnSeconds = %d, want 2", cfg.Limits.MaxTurnSeconds)
+	}
+
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/sessions", nil))
+	var created SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&created)
+
+	w2 := newStreamRecorder()
+	body := bytes.NewBufferString(`{"message":"hi","style":"tech"}`)
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/messages", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }()
+		s.engine.ServeHTTP(w2, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("streaming handler hung past the turn deadline")
+	}
+
+	frames := w2.Body.String()
+	if !strings.Contains(frames, "turn_timeout") && !strings.Contains(frames, "回合超出最长执行时间") {
+		t.Fatalf("expected a terminal turn_timeout error frame, got: %q", frames)
+	}
+}
+
+func TestLoadHistoryForSend_BoundsUncompressedHistory(t *testing.T) {
+	s, cfg := newTestServer(t)
+	s.handler.SetSummarizer(nil)
+	cfg.Limits.MaxStoredMessages = 5
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCurrent(convID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		store.AddChatMessageTo(convID, llm.ChatMessage{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     fmt.Sprintf("msg-%02d", i),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	hist, summary := s.handler.loadHistoryForSend(context.Background(), convID, "cs", "doubao-seed-2.0-lite")
+	if summary != "" {
+		t.Fatalf("summary = %q, want empty when summarizer is unavailable", summary)
+	}
+	if len(hist) != 5 {
+		t.Fatalf("history len = %d, want bounded 5", len(hist))
+	}
+	if hist[0].Content != "msg-07" || hist[len(hist)-1].Content != "msg-11" {
+		t.Fatalf("history range = %q..%q, want latest msg-07..msg-11", hist[0].Content, hist[len(hist)-1].Content)
+	}
 }
 
 // ====================================================================
@@ -771,8 +1008,105 @@ func TestPatchSession_ProviderOnly(t *testing.T) {
 		t.Errorf("Provider = %q, want cs", got.Provider)
 	}
 	// Model resets to cs's default (because we didn't pin one).
-	if got.Model == "" {
-		t.Error("Model should default to cs's EffectiveModel, got empty")
+	if got.Model != "doubao-seed-2.0-lite" {
+		t.Errorf("Model = %q, want doubao-seed-2.0-lite", got.Model)
+	}
+}
+
+func TestPatchSession_PermissionLevelUpdatesLiveToolContext(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, "")
+	t.Cleanup(func() { tool.SetSessionPermissionLevel(sess.ID, "") })
+
+	w := patchSession(t, s, sess.ID, `{"permission_level":"full"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := tool.SessionPermissionLevel(sess.ID); got != tool.PermissionFull {
+		t.Fatalf("live permission = %q, want %q", got, tool.PermissionFull)
+	}
+
+	w = patchSession(t, s, sess.ID, `{"permission_level":"ask"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := tool.SessionPermissionLevel(sess.ID); got != tool.PermissionAsk {
+		t.Fatalf("live permission after ask = %q, want %q", got, tool.PermissionAsk)
+	}
+}
+
+func TestConfirmResponseAlwaysPromotesSessionPermission(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, "")
+	t.Cleanup(func() { tool.SetSessionPermissionLevel(sess.ID, "") })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan tool.ConfirmResponse, 1)
+	go func() {
+		resp, err := tool.WaitForConfirmResponse(ctx, sess.ID, tool.ConfirmRequest{
+			ToolName:  "exec_command",
+			Args:      `{"command":"npm run dev"}`,
+			RiskLevel: "high",
+		})
+		if err != nil {
+			t.Errorf("WaitForConfirmResponse returned error: %v", err)
+			return
+		}
+		done <- resp
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		"POST",
+		"/api/v1/sessions/"+sess.ID+"/confirm-response",
+		bytes.NewBufferString(`{"action":"always"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := tool.SessionPermissionLevel(sess.ID); got != tool.PermissionFull {
+		t.Fatalf("live permission = %q, want %q", got, tool.PermissionFull)
+	}
+
+	select {
+	case resp := <-done:
+		if !resp.Approved || resp.Action != tool.ConfirmActionAlways {
+			t.Fatalf("response = %+v, want approved always", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for confirm response")
+	}
+}
+
+func TestSessionModel_FallsBackWhenCachedModelBelongsToDifferentProvider(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o"}`)
+	h := s.Handler()
+
+	h.metaMu.Lock()
+	meta := h.meta[sess.ID]
+	meta.Provider = "cs"
+	meta.Model = "gpt-4o"
+	h.meta[sess.ID] = meta
+	h.metaMu.Unlock()
+
+	if got := h.sessionModel(sess.ID, "cs"); got != "doubao-seed-2.0-lite" {
+		t.Fatalf("sessionModel = %q, want cs default", got)
+	}
+
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if got.Provider != "cs" || got.Model != "doubao-seed-2.0-lite" {
+		t.Fatalf("response meta = %+v, want provider=cs model=doubao-seed-2.0-lite", got)
 	}
 }
 
@@ -934,7 +1268,7 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := 	New(cfg, agt, store, styleMgr, tools, nil)
+	srv1 := New(cfg, agt, store, styleMgr, tools, nil)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro"}`)
 	if err := store.Close(); err != nil {
@@ -994,12 +1328,12 @@ func TestDeleteSession_DropsCachedMeta(t *testing.T) {
 // exercise is:
 //
 //  1. PATCH a session with {style:"guofeng"}.
- 	//  2. GET /sessions (the list) reports style=guofeng for that id.
- 	//  3. After a server "restart" (new handler on the same store),
- 	//     GET /sessions/:id still reports style=guofeng — proving
- 	//     the SessionResponse has the resolved value (not the raw
- 	//     metadata blob) and survives the hot-path cache being
- 	//     rebuilt from disk.
+//  2. GET /sessions (the list) reports style=guofeng for that id.
+//  3. After a server "restart" (new handler on the same store),
+//     GET /sessions/:id still reports style=guofeng — proving
+//     the SessionResponse has the resolved value (not the raw
+//     metadata blob) and survives the hot-path cache being
+//     rebuilt from disk.
 func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
@@ -1026,7 +1360,7 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	tools := tool.NewRegistry()
 	tool.RegisterBuiltin(tools)
 	agt := agent.New(cfg, llmClient, styleMgr, store, tools)
-	srv1 := 	New(cfg, agt, store, styleMgr, tools, nil)
+	srv1 := New(cfg, agt, store, styleMgr, tools, nil)
 
 	sess := createSessionPOST(t, srv1, `{"provider":"cs","model":"doubao-pro","style":"tech"}`)
 

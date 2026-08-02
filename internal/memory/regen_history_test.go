@@ -445,9 +445,11 @@ func TestRegenGroup_BackfillOnExistingRows(t *testing.T) {
 	if _, err := s.db.Exec(`ALTER TABLE messages DROP COLUMN is_archived`); err != nil {
 		t.Fatal(err)
 	}
-	// Mark migration 9 as not-applied so a re-run
-	// fires its Up.
-	if _, err := s.db.Exec(`DELETE FROM schema_migrations WHERE version = 9`); err != nil {
+	// Mark migration 9 (and any later version) as
+	// not-applied so a re-run fires its Up. Deleting only
+	// the v9 row would leave v10 recorded as the latest,
+	// so a reopen would never re-run v9.
+	if _, err := s.db.Exec(`DELETE FROM schema_migrations WHERE version >= 9`); err != nil {
 		t.Fatal(err)
 	}
 

@@ -30,8 +30,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 func (h *Handler) ListSessions(c *gin.Context) {
@@ -145,12 +147,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	}
 	model := req.Model
 	if model == "" {
-		for _, p := range h.getCfg().LLM.Providers {
-			if p.Name == provider {
-				model = p.EffectiveModel()
-				break
-			}
-		}
+		model = h.defaultModelForProvider(provider)
 	} else if !h.validModel(provider, model) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model %q not found under provider %q", model, provider)})
 		return
@@ -223,6 +220,10 @@ func (h *Handler) PermanentDeleteSession(c *gin.Context) {
 	h.metaMu.Lock()
 	delete(h.meta, id)
 	h.metaMu.Unlock()
+	// Permanent deletion must also release the process-local todo cache;
+	// otherwise every deleted session would retain its last active plan until
+	// process exit even though the durable rows are gone.
+	tool.SetSessionTodosMemory(id, nil)
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }
 
@@ -644,20 +645,26 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 
 	// Validate provider (if specified) before touching meta.
 	provider := h.sessionProvider(id)
+	model := ""
 	if req.Provider != nil {
 		if !h.validProvider(*req.Provider) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unknown provider %q", *req.Provider)})
 			return
 		}
+		previousProvider := provider
 		provider = *req.Provider
+		if provider != previousProvider && req.Model == nil {
+			model = h.defaultModelForProvider(provider)
+		}
 	}
 	if req.Model != nil {
 		if !h.validModel(provider, *req.Model) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model %q not found under provider %q", *req.Model, provider)})
 			return
 		}
+		model = *req.Model
 	}
-	h.setSessionMeta(id, deref(req.Style), provider, deref(req.Model))
+	h.setSessionMeta(id, deref(req.Style), provider, model)
 	if req.WorkMode != nil {
 		h.setSessionMetaWorkMode(id, *req.WorkMode)
 	}
@@ -669,12 +676,7 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": `permission_level must be "ask", "auto", or "full"`})
 			return
 		}
-		h.metaMu.Lock()
-		m := h.meta[id]
-		m.PermissionLevel = level
-		h.meta[id] = m
-		h.metaMu.Unlock()
-		h.persistSessionMeta(id, m)
+		h.setSessionPermissionLevel(id, level)
 	}
 
 	// Handle vector_store as a first-class conversation column.
@@ -703,6 +705,15 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		m.AutoContinue = req.AutoContinue
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
+	if req.TodoLongRunMode != nil {
+		mode := config.NormalizeTodoLongRunMode(*req.TodoLongRunMode)
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.TodoLongRunMode = &mode
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)

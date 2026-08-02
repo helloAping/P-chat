@@ -118,3 +118,32 @@ func TestTraceID_AllowsHeaderInCORS(t *testing.T) {
 		t.Errorf("Access-Control-Allow-Headers = %q, want to include X-Trace-Id", allowed)
 	}
 }
+
+func TestCORS_AllowsWailsDirectBackendStream(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodOptions, srv.URL+"/api/v1/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Origin", "http://wails.localhost")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	req.Header.Set("Access-Control-Request-Headers", "Content-Type,X-Trace-Id")
+	req.Header.Set("Access-Control-Request-Private-Network", "true")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "http://wails.localhost" {
+		t.Errorf("Access-Control-Allow-Origin = %q", got)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Private-Network"); got != "true" {
+		t.Errorf("Access-Control-Allow-Private-Network = %q, want true", got)
+	}
+}

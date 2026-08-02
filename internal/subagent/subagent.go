@@ -126,6 +126,12 @@ type Default struct {
 	// to its own UI stream. When nil, sub-agent events are not surfaced
 	// to the parent (the parent only sees the final result).
 	OnEvent func(chunk agent.ChatStreamChunk)
+
+	// runChat, when non-nil, replaces the internal agent's
+	// ChatWithTools stream. Tests inject a synthetic stream here
+	// (no real LLM client needed); production leaves it nil so the
+	// freshly-built sub-agent agent runs its own ReAct loop.
+	runChat func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk
 }
 
 // SubAgentToolFilter is a subset of config.SubAgentConfig that the
@@ -149,8 +155,42 @@ func tryForward(chunk agent.ChatStreamChunk, onEvent func(agent.ChatStreamChunk)
 	onEvent(chunk)
 }
 
-// Cache stores recent sub-agent results keyed by a hash of
-// (description, style, provider). Safe for concurrent use.
+// newSubAgentStore 为一次子代理运行创建独立的进程内持久化。
+// It must never use memory.Open, which targets the user's global chat
+// database.
+func newSubAgentStore() (*memory.Store, error) {
+	return memory.OpenAt(":memory:", 100)
+}
+
+// subAgentCacheKey 将所有影响子代理执行的输入压缩为稳定缓存 identity。
+// Every execution-affecting field is included so cache hits cannot cross
+// sub-agent type, model, prompt, project, or tool scope.
+func subAgentCacheKey(
+	req Request,
+	s style.Style,
+	provider, subType, model, toolScope string,
+) string {
+	h := sha256.New()
+	for _, value := range []string{
+		req.TaskID,
+		req.Description,
+		string(s),
+		provider,
+		subType,
+		model,
+		req.PromptOverride,
+		req.ProjectRoot,
+		toolScope,
+	} {
+		h.Write([]byte(value))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// Cache 保存以不透明执行 identity 索引的近期子代理结果。
+// Cache stores recent results keyed by an opaque execution identity. Safe for
+// concurrent use.
 type Cache struct {
 	mu      sync.Mutex
 	ttl     time.Duration
@@ -465,6 +505,15 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 				// Normal content/thinking/tool deltas stay non-blocking
 				// — losing one delta is a small visual hiccup, while
 				// losing the close event is a state-machine corruption.
+				// The 2s cap is a deliberate ceiling, NOT a value to
+				// grow. This send runs synchronously inside Run(), which
+				// the parent agent's toolsDone wait is blocked on; if it
+				// waited unbounded, the parent's `done` event would be
+				// delayed by the same amount and the "task 一直执行中"
+				// symptom would get WORSE. When the event is dropped
+				// here, the frontend's done-triggered safety net
+				// (chat.ts force-closes start-status sub_agent parts)
+				// still recovers the card once the parent turn ends.
 				isClose := c.SubAgentStatus != "" && c.SubAgentStatus != "start"
 				if isClose {
 					select {
@@ -631,18 +680,15 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		}
 	}
 
-	// Cache hit? Key on (task_id, subagent_type, model) when
-	// task_id is provided, else fall back to the legacy
-	// (description, style, provider) key. task_id takes
-	// priority because it is the explicit resume signal.
-	if d.Cache != nil && req.TaskID != "" {
-		cacheKey := req.TaskID + "|" + subType + "|" + modelOv + "|" + string(s) + "|" + prov
-		if hit, ok := d.Cache.GetByKey(cacheKey); ok {
-			return hit, nil
-		}
+	// 在构成缓存 identity 前解析有效模型。
+	// A request override wins, followed by the sub-agent definition and parent
+	// model.
+	chatModel := modelOv
+	if chatModel == "" {
+		chatModel = d.ParentProviderModel
 	}
-	if hit, ok := d.Cache.Get(req.Description, s, prov); ok {
-		return hit, nil
+	if chatModel == "" {
+		chatModel = prov
 	}
 
 	// Emit a single synthetic "start" event for the parent's UI so it
@@ -674,47 +720,50 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 	defer cancel()
 
 	// Build a sub-agent's tool registry. Three layers of filter
-	// (in priority order, each can further narrow):
+	// (in priority order):
 	//   1. Hard exclusions: task, recall (recursion / coordination).
-	//   2. Global config allow/deny list (`subagent.allowed_tools` /
-	//      `subagent.denied_tools` in ~/.p-chat/config.json).
-	//   3. Per-agent whitelist (agentInfo.Tools). When non-empty,
-	//      only those tools are exposed (still minus the hard
-	//      exclusions).
-	subTools := tool.NewRegistry()
-	parentAllowed := func(name string) bool { return true }
-	if d.Cfg != nil {
-		parentAllowed = d.Cfg.SubAgent.ToolAllowed
-	}
-	for _, name := range d.ParentTools.Names() {
-		// Sub-agents can't spawn sub-agents or call recall themselves;
-		// both are coordination tools that should stay at the top level.
-		if name == "task" || name == "recall" {
-			continue
+	//   2. Per-agent whitelist (agentInfo.Tools). When non-empty, ONLY
+	//      those tools are exposed (minus the hard exclusions). A tool
+	//      on the whitelist is explicitly authorized by the agent
+	//      author and bypasses the global allow/deny — e.g. explore
+	//      lists exec_command for read-only shell use, and the global
+	//      deny must not veto it (that combo made explore spin on a
+	//      tool it could never call until timeout).
+	//   3. Global config allow/deny (`subagent.allowed_tools` /
+	//      `subagent.denied_tools` in ~/.p-chat/config.json). Applies
+	//      only to tools NOT on a per-agent whitelist (general-purpose,
+	//      custom agents with an empty whitelist).
+	subTools := filterSubAgentTools(d.ParentTools, agentKnown, agentInfo.Tools, func(name string) bool {
+		if d.Cfg != nil {
+			return d.Cfg.SubAgent.ToolAllowed(name)
 		}
-		if !parentAllowed(name) {
-			continue
-		}
-		// Per-agent whitelist (overrides global config).
-		if agentKnown && len(agentInfo.Tools) > 0 {
-			ok := false
-			for _, t := range agentInfo.Tools {
-				if t == name {
-					ok = true
-					break
-				}
-			}
-			if !ok {
-				continue
-			}
-		}
-		if tt, hh, ok := d.ParentTools.Lookup(name); ok {
-			subTools.Register(tt, hh)
-		}
+		return true
+	})
+	cacheReq := req
+	cacheReq.PromptOverride = promptOv
+	cacheKey := subAgentCacheKey(
+		cacheReq,
+		s,
+		prov,
+		subType,
+		chatModel,
+		strings.Join(subTools.Names(), "\x00"),
+	)
+	if hit, ok := d.Cache.GetByKey(cacheKey); ok {
+		return hit, nil
 	}
 
-	// Fresh in-memory store; no shared history with the parent.
-	store, _ := memory.Open(100)
+	// 子代理使用进程内 SQLite，不共享父会话历史，也不触碰全局数据库。
+	// Each run owns an ephemeral SQLite store for its full lifetime.
+	store, err := newSubAgentStore()
+	if err != nil {
+		return Result{}, fmt.Errorf("open subagent store: %w", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Printf("[subagent] close ephemeral store: %v", err)
+		}
+	}()
 
 	subAgent := agent.New(d.Cfg, d.LLM, d.StyleMgr, store, subTools)
 
@@ -725,31 +774,25 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		subAgent.SetSummarizer(sm)
 	}
 
-	// Resolve the model string. Order of priority:
-	//   1. Per-request model override (Args.Model)
-	//   2. Per-agent model (Registry entry's Model)
-	//   3. Parent's specific provider/model
-	//   4. Parent's provider name (legacy fallback)
-	chatModel := modelOv
-	if chatModel == "" {
-		chatModel = d.ParentProviderModel
-	}
-	if chatModel == "" {
-		chatModel = prov
-	}
-
 	chatReq := buildSubAgentChatRequest(req, s, prov, chatModel, promptOv, subType, color)
 
 	start := time.Now()
-	stream := subAgent.ChatWithTools(runCtx, chatReq)
+	chat := d.runChat
+	if chat == nil {
+		chat = subAgent.ChatWithTools
+	}
+	stream := chat(runCtx, chatReq)
 
 	var (
-		content             string
-		contentProduced     bool // any non-empty Content chunk seen?
-		tokensIn, tokensOut int
-		rounds              int
-		failed              bool
-		failureReason       string
+		content          string
+		contentProduced  bool // any non-empty Content chunk seen?
+		tokensIn         int
+		tokensOut        int
+		rounds           int
+		failed           bool
+		failureReason    string
+		streamDoneChunk  bool // saw a Done=true chunk?
+		streamErrorChunk bool // saw an Error chunk?
 	)
 	for chunk := range stream {
 		// Tag every chunk as sub-agent so the parent can route it
@@ -766,6 +809,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		chunk.SubAgentTaskID = req.TaskID
 
 		if chunk.Error != "" {
+			streamErrorChunk = true
 			// Two flavours of error:
 			//
 			//   * HARD failure (no content produced): the
@@ -838,6 +882,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		// below (sub_agent_ok / sub_agent_err), not the
 		// internal Done bookmark.
 		if chunk.Done {
+			streamDoneChunk = true
 			break
 		}
 
@@ -849,21 +894,54 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		tryForward(chunk, d.OnEvent)
 	}
 
-	// Emit the closing status event. The parent UI uses this
-	// to flip the card from "running" to "ok" / "err" and
-	// to collapse / stop the spinner.
+	// ★ 静默关闭检测：子代理的 stream 可能在"没有 Done、没有 Error"的
+	// 情况下直接关闭（channel close）。这发生在子代理的 ReAct 循环在
+	// 工具执行等待中（agent.go toolsDone 段）或 LLM 重试退避期间被
+	// runCtx 超时 / 父级取消打断时——那两个出口只 `return`，不产生
+	// 任何事件。若不处理，这里会把"被超时打断"误判成"成功完成"
+	// （failed 保持 false），向上返回空 content + sub_agent_ok，
+	// 父 LLM 拿到 `(sub-agent returned no content)` 且无错误标记，
+	// 于是主对话收不到汇总、永远等不到有效结果。
+	//
+	// Silent-close detection: the sub-agent stream can close without
+	// a Done or Error chunk when its ReAct loop is cancelled
+	// mid-tool-execution or during the LLM retry backoff by the
+	// runCtx timeout or a parent cancel — both exits plain `return`
+	// with no event. Without this, the timeout is misreported as
+	// success (empty content + sub_agent_ok) and the parent LLM —
+	// seeing `(sub-agent returned no content)` with no error flag —
+	// has nothing to summarise, so the main conversation stalls.
 	status := "ok"
-	if failed {
+	switch {
+	case !streamDoneChunk && !streamErrorChunk:
+		// 流被静默关闭（超时 / 中断）。无论是否有部分输出都按失败处理：
+		// 有输出 → 卡片显示部分内容但标记 err，父级拿到失败错误而非
+		// 自信的部分总结；无输出 → 同样是硬失败。父级必须知道子代理
+		// 没有完成，否则它会基于不完整结果生成"成功"的汇总。
+		//
+		// Silent close = the sub-agent was killed by timeout or a
+		// cancel; it did NOT finish. Always a failure — with partial
+		// content the card keeps the partial text but the parent gets
+		// a failure error instead of a confident summary of work that
+		// was never completed.
 		status = "err"
+		failed = true
+		if contentProduced {
+			failureReason = fmt.Sprintf("sub-agent stream ended without completion (timeout or interrupted after %d bytes of output)", len(content))
+		} else {
+			failureReason = "sub-agent stream ended without completion (timeout or interrupted before producing output)"
+		}
+	case failed:
 		// Hard failure: surface the underlying error so the
 		// GUI can show "失败: <reason>" in the card header.
-	} else if contentProduced && failureReason != "" {
+		status = "err"
+	case contentProduced && failureReason != "":
 		// Soft failure: the LLM produced content but the
-		// stream ended with an error. We changed `failed`
-		// to false above (per the soft-fail rule) but the
-		// UI should still know what happened at the tail
-		// so it can show a hint like "completed with a
-		// tail-end hiccup" instead of a clean "已完成".
+		// stream ended with an error. We keep `failed`
+		// false (per the soft-fail rule) but the UI should
+		// still know what happened at the tail so it can
+		// show a hint like "completed with a tail-end
+		// hiccup" instead of a clean "已完成".
 		failureReason = "tail-end hiccup (output still returned): " + failureReason
 	}
 	if d.OnEvent != nil {
@@ -887,6 +965,9 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		// return without a result. The tool layer will turn
 		// the lack of result into a "sub-agent failed"
 		// CallResult.
+		if failureReason != "" {
+			return Result{}, fmt.Errorf("%s", failureReason)
+		}
 		return Result{}, fmt.Errorf("sub-agent stream errored")
 	}
 
@@ -910,15 +991,15 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		TaskID:        req.TaskID,
 	}
 
-	// Store in cache. task_id path uses a stable key so two
-	// calls with the same task_id return the same result even
-	// if the description wording drifts. The legacy key is
-	// kept for ad-hoc calls.
-	if d.Cache != nil && req.TaskID != "" {
-		cacheKey := req.TaskID + "|" + subType + "|" + modelOv + "|" + string(s) + "|" + prov
+	// 同一个完整执行 identity 才可复用结果，task_id 也不绕过配置隔离。
+	// Reuse results only through the complete execution identity.
+	// 失败 / 无输出的结果不缓存：超时或中断产生的空结果若被缓存，
+	// 用户在 TTL 内重试会直接命中拿到空结果，主对话依然收不到汇总。
+	// Do not cache failures / empty results — a timed-out run cached
+	// with an empty body would poison retries within the TTL.
+	if strings.TrimSpace(res.Content) != "" {
 		d.Cache.PutByKey(cacheKey, res)
 	}
-	d.Cache.Put(req.Description, s, prov, res)
 	_ = agentKnown // silence linter when agent lookup happens but is unused beyond populating res
 	return res, nil
 }
@@ -954,6 +1035,62 @@ func redactPhantomErrorsServer(s string) string {
 		return s
 	}
 	return phantomScrubRe.ReplaceAllString(s, phantomScrubReplacement)
+}
+
+// filterSubAgentTools builds the sub-agent's tool registry from the
+// parent registry. Three layers, in priority order:
+//
+//  1. Hard exclusions: task, recall (recursion / coordination).
+//  2. Per-agent whitelist (agentWhitelist). When non-empty, ONLY
+//     those tools are exposed (minus the hard exclusions). A tool on
+//     the whitelist is explicitly authorized by the agent author and
+//     BYPASSES the global allow/deny — e.g. explore/plan list
+//     exec_command for read-only shell use (see builtins.go); the
+//     global deny must not veto it, otherwise the agent calls a tool
+//     it can never use and spins until the sub-agent timeout fires
+//     (the "explore runs forever then fails" symptom). The sandbox
+//     (injected via ctx at dispatch) still guards dangerous commands.
+//  3. Global config allow/deny (parentAllowed). Applies only to tools
+//     NOT on a per-agent whitelist (general-purpose inherits the
+//     parent set, custom agents with an empty whitelist).
+//
+// Extracted from Default.Run so the priority rules are unit-testable
+// without a full agent + LLM stack.
+func filterSubAgentTools(
+	parent *tool.Registry,
+	agentKnown bool,
+	agentWhitelist []string,
+	parentAllowed func(name string) bool,
+) *tool.Registry {
+	subTools := tool.NewRegistry()
+	for _, name := range parent.Names() {
+		// Sub-agents can't spawn sub-agents or call recall themselves;
+		// both are coordination tools that should stay at the top level.
+		if name == "task" || name == "recall" {
+			continue
+		}
+		// Per-agent whitelist takes priority over the global
+		// allow/deny list (see the doc comment above).
+		inWhitelist := false
+		if agentKnown && len(agentWhitelist) > 0 {
+			for _, t := range agentWhitelist {
+				if t == name {
+					inWhitelist = true
+					break
+				}
+			}
+			if !inWhitelist {
+				continue
+			}
+		}
+		if !inWhitelist && !parentAllowed(name) {
+			continue
+		}
+		if tt, hh, ok := parent.Lookup(name); ok {
+			subTools.Register(tt, hh)
+		}
+	}
+	return subTools
 }
 
 // buildSubAgentChatRequest assembles the ChatRequest the sub-agent

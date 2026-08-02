@@ -33,14 +33,14 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NSelect, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NSpace, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
 import { h } from 'vue'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
 } from '../stores/chat'
 import * as api from '../api/client'
-import type { SelectOption } from 'naive-ui'
+import type { DropdownOption } from 'naive-ui'
 import { checkUpdate } from '../api/update'
 import type { UpdateInfo } from '../api/update'
 import type { SearchResult } from '../api/client'
@@ -67,6 +67,8 @@ const dialog = useDialog()
 const showAddProject = ref(false)
 const newProjectName = ref('')
 const newProjectPath = ref('')
+const projectNameError = ref('')
+const projectPathError = ref('')
 const showConfirmDeleteProject = ref(false)
 const showAbout = ref(false)
 const showRename = ref(false)
@@ -189,9 +191,20 @@ function shortTime(ts: number, group: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Top-bar menu (theme-agnostic): Token usage / Settings / About
+// Header menu: project actions + app actions.
 // ---------------------------------------------------------------------------
-const menuOptions = computed(() => [
+const menuOptions = computed<DropdownOption[]>(() => [
+  {
+    label: '添加项目',
+    key: 'add-project',
+    icon: () => h(Plus, { size: 16 }),
+  },
+  ...(state.activeProjectPath ? [{
+    label: '移除当前项目',
+    key: 'remove-project',
+    icon: () => h(XIcon, { size: 16 }),
+  }] : []),
+  { type: 'divider' as const, key: 'project-divider' },
   {
     label: 'Token 用量',
     key: 'token-stats',
@@ -212,6 +225,11 @@ const menuOptions = computed(() => [
 
 function handleMenuSelect(key: string) {
   switch (key) {
+    case 'add-project': showAddProject.value = true; break
+    case 'remove-project': {
+      if (state.activeProjectPath) showConfirmDeleteProject.value = true
+      break
+    }
     case 'token-stats': showTokenStats.value = true; break
     case 'settings': emit('open-settings'); break
     case 'about': openAbout(); break
@@ -243,6 +261,15 @@ function doSearch() {
 watch(searchQuery, () => {
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(doSearch, 300)
+})
+
+watch(showAddProject, (show) => {
+  if (!show) {
+    newProjectName.value = ''
+    newProjectPath.value = ''
+    projectNameError.value = ''
+    projectPathError.value = ''
+  }
 })
 
 function clearSearch() {
@@ -548,7 +575,7 @@ async function onProjectChange(path: string) {
 }
 
 async function onAddProject() {
-  if (!newProjectName.value.trim() || !newProjectPath.value.trim()) return
+  if (!validateProjectForm()) return
   try {
     await api.addProject(newProjectName.value.trim(), newProjectPath.value.trim())
     await loadProjects()
@@ -557,7 +584,19 @@ async function onAddProject() {
     newProjectName.value = ''
     newProjectPath.value = ''
   } catch (e: any) {
-    message.error(e.message || '添加失败')
+    const raw = e.message || '添加失败'
+    if (raw.includes('already exists')) {
+      projectPathError.value = '该目录已经在项目列表中'
+      message.warning(projectPathError.value)
+    } else if (raw.includes('absolute')) {
+      projectPathError.value = '请输入绝对路径'
+      message.warning(projectPathError.value)
+    } else if (raw.includes('existing directory')) {
+      projectPathError.value = '项目目录不存在或不是文件夹'
+      message.warning(projectPathError.value)
+    } else {
+      message.error(raw)
+    }
   }
 }
 
@@ -566,16 +605,78 @@ async function pickDirectory() {
     const { path } = await api.pickFolder()
     if (path) {
       newProjectPath.value = path
+      projectPathError.value = ''
+      if (!newProjectName.value.trim()) {
+        newProjectName.value = basenameFromPath(path)
+        projectNameError.value = ''
+      }
     }
   } catch (e: any) {
     message.error(e.message || '选取目录失败')
   }
 }
 
+function validateProjectForm() {
+  const name = newProjectName.value.trim()
+  const path = newProjectPath.value.trim()
+  projectNameError.value = ''
+  projectPathError.value = ''
+  if (!name) {
+    projectNameError.value = '项目名称必填'
+  }
+  if (!path) {
+    projectPathError.value = '项目目录必填'
+  } else if (!isAbsolutePath(path)) {
+    projectPathError.value = '请输入绝对路径'
+  } else if (state.projects.some(p => sameProjectPath(p.path, path))) {
+    projectPathError.value = '该目录已经在项目列表中'
+  }
+  if (projectNameError.value || projectPathError.value) {
+    message.warning(projectNameError.value || projectPathError.value)
+    return false
+  }
+  return true
+}
+
+function isAbsolutePath(path: string) {
+  const value = path.trim()
+  return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\') || value.startsWith('/')
+}
+
+function normalizeProjectPath(path: string) {
+  return path.trim().replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase()
+}
+
+function sameProjectPath(a: string, b: string) {
+  return normalizeProjectPath(a) === normalizeProjectPath(b)
+}
+
+function basenameFromPath(path: string) {
+  const parts = path.trim().split(/[\\/]+/).filter(Boolean)
+  return parts[parts.length - 1] || '新项目'
+}
+
+function compactProjectPath(path: string, maxSegments = 3) {
+  const value = path.trim()
+  const parts = value.split(/[\\/]+/).filter(Boolean)
+  if (parts.length <= maxSegments) return value
+  return `...\\${parts.slice(-maxSegments).join('\\')}`
+}
+
+function projectRailLabel(name: string) {
+  const value = name.trim()
+  if (!value) return '?'
+  const ascii = value.match(/[A-Za-z0-9]+/g)
+  if (ascii?.length) return ascii[0].slice(0, 2).toUpperCase()
+  return Array.from(value).slice(0, 2).join('')
+}
+
 async function onRemoveProject(path: string) {
   try {
     await api.removeProject(path)
     await loadProjects()
+    delete state.projectSessions[path]
+    delete state.lastSessionByProject[path]
     if (state.activeProjectPath === path) {
       await setActiveProject('')
     }
@@ -585,26 +686,25 @@ async function onRemoveProject(path: string) {
   }
 }
 
-const projectOptions = computed<SelectOption[]>(() => [
-  {
-    label: '全局',
-    value: '',
-    renderLabel: (option: SelectOption) =>
-      h('span', { class: 'project-option' }, [
-        h(Globe, { size: 14, class: 'project-option-icon' }),
-        option.label as string,
-      ]),
-  },
+type ProjectTab = { name: string; path: string; shortPath: string }
+
+const allProjectTabs = computed<ProjectTab[]>(() => [
+  { name: '全局', path: '', shortPath: '所有未绑定目录的会话' },
   ...state.projects.map(p => ({
-    label: p.name,
-    value: p.path,
-    renderLabel: (option: SelectOption) =>
-      h('span', { class: 'project-option' }, [
-        h(Folder, { size: 14, class: 'project-option-icon' }),
-        option.label as string,
-      ]),
+    name: p.name,
+    path: p.path,
+    shortPath: compactProjectPath(p.path, 2),
   })),
 ])
+
+const activeProjectTab = computed<ProjectTab>(() =>
+  allProjectTabs.value.find(p => p.path === state.activeProjectPath) || allProjectTabs.value[0],
+)
+
+function projectHasStreaming(path: string): boolean {
+  const sessions = state.projectSessions[path] || (path === state.activeProjectPath ? state.sessions : [])
+  return sessions.some(s => !!state.streaming[s.id])
+}
 
 function toggleTheme() {
   themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
@@ -626,191 +726,216 @@ onMounted(() => {
 
 <template>
   <aside class="sidebar">
-    <!-- Brand header: logo + wordmark, then theme toggle + menu. -->
-    <div class="sidebar-header">
-      <div class="logo">
-        <BrandLogo :size="22" />
-        <span>P-Chat</span>
-      </div>
-      <NSpace size="small">
-        <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'" aria-label="切换主题">
-          <component :is="themeName === 'dark' ? Sun : Moon" :size="16" />
-        </NButton>
-        <NDropdown trigger="click" :options="menuOptions" @select="handleMenuSelect">
-          <NButton size="small" quaternary title="更多" aria-label="更多">
-            <MoreHorizontal :size="16" />
-          </NButton>
-        </NDropdown>
-      </NSpace>
-    </div>
-
-    <!-- Project bar: which project's sessions are we browsing? -->
-    <div class="project-bar">
-      <NSelect
-        :value="state.activeProjectPath"
-        :options="projectOptions"
-        size="small"
-        placeholder="选择项目"
-        @update:value="onProjectChange"
-      />
-      <NButton size="tiny" quaternary @click="showAddProject = true" title="添加项目目录" aria-label="添加项目目录">
-        <Plus :size="14" />
-      </NButton>
-      <NButton v-if="state.activeProjectPath" size="tiny" quaternary @click="showConfirmDeleteProject = true" title="删除当前项目" class="project-remove-btn">
-        <XIcon :size="14" />
-      </NButton>
-    </div>
-
-    <!-- Search bar (filters across all sessions in current project). -->
-    <div class="search-bar">
-      <NInput
-        v-model:value="searchQuery"
-        size="small"
-        placeholder="搜索会话内容..."
-        clearable
-        @clear="clearSearch"
-      >
-        <template #prefix>
-          <SearchIcon :size="14" class="search-icon" />
-        </template>
-      </NInput>
-    </div>
-
-    <!-- New session CTA: pinned to the top so it's always
-         one click away. Replaces the old footer "新建会话"
-         button which used to push the action below the fold
-         once the sidebar scrolled. -->
-    <div class="new-session-bar">
-      <button class="new-session-btn" @click="onNew" aria-label="新建对话">
-        <Plus :size="14" />
-        <span>新建对话</span>
-      </button>
-    </div>
-
-    <NScrollbar style="flex: 1; min-height: 0">
-      <!-- Search results -->
-      <div v-if="searchQuery.trim()" class="search-results">
-        <NSpin :show="searchLoading" size="small">
-          <div v-if="searchResults.length === 0 && !searchLoading" class="search-empty">
-            无匹配结果
-          </div>
-          <div
-            v-for="r in searchResults"
-            :key="`${r.conversation_id}-${r.message_id}`"
-            class="search-result-item"
-            @click="jumpToResult(r)"
-          >
-            <div class="result-header">
-              <span class="result-title">{{ r.conversation_title || '(无标题)' }}</span>
-              <span class="result-time">{{ shortTime(r.created_at, 'today') }}</span>
-            </div>
-            <div class="result-snippet">{{ r.snippet }}</div>
-          </div>
-        </NSpin>
-      </div>
-
-      <!-- Session list, grouped by relative time. -->
-      <div v-else class="session-list">
-        <template v-for="group in groupedSessions" :key="group.key">
-          <div class="group">
-            <div class="group-header">
-              <span class="group-label">{{ group.label }}</span>
-              <span v-if="group.key === 'pinned'" class="group-count">{{ group.sessions.length }}</span>
-            </div>
-            <div
-              v-for="s in group.key === 'older' && !showOlderExpanded ? [] : group.sessions"
-              :key="s.id"
-              class="session-item"
-              :class="{ active: s.id === state.currentID, pinned: isPinned(s.id) }"
-            >
-              <div class="item-row" @click="switchSession(s.id)">
-                <div class="item-main" @contextmenu="openSessionMenu($event, s.id)">
-                  <span v-if="isPinned(s.id)" class="item-pin" :title="'已置顶'" aria-label="已置顶">
-                    <Pin :size="11" />
-                  </span>
-                  <span class="item-title">{{ s.title || '(无标题)' }}</span>
-                  <span v-if="state.streaming[s.id]" class="streaming-dot" title="正在生成" aria-label="正在生成">
-                    <Circle :size="7" fill="currentColor" />
-                  </span>
-                </div>
-                <div class="item-meta">
-                  <span class="item-time">{{ shortTime(s.updated_at, group.key) }}</span>
-                  <NDropdown
-                    :ref="bindSessionMenuRef(s.id)"
-                    trigger="click"
-                    placement="bottom-end"
-                    :options="sessionMenuOptions(s.id)"
-                    @select="(key) => onSessionMenu(key, s.id)"
-                  >
-                    <button
-                      class="item-menu-btn"
-                      :aria-label="'会话操作'"
-                      title="更多（支持右键标题打开）"
-                      @click.stop
-                    >
-                      <MoreHorizontal :size="12" />
-                    </button>
-                  </NDropdown>
-                </div>
-              </div>
-            </div>
-            <div
-              v-if="group.key === 'older' && !showOlderExpanded && group.sessions.length > 0"
-              class="older-toggle"
-              @click="showOlderExpanded = true"
-            >
-              <ChevronDown :size="12" />
-              <span>展开更早的 {{ group.sessions.length }} 个会话</span>
-            </div>
-            <div
-              v-else-if="group.key === 'older' && showOlderExpanded"
-              class="older-toggle"
-              @click="showOlderExpanded = false"
-            >
-              <ChevronRight :size="12" />
-              <span>收起</span>
-            </div>
-          </div>
-        </template>
-      </div>
-    </NScrollbar>
-
-    <!-- Footer user card: brand mark + version + quick action.
-         Replaces the old "新建会话" footer with app-level info
-         (since the new-session button moved to the top). The
-         gear icon opens settings — the highest-traffic footer
-         action — and clicking the brand area opens About. -->
-    <!-- PR #9 follow-up: removed the BrandLogo from the
-         user card — it's already in the sidebar header
-         (the prominent logo at the top), so showing it
-         again in the footer was visually redundant. The
-         footer now shows just the app name + version as
-         informational text, with the settings button on the
-         right. The whole left side stays clickable to open
-         About, preserving the existing behavior. -->
-    <div class="user-card">
+    <nav class="project-rail" aria-label="项目">
       <button
-        class="user-card-brand"
         type="button"
-        :title="'关于 P-Chat'"
-        :aria-label="'关于 P-Chat'"
+        class="rail-brand"
+        title="关于 P-Chat"
+        aria-label="关于 P-Chat"
         @click="openAbout"
       >
-        <span class="user-card-text">
-          <span class="user-card-name">P-Chat</span>
-          <span class="user-card-version">v{{ APP_VERSION }}</span>
-        </span>
+        <BrandLogo :size="28" />
       </button>
-      <NButton
-        size="small"
-        quaternary
-        :title="'设置'"
-        :aria-label="'设置'"
-        @click="emit('open-settings')"
+
+      <div class="project-tabs" role="tablist" aria-label="项目列表">
+        <button
+          v-for="project in allProjectTabs"
+          :key="project.path || '__global__'"
+          type="button"
+          class="project-tab"
+          :class="{ 'project-tab--active': project.path === state.activeProjectPath }"
+          :title="project.path || project.shortPath"
+          :aria-label="project.path ? `切换到项目 ${project.name}` : '切换到全局会话'"
+          :aria-current="project.path === state.activeProjectPath ? 'page' : undefined"
+          @click="onProjectChange(project.path)"
+        >
+          <Globe v-if="!project.path" :size="17" />
+          <span v-else class="project-tab-label">{{ projectRailLabel(project.name) }}</span>
+          <span
+            v-if="projectHasStreaming(project.path)"
+            class="project-tab-running"
+            aria-label="运行中"
+          />
+        </button>
+      </div>
+
+      <button
+        type="button"
+        class="project-add-tab"
+        title="添加项目"
+        aria-label="添加项目"
+        @click="showAddProject = true"
       >
-        <Settings :size="14" />
-      </NButton>
-    </div>
+        <Plus :size="18" />
+      </button>
+    </nav>
+
+    <section class="session-panel" aria-label="会话">
+      <!-- Current project summary + theme / app actions. -->
+      <div class="sidebar-header">
+        <div class="project-summary" :title="activeProjectTab.path || activeProjectTab.shortPath">
+          <span class="project-summary-icon">
+            <Globe v-if="!activeProjectTab.path" :size="16" />
+            <Folder v-else :size="16" />
+          </span>
+          <span class="project-summary-copy">
+            <span class="project-summary-name">{{ activeProjectTab.name }}</span>
+            <span class="project-summary-path">{{ activeProjectTab.shortPath }}</span>
+          </span>
+        </div>
+        <NSpace size="small">
+          <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'" aria-label="切换主题">
+            <component :is="themeName === 'dark' ? Sun : Moon" :size="16" />
+          </NButton>
+          <NDropdown
+            trigger="click"
+            placement="bottom-end"
+            :options="menuOptions"
+            @select="(key) => handleMenuSelect(String(key))"
+          >
+            <NButton size="small" quaternary title="更多" aria-label="更多">
+              <MoreHorizontal :size="16" />
+            </NButton>
+          </NDropdown>
+        </NSpace>
+      </div>
+
+      <!-- Search bar (filters across all sessions in current project). -->
+      <div class="search-bar">
+        <NInput
+          v-model:value="searchQuery"
+          size="small"
+          placeholder="搜索会话内容..."
+          clearable
+          @clear="clearSearch"
+        >
+          <template #prefix>
+            <SearchIcon :size="14" class="search-icon" />
+          </template>
+        </NInput>
+      </div>
+
+      <!-- New session CTA: pinned to the top so it's always one click away. -->
+      <div class="new-session-bar">
+        <button class="new-session-btn" @click="onNew" aria-label="新建对话">
+          <Plus :size="14" />
+          <span>新建对话</span>
+        </button>
+      </div>
+
+      <NScrollbar class="session-scroll">
+        <!-- Search results -->
+        <div v-if="searchQuery.trim()" class="search-results">
+          <NSpin :show="searchLoading" size="small">
+            <div v-if="searchResults.length === 0 && !searchLoading" class="search-empty">
+              无匹配结果
+            </div>
+            <div
+              v-for="r in searchResults"
+              :key="`${r.conversation_id}-${r.message_id}`"
+              class="search-result-item"
+              @click="jumpToResult(r)"
+            >
+              <div class="result-header">
+                <span class="result-title">{{ r.conversation_title || '(无标题)' }}</span>
+                <span class="result-time">{{ shortTime(r.created_at, 'today') }}</span>
+              </div>
+              <div class="result-snippet">{{ r.snippet }}</div>
+            </div>
+          </NSpin>
+        </div>
+
+        <!-- Session list, grouped by relative time. -->
+        <div v-else class="session-list">
+          <template v-for="group in groupedSessions" :key="group.key">
+            <div class="group">
+              <div class="group-header">
+                <span class="group-label">{{ group.label }}</span>
+                <span v-if="group.key === 'pinned'" class="group-count">{{ group.sessions.length }}</span>
+              </div>
+              <div
+                v-for="s in group.key === 'older' && !showOlderExpanded ? [] : group.sessions"
+                :key="s.id"
+                class="session-item"
+                :class="{ active: s.id === state.currentID, pinned: isPinned(s.id) }"
+              >
+                <div class="item-row" @click="switchSession(s.id)">
+                  <div class="item-main" @contextmenu="openSessionMenu($event, s.id)">
+                    <span v-if="isPinned(s.id)" class="item-pin" :title="'已置顶'" aria-label="已置顶">
+                      <Pin :size="11" />
+                    </span>
+                    <span class="item-title">{{ s.title || '(无标题)' }}</span>
+                    <span v-if="state.streaming[s.id]" class="streaming-dot" title="正在生成" aria-label="正在生成">
+                      <Circle :size="7" fill="currentColor" />
+                    </span>
+                  </div>
+                  <div class="item-meta">
+                    <span class="item-time">{{ shortTime(s.updated_at, group.key) }}</span>
+                    <NDropdown
+                      :ref="bindSessionMenuRef(s.id)"
+                      trigger="click"
+                      placement="bottom-end"
+                      :options="sessionMenuOptions(s.id)"
+                      @select="(key) => onSessionMenu(String(key), s.id)"
+                    >
+                      <button
+                        class="item-menu-btn"
+                        :aria-label="'会话操作'"
+                        title="更多（支持右键标题打开）"
+                        @click.stop
+                      >
+                        <MoreHorizontal :size="12" />
+                      </button>
+                    </NDropdown>
+                  </div>
+                </div>
+              </div>
+              <div
+                v-if="group.key === 'older' && !showOlderExpanded && group.sessions.length > 0"
+                class="older-toggle"
+                @click="showOlderExpanded = true"
+              >
+                <ChevronDown :size="12" />
+                <span>展开更早的 {{ group.sessions.length }} 个会话</span>
+              </div>
+              <div
+                v-else-if="group.key === 'older' && showOlderExpanded"
+                class="older-toggle"
+                @click="showOlderExpanded = false"
+              >
+                <ChevronRight :size="12" />
+                <span>收起</span>
+              </div>
+            </div>
+          </template>
+        </div>
+      </NScrollbar>
+
+      <!-- Footer user card: app version + settings. -->
+      <div class="user-card">
+        <button
+          class="user-card-brand"
+          type="button"
+          :title="'关于 P-Chat'"
+          :aria-label="'关于 P-Chat'"
+          @click="openAbout"
+        >
+          <span class="user-card-text">
+            <span class="user-card-name">P-Chat</span>
+            <span class="user-card-version">v{{ APP_VERSION }}</span>
+          </span>
+        </button>
+        <NButton
+          size="small"
+          quaternary
+          :title="'设置'"
+          :aria-label="'设置'"
+          @click="emit('open-settings')"
+        >
+          <Settings :size="14" />
+        </NButton>
+      </div>
+    </section>
 
     <!-- Modals (PR #7: migrated to AppModal for consistent
          styling). The about-modal is left as a raw NModal
@@ -825,12 +950,25 @@ onMounted(() => {
     >
       <div class="add-project-form">
         <label>项目名称</label>
-        <NInput v-model:value="newProjectName" placeholder="例如：我的项目" />
-        <label style="margin-top: 12px">项目目录</label>
+        <NInput
+          v-model:value="newProjectName"
+          placeholder="例如：我的项目"
+          :status="projectNameError ? 'error' : undefined"
+          @update:value="projectNameError = ''"
+        />
+        <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
+        <label class="project-path-label">项目目录</label>
         <div class="path-row">
-          <NInput v-model:value="newProjectPath" placeholder="例如：D:\projects\my-app" style="flex:1" />
+          <NInput
+            v-model:value="newProjectPath"
+            placeholder="例如：D:\projects\my-app"
+            class="path-input"
+            :status="projectPathError ? 'error' : undefined"
+            @update:value="projectPathError = ''"
+          />
           <NButton size="small" @click="pickDirectory" title="选择目录">浏览</NButton>
         </div>
+        <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
       </div>
       <template #footer>
         <NButton size="small" @click="showAddProject = false">取消</NButton>
@@ -916,44 +1054,166 @@ onMounted(() => {
 
 <style scoped>
 .sidebar {
-  width: 280px;
+  width: 320px;
   background: var(--surface-1);
   border-right: 1px solid var(--border-subtle);
   display: flex;
-  flex-direction: column;
   flex-shrink: 0;
   transition: width var(--dur-base) var(--ease-out);
 }
 
-/* --- Brand header ------------------------------------------------------ */
+/* --- Project rail ------------------------------------------------------ */
+.project-rail {
+  width: 56px;
+  flex: 0 0 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-2);
+  background: var(--surface-0);
+  border-right: 1px solid var(--border-subtle);
+}
+.rail-brand,
+.project-tab,
+.project-add-tab {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+.rail-brand:hover,
+.project-tab:hover,
+.project-add-tab:hover {
+  background: var(--surface-2);
+  color: var(--text-primary);
+}
+.rail-brand {
+  color: var(--text-primary);
+}
+.project-tabs {
+  width: 100%;
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  overflow-y: auto;
+  padding: var(--space-1) 0;
+}
+.project-tabs::before {
+  content: '';
+  width: 24px;
+  height: 1px;
+  flex: 0 0 1px;
+  background: var(--border-subtle);
+  margin-bottom: var(--space-1);
+}
+.project-tab--active {
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-600);
+  box-shadow: inset 3px 0 0 0 var(--brand-500);
+}
+.project-tab-label {
+  max-width: 28px;
+  overflow: hidden;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.project-tab-running {
+  width: 6px;
+  height: 6px;
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--brand-500);
+  box-shadow: 0 0 0 2px var(--surface-0);
+}
+.project-add-tab {
+  flex: 0 0 36px;
+  color: var(--text-tertiary);
+}
+
+/* --- Session panel + header ------------------------------------------- */
+.session-panel {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1);
+}
 .sidebar-header {
   padding: 10px 12px;
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: var(--space-2);
   flex-shrink: 0;
 }
-.logo {
+.project-summary {
+  min-width: 0;
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-weight: 600;
-  font-size: 14px;
-  letter-spacing: -0.01em;
+  gap: var(--space-2);
+}
+.project-summary-icon {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 28px;
+  border-radius: var(--radius-md);
+  background: var(--brand-50);
+  color: var(--brand-500);
+}
+.project-summary-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.project-summary-name {
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.25;
 }
-
-/* --- Project bar ------------------------------------------------------- */
-.project-bar {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border-subtle);
-  flex-shrink: 0;
+.project-summary-path {
+  min-width: 0;
+  max-width: 150px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.project-bar :deep(.n-base-select) { flex: 1; }
-.project-remove-btn { color: var(--warn-500); }
 
 /* --- Search bar -------------------------------------------------------- */
 .search-bar {
@@ -976,7 +1236,7 @@ onMounted(() => {
   gap: 6px;
   padding: 7px 12px;
   background: var(--brand-500);
-  color: #ffffff;
+  color: var(--on-brand);
   border: 1px solid var(--brand-500);
   border-radius: var(--radius-md);
   font-size: 13px;
@@ -994,6 +1254,10 @@ onMounted(() => {
 }
 
 /* --- Session list (grouped) ------------------------------------------- */
+.session-scroll {
+  flex: 1;
+  min-height: 0;
+}
 .session-list { padding: 4px 8px 8px; }
 .group { margin-bottom: 4px; }
 .group-header {
@@ -1086,22 +1350,37 @@ onMounted(() => {
 }
 .session-item.active .item-time { color: var(--text-secondary); }
 .item-menu-btn {
-  background: none;
-  border: none;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: 1px solid transparent;
   color: var(--text-tertiary);
   cursor: pointer;
-  padding: 3px 4px;
-  border-radius: 3px;
+  padding: 0;
+  border-radius: var(--radius-sm);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   opacity: 0;
-  transition: opacity var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
 }
-.session-item:hover .item-menu-btn { opacity: 1; }
+.session-item:hover .item-menu-btn,
+.item-menu-btn:focus-visible {
+  opacity: 1;
+}
 .item-menu-btn:hover {
-  background: var(--surface-3);
+  background: var(--surface-2);
+  border-color: var(--border-default);
   color: var(--text-primary);
+}
+.item-menu-btn:active {
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-600);
 }
 
 /* Older-group collapsible toggle. */
@@ -1203,7 +1482,15 @@ onMounted(() => {
   display: block; font-size: 13px; margin-bottom: 4px; color: var(--text-secondary);
   font-weight: 500;
 }
+.project-path-label { margin-top: var(--space-3); }
 .path-row { display: flex; gap: 8px; align-items: center; }
+.path-input { flex: 1; }
+.field-error {
+  margin: 5px 0 0;
+  color: var(--error-500);
+  font-size: 12px;
+  line-height: 1.35;
+}
 .about-body { padding: 4px 0; }
 .about-name { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
 .about-version { font-size: 13px; color: var(--text-tertiary); margin: 0 0 12px; }
@@ -1222,19 +1509,4 @@ onMounted(() => {
 .about-links a { color: var(--brand-500); text-decoration: none; }
 .about-links a:hover { text-decoration: underline; }
 .about-links .sep { color: var(--text-tertiary); margin: 0 6px; }
-</style>
-
-<style>
-/* NSelect dropdown items are teleported to body, so scoped styles
- * don't reach them. Project picker uses renderLabel() to inject an
- * icon + label combo; this rule styles those elements globally. */
-.project-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.project-option-icon {
-  color: var(--text-tertiary);
-  flex-shrink: 0;
-}
 </style>

@@ -57,7 +57,15 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+
+	"github.com/p-chat/pchat/cmd/pchat-gui/rotatelog"
 )
+
+// appLogDir is the directory holding the GUI's rotated log files.
+// It is resolved once at startup (main) and reused when redirecting
+// the pchat-server child's output, so both processes log side by
+// side under <data-home>/logs.
+var appLogDir string
 
 // loadingHTML is served by the AssetServer handler while pchat-server is
 // still starting up. The embedded JS polls /api/v1/health (which, once
@@ -101,7 +109,7 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
   }
   function tick(){
     tries++;
-    if (tries > 300) { fail('后端服务启动超时（60秒），请查看 pchat-gui.log / pchat-server.log'); return; }
+    if (tries > 300) { fail('后端服务启动超时（60秒），请查看 <数据目录>/logs/ 下的 pchat-gui.log / pchat-server.log'); return; }
     fetch('/api/v1/health', {cache:'no-store', credentials:'omit'})
       .then(function(r){
         // We only treat the backend as "ready" when we get a real JSON
@@ -134,16 +142,20 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
 `
 
 func main() {
-	// Open a debug log on disk so we can diagnose issues even if the
-	// webview never appears (e.g. headless session).
 	exe, _ := os.Executable()
-	logPath := filepath.Join(filepath.Dir(exe), "pchat-gui.log")
-	if lf, lfErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); lfErr == nil {
-		log.SetOutput(lf)
-		defer lf.Close()
+	// Open a dated debug log on disk so we can diagnose issues even
+	// if the webview never appears (e.g. headless session). Logs
+	// live under <data-home>/logs and rotate by date with a 7-day
+	// retention.
+	appLogDir = filepath.Join(resolveHomeDir(), "logs")
+	if logWriter, logErr := rotatelog.New(appLogDir, "pchat-gui", 7); logErr == nil {
+		log.SetOutput(logWriter)
+		defer logWriter.Close()
+	} else {
+		log.SetOutput(os.Stderr)
 	}
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("pchat-gui starting; exe=%s", exe)
+	log.Printf("pchat-gui starting; exe=%s log_dir=%s", exe, appLogDir)
 
 	instanceLock, alreadyRunning, lockErr := acquireSingleInstance()
 	if lockErr != nil {
@@ -192,16 +204,28 @@ type App struct {
 	serverCmd          *exec.Cmd
 	backendURL         atomic.Pointer[string] // "http://127.0.0.1:PORT"
 	serverMu           sync.Mutex
+	streamMu           sync.Mutex
+	activeStreams      map[string]*activeStream
 	serverStopped      bool
 	quitting           atomic.Bool
 	closePromptPending atomic.Bool
-	ready              atomic.Bool
-	tray               *trayHandle
+	// noMoreConfirm is an in-memory, per-process flag set when the
+	// user checks "不再提醒" on the close-confirm popup. While set,
+	// closing the window goes straight to tray without asking again.
+	// It lives only in RAM — the next process launch starts fresh and
+	// the popup comes back.
+	noMoreConfirm atomic.Bool
+	ready         atomic.Bool
+	tray          *trayHandle
+}
+
+type activeStream struct {
+	cancel context.CancelFunc
 }
 
 // NewApp creates a new App application struct.
 func NewApp() *App {
-	return &App{}
+	return &App{activeStreams: make(map[string]*activeStream)}
 }
 
 // ServeHTTP routes the request. If pchat-server is healthy and a backend
@@ -230,6 +254,13 @@ func (a *App) OpenExplorer(path string) {
 func (a *App) OpenTerminal(path string) {
 	if err := openTerminal(path); err != nil {
 		log.Printf("OpenTerminal %q: %v", path, err)
+	}
+}
+
+// OpenURL opens an http(s) URL in the user's default browser.
+func (a *App) OpenURL(rawURL string) {
+	if err := openExternalURL(rawURL); err != nil {
+		log.Printf("OpenURL %q: %v", rawURL, err)
 	}
 }
 
@@ -290,8 +321,13 @@ func (a *App) StreamMessages(sessionID string, bodyJSON string) (int, error) {
 		return 0, fmt.Errorf("pchat-server not ready (no backend URL)")
 	}
 	url := fmt.Sprintf("%s/api/v1/sessions/%s/messages", backend, sessionID)
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(bodyJSON))
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := a.registerStreamCancel(sessionID, cancel)
+	defer a.unregisterStreamCancel(sessionID, stream)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(bodyJSON))
 	if err != nil {
+		cancel()
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -393,6 +429,35 @@ func (a *App) StreamMessages(sessionID string, bodyJSON string) (int, error) {
 // cancellation, ctx propagation) has a place to live.
 func (a *App) CancelStream(sessionID string) {
 	log.Printf("CancelStream: session=%s", sessionID)
+	a.streamMu.Lock()
+	stream := a.activeStreams[sessionID]
+	a.streamMu.Unlock()
+	if stream != nil {
+		stream.cancel()
+	}
+}
+
+func (a *App) registerStreamCancel(sessionID string, cancel context.CancelFunc) *activeStream {
+	a.streamMu.Lock()
+	defer a.streamMu.Unlock()
+	if a.activeStreams == nil {
+		a.activeStreams = make(map[string]*activeStream)
+	}
+	if prev := a.activeStreams[sessionID]; prev != nil {
+		prev.cancel()
+	}
+	stream := &activeStream{cancel: cancel}
+	a.activeStreams[sessionID] = stream
+	return stream
+}
+
+func (a *App) unregisterStreamCancel(sessionID string, stream *activeStream) {
+	a.streamMu.Lock()
+	defer a.streamMu.Unlock()
+	if a.activeStreams[sessionID] == stream {
+		delete(a.activeStreams, sessionID)
+	}
+	stream.cancel()
 }
 
 // openExplorer opens the OS file manager at the given path.
@@ -428,6 +493,32 @@ func openTerminal(path string) error {
 	default:
 		return fmt.Errorf("terminal not supported on %s", runtime.GOOS)
 	}
+}
+
+// openExternalURL delegates http(s) links to the OS default browser.
+func openExternalURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported url scheme: %s", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("missing url host")
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
+	case "darwin":
+		cmd = exec.Command("open", rawURL)
+	default:
+		cmd = exec.Command("xdg-open", rawURL)
+	}
+	hideChildConsole(cmd)
+	return cmd.Start()
 }
 
 func writeLoading(w http.ResponseWriter) {
@@ -713,6 +804,13 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	log.Printf("OnStartup called")
 	a.tray = startTray(a)
+	// Initialise the Windows toast notification service so
+	// runtime.SendNotification from the webview shows the app's own
+	// identity (not the webview origin "Wails.localhost") as the
+	// notification source.
+	if err := wailsruntime.InitializeNotifications(a.ctx); err != nil {
+		log.Printf("InitializeNotifications failed: %v", err)
+	}
 	go a.spawnAndWatch()
 }
 
@@ -787,11 +885,28 @@ func (a *App) beforeClose(ctx context.Context) bool {
 		a.stopServer()
 		return false
 	}
+	// "不再提醒"（本次进程内已勾选）且托盘就绪时，跳过确认弹窗
+	// 直接驻留后台。该标志只存在于内存，进程退出后即失效，
+	// 下次启动会重新弹出确认。
+	if a.noMoreConfirm.Load() && a.tray != nil && a.tray.ready() {
+		log.Printf("noMoreConfirm=true — hiding to tray without prompting")
+		a.hideMainWindow()
+		return true
+	}
 	if a.requestCloseConfirmation() {
 		return true
 	}
 	a.stopServer()
 	return false
+}
+
+// SetNoMoreConfirm marks that the user checked "不再提醒" on the
+// close-confirm popup. From then on, closing the window hides to tray
+// without asking again — for this process only. The flag is
+// intentionally not persisted; a fresh launch shows the popup again.
+func (a *App) SetNoMoreConfirm() {
+	log.Printf("SetNoMoreConfirm called")
+	a.noMoreConfirm.Store(true)
 }
 
 // stopServer stops the pchat-server child started by this GUI.
@@ -929,11 +1044,14 @@ func (a *App) spawnAndWatch() {
 	// unless we set CREATE_NO_WINDOW explicitly. Without this, every
 	// launch would pop up a black console window for pchat-server.
 	hideChildConsole(cmd)
-	// Forward child output to the same log file the GUI uses so users
-	// can see both pchat-gui and pchat-server logs side by side.
-	if lf, lfErr := os.OpenFile(filepath.Join(filepath.Dir(bin), "pchat-server.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); lfErr == nil {
-		cmd.Stdout = lf
-		cmd.Stderr = lf
+	// Forward child output to the same dated log directory the GUI
+	// uses (with its own base name) so users can see both pchat-gui
+	// and pchat-server logs side by side under <data-home>/logs.
+	// The server process writes to a fresh file each day and old
+	// files are pruned automatically.
+	if lw, lwErr := rotatelog.New(appLogDir, "pchat-server", 7); lwErr == nil {
+		cmd.Stdout = lw
+		cmd.Stderr = lw
 	} else {
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr

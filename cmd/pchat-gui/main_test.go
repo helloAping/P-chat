@@ -224,6 +224,73 @@ func TestStopServer_NoProcessIsIdempotent(t *testing.T) {
 	app.stopServer()
 }
 
+func TestSetNoMoreConfirm_IsInMemoryFlag(t *testing.T) {
+	app := NewApp()
+	if app.noMoreConfirm.Load() {
+		t.Fatal("noMoreConfirm should start false")
+	}
+	app.SetNoMoreConfirm()
+	if !app.noMoreConfirm.Load() {
+		t.Fatal("noMoreConfirm should be true after SetNoMoreConfirm")
+	}
+	// A fresh App (new process launch) must start with the flag cleared,
+	// so the close-confirm popup comes back after restart.
+	fresh := NewApp()
+	if fresh.noMoreConfirm.Load() {
+		t.Fatal("new process must not inherit noMoreConfirm")
+	}
+}
+
+func TestCancelStreamCancelsInFlightStreamMessages(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	responseStarted := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sessions/s1/messages" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"hello\"}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		close(responseStarted)
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer srv.Close()
+
+	app := NewApp()
+	backend := srv.URL
+	app.backendURL.Store(&backend)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := app.StreamMessages("s1", `{"message":"hi"}`)
+		done <- err
+	}()
+
+	select {
+	case <-responseStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not start")
+	}
+
+	app.CancelStream("s1")
+
+	select {
+	case <-requestCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backend request was not canceled")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StreamMessages did not return after cancel")
+	}
+}
+
 func TestRecentTraySessions_LimitsAndSkipsEmptyIDs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/sessions" {

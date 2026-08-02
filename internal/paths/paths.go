@@ -134,6 +134,14 @@ func UploadsDir() string {
 	return filepath.Join(GlobalDir(), "uploads")
 }
 
+// WorkspaceDir returns ~/.p-chat/workspace/ — the global default
+// working directory used when a session has no project path. All
+// file / command / grep operations for such sessions anchor here so
+// the agent always has a fixed, user-visible scope.
+func WorkspaceDir() string {
+	return filepath.Join(GlobalDir(), "workspace")
+}
+
 // ToolsDir returns ~/.p-chat/tools/
 func ToolsDir() string {
 	return filepath.Join(GlobalDir(), "tools")
@@ -201,6 +209,7 @@ func EnsureGlobal() error {
 		ToolsDir(),
 		KnowledgeDir(),
 		UploadsDir(),
+		WorkspaceDir(),
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {

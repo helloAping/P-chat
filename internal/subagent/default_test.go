@@ -3,6 +3,7 @@ package subagent
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 
@@ -12,6 +13,46 @@ import (
 
 func noopHandler(_ context.Context, _ json.RawMessage) (*tool.CallResult, error) {
 	return &tool.CallResult{Content: "ok"}, nil
+}
+
+func TestNewSubAgentStore_IsEphemeral(t *testing.T) {
+	store, err := newSubAgentStore()
+	if err != nil {
+		t.Fatalf("newSubAgentStore: %v", err)
+	}
+
+	rows, err := store.DB().Query("PRAGMA database_list")
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("database list: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			seq  int
+			name string
+			path string
+		)
+		if err := rows.Scan(&seq, &name, &path); err != nil {
+			_ = store.Close()
+			t.Fatalf("scan database list: %v", err)
+		}
+		if name == "main" && path != "" {
+			_ = store.Close()
+			t.Fatalf("main database path = %q, want in-memory store", path)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = store.Close()
+		t.Fatalf("iterate database list: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close ephemeral store: %v", err)
+	}
+	if err := store.Ping(); err == nil {
+		t.Fatal("closed ephemeral store is still usable")
+	}
 }
 
 // TestDefault_ExcludesTaskTool verifies the recursion guard.
@@ -100,6 +141,77 @@ func TestDefault_AppliesAllowDenyFilter(t *testing.T) {
 			}
 		}
 	})
+}
+
+// newFilterTestRegistry builds a parent registry with a few tools for
+// the filter tests below.
+func newFilterTestRegistry() *tool.Registry {
+	r := tool.NewRegistry()
+	for _, name := range []string{"task", "recall", "read_file", "list_files", "exec_command", "write_file"} {
+		r.Register(tool.Tool{Name: name, Description: name}, noopHandler)
+	}
+	return r
+}
+
+// TestFilterSubAgentTools_PerAgentWhitelistBeatsGlobalDeny pins the
+// fix for the "explore spins forever then fails" bug. explore/plan
+// whitelist exec_command for read-only shell use (builtins.go), but the
+// default config denies exec_command globally (config.go). The per-agent
+// whitelist must WIN — otherwise the agent calls a tool it can never
+// use and loops until the sub-agent timeout.
+func TestFilterSubAgentTools_PerAgentWhitelistBeatsGlobalDeny(t *testing.T) {
+	parent := newFilterTestRegistry()
+	globalDenyExec := func(name string) bool {
+		if name == "task" {
+			return false
+		}
+		if name == "exec_command" {
+			return false
+		}
+		return true
+	}
+
+	// explore: whitelist = {read_file, list_files, exec_command}
+	sub := filterSubAgentTools(parent, true, []string{"read_file", "list_files", "exec_command"}, globalDenyExec)
+	got := strings.Join(sub.Names(), ",")
+	for _, want := range []string{"read_file", "list_files", "exec_command"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("explore sub-agent tools = %q, missing whitelisted %q (global deny must not veto whitelist)", got, want)
+		}
+	}
+	if strings.Contains(got, "write_file") {
+		t.Errorf("explore sub-agent tools = %q, must not contain write_file (not on whitelist)", got)
+	}
+	if strings.Contains(got, "task") || strings.Contains(got, "recall") {
+		t.Errorf("explore sub-agent tools = %q, must not contain task/recall (hard exclusion)", got)
+	}
+}
+
+// TestFilterSubAgentTools_GlobalDenyAppliesWhenNoWhitelist covers
+// general-purpose / custom agents with an empty whitelist: the global
+// allow/deny still governs, so the default deny of exec_command keeps
+// blocking it.
+func TestFilterSubAgentTools_GlobalDenyAppliesWhenNoWhitelist(t *testing.T) {
+	parent := newFilterTestRegistry()
+	globalDenyExec := func(name string) bool {
+		if name == "task" {
+			return false
+		}
+		if name == "exec_command" {
+			return false
+		}
+		return true
+	}
+
+	// general-purpose: no per-agent whitelist
+	sub := filterSubAgentTools(parent, true, nil, globalDenyExec)
+	got := strings.Join(sub.Names(), ",")
+	if strings.Contains(got, "exec_command") {
+		t.Errorf("general-purpose sub-agent tools = %q, must NOT contain exec_command (global deny still applies when no whitelist)", got)
+	}
+	if !strings.Contains(got, "read_file") {
+		t.Errorf("general-purpose sub-agent tools = %q, should contain read_file", got)
+	}
 }
 
 // TestDefault_EmitsSubAgentLifecycleEvents verifies that
@@ -236,4 +348,159 @@ func TestDefault_EmitsCloseOnImmediateError(t *testing.T) {
 			t.Errorf("Duration = %q, want 1.2s", ev.Duration)
 		}
 	})
+}
+
+// newRunTestDefault builds a Default wired for end-to-end runner
+// tests: a parent tool registry with one read-only tool, a synthetic
+// stream (runChat) that yields the given chunks, and an OnEvent sink.
+// The synthetic stream lets us drive Run()'s chunk loop (and the new
+// silent-close detection) without a real LLM client.
+func newRunTestDefault(chunks []agent.ChatStreamChunk) (*Default, *[]agent.ChatStreamChunk) {
+	parent := tool.NewRegistry()
+	parent.Register(tool.Tool{Name: "read_file", Description: "r"}, noopHandler)
+
+	var mu sync.Mutex
+	var events []agent.ChatStreamChunk
+	onEvent := func(c agent.ChatStreamChunk) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, c)
+	}
+
+	d := &Default{
+		ParentTools: parent,
+		OnEvent:     onEvent,
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			ch := make(chan agent.ChatStreamChunk, len(chunks))
+			for _, c := range chunks {
+				ch <- c
+			}
+			close(ch)
+			return ch
+		},
+	}
+	return d, &events
+}
+
+// TestDefault_SilentCloseIsFailure is the regression test for the
+// "sub-agent timed out but was reported as success, parent has
+// nothing to summarise" bug. The sub-agent's ReAct loop can be
+// cancelled mid-tool-execution by the runCtx timeout (or a parent
+// cancel); that exit closes the stream with NO Done and NO Error
+// chunk. The runner must treat that as a failure — emit sub_agent_err
+// and return an error — instead of a success with empty content.
+func TestDefault_SilentCloseIsFailure(t *testing.T) {
+	d, events := newRunTestDefault([]agent.ChatStreamChunk{
+		{Content: "partial find result"},
+	})
+
+	res, err := d.Run(context.Background(), Request{Description: "explore src/"})
+	if err == nil {
+		t.Fatalf("silent-close Run() returned err=nil, want a timeout/interruption error (res=%+v)", res)
+	}
+	if !strings.Contains(err.Error(), "without completion") {
+		t.Errorf("err = %q, want it to mention 'without completion' (timeout/interruption)", err)
+	}
+
+	var gotStatus, gotReason string
+	for _, e := range *events {
+		if e.SubAgentStatus != "" {
+			gotStatus = e.SubAgentStatus
+		}
+		if e.SubAgentFailureReason != "" {
+			gotReason = e.SubAgentFailureReason
+		}
+	}
+	if gotStatus != "err" {
+		t.Errorf("close event SubAgentStatus = %q, want err", gotStatus)
+	}
+	if !strings.Contains(gotReason, "without completion") {
+		t.Errorf("close event SubAgentFailureReason = %q, want 'without completion'", gotReason)
+	}
+}
+
+// TestDefault_SilentCloseNoContentIsHardFailure covers the no-output
+// flavour of the same bug: the stream closes silently before any
+// content arrived (e.g. the LLM stream was still in backoff when the
+// timeout fired). This must be a HARD failure so the tool layer turns
+// it into an IsError result the parent LLM can see — never a
+// "successful" empty reply.
+func TestDefault_SilentCloseNoContentIsHardFailure(t *testing.T) {
+	d, events := newRunTestDefault(nil) // empty stream: closes immediately, no Done/Error
+
+	res, err := d.Run(context.Background(), Request{Description: "explore src/"})
+	if err == nil {
+		t.Fatalf("silent-close-with-no-content Run() returned err=nil, want a hard failure error (res=%+v)", res)
+	}
+	if !strings.Contains(err.Error(), "without completion") {
+		t.Errorf("err = %q, want it to mention 'without completion'", err)
+	}
+
+	var gotStatus string
+	for _, e := range *events {
+		if e.SubAgentStatus != "" {
+			gotStatus = e.SubAgentStatus
+		}
+	}
+	if gotStatus != "err" {
+		t.Errorf("close event SubAgentStatus = %q, want err", gotStatus)
+	}
+}
+
+// TestDefault_DoneChunkIsSuccess guards the happy path: a stream that
+// ends with a normal Done chunk (or content + Done) must still be
+// reported as success. Without this, the silent-close check above
+// would regress every normal sub-agent run into "err".
+func TestDefault_DoneChunkIsSuccess(t *testing.T) {
+	d, events := newRunTestDefault([]agent.ChatStreamChunk{
+		{Content: "found the answer"},
+		{Done: true},
+	})
+
+	res, err := d.Run(context.Background(), Request{Description: "explore src/"})
+	if err != nil {
+		t.Fatalf("Done-chunk Run() returned err: %v", err)
+	}
+	if !strings.Contains(res.Content, "found the answer") {
+		t.Errorf("res.Content = %q, want to contain 'found the answer'", res.Content)
+	}
+
+	var gotStatus string
+	for _, e := range *events {
+		if e.SubAgentStatus != "" {
+			gotStatus = e.SubAgentStatus
+		}
+	}
+	if gotStatus != "ok" {
+		t.Errorf("close event SubAgentStatus = %q, want ok", gotStatus)
+	}
+}
+
+// TestDefault_SoftErrorKeepsContent pins the soft-fail contract: a
+// stream that produced content and THEN hit an error tail keeps its
+// content, is reported ok (not hard-failed), and the parent still gets
+// the partial text to summarise.
+func TestDefault_SoftErrorKeepsContent(t *testing.T) {
+	d, events := newRunTestDefault([]agent.ChatStreamChunk{
+		{Content: "partial answer"},
+		{Error: "upstream cut off"},
+	})
+
+	res, err := d.Run(context.Background(), Request{Description: "explore src/"})
+	if err != nil {
+		t.Fatalf("soft-error Run() returned err: %v", err)
+	}
+	if !strings.Contains(res.Content, "partial answer") {
+		t.Errorf("res.Content = %q, want to contain 'partial answer'", res.Content)
+	}
+
+	var gotStatus string
+	for _, e := range *events {
+		if e.SubAgentStatus != "" {
+			gotStatus = e.SubAgentStatus
+		}
+	}
+	if gotStatus != "ok" {
+		t.Errorf("close event SubAgentStatus = %q, want ok (soft failure keeps content)", gotStatus)
+	}
 }

@@ -50,8 +50,14 @@ tasks:
     silent: false
 
   build:
-    desc: 编译 CLI 和 Server（前端由 build:gui:npm 统一调度）
+    desc: 编译 CLI 和 Server（包含一次前端构建）
+    cmds:
+      - task: build:binaries
     deps: [build:frontend]
+    silent: false
+
+  build:binaries:
+    internal: true
     cmds:
       - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat.exe ./cmd/pchat
       - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server.exe ./cmd/pchat-server
@@ -59,8 +65,14 @@ tasks:
     silent: false
 
   build:gui:
-    desc: 编译桌面端 (Wails v2，跳过 Wails 自带的前端构建——前端已由 build:frontend 生成)
+    desc: 编译桌面端 (Wails v2，包含一次前端构建)
     deps: [build:frontend]
+    cmds:
+      - task: build:gui:binary
+    silent: false
+
+  build:gui:binary:
+    internal: true
     dir: cmd\pchat-gui
     cmds:
       # wails-build.ps1 locates the wails CLI in the standard
@@ -80,6 +92,12 @@ tasks:
   build:gui:linux:
     desc: 编译 Linux 桌面端 (Wails v2)
     deps: [build:frontend]
+    cmds:
+      - task: build:gui:linux:binary
+    silent: false
+
+  build:gui:linux:binary:
+    internal: true
     dir: cmd\pchat-gui
     cmds:
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "linux/amd64" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
@@ -91,6 +109,12 @@ tasks:
   build:gui:macos:
     desc: 编译 macOS 桌面端 (Wails v2) — 需要在 macOS 主机上运行
     deps: [build:frontend]
+    cmds:
+      - task: build:gui:macos:binary
+    silent: false
+
+  build:gui:macos:binary:
+    internal: true
     dir: cmd\pchat-gui
     cmds:
       # Wails v2 does not support cross-compile to macOS — Apple's
@@ -112,6 +136,18 @@ tasks:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: 0
+    silent: false
+
+  build:im_qq:
+    desc: 编译带 QQ IM adapter build tag 的 Server
+    cmds:
+      - go build -tags im_qq -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-im-qq.exe ./cmd/pchat-server
+    silent: false
+
+  build:im_wx:
+    desc: 编译带 QQ + 微信 IM adapter build tag 的 Server
+    cmds:
+      - go build -tags "im_qq im_wx" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-im-wx.exe ./cmd/pchat-server
     silent: false
 
   build:server:macos:
@@ -152,50 +188,72 @@ tasks:
 
   build:setup:
     desc: 构建单文件安装器 bin/pchat-setup-v{version}.exe（依赖 build + build:gui）
-    deps: [build, build:gui]
     cmds:
-      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
+      - task: build:frontend
+      - task: build:windows:artifacts
+      - task: build:setup:installer
     generates:
       - bin/pchat-setup-v*.exe
     silent: false
 
+  build:setup:installer:
+    internal: true
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-installer.ps1
+    silent: false
+
+  build:windows:artifacts:
+    internal: true
+    # 前端就绪后并行编译。Compile independent Windows artifacts in parallel after the SPA is ready.
+    deps: [build:binaries, build:gui:binary]
+
   build:all:
     desc: 同时编译 CLI / Server / 桌面端 / 安装器（含 Linux/macOS GUI 安装包 best-effort）
     cmds:
-      - task: build
-      - task: build:gui
-      - task: build:setup
+      # 前端只构建并同步一次。Build and sync the SPA exactly once.
+      # 后续阶段直接消费已有产物。Following stages consume the existing output.
+      - task: build:frontend
+      - task: build:windows:artifacts
+      - task: build:setup:installer
       # Linux GUI package: best-effort. Skips with warning on non-Linux
       # hosts, or on Windows when the Wails Linux cross-compile toolchain
       # isn't installed (CGO + GTK + webkit2gtk-4.0). Run on a Linux
       # host or a CI runner with the deps for a real build.
-      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -Task "package:gui:linux" -Platform "linux/amd64"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -Task "package:gui:linux:prepared" -Platform "linux/amd64"
       # macOS GUI package: only runs on macOS hosts (Wails v2 cannot
       # cross-compile to darwin from Windows/Linux). Wrapper exits 0
       # with a skip message on any other OS so the aggregate task
       # keeps going.
-      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -RequiredOS darwin -Task "package:gui:macos" -Platform "darwin/universal"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -RequiredOS darwin -Task "package:gui:macos:prepared" -Platform "darwin/universal"
 
   package:gui:
     desc: 把桌面端打包到 bin\（含前端 SPA + pchat-server.exe + install/uninstall 脚本）
     cmds:
-      - task: build
-      - task: build:gui
+      - task: build:frontend
+      - task: build:windows:artifacts
       - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-gui.ps1
     silent: false
 
   package:gui:linux:
     desc: 打包 Linux 安装包到 build/bin/（含 Linux server/CLI 二进制，非 Windows .exe）
-    deps: [build:server:linux, build:cli:linux]
     cmds:
       - task: build:frontend
+      - task: package:gui:linux:prepared
+    silent: false
+
+  # build:all 在前端就绪后调用的隐藏入口。Hidden entry point used after build:frontend.
+  # 平台包装脚本会启动子 Task 进程，因此此任务需保持可调用。
+  # The platform wrapper starts a child Task process, so this task stays callable.
+  package:gui:linux:prepared:
+    deps: [build:server:linux, build:cli:linux]
+    cmds:
       # Wails v2 does not support Windows→Linux cross-compile. The
       # build step is best-effort: when it fails (or is run on
       # Windows without a CGO+GTK+webkit toolchain) we still ship
       # the rest of the bundle (server + CLI + SPA + scripts). The
       # user can build pchat-gui on a Linux host or via a Linux CI
       # runner and drop it into build/bin/ before installing.
-      - task: build:gui:linux
+      - task: build:gui:linux:binary
         ignore_error: true
       # The actual assembly lives in a dedicated script. The
       # equivalent inline PowerShell trips on `:` in warning
@@ -207,14 +265,20 @@ tasks:
 
   package:gui:macos:
     desc: 打包 macOS 安装包到 build/bin/pchat-gui-macos/ — 需要在 macOS 主机上运行
+    cmds:
+      - task: build:frontend
+      - task: package:gui:macos:prepared
+    silent: false
+
+  # build:all 在共享前端构建后调用的隐藏入口。Hidden entry point used after the shared SPA build.
+  package:gui:macos:prepared:
     deps: [build:server:macos, build:cli:macos]
     cmds:
       # Wails v2 cannot cross-compile to darwin from Windows/Linux.
       # Skip with a clear message on non-macOS hosts; the actual
       # packaging step below runs only on macOS.
       - cmd: powershell -NoProfile -Command "if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { Write-Host '[skip] pchat-gui macOS package requires macOS host. Run this on a Mac or in a macOS CI runner.' -ForegroundColor Yellow; exit 0 }"
-      - task: build:frontend
-      - task: build:gui:macos
+      - task: build:gui:macos:binary
         ignore_error: true
       # Only run the bundle assembly on macOS — the script does
       # `cp` / `chmod` on the .app, server, and CLI, and the .app
@@ -324,6 +388,11 @@ tasks:
     dir: cmd\pchat-gui
     cmds:
       - go test -v ./
+
+  test:build:
+    desc: 验证聚合构建任务只构建一次前端
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-build-task-graph.ps1
 
   smoke:gui:
     desc: 桌面端端到端冒烟 (装 -> 启 -> 后端健康 -> 卸)

@@ -32,28 +32,42 @@ type ConfirmRequest struct {
 }
 
 type ConfirmResponse struct {
-	Approved bool `json:"approved"`
+	Approved bool   `json:"approved"`
+	Action   string `json:"action,omitempty"`
+}
+
+const (
+	ConfirmActionReject = "reject"
+	ConfirmActionOnce   = "once"
+	ConfirmActionAlways = "always"
+)
+
+type pendingConfirm struct {
+	req ConfirmRequest
+	ch  chan ConfirmResponse
 }
 
 var (
-	confirmMu  sync.Mutex
-	confirmChs = make(map[string][]chan ConfirmResponse)
+	confirmMu          sync.Mutex
+	confirmChs         = make(map[string][]pendingConfirm)
+	confirmAllowed     = make(map[string]map[string]struct{})
+	sessionPermissions = make(map[string]string)
 )
 
-func WaitForConfirm(ctx context.Context, sessionID string, req ConfirmRequest) (bool, error) {
+func WaitForConfirmResponse(ctx context.Context, sessionID string, req ConfirmRequest) (ConfirmResponse, error) {
 	ch := make(chan ConfirmResponse, 1)
 
 	confirmMu.Lock()
-	confirmChs[sessionID] = append(confirmChs[sessionID], ch)
+	confirmChs[sessionID] = append(confirmChs[sessionID], pendingConfirm{req: req, ch: ch})
 	confirmMu.Unlock()
 
 	defer func() {
 		confirmMu.Lock()
 		list := confirmChs[sessionID]
-		for i, c := range list {
-			if c == ch {
+		for i, item := range list {
+			if item.ch == ch {
 				// Copy to avoid slice aliasing (same as SubmitConfirm).
-				newList := make([]chan ConfirmResponse, 0, len(list)-1)
+				newList := make([]pendingConfirm, 0, len(list)-1)
 				newList = append(newList, list[:i]...)
 				newList = append(newList, list[i+1:]...)
 				confirmChs[sessionID] = newList
@@ -68,39 +82,175 @@ func WaitForConfirm(ctx context.Context, sessionID string, req ConfirmRequest) (
 
 	select {
 	case <-ctx.Done():
-		return false, ctx.Err()
+		return ConfirmResponse{Approved: false, Action: ConfirmActionReject}, ctx.Err()
 	case resp := <-ch:
-		return resp.Approved, nil
+		resp = normalizeConfirmResponse(resp)
+		return resp, nil
 	case <-time.After(5 * time.Minute):
-		return false, fmt.Errorf("confirm timed out")
+		return ConfirmResponse{Approved: false, Action: ConfirmActionReject}, fmt.Errorf("confirm timed out")
 	}
 }
 
-func SubmitConfirm(sessionID string, approved bool) bool {
+func WaitForConfirm(ctx context.Context, sessionID string, req ConfirmRequest) (bool, error) {
+	resp, err := WaitForConfirmResponse(ctx, sessionID, req)
+	if err != nil {
+		return false, err
+	}
+	return resp.Approved, nil
+}
+
+func SubmitConfirmResponse(sessionID string, resp ConfirmResponse) bool {
+	resp = normalizeConfirmResponse(resp)
 	confirmMu.Lock()
 	list := confirmChs[sessionID]
 	if len(list) == 0 {
 		confirmMu.Unlock()
 		return false
 	}
-	ch := list[0]
+	item := list[0]
 	// Copy the tail into a fresh slice so a concurrent
 	// WaitForConfirm append cannot write into the slot we
 	// just released via list[1:] (slice aliasing bug).
-	rest := make([]chan ConfirmResponse, len(list)-1)
+	rest := make([]pendingConfirm, len(list)-1)
 	copy(rest, list[1:])
 	confirmChs[sessionID] = rest
 	if len(confirmChs[sessionID]) == 0 {
 		delete(confirmChs, sessionID)
 	}
+	if resp.Action == ConfirmActionAlways && resp.Approved {
+		rememberAllowedConfirmLocked(sessionID, item.req)
+	}
 	confirmMu.Unlock()
 
 	select {
-	case ch <- ConfirmResponse{Approved: approved}:
+	case item.ch <- resp:
 		return true
 	default:
 		return false
 	}
+}
+
+func SubmitConfirm(sessionID string, approved bool) bool {
+	action := ConfirmActionReject
+	if approved {
+		action = ConfirmActionOnce
+	}
+	return SubmitConfirmResponse(sessionID, ConfirmResponse{Approved: approved, Action: action})
+}
+
+func normalizeConfirmResponse(resp ConfirmResponse) ConfirmResponse {
+	switch resp.Action {
+	case ConfirmActionAlways, ConfirmActionOnce:
+		resp.Approved = true
+	case ConfirmActionReject:
+		resp.Approved = false
+	default:
+		if resp.Approved {
+			resp.Action = ConfirmActionOnce
+		} else {
+			resp.Action = ConfirmActionReject
+		}
+	}
+	return resp
+}
+
+// NormalizePermissionLevel normalises persisted/session permission
+// values into the three supported levels.
+func NormalizePermissionLevel(level string) string {
+	switch level {
+	case PermissionAuto, PermissionFull:
+		return level
+	default:
+		return PermissionAsk
+	}
+}
+
+// SetSessionPermissionLevel publishes a live permission override for
+// a session. It is intentionally process-local: conversations persist
+// the durable value in metadata, while this map lets an already-running
+// tool dispatch observe a GUI permission change immediately.
+func SetSessionPermissionLevel(sessionID, level string) {
+	if sessionID == "" {
+		return
+	}
+	confirmMu.Lock()
+	defer confirmMu.Unlock()
+	if level == "" {
+		delete(sessionPermissions, sessionID)
+		return
+	}
+	level = NormalizePermissionLevel(level)
+	sessionPermissions[sessionID] = level
+}
+
+// SessionPermissionLevel returns the live process-local permission
+// override for a session, or "" when no override is installed.
+func SessionPermissionLevel(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	confirmMu.Lock()
+	defer confirmMu.Unlock()
+	return sessionPermissions[sessionID]
+}
+
+func IsConfirmAllowed(sessionID string, req ConfirmRequest) bool {
+	key := confirmAllowKey(req)
+	if sessionID == "" || key == "" {
+		return false
+	}
+	confirmMu.Lock()
+	defer confirmMu.Unlock()
+	_, ok := confirmAllowed[sessionID][key]
+	return ok
+}
+
+func rememberAllowedConfirmLocked(sessionID string, req ConfirmRequest) {
+	key := confirmAllowKey(req)
+	if sessionID == "" || key == "" {
+		return
+	}
+	if confirmAllowed[sessionID] == nil {
+		confirmAllowed[sessionID] = make(map[string]struct{})
+	}
+	confirmAllowed[sessionID][key] = struct{}{}
+}
+
+func confirmAllowKey(req ConfirmRequest) string {
+	if req.ToolName == "" {
+		return ""
+	}
+	if req.ResolvedPath != "" {
+		return req.ToolName + "|path|" + req.PathClass + "|" + req.ResolvedPath
+	}
+	return req.ToolName + "|args|" + normalizeConfirmArgs(req.Args)
+}
+
+func normalizeConfirmArgs(args string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(args), &payload); err == nil {
+		if command, ok := payload["command"].(string); ok {
+			return compactSpaces(command)
+		}
+	}
+	return compactSpaces(args)
+}
+
+func compactSpaces(s string) string {
+	out := make([]rune, 0, len(s))
+	lastSpace := false
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if !lastSpace {
+				out = append(out, ' ')
+				lastSpace = true
+			}
+			continue
+		}
+		out = append(out, r)
+		lastSpace = false
+	}
+	return string(out)
 }
 
 func MarshalConfirm(req ConfirmRequest) string {
@@ -138,8 +288,13 @@ func PermissionLevelFromCtx(ctx context.Context) string {
 	if ctx == nil {
 		return PermissionAsk
 	}
+	if sid, ok := ctx.Value(SessionIDKey{}).(string); ok {
+		if level := SessionPermissionLevel(sid); level != "" {
+			return level
+		}
+	}
 	if v, ok := ctx.Value(PermissionLevelKey{}).(string); ok && v != "" {
-		return v
+		return NormalizePermissionLevel(v)
 	}
 	return PermissionAsk
 }
@@ -164,6 +319,9 @@ func RequireConfirm(ctx context.Context, req ConfirmRequest) (bool, error) {
 	emit := confirmEmitterFromCtx(ctx)
 	if emit == nil || sid == "" {
 		return false, fmt.Errorf("confirm unavailable (session or emitter missing)")
+	}
+	if IsConfirmAllowed(sid, req) {
+		return true, nil
 	}
 
 	emit(req)

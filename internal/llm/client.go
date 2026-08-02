@@ -12,6 +12,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/tool"
@@ -29,9 +32,9 @@ type StreamChunk struct {
 	// o1 reasoning tokens). Empty for models that don't
 	// emit thinking. Surfaced all the way to the UI as a
 	// collapsible "thinking" block (DeepSeek-style).
-	Thinking string
-	Done     bool
-	Err      error
+	Thinking  string
+	Done      bool
+	Err       error
 	TokensIn  int
 	TokensOut int
 
@@ -54,9 +57,9 @@ type ToolCallDelta struct {
 // Temperature == 0 and TopP == 0 it picks a default; MaxTokens == 0
 // means "no cap".
 type ChatOptions struct {
-	Temperature    float64
-	TopP           float64
-	MaxTokens      int
+	Temperature     float64
+	TopP            float64
+	MaxTokens       int
 	ReasoningEffort string // off|low|medium|high|max; empty means not set
 }
 
@@ -86,7 +89,18 @@ type providerEntry struct {
 	model     string
 	apiKey    string
 	baseURL   string
+
+	// ResponseHeaderTimeout bounds a stalled request before the server
+	// responds. StreamIdleTimeout only applies after a response is open,
+	// so a long-running response remains valid while it keeps producing data.
+	responseHeaderTimeout time.Duration
+	streamIdleTimeout     time.Duration
 }
+
+const (
+	defaultResponseHeaderTimeout = 60 * time.Second
+	defaultStreamIdleTimeout     = 120 * time.Second
+)
 
 type Client struct {
 	providers map[string]*providerEntry
@@ -96,6 +110,143 @@ type Client struct {
 	// we can answer questions like "what models does provider X
 	// expose?" and "what was the configured default model?".
 	cfgModels []config.ProviderConfig
+}
+
+// streamingHTTPClient creates a client that times out only while waiting for
+// response headers. A total client timeout is unsuitable for SSE because it
+// would terminate a healthy, long-running response.
+func streamingHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
+	client := *NewHTTPClient()
+	client.Timeout = 0
+
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = defaultResponseHeaderTimeout
+	}
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		transport = transport.Clone()
+		transport.ResponseHeaderTimeout = responseHeaderTimeout
+		client.Transport = transport
+	} else if client.Transport == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.ResponseHeaderTimeout = responseHeaderTimeout
+		client.Transport = transport
+	}
+	return &client
+}
+
+// idleTimeoutReader resets its watchdog whenever transport bytes arrive. The
+// watchdog cancels the request context, which closes the underlying response
+// body and unblocks a pending Read without leaving a goroutine behind.
+type idleTimeoutReader struct {
+	r       io.Reader
+	timeout time.Duration
+	cancel  context.CancelFunc
+
+	activity chan struct{}
+	stop     chan struct{}
+	done     chan struct{}
+	once     sync.Once
+	timedOut atomic.Bool
+}
+
+func newIdleTimeoutReader(r io.Reader, timeout time.Duration, cancel context.CancelFunc) *idleTimeoutReader {
+	if timeout <= 0 {
+		timeout = defaultStreamIdleTimeout
+	}
+	w := &idleTimeoutReader{
+		r:        r,
+		timeout:  timeout,
+		cancel:   cancel,
+		activity: make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	go w.watch()
+	return w
+}
+
+func (w *idleTimeoutReader) watch() {
+	defer close(w.done)
+	timer := time.NewTimer(w.timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-w.stop:
+			return
+		case <-w.activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(w.timeout)
+		case <-timer.C:
+			w.timedOut.Store(true)
+			w.cancel()
+			return
+		}
+	}
+}
+
+func (w *idleTimeoutReader) Read(p []byte) (int, error) {
+	n, err := w.r.Read(p)
+	if n > 0 {
+		select {
+		case w.activity <- struct{}{}:
+		default:
+		}
+	}
+	if err != nil && n == 0 && w.timedOut.Load() {
+		return 0, fmt.Errorf("LLM stream idle for %s: %w", w.timeout, context.DeadlineExceeded)
+	}
+	return n, err
+}
+
+func (w *idleTimeoutReader) Close() error {
+	w.once.Do(func() {
+		close(w.stop)
+		<-w.done
+	})
+	if closer, ok := w.r.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+func streamTimeouts(p *providerEntry) (time.Duration, time.Duration) {
+	headerTimeout := p.responseHeaderTimeout
+	if headerTimeout <= 0 {
+		headerTimeout = defaultResponseHeaderTimeout
+	}
+	idleTimeout := p.streamIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultStreamIdleTimeout
+	}
+	return headerTimeout, idleTimeout
+}
+
+// manageStream owns the response body and maps watchdog cancellation to the
+// normal timeout error path. Its send is cancellation-aware so an abandoned
+// consumer cannot retain the parser or idle watchdog.
+func manageStream(ctx context.Context, cancel context.CancelFunc, provider string, body io.Closer, stream <-chan StreamChunk) <-chan StreamChunk {
+	out := make(chan StreamChunk, 64)
+	go func() {
+		defer close(out)
+		defer cancel()
+		defer body.Close()
+		for chunk := range stream {
+			if chunk.Err != nil {
+				chunk.Err = ClassifyAPIError(provider, chunk.Err)
+			}
+			select {
+			case out <- chunk:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
 }
 
 func NewClient(cfg *config.LLMConfig) (*Client, error) {
@@ -131,11 +282,13 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 
 	for _, p := range cfg.Providers {
 		entry := &providerEntry{
-			name:     p.Name,
-			protocol: p.GetProtocol(),
-			model:    p.EffectiveModel(), // start with the default model
-			apiKey:   p.APIKey,
-			baseURL:  p.BaseURL,
+			name:                  p.Name,
+			protocol:              p.GetProtocol(),
+			model:                 p.EffectiveModel(), // start with the default model
+			apiKey:                p.APIKey,
+			baseURL:               p.BaseURL,
+			responseHeaderTimeout: defaultResponseHeaderTimeout,
+			streamIdleTimeout:     defaultStreamIdleTimeout,
 		}
 
 		switch p.GetProtocol() {
@@ -241,10 +394,25 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
 		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
 	}
+	log.Printf("%s[llm] request provider=%s model=%s messages=%d tools=%d estimated_tokens=%d context_window=%d body_bytes=%d",
+		trace.LogPrefix(ctx),
+		p.name,
+		model,
+		len(messages),
+		len(tools),
+		EstimatePromptTokens(messages, tools),
+		normalizedContextWindow(c.ContextWindow(p.name, model)),
+		len(req.Body),
+	)
 
+	// Give this round its own cancellation path. The idle watchdog cancels the
+	// transport while the caller's context stays available to receive the
+	// resulting timeout chunk.
+	streamCtx, cancelStream := context.WithCancel(ctx)
 	// Send the request and return the parsed stream.
-	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
+	httpReq, err := http.NewRequestWithContext(streamCtx, req.Method, req.URL, bytes.NewReader(req.Body))
 	if err != nil {
+		cancelStream()
 		ch := make(chan StreamChunk, 1)
 		ch <- StreamChunk{Err: err}
 		close(ch)
@@ -254,9 +422,11 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 		httpReq.Header.Set(k, v)
 	}
 
-	httpClient := NewHTTPClient()
+	headerTimeout, idleTimeout := streamTimeouts(p)
+	httpClient := streamingHTTPClient(headerTimeout)
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
+		cancelStream()
 		ch := make(chan StreamChunk, 1)
 		ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
 		close(ch)
@@ -265,13 +435,15 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		cancelStream()
 		ch := make(chan StreamChunk, 1)
 		ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(errBody)))}
 		close(ch)
 		return ch
 	}
 
-	return p.adapter.ParseStream(resp.Body)
+	body := newIdleTimeoutReader(resp.Body, idleTimeout, cancelStream)
+	return manageStream(ctx, cancelStream, p.name, body, p.adapter.ParseStream(body))
 }
 
 // ToolsFromRegistryDef builds []ToolDef from the tool registry.
@@ -324,6 +496,8 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 
 	go func() {
 		defer close(ch)
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		defer cancelStream()
 
 		// Per-model overrides win over the supplied opts when set.
 		// (Per-model MaxTokensOutput is non-zero → use it; otherwise
@@ -373,7 +547,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			return
 		}
 		endpoint := strings.TrimRight(p.baseURL, "/") + "/chat/completions"
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			ch <- StreamChunk{Err: fmt.Errorf("build openai request: %w", err)}
 			return
@@ -394,13 +568,15 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		if p.apiKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 		}
-		httpClient := &http.Client{Timeout: 0}
+		headerTimeout, idleTimeout := streamTimeouts(p)
+		httpClient := streamingHTTPClient(headerTimeout)
 		resp, err := httpClient.Do(httpReq)
 		if err != nil {
 			ch <- StreamChunk{Err: ClassifyAPIError(p.name, err)}
 			return
 		}
-		defer resp.Body.Close()
+		streamBody := newIdleTimeoutReader(resp.Body, idleTimeout, cancelStream)
+		defer streamBody.Close()
 		if resp.StatusCode >= 400 {
 			// Read up to 4 KB of body for the error message.
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -423,13 +599,13 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		// surface a "0 chars received" line at the end of
 		// the stream and the user can copy the raw chunk
 		// dump into the issue tracker.
-		reader := bufio.NewReaderSize(resp.Body, 1<<20)
+		reader := bufio.NewReaderSize(streamBody, 1<<20)
 		var (
-			rawChunks      int
-			parseFailures  int
-			contentChars   int
-			thinkingChars  int
-			choiceCount    int
+			rawChunks     int
+			parseFailures int
+			contentChars  int
+			thinkingChars int
+			choiceCount   int
 		)
 		for {
 			line, err := reader.ReadBytes('\n')
@@ -605,31 +781,31 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 // `ReasoningContent` — that field would be silently dropped
 // by the JSON decoder.
 type openaiStreamResponse struct {
-	ID                string                         `json:"id"`
-	Object            string                         `json:"object"`
-	Created           int64                          `json:"created"`
-	Model             string                         `json:"model"`
-	Choices           []openaiStreamChoice           `json:"choices"`
-	Usage             *openaiStreamUsage             `json:"usage,omitempty"`
-	SystemFingerprint string                         `json:"system_fingerprint,omitempty"`
+	ID                string               `json:"id"`
+	Object            string               `json:"object"`
+	Created           int64                `json:"created"`
+	Model             string               `json:"model"`
+	Choices           []openaiStreamChoice `json:"choices"`
+	Usage             *openaiStreamUsage   `json:"usage,omitempty"`
+	SystemFingerprint string               `json:"system_fingerprint,omitempty"`
 }
 
 type openaiStreamChoice struct {
-	Index        int                       `json:"index"`
-	Delta        openaiStreamChoiceDelta   `json:"delta"`
-	FinishReason *string                   `json:"finish_reason,omitempty"`
+	Index        int                     `json:"index"`
+	Delta        openaiStreamChoiceDelta `json:"delta"`
+	FinishReason *string                 `json:"finish_reason,omitempty"`
 }
 
 type openaiStreamChoiceDelta struct {
-	Role             string                    `json:"role,omitempty"`
-	Content          string                    `json:"content,omitempty"`
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
 	// Text is the legacy /v1/completions field name
 	// (completions API, not chat). Some OpenAI-compatible
 	// proxies that route the chat completions endpoint
 	// through a completions-style backend emit `text`
 	// instead of `content` — we read both and pick whichever
 	// is non-empty.
-	Text             string                    `json:"text,omitempty"`
+	Text string `json:"text,omitempty"`
 	// ReasoningContent is the chain-of-thought / reasoning
 	// delta. Sent by DeepSeek (their `reasoning_content`
 	// field) and by OpenAI o-series models (their
@@ -647,10 +823,10 @@ type openaiStreamFunctionCall struct {
 }
 
 type openaiStreamToolCall struct {
-	Index    int                       `json:"index"`
-	ID       string                    `json:"id"`
-	Type     string                    `json:"type"`
-	Function openaiStreamToolCallFunc  `json:"function"`
+	Index    int                      `json:"index"`
+	ID       string                   `json:"id"`
+	Type     string                   `json:"type"`
+	Function openaiStreamToolCallFunc `json:"function"`
 }
 
 type openaiStreamToolCallFunc struct {
@@ -788,6 +964,15 @@ func (c *Client) ContextWindow(providerName, modelName string) int {
 	return 0
 }
 
+// normalizedContextWindow provides the same conservative fallback used by
+// the agent when a model omits max_tokens_context.
+func normalizedContextWindow(window int) int {
+	if window <= 0 {
+		return DefaultContextWindow
+	}
+	return window
+}
+
 // ModelMaxTokensOutput returns the per-model MaxTokensOutput
 // override, or 0 if the model is unknown / unset. Callers usually
 // fall back to LLMConfig.MaxTokens (the global setting) when
@@ -861,7 +1046,9 @@ func topLevelKeys(payload []byte) []string {
 // payload is a normal response.
 //
 // A proxy that returns 200 OK with
-//   {"error": {"message": "...", "type": "...", "code": "..."}}
+//
+//	{"error": {"message": "...", "type": "...", "code": "..."}}
+//
 // is a common OpenAI-compatible pattern for surfacing
 // upstream failures (rate limits, quota exceeded,
 // bad request) without breaking the SSE framing. The
@@ -914,7 +1101,9 @@ func extractProxyError(payload []byte) string {
 //
 // Note: `message` is intentionally NOT in the list.
 // A common proxy pattern is
-//   {"error": {"message": "..."}}
+//
+//	{"error": {"message": "..."}}
+//
 // and including `message` as a content candidate
 // would (and did) cause the walker to surface the
 // error message as a fake assistant reply. The

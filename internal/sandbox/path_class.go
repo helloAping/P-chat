@@ -68,7 +68,7 @@ func (c PathClass) String() string { return string(c) }
 // paths, as built by Sandbox.New — the caller is responsible for
 // home expansion and `filepath.Abs`. classifyPath itself only
 // does the containment check.
-func classifyPath(path, projectRoot string, extraAllowed []string, protectedDirs []string) PathClass {
+func classifyPath(path, projectRoot string, extraAllowed []string, protectedDirs []string, protectedWideDirs []string) PathClass {
 	if path == "" {
 		// Treat empty path as external (caller decides whether
 		// that's block or confirm; classifyPath only classifies).
@@ -80,8 +80,8 @@ func classifyPath(path, projectRoot string, extraAllowed []string, protectedDirs
 		return PathClassExternal
 	}
 
-	// 1. Protected paths win over everything. Even the project
-	//    root can't open up ~/.ssh or /etc.
+	// 1. Specific protected paths win over everything. Even the
+	//    project root can't open up ~/.ssh or /etc.
 	for _, dir := range protectedDirs {
 		if dir == "" {
 			continue
@@ -92,14 +92,29 @@ func classifyPath(path, projectRoot string, extraAllowed []string, protectedDirs
 	}
 
 	// 2. Project root. The session's own working directory
-	//    deserves the relaxed read / confirm-write policy.
+	//    deserves the relaxed read / confirm-write policy. This
+	//    takes priority over WIDE protected paths (e.g. the whole
+	//    home dir), so a project living under ~/ isn't hard-blocked.
 	if projectRoot != "" {
 		if isPathUnder(cleaned, projectRoot) {
 			return PathClassProject
 		}
 	}
 
-	// 3. User's extra-allow list (Phase 2 whitelist). The user
+	// 3. Wide protected paths (home or its parent). Checked AFTER
+	//    the project root so they only guard non-project paths —
+	//    a home-wide protection still hard-blocks anything outside
+	//    the session's project.
+	for _, dir := range protectedWideDirs {
+		if dir == "" {
+			continue
+		}
+		if isPathUnder(cleaned, dir) {
+			return PathClassProtected
+		}
+	}
+
+	// 4. User's extra-allow list (Phase 2 whitelist). The user
 	//    has explicitly said "this directory is OK to read AND
 	//    write without a confirm modal", so it sits in its own
 	//    bucket — distinct from project because the policy is
@@ -113,7 +128,7 @@ func classifyPath(path, projectRoot string, extraAllowed []string, protectedDirs
 		}
 	}
 
-	// 4. Global vs External. The only difference is whether the
+	// 5. Global vs External. The only difference is whether the
 	//    session has pinned a project at all:
 	//      - projectRoot == ""  → external (the "global mode" UX)
 	//      - projectRoot != ""  → global (the path is outside the

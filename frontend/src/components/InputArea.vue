@@ -6,25 +6,28 @@
 // insensitively. Unknown commands fall through to the normal send
 // path so the LLM can answer "what is /foo?" questions naturally.
 
-import { onMounted, ref, computed, watch, nextTick } from 'vue'
-import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useMessage } from 'naive-ui'
+import { h, onMounted, ref, computed, watch, nextTick } from 'vue'
+import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
-  Lock, Unlock, Key, Database, Terminal,
+  Lock, Unlock, Key, Database, Copy, Scissors, ClipboardPaste, TextCursorInput,
+  Settings,
 } from './icons'
 import * as api from '../api/client'
 import {
   state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments,
-  isStreaming, startStream, stopStream, appendStreamEvent, endStream,
+  isStreaming,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
-  recoverMissingParts,
+  currentPendingConfirm, submitToolConfirm,
 } from '../stores/chat'
+import { stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
 import { notifyManager } from '../utils/notify'
+import { copyText } from '../utils/clipboard'
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const inputText = ref('')
@@ -63,8 +66,10 @@ watch(currentPendingInput, (val) => {
 // Also sync after backspace / clear (send resets inputText to '').
 onMounted(() => nextTick(resizeTextarea))
 const sending = ref(false)
+const sendPreflightSessions = new Set<string>()
 const showSessionConfig = ref(false)
 const message = useMessage()
+const dialog = useDialog()
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const reasoningEffort = computed({
@@ -132,7 +137,13 @@ async function onChangePermissionLevel(val: string) {
       ...state.sessionMeta[state.currentID],
       permission_level: val,
     }
-  } catch {}
+    if ((val === 'auto' || val === 'full') && currentPendingConfirm.value) {
+      submitToolConfirm('once')
+      message.info('已按新的权限设置通过当前沙箱请求')
+    }
+  } catch (e: any) {
+    message.error(`权限更新失败：${e?.message || e}`)
+  }
 }
 
 function onToggleMute() {
@@ -148,6 +159,17 @@ const kbOptions = computed(() => [
   { label: '知识库 · 全部', value: '__all__' },
   ...kbBases.value.filter(b => b.enabled).map(b => ({ label: `知识库 · ${b.name}`, value: b.name })),
 ])
+const kbMenuOptions = computed<DropdownOption[]>(() =>
+  kbOptions.value.map((opt) => ({
+    label: opt.value === '__off__'
+      ? '不使用知识库'
+      : opt.value === '__all__'
+        ? '全部知识库'
+        : opt.value,
+    key: opt.value,
+    icon: menuIcon(Database),
+  })),
+)
 const kbBase = computed({
   get: () => {
     if (!state.currentID) return '__off__'
@@ -237,6 +259,19 @@ async function onFiles(files: FileList | null) {
   if (fileInput.value) fileInput.value.value = ''
 }
 
+function openAttachmentPreview(a: { kind: string; _previewURL: string; name: string; _error: boolean }) {
+  if (a._error || !a._previewURL) return
+  if (a.kind === 'image') {
+    state.lightbox = { show: true, src: a._previewURL, alt: a.name, kind: 'image' }
+  } else if (a.kind === 'video') {
+    state.lightbox = { show: true, src: a._previewURL, alt: a.name, kind: 'video' }
+  }
+}
+
+function isPreviewableAttachment(a: { kind: string; _error: boolean; _previewURL: string }) {
+  return !a._error && !!a._previewURL && (a.kind === 'image' || a.kind === 'video')
+}
+
 // Build a friendly name for a clipboard file item. Chromium
 // hands image screenshots back as File{name: 'image.png'} —
 // a generic placeholder that would collide if the user
@@ -321,6 +356,123 @@ function onPaste(e: ClipboardEvent) {
   const preview = files.slice(0, 2).map(f => f.name).join(', ')
   const more = files.length > 2 ? ` 等 ${files.length} 个` : ''
   message.success(`已添加附件: ${preview}${more}`, { duration: 1800 })
+}
+
+const inputContextMenuVisible = ref(false)
+const inputContextMenuX = ref(0)
+const inputContextMenuY = ref(0)
+
+function menuIcon(icon: any) {
+  return () => h(icon, { size: 14 })
+}
+
+const inputContextMenuOptions: DropdownOption[] = [
+  { key: 'copy', label: '复制', icon: menuIcon(Copy) },
+  { key: 'cut', label: '剪切', icon: menuIcon(Scissors) },
+  { key: 'paste', label: '粘贴', icon: menuIcon(ClipboardPaste) },
+  { key: 'select_all', label: '全选', icon: menuIcon(TextCursorInput) },
+]
+
+function inputSelection() {
+  const el = inputEl.value
+  const start = el?.selectionStart ?? 0
+  const end = el?.selectionEnd ?? start
+  return { el, start, end, selected: inputText.value.slice(start, end) }
+}
+
+function setInputSelection(start: number, end = start) {
+  nextTick(() => {
+    const el = inputEl.value
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(start, end)
+    resizeTextarea()
+  })
+}
+
+async function copyInputSelection() {
+  const { selected } = inputSelection()
+  const text = selected || inputText.value
+  if (!text) {
+    message.warning('没有可复制内容')
+    return false
+  }
+  const ok = await copyText(text)
+  if (ok) message.success('复制成功')
+  else message.error('复制失败')
+  return ok
+}
+
+async function cutInputSelection() {
+  const { start, end, selected } = inputSelection()
+  const text = selected || inputText.value
+  if (!text) {
+    message.warning('没有可剪切内容')
+    return
+  }
+  const ok = await copyText(text)
+  if (!ok) {
+    message.error('剪切失败')
+    return
+  }
+  if (selected) {
+    inputText.value = inputText.value.slice(0, start) + inputText.value.slice(end)
+    setInputSelection(start)
+  } else {
+    inputText.value = ''
+    setInputSelection(0)
+  }
+  message.success('剪切成功')
+}
+
+async function pasteIntoInput() {
+  try {
+    const text = await navigator.clipboard?.readText?.()
+    if (!text) {
+      message.warning('剪贴板为空')
+      return
+    }
+    const { start, end } = inputSelection()
+    inputText.value = inputText.value.slice(0, start) + text + inputText.value.slice(end)
+    setInputSelection(start + text.length)
+    message.success('粘贴成功')
+  } catch {
+    message.error('粘贴失败')
+  }
+}
+
+function selectAllInputText() {
+  inputEl.value?.focus()
+  inputEl.value?.select()
+  message.success('全选成功')
+}
+
+function onInputContextMenu(e: MouseEvent) {
+  e.preventDefault()
+  inputContextMenuVisible.value = false
+  nextTick(() => {
+    inputContextMenuX.value = e.clientX
+    inputContextMenuY.value = e.clientY
+    inputContextMenuVisible.value = true
+  })
+}
+
+async function onInputContextMenuSelect(key: string | number) {
+  inputContextMenuVisible.value = false
+  switch (key) {
+    case 'copy':
+      await copyInputSelection()
+      break
+    case 'cut':
+      await cutInputSelection()
+      break
+    case 'paste':
+      await pasteIntoInput()
+      break
+    case 'select_all':
+      selectAllInputText()
+      break
+  }
 }
 
 // --- Slash command palette ---
@@ -649,9 +801,68 @@ function pushAssistantMessage(sessionId: string, content: string) {
   state.sessionMessages[sessionId].push({ role: 'assistant', content, parts: [] })
 }
 
+function hasUnfinishedTodos(todos: api.TodoItem[]): boolean {
+  return todos.some(todo => todo.status === 'pending' || todo.status === 'in_progress')
+}
+
+type TodoSendPreflightChoice = 'clear' | 'keep' | 'cancel'
+type TodoSendMode = 'auto' | 'resume' | 'clear'
+
+function chooseTodoSendMode(): Promise<TodoSendPreflightChoice> {
+  return new Promise((resolve) => {
+    let settled = false
+    let dialogRef: { destroy: () => void } | null = null
+    const finish = (choice: TodoSendPreflightChoice) => {
+      if (settled) return
+      settled = true
+      resolve(choice)
+      dialogRef?.destroy()
+    }
+    dialogRef = dialog.warning({
+      title: '存在未完成任务',
+      content: '上次任务还有未完成待办。你可以清空旧待办后发送，也可以保留待办继续发送当前消息。',
+      action: () => h(NSpace, { justify: 'end', size: 8 }, () => [
+        h(NButton, { size: 'small', onClick: () => finish('cancel') }, { default: () => '取消发送' }),
+        h(NButton, { size: 'small', secondary: true, onClick: () => finish('keep') }, { default: () => '继续发送不清空' }),
+        h(NButton, { size: 'small', type: 'warning', onClick: () => finish('clear') }, { default: () => '清空并继续' }),
+      ]),
+      onClose: () => finish('cancel'),
+    })
+  })
+}
+
+async function clearUnfinishedTodosBeforeSend(id: string): Promise<TodoSendMode | null> {
+  let todos = state.sessionTodos[id] || []
+  try {
+    const response = await api.getTodos(id)
+    todos = response.todos || []
+    state.sessionTodos[id] = todos
+  } catch {
+    // Fall back to todo_write events already held by the local store.
+  }
+  if (!hasUnfinishedTodos(todos)) return 'auto'
+
+  const todoSendMode = await chooseTodoSendMode()
+  if (todoSendMode === 'cancel') return null
+  if (todoSendMode === 'keep') return 'resume'
+  try {
+    await api.clearTodos(id)
+    state.sessionTodos[id] = []
+    return 'clear'
+  } catch (e: any) {
+    message.error(`清空待办失败：${e?.message || e}`)
+    return null
+  }
+}
+
 async function send() {
   const raw = inputText.value.trim()
   if (!raw) return
+  if (isStreaming.value) {
+    // 当前会话已有流在进行，直接忽略重复发送。
+    // The active session already has a stream; ignore duplicate sends.
+    return
+  }
   // NOTE: we intentionally do NOT gate on `sending.value`
   // here. That ref is local to this InputArea instance, but
   // multiple conversations can stream in parallel. If session
@@ -696,6 +907,23 @@ async function send() {
       inputText.value = ''
       return
     }
+  }
+
+  const preflightSessionID = state.currentID
+  let todoMode: TodoSendMode = 'auto'
+  if (preflightSessionID) {
+    if (sendPreflightSessions.has(preflightSessionID)) return
+    sendPreflightSessions.add(preflightSessionID)
+    let selectedMode: TodoSendMode | null = null
+    try {
+      selectedMode = await clearUnfinishedTodosBeforeSend(preflightSessionID)
+    } finally {
+      sendPreflightSessions.delete(preflightSessionID)
+    }
+    if (!selectedMode) return
+    todoMode = selectedMode
+    // Do not move a message across sessions while the confirmation is open.
+    if (state.currentID !== preflightSessionID) return
   }
 
   const text = inputText.value.trim()
@@ -808,13 +1036,9 @@ async function send() {
   notifyManager.unlock()
 
   sending.value = true
-  const ctrl = new AbortController()
-  // Install the placeholder assistant message immediately so
-  // the three-bouncing-dots spinner is reachable. The actual
-  // mutation happens in the onEvent callback below.
-  startStream(id, ctrl)
   try {
-    await api.streamMessagesRetry(id, {
+    await submitConversationTurn({
+      sessionId: id,
       message: text,
       // The integer id minted above (and stamped on the
       // local Message as `msg.id`) is shipped to the
@@ -823,50 +1047,25 @@ async function send() {
       // autoincrement. That keeps the local msg.id and
       // the SQLite row id in lockstep, so rollback and
       // regenerate work the instant the user clicks them.
-      client_msg_id: clientMsgId,
+      clientMsgID: clientMsgId,
       provider: meta.provider,
       model: meta.model,
       style: meta.style,
       workMode: meta.workMode,
+      todoMode,
       attachments: inlineAttachments,
-      signal: ctrl.signal,
-      skill_context: pendingSkillContext || undefined,
-      // P0-1: when the SSE stream dies mid-turn, call
-      // the snapshot endpoint to recover whatever
-      // assistant content already landed. The recovery
-      // flow is fire-and-forget from this call site; the
-      // chat store mutates the trailing message
-      // directly. NOT triggered on user abort (the stop
-      // button sets signal.aborted; the underlying
-      // fetch is then cancelled and the drop callback
-      // is short-circuited in client.ts).
-      onStreamDrop: ({ lastSeq, reason }) => {
-        recoverMissingParts(id, lastSeq, reason).catch((err) => {
-          console.warn('[stream] recovery failed:', err)
-        })
-      },
-      onEvent: (ev) => {
+      skillContext: pendingSkillContext || undefined,
+      // 首个流事件到达后，技能上下文已经提交给服务端。
+      // The first stream event confirms the skill context was submitted.
+      onFirstEvent: () => {
         pendingSkillContext = ''
-        // Surface top-level errors (auth, network) as
-        // toast notifications. Per-event errors
-        // (e.g. tool execution failure) flow through
-        // appendStreamEvent and are rendered inline.
-        // Errors with a suggestion get a longer-duration
-        // toast so the user has time to read the fix
-        // hint (especially the vision_unsupported case
-        // where the toast is the first place they see
-        // the actionable advice).
-        if (ev.type === 'error' && ev.error) {
-          if (ev.suggestion) {
-            message.error(`${ev.error}\n${ev.suggestion}`, { duration: 8000 })
-          } else {
-            message.error(ev.error)
-          }
-          // Still call appendStreamEvent so the error text
-          // renders inline in the assistant bubble — the
-          // user sees context for the failure.
+      },
+      onServerError: (event) => {
+        if (event.suggestion) {
+          message.error(`${event.error}\n${event.suggestion}`, { duration: 8000 })
+        } else if (event.error) {
+          message.error(event.error)
         }
-        appendStreamEvent(id, ev)
       },
     })
   } catch (e: any) {
@@ -874,13 +1073,12 @@ async function send() {
       message.error(`发送失败: ${e.message}`)
     }
   } finally {
-    endStream(id)
     sending.value = false
   }
 }
 
 function stop() {
-  if (state.currentID) stopStream(state.currentID)
+  if (state.currentID) stopConversationTurn(state.currentID)
   sending.value = false
 }
 
@@ -924,7 +1122,9 @@ onMounted(() => {
 // and the advanced row (reasoning + KB) which lives behind
 // the "更多" toggle.
 
-const styleOptions = ref<{ label: string; value: string }[]>([])
+const styleOptions = ref<{ label: string; value: string }[]>([
+  { label: '关闭', value: 'off' },
+])
 const workModeOptions = [
   { label: '编码 (coding)', value: 'coding' },
   { label: '日常工作 (daily)', value: 'daily' },
@@ -975,7 +1175,7 @@ async function onStylePick(v: string) {
 }
 
 const currentStyleValue = computed({
-  get: () => currentMeta.value.style || 'tech',
+  get: () => currentMeta.value.style || 'off',
   set: (v: string) => onStylePick(v),
 })
 
@@ -997,6 +1197,33 @@ async function onWorkModePick(v: string) {
   if (s) s.work_mode = mode
 }
 
+const todoLongRunOptions = [
+  { label: '关闭', value: 'off' },
+  { label: '自适应', value: 'adaptive' },
+  { label: '不限轮次', value: 'unlimited' },
+] as const
+
+const todoLongRunMode = computed(() =>
+  state.sessionMeta[state.currentID]?.todo_long_run_mode || 'adaptive',
+)
+
+async function onTodoLongRunPick(v: 'off' | 'adaptive' | 'unlimited') {
+  if (!state.currentID) return
+  try {
+    const resp = await api.updateSessionMeta(state.currentID, { todo_long_run_mode: v })
+    const id = state.currentID
+    const mode = resp.todo_long_run_mode ?? v
+    state.sessionMeta[id] = {
+      ...(state.sessionMeta[id] || currentMeta.value),
+      todo_long_run_mode: mode,
+    }
+    const session = state.sessions.find(s => s.id === id)
+    if (session) session.todo_long_run_mode = mode
+  } catch (e: any) {
+    message.error(`长任务设置失败：${e?.message || e}`)
+  }
+}
+
 const currentWorkModeValue = computed({
   get: () => currentMeta.value.workMode || state.globalWorkMode || 'coding',
   set: (v: string) => onWorkModePick(v),
@@ -1005,10 +1232,6 @@ const currentWorkModeValue = computed({
 const currentWorkModeLabel = computed(() =>
   currentWorkModeValue.value === 'daily' ? '日常' : '编码',
 )
-const workModeIcon = computed(() =>
-  currentWorkModeValue.value === 'daily' ? FileText : Terminal,
-)
-
 // Display label for the reasoning picker. Maps the enum
 // value (off/low/medium/high/max) to the Chinese label
 // that reasoningEffortOptions uses, so the button shows
@@ -1025,6 +1248,10 @@ const currentReasoningLabel = computed(() => {
   const v = reasoningEffort.value || 'off'
   return REASONING_LABELS[v] || v
 })
+
+const sessionConfigSummary = computed(() =>
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 风格${currentStyleLabel.value}`,
+)
 
 // Display label for the knowledge base picker. The "off"
 // and "all" pseudo-bases get short labels so the button
@@ -1096,6 +1323,16 @@ onMounted(() => {
 
 <template>
   <div class="input-area">
+    <NDropdown
+      trigger="manual"
+      placement="bottom-start"
+      :show="inputContextMenuVisible"
+      :x="inputContextMenuX"
+      :y="inputContextMenuY"
+      :options="inputContextMenuOptions"
+      @select="onInputContextMenuSelect"
+      @clickoutside="inputContextMenuVisible = false"
+    />
     <!-- Rollback undo banner -->
     <div v-if="currentRollbackBanner" class="rollback-banner">
       <Undo2 :size="14" class="rollback-banner-icon" />
@@ -1134,78 +1371,8 @@ onMounted(() => {
           :placeholder="isSlashLine() ? '输入 / 后跟命令 (例如 /help)' : '输入消息，Enter 发送，Shift+Enter 换行，Esc 停止，/ 前缀是命令'"
           @keydown="onKeyDown"
           @paste="onPaste"
+          @contextmenu="onInputContextMenu"
         ></textarea>
-        <!-- Session-level option pickers (style + reasoning).
-             These all share the same visual treatment —
-             a compact pill button with a small chevron that
-             opens an NDropdown — so they read as a single
-             "session settings" cluster on the right side of
-             the input. The dropdown is preferred over
-             NSelect here because:
-               1. NSelect's chrome (border + chevron) would
-                  fight the input-wrap's own border and the
-                  attach/send button styling, producing a
-                  visually busy row.
-               2. The trigger is purely cosmetic — the actual
-                  selection lives in the dropdown menu, so
-                  the button just needs to look "pressable"
-                  and show the current value.
-             Reasoning was promoted from the "more" advanced
-             row (PR #10) so the user doesn't have to expand
-             a hidden section to reach a setting they touch
-             on most tasks. -->
-        <NDropdown
-          trigger="click"
-          placement="top-end"
-          :options="styleOptions.map(o => ({ key: o.value, label: o.label }))"
-          @select="(key: string | number) => onStylePick(String(key))"
-        >
-          <button
-            type="button"
-            class="opt-pick"
-            :disabled="!state.currentID"
-            :title="`当前风格: ${currentStyleLabel}`"
-            :aria-label="`当前风格: ${currentStyleLabel}`"
-          >
-            <span class="opt-pick-label">{{ currentStyleLabel }}</span>
-            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
-          </button>
-        </NDropdown>
-        <NDropdown
-          trigger="click"
-          placement="top-end"
-          :options="workModeOptions.map(o => ({ key: o.value, label: o.label }))"
-          @select="(key: string | number) => onWorkModePick(String(key))"
-        >
-          <button
-            type="button"
-            class="opt-pick opt-pick--narrow"
-            :disabled="!state.currentID"
-            :title="`工作模式: ${currentWorkModeValue}`"
-            :aria-label="`工作模式: ${currentWorkModeValue}`"
-          >
-            <component :is="workModeIcon" :size="12" class="opt-pick-icon" />
-            <span class="opt-pick-label">{{ currentWorkModeLabel }}</span>
-            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
-          </button>
-        </NDropdown>
-        <NDropdown
-          trigger="click"
-          placement="top-end"
-          :options="(reasoningEffortOptions[0]?.children || []).map(o => ({ key: o.value, label: o.label }))"
-          @select="(key: string | number) => pickReasoning(String(key))"
-        >
-          <button
-            type="button"
-            class="opt-pick opt-pick--narrow"
-            :disabled="!state.currentID"
-            :title="`推理等级: ${currentReasoningLabel}`"
-            :aria-label="`推理等级: ${currentReasoningLabel}`"
-          >
-            <span class="opt-pick-label">{{ currentReasoningLabel }}</span>
-            <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
-          </button>
-        </NDropdown>
         <button
           v-if="!isStreaming"
           class="send-btn"
@@ -1233,7 +1400,12 @@ onMounted(() => {
           class="attach-chip"
           :class="{ uploading: a._uploading, error: a._error }"
         >
-          <div class="thumb">
+          <div
+            class="thumb"
+            :class="{ 'thumb--previewable': isPreviewableAttachment(a) }"
+            :title="isPreviewableAttachment(a) ? '点击预览' : undefined"
+            @click="openAttachmentPreview(a)"
+          >
             <img v-if="a.kind === 'image'" :src="a._previewURL" :alt="a.name" />
             <video v-else-if="a.kind === 'video'" :src="a._previewURL" muted preload="metadata" />
             <Volume2 v-else-if="a.kind === 'audio'" :size="18" />
@@ -1290,6 +1462,98 @@ onMounted(() => {
             </button>
           </template>
         </ModelPicker>
+
+        <NPopover
+          v-model:show="showSessionConfig"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
+          style="padding: 0; background: transparent; box-shadow: none;"
+        >
+          <template #trigger>
+            <button
+              type="button"
+              class="ctrl-btn session-config-trigger"
+              :disabled="!state.currentID"
+              :title="sessionConfigSummary"
+              :aria-label="`会话设置：${sessionConfigSummary}`"
+            >
+              <Settings :size="13" />
+              <span class="ctrl-btn-label">会话设置</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }}</span>
+            </button>
+          </template>
+          <div class="session-config-popover">
+            <div class="session-config-head">
+              <Settings :size="14" />
+              <span>会话设置</span>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">风格</div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in styleOptions"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': currentStyleValue === opt.value }"
+                  @click="onStylePick(opt.value)"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">类型</div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in workModeOptions"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': currentWorkModeValue === opt.value }"
+                  @click="onWorkModePick(opt.value)"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">思考</div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in reasoningEffortOptions[0]?.children || []"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': reasoningEffort === opt.value }"
+                  @click="pickReasoning(opt.value)"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">长任务</div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in todoLongRunOptions"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': todoLongRunMode === opt.value }"
+                  @click="onTodoLongRunPick(opt.value)"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </NPopover>
 
         <!-- Plan mode toggle: stays inline because the user
              switches it often (planning vs building a feature). -->
@@ -1404,7 +1668,7 @@ onMounted(() => {
           <NDropdown
             trigger="click"
             placement="top-end"
-            :options="kbOptions.map(o => ({ key: o.value, label: o.label }))"
+            :options="kbMenuOptions"
             @select="(key: string | number) => pickKB(String(key))"
           >
             <button
@@ -1509,6 +1773,7 @@ onMounted(() => {
   font-size: 18px;
   flex-shrink: 0;
 }
+.thumb--previewable { cursor: zoom-in; }
 .thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; }
 .name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rm {
@@ -1874,6 +2139,88 @@ onMounted(() => {
   font-family: var(--font-mono);
 }
 .model-badge--unset .model-badge-name { color: var(--text-tertiary); font-style: italic; }
+
+/* --- Session config popover ------------------------------------ */
+.session-config-trigger {
+  background: var(--surface-1);
+  border-color: var(--border-subtle);
+  max-width: 260px;
+}
+.session-config-trigger:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--border-default);
+}
+.session-config-summary {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 400;
+  max-width: 128px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-config-popover {
+  width: min(420px, calc(100vw - 32px));
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 8px;
+}
+.session-config-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 6px 8px;
+}
+.session-config-row {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 8px 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+.session-config-label {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 26px;
+}
+.session-config-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.session-config-choice {
+  height: 26px;
+  padding: 0 9px;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.session-config-choice:hover {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.session-config-choice--active {
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-600);
+}
+.session-config-choice--active:hover {
+  background: var(--brand-100);
+  color: var(--brand-700);
+}
 
 /* --- Permission popover ---------------------------------------- */
 /* The permission picker is an NPopover that anchors to the

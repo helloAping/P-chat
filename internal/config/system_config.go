@@ -4,13 +4,14 @@ import "fmt"
 
 // LimitsConfigPatch is a partial update for LimitsConfig.
 type LimitsConfigPatch struct {
-	AutoCompactBuffer    *int `json:"auto_compact_buffer,omitempty"`
-	ToolResultExecCap    *int `json:"tool_result_exec_cap,omitempty"`
-	ToolResultReadCap    *int `json:"tool_result_read_cap,omitempty"`
-	ToolResultDefaultCap *int `json:"tool_result_default_cap,omitempty"`
-	PruneAfterRounds     *int `json:"prune_after_rounds,omitempty"`
-	MaxRounds            *int `json:"max_rounds,omitempty"`
-	MaxStoredMessages    *int `json:"max_stored_messages,omitempty"`
+	AutoCompactBuffer    *int             `json:"auto_compact_buffer,omitempty"`
+	ToolResultExecCap    *int             `json:"tool_result_exec_cap,omitempty"`
+	ToolResultReadCap    *int             `json:"tool_result_read_cap,omitempty"`
+	ToolResultDefaultCap *int             `json:"tool_result_default_cap,omitempty"`
+	PruneAfterRounds     *int             `json:"prune_after_rounds,omitempty"`
+	MaxRounds            *int             `json:"max_rounds,omitempty"`
+	TodoLongRunMode      *TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	MaxStoredMessages    *int             `json:"max_stored_messages,omitempty"`
 }
 
 // SubAgentConfigPatch is a partial update for SubAgentConfig.
@@ -83,6 +84,9 @@ func mergeLimits(l *LimitsConfig, p *LimitsConfigPatch) {
 	}
 	if p.MaxRounds != nil {
 		l.MaxRounds = *p.MaxRounds
+	}
+	if p.TodoLongRunMode != nil {
+		l.TodoLongRunMode = NormalizeTodoLongRunMode(*p.TodoLongRunMode)
 	}
 	if p.MaxStoredMessages != nil {
 		l.MaxStoredMessages = *p.MaxStoredMessages

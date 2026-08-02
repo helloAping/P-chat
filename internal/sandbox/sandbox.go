@@ -62,11 +62,19 @@ func (d Decision) String() string {
 // is stateless and the classification logic is testable without
 // mutating the struct.
 type Sandbox struct {
-	enabled       bool
-	requireMode   string // "always" | "dangerous" | "confirm" | "never"
-	maxCmdLen     int
+	enabled     bool
+	requireMode string // "always" | "dangerous" | "confirm" | "never"
+	maxCmdLen   int
 	protectedDirs []string // resolved absolute paths (no ~ inside)
 	protectedGlobs []string // raw globs that we still do a substring match for
+	// protectedWideDirs are broad protected prefixes (e.g. the user's
+	// whole home directory) that must NOT shadow a session's project
+	// root. classifyPath checks specific protectedDirs first (highest
+	// priority), then the project root, and only then wide dirs — so a
+	// project living under ~/ still gets normal project policy (read
+	// allow / write confirm) instead of being hard-blocked. Only
+	// specific sensitive dirs like ~/.ssh or /etc remain hard blocks.
+	protectedWideDirs []string
 	execPatterns  []*regexp.Regexp
 	execNames     []string
 	// extraAllowedDirs is the per-user whitelist (Phase 2
@@ -107,7 +115,19 @@ func New(cfg config.SandboxConfig) (*Sandbox, error) {
 		}
 		expanded := expandHome(p)
 		if abs, err := filepath.Abs(expanded); err == nil {
-			s.protectedDirs = append(s.protectedDirs, abs)
+			abs = filepath.Clean(abs)
+			// A protected path is "wide" when it covers the user's
+			// home (or its parent) — e.g. the bare home dir added by
+			// defaultWriteProtectedPaths, or "/". Such broad
+			// protection must not shadow a session's project root,
+			// otherwise a project living under ~/ gets hard-blocked.
+			// Specific sensitive dirs (~/.ssh, /etc, a config file)
+			// stay in protectedDirs and keep the highest priority.
+			if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" && isPathUnder(homeDir, abs) {
+				s.protectedWideDirs = append(s.protectedWideDirs, abs)
+			} else {
+				s.protectedDirs = append(s.protectedDirs, abs)
+			}
 		} else {
 			// Fall back to the literal pattern (substring match).
 			s.protectedGlobs = append(s.protectedGlobs, p)
@@ -216,7 +236,7 @@ func (s *Sandbox) CheckWrite(path, projectRoot string) Decision {
 	if path == "" {
 		return Block
 	}
-	class := classifyPath(path, projectRoot, s.extraAllowedDirs, s.protectedDirs)
+	class := classifyPath(path, projectRoot, s.extraAllowedDirs, s.protectedDirs, s.protectedWideDirs)
 	return writeClassDecision(class)
 }
 
@@ -233,7 +253,7 @@ func (s *Sandbox) CheckRead(path, projectRoot string) Decision {
 	if path == "" {
 		return Block
 	}
-	class := classifyPath(path, projectRoot, s.extraAllowedDirs, s.protectedDirs)
+	class := classifyPath(path, projectRoot, s.extraAllowedDirs, s.protectedDirs, s.protectedWideDirs)
 	return readClassDecision(class)
 }
 

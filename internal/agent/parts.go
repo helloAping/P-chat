@@ -47,25 +47,26 @@ import (
 //   - "tool"      — a single tool call (Name, Args, Status, Result, ...)
 //   - "sub_agent" — a nested sub-agent run (Task, Status, Parts)
 //   - "question"  — a user-facing question card (Text=questions JSON,
-//                   Name=answers JSON after the user picks)
+//     Name=answers JSON after the user picks)
 //
 // The JSON tags are the wire format. Anything not appropriate for
 // a given Kind is left at the zero value and is dropped by
 // `omitempty` so e.g. a "text" part never carries a stray
 // "elapsed" field.
 type MessagePart struct {
-	Kind     string        `json:"kind"`
-	Text     string        `json:"text,omitempty"`
-	Streaming bool         `json:"streaming,omitempty"`
-	Name     string        `json:"name,omitempty"`
-	Args     string        `json:"args,omitempty"`
-	Status   string        `json:"status,omitempty"`
-	Result   string        `json:"result,omitempty"`
-	Error    string        `json:"error,omitempty"`
-	Elapsed  string        `json:"elapsed,omitempty"`
-	Task     string        `json:"task,omitempty"`
-	Parts    []MessagePart `json:"parts,omitempty"`
-	ToolID   string        `json:"tool_id,omitempty"`
+	Kind       string `json:"kind"`
+	Text       string `json:"text,omitempty"`
+	textBuffer []byte
+	Streaming  bool          `json:"streaming,omitempty"`
+	Name       string        `json:"name,omitempty"`
+	Args       string        `json:"args,omitempty"`
+	Status     string        `json:"status,omitempty"`
+	Result     string        `json:"result,omitempty"`
+	Error      string        `json:"error,omitempty"`
+	Elapsed    string        `json:"elapsed,omitempty"`
+	Task       string        `json:"task,omitempty"`
+	Parts      []MessagePart `json:"parts,omitempty"`
+	ToolID     string        `json:"tool_id,omitempty"`
 	// AgentType is the sub-agent's registered name
 	// ("explore", "plan", "general-purpose", or a custom
 	// agent from .p-chat/agent/*.md). Set on sub_agent
@@ -104,11 +105,11 @@ type MessagePart struct {
 
 // Part kind numeric constants for dispatch.
 const (
-	PartKindText      = 0
-	PartKindThinking  = 1
-	PartKindTool      = 2
-	PartKindSubAgent  = 3
-	PartKindQuestion  = 4
+	PartKindText     = 0
+	PartKindThinking = 1
+	PartKindTool     = 2
+	PartKindSubAgent = 3
+	PartKindQuestion = 4
 )
 
 // PartKindMap maps numeric part kind to its string representation.
@@ -235,6 +236,22 @@ func (a *partsAccumulator) setActiveParts(p []MessagePart) {
 	}
 }
 
+// appendPartText grows streaming text in a byte slice so thousands of small
+// token deltas remain linear-time. 流结束或创建快照时再一次性转成 string。
+func appendPartText(part *MessagePart, delta string) {
+	if part.textBuffer == nil {
+		part.textBuffer = make([]byte, 0, len(part.Text)+len(delta))
+		part.textBuffer = append(part.textBuffer, part.Text...)
+		part.Text = ""
+	}
+	part.textBuffer = append(part.textBuffer, delta...)
+}
+
+func replacePartText(part *MessagePart, text string) {
+	part.textBuffer = nil
+	part.Text = text
+}
+
 // update applies one chunk to the accumulator. The chunk's role
 // is identified by the same fields chunkToEvent uses on the
 // server: content, thinking, tool_*, sub_agent_*.
@@ -253,15 +270,15 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			// this also ensures the part exists for any
 			// nested content / thinking that follows.
 			sub := MessagePart{
-				Kind:              "sub_agent",
-				Task:              c.SubAgentTask,
-				Status:            "start",
-				AgentType:         c.SubAgentType,
-				AgentColor:        c.SubAgentColor,
-				AgentModel:        c.SubAgentModel,
-				AgentDescription:  c.SubAgentDescription,
-				TaskID:            c.SubAgentTaskID,
-				Parts:             nil,
+				Kind:             "sub_agent",
+				Task:             c.SubAgentTask,
+				Status:           "start",
+				AgentType:        c.SubAgentType,
+				AgentColor:       c.SubAgentColor,
+				AgentModel:       c.SubAgentModel,
+				AgentDescription: c.SubAgentDescription,
+				TaskID:           c.SubAgentTaskID,
+				Parts:            nil,
 			}
 			a.parts = append(a.parts, sub)
 			a.activeSub = len(a.parts) - 1
@@ -434,12 +451,12 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	if c.Thinking != "" {
 		parts := a.activeParts()
 		if i := lastIndexOfKind(parts, "thinking"); i >= 0 && parts[i].Streaming {
-			parts[i].Text += c.Thinking
+			appendPartText(&parts[i], c.Thinking)
 		} else {
 			parts = append(parts, MessagePart{
-				Kind:      "thinking",
-				Text:      c.Thinking,
-				Streaming: true,
+				Kind:       "thinking",
+				Streaming:  true,
+				textBuffer: append([]byte(nil), c.Thinking...),
 			})
 		}
 		a.setActiveParts(parts)
@@ -476,11 +493,11 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			parts[i].Streaming = false
 		}
 		if i := lastIndexOfKind(parts, "text"); i >= 0 {
-			parts[i].Text += c.Content
+			appendPartText(&parts[i], c.Content)
 		} else {
 			parts = append(parts, MessagePart{
-				Kind: "text",
-				Text: c.Content,
+				Kind:       "text",
+				textBuffer: append([]byte(nil), c.Content...),
 			})
 		}
 		a.setActiveParts(parts)
@@ -518,7 +535,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		// trailing open question part in place.
 		var resultPayload struct {
 			Questions []json.RawMessage `json:"questions"`
-			Answers   map[string]string  `json:"answers"`
+			Answers   map[string]string `json:"answers"`
 		}
 		if err := json.Unmarshal([]byte(c.QuestionJSON), &resultPayload); err == nil &&
 			len(resultPayload.Answers) > 0 {
@@ -594,7 +611,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		parts := a.activeParts()
 		for i := len(parts) - 1; i >= 0; i-- {
 			if parts[i].Kind == "text" {
-				parts[i].Text = c.ContentRewrite
+				replacePartText(&parts[i], c.ContentRewrite)
 				break
 			}
 		}
@@ -607,7 +624,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		parts := a.activeParts()
 		for i := len(parts) - 1; i >= 0; i-- {
 			if parts[i].Kind == "thinking" {
-				parts[i].Text = c.ThinkingRewrite
+				replacePartText(&parts[i], c.ThinkingRewrite)
 				break
 			}
 		}
@@ -705,19 +722,30 @@ func canonicalStatus(s string) string {
 	return s
 }
 
-// snapshot returns a deep-enough copy of the parts for
-// JSON-encoding. We do a full Marshal/Unmarshal round-trip so
-// the caller gets a self-contained slice (no aliasing into the
-// accumulator's internal buffers).
+// snapshot returns a self-contained copy and materializes buffered token
+// deltas. 快照不与 accumulator 的内部 slice 共享可变存储。
 func (a *partsAccumulator) snapshot() []MessagePart {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if len(a.parts) == 0 {
 		return nil
 	}
-	b, _ := json.Marshal(a.parts)
-	var out []MessagePart
-	_ = json.Unmarshal(b, &out)
+	return cloneMaterializedParts(a.parts)
+}
+
+func cloneMaterializedParts(parts []MessagePart) []MessagePart {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]MessagePart, len(parts))
+	for i := range parts {
+		out[i] = parts[i]
+		if parts[i].textBuffer != nil {
+			out[i].Text = string(parts[i].textBuffer)
+			out[i].textBuffer = nil
+		}
+		out[i].Parts = cloneMaterializedParts(parts[i].Parts)
+	}
 	return out
 }
 
@@ -752,13 +780,8 @@ func snapshotStructural(a *partsAccumulator) []MessagePart {
 	if len(a.parts) == 0 {
 		return nil
 	}
-	// Deep-copy via JSON round-trip, then force-clear the
-	// Streaming flag on every part (including nested sub-agent
-	// inner parts). The persisted state is the final state;
-	// streaming is a live-UI signal only.
-	b, _ := json.Marshal(a.parts)
-	var out []MessagePart
-	_ = json.Unmarshal(b, &out)
+	// Materialize buffered deltas once, then clear live-only flags.
+	out := cloneMaterializedParts(a.parts)
 	clearStreamingFlag(&out)
 	return out
 }

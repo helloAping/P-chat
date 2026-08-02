@@ -111,7 +111,13 @@ func (p *TavilyProvider) Search(ctx context.Context, q Query) ([]Result, error) 
 	}
 
 	dec := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes))
-	dec.DisallowUnknownFields() // Tavily occasionally adds fields; we ignore them
+	// Do NOT use DisallowUnknownFields here: Tavily's real
+	// /search response echoes the request back as a top-level
+	// `query` field, and may add `answer`, `images`,
+	// `follow_up_questions` over time. A strict decoder would
+	// reject all of those with "unknown field" and break the
+	// "test connection" flow. We only need the `results`
+	// sub-array, so permissive decoding is the right default.
 
 	var parsed tavilyResponse
 	if err := dec.Decode(&parsed); err != nil {

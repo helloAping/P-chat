@@ -57,6 +57,11 @@ type cliContext interface {
 	ClearMessages(ctx context.Context, id string) error
 	CurrentMessageCount() int
 	SubmitQuestionAnswer(ctx context.Context, sessionID string, answers map[string]string) error
+	SubmitToolConfirm(ctx context.Context, sessionID string, approved bool, action string) error
+	CompressSession(ctx context.Context, sessionID string) (httpcli.CompressResult, error)
+	GetSessionContext(ctx context.Context, sessionID string) (httpcli.ContextInspector, error)
+	SetReasoningEffort(ctx context.Context, sessionID, level string) (string, error)
+	Regenerate(ctx context.Context, sessionID string, userMessageID int64) (<-chan agent.ChatStreamChunk, error)
 
 	// === Rollback ===
 	RollbackMessages(ctx context.Context, conversationID string, fromID int64) ([]httpcli.Message, error)
@@ -393,6 +398,29 @@ func (c *localContext) SubmitQuestionAnswer(ctx context.Context, sessionID strin
 		return fmt.Errorf("no pending question for session %s", sessionID)
 	}
 	return nil
+}
+
+func (c *localContext) SubmitToolConfirm(ctx context.Context, sessionID string, approved bool, action string) error {
+	if !tool.SubmitConfirmResponse(sessionID, tool.ConfirmResponse{Approved: approved, Action: action}) {
+		return fmt.Errorf("no pending tool confirmation for session %s", sessionID)
+	}
+	return nil
+}
+
+func (c *localContext) CompressSession(ctx context.Context, sessionID string) (httpcli.CompressResult, error) {
+	return httpcli.CompressResult{}, &ErrUnsupported{Op: "CompressSession"}
+}
+
+func (c *localContext) GetSessionContext(ctx context.Context, sessionID string) (httpcli.ContextInspector, error) {
+	return httpcli.ContextInspector{}, &ErrUnsupported{Op: "GetSessionContext"}
+}
+
+func (c *localContext) SetReasoningEffort(ctx context.Context, sessionID, level string) (string, error) {
+	return "", &ErrUnsupported{Op: "SetReasoningEffort"}
+}
+
+func (c *localContext) Regenerate(ctx context.Context, sessionID string, userMessageID int64) (<-chan agent.ChatStreamChunk, error) {
+	return nil, &ErrUnsupported{Op: "Regenerate"}
 }
 
 func (c *localContext) RollbackMessages(ctx context.Context, convID string, fromID int64) ([]httpcli.Message, error) {
@@ -1048,6 +1076,38 @@ func (c *httpContext) SubmitQuestionAnswer(ctx context.Context, sessionID string
 	return c.c.SubmitQuestionResponse(ctx, sessionID, answers)
 }
 
+func (c *httpContext) SubmitToolConfirm(ctx context.Context, sessionID string, approved bool, action string) error {
+	return c.c.SubmitConfirmResponse(ctx, sessionID, approved, action)
+}
+
+func (c *httpContext) CompressSession(ctx context.Context, sessionID string) (httpcli.CompressResult, error) {
+	return c.c.CompressSession(ctx, sessionID)
+}
+
+func (c *httpContext) GetSessionContext(ctx context.Context, sessionID string) (httpcli.ContextInspector, error) {
+	return c.c.GetSessionContext(ctx, sessionID)
+}
+
+func (c *httpContext) SetReasoningEffort(ctx context.Context, sessionID, level string) (string, error) {
+	return c.c.SetReasoningEffort(ctx, sessionID, level)
+}
+
+func (c *httpContext) Regenerate(ctx context.Context, sessionID string, userMessageID int64) (<-chan agent.ChatStreamChunk, error) {
+	out := make(chan agent.ChatStreamChunk, 16)
+	go func() {
+		defer close(out)
+		err := c.c.Regenerate(ctx, sessionID, userMessageID, func(ev httpcli.StreamEvent) {
+			out <- httpEventToChunk(ev)
+		})
+		if err != nil {
+			out <- agent.ChatStreamChunk{Error: err.Error(), Done: true}
+			return
+		}
+		out <- agent.ChatStreamChunk{Done: true}
+	}()
+	return out, nil
+}
+
 func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
 	out := make(chan agent.ChatStreamChunk, 16)
 	go func() {
@@ -1056,6 +1116,8 @@ func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) 
 			Message:  lastUserContent(req.Messages),
 			Style:    string(req.Style),
 			WorkMode: string(req.WorkMode),
+			Provider: c.prov,
+			Model:    c.c.ProviderModel(),
 		}
 		err := c.c.SendMessage(ctx, c.curSess, opts, func(ev httpcli.StreamEvent) {
 			out <- httpEventToChunk(ev)
@@ -1104,7 +1166,21 @@ func (c *httpContext) SetMode(name string) error {
 	c.mode = string(wm)
 	return nil
 }
-func (c *httpContext) ListTools() []ToolView   { return nil }
+func (c *httpContext) ListTools() []ToolView {
+	tools, err := c.c.ListTools(context.Background(), c.curSess)
+	if err != nil {
+		return nil
+	}
+	out := make([]ToolView, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, ToolView{
+			Name:        t.Name,
+			Description: t.Description,
+			Highlight:   t.Name == "task",
+		})
+	}
+	return out
+}
 func (c *httpContext) ToolsEnabled() bool      { return true }
 func (c *httpContext) SetToolsEnabled(on bool) {}
 
@@ -1175,19 +1251,46 @@ func lastUserContent(msgs []llm.ChatMessage) string {
 // agent.ChatStreamChunk shape used by the local UI renderer.
 func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 	return agent.ChatStreamChunk{
-		Content:      ev.Content,
-		Phase:        ev.Phase,
-		Step:         ev.Step,
-		Message:      ev.Msg,
-		ToolName:     ev.ToolName,
-		ToolResult:   ev.ToolResult,
-		ToolError:    ev.ToolError,
-		ToolElapsed:  ev.ToolElapsed,
-		TokensIn:     ev.TokensIn,
-		TokensOut:    ev.TokensOut,
-		Duration:     ev.Elapsed,
-		Error:        ev.Error,
-		QuestionJSON: ev.QuestionJSON,
+		Seq:                   ev.Seq,
+		Content:               ev.Content,
+		Thinking:              ev.Thinking,
+		Error:                 ev.Error,
+		Suggestion:            ev.Suggestion,
+		ErrorKind:             ev.ErrorKind,
+		Phase:                 ev.Phase,
+		Step:                  ev.Step,
+		Message:               ev.Msg,
+		Duration:              ev.Elapsed,
+		ToolID:                ev.ToolID,
+		ToolName:              ev.ToolName,
+		ToolArgs:              ev.ToolArgs,
+		ToolResult:            ev.ToolResult,
+		ToolResultFull:        ev.ToolResultFull,
+		ToolError:             ev.ToolError,
+		ToolElapsed:           ev.ToolElapsed,
+		ToolCallStatus:        ev.ToolCallStatus,
+		ToolSummary:           ev.ToolSummary,
+		ToolChangedPaths:      ev.ToolChangedPaths,
+		ToolRetryable:         ev.ToolRetryable,
+		ToolRequiresUser:      ev.ToolRequiresUser,
+		ToolNextAction:        ev.ToolNextAction,
+		TokensIn:              ev.TokensIn,
+		TokensOut:             ev.TokensOut,
+		SubAgent:              ev.SubAgent,
+		SubAgentTask:          ev.SubAgentTask,
+		SubAgentStatus:        ev.SubAgentStatus,
+		SubAgentType:          ev.SubAgentType,
+		SubAgentColor:         ev.SubAgentColor,
+		SubAgentModel:         ev.SubAgentModel,
+		SubAgentTaskID:        ev.SubAgentTaskID,
+		SubAgentDescription:   ev.SubAgentDescription,
+		SubAgentFailureReason: ev.SubAgentFailureReason,
+		TraceID:               ev.TraceID,
+		QuestionJSON:          ev.QuestionJSON,
+		ToolConfirmJSON:       ev.ToolConfirmJSON,
+		ContentRewrite:        ev.ContentRewrite,
+		ThinkingRewrite:       ev.ThinkingRewrite,
+		SessionStatus:         ev.SessionStatus,
 	}
 }
 
@@ -1270,6 +1373,7 @@ func runLocalPlan(ctx cliContext, args string) error {
 		WorkMode: r.mode.Normalize(),
 		Provider: r.provider,
 		Messages: msgs,
+		HistoryMessageCount: len(msgs) - 1,
 		PlanMode: true,
 	}
 
@@ -1376,6 +1480,7 @@ func runLocalExecutePlan(ctx cliContext, msgs []llm.ChatMessage, plan, provModel
 			Type:    llm.TypeText,
 			Content: "好的，请按计划执行。",
 		}),
+		HistoryMessageCount: len(msgs) + 1,
 	}
 	ui := NewChatUI(r.provider, provModel)
 	ui.PrintBannerHeader(task + " (执行)")

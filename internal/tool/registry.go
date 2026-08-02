@@ -24,6 +24,10 @@ type Tool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	// Policy describes execution risk and scheduling defaults. It is optional
+	// so existing dynamic tool definitions remain source-compatible; callers
+	// should use EffectivePolicy when they need a complete policy.
+	Policy *ToolPolicy `json:"policy,omitempty"`
 }
 
 type CallRequest struct {
@@ -47,6 +51,22 @@ type CallResultImage struct {
 type CallResult struct {
 	Content string `json:"content"`
 	IsError bool   `json:"is_error"`
+	// Status is the structured outcome for newer callers. Empty status is
+	// normalized from the legacy IsError flag by Normalize.
+	Status CallStatus `json:"status,omitempty"`
+	// Summary is a short outcome description for newer callers. Content remains
+	// the compatibility payload and may contain the detailed text.
+	Summary string `json:"summary,omitempty"`
+	// ChangedPaths identifies workspace files touched by a successful tool.
+	ChangedPaths []string `json:"changed_paths,omitempty"`
+	// Retryable tells the scheduler whether retrying with the same call shape
+	// can plausibly succeed. It defaults to false for safety.
+	Retryable bool `json:"retryable,omitempty"`
+	// RequiresUser marks an interaction that must wait for user input.
+	RequiresUser bool `json:"requires_user,omitempty"`
+	// NextAction gives the agent a bounded hint for the next phase, without
+	// requiring it to parse free-form Content.
+	NextAction string `json:"next_action,omitempty"`
 	// RawFull, when set, carries the untruncated raw payload for the
 	// frontend (via ToolResultFull on the SSE event). It never reaches
 	// the LLM — the LLM only sees Content. Used by tools whose full
@@ -562,7 +582,7 @@ func StringEnumProp(description string, values ...string) map[string]any {
 func RegisterBuiltin(r *Registry) {
 	r.Register(Tool{
 		Name:        "exec_command",
-		Description: "Execute a shell command on the local system. Returns stdout+stderr combined. Use for running scripts, system operations, and one-off commands.",
+		Description: "Execute a shell command on the local system. Returns stdout+stderr combined. Use for one-off commands. Long-running dev servers are started in the background and return a process_id.",
 		Parameters: ObjectSchema(map[string]any{
 			"command":  StringProp("The shell command to execute (cmd.exe syntax on Windows)"),
 			"work_dir": StringProp("Optional working directory for the command"),
@@ -573,9 +593,42 @@ func RegisterBuiltin(r *Registry) {
 			// when the user says "试一下" / "preview";
 			// the front-end "干跑" button also sets
 			// it on a direct call.
-			"dry_run": BoolProp("If true, return a preview of what would execute without actually running the command. Sandbox check still applies."),
+			"dry_run":    BoolProp("If true, return a preview of what would execute without actually running the command. Sandbox check still applies."),
+			"background": BoolProp("If true, start the command as a managed background process and return a process_id immediately."),
 		}, []string{"command"}),
 	}, handleExecCommand)
+
+	r.Register(Tool{
+		Name:        "start_process",
+		Description: "Start a long-running local command in the background. Returns a managed process_id. Use for dev servers, watchers, Java services, and Node servers.",
+		Parameters: ObjectSchema(map[string]any{
+			"command":  StringProp("The shell command to execute in the background"),
+			"work_dir": StringProp("Optional working directory for the command"),
+		}, []string{"command"}),
+	}, handleStartProcess)
+
+	r.Register(Tool{
+		Name:        "read_process_output",
+		Description: "Read buffered stdout/stderr from a process started by start_process or a backgrounded exec_command.",
+		Parameters: ObjectSchema(map[string]any{
+			"process_id": StringProp("The managed process id returned by start_process or exec_command"),
+			"max_bytes":  map[string]any{"type": "integer", "description": "Optional maximum bytes to return from the tail of the buffered output"},
+		}, []string{"process_id"}),
+	}, handleReadProcessOutput)
+
+	r.Register(Tool{
+		Name:        "stop_process",
+		Description: "Stop a managed background process previously started by P-Chat.",
+		Parameters: ObjectSchema(map[string]any{
+			"process_id": StringProp("The managed process id to stop"),
+		}, []string{"process_id"}),
+	}, handleStopProcess)
+
+	r.Register(Tool{
+		Name:        "list_processes",
+		Description: "List background processes started and managed by P-Chat in this app session.",
+		Parameters:  ObjectSchema(map[string]any{}, nil),
+	}, handleListProcesses)
 
 	r.Register(Tool{
 		Name: "read_file",
@@ -599,6 +652,18 @@ func RegisterBuiltin(r *Registry) {
 			"dry_run": BoolProp("If true, return content size + first 200 chars without writing to disk."),
 		}, []string{"path", "content"}),
 	}, handleWriteFile)
+
+	r.Register(Tool{
+		Name:        "edit_file",
+		Description: "Replace an exact text fragment in a text file. Requires one unique match unless replace_all is true; uses an atomic write and returns the changed path.",
+		Parameters: ObjectSchema(map[string]any{
+			"path":        StringProp("Absolute or relative path to the text file"),
+			"old_text":    StringProp("Exact existing text to replace; include enough surrounding context to make it unique"),
+			"new_text":    StringProp("Replacement text; may be empty to delete the matched text"),
+			"replace_all": BoolProp("If true, replace every match; default false rejects ambiguous matches"),
+			"dry_run":     BoolProp("If true, report the proposed edit without writing the file"),
+		}, []string{"path", "old_text", "new_text"}),
+	}, handleEditFile)
 
 	r.Register(Tool{
 		Name:        "read_docx",
@@ -685,7 +750,8 @@ type execArgs struct {
 	// the user / LLM can see what would happen.
 	// Always safe to flip on — it just makes the
 	// tool a strict subset of its real behaviour.
-	DryRun bool `json:"dry_run,omitempty"`
+	DryRun     bool `json:"dry_run,omitempty"`
+	Background bool `json:"background,omitempty"`
 }
 
 func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, error) {
@@ -750,37 +816,71 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 				"(no command was actually run; remove dry_run or set it to false to execute)",
 			a.Command, workDir,
 		)
-		return &CallResult{Content: preview}, nil
+		return &CallResult{Content: preview, Summary: "Dry run: would execute " + a.Command, NextAction: "review"}, nil
 	}
 
-	cmd := exec.CommandContext(ctx, "cmd", "/C", a.Command)
-	root := projectRootFromCtx(ctx)
-	if a.WorkDir != "" {
-		if filepath.IsAbs(a.WorkDir) || root == "" {
-			cmd.Dir = a.WorkDir
+	if a.Background || looksPersistentCommand(a.Command) {
+		return startManagedProcess(ctx, a.Command, a.WorkDir)
+	}
+
+	cmd, _ := buildExecCommand(ctx, a.Command, a.WorkDir, projectRootFromCtx(ctx))
+	out, err := readLimitedOutput(ctx, cmd)
+	if err != nil {
+		content := strings.TrimRight(string(out), "\r\n")
+		if content != "" {
+			content += "\n"
+		}
+		content += err.Error()
+
+		// opcode-style actionable hints: when a command fails
+		// because it doesn't exist on this platform, tell the
+		// LLM about alternatives so it can recover.
+		if runtime.GOOS == "windows" {
+			switch {
+			case strings.Contains(err.Error(), "is not recognized"):
+				content += "\nHint: This command doesn't exist on Windows. Use findstr (not grep), dir (not ls), type (not cat), or pwsh -NoProfile -Command \"...\" for PowerShell scripts."
+			case strings.Contains(err.Error(), "The system cannot find the file"):
+				content += "\nHint: The executable was not found. Check the command name - on Windows the available commands are: dir, findstr, type, copy, move, del, mkdir, cd, set, pwsh."
+			}
 		} else {
-			cmd.Dir = filepath.Join(root, a.WorkDir)
+			if strings.Contains(err.Error(), "executable file not found") || strings.Contains(err.Error(), "command not found") {
+				content += "\nHint: The command was not found. Try installing it or use an alternative."
+			}
+		}
+		return &CallResult{Content: content, IsError: true}, nil
+	}
+	return &CallResult{Content: string(out)}, nil
+}
+
+func buildExecCommand(ctx context.Context, command, workDir, root string) (*exec.Cmd, string) {
+	newCmd := func(name string, args ...string) *exec.Cmd {
+		if ctx == nil {
+			return exec.Command(name, args...)
+		}
+		return exec.CommandContext(ctx, name, args...)
+	}
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = newCmd("cmd", "/C", command)
+	} else {
+		cmd = newCmd("sh", "-c", command)
+	}
+	resolvedWorkDir := ""
+	if workDir != "" {
+		if filepath.IsAbs(workDir) || root == "" {
+			resolvedWorkDir = workDir
+		} else {
+			resolvedWorkDir = filepath.Join(root, workDir)
 		}
 	} else if root != "" {
-		cmd.Dir = root
+		resolvedWorkDir = root
+	}
+	if resolvedWorkDir != "" {
+		cmd.Dir = resolvedWorkDir
 	}
 
-	// PowerShell on Windows: bypass cmd /C to avoid:
-	// 1. cmd.exe intercepting pipes (|) inside -Command "..."
-	// 2. GBK output encoding (PowerShell 5.1 default on zh-CN)
-	//
-	// Original: powershell -NoProfile -Command "Get-Content ... | Select-Object ..."
-	//   �?cmd /C strips outer quotes �?| interpreted by cmd.exe �?parser error
-	//
-	// Fix: run powershell.exe directly with [Console]::OutputEncoding = UTF-8.
-	//
-	// Detection: scan ALL tokens for powershell|pwsh, not just the
-	// first one. The LLM can bypass the prefix-only check by writing
-	// "cmd /C powershell ..." or prepending whitespace, which would
-	// otherwise fall through to `cmd /C powershell -Command "..."`
-	// where cmd.exe misinterprets the inner quotes/pipes.
 	if runtime.GOOS == "windows" {
-		trimmed := strings.TrimSpace(a.Command)
+		trimmed := strings.TrimSpace(command)
 		tokens := strings.Fields(trimmed)
 		var psIdx int = -1
 		var psExe string
@@ -811,45 +911,36 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 				script = fmt.Sprintf("[Console]::OutputEncoding = [Text.Encoding]::UTF8; %s", script)
 				args := append([]string{}, strings.Fields(flags)...)
 				args = append(args, "-Command", script)
-				cmd = exec.CommandContext(ctx, psExe, args...)
+				cmd = newCmd(psExe, args...)
+				if resolvedWorkDir != "" {
+					cmd.Dir = resolvedWorkDir
+				}
 			}
 		}
 	}
-
-	out, err := readLimitedOutput(cmd)
-	if err != nil {
-		content := strings.TrimRight(string(out), "\r\n")
-		if content != "" {
-			content += "\n"
-		}
-		content += err.Error()
-
-		// opcode-style actionable hints: when a command fails
-		// because it doesn't exist on this platform, tell the
-		// LLM about alternatives so it can recover.
-		if runtime.GOOS == "windows" {
-			switch {
-			case strings.Contains(err.Error(), "is not recognized"):
-				content += "\nHint: This command doesn't exist on Windows. Use findstr (not grep), dir (not ls), type (not cat), or pwsh -NoProfile -Command \"...\" for PowerShell scripts."
-			case strings.Contains(err.Error(), "The system cannot find the file"):
-				content += "\nHint: The executable was not found. Check the command name �?on Windows the available commands are: dir, findstr, type, copy, move, del, mkdir, cd, set, pwsh."
-			}
-		} else {
-			if strings.Contains(err.Error(), "executable file not found") || strings.Contains(err.Error(), "command not found") {
-				content += "\nHint: The command was not found. Try installing it or use an alternative."
-			}
-		}
-		return &CallResult{Content: content, IsError: true}, nil
-	}
-	return &CallResult{Content: string(out)}, nil
+	return cmd, resolvedWorkDir
 }
 
 const maxExecReadSize = 256 * 1024
 
+// execPipeCloseTimeout is the grace period allowed for the stdout/stderr
+// pipe readers to drain after the process exits (or is killed). A spawned
+// grandchild that inherited the pipe handles keeps the write ends open, so
+// io.ReadAll would otherwise block forever — the classic Windows
+// `cmd /C` orphaned-server deadlock. We read the pipes in a goroutine and
+// give up after this window, returning the bytes collected so far.
+const execPipeCloseTimeout = 15 * time.Second
+
 // readLimitedOutput captures stdout+stderr with a hard byte cap
 // to prevent memory exhaustion if the LLM runs an unbounded
 // command (e.g. `cat /dev/zero`).
-func readLimitedOutput(cmd *exec.Cmd) ([]byte, error) {
+//
+// ctx bounds the whole call: when it is cancelled (tool timeout,
+// user stop), the process group is killed and the pipe readers are
+// released via execPipeCloseTimeout, so the caller can never hang
+// forever on a command that left a grandchild holding the pipe.
+func readLimitedOutput(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
+	setProcessGroup(cmd)
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
@@ -867,12 +958,46 @@ func readLimitedOutput(cmd *exec.Cmd) ([]byte, error) {
 	go readPipe(stdout)
 	go readPipe(stderr)
 
-	r1, r2 := <-ch, <-ch
-	waitErr := cmd.Wait()
+	var r1, r2 result
+	var waitErr error
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		waitErr = cmd.Wait()
+		// Wait() closes the read ends only after the child exits. A
+		// grandchild that inherited the write ends keeps the pipes
+		// open, so the io.ReadAll goroutines may still be blocked.
+		// Close the read ends to release them before we report the
+		// wait error.
+		_ = stdout.Close()
+		_ = stderr.Close()
+		r1, r2 = <-ch, <-ch
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Kill the whole process tree (cmd.exe wrapper AND its
+		// children) so no orphan keeps the pipes alive. On
+		// Windows this is `taskkill /T /F`; on Unix the
+		// process group gets SIGKILL. Without this the tool
+		// timeout only killed the wrapper and the real command
+		// was orphaned holding stdout/stderr — the unbounded
+		// hang behind "多轮工具后卡住".
+		if err := stopProcessTree(cmd); err != nil {
+			log.Printf("[tool/exec_command] kill process tree: %v", err)
+		}
+		select {
+		case <-waitDone:
+		case <-time.After(execPipeCloseTimeout):
+			return nil, fmt.Errorf("exec_command interrupted: %w (pipe readers did not drain after %s)", ctx.Err(), execPipeCloseTimeout)
+		}
+	case <-waitDone:
+	}
+
 	out := append(r1.data, r2.data...)
 
 	// Surface every error. The previous code only returned
-	// waitErr when there was no read error �?meaning a read
+	// waitErr when there was no read error — meaning a read
 	// error during a successful process was silently dropped
 	// (the user would see partial output with no warning).
 	switch {
@@ -1074,13 +1199,18 @@ func handleWriteFile(ctx context.Context, args json.RawMessage) (*CallResult, er
 			head = head[:200] + "..."
 		}
 		preview += "\nfirst 200 chars of content:\n" + head
-		return &CallResult{Content: preview}, nil
+		return &CallResult{Content: preview, Summary: "Dry run: would write " + a.Path, NextAction: "review"}, nil
 	}
 
 	if err := writeFile(a.Path, []byte(a.Content)); err != nil {
 		return &CallResult{Content: err.Error(), IsError: true}, nil
 	}
-	return &CallResult{Content: fmt.Sprintf("written %d bytes to %s", len(a.Content), a.Path)}, nil
+	return &CallResult{
+		Content:      fmt.Sprintf("written %d bytes to %s", len(a.Content), a.Path),
+		Summary:      "Wrote file " + a.Path,
+		ChangedPaths: []string{a.Path},
+		NextAction:   "verify",
+	}, nil
 }
 
 type listFilesArgs struct {
