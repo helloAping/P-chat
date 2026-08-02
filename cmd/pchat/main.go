@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 
 	"github.com/fatih/color"
 	"github.com/p-chat/pchat/internal/cli"
@@ -81,6 +82,9 @@ func init() {
 }
 
 func main() {
+	// Soft memory ceiling — see cmd/pchat-server/main.go
+	// configureGCLimit for the rationale.
+	debug.SetMemoryLimit(2 << 30)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}

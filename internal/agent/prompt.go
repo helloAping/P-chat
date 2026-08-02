@@ -359,8 +359,8 @@ func buildConversationContinuitySection() string {
 	sb.WriteString("the extension may reconnect. Retry once; if it fails again, tell the user the browser extension disconnected ")
 	sb.WriteString("and ask whether to wait, re-establish the connection, or continue without browser tools\n")
 	sb.WriteString("- `browser_screenshot` captures the viewport and the picture is automatically delivered as a " +
-		"follow-up image message so you can see it directly (requires vision). If the picture doesn't appear or the " +
-		"model doesn't support vision, fall back to `browser_snapshot` (text-based, no image payload)\n")
+		"follow-up image message so you can see it directly (requires vision). Text-only models do NOT get " +
+		"browser_screenshot in their tool list — use `browser_extract` to read the rendered page text instead\n")
 	sb.WriteString("- `browser_snapshot` returns too few elements (e.g. SPA page where content is dynamic divs, not interactive elements) → ")
 	sb.WriteString("use `browser_extract` to get all visible rendered text content\n")
 	sb.WriteString("- Reading page content on a SPA / JavaScript-heavy site → ")

@@ -302,6 +302,64 @@ func (a *Agent) modelSupportsVision(providerName, modelName string) bool {
 	return visionCapableByHeuristic(providerName, modelName)
 }
 
+// modelExplicitlySupportsVision reports whether the active
+// (provider, model) pair is *explicitly* marked vision-capable via
+// `capabilities: { supports_vision: true }` in the config.
+//
+// Unlike modelSupportsVision, this is a strict opt-in: it never
+// consults the heuristic, and "no opinion" (capabilities: {} or
+// capabilities absent) reads as text-only. Used to gate tools whose
+// value depends on the model seeing an image (browser_screenshot) —
+// a screenshot is only worth taking (and only worth the ~100KB+
+// base64 payload in the LLM request) when the model is confirmed to
+// accept image input. Text-only models get browser_extract instead,
+// which returns the rendered page text without needing vision.
+func (a *Agent) modelExplicitlySupportsVision(providerName, modelName string) bool {
+	if a.cfg == nil {
+		return false
+	}
+	for _, p := range a.cfg.LLM.Providers {
+		if p.Name != providerName {
+			continue
+		}
+		for _, m := range p.Models {
+			if m.Name == modelName {
+				return m.Capabilities.SupportsVision
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// filterVisionTools removes browser_screenshot from a tool list. The
+// screenshot's only value is the base64 image it injects into the
+// LLM request — meaningless for a text-only model — so text-only
+// models get browser_extract (rendered page text) instead. All other
+// tools pass through untouched.
+func filterVisionTools(tools []tool.Tool) []tool.Tool {
+	out := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		if t.Name == "browser_screenshot" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// visionGatedTools drops browser_screenshot from a tool list unless
+// the active (provider, model) pair is explicitly marked
+// vision-capable. Convenience wrapper used at tool-load time in
+// ChatWithTools so the screenshot tool and the injection logic stay
+// in lockstep.
+func (a *Agent) visionGatedTools(providerName, modelName string, tools []tool.Tool) []tool.Tool {
+	if a.modelExplicitlySupportsVision(providerName, modelName) {
+		return tools
+	}
+	return filterVisionTools(tools)
+}
+
 // visionCapableByHeuristic returns a best-guess vision
 // capability for an unknown (provider, model) pair. The
 // goal is to NOT trust the LLM API to surface the error
@@ -1060,6 +1118,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 			availableTools = filtered
 		}
+		// Gate browser_screenshot on the active model's vision
+		// capability. Screenshots only help the agent when the
+		// model can actually see the image; for a text-only
+		// model the ~100KB+ base64 payload is pure overhead (and
+		// a silent context-window tax). Text-only models fall
+		// back to browser_extract, which returns the rendered
+		// page's text without needing vision. Filtering here
+		// (before toolDefs / prompt / subagent wiring) keeps
+		// every downstream consumer consistent.
+		availableTools = a.visionGatedTools(req.Provider, req.Model, availableTools)
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))

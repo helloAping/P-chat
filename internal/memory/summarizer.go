@@ -106,16 +106,7 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 		}
 		startID, endID := batch[0], batch[len(batch)-1]
 
-		texts := make([]string, 0, len(batch))
-		for _, id := range batch {
-			var role, content string
-			if err := sm.store.db.QueryRow(
-				`SELECT role, content FROM messages WHERE id = ?`, id,
-			).Scan(&role, &content); err == nil {
-				t := role + ": " + truncateStr(content, 200)
-				texts = append(texts, t)
-			}
-		}
+		texts := sm.fetchBatchTexts(batch)
 		joined := strings.Join(texts, "\n")
 
 		summary, err := sm.summarize(ctx, joined)
@@ -135,6 +126,56 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 		toSummarize = toSummarize[len(batch):]
 	}
 	return true, strings.Join(allSummaries, "\n"), nil
+}
+
+// fetchBatchTexts loads the role+content of a batch of message ids in
+// a SINGLE range query, then builds the "role: content" lines the
+// summarizer LLM prompt needs. The previous per-id `QueryRow` loop
+// issued up to 100 individual statements per batch — the dominant
+// allocation source in the auto-compact GC storm (Summarizer.Compress
+// accounted for ~74% of cumulative heap in the 2026-08 profile).
+func (sm *Summarizer) fetchBatchTexts(batch []int64) []string {
+	texts := make([]string, 0, len(batch))
+	if len(batch) == 0 {
+		return texts
+	}
+	// Range boundaries are min/max of the batch, not batch[0] /
+	// batch[len-1] — callers pass ascending ids, but the reader
+	// should stay correct even for an unordered batch.
+	lo, hi := batch[0], batch[0]
+	for _, id := range batch {
+		if id < lo {
+			lo = id
+		}
+		if id > hi {
+			hi = id
+		}
+	}
+	rows, err := sm.store.db.Query(
+		`SELECT id, role, content FROM messages WHERE id >= ? AND id <= ? ORDER BY id ASC`,
+		lo, hi,
+	)
+	if err != nil {
+		return texts
+	}
+	defer rows.Close()
+	// ids in `batch` may be sparse (some rows deleted); index the
+	// fetched rows by id so output order matches the batch.
+	byID := make(map[int64][2]string, len(batch))
+	for rows.Next() {
+		var id int64
+		var role, content string
+		if err := rows.Scan(&id, &role, &content); err != nil {
+			continue
+		}
+		byID[id] = [2]string{role, content}
+	}
+	for _, id := range batch {
+		if rc, ok := byID[id]; ok {
+			texts = append(texts, rc[0]+": "+truncateStr(rc[1], 200))
+		}
+	}
+	return texts
 }
 
 // MaybeSummarize checks if the current conversation has grown past the
@@ -188,16 +229,7 @@ func (sm *Summarizer) MaybeSummarize(ctx context.Context, convID string) (bool, 
 	startID, endID := rangeIDs[0], rangeIDs[len(rangeIDs)-1]
 
 	// Read the content of these messages.
-	texts := make([]string, 0, len(rangeIDs))
-	for _, id := range rangeIDs {
-		var role, content string
-		if err := sm.store.db.QueryRow(
-			`SELECT role, content FROM messages WHERE id = ?`, id,
-		).Scan(&role, &content); err == nil {
-			t := role + ": " + truncateStr(content, 200)
-			texts = append(texts, t)
-		}
-	}
+	texts := sm.fetchBatchTexts(rangeIDs)
 	joined := strings.Join(texts, "\n")
 
 	summary, err := sm.summarize(ctx, joined)

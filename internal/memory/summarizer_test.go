@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -238,5 +239,89 @@ func TestRangeContainsID(t *testing.T) {
 		if got := rangeContainsID(ranges, c.id); got != c.want {
 			t.Errorf("rangeContainsID(%d) = %v, want %v", c.id, got, c.want)
 		}
+	}
+}
+
+// TestFetchBatchTexts verifies the single-range-query batch reader:
+// output order follows the input batch (even for sparse / out-of-range
+// ids), long content is truncated, and missing rows are skipped.
+func TestFetchBatchTexts(t *testing.T) {
+	store, err := OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	convID := "conv_fetch_batch"
+	if err := store.EnsureConversation(convID, "t"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		store.AddChatMessageTo(convID, llm.ChatMessage{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     fmt.Sprintf("content-%d", i),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var ids []int64
+	rows, err := store.db.Query(`SELECT id FROM messages WHERE conversation_id = ? ORDER BY id ASC`, convID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if len(ids) != 3 {
+		t.Fatalf("got %d message ids, want 3", len(ids))
+	}
+
+	sm := NewSummarizer(store, nil, "test", 50)
+	batch := []int64{ids[2], ids[0] + 99999, ids[0]}
+	texts := sm.fetchBatchTexts(batch)
+	if len(texts) != 2 {
+		t.Fatalf("fetchBatchTexts returned %d entries, want 2 (missing id skipped): %+v", len(texts), texts)
+	}
+	if !strings.Contains(texts[0], "content-2") {
+		t.Errorf("texts[0] = %q, want content-2 first (batch order)", texts[0])
+	}
+	if !strings.Contains(texts[1], "content-0") {
+		t.Errorf("texts[1] = %q, want content-0 second (batch order)", texts[1])
+	}
+
+	long := strings.Repeat("a", 500)
+	store.AddChatMessageTo(convID, llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     long,
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	store.Flush()
+	lrows, _ := store.db.Query(`SELECT id FROM messages WHERE conversation_id = ? AND content = ?`, convID, long)
+	defer lrows.Close()
+	if !lrows.Next() {
+		t.Fatal("long message not found")
+	}
+	var longID int64
+	lrows.Scan(&longID)
+	out := sm.fetchBatchTexts([]int64{longID})
+	if len(out) != 1 {
+		t.Fatalf("fetchBatchTexts(long) returned %d entries, want 1", len(out))
+	}
+	// "assistant: " prefix (11 chars) + 200 truncated chars + "...".
+	if len(out[0]) > 214 {
+		t.Errorf("truncated entry too long: %d chars", len(out[0]))
+	}
+	if !strings.HasSuffix(out[0], "...") {
+		t.Errorf("truncated entry should end with '...': %q", out[0])
 	}
 }

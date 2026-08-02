@@ -10,9 +10,7 @@ func EstimateTokens(s string) int {
 	if s == "" {
 		return 0
 	}
-	runes := utf8.RuneCountInString(s)
-	cjk := 0
-	ascii := 0
+	ascii, cjk := 0, 0
 	for _, r := range s {
 		if r <= 0x007F {
 			ascii++
@@ -20,10 +18,28 @@ func EstimateTokens(s string) int {
 			cjk++
 		}
 	}
-	// ASCII: ~4 chars / token → 0.25 token/char
-	// CJK: ~1.5 char / token → 0.67 token/char
-	// Round up for safety.
-	_ = runes
+	return (ascii+3)/4 + (cjk*2+2)/3
+}
+
+// EstimateTokensBytes is the []byte variant of EstimateTokens. It
+// decodes runes in place via utf8.DecodeRune instead of converting to
+// a string, so it performs zero allocations — important for tool
+// parameter schemas, which are json.RawMessage bytes scanned on every
+// EstimateTokensTools call.
+func EstimateTokensBytes(b []byte) int {
+	if len(b) == 0 {
+		return 0
+	}
+	ascii, cjk := 0, 0
+	for len(b) > 0 {
+		r, size := utf8.DecodeRune(b)
+		if r <= 0x007F {
+			ascii++
+		} else {
+			cjk++
+		}
+		b = b[size:]
+	}
 	return (ascii+3)/4 + (cjk*2+2)/3
 }
 
@@ -52,7 +68,7 @@ func EstimateTokensTools(tools []ToolDef) int {
 	for _, t := range tools {
 		total += EstimateTokens(t.Name)
 		total += EstimateTokens(t.Description)
-		total += EstimateTokens(string(t.Parameters))
+		total += EstimateTokensBytes(t.Parameters)
 		total += 24 // JSON schema/function wrapper overhead
 	}
 	return total
