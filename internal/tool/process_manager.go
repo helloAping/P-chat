@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,12 @@ import (
 )
 
 const processBufferLimit = 256 * 1024
+
+// maxManagedProcesses caps how many background processes the registry may
+// retain. Exited processes beyond this cap are evicted (oldest first) by
+// pruneExitedProcesses so a long agent turn that backgrounds many helpers
+// cannot grow the registry / output buffers without bound.
+const maxManagedProcesses = 64
 
 type managedProcess struct {
 	id        string
@@ -204,6 +212,41 @@ func (p *managedProcess) wait() {
 		p.exitText = "exit 0"
 	}
 	p.mu.Unlock()
+	pruneExitedProcesses()
+}
+
+// pruneExitedProcesses evicts the oldest EXITED processes once the registry
+// exceeds maxManagedProcesses. Running processes are never evicted, and a
+// just-exited process stays readable via read_process_output until the cap is
+// crossed — so the bounded registry does not break the start → read flow.
+func pruneExitedProcesses() {
+	processMu.Lock()
+	defer processMu.Unlock()
+	if len(processes) <= maxManagedProcesses {
+		return
+	}
+	type entry struct {
+		id      string
+		started time.Time
+	}
+	var exited []entry
+	for id, p := range processes {
+		p.mu.Lock()
+		done, started := p.exited, p.startedAt
+		p.mu.Unlock()
+		if done {
+			exited = append(exited, entry{id, started})
+		}
+	}
+	if len(processes)-len(exited) >= maxManagedProcesses {
+		// Evicting only running processes could free nothing; bail rather
+		// than ever removing a live process.
+		return
+	}
+	sort.Slice(exited, func(i, j int) bool { return exited[i].started.Before(exited[j].started) })
+	for i := 0; i < len(exited) && len(processes) > maxManagedProcesses; i++ {
+		delete(processes, exited[i].id)
+	}
 }
 
 func (p *managedProcess) snapshot(maxBytes int) processSnapshot {
@@ -224,12 +267,31 @@ func (p *managedProcess) snapshot(maxBytes int) processSnapshot {
 	}
 }
 
+// serverEntrypoints are conventional node/java entrypoint basenames (with or
+// without a trailing extension) that are expected to run indefinitely as a
+// server. Only these are auto-backgrounded when invoked through the bare
+// `node ...` / `java ...` form. Everything else — one-shot helper scripts,
+// CLIs, file-readers such as `node tmp-lines.js file 1:40` — must run inline
+// so the LLM receives their stdout instead of a background process_id.
+var serverEntrypoints = map[string]bool{
+	"server":  true,
+	"app":     true,
+	"index":   true,
+	"main":    true,
+	"listen":  true,
+	"backend": true,
+	"service": true,
+	"api":     true,
+	"gateway": true,
+}
+
 func looksPersistentCommand(command string) bool {
 	cmd := strings.ToLower(compactSpaces(command))
 	if cmd == "" {
 		return false
 	}
-	quickExit := []string{" -v", " --version", " -h", " --help", " -e "}
+	// Explicit quick-exit invocations always run inline, even for node/java.
+	quickExit := []string{" -v", " --version", " -h", " --help", " -e ", " --eval"}
 	for _, marker := range quickExit {
 		if strings.Contains(cmd, marker) {
 			return false
@@ -246,5 +308,45 @@ func looksPersistentCommand(command string) bool {
 			return true
 		}
 	}
-	return strings.HasPrefix(cmd, "node ") || strings.HasPrefix(cmd, "java ")
+	// node/java: background only a conventional server entrypoint. A general
+	// `node <helper> <args>` call is a one-shot and must run inline — this is
+	// the regression behind the 2026-08 runaway-loop / OOM bug.
+	if strings.HasPrefix(cmd, "node ") || strings.HasPrefix(cmd, "java ") {
+		return isServerEntrypoint(cmd)
+	}
+	return false
+}
+
+// isServerEntrypoint reports whether the first non-flag argument of a
+// `node ...` / `java ...` invocation names a conventional server entrypoint
+// (e.g. `node server.js`, `java -jar app.jar`). Flags are skipped so a
+// `-jar`/`-cp`/loader prefix does not hide the real entrypoint.
+func isServerEntrypoint(cmd string) bool {
+	rest := strings.TrimSpace(cmd)
+	if i := strings.IndexByte(rest, ' '); i >= 0 {
+		rest = rest[i+1:]
+	} else {
+		return false
+	}
+	for {
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			return false
+		}
+		if !strings.HasPrefix(rest, "-") {
+			break
+		}
+		if i := strings.IndexByte(rest, ' '); i >= 0 {
+			rest = rest[i+1:]
+		} else {
+			return false
+		}
+	}
+	token := rest
+	if i := strings.IndexByte(rest, ' '); i >= 0 {
+		token = rest[:i]
+	}
+	base := filepath.Base(token)
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	return serverEntrypoints[base]
 }
