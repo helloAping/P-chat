@@ -95,6 +95,7 @@ export {
   VolumeX,
   GitBranch,
   Cpu,
+  Activity,
   Palette,
   Archive,
   Server,

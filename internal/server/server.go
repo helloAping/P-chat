@@ -44,6 +44,12 @@ type Server struct {
 	// dynamicWatchStop stops the P3-2 dynamic tool
 	// watcher. Same shape as rulesWatchStop.
 	dynamicWatchStop func()
+	// monitorStop cancels the memory/goroutine heartbeat + heap-dump
+	// goroutine (see monitor.go). Same shape as the watchers above.
+	monitorStop func()
+	// memMon is the memory monitor backing /diagnostics/* and the
+	// heartbeat/auto-dump. Created in NewWithStaticFS.
+	memMon *memoryMonitor
 }
 
 // Engine returns the underlying gin.Engine so tests (or embedders)
@@ -171,6 +177,14 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// System config
 		api.GET("/config", h.GetSystemConfig)
 		api.PATCH("/config", h.UpdateSystemConfig)
+
+		// Diagnostics (GUI "诊断 / 内存监控" tab): live memory, monitor
+		// config, and on-demand heap / goroutine snapshot downloads.
+		api.GET("/diagnostics/memory", h.MemoryDiagnostics)
+		api.GET("/diagnostics/config", h.DiagnosticsConfigGet)
+		api.PATCH("/diagnostics/config", h.DiagnosticsConfigUpdate)
+		api.GET("/diagnostics/snapshot/heap", h.DiagnosticsHeapSnapshot)
+		api.GET("/diagnostics/snapshot/goroutine", h.DiagnosticsGoroutineSnapshot)
 
 		// Uploads
 		api.POST("/uploads", h.Upload)
@@ -399,6 +413,19 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 			s.dynamicWatchStop = dynStop
 		}
 	}
+
+	// Diagnostics: pprof endpoint + memory/goroutine heartbeat +
+	// automatic heap dump + GUI-facing /diagnostics/* endpoints.
+	// See monitor.go for the env tuning knobs.
+	registerPprof(r)
+	{
+		mm := newMemoryMonitor()
+		s.memMon = mm
+		h.SetMemoryMonitor(mm)
+		monitorCtx, cancel := context.WithCancel(context.Background())
+		s.monitorStop = cancel
+		go mm.run(monitorCtx)
+	}
 	return s
 }
 
@@ -454,6 +481,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	if s.dynamicWatchStop != nil {
 		s.dynamicWatchStop()
+	}
+	if s.monitorStop != nil {
+		s.monitorStop()
 	}
 	if s.srv != nil {
 		return s.srv.Shutdown(ctx)

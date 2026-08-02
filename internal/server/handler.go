@@ -39,6 +39,11 @@ type Handler struct {
 	// nil in tests that don't need tool listing.
 	toolReg *tool.Registry
 
+	// memMon powers the /api/v1/diagnostics/* endpoints (live memory,
+	// config, heap/goroutine snapshot downloads). May be nil in tests
+	// that don't construct the monitor; handlers 503 in that case.
+	memMon *memoryMonitor
+
 	// listenAddr is the actual address the HTTP server is bound to
 	// (e.g. "127.0.0.1:14712"). Set once at startup by the server.
 	// Used by the browser extension UI to construct a real WS URL.
@@ -944,6 +949,12 @@ func (h *Handler) Providers(c *gin.Context) {
 
 func (h *Handler) SetSummarizer(sm *memory.Summarizer) {
 	h.summarizer = sm
+}
+
+// SetMemoryMonitor wires the memory monitor backing the /diagnostics/*
+// endpoints. Pass nil to keep the endpoints disabled (503).
+func (h *Handler) SetMemoryMonitor(m *memoryMonitor) {
+	h.memMon = m
 }
 
 // SetBrowserManager wires the browser control manager for WebSocket

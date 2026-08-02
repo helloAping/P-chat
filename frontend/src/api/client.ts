@@ -1993,6 +1993,54 @@ export const testWebSearchConnection = () =>
     { method: 'POST' },
   )
 
+// ---- Diagnostics (内存监控) ----
+
+export interface MemorySnapshot {
+  heap_alloc_mb: number
+  heap_sys_mb: number
+  heap_objects: number
+  num_gc: number
+  goroutines: number
+  rss_mb: number
+}
+
+export interface DiagnosticsConfig {
+  mem_heartbeat_sec: number
+  heap_dump_mb: number
+  pprof_enabled: boolean
+  heap_dump_dir: string
+}
+
+export interface DiagnosticsConfigUpdate {
+  mem_heartbeat_sec?: number
+  heap_dump_mb?: number
+}
+
+export const getMemoryDiagnostics = () =>
+  jsonFetch<MemorySnapshot>('/api/v1/diagnostics/memory')
+
+export const getDiagnosticsConfig = () =>
+  jsonFetch<DiagnosticsConfig>('/api/v1/diagnostics/config')
+
+export const updateDiagnosticsConfig = (patch: DiagnosticsConfigUpdate) =>
+  jsonFetch<DiagnosticsConfig>('/api/v1/diagnostics/config', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })
+
+// Trigger a browser download of a heap (.prof) or goroutine (.txt)
+// snapshot. The server writes the file and responds with
+// Content-Disposition: attachment; the `download` attribute is the
+// fallback filename.
+export function downloadDiagnosticsSnapshot(kind: 'heap' | 'goroutine') {
+  const a = document.createElement('a')
+  a.href = `${BASE}/api/v1/diagnostics/snapshot/${kind}`
+  a.download = kind === 'heap' ? `heap-${Date.now()}.prof` : `goroutine-${Date.now()}.txt`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+
 // ---- Browser control ----
 
 export interface BrowserInfo {
