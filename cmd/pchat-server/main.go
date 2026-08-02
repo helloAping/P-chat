@@ -135,8 +135,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	} else {
 		log.Printf("[search] web_search disabled (no provider configured)")
 	}
+	tool.RegisterGrep(toolReg, cfg)
 	if cfg.Knowledge.Enabled {
-		tool.RegisterGrep(toolReg, cfg)
 		tool.RegisterWiki(toolReg, cfg)
 		// Migrate legacy wiki_sections → three-level index_nodes.
 		var bases []knowledge.BaseRef

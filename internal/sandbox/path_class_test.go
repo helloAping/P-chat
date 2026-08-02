@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/config"
 )
 
 // TestClassifyPath_Table is the main behavioural spec for the
@@ -95,7 +97,7 @@ func TestClassifyPath_Table(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
-			got := classifyPath(c.path, c.projectRoot, extraAllowed, protectedDirs)
+			got := classifyPath(c.path, c.projectRoot, extraAllowed, protectedDirs, nil)
 			if got != c.want {
 				t.Errorf("classifyPath(%q, projectRoot=%q) = %s, want %s",
 					c.path, c.projectRoot, got, c.want)
@@ -126,12 +128,12 @@ func TestClassifyPath_TraversalCleanup(t *testing.T) {
 	// root (outside project, not in protected). Should NOT be
 	// classified as project.
 	rel := filepath.Join(project, "..", "outside.txt")
-	if got := classifyPath(rel, project, nil, protectedDirs); got == PathClassProject {
+	if got := classifyPath(rel, project, nil, protectedDirs, nil); got == PathClassProject {
 		t.Errorf("traversal %q leaked into project bucket (got %s)", rel, got)
 	}
 	// The only invariant is "not project". It should be
 	// global (projectRoot is set, path is outside).
-	if got := classifyPath(rel, project, nil, protectedDirs); got != PathClassGlobal {
+	if got := classifyPath(rel, project, nil, protectedDirs, nil); got != PathClassGlobal {
 		t.Errorf("traversal expected global, got %s", got)
 	}
 }
@@ -142,13 +144,13 @@ func TestClassifyPath_TraversalCleanup(t *testing.T) {
 // pass to the decision matrix; an empty input mapping to
 // PathClassExternal is the most conservative default.
 func TestClassifyPath_EmptyInputs(t *testing.T) {
-	if got := classifyPath("", "/home/u/proj", nil, nil); got != PathClassExternal {
+	if got := classifyPath("", "/home/u/proj", nil, nil, nil); got != PathClassExternal {
 		t.Errorf("empty path: got %s, want external", got)
 	}
-	if got := classifyPath("foo.go", "", nil, nil); got != PathClassExternal {
+	if got := classifyPath("foo.go", "", nil, nil, nil); got != PathClassExternal {
 		t.Errorf("empty projectRoot: got %s, want external", got)
 	}
-	if got := classifyPath("foo.go", "/home/u/proj", nil, nil); got != PathClassGlobal {
+	if got := classifyPath("foo.go", "/home/u/proj", nil, nil, nil); got != PathClassGlobal {
 		t.Errorf("project set, path outside: got %s, want global", got)
 	}
 }
@@ -169,7 +171,7 @@ func TestClassifyPath_NoIO(t *testing.T) {
 	// A non-existent file under project must still land in
 	// PathClassProject (the textual containment check on the
 	// cleaned form should not require the file to exist).
-	if got := classifyPath(ghost, project, nil, nil); got != PathClassProject {
+	if got := classifyPath(ghost, project, nil, nil, nil); got != PathClassProject {
 		t.Errorf("classifyPath(non-existent under project) = %s, want project", got)
 	}
 }
@@ -195,13 +197,104 @@ func TestClassifyPath_CaseInsensitiveOnWindows(t *testing.T) {
 	}
 	// On Windows, EvalSymlinks may return the actual on-disk
 	// case; the test exercises the textual-clean path.
-	got := classifyPath(upperVariant, project, nil, nil)
+	got := classifyPath(upperVariant, project, nil, nil, nil)
 	// We accept either Project (case-insensitive match
 	// worked) or Global (case-sensitive match failed) — the
 	// invariant is that classifyPath does not crash. Tighten
 	// the assertion once isPathUnder is verified case-
 	// insensitive on Windows in another test.
 	_ = got
+}
+
+// TestClassifyPath_ProjectBeatsWideProtected is the regression test
+// for the workspace-under-home bug: a project living under a WIDE
+// protected prefix (e.g. the whole home dir in
+// defaultWriteProtectedPaths) must get project policy, not a hard
+// block. Specific protected dirs (~/.ssh) still win over the
+// project.
+func TestClassifyPath_ProjectBeatsWideProtected(t *testing.T) {
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	project := filepath.Join(home, "proj")
+	if err := mkdirAllForTest(project); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// The wide protected dir is home itself (broad, wraps project).
+	wide := []string{home}
+	// A specific sensitive dir under home that must stay protected.
+	specific := []string{filepath.Join(home, ".ssh")}
+
+	// File inside project, project set → project (not blocked by wide home).
+	if got := classifyPath(filepath.Join(project, "x.go"), project, nil, specific, wide); got != PathClassProject {
+		t.Errorf("project under wide-protected home = %s, want project", got)
+	}
+	// File under ~/.ssh, even inside a "project" claim → still protected.
+	if got := classifyPath(filepath.Join(home, ".ssh", "id_rsa"), project, nil, specific, wide); got != PathClassProtected {
+		t.Errorf("~/.ssh inside project = %s, want protected", got)
+	}
+	// Non-project file under home, project set → protected (wide dir still guards non-project paths).
+	if got := classifyPath(filepath.Join(home, "other", "x.txt"), project, nil, specific, wide); got != PathClassProtected {
+		t.Errorf("non-project home path = %s, want protected", got)
+	}
+}
+
+// TestCheckWrite_WorkspaceUnderHomeNotBlocked is the end-to-end
+// regression for the ~/.p-chat/workspace default working directory:
+// with home in WriteProtectedPaths (the default), a write inside the
+// workspace (which lives under home) must be Confirm, not Block. This
+// is what lets a project-less session write files in its default
+// working directory.
+func TestCheckWrite_WorkspaceUnderHomeNotBlocked(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory")
+	}
+	cfg := config.SandboxConfig{
+		Enabled:             true,
+		RequireConfirm:      "dangerous",
+		WriteProtectedPaths: []string{home},
+	}
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ws := filepath.Join(home, ".p-chat", "workspace")
+	if got := s.CheckWrite(filepath.Join(ws, "x.go"), ws); got != Confirm {
+		t.Errorf("CheckWrite(workspace, projectRoot=workspace) = %s, want confirm", got)
+	}
+	if got := s.CheckRead(filepath.Join(ws, "x.go"), ws); got != Allow {
+		t.Errorf("CheckRead(workspace, projectRoot=workspace) = %s, want allow", got)
+	}
+}
+
+// TestCheckWrite_HomeProtectedStillGuards is the safety-net check:
+// the home-wide protection must still hard-block writes OUTSIDE the
+// project (no silent widening), and specific dirs like ~/.ssh remain
+// blocked even inside a project claim.
+func TestCheckWrite_HomeProtectedStillGuards(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory")
+	}
+	cfg := config.SandboxConfig{
+		Enabled:             true,
+		RequireConfirm:      "dangerous",
+		WriteProtectedPaths: []string{home, filepath.Join(home, ".ssh")},
+	}
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	proj := filepath.Join(home, "myproj")
+	// Non-project home path with a project set → still blocked by the
+	// home-wide protection (unchanged safety net).
+	if got := s.CheckWrite(filepath.Join(home, "other", "x.txt"), proj); got != Block {
+		t.Errorf("non-project home path = %s, want block", got)
+	}
+	// ~/.ssh inside a project claim → still blocked (specific wins).
+	if got := s.CheckWrite(filepath.Join(home, ".ssh", "id_rsa"), proj); got != Block {
+		t.Errorf("~/.ssh = %s, want block", got)
+	}
 }
 
 // mustAbs is a tiny helper that turns a path into an absolute

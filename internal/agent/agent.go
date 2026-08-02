@@ -955,6 +955,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 	go func() {
 		defer close(ch)
+		// Global default working directory: when the session has no
+		// project path, anchor all file/command/grep operations to
+		// ~/.p-chat/workspace/ so the agent always has a fixed,
+		// user-visible scope instead of the server's startup CWD.
+		if req.ProjectRoot == "" {
+			req.ProjectRoot = paths.WorkspaceDir()
+		}
 		// partsAcc accumulates the trailing assistant message's
 		// parts (text + thinking + tool + sub_agent) as chunks
 		// flow through. It's mutated both by the main LLM-stream

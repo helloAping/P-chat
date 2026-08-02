@@ -215,8 +215,9 @@ func buildToolSpecificHints(availableTools []tool.Tool, kbEnabled bool) string {
 	}
 	if hasGrep {
 		sb.WriteString("\n\n---\n\n## Using grep\n\n" +
-			"使用 `grep(pattern=\"...\")` 在知识库文件中精确搜索关键词。\n" +
-			"适用场景：找特定函数名、变量名、类名、配置项、或任何精确文本。\n" +
+			"使用 `grep(pattern=\"...\")` 在当前工作目录（项目根目录）递归搜索关键词或精确文本。\n" +
+			"适用场景：找特定函数名、变量名、类名、配置项、或任何精确字符串。\n" +
+			"参数：`path` 限定搜索范围（子目录或单个文件）；`case_sensitive=true` 区分大小写；`top_k` 控制返回条数。\n" +
 			"recall 适合语义概念搜索，grep 适合精确字符串定位。\n" +
 			"两者可结合使用：先用 recall 理解上下文，再用 grep 精确定位。\n")
 	}
@@ -273,15 +274,16 @@ func buildAvailableToolsSection(availableTools []tool.Tool) string {
 		sb.WriteString(fmt.Sprintf("| `%s` | %s |\n", t.Name, desc))
 	}
 	sb.WriteString("\nOperation → correct tool mapping:\n")
-	sb.WriteString("- Read a file → `read_file` (NOT `cat` / `type` / `head` / `tail`)\n")
+	sb.WriteString("- Read a file → `read_file` (NOT `cat` / `type` / `head` / `tail`; for large files see Code Exploration)\n")
 	sb.WriteString("- Write a file → `write_file` (NOT `echo >` / `cat >`)\n")
 	sb.WriteString("- List directory → `list_files` (NOT `ls` / `dir`)\n")
 	sb.WriteString("- System commands → `exec_command` (NOT `bash` / `sh` / `powershell`)\n")
-	sb.WriteString("- Search file contents → `exec_command` with shell search commands\n")
+	sb.WriteString("- Search code in the working directory → `grep` tool or `exec_command` with `findstr` (Windows) / `grep -rn` (Unix)\n")
 	sb.WriteString("- Search the web → `web_search` (returns title+url+snippet; chain with `web_fetch` for full content)\n")
 	sb.WriteString("- Fetch a URL → `web_fetch` (NOT `curl` / `Invoke-WebRequest`)\n")
 	sb.WriteString("- Manage tasks → `todo_write`\n")
 	sb.WriteString("- Ask user → `question`\n")
+	sb.WriteString("- Prefer the built-in tools above over writing your own helper scripts (e.g. a dump script) to do the same job\n")
 	return sb.String()
 }
 
@@ -333,10 +335,25 @@ func buildConversationContinuitySection() string {
 	sb.WriteString("3. After 3 consecutive failures on the same task, use `question` to ask the user for guidance\n")
 	sb.WriteString("4. A tool failure does NOT mean the task is impossible — keep going\n")
 	sb.WriteString("5. NEVER end a turn with only a status summary after a tool error — always propose or attempt the next step\n\n")
+	sb.WriteString("## Code Exploration & Context Management\n\n")
+	sb.WriteString("Explore unfamiliar code incrementally — read only what you need, then decide. ")
+	sb.WriteString("Your context is a finite resource: dumping whole files into it makes every later turn slower and degrades your judgment.\n\n")
+	sb.WriteString("- **Locate first, then read.** Search for a symbol, endpoint, or keyword before opening a file. ")
+	sb.WriteString("Use the built-in `grep` tool (searches the working directory) or `exec_command` with `findstr /s /n /i \"pattern\" *` (Windows) / `grep -rn \"pattern\" .` (Unix) to find the exact file:line.\n")
+	sb.WriteString("- **Read small ranges, not whole files.** `read_file` reads the entire file; for large files pass `dry_run=true` ")
+	sb.WriteString("to see the size + first 200 chars first, then read a targeted slice via `exec_command` ")
+	sb.WriteString("(`type \"file\" | more /e +120` on Windows, `sed -n '120,200p' file` on Unix). ")
+	sb.WriteString("One focused range beats an entire file dumped into context.\n")
+	sb.WriteString("- **Do not write helper scripts to read files.** Never create a temporary script (e.g. a dump/pretty-print script) ")
+	sb.WriteString("just to read code — it pollutes the workspace and drags whole files into context. Use the tools above directly.\n")
+	sb.WriteString("- **If a result is truncated or too big, narrow the range and re-read** — do not broaden and re-dump. ")
+	sb.WriteString("Truncation is a signal that you asked for too much at once.\n")
+	sb.WriteString("- **Stop when you have enough.** Do not keep reading files once you can answer or act. ")
+	sb.WriteString("Each turn should bring back only the information needed to solve the current step.\n\n")
 	sb.WriteString("Operation → fallback mapping (when the primary approach fails):\n")
 	sb.WriteString("- `read_file` path not found → try `list_files` to discover the correct path\n")
 	sb.WriteString("- Command not found in `exec_command` → check the Platform section for available commands\n")
-	sb.WriteString("- File too large for `read_file` → use `exec_command` with `type` or `findstr` to grep specific lines\n")
+	sb.WriteString("- File too large for `read_file` (or the whole file isn't needed) → use `read_file` with `dry_run=true` to inspect size, then `exec_command` (`type` + `more` / `sed -n`) to read a targeted line range\n")
 	sb.WriteString("- Tool not found error → re-read the Available Tools table; use only listed tools\n")
 	sb.WriteString("- `browser_*` connection error (\"connection closed\", \"browser extension has disconnected\") → ")
 	sb.WriteString("the extension may reconnect. Retry once; if it fails again, tell the user the browser extension disconnected ")
