@@ -582,7 +582,7 @@ GUI：顶栏 🔧 按钮。CLI：`/tools`。自定义 YAML 工具放 `~/.p-chat/
 见上方 [浏览器控制](#浏览器控制) 章节：装扩展 → 弹窗填服务器地址 → GUI 看到「已连接浏览器 > 0」→ LLM 自动开始用 `browser_*` 工具。15 个工具的清单、双通道截图嵌入、BR-04 域名策略、控制目标 tab 切换都在那一节。
 
 **6. trace id 在哪看？**
-错误气泡上的 `trace id` 按钮直接复制；顶栏 `#` 按钮是最近一次的。日志在 `~/.p-chat/server-debug.log`。
+错误气泡上的 `trace id` 按钮直接复制；顶栏 `#` 按钮是最近一次的。日志在 `~/.p-chat/logs/`（按日期切割，保留 7 天，如 `server-debug-2026-08-02.log`）。
 
 **7. 重答后能看上一版吗？**
 assistant 消息底部「重答」会保留所有历史版本，消息下方出现版本切换条。
@@ -608,7 +608,8 @@ go test -count=1 ./...
 cd frontend && npx vue-tsc -b
 
 # 调试
-~/.p-chat/server-debug.log    # LLM 请求 + SSE 事件
+~/.p-chat/logs/                # 按日期切割的日志（保留 7 天）
+~/.p-chat/logs/server-debug-2026-08-02.log   # LLM 请求 + SSE 事件
 ```
 
 `scripts/` 下都是平台无关工具脚本（`clean-frontend-output.ps1` / `sync-web.ps1` / `package-gui.ps1` / `build-installer.ps1` 等）。

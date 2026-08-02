@@ -277,9 +277,9 @@ npm run build                                   # 前端 bundle
 
 | 问题 | 怎么查 |
 | --- | --- |
-| LLM 回复不显示 | `~/.p-chat/server-debug.log` |
+| LLM 回复不显示 | `~/.p-chat/logs/`（按日期切割，保留 7 天，如 `server-debug-2026-08-02.log`） |
 | 前端路由错 | `MessageBubble.vue` `parts` 数组 |
-| Wails 启动失败 | `bin/pchat-server.log` |
+| Wails 启动失败 | `~/.p-chat/logs/` 下 `pchat-gui-<date>.log` 与 `pchat-server-<date>.log` |
 | Anthropic 协议不工作 | `internal/llm/anthropic.go:130-260` |
 
 ---

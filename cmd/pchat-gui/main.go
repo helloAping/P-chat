@@ -57,7 +57,15 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+
+	"github.com/p-chat/pchat/cmd/pchat-gui/rotatelog"
 )
+
+// appLogDir is the directory holding the GUI's rotated log files.
+// It is resolved once at startup (main) and reused when redirecting
+// the pchat-server child's output, so both processes log side by
+// side under <data-home>/logs.
+var appLogDir string
 
 // loadingHTML is served by the AssetServer handler while pchat-server is
 // still starting up. The embedded JS polls /api/v1/health (which, once
@@ -101,7 +109,7 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
   }
   function tick(){
     tries++;
-    if (tries > 300) { fail('后端服务启动超时（60秒），请查看 pchat-gui.log / pchat-server.log'); return; }
+    if (tries > 300) { fail('后端服务启动超时（60秒），请查看 <数据目录>/logs/ 下的 pchat-gui.log / pchat-server.log'); return; }
     fetch('/api/v1/health', {cache:'no-store', credentials:'omit'})
       .then(function(r){
         // We only treat the backend as "ready" when we get a real JSON
@@ -134,16 +142,20 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
 `
 
 func main() {
-	// Open a debug log on disk so we can diagnose issues even if the
-	// webview never appears (e.g. headless session).
 	exe, _ := os.Executable()
-	logPath := filepath.Join(filepath.Dir(exe), "pchat-gui.log")
-	if lf, lfErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); lfErr == nil {
-		log.SetOutput(lf)
-		defer lf.Close()
+	// Open a dated debug log on disk so we can diagnose issues even
+	// if the webview never appears (e.g. headless session). Logs
+	// live under <data-home>/logs and rotate by date with a 7-day
+	// retention.
+	appLogDir = filepath.Join(resolveHomeDir(), "logs")
+	if logWriter, logErr := rotatelog.New(appLogDir, "pchat-gui", 7); logErr == nil {
+		log.SetOutput(logWriter)
+		defer logWriter.Close()
+	} else {
+		log.SetOutput(os.Stderr)
 	}
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("pchat-gui starting; exe=%s", exe)
+	log.Printf("pchat-gui starting; exe=%s log_dir=%s", exe, appLogDir)
 
 	instanceLock, alreadyRunning, lockErr := acquireSingleInstance()
 	if lockErr != nil {
@@ -1032,11 +1044,14 @@ func (a *App) spawnAndWatch() {
 	// unless we set CREATE_NO_WINDOW explicitly. Without this, every
 	// launch would pop up a black console window for pchat-server.
 	hideChildConsole(cmd)
-	// Forward child output to the same log file the GUI uses so users
-	// can see both pchat-gui and pchat-server logs side by side.
-	if lf, lfErr := os.OpenFile(filepath.Join(filepath.Dir(bin), "pchat-server.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); lfErr == nil {
-		cmd.Stdout = lf
-		cmd.Stderr = lf
+	// Forward child output to the same dated log directory the GUI
+	// uses (with its own base name) so users can see both pchat-gui
+	// and pchat-server logs side by side under <data-home>/logs.
+	// The server process writes to a fresh file each day and old
+	// files are pruned automatically.
+	if lw, lwErr := rotatelog.New(appLogDir, "pchat-server", 7); lwErr == nil {
+		cmd.Stdout = lw
+		cmd.Stderr = lw
 	} else {
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr

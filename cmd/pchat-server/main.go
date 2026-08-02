@@ -23,6 +23,7 @@ import (
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/internal/rotatelog"
 	"github.com/p-chat/pchat/internal/sandbox"
 	"github.com/p-chat/pchat/internal/search"
 	"github.com/p-chat/pchat/internal/server"
@@ -70,7 +71,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("init directories: %w", err)
 	}
 
-	// Mirror the standard log to a file under ~/.p-chat so
+	// Mirror the standard log to a dated file under ~/.p-chat/logs so
 	// the LLM-SSE debug output is easy to find when pchat-server
 	// is launched as a child process (e.g. by pchat-gui) and
 	// stderr is not visible in a terminal. The first few raw
@@ -82,9 +83,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// a fix that correctly handles non-standard proxy field
 	// names, we still need a way for the user to inspect what
 	// the proxy actually sent. This log is the answer.
-	if logFile, err := os.OpenFile(filepath.Join(paths.GlobalDir(), "server-debug.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
-		log.SetOutput(logFile)
+	//
+	// Logs rotate by date (server-debug-YYYY-MM-DD.log) and old
+	// files beyond the 7-day retention are pruned automatically.
+	if logWriter, logErr := rotatelog.New(filepath.Join(paths.GlobalDir(), "logs"), "server-debug", 7); logErr == nil {
+		log.SetOutput(logWriter)
+		defer logWriter.Close()
 	}
 
 	cfg, err := config.Load(cfgFile)

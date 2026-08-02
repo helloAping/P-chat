@@ -15,6 +15,7 @@ import (
 	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/recall"
+	"github.com/p-chat/pchat/internal/rotatelog"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/version"
@@ -90,11 +91,13 @@ func runREPL(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("init directories: %w", err)
 	}
 
-	// Redirect log output to a debug file so raw LLM JSON chunks
-	// don't leak to the terminal during "思考中" (thinking).
-	if logFile, err := os.OpenFile(filepath.Join(paths.GlobalDir(), "server-debug.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600); err == nil {
-		log.SetOutput(logFile)
+	// Redirect log output to a dated debug file under
+	// ~/.p-chat/logs so raw LLM JSON chunks don't leak to the
+	// terminal during "思考中" (thinking). Files rotate by date
+	// and files older than 7 days are pruned.
+	if logWriter, logErr := rotatelog.New(filepath.Join(paths.GlobalDir(), "logs"), "server-debug", 7); logErr == nil {
+		log.SetOutput(logWriter)
+		defer logWriter.Close()
 	}
 
 	cfg, err := config.Load(cfgFile)
