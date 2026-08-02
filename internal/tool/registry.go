@@ -824,7 +824,7 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	}
 
 	cmd, _ := buildExecCommand(ctx, a.Command, a.WorkDir, projectRootFromCtx(ctx))
-	out, err := readLimitedOutput(cmd)
+	out, err := readLimitedOutput(ctx, cmd)
 	if err != nil {
 		content := strings.TrimRight(string(out), "\r\n")
 		if content != "" {
@@ -923,10 +923,24 @@ func buildExecCommand(ctx context.Context, command, workDir, root string) (*exec
 
 const maxExecReadSize = 256 * 1024
 
+// execPipeCloseTimeout is the grace period allowed for the stdout/stderr
+// pipe readers to drain after the process exits (or is killed). A spawned
+// grandchild that inherited the pipe handles keeps the write ends open, so
+// io.ReadAll would otherwise block forever — the classic Windows
+// `cmd /C` orphaned-server deadlock. We read the pipes in a goroutine and
+// give up after this window, returning the bytes collected so far.
+const execPipeCloseTimeout = 15 * time.Second
+
 // readLimitedOutput captures stdout+stderr with a hard byte cap
 // to prevent memory exhaustion if the LLM runs an unbounded
 // command (e.g. `cat /dev/zero`).
-func readLimitedOutput(cmd *exec.Cmd) ([]byte, error) {
+//
+// ctx bounds the whole call: when it is cancelled (tool timeout,
+// user stop), the process group is killed and the pipe readers are
+// released via execPipeCloseTimeout, so the caller can never hang
+// forever on a command that left a grandchild holding the pipe.
+func readLimitedOutput(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
+	setProcessGroup(cmd)
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
@@ -944,12 +958,46 @@ func readLimitedOutput(cmd *exec.Cmd) ([]byte, error) {
 	go readPipe(stdout)
 	go readPipe(stderr)
 
-	r1, r2 := <-ch, <-ch
-	waitErr := cmd.Wait()
+	var r1, r2 result
+	var waitErr error
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		waitErr = cmd.Wait()
+		// Wait() closes the read ends only after the child exits. A
+		// grandchild that inherited the write ends keeps the pipes
+		// open, so the io.ReadAll goroutines may still be blocked.
+		// Close the read ends to release them before we report the
+		// wait error.
+		_ = stdout.Close()
+		_ = stderr.Close()
+		r1, r2 = <-ch, <-ch
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Kill the whole process tree (cmd.exe wrapper AND its
+		// children) so no orphan keeps the pipes alive. On
+		// Windows this is `taskkill /T /F`; on Unix the
+		// process group gets SIGKILL. Without this the tool
+		// timeout only killed the wrapper and the real command
+		// was orphaned holding stdout/stderr — the unbounded
+		// hang behind "多轮工具后卡住".
+		if err := stopProcessTree(cmd); err != nil {
+			log.Printf("[tool/exec_command] kill process tree: %v", err)
+		}
+		select {
+		case <-waitDone:
+		case <-time.After(execPipeCloseTimeout):
+			return nil, fmt.Errorf("exec_command interrupted: %w (pipe readers did not drain after %s)", ctx.Err(), execPipeCloseTimeout)
+		}
+	case <-waitDone:
+	}
+
 	out := append(r1.data, r2.data...)
 
 	// Surface every error. The previous code only returned
-	// waitErr when there was no read error �?meaning a read
+	// waitErr when there was no read error — meaning a read
 	// error during a successful process was silently dropped
 	// (the user would see partial output with no warning).
 	switch {

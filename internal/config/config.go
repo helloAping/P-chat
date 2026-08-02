@@ -72,6 +72,13 @@ type LimitsConfig struct {
 	// messages beyond this count per conversation are deleted oldest-
 	// first. 0 = unlimited (default).
 	MaxStoredMessages int `json:"max_stored_messages"`
+	// MaxTurnSeconds is the hard wall-clock cap for one agent turn
+	// (SendMessage → done). 0 = disabled. Default 900 (15 min).
+	// This is the backstop for unbounded hangs that escape the
+	// per-tool and LLM-stream timeouts — e.g. an exec_command that
+	// left an orphaned grandchild holding its pipes, or an SSE write
+	// blocked against a dead client connection.
+	MaxTurnSeconds int `json:"max_turn_seconds"`
 }
 
 // TodoLongRunMode configures the long-running task policy.
@@ -921,6 +928,7 @@ func Default() *Config {
 		Limits: LimitsConfig{
 			MaxRounds:       300,
 			TodoLongRunMode: TodoLongRunAdaptive,
+			MaxTurnSeconds:  900,
 		},
 		Sandbox: SandboxConfig{
 			Enabled:               true,

@@ -12,6 +12,11 @@ export interface SSEConsumerOptions<T extends StreamEventLike> {
   label: string
   onEvent: (ev: T) => void
   onStreamDrop?: (drop: { lastSeq: number; reason: string }) => void
+  // idleTimeoutMs bounds the time a read may stay silent. When no
+  // bytes arrive for this long, the reader is cancelled, onStreamDrop
+  // fires, and an "idle" error is thrown (not retried — the caller
+  // recovers missing parts from the server instead). 0 disables.
+  idleTimeoutMs?: number
 }
 
 export function parseSSEFrame(block: string): { data: string; seq?: number } {
@@ -89,6 +94,53 @@ export function abortableDelay(ms: number, signal?: AbortSignal): Promise<boolea
   })
 }
 
+// readWithIdleTimeout races a single reader.read() against an idle
+// watchdog. On timeout the reader is cancelled and the promise rejects
+// with the idle error; the caller reports the drop and recovers via the
+// P0-1 snapshot path instead of spinning forever against a stuck turn.
+function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal | undefined,
+  idleTimeoutMs: number,
+  makeIdleError: () => Error,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      if (signal?.aborted) return
+      reader.cancel().catch(() => {})
+      reject(makeIdleError())
+    }, idleTimeoutMs)
+    const clear = () => clearTimeout(timer)
+    reader.read().then(
+      (r) => {
+        if (settled) return
+        settled = true
+        clear()
+        resolve(r)
+      },
+      (e) => {
+        if (settled) return
+        settled = true
+        clear()
+        reject(e)
+      },
+    )
+    signal?.addEventListener(
+      'abort',
+      () => {
+        if (settled) return
+        settled = true
+        clear()
+        resolve({ done: true, value: undefined } as ReadableStreamReadResult<Uint8Array>)
+      },
+      { once: true },
+    )
+  })
+}
+
 export async function consumeSSEStream<T extends StreamEventLike>(
   options: SSEConsumerOptions<T>,
 ): Promise<void> {
@@ -96,13 +148,28 @@ export async function consumeSSEStream<T extends StreamEventLike>(
   let buffer = ''
   let lastSeq = -1
   let done = false
+  // Pending idle watchdog for the current read. Created on every
+  // loop iteration (not once) so a stream that delivers bytes
+  // continuously — e.g. a model in a long reasoning pass — keeps
+  // resetting the timer and is never cut off.
+  const idleError = () =>
+    new Error(`${options.label} stream: no data for ${options.idleTimeoutMs}ms (turn may be stuck)`)
 
   while (!done) {
     if (options.signal?.aborted) return
 
     let result: ReadableStreamReadResult<Uint8Array>
     try {
-      result = await options.reader.read()
+      if (options.idleTimeoutMs && options.idleTimeoutMs > 0) {
+        result = await readWithIdleTimeout(
+          options.reader,
+          options.signal,
+          options.idleTimeoutMs,
+          idleError,
+        )
+      } else {
+        result = await options.reader.read()
+      }
     } catch (error: any) {
       if (options.signal?.aborted) return
       const reason = error?.message || 'read failed'
@@ -113,6 +180,14 @@ export async function consumeSSEStream<T extends StreamEventLike>(
           // 恢复回调不能掩盖原始流错误。
           // A recovery callback must not hide the original stream error.
         }
+      }
+      if (options.idleTimeoutMs && options.idleTimeoutMs > 0 && reason.includes('no data for')) {
+        // Idle timeouts are NOT transport errors: the connection is
+        // fine, the turn is simply stuck. Reconnect-retry would loop
+        // forever against the same stuck turn; the P0-1 recovery path
+        // (recoverMissingParts) is the correct way to surface what
+        // the server did manage to persist.
+        throw error
       }
       throw new Error(`${options.label} stream: ${reason}`)
     }

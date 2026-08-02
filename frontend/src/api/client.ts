@@ -1158,6 +1158,10 @@ async function streamMessagesViaFetch(
     label: 'stream',
     onEvent: opts.onEvent,
     onStreamDrop: opts.onStreamDrop,
+    // 150s of silence → the turn is stuck (server LLM idle timeout
+    // is 120s; its error would have arrived by then). Cancel and
+    // recover via P0-1 instead of spinning forever.
+    idleTimeoutMs: 150_000,
   })
 }
 
@@ -1168,6 +1172,7 @@ type StreamRequest = {
   onEvent: (ev: StreamEvent) => void
   onStreamDrop?: (info: { lastSeq: number; reason: string }) => void
   label: string
+  idleTimeoutMs?: number
 }
 
 // consumeStreamRequest 是聊天 SSE 端点的唯一传输适配器。
@@ -1202,6 +1207,7 @@ async function consumeStreamRequest(request: StreamRequest): Promise<void> {
     label: request.label,
     onEvent: request.onEvent,
     onStreamDrop: request.onStreamDrop,
+    idleTimeoutMs: request.idleTimeoutMs,
   })
 }
 

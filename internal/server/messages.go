@@ -18,6 +18,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
@@ -217,7 +218,25 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		TraceID: trace.FromContext(c.Request.Context()),
 	}
 
-	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
+	// Hard wall-clock cap for the whole turn. Backstop for hangs that
+	// escape the per-tool / LLM-stream timeouts: an exec_command whose
+	// orphaned grandchild holds the output pipes, or an SSE write
+	// blocked against a dead client connection. When the deadline
+	// fires, ChatWithTools' ctx.Done() path emits an error event and
+	// the session lock is released, so the user is never stuck on a
+	// permanently "busy" session.
+	turnCtx := c.Request.Context()
+	if maxSec := h.getCfg().Limits.MaxTurnSeconds; maxSec > 0 {
+		var cancel context.CancelFunc
+		turnCtx, cancel = context.WithTimeout(turnCtx, time.Duration(maxSec)*time.Second)
+		defer cancel()
+		// Replace the request context so respondSSE can observe the
+		// deadline error and emit a terminal error frame when the
+		// stream closes without a done event.
+		c.Request = c.Request.WithContext(turnCtx)
+	}
+
+	stream := h.agent.ChatStream(turnCtx, chatReq)
 	h.respondSSE(c, stream, id, provider, model)
 }
 
@@ -277,6 +296,13 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 	}
 	c.Writer.Flush()
 
+	// Track whether a terminal frame (done / error with Done=true)
+	// was emitted. When the stream closes without one — e.g. the
+	// turn's hard timeout fired and ChatWithTools' ctx.Done() paths
+	// returned silently — emit a terminal error frame so the client
+	// can distinguish "interrupted" from "completed" instead of
+	// treating a truncation as success.
+	terminalEmitted := false
 	c.Stream(func(w io.Writer) bool {
 		defer func() {
 			if r := recover(); r != nil {
@@ -285,6 +311,24 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		}()
 		chunk, ok := <-stream
 		if !ok {
+			// Stream closed without a done event. If the turn was
+			// interrupted by its hard deadline, surface that to the
+			// client as a terminal error frame.
+			if !terminalEmitted {
+				terminalEmitted = true
+				if err := c.Request.Context().Err(); err != nil {
+					ev := streamEventFromChunk(agent.ChatStreamChunk{
+						Error:    fmt.Sprintf("回合超出最长执行时间被终止: %v", err),
+						ErrorKind: "turn_timeout",
+						Done:     true,
+					}, provider, model, streamDoneIDs{})
+					if werr := writeSSEFrame(w, ev); werr == nil {
+						if fl, ok := c.Writer.(http.Flusher); ok {
+							fl.Flush()
+						}
+					}
+				}
+			}
 			return false
 		}
 		var ids streamDoneIDs
@@ -293,6 +337,9 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 			ids.lastMessageID = h.store.GetLastMessageID(sessionID)
 		}
 		ev := streamEventFromChunk(chunk, provider, model, ids)
+		if chunk.Done {
+			terminalEmitted = true
+		}
 		if ev.Type == "question" {
 			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
 		}

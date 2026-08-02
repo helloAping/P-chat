@@ -87,6 +87,10 @@ memory:
 # max_rounds while preserving cancellation, context compaction, and tool-failure guards.
 limits:
   max_rounds: 300
+  # Hard wall-clock cap for one agent turn (0 = disabled). Backstop for
+  # hangs that escape per-tool timeouts (e.g. an exec_command whose
+  # orphaned child holds the output pipes).
+  max_turn_seconds: 900
   todo_long_run_mode: "adaptive" # "off" | "adaptive" | "unlimited"
 
 sandbox:

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -708,6 +709,85 @@ func TestSendMessage_StreamsSSE(t *testing.T) {
 	// We just want to confirm the request was accepted; with no
 	// real LLM the body will likely be empty.
 	t.Logf("streaming completed; status would be checked via real client")
+}
+
+// TestSendMessage_TurnTimeoutEmitsTerminalError is the regression
+// test for the 30-minute stuck turns: when the upstream LLM hangs
+// (accepts the connection then stalls), the per-turn hard deadline
+// must terminate the SSE stream with a visible error frame instead
+// of closing silently — the client would otherwise treat the
+// truncated stream as a successful turn.
+func TestSendMessage_TurnTimeoutEmitsTerminalError(t *testing.T) {
+	// A listener that accepts the connection and then holds it open
+	// without ever responding — the exact "stalled upstream" shape
+	// behind the 503-then-hang incident in server-debug.log.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				// Read the request headers, then go silent.
+				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)
+				_ = c.SetReadDeadline(time.Time{})
+				<-time.After(30 * time.Second)
+				_ = c.Close()
+			}(conn)
+		}
+	}()
+
+	// Seed a config pointing at the stalled listener with a 2-second
+	// turn cap.
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "http://`+ln.Addr().String()+`/v1"`, 1)
+	var cfgMap map[string]any
+	if err := json.Unmarshal([]byte(cfgJSON), &cfgMap); err != nil {
+		t.Fatal(err)
+	}
+	cfgMap["limits"] = map[string]any{"max_turn_seconds": 2}
+	cfgJSONBytes, err := json.Marshal(cfgMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, cfg := newTestServerWithConfig(t, string(cfgJSONBytes))
+	if cfg.Limits.MaxTurnSeconds != 2 {
+		t.Fatalf("MaxTurnSeconds = %d, want 2", cfg.Limits.MaxTurnSeconds)
+	}
+
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/sessions", nil))
+	var created SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&created)
+
+	w2 := newStreamRecorder()
+	body := bytes.NewBufferString(`{"message":"hi","style":"tech"}`)
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/messages", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }()
+		s.engine.ServeHTTP(w2, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("streaming handler hung past the turn deadline")
+	}
+
+	frames := w2.Body.String()
+	if !strings.Contains(frames, "turn_timeout") && !strings.Contains(frames, "回合超出最长执行时间") {
+		t.Fatalf("expected a terminal turn_timeout error frame, got: %q", frames)
+	}
 }
 
 func TestLoadHistoryForSend_BoundsUncompressedHistory(t *testing.T) {
