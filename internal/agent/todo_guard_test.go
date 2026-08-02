@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -84,5 +85,40 @@ func TestBuildTodoGuardPromptPrioritizesInProgress(t *testing.T) {
 	}
 	if strings.Index(prompt, "[active]") > strings.Index(prompt, "[pending]") {
 		t.Fatalf("in_progress item was not listed first: %q", prompt)
+	}
+}
+
+func TestResolveRoundLimit(t *testing.T) {
+	tests := []struct {
+		name           string
+		maxRounds      int
+		mode           string
+		hasActiveTodos bool
+		want           int
+	}{
+		{name: "build mode no todos", maxRounds: 300, mode: "adaptive", hasActiveTodos: false, want: 300},
+		{name: "adaptive active todos extends to 3x", maxRounds: 300, mode: "adaptive", hasActiveTodos: true, want: 900},
+		{name: "off never extends", maxRounds: 300, mode: "off", hasActiveTodos: true, want: 300},
+		{name: "empty mode normalizes to adaptive", maxRounds: 300, mode: "", hasActiveTodos: true, want: 900},
+		{name: "explicit unlimited stays unbounded", maxRounds: 300, mode: "unlimited", hasActiveTodos: true, want: 0},
+		{name: "maxRounds zero stays zero", maxRounds: 0, mode: "adaptive", hasActiveTodos: true, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveRoundLimit(tt.maxRounds, config.TodoLongRunMode(tt.mode), tt.hasActiveTodos); got != tt.want {
+				t.Fatalf("resolveRoundLimit(%d, %q, %v) = %d, want %d", tt.maxRounds, tt.mode, tt.hasActiveTodos, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLongRunCeilingMultiplier pins the multiplier so a future change updates
+// the plan docs, matching the codebase convention for loop-guard constants.
+func TestLongRunCeilingMultiplier(t *testing.T) {
+	if longRunCeilingMultiplier < 2 {
+		t.Errorf("longRunCeilingMultiplier = %d, want >= 2 (a meaningful extension over MaxRounds)", longRunCeilingMultiplier)
+	}
+	if longRunCeilingMultiplier > 10 {
+		t.Errorf("longRunCeilingMultiplier = %d, want <= 10 (must stay a bounded backstop)", longRunCeilingMultiplier)
 	}
 }

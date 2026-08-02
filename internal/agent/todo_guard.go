@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -24,6 +25,32 @@ const (
 // limit local to a stream prevents a forgotten update from creating an
 // unbounded ReAct loop or retaining per-session state in a global map.
 const MaxTodoCheckpointAttempts = 3
+
+// longRunCeilingMultiplier caps how far TodoLongRunAdaptive may extend
+// MaxRounds when a todo plan is active. Active plans are meant to outlive the
+// default safety net, but not without bound — the 2026-08 recipes.js re-read
+// loop ran ~700 rounds because the adaptive mode bypassed the cap entirely.
+// An active plan now gets up to multiplier × MaxRounds before the hard
+// text-only final round forces a conclusion.
+const longRunCeilingMultiplier = 3
+
+// resolveRoundLimit returns the effective round cap for a turn (0 = unbounded).
+// Build mode (no active todo plan) uses MaxRounds; an active plan in
+// TodoLongRunAdaptive extends it to longRunCeilingMultiplier × MaxRounds;
+// TodoLongRunUnlimited is an explicit opt-in and stays unbounded. maxRounds
+// <= 0 is returned unchanged (the caller treats it as no cap).
+func resolveRoundLimit(maxRounds int, mode config.TodoLongRunMode, hasActiveTodos bool) int {
+	if maxRounds <= 0 {
+		return maxRounds
+	}
+	if !mode.AllowsUnlimitedRounds(hasActiveTodos) {
+		return maxRounds
+	}
+	if mode == config.TodoLongRunUnlimited {
+		return 0
+	}
+	return maxRounds * longRunCeilingMultiplier
+}
 
 const (
 	todoGuardStart = "\n\n[PCHAT_TODO_GUARD]\n"

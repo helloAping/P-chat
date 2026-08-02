@@ -1316,6 +1316,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// work phase without recording that work in the todo list.
 			todoCheckpoint         todoCheckpointState
 			todoCheckpointAttempts int
+			// No-progress guard: catches rounds that only re-read files already
+			// read, with no mutation (the 2026-08 recipes.js re-read loop), which
+			// the stuck-loop guard (identical failing calls) cannot see.
+			noProgress noProgressGuard
+			// forceSummaryRound flips when the no-progress guard has been
+			// ignored long enough; the next round then drops tools (see
+			// isLastRound) so the model is physically forced to conclude.
+			forceSummaryRound bool
 		)
 		const stuckThreshold = 3
 		const sameToolErrMax = 4
@@ -1350,25 +1358,34 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// cannot call tools and is forced to give a text
 			// summary. See opencode's `runner/max-steps.ts:1-16`
 			// and `llm.ts:197-209`.
-			isLastRound := (req.PlanMode || !longRunMode.AllowsUnlimitedRounds(len(currentTodos) > 0)) && maxRounds > 0 && round >= maxRounds
+			//
+			// Round cap resolution. Build mode uses MaxRounds as the safety
+			// net; an active todo plan (TodoLongRunAdaptive) may extend it, but
+			// only up to longRunCeilingMultiplier × MaxRounds so a runaway
+			// plan (the 2026-08 recipes.js re-read loop) cannot run forever.
+			// TodoLongRunUnlimited is an explicit opt-in and stays unbounded
+			// (roundLimit 0). The no-progress guard can force an early
+			// text-only round via forceSummaryRound.
+			roundLimit := resolveRoundLimit(maxRounds, longRunMode, len(currentTodos) > 0)
+			isLastRound := req.PlanMode || forceSummaryRound || (roundLimit > 0 && round >= roundLimit)
 
 			// Pre-limit warning: when within 10 rounds of the
 			// cap, inject a gentle heads-up so the LLM can wrap
 			// up gracefully instead of being cut off abruptly.
 			// Only injected once — the flag ensures no spam.
-			if !nearLimitWarningSent && maxRounds > 10 && round >= maxRounds-10 && !isLastRound {
+			if !nearLimitWarningSent && roundLimit > 10 && round >= roundLimit-10 && !isLastRound {
 				nearLimitWarningSent = true
 				msgs = append(msgs, llm.ChatMessage{
 					Role:    llm.RoleSystem,
 					Type:    llm.TypeText,
-					Content: fmt.Sprintf("注意：当前会话轮次即将达到上限（%d 轮，剩余约 %d 轮）。请开始收尾当前任务，优先完成最关键的未完成工作，避免开启需要多轮的新子任务。", maxRounds, maxRounds-round),
+					Content: fmt.Sprintf("注意：当前会话轮次即将达到上限（%d 轮，剩余约 %d 轮）。请开始收尾当前任务，优先完成最关键的未完成工作，避免开启需要多轮的新子任务。", roundLimit, roundLimit-round),
 				})
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 					Phase:    "llm",
 					Step:     "near-limit",
-					Message:  fmt.Sprintf("轮次接近上限（剩余 %d 轮），提醒 LLM 收尾", maxRounds-round),
+					Message:  fmt.Sprintf("轮次接近上限（剩余 %d 轮），提醒 LLM 收尾", roundLimit-round),
 					Round:    roundNum,
-					MaxRound: maxRounds,
+					MaxRound: roundLimit,
 				})
 			}
 
@@ -2483,6 +2500,38 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				})
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 				return
+			}
+
+			// No-progress guard: catches rounds that only re-read files already
+			// read, with no mutation (the 2026-08 recipes.js re-read loop).
+			// Every tool SUCCEEDS here, so neither the stuck-loop guard (which
+			// needs identical failing calls) nor the same-tool error counter can
+			// see it. At noProgressDirectiveAfter we steer the LLM; at
+			// noProgressForceStopAfter we force a text-only final round.
+			if streak := noProgress.observe(toolCalls); streak == noProgressDirectiveAfter {
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("你已连续 %d 轮仅重复读取文件但未做任何修改。请立即停止重复读取：要么直接执行修改（write_file / edit_file），要么基于已读内容给出最终结论。不要再调用只读工具。", streak),
+				})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:    "stuck",
+					Step:     "no-progress-directive",
+					Message:  fmt.Sprintf("检测到连续 %d 轮只读无进展（重复读取相同文件），已提示 LLM 停止读取。", streak),
+					Round:    roundNum,
+					MaxRound: maxRounds,
+				})
+			} else if streak >= noProgressForceStopAfter && !forceSummaryRound {
+				forceSummaryRound = true
+				emitTodoIncomplete("no-progress loop forced a text-only final round", roundNum)
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:    "stuck",
+					Step:     "no-progress-force-stop",
+					Message:  fmt.Sprintf("已连续 %d 轮重复读取相同文件且未做修改，强制结束工具调用，请给出总结。", streak),
+					Round:    roundNum,
+					MaxRound: maxRounds,
+					TokensIn: totalIn, TokensOut: totalOut,
+				})
 			}
 
 			// Same-tool-name error counter: if a single tool
