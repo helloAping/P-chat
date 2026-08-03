@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -196,8 +197,71 @@ func ClassifyAPIError(providerName string, err error) error {
 		return &APIError{Kind: KindNetwork, Message: "网络连接失败", Cause: err}
 	}
 
+	// HTTP status errors surfaced by the streaming client as
+	// fmt.Errorf("llm http %d: ...") / fmt.Errorf("openai http %d: ...").
+	// Without this, 429 / 5xx from a proxy would fall through as raw
+	// (non-retryable) errors — the agent's retryable set
+	// (rate_limit/server/network/timeout) would never fire on them.
+	if status, rest, ok := parseHTTPStatusError(msg); ok {
+		out := &APIError{StatusCode: status, Cause: err}
+		switch {
+		case status == 401 || status == 403:
+			out.Kind = KindAuth
+			out.Message = "API key 无效或未授权"
+			out.Suggestion = fmt.Sprintf("用 /config key %s <新key> 更新", providerName)
+		case status == 404:
+			out.Kind = KindNotFound
+			out.Message = fmt.Sprintf("模型不存在 (%d)", status)
+			out.Suggestion = "/model 切换到该 provider 已配置的模型"
+		case status == 429:
+			out.Kind = KindRateLimit
+			out.Message = "请求频率超限 (rate limit)"
+			out.Suggestion = "稍后重试，或考虑切换到更便宜的模型"
+		case status >= 500:
+			out.Kind = KindServer
+			out.Message = fmt.Sprintf("上游服务异常 (%d)", status)
+			out.Suggestion = "稍后重试"
+		case status >= 400:
+			out.Kind = KindBadRequest
+			out.Message = fmt.Sprintf("请求被拒绝 (%d)", status)
+		default:
+			out.Kind = KindUnknown
+			out.Message = truncate(rest, 120)
+		}
+		return out
+	}
+
 	// Fall through: unknown error, pass through.
 	return err
+}
+
+// parseHTTPStatusError parses the streaming client's status-error
+// envelope, e.g. "llm http 500: {json}" or "openai http 429: ...".
+// Returns the status code and the remainder after the prefix, or ok=false
+// when msg is not one of those envelopes.
+func parseHTTPStatusError(msg string) (int, string, bool) {
+	const (
+		llmPrefix    = "llm http "
+		openaiPrefix = "openai http "
+	)
+	var rest string
+	switch {
+	case strings.HasPrefix(msg, llmPrefix):
+		rest = msg[len(llmPrefix):]
+	case strings.HasPrefix(msg, openaiPrefix):
+		rest = msg[len(openaiPrefix):]
+	default:
+		return 0, "", false
+	}
+	sp := strings.Index(rest, ":")
+	if sp < 0 {
+		return 0, "", false
+	}
+	status, err := strconv.Atoi(rest[:sp])
+	if err != nil || status <= 0 {
+		return 0, "", false
+	}
+	return status, rest[sp+1:], true
 }
 
 // IsVisionUnsupportedError reports whether the upstream LLM

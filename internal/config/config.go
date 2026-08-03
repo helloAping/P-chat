@@ -88,6 +88,15 @@ type LimitsConfig struct {
 	// MaxTurnSeconds budget. 0 = disabled (previous behaviour).
 	// Default 2. Absent from config → default; explicit 0 → off.
 	MaxTurnRetries int `json:"max_turn_retries"`
+	// LLMRetryBackoffs is the per-retry backoff staircase (in seconds)
+	// for transient upstream LLM errors (rate_limit / server_error /
+	// network / timeout). The k-th value is how long to wait before the
+	// k-th retry; retry count = len(list) (total attempts = len+1).
+	// Empty list = no retry (single attempt). Default [5, 60, 180, 300,
+	// 600]. Retries are detached from the MaxTurnSeconds turn budget —
+	// they are bounded only by this list plus user cancellation — so a
+	// long backoff sequence is never truncated by the turn deadline.
+	LLMRetryBackoffs []int `json:"llm_retry_backoffs,omitempty"`
 }
 
 // TodoLongRunMode configures the long-running task policy.
@@ -946,10 +955,11 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Limits: LimitsConfig{
-			MaxRounds:       300,
-			TodoLongRunMode: TodoLongRunAdaptive,
-			MaxTurnSeconds:  900,
-			MaxTurnRetries:  2,
+			MaxRounds:        300,
+			TodoLongRunMode:  TodoLongRunAdaptive,
+			MaxTurnSeconds:   900,
+			MaxTurnRetries:   2,
+			LLMRetryBackoffs: []int{5, 60, 180, 300, 600},
 		},
 		Sandbox: SandboxConfig{
 			Enabled:               true,

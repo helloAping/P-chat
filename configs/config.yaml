@@ -95,6 +95,11 @@ limits:
   # 会重新加载已持久化的部分进度 + 自动注入一条"继续"消息，重新计时。
   # 相当于用户手动发送"继续"。默认 2。
   max_turn_retries: 2
+  # 上游 LLM 请求瞬时错误（限流/5xx/网络/超时）的阶梯式重试退避（秒）。
+  # 第 k 个值 = 第 k 次重试前的等待；重试次数 = 列表长度（总尝试 = len+1）。
+  # 空列表 [] = 不重试。重试脱离 max_turn_seconds 回合预算，只受本表 +
+  # 用户取消约束，不会被回合截止截断。默认 [5, 60, 180, 300, 600]。
+  llm_retry_backoffs: [5, 60, 180, 300, 600]
   todo_long_run_mode: "adaptive" # "off" | "adaptive" | "unlimited"
 
 sandbox:

@@ -236,6 +236,14 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// SSE stream, so the session lock is held throughout and the
 	// frontend sees a single continuous turn.
 	baseCtx := c.Request.Context()
+	// abortCtx is a deadline-free context cancelled whenever the user
+	// stops the turn (cancel-stream) or the client disconnects. The LLM
+	// retry phase runs on it (via agent.WithAbortContext) so a long
+	// staircase backoff (up to ~19 min with the default table) is not
+	// truncated by MaxTurnSeconds — retries are bounded by their own cap
+	// plus user cancellation instead.
+	abortCtx, abortCancel := context.WithCancel(baseCtx)
+	defer abortCancel()
 	maxSec := h.getCfg().Limits.MaxTurnSeconds
 	maxRetries := h.getCfg().Limits.MaxTurnRetries
 	if maxRetries < 0 {
@@ -257,7 +265,12 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			// can abort a stuck turn instead of blocking forever.
 			turnCtx, cancel = context.WithCancel(turnCtx)
 		}
-		unregister := h.registerTurnCancel(id, cancel)
+		// Attach the deadline-free abort context so the agent's retry
+		// loop can escape the turn deadline (deadline still enforced for
+		// everything else via the c.Request context above).
+		turnCtx = agent.WithAbortContext(turnCtx, abortCtx)
+		// cancel-stream must abort BOTH the turn and the retry phase.
+		unregister := h.registerTurnCancel(id, func() { cancel(); abortCancel() })
 
 		var retryNotice string
 		if attempt < maxRetries {

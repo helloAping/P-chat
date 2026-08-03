@@ -909,6 +909,139 @@ func TestSendMessage_TurnTimeoutAutoResumes(t *testing.T) {
 	}
 }
 
+// TestSendMessage_LLMRetrySurvivesTurnDeadline verifies the staircase
+// retry is DETACHED from the MaxTurnSeconds turn budget: the first
+// upstream attempt fails with a retryable 500, the retry backoff (2s)
+// outlives the 1s turn deadline, and the retry's reply is wrapped up
+// gracefully (persisted + done) instead of the turn being terminated by
+// the deadline.
+func TestSendMessage_LLMRetrySurvivesTurnDeadline(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			// First attempt: retryable upstream 500.
+			http.Error(w, `{"error":{"message":"boom","type":"server_error"}}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "`+srv.URL+`/v1"`, 1)
+	var cfgMap map[string]any
+	if err := json.Unmarshal([]byte(cfgJSON), &cfgMap); err != nil {
+		t.Fatal(err)
+	}
+	// 1s turn budget, but the 2s retry backoff runs detached from it.
+	// max_turn_retries=0 keeps the turn auto-resume out of this test.
+	cfgMap["limits"] = map[string]any{"max_turn_seconds": 1, "max_turn_retries": 0, "llm_retry_backoffs": []int{2}}
+	cfgJSONBytes, err := json.Marshal(cfgMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := newTestServerWithConfig(t, string(cfgJSONBytes))
+
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/sessions", nil))
+	var created SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&created)
+
+	w2 := newStreamRecorder()
+	body := bytes.NewBufferString(`{"message":"hi","style":"tech"}`)
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/messages", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }()
+		s.engine.ServeHTTP(w2, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("streaming handler hung")
+	}
+
+	frames := w2.Body.String()
+	if !strings.Contains(frames, "后重试") {
+		t.Fatalf("expected a retry phase event, got: %q", frames)
+	}
+	if !strings.Contains(frames, "recovered") {
+		t.Fatalf("expected the retried LLM content, got: %q", frames)
+	}
+	if !strings.Contains(frames, `"type":"done"`) {
+		t.Fatalf("expected a done event after the late retry recovery, got: %q", frames)
+	}
+	if strings.Contains(frames, "turn_timeout") || strings.Contains(frames, "回合超出最长执行时间被终止") {
+		t.Fatalf("turn deadline must NOT terminate a turn that recovered via retry, got: %q", frames)
+	}
+	if strings.Contains(frames, "重试 1 次后仍然失败") {
+		t.Fatalf("retry must succeed, not exhaust, got: %q", frames)
+	}
+}
+
+// TestSendMessage_CancelStreamAbortsLLMRetryBackoff verifies that a user
+// cancel (POST /cancel-stream) reaches the DETACHED retry phase: with no
+// turn deadline configured, the only thing that can abort the 100s retry
+// backoff is cancel-stream cancelling the deadline-free abort context.
+func TestSendMessage_CancelStreamAbortsLLMRetryBackoff(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every attempt fails with a retryable 500 → long backoff.
+		http.Error(w, `{"error":{"message":"boom","type":"server_error"}}`, http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "`+srv.URL+`/v1"`, 1)
+	var cfgMap map[string]any
+	if err := json.Unmarshal([]byte(cfgJSON), &cfgMap); err != nil {
+		t.Fatal(err)
+	}
+	// No turn deadline: the retry backoff (100s) is the only outstanding
+	// wait, and it must be abortable by cancel-stream.
+	cfgMap["limits"] = map[string]any{"max_turn_seconds": 0, "max_turn_retries": 0, "llm_retry_backoffs": []int{100}}
+	cfgJSONBytes, err := json.Marshal(cfgMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := newTestServerWithConfig(t, string(cfgJSONBytes))
+
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/sessions", nil))
+	var created SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&created)
+
+	w2 := newStreamRecorder()
+	body := bytes.NewBufferString(`{"message":"hi","style":"tech"}`)
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/messages", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }()
+		s.engine.ServeHTTP(w2, req)
+		close(done)
+	}()
+	// Let attempt 1 fail (500) and enter the 100s backoff sleep.
+	time.Sleep(1500 * time.Millisecond)
+
+	cw := httptest.NewRecorder()
+	s.engine.ServeHTTP(cw, httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/cancel-stream", nil))
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("turn was not aborted by cancel-stream during the detached retry backoff")
+	}
+}
+
 func TestCancelStream_AbortsStalledTurnAndReleasesLock(t *testing.T) {
 	// A listener that accepts the connection and then holds it open
 	// without ever responding — the same stalled-upstream shape as

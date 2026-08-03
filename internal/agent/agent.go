@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -1551,24 +1552,52 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 
 			// LLM stream with retry for recoverable errors
-			// (rate_limit, server_error, network, timeout).
-			const maxLLMRetries = 3
+			// (rate_limit, server_error, network, timeout). The
+			// backoff staircase comes from limits.llm_retry_backoffs
+			// (default [5, 60, 180, 300, 600]s); retry count =
+			// len(backoffs), total attempts = len(backoffs) + 1.
+			// Retries are detached from the turn budget: they run on a
+			// deadline-free abort context (cancelled only by
+			// cancel-stream / client disconnect), so a long backoff
+			// sequence is never truncated by MaxTurnSeconds. The
+			// initial attempt keeps the turn deadline as the hang
+			// backstop.
+			backoffs := llmRetryBackoffs(a.cfg)
+			maxAttempts := len(backoffs) + 1
 			var retryableErr error
 			contextRecoveryUsed := false
+			// successAttempt records which attempt produced the reply
+			// (0 = the initial attempt). A reply that only arrived via a
+			// retry AFTER the turn deadline crossed is wrapped up
+			// gracefully instead of dispatching tools on an expired ctx.
+			successAttempt := 0
+			// retryCtx is deadline-free but still aborted by
+			// cancel-stream / client disconnect. Falls back to ctx
+			// (turn-deadline bound) when no abort context is attached.
+			retryCtx := ctx
+			if ac := AbortContextFrom(ctx); ac != nil {
+				retryCtx = ac
+			}
 		att:
-			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
+			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				// attemptCtx is what this attempt's stream and
+				// cancellation checks run on: the initial attempt stays
+				// on the turn context (deadline backstop); retries move
+				// to the deadline-free abort context.
+				attemptCtx := ctx
 				if attempt > 1 {
-					backoff := time.Duration(attempt*attempt) * time.Second
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					attemptCtx = retryCtx
+					backoff := retryBackoffDuration(backoffs, attempt-1)
+					sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 						Phase:    "llm",
 						Step:     "retry",
-						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt, maxLLMRetries),
+						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt-1, len(backoffs)),
 						Round:    roundNum,
 						MaxRound: maxRounds,
 					})
 					timer := time.NewTimer(backoff)
 					select {
-					case <-ctx.Done():
+					case <-retryCtx.Done():
 						timer.Stop()
 						return
 					case <-timer.C:
@@ -1593,14 +1622,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if needsNormalizedToolResults(req.Provider) {
 					msgsForLLM = normalizeToolResults(roundMsgsForLLM)
 				}
-				streamCtx, cancelStream := context.WithCancel(ctx)
+				streamCtx, cancelStream := context.WithCancel(attemptCtx)
 				stream := a.llm.ChatStreamCM(streamCtx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
 				streamOpen := true
 				for streamOpen {
 					var chunk llm.StreamChunk
 					var ok bool
 					select {
-					case <-ctx.Done():
+					case <-attemptCtx.Done():
 						cancelStream()
 						return
 					case chunk, ok = <-stream:
@@ -1635,13 +1664,33 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 									break
 								}
 							}
-							if isRetryable(apiErr.Kind) && attempt < maxLLMRetries {
+							// Retry only while the turn is still live (for
+							// the initial attempt) — if the turn deadline
+							// fired at the same moment, the attempt's
+							// timeout error is a side effect of the abort,
+							// not an upstream failure worth retrying.
+							// Detached retries (attempt > 1, running on the
+							// deadline-free abort context) retry regardless.
+							if isRetryable(apiErr.Kind) && attempt < maxAttempts && (attempt > 1 || ctx.Err() == nil) {
 								retryableErr = chunk.Err
 								cancelStream()
 								break // break inner stream loop, retry outer
 							}
 						}
-						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						// If the turn is already over (deadline / user cancel) during
+						// the INITIAL attempt, behave like the ctx.Done abort: return
+						// silently so respondSSE emits the turn_timeout frame. The
+						// stream error at that point is a side effect of the abort,
+						// not a real upstream failure — and emitting it here would
+						// make the deadline outcome depend on a select race.
+						if attempt == 1 && ctx.Err() != nil {
+							cancelStream()
+							return
+						}
+						// Emit on retryCtx (the deadline-free abort context) so a
+						// non-retryable error from a detached retry still reaches the
+						// client past the turn deadline.
+						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 							Phase:      "llm",
 							Error:      errMsg,
 							Suggestion: errSuggestion,
@@ -1653,6 +1702,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 					if chunk.Done {
 						retryableErr = nil
+						successAttempt = attempt
 						cancelStream()
 						break att // success — break outer loop too
 					}
@@ -1682,12 +1732,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if chunk.Content != "" {
 						fullContentBuilder.WriteString(chunk.Content)
 						partsAcc.update(ChatStreamChunk{Content: chunk.Content})
-						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
+						sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
 					}
 					if chunk.Thinking != "" {
 						fullThinkingBuilder.WriteString(chunk.Thinking)
 						partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
-						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
+						sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
 					}
 					if chunk.ToolCallDelta != nil {
 						tcd := chunk.ToolCallDelta
@@ -1711,11 +1761,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			fullContent := fullContentBuilder.String()
 			fullThinking := fullThinkingBuilder.String()
 
-			// If we exhausted retries without success, surface the last error.
+			// If we exhausted retries without success, surface the last
+			// error. Emit on retryCtx (the deadline-free abort context) so
+			// the "重试 N 次后仍然失败" terminal survives even when the
+			// turn deadline fired mid-retry.
 			if retryableErr != nil {
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 					Phase: "llm",
-					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", maxLLMRetries, retryableErr),
+					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", len(backoffs), retryableErr),
 					Done:  true,
 				})
 				return
@@ -1777,6 +1830,26 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				SubmitToLLM: 1,
 			}
 			msgs = append(msgs, assistantMsg)
+
+			// Late-retry success past the turn budget: the retry phase is
+			// detached from MaxTurnSeconds, so a reply can land after the
+			// deadline fired. Wrap up gracefully instead of dispatching
+			// tools / starting a new round on an expired context — persist
+			// the reply and end with a done event.
+			if successAttempt > 1 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
+					Phase:     "done",
+					Step:      "done",
+					Message:   "回合执行预算已超出，重试恢复后直接收尾（本轮未执行工具）",
+					Round:     roundNum,
+					MaxRound:  maxRounds,
+					TokensIn:  totalIn,
+					TokensOut: totalOut,
+				})
+				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{Done: true})
+				return
+			}
 
 			// NOTE: per-round stripImageContent sweep removed.
 			// Image base64 is preserved verbatim in msgs so the LLM
