@@ -91,6 +91,10 @@ limits:
   # hangs that escape per-tool timeouts (e.g. an exec_command whose
   # orphaned child holds the output pipes).
   max_turn_seconds: 900
+  # 回合因 max_turn_seconds 被终止后，自动重试次数（0 = 关闭）。每次重试
+  # 会重新加载已持久化的部分进度 + 自动注入一条"继续"消息，重新计时。
+  # 相当于用户手动发送"继续"。默认 2。
+  max_turn_retries: 2
   todo_long_run_mode: "adaptive" # "off" | "adaptive" | "unlimited"
 
 sandbox:

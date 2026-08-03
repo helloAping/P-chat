@@ -14,6 +14,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -225,26 +226,76 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// fires, ChatWithTools' ctx.Done() path emits an error event and
 	// the session lock is released, so the user is never stuck on a
 	// permanently "busy" session.
-	turnCtx := c.Request.Context()
-	var cancel context.CancelFunc
-	if maxSec := h.getCfg().Limits.MaxTurnSeconds; maxSec > 0 {
-		turnCtx, cancel = context.WithTimeout(turnCtx, time.Duration(maxSec)*time.Second)
-		// Replace the request context so respondSSE can observe the
-		// deadline error and emit a terminal error frame when the
-		// stream closes without a done event.
-		c.Request = c.Request.WithContext(turnCtx)
-	} else {
-		// No hard cap configured: still create a cancelable ctx so
-		// respondSSE's write-timeout path and POST /cancel-stream
-		// can abort a stuck turn instead of blocking forever.
-		turnCtx, cancel = context.WithCancel(turnCtx)
+	//
+	// Auto-resume (2026-08): when the deadline terminates the turn, the
+	// server reloads the persisted partial conversation and re-invokes
+	// the agent loop with a fresh full budget, injecting a user-style
+	// "继续" message — the semantic equivalent of the user manually
+	// continuing. Bounded by Limits.MaxTurnRetries (0 = disabled). The
+	// whole retry sequence stays inside this one HTTP request / one
+	// SSE stream, so the session lock is held throughout and the
+	// frontend sees a single continuous turn.
+	baseCtx := c.Request.Context()
+	maxSec := h.getCfg().Limits.MaxTurnSeconds
+	maxRetries := h.getCfg().Limits.MaxTurnRetries
+	if maxRetries < 0 {
+		maxRetries = 0
 	}
-	defer cancel()
-	unregister := h.registerTurnCancel(id, cancel)
-	defer unregister()
+	for attempt := 0; ; attempt++ {
+		turnCtx := baseCtx
+		var cancel context.CancelFunc
+		if maxSec > 0 {
+			turnCtx, cancel = context.WithTimeout(turnCtx, time.Duration(maxSec)*time.Second)
+			// Replace the request context so respondSSE can observe the
+			// deadline error and either signal a retry or emit a
+			// terminal error frame when the stream closes without a
+			// done event.
+			c.Request = c.Request.WithContext(turnCtx)
+		} else {
+			// No hard cap configured: still create a cancelable ctx so
+			// respondSSE's write-timeout path and POST /cancel-stream
+			// can abort a stuck turn instead of blocking forever.
+			turnCtx, cancel = context.WithCancel(turnCtx)
+		}
+		unregister := h.registerTurnCancel(id, cancel)
 
-	stream := h.agent.ChatStream(turnCtx, chatReq)
-	h.respondSSE(c, stream, id, provider, model)
+		var retryNotice string
+		if attempt < maxRetries {
+			retryNotice = fmt.Sprintf("⏱ 回合超出最长执行时间，自动重试（第 %d/%d 次）——相当于自动发送“继续”…", attempt+1, maxRetries)
+		}
+
+		stream := h.agent.ChatStream(turnCtx, chatReq)
+		res := h.respondSSE(c, stream, id, provider, model, retryNotice)
+
+		unregister()
+		cancel()
+
+		if res != turnStreamRetry || attempt >= maxRetries {
+			break
+		}
+
+		// Build the resume request. Reload the conversation — the
+		// timed-out attempt persisted every completed round — and append
+		// a user-style "继续" nudge as the only new message. ClientMsgID
+		// = 0 so no row is re-pinned; Attachments are dropped because
+		// the first attempt already expanded + persisted them; TodoMode
+		// is forced to resume so an active task chain is preserved.
+		histMsgs, compSummary := h.loadHistoryForSend(baseCtx, id, provider, model)
+		resumeMsgs := buildLLMMessages(histMsgs)
+		resumeMsgs = append(resumeMsgs, llm.ChatMessage{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     agent.BuildTurnTimeoutResumePrompt(id),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+		chatReq.Messages = resumeMsgs
+		chatReq.HistoryMessageCount = len(resumeMsgs) - 1
+		chatReq.ClientMsgID = 0
+		chatReq.Attachments = nil
+		chatReq.CompressedSummary = compSummary
+		chatReq.TodoMode = agent.TodoModeResume
+	}
 }
 
 // turnCancelRegistration is the cleanup handle returned by
@@ -362,12 +413,32 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 	return histMsgs, compSummary
 }
 
+// turnStreamResult tells SendMessage how a chat stream ended so it can
+// decide whether to auto-resume a deadline-terminated turn.
+type turnStreamResult int
+
+const (
+	// turnStreamEnded: a terminal frame (done or error) was emitted, or
+	// the stream closed for a non-retryable reason — stop the turn.
+	turnStreamEnded turnStreamResult = iota
+	// turnStreamRetry: the turn was cut short by the MaxTurnSeconds
+	// deadline, no terminal frame was emitted, and a retryNotice was
+	// set — SendMessage should reload the persisted conversation and
+	// re-run the agent loop with a fresh budget.
+	turnStreamRetry
+)
+
 // respondSSE writes a chat stream to the response. Used
 // by both SendMessage and the P1-3 Regenerate endpoint —
 // both paths produce an `agent.ChatStreamChunk` channel
 // and need the same SSE envelope (data + id, flush
 // per-frame, done-handling). Keep this the only place
 // that knows how an internal chunk becomes wire bytes.
+//
+// retryNotice is the message emitted (as a phase event) when the turn
+// is terminated by its hard deadline and the caller wants to auto-resume
+// instead of emitting the terminal turn_timeout frame. Empty = no
+// auto-resume (terminal frame behaviour preserved, e.g. Regenerate).
 
 // writeSSEWithTimeout writes one SSE frame under a hard write
 // deadline. A WebView2 renderer frozen by memory pressure stops
@@ -402,7 +473,7 @@ func writeSSEWithTimeout(w http.ResponseWriter, ev StreamEvent, timeout time.Dur
 	}
 }
 
-func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk, sessionID, provider, model string) {
+func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk, sessionID, provider, model string, retryNotice string) turnStreamResult {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -446,6 +517,7 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 			}
 		}
 	}
+	result := turnStreamEnded
 	c.Stream(func(w io.Writer) bool {
 		// gin passes c.Writer (an http.ResponseWriter) here; cast
 		// back so writeSSEWithTimeout can reach the net.Conn.
@@ -461,15 +533,41 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		chunk, ok := <-stream
 		if !ok {
 			// Stream closed without a done event. If the turn was
-			// interrupted by its hard deadline, surface that to the
-			// client as a terminal error frame.
+			// interrupted by its hard deadline, either auto-resume
+			// (signal SendMessage to re-run the loop with a "继续"
+			// nudge) or surface a terminal turn_timeout error frame
+			// when the retry budget is exhausted.
 			if !terminalEmitted {
-				terminalEmitted = true
 				if err := c.Request.Context().Err(); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) && retryNotice != "" {
+						// Auto-resume: keep the stream open, tell the
+						// user a retry is starting, and re-mark the
+						// session busy (the agent loop already sent an
+						// idle event on its way out). SendMessage then
+						// reloads the persisted partial conversation and
+						// re-invokes the agent loop with a fresh budget.
+						notice := streamEventFromChunk(agent.ChatStreamChunk{
+							Phase:   "system",
+							Step:    "turn-retry",
+							Message: retryNotice,
+						}, provider, model, streamDoneIDs{})
+						if werr := writeSSEWithTimeout(rw, notice, sseWriteTimeout); werr == nil {
+							if fl, ok := c.Writer.(http.Flusher); ok {
+								fl.Flush()
+							}
+						}
+						busy := streamEventFromChunk(agent.ChatStreamChunk{
+							SessionStatus: "retry",
+						}, provider, model, streamDoneIDs{})
+						_ = writeSSEWithTimeout(rw, busy, sseWriteTimeout)
+						result = turnStreamRetry
+						return false
+					}
+					terminalEmitted = true
 					ev := streamEventFromChunk(agent.ChatStreamChunk{
-						Error:    fmt.Sprintf("回合超出最长执行时间被终止: %v", err),
+						Error:     fmt.Sprintf("回合超出最长执行时间被终止: %v", err),
 						ErrorKind: "turn_timeout",
-						Done:     true,
+						Done:      true,
 					}, provider, model, streamDoneIDs{})
 					if werr := writeSSEWithTimeout(rw, ev, sseWriteTimeout); werr == nil {
 						if fl, ok := c.Writer.(http.Flusher); ok {
@@ -502,6 +600,7 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		}
 		return !chunk.Done
 	})
+	return result
 }
 
 // chunkToEvent maps an internal ChatStreamChunk to a public

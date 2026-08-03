@@ -161,7 +161,9 @@ func (h *Handler) Regenerate(c *gin.Context) {
 	defer unregister()
 
 	stream := h.agent.ChatStream(regenCtx, chatReq)
-	h.respondSSE(c, stream, id, provider, model)
+	// No auto-resume for an explicit regenerate: the user just asked for
+	// a fresh answer, so a timeout should surface as-is (empty retryNotice).
+	h.respondSSE(c, stream, id, provider, model, "")
 }
 
 // UserMessageSummary is the wire shape of the parent user

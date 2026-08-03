@@ -93,6 +93,53 @@ func sessionPendingTodos(sessionID string) (count int, items []tool.TodoItem) {
 	return len(items), items
 }
 
+// BuildTurnTimeoutResumePrompt returns the user-style "继续" nudge the
+// server injects as the only new message when a turn terminated by the
+// MaxTurnSeconds deadline is auto-resumed — the semantic equivalent of
+// the user manually typing "继续".
+//
+// When the session has active todos (pending / in_progress), the nudge
+// anchors the model to the todo list: re-check the in_progress item
+// first, then continue the pending ones, keeping the mandatory
+// todo_write contract (original IDs, only status updates, no new list,
+// no skipping) — the model may only summarise once every todo reaches a
+// terminal state. When there are no todos, it degrades to a plain
+// "继续" with no todo contract. Exported because internal/server needs
+// it to build the retry ChatRequest.
+func BuildTurnTimeoutResumePrompt(sessionID string) string {
+	_, items := sessionPendingTodos(sessionID)
+	var sb strings.Builder
+	sb.WriteString("⏱ 上一回合因超出最长执行时间被自动终止，请像收到“继续”一样接着完成当前任务。\n\n")
+	if len(items) == 0 {
+		sb.WriteString("当前没有待办任务。请继续执行上一回合未完成的工作，需要时用工具推进，完成后给出总结。")
+		return sb.String()
+	}
+	// 进行中项排前，确保续跑不跳过被中断的工作（与 todo guard 排序一致）。
+	// Order in_progress items first so a resume cannot skip interrupted
+	// work (mirrors the todo guard ordering).
+	sorted := make([]tool.TodoItem, 0, len(items))
+	for _, status := range []string{"in_progress", "pending"} {
+		for _, t := range items {
+			if t.Status == status {
+				sorted = append(sorted, t)
+			}
+		}
+	}
+	sb.WriteString("当前待办状态（先处理进行中的项）：\n")
+	for _, t := range sorted {
+		status := "待开始"
+		if t.Status == "in_progress" {
+			status = "进行中"
+		}
+		fmt.Fprintf(&sb, "- [%s] (%s) %s\n", t.ID, status, t.Content)
+	}
+	sb.WriteString("\n请按上面的 todo 列表继续执行，而不是重新开始整个任务：\n")
+	sb.WriteString("1. 先复核并继续 in_progress 项（不要重复已完成的工作），再处理 pending 项；不得跳过、重建或改名原 todo。\n")
+	sb.WriteString("2. 每完成一项，立即用原 ID 调用 `todo_write` 标记 `done`（无法完成标记 `cancelled`）；只更新 status，不要创建新的 todo_list。\n")
+	sb.WriteString("3. 仅当全部 todo 均为 `done` 或 `cancelled` 时，才给出最终总结；在此之前不要只发文本总结就停止。")
+	return sb.String()
+}
+
 // buildAutoContinuePrompt formats the user-style reminder
 // injected when the LLM exits with no tool calls but the
 // todo list has unfinished items. We send this as a user

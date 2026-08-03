@@ -79,6 +79,15 @@ type LimitsConfig struct {
 	// left an orphaned grandchild holding its pipes, or an SSE write
 	// blocked against a dead client connection.
 	MaxTurnSeconds int `json:"max_turn_seconds"`
+	// MaxTurnRetries is how many times a turn that was terminated by
+	// the MaxTurnSeconds deadline is automatically resumed server-side
+	// before the terminal turn_timeout error is emitted. Each retry
+	// reloads the persisted partial conversation, re-injects a
+	// user-style "继续" message (equivalent to the user continuing
+	// manually), and runs the agent loop again with a fresh full
+	// MaxTurnSeconds budget. 0 = disabled (previous behaviour).
+	// Default 2. Absent from config → default; explicit 0 → off.
+	MaxTurnRetries int `json:"max_turn_retries"`
 }
 
 // TodoLongRunMode configures the long-running task policy.
@@ -940,6 +949,7 @@ func Default() *Config {
 			MaxRounds:       300,
 			TodoLongRunMode: TodoLongRunAdaptive,
 			MaxTurnSeconds:  900,
+			MaxTurnRetries:  2,
 		},
 		Sandbox: SandboxConfig{
 			Enabled:               true,

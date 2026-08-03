@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -752,7 +753,7 @@ func TestSendMessage_TurnTimeoutEmitsTerminalError(t *testing.T) {
 	if err := json.Unmarshal([]byte(cfgJSON), &cfgMap); err != nil {
 		t.Fatal(err)
 	}
-	cfgMap["limits"] = map[string]any{"max_turn_seconds": 2}
+	cfgMap["limits"] = map[string]any{"max_turn_seconds": 2, "max_turn_retries": 0}
 	cfgJSONBytes, err := json.Marshal(cfgMap)
 	if err != nil {
 		t.Fatal(err)
@@ -787,6 +788,124 @@ func TestSendMessage_TurnTimeoutEmitsTerminalError(t *testing.T) {
 	frames := w2.Body.String()
 	if !strings.Contains(frames, "turn_timeout") && !strings.Contains(frames, "回合超出最长执行时间") {
 		t.Fatalf("expected a terminal turn_timeout error frame, got: %q", frames)
+	}
+}
+
+// TestSendMessage_TurnTimeoutAutoResumes is the regression test for the
+// server-side auto-resume feature: when a turn is terminated by the
+// MaxTurnSeconds deadline, the server automatically re-runs the agent
+// loop (the semantic equivalent of the user sending "继续") within the
+// SAME SSE stream, up to Limits.MaxTurnRetries times. A stalled upstream
+// on the first attempt must NOT yield a terminal turn_timeout frame —
+// the retry must pick up and finish normally, without duplicating the
+// user message.
+func TestSendMessage_TurnTimeoutAutoResumes(t *testing.T) {
+	// Upstream that hangs on the FIRST connection (tripping the turn
+	// deadline) and answers normally on every connection after. The
+	// stalled connection is released explicitly at teardown: after the
+	// turn deadline aborts the request, the client transport may park the
+	// socket in its keep-alive pool instead of closing it, so
+	// srv.Close() would otherwise block on the still-"active" connection.
+	releaseStall := make(chan struct{})
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			select {
+			case <-releaseStall:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"resumed\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}))
+	defer func() {
+		close(releaseStall)
+		srv.Close()
+	}()
+
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "`+srv.URL+`/v1"`, 1)
+	var cfgMap map[string]any
+	if err := json.Unmarshal([]byte(cfgJSON), &cfgMap); err != nil {
+		t.Fatal(err)
+	}
+	// 2s budget per attempt + 1 auto-resume: attempt 1 stalls and hits
+	// the deadline, attempt 2 succeeds.
+	cfgMap["limits"] = map[string]any{"max_turn_seconds": 2, "max_turn_retries": 1}
+	cfgJSONBytes, err := json.Marshal(cfgMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, cfg := newTestServerWithConfig(t, string(cfgJSONBytes))
+	if cfg.Limits.MaxTurnRetries != 1 {
+		t.Fatalf("MaxTurnRetries = %d, want 1", cfg.Limits.MaxTurnRetries)
+	}
+
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/sessions", nil))
+	var created SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&created)
+
+	w2 := newStreamRecorder()
+	body := bytes.NewBufferString(`{"message":"hi","style":"tech"}`)
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/messages", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }()
+		s.engine.ServeHTTP(w2, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("streaming handler hung past the turn deadline + retry budget")
+	}
+
+	frames := w2.Body.String()
+	if !strings.Contains(frames, "自动重试") {
+		t.Fatalf("expected an auto-retry phase notice, got: %q", frames)
+	}
+	if strings.Contains(frames, "turn_timeout") || strings.Contains(frames, "被终止") {
+		t.Fatalf("terminal turn_timeout frame must NOT be emitted after a successful retry, got: %q", frames)
+	}
+	if !strings.Contains(frames, `"type":"done"`) {
+		t.Fatalf("expected a done event after the auto-retry, got: %q", frames)
+	}
+	if !strings.Contains(frames, "resumed") {
+		t.Fatalf("expected the retried LLM content, got: %q", frames)
+	}
+
+	// The retry must not duplicate the user message: exactly one user
+	// row (the original) + one injected "继续" nudge + one assistant row.
+	msgs := s.store.GetChatMessagesFor(created.ID, 0)
+	userCount, asstCount := 0, 0
+	hasNudge := false
+	for _, m := range msgs {
+		switch m.Role {
+		case llm.RoleUser:
+			userCount++
+			if strings.Contains(m.Content, "继续") {
+				hasNudge = true
+			}
+		case llm.RoleAssistant:
+			asstCount++
+		}
+	}
+	if userCount != 2 {
+		t.Fatalf("user rows = %d, want 2 (original + 继续 nudge)", userCount)
+	}
+	if !hasNudge {
+		t.Fatal("expected a persisted 继续 nudge user message")
+	}
+	if asstCount != 1 {
+		t.Fatalf("assistant rows = %d, want 1", asstCount)
 	}
 }
 
