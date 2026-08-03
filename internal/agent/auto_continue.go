@@ -30,11 +30,29 @@ func pickMaxStepsPrompt(lang string) string {
 // MaxStepsPrompt and the user can continue with a follow-up message.
 const MaxRoundsDefault = 300
 
+// CumToolErrMax is the cumulative tool-failure breaker threshold in
+// ChatWithTools. After this many total tool failures across a turn
+// (each a different failing command), the agent injects a "stop and
+// summarise" system message instead of letting the loop spin — the
+// same-tool and stuck-loop guards only catch REPEATED failures, not
+// the whack-a-mole case where the model tries a fresh failing command
+// every round (e.g. `find` on Windows). Exported so tests can assert
+// the breaker fires within a bounded number of rounds.
+const CumToolErrMax = 8
+
 // MaxStreamBytesPerRound limits the combined text, thinking, and tool-call
 // argument deltas accepted from one upstream LLM round. 正常模型输出远小于 1 MiB；
 // this guard prevents a broken or looping SSE provider from growing the server
 // heap without bound before cancellation reaches the transport.
 const MaxStreamBytesPerRound = 1 << 20
+
+// MaxToolResultFullBytes caps how much of a tool result is shipped
+// to the frontend as ToolResultFull. Results larger than this are
+// truncated to the display preview; the frontend fetches the full
+// body on demand via the tool-result endpoint. 32 KiB keeps the
+// common cases (file reads, command output, todo JSON) inline while
+// bounding what the Vue reactive store can be asked to hold.
+const MaxToolResultFullBytes = 32 << 10
 
 // MaxAutoContinue caps how many times the agent loop will
 // auto-re-prompt the LLM after a no-tool-call exit when the

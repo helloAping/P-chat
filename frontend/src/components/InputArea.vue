@@ -25,6 +25,7 @@ import {
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
   currentPendingConfirm, submitToolConfirm,
 } from '../stores/chat'
+import type { PendingAttachment } from '../stores/chat'
 import { stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
 import { notifyManager } from '../utils/notify'
 import { copyText } from '../utils/clipboard'
@@ -943,12 +944,15 @@ async function send() {
   const id = state.currentID
   const meta = currentMeta.value
   // Build the attachment payload in two directions at once:
-  //   - inlineAttachments: the data URLs/text bodies that we
-  //     send to the server (so the message is self-contained and
-  //     the LLM gets bytes without another disk read).
+  //   - inlineAttachments: what we send to the server. Images
+  //     are uploaded to /api/v1/uploads first; the wire carries
+  //     { upload_id, name, kind, mime } and NO inline bytes, so
+  //     the server persists an "upl://<id>" reference and the
+  //     request body stays small. Audio/video/text keep the
+  //     inline data URL / text body as before.
   //   - bubbleAttachments: the same data shaped for the chat
-  //     bubble (the data URL goes into `url`, the original file
-  //     name into `name`) so the user sees the image right
+  //     bubble (the local data URL goes into `url`, the original
+  //     file name into `name`) so the user sees the image right
   //     away, not after a server round-trip.
   //
   // Attachments are read from the *current* session's pending
@@ -962,7 +966,17 @@ async function send() {
     const data = a._dataURL
     if (!data) continue
     if (a.kind === 'image') {
-      inlineAttachments.push({ type: 'image_url', url: data, name: a.name, kind: a.kind, mime: a.mime })
+      // Image bytes go through the upload endpoint so the
+      // database row stays a small reference. The upload is
+      // parallel-ready and fail-soft: on any error we fall back
+      // to shipping the inline data URL, so a blocked /uploads
+      // request never blocks the user's message.
+      let uploadID: string | undefined
+      try {
+        const up = await api.uploadFile((a as PendingAttachment)._file as File)
+        uploadID = up.id
+      } catch { /* inline fallback below */ }
+      inlineAttachments.push({ type: 'image_url', url: uploadID ? undefined : data, upload_id: uploadID, name: a.name, kind: a.kind, mime: a.mime })
       bubbleAttachments.push({ type: 'image_url', url: data, name: a.name, kind: a.kind, mime: a.mime })
     } else if (a.kind === 'audio' || a.kind === 'video') {
       // Audio and video ride the same wire path as images:

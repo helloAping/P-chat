@@ -142,6 +142,13 @@ export type MessagePart =
       result?: string
       error?: string
       elapsed?: string
+      // result_truncated is true when the server omitted the full
+      // payload (>32 KiB) and the full body must be fetched on
+      // demand via getToolResult.
+      result_truncated?: boolean
+      // result_full_len is the byte length of the untruncated
+      // result, for labeling the "查看完整输出" affordance.
+      result_full_len?: number
     }
   | {
       kind: 'sub_agent'
@@ -914,6 +921,14 @@ export interface InlineAttachment {
   // (e.g. "data:image/png;base64,...") carrying the inline
   // file bytes. For text: undefined (the body is in `text`).
   url?: string
+  // For *_url attachments: the server-side upload id when the
+  // file was POSTed to /api/v1/uploads first. The backend stores
+  // "upl://<upload_id>" in the DB row instead of base64, so the
+  // SQLite database stays small; the message bubble previews the
+  // local data URL in `url` while the server round-trips the id.
+  // When upload_id is set, `url` is a local preview only and the
+  // server reads the bytes from disk.
+  upload_id?: string
   // For text: the file body. For *_url: undefined.
   text?: string
   // Original filename, kept around for the chat bubble label and
@@ -1003,6 +1018,15 @@ export interface StreamEvent {
   // (newlines and all). The chat store uses tool_result_full in
   // preference to tool_result when present.
   tool_result_full?: string
+  // tool_result_truncated is true when the server omitted the
+  // full payload (>32 KiB). The card shows a "查看完整输出"
+  // affordance that fetches the body on demand via
+  // getToolResult.
+  tool_result_truncated?: boolean
+  // tool_result_full_len is the byte length of the untruncated
+  // result, surfaced so the affordance can be labeled
+  // ("完整输出 1.2 MB") without a round-trip.
+  tool_result_full_len?: number
   tool_error?: string
   tool_elapsed?: string
   // Structured tool result metadata. These fields supplement the legacy
@@ -1106,6 +1130,38 @@ export async function submitConfirmResponse(sessionId: string, approved: boolean
     method: 'POST',
     body: JSON.stringify({ approved, action }),
   })
+}
+
+// cancelStream asks the server to abort the in-flight SendMessage
+// turn for a session. Called after the client's AbortController
+// fires so the server-side agent loop exits promptly and the
+// session lock releases — a frozen renderer keeps the TCP
+// connection open, so without this the server would hold the turn
+// until the MaxTurnSeconds backstop. Best-effort: the endpoint is
+// idempotent and never errors the caller.
+export function cancelStream(sessionId: string): void {
+  const backend = directBackendURL()
+  void fetch(`${backend}/api/v1/sessions/${encodeURIComponent(sessionId)}/cancel-stream`, {
+    method: 'POST',
+    headers: { 'X-Trace-Id': mintTraceId() },
+  }).catch(() => { /* best-effort abort notification */ })
+}
+
+export interface ToolResultResponse {
+  tool_id: string
+  tool_name?: string
+  content: string
+  bytes: number
+}
+
+// getToolResult fetches the full body of a tool result that was
+// truncated server-side (>32 KiB). The response is NOT cached in
+// Vue state — the caller renders it transiently so a multi-MB
+// string never lands in the reactive store.
+export function getToolResult(sessionId: string, msgId: number, toolId: string): Promise<ToolResultResponse> {
+  return jsonFetch<ToolResultResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${msgId}/tool-result/${encodeURIComponent(toolId)}`,
+  )
 }
 
 export async function streamMessages(sessionId: string, opts: SendOptions): Promise<void> {

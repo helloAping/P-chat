@@ -126,9 +126,20 @@ type SubAgentConfig struct {
 	AllowedTools []string `json:"allowed_tools,omitempty"`
 	DeniedTools  []string `json:"denied_tools,omitempty"`
 
-	// Timeout is the per-sub-agent execution cap. Parsed from JSON
-	// (e.g. "5m", "30s"). Zero means no explicit cap (the runner
-	// applies a sensible default of 5 minutes).
+	// Timeout is the per-sub-agent wall-clock execution cap. Parsed
+	// from JSON (e.g. "30m", "5m"). Zero means no explicit cap (the
+	// runner applies a sensible default of 30 minutes).
+	//
+	// This is a LAST-RESORT backstop, not the primary hang guard. A
+	// normal long sub-agent (e.g. explore reading 50 files, or a
+	// multi-round plan on a slow local model) can legitimately run
+	// 10-20 minutes; cutting it at 5m discards useful work. Actual
+	// hangs are caught earlier by finer-grained guards: the LLM
+	// stream idle timeout (120s of no bytes → cancel), per-tool
+	// timeouts (exec_command 5m, read_file 60s), the cumulative
+	// tool-failure breaker (CumToolErrMax) and the sub-agent round
+	// cap (MaxRounds 30). The wall clock is only reached when every
+	// one of those failed.
 	Timeout string `json:"timeout,omitempty"`
 
 	// CacheTTL is how long a sub-agent result stays cached. Parsed
@@ -136,14 +147,14 @@ type SubAgentConfig struct {
 	CacheTTL string `json:"cache_ttl,omitempty"`
 }
 
-// TimeoutDuration returns the parsed timeout, or 5m if unset/invalid.
+// TimeoutDuration returns the parsed timeout, or 30m if unset/invalid.
 func (s SubAgentConfig) TimeoutDuration() time.Duration {
 	if s.Timeout == "" {
-		return 5 * time.Minute
+		return 30 * time.Minute
 	}
 	d, err := time.ParseDuration(s.Timeout)
 	if err != nil || d <= 0 {
-		return 5 * time.Minute
+		return 30 * time.Minute
 	}
 	return d
 }

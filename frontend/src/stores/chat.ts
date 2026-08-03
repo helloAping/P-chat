@@ -307,6 +307,60 @@ const MAX_LOADED_SESSIONS = 4
 const _loadedSessions: Record<string, number> = {}
 let _loadedSeq = 0
 
+// MAX_MESSAGES_PER_SESSION caps how many messages one session
+// keeps in the in-memory (Vue reactive) store. A long aicoding
+// session can accumulate thousands of messages, each with dozens
+// of parts (tool cards, sub-agents, large results) — all deep-
+// proxied by Vue and retained for the session's lifetime. Beyond
+// this cap the oldest messages are dropped (blob URLs revoked)
+// and the paging cursor advances, so memory stays bounded while
+// the user can still scroll older pages back in via the infinite
+// scroller.
+const MAX_MESSAGES_PER_SESSION = 300
+
+// capSessionMessages trims sessionMessages[id] to the cap and
+// advances the paging cursor past the dropped rows. Call it after
+// appends (done, startStream) and after history loads
+// (switchSession / loadMoreMessages).
+function capSessionMessages(id: string) {
+  const msgs = state.sessionMessages[id]
+  if (!msgs || msgs.length <= MAX_MESSAGES_PER_SESSION) return
+  const overflow = msgs.length - MAX_MESSAGES_PER_SESSION
+  const dropped = msgs.splice(0, overflow)
+  revokeSessionBlobUrlsForMessages(dropped)
+  // Advance the paging cursor to the new oldest message so a
+  // subsequent scroll-up page doesn't re-fetch rows we just
+  // dropped (and so dedup doesn't re-insert them).
+  const paging = state.sessionPaging[id]
+  if (paging && msgs.length > 0) {
+    const oldest = msgs[0]
+    if (oldest.seq != null && oldest.seq > 0) paging.oldestSeq = oldest.seq
+    if (oldest.id != null) paging.oldestId = oldest.id
+  }
+}
+
+// revokeSessionBlobUrlsForMessages revokes blob URLs owned by a
+// message list without touching state — used when messages are
+// dropped from the store by capSessionMessages.
+function revokeSessionBlobUrlsForMessages(msgs: Message[]) {
+  for (const m of msgs) {
+    if (m.parts) {
+      walkParts(m.parts, (p) => {
+        if (p.kind !== 'tool') return
+        const r = p.result
+        if (typeof r === 'string' && r.startsWith('blob:')) {
+          URL.revokeObjectURL(r)
+        }
+      })
+    }
+    if (m.attachments) {
+      for (const att of m.attachments) {
+        if (att.url?.startsWith('blob:')) URL.revokeObjectURL(att.url)
+      }
+    }
+  }
+}
+
 function markSessionHot(id: string) {
   if (!id) return
   _loadedSessions[id] = ++_loadedSeq
@@ -471,6 +525,7 @@ export async function switchSession(id: string) {
       // loaded history into blob URLs, then strip old ones
       // so the session opens with a bounded memory footprint.
       convertAndStripScreenshots(id)
+      capSessionMessages(id)
     }
   }
   // Mark this session as most-recently-used so evictCold
@@ -567,6 +622,13 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
       // by pre-blob-URL versions. Convert them + enforce
       // the global cap so scroll-up doesn't grow memory.
       convertAndStripScreenshots(id)
+      // NOTE: no capSessionMessages here — a scroll-up load
+      // prepends OLDER messages, and capping would splice out
+      // the very rows the user just asked for (plus break the
+      // scroll-preservation bookkeeping). The cap applies at
+      // append points (done / startStream), which bound the
+      // list between turns; scrolling back into history is a
+      // deliberate, bounded act.
     }
     paging.oldestSeq = r.oldest_seq ?? paging.oldestSeq
     paging.oldestId = r.oldest_id
@@ -1023,6 +1085,7 @@ export function startStream(id: string, ctrl: AbortController) {
   // event — without this, the spinner is unreachable.
   state.sessionMessages[id].push({ role: 'assistant', content: '', parts: [] })
   state.streaming[id] = { ctrl, asstContent: '' }
+  capSessionMessages(id)
   state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
 }
 
@@ -1036,6 +1099,10 @@ export function stopStream(id: string) {
   const s = state.streaming[id]
   if (s) {
     s.ctrl.abort()
+    // Best-effort server-side abort: a frozen renderer keeps the
+    // TCP connection open, so without this the server holds the
+    // session lock until the MaxTurnSeconds backstop.
+    api.cancelStream(id)
     endStream(id, s.ctrl)
   }
 }
@@ -1616,6 +1683,12 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             p.error = ev.tool_error
             p.elapsed = ev.tool_elapsed
             if (ev.tool_args) p.args = ev.tool_args
+            // Server-side truncation marker: the full body (>32
+            // KiB) must be fetched on demand, never stored here.
+            if (ev.tool_result_truncated) {
+              ;(p as any).result_truncated = true
+              ;(p as any).result_full_len = ev.tool_result_full_len
+            }
             found = true
             break
           }
@@ -1631,6 +1704,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             result: dataUrlToBlobUrl(ev.tool_result_full || ev.tool_result),
             error: ev.tool_error,
             elapsed: ev.tool_elapsed,
+            result_truncated: ev.tool_result_truncated || undefined,
+            result_full_len: ev.tool_result_full_len,
           })
         }
         // Enforce the screenshot cap as each image arrives rather
@@ -1802,6 +1877,11 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // to blob URLs, and strip all but the last few across
       // the entire session. See convertAndStripScreenshots().
       convertAndStripScreenshots(id)
+      // Bound the in-memory message list: drop the oldest rows
+      // (and their blob URLs) beyond the per-session cap so a
+      // long-running session cannot grow the Vue reactive store
+      // without bound.
+      capSessionMessages(id)
       // Stamp the server-assigned row id on the user message
       // that started this turn and on the assistant reply so
       // fork/rollback can target either.

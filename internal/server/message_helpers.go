@@ -13,13 +13,17 @@ package server
 // Split from handler.go in T04. Behaviour unchanged.
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 )
@@ -537,19 +541,36 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 	// `type` (image_url / audio_url / video_url). We keep
 	// the same structure for all three so the storage
 	// path (raw base64 in messages.content) is identical.
+	//
+	// Rows persisted from an uploaded file carry "upl://<id>"
+	// instead of base64; surface those as a relative
+	// /api/v1/uploads/<id> URL so the browser fetches the
+	// bytes on demand instead of shipping them through the
+	// messages payload. Legacy base64 rows fall through to
+	// the data: URL path unchanged.
 	if isMediaType(m.Type) && m.Content != "" {
 		mime := m.MimeType
 		if mime == "" {
 			mime = defaultMIMEForType(m.Type)
 		}
-		dataURL := "data:" + mime + ";base64," + m.Content
-		resp.Attachments = append(resp.Attachments, AttachmentPart{
-			Type: typeURLFor(m.Type),
-			URL:  dataURL,
-			Name: m.Name,
-			Kind: kindFor(m.Type),
-			MIME: mime,
-		})
+		if uploadID, ok := uploadIDFromContent(m.Content); ok {
+			resp.Attachments = append(resp.Attachments, AttachmentPart{
+				Type: typeURLFor(m.Type),
+				URL:  "/api/v1/uploads/" + uploadID,
+				Name: m.Name,
+				Kind: kindFor(m.Type),
+				MIME: mime,
+			})
+		} else {
+			dataURL := "data:" + mime + ";base64," + m.Content
+			resp.Attachments = append(resp.Attachments, AttachmentPart{
+				Type: typeURLFor(m.Type),
+				URL:  dataURL,
+				Name: m.Name,
+				Kind: kindFor(m.Type),
+				MIME: mime,
+			})
+		}
 	}
 
 	// Tool call metadata.
@@ -630,6 +651,61 @@ func parseIntQuery(c *gin.Context, key string, def int) int {
 
 func isMediaType(t string) bool {
 	return t == llm.TypeImage || t == llm.TypeAudio || t == llm.TypeVideo
+}
+
+// uplRefPrefix marks a media row whose bytes live on disk in
+// ~/.p-chat/uploads instead of base64 in messages.content. The
+// content column stores "upl://<uploadID>"; the frontend fetches
+// the file via GET /api/v1/uploads/<id> on demand.
+const uplRefPrefix = "upl://"
+
+// uploadIDFromContent extracts the upload id from a media row's
+// content. Returns (id, true) when content is an upl:// reference,
+// (_, false) for legacy base64 payloads.
+func uploadIDFromContent(content string) (string, bool) {
+	if !strings.HasPrefix(content, uplRefPrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(content, uplRefPrefix), true
+}
+
+// resolveHistoryUploads replaces "upl://<id>" media rows with the
+// base64 bytes re-read from ~/.p-chat/uploads, so the LLM context
+// carries the actual image (models read URLs, not references).
+// Missing files degrade to a text marker rather than dropping the
+// turn. The display path (ListMessages) is untouched — it resolves
+// references to /api/v1/uploads/<id> URLs for on-demand loading.
+func resolveHistoryUploads(msgs []llm.ChatMessage, r *agent.DiskAttachmentResolver) []llm.ChatMessage {
+	if r == nil {
+		return msgs
+	}
+	for i, m := range msgs {
+		id, ok := uploadIDFromContent(m.Content)
+		if !ok || m.UploadID != "" {
+			continue
+		}
+		path, _ := r.Resolve(agent.Attachment{ID: id})
+		var data []byte
+		if path != "" {
+			if read, err := os.ReadFile(path); err == nil {
+				data = read
+			}
+		}
+		if data == nil {
+			msgs[i] = llm.ChatMessage{
+				Role:        m.Role,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("(attached image %s — file not found on server)", m.Name),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
+			}
+			continue
+		}
+		m.Content = base64.StdEncoding.EncodeToString(data)
+		m.UploadID = id
+		msgs[i] = m
+	}
+	return msgs
 }
 
 // defaultMIMEForType picks a sane MIME for a media row whose

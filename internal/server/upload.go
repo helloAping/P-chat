@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/paths"
@@ -59,6 +60,83 @@ const maxUploadSize = 25 << 20
 // UploadDir returns ~/.p-chat/uploads/. Created on first use.
 func UploadDir() string {
 	return filepath.Join(paths.GlobalDir(), "uploads")
+}
+
+// pruneUploadFiles deletes the on-disk files for upload ids that are
+// NO LONGER referenced by any message row. Called after a destructive
+// delete (permanent session delete / clear session messages) so the
+// orphaned image bytes don't accumulate forever. Never called from the
+// rollback path — undo restores the messages, which would then 404 on
+// the pruned file. Reference counting lives in the store
+// (CountUploadRefs), which counts across ALL conversations.
+func (h *Handler) pruneUploadFiles(ids []string) {
+	if h.store == nil {
+		return
+	}
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if h.store.CountUploadRefs(id) > 0 {
+			continue // still referenced elsewhere — keep the file
+		}
+		entries, err := os.ReadDir(UploadDir())
+		if err != nil {
+			continue
+		}
+		prefix := id + "-"
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+				continue
+			}
+			_ = os.Remove(filepath.Join(UploadDir(), e.Name()))
+		}
+	}
+}
+
+// sweepOrphanUploads scans ~/.p-chat/uploads and deletes files whose
+// upload id is referenced by no message row AND whose mtime is older
+// than the grace period. The grace period protects files uploaded but
+// not yet sent in a message (the SPA POSTs /uploads first, then ships
+// the id with the next message) — a user who uploads an image and
+// abandons it for > grace days is a genuine orphan. Returns the number
+// of files removed. Best-effort; errors are ignored.
+func (h *Handler) sweepOrphanUploads(grace time.Duration) int {
+	if h.store == nil {
+		return 0
+	}
+	entries, err := os.ReadDir(UploadDir())
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	cutoff := time.Now().Add(-grace)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		// Filename is "<16-hex-id>-<name>". The id is the part
+		// before the first dash; upload ids are exactly 16 hex chars.
+		name := e.Name()
+		idx := strings.IndexByte(name, '-')
+		if idx < 0 {
+			continue
+		}
+		id := name[:idx]
+		if !validUploadID(id) {
+			continue
+		}
+		if h.store.CountUploadRefs(id) > 0 {
+			continue
+		}
+		_ = os.Remove(filepath.Join(UploadDir(), name))
+		removed++
+	}
+	return removed
 }
 
 // POST /api/v1/uploads �?multipart/form-data with a single "file"

@@ -57,6 +57,7 @@ const explorePrompt = "You are a file search specialist. You excel at thoroughly
 	"Guidelines:\n" +
 	"- Use list_files for directory contents and read_file for individual files.\n" +
 	"- Use exec_command for grep/find/ls/git status/git log/git diff/cat/head/tail — read-only shell commands only. Do not modify any file or run any command that changes system state.\n" +
+	"- On Windows (the common desktop case), `find` and `ls` are NOT the Unix tools: `find` searches strings in files and `ls` does not exist. Prefer `dir` / `findstr` / `powershell Get-ChildItem` / `Select-String` / `type`. If a command fails, switch tools instead of retrying with variations.\n" +
 	"- Adapt your search approach based on the thoroughness level specified by the caller.\n" +
 	"- Return file paths as absolute paths in your final response.\n" +
 	"- For clear communication, avoid using emojis.\n\n" +

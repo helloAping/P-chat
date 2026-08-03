@@ -132,3 +132,112 @@ func TestChatWithTools_NoProgressLoop_ForcesStop(t *testing.T) {
 		t.Errorf("turn ran %d rounds before stopping, want ~%d (force-stop threshold)", rounds, noProgressForceStopAfter+1)
 	}
 }
+
+// TestChatWithTools_CumulativeToolErrors_BreaksWhackAMole is the end-to-end
+// regression test for the "whack-a-mole" sub-agent spin: each round the model
+// calls exec_command with a DIFFERENT failing command (the 2026-08 explore
+// `find` on Windows case), so the stuck-loop guard (identical signature) never
+// fires and the same-tool guard (identical name) never fires either. The
+// cumulative failure breaker must inject the "stop and summarise" instruction
+// after CumToolErrMax total failures instead of spinning until the round cap.
+func TestChatWithTools_CumulativeToolErrors_BreaksWhackAMole(t *testing.T) {
+	// Always emit a failing exec_command, but with a UNIQUE command string
+	// every round so the stuck-loop signature never repeats. `exit 1`
+	// reliably fails on both cmd and sh, so roundAnyToolErrored flips
+	// and the cumulative breaker can see it.
+	var callSeq atomic.Uint64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		id := fmt.Sprintf("call_fail_%d", callSeq.Add(1))
+		cmd := fmt.Sprintf("exit %d", callSeq.Load())
+		args, _ := json.Marshal(map[string]string{"command": cmd})
+		line := fmt.Sprintf(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":%q,"type":"function","function":{"name":"exec_command","arguments":%s}}]}}]}`,
+			id, strconv.Quote(string(args)))
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, line+"\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Default: "test",
+			Providers: []config.ProviderConfig{{
+				Name:     "test",
+				Protocol: "openai",
+				BaseURL:  srv.URL,
+				APIKey:   "test-key",
+				Model:    "test-model",
+			}},
+		},
+		// Low round cap so a broken cumulative breaker (the
+		// regression this test guards against) fails fast instead
+		// of running 300 rounds. The fake LLM ignores the "stop"
+		// system message, so the loop keeps failing until the cap
+		// — the breaker is a *nudge*, not a hard stop; a real LLM
+		// obeys the instruction and summarises. What we assert is
+		// that the breaker FIRES, i.e. the cum-tool-err-limit
+		// event exists at all.
+		Limits: config.LimitsConfig{MaxRounds: 20},
+	}
+	llmClient, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := memory.OpenAt(":memory:", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := upgrade.SeedForTesting(store.DB()); err != nil {
+		t.Fatal(err)
+	}
+	styleMgr, err := style.NewManager(store.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := tool.NewRegistry()
+	tool.RegisterBuiltin(reg)
+	agt := New(cfg, llmClient, styleMgr, store, reg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var sawCumBreaker bool
+	var rounds int
+	for chunk := range agt.ChatWithTools(ctx, ChatRequest{
+		Style:     style.Tech,
+		Provider:  "test",
+		Model:     "test-model",
+		SessionID: "cum-err-int-test",
+		Messages: []llm.ChatMessage{{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     "search the codebase",
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		}},
+	}) {
+		if chunk.Phase == "limit" && chunk.Step == "cum-tool-err-limit" {
+			sawCumBreaker = true
+		}
+		if chunk.Phase == "llm" && roundStartRe.MatchString(chunk.Step) {
+			rounds++
+		}
+	}
+	if !sawCumBreaker {
+		t.Fatalf("cumulative failure breaker never fired (rounds=%d) — the whack-a-mole loop ran to the round cap without the cum-tool-err-limit event", rounds)
+	}
+	// The breaker must fire BEFORE the round cap — i.e. the
+	// cum-tool-err-limit event exists at all. The fake LLM ignores
+	// the "stop" instruction, so rounds may reach MaxRounds (20);
+	// that's expected for a non-compliant model. The regression we
+	// guard against is the breaker NEVER firing, which would leave
+	// the sub-agent spinning until its wall-clock timeout.
+	if rounds >= 20 {
+		t.Logf("breaker fired but the fake LLM kept failing to the round cap (rounds=%d) — expected, the real LLM obeys the stop instruction", rounds)
+	}
+}

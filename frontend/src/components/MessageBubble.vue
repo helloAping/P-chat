@@ -57,6 +57,16 @@ function cacheCost(text: string, html: string): number {
   // accounting approximation for the cache's retained strings.
   return (text.length + html.length) * 2
 }
+// MAX_MD_INLINE_CHARS bounds how much of a single text part is
+// parsed into markdown DOM at once. LLM replies are normally a few
+// KB; a pathological part (a tool echoing a whole file, a stuck
+// model dumping context) can be 100s of KB — marked.parse on that
+// is O(n²) and the resulting DOM dwarfs everything else in the
+// message. Text beyond the cap is truncated for rendering and the
+// full body is shown via the "展开全文" toggle below (rendered
+// once, on demand).
+const MAX_MD_INLINE_CHARS = 32 * 1024
+
 function renderMd(text: string): string {
   if (!text) return ''
   const cached = mdCache.get(text)
@@ -299,6 +309,31 @@ const isSystem = computed(() => (props.message.msg_type ?? 0) === 0 && props.mes
 const assistantHtml = computed(() => '')
 
 const userHtml = computed(() => renderMd(props.message.content || ''))
+
+// --- Long text part handling ----------------------------------
+// A text part longer than MAX_MD_INLINE_CHARS is truncated for
+// rendering (marked.parse on 100s of KB is O(n²) and the DOM
+// dwarfs the message); the full body renders once, on demand,
+// via the "展开全文" button.
+const expandedTextParts = ref(new Set<number>())
+function textPartTruncated(p: MessagePart): boolean {
+  return p.kind === 'text' && (p.text?.length ?? 0) > MAX_MD_INLINE_CHARS
+}
+function textPartExpanded(index: number): boolean {
+  return expandedTextParts.value.has(index)
+}
+function textPartFullLen(p: MessagePart): number {
+  return p.kind === 'text' ? (p.text?.length ?? 0) : 0
+}
+function textPartForRender(p: MessagePart): string {
+  if (p.kind !== 'text') return ''
+  const t = p.text || ''
+  if (t.length <= MAX_MD_INLINE_CHARS) return t
+  return t.slice(0, MAX_MD_INLINE_CHARS) + '\n\n…(内容过长，已截断)…'
+}
+function expandTextPart(index: number) {
+  expandedTextParts.value = new Set(expandedTextParts.value).add(index)
+}
 
 // Attachments (images / files) — only used by user
 // messages today, but kept general.
@@ -1222,13 +1257,19 @@ function findPrecedingUserMessageId(): number {
                   :text="entry.part.text || ''"
                   :active="true"
                 />
-                <div
-                  v-else-if="entry.part.kind === 'text'"
-                  ref="mdBodyEl"
-                  class="md-body"
-                  v-html="renderMd(entry.part.text || '')"
-                  @click="onMarkdownClick"
-                />
+                <div v-else-if="entry.part.kind === 'text'">
+                  <div
+                    ref="mdBodyEl"
+                    class="md-body"
+                    v-html="renderMd(textPartForRender(entry.part))"
+                    @click="onMarkdownClick"
+                  ></div>
+                  <button
+                    v-if="textPartTruncated(entry.part) && !textPartExpanded(entry.index)"
+                    class="md-expand-btn"
+                    @click.stop="expandTextPart(entry.index)"
+                  >展开全文 ({{ textPartFullLen(entry.part) }} 字)</button>
+                </div>
               </template>
             </template>
             <template v-else-if="message.content">
@@ -1575,6 +1616,19 @@ function findPrecedingUserMessageId(): number {
 .msg.user .bubble-body * { color: inherit; }
 .msg.user .md-body code { background: rgba(255, 255, 255, 0.18); color: inherit; }
 .msg.user .md-body pre { background: rgba(0, 0, 0, 0.18); border-color: rgba(255, 255, 255, 0.18); }
+
+/* "展开全文" affordance for truncated text parts. */
+.md-expand-btn {
+  margin-top: 6px;
+  padding: 2px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--brand-600);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.md-expand-btn:hover { background: var(--brand-50); }
 
 /* --- Floating action bar -----------------------------------------
  * Anchored to the top-right of the assistant bubble (or

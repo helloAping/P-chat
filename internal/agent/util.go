@@ -34,6 +34,20 @@ func formatElapsed(d time.Duration) string {
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
+// truncatePreview returns the first maxLen runes of s plus an
+// ellipsis when s is longer. Byte-safe for UTF-8 (slices on runes,
+// not bytes) so multi-byte CJK text is never cut mid-rune.
+func truncatePreview(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	rs := []rune(s)
+	if len(rs) <= maxLen {
+		return s
+	}
+	return string(rs[:maxLen]) + "..."
+}
+
 // resetGuardCounters clears the stuck-loop guard state. Called
 // when a stronger intervention fires (e.g. sameToolErrCount
 // injects a "改用其他方式" hint) so the LLM gets a fresh

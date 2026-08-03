@@ -46,12 +46,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | 工具注册 / 实现 | [`.agents/docs/tool.md`](docs/tool.md) |
 | 子代理系统 | `.agents/AGENTS.md` §1.3 + [`.agents/docs/subagent.md`](docs/subagent.md) |
 | 数据库 / 持久化 | [`.agents/docs/memory.md`](docs/memory.md) |
+| Schema 迁移 / 版本发布 | [`.agents/docs/versioning.md`](docs/versioning.md) |
 | 配置管理 | [`.agents/docs/config.md`](docs/config.md) |
 | CLI 终端 | [`.agents/docs/cli.md`](docs/cli.md) |
 | Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) |
+| **前端样式 / 设计 token** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md) |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
+| 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
+| **IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [`.agents/docs/im.md`](docs/im.md) + [实现计划 `docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
 | 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
-| 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
+| 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](../README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
 
 **模块文档位置**：`.agents/docs/` 目录下，每个模块一个 `.md` 文件。
 
@@ -93,6 +97,7 @@ D:\develop\project\P-chat\
 │   │   ├── config.md           #   配置管理
 │   │   ├── cli.md              #   CLI REPL
 │   │   ├── frontend.md         #   Vue 3 前端
+│   │   ├── frontend-design.md  #   设计 token + 组件样式规则 + 约束
 │   │   └── infrastructure.md   #   基础设施模块
 │   └── scripts/
 │       ├── install.ps1         # Windows 安装脚本
@@ -119,7 +124,7 @@ D:\develop\project\P-chat\
 │   ├── agents/                 # AGENTS.md 加载器
 │   ├── rules/                  # .rules/ 规则监听
 │   ├── knowledge/              # RAG 知识检索
-│   ├── recall/                 # 记忆召回
+│   ├── upgrade/                # 版本升级系统
 │   ├── paths/                  # ~/.p-chat 路径解析
 │   ├── httpcli/                # CLI HTTP+SSE 客户端
 │   └── serverproc/             # 服务器进程生命周期管理
@@ -246,6 +251,22 @@ parser 三层 fallback：
 - Go: `camelCase` 私有，`PascalCase` 导出
 - TS: `camelCase` 变量/函数，`PascalCase` 类型/组件
 
+### 2.5 版本升级（强约束）
+
+**任何涉及以下内容的变更，必须通过 `internal/upgrade/` 包编写升级步骤，禁止在其他地方写 ad-hoc 迁移代码：**
+
+- `~/.p-chat/` 目录结构变更
+- SQLite schema 变更（表结构、新增列）
+- 配置文件格式变更
+- 数据存储位置/格式变更（如 prompts 文件→DB）
+
+**变更流程**：
+1. 在 `internal/upgrade/version.go` 中新增版本常量，更新 `Current`
+2. 在 `internal/upgrade/steps.go` 中注册升级函数
+3. 升级函数需满足：幂等（`IF NOT EXISTS`）、顺序性、断点续升
+
+详见 [`.agents/docs/upgrade.md`](docs/upgrade.md)。
+
 ---
 
 ## 3. 构建与运行
@@ -264,7 +285,23 @@ task package:gui      # 额外：完整 bundle (含 web/ 资源)
 - `scripts/sync-web.ps1` — 同步 `web/` → `cmd/pchat-server/web/`
 - `scripts/package-gui.ps1` — web/assets/ merge 到 Wails 产物
 
-### 3.3 测试
+### 3.3 版本管理
+
+```powershell
+# 修改版本号 — 唯一真源文件
+notepad VERSION
+
+# 构建（版本号自动注入）
+task build
+
+# 查询版本
+.\bin\pchat.exe version
+curl http://localhost:xxxxx/api/v1/version
+```
+
+版本管理与 Schema 迁移完整规范 → [`.agents/docs/versioning.md`](docs/versioning.md)
+
+### 3.4 测试
 
 ```powershell
 go test -count=1 ./...                          # 所有 Go 测试
@@ -277,9 +314,9 @@ npm run build                                   # 前端 bundle
 
 | 问题 | 怎么查 |
 | --- | --- |
-| LLM 回复不显示 | `~/.p-chat/logs/`（按日期切割，保留 7 天，如 `server-debug-2026-08-02.log`） |
+| LLM 回复不显示 | `~/.p-chat/server-debug.log` |
 | 前端路由错 | `MessageBubble.vue` `parts` 数组 |
-| Wails 启动失败 | `~/.p-chat/logs/` 下 `pchat-gui-<date>.log` 与 `pchat-server-<date>.log` |
+| Wails 启动失败 | `bin/pchat-server.log` |
 | Anthropic 协议不工作 | `internal/llm/anthropic.go:130-260` |
 
 ---
@@ -317,6 +354,10 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | parts 累加器 | `internal/agent/parts.go` |
 | 流式事件分发 | `frontend/src/stores/chat.ts:828-1103` `appendStreamEvent()` |
 | 后端 SSE 事件映射 | `internal/server/handler.go:1495-1613` `chunkToEvent()` |
+| 工作模式 `work_mode` 配置 | `internal/config/config.go` `WorkModeConfig` |
+| `work_mode` 提示词段 | `internal/agent/prompt.go` `buildWorkModeBlock()` |
+| `work_mode` per-session 覆盖 | `internal/server/handler.go` `sessionMeta.WorkMode` |
+| CLI `/mode` 命令 | `internal/cli/commands.go` `cmdMode()` |
 | 子 agent runner | `internal/subagent/subagent.go:511-832` `Run()` |
 | 子 agent 事件转发 | `internal/subagent/subagent.go:837-842` `tryForward()` |
 | OpenAI SSE parser | `internal/llm/client.go:235-440` |
@@ -324,6 +365,16 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 系统 prompt 拼装 | `internal/agent/agent.go:820-876` |
 | 配置加载 | `internal/config/config.go` |
 | 数据库 CRUD | `internal/memory/memory.go` |
+| `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
+| **IM Gateway 入口** | [`.agents/docs/im.md`](docs/im.md) + [`docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
+| **IM 配置文件 schema** | `internal/config/im_config.go`（落地后）`IMConfig` |
+| sendOrDrop 逃生 | `internal/agent/agent.go`（`sendOrDropTimeout`，channel 满 30s 丢非关键事件） |
+| 大 tool 结果截断 + 有界缓存 | `internal/agent/agent.go`（`MaxToolResultFullBytes`）+ `internal/agent/tool_result_cache.go` |
+| cancel-stream / tool-result 端点 | `internal/server/messages.go` + `server.go` |
+| **图片实体化（upl://）** | `internal/agent/attachment.go`（`ExpandAttachmentsCM`）+ `internal/server/message_helpers.go`（`buildMessageResponse` / `resolveHistoryUploads`）+ `internal/server/upload.go` |
+| **子代理超时/部分结果** | `internal/subagent/subagent.go` `Run()`（`Result.Interrupted`）+ `internal/agent/auto_continue.go`（`CumToolErrMax`） |
+| **子代理失败熔断** | `internal/agent/agent.go`（same-tool / stuck-loop / cumulative breaker）+ `internal/subagent/subagent.go`（`buildSubAgentChatRequest` MaxRounds） |
+| **uploads 孤儿清理（D3）** | `internal/server/upload.go`（`pruneUploadFiles` / `sweepOrphanUploads`）+ `internal/memory/memory.go`（`UploadRefsForConversation` / `CountUploadRefs`） |
 
 ---
 

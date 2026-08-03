@@ -267,6 +267,16 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/sessions/:id/question-response", h.QuestionResponse)
 		api.POST("/sessions/:id/confirm-response", h.ConfirmResponse)
 		api.POST("/sessions/:id/execute-plan", h.ExecutePlan)
+		// Client-side abort: cancels the in-flight SendMessage turn
+		// so the session lock releases promptly even when the TCP
+		// connection stays open (frozen renderer).
+		api.POST("/sessions/:id/cancel-stream", h.CancelStream)
+		// On-demand fetch of a tool result whose SSE event was
+		// truncated server-side (> MaxToolResultFullBytes).
+		// :user_msg_id matches the wildcard name used by the
+		// sibling /replies route (gin forbids two different
+		// wildcard names at the same path depth).
+		api.GET("/sessions/:id/messages/:user_msg_id/tool-result/:tool_id", h.GetToolResult)
 
 		// Archive
 		api.POST("/sessions/:id/archive", h.ArchiveSession)
@@ -464,6 +474,20 @@ func (s *Server) RunWithGracefulShutdown(addr string) error {
 		}
 		close(idleConnsClosed)
 	}()
+
+	// Startup orphan sweep: delete upload files that no message row
+	// references and that are older than the grace period. Files
+	// uploaded but never sent in a message (user abandoned the
+	// compose box) are the common case. Runs in the background so a
+	// huge uploads dir never delays first response. See
+	// sweepOrphanUploads for the reference-count + mtime rules.
+	if s.handler != nil {
+		go func() {
+			if n := s.handler.sweepOrphanUploads(24 * time.Hour); n > 0 {
+				log.Printf("[server] startup orphan sweep removed %d unreferenced upload file(s)", n)
+			}
+		}()
+	}
 
 	if err := s.srv.ListenAndServe(); err != http.ErrServerClosed {
 		return err

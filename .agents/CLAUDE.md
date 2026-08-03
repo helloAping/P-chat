@@ -46,10 +46,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | 工具注册 / 实现 | [`.agents/docs/tool.md`](docs/tool.md) |
 | 子代理系统 | `.agents/AGENTS.md` §1.3 + [`.agents/docs/subagent.md`](docs/subagent.md) |
 | 数据库 / 持久化 | [`.agents/docs/memory.md`](docs/memory.md) |
+| Schema 迁移 / 版本发布 | [`.agents/docs/versioning.md`](docs/versioning.md) |
 | 配置管理 | [`.agents/docs/config.md`](docs/config.md) |
 | CLI 终端 | [`.agents/docs/cli.md`](docs/cli.md) |
 | Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) |
+| **前端样式 / 设计 token** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md) |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
+| 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
+| **IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [`.agents/docs/im.md`](docs/im.md) + [实现计划 `docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
 | 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
 | 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](../README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
 
@@ -93,6 +97,7 @@ D:\develop\project\P-chat\
 │   │   ├── config.md           #   配置管理
 │   │   ├── cli.md              #   CLI REPL
 │   │   ├── frontend.md         #   Vue 3 前端
+│   │   ├── frontend-design.md  #   设计 token + 组件样式规则 + 约束
 │   │   └── infrastructure.md   #   基础设施模块
 │   └── scripts/
 │       ├── install.ps1         # Windows 安装脚本
@@ -119,7 +124,7 @@ D:\develop\project\P-chat\
 │   ├── agents/                 # AGENTS.md 加载器
 │   ├── rules/                  # .rules/ 规则监听
 │   ├── knowledge/              # RAG 知识检索
-│   ├── recall/                 # 记忆召回
+│   ├── upgrade/                # 版本升级系统
 │   ├── paths/                  # ~/.p-chat 路径解析
 │   ├── httpcli/                # CLI HTTP+SSE 客户端
 │   └── serverproc/             # 服务器进程生命周期管理
@@ -170,22 +175,11 @@ type MessagePart =
               → tool handler → subagent           (subagent/*)
           → chunkToEvent(ev) → type mapping      (server/handler.go)
           → SSE: "data: {...}\n\n"               (server/handler.go)
-      → 主循环出口 #1（len(toolCalls)==0）：
-          → P0-3 auto-continue 守卫：检查 todo 列表
-            → 有 pending/in_progress 项 + AutoContinue=true + count<3
-              → 注入 user 风格"未完成"提示 → continue 重入
-              → 发 SSE Phase="auto-continue" Step="todo-incomplete"
-            → 否则正常 persistAssistant + Done: true
       → 前端 appendStreamEvent()                  (frontend/stores/chat.ts)
         → 路由到 parts (text/thinking/tool/sub_agent)
-        → status bar 显示 "⚠ 自动续 LLM (第 N/M 次)"  (auto-continue 阶段)
         → Vue 响应式 → DOM 渲染
     → memory.Store 持久化                          (memory/*)
 ```
-
-#### P0-3 自动续 LLM (2026-07-15)
-
-新加的 `Phase="auto-continue"` 阶段表示 agent 在 LLM 自然退出但 todo 未完成时自动注入续提示并重入循环。详见 [`.agents/docs/agent.md`](docs/agent.md) §1 退出条件表。
 
 ### 1.3 SSE 协议
 
@@ -196,14 +190,11 @@ Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（
 | `content` | LLM 文本 delta | `content` |
 | `thinking` | reasoning delta | `thinking` |
 | `tool` | 工具调用生命周期 | `tool_name`, `tool_status`, `tool_result`, `tool_args`, `tool_elapsed` |
-| `phase` | sub-agent lifecycle / system status / **P0-3 auto-continue** | `phase`, `sub_agent_status` |
+| `phase` | sub-agent lifecycle / system status | `phase`, `sub_agent_status` |
 | `error` | LLM/transport error | `error`, `error_kind` |
 | `done` | 流结束 | `tokens_in`, `tokens_out`, `elapsed` |
 | `question` | LLM 向用户提问 | `question_json` |
 | `tool_confirm` | 沙箱确认请求 | `tool_confirm_json` |
-| `session_status` | 回合生命周期 | `session_status` (`busy` / `idle` / `retry`) |
-
-P0-3 auto-continue 通过 `phase` 事件发出，phase 字符串为 `"auto-continue"`、step 字符串为 `"todo-incomplete"`、`message` 字段包含 `自动续 LLM (第 N/3 次)`。前端 `MessageBubble.vue` 的 `.status-line-auto-continue` class 会高亮该行。
 
 ### 1.4 子 agent 系统
 
@@ -260,6 +251,22 @@ parser 三层 fallback：
 - Go: `camelCase` 私有，`PascalCase` 导出
 - TS: `camelCase` 变量/函数，`PascalCase` 类型/组件
 
+### 2.5 版本升级（强约束）
+
+**任何涉及以下内容的变更，必须通过 `internal/upgrade/` 包编写升级步骤，禁止在其他地方写 ad-hoc 迁移代码：**
+
+- `~/.p-chat/` 目录结构变更
+- SQLite schema 变更（表结构、新增列）
+- 配置文件格式变更
+- 数据存储位置/格式变更（如 prompts 文件→DB）
+
+**变更流程**：
+1. 在 `internal/upgrade/version.go` 中新增版本常量，更新 `Current`
+2. 在 `internal/upgrade/steps.go` 中注册升级函数
+3. 升级函数需满足：幂等（`IF NOT EXISTS`）、顺序性、断点续升
+
+详见 [`.agents/docs/upgrade.md`](docs/upgrade.md)。
+
 ---
 
 ## 3. 构建与运行
@@ -278,7 +285,23 @@ task package:gui      # 额外：完整 bundle (含 web/ 资源)
 - `scripts/sync-web.ps1` — 同步 `web/` → `cmd/pchat-server/web/`
 - `scripts/package-gui.ps1` — web/assets/ merge 到 Wails 产物
 
-### 3.3 测试
+### 3.3 版本管理
+
+```powershell
+# 修改版本号 — 唯一真源文件
+notepad VERSION
+
+# 构建（版本号自动注入）
+task build
+
+# 查询版本
+.\bin\pchat.exe version
+curl http://localhost:xxxxx/api/v1/version
+```
+
+版本管理与 Schema 迁移完整规范 → [`.agents/docs/versioning.md`](docs/versioning.md)
+
+### 3.4 测试
 
 ```powershell
 go test -count=1 ./...                          # 所有 Go 测试
@@ -295,7 +318,6 @@ npm run build                                   # 前端 bundle
 | 前端路由错 | `MessageBubble.vue` `parts` 数组 |
 | Wails 启动失败 | `bin/pchat-server.log` |
 | Anthropic 协议不工作 | `internal/llm/anthropic.go:130-260` |
-| 上游 "Upstream request failed" | 大概率是 `openai_adapter.go` 并行 tool_call 没合并；先看 `internal/llm/openai_adapter_test.go` 的回归测试是否还过 |
 
 ---
 
@@ -327,33 +349,68 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 
 | 想改 | 看 |
 | --- | --- |
-| ReAct 主循环 | `internal/agent/agent.go` `ChatWithTools()` |
-| 工具派发 + forwarder | `internal/agent/agent.go` 工具派发段 |
+| ReAct 主循环 | `internal/agent/agent.go:900-1510` `ChatWithTools()` |
+| 工具派发 + forwarder | `internal/agent/agent.go:1150-1471` |
 | parts 累加器 | `internal/agent/parts.go` |
-| 流式事件分发 | `frontend/src/stores/chat.ts` `appendStreamEvent()` |
-| 后端 SSE 事件映射 | `internal/server/handler.go` `chunkToEvent()` |
+| 流式事件分发 | `frontend/src/stores/chat.ts:828-1103` `appendStreamEvent()` |
+| 后端 SSE 事件映射 | `internal/server/handler.go:1495-1613` `chunkToEvent()` |
 | 工作模式 `work_mode` 配置 | `internal/config/config.go` `WorkModeConfig` |
 | `work_mode` 提示词段 | `internal/agent/prompt.go` `buildWorkModeBlock()` |
 | `work_mode` per-session 覆盖 | `internal/server/handler.go` `sessionMeta.WorkMode` |
 | CLI `/mode` 命令 | `internal/cli/commands.go` `cmdMode()` |
-| 子 agent runner | `internal/subagent/subagent.go` `Run()` |
-| 子 agent 事件转发 | `internal/subagent/subagent.go` `tryForward()` |
-| OpenAI SSE parser | `internal/llm/client.go` |
-| Anthropic SSE parser | `internal/llm/anthropic.go` + `anthropic_adapter.go` |
-| **P2-3 并行 tool_call 合并** | `internal/llm/openai_adapter.go::Build` (lastAssistantIdx) + `internal/llm/anthropic_adapter.go::Build` (lastAssistantIdx + lastUserResultIdx) + 对应 `*_test.go` 回归测试 |
-| 系统 prompt 拼装 | `internal/agent/agent.go` `buildStaticSystemPrompt()` + 9 个 helper |
+| 子 agent runner | `internal/subagent/subagent.go:511-832` `Run()` |
+| 子 agent 事件转发 | `internal/subagent/subagent.go:837-842` `tryForward()` |
+| OpenAI SSE parser | `internal/llm/client.go:235-440` |
+| Anthropic SSE parser | `internal/llm/anthropic.go:130-260` |
+| 系统 prompt 拼装 | `internal/agent/agent.go:820-876` |
 | 配置加载 | `internal/config/config.go` |
 | 数据库 CRUD | `internal/memory/memory.go` |
-| **P0-3 auto-continue 守卫** | `internal/agent/agent.go` `sessionPendingTodos()` + `buildAutoContinuePrompt()` + ChatRequest.AutoContinue |
-| todo 系统 | `internal/tool/todo.go` |
-| CLI `/auto-continue` 命令 | `internal/cli/commands.go` `cmdAutoContinue()` |
-| per-session meta 持久化 | `internal/server/handler.go` `sessionMeta` / `sessionMetaBlob` / `UpdateSessionMeta` |
+| `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
+| **IM Gateway 入口** | [`.agents/docs/im.md`](docs/im.md) + [`docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
+| **IM 配置文件 schema** | `internal/config/im_config.go`（落地后）`IMConfig` |
+| sendOrDrop 逃生 | `internal/agent/agent.go`（`sendOrDropTimeout`，channel 满 30s 丢非关键事件） |
+| 大 tool 结果截断 + 有界缓存 | `internal/agent/agent.go`（`MaxToolResultFullBytes`）+ `internal/agent/tool_result_cache.go` |
+| cancel-stream / tool-result 端点 | `internal/server/messages.go` + `server.go` |
+| **图片实体化（upl://）** | `internal/agent/attachment.go`（`ExpandAttachmentsCM`）+ `internal/server/message_helpers.go`（`buildMessageResponse` / `resolveHistoryUploads`）+ `internal/server/upload.go` |
+| **子代理超时/部分结果** | `internal/subagent/subagent.go` `Run()`（`Result.Interrupted`）+ `internal/agent/auto_continue.go`（`CumToolErrMax`） |
+| **子代理失败熔断** | `internal/agent/agent.go`（same-tool / stuck-loop / cumulative breaker）+ `internal/subagent/subagent.go`（`buildSubAgentChatRequest` MaxRounds） |
+| **uploads 孤儿清理（D3）** | `internal/server/upload.go`（`pruneUploadFiles` / `sweepOrphanUploads`）+ `internal/memory/memory.go`（`UploadRefsForConversation` / `CountUploadRefs`） |
 
 ---
 
 ## 6. `.agents/` 目录约定
 
-为了**让多个 agent 工具（opencode / codex / claude 等）共享同一份规范**，本项目用 `.agents/` 目录作为**canonical source**：
+为了**让多个 agent 工具（opencode / codex / claude 等）共享同一份规范**，本项目用 `.agents/` 目录作为**canonical source**。
+
+### 目录级符号链接
+
+安装脚本创建**目录级**符号链接（Windows Junction），而非逐个文件链接：
+
+```
+.opencode  ──junction──>  .agents/    (opencode 读 .opencode/AGENTS.md)
+.codex     ──junction──>  .agents/    (codex 读 .codex/AGENTS.md)
+.claude    ──junction──>  .agents/    (claude 读 .claude/CLAUDE.md)
+```
+
+目录级的好处：`.agents/` 下的所有子内容（`docs/`、`scripts/`）自动可见。
+
+```powershell
+# 验证：以下路径应解析到同一文件
+.opencode/AGENTS.md   → .agents/AGENTS.md  ✓
+.codex/AGENTS.md      → .agents/AGENTS.md  ✓
+.claude/CLAUDE.md     → .agents/CLAUDE.md ──copy──> AGENTS.md  ✓
+.opencode/docs/       → .agents/docs/     ✓
+```
+
+### Agent 启动时的符号链接检测
+
+Agent 启动检查自身入口是否存在并指向正确目标：
+
+1. 检查目录是否存在且为符号链接：
+   ```powershell
+   (Get-Item ".opencode" -Force).Attributes -band [IO.FileAttributes]::ReparsePoint
+   ```
+2. 若不存在或为普通目录 → 运行 install 脚本。
 
 ### 安装（一次性）
 
@@ -365,25 +422,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1
 bash .agents/scripts/install.sh
 ```
 
-执行后会自动建立符号链接：
+### .p-chat 的特殊处理
 
-| 符号链接 | 目标 |
-| --- | --- |
-| `.opencode/AGENTS.md` | `../.agents/AGENTS.md` |
-| `.codex/AGENTS.md` | `../.agents/AGENTS.md` |
-| `.claude/CLAUDE.md` | `../.agents/AGENTS.md` |
-| 根 `AGENTS.md` | `../.agents/AGENTS.md`（如果根文件是 stub） |
+`.p-chat/` 是项目级运行时配置目录（含 `config.yaml`、`memory/` 等），保留为普通目录。安装脚本仅将 `AGENTS.md` 同步到 `.p-chat/AGENTS.md`。
 
-之后无论用哪个 agent 工具，都会读到同一份规范。**修改规范只需改 `.agents/AGENTS.md`**。
+### Windows Junction 与权限
 
-### 符号链接状态检测
+Windows Junction（`mklink /J`）不需要管理员权限即可创建，是本项目推荐的符号链接方式。脚本三级回退：
+1. `mklink /J` — Junction（绝对路径，无需管理员）
+2. `mklink /D` — 目录符号链接（需管理员或开发者模式）
+3. `Copy-Item -Recurse` — 文件副本（最后兜底）
 
-Agent 在启动时检查自身入口是否存在且指向本文件：
-
-```
-.opencode/AGENTS.md → ../.agents/AGENTS.md  ✓
-.codex/AGENTS.md    → ../.agents/AGENTS.md  ✓
-.claude/CLAUDE.md   → ../.agents/AGENTS.md  ✓
-```
-
-若目标不存在或指向错误 → 重新运行 install 脚本。
+修改规范只需改 `.agents/AGENTS.md`，所有工具通过符号链接自动读取最新内容。

@@ -952,6 +952,9 @@ func encodeChatMeta(msg llm.ChatMessage) map[string]string {
 	if msg.MimeType != "" {
 		m["mime_type"] = msg.MimeType
 	}
+	if msg.UploadID != "" {
+		m["upload_id"] = msg.UploadID
+	}
 	if msg.ToolID != "" {
 		m["tool_id"] = msg.ToolID
 	}
@@ -1075,6 +1078,7 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 			Content:     content,
 			Name:        meta["name"],
 			MimeType:    meta["mime_type"],
+			UploadID:    meta["upload_id"],
 			ToolID:      meta["tool_id"],
 			ToolName:    meta["tool_name"],
 			ToolInput:   meta["tool_input"],
@@ -2816,6 +2820,57 @@ func (s *Store) SaveSummary(conversationID string, startID, endID int64, summary
 		conversationID, startID, endID, summary, time.Now().Unix(),
 	)
 	return err
+}
+
+// uplRefPrefix marks a media row whose bytes live on disk in
+// ~/.p-chat/uploads; messages.content stores "upl://<uploadID>".
+// Kept in sync with the server's message_helpers.uplRefPrefix.
+const uplRefPrefix = "upl://"
+
+// UploadRefsForConversation returns the distinct upload ids referenced
+// by a conversation's messages (content matching "upl://<id>"). Used
+// before a destructive delete so the caller can prune the now-orphaned
+// files from ~/.p-chat/uploads.
+func (s *Store) UploadRefsForConversation(convID string) []string {
+	if convID == "" {
+		return nil
+	}
+	rows, err := s.db.Query(
+		`SELECT DISTINCT content FROM messages WHERE conversation_id = ? AND content LIKE ?`,
+		convID, uplRefPrefix+"%",
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var content string
+		if err := rows.Scan(&content); err != nil {
+			continue
+		}
+		id := strings.TrimPrefix(content, uplRefPrefix)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// CountUploadRefs returns how many message rows (across ALL
+// conversations) still reference the given upload id. A file may be
+// pruned only when this returns 0 — otherwise another message (or a
+// rolled-back copy) still needs it.
+func (s *Store) CountUploadRefs(uploadID string) int {
+	if uploadID == "" {
+		return 0
+	}
+	var n int
+	_ = s.db.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE content = ?`,
+		uplRefPrefix+uploadID,
+	).Scan(&n)
+	return n
 }
 
 // GetSummaries returns all summaries for a conversation, oldest first.

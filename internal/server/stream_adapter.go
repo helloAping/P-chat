@@ -89,6 +89,8 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolArgs = chunk.ToolArgs
 		ev.ToolResult = chunk.ToolResult
 		ev.ToolResultFull = chunk.ToolResultFull
+		ev.ToolResultTruncated = chunk.ToolResultTruncated
+		ev.ToolResultFullLen = chunk.ToolResultFullLen
 		ev.ToolError = chunk.ToolError
 		ev.ToolElapsed = chunk.ToolElapsed
 		ev.ToolCallStatus = chunk.ToolCallStatus

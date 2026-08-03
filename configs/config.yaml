@@ -111,13 +111,17 @@ sandbox:
 # - `denied_tools`: blacklist; when `allowed_tools` is empty, these are
 #   excluded from the parent's tool set when building the sub-agent.
 #   Default: `["exec_command"]` for safety.
-# - `timeout`: per-sub-agent execution cap. Default: "5m".
+# - `timeout`: per-sub-agent wall-clock cap (LAST-RESORT backstop).
+#   Default: "30m". Real hangs are caught earlier by the LLM stream
+#   idle timeout (120s), per-tool timeouts, the cumulative failure
+#   breaker, and the round cap — a legit long sub-agent (slow local
+#   model, many files) can take 10-20m, so keep this generous.
 # - `cache_ttl`: how long identical (description, style, provider) results
 #   are reused. Default: "5m". Set to "0s" to disable caching.
 subagent:
   denied_tools:
     - "exec_command"
-  timeout: "5m"
+  timeout: "30m"
   cache_ttl: "5m"
   # Example: only allow safe tools (whitelist mode)
   # allowed_tools:

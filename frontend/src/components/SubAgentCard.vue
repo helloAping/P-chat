@@ -82,7 +82,11 @@ const statusLabel = () => {
   switch (props.part.status) {
     case 'start': return '运行中…'
     case 'ok':    return '已完成'
-    case 'err':   return '失败'
+    case 'err':
+      // An interrupted sub-agent (timeout / cancel) with partial
+      // output shows "失败（部分内容）" so the user knows the
+      // card body holds usable findings, not just an error.
+      return props.part.parts.some(p => p.kind === 'text' && p.text) ? '失败（部分内容）' : '失败'
     default:      return props.part.status
   }
 }
@@ -116,9 +120,11 @@ async function copyTaskId() {
 // still read whatever text the sub-agent did produce.
 // STUCK_TIMEOUT_MS is a last-resort client-side safety net
 // for when the server never sends the sub-agent close event
-// (e.g. server crash mid-run). The server's actual hard
-// timeout is 5 minutes (subagent.go:652 and
-// internal/config SubAgent.TimeoutDuration, default 5m). We
+// (e.g. server crash mid-run). The server's wall-clock cap is
+// 30 minutes by default (config subagent.timeout) — but real
+// hangs are caught far earlier by the LLM stream idle timeout
+// (120s) and per-tool timeouts, so a legit sub-agent either
+// finishes or the server closes it well within 6 minutes. We
 // use 6 minutes here so the client never force-closes BEFORE
 // the server's natural close event lands — otherwise the
 // client would mark the sub-agent as failed even when the
@@ -146,37 +152,58 @@ function renderSubText(raw: string | undefined): string {
   }
 }
 let stuckTimer: ReturnType<typeof setTimeout> | null = null
+// armStuckTimer (re)starts the force-close safety net. Only a
+// sub-agent that is BOTH still 'start' AND has produced no new
+// parts for STUCK_TIMEOUT_MS gets force-closed — an actively
+// streaming run (server wall-clock now defaults to 30m for legit
+// long tasks) resets the timer on every incoming part.
+function armStuckTimer() {
+  if (stuckTimer) clearTimeout(stuckTimer)
+  const t = setTimeout(() => {
+    stuckTimer = null
+    // Read props at fire time (not capture time) so the
+    // latest status wins.
+    if (props.part.status === 'start') {
+      // Mutating the parent's `part` directly is OK
+      // because the chat store created the part and
+      // owns the proxy. A no-op when the close event
+      // has already arrived.
+      ;(props.part as any).status = 'err'
+    }
+  }, STUCK_TIMEOUT_MS)
+  stuckTimer = t
+}
+function clearStuckTimer() {
+  if (stuckTimer) {
+    clearTimeout(stuckTimer)
+    stuckTimer = null
+  }
+}
 watch(
   () => props.part.status,
   (s, prev) => {
     if (s === 'start' && prev !== 'start') {
       // Just transitioned to running — arm the safety net.
-      const t = setTimeout(() => {
-        // Read props at fire time (not capture time) so the
-        // latest status wins.
-        if (props.part.status === 'start') {
-          // Mutating the parent's `part` directly is OK
-          // because the chat store created the part and
-          // owns the proxy. A no-op when the close event
-          // has already arrived.
-          ;(props.part as any).status = 'err'
-        }
-      }, STUCK_TIMEOUT_MS)
-      stuckTimer = t
+      armStuckTimer()
     } else if (s !== 'start' && prev === 'start') {
       // Close event arrived — clear the safety net.
-      if (stuckTimer) {
-        clearTimeout(stuckTimer)
-        stuckTimer = null
-      }
+      clearStuckTimer()
       if (!userToggled.value) open.value = false
     }
   },
   { immediate: true },
 )
-onBeforeUnmount(() => {
-  if (stuckTimer) clearTimeout(stuckTimer)
-})
+// Activity reset: a growing parts array means the sub-agent is
+// still streaming (thinking / tool / text deltas). Reset the stuck
+// timer so a legitimately long run (10-20m on a slow local model)
+// is never force-closed as err while it is actively producing.
+watch(
+  () => props.part.parts.length,
+  () => {
+    if (props.part.status === 'start' && stuckTimer) armStuckTimer()
+  },
+)
+onBeforeUnmount(() => clearStuckTimer())
 </script>
 
 <template>

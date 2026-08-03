@@ -109,6 +109,12 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       recoverMissingParts(input.sessionId, drop.lastSeq, drop.reason).catch((error) => {
         console.warn('[stream] recovery failed:', error)
       })
+    } else if (ctrl.signal.aborted) {
+      // User-initiated stop: notify the server so the turn's
+      // session lock releases promptly (frozen renderers keep the
+      // TCP connection open, so the server would otherwise hold it
+      // until MaxTurnSeconds).
+      api.cancelStream(input.sessionId)
     }
   }
 }

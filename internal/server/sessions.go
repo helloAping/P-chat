@@ -213,6 +213,9 @@ func (h *Handler) PermanentDeleteSession(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
+	// Snapshot the upload references before the rows are gone so we
+	// can prune the now-orphaned files from ~/.p-chat/uploads.
+	refs := h.store.UploadRefsForConversation(id)
 	if err := h.store.DeleteConversation(id); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
@@ -224,6 +227,7 @@ func (h *Handler) PermanentDeleteSession(c *gin.Context) {
 	// otherwise every deleted session would retain its last active plan until
 	// process exit even though the durable rows are gone.
 	tool.SetSessionTodosMemory(id, nil)
+	h.pruneUploadFiles(refs)
 	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }
 
@@ -234,10 +238,15 @@ func (h *Handler) ClearSessionMessages(c *gin.Context) {
 		return
 	}
 	id := c.Param("id")
+	// Snapshot upload references before the rows are cleared so the
+	// orphaned files can be pruned. Clearing a session's messages is
+	// irreversible (no undo), so pruning is safe here.
+	refs := h.store.UploadRefsForConversation(id)
 	if err := h.store.ClearMessages(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.pruneUploadFiles(refs)
 	c.JSON(http.StatusOK, gin.H{"cleared": id})
 }
 

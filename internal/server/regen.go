@@ -9,8 +9,10 @@ package server
 // Split from handler.go in T04. Behaviour unchanged.
 
 import (
+	"context"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
@@ -145,7 +147,20 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		TraceID:      trace.FromContext(c.Request.Context()),
 	}
 
-	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
+	// Regeneration runs the agent loop like SendMessage, so give it
+	// the same cancelable ctx + turnCancels registration: respondSSE's
+	// write-timeout path (client stopped reading) and
+	// POST /cancel-stream can then abort a stuck regen turn promptly
+	// instead of holding the session lock until MaxTurnSeconds (M1).
+	regenCtx, cancel := context.WithCancel(c.Request.Context())
+	if maxSec := h.getCfg().Limits.MaxTurnSeconds; maxSec > 0 {
+		regenCtx, cancel = context.WithTimeout(regenCtx, time.Duration(maxSec)*time.Second)
+	}
+	defer cancel()
+	unregister := h.registerTurnCancel(id, cancel)
+	defer unregister()
+
+	stream := h.agent.ChatStream(regenCtx, chatReq)
 	h.respondSSE(c, stream, id, provider, model)
 }
 

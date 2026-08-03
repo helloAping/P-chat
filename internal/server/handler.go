@@ -33,6 +33,12 @@ type Handler struct {
 	browserMgr *browser.Manager
 	imGateway  *im.Gateway
 	wechatQR   *im.WeChatQRManager
+	// attachResolver reads upload files by id. Used to re-hydrate
+	// "upl://<id>" media rows from disk when building the LLM
+	// context (the agent holds the same resolver for the current
+	// turn's attachments). May be nil in unit tests that never
+	// call loadHistoryForSend with upl:// rows.
+	attachResolver *agent.DiskAttachmentResolver
 	// toolReg is the P3-2 shared tool registry. The
 	// dynamic-tool watcher in server.go writes here; the
 	// GET /api/v1/tools endpoint reads from here. May be
@@ -55,7 +61,13 @@ type Handler struct {
 	// sessionLocks serialises concurrent SendMessage calls per
 	// session to prevent interleaved message writes.
 	sessionLocks sync.Map // string → struct{}
-	meta         map[string]sessionMeta
+	// turnCancels maps sessionID → cancel func for the in-flight
+	// SendMessage turn. POST /cancel-stream calls it so a client
+	// abort that the TCP layer can't see (e.g. WebView2 renderer
+	// frozen) still releases the session lock promptly instead of
+	// waiting for the MaxTurnSeconds backstop.
+	turnCancels sync.Map // string → context.CancelFunc
+	meta        map[string]sessionMeta
 }
 
 type sessionMeta struct {
@@ -109,13 +121,18 @@ func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMg
 		meta:     make(map[string]sessionMeta),
 	}
 	h.cfg.Store(cfg)
-	// Wire the upload resolver so the agent can read attached
-	// files by their upload id. The resolver lives in the agent
-	// (not the handler) because attachment expansion happens
-	// inside the LLM call path, after the handler has already
-	// handed the request to the agent.
-	a.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
+	h.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
 	return h
+}
+
+// SetAttachmentResolver installs the upload resolver on both the
+// handler (so historical upl:// image rows can be re-read as base64
+// for the LLM context) and the agent (which resolves the current
+// turn's attachment ids). Tests inject a temp-dir resolver; the
+// production handler always uses ~/.p-chat/uploads.
+func (h *Handler) SetAttachmentResolver(r *agent.DiskAttachmentResolver) {
+	h.attachResolver = r
+	h.agent.SetAttachmentResolver(r)
 }
 
 func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
@@ -700,6 +717,15 @@ type StreamEvent struct {
 	// store uses ToolResultFull in preference to ToolResult when
 	// the tool name is todo_write / question.
 	ToolResultFull string `json:"tool_result_full,omitempty"`
+	// ToolResultTruncated is true when the result exceeded the
+	// server's full-payload cap and ToolResultFull was omitted.
+	// The frontend shows a "查看完整输出" affordance and fetches
+	// the full body on demand via
+	// GET /sessions/:id/messages/:msg_id/tool-result/:tool_id.
+	ToolResultTruncated bool `json:"tool_result_truncated,omitempty"`
+	// ToolResultFullLen is the byte length of the untruncated
+	// result (surfaceable as "完整输出 1.2 MB" without a fetch).
+	ToolResultFullLen int `json:"tool_result_full_len,omitempty"`
 	ToolError      string `json:"tool_error,omitempty"`
 	ToolElapsed    string `json:"tool_elapsed,omitempty"`
 	// Structured tool result fields supplement the legacy tool_result preview.

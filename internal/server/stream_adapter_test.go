@@ -57,6 +57,33 @@ func TestChunkToEvent(t *testing.T) {
 			t.Fatalf("structured tool event = %#v", ev)
 		}
 	})
+	t.Run("tool truncated result marker", func(t *testing.T) {
+		// The agent truncates tool results > MaxToolResultFullBytes:
+		// the SSE event must carry the truncated flag + full length
+		// while omitting the full payload, so the frontend shows the
+		// "查看完整输出" affordance instead of storing a multi-MB string.
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			Phase: "tool", Step: "call-1-ok", ToolName: "exec_command", ToolResult: "preview...",
+			ToolResultFull:      "",
+			ToolResultTruncated: true,
+			ToolResultFullLen:   2_000_000,
+		}, "cs", "gpt-4o")
+		if ev.Type != "tool" {
+			t.Errorf("Type = %q, want tool", ev.Type)
+		}
+		if !ev.ToolResultTruncated {
+			t.Errorf("ToolResultTruncated = false, want true")
+		}
+		if ev.ToolResultFullLen != 2_000_000 {
+			t.Errorf("ToolResultFullLen = %d, want 2000000", ev.ToolResultFullLen)
+		}
+		if ev.ToolResultFull != "" {
+			t.Errorf("ToolResultFull = %q, want empty (payload omitted)", ev.ToolResultFull)
+		}
+		if ev.ToolResult != "preview..." {
+			t.Errorf("ToolResult = %q, want preview", ev.ToolResult)
+		}
+	})
 	t.Run("phase", func(t *testing.T) {
 		ev := chunkToEvent(agent.ChatStreamChunk{Phase: "llm", Step: "round-1", Message: "thinking"}, "cs", "gpt-4o")
 		if ev.Type != "phase" {

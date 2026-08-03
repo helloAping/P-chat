@@ -226,18 +226,99 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// the session lock is released, so the user is never stuck on a
 	// permanently "busy" session.
 	turnCtx := c.Request.Context()
+	var cancel context.CancelFunc
 	if maxSec := h.getCfg().Limits.MaxTurnSeconds; maxSec > 0 {
-		var cancel context.CancelFunc
 		turnCtx, cancel = context.WithTimeout(turnCtx, time.Duration(maxSec)*time.Second)
-		defer cancel()
 		// Replace the request context so respondSSE can observe the
 		// deadline error and emit a terminal error frame when the
 		// stream closes without a done event.
 		c.Request = c.Request.WithContext(turnCtx)
+	} else {
+		// No hard cap configured: still create a cancelable ctx so
+		// respondSSE's write-timeout path and POST /cancel-stream
+		// can abort a stuck turn instead of blocking forever.
+		turnCtx, cancel = context.WithCancel(turnCtx)
 	}
+	defer cancel()
+	unregister := h.registerTurnCancel(id, cancel)
+	defer unregister()
 
 	stream := h.agent.ChatStream(turnCtx, chatReq)
 	h.respondSSE(c, stream, id, provider, model)
+}
+
+// turnCancelRegistration is the cleanup handle returned by
+// registerTurnCancel. Caller must invoke it when the stream ends.
+type turnCancelRegistration func()
+
+// registerTurnCancel publishes the turn's cancel func so
+// respondSSE's write-timeout path and POST /cancel-stream can
+// abort it from outside. Returns a cleanup func the caller defers;
+// a stale cancel for a finished turn is a harmless no-op, but the
+// entry should be removed once the stream completes so the map
+// doesn't grow. Shared by SendMessage and Regenerate (both feed
+// respondSSE).
+func (h *Handler) registerTurnCancel(id string, cancel context.CancelFunc) turnCancelRegistration {
+	h.turnCancels.Store(id, cancel)
+	return func() {
+		h.turnCancels.Delete(id)
+	}
+}
+
+// CancelStream aborts the in-flight SendMessage turn for a session.
+// POST /api/v1/sessions/:id/cancel-stream. The frontend calls this
+// after an AbortController fires so the server-side agent loop
+// exits promptly and the session lock releases — without it, a
+// client that stops reading but keeps the TCP connection open
+// (frozen WebView2 renderer) would hold the turn until the
+// MaxTurnSeconds backstop.
+//
+// Idempotent: cancelling a turn that already finished (or never
+// started) is a no-op. Always returns 200 so the client never
+// sees an error for a best-effort abort.
+func (h *Handler) CancelStream(c *gin.Context) {
+	id := c.Param("id")
+	if v, ok := h.turnCancels.Load(id); ok {
+		if f, ok := v.(context.CancelFunc); ok {
+			log.Printf("[cancel-stream] cancelling turn for session %s", id)
+			f()
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ToolResultResponse is the body of GET
+// /sessions/:id/messages/:msg_id/tool-result/:tool_id.
+type ToolResultResponse struct {
+	ToolID   string `json:"tool_id"`
+	ToolName string `json:"tool_name,omitempty"`
+	Content  string `json:"content"`
+	// Truncated echoes the byte length of the untruncated result
+	// so the frontend can label the affordance.
+	Bytes int `json:"bytes"`
+}
+
+// GetToolResult returns the full (untruncated) body of a tool
+// result whose SSE event was truncated server-side (tool results >
+// MaxToolResultFullBytes ship only a display preview; the full body
+// is parked in the agent's bounded cache and fetched here on
+// demand). This keeps multi-MB outputs out of the Vue reactive
+// store while still letting the user read them.
+//
+// GET /api/v1/sessions/:id/messages/:user_msg_id/tool-result/:tool_id
+func (h *Handler) GetToolResult(c *gin.Context) {
+	id := c.Param("id")
+	toolID := c.Param("tool_id")
+	content, ok := agent.LookupTruncatedResult(id, toolID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "tool result not found or expired"})
+		return
+	}
+	c.JSON(http.StatusOK, ToolResultResponse{
+		ToolID:  toolID,
+		Content: content,
+		Bytes:   len(content),
+	})
 }
 
 func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model string) ([]llm.ChatMessage, string) {
@@ -255,17 +336,30 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 		lastComp = h.store.LastCompressedIDFor(id)
 	}
 
+	var histMsgs []llm.ChatMessage
+	var compSummary string
 	if lastComp > 0 {
-		histMsgs, _, _ := h.store.GetChatMessagesAfterIDFor(id, contextCap, lastComp)
-		return histMsgs, h.store.CompressedSummaryFor(id)
+		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, contextCap, lastComp)
+		// Carry the pre-summarized history so the agent can inject
+		// "[前文摘要]" into the system prompt — the LLM must know
+		// what the compressed-away history contained. Dropping this
+		// (a regression in an earlier refactor) made every post-
+		// compaction turn blind to the summarized context.
+		compSummary = h.store.CompressedSummaryFor(id)
+	} else {
+		limit := 0
+		if h.store.CountChatMessages(id) > contextCap {
+			limit = contextCap
+		}
+		histMsgs = h.store.GetChatMessagesFor(id, limit)
 	}
-
-	limit := 0
-	if h.store.CountChatMessages(id) > contextCap {
-		limit = contextCap
-	}
-	histMsgs := h.store.GetChatMessagesFor(id, limit)
-	return histMsgs, ""
+	// Media rows persisted as "upl://<id>" references must come
+	// back as base64 for the LLM request; the disk read replaces
+	// the old SQLite read and keeps the model's vision context
+	// intact. Best-effort: a missing file degrades to a text
+	// marker instead of breaking the turn.
+	histMsgs = resolveHistoryUploads(histMsgs, h.attachResolver)
+	return histMsgs, compSummary
 }
 
 // respondSSE writes a chat stream to the response. Used
@@ -274,6 +368,39 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 // and need the same SSE envelope (data + id, flush
 // per-frame, done-handling). Keep this the only place
 // that knows how an internal chunk becomes wire bytes.
+
+// writeSSEWithTimeout writes one SSE frame under a hard write
+// deadline. A WebView2 renderer frozen by memory pressure stops
+// reading the response body but keeps the TCP connection open —
+// net/http only cancels the request ctx when the connection
+// *closes*, so a stuck client would otherwise keep the turn alive
+// until MaxTurnSeconds. The deadline makes the write fail fast,
+// respondSSE cancels the turn, and the agent loop exits via
+// ctx.Done().
+func writeSSEWithTimeout(w http.ResponseWriter, ev StreamEvent, timeout time.Duration) error {
+	// http.NewResponseController unwraps gin's writer down to the
+	// underlying net.Conn and sets a write deadline there.
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(timeout)); err == nil {
+		return writeSSEFrame(w, ev)
+	}
+	// No deadline support (e.g. a test buffer): goroutine + timer.
+	// The caller stops writing after the first failure, so the
+	// abandoned goroutine is bounded to one write.
+	type result struct{ err error }
+	done := make(chan result, 1)
+	go func() {
+		done <- result{err: writeSSEFrame(w, ev)}
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case r := <-done:
+		return r.err
+	case <-t.C:
+		return fmt.Errorf("sse write timed out after %s (client not reading)", timeout)
+	}
+}
 
 func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk, sessionID, provider, model string) {
 	c.Header("Content-Type", "text/event-stream")
@@ -303,7 +430,29 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 	// can distinguish "interrupted" from "completed" instead of
 	// treating a truncation as success.
 	terminalEmitted := false
+	// sseWriteTimeout bounds one frame write. When the client stops
+	// reading (frozen renderer), the write hangs; the timeout cancels
+	// the turn via turnCtx so the agent loop exits and the session
+	// lock releases instead of blocking until MaxTurnSeconds.
+	const sseWriteTimeout = 10 * time.Second
+	// cancelTurn aborts the in-flight turn. Resolved from
+	// c.Request.Context()'s cancel — SendMessage registered it in
+	// h.turnCancels; we look it up here so Regenerate (which also
+	// calls respondSSE) works too.
+	cancelTurn := func() {
+		if v, ok := h.turnCancels.Load(sessionID); ok {
+			if f, ok := v.(context.CancelFunc); ok {
+				f()
+			}
+		}
+	}
 	c.Stream(func(w io.Writer) bool {
+		// gin passes c.Writer (an http.ResponseWriter) here; cast
+		// back so writeSSEWithTimeout can reach the net.Conn.
+		rw, isRW := w.(http.ResponseWriter)
+		if !isRW {
+			rw = c.Writer
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("[sse] panic in stream writer: %v", r)
@@ -322,7 +471,7 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 						ErrorKind: "turn_timeout",
 						Done:     true,
 					}, provider, model, streamDoneIDs{})
-					if werr := writeSSEFrame(w, ev); werr == nil {
+					if werr := writeSSEWithTimeout(rw, ev, sseWriteTimeout); werr == nil {
 						if fl, ok := c.Writer.(http.Flusher); ok {
 							fl.Flush()
 						}
@@ -343,7 +492,9 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		if ev.Type == "question" {
 			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
 		}
-		if err := writeSSEFrame(w, ev); err != nil {
+		if err := writeSSEWithTimeout(rw, ev, sseWriteTimeout); err != nil {
+			log.Printf("%s[sse] write failed (client stopped reading): %v — cancelling turn", trace.LogPrefix(c.Request.Context()), err)
+			cancelTurn()
 			return false
 		}
 		if fl, ok := c.Writer.(http.Flusher); ok {

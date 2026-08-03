@@ -593,8 +593,18 @@ type ChatStreamChunk struct {
 	// The frontend prefers ToolResultFull over ToolResult when
 	// it's present.
 	ToolResultFull string `json:"tool_result_full,omitempty"`
-	ToolError      string `json:"tool_error,omitempty"`
-	ToolElapsed    string `json:"tool_elapsed,omitempty"`
+	// ToolResultTruncated is true when the tool result exceeded
+	// MaxToolResultFullBytes and ToolResultFull was NOT sent (the
+	// frontend shows a "查看完整输出" affordance and fetches the
+	// full body on demand). Empty ToolResultFull with this flag set
+	// means "full body exists server-side, ask for it".
+	ToolResultTruncated bool `json:"tool_result_truncated,omitempty"`
+	// ToolResultFullLen is the byte length of the untruncated
+	// result, surfaced so the frontend can label the affordance
+	// ("完整输出 1.2 MB") without a round-trip.
+	ToolResultFullLen int    `json:"tool_result_full_len,omitempty"`
+	ToolError         string `json:"tool_error,omitempty"`
+	ToolElapsed       string `json:"tool_elapsed,omitempty"`
 	// Structured tool result fields supplement the legacy ToolResult preview.
 	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
 	ToolSummary      string   `json:"tool_summary,omitempty"`
@@ -960,6 +970,16 @@ func attachToolResultMetadata(chunk *ChatStreamChunk, result *tool.CallResult) {
 // closure captures the local counter variable by reference. The
 // returned value is whatever the closure yields, typically
 // `seqCounter.Add(1) - 1` for the standard 0,1,2,… sequence.
+// sendOrDropTimeout bounds how long a non-terminal chunk may block
+// on a full channel before being dropped. A consumer that stops
+// reading (frozen renderer) must not wedge the agent loop for the
+// full MaxTurnSeconds — dropping intermediate events is a visual
+// hiccup, holding the turn hostage is not. Terminal chunks (Done /
+// SessionStatus) deliberately bypass the timeout: losing them
+// corrupts the turn's lifecycle, so they keep blocking (the SSE
+// write-timeout in respondSSE is the backstop for those).
+const sendOrDropTimeout = 30 * time.Second
+
 func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, chunk ChatStreamChunk) {
 	if nextSeq != nil {
 		chunk.Seq = nextSeq()
@@ -969,9 +989,18 @@ func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() u
 			chunk.TraceID = tid
 		}
 	}
+	if chunk.Done || chunk.SessionStatus != "" {
+		select {
+		case ch <- chunk:
+		case <-ctx.Done():
+		}
+		return
+	}
 	select {
 	case ch <- chunk:
 	case <-ctx.Done():
+	case <-time.After(sendOrDropTimeout):
+		log.Printf("sendOrDrop: dropped chunk (type=%q phase=%q) after %s — consumer not reading", chunk.Phase, chunk.Step, sendOrDropTimeout)
 	}
 }
 
@@ -1288,6 +1317,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// This history row is already in storage.
 					continue
 				}
+				// Images uploaded via the SPA are persisted as a
+				// "upl://<id>" reference instead of base64: the
+				// bytes live in ~/.p-chat/uploads and the DB row
+				// stores only the pointer, keeping the database
+				// small and history loading cheap. Only the
+				// persisted copy is rewritten — the in-memory
+				// msgs keep the base64 the LLM request needs.
+				if m.UploadID != "" {
+					m.Content = "upl://" + m.UploadID
+				}
 				if pinnedUserID > 0 && m.Role == llm.RoleUser {
 					a.store.AddChatMessageToWithID(req.SessionID, m, pinnedUserID)
 					// Only the first user message gets the
@@ -1363,11 +1402,22 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// errored, we break out with a "stuck" event rather than
 		// letting the LLM hammer the same failing call forever.
 		var (
-			stuckStreak          int
-			prevToolSig          string
-			prevErrored          bool
-			sameToolErrName      string
-			sameToolErrCount     int
+			stuckStreak      int
+			prevToolSig      string
+			prevErrored      bool
+			sameToolErrName  string
+			sameToolErrCount int
+			// cumToolErrCount totals tool failures across the
+			// whole turn WITHOUT requiring identical signatures.
+			// The same-tool guard fires when the LLM repeats ONE
+			// failing call; this catches the "whack-a-mole" loop
+			// where each round tries a DIFFERENT failing command
+			// (e.g. `find` on Windows always failing, the model
+			// inventing a new variant every round) — the stuck
+			// guard's signature never repeats, so the turn would
+			// otherwise spin until the round cap or the wall-clock
+			// timeout.
+			cumToolErrCount      int
 			nearLimitWarningSent bool
 			// P0-3: auto-continue counter. Resets every
 			// user turn (declared outside the for loop,
@@ -2056,6 +2106,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						if ev.QuestionJSON != "" {
 							log.Printf("[forwarder] got question event (%d bytes)", len(ev.QuestionJSON))
 						}
+						// Truncated tool results produced inside a
+						// sub-agent are cached under the SUB-AGENT's
+						// session id, but the frontend fetches them
+						// with the parent session id — rekey the
+						// entry so "查看完整输出" resolves.
+						if ev.ToolResultTruncated && ev.ToolID != "" {
+							rekeyTruncatedResult(req.SessionID, ev.ToolID)
+						}
 						partsAcc.update(ev)
 						sendOrDrop(ctx, ch, nextSeq, ev)
 						if ev.QuestionJSON != "" {
@@ -2342,6 +2400,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 				if o.err != nil || o.result == nil {
 					roundAnyToolErrored = true
+					cumToolErrCount++
 					errMsg := "unknown error"
 					if o.result != nil {
 						errMsg = o.result.Content
@@ -2373,10 +2432,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 
 				result := o.result
-				resultPreview := result.Content
-				if len(resultPreview) > 300 {
-					resultPreview = resultPreview[:300] + "..."
-				}
+				resultPreview := truncatePreview(result.Content, 300)
 				resultPreview = strings.Map(func(r rune) rune {
 					if r == '\n' || r == '\r' {
 						return ' '
@@ -2392,6 +2448,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if result.IsError {
 					roundAnyToolErrored = true
+					cumToolErrCount++
 					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					attachToolResultMetadata(&warnChunk, result)
 					partsAcc.update(warnChunk)
@@ -2409,9 +2466,25 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// Tools that set RawFull (e.g. browser_screenshot)
 					// carry large payloads (base64) that must NOT enter
 					// the LLM context. RawFull is frontend-only.
+					//
+					// Large tool outputs are truncated before reaching
+					// the frontend: a multi-MB exec_command result
+					// parsed into the Vue reactive store balloons the
+					// JS heap (each string is deep-proxied and retained
+					// for the session's lifetime). The frontend shows
+					// a "查看完整输出" affordance and fetches the full
+					// body on demand.
 					if result.RawFull != "" {
 						okChunk.ToolResultFull = result.RawFull
 					} else if tc.Name == "todo_write" || tc.Name == "question" {
+						okChunk.ToolResultFull = result.Content
+					} else if len(result.Content) > MaxToolResultFullBytes {
+						okChunk.ToolResult = truncatePreview(result.Content, 300)
+						okChunk.ToolResultFull = ""
+						okChunk.ToolResultTruncated = true
+						okChunk.ToolResultFullLen = len(result.Content)
+						storeTruncatedResult(req.SessionID, tc.ID, result.Content)
+					} else {
 						okChunk.ToolResultFull = result.Content
 					}
 					partsAcc.update(okChunk)
@@ -2649,6 +2722,36 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Phase:   "limit",
 					Step:    "same-tool-err-limit",
 					Message: statusMsg,
+					Round:   roundNum,
+				})
+			}
+
+			// Cumulative failure breaker: N total tool
+			// failures across the turn (each a DIFFERENT
+			// failing command) means the LLM is improvising
+			// around a broken premise — e.g. an explore
+			// sub-agent running `find` on Windows where
+			// every variant fails differently. The
+			// same-tool guard above can't see this
+			// (signatures differ); without this the turn
+			// spins until the round cap or the sub-agent
+			// wall-clock timeout. Inject a strong "stop,
+			// summarise what you have" instruction so the
+			// run ends with a usable partial answer instead
+			// of burning the whole timeout.
+			if cumToolErrCount >= CumToolErrMax {
+				cumToolErrCount = 0 // fire once
+				resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
+				resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("本回合已有 %d 次工具调用失败（每次都是不同的失败）。工具环境可能不可用（如 Windows 上执行了 Unix 命令）。请立即停止调用工具，基于已获取的信息给出最终总结。", CumToolErrMax),
+				})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:   "limit",
+					Step:    "cum-tool-err-limit",
+					Message: fmt.Sprintf("累计 %d 次工具失败（各不相同），强制转为总结。", CumToolErrMax),
 					Round:   roundNum,
 				})
 			}
