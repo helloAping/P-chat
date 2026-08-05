@@ -2229,7 +2229,24 @@ export async function recoverMissingParts(
     // Refresh the cached content string from parts so
     // the markdown body matches.
     trailing.content = assembleTextContent(trailing.parts || [])
-    showRecoveryBanner(sessionId, merged, reason)
+    // `duplicate_client_message` means the server had already
+    // accepted the user row on a prior request (the SSE
+    // connection just dropped before the client saw any `done`
+    // event). Show a friendlier reason than the raw token so
+    // the recovery banner reads naturally to the user.
+    const userFacingReason =
+      reason === 'duplicate_client_message' ? '连接中断，已自动续接' : reason
+    showRecoveryBanner(sessionId, merged, userFacingReason)
+  } else if (reason === 'duplicate_client_message') {
+    // Server accepted the user row but the snapshot has no
+    // assistant rows yet — either the agent loop hasn't started
+    // (rare: the connection dropped in the narrow window between
+    // user-row commit and agent dispatch) or it ran but produced
+    // no persisted parts. Either way, the user already has their
+    // user message on the server; tell them it's safe to retry
+    // by sending a follow-up — the original prompt is in place.
+    state.isRecovering[sessionId] = false
+    showRecoveryBanner(sessionId, 0, '已送达服务器，可继续追问')
   }
   state.isRecovering[sessionId] = false
 }

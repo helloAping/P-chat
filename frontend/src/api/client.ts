@@ -3,7 +3,7 @@
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
 
-import { abortableDelay, consumeSSEStream, shouldRetryStreamError } from './sse'
+import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError } from './sse'
 
 const BASE = '' // same origin; pchat-server serves both UI and API
 
@@ -1249,6 +1249,30 @@ async function consumeStreamRequest(request: StreamRequest): Promise<void> {
   if (!resp.ok || !resp.body) {
     const bodyText = await resp.text().catch(() => '')
     const err = new Error(`${request.label}: HTTP ${resp.status}: ${bodyText || resp.statusText}`)
+    // Special-case `duplicate_client_message` (HTTP 409, server's
+    // idempotency check found the user row already persisted). The
+    // request was accepted the first time; the SSE connection was
+    // just severed before any `done` event reached us. Throwing
+    // here used to surface as a hard "发送失败: HTTP 409" toast
+    // because shouldRetryStreamError excludes 409 — the user had
+    // to re-type the same message to recover. Instead, route through
+    // onStreamDrop so conversationTurn.ts's recovery flow re-merges
+    // any assistant rows that landed server-side, exactly as it
+    // already does for SSE mid-stream drops. Other 409s (e.g. the
+    // "session busy" lock) keep their current "throw" behaviour
+    // so shouldRetryStreamError can still short-circuit them.
+    if (isDuplicateClientMessageError(err)) {
+      if (!request.signal?.aborted && request.onStreamDrop) {
+        try {
+          request.onStreamDrop({ lastSeq: -1, reason: 'duplicate_client_message' })
+        } catch {
+          // Drop reporting must not mask the recovery — even if the
+          // callback throws, we still want to swallow the 409 so
+          // the caller can run recoverMissingParts.
+        }
+      }
+      return
+    }
     if (!request.signal?.aborted && request.onStreamDrop && shouldRetryStreamError(err)) {
       try {
         request.onStreamDrop({ lastSeq: -1, reason: `HTTP ${resp.status}` })
