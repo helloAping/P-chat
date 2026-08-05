@@ -288,6 +288,21 @@ func isRetryable(kind llm.ErrorKind) bool {
 	}
 }
 
+// IsRetryableErrorKind reports whether an error_kind string (as carried on
+// ChatStreamChunk.ErrorKind) represents a transient failure worth
+// auto-resuming an interrupted turn — rate_limit / server_error / network /
+// timeout. Permanent errors (bad_request, auth, not_found,
+// vision_unsupported) return false so the server does NOT loop an
+// unresolvable failure. Exported for internal/server.
+func IsRetryableErrorKind(kind string) bool {
+	switch kind {
+	case "rate_limit", "server_error", "network", "timeout":
+		return true
+	default:
+		return false
+	}
+}
+
 const pruneAfterRounds = 15
 
 // pruneOldToolResults scans the message list backward and marks tool

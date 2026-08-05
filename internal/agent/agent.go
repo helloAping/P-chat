@@ -1565,6 +1565,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			backoffs := llmRetryBackoffs(a.cfg)
 			maxAttempts := len(backoffs) + 1
 			var retryableErr error
+			// retryableErrKind remembers the classification of the last
+			// retryable failure so the "重试 N 次后仍然失败" terminal can
+			// carry an error_kind the server uses to decide auto-resume.
+			retryableErrKind := llm.KindUnknown
 			contextRecoveryUsed := false
 			// successAttempt records which attempt produced the reply
 			// (0 = the initial attempt). A reply that only arrived via a
@@ -1673,13 +1677,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						stallTimer.Stop()
 						if attempt < maxAttempts && (attempt > 1 || ctx.Err() == nil) {
 							retryableErr = fmt.Errorf("LLM stream stalled: no data received for %s", stallTimeout)
+							retryableErrKind = llm.KindTimeout
 							cancelStream()
 							break // break inner stream loop → outer retries
 						}
 						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
-							Phase: "llm",
-							Error: fmt.Sprintf("LLM 流长时间无数据（%s），已终止本轮。上游可能已中断，请重试。", stallTimeout),
-							Done:  true,
+							Phase:     "llm",
+							Error:     fmt.Sprintf("LLM 流长时间无数据（%s），已终止本轮。上游可能已中断，请重试。", stallTimeout),
+							ErrorKind: llm.KindTimeout.String(),
+							Done:      true,
 						})
 						cancelStream()
 						return
@@ -1719,6 +1725,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							// deadline-free abort context) retry regardless.
 							if isRetryable(apiErr.Kind) && attempt < maxAttempts && (attempt > 1 || ctx.Err() == nil) {
 								retryableErr = chunk.Err
+								retryableErrKind = apiErr.Kind
 								cancelStream()
 								break // break inner stream loop, retry outer
 							}
@@ -1813,9 +1820,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// turn deadline fired mid-retry.
 			if retryableErr != nil {
 				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
-					Phase: "llm",
-					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", len(backoffs), retryableErr),
-					Done:  true,
+					Phase:     "llm",
+					Error:     fmt.Sprintf("重试 %d 次后仍然失败: %v", len(backoffs), retryableErr),
+					ErrorKind: retryableErrKind.String(),
+					Done:      true,
 				})
 				return
 			}

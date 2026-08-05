@@ -295,10 +295,19 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		// is forced to resume so an active task chain is preserved.
 		histMsgs, compSummary := h.loadHistoryForSend(baseCtx, id, provider, model)
 		resumeMsgs := buildLLMMessages(histMsgs)
+		// The nudge names the reason dynamically: when todos are still
+		// unfinished (the common auto-continue case — the LLM ended without
+		// marking every todo done/cancelled), say so explicitly so the model
+		// verifies completion and calls todo_write; otherwise fall back to a
+		// generic "中断" (deadline / upstream-error resume).
+		resumeReason := "中断"
+		if agent.HasPendingTodos(id) {
+			resumeReason = "任务尚未完成"
+		}
 		resumeMsgs = append(resumeMsgs, llm.ChatMessage{
 			Role:        llm.RoleUser,
 			Type:        llm.TypeText,
-			Content:     agent.BuildTurnTimeoutResumePrompt(id),
+			Content:     agent.BuildAutoResumePrompt(id, resumeReason),
 			MsgType:     llm.MsgTypeText,
 			SubmitToLLM: 1,
 		})
@@ -604,6 +613,48 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 			ids.lastMessageID = h.store.GetLastMessageID(sessionID)
 		}
 		ev := streamEventFromChunk(chunk, provider, model, ids)
+		// Auto-resume on a retryable terminal error (LLM upstream failure
+		// after the staircase retries are exhausted, stream stall, timeout)
+		// when the session still has unfinished todos. The turn is re-run
+		// with a "继续完成<任务>" nudge instead of forcing the user to type
+		// "继续" again. retryNotice is only set while the retry budget
+		// remains, and permanent errors (bad_request / auth / not_found /
+		// vision_unsupported) never resume, so this cannot loop on an
+		// unresolvable failure.
+		if chunk.Done && chunk.Error != "" && retryNotice != "" &&
+			agent.IsRetryableErrorKind(chunk.ErrorKind) && agent.HasPendingTodos(sessionID) {
+			if err := writeSSEWithTimeout(rw, ev, sseWriteTimeout); err != nil {
+				log.Printf("%s[sse] write failed (client stopped reading): %v — cancelling turn", trace.LogPrefix(c.Request.Context()), err)
+				cancelTurn()
+				return false
+			}
+			// Not terminal: SendMessage re-invokes the loop with a fresh
+			// budget and the auto-resume nudge (turnStreamRetry).
+			result = turnStreamRetry
+			return false
+		}
+		// Normal completion but the session still has unfinished todos: the
+		// LLM gave a final answer without marking every todo done/cancelled
+		// (e.g. it declared "done" while an item is still in_progress, or the
+		// internal auto-continue budget was exhausted). Auto-resume with a
+		// "检查并更新 todo" nudge so the user never has to type "继续" while
+		// real work is still tracked. Gated on the retry budget (retryNotice
+		// set) and on pending todos, so a finished plan (all done/cancelled)
+		// and non-resumable endpoints (Regenerate passes empty retryNotice)
+		// end normally. Crucially we do NOT emit the type="done" frame here —
+		// the client keeps reading the same SSE stream while SendMessage
+		// re-runs the loop.
+		if chunk.Done && chunk.Error == "" && retryNotice != "" && agent.HasPendingTodos(sessionID) {
+			notice := streamEventFromChunk(agent.ChatStreamChunk{
+				Phase:   "system",
+				Step:    "todo-auto-continue",
+				Message: "检测到 todo 仍有未完成项，自动继续检查并更新状态…",
+			}, provider, model, streamDoneIDs{})
+			// writeSSEWithTimeout writes AND flushes, bounded.
+			_ = writeSSEWithTimeout(rw, notice, sseWriteTimeout)
+			result = turnStreamRetry
+			return false
+		}
 		if chunk.Done {
 			terminalEmitted = true
 		}

@@ -113,23 +113,69 @@ func sessionPendingTodos(sessionID string) (count int, items []tool.TodoItem) {
 	return len(items), items
 }
 
-// BuildTurnTimeoutResumePrompt returns the user-style "继续" nudge the
-// server injects as the only new message when a turn terminated by the
-// MaxTurnSeconds deadline is auto-resumed — the semantic equivalent of
-// the user manually typing "继续".
-//
-// When the session has active todos (pending / in_progress), the nudge
-// anchors the model to the todo list: re-check the in_progress item
-// first, then continue the pending ones, keeping the mandatory
-// todo_write contract (original IDs, only status updates, no new list,
-// no skipping) — the model may only summarise once every todo reaches a
-// terminal state. When there are no todos, it degrades to a plain
-// "继续" with no todo contract. Exported because internal/server needs
-// it to build the retry ChatRequest.
+// HasPendingTodos reports whether the session currently has unfinished
+// todo items (pending or in_progress). Exported so the server can decide
+// whether an interrupted turn should auto-resume: when real work is in
+// flight, the turn is re-run with a "继续完成<任务>" nudge instead of
+// forcing the user to type "继续" by hand.
+func HasPendingTodos(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	count, _ := sessionPendingTodos(sessionID)
+	return count > 0
+}
+
+// BuildTurnTimeoutResumePrompt is the MaxTurnSeconds-deadline variant of
+// BuildAutoResumePrompt. Kept exported for backwards compatibility.
 func BuildTurnTimeoutResumePrompt(sessionID string) string {
+	return BuildAutoResumePrompt(sessionID, "超出最长执行时间")
+}
+
+// BuildAutoResumePrompt returns the user-style "继续" nudge the server
+// injects as the only new message when an interrupted turn is auto-resumed
+// — the semantic equivalent of the user manually typing "继续".
+//
+// Unlike BuildTurnTimeoutResumePrompt (specific to the MaxTurnSeconds
+// deadline), this covers every interrupt path: LLM upstream errors after
+// retries are exhausted, LLM stream stalls, tool hangs, deadline
+// termination. When the session has active todos (pending / in_progress),
+// the nudge names the first unfinished task ("继续完成“<任务名>”") and
+// anchors the model to the whole todo list: re-check the in_progress item
+// first, then continue the pending ones, keeping the mandatory todo_write
+// contract (original IDs, only status updates, no new list, no skipping) —
+// the model may only summarise once every todo reaches a terminal state.
+// When there are no todos, it degrades to a plain "继续" with no contract.
+//
+// reason is a short Chinese label for what interrupted the turn, e.g.
+// "超出最长执行时间" or "上游长时间无响应". Exported because
+// internal/server needs it to build the retry ChatRequest.
+func BuildAutoResumePrompt(sessionID, reason string) string {
 	_, items := sessionPendingTodos(sessionID)
+	if reason == "" {
+		reason = "中断"
+	}
 	var sb strings.Builder
-	sb.WriteString("⏱ 上一回合因超出最长执行时间被自动终止，请像收到“继续”一样接着完成当前任务。\n\n")
+	// 任务名取第一个未完成项（进行中优先），让提示语直接点名要续跑的任务。
+	// Name the first unfinished task so the nudge says exactly what to
+	// continue instead of a generic "继续".
+	taskName := ""
+	for _, status := range []string{"in_progress", "pending"} {
+		for _, t := range items {
+			if t.Status == status {
+				taskName = t.Content
+				break
+			}
+		}
+		if taskName != "" {
+			break
+		}
+	}
+	if taskName != "" {
+		fmt.Fprintf(&sb, "⏱ 上一回合因%s被中断，请继续完成“%s”…\n\n", reason, taskName)
+	} else {
+		fmt.Fprintf(&sb, "⏱ 上一回合因%s被自动终止，请像收到“继续”一样接着完成当前任务。\n\n", reason)
+	}
 	if len(items) == 0 {
 		sb.WriteString("当前没有待办任务。请继续执行上一回合未完成的工作，需要时用工具推进，完成后给出总结。")
 		return sb.String()
