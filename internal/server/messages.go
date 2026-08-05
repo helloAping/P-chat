@@ -462,19 +462,32 @@ const (
 // respondSSE cancels the turn, and the agent loop exits via
 // ctx.Done().
 func writeSSEWithTimeout(w http.ResponseWriter, ev StreamEvent, timeout time.Duration) error {
-	// http.NewResponseController unwraps gin's writer down to the
-	// underlying net.Conn and sets a write deadline there.
-	rc := http.NewResponseController(w)
-	if err := rc.SetWriteDeadline(time.Now().Add(timeout)); err == nil {
-		return writeSSEFrame(w, ev)
-	}
-	// No deadline support (e.g. a test buffer): goroutine + timer.
-	// The caller stops writing after the first failure, so the
-	// abandoned goroutine is bounded to one write.
+	// Best-effort socket write deadline: http.NewResponseController unwraps
+	// gin's writer down to the underlying net.Conn and sets a write deadline
+	// there. On Windows a stuck flush is NOT reliably interrupted by
+	// SetWriteDeadline — the 2026-08-04 hang: a WebView2 renderer frozen by
+	// jank kept the TCP conn open but stopped reading, the frame flush
+	// blocked in WSASend, and the bare fl.Flush() that followed
+	// writeSSEFrame wedged respondSSE for the rest of the turn (see the
+	// 08-03 goroutine dump: SendMessage → respondSSE → Flush → WSASend).
+	// So the goroutine+timer below is the real backstop: respondSSE always
+	// returns within timeout, cancels the turn, and closing the conn frees
+	// the abandoned writer goroutine. Write AND flush are kept inside the
+	// goroutine so the flush cannot block the callback on its own.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout))
 	type result struct{ err error }
 	done := make(chan result, 1)
 	go func() {
-		done <- result{err: writeSSEFrame(w, ev)}
+		ferr := writeSSEFrame(w, ev)
+		if ferr == nil {
+			// http.Flusher.Flush has no error return; the write deadline +
+			// the timer below still bound a stuck flush (goroutine/timer
+			// backstop), and the conn close on turn cancellation frees it.
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+		}
+		done <- result{err: ferr}
 	}()
 	t := time.NewTimer(timeout)
 	defer t.Stop()
@@ -564,11 +577,8 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 							Step:    "turn-retry",
 							Message: retryNotice,
 						}, provider, model, streamDoneIDs{})
-						if werr := writeSSEWithTimeout(rw, notice, sseWriteTimeout); werr == nil {
-							if fl, ok := c.Writer.(http.Flusher); ok {
-								fl.Flush()
-							}
-						}
+						// writeSSEWithTimeout writes AND flushes, bounded.
+						_ = writeSSEWithTimeout(rw, notice, sseWriteTimeout)
 						busy := streamEventFromChunk(agent.ChatStreamChunk{
 							SessionStatus: "retry",
 						}, provider, model, streamDoneIDs{})
@@ -582,11 +592,8 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 						ErrorKind: "turn_timeout",
 						Done:      true,
 					}, provider, model, streamDoneIDs{})
-					if werr := writeSSEWithTimeout(rw, ev, sseWriteTimeout); werr == nil {
-						if fl, ok := c.Writer.(http.Flusher); ok {
-							fl.Flush()
-						}
-					}
+					// writeSSEWithTimeout writes AND flushes, bounded.
+					_ = writeSSEWithTimeout(rw, ev, sseWriteTimeout)
 				}
 			}
 			return false
@@ -607,9 +614,6 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 			log.Printf("%s[sse] write failed (client stopped reading): %v — cancelling turn", trace.LogPrefix(c.Request.Context()), err)
 			cancelTurn()
 			return false
-		}
-		if fl, ok := c.Writer.(http.Flusher); ok {
-			fl.Flush()
 		}
 		return !chunk.Done
 	})

@@ -183,6 +183,10 @@ func (w *idleTimeoutReader) watch() {
 			timer.Reset(w.timeout)
 		case <-timer.C:
 			w.timedOut.Store(true)
+			// Diagnostic: a silent upstream (no transport bytes for the
+			// idle window) is exactly the "tool/sub-agent spins forever"
+			// failure mode. Log it so server-debug shows the recovery fired.
+			log.Printf("[llm] stream idle watchdog fired after %s (no bytes); cancelling request", w.timeout)
 			w.cancel()
 			return
 		}

@@ -12,6 +12,7 @@ package agent
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -45,6 +46,25 @@ const CumToolErrMax = 8
 // this guard prevents a broken or looping SSE provider from growing the server
 // heap without bound before cancellation reaches the transport.
 const MaxStreamBytesPerRound = 1 << 20
+
+// RoundStreamStallTimeout is the per-attempt ceiling on receiving NO chunk
+// at all from an upstream LLM stream. The LLM client already runs its own
+// idle watchdog (default 120s, internal/llm/client.go) — but that watchdog
+// resets on ANY transport byte, so a proxy that pads a dead upstream with
+// SSE keep-alive lines can keep it "alive" indefinitely. Without this
+// backstop the round's select would block until the turn deadline
+// (MaxTurnSeconds, default 3600s) and the UI would show a permanently
+// spinning tool / sub-agent card.
+//
+// 3 minutes sits safely above the default 120s client-side idle watchdog
+// (so the client's own recovery — which knows the provider — runs first and
+// yields a properly-classified API error), while still bounding a genuinely
+// silent stream well before the turn deadline. Fires on NO chunk of any
+// kind (content/thinking/tool/error/done), independent of keep-alive bytes.
+//
+// This is the default; limits.round_stream_stall_timeout (seconds)
+// overrides it. 0 in config keeps this default.
+const RoundStreamStallTimeout = 3 * time.Minute
 
 // MaxToolResultFullBytes caps how much of a tool result is shipped
 // to the frontend as ToolResultFull. Results larger than this are

@@ -1625,6 +1625,22 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				streamCtx, cancelStream := context.WithCancel(attemptCtx)
 				stream := a.llm.ChatStreamCM(streamCtx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
 				streamOpen := true
+				// Per-attempt stall watchdog. The LLM client's own idle
+				// watchdog (default 120s) resets on ANY transport byte, so a
+				// proxy that pads a dead upstream with SSE keep-alive lines can
+				// keep this stream "open" forever — the select below would
+				// block until the turn deadline (MaxTurnSeconds) and the UI
+				// would show a permanently spinning tool / sub-agent card.
+				// This timer is a hard backstop: it fires on NO chunk for the
+				// stall window regardless of keep-alives, then retries (if
+				// attempts remain) or surfaces error+done. Tuned via
+				// limits.round_stream_stall_timeout (0 = default 180s).
+				stallTimeout := RoundStreamStallTimeout
+				if a.cfg != nil && a.cfg.Limits.RoundStreamStallSeconds > 0 {
+					stallTimeout = time.Duration(a.cfg.Limits.RoundStreamStallSeconds) * time.Second
+				}
+				stallTimer := time.NewTimer(stallTimeout)
+				defer stallTimer.Stop()
 				for streamOpen {
 					var chunk llm.StreamChunk
 					var ok bool
@@ -1634,9 +1650,39 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						return
 					case chunk, ok = <-stream:
 						if !ok {
+							stallTimer.Stop()
 							streamOpen = false
 							continue
 						}
+						// Any real chunk resets the stall window.
+						if !stallTimer.Stop() {
+							select {
+							case <-stallTimer.C:
+							default:
+							}
+						}
+						stallTimer.Reset(stallTimeout)
+					case <-stallTimer.C:
+						// No chunk at all for the stall window → the
+						// upstream is silent (mid-stream stall, e.g. the
+						// api-convert proxy dropping deepseek mid-response
+						// with no [DONE] and no close). Recover: retry while
+						// attempts remain (mirrors the retryable chunk.Err
+						// path), else terminate the round with error+done so
+						// the frontend never hangs on a spinning card.
+						stallTimer.Stop()
+						if attempt < maxAttempts && (attempt > 1 || ctx.Err() == nil) {
+							retryableErr = fmt.Errorf("LLM stream stalled: no data received for %s", stallTimeout)
+							cancelStream()
+							break // break inner stream loop → outer retries
+						}
+						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
+							Phase: "llm",
+							Error: fmt.Sprintf("LLM 流长时间无数据（%s），已终止本轮。上游可能已中断，请重试。", stallTimeout),
+							Done:  true,
+						})
+						cancelStream()
+						return
 					}
 					if chunk.Err != nil {
 						classified := llm.ClassifyAPIError(req.Provider, chunk.Err)

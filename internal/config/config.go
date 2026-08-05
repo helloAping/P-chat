@@ -97,6 +97,16 @@ type LimitsConfig struct {
 	// they are bounded only by this list plus user cancellation — so a
 	// long backoff sequence is never truncated by the turn deadline.
 	LLMRetryBackoffs []int `json:"llm_retry_backoffs,omitempty"`
+	// RoundStreamStallSeconds is the per-attempt ceiling (seconds) on
+	// receiving NO chunk at all from an upstream LLM stream. The LLM
+	// client's own idle watchdog resets on any transport byte, so a
+	// proxy that pads a dead upstream with SSE keep-alive lines can keep
+	// a stream "open" forever; this is the agent-level backstop that
+	// turns such a hang into a retry / error+done instead of blocking
+	// until MaxTurnSeconds. 0 = default (180). Absent from config →
+	// default; explicit 0 → off (previous behaviour: rely solely on the
+	// client-side idle watchdog).
+	RoundStreamStallSeconds int `json:"round_stream_stall_timeout,omitempty"`
 }
 
 // TodoLongRunMode configures the long-running task policy.
@@ -955,11 +965,12 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Limits: LimitsConfig{
-			MaxRounds:        300,
-			TodoLongRunMode:  TodoLongRunAdaptive,
-			MaxTurnSeconds:   900,
-			MaxTurnRetries:   2,
-			LLMRetryBackoffs: []int{5, 60, 180, 300, 600},
+			MaxRounds:              300,
+			TodoLongRunMode:        TodoLongRunAdaptive,
+			MaxTurnSeconds:         900,
+			MaxTurnRetries:         2,
+			LLMRetryBackoffs:       []int{5, 60, 180, 300, 600},
+			RoundStreamStallSeconds: 180,
 		},
 		Sandbox: SandboxConfig{
 			Enabled:               true,

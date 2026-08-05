@@ -64,7 +64,13 @@ const memRows = computed(() => [
   { label: '进程 RSS', value: mem.value ? `${mem.value.rss_mb} MB` : '—' },
 ])
 
+// inFlight guards against overlapping refreshes: if the server is slow and
+// the 3s interval fires again, skip rather than queue a second request
+// (rapid stacked requests were observed in server access logs).
+let inFlight = false
 async function refreshMem() {
+  if (inFlight) return
+  inFlight = true
   try {
     loadingMem.value = true
     mem.value = await getMemoryDiagnostics()
@@ -72,6 +78,7 @@ async function refreshMem() {
     // Background auto-refresh stays silent; only the first load surfaces an error.
     if (!mem.value) message.error(`拉取内存状态失败: ${(e as Error).message}`)
   } finally {
+    inFlight = false
     loadingMem.value = false
   }
 }
@@ -126,7 +133,13 @@ let timer: number | undefined
 onMounted(() => {
   refreshMem()
   refreshConfig()
-  timer = window.setInterval(refreshMem, 3000)
+  timer = window.setInterval(() => {
+    // Skip polling while the document is hidden (e.g. a background
+    // conversation) — a monitor panel doesn't need live data then, and
+    // background requests add load for nothing.
+    if (document.hidden) return
+    refreshMem()
+  }, 3000)
 })
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer)
