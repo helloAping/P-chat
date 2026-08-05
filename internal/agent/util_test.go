@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -492,6 +493,61 @@ func TestTruncateToFit_SingleMessage(t *testing.T) {
 	truncateToFit(&msgs, 0)
 	if len(msgs) != 1 || msgs[0].Content != "only" {
 		t.Errorf("single-msg slice altered: %v", msgs)
+	}
+}
+
+// TestTruncateToFit_PerfBound guards the O(n²) regression: the old
+// implementation rebuilt + re-estimated the whole kept slice per message,
+// which on a 3900-message session allocated tens of MB per call and fed an
+// auto-compact GC storm (2026-08-05 CPU spike). The O(n) rewrite must stay
+// comfortably under 50ms with negligible allocation on the same input.
+func TestTruncateToFit_PerfBound(t *testing.T) {
+	msgs := make([]llm.ChatMessage, 0, 3916)
+	msgs = append(msgs, llm.ChatMessage{Role: llm.RoleSystem, Type: llm.TypeText, Content: "sys"})
+	// Realistic: each message carries a ~2KB body (tool result / prose).
+	for i := 0; i < 3916; i++ {
+		body := make([]byte, 2000)
+		for j := range body {
+			body[j] = byte('a' + (i*7+j)%26)
+		}
+		msgs = append(msgs, llm.ChatMessage{Role: llm.RoleUser, Type: llm.TypeText, Content: string(body)})
+	}
+
+	// Warm up once so allocations don't count the growth of the input.
+	start := time.Now()
+	truncateToFit(&msgs, 20000)
+	elapsed := time.Since(start)
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("truncateToFit(3916 msgs) took %v, want <50ms (O(n) regression?)", elapsed)
+	}
+	if len(msgs) == 3917 {
+		t.Fatalf("truncateToFit did not drop any messages on a 3916-msg input")
+	}
+}
+
+// TestTruncateToFit_KeepsNewestChronological checks the O(n) rewrite keeps
+// the old semantics: system msg preserved, most-recent messages kept in
+// chronological order, an individual oversized message skipped while older
+// ones that fit are still kept.
+func TestTruncateToFit_KeepsNewestChronological(t *testing.T) {
+	big := strings.Repeat("x", 500) // oversized on its own vs usable=50
+	msgs := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "sys"},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "oldest"},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "old-2"},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: big},  // skipped: too big
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "recent"},
+	}
+	truncateToFit(&msgs, 50)
+	if msgs[0].Content != "sys" {
+		t.Fatalf("system message lost: %v", msgs)
+	}
+	// "recent" must be kept and be the LAST message (chronological order).
+	if len(msgs) < 2 || msgs[len(msgs)-1].Content != "recent" {
+		t.Fatalf("most-recent message missing/out of order: %v", msgs)
+	}
+	if strings.Contains(fmt.Sprint(msgs), "big") {
+		t.Fatalf("oversized message should be skipped: %v", msgs)
 	}
 }
 

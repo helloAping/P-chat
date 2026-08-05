@@ -2996,6 +2996,18 @@ func (a *Agent) tryAutoCompact(
 		// Fallback: hard-truncate the message list so the LLM
 		// call doesn't fail with a 413. Drop oldest non-system
 		// messages to stay within the usable context window.
+		//
+		// IMPORTANT: this returns false, NOT true. Returning true
+		// made the caller `continue` into the next round, which
+		// re-entered tryAutoCompact → Compress → (summarizer LLM
+		// keeps failing, e.g. an unavailable proxy) → truncate →
+		// return true → ... — an infinite loop that burned CPU on
+		// O(n²) truncateToFit while GC storms (the 2026-08-05
+		// CPU spike: num_gc 580 → 32000 in 13 min, turn never
+		// ended). The messages list is already truncated here, so
+		// the caller can fall through to the LLM call with the
+		// reduced context; if it overflows again, the bad-request
+		// recovery path handles it (bounded).
 		usable := llm.UsableContextWithBuf(ctxWindow, buf) - llm.EstimateTokensTools(tools)
 		if usable > 0 {
 			truncateToFit(msgs, usable)
@@ -3008,7 +3020,7 @@ func (a *Agent) tryAutoCompact(
 				MaxRound: maxRounds,
 			})
 			_ = summary
-			return true
+			return false
 		}
 		return false
 	}

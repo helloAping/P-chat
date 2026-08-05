@@ -334,28 +334,48 @@ func pruneOldToolResults(msgs []llm.ChatMessage, currentRound, keepRounds int) {
 // until the total estimated tokens fit within usable. Messages are
 // removed from the front (after msgs[0]) so the most recent context
 // is preserved.
+//
+// Implementation note: this is a single O(n) pass with incremental
+// token accounting. The previous version rebuilt the whole kept slice
+// (make + append(kept...)) and re-estimated every kept message on each
+// iteration — O(n²) work and allocation that on a 3900-message session
+// allocated tens of MB per call and fed an auto-compact GC storm (the
+// 2026-08-05 CPU spike: num_gc 580 → 32000 while tryAutoCompact
+// dead-looped). Each message is now estimated once; kept grows by
+// append only (never copied wholesale); the result is reversed once.
 func truncateToFit(msgs *[]llm.ChatMessage, usable int) {
 	if len(*msgs) <= 1 {
 		return
 	}
 	sysMsg := (*msgs)[0]
 	rest := (*msgs)[1:]
+	// Fast path: the whole tail already fits — nothing to drop.
 	if total := llm.EstimateTokensMessages(rest); total <= usable {
 		return
 	}
 
+	// Greedy newest-first: keep the most recent messages that fit,
+	// skip individual messages that would overflow (matching the old
+	// behaviour), keep looking older.
 	kept := make([]llm.ChatMessage, 0, len(rest))
+	acc := 0
 	for i := len(rest) - 1; i >= 0; i-- {
-		candidate := make([]llm.ChatMessage, 0, len(kept)+1)
-		candidate = append(candidate, rest[i])
-		candidate = append(candidate, kept...)
-		if llm.EstimateTokensMessages(candidate) > usable {
+		delta := llm.EstimateTokensMessages(rest[i : i+1])
+		if acc+delta > usable {
 			continue
 		}
-		kept = candidate
+		acc += delta
+		kept = append(kept, rest[i])
 	}
-	if len(kept) == 0 {
+	if len(kept) == 0 && len(rest) > 0 {
+		// Nothing fit; keep the newest message so the model still
+		// has some context (old code did the same).
 		kept = []llm.ChatMessage{rest[len(rest)-1]}
+	}
+	// kept is newest-first (appended from the tail); reverse it back
+	// to chronological order.
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
 	}
 	*msgs = append([]llm.ChatMessage{sysMsg}, kept...)
 }
