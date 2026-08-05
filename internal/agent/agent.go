@@ -1626,6 +1626,24 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if needsNormalizedToolResults(req.Provider) {
 					msgsForLLM = normalizeToolResults(roundMsgsForLLM)
 				}
+				// T1 (P0) hard context-window gate: never send an
+				// over-window request. tryAutoCompact has already run
+				// above; this is the last-resort guarantee that the
+				// actual payload fits, force-truncating when possible
+				// and refusing with a clear error otherwise (see
+				// context_guard.go). The check is idempotent across
+				// attempts, so running it per-attempt is safe.
+				if checkedMsgs, err := a.ensureWithinWindow(msgsForLLM, roundTools, req); err != nil {
+					sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
+						Phase:     "llm",
+						Error:     err.Error(),
+						ErrorKind: llm.KindUnknown.String(),
+						Done:      true,
+					})
+					return
+				} else {
+					msgsForLLM = checkedMsgs
+				}
 				streamCtx, cancelStream := context.WithCancel(attemptCtx)
 				stream := a.llm.ChatStreamCM(streamCtx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
 				streamOpen := true
