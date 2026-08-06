@@ -1626,24 +1626,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if needsNormalizedToolResults(req.Provider) {
 					msgsForLLM = normalizeToolResults(roundMsgsForLLM)
 				}
-				// T1 (P0) hard context-window gate: never send an
-				// over-window request. tryAutoCompact has already run
-				// above; this is the last-resort guarantee that the
-				// actual payload fits, force-truncating when possible
-				// and refusing with a clear error otherwise (see
-				// context_guard.go). The check is idempotent across
-				// attempts, so running it per-attempt is safe.
-				if checkedMsgs, err := a.ensureWithinWindow(msgsForLLM, roundTools, req); err != nil {
-					sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
-						Phase:     "llm",
-						Error:     err.Error(),
-						ErrorKind: llm.KindUnknown.String(),
-						Done:      true,
-					})
-					return
-				} else {
-					msgsForLLM = checkedMsgs
-				}
+				// T1 (P0) request-time context-window convergence gate:
+				// never refuses — summary-replace → head-trim → truncate
+				// oversized content / trim tools → minimal set (see
+				// context_guard.go). tryAutoCompact has already run
+				// above; this guarantees the payload actually sent fits
+				// the usable window while keeping the conversation
+				// going. Compaction (level 1) runs only on the first
+				// attempt — it advances the compression point and is
+				// expensive; retries re-run only the cheap, idempotent
+				// truncation levels.
+				msgsForLLM, roundTools = a.ensureWithinWindow(retryCtx, msgsForLLM, roundTools, req, ch, nextSeq, roundNum, maxRounds, attempt == 1)
 				streamCtx, cancelStream := context.WithCancel(attemptCtx)
 				stream := a.llm.ChatStreamCM(streamCtx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
 				streamOpen := true
