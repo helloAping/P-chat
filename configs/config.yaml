@@ -91,6 +91,15 @@ limits:
   # hangs that escape per-tool timeouts (e.g. an exec_command whose
   # orphaned child holds the output pipes).
   max_turn_seconds: 900
+  # 回合因 max_turn_seconds 被终止后，自动重试次数（0 = 关闭）。每次重试
+  # 会重新加载已持久化的部分进度 + 自动注入一条"继续"消息，重新计时。
+  # 相当于用户手动发送"继续"。默认 2。
+  max_turn_retries: 2
+  # 上游 LLM 请求瞬时错误（限流/5xx/网络/超时）的阶梯式重试退避（秒）。
+  # 第 k 个值 = 第 k 次重试前的等待；重试次数 = 列表长度（总尝试 = len+1）。
+  # 空列表 [] = 不重试。重试脱离 max_turn_seconds 回合预算，只受本表 +
+  # 用户取消约束，不会被回合截止截断。默认 [5, 60, 180, 300, 600]。
+  llm_retry_backoffs: [5, 60, 180, 300, 600]
   todo_long_run_mode: "adaptive" # "off" | "adaptive" | "unlimited"
 
 sandbox:
@@ -111,13 +120,17 @@ sandbox:
 # - `denied_tools`: blacklist; when `allowed_tools` is empty, these are
 #   excluded from the parent's tool set when building the sub-agent.
 #   Default: `["exec_command"]` for safety.
-# - `timeout`: per-sub-agent execution cap. Default: "5m".
+# - `timeout`: per-sub-agent wall-clock cap (LAST-RESORT backstop).
+#   Default: "30m". Real hangs are caught earlier by the LLM stream
+#   idle timeout (120s), per-tool timeouts, the cumulative failure
+#   breaker, and the round cap — a legit long sub-agent (slow local
+#   model, many files) can take 10-20m, so keep this generous.
 # - `cache_ttl`: how long identical (description, style, provider) results
 #   are reused. Default: "5m". Set to "0s" to disable caching.
 subagent:
   denied_tools:
     - "exec_command"
-  timeout: "5m"
+  timeout: "30m"
   cache_ttl: "5m"
   # Example: only allow safe tools (whitelist mode)
   # allowed_tools:

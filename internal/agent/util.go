@@ -34,6 +34,20 @@ func formatElapsed(d time.Duration) string {
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
+// truncatePreview returns the first maxLen runes of s plus an
+// ellipsis when s is longer. Byte-safe for UTF-8 (slices on runes,
+// not bytes) so multi-byte CJK text is never cut mid-rune.
+func truncatePreview(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	rs := []rune(s)
+	if len(rs) <= maxLen {
+		return s
+	}
+	return string(rs[:maxLen]) + "..."
+}
+
 // resetGuardCounters clears the stuck-loop guard state. Called
 // when a stronger intervention fires (e.g. sameToolErrCount
 // injects a "改用其他方式" hint) so the LLM gets a fresh
@@ -274,6 +288,21 @@ func isRetryable(kind llm.ErrorKind) bool {
 	}
 }
 
+// IsRetryableErrorKind reports whether an error_kind string (as carried on
+// ChatStreamChunk.ErrorKind) represents a transient failure worth
+// auto-resuming an interrupted turn — rate_limit / server_error / network /
+// timeout. Permanent errors (bad_request, auth, not_found,
+// vision_unsupported) return false so the server does NOT loop an
+// unresolvable failure. Exported for internal/server.
+func IsRetryableErrorKind(kind string) bool {
+	switch kind {
+	case "rate_limit", "server_error", "network", "timeout":
+		return true
+	default:
+		return false
+	}
+}
+
 const pruneAfterRounds = 15
 
 // pruneOldToolResults scans the message list backward and marks tool
@@ -320,28 +349,48 @@ func pruneOldToolResults(msgs []llm.ChatMessage, currentRound, keepRounds int) {
 // until the total estimated tokens fit within usable. Messages are
 // removed from the front (after msgs[0]) so the most recent context
 // is preserved.
+//
+// Implementation note: this is a single O(n) pass with incremental
+// token accounting. The previous version rebuilt the whole kept slice
+// (make + append(kept...)) and re-estimated every kept message on each
+// iteration — O(n²) work and allocation that on a 3900-message session
+// allocated tens of MB per call and fed an auto-compact GC storm (the
+// 2026-08-05 CPU spike: num_gc 580 → 32000 while tryAutoCompact
+// dead-looped). Each message is now estimated once; kept grows by
+// append only (never copied wholesale); the result is reversed once.
 func truncateToFit(msgs *[]llm.ChatMessage, usable int) {
 	if len(*msgs) <= 1 {
 		return
 	}
 	sysMsg := (*msgs)[0]
 	rest := (*msgs)[1:]
+	// Fast path: the whole tail already fits — nothing to drop.
 	if total := llm.EstimateTokensMessages(rest); total <= usable {
 		return
 	}
 
+	// Greedy newest-first: keep the most recent messages that fit,
+	// skip individual messages that would overflow (matching the old
+	// behaviour), keep looking older.
 	kept := make([]llm.ChatMessage, 0, len(rest))
+	acc := 0
 	for i := len(rest) - 1; i >= 0; i-- {
-		candidate := make([]llm.ChatMessage, 0, len(kept)+1)
-		candidate = append(candidate, rest[i])
-		candidate = append(candidate, kept...)
-		if llm.EstimateTokensMessages(candidate) > usable {
+		delta := llm.EstimateTokensMessages(rest[i : i+1])
+		if acc+delta > usable {
 			continue
 		}
-		kept = candidate
+		acc += delta
+		kept = append(kept, rest[i])
 	}
-	if len(kept) == 0 {
+	if len(kept) == 0 && len(rest) > 0 {
+		// Nothing fit; keep the newest message so the model still
+		// has some context (old code did the same).
 		kept = []llm.ChatMessage{rest[len(rest)-1]}
+	}
+	// kept is newest-first (appended from the tail); reverse it back
+	// to chronological order.
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
 	}
 	*msgs = append([]llm.ChatMessage{sysMsg}, kept...)
 }

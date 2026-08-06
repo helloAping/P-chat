@@ -331,10 +331,22 @@ func buildConversationContinuitySection() string {
 	sb.WriteString("Your goal is to complete the task, not merely report status.\n\n")
 	sb.WriteString("When a tool call fails:\n")
 	sb.WriteString("1. Read the error message carefully — identify the root cause\n")
-	sb.WriteString("2. Try an alternative approach using different tools or parameters\n")
+	// T5: harden the anti-repeat guidance. The 2026-08 my-blog session
+	// re-ran the same failing go test command 810 times across 51
+	// auto-resumes; the prompt must forbid repeating the same command
+	// and force a different approach after 2 consecutive failures.
+	sb.WriteString("2. Do NOT retry the same command repeatedly — after the FIRST failure switch your approach (different tool, different parameters, or smaller steps). After 2 consecutive failures of the SAME command, you MUST switch to a different approach entirely\n")
 	sb.WriteString("3. After 3 consecutive failures on the same task, use `question` to ask the user for guidance\n")
 	sb.WriteString("4. A tool failure does NOT mean the task is impossible — keep going\n")
 	sb.WriteString("5. NEVER end a turn with only a status summary after a tool error — always propose or attempt the next step\n\n")
+	// T5 (bilingual, 中文 → English): the incident model (deepseek) is
+	// Chinese-native; the concise Chinese mirror carries these rules
+	// stronger than the English list alone. Kept to three lines so the
+	// prompt does not bloat.
+	sb.WriteString("工具失败处理（Tool failure handling）：\n")
+	sb.WriteString("- 工具执行失败时，立即换思路（换工具 / 换参数 / 拆解为更小步骤），不要反复重试同一命令；连续失败 2 次必须换方式。\n")
+	sb.WriteString("- `go test ./...` 输出 `[no test files]` 是正常信息，不是错误，不要把它当成失败反复重试。\n")
+	sb.WriteString("- Windows 下优先用 `type`（读文件）/ `findstr`（搜文本），注意 findstr 的 `/C:` 参数写法，避免 shell 兼容问题。\n\n")
 	sb.WriteString("## Code Exploration & Context Management\n\n")
 	sb.WriteString("Explore unfamiliar code incrementally — read only what you need, then decide. ")
 	sb.WriteString("Your context is a finite resource: dumping whole files into it makes every later turn slower and degrades your judgment.\n\n")
@@ -359,8 +371,8 @@ func buildConversationContinuitySection() string {
 	sb.WriteString("the extension may reconnect. Retry once; if it fails again, tell the user the browser extension disconnected ")
 	sb.WriteString("and ask whether to wait, re-establish the connection, or continue without browser tools\n")
 	sb.WriteString("- `browser_screenshot` captures the viewport and the picture is automatically delivered as a " +
-		"follow-up image message so you can see it directly (requires vision). If the picture doesn't appear or the " +
-		"model doesn't support vision, fall back to `browser_snapshot` (text-based, no image payload)\n")
+		"follow-up image message so you can see it directly (requires vision). Text-only models do NOT get " +
+		"browser_screenshot in their tool list — use `browser_extract` to read the rendered page text instead\n")
 	sb.WriteString("- `browser_snapshot` returns too few elements (e.g. SPA page where content is dynamic divs, not interactive elements) → ")
 	sb.WriteString("use `browser_extract` to get all visible rendered text content\n")
 	sb.WriteString("- Reading page content on a SPA / JavaScript-heavy site → ")

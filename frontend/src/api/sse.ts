@@ -76,6 +76,28 @@ export function shouldRetryStreamError(error: unknown): boolean {
   return streamErrorStatus(error) !== 409
 }
 
+// isDuplicateClientMessageError reports whether `error` is the
+// "the server already accepted this exact user message" response
+// the idempotency check emits as HTTP 409. The retry layer MUST
+// treat this as a non-error: the request was accepted the first
+// time, the SSE connection just died before any `done` event
+// reached the client. The transport surfaces it as a stream drop
+// (with reason 'duplicate_client_message') so conversationTurn.ts
+// can run the snapshot recovery path — without this, a dropped
+// mid-handshake connection used to surface as a hard
+// "发送失败: HTTP 409" toast and the user had to re-type.
+//
+// We match on the JSON `code` substring instead of fully parsing
+// the body to keep this synchronous and zero-dependency (the body
+// can be large on some proxies). The token is server-defined and
+// stable: see internal/server/messages.go's `duplicate_client_message`.
+export function isDuplicateClientMessageError(error: unknown): boolean {
+  const status = streamErrorStatus(error)
+  if (status !== 409) return false
+  const message = String((error as any)?.message ?? error ?? '')
+  return message.includes('"duplicate_client_message"')
+}
+
 // abortableDelay waits for retry backoff without outliving a user stop.
 // It returns true when the timer elapsed and false when the signal aborted.
 export function abortableDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
@@ -106,38 +128,49 @@ function readWithIdleTimeout(
 ): Promise<ReadableStreamReadResult<Uint8Array>> {
   return new Promise((resolve, reject) => {
     let settled = false
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const clear = () => {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+    // Named handler so we can removeEventListener on EVERY settle path.
+    // A `{ once: true }` listener is only removed when the signal FIRES —
+    // on a normally-completing stream (never aborted) it would otherwise
+    // stay registered forever, one per read, each pinning its Promise and
+    // the resolved Uint8Array chunk. That accumulation is a real leak:
+    // a long multi-round SSE turn (thousands of chunks) grew ~28k
+    // listeners + Promises + ArrayBuffers in the webview heap (see
+    // heap snapshot 2026-08-04, AbortSignal had 10× ~2.8k listeners).
+    const onAbort = () => {
       if (settled) return
       settled = true
+      clear()
+      resolve({ done: true, value: undefined } as ReadableStreamReadResult<Uint8Array>)
+    }
+    timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener('abort', onAbort)
       if (signal?.aborted) return
       reader.cancel().catch(() => {})
       reject(makeIdleError())
     }, idleTimeoutMs)
-    const clear = () => clearTimeout(timer)
     reader.read().then(
       (r) => {
         if (settled) return
         settled = true
         clear()
+        signal?.removeEventListener('abort', onAbort)
         resolve(r)
       },
       (e) => {
         if (settled) return
         settled = true
         clear()
+        signal?.removeEventListener('abort', onAbort)
         reject(e)
       },
     )
-    signal?.addEventListener(
-      'abort',
-      () => {
-        if (settled) return
-        settled = true
-        clear()
-        resolve({ done: true, value: undefined } as ReadableStreamReadResult<Uint8Array>)
-      },
-      { once: true },
-    )
+    signal?.addEventListener('abort', onAbort, { once: true })
   })
 }
 

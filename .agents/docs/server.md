@@ -130,6 +130,34 @@ SendMessage 和 Regenerate 共享的 SSE 写循环：
 设 header + 写 `data: <json>\nid: <N>\n\n`（P3-1 顺序）+ 强制 Flush。
 新增 SSE 端点应复用此函数，避免重复实现。
 
+签名 `respondSSE(c, stream, sessionID, provider, model, retryNotice) turnStreamResult`：
+
+- 返回值告诉 `SendMessage` 流是怎么结束的：
+  - `turnStreamEnded` — 已发出终止帧（done / error）或非可重试原因关闭 → 结束回合
+  - `turnStreamRetry` — 流在**没有**终止帧的情况下因 `MaxTurnSeconds` 截止时间被切断，
+    且 `retryNotice` 非空 → `SendMessage` 重新加载已持久化的部分会话、注入一条
+    "继续"用户消息、以全新预算重跑 agent loop
+- 重试分支条件：`c.Request.Context().Err()` 是 `context.DeadlineExceeded` **且**
+  `retryNotice != ""`。用户取消 / cancel-stream（`context.Canceled`）不会重试。
+- `retryNotice` 为空（如 Regenerate 显式重新生成）→ 保留旧行为，直接输出
+  `turn_timeout` 终止错误帧。
+
+#### 回合超时自动重试 (2026-08)
+
+`limits.max_turn_retries`（默认 2，0 = 关闭）控制超时后的服务端自动续跑：
+
+- 每次重试 = 重新 `loadHistoryForSend`（能看到上一 attempt 已持久化的完成轮次）
+  + 追加一条 `agent.BuildTurnTimeoutResumePrompt` 的 "继续" 用户消息
+  + 全新 `MaxTurnSeconds` 预算；`ClientMsgID=0`（不重复 pin 用户行）、
+    `Attachments=nil`（首轮已展开持久化）、`TodoMode=resume`（保留任务链）
+- nudge 文案按"是否有活动 todo"分支（`agent.BuildTurnTimeoutResumePrompt`）：
+  有 todo 时锚定到 todo 列表执行（复核 in_progress → 续跑 pending → 必须沿用
+  原 ID 只更新 status / 不新建 todo_list / 全部 done| cancelled 才总结）；
+  无 todo 时退化为纯 "继续"
+- 整条重试序列在**同一个 HTTP 请求 / 同一个 SSE 流**内完成，`sessionLocks`
+  全程持有，前端看到一条连续流（中间一个 `phase` 通知 + `session_status: "retry"`）
+- 重试耗尽后（或非截止时间中断）才输出 "回合超出最长执行时间被终止" 终止帧
+
 #### ContextInspector (P2-3)
 
 `GET /api/v1/sessions/:id/context` — 返回 `{session_id, provider, model,

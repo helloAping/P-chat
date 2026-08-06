@@ -130,6 +130,160 @@ func TestBuildAutoContinuePrompt_OnlyPending(t *testing.T) {
 	}
 }
 
+// TestBuildTurnTimeoutResumePrompt_WithTodos verifies the timeout-retry
+// nudge anchors the model to the todo list: in_progress items listed
+// first, the mandatory todo_write contract present (original IDs, only
+// status updates, no new list, no skipping), and the "summarise only
+// once every todo is terminal" rule.
+func TestBuildTurnTimeoutResumePrompt_WithTodos(t *testing.T) {
+	sid := "turn-timeout-resume-with-todos"
+	tool.SetSessionTodos(sid, []tool.TodoItem{
+		{ID: "b", Content: "第二项", Status: "in_progress"},
+		{ID: "c", Content: "第三项", Status: "pending"},
+		{ID: "a", Content: "第一项", Status: "in_progress"},
+	})
+	t.Cleanup(func() { tool.SetSessionTodos(sid, nil) })
+
+	prompt := BuildTurnTimeoutResumePrompt(sid)
+
+	if !strings.Contains(prompt, "继续") {
+		t.Error("prompt missing the '继续' semantics")
+	}
+	for _, want := range []string{"[a]", "[b]", "[c]"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing todo item %q", want)
+		}
+	}
+	// in_progress items must appear before pending ones.
+	ipIdx := strings.Index(prompt, "[b]")
+	pIdx := strings.Index(prompt, "[c]")
+	if ipIdx < 0 || pIdx < 0 {
+		t.Fatalf("prompt missing in_progress item (idx=%d) or pending item (idx=%d)", ipIdx, pIdx)
+	}
+	if ipIdx >= pIdx {
+		t.Errorf("in_progress item should appear before pending item (ipIdx=%d, pIdx=%d)", ipIdx, pIdx)
+	}
+	// Mandatory todo contract phrases.
+	for _, want := range []string{"原 ID", "只更新 status", "不要创建新的 todo_list", "`done`", "`cancelled`", "不要只发文本总结就停止"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing contract phrase %q", want)
+		}
+	}
+}
+
+// TestBuildTurnTimeoutResumePrompt_NoTodos verifies the retry nudge
+// degrades to a plain "继续" with no todo contract when the session has
+// no active todos.
+func TestBuildTurnTimeoutResumePrompt_NoTodos(t *testing.T) {
+	prompt := BuildTurnTimeoutResumePrompt("turn-timeout-resume-no-todos")
+
+	if !strings.Contains(prompt, "继续") {
+		t.Error("prompt missing the '继续' semantics")
+	}
+	for _, forbid := range []string{"todo_write", "todo_list", "原 ID", "in_progress"} {
+		if strings.Contains(prompt, forbid) {
+			t.Errorf("no-todo prompt should NOT contain %q, got: %q", forbid, prompt)
+		}
+	}
+}
+
+// TestBuildAutoResumePrompt_NamesTask verifies the generalized interrupt
+// resume nudge (used for LLM errors / stream stalls, not just deadline
+// timeouts) names the first unfinished task as "继续完成“<任务名>”" and
+// still carries the full todo contract + in_progress-first ordering.
+func TestBuildAutoResumePrompt_NamesTask(t *testing.T) {
+	sid := "auto-resume-names-task"
+	tool.SetSessionTodos(sid, []tool.TodoItem{
+		{ID: "p1", Content: "排查剩余测试失败", Status: "pending"},
+		{ID: "p2", Content: "修复 TestTrimDaily", Status: "in_progress"},
+	})
+	t.Cleanup(func() { tool.SetSessionTodos(sid, nil) })
+
+	prompt := BuildAutoResumePrompt(sid, "上游长时间无响应")
+
+	// The nudge must name the first unfinished task (in_progress first).
+	if !strings.Contains(prompt, "继续完成“修复 TestTrimDaily”") {
+		t.Errorf("prompt does not name the task to continue, got: %q", prompt)
+	}
+	// Reason is surfaced.
+	if !strings.Contains(prompt, "上游长时间无响应") {
+		t.Errorf("prompt does not surface the interrupt reason, got: %q", prompt)
+	}
+	// Contract still present.
+	for _, want := range []string{"原 ID", "只更新 status", "`done`", "不要只发文本总结就停止"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing contract phrase %q", want)
+		}
+	}
+	// in_progress item listed before pending.
+	ipIdx := strings.Index(prompt, "[p2]")
+	pIdx := strings.Index(prompt, "[p1]")
+	if ipIdx < 0 || pIdx < 0 {
+		t.Fatalf("prompt missing todo rows (p2@%d p1@%d)", ipIdx, pIdx)
+	}
+	if ipIdx >= pIdx {
+		t.Errorf("in_progress item should precede pending (ipIdx=%d, pIdx=%d)", ipIdx, pIdx)
+	}
+}
+
+// TestBuildAutoResumePrompt_NoTodos verifies the generalized nudge degrades
+// to a plain "继续" when there are no unfinished todos.
+func TestBuildAutoResumePrompt_NoTodos(t *testing.T) {
+	prompt := BuildAutoResumePrompt("auto-resume-no-todos", "中断")
+	if !strings.Contains(prompt, "继续") {
+		t.Error("no-todo prompt missing '继续' semantics")
+	}
+	for _, forbid := range []string{"todo_write", "todo_list", "原 ID"} {
+		if strings.Contains(prompt, forbid) {
+			t.Errorf("no-todo prompt should NOT contain %q, got: %q", forbid, prompt)
+		}
+	}
+}
+
+// TestHasPendingTodos verifies the server-facing gate: true only when a
+// session has pending/in_progress todos; false for empty/unknown sessions
+// and for sessions whose todos are all done/cancelled.
+func TestHasPendingTodos(t *testing.T) {
+	if HasPendingTodos("") {
+		t.Error("HasPendingTodos('') should be false")
+	}
+	if HasPendingTodos("has-pending-nonexistent") {
+		t.Error("unknown session should have no pending todos")
+	}
+	sid := "has-pending-todos"
+	tool.SetSessionTodos(sid, []tool.TodoItem{
+		{ID: "a", Content: "done item", Status: "done"},
+		{ID: "b", Content: "cancelled item", Status: "cancelled"},
+	})
+	if HasPendingTodos(sid) {
+		t.Error("all-terminal todos should report no pending work")
+	}
+	tool.SetSessionTodos(sid, []tool.TodoItem{
+		{ID: "a", Content: "done item", Status: "done"},
+		{ID: "b", Content: "in-flight item", Status: "in_progress"},
+	})
+	if !HasPendingTodos(sid) {
+		t.Error("an in_progress todo should report pending work")
+	}
+	tool.SetSessionTodos(sid, nil)
+}
+
+// TestIsRetryableErrorKind verifies the server-facing gate: transient kinds
+// (rate_limit / server_error / network / timeout) resume; permanent kinds
+// and empty/unknown do not, so an unresolvable failure can't loop.
+func TestIsRetryableErrorKind(t *testing.T) {
+	for _, k := range []string{"rate_limit", "server_error", "network", "timeout"} {
+		if !IsRetryableErrorKind(k) {
+			t.Errorf("IsRetryableErrorKind(%q) = false, want true", k)
+		}
+	}
+	for _, k := range []string{"bad_request", "auth_error", "not_found", "vision_unsupported", "", "unknown"} {
+		if IsRetryableErrorKind(k) {
+			t.Errorf("IsRetryableErrorKind(%q) = true, want false", k)
+		}
+	}
+}
+
 // TestMaxAutoContinue_Is3 locks the constant at 3 so it
 // doesn't drift accidentally. 3 is a deliberate trade-off
 // (see docs/plans/auto-continue-plan.md §1.3 设计决策).

@@ -596,6 +596,22 @@ function messageKey(m: any, i: number): string | number {
   display: flex;
   flex-direction: column;
 }
+
+/* Messages are virtualized via CSS `content-visibility: auto`:
+ * the browser skips layout/paint for bubbles outside the
+ * viewport while keeping them in the DOM (so scroll position,
+ * infinite scroll, and the anchor FAB keep working unchanged).
+ * With the store's 300-message cap this bounds render cost the
+ * same way a JS virtual list would, without touching the
+ * scroll bookkeeping that JS virtualization would break.
+ *
+ * `contain-intrinsic-size` gives the browser a fallback size
+ * for skipped content so scrollbar/scrollHeight estimates stay
+ * sane before a bubble is first laid out. */
+.messages > * {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 220px;
+}
 .history-loading {
   text-align: center;
   font-size: 12px;

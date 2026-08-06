@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,7 +24,14 @@ type Attachment struct {
 	// ID is the server-side upload id (legacy path; the handler
 	// resolves it through AttachmentResolver). Optional when
 	// Data is set.
-	ID   string `json:"id"`
+	ID string `json:"id"`
+	// UploadID is the upload id the SPA posts for media
+	// attachments. The server stores "upl://<UploadID>" in the
+	// message row instead of base64, so the SQLite database holds
+	// a reference while the LLM context keeps the base64 bytes
+	// (re-read from disk). Mirrored into ID by
+	// UnmarshalJSON so the resolver path works unchanged.
+	UploadID string `json:"upload_id,omitempty"`
 	// Name is the original filename, used for the message bubble
 	// and for the system prompt's "## Uploaded Attachments"
 	// section.
@@ -49,6 +57,22 @@ type Attachment struct {
 	// is non-empty.
 	Data string `json:"data,omitempty"`
 	URL  string `json:"url,omitempty"`
+}
+
+// UnmarshalJSON mirrors UploadID into ID so the resolver path
+// (which keys off a.ID) works for the SPA's upload_id payload
+// without every call site branching on both fields.
+func (a *Attachment) UnmarshalJSON(b []byte) error {
+	type alias Attachment
+	var raw alias
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*a = Attachment(raw)
+	if a.ID == "" && a.UploadID != "" {
+		a.ID = a.UploadID
+	}
+	return nil
 }
 
 // AttachmentResolver turns an Attachment into the actual file
@@ -175,6 +199,7 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 				Content:     base64.StdEncoding.EncodeToString(data),
 				Name:        a.Name,
 				MimeType:    mime,
+				UploadID:    a.UploadID,
 				MsgType:     llm.MsgTypeImage,
 				SubmitToLLM: 1,
 			})
@@ -268,6 +293,13 @@ func saveToWorkspace(name string, data []byte) (string, bool) {
 // Inlined data (URL or Data field) is preferred; otherwise the
 // resolver is used to read from disk.
 func resolveAttachmentData(a Attachment, r AttachmentResolver) ([]byte, string) {
+	// Normalize the SPA's upload_id onto ID so the resolver path
+	// works regardless of whether the Attachment was built by
+	// UnmarshalJSON (which mirrors the fields) or by a struct
+	// literal in tests/callers.
+	if a.ID == "" && a.UploadID != "" {
+		a.ID = a.UploadID
+	}
 	inlineRaw := a.Data
 	if a.URL != "" {
 		inlineRaw = a.URL

@@ -34,6 +34,13 @@ type ChatMessage struct {
 	// ── attachment metadata (type = image / audio / file) ──
 	Name     string `json:"name,omitempty"`      // original filename
 	MimeType string `json:"mime_type,omitempty"` // image/png, audio/mp3, ...
+	// UploadID is the server-side upload id for a media message
+	// whose bytes live in ~/.p-chat/uploads. When set, the
+	// message's Content is persisted as "upl://<UploadID>" instead
+	// of base64 (the DB holds a reference, not the bytes); the
+	// LLM context keeps the base64 form, re-read from disk on
+	// load. Never sent to the LLM wire.
+	UploadID string `json:"upload_id,omitempty"`
 
 	// ── tool metadata (type = tool_call / tool_result) ──
 	ToolID    string `json:"tool_id,omitempty"`    // matches tool_use.id ↔ tool_result.tool_use_id

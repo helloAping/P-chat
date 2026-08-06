@@ -6,6 +6,7 @@ import {
   consumeSSEStream,
   decodeStreamEvent,
   emitStreamEvent,
+  isDuplicateClientMessageError,
   parseSSEFrame,
   shouldRetryStreamError,
   streamErrorStatus,
@@ -181,4 +182,32 @@ test('consumeSSEStream drops buffered events after cancellation', async () => {
   })
 
   assert.deepEqual(events, [{ type: 'content', content: 'first', seq: 1 }])
+})
+
+test('isDuplicateClientMessageError matches only the idempotency 409', () => {
+  // Server-side exact body shape — keep this in sync with
+  // internal/server/messages.go's SendMessage handler.
+  const dup = new Error(
+    'stream: stream POST http://127.0.0.1/messages: HTTP 409: ' +
+      '{"error":"this client message has already been accepted; recover the existing reply instead of resending it","code":"duplicate_client_message"}',
+  )
+  // Other 409s (e.g. session-busy lock) must NOT be absorbed —
+  // they keep the current "throw and let shouldRetryStreamError
+  // short-circuit" behaviour.
+  const busy = new Error('stream: HTTP 409: {"error":"a message is already being processed for this session"}')
+  // Non-409s obviously stay non-duplicates.
+  const network = new Error('stream: network gone')
+  const http500 = new Error('stream: HTTP 500: oops')
+
+  assert.equal(isDuplicateClientMessageError(dup), true)
+  assert.equal(isDuplicateClientMessageError(busy), false)
+  assert.equal(isDuplicateClientMessageError(network), false)
+  assert.equal(isDuplicateClientMessageError(http500), false)
+  assert.equal(isDuplicateClientMessageError(null), false)
+  assert.equal(isDuplicateClientMessageError(undefined), false)
+  // The retry layer's existing 409-skip rule still applies for
+  // non-duplicate 409s (it lives one layer up in streamMessagesRetry),
+  // so we don't need to re-test that here.
+  assert.equal(shouldRetryStreamError(dup), false)
+  assert.equal(shouldRetryStreamError(busy), false)
 })

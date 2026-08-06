@@ -42,6 +42,23 @@ func TestEstimateTokensMessagesIncludesToolFields(t *testing.T) {
 	}
 }
 
+func TestEstimateTokensBytesMatchesStringVariant(t *testing.T) {
+	cases := []string{
+		"",
+		"hello",
+		"用户发布菜谱有两种选项",
+		`{"type":"object","properties":{"command":{"type":"string"},"dry_run":{"type":"boolean"}}}`,
+		"mixed ASCII + 中文 + 123456",
+	}
+	for _, c := range cases {
+		want := EstimateTokens(c)
+		got := EstimateTokensBytes([]byte(c))
+		if got != want {
+			t.Errorf("EstimateTokensBytes(%q) = %d, EstimateTokens = %d", c, got, want)
+		}
+	}
+}
+
 func TestUsableContextUsesConservativeUnknownModelFallback(t *testing.T) {
 	if DefaultContextWindow != 64_000 {
 		t.Fatalf("DefaultContextWindow = %d, want 64000", DefaultContextWindow)

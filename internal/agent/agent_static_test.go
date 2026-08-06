@@ -381,6 +381,155 @@ func TestModelSupportsVision_Config(t *testing.T) {
 	}
 }
 
+// TestModelExplicitlySupportsVision locks down the strict opt-in
+// used to gate browser_screenshot. Unlike modelSupportsVision, this
+// never consults the heuristic — `capabilities: {}` reads as
+// text-only, so a screenshot's ~100KB+ base64 payload is never
+// injected into the LLM request for a model that can't see it.
+func TestModelExplicitlySupportsVision(t *testing.T) {
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Providers: []config.ProviderConfig{
+				{
+					Name:     "cs",
+					Protocol: "openai",
+					Models: []config.ModelConfig{
+						// Text-only by default (capabilities: {}).
+						{Name: "deepseek-v4-flash", Default: true, Capabilities: config.Capabilities{}},
+						// Explicit opt-in → vision.
+						{Name: "mimo-v2.5", Capabilities: config.Capabilities{SupportsVision: true}},
+						{Name: "minimax-m3", Capabilities: config.Capabilities{SupportsVision: true}},
+					},
+				},
+			},
+		},
+	}
+	a := &Agent{cfg: cfg}
+
+	cases := []struct {
+		provider, model string
+		want            bool
+	}{
+		// Explicit supports_vision: true → true.
+		{"cs", "mimo-v2.5", true},
+		{"cs", "minimax-m3", true},
+		// capabilities: {} → false even though the heuristic would
+		// recognise deepseek-v4-flash as vision-capable.
+		{"cs", "deepseek-v4-flash", false},
+		// Model not listed under a known provider → false.
+		{"cs", "gpt-4o", false},
+		// Provider not in config at all → false.
+		{"unknown", "mimo-v2.5", false},
+		// No config at all → false.
+	}
+	for _, c := range cases {
+		got := a.modelExplicitlySupportsVision(c.provider, c.model)
+		if got != c.want {
+			t.Errorf("modelExplicitlySupportsVision(%q, %q) = %v, want %v", c.provider, c.model, got, c.want)
+		}
+	}
+
+	if (&Agent{}).modelExplicitlySupportsVision("cs", "mimo-v2.5") {
+		t.Error("modelExplicitlySupportsVision with nil cfg should be false")
+	}
+}
+
+// TestFilterVisionTools verifies browser_screenshot is dropped from
+// a text-only model's tool list while all other tools survive. This
+// is the seam that prevents a ~100KB base64 screenshot payload from
+// being injected into a model that can't see it.
+func TestFilterVisionTools(t *testing.T) {
+	all := []tool.Tool{
+		{Name: "browser_navigate"},
+		{Name: "browser_screenshot"},
+		{Name: "browser_extract"},
+		{Name: "read_file"},
+		{Name: "exec_command"},
+	}
+	got := filterVisionTools(all)
+	want := []string{"browser_navigate", "browser_extract", "read_file", "exec_command"}
+	if len(got) != len(want) {
+		t.Fatalf("filterVisionTools len = %d, want %d (%+v)", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Errorf("filterVisionTools[%d] = %q, want %q", i, got[i].Name, w)
+		}
+	}
+	// Input must not be mutated.
+	if len(all) != 5 || all[1].Name != "browser_screenshot" {
+		t.Error("filterVisionTools mutated the input slice")
+	}
+}
+
+// TestVisionGatedTools mirrors the user's real config.json: the "cs"
+// provider with deepseek-v4-flash (capabilities: {} → text-only by
+// the strict rule) and mimo-v2.5 / minimax-m3 (explicitly
+// supports_vision: true). It verifies the full gate that decides
+// whether browser_screenshot is available for the active model.
+func TestVisionGatedTools(t *testing.T) {
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Providers: []config.ProviderConfig{
+				{
+					Name:     "cs",
+					Protocol: "openai",
+					Models: []config.ModelConfig{
+						{Name: "deepseek-v4-flash", Default: true, Capabilities: config.Capabilities{}},
+						{Name: "mimo-v2.5", Capabilities: config.Capabilities{SupportsVision: true}},
+						{Name: "minimax-m3", Capabilities: config.Capabilities{SupportsVision: true}},
+					},
+				},
+			},
+		},
+	}
+	a := &Agent{cfg: cfg}
+
+	base := []tool.Tool{
+		{Name: "browser_navigate"},
+		{Name: "browser_screenshot"},
+		{Name: "browser_extract"},
+		{Name: "browser_snapshot"},
+		{Name: "read_file"},
+	}
+	hasShot := func(tools []tool.Tool) bool {
+		for _, t := range tools {
+			if t.Name == "browser_screenshot" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Text-only model: screenshot dropped, everything else kept.
+	got := a.visionGatedTools("cs", "deepseek-v4-flash", base)
+	if hasShot(got) {
+		t.Error("deepseek-v4-flash (capabilities: {}) must NOT get browser_screenshot")
+	}
+	if len(got) != 4 {
+		t.Errorf("deepseek-v4-flash got %d tools, want 4 (%+v)", len(got), got)
+	}
+
+	// Vision models: screenshot stays.
+	for _, m := range []string{"mimo-v2.5", "minimax-m3"} {
+		got := a.visionGatedTools("cs", m, base)
+		if !hasShot(got) {
+			t.Errorf("%s (supports_vision: true) must keep browser_screenshot", m)
+		}
+		if len(got) != 5 {
+			t.Errorf("%s got %d tools, want 5", m, len(got))
+		}
+	}
+
+	// Unknown model / provider: conservative deny.
+	if hasShot(a.visionGatedTools("cs", "some-unknown-model", base)) {
+		t.Error("unknown model must not get browser_screenshot")
+	}
+	if hasShot(a.visionGatedTools("unknown-provider", "mimo-v2.5", base)) {
+		t.Error("unknown provider must not get browser_screenshot")
+	}
+}
+
 // TestToolCallSignature covers the helper used by the
 // stuck-loop guard. Same (name, args) → same signature; order
 // doesn't matter (sort stable); empty input → empty signature

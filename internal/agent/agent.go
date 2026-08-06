@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -103,6 +104,11 @@ type Agent struct {
 	// rules dir). The field lets buildStaticSystemPrompt
 	// detect a project switch and invalidate the cache.
 	lastProjectRoot string
+
+	// breakers holds the T4 cross-turn tool-failure breaker state,
+	// keyed by session id. Auto-resume turns accumulate into it across
+	// turn boundaries; a genuine user message resets it. See breaker.go.
+	breakers sync.Map
 }
 
 // SetChatOptions overrides the per-request sampling parameters
@@ -300,6 +306,64 @@ func (a *Agent) modelSupportsVision(providerName, modelName string) bool {
 	}
 	// Provider not found in config: same deny-by-default.
 	return visionCapableByHeuristic(providerName, modelName)
+}
+
+// modelExplicitlySupportsVision reports whether the active
+// (provider, model) pair is *explicitly* marked vision-capable via
+// `capabilities: { supports_vision: true }` in the config.
+//
+// Unlike modelSupportsVision, this is a strict opt-in: it never
+// consults the heuristic, and "no opinion" (capabilities: {} or
+// capabilities absent) reads as text-only. Used to gate tools whose
+// value depends on the model seeing an image (browser_screenshot) —
+// a screenshot is only worth taking (and only worth the ~100KB+
+// base64 payload in the LLM request) when the model is confirmed to
+// accept image input. Text-only models get browser_extract instead,
+// which returns the rendered page text without needing vision.
+func (a *Agent) modelExplicitlySupportsVision(providerName, modelName string) bool {
+	if a.cfg == nil {
+		return false
+	}
+	for _, p := range a.cfg.LLM.Providers {
+		if p.Name != providerName {
+			continue
+		}
+		for _, m := range p.Models {
+			if m.Name == modelName {
+				return m.Capabilities.SupportsVision
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// filterVisionTools removes browser_screenshot from a tool list. The
+// screenshot's only value is the base64 image it injects into the
+// LLM request — meaningless for a text-only model — so text-only
+// models get browser_extract (rendered page text) instead. All other
+// tools pass through untouched.
+func filterVisionTools(tools []tool.Tool) []tool.Tool {
+	out := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		if t.Name == "browser_screenshot" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// visionGatedTools drops browser_screenshot from a tool list unless
+// the active (provider, model) pair is explicitly marked
+// vision-capable. Convenience wrapper used at tool-load time in
+// ChatWithTools so the screenshot tool and the injection logic stay
+// in lockstep.
+func (a *Agent) visionGatedTools(providerName, modelName string, tools []tool.Tool) []tool.Tool {
+	if a.modelExplicitlySupportsVision(providerName, modelName) {
+		return tools
+	}
+	return filterVisionTools(tools)
 }
 
 // visionCapableByHeuristic returns a best-guess vision
@@ -535,8 +599,18 @@ type ChatStreamChunk struct {
 	// The frontend prefers ToolResultFull over ToolResult when
 	// it's present.
 	ToolResultFull string `json:"tool_result_full,omitempty"`
-	ToolError      string `json:"tool_error,omitempty"`
-	ToolElapsed    string `json:"tool_elapsed,omitempty"`
+	// ToolResultTruncated is true when the tool result exceeded
+	// MaxToolResultFullBytes and ToolResultFull was NOT sent (the
+	// frontend shows a "查看完整输出" affordance and fetches the
+	// full body on demand). Empty ToolResultFull with this flag set
+	// means "full body exists server-side, ask for it".
+	ToolResultTruncated bool `json:"tool_result_truncated,omitempty"`
+	// ToolResultFullLen is the byte length of the untruncated
+	// result, surfaced so the frontend can label the affordance
+	// ("完整输出 1.2 MB") without a round-trip.
+	ToolResultFullLen int    `json:"tool_result_full_len,omitempty"`
+	ToolError         string `json:"tool_error,omitempty"`
+	ToolElapsed       string `json:"tool_elapsed,omitempty"`
 	// Structured tool result fields supplement the legacy ToolResult preview.
 	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
 	ToolSummary      string   `json:"tool_summary,omitempty"`
@@ -902,6 +976,16 @@ func attachToolResultMetadata(chunk *ChatStreamChunk, result *tool.CallResult) {
 // closure captures the local counter variable by reference. The
 // returned value is whatever the closure yields, typically
 // `seqCounter.Add(1) - 1` for the standard 0,1,2,… sequence.
+// sendOrDropTimeout bounds how long a non-terminal chunk may block
+// on a full channel before being dropped. A consumer that stops
+// reading (frozen renderer) must not wedge the agent loop for the
+// full MaxTurnSeconds — dropping intermediate events is a visual
+// hiccup, holding the turn hostage is not. Terminal chunks (Done /
+// SessionStatus) deliberately bypass the timeout: losing them
+// corrupts the turn's lifecycle, so they keep blocking (the SSE
+// write-timeout in respondSSE is the backstop for those).
+const sendOrDropTimeout = 30 * time.Second
+
 func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, chunk ChatStreamChunk) {
 	if nextSeq != nil {
 		chunk.Seq = nextSeq()
@@ -911,9 +995,18 @@ func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() u
 			chunk.TraceID = tid
 		}
 	}
+	if chunk.Done || chunk.SessionStatus != "" {
+		select {
+		case ch <- chunk:
+		case <-ctx.Done():
+		}
+		return
+	}
 	select {
 	case ch <- chunk:
 	case <-ctx.Done():
+	case <-time.After(sendOrDropTimeout):
+		log.Printf("sendOrDrop: dropped chunk (type=%q phase=%q) after %s — consumer not reading", chunk.Phase, chunk.Step, sendOrDropTimeout)
 	}
 }
 
@@ -972,6 +1065,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// when the user reopens the session.
 		partsAcc := newPartsAccumulator()
 		todoMode := todoModeFromRequest(req.TodoMode)
+		// T4: per-session cross-turn tool-failure breaker. Auto-resume
+		// turns keep accumulating across turn boundaries (that is the
+		// fix for the my-blog dead-loop, where local counters reset
+		// every turn); a genuine user message resets the breaker so a
+		// new intent starts fresh and the breaker can recover.
+		var breaker *breakerState
+		if req.SessionID != "" {
+			v, _ := a.breakers.LoadOrStore(req.SessionID, &breakerState{})
+			breaker = v.(*breakerState)
+			if !isAutoResumeTurn(req) {
+				breaker.reset()
+			}
+		}
 		todoIncompleteSent := false
 		emitTodoIncomplete := func(reason string, round int) {
 			if todoIncompleteSent {
@@ -1060,6 +1166,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 			availableTools = filtered
 		}
+		// Gate browser_screenshot on the active model's vision
+		// capability. Screenshots only help the agent when the
+		// model can actually see the image; for a text-only
+		// model the ~100KB+ base64 payload is pure overhead (and
+		// a silent context-window tax). Text-only models fall
+		// back to browser_extract, which returns the rendered
+		// page's text without needing vision. Filtering here
+		// (before toolDefs / prompt / subagent wiring) keeps
+		// every downstream consumer consistent.
+		availableTools = a.visionGatedTools(req.Provider, req.Model, availableTools)
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -1119,8 +1235,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{SessionStatus: "busy"})
 
 		// Append compressed summary if provided (from /compress).
+		// T2: inject via appendSummaryInjection — replace any earlier
+		// block, cap the size — so the summary can never accumulate
+		// multiple copies inside one system message (the 2026-08-05
+		// my-blog dead-loop root cause, see summary_inject.go).
 		if req.CompressedSummary != "" {
-			systemPrompt += "\n\n[前文摘要]\n" + req.CompressedSummary
+			systemPrompt = appendSummaryInjection(systemPrompt, req.CompressedSummary)
 		}
 		// Append active skill context (from /skillname slash command).
 		if req.SkillContext != "" {
@@ -1220,6 +1340,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// This history row is already in storage.
 					continue
 				}
+				// Images uploaded via the SPA are persisted as a
+				// "upl://<id>" reference instead of base64: the
+				// bytes live in ~/.p-chat/uploads and the DB row
+				// stores only the pointer, keeping the database
+				// small and history loading cheap. Only the
+				// persisted copy is rewritten — the in-memory
+				// msgs keep the base64 the LLM request needs.
+				if m.UploadID != "" {
+					m.Content = "upl://" + m.UploadID
+				}
 				if pinnedUserID > 0 && m.Role == llm.RoleUser {
 					a.store.AddChatMessageToWithID(req.SessionID, m, pinnedUserID)
 					// Only the first user message gets the
@@ -1295,11 +1425,22 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// errored, we break out with a "stuck" event rather than
 		// letting the LLM hammer the same failing call forever.
 		var (
-			stuckStreak          int
-			prevToolSig          string
-			prevErrored          bool
-			sameToolErrName      string
-			sameToolErrCount     int
+			stuckStreak      int
+			prevToolSig      string
+			prevErrored      bool
+			sameToolErrName  string
+			sameToolErrCount int
+			// cumToolErrCount totals tool failures across the
+			// whole turn WITHOUT requiring identical signatures.
+			// The same-tool guard fires when the LLM repeats ONE
+			// failing call; this catches the "whack-a-mole" loop
+			// where each round tries a DIFFERENT failing command
+			// (e.g. `find` on Windows always failing, the model
+			// inventing a new variant every round) — the stuck
+			// guard's signature never repeats, so the turn would
+			// otherwise spin until the round cap or the wall-clock
+			// timeout.
+			cumToolErrCount      int
 			nearLimitWarningSent bool
 			// P0-3: auto-continue counter. Resets every
 			// user turn (declared outside the for loop,
@@ -1344,7 +1485,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				toolCalls           []nativeToolCall
 				argsAccum           = make(map[int]*nativeToolCall)
 				roundAnyToolErrored bool
-				streamBytes         int
+				// roundFailSigs collects the normalized signatures of
+				// this round's failing tool calls, fed to the T4
+				// cross-turn breaker after the round.
+				roundFailSigs []string
+				streamBytes   int
 			)
 
 			opts := a.options
@@ -1433,24 +1578,56 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 
 			// LLM stream with retry for recoverable errors
-			// (rate_limit, server_error, network, timeout).
-			const maxLLMRetries = 3
+			// (rate_limit, server_error, network, timeout). The
+			// backoff staircase comes from limits.llm_retry_backoffs
+			// (default [5, 60, 180, 300, 600]s); retry count =
+			// len(backoffs), total attempts = len(backoffs) + 1.
+			// Retries are detached from the turn budget: they run on a
+			// deadline-free abort context (cancelled only by
+			// cancel-stream / client disconnect), so a long backoff
+			// sequence is never truncated by MaxTurnSeconds. The
+			// initial attempt keeps the turn deadline as the hang
+			// backstop.
+			backoffs := llmRetryBackoffs(a.cfg)
+			maxAttempts := len(backoffs) + 1
 			var retryableErr error
+			// retryableErrKind remembers the classification of the last
+			// retryable failure so the "重试 N 次后仍然失败" terminal can
+			// carry an error_kind the server uses to decide auto-resume.
+			retryableErrKind := llm.KindUnknown
 			contextRecoveryUsed := false
+			// successAttempt records which attempt produced the reply
+			// (0 = the initial attempt). A reply that only arrived via a
+			// retry AFTER the turn deadline crossed is wrapped up
+			// gracefully instead of dispatching tools on an expired ctx.
+			successAttempt := 0
+			// retryCtx is deadline-free but still aborted by
+			// cancel-stream / client disconnect. Falls back to ctx
+			// (turn-deadline bound) when no abort context is attached.
+			retryCtx := ctx
+			if ac := AbortContextFrom(ctx); ac != nil {
+				retryCtx = ac
+			}
 		att:
-			for attempt := 1; attempt <= maxLLMRetries; attempt++ {
+			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				// attemptCtx is what this attempt's stream and
+				// cancellation checks run on: the initial attempt stays
+				// on the turn context (deadline backstop); retries move
+				// to the deadline-free abort context.
+				attemptCtx := ctx
 				if attempt > 1 {
-					backoff := time.Duration(attempt*attempt) * time.Second
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					attemptCtx = retryCtx
+					backoff := retryBackoffDuration(backoffs, attempt-1)
+					sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 						Phase:    "llm",
 						Step:     "retry",
-						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt, maxLLMRetries),
+						Message:  fmt.Sprintf("%s 后重试 (第 %d/%d 次)…", backoff, attempt-1, len(backoffs)),
 						Round:    roundNum,
 						MaxRound: maxRounds,
 					})
 					timer := time.NewTimer(backoff)
 					select {
-					case <-ctx.Done():
+					case <-retryCtx.Done():
 						timer.Stop()
 						return
 					case <-timer.C:
@@ -1475,21 +1652,80 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if needsNormalizedToolResults(req.Provider) {
 					msgsForLLM = normalizeToolResults(roundMsgsForLLM)
 				}
-				streamCtx, cancelStream := context.WithCancel(ctx)
+				// T1 (P0) request-time context-window convergence gate:
+				// never refuses — summary-replace → head-trim → truncate
+				// oversized content / trim tools → minimal set (see
+				// context_guard.go). tryAutoCompact has already run
+				// above; this guarantees the payload actually sent fits
+				// the usable window while keeping the conversation
+				// going. Compaction (level 1) runs only on the first
+				// attempt — it advances the compression point and is
+				// expensive; retries re-run only the cheap, idempotent
+				// truncation levels.
+				msgsForLLM, roundTools = a.ensureWithinWindow(retryCtx, msgsForLLM, roundTools, req, ch, nextSeq, roundNum, maxRounds, attempt == 1)
+				streamCtx, cancelStream := context.WithCancel(attemptCtx)
 				stream := a.llm.ChatStreamCM(streamCtx, req.Provider, req.Model, msgsForLLM, roundTools, opts)
 				streamOpen := true
+				// Per-attempt stall watchdog. The LLM client's own idle
+				// watchdog (default 120s) resets on ANY transport byte, so a
+				// proxy that pads a dead upstream with SSE keep-alive lines can
+				// keep this stream "open" forever — the select below would
+				// block until the turn deadline (MaxTurnSeconds) and the UI
+				// would show a permanently spinning tool / sub-agent card.
+				// This timer is a hard backstop: it fires on NO chunk for the
+				// stall window regardless of keep-alives, then retries (if
+				// attempts remain) or surfaces error+done. Tuned via
+				// limits.round_stream_stall_timeout (0 = default 180s).
+				stallTimeout := RoundStreamStallTimeout
+				if a.cfg != nil && a.cfg.Limits.RoundStreamStallSeconds > 0 {
+					stallTimeout = time.Duration(a.cfg.Limits.RoundStreamStallSeconds) * time.Second
+				}
+				stallTimer := time.NewTimer(stallTimeout)
+				defer stallTimer.Stop()
 				for streamOpen {
 					var chunk llm.StreamChunk
 					var ok bool
 					select {
-					case <-ctx.Done():
+					case <-attemptCtx.Done():
 						cancelStream()
 						return
 					case chunk, ok = <-stream:
 						if !ok {
+							stallTimer.Stop()
 							streamOpen = false
 							continue
 						}
+						// Any real chunk resets the stall window.
+						if !stallTimer.Stop() {
+							select {
+							case <-stallTimer.C:
+							default:
+							}
+						}
+						stallTimer.Reset(stallTimeout)
+					case <-stallTimer.C:
+						// No chunk at all for the stall window → the
+						// upstream is silent (mid-stream stall, e.g. the
+						// api-convert proxy dropping deepseek mid-response
+						// with no [DONE] and no close). Recover: retry while
+						// attempts remain (mirrors the retryable chunk.Err
+						// path), else terminate the round with error+done so
+						// the frontend never hangs on a spinning card.
+						stallTimer.Stop()
+						if attempt < maxAttempts && (attempt > 1 || ctx.Err() == nil) {
+							retryableErr = fmt.Errorf("LLM stream stalled: no data received for %s", stallTimeout)
+							retryableErrKind = llm.KindTimeout
+							cancelStream()
+							break // break inner stream loop → outer retries
+						}
+						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
+							Phase:     "llm",
+							Error:     fmt.Sprintf("LLM 流长时间无数据（%s），已终止本轮。上游可能已中断，请重试。", stallTimeout),
+							ErrorKind: llm.KindTimeout.String(),
+							Done:      true,
+						})
+						cancelStream()
+						return
 					}
 					if chunk.Err != nil {
 						classified := llm.ClassifyAPIError(req.Provider, chunk.Err)
@@ -1517,13 +1753,34 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 									break
 								}
 							}
-							if isRetryable(apiErr.Kind) && attempt < maxLLMRetries {
+							// Retry only while the turn is still live (for
+							// the initial attempt) — if the turn deadline
+							// fired at the same moment, the attempt's
+							// timeout error is a side effect of the abort,
+							// not an upstream failure worth retrying.
+							// Detached retries (attempt > 1, running on the
+							// deadline-free abort context) retry regardless.
+							if isRetryable(apiErr.Kind) && attempt < maxAttempts && (attempt > 1 || ctx.Err() == nil) {
 								retryableErr = chunk.Err
+								retryableErrKind = apiErr.Kind
 								cancelStream()
 								break // break inner stream loop, retry outer
 							}
 						}
-						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						// If the turn is already over (deadline / user cancel) during
+						// the INITIAL attempt, behave like the ctx.Done abort: return
+						// silently so respondSSE emits the turn_timeout frame. The
+						// stream error at that point is a side effect of the abort,
+						// not a real upstream failure — and emitting it here would
+						// make the deadline outcome depend on a select race.
+						if attempt == 1 && ctx.Err() != nil {
+							cancelStream()
+							return
+						}
+						// Emit on retryCtx (the deadline-free abort context) so a
+						// non-retryable error from a detached retry still reaches the
+						// client past the turn deadline.
+						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 							Phase:      "llm",
 							Error:      errMsg,
 							Suggestion: errSuggestion,
@@ -1535,6 +1792,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 					if chunk.Done {
 						retryableErr = nil
+						successAttempt = attempt
 						cancelStream()
 						break att // success — break outer loop too
 					}
@@ -1564,12 +1822,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if chunk.Content != "" {
 						fullContentBuilder.WriteString(chunk.Content)
 						partsAcc.update(ChatStreamChunk{Content: chunk.Content})
-						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
+						sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{Content: chunk.Content, TokensIn: totalIn, TokensOut: totalOut})
 					}
 					if chunk.Thinking != "" {
 						fullThinkingBuilder.WriteString(chunk.Thinking)
 						partsAcc.update(ChatStreamChunk{Thinking: chunk.Thinking})
-						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
+						sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{Thinking: chunk.Thinking, TokensIn: totalIn, TokensOut: totalOut})
 					}
 					if chunk.ToolCallDelta != nil {
 						tcd := chunk.ToolCallDelta
@@ -1593,12 +1851,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			fullContent := fullContentBuilder.String()
 			fullThinking := fullThinkingBuilder.String()
 
-			// If we exhausted retries without success, surface the last error.
+			// If we exhausted retries without success, surface the last
+			// error. Emit on retryCtx (the deadline-free abort context) so
+			// the "重试 N 次后仍然失败" terminal survives even when the
+			// turn deadline fired mid-retry.
 			if retryableErr != nil {
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-					Phase: "llm",
-					Error: fmt.Sprintf("重试 %d 次后仍然失败: %v", maxLLMRetries, retryableErr),
-					Done:  true,
+				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
+					Phase:     "llm",
+					Error:     fmt.Sprintf("重试 %d 次后仍然失败: %v", len(backoffs), retryableErr),
+					ErrorKind: retryableErrKind.String(),
+					Done:      true,
 				})
 				return
 			}
@@ -1659,6 +1921,26 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				SubmitToLLM: 1,
 			}
 			msgs = append(msgs, assistantMsg)
+
+			// Late-retry success past the turn budget: the retry phase is
+			// detached from MaxTurnSeconds, so a reply can land after the
+			// deadline fired. Wrap up gracefully instead of dispatching
+			// tools / starting a new round on an expired context — persist
+			// the reply and end with a done event.
+			if successAttempt > 1 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
+					Phase:     "done",
+					Step:      "done",
+					Message:   "回合执行预算已超出，重试恢复后直接收尾（本轮未执行工具）",
+					Round:     roundNum,
+					MaxRound:  maxRounds,
+					TokensIn:  totalIn,
+					TokensOut: totalOut,
+				})
+				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{Done: true})
+				return
+			}
 
 			// NOTE: per-round stripImageContent sweep removed.
 			// Image base64 is preserved verbatim in msgs so the LLM
@@ -1988,6 +2270,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						if ev.QuestionJSON != "" {
 							log.Printf("[forwarder] got question event (%d bytes)", len(ev.QuestionJSON))
 						}
+						// Truncated tool results produced inside a
+						// sub-agent are cached under the SUB-AGENT's
+						// session id, but the frontend fetches them
+						// with the parent session id — rekey the
+						// entry so "查看完整输出" resolves.
+						if ev.ToolResultTruncated && ev.ToolID != "" {
+							rekeyTruncatedResult(req.SessionID, ev.ToolID)
+						}
 						partsAcc.update(ev)
 						sendOrDrop(ctx, ch, nextSeq, ev)
 						if ev.QuestionJSON != "" {
@@ -2274,6 +2564,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 				if o.err != nil || o.result == nil {
 					roundAnyToolErrored = true
+					cumToolErrCount++
+					roundFailSigs = append(roundFailSigs, normalizeToolFailureSig(tc.Name, tc.ArgsJSON))
 					errMsg := "unknown error"
 					if o.result != nil {
 						errMsg = o.result.Content
@@ -2305,10 +2597,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 
 				result := o.result
-				resultPreview := result.Content
-				if len(resultPreview) > 300 {
-					resultPreview = resultPreview[:300] + "..."
-				}
+				resultPreview := truncatePreview(result.Content, 300)
 				resultPreview = strings.Map(func(r rune) rune {
 					if r == '\n' || r == '\r' {
 						return ' '
@@ -2324,6 +2613,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if result.IsError {
 					roundAnyToolErrored = true
+					cumToolErrCount++
+					roundFailSigs = append(roundFailSigs, normalizeToolFailureSig(tc.Name, tc.ArgsJSON))
 					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					attachToolResultMetadata(&warnChunk, result)
 					partsAcc.update(warnChunk)
@@ -2341,9 +2632,25 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// Tools that set RawFull (e.g. browser_screenshot)
 					// carry large payloads (base64) that must NOT enter
 					// the LLM context. RawFull is frontend-only.
+					//
+					// Large tool outputs are truncated before reaching
+					// the frontend: a multi-MB exec_command result
+					// parsed into the Vue reactive store balloons the
+					// JS heap (each string is deep-proxied and retained
+					// for the session's lifetime). The frontend shows
+					// a "查看完整输出" affordance and fetches the full
+					// body on demand.
 					if result.RawFull != "" {
 						okChunk.ToolResultFull = result.RawFull
 					} else if tc.Name == "todo_write" || tc.Name == "question" {
+						okChunk.ToolResultFull = result.Content
+					} else if len(result.Content) > MaxToolResultFullBytes {
+						okChunk.ToolResult = truncatePreview(result.Content, 300)
+						okChunk.ToolResultFull = ""
+						okChunk.ToolResultTruncated = true
+						okChunk.ToolResultFullLen = len(result.Content)
+						storeTruncatedResult(req.SessionID, tc.ID, result.Content)
+					} else {
 						okChunk.ToolResultFull = result.Content
 					}
 					partsAcc.update(okChunk)
@@ -2534,6 +2841,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				})
 			}
 
+			// T4: feed the cross-turn breaker with this round's failing
+			// signatures. The intra-turn guards below may fire and reset
+			// it; the cross-turn check at the end only fires when neither
+			// intra-turn guard did (so the user gets one clear message,
+			// not two).
+			if breaker != nil {
+				for _, sig := range roundFailSigs {
+					breaker.recordFailure(sig)
+				}
+			}
+
 			// Same-tool-name error counter: if a single tool
 			// errors N times in a row (even with different
 			// args — the stuck-loop guard only catches
@@ -2550,6 +2868,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			} else {
 				sameToolErrName = ""
 				sameToolErrCount = 0
+			}
+			// A tool round that made progress (at least one tool returned
+			// successfully) means the LLM moved on from the failing
+			// command — the cross-turn same-command streak must not carry
+			// over. Text-only rounds deliberately do NOT reset it: an
+			// interrupted turn often ends with a text reply after failed
+			// tool rounds, and the next auto-resume must still see the
+			// streak (that is the whole point of cross-turn accumulation).
+			if roundToolSucceeded && breaker != nil {
+				breaker.resetStreak()
 			}
 			if sameToolErrCount >= sameToolErrMax {
 				// P2-1: reset the stuck-loop guard too.
@@ -2572,6 +2900,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				statusMsg := fmt.Sprintf("%s 已连续失败 %d 次，改用其他方式。", sameToolErrName, sameToolErrCount)
 				resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
 				resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+				if breaker != nil {
+					// The intra-turn guard already told the LLM to stop;
+					// reset the cross-turn state so it does not fire a
+					// duplicate message in the same round.
+					breaker.reset()
+				}
 				msgs = append(msgs, llm.ChatMessage{
 					Role:    llm.RoleSystem,
 					Type:    llm.TypeText,
@@ -2583,6 +2917,82 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Message: statusMsg,
 					Round:   roundNum,
 				})
+			}
+
+			// Cumulative failure breaker: N total tool
+			// failures across the turn (each a DIFFERENT
+			// failing command) means the LLM is improvising
+			// around a broken premise — e.g. an explore
+			// sub-agent running `find` on Windows where
+			// every variant fails differently. The
+			// same-tool guard above can't see this
+			// (signatures differ); without this the turn
+			// spins until the round cap or the sub-agent
+			// wall-clock timeout. Inject a strong "stop,
+			// summarise what you have" instruction so the
+			// run ends with a usable partial answer instead
+			// of burning the whole timeout.
+			if cumToolErrCount >= CumToolErrMax {
+				cumToolErrCount = 0 // fire once
+				resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
+				resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+				if breaker != nil {
+					breaker.reset()
+				}
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: fmt.Sprintf("本回合已有 %d 次工具调用失败（每次都是不同的失败）。工具环境可能不可用（如 Windows 上执行了 Unix 命令）。请立即停止调用工具，基于已获取的信息给出最终总结。", CumToolErrMax),
+				})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:   "limit",
+					Step:    "cum-tool-err-limit",
+					Message: fmt.Sprintf("累计 %d 次工具失败（各不相同），强制转为总结。", CumToolErrMax),
+					Round:   roundNum,
+				})
+			}
+
+			// T4: cross-turn breaker check. The state above survives turn
+			// boundaries (auto-resume chains keep accumulating; only a
+			// user message / intra-turn guard / breaker fire resets it),
+			// so the my-blog pattern — a failing command repeated across
+			// many turns with local counters reset every turn — finally
+			// trips a breaker. Runs only when no intra-turn guard fired
+			// this round (they reset the breaker themselves).
+			if breaker != nil {
+				streak, cum, sig := breaker.peek()
+				switch {
+				case streak >= crossTurnSameToolMax:
+					breaker.reset()
+					resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
+					resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+					msgs = append(msgs, llm.ChatMessage{
+						Role:    llm.RoleSystem,
+						Type:    llm.TypeText,
+						Content: fmt.Sprintf("工具 `%s` 已连续失败 %d 次（跨回合累计，参数相近的命令视为同一次失败）。不要重试 — 改用其他方式完成任务（如 read_file、list_files、或 task 子代理）。", toolNameFromSig(sig), streak),
+					})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:   "limit",
+						Step:    "cross-turn-same-tool-limit",
+						Message: fmt.Sprintf("工具调用已连续 %d 次（跨回合累计）失败，改用其他方式。", streak),
+						Round:   roundNum,
+					})
+				case cum >= CumToolErrMax:
+					breaker.reset()
+					resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
+					resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+					msgs = append(msgs, llm.ChatMessage{
+						Role:    llm.RoleSystem,
+						Type:    llm.TypeText,
+						Content: fmt.Sprintf("当前任务已累计 %d 次工具调用失败（跨回合累计）。工具环境可能不可用（如 Windows 上执行了 Unix 命令）。请立即停止调用工具，基于已获取的信息给出最终总结。", CumToolErrMax),
+					})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:   "limit",
+						Step:    "cross-turn-cum-limit",
+						Message: fmt.Sprintf("累计 %d 次工具失败（跨回合），强制转为总结。", CumToolErrMax),
+						Round:   roundNum,
+					})
+				}
 			}
 
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
@@ -2604,11 +3014,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			pruneOldToolResults(msgs, roundNum, pr)
 		}
 
-		if maxRounds > 0 {
-			emitTodoIncomplete("max rounds reached before the plan was complete", maxRounds)
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
-		}
-		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+		// NOTE: the round loop above can only exit via `return` — every
+		// path ends inside the loop (the no-tool-call branch persists the
+		// assistant and emits Done, error paths return with error+done).
+		// The old post-loop "max rounds reached" emit + trailing
+		// sendOrDrop(Done) here was dead code (go vet unreachable) and
+		// was removed; the round-cap turn already emits its done frame
+		// and todo-incomplete notice from the live paths.
 	}()
 
 	return ch
@@ -2752,6 +3164,18 @@ func (a *Agent) tryAutoCompact(
 		// Fallback: hard-truncate the message list so the LLM
 		// call doesn't fail with a 413. Drop oldest non-system
 		// messages to stay within the usable context window.
+		//
+		// IMPORTANT: this returns false, NOT true. Returning true
+		// made the caller `continue` into the next round, which
+		// re-entered tryAutoCompact → Compress → (summarizer LLM
+		// keeps failing, e.g. an unavailable proxy) → truncate →
+		// return true → ... — an infinite loop that burned CPU on
+		// O(n²) truncateToFit while GC storms (the 2026-08-05
+		// CPU spike: num_gc 580 → 32000 in 13 min, turn never
+		// ended). The messages list is already truncated here, so
+		// the caller can fall through to the LLM call with the
+		// reduced context; if it overflows again, the bad-request
+		// recovery path handles it (bounded).
 		usable := llm.UsableContextWithBuf(ctxWindow, buf) - llm.EstimateTokensTools(tools)
 		if usable > 0 {
 			truncateToFit(msgs, usable)
@@ -2764,7 +3188,7 @@ func (a *Agent) tryAutoCompact(
 				MaxRound: maxRounds,
 			})
 			_ = summary
-			return true
+			return false
 		}
 		return false
 	}
@@ -2787,8 +3211,15 @@ func (a *Agent) tryAutoCompact(
 		newMsgs := make([]llm.ChatMessage, 0, len(hist)+2)
 		// Keep the system prompt (first message).
 		newMsgs = append(newMsgs, (*msgs)[0])
+		// T2: the summary must REPLACE any previously injected block
+		// (strip + append), never accumulate. Before this fix every
+		// compaction re-appended the FULL accumulated summary to the
+		// system message, growing it by ~54KB per round until the
+		// request carried ~80万 tokens against a 6.4万 window — the
+		// my-blog dead-loop. appendSummaryInjection also caps the
+		// injected size (MaxSummaryPromptTokens).
 		if compSum != "" {
-			newMsgs[0].Content += "\n\n[前文摘要]\n" + compSum
+			newMsgs[0].Content = appendSummaryInjection(newMsgs[0].Content, compSum)
 		}
 		// Append messages from DB (after compression point).
 		for _, m := range hist {

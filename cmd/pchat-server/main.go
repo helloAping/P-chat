@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -60,9 +61,21 @@ func init() {
 }
 
 func main() {
+	configureGCLimit()
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// configureGCLimit sets a soft memory limit so Go's GC targets total
+// memory instead of heap-growth. The summarizer's auto-compact path
+// can briefly allocate hundreds of MB (scanning a 2000+ message
+// conversation) and with the default GOGC=100 the GC chases that
+// spike with back-to-back collections — the "GC storm" that showed up
+// as 28k collections in ~14 minutes. A soft ceiling keeps RSS bounded
+// without changing allocation behavior for normal turns.
+func configureGCLimit() {
+	debug.SetMemoryLimit(2 << 30) // 2 GiB soft ceiling
 }
 
 func runServer(cmd *cobra.Command, args []string) error {

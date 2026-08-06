@@ -9,8 +9,10 @@ package server
 // Split from handler.go in T04. Behaviour unchanged.
 
 import (
+	"context"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
@@ -145,8 +147,28 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		TraceID:      trace.FromContext(c.Request.Context()),
 	}
 
-	stream := h.agent.ChatStream(c.Request.Context(), chatReq)
-	h.respondSSE(c, stream, id, provider, model)
+	// Regeneration runs the agent loop like SendMessage, so give it
+	// the same cancelable ctx + turnCancels registration: respondSSE's
+	// write-timeout path (client stopped reading) and
+	// POST /cancel-stream can then abort a stuck regen turn promptly
+	// instead of holding the session lock until MaxTurnSeconds (M1).
+	// A deadline-free abort ctx is attached (same as SendMessage) so LLM
+	// retries in a regenerate turn are not truncated by MaxTurnSeconds.
+	abortCtx, abortCancel := context.WithCancel(c.Request.Context())
+	defer abortCancel()
+	regenCtx, cancel := context.WithCancel(c.Request.Context())
+	if maxSec := h.getCfg().Limits.MaxTurnSeconds; maxSec > 0 {
+		regenCtx, cancel = context.WithTimeout(regenCtx, time.Duration(maxSec)*time.Second)
+	}
+	regenCtx = agent.WithAbortContext(regenCtx, abortCtx)
+	defer cancel()
+	unregister := h.registerTurnCancel(id, func() { cancel(); abortCancel() })
+	defer unregister()
+
+	stream := h.agent.ChatStream(regenCtx, chatReq)
+	// No auto-resume for an explicit regenerate: the user just asked for
+	// a fresh answer, so a timeout should surface as-is (empty retryNotice).
+	h.respondSSE(c, stream, id, provider, model, "")
 }
 
 // UserMessageSummary is the wire shape of the parent user

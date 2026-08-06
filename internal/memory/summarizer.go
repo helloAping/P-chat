@@ -29,6 +29,18 @@ type Summarizer struct {
 // or in-loop auto-compact) cover the rest.
 const maxCompressBatches = 4
 
+// summaryProtectedNewest is how many of the newest messages are never
+// summarized. The agent must always be able to see its most recent tool
+// interactions, or it loses track of its own last action and repeats the
+// same failing command (the 2026-08-05 my-blog dead-loop: every round
+// compressed the just-executed tool result, so the backfilled request was
+// system-only — "messages=1" with ~80万 tokens — and the LLM, blind to its
+// own output, re-ran go test forever). 6 messages ≈ the last two tool
+// rounds (assistant text + tool_call + tool_result), enough for the model
+// to know what it just did. Protection rotates naturally: a protected
+// message becomes summarizable once 6 newer messages exist.
+const summaryProtectedNewest = 6
+
 func NewSummarizer(s *Store, l *llm.Client, provider string, triggerAt int) *Summarizer {
 	if triggerAt <= 0 {
 		triggerAt = 50
@@ -73,8 +85,21 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 	summaryRanges := sm.loadSummaryRanges(convID)
 	summarized := func(id int64) bool { return rangeContainsID(summaryRanges, id) }
 
+	// Collect un-summarized message ids, EXCLUDING the newest
+	// summaryProtectedNewest messages. Those must stay visible to the
+	// agent (its last tool interactions) or the model loses track of its
+	// own previous action and repeats it — the amnesia dead-loop. See
+	// summaryProtectedNewest.
+	scan := ids
+	if n := len(scan); n > 0 {
+		protect := summaryProtectedNewest
+		if protect > n {
+			protect = n
+		}
+		scan = scan[:n-protect]
+	}
 	toSummarize := []int64{}
-	for _, id := range ids {
+	for _, id := range scan {
 		if !summarized(id) {
 			toSummarize = append(toSummarize, id)
 		}
@@ -106,16 +131,7 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 		}
 		startID, endID := batch[0], batch[len(batch)-1]
 
-		texts := make([]string, 0, len(batch))
-		for _, id := range batch {
-			var role, content string
-			if err := sm.store.db.QueryRow(
-				`SELECT role, content FROM messages WHERE id = ?`, id,
-			).Scan(&role, &content); err == nil {
-				t := role + ": " + truncateStr(content, 200)
-				texts = append(texts, t)
-			}
-		}
+		texts := sm.fetchBatchTexts(batch)
 		joined := strings.Join(texts, "\n")
 
 		summary, err := sm.summarize(ctx, joined)
@@ -135,6 +151,56 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 		toSummarize = toSummarize[len(batch):]
 	}
 	return true, strings.Join(allSummaries, "\n"), nil
+}
+
+// fetchBatchTexts loads the role+content of a batch of message ids in
+// a SINGLE range query, then builds the "role: content" lines the
+// summarizer LLM prompt needs. The previous per-id `QueryRow` loop
+// issued up to 100 individual statements per batch — the dominant
+// allocation source in the auto-compact GC storm (Summarizer.Compress
+// accounted for ~74% of cumulative heap in the 2026-08 profile).
+func (sm *Summarizer) fetchBatchTexts(batch []int64) []string {
+	texts := make([]string, 0, len(batch))
+	if len(batch) == 0 {
+		return texts
+	}
+	// Range boundaries are min/max of the batch, not batch[0] /
+	// batch[len-1] — callers pass ascending ids, but the reader
+	// should stay correct even for an unordered batch.
+	lo, hi := batch[0], batch[0]
+	for _, id := range batch {
+		if id < lo {
+			lo = id
+		}
+		if id > hi {
+			hi = id
+		}
+	}
+	rows, err := sm.store.db.Query(
+		`SELECT id, role, content FROM messages WHERE id >= ? AND id <= ? ORDER BY id ASC`,
+		lo, hi,
+	)
+	if err != nil {
+		return texts
+	}
+	defer rows.Close()
+	// ids in `batch` may be sparse (some rows deleted); index the
+	// fetched rows by id so output order matches the batch.
+	byID := make(map[int64][2]string, len(batch))
+	for rows.Next() {
+		var id int64
+		var role, content string
+		if err := rows.Scan(&id, &role, &content); err != nil {
+			continue
+		}
+		byID[id] = [2]string{role, content}
+	}
+	for _, id := range batch {
+		if rc, ok := byID[id]; ok {
+			texts = append(texts, rc[0]+": "+truncateStr(rc[1], 200))
+		}
+	}
+	return texts
 }
 
 // MaybeSummarize checks if the current conversation has grown past the
@@ -170,8 +236,20 @@ func (sm *Summarizer) MaybeSummarize(ctx context.Context, convID string) (bool, 
 	summarized := func(id int64) bool { return rangeContainsID(summaryRanges, id) }
 
 	// Pick the oldest non-summarized block (up to half of the message list).
+	// Same newest-message protection as Compress: the last
+	// summaryProtectedNewest messages are never summarized, so the agent
+	// always retains its most recent tool interactions (see
+	// summaryProtectedNewest).
+	scan := ids
+	if n := len(scan); n > 0 {
+		protect := summaryProtectedNewest
+		if protect > n {
+			protect = n
+		}
+		scan = scan[:n-protect]
+	}
 	toSummarize := []int64{}
-	for _, id := range ids {
+	for _, id := range scan {
 		if !summarized(id) {
 			toSummarize = append(toSummarize, id)
 		}
@@ -188,16 +266,7 @@ func (sm *Summarizer) MaybeSummarize(ctx context.Context, convID string) (bool, 
 	startID, endID := rangeIDs[0], rangeIDs[len(rangeIDs)-1]
 
 	// Read the content of these messages.
-	texts := make([]string, 0, len(rangeIDs))
-	for _, id := range rangeIDs {
-		var role, content string
-		if err := sm.store.db.QueryRow(
-			`SELECT role, content FROM messages WHERE id = ?`, id,
-		).Scan(&role, &content); err == nil {
-			t := role + ": " + truncateStr(content, 200)
-			texts = append(texts, t)
-		}
-	}
+	texts := sm.fetchBatchTexts(rangeIDs)
 	joined := strings.Join(texts, "\n")
 
 	summary, err := sm.summarize(ctx, joined)

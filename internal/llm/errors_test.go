@@ -292,6 +292,50 @@ func TestClassifyAPIError_SSE_InvalidRequest(t *testing.T) {
 	}
 }
 
+// TestClassifyAPIError_HTTPStatusEnvelope verifies that the streaming
+// client's status-error envelopes ("llm http 429: ..." / "openai http
+// 500: ...") are classified into the retryable kinds — without this, an
+// HTTP 429 / 5xx would never trigger the staircase retry in the agent.
+func TestClassifyAPIError_HTTPStatusEnvelope(t *testing.T) {
+	cases := []struct {
+		envelope string
+		want     ErrorKind
+	}{
+		{"llm http 429: {\"error\":\"slow down\"}", KindRateLimit},
+		{"openai http 500: internal error", KindServer},
+		{"llm http 503: unavailable", KindServer},
+		{"openai http 401: bad key", KindAuth},
+		{"llm http 403: forbidden", KindAuth},
+		{"openai http 404: no model", KindNotFound},
+		{"llm http 400: bad request", KindBadRequest},
+	}
+	for _, c := range cases {
+		got := ClassifyAPIError("openai", errors.New(c.envelope))
+		var apiErr *APIError
+		if !errors.As(got, &apiErr) {
+			t.Fatalf("ClassifyAPIError(%q) = %T, want *APIError", c.envelope, got)
+		}
+		if apiErr.Kind != c.want {
+			t.Errorf("ClassifyAPIError(%q).Kind = %v, want %v", c.envelope, apiErr.Kind, c.want)
+		}
+	}
+}
+
+// TestParseHTTPStatusError covers the envelope parser's reject cases.
+func TestParseHTTPStatusError(t *testing.T) {
+	if _, _, ok := parseHTTPStatusError("llm http 500: x"); !ok {
+		t.Error("valid llm envelope should parse")
+	}
+	if _, _, ok := parseHTTPStatusError("openai http 429: x"); !ok {
+		t.Error("valid openai envelope should parse")
+	}
+	for _, bad := range []string{"http 500: x", "llm http abc: x", "llm http 500", "boom", ""} {
+		if _, _, ok := parseHTTPStatusError(bad); ok {
+			t.Errorf("parseHTTPStatusError(%q) should fail", bad)
+		}
+	}
+}
+
 func TestClassifyAPIError_SSE_UnknownType(t *testing.T) {
 	err := makeSSEError("weird_custom_type", "weird_code", "weird thing")
 	got := ClassifyAPIError("openai", err)

@@ -51,8 +51,8 @@ import (
 // registry / parent context before invoking the child.
 type Request struct {
 	Description    string
-	SubagentType  string
-	Model         string
+	SubagentType   string
+	Model          string
 	PromptOverride string
 	Style          style.Style
 	Provider       string
@@ -87,6 +87,14 @@ type Result struct {
 	// runs). Useful for the parent's "resume by task_id"
 	// code path.
 	TaskID string
+	// Interrupted marks a run that ended WITHOUT a Done signal
+	// (sub-agent timeout, parent cancel, silent stream close)
+	// but still produced partial output. The parent receives the
+	// partial content as a tool result with a clear "interrupted
+	// mid-run, content is partial" marker — the parent LLM can
+	// then summarise what the sub-agent did accomplish instead
+	// of treating the whole task as failed. Empty on success.
+	Interrupted string
 }
 
 // Runner spawns a fresh sub-agent and runs it synchronously. The CLI
@@ -467,7 +475,7 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 				"Replaces the parent's prompt for this run. Useful for very specialized tasks."),
 			"style": tool.StringEnumProp("Optional personality for the sub-agent. "+
 				"Defaults to the parent agent's style.", "cute", "guofeng", "tech"),
-			"provider": tool.StringProp("Optional LLM provider name from the parent config. "+
+			"provider": tool.StringProp("Optional LLM provider name from the parent config. " +
 				"Defaults to the parent agent's provider."),
 			"task_id": tool.StringProp("Optional stable identifier. Two calls with the same (task_id, subagent_type, model) " +
 				"return the cached result of the first run without re-executing the sub-agent. " +
@@ -558,14 +566,14 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 		projectRoot := tool.ProjectRootFromCtx(ctx)
 
 		res, err := runner.Run(ctx, Request{
-			Description:     a.Description,
-			SubagentType:    strings.TrimSpace(a.SubagentType),
-			Model:           strings.TrimSpace(a.Model),
-			PromptOverride:  a.Prompt,
-			Style:           style.Style(strings.ToLower(strings.TrimSpace(a.Style))),
-			Provider:        strings.TrimSpace(a.Provider),
-			TaskID:          strings.TrimSpace(a.TaskID),
-			ProjectRoot:     projectRoot,
+			Description:    a.Description,
+			SubagentType:   strings.TrimSpace(a.SubagentType),
+			Model:          strings.TrimSpace(a.Model),
+			PromptOverride: a.Prompt,
+			Style:          style.Style(strings.ToLower(strings.TrimSpace(a.Style))),
+			Provider:       strings.TrimSpace(a.Provider),
+			TaskID:         strings.TrimSpace(a.TaskID),
+			ProjectRoot:    projectRoot,
 		})
 		if err != nil {
 			return &tool.CallResult{
@@ -594,11 +602,20 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 		// surface to the user. The metadata is also kept in the
 		// Result struct for callers that want the structured
 		// form (e.g. the Wails GUI's session inspector).
+		//
+		// Interrupted runs (timeout / cancel with partial output)
+		// still return the partial content — the parent can
+		// summarise what the sub-agent DID accomplish — but the
+		// marker tells the parent the work is incomplete so it
+		// doesn't mistake it for a full result.
 		var content string
 		if res.Content != "" {
 			content = res.Content
 		} else {
 			content = "(sub-agent returned no content)"
+		}
+		if res.Interrupted != "" {
+			content = "[sub-agent was " + res.Interrupted + " and did not finish; the content below is PARTIAL — summarise what it did accomplish and continue the remaining work]\n\n" + content
 		}
 		// Append a brief metadata footer so the parent LLM
 		// (and the user, when /tools shows the raw tool
@@ -711,8 +728,14 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		})
 	}
 
-	// Per-sub-agent timeout. Default 5 minutes, or use the config if set.
-	timeout := 5 * time.Minute
+	// Per-sub-agent wall-clock timeout. This is a LAST-RESORT
+	// backstop, not the primary hang guard — a legitimate long run
+	// (slow local model, many files to read) can take 10-20 minutes.
+	// Real hangs are caught earlier by the LLM stream idle timeout
+	// (120s), per-tool timeouts, the cumulative failure breaker, and
+	// the round cap (MaxRounds 30). Default 30 minutes, or use the
+	// config if set.
+	timeout := 30 * time.Minute
 	if d.Cfg != nil {
 		timeout = d.Cfg.SubAgent.TimeoutDuration()
 	}
@@ -764,6 +787,18 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 			log.Printf("[subagent] close ephemeral store: %v", err)
 		}
 	}()
+	// The ephemeral store starts empty — no conversations row exists
+	// for the sub-agent's SessionID. Without this, every
+	// AddChatMessageTo in the child's ChatWithTools violates the
+	// messages.conversation_id foreign key at Flush time: history is
+	// silently lost (auto-compaction reads nothing back, so long
+	// sub-agent contexts grow unbounded), and Close() logs a spurious
+	// "constraint failed" every run. Create the row up front so the
+	// child's persistence behaves exactly like a real session.
+	sid := buildSubAgentSessionID(subType, req.TaskID)
+	if err := store.EnsureConversation(sid, ""); err != nil {
+		return Result{}, fmt.Errorf("seed subagent conversation: %w", err)
+	}
 
 	subAgent := agent.New(d.Cfg, d.LLM, d.StyleMgr, store, subTools)
 
@@ -914,16 +949,23 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 	status := "ok"
 	switch {
 	case !streamDoneChunk && !streamErrorChunk:
-		// 流被静默关闭（超时 / 中断）。无论是否有部分输出都按失败处理：
-		// 有输出 → 卡片显示部分内容但标记 err，父级拿到失败错误而非
-		// 自信的部分总结；无输出 → 同样是硬失败。父级必须知道子代理
-		// 没有完成，否则它会基于不完整结果生成"成功"的汇总。
+		// 流被静默关闭（超时 / 中断）。这个出口要区分两种结果：
+		//
+		//   1. 有部分输出：不再丢弃。把已产出的部分内容返回给父级，
+		//      父 LLM 能基于它总结子代理已完成的调研/工作，而不是
+		//      整段作废（dev-bin 实测：explore 子代理 5m 超时后父级
+		//      收到 "(sub-agent returned no content)"，主对话拿不到
+		//      任何架构信息）。卡片仍标 err（工作确实未完成），但
+		//      部分内容随 tool result 传给父 LLM，并带 Interrupted
+		//      标记让父级知道这是不完整的。
+		//
+		//   2. 无输出：硬失败，父级拿到明确的超时错误。
 		//
 		// Silent close = the sub-agent was killed by timeout or a
-		// cancel; it did NOT finish. Always a failure — with partial
-		// content the card keeps the partial text but the parent gets
-		// a failure error instead of a confident summary of work that
-		// was never completed.
+		// cancel; it did NOT finish. When partial content exists it is
+		// still returned to the parent (marked Interrupted) so the
+		// parent can summarise what was accomplished; with no content
+		// it is a hard failure.
 		status = "err"
 		failed = true
 		if contentProduced {
@@ -946,25 +988,52 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 	}
 	if d.OnEvent != nil {
 		d.OnEvent(agent.ChatStreamChunk{
-			Phase:               "sub_agent_" + status,
-			SubAgent:            true,
-			SubAgentTask:        req.Description,
-			SubAgentStatus:      status,
-			SubAgentType:        subType,
-			SubAgentColor:       color,
-			SubAgentModel:       chatModel,
-			SubAgentDescription: agentInfo.Description,
+			Phase:                 "sub_agent_" + status,
+			SubAgent:              true,
+			SubAgentTask:          req.Description,
+			SubAgentStatus:        status,
+			SubAgentType:          subType,
+			SubAgentColor:         color,
+			SubAgentModel:         chatModel,
+			SubAgentDescription:   agentInfo.Description,
 			SubAgentFailureReason: failureReason,
-			SubAgentTaskID:      req.TaskID,
-			Duration:            time.Since(start).Round(10 * time.Millisecond).String(),
+			SubAgentTaskID:        req.TaskID,
+			Duration:              time.Since(start).Round(10 * time.Millisecond).String(),
 		})
 	}
 
 	if failed {
-		// We already forwarded the error chunk above; just
-		// return without a result. The tool layer will turn
-		// the lack of result into a "sub-agent failed"
-		// CallResult.
+		// Hard failure — no usable content for the parent. The
+		// failure was already forwarded as a sub_agent_err close
+		// event above; the tool layer turns the error into an
+		// IsError result.
+		//
+		// The one exception: a silent close (timeout / parent
+		// cancel) that still produced partial output. The
+		// partial content IS returned to the parent (marked
+		// Interrupted) so the parent LLM can summarise what the
+		// sub-agent did accomplish instead of discarding the
+		// work — the card still shows err (the run didn't
+		// complete), but the parent gets material to work with.
+		//
+		// An Error chunk (streamErrorChunk) stays a hard
+		// failure: the sub-agent itself reported an error, so
+		// the tail content is not trustworthy.
+		if !streamErrorChunk && contentProduced {
+			res := Result{
+				Content:      redactPhantomErrorsServer(strings.TrimSpace(content)),
+				TokensIn:     tokensIn,
+				TokensOut:    tokensOut,
+				Elapsed:      time.Since(start),
+				Rounds:       rounds,
+				SubagentType: subType,
+				Model:        chatModel,
+				Color:        color,
+				TaskID:       req.TaskID,
+				Interrupted:  "interrupted",
+			}
+			return res, nil
+		}
 		if failureReason != "" {
 			return Result{}, fmt.Errorf("%s", failureReason)
 		}
@@ -980,15 +1049,15 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		// skipped — this last-pass scrub makes sure the
 		// parent LLM never sees the raw phantom through
 		// the tool result channel.
-		Content:       redactPhantomErrorsServer(strings.TrimSpace(content)),
-		TokensIn:      tokensIn,
-		TokensOut:     tokensOut,
-		Elapsed:       time.Since(start),
-		Rounds:        rounds,
-		SubagentType:  subType,
-		Model:         chatModel,
-		Color:         color,
-		TaskID:        req.TaskID,
+		Content:      redactPhantomErrorsServer(strings.TrimSpace(content)),
+		TokensIn:     tokensIn,
+		TokensOut:    tokensOut,
+		Elapsed:      time.Since(start),
+		Rounds:       rounds,
+		SubagentType: subType,
+		Model:        chatModel,
+		Color:        color,
+		TaskID:       req.TaskID,
 	}
 
 	// 同一个完整执行 identity 才可复用结果，task_id 也不绕过配置隔离。
@@ -1016,6 +1085,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 var phantomScrubRe = regexp.MustCompile(
 	`(?is)(?:Cannot|Unable to|Failed to|cannot|unable to) (?:read|view|process)[\s\S]{0,400}?[Ii]nform the user\.?`,
 )
+
 const phantomScrubReplacement = "（当前模型不支持读取图片。请在「设置 → 提供商/模型」中切换到支持视觉的模型（如 claude-3、gpt-4o、gemini-1.5、qwen-vl、doubao-1.5-vision-pro 等）后重新发送。）"
 
 // redactPhantomErrorsServer is the subagent runner's last
@@ -1093,6 +1163,13 @@ func filterSubAgentTools(
 	return subTools
 }
 
+// buildSubAgentSessionID returns the stable SessionID a sub-agent
+// run persists its messages under in its ephemeral store. Must stay
+// in lockstep with buildSubAgentChatRequest.
+func buildSubAgentSessionID(subType, taskID string) string {
+	return "subagent-" + subType + "-" + taskID
+}
+
 // buildSubAgentChatRequest assembles the ChatRequest the sub-agent
 // runner hands to agent.ChatWithTools. Extracted from Default.Run
 // so the field wiring (notably ProjectRoot, which silently dropped
@@ -1112,7 +1189,14 @@ func buildSubAgentChatRequest(
 		SubagentColor:  color,
 		SubagentTaskID: req.TaskID,
 		ProjectRoot:    req.ProjectRoot,
-		SessionID:      "subagent-" + subType + "-" + req.TaskID,
+		SessionID:      buildSubAgentSessionID(subType, req.TaskID),
+		// Sub-agents are short focused runs. Cap rounds well
+		// below the parent's 300 default so a failing loop
+		// (whack-a-mole tool errors, re-read loops) ends in
+		// ~30 rounds instead of spinning until the wall-clock
+		// timeout — the cumulative failure breaker fires
+		// earlier, but this is the hard backstop.
+		MaxRounds: 30,
 		Messages: []llm.ChatMessage{
 			{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Description},
 		},

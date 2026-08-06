@@ -46,6 +46,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -142,6 +143,11 @@ p{color:#9aa0a6;font-size:13px;margin:0;min-height:18px}
 `
 
 func main() {
+	// Soft memory ceiling — see cmd/pchat-server/main.go
+	// configureGCLimit for the rationale. Applied here too because
+	// the GUI host's own allocations (reverse proxy, JSON) matter.
+	debug.SetMemoryLimit(2 << 30)
+
 	exe, _ := os.Executable()
 	// Open a dated debug log on disk so we can diagnose issues even
 	// if the webview never appears (e.g. headless session). Logs

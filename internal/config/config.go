@@ -79,6 +79,34 @@ type LimitsConfig struct {
 	// left an orphaned grandchild holding its pipes, or an SSE write
 	// blocked against a dead client connection.
 	MaxTurnSeconds int `json:"max_turn_seconds"`
+	// MaxTurnRetries is how many times a turn that was terminated by
+	// the MaxTurnSeconds deadline is automatically resumed server-side
+	// before the terminal turn_timeout error is emitted. Each retry
+	// reloads the persisted partial conversation, re-injects a
+	// user-style "继续" message (equivalent to the user continuing
+	// manually), and runs the agent loop again with a fresh full
+	// MaxTurnSeconds budget. 0 = disabled (previous behaviour).
+	// Default 2. Absent from config → default; explicit 0 → off.
+	MaxTurnRetries int `json:"max_turn_retries"`
+	// LLMRetryBackoffs is the per-retry backoff staircase (in seconds)
+	// for transient upstream LLM errors (rate_limit / server_error /
+	// network / timeout). The k-th value is how long to wait before the
+	// k-th retry; retry count = len(list) (total attempts = len+1).
+	// Empty list = no retry (single attempt). Default [5, 60, 180, 300,
+	// 600]. Retries are detached from the MaxTurnSeconds turn budget —
+	// they are bounded only by this list plus user cancellation — so a
+	// long backoff sequence is never truncated by the turn deadline.
+	LLMRetryBackoffs []int `json:"llm_retry_backoffs,omitempty"`
+	// RoundStreamStallSeconds is the per-attempt ceiling (seconds) on
+	// receiving NO chunk at all from an upstream LLM stream. The LLM
+	// client's own idle watchdog resets on any transport byte, so a
+	// proxy that pads a dead upstream with SSE keep-alive lines can keep
+	// a stream "open" forever; this is the agent-level backstop that
+	// turns such a hang into a retry / error+done instead of blocking
+	// until MaxTurnSeconds. 0 = default (180). Absent from config →
+	// default; explicit 0 → off (previous behaviour: rely solely on the
+	// client-side idle watchdog).
+	RoundStreamStallSeconds int `json:"round_stream_stall_timeout,omitempty"`
 }
 
 // TodoLongRunMode configures the long-running task policy.
@@ -126,9 +154,20 @@ type SubAgentConfig struct {
 	AllowedTools []string `json:"allowed_tools,omitempty"`
 	DeniedTools  []string `json:"denied_tools,omitempty"`
 
-	// Timeout is the per-sub-agent execution cap. Parsed from JSON
-	// (e.g. "5m", "30s"). Zero means no explicit cap (the runner
-	// applies a sensible default of 5 minutes).
+	// Timeout is the per-sub-agent wall-clock execution cap. Parsed
+	// from JSON (e.g. "30m", "5m"). Zero means no explicit cap (the
+	// runner applies a sensible default of 30 minutes).
+	//
+	// This is a LAST-RESORT backstop, not the primary hang guard. A
+	// normal long sub-agent (e.g. explore reading 50 files, or a
+	// multi-round plan on a slow local model) can legitimately run
+	// 10-20 minutes; cutting it at 5m discards useful work. Actual
+	// hangs are caught earlier by finer-grained guards: the LLM
+	// stream idle timeout (120s of no bytes → cancel), per-tool
+	// timeouts (exec_command 5m, read_file 60s), the cumulative
+	// tool-failure breaker (CumToolErrMax) and the sub-agent round
+	// cap (MaxRounds 30). The wall clock is only reached when every
+	// one of those failed.
 	Timeout string `json:"timeout,omitempty"`
 
 	// CacheTTL is how long a sub-agent result stays cached. Parsed
@@ -136,14 +175,14 @@ type SubAgentConfig struct {
 	CacheTTL string `json:"cache_ttl,omitempty"`
 }
 
-// TimeoutDuration returns the parsed timeout, or 5m if unset/invalid.
+// TimeoutDuration returns the parsed timeout, or 30m if unset/invalid.
 func (s SubAgentConfig) TimeoutDuration() time.Duration {
 	if s.Timeout == "" {
-		return 5 * time.Minute
+		return 30 * time.Minute
 	}
 	d, err := time.ParseDuration(s.Timeout)
 	if err != nil || d <= 0 {
-		return 5 * time.Minute
+		return 30 * time.Minute
 	}
 	return d
 }
@@ -926,9 +965,12 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Limits: LimitsConfig{
-			MaxRounds:       300,
-			TodoLongRunMode: TodoLongRunAdaptive,
-			MaxTurnSeconds:  900,
+			MaxRounds:              300,
+			TodoLongRunMode:        TodoLongRunAdaptive,
+			MaxTurnSeconds:         900,
+			MaxTurnRetries:         2,
+			LLMRetryBackoffs:       []int{5, 60, 180, 300, 600},
+			RoundStreamStallSeconds: 180,
 		},
 		Sandbox: SandboxConfig{
 			Enabled:               true,

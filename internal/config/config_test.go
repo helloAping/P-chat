@@ -25,6 +25,22 @@ func TestSubAgentConfig_Defaults(t *testing.T) {
 	}
 }
 
+// TestLimitsConfig_LLMRetryBackoffsDefault locks the default staircase
+// retry table. 5 steps / 6 total attempts, cumulative backoff 1145s, so
+// a transient upstream outage gets a real chance to recover.
+func TestLimitsConfig_LLMRetryBackoffsDefault(t *testing.T) {
+	got := Default().Limits.LLMRetryBackoffs
+	want := []int{5, 60, 180, 300, 600}
+	if len(got) != len(want) {
+		t.Fatalf("LLMRetryBackoffs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("LLMRetryBackoffs[%d] = %d, want %d", i, got[i], want[i])
+		}
+	}
+}
+
 func TestWorkModeNormalize(t *testing.T) {
 	cases := []struct {
 		in   WorkMode
@@ -115,8 +131,8 @@ func TestSubAgentConfig_DenyList(t *testing.T) {
 func TestSubAgentConfig_Timeout(t *testing.T) {
 	// Default
 	c := &SubAgentConfig{}
-	if got := c.TimeoutDuration(); got != 5*time.Minute {
-		t.Errorf("default timeout = %v, want 5m", got)
+	if got := c.TimeoutDuration(); got != 30*time.Minute {
+		t.Errorf("default timeout = %v, want 30m", got)
 	}
 
 	// Custom
@@ -127,8 +143,8 @@ func TestSubAgentConfig_Timeout(t *testing.T) {
 
 	// Invalid
 	c = &SubAgentConfig{Timeout: "garbage"}
-	if got := c.TimeoutDuration(); got != 5*time.Minute {
-		t.Errorf("invalid timeout should fall back to 5m, got %v", got)
+	if got := c.TimeoutDuration(); got != 30*time.Minute {
+		t.Errorf("invalid timeout should fall back to 30m, got %v", got)
 	}
 }
 

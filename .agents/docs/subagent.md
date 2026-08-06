@@ -61,6 +61,26 @@
 
 `agentCache` 按 `(description, subagent_type, model)` 缓存结果。通过 `task_id` 参数可恢复缓存（不重新执行）。
 
+### 6. 超时与部分结果（2026-08-03 起）
+
+**超时来源**：`subagent.timeout`（默认 **30 分钟**）是 wall-clock **兜底**（不是主防卡死）。`runCtx` 超时后子代理 ReAct 循环可能**静默关闭**（无 Done、无 Error chunk）。
+
+**防卡死依赖的细粒度守卫**（都早于 30m wall-clock 触发）：
+- LLM stream idle timeout **120s**（上游 120s 无字节 → cancel）
+- 工具超时：exec_command 5m、read_file 60s、question 10m
+- 累计失败熔断 `CumToolErrMax=8`（打地鼠式不同命令失败）
+- 子代理轮数上限 `MaxRounds=30`
+
+**为什么默认从 5m 调到 30m**：正常长任务（explore 读 50 文件 / 慢速本地模型多轮）可合法跑 10-20 分钟，5m 会误杀已产出的有效工作。真卡死已被上面的细粒度守卫提前拦截，wall-clock 只在全部失效时才兜底。
+
+**部分结果策略**：超时/中断时，若子代理已产出部分内容（如 explore 已完成一半调研），不再整段丢弃——`Default.Run` 把部分内容作为 `Result.Content` 返回（带 `Interrupted` 标记），`task` 工具 handler 把它包装成带 "PARTIAL" 前缀的 tool result 传给父 LLM。父 LLM 据此**总结子代理已完成的工作并继续剩余部分**，而不是收到 `(sub-agent returned no content)` 后无从下手。
+
+**判定规则**（`Default.Run` 的 silent-close 检测）：
+- 静默关闭 + 有部分输出 → `sub_agent_err`（卡片标"失败（部分内容）"）+ 部分内容返回给父级（`Interrupted` 非空）
+- 静默关闭 + 无输出 → 硬失败，父级收到明确超时错误
+- Error chunk → 硬失败（子代理自报错误，尾部内容不可信）
+- 正常 Done / 软失败 → 不变
+
 ## 修改指南
 
 ### 要修改子代理创建流程
@@ -81,6 +101,11 @@
 ### 要修改子代理超时
 - `timeout` 变量 (subagent.go:566-568)
 - config 中的 `subagent.timeout` 字段
+
+### 要修改子代理空转熔断
+- `CumToolErrMax` (agent/auto_continue.go) — 累计工具失败熔断阈值（默认 8，跨不同命令）
+- `MaxRounds: 30` (subagent.go `buildSubAgentChatRequest`) — 子代理轮数硬上限
+- `sameToolErrMax` / stuck-loop 守卫 (agent/agent.go) — 同工具/同签名失败熔断
 
 ## 相关模块
 

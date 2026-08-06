@@ -160,6 +160,40 @@ forwarder goroutine:
 
 `toolCallSignature()` 计算每轮工具调用的稳定签名。若连续 3 轮相同的工具调用都失败 → 判定卡死 → 自动停止。
 
+### 6.5 LLM 阶梯式重试 (2026-08)
+
+每轮 LLM 调用对瞬时上游错误（rate_limit / server_error / network / timeout）做阶梯式重试：
+
+- **退避表**：`limits.llm_retry_backoffs`（秒数组，默认 `[5, 60, 180, 300, 600]`）。
+  第 k 个值 = 第 k 次重试前的等待；**重试次数 = 数组长度**（总尝试 = len+1）。
+  `[]` = 不重试（单次尝试）。
+- **重试请求参数与上次一致**：同一轮内 `msgsForLLM / roundTools / opts` 跨尝试不变。
+- **5 次后彻底终止**：全部尝试失败 → 输出 `"重试 N 次后仍然失败"` 终止帧 + Done，不会无限重试。
+- **脱离回合预算**：重试运行在**无截止时间的 abort 上下文**（`agent.WithAbortContext` /
+  `AbortContextFrom`，由服务端创建、仅被 cancel-stream / 客户端断连取消）上，
+  因此长退避序列（累计 ~19 min）不会被 `MaxTurnSeconds` 回合截止截断。首次尝试仍绑定
+  回合上下文（保留超时兜底）；回合截止恰在首次尝试时触发 → 走 `turn_timeout` 路径而非重试。
+- **晚到重试成功**：若某次重试在回合截止后成功，`successAttempt > 1` 且
+  `ctx.Err() == DeadlineExceeded` → 优雅收尾（持久化回复 + done，不再派发工具/开新一轮）。
+- **HTTP 4xx/5xx 分类**：流式客户端把上游非 2xx 包装为 `"llm/openai http <code>: ..."`，
+  `ClassifyAPIError` 的 `parseHTTPStatusError` 将其映射到 retryable kind（429→RateLimit、
+  5xx→Server、401/403→Auth、404→NotFound、400→BadRequest），否则这些错误不会触发重试。
+
+子代理走同一 `ChatWithTools`，自动继承该重试策略。
+
+> **作用域（务必区分）**：本重试**仅覆盖“请求上游 LLM 时的异常”**——HTTP 429/5xx、
+> 传输层网络/超时、SSE 流内错误 envelope。与以下机制**无关**，不要混为一谈：
+> - **工具执行失败**：工具错误走工具结果回填 + 同工具 / 卡死 / 累积错误熔断
+>   （`CumToolErrMax`），不经本重试。
+> - **回合超时自动续跑**（`max_turn_retries`）：服务端整体重跑 agent 循环 + 注入
+>   “继续”nudge，是另一套机制。
+> - **前端 SSE 断流恢复**（P0-1 `recoverMissingParts`）。
+>
+> 另注：`ClassifyAPIError` 也被非流式适配器（模型列表、knowledge 调用）与错误展示层
+> 复用；`parseHTTPStatusError` 让这些位置的 429/5xx 也变成规范的 APIError kind
+> （更友好的提示），是正向副作用，不改变重试逻辑本身。
+
+
 ### 7. 项目根感知的内容加载 (2026-07)
 
 `Agent.lastProjectRoot` 字段追踪当前 skills / rules 加载时锚定的项目根。`ReloadWithRootIfChanged(root)` 在 `buildStaticSystemPrompt` 入口被调用：

@@ -368,6 +368,13 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
 | **IM Gateway 入口** | [`.agents/docs/im.md`](docs/im.md) + [`docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
 | **IM 配置文件 schema** | `internal/config/im_config.go`（落地后）`IMConfig` |
+| sendOrDrop 逃生 | `internal/agent/agent.go`（`sendOrDropTimeout`，channel 满 30s 丢非关键事件） |
+| 大 tool 结果截断 + 有界缓存 | `internal/agent/agent.go`（`MaxToolResultFullBytes`）+ `internal/agent/tool_result_cache.go` |
+| cancel-stream / tool-result 端点 | `internal/server/messages.go` + `server.go` |
+| **图片实体化（upl://）** | `internal/agent/attachment.go`（`ExpandAttachmentsCM`）+ `internal/server/message_helpers.go`（`buildMessageResponse` / `resolveHistoryUploads`）+ `internal/server/upload.go` |
+| **子代理超时/部分结果** | `internal/subagent/subagent.go` `Run()`（`Result.Interrupted`）+ `internal/agent/auto_continue.go`（`CumToolErrMax`） |
+| **子代理失败熔断** | `internal/agent/agent.go`（same-tool / stuck-loop / cumulative breaker）+ `internal/subagent/subagent.go`（`buildSubAgentChatRequest` MaxRounds） |
+| **uploads 孤儿清理（D3）** | `internal/server/upload.go`（`pruneUploadFiles` / `sweepOrphanUploads`）+ `internal/memory/memory.go`（`UploadRefsForConversation` / `CountUploadRefs`） |
 
 ---
 

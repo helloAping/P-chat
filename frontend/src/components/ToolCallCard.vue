@@ -190,6 +190,54 @@ async function copyResult() {
     setTimeout(() => (copyState.value = 'idle'), 1200)
   }
 }
+
+// Truncated large results: the server omits the full body
+// (>32 KiB) and the card shows a "查看完整输出" affordance.
+// The full body is fetched on demand and held in a LOCAL ref
+// (not the reactive store) so a multi-MB string never lands
+// in the Vue state. The message id is resolved from the chat
+// store's trailing assistant message on click.
+import * as api from '../api/client'
+import { state } from '../stores/chat'
+const fetchState = ref<'idle' | 'loading' | 'ok' | 'err'>('idle')
+const fullResult = ref('')
+const resultTruncated = computed(() => !!(props.part as any).result_truncated)
+const resultFullLen = computed(() => (props.part as any).result_full_len as number | undefined)
+const truncatedLabel = computed(() => {
+  const len = resultFullLen.value
+  if (!len) return '查看完整输出'
+  const kb = (len / 1024).toFixed(len >= 1024 * 1024 ? 1 : 0)
+  return len >= 1024 * 1024 ? `查看完整输出 (${(len / 1048576).toFixed(1)} MB)` : `查看完整输出 (${kb} KB)`
+})
+async function fetchFullResult() {
+  if (fetchState.value === 'loading' || fetchState.value === 'ok') return
+  const sid = state.currentID
+  const toolId = props.part.tool_id || props.part.id
+  if (!sid || !toolId) return
+  fetchState.value = 'loading'
+  try {
+    // Resolve the trailing assistant message id (the SSE done
+    // event stamps it; fall back to 0 and let the server's
+    // tool_id lookup carry the session check).
+    let msgId = 0
+    const msgs = state.sessionMessages[sid]
+    if (msgs) {
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const mid = msgs[i].id
+        if (msgs[i].role === 'assistant' && mid) {
+          msgId = mid
+          break
+        }
+      }
+    }
+    const resp = await api.getToolResult(sid, msgId, toolId)
+    fullResult.value = resp.content
+    fetchState.value = 'ok'
+  } catch {
+    fetchState.value = 'err'
+    setTimeout(() => (fetchState.value = 'idle'), 2000)
+  }
+}
 </script>
 
 <template>
@@ -222,7 +270,19 @@ async function copyResult() {
       <div v-if="part.result" class="tool-result">
         <div class="tool-section-label">结果</div>
         <img v-if="screenshotURL" :src="screenshotURL" class="tool-screenshot" loading="lazy" />
+        <pre v-else-if="fetchState === 'ok'">{{ fullResult }}</pre>
         <pre v-else>{{ part.result }}</pre>
+        <button
+          v-if="resultTruncated"
+          class="tool-full-result-btn"
+          :disabled="fetchState === 'loading'"
+          @click.stop="fetchFullResult"
+        >
+          <Loader2 v-if="fetchState === 'loading'" :size="11" class="spin" />
+          <span v-else-if="fetchState === 'err'">加载失败，点击重试</span>
+          <span v-else-if="fetchState === 'ok'">已加载完整输出</span>
+          <span v-else>{{ truncatedLabel }}</span>
+        </button>
       </div>
       <div v-if="part.error" class="tool-error">
         <div class="tool-section-label">错误</div>
@@ -317,6 +377,30 @@ async function copyResult() {
   flex-shrink: 0;
 }
 .tool-caret { margin-left: auto; color: var(--text-tertiary); flex-shrink: 0; }
+
+/* "查看完整输出" affordance for server-truncated results.
+ * Compact ghost button under the result body. */
+.tool-full-result-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 2px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--brand-600);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.tool-full-result-btn:hover:not(:disabled) {
+  background: var(--brand-50);
+}
+.tool-full-result-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
 
 .tool-body {
   border-top: 1px dashed var(--border-subtle);

@@ -14,6 +14,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -158,6 +159,14 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// a server restart; clear is idempotent because the UI may have already
 	// called DELETE /todos during preflight.
 	todoMode := agent.NormalizeTodoMode(req.TodoMode)
+	// T3: a genuine user message resets the session's auto-resume
+	// no-progress tracker — the user changed intent, so the resume budget
+	// starts fresh. Auto-resume re-invocations (ClientMsgID==0 +
+	// TodoMode=resume) keep it, so an interrupted chain keeps its
+	// no-progress count across turns (see auto_resume.go).
+	if req.ClientMsgID != 0 || todoMode != agent.TodoModeResume {
+		h.resumeTrackers.Delete(id)
+	}
 	h.hydrateSessionTodos(id)
 	if todoMode == agent.TodoModeClear {
 		if err := h.clearSessionTodos(id); err != nil {
@@ -225,19 +234,183 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// fires, ChatWithTools' ctx.Done() path emits an error event and
 	// the session lock is released, so the user is never stuck on a
 	// permanently "busy" session.
-	turnCtx := c.Request.Context()
-	if maxSec := h.getCfg().Limits.MaxTurnSeconds; maxSec > 0 {
+	//
+	// Auto-resume (2026-08): when the deadline terminates the turn, the
+	// server reloads the persisted partial conversation and re-invokes
+	// the agent loop with a fresh full budget, injecting a user-style
+	// "继续" message — the semantic equivalent of the user manually
+	// continuing. Bounded by Limits.MaxTurnRetries (0 = disabled). The
+	// whole retry sequence stays inside this one HTTP request / one
+	// SSE stream, so the session lock is held throughout and the
+	// frontend sees a single continuous turn.
+	baseCtx := c.Request.Context()
+	// abortCtx is a deadline-free context cancelled whenever the user
+	// stops the turn (cancel-stream) or the client disconnects. The LLM
+	// retry phase runs on it (via agent.WithAbortContext) so a long
+	// staircase backoff (up to ~19 min with the default table) is not
+	// truncated by MaxTurnSeconds — retries are bounded by their own cap
+	// plus user cancellation instead.
+	abortCtx, abortCancel := context.WithCancel(baseCtx)
+	defer abortCancel()
+	maxSec := h.getCfg().Limits.MaxTurnSeconds
+	maxRetries := h.getCfg().Limits.MaxTurnRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	for attempt := 0; ; attempt++ {
+		turnCtx := baseCtx
 		var cancel context.CancelFunc
-		turnCtx, cancel = context.WithTimeout(turnCtx, time.Duration(maxSec)*time.Second)
-		defer cancel()
-		// Replace the request context so respondSSE can observe the
-		// deadline error and emit a terminal error frame when the
-		// stream closes without a done event.
-		c.Request = c.Request.WithContext(turnCtx)
+		if maxSec > 0 {
+			turnCtx, cancel = context.WithTimeout(turnCtx, time.Duration(maxSec)*time.Second)
+			// Replace the request context so respondSSE can observe the
+			// deadline error and either signal a retry or emit a
+			// terminal error frame when the stream closes without a
+			// done event.
+			c.Request = c.Request.WithContext(turnCtx)
+		} else {
+			// No hard cap configured: still create a cancelable ctx so
+			// respondSSE's write-timeout path and POST /cancel-stream
+			// can abort a stuck turn instead of blocking forever.
+			turnCtx, cancel = context.WithCancel(turnCtx)
+		}
+		// Attach the deadline-free abort context so the agent's retry
+		// loop can escape the turn deadline (deadline still enforced for
+		// everything else via the c.Request context above).
+		turnCtx = agent.WithAbortContext(turnCtx, abortCtx)
+		// cancel-stream must abort BOTH the turn and the retry phase.
+		unregister := h.registerTurnCancel(id, func() { cancel(); abortCancel() })
+
+		var retryNotice string
+		if attempt < maxRetries {
+			retryNotice = fmt.Sprintf("⏱ 回合超出最长执行时间，自动重试（第 %d/%d 次）——相当于自动发送“继续”…", attempt+1, maxRetries)
+		}
+
+		stream := h.agent.ChatStream(turnCtx, chatReq)
+		res := h.respondSSE(c, stream, id, provider, model, retryNotice)
+
+		unregister()
+		cancel()
+
+		if res != turnStreamRetry || attempt >= maxRetries {
+			break
+		}
+
+		// Build the resume request. Reload the conversation — the
+		// timed-out attempt persisted every completed round — and append
+		// a user-style "继续" nudge as the only new message. ClientMsgID
+		// = 0 so no row is re-pinned; Attachments are dropped because
+		// the first attempt already expanded + persisted them; TodoMode
+		// is forced to resume so an active task chain is preserved.
+		histMsgs, compSummary := h.loadHistoryForSend(baseCtx, id, provider, model)
+		resumeMsgs := buildLLMMessages(histMsgs)
+		// The nudge names the reason dynamically: when todos are still
+		// unfinished (the common auto-continue case — the LLM ended without
+		// marking every todo done/cancelled), say so explicitly so the model
+		// verifies completion and calls todo_write; otherwise fall back to a
+		// generic "中断" (deadline / upstream-error resume).
+		resumeReason := "中断"
+		if agent.HasPendingTodos(id) {
+			resumeReason = "任务尚未完成"
+		}
+		resumeMsgs = append(resumeMsgs, llm.ChatMessage{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     agent.BuildAutoResumePrompt(id, resumeReason),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+		chatReq.Messages = resumeMsgs
+		chatReq.HistoryMessageCount = len(resumeMsgs) - 1
+		chatReq.ClientMsgID = 0
+		chatReq.Attachments = nil
+		chatReq.CompressedSummary = compSummary
+		chatReq.TodoMode = agent.TodoModeResume
 	}
 
-	stream := h.agent.ChatStream(turnCtx, chatReq)
-	h.respondSSE(c, stream, id, provider, model)
+	// The retry chain has fully ended. Release the per-session T3/T4
+	// bookkeeping so dead sessions do not accumulate entries for the
+	// process lifetime: the T3 resume tracker and the T4 cross-turn
+	// breaker. This is the chain-end point — never mid-chain, or the
+	// accumulated no-progress / failure streak the next resume needs
+	// would be lost. The next user message recreates both fresh.
+	h.resumeTrackers.Delete(id)
+	if h.agent != nil {
+		h.agent.ClearBreakerState(id)
+	}
+}
+
+// turnCancelRegistration is the cleanup handle returned by
+// registerTurnCancel. Caller must invoke it when the stream ends.
+type turnCancelRegistration func()
+
+// registerTurnCancel publishes the turn's cancel func so
+// respondSSE's write-timeout path and POST /cancel-stream can
+// abort it from outside. Returns a cleanup func the caller defers;
+// a stale cancel for a finished turn is a harmless no-op, but the
+// entry should be removed once the stream completes so the map
+// doesn't grow. Shared by SendMessage and Regenerate (both feed
+// respondSSE).
+func (h *Handler) registerTurnCancel(id string, cancel context.CancelFunc) turnCancelRegistration {
+	h.turnCancels.Store(id, cancel)
+	return func() {
+		h.turnCancels.Delete(id)
+	}
+}
+
+// CancelStream aborts the in-flight SendMessage turn for a session.
+// POST /api/v1/sessions/:id/cancel-stream. The frontend calls this
+// after an AbortController fires so the server-side agent loop
+// exits promptly and the session lock releases — without it, a
+// client that stops reading but keeps the TCP connection open
+// (frozen WebView2 renderer) would hold the turn until the
+// MaxTurnSeconds backstop.
+//
+// Idempotent: cancelling a turn that already finished (or never
+// started) is a no-op. Always returns 200 so the client never
+// sees an error for a best-effort abort.
+func (h *Handler) CancelStream(c *gin.Context) {
+	id := c.Param("id")
+	if v, ok := h.turnCancels.Load(id); ok {
+		if f, ok := v.(context.CancelFunc); ok {
+			log.Printf("[cancel-stream] cancelling turn for session %s", id)
+			f()
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ToolResultResponse is the body of GET
+// /sessions/:id/messages/:msg_id/tool-result/:tool_id.
+type ToolResultResponse struct {
+	ToolID   string `json:"tool_id"`
+	ToolName string `json:"tool_name,omitempty"`
+	Content  string `json:"content"`
+	// Truncated echoes the byte length of the untruncated result
+	// so the frontend can label the affordance.
+	Bytes int `json:"bytes"`
+}
+
+// GetToolResult returns the full (untruncated) body of a tool
+// result whose SSE event was truncated server-side (tool results >
+// MaxToolResultFullBytes ship only a display preview; the full body
+// is parked in the agent's bounded cache and fetched here on
+// demand). This keeps multi-MB outputs out of the Vue reactive
+// store while still letting the user read them.
+//
+// GET /api/v1/sessions/:id/messages/:user_msg_id/tool-result/:tool_id
+func (h *Handler) GetToolResult(c *gin.Context) {
+	id := c.Param("id")
+	toolID := c.Param("tool_id")
+	content, ok := agent.LookupTruncatedResult(id, toolID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "tool result not found or expired"})
+		return
+	}
+	c.JSON(http.StatusOK, ToolResultResponse{
+		ToolID:  toolID,
+		Content: content,
+		Bytes:   len(content),
+	})
 }
 
 func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model string) ([]llm.ChatMessage, string) {
@@ -255,18 +428,46 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 		lastComp = h.store.LastCompressedIDFor(id)
 	}
 
+	var histMsgs []llm.ChatMessage
+	var compSummary string
 	if lastComp > 0 {
-		histMsgs, _, _ := h.store.GetChatMessagesAfterIDFor(id, contextCap, lastComp)
-		return histMsgs, h.store.CompressedSummaryFor(id)
+		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, contextCap, lastComp)
+		// Carry the pre-summarized history so the agent can inject
+		// "[前文摘要]" into the system prompt — the LLM must know
+		// what the compressed-away history contained. Dropping this
+		// (a regression in an earlier refactor) made every post-
+		// compaction turn blind to the summarized context.
+		compSummary = h.store.CompressedSummaryFor(id)
+	} else {
+		limit := 0
+		if h.store.CountChatMessages(id) > contextCap {
+			limit = contextCap
+		}
+		histMsgs = h.store.GetChatMessagesFor(id, limit)
 	}
-
-	limit := 0
-	if h.store.CountChatMessages(id) > contextCap {
-		limit = contextCap
-	}
-	histMsgs := h.store.GetChatMessagesFor(id, limit)
-	return histMsgs, ""
+	// Media rows persisted as "upl://<id>" references must come
+	// back as base64 for the LLM request; the disk read replaces
+	// the old SQLite read and keeps the model's vision context
+	// intact. Best-effort: a missing file degrades to a text
+	// marker instead of breaking the turn.
+	histMsgs = resolveHistoryUploads(histMsgs, h.attachResolver)
+	return histMsgs, compSummary
 }
+
+// turnStreamResult tells SendMessage how a chat stream ended so it can
+// decide whether to auto-resume a deadline-terminated turn.
+type turnStreamResult int
+
+const (
+	// turnStreamEnded: a terminal frame (done or error) was emitted, or
+	// the stream closed for a non-retryable reason — stop the turn.
+	turnStreamEnded turnStreamResult = iota
+	// turnStreamRetry: the turn was cut short by the MaxTurnSeconds
+	// deadline, no terminal frame was emitted, and a retryNotice was
+	// set — SendMessage should reload the persisted conversation and
+	// re-run the agent loop with a fresh budget.
+	turnStreamRetry
+)
 
 // respondSSE writes a chat stream to the response. Used
 // by both SendMessage and the P1-3 Regenerate endpoint —
@@ -274,8 +475,59 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 // and need the same SSE envelope (data + id, flush
 // per-frame, done-handling). Keep this the only place
 // that knows how an internal chunk becomes wire bytes.
+//
+// retryNotice is the message emitted (as a phase event) when the turn
+// is terminated by its hard deadline and the caller wants to auto-resume
+// instead of emitting the terminal turn_timeout frame. Empty = no
+// auto-resume (terminal frame behaviour preserved, e.g. Regenerate).
 
-func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk, sessionID, provider, model string) {
+// writeSSEWithTimeout writes one SSE frame under a hard write
+// deadline. A WebView2 renderer frozen by memory pressure stops
+// reading the response body but keeps the TCP connection open —
+// net/http only cancels the request ctx when the connection
+// *closes*, so a stuck client would otherwise keep the turn alive
+// until MaxTurnSeconds. The deadline makes the write fail fast,
+// respondSSE cancels the turn, and the agent loop exits via
+// ctx.Done().
+func writeSSEWithTimeout(w http.ResponseWriter, ev StreamEvent, timeout time.Duration) error {
+	// Best-effort socket write deadline: http.NewResponseController unwraps
+	// gin's writer down to the underlying net.Conn and sets a write deadline
+	// there. On Windows a stuck flush is NOT reliably interrupted by
+	// SetWriteDeadline — the 2026-08-04 hang: a WebView2 renderer frozen by
+	// jank kept the TCP conn open but stopped reading, the frame flush
+	// blocked in WSASend, and the bare fl.Flush() that followed
+	// writeSSEFrame wedged respondSSE for the rest of the turn (see the
+	// 08-03 goroutine dump: SendMessage → respondSSE → Flush → WSASend).
+	// So the goroutine+timer below is the real backstop: respondSSE always
+	// returns within timeout, cancels the turn, and closing the conn frees
+	// the abandoned writer goroutine. Write AND flush are kept inside the
+	// goroutine so the flush cannot block the callback on its own.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout))
+	type result struct{ err error }
+	done := make(chan result, 1)
+	go func() {
+		ferr := writeSSEFrame(w, ev)
+		if ferr == nil {
+			// http.Flusher.Flush has no error return; the write deadline +
+			// the timer below still bound a stuck flush (goroutine/timer
+			// backstop), and the conn close on turn cancellation frees it.
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+		}
+		done <- result{err: ferr}
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case r := <-done:
+		return r.err
+	case <-t.C:
+		return fmt.Errorf("sse write timed out after %s (client not reading)", timeout)
+	}
+}
+
+func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk, sessionID, provider, model string, retryNotice string) turnStreamResult {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -303,7 +555,30 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 	// can distinguish "interrupted" from "completed" instead of
 	// treating a truncation as success.
 	terminalEmitted := false
+	// sseWriteTimeout bounds one frame write. When the client stops
+	// reading (frozen renderer), the write hangs; the timeout cancels
+	// the turn via turnCtx so the agent loop exits and the session
+	// lock releases instead of blocking until MaxTurnSeconds.
+	const sseWriteTimeout = 10 * time.Second
+	// cancelTurn aborts the in-flight turn. Resolved from
+	// c.Request.Context()'s cancel — SendMessage registered it in
+	// h.turnCancels; we look it up here so Regenerate (which also
+	// calls respondSSE) works too.
+	cancelTurn := func() {
+		if v, ok := h.turnCancels.Load(sessionID); ok {
+			if f, ok := v.(context.CancelFunc); ok {
+				f()
+			}
+		}
+	}
+	result := turnStreamEnded
 	c.Stream(func(w io.Writer) bool {
+		// gin passes c.Writer (an http.ResponseWriter) here; cast
+		// back so writeSSEWithTimeout can reach the net.Conn.
+		rw, isRW := w.(http.ResponseWriter)
+		if !isRW {
+			rw = c.Writer
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("[sse] panic in stream writer: %v", r)
@@ -312,21 +587,41 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		chunk, ok := <-stream
 		if !ok {
 			// Stream closed without a done event. If the turn was
-			// interrupted by its hard deadline, surface that to the
-			// client as a terminal error frame.
+			// interrupted by its hard deadline, either auto-resume
+			// (signal SendMessage to re-run the loop with a "继续"
+			// nudge) or surface a terminal turn_timeout error frame
+			// when the retry budget is exhausted.
 			if !terminalEmitted {
-				terminalEmitted = true
 				if err := c.Request.Context().Err(); err != nil {
-					ev := streamEventFromChunk(agent.ChatStreamChunk{
-						Error:    fmt.Sprintf("回合超出最长执行时间被终止: %v", err),
-						ErrorKind: "turn_timeout",
-						Done:     true,
-					}, provider, model, streamDoneIDs{})
-					if werr := writeSSEFrame(w, ev); werr == nil {
-						if fl, ok := c.Writer.(http.Flusher); ok {
-							fl.Flush()
-						}
+					if errors.Is(err, context.DeadlineExceeded) && retryNotice != "" {
+						// Auto-resume: keep the stream open, tell the
+						// user a retry is starting, and re-mark the
+						// session busy (the agent loop already sent an
+						// idle event on its way out). SendMessage then
+						// reloads the persisted partial conversation and
+						// re-invokes the agent loop with a fresh budget.
+						notice := streamEventFromChunk(agent.ChatStreamChunk{
+							Phase:   "system",
+							Step:    "turn-retry",
+							Message: retryNotice,
+						}, provider, model, streamDoneIDs{})
+						// writeSSEWithTimeout writes AND flushes, bounded.
+						_ = writeSSEWithTimeout(rw, notice, sseWriteTimeout)
+						busy := streamEventFromChunk(agent.ChatStreamChunk{
+							SessionStatus: "retry",
+						}, provider, model, streamDoneIDs{})
+						_ = writeSSEWithTimeout(rw, busy, sseWriteTimeout)
+						result = turnStreamRetry
+						return false
 					}
+					terminalEmitted = true
+					ev := streamEventFromChunk(agent.ChatStreamChunk{
+						Error:     fmt.Sprintf("回合超出最长执行时间被终止: %v", err),
+						ErrorKind: "turn_timeout",
+						Done:      true,
+					}, provider, model, streamDoneIDs{})
+					// writeSSEWithTimeout writes AND flushes, bounded.
+					_ = writeSSEWithTimeout(rw, ev, sseWriteTimeout)
 				}
 			}
 			return false
@@ -337,20 +632,89 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 			ids.lastMessageID = h.store.GetLastMessageID(sessionID)
 		}
 		ev := streamEventFromChunk(chunk, provider, model, ids)
+		// Auto-resume on a retryable terminal error (LLM upstream failure
+		// after the staircase retries are exhausted, stream stall, timeout)
+		// when the session still has unfinished todos. The turn is re-run
+		// with a "继续完成<任务>" nudge instead of forcing the user to type
+		// "继续" again. retryNotice is only set while the retry budget
+		// remains, and permanent errors (bad_request / auth / not_found /
+		// vision_unsupported) never resume, so this cannot loop on an
+		// unresolvable failure. T3: the no-progress breaker
+		// (shouldAutoResume) stops the chain when the todo set never
+		// changes across resumes — the turn then ends with its terminal
+		// error frame and a notice asking the user to intervene.
+		if chunk.Done && chunk.Error != "" && retryNotice != "" &&
+			agent.IsRetryableErrorKind(chunk.ErrorKind) && agent.HasPendingTodos(sessionID) {
+			if resume, notice := h.shouldAutoResume(sessionID); resume {
+				if err := writeSSEWithTimeout(rw, ev, sseWriteTimeout); err != nil {
+					log.Printf("%s[sse] write failed (client stopped reading): %v — cancelling turn", trace.LogPrefix(c.Request.Context()), err)
+					cancelTurn()
+					return false
+				}
+				// Not terminal: SendMessage re-invokes the loop with a fresh
+				// budget and the auto-resume nudge (turnStreamRetry).
+				result = turnStreamRetry
+				return false
+			} else if notice != "" {
+				// No-progress limit hit: tell the user, then fall through
+				// to the generic terminal frame write below (error+done).
+				n := streamEventFromChunk(agent.ChatStreamChunk{
+					Phase:   "system",
+					Step:    "auto-resume-stopped",
+					Message: notice,
+				}, provider, model, streamDoneIDs{})
+				_ = writeSSEWithTimeout(rw, n, sseWriteTimeout)
+			}
+		}
+		// Normal completion but the session still has unfinished todos: the
+		// LLM gave a final answer without marking every todo done/cancelled
+		// (e.g. it declared "done" while an item is still in_progress, or the
+		// internal auto-continue budget was exhausted). Auto-resume with a
+		// "检查并更新 todo" nudge so the user never has to type "继续" while
+		// real work is still tracked. Gated on the retry budget (retryNotice
+		// set) and on pending todos, so a finished plan (all done/cancelled)
+		// and non-resumable endpoints (Regenerate passes empty retryNotice)
+		// end normally. Crucially we do NOT emit the type="done" frame here —
+		// the client keeps reading the same SSE stream while SendMessage
+		// re-runs the loop. T3: the no-progress breaker (shouldAutoResume)
+		// stops the chain when the todo set never changes across resumes —
+		// the turn then ends with its done frame and a notice.
+		if chunk.Done && chunk.Error == "" && retryNotice != "" && agent.HasPendingTodos(sessionID) {
+			if resume, stopNotice := h.shouldAutoResume(sessionID); resume {
+				notice := streamEventFromChunk(agent.ChatStreamChunk{
+					Phase:   "system",
+					Step:    "todo-auto-continue",
+					Message: "检测到 todo 仍有未完成项，自动继续检查并更新状态…",
+				}, provider, model, streamDoneIDs{})
+				// writeSSEWithTimeout writes AND flushes, bounded.
+				_ = writeSSEWithTimeout(rw, notice, sseWriteTimeout)
+				result = turnStreamRetry
+				return false
+			} else if stopNotice != "" {
+				// No-progress limit hit: tell the user, then fall through
+				// to the generic done-frame write below.
+				n := streamEventFromChunk(agent.ChatStreamChunk{
+					Phase:   "system",
+					Step:    "auto-resume-stopped",
+					Message: stopNotice,
+				}, provider, model, streamDoneIDs{})
+				_ = writeSSEWithTimeout(rw, n, sseWriteTimeout)
+			}
+		}
 		if chunk.Done {
 			terminalEmitted = true
 		}
 		if ev.Type == "question" {
 			log.Printf("[sse] writing question event (%d bytes json)", len(ev.QuestionJSON))
 		}
-		if err := writeSSEFrame(w, ev); err != nil {
+		if err := writeSSEWithTimeout(rw, ev, sseWriteTimeout); err != nil {
+			log.Printf("%s[sse] write failed (client stopped reading): %v — cancelling turn", trace.LogPrefix(c.Request.Context()), err)
+			cancelTurn()
 			return false
-		}
-		if fl, ok := c.Writer.(http.Flusher); ok {
-			fl.Flush()
 		}
 		return !chunk.Done
 	})
+	return result
 }
 
 // chunkToEvent maps an internal ChatStreamChunk to a public

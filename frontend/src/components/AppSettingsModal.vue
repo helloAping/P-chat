@@ -2084,8 +2084,8 @@ function kbModelSupportsVision(scanModel: string) {
                     </div>
                     <div class="sys-form-row">
                       <span class="sys-label">超时时间</span>
-                      <NInput v-model:value="sysSubAgent.timeout" size="small" placeholder="例如: 5m" style="width:140px" @update:value="markSysDirty" />
-                      <span class="sys-hint">留空 = 默认 5 分钟</span>
+                      <NInput v-model:value="sysSubAgent.timeout" size="small" placeholder="例如: 30m" style="width:140px" @update:value="markSysDirty" />
+                      <span class="sys-hint">留空 = 默认 30 分钟（兜底；卡死由 LLM idle / 工具超时提前拦截）</span>
                     </div>
                   </div>
                 </NCollapseItem>

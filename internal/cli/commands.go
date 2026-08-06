@@ -2226,7 +2226,7 @@ func cmdTools(ctx cliContext, args string) error {
 		color.Magenta("  ◆ task 工具：派生子 agent")
 		color.HiBlack("    - 子 agent 获得独立的 system prompt + 工具集")
 		color.HiBlack("    - 排除 task 自身（防止无限递归）")
-		color.HiBlack("    - 默认 5 分钟超时，父 ctx 取消会传播")
+		color.HiBlack("    - 默认 30 分钟 wall-clock 兜底（防卡死靠 LLM idle/工具超时），父 ctx 取消会传播")
 		color.HiBlack("    - 5 分钟内同 (description, style, provider) 命中缓存")
 	}
 
