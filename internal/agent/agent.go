@@ -3014,11 +3014,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			pruneOldToolResults(msgs, roundNum, pr)
 		}
 
-		if maxRounds > 0 {
-			emitTodoIncomplete("max rounds reached before the plan was complete", maxRounds)
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "limit", Step: "max-rounds", Message: fmt.Sprintf("已达到 %d 轮上限 (总耗时 %s)。LLM 已强制给出文本总结。", maxRounds, formatElapsed(time.Since(start))), Round: maxRounds, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
-		}
-		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+		// NOTE: the round loop above can only exit via `return` — every
+		// path ends inside the loop (the no-tool-call branch persists the
+		// assistant and emits Done, error paths return with error+done).
+		// The old post-loop "max rounds reached" emit + trailing
+		// sendOrDrop(Done) here was dead code (go vet unreachable) and
+		// was removed; the round-cap turn already emits its done frame
+		// and todo-incomplete notice from the live paths.
 	}()
 
 	return ch

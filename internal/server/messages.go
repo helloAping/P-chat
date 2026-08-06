@@ -326,6 +326,17 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		chatReq.CompressedSummary = compSummary
 		chatReq.TodoMode = agent.TodoModeResume
 	}
+
+	// The retry chain has fully ended. Release the per-session T3/T4
+	// bookkeeping so dead sessions do not accumulate entries for the
+	// process lifetime: the T3 resume tracker and the T4 cross-turn
+	// breaker. This is the chain-end point — never mid-chain, or the
+	// accumulated no-progress / failure streak the next resume needs
+	// would be lost. The next user message recreates both fresh.
+	h.resumeTrackers.Delete(id)
+	if h.agent != nil {
+		h.agent.ClearBreakerState(id)
+	}
 }
 
 // turnCancelRegistration is the cleanup handle returned by

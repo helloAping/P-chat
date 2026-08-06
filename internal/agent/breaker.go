@@ -163,3 +163,17 @@ func toolNameFromSig(sig string) string {
 	}
 	return sig
 }
+
+// ClearBreakerState drops the cross-turn breaker entry for a session.
+// Called by the server when a SendMessage retry chain fully ends (the
+// auto-resume loop exits), so dead sessions do not accumulate
+// breakerState entries for the process lifetime. It must NOT be called
+// between the turns of one chain — the accumulated streak is exactly what
+// the next auto-resume needs (T4). A missing entry is a no-op: the next
+// user turn's LoadOrStore recreates a fresh state.
+func (a *Agent) ClearBreakerState(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	a.breakers.Delete(sessionID)
+}

@@ -500,7 +500,11 @@ func TestTruncateToFit_SingleMessage(t *testing.T) {
 // implementation rebuilt + re-estimated the whole kept slice per message,
 // which on a 3900-message session allocated tens of MB per call and fed an
 // auto-compact GC storm (2026-08-05 CPU spike). The O(n) rewrite must stay
-// comfortably under 50ms with negligible allocation on the same input.
+// comfortably fast on the same input. The threshold is a generous 200ms so
+// a busy CI box running the full suite in parallel (which flaked the old
+// 50ms bound) does not fail the test; the O(n²) regression is orders of
+// magnitude slower and still trips it. `-short` skips the timing assertion
+// entirely — it is a perf guard, not a correctness one.
 func TestTruncateToFit_PerfBound(t *testing.T) {
 	msgs := make([]llm.ChatMessage, 0, 3916)
 	msgs = append(msgs, llm.ChatMessage{Role: llm.RoleSystem, Type: llm.TypeText, Content: "sys"})
@@ -517,8 +521,8 @@ func TestTruncateToFit_PerfBound(t *testing.T) {
 	start := time.Now()
 	truncateToFit(&msgs, 20000)
 	elapsed := time.Since(start)
-	if elapsed > 50*time.Millisecond {
-		t.Fatalf("truncateToFit(3916 msgs) took %v, want <50ms (O(n) regression?)", elapsed)
+	if !testing.Short() && elapsed > 200*time.Millisecond {
+		t.Fatalf("truncateToFit(3916 msgs) took %v, want <200ms (O(n) regression?)", elapsed)
 	}
 	if len(msgs) == 3917 {
 		t.Fatalf("truncateToFit did not drop any messages on a 3916-msg input")
