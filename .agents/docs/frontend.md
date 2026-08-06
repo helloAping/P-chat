@@ -32,6 +32,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/CommandPalette.vue` | `/` 斜杠命令内联自动补全 | |
 | `components/TodoPanel.vue` | 待办事项面板（交互式） | |
 | `components/QuestionModal.vue` | 多选问题对话框 | |
+| `components/StreamingBar.vue` | 对话页顶部"对话进行中"加载条（transform 滚动渐变，compositor-only） | 绑定 `isStreaming`/`currentSessionWorking` |
 | `components/ImageLightbox.vue` | 全屏图片查看器 | |
 | `components/LoadingDots.vue` | 子代理加载指示器 | |
 | `components/AppSettingsModal.vue` | Provider/Model/Style/知识库管理 | 左右分栏 + KB 三层树视图 + NCollapse |
@@ -274,6 +275,10 @@ flag + `source` 路径）。`GET /api/v1/tools` 同时返回 `diagnostics[]`，
 验证：`scripts/gpu-probe/` A/B 测量（Chromium GPU 进程，见其 README），
 流式 renderer 20.5%→10.3%、GPU 11.7%→8.1%。卡死流（`done` 丢失）由传输层
 150s idle watchdog（`idleTimeoutMs`）兜底，无需额外前端看门狗。
+
+对话页顶部的 `StreamingBar.vue`（"对话进行中"加载条）同样遵循
+compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
+重复模式实现无缝滚动，无 `background-position` 动画（见 §8.4 例外）。
 
 ## 修改指南
 

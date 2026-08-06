@@ -6,6 +6,7 @@ import MessageBubble from './MessageBubble.vue'
 import ContextInspectorDrawer from './ContextInspectorDrawer.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
+import StreamingBar from './StreamingBar.vue'
 import QuestionModal from './QuestionModal.vue'
 // QuestionPanel removed in 2026-07-09 — it duplicated
 // QuestionModal's state (answers, multiAnswers) and created a
@@ -351,6 +352,10 @@ function messageKey(m: any, i: number): string | number {
 
 <template>
   <main class="chat-main">
+    <!-- Conversation-in-progress loading bar. Thin indeterminate
+         strip at the top of the chat page; visible from the moment
+         a turn starts until it ends (isStreaming || sessionWorking). -->
+    <StreamingBar />
     <!-- P0-1: transient banner shown when the recovery
          flow successfully merged server-side parts into
          the trailing assistant message. currentRecoveryBanner

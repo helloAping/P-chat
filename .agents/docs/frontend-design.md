@@ -538,8 +538,11 @@ WebView2 **GPU 进程**（合成器/光栅线程）对流式期间的动画极�
   （已从 `MessageBubble.vue` 移除，改用 6px stream-dot 提示）
 - **禁止**用 `background-position` 动画做 shimmer（每帧重绘 + GPU raster；
   已从 `SubAgentCard.vue` 移除）
-- 流式指示只能用 ≤20px 的小组件（dot / spinner / caret），且只动画
-  `opacity` / `transform`（compositor-only，不动 layout/paint）
+- 流式指示优先用 ≤20px 的小组件（dot / spinner / caret），且只动画
+  `opacity` / `transform`（compositor-only，不动 layout/paint）。**唯一例外**：
+  对话页顶部的**全宽加载条**（`StreamingBar.vue`，3px）——它用 `transform`
+  平移一条超宽渐变条 + `background-size` 重复模式实现无缝滚动（纯合成器，
+  无 `background-position` 动画），所以允许存在
 - 流式文本用 `textContent` 直写（TypedText 模式），**不**每 delta 跑
   `marked.parse`；markdown 只渲染一次，走共享缓存
   `utils/markdownCache.ts`
