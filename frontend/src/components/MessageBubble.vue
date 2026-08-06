@@ -28,7 +28,7 @@
 //     the user sees a blinking caret alone in the
 //     bubble as soon as they hit send.
 import { computed, h, nextTick, ref, useTemplateRef, watch } from 'vue'
-import { marked } from 'marked'
+import { renderMarkdown } from '../utils/markdownCache'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
@@ -37,26 +37,10 @@ import {
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
 
-// Markdown render cache. The MessageBubble template previously
-// called `marked.parse(p.text || '')` on every render — for
-// long sessions with many static text parts, this is a major
-// source of jank because marked.parse is O(text length) and
-// Vue re-evaluates the v-html expression any time any reactive
-// dep in the component ticks. Cache by text content; cap the
-// cache at 256 entries to bound memory for very long sessions.
+// Markdown rendering is cached in a shared LRU (`renderMarkdown`) so
+// static text parts never re-parse across re-renders. The live streaming
+// part routes through TypedText (textContent), not this path.
 //
-// LRU-ish: a Map preserves insertion order, so we can pop the
-// oldest entry when over the cap.
-const MD_CACHE_MAX = 256
-const MD_CACHE_MAX_BYTES = 2 * 1024 * 1024
-const MD_CACHE_ENTRY_MAX_BYTES = 64 * 1024
-const mdCache = new Map<string, string>()
-let mdCacheBytes = 0
-function cacheCost(text: string, html: string): number {
-  // JavaScript strings are UTF-16, so this is a conservative
-  // accounting approximation for the cache's retained strings.
-  return (text.length + html.length) * 2
-}
 // MAX_MD_INLINE_CHARS bounds how much of a single text part is
 // parsed into markdown DOM at once. LLM replies are normally a few
 // KB; a pathological part (a tool echoing a whole file, a stuck
@@ -67,28 +51,7 @@ function cacheCost(text: string, html: string): number {
 // once, on demand).
 const MAX_MD_INLINE_CHARS = 32 * 1024
 
-function renderMd(text: string): string {
-  if (!text) return ''
-  const cached = mdCache.get(text)
-  if (cached !== undefined) {
-    // Touch: move to end of Map to mark as recently used.
-    mdCache.delete(text)
-    mdCache.set(text, cached)
-    return cached
-  }
-  const html = marked.parse(text, { async: false, breaks: true }) as string
-  if (cacheCost(text, html) > MD_CACHE_ENTRY_MAX_BYTES) return html
-  mdCache.set(text, html)
-  mdCacheBytes += cacheCost(text, html)
-  while (mdCache.size > MD_CACHE_MAX || mdCacheBytes > MD_CACHE_MAX_BYTES) {
-    const oldest = mdCache.keys().next().value
-    if (oldest === undefined) break
-    const oldestHTML = mdCache.get(oldest)
-    if (oldestHTML !== undefined) mdCacheBytes -= cacheCost(oldest, oldestHTML)
-    mdCache.delete(oldest)
-  }
-  return html
-}
+const renderMd = renderMarkdown
 import { NDropdown, useMessage, useDialog, type DropdownOption } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import * as api from '../api/client'
@@ -2074,7 +2037,12 @@ function findPrecedingUserMessageId(): number {
 }
 
 /* --- Streaming + meta -------------------------------------------- */
-.msg.streaming .bubble { animation: pulse 1.5s infinite; }
+/* The whole-bubble opacity pulse was removed (2026-08-06): animating
+ * opacity on a large message layer every frame keeps the WebView2 GPU
+ * process (compositor) busy for the entire stream — 60fps for minutes
+ * — with no info gain. Streaming is already signalled cheaply by the
+ * 6px stream-dot, the TypedText caret, and the thinking spinner. */
+
 
 .msg-meta {
   margin-top: 6px;

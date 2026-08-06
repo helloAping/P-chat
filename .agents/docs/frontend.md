@@ -18,6 +18,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 |---|---|---|
 | `api/client.ts` | HTTP+SSE 客户端、类型定义 | `StreamEvent`, `MessagePart`, `streamMessages()`, `sendMessage()` |
 | `stores/chat.ts` | Pinia 状态管理（会话、消息、流） | `appendStreamEvent()`, `useChatStore()` |
+| `utils/markdownCache.ts` | 共享 markdown 渲染 LRU 缓存（MessageBubble / SubAgentCard 共用） | `renderMarkdown()` |
 | `main.ts` | 应用入口（Naive UI + Router） | `createApp()` |
 | `App.vue` | 根布局（侧边栏 + 聊天区域） | |
 | `components/ChatWindow.vue` | 聊天窗口（消息列表 + 输入区） | |
@@ -253,6 +254,26 @@ flag + `source` 路径）。`GET /api/v1/tools` 同时返回 `diagnostics[]`，
 浏览器的标签页列表，并允许用户把某一页设为「控制目标」。扩展侧维护
 `preferredTabId`；`browser_*` 工具默认作用到该目标，也可在参数里显式传
 `tab_id` 覆盖。协议版本现为 `3`。
+
+### 11. GPU 渲染优化 (2026-08-06)
+
+修复 WebView2 **GPU 进程**（合成器/光栅线程）流式期间持续高 CPU。核心原则：
+**流式指示只允许小组件（dot / spinner / caret，只动画 `opacity`/`transform`）；
+大图层禁止持续动画；流式文本禁止每 delta 重解析 markdown。**
+
+- **F1** — 移除整气泡流式 opacity 脉冲（`MessageBubble.vue` 曾
+  `.msg.streaming .bubble { animation: pulse 1.5s infinite }`）。整层 opacity
+  动画 = 合成器全程 60fps，流式几分钟就烧几分钟。流式信号改由 6px stream-dot
+  + TypedText caret + thinking spinner 承担。
+- **F2** — 移除子代理 header 的 `background-position` shimmer（每帧重绘 +
+  GPU raster）。运行态改为静态 surface tint + 左 accent 边框。
+- **F3** — 子代理**流式中的文本**改走 `TypedText`（textContent 直写，O(1)），
+  不再每次 delta 对全文 `marked.parse`（O(n²)）。静态 part 统一走共享 LRU 缓存
+  `utils/markdownCache.ts`（MessageBubble / SubAgentCard 共用）。
+
+验证：`scripts/gpu-probe/` A/B 测量（Chromium GPU 进程，见其 README），
+流式 renderer 20.5%→10.3%、GPU 11.7%→8.1%。卡死流（`done` 丢失）由传输层
+150s idle watchdog（`idleTimeoutMs`）兜底，无需额外前端看门狗。
 
 ## 修改指南
 

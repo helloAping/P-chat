@@ -353,6 +353,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 工具派发 + forwarder | `internal/agent/agent.go:1150-1471` |
 | parts 累加器 | `internal/agent/parts.go` |
 | 流式事件分发 | `frontend/src/stores/chat.ts:828-1103` `appendStreamEvent()` |
+| 共享 markdown 渲染缓存 | `frontend/src/utils/markdownCache.ts` |
 | 后端 SSE 事件映射 | `internal/server/handler.go:1495-1613` `chunkToEvent()` |
 | 工作模式 `work_mode` 配置 | `internal/config/config.go` `WorkModeConfig` |
 | `work_mode` 提示词段 | `internal/agent/prompt.go` `buildWorkModeBlock()` |
