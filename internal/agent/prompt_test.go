@@ -115,6 +115,29 @@ func TestBuildPlatformSection_HasShellHint(t *testing.T) {
 	}
 }
 
+// TestBuildConversationContinuity_HardenedToolFailureGuidance locks down
+// the T5 prompt strengthening: the system prompt must forbid repeating
+// the same failing command, force a different approach after 2
+// consecutive failures, and explain that `[no test files]` is normal.
+// The 2026-08 my-blog session re-ran the same go test command 810 times
+// across 51 auto-resumes partly because this guidance was missing.
+func TestBuildConversationContinuity_HardenedToolFailureGuidance(t *testing.T) {
+	got := buildConversationContinuitySection()
+	for _, want := range []string{
+		"Do NOT retry the same command repeatedly",
+		"After 2 consecutive failures of the SAME command",
+		"不要反复重试同一命令",
+		"连续失败 2 次必须换方式",
+		"[no test files]",
+		"不是错误",
+		"findstr",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("conversation continuity section missing %q", want)
+		}
+	}
+}
+
 // =====================================================================
 // buildAttachmentsSection
 // =====================================================================
