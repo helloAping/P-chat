@@ -104,6 +104,11 @@ type Agent struct {
 	// rules dir). The field lets buildStaticSystemPrompt
 	// detect a project switch and invalidate the cache.
 	lastProjectRoot string
+
+	// breakers holds the T4 cross-turn tool-failure breaker state,
+	// keyed by session id. Auto-resume turns accumulate into it across
+	// turn boundaries; a genuine user message resets it. See breaker.go.
+	breakers sync.Map
 }
 
 // SetChatOptions overrides the per-request sampling parameters
@@ -1060,6 +1065,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// when the user reopens the session.
 		partsAcc := newPartsAccumulator()
 		todoMode := todoModeFromRequest(req.TodoMode)
+		// T4: per-session cross-turn tool-failure breaker. Auto-resume
+		// turns keep accumulating across turn boundaries (that is the
+		// fix for the my-blog dead-loop, where local counters reset
+		// every turn); a genuine user message resets the breaker so a
+		// new intent starts fresh and the breaker can recover.
+		var breaker *breakerState
+		if req.SessionID != "" {
+			v, _ := a.breakers.LoadOrStore(req.SessionID, &breakerState{})
+			breaker = v.(*breakerState)
+			if !isAutoResumeTurn(req) {
+				breaker.reset()
+			}
+		}
 		todoIncompleteSent := false
 		emitTodoIncomplete := func(reason string, round int) {
 			if todoIncompleteSent {
@@ -1467,7 +1485,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				toolCalls           []nativeToolCall
 				argsAccum           = make(map[int]*nativeToolCall)
 				roundAnyToolErrored bool
-				streamBytes         int
+				// roundFailSigs collects the normalized signatures of
+				// this round's failing tool calls, fed to the T4
+				// cross-turn breaker after the round.
+				roundFailSigs []string
+				streamBytes   int
 			)
 
 			opts := a.options
@@ -2543,6 +2565,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if o.err != nil || o.result == nil {
 					roundAnyToolErrored = true
 					cumToolErrCount++
+					roundFailSigs = append(roundFailSigs, normalizeToolFailureSig(tc.Name, tc.ArgsJSON))
 					errMsg := "unknown error"
 					if o.result != nil {
 						errMsg = o.result.Content
@@ -2591,6 +2614,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if result.IsError {
 					roundAnyToolErrored = true
 					cumToolErrCount++
+					roundFailSigs = append(roundFailSigs, normalizeToolFailureSig(tc.Name, tc.ArgsJSON))
 					warnChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d-warn", i+1), Message: fmt.Sprintf("     ! %s 返回错误 (%s)", tc.Name, toolElapsed), ToolID: tc.ID, ToolName: tc.Name, ToolResult: resultPreview, ToolError: "tool returned error", ToolElapsed: toolElapsed, Round: roundNum, MaxRound: maxRounds}
 					attachToolResultMetadata(&warnChunk, result)
 					partsAcc.update(warnChunk)
@@ -2817,6 +2841,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				})
 			}
 
+			// T4: feed the cross-turn breaker with this round's failing
+			// signatures. The intra-turn guards below may fire and reset
+			// it; the cross-turn check at the end only fires when neither
+			// intra-turn guard did (so the user gets one clear message,
+			// not two).
+			if breaker != nil {
+				for _, sig := range roundFailSigs {
+					breaker.recordFailure(sig)
+				}
+			}
+
 			// Same-tool-name error counter: if a single tool
 			// errors N times in a row (even with different
 			// args — the stuck-loop guard only catches
@@ -2833,6 +2868,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			} else {
 				sameToolErrName = ""
 				sameToolErrCount = 0
+			}
+			// A tool round that made progress (at least one tool returned
+			// successfully) means the LLM moved on from the failing
+			// command — the cross-turn same-command streak must not carry
+			// over. Text-only rounds deliberately do NOT reset it: an
+			// interrupted turn often ends with a text reply after failed
+			// tool rounds, and the next auto-resume must still see the
+			// streak (that is the whole point of cross-turn accumulation).
+			if roundToolSucceeded && breaker != nil {
+				breaker.resetStreak()
 			}
 			if sameToolErrCount >= sameToolErrMax {
 				// P2-1: reset the stuck-loop guard too.
@@ -2855,6 +2900,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				statusMsg := fmt.Sprintf("%s 已连续失败 %d 次，改用其他方式。", sameToolErrName, sameToolErrCount)
 				resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
 				resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+				if breaker != nil {
+					// The intra-turn guard already told the LLM to stop;
+					// reset the cross-turn state so it does not fire a
+					// duplicate message in the same round.
+					breaker.reset()
+				}
 				msgs = append(msgs, llm.ChatMessage{
 					Role:    llm.RoleSystem,
 					Type:    llm.TypeText,
@@ -2885,6 +2936,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				cumToolErrCount = 0 // fire once
 				resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
 				resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+				if breaker != nil {
+					breaker.reset()
+				}
 				msgs = append(msgs, llm.ChatMessage{
 					Role:    llm.RoleSystem,
 					Type:    llm.TypeText,
@@ -2896,6 +2950,49 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					Message: fmt.Sprintf("累计 %d 次工具失败（各不相同），强制转为总结。", CumToolErrMax),
 					Round:   roundNum,
 				})
+			}
+
+			// T4: cross-turn breaker check. The state above survives turn
+			// boundaries (auto-resume chains keep accumulating; only a
+			// user message / intra-turn guard / breaker fire resets it),
+			// so the my-blog pattern — a failing command repeated across
+			// many turns with local counters reset every turn — finally
+			// trips a breaker. Runs only when no intra-turn guard fired
+			// this round (they reset the breaker themselves).
+			if breaker != nil {
+				streak, cum, sig := breaker.peek()
+				switch {
+				case streak >= crossTurnSameToolMax:
+					breaker.reset()
+					resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
+					resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+					msgs = append(msgs, llm.ChatMessage{
+						Role:    llm.RoleSystem,
+						Type:    llm.TypeText,
+						Content: fmt.Sprintf("工具 `%s` 已连续失败 %d 次（跨回合累计，参数相近的命令视为同一次失败）。不要重试 — 改用其他方式完成任务（如 read_file、list_files、或 task 子代理）。", toolNameFromSig(sig), streak),
+					})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:   "limit",
+						Step:    "cross-turn-same-tool-limit",
+						Message: fmt.Sprintf("工具调用已连续 %d 次（跨回合累计）失败，改用其他方式。", streak),
+						Round:   roundNum,
+					})
+				case cum >= CumToolErrMax:
+					breaker.reset()
+					resetGuardCounters(&stuckStreak, &prevToolSig, &prevErrored)
+					resetSameToolErr(&sameToolErrName, &sameToolErrCount)
+					msgs = append(msgs, llm.ChatMessage{
+						Role:    llm.RoleSystem,
+						Type:    llm.TypeText,
+						Content: fmt.Sprintf("当前任务已累计 %d 次工具调用失败（跨回合累计）。工具环境可能不可用（如 Windows 上执行了 Unix 命令）。请立即停止调用工具，基于已获取的信息给出最终总结。", CumToolErrMax),
+					})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:   "limit",
+						Step:    "cross-turn-cum-limit",
+						Message: fmt.Sprintf("累计 %d 次工具失败（跨回合），强制转为总结。", CumToolErrMax),
+						Round:   roundNum,
+					})
+				}
 			}
 
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
