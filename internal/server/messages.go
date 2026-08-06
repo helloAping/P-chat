@@ -159,6 +159,14 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// a server restart; clear is idempotent because the UI may have already
 	// called DELETE /todos during preflight.
 	todoMode := agent.NormalizeTodoMode(req.TodoMode)
+	// T3: a genuine user message resets the session's auto-resume
+	// no-progress tracker — the user changed intent, so the resume budget
+	// starts fresh. Auto-resume re-invocations (ClientMsgID==0 +
+	// TodoMode=resume) keep it, so an interrupted chain keeps its
+	// no-progress count across turns (see auto_resume.go).
+	if req.ClientMsgID != 0 || todoMode != agent.TodoModeResume {
+		h.resumeTrackers.Delete(id)
+	}
 	h.hydrateSessionTodos(id)
 	if todoMode == agent.TodoModeClear {
 		if err := h.clearSessionTodos(id); err != nil {
@@ -620,18 +628,32 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		// "继续" again. retryNotice is only set while the retry budget
 		// remains, and permanent errors (bad_request / auth / not_found /
 		// vision_unsupported) never resume, so this cannot loop on an
-		// unresolvable failure.
+		// unresolvable failure. T3: the no-progress breaker
+		// (shouldAutoResume) stops the chain when the todo set never
+		// changes across resumes — the turn then ends with its terminal
+		// error frame and a notice asking the user to intervene.
 		if chunk.Done && chunk.Error != "" && retryNotice != "" &&
 			agent.IsRetryableErrorKind(chunk.ErrorKind) && agent.HasPendingTodos(sessionID) {
-			if err := writeSSEWithTimeout(rw, ev, sseWriteTimeout); err != nil {
-				log.Printf("%s[sse] write failed (client stopped reading): %v — cancelling turn", trace.LogPrefix(c.Request.Context()), err)
-				cancelTurn()
+			if resume, notice := h.shouldAutoResume(sessionID); resume {
+				if err := writeSSEWithTimeout(rw, ev, sseWriteTimeout); err != nil {
+					log.Printf("%s[sse] write failed (client stopped reading): %v — cancelling turn", trace.LogPrefix(c.Request.Context()), err)
+					cancelTurn()
+					return false
+				}
+				// Not terminal: SendMessage re-invokes the loop with a fresh
+				// budget and the auto-resume nudge (turnStreamRetry).
+				result = turnStreamRetry
 				return false
+			} else if notice != "" {
+				// No-progress limit hit: tell the user, then fall through
+				// to the generic terminal frame write below (error+done).
+				n := streamEventFromChunk(agent.ChatStreamChunk{
+					Phase:   "system",
+					Step:    "auto-resume-stopped",
+					Message: notice,
+				}, provider, model, streamDoneIDs{})
+				_ = writeSSEWithTimeout(rw, n, sseWriteTimeout)
 			}
-			// Not terminal: SendMessage re-invokes the loop with a fresh
-			// budget and the auto-resume nudge (turnStreamRetry).
-			result = turnStreamRetry
-			return false
 		}
 		// Normal completion but the session still has unfinished todos: the
 		// LLM gave a final answer without marking every todo done/cancelled
@@ -643,17 +665,30 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		// and non-resumable endpoints (Regenerate passes empty retryNotice)
 		// end normally. Crucially we do NOT emit the type="done" frame here —
 		// the client keeps reading the same SSE stream while SendMessage
-		// re-runs the loop.
+		// re-runs the loop. T3: the no-progress breaker (shouldAutoResume)
+		// stops the chain when the todo set never changes across resumes —
+		// the turn then ends with its done frame and a notice.
 		if chunk.Done && chunk.Error == "" && retryNotice != "" && agent.HasPendingTodos(sessionID) {
-			notice := streamEventFromChunk(agent.ChatStreamChunk{
-				Phase:   "system",
-				Step:    "todo-auto-continue",
-				Message: "检测到 todo 仍有未完成项，自动继续检查并更新状态…",
-			}, provider, model, streamDoneIDs{})
-			// writeSSEWithTimeout writes AND flushes, bounded.
-			_ = writeSSEWithTimeout(rw, notice, sseWriteTimeout)
-			result = turnStreamRetry
-			return false
+			if resume, stopNotice := h.shouldAutoResume(sessionID); resume {
+				notice := streamEventFromChunk(agent.ChatStreamChunk{
+					Phase:   "system",
+					Step:    "todo-auto-continue",
+					Message: "检测到 todo 仍有未完成项，自动继续检查并更新状态…",
+				}, provider, model, streamDoneIDs{})
+				// writeSSEWithTimeout writes AND flushes, bounded.
+				_ = writeSSEWithTimeout(rw, notice, sseWriteTimeout)
+				result = turnStreamRetry
+				return false
+			} else if stopNotice != "" {
+				// No-progress limit hit: tell the user, then fall through
+				// to the generic done-frame write below.
+				n := streamEventFromChunk(agent.ChatStreamChunk{
+					Phase:   "system",
+					Step:    "auto-resume-stopped",
+					Message: stopNotice,
+				}, provider, model, streamDoneIDs{})
+				_ = writeSSEWithTimeout(rw, n, sseWriteTimeout)
+			}
 		}
 		if chunk.Done {
 			terminalEmitted = true

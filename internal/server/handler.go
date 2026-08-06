@@ -67,7 +67,12 @@ type Handler struct {
 	// frozen) still releases the session lock promptly instead of
 	// waiting for the MaxTurnSeconds backstop.
 	turnCancels sync.Map // string → context.CancelFunc
-	meta        map[string]sessionMeta
+	// resumeTrackers tracks todo progress across auto-resumes per
+	// session (T3 no-progress breaker). A genuine user message deletes
+	// the entry; auto-resume chains accumulate into it. See
+	// auto_resume.go.
+	resumeTrackers sync.Map // string → *resumeTracker
+	meta           map[string]sessionMeta
 }
 
 type sessionMeta struct {
