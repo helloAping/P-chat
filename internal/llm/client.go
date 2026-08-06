@@ -398,13 +398,22 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
 		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
 	}
-	log.Printf("%s[llm] request provider=%s model=%s messages=%d tools=%d estimated_tokens=%d context_window=%d body_bytes=%d",
+	// T2 diagnostics: log the message vs tool breakdown so an over-window
+	// request can be attributed to the right side. The my-blog dead-loop
+	// (2026-08-05) showed a single "messages=1" request carrying ~80万
+	// estimated tokens; the total alone could not say whether the messages
+	// or the tool schemas were the culprit — with the breakdown the log
+	// does. msgs_tokens / tools_tokens are the two components of
+	// estimated_tokens (sum equals the total).
+	log.Printf("%s[llm] request provider=%s model=%s messages=%d tools=%d estimated_tokens=%d (msgs_tokens=%d tools_tokens=%d) context_window=%d body_bytes=%d",
 		trace.LogPrefix(ctx),
 		p.name,
 		model,
 		len(messages),
 		len(tools),
 		EstimatePromptTokens(messages, tools),
+		EstimateTokensMessages(messages),
+		EstimateTokensTools(tools),
 		normalizedContextWindow(c.ContextWindow(p.name, model)),
 		len(req.Body),
 	)

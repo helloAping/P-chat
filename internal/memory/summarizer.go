@@ -29,6 +29,18 @@ type Summarizer struct {
 // or in-loop auto-compact) cover the rest.
 const maxCompressBatches = 4
 
+// summaryProtectedNewest is how many of the newest messages are never
+// summarized. The agent must always be able to see its most recent tool
+// interactions, or it loses track of its own last action and repeats the
+// same failing command (the 2026-08-05 my-blog dead-loop: every round
+// compressed the just-executed tool result, so the backfilled request was
+// system-only — "messages=1" with ~80万 tokens — and the LLM, blind to its
+// own output, re-ran go test forever). 6 messages ≈ the last two tool
+// rounds (assistant text + tool_call + tool_result), enough for the model
+// to know what it just did. Protection rotates naturally: a protected
+// message becomes summarizable once 6 newer messages exist.
+const summaryProtectedNewest = 6
+
 func NewSummarizer(s *Store, l *llm.Client, provider string, triggerAt int) *Summarizer {
 	if triggerAt <= 0 {
 		triggerAt = 50
@@ -73,8 +85,21 @@ func (sm *Summarizer) Compress(ctx context.Context, convID string) (bool, string
 	summaryRanges := sm.loadSummaryRanges(convID)
 	summarized := func(id int64) bool { return rangeContainsID(summaryRanges, id) }
 
+	// Collect un-summarized message ids, EXCLUDING the newest
+	// summaryProtectedNewest messages. Those must stay visible to the
+	// agent (its last tool interactions) or the model loses track of its
+	// own previous action and repeats it — the amnesia dead-loop. See
+	// summaryProtectedNewest.
+	scan := ids
+	if n := len(scan); n > 0 {
+		protect := summaryProtectedNewest
+		if protect > n {
+			protect = n
+		}
+		scan = scan[:n-protect]
+	}
 	toSummarize := []int64{}
-	for _, id := range ids {
+	for _, id := range scan {
 		if !summarized(id) {
 			toSummarize = append(toSummarize, id)
 		}
@@ -211,8 +236,20 @@ func (sm *Summarizer) MaybeSummarize(ctx context.Context, convID string) (bool, 
 	summarized := func(id int64) bool { return rangeContainsID(summaryRanges, id) }
 
 	// Pick the oldest non-summarized block (up to half of the message list).
+	// Same newest-message protection as Compress: the last
+	// summaryProtectedNewest messages are never summarized, so the agent
+	// always retains its most recent tool interactions (see
+	// summaryProtectedNewest).
+	scan := ids
+	if n := len(scan); n > 0 {
+		protect := summaryProtectedNewest
+		if protect > n {
+			protect = n
+		}
+		scan = scan[:n-protect]
+	}
 	toSummarize := []int64{}
-	for _, id := range ids {
+	for _, id := range scan {
 		if !summarized(id) {
 			toSummarize = append(toSummarize, id)
 		}

@@ -1217,8 +1217,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{SessionStatus: "busy"})
 
 		// Append compressed summary if provided (from /compress).
+		// T2: inject via appendSummaryInjection — replace any earlier
+		// block, cap the size — so the summary can never accumulate
+		// multiple copies inside one system message (the 2026-08-05
+		// my-blog dead-loop root cause, see summary_inject.go).
 		if req.CompressedSummary != "" {
-			systemPrompt += "\n\n[前文摘要]\n" + req.CompressedSummary
+			systemPrompt = appendSummaryInjection(systemPrompt, req.CompressedSummary)
 		}
 		// Append active skill context (from /skillname slash command).
 		if req.SkillContext != "" {
@@ -3108,8 +3112,15 @@ func (a *Agent) tryAutoCompact(
 		newMsgs := make([]llm.ChatMessage, 0, len(hist)+2)
 		// Keep the system prompt (first message).
 		newMsgs = append(newMsgs, (*msgs)[0])
+		// T2: the summary must REPLACE any previously injected block
+		// (strip + append), never accumulate. Before this fix every
+		// compaction re-appended the FULL accumulated summary to the
+		// system message, growing it by ~54KB per round until the
+		// request carried ~80万 tokens against a 6.4万 window — the
+		// my-blog dead-loop. appendSummaryInjection also caps the
+		// injected size (MaxSummaryPromptTokens).
 		if compSum != "" {
-			newMsgs[0].Content += "\n\n[前文摘要]\n" + compSum
+			newMsgs[0].Content = appendSummaryInjection(newMsgs[0].Content, compSum)
 		}
 		// Append messages from DB (after compression point).
 		for _, m := range hist {

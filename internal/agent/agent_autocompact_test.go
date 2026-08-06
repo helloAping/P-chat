@@ -2,6 +2,9 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -140,5 +143,121 @@ func TestTryAutoCompact_NoSummarizerShortCircuits(t *testing.T) {
 	seq := uint64(0)
 	if got := agt.tryAutoCompact(context.Background(), &msgs, ChatRequest{SessionID: "s", Provider: "test", Model: "m"}, nil, ch, func() uint64 { seq++; return seq - 1 }, 1, 5); got {
 		t.Fatalf("nil summarizer should short-circuit to false")
+	}
+}
+
+// TestTryAutoCompact_BackfillDoesNotDuplicateSummary is the T2 regression
+// for the 2026-08-05 my-blog dead-loop root cause. Previously the success
+// backfill APPENDED the full accumulated summary to the system message on
+// EVERY compaction, while the turn-start injection had already added one
+// copy — so the system message grew by ~54KB per round until the request
+// carried ~80万 tokens (window 6.4万). The backfill must REPLACE the old
+// block with the fresh summary (one block, ever), and must keep the
+// newest messages visible (hist non-empty) so the LLM never loses its
+// most recent tool interactions.
+func TestTryAutoCompact_BackfillDoesNotDuplicateSummary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"S1"}}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Default: "test",
+			Providers: []config.ProviderConfig{{
+				Name: "test", Protocol: "openai", BaseURL: srv.URL, APIKey: "k", Model: "m",
+			}},
+		},
+		Limits: config.LimitsConfig{MaxRounds: 5},
+	}
+	llmClient, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := memory.OpenAt(":memory:", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := upgrade.SeedForTesting(store.DB()); err != nil {
+		t.Fatal(err)
+	}
+	styleMgr, err := style.NewManager(store.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	agt := New(cfg, llmClient, styleMgr, store, tool.NewRegistry())
+	agt.SetSummarizer(memory.NewSummarizer(store, llmClient, "test", 50))
+
+	convID := "backfill-no-dup"
+	if err := store.EnsureConversation(convID, "t"); err != nil {
+		t.Fatal(err)
+	}
+	// Messages 1..40 are already covered by the "old" summary (small, so
+	// the fresh summary S1 added by this compaction survives the injection
+	// cap — the cap itself is covered by TestAppendSummaryInjection_CapsSize).
+	if err := store.SaveSummary(convID, 1, 40, "old-summary-v0"); err != nil {
+		t.Fatal(err)
+	}
+	// Messages 41..50 are un-summarized; the newest 6 (45..50) must stay
+	// visible after compaction (summaryProtectedNewest).
+	for i := 41; i <= 50; i++ {
+		store.AddChatMessageToWithID(convID, llm.ChatMessage{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     fmt.Sprintf("msg-%d", i),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		}, int64(i))
+	}
+
+	// System prompt with a turn-start summary injection (as the agent does
+	// at request build), plus an in-flight tail of BIG messages to push the
+	// estimate over the window so tryAutoCompact fires. The backfill then
+	// REPLACES this list with the DB-derived tail (small rows), so the
+	// post-compact payload is small — exactly the production shape.
+	msgs := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: appendSummaryInjection("static", "old-summary-v0")},
+	}
+	big := strings.Repeat("内容内容", 2000) // ≈ 4k tokens each
+	for i := 41; i <= 50; i++ {
+		msgs = append(msgs, llm.ChatMessage{Role: llm.RoleUser, Type: llm.TypeText, Content: big})
+	}
+	if total := llm.EstimatePromptTokens(msgs, nil); total <= 35808 {
+		t.Fatalf("setup: not over budget (total=%d)", total)
+	}
+
+	ch := make(chan ChatStreamChunk, 64)
+	seq := uint64(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	compacted := agt.tryAutoCompact(ctx, &msgs, ChatRequest{
+		SessionID: convID,
+		Provider:  "test",
+		Model:     "m",
+	}, nil, ch, func() uint64 { seq++; return seq - 1 }, 1, 5)
+	if !compacted {
+		t.Fatal("expected compaction to succeed")
+	}
+
+	// Exactly ONE summary block — the fresh summary REPLACED the old one.
+	if got := strings.Count(msgs[0].Content, summaryBlockStart); got != 1 {
+		t.Fatalf("system prompt has %d summary blocks after backfill, want exactly 1 (the T2 duplication bug)", got)
+	}
+	// The fresh summary (S1) must be present; the summary must be bounded.
+	if !strings.Contains(msgs[0].Content, "S1") {
+		t.Fatal("fresh summary S1 missing after backfill")
+	}
+	// The newest messages must still be in the request — the LLM keeps its
+	// recent context (messages=1 dead-loop must never recur).
+	if len(msgs) < 2 {
+		t.Fatal("backfill collapsed the request to system-only — the LLM would lose its recent context")
+	}
+	if got := llm.EstimatePromptTokens(msgs, nil); got > 35808 {
+		t.Fatalf("backfilled payload still over window: %d", got)
+	}
+	for len(ch) > 0 {
+		<-ch
 	}
 }

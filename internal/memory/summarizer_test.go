@@ -211,10 +211,88 @@ func TestCompress_NoSummaryRangeExpansion(t *testing.T) {
 		t.Fatal("expected a summary")
 	}
 	if got := calls.Load(); got != 1 {
-		t.Errorf("Compress made %d LLM calls, want 1 (single batch of the 100 unsummarized)", got)
+		t.Errorf("Compress made %d LLM calls, want 1 (single batch of the unsummarized tail)", got)
 	}
-	if last := store.LastCompressedIDFor(convID); last != tsSchemeBase+99 {
-		t.Errorf("LastCompressedIDFor = %d, want %d (compression point advanced past the corrupt range)", last, tsSchemeBase+99)
+	// Compression point advances past the corrupt range, but stops before
+	// the newest summaryProtectedNewest messages (ts+94..ts+99), which
+	// must stay visible to the agent (see summaryProtectedNewest).
+	if last := store.LastCompressedIDFor(convID); last != tsSchemeBase+99-int64(summaryProtectedNewest) {
+		t.Errorf("LastCompressedIDFor = %d, want %d (past the corrupt range, short of the protected newest)", last, tsSchemeBase+99-int64(summaryProtectedNewest))
+	}
+}
+
+// TestCompress_ProtectsNewestMessages locks down the T2 amnesia fix: the
+// newest summaryProtectedNewest messages are never summarized, so the
+// agent always sees its most recent tool interactions in the request
+// (backfill hist non-empty, "messages=1" never recurs). Running Compress
+// repeatedly must never advance the compression point past the protected
+// tail.
+func TestCompress_ProtectsNewestMessages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"summarized"}}]}`))
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{LLM: config.LLMConfig{
+		Default: "test",
+		Providers: []config.ProviderConfig{{
+			Name: "test", Protocol: "openai", BaseURL: srv.URL, APIKey: "k", Model: "m",
+		}},
+	}}
+	lc, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	convID := "conv_protect_newest"
+	if err := store.EnsureConversation(convID, "t"); err != nil {
+		t.Fatal(err)
+	}
+	const n = 20
+	for i := 1; i <= n; i++ {
+		store.AddChatMessageToWithID(convID, llm.ChatMessage{
+			Role: llm.RoleUser, Type: llm.TypeText, Content: fmt.Sprintf("msg-%d", i),
+			MsgType: llm.MsgTypeText, SubmitToLLM: 1,
+		}, int64(i))
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	sm := NewSummarizer(store, lc, "test", 50)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ok, _, err := sm.Compress(ctx, convID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected the summarizable prefix to be compressed")
+	}
+	// The protected tail (newest 6 of 20 → ids 15..20) must never be
+	// covered by a summary range.
+	if last := store.LastCompressedIDFor(convID); last != int64(n-summaryProtectedNewest) {
+		t.Fatalf("LastCompressedIDFor = %d, want %d — the newest %d messages must stay unprotected", last, n-summaryProtectedNewest, summaryProtectedNewest)
+	}
+
+	// A second Compress has nothing left to summarize (the whole
+	// summarizable prefix is covered) and must not touch the protected tail.
+	ok2, _, err2 := sm.Compress(ctx, convID)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if ok2 {
+		t.Fatal("second Compress summarized the protected tail — newest messages must never be summarized")
+	}
+	if last := store.LastCompressedIDFor(convID); last != int64(n-summaryProtectedNewest) {
+		t.Fatalf("second Compress moved the compression point to %d — protected tail was summarized", last)
 	}
 }
 
