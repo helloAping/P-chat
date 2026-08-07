@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
-    "test": "node --test tests/sse.test.ts tests/export.test.ts tests/wechatQr.test.ts tests/projectSwitch.test.ts tests/rollbackAndInputMenu.test.ts tests/chatMemory.test.ts tests/conversationTurn.test.ts tests/closeConfirm.test.ts",
+    "test": "node --test tests/sse.test.ts tests/export.test.ts tests/wechatQr.test.ts tests/projectSwitch.test.ts tests/rollbackAndInputMenu.test.ts tests/chatMemory.test.ts tests/conversationTurn.test.ts tests/closeConfirm.test.ts tests/markdownCache.test.ts",
     "test:sse": "node --test tests/sse.test.ts",
     "test:webview-memory": "node tests/webview-memory-stress.mjs"
   },

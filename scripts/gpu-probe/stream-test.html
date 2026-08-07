@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh">
+<!--
+  Synthetic streaming-render A/B harness for P-Chat GPU CPU.
+
+  Reproduces the exact patterns that drive the WebView2/Chromium GPU
+  process during a P-Chat stream:
+    1. .msg.streaming .bubble whole-bubble opacity pulse (MessageBubble.vue:2077)
+    2. .sub-header.running background-position shimmer  (SubAgentCard.vue:330)
+    3. per-delta uncached innerHTML re-render of sub-agent text (renderSubText)
+
+  ?mode=current   → current P-Chat CSS (before optimization)
+  ?mode=optimized → proposed fixes:
+       F1: drop the whole-bubble opacity pulse (keep only the 6px dot)
+       F2: shimmer → static surface (no per-frame repaint)
+       F3: sub-agent text updated via textContent delta-append (no re-parse)
+  ?mode=idle      → nothing animating (reference floor)
+-->
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --surface-1:#14171F; --surface-2:#1C1F29; --surface-3:#262A36;
+    --text-primary:#F4F5F7; --text-secondary:#A8ADBA; --text-tertiary:#6B7180;
+    --brand-500:#4A4DFF; --ai-500:#7C5BFF;
+    --border-subtle:rgba(255,255,255,.06); --shadow-sm:0 1px 3px rgba(0,0,0,.3);
+    --ease-out:cubic-bezier(.16,1,.3,1); --dur-fast:120ms;
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--surface-1); color:var(--text-primary); margin:0;
+         font:14px/1.55 system-ui,sans-serif; }
+  #chat { max-width:760px; margin:0 auto; padding:16px; }
+  .msg { margin:14px 0; display:flex; gap:10px; }
+  .avatar { width:28px; height:28px; border-radius:50%; flex-shrink:0; margin-top:2px; }
+  .msg.user .avatar { background:var(--brand-500); }
+  .msg.assistant .avatar { background:var(--ai-500); }
+  .bubble { position:relative; min-width:0; word-wrap:break-word; }
+  .msg.user .bubble { background:var(--brand-500); color:#fff; padding:10px 14px;
+                      border-radius:14px; box-shadow:var(--shadow-sm); max-width:80%; }
+  .msg.assistant .bubble { background:transparent; padding:0 4px; flex:1; }
+
+  /* ---- current P-Chat streaming styles (also used by the live part) ---- */
+  .msg.streaming .bubble { animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%,80%{opacity:.35} }
+
+  .bubble-stream-dot { width:6px; height:6px; border-radius:50%;
+    background:var(--brand-500); animation:pulse 1.4s infinite; margin-left:4px; }
+
+  .sub-agent-card { border:1px solid var(--border-subtle); border-radius:10px;
+    background:var(--surface-2); overflow:hidden; }
+  .sub-header { padding:5px 12px; color:var(--text-secondary); font-size:12.5px; }
+  .sub-header.running {
+    background-image:linear-gradient(90deg,var(--surface-2) 0%,var(--surface-3) 50%,var(--surface-2) 100%);
+    background-size:200% 100%;
+    animation: sub-shimmer 1.8s linear infinite;
+  }
+  @keyframes sub-shimmer { 0%{background-position:100% 0} 100%{background-position:-100% 0} }
+  .sub-body { padding:8px 12px; border-top:1px solid var(--border-subtle); }
+  .sub-text { font-size:13px; line-height:1.6; color:var(--text-secondary); }
+  .sub-text code { background:var(--surface-3); padding:1px 4px; border-radius:4px;
+                   font-family:ui-monospace,monospace; font-size:12px; }
+  .md-body p { margin:6px 0; }
+  .md-body h3 { margin:10px 0 6px; font-size:15px; }
+  .md-body pre { background:var(--surface-3); padding:8px 10px; border-radius:8px;
+                 overflow:auto; font-size:12px; }
+
+  /* ---- optimized variants ---- */
+  body[data-mode="optimized"] .msg.streaming .bubble,
+  body[data-mode="idle"] .msg.streaming .bubble { animation:none; }
+  body[data-mode="optimized"] .sub-header.running,
+  body[data-mode="idle"] .sub-header.running {
+    background-image:none; animation:none;
+  }
+  .status { position:fixed; right:10px; top:8px; font:11px ui-monospace,monospace;
+            color:var(--text-tertiary); background:var(--surface-2); padding:4px 8px;
+            border-radius:6px; z-index:9; }
+</style>
+</head>
+<body data-mode="current">
+<div class="status" id="status">mode=current · tokens=0 · fps=0</div>
+<div id="chat">
+  <div class="msg user"><div class="avatar"></div><div class="bubble">优化 WebView2 GPU 占用</div></div>
+  <div class="msg assistant streaming">
+    <div class="avatar"></div>
+    <div class="bubble">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+        <span style="font-size:12px;color:var(--text-secondary)">deepseek-v4-flash</span>
+        <span class="bubble-stream-dot"></span>
+      </div>
+      <pre id="liveText" style="margin:0;white-space:pre-wrap;word-break:break-word;font:inherit;color:inherit;"></pre>
+      <div id="liveCaret" style="display:inline-block;color:var(--text-tertiary)">▍</div>
+
+      <!-- long accumulated content that the pulse animation must composite -->
+      <div class="md-body" id="accumulated"></div>
+
+      <!-- sub-agent card (shimmer header + streaming sub-text) -->
+      <div class="sub-agent-card" style="margin-top:12px;">
+        <div class="sub-header running">🔨 子代理 researcher · 研究任务</div>
+        <div class="sub-body">
+          <div class="sub-text" id="subText"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const mode = new URLSearchParams(location.search).get('mode') || 'current';
+document.body.dataset.mode = mode;
+document.getElementById('status').textContent = 'mode=' + mode + ' · tokens=0';
+
+// Simulated markdown renderer — same shape of work as marked.parse + innerHTML.
+function fakeMarkdown(text) {
+  // Escape then wrap in paragraphs; cheap but realistic-sized innerHTML.
+  const esc = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const paras = esc.split('\n').map(p => '<p>' + p + '</p>').join('');
+  return '<h3>研究进度</h3>' + paras + '<pre>' + esc.slice(0, 400) + '</pre>';
+}
+
+const liveText = document.getElementById('liveText');
+const liveCaret = document.getElementById('liveCaret');
+const accumulated = document.getElementById('accumulated');
+const subText = document.getElementById('subText');
+const status = document.getElementById('status');
+
+// The "long accumulated" body stays ~static once built; build it once so the
+// pulse layer is large (simulates a big assistant message that keeps pulsing).
+const BODY = '这是一段很长的助手回复内容，包含若干段落和代码块，用来模拟一个较大的流式消息气泡，让整气泡 opacity 动画在合成器上产生真实负载。'.repeat(60);
+accumulated.innerHTML = fakeMarkdown(BODY);
+
+let live = '';
+let sub = '';
+let tokens = 0;
+let frames = 0;
+let fpsT0 = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  const dt = (now - fpsT0) / 1000;
+  if (dt >= 1) { status.textContent = 'mode=' + mode + ' · tokens=' + tokens + ' · fps=' + Math.round(frames/dt); frames = 0; fpsT0 = now; }
+}, 1000);
+
+// Streaming drive loop: appends tokens every 40ms (≈25Hz — the rAF-batched
+// SSE rate the real app coalesces to), simulating an active stream.
+const TOKENS = ['前端','渲染','链路','GPU','合成器','光栅','优化','缓存','减少','重绘','布局','层','纹理','视觉','更新','帧','性能','采样'];
+setInterval(() => {
+  if (mode === 'idle') return;
+  const t = TOKENS[tokens % TOKENS.length];
+  tokens++;
+  live += t + ' ';
+  sub += t + ' ';
+
+  // live part: cheap textContent append (current + optimized both do this —
+  // the real app's TypedText already uses textContent).
+  liveText.textContent = live;
+
+  // sub-agent part: current = full innerHTML re-parse each delta (renderSubText),
+  // optimized = textContent delta append (F3).
+  if (mode === 'current') {
+    subText.innerHTML = fakeMarkdown(sub);
+  } else {
+    subText.textContent = sub;
+  }
+
+  // F1 is purely CSS (data-mode switch); the pulse runs in 'current' only.
+}, 40);
+</script>
+</body>
+</html>

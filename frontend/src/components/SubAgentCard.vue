@@ -19,12 +19,13 @@
 // the clipboard so the user can re-invoke the same
 // sub-agent by passing it back as the `task_id` arg.
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { marked } from 'marked'
+import { renderMarkdown } from '../utils/markdownCache'
 import type { SubAgentPart, MessagePart } from '../api/client'
 import { Check, X, Clipboard, ChevronDown, ChevronRight } from './icons'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import LoadingDots from './LoadingDots.vue'
+import TypedText from './TypedText.vue'
 
 const props = defineProps<{ part: SubAgentPart }>()
 
@@ -134,22 +135,39 @@ async function copyTaskId() {
 // backstop.
 const STUCK_TIMEOUT_MS = 6 * 60 * 1000 // 6 minutes
 
-// renderSubText runs the sub-agent's text part through the
-// same markdown pipeline as the parent MessageBubble uses
-// (.md-body). Keeps the sub-agent's prose visually
-// consistent with the main chat: headings, code, lists,
-// links, bold/italic all render the same way. Falls back
-// to the raw escaped text on parse failure so a malformed
-// markdown payload never blanks the card.
+// renderSubText runs the sub-agent's *static* text part through the
+// same markdown pipeline as the parent MessageBubble uses (.md-body),
+// via the shared LRU cache. Keeps the sub-agent's prose visually
+// consistent with the main chat: headings, code, lists, links,
+// bold/italic all render the same way. Falls back to the raw escaped
+// text on parse failure so a malformed markdown payload never blanks
+// the card.
+//
+// NOTE: the *live* streaming text part does NOT go through here — it
+// renders via <TypedText> (direct textContent) so a growing sub-agent
+// reply never re-parses the full accumulated markdown per delta
+// (that's O(n²) over the stream and shows up as renderer + raster CPU).
+// Once the sub-agent closes, this markdown path takes over once.
 function renderSubText(raw: string | undefined): string {
   if (!raw) return ''
   try {
-    return marked.parse(raw, { async: false, gfm: true, breaks: true }) as string
+    return renderMarkdown(raw)
   } catch {
     return raw.replace(/[&<>"']/g, c => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     }[c] as string))
   }
+}
+
+// isLiveTextPart mirrors MessageBubble's invariant: while the sub-agent
+// is still running, only the very last part can be the one actively
+// streaming, and only if it's a text part. It renders through TypedText;
+// once the sub-agent closes (status leaves 'start'), this returns false
+// and the static markdown render takes over.
+function isLiveTextPart(idx: number, part: MessagePart): boolean {
+  if (part.kind !== 'text') return false
+  if (props.part.status !== 'start') return false
+  return idx === props.part.parts.length - 1
 }
 let stuckTimer: ReturnType<typeof setTimeout> | null = null
 // armStuckTimer (re)starts the force-close safety net. Only a
@@ -259,6 +277,11 @@ onBeforeUnmount(() => clearStuckTimer())
         />
         <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
         <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
+        <TypedText
+          v-else-if="entry.part.kind === 'text' && isLiveTextPart(entry.index, entry.part)"
+          :text="entry.part.text || ''"
+          :active="true"
+        />
         <div v-else-if="entry.part.kind === 'text'" class="sub-text" v-html="renderSubText(entry.part.text)" />
       </template>
       <!-- task_id footer: stable identifier the LLM can pass back
@@ -319,19 +342,13 @@ onBeforeUnmount(() => clearStuckTimer())
   transition: background var(--dur-fast) var(--ease-out);
 }
 .sub-header:hover { background: var(--surface-3); }
+/* The running state used to sweep a background gradient
+ * (background-position animation = a full repaint + GPU raster pass
+ * every frame). Since 2026-08-06 it's a static surface tint instead —
+ * the running signal is carried by the left accent border, the status
+ * text and the live parts counter, none of which cost per-frame work. */
 .sub-header.running {
-  background-image: linear-gradient(
-    90deg,
-    var(--surface-2) 0%,
-    var(--surface-3) 50%,
-    var(--surface-2) 100%
-  );
-  background-size: 200% 100%;
-  animation: sub-shimmer 1.8s linear infinite;
-}
-@keyframes sub-shimmer {
-  0%   { background-position: 100% 0; }
-  100% { background-position: -100% 0; }
+  background: var(--surface-3);
 }
 .sub-icon {
   display: inline-flex;
