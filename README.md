@@ -630,6 +630,6 @@ cd frontend && npx vue-tsc -b
 
 ### 社区支持
 
-感谢 <[http://www.08ms.cn](https://linux.do/)>（**LINUX DO**） 社区对 P-chat 的支持。
+感谢 <[[http://www.08ms.cn](https://linux.do/)](https://linux.do/)>（**LINUX DO**） 社区对 P-chat 的支持。
 
 ---
