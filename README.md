@@ -629,7 +629,6 @@ cd frontend && npx vue-tsc -b
 `docs/plans/*.md` 只保留历史设计背景；当前状态以 `README.md` 的快照和 `docs/feature-opportunities.md` 为准。
 
 ### 社区支持
-
-感谢 <[[http://www.08ms.cn](https://linux.do/)](https://linux.do/)>（**LINUX DO**） 社区对 P-chat 的支持。
+感谢 <https://linux.do>（**LinuxDo**） 社区对 P-chat 的支持。
 
 ---
