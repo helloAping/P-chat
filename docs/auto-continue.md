@@ -88,7 +88,7 @@ Web 端的 UI 控制项在「会话设置」面板（待实现；当前只能通
 
 ### 跟 maxRounds 关系
 
-`maxRounds` 是硬上限（默认 300）；`auto-continue` 是软上限（3 次）。两者独立计数，auto-continue 续的轮次**会**计入 `maxRounds`（因为 `continue` 触发 `round++`）。这是合理的：每次续都是一次真实的 LLM 调用，消耗 token / 时间。
+`maxRounds` 是硬上限（默认 500）；`auto-continue` 是软上限（3 次）。两者独立计数，auto-continue 续的轮次**会**计入 `maxRounds`（因为 `continue` 触发 `round++`）。这是合理的：每次续都是一次真实的 LLM 调用，消耗 token / 时间。
 
 ### 跟 stuck-loop / same-tool-err 关系
 

@@ -96,11 +96,11 @@ func TestResolveRoundLimit(t *testing.T) {
 		hasActiveTodos bool
 		want           int
 	}{
-		{name: "build mode no todos", maxRounds: 300, mode: "adaptive", hasActiveTodos: false, want: 300},
-		{name: "adaptive active todos extends to 3x", maxRounds: 300, mode: "adaptive", hasActiveTodos: true, want: 900},
-		{name: "off never extends", maxRounds: 300, mode: "off", hasActiveTodos: true, want: 300},
-		{name: "empty mode normalizes to adaptive", maxRounds: 300, mode: "", hasActiveTodos: true, want: 900},
-		{name: "explicit unlimited stays unbounded", maxRounds: 300, mode: "unlimited", hasActiveTodos: true, want: 0},
+		{name: "build mode no todos", maxRounds: 500, mode: "adaptive", hasActiveTodos: false, want: 500},
+		{name: "adaptive active todos extends to 3x", maxRounds: 500, mode: "adaptive", hasActiveTodos: true, want: 1500},
+		{name: "off never extends", maxRounds: 500, mode: "off", hasActiveTodos: true, want: 500},
+		{name: "empty mode normalizes to adaptive", maxRounds: 500, mode: "", hasActiveTodos: true, want: 1500},
+		{name: "explicit unlimited stays unbounded", maxRounds: 500, mode: "unlimited", hasActiveTodos: true, want: 0},
 		{name: "maxRounds zero stays zero", maxRounds: 0, mode: "adaptive", hasActiveTodos: true, want: 0},
 	}
 	for _, tt := range tests {

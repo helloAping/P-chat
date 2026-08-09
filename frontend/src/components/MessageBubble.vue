@@ -566,6 +566,7 @@ async function copyEntireMessage() {
 // <pre><code class="language-xxx">…</code></pre>; we leave
 // the <pre>/<code> alone and prepend the toolbar.
 const mdBodyEl = useTemplateRef<HTMLElement>('mdBodyEl')
+const rootEl = useTemplateRef<HTMLElement>('rootEl')
 
 // processedPres tracks <pre> nodes that already have a
 // toolbar attached, so we don't double-inject on every
@@ -610,7 +611,13 @@ async function onCodeClick(e: Event) {
   const btn = target.closest<HTMLButtonElement>('[data-code-action]')
   if (!btn) return
   const action = btn.getAttribute('data-code-action')
-  const pre = btn.closest('pre')
+  // The toolbar button lives inside the .code-block wrapper,
+  // next to (not inside) the <pre> — so walk up to the
+  // wrapper and query the code block from there. A bare
+  // btn.closest('pre') would always miss (returns null),
+  // silently swallowing the click.
+  const wrapper = btn.closest<HTMLElement>('.code-block')
+  const pre = wrapper?.querySelector('pre')
   if (!pre) return
   const code = pre.querySelector('code')
   const text = code?.textContent || pre.textContent || ''
@@ -691,15 +698,22 @@ function langExt(lang: string): string {
 // (new SSE chunk, message re-render, etc.). The
 // processedPres set keeps re-runs cheap — each <pre> is
 // only touched once.
-watch(mdBodyEl, async (el) => {
-  await nextTick()
-  injectCodeToolbars(el)
-}, { flush: 'post' })
-
-watch(userHtml, async () => {
-  await nextTick()
-  injectCodeToolbars(mdBodyEl.value)
-})
+//
+// Note: we scan *every* .md-body inside this bubble instead
+// of the single `mdBodyEl` ref. In a v-for (multi-part
+// message) the template ref only ever holds the LAST text
+// part's element, so parts before it would never get their
+// toolbars. Scanning the root element covers all parts.
+watch(
+  [mdBodyEl, userHtml, () => props.message.parts],
+  async () => {
+    await nextTick()
+    const root = rootEl.value
+    if (!root) return
+    root.querySelectorAll<HTMLElement>('.md-body').forEach((el) => injectCodeToolbars(el))
+  },
+  { flush: 'post', deep: true },
+)
 function shortWarnText(t?: string): string {
   if (!t) return 'image skipped'
   const m = t.match(/\(attached image: ([^,]+)/)
@@ -1025,6 +1039,7 @@ function findPrecedingUserMessageId(): number {
 <template>
   <div
     class="msg"
+    ref="rootEl"
     :class="[message.role, { streaming }]"
     :data-msg-id="message.id"
     @contextmenu="onMessageContextMenu"
@@ -2132,7 +2147,7 @@ function findPrecedingUserMessageId(): number {
   right: 4px;
   display: flex;
   gap: 4px;
-  opacity: 0;
+  opacity: 1;
   transition: opacity 0.15s ease;
   z-index: 1;
 }

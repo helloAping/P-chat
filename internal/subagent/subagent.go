@@ -1191,7 +1191,7 @@ func buildSubAgentChatRequest(
 		ProjectRoot:    req.ProjectRoot,
 		SessionID:      buildSubAgentSessionID(subType, req.TaskID),
 		// Sub-agents are short focused runs. Cap rounds well
-		// below the parent's 300 default so a failing loop
+		// below the parent's 500 default so a failing loop
 		// (whack-a-mole tool errors, re-read loops) ends in
 		// ~30 rounds instead of spinning until the wall-clock
 		// timeout — the cumulative failure breaker fires

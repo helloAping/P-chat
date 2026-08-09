@@ -174,6 +174,12 @@ function isActive(name: string) {
                 <component v-if="t.icon" :is="t.icon" :size="16" class="settings-nav-icon" />
                 <span class="settings-nav-label">{{ t.label }}</span>
               </button>
+
+              <!-- Optional footer row pinned to the bottom of
+                   the nav (e.g. a "使用文档" external link). -->
+              <div class="settings-nav-footer">
+                <slot name="nav-footer" />
+              </div>
             </nav>
 
             <div class="settings-content">
@@ -342,6 +348,12 @@ function isActive(name: string) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Footer row pinned to the bottom of the nav column. */
+.settings-nav-footer {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
 }
 
 /* Content column — fills the remaining space.

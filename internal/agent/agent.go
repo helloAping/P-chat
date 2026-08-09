@@ -489,7 +489,10 @@ type ChatRequest struct {
 	// assistant message has regen_group_id = NULL, the
 	// legacy single-shot behaviour).
 	RegenGroupID string `json:"regen_group_id,omitempty"`
-	// MaxRounds caps the ReAct tool-use loop. 0 means default (50).
+	// MaxRounds caps the ReAct tool-use loop. 0 = no per-request
+	// override: falls back to the configured Limits.MaxRounds (0 there
+	// means unlimited), or the built-in MaxRoundsDefault when no config
+	// is attached.
 	// After MaxRounds the loop stops and the user can continue
 	// with a follow-up message.
 	MaxRounds int `json:"max_rounds,omitempty"`
@@ -1384,7 +1387,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			maxRounds = req.MaxRounds
 		} else if a.cfg != nil {
 			// Zero is a deliberate unlimited setting. The default config stores
-			// 300 explicitly, so it is no longer ambiguous with an unset value.
+			// 500 explicitly, so it is no longer ambiguous with an unset value.
 			maxRounds = a.cfg.Limits.MaxRounds
 		}
 		longRunMode := req.TodoLongRunMode

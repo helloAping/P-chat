@@ -214,7 +214,7 @@ setup.exe
 
 ### 整体布局
 
-![主界面](docs/assets/gui-main-window.png)
+![桌面端主界面](docs/images/p-chat-web/8302c50626454bbf.png)
 
 ```
 ┌─────────┬──────────────────────────────────────────┐
@@ -244,9 +244,9 @@ setup.exe
 
 ### 设置面板
 
-点击右上角齿轮（或键盘快捷键）打开设置面板。共 9 个 Tab：
+点击**左侧边栏底部的齿轮图标（⚙ 设置）**（或侧边栏顶部 ⋯ 菜单 → 设置）打开设置面板。左侧导航共 11 个分类，常用如下（完整步骤与截图见 [安装指南 2.3 方式一：GUI 可视化配置](http://www.08ms.cn/article/p-chat)）：
 
-![设置入口](docs/assets/gui-settings-modal.png)
+![设置入口：主界面左侧边栏底部的齿轮按钮](docs/images/p-chat-web/97f4e736db78c4d1.png)
 
 | Tab | 作用 |
 | --- | --- |
@@ -262,7 +262,7 @@ setup.exe
 
 #### LLM 提供商
 
-![LLM 提供商](docs/assets/gui-llm-providers.png)
+![设置面板全貌：左侧导航 + 右侧「LLM 提供商」页](docs/images/p-chat-web/f97e9cbbe10d9058.png)
 
 - **协议**：OpenAI 兼容（绝大多数国内模型都走这个）或 Anthropic 原生（Claude）
 - **Base URL**：OpenAI 兼容用 `https://api.deepseek.com/v1` 这种带 `/v1` 的形式；Anthropic 用 `https://api.anthropic.com`
@@ -305,6 +305,8 @@ LLM 在需要时调用 `recall` 工具按需检索。详见 [docs/knowledge.md](
 | 启用浏览器控制 | 「设置」→「浏览器」→ 开开关 → 下载扩展 → chrome://extensions 加载；详见 [浏览器控制](#浏览器控制) |
 | 复制 trace id | 顶栏 `#` 按钮，或错误气泡上的 trace id 按钮 |
 | 重新生成 | assistant 消息底部「重答」按钮，旧版会作为历史版本保留 |
+
+界面操作细节与截图（模型徽章切换、会话设置、风格切换、工具调用可视化、fork / 撤回）见 [安装指南 4.3 界面操作](http://www.08ms.cn/article/p-chat)。
 
 ---
 
@@ -621,6 +623,7 @@ cd frontend && npx vue-tsc -b
 | 文档 | 什么时候改 |
 | --- | --- |
 | `README.md` | 用户入口、GUI 操作步骤、常见问题、当前进度摘要变化 |
+| [网页版说明文档](http://www.08ms.cn/article/p-chat) | 安装、API 厂商接入、CLI/GUI 使用指南（与官网说明同步） |
 | `docs/feature-opportunities.md` | 功能从待办变为已落地、backlog 优先级变化、废弃历史计划 |
 | `CHANGELOG.md` | 版本交付、升级说明、重要 bug 修复和测试覆盖 |
 | `.agents/docs/*.md` | 模块实现细节、关键文件、测试方式、agent 修改入口 |

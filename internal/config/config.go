@@ -62,7 +62,7 @@ type LimitsConfig struct {
 	// rounds as [pruned]. Default 15. 0 = disable pruning.
 	PruneAfterRounds int `json:"prune_after_rounds"`
 	// MaxRounds overrides the agent's built-in safety-net round cap.
-	// Default 300. 0 = unlimited.
+	// Default 500. 0 = unlimited.
 	MaxRounds int `json:"max_rounds"`
 	// TodoLongRunMode controls whether active todo plans can run beyond
 	// MaxRounds. "adaptive" is the safe default: only active plans bypass the
@@ -973,7 +973,7 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Limits: LimitsConfig{
-			MaxRounds:              300,
+			MaxRounds:              500,
 			TodoLongRunMode:        TodoLongRunAdaptive,
 			MaxTurnSeconds:         900,
 			MaxTurnRetries:         2,
