@@ -20,6 +20,7 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
@@ -89,8 +90,20 @@ func newTestServerWithConfig(t *testing.T, jsonBody string) (*Server, *config.Co
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
-	// Seed a config file so config.Load picks up our providers.
+	// resolveHome() checks PCHAT_DATA_HOME (or the test override)
+	// before USERPROFILE/HOME. On machines where PCHAT_DATA_HOME is
+	// set (e.g. C:\Users\admin\.p-chat), t.Setenv alone would still
+	// resolve to the REAL user config and the test would hit the
+	// live provider. The test-only hook forces the temp dir.
+	//
+	// NB: SetHomeForTest mirrors the PCHAT_DATA_HOME semantics — the
+	// value is the DATA DIRECTORY ITSELF (the ~/.p-chat folder), not
+	// its parent, because GlobalDir() == resolveHome().dir and
+	// GlobalConfig() == GlobalDir()+"/config.json".
 	pchatDir := filepath.Join(dir, ".p-chat")
+	paths.SetHomeForTest(pchatDir)
+	t.Cleanup(func() { paths.SetHomeForTest("") })
+	// Seed a config file so config.Load picks up our providers.
 	if err := os.MkdirAll(pchatDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1612,6 +1625,9 @@ func TestSessionMeta_PersistsAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
+	// PCHAT_DATA_HOME isolation: see newTestServerWithConfig.
+	paths.SetHomeForTest(filepath.Join(dir, ".p-chat"))
+	t.Cleanup(func() { paths.SetHomeForTest("") })
 	// Seed a config file so config.Load picks up our providers.
 	pchatDir := filepath.Join(dir, ".p-chat")
 	if err := os.MkdirAll(pchatDir, 0o755); err != nil {
@@ -1706,6 +1722,9 @@ func TestSessionStyle_PersistsAndRoundTrips(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
+	// PCHAT_DATA_HOME isolation: see newTestServerWithConfig.
+	paths.SetHomeForTest(filepath.Join(dir, ".p-chat"))
+	t.Cleanup(func() { paths.SetHomeForTest("") })
 	pchatDir := filepath.Join(dir, ".p-chat")
 	if err := os.MkdirAll(pchatDir, 0o755); err != nil {
 		t.Fatal(err)

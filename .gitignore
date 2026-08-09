@@ -88,6 +88,16 @@ conversations.json
 # refactors. It contains captured server.out/server.err and is
 # reproducible.
 test_http/
+# Debug scratch files dumped to the repo root by ad-hoc `go test`
+# probes (build_check.txt, g1.txt, test_full.txt, …). Root has no
+# tracked .txt files, so these patterns are safe.
+/build_check.txt
+/build_out.txt
+/g*.txt
+/t*.txt
+/test_*.txt
+/testout.txt
+/turn_test.txt
 # Generic scratch dirs that the test commands sometimes use.
 scratch/
 tmp/

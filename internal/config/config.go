@@ -87,6 +87,14 @@ type LimitsConfig struct {
 	// manually), and runs the agent loop again with a fresh full
 	// MaxTurnSeconds budget. 0 = disabled (previous behaviour).
 	// Default 2. Absent from config → default; explicit 0 → off.
+	//
+	// Note: the budget gates only the deadline-driven staircase retry.
+	// Todo-driven resumes (the session still has pending todos — the
+	// LLM ended the turn without marking every todo done/cancelled)
+	// are NOT counted against MaxTurnRetries: they re-run the turn to
+	// finish tracked work and are instead bounded by the T3 no-progress
+	// breaker (maxNoProgressResumes) in the server. A budget-exhausted
+	// turn with unfinished todos still auto-continues.
 	MaxTurnRetries int `json:"max_turn_retries"`
 	// LLMRetryBackoffs is the per-retry backoff staircase (in seconds)
 	// for transient upstream LLM errors (rate_limit / server_error /
