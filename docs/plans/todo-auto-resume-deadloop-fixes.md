@@ -1,6 +1,7 @@
 # 任务规划：todo 自动续跑死循环修复
 
-> **状态**: 规划中（未实施，仅文档）
+> **状态**: ✅ 已实施（2026-08-06 代码与测试全部落地）
+> **实施记录**: T1–T5 各有独立 commit（`593d2bb` / `111a09c` / `80f19b8` / `6f17e05` / `070f4a9`）；`go test ./...` 通过
 > **创建日期**: 2026-08-05
 > **优先级**: P0（止血）+ P1 + P2
 > **来源**: my-blog 会话 conv_1785593685713979400_2 死循环分析
@@ -63,13 +64,13 @@ my-blog 最新会话（`conv_1785593685713979400_2`）累积 **5041 条消息**�
 
 ## 2. 任务总览
 
-| # | 优先级 | 任务 | 目标 | 依赖 |
-| --- | --- | --- | --- | --- |
-| T1 | **P0** | 请求前强制上下文收敛（压缩→裁剪） | 超窗自动收敛，对话不中断（止血） | 无 |
-| T2 | **P0** | 定位并修复 auto-compact 后仍超窗的机制 | 根治"messages=1 却 20万 token" | T1 之后便于复现 |
-| T3 | **P1** | 自动续跑"无进展熔断" | 防止续跑功能放大死循环 | 无 |
-| T4 | **P1** | 熔断跨 turn 累计（same-tool / CumToolErrMax） | 拦住 LLM 工具失败循环 | 无 |
-| T5 | **P2** | LLM 工具失败 prompt 强化 | 减少无效工具重试 | 无 |
+| # | 优先级 | 任务 | 目标 | 依赖 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| T1 | **P0** | 请求前强制上下文收敛（压缩→裁剪） | 超窗自动收敛，对话不中断（止血） | 无 | ✅ |
+| T2 | **P0** | 定位并修复 auto-compact 后仍超窗的机制 | 根治"messages=1 却 20万 token" | T1 之后便于复现 | ✅ |
+| T3 | **P1** | 自动续跑"无进展熔断" | 防止续跑功能放大死循环 | 无 | ✅ |
+| T4 | **P1** | 熔断跨 turn 累计（same-tool / CumToolErrMax） | 拦住 LLM 工具失败循环 | 无 | ✅ |
+| T5 | **P2** | LLM 工具失败 prompt 强化 | 减少无效工具重试 | 无 | ✅ |
 
 ---
 
@@ -251,12 +252,12 @@ T5（prompt 强化）           ← 依赖 T4（熔断兜底存在后 prompt 才
 
 ## 5. 验收标准
 
-- [ ] T1：构造超窗请求（含单条超大消息），断言请求**仍发出**且 `estimated_tokens ≤ usableWindow`（经总结替换→头部裁剪→截断超大内容/裁剪工具逐级收敛）；system prompt + 最新用户消息保留；对话不中断、不发"拒绝"错误。
-- [ ] T2：`estimated_tokens` 分解日志显示消息 vs 工具占比；修复后任何请求 `estimated_tokens ≤ context_window`。
-- [ ] T3：mock LLM 永不更新 todo，断言自动续跑 N 次后停止并提示用户；手动消息重置计数。
-- [ ] T4：同命令跨两个 turn 失败，第二个 turn 触发熔断；正常多轮任务不误伤。
-- [ ] T5：工具失败后 LLM 换思路（不再反复同一命令）；正常重试一次仍允许。
-- [ ] 回归：`go test ./...` 全绿；my-blog 会话复跑不再出现"token 单调暴涨 + 频繁续跑"。
+- [x] T1：构造超窗请求（含单条超大消息），断言请求**仍发出**且 `estimated_tokens ≤ usableWindow`（经总结替换→头部裁剪→截断超大内容/裁剪工具逐级收敛）；system prompt + 最新用户消息保留；对话不中断、不发"拒绝"错误。（`internal/agent/context_guard.go` + `context_guard_test.go`）
+- [x] T2：`estimated_tokens` 分解日志显示消息 vs 工具占比；修复后任何请求 `estimated_tokens ≤ context_window`。（`context_guard.go` Level 3 trimToolsToFit / truncateOversizedMessages）
+- [x] T3：mock LLM 永不更新 todo，断言自动续跑 N 次后停止并提示用户；手动消息重置计数。（`internal/agent/no_progress.go` + `agent_no_progress_int_test.go`）
+- [x] T4：同命令跨两个 turn 失败，第二个 turn 触发熔断；正常多轮任务不误伤。（`internal/agent/agent.go` cumToolErrCount ≥ CumToolErrMax）
+- [x] T5：工具失败后 LLM 换思路（不再反复同一命令）；正常重试一次仍允许。（`internal/agent/prompt.go` 工具失败处理段）
+- [x] 回归：`go test ./...` 全绿；~~my-blog 会话复跑~~（运行时回归项，待真实会话验证）
 
 ---
 
