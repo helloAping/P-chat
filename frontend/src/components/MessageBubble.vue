@@ -1607,12 +1607,15 @@ function findPrecedingUserMessageId(): number {
 }
 
 /* Force the markdown body inside a user bubble to inherit
- * the white text color. The default --text-primary would
- * win because of specificity, so we override here. */
+ * the white text color (--on-brand). The default --text-primary
+ * would win because of specificity, so we override here.
+ * NOTE: this only reaches template-owned elements (the .md-body
+ * container itself). Code blocks inside are injected via v-html
+ * and carry no [data-v] attribute, so scoped rules never reach
+ * their <pre>/<code> — those overrides live in the GLOBAL
+ * <style> block below (see .msg.user .md-body pre). */
 .msg.user .bubble-body,
 .msg.user .bubble-body * { color: inherit; }
-.msg.user .md-body code { background: rgba(255, 255, 255, 0.18); color: inherit; }
-.msg.user .md-body pre { background: rgba(0, 0, 0, 0.18); border-color: rgba(255, 255, 255, 0.18); }
 
 /* "展开全文" affordance for truncated text parts. */
 .md-expand-btn {
@@ -2162,6 +2165,30 @@ function findPrecedingUserMessageId(): number {
 </style>
 
 <style>
+/* User-bubble code blocks. The user message's markdown is injected
+ * via v-html, so the <pre>/<code> elements carry no [data-v]
+ * attribute and the scoped styles above never reach them. These
+ * global rules force a dark translucent surface + white text
+ * (--on-brand) on the brand-coloured user bubble, and override the
+ * highlight.js token colours (dark in light mode — unreadable on
+ * the brand-blue bubble). Assistant bubbles are NOT affected: they
+ * stay on the theme's --code-bg surface with token-coloured text. */
+.msg.user .md-body pre {
+  background: rgba(0, 0, 0, 0.25);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+.msg.user .md-body pre code {
+  background: transparent;
+  color: var(--on-brand);
+}
+.msg.user .md-body pre code.hljs span {
+  color: var(--on-brand);
+}
+.msg.user .md-body code:not(pre code) {
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--on-brand);
+}
+
 /* Code-block copy/download toolbar styles. These are global
  * (not scoped) because we inject the toolbar into the
  * marked-rendered <pre> elements via DOM manipulation —
