@@ -24,10 +24,12 @@
  */
 import { computed, ref } from 'vue'
 import { NButton, NTooltip, useMessage } from 'naive-ui'
-import { state, currentMeta, openContextInspector } from '../stores/chat'
+import { state, refreshContextUsage } from '../stores/chat'
 import * as api from '../api/client'
+import { formatCompactTokens } from '../utils/format'
 import BrandLogo from './BrandLogo.vue'
 import ToolListDrawer from './ToolListDrawer.vue'
+import StyleGenModal from './StyleGenModal.vue'
 import { FolderOpen, Terminal, PanelLeftClose, PanelLeftOpen, Sparkles, BarChart3, Wrench, Hash } from './icons'
 import { copyText } from '../utils/clipboard'
 
@@ -53,37 +55,6 @@ const projectName = computed(() => {
   return p?.name || state.activeProjectPath
 })
 
-// --- Current model display -----------------------------------------------
-// currentMeta resolves the active provider + model for the current
-// session. The provider list has the protocol so we can color the
-// badge dot accordingly. P-Chat doesn't assign explicit provider
-// colors — we derive a hue from the protocol so visually
-// distinguishable, but stable.
-const modelLabel = computed(() => {
-  const m = currentMeta.value
-  if (!m.model) return '未选择模型'
-  return m.model
-})
-const providerLabel = computed(() => currentMeta.value.provider || '')
-
-// Provider color: deterministic mapping from protocol → CSS color.
-// We use semantic hues (Anthropic = orange, OpenAI = green, CS
-// proxy = brand purple) so a glance tells the user which protocol
-// their request will go through. Falls back to neutral gray.
-const providerColor = computed(() => {
-  const m = currentMeta.value
-  if (!m.provider) return 'var(--text-quaternary)'
-  const p = state.providers.find(p => p.name === m.provider) as any
-  const protocol = p?.protocol as string | undefined
-  if (protocol === 'anthropic') return 'var(--provider-anthropic)'
-  if (protocol === 'openai') return 'var(--provider-openai)'
-  // Custom / CS proxy: use brand purple so it ties into the
-  // app's identity. Could be overridden by a per-provider color
-  // field in a future schema change.
-  if (m.provider === 'cs' || protocol === 'openai-compatible') return 'var(--provider-openai-compatible)'
-  return 'var(--text-tertiary)'
-})
-
 const canOpenProject = computed(() => !!state.activeProjectPath)
 
 async function openExplorer() {
@@ -101,6 +72,11 @@ async function openTerminal() {
 // the active conversation.
 const showToolList = ref(false)
 const message = useMessage()
+
+// showStyleGen toggles the StyleGenModal (generate / optimize an AI
+// persona style from the current conversation). Disabled without an
+// active session — there's no conversation to learn from.
+const showStyleGen = ref(false)
 
 // currentTraceId: the P3-3 end-to-end correlation id for the
 // active turn. Minted server-side on POST /messages, mirrored
@@ -131,6 +107,57 @@ async function copyTrace() {
   }
 }
 function toggleSidebar() { emit('toggle-sidebar') }
+
+// --- Context utilisation badge (P2-3) -----------------------------
+// The badge reads the silently-refreshed context inspector data
+// (the chat store's refreshContextUsage, fired on session switch
+// and after each turn). No data, a stale session, or a missing
+// context window → the badge collapses back to a bare icon button.
+const ctxData = computed(() => {
+  const s = state.currentID
+  const d = state.contextInspector?.data
+  if (!s || !d || d.session_id !== s) return null
+  if (!d.context_window || d.context_window <= 0) return null
+  return d
+})
+
+// ctxPct is the percentage against the FULL context window — the
+// denominator the user reads as "how full the model is" (200K/1M).
+// Prefers the server's context_window_pct, falls back to a client
+// computation for older servers.
+const ctxPct = computed(() => {
+  const d = ctxData.value
+  if (!d) return 0
+  const p = d.context_window_pct
+  if (p != null && Number.isFinite(p)) return Math.min(p, 999.9)
+  return (d.estimated_tokens / d.context_window) * 100
+})
+const ctxBarPct = computed(() => Math.min(Math.max(ctxPct.value, 0), 100))
+const ctxPctText = computed(() => `${ctxPct.value.toFixed(1)}%`)
+const ctxTokensText = computed(() => {
+  const d = ctxData.value
+  if (!d) return ''
+  return `${formatCompactTokens(d.estimated_tokens)} / ${formatCompactTokens(d.context_window)}`
+})
+
+// ctxColor mirrors the drawer's thresholds (<60% green, 60-80%
+// yellow, >80% red) so the badge and the auto-compact behaviour
+// tell the same story at a glance.
+const ctxColor = computed(() => {
+  const p = ctxPct.value
+  if (p >= 80) return 'error'
+  if (p >= 60) return 'warning'
+  return 'success'
+})
+
+// ctxTip is the hover tooltip: model + full-window ratio + usable
+// number (all estimates). Plain label when no data is loaded.
+const ctxTip = computed(() => {
+  const d = ctxData.value
+  if (!d) return '上下文占用'
+  const usable = d.usable_tokens || d.context_window
+  return `上下文占用 · ${d.model || '未知模型'} · ${formatCompactTokens(d.estimated_tokens)} / ${formatCompactTokens(d.context_window)}（${ctxPct.value.toFixed(1)}%）· 可用 ${formatCompactTokens(usable)}（估算）`
+})
 </script>
 
 <template>
@@ -181,25 +208,44 @@ function toggleSidebar() { emit('toggle-sidebar') }
       </template>
     </div>
 
-    <!-- Right section: model badge + project actions. -->
+    <!-- Right section: project actions. The model name used to
+         live here but was removed — the per-message assistant
+         header already shows which model answered. -->
     <div class="topbar-right">
-      <!-- P2-3: context inspector trigger. The drawer
-           itself lives in ChatWindow (so it overlays
-           the chat area, not the top bar). Clicking
-           this button opens it AND kicks off the
-           fetch in one go. -->
+      <!-- P2-3: context usage. Clicking refreshes the estimate
+           (no popup — the old drawer is gone). When the badge
+           data is loaded (silent refreshContextUsage on session
+           switch / turn end), we render a compact utilisation
+           badge so the context ratio is visible at a glance;
+           without data it falls back to a bare icon. -->
       <NTooltip>
         <template #trigger>
           <NButton
+            v-if="!ctxData"
             size="tiny"
             quaternary
             aria-label="查看上下文占用"
-            @click="openContextInspector(state.currentID)"
+            @click="refreshContextUsage(state.currentID)"
           >
             <BarChart3 :size="16" />
           </NButton>
+          <button
+            v-else
+            type="button"
+            class="ctx-badge"
+            :class="ctxColor"
+            :aria-label="`查看上下文占用：${ctxTip}`"
+            @click="refreshContextUsage(state.currentID)"
+          >
+            <BarChart3 :size="15" />
+            <span class="ctx-badge-bar">
+              <span class="ctx-badge-bar-fill" :style="{ width: ctxBarPct + '%' }" />
+            </span>
+            <span class="ctx-badge-pct">{{ ctxPctText }}</span>
+            <span class="ctx-badge-tokens">{{ ctxTokensText }}</span>
+          </button>
         </template>
-        上下文占用
+        {{ ctxTip }}（点击刷新）
       </NTooltip>
       <!-- P3-3: global trace id. Clicking copies the
            current session's correlation id to the
@@ -239,11 +285,22 @@ function toggleSidebar() { emit('toggle-sidebar') }
         </template>
         工具列表
       </NTooltip>
-      <div class="model-badge" :title="`提供商: ${providerLabel || '未选择'}`">
-        <span class="model-dot" :style="{ background: providerColor }" aria-hidden="true" />
-        <Sparkles :size="13" class="model-badge-icon" />
-        <span class="model-name">{{ modelLabel }}</span>
-      </div>
+      <!-- StyleGen: generate / optimize an AI persona from the current
+           conversation. Disabled when there's no active session. -->
+      <NTooltip>
+        <template #trigger>
+          <NButton
+            size="tiny"
+            quaternary
+            aria-label="从当前对话生成风格"
+            :disabled="!state.currentID"
+            @click="showStyleGen = true"
+          >
+            <Sparkles :size="16" />
+          </NButton>
+        </template>
+        生成风格
+      </NTooltip>
       <template v-if="canOpenProject">
         <NTooltip>
           <template #trigger>
@@ -281,6 +338,9 @@ function toggleSidebar() { emit('toggle-sidebar') }
          browse their tool list before picking a
          session. -->
     <ToolListDrawer v-model:show="showToolList" />
+    <!-- StyleGen modal: generate / optimize an AI style from the
+         current conversation (sources state.currentID read-only). -->
+    <StyleGenModal v-model:show="showStyleGen" />
   </header>
 </template>
 
@@ -395,37 +455,58 @@ function toggleSidebar() { emit('toggle-sidebar') }
   gap: 4px;
   flex-shrink: 0;
 }
-.model-badge {
+
+/* --- Context utilisation badge -----------------------------------
+ * Replaces the bare context icon when badge data is loaded. The
+ * fill colour follows the same thresholds as the context drawer
+ * (<60% success, 60-80% warning, >80% error) so the badge and the
+ * auto-compact behaviour tell one story. */
+.ctx-badge {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
-  margin-right: 4px;
+  height: 26px;
+  padding: 0 8px;
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-pill);
-  font-size: 12px;
   color: var(--text-secondary);
-  cursor: default;
-  user-select: none;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
 }
-.model-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  box-shadow: 0 0 0 2px var(--surface-2);
+.ctx-badge:hover {
+  background: var(--surface-3);
+  border-color: var(--border-default);
 }
-.model-badge-icon {
-  color: var(--text-tertiary);
-  flex-shrink: 0;
-}
-.model-name {
-  font-weight: 500;
-  color: var(--text-primary);
-  white-space: nowrap;
-  max-width: 160px;
+.ctx-badge-bar {
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-3);
   overflow: hidden;
-  text-overflow: ellipsis;
+  flex-shrink: 0;
 }
+.ctx-badge-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: currentColor;
+  transition: width var(--dur-base, 200ms) var(--ease-out);
+}
+.ctx-badge-pct {
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.ctx-badge-tokens {
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+}
+.ctx-badge.success { color: var(--success-500, #10b981); }
+.ctx-badge.warning { color: var(--warn-500, #f59e0b); }
+.ctx-badge.error   { color: var(--error-500, #ef4444); }
 </style>

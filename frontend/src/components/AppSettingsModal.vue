@@ -272,7 +272,7 @@ const sysLimits = ref<api.LimitsConfig>({
   tool_result_read_cap: 8000,
   tool_result_default_cap: 6000,
   prune_after_rounds: 15,
-  max_rounds: 300,
+  max_rounds: 500,
   todo_long_run_mode: 'adaptive',
   max_stored_messages: 0,
 })
@@ -345,7 +345,7 @@ function resetSystemConfig() {
     tool_result_read_cap: 8000,
     tool_result_default_cap: 6000,
     prune_after_rounds: 15,
-    max_rounds: 300,
+    max_rounds: 500,
     todo_long_run_mode: 'adaptive',
     max_stored_messages: 0,
   }
@@ -2046,7 +2046,7 @@ function kbModelSupportsVision(scanModel: string) {
                     <div class="sys-form-row">
                       <span class="sys-label">最大回合数</span>
                       <NInputNumber v-model:value="sysLimits.max_rounds" :min="0" :step="10" size="small" style="width:100px" @update:value="markSysDirty" />
-                      <span class="sys-hint">0 = 不限制，默认 300</span>
+                      <span class="sys-hint">0 = 不限制，默认 500</span>
                     </div>
                     <div class="sys-form-row">
                       <span class="sys-label">Todo 长任务</span>

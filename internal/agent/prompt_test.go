@@ -217,6 +217,50 @@ func TestBuildToolHintBlock_NoToolsKB(t *testing.T) {
 }
 
 // =====================================================================
+// buildToolHint (Tool Fallback section)
+// =====================================================================
+
+// TestBuildToolHint_ForbidsXMLMarkers pins the 2026-08 DSML regression
+// guard: deepseek 系模型偶发把工具调用写成 <invoke name="..."> /
+// antml:invoke / <tool_calls> XML 文本，P-Chat 不解析这类标记会原样
+// 渲染、工具不执行、回合被打断。提示词必须明确禁止这些标记，并只
+// 支持 ```tool_call``` JSON 块作为文本 fallback。
+func TestBuildToolHint_ForbidsXMLMarkers(t *testing.T) {
+	got := buildToolHint([]tool.Tool{{Name: "exec_command", Description: "x"}})
+	if got == "" {
+		t.Fatal("expected non-empty tool fallback hint")
+	}
+	for _, marker := range []string{
+		`<invoke name="..."`,
+		"antml:invoke",
+		"<tool_calls>",
+		"```tool_call", // supported text fallback must still be present
+	} {
+		if !strings.Contains(got, marker) {
+			t.Errorf("Tool Fallback hint should mention %q, got %q", marker, got)
+		}
+	}
+}
+
+// TestMaxStepsPrompt_ForbidsXMLMarkers pins the same guard on the
+// last-round prompt (the scenario where DSML actually leaked: tools=0
+// + model still wanted to call a tool). Both language variants must
+// forbid XML/DSML tool-call markers.
+func TestMaxStepsPrompt_ForbidsXMLMarkers(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"MaxStepsPromptEN": MaxStepsPromptEN,
+		"MaxStepsPromptZH": MaxStepsPromptZH,
+	} {
+		if !strings.Contains(prompt, "antml:invoke") {
+			t.Errorf("%s should forbid antml:invoke markers: %q", name, prompt)
+		}
+		if !strings.Contains(prompt, "<invoke") {
+			t.Errorf("%s should forbid <invoke> markers: %q", name, prompt)
+		}
+	}
+}
+
+// =====================================================================
 // buildToolSpecificHints
 // =====================================================================
 

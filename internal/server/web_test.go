@@ -12,6 +12,7 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/server"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
@@ -25,6 +26,16 @@ func newWebServer(t *testing.T) *httptest.Server {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
+
+	// Same PCHAT_DATA_HOME isolation as newTestServerWithConfig:
+	// on dev machines where PCHAT_DATA_HOME is set, config.Load("")
+	// would otherwise read the REAL user config and provider CRUD
+	// tests would see pre-existing providers (409 instead of 201).
+	// SetHomeForTest mirrors PCHAT_DATA_HOME semantics — the value is
+	// the data directory itself (~/.p-chat), since GlobalDir() ==
+	// resolveHome().dir and GlobalConfig() == GlobalDir()+"/config.json".
+	paths.SetHomeForTest(filepath.Join(dir, ".p-chat"))
+	t.Cleanup(func() { paths.SetHomeForTest("") })
 
 	cfg, err := config.Load("")
 	if err != nil {

@@ -3,7 +3,7 @@
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
 
-import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError } from './sse'
+import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, type StreamEventLike } from './sse'
 
 const BASE = '' // same origin; pchat-server serves both UI and API
 
@@ -778,6 +778,80 @@ export const deleteStyle = (id: string) =>
   jsonFetch<{ ok: boolean; id: string }>(`/api/v1/styles/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   })
+
+// --- StyleGen (generate / optimize an AI style from the current conversation) ---
+// The job runs in a background goroutine on the server; startStyleGen
+// returns a job id and streamStyleGen consumes the SSE progress stream.
+
+export interface StyleGenRequest {
+  mode: 'create' | 'optimize'
+  style_id?: string
+  label: string
+  requirement?: string
+  conversation_id: string
+}
+
+export interface StyleGenResult {
+  id: string
+  label: string
+  prompt: string
+  memory: string
+  mode: string
+  updated: boolean // true = target updated in place; false = new style created
+}
+
+export interface StyleGenEvent extends StreamEventLike {
+  type?: string
+  stage?: string
+  label?: string
+  content?: string
+  thinking?: string
+  result_json?: StyleGenResult
+  error?: string
+  error_kind?: string
+}
+
+export const startStyleGen = (req: StyleGenRequest) =>
+  jsonFetch<{ job_id: string }>('/api/v1/stylegen', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  })
+
+export interface StyleGenJobStatus {
+  id: string
+  status: 'running' | 'done' | 'error'
+  stages?: { stage: string; label: string; done: boolean }[]
+  result?: StyleGenResult
+  error?: string
+  error_kind?: string
+  created_at?: number
+  done_at?: number
+}
+
+export const fetchStyleGenStatus = (jobID: string) =>
+  jsonFetch<StyleGenJobStatus>(`/api/v1/stylegen/${encodeURIComponent(jobID)}`)
+
+export async function streamStyleGen(
+  jobID: string,
+  onEvent: (ev: StyleGenEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = await waitForDirectBackend()
+  const resp = await fetch(`${base}/api/v1/stylegen/${encodeURIComponent(jobID)}/events`, {
+    method: 'GET',
+    headers: { Accept: 'text/event-stream' },
+    signal,
+  })
+  if (!resp.ok || !resp.body) {
+    throw new Error(`stylegen events: HTTP ${resp.status}: ${resp.statusText}`)
+  }
+  await consumeSSEStream<StyleGenEvent>({
+    reader: resp.body.getReader(),
+    signal,
+    label: 'stylegen',
+    onEvent,
+  })
+}
 
 // --- Slash commands ---
 export interface CommandSpec {
@@ -1558,6 +1632,11 @@ export interface ContextInspector {
   estimated_tokens: number
   usable_tokens: number
   utilization_pct: number
+  // estimated_tokens / context_window * 100 — the "how full is
+  // the model's window" number (200K / 1M = 20%), distinct from
+  // utilization_pct (usable-window based, the auto-compact
+  // trigger). Optional so older servers degrade gracefully.
+  context_window_pct?: number
   compressed_summary?: string
   messages: ContextMessage[]
 }

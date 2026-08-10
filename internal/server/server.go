@@ -161,6 +161,12 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/styles/:id", h.GetStyle)
 		api.PATCH("/styles/:id", h.UpdateStyle)
 		api.DELETE("/styles/:id", h.DeleteStyle)
+		// stylegen: generate / optimize an AI style from the current
+		// conversation. POST submits a background job (202 {job_id}),
+		// GET /:job/events streams SSE progress, GET /:job polls.
+		api.POST("/stylegen", h.StyleGenStart)
+		api.GET("/stylegen/:job", h.StyleGenStatus)
+		api.GET("/stylegen/:job/events", h.StyleGenEvents)
 		api.GET("/providers", h.Providers)
 		api.GET("/providers/:name", h.GetProvider)
 		api.POST("/providers", h.AddProvider)

@@ -145,13 +145,12 @@ export const state = reactive({
   // 未送达消息…") while this is true so the user knows
   // the system is doing work, not hanging.
   isRecovering: {} as Record<string, boolean>,
-  // P2-3: context inspector drawer state. When non-null
-  // the drawer is open with this payload. Loading and
-  // error states are tracked separately so the drawer
-  // can show a spinner / retry button without losing
-  // its open/close state across reloads.
+  // P2-3: context usage snapshot for the TopBar badge. When
+  // non-null it holds the cached payload + loading/error state
+  // for the current session's context utilisation estimate.
+  // `refreshContextUsage` updates it silently; the badge reads
+  // `.data` (and hides on a failed fetch).
   contextInspector: null as null | {
-    open: boolean
     loading: boolean
     error: string | null
     data: api.ContextInspector | null
@@ -571,6 +570,9 @@ export async function switchSession(id: string) {
       state.sessionTodos[id] = t.todos || []
     } catch { /* ignore — server may not have todos yet */ }
   }
+  // P4-x: keep the TopBar context badge in sync with the newly
+  // active session. Silent fetch — the drawer stays closed.
+  void refreshContextUsage(id)
 }
 
 // loadMoreMessages fetches the next page of older history
@@ -1912,6 +1914,9 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           state.pendingPlanText[id] = planText
         }
       }
+      // P4-x: turn finished — refresh the TopBar context badge
+      // so the estimate reflects the tokens this turn added.
+      void refreshContextUsage(id)
       break
     case 'question':
       // The LLM is asking the user a question. Two emit
@@ -2316,51 +2321,22 @@ export function appendSystemMessage(text: string) {
   state.sessionMessages[cid].push({ role: 'system', content: scrubPhantomError(text) })
 }
 
-// --- P2-3 context inspector ---
+// --- P2-3 context usage (TopBar badge) ---
 
-// openContextInspector opens the drawer and kicks off
-// the fetch. Re-opening while a previous load is
-// in-flight is a no-op (the in-flight promise is
-// allowed to complete). Re-opening after a successful
-// load also refetches — the user may have sent new
-// messages since the last open and the inspector
-// should reflect the current state.
-export function openContextInspector(sessionId: string) {
-  if (!sessionId) return
-  const cur = state.contextInspector
-  state.contextInspector = {
-    open: true,
-    loading: !cur?.data, // skip the spinner on refresh
-    error: null,
-    data: cur?.data ?? null,
-  }
-  void loadContextInspector(sessionId)
-}
-
-// closeContextInspector is purely UI state — the
-// cached data is kept so re-opening is instant. The
-// caller (drawer's "×" button) toggles `open` only;
-// the next open will refresh.
-export function closeContextInspector() {
-  if (!state.contextInspector) return
-  state.contextInspector = { ...state.contextInspector, open: false }
-}
-
-// loadContextInspector pulls the per-message token
-// breakdown + utilisation for the active session.
-// Errors land in `state.contextInspector.error` so the
-// drawer can show a retry button without losing the
-// open/close state.
+// loadContextInspector pulls the current session's token
+// estimate + utilisation into `state.contextInspector.data`.
+// Errors land in `state.contextInspector.error`; the badge
+// just hides on failure (data is left intact if present).
 export async function loadContextInspector(sessionId: string): Promise<void> {
   if (!state.contextInspector) {
-    state.contextInspector = { open: true, loading: true, error: null, data: null }
+    state.contextInspector = { loading: true, error: null, data: null }
   } else {
     state.contextInspector.loading = true
     state.contextInspector.error = null
   }
   try {
     const data = await api.getSessionContext(sessionId)
-    if (!state.contextInspector) return // closed mid-load
+    if (!state.contextInspector) return // cleared mid-load
     state.contextInspector.data = data
     state.contextInspector.loading = false
   } catch (e: any) {
@@ -2368,6 +2344,21 @@ export async function loadContextInspector(sessionId: string): Promise<void> {
     state.contextInspector.error = e?.message || 'load failed'
     state.contextInspector.loading = false
   }
+}
+
+// refreshContextUsage fetches the context utilisation snapshot
+// for the given session. It is the ONLY entry point now — the
+// old drawer that opened on click is gone; the TopBar badge
+// renders from `state.contextInspector.data`. Called on session
+// switch / after each turn (and on badge click) to keep the
+// badge current. Errors are swallowed — the badge hides.
+export function refreshContextUsage(sessionId: string) {
+  if (!sessionId) return
+  if (!state.contextInspector) {
+    // Create the bucket so the badge can read data.
+    state.contextInspector = { loading: true, error: null, data: null }
+  }
+  void loadContextInspector(sessionId)
 }
 
 export function endStream(id: string, ctrl?: AbortController) {
@@ -2393,6 +2384,11 @@ export function endStream(id: string, ctrl?: AbortController) {
   delete state.streaming[id]
   state.sessionWorking[id] = false
   state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
+  // P4-x: stop/abort/regenerate also changes what the next turn
+  // will send — refresh the TopBar context badge. (The normal
+  // `done` path already refreshed in appendStreamEvent, so no
+  // double-fetch here.)
+  void refreshContextUsage(id)
 }
 
 // regenerateMessage is the P1-3 entry point. The

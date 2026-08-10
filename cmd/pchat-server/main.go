@@ -30,6 +30,7 @@ import (
 	"github.com/p-chat/pchat/internal/server"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/stylegen"
 	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
@@ -265,6 +266,18 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
+
+	// Wire the stylegen background job manager (generate / optimize an
+	// AI style from the current conversation). It reads the store
+	// read-only and writes only to the styles table.
+	srv.Handler().SetStyleGen(stylegen.NewJobManager(stylegen.Deps{
+		Store:    memStore,
+		StyleMgr: styleMgr,
+		LLM:      llmClient,
+		Provider: defaultProviderName(cfg),
+		Model:    "",
+		MaxChars: 40000,
+	}))
 
 	imGateway := im.NewGateway(cfg.IM)
 	registerIMAdapters(imGateway, cfg.IM)

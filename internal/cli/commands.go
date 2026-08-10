@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -462,6 +463,19 @@ func init() {
 				"/branch 3",
 			},
 			Handler: cmdFork,
+		},
+		{
+			Name: "/stylegen", Aliases: []string{"/sg"}, Description: "从当前对话生成/优化 AI 风格",
+			Usage: "/stylegen create \"名称\" [要求] | /stylegen optimize <style_id> [要求]",
+			Args: "create \"名称\" [要求]    - 基于当前对话生成一套新风格（名称可用中文；要求可选）\n" +
+				"optimize <style_id> [要求] - 基于当前对话优化现有风格；内置(cute/guofeng/tech)会另存\n" +
+				"  缺省参数会交互式补全；来源对话固定为当前会话",
+			Examples: []string{
+				`/stylegen create "温柔老师" "语气要温柔"`,
+				`/stylegen optimize custom1 "更简洁一点"`,
+				"/sg create \"代码导师\"",
+			},
+			Handler: cmdStyleGen,
 		},
 	}
 
@@ -1907,6 +1921,164 @@ func cmdFork(ctx cliContext, args string) error {
 	color.Green("  ✓ 已创建分支对话 %s（含 %d 条消息）", sess.ID[:16], targetIdx+1)
 	color.Cyan("    标题: %s", sess.Title)
 	return nil
+}
+
+// cmdStyleGen 从当前对话生成/优化 AI 风格。
+// cmdStyleGen generates or optimizes an AI persona style from the
+// current conversation.
+//
+//	/stylegen create "温柔老师" [要求...]
+//	/stylegen optimize <style_id> [要求...]
+//
+// Missing arguments are completed interactively; the source conversation
+// is always the current session. The actual generation runs through
+// cliContext.StyleGen (local = synchronous Generate, http = server job
+// polling), which prints stage progress lines.
+func cmdStyleGen(ctx cliContext, args string) error {
+	args = strings.TrimSpace(args)
+	sub, rest := splitStyleGenArgs(args)
+	if sub == "" {
+		color.Yellow("  用法: /stylegen create \"名称\" [要求] | /stylegen optimize <style_id> [要求]")
+		return nil
+	}
+	mode := strings.ToLower(sub)
+	if mode != "create" && mode != "optimize" {
+		color.Yellow("  用法: /stylegen create \"名称\" [要求] | /stylegen optimize <style_id> [要求]")
+		return nil
+	}
+
+	if ctx.GetCurrentSessionID() == "" {
+		color.Red("  ✗ 当前没有活跃会话")
+		return nil
+	}
+
+	var styleID, label, requirement string
+	if mode == "create" {
+		label, requirement = splitStyleGenArgs(rest)
+		requirement = stripQuotes(requirement)
+		if label == "" {
+			fmt.Print("风格名称（如：温柔老师）> ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if !scanner.Scan() {
+				color.HiBlack("  已取消")
+				return nil
+			}
+			label = strings.TrimSpace(scanner.Text())
+		}
+		if label == "" {
+			color.HiBlack("  未提供风格名称，已取消")
+			return nil
+		}
+		if requirement == "" {
+			fmt.Print("补充要求（可留空，如：语气温柔 / 记得我的称呼）> ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if !scanner.Scan() {
+				color.HiBlack("  已取消")
+				return nil
+			}
+			requirement = strings.TrimSpace(scanner.Text())
+		}
+	} else { // optimize
+		styleID, requirement = splitStyleGenArgs(rest)
+		requirement = stripQuotes(requirement)
+		if styleID == "" {
+			styles := ctx.ListAllStyles(context.Background())
+			if len(styles) == 0 {
+				color.HiBlack("  没有任何可优化的风格，先用 /stylegen create 生成一个")
+				return nil
+			}
+			fmt.Println("选择要优化的风格：")
+			for i, s := range styles {
+				desc := ""
+				if s.Desc != "" {
+					desc = " — " + s.Desc
+				}
+				fmt.Printf("  %2d  %s  (%s)%s\n", i+1, s.Label, s.ID, desc)
+			}
+			fmt.Print("序号> ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if !scanner.Scan() {
+				color.HiBlack("  已取消")
+				return nil
+			}
+			idx, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
+			if err != nil || idx < 1 || idx > len(styles) {
+				color.HiBlack("  无效序号")
+				return nil
+			}
+			styleID = styles[idx-1].ID
+		}
+		if requirement == "" {
+			fmt.Print("想改哪里（如：更简洁 / 语气再冷一点，可留空）> ")
+			scanner := bufio.NewScanner(os.Stdin)
+			if !scanner.Scan() {
+				color.HiBlack("  已取消")
+				return nil
+			}
+			requirement = strings.TrimSpace(scanner.Text())
+		}
+	}
+
+	color.HiBlack("  ◇ 来源对话: 当前会话；模式: %s", mode)
+	res, err := ctx.StyleGen(context.Background(), mode, styleID, label, requirement)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			color.HiBlack("  已取消")
+			return nil
+		}
+		color.Red("  ✗ 生成失败: %v", err)
+		return nil
+	}
+	if res == nil {
+		color.HiBlack("  未返回结果")
+		return nil
+	}
+	printStyleGenResult(mode, res)
+	return nil
+}
+
+// splitStyleGenArgs splits the first token (possibly double-quoted) from
+// the rest of the line. Returns ("", "") when s is empty.
+func splitStyleGenArgs(s string) (first, rest string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	if s[0] == '"' {
+		if end := strings.Index(s[1:], `"`); end >= 0 {
+			return s[1 : end+1], strings.TrimSpace(s[end+2:])
+		}
+		return s[1:], ""
+	}
+	if idx := strings.IndexAny(s, " \t"); idx >= 0 {
+		return s[:idx], strings.TrimSpace(s[idx+1:])
+	}
+	return s, ""
+}
+
+// stripQuotes removes a surrounding pair of double quotes from a token
+// (the second token of /stylegen create "name" "requirement" keeps its
+// quotes after splitStyleGenArgs, which only unquotes the first token).
+func stripQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// printStyleGenResult prints the finished stylegen result line.
+func printStyleGenResult(mode string, res *StyleGenResult) {
+	if mode == "optimize" && !res.Updated {
+		color.Green("  ✓ 内置风格只读，已另存为新风格")
+	} else if mode == "optimize" {
+		color.Green("  ✓ 已原地更新风格 %s", res.ID)
+	} else {
+		color.Green("  ✓ 新风格已创建")
+	}
+	color.Cyan("    id:    %s", res.ID)
+	color.Cyan("    label: %s", res.Label)
+	fmt.Printf("    prompt: %d 字符, memory: %d 字符（可去设置→风格 编辑）\n", len(res.Prompt), len(res.Memory))
 }
 
 // cmdPlan asks the LLM to produce a step-by-step plan in plain

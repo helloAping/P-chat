@@ -1,6 +1,7 @@
 # 浏览器控制功能开发计划
 
-> **状态**: 规划中  
+> **状态**: ✅ 已实施（P1–P6 代码与测试全部落地；P7 测试/打包/README 完成，P7.4 用户文档未编写）
+> **实施核验**（2026-08-06）: P1–P6 全部落地（`internal/browser/*`、`browser-extension/*`、server 路由、前端 Tab 与截图渲染）；P3.4 content.css 为可选项未做；P6.4 stripImageContent 实现方式变更（已移除，见 `internal/agent/agent.go:1945`）；P7.1 / P7.3 / P7.5 ✅，P7.2 自动化 E2E 覆盖（`e2e_test.go`），P7.4 ❌ `docs/browser-control.md` 未编写  
 > **创建日期**: 2026-07-13  
 > **预估工期**: 11 个工作日  
 > **优先级**: High

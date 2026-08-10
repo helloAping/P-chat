@@ -106,20 +106,24 @@ func (mockBase) ChatWithTools(context.Context, agent.ChatRequest) (<-chan agent.
 func (mockBase) ChatStream(context.Context, agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
 	return nil, nil
 }
-func (mockBase) StyleLabel(style.Style) string { return "" }
-func (mockBase) ListStyles() []style.Style     { return nil }
-func (mockBase) StyleName() string             { return "" }
-func (mockBase) SetStyle(string) error         { return nil }
-func (mockBase) ListModes() []config.WorkMode  { return nil }
-func (mockBase) ModeName() string              { return "" }
-func (mockBase) SetMode(string) error          { return nil }
-func (mockBase) ListTools() []ToolView         { return nil }
-func (mockBase) ToolsEnabled() bool            { return false }
-func (mockBase) SetToolsEnabled(bool)          {}
-func (mockBase) SetSandbox(bool)               {}
-func (mockBase) BypassSandboxOnce()            {}
-func (mockBase) RebuildSandbox() error         { return nil }
-func (mockBase) ExpandList() []ToolResultView  { return nil }
+func (mockBase) StyleLabel(style.Style) string             { return "" }
+func (mockBase) ListStyles() []style.Style                 { return nil }
+func (mockBase) StyleName() string                         { return "" }
+func (mockBase) SetStyle(string) error                     { return nil }
+func (mockBase) ListAllStyles(context.Context) []StyleView { return nil }
+func (mockBase) StyleGen(context.Context, string, string, string, string) (*StyleGenResult, error) {
+	return nil, nil
+}
+func (mockBase) ListModes() []config.WorkMode { return nil }
+func (mockBase) ModeName() string             { return "" }
+func (mockBase) SetMode(string) error         { return nil }
+func (mockBase) ListTools() []ToolView        { return nil }
+func (mockBase) ToolsEnabled() bool           { return false }
+func (mockBase) SetToolsEnabled(bool)         {}
+func (mockBase) SetSandbox(bool)              {}
+func (mockBase) BypassSandboxOnce()           {}
+func (mockBase) RebuildSandbox() error        { return nil }
+func (mockBase) ExpandList() []ToolResultView { return nil }
 func (mockBase) ExpandByIndex(int) (ToolResultView, bool) {
 	return ToolResultView{}, false
 }
@@ -189,6 +193,15 @@ type mockCtx struct {
 	reasoningLevel     string
 	regenSessionID     string
 	regenUserMessageID int64
+
+	// Stylegen recordings.
+	styleGenMode        string
+	styleGenStyleID     string
+	styleGenLabel       string
+	styleGenRequirement string
+	styleGenResult      *StyleGenResult
+	styleGenErr         error
+	allStyles           []StyleView
 }
 
 // Per-method overrides for the methods the cmdXxx tests need.
@@ -285,6 +298,25 @@ func (m *mockCtx) ForkSession(_ context.Context, src string, beforeID int64) (*h
 	m.forkedBeforeID = beforeID
 	// ID must be ≥16 chars; cmdFork prints sess.ID[:16].
 	return &httpcli.Session{ID: "forked-sess-1234567890"}, m.err
+}
+
+// ListAllStyles / StyleGen overrides let cmdStyleGen tests drive the
+// optimize picker and record the generation call.
+func (m *mockCtx) ListAllStyles(_ context.Context) []StyleView {
+	return m.allStyles
+}
+func (m *mockCtx) StyleGen(_ context.Context, mode, styleID, label, requirement string) (*StyleGenResult, error) {
+	m.styleGenMode = mode
+	m.styleGenStyleID = styleID
+	m.styleGenLabel = label
+	m.styleGenRequirement = requirement
+	if m.styleGenErr != nil {
+		return nil, m.styleGenErr
+	}
+	if m.styleGenResult != nil {
+		return m.styleGenResult, nil
+	}
+	return &StyleGenResult{ID: "gentle-teacher", Label: label, Updated: false}, nil
 }
 func (m *mockCtx) AddKB(p string) error {
 	m.kbAction = "add"
@@ -1430,5 +1462,122 @@ func TestMatchCommand_UnknownReturnsNil(t *testing.T) {
 	// implementation returns ("", "") for unknown.
 	if args != "" {
 		t.Errorf("unknown-command args = %q, want empty", args)
+	}
+}
+
+// =====================================================================
+// /stylegen
+// =====================================================================
+
+func TestCmdStyleGen_Create(t *testing.T) {
+	ctx := &mockCtx{sessionID: "sess-1"}
+	if err := cmdStyleGen(ctx, `create "温柔老师" "语气要温柔"`); err != nil {
+		t.Fatalf("cmdStyleGen(create): %v", err)
+	}
+	if ctx.styleGenMode != "create" {
+		t.Errorf("mode = %q, want create", ctx.styleGenMode)
+	}
+	if ctx.styleGenLabel != "温柔老师" {
+		t.Errorf("label = %q", ctx.styleGenLabel)
+	}
+	if ctx.styleGenRequirement != "语气要温柔" {
+		t.Errorf("requirement = %q", ctx.styleGenRequirement)
+	}
+	if ctx.styleGenStyleID != "" {
+		t.Errorf("create should pass empty style_id, got %q", ctx.styleGenStyleID)
+	}
+}
+
+// TestCmdStyleGen_StdinCancel: when the requirement is missing the command
+// prompts on stdin; with no stdin input it cancels gracefully without
+// calling StyleGen.
+func TestCmdStyleGen_StdinCancel(t *testing.T) {
+	ctx := &mockCtx{sessionID: "sess-1"}
+	if err := cmdStyleGen(ctx, `create "代码导师"`); err != nil {
+		t.Fatalf("cmdStyleGen(create no req): %v", err)
+	}
+	if ctx.styleGenMode != "" {
+		t.Errorf("StyleGen should not be called when the requirement prompt is cancelled; got mode=%q", ctx.styleGenMode)
+	}
+}
+
+func TestSplitStyleGenArgs(t *testing.T) {
+	cases := []struct {
+		in, first, rest string
+	}{
+		{`create "温柔老师" "语气要温柔"`, "create", `"温柔老师" "语气要温柔"`},
+		{`create`, "create", ""},
+		{`optimize tech`, "optimize", "tech"},
+		{`  create "x"  `, "create", `"x"`},
+		{`"only quoted"`, "only quoted", ""},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		first, rest := splitStyleGenArgs(c.in)
+		if first != c.first || rest != c.rest {
+			t.Errorf("splitStyleGenArgs(%q) = (%q, %q), want (%q, %q)", c.in, first, rest, c.first, c.rest)
+		}
+	}
+}
+
+func TestCmdStyleGen_OptimizeCustom(t *testing.T) {
+	ctx := &mockCtx{sessionID: "sess-1", styleGenResult: &StyleGenResult{ID: "custom1", Label: "自定义", Updated: true}}
+	if err := cmdStyleGen(ctx, `optimize custom1 "更简洁"`); err != nil {
+		t.Fatalf("cmdStyleGen(optimize): %v", err)
+	}
+	if ctx.styleGenMode != "optimize" {
+		t.Errorf("mode = %q, want optimize", ctx.styleGenMode)
+	}
+	if ctx.styleGenStyleID != "custom1" {
+		t.Errorf("style_id = %q", ctx.styleGenStyleID)
+	}
+	// The CLI passes no label for optimize — the stylegen core is
+	// responsible for keeping the target's current name. Passing empty
+	// must be allowed (regression for the optimize-always-fails bug).
+	if ctx.styleGenLabel != "" {
+		t.Errorf("optimize should pass empty label, got %q", ctx.styleGenLabel)
+	}
+	if ctx.styleGenRequirement != "更简洁" {
+		t.Errorf("requirement = %q", ctx.styleGenRequirement)
+	}
+}
+
+func TestCmdStyleGen_NoSession(t *testing.T) {
+	ctx := &mockCtx{} // no sessionID
+	if err := cmdStyleGen(ctx, `create "x"`); err != nil {
+		t.Fatalf("cmdStyleGen: %v", err)
+	}
+	if ctx.styleGenMode != "" {
+		t.Errorf("StyleGen should not be called without a session; got mode=%q", ctx.styleGenMode)
+	}
+}
+
+func TestCmdStyleGen_NoArgs(t *testing.T) {
+	ctx := &mockCtx{sessionID: "sess-1"}
+	if err := cmdStyleGen(ctx, ""); err != nil {
+		t.Fatalf("cmdStyleGen(\"\"): %v", err)
+	}
+	if ctx.styleGenMode != "" {
+		t.Errorf("StyleGen should not be called for empty args; got mode=%q", ctx.styleGenMode)
+	}
+}
+
+func TestCmdStyleGen_ErrorPropagates(t *testing.T) {
+	ctx := &mockCtx{sessionID: "sess-1", styleGenErr: errors.New("E_EMPTY: 对话为空")}
+	if err := cmdStyleGen(ctx, `create "x"`); err != nil {
+		t.Fatalf("cmdStyleGen should print the error and return nil: %v", err)
+	}
+}
+
+// TestCmdStyleGen_OptimizePicker drives the interactive style picker by
+// pre-populating allStyles; the command falls back to the list only when
+// no style_id arg is given. With an explicit arg the picker is skipped.
+func TestCmdStyleGen_OptimizeWithExplicitID(t *testing.T) {
+	ctx := &mockCtx{sessionID: "sess-1", allStyles: []StyleView{{ID: "tech", Label: "科技风"}}}
+	if err := cmdStyleGen(ctx, `optimize tech "再酷一点"`); err != nil {
+		t.Fatalf("cmdStyleGen(optimize tech): %v", err)
+	}
+	if ctx.styleGenStyleID != "tech" {
+		t.Errorf("style_id = %q, want tech", ctx.styleGenStyleID)
 	}
 }

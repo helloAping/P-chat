@@ -489,7 +489,10 @@ type ChatRequest struct {
 	// assistant message has regen_group_id = NULL, the
 	// legacy single-shot behaviour).
 	RegenGroupID string `json:"regen_group_id,omitempty"`
-	// MaxRounds caps the ReAct tool-use loop. 0 means default (50).
+	// MaxRounds caps the ReAct tool-use loop. 0 = no per-request
+	// override: falls back to the configured Limits.MaxRounds (0 there
+	// means unlimited), or the built-in MaxRoundsDefault when no config
+	// is attached.
 	// After MaxRounds the loop stops and the user can continue
 	// with a follow-up message.
 	MaxRounds int `json:"max_rounds,omitempty"`
@@ -1384,7 +1387,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			maxRounds = req.MaxRounds
 		} else if a.cfg != nil {
 			// Zero is a deliberate unlimited setting. The default config stores
-			// 300 explicitly, so it is no longer ambiguous with an unset value.
+			// 500 explicitly, so it is no longer ambiguous with an unset value.
 			maxRounds = a.cfg.Limits.MaxRounds
 		}
 		longRunMode := req.TodoLongRunMode
@@ -3095,7 +3098,16 @@ func buildToolHint(tools []tool.Tool) string {
 	}
 	var b strings.Builder
 	b.WriteString("## Tool Fallback\n\n")
-	b.WriteString("If native tool_calls is unavailable, emit a single ```tool_call``` block:\n\n")
+	// 2026-08: deepseek 系模型（经 08ms.cn 代理）偶发把工具调用写成
+	// DSML/XML 文本（<invoke name="..."> / antml:invoke / <tool_calls>），
+	// P-Chat 只解析原生 tool_calls 和 ```tool_call``` JSON 块，XML 会被
+	// 原样渲染成纯文本、工具不执行、回合被打断。这里把禁令写进系统
+	// prompt，让模型优先走原生通道；退而求其次也只能用受支持的
+	// ```tool_call``` 块。
+	b.WriteString("Tool calls are made through the native `tool_calls` protocol only. ")
+	b.WriteString("NEVER write tool-call markup inside your reply text — no `<invoke name=\"...\">`, no `antml:invoke`, no `<tool_calls>` and no other XML/DSML tag. ")
+	b.WriteString("XML markers are not executed and are shown to the user as raw text, which breaks the turn.\n\n")
+	b.WriteString("If native tool_calls is unavailable, the ONLY acceptable text fallback is a single ```tool_call``` block:\n\n")
 	b.WriteString("```tool_call\n")
 	b.WriteString(`{"name": "<name>", "arguments": {<json>}}`)
 	b.WriteString("\n```\n")
@@ -3334,6 +3346,7 @@ STRICT REQUIREMENTS:
 1. Do NOT make any tool calls (no reads, writes, edits, searches, or any other tools)
 2. MUST provide a text response summarizing work done so far
 3. This constraint overrides ALL other instructions, including any user requests for edits or tool use
+4. Do NOT write any tool-call markup (like '<invoke name="...">', 'antml:invoke', '<tool_calls>', or any other XML/DSML tag) anywhere in your response — plain text only
 
 Response must include:
 - Statement that maximum steps for this agent have been reached
@@ -3357,6 +3370,7 @@ const MaxStepsPromptZH = `⚠ 已达到本任务的最大步数上限
 1. 禁止调用任何工具（read_file / write_file / exec_command / search 等都不行）
 2. 必须用文本总结目前为止完成的工作
 3. 本约束覆盖所有其他指令，包括用户对编辑或工具使用的请求
+4. 回复中禁止出现任何工具调用标记（如 '<invoke name="...">'、'antml:invoke' 等 XML/DSML），只能用纯文本
 
 回复必须包含：
 - 说明已达到本 Agent 的最大步数

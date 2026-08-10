@@ -62,7 +62,7 @@ type LimitsConfig struct {
 	// rounds as [pruned]. Default 15. 0 = disable pruning.
 	PruneAfterRounds int `json:"prune_after_rounds"`
 	// MaxRounds overrides the agent's built-in safety-net round cap.
-	// Default 300. 0 = unlimited.
+	// Default 500. 0 = unlimited.
 	MaxRounds int `json:"max_rounds"`
 	// TodoLongRunMode controls whether active todo plans can run beyond
 	// MaxRounds. "adaptive" is the safe default: only active plans bypass the
@@ -87,6 +87,14 @@ type LimitsConfig struct {
 	// manually), and runs the agent loop again with a fresh full
 	// MaxTurnSeconds budget. 0 = disabled (previous behaviour).
 	// Default 2. Absent from config → default; explicit 0 → off.
+	//
+	// Note: the budget gates only the deadline-driven staircase retry.
+	// Todo-driven resumes (the session still has pending todos — the
+	// LLM ended the turn without marking every todo done/cancelled)
+	// are NOT counted against MaxTurnRetries: they re-run the turn to
+	// finish tracked work and are instead bounded by the T3 no-progress
+	// breaker (maxNoProgressResumes) in the server. A budget-exhausted
+	// turn with unfinished todos still auto-continues.
 	MaxTurnRetries int `json:"max_turn_retries"`
 	// LLMRetryBackoffs is the per-retry backoff staircase (in seconds)
 	// for transient upstream LLM errors (rate_limit / server_error /
@@ -965,7 +973,7 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Limits: LimitsConfig{
-			MaxRounds:              300,
+			MaxRounds:              500,
 			TodoLongRunMode:        TodoLongRunAdaptive,
 			MaxTurnSeconds:         900,
 			MaxTurnRetries:         2,

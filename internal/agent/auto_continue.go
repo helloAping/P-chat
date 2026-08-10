@@ -25,11 +25,11 @@ func pickMaxStepsPrompt(lang string) string {
 }
 
 // MaxRoundsDefault is the safety-net per-session cap (build mode).
-// At 300 rounds this is a last-resort guard against infinite loops;
+// At 500 rounds this is a last-resort guard against infinite loops;
 // normal conversations are limited by the auto-compaction token budget,
 // not by round count. When the cap fires the LLM responds with
 // MaxStepsPrompt and the user can continue with a follow-up message.
-const MaxRoundsDefault = 300
+const MaxRoundsDefault = 500
 
 // CumToolErrMax is the cumulative tool-failure breaker threshold in
 // ChatWithTools. After this many total tool failures across a turn

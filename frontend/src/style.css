@@ -17,15 +17,15 @@
  * ========================================================================= */
 
 /* --- 0. highlight.js theme ----------------------------------------------
- * MUST come before every other CSS rule (per the CSS @import spec) so
- * the parser doesn't drop it with a vite:css warning. The theme is
- * loaded as a side-effect rather than from main.ts to keep the order
- * of CSS rules predictable: the design-token layer below defines the
- * surface / text variables, this layer uses them, and our
- * `.hljs` namespace overrides below tweak the GitHub-dark baseline
- * (background: transparent + monospace font) for the P-Chat surface.
+ * Code highlighting is defined by the --code-* design tokens below
+ * (separate dark / light values) plus the token-driven `.hljs` rules
+ * at the bottom of this file. There is deliberately NO @import of a
+ * hardcoded highlight.js stylesheet — the old github-dark import
+ * painted light text (#C9D1D9) on the white code-block surface in
+ * light mode, which made code unreadable. The `.hljs` rules are
+ * theme-independent: they only read the --code-* tokens, so code
+ * colours follow the app theme automatically.
  */
-@import 'highlight.js/styles/github-dark.css';
 
 /* --- 1. Inter Variable Font (locally bundled) -----------------------------
  * Single variable-axis woff2 covers weights 100-900 with full Latin +
@@ -107,6 +107,27 @@
   --on-brand:         #FFFFFF;
   --on-accent:        #FFFFFF; /* legacy alias */
 
+  /* 2.7b Code highlight — GitHub-dark palette. The `.hljs` rules
+   * at the bottom of this file read these tokens, so code blocks
+   * follow the app theme instead of a hardcoded highlight.js
+   * stylesheet. Values mirror github-dark.css exactly. */
+  --code-fg:          #C9D1D9;
+  --code-bg:          #0B0D12;  /* code block surface (= surface-0) */
+  --code-comment:     #8B949E;
+  --code-keyword:     #FF7B72;
+  --code-string:      #A5D6FF;
+  --code-number:      #79C0FF;
+  --code-title:       #D2A8FF;
+  --code-builtin:     #FFA657;
+  --code-attr:        #79C0FF;
+  --code-name:        #7EE787;  /* tags / selector names */
+  --code-section:     #1F6FEB;
+  --code-bullet:      #F2CC60;
+  --code-addition:    #AFF5B4;
+  --code-addition-bg: #033A16;
+  --code-deletion:    #FFDCD7;
+  --code-deletion-bg: #67060C;
+
   /* 2.8 Spacing — 4-pt scale */
   --space-1:          4px;
   --space-2:          8px;
@@ -167,6 +188,25 @@
   --ai-100:           rgba(91, 61, 187, 0.16);
   --ai-500:           #5B3DDB;
   --ai-600:           #4A2EBF;
+
+  /* 2.7b Code highlight — GitHub-light palette. Dark text on a
+   * light grey code surface so code stays readable on white. */
+  --code-fg:          #24292E;
+  --code-bg:          #F6F8FA;
+  --code-comment:     #6A737D;
+  --code-keyword:     #D73A49;
+  --code-string:      #032F62;
+  --code-number:      #005CC5;
+  --code-title:       #6F42C1;
+  --code-builtin:     #E36209;
+  --code-attr:        #005CC5;
+  --code-name:        #22863A;
+  --code-section:     #005CC5;
+  --code-bullet:      #735C0F;
+  --code-addition:    #22863A;
+  --code-addition-bg: #F0FFF4;
+  --code-deletion:    #B31D28;
+  --code-deletion-bg: #FFEEF0;
 
   --shadow-sm:        0 1px 2px rgba(0, 0, 0, 0.06);
   --shadow-md:        0 4px 12px rgba(0, 0, 0, 0.10);
@@ -348,7 +388,7 @@ html, body, #app {
 .md-body p { margin: 0 0 8px 0; }
 .md-body p:last-child { margin-bottom: 0; }
 .md-body code { background: var(--surface-2); padding: 2px 6px; border-radius: 3px; font-family: var(--font-mono); font-size: 0.9em; }
-.md-body pre { background: var(--surface-0); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; overflow-x: auto; }
+.md-body pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; overflow-x: auto; }
 .md-body pre code { background: none; padding: 0; }
 .md-body a { color: var(--brand-600); }
 .md-body a:hover { color: var(--brand-500); }
@@ -428,21 +468,26 @@ html, body, #app {
 .cmd-tag.tag-vis { background: var(--brand-50); color: var(--brand-600); }
 
 /* =========================================================================
- * P2-2 highlight.js theme overrides
+ * highlight.js rules (token-driven, theme-independent)
  * =========================================================================
- * The actual @import for highlight.js's github-dark stylesheet
- * is at the top of this file (per the CSS @import spec, it
- * must precede all other rules — vite:css warns otherwise).
- * The block below tweaks the GitHub-dark baseline to match
- * the P-Chat dark surface: transparent background so the
- * surrounding code block owns the visual frame, and a
- * monospace font that defers to our design tokens.
+ * These rules replace the old hardcoded `@import
+ * 'highlight.js/styles/github-dark.css'`. Every colour reads a
+ * --code-* token defined in the dark / light token blocks above,
+ * so code blocks follow the app theme with zero per-theme rules.
+ * Class groups mirror the GitHub dark/light palettes the tokens
+ * encode (keyword / string / number / title / builtin / comment /
+ * name / section / bullet / addition / deletion).
  *
- * The .hljs class is what highlight.js stamps on every
- * <code> element it processes, so all our scoped overrides
- * live under that namespace.
+ * The .hljs class is what highlight.js stamps on every <code>
+ * element it processes.
  */
 
+/* Base: transparent background (the surrounding .md-body pre owns
+ * the visual frame via --code-bg) + the code base text colour. */
+.hljs {
+  color: var(--code-fg);
+  background: transparent;
+}
 pre code.hljs {
   background: transparent;
   padding: 0;
@@ -459,4 +504,106 @@ pre code.hljs {
  * background doesn't kiss the card border. */
 pre {
   padding: 8px 10px;
+}
+
+/* keyword / control flow / operators */
+.hljs-doctag,
+.hljs-keyword,
+.hljs-meta .hljs-keyword,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-variable.language_,
+.hljs-operator {
+  color: var(--code-keyword);
+}
+
+/* title — function / class / section names */
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.class_.inherited__,
+.hljs-title.function_ {
+  color: var(--code-title);
+}
+
+/* numbers / attributes / params / meta */
+.hljs-attr,
+.hljs-attribute,
+.hljs-literal,
+.hljs-meta,
+.hljs-number,
+.hljs-variable,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id,
+.hljs-property {
+  color: var(--code-attr);
+}
+
+/* strings / regex */
+.hljs-regexp,
+.hljs-string,
+.hljs-meta .hljs-string,
+.hljs-char.escape_ {
+  color: var(--code-string);
+}
+
+/* built-ins / symbols */
+.hljs-built_in,
+.hljs-symbol {
+  color: var(--code-builtin);
+}
+
+/* comments / formulas */
+.hljs-code,
+.hljs-comment,
+.hljs-formula,
+.hljs-quote {
+  color: var(--code-comment);
+}
+
+/* tags / selector names */
+.hljs-name,
+.hljs-selector-tag,
+.hljs-selector-pseudo {
+  color: var(--code-name);
+}
+
+/* section headings / list bullets */
+.hljs-section {
+  color: var(--code-section);
+}
+.hljs-bullet {
+  color: var(--code-bullet);
+}
+
+/* substitution falls back to the base text colour */
+.hljs-subst {
+  color: var(--code-fg);
+}
+
+/* emphasis / strong keep the base colour + weight */
+.hljs-emphasis {
+  color: var(--code-fg);
+  font-style: italic;
+}
+.hljs-strong {
+  color: var(--code-fg);
+  font-weight: 700;
+}
+
+/* diff — colour + tinted background */
+.hljs-addition {
+  color: var(--code-addition);
+  background-color: var(--code-addition-bg);
+}
+.hljs-deletion {
+  color: var(--code-deletion);
+  background-color: var(--code-deletion-bg);
+}
+
+/* links */
+.hljs-link {
+  color: var(--code-fg);
+  text-decoration: underline;
 }

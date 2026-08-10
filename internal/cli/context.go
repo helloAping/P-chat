@@ -19,6 +19,7 @@ import (
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/stylegen"
 	"github.com/p-chat/pchat/internal/tool"
 )
 
@@ -131,6 +132,15 @@ type cliContext interface {
 	ListTools() []ToolView
 	ToolsEnabled() bool
 	SetToolsEnabled(on bool)
+
+	// === Stylegen ===
+	// ListAllStyles returns every style (built-in + user-defined) so
+	// /stylegen optimize can offer a picker.
+	ListAllStyles(ctx context.Context) []StyleView
+	// StyleGen generates (mode="create") or optimizes (mode="optimize")
+	// an AI style from the current conversation. It prints stage
+	// progress lines as the job runs and returns the finished style.
+	StyleGen(ctx context.Context, mode, styleID, label, requirement string) (*StyleGenResult, error)
 
 	// === Sandbox ===
 	// SetSandbox toggles the sandbox on/off for subsequent tool
@@ -246,6 +256,23 @@ type KBView struct {
 	Path  string
 	Files int
 	Size  int64
+}
+
+// StyleView is one style offered by the /stylegen optimize picker.
+type StyleView struct {
+	ID    string
+	Label string
+	Desc  string
+}
+
+// StyleGenResult is the CLI's view of a finished stylegen run.
+type StyleGenResult struct {
+	ID      string
+	Label   string
+	Prompt  string
+	Memory  string
+	Mode    string
+	Updated bool // true = target updated in place; false = new style created
 }
 
 // ErrUnsupported is returned by cliContext methods that are inherently
@@ -714,6 +741,54 @@ func (c *localContext) SetStyle(name string) error {
 	return nil
 }
 
+// ListAllStyles returns every style (built-in first, then user-defined)
+// directly from the in-process style manager.
+func (c *localContext) ListAllStyles(ctx context.Context) []StyleView {
+	if c.r.styleMgr == nil {
+		return nil
+	}
+	var out []StyleView
+	for _, s := range c.r.styleMgr.ListAll() {
+		out = append(out, StyleView{ID: string(s), Label: c.r.styleMgr.DisplayLabel(s)})
+	}
+	return out
+}
+
+// StyleGen runs stylegen.Generate synchronously against the in-process
+// store / style manager / LLM, printing stage lines as it goes.
+func (c *localContext) StyleGen(ctx context.Context, mode, styleID, label, requirement string) (*StyleGenResult, error) {
+	if c.r.llm == nil {
+		return nil, errors.New("LLM 客户端未初始化")
+	}
+	convID := c.GetCurrentSessionID()
+	if convID == "" {
+		return nil, errors.New("当前没有活跃会话")
+	}
+	deps := stylegen.Deps{
+		Store:    c.r.store,
+		StyleMgr: c.r.styleMgr,
+		LLM:      c.r.llm,
+		Provider: c.r.provider,
+		MaxChars: 40000,
+	}
+	res, err := stylegen.Generate(ctx, deps, stylegen.Params{
+		Mode:           mode,
+		StyleID:        styleID,
+		Label:          label,
+		Requirement:    requirement,
+		ConversationID: convID,
+	}, func(ev stylegen.ProgressEvent) {
+		printStyleGenStage(ev.Stage, ev.Label)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &StyleGenResult{
+		ID: res.ID, Label: res.Label, Prompt: res.Prompt, Memory: res.Memory,
+		Mode: res.Mode, Updated: res.Updated,
+	}, nil
+}
+
 func (c *localContext) ListModes() []config.WorkMode {
 	return []config.WorkMode{config.WorkModeCoding, config.WorkModeDaily}
 }
@@ -1149,6 +1224,70 @@ func (c *httpContext) SetStyle(name string) error {
 	c.style = name
 	return nil
 }
+
+// ListAllStyles fetches every style from the server (built-in +
+// user-defined) for the /stylegen optimize picker.
+func (c *httpContext) ListAllStyles(ctx context.Context) []StyleView {
+	styles, err := c.c.ListStyles(ctx)
+	if err != nil {
+		return nil
+	}
+	out := make([]StyleView, 0, len(styles))
+	for _, s := range styles {
+		out = append(out, StyleView{ID: s.ID, Label: s.Label, Desc: s.Desc})
+	}
+	return out
+}
+
+// StyleGen submits the job to the server and polls its status, printing
+// new stage lines as they appear (the CLI is a terminal — no SSE needed).
+func (c *httpContext) StyleGen(ctx context.Context, mode, styleID, label, requirement string) (*StyleGenResult, error) {
+	convID := c.GetCurrentSessionID()
+	if convID == "" {
+		return nil, errors.New("当前没有活跃会话")
+	}
+	jobID, err := c.c.StartStyleGen(ctx, httpcli.StyleGenRequest{
+		Mode:           mode,
+		StyleID:        styleID,
+		Label:          label,
+		Requirement:    requirement,
+		ConversationID: convID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+	for {
+		st, err := c.c.GetStyleGenJob(ctx, jobID)
+		if err != nil {
+			return nil, err
+		}
+		for _, s := range st.Stages {
+			if s.Done && !seen[s.Stage] {
+				seen[s.Stage] = true
+				printStyleGenStage(s.Stage, s.Label)
+			}
+		}
+		if st.Status != "running" {
+			if st.Status == "error" {
+				return nil, styleGenErrFromStatus(st)
+			}
+			if st.Result == nil {
+				return nil, errors.New("任务已结束但缺少结果")
+			}
+			return &StyleGenResult{
+				ID: st.Result.ID, Label: st.Result.Label, Prompt: st.Result.Prompt,
+				Memory: st.Result.Memory, Mode: st.Result.Mode, Updated: st.Result.Updated,
+			}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
 func (c *httpContext) ListModes() []config.WorkMode {
 	return []config.WorkMode{config.WorkModeCoding, config.WorkModeDaily}
 }
@@ -1369,12 +1508,12 @@ func runLocalPlan(ctx cliContext, args string) error {
 
 	// Plan mode disables tools and limits to 1 round (handled in agent).
 	req := agent.ChatRequest{
-		Style:    r.style,
-		WorkMode: r.mode.Normalize(),
-		Provider: r.provider,
-		Messages: msgs,
+		Style:               r.style,
+		WorkMode:            r.mode.Normalize(),
+		Provider:            r.provider,
+		Messages:            msgs,
 		HistoryMessageCount: len(msgs) - 1,
-		PlanMode: true,
+		PlanMode:            true,
 	}
 
 	cctx, cancel := context.WithCancel(context.Background())
@@ -1504,4 +1643,45 @@ func runLocalExecutePlan(ctx cliContext, msgs []llm.ChatMessage, plan, provModel
 	}
 	ui.Finish()
 	return nil
+}
+
+// printStyleGenStage prints one stylegen progress stage line to the
+// terminal. Shared by the local (synchronous) and HTTP (polled) paths.
+func printStyleGenStage(stage, label string) {
+	switch stage {
+	case "reading":
+		color.HiBlack("  · 读取当前对话…")
+	case "analyzing":
+		color.HiBlack("  · 分析对话与要求…")
+	case "generating":
+		color.Cyan("  · 生成人格与记忆…")
+	case "saving":
+		color.HiBlack("  · 保存风格…")
+	case "done":
+		color.Green("  ✓ 完成")
+	default:
+		if label != "" {
+			color.HiBlack("  · " + label)
+		}
+	}
+}
+
+// styleGenErrFromStatus turns a failed stylegen job status into a
+// human-readable error, translating the E_* codes into Chinese hints.
+func styleGenErrFromStatus(st *httpcli.StyleGenJobStatus) error {
+	switch st.ErrorKind {
+	case "E_EMPTY":
+		return errors.New("当前对话为空：先聊几句，或补一个要求")
+	case "E_NOT_FOUND":
+		return errors.New("风格不存在，用 /stylegen optimize 交互选择现有风格")
+	case "E_DUP":
+		return errors.New("生成的风格 id 已存在，换个名称重试")
+	case "E_ARGS":
+		return errors.New("参数不正确：" + st.Error)
+	default:
+		if st.Error != "" {
+			return errors.New(st.Error)
+		}
+		return errors.New("stylegen 任务失败")
+	}
 }

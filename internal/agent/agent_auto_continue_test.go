@@ -11,8 +11,22 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/tool"
 )
+
+// TestMaxRoundsDefaultMatchesConfigDefault pins the two independent
+// "default round cap" values to the same number. agent.MaxRoundsDefault is
+// the built-in safety net used when no config is attached; config's
+// Default().Limits.MaxRounds is the value materialized by the config loader.
+// They must stay in sync, or nil-cfg callers get a different cap than
+// config-driven callers.
+func TestMaxRoundsDefaultMatchesConfigDefault(t *testing.T) {
+	want := config.Default().Limits.MaxRounds
+	if MaxRoundsDefault != want {
+		t.Fatalf("MaxRoundsDefault = %d, config default = %d; keep the two round-cap defaults in sync", MaxRoundsDefault, want)
+	}
+}
 
 // TestSessionPendingTodos_CountsBothStates verifies the helper
 // returns only pending + in_progress items (not done / cancelled).

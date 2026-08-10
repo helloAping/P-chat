@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
@@ -216,5 +218,111 @@ func TestRespondSSE_UserMessageResetsTracker(t *testing.T) {
 	h.resumeTrackers.Delete(sid)
 	if res, _ := runRespondSSE(t, h, doneChunk(), "⏱"); res != turnStreamRetry {
 		t.Fatal("after a user message the auto-resume budget must start fresh")
+	}
+}
+
+// runRespondSSETimeout drives respondSSE the way SendMessage does when a
+// turn is cut short by its MaxTurnSeconds hard deadline: the request
+// context is already expired, so the stream loop observes
+// context.DeadlineExceeded on a closed stream with no terminal frame.
+// retryNotice mirrors what SendMessage computed for that turn (non-empty
+// while the staircase budget remains or pending todos exist, empty when
+// the budget is spent AND no todo is left).
+func runRespondSSETimeout(t *testing.T, h *Handler, retryNotice string) (turnStreamResult, string) {
+	t.Helper()
+	w := newStreamRecorder() // CloseNotify needed by gin's c.Stream
+	ginCtx, _ := gin.CreateTestContext(w)
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/", nil).WithContext(expired)
+	ch := make(chan agent.ChatStreamChunk) // closed empty: no chunk, no terminal frame
+	close(ch)
+	res := h.respondSSE(ginCtx, ch, "sess", "test", "m", retryNotice)
+	return res, w.Body.String()
+}
+
+// TestRespondSSE_TimeoutBudgetExhaustedWithTodos covers the
+// budget-exhausted-but-todos-remain deadline path: the turn hit its
+// MaxTurnSeconds deadline AFTER the MaxTurnRetries staircase budget ran
+// out, yet unfinished todos are still pending — respondSSE must
+// auto-resume (turnStreamRetry) and show the todo-driven continue notice.
+func TestRespondSSE_TimeoutBudgetExhaustedWithTodos(t *testing.T) {
+	h, _ := newAutoResumeHandler(t)
+	sid := "sess"
+	tool.SetSessionTodos(sid, []tool.TodoItem{
+		{ID: "t1", Content: "a", Status: "pending"},
+		{ID: "t2", Content: "b", Status: "pending"},
+	})
+	t.Cleanup(func() { tool.SetSessionTodos(sid, nil) })
+
+	retryNotice := "⏱ 回合超出最长执行时间，检测到未完成任务，自动继续"
+	res, body := runRespondSSETimeout(t, h, retryNotice)
+	if res != turnStreamRetry {
+		t.Fatalf("result = %v, want turnStreamRetry; body=%s", res, body)
+	}
+	if !strings.Contains(body, "turn-retry") {
+		t.Fatalf("missing turn-retry notice frame; body=%s", body)
+	}
+	if !strings.Contains(body, "自动继续") {
+		t.Fatalf("missing todo auto-continue notice text; body=%s", body)
+	}
+	if !strings.Contains(body, `"session_status":"retry"`) {
+		t.Fatalf("missing busy(retry) session-status frame; body=%s", body)
+	}
+}
+
+// TestRespondSSE_TimeoutBudgetExhaustedNoTodos covers the other half of
+// budget exhaustion: the deadline hit with the retry budget spent AND no
+// pending todos left — retryNotice is empty, so respondSSE must NOT
+// resume; it emits a terminal turn_timeout error frame and the caller
+// reports the turn as ended.
+func TestRespondSSE_TimeoutBudgetExhaustedNoTodos(t *testing.T) {
+	h, _ := newAutoResumeHandler(t)
+	// No session todos registered: the snapshot is empty.
+
+	res, body := runRespondSSETimeout(t, h, "") // budget exhausted, nothing to continue
+	if res != turnStreamEnded {
+		t.Fatalf("result = %v, want turnStreamEnded; body=%s", res, body)
+	}
+	if !strings.Contains(body, "turn_timeout") {
+		t.Fatalf("missing terminal turn_timeout error frame; body=%s", body)
+	}
+	if strings.Contains(body, "turn-retry") {
+		t.Fatalf("budget-exhausted turn without todos must not retry; body=%s", body)
+	}
+}
+
+// TestRespondSSE_TimeoutNoProgressBreaker is the T3 integration for the
+// deadline path: a todo-driven resume chain that keeps hitting the turn
+// deadline WITHOUT todo progress is bounded by the no-progress breaker —
+// baseline + counted resumes first, then a terminal turn_timeout frame
+// with an auto-resume-stopped notice.
+func TestRespondSSE_TimeoutNoProgressBreaker(t *testing.T) {
+	h, _ := newAutoResumeHandler(t)
+	sid := "sess"
+	tool.SetSessionTodos(sid, []tool.TodoItem{
+		{ID: "t1", Content: "a", Status: "pending"},
+		{ID: "t2", Content: "b", Status: "pending"},
+	})
+	t.Cleanup(func() { tool.SetSessionTodos(sid, nil) })
+
+	retryNotice := "⏱ 回合超出最长执行时间，检测到未完成任务，自动继续"
+	// Baseline + counted resumes 1..2 are allowed...
+	for turn := 1; turn <= 1+maxNoProgressResumes-1; turn++ {
+		res, body := runRespondSSETimeout(t, h, retryNotice)
+		if res != turnStreamRetry {
+			t.Fatalf("turn %d: result = %v, want turnStreamRetry; body=%s", turn, res, body)
+		}
+	}
+	// ...then the no-progress limit stops the chain.
+	res, body := runRespondSSETimeout(t, h, retryNotice)
+	if res != turnStreamEnded {
+		t.Fatalf("limit turn: result = %v, want turnStreamEnded; body=%s", res, body)
+	}
+	if !strings.Contains(body, "auto-resume-stopped") {
+		t.Fatalf("limit turn: missing auto-resume-stopped notice; body=%s", body)
+	}
+	if !strings.Contains(body, "turn_timeout") {
+		t.Fatalf("limit turn: missing terminal turn_timeout frame; body=%s", body)
 	}
 }

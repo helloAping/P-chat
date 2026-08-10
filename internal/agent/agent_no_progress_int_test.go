@@ -175,7 +175,7 @@ func TestChatWithTools_CumulativeToolErrors_BreaksWhackAMole(t *testing.T) {
 		},
 		// Low round cap so a broken cumulative breaker (the
 		// regression this test guards against) fails fast instead
-		// of running 300 rounds. The fake LLM ignores the "stop"
+		// of running the 500-round default. The fake LLM ignores the "stop"
 		// system message, so the loop keeps failing until the cap
 		// — the breaker is a *nudge*, not a hard stop; a real LLM
 		// obeys the instruction and summarises. What we assert is

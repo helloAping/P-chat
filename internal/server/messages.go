@@ -280,9 +280,20 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		// cancel-stream must abort BOTH the turn and the retry phase.
 		unregister := h.registerTurnCancel(id, func() { cancel(); abortCancel() })
 
+		// retryNotice is set while the staircase retry budget remains, OR
+		// when the budget is exhausted but the session still has pending
+		// todos — the todo-driven resume chain is deliberately NOT gated on
+		// MaxTurnRetries (each resume only re-runs the turn, it does not
+		// consume retry budget), so a budget-exhausted turn with unfinished
+		// tasks still auto-continues. Only when the budget is spent AND no
+		// todo remains does retryNotice stay empty, signalling respondSSE to
+		// emit the terminal frame instead of resuming.
 		var retryNotice string
-		if attempt < maxRetries {
+		switch {
+		case attempt < maxRetries:
 			retryNotice = fmt.Sprintf("⏱ 回合超出最长执行时间，自动重试（第 %d/%d 次）——相当于自动发送“继续”…", attempt+1, maxRetries)
+		case agent.HasPendingTodos(id):
+			retryNotice = "⏱ 回合超出最长执行时间，检测到未完成任务，自动继续…"
 		}
 
 		stream := h.agent.ChatStream(turnCtx, chatReq)
@@ -291,7 +302,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		unregister()
 		cancel()
 
-		if res != turnStreamRetry || attempt >= maxRetries {
+		if res != turnStreamRetry {
 			break
 		}
 
@@ -600,19 +611,35 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 						// idle event on its way out). SendMessage then
 						// reloads the persisted partial conversation and
 						// re-invokes the agent loop with a fresh budget.
-						notice := streamEventFromChunk(agent.ChatStreamChunk{
-							Phase:   "system",
-							Step:    "turn-retry",
-							Message: retryNotice,
-						}, provider, model, streamDoneIDs{})
-						// writeSSEWithTimeout writes AND flushes, bounded.
-						_ = writeSSEWithTimeout(rw, notice, sseWriteTimeout)
-						busy := streamEventFromChunk(agent.ChatStreamChunk{
-							SessionStatus: "retry",
-						}, provider, model, streamDoneIDs{})
-						_ = writeSSEWithTimeout(rw, busy, sseWriteTimeout)
-						result = turnStreamRetry
-						return false
+						// T3: the no-progress breaker (shouldAutoResume)
+						// gates this path too — a todo-driven resume chain
+						// that keeps hitting the turn deadline without todo
+						// progress must not loop forever.
+						if resume, stopNotice := h.shouldAutoResume(sessionID); resume {
+							notice := streamEventFromChunk(agent.ChatStreamChunk{
+								Phase:   "system",
+								Step:    "turn-retry",
+								Message: retryNotice,
+							}, provider, model, streamDoneIDs{})
+							// writeSSEWithTimeout writes AND flushes, bounded.
+							_ = writeSSEWithTimeout(rw, notice, sseWriteTimeout)
+							busy := streamEventFromChunk(agent.ChatStreamChunk{
+								SessionStatus: "retry",
+							}, provider, model, streamDoneIDs{})
+							_ = writeSSEWithTimeout(rw, busy, sseWriteTimeout)
+							result = turnStreamRetry
+							return false
+						} else if stopNotice != "" {
+							// No-progress limit hit: tell the user, then
+							// fall through to the terminal turn_timeout
+							// frame below instead of re-running the turn.
+							n := streamEventFromChunk(agent.ChatStreamChunk{
+								Phase:   "system",
+								Step:    "auto-resume-stopped",
+								Message: stopNotice,
+							}, provider, model, streamDoneIDs{})
+							_ = writeSSEWithTimeout(rw, n, sseWriteTimeout)
+						}
 					}
 					terminalEmitted = true
 					ev := streamEventFromChunk(agent.ChatStreamChunk{

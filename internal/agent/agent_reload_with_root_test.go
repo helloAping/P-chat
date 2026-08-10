@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/paths"
 )
 
 // TestReloadWithRootIfChanged_NoOpOnSameRoot is the
@@ -79,6 +81,11 @@ func TestReloadWithRoot_LoadsProjectSkills(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("USERPROFILE", tmp)
 	t.Setenv("HOME", tmp)
+	// PCHAT_DATA_HOME on the dev machine would otherwise
+	// redirect GlobalSkillsDir() to the real ~/.p-chat and
+	// leak global skills (docx/pptx) into the count below.
+	paths.SetHomeForTest(tmp)
+	t.Cleanup(func() { paths.SetHomeForTest("") })
 
 	root := t.TempDir()
 

@@ -29,6 +29,7 @@
 //     bubble as soon as they hit send.
 import { computed, h, nextTick, ref, useTemplateRef, watch } from 'vue'
 import { renderMarkdown } from '../utils/markdownCache'
+import { formatMessageTime } from '../utils/format'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
@@ -566,6 +567,7 @@ async function copyEntireMessage() {
 // <pre><code class="language-xxx">…</code></pre>; we leave
 // the <pre>/<code> alone and prepend the toolbar.
 const mdBodyEl = useTemplateRef<HTMLElement>('mdBodyEl')
+const rootEl = useTemplateRef<HTMLElement>('rootEl')
 
 // processedPres tracks <pre> nodes that already have a
 // toolbar attached, so we don't double-inject on every
@@ -610,7 +612,13 @@ async function onCodeClick(e: Event) {
   const btn = target.closest<HTMLButtonElement>('[data-code-action]')
   if (!btn) return
   const action = btn.getAttribute('data-code-action')
-  const pre = btn.closest('pre')
+  // The toolbar button lives inside the .code-block wrapper,
+  // next to (not inside) the <pre> — so walk up to the
+  // wrapper and query the code block from there. A bare
+  // btn.closest('pre') would always miss (returns null),
+  // silently swallowing the click.
+  const wrapper = btn.closest<HTMLElement>('.code-block')
+  const pre = wrapper?.querySelector('pre')
   if (!pre) return
   const code = pre.querySelector('code')
   const text = code?.textContent || pre.textContent || ''
@@ -691,15 +699,22 @@ function langExt(lang: string): string {
 // (new SSE chunk, message re-render, etc.). The
 // processedPres set keeps re-runs cheap — each <pre> is
 // only touched once.
-watch(mdBodyEl, async (el) => {
-  await nextTick()
-  injectCodeToolbars(el)
-}, { flush: 'post' })
-
-watch(userHtml, async () => {
-  await nextTick()
-  injectCodeToolbars(mdBodyEl.value)
-})
+//
+// Note: we scan *every* .md-body inside this bubble instead
+// of the single `mdBodyEl` ref. In a v-for (multi-part
+// message) the template ref only ever holds the LAST text
+// part's element, so parts before it would never get their
+// toolbars. Scanning the root element covers all parts.
+watch(
+  [mdBodyEl, userHtml, () => props.message.parts],
+  async () => {
+    await nextTick()
+    const root = rootEl.value
+    if (!root) return
+    root.querySelectorAll<HTMLElement>('.md-body').forEach((el) => injectCodeToolbars(el))
+  },
+  { flush: 'post', deep: true },
+)
 function shortWarnText(t?: string): string {
   if (!t) return 'image skipped'
   const m = t.match(/\(attached image: ([^,]+)/)
@@ -782,6 +797,19 @@ async function copyTraceId() {
 const showAssistantHeader = computed(() =>
   props.message.role === 'assistant' && !isSystem.value
 )
+
+// userTimeText renders the send time for USER messages only,
+// shown below the bubble. History messages carry the server's
+// created_at; optimistic rows get a local stamp at send time
+// (InputArea). Assistant / system / tool messages never show a
+// time footer — the assistant already shows model + elapsed in
+// its header / meta.
+const userTimeText = computed(() => {
+  if (props.message.role !== 'user') return ''
+  const t = props.message.created_at
+  if (!t) return ''
+  return formatMessageTime(t)
+})
 
 // Action-bar visibility:
 //   - copy:   always available (copies the visible text)
@@ -1025,6 +1053,7 @@ function findPrecedingUserMessageId(): number {
 <template>
   <div
     class="msg"
+    ref="rootEl"
     :class="[message.role, { streaming }]"
     :data-msg-id="message.id"
     @contextmenu="onMessageContextMenu"
@@ -1396,6 +1425,11 @@ function findPrecedingUserMessageId(): number {
           </button>
         </div>
       </div>
+
+      <!-- Send time for user messages only. Sits below the
+           bubble, right-aligned to match the row-reverse user
+           bubble. Assistant / system / tool messages skip it. -->
+      <div v-if="userTimeText" class="msg-time">{{ userTimeText }}</div>
     </div>
   </div>
 </template>
@@ -1573,12 +1607,15 @@ function findPrecedingUserMessageId(): number {
 }
 
 /* Force the markdown body inside a user bubble to inherit
- * the white text color. The default --text-primary would
- * win because of specificity, so we override here. */
+ * the white text color (--on-brand). The default --text-primary
+ * would win because of specificity, so we override here.
+ * NOTE: this only reaches template-owned elements (the .md-body
+ * container itself). Code blocks inside are injected via v-html
+ * and carry no [data-v] attribute, so scoped rules never reach
+ * their <pre>/<code> — those overrides live in the GLOBAL
+ * <style> block below (see .msg.user .md-body pre). */
 .msg.user .bubble-body,
 .msg.user .bubble-body * { color: inherit; }
-.msg.user .md-body code { background: rgba(255, 255, 255, 0.18); color: inherit; }
-.msg.user .md-body pre { background: rgba(0, 0, 0, 0.18); border-color: rgba(255, 255, 255, 0.18); }
 
 /* "展开全文" affordance for truncated text parts. */
 .md-expand-btn {
@@ -2044,6 +2081,21 @@ function findPrecedingUserMessageId(): number {
  * 6px stream-dot, the TypedText caret, and the thinking spinner. */
 
 
+/* --- Send-time footer (user messages only) -----------------------
+ * Sits below the user bubble; right-aligned because the user
+ * bubble-col is row-reverse / align-items: flex-end. Uses the
+ * quietest text tier + tabular numerals so it never competes
+ * with the message body. */
+.msg-time {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-quaternary);
+  font-variant-numeric: tabular-nums;
+  padding: 0 4px;
+  user-select: none;
+}
+.msg.user .msg-time { align-self: flex-end; }
+
 .msg-meta {
   margin-top: 6px;
   padding-top: 4px;
@@ -2113,6 +2165,30 @@ function findPrecedingUserMessageId(): number {
 </style>
 
 <style>
+/* User-bubble code blocks. The user message's markdown is injected
+ * via v-html, so the <pre>/<code> elements carry no [data-v]
+ * attribute and the scoped styles above never reach them. These
+ * global rules force a dark translucent surface + white text
+ * (--on-brand) on the brand-coloured user bubble, and override the
+ * highlight.js token colours (dark in light mode — unreadable on
+ * the brand-blue bubble). Assistant bubbles are NOT affected: they
+ * stay on the theme's --code-bg surface with token-coloured text. */
+.msg.user .md-body pre {
+  background: rgba(0, 0, 0, 0.25);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+.msg.user .md-body pre code {
+  background: transparent;
+  color: var(--on-brand);
+}
+.msg.user .md-body pre code.hljs span {
+  color: var(--on-brand);
+}
+.msg.user .md-body code:not(pre code) {
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--on-brand);
+}
+
 /* Code-block copy/download toolbar styles. These are global
  * (not scoped) because we inject the toolbar into the
  * marked-rendered <pre> elements via DOM manipulation —
@@ -2132,7 +2208,7 @@ function findPrecedingUserMessageId(): number {
   right: 4px;
   display: flex;
   gap: 4px;
-  opacity: 0;
+  opacity: 1;
   transition: opacity 0.15s ease;
   z-index: 1;
 }

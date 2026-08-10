@@ -22,8 +22,8 @@ func TestTodoLongRunModeNormalizationAndRoundBypass(t *testing.T) {
 
 func TestDefaultSetsAnExplicitRoundCap(t *testing.T) {
 	cfg := Default()
-	if cfg.Limits.MaxRounds != 300 {
-		t.Fatalf("default max rounds = %d, want 300", cfg.Limits.MaxRounds)
+	if cfg.Limits.MaxRounds != 500 {
+		t.Fatalf("default max rounds = %d, want 500", cfg.Limits.MaxRounds)
 	}
 	if cfg.Limits.TodoLongRunMode != TodoLongRunAdaptive {
 		t.Fatalf("default todo long run mode = %q, want adaptive", cfg.Limits.TodoLongRunMode)
