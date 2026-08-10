@@ -1632,6 +1632,11 @@ export interface ContextInspector {
   estimated_tokens: number
   usable_tokens: number
   utilization_pct: number
+  // estimated_tokens / context_window * 100 — the "how full is
+  // the model's window" number (200K / 1M = 20%), distinct from
+  // utilization_pct (usable-window based, the auto-compact
+  // trigger). Optional so older servers degrade gracefully.
+  context_window_pct?: number
   compressed_summary?: string
   messages: ContextMessage[]
 }

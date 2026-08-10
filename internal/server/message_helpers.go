@@ -295,7 +295,14 @@ type ContextInspectorResponse struct {
 	ContextWindow     int              `json:"context_window"`
 	EstimatedTokens   int              `json:"estimated_tokens"`
 	UsableTokens      int              `json:"usable_tokens"`
-	UtilizationPct    float64          `json:"utilization_pct"`
+	// UtilizationPct is estimated_tokens / usable_tokens * 100 —
+	// the denominator the auto-compact logic actually triggers on.
+	UtilizationPct float64 `json:"utilization_pct"`
+	// ContextWindowPct is estimated_tokens / context_window * 100 —
+	// the denominator the user sees as "how full the model's window
+	// is" (e.g. 200K / 1M = 20%). Both pcts are returned so the UI
+	// can show either without a second pass.
+	ContextWindowPct  float64          `json:"context_window_pct"`
 	CompressedSummary string           `json:"compressed_summary,omitempty"`
 	Messages          []ContextMessage `json:"messages"`
 }
@@ -418,6 +425,17 @@ func (h *Handler) ContextInspector(c *gin.Context) {
 			utilPct = 999.9
 		}
 	}
+	// ContextWindowPct uses the FULL window as the denominator —
+	// the number the user reads as "how full the model is" (200K/1M).
+	// It stays distinct from utilPct (usable-based, the auto-compact
+	// trigger) so the UI can render both honest numbers.
+	cwPct := 0.0
+	if cw > 0 {
+		cwPct = float64(totalEstimate) / float64(cw) * 100.0
+		if cwPct > 999.9 {
+			cwPct = 999.9
+		}
+	}
 
 	c.JSON(http.StatusOK, ContextInspectorResponse{
 		SessionID:         id,
@@ -427,6 +445,7 @@ func (h *Handler) ContextInspector(c *gin.Context) {
 		EstimatedTokens:   totalEstimate,
 		UsableTokens:      usable,
 		UtilizationPct:    utilPct,
+		ContextWindowPct:  cwPct,
 		CompressedSummary: compSummary,
 		Messages:          out,
 	})

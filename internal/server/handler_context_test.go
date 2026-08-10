@@ -84,12 +84,13 @@ func TestContextInspector_BasicCounting(t *testing.T) {
 		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
 	}
 	var body struct {
-		EstimatedTokens int    `json:"estimated_tokens"`
-		UsableTokens    int    `json:"usable_tokens"`
-		UtilizationPct  float64 `json:"utilization_pct"`
-		Messages        []struct {
-			Role   string `json:"role"`
-			Tokens int    `json:"tokens"`
+		EstimatedTokens  int     `json:"estimated_tokens"`
+		UsableTokens     int     `json:"usable_tokens"`
+		UtilizationPct   float64 `json:"utilization_pct"`
+		ContextWindowPct float64 `json:"context_window_pct"`
+		Messages         []struct {
+			Role    string `json:"role"`
+			Tokens  int    `json:"tokens"`
 			Preview string `json:"preview"`
 		} `json:"messages"`
 	}
@@ -129,6 +130,13 @@ func TestContextInspector_BasicCounting(t *testing.T) {
 	}
 	if body.UtilizationPct < 0 || body.UtilizationPct > 999.9 {
 		t.Errorf("utilization_pct = %f, want 0..999.9", body.UtilizationPct)
+	}
+	// ContextWindowPct uses the full context_window as the
+	// denominator. DefaultContextWindow is used when no model
+	// is configured, so cw > 0 here and the pct must be in a
+	// sane 0..100 range for a tiny 3-message session.
+	if body.ContextWindowPct < 0 || body.ContextWindowPct > 100 {
+		t.Errorf("context_window_pct = %f, want 0..100", body.ContextWindowPct)
 	}
 }
 

@@ -1007,10 +1007,14 @@ async function send() {
   // bubble renders correctly without waiting for the
   // next history fetch, and so rollback can target the
   // exact row from the moment the message is sent.
+  // created_at (Unix sec) is stamped locally so the
+  // "send time" footer renders immediately; history
+  // reloads replace it with the server's value.
   state.sessionMessages[id].push({
     id: clientMsgId,
     role: 'user',
     content: text,
+    created_at: Date.now() / 1000,
     attachments: bubbleAttachments.length ? bubbleAttachments : undefined,
   })
   // Convert inline base64 data: URLs on user-sent image

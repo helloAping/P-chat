@@ -29,6 +29,7 @@
 //     bubble as soon as they hit send.
 import { computed, h, nextTick, ref, useTemplateRef, watch } from 'vue'
 import { renderMarkdown } from '../utils/markdownCache'
+import { formatMessageTime } from '../utils/format'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
@@ -797,6 +798,19 @@ const showAssistantHeader = computed(() =>
   props.message.role === 'assistant' && !isSystem.value
 )
 
+// userTimeText renders the send time for USER messages only,
+// shown below the bubble. History messages carry the server's
+// created_at; optimistic rows get a local stamp at send time
+// (InputArea). Assistant / system / tool messages never show a
+// time footer — the assistant already shows model + elapsed in
+// its header / meta.
+const userTimeText = computed(() => {
+  if (props.message.role !== 'user') return ''
+  const t = props.message.created_at
+  if (!t) return ''
+  return formatMessageTime(t)
+})
+
 // Action-bar visibility:
 //   - copy:   always available (copies the visible text)
 //   - fork:   user only (PR #2 feature, kept)
@@ -1411,6 +1425,11 @@ function findPrecedingUserMessageId(): number {
           </button>
         </div>
       </div>
+
+      <!-- Send time for user messages only. Sits below the
+           bubble, right-aligned to match the row-reverse user
+           bubble. Assistant / system / tool messages skip it. -->
+      <div v-if="userTimeText" class="msg-time">{{ userTimeText }}</div>
     </div>
   </div>
 </template>
@@ -2058,6 +2077,21 @@ function findPrecedingUserMessageId(): number {
  * — with no info gain. Streaming is already signalled cheaply by the
  * 6px stream-dot, the TypedText caret, and the thinking spinner. */
 
+
+/* --- Send-time footer (user messages only) -----------------------
+ * Sits below the user bubble; right-aligned because the user
+ * bubble-col is row-reverse / align-items: flex-end. Uses the
+ * quietest text tier + tabular numerals so it never competes
+ * with the message body. */
+.msg-time {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-quaternary);
+  font-variant-numeric: tabular-nums;
+  padding: 0 4px;
+  user-select: none;
+}
+.msg.user .msg-time { align-self: flex-end; }
 
 .msg-meta {
   margin-top: 6px;
