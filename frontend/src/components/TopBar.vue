@@ -28,6 +28,7 @@ import { state, currentMeta, openContextInspector } from '../stores/chat'
 import * as api from '../api/client'
 import BrandLogo from './BrandLogo.vue'
 import ToolListDrawer from './ToolListDrawer.vue'
+import StyleGenModal from './StyleGenModal.vue'
 import { FolderOpen, Terminal, PanelLeftClose, PanelLeftOpen, Sparkles, BarChart3, Wrench, Hash } from './icons'
 import { copyText } from '../utils/clipboard'
 
@@ -101,6 +102,11 @@ async function openTerminal() {
 // the active conversation.
 const showToolList = ref(false)
 const message = useMessage()
+
+// showStyleGen toggles the StyleGenModal (generate / optimize an AI
+// persona style from the current conversation). Disabled without an
+// active session — there's no conversation to learn from.
+const showStyleGen = ref(false)
 
 // currentTraceId: the P3-3 end-to-end correlation id for the
 // active turn. Minted server-side on POST /messages, mirrored
@@ -239,6 +245,22 @@ function toggleSidebar() { emit('toggle-sidebar') }
         </template>
         工具列表
       </NTooltip>
+      <!-- StyleGen: generate / optimize an AI persona from the current
+           conversation. Disabled when there's no active session. -->
+      <NTooltip>
+        <template #trigger>
+          <NButton
+            size="tiny"
+            quaternary
+            aria-label="从当前对话生成风格"
+            :disabled="!state.currentID"
+            @click="showStyleGen = true"
+          >
+            <Sparkles :size="16" />
+          </NButton>
+        </template>
+        生成风格
+      </NTooltip>
       <div class="model-badge" :title="`提供商: ${providerLabel || '未选择'}`">
         <span class="model-dot" :style="{ background: providerColor }" aria-hidden="true" />
         <Sparkles :size="13" class="model-badge-icon" />
@@ -281,6 +303,9 @@ function toggleSidebar() { emit('toggle-sidebar') }
          browse their tool list before picking a
          session. -->
     <ToolListDrawer v-model:show="showToolList" />
+    <!-- StyleGen modal: generate / optimize an AI style from the
+         current conversation (sources state.currentID read-only). -->
+    <StyleGenModal v-model:show="showStyleGen" />
   </header>
 </template>
 

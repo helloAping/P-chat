@@ -16,6 +16,7 @@ import (
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/search"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/stylegen"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/version"
 )
@@ -29,7 +30,11 @@ type Handler struct {
 	store      *memory.Store
 	styleMgr   *style.Manager
 	summarizer *memory.Summarizer
-	mcpMgr     *mcp.Manager
+	// styleGenMgr runs background /api/v1/stylegen jobs (in-memory
+	// JobManager). May be nil in tests that don't wire it; handlers
+	// return 503 in that case.
+	styleGenMgr *stylegen.JobManager
+	mcpMgr      *mcp.Manager
 	browserMgr *browser.Manager
 	imGateway  *im.Gateway
 	wechatQR   *im.WeChatQRManager
@@ -980,6 +985,13 @@ func (h *Handler) Providers(c *gin.Context) {
 
 func (h *Handler) SetSummarizer(sm *memory.Summarizer) {
 	h.summarizer = sm
+}
+
+// SetStyleGen wires the background stylegen JobManager backing the
+// /api/v1/stylegen endpoints. Pass nil to keep the endpoints disabled
+// (503).
+func (h *Handler) SetStyleGen(jm *stylegen.JobManager) {
+	h.styleGenMgr = jm
 }
 
 // SetMemoryMonitor wires the memory monitor backing the /diagnostics/*

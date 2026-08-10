@@ -506,6 +506,68 @@ func (c *Client) CompressSession(ctx context.Context, sessionID string) (Compres
 	return result, err
 }
 
+// ─── StyleGen ────────────────────────────────────────────────────────
+// Stylegen runs as a background job on the server: StartStyleGen submits
+// it and returns a job id, GetStyleGenJob polls its status.
+
+// StyleGenRequest is the POST /api/v1/stylegen body.
+type StyleGenRequest struct {
+	Mode           string `json:"mode"`
+	StyleID        string `json:"style_id"`
+	Label          string `json:"label"`
+	Requirement    string `json:"requirement"`
+	ConversationID string `json:"conversation_id"`
+}
+
+// StyleGenResult is a finished stylegen outcome.
+type StyleGenResult struct {
+	ID      string `json:"id"`
+	Label   string `json:"label"`
+	Prompt  string `json:"prompt"`
+	Memory  string `json:"memory"`
+	Mode    string `json:"mode"`
+	Updated bool   `json:"updated"`
+}
+
+// StyleGenStage is one checklist step of a stylegen job.
+type StyleGenStage struct {
+	Stage string `json:"stage"`
+	Label string `json:"label"`
+	Done  bool   `json:"done"`
+}
+
+// StyleGenJobStatus is the pollable status of a stylegen job.
+type StyleGenJobStatus struct {
+	ID        string          `json:"id"`
+	Status    string          `json:"status"` // running | done | error
+	Stages    []StyleGenStage `json:"stages"`
+	Result    *StyleGenResult `json:"result"`
+	Error     string          `json:"error"`
+	ErrorKind string          `json:"error_kind"`
+	CreatedAt int64           `json:"created_at"`
+	DoneAt    int64           `json:"done_at"`
+}
+
+// StartStyleGen submits a stylegen job and returns its job id.
+func (c *Client) StartStyleGen(ctx context.Context, req StyleGenRequest) (string, error) {
+	var resp struct {
+		JobID string `json:"job_id"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/stylegen", req, &resp); err != nil {
+		return "", err
+	}
+	return resp.JobID, nil
+}
+
+// GetStyleGenJob polls a stylegen job's status.
+func (c *Client) GetStyleGenJob(ctx context.Context, jobID string) (*StyleGenJobStatus, error) {
+	var st StyleGenJobStatus
+	if err := c.doJSON(ctx, http.MethodGet, "/api/v1/stylegen/"+url.PathEscape(jobID), nil, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
 // GetSessionContext 返回会话上下文估算。GetSessionContext returns the session context estimate.
 func (c *Client) GetSessionContext(ctx context.Context, sessionID string) (ContextInspector, error) {
 	var result ContextInspector
