@@ -57,6 +57,13 @@ import {
 const APP_VERSION = __APP_VERSION__
 const GITHUB_REPO = __GITHUB_REPO__
 
+// Online usage documentation, opened in the system browser from
+// the About dialog (moved here from the old Settings nav footer).
+const DOCS_URL = 'http://www.08ms.cn/article/p-chat'
+function openDocs() {
+  api.openExternalURL(DOCS_URL)
+}
+
 const emit = defineEmits<{ (e: 'open-settings'): void }>()
 
 const themeName = defineModel<'dark' | 'light'>('themeName', { default: 'dark' })
@@ -1040,6 +1047,14 @@ onMounted(() => {
         </template>
         <p v-else class="update-ok">正在检查更新…</p>
 
+        <!-- Usage documentation — the primary action of the
+             About dialog (relocated from the Settings nav footer).
+             Opens the online doc in the system browser. -->
+        <button type="button" class="about-docs" @click="openDocs">
+          <Globe :size="14" class="about-docs-icon" />
+          查看使用文档
+        </button>
+
         <div class="about-links">
           <a :href="'https://github.com/' + GITHUB_REPO" target="_blank">GitHub</a>
           <span class="sep">·</span>
@@ -1505,6 +1520,33 @@ onMounted(() => {
 .update-banner p { margin: 4px 0; font-size: 13px; }
 .update-body { color: var(--text-tertiary); font-size: 12px !important; max-height: 120px; overflow: auto; white-space: pre-wrap; }
 .update-ok { font-size: 13px; color: var(--text-tertiary); margin: 12px 0; }
+
+/* Usage documentation button — primary action of the About dialog.
+ * Brand-filled so it reads as the main thing to do here. */
+.about-docs {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  margin: 14px 0 0;
+  padding: 9px 12px;
+  background: var(--brand-500);
+  color: var(--on-brand);
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.about-docs:hover { background: var(--brand-600); }
+.about-docs:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.about-docs-icon { flex-shrink: 0; }
+
 .about-links { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-default); font-size: 13px; }
 .about-links a { color: var(--brand-500); text-decoration: none; }
 .about-links a:hover { text-decoration: underline; }

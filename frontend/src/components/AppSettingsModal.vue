@@ -30,7 +30,7 @@ import {
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash,
   Cpu, Activity, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
-  MessageSquare, ExternalLink,
+  MessageSquare,
 } from './icons'
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion, state as chatState } from '../stores/chat'
@@ -54,13 +54,6 @@ const emit = defineEmits<{
 
 function close() {
   emit('update:show', false)
-}
-
-// Online usage documentation opened from the nav footer.
-const DOCS_URL = 'http://www.08ms.cn/article/p-chat'
-
-function openDocs() {
-  api.openExternalURL(DOCS_URL)
 }
 
 // ---- 风格样例模板 ----
@@ -1668,17 +1661,6 @@ function kbModelSupportsVision(scanModel: string) {
     title="应用设置"
     @close="close"
   >
-    <template #nav-footer>
-      <button
-        type="button"
-        class="settings-nav-item"
-        title="打开在线使用文档"
-        @click="openDocs"
-      >
-        <ExternalLink :size="16" class="settings-nav-icon" />
-        <span class="settings-nav-label">使用文档</span>
-      </button>
-    </template>
     <NTabs
       v-model:value="tab"
       type="line"

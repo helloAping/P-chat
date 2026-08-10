@@ -176,7 +176,9 @@ function isActive(name: string) {
               </button>
 
               <!-- Optional footer row pinned to the bottom of
-                   the nav (e.g. a "使用文档" external link). -->
+                   the nav (consumers can slot extra entries here;
+                   the old "使用文档" link moved to the About
+                   dialog). -->
               <div class="settings-nav-footer">
                 <slot name="nav-footer" />
               </div>
