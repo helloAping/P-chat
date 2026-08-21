@@ -81,10 +81,21 @@
 
 ### P3：异步 subagent job 状态层
 
+P3a 已落地：新增持久化状态层和 Store CRUD，但尚未接入 `task mode=async`、HTTP API 或前端。
+
 新增持久化状态：
 
 - `subagent_jobs`
 - 字段：`id/task_id/session_id/status/subagent_type/model/description/result/error/progress_json/created_at/started_at/finished_at/cancelled_at`
+
+新增 Store API：
+
+- `CreateSubagentJob`
+- `GetSubagentJob` / `GetSubagentJobByID`
+- `ListSubagentJobs`
+- `MarkSubagentJobRunning`
+- `UpdateSubagentJobProgress`
+- `CompleteSubagentJob` / `FailSubagentJob` / `CancelSubagentJob`
 
 新增服务端能力：
 
@@ -93,7 +104,7 @@
 - 取消 job。
 - job 完成后写入主会话 synthetic message 或 structured part。
 
-这一步涉及 SQLite schema，必须走 `internal/memory/migrations.go` 迁移。
+后续接入仍需实现服务端能力；schema 已走 `internal/memory/migrations.go` migration v11，并覆盖升级 / 回滚 / 幂等 / CRUD 测试。
 
 ### P4：工具协议扩展
 
@@ -131,4 +142,4 @@ Use task_status with the same task_id to check progress.
 
 ## 当前执行顺序
 
-本轮先执行 P0 + P1。P2/P3/P4/P5 作为后续小步继续推进，避免一次性引入 job 持久化、API、前端三类风险。
+已完成 P0、P1、P2、P3a。下一步进入 P4：扩展 `task` 参数支持 `mode=async`，后台 runner 使用 P3a 的 job 状态层落盘，并新增 `task_status` / `task_cancel` 工具。

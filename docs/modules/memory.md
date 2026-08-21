@@ -12,7 +12,9 @@ Memory 模块管理 P-Chat 的持久化存储——SQLite 数据库存储对话�
 
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
-| `memory.go` | SQLite 数据库操作、CRUD、迁移、待办 | `Store`, `Open()`, `OpenAt()`, `AddChatMessageTo()` |
+| `memory.go` | SQLite 数据库操作、CRUD、迁移入口 | `Store`, `Open()`, `OpenAt()`, `AddChatMessageTo()` |
+| `migrations.go` | **Schema 迁移引擎** — 版本表 + 所有迁移定义 | `Migrate()`, `Rollback()`, `allMigrations` |
+| `subagent_jobs.go` | 异步子代理 job 状态 CRUD | `SubagentJob`, `CreateSubagentJob()`, `ListSubagentJobs()` |
 | `summarizer.go` | LLM 驱动的对话压缩 | `Summarizer`, `Compress()` |
 | `fileio.go` | 旧版 JSON 文件导入 | `migrateFromLegacyJSON()` |
 
@@ -46,23 +48,41 @@ type Store struct {
 
 ### 2. 数据库 Schema
 
+当前版本表（由 `migrations.go` 中 `allMigrations[].Up` 定义）：
+
 ```sql
+-- 元表
+schema_migrations: version, name, applied_at
+
+-- 业务表
 conversations: id, title, created_at, updated_at, metadata, archived
 messages: id, conversation_id, role, content, tokens, created_at, metadata
 summaries: conversation_id, range_start, range_end, summary, created_at
-todo_items: id, session_id, content, status, created_at, updated_at
-knowledge_chunks: id, conversation_id, content, embedding, source, created_at
-compression_snapshots: conversation_id, summary, message_count, created_at
+todo_items: session_id, item_id, content, status, sort_order
+chunks: id, source, content, metadata, created_at
+embeddings: chunk_id, model, vector, dim, created_at
+subagent_jobs: id, task_id, session_id, status, subagent_type, model, description, result, error, progress_json, created_at, started_at, finished_at, cancelled_at
 ```
 
-### 3. 批量写入
+**Schema 变更规则** → 详见 [versioning.md §二](versioning.md#二schema-迁移规范)。
+
+### 3. Schema 迁移（重要）
+
+- 启动时自动执行 `Migrate()` — 已应用的迁移幂等跳过
+- 回滚需手动调用 `POST /api/v1/migrations/rollback`
+- 新增迁移只需在 `migrations.go` 的 `allMigrations` 末尾追加
+- **破坏性变更**（DROP TABLE / DROP COLUMN）必须在 Up/Down 注释中标注 ⚠️
+
+详见 [versioning.md](versioning.md) 完整规范。
+
+### 4. 批量写入
 
 为减少 fsync 开销，消息写入是异步的：
 - `AddChatMessageTo()` 将消息加入 `pendingWrites` 缓冲区
 - 定时器（`flushInterval`）或缓冲满（`maxPending`）触发 flush
 - flush 使用 `BEGIN → INSERT → COMMIT` 事务
 
-### 4. 元数据格式
+### 5. 元数据格式
 
 `messages.metadata` 列存储 JSON `map[string]string`，常用键：
 - `role` — 消息角色
@@ -70,22 +90,23 @@ compression_snapshots: conversation_id, summary, message_count, created_at
 - `thinking` — 完整思考文本（非 parts 路径）
 - `parts` — 结构化 parts JSON（tool + sub_agent）
 
-### 5. Summarizer（对话压缩）
+### 6. Summarizer（对话压缩）
 
 `Summarizer` 使用 LLM 压缩旧消息为摘要：
 - `Compress(convID, maxMessages)` — 保留最近 N 条，其余压缩为摘要
 - 摘要存储在 `compression_snapshots` 表
 - 后续 `ChatRequest` 会携带 `CompressedSummary`
 
-### 6. 遗留数据迁移
+### 7. 遗留数据迁移
 
 `Open()` 首次打开时自动迁移旧的 JSON 文件格式到 SQLite。
 
 ## 修改指南
 
 ### 要修改数据库 Schema
-- `memory.go` 中的 `initTables()` / `runMigrations()`
-- 使用 `migration_*` 命名模式添加新迁移
+- `migrations.go` 中的 `allMigrations` 列表 — **追加新 Migration，不修改已有**
+- 遵循破坏性变更约束 → [versioning.md §二](versioning.md#二schema-迁移规范)
+- 必须添加对应测试（升级 / 回滚 / 幂等）
 
 ### 要修改消息持久化格式
 - `AddChatMessageWithMetaTo()` (memory.go)

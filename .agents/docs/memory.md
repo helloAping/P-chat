@@ -14,6 +14,7 @@ Memory 模块管理 P-Chat 的持久化存储——SQLite 数据库存储对话�
 |---|---|---|
 | `memory.go` | SQLite 数据库操作、CRUD、迁移入口 | `Store`, `Open()`, `OpenAt()`, `AddChatMessageTo()` |
 | `migrations.go` | **Schema 迁移引擎** — 版本表 + 所有迁移定义 | `Migrate()`, `Rollback()`, `allMigrations` |
+| `subagent_jobs.go` | 异步子代理 job 状态 CRUD | `SubagentJob`, `CreateSubagentJob()`, `ListSubagentJobs()` |
 | `summarizer.go` | LLM 驱动的对话压缩 | `Summarizer`, `Compress()` |
 | `fileio.go` | 旧版 JSON 文件导入 | `migrateFromLegacyJSON()` |
 
@@ -60,6 +61,7 @@ summaries: conversation_id, range_start, range_end, summary, created_at
 todo_items: session_id, item_id, content, status, sort_order
 chunks: id, source, content, metadata, created_at
 embeddings: chunk_id, model, vector, dim, created_at
+subagent_jobs: id, task_id, session_id, status, subagent_type, model, description, result, error, progress_json, created_at, started_at, finished_at, cancelled_at
 ```
 
 **Schema 变更规则** → 详见 [versioning.md §二](versioning.md#二schema-迁移规范)。

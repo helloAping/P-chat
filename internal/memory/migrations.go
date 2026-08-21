@@ -361,7 +361,48 @@ DELETE FROM summaries
 		Down: `-- no down — re-inserting the corrupt ranges would
 -- re-introduce the heap explosion.`,
 	},
+	{
+		// Migration 11: async subagent jobs.
+		//
+		// This table is the durable state layer for background
+		// subagent work. The sync `task` tool still returns an
+		// immediate tool result, but async `task` needs a row that
+		// survives the HTTP/SSE turn: parent conversation, caller
+		// task_id, status, progress, final result/error, and the
+		// cancellation/finish timestamps.
+		//
+		// `id` is the internal immutable job id. `task_id` is the
+		// user/tool visible handle; it is unique only within a
+		// session so different conversations can reuse natural ids.
+		Version: 11,
+		Name:    "subagent_jobs",
+		Up: `
+CREATE TABLE IF NOT EXISTS subagent_jobs (
+    id            TEXT PRIMARY KEY,
+    task_id       TEXT NOT NULL,
+    session_id    TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    subagent_type TEXT NOT NULL DEFAULT '',
+    model         TEXT NOT NULL DEFAULT '',
+    description   TEXT NOT NULL DEFAULT '',
+    result        TEXT NOT NULL DEFAULT '',
+    error         TEXT NOT NULL DEFAULT '',
+    progress_json TEXT NOT NULL DEFAULT '',
+    created_at    INTEGER NOT NULL,
+    started_at    INTEGER,
+    finished_at   INTEGER,
+    cancelled_at  INTEGER,
+    UNIQUE(session_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_subagent_jobs_session_created ON subagent_jobs(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_subagent_jobs_status ON subagent_jobs(status, created_at);`,
+		Down: `
+DROP INDEX IF EXISTS idx_subagent_jobs_status;
+DROP INDEX IF EXISTS idx_subagent_jobs_session_created;
+DROP TABLE IF EXISTS subagent_jobs;`,
+	},
 }
+
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (
     version    INTEGER PRIMARY KEY,
     name       TEXT NOT NULL,
