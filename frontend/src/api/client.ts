@@ -618,6 +618,32 @@ export interface ListMessagesResult {
   oldest_id: number
 }
 
+export interface SubAgentJob {
+  id: string
+  task_id: string
+  session_id: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | string
+  subagent_type?: string
+  model?: string
+  description?: string
+  result?: string
+  error?: string
+  progress_json?: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  cancelled_at?: string
+}
+
+export interface SubAgentJobListResponse {
+  jobs: SubAgentJob[]
+}
+
+export interface SubAgentJobCancelResponse {
+  job: SubAgentJob
+  cancelled_live: boolean
+}
+
 // listMessages fetches a page of session history. Omit
 // `opts` to get the full history (first open after reload —
 // the server applies the context-window cap automatically).
@@ -634,6 +660,22 @@ export const listMessages = (id: string, opts?: PageOpts) => {
     `/api/v1/sessions/${id}/messages${qs ? '?' + qs : ''}`,
   )
 }
+
+export const listSubAgentJobs = (sessionId: string, limit = 20) =>
+  jsonFetch<SubAgentJobListResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs?limit=${limit}`,
+  )
+
+export const getSubAgentJob = (sessionId: string, taskId: string) =>
+  jsonFetch<SubAgentJob>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs/${encodeURIComponent(taskId)}`,
+  )
+
+export const cancelSubAgentJob = (sessionId: string, taskId: string) =>
+  jsonFetch<SubAgentJobCancelResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs/${encodeURIComponent(taskId)}/cancel`,
+    { method: 'POST' },
+  )
 
 // --- Archive ---
 export const archiveSession = (id: string) =>

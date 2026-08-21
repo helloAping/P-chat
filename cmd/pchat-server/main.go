@@ -193,6 +193,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// runner, but the server is the canonical path. Wiring
 	// happens here so the `task` tool is live for every
 	// session from the first turn.
+	asyncMgr := subagent.NewAsyncManager()
 	runner := &subagent.Default{
 		Cfg:            cfg,
 		LLM:            llmClient,
@@ -203,7 +204,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		ParentProvider: defaultProviderName(cfg),
 		Registry:       subagentReg,
 		Cache:          subagent.NewCache(cfg.SubAgent.CacheTTLDuration()),
-		Async:          subagent.NewAsyncManager(),
+		Async:          asyncMgr,
 	}
 	tt, hh := runner.Tool()
 	toolReg.Register(tt, hh)
@@ -272,6 +273,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
+	srv.Handler().SetSubagentJobCanceller(asyncMgr)
 
 	// Wire the stylegen background job manager (generate / optimize an
 	// AI style from the current conversation). It reads the store

@@ -183,6 +183,13 @@ func (m *AsyncManager) cancel(id string) bool {
 	return true
 }
 
+// Cancel stops a process-local async subagent job when this
+// server still owns its cancel hook. Durable job state is
+// updated by the caller.
+func (m *AsyncManager) Cancel(id string) bool {
+	return m.cancel(id)
+}
+
 func (m *AsyncManager) remove(id string) {
 	if m == nil || id == "" {
 		return
@@ -799,7 +806,7 @@ func (d *Default) TaskCancelTool() (tool.Tool, tool.ToolHandler) {
 		if subagentJobTerminal(job.Status) {
 			return &tool.CallResult{Content: "task already terminal:\n" + formatSubagentJob(job)}, nil
 		}
-		cancelledLive := d.asyncManager().cancel(job.ID)
+		cancelledLive := d.asyncManager().Cancel(job.ID)
 		if err := d.JobStore.CancelSubagentJob(job.ID); err != nil {
 			return &tool.CallResult{Content: "task_cancel failed: " + err.Error(), IsError: true}, nil
 		}

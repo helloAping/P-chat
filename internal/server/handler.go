@@ -34,10 +34,14 @@ type Handler struct {
 	// JobManager). May be nil in tests that don't wire it; handlers
 	// return 503 in that case.
 	styleGenMgr *stylegen.JobManager
-	mcpMgr      *mcp.Manager
-	browserMgr *browser.Manager
-	imGateway  *im.Gateway
-	wechatQR   *im.WeChatQRManager
+	// subagentJobs cancels process-local async subagent jobs. Durable
+	// job state lives in the memory store; this hook only covers jobs
+	// that are still running in this server process.
+	subagentJobs subagentJobCanceller
+	mcpMgr       *mcp.Manager
+	browserMgr   *browser.Manager
+	imGateway    *im.Gateway
+	wechatQR     *im.WeChatQRManager
 	// attachResolver reads upload files by id. Used to re-hydrate
 	// "upl://<id>" media rows from disk when building the LLM
 	// context (the agent holds the same resolver for the current
@@ -735,9 +739,9 @@ type StreamEvent struct {
 	ToolResultTruncated bool `json:"tool_result_truncated,omitempty"`
 	// ToolResultFullLen is the byte length of the untruncated
 	// result (surfaceable as "完整输出 1.2 MB" without a fetch).
-	ToolResultFullLen int `json:"tool_result_full_len,omitempty"`
-	ToolError      string `json:"tool_error,omitempty"`
-	ToolElapsed    string `json:"tool_elapsed,omitempty"`
+	ToolResultFullLen int    `json:"tool_result_full_len,omitempty"`
+	ToolError         string `json:"tool_error,omitempty"`
+	ToolElapsed       string `json:"tool_elapsed,omitempty"`
 	// Structured tool result fields supplement the legacy tool_result preview.
 	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
 	ToolSummary      string   `json:"tool_summary,omitempty"`

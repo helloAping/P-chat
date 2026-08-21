@@ -5,6 +5,7 @@ import { ArrowDown, ArrowUp, MessageSquare } from './icons'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
+import SubAgentJobsPanel from './SubAgentJobsPanel.vue'
 import StreamingBar from './StreamingBar.vue'
 import QuestionModal from './QuestionModal.vue'
 // QuestionPanel removed in 2026-07-09 — it duplicated
@@ -432,6 +433,7 @@ function messageKey(m: any, i: number): string | number {
     </div>
     <QuestionModal @locate-question="locateOpenQuestion" />
     <TodoPanel />
+    <SubAgentJobsPanel :session-id="state.currentID" />
     <InputArea />
     <!-- P1-4: 锚定 FAB (jump-to-user-message). Shown
          when the user is scrolled up beyond the 50px
