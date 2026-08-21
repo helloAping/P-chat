@@ -68,13 +68,16 @@
 
 问题：即使 P1 完成，父 `limits.max_turn_seconds` 仍会取消同步 subagent。
 
-候选方案：
+已落地策略：
 
-- 方案 A：文档建议用户把 `max_turn_seconds` 调大或设 0。实现最小，但体验一般。
-- 方案 B：同步 `task` 使用 deadline-free abort context 执行，只受用户取消和内部 hook 取消约束。需要谨慎处理 SSE 写超时和 session lock。
-- 方案 C：当父 turn deadline 快到时，自动把运行中的同步 subagent 转后台 job。复杂度最高。
+- 当本轮工具调用包含同步 `task` 时，父 agent 将后续工具执行、subagent 事件转发、工具结果回填后的 continuation LLM 调用切换到 deadline-free abort context。
+- 这个 abort context 仍会被用户取消、`cancel-stream`、客户端断开取消。
+- 普通工具仍保留自己的 per-tool timeout；普通非 task turn 仍受 `limits.max_turn_seconds` 保护。
 
-建议：先做 A+B 的设计评审，再落地 B。
+剩余限制：
+
+- 同步 `task` 一旦触发，当前 turn 的后续 continuation 也脱离 `max_turn_seconds`，依靠 LLM stall、工具 timeout、失败熔断、轮次上限和用户取消收敛。
+- 真正后台执行、跨请求查询和完成后 hook 回主对话仍需要 P3 的 job 状态层。
 
 ### P3：异步 subagent job 状态层
 

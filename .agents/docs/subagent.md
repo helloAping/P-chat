@@ -65,7 +65,7 @@
 
 **超时来源**：默认不再给 `task` 工具或子代理安装独立 wall-clock deadline。`task` 工具不再继承普通工具 5 分钟 per-tool timeout；`subagent.timeout` 为空、`"0"` 或非法时表示禁用。只有配置为正数 Go duration（如 `"30m"`）时，才作为显式部署策略生效。
 
-同步 `task` 仍继承父 turn context：如果 `limits.max_turn_seconds` 到期，父 turn 会取消正在等待的同步 subagent。这是当前同步模型的剩余限制，异步 subagent job 化后应由后台 job context 承接长任务。
+同步 `task` 检测到后，父 agent 会将工具执行、子代理事件转发、工具结果回填后的 continuation LLM 调用切换到 deadline-free abort context。它不再被 `limits.max_turn_seconds` 截断，但仍响应用户取消、`cancel-stream`、客户端断开，以及内部 LLM/tool/failure/round 守卫。
 
 **防卡死依赖的细粒度守卫**：
 - LLM stream idle timeout **120s**（上游 120s 无字节 → cancel）

@@ -1013,6 +1013,26 @@ func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() u
 	}
 }
 
+func detachTurnDeadlineForTask(ctx context.Context) (context.Context, bool) {
+	abortCtx := AbortContextFrom(ctx)
+	if abortCtx == nil {
+		return ctx, false
+	}
+	if tid := trace.FromContext(ctx); tid != "" {
+		abortCtx = trace.WithID(abortCtx, tid)
+	}
+	return WithAbortContext(abortCtx, abortCtx), true
+}
+
+func hasTaskToolCall(toolCalls []nativeToolCall) bool {
+	for _, tc := range toolCalls {
+		if tc.Name == "task" {
+			return true
+		}
+	}
+	return false
+}
+
 // ChatWithTools performs a ReAct-style loop: send messages to the LLM with
 // available tools, execute any tool calls, and feed results back to the LLM
 // until it gives a final answer.
@@ -1887,6 +1907,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// user doesn't see both raw tool blocks AND tool cards.
 			if len(toolCalls) > 0 {
 				fullContent = cleanMarkdownToolCalls(fullContent)
+			}
+			if hasTaskToolCall(toolCalls) {
+				if detached, ok := detachTurnDeadlineForTask(ctx); ok {
+					ctx = detached
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:    "tool",
+						Step:     "task-detached",
+						Message:  "检测到同步子代理任务，已切换为仅受用户取消/连接断开控制，避免父回合 wall-clock 截断。",
+						Round:    roundNum,
+						MaxRound: maxRounds,
+					})
+				}
 			}
 
 			// Post-stream redactor: catch phantom "ERROR: Cannot read
