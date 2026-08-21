@@ -197,14 +197,20 @@ func runServer(cmd *cobra.Command, args []string) error {
 		Cfg:            cfg,
 		LLM:            llmClient,
 		StyleMgr:       styleMgr,
+		JobStore:       memStore,
 		ParentTools:    toolReg,
 		ParentStyle:    style.Style(currentStyleName(cfg)),
 		ParentProvider: defaultProviderName(cfg),
 		Registry:       subagentReg,
 		Cache:          subagent.NewCache(cfg.SubAgent.CacheTTLDuration()),
+		Async:          subagent.NewAsyncManager(),
 	}
 	tt, hh := runner.Tool()
 	toolReg.Register(tt, hh)
+	tst, tsh := runner.TaskStatusTool()
+	toolReg.Register(tst, tsh)
+	tct, tch := runner.TaskCancelTool()
+	toolReg.Register(tct, tch)
 	log.Printf("[subagent] task tool registered (timeout=%s cache_ttl=%s)",
 		cfg.SubAgent.TimeoutDuration(), cfg.SubAgent.CacheTTLDuration())
 

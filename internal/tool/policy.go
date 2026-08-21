@@ -128,7 +128,7 @@ func defaultToolPolicy(name string) ToolPolicy {
 		MaxOutputBytes: 1 << 20,
 	}
 	switch {
-	case name == "read_file" || name == "read_docx" || name == "read_pdf" || name == "list_files" || name == "grep" || name == "recall" || name == "wiki_lookup" || name == "wiki_list":
+	case name == "read_file" || name == "read_docx" || name == "read_pdf" || name == "list_files" || name == "grep" || name == "recall" || name == "wiki_lookup" || name == "wiki_list" || name == "task_status":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryRead, ToolSideEffectNone, ToolRiskLow, ToolParallelSafe
 		p.TimeoutMS = 60 * 1000
 	case name == "write_file" || name == "edit_file":
@@ -149,6 +149,9 @@ func defaultToolPolicy(name string) ToolPolicy {
 	case name == "task":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectProcess, ToolRiskConfirm, ToolParallelExclusive
 		p.TimeoutMS = -1
+	case name == "task_cancel":
+		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectState, ToolRiskMedium, ToolParallelExclusive
+		p.TimeoutMS = 30 * 1000
 	}
 	return p
 }

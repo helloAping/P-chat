@@ -81,7 +81,7 @@
 
 ### P3：异步 subagent job 状态层
 
-P3a 已落地：新增持久化状态层和 Store CRUD，但尚未接入 `task mode=async`、HTTP API 或前端。
+P3a 已落地：新增持久化状态层和 Store CRUD。
 
 新增持久化状态：
 
@@ -97,14 +97,14 @@ P3a 已落地：新增持久化状态层和 Store CRUD，但尚未接入 `task m
 - `UpdateSubagentJobProgress`
 - `CompleteSubagentJob` / `FailSubagentJob` / `CancelSubagentJob`
 
-新增服务端能力：
+已接入服务端能力：
 
 - 创建后台 job。
 - 查询 job 列表和详情。
 - 取消 job。
-- job 完成后写入主会话 synthetic message 或 structured part。
+- job 完成后写入主会话 synthetic message。
 
-后续接入仍需实现服务端能力；schema 已走 `internal/memory/migrations.go` migration v11，并覆盖升级 / 回滚 / 幂等 / CRUD 测试。
+schema 已走 `internal/memory/migrations.go` migration v11，并覆盖升级 / 回滚 / 幂等 / CRUD 测试。
 
 ### P4：工具协议扩展
 
@@ -128,10 +128,16 @@ sub-agent launched in background: task_id=<id>, status=running
 Use task_status with the same task_id to check progress.
 ```
 
-新增工具：
+新增工具已落地：
 
 - `task_status`
 - `task_cancel`
+
+剩余限制：
+
+- `async` 完成后目前通过 synthetic assistant message 回写主会话；没有独立 SSE 推送给已结束的前端流。
+- 进程重启后可以查询历史 job，但只能取消当前 server 进程内仍在运行的 job。
+- 前端尚未提供后台 job 专用卡片、刷新按钮或取消按钮。
 
 ### P5：前端/CLI 体验
 
@@ -142,4 +148,4 @@ Use task_status with the same task_id to check progress.
 
 ## 当前执行顺序
 
-已完成 P0、P1、P2、P3a。下一步进入 P4：扩展 `task` 参数支持 `mode=async`，后台 runner 使用 P3a 的 job 状态层落盘，并新增 `task_status` / `task_cancel` 工具。
+已完成 P0、P1、P2、P3a、P4 后端最小闭环。下一步进入 P5：前端/CLI 展示后台 job 状态、刷新/取消入口，以及完成通知体验。

@@ -12,7 +12,7 @@
 
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
-| `subagent.go` | Runner 实现 + task 工具入口 | `Tool()`, `Default.Run()`, `Result` |
+| `subagent.go` | Runner 实现 + task 工具入口 + async job 工具 | `Tool()`, `TaskStatusTool()`, `TaskCancelTool()`, `Default.Run()`, `Result` |
 | `registry.go` | 子代理目录（合并内置 + 用户自定义） | `Registry`, `AgentInfo`, `NewRegistry()` |
 | `builtins.go` | 内置子代理定义（general-purpose/explore/plan） | Built-in prompts |
 | `markdown.go` | 用户自定义代理加载（.p-chat/agent/*.md） | `loadFromDir()` |
@@ -26,7 +26,7 @@
 ```
 1. 缓存检查 (task_id 命中 → 直接返回缓存)
 2. 发出 sub_agent_start 事件 (Phase="sub_agent_start", SubAgentStatus="start")
-3. 构建子工具注册表 (过滤: 移除 task/recall, 应用全局 allow/deny, 应用 agent 白名单)
+3. 构建子工具注册表 (过滤: 移除 task/task_status/task_cancel/recall, 应用全局 allow/deny, 应用 agent 白名单)
 4. 创建独立 agent 实例 (独立 memory.Store, 独立事件系统)
 5. 调用 subAgent.ChatWithTools(runCtx, chatReq) → stream channel
 6. 转发每个 chunk 到父级 (tryForward → OnEvent → eventCh)
@@ -61,7 +61,17 @@
 
 `agentCache` 按 `(description, subagent_type, model)` 缓存结果。通过 `task_id` 参数可恢复缓存（不重新执行）。
 
-### 6. 超时与部分结果（2026-08-21 起）
+### 6. 异步 job（2026-08-21 起）
+
+`task` 参数支持 `mode: "sync" | "async"`：
+
+- `sync` 是默认行为：父对话等待子代理完成，并把最终结果作为当前 tool result 回填给父 LLM。
+- `async` 会立即创建 `subagent_jobs` 记录并返回 `task_id`，后台 goroutine 使用独立 context 执行，不依赖当前 HTTP/SSE turn 生命周期。
+- `task_status` 查询当前 session 的 job 列表或单个 `task_id` 详情。
+- `task_cancel` 取消当前 server 进程内仍在运行的后台 job，并把 durable 状态标记为 `cancelled`。
+- job 完成后会向主会话追加一条 synthetic assistant message，包含最终结果和 subagent stats。实时前端后台卡片/通知仍属于后续 P5。
+
+### 7. 超时与部分结果（2026-08-21 起）
 
 **超时来源**：默认不再给 `task` 工具或子代理安装独立 wall-clock deadline。`task` 工具不再继承普通工具 5 分钟 per-tool timeout；`subagent.timeout` 为空、`"0"` 或非法时表示禁用。只有配置为正数 Go duration（如 `"30m"`）时，才作为显式部署策略生效。
 
@@ -92,6 +102,11 @@
 ### 要修改子代理事件转发
 - `tryForward()` (subagent.go:837-842)
 - `OnEvent` 回调构造 (subagent.go 的 Tool handler)
+
+### 要修改异步子代理
+- `TaskStatusTool()` / `TaskCancelTool()` / `launchAsyncTask()` (subagent.go)
+- `SubagentJob` CRUD (memory/subagent_jobs.go)
+- `subagent_jobs` schema (memory/migrations.go migration v11)
 
 ### 要添加新的内置子代理
 1. 在 `builtins.go` 定义 Prompt 常量

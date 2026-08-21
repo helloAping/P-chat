@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -12,11 +13,27 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/tool"
 )
 
 func noopHandler(_ context.Context, _ json.RawMessage) (*tool.CallResult, error) {
 	return &tool.CallResult{Content: "ok"}, nil
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ok() {
+		return
+	}
+	t.Fatalf("condition not satisfied within %s", timeout)
 }
 
 func TestNewSubAgentStore_IsEphemeral(t *testing.T) {
@@ -63,6 +80,8 @@ func TestNewSubAgentStore_IsEphemeral(t *testing.T) {
 func TestDefault_ExcludesTaskTool(t *testing.T) {
 	parent := tool.NewRegistry()
 	parent.Register(tool.Tool{Name: "task", Description: "spawn sub"}, noopHandler)
+	parent.Register(tool.Tool{Name: "task_status", Description: "status"}, noopHandler)
+	parent.Register(tool.Tool{Name: "task_cancel", Description: "cancel"}, noopHandler)
 	parent.Register(tool.Tool{Name: "read_file", Description: "r"}, noopHandler)
 	parent.Register(tool.Tool{Name: "recall", Description: "r"}, noopHandler)
 
@@ -70,7 +89,7 @@ func TestDefault_ExcludesTaskTool(t *testing.T) {
 
 	subTools := tool.NewRegistry()
 	for _, name := range d.ParentTools.Names() {
-		if name == "task" || name == "recall" {
+		if name == "task" || name == "task_status" || name == "task_cancel" || name == "recall" {
 			continue
 		}
 		if tt, h, ok := d.ParentTools.Lookup(name); ok {
@@ -81,12 +100,155 @@ func TestDefault_ExcludesTaskTool(t *testing.T) {
 	if _, ok := subTools.Get("task"); ok {
 		t.Error("task must NOT be in sub-agent registry")
 	}
+	if _, ok := subTools.Get("task_status"); ok {
+		t.Error("task_status must NOT be in sub-agent registry")
+	}
+	if _, ok := subTools.Get("task_cancel"); ok {
+		t.Error("task_cancel must NOT be in sub-agent registry")
+	}
 	if _, ok := subTools.Get("recall"); ok {
 		t.Error("recall must NOT be in sub-agent registry")
 	}
 	if _, ok := subTools.Get("read_file"); !ok {
 		t.Error("read_file SHOULD be in sub-agent registry")
 	}
+}
+
+func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
+	store, err := memory.OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureConversation("session-1", ""); err != nil {
+		t.Fatalf("EnsureConversation: %v", err)
+	}
+
+	d := &Default{
+		JobStore:    store,
+		ParentTools: tool.NewRegistry(),
+		Async:       NewAsyncManager(),
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			ch := make(chan agent.ChatStreamChunk, 2)
+			go func() {
+				defer close(ch)
+				ch <- agent.ChatStreamChunk{Content: "async result"}
+				ch <- agent.ChatStreamChunk{Done: true, TokensIn: 3, TokensOut: 4, Round: 1}
+			}()
+			return ch
+		},
+	}
+	_, taskHandler := d.Tool()
+	result, err := taskHandler(
+		tool.WithSessionID(context.Background(), "session-1"),
+		json.RawMessage(`{"mode":"async","description":"background work","task_id":"task-1"}`),
+	)
+	if err != nil {
+		t.Fatalf("task async handler: %v", err)
+	}
+	if result == nil || result.IsError || !strings.Contains(result.Content, "task_id=task-1") {
+		t.Fatalf("async launch result = %+v", result)
+	}
+
+	var job memory.SubagentJob
+	waitUntil(t, time.Second, func() bool {
+		got, ok, err := store.GetSubagentJob("session-1", "task-1")
+		if err != nil || !ok {
+			return false
+		}
+		job = got
+		return got.Status == memory.SubagentJobSucceeded
+	})
+	if !strings.Contains(job.Result, "async result") {
+		t.Fatalf("job result missing async output: %+v", job)
+	}
+
+	_, statusHandler := d.TaskStatusTool()
+	status, err := statusHandler(
+		tool.WithSessionID(context.Background(), "session-1"),
+		json.RawMessage(`{"task_id":"task-1"}`),
+	)
+	if err != nil {
+		t.Fatalf("task_status handler: %v", err)
+	}
+	if status == nil || !strings.Contains(status.Content, "status: succeeded") || !strings.Contains(status.Content, "async result") {
+		t.Fatalf("unexpected task_status result: %+v", status)
+	}
+
+	msgs := store.GetChatMessagesFor("session-1", 10)
+	foundSynthetic := false
+	for _, msg := range msgs {
+		if strings.Contains(msg.Content, "Async sub-agent task `task-1` completed") &&
+			strings.Contains(msg.Content, "async result") {
+			foundSynthetic = true
+			break
+		}
+	}
+	if !foundSynthetic {
+		t.Fatalf("synthetic async completion message not found: %+v", msgs)
+	}
+}
+
+func TestTaskCancelStopsRunningAsyncJob(t *testing.T) {
+	store, err := memory.OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureConversation("session-1", ""); err != nil {
+		t.Fatalf("EnsureConversation: %v", err)
+	}
+
+	started := make(chan struct{})
+	d := &Default{
+		JobStore:    store,
+		ParentTools: tool.NewRegistry(),
+		Async:       NewAsyncManager(),
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			ch := make(chan agent.ChatStreamChunk)
+			go func() {
+				defer close(ch)
+				close(started)
+				<-ctx.Done()
+			}()
+			return ch
+		},
+	}
+	_, taskHandler := d.Tool()
+	if _, err := taskHandler(
+		tool.WithSessionID(context.Background(), "session-1"),
+		json.RawMessage(`{"mode":"async","description":"cancel me","task_id":"task-cancel"}`),
+	); err != nil {
+		t.Fatalf("task async handler: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("async job did not start")
+	}
+
+	_, cancelHandler := d.TaskCancelTool()
+	cancelResult, err := cancelHandler(
+		tool.WithSessionID(context.Background(), "session-1"),
+		json.RawMessage(`{"task_id":"task-cancel"}`),
+	)
+	if err != nil {
+		t.Fatalf("task_cancel handler: %v", err)
+	}
+	if cancelResult == nil || cancelResult.IsError || !strings.Contains(cancelResult.Content, "cancelled") {
+		t.Fatalf("unexpected cancel result: %+v", cancelResult)
+	}
+
+	waitUntil(t, time.Second, func() bool {
+		job, ok, err := store.GetSubagentJob("session-1", "task-cancel")
+		return err == nil && ok && job.Status == memory.SubagentJobCancelled
+	})
+	waitUntil(t, time.Second, func() bool {
+		d.Async.mu.Lock()
+		defer d.Async.mu.Unlock()
+		return len(d.Async.cancels) == 0
+	})
 }
 
 // TestDefault_AppliesAllowDenyFilter mirrors the production

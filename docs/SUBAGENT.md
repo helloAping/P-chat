@@ -383,7 +383,7 @@ a **per-tool event channel** (`toolEventChanKey{}` in
 1. Tagged with `SubAgent=true`, `SubAgentTask=<description>`,
    `SubAgentType=<agent name>`, `SubAgentColor=<color>`,
    `SubAgentModel=<model>`, `SubAgentTaskID=<id>`.
-2. Pushed to the parent's per-tool `eventCh` (buffer 16).
+2. Pushed to the parent's per-tool `eventCh` (buffer 64).
 3. Picked up by a per-tool forwarder goroutine in the
    parent loop.
 4. Fed into the parent's `partsAccumulator` (so the
@@ -472,8 +472,8 @@ doesn't drown out the parent's stream.
 | **Per-agent tool filter**            | `tools: ["*"]` + `disallowedTools: ["Agent", "Edit", "Write", ...]` | legacy `tools: { "*": false, "github-pr-search": true }` (migrated to permission) OR `permission:` ruleset | `tools: ["read_file", "list_files"]` (whitelist) |
 | **Permission model**                 | per-agent `permissionMode` (default, acceptEdits, plan, dontAsk, bubble, bypassPermissions) | permission ruleset (allow/deny/ask by pattern) + `deriveSubagentSessionPermission` (parent deny + external_directory + subagent's own) | hard exclusions + global allow/deny + per-agent whitelist |
 | **Recursion depth**                  | 1 (hard-coded via `ALL_AGENT_DISALLOWED_TOOLS`) | 1 by default (opt-in via `task: allow`) | 1 (hard exclusion) |
-| **Async / background mode**          | ✅ `run_in_background: true` → `status: 'async_launched'` + output file + `task-notification` injected back | ✅ `background: true` → `BackgroundJob` + `injectBackgroundResult` synthetic assistant text | ❌ not yet (roadmap) |
-| **Resumption by task_id**            | ✅ `task_id` resumes from disk JSONL sidechain transcript | ✅ `task_id` resumes the same `Session` row (linked via `parentID`) | ✅ `task_id` resumes from in-process cache (no disk persistence yet) |
+| **Async / background mode**          | ✅ `run_in_background: true` → `status: 'async_launched'` + output file + `task-notification` injected back | ✅ `background: true` → `BackgroundJob` + `injectBackgroundResult` synthetic assistant text | ✅ `mode:"async"` → `subagent_jobs` + `task_status`/`task_cancel` + synthetic assistant result |
+| **Resumption by task_id**            | ✅ `task_id` resumes from disk JSONL sidechain transcript | ✅ `task_id` resumes the same `Session` row (linked via `parentID`) | partial — sync uses in-process cache; async persists job status/result by `task_id` |
 | **Clickable card → child session**   | ✅ full child session in sidebar; tab routing | ✅ child session in sidebar; `task-tool-card` has chevron → navigate | ❌ card shows metadata but doesn't navigate (cache-only, no child session) |
 | **Worktree isolation**               | ✅ `isolation: 'worktree'` → temporary git worktree | ❌ | ❌ (roadmap) |
 | **Per-agent memory**                 | ✅ `memory: user\|project\|local` → persistent file in `~/.claude/agent-memory/<name>/` | ❌ | ❌ (roadmap) |
@@ -521,16 +521,15 @@ memory — the sub-agent starts fresh every call. We can
 add this later if it becomes a pain point (likely yes for
 code-review / code-audit agents).
 
-**In-process cache only.** Claude Code persists the
+**Sync cache + async job persistence.** Claude Code persists the
 sub-agent's full transcript to a sidechain JSONL file on
 disk and reloads it on `task_id` resume. opencode links
 the child to the parent via `Session.parentID` so the
-child is a real session row in the DB. P-Chat's cache
-is in-process (`subagent.Cache`, a `map[string]cacheEntry`
-behind a mutex). Survives a server restart? No. The
-trade-off: simpler code, but resuming a sub-agent after
-a server restart is a cache miss. We can add disk
-persistence when the user actually needs it.
+child is a real session row in the DB. P-Chat keeps sync
+sub-agent result reuse in-process (`subagent.Cache`), while
+async `mode:"async"` jobs persist status/result in
+`subagent_jobs` and can be queried after a server restart.
+The remaining gap is full child transcript/session navigation.
 
 ---
 
@@ -542,15 +541,12 @@ overall roadmap.
 
 ### Phase A (low effort, high value)
 
-1. **Async / background mode** (opencode `background: true`).
-   - The sub-agent tool emits an `async_launched` chunk with
-     a `task_id` immediately and returns. The actual work
-     happens in a goroutine.
-   - When the background sub-agent finishes, the result is
-     injected back into the parent as a synthetic assistant
-     text part (`injectBackgroundResult`-style).
-   - The card shows a "running in background" pill that the
-     user can click to navigate to / wait for.
+1. **Async / background mode UI** (backend done).
+   - Backend supports `task mode="async"`, `task_status`,
+     `task_cancel`, durable `subagent_jobs`, and synthetic
+     assistant completion messages.
+   - Remaining work: the card shows a "running in background"
+     pill, refresh/cancel buttons, and completion notification.
 
 2. **Tool count + token count in the card** (Claude Code
    `AgentProgressLine`).
