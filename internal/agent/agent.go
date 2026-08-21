@@ -2236,7 +2236,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot); ok {
 					toolTimeout = meta.EffectivePolicy().Timeout()
 				}
-				tctx, cancel := context.WithTimeout(tctx, toolTimeout)
+				var cancel context.CancelFunc
+				if toolTimeout > 0 {
+					tctx, cancel = context.WithTimeout(tctx, toolTimeout)
+				} else {
+					// Some orchestration tools, notably `task`, intentionally
+					// have no per-tool wall-clock deadline. They still need a
+					// child context so defer cancel releases resources and user
+					// / parent turn cancellation propagates normally.
+					tctx, cancel = context.WithCancel(tctx)
+				}
 
 				fwd := forwarder{done: make(chan struct{})}
 				forwarders = append(forwarders, fwd)

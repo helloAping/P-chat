@@ -78,8 +78,14 @@ The sub-agent gets:
   agent's `Prompt` field, OR the request's `prompt` override
   when set). The system prompt is the only piece of context
   the sub-agent sees from the parent.
-- **A per-call timeout** (default 5 minutes, configurable via
-  `subagent.timeout` in `~/.p-chat/config.json`).
+- **Optional per-call timeout** via `subagent.timeout` in
+  `~/.p-chat/config.json`. Empty / `"0"` / invalid values disable
+  the sub-agent-specific wall-clock deadline; normal cancellation is
+  driven by user stop, parent turn cancellation, stream stall
+  detection, per-tool timeouts, failure breakers, and the sub-agent
+  round cap. The `task` orchestration tool itself also has no default
+  per-tool deadline, so it no longer inherits the ordinary 5-minute
+  tool timeout.
 - **A fresh event channel** so the parent's UI can stream
   the sub-agent's progress in real time.
 

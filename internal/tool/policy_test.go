@@ -15,6 +15,13 @@ func TestEffectivePolicyClassifiesBuiltins(t *testing.T) {
 	if checkpoint.Category != ToolCategoryCheckpoint || !checkpoint.Idempotent {
 		t.Fatalf("todo_write policy = %#v, want idempotent checkpoint", checkpoint)
 	}
+	task := (Tool{Name: "task"}).EffectivePolicy()
+	if task.Timeout() != 0 {
+		t.Fatalf("task timeout = %v, want no per-tool deadline", task.Timeout())
+	}
+	if task.CanRunInParallel() || task.Category != ToolCategoryOrchestration {
+		t.Fatalf("task policy = %#v, want exclusive orchestration", task)
+	}
 }
 
 func TestCallResultNormalizePreservesLegacyFields(t *testing.T) {

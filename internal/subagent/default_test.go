@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -383,6 +384,56 @@ func newRunTestDefault(chunks []agent.ChatStreamChunk) (*Default, *[]agent.ChatS
 		},
 	}
 	return d, &events
+}
+
+func TestDefault_RunDoesNotInstallDeadlineWhenSubagentTimeoutDisabled(t *testing.T) {
+	parent := tool.NewRegistry()
+	parent.Register(tool.Tool{Name: "read_file", Description: "r"}, noopHandler)
+
+	var sawDeadline bool
+	d := &Default{
+		ParentTools: parent,
+		Cfg:         &config.Config{SubAgent: config.SubAgentConfig{}},
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			_, sawDeadline = ctx.Deadline()
+			ch := make(chan agent.ChatStreamChunk, 1)
+			ch <- agent.ChatStreamChunk{Done: true}
+			close(ch)
+			return ch
+		},
+	}
+
+	if _, err := d.Run(context.Background(), Request{Description: "explore src/"}); err != nil {
+		t.Fatalf("Run() returned err: %v", err)
+	}
+	if sawDeadline {
+		t.Fatal("subagent timeout disabled should not install a child context deadline")
+	}
+}
+
+func TestDefault_RunInstallsDeadlineWhenSubagentTimeoutConfigured(t *testing.T) {
+	parent := tool.NewRegistry()
+	parent.Register(tool.Tool{Name: "read_file", Description: "r"}, noopHandler)
+
+	var sawDeadline bool
+	d := &Default{
+		ParentTools: parent,
+		Cfg:         &config.Config{SubAgent: config.SubAgentConfig{Timeout: "30s"}},
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			_, sawDeadline = ctx.Deadline()
+			ch := make(chan agent.ChatStreamChunk, 1)
+			ch <- agent.ChatStreamChunk{Done: true}
+			close(ch)
+			return ch
+		},
+	}
+
+	if _, err := d.Run(context.Background(), Request{Description: "explore src/"}); err != nil {
+		t.Fatalf("Run() returned err: %v", err)
+	}
+	if !sawDeadline {
+		t.Fatal("positive subagent timeout should install a child context deadline")
+	}
 }
 
 // TestDefault_SilentCloseIsFailure is the regression test for the

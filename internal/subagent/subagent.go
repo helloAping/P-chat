@@ -728,18 +728,20 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		})
 	}
 
-	// Per-sub-agent wall-clock timeout. This is a LAST-RESORT
-	// backstop, not the primary hang guard — a legitimate long run
-	// (slow local model, many files to read) can take 10-20 minutes.
-	// Real hangs are caught earlier by the LLM stream idle timeout
-	// (120s), per-tool timeouts, the cumulative failure breaker, and
-	// the round cap (MaxRounds 30). Default 30 minutes, or use the
-	// config if set.
-	timeout := 30 * time.Minute
+	// Optional per-sub-agent wall-clock timeout. By default this is
+	// disabled: long sub-agents should be stopped by explicit hooks
+	// (user/parent cancellation), LLM stream stall detection, per-tool
+	// timeouts, failure breakers, or the round cap. A positive
+	// subagent.timeout remains available as a deployment policy.
+	timeout := time.Duration(0)
 	if d.Cfg != nil {
 		timeout = d.Cfg.SubAgent.TimeoutDuration()
 	}
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	runCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
 
 	// Build a sub-agent's tool registry. Three layers of filter

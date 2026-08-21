@@ -83,7 +83,7 @@ func (t Tool) EffectivePolicy() ToolPolicy {
 	if custom.Parallelism != "" {
 		p.Parallelism = custom.Parallelism
 	}
-	if custom.TimeoutMS > 0 {
+	if custom.TimeoutMS != 0 {
 		p.TimeoutMS = custom.TimeoutMS
 	}
 	if custom.MaxOutputBytes > 0 {
@@ -99,7 +99,12 @@ func (t Tool) EffectivePolicy() ToolPolicy {
 }
 
 // Timeout returns the bounded per-call timeout represented by the policy.
+// A negative TimeoutMS means "no per-tool deadline"; callers should still
+// pass a cancellable parent context so user stop / turn cancellation works.
 func (p ToolPolicy) Timeout() time.Duration {
+	if p.TimeoutMS < 0 {
+		return 0
+	}
 	if p.TimeoutMS <= 0 {
 		return 5 * time.Minute
 	}
@@ -143,6 +148,7 @@ func defaultToolPolicy(name string) ToolPolicy {
 		p.TimeoutMS = 2 * 60 * 1000
 	case name == "task":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectProcess, ToolRiskConfirm, ToolParallelExclusive
+		p.TimeoutMS = -1
 	}
 	return p
 }

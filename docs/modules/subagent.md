@@ -61,6 +61,28 @@
 
 `agentCache` 按 `(description, subagent_type, model)` 缓存结果。通过 `task_id` 参数可恢复缓存（不重新执行）。
 
+### 6. 超时与部分结果（2026-08-21 起）
+
+**超时来源**：默认不再给 `task` 工具或子代理安装独立 wall-clock deadline。`task` 工具不再继承普通工具 5 分钟 per-tool timeout；`subagent.timeout` 为空、`"0"` 或非法时表示禁用。只有配置为正数 Go duration（如 `"30m"`）时，才作为显式部署策略生效。
+
+同步 `task` 仍继承父 turn context：如果 `limits.max_turn_seconds` 到期，父 turn 会取消正在等待的同步 subagent。这是当前同步模型的剩余限制，异步 subagent job 化后应由后台 job context 承接长任务。
+
+**防卡死依赖的细粒度守卫**：
+- LLM stream idle timeout **120s**（上游 120s 无字节 → cancel）
+- 工具超时：exec_command 5m、read_file 60s、question 10m
+- 累计失败熔断 `CumToolErrMax=8`（打地鼠式不同命令失败）
+- 子代理轮数上限 `MaxRounds=30`
+
+**为什么取消默认 wall-clock**：正常长任务（explore 读 50 文件 / 慢速本地模型多轮）可能合法运行很久。固定 wall-clock 会把“正常但慢”的子代理误判为失败；真实卡死应由上面的细粒度守卫、用户取消、父 turn 取消或异步 job 取消 hook 处理。
+
+**部分结果策略**：超时/中断时，若子代理已产出部分内容（如 explore 已完成一半调研），不再整段丢弃——`Default.Run` 把部分内容作为 `Result.Content` 返回（带 `Interrupted` 标记），`task` 工具 handler 把它包装成带 "PARTIAL" 前缀的 tool result 传给父 LLM。父 LLM 据此总结子代理已完成的工作并继续剩余部分，而不是收到 `(sub-agent returned no content)` 后无从下手。
+
+**判定规则**（`Default.Run` 的 silent-close 检测）：
+- 静默关闭 + 有部分输出 → `sub_agent_err`（卡片标"失败（部分内容）"）+ 部分内容返回给父级（`Interrupted` 非空）
+- 静默关闭 + 无输出 → 硬失败，父级收到明确超时错误
+- Error chunk → 硬失败（子代理自报错误，尾部内容不可信）
+- 正常 Done / 软失败 → 不变
+
 ## 修改指南
 
 ### 要修改子代理创建流程
@@ -79,7 +101,7 @@
 - `agentCache` 定义和 `Cache.Get/Set` (subagent.go)
 
 ### 要修改子代理超时
-- `timeout` 变量 (subagent.go:566-568)
+- `timeout` / `runCtx` 构造 (subagent.go `Default.Run`)
 - config 中的 `subagent.timeout` 字段
 
 ## 相关模块

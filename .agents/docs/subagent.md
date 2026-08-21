@@ -61,17 +61,19 @@
 
 `agentCache` 按 `(description, subagent_type, model)` 缓存结果。通过 `task_id` 参数可恢复缓存（不重新执行）。
 
-### 6. 超时与部分结果（2026-08-03 起）
+### 6. 超时与部分结果（2026-08-21 起）
 
-**超时来源**：`subagent.timeout`（默认 **30 分钟**）是 wall-clock **兜底**（不是主防卡死）。`runCtx` 超时后子代理 ReAct 循环可能**静默关闭**（无 Done、无 Error chunk）。
+**超时来源**：默认不再给 `task` 工具或子代理安装独立 wall-clock deadline。`task` 工具不再继承普通工具 5 分钟 per-tool timeout；`subagent.timeout` 为空、`"0"` 或非法时表示禁用。只有配置为正数 Go duration（如 `"30m"`）时，才作为显式部署策略生效。
 
-**防卡死依赖的细粒度守卫**（都早于 30m wall-clock 触发）：
+同步 `task` 仍继承父 turn context：如果 `limits.max_turn_seconds` 到期，父 turn 会取消正在等待的同步 subagent。这是当前同步模型的剩余限制，异步 subagent job 化后应由后台 job context 承接长任务。
+
+**防卡死依赖的细粒度守卫**：
 - LLM stream idle timeout **120s**（上游 120s 无字节 → cancel）
 - 工具超时：exec_command 5m、read_file 60s、question 10m
 - 累计失败熔断 `CumToolErrMax=8`（打地鼠式不同命令失败）
 - 子代理轮数上限 `MaxRounds=30`
 
-**为什么默认从 5m 调到 30m**：正常长任务（explore 读 50 文件 / 慢速本地模型多轮）可合法跑 10-20 分钟，5m 会误杀已产出的有效工作。真卡死已被上面的细粒度守卫提前拦截，wall-clock 只在全部失效时才兜底。
+**为什么取消默认 wall-clock**：正常长任务（explore 读 50 文件 / 慢速本地模型多轮）可能合法运行很久。固定 wall-clock 会把“正常但慢”的子代理误判为失败；真实卡死应由上面的细粒度守卫、用户取消、父 turn 取消或异步 job 取消 hook 处理。
 
 **部分结果策略**：超时/中断时，若子代理已产出部分内容（如 explore 已完成一半调研），不再整段丢弃——`Default.Run` 把部分内容作为 `Result.Content` 返回（带 `Interrupted` 标记），`task` 工具 handler 把它包装成带 "PARTIAL" 前缀的 tool result 传给父 LLM。父 LLM 据此**总结子代理已完成的工作并继续剩余部分**，而不是收到 `(sub-agent returned no content)` 后无从下手。
 
@@ -99,7 +101,7 @@
 - `agentCache` 定义和 `Cache.Get/Set` (subagent.go)
 
 ### 要修改子代理超时
-- `timeout` 变量 (subagent.go:566-568)
+- `timeout` / `runCtx` 构造 (subagent.go `Default.Run`)
 - config 中的 `subagent.timeout` 字段
 
 ### 要修改子代理空转熔断

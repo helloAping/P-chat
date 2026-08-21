@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -162,20 +163,16 @@ type SubAgentConfig struct {
 	AllowedTools []string `json:"allowed_tools,omitempty"`
 	DeniedTools  []string `json:"denied_tools,omitempty"`
 
-	// Timeout is the per-sub-agent wall-clock execution cap. Parsed
-	// from JSON (e.g. "30m", "5m"). Zero means no explicit cap (the
-	// runner applies a sensible default of 30 minutes).
+	// Timeout is the optional per-sub-agent wall-clock execution cap.
+	// Parsed from JSON (e.g. "30m", "5m"). Empty, zero, or invalid
+	// means no sub-agent-specific deadline; the runner relies on parent
+	// cancellation plus fine-grained guards instead.
 	//
-	// This is a LAST-RESORT backstop, not the primary hang guard. A
-	// normal long sub-agent (e.g. explore reading 50 files, or a
-	// multi-round plan on a slow local model) can legitimately run
-	// 10-20 minutes; cutting it at 5m discards useful work. Actual
-	// hangs are caught earlier by finer-grained guards: the LLM
-	// stream idle timeout (120s of no bytes → cancel), per-tool
-	// timeouts (exec_command 5m, read_file 60s), the cumulative
-	// tool-failure breaker (CumToolErrMax) and the sub-agent round
-	// cap (MaxRounds 30). The wall clock is only reached when every
-	// one of those failed.
+	// This should only be set as an explicit deployment policy. Normal
+	// long sub-agents can legitimately run for a long time; hangs are
+	// bounded by finer-grained guards: LLM stream stall detection,
+	// per-tool timeouts, the cumulative tool-failure breaker, and the
+	// sub-agent round cap.
 	Timeout string `json:"timeout,omitempty"`
 
 	// CacheTTL is how long a sub-agent result stays cached. Parsed
@@ -183,14 +180,16 @@ type SubAgentConfig struct {
 	CacheTTL string `json:"cache_ttl,omitempty"`
 }
 
-// TimeoutDuration returns the parsed timeout, or 30m if unset/invalid.
+// TimeoutDuration returns the parsed timeout. A non-positive result means
+// no sub-agent-specific deadline should be installed.
 func (s SubAgentConfig) TimeoutDuration() time.Duration {
-	if s.Timeout == "" {
-		return 30 * time.Minute
+	raw := strings.TrimSpace(s.Timeout)
+	if raw == "" || raw == "0" {
+		return 0
 	}
-	d, err := time.ParseDuration(s.Timeout)
+	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
-		return 30 * time.Minute
+		return 0
 	}
 	return d
 }
@@ -973,11 +972,11 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Limits: LimitsConfig{
-			MaxRounds:              500,
-			TodoLongRunMode:        TodoLongRunAdaptive,
-			MaxTurnSeconds:         900,
-			MaxTurnRetries:         2,
-			LLMRetryBackoffs:       []int{5, 60, 180, 300, 600},
+			MaxRounds:               500,
+			TodoLongRunMode:         TodoLongRunAdaptive,
+			MaxTurnSeconds:          900,
+			MaxTurnRetries:          2,
+			LLMRetryBackoffs:        []int{5, 60, 180, 300, 600},
 			RoundStreamStallSeconds: 180,
 		},
 		Sandbox: SandboxConfig{

@@ -129,22 +129,24 @@ func TestSubAgentConfig_DenyList(t *testing.T) {
 }
 
 func TestSubAgentConfig_Timeout(t *testing.T) {
-	// Default
 	c := &SubAgentConfig{}
-	if got := c.TimeoutDuration(); got != 30*time.Minute {
-		t.Errorf("default timeout = %v, want 30m", got)
+	if got := c.TimeoutDuration(); got != 0 {
+		t.Errorf("default timeout = %v, want 0 (disabled)", got)
 	}
 
-	// Custom
+	c = &SubAgentConfig{Timeout: "0"}
+	if got := c.TimeoutDuration(); got != 0 {
+		t.Errorf("zero timeout = %v, want 0 (disabled)", got)
+	}
+
 	c = &SubAgentConfig{Timeout: "30s"}
 	if got := c.TimeoutDuration(); got != 30*time.Second {
 		t.Errorf("custom timeout = %v, want 30s", got)
 	}
 
-	// Invalid
 	c = &SubAgentConfig{Timeout: "garbage"}
-	if got := c.TimeoutDuration(); got != 30*time.Minute {
-		t.Errorf("invalid timeout should fall back to 30m, got %v", got)
+	if got := c.TimeoutDuration(); got != 0 {
+		t.Errorf("invalid timeout should disable the sub-agent deadline, got %v", got)
 	}
 }
 
