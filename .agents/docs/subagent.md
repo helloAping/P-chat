@@ -81,7 +81,8 @@
 - LLM stream idle timeout **120s**（上游 120s 无字节 → cancel）
 - 工具超时：exec_command 5m、read_file 60s、question 10m
 - 累计失败熔断 `CumToolErrMax=8`（打地鼠式不同命令失败）
-- 子代理轮数上限 `MaxRounds=30`
+- 轮次策略继承主对话配置：子代理 `ChatRequest.MaxRounds=0`，由 `limits.max_rounds` / `todo_long_run_mode` 统一解析
+- 子代理公共守则与长轮次软提醒：仅引导聚焦、总结进度、停止重复路径，不作为硬停止条件
 
 **为什么取消默认 wall-clock**：正常长任务（explore 读 50 文件 / 慢速本地模型多轮）可能合法运行很久。固定 wall-clock 会把“正常但慢”的子代理误判为失败；真实卡死应由上面的细粒度守卫、用户取消、父 turn 取消或异步 job 取消 hook 处理。
 
@@ -121,8 +122,9 @@
 
 ### 要修改子代理空转熔断
 - `CumToolErrMax` (agent/auto_continue.go) — 累计工具失败熔断阈值（默认 8，跨不同命令）
-- `MaxRounds: 30` (subagent.go `buildSubAgentChatRequest`) — 子代理轮数硬上限
-- `sameToolErrMax` / stuck-loop 守卫 (agent/agent.go) — 同工具/同签名失败熔断
+- `buildSubAgentChatRequest` 保持 `MaxRounds=0` — 子代理继承主对话 / 全局轮次策略
+- `subagent_guard.go` — 子代理公共守则与第 50/100/150… 轮软提醒
+- `sameToolErrMax` / stuck-loop / no-progress 守卫 (agent/agent.go) — 同工具、同签名失败或只读无进展熔断
 
 ## 相关模块
 

@@ -1549,13 +1549,12 @@ func buildSubAgentChatRequest(
 		SubagentTaskID: req.TaskID,
 		ProjectRoot:    req.ProjectRoot,
 		SessionID:      buildSubAgentSessionID(subType, req.TaskID),
-		// Sub-agents are short focused runs. Cap rounds well
-		// below the parent's 500 default so a failing loop
-		// (whack-a-mole tool errors, re-read loops) ends in
-		// ~30 rounds instead of spinning until the wall-clock
-		// timeout — the cumulative failure breaker fires
-		// earlier, but this is the hard backstop.
-		MaxRounds: 30,
+		// Leave MaxRounds unset so the child inherits the same
+		// configured round policy as the parent conversation. Long
+		// sub-agents are guided by the shared guards in agent.ChatWithTools
+		// (stall, tool timeout, failure breakers, no-progress, cancel),
+		// not by a shorter child-only cap.
+		MaxRounds: 0,
 		Messages: []llm.ChatMessage{
 			{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Description},
 		},

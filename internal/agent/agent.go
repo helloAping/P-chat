@@ -1249,6 +1249,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if req.ProjectRoot != "" {
 			systemPrompt += appendWorkingDirectoryBlock(req.ProjectRoot)
 		}
+		if req.SubagentType != "" {
+			systemPrompt += "\n\n" + buildSubagentGuardPrompt(req.SubagentType, req.SubagentTaskID)
+		}
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))})
 		// P3-1: announce "busy" now that the system prompt
 		// is assembled and the first LLM call is imminent.
@@ -1536,6 +1539,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// text-only round via forceSummaryRound.
 			roundLimit := resolveRoundLimit(maxRounds, longRunMode, len(currentTodos) > 0)
 			isLastRound := req.PlanMode || forceSummaryRound || (roundLimit > 0 && round >= roundLimit)
+
+			if req.SubagentType != "" && !isLastRound && subagentProgressReminderDue(round) {
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: buildSubagentProgressReminder(req, round),
+				})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:    "llm",
+					Step:     "subagent-progress-reminder",
+					Message:  fmt.Sprintf("子代理已运行 %d 轮，已注入聚焦与进度提醒。", round),
+					Round:    roundNum,
+					MaxRound: roundLimit,
+				})
+			}
 
 			// Pre-limit warning: when within 10 rounds of the
 			// cap, inject a gentle heads-up so the LLM can wrap

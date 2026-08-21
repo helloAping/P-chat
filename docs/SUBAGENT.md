@@ -82,10 +82,17 @@ The sub-agent gets:
   `~/.p-chat/config.json`. Empty / `"0"` / invalid values disable
   the sub-agent-specific wall-clock deadline; normal cancellation is
   driven by user stop, parent turn cancellation, stream stall
-  detection, per-tool timeouts, failure breakers, and the sub-agent
-  round cap. The `task` orchestration tool itself also has no default
-  per-tool deadline, so it no longer inherits the ordinary 5-minute
-  tool timeout.
+  detection, per-tool timeouts, failure breakers, no-progress guards,
+  and the shared round policy inherited from the parent/config. The
+  `task` orchestration tool itself also has no default per-tool
+  deadline, so it no longer inherits the ordinary 5-minute tool
+  timeout.
+- **A shared sub-agent execution contract** appended by the agent loop:
+  stay within the delegated task, avoid repeated failed paths, keep
+  progress compact, and return partial findings if interrupted. Long
+  child runs receive soft progress reminders at round 50 and every 50
+  rounds after that; these reminders guide behavior but do not stop the
+  run.
 - **A fresh event channel** so the parent's UI can stream
   the sub-agent's progress in real time.
 
