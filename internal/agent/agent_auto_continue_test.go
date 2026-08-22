@@ -440,6 +440,66 @@ func TestNormalizeToolCallIDs(t *testing.T) {
 	})
 }
 
+func TestNormalizeToolCallArgsJSON(t *testing.T) {
+	cases := []struct {
+		name     string
+		toolName string
+		args     string
+		want     string
+	}{
+		{
+			name:     "valid object unchanged",
+			toolName: "exec_command",
+			args:     `{"command":"go test ./..."}`,
+			want:     `{"command":"go test ./..."}`,
+		},
+		{
+			name:     "empty becomes object",
+			toolName: "read_file",
+			args:     "",
+			want:     `{}`,
+		},
+		{
+			name:     "null becomes object",
+			toolName: "read_file",
+			args:     "null",
+			want:     `{}`,
+		},
+		{
+			name:     "bare exec command becomes command object",
+			toolName: "exec_command",
+			args:     `go test ./...`,
+			want:     `{"command":"go test ./..."}`,
+		},
+		{
+			name:     "json string read_file becomes path object",
+			toolName: "read_file",
+			args:     `"internal/agent/agent.go"`,
+			want:     `{"path":"internal/agent/agent.go"}`,
+		},
+		{
+			name:     "unknown malformed falls back to empty object",
+			toolName: "unknown",
+			args:     `{bad`,
+			want:     `{}`,
+		},
+		{
+			name:     "malformed structured exec args are not treated as command text",
+			toolName: "exec_command",
+			args:     `{"command":"go test ./...`,
+			want:     `{}`,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeToolCallArgsJSON(tt.toolName, tt.args); got != tt.want {
+				t.Fatalf("normalizeToolCallArgsJSON() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestChatRequest_AutoContinueJSONTag locks the JSON wire
 // format used by the server's PATCH /sessions/:id endpoint.
 // The frontend sends `{"auto_continue": false}`; if the tag

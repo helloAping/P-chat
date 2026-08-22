@@ -1,15 +1,21 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
-import { Activity, AlertCircle, Bot, CheckCircle2, Loader2, RotateCw, X, XCircle } from './icons'
+import { Activity, AlertCircle, Bot, CheckCircle2, ChevronDown, ChevronUp, Loader2, RotateCw, X, XCircle } from './icons'
 import {
   cancelSubAgentJob,
   listSubAgentJobs,
+  streamSubAgentJobEvents,
   type SubAgentJob,
+  type SubAgentJobEvent,
 } from '../api/client'
 
 const props = defineProps<{
   sessionId?: string
+}>()
+
+const emit = defineEmits<{
+  (e: 'job-terminal', job: SubAgentJob): void
 }>()
 
 const message = useMessage()
@@ -17,15 +23,35 @@ const jobs = ref<SubAgentJob[]>([])
 const loading = ref(false)
 const error = ref('')
 const cancelling = ref<Record<string, boolean>>({})
+const collapsed = ref(readCollapsedState())
+const dismissed = ref(false)
+const eventConnected = ref(false)
 let pollTimer: number | null = null
+let retryTimer: number | null = null
+let eventCtrl: AbortController | null = null
 let requestSeq = 0
 
 const visibleJobs = computed(() => jobs.value.slice(0, 5))
 const activeJobs = computed(() => jobs.value.filter(isActiveJob))
 const hasJobs = computed(() => jobs.value.length > 0)
+const panelVisible = computed(() => (hasJobs.value || error.value) && !dismissed.value)
+const summaryText = computed(() => {
+  if (activeJobs.value.length > 0) return `${activeJobs.value.length} 个任务运行中`
+  if (jobs.value.length > 0) return `${jobs.value.length} 个最近任务`
+  return '暂无后台任务'
+})
+
+function readCollapsedState(): boolean {
+  if (typeof window === 'undefined') return false
+  return window.localStorage.getItem('pchat.subagentJobs.collapsed') === '1'
+}
 
 function isActiveJob(job: SubAgentJob): boolean {
   return job.status === 'queued' || job.status === 'running'
+}
+
+function isTerminalJob(job: SubAgentJob): boolean {
+  return job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled'
 }
 
 function jobLabel(job: SubAgentJob): string {
@@ -82,6 +108,50 @@ function formatTime(value?: string): string {
   return t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+function sortJobs(items: SubAgentJob[]): SubAgentJob[] {
+  return [...items].sort((a, b) => {
+    const at = new Date(a.created_at || '').getTime() || 0
+    const bt = new Date(b.created_at || '').getTime() || 0
+    return bt - at
+  })
+}
+
+function upsertJob(job: SubAgentJob) {
+  const idx = jobs.value.findIndex((j) => j.task_id === job.task_id)
+  if (idx >= 0) {
+    const next = [...jobs.value]
+    next[idx] = job
+    jobs.value = sortJobs(next).slice(0, 20)
+    return
+  }
+  jobs.value = sortJobs([job, ...jobs.value]).slice(0, 20)
+}
+
+function notifyTerminal(job: SubAgentJob) {
+  if (job.status === 'succeeded') {
+    message.success(`后台子代理已完成：${jobLabel(job)}`)
+  } else if (job.status === 'failed') {
+    message.error(`后台子代理失败：${jobLabel(job)}`)
+  }
+  emit('job-terminal', job)
+}
+
+function handleJobEvent(ev: SubAgentJobEvent) {
+  if (ev.type === 'heartbeat' || !ev.job || !ev.job.task_id) return
+  const previous = jobs.value.find((j) => j.task_id === ev.job?.task_id)
+  const wasActive = previous ? isActiveJob(previous) : false
+  upsertJob(ev.job)
+  if (isActiveJob(ev.job) && (!previous || ev.type === 'created')) {
+    dismissed.value = false
+  }
+  if (isTerminalJob(ev.job) && (wasActive || !previous)) {
+    if (activeJobs.value.length === 0) {
+      collapsed.value = true
+    }
+    notifyTerminal(ev.job)
+  }
+}
+
 async function refresh(silent = false) {
   const seq = ++requestSeq
   const sessionId = props.sessionId
@@ -96,7 +166,7 @@ async function refresh(silent = false) {
   try {
     const res = await listSubAgentJobs(sessionId, 20)
     if (seq !== requestSeq) return
-    jobs.value = res.jobs || []
+    jobs.value = sortJobs(res.jobs || [])
   } catch (e: any) {
     if (seq !== requestSeq) return
     error.value = e?.message || String(e)
@@ -122,6 +192,14 @@ async function cancelJob(job: SubAgentJob) {
   }
 }
 
+function toggleCollapsed() {
+  collapsed.value = !collapsed.value
+}
+
+function hidePanel() {
+  dismissed.value = true
+}
+
 function clearPoll() {
   if (pollTimer !== null) {
     window.clearInterval(pollTimer)
@@ -131,17 +209,62 @@ function clearPoll() {
 
 function ensurePoll() {
   clearPoll()
-  if (!props.sessionId) return
+  if (!props.sessionId || eventConnected.value) return
   pollTimer = window.setInterval(() => {
     refresh(true)
-  }, activeJobs.value.length > 0 ? 2500 : 8000)
+  }, activeJobs.value.length > 0 ? 5000 : 30000)
+}
+
+function clearRetry() {
+  if (retryTimer !== null) {
+    window.clearTimeout(retryTimer)
+    retryTimer = null
+  }
+}
+
+function stopEventStream() {
+  clearRetry()
+  if (eventCtrl) {
+    eventCtrl.abort()
+    eventCtrl = null
+  }
+  eventConnected.value = false
+}
+
+function startEventStream() {
+  stopEventStream()
+  const sessionId = props.sessionId
+  if (!sessionId) return
+  const ctrl = new AbortController()
+  eventCtrl = ctrl
+  eventConnected.value = true
+  clearPoll()
+  streamSubAgentJobEvents(sessionId, handleJobEvent, ctrl.signal)
+    .then(() => {
+      if (ctrl.signal.aborted) return
+      eventConnected.value = false
+      ensurePoll()
+      retryTimer = window.setTimeout(startEventStream, activeJobs.value.length > 0 ? 3000 : 10000)
+    })
+    .catch((e: any) => {
+      if (ctrl.signal.aborted) return
+      eventConnected.value = false
+      console.warn('subagent job event stream failed:', e)
+      ensurePoll()
+      retryTimer = window.setTimeout(startEventStream, activeJobs.value.length > 0 ? 3000 : 10000)
+    })
 }
 
 watch(
   () => props.sessionId,
   () => {
+    stopEventStream()
     clearPoll()
-    refresh(true).finally(ensurePoll)
+    dismissed.value = false
+    refresh(true).finally(() => {
+      startEventStream()
+      ensurePoll()
+    })
   },
   { immediate: true },
 )
@@ -151,7 +274,14 @@ watch(
   () => ensurePoll(),
 )
 
+watch(collapsed, (value) => {
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem('pchat.subagentJobs.collapsed', value ? '1' : '0')
+  }
+})
+
 onBeforeUnmount(() => {
+  stopEventStream()
   clearPoll()
   requestSeq++
 })
@@ -159,29 +289,54 @@ onBeforeUnmount(() => {
 
 <template>
   <Transition name="subagent-jobs">
-    <section v-if="hasJobs || error" class="subagent-jobs" aria-label="后台子代理任务">
+    <section
+      v-if="panelVisible"
+      class="subagent-jobs"
+      :class="{ 'subagent-jobs--collapsed': collapsed }"
+      aria-label="后台子代理任务"
+    >
       <div class="jobs-header">
-        <div class="jobs-title">
+        <button
+          class="jobs-title jobs-title-button"
+          type="button"
+          :aria-expanded="!collapsed"
+          :title="collapsed ? '展开后台子代理任务' : '收缩后台子代理任务'"
+          @click="toggleCollapsed"
+        >
           <Bot :size="15" />
           <span>后台子代理</span>
           <span v-if="activeJobs.length" class="active-count">{{ activeJobs.length }}</span>
-        </div>
-        <button
-          class="icon-btn"
-          type="button"
-          aria-label="刷新后台子代理任务"
-          title="刷新"
-          :disabled="loading"
-          @click="refresh(false)"
-        >
-          <RotateCw :size="15" :class="{ spinning: loading }" />
+          <span v-if="collapsed" class="jobs-summary">{{ summaryText }}</span>
+          <ChevronDown v-if="collapsed" :size="14" class="jobs-caret" />
+          <ChevronUp v-else :size="14" class="jobs-caret" />
         </button>
+        <div class="jobs-actions">
+          <button
+            class="icon-btn"
+            type="button"
+            aria-label="刷新后台子代理任务"
+            title="刷新"
+            :disabled="loading"
+            @click="refresh(false)"
+          >
+            <RotateCw :size="15" :class="{ spinning: loading }" />
+          </button>
+          <button
+            class="icon-btn"
+            type="button"
+            aria-label="隐藏后台子代理任务"
+            title="隐藏"
+            @click="hidePanel"
+          >
+            <X :size="15" />
+          </button>
+        </div>
       </div>
-      <div v-if="error" class="jobs-error">
+      <div v-if="error && !collapsed" class="jobs-error">
         <AlertCircle :size="14" />
         <span>{{ error }}</span>
       </div>
-      <div v-else class="jobs-list">
+      <div v-else-if="!collapsed" class="jobs-list">
         <div
           v-for="job in visibleJobs"
           :key="job.id"
@@ -233,6 +388,11 @@ onBeforeUnmount(() => {
   padding: 8px 14px;
 }
 
+.subagent-jobs--collapsed {
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
 .jobs-header {
   display: flex;
   align-items: center;
@@ -249,6 +409,41 @@ onBeforeUnmount(() => {
   color: var(--text-primary);
   font-size: 12.5px;
   font-weight: 600;
+}
+
+.jobs-title-button {
+  flex: 1 1 auto;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.jobs-title-button:hover {
+  color: var(--brand-600);
+}
+
+.jobs-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.jobs-caret {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+}
+
+.jobs-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 0 0 auto;
 }
 
 .active-count {

@@ -59,6 +59,7 @@ import * as api from '../api/client'
 import { state, regenerateMessage, fetchReplies, activateReply } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
+import ToolCallGroup from './ToolCallGroup.vue'
 import SubAgentCard from './SubAgentCard.vue'
 import QuestionTable from './QuestionTable.vue'
 import ExecOutputCard from './ExecOutputCard.vue'
@@ -67,6 +68,7 @@ import {
   copyImageToClipboard, copyText, downloadBlob, downloadFromUrl,
   extensionForMime, fetchAsBlob,
 } from '../utils/clipboard'
+import { groupConsecutiveToolParts } from '../utils/toolPartGrouping'
 
 const dialog = useDialog()
 
@@ -256,6 +258,7 @@ const visibleParts = computed(() => {
   const start = partWindowStart.value
   return parts.slice(start).map((part, offset) => ({ part, index: start + offset }))
 })
+const visibleRenderEntries = computed(() => groupConsecutiveToolParts(visibleParts.value))
 function showEarlierParts() {
   revealedEarlierParts.value += PART_RENDER_WINDOW
 }
@@ -1235,33 +1238,42 @@ function findPrecedingUserMessageId(): number {
               >
                 已折叠 {{ hiddenPartCount }} 条过程记录
               </button>
-              <template v-for="entry in visibleParts" :key="entry.index">
-                <ThinkingBlock
-                  v-if="entry.part.kind === 'thinking'"
-                  :part="entry.part"
-                  :default-open="isLiveThinkingPart(entry.index, entry.part.kind, message.parts)"
+              <template
+                v-for="entry in visibleRenderEntries"
+                :key="entry.kind === 'tool_group' ? `tool-group-${entry.startIndex}` : entry.index"
+              >
+                <ToolCallGroup
+                  v-if="entry.kind === 'tool_group'"
+                  :parts="entry.parts"
                 />
-                <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
-                <SubAgentCard v-else-if="entry.part.kind === 'sub_agent'" :part="entry.part" />
-                <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
-                <TypedText
-                  v-else-if="entry.part.kind === 'text' && isLiveTextPart(entry.index, entry.part.kind, message.parts)"
-                  :text="entry.part.text || ''"
-                  :active="true"
-                />
-                <div v-else-if="entry.part.kind === 'text'">
-                  <div
-                    ref="mdBodyEl"
-                    class="md-body"
-                    v-html="renderMd(textPartForRender(entry.part))"
-                    @click="onMarkdownClick"
-                  ></div>
-                  <button
-                    v-if="textPartTruncated(entry.part) && !textPartExpanded(entry.index)"
-                    class="md-expand-btn"
-                    @click.stop="expandTextPart(entry.index)"
-                  >展开全文 ({{ textPartFullLen(entry.part) }} 字)</button>
-                </div>
+                <template v-else>
+                  <ThinkingBlock
+                    v-if="entry.part.kind === 'thinking'"
+                    :part="entry.part"
+                    :default-open="isLiveThinkingPart(entry.index, entry.part.kind, message.parts)"
+                  />
+                  <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
+                  <SubAgentCard v-else-if="entry.part.kind === 'sub_agent'" :part="entry.part" />
+                  <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
+                  <TypedText
+                    v-else-if="entry.part.kind === 'text' && isLiveTextPart(entry.index, entry.part.kind, message.parts)"
+                    :text="entry.part.text || ''"
+                    :active="true"
+                  />
+                  <div v-else-if="entry.part.kind === 'text'">
+                    <div
+                      ref="mdBodyEl"
+                      class="md-body"
+                      v-html="renderMd(textPartForRender(entry.part))"
+                      @click="onMarkdownClick"
+                    ></div>
+                    <button
+                      v-if="textPartTruncated(entry.part) && !textPartExpanded(entry.index)"
+                      class="md-expand-btn"
+                      @click.stop="expandTextPart(entry.index)"
+                    >展开全文 ({{ textPartFullLen(entry.part) }} 字)</button>
+                  </div>
+                </template>
               </template>
             </template>
             <template v-else-if="message.content">

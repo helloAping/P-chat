@@ -271,6 +271,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/sessions/:id/todos", h.GetTodos)
 		api.DELETE("/sessions/:id/todos", h.ClearTodos)
 		api.GET("/sessions/:id/subagent-jobs", h.ListSubagentJobs)
+		api.GET("/sessions/:id/subagent-jobs/events", h.SubagentJobEvents)
 		api.GET("/sessions/:id/subagent-jobs/:task_id", h.GetSubagentJob)
 		api.POST("/sessions/:id/subagent-jobs/:task_id/cancel", h.CancelSubagentJob)
 		api.POST("/sessions/:id/question-response", h.QuestionResponse)

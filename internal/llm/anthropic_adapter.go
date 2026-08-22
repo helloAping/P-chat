@@ -110,10 +110,7 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			// assistant turn, so the user-side merge pointer
 			// (lastUserResultIdx) is invalidated.
 			lastUserResultIdx = -1
-			inputJSON := json.RawMessage(msg.ToolInput)
-			if inputJSON == nil {
-				inputJSON = json.RawMessage("{}")
-			}
+			inputJSON := json.RawMessage(SafeToolInputJSON(msg.ToolInput))
 			toolUseBlock := map[string]any{
 				"type":  "tool_use",
 				"id":    msg.ToolID,

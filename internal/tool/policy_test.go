@@ -19,8 +19,8 @@ func TestEffectivePolicyClassifiesBuiltins(t *testing.T) {
 	if task.Timeout() != 0 {
 		t.Fatalf("task timeout = %v, want no per-tool deadline", task.Timeout())
 	}
-	if task.CanRunInParallel() || task.Category != ToolCategoryOrchestration {
-		t.Fatalf("task policy = %#v, want exclusive orchestration", task)
+	if !task.CanRunInParallel() || task.Category != ToolCategoryOrchestration {
+		t.Fatalf("task policy = %#v, want parallel orchestration", task)
 	}
 }
 

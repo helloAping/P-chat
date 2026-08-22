@@ -158,17 +158,16 @@ type partsAccumulator struct {
 	// their own nested parts inside sub.Parts; we never recurse
 	// at the accumulator level.
 	parts []MessagePart
-	// activeSub is the index in `parts` of the most-recently
-	// opened sub-agent card (status == "start"). Cleared when
-	// the matching sub_agent_ok / sub_agent_err arrives. Only
-	// one level deep — sub-agents cannot spawn sub-agents in
-	// practice.
-	activeSub int
-	activeSet bool
+	// activeSubByKey maps a running sub-agent identity to its
+	// top-level part index. Use task_id when available and fall
+	// back to the human task text for legacy events. Multiple
+	// sibling sub-agents can run concurrently, so a single
+	// "current active sub-agent" slot is not enough.
+	activeSubByKey map[string]int
 }
 
 func newPartsAccumulator() *partsAccumulator {
-	return &partsAccumulator{activeSub: -1}
+	return &partsAccumulator{activeSubByKey: make(map[string]int)}
 }
 
 // lastIndexOfKind returns the index of the trailing part of the
@@ -217,20 +216,119 @@ func mustMarshalRaw(rr []json.RawMessage) json.RawMessage {
 	return out
 }
 
-// activeSubParts returns the inner parts list of the active
-// sub-agent, or the top-level parts if no sub-agent is active.
-func (a *partsAccumulator) activeParts() []MessagePart {
-	if a.activeSet {
-		return a.parts[a.activeSub].Parts
+func subAgentIDKey(taskID string) string {
+	if taskID == "" {
+		return ""
 	}
-	return a.parts
+	return "id:" + taskID
 }
 
-// setActiveParts writes the (possibly new) inner parts list back
-// to the active sub-agent, or to the top-level slice otherwise.
-func (a *partsAccumulator) setActiveParts(p []MessagePart) {
-	if a.activeSet {
-		a.parts[a.activeSub].Parts = p
+func subAgentTaskKey(task string) string {
+	if task == "" {
+		return ""
+	}
+	return "task:" + task
+}
+
+func (a *partsAccumulator) rememberSubAgent(idx int) {
+	if idx < 0 || idx >= len(a.parts) {
+		return
+	}
+	if a.activeSubByKey == nil {
+		a.activeSubByKey = make(map[string]int)
+	}
+	p := a.parts[idx]
+	if key := subAgentIDKey(p.TaskID); key != "" {
+		a.activeSubByKey[key] = idx
+	}
+	if key := subAgentTaskKey(p.Task); key != "" {
+		a.activeSubByKey[key] = idx
+	}
+}
+
+func (a *partsAccumulator) forgetSubAgent(idx int) {
+	if idx < 0 || idx >= len(a.parts) || a.activeSubByKey == nil {
+		return
+	}
+	p := a.parts[idx]
+	if key := subAgentIDKey(p.TaskID); key != "" {
+		if a.activeSubByKey[key] == idx {
+			delete(a.activeSubByKey, key)
+		}
+	}
+	if key := subAgentTaskKey(p.Task); key != "" {
+		if a.activeSubByKey[key] == idx {
+			delete(a.activeSubByKey, key)
+		}
+	}
+}
+
+func (a *partsAccumulator) findSubAgentIndex(c ChatStreamChunk) int {
+	if !c.SubAgent {
+		return -1
+	}
+	if a.activeSubByKey != nil {
+		if key := subAgentIDKey(c.SubAgentTaskID); key != "" {
+			if idx, ok := a.activeSubByKey[key]; ok && idx >= 0 && idx < len(a.parts) {
+				return idx
+			}
+		}
+		if key := subAgentTaskKey(c.SubAgentTask); key != "" {
+			if idx, ok := a.activeSubByKey[key]; ok && idx >= 0 && idx < len(a.parts) {
+				return idx
+			}
+		}
+	}
+	for i := len(a.parts) - 1; i >= 0; i-- {
+		p := a.parts[i]
+		if p.Kind != "sub_agent" {
+			continue
+		}
+		if c.SubAgentTaskID != "" && p.TaskID == c.SubAgentTaskID {
+			return i
+		}
+		if c.SubAgentTask != "" && p.Task == c.SubAgentTask {
+			return i
+		}
+	}
+	return -1
+}
+
+func (a *partsAccumulator) newSubAgentPart(c ChatStreamChunk) MessagePart {
+	return MessagePart{
+		Kind:             "sub_agent",
+		Task:             c.SubAgentTask,
+		Status:           "start",
+		AgentType:        c.SubAgentType,
+		AgentColor:       c.SubAgentColor,
+		AgentModel:       c.SubAgentModel,
+		AgentDescription: c.SubAgentDescription,
+		TaskID:           c.SubAgentTaskID,
+		Parts:            nil,
+	}
+}
+
+// activePartsFor returns the destination parts list for this chunk.
+// Sub-agent chunks are routed by task_id/task text; parent chunks always
+// stay at the top level even while sub-agents are running concurrently.
+func (a *partsAccumulator) activePartsFor(c ChatStreamChunk) ([]MessagePart, int) {
+	if c.SubAgent {
+		if idx := a.findSubAgentIndex(c); idx >= 0 {
+			return a.parts[idx].Parts, idx
+		}
+		if c.SubAgentTask != "" || c.SubAgentTaskID != "" {
+			a.parts = append(a.parts, a.newSubAgentPart(c))
+			idx := len(a.parts) - 1
+			a.rememberSubAgent(idx)
+			return a.parts[idx].Parts, idx
+		}
+	}
+	return a.parts, -1
+}
+
+func (a *partsAccumulator) setPartsFor(subIdx int, p []MessagePart) {
+	if subIdx >= 0 {
+		a.parts[subIdx].Parts = p
 	} else {
 		a.parts = p
 	}
@@ -264,34 +362,15 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	// with SubAgent=true; the SubAgentStatus is the gate.)
 	if c.SubAgent && c.SubAgentStatus != "" {
 		if c.SubAgentStatus == "start" {
-			// Push a new sub_agent part and mark it as the
-			// active sink for nested events. A sub-agent's
-			// first chunk is the "start" lifecycle event, so
-			// this also ensures the part exists for any
-			// nested content / thinking that follows.
-			sub := MessagePart{
-				Kind:             "sub_agent",
-				Task:             c.SubAgentTask,
-				Status:           "start",
-				AgentType:        c.SubAgentType,
-				AgentColor:       c.SubAgentColor,
-				AgentModel:       c.SubAgentModel,
-				AgentDescription: c.SubAgentDescription,
-				TaskID:           c.SubAgentTaskID,
-				Parts:            nil,
-			}
-			a.parts = append(a.parts, sub)
-			a.activeSub = len(a.parts) - 1
-			a.activeSet = true
+			a.parts = append(a.parts, a.newSubAgentPart(c))
+			a.rememberSubAgent(len(a.parts) - 1)
 			return
 		}
-		// ok / err — find the matching sub-agent part. We
-		// match by Task + Status=="start" so concurrent
-		// sub-agents (theoretically) don't trip each other.
-		for i := len(a.parts) - 1; i >= 0; i-- {
-			if a.parts[i].Kind != "sub_agent" || a.parts[i].Task != c.SubAgentTask || a.parts[i].Status != "start" {
-				continue
-			}
+		// ok / err — find the matching sub-agent part by
+		// task_id first and task text second. Multiple sibling
+		// sub-agents can run concurrently, so close events must
+		// not clear a global active slot.
+		if i := a.findSubAgentIndex(c); i >= 0 && a.parts[i].Status == "start" {
 			a.parts[i].Status = c.SubAgentStatus
 			if c.Duration != "" {
 				a.parts[i].Elapsed = c.Duration
@@ -305,6 +384,9 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			}
 			if c.SubAgentColor != "" && a.parts[i].AgentColor == "" {
 				a.parts[i].AgentColor = c.SubAgentColor
+			}
+			if c.SubAgentTaskID != "" && a.parts[i].TaskID == "" {
+				a.parts[i].TaskID = c.SubAgentTaskID
 			}
 			// ★ 清除嵌套 thinking parts 的 streaming flag。
 			// 子代理的 Done chunk 不再转发到 partsAcc（subagent.go
@@ -323,8 +405,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 					a.parts[i].Parts[j].Streaming = false
 				}
 			}
-			a.activeSet = false
-			a.activeSub = -1
+			a.forgetSubAgent(i)
 			return
 		}
 		// Unknown task — drop.
@@ -350,13 +431,17 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			if c.SubAgentColor != "" && a.parts[i].AgentColor == "" {
 				a.parts[i].AgentColor = c.SubAgentColor
 			}
+			if c.SubAgentTaskID != "" && a.parts[i].TaskID == "" {
+				a.parts[i].TaskID = c.SubAgentTaskID
+				a.rememberSubAgent(i)
+			}
 			break
 		}
 	}
 
 	// Tool call: start / ok / warn / error.
 	if c.ToolName != "" {
-		parts := a.activeParts()
+		parts, subIdx := a.activePartsFor(c)
 		status := ToolStatusFromStep(c.Step, c.ToolError)
 		if status == "start" {
 			// When a ToolID is present, avoid clobbering an
@@ -371,7 +456,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 					if c.ToolArgs != "" {
 						parts[i].Args = c.ToolArgs
 					}
-					a.setActiveParts(parts)
+					a.setPartsFor(subIdx, parts)
 					return
 				}
 			} else if i := len(parts) - 1; i >= 0 &&
@@ -381,7 +466,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 				if c.ToolArgs != "" {
 					parts[i].Args = c.ToolArgs
 				}
-				a.setActiveParts(parts)
+				a.setPartsFor(subIdx, parts)
 				return
 			}
 			parts = append(parts, MessagePart{
@@ -391,7 +476,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 				Status: "start",
 				ToolID: c.ToolID,
 			})
-			a.setActiveParts(parts)
+			a.setPartsFor(subIdx, parts)
 			return
 		}
 		// ok / warn / error — exact match by ID, fallback to
@@ -411,7 +496,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 					p.Args = c.ToolArgs
 				}
 				parts[i] = p
-				a.setActiveParts(parts)
+				a.setPartsFor(subIdx, parts)
 				return
 			}
 		}
@@ -428,7 +513,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			Elapsed: c.ToolElapsed,
 			ToolID:  c.ToolID,
 		})
-		a.setActiveParts(parts)
+		a.setPartsFor(subIdx, parts)
 		return
 	}
 
@@ -449,7 +534,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	// fix below addresses from the other side. Both
 	// guards need to be present.
 	if c.Thinking != "" {
-		parts := a.activeParts()
+		parts, subIdx := a.activePartsFor(c)
 		if i := lastIndexOfKind(parts, "thinking"); i >= 0 && parts[i].Streaming {
 			appendPartText(&parts[i], c.Thinking)
 		} else {
@@ -459,7 +544,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 				textBuffer: append([]byte(nil), c.Thinking...),
 			})
 		}
-		a.setActiveParts(parts)
+		a.setPartsFor(subIdx, parts)
 		return
 	}
 
@@ -488,7 +573,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	// mid-content thinking delta is the pre-existing
 	// quirk (the spec doesn't define interleaving).
 	if c.Content != "" {
-		parts := a.activeParts()
+		parts, subIdx := a.activePartsFor(c)
 		if i := lastIndexOfKind(parts, "thinking"); i >= 0 && parts[i].Streaming {
 			parts[i].Streaming = false
 		}
@@ -500,7 +585,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 				textBuffer: append([]byte(nil), c.Content...),
 			})
 		}
-		a.setActiveParts(parts)
+		a.setPartsFor(subIdx, parts)
 		return
 	}
 
@@ -539,7 +624,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		}
 		if err := json.Unmarshal([]byte(c.QuestionJSON), &resultPayload); err == nil &&
 			len(resultPayload.Answers) > 0 {
-			parts := a.activeParts()
+			parts, subIdx := a.activePartsFor(c)
 			if i := lastIndexOfKind(parts, "question"); i >= 0 {
 				tail := parts[i]
 				if tail.QuestionStatus == "" || tail.QuestionStatus == "open" {
@@ -560,7 +645,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 					tail.Name = string(ans)
 					tail.QuestionStatus = "ok"
 					parts[i] = tail
-					a.setActiveParts(parts)
+					a.setPartsFor(subIdx, parts)
 					return
 				}
 			}
@@ -590,13 +675,13 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		canonical, _ := json.Marshal(map[string]json.RawMessage{
 			"questions": mustMarshalRaw(questionsArr),
 		})
-		parts := a.activeParts()
+		parts, subIdx := a.activePartsFor(c)
 		parts = append(parts, MessagePart{
 			Kind:           "question",
 			Text:           string(canonical),
 			QuestionStatus: "open",
 		})
-		a.setActiveParts(parts)
+		a.setPartsFor(subIdx, parts)
 		return
 	}
 
@@ -608,27 +693,27 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	// reappear on session reload (the frontend's scrubbing in
 	// switchSession is a secondary defense, not the primary).
 	if c.ContentRewrite != "" {
-		parts := a.activeParts()
+		parts, subIdx := a.activePartsFor(c)
 		for i := len(parts) - 1; i >= 0; i-- {
 			if parts[i].Kind == "text" {
 				replacePartText(&parts[i], c.ContentRewrite)
 				break
 			}
 		}
-		a.setActiveParts(parts)
+		a.setPartsFor(subIdx, parts)
 		return
 	}
 
 	// ThinkingRewrite: same pattern for the thinking block.
 	if c.ThinkingRewrite != "" {
-		parts := a.activeParts()
+		parts, subIdx := a.activePartsFor(c)
 		for i := len(parts) - 1; i >= 0; i-- {
 			if parts[i].Kind == "thinking" {
 				replacePartText(&parts[i], c.ThinkingRewrite)
 				break
 			}
 		}
-		a.setActiveParts(parts)
+		a.setPartsFor(subIdx, parts)
 		return
 	}
 

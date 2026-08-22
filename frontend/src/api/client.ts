@@ -644,6 +644,11 @@ export interface SubAgentJobCancelResponse {
   cancelled_live: boolean
 }
 
+export interface SubAgentJobEvent extends StreamEventLike {
+  type: 'created' | 'updated' | 'heartbeat' | string
+  job?: SubAgentJob
+}
+
 // listMessages fetches a page of session history. Omit
 // `opts` to get the full history (first open after reload —
 // the server applies the context-window cap automatically).
@@ -676,6 +681,28 @@ export const cancelSubAgentJob = (sessionId: string, taskId: string) =>
     `/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs/${encodeURIComponent(taskId)}/cancel`,
     { method: 'POST' },
   )
+
+export async function streamSubAgentJobEvents(
+  sessionId: string,
+  onEvent: (ev: SubAgentJobEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = await waitForDirectBackend()
+  const resp = await fetch(`${base}/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs/events`, {
+    method: 'GET',
+    headers: { Accept: 'text/event-stream' },
+    signal,
+  })
+  if (!resp.ok || !resp.body) {
+    throw new Error(`subagent job events: HTTP ${resp.status}: ${resp.statusText}`)
+  }
+  await consumeSSEStream<SubAgentJobEvent>({
+    reader: resp.body.getReader(),
+    signal,
+    label: 'subagent-job-events',
+    onEvent,
+  })
+}
 
 // --- Archive ---
 export const archiveSession = (id: string) =>

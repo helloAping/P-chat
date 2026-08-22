@@ -26,6 +26,7 @@ func TestBuildSubagentGuardPrompt_ScopesChildAgent(t *testing.T) {
 		"Task id: task-123",
 		"Stay inside the assigned sub-task",
 		"Every tool call must directly advance",
+		"one high-signal read/search command",
 		"return the best partial result",
 	} {
 		if !strings.Contains(got, want) {

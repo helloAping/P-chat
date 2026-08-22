@@ -26,6 +26,46 @@ func TestPermissionLevelFromCtxUsesLiveSessionOverride(t *testing.T) {
 	}
 }
 
+func TestIsolatedPermissionLevelIgnoresLiveSessionOverride(t *testing.T) {
+	sessionID := "permission-isolated-" + time.Now().Format("150405.000000000")
+	ctx := WithSessionID(
+		WithIsolatedPermissionLevel(context.Background(), PermissionAsk),
+		sessionID,
+	)
+
+	SetSessionPermissionLevel(sessionID, PermissionFull)
+	t.Cleanup(func() { SetSessionPermissionLevel(sessionID, "") })
+
+	if got := PermissionLevelFromCtx(ctx); got != PermissionAsk {
+		t.Fatalf("PermissionLevelFromCtx = %q, want %q", got, PermissionAsk)
+	}
+}
+
+func TestRequireConfirmParentAuthorityOnlyFailsClosed(t *testing.T) {
+	emitted := false
+	ctx := WithParentAuthorityOnly(
+		WithConfirmEmitter(
+			WithSessionID(context.Background(), "subagent-confirm-test"),
+			func(ConfirmRequest) { emitted = true },
+		),
+	)
+
+	approved, err := RequireConfirm(ctx, ConfirmRequest{
+		ToolName:  "browser_click",
+		Args:      `{}`,
+		RiskLevel: "medium",
+	})
+	if err == nil {
+		t.Fatal("RequireConfirm returned nil error, want parent-approval error")
+	}
+	if approved {
+		t.Fatal("RequireConfirm approved in parent-authority-only mode")
+	}
+	if emitted {
+		t.Fatal("RequireConfirm emitted a child confirm event")
+	}
+}
+
 func TestConfirmAlwaysAllowStoresSessionRule(t *testing.T) {
 	sessionID := "confirm-always-" + time.Now().Format("150405.000000000")
 	req := ConfirmRequest{

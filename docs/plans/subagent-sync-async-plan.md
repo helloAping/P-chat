@@ -146,6 +146,38 @@ Use task_status with the same task_id to check progress.
 - 支持点击取消或刷新。
 - CLI 显示后台 job launched/completed/cancelled。
 
+### P6：子代理工具执行压缩与重复控制
+
+实际测试补充了第三类问题：子代理在一个工具组内连续发起大量语义相近的 `exec_command`，例如多次 `Get-Content -Encoding UTF8 internal\...`、多次 `Select-String -Path internal\...`、多次读取/搜索 `web\admin\...`。这些调用有成功也有失败，不是单纯失败重试，也不是前端重复渲染。
+
+当前防线的缺口：
+
+- `toolCallSignature()` 按完整 `ArgsJSON` 精确匹配；路径、行号、搜索词、输出过滤稍变就不算重复。
+- `normalizeToolFailureSig()` 只进入失败分支；成功工具不会参与失败归一化。
+- 同一轮内存在多条工具调用时，`sameToolErrCount` 不累计。
+- `noProgressGuard` 按“轮”观察重复读取，不能压缩同一轮内一次性发出的二十多条相近命令。
+- 混合成功/失败会被视为仍有进展，cross-turn 失败 streak 也可能被成功工具 reset。
+
+目标不是一刀切禁止工具，而是把“多次低信息量工具调用”压缩成“少数高信息量工具调用”。子代理仍然可以充分使用工具，但需要优先使用覆盖面更大的查询，避免反复用窄查询撞同一目标。
+
+建议执行语义：
+
+1. **先压缩，不先熔断**：检测到同一轮内多个相近只读命令时，优先合并/覆盖，而不是直接停止子代理。
+2. **按意图归一化**：给 `exec_command` 增加 operation fingerprint，例如 `read-file:<path>`、`search-file:<path>`、`search-tree:<root>`、`verify:go-test:<scope>`。归一化时剥离 PowerShell 包装、`2>&1`、`Select-Object -Last N`、`Write-Host exit`、纯展示管道等噪声。
+3. **同轮压缩**：在工具派发前扫描本轮 tool calls。对相同 fingerprint 的只读命令，执行覆盖范围最大/信息量最高的代表调用；其余 tool_call 返回合成 tool_result，说明“已由同组代表调用覆盖”，以保持 LLM 工具协议配对完整。
+4. **成功结果缓存**：同一子代理内，若已成功获得某 fingerprint 的结果，后续相近调用优先返回缓存摘要或提示使用已有结果，而不是再次执行。
+5. **失败结果不盲目重试**：同 fingerprint 失败后，允许一次不同策略重试；继续失败则引导切换工具或基于已有证据总结。
+6. **分级引导**：第一次发现低效重复时注入软提示，要求扩大查询或汇总；第二次仍重复时压缩执行；第三次仍重复时才强制进入总结轮。
+7. **只读范围优先**：P6 首期只处理子代理里的只读工具和只读 `exec_command`，不碰写入、编辑、删除、构建产物生成等有副作用命令。
+
+实施拆分：
+
+- P6a：新增 `operationFingerprint` 纯函数与测试，覆盖 `Get-Content`、`Select-String`、`go test`、输出过滤变体。
+- P6b：新增“同轮工具压缩器”，只对只读 `exec_command` 生效；被压缩的 tool_call 返回合成结果，确保每个 tool_call id 都有 tool_result。
+- P6c：新增子代理内 fingerprint 成功/失败缓存，避免跨轮重复执行同一意图。
+- P6d：扩展子代理 prompt，明确“优先用少量高覆盖工具完成调查；不要用多个窄查询反复读取同一目标；工具输出被截断时先改用更聚焦的单次查询，而不是连续发起多条近似查询”。
+- P6e：前端工具组展示增加“已压缩/已覆盖”状态，便于用户区分真实执行与协议占位结果。
+
 ## 当前执行顺序
 
-已完成 P0、P1、P2、P3a、P4 后端最小闭环。下一步进入 P5：前端/CLI 展示后台 job 状态、刷新/取消入口，以及完成通知体验。
+已完成 P0、P1、P2、P3a、P4 后端最小闭环。下一步进入 P5：前端/CLI 展示后台 job 状态、刷新/取消入口，以及完成通知体验。P6 作为新增质量改进线并行推进，优先级应高于纯展示优化，因为它直接影响子代理执行成本、上下文膨胀和长任务稳定性。

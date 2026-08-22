@@ -217,6 +217,24 @@ func TestOpenAIBuild_ToolResultResetsAssistant(t *testing.T) {
 	}
 }
 
+func TestOpenAIBuild_ToolCallArgumentsAreSafeJSONObjects(t *testing.T) {
+	a := NewOpenAIAdapter("https://api.example.com", "sk-test", "test")
+	msgs := []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "run tests"},
+		{Role: RoleAssistant, Type: TypeToolCall, ToolID: "call_bad", ToolName: "exec_command", ToolInput: `go test ./...`},
+		{Role: RoleTool, Type: TypeToolResult, ToolID: "call_bad", ToolName: "exec_command", Content: "ok"},
+	}
+	out := mustBuildOpenAI(t, a, msgs, "")
+	got := out.Messages[1].ToolCalls[0].Function.Arguments
+	if got != `{}` {
+		t.Fatalf("arguments = %q, want sanitized empty object for malformed history", got)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("arguments must be valid JSON object: %v", err)
+	}
+}
+
 // TestOpenAIBuild_SystemPrepended verifies the system prompt
 // becomes the first message and is not affected by the merge
 // logic.

@@ -38,6 +38,13 @@ type SubagentJob struct {
 	CancelledAt  time.Time `json:"cancelled_at,omitempty"`
 }
 
+// SubagentJobEvent is a lightweight process-local notification emitted when
+// an async subagent job changes state. Durable state remains in SubagentJob.
+type SubagentJobEvent struct {
+	Type string       `json:"type"`
+	Job  *SubagentJob `json:"job,omitempty"`
+}
+
 var subagentJobCounter atomic.Int64
 
 // CreateSubagentJob inserts a new asynchronous subagent job.

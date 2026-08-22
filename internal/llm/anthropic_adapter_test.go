@@ -168,6 +168,23 @@ func TestAnthropicBuild_ToolResultResetsAssistant(t *testing.T) {
 	}
 }
 
+func TestAnthropicBuild_ToolCallInputIsSafeJSONObject(t *testing.T) {
+	a := NewAnthropicAdapter("https://api.example.com", "sk-test", "test")
+	msgs := []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "run tests"},
+		{Role: RoleAssistant, Type: TypeToolCall, ToolID: "toolu_bad", ToolName: "exec_command", ToolInput: `go test ./...`},
+		{Role: RoleTool, Type: TypeToolResult, ToolID: "toolu_bad", ToolName: "exec_command", Content: "ok"},
+	}
+	out := mustBuildAnthropic(t, a, msgs, "")
+	blocks := extractBlocks(t, out.Messages[1].Content)
+	if len(blocks) != 1 || blocks[0].Type != "tool_use" {
+		t.Fatalf("assistant blocks = %+v, want one tool_use", blocks)
+	}
+	if got := strings.TrimSpace(string(blocks[0].Input)); got != `{}` {
+		t.Fatalf("tool_use input = %q, want sanitized empty object for malformed history", got)
+	}
+}
+
 // mustBodyAnthropic returns the raw request body bytes for the
 // given input. Used in error messages only.
 func mustBodyAnthropic(a *AnthropicAdapter, msgs []ChatMessage, system string) []byte {

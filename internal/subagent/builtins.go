@@ -48,7 +48,7 @@ const generalPurposePrompt = "You are a focused sub-agent spawned by a parent ag
 
 // explorePrompt is a read-only file search specialist. Mirrors
 // opencode's explore and Claude Code's Explore agent. Restricted
-// to read-only tools; cannot edit, write, or execute commands.
+// to project-local read tools; cannot edit, write, or execute commands.
 const explorePrompt = "You are a file search specialist. You excel at thoroughly navigating and exploring codebases.\n\n" +
 	"Your strengths:\n" +
 	"- Rapidly finding files using glob patterns\n" +
@@ -56,8 +56,7 @@ const explorePrompt = "You are a file search specialist. You excel at thoroughly
 	"- Reading and analyzing file contents\n\n" +
 	"Guidelines:\n" +
 	"- Use list_files for directory contents and read_file for individual files.\n" +
-	"- Use exec_command for grep/find/ls/git status/git log/git diff/cat/head/tail — read-only shell commands only. Do not modify any file or run any command that changes system state.\n" +
-	"- On Windows (the common desktop case), `find` and `ls` are NOT the Unix tools: `find` searches strings in files and `ls` does not exist. Prefer `dir` / `findstr` / `powershell Get-ChildItem` / `Select-String` / `type`. If a command fails, switch tools instead of retrying with variations.\n" +
+	"- Do not use shell commands. If shell search, git inspection, tests, or any process execution is necessary, return a concise request for the parent conversation to run it.\n" +
 	"- Adapt your search approach based on the thoroughness level specified by the caller.\n" +
 	"- Return file paths as absolute paths in your final response.\n" +
 	"- For clear communication, avoid using emojis.\n\n" +
@@ -69,9 +68,9 @@ const explorePrompt = "You are a file search specialist. You excel at thoroughly
 // framing (produce a plan, not just answers).
 const planPrompt = "You are a read-only architect agent. Your job is to produce a clear, actionable implementation plan for the user's request.\n\n" +
 	"You are READ-ONLY:\n" +
-	"- You can list files, read files, and run read-only shell commands (grep, find, ls, git status, git log, git diff, cat, head, tail).\n" +
+	"- You can list files and read files inside the assigned project.\n" +
 	"- You CANNOT edit, write, create, delete, or modify any file.\n" +
-	"- You CANNOT run commands that change system state.\n" +
+	"- You CANNOT run shell commands or start processes. If shell search, git inspection, tests, or any process execution is necessary, ask the parent conversation to decide.\n" +
 	"- You CANNOT call the 'task' tool or spawn sub-agents.\n\n" +
 	"When producing a plan:\n" +
 	"1. First, gather enough context to understand the current state. Search the codebase, read the relevant files, and form a clear picture of what exists.\n" +
@@ -103,7 +102,7 @@ func Builtins() []AgentInfo {
 			Description: "Fast read-only agent specialized for exploring codebases. Use for searches, file lookups, and codebase Q&A. Cannot modify files.",
 			Prompt:      explorePrompt,
 			Color:       "#44BA81",
-			Tools:       []string{"read_file", "list_files", "exec_command"},
+			Tools:       []string{"read_file", "list_files"},
 			Builtin:     true,
 			Source:      "builtin",
 		},
@@ -112,7 +111,7 @@ func Builtins() []AgentInfo {
 			Description: "Read-only architect that produces a step-by-step implementation plan. Use when you need a design before executing.",
 			Prompt:      planPrompt,
 			Color:       "#E8A33D",
-			Tools:       []string{"read_file", "list_files", "exec_command"},
+			Tools:       []string{"read_file", "list_files"},
 			Builtin:     true,
 			Source:      "builtin",
 		},

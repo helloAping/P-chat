@@ -112,7 +112,7 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 				Type: openai.ToolTypeFunction,
 				Function: openai.FunctionCall{
 					Name:      msg.ToolName,
-					Arguments: msg.ToolInput,
+					Arguments: SafeToolInputJSON(msg.ToolInput),
 				},
 			}
 			if la := lastAssistant(); la != nil {

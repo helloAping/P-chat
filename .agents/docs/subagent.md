@@ -44,6 +44,8 @@
 - **★ Done=true** — 本地消费，不转发（防止触发父 SSE 关闭）
 - **sub_agent_ok/err** — 关闭 SubAgentCard，status="ok"/"err"
 
+隔离约束：子代理内部工具事件只能更新嵌套 SubAgentCard。即使子代理暴露并调用 `todo_write`，它也只能维护子代理自己的私有 todo，不得驱动父会话 TodoPanel、父会话持久化 todo 或任何主对话控制状态。
+
 ### 3. 关闭事件的重要性
 
 `sub_agent_ok/err` 事件是子代理的**唯一外部结束信号**：
@@ -51,11 +53,23 @@
 - partsAcc 更新 Status 和 Elapsed
 - 持久化时 status 正确写入
 
-### 4. 三层工具隔离
+### 4. 工具隔离与父级授权
 
-1. **硬排除**：task, recall 强制移除
+子代理隔离分成两层：工具可见性只决定模型能看到什么；执行授权在 `agent.ChatWithTools` 的工具派发前再次判断，不能只依赖白名单。
+
+工具可见性：
+1. **硬排除**：`task`, `task_status`, `task_cancel`, `recall` 强制移除
 2. **全局配置过滤**：`subagent.allowed_tools` / `denied_tools`
 3. **Per-agent 白名单**：`agentInfo.Tools` 非空时只暴露列表中的
+
+执行授权：
+1. 子代理强制使用隔离的 `permission_level=ask`，不继承父会话的 `auto` / `full` / live session override
+2. 子代理不能消费 `/unsafe once`
+3. 子代理不能打开自己的 confirm flow；`tool.RequireConfirm` 在子代理上下文中 fail-closed
+4. 子代理默认只允许项目内、只读、低风险工具执行
+5. 写文件、编辑文件、启动进程、执行 shell、外部访问、交互提问、项目外读取、动态高风险工具调用返回 `SUBAGENT_PARENT_APPROVAL_REQUIRED`，由父对话决定后续动作
+
+内置 `explore` / `plan` 只暴露 `read_file` 和 `list_files`。如果确实需要 shell search、git inspection、测试或其他进程执行，子代理应在最终结果中向父对话提出请求，而不是自行执行。
 
 ### 5. 缓存
 

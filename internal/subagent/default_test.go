@@ -14,6 +14,7 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 )
 
@@ -451,6 +452,38 @@ func TestTryForward_NilOnEvent(t *testing.T) {
 	// Multiple calls in a row also fine.
 	for i := 0; i < 5; i++ {
 		tryForward(agent.ChatStreamChunk{Content: "x"}, nil)
+	}
+}
+
+func TestBuildSubAgentChatRequestUsesIsolatedSession(t *testing.T) {
+	const parentSession = "parent-session"
+	req := Request{
+		Description: "audit frontend",
+		TaskID:      "call_child_1",
+		ProjectRoot: `D:\develop\project\my-blog`,
+	}
+
+	chatReq := buildSubAgentChatRequest(
+		req,
+		style.Tech,
+		"openai",
+		"gpt-4o-mini",
+		"",
+		"explore",
+		"#44BA81",
+	)
+
+	if chatReq.SessionID != "subagent-explore-call_child_1" {
+		t.Fatalf("SessionID = %q, want isolated subagent session", chatReq.SessionID)
+	}
+	if chatReq.SessionID == parentSession {
+		t.Fatal("sub-agent must never reuse the parent session id")
+	}
+	if chatReq.SubagentTaskID != req.TaskID {
+		t.Fatalf("SubagentTaskID = %q, want %q", chatReq.SubagentTaskID, req.TaskID)
+	}
+	if chatReq.ProjectRoot != req.ProjectRoot {
+		t.Fatalf("ProjectRoot = %q, want %q", chatReq.ProjectRoot, req.ProjectRoot)
 	}
 }
 

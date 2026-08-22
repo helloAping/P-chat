@@ -13,7 +13,7 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages } from '../stores/chat'
 
 // isRecoveringCurrent mirrors state.isRecovering[currentID].
 // Watched reactively by the recovery-in-progress banner
@@ -330,6 +330,11 @@ async function handleFork(index: number) {
   }
 }
 
+function handleSubAgentJobTerminal() {
+  if (!state.currentID) return
+  void refreshLatestMessages(state.currentID)
+}
+
 // messageKey produces a stable Vue :key for a message in the
 // v-for list. We prefer seq (the per-conversation logical
 // position, stable across rollback/undo) and fall back to
@@ -433,7 +438,7 @@ function messageKey(m: any, i: number): string | number {
     </div>
     <QuestionModal @locate-question="locateOpenQuestion" />
     <TodoPanel />
-    <SubAgentJobsPanel :session-id="state.currentID" />
+    <SubAgentJobsPanel :session-id="state.currentID" @job-terminal="handleSubAgentJobTerminal" />
     <InputArea />
     <!-- P1-4: 锚定 FAB (jump-to-user-message). Shown
          when the user is scrolled up beyond the 50px

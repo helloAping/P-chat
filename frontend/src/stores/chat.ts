@@ -644,6 +644,25 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
   }
 }
 
+// refreshLatestMessages merges the newest server-side rows into an already
+// loaded session. Async subagent jobs use this after a terminal event because
+// the backend appends a synthetic assistant message outside the chat SSE turn.
+export async function refreshLatestMessages(id: string, limit = 20): Promise<void> {
+  if (!id || !state.sessionMessages[id]) return
+  try {
+    const r = await api.listMessages(id, { limit })
+    if (r.messages.length === 0) return
+    for (const m of r.messages) {
+      if (m.parts) scrubMessagePhantoms(m)
+    }
+    state.sessionMessages[id] = dedupMessagesByKey(state.sessionMessages[id] || [], r.messages)
+    convertAndStripScreenshots(id)
+    capSessionMessages(id)
+  } catch (e) {
+    console.warn('refreshLatestMessages failed:', e)
+  }
+}
+
 // loadProviders fetches the provider list and resolves
 // the "default" model — the first provider with
 // is_default: true, else the first provider; within that
@@ -1241,9 +1260,15 @@ function findOrCreateSubAgent(
   ev?: api.StreamEvent,
 ): MessagePart & { kind: 'sub_agent' } {
   if (!m.parts) m.parts = []
+  const taskId = ev?.sub_agent_task_id || ''
   for (let i = m.parts.length - 1; i >= 0; i--) {
     const p = m.parts[i]
-    if (p.kind === 'sub_agent' && p.task === task) {
+    if (
+      p.kind === 'sub_agent' &&
+      ((taskId && p.taskId === taskId) ||
+        (taskId && !p.taskId && p.task === task) ||
+        (!taskId && p.task === task))
+    ) {
       // Backfill any metadata that arrived on a later
       // event (e.g. the close event may carry the
       // resolved model name).
@@ -1416,6 +1441,12 @@ function closeTrailingThinking(parts: MessagePart[] | undefined) {
 function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null) {
   const parts = (target ?? m.parts)!
   closeTrailingThinking(parts)
+  const dropTrailingBlankText = () => {
+    const last = parts[parts.length - 1]
+    if (last?.kind === 'text' && !(last.text || '').trim()) {
+      parts.pop()
+    }
+  }
   // Two-pass scrub:
   //
   //  1. scrub the incoming delta (catches the case where
@@ -1439,11 +1470,14 @@ function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null
   // text streaming in real time), then scrub the buffer
   // globally. The scrub is synchronous so Vue's next
   // tick won't render the phantom.
+  const cleanedDelta = scrubPhantomError(delta)
   if (parts.length === 0 || parts[parts.length - 1].kind !== 'text') {
-    parts.push({ kind: 'text', text: scrubPhantomError(delta) })
+    if (cleanedDelta.trim()) {
+      parts.push({ kind: 'text', text: cleanedDelta })
+    }
   } else {
     const last = parts[parts.length - 1] as any
-    last.text = (last.text || '') + delta
+    last.text = (last.text || '') + cleanedDelta
     // Buffer-based scrub for split phantoms. Use the
     // scrub helper (which is already global) on the buffer
     // so all matches in the visible window are caught in
@@ -1455,6 +1489,7 @@ function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null
         last.text = last.text.slice(0, last.text.length - buf.length) + scrubbedBuf
       }
     }
+    dropTrailingBlankText()
   }
   // `m.content` is intentionally NOT updated from the
   // delta. The MessageBubble component renders assistant
@@ -1573,9 +1608,15 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // Apply the explicit rewrite to the trailing text part.
       const last = parts[parts.length - 1]
       if (last && last.kind === 'text') {
-        last.text = cleanedContent
+        if (cleanedContent.trim()) {
+          last.text = cleanedContent
+        } else {
+          parts.pop()
+        }
       } else {
-        parts.push({ kind: 'text', text: cleanedContent })
+        if (cleanedContent.trim()) {
+          parts.push({ kind: 'text', text: cleanedContent })
+        }
       }
       // Defensive: re-scrub every text/thinking part in the
       // message in case earlier rounds slipped a phantom
@@ -1767,13 +1808,17 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           }
         }
       }
-      // Sync todo list from todo_write tool results. Prefer
+      // Sync the main todo list from top-level todo_write tool results. Sub-agent
+      // todo_write events are private to the nested card and must not control the
+      // parent session's TodoPanel.
+      //
+      // Prefer
       // the untruncated tool_result_full (newlines intact, no
       // 300-char cap) so JSON.parse succeeds for lists with
       // many todos or long content. Fall back to the
       // display-only tool_result preview for older server
       // versions that don't emit tool_result_full.
-      if (ev.tool_name === 'todo_write' && ev.tool_status === 'ok') {
+      if (ev.tool_name === 'todo_write' && ev.tool_status === 'ok' && !ev.sub_agent) {
         const payload = ev.tool_result_full || ev.tool_result
         if (payload) {
           try {
@@ -2215,7 +2260,7 @@ export async function recoverMissingParts(
     if (p.kind === 'tool') return `tool:${p.tool_id || p.id || p.name || ''}`
     if (p.kind === 'text') return `text:${(p.text || '').slice(0, 40)}`
     if (p.kind === 'thinking') return `think:${(p.text || '').slice(0, 40)}`
-    if (p.kind === 'sub_agent') return `sub:${p.task || ''}`
+    if (p.kind === 'sub_agent') return `sub:${p.taskId || p.task || ''}`
     if (p.kind === 'question') return `q:${(p.text || '').slice(0, 40)}`
     return `${p.kind || '?'}:${JSON.stringify(p).slice(0, 60)}`
   }

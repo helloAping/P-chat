@@ -282,13 +282,49 @@ func confirmEmitterFromCtx(ctx context.Context) func(ConfirmRequest) {
 	return nil
 }
 
+type isolatedPermissionLevelKey struct{}
+
+// WithIsolatedPermissionLevel attaches a fixed permission level and prevents
+// process-local session permission overrides from replacing it. Sub-agents use
+// this so a parent session's live "full"/"auto" setting cannot leak into child
+// tool dispatch.
+func WithIsolatedPermissionLevel(ctx context.Context, level string) context.Context {
+	ctx = context.WithValue(ctx, isolatedPermissionLevelKey{}, true)
+	return WithPermissionLevel(ctx, level)
+}
+
+func isolatedPermissionLevelFromCtx(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(isolatedPermissionLevelKey{}).(bool)
+	return v
+}
+
+type parentAuthorityOnlyKey struct{}
+
+// WithParentAuthorityOnly marks a tool context as unable to ask or decide
+// confirmations directly. Sub-agent handlers run with this flag so self-gated
+// tools fail closed and hand the decision back to the parent conversation.
+func WithParentAuthorityOnly(ctx context.Context) context.Context {
+	return context.WithValue(ctx, parentAuthorityOnlyKey{}, true)
+}
+
+func ParentAuthorityOnlyFromCtx(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(parentAuthorityOnlyKey{}).(bool)
+	return v
+}
+
 // PermissionLevelFromCtx returns the per-session permission level
 // ("ask" / "auto" / "full"), defaulting to PermissionAsk.
 func PermissionLevelFromCtx(ctx context.Context) string {
 	if ctx == nil {
 		return PermissionAsk
 	}
-	if sid, ok := ctx.Value(SessionIDKey{}).(string); ok {
+	if sid, ok := ctx.Value(SessionIDKey{}).(string); ok && !isolatedPermissionLevelFromCtx(ctx) {
 		if level := SessionPermissionLevel(sid); level != "" {
 			return level
 		}
@@ -302,6 +338,8 @@ func PermissionLevelFromCtx(ctx context.Context) string {
 // RequireConfirm runs the shared confirm modal flow for tools that
 // self-gate (browser_*, future MCP tools). Behaviour:
 //
+//   - parent-authority-only → fail closed; the caller must hand the
+//     decision back to the parent conversation
 //   - permission "full"  → skip (caller still owns any hard blocks)
 //   - permission "auto"  → skip modal, return approved=true
 //   - no emitter / no session → fail-closed (approved=false) so a
@@ -310,6 +348,10 @@ func PermissionLevelFromCtx(ctx context.Context) string {
 //
 // Returns (approved, error). error is non-nil on timeout / cancel.
 func RequireConfirm(ctx context.Context, req ConfirmRequest) (bool, error) {
+	if ParentAuthorityOnlyFromCtx(ctx) {
+		return false, fmt.Errorf("confirm requires parent conversation approval")
+	}
+
 	level := PermissionLevelFromCtx(ctx)
 	if level == PermissionFull || level == PermissionAuto {
 		return true, nil

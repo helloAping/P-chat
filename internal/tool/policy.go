@@ -114,7 +114,13 @@ func (p ToolPolicy) Timeout() time.Duration {
 // CanRunInParallel reports whether the tool is safe to batch with another
 // call. The default is deliberately conservative for unknown tools.
 func (p ToolPolicy) CanRunInParallel() bool {
-	return p.Category == ToolCategoryRead && p.SideEffect == ToolSideEffectNone && p.Parallelism == ToolParallelSafe
+	if p.Parallelism != ToolParallelSafe {
+		return false
+	}
+	if p.Category == ToolCategoryRead && p.SideEffect == ToolSideEffectNone {
+		return true
+	}
+	return p.Category == ToolCategoryOrchestration && p.SideEffect == ToolSideEffectProcess
 }
 
 func defaultToolPolicy(name string) ToolPolicy {
@@ -147,7 +153,7 @@ func defaultToolPolicy(name string) ToolPolicy {
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryExternal, ToolSideEffectNetwork, ToolRiskMedium, ToolParallelExclusive
 		p.TimeoutMS = 2 * 60 * 1000
 	case name == "task":
-		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectProcess, ToolRiskConfirm, ToolParallelExclusive
+		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectProcess, ToolRiskConfirm, ToolParallelSafe
 		p.TimeoutMS = -1
 	case name == "task_cancel":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectState, ToolRiskMedium, ToolParallelExclusive

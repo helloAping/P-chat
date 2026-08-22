@@ -855,6 +855,26 @@ func GetToolEventChan(ctx context.Context) chan<- ChatStreamChunk {
 	return nil
 }
 
+type parentToolCallIDKey struct{}
+
+// WithParentToolCallID publishes the parent LLM tool_call id to a tool
+// handler. The task tool uses it as a generated sub-agent identity when
+// the model did not provide task_id explicitly.
+func WithParentToolCallID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, parentToolCallIDKey{}, id)
+}
+
+// GetParentToolCallID returns the current parent tool_call id, if any.
+func GetParentToolCallID(ctx context.Context) string {
+	if v, ok := ctx.Value(parentToolCallIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // parentModelCtxKey is the context key under which the agent publishes
 // the *current turn's* (provider, model) pair. Sub-agents read this via
 // GetParentModel(ctx) so the child session inherits the same model the
@@ -2045,6 +2065,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// card key) so this is a transparent change.
 			seenIDs := make(map[string]bool, len(toolCalls))
 			normalizeToolCallIDs(toolCalls, seenIDs)
+			normalizeToolCallArgs(toolCalls)
 			for i := range toolCalls {
 				tc := &toolCalls[i]
 				tcm := llm.ChatMessage{
@@ -2180,6 +2201,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				partsAcc.update(startChunk)
 				sendOrDrop(ctx, ch, nextSeq, startChunk)
 			}
+			compressionPlan := buildSubagentToolCompressionPlan(req, toolCalls)
+			if len(compressionPlan) > 0 {
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:    "tool",
+					Step:     "subagent-tool-compression",
+					Message:  fmt.Sprintf("子代理本轮检测到 %d 个相近只读命令，已压缩为复用代表工具结果。", len(compressionPlan)),
+					Round:    roundNum,
+					MaxRound: maxRounds,
+				})
+			}
 
 			// Each tool call gets its own event channel. The agent loop
 			// launches a forwarder per channel and collects the done
@@ -2214,6 +2245,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// forwarder will drain it before the next push.
 				eventCh := make(chan ChatStreamChunk, 64)
 				tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
+				tctx = WithParentToolCallID(tctx, tc.ID)
 				if a.subagentRegistry != nil {
 					tctx = WithSubagentRegistry(tctx, a.subagentRegistry)
 				}
@@ -2240,7 +2272,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						return a.store.SaveTodos(sessionID, stored)
 					})
 				}
-				if req.PermissionLevel != "" {
+				if req.SubagentType != "" {
+					// Child agents do not inherit the parent conversation's live
+					// permission state. They can only run calls allowed by the
+					// sub-agent authority gate below; anything requiring approval
+					// must be handed back to the parent conversation.
+					tctx = tool.WithParentAuthorityOnly(tool.WithIsolatedPermissionLevel(tctx, tool.PermissionAsk))
+				} else if req.PermissionLevel != "" {
 					tctx = tool.WithPermissionLevel(tctx, req.PermissionLevel)
 				}
 				if req.ProjectRoot != "" {
@@ -2368,6 +2406,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						}
 						return
 					}
+					if compressed, ok := compressionPlan[i]; ok {
+						outcomes[i] = toolOutcome{
+							idx:     i,
+							tc:      tc,
+							result:  compressedToolResult(compressed),
+							elapsed: 0,
+						}
+						return
+					}
 					if serialGate != nil {
 						select {
 						case serialGate <- struct{}{}:
@@ -2390,7 +2437,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						}
 					}
 
-					handler, ok := a.tools.GetForProject(tc.Name, req.ProjectRoot)
+					meta, handler, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot)
 					if !ok {
 						errMsg := fmt.Sprintf("error: tool %q not found (available: %s)", tc.Name, availableToolNames(a.tools.ListForProject(req.ProjectRoot)))
 						// Browser tools may have been unregistered at runtime.
@@ -2452,7 +2499,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					//   "ask"  — normal confirm flow (default)
 					toolCtx := tctx
 					permLevel := tool.PermissionLevelFromCtx(tctx)
-					bypass := a.bypassOnce.Swap(false)
+					bypass := false
+					if req.SubagentType == "" {
+						bypass = a.bypassOnce.Swap(false)
+					}
 					// /unsafe once → treat this single call as
 					// permission=full so browser_* confirm gates
 					// (BR-04 RequireConfirm) and path sandbox
@@ -2460,6 +2510,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if bypass {
 						toolCtx = tool.WithPermissionLevel(tctx, tool.PermissionFull)
 						permLevel = tool.PermissionFull
+					}
+					if authResult, handled := subagentToolAuthorizationResult(req, tc, meta, a.sandbox); handled {
+						outcomes[i] = toolOutcome{
+							idx:     i,
+							tc:      tc,
+							result:  authResult,
+							elapsed: time.Since(toolStart),
+						}
+						return
 					}
 					sandboxActive := a.sandbox != nil && !bypass && permLevel != tool.PermissionFull
 					if sandboxActive {

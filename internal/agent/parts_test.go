@@ -254,6 +254,43 @@ func TestPartsAccumulator_SubAgentMetadataBackfill(t *testing.T) {
 	}
 }
 
+func TestPartsAccumulator_ConcurrentSubAgentsRouteByTaskID(t *testing.T) {
+	acc := newPartsAccumulator()
+	acc.update(ChatStreamChunk{
+		SubAgent: true, SubAgentStatus: "start", SubAgentTask: "audit api", SubAgentTaskID: "task-a",
+		SubAgentType: "explore",
+	})
+	acc.update(ChatStreamChunk{
+		SubAgent: true, SubAgentStatus: "start", SubAgentTask: "audit ui", SubAgentTaskID: "task-b",
+		SubAgentType: "explore",
+	})
+	acc.update(ChatStreamChunk{SubAgent: true, SubAgentTask: "audit api", SubAgentTaskID: "task-a", Content: "api result"})
+	acc.update(ChatStreamChunk{SubAgent: true, SubAgentTask: "audit ui", SubAgentTaskID: "task-b", Content: "ui result"})
+	acc.update(ChatStreamChunk{SubAgent: true, SubAgentStatus: "ok", SubAgentTask: "audit api", SubAgentTaskID: "task-a"})
+	acc.update(ChatStreamChunk{SubAgent: true, SubAgentStatus: "ok", SubAgentTask: "audit ui", SubAgentTaskID: "task-b"})
+
+	parts := acc.snapshot()
+	if len(parts) != 2 {
+		t.Fatalf("want two sub_agent parts, got %+v", parts)
+	}
+	got := map[string]string{}
+	for _, p := range parts {
+		if p.Kind != "sub_agent" {
+			t.Fatalf("unexpected non-subagent part: %+v", p)
+		}
+		if p.Status != "ok" {
+			t.Fatalf("subagent %s status = %q, want ok", p.TaskID, p.Status)
+		}
+		if len(p.Parts) != 1 || p.Parts[0].Kind != "text" {
+			t.Fatalf("subagent %s inner parts wrong: %+v", p.TaskID, p.Parts)
+		}
+		got[p.TaskID] = p.Parts[0].Text
+	}
+	if got["task-a"] != "api result" || got["task-b"] != "ui result" {
+		t.Fatalf("subagent content routed wrong: %+v", got)
+	}
+}
+
 func TestPartsAccumulator_DoneClearsStreaming(t *testing.T) {
 	acc := newPartsAccumulator()
 	acc.update(ChatStreamChunk{Thinking: "reasoning..."})

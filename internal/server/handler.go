@@ -37,11 +37,12 @@ type Handler struct {
 	// subagentJobs cancels process-local async subagent jobs. Durable
 	// job state lives in the memory store; this hook only covers jobs
 	// that are still running in this server process.
-	subagentJobs subagentJobCanceller
-	mcpMgr       *mcp.Manager
-	browserMgr   *browser.Manager
-	imGateway    *im.Gateway
-	wechatQR     *im.WeChatQRManager
+	subagentJobs      subagentJobCanceller
+	subagentJobEvents subagentJobEventSource
+	mcpMgr            *mcp.Manager
+	browserMgr        *browser.Manager
+	imGateway         *im.Gateway
+	wechatQR          *im.WeChatQRManager
 	// attachResolver reads upload files by id. Used to re-hydrate
 	// "upl://<id>" media rows from disk when building the LLM
 	// context (the agent holds the same resolver for the current

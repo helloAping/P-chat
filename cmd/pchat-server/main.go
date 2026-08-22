@@ -274,6 +274,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
 	srv.Handler().SetSubagentJobCanceller(asyncMgr)
+	srv.Handler().SetSubagentJobEvents(asyncMgr)
 
 	// Wire the stylegen background job manager (generate / optimize an
 	// AI style from the current conversation). It reads the store
