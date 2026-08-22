@@ -615,7 +615,9 @@ type MessagePart struct {
 	AgentColor       string `json:"agent_color,omitempty"`
 	AgentModel       string `json:"agent_model,omitempty"`
 	TaskID           string `json:"task_id,omitempty"`
+	RunMode          string `json:"run_mode,omitempty"`
 	AgentDescription string `json:"agent_description,omitempty"`
+	FailureReason    string `json:"failure_reason,omitempty"`
 }
 
 // messagePartWire is the on-the-wire shape of MessagePart,
@@ -647,7 +649,9 @@ type messagePartWire struct {
 	AgentColor       string `json:"agentColor,omitempty"`
 	AgentModel       string `json:"agentModel,omitempty"`
 	TaskID           string `json:"taskId,omitempty"`
+	RunMode          string `json:"runMode,omitempty"`
 	AgentDescription string `json:"agentDescription,omitempty"`
+	FailureReason    string `json:"failureReason,omitempty"`
 }
 
 // MarshalJSON emits the wire format for MessagePart. The
@@ -676,9 +680,55 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 		AgentColor:       p.AgentColor,
 		AgentModel:       p.AgentModel,
 		TaskID:           p.TaskID,
+		RunMode:          p.RunMode,
 		AgentDescription: p.AgentDescription,
+		FailureReason:    p.FailureReason,
 	}
 	return json.Marshal(w)
+}
+
+// UnmarshalJSON accepts both storage JSON (snake_case sub-agent
+// metadata) and wire JSON (camelCase sub-agent metadata). The storage
+// path is used when reloading meta["parts"]; the wire shape appears in
+// tests and older client round-trips.
+func (p *MessagePart) UnmarshalJSON(data []byte) error {
+	type messagePartStorage MessagePart
+	var v struct {
+		messagePartStorage
+		AgentTypeCamel        string `json:"agentType,omitempty"`
+		AgentColorCamel       string `json:"agentColor,omitempty"`
+		AgentModelCamel       string `json:"agentModel,omitempty"`
+		TaskIDCamel           string `json:"taskId,omitempty"`
+		RunModeCamel          string `json:"runMode,omitempty"`
+		AgentDescriptionCamel string `json:"agentDescription,omitempty"`
+		FailureReasonCamel    string `json:"failureReason,omitempty"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	*p = MessagePart(v.messagePartStorage)
+	if v.AgentTypeCamel != "" {
+		p.AgentType = v.AgentTypeCamel
+	}
+	if v.AgentColorCamel != "" {
+		p.AgentColor = v.AgentColorCamel
+	}
+	if v.AgentModelCamel != "" {
+		p.AgentModel = v.AgentModelCamel
+	}
+	if v.TaskIDCamel != "" {
+		p.TaskID = v.TaskIDCamel
+	}
+	if v.RunModeCamel != "" {
+		p.RunMode = v.RunModeCamel
+	}
+	if v.AgentDescriptionCamel != "" {
+		p.AgentDescription = v.AgentDescriptionCamel
+	}
+	if v.FailureReasonCamel != "" {
+		p.FailureReason = v.FailureReasonCamel
+	}
+	return nil
 }
 
 // AttachmentPart is a single part of a multi-content message,
@@ -782,6 +832,9 @@ type StreamEvent struct {
 	// SubAgentTaskID is the resume-by-id key. Surfaced as
 	// a monospace badge in the card footer.
 	SubAgentTaskID string `json:"sub_agent_task_id,omitempty"`
+	// SubAgentRunMode is "sync" for an in-turn sub-agent and
+	// "async" for a durable background sub-agent job.
+	SubAgentRunMode string `json:"sub_agent_run_mode,omitempty"`
 	// SubAgentDescription is the agent's "when to use" hint.
 	// Surfaced as a hover tooltip on the agent-name badge
 	// in the SubAgentCard so the user can read the full

@@ -82,6 +82,9 @@ type MessagePart struct {
 	// TaskID is the resume-by-id key (Args.task_id).
 	// Surfaced in the card footer as a monospace badge.
 	TaskID string `json:"task_id,omitempty"`
+	// RunMode is "sync" for a regular in-turn sub-agent
+	// and "async" for a background sub-agent job.
+	RunMode string `json:"run_mode,omitempty"`
 	// AgentDescription is the one-line "when to use" hint
 	// from the agent's registry entry. Surfaced as a
 	// hover tooltip on the agent-name badge in the card
@@ -304,6 +307,7 @@ func (a *partsAccumulator) newSubAgentPart(c ChatStreamChunk) MessagePart {
 		AgentModel:       c.SubAgentModel,
 		AgentDescription: c.SubAgentDescription,
 		TaskID:           c.SubAgentTaskID,
+		RunMode:          c.SubAgentRunMode,
 		Parts:            nil,
 	}
 }
@@ -388,6 +392,9 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			if c.SubAgentTaskID != "" && a.parts[i].TaskID == "" {
 				a.parts[i].TaskID = c.SubAgentTaskID
 			}
+			if c.SubAgentRunMode != "" && a.parts[i].RunMode == "" {
+				a.parts[i].RunMode = c.SubAgentRunMode
+			}
 			// ★ 清除嵌套 thinking parts 的 streaming flag。
 			// 子代理的 Done chunk 不再转发到 partsAcc（subagent.go
 			// 拦截了它），所以 Done 分支无法为子代理清理 streaming。
@@ -434,6 +441,9 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			if c.SubAgentTaskID != "" && a.parts[i].TaskID == "" {
 				a.parts[i].TaskID = c.SubAgentTaskID
 				a.rememberSubAgent(i)
+			}
+			if c.SubAgentRunMode != "" && a.parts[i].RunMode == "" {
+				a.parts[i].RunMode = c.SubAgentRunMode
 			}
 			break
 		}
@@ -882,4 +892,36 @@ func clearStreamingFlag(parts *[]MessagePart) {
 			clearStreamingFlag(&(*parts)[i].Parts)
 		}
 	}
+}
+
+// PartsRecorder is a small public wrapper around the streaming parts
+// accumulator. It is used by async sub-agent jobs, which do not have a
+// parent SSE stream but still need to persist the same card body that a
+// regular in-turn sub-agent would have shown live.
+type PartsRecorder struct {
+	acc *partsAccumulator
+}
+
+// NewPartsRecorder returns an empty recorder for ChatStreamChunk events.
+func NewPartsRecorder() *PartsRecorder {
+	return &PartsRecorder{acc: newPartsAccumulator()}
+}
+
+// Update applies one stream chunk to the recorder.
+func (r *PartsRecorder) Update(c ChatStreamChunk) {
+	if r == nil {
+		return
+	}
+	if r.acc == nil {
+		r.acc = newPartsAccumulator()
+	}
+	r.acc.update(c)
+}
+
+// Snapshot returns a materialized, non-streaming parts snapshot.
+func (r *PartsRecorder) Snapshot() []MessagePart {
+	if r == nil || r.acc == nil {
+		return nil
+	}
+	return snapshotStructural(r.acc)
 }

@@ -109,7 +109,7 @@ func singleStringToolArgs(toolName, value string) string {
 		key = "query"
 	case "read_process_output", "stop_process":
 		key = "process_id"
-	case "task_status", "task_cancel":
+	case "task_status", "task_cancel", "task_wait":
 		key = "task_id"
 	case "task":
 		data, _ := json.Marshal(map[string]string{

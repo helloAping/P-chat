@@ -9,6 +9,7 @@ import {
   type SubAgentJob,
   type SubAgentJobEvent,
 } from '../api/client'
+import { setSessionBackgroundSubAgentJobs } from '../stores/chat'
 
 const props = defineProps<{
   sessionId?: string
@@ -28,6 +29,7 @@ const dismissed = ref(false)
 const eventConnected = ref(false)
 let pollTimer: number | null = null
 let retryTimer: number | null = null
+let clearTimer: number | null = null
 let eventCtrl: AbortController | null = null
 let requestSeq = 0
 
@@ -127,6 +129,31 @@ function upsertJob(job: SubAgentJob) {
   jobs.value = sortJobs([job, ...jobs.value]).slice(0, 20)
 }
 
+function clearAutoClearTimer() {
+  if (clearTimer !== null) {
+    window.clearTimeout(clearTimer)
+    clearTimer = null
+  }
+}
+
+function syncBackgroundJobState() {
+  if (props.sessionId) {
+    setSessionBackgroundSubAgentJobs(props.sessionId, activeJobs.value.length)
+  }
+}
+
+function scheduleClearIfIdle() {
+  clearAutoClearTimer()
+  if (activeJobs.value.length > 0) return
+  clearTimer = window.setTimeout(() => {
+    if (activeJobs.value.length === 0) {
+      jobs.value = []
+      dismissed.value = false
+    }
+    clearTimer = null
+  }, 2500)
+}
+
 function notifyTerminal(job: SubAgentJob) {
   if (job.status === 'succeeded') {
     message.success(`后台子代理已完成：${jobLabel(job)}`)
@@ -142,6 +169,7 @@ function handleJobEvent(ev: SubAgentJobEvent) {
   const wasActive = previous ? isActiveJob(previous) : false
   upsertJob(ev.job)
   if (isActiveJob(ev.job) && (!previous || ev.type === 'created')) {
+    clearAutoClearTimer()
     dismissed.value = false
   }
   if (isTerminalJob(ev.job) && (wasActive || !previous)) {
@@ -149,6 +177,7 @@ function handleJobEvent(ev: SubAgentJobEvent) {
       collapsed.value = true
     }
     notifyTerminal(ev.job)
+    scheduleClearIfIdle()
   }
 }
 
@@ -166,7 +195,7 @@ async function refresh(silent = false) {
   try {
     const res = await listSubAgentJobs(sessionId, 20)
     if (seq !== requestSeq) return
-    jobs.value = sortJobs(res.jobs || [])
+    jobs.value = sortJobs(res.jobs || []).filter(isActiveJob)
   } catch (e: any) {
     if (seq !== requestSeq) return
     error.value = e?.message || String(e)
@@ -182,6 +211,7 @@ async function cancelJob(job: SubAgentJob) {
   try {
     const res = await cancelSubAgentJob(sessionId, job.task_id)
     jobs.value = jobs.value.map((j) => j.task_id === job.task_id ? res.job : j)
+    scheduleClearIfIdle()
     message.info('已取消后台子代理任务')
   } catch (e: any) {
     message.error(`取消失败：${e?.message || e}`)
@@ -223,6 +253,7 @@ function clearRetry() {
 }
 
 function stopEventStream() {
+  clearAutoClearTimer()
   clearRetry()
   if (eventCtrl) {
     eventCtrl.abort()
@@ -257,11 +288,13 @@ function startEventStream() {
 
 watch(
   () => props.sessionId,
-  () => {
+  (_next, prev) => {
+    if (prev) setSessionBackgroundSubAgentJobs(prev, 0)
     stopEventStream()
     clearPoll()
     dismissed.value = false
     refresh(true).finally(() => {
+      syncBackgroundJobState()
       startEventStream()
       ensurePoll()
     })
@@ -271,7 +304,10 @@ watch(
 
 watch(
   () => activeJobs.value.length,
-  () => ensurePoll(),
+  () => {
+    syncBackgroundJobState()
+    ensurePoll()
+  },
 )
 
 watch(collapsed, (value) => {
@@ -281,8 +317,10 @@ watch(collapsed, (value) => {
 })
 
 onBeforeUnmount(() => {
+  if (props.sessionId) setSessionBackgroundSubAgentJobs(props.sessionId, 0)
   stopEventStream()
   clearPoll()
+  clearAutoClearTimer()
   requestSeq++
 })
 </script>

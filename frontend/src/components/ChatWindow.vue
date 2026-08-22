@@ -13,7 +13,7 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging } from '../stores/chat'
 
 // isRecoveringCurrent mirrors state.isRecovering[currentID].
 // Watched reactively by the recovery-in-progress banner
@@ -330,9 +330,15 @@ async function handleFork(index: number) {
   }
 }
 
-function handleSubAgentJobTerminal() {
+async function handleSubAgentJobTerminal() {
   if (!state.currentID) return
-  void refreshLatestMessages(state.currentID)
+  const sessionID = state.currentID
+  setSessionBackgroundHookMerging(sessionID, true)
+  try {
+    await refreshLatestMessages(sessionID)
+  } finally {
+    setSessionBackgroundHookMerging(sessionID, false)
+  }
 }
 
 // messageKey produces a stable Vue :key for a message in the

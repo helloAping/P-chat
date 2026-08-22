@@ -656,6 +656,11 @@ type ChatStreamChunk struct {
 	// LLM can pass back to resume / dedupe the sub-agent
 	// run. Opaque string; currently SHA-256 truncated.
 	SubAgentTaskID string `json:"sub_agent_task_id,omitempty"`
+	// SubAgentRunMode is "sync" for normal task calls and
+	// "async" for durable background jobs. The UI uses this
+	// to label the same SubAgentCard chrome without changing
+	// the event routing model.
+	SubAgentRunMode string `json:"sub_agent_run_mode,omitempty"`
 	// SubAgentDescription is the one-line "when to use" hint
 	// for the agent (e.g. "Fast read-only file search.").
 	// Surfaced as a hover tooltip on the agent-name badge in
@@ -1046,7 +1051,7 @@ func detachTurnDeadlineForTask(ctx context.Context) (context.Context, bool) {
 
 func hasTaskToolCall(toolCalls []nativeToolCall) bool {
 	for _, tc := range toolCalls {
-		if tc.Name == "task" {
+		if tc.Name == "task" || tc.Name == "task_wait" {
 			return true
 		}
 	}
@@ -1952,7 +1957,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
 						Phase:    "tool",
 						Step:     "task-detached",
-						Message:  "检测到同步子代理任务，已切换为仅受用户取消/连接断开控制，避免父回合 wall-clock 截断。",
+						Message:  "检测到子代理编排/等待任务，已切换为仅受用户取消/连接断开控制，避免父回合 wall-clock 截断。",
 						Round:    roundNum,
 						MaxRound: maxRounds,
 					})
@@ -2084,6 +2089,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 
 			if len(toolCalls) == 0 {
+				if jobs, err := activeAsyncSubagentJobs(a.store, req.SessionID); err == nil && len(jobs) > 0 && !isLastRound && toolAvailable(availableTools, "task_wait") {
+					msgs = append(msgs, llm.ChatMessage{
+						Role:    llm.RoleUser,
+						Type:    llm.TypeText,
+						Content: buildAsyncSubagentWaitPrompt(jobs),
+					})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:    "subagent",
+						Step:     "async-wait",
+						Message:  fmt.Sprintf("检测到 %d 个后台子代理仍在执行，阻塞等待完成后再总结。", len(jobs)),
+						Round:    roundNum,
+						MaxRound: maxRounds,
+					})
+					continue
+				}
 				// P0-3: auto-continue guard. The LLM often
 				// finishes a real tool run but emits a
 				// "ready to continue" text block instead of
@@ -3435,6 +3455,47 @@ func toolCallSignature(calls []nativeToolCall) string {
 		b.WriteByte(';')
 	}
 	return b.String()
+}
+
+func activeAsyncSubagentJobs(store *memory.Store, sessionID string) ([]memory.SubagentJob, error) {
+	if store == nil || strings.TrimSpace(sessionID) == "" {
+		return nil, nil
+	}
+	jobs, err := store.ListSubagentJobs(sessionID, 100)
+	if err != nil {
+		return nil, err
+	}
+	active := make([]memory.SubagentJob, 0, len(jobs))
+	for _, job := range jobs {
+		if job.Status == memory.SubagentJobQueued || job.Status == memory.SubagentJobRunning {
+			active = append(active, job)
+		}
+	}
+	return active, nil
+}
+
+func toolAvailable(tools []tool.Tool, name string) bool {
+	for _, t := range tools {
+		if t.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func buildAsyncSubagentWaitPrompt(jobs []memory.SubagentJob) string {
+	taskIDs := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		if id := strings.TrimSpace(job.TaskID); id != "" {
+			taskIDs = append(taskIDs, id)
+		}
+	}
+	if len(taskIDs) == 0 {
+		return "当前仍有后台子代理任务在运行。不要结束本轮对话；请调用 task_wait 等待任一后台任务完成，然后基于完成结果继续总结。"
+	}
+	encoded, _ := json.Marshal(taskIDs)
+	return fmt.Sprintf("当前仍有后台子代理任务在运行：%s。不要结束本轮对话；请调用 task_wait，传入 task_ids=%s 等待任一后台任务完成。task_wait 返回完成结果后，基于结果继续总结；如果还有未完成后台任务，继续等待或处理下一项。",
+		strings.Join(taskIDs, ", "), string(encoded))
 }
 
 // MaxStepsPrompt is injected as a fake assistant message right

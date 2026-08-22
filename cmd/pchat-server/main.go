@@ -210,6 +210,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 	toolReg.Register(tt, hh)
 	tst, tsh := runner.TaskStatusTool()
 	toolReg.Register(tst, tsh)
+	twt, twh := runner.TaskWaitTool()
+	toolReg.Register(twt, twh)
 	tct, tch := runner.TaskCancelTool()
 	toolReg.Register(tct, tch)
 	log.Printf("[subagent] task tool registered (timeout=%s cache_ttl=%s)",

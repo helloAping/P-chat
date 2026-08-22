@@ -80,6 +80,8 @@ const accentStyle = computed(() => {
 
 const titleLabel = computed(() => `${agentLabel.value} · ${props.part.task || '未命名子任务'}`)
 
+const runModeLabel = computed(() => props.part.runMode === 'async' ? '后台子代理' : '常规子代理')
+
 const toolCount = computed(() => props.part.parts.filter(p => p.kind === 'tool').length)
 
 const latestActivity = computed(() => {
@@ -256,6 +258,11 @@ onBeforeUnmount(() => clearStuckTimer())
       :title="open ? '收起子代理消息' : '展开子代理消息'"
     >
       <span class="sub-icon">{{ agentLabel.charAt(0).toUpperCase() }}</span>
+      <span
+        class="sub-run-mode"
+        :class="'mode-' + (part.runMode === 'async' ? 'async' : 'sync')"
+        :title="part.runMode === 'async' ? '后台异步执行的子代理' : '当前对话内执行的常规子代理'"
+      >{{ runModeLabel }}</span>
       <span class="sub-title-wrap">
         <span
           class="sub-title"
@@ -297,6 +304,7 @@ onBeforeUnmount(() => clearStuckTimer())
           <span class="sub-summary-status" :class="'status-' + part.status">{{ statusLabel() }}</span>
         </div>
         <div class="sub-summary-meta">
+          <span>{{ runModeLabel }}</span>
           <span>{{ part.parts.length }} parts</span>
           <span v-if="toolCount > 0">{{ toolCount }} tools</span>
           <span v-if="part.elapsed">{{ part.elapsed }}</span>
@@ -428,6 +436,24 @@ onBeforeUnmount(() => clearStuckTimer())
   color: var(--sub-accent, var(--brand-500));
   background: var(--sub-accent-soft, var(--brand-50));
   flex-shrink: 0;
+}
+.sub-run-mode {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-3);
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  line-height: 1.35;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.sub-run-mode.mode-async {
+  border-color: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 24%, var(--border-subtle));
+  background: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 12%, var(--surface-2));
+  color: var(--sub-accent, var(--brand-500));
 }
 .sub-title-wrap {
   display: flex;

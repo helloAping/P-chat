@@ -289,12 +289,12 @@ type ContextMessage struct {
 // snapshot of the current conversation's footprint so
 // the chat UI can render the "上下文" tab/drawer.
 type ContextInspectorResponse struct {
-	SessionID         string           `json:"session_id"`
-	Provider          string           `json:"provider"`
-	Model             string           `json:"model"`
-	ContextWindow     int              `json:"context_window"`
-	EstimatedTokens   int              `json:"estimated_tokens"`
-	UsableTokens      int              `json:"usable_tokens"`
+	SessionID       string `json:"session_id"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	ContextWindow   int    `json:"context_window"`
+	EstimatedTokens int    `json:"estimated_tokens"`
+	UsableTokens    int    `json:"usable_tokens"`
 	// UtilizationPct is estimated_tokens / usable_tokens * 100 —
 	// the denominator the auto-compact logic actually triggers on.
 	UtilizationPct float64 `json:"utilization_pct"`
@@ -933,6 +933,9 @@ func decodePartsFromMeta(meta string, content string) []MessagePart {
 func hasTextOrThinking(parts []MessagePart) bool {
 	for _, p := range parts {
 		if p.Kind == "text" || p.Kind == "thinking" {
+			return true
+		}
+		if len(p.Parts) > 0 && hasTextOrThinking(p.Parts) {
 			return true
 		}
 	}

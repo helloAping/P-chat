@@ -3,7 +3,6 @@ package subagent
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -82,6 +81,7 @@ func TestDefault_ExcludesTaskTool(t *testing.T) {
 	parent := tool.NewRegistry()
 	parent.Register(tool.Tool{Name: "task", Description: "spawn sub"}, noopHandler)
 	parent.Register(tool.Tool{Name: "task_status", Description: "status"}, noopHandler)
+	parent.Register(tool.Tool{Name: "task_wait", Description: "wait"}, noopHandler)
 	parent.Register(tool.Tool{Name: "task_cancel", Description: "cancel"}, noopHandler)
 	parent.Register(tool.Tool{Name: "read_file", Description: "r"}, noopHandler)
 	parent.Register(tool.Tool{Name: "recall", Description: "r"}, noopHandler)
@@ -90,7 +90,7 @@ func TestDefault_ExcludesTaskTool(t *testing.T) {
 
 	subTools := tool.NewRegistry()
 	for _, name := range d.ParentTools.Names() {
-		if name == "task" || name == "task_status" || name == "task_cancel" || name == "recall" {
+		if name == "task" || name == "task_status" || name == "task_wait" || name == "task_cancel" || name == "recall" {
 			continue
 		}
 		if tt, h, ok := d.ParentTools.Lookup(name); ok {
@@ -103,6 +103,9 @@ func TestDefault_ExcludesTaskTool(t *testing.T) {
 	}
 	if _, ok := subTools.Get("task_status"); ok {
 		t.Error("task_status must NOT be in sub-agent registry")
+	}
+	if _, ok := subTools.Get("task_wait"); ok {
+		t.Error("task_wait must NOT be in sub-agent registry")
 	}
 	if _, ok := subTools.Get("task_cancel"); ok {
 		t.Error("task_cancel must NOT be in sub-agent registry")
@@ -130,9 +133,11 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 		ParentTools: tool.NewRegistry(),
 		Async:       NewAsyncManager(),
 		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
-			ch := make(chan agent.ChatStreamChunk, 2)
+			ch := make(chan agent.ChatStreamChunk, 4)
 			go func() {
 				defer close(ch)
+				ch <- agent.ChatStreamChunk{Phase: "tool", Step: "call-1-start", ToolName: "read_file", ToolArgs: `{"path":"a.go"}`}
+				ch <- agent.ChatStreamChunk{Phase: "tool", Step: "call-1-ok", ToolName: "read_file", ToolResult: "file body", ToolElapsed: "2ms"}
 				ch <- agent.ChatStreamChunk{Content: "async result"}
 				ch <- agent.ChatStreamChunk{Done: true, TokensIn: 3, TokensOut: 4, Round: 1}
 			}()
@@ -163,6 +168,9 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 	if !strings.Contains(job.Result, "async result") {
 		t.Fatalf("job result missing async output: %+v", job)
 	}
+	if strings.Contains(job.Result, "subagent stats") {
+		t.Fatalf("job result leaked stats footer: %+v", job)
+	}
 
 	_, statusHandler := d.TaskStatusTool()
 	status, err := statusHandler(
@@ -176,17 +184,130 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 		t.Fatalf("unexpected task_status result: %+v", status)
 	}
 
-	msgs := store.GetChatMessagesFor("session-1", 10)
+	msgs, metas, _ := store.GetChatMessagesWithMetaFor("session-1", 10)
 	foundSynthetic := false
-	for _, msg := range msgs {
+	foundStructuredPart := false
+	for i, msg := range msgs {
 		if strings.Contains(msg.Content, "Async sub-agent task `task-1` completed") &&
 			strings.Contains(msg.Content, "async result") {
 			foundSynthetic = true
+			var meta map[string]string
+			if err := json.Unmarshal([]byte(metas[i]), &meta); err != nil {
+				t.Fatalf("decode synthetic meta: %v", err)
+			}
+			var parts []agent.MessagePart
+			if err := json.Unmarshal([]byte(meta["parts"]), &parts); err != nil {
+				t.Fatalf("decode synthetic parts: %v", err)
+			}
+			if len(parts) != 1 || parts[0].Kind != "sub_agent" {
+				t.Fatalf("synthetic parts = %+v, want one sub_agent part", parts)
+			}
+			if parts[0].Status != "ok" || parts[0].TaskID != "task-1" || parts[0].Task != "background work" || parts[0].RunMode != "async" {
+				t.Fatalf("synthetic sub_agent metadata wrong: %+v", parts[0])
+			}
+			if len(parts[0].Parts) < 2 {
+				t.Fatalf("synthetic sub_agent should include internal tool/text parts: %+v", parts[0].Parts)
+			}
+			if parts[0].Parts[0].Kind != "tool" || parts[0].Parts[0].Name != "read_file" || parts[0].Parts[0].Status != "ok" {
+				t.Fatalf("synthetic sub_agent tool part missing: %+v", parts[0].Parts)
+			}
+			if !strings.Contains(parts[0].Parts[len(parts[0].Parts)-1].Text, "async result") {
+				t.Fatalf("synthetic sub_agent result missing: %+v", parts[0].Parts)
+			}
+			if strings.Contains(msg.Content, "subagent stats") {
+				t.Fatalf("synthetic async completion message leaked stats footer: %q", msg.Content)
+			}
+			foundStructuredPart = true
 			break
 		}
 	}
 	if !foundSynthetic {
 		t.Fatalf("synthetic async completion message not found: %+v", msgs)
+	}
+	if !foundStructuredPart {
+		t.Fatalf("synthetic async completion message missing structured sub_agent part: metas=%+v", metas)
+	}
+}
+
+func TestTaskWaitReturnsFirstCompletedAsyncJob(t *testing.T) {
+	store, err := memory.OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureConversation("session-1", ""); err != nil {
+		t.Fatalf("EnsureConversation: %v", err)
+	}
+
+	manager := NewAsyncManager()
+	d := &Default{JobStore: store, Async: manager}
+	job1, err := store.CreateSubagentJob(memory.SubagentJob{
+		TaskID:      "task-wait-1",
+		SessionID:   "session-1",
+		Status:      memory.SubagentJobRunning,
+		Description: "slow job",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job2, err := store.CreateSubagentJob(memory.SubagentJob{
+		TaskID:      "task-wait-2",
+		SessionID:   "session-1",
+		Status:      memory.SubagentJobRunning,
+		Description: "fast job",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, waitHandler := d.TaskWaitTool()
+	resultCh := make(chan *tool.CallResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		res, err := waitHandler(
+			tool.WithSessionID(context.Background(), "session-1"),
+			json.RawMessage(`{"task_ids":["task-wait-1","task-wait-2"],"timeout_ms":1000}`),
+		)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- res
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := store.CompleteSubagentJob(job2.ID, "fast result"); err != nil {
+		t.Fatal(err)
+	}
+	updated, ok, err := store.GetSubagentJobByID(job2.ID)
+	if err != nil || !ok {
+		t.Fatalf("load completed job: ok=%v err=%v", ok, err)
+	}
+	manager.PublishJob("updated", updated)
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("task_wait returned error: %v", err)
+	case res := <-resultCh:
+		if res == nil || res.IsError {
+			t.Fatalf("task_wait result = %+v", res)
+		}
+		if !strings.Contains(res.Content, "task_id=task-wait-2") {
+			t.Fatalf("task_wait did not return completed job2: %+v", res)
+		}
+		if !strings.Contains(res.Content, "fast result") {
+			t.Fatalf("task_wait did not include completed result: %+v", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("task_wait did not wake after job completion")
+	}
+
+	unchanged, ok, err := store.GetSubagentJobByID(job1.ID)
+	if err != nil || !ok {
+		t.Fatalf("load job1: ok=%v err=%v", ok, err)
+	}
+	if unchanged.Status != memory.SubagentJobRunning {
+		t.Fatalf("job1 status changed unexpectedly: %+v", unchanged)
 	}
 }
 
@@ -801,13 +922,7 @@ func TestToolHandler_InterruptedResultCarriesPartialContent(t *testing.T) {
 		Model:       "gpt-4o",
 		Interrupted: "interrupted",
 	}
-	content := res.Content
-	if res.Interrupted != "" {
-		content = "[sub-agent was " + res.Interrupted + " and did not finish; the content below is PARTIAL — summarise what it did accomplish and continue the remaining work]\n\n" + content
-	}
-	stats := fmt.Sprintf("\n\n---\n[subagent stats: model=%s, elapsed=%s, rounds=%d, tokens=%d/%d]",
-		res.Model, res.Elapsed.Round(10*time.Millisecond), res.Rounds, res.TokensIn, res.TokensOut)
-	content += stats
+	content := formatSubagentToolResult(res)
 
 	if !strings.Contains(content, "PARTIAL") {
 		t.Errorf("tool result must carry the PARTIAL marker: %q", content)
@@ -815,8 +930,8 @@ func TestToolHandler_InterruptedResultCarriesPartialContent(t *testing.T) {
 	if !strings.Contains(content, "已梳理 12 个模块") {
 		t.Errorf("tool result must carry the partial content: %q", content)
 	}
-	if !strings.Contains(content, "subagent stats") {
-		t.Errorf("tool result must keep the stats footer: %q", content)
+	if strings.Contains(content, "subagent stats") {
+		t.Errorf("tool result must not expose stats footer: %q", content)
 	}
 }
 

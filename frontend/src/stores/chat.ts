@@ -5,6 +5,7 @@
 import { reactive, ref, computed, watch } from 'vue'
 import * as api from '../api/client'
 import { notifyManager } from '../utils/notify'
+import { dedupMessagesByKey } from '../utils/messageDedup'
 import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
 import { isCurrentStream } from './streamLifecycle'
 
@@ -91,6 +92,14 @@ export const state = reactive({
   // Default false (idle) — sessions that have never been
   // streamed to aren't busy.
   sessionWorking: {} as Record<string, boolean>,
+  // Active async sub-agent jobs per session. These jobs run
+  // outside the main chat SSE turn, but the conversation is
+  // still busy from the user's point of view until they finish
+  // and their hook message has been merged back.
+  sessionBackgroundSubAgentJobs: {} as Record<string, number>,
+  // True while the UI is merging a terminal async sub-agent
+  // hook message from the server into the chat transcript.
+  sessionBackgroundHookMerging: {} as Record<string, boolean>,
   // Pending question from the LLM's question tool, keyed by
   // session id. Background sessions may have a question open
   // while the user is viewing another session, so the global
@@ -204,8 +213,28 @@ export const currentRecoveryBanner = computed(() => {
 // combines this with currentTodos to decide whether to
 // show, hide, or clear the dock.
 export const currentSessionWorking = computed(() =>
-  !!state.sessionWorking[state.currentID],
+  !!state.sessionWorking[state.currentID] ||
+  (state.sessionBackgroundSubAgentJobs[state.currentID] || 0) > 0 ||
+  !!state.sessionBackgroundHookMerging[state.currentID],
 )
+
+export function setSessionBackgroundSubAgentJobs(id: string, count: number) {
+  if (!id) return
+  if (count > 0) {
+    state.sessionBackgroundSubAgentJobs[id] = count
+  } else {
+    delete state.sessionBackgroundSubAgentJobs[id]
+  }
+}
+
+export function setSessionBackgroundHookMerging(id: string, merging: boolean) {
+  if (!id) return
+  if (merging) {
+    state.sessionBackgroundHookMerging[id] = true
+  } else {
+    delete state.sessionBackgroundHookMerging[id]
+  }
+}
 
 // clearSessionTodos wipes the local todo list for a session.
 // Used by the TodoPanel's "stale-clear" hack when the
@@ -437,36 +466,6 @@ export async function setActiveProject(path: string) {
 // rarely needs to scroll up to see more. Subsequent pages
 // (loaded by loadMoreMessages) use the same size.
 const initialHistoryLimit = 50
-
-// dedupMessagesByKey folds a freshly-loaded page into the
-// existing in-memory list, dropping any rows we already
-// have. The dedup key is `seq` when available (the new
-// stable per-conversation identity) and `id` as a
-// fallback for older messages / pre-seq DBs.
-//
-// Newer entries (from `incoming`) win on key collision
-// so a re-fetch picks up server-side state changes
-// (e.g. the redactor rewrote `content` on the same row).
-// The merged result is sorted ascending by seq (or id
-// when seq is 0) so the oldest-first invariant holds for
-// the renderer.
-//
-// Idempotency: a stale local state from before the server
-// cursor fix, or a future server bug that returns the same
-// page twice in a row, is collapsed silently. The user
-// never sees the duplicate.
-function dedupMessagesByKey(existing: Message[], incoming: Message[]): Message[] {
-  if (incoming.length === 0) return existing
-  const byKey = new Map<number, Message>()
-  const keyOf = (m: Message): number => (m.seq != null && m.seq > 0) ? m.seq : -(m.id ?? 0)
-  for (const m of existing) {
-    byKey.set(keyOf(m), m)
-  }
-  for (const m of incoming) {
-    byKey.set(keyOf(m), m)
-  }
-  return Array.from(byKey.values()).sort((a, b) => keyOf(a) - keyOf(b))
-}
 
 export async function switchSession(id: string) {
   state.currentID = id
@@ -742,6 +741,8 @@ export async function deleteSessionById(id: string) {
   delete state.sessionMeta[id]
   delete state.sessionTodos[id]
   delete state.sessionWorking[id]
+  delete state.sessionBackgroundSubAgentJobs[id]
+  delete state.sessionBackgroundHookMerging[id]
   delete state.sessionPaging[id]
   // P1-4: drop the per-session regen caches too. The
   // session is being archived; its replies and
@@ -1302,6 +1303,7 @@ function backfillSubAgentMetadata(
   if (ev.sub_agent_color && !p.agentColor) p.agentColor = ev.sub_agent_color
   if (ev.sub_agent_model && !p.agentModel) p.agentModel = ev.sub_agent_model
   if (ev.sub_agent_task_id && !p.taskId) p.taskId = ev.sub_agent_task_id
+  if (ev.sub_agent_run_mode && !p.runMode) p.runMode = ev.sub_agent_run_mode
   if (ev.sub_agent_description && !p.agentDescription) p.agentDescription = ev.sub_agent_description
   if (ev.sub_agent_failure_reason && !p.failureReason) p.failureReason = ev.sub_agent_failure_reason
 }

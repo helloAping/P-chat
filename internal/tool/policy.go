@@ -155,6 +155,9 @@ func defaultToolPolicy(name string) ToolPolicy {
 	case name == "task":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectProcess, ToolRiskConfirm, ToolParallelSafe
 		p.TimeoutMS = -1
+	case name == "task_wait":
+		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectNone, ToolRiskLow, ToolParallelExclusive
+		p.TimeoutMS = -1
 	case name == "task_cancel":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryOrchestration, ToolSideEffectState, ToolRiskMedium, ToolParallelExclusive
 		p.TimeoutMS = 30 * 1000

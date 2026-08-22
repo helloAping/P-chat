@@ -57,6 +57,9 @@ type Request struct {
 	Style          style.Style
 	Provider       string
 	TaskID         string
+	// RunMode is "sync" for a regular in-turn sub-agent and
+	// "async" for a durable background job.
+	RunMode string
 	// ProjectRoot is the session's working directory. The
 	// sub-agent runner reads it from the parent ctx (see
 	// tool.ProjectRootFromCtx) and passes it down to the
@@ -231,6 +234,14 @@ func (m *AsyncManager) Subscribe(sessionID string) (<-chan memory.SubagentJobEve
 		m.mu.Unlock()
 	}
 	return ch, unsubscribe
+}
+
+// PublishJob broadcasts one durable job snapshot to subscribers.
+func (m *AsyncManager) PublishJob(eventType string, job memory.SubagentJob) {
+	if eventType == "" {
+		eventType = "updated"
+	}
+	m.Publish(memory.SubagentJobEvent{Type: eventType, Job: &job})
 }
 
 // Publish notifies live subscribers that a durable async job changed.
@@ -577,8 +588,9 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 		"sub-task benefits from a fresh context (no shared history). " +
 		"The sub-agent gets its own system prompt, its own tool set (file/shell ops, but NOT task), " +
 		"and runs in sync mode by default. Use mode='async' for long background exploration; " +
-		"after launching async work, do not poll task_status in a loop; wait for a completion notification, " +
-		"or check once only when the user explicitly asks. Use task_cancel to stop it. " +
+		"after launching async work, do not end the conversation by saying you will wait. " +
+		"If there is no other useful parent work, call task_wait to block until one background job finishes " +
+		"or the wait window expires. Then call task_status once for completed jobs. Use task_cancel to stop a job. " +
 		"Sync mode returns the sub-agent's final answer. " +
 		"Prefer calling this multiple times in parallel (multiple task calls in one assistant turn) " +
 		"over chaining them when the sub-tasks are independent."
@@ -596,7 +608,7 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 			"description": tool.StringProp("Clear, self-contained description of the sub-task. " +
 				"The sub-agent has no knowledge of the parent conversation, so include all necessary context."),
 			"mode": tool.StringEnumProp("Execution mode. 'sync' launches the sub-agent as concurrent fan-out work and waits for its final answer in this tool call. "+
-				"'async' launches a background job and returns task_id immediately. Do not repeatedly call task_status; wait for the background completion notification or a user request.", "sync", "async"),
+				"'async' launches a background job and returns task_id immediately. If no parent work remains, call task_wait rather than ending the turn with a promise to wait.", "sync", "async"),
 			"subagent_type": tool.StringProp("Optional. Name of a registered sub-agent (e.g. 'explore', 'plan', 'general-purpose', or a custom agent from .p-chat/agent/*.md). " +
 				"Defaults to 'general-purpose' when omitted."),
 			"model": tool.StringProp("Optional 'providerID/modelID' override. " +
@@ -717,8 +729,10 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 		}
 
 		if mode == "async" {
+			req.RunMode = "async"
 			return d.launchAsyncTask(ctx, runner, req)
 		}
+		req.RunMode = "sync"
 
 		res, err := runner.Run(ctx, req)
 		if err != nil {
@@ -730,24 +744,9 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 
 		// Tool result format. The parent LLM is the consumer and
 		// treats this as plain text in the tool result message.
-		// Returning a raw JSON blob here confuses the parent (it
-		// can't easily extract the content) and was a common
-		// cause of "subagent finished but parent produced no
-		// summary" — the parent would echo the JSON keys back
-		// instead of synthesising a real response.
-		//
-		// Format:
-		//   <text content from the sub-agent, verbatim>
-		//
-		//   ---
-		//   [subagent stats: model=<m>, elapsed=<t>, rounds=<n>, tokens=<in>/<out>]
-		//
-		// The text content is the primary payload (what the
-		// parent LLM should read and act on). The stats footer
-		// is a small, recognisable block the LLM can ignore or
-		// surface to the user. The metadata is also kept in the
-		// Result struct for callers that want the structured
-		// form (e.g. the Wails GUI's session inspector).
+		// Return only the sub-agent's content; runtime metadata
+		// stays in Result / SubAgentCard fields so the user does
+		// not see a raw "[subagent stats: ...]" footer.
 		//
 		// Interrupted runs (timeout / cancel with partial output)
 		// still return the partial content — the parent can
@@ -765,6 +764,83 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 		return &tool.CallResult{Content: content}, nil
 	}
 
+	return t, h
+}
+
+type taskWaitArgs struct {
+	TaskID    string   `json:"task_id,omitempty"`
+	TaskIDs   []string `json:"task_ids,omitempty"`
+	TimeoutMS int      `json:"timeout_ms,omitempty"`
+}
+
+// TaskWaitTool blocks the parent turn until an async subagent job finishes.
+func (d *Default) TaskWaitTool() (tool.Tool, tool.ToolHandler) {
+	t := tool.Tool{
+		Name:        "task_wait",
+		Description: "Wait for any async sub-agent job in the current session to finish. Use after launching async tasks when no other parent work is available. If it returns a completed task_id, call task_status once for that task. If it times out, call task_wait again to continue waiting or do other useful work; do not loop task_status.",
+		Parameters: tool.ObjectSchema(map[string]any{
+			"task_id":    tool.StringProp("Optional single task_id to wait on."),
+			"task_ids":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional task_id list to wait on. Omit to wait for any running job in the current session."},
+			"timeout_ms": map[string]any{"type": "integer", "description": "Optional wait window in milliseconds. Defaults to 60000; capped at 120000."},
+		}, nil),
+	}
+	h := func(ctx context.Context, args json.RawMessage) (*tool.CallResult, error) {
+		if d.JobStore == nil {
+			return &tool.CallResult{Content: "task_wait unavailable: job store is not configured", IsError: true}, nil
+		}
+		sessionID, _ := ctx.Value(tool.SessionIDKey{}).(string)
+		if sessionID == "" {
+			return &tool.CallResult{Content: "task_wait unavailable: session id is missing", IsError: true}, nil
+		}
+		var a taskWaitArgs
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &a); err != nil {
+				return &tool.CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
+			}
+		}
+		wanted := normalizeTaskIDSet(a.TaskID, a.TaskIDs)
+		jobs, err := d.JobStore.ListSubagentJobs(sessionID, 100)
+		if err != nil {
+			return &tool.CallResult{Content: "task_wait failed: " + err.Error(), IsError: true}, nil
+		}
+		if len(wanted) == 0 {
+			wanted = activeTaskIDSet(jobs)
+			if len(wanted) == 0 {
+				return &tool.CallResult{Content: "task_wait: no running async sub-agent jobs match this request"}, nil
+			}
+		}
+		if job, ok := firstMatchingTerminalJob(jobs, wanted); ok {
+			return &tool.CallResult{Content: formatTaskWaitCompleted(job)}, nil
+		}
+		if !hasMatchingActiveJob(jobs, wanted) {
+			return &tool.CallResult{Content: "task_wait: no running async sub-agent jobs match this request"}, nil
+		}
+
+		timeout := taskWaitTimeout(a.TimeoutMS)
+		events, unsubscribe := d.asyncManager().Subscribe(sessionID)
+		defer unsubscribe()
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return &tool.CallResult{Content: "task_wait cancelled: " + ctx.Err().Error(), IsError: true}, nil
+			case <-timer.C:
+				return &tool.CallResult{Content: fmt.Sprintf("task_wait timed out after %s: no matching background task finished yet. Continue useful parent work if possible; otherwise call task_wait again to keep waiting.", timeout.Round(time.Millisecond))}, nil
+			case ev, ok := <-events:
+				if !ok {
+					return &tool.CallResult{Content: "task_wait event stream closed; call task_status once if you need a snapshot, or task_wait again to continue waiting."}, nil
+				}
+				if ev.Job == nil || ev.Job.SessionID != sessionID {
+					continue
+				}
+				if !matchesTaskID(ev.Job.TaskID, wanted) || !subagentJobTerminal(ev.Job.Status) {
+					continue
+				}
+				return &tool.CallResult{Content: formatTaskWaitCompleted(*ev.Job)}, nil
+			}
+		}
+	}
 	return t, h
 }
 
@@ -908,7 +984,7 @@ func (d *Default) launchAsyncTask(ctx context.Context, runner Default, req Reque
 	go runAsyncTaskJob(bgCtx, cancel, manager, d.JobStore, runner, job, req)
 
 	return &tool.CallResult{
-		Content: fmt.Sprintf("sub-agent launched in background: task_id=%s, status=%s\nDo not poll task_status repeatedly. Wait for the background completion notification, then call task_status once if you need the final result, or use task_cancel to stop it.",
+		Content: fmt.Sprintf("sub-agent launched in background: task_id=%s, status=%s\nIf no useful parent work remains, immediately call task_wait instead of ending the conversation with a promise to wait. When task_wait reports a completed task_id, call task_status once for that task. Do not poll task_status repeatedly.",
 			job.TaskID, job.Status),
 	}, nil
 }
@@ -920,6 +996,75 @@ func subagentJobTerminal(status string) bool {
 	default:
 		return false
 	}
+}
+
+func normalizeTaskIDSet(single string, ids []string) map[string]struct{} {
+	out := make(map[string]struct{})
+	if id := strings.TrimSpace(single); id != "" {
+		out[id] = struct{}{}
+	}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			out[id] = struct{}{}
+		}
+	}
+	return out
+}
+
+func matchesTaskID(taskID string, wanted map[string]struct{}) bool {
+	if len(wanted) == 0 {
+		return true
+	}
+	_, ok := wanted[taskID]
+	return ok
+}
+
+func taskWaitTimeout(ms int) time.Duration {
+	if ms <= 0 {
+		return 60 * time.Second
+	}
+	d := time.Duration(ms) * time.Millisecond
+	if d < time.Second {
+		return time.Second
+	}
+	if d > 120*time.Second {
+		return 120 * time.Second
+	}
+	return d
+}
+
+func firstMatchingTerminalJob(jobs []memory.SubagentJob, wanted map[string]struct{}) (memory.SubagentJob, bool) {
+	for _, job := range jobs {
+		if matchesTaskID(job.TaskID, wanted) && subagentJobTerminal(job.Status) {
+			return job, true
+		}
+	}
+	return memory.SubagentJob{}, false
+}
+
+func hasMatchingActiveJob(jobs []memory.SubagentJob, wanted map[string]struct{}) bool {
+	for _, job := range jobs {
+		if matchesTaskID(job.TaskID, wanted) && !subagentJobTerminal(job.Status) {
+			return true
+		}
+	}
+	return false
+}
+
+func activeTaskIDSet(jobs []memory.SubagentJob) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, job := range jobs {
+		if job.TaskID != "" && !subagentJobTerminal(job.Status) {
+			out[job.TaskID] = struct{}{}
+		}
+	}
+	return out
+}
+
+func formatTaskWaitCompleted(job memory.SubagentJob) string {
+	return fmt.Sprintf("task_wait completed: task_id=%s status=%s\n\n%s\n\nUse the result above to continue or summarize. If other async sub-agent jobs are still running, call task_wait again for the remaining task_ids.",
+		job.TaskID, job.Status, formatSubagentJob(job))
 }
 
 func formatSubagentJob(job memory.SubagentJob) string {
@@ -971,6 +1116,7 @@ func runAsyncTaskJob(ctx context.Context, cancel context.CancelFunc, manager *As
 		if err := store.CancelSubagentJob(job.ID); err != nil {
 			log.Printf("[subagent/async] mark cancelled job=%s: %v", job.ID, err)
 		}
+		appendAsyncJobMessage(store, job, fmt.Sprintf("Async sub-agent task `%s` cancelled: %v", job.TaskID, ctx.Err()), "cancelled", Result{}, ctx.Err().Error())
 		publishStoredSubagentJob(manager, store, job.ID, "updated")
 		return
 	}
@@ -978,7 +1124,7 @@ func runAsyncTaskJob(ctx context.Context, cancel context.CancelFunc, manager *As
 		if e := store.FailSubagentJob(job.ID, err.Error()); e != nil {
 			log.Printf("[subagent/async] mark failed job=%s: %v", job.ID, e)
 		}
-		appendAsyncJobMessage(store, job, fmt.Sprintf("Async sub-agent task `%s` failed: %v", job.TaskID, err), "failed")
+		appendAsyncJobMessage(store, job, fmt.Sprintf("Async sub-agent task `%s` failed: %v", job.TaskID, err), "failed", Result{}, err.Error())
 		publishStoredSubagentJob(manager, store, job.ID, "updated")
 		return
 	}
@@ -987,7 +1133,7 @@ func runAsyncTaskJob(ctx context.Context, cancel context.CancelFunc, manager *As
 	if err := store.CompleteSubagentJob(job.ID, content); err != nil {
 		log.Printf("[subagent/async] mark complete job=%s: %v", job.ID, err)
 	}
-	appendAsyncJobMessage(store, job, "Async sub-agent task `"+job.TaskID+"` completed.\n\n"+content, "succeeded")
+	appendAsyncJobMessage(store, job, "Async sub-agent task `"+job.TaskID+"` completed.\n\n"+content, "succeeded", res, "")
 	publishStoredSubagentJob(manager, store, job.ID, "updated")
 }
 
@@ -995,11 +1141,13 @@ func makeAsyncProgressHook(store *memory.Store, manager *AsyncManager, jobID str
 	var (
 		mu       sync.Mutex
 		lastSave time.Time
+		recorder = agent.NewPartsRecorder()
 	)
 	return func(c agent.ChatStreamChunk) {
 		if store == nil || jobID == "" {
 			return
 		}
+		recorder.Update(c)
 		important := c.SubAgentStatus != "" || c.Error != "" || c.ToolName != "" || c.Phase != ""
 		if !important {
 			return
@@ -1012,12 +1160,13 @@ func makeAsyncProgressHook(store *memory.Store, manager *AsyncManager, jobID str
 		lastSave = time.Now()
 		mu.Unlock()
 
-		payload := map[string]string{
-			"phase":   c.Phase,
-			"status":  c.SubAgentStatus,
-			"tool":    c.ToolName,
-			"error":   c.Error,
-			"elapsed": c.Duration,
+		payload := asyncProgressPayload{
+			Phase:   c.Phase,
+			Status:  c.SubAgentStatus,
+			Tool:    c.ToolName,
+			Error:   c.Error,
+			Elapsed: c.Duration,
+			Parts:   recorder.Snapshot(),
 		}
 		b, _ := json.Marshal(payload)
 		if err := store.UpdateSubagentJobProgress(jobID, string(b)); err != nil {
@@ -1026,6 +1175,15 @@ func makeAsyncProgressHook(store *memory.Store, manager *AsyncManager, jobID str
 		}
 		publishStoredSubagentJob(manager, store, jobID, "updated")
 	}
+}
+
+type asyncProgressPayload struct {
+	Phase   string              `json:"phase,omitempty"`
+	Status  string              `json:"status,omitempty"`
+	Tool    string              `json:"tool,omitempty"`
+	Error   string              `json:"error,omitempty"`
+	Elapsed string              `json:"elapsed,omitempty"`
+	Parts   []agent.MessagePart `json:"parts,omitempty"`
 }
 
 func publishStoredSubagentJob(manager *AsyncManager, store *memory.Store, jobID, eventType string) {
@@ -1046,23 +1204,117 @@ func publishStoredSubagentJob(manager *AsyncManager, store *memory.Store, jobID,
 	manager.Publish(memory.SubagentJobEvent{Type: eventType, Job: &job})
 }
 
-func appendAsyncJobMessage(store *memory.Store, job memory.SubagentJob, content, status string) {
+func appendAsyncJobMessage(store *memory.Store, job memory.SubagentJob, content, status string, res Result, failureReason string) {
 	if store == nil || job.SessionID == "" {
 		return
+	}
+	if fresh, ok, err := store.GetSubagentJobByID(job.ID); err == nil && ok {
+		job = fresh
+	}
+	parts, err := json.Marshal(asyncJobMessageParts(job, content, status, res, failureReason))
+	if err != nil {
+		log.Printf("[subagent/async] marshal synthetic parts job=%s: %v", job.ID, err)
+	}
+	meta := map[string]string{
+		"reason":          "subagent_async",
+		"subagent_job_id": job.ID,
+		"task_id":         job.TaskID,
+		"status":          status,
+	}
+	if len(parts) > 0 {
+		meta["parts"] = string(parts)
 	}
 	store.AddChatMessageWithMetaTo(job.SessionID, llm.ChatMessage{
 		Role:    llm.RoleAssistant,
 		Type:    llm.TypeText,
 		Content: content,
-	}, map[string]string{
-		"reason":          "subagent_async",
-		"subagent_job_id": job.ID,
-		"task_id":         job.TaskID,
-		"status":          status,
-	})
+	}, meta)
 	if err := store.Flush(); err != nil {
 		log.Printf("[subagent/async] flush synthetic message job=%s: %v", job.ID, err)
 	}
+}
+
+func asyncJobMessageParts(job memory.SubagentJob, content, status string, res Result, failureReason string) []agent.MessagePart {
+	partStatus := "err"
+	if status == memory.SubagentJobSucceeded || status == "succeeded" {
+		partStatus = "ok"
+	}
+	if parts := asyncProgressParts(job.ProgressJSON); len(parts) > 0 {
+		for i := range parts {
+			if parts[i].Kind != "sub_agent" {
+				continue
+			}
+			if parts[i].Status == "" || parts[i].Status == "start" {
+				parts[i].Status = partStatus
+			}
+			if parts[i].RunMode == "" {
+				parts[i].RunMode = "async"
+			}
+			if parts[i].TaskID == "" {
+				parts[i].TaskID = job.TaskID
+			}
+			if parts[i].Task == "" {
+				parts[i].Task = strings.TrimSpace(job.Description)
+			}
+			if parts[i].AgentType == "" {
+				parts[i].AgentType = job.SubagentType
+			}
+			if parts[i].AgentModel == "" {
+				parts[i].AgentModel = job.Model
+			}
+			if failureReason != "" && parts[i].FailureReason == "" {
+				parts[i].FailureReason = failureReason
+			}
+		}
+		return parts
+	}
+	agentType := res.SubagentType
+	if agentType == "" {
+		agentType = job.SubagentType
+	}
+	model := res.Model
+	if model == "" {
+		model = job.Model
+	}
+	elapsed := ""
+	if res.Elapsed > 0 {
+		elapsed = res.Elapsed.Round(10 * time.Millisecond).String()
+	}
+	task := strings.TrimSpace(job.Description)
+	if task == "" {
+		task = job.TaskID
+	}
+	return []agent.MessagePart{
+		{
+			Kind:          "sub_agent",
+			Task:          task,
+			Status:        partStatus,
+			Elapsed:       elapsed,
+			TaskID:        job.TaskID,
+			RunMode:       "async",
+			AgentType:     agentType,
+			AgentModel:    model,
+			FailureReason: failureReason,
+			Parts: []agent.MessagePart{
+				{Kind: "text", Text: content},
+			},
+		},
+	}
+}
+
+func asyncProgressParts(raw string) []agent.MessagePart {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var payload asyncProgressPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err == nil && len(payload.Parts) > 0 {
+		return payload.Parts
+	}
+	var legacyParts []agent.MessagePart
+	if err := json.Unmarshal([]byte(raw), &legacyParts); err == nil && len(legacyParts) > 0 {
+		return legacyParts
+	}
+	return nil
 }
 
 func formatSubagentToolResult(res Result) string {
@@ -1073,13 +1325,7 @@ func formatSubagentToolResult(res Result) string {
 	if res.Interrupted != "" {
 		content = "[sub-agent was " + res.Interrupted + " and did not finish; the content below is PARTIAL — summarise what it did accomplish and continue the remaining work]\n\n" + content
 	}
-	return content + fmt.Sprintf("\n\n---\n[subagent stats: model=%s, elapsed=%s, rounds=%d, tokens=%d/%d]",
-		res.Model,
-		res.Elapsed.Round(10*time.Millisecond),
-		res.Rounds,
-		res.TokensIn,
-		res.TokensOut,
-	)
+	return content
 }
 
 // Run implements Runner.
@@ -1147,6 +1393,10 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 	if chatModel == "" {
 		chatModel = prov
 	}
+	runMode := strings.TrimSpace(req.RunMode)
+	if runMode == "" {
+		runMode = "sync"
+	}
 
 	// Emit a single synthetic "start" event for the parent's UI so it
 	// can open a nested sub-agent card immediately. The card header
@@ -1165,6 +1415,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 			SubAgentColor:       color,
 			SubAgentDescription: agentInfo.Description,
 			SubAgentTaskID:      req.TaskID,
+			SubAgentRunMode:     runMode,
 		})
 	}
 
@@ -1186,7 +1437,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 
 	// Build a sub-agent's tool registry. Three layers of filter
 	// (in priority order):
-	//   1. Hard exclusions: task/task_status/task_cancel, recall
+	//   1. Hard exclusions: task/task_status/task_wait/task_cancel, recall
 	//      (recursion / coordination).
 	//   2. Per-agent whitelist (agentInfo.Tools). When non-empty, ONLY
 	//      those tools are exposed (minus the hard exclusions). A tool
@@ -1284,6 +1535,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		chunk.SubAgentType = subType
 		chunk.SubAgentColor = color
 		chunk.SubAgentTaskID = req.TaskID
+		chunk.SubAgentRunMode = runMode
 
 		if chunk.Error != "" {
 			streamErrorChunk = true
@@ -1440,6 +1692,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 			SubAgentDescription:   agentInfo.Description,
 			SubAgentFailureReason: failureReason,
 			SubAgentTaskID:        req.TaskID,
+			SubAgentRunMode:       runMode,
 			Duration:              time.Since(start).Round(10 * time.Millisecond).String(),
 		})
 	}
@@ -1552,7 +1805,7 @@ func redactPhantomErrorsServer(s string) string {
 // filterSubAgentTools builds the sub-agent's tool registry from the
 // parent registry. Three layers, in priority order:
 //
-//  1. Hard exclusions: task/task_status/task_cancel, recall
+//  1. Hard exclusions: task/task_status/task_wait/task_cancel, recall
 //     (recursion / coordination).
 //  2. Per-agent whitelist (agentWhitelist). When non-empty, ONLY
 //     those tools are exposed (minus the hard exclusions). A tool on
@@ -1576,7 +1829,7 @@ func filterSubAgentTools(
 	for _, name := range parent.Names() {
 		// Sub-agents can't spawn/manage sub-agents or call recall
 		// themselves; these coordination tools stay at the top level.
-		if name == "task" || name == "task_status" || name == "task_cancel" || name == "recall" {
+		if name == "task" || name == "task_status" || name == "task_wait" || name == "task_cancel" || name == "recall" {
 			continue
 		}
 		// Per-agent whitelist takes priority over the global

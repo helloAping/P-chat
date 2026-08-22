@@ -160,6 +160,7 @@ export type MessagePart =
       agentColor?: string
       agentModel?: string
       taskId?: string
+      runMode?: 'sync' | 'async' | string
       agentDescription?: string
       failureReason?: string
     }
@@ -1195,6 +1196,7 @@ export interface StreamEvent {
   sub_agent_color?: string
   sub_agent_model?: string
   sub_agent_task_id?: string
+  sub_agent_run_mode?: 'sync' | 'async' | string
   sub_agent_description?: string
   sub_agent_failure_reason?: string
   // thinking_rewrite is the post-stream redactor's

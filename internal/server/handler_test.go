@@ -454,9 +454,7 @@ func TestListMessages_PartsRoundTrip(t *testing.T) {
 	store.AddMessage(llm.Message{Role: "user", Content: "hi"})
 	partsBlob := []agent.MessagePart{
 		{Kind: "tool", Name: "read_file", Args: `{"path":"x"}`, Status: "ok", Result: "data", Elapsed: "5ms"},
-		{Kind: "sub_agent", Task: "list repo", Status: "ok", Elapsed: "1s", Parts: []agent.MessagePart{
-			{Kind: "text", Text: "found 3 files"},
-		}},
+		{Kind: "sub_agent", Task: "list repo", Status: "ok", Elapsed: "1s"},
 	}
 	partsJSON, _ := json.Marshal(partsBlob)
 	store.AddMessageWithMeta(llm.Message{Role: "assistant", Content: "hello there"}, map[string]string{
@@ -509,7 +507,7 @@ func TestListMessages_PartsRoundTrip(t *testing.T) {
 	if asst.Parts[3].Kind != "text" || asst.Parts[3].Text != "hello there" {
 		t.Errorf("parts[3] text wrong: %+v", asst.Parts[3])
 	}
-	if len(asst.Parts[2].Parts) != 1 || asst.Parts[2].Parts[0].Text != "found 3 files" {
+	if len(asst.Parts[2].Parts) != 0 {
 		t.Errorf("sub-agent inner parts wrong: %+v", asst.Parts[2].Parts)
 	}
 }
