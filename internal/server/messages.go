@@ -153,6 +153,10 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	if req.WorkMode != "" {
 		h.setSessionMetaWorkMode(id, string(workMode))
 	}
+	useImageRecognition := h.sessionUseImageRecognition(id)
+	if req.UseImageRecognition != nil {
+		useImageRecognition = *req.UseImageRecognition
+	}
 
 	// Hydrate the durable plan before the agent builds its prompt. A
 	// resume request must see the interrupted in_progress item even after
@@ -200,6 +204,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		Messages:            msgs,
 		HistoryMessageCount: historyMessageCount,
 		Attachments:         req.Attachments,
+		UseImageRecognition: useImageRecognition,
 		// Forward the frontend's client-minted row id. The
 		// agent uses it as the explicit SQLite row id for
 		// this turn's user message, so rollback/regen

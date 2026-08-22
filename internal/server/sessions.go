@@ -727,6 +727,14 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)
 	}
+	if req.UseImageRecognition != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.UseImageRecognition = *req.UseImageRecognition
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
 
 	// Re-read so the response reflects the on-disk truth.
 	cv, err = h.store.GetConversation(id)

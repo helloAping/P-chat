@@ -6,7 +6,7 @@
 
 ## 概述
 
-Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工具是 LLM 可以调用的函数：执行命令、读写文件、列目录、阅读文档（PDF/DOCX）、待办管理（todo_write）、用户提问（question）。
+Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工具是 LLM 可以调用的函数：执行命令、读写文件、列目录、阅读文档（PDF/DOCX）、待办管理（todo_write）、用户提问（question）、图片识别（image_recognize）。
 
 ## 文件结构
 
@@ -52,6 +52,7 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 | `read_pdf` | 读取 .pdf | registry.go:240, 555 |
 | `web_fetch` | HTTP 抓取 URL（带 SSRF 防护） | registry.go:275, 749 |
 | `web_search` | 公开网络搜索（snippet+url，可插拔 provider） | websearch.go |
+| `image_recognize` | 调用系统配置中的外接多模态模型识别会话上传图片 | image_recognize.go, registry.go |
 | `todo_write` | 管理待办列表 | registry.go:256, todo.go |
 | `question` | 向用户提问并等待 | registry.go:275, question.go |
 
@@ -90,6 +91,14 @@ type SandboxChecker interface {
 ### 6. Todo 持久化
 
 `todo_write` 的工具结果通过 `PersistTodos` 持久化到 SQLite。`GET /sessions/:id/todos` 可在服务器重启后重新加载。
+
+### 6.5 图片识别工具
+
+`image_recognize` 只在两层开关同时满足时暴露给 LLM：
+- 系统配置 `vision_recognition.enabled=true`，且指定的 provider/model 已存在。
+- 当前会话 `use_image_recognition=true`。
+
+图片上传后，`ExpandAttachmentsCM()` 会把图片作为 `SubmitToLLM=0` 的显示/持久化消息保存，并给主模型追加一条 system 引用，提示可用的 `upload_id`。主模型看不到图片二进制，只能调用 `image_recognize`；工具 handler 通过会话上传引用校验 `upload_id`，再调用系统配置里的多模态模型，把识别文本返回给主对话。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

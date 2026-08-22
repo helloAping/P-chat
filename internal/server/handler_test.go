@@ -1580,6 +1580,34 @@ func TestPatchSession_StillRenamesWhenTitleOnly(t *testing.T) {
 	}
 }
 
+func TestPatchSession_PersistsUseImageRecognition(t *testing.T) {
+	srv, _ := newTestServer(t)
+	sess := createSessionPOST(t, srv, "")
+	w := patchSession(t, srv, sess.ID, `{"use_image_recognition":true}`)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.UseImageRecognition {
+		t.Fatalf("UseImageRecognition = false, want true")
+	}
+
+	for k := range srv.Handler().meta {
+		delete(srv.Handler().meta, k)
+	}
+	w = httptest.NewRecorder()
+	srv.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != 200 {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	got = SessionResponse{}
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.UseImageRecognition {
+		t.Fatalf("reloaded UseImageRecognition = false, want true")
+	}
+}
+
 func TestSessionMeta_PersistsAcrossNewHandler(t *testing.T) {
 	// The on-disk meta blob (conversations.metadata) is the
 	// single source of truth. A fresh *Handler reading the same

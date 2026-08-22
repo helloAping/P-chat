@@ -38,7 +38,7 @@ type Attachment struct {
 	Name string `json:"name"`
 	// Size is the file size in bytes. Computed from Data when
 	// the attachment is inlined.
-	Size int64  `json:"size,omitempty"`
+	Size int64 `json:"size,omitempty"`
 	// Kind is "image" | "audio" | "text" | "file". Drives the
 	// multi-content part type and the system prompt section.
 	Kind string `json:"kind"`
@@ -126,8 +126,11 @@ func (r *DiskAttachmentResolver) Resolve(a Attachment) (string, int64) {
 // attachments are inlined as type=text blocks.
 //
 // visionCapable is an optional callback; when it returns false,
-// image attachments are replaced with a text marker.
-func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachment, r AttachmentResolver, visionCapable func() bool) []llm.ChatMessage {
+// image attachments are replaced with a text marker. When
+// useImageRecognition is true, images are kept for display/storage but
+// withheld from the main LLM; a system reference tells the model to call
+// image_recognize with the upload_id.
+func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachment, r AttachmentResolver, visionCapable func() bool, useImageRecognition bool) []llm.ChatMessage {
 	if len(atts) == 0 || r == nil {
 		return msgs
 	}
@@ -183,6 +186,35 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 		switch a.Kind {
 		case "image":
 			mime := imageMIME(a.Name, a.MIME)
+			if useImageRecognition {
+				result = append(result, llm.ChatMessage{
+					Role:        llm.RoleUser,
+					Type:        llm.TypeImage,
+					Content:     base64.StdEncoding.EncodeToString(data),
+					Name:        a.Name,
+					MimeType:    mime,
+					UploadID:    a.UploadID,
+					MsgType:     llm.MsgTypeImage,
+					SubmitToLLM: 0,
+				})
+				if a.UploadID != "" {
+					result = append(result, llm.ChatMessage{
+						Role: llm.RoleSystem,
+						Type: llm.TypeText,
+						Content: fmt.Sprintf(
+							"Uploaded image available for tool-based recognition: name=%q, upload_id=%q, size=%d bytes, MIME=%s. The main model cannot see this image directly in this session. If image details are needed, call image_recognize with this upload_id and a focused question.",
+							a.Name, a.UploadID, len(data), mime,
+						),
+					})
+				} else {
+					result = append(result, llm.ChatMessage{
+						Role:    llm.RoleSystem,
+						Type:    llm.TypeText,
+						Content: fmt.Sprintf("An image named %q was uploaded, but it has no upload_id; image_recognize cannot access it. Ask the user to upload it again if image details are required.", a.Name),
+					})
+				}
+				continue
+			}
 			if visionCapable != nil && !visionCapable() {
 				result = append(result, llm.ChatMessage{
 					Role:        llm.RoleUser,

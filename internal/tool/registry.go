@@ -700,6 +700,15 @@ func RegisterBuiltin(r *Registry) {
 	}, handleWebFetch)
 
 	r.Register(Tool{
+		Name:        "image_recognize",
+		Description: "Analyze a user-uploaded image through the configured external multimodal model and return a text description to the main conversation. Use only for upload_id values explicitly shown in this chat. Do not pass file paths.",
+		Parameters: ObjectSchema(map[string]any{
+			"upload_id": StringProp("The upload_id of an image attached in this conversation"),
+			"question":  StringProp("Optional focused question for the vision model, e.g. what details to extract from the image"),
+		}, []string{"upload_id"}),
+	}, handleImageRecognize)
+
+	r.Register(Tool{
 		Name:        "todo_write",
 		Description: "Create and manage a structured task list for your current coding session. Use this to plan work, track progress, and show the user what you're doing. Each todo item has an id, content, and status (pending/in_progress/done/cancelled). Always include the full list when calling this tool �?it replaces the previous list entirely.",
 		Parameters: ObjectSchema(map[string]any{

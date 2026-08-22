@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/p-chat/pchat/internal/llm"
@@ -184,7 +185,7 @@ func TestExpandAttachmentsCM_UploadImage(t *testing.T) {
 	}
 	out := ExpandAttachmentsCM("openai", in, []Attachment{
 		{UploadID: id, Name: "test.png", Kind: "image", MIME: "image/png"},
-	}, resolver, func() bool { return true })
+	}, resolver, func() bool { return true }, false)
 	if len(out) != 2 {
 		t.Fatalf("len(out) = %d, want 2 (text + image)", len(out))
 	}
@@ -201,6 +202,36 @@ func TestExpandAttachmentsCM_UploadImage(t *testing.T) {
 	}
 	if img.Name != "test.png" || img.MimeType != "image/png" {
 		t.Errorf("img metadata = (%q, %q), want (test.png, image/png)", img.Name, img.MimeType)
+	}
+}
+
+func TestExpandAttachmentsCM_ImageRecognitionMode(t *testing.T) {
+	dir := t.TempDir()
+	id := "abcd1234567890ab"
+	raw := []byte("fake-png-bytes")
+	if err := os.WriteFile(filepath.Join(dir, id+"-test.png"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &DiskAttachmentResolver{BaseDir: dir}
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "look at this", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+	}
+	out := ExpandAttachmentsCM("openai", in, []Attachment{
+		{UploadID: id, Name: "test.png", Kind: "image", MIME: "image/png"},
+	}, resolver, func() bool { return false }, true)
+	if len(out) != 3 {
+		t.Fatalf("len(out) = %d, want 3 (text + display image + system ref)", len(out))
+	}
+	img := out[1]
+	if img.Type != llm.TypeImage || img.SubmitToLLM != 0 {
+		t.Fatalf("image = %#v, want display-only image", img)
+	}
+	if img.UploadID != id {
+		t.Fatalf("img.UploadID = %q, want %q", img.UploadID, id)
+	}
+	ref := out[2]
+	if ref.Role != llm.RoleSystem || !strings.Contains(ref.Content, id) || !strings.Contains(ref.Content, "image_recognize") {
+		t.Fatalf("system ref = %#v, want upload_id image_recognize hint", ref)
 	}
 }
 

@@ -82,7 +82,7 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string; todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited' }>,
+  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string; todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'; use_image_recognition?: boolean }>,
   globalWorkMode: 'coding' as string,
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
@@ -278,6 +278,7 @@ export const currentMeta = computed(() => {
     title: '',
     vector_store: '',
     knowledge_base: '',
+    use_image_recognition: false,
   }
 })
 
@@ -561,6 +562,7 @@ export async function switchSession(id: string) {
       vector_store: s.vector_store || '',
       knowledge_base: s.knowledge_base || '',
       todo_long_run_mode: s.todo_long_run_mode || 'adaptive',
+      use_image_recognition: s.use_image_recognition || false,
     }
   }
   // Load per-session todos.
@@ -786,6 +788,7 @@ export async function renameSession(id: string, title: string) {
     s.work_mode = resp.work_mode ?? s.work_mode
     s.provider = resp.provider ?? s.provider
     s.model = resp.model ?? s.model
+    s.use_image_recognition = resp.use_image_recognition ?? s.use_image_recognition
   }
   if (state.sessionMeta[id]) {
     state.sessionMeta[id] = {
@@ -800,6 +803,7 @@ export async function renameSession(id: string, title: string) {
       vector_store: resp.vector_store ?? state.sessionMeta[id].vector_store,
       knowledge_base: resp.knowledge_base ?? state.sessionMeta[id].knowledge_base,
       todo_long_run_mode: resp.todo_long_run_mode ?? state.sessionMeta[id].todo_long_run_mode,
+      use_image_recognition: resp.use_image_recognition ?? state.sessionMeta[id].use_image_recognition,
     }
   }
 }

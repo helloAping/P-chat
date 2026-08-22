@@ -18,11 +18,13 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -166,6 +168,11 @@ func (a *Agent) LLM() *llm.Client { return a.llm }
 // a config change so new providers / API keys take effect immediately.
 func (a *Agent) SetLLM(c *llm.Client) {
 	a.llm = c
+}
+
+// SetConfig swaps the agent's config pointer after a system config change.
+func (a *Agent) SetConfig(cfg *config.Config) {
+	a.cfg = cfg
 }
 
 // BypassSandboxOnce makes the next tool call skip sandbox checks.
@@ -366,6 +373,155 @@ func (a *Agent) visionGatedTools(providerName, modelName string, tools []tool.To
 	return filterVisionTools(tools)
 }
 
+func filterImageRecognitionTools(tools []tool.Tool) []tool.Tool {
+	out := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		if t.Name == "image_recognize" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+func (a *Agent) imageRecognitionAvailable() bool {
+	if a == nil || a.cfg == nil || a.llm == nil {
+		return false
+	}
+	vc := a.cfg.Vision
+	vc.Normalize()
+	if !vc.Enabled || strings.TrimSpace(vc.Provider) == "" || strings.TrimSpace(vc.Model) == "" {
+		return false
+	}
+	for _, p := range a.cfg.LLM.Providers {
+		if p.Name != vc.Provider {
+			continue
+		}
+		for _, m := range p.AllModels() {
+			if m.Name == vc.Model {
+				return true
+			}
+		}
+		return p.Model == vc.Model
+	}
+	return false
+}
+
+func (a *Agent) imageRecognitionGatedTools(enabledForSession bool, tools []tool.Tool) []tool.Tool {
+	if enabledForSession && a.imageRecognitionAvailable() {
+		return tools
+	}
+	return filterImageRecognitionTools(tools)
+}
+
+func dropDisplayOnlyMediaMessages(msgs []llm.ChatMessage) []llm.ChatMessage {
+	out := msgs[:0]
+	for _, m := range msgs {
+		if m.SubmitToLLM == 0 && (m.Type == llm.TypeImage || m.Type == llm.TypeAudio || m.Type == llm.TypeVideo) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func (a *Agent) resolveImageForRecognition(ctx context.Context, sessionID, uploadID string) (tool.ImageRecognitionImage, error) {
+	if a == nil || a.store == nil || a.attach == nil {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("image storage is not available")
+	}
+	allowed := false
+	for _, ref := range a.store.UploadRefsForConversation(sessionID) {
+		if ref == uploadID {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("upload_id %q is not referenced by this conversation", uploadID)
+	}
+	path, size := a.attach.Resolve(Attachment{ID: uploadID})
+	if path == "" {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("upload %q not found", uploadID)
+	}
+	vc := a.cfg.Vision
+	vc.Normalize()
+	if size > vc.MaxImageBytes {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("image is too large: %d bytes (max %d)", size, vc.MaxImageBytes)
+	}
+	select {
+	case <-ctx.Done():
+		return tool.ImageRecognitionImage{}, ctx.Err()
+	default:
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return tool.ImageRecognitionImage{}, err
+	}
+	if int64(len(data)) > vc.MaxImageBytes {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("image is too large: %d bytes (max %d)", len(data), vc.MaxImageBytes)
+	}
+	name := filepath.Base(path)
+	prefix := uploadID + "-"
+	if strings.HasPrefix(name, prefix) {
+		name = strings.TrimPrefix(name, prefix)
+	}
+	return tool.ImageRecognitionImage{
+		UploadID: uploadID,
+		Name:     name,
+		MIME:     imageMIME(name, ""),
+		Data:     data,
+	}, nil
+}
+
+func (a *Agent) recognizeImageWithConfiguredModel(ctx context.Context, req tool.ImageRecognitionRequest) (string, error) {
+	if !a.imageRecognitionAvailable() {
+		return "", fmt.Errorf("vision_recognition is not configured")
+	}
+	vc := a.cfg.Vision
+	vc.Normalize()
+	timeout := time.Duration(vc.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	question := strings.TrimSpace(req.Question)
+	if question == "" {
+		question = "Describe this image in detail."
+	}
+	msgs := []llm.ChatMessage{
+		{
+			Role:    llm.RoleSystem,
+			Type:    llm.TypeText,
+			Content: "You are an image recognition tool for P-Chat. Return only factual visual observations and visible text. If uncertain, say so. Match the user's language when possible.",
+		},
+		{
+			Role:    llm.RoleUser,
+			Type:    llm.TypeText,
+			Content: question,
+		},
+		{
+			Role:     llm.RoleUser,
+			Type:     llm.TypeImage,
+			Content:  base64.StdEncoding.EncodeToString(req.Image.Data),
+			Name:     req.Image.Name,
+			MimeType: req.Image.MIME,
+		},
+	}
+	ch := a.llm.ChatStreamCM(callCtx, vc.Provider, vc.Model, msgs, nil, llm.ChatOptions{})
+	var sb strings.Builder
+	for chunk := range ch {
+		if chunk.Err != nil {
+			return "", chunk.Err
+		}
+		if chunk.Done {
+			break
+		}
+		sb.WriteString(chunk.Content)
+	}
+	return strings.TrimSpace(sb.String()), nil
+}
+
 // visionCapableByHeuristic returns a best-guess vision
 // capability for an unknown (provider, model) pair. The
 // goal is to NOT trust the LLM API to surface the error
@@ -442,6 +598,10 @@ type ChatRequest struct {
 	// entries (text + image/file) before being sent to the LLM.
 	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// UseImageRecognition keeps uploaded images out of the main model and
+	// exposes image_recognize so a configured multimodal model can describe
+	// them as text.
+	UseImageRecognition bool `json:"use_image_recognition,omitempty"`
 	// ClientMsgID, when non-zero, is the row id the frontend
 	// minted at send time (Date.now() × 1000 + random, well
 	// outside SQLite's AUTOINCREMENT range). The agent uses
@@ -1238,6 +1398,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
 		a.loadProjectDynamicTools(req.ProjectRoot)
 		availableTools := a.tools.ListForProject(req.ProjectRoot)
+		useImageRecognition := req.UseImageRecognition && a.imageRecognitionAvailable()
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
 		kbEnabled := req.KBBase != "" && req.KBBase != "__off__"
@@ -1261,6 +1422,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// (before toolDefs / prompt / subagent wiring) keeps
 		// every downstream consumer consistent.
 		availableTools = a.visionGatedTools(req.Provider, req.Model, availableTools)
+		availableTools = a.imageRecognitionGatedTools(useImageRecognition, availableTools)
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -1394,7 +1556,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if len(req.Attachments) > 0 && a.attach != nil {
 			protocol := a.protocolFor(req.Provider)
 			vision := func() bool { return a.modelSupportsVision(req.Provider, req.Model) }
-			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision)
+			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision, useImageRecognition)
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))})
 		}
 
@@ -1451,6 +1613,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				a.store.AddChatMessageTo(req.SessionID, m)
 			}
 		}
+		msgs = dropDisplayOnlyMediaMessages(msgs)
 
 		// Plan mode: the LLM can use `todo_write` to break down
 		// the analysis into steps, and `question` to clarify vague
@@ -2318,6 +2481,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				tctx = WithParentModel(tctx, req.Provider, req.Model)
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
+				}
+				if useImageRecognition {
+					tctx = tool.WithImageResolver(tctx, a.resolveImageForRecognition)
+					tctx = tool.WithImageRecognizer(tctx, a.recognizeImageWithConfiguredModel)
 				}
 				if a.store != nil {
 					// Persist todo writes through the request context so each

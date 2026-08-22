@@ -20,21 +20,22 @@ import (
 // been removed. The loader still accepts a legacy config.yaml as
 // a one-shot migration source — see Load.
 type Config struct {
-	Server    ServerConfig    `json:"server"`
-	LLM       LLMConfig       `json:"llm"`
-	Style     StyleConfig     `json:"style"`
-	UI        UIConfig        `json:"ui"`
-	WorkMode  WorkModeConfig  `json:"work_mode"`
-	Tools     ToolsConfig     `json:"tools"`
-	Memory    MemoryConfig    `json:"memory"`
-	Sandbox   SandboxConfig   `json:"sandbox"`
-	SubAgent  SubAgentConfig  `json:"subagent"`
-	MCP       MCPConfig       `json:"mcp"`
-	Knowledge KnowledgeConfig `json:"knowledge"`
-	Limits    LimitsConfig    `json:"limits"`
-	Search    SearchConfig    `json:"search"`
-	Browser   BrowserConfig   `json:"browser"`
-	IM        IMConfig        `json:"im"`
+	Server    ServerConfig            `json:"server"`
+	LLM       LLMConfig               `json:"llm"`
+	Style     StyleConfig             `json:"style"`
+	UI        UIConfig                `json:"ui"`
+	WorkMode  WorkModeConfig          `json:"work_mode"`
+	Tools     ToolsConfig             `json:"tools"`
+	Memory    MemoryConfig            `json:"memory"`
+	Sandbox   SandboxConfig           `json:"sandbox"`
+	SubAgent  SubAgentConfig          `json:"subagent"`
+	MCP       MCPConfig               `json:"mcp"`
+	Knowledge KnowledgeConfig         `json:"knowledge"`
+	Limits    LimitsConfig            `json:"limits"`
+	Search    SearchConfig            `json:"search"`
+	Browser   BrowserConfig           `json:"browser"`
+	Vision    VisionRecognitionConfig `json:"vision_recognition"`
+	IM        IMConfig                `json:"im"`
 	// Dynamic is the P3-2 per-tool config table. The
 	// user writes `dynamic.<tool_name>.config: {…}`
 	// in their config.json and the dynamic tool's
@@ -489,6 +490,28 @@ type WorkModeConfig struct {
 	Default WorkMode `json:"default"`
 }
 
+// VisionRecognitionConfig selects the external multimodal model used by
+// the image_recognize tool. The main chat model can stay text-only; when
+// a session opts in, uploaded images are described through this model and
+// returned to the main conversation as tool text.
+type VisionRecognitionConfig struct {
+	Enabled        bool   `json:"enabled"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	MaxImageBytes  int64  `json:"max_image_bytes,omitempty"`
+}
+
+// Normalize fills conservative defaults for unset numeric limits.
+func (v *VisionRecognitionConfig) Normalize() {
+	if v.TimeoutSeconds <= 0 {
+		v.TimeoutSeconds = 60
+	}
+	if v.MaxImageBytes <= 0 {
+		v.MaxImageBytes = 10 << 20
+	}
+}
+
 type ToolsConfig struct {
 	Enabled []string           `json:"enabled"`
 	Servers []ToolServerConfig `json:"servers"`
@@ -887,6 +910,7 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	migrateKnowledgeDefaults(cfg)
 	cfg.UI.CloseBehavior = cfg.UI.CloseBehavior.Normalize()
 	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
+	cfg.Vision.Normalize()
 
 	return cfg, nil
 }
@@ -1027,6 +1051,11 @@ func Default() *Config {
 				"*.alipay.com",
 				"*.paypal.com",
 			},
+		},
+		Vision: VisionRecognitionConfig{
+			Enabled:        false,
+			TimeoutSeconds: 60,
+			MaxImageBytes:  10 << 20,
 		},
 		IM: DefaultIMConfig(),
 	}

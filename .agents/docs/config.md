@@ -33,6 +33,7 @@ type Config struct {
     Sandbox SandboxConfig // 命令/文件写入保护模式
     SubAgent SubAgentConfig // 子代理超时/工具过滤
     WorkMode WorkModeConfig // 默认工作侧重点：coding / daily
+    Vision VisionRecognitionConfig // 外接图片识别模型设置
 }
 ```
 
@@ -63,6 +64,16 @@ LLMConfig 核心字段：
 - `WorkMode.Normalize()` 会把空值或未知值回落到 `coding`；`IsValid()` 只接受 `coding` 和 `daily`。
 
 全局默认通过 `/api/v1/config` 读写；单会话覆盖值存放在 `conversations.metadata.work_mode`。
+
+### 6. VisionRecognitionConfig
+
+`vision_recognition` 是全局系统配置，用于给不支持多模态的主对话模型外接一个多模态模型：
+- `enabled` — 是否允许会话启用图片识别工具。
+- `provider` / `model` — 使用已配置 LLM provider 中的模型。
+- `timeout_seconds` — 单次识别超时，默认 60 秒。
+- `max_image_bytes` — 单张图片大小上限，默认 10 MiB。
+
+单会话是否使用该能力存放在 `conversations.metadata.use_image_recognition`；只有系统配置和会话开关都开启时，Agent 才会向 LLM 暴露 `image_recognize` 工具。
 
 ## 修改指南
 

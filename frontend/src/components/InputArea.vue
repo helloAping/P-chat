@@ -14,7 +14,7 @@ import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
   Lock, Unlock, Key, Database, Copy, Scissors, ClipboardPaste, TextCursorInput,
-  Settings,
+  Settings, ImageIcon,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -1070,6 +1070,7 @@ async function send() {
       model: meta.model,
       style: meta.style,
       workMode: meta.workMode,
+      useImageRecognition: meta.use_image_recognition,
       todoMode,
       attachments: inlineAttachments,
       skillContext: pendingSkillContext || undefined,
@@ -1242,6 +1243,31 @@ async function onTodoLongRunPick(v: 'off' | 'adaptive' | 'unlimited') {
   }
 }
 
+const imageRecognitionEnabled = computed(() =>
+  !!state.sessionMeta[state.currentID]?.use_image_recognition,
+)
+
+const imageRecognitionLabel = computed(() =>
+  imageRecognitionEnabled.value ? '开' : '关',
+)
+
+async function onImageRecognitionPick(v: boolean) {
+  if (!state.currentID) return
+  try {
+    const resp = await api.updateSessionMeta(state.currentID, { use_image_recognition: v })
+    const id = state.currentID
+    const enabled = resp.use_image_recognition ?? v
+    state.sessionMeta[id] = {
+      ...(state.sessionMeta[id] || currentMeta.value),
+      use_image_recognition: enabled,
+    }
+    const session = state.sessions.find(s => s.id === id)
+    if (session) session.use_image_recognition = enabled
+  } catch (e: any) {
+    message.error(`图像识别设置失败：${e?.message || e}`)
+  }
+}
+
 const currentWorkModeValue = computed({
   get: () => currentMeta.value.workMode || state.globalWorkMode || 'coding',
   set: (v: string) => onWorkModePick(v),
@@ -1268,7 +1294,7 @@ const currentReasoningLabel = computed(() => {
 })
 
 const sessionConfigSummary = computed(() =>
-  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 风格${currentStyleLabel.value}`,
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 识图${imageRecognitionLabel.value} · 风格${currentStyleLabel.value}`,
 )
 
 // Display label for the knowledge base picker. The "off"
@@ -1498,7 +1524,7 @@ onMounted(() => {
             >
               <Settings :size="13" />
               <span class="ctrl-btn-label">会话设置</span>
-              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }}</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 识图{{ imageRecognitionLabel }}</span>
             </button>
           </template>
           <div class="session-config-popover">
@@ -1551,6 +1577,31 @@ onMounted(() => {
                   @click="pickReasoning(opt.value)"
                 >
                   {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">
+                <ImageIcon :size="12" />
+                <span>图像识别</span>
+              </div>
+              <div class="session-config-options">
+                <button
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': !imageRecognitionEnabled }"
+                  @click="onImageRecognitionPick(false)"
+                >
+                  关闭
+                </button>
+                <button
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': imageRecognitionEnabled }"
+                  @click="onImageRecognitionPick(true)"
+                >
+                  使用工具
                 </button>
               </div>
             </div>
@@ -2195,13 +2246,16 @@ onMounted(() => {
 }
 .session-config-row {
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr);
+  grid-template-columns: 64px minmax(0, 1fr);
   gap: 8px;
   align-items: start;
   padding: 8px 6px;
   border-top: 1px solid var(--border-subtle);
 }
 .session-config-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   color: var(--text-tertiary);
   font-size: 12px;
   line-height: 26px;

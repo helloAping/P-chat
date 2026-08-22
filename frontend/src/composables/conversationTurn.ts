@@ -9,6 +9,7 @@ export type ConversationTurnInput = {
   model?: string
   style?: string
   workMode?: string
+  useImageRecognition?: boolean
   todoMode: 'auto' | 'resume' | 'clear'
   attachments?: api.InlineAttachment[]
   skillContext?: string
@@ -91,6 +92,7 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       model: input.model,
       style: input.style,
       workMode: input.workMode,
+      useImageRecognition: input.useImageRecognition,
       todo_mode: input.todoMode,
       attachments: input.attachments,
       signal: ctrl.signal,

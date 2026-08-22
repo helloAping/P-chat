@@ -280,6 +280,13 @@ const sysSubAgent = ref<api.SubAgentConfig>({
   cache_ttl: '',
   timeout: '',
 })
+const sysVision = ref<api.VisionRecognitionConfig>({
+  enabled: false,
+  provider: '',
+  model: '',
+  timeout_seconds: 60,
+  max_image_bytes: 10 * 1024 * 1024,
+})
 const sysWorkMode = ref('coding')
 const sysCloseBehavior = ref<'exit' | 'tray'>('exit')
 const sysDirty = ref(false)
@@ -294,6 +301,13 @@ async function loadSystemConfig() {
     const sc = await api.getSystemConfig()
     sysLimits.value = sc.limits
     sysSubAgent.value = sc.sub_agent
+    sysVision.value = sc.vision_recognition || {
+      enabled: false,
+      provider: '',
+      model: '',
+      timeout_seconds: 60,
+      max_image_bytes: 10 * 1024 * 1024,
+    }
     sysWorkMode.value = sc.work_mode?.default || 'coding'
     sysCloseBehavior.value = normalizeCloseBehavior(sc.ui?.close_behavior)
     chatState.globalWorkMode = sysWorkMode.value
@@ -325,10 +339,18 @@ async function saveSystemConfig() {
     patch.sub_agent = sa
     patch.work_mode = { default: sysWorkMode.value }
     patch.ui = { close_behavior: sysCloseBehavior.value }
+    patch.vision_recognition = {
+      enabled: sysVision.value.enabled,
+      provider: sysVision.value.provider,
+      model: sysVision.value.model,
+      timeout_seconds: sysVision.value.timeout_seconds,
+      max_image_bytes: sysVision.value.max_image_bytes,
+    }
 
     const updated = await api.updateSystemConfig(patch)
     chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
     sysCloseBehavior.value = normalizeCloseBehavior(updated.ui?.close_behavior)
+    if (updated.vision_recognition) sysVision.value = updated.vision_recognition
     sysDirty.value = false
     message.success('系统配置已保存')
   } catch (e: any) {
@@ -350,6 +372,13 @@ function resetSystemConfig() {
     max_stored_messages: 0,
   }
   sysSubAgent.value = { cache_ttl: '', timeout: '' }
+  sysVision.value = {
+    enabled: false,
+    provider: '',
+    model: '',
+    timeout_seconds: 60,
+    max_image_bytes: 10 * 1024 * 1024,
+  }
   sysWorkMode.value = 'coding'
   sysCloseBehavior.value = 'exit'
   sysDirty.value = true
@@ -987,6 +1016,35 @@ const protocolOptions = [
   { label: 'OpenAI 兼容', value: 'openai' },
   { label: 'Anthropic (Claude)', value: 'anthropic' },
 ]
+
+const visionProviderOptions = computed(() =>
+  providers.value.map(p => ({ label: p.name, value: p.name })),
+)
+
+const visionModelOptions = computed(() => {
+  const p = providers.value.find(x => x.name === sysVision.value.provider)
+  if (!p) return []
+  return (p.models || []).map(m => {
+    const suffix = m.capabilities?.supports_vision ? ' · 视觉' : ''
+    const label = m.display_name ? `${m.display_name} (${m.name})${suffix}` : `${m.name}${suffix}`
+    return { label, value: m.name }
+  })
+})
+
+function onVisionProviderUpdate(provider: string) {
+  sysVision.value.provider = provider || ''
+  const p = providers.value.find(x => x.name === provider)
+  const models = p?.models || []
+  if (!models.some(m => m.name === sysVision.value.model)) {
+    sysVision.value.model = models.find(m => m.default)?.name || models[0]?.name || ''
+  }
+  markSysDirty()
+}
+
+function onVisionModelUpdate(model: string) {
+  sysVision.value.model = model || ''
+  markSysDirty()
+}
 
 // model-table row helpers
 function fmtContext(n?: number) {
@@ -1994,7 +2052,7 @@ function kbModelSupportsVision(scanModel: string) {
                   </p>
                 </div>
               </div>
-              <NCollapse class="sys-collapse" :default-expanded-names="['work-mode', 'window', 'context', 'agent', 'subagent']">
+              <NCollapse class="sys-collapse" :default-expanded-names="['work-mode', 'vision', 'window', 'context', 'agent', 'subagent']">
                 <NCollapseItem title="工作模式" name="work-mode">
                   <div class="sys-form-grid">
                     <div class="sys-form-row">
@@ -2004,6 +2062,51 @@ function kbModelSupportsVision(scanModel: string) {
                         <NRadioButton value="daily">日常工作</NRadioButton>
                       </NRadioGroup>
                       <span class="sys-hint">风格只决定怎么说；工作模式决定优先处理哪类任务。</span>
+                    </div>
+                  </div>
+                </NCollapseItem>
+
+                <NCollapseItem title="图像识别" name="vision">
+                  <div class="sys-form-grid">
+                    <div class="sys-form-row">
+                      <span class="sys-label">启用工具</span>
+                      <NSwitch v-model:value="sysVision.enabled" size="small" @update:value="markSysDirty" />
+                      <span class="sys-hint">启用后，会话可选择通过 image_recognize 调用外部多模态模型。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">供应商</span>
+                      <NSelect
+                        :value="sysVision.provider"
+                        :options="visionProviderOptions"
+                        size="small"
+                        style="width: 180px"
+                        clearable
+                        @update:value="onVisionProviderUpdate"
+                      />
+                      <span class="sys-hint">从已添加的 LLM 提供商中选择。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">模型</span>
+                      <NSelect
+                        :value="sysVision.model"
+                        :options="visionModelOptions"
+                        size="small"
+                        style="width: 240px"
+                        clearable
+                        :disabled="!sysVision.provider"
+                        @update:value="onVisionModelUpdate"
+                      />
+                      <span class="sys-hint">建议选择已标记支持视觉输入的模型。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">超时</span>
+                      <NInputNumber v-model:value="sysVision.timeout_seconds" :min="5" :step="5" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">秒，默认 60。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">图片大小</span>
+                      <NInputNumber v-model:value="sysVision.max_image_bytes" :min="1024" :step="1048576" size="small" style="width:140px" @update:value="markSysDirty" />
+                      <span class="sys-hint">bytes，默认 10485760。</span>
                     </div>
                   </div>
                 </NCollapseItem>
