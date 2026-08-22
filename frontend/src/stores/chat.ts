@@ -6,6 +6,7 @@ import { reactive, ref, computed, watch } from 'vue'
 import * as api from '../api/client'
 import { notifyManager } from '../utils/notify'
 import { dedupMessagesByKey } from '../utils/messageDedup'
+import { insertAsyncSubAgentAfterTaskTools } from '../utils/subAgentOrder'
 import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
 import { isCurrentStream } from './streamLifecycle'
 
@@ -1284,7 +1285,11 @@ function findOrCreateSubAgent(
     parts: [],
   }
   if (ev) backfillSubAgentMetadata(sub, ev)
-  m.parts.push(sub)
+  if (sub.runMode === 'async') {
+    insertAsyncSubAgentAfterTaskTools(m.parts, sub as SubAgentPart)
+  } else {
+    m.parts.push(sub)
+  }
   return sub as any
 }
 

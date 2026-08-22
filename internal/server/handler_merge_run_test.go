@@ -97,3 +97,56 @@ func TestMergeAssistantRun_SingleMessage(t *testing.T) {
 		t.Errorf("Parts len = %d, want 1", len(got.Parts))
 	}
 }
+
+func TestMergeAssistantRun_AsyncSubAgentsFollowTaskToolsInCallOrder(t *testing.T) {
+	run := []MessageResponse{
+		{
+			Role: "assistant",
+			Parts: []MessagePart{
+				{Kind: "sub_agent", Task: "second background task", TaskID: "task-b", RunMode: "async"},
+				{Kind: "sub_agent", Task: "first background task", TaskID: "task-a", RunMode: "async"},
+			},
+		},
+		{
+			Role: "assistant",
+			Parts: []MessagePart{
+				{Kind: "thinking", Text: "decide to launch tasks"},
+				{Kind: "tool", Name: "task", Status: "ok", Args: `{"mode":"async","description":"first background task"}`, Result: "sub-agent launched in background: task_id=task-a, status=running"},
+				{Kind: "tool", Name: "task", Status: "ok", Args: `{"mode":"async","description":"second background task"}`, Result: "sub-agent launched in background: task_id=task-b, status=running"},
+				{Kind: "thinking", Text: "wait for one result"},
+				{Kind: "tool", Name: "task_wait", Status: "ok", Result: "task-a completed"},
+			},
+		},
+	}
+
+	got := mergeAssistantRun(run)
+	kinds := make([]string, 0, len(got.Parts))
+	for _, p := range got.Parts {
+		if p.Kind == "tool" {
+			kinds = append(kinds, "tool:"+p.Name)
+			continue
+		}
+		if p.Kind == "sub_agent" {
+			kinds = append(kinds, "sub:"+p.TaskID)
+			continue
+		}
+		kinds = append(kinds, p.Kind)
+	}
+	want := []string{
+		"thinking",
+		"tool:task",
+		"tool:task",
+		"sub:task-a",
+		"sub:task-b",
+		"thinking",
+		"tool:task_wait",
+	}
+	if len(kinds) != len(want) {
+		t.Fatalf("parts order len = %d (%v), want %d (%v)", len(kinds), kinds, len(want), want)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("parts order = %v, want %v", kinds, want)
+		}
+	}
+}

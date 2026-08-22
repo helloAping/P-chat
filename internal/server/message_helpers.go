@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -503,7 +504,7 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 		parts = append(parts, m.Parts...)
 	}
 
-	base.Parts = parts
+	base.Parts = reorderAsyncSubAgentsAfterTaskTools(parts)
 	// `base.Content` is intentionally NOT regenerated from
 	// parts. The MessageBubble component (frontend/src/components/
 	// MessageBubble.vue) renders assistant messages off
@@ -515,6 +516,158 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 	// recomputing Content here would diverge from the
 	// user-visible streaming bubble.
 	return base
+}
+
+func reorderAsyncSubAgentsAfterTaskTools(parts []MessagePart) []MessagePart {
+	if len(parts) <= 1 {
+		return parts
+	}
+
+	rest := make([]MessagePart, 0, len(parts))
+	asyncSubs := make([]MessagePart, 0)
+	for _, p := range parts {
+		if isAsyncSubAgentPart(p) {
+			asyncSubs = append(asyncSubs, p)
+			continue
+		}
+		rest = append(rest, p)
+	}
+	if len(asyncSubs) == 0 {
+		return parts
+	}
+
+	insertAfter := -1
+	taskOrder := make([]string, 0, len(asyncSubs))
+	seen := make(map[string]struct{})
+	for i, p := range rest {
+		if !isTaskToolPart(p) {
+			continue
+		}
+		insertAfter = i
+		for _, key := range taskToolOrderKeys(p) {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			taskOrder = append(taskOrder, key)
+		}
+	}
+	if insertAfter < 0 {
+		return parts
+	}
+
+	orderedSubs := orderAsyncSubAgents(asyncSubs, taskOrder)
+	out := make([]MessagePart, 0, len(parts))
+	out = append(out, rest[:insertAfter+1]...)
+	out = append(out, orderedSubs...)
+	out = append(out, rest[insertAfter+1:]...)
+	return out
+}
+
+func isAsyncSubAgentPart(p MessagePart) bool {
+	return p.Kind == "sub_agent" && p.RunMode == "async"
+}
+
+func isTaskToolPart(p MessagePart) bool {
+	return p.Kind == "tool" && p.Name == "task"
+}
+
+func taskToolOrderKeys(p MessagePart) []string {
+	keys := make([]string, 0, 3)
+	for _, key := range []string{
+		taskIDFromJSON(p.Args),
+		taskIDFromText(p.Result),
+		taskDescriptionFromJSON(p.Args),
+	} {
+		key = normalizeTaskOrderKey(key)
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func orderAsyncSubAgents(parts []MessagePart, taskOrder []string) []MessagePart {
+	if len(parts) <= 1 || len(taskOrder) == 0 {
+		return parts
+	}
+	order := make(map[string]int, len(taskOrder))
+	for i, key := range taskOrder {
+		if _, ok := order[key]; !ok {
+			order[key] = i
+		}
+	}
+	type rankedPart struct {
+		part  MessagePart
+		rank  int
+		index int
+	}
+	ranked := make([]rankedPart, 0, len(parts))
+	for i, p := range parts {
+		rank := len(taskOrder) + i
+		for _, key := range []string{p.TaskID, p.Task} {
+			if n, ok := order[normalizeTaskOrderKey(key)]; ok {
+				rank = n
+				break
+			}
+		}
+		ranked = append(ranked, rankedPart{part: p, rank: rank, index: i})
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].rank != ranked[j].rank {
+			return ranked[i].rank < ranked[j].rank
+		}
+		return ranked[i].index < ranked[j].index
+	})
+	out := make([]MessagePart, 0, len(parts))
+	for _, item := range ranked {
+		out = append(out, item.part)
+	}
+	return out
+}
+
+func taskIDFromJSON(raw string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+	if v, ok := payload["task_id"].(string); ok {
+		return v
+	}
+	if v, ok := payload["taskId"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func taskDescriptionFromJSON(raw string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+	if v, ok := payload["description"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func taskIDFromText(s string) string {
+	const marker = "task_id="
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(marker):]
+	for j, r := range rest {
+		if r == ',' || r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			return rest[:j]
+		}
+	}
+	return rest
+}
+
+func normalizeTaskOrderKey(s string) string {
+	return strings.TrimSpace(s)
 }
 
 // buildMessageResponse shapes one ChatMessage row into the
