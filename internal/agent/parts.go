@@ -366,6 +366,31 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	// with SubAgent=true; the SubAgentStatus is the gate.)
 	if c.SubAgent && c.SubAgentStatus != "" {
 		if c.SubAgentStatus == "start" {
+			if i := a.findSubAgentIndex(c); i >= 0 {
+				if a.parts[i].Status == "" {
+					a.parts[i].Status = "start"
+				}
+				if c.SubAgentType != "" && a.parts[i].AgentType == "" {
+					a.parts[i].AgentType = c.SubAgentType
+				}
+				if c.SubAgentColor != "" && a.parts[i].AgentColor == "" {
+					a.parts[i].AgentColor = c.SubAgentColor
+				}
+				if c.SubAgentModel != "" && a.parts[i].AgentModel == "" {
+					a.parts[i].AgentModel = c.SubAgentModel
+				}
+				if c.SubAgentDescription != "" && a.parts[i].AgentDescription == "" {
+					a.parts[i].AgentDescription = c.SubAgentDescription
+				}
+				if c.SubAgentTaskID != "" && a.parts[i].TaskID == "" {
+					a.parts[i].TaskID = c.SubAgentTaskID
+				}
+				if c.SubAgentRunMode != "" && a.parts[i].RunMode == "" {
+					a.parts[i].RunMode = c.SubAgentRunMode
+				}
+				a.rememberSubAgent(i)
+				return
+			}
 			a.parts = append(a.parts, a.newSubAgentPart(c))
 			a.rememberSubAgent(len(a.parts) - 1)
 			return

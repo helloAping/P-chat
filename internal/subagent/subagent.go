@@ -977,8 +977,13 @@ func (d *Default) launchAsyncTask(ctx context.Context, runner Default, req Reque
 	req.TaskID = job.TaskID
 
 	manager := d.asyncManager()
+	startChunk := asyncSubagentStartChunk(job, req)
+	messageID := createAsyncJobMessage(d.JobStore, job, startChunk)
+	if sink := agent.GetAsyncSubagentLiveSink(ctx); sink != nil {
+		sink(startChunk)
+	}
 	manager.Publish(memory.SubagentJobEvent{Type: "created", Job: &job})
-	runner.OnEvent = makeAsyncProgressHook(d.JobStore, manager, job.ID)
+	runner.OnEvent = makeAsyncProgressHook(d.JobStore, manager, job, messageID, startChunk, agent.GetAsyncSubagentLiveSink(ctx))
 	bgCtx, cancel := context.WithCancel(context.Background())
 	manager.register(job.ID, cancel)
 	go runAsyncTaskJob(bgCtx, cancel, manager, d.JobStore, runner, job, req)
@@ -987,6 +992,23 @@ func (d *Default) launchAsyncTask(ctx context.Context, runner Default, req Reque
 		Content: fmt.Sprintf("sub-agent launched in background: task_id=%s, status=%s\nIf no useful parent work remains, immediately call task_wait instead of ending the conversation with a promise to wait. When task_wait reports a completed task_id, call task_status once for that task. Do not poll task_status repeatedly.",
 			job.TaskID, job.Status),
 	}, nil
+}
+
+func asyncSubagentStartChunk(job memory.SubagentJob, req Request) agent.ChatStreamChunk {
+	subType := strings.TrimSpace(req.SubagentType)
+	if subType == "" {
+		subType = "general-purpose"
+	}
+	return agent.ChatStreamChunk{
+		Phase:           "sub_agent_start",
+		SubAgent:        true,
+		SubAgentTask:    req.Description,
+		SubAgentStatus:  "start",
+		SubAgentType:    subType,
+		SubAgentModel:   req.Model,
+		SubAgentTaskID:  job.TaskID,
+		SubAgentRunMode: "async",
+	}
 }
 
 func subagentJobTerminal(status string) bool {
@@ -1137,15 +1159,19 @@ func runAsyncTaskJob(ctx context.Context, cancel context.CancelFunc, manager *As
 	publishStoredSubagentJob(manager, store, job.ID, "updated")
 }
 
-func makeAsyncProgressHook(store *memory.Store, manager *AsyncManager, jobID string) func(agent.ChatStreamChunk) {
+func makeAsyncProgressHook(store *memory.Store, manager *AsyncManager, job memory.SubagentJob, messageID int64, startChunk agent.ChatStreamChunk, liveSink agent.AsyncSubagentLiveSink) func(agent.ChatStreamChunk) {
 	var (
 		mu       sync.Mutex
 		lastSave time.Time
 		recorder = agent.NewPartsRecorder()
 	)
+	recorder.Update(startChunk)
 	return func(c agent.ChatStreamChunk) {
-		if store == nil || jobID == "" {
+		if store == nil || job.ID == "" {
 			return
+		}
+		if liveSink != nil {
+			liveSink(c)
 		}
 		recorder.Update(c)
 		important := c.SubAgentStatus != "" || c.Error != "" || c.ToolName != "" || c.Phase != ""
@@ -1160,30 +1186,40 @@ func makeAsyncProgressHook(store *memory.Store, manager *AsyncManager, jobID str
 		lastSave = time.Now()
 		mu.Unlock()
 
+		parts := recorder.Snapshot()
 		payload := asyncProgressPayload{
-			Phase:   c.Phase,
-			Status:  c.SubAgentStatus,
-			Tool:    c.ToolName,
-			Error:   c.Error,
-			Elapsed: c.Duration,
-			Parts:   recorder.Snapshot(),
+			Phase:     c.Phase,
+			Status:    c.SubAgentStatus,
+			Tool:      c.ToolName,
+			Error:     c.Error,
+			Elapsed:   c.Duration,
+			Parts:     parts,
+			MessageID: messageID,
 		}
 		b, _ := json.Marshal(payload)
-		if err := store.UpdateSubagentJobProgress(jobID, string(b)); err != nil {
-			log.Printf("[subagent/async] update progress job=%s: %v", jobID, err)
+		if err := store.UpdateSubagentJobProgress(job.ID, string(b)); err != nil {
+			log.Printf("[subagent/async] update progress job=%s: %v", job.ID, err)
 			return
 		}
-		publishStoredSubagentJob(manager, store, jobID, "updated")
+		if messageID > 0 {
+			if partsJSON, err := json.Marshal(parts); err == nil {
+				if err := store.UpdateChatMessageContentAndMeta(messageID, "", asyncJobMessageMeta(job, memory.SubagentJobRunning, string(partsJSON))); err != nil {
+					log.Printf("[subagent/async] update progress message job=%s msg=%d: %v", job.ID, messageID, err)
+				}
+			}
+		}
+		publishStoredSubagentJob(manager, store, job.ID, "updated")
 	}
 }
 
 type asyncProgressPayload struct {
-	Phase   string              `json:"phase,omitempty"`
-	Status  string              `json:"status,omitempty"`
-	Tool    string              `json:"tool,omitempty"`
-	Error   string              `json:"error,omitempty"`
-	Elapsed string              `json:"elapsed,omitempty"`
-	Parts   []agent.MessagePart `json:"parts,omitempty"`
+	Phase     string              `json:"phase,omitempty"`
+	Status    string              `json:"status,omitempty"`
+	Tool      string              `json:"tool,omitempty"`
+	Error     string              `json:"error,omitempty"`
+	Elapsed   string              `json:"elapsed,omitempty"`
+	Parts     []agent.MessagePart `json:"parts,omitempty"`
+	MessageID int64               `json:"message_id,omitempty"`
 }
 
 func publishStoredSubagentJob(manager *AsyncManager, store *memory.Store, jobID, eventType string) {
@@ -1204,6 +1240,55 @@ func publishStoredSubagentJob(manager *AsyncManager, store *memory.Store, jobID,
 	manager.Publish(memory.SubagentJobEvent{Type: eventType, Job: &job})
 }
 
+func createAsyncJobMessage(store *memory.Store, job memory.SubagentJob, startChunk agent.ChatStreamChunk) int64 {
+	if store == nil || job.SessionID == "" {
+		return 0
+	}
+	parts := asyncJobMessageParts(job, "", memory.SubagentJobRunning, Result{}, "")
+	partsJSON, err := json.Marshal(parts)
+	if err != nil {
+		log.Printf("[subagent/async] marshal start parts job=%s: %v", job.ID, err)
+		return 0
+	}
+	meta := asyncJobMessageMeta(job, memory.SubagentJobRunning, string(partsJSON))
+	messageID, err := store.AddChatMessageWithMetaToNow(job.SessionID, llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     "",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 0,
+	}, meta)
+	if err != nil {
+		log.Printf("[subagent/async] create live card message job=%s: %v", job.ID, err)
+		return 0
+	}
+	payload := asyncProgressPayload{
+		Phase:     startChunk.Phase,
+		Status:    startChunk.SubAgentStatus,
+		Parts:     parts,
+		MessageID: messageID,
+	}
+	if b, err := json.Marshal(payload); err == nil {
+		if err := store.UpdateSubagentJobProgress(job.ID, string(b)); err != nil {
+			log.Printf("[subagent/async] seed progress job=%s: %v", job.ID, err)
+		}
+	}
+	return messageID
+}
+
+func asyncJobMessageMeta(job memory.SubagentJob, status, partsJSON string) map[string]string {
+	meta := map[string]string{
+		"reason":          "subagent_async",
+		"subagent_job_id": job.ID,
+		"task_id":         job.TaskID,
+		"status":          status,
+	}
+	if partsJSON != "" {
+		meta["parts"] = partsJSON
+	}
+	return meta
+}
+
 func appendAsyncJobMessage(store *memory.Store, job memory.SubagentJob, content, status string, res Result, failureReason string) {
 	if store == nil || job.SessionID == "" {
 		return
@@ -1215,14 +1300,12 @@ func appendAsyncJobMessage(store *memory.Store, job memory.SubagentJob, content,
 	if err != nil {
 		log.Printf("[subagent/async] marshal synthetic parts job=%s: %v", job.ID, err)
 	}
-	meta := map[string]string{
-		"reason":          "subagent_async",
-		"subagent_job_id": job.ID,
-		"task_id":         job.TaskID,
-		"status":          status,
-	}
-	if len(parts) > 0 {
-		meta["parts"] = string(parts)
+	meta := asyncJobMessageMeta(job, status, string(parts))
+	if messageID := asyncProgressMessageID(job.ProgressJSON); messageID > 0 {
+		if err := store.UpdateChatMessageContentAndMeta(messageID, content, meta); err != nil {
+			log.Printf("[subagent/async] update anchor message job=%s msg=%d: %v", job.ID, messageID, err)
+		}
+		return
 	}
 	store.AddChatMessageWithMetaTo(job.SessionID, llm.ChatMessage{
 		Role:    llm.RoleAssistant,
@@ -1235,10 +1318,7 @@ func appendAsyncJobMessage(store *memory.Store, job memory.SubagentJob, content,
 }
 
 func asyncJobMessageParts(job memory.SubagentJob, content, status string, res Result, failureReason string) []agent.MessagePart {
-	partStatus := "err"
-	if status == memory.SubagentJobSucceeded || status == "succeeded" {
-		partStatus = "ok"
-	}
+	partStatus := asyncPartStatus(status)
 	if parts := asyncProgressParts(job.ProgressJSON); len(parts) > 0 {
 		for i := range parts {
 			if parts[i].Kind != "sub_agent" {
@@ -1258,6 +1338,9 @@ func asyncJobMessageParts(job memory.SubagentJob, content, status string, res Re
 			}
 			if parts[i].AgentType == "" {
 				parts[i].AgentType = job.SubagentType
+				if parts[i].AgentType == "" {
+					parts[i].AgentType = "general-purpose"
+				}
 			}
 			if parts[i].AgentModel == "" {
 				parts[i].AgentModel = job.Model
@@ -1271,6 +1354,9 @@ func asyncJobMessageParts(job memory.SubagentJob, content, status string, res Re
 	agentType := res.SubagentType
 	if agentType == "" {
 		agentType = job.SubagentType
+	}
+	if agentType == "" {
+		agentType = "general-purpose"
 	}
 	model := res.Model
 	if model == "" {
@@ -1302,6 +1388,17 @@ func asyncJobMessageParts(job memory.SubagentJob, content, status string, res Re
 	}
 }
 
+func asyncPartStatus(status string) string {
+	switch status {
+	case memory.SubagentJobSucceeded:
+		return "ok"
+	case memory.SubagentJobFailed, memory.SubagentJobCancelled:
+		return "err"
+	default:
+		return "start"
+	}
+}
+
 func asyncProgressParts(raw string) []agent.MessagePart {
 	if strings.TrimSpace(raw) == "" {
 		return nil
@@ -1315,6 +1412,17 @@ func asyncProgressParts(raw string) []agent.MessagePart {
 		return legacyParts
 	}
 	return nil
+}
+
+func asyncProgressMessageID(raw string) int64 {
+	if strings.TrimSpace(raw) == "" {
+		return 0
+	}
+	var payload asyncProgressPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return 0
+	}
+	return payload.MessageID
 }
 
 func formatSubagentToolResult(res Result) string {

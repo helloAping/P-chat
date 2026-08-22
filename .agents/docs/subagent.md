@@ -83,7 +83,7 @@
 - `async` 会立即创建 `subagent_jobs` 记录并返回 `task_id`，后台 goroutine 使用独立 context 执行，不依赖当前 HTTP/SSE turn 生命周期。
 - `task_status` 查询当前 session 的 job 列表或单个 `task_id` 详情。
 - `task_cancel` 取消当前 server 进程内仍在运行的后台 job，并把 durable 状态标记为 `cancelled`。
-- job 完成后会向主会话追加一条 synthetic assistant message，使用与常规子代理相同的 `sub_agent` part 卡片结构；卡片用 `run_mode=async` 标记为后台子代理，并复用后台执行期间保存的内部 parts。stats 只保留在结构化 Result / job 元数据中，不作为聊天可见文本展示。
+- job 启动时会立即在主会话创建一条 assistant 锚点消息，使用与常规子代理相同的 `sub_agent` part 卡片结构；卡片用 `run_mode=async` 标记为后台子代理，并通过 live SSE 与 `progress_json` 持续更新内部 parts。job 完成/失败/取消时只更新这条锚点消息；只有旧数据或锚点缺失时才 fallback 追加 synthetic message。stats 只保留在结构化 Result / job 元数据中，不作为聊天可见文本展示。
 
 ### 7. 超时与部分结果（2026-08-21 起）
 

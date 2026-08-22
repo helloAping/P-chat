@@ -440,6 +440,80 @@ func (s *Store) AddChatMessageWithMetaTo(convID string, msg llm.ChatMessage, ext
 	s.AddChatMessageWithMetaToRegen(convID, msg, extraMeta, "", false)
 }
 
+// AddChatMessageWithMetaToNow writes a ChatMessage immediately and returns
+// its SQLite row id. It is for callers that need a durable row anchor they
+// can update later (for example a background sub-agent card).
+func (s *Store) AddChatMessageWithMetaToNow(convID string, msg llm.ChatMessage, extraMeta map[string]string) (int64, error) {
+	if convID == "" {
+		return 0, fmt.Errorf("conversation id is required")
+	}
+	if err := s.Flush(); err != nil {
+		return 0, err
+	}
+	m := encodeChatMeta(msg)
+	for k, v := range extraMeta {
+		m[k] = v
+	}
+	b, _ := json.Marshal(m)
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var maxSeq sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(seq) FROM messages WHERE conversation_id = ?`, convID).Scan(&maxSeq); err != nil {
+		return 0, err
+	}
+	nextSeq := int64(1)
+	if maxSeq.Valid {
+		nextSeq = maxSeq.Int64 + 1
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq, is_archived)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+		convID, msg.Role, msg.Content, now.Unix(), string(b), msg.MsgType, msg.SubmitToLLM, nextSeq,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.db.Exec(`UPDATE conversations SET updated_at = ? WHERE id = ?`, now.Unix(), convID); err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// UpdateChatMessageContentAndMeta updates one existing message row's visible
+// content and metadata. It intentionally does not create a new row: callers
+// use it to keep long-running background cards stable across refreshes.
+func (s *Store) UpdateChatMessageContentAndMeta(rowID int64, content string, meta map[string]string) error {
+	if rowID <= 0 {
+		return fmt.Errorf("message row id is required")
+	}
+	if err := s.Flush(); err != nil {
+		return err
+	}
+	b, _ := json.Marshal(meta)
+	now := time.Now().Unix()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.db.Exec(`UPDATE messages SET content = ?, metadata = ? WHERE id = ?`, content, string(b), rowID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(
+		`UPDATE conversations
+		    SET updated_at = ?
+		  WHERE id = (SELECT conversation_id FROM messages WHERE id = ?)`,
+		now, rowID,
+	)
+	return err
+}
+
 // AddChatMessageWithMetaToRegen is the P1-4 regen-aware
 // variant of AddChatMessageWithMetaTo. regenGroupID is the
 // string form of the user message id that this assistant

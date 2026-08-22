@@ -860,6 +860,29 @@ func GetToolEventChan(ctx context.Context) chan<- ChatStreamChunk {
 	return nil
 }
 
+// AsyncSubagentLiveSink is a best-effort live bridge for durable async
+// sub-agent jobs. It returns false when the parent SSE turn is no longer
+// available; callers must still persist progress independently.
+type AsyncSubagentLiveSink func(ChatStreamChunk) bool
+
+type asyncSubagentLiveSinkKey struct{}
+
+// WithAsyncSubagentLiveSink stores the current parent turn's live event sink.
+func WithAsyncSubagentLiveSink(ctx context.Context, sink AsyncSubagentLiveSink) context.Context {
+	if sink == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, asyncSubagentLiveSinkKey{}, sink)
+}
+
+// GetAsyncSubagentLiveSink returns the parent turn's async sub-agent live sink.
+func GetAsyncSubagentLiveSink(ctx context.Context) AsyncSubagentLiveSink {
+	if v, ok := ctx.Value(asyncSubagentLiveSinkKey{}).(AsyncSubagentLiveSink); ok {
+		return v
+	}
+	return nil
+}
+
 type parentToolCallIDKey struct{}
 
 // WithParentToolCallID publishes the parent LLM tool_call id to a tool
@@ -1096,6 +1119,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 	go func() {
 		defer close(ch)
+		var asyncLiveClosed atomic.Bool
+		defer asyncLiveClosed.Store(true)
 		// Global default working directory: when the session has no
 		// project path, anchor all file/command/grep operations to
 		// ~/.p-chat/workspace/ so the agent always has a fixed,
@@ -1112,6 +1137,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// metadata under "parts" so the same view comes back
 		// when the user reopens the session.
 		partsAcc := newPartsAccumulator()
+		asyncLiveSink := AsyncSubagentLiveSink(func(ev ChatStreamChunk) (ok bool) {
+			if asyncLiveClosed.Load() || ctx.Err() != nil {
+				return false
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					ok = false
+				}
+			}()
+			sendOrDrop(ctx, ch, nextSeq, ev)
+			return ctx.Err() == nil && !asyncLiveClosed.Load()
+		})
 		todoMode := todoModeFromRequest(req.TodoMode)
 		// T4: per-session cross-turn tool-failure breaker. Auto-resume
 		// turns keep accumulating across turn boundaries (that is the
@@ -2266,6 +2303,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				eventCh := make(chan ChatStreamChunk, 64)
 				tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
 				tctx = WithParentToolCallID(tctx, tc.ID)
+				tctx = WithAsyncSubagentLiveSink(tctx, asyncLiveSink)
 				if a.subagentRegistry != nil {
 					tctx = WithSubagentRegistry(tctx, a.subagentRegistry)
 				}

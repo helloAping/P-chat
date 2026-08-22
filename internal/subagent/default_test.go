@@ -128,6 +128,11 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 		t.Fatalf("EnsureConversation: %v", err)
 	}
 
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	var liveMu sync.Mutex
+	var liveEvents []agent.ChatStreamChunk
 	d := &Default{
 		JobStore:    store,
 		ParentTools: tool.NewRegistry(),
@@ -136,6 +141,11 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 			ch := make(chan agent.ChatStreamChunk, 4)
 			go func() {
 				defer close(ch)
+				select {
+				case <-ctx.Done():
+					return
+				case <-release:
+				}
 				ch <- agent.ChatStreamChunk{Phase: "tool", Step: "call-1-start", ToolName: "read_file", ToolArgs: `{"path":"a.go"}`}
 				ch <- agent.ChatStreamChunk{Phase: "tool", Step: "call-1-ok", ToolName: "read_file", ToolResult: "file body", ToolElapsed: "2ms"}
 				ch <- agent.ChatStreamChunk{Content: "async result"}
@@ -145,8 +155,14 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 		},
 	}
 	_, taskHandler := d.Tool()
+	ctx := agent.WithAsyncSubagentLiveSink(tool.WithSessionID(context.Background(), "session-1"), func(c agent.ChatStreamChunk) bool {
+		liveMu.Lock()
+		defer liveMu.Unlock()
+		liveEvents = append(liveEvents, c)
+		return true
+	})
 	result, err := taskHandler(
-		tool.WithSessionID(context.Background(), "session-1"),
+		ctx,
 		json.RawMessage(`{"mode":"async","description":"background work","task_id":"task-1"}`),
 	)
 	if err != nil {
@@ -156,6 +172,47 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 		t.Fatalf("async launch result = %+v", result)
 	}
 
+	liveMu.Lock()
+	if len(liveEvents) == 0 || liveEvents[0].SubAgentStatus != "start" || liveEvents[0].SubAgentRunMode != "async" || liveEvents[0].SubAgentTaskID != "task-1" {
+		t.Fatalf("async launch did not emit live start event: %+v", liveEvents)
+	}
+	liveMu.Unlock()
+
+	runningJob, ok, err := store.GetSubagentJob("session-1", "task-1")
+	if err != nil || !ok {
+		t.Fatalf("running job not found: ok=%v err=%v", ok, err)
+	}
+	messageID := asyncProgressMessageID(runningJob.ProgressJSON)
+	if messageID == 0 {
+		t.Fatalf("running job progress missing anchor message id: %+v", runningJob)
+	}
+	msgs, metas, _ := store.GetChatMessagesWithMetaFor("session-1", 10)
+	foundRunningAnchor := false
+	for i, msg := range msgs {
+		var meta map[string]string
+		if err := json.Unmarshal([]byte(metas[i]), &meta); err != nil {
+			t.Fatalf("decode running meta: %v", err)
+		}
+		if meta["reason"] != "subagent_async" || meta["task_id"] != "task-1" {
+			continue
+		}
+		if msg.Content != "" || meta["status"] != memory.SubagentJobRunning {
+			t.Fatalf("running anchor should be empty/running, msg=%+v meta=%+v", msg, meta)
+		}
+		var parts []agent.MessagePart
+		if err := json.Unmarshal([]byte(meta["parts"]), &parts); err != nil {
+			t.Fatalf("decode running anchor parts: %v", err)
+		}
+		if len(parts) != 1 || parts[0].Kind != "sub_agent" || parts[0].Status != "start" || parts[0].RunMode != "async" {
+			t.Fatalf("running anchor parts wrong: %+v", parts)
+		}
+		foundRunningAnchor = true
+	}
+	if !foundRunningAnchor {
+		t.Fatalf("running async anchor message not found: msgs=%+v metas=%+v", msgs, metas)
+	}
+
+	releaseOnce.Do(func() { close(release) })
 	var job memory.SubagentJob
 	waitUntil(t, time.Second, func() bool {
 		got, ok, err := store.GetSubagentJob("session-1", "task-1")
@@ -184,17 +241,21 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 		t.Fatalf("unexpected task_status result: %+v", status)
 	}
 
-	msgs, metas, _ := store.GetChatMessagesWithMetaFor("session-1", 10)
-	foundSynthetic := false
+	msgs, metas, _ = store.GetChatMessagesWithMetaFor("session-1", 10)
+	foundAnchorCompletion := false
 	foundStructuredPart := false
+	asyncMessageCount := 0
 	for i, msg := range msgs {
+		var meta map[string]string
+		if err := json.Unmarshal([]byte(metas[i]), &meta); err != nil {
+			t.Fatalf("decode message meta: %v", err)
+		}
+		if meta["reason"] == "subagent_async" && meta["task_id"] == "task-1" {
+			asyncMessageCount++
+		}
 		if strings.Contains(msg.Content, "Async sub-agent task `task-1` completed") &&
 			strings.Contains(msg.Content, "async result") {
-			foundSynthetic = true
-			var meta map[string]string
-			if err := json.Unmarshal([]byte(metas[i]), &meta); err != nil {
-				t.Fatalf("decode synthetic meta: %v", err)
-			}
+			foundAnchorCompletion = true
 			var parts []agent.MessagePart
 			if err := json.Unmarshal([]byte(meta["parts"]), &parts); err != nil {
 				t.Fatalf("decode synthetic parts: %v", err)
@@ -218,14 +279,16 @@ func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
 				t.Fatalf("synthetic async completion message leaked stats footer: %q", msg.Content)
 			}
 			foundStructuredPart = true
-			break
 		}
 	}
-	if !foundSynthetic {
-		t.Fatalf("synthetic async completion message not found: %+v", msgs)
+	if !foundAnchorCompletion {
+		t.Fatalf("async anchor completion message not found: %+v", msgs)
 	}
 	if !foundStructuredPart {
-		t.Fatalf("synthetic async completion message missing structured sub_agent part: metas=%+v", metas)
+		t.Fatalf("async anchor completion message missing structured sub_agent part: metas=%+v", metas)
+	}
+	if asyncMessageCount != 1 {
+		t.Fatalf("async completion should update one anchor message, got %d messages: %+v", asyncMessageCount, msgs)
 	}
 }
 
