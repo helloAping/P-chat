@@ -61,7 +61,7 @@ type ChatMessage struct {
 
 `Type` 枚举：
 - `text` — 普通文本
-- `image` — 图片（base64 或 URL）
+- `image` — 图片（base64 或 URL）；OpenAI-compatible 请求会在 `image_url.url` 放 data URL，同时补 `image_url.data` raw base64 兼容需要 data 字段的代理。
 - `tool_call` — LLM 发出的工具调用（OpenAI native）
 - `tool_result` — 工具执行结果
 - `thinking` — 代理内部思考（不发送给 LLM）

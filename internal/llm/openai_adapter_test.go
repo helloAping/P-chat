@@ -283,6 +283,14 @@ func TestOpenAIBuild_UserTextAndMultipleImages_Merged(t *testing.T) {
 	if got := user.MultiContent[2].ImageURL.URL; got != "data:image/jpeg;base64,BBB" {
 		t.Fatalf("image 2 url = %q", got)
 	}
+	raw := mustOpenAIBodyMap(t, a, msgs, "")
+	messages := raw["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	img1 := content[1].(map[string]any)["image_url"].(map[string]any)
+	img2 := content[2].(map[string]any)["image_url"].(map[string]any)
+	if img1["data"] != "AAA" || img2["data"] != "BBB" {
+		t.Fatalf("image_url data fields = %v / %v, want raw base64", img1["data"], img2["data"])
+	}
 }
 
 // mustBody returns the raw request body bytes for the given input.
@@ -294,4 +302,14 @@ func mustBody(a *OpenAIAdapter, msgs []ChatMessage, system string) []byte {
 		return []byte("<build error: " + err.Error() + ">")
 	}
 	return req.Body
+}
+
+func mustOpenAIBodyMap(t *testing.T, a *OpenAIAdapter, msgs []ChatMessage, system string) map[string]any {
+	t.Helper()
+	body := mustBody(a, msgs, system)
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("unmarshal body map: %v\nbody=%s", err, string(body))
+	}
+	return out
 }
