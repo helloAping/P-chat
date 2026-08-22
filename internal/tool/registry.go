@@ -701,11 +701,17 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "image_recognize",
-		Description: "Analyze a user-uploaded image through the configured external multimodal model and return a text description to the main conversation. Use only for upload_id values explicitly shown in this chat. Do not pass file paths.",
+		Description: "Analyze one or more user-uploaded images through the configured external multimodal model and return text to the main conversation. Use upload_ids for multiple images in a single call. Use only upload_id values explicitly shown in this chat. Do not pass file paths.",
 		Parameters: ObjectSchema(map[string]any{
-			"upload_id": StringProp("The upload_id of an image attached in this conversation"),
-			"question":  StringProp("Optional focused question for the vision model, e.g. what details to extract from the image"),
-		}, []string{"upload_id"}),
+			"upload_id": StringProp("The upload_id of a single image attached in this conversation. Kept for compatibility; prefer upload_ids when there is more than one image."),
+			"upload_ids": map[string]any{
+				"type":        "array",
+				"description": "Upload ids of images attached in this conversation, in the order they should be analyzed.",
+				"items":       map[string]any{"type": "string"},
+				"minItems":    1,
+			},
+			"question": StringProp("Optional focused question for the vision model, e.g. what details to extract from the image"),
+		}, nil),
 	}, handleImageRecognize)
 
 	r.Register(Tool{

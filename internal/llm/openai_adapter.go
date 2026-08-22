@@ -144,7 +144,6 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 			})
 
 		case TypeImage:
-			flushPending()
 			lastAssistantIdx = -1
 			part := openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeImageURL,

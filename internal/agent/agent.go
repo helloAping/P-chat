@@ -425,6 +425,38 @@ func dropDisplayOnlyMediaMessages(msgs []llm.ChatMessage) []llm.ChatMessage {
 	return out
 }
 
+func replaceImagesWithRecognitionRefs(msgs []llm.ChatMessage) []llm.ChatMessage {
+	out := make([]llm.ChatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Type != llm.TypeImage {
+			out = append(out, m)
+			continue
+		}
+		name := strings.TrimSpace(m.Name)
+		if name == "" {
+			name = "uploaded image"
+		}
+		if m.UploadID != "" {
+			out = append(out, llm.ChatMessage{
+				Role:        llm.RoleSystem,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("Uploaded image available for tool-based recognition: name=%q, upload_id=%q, MIME=%s. Do not claim to see the image directly. If image details are needed, call image_recognize with this upload_id, or include it in upload_ids with the other images.", name, m.UploadID, m.MimeType),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
+			})
+			continue
+		}
+		out = append(out, llm.ChatMessage{
+			Role:        llm.RoleSystem,
+			Type:        llm.TypeText,
+			Content:     fmt.Sprintf("An earlier image named %q is not sent to the main model because image recognition mode is enabled, but it has no upload_id for image_recognize.", name),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+	}
+	return out
+}
+
 func (a *Agent) resolveImageForRecognition(ctx context.Context, sessionID, uploadID string) (tool.ImageRecognitionImage, error) {
 	if a == nil || a.store == nil || a.attach == nil {
 		return tool.ImageRecognitionImage{}, fmt.Errorf("image storage is not available")
@@ -489,6 +521,13 @@ func (a *Agent) recognizeImageWithConfiguredModel(ctx context.Context, req tool.
 	if question == "" {
 		question = "Describe this image in detail."
 	}
+	images := req.Images
+	if len(images) == 0 && req.Image.UploadID != "" {
+		images = []tool.ImageRecognitionImage{req.Image}
+	}
+	if len(images) == 0 {
+		return "", fmt.Errorf("no images provided")
+	}
 	msgs := []llm.ChatMessage{
 		{
 			Role:    llm.RoleSystem,
@@ -500,13 +539,15 @@ func (a *Agent) recognizeImageWithConfiguredModel(ctx context.Context, req tool.
 			Type:    llm.TypeText,
 			Content: question,
 		},
-		{
+	}
+	for _, img := range images {
+		msgs = append(msgs, llm.ChatMessage{
 			Role:     llm.RoleUser,
 			Type:     llm.TypeImage,
-			Content:  base64.StdEncoding.EncodeToString(req.Image.Data),
-			Name:     req.Image.Name,
-			MimeType: req.Image.MIME,
-		},
+			Content:  base64.StdEncoding.EncodeToString(img.Data),
+			Name:     img.Name,
+			MimeType: img.MIME,
+		})
 	}
 	ch := a.llm.ChatStreamCM(callCtx, vc.Provider, vc.Model, msgs, nil, llm.ChatOptions{})
 	var sb strings.Builder
@@ -1614,6 +1655,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 		}
 		msgs = dropDisplayOnlyMediaMessages(msgs)
+		if useImageRecognition {
+			msgs = replaceImagesWithRecognitionRefs(msgs)
+		}
 
 		// Plan mode: the LLM can use `todo_write` to break down
 		// the analysis into steps, and `question` to clarify vague

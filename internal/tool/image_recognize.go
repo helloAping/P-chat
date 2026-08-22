@@ -21,6 +21,7 @@ type ImageRecognitionImage struct {
 // multimodal recognizer.
 type ImageRecognitionRequest struct {
 	Image    ImageRecognitionImage
+	Images   []ImageRecognitionImage
 	Question string
 }
 
@@ -65,8 +66,9 @@ func imageRecognizerFromCtx(ctx context.Context) ImageRecognizer {
 }
 
 type imageRecognizeArgs struct {
-	UploadID string `json:"upload_id"`
-	Question string `json:"question,omitempty"`
+	UploadID  string   `json:"upload_id"`
+	UploadIDs []string `json:"upload_ids,omitempty"`
+	Question  string   `json:"question,omitempty"`
 }
 
 func handleImageRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallResult, error) {
@@ -74,12 +76,16 @@ func handleImageRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 	if err := json.Unmarshal(argsRaw, &args); err != nil {
 		return &CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
 	}
-	args.UploadID = strings.TrimSpace(args.UploadID)
-	if args.UploadID == "" {
-		return &CallResult{Content: "upload_id is required", IsError: true}, nil
+	uploadIDs := normalizeImageUploadIDs(args.UploadID, args.UploadIDs)
+	if len(uploadIDs) == 0 {
+		return &CallResult{Content: "upload_id or upload_ids is required", IsError: true}, nil
 	}
 	if args.Question == "" {
-		args.Question = "Describe the image in detail. Include visible text, objects, layout, and anything relevant to the user's request."
+		if len(uploadIDs) == 1 {
+			args.Question = "Describe the image in detail. Include visible text, objects, layout, and anything relevant to the user's request."
+		} else {
+			args.Question = "Describe all images in order. Compare them when relevant, include visible text, objects, layout, and anything relevant to the user's request."
+		}
 	}
 	sid, _ := ctx.Value(SessionIDKey{}).(string)
 	if sid == "" {
@@ -93,12 +99,17 @@ func handleImageRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 	if recognizer == nil {
 		return &CallResult{Content: "image_recognize is not configured", IsError: true}, nil
 	}
-	img, err := resolver(ctx, sid, args.UploadID)
-	if err != nil {
-		return &CallResult{Content: "image_recognize failed to resolve image: " + err.Error(), IsError: true}, nil
+	images := make([]ImageRecognitionImage, 0, len(uploadIDs))
+	for _, uploadID := range uploadIDs {
+		img, err := resolver(ctx, sid, uploadID)
+		if err != nil {
+			return &CallResult{Content: "image_recognize failed to resolve image: " + err.Error(), IsError: true}, nil
+		}
+		images = append(images, img)
 	}
 	text, err := recognizer(ctx, ImageRecognitionRequest{
-		Image:    img,
+		Image:    images[0],
+		Images:   images,
 		Question: strings.TrimSpace(args.Question),
 	})
 	if err != nil {
@@ -108,8 +119,37 @@ func handleImageRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 	if text == "" {
 		return &CallResult{Content: "image_recognize returned an empty description", IsError: true}, nil
 	}
+	names := make([]string, 0, len(images))
+	for _, img := range images {
+		names = append(names, img.Name)
+	}
+	if len(images) == 1 {
+		img := images[0]
+		return &CallResult{
+			Content: fmt.Sprintf("Image %s (%s, upload_id=%s) recognition result:\n%s", img.Name, img.MIME, img.UploadID, text),
+			Summary: "Recognized image " + img.Name,
+		}, nil
+	}
 	return &CallResult{
-		Content: fmt.Sprintf("Image %s (%s, upload_id=%s) recognition result:\n%s", img.Name, img.MIME, img.UploadID, text),
-		Summary: "Recognized image " + img.Name,
+		Content: fmt.Sprintf("Images %s (upload_ids=%s) recognition result:\n%s", strings.Join(names, ", "), strings.Join(uploadIDs, ","), text),
+		Summary: fmt.Sprintf("Recognized %d images", len(images)),
 	}, nil
+}
+
+func normalizeImageUploadIDs(single string, many []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, 1+len(many))
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	add(single)
+	for _, id := range many {
+		add(id)
+	}
+	return out
 }

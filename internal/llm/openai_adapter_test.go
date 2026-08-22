@@ -252,6 +252,39 @@ func TestOpenAIBuild_SystemPrepended(t *testing.T) {
 	}
 }
 
+func TestOpenAIBuild_UserTextAndMultipleImages_Merged(t *testing.T) {
+	a := NewOpenAIAdapter("https://api.example.com", "sk-test", "test")
+	msgs := []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "compare these images"},
+		{Role: RoleUser, Type: TypeImage, Content: "AAA", MimeType: "image/png", Name: "a.png"},
+		{Role: RoleUser, Type: TypeImage, Content: "BBB", MimeType: "image/jpeg", Name: "b.jpg"},
+	}
+	out := mustBuildOpenAI(t, a, msgs, "")
+
+	if got := len(out.Messages); got != 1 {
+		t.Fatalf("messages count = %d, want 1 combined user message. body=%s", got, string(mustBody(a, msgs, "")))
+	}
+	user := out.Messages[0]
+	if user.Role != openai.ChatMessageRoleUser {
+		t.Fatalf("role = %q, want user", user.Role)
+	}
+	if len(user.MultiContent) != 3 {
+		t.Fatalf("content parts = %d, want text + 2 images. msg=%+v", len(user.MultiContent), user)
+	}
+	if user.MultiContent[0].Type != openai.ChatMessagePartTypeText || user.MultiContent[0].Text != "compare these images" {
+		t.Fatalf("part[0] = %+v, want text", user.MultiContent[0])
+	}
+	if user.MultiContent[1].Type != openai.ChatMessagePartTypeImageURL || user.MultiContent[2].Type != openai.ChatMessagePartTypeImageURL {
+		t.Fatalf("image parts = %+v / %+v, want image_url", user.MultiContent[1], user.MultiContent[2])
+	}
+	if got := user.MultiContent[1].ImageURL.URL; got != "data:image/png;base64,AAA" {
+		t.Fatalf("image 1 url = %q", got)
+	}
+	if got := user.MultiContent[2].ImageURL.URL; got != "data:image/jpeg;base64,BBB" {
+		t.Fatalf("image 2 url = %q", got)
+	}
+}
+
 // mustBody returns the raw request body bytes for the given input.
 // Used in error messages for debugging — small enough that the
 // extra marshal cost is irrelevant.

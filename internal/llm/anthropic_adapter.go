@@ -85,6 +85,29 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 		}
 		return &anthropicMsgs[lastUserResultIdx]
 	}
+	lastUserContentIdx := -1
+	lastUserContent := func() *anthropicMessage {
+		if lastUserContentIdx < 0 || lastUserContentIdx >= len(anthropicMsgs) {
+			return nil
+		}
+		if anthropicMsgs[lastUserContentIdx].Role != "user" {
+			return nil
+		}
+		return &anthropicMsgs[lastUserContentIdx]
+	}
+	appendUserContentBlock := func(block anthropicContentBlock) {
+		lastAssistantIdx = -1
+		lastUserResultIdx = -1
+		if lu := lastUserContent(); lu != nil {
+			lu.Content = append(lu.Content, block)
+			return
+		}
+		anthropicMsgs = append(anthropicMsgs, anthropicMessage{
+			Role:    "user",
+			Content: anthropicBlocksRaw{block},
+		})
+		lastUserContentIdx = len(anthropicMsgs) - 1
+	}
 
 	for _, msg := range messages {
 		// System role messages accumulate into the top-level
@@ -110,6 +133,7 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			// assistant turn, so the user-side merge pointer
 			// (lastUserResultIdx) is invalidated.
 			lastUserResultIdx = -1
+			lastUserContentIdx = -1
 			inputJSON := json.RawMessage(SafeToolInputJSON(msg.ToolInput))
 			toolUseBlock := map[string]any{
 				"type":  "tool_use",
@@ -134,6 +158,7 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			// tool_calls are folded into the same user
 			// message.
 			lastAssistantIdx = -1
+			lastUserContentIdx = -1
 			content := msg.Content
 			if msg.ToolError {
 				content = "error: " + msg.Content
@@ -160,20 +185,14 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			lastUserResultIdx = len(anthropicMsgs) - 1
 
 		case TypeImage:
-			lastAssistantIdx = -1
-			lastUserResultIdx = -1
 			// Build an image block with base64 source.
-			block := map[string]any{
-				"type": "image",
-				"source": map[string]any{
-					"type":       "base64",
-					"media_type": msg.MimeType,
-					"data":       msg.Content,
+			appendUserContentBlock(anthropicContentBlock{
+				Type: "image",
+				Source: &anthropicContentSource{
+					Type:      "base64",
+					MediaType: msg.MimeType,
+					Data:      msg.Content,
 				},
-			}
-			anthropicMsgs = append(anthropicMsgs, anthropicMessage{
-				Role:    anthropicRole(msg.Role),
-				Content: anthropicBlocksRaw{anthropicBlockFromMap(block)},
 			})
 
 		case TypeText:
@@ -181,7 +200,15 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			if msg.Content == "" {
 				continue
 			}
+			if role == "user" {
+				appendUserContentBlock(anthropicContentBlock{
+					Type: "text",
+					Text: msg.Content,
+				})
+				continue
+			}
 			if role == "assistant" {
+				lastUserContentIdx = -1
 				if la := lastAssistant(); la != nil {
 					// Fold into the previous assistant
 					// message's content array so the wire
@@ -197,6 +224,7 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 				// turn — invalidate the merge pointer.
 				lastAssistantIdx = -1
 				lastUserResultIdx = -1
+				lastUserContentIdx = -1
 			}
 			anthropicMsgs = append(anthropicMsgs, anthropicMessage{
 				Role:    role,
@@ -213,6 +241,7 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			// marker.
 			lastAssistantIdx = -1
 			lastUserResultIdx = -1
+			lastUserContentIdx = -1
 			role := anthropicRole(msg.Role)
 			content := msg.Content
 			switch msg.Type {

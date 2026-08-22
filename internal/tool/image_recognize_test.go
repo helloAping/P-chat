@@ -51,3 +51,45 @@ func TestHandleImageRecognizeCallsRecognizer(t *testing.T) {
 		t.Fatalf("content = %q", res.Content)
 	}
 }
+
+func TestHandleImageRecognizeCallsRecognizerOnceForMultipleImages(t *testing.T) {
+	ctx := WithSessionID(context.Background(), "s1")
+	var resolved []string
+	ctx = WithImageResolver(ctx, func(ctx context.Context, sessionID, uploadID string) (ImageRecognitionImage, error) {
+		resolved = append(resolved, uploadID)
+		return ImageRecognitionImage{
+			UploadID: uploadID,
+			Name:     uploadID + ".png",
+			MIME:     "image/png",
+			Data:     []byte(uploadID),
+		}, nil
+	})
+	calls := 0
+	ctx = WithImageRecognizer(ctx, func(ctx context.Context, req ImageRecognitionRequest) (string, error) {
+		calls++
+		if len(req.Images) != 2 {
+			t.Fatalf("Images len = %d, want 2", len(req.Images))
+		}
+		if req.Images[0].UploadID != "upl1" || req.Images[1].UploadID != "upl2" {
+			t.Fatalf("Images = %+v", req.Images)
+		}
+		return "two images recognized", nil
+	})
+
+	res, err := handleImageRecognize(ctx, json.RawMessage(`{"upload_ids":["upl1","upl2"],"question":"compare"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("res is error: %#v", res)
+	}
+	if calls != 1 {
+		t.Fatalf("recognizer calls = %d, want 1", calls)
+	}
+	if strings.Join(resolved, ",") != "upl1,upl2" {
+		t.Fatalf("resolved = %v", resolved)
+	}
+	if !strings.Contains(res.Content, "two images recognized") || !strings.Contains(res.Content, "upload_ids=upl1,upl2") {
+		t.Fatalf("content = %q", res.Content)
+	}
+}

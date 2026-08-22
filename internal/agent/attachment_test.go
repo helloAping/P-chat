@@ -235,6 +235,29 @@ func TestExpandAttachmentsCM_ImageRecognitionMode(t *testing.T) {
 	}
 }
 
+func TestReplaceImagesWithRecognitionRefs(t *testing.T) {
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "compare", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "AAA", Name: "a.png", MimeType: "image/png", UploadID: "upl1", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "BBB", Name: "b.png", MimeType: "image/png", UploadID: "upl2", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+	}
+	out := replaceImagesWithRecognitionRefs(in)
+	if len(out) != 3 {
+		t.Fatalf("len(out) = %d, want 3", len(out))
+	}
+	for i, m := range out {
+		if m.Type == llm.TypeImage {
+			t.Fatalf("out[%d] is still image: %#v", i, m)
+		}
+	}
+	if !strings.Contains(out[1].Content, "upl1") || !strings.Contains(out[2].Content, "upl2") {
+		t.Fatalf("refs missing upload ids: %#v", out)
+	}
+	if !strings.Contains(out[1].Content, "image_recognize") || !strings.Contains(out[2].Content, "image_recognize") {
+		t.Fatalf("refs missing tool hint: %#v", out)
+	}
+}
+
 // TestExpandAttachmentsCM_UploadIDMapsToResolver verifies the
 // UnmarshalJSON mirror: a client posting "upload_id" (the SPA
 // wire) resolves through the same disk path as a legacy "id".

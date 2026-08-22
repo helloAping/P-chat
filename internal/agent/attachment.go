@@ -202,7 +202,7 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 						Role: llm.RoleSystem,
 						Type: llm.TypeText,
 						Content: fmt.Sprintf(
-							"Uploaded image available for tool-based recognition: name=%q, upload_id=%q, size=%d bytes, MIME=%s. The main model cannot see this image directly in this session. If image details are needed, call image_recognize with this upload_id and a focused question.",
+							"Uploaded image available for tool-based recognition: name=%q, upload_id=%q, size=%d bytes, MIME=%s. The main model cannot see this image directly in this session. If image details are needed, call image_recognize with this upload_id, or use upload_ids to analyze multiple images in one call.",
 							a.Name, a.UploadID, len(data), mime,
 						),
 					})
