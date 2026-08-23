@@ -93,12 +93,7 @@ func copyDir(src string, dst string) error {
 
 func runInstall(tmp string, args []string) error {
 	ps1 := filepath.Join(tmp, "install.ps1")
-	psArgs := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1}
-	if len(args) == 0 {
-		psArgs = append(psArgs, "-Gui")
-	} else {
-		psArgs = append(psArgs, args...)
-	}
+	psArgs := installPowerShellArgs(ps1, args)
 	cmd := exec.Command("powershell", psArgs...)
 	cmd.Dir = tmp
 	configureInstallCommand(cmd)
@@ -110,6 +105,16 @@ func runInstall(tmp string, args []string) error {
 		return err
 	}
 	return nil
+}
+
+func installPowerShellArgs(ps1 string, args []string) []string {
+	psArgs := []string{"-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1}
+	if len(args) == 0 {
+		psArgs = append(psArgs, "-Gui")
+	} else {
+		psArgs = append(psArgs, args...)
+	}
+	return psArgs
 }
 
 func fail(msg string, err error) {
