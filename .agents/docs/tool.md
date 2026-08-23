@@ -52,7 +52,7 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 | `read_pdf` | 读取 .pdf | registry.go:240, 555 |
 | `web_fetch` | HTTP 抓取 URL（带 SSRF 防护） | registry.go:275, 749 |
 | `web_search` | 公开网络搜索（snippet+url，可插拔 provider） | websearch.go |
-| `image_recognize` | 调用系统配置中的外接多模态模型识别会话上传图片 | image_recognize.go, registry.go |
+| `image_recognize` | 识别会话上传图片；优先用系统识图模型，必要时 fallback 到当前视觉模型 | image_recognize.go, registry.go |
 | `todo_write` | 管理待办列表 | registry.go:256, todo.go |
 | `question` | 向用户提问并等待 | registry.go:275, question.go |
 
