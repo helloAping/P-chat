@@ -7,13 +7,13 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"strings"
 )
 
 //go:embed assets
 var bundled embed.FS
 
 func main() {
+	visualMode := len(os.Args) == 1
 	tmp, err := os.MkdirTemp("", "pchat-setup")
 	if err != nil {
 		fail("创建临时目录失败", err)
@@ -23,18 +23,11 @@ func main() {
 	fmt.Println("────────────────")
 	fmt.Println()
 
-	installDir := pickDir()
-	if installDir == "" {
-		fmt.Println("已取消。")
-		pause()
-		return
-	}
-
 	if err := extractAssets(tmp); err != nil {
 		fail("解压文件失败", err)
 	}
 
-	if err := runInstall(tmp, installDir); err != nil {
+	if err := runInstall(tmp, os.Args[1:]); err != nil {
 		fmt.Println()
 		fmt.Println("安装失败，临时文件保留在:", tmp)
 		fail("", err)
@@ -45,8 +38,10 @@ func main() {
 	}
 
 	fmt.Println()
-	fmt.Println("安装完成! 可从开始菜单或桌面快捷方式启动 P-Chat。")
-	pause()
+	fmt.Println("安装程序已结束。")
+	if !visualMode {
+		pause()
+	}
 }
 
 func extractAssets(dest string) error {
@@ -104,57 +99,16 @@ func copyDir(src string, dst string) error {
 	return nil
 }
 
-func pickDir() string {
-	fmt.Println("请选择安装目录…")
-
-	path := pickDirGUI()
-	if path == "" {
-		fmt.Print("请输入安装目录路径: ")
-		fmt.Scanln(&path)
-		path = strings.TrimSpace(path)
-	}
-	if path == "" {
-		return ""
-	}
-
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		fmt.Printf("无效路径: %v\n", err)
-		return ""
-	}
-
-	if err := os.MkdirAll(abs, 0755); err != nil {
-		fmt.Printf("无法创建目录: %v\n", err)
-		return ""
-	}
-
-	fmt.Printf("安装目录: %s\n\n", abs)
-	return abs
-}
-
-func pickDirGUI() string {
-	ps := `
-Add-Type -AssemblyName System.Windows.Forms
-$d = New-Object System.Windows.Forms.FolderBrowserDialog
-$d.Description = "选择 P-Chat 安装目录"
-$d.ShowNewFolderButton = $true
-if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }
-`
-	out, err := exec.Command("powershell", "-NoProfile", "-Command", ps).Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
-func runInstall(tmp, target string) error {
+func runInstall(tmp string, args []string) error {
 	fmt.Print("执行安装脚本... ")
 	ps1 := filepath.Join(tmp, "install.ps1")
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-		"-File", ps1,
-		"-InstallDir", target,
-		"-AddToPath",
-	)
+	psArgs := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1}
+	if len(args) == 0 {
+		psArgs = append(psArgs, "-Gui")
+	} else {
+		psArgs = append(psArgs, args...)
+	}
+	cmd := exec.Command("powershell", psArgs...)
 	cmd.Dir = tmp
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
