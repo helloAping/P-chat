@@ -14,7 +14,7 @@ import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
   Lock, Unlock, Key, Database, Copy, Scissors, ClipboardPaste, TextCursorInput,
-  Settings, ImageIcon,
+  Settings, HelpCircle,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -1541,7 +1541,31 @@ onMounted(() => {
             </div>
 
             <div class="session-config-row">
-              <div class="session-config-label">风格</div>
+              <div class="session-config-label">
+                <span>风格</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="风格说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">风格</div>
+                    <p>决定助手在当前会话里的说话方式，比如更活泼、更简洁，或按某个角色来回复。</p>
+                    <p>右上角的“生成风格”按钮可以根据当前对话自动整理一个新风格，也可以优化已有风格，并把相关备注一起保存。</p>
+                    <p>这里选中的风格只影响当前会话。想查看、编辑或手动新增风格，可以到“应用设置 > 风格”。</p>
+                  </div>
+                </NPopover>
+              </div>
               <div class="session-config-options">
                 <button
                   v-for="opt in styleOptions"
@@ -1573,7 +1597,31 @@ onMounted(() => {
             </div>
 
             <div class="session-config-row">
-              <div class="session-config-label">思考</div>
+              <div class="session-config-label">
+                <span>思考</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="思考说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">思考</div>
+                    <p>控制助手回答前要不要多想一会儿。问题越复杂，适当调高越容易得到更稳的结果。</p>
+                    <p>调高后回复可能更慢，也可能消耗更多额度；普通聊天、简单改写建议保持关闭或低。</p>
+                    <p>这里设置只影响当前会话，并且是否生效取决于当前模型是否支持。</p>
+                  </div>
+                </NPopover>
+              </div>
               <div class="session-config-options">
                 <button
                   v-for="opt in reasoningEffortOptions[0]?.children || []"
@@ -1590,8 +1638,29 @@ onMounted(() => {
 
             <div class="session-config-row">
               <div class="session-config-label">
-                <ImageIcon :size="12" />
                 <span>图像识别</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="图像识别说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">图像识别</div>
+                    <p>开启后，助手可以在需要时“看”你上传的图片，比如读图中文字、描述画面、找物体或比较多张图片。</p>
+                    <p>需要先到“应用设置 > 系统 > 图像识别”开启，并选择一个负责看图的模型。</p>
+                    <p>看图会多走一步，可能比普通文字聊天慢一些；如果全局没有配置，这里不能启用。</p>
+                  </div>
+                </NPopover>
               </div>
               <div class="session-config-options">
                 <button
@@ -1619,7 +1688,31 @@ onMounted(() => {
             </div>
 
             <div class="session-config-row">
-              <div class="session-config-label">长任务</div>
+              <div class="session-config-label">
+                <span>长任务</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="长任务说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">长任务</div>
+                    <p>控制助手处理多步骤任务时，完成一轮后要不要继续往下做。</p>
+                    <p>“自适应”适合大多数情况；“不限轮次”适合整理大量资料、批量修改这类长流程，但可能运行更久。</p>
+                    <p>如果你希望助手每一步都先停下来等你确认，可以选择“关闭”。</p>
+                  </div>
+                </NPopover>
+              </div>
               <div class="session-config-options">
                 <button
                   v-for="opt in todoLongRunOptions"
@@ -2277,6 +2370,55 @@ onMounted(() => {
   font-weight: 500;
   line-height: 30px;
   white-space: nowrap;
+}
+.session-config-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  color: var(--text-tertiary);
+  cursor: help;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.session-config-help:hover {
+  background: var(--surface-3);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+.session-config-help-popover {
+  width: 300px;
+  padding: var(--space-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.session-config-help-title {
+  margin-bottom: var(--space-2);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+.session-config-help-popover p {
+  margin: 0;
+}
+.session-config-help-popover p + p {
+  margin-top: var(--space-2);
+}
+.session-config-help-popover code {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
 }
 .session-config-options {
   display: flex;

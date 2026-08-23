@@ -282,6 +282,35 @@ func TestReplaceImagesWithRecognitionRefs(t *testing.T) {
 	}
 }
 
+func TestReplaceHistoricalImagesWithReuploadPlaceholders(t *testing.T) {
+	in := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "system", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "old text", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "OLD_IMAGE_BASE64", Name: "old.png", MimeType: "image/png", UploadID: "old-upl", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "current text", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "CURRENT_IMAGE_BASE64", Name: "current.png", MimeType: "image/png", UploadID: "current-upl", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+	}
+
+	out := replaceHistoricalImagesWithReuploadPlaceholders(in, 3)
+	if len(out) != len(in) {
+		t.Fatalf("len(out) = %d, want %d", len(out), len(in))
+	}
+	histImage := out[2]
+	if histImage.Type != llm.TypeText {
+		t.Fatalf("historical image Type = %q, want text placeholder", histImage.Type)
+	}
+	if strings.Contains(histImage.Content, "OLD_IMAGE_BASE64") {
+		t.Fatalf("historical image placeholder leaked image bytes: %q", histImage.Content)
+	}
+	if !strings.Contains(histImage.Content, "old.png") || !strings.Contains(histImage.Content, "重新上传") {
+		t.Fatalf("historical image placeholder missing filename/reupload guidance: %q", histImage.Content)
+	}
+	currentImage := out[4]
+	if currentImage.Type != llm.TypeImage || currentImage.Content != "CURRENT_IMAGE_BASE64" {
+		t.Fatalf("current image = %#v, want unchanged image payload", currentImage)
+	}
+}
+
 // TestExpandAttachmentsCM_UploadIDMapsToResolver verifies the
 // UnmarshalJSON mirror: a client posting "upload_id" (the SPA
 // wire) resolves through the same disk path as a legacy "id".

@@ -2006,8 +2006,29 @@ function kbModelSupportsVision(scanModel: string) {
               </div>
             </div>
             <p class="settings-section-description">
-              风格定义 LLM 的人设与记忆。内置风格不可编辑，可复制后创建自定义版本。
+              风格决定助手的语气、角色和长期备注。内置风格不可编辑，可复制后创建自定义版本。
             </p>
+            <div class="style-usage">
+              <div class="style-usage-title">使用说明</div>
+              <div class="style-usage-grid">
+                <div class="style-usage-item">
+                  <div class="style-usage-item-title">当前会话怎么用</div>
+                  <p>在聊天输入框下方打开“会话设置”，选择一个风格后，只会影响当前会话。</p>
+                </div>
+                <div class="style-usage-item">
+                  <div class="style-usage-item-title">自动生成风格</div>
+                  <p>聊天页右上角有“生成风格”按钮，可根据当前对话总结出新的回复风格，也可以优化已有风格。</p>
+                </div>
+                <div class="style-usage-item">
+                  <div class="style-usage-item-title">备注会一起保存</div>
+                  <p>生成风格时会同步整理备注/记忆，例如称呼偏好、常用表达和需要长期记住的背景信息。</p>
+                </div>
+                <div class="style-usage-item">
+                  <div class="style-usage-item-title">手动维护</div>
+                  <p>点击“查看/编辑”可以调整风格内容；点击“新增风格”可以从空白模板手动创建。</p>
+                </div>
+              </div>
+            </div>
           </div>
           <div class="style-grid">
             <div v-for="s in styles" :key="s.id" class="style-card">
@@ -3532,6 +3553,39 @@ function kbModelSupportsVision(scanModel: string) {
 .styles-tab-body {
   min-height: 100%;
   overflow: visible;
+}
+.style-usage {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.style-usage-title {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: var(--space-2);
+}
+.style-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+.style-usage-item {
+  min-width: 0;
+}
+.style-usage-item-title {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 500;
+  margin-bottom: var(--space-1);
+}
+.style-usage-item p {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.5;
 }
 /* ---- 风格卡片网格 ---- */
 .style-grid {

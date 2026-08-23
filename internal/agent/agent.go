@@ -425,6 +425,33 @@ func dropDisplayOnlyMediaMessages(msgs []llm.ChatMessage) []llm.ChatMessage {
 	return out
 }
 
+func replaceHistoricalImagesWithReuploadPlaceholders(msgs []llm.ChatMessage, currentTurnStart int) []llm.ChatMessage {
+	currentTurnStart = clampHistoryMessageCount(currentTurnStart, len(msgs))
+	out := make([]llm.ChatMessage, 0, len(msgs))
+	for i, m := range msgs {
+		if i >= currentTurnStart || m.Type != llm.TypeImage {
+			out = append(out, m)
+			continue
+		}
+		name := strings.TrimSpace(m.Name)
+		if name == "" {
+			name = "未命名图片"
+		}
+		mime := strings.TrimSpace(m.MimeType)
+		if mime == "" {
+			mime = "未知类型"
+		}
+		out = append(out, llm.ChatMessage{
+			Role:        m.Role,
+			Type:        llm.TypeText,
+			Content:     fmt.Sprintf("[历史图片：%s，MIME=%s。该图片未随本次请求重新发送，当前模型无法直接查看图片内容。若用户要求查看、分析或回看这张图片，请明确说明需要用户重新上传图片后才能继续。]", name, mime),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+	}
+	return out
+}
+
 func replaceImagesWithRecognitionRefs(msgs []llm.ChatMessage) []llm.ChatMessage {
 	out := make([]llm.ChatMessage, 0, len(msgs))
 	for _, m := range msgs {
@@ -1657,6 +1684,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if currentTurnImageRecognition {
 			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, latestUserText(newMessages), ch, nextSeq)
 		}
+		msgs = replaceHistoricalImagesWithReuploadPlaceholders(msgs, persistStart)
 		msgs = dropDisplayOnlyMediaMessages(msgs)
 		if useImageRecognition {
 			if currentTurnImageRecognition {
