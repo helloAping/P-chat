@@ -164,6 +164,11 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// question tool's tool_call/tool_result row (msg_type=4),
 	// which buildMessageResponse already filters out below.
 
+	// Merge user attachment rows back into the text row from the same
+	// turn. Live streaming renders text+uploads as one local message;
+	// storage keeps them as separate rows so uploads can stay typed.
+	out = mergeUserAttachmentRows(out)
+
 	// Merge consecutive assistant messages that belong to the
 	// same user turn. During live streaming the frontend
 	// accumulates all ReAct-round outputs into a single message
@@ -178,6 +183,35 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		"oldest_id":  oldestID,
 		"oldest_seq": oldestSeq,
 	})
+}
+
+func mergeUserAttachmentRows(msgs []MessageResponse) []MessageResponse {
+	if len(msgs) <= 1 {
+		return msgs
+	}
+	merged := make([]MessageResponse, 0, len(msgs))
+	for _, msg := range msgs {
+		if len(merged) > 0 && shouldMergeUserAttachmentRow(merged[len(merged)-1], msg) {
+			prev := &merged[len(merged)-1]
+			prev.Attachments = append(prev.Attachments, msg.Attachments...)
+			if strings.TrimSpace(prev.Content) == "" && strings.TrimSpace(msg.Content) != "" {
+				prev.Content = msg.Content
+			}
+			continue
+		}
+		merged = append(merged, msg)
+	}
+	return merged
+}
+
+func shouldMergeUserAttachmentRow(prev, curr MessageResponse) bool {
+	if prev.Role != "user" || curr.Role != "user" {
+		return false
+	}
+	if len(curr.Attachments) == 0 {
+		return false
+	}
+	return strings.TrimSpace(curr.Content) == ""
 }
 
 // SnapshotRecovery (P0-1) returns the delta of assistant
@@ -379,10 +413,10 @@ func (h *Handler) ContextInspector(c *gin.Context) {
 	// Per-message breakdown for the UI list. We use
 	// the RAW (un-bound) messages here so each row
 	// corresponds to a single database row the user
-	// can mentally map. The token count is the
-	// `EstimateTokens` of the content (no per-
-	// message overhead at the row level — that
-	// overhead is rolled into the total below).
+	// can mentally map. The token count uses the
+	// same single-message estimator as the agent, so
+	// media rows are bounded multimodal parts rather
+	// than raw base64 text.
 	const previewMax = 100
 	out := make([]ContextMessage, 0, len(histMsgs))
 	for _, m := range histMsgs {
@@ -403,7 +437,7 @@ func (h *Handler) ContextInspector(c *gin.Context) {
 		}
 		out = append(out, ContextMessage{
 			Role:         m.Role,
-			Tokens:       llm.EstimateTokens(m.Content),
+			Tokens:       llm.EstimateMessageTokens(m),
 			Preview:      preview,
 			IsToolResult: m.Role == "tool",
 		})
@@ -853,7 +887,7 @@ func resolveHistoryUploads(msgs []llm.ChatMessage, r *agent.DiskAttachmentResolv
 	}
 	for i, m := range msgs {
 		id, ok := uploadIDFromContent(m.Content)
-		if !ok || m.UploadID != "" {
+		if !ok {
 			continue
 		}
 		path, _ := r.Resolve(agent.Attachment{ID: id})
@@ -868,6 +902,16 @@ func resolveHistoryUploads(msgs []llm.ChatMessage, r *agent.DiskAttachmentResolv
 				Role:        m.Role,
 				Type:        llm.TypeText,
 				Content:     fmt.Sprintf("(attached image %s — file not found on server)", m.Name),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
+			}
+			continue
+		}
+		if len(data) == 0 {
+			msgs[i] = llm.ChatMessage{
+				Role:        m.Role,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("(attached image %s — upload file is empty)", m.Name),
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
 			}

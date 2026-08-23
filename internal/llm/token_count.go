@@ -43,19 +43,49 @@ func EstimateTokensBytes(b []byte) int {
 	return (ascii+3)/4 + (cjk*2+2)/3
 }
 
+const (
+	// visionImageTokenEstimate is a bounded placeholder for one image
+	// part in a multimodal request. Image rows store base64 locally, but
+	// providers charge/count the visual input as image tokens, not as the
+	// literal base64 text. Counting base64 here turns a normal uploaded
+	// screenshot/photo into ~100K+ fake text tokens and triggers history
+	// compaction before the first real model call.
+	visionImageTokenEstimate = 1024
+	mediaMarkerTokenEstimate = 64
+)
+
+// EstimateMessageTokens returns a rough token estimate for one
+// ChatMessage, including protocol-relevant metadata and wrapper overhead.
+// Binary media payloads are intentionally bounded: their Content field is
+// local base64 transport data, not prompt text.
+func EstimateMessageTokens(m ChatMessage) int {
+	contentTokens := EstimateTokens(m.Content)
+	switch m.Type {
+	case TypeImage:
+		contentTokens = visionImageTokenEstimate
+	case TypeAudio, TypeVideo:
+		contentTokens = mediaMarkerTokenEstimate
+	case TypeFile:
+		if m.MimeType != "" {
+			contentTokens = mediaMarkerTokenEstimate
+		}
+	}
+	return contentTokens +
+		EstimateTokens(m.ToolInput) +
+		EstimateTokens(m.ToolName) +
+		EstimateTokens(m.ToolID) +
+		EstimateTokens(m.Name) +
+		EstimateTokens(m.MimeType) +
+		12 // role/type/protocol wrapper overhead
+}
+
 // EstimateTokensMessages returns a rough token estimate for a slice of
 // ChatMessage. It counts the primary content plus protocol-relevant
 // metadata such as tool arguments, attachment names, and MIME types.
 func EstimateTokensMessages(msgs []ChatMessage) int {
 	total := 0
 	for _, m := range msgs {
-		total += EstimateTokens(m.Content)
-		total += EstimateTokens(m.ToolInput)
-		total += EstimateTokens(m.ToolName)
-		total += EstimateTokens(m.ToolID)
-		total += EstimateTokens(m.Name)
-		total += EstimateTokens(m.MimeType)
-		total += 12 // role/type/protocol wrapper overhead
+		total += EstimateMessageTokens(m)
 	}
 	return total
 }

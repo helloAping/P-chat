@@ -84,6 +84,7 @@ export const state = reactive({
   defaultModel: null as { provider: string; model: string } | null,
   sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string; todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'; use_image_recognition?: boolean }>,
   globalWorkMode: 'coding' as string,
+  visionRecognitionEnabled: false,
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
   // sessionWorking is the per-session "is the LLM mid-turn"
@@ -866,6 +867,9 @@ export async function addAttachment(file: File) {
     // server URL after upload completed.)
   } catch (e: any) {
     placeholder._uploading = false
+    if (placeholder._dataURL) {
+      return
+    }
     placeholder._error = true
     throw e
   }

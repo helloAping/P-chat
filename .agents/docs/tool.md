@@ -98,9 +98,11 @@ type SandboxChecker interface {
 - 系统配置 `vision_recognition.enabled=true`，且指定的 provider/model 已存在。
 - 当前会话 `use_image_recognition=true`。
 
-图片上传后，`ExpandAttachmentsCM()` 会把图片作为 `SubmitToLLM=0` 的显示/持久化消息保存，并给主模型追加一条 system 引用，提示可用的 `upload_id`。主模型看不到图片二进制，只能调用 `image_recognize`；工具 handler 通过会话上传引用校验 `upload_id` / `upload_ids`，再用一次请求把一张或多张图片发给系统配置里的多模态模型，把识别文本返回给主对话。
+本轮刚上传的图片会先走 preflight：`ExpandAttachmentsCM()` 把图片作为 `SubmitToLLM=0` 的显示/持久化消息保存，agent 随后直接调用系统配置中的多模态模型识别这些“当前轮图片”，并把识别文本作为 system 上下文注入给主模型。该上下文必须标记为视觉/OCR 观察，不是用户指令；本轮主模型不再暴露 `image_recognize`，避免它自行选择错误的历史 `upload_id` 或重复调用。
 
-识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，本轮和历史图片都会从主模型上下文中替换为工具引用，避免主模型收到 `image_url` / image block。
+没有新图片的后续追问仍可暴露 `image_recognize`：历史图片会从主模型上下文中替换为带 `upload_id` 的工具引用，工具 handler 通过会话上传引用校验 `upload_id` / `upload_ids`，再把一张或多张图片发给系统配置里的多模态模型，把识别文本返回给主对话。
+
+识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，图片二进制都不会发给主模型，避免主模型收到 `image_url` / image block。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

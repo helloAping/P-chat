@@ -549,18 +549,7 @@ func (a *Agent) recognizeImageWithConfiguredModel(ctx context.Context, req tool.
 			MimeType: img.MIME,
 		})
 	}
-	ch := a.llm.ChatStreamCM(callCtx, vc.Provider, vc.Model, msgs, nil, llm.ChatOptions{})
-	var sb strings.Builder
-	for chunk := range ch {
-		if chunk.Err != nil {
-			return "", chunk.Err
-		}
-		if chunk.Done {
-			break
-		}
-		sb.WriteString(chunk.Content)
-	}
-	return strings.TrimSpace(sb.String()), nil
+	return a.llm.ChatCM(callCtx, vc.Provider, vc.Model, msgs, llm.ChatOptions{})
 }
 
 // visionCapableByHeuristic returns a best-guess vision
@@ -634,14 +623,20 @@ type ChatRequest struct {
 	HistoryMessageCount int    `json:"history_message_count,omitempty"`
 	Provider            string `json:"provider,omitempty"`
 	Model               string `json:"model,omitempty"`
+	// CurrentTurnAlreadyPersisted marks regeneration-style requests where
+	// Messages[HistoryMessageCount:] is the current user turn read back from
+	// storage. The agent should use that suffix for current-turn semantics
+	// (for example image preflight) but must not write those rows again.
+	CurrentTurnAlreadyPersisted bool `json:"current_turn_already_persisted,omitempty"`
 	// Attachments are file ids the user attached to this turn.
 	// Expanded into the message list as separate ChatMessage
 	// entries (text + image/file) before being sent to the LLM.
 	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
-	// UseImageRecognition keeps uploaded images out of the main model and
-	// exposes image_recognize so a configured multimodal model can describe
-	// them as text.
+	// UseImageRecognition keeps uploaded images out of the main model.
+	// Current-turn image attachments are recognized before the main model call
+	// and injected as text context; follow-up turns can still expose
+	// image_recognize for historical upload_ids.
 	UseImageRecognition bool `json:"use_image_recognition,omitempty"`
 	// ClientMsgID, when non-zero, is the row id the frontend
 	// minted at send time (Date.now() × 1000 + random, well
@@ -1440,6 +1435,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		a.loadProjectDynamicTools(req.ProjectRoot)
 		availableTools := a.tools.ListForProject(req.ProjectRoot)
 		useImageRecognition := req.UseImageRecognition && a.imageRecognitionAvailable()
+		requestHistoryCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
+		currentTurnImageRecognition := useImageRecognition && ((a.attach != nil && hasImageAttachments(req.Attachments)) || hasImageMessages(req.Messages[requestHistoryCount:]))
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
 		kbEnabled := req.KBBase != "" && req.KBBase != "__off__"
@@ -1463,7 +1460,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// (before toolDefs / prompt / subagent wiring) keeps
 		// every downstream consumer consistent.
 		availableTools = a.visionGatedTools(req.Provider, req.Model, availableTools)
-		availableTools = a.imageRecognitionGatedTools(useImageRecognition, availableTools)
+		// Current-turn uploads are recognized before the main LLM call and
+		// injected as bounded context. Keep image_recognize available only for
+		// follow-up turns that need to revisit historical upload_ids.
+		availableTools = a.imageRecognitionGatedTools(useImageRecognition && !currentTurnImageRecognition, availableTools)
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -1555,13 +1555,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if todoGuardActive(todoMode, initialTodos) {
 			upsertTodoGuard(&msgs, todoMode, initialTodos, false)
 		}
-		historyCount := req.HistoryMessageCount
-		if historyCount < 0 {
-			historyCount = 0
-		}
-		if historyCount > len(req.Messages) {
-			historyCount = len(req.Messages)
-		}
+		historyCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
 		history := req.Messages[:historyCount]
 		newMessages := req.Messages[historyCount:]
 		// When knowledge base is off, strip wiki-related messages
@@ -1631,6 +1625,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// This history row is already in storage.
 					continue
 				}
+				if req.CurrentTurnAlreadyPersisted {
+					// 重答会把原用户消息及其附件作为当前轮后缀重放。
+					// They drive the retry and image preflight, but already
+					// exist in the database and must not be duplicated.
+					continue
+				}
 				// Images uploaded via the SPA are persisted as a
 				// "upl://<id>" reference instead of base64: the
 				// bytes live in ~/.p-chat/uploads and the DB row
@@ -1654,9 +1654,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				a.store.AddChatMessageTo(req.SessionID, m)
 			}
 		}
+		if currentTurnImageRecognition {
+			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, latestUserText(newMessages), ch, nextSeq)
+		}
 		msgs = dropDisplayOnlyMediaMessages(msgs)
 		if useImageRecognition {
-			msgs = replaceImagesWithRecognitionRefs(msgs)
+			if currentTurnImageRecognition {
+				msgs = replaceImagesWithHeldRefs(msgs)
+			} else {
+				msgs = replaceImagesWithRecognitionRefs(msgs)
+			}
 		}
 
 		// Plan mode: the LLM can use `todo_write` to break down
@@ -2526,7 +2533,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
 				}
-				if useImageRecognition {
+				if useImageRecognition && !currentTurnImageRecognition {
 					tctx = tool.WithImageResolver(tctx, a.resolveImageForRecognition)
 					tctx = tool.WithImageRecognizer(tctx, a.recognizeImageWithConfiguredModel)
 				}

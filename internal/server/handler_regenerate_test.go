@@ -8,10 +8,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,10 +297,211 @@ func TestRegenerate_UsesBoundedHistoryLoader(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(source)
-	if !strings.Contains(body, "h.loadHistoryForSend(c.Request.Context(), id, provider, model)") {
+	if !strings.Contains(body, "h.loadHistoryForSendWithIDs(c.Request.Context(), id, provider, model)") {
 		t.Fatal("Regenerate should use loadHistoryForSend so long histories stay bounded")
 	}
 	if strings.Contains(body, "GetChatMessagesFor(id, 0)") {
 		t.Fatal("Regenerate must not load full unbounded history")
+	}
+}
+
+func TestBuildRegenerateMessages_KeepsTargetImagesInCurrentTurn(t *testing.T) {
+	hist := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "previous", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleAssistant, Type: llm.TypeText, Content: "previous reply", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "图片说什么", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "aW1hZ2U=", Name: "screen.png", MimeType: "image/png", UploadID: "upl1", MsgType: llm.MsgTypeImage, SubmitToLLM: 0},
+	}
+	rowIDs := []int64{1, 2, 3, 4}
+
+	msgs, historyCount, ok := buildRegenerateMessages(hist, rowIDs, 3)
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if historyCount != 2 {
+		t.Fatalf("historyCount = %d, want 2", historyCount)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("len(msgs) = %d, want 4", len(msgs))
+	}
+	current := msgs[historyCount:]
+	if len(current) != 2 {
+		t.Fatalf("current len = %d, want text + image", len(current))
+	}
+	if current[0].Content != "图片说什么" {
+		t.Fatalf("current text = %+v", current[0])
+	}
+	if current[1].Type != llm.TypeImage || current[1].UploadID != "upl1" || current[1].SubmitToLLM != 0 {
+		t.Fatalf("current image = %+v, want display image preserved for preflight", current[1])
+	}
+}
+
+func TestRegenerate_PreRecognizesPersistedUploadReference(t *testing.T) {
+	type requestRecord struct {
+		Model string
+		Body  string
+	}
+	var (
+		mu      sync.Mutex
+		records []requestRecord
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		model, _ := body["model"].(string)
+		raw, _ := json.Marshal(body)
+		mu.Lock()
+		records = append(records, requestRecord{Model: model, Body: string(raw)})
+		mu.Unlock()
+
+		if model == "vision-model" {
+			if stream, _ := body["stream"].(bool); stream {
+				t.Fatalf("vision regenerate request must be non-streaming, body=%s", raw)
+			}
+			if !strings.Contains(string(raw), "data:image/png;base64,") {
+				t.Fatalf("vision regenerate request missing image data:\n%s", raw)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{map[string]any{
+					"message": map[string]any{"content": "识别结果：图片里有龙眼果和小猫。"},
+				}},
+			})
+			return
+		}
+
+		if model == "main-model" && !strings.Contains(string(raw), "识别结果：图片里有龙眼果和小猫") {
+			t.Fatalf("main regenerate request missing recognition context:\n%s", raw)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"图片里是龙眼和小猫。\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfgJSON := `{
+	  "server": { "host": "127.0.0.1", "port": 8960 },
+	  "llm": {
+	    "default": "main",
+	    "providers": [
+	      {
+	        "name": "main",
+	        "protocol": "openai",
+	        "base_url": "` + upstream.URL + `",
+	        "api_key": "sk-main",
+	        "models": [{ "name": "main-model", "default": true }]
+	      },
+	      {
+	        "name": "vision",
+	        "protocol": "openai",
+	        "base_url": "` + upstream.URL + `",
+	        "api_key": "sk-vision",
+	        "models": [{ "name": "vision-model", "default": true, "capabilities": { "supports_vision": true } }]
+	      }
+	    ]
+	  },
+	  "vision_recognition": {
+	    "enabled": true,
+	    "provider": "vision",
+	    "model": "vision-model",
+	    "timeout_seconds": 5
+	  },
+	  "limits": { "max_rounds": 1, "max_turn_seconds": 5 }
+	}`
+	s, _ := newTestServerWithConfig(t, cfgJSON)
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCurrent(convID); err != nil {
+		t.Fatal(err)
+	}
+
+	s.handler.metaMu.Lock()
+	s.handler.meta[convID] = sessionMeta{Provider: "main", Model: "main-model", UseImageRecognition: true}
+	meta := s.handler.meta[convID]
+	s.handler.metaMu.Unlock()
+	s.handler.persistSessionMeta(convID, meta)
+
+	uploadID := "abcd1234567890ab"
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(UploadDir(), uploadID+"-screen.png"), []byte("fake-png-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store.AddChatMessageTo(convID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "图片说啥",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	userID := store.GetLastUserMessageID(convID)
+	if userID <= 0 {
+		t.Fatalf("expected user id > 0, got %d", userID)
+	}
+	store.AddChatMessageTo(convID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeImage,
+		Content:     "upl://" + uploadID,
+		Name:        "screen.png",
+		MimeType:    "image/png",
+		UploadID:    uploadID,
+		MsgType:     llm.MsgTypeImage,
+		SubmitToLLM: 0,
+	})
+	store.AddChatMessageWithMetaToRegen(convID,
+		llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText, Content: "old reply", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		map[string]string{"role": llm.RoleAssistant},
+		strconv.FormatInt(userID, 10),
+		false,
+	)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := newStreamRecorder()
+	body := `{"user_message_id": ` + strconv.FormatInt(userID, 10) + `}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+convID+"/regenerate", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }()
+		s.engine.ServeHTTP(w, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("regenerate request hung")
+	}
+
+	frames := w.Body.String()
+	if !strings.Contains(frames, "图片里是龙眼和小猫") {
+		t.Fatalf("regenerate stream did not include final image answer:\n%s", frames)
+	}
+
+	mu.Lock()
+	gotRecords := append([]requestRecord(nil), records...)
+	mu.Unlock()
+	if len(gotRecords) < 2 {
+		t.Fatalf("upstream requests = %d, want vision preflight + main request: %#v", len(gotRecords), gotRecords)
+	}
+	if gotRecords[0].Model != "vision-model" {
+		t.Fatalf("first upstream model = %q, want vision-model", gotRecords[0].Model)
+	}
+	if gotRecords[1].Model != "main-model" {
+		t.Fatalf("second upstream model = %q, want main-model", gotRecords[1].Model)
 	}
 }

@@ -118,7 +118,7 @@ func TestTryAutoCompact_CompressFailureDoesNotLoop(t *testing.T) {
 func TestTryAutoCompact_NoSummarizerShortCircuits(t *testing.T) {
 	cfg := &config.Config{
 		LLM: config.LLMConfig{
-			Default: "test",
+			Default:   "test",
 			Providers: []config.ProviderConfig{{Name: "test", Protocol: "openai", BaseURL: "http://127.0.0.1:9", APIKey: "k", Model: "m"}},
 		},
 		Limits: config.LimitsConfig{MaxRounds: 5},
@@ -143,6 +143,68 @@ func TestTryAutoCompact_NoSummarizerShortCircuits(t *testing.T) {
 	seq := uint64(0)
 	if got := agt.tryAutoCompact(context.Background(), &msgs, ChatRequest{SessionID: "s", Provider: "test", Model: "m"}, nil, ch, func() uint64 { seq++; return seq - 1 }, 1, 5); got {
 		t.Fatalf("nil summarizer should short-circuit to false")
+	}
+}
+
+func TestTryAutoCompact_FirstTurnImageDoesNotCountBase64AsText(t *testing.T) {
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Default:   "test",
+			Providers: []config.ProviderConfig{{Name: "test", Protocol: "openai", BaseURL: "http://127.0.0.1:9", APIKey: "k", Model: "m"}},
+		},
+		Limits: config.LimitsConfig{MaxRounds: 5},
+	}
+	llmClient, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := memory.OpenAt(":memory:", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := upgrade.SeedForTesting(store.DB()); err != nil {
+		t.Fatal(err)
+	}
+	styleMgr, err := style.NewManager(store.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	agt := New(cfg, llmClient, styleMgr, store, tool.NewRegistry())
+	// Keep a summarizer wired so this test exercises the estimate gate
+	// inside tryAutoCompact, not the nil-summarizer short circuit.
+	agt.SetSummarizer(memory.NewSummarizer(store, nil, "test", 50))
+
+	imageBase64 := strings.Repeat("A", 740_000) // old estimate: ~185k fake text tokens
+	msgs := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "sys"},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "what is in this image?"},
+		{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeImage,
+			Content:     imageBase64,
+			Name:        "screen.png",
+			MimeType:    "image/png",
+			MsgType:     llm.MsgTypeImage,
+			SubmitToLLM: 1,
+		},
+	}
+	if total := llm.EstimatePromptTokens(msgs, nil); total > 35_808 {
+		t.Fatalf("first-turn image estimate = %d, want under compact threshold; image base64 was counted as text", total)
+	}
+
+	ch := make(chan ChatStreamChunk, 8)
+	seq := uint64(0)
+	origLen := len(msgs)
+	compacted := agt.tryAutoCompact(context.Background(), &msgs, ChatRequest{SessionID: "first-image", Provider: "test", Model: "m"}, nil, ch, func() uint64 { seq++; return seq - 1 }, 1, 5)
+	if compacted {
+		t.Fatal("first-turn image should not trigger auto-compact")
+	}
+	if len(msgs) != origLen {
+		t.Fatalf("message list was truncated: len=%d want %d", len(msgs), origLen)
+	}
+	if len(ch) != 0 {
+		t.Fatalf("unexpected compact events emitted: %d", len(ch))
 	}
 }
 

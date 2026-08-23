@@ -293,6 +293,29 @@ func TestOpenAIBuild_UserTextAndMultipleImages_Merged(t *testing.T) {
 	}
 }
 
+func TestOpenAIBuild_EmptyImageDegradesToText(t *testing.T) {
+	a := NewOpenAIAdapter("https://api.example.com", "sk-test", "test")
+	msgs := []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "look"},
+		{Role: RoleUser, Type: TypeImage, Content: "", MimeType: "image/png", Name: "empty.png"},
+	}
+	out := mustBuildOpenAI(t, a, msgs, "")
+	if got := len(out.Messages); got != 1 {
+		t.Fatalf("messages count = %d, want 1 combined user message", got)
+	}
+	user := out.Messages[0]
+	if len(user.MultiContent) != 2 {
+		t.Fatalf("content parts = %d, want text + marker", len(user.MultiContent))
+	}
+	if user.MultiContent[1].Type != openai.ChatMessagePartTypeText {
+		t.Fatalf("part[1].Type = %q, want text marker", user.MultiContent[1].Type)
+	}
+	body := string(mustBody(a, msgs, ""))
+	if strings.Contains(body, "data:image/png;base64,") || strings.Contains(body, `"type":"image_url"`) {
+		t.Fatalf("empty image must not emit image_url. body=%s", body)
+	}
+}
+
 // mustBody returns the raw request body bytes for the given input.
 // Used in error messages for debugging — small enough that the
 // extra marshal cost is irrelevant.

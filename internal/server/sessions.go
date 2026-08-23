@@ -728,6 +728,10 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.persistSessionMeta(id, m)
 	}
 	if req.UseImageRecognition != nil {
+		if *req.UseImageRecognition && !h.getCfg().Vision.Enabled {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "image recognition is disabled globally; enable it in App Settings > System > Image Recognition first"})
+			return
+		}
 		h.metaMu.Lock()
 		m := h.meta[id]
 		m.UseImageRecognition = *req.UseImageRecognition

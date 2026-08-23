@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,7 +41,9 @@ func TestChatStreamCM_ResponseHeaderTimeout(t *testing.T) {
 	})
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	c.providers["openai"].responseHeaderTimeout = 100 * time.Millisecond
 	c.providers["openai"].streamIdleTimeout = time.Second
 
@@ -77,7 +80,9 @@ func TestChatStreamCM_StreamIdleTimeout(t *testing.T) {
 	})
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	c.providers["openai"].responseHeaderTimeout = time.Second
 	c.providers["openai"].streamIdleTimeout = 100 * time.Millisecond
 
@@ -102,11 +107,70 @@ func assertTimeoutChunk(t *testing.T, chunk StreamChunk) {
 	}
 }
 
+func TestChatCM_OpenAIUsesNonStreamingJSON(t *testing.T) {
+	var sawImage bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+			t.Fatalf("Accept = %q, want non-streaming JSON request", r.Header.Get("Accept"))
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if stream, _ := body["stream"].(bool); stream {
+			t.Fatalf("stream = true, want false; body=%v", body)
+		}
+		if _, ok := body["stream_options"]; ok {
+			t.Fatalf("stream_options should be omitted for non-streaming request: %v", body["stream_options"])
+		}
+		raw, _ := json.Marshal(body)
+		sawImage = strings.Contains(string(raw), "data:image/png;base64,")
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message": map[string]any{"content": "recognized"},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	cfg := config.LLMConfig{
+		Default: "vision",
+		Providers: []config.ProviderConfig{{
+			Name:     "vision",
+			Protocol: "openai",
+			BaseURL:  srv.URL,
+			APIKey:   "test-key",
+			Model:    "vision-model",
+		}},
+	}
+	c, err := NewClient(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.ChatCM(context.Background(), "vision", "vision-model", []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "图片说什么"},
+		{Role: RoleUser, Type: TypeImage, Content: "aW1hZ2U=", MimeType: "image/png", Name: "screen.png"},
+	}, ChatOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "recognized" {
+		t.Fatalf("content = %q, want recognized", got)
+	}
+	if !sawImage {
+		t.Fatal("non-streaming request did not include image data")
+	}
+}
+
 // TestOpenAIStream_StandardField verifies the parser
 // still handles the canonical OpenAI wire shape:
-//   data: {"choices":[{"delta":{"content":"hello"}}]}
-//   data: {"choices":[{"delta":{"content":" world"}}]}
-//   data: [DONE]
+//
+//	data: {"choices":[{"delta":{"content":"hello"}}]}
+//	data: {"choices":[{"delta":{"content":" world"}}]}
+//	data: [DONE]
 func TestOpenAIStream_StandardField(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -115,18 +179,26 @@ func TestOpenAIStream_StandardField(t *testing.T) {
 		parts := []string{"hello", " ", "world", "!"}
 		for _, p := range parts {
 			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", p)
-			if fl != nil { fl.Flush() }
+			if fl != nil {
+				fl.Flush()
+			}
 		}
 		// Final usage chunk with no choices.
 		fmt.Fprintf(w, "data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n")
-		if fl != nil { fl.Flush() }
+		if fl != nil {
+			fl.Flush()
+		}
 		fmt.Fprintf(w, "data: [DONE]\n\n")
-		if fl != nil { fl.Flush() }
+		if fl != nil {
+			fl.Flush()
+		}
 	}))
 	defer srv.Close()
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -136,8 +208,12 @@ func TestOpenAIStream_StandardField(t *testing.T) {
 	}))
 	var content strings.Builder
 	for _, c := range chunks {
-		if c.Err != nil { t.Fatalf("stream error: %v", c.Err) }
-		if c.Content != "" { content.WriteString(c.Content) }
+		if c.Err != nil {
+			t.Fatalf("stream error: %v", c.Err)
+		}
+		if c.Content != "" {
+			content.WriteString(c.Content)
+		}
 	}
 	if got := content.String(); got != "hello world!" {
 		t.Errorf("content = %q, want %q", got, "hello world!")
@@ -159,15 +235,21 @@ func TestOpenAIStream_LegacyTextField(t *testing.T) {
 		parts := []string{"我", "是", "助手"}
 		for _, p := range parts {
 			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"text\":%q}}]}\n\n", p)
-			if fl != nil { fl.Flush() }
+			if fl != nil {
+				fl.Flush()
+			}
 		}
 		fmt.Fprintf(w, "data: [DONE]\n\n")
-		if fl != nil { fl.Flush() }
+		if fl != nil {
+			fl.Flush()
+		}
 	}))
 	defer srv.Close()
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -177,8 +259,12 @@ func TestOpenAIStream_LegacyTextField(t *testing.T) {
 	}))
 	var content strings.Builder
 	for _, c := range chunks {
-		if c.Err != nil { t.Fatalf("stream error: %v", c.Err) }
-		if c.Content != "" { content.WriteString(c.Content) }
+		if c.Err != nil {
+			t.Fatalf("stream error: %v", c.Err)
+		}
+		if c.Content != "" {
+			content.WriteString(c.Content)
+		}
 	}
 	if got := content.String(); got != "我是助手" {
 		t.Errorf("content = %q, want %q", got, "我是助手")
@@ -194,25 +280,38 @@ func TestOpenAIStream_ReasoningField(t *testing.T) {
 		w.WriteHeader(200)
 		fl, _ := w.(http.Flusher)
 		// Three reasoning chunks, two content chunks.
-		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Let me \"}}]}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think.\"}}]}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Answer: \"}}]}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"42\"}}]}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: [DONE]\n\n"); fl.Flush()
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Let me \"}}]}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think.\"}}]}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Answer: \"}}]}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"42\"}}]}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		fl.Flush()
 	}))
 	defer srv.Close()
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	chunks := readAll(c.ChatStream(ctx, "openai", "test-model", []Message{{Role: "user", Content: "?"}}))
 
 	var thinking, content strings.Builder
 	for _, c := range chunks {
-		if c.Err != nil { t.Fatalf("stream error: %v", c.Err) }
-		if c.Thinking != "" { thinking.WriteString(c.Thinking) }
-		if c.Content != "" { content.WriteString(c.Content) }
+		if c.Err != nil {
+			t.Fatalf("stream error: %v", c.Err)
+		}
+		if c.Thinking != "" {
+			thinking.WriteString(c.Thinking)
+		}
+		if c.Content != "" {
+			content.WriteString(c.Content)
+		}
 	}
 	if got := thinking.String(); got != "Let me think." {
 		t.Errorf("thinking = %q, want %q", got, "Let me think.")
@@ -233,25 +332,36 @@ func TestOpenAIStream_EmptyChoicesChunk(t *testing.T) {
 		w.WriteHeader(200)
 		fl, _ := w.(http.Flusher)
 		atomic.AddInt32(&hits, 1)
-		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: [DONE]\n\n"); fl.Flush()
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		fl.Flush()
 	}))
 	defer srv.Close()
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	chunks := readAll(c.ChatStream(ctx, "openai", "test-model", []Message{{Role: "user", Content: "hi"}}))
 
 	var last StreamChunk
 	for _, c := range chunks {
-		if c.Err != nil { t.Fatalf("stream error: %v", c.Err) }
+		if c.Err != nil {
+			t.Fatalf("stream error: %v", c.Err)
+		}
 		last = c
 	}
-	if !last.Done { t.Error("final chunk should be Done") }
-	if atomic.LoadInt32(&hits) != 1 { t.Errorf("server hits = %d, want 1", hits) }
+	if !last.Done {
+		t.Error("final chunk should be Done")
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Errorf("server hits = %d, want 1", hits)
+	}
 }
 
 // TestOpenAIStream_HttpError verifies the parser
@@ -266,13 +376,19 @@ func TestOpenAIStream_HttpError(t *testing.T) {
 	defer srv.Close()
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	chunks := readAll(c.ChatStream(ctx, "openai", "test-model", []Message{{Role: "user", Content: "hi"}}))
 
-	if len(chunks) != 1 { t.Fatalf("got %d chunks, want 1", len(chunks)) }
-	if chunks[0].Err == nil { t.Error("expected an error chunk") }
+	if len(chunks) != 1 {
+		t.Fatalf("got %d chunks, want 1", len(chunks))
+	}
+	if chunks[0].Err == nil {
+		t.Error("expected an error chunk")
+	}
 }
 
 // newTestClient builds a minimal Client wired to a
@@ -412,22 +528,31 @@ func TestOpenAIStream_WrappedEnvelope(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 		fl, _ := w.(http.Flusher)
-		fmt.Fprintf(w, "data: {\"data\":{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: {\"data\":{\"choices\":[{\"delta\":{\"content\":\" world\"}}]}}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: [DONE]\n\n"); fl.Flush()
+		fmt.Fprintf(w, "data: {\"data\":{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: {\"data\":{\"choices\":[{\"delta\":{\"content\":\" world\"}}]}}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		fl.Flush()
 	}))
 	defer srv.Close()
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	chunks := readAll(c.ChatStream(ctx, "openai", "test-model", []Message{{Role: "user", Content: "hi"}}))
 
 	var content strings.Builder
 	for _, c := range chunks {
-		if c.Err != nil { t.Fatalf("stream error: %v", c.Err) }
-		if c.Content != "" { content.WriteString(c.Content) }
+		if c.Err != nil {
+			t.Fatalf("stream error: %v", c.Err)
+		}
+		if c.Content != "" {
+			content.WriteString(c.Content)
+		}
 	}
 	if got := content.String(); got != "hello world" {
 		t.Errorf("content = %q, want %q (walker should have recovered it from the wrapped envelope)", got, "hello world")
@@ -452,13 +577,17 @@ func TestOpenAIStream_ProxyErrorEnvelope(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 		fl, _ := w.(http.Flusher)
-		fmt.Fprintf(w, "data: {\"error\":{\"message\":\"Provider rate limited: status=429, body=...\",\"type\":\"server_error\",\"code\":\"provider_rate_limited\"}}\n\n"); fl.Flush()
-		fmt.Fprintf(w, "data: [DONE]\n\n"); fl.Flush()
+		fmt.Fprintf(w, "data: {\"error\":{\"message\":\"Provider rate limited: status=429, body=...\",\"type\":\"server_error\",\"code\":\"provider_rate_limited\"}}\n\n")
+		fl.Flush()
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		fl.Flush()
 	}))
 	defer srv.Close()
 
 	c, err := newTestClient("openai", srv.URL)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	chunks := readAll(c.ChatStream(ctx, "openai", "test-model", []Message{{Role: "user", Content: "hi"}}))

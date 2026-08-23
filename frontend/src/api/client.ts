@@ -752,12 +752,17 @@ export const forkSession = (sessionId: string, beforeId: number) =>
 export async function uploadFile(file: File): Promise<UploadMeta> {
   const fd = new FormData()
   fd.append('file', file)
-  const res = await fetch(BASE + '/api/v1/uploads', { method: 'POST', body: fd })
+  const backend = await waitForDirectBackend()
+  const res = await fetch(`${backend}/api/v1/uploads`, { method: 'POST', body: fd, credentials: 'omit' })
   if (!res.ok) {
     const t = await res.text()
     throw new Error(`HTTP ${res.status}: ${t}`)
   }
-  return res.json() as Promise<UploadMeta>
+  const meta = await res.json() as UploadMeta
+  if (!meta || meta.size <= 0) {
+    throw new Error('upload returned empty file')
+  }
+  return meta
 }
 
 export function uploadURL(id: string): string {

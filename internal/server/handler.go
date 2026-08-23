@@ -296,7 +296,7 @@ func (h *Handler) sessionTodoLongRunMode(id string) config.TodoLongRunMode {
 }
 
 func (h *Handler) sessionUseImageRecognition(id string) bool {
-	return h.ensureMetaLoaded(id).UseImageRecognition
+	return h.getCfg().Vision.Enabled && h.ensureMetaLoaded(id).UseImageRecognition
 }
 
 func (h *Handler) sessionProvider(id string) string {

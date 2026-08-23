@@ -205,6 +205,30 @@ func TestExpandAttachmentsCM_UploadImage(t *testing.T) {
 	}
 }
 
+func TestExpandAttachmentsCM_EmptyUploadImageDegradesToText(t *testing.T) {
+	dir := t.TempDir()
+	id := "abcd1234567890ab"
+	if err := os.WriteFile(filepath.Join(dir, id+"-empty.png"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &DiskAttachmentResolver{BaseDir: dir}
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "look at this", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+	}
+	out := ExpandAttachmentsCM("openai", in, []Attachment{
+		{UploadID: id, Name: "empty.png", Kind: "image", MIME: "image/png"},
+	}, resolver, func() bool { return true }, false)
+	if len(out) != 2 {
+		t.Fatalf("len(out) = %d, want text + marker", len(out))
+	}
+	if out[1].Type != llm.TypeText {
+		t.Fatalf("out[1].Type = %q, want text marker", out[1].Type)
+	}
+	if !strings.Contains(out[1].Content, "empty.png") {
+		t.Fatalf("marker missing filename: %#v", out[1])
+	}
+}
+
 func TestExpandAttachmentsCM_ImageRecognitionMode(t *testing.T) {
 	dir := t.TempDir()
 	id := "abcd1234567890ab"

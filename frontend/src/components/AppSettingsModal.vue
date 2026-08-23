@@ -311,6 +311,7 @@ async function loadSystemConfig() {
     sysWorkMode.value = sc.work_mode?.default || 'coding'
     sysCloseBehavior.value = normalizeCloseBehavior(sc.ui?.close_behavior)
     chatState.globalWorkMode = sysWorkMode.value
+    chatState.visionRecognitionEnabled = !!sysVision.value.enabled
     sysDirty.value = false
   } catch { /* ignore */ }
 }
@@ -350,7 +351,10 @@ async function saveSystemConfig() {
     const updated = await api.updateSystemConfig(patch)
     chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
     sysCloseBehavior.value = normalizeCloseBehavior(updated.ui?.close_behavior)
-    if (updated.vision_recognition) sysVision.value = updated.vision_recognition
+    if (updated.vision_recognition) {
+      sysVision.value = updated.vision_recognition
+      chatState.visionRecognitionEnabled = !!updated.vision_recognition.enabled
+    }
     sysDirty.value = false
     message.success('系统配置已保存')
   } catch (e: any) {

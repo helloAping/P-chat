@@ -155,7 +155,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	}
 	useImageRecognition := h.sessionUseImageRecognition(id)
 	if req.UseImageRecognition != nil {
-		useImageRecognition = *req.UseImageRecognition
+		useImageRecognition = h.getCfg().Vision.Enabled && *req.UseImageRecognition
 	}
 
 	// Hydrate the durable plan before the agent builds its prompt. A
@@ -430,6 +430,11 @@ func (h *Handler) GetToolResult(c *gin.Context) {
 }
 
 func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model string) ([]llm.ChatMessage, string) {
+	histMsgs, _, compSummary := h.loadHistoryForSendWithIDs(ctx, id, provider, model)
+	return histMsgs, compSummary
+}
+
+func (h *Handler) loadHistoryForSendWithIDs(ctx context.Context, id, provider, model string) ([]llm.ChatMessage, []int64, string) {
 	_ = h.store.Flush()
 	lastComp := h.store.LastCompressedIDFor(id)
 	contextCap := h.contextMessageLimit(provider, model)
@@ -445,9 +450,10 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 	}
 
 	var histMsgs []llm.ChatMessage
+	var rowIDs []int64
 	var compSummary string
 	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, contextCap, lastComp)
+		histMsgs, _, _, rowIDs = h.store.GetChatMessagesAfterIDForWithIDs(id, contextCap, lastComp)
 		// Carry the pre-summarized history so the agent can inject
 		// "[前文摘要]" into the system prompt — the LLM must know
 		// what the compressed-away history contained. Dropping this
@@ -459,7 +465,7 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 		if h.store.CountChatMessages(id) > contextCap {
 			limit = contextCap
 		}
-		histMsgs = h.store.GetChatMessagesFor(id, limit)
+		histMsgs, _, _, rowIDs, _, _, _ = h.store.GetChatMessagesWithMetaPage(id, 0, limit)
 	}
 	// Media rows persisted as "upl://<id>" references must come
 	// back as base64 for the LLM request; the disk read replaces
@@ -467,7 +473,7 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 	// intact. Best-effort: a missing file degrades to a text
 	// marker instead of breaking the turn.
 	histMsgs = resolveHistoryUploads(histMsgs, h.attachResolver)
-	return histMsgs, compSummary
+	return histMsgs, rowIDs, compSummary
 }
 
 // turnStreamResult tells SendMessage how a chat stream ended so it can

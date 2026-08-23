@@ -974,7 +974,7 @@ async function send() {
       let uploadID: string | undefined
       try {
         const up = await api.uploadFile((a as PendingAttachment)._file as File)
-        uploadID = up.id
+        if (up.size > 0) uploadID = up.id
       } catch { /* inline fallback below */ }
       inlineAttachments.push({ type: 'image_url', url: uploadID ? undefined : data, upload_id: uploadID, name: a.name, kind: a.kind, mime: a.mime })
       bubbleAttachments.push({ type: 'image_url', url: data, name: a.name, kind: a.kind, mime: a.mime })
@@ -1066,11 +1066,11 @@ async function send() {
       // the SQLite row id in lockstep, so rollback and
       // regenerate work the instant the user clicks them.
       clientMsgID: clientMsgId,
-      provider: meta.provider,
-      model: meta.model,
-      style: meta.style,
-      workMode: meta.workMode,
-      useImageRecognition: meta.use_image_recognition,
+    provider: meta.provider,
+    model: meta.model,
+    style: meta.style,
+    workMode: meta.workMode,
+    useImageRecognition: imageRecognitionEnabled.value,
       todoMode,
       attachments: inlineAttachments,
       skillContext: pendingSkillContext || undefined,
@@ -1155,6 +1155,7 @@ async function loadConfig() {
     loadKBases()
     const sc = await api.getSystemConfig()
     state.globalWorkMode = sc.work_mode?.default || 'coding'
+    state.visionRecognitionEnabled = !!sc.vision_recognition?.enabled
     const st = await api.getStyles()
     styleOptions.value = [
       { label: '关闭', value: 'off' },
@@ -1243,16 +1244,22 @@ async function onTodoLongRunPick(v: 'off' | 'adaptive' | 'unlimited') {
   }
 }
 
+const imageRecognitionAvailable = computed(() => !!state.visionRecognitionEnabled)
+
 const imageRecognitionEnabled = computed(() =>
-  !!state.sessionMeta[state.currentID]?.use_image_recognition,
+  imageRecognitionAvailable.value && !!state.sessionMeta[state.currentID]?.use_image_recognition,
 )
 
 const imageRecognitionLabel = computed(() =>
-  imageRecognitionEnabled.value ? '开' : '关',
+  imageRecognitionAvailable.value ? (imageRecognitionEnabled.value ? '开' : '关') : '不可用',
 )
 
 async function onImageRecognitionPick(v: boolean) {
   if (!state.currentID) return
+  if (v && !imageRecognitionAvailable.value) {
+    message.warning('请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。', { duration: 5000 })
+    return
+  }
   try {
     const resp = await api.updateSessionMeta(state.currentID, { use_image_recognition: v })
     const id = state.currentID
@@ -1599,10 +1606,15 @@ onMounted(() => {
                   type="button"
                   class="session-config-choice"
                   :class="{ 'session-config-choice--active': imageRecognitionEnabled }"
+                  :disabled="!imageRecognitionAvailable"
+                  :title="imageRecognitionAvailable ? '使用 image_recognize 工具识别图片' : '请先到“应用设置 > 系统 > 图像识别”启用工具'"
                   @click="onImageRecognitionPick(true)"
                 >
                   使用工具
                 </button>
+                <div v-if="!imageRecognitionAvailable" class="session-config-hint">
+                  请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。
+                </div>
               </div>
             </div>
 
@@ -2228,59 +2240,66 @@ onMounted(() => {
   text-overflow: ellipsis;
 }
 .session-config-popover {
-  width: min(420px, calc(100vw - 32px));
+  width: min(520px, calc(100vw - 32px));
   background: var(--surface-1);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
-  padding: 8px;
+  overflow: hidden;
 }
 .session-config-head {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
-  padding: 4px 6px 8px;
+  padding: var(--space-4) var(--space-5) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
 }
 .session-config-row {
   display: grid;
-  grid-template-columns: 64px minmax(0, 1fr);
-  gap: 8px;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: var(--space-3);
   align-items: start;
-  padding: 8px 6px;
-  border-top: 1px solid var(--border-subtle);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.session-config-row:last-child {
+  border-bottom: none;
 }
 .session-config-label {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  color: var(--text-tertiary);
-  font-size: 12px;
-  line-height: 26px;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 30px;
+  white-space: nowrap;
 }
 .session-config-options {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--space-2);
   min-width: 0;
 }
 .session-config-choice {
-  height: 26px;
-  padding: 0 9px;
-  background: transparent;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
+  min-height: 30px;
+  padding: 0 var(--space-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
   transition: background var(--dur-fast) var(--ease-out),
               border-color var(--dur-fast) var(--ease-out),
               color var(--dur-fast) var(--ease-out);
 }
-.session-config-choice:hover {
+.session-config-choice:hover:not(:disabled) {
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -2289,9 +2308,22 @@ onMounted(() => {
   border-color: var(--brand-100);
   color: var(--brand-600);
 }
-.session-config-choice--active:hover {
+.session-config-choice--active:hover:not(:disabled) {
   background: var(--brand-100);
   color: var(--brand-700);
+}
+.session-config-choice:disabled {
+  background: var(--surface-2);
+  border-color: var(--border-subtle);
+  color: var(--text-quaternary);
+  cursor: not-allowed;
+}
+.session-config-hint {
+  flex-basis: 100%;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding-top: var(--space-1);
 }
 
 /* --- Permission popover ---------------------------------------- */

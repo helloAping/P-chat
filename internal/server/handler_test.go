@@ -1581,7 +1581,8 @@ func TestPatchSession_StillRenamesWhenTitleOnly(t *testing.T) {
 }
 
 func TestPatchSession_PersistsUseImageRecognition(t *testing.T) {
-	srv, _ := newTestServer(t)
+	srv, cfg := newTestServer(t)
+	cfg.Vision.Enabled = true
 	sess := createSessionPOST(t, srv, "")
 	w := patchSession(t, srv, sess.ID, `{"use_image_recognition":true}`)
 	if w.Code != 200 {
@@ -1605,6 +1606,20 @@ func TestPatchSession_PersistsUseImageRecognition(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&got)
 	if !got.UseImageRecognition {
 		t.Fatalf("reloaded UseImageRecognition = false, want true")
+	}
+}
+
+func TestPatchSession_RejectsUseImageRecognitionWhenGloballyDisabled(t *testing.T) {
+	srv, cfg := newTestServer(t)
+	cfg.Vision.Enabled = false
+	sess := createSessionPOST(t, srv, "")
+
+	w := patchSession(t, srv, sess.ID, `{"use_image_recognition":true}`)
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "image recognition is disabled globally") {
+		t.Fatalf("body = %s, want settings path hint", w.Body.String())
 	}
 }
 

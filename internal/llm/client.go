@@ -459,6 +459,159 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	return manageStream(ctx, cancelStream, p.name, body, p.adapter.ParseStream(body))
 }
 
+// ChatCM sends a non-streaming chat-completions request using the
+// protocol-agnostic ChatMessage shape. It is intentionally separate from
+// ChatStreamCM for tool-internal calls such as image recognition, where the
+// caller needs one bounded result and some upstream multimodal proxies do not
+// support SSE reliably for image payloads.
+func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, messages []ChatMessage, opts ChatOptions) (string, error) {
+	p, ok := c.providers[providerName]
+	if !ok {
+		p = c.providers[c.default_]
+	}
+
+	model := modelName
+	if model == "" {
+		model = p.model
+	}
+
+	maxTokens := opts.MaxTokens
+	if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
+		maxTokens = mt
+	}
+
+	req, err := p.adapter.Build(messages, model, maxTokens, nil, "", float32(opts.Temperature), float32(opts.TopP))
+	if err != nil {
+		return "", err
+	}
+	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
+		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
+	}
+	req.Body = forceNonStreamingBody(req.Body)
+
+	log.Printf("%s[llm] non-stream request provider=%s model=%s messages=%d estimated_tokens=%d context_window=%d body_bytes=%d",
+		trace.LogPrefix(ctx),
+		p.name,
+		model,
+		len(messages),
+		EstimateTokensMessages(messages),
+		normalizedContextWindow(c.ContextWindow(p.name, model)),
+		len(req.Body),
+	)
+
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
+	if err != nil {
+		return "", err
+	}
+	for k, v := range req.Headers {
+		httpReq.Header.Set(k, v)
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Del("Cache-Control")
+	httpReq.Header.Del("Connection")
+	if tid := trace.FromContext(ctx); tid != "" {
+		httpReq.Header.Set("X-Trace-Id", tid)
+	}
+
+	resp, err := NewHTTPClient().Do(httpReq)
+	if err != nil {
+		return "", ClassifyAPIError(p.name, err)
+	}
+	defer resp.Body.Close()
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if readErr != nil {
+		return "", ClassifyAPIError(p.name, readErr)
+	}
+	if resp.StatusCode >= 400 {
+		return "", ClassifyAPIError(p.name, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(body)))
+	}
+	text, err := parseNonStreamContent(p.protocol, body)
+	if err != nil {
+		return "", ClassifyAPIError(p.name, err)
+	}
+	return text, nil
+}
+
+func forceNonStreamingBody(body []byte) []byte {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body
+	}
+	root["stream"] = false
+	delete(root, "stream_options")
+	out, err := json.Marshal(root)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func parseNonStreamContent(protocol string, body []byte) (string, error) {
+	if proxyErr := extractProxyError(body); proxyErr != "" {
+		return "", errors.New(proxyErr)
+	}
+	if protocol == "anthropic" {
+		var resp anthropicResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return "", fmt.Errorf("decode anthropic response: %w", err)
+		}
+		var sb strings.Builder
+		for _, block := range resp.Content {
+			if block.Text != "" {
+				sb.WriteString(block.Text)
+			}
+		}
+		if text := strings.TrimSpace(sb.String()); text != "" {
+			return text, nil
+		}
+		return "", fmt.Errorf("empty response from anthropic")
+	}
+
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content any `json:"content"`
+			} `json:"message"`
+			Text string `json:"text,omitempty"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("decode openai response: %w", err)
+	}
+	for _, choice := range resp.Choices {
+		if text := strings.TrimSpace(textFromNonStreamContent(choice.Message.Content)); text != "" {
+			return text, nil
+		}
+		if text := strings.TrimSpace(choice.Text); text != "" {
+			return text, nil
+		}
+	}
+	return "", fmt.Errorf("empty response")
+}
+
+func textFromNonStreamContent(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []any:
+		var sb strings.Builder
+		for _, item := range x {
+			switch p := item.(type) {
+			case map[string]any:
+				if text, _ := p["text"].(string); text != "" {
+					sb.WriteString(text)
+				}
+			case string:
+				sb.WriteString(p)
+			}
+		}
+		return sb.String()
+	default:
+		return ""
+	}
+}
+
 // ToolsFromRegistryDef builds []ToolDef from the tool registry.
 func ToolsFromRegistryDef(tools []tool.Tool) []ToolDef {
 	out := make([]ToolDef, 0, len(tools))

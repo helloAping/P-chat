@@ -145,6 +145,22 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 
 		case TypeImage:
 			lastAssistantIdx = -1
+			if strings.TrimSpace(msg.Content) == "" {
+				part := openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: fmt.Sprintf("(attached image %s is empty; upload bytes were not available)", msg.Name),
+				}
+				if pending != nil && pending.Role == openai.ChatMessageRoleUser {
+					pending.MultiContent = append(pending.MultiContent, part)
+				} else {
+					flushPending()
+					pending = &openai.ChatCompletionMessage{
+						Role:         openai.ChatMessageRoleUser,
+						MultiContent: []openai.ChatMessagePart{part},
+					}
+				}
+				continue
+			}
 			part := openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeImageURL,
 				ImageURL: &openai.ChatMessageImageURL{

@@ -1,6 +1,9 @@
 package llm
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestEstimatePromptTokensIncludesToolSchema(t *testing.T) {
 	msgs := []ChatMessage{
@@ -39,6 +42,33 @@ func TestEstimateTokensMessagesIncludesToolFields(t *testing.T) {
 	})
 	if withMetadata <= plain {
 		t.Fatalf("metadata estimate = %d, plain estimate = %d; tool metadata was not counted", withMetadata, plain)
+	}
+}
+
+func TestEstimateTokensMessagesBoundsImageBase64(t *testing.T) {
+	hugeBase64 := strings.Repeat("A", 740_000)
+	if rawText := EstimateTokens(hugeBase64); rawText < 180_000 {
+		t.Fatalf("test setup: raw base64 estimate = %d, want screenshot-sized text estimate", rawText)
+	}
+
+	textEstimate := EstimateTokensMessages([]ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: hugeBase64},
+	})
+	imageEstimate := EstimateTokensMessages([]ChatMessage{
+		{
+			Role:     RoleUser,
+			Type:     TypeImage,
+			Content:  hugeBase64,
+			Name:     "screen.png",
+			MimeType: "image/png",
+		},
+	})
+
+	if imageEstimate >= 5_000 {
+		t.Fatalf("image estimate = %d, want bounded multimodal estimate, not raw base64 text", imageEstimate)
+	}
+	if textEstimate <= imageEstimate*20 {
+		t.Fatalf("text estimate = %d, image estimate = %d; image base64 was not meaningfully bounded", textEstimate, imageEstimate)
 	}
 }
 

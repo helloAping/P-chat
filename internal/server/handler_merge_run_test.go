@@ -150,3 +150,56 @@ func TestMergeAssistantRun_AsyncSubAgentsFollowTaskToolsInCallOrder(t *testing.T
 		}
 	}
 }
+
+func TestMergeUserAttachmentRows_TextAndImageRenderAsOneBubble(t *testing.T) {
+	msgs := []MessageResponse{
+		{
+			ID:      10,
+			Role:    "user",
+			Content: "图片说什么",
+		},
+		{
+			ID:      11,
+			Role:    "user",
+			Content: "",
+			Attachments: []AttachmentPart{{
+				Type: "image_url",
+				URL:  "/api/v1/uploads/upl1",
+				Name: "screen.png",
+				Kind: "image",
+				MIME: "image/png",
+			}},
+		},
+		{
+			ID:      12,
+			Role:    "assistant",
+			Content: "图片里有龙眼和小猫。",
+		},
+	}
+
+	got := mergeUserAttachmentRows(msgs)
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0].ID != 10 || got[0].Content != "图片说什么" {
+		t.Fatalf("merged user base = %+v, want text row kept", got[0])
+	}
+	if len(got[0].Attachments) != 1 || got[0].Attachments[0].Name != "screen.png" {
+		t.Fatalf("attachments = %+v, want image moved onto text row", got[0].Attachments)
+	}
+	if got[1].Role != "assistant" {
+		t.Fatalf("second row = %+v, want assistant preserved", got[1])
+	}
+}
+
+func TestMergeUserAttachmentRows_DoesNotMergeTwoTextMessages(t *testing.T) {
+	msgs := []MessageResponse{
+		{ID: 1, Role: "user", Content: "first"},
+		{ID: 2, Role: "user", Content: "second", Attachments: []AttachmentPart{{Type: "image_url", Kind: "image"}}},
+	}
+
+	got := mergeUserAttachmentRows(msgs)
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2; got=%+v", len(got), got)
+	}
+}

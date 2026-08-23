@@ -3035,9 +3035,18 @@ func (s *Store) GetChatMessagesAfterID(limit int, afterID int64) ([]llm.ChatMess
 // GetChatMessagesAfterIDFor is the multi-session-safe variant of
 // GetChatMessagesAfterID. Pass the conversation id explicitly.
 func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int64) ([]llm.ChatMessage, []string, []int64) {
+	msgs, metas, createds, _ := s.GetChatMessagesAfterIDForWithIDs(convID, limit, afterID)
+	return msgs, metas, createds
+}
+
+// GetChatMessagesAfterIDForWithIDs is the multi-session-safe after-id
+// history loader plus the SQLite row ids parallel to the decoded messages.
+// When one database row decodes into multiple ChatMessage values, the same
+// row id is repeated so callers can still find the source row.
+func (s *Store) GetChatMessagesAfterIDForWithIDs(convID string, limit int, afterID int64) ([]llm.ChatMessage, []string, []int64, []int64) {
 	_ = s.Flush()
 	if convID == "" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	rows, err := s.db.Query(
 		`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
@@ -3046,11 +3055,12 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 		convID, afterID, limitOrHuge(limit),
 	)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	defer rows.Close()
 
 	type row struct {
+		id      int64
 		msg     llm.ChatMessage
 		meta    string
 		created int64
@@ -3073,7 +3083,7 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 		}
 		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
-			rev = append(rev, row{msg: m, meta: meta, created: created})
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created})
 		}
 	}
 	// Reverse to ASC order.
@@ -3081,12 +3091,14 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 	out := make([]llm.ChatMessage, n)
 	metas := make([]string, n)
 	createds := make([]int64, n)
+	ids := make([]int64, n)
 	for i, r := range rev {
 		out[n-1-i] = r.msg
 		metas[n-1-i] = r.meta
 		createds[n-1-i] = r.created
+		ids[n-1-i] = r.id
 	}
-	return out, metas, createds
+	return out, metas, createds, ids
 }
 
 // ConversationMessageCount returns the number of messages in the current

@@ -148,6 +148,16 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 		if data == nil {
 			continue
 		}
+		if len(data) == 0 {
+			result = append(result, llm.ChatMessage{
+				Role:        llm.RoleUser,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("(attached file %s is empty; upload bytes were not available)", a.Name),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
+			})
+			continue
+		}
 
 		// Extension-driven routing for document formats that
 		// should be saved to workspace (read_docx / read_pdf).
@@ -474,6 +484,13 @@ func expandAttachments(msgs []llm.Message, atts []Attachment, r AttachmentResolv
 				continue
 			}
 			data = read
+		}
+		if len(data) == 0 {
+			parts = append(parts, openai.ChatMessagePart{
+				Type: openai.ChatMessagePartTypeText,
+				Text: fmt.Sprintf("(attached file %s is empty; upload bytes were not available)", a.Name),
+			})
+			continue
 		}
 		switch a.Kind {
 		case "image":
