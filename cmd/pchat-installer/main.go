@@ -13,39 +13,25 @@ import (
 var bundled embed.FS
 
 func main() {
-	visualMode := len(os.Args) == 1
 	tmp, err := os.MkdirTemp("", "pchat-setup")
 	if err != nil {
 		fail("创建临时目录失败", err)
 	}
-
-	fmt.Println("P-Chat 安装程序")
-	fmt.Println("────────────────")
-	fmt.Println()
 
 	if err := extractAssets(tmp); err != nil {
 		fail("解压文件失败", err)
 	}
 
 	if err := runInstall(tmp, os.Args[1:]); err != nil {
-		fmt.Println()
-		fmt.Println("安装失败，临时文件保留在:", tmp)
-		fail("", err)
+		fail(fmt.Sprintf("安装失败，临时文件保留在: %s", tmp), err)
 	}
 
 	if err := os.RemoveAll(tmp); err != nil {
-		fmt.Println("(清理临时文件失败, 可手动删除:", tmp, ")")
-	}
-
-	fmt.Println()
-	fmt.Println("安装程序已结束。")
-	if !visualMode {
-		pause()
+		showInstallerError("P-Chat 安装程序", fmt.Sprintf("安装已完成，但清理临时目录失败，可手动删除:\n%s\n\n%v", tmp, err))
 	}
 }
 
 func extractAssets(dest string) error {
-	fmt.Print("解压文件... ")
 	entries, err := bundled.ReadDir("assets")
 	if err != nil {
 		return err
@@ -63,7 +49,6 @@ func extractAssets(dest string) error {
 			}
 		}
 	}
-	fmt.Println("完成")
 	return nil
 }
 
@@ -100,7 +85,6 @@ func copyDir(src string, dst string) error {
 }
 
 func runInstall(tmp string, args []string) error {
-	fmt.Print("执行安装脚本... ")
 	ps1 := filepath.Join(tmp, "install.ps1")
 	psArgs := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1}
 	if len(args) == 0 {
@@ -110,24 +94,25 @@ func runInstall(tmp string, args []string) error {
 	}
 	cmd := exec.Command("powershell", psArgs...)
 	cmd.Dir = tmp
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func pause() {
-	fmt.Println()
-	fmt.Print("按 Enter 退出...")
-	fmt.Scanln()
+	configureInstallCommand(cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if len(output) > 0 {
+			return fmt.Errorf("%w\n\n%s", err, string(output))
+		}
+		return err
+	}
+	return nil
 }
 
 func fail(msg string, err error) {
-	if msg != "" {
-		fmt.Fprintf(os.Stderr, "错误: %s\n", msg)
-	}
+	text := msg
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  %v\n", err)
+		if text != "" {
+			text += "\n\n"
+		}
+		text += err.Error()
 	}
-	pause()
+	showInstallerError("P-Chat 安装程序", text)
 	os.Exit(1)
 }

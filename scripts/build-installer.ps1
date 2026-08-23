@@ -6,7 +6,8 @@
   1. Copies fresh pchat.exe / pchat-server.exe / pchat-gui.exe into
      cmd/pchat-installer/assets/ (binaries).
   2. Copies web/ + install.ps1 + uninstall.ps1 into assets/ (data).
-  3. Runs `go build -o bin/pchat-setup.exe ./cmd/pchat-installer`.
+  3. 运行 `go build` 生成 GUI 安装器。
+     Runs `go build` for the GUI installer.
 
   Prerequisites: `task build` and `task build:gui` must have run
   first so bin/pchat.exe / bin/pchat-server.exe / bin/pchat-gui.exe
@@ -63,6 +64,14 @@ Copy-Item -LiteralPath $uninstPs  -Destination "$assets\uninstall.ps1" -Force
 # --- build ---
 Write-Host "[build-installer] go build -> $exeName"
 $outPath = Join-Path $bin $exeName
-go build -o $outPath "$root\cmd\pchat-installer"
+$goArgs = @("build", "-o", $outPath)
+if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+    $goArgs += @("-ldflags", "-H=windowsgui")
+}
+$goArgs += "$root\cmd\pchat-installer"
+& go @goArgs
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 Write-Host "[build-installer] Done: $outPath"
