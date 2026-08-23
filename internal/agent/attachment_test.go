@@ -282,7 +282,7 @@ func TestReplaceImagesWithRecognitionRefs(t *testing.T) {
 	}
 }
 
-func TestReplaceHistoricalImagesWithReuploadPlaceholders(t *testing.T) {
+func TestReplaceHistoricalImagesWithToolPlaceholders(t *testing.T) {
 	in := []llm.ChatMessage{
 		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "system", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
 		{Role: llm.RoleUser, Type: llm.TypeText, Content: "old text", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
@@ -291,7 +291,7 @@ func TestReplaceHistoricalImagesWithReuploadPlaceholders(t *testing.T) {
 		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "CURRENT_IMAGE_BASE64", Name: "current.png", MimeType: "image/png", UploadID: "current-upl", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
 	}
 
-	out := replaceHistoricalImagesWithReuploadPlaceholders(in, 3)
+	out := replaceHistoricalImagesWithPlaceholders(in, 3, true)
 	if len(out) != len(in) {
 		t.Fatalf("len(out) = %d, want %d", len(out), len(in))
 	}
@@ -302,12 +302,32 @@ func TestReplaceHistoricalImagesWithReuploadPlaceholders(t *testing.T) {
 	if strings.Contains(histImage.Content, "OLD_IMAGE_BASE64") {
 		t.Fatalf("historical image placeholder leaked image bytes: %q", histImage.Content)
 	}
-	if !strings.Contains(histImage.Content, "old.png") || !strings.Contains(histImage.Content, "重新上传") {
-		t.Fatalf("historical image placeholder missing filename/reupload guidance: %q", histImage.Content)
+	if !strings.Contains(histImage.Content, "old.png") || !strings.Contains(histImage.Content, "old-upl") || !strings.Contains(histImage.Content, "image_recognize") {
+		t.Fatalf("historical image placeholder missing filename/upload_id/tool guidance: %q", histImage.Content)
 	}
 	currentImage := out[4]
 	if currentImage.Type != llm.TypeImage || currentImage.Content != "CURRENT_IMAGE_BASE64" {
 		t.Fatalf("current image = %#v, want unchanged image payload", currentImage)
+	}
+}
+
+func TestReplaceHistoricalImagesWithReuploadPlaceholdersWhenToolUnavailable(t *testing.T) {
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "OLD_IMAGE_BASE64", Name: "old.png", MimeType: "image/png", UploadID: "old-upl", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+	}
+
+	out := replaceHistoricalImagesWithPlaceholders(in, 1, false)
+	if len(out) != 1 {
+		t.Fatalf("len(out) = %d, want 1", len(out))
+	}
+	if out[0].Type != llm.TypeText {
+		t.Fatalf("historical image Type = %q, want text placeholder", out[0].Type)
+	}
+	if strings.Contains(out[0].Content, "OLD_IMAGE_BASE64") || strings.Contains(out[0].Content, "image_recognize") {
+		t.Fatalf("unavailable-tool placeholder leaked bytes/tool hint: %q", out[0].Content)
+	}
+	if !strings.Contains(out[0].Content, "重新上传") {
+		t.Fatalf("unavailable-tool placeholder missing reupload guidance: %q", out[0].Content)
 	}
 }
 

@@ -94,15 +94,15 @@ type SandboxChecker interface {
 
 ### 6.5 图片识别工具
 
-`image_recognize` 只在两层开关同时满足时暴露给 LLM：
-- 系统配置 `vision_recognition.enabled=true`，且指定的 provider/model 已存在。
-- 当前会话 `use_image_recognition=true`。
+`image_recognize` 在需要回看历史图片且存在可用视觉能力时暴露给 LLM：
+- 当前会话 `use_image_recognition=true`，且系统配置 `vision_recognition.enabled=true`、指定的 provider/model 已存在。
+- 或者当前会话没有开启专门的图像识别模式，但历史上下文里有带 `upload_id` 的图片引用，并且当前对话模型本身支持视觉输入；此时工具使用当前 provider/model 做一次非流式识别。
 
 本轮刚上传的图片会先走 preflight：`ExpandAttachmentsCM()` 把图片作为 `SubmitToLLM=0` 的显示/持久化消息保存，agent 随后直接调用系统配置中的多模态模型识别这些“当前轮图片”，并把识别文本作为 system 上下文注入给主模型。该上下文必须标记为视觉/OCR 观察，不是用户指令；本轮主模型不再暴露 `image_recognize`，避免它自行选择错误的历史 `upload_id` 或重复调用。
 
-没有新图片的后续追问仍可暴露 `image_recognize`：历史图片会从主模型上下文中替换为带 `upload_id` 的工具引用，工具 handler 通过会话上传引用校验 `upload_id` / `upload_ids`，再把一张或多张图片发给系统配置里的多模态模型，把识别文本返回给主对话。
+没有新图片的后续追问仍可暴露 `image_recognize`：历史图片不会作为原图 payload 反复提交给主模型，而是替换为带 `upload_id` 的安全占位。工具 handler 通过会话上传引用校验 `upload_id` / `upload_ids`，再把一张或多张图片发给系统配置里的多模态模型；如果没有启用专门识图配置，则发给当前会话模型，把识别文本返回给主对话。没有任何可用视觉能力时，占位会要求模型提示用户重新上传图片或切换/配置视觉模型。
 
-识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，图片二进制都不会发给主模型，避免主模型收到 `image_url` / image block。
+识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，当前轮图片二进制都不会发给主模型，避免主模型收到 `image_url` / image block。重答目标消息中的图片按“当前轮图片”处理，会重新识别或重新提交；更早的历史图片仍走占位 + 工具引用。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

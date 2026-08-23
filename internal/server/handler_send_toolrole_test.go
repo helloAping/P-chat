@@ -31,6 +31,22 @@ func TestBuildLLMMessages_FiltersDisplayOnly(t *testing.T) {
 	}
 }
 
+func TestBuildLLMMessages_PreservesDisplayOnlyImageReferences(t *testing.T) {
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "look at the old image", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "upl://old-upl", Name: "old.png", MimeType: "image/png", UploadID: "old-upl", MsgType: llm.MsgTypeImage, SubmitToLLM: 0},
+		{Role: llm.RoleAssistant, Type: llm.TypeThinking, Content: "thinking", MsgType: llm.MsgTypeText, SubmitToLLM: 0},
+	}
+
+	got := buildLLMMessages(in)
+	if len(got) != 2 {
+		t.Fatalf("got %d msgs, want text + image reference", len(got))
+	}
+	if got[1].Type != llm.TypeImage || got[1].UploadID != "old-upl" {
+		t.Fatalf("got[1] = %#v, want preserved image reference", got[1])
+	}
+}
+
 // TestBuildLLMMessages_TaskResultRoleRewrite is the bug #3
 // regression test. The historical fix (commit 51039e2)
 // flipped every tool_result to role=user so the LLM wouldn't

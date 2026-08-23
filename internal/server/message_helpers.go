@@ -1014,7 +1014,10 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 //  1. Filter out display-only rows (SubmitToLLM == 0): the
 //     system prompt, thinking blocks, raw exec_command output,
 //     etc. — anything the user sees in the chat but the LLM
-//     doesn't need in its context.
+//     doesn't need in its context. Historical image rows with
+//     upload_id are the exception: the agent needs their
+//     references so it can replace them with safe placeholders
+//     or image_recognize tool hints before the LLM request.
 //
 //  2. Rewrite `task` tool results from role=tool to role=user.
 //     The `task` tool is the sub-agent system entry point.
@@ -1040,7 +1043,7 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 func buildLLMMessages(histMsgs []llm.ChatMessage) []llm.ChatMessage {
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
-		if m.SubmitToLLM == 0 {
+		if m.SubmitToLLM == 0 && !isHistoricalImageReference(m) {
 			continue
 		}
 		if m.MsgType == llm.MsgTypeTool && m.Role == llm.RoleTool && m.ToolName == "task" {
@@ -1049,6 +1052,10 @@ func buildLLMMessages(histMsgs []llm.ChatMessage) []llm.ChatMessage {
 		msgs = append(msgs, m)
 	}
 	return msgs
+}
+
+func isHistoricalImageReference(m llm.ChatMessage) bool {
+	return m.Type == llm.TypeImage && strings.TrimSpace(m.UploadID) != ""
 }
 
 // decodePartsFromMeta pulls the assistant message's `parts`

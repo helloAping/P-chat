@@ -28,6 +28,15 @@ func hasImageMessages(msgs []llm.ChatMessage) bool {
 	return false
 }
 
+func hasImageUploadRefs(msgs []llm.ChatMessage) bool {
+	for _, m := range msgs {
+		if m.Type == llm.TypeImage && strings.TrimSpace(m.UploadID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func clampHistoryMessageCount(n, total int) int {
 	if n < 0 {
 		return 0

@@ -336,6 +336,72 @@ func TestChatWithTools_PreRecognizesPersistedCurrentImageOnRegenerate(t *testing
 	}
 }
 
+func TestRecognizeImageWithCurrentModelFallback(t *testing.T) {
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		gotModel, _ = body["model"].(string)
+		raw, _ := json.Marshal(body)
+		if !strings.Contains(string(raw), "data:image/png;base64,") {
+			t.Fatalf("current-model image recognition request missing image data:\n%s", raw)
+		}
+		writeJSONContent(t, w, "识别结果：历史图片里有一个设置面板。")
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Default: "main",
+			Providers: []config.ProviderConfig{{
+				Name:     "main",
+				Protocol: "openai",
+				BaseURL:  srv.URL,
+				APIKey:   "test-key",
+				Model:    "main-model",
+				Models: []config.ModelConfig{{
+					Name: "main-model",
+					Capabilities: config.Capabilities{
+						SupportsVision: true,
+					},
+				}},
+			}},
+		},
+	}
+	llmClient, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := memory.OpenAt(":memory:", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	agt := New(cfg, llmClient, nil, store, tool.NewRegistry())
+	agt.SetAttachmentResolver(&DiskAttachmentResolver{BaseDir: t.TempDir()})
+
+	text, err := agt.recognizeImageWithCurrentModel("main", "main-model")(context.Background(), tool.ImageRecognitionRequest{
+		Image: tool.ImageRecognitionImage{
+			UploadID: "upl-history",
+			Name:     "history.png",
+			MIME:     "image/png",
+			Data:     []byte("fake-png-bytes"),
+		},
+		Question: "继续看这张历史图片",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotModel != "main-model" {
+		t.Fatalf("model = %q, want current model", gotModel)
+	}
+	if !strings.Contains(text, "设置面板") {
+		t.Fatalf("recognition text = %q", text)
+	}
+}
+
 func writeSSEContent(t *testing.T, w http.ResponseWriter, content string) {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{

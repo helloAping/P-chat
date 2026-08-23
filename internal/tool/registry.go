@@ -701,7 +701,7 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "image_recognize",
-		Description: "Analyze one or more user-uploaded images through the configured external multimodal model and return text to the main conversation. Use upload_ids for multiple images in a single call. Use only upload_id values explicitly shown in this chat. Do not pass file paths.",
+		Description: "Analyze one or more user-uploaded images and return text to the main conversation. The host may use a configured image recognition model or the current vision-capable chat model. Use upload_ids for multiple images in a single call. Use only upload_id values explicitly shown in this chat. Do not pass file paths.",
 		Parameters: ObjectSchema(map[string]any{
 			"upload_id": StringProp("The upload_id of a single image attached in this conversation. Kept for compatibility; prefer upload_ids when there is more than one image."),
 			"upload_ids": map[string]any{

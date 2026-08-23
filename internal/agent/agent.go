@@ -407,8 +407,12 @@ func (a *Agent) imageRecognitionAvailable() bool {
 	return false
 }
 
-func (a *Agent) imageRecognitionGatedTools(enabledForSession bool, tools []tool.Tool) []tool.Tool {
-	if enabledForSession && a.imageRecognitionAvailable() {
+func (a *Agent) currentModelImageRecognitionAvailable(providerName, modelName string) bool {
+	return a != nil && a.store != nil && a.attach != nil && a.llm != nil && a.modelSupportsVision(providerName, modelName)
+}
+
+func (a *Agent) imageRecognitionGatedTools(enabled bool, tools []tool.Tool) []tool.Tool {
+	if enabled {
 		return tools
 	}
 	return filterImageRecognitionTools(tools)
@@ -425,7 +429,7 @@ func dropDisplayOnlyMediaMessages(msgs []llm.ChatMessage) []llm.ChatMessage {
 	return out
 }
 
-func replaceHistoricalImagesWithReuploadPlaceholders(msgs []llm.ChatMessage, currentTurnStart int) []llm.ChatMessage {
+func replaceHistoricalImagesWithPlaceholders(msgs []llm.ChatMessage, currentTurnStart int, imageToolAvailable bool) []llm.ChatMessage {
 	currentTurnStart = clampHistoryMessageCount(currentTurnStart, len(msgs))
 	out := make([]llm.ChatMessage, 0, len(msgs))
 	for i, m := range msgs {
@@ -441,10 +445,14 @@ func replaceHistoricalImagesWithReuploadPlaceholders(msgs []llm.ChatMessage, cur
 		if mime == "" {
 			mime = "未知类型"
 		}
+		content := fmt.Sprintf("[历史图片：%s，MIME=%s。该图片未随本次请求重新发送，当前模型无法直接查看图片内容。若用户要求查看、分析或回看这张图片，请明确说明需要用户重新上传图片后才能继续。]", name, mime)
+		if imageToolAvailable && strings.TrimSpace(m.UploadID) != "" {
+			content = fmt.Sprintf("[历史图片：%s，upload_id=%s，MIME=%s。该图片已保存在当前会话中，但未随本次请求直接发送，当前模型不能直接查看图片内容。若用户需要继续查看、纠正、比较或分析这张图片，请调用 image_recognize 工具读取该 upload_id；不要声称已经直接看到了图片。]", name, strings.TrimSpace(m.UploadID), mime)
+		}
 		out = append(out, llm.ChatMessage{
-			Role:        m.Role,
+			Role:        llm.RoleSystem,
 			Type:        llm.TypeText,
-			Content:     fmt.Sprintf("[历史图片：%s，MIME=%s。该图片未随本次请求重新发送，当前模型无法直接查看图片内容。若用户要求查看、分析或回看这张图片，请明确说明需要用户重新上传图片后才能继续。]", name, mime),
+			Content:     content,
 			MsgType:     llm.MsgTypeText,
 			SubmitToLLM: 1,
 		})
@@ -542,6 +550,35 @@ func (a *Agent) recognizeImageWithConfiguredModel(ctx context.Context, req tool.
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
+	return a.recognizeImageWithModel(ctx, vc.Provider, vc.Model, timeout, req)
+}
+
+func (a *Agent) recognizeImageWithCurrentModel(providerName, modelName string) tool.ImageRecognizer {
+	return func(ctx context.Context, req tool.ImageRecognitionRequest) (string, error) {
+		if !a.currentModelImageRecognitionAvailable(providerName, modelName) {
+			return "", fmt.Errorf("current model %s/%s is not available for image recognition", providerName, modelName)
+		}
+		timeout := 60 * time.Second
+		if a != nil && a.cfg != nil {
+			vc := a.cfg.Vision
+			vc.Normalize()
+			if vc.TimeoutSeconds > 0 {
+				timeout = time.Duration(vc.TimeoutSeconds) * time.Second
+			}
+		}
+		return a.recognizeImageWithModel(ctx, providerName, modelName, timeout, req)
+	}
+}
+
+func (a *Agent) recognizeImageWithModel(ctx context.Context, providerName, modelName string, timeout time.Duration, req tool.ImageRecognitionRequest) (string, error) {
+	if a == nil || a.llm == nil {
+		return "", fmt.Errorf("LLM client is not available")
+	}
+	providerName = strings.TrimSpace(providerName)
+	modelName = strings.TrimSpace(modelName)
+	if providerName == "" || modelName == "" {
+		return "", fmt.Errorf("image recognition model is not configured")
+	}
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	question := strings.TrimSpace(req.Question)
@@ -576,7 +613,7 @@ func (a *Agent) recognizeImageWithConfiguredModel(ctx context.Context, req tool.
 			MimeType: img.MIME,
 		})
 	}
-	return a.llm.ChatCM(callCtx, vc.Provider, vc.Model, msgs, llm.ChatOptions{})
+	return a.llm.ChatCM(callCtx, providerName, modelName, msgs, llm.ChatOptions{})
 }
 
 // visionCapableByHeuristic returns a best-guess vision
@@ -1463,7 +1500,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		availableTools := a.tools.ListForProject(req.ProjectRoot)
 		useImageRecognition := req.UseImageRecognition && a.imageRecognitionAvailable()
 		requestHistoryCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
+		historyHasImageRefs := hasImageUploadRefs(req.Messages[:requestHistoryCount])
 		currentTurnImageRecognition := useImageRecognition && ((a.attach != nil && hasImageAttachments(req.Attachments)) || hasImageMessages(req.Messages[requestHistoryCount:]))
+		historyImageRecognitionAvailable := historyHasImageRefs && a.store != nil && a.attach != nil && (useImageRecognition || a.currentModelImageRecognitionAvailable(req.Provider, req.Model))
+		imageRecognitionToolAvailable := historyImageRecognitionAvailable && !currentTurnImageRecognition
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
 		kbEnabled := req.KBBase != "" && req.KBBase != "__off__"
@@ -1490,7 +1530,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Current-turn uploads are recognized before the main LLM call and
 		// injected as bounded context. Keep image_recognize available only for
 		// follow-up turns that need to revisit historical upload_ids.
-		availableTools = a.imageRecognitionGatedTools(useImageRecognition && !currentTurnImageRecognition, availableTools)
+		availableTools = a.imageRecognitionGatedTools(imageRecognitionToolAvailable, availableTools)
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -1684,7 +1724,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if currentTurnImageRecognition {
 			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, latestUserText(newMessages), ch, nextSeq)
 		}
-		msgs = replaceHistoricalImagesWithReuploadPlaceholders(msgs, persistStart)
+		msgs = replaceHistoricalImagesWithPlaceholders(msgs, persistStart, imageRecognitionToolAvailable)
 		msgs = dropDisplayOnlyMediaMessages(msgs)
 		if useImageRecognition {
 			if currentTurnImageRecognition {
@@ -2561,9 +2601,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
 				}
-				if useImageRecognition && !currentTurnImageRecognition {
+				if imageRecognitionToolAvailable {
 					tctx = tool.WithImageResolver(tctx, a.resolveImageForRecognition)
-					tctx = tool.WithImageRecognizer(tctx, a.recognizeImageWithConfiguredModel)
+					recognizer := tool.ImageRecognizer(a.recognizeImageWithConfiguredModel)
+					if !useImageRecognition {
+						recognizer = a.recognizeImageWithCurrentModel(req.Provider, req.Model)
+					}
+					tctx = tool.WithImageRecognizer(tctx, recognizer)
 				}
 				if a.store != nil {
 					// Persist todo writes through the request context so each
