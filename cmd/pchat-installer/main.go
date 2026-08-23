@@ -57,7 +57,14 @@ func copyFile(src string, dst string) error {
 	if err != nil {
 		return err
 	}
+	if filepath.Ext(dst) == ".ps1" && !hasUTF8BOM(data) {
+		data = append([]byte{0xEF, 0xBB, 0xBF}, data...)
+	}
 	return os.WriteFile(dst, data, 0644)
+}
+
+func hasUTF8BOM(data []byte) bool {
+	return len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF
 }
 
 func copyDir(src string, dst string) error {

@@ -21,6 +21,19 @@ if (-not (Test-Path -LiteralPath $srcGui)) { throw "pchat-gui build dir not foun
 if (-not (Test-Path -LiteralPath $binDir)) { throw "bin dir not found: $binDir" }
 if (-not (Test-Path -LiteralPath $webDir)) { throw "web/ (built SPA) not found: $webDir -- run 'task build:frontend' first" }
 
+function Copy-PowerShellScriptForWindowsPowerShell {
+    param(
+        [Parameter(Mandatory = $true)][string] $Source,
+        [Parameter(Mandatory = $true)][string] $Destination
+    )
+
+    $bytes = [IO.File]::ReadAllBytes($Source)
+    if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+        $bytes = [byte[]](0xEF, 0xBB, 0xBF) + $bytes
+    }
+    [IO.File]::WriteAllBytes($Destination, $bytes)
+}
+
 # --- Server binary (embeds the SPA) ---
 Copy-Item -LiteralPath (Join-Path $binDir "pchat-server.exe") -Destination (Join-Path $srcGui "pchat-server.exe") -Force
 
@@ -30,9 +43,9 @@ Copy-Item -LiteralPath (Join-Path $binDir "pchat-server.exe") -Destination (Join
 # available on the user PATH after `-AddToPath`.
 Copy-Item -LiteralPath (Join-Path $binDir "pchat.exe") -Destination (Join-Path $srcGui "pchat.exe") -Force
 
-# --- Install scripts ---
-Copy-Item -LiteralPath (Join-Path $root "cmd\pchat-gui\install.ps1")   -Destination (Join-Path $srcGui "install.ps1")   -Force
-Copy-Item -LiteralPath (Join-Path $root "cmd\pchat-gui\uninstall.ps1") -Destination (Join-Path $srcGui "uninstall.ps1") -Force
+# --- 安装脚本运行副本 / Install script runtime copies ---
+Copy-PowerShellScriptForWindowsPowerShell -Source (Join-Path $root "cmd\pchat-gui\install.ps1") -Destination (Join-Path $srcGui "install.ps1")
+Copy-PowerShellScriptForWindowsPowerShell -Source (Join-Path $root "cmd\pchat-gui\uninstall.ps1") -Destination (Join-Path $srcGui "uninstall.ps1")
 
 # --- Built SPA copied into the GUI bundle (web/index.html + assets) ---
 # Wipe any existing contents so removed/renamed files from a prior
