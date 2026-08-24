@@ -241,6 +241,23 @@ func runRespondSSETimeout(t *testing.T, h *Handler, retryNotice string) (turnStr
 	return res, w.Body.String()
 }
 
+// runRespondSSECanceled 驱动“流无终止帧关闭，request context 被取消”的路径。
+// runRespondSSECanceled drives the "stream closed without terminal frame,
+// request context was canceled" path. In production this is what a stuck
+// WebView/SSE writer or cancel-stream looks like to respondSSE.
+func runRespondSSECanceled(t *testing.T, h *Handler, retryNotice string) (turnStreamResult, string) {
+	t.Helper()
+	w := newStreamRecorder() // CloseNotify needed by gin's c.Stream
+	ginCtx, _ := gin.CreateTestContext(w)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
+	ch := make(chan agent.ChatStreamChunk) // closed empty: no chunk, no terminal frame
+	close(ch)
+	res := h.respondSSE(ginCtx, ch, "sess", "test", "m", retryNotice)
+	return res, w.Body.String()
+}
+
 // TestRespondSSE_TimeoutBudgetExhaustedWithTodos covers the
 // budget-exhausted-but-todos-remain deadline path: the turn hit its
 // MaxTurnSeconds deadline AFTER the MaxTurnRetries staircase budget ran
@@ -268,6 +285,26 @@ func TestRespondSSE_TimeoutBudgetExhaustedWithTodos(t *testing.T) {
 	}
 	if !strings.Contains(body, `"session_status":"retry"`) {
 		t.Fatalf("missing busy(retry) session-status frame; body=%s", body)
+	}
+}
+
+func TestRespondSSE_CanceledWithPendingTodosResumes(t *testing.T) {
+	h, _ := newAutoResumeHandler(t)
+	sid := "sess"
+	tool.SetSessionTodos(sid, []tool.TodoItem{
+		{ID: "t1", Content: "继续完成被中断的任务", Status: "in_progress"},
+	})
+	t.Cleanup(func() { tool.SetSessionTodos(sid, nil) })
+
+	res, body := runRespondSSECanceled(t, h, "检测到任务仍未完成，自动继续")
+	if res != turnStreamRetry {
+		t.Fatalf("result = %v, want turnStreamRetry when canceled with pending todos; body=%s", res, body)
+	}
+	if !strings.Contains(body, "turn-retry") {
+		t.Fatalf("missing turn-retry notice frame; body=%s", body)
+	}
+	if strings.Contains(body, "turn_timeout") {
+		t.Fatalf("canceled todo-resume path should not emit terminal turn_timeout; body=%s", body)
 	}
 }
 

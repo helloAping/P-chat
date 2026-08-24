@@ -608,14 +608,16 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		}()
 		chunk, ok := <-stream
 		if !ok {
-			// Stream closed without a done event. If the turn was
-			// interrupted by its hard deadline, either auto-resume
-			// (signal SendMessage to re-run the loop with a "继续"
-			// nudge) or surface a terminal turn_timeout error frame
-			// when the retry budget is exhausted.
+			// 流关闭但没有 done：回合超时，或仍有追踪任务时被取消，都应进入自动续跑。
+			// Stream closed without a done event. If the turn was interrupted
+			// by its hard deadline, or it was canceled while tracked work is
+			// still pending, either auto-resume (signal SendMessage to re-run
+			// the loop with a "继续" nudge) or surface a terminal turn_timeout
+			// error frame when the retry budget is exhausted.
 			if !terminalEmitted {
 				if err := c.Request.Context().Err(); err != nil {
-					if errors.Is(err, context.DeadlineExceeded) && retryNotice != "" {
+					interruptedWithPendingTodos := errors.Is(err, context.Canceled) && agent.HasPendingTodos(sessionID)
+					if (errors.Is(err, context.DeadlineExceeded) || interruptedWithPendingTodos) && retryNotice != "" {
 						// Auto-resume: keep the stream open, tell the
 						// user a retry is starting, and re-mark the
 						// session busy (the agent loop already sent an
