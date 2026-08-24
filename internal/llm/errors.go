@@ -196,6 +196,14 @@ func ClassifyAPIError(providerName string, err error) error {
 		strings.Contains(msg, "dial tcp"):
 		return &APIError{Kind: KindNetwork, Message: "网络连接失败", Cause: err}
 	}
+	if isTransientProviderUnavailable(msg) {
+		return &APIError{
+			Kind:       KindServer,
+			Message:    "provider 暂时不可用",
+			Suggestion: "稍后重试，或切换到其他 provider",
+			Cause:      err,
+		}
+	}
 
 	// HTTP status errors surfaced by the streaming client as
 	// fmt.Errorf("llm http %d: ...") / fmt.Errorf("openai http %d: ...").
@@ -233,6 +241,18 @@ func ClassifyAPIError(providerName string, err error) error {
 
 	// Fall through: unknown error, pass through.
 	return err
+}
+
+func isTransientProviderUnavailable(msg string) bool {
+	lc := strings.ToLower(msg)
+	if strings.Contains(lc, "provider_unavailable") {
+		return true
+	}
+	if strings.Contains(lc, "rst_stream") || strings.Contains(lc, "received rst_stream") {
+		return true
+	}
+	return strings.Contains(lc, "provider request failed") &&
+		(strings.Contains(lc, "i/o error") || strings.Contains(lc, "ioexception"))
 }
 
 // parseHTTPStatusError parses the streaming client's status-error

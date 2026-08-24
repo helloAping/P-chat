@@ -40,7 +40,7 @@ import {
   loadProjects, setActiveProject,
 } from '../stores/chat'
 import * as api from '../api/client'
-import type { DropdownOption } from 'naive-ui'
+import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
 import { checkUpdate } from '../api/update'
 import type { UpdateInfo } from '../api/update'
 import type { SearchResult } from '../api/client'
@@ -229,6 +229,10 @@ const menuOptions = computed<DropdownOption[]>(() => [
     icon: () => h(updateInfo.value?.hasUpdate ? Bell : Info, { size: 16 }),
   },
 ])
+
+const projectActionMenuProps: DropdownMenuProps = () => ({
+  class: 'project-action-menu',
+})
 
 function handleMenuSelect(key: string) {
   switch (key) {
@@ -798,6 +802,7 @@ onMounted(() => {
             trigger="click"
             placement="bottom-end"
             :options="menuOptions"
+            :menu-props="projectActionMenuProps"
             @select="(key) => handleMenuSelect(String(key))"
           >
             <NButton size="small" quaternary title="更多" aria-label="更多">

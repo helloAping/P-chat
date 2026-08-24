@@ -96,6 +96,21 @@ func TestClassifyAPIError_Network(t *testing.T) {
 	}
 }
 
+func TestClassifyAPIError_OpenAIProxyProviderUnavailableRSTStream(t *testing.T) {
+	err := fmt.Errorf(`openai proxy error: [provider_unavailable] Provider request failed: I/O error on POST request for "https://opencode.ai/zen/go/v1/chat/completions": Received RST_STREAM: Protocol error; rootCause=IOException: Received RST_STREAM: Protocol error`)
+	apiErr := ClassifyAPIError("openai", err)
+	var got *APIError
+	if !errors.As(apiErr, &got) {
+		t.Fatalf("expected *APIError, got %T", apiErr)
+	}
+	if got.Kind != KindServer {
+		t.Errorf("Kind = %v, want KindServer", got.Kind)
+	}
+	if got.Suggestion == "" {
+		t.Error("expected retry suggestion")
+	}
+}
+
 func TestClassifyAPIError_PassThrough(t *testing.T) {
 	// Non-classified errors pass through unchanged.
 	orig := errors.New("some weird error")
@@ -145,8 +160,8 @@ func TestErrorKindString(t *testing.T) {
 		KindUnknown:    "unknown",
 		KindAuth:       "auth_error",
 		KindRateLimit:  "rate_limit",
-		KindNotFound:    "not_found",
-		KindBadRequest:  "bad_request",
+		KindNotFound:   "not_found",
+		KindBadRequest: "bad_request",
 		KindServer:     "server_error",
 		KindNetwork:    "network_error",
 		KindTimeout:    "timeout",

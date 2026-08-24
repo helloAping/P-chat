@@ -373,6 +373,105 @@ html, body, #app {
   white-space: nowrap;
 }
 
+.project-action-menu.n-dropdown-menu {
+  width: calc(var(--space-8) * 4);
+  max-width: calc(100vw - var(--space-6));
+  padding: var(--space-2) !important;
+  border-radius: var(--radius-lg) !important;
+  background: var(--surface-1) !important;
+  box-shadow: var(--shadow-lg) !important;
+}
+
+.project-action-menu .n-dropdown-option {
+  margin: 0 !important;
+}
+
+.project-action-menu .n-dropdown-option + .n-dropdown-option {
+  margin-top: var(--space-1) !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body {
+  box-sizing: border-box;
+  height: calc(var(--space-8) - var(--space-1)) !important;
+  min-height: calc(var(--space-8) - var(--space-1)) !important;
+  padding: 0 var(--space-3) !important;
+  display: flex !important;
+  align-items: center;
+  gap: 0;
+  overflow: hidden;
+  border-radius: var(--radius-md) !important;
+  color: var(--text-secondary) !important;
+  line-height: 1.3 !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body::before {
+  inset: 0 !important;
+  border-radius: inherit !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body:hover,
+.project-action-menu .n-dropdown-option .n-dropdown-option-body--pending {
+  color: var(--text-primary) !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body:hover::before,
+.project-action-menu .n-dropdown-option .n-dropdown-option-body--pending::before {
+  background: var(--surface-2) !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body:active {
+  color: var(--brand-600) !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body:active::before {
+  background: var(--brand-50) !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body__prefix {
+  width: var(--space-5) !important;
+  height: var(--space-5) !important;
+  margin-right: var(--space-2) !important;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 var(--space-5);
+  color: var(--text-tertiary) !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body__prefix--show-icon {
+  width: var(--space-5) !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body__prefix svg {
+  display: block;
+  width: var(--space-4);
+  height: var(--space-4);
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body:hover .n-dropdown-option-body__prefix,
+.project-action-menu .n-dropdown-option .n-dropdown-option-body--pending .n-dropdown-option-body__prefix {
+  color: var(--brand-500) !important;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body__label {
+  min-width: 0;
+  color: inherit !important;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+}
+
+.project-action-menu .n-dropdown-option .n-dropdown-option-body__suffix {
+  width: 0 !important;
+  min-width: 0 !important;
+  padding: 0 !important;
+}
+
+.project-action-menu .n-dropdown-divider {
+  margin: var(--space-2) var(--space-3) !important;
+  border-color: var(--border-subtle) !important;
+}
+
 /* --- 9. Reduced motion ------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
