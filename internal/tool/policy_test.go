@@ -1,6 +1,9 @@
 package tool
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestEffectivePolicyClassifiesBuiltins(t *testing.T) {
 	read := (Tool{Name: "read_file"}).EffectivePolicy()
@@ -21,6 +24,32 @@ func TestEffectivePolicyClassifiesBuiltins(t *testing.T) {
 	}
 	if !task.CanRunInParallel() || task.Category != ToolCategoryOrchestration {
 		t.Fatalf("task policy = %#v, want parallel orchestration", task)
+	}
+}
+
+func TestEffectivePolicyTimeoutsMatchSharedBudgets(t *testing.T) {
+	cases := []struct {
+		name string
+		want time.Duration
+	}{
+		{"read_file", ReadToolTimeout},
+		{"write_file", WriteToolTimeout},
+		{"exec_command", DefaultToolTimeout},
+		{"todo_write", CheckpointToolTimeout},
+		{"question", QuestionWaitTimeout},
+		{"web_search", WebSearchTimeout},
+		{"web_fetch", WebFetchTimeout},
+		{"browser_click", WebFetchTimeout},
+		{"unknown_custom", DefaultToolTimeout},
+	}
+	for _, tc := range cases {
+		got := (Tool{Name: tc.name}).EffectivePolicy().Timeout()
+		if got != tc.want {
+			t.Errorf("%s timeout = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+	if WebSearchTimeout != 60*time.Second {
+		t.Fatalf("WebSearchTimeout = %s, want 60s to match search.pickTimeout cap", WebSearchTimeout)
 	}
 }
 

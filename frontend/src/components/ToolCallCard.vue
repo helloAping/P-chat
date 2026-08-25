@@ -392,7 +392,7 @@ async function fetchFullResult() {
   color: var(--brand-600);
   font-size: 11.5px;
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition: background var(--dur-fast) var(--ease-out);
 }
 .tool-full-result-btn:hover:not(:disabled) {
   background: var(--brand-50);
@@ -469,7 +469,7 @@ async function fetchFullResult() {
   font-size: 10.5px;
   line-height: 1;
   cursor: pointer;
-  transition: background var(--dur-fast, 120ms) var(--ease-out, ease);
+  transition: background var(--dur-fast) var(--ease-out);
 }
 .tool-copy:hover {
   background: var(--surface-3, rgba(0, 0, 0, 0.05));

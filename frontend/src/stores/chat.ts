@@ -9,6 +9,12 @@ import { dedupMessagesByKey } from '../utils/messageDedup'
 import { insertAsyncSubAgentAfterTaskTools } from '../utils/subAgentOrder'
 import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
 import { isCurrentStream } from './streamLifecycle'
+import {
+  buildInterruptNotice,
+  closeOpenPartsOnInterrupt,
+  humanizeStreamDropReason,
+  pendingTodoCount,
+} from '../utils/streamInterrupt'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -31,6 +37,75 @@ export interface PendingAttachment {
   // MessageBubble renders directly and the backend can pass
   // straight through to the LLM.
   _dataURL?: string
+}
+
+type SessionPermissionLevel = 'ask' | 'auto' | 'full'
+type TodoLongRunMode = 'off' | 'adaptive' | 'unlimited'
+type SessionMetaState = {
+  style: string
+  workMode: string
+  provider: string
+  model: string
+  title: string
+  plan_mode?: boolean
+  permission_level?: string
+  reasoning_effort?: string
+  vector_store?: string
+  knowledge_base?: string
+  auto_continue?: boolean
+  todo_long_run_mode?: TodoLongRunMode
+  use_image_recognition?: boolean
+}
+
+const LAST_PROJECT_KEY = 'pchat:last-project-path'
+const LAST_SESSION_KEY_PREFIX = 'pchat:last-session:'
+const GLOBAL_PROJECT_KEY = '__global__'
+
+function storageGet(key: string): string {
+  if (typeof window === 'undefined') return ''
+  try {
+    return window.localStorage.getItem(key) || ''
+  } catch {
+    return ''
+  }
+}
+
+function storageSet(key: string, value: string) {
+  if (typeof window === 'undefined') return
+  try {
+    if (value) window.localStorage.setItem(key, value)
+    else window.localStorage.removeItem(key)
+  } catch {
+    // Ignore disabled localStorage; in-memory state still works.
+  }
+}
+
+function lastSessionStorageKey(projectPath: string): string {
+  return `${LAST_SESSION_KEY_PREFIX}${encodeURIComponent(projectPath || GLOBAL_PROJECT_KEY)}`
+}
+
+function readLastSession(projectPath: string): string {
+  return storageGet(lastSessionStorageKey(projectPath))
+}
+
+function rememberLastSession(projectPath: string, sessionID: string) {
+  if (!sessionID) return
+  storageSet(lastSessionStorageKey(projectPath), sessionID)
+}
+
+function forgetLastSession(projectPath: string, sessionID: string) {
+  if (readLastSession(projectPath) === sessionID) {
+    storageSet(lastSessionStorageKey(projectPath), '')
+  }
+}
+
+function rememberLastProject(projectPath: string) {
+  storageSet(LAST_PROJECT_KEY, projectPath || GLOBAL_PROJECT_KEY)
+}
+
+function readLastProject(): string {
+  const stored = storageGet(LAST_PROJECT_KEY)
+  return stored === GLOBAL_PROJECT_KEY ? '' : stored
 }
 
 // Expose state on window for in-browser debugging
@@ -82,7 +157,8 @@ export const state = reactive({
   // "no model selected" symptom is indistinguishable from
   // "no providers configured".
   defaultModel: null as { provider: string; model: string } | null,
-  sessionMeta: {} as Record<string, { style: string; workMode: string; provider: string; model: string; title: string; plan_mode?: boolean; permission_level?: string; reasoning_effort?: string; vector_store?: string; knowledge_base?: string; todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'; use_image_recognition?: boolean }>,
+  sessionMeta: {} as Record<string, SessionMetaState>,
+  lastPermissionLevel: 'ask' as SessionPermissionLevel,
   globalWorkMode: 'coding' as string,
   visionRecognitionEnabled: false,
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
@@ -147,6 +223,7 @@ export const state = reactive({
     recovered: number
     reason: string
     shownAt: number
+    kind?: 'recovery' | 'interrupt'
   },
   // P0-1: is the recoverMissingParts flow currently
   // running? Set true at the start of recoverMissingParts
@@ -199,6 +276,11 @@ export const currentMessages = computed(() =>
 export const currentTodos = computed(() =>
   state.sessionTodos[state.currentID] || [],
 )
+
+function normalizePermissionLevel(level: string | undefined): SessionPermissionLevel {
+  if (level === 'auto' || level === 'full') return level
+  return 'ask'
+}
 
 // currentRecoveryBanner is the P0-1 banner payload for
 // the active session. Null when no banner is active or
@@ -277,8 +359,13 @@ export const currentMeta = computed(() => {
     provider: def?.provider || '',
     model: def?.model || '',
     title: '',
+    plan_mode: false,
+    permission_level: state.lastPermissionLevel || 'ask',
+    reasoning_effort: 'off',
     vector_store: '',
     knowledge_base: '',
+    auto_continue: true,
+    todo_long_run_mode: 'adaptive' as TodoLongRunMode,
     use_image_recognition: false,
   }
 })
@@ -428,12 +515,14 @@ export async function loadSessions() {
   state.sessions = sessions
   const currentInProject = !!state.currentID && sessions.some(s => s.id === state.currentID)
   if (!currentInProject) {
-    const last = state.lastSessionByProject[projectPath]
+    const last = state.lastSessionByProject[projectPath] || readLastSession(projectPath)
     const next = sessions.find(s => s.id === last)?.id || sessions[0]?.id || ''
     state.currentID = ''
     if (next) await switchSession(next)
   } else {
     state.lastSessionByProject[projectPath] = state.currentID
+    rememberLastSession(projectPath, state.currentID)
+    rememberLastProject(projectPath)
   }
 }
 
@@ -441,6 +530,13 @@ export async function loadProjects() {
   try {
     const r = await api.listProjects()
     state.projects = r.projects || []
+    const storedProject = readLastProject()
+    if (storedProject && state.projects.some(p => p.path === storedProject)) {
+      state.activeProjectPath = storedProject
+    } else if (storedProject) {
+      rememberLastProject('')
+      state.activeProjectPath = ''
+    }
   } catch {
     state.projects = []
   }
@@ -450,14 +546,16 @@ export async function setActiveProject(path: string) {
   const previousProject = state.activeProjectPath
   if (state.currentID) {
     state.lastSessionByProject[previousProject] = state.currentID
+    rememberLastSession(previousProject, state.currentID)
   }
   state.activeProjectPath = path
+  rememberLastProject(path)
   state.currentID = ''
   state.currentTraceId = ''
 
   const cached = state.projectSessions[path] || []
   state.sessions = cached
-  const last = state.lastSessionByProject[path]
+  const last = state.lastSessionByProject[path] || readLastSession(path)
   const next = cached.find(s => s.id === last)?.id || cached[0]?.id || ''
   if (next) await switchSession(next)
   await loadSessions()
@@ -473,6 +571,8 @@ const initialHistoryLimit = 50
 export async function switchSession(id: string) {
   state.currentID = id
   state.lastSessionByProject[state.activeProjectPath] = id
+  rememberLastSession(state.activeProjectPath, id)
+  rememberLastProject(state.activeProjectPath)
   // P3-3: clear the previous session's trace id so the
   // TopBar tooltip doesn't show a stale id from a session
   // the user is no longer looking at. The next event of
@@ -562,9 +662,11 @@ export async function switchSession(id: string) {
       reasoning_effort: s.reasoning_effort || 'off',
       vector_store: s.vector_store || '',
       knowledge_base: s.knowledge_base || '',
+      auto_continue: s.auto_continue ?? true,
       todo_long_run_mode: s.todo_long_run_mode || 'adaptive',
       use_image_recognition: s.use_image_recognition || false,
     }
+    state.lastPermissionLevel = normalizePermissionLevel(state.sessionMeta[id].permission_level)
   }
   // Load per-session todos.
   if (!state.sessionTodos[id]) {
@@ -698,9 +800,28 @@ export async function loadProviders() {
   }
 }
 
+function buildCreateSessionOptions(): api.CreateSessionOptions {
+  const meta = state.sessionMeta[state.currentID] || currentMeta.value
+  return {
+    project_path: state.activeProjectPath || '',
+    work_mode: meta.workMode || state.globalWorkMode || 'coding',
+    provider: meta.provider || '',
+    model: meta.model || '',
+    style: meta.style || 'off',
+    plan_mode: !!meta.plan_mode,
+    permission_level: normalizePermissionLevel(meta.permission_level || state.lastPermissionLevel),
+    reasoning_effort: meta.reasoning_effort || 'off',
+    vector_store: meta.vector_store || '',
+    knowledge_base: meta.knowledge_base || '',
+    auto_continue: meta.auto_continue ?? true,
+    todo_long_run_mode: meta.todo_long_run_mode || 'adaptive',
+    use_image_recognition: !!meta.use_image_recognition,
+  }
+}
+
 export async function createSession(): Promise<string> {
-  const projectPath = state.activeProjectPath || undefined
-  const { id } = await api.createSession(projectPath)
+  const created = await api.createSession(buildCreateSessionOptions())
+  const id = created.id
   // Fetch the freshly created session's resolved meta from
   // the server. The server's sessionToResponse applies the
   // per-session override → global default chain for
@@ -708,13 +829,15 @@ export async function createSession(): Promise<string> {
   // guaranteed-correct default value to seed state.sessions
   // with. Without this round-trip the chat NSelect would
   // stay empty until the user manually picked a model.
-  let resolved: Session | null = null
-  try {
-    resolved = await api.getSession(id)
-  } catch {
-    // Non-fatal: switchSession will still set up a
-    // sessionMeta entry; currentMeta falls back to
-    // state.defaultModel.
+  let resolved: Session | null = created.title ? created : null
+  if (!resolved) {
+    try {
+      resolved = await api.getSession(id)
+    } catch {
+      // Non-fatal: switchSession will still set up a
+      // sessionMeta entry; currentMeta falls back to
+      // state.defaultModel.
+    }
   }
   const fresh: Session = resolved || {
     id,
@@ -733,9 +856,14 @@ export async function createSession(): Promise<string> {
 }
 
 export async function deleteSessionById(id: string) {
+  const projectPath = state.activeProjectPath
   await api.archiveSession(id)
   state.sessions = state.sessions.filter(s => s.id !== id)
-  state.projectSessions[state.activeProjectPath] = state.sessions
+  state.projectSessions[projectPath] = state.sessions
+  if (state.lastSessionByProject[projectPath] === id) {
+    delete state.lastSessionByProject[projectPath]
+  }
+  forgetLastSession(projectPath, id)
   // Revoke all screenshot blob URLs owned by this session
   // before clearing the messages, otherwise those URLs
   // remain referenced until the next page reload.
@@ -2220,117 +2348,91 @@ export async function recoverMissingParts(
   // a spinner-style banner. We clear it in the finally
   // block below so it always resets, even on error.
   state.isRecovering[sessionId] = true
-  const afterSeq = lastSeq >= 0 ? lastSeq : 0
-  let snap: api.SnapshotRecovery
-  try {
-    snap = await api.getSessionSnapshot(sessionId, afterSeq)
-  } catch (e: any) {
-    console.warn('[recovery] snapshot fetch failed:', e?.message || e)
-    state.isRecovering[sessionId] = false
-    return
-  }
-  if (!snap.messages || snap.messages.length === 0) {
-    // No new assistant rows landed. Nothing to merge.
-    state.isRecovering[sessionId] = false
-    return
-  }
-
-  const msgs = state.sessionMessages[sessionId]
-  if (!msgs || msgs.length === 0) {
-    // No local message list — the session was switched
-    // out between drop and recovery. Bail; the next
-    // switchSession / list-load will pick up the rows.
-    return
-  }
-
-  // Find the trailing assistant message — that's the
-  // bubble that was being streamed. The DB may have
-  // MULTIPLE new assistant rows (one per ReAct round),
-  // but locally the chat store merges them into a
-  // single bubble, so the strategy is: take the LAST
-  // returned assistant message's parts and merge them
-  // into the trailing local bubble. Earlier rounds'
-  // parts are already present (they were streamed live
-  // before the drop), so the local bubble should
-  // already reflect them.
-  const last = snap.messages[snap.messages.length - 1]
-  if (!last.parts || last.parts.length === 0) {
-    return
-  }
-
-  const trailing = findTrailingAssistant(sessionId)
-  if (!trailing) {
-    return
-  }
-  // Build a set of "already-present" fingerprints from
-  // the local trailing bubble, then add any returned
-  // part whose fingerprint is new. Fingerprint =
-  // `${kind}:${tool_id || name || first 40 chars of
-  // text}`. This is best-effort: if the LLM produced
-  // identical text in two parts (rare), the second
-  // would be dedup'd. That's an acceptable trade for
-  // never double-painting.
-  const localFP = new Set<string>()
-  const fp = (p: any): string => {
-    if (p.kind === 'tool') return `tool:${p.tool_id || p.id || p.name || ''}`
-    if (p.kind === 'text') return `text:${(p.text || '').slice(0, 40)}`
-    if (p.kind === 'thinking') return `think:${(p.text || '').slice(0, 40)}`
-    if (p.kind === 'sub_agent') return `sub:${p.taskId || p.task || ''}`
-    if (p.kind === 'question') return `q:${(p.text || '').slice(0, 40)}`
-    return `${p.kind || '?'}:${JSON.stringify(p).slice(0, 60)}`
-  }
-  walkParts(trailing.parts || [], p => localFP.add(fp(p)))
-
   let merged = 0
-  for (const p of last.parts as any[]) {
-    const key = fp(p)
-    if (localFP.has(key)) continue
-    if (!trailing.parts) trailing.parts = []
-    trailing.parts.push(p)
-    localFP.add(key)
-    merged++
-  }
-  if (merged > 0) {
-    // Refresh the cached content string from parts so
-    // the markdown body matches.
-    trailing.content = assembleTextContent(trailing.parts || [])
-    // `duplicate_client_message` means the server had already
-    // accepted the user row on a prior request (the SSE
-    // connection just dropped before the client saw any `done`
-    // event). Show a friendlier reason than the raw token so
-    // the recovery banner reads naturally to the user.
-    const userFacingReason =
-      reason === 'duplicate_client_message' ? '连接中断，已自动续接' : reason
-    showRecoveryBanner(sessionId, merged, userFacingReason)
-  } else if (reason === 'duplicate_client_message') {
-    // Server accepted the user row but the snapshot has no
-    // assistant rows yet — either the agent loop hasn't started
-    // (rare: the connection dropped in the narrow window between
-    // user-row commit and agent dispatch) or it ran but produced
-    // no persisted parts. Either way, the user already has their
-    // user message on the server; tell them it's safe to retry
-    // by sending a follow-up — the original prompt is in place.
+  try {
+    const afterSeq = lastSeq >= 0 ? lastSeq : 0
+    let snap: api.SnapshotRecovery | null = null
+    try {
+      snap = await api.getSessionSnapshot(sessionId, afterSeq)
+    } catch (e: any) {
+      console.warn('[recovery] snapshot fetch failed:', e?.message || e)
+    }
+
+    const last = snap?.messages?.[snap.messages.length - 1]
+    const trailing = findTrailingAssistant(sessionId)
+    if (last?.parts?.length && trailing) {
+      const localFP = new Set<string>()
+      const fp = (p: any): string => {
+        if (p.kind === 'tool') return `tool:${p.tool_id || p.id || p.name || ''}`
+        if (p.kind === 'text') return `text:${(p.text || '').slice(0, 40)}`
+        if (p.kind === 'thinking') return `think:${(p.text || '').slice(0, 40)}`
+        if (p.kind === 'sub_agent') return `sub:${p.taskId || p.task || ''}`
+        if (p.kind === 'question') return `q:${(p.text || '').slice(0, 40)}`
+        return `${p.kind || '?'}:${JSON.stringify(p).slice(0, 60)}`
+      }
+      walkParts(trailing.parts || [], p => localFP.add(fp(p)))
+
+      for (const p of last.parts as any[]) {
+        const key = fp(p)
+        if (localFP.has(key)) continue
+        if (!trailing.parts) trailing.parts = []
+        trailing.parts.push(p)
+        localFP.add(key)
+        merged++
+      }
+      if (merged > 0) {
+        trailing.content = assembleTextContent(trailing.parts || [])
+      }
+    }
+  } finally {
+    // Always explain the drop. An empty snapshot used to
+    // return silently, so a todo task that died mid-tool
+    // looked like a clean finish with no error.
+    markUnexpectedInterrupt(sessionId, reason, merged)
     state.isRecovering[sessionId] = false
-    showRecoveryBanner(sessionId, 0, '已送达服务器，可继续追问')
   }
-  state.isRecovering[sessionId] = false
 }
 
-// showRecoveryBanner flips a transient state flag for
-// 3 seconds. The ChatWindow watches the flag and
-// renders the actual <RecoveryBanner> pill.
-function showRecoveryBanner(sessionId: string, recovered: number, reason: string) {
+function markUnexpectedInterrupt(sessionId: string, reason: string, recovered: number) {
+  const pending = pendingTodoCount(state.sessionTodos[sessionId])
+  const trailing = findTrailingAssistant(sessionId)
+  if (trailing) {
+    if (!trailing.parts) trailing.parts = []
+    closeOpenPartsOnInterrupt(trailing.parts)
+    const already = trailing.parts.some(
+      p => p.kind === 'text' && (p.text || '').includes('对话连接中断'),
+    )
+    if (!already) {
+      appendTextPart(trailing, buildInterruptNotice(pending, reason))
+    }
+  }
+  const why = humanizeStreamDropReason(reason)
+  const kind: 'recovery' | 'interrupt' = pending > 0 || recovered === 0 ? 'interrupt' : 'recovery'
+  const bannerReason = pending > 0
+    ? `${why} · ${pending} 项待办未完成，请发送「继续」`
+    : why
+  showRecoveryBanner(sessionId, recovered, bannerReason, kind)
+}
+
+function showRecoveryBanner(
+  sessionId: string,
+  recovered: number,
+  reason: string,
+  kind: 'recovery' | 'interrupt' = 'recovery',
+) {
+  const shownAt = Date.now()
   state.recoveryBanner = {
     sessionId,
     recovered,
     reason: reason || 'stream dropped',
-    shownAt: Date.now(),
+    shownAt,
+    kind,
   }
   setTimeout(() => {
-    if (state.recoveryBanner && state.recoveryBanner.shownAt === state.recoveryBanner.shownAt) {
+    if (state.recoveryBanner && state.recoveryBanner.shownAt === shownAt) {
       state.recoveryBanner = null
     }
-  }, 3000)
+  }, kind === 'interrupt' ? 8000 : 3000)
 }
 
 // findTrailingAssistant returns the trailing
@@ -2555,7 +2657,6 @@ export async function regenerateMessage(
   }
 
   const meta = state.sessionMeta[sessionId] || ({} as any)
-  let streamSucceeded = false
   let deferredDrop: { lastSeq: number; reason: string } | null = null
   try {
     await api.streamRegenerate(sessionId, userMessageId, {
@@ -2574,11 +2675,10 @@ export async function regenerateMessage(
         if (isActiveStream(sessionId, ctrl)) appendStreamEvent(sessionId, ev)
       },
     })
-    streamSucceeded = true
   } finally {
     endStream(sessionId, ctrl)
     const drop = deferredDrop as { lastSeq: number; reason: string } | null
-    if (!streamSucceeded && drop && !ctrl.signal.aborted) {
+    if (drop && !ctrl.signal.aborted) {
       recoverMissingParts(sessionId, drop.lastSeq, drop.reason).catch(() => {})
     }
   }
@@ -2731,6 +2831,7 @@ async function submitConfirmResponseInner(id: string, action: api.ConfirmAction)
         ...state.sessionMeta[id],
         permission_level: 'full',
       }
+      state.lastPermissionLevel = 'full'
     }
   } catch {
     // server already unblocked via resolve
@@ -2748,6 +2849,7 @@ export function submitToolConfirm(action: api.ConfirmAction) {
         ...state.sessionMeta[state.currentID],
         permission_level: 'full',
       }
+      state.lastPermissionLevel = 'full'
     }
   }
 }

@@ -3412,10 +3412,10 @@ function kbModelSupportsVision(scanModel: string) {
 .provider-items { flex: 1; overflow: auto; padding: 4px; }
 .provider-item {
   padding: 8px 10px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   margin-bottom: 2px;
-  transition: background 0.15s;
+  transition: background var(--dur-fast) var(--ease-out);
 }
 .provider-item:hover { background: var(--bg-3); }
 .provider-item.active {
@@ -3431,7 +3431,7 @@ function kbModelSupportsVision(scanModel: string) {
 .provider-del-btn {
   opacity: 0;
   margin-left: auto;
-  transition: opacity 0.15s;
+  transition: opacity var(--dur-fast) var(--ease-out);
 }
 .provider-item:hover .provider-del-btn { opacity: 1; }
 .provider-item-sub {
@@ -3599,7 +3599,7 @@ function kbModelSupportsVision(scanModel: string) {
   border-radius: 8px;
   padding: 14px 16px;
   display: flex; flex-direction: column; gap: 8px;
-  transition: border-color .15s;
+  transition: border-color var(--dur-fast) var(--ease-out);
 }
 .style-card:hover { border-color: var(--accent); }
 .style-card-top { display: flex; align-items: center; gap: 8px; }
@@ -3809,7 +3809,7 @@ code {
 .scan-progress { padding: 8px 0; }
 .scan-info { display: flex; gap: 12px; align-items: center; font-size: 13px; }
 .scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; flex: 1; }
-.scan-bar-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
+.scan-bar-fill { height: 100%; background: var(--accent); transition: width var(--dur-slow) var(--ease-out); }
 .scan-bar-pct { font-size: 10px; color: var(--text-4); margin-left: 6px; white-space: nowrap; }
 .scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
 
@@ -3945,8 +3945,8 @@ code {
 /* Child rows in L2 detail */
 .kb-node-child-row {
   display: flex; align-items: center; gap: 6px;
-  padding: 5px 8px; border-radius: 4px; cursor: pointer;
-  transition: background 0.15s;
+  padding: 5px 8px; border-radius: var(--radius-sm); cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
 }
 .kb-node-child-row:hover { background: var(--bg-3); }
 .kb-node-child-row.active { background: var(--bg-3); }

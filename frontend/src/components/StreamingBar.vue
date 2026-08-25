@@ -57,9 +57,11 @@ const active = computed(() => isStreaming.value || currentSessionWorking.value)
   from { transform: translateX(0); }
   to   { transform: translateX(-50%); }
 }
-.stream-bar-enter-active,
-.stream-bar-leave-active {
+.stream-bar-enter-active {
   transition: opacity var(--dur-base) var(--ease-out);
+}
+.stream-bar-leave-active {
+  transition: opacity var(--dur-fast) var(--ease-in);
 }
 .stream-bar-enter-from,
 .stream-bar-leave-to {

@@ -146,18 +146,15 @@ async function copyTaskId() {
 // still read whatever text the sub-agent did produce.
 // STUCK_TIMEOUT_MS is a last-resort client-side safety net
 // for when the server never sends the sub-agent close event
-// (e.g. server crash mid-run). The server's wall-clock cap is
-// 30 minutes by default (config subagent.timeout) — but real
-// hangs are caught far earlier by the LLM stream idle timeout
-// (120s) and per-tool timeouts, so a legit sub-agent either
-// finishes or the server closes it well within 6 minutes. We
-// use 6 minutes here so the client never force-closes BEFORE
-// the server's natural close event lands — otherwise the
-// client would mark the sub-agent as failed even when the
-// server actually completed successfully. If the server
-// timeout is configured differently, the user's server
-// already enforces it; this client-side timer is purely a
-// backstop.
+// (e.g. server crash mid-run). The server does not install a
+// default sub-agent wall-clock cap (`subagent.timeout` empty
+// = none). Real hangs are caught by LLM stream idle (120s),
+// per-tool timeouts, and the turn deadline (MaxTurnSeconds,
+// default 15 min). 6 minutes sits above typical tool/LLM
+// stalls so the client does not force-close a still-running
+// sub-agent that the server will close itself. If the user
+// sets `subagent.timeout`, the server already enforces it;
+// this timer is purely a UI backstop.
 const STUCK_TIMEOUT_MS = 6 * 60 * 1000 // 6 minutes
 
 // renderSubText runs the sub-agent's *static* text part through the

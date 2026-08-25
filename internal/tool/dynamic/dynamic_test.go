@@ -40,6 +40,10 @@ sandbox:
 	if spec.Template.Timeout.Std() != 5*time.Second {
 		t.Errorf("Template.Timeout = %v, want 5s", spec.Template.Timeout)
 	}
+	got := spec.AsTool()
+	if got.Policy == nil || got.EffectivePolicy().Timeout() != 5*time.Second {
+		t.Errorf("AsTool policy timeout = %#v, want 5s", got.Policy)
+	}
 	if spec.Sandbox.Exec != "allow" {
 		t.Errorf("Sandbox.Exec = %q, want allow", spec.Sandbox.Exec)
 	}

@@ -260,7 +260,7 @@ function isActive(name: string) {
   height: 32px;
   padding: 0 14px;
   background: var(--brand-500);
-  color: #ffffff;
+  color: var(--on-brand);
   border: 1px solid var(--brand-500);
   border-radius: var(--radius-md);
   font-size: 13px;
@@ -373,21 +373,31 @@ function isActive(name: string) {
   background: var(--surface-0);
 }
 
-/* --- Modal open/close transition ---------------------------------- */
-.settings-fade-enter-active,
-.settings-fade-leave-active {
-  transition: opacity var(--dur-base) var(--ease-out);
+/* --- Modal open/close transition ----------------------------------
+ * Enter: slower settle (--dur-slow + ease-out) so the sheet
+ * lands instead of popping. Leave: quicker ease-in dismiss. */
+.settings-fade-enter-active {
+  transition: opacity var(--dur-slow) var(--ease-out);
 }
-.settings-fade-enter-active .settings-window,
+.settings-fade-leave-active {
+  transition: opacity var(--dur-base) var(--ease-in);
+}
+.settings-fade-enter-active .settings-window {
+  transition: transform var(--dur-slow) var(--ease-out),
+              opacity var(--dur-slow) var(--ease-out);
+}
 .settings-fade-leave-active .settings-window {
-  transition: transform var(--dur-base) var(--ease-out),
-              opacity var(--dur-base) var(--ease-out);
+  transition: transform var(--dur-base) var(--ease-in),
+              opacity var(--dur-base) var(--ease-in);
 }
 .settings-fade-enter-from,
 .settings-fade-leave-to {
   opacity: 0;
 }
-.settings-fade-enter-from .settings-window,
+.settings-fade-enter-from .settings-window {
+  transform: translateY(12px) scale(0.98);
+  opacity: 0;
+}
 .settings-fade-leave-to .settings-window {
   transform: translateY(8px) scale(0.98);
   opacity: 0;

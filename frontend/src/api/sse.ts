@@ -6,6 +6,19 @@ export interface StreamEventLike {
   [key: string]: unknown
 }
 
+// STREAM_IDLE_AFTER_LLM_MS is the default silence budget while the
+// model is streaming text/thinking. It sits above the server stall
+// watchdog (180s) so a genuine stall error can arrive before the
+// GUI gives up. 150s used to win that race and look like a silent
+// interrupt.
+export const STREAM_IDLE_AFTER_LLM_MS = 210_000
+// STREAM_IDLE_AFTER_TOOL_MS covers long-running tools (exec 5m,
+// question 10m, sub-agent 30m) that emit a start event then go
+// silent until they finish. A 150s idle here cancelled the reader,
+// the server write-timeout killed the turn, and in-progress todos
+// stopped with no error in the bubble.
+export const STREAM_IDLE_AFTER_TOOL_MS = 35 * 60 * 1000
+
 export interface SSEConsumerOptions<T extends StreamEventLike> {
   reader: ReadableStreamDefaultReader<Uint8Array>
   signal?: AbortSignal
@@ -17,6 +30,43 @@ export interface SSEConsumerOptions<T extends StreamEventLike> {
   // fires, and an "idle" error is thrown (not retried — the caller
   // recovers missing parts from the server instead). 0 disables.
   idleTimeoutMs?: number
+}
+
+// nextStreamIdleTimeoutMs stretches the GUI idle watchdog while a
+// tool / sub-agent is in flight, then snaps back after it completes.
+// Heartbeats and other phase events keep the current budget so a
+// long exec_command is not cut short by a keep-alive frame.
+export function nextStreamIdleTimeoutMs(
+  event: StreamEventLike | undefined,
+  current: number,
+  base: number,
+): number {
+  if (base <= 0) return 0
+  if (!event) return current
+  const type = String(event.type || '')
+  const toolStatus = String(event.tool_status || '')
+  const subStatus = String(event.sub_agent_status || '')
+  if ((type === 'tool' && toolStatus === 'start') || subStatus === 'start') {
+    return Math.max(current, STREAM_IDLE_AFTER_TOOL_MS)
+  }
+  if (
+    type === 'session_status' &&
+    (event.session_status === 'retry' || event.session_status === 'busy')
+  ) {
+    return Math.max(current, STREAM_IDLE_AFTER_TOOL_MS)
+  }
+  if (
+    (type === 'tool' && toolStatus !== '' && toolStatus !== 'start') ||
+    subStatus === 'ok' ||
+    subStatus === 'err' ||
+    type === 'content' ||
+    type === 'thinking' ||
+    type === 'done' ||
+    type === 'error'
+  ) {
+    return base
+  }
+  return current
 }
 
 export function parseSSEFrame(block: string): { data: string; seq?: number } {
@@ -181,23 +231,26 @@ export async function consumeSSEStream<T extends StreamEventLike>(
   let buffer = ''
   let lastSeq = -1
   let done = false
+  let sawDone = false
+  const baseIdleMs = options.idleTimeoutMs ?? 0
+  let idleMs = baseIdleMs
   // Pending idle watchdog for the current read. Created on every
   // loop iteration (not once) so a stream that delivers bytes
   // continuously — e.g. a model in a long reasoning pass — keeps
   // resetting the timer and is never cut off.
   const idleError = () =>
-    new Error(`${options.label} stream: no data for ${options.idleTimeoutMs}ms (turn may be stuck)`)
+    new Error(`${options.label} stream: no data for ${idleMs}ms (turn may be stuck)`)
 
   while (!done) {
     if (options.signal?.aborted) return
 
     let result: ReadableStreamReadResult<Uint8Array>
     try {
-      if (options.idleTimeoutMs && options.idleTimeoutMs > 0) {
+      if (idleMs && idleMs > 0) {
         result = await readWithIdleTimeout(
           options.reader,
           options.signal,
-          options.idleTimeoutMs,
+          idleMs,
           idleError,
         )
       } else {
@@ -214,7 +267,7 @@ export async function consumeSSEStream<T extends StreamEventLike>(
           // A recovery callback must not hide the original stream error.
         }
       }
-      if (options.idleTimeoutMs && options.idleTimeoutMs > 0 && reason.includes('no data for')) {
+      if (idleMs && idleMs > 0 && reason.includes('no data for')) {
         // Idle timeouts are NOT transport errors: the connection is
         // fine, the turn is simply stuck. Reconnect-retry would loop
         // forever against the same stuck turn; the P0-1 recovery path
@@ -253,11 +306,26 @@ export async function consumeSSEStream<T extends StreamEventLike>(
         }
       }
 
+      idleMs = nextStreamIdleTimeoutMs(event, idleMs, baseIdleMs)
       emitStreamEvent(event, options.label, options.onEvent)
       if (event.type === 'done') {
+        sawDone = true
         done = true
         break
       }
+    }
+  }
+
+  // A TCP/SSE close without a terminal `done` frame used to look like
+  // a successful finish: the input bar unlocked, running tools kept
+  // spinning, and in-progress todos had no error. Report it as a drop
+  // so the chat store can show "对话连接中断" and close open parts.
+  if (!sawDone && !options.signal?.aborted && options.onStreamDrop) {
+    try {
+      options.onStreamDrop({ lastSeq, reason: 'stream closed without done' })
+    } catch {
+      // 恢复回调不能掩盖原始流结束。
+      // A recovery callback must not hide a clean-looking close.
     }
   }
 }

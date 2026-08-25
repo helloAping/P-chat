@@ -375,11 +375,12 @@ function messageKey(m: any, i: number): string | number {
       <div
         v-if="currentRecoveryBanner"
         class="recovery-banner"
+        :class="{ 'recovery-banner--interrupt': currentRecoveryBanner.kind === 'interrupt' }"
         :key="currentRecoveryBanner.shownAt"
       >
-        <span class="recovery-icon">📥</span>
+        <span class="recovery-icon">{{ currentRecoveryBanner.kind === 'interrupt' ? '⚠' : '📥' }}</span>
         <span class="recovery-text">
-          已恢复 {{ currentRecoveryBanner.recovered }} 条消息
+          {{ currentRecoveryBanner.kind === 'interrupt' ? '对话已中断' : `已恢复 ${currentRecoveryBanner.recovered} 条消息` }}
         </span>
         <span class="recovery-reason">{{ currentRecoveryBanner.reason }}</span>
       </div>
@@ -516,6 +517,9 @@ function messageKey(m: any, i: number): string | number {
   animation: recovery-pulse 1.4s ease-in-out infinite;
   display: inline-block;
 }
+.recovery-banner--interrupt {
+  border-bottom-color: var(--warning);
+}
 @keyframes recovery-pulse {
   0%, 100% { opacity: 0.5; transform: scale(0.95); }
   50%      { opacity: 1.0; transform: scale(1.05); }
@@ -535,10 +539,13 @@ function messageKey(m: any, i: number): string | number {
 .recovery-banner-leave-to {
   opacity: 0;
 }
-.recovery-banner-enter-active,
+.recovery-banner-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
 .recovery-banner-leave-active {
-  transition: opacity 200ms var(--ease-out, ease),
-              transform 200ms var(--ease-out, ease);
+  transition: opacity var(--dur-fast) var(--ease-in),
+              transform var(--dur-fast) var(--ease-in);
 }
 .chat-main {
   flex: 1;
@@ -657,7 +664,7 @@ function messageKey(m: any, i: number): string | number {
   bottom: 130px;
   width: 36px;
   height: 36px;
-  border-radius: 50%;
+  border-radius: var(--radius-pill);
   background: var(--bg-2);
   border: 1px solid var(--border-default);
   color: var(--text-2);
@@ -665,9 +672,10 @@ function messageKey(m: any, i: number): string | number {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--shadow-md);
   z-index: 10;
-  transition: background 0.15s var(--ease-out, ease), color 0.15s var(--ease-out, ease), transform 0.15s var(--ease-out, ease);
+  transition: var(--transition-colors),
+              transform var(--dur-fast) var(--ease-out);
 }
 .jump-to-bottom:hover {
   background: var(--bg-3);
@@ -679,9 +687,13 @@ function messageKey(m: any, i: number): string | number {
 }
 /* Fade in from below when the user first scrolls up, fade out
  * when they scroll back to the bottom. */
-.jump-btn-enter-active,
+.jump-btn-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
 .jump-btn-leave-active {
-  transition: opacity 0.2s var(--ease-out, ease), transform 0.2s var(--ease-out, ease);
+  transition: opacity var(--dur-fast) var(--ease-in),
+              transform var(--dur-fast) var(--ease-in);
 }
 .jump-btn-enter-from,
 .jump-btn-leave-to {
@@ -706,7 +718,7 @@ function messageKey(m: any, i: number): string | number {
   bottom: 178px;
   width: 36px;
   height: 36px;
-  border-radius: 50%;
+  border-radius: var(--radius-pill);
   background: var(--brand-50);
   border: 1px solid var(--brand-100);
   color: var(--brand-700);
@@ -714,13 +726,14 @@ function messageKey(m: any, i: number): string | number {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--shadow-md);
   z-index: 10;
-  transition: background 0.15s var(--ease-out, ease), color 0.15s var(--ease-out, ease), transform 0.15s var(--ease-out, ease);
+  transition: var(--transition-colors),
+              transform var(--dur-fast) var(--ease-out);
 }
 .anchor-fab:hover {
   background: var(--brand-100);
-  color: var(--brand-800);
+  color: var(--brand-700);
   transform: translateY(-1px);
 }
 .anchor-fab:active {
@@ -730,9 +743,13 @@ function messageKey(m: any, i: number): string | number {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-.anchor-btn-enter-active,
+.anchor-btn-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
 .anchor-btn-leave-active {
-  transition: opacity 0.2s var(--ease-out, ease), transform 0.2s var(--ease-out, ease);
+  transition: opacity var(--dur-fast) var(--ease-in),
+              transform var(--dur-fast) var(--ease-in);
 }
 .anchor-btn-enter-from,
 .anchor-btn-leave-to {

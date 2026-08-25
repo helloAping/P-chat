@@ -508,7 +508,7 @@ onMounted(loadSettings)
 .quota-bar-fill {
   height: 100%;
   background: var(--brand-500);
-  transition: width 0.2s ease;
+  transition: width var(--dur-base) var(--ease-out);
 }
 
 /* ---- Form (NCollapse wrapper) ----

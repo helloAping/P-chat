@@ -1075,11 +1075,19 @@ onMounted(() => {
 <style scoped>
 .sidebar {
   width: 320px;
+  min-width: 0;
   background: var(--surface-1);
   border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-shrink: 0;
-  transition: width var(--dur-base) var(--ease-out);
+  overflow: hidden;
+  transition: width var(--dur-slow) var(--ease-in-out),
+              border-color var(--dur-slow) var(--ease-in-out);
+}
+.sidebar.sidebar-collapsed {
+  width: 0;
+  border-right-color: transparent;
+  pointer-events: none;
 }
 
 /* --- Project rail ------------------------------------------------------ */
@@ -1441,7 +1449,7 @@ onMounted(() => {
 .search-results { padding: 8px; }
 .search-result-item {
   padding: 10px 12px; margin-bottom: 6px; border-radius: 6px;
-  cursor: pointer; background: var(--surface-2); transition: background 0.1s;
+  cursor: pointer; background: var(--surface-2); transition: background var(--dur-fast) var(--ease-out);
 }
 .search-result-item:hover { background: var(--surface-3); }
 .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }

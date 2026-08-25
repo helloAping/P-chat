@@ -3,7 +3,7 @@
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
 
-import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, type StreamEventLike } from './sse'
+import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, STREAM_IDLE_AFTER_LLM_MS, type StreamEventLike } from './sse'
 
 const BASE = '' // same origin; pchat-server serves both UI and API
 
@@ -379,10 +379,26 @@ export const listSessions = (projectPath: string) =>
 export const getSession = (id: string) =>
   jsonFetch<Session>(`/api/v1/sessions/${encodeURIComponent(id)}`)
 
-export const createSession = (projectPath?: string, workMode?: string) =>
-  jsonFetch<{ id: string }>(
+export interface CreateSessionOptions {
+  project_path?: string
+  work_mode?: string
+  provider?: string
+  model?: string
+  style?: string
+  plan_mode?: boolean
+  permission_level?: string
+  reasoning_effort?: string
+  vector_store?: string
+  knowledge_base?: string
+  auto_continue?: boolean
+  todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
+  use_image_recognition?: boolean
+}
+
+export const createSession = (options: CreateSessionOptions = {}) =>
+  jsonFetch<Session>(
     '/api/v1/sessions',
-    { method: 'POST', body: JSON.stringify({ project_path: projectPath || '', work_mode: workMode || '' }) },
+    { method: 'POST', body: JSON.stringify(options) },
   )
 
 export const deleteSession = (id: string) =>
@@ -1368,10 +1384,11 @@ async function streamMessagesViaFetch(
     label: 'stream',
     onEvent: opts.onEvent,
     onStreamDrop: opts.onStreamDrop,
-    // 150s of silence → the turn is stuck (server LLM idle timeout
-    // is 120s; its error would have arrived by then). Cancel and
-    // recover via P0-1 instead of spinning forever.
-    idleTimeoutMs: 150_000,
+    // Default idle sits above the server stall watchdog (180s).
+    // consumeSSEStream stretches this to STREAM_IDLE_AFTER_TOOL_MS
+    // after a tool/sub-agent start so long exec/task runs are not
+    // mistaken for a stuck turn.
+    idleTimeoutMs: STREAM_IDLE_AFTER_LLM_MS,
   })
 }
 

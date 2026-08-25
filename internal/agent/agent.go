@@ -1297,6 +1297,12 @@ func attachToolResultMetadata(chunk *ChatStreamChunk, result *tool.CallResult) {
 // write-timeout in respondSSE is the backstop for those).
 const sendOrDropTimeout = 30 * time.Second
 
+// toolWaitHeartbeatInterval keeps the SSE stream alive while tools
+// run with no output. The GUI idle watchdog used to treat that
+// silence as a stuck turn, cancel the reader, and drop in-progress
+// todo work with no error in the bubble.
+const toolWaitHeartbeatInterval = 30 * time.Second
+
 func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, chunk ChatStreamChunk) {
 	if nextSeq != nil {
 		chunk.Seq = nextSeq()
@@ -1318,6 +1324,32 @@ func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() u
 	case <-ctx.Done():
 	case <-time.After(sendOrDropTimeout):
 		log.Printf("sendOrDrop: dropped chunk (type=%q phase=%q) after %s — consumer not reading", chunk.Phase, chunk.Step, sendOrDropTimeout)
+	}
+}
+
+// waitToolsWithHeartbeat blocks until every tool goroutine finishes,
+// emitting a phase heartbeat on interval so the SSE consumer (and the
+// GUI idle watchdog) can tell the turn is still alive. ctx cancel
+// returns immediately so a user stop does not wait out a hung tool.
+func waitToolsWithHeartbeat(ctx context.Context, toolsDone <-chan struct{}, ch chan<- ChatStreamChunk, nextSeq func() uint64, interval time.Duration) error {
+	if interval <= 0 {
+		interval = toolWaitHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-toolsDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+				Phase:   "system",
+				Step:    "tool-heartbeat",
+				Message: "工具仍在执行…",
+			})
+		}
 	}
 }
 
@@ -2668,19 +2700,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					case <-tctx.Done():
 					}
 				})
-				toolTimeout := 5 * time.Minute
+				// User-facing waits (sandbox confirm, question, browser
+				// RequireConfirm) must not share the per-tool execution
+				// deadline — otherwise write_file's 60s budget expires
+				// while the confirm modal is still on screen. The turn
+				// ctx still cancels those waits on user stop / turn
+				// timeout; ConfirmWaitTimeout / QuestionWaitTimeout are
+				// the interactive caps.
+				tctx = tool.WithInteractiveContext(tctx, ctx)
+				toolTimeout := tool.DefaultToolTimeout
 				if meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot); ok {
 					toolTimeout = meta.EffectivePolicy().Timeout()
-				}
-				var cancel context.CancelFunc
-				if toolTimeout > 0 {
-					tctx, cancel = context.WithTimeout(tctx, toolTimeout)
-				} else {
-					// Some orchestration tools, notably `task`, intentionally
-					// have no per-tool wall-clock deadline. They still need a
-					// child context so defer cancel releases resources and user
-					// / parent turn cancellation propagates normally.
-					tctx, cancel = context.WithCancel(tctx)
 				}
 
 				fwd := forwarder{done: make(chan struct{})}
@@ -2736,7 +2766,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 				go func(i int, tc nativeToolCall) {
 					defer wg.Done()
-					defer cancel()
 					defer close(eventCh)
 					// Tool definitions are intentionally restricted during a
 					// checkpoint, but markdown-format calls are parsed locally and
@@ -2976,7 +3005,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// The handler still BLOCKS here for the
 					// user to answer (the result carries
 					// {"questions":..., "answers":...}).
-					result, err := handler(toolCtx, argsRaw)
+					//
+					// Apply the per-tool execution deadline only
+					// after sandbox confirm so the user wait is
+					// not billed against write_file's 60s (etc.).
+					// question / RequireConfirm still honor
+					// InteractiveContextFrom for their own caps.
+					execCtx := toolCtx
+					execCancel := func() {}
+					if toolTimeout > 0 {
+						execCtx, execCancel = context.WithTimeout(toolCtx, toolTimeout)
+					} else {
+						execCtx, execCancel = context.WithCancel(toolCtx)
+					}
+					defer execCancel()
+					result, err := handler(execCtx, argsRaw)
 					outcomes[i] = toolOutcome{
 						idx:     i,
 						tc:      tc,
@@ -2990,15 +3033,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// stream immediately on cancellation. Third-party and dynamic
 			// tools are expected to honor ctx, yet one broken handler must
 			// not retain the entire conversation and keep the SSE request
-			// alive until the five-minute tool timeout expires.
+			// alive until the per-tool timeout expires.
 			toolsDone := make(chan struct{})
 			go func() {
 				wg.Wait()
 				close(toolsDone)
 			}()
-			select {
-			case <-toolsDone:
-			case <-ctx.Done():
+			if err := waitToolsWithHeartbeat(ctx, toolsDone, ch, nextSeq, toolWaitHeartbeatInterval); err != nil {
 				return
 			}
 			// All tools completed normally. Drain their final events before

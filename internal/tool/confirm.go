@@ -80,13 +80,16 @@ func WaitForConfirmResponse(ctx context.Context, sessionID string, req ConfirmRe
 		confirmMu.Unlock()
 	}()
 
+	waitCtx := InteractiveContextFrom(ctx)
+	timer := time.NewTimer(ConfirmWaitTimeout)
+	defer timer.Stop()
 	select {
-	case <-ctx.Done():
-		return ConfirmResponse{Approved: false, Action: ConfirmActionReject}, ctx.Err()
+	case <-waitCtx.Done():
+		return ConfirmResponse{Approved: false, Action: ConfirmActionReject}, waitCtx.Err()
 	case resp := <-ch:
 		resp = normalizeConfirmResponse(resp)
 		return resp, nil
-	case <-time.After(5 * time.Minute):
+	case <-timer.C:
 		return ConfirmResponse{Approved: false, Action: ConfirmActionReject}, fmt.Errorf("confirm timed out")
 	}
 }
@@ -173,14 +176,27 @@ func SetSessionPermissionLevel(sessionID, level string) {
 	if sessionID == "" {
 		return
 	}
+	var approvePending []pendingConfirm
 	confirmMu.Lock()
-	defer confirmMu.Unlock()
 	if level == "" {
 		delete(sessionPermissions, sessionID)
+		confirmMu.Unlock()
 		return
 	}
 	level = NormalizePermissionLevel(level)
 	sessionPermissions[sessionID] = level
+	if level == PermissionAuto || level == PermissionFull {
+		approvePending = append(approvePending, confirmChs[sessionID]...)
+		delete(confirmChs, sessionID)
+	}
+	confirmMu.Unlock()
+
+	for _, item := range approvePending {
+		select {
+		case item.ch <- ConfirmResponse{Approved: true, Action: ConfirmActionOnce}:
+		default:
+		}
+	}
 }
 
 // SessionPermissionLevel returns the live process-local permission

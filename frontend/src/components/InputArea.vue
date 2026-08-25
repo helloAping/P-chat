@@ -138,6 +138,9 @@ async function onChangePermissionLevel(val: string) {
       ...state.sessionMeta[state.currentID],
       permission_level: val,
     }
+    if (val === 'ask' || val === 'auto' || val === 'full') {
+      state.lastPermissionLevel = val
+    }
     if ((val === 'auto' || val === 'full') && currentPendingConfirm.value) {
       submitToolConfirm('once')
       message.info('已按新的权限设置通过当前沙箱请求')
@@ -1912,13 +1915,13 @@ onMounted(() => {
    * The chip-appear keyframe on individual chips is the
    * primary feedback; this just makes the wrap itself
    * glide rather than pop. */
-  transition: max-height 0.2s var(--ease-out);
+  transition: max-height var(--dur-base) var(--ease-out);
 }
 .attach-chip {
   display: inline-flex; align-items: center; gap: 6px;
   background: var(--bg-3);
   border: 1px solid var(--border-2);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 4px 6px 4px 4px;
   font-size: 12px;
   flex: 0 0 auto;
@@ -1929,8 +1932,9 @@ onMounted(() => {
    * translateY direction is "from above" so the chip looks
    * like it dropped in from the input above it — coherent
    * with the new "below the input" position. */
-  animation: chip-appear 0.22s var(--ease-out);
-  transition: border-color 0.15s, background 0.15s;
+  animation: chip-appear var(--dur-base) var(--ease-out);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
 }
 .attach-chip:hover {
   border-color: var(--accent);
@@ -2016,14 +2020,19 @@ onMounted(() => {
 .input-wrap {
   background: var(--bg-input);
   border: 1px solid var(--border-2);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   padding: 0 12px 0 12px;
-  transition: border-color 0.15s;
+  transition: border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
   display: flex;
   flex-direction: column;
 }
 .input-wrap.has-attachments { padding-top: 0; }
-.input-wrap:focus-within { border-color: var(--accent); }
+.input-wrap:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--brand-50);
+}
 .input-wrap.dragover { border-color: var(--accent-2); background: var(--bg-3); }
 .input-row {
   display: flex;
@@ -2032,13 +2041,14 @@ onMounted(() => {
 }
 .attach-icon-btn {
   width: 32px; height: 32px;
-  border: none; border-radius: 8px;
+  border: none; border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-3);
   font-size: 16px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   flex-shrink: 0;
-  transition: color 0.15s, background 0.15s;
+  transition: color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
 }
 .attach-icon-btn:hover { color: var(--accent); background: var(--bg-3); }
 .textarea {
@@ -2124,12 +2134,15 @@ onMounted(() => {
 }
 .send-btn, .stop-btn {
   width: 32px; height: 32px;
-  border: none; border-radius: 8px;
+  border: none; border-radius: var(--radius-md);
   font-size: 14px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   background: var(--accent); color: var(--on-accent);
   flex-shrink: 0;
   margin-left: 8px;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              opacity var(--dur-fast) var(--ease-out);
 }
 .send-btn:disabled { background: var(--bg-3); color: var(--text-4); cursor: not-allowed; }
 .send-btn:hover:not(:disabled) { background: var(--accent-2); }
@@ -2202,10 +2215,14 @@ onMounted(() => {
 /* Slide-down transition for the advanced row. Tied to the
  * <Transition name="row-slide"> in the template. The classes
  * are named in the Vue 2 / 3 transition convention. */
-.row-slide-enter-active,
-.row-slide-leave-active {
+.row-slide-enter-active {
   transition: max-height var(--dur-base) var(--ease-out),
               opacity var(--dur-base) var(--ease-out);
+  overflow: hidden;
+}
+.row-slide-leave-active {
+  transition: max-height var(--dur-fast) var(--ease-in),
+              opacity var(--dur-fast) var(--ease-in);
   overflow: hidden;
 }
 .row-slide-enter-from,

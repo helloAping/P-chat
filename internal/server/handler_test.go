@@ -1316,6 +1316,57 @@ func TestCreateSession_WithExplicitModel(t *testing.T) {
 	}
 }
 
+func TestCreateSession_WithPermissionLevel(t *testing.T) {
+	s, _ := newTestServer(t)
+	got := createSessionPOST(t, s, `{"permission_level":"full"}`)
+	t.Cleanup(func() { tool.SetSessionPermissionLevel(got.ID, "") })
+	if got.PermissionLevel != tool.PermissionFull {
+		t.Fatalf("PermissionLevel = %q, want %q", got.PermissionLevel, tool.PermissionFull)
+	}
+	if live := tool.SessionPermissionLevel(got.ID); live != tool.PermissionFull {
+		t.Fatalf("live permission = %q, want %q", live, tool.PermissionFull)
+	}
+}
+
+func TestCreateSession_WithInheritedMetaFields(t *testing.T) {
+	s, cfg := newTestServer(t)
+	cfg.Vision.Enabled = true
+	got := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o-mini","style":"cute","work_mode":"daily","plan_mode":true,"permission_level":"auto","reasoning_effort":"high","vector_store":"kb-vector","knowledge_base":"docs","auto_continue":false,"todo_long_run_mode":"unlimited","use_image_recognition":true}`)
+	t.Cleanup(func() { tool.SetSessionPermissionLevel(got.ID, "") })
+
+	if got.Provider != "openai" || got.Model != "gpt-4o-mini" || got.Style != "cute" || got.WorkMode != "daily" {
+		t.Fatalf("session picker meta = %+v", got)
+	}
+	if !got.PlanMode || got.PermissionLevel != tool.PermissionAuto || got.ReasoningEffort != "high" {
+		t.Fatalf("session execution meta = %+v", got)
+	}
+	if got.VectorStore != "kb-vector" || got.KnowledgeBase != "docs" || got.AutoContinue {
+		t.Fatalf("session knowledge/continue meta = %+v", got)
+	}
+	if got.TodoLongRunMode != "unlimited" || !got.UseImageRecognition {
+		t.Fatalf("session long-run/vision meta = %+v", got)
+	}
+	if live := tool.SessionPermissionLevel(got.ID); live != tool.PermissionAuto {
+		t.Fatalf("live permission = %q, want %q", live, tool.PermissionAuto)
+	}
+
+	for k := range s.Handler().meta {
+		delete(s.Handler().meta, k)
+	}
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+got.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var reloaded SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&reloaded); err != nil {
+		t.Fatalf("decode reload: %v", err)
+	}
+	if reloaded.ReasoningEffort != "high" || reloaded.TodoLongRunMode != "unlimited" || !reloaded.UseImageRecognition || reloaded.AutoContinue {
+		t.Fatalf("reloaded meta = %+v", reloaded)
+	}
+}
+
 func TestCreateSession_BadProvider(t *testing.T) {
 	s, _ := newTestServer(t)
 	w := httptest.NewRecorder()

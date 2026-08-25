@@ -122,17 +122,22 @@
 
 | Token | 值 | 用途 |
 |---|---|---|
-| `--ease-out` | `cubic-bezier(0.16, 1, 0.3, 1)` | 进入动画（"out" 曲线） |
-| `--ease-in-out` | `cubic-bezier(0.4, 0, 0.2, 1)` | 状态变化 |
+| `--ease-out` | `cubic-bezier(0.16, 1, 0.3, 1)` | 进入 / hover 落定（减速入位） |
+| `--ease-in` | `cubic-bezier(0.4, 0, 1, 1)` | 离开 / 关闭（加速离场） |
+| `--ease-in-out` | `cubic-bezier(0.4, 0, 0.2, 1)` | 双向布局（侧边栏宽度、dock） |
 | `--dur-fast` | `120ms` | hover、focus |
-| `--dur-base` | `200ms` | 默认 transition |
-| `--dur-slow` | `320ms` | modal 出现/消失 |
+| `--dur-base` | `200ms` | 默认 transition；离开动画 |
+| `--dur-slow` | `320ms` | modal / 侧边栏 / 大面板进入 |
+| `--transition-colors` | shorthand | hover/focus 的颜色族一次性声明 |
+
+**进入慢、离开快**：enter 用 `--dur-slow/--dur-base` + `--ease-out`，leave 用 `--dur-base/--dur-fast` + `--ease-in`。不要进出共用同一条曲线。
 
 **标准 transition 写法**：
 ```css
-transition: background var(--dur-fast) var(--ease-out),
-            color var(--dur-fast) var(--ease-out),
-            border-color var(--dur-fast) var(--ease-out);
+transition: var(--transition-colors);
+/* 需要位移时再叠 transform */
+transition: var(--transition-colors),
+            transform var(--dur-fast) var(--ease-out);
 ```
 
 ### 1.10 Typography
@@ -483,35 +488,30 @@ import { Send } from 'lucide-vue-next'  // 绕过 barrel，破坏 tree-shaking
 
 ```css
 .foo {
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out);
+  transition: var(--transition-colors);
 }
 ```
 
 ### 8.2 Enter / Leave 动画
 
-Modal、tooltip 用 Vue `<Transition>`：
+优先复用 `style.css` 里已经注册的全局 name，不要再在组件里复制一份：
+
+| name | 用途 |
+|---|---|
+| `fade` | 纯透明度（lightbox 蒙层、轻提示） |
+| `fade-scale` | 弹层 / 卡片出现（scale 0.96） |
+| `fade-up` | 从下方 8px 浮入（FAB、dock） |
+| `row-slide` | 输入区 advanced row（max-height + opacity） |
+
+Enter 用 `--ease-out`（稍慢），leave 用 `--ease-in`（稍快）。Naive UI 的 `fade-in-scale-up` / `slide-in-from-right` 已在 `style.css` 覆盖成同一套节奏。
+
 ```vue
 <Transition name="fade-scale">
   <div v-if="show">...</div>
 </Transition>
 ```
 
-```css
-.fade-scale-enter-active,
-.fade-scale-leave-active {
-  transition: opacity var(--dur-base) var(--ease-out),
-              transform var(--dur-base) var(--ease-out);
-}
-.fade-scale-enter-from,
-.fade-scale-leave-to {
-  opacity: 0;
-  transform: scale(0.96);
-}
-```
-
-**已有的 transition name**：`.fade` (default)、`.row-slide` (max-height + opacity)。新增前先查重。
+**新增前先查重**，不要发明第四种 fade。
 
 ### 8.3 Reduced Motion
 

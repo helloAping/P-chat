@@ -97,11 +97,11 @@ const inner = computed(() => {
  * purple) and brand (high-contrast on brand-500). */
 .role-avatar--assistant {
   background: var(--ai-500);
-  color: #ffffff;
+  color: var(--on-brand);
 }
 .role-avatar--user {
   background: var(--brand-500);
-  color: #ffffff;
+  color: var(--on-brand);
 }
 .role-avatar--system {
   background: var(--surface-2);

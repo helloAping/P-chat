@@ -65,7 +65,7 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 	// just overwrite the map entry — do NOT close the old
 	// channel. Closing while SubmitAnswer may still hold a
 	// reference and write to it would cause a panic.
-	// The old goroutine will return via its 5-minute timeout
+	// The old goroutine will return via QuestionWaitTimeout
 	// (or ctx cancel) and the old channel is then GC'd.
 	questionChs[sessionID] = ch
 	questionMu.Unlock()
@@ -87,11 +87,14 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 		log.Printf("[question] WARNING: sendFn is nil (session=%s)", sessionID)
 	}
 
-	log.Printf("[question] waiting for user answer (session=%s, timeout=5m)", sessionID)
+	waitCtx := InteractiveContextFrom(ctx)
+	log.Printf("[question] waiting for user answer (session=%s, timeout=%s)", sessionID, QuestionWaitTimeout)
+	timer := time.NewTimer(QuestionWaitTimeout)
+	defer timer.Stop()
 	select {
-	case <-ctx.Done():
-		log.Printf("[question] ctx cancelled (session=%s): %v", sessionID, ctx.Err())
-		return QuestionResponse{}, ctx.Err()
+	case <-waitCtx.Done():
+		log.Printf("[question] ctx cancelled (session=%s): %v", sessionID, waitCtx.Err())
+		return QuestionResponse{}, waitCtx.Err()
 	case resp := <-ch:
 		log.Printf("[question] received answer (session=%s, %d answers)", sessionID, len(resp.Answers))
 		// Emit a second question event with the result-with-
@@ -122,7 +125,7 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 			sendFn(string(data))
 		}
 		return resp, nil
-	case <-time.After(5 * time.Minute):
+	case <-timer.C:
 		log.Printf("[question] timeout (session=%s)", sessionID)
 		return QuestionResponse{}, fmt.Errorf("question timed out waiting for user response")
 	}

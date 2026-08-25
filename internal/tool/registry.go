@@ -1457,7 +1457,7 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 		reqBody = strings.NewReader(a.Body)
 	}
 
-	httpCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	httpCtx, cancel := context.WithTimeout(ctx, WebFetchTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(httpCtx, method, a.URL, reqBody)
@@ -1469,7 +1469,7 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: WebFetchTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return &CallResult{Content: "fetch error: " + err.Error(), IsError: true}, nil

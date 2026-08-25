@@ -617,9 +617,13 @@ onBeforeUnmount(() => {
   to { transform: rotate(360deg); }
 }
 
-.subagent-jobs-enter-active,
+.subagent-jobs-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
 .subagent-jobs-leave-active {
-  transition: opacity 0.16s var(--ease-out, ease), transform 0.16s var(--ease-out, ease);
+  transition: opacity var(--dur-fast) var(--ease-in),
+              transform var(--dur-fast) var(--ease-in);
 }
 
 .subagent-jobs-enter-from,

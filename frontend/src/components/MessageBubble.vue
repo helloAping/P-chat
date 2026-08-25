@@ -1722,7 +1722,7 @@ function findPrecedingUserMessageId(): number {
 .bubble-action-btn.is-feedback {
   background: var(--success-50);
   color: var(--success-500);
-  animation: bubble-action-feedback var(--dur-base, 200ms) var(--ease-out, ease-out);
+  animation: bubble-action-feedback var(--dur-base) var(--ease-out);
 }
 .bubble-action-btn.is-feedback:hover {
   background: var(--success-50);
@@ -1754,12 +1754,12 @@ function findPrecedingUserMessageId(): number {
   border: 1px solid var(--brand-100);
   font-size: 12px;
   font-weight: 500;
-  transition: width var(--dur-fast) var(--ease-out, ease-out),
-              padding var(--dur-fast) var(--ease-out, ease-out),
-              background var(--dur-fast) var(--ease-out, ease-out),
-              color var(--dur-fast) var(--ease-out, ease-out),
-              border-color var(--dur-fast) var(--ease-out, ease-out),
-              transform var(--dur-fast) var(--ease-out, ease-out);
+  transition: width var(--dur-fast) var(--ease-out),
+              padding var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
 .bubble-action-btn.bubble-action-regenerate:hover {
   background: var(--brand-100);
@@ -1788,7 +1788,7 @@ function findPrecedingUserMessageId(): number {
    * completes — matches the icon's own fade-in
    * (bubble-action-icon-in) so the icon+text come back as
    * a single unit rather than the text popping in late. */
-  animation: bubble-action-text-in 140ms var(--ease-out, ease-out);
+  animation: bubble-action-text-in var(--dur-fast) var(--ease-out);
 }
 @keyframes bubble-action-text-in {
   from { opacity: 0; transform: translateX(-2px); }
@@ -1801,7 +1801,7 @@ function findPrecedingUserMessageId(): number {
  * by the parent component) to recreate the element and
  * re-fire the keyframe. */
 .bubble-action-pulse:active {
-  animation: bubble-action-pulse 220ms var(--ease-out, ease-out);
+  animation: bubble-action-pulse var(--dur-base) var(--ease-out);
 }
 
 /* Rollback countdown label. Renders inside the pending
@@ -1841,7 +1841,7 @@ function findPrecedingUserMessageId(): number {
  * at opacity 0 and fades to 1 over 120ms so the swap
  * doesn't feel like a hard cut. */
 .bubble-action-icon {
-  animation: bubble-action-icon-in 140ms var(--ease-out, ease-out);
+  animation: bubble-action-icon-in var(--dur-fast) var(--ease-out);
 }
 @keyframes bubble-action-icon-in {
   from { opacity: 0; transform: scale(0.7); }
@@ -1895,7 +1895,7 @@ function findPrecedingUserMessageId(): number {
   display: flex;
   gap: 4px;
   opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: opacity var(--dur-fast) var(--ease-out);
   z-index: 2;
 }
 .attach-actions-inline {
@@ -2030,7 +2030,7 @@ function findPrecedingUserMessageId(): number {
    * bubbles never had a pager before). Subtle — 8px
    * over 140ms — and uses the same --dur-fast easing
    * as the rest of the toolbar. */
-  animation: bubble-reply-pager-in 140ms var(--ease-out, ease-out);
+  animation: bubble-reply-pager-in var(--dur-fast) var(--ease-out);
 }
 .bubble-reply-pager-btn {
   border: none;
@@ -2046,12 +2046,12 @@ function findPrecedingUserMessageId(): number {
   padding: 0;
   font-size: 12px;
   line-height: 1;
-  transition: background var(--dur-fast) var(--ease-out, ease-out),
-              color var(--dur-fast) var(--ease-out, ease-out);
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
 }
 .bubble-reply-pager-btn:hover:not(:disabled) {
   background: var(--brand-100);
-  color: var(--brand-800);
+  color: var(--brand-700);
 }
 .bubble-reply-pager-btn:focus-visible {
   outline: 2px solid var(--accent);
@@ -2164,7 +2164,7 @@ function findPrecedingUserMessageId(): number {
   border: 1px solid var(--border);
   border-radius: 4px;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  transition: var(--transition-colors);
 }
 .trace-id-chip:hover {
   background: var(--bg-3, var(--bg-2));
@@ -2221,7 +2221,7 @@ function findPrecedingUserMessageId(): number {
   display: flex;
   gap: 4px;
   opacity: 1;
-  transition: opacity 0.15s ease;
+  transition: opacity var(--dur-fast) var(--ease-out);
   z-index: 1;
 }
 .code-block:hover .code-toolbar,

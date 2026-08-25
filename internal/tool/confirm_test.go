@@ -145,3 +145,67 @@ func TestConfirmAllowOnceDoesNotStoreSessionRule(t *testing.T) {
 		t.Fatal("allow once should not store a session rule")
 	}
 }
+
+func TestSetSessionPermissionLevelAutoApprovesPendingConfirm(t *testing.T) {
+	sessionID := "confirm-permission-" + time.Now().Format("150405.000000000")
+	req := ConfirmRequest{
+		ToolName:  "write_file",
+		Args:      `{"path":"x"}`,
+		RiskLevel: "high",
+	}
+	t.Cleanup(func() { SetSessionPermissionLevel(sessionID, "") })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	done := make(chan ConfirmResponse, 1)
+	go func() {
+		resp, err := WaitForConfirmResponse(ctx, sessionID, req)
+		if err != nil {
+			t.Errorf("WaitForConfirmResponse returned error: %v", err)
+			return
+		}
+		done <- resp
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	SetSessionPermissionLevel(sessionID, PermissionAuto)
+
+	select {
+	case resp := <-done:
+		if !resp.Approved || resp.Action != ConfirmActionOnce {
+			t.Fatalf("response = %+v, want approved once", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for auto approval")
+	}
+}
+
+func TestWaitForConfirmIgnoresShortToolDeadline(t *testing.T) {
+	sessionID := "confirm-interactive-" + time.Now().Format("150405.000000000")
+	req := ConfirmRequest{ToolName: "write_file", Args: `{"path":"x"}`, RiskLevel: "high"}
+
+	toolCtx, toolCancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer toolCancel()
+	turnCtx, turnCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer turnCancel()
+	ctx := WithInteractiveContext(toolCtx, turnCtx)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := WaitForConfirm(ctx, sessionID, req)
+		done <- err
+	}()
+	time.Sleep(120 * time.Millisecond)
+	if !SubmitConfirm(sessionID, true) {
+		t.Fatal("SubmitConfirm returned false after tool deadline")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("confirm failed after short tool deadline: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for confirm")
+	}
+}

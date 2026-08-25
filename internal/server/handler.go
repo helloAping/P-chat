@@ -434,12 +434,20 @@ type SendMessageRequest struct {
 
 // CreateSessionRequest is the body of POST /sessions.
 type CreateSessionRequest struct {
-	Style       string `json:"style,omitempty"`
-	WorkMode    string `json:"work_mode,omitempty"`
-	Provider    string `json:"provider,omitempty"`
-	Model       string `json:"model,omitempty"`
-	Title       string `json:"title,omitempty"`
-	ProjectPath string `json:"project_path,omitempty"`
+	Style               string                  `json:"style,omitempty"`
+	WorkMode            string                  `json:"work_mode,omitempty"`
+	Provider            string                  `json:"provider,omitempty"`
+	Model               string                  `json:"model,omitempty"`
+	Title               string                  `json:"title,omitempty"`
+	ProjectPath         string                  `json:"project_path,omitempty"`
+	PlanMode            *bool                   `json:"plan_mode,omitempty"`
+	PermissionLevel     string                  `json:"permission_level,omitempty"`
+	ReasoningEffort     string                  `json:"reasoning_effort,omitempty"`
+	VectorStore         string                  `json:"vector_store,omitempty"`
+	KnowledgeBase       string                  `json:"knowledge_base,omitempty"`
+	AutoContinue        *bool                   `json:"auto_continue,omitempty"`
+	TodoLongRunMode     *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	UseImageRecognition *bool                   `json:"use_image_recognition,omitempty"`
 }
 
 // RenameSessionRequest is the body of PATCH /sessions/:id when the
