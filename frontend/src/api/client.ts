@@ -530,20 +530,39 @@ export interface SearchSkillItem {
   url: string
 }
 
-export const listSkills = () =>
-  jsonFetch<{ skills: SkillItem[] }>('/api/v1/skills')
+export interface SkillScopeOptions {
+  sessionId?: string
+  projectPath?: string
+}
 
-export const getSkill = (name: string) =>
-  jsonFetch<{ skill: SkillItem }>(`/api/v1/skills/${encodeURIComponent(name)}`)
+function skillScopeQuery(opts?: SkillScopeOptions) {
+  const q = new URLSearchParams()
+  if (opts?.sessionId) q.set('session_id', opts.sessionId)
+  if (opts?.projectPath) q.set('project_path', opts.projectPath)
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
 
-export const installSkill = (name: string, url: string) =>
+export const listSkills = (opts?: SkillScopeOptions) =>
+  jsonFetch<{ skills: SkillItem[] }>(`/api/v1/skills${skillScopeQuery(opts)}`)
+
+export const getSkill = (name: string, opts?: SkillScopeOptions) =>
+  jsonFetch<{ skill: SkillItem }>(`/api/v1/skills/${encodeURIComponent(name)}${skillScopeQuery(opts)}`)
+
+export const installSkill = (name: string, url: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
   jsonFetch<{ ok: boolean; name: string }>('/api/v1/skills/install', {
     method: 'POST',
-    body: JSON.stringify({ name, url }),
+    body: JSON.stringify({
+      name,
+      url,
+      scope: opts?.scope,
+      session_id: opts?.sessionId,
+      project_path: opts?.projectPath,
+    }),
   })
 
-export const deleteSkill = (name: string) =>
-  jsonFetch<{ ok: boolean }>(`/api/v1/skills/${encodeURIComponent(name)}`, { method: 'DELETE' })
+export const deleteSkill = (name: string, opts?: SkillScopeOptions) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/skills/${encodeURIComponent(name)}${skillScopeQuery(opts)}`, { method: 'DELETE' })
 
 export const searchSkills = (q: string) =>
   jsonFetch<{ results: SearchSkillItem[] }>(`/api/v1/skills/search?q=${encodeURIComponent(q)}`)
@@ -596,6 +615,12 @@ export const addMCPServer = (cfg: {
 
 export const removeMCPServer = (name: string) =>
   jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}`, { method: 'DELETE' })
+
+export const startMCPServer = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}/start`, { method: 'POST' })
+
+export const stopMCPServer = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}/stop`, { method: 'POST' })
 
 export const restartMCPServer = (name: string) =>
   jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}/restart`, { method: 'POST' })

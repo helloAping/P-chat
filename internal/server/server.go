@@ -320,6 +320,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/mcp/servers", h.ListMCPServers)
 		api.POST("/mcp/servers", h.AddMCPServer)
 		api.DELETE("/mcp/servers/:name", h.RemoveMCPServer)
+		api.POST("/mcp/servers/:name/start", h.StartMCPServer)
+		api.POST("/mcp/servers/:name/stop", h.StopMCPServer)
 		api.POST("/mcp/servers/:name/restart", h.RestartMCPServer)
 		api.PATCH("/mcp/global", h.SetMCPGlobal)
 

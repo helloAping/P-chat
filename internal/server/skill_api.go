@@ -23,7 +23,7 @@ type skillResponse struct {
 
 // ListSkills GET /api/v1/skills
 func (h *Handler) ListSkills(c *gin.Context) {
-	skills, err := skill.LoadAll()
+	skills, err := skill.LoadAllWithRoot(h.skillsProjectRoot(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -42,7 +42,7 @@ func (h *Handler) ListSkills(c *gin.Context) {
 // GetSkill GET /api/v1/skills/:name
 func (h *Handler) GetSkill(c *gin.Context) {
 	name := c.Param("name")
-	skills, err := skill.LoadAll()
+	skills, err := skill.LoadAllWithRoot(h.skillsProjectRoot(c))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -68,7 +68,17 @@ func (h *Handler) DeleteSkill(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "skill name is required"})
 		return
 	}
+	if !validSkillName(name) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid skill name"})
+		return
+	}
 	dir := filepath.Join(paths.GlobalSkillsDir(), name)
+	if root := h.skillsProjectRoot(c); root != "" {
+		projectDir := filepath.Join(paths.ProjectSkillsDirWithRoot(root), name)
+		if _, err := os.Stat(projectDir); err == nil {
+			dir = projectDir
+		}
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -81,8 +91,11 @@ func (h *Handler) DeleteSkill(c *gin.Context) {
 }
 
 type installSkillRequest struct {
-	Name string `json:"name"`
-	URL  string `json:"url"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	Scope       string `json:"scope,omitempty"` // "global" (default) | "project"
+	ProjectPath string `json:"project_path,omitempty"`
+	SessionID   string `json:"session_id,omitempty"`
 }
 
 // InstallSkill POST /api/v1/skills/install
@@ -105,6 +118,10 @@ func (h *Handler) InstallSkill(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	if !validSkillName(name) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid skill name"})
+		return
+	}
 
 	content, err := fetchSkillContent(req.URL)
 	if err != nil {
@@ -112,7 +129,11 @@ func (h *Handler) InstallSkill(c *gin.Context) {
 		return
 	}
 
-	dir := filepath.Join(paths.GlobalSkillsDir(), name)
+	dir, err := h.skillInstallDir(req, name)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -125,6 +146,40 @@ func (h *Handler) InstallSkill(c *gin.Context) {
 		h.agent.Reload()
 	}
 	c.JSON(http.StatusCreated, gin.H{"ok": true, "name": name})
+}
+
+func (h *Handler) skillsProjectRoot(c *gin.Context) string {
+	if sessionID := c.Query("session_id"); sessionID != "" {
+		return h.sessionProjectPath(sessionID)
+	}
+	return c.Query("project_path")
+}
+
+func (h *Handler) skillInstallDir(req installSkillRequest, name string) (string, error) {
+	if req.Scope == "" || req.Scope == "global" {
+		return filepath.Join(paths.GlobalSkillsDir(), name), nil
+	}
+	if req.Scope != "project" {
+		return "", fmt.Errorf(`scope must be "global" or "project"`)
+	}
+	root := req.ProjectPath
+	if root == "" && req.SessionID != "" {
+		root = h.sessionProjectPath(req.SessionID)
+	}
+	if root == "" {
+		return "", fmt.Errorf("project_path or session_id is required for project skill install")
+	}
+	return filepath.Join(paths.ProjectSkillsDirWithRoot(root), name), nil
+}
+
+func validSkillName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return false
+	}
+	return filepath.Base(name) == name
 }
 
 // inferSkillName extracts a skill name from a URL.
@@ -414,7 +469,9 @@ func (h *Handler) AddSkillRepo(c *gin.Context) {
 
 // RemoveSkillRepo DELETE /api/v1/skills/repos
 func (h *Handler) RemoveSkillRepo(c *gin.Context) {
-	var req struct{ URL string `json:"url"` }
+	var req struct {
+		URL string `json:"url"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return

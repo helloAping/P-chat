@@ -1091,13 +1091,9 @@ async function onToggleMCPGlobal(v: boolean) {
 async function onToggleMCPServer(name: string, enabled: boolean) {
   try {
     if (enabled) {
-      await api.addMCPServer({
-        name,
-        command: '', // use existing config, server restores from persisted config
-        enabled: true,
-      })
+      await api.startMCPServer(name)
     } else {
-      await api.removeMCPServer(name)
+      await api.stopMCPServer(name)
     }
     await refreshMCP()
   } catch (e: any) {
@@ -2391,7 +2387,7 @@ function kbModelSupportsVision(scanModel: string) {
               <template v-if="newMCPType === 'stdio'">
                 <div class="settings-form-row">
                   <label class="settings-form-label">命令</label>
-                  <NInput v-model:value="newMCPCommand" placeholder="如：npx" size="small" style="max-width: 320px" />
+                  <NInput v-model:value="newMCPCommand" placeholder="如：C:\\Program Files\\nodejs\\npx.cmd" size="small" style="max-width: 320px" />
                 </div>
                 <div class="settings-form-row">
                   <label class="settings-form-label">参数</label>

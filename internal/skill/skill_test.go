@@ -165,6 +165,27 @@ func TestBuildSkillContext_StableAcrossCalls(t *testing.T) {
 	}
 }
 
+func TestExtractDescription_UsesFrontmatterDescription(t *testing.T) {
+	content := "---\nname: frontmatter-skill\ndescription: Frontmatter description.\n---\n# frontmatter-skill\n\nBody paragraph.\n"
+	if got := extractDescription(content); got != "Frontmatter description." {
+		t.Fatalf("description = %q, want frontmatter description", got)
+	}
+}
+
+func TestExtractDescription_SkipsFrontmatterWithoutDescription(t *testing.T) {
+	content := "---\nname: frontmatter-skill\n---\n# frontmatter-skill\n\nBody paragraph.\n"
+	if got := extractDescription(content); got != "Body paragraph." {
+		t.Fatalf("description = %q, want body paragraph", got)
+	}
+}
+
+func TestExtractDescription_HandlesFrontmatterAtEOF(t *testing.T) {
+	content := "---\ndescription: Frontmatter description.\n---"
+	if got := extractDescription(content); got != "Frontmatter description." {
+		t.Fatalf("description = %q, want frontmatter description", got)
+	}
+}
+
 // --- 2026-07 project-aware loader tests ----------------------
 //
 // Pre-2026-07 LoadAll() walked paths.ProjectSkillsDir() which

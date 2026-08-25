@@ -234,10 +234,11 @@ onMounted(async () => {
   }
   loadSkillCommands()
 })
+watch(() => state.currentID, () => { loadSkillCommands() })
 
 async function loadSkillCommands() {
   try {
-    const r = await api.listSkills()
+    const r = await api.listSkills(state.currentID ? { sessionId: state.currentID } : undefined)
     skillCommands.value = (r.skills || []).map(s => ({
       name: s.name,
       description: s.description || '加载技能上下文',
@@ -745,7 +746,7 @@ async function renderStyles(): Promise<string> {
 
 async function renderSkills(): Promise<string> {
   try {
-    const r = await api.listSkills()
+    const r = await api.listSkills(state.currentID ? { sessionId: state.currentID } : undefined)
     const skills = r.skills || []
     if (!skills.length) return '<div class="cmd-info">暂无已安装的技能。使用 /skills 搜索安装。</div>'
     let html = '<div class="cmd-skills">'
@@ -884,7 +885,7 @@ async function send() {
       if (skillCommands.value.some(c => c.name === parsed.name)) {
         sending.value = true
         try {
-          const r = await api.getSkill(parsed.name)
+          const r = await api.getSkill(parsed.name, state.currentID ? { sessionId: state.currentID } : undefined)
           const skillContent = r.skill.content || ''
           const userInput = parsed.args || ''
           pendingSkillContext = skillContent

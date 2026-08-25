@@ -137,6 +137,26 @@ subagent:
   #   - "write_file"
   #   - "list_files"
 
+# MCP (Model Context Protocol) tools. Disabled by default.
+# Stdio commands run directly without a shell, so use an absolute executable
+# path (for example C:\Program Files\nodejs\npx.cmd on Windows).
+mcp:
+  enabled: false
+  servers: []
+  # servers:
+  #   - name: "playwright"
+  #     type: "stdio"
+  #     command: "C:\\Program Files\\nodejs\\npx.cmd"
+  #     args: ["-y", "@playwright/mcp"]
+  #     env: {}
+  #     enabled: true
+  #     timeout: "60s"
+  #   - name: "local-sse"
+  #     type: "sse"
+  #     url: "http://127.0.0.1:3001"
+  #     enabled: true
+  #     timeout: "60s"
+
 # Web search tool. The `web_search` tool is registered
 # only when `enabled: true` AND a usable API key is set;
 # otherwise the LLM cannot see the tool (no "feature not

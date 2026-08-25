@@ -41,16 +41,22 @@ func (t *SSETransport) Start(ctx context.Context) error {
 	sseURL := t.baseURL + "/sse"
 	req, err := http.NewRequestWithContext(ctx, "GET", sseURL, nil)
 	if err != nil {
+		close(t.done)
+		close(t.outCh)
 		return fmt.Errorf("build SSE request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := t.httpClient.Do(req)
 	if err != nil {
+		close(t.done)
+		close(t.outCh)
 		return fmt.Errorf("SSE connect: %w", err)
 	}
 	if resp.StatusCode >= 400 {
 		resp.Body.Close()
+		close(t.done)
+		close(t.outCh)
 		return fmt.Errorf("SSE connect: HTTP %d", resp.StatusCode)
 	}
 
@@ -65,6 +71,8 @@ func (t *SSETransport) Start(ctx context.Context) error {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			resp.Body.Close()
+			close(t.done)
+			close(t.outCh)
 			return fmt.Errorf("read endpoint event: %w", err)
 		}
 		line = strings.TrimRight(line, "\r\n")
