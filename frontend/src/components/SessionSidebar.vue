@@ -33,7 +33,7 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
 import { h } from 'vue'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
@@ -794,7 +794,7 @@ onMounted(() => {
             <span class="project-summary-path">{{ activeProjectTab.shortPath }}</span>
           </span>
         </div>
-        <NSpace size="small">
+        <div class="sidebar-actions">
           <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'" aria-label="切换主题">
             <component :is="themeName === 'dark' ? Sun : Moon" :size="16" />
           </NButton>
@@ -809,7 +809,7 @@ onMounted(() => {
               <MoreHorizontal :size="16" />
             </NButton>
           </NDropdown>
-        </NSpace>
+        </div>
       </div>
 
       <!-- Search bar (filters across all sessions in current project). -->
@@ -1199,6 +1199,7 @@ onMounted(() => {
 }
 .project-summary {
   min-width: 0;
+  flex: 1 1 auto;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -1222,7 +1223,6 @@ onMounted(() => {
 }
 .project-summary-name {
   min-width: 0;
-  max-width: 150px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1233,7 +1233,6 @@ onMounted(() => {
 }
 .project-summary-path {
   min-width: 0;
-  max-width: 150px;
   color: var(--text-tertiary);
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1241,6 +1240,17 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.sidebar-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+.sidebar-actions :deep(.n-button) {
+  flex: 0 0 auto;
 }
 
 /* --- Search bar -------------------------------------------------------- */

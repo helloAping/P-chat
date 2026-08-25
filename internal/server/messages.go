@@ -296,7 +296,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		var retryNotice string
 		switch {
 		case attempt < maxRetries:
-			retryNotice = fmt.Sprintf("⏱ 回合超出最长执行时间，自动重试（第 %d/%d 次）——相当于自动发送“继续”…", attempt+1, maxRetries)
+			retryNotice = fmt.Sprintf("⏱ 回合超出最长执行时间，自动重试并接续当前任务（第 %d/%d 次）…", attempt+1, maxRetries)
 		case agent.HasPendingTodos(id):
 			retryNotice = "⏱ 回合超出最长执行时间，检测到未完成任务，自动继续…"
 		}
@@ -334,6 +334,10 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			Content:     agent.BuildAutoResumePrompt(id, resumeReason),
 			MsgType:     llm.MsgTypeText,
 			SubmitToLLM: 1,
+			Meta: map[string]any{
+				"origin":    "auto_resume",
+				"ui_hidden": true,
+			},
 		})
 		chatReq.Messages = resumeMsgs
 		chatReq.HistoryMessageCount = len(resumeMsgs) - 1

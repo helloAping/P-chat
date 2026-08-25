@@ -724,6 +724,12 @@ func normalizeTaskOrderKey(s string) string {
 // (groupID, true) rows.
 
 func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64, seq int64, regenGroupID string, isArchived bool) *MessageResponse {
+	if i < len(metas) && isUIHiddenMessageMeta(metas[i]) {
+		return nil
+	}
+	if isLegacyInternalResumeMessage(m) {
+		return nil
+	}
 	created := time.Now().Unix()
 	if i < len(createds) && createds[i] != 0 {
 		created = createds[i]
@@ -818,6 +824,33 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 	}
 
 	return &resp
+}
+
+func isUIHiddenMessageMeta(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+		return false
+	}
+	switch v := meta["ui_hidden"].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
+	}
+}
+
+func isLegacyInternalResumeMessage(m llm.ChatMessage) bool {
+	if m.Role != llm.RoleUser || m.MsgType != llm.MsgTypeText {
+		return false
+	}
+	content := strings.TrimSpace(m.Content)
+	return strings.HasPrefix(content, "⏱ 上一回合因") ||
+		strings.HasPrefix(content, "⚠ 系统检测：你刚才的回复没有调用任何工具")
 }
 
 // parseInt64Query returns the int64 value of a query string

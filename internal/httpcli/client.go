@@ -111,23 +111,25 @@ type StreamEvent struct {
 	Thinking string `json:"thinking,omitempty"`
 
 	// Phase/tool fields
-	Phase            string   `json:"phase,omitempty"`
-	Step             string   `json:"step,omitempty"`
-	Msg              string   `json:"message,omitempty"`
-	ToolID           string   `json:"tool_id,omitempty"`
-	ToolName         string   `json:"tool_name,omitempty"`
-	ToolStatus       string   `json:"tool_status,omitempty"`
-	ToolResult       string   `json:"tool_result,omitempty"`
-	ToolResultFull   string   `json:"tool_result_full,omitempty"`
-	ToolError        string   `json:"tool_error,omitempty"`
-	ToolElapsed      string   `json:"tool_elapsed,omitempty"`
-	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
-	ToolSummary      string   `json:"tool_summary,omitempty"`
-	ToolChangedPaths []string `json:"tool_changed_paths,omitempty"`
-	ToolRetryable    bool     `json:"tool_retryable,omitempty"`
-	ToolRequiresUser bool     `json:"tool_requires_user,omitempty"`
-	ToolNextAction   string   `json:"tool_next_action,omitempty"`
-	ToolArgs         string   `json:"tool_args,omitempty"`
+	Phase               string   `json:"phase,omitempty"`
+	Step                string   `json:"step,omitempty"`
+	Msg                 string   `json:"message,omitempty"`
+	ToolID              string   `json:"tool_id,omitempty"`
+	ToolName            string   `json:"tool_name,omitempty"`
+	ToolStatus          string   `json:"tool_status,omitempty"`
+	ToolResult          string   `json:"tool_result,omitempty"`
+	ToolResultFull      string   `json:"tool_result_full,omitempty"`
+	ToolResultTruncated bool     `json:"tool_result_truncated,omitempty"`
+	ToolResultFullLen   int      `json:"tool_result_full_len,omitempty"`
+	ToolError           string   `json:"tool_error,omitempty"`
+	ToolElapsed         string   `json:"tool_elapsed,omitempty"`
+	ToolCallStatus      string   `json:"tool_call_status,omitempty"`
+	ToolSummary         string   `json:"tool_summary,omitempty"`
+	ToolChangedPaths    []string `json:"tool_changed_paths,omitempty"`
+	ToolRetryable       bool     `json:"tool_retryable,omitempty"`
+	ToolRequiresUser    bool     `json:"tool_requires_user,omitempty"`
+	ToolNextAction      string   `json:"tool_next_action,omitempty"`
+	ToolArgs            string   `json:"tool_args,omitempty"`
 
 	// 子代理事件与父流交错传输。Sub-agent events are interleaved with the parent stream.
 	SubAgent              bool   `json:"sub_agent,omitempty"`
@@ -137,6 +139,7 @@ type StreamEvent struct {
 	SubAgentColor         string `json:"sub_agent_color,omitempty"`
 	SubAgentModel         string `json:"sub_agent_model,omitempty"`
 	SubAgentTaskID        string `json:"sub_agent_task_id,omitempty"`
+	SubAgentRunMode       string `json:"sub_agent_run_mode,omitempty"`
 	SubAgentDescription   string `json:"sub_agent_description,omitempty"`
 	SubAgentFailureReason string `json:"sub_agent_failure_reason,omitempty"`
 
@@ -191,6 +194,25 @@ type ToolInfo struct {
 	Description string `json:"description"`
 	Dynamic     bool   `json:"dynamic"`
 	Scope       string `json:"scope"`
+	Source      string `json:"source,omitempty"`
+	ProjectRoot string `json:"project_root,omitempty"`
+}
+
+// ToolLoadDiagnostic 映射动态工具加载诊断。ToolLoadDiagnostic mirrors dynamic tool load diagnostics.
+type ToolLoadDiagnostic struct {
+	Source      string `json:"source"`
+	Name        string `json:"name,omitempty"`
+	Status      string `json:"status"`
+	Error       string `json:"error,omitempty"`
+	Scope       string `json:"scope,omitempty"`
+	ProjectRoot string `json:"project_root,omitempty"`
+	ModAt       string `json:"mod_at,omitempty"`
+}
+
+// ToolListResponse is the full response from GET /api/v1/tools.
+type ToolListResponse struct {
+	Tools       []ToolInfo           `json:"tools"`
+	Diagnostics []ToolLoadDiagnostic `json:"diagnostics"`
 }
 
 // CompressResult 映射会话压缩结果。CompressResult mirrors the session compression result.
@@ -483,17 +505,27 @@ func (c *Client) ListStyles(ctx context.Context) ([]StyleInfo, error) {
 	return resp.Styles, nil
 }
 
-// ListTools 返回会话可用工具。ListTools returns the tools available to a session.
-// 可选会话决定服务端暴露的项目级动态工具。The optional session selects the project-level dynamic tools that the server exposes.
-func (c *Client) ListTools(ctx context.Context, sessionID string) ([]ToolInfo, error) {
+// ListToolsDetailed 返回会话可用工具和动态工具诊断。
+// ListToolsDetailed returns tools and dynamic-tool diagnostics for a session.
+//
+// 可选会话决定服务端暴露的项目级动态工具。The optional session selects
+// the project-level dynamic tools that the server exposes.
+func (c *Client) ListToolsDetailed(ctx context.Context, sessionID string) (ToolListResponse, error) {
 	path := "/api/v1/tools"
 	if sessionID != "" {
 		path += "?session_id=" + url.QueryEscape(sessionID)
 	}
-	var resp struct {
-		Tools []ToolInfo `json:"tools"`
-	}
+	var resp ToolListResponse
 	if err := c.doJSON(ctx, "GET", path, nil, &resp); err != nil {
+		return ToolListResponse{}, err
+	}
+	return resp, nil
+}
+
+// ListTools 返回会话可用工具。ListTools returns the tools available to a session.
+func (c *Client) ListTools(ctx context.Context, sessionID string) ([]ToolInfo, error) {
+	resp, err := c.ListToolsDetailed(ctx, sessionID)
+	if err != nil {
 		return nil, err
 	}
 	return resp.Tools, nil

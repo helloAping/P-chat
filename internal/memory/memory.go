@@ -1017,6 +1017,22 @@ func (s *Store) GetAssistantMessagesAfterSeq(convID string, afterSeq int64) ([]l
 // ChatMessage.
 func encodeChatMeta(msg llm.ChatMessage) map[string]string {
 	m := make(map[string]string)
+	for k, v := range msg.Meta {
+		switch x := v.(type) {
+		case string:
+			m[k] = x
+		case bool:
+			if x {
+				m[k] = "true"
+			} else {
+				m[k] = "false"
+			}
+		case fmt.Stringer:
+			m[k] = x.String()
+		default:
+			m[k] = fmt.Sprint(x)
+		}
+	}
 	if msg.Type != "" {
 		m["type"] = msg.Type
 	}

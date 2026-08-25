@@ -37,6 +37,7 @@ type ChatUI struct {
 	start     time.Time
 	round     int
 	maxRound  int
+	traceID   string
 
 	// Streaming text state
 	inTextBlock  bool
@@ -86,6 +87,15 @@ func (u *ChatUI) Handle(chunk agent.ChatStreamChunk) {
 	if chunk.MaxRound > 0 {
 		u.maxRound = chunk.MaxRound
 	}
+	if chunk.TraceID != "" {
+		u.traceID = chunk.TraceID
+	}
+
+	if chunk.SessionStatus != "" && !chunk.Done {
+		if u.handleSessionStatusEvent(chunk) {
+			return
+		}
+	}
 
 	// Sub-agent events get a dedicated, indented display path so the
 	// user can see what's happening inside the task tool.
@@ -120,6 +130,11 @@ func (u *ChatUI) Handle(chunk agent.ChatStreamChunk) {
 	// Phase events
 	if chunk.Phase != "" {
 		u.handlePhaseEvent(chunk)
+		return
+	}
+
+	if chunk.ContentRewrite != "" || chunk.ThinkingRewrite != "" {
+		u.handleRewriteEvent(chunk)
 		return
 	}
 
@@ -168,6 +183,12 @@ func (u *ChatUI) handleSubAgentEvent(chunk agent.ChatStreamChunk) {
 		} else {
 			header += color.HiCyanString("sub-agent ")
 		}
+		if chunk.SubAgentRunMode == "async" {
+			header += color.MagentaString("[async] ")
+		}
+		if chunk.SubAgentTaskID != "" {
+			header += color.HiBlackString("#%s ", shortID(chunk.SubAgentTaskID))
+		}
 		header += chunk.SubAgentTask
 		fmt.Println()
 		fmt.Println(header)
@@ -192,6 +213,9 @@ func (u *ChatUI) handleSubAgentEvent(chunk agent.ChatStreamChunk) {
 		}
 		if chunk.SubAgentModel != "" {
 			summary += " " + color.HiBlackString("[%s]", chunk.SubAgentModel)
+		}
+		if chunk.SubAgentFailureReason != "" {
+			summary += " " + color.HiBlackString("原因: %s", oneLine(chunk.SubAgentFailureReason))
 		}
 		fmt.Println(summary)
 		return
@@ -253,10 +277,42 @@ func (u *ChatUI) handlePhaseEvent(chunk agent.ChatStreamChunk) {
 		u.ensureLine()
 		fmt.Println()
 		u.printStatusBar()
+	case "system":
+		u.handleSystemEvent(chunk)
 	default:
 		// Silently ignore system/memory/plan/tools phases -
 		// they're internal and don't need to be shown by default
 	}
+}
+
+func (u *ChatUI) handleSessionStatusEvent(chunk agent.ChatStreamChunk) bool {
+	switch chunk.SessionStatus {
+	case "retry":
+		u.stopSpinner()
+		u.ensureLine()
+		color.Yellow("  ↻ 服务端正在自动续跑当前回合…")
+		u.startSpinner("继续执行中...")
+		return true
+	case "busy", "idle":
+		return false
+	default:
+		return false
+	}
+}
+
+func (u *ChatUI) handleSystemEvent(chunk agent.ChatStreamChunk) {
+	msg := strings.TrimSpace(chunk.Message)
+	if msg == "" {
+		return
+	}
+	u.stopSpinner()
+	u.ensureLine()
+	if chunk.Step == "turn-retry" || chunk.Step == "todo-auto-continue" {
+		color.Yellow("  ↻ %s", msg)
+		u.startSpinner("继续执行中...")
+		return
+	}
+	color.HiBlack("  %s", msg)
 }
 
 func (u *ChatUI) handleLLMEvent(chunk agent.ChatStreamChunk) {
@@ -295,6 +351,9 @@ func (u *ChatUI) handleToolEvent(chunk agent.ChatStreamChunk) {
 		args := u.formatArgs(chunk.ToolArgs)
 		icon := color.New(color.FgYellow)
 		icon.Printf("  ● %s", chunk.ToolName)
+		if toolArgsDryRun(chunk.ToolArgs) {
+			color.HiBlack(" [dry-run]")
+		}
 		if args != "" {
 			color.HiBlack("(%s)", args)
 		}
@@ -311,7 +370,7 @@ func (u *ChatUI) handleToolEvent(chunk agent.ChatStreamChunk) {
 		if elapsed == "" {
 			elapsed = ""
 		}
-		result := chunk.ToolResult
+		result := toolDisplayText(chunk)
 		if len(result) > 200 {
 			result = result[:200] + "..."
 		}
@@ -324,11 +383,14 @@ func (u *ChatUI) handleToolEvent(chunk agent.ChatStreamChunk) {
 		if elapsed != "" {
 			color.HiBlack("  (%s)", elapsed)
 		}
-		// Suggest /expand for non-trivial results.
-		if len(chunk.ToolResult) > 200 {
+		if chunk.ToolCallStatus != "" && chunk.ToolCallStatus != "ok" {
+			color.HiBlack("  [%s]", chunk.ToolCallStatus)
+		}
+		if toolResultExpandable(chunk) {
 			color.HiBlack("  ▸ /expand last")
 		}
 		fmt.Println()
+		u.printToolDetails(chunk)
 		return
 	}
 
@@ -382,6 +444,7 @@ type cliConfirmRequest struct {
 	Args         string `json:"args"`
 	Reason       string `json:"reason"`
 	ResolvedPath string `json:"resolved_path,omitempty"`
+	PathClass    string `json:"path_class,omitempty"`
 	RiskLevel    string `json:"risk_level,omitempty"`
 }
 
@@ -391,22 +454,33 @@ func (u *ChatUI) handleToolConfirmEvent(rawJSON string) {
 
 	var req cliConfirmRequest
 	if err := json.Unmarshal([]byte(rawJSON), &req); err != nil {
-		color.Red("  Unable to parse tool confirmation: %v", err)
+		color.Red("  无法解析工具确认请求: %v", err)
 		return
 	}
 
 	fmt.Println()
-	color.Yellow("  Tool confirmation required: %s", req.ToolName)
+	color.Yellow("  需要确认工具调用: %s", req.ToolName)
 	if req.Reason != "" {
 		color.HiBlack("  %s", req.Reason)
 	}
+	if req.RiskLevel != "" || req.PathClass != "" {
+		metaParts := []string{}
+		if req.RiskLevel != "" {
+			metaParts = append(metaParts, req.RiskLevel)
+		}
+		if req.PathClass != "" {
+			metaParts = append(metaParts, req.PathClass)
+		}
+		meta := strings.Join(metaParts, " ")
+		color.HiBlack("  风险: %s", meta)
+	}
 	if req.ResolvedPath != "" {
-		color.HiBlack("  Target: %s", req.ResolvedPath)
+		color.HiBlack("  目标: %s", req.ResolvedPath)
 	}
 	if req.Args != "" {
-		color.HiBlack("  Arguments: %s", req.Args)
+		color.HiBlack("  参数: %s", req.Args)
 	}
-	color.Cyan("  [y] Allow once  [a] Always allow  [n] Reject")
+	color.Cyan("  [y] 允许一次  [a] 始终允许  [n] 拒绝")
 
 	approved := false
 	action := "reject"
@@ -433,15 +507,31 @@ func (u *ChatUI) handleToolConfirmEvent(rawJSON string) {
 			break
 		}
 	} else {
-		color.Yellow("  Non-interactive terminal: tool call rejected")
+		color.Yellow("  非交互终端: 已拒绝工具调用")
 	}
 
 	if u.submitConfirm == nil {
-		color.Red("  Tool confirmation handler is unavailable")
+		color.Red("  工具确认处理器不可用")
 		return
 	}
 	if err := u.submitConfirm(u.sessionID, approved, action); err != nil {
-		color.Red("  Failed to submit tool confirmation: %v", err)
+		color.Red("  提交工具确认失败: %v", err)
+	}
+}
+
+func (u *ChatUI) handleRewriteEvent(chunk agent.ChatStreamChunk) {
+	u.stopSpinner()
+	u.ensureLine()
+	if chunk.ThinkingRewrite != "" {
+		color.HiBlack("  ↻ 推理内容已按后处理规则修正")
+	}
+	if chunk.ContentRewrite != "" {
+		color.HiBlack("  ↻ 回复内容已按后处理规则修正")
+		fmt.Print("  ")
+		fmt.Print(chunk.ContentRewrite)
+		if !strings.HasSuffix(chunk.ContentRewrite, "\n") {
+			fmt.Println()
+		}
 	}
 }
 
@@ -630,6 +720,10 @@ func (u *ChatUI) printStatusBar() {
 		parts = append(parts, fmt.Sprintf("%d tool calls", u.toolsRun))
 	}
 
+	if u.traceID != "" {
+		parts = append(parts, "trace "+u.traceID)
+	}
+
 	if u.maxRound > 1 && u.toolsActually > 0 {
 		parts = append(parts, fmt.Sprintf("round %d/%d", u.round, u.maxRound))
 	}
@@ -644,6 +738,10 @@ func (u *ChatUI) PrintBannerHeader(userInput string) {
 	u.tokensIn.Store(0)
 	u.tokensOut.Store(0)
 	u.toolsRun = 0
+	u.toolsActually = 0
+	u.traceID = ""
+	u.round = 0
+	u.maxRound = 0
 	u.firstContent = true
 	u.inTextBlock = false
 	dim := color.New(color.FgCyan, color.Bold)
@@ -763,4 +861,71 @@ func oneLine(s string) string {
 		s = strings.ReplaceAll(s, "  ", " ")
 	}
 	return strings.TrimSpace(s)
+}
+
+func toolArgsDryRun(args string) bool {
+	args = strings.TrimSpace(args)
+	if args == "" || args == "null" {
+		return false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(args), &obj); err != nil {
+		return false
+	}
+	v, ok := obj["dry_run"].(bool)
+	return ok && v
+}
+
+func toolDisplayText(chunk agent.ChatStreamChunk) string {
+	if strings.TrimSpace(chunk.ToolSummary) != "" {
+		return chunk.ToolSummary
+	}
+	if strings.TrimSpace(chunk.ToolResult) != "" {
+		return chunk.ToolResult
+	}
+	return chunk.ToolResultFull
+}
+
+func toolResultExpandable(chunk agent.ChatStreamChunk) bool {
+	if chunk.ToolResultTruncated || chunk.ToolResultFullLen > 200 {
+		return true
+	}
+	return len(chunk.ToolResultFull) > 200 || len(chunk.ToolResult) > 200
+}
+
+func (u *ChatUI) printToolDetails(chunk agent.ChatStreamChunk) {
+	if len(chunk.ToolChangedPaths) > 0 {
+		paths := chunk.ToolChangedPaths
+		if len(paths) > 3 {
+			paths = paths[:3]
+		}
+		line := strings.Join(paths, ", ")
+		if len(chunk.ToolChangedPaths) > len(paths) {
+			line += fmt.Sprintf(" (+%d)", len(chunk.ToolChangedPaths)-len(paths))
+		}
+		color.HiBlack("    ↳ 变更: %s", line)
+	}
+	if chunk.ToolNextAction != "" {
+		color.HiBlack("    ↳ 下一步: %s", oneLine(chunk.ToolNextAction))
+	}
+	if chunk.ToolRequiresUser {
+		color.Yellow("    ↳ 需要用户输入后才能继续")
+	}
+	if chunk.ToolRetryable {
+		color.HiBlack("    ↳ 可重试")
+	}
+	if chunk.ToolResultTruncated {
+		size := "完整输出"
+		if chunk.ToolResultFullLen > 0 {
+			size = fmt.Sprintf("完整输出约 %d bytes", chunk.ToolResultFullLen)
+		}
+		color.HiBlack("    ↳ %s 已由服务端保留", size)
+	}
+}
+
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
 }
