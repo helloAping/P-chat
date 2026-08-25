@@ -57,7 +57,8 @@ param(
     [switch] $RemoveFromPath,
     [switch] $Gui,
     [switch] $Launch,
-    [switch] $Force
+    [switch] $Force,
+    [string] $GuiResultPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -148,9 +149,104 @@ function Set-PChatUserPath {
     [Environment]::SetEnvironmentVariable("Path", ($kept -join ';'), "User")
 }
 
+function ConvertTo-PChatProcessArgument {
+    param(
+        [AllowEmptyString()][string] $Value
+    )
+
+    if ($null -eq $Value) { return "''" }
+    if ($Value -match '^[A-Za-z0-9_./:\\-]+$') { return $Value }
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Join-PChatProcessArguments {
+    param(
+        [Parameter(Mandatory = $true)][string[]] $Arguments
+    )
+
+    return (($Arguments | ForEach-Object { ConvertTo-PChatProcessArgument $_ }) -join ' ')
+}
+
+function New-PChatInstallArguments {
+    param(
+        [Parameter(Mandatory = $true)][object] $Choice,
+        [Parameter(Mandatory = $true)][bool] $PortableMode,
+        [Parameter(Mandatory = $true)][bool] $ForceInstall,
+        [Parameter(Mandatory = $true)][string] $ResultPath
+    )
+
+    $args = @("-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath)
+    if ($PortableMode) {
+        $args += "-Portable"
+    } else {
+        $args += @("-InstallDir", $Choice.InstallDir)
+    }
+    if (-not $Choice.StartMenu) { $args += "-NoStartMenu" }
+    if ($Choice.DesktopShortcut) { $args += "-DesktopShortcut" }
+    if ($Choice.AddToPath) {
+        $args += "-AddToPath"
+    } else {
+        $args += "-RemoveFromPath"
+    }
+    if ($Choice.Launch) { $args += "-Launch" }
+    if ($ForceInstall) { $args += "-Force" }
+    $args += @("-GuiResultPath", $ResultPath)
+    return $args
+}
+
+function Start-PChatGuiInstall {
+    param(
+        [Parameter(Mandatory = $true)][object] $Choice,
+        [Parameter(Mandatory = $true)][bool] $PortableMode,
+        [Parameter(Mandatory = $true)][bool] $ForceInstall,
+        [Parameter(Mandatory = $true)][string] $ResultPath,
+        [Parameter(Mandatory = $true)][string] $OutputPath,
+        [Parameter(Mandatory = $true)][string] $ErrorPath
+    )
+
+    foreach ($logPath in @($OutputPath, $ErrorPath, $ResultPath)) {
+        if (Test-Path -LiteralPath $logPath) {
+            Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $childArgs = New-PChatInstallArguments -Choice $Choice -PortableMode $PortableMode -ForceInstall $ForceInstall -ResultPath $ResultPath
+    Start-Process `
+        -FilePath "powershell.exe" `
+        -ArgumentList (Join-PChatProcessArguments $childArgs) `
+        -WorkingDirectory $here `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $OutputPath `
+        -RedirectStandardError $ErrorPath `
+        -PassThru
+}
+
+function Read-PChatInstallLog {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    return (Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue)
+}
+
+function Test-PChatInstallSucceeded {
+    param(
+        [Parameter(Mandatory = $true)][int] $ExitCode,
+        [Parameter(Mandatory = $true)][string] $ResultPath
+    )
+
+    if ($ExitCode -eq 0) { return $true }
+    if (-not (Test-Path -LiteralPath $ResultPath)) { return $false }
+    $result = (Get-Content -LiteralPath $ResultPath -Raw -ErrorAction SilentlyContinue).Trim()
+    return $result.Equals("ok", [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Show-PChatInstallDialog {
     param(
-        [Parameter(Mandatory = $true)][string] $InitialDir
+        [Parameter(Mandatory = $true)][string] $InitialDir,
+        [Parameter(Mandatory = $true)][bool] $PortableMode,
+        [Parameter(Mandatory = $true)][bool] $ForceInstall
     )
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -163,7 +259,7 @@ function Show-PChatInstallDialog {
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
-    $form.ClientSize = New-Object System.Drawing.Size(620, 390)
+    $form.ClientSize = New-Object System.Drawing.Size(620, 430)
     $form.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 
     $title = New-Object System.Windows.Forms.Label
@@ -243,10 +339,94 @@ function Show-PChatInstallDialog {
     $launchOption.Location = New-Object System.Drawing.Point(320, 220)
     $form.Controls.Add($launchOption)
 
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Text = "正在安装，请稍候。安装过程中请不要关闭窗口。"
+    $statusLabel.AutoSize = $true
+    $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(88, 88, 88)
+    $statusLabel.Location = New-Object System.Drawing.Point(31, 320)
+    $statusLabel.Visible = $false
+    $form.Controls.Add($statusLabel)
+
+    $progress = New-Object System.Windows.Forms.ProgressBar
+    $progress.Location = New-Object System.Drawing.Point(31, 348)
+    $progress.Size = New-Object System.Drawing.Size(360, 12)
+    $progress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+    $progress.MarqueeAnimationSpeed = 30
+    $progress.Visible = $false
+    $form.Controls.Add($progress)
+
     $install = New-Object System.Windows.Forms.Button
     $install.Text = "安装"
-    $install.Location = New-Object System.Drawing.Point(405, 334)
+    $install.Location = New-Object System.Drawing.Point(405, 374)
     $install.Size = New-Object System.Drawing.Size(90, 34)
+    $state = @{
+        Installing = $false
+        Process    = $null
+        OutputPath = Join-Path ([System.IO.Path]::GetTempPath()) ("pchat-install-{0}.out.log" -f ([System.Guid]::NewGuid().ToString("N")))
+        ErrorPath  = Join-Path ([System.IO.Path]::GetTempPath()) ("pchat-install-{0}.err.log" -f ([System.Guid]::NewGuid().ToString("N")))
+        ResultPath = Join-Path ([System.IO.Path]::GetTempPath()) ("pchat-install-{0}.result" -f ([System.Guid]::NewGuid().ToString("N")))
+    }
+    $setBusy = {
+        param([bool] $Busy)
+
+        $state.Installing = $Busy
+        foreach ($control in @($pathText, $browse, $startMenuOption, $desktopOption, $pathOption, $launchOption)) {
+            $control.Enabled = -not $Busy
+        }
+        $install.Enabled = -not $Busy
+        $install.Text = $(if ($Busy) { "安装中..." } else { "安装" })
+        $cancel.Enabled = -not $Busy
+        $statusLabel.Visible = $Busy
+        $progress.Visible = $Busy
+        $form.ControlBox = -not $Busy
+        $form.UseWaitCursor = $Busy
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 250
+    $timer.Add_Tick({
+        if (-not $state.Process) { return }
+        if (-not $state.Process.HasExited) { return }
+
+        $timer.Stop()
+        $state.Process.WaitForExit()
+        $exitCode = $state.Process.ExitCode
+        $succeeded = Test-PChatInstallSucceeded -ExitCode $exitCode -ResultPath $state.ResultPath
+        $output = (Read-PChatInstallLog -Path $state.OutputPath) + (Read-PChatInstallLog -Path $state.ErrorPath)
+        foreach ($logPath in @($state.OutputPath, $state.ErrorPath, $state.ResultPath)) {
+            if (Test-Path -LiteralPath $logPath) {
+                Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        & $setBusy $false
+        if ($succeeded) {
+            [System.Windows.Forms.MessageBox]::Show(
+                $form,
+                "P-Chat 已安装到:`n$($form.Tag.InstallDir)",
+                "P-Chat 安装完成",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $form.Close()
+            return
+        }
+
+        $message = "安装失败，请检查安装目录后重试。"
+        if (-not [string]::IsNullOrWhiteSpace($output)) {
+            $message += "`n`n$output"
+        }
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            $message,
+            "P-Chat 安装程序",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    })
+
     $install.Add_Click({
         $selected = $pathText.Text.Trim()
         if (-not $selected) {
@@ -261,21 +441,40 @@ function Show-PChatInstallDialog {
             AddToPath       = $pathOption.Checked
             Launch          = $launchOption.Checked
         }
-        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        $form.Close()
+        & $setBusy $true
+        try {
+            $state.Process = Start-PChatGuiInstall `
+                -Choice $form.Tag `
+                -PortableMode $PortableMode `
+                -ForceInstall $ForceInstall `
+                -ResultPath $state.ResultPath `
+                -OutputPath $state.OutputPath `
+                -ErrorPath $state.ErrorPath
+            $timer.Start()
+        } catch {
+            & $setBusy $false
+            [System.Windows.Forms.MessageBox]::Show($form, "启动安装失败。`n`n$($_.Exception.Message)", "P-Chat 安装程序", "OK", "Error") | Out-Null
+        }
     })
     $form.Controls.Add($install)
 
     $cancel = New-Object System.Windows.Forms.Button
     $cancel.Text = "取消"
-    $cancel.Location = New-Object System.Drawing.Point(505, 334)
+    $cancel.Location = New-Object System.Drawing.Point(505, 374)
     $cancel.Size = New-Object System.Drawing.Size(85, 34)
     $cancel.Add_Click({
+        if ($state.Installing) { return }
         $form.Tag = [pscustomobject]@{ Cancelled = $true }
         $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
         $form.Close()
     })
     $form.Controls.Add($cancel)
+
+    $form.Add_FormClosing({
+        if ($state.Installing) {
+            $_.Cancel = $true
+        }
+    })
 
     $form.AcceptButton = $install
     $form.CancelButton = $cancel
@@ -327,19 +526,12 @@ if ($Gui) {
         }
     }
 
-    $choice = Show-PChatInstallDialog -InitialDir $initialDir
+    $choice = Show-PChatInstallDialog -InitialDir $initialDir -PortableMode ([bool]$Portable) -ForceInstall ([bool]$Force)
     if ($choice.Cancelled) {
         Write-Host "[install] cancelled by user"
         exit 0
     }
-
-    $InstallDir = $choice.InstallDir
-    $NoStartMenu = -not $choice.StartMenu
-    $DesktopShortcut = $choice.DesktopShortcut
-    $AddToPath = $choice.AddToPath
-    $RemoveFromPath = -not $choice.AddToPath
-    $pathChoiceFromGui = $true
-    $Launch = $choice.Launch
+    exit 0
 }
 
 if ($Portable) {
@@ -501,3 +693,7 @@ if ($Gui) {
 }
 
 Write-Host "[install] done.  Launch: $target\pchat-gui.exe"
+if ($GuiResultPath) {
+    Set-Content -LiteralPath $GuiResultPath -Value "ok" -Encoding UTF8
+}
+exit 0

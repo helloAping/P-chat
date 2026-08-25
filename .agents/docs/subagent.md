@@ -26,7 +26,7 @@
 ```
 1. 缓存检查 (task_id 命中 → 直接返回缓存)
 2. 发出 sub_agent_start 事件 (Phase="sub_agent_start", SubAgentStatus="start")
-3. 构建子工具注册表 (过滤: 移除 task/task_status/task_cancel/recall, 应用全局 allow/deny, 应用 agent 白名单)
+3. 构建子工具注册表 (过滤: 硬排除 task/recall、执行安全集、全局 allow/deny、agent 白名单)
 4. 创建独立 agent 实例 (独立 memory.Store, 独立事件系统)
 5. 调用 subAgent.ChatWithTools(runCtx, chatReq) → stream channel
 6. 转发每个 chunk 到父级 (tryForward → OnEvent → eventCh)
@@ -59,17 +59,18 @@
 
 工具可见性：
 1. **硬排除**：`task`, `task_status`, `task_cancel`, `recall` 强制移除
-2. **全局配置过滤**：`subagent.allowed_tools` / `denied_tools`
-3. **Per-agent 白名单**：`agentInfo.Tools` 非空时只暴露列表中的
+2. **执行安全集**：`tool.SubagentMayExpose` — 只读本地工具、`todo_write`、`web_search`、`web_fetch`。白名单不能放宽到写文件 / 执行 / 交互 / 浏览器 / MCP
+3. **全局配置过滤**：`subagent.allowed_tools` / `denied_tools`（不能越过安全集）
+4. **Per-agent 白名单**：`agentInfo.Tools` 非空时只暴露列表中的（仍受安全集约束；白名单可绕过全局 deny）
 
 执行授权：
 1. 子代理强制使用隔离的 `permission_level=ask`，不继承父会话的 `auto` / `full` / live session override
 2. 子代理不能消费 `/unsafe once`
 3. 子代理不能打开自己的 confirm flow；`tool.RequireConfirm` 在子代理上下文中 fail-closed
-4. 子代理默认只允许项目内、只读、低风险工具执行
-5. 写文件、编辑文件、启动进程、执行 shell、外部访问、交互提问、项目外读取、动态高风险工具调用返回 `SUBAGENT_PARENT_APPROVAL_REQUIRED`，由父对话决定后续动作
+4. 子代理可执行项目内只读工具（`read_file` / `list_files` / `grep` / `read_docx` / `read_pdf` / wiki）、私有 `todo_write`、`web_search`，以及公网 `web_fetch`（GET / POST）
+5. 写文件、编辑文件、启动进程、执行 shell、私网/回环 URL、交互提问、项目外读取、动态高风险工具调用返回 `SUBAGENT_PARENT_APPROVAL_REQUIRED`（或对私网 URL 直接 block），由父对话决定后续动作
 
-内置 `explore` / `plan` 只暴露 `read_file` 和 `list_files`。如果确实需要 shell search、git inspection、测试或其他进程执行，子代理应在最终结果中向父对话提出请求，而不是自行执行。
+内置 `explore` / `plan` 暴露 `read_file`、`list_files`、`grep`、`read_docx`、`read_pdf`。git / 测试 / 进程执行应在最终结果中向父对话提出，而不是自行执行。`general-purpose` 额外可使用 `todo_write`、`web_search` 和公网 `web_fetch`。
 
 ### 5. 缓存
 

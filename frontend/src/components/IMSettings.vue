@@ -56,7 +56,7 @@ const wechatQRStatusText = computed(() => {
   switch (wechatQRStatus.value) {
     case 'waiting': return '请使用微信扫码'
     case 'scanned': return '已扫码，等待手机确认'
-    case 'confirmed': return '微信已连接'
+    case 'confirmed': return '登录已确认'
     case 'confirmed_without_token': return '未保存连接凭证'
     case 'expired': return '二维码已过期'
     case 'canceled': return '扫码已取消'
@@ -71,7 +71,7 @@ const wechatQRHint = computed(() => {
   switch (wechatQRStatus.value) {
     case 'waiting': return '打开微信扫码登录，扫码后请在手机上确认。'
     case 'scanned': return '请在手机微信中确认登录，确认后这里会自动完成连接。'
-    case 'confirmed': return '微信 Bot 登录态已保存，可继续启用消息收发能力。'
+    case 'confirmed': return '微信 Bot 登录态已保存，消息通道启动后状态会显示为轮询中。'
     case 'confirmed_without_token': return wechatQRSession.value?.message || '微信已确认登录，但服务未返回可保存的连接凭证，请重新扫码或检查微信连接服务。'
     case 'expired': return '二维码已过期，请点击重新获取。'
     case 'canceled': return '扫码已取消，请重新获取二维码。'
@@ -97,7 +97,7 @@ function statusLabel(status?: string) {
   switch (status) {
     case 'ok': return '已连接'
     case 'polling': return '轮询中'
-    case 'authenticated': return '已登录'
+    case 'authenticated': return '已登录未收发'
     case 'registered': return '可用'
     case 'configured': return '已配置'
     case 'disabled': return '未启用'
@@ -111,8 +111,8 @@ function statusLabel(status?: string) {
 }
 
 function statusType(status?: string): 'success' | 'warning' | 'error' | 'default' {
-  if (status === 'ok' || status === 'registered' || status === 'authenticated' || status === 'polling') return 'success'
-  if (status === 'configured' || status === 'disabled' || status === 'not_configured') return 'warning'
+  if (status === 'ok' || status === 'registered' || status === 'polling') return 'success'
+  if (status === 'authenticated' || status === 'configured' || status === 'disabled' || status === 'not_configured') return 'warning'
   if (status === 'error' || status === 'expired' || status === 'unavailable' || status === 'not_implemented') return 'error'
   return 'default'
 }
@@ -149,7 +149,7 @@ function defaultsFor(type: 'feishu' | 'wechat' | 'qq'): api.IMPlatformConfig {
       type: 'wechat',
       variant: 'wechatbot',
       enabled: false,
-      mode: 'websocket',
+      mode: 'polling',
       allowed_senders: ['*'],
     })
   }
@@ -394,8 +394,13 @@ async function pollWechatQR() {
     const session = await api.pollWeChatQR(id)
     wechatQRSession.value = session
     if (session.status === 'confirmed') {
-      message.success('微信已连接')
       await refreshAll()
+      const status = healthFor('wechat', wechat.value?.variant)?.status
+      if (status === 'polling' || status === 'ok') {
+        message.success('微信消息通道已启动')
+      } else {
+        message.warning(`微信登录已确认，但消息通道未就绪: ${friendlyStatus('wechat', status || 'not_configured')}`)
+      }
       stopWechatQRPoll()
       return
     }

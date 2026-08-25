@@ -18,10 +18,17 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	if h == nil || h.agent == nil || h.store == nil {
 		return nil
 	}
-	if h.getCfg() == nil {
+	cfg := h.getCfg()
+	if cfg == nil {
 		return fmt.Errorf("config not available")
 	}
-	sessionID := imConversationID(ev)
+	imCfg := cfg.IM
+	imCfg.Normalize()
+	plan := im.PlanInbound(imCfg, ev)
+	if !plan.Process {
+		return nil
+	}
+	sessionID := plan.SessionID
 	if sessionID == "" {
 		return fmt.Errorf("im event missing session key")
 	}
@@ -41,8 +48,20 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	// interrupted plan before the agent constructs its guard prompt.
 	h.hydrateSessionTodos(sessionID)
 	meta := h.ensureMetaLoaded(sessionID)
+	persona := plan.Persona
 	provider := h.sessionProvider(sessionID)
 	model := h.sessionModel(sessionID, provider)
+	if strings.TrimSpace(persona.Model) != "" {
+		model = strings.TrimSpace(persona.Model)
+	}
+	reqStyle := style.Style(h.sessionStyle(sessionID))
+	if strings.TrimSpace(persona.Style) != "" {
+		reqStyle = style.Style(strings.TrimSpace(persona.Style))
+	}
+	reqWorkMode := h.sessionWorkMode(sessionID)
+	if persona.WorkMode != "" {
+		reqWorkMode = persona.WorkMode.Normalize()
+	}
 	histMsgs, compSummary := h.loadHistoryForSend(ctx, sessionID, provider, model)
 	msgs := buildLLMMessages(histMsgs)
 	historyMessageCount := len(msgs)
@@ -55,8 +74,8 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	})
 
 	req := agent.ChatRequest{
-		Style:               style.Style(h.sessionStyle(sessionID)),
-		WorkMode:            h.sessionWorkMode(sessionID),
+		Style:               reqStyle,
+		WorkMode:            reqWorkMode,
 		Provider:            provider,
 		Model:               model,
 		Messages:            msgs,
@@ -70,6 +89,10 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 		AutoContinue:        h.sessionAutoContinue(sessionID),
 		TodoLongRunMode:     h.sessionTodoLongRunMode(sessionID),
 		TraceID:             ev.TraceID,
+		AllowedTools:        plan.AllowedTools,
+	}
+	if inject := strings.TrimSpace(persona.PromptInject); inject != "" {
+		req.SkillContext = "## IM Persona\n\n" + inject
 	}
 
 	stream := h.agent.ChatStream(ctx, req)
@@ -114,17 +137,6 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 		})
 	}
 	return nil
-}
-
-func imConversationID(ev im.IMEvent) string {
-	chatID := strings.TrimSpace(ev.Chat.ChatID)
-	if chatID == "" {
-		chatID = strings.TrimSpace(ev.Sender.ID)
-	}
-	if chatID == "" || ev.Platform == "" {
-		return ""
-	}
-	return fmt.Sprintf("im:%s:%s", ev.Platform, chatID)
 }
 
 func imConversationTitle(ev im.IMEvent) string {

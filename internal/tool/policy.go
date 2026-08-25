@@ -123,6 +123,24 @@ func (p ToolPolicy) CanRunInParallel() bool {
 	return p.Category == ToolCategoryOrchestration && p.SideEffect == ToolSideEffectProcess
 }
 
+// SubagentMayExpose reports whether a child agent may see (and, after
+// per-call checks, run) this tool. Visibility and the execution gate
+// share this predicate so a sub-agent cannot discover a tool it is
+// not allowed to execute.
+//
+// Allowed: project-local read tools, private todo_write, web_search,
+// and web_fetch (GET/POST to public URLs). Write/exec/interactive/
+// browser/MCP/dynamic tools stay with the parent conversation.
+func SubagentMayExpose(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case "todo_write", "web_search", "web_fetch":
+		return true
+	}
+	p := defaultToolPolicy(name)
+	return p.Category == ToolCategoryRead && p.SideEffect == ToolSideEffectNone
+}
+
 func defaultToolPolicy(name string) ToolPolicy {
 	name = strings.ToLower(strings.TrimSpace(name))
 	p := ToolPolicy{

@@ -21,7 +21,7 @@ package subagent
 //	description: Short "when to use" hint # required; surfaced to parent LLM
 //	model: openai/gpt-4o-mini            # optional; "providerID/modelID"
 //	color: "#44BA81"                     # optional; hex or CSS color
-//	tools: [read_file, list_files]        # optional; per-agent whitelist
+//	tools: [read_file, list_files, grep]  # optional; per-agent whitelist
 //	hidden: false                        # optional; exclude from description
 //	---
 //	Body of file = the agent's system prompt.

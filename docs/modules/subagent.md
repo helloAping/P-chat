@@ -51,11 +51,13 @@
 - partsAcc 更新 Status 和 Elapsed
 - 持久化时 status 正确写入
 
-### 4. 三层工具隔离
+### 4. 工具隔离与父级授权
 
-1. **硬排除**：task, recall 强制移除
-2. **全局配置过滤**：`subagent.allowed_tools` / `denied_tools`
-3. **Per-agent 白名单**：`agentInfo.Tools` 非空时只暴露列表中的
+子代理隔离分成可见性 + 执行授权两层。可见性 capped by `tool.SubagentMayExpose`（只读本地、`todo_write`、`web_search`、`web_fetch`），再叠加硬排除 / 全局 allow-deny / per-agent 白名单。白名单不能放宽到写文件、shell、提问或浏览器。
+
+执行时子代理强制 `permission_level=ask`，不能弹 confirm。项目内只读和公网 `web_fetch`（GET / POST）可跑；写、执行、私网 URL、提问打回父对话。
+
+内置 `explore` / `plan`：`read_file`、`list_files`、`grep`、`read_docx`、`read_pdf`。`general-purpose` 额外可 `todo_write` / `web_search` / 公网 `web_fetch`。
 
 ### 5. 缓存
 

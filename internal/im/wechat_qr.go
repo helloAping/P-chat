@@ -32,8 +32,10 @@ func (e WeChatQRServiceError) Unwrap() error {
 
 // WeChatQRClient starts and polls a WeChat Bot QR login flow.
 type WeChatQRClient struct {
-	BaseURL    string
-	HTTPClient *http.Client
+	BaseURL       string
+	AppID         string
+	ClientVersion string
+	HTTPClient    *http.Client
 }
 
 // WeChatQRSession is the user-facing snapshot of a QR login flow.
@@ -157,6 +159,15 @@ func (m *WeChatQRManager) clientFor(platform config.IMPlatformConfig) WeChatQRCl
 	if base := stringFromExtra(platform.Extra, "qr_base_url", "base_url"); base != "" {
 		client.BaseURL = base
 	}
+	if appID := stringFromExtra(platform.Extra, "app_id", "ilink_app_id"); appID != "" {
+		client.AppID = appID
+	}
+	if platform.AppID != "" {
+		client.AppID = platform.AppID
+	}
+	if version := stringFromExtra(platform.Extra, "client_version", "ilink_client_version"); version != "" {
+		client.ClientVersion = version
+	}
 	return client
 }
 
@@ -166,6 +177,7 @@ func (c WeChatQRClient) Start(ctx context.Context) (WeChatQRSession, error) {
 	if err != nil {
 		return WeChatQRSession{}, err
 	}
+	c.setCommonHeaders(req)
 	var raw map[string]any
 	if err := c.doJSON(req, &raw); err != nil {
 		return WeChatQRSession{}, err
@@ -201,7 +213,7 @@ func (c WeChatQRClient) Poll(ctx context.Context, qrcode string) (WeChatQRSessio
 	if err != nil {
 		return WeChatQRSession{}, WeChatCredential{}, err
 	}
-	req.Header.Set("iLink-App-ClientVersion", "1")
+	c.setCommonHeaders(req)
 	var raw map[string]any
 	if err := c.doJSON(req, &raw); err != nil {
 		return WeChatQRSession{}, WeChatCredential{}, err
@@ -291,6 +303,28 @@ func (c WeChatQRClient) baseURL() string {
 		return strings.TrimSpace(c.BaseURL)
 	}
 	return defaultWeChatQRBaseURL
+}
+
+func (c WeChatQRClient) setCommonHeaders(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header.Set("iLink-App-Id", c.appID())
+	req.Header.Set("iLink-App-ClientVersion", c.clientVersion())
+}
+
+func (c WeChatQRClient) appID() string {
+	if strings.TrimSpace(c.AppID) != "" {
+		return strings.TrimSpace(c.AppID)
+	}
+	return wechatDefaultAppID
+}
+
+func (c WeChatQRClient) clientVersion() string {
+	if strings.TrimSpace(c.ClientVersion) != "" {
+		return strings.TrimSpace(c.ClientVersion)
+	}
+	return wechatDefaultClientVersion
 }
 
 func normalizeWeChatQRStatus(raw string) string {

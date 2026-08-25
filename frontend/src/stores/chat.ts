@@ -2,7 +2,7 @@
 // keeps the surface small — we don't need time-travel debugging
 // or modular stores for a chat app.
 
-import { reactive, ref, computed, watch } from 'vue'
+import { reactive, ref, computed, watch, nextTick } from 'vue'
 import * as api from '../api/client'
 import { notifyManager } from '../utils/notify'
 import { dedupMessagesByKey } from '../utils/messageDedup'
@@ -267,6 +267,12 @@ export const state = reactive({
   // time, and a paginated bubble's user message could
   // be on an older page).
   sessionUserMsgs: {} as Record<string, Record<string, api.UserMessageSummary>>,
+  // True while switchSession / setActiveProject is swapping the
+  // chat pane. ChatWindow shows a short loading veil so the
+  // previous transcript does not hard-cut into the next one
+  // (or flash the empty state while history is in flight).
+  viewLoading: false,
+  viewLoadingHint: '' as string,
 })
 
 export const currentMessages = computed(() =>
@@ -507,6 +513,42 @@ function evictColdSessions() {
   }
 }
 
+// Minimum overlay time so even a cached switch gets a beat
+// of loading → reveal instead of a hard cut. Fetching history
+// can be shorter because the network wait already covers it.
+export const VIEW_LOAD_MIN_CACHED_MS = 180
+export const VIEW_LOAD_MIN_FETCH_MS = 160
+export const VIEW_LOAD_MIN_PROJECT_MS = 220
+
+let viewLoadHold = 0
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now()
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function acquireViewLoad(hint: string): Promise<void> {
+  viewLoadHold++
+  state.viewLoading = true
+  if (viewLoadHold === 1) {
+    state.viewLoadingHint = hint
+    await nextTick()
+  }
+}
+
+async function releaseViewLoad(startedAt: number, minMs: number): Promise<void> {
+  const wait = minMs - (nowMs() - startedAt)
+  if (wait > 0) await sleep(wait)
+  viewLoadHold = Math.max(0, viewLoadHold - 1)
+  if (viewLoadHold === 0) {
+    state.viewLoading = false
+    state.viewLoadingHint = ''
+  }
+}
+
 export async function loadSessions() {
   const projectPath = state.activeProjectPath
   const { sessions } = await api.listSessions(projectPath)
@@ -543,22 +585,29 @@ export async function loadProjects() {
 }
 
 export async function setActiveProject(path: string) {
-  const previousProject = state.activeProjectPath
-  if (state.currentID) {
-    state.lastSessionByProject[previousProject] = state.currentID
-    rememberLastSession(previousProject, state.currentID)
-  }
-  state.activeProjectPath = path
-  rememberLastProject(path)
-  state.currentID = ''
-  state.currentTraceId = ''
+  if (path === state.activeProjectPath) return
+  const startedAt = nowMs()
+  await acquireViewLoad('正在切换项目…')
+  try {
+    const previousProject = state.activeProjectPath
+    if (state.currentID) {
+      state.lastSessionByProject[previousProject] = state.currentID
+      rememberLastSession(previousProject, state.currentID)
+    }
+    state.activeProjectPath = path
+    rememberLastProject(path)
+    state.currentID = ''
+    state.currentTraceId = ''
 
-  const cached = state.projectSessions[path] || []
-  state.sessions = cached
-  const last = state.lastSessionByProject[path] || readLastSession(path)
-  const next = cached.find(s => s.id === last)?.id || cached[0]?.id || ''
-  if (next) await switchSession(next)
-  await loadSessions()
+    const cached = state.projectSessions[path] || []
+    state.sessions = cached
+    const last = state.lastSessionByProject[path] || readLastSession(path)
+    const next = cached.find(s => s.id === last)?.id || cached[0]?.id || ''
+    if (next) await switchSession(next)
+    await loadSessions()
+  } finally {
+    await releaseViewLoad(startedAt, VIEW_LOAD_MIN_PROJECT_MS)
+  }
 }
 
 // initialHistoryLimit is the page size for the first history
@@ -569,6 +618,20 @@ export async function setActiveProject(path: string) {
 const initialHistoryLimit = 50
 
 export async function switchSession(id: string) {
+  if (!id) return
+  if (id === state.currentID && state.sessionMessages[id] && !state.viewLoading) return
+
+  const cached = !!state.sessionMessages[id]
+  const startedAt = nowMs()
+  await acquireViewLoad('正在加载对话…')
+  try {
+    await switchSessionBody(id)
+  } finally {
+    await releaseViewLoad(startedAt, cached ? VIEW_LOAD_MIN_CACHED_MS : VIEW_LOAD_MIN_FETCH_MS)
+  }
+}
+
+async function switchSessionBody(id: string) {
   state.currentID = id
   state.lastSessionByProject[state.activeProjectPath] = id
   rememberLastSession(state.activeProjectPath, id)

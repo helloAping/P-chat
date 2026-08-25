@@ -243,6 +243,7 @@ func TestWeChatQRFlowPersistsConfirmedCredential(t *testing.T) {
 	var body struct {
 		Platforms []struct {
 			Type    string         `json:"type"`
+			Mode    string         `json:"mode"`
 			Token   string         `json:"token"`
 			Extra   map[string]any `json:"extra"`
 			Enabled bool           `json:"enabled"`
@@ -253,6 +254,9 @@ func TestWeChatQRFlowPersistsConfirmedCredential(t *testing.T) {
 	}
 	if len(body.Platforms) != 1 || body.Platforms[0].Type != "wechat" || body.Platforms[0].Token != "wx-token" || !body.Platforms[0].Enabled {
 		t.Fatalf("persisted platforms = %+v, want enabled wechat token", body.Platforms)
+	}
+	if body.Platforms[0].Mode != "polling" {
+		t.Fatalf("mode = %q, want polling", body.Platforms[0].Mode)
 	}
 	if body.Platforms[0].Extra["ilink_bot_id"] != "bot-1" {
 		t.Fatalf("extra = %+v, want ilink_bot_id", body.Platforms[0].Extra)

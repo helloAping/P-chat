@@ -23,6 +23,9 @@ func TestWeChatQRStartUsesOpenClawEndpoint(t *testing.T) {
 			if req.URL.String() != "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3" {
 				t.Fatalf("url = %s, want OpenClaw iLink QR endpoint", req.URL.String())
 			}
+			if req.Header.Get("iLink-App-Id") == "" || req.Header.Get("iLink-App-ClientVersion") == "" {
+				t.Fatalf("missing iLink headers: app_id=%q client_version=%q", req.Header.Get("iLink-App-Id"), req.Header.Get("iLink-App-ClientVersion"))
+			}
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"qrcode":"qr-1","qrcode_img_content":"data:image/png;base64,abc"}}`)),

@@ -498,70 +498,81 @@ func TestDefault_AppliesAllowDenyFilter(t *testing.T) {
 // the filter tests below.
 func newFilterTestRegistry() *tool.Registry {
 	r := tool.NewRegistry()
-	for _, name := range []string{"task", "recall", "read_file", "list_files", "exec_command", "write_file"} {
+	for _, name := range []string{
+		"task", "recall", "read_file", "list_files", "grep", "read_docx", "read_pdf",
+		"exec_command", "write_file", "web_search", "web_fetch", "todo_write", "question",
+	} {
 		r.Register(tool.Tool{Name: name, Description: name}, noopHandler)
 	}
 	return r
 }
 
-// TestFilterSubAgentTools_PerAgentWhitelistBeatsGlobalDeny pins the
-// fix for the "explore spins forever then fails" bug. explore/plan
-// whitelist exec_command for read-only shell use (builtins.go), but the
-// default config denies exec_command globally (config.go). The per-agent
-// whitelist must WIN — otherwise the agent calls a tool it can never
-// use and loops until the sub-agent timeout.
-func TestFilterSubAgentTools_PerAgentWhitelistBeatsGlobalDeny(t *testing.T) {
-	parent := newFilterTestRegistry()
-	globalDenyExec := func(name string) bool {
-		if name == "task" {
-			return false
-		}
-		if name == "exec_command" {
-			return false
-		}
-		return true
+func allowAllExcept(denied ...string) func(string) bool {
+	deny := map[string]bool{}
+	for _, n := range denied {
+		deny[n] = true
 	}
+	return func(name string) bool {
+		return !deny[name]
+	}
+}
 
-	// explore: whitelist = {read_file, list_files, exec_command}
-	sub := filterSubAgentTools(parent, true, []string{"read_file", "list_files", "exec_command"}, globalDenyExec)
+// TestFilterSubAgentTools_WhitelistCannotWidenPastSafeSet pins that
+// putting exec_command on a per-agent whitelist no longer exposes it.
+// The execution-safe predicate is the hard ceiling; whitelist may only
+// narrow.
+func TestFilterSubAgentTools_WhitelistCannotWidenPastSafeSet(t *testing.T) {
+	parent := newFilterTestRegistry()
+	sub := filterSubAgentTools(parent, true, []string{"read_file", "list_files", "grep", "exec_command"}, allowAllExcept("exec_command"))
 	got := strings.Join(sub.Names(), ",")
-	for _, want := range []string{"read_file", "list_files", "exec_command"} {
+	for _, want := range []string{"read_file", "list_files", "grep"} {
 		if !strings.Contains(got, want) {
-			t.Errorf("explore sub-agent tools = %q, missing whitelisted %q (global deny must not veto whitelist)", got, want)
+			t.Errorf("explore sub-agent tools = %q, missing whitelisted %q", got, want)
 		}
 	}
-	if strings.Contains(got, "write_file") {
-		t.Errorf("explore sub-agent tools = %q, must not contain write_file (not on whitelist)", got)
+	if strings.Contains(got, "exec_command") {
+		t.Errorf("explore sub-agent tools = %q, must not contain exec_command even when whitelisted", got)
+	}
+	if strings.Contains(got, "write_file") || strings.Contains(got, "web_search") {
+		t.Errorf("explore sub-agent tools = %q, must not contain tools off the whitelist", got)
 	}
 	if strings.Contains(got, "task") || strings.Contains(got, "recall") {
 		t.Errorf("explore sub-agent tools = %q, must not contain task/recall (hard exclusion)", got)
 	}
 }
 
+// TestFilterSubAgentTools_WhitelistBeatsGlobalDenyForSafeTools covers
+// a custom/research agent that opts into web_search even when the
+// global denylist includes it.
+func TestFilterSubAgentTools_WhitelistBeatsGlobalDenyForSafeTools(t *testing.T) {
+	parent := newFilterTestRegistry()
+	sub := filterSubAgentTools(parent, true, []string{"web_search", "web_fetch"}, allowAllExcept("web_search", "web_fetch"))
+	got := strings.Join(sub.Names(), ",")
+	if !strings.Contains(got, "web_search") || !strings.Contains(got, "web_fetch") {
+		t.Errorf("whitelisted network tools = %q, want web_search and web_fetch despite global deny", got)
+	}
+	if strings.Contains(got, "read_file") {
+		t.Errorf("whitelisted network tools = %q, must not inherit unlisted read_file", got)
+	}
+}
+
 // TestFilterSubAgentTools_GlobalDenyAppliesWhenNoWhitelist covers
-// general-purpose / custom agents with an empty whitelist: the global
-// allow/deny still governs, so the default deny of exec_command keeps
-// blocking it.
+// general-purpose / custom agents with an empty whitelist: they inherit
+// the execution-safe parent set, minus global denials, and never see
+// write/exec/question tools.
 func TestFilterSubAgentTools_GlobalDenyAppliesWhenNoWhitelist(t *testing.T) {
 	parent := newFilterTestRegistry()
-	globalDenyExec := func(name string) bool {
-		if name == "task" {
-			return false
-		}
-		if name == "exec_command" {
-			return false
-		}
-		return true
-	}
-
-	// general-purpose: no per-agent whitelist
-	sub := filterSubAgentTools(parent, true, nil, globalDenyExec)
+	sub := filterSubAgentTools(parent, true, nil, allowAllExcept("exec_command"))
 	got := strings.Join(sub.Names(), ",")
-	if strings.Contains(got, "exec_command") {
-		t.Errorf("general-purpose sub-agent tools = %q, must NOT contain exec_command (global deny still applies when no whitelist)", got)
+	for _, want := range []string{"read_file", "grep", "web_search", "web_fetch", "todo_write"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("general-purpose sub-agent tools = %q, missing %q", got, want)
+		}
 	}
-	if !strings.Contains(got, "read_file") {
-		t.Errorf("general-purpose sub-agent tools = %q, should contain read_file", got)
+	for _, deny := range []string{"exec_command", "write_file", "question", "task", "recall"} {
+		if strings.Contains(got, deny) {
+			t.Errorf("general-purpose sub-agent tools = %q, must NOT contain %q", got, deny)
+		}
 	}
 }
 

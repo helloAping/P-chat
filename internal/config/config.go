@@ -153,13 +153,14 @@ func (m TodoLongRunMode) AllowsUnlimitedRounds(hasActiveTodos bool) bool {
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
 //
-// AllowedTools is a whitelist: when non-empty, only these tool names
-// are passed to the sub-agent. The `task` tool itself is always excluded
-// to prevent recursion. When the list is empty, all non-task tools
-// (excluding any listed in DeniedTools) are passed.
+// Visibility is first capped by the execution-safe set
+// (tool.SubagentMayExpose): local reads, todo_write, web_search, and
+// web_fetch. AllowedTools then further restricts that set; when
+// empty, all execution-safe parent tools except DeniedTools are
+// passed. The `task` family and `recall` are always excluded.
 //
-// DeniedTools is a blacklist applied after AllowedTools. Useful for
-// blocking dangerous tools like `exec_command` while keeping the rest.
+// DeniedTools is a blacklist applied when AllowedTools is empty.
+// Default denies `exec_command` as defense in depth.
 type SubAgentConfig struct {
 	AllowedTools []string `json:"allowed_tools,omitempty"`
 	DeniedTools  []string `json:"denied_tools,omitempty"`
@@ -1011,15 +1012,11 @@ func Default() *Config {
 			ExecDangerousPatterns: defaultDangerousPatterns(),
 		},
 		SubAgent: SubAgentConfig{
-			// Default safety stance: deny exec_command for sub-agents
-			// that inherit the parent's full tool set (general-purpose,
-			// custom agents with no whitelist). Built-in read-only
-			// agents (explore/plan) list exec_command on their own
-			// whitelist for read-only shell use — that per-agent
-			// whitelist takes priority over this global deny (see
-			// subagent.filterSubAgentTools), and the sandbox still
-			// guards dangerous commands at dispatch time. Users can
-			// override by setting allowed_tools explicitly.
+			// Defense in depth: deny exec_command for any sub-agent
+			// that somehow inherits a parent tool the execution-safe
+			// filter missed. Built-in explore/plan no longer opt into
+			// shell; they use grep + file reads. Users can still
+			// narrow further with allowed_tools.
 			DeniedTools: []string{"exec_command"},
 			// Enable result caching by default so repeated sub-agent
 			// tasks (e.g. searching the same file) hit the cache.

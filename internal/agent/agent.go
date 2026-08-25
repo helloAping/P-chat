@@ -384,6 +384,29 @@ func filterImageRecognitionTools(tools []tool.Tool) []tool.Tool {
 	return out
 }
 
+func filterAllowedTools(tools []tool.Tool, allow []string) []tool.Tool {
+	if len(allow) == 0 {
+		return tools
+	}
+	allowed := make(map[string]struct{}, len(allow))
+	for _, name := range allow {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			allowed[name] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	out := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		if _, ok := allowed[t.Name]; ok {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 func (a *Agent) imageRecognitionAvailable() bool {
 	if a == nil || a.cfg == nil || a.llm == nil {
 		return false
@@ -736,6 +759,9 @@ type ChatRequest struct {
 	// activated via slash command. It is appended to the system
 	// prompt so the LLM sees it without cluttering the chat.
 	SkillContext string `json:"skill_context,omitempty"`
+	// AllowedTools 限制本次请求可见和可执行的工具集合。
+	// AllowedTools limits the tool set exposed to and executable by this request.
+	AllowedTools []string `json:"allowed_tools,omitempty"`
 	// PermissionLevel overrides the sandbox confirm behaviour for
 	// this session. Values: "ask", "auto", "full". Default "ask".
 	PermissionLevel string `json:"permission_level,omitempty"`
@@ -1530,6 +1556,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
 		a.loadProjectDynamicTools(req.ProjectRoot)
 		availableTools := a.tools.ListForProject(req.ProjectRoot)
+		availableTools = filterAllowedTools(availableTools, req.AllowedTools)
 		useImageRecognition := req.UseImageRecognition && a.imageRecognitionAvailable()
 		requestHistoryCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
 		historyHasImageRefs := hasImageUploadRefs(req.Messages[:requestHistoryCount])
@@ -2812,6 +2839,17 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						case <-ctx.Done():
 							return
 						}
+					}
+
+					if !toolAvailable(availableTools, tc.Name) {
+						errMsg := fmt.Sprintf("error: tool %q is not allowed for this request", tc.Name)
+						outcomes[i] = toolOutcome{
+							idx:    i,
+							tc:     tc,
+							result: &tool.CallResult{Content: errMsg, IsError: true},
+							err:    fmt.Errorf("tool not allowed"),
+						}
+						return
 					}
 
 					meta, handler, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot)

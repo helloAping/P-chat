@@ -74,6 +74,65 @@ func TestSubagentToolAuthorizationDelegatesExecEvenWhenSandboxAllows(t *testing.
 	}
 }
 
+func TestSubagentToolAuthorizationAllowsGrepAndDocs(t *testing.T) {
+	for _, name := range []string{"grep", "read_docx", "read_pdf"} {
+		result, handled := subagentToolAuthorizationResult(
+			ChatRequest{SubagentType: "explore", ProjectRoot: `D:\projects\app`},
+			nativeToolCall{Name: name, ArgsJSON: `{"path":"docs","pattern":"TODO"}`},
+			tool.Tool{Name: name},
+			&stubSandboxForConfirm{readDecision: tool.SandboxAllow},
+		)
+		if handled || result != nil {
+			t.Fatalf("%s was handled=%v result=%#v, want pass-through", name, handled, result)
+		}
+	}
+}
+
+func TestSubagentToolAuthorizationAllowsWebSearch(t *testing.T) {
+	result, handled := subagentToolAuthorizationResult(
+		ChatRequest{SubagentType: "general-purpose", ProjectRoot: `D:\projects\app`},
+		nativeToolCall{Name: "web_search", ArgsJSON: `{"query":"go context timeout"}`},
+		tool.Tool{Name: "web_search"},
+		nil,
+	)
+	if handled || result != nil {
+		t.Fatalf("web_search was handled=%v result=%#v, want pass-through", handled, result)
+	}
+}
+
+func TestSubagentToolAuthorizationAllowsPublicWebFetch(t *testing.T) {
+	cases := []string{
+		`{"url":"https://example.com/docs"}`,
+		`{"url":"https://example.com/api","method":"POST","body":"{}"}`,
+	}
+	for _, args := range cases {
+		result, handled := subagentToolAuthorizationResult(
+			ChatRequest{SubagentType: "general-purpose", ProjectRoot: `D:\projects\app`},
+			nativeToolCall{Name: "web_fetch", ArgsJSON: args},
+			tool.Tool{Name: "web_fetch"},
+			nil,
+		)
+		if handled || result != nil {
+			t.Fatalf("web_fetch %s was handled=%v result=%#v, want pass-through", args, handled, result)
+		}
+	}
+}
+
+func TestSubagentToolAuthorizationBlocksPrivateWebFetch(t *testing.T) {
+	result, handled := subagentToolAuthorizationResult(
+		ChatRequest{SubagentType: "general-purpose", ProjectRoot: `D:\projects\app`},
+		nativeToolCall{Name: "web_fetch", ArgsJSON: `{"url":"https://127.0.0.1/secret"}`},
+		tool.Tool{Name: "web_fetch"},
+		nil,
+	)
+	if !handled || result == nil {
+		t.Fatal("loopback web_fetch was not intercepted")
+	}
+	if result.Status != tool.CallStatusBlocked || !result.IsError {
+		t.Fatalf("result = %#v, want blocked error", result)
+	}
+}
+
 func TestChatWithToolsSubagentDoesNotExecuteWriteWithFullPermission(t *testing.T) {
 	var requests atomic.Int32
 	writeArgs, err := json.Marshal(map[string]string{"path": "owned.txt", "content": "nope"})

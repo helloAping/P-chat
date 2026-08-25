@@ -47,8 +47,9 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 | `exec_command` | 执行 shell 命令 | registry.go:201, 303 |
 | `read_file` | 读取文本文件 | registry.go:211, 390 |
 | `write_file` | 写入/创建文件 | registry.go:223, 440 |
-| `list_files` | 列出目录 | registry.go:248, 467 |
-| `read_docx` | 读取 .docx | registry.go:232, 540 |
+| `list_files` | 列出目录 | registry.go |
+| `grep` | 在项目根目录精确搜索关键词 | grep.go |
+| `read_docx` | 读取 .docx | registry.go |
 | `read_pdf` | 读取 .pdf | registry.go:240, 555 |
 | `web_fetch` | HTTP 抓取 URL（带 SSRF 防护） | registry.go:275, 749 |
 | `web_search` | 公开网络搜索（snippet+url，可插拔 provider） | websearch.go |

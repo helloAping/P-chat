@@ -14,7 +14,7 @@ IM 桥接模块把 P-Chat 暴露为多平台聊天机器人。**核心形态**�
 - 跨平台 session 续传（同一用户在 TG / 飞书共享 principal session）
 - per-channel persona（不同平台不同风格 / 工具集 / 模型）
 
-**当前实现状态**：🚧 P-IM-1 后端骨架已部分落地：Gateway / adapter 抽象、IMConfig、管理 API、飞书 webhook 文本入站、飞书文本出站 renderer、OutboundDispatcher 与长文本切分已具备；下一步优先做 P-IM-1.5 GUI 设置 MVP，再补入站到 Agent 主流程。完整方案见 [`docs/plans/im-bridge-plan.md`](../../docs/plans/im-bridge-plan.md)。
+**当前实现状态**：🚧 P-IM-1 后端骨架已部分落地：Gateway / adapter 抽象、IMConfig、管理 API、飞书 webhook 文本入站、飞书文本出站 renderer、OutboundDispatcher 与长文本切分已具备；入站消息已通过独立 `im.PlanInbound()` 路由层完成平台鉴权、mention、session、persona、工具白名单解析后进入 Agent 主流程。下一步优先做 P-IM-1.5 GUI 设置 MVP，并补飞书 / QQ / 微信 websocket adapter。完整方案见 [`docs/plans/im-bridge-plan.md`](../../docs/plans/im-bridge-plan.md)。
 
 ## 用户面向说明
 
@@ -29,6 +29,7 @@ IM 桥接模块把 P-Chat 暴露为多平台聊天机器人。**核心形态**�
 | `gateway.go` | Gateway 主循环、Bus、生命周期 |
 | `adapter.go` | `Adapter` / `OutboundRenderer` 接口 |
 | `event.go` | `IMEvent` / `IMOutChunk` / `ChatRef` / `SenderRef` |
+| `routing.go` | IM 入站路由计划：平台鉴权、sender allowlist、mention gate、persona、工具白名单 |
 | `session.go` | IM 元组 → session key 解析 + principal 聚合 |
 | `persona.go` | per-channel persona 匹配 |
 | `ratelimit.go` | 三级限流（platform / chat / sender）|

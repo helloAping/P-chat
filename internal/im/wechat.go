@@ -24,6 +24,8 @@ import (
 
 const (
 	defaultWeChatAPIBase       = "https://ilinkai.weixin.qq.com"
+	wechatDefaultAppID         = "wx95125f84d7df0295"
+	wechatDefaultClientVersion = "1"
 	wechatChannelVersion       = "2.0.0"
 	wechatBotAgent             = "P-Chat/1.0"
 	wechatPollInterval         = 2 * time.Second
@@ -96,6 +98,9 @@ func RegisterConfiguredWeChatAdapters(gateway *Gateway, cfg config.IMConfig) {
 // RegisterWeChatAdapter wires one WeChat platform into the Gateway.
 func RegisterWeChatAdapter(gateway *Gateway, platform config.IMPlatformConfig) {
 	if gateway == nil || platform.Type != "wechat" || !platform.Enabled {
+		return
+	}
+	if !wechatModeSupported(platform.Mode) {
 		return
 	}
 	if platform.Variant == "" {
@@ -383,6 +388,8 @@ func (a *WeChatAdapter) postJSON(ctx context.Context, path string, body any, out
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("AuthorizationType", wechatAuthorizationType)
 	req.Header.Set("Authorization", "Bearer "+a.cfg.Token)
+	req.Header.Set("iLink-App-Id", a.appID())
+	req.Header.Set("iLink-App-ClientVersion", a.clientVersion())
 	req.Header.Set("X-WECHAT-UIN", randomWeChatUIN())
 	resp, err := a.client.Do(req)
 	if err != nil {
@@ -413,6 +420,32 @@ func (a *WeChatAdapter) baseURL() string {
 		return base
 	}
 	return defaultWeChatAPIBase
+}
+
+func (a *WeChatAdapter) appID() string {
+	if v := stringFromExtra(a.cfg.Extra, "app_id", "ilink_app_id"); v != "" {
+		return v
+	}
+	if a.cfg.AppID != "" {
+		return a.cfg.AppID
+	}
+	return wechatDefaultAppID
+}
+
+func (a *WeChatAdapter) clientVersion() string {
+	if v := stringFromExtra(a.cfg.Extra, "client_version", "ilink_client_version"); v != "" {
+		return v
+	}
+	return wechatDefaultClientVersion
+}
+
+func wechatModeSupported(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "polling", "long_polling", "long-polling":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *WeChatAdapter) currentCursor() string {
@@ -548,6 +581,18 @@ func (r *wechatUpdatesResponse) normalize() {
 	}
 	if len(r.Messages) == 0 {
 		r.Messages = rawMessagesFromAny(r.Data["messages"])
+	}
+	if len(r.Messages) == 0 {
+		r.Messages = rawMessagesFromAny(r.Data["msg_list"])
+	}
+	if len(r.Messages) == 0 {
+		r.Messages = rawMessagesFromAny(r.Data["message_list"])
+	}
+	if len(r.Messages) == 0 {
+		r.Messages = rawMessagesFromAny(r.Data["updates"])
+	}
+	if len(r.Messages) == 0 {
+		r.Messages = rawMessagesFromAny(r.Data["list"])
 	}
 }
 

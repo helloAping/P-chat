@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,6 +126,51 @@ func TestGrepWorkingDir_RelativePath(t *testing.T) {
 	results := grepWorkingDir(grepCtx(root), filepath.Join(root, "sub", "nested"), root, "content", false, 10)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+}
+
+func TestGrepHandler_RejectsPathOutsideRoot(t *testing.T) {
+	root := buildGrepWorkspace(t)
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "secret.md"), []byte("secret-token"), 0o644)
+
+	r := NewRegistry()
+	RegisterGrep(r, nil)
+	_, h, ok := r.Lookup("grep")
+	if !ok {
+		t.Fatal("grep not registered")
+	}
+	args, err := json.Marshal(map[string]any{
+		"pattern": "secret-token",
+		"path":    outside,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := h(grepCtx(root), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("want error for outside path, got %#v", res)
+	}
+	if strings.Contains(res.Content, "secret-token") {
+		t.Fatal("outside file content leaked")
+	}
+
+	relArgs, err := json.Marshal(map[string]any{
+		"pattern": "secret-token",
+		"path":    "..",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err = h(grepCtx(root), relArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil || !res.IsError {
+		t.Fatalf("want error for relative escape, got %#v", res)
 	}
 }
 

@@ -1543,17 +1543,17 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 	}
 	defer cancel()
 
-	// Build a sub-agent's tool registry. Three layers of filter
+	// Build a sub-agent's tool registry. Four layers of filter
 	// (in priority order):
 	//   1. Hard exclusions: task/task_status/task_wait/task_cancel, recall
 	//      (recursion / coordination).
-	//   2. Per-agent whitelist (agentInfo.Tools). When non-empty, ONLY
-	//      those tools are exposed (minus the hard exclusions). A tool
-	//      on the whitelist is explicitly selected by the agent
-	//      author and bypasses the global allow/deny. This affects
-	//      visibility only; the child tool dispatch still runs the
-	//      parent-authority gate before execution.
-	//   3. Global config allow/deny (`subagent.allowed_tools` /
+	//   2. Execution-safe set (tool.SubagentMayExpose): read-only local
+	//      tools, todo_write, web_search, web_fetch. A whitelist cannot
+	//      widen into write/exec/interactive/browser/MCP tools.
+	//   3. Per-agent whitelist (agentInfo.Tools). When non-empty, ONLY
+	//      those tools are exposed (minus layers 1-2). A tool on the
+	//      whitelist still bypasses the global allow/deny.
+	//   4. Global config allow/deny (`subagent.allowed_tools` /
 	//      `subagent.denied_tools` in ~/.p-chat/config.json). Applies
 	//      only to tools NOT on a per-agent whitelist (general-purpose,
 	//      custom agents with an empty whitelist).
@@ -1911,19 +1911,18 @@ func redactPhantomErrorsServer(s string) string {
 }
 
 // filterSubAgentTools builds the sub-agent's tool registry from the
-// parent registry. Three layers, in priority order:
+// parent registry. Four layers, in priority order:
 //
 //  1. Hard exclusions: task/task_status/task_wait/task_cancel, recall
 //     (recursion / coordination).
-//  2. Per-agent whitelist (agentWhitelist). When non-empty, ONLY
-//     those tools are exposed (minus the hard exclusions). A tool on
-//     the whitelist is explicitly selected by the agent author and
-//     BYPASSES the global allow/deny. This affects visibility only;
-//     the child tool dispatch still runs the parent-authority gate
-//     before execution.
-//  3. Global config allow/deny (parentAllowed). Applies only to tools
+//  2. Execution-safe set (tool.SubagentMayExpose). A per-agent
+//     whitelist cannot widen into write/exec/interactive tools.
+//  3. Per-agent whitelist (agentWhitelist). When non-empty, ONLY
+//     those tools are exposed (minus layers 1-2). A tool on the
+//     whitelist BYPASSES the global allow/deny.
+//  4. Global config allow/deny (parentAllowed). Applies only to tools
 //     NOT on a per-agent whitelist (general-purpose inherits the
-//     parent set, custom agents with an empty whitelist).
+//     parent's filtered set, custom agents with an empty whitelist).
 //
 // Extracted from Default.Run so the priority rules are unit-testable
 // without a full agent + LLM stack.
@@ -1938,6 +1937,9 @@ func filterSubAgentTools(
 		// Sub-agents can't spawn/manage sub-agents or call recall
 		// themselves; these coordination tools stay at the top level.
 		if name == "task" || name == "task_status" || name == "task_wait" || name == "task_cancel" || name == "recall" {
+			continue
+		}
+		if !tool.SubagentMayExpose(name) {
 			continue
 		}
 		// Per-agent whitelist takes priority over the global

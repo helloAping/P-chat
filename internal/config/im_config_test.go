@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/paths"
 )
 
 func TestDefaultIMConfigIsDisabledAndNormalized(t *testing.T) {
@@ -72,7 +74,10 @@ func TestUpdateIMConfigPatchPreservesDefaults(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
 	t.Setenv("HOME", dir)
+	t.Setenv("PCHAT_DATA_HOME", "")
 	pchatDir := filepath.Join(dir, ".p-chat")
+	paths.SetHomeForTest(pchatDir)
+	t.Cleanup(func() { paths.SetHomeForTest("") })
 	if err := os.MkdirAll(pchatDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

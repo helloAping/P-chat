@@ -119,7 +119,11 @@ sandbox:
 #   to the sub-agent (in addition to excluding `task` itself).
 # - `denied_tools`: blacklist; when `allowed_tools` is empty, these are
 #   excluded from the parent's tool set when building the sub-agent.
-#   Default: `["exec_command"]` for safety.
+#   Default: `["exec_command"]` (defense in depth; the execution-safe
+#   filter already hides write/exec/interactive tools).
+#   explore/plan use grep + file reads, not shell.
+#   general-purpose may use web_search and web_fetch when the
+#   parent has those tools registered.
 # - `timeout`: optional per-sub-agent wall-clock cap. Default is disabled
 #   (empty/0). Prefer hook-based cancellation: user stop, parent turn
 #   cancellation, LLM stream stall detection, per-tool timeouts,
@@ -131,11 +135,11 @@ subagent:
     - "exec_command"
   timeout: ""
   cache_ttl: "5m"
-  # Example: only allow safe tools (whitelist mode)
+  # Example: only allow local read tools (whitelist mode)
   # allowed_tools:
   #   - "read_file"
-  #   - "write_file"
   #   - "list_files"
+  #   - "grep"
 
 # MCP (Model Context Protocol) tools. Disabled by default.
 # Stdio commands run directly without a shell, so use an absolute executable
