@@ -70,6 +70,7 @@ if req.AutoContinue && autoContinueCount < MaxAutoContinue {
 要点：
 - `MaxAutoContinue = 3`：多了 LLM 学会偷懒，少了不够用
 - per-session 开关：`ChatRequest.AutoContinue`，CLI 用 `/auto-continue on|off` 切换
+- 注入的是给 LLM 的内部 user-style nudge，不代表用户真的发送了一条新消息；若该类 nudge 因服务端续跑路径入库，必须带 `Meta{"origin":"auto_resume","ui_hidden":true}`，历史接口不得把它渲染成用户气泡
 - 配套 P1-1（Plan B）在系统 prompt 加"完成契约"规则，让 LLM 习惯性地把 todo 列表维护到最终状态再退出
 - 配套 P2-1：注入 same-tool-err-limit 时同时重置 stuck-streak，避免互相打架
 

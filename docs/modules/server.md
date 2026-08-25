@@ -14,6 +14,8 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 |---|---|---|
 | `server.go` | Gin 引擎构建、路由注册、CORS 中间件 | `New()`, `NewWithStaticFS()`, `corsMiddleware()` |
 | `handler.go` | 所有 API handler 实现（~2130行） | `SendMessage()`, `ListMessages()`, `chunkToEvent()` 等 |
+| `messages.go` | 消息发送 / 重答 / SSE 写循环 / 自动续跑控制 | `SendMessage()`, `respondSSE()` |
+| `message_helpers.go` | 历史消息响应整形、parts 解码、内部行过滤、附件合并 | `ListMessages()`, `buildMessageResponse()` |
 | `handler_test.go` | Handler 单元测试 | |
 | `provider_api.go` | Provider/Model CRUD + 上游模型查询 | |
 | `config_api.go` | 全局配置接口 | |
@@ -97,6 +99,15 @@ Chunk 字段检查顺序（优先级从高到低）:
 - 消息通过 `memory.Store.AddChatMessageTo()` 持久化
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
+- `buildMessageResponse()` 会过滤不应渲染的内部行：tool_call/tool_result、媒体附件独立行、`metadata.ui_hidden=true` 的消息，以及旧库中以 `⏱ 上一回合因` / `⚠ 系统检测：你刚才的回复没有调用任何工具` 开头的自动续跑 user-style nudge。内部续跑提示只能影响下一次 LLM 输入，不应在 GUI 里表现成用户重复发送消息。
+
+### 6. 回合超时自动重试
+
+`limits.max_turn_retries` 控制超时后的服务端自动续跑。每次续跑会重新加载已持久化历史，
+追加一条给 LLM 的 "继续" user-style nudge，并在同一个 HTTP 请求 / SSE 流内重新运行 agent。
+这条 nudge 入库时必须带 `Meta{"origin":"auto_resume","ui_hidden":true}`。
+`ListMessages` / `SnapshotRecovery` 通过 `buildMessageResponse()` 过滤该行；用户只看到
+`phase` / `session_status` 表示系统自动接续，不会看到一条伪造的用户气泡。
 
 ## 修改指南
 

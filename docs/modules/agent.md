@@ -40,12 +40,21 @@ for round := 1; maxRounds==0 || round<=maxRounds; round++ {
 
 | 条件 | 阶段 | 行为 |
 |---|---|---|
-| `len(toolCalls) == 0` | `done` | LLM 自然完成 |
+| `len(toolCalls) == 0` + todo 全 done | `done` | LLM 自然完成 |
+| `len(toolCalls) == 0` + todo 未完成 + `autoContinueCount < 3` | `auto-continue` | 注入内部 user-style nudge，循环续 |
+| `len(toolCalls) == 0` + todo 未完成 + `autoContinueCount >= 3` | `done` | 兜底退出，不再续 |
 | `meaningful > 80` | `context_warn` | 仅警告 |
 | `meaningful > 120` | `context_warn` | 自动停止，建议 /compress |
 | `ctx.Err() != nil` | (错误路径) | 用户取消 |
 | `maxRounds` 达到 | `limit` | 强制停止 |
 | `stuckStreak >= 3` | `stuck` | 连续 3 轮相同失败工具调用 |
+
+#### P0-3 自动续 LLM 守卫
+
+当 LLM 没有继续调用工具，但当前会话 todo 仍有未完成项时，`ChatWithTools()`
+会追加一条给 LLM 看的内部 user-style nudge 并进入下一轮，最多 3 次。
+这条 nudge 不代表用户真的发送了新消息；若服务端续跑路径把类似 nudge 持久化，
+必须带 `Meta{"origin":"auto_resume","ui_hidden":true}`，历史接口不得把它渲染成用户气泡。
 
 ### 2. 工具执行的并行派发 (`agent.go:1185-1471`)
 
