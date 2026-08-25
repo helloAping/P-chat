@@ -12,7 +12,7 @@
 # read and edit, and the Taskfile stays a thin glue layer.
 #
 # Usage:
-#   powershell -File wails-build.ps1 -Platform windows/amd64 -Ldflags "-X ...Version=... -X ...GitCommit=..."
+#   powershell -File wails-build.ps1 -Platform win -Ldflags "-X ...Version=... -X ...GitCommit=..."
 #
 # Exit code: propagates the wails build's exit code (0 on
 # success, non-zero on failure). If wails is not found, prints
@@ -20,7 +20,9 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$Platform,
+    [Parameter(Mandatory = $true)]
+    [Alias('PlatformName', 'Name')]
+    [string]$Platform,
     [Parameter(Mandatory = $true)][string]$Ldflags
 )
 
@@ -34,10 +36,13 @@ if (-not $wailsDir) {
 }
 
 # Prepend the discovered dir to $PATH so the bare `wails`
-# call below resolves correctly. This mutates the *current
-# process*'s PATH, which is what the spawned `wails build`
-# inherits on Windows.
-$env:PATH = "$wailsDir;$env:PATH"
+# call below resolves correctly. This mutates the current process PATH.
+$env:PATH = "$wailsDir$([System.IO.Path]::PathSeparator)$env:PATH"
+
+$wailsPlatform = & "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format wails
+if (-not $wailsPlatform) {
+    exit 1
+}
 
 # Split the ldflags string on `-X ` boundaries so each `-X`
 # flag is its own positional argument. The string is built
@@ -72,5 +77,5 @@ if ($ldFlagArgs.Count -eq 0) {
     $ldFlagArgs = @($Ldflags)
 }
 
-& wails build -platform $Platform -ldflags $ldFlagArgs -s
+& wails build -platform $wailsPlatform -ldflags $ldFlagArgs -s
 exit $LASTEXITCODE

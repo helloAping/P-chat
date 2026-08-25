@@ -71,6 +71,20 @@ tasks:
       - task: build:gui:binary
     silent: false
 
+  build:gui:platform:
+    desc: 编译指定平台桌面端。用法：task build:gui:platform PLATFORM=win|linux|mac
+    vars:
+      PLATFORM: '{{default "win" .PLATFORM}}'
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -Task "build:gui:{{.PLATFORM}}" -Platform "{{.PLATFORM}}"
+    silent: false
+
+  build:gui:win:
+    desc: 编译 Windows 桌面端别名
+    cmds:
+      - task: build:gui
+    silent: false
+
   build:gui:binary:
     internal: true
     dir: cmd\pchat-gui
@@ -82,7 +96,7 @@ tasks:
       # with embedded ": " characters broke YAML's plain-
       # scalar parser (see scripts/wails-build.ps1 for the
       # full rationale).
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "windows/amd64" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "win" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -100,7 +114,7 @@ tasks:
     internal: true
     dir: cmd\pchat-gui
     cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "linux/amd64" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "linux" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -113,6 +127,12 @@ tasks:
       - task: build:gui:macos:binary
     silent: false
 
+  build:gui:mac:
+    desc: 编译 macOS 桌面端别名
+    cmds:
+      - task: build:gui:macos
+    silent: false
+
   build:gui:macos:binary:
     internal: true
     dir: cmd\pchat-gui
@@ -122,7 +142,7 @@ tasks:
       # hosts so `build:all` doesn't surface a cryptic linker error
       # when run from Windows/Linux CI.
       - cmd: powershell -NoProfile -Command "if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { Write-Host '[skip] pchat-gui macOS build requires macOS host. Run this on a Mac or in a macOS CI runner.' -ForegroundColor Yellow; exit 0 }"
-      - cmd: wails build -platform darwin/universal -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -s
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "mac" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -219,12 +239,12 @@ tasks:
       # hosts, or on Windows when the Wails Linux cross-compile toolchain
       # isn't installed (CGO + GTK + webkit2gtk-4.0). Run on a Linux
       # host or a CI runner with the deps for a real build.
-      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -Task "package:gui:linux:prepared" -Platform "linux/amd64"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -Task "package:gui:linux:prepared" -Platform "linux"
       # macOS GUI package: only runs on macOS hosts (Wails v2 cannot
       # cross-compile to darwin from Windows/Linux). Wrapper exits 0
       # with a skip message on any other OS so the aggregate task
       # keeps going.
-      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -RequiredOS darwin -Task "package:gui:macos:prepared" -Platform "darwin/universal"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -RequiredOS mac -Task "package:gui:macos:prepared" -Platform "mac"
 
   package:gui:
     desc: 把桌面端打包到 bin\（含前端 SPA + pchat-server.exe + install/uninstall 脚本）
@@ -232,6 +252,20 @@ tasks:
       - task: build:frontend
       - task: build:windows:artifacts
       - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-gui.ps1
+    silent: false
+
+  package:gui:platform:
+    desc: 打包指定平台桌面端。用法：task package:gui:platform PLATFORM=win|linux|mac
+    vars:
+      PLATFORM: '{{default "win" .PLATFORM}}'
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -Task "package:gui:{{.PLATFORM}}" -Platform "{{.PLATFORM}}"
+    silent: false
+
+  package:gui:win:
+    desc: 打包 Windows 桌面端别名
+    cmds:
+      - task: package:gui
     silent: false
 
   package:gui:linux:
@@ -268,6 +302,12 @@ tasks:
     cmds:
       - task: build:frontend
       - task: package:gui:macos:prepared
+    silent: false
+
+  package:gui:mac:
+    desc: 打包 macOS 桌面端别名
+    cmds:
+      - task: package:gui:macos
     silent: false
 
   # build:all 在共享前端构建后调用的隐藏入口。Hidden entry point used after the shared SPA build.

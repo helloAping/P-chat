@@ -2,7 +2,7 @@
 //
 // Architecture:
 //   - This is a Wails v2 app that opens a WebView2 window.
-//   - On startup, it spawns pchat-server.exe as a child process on a
+//   - On startup, it spawns pchat-server as a child process on a
 //     stable preferred port on 127.0.0.1, falling back only if needed.
 //   - The webview serves ALL content from a reverse proxy: when the user
 //     navigates to http://wails.localhost/..., we forward the request to
@@ -803,7 +803,7 @@ func (t *dialFallbackTransport) RoundTrip(req *http.Request) (*http.Response, er
 	}, nil
 }
 
-// startup is called when the app starts. We spawn pchat-server.exe in a
+// startup is called when the app starts. We spawn pchat-server in a
 // background goroutine and install the reverse proxy once it's healthy,
 // at which point we also show the window.
 func (a *App) startup(ctx context.Context) {
@@ -1005,7 +1005,7 @@ func (a *App) quitApp() {
 
 // ---------- server spawning ----------
 
-// spawnAndWatch locates pchat-server.exe, picks a preferred port, starts it
+// spawnAndWatch locates pchat-server, picks a preferred port, starts it
 // as a child process, installs the reverse proxy, waits for it to be
 // healthy, and finally shows the window.
 func (a *App) spawnAndWatch() {
@@ -1123,20 +1123,42 @@ func (a *App) spawnAndWatch() {
 	a.showMainWindow()
 }
 
-// findServerBinary searches common locations for pchat-server.exe, in order:
-//  1. The directory of the running pchat-gui.exe
+// serverBinaryName 返回当前平台的 pchat-server 文件名。
+// serverBinaryName returns the platform-native pchat-server filename.
+func serverBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "pchat-server.exe"
+	}
+	return "pchat-server"
+}
+
+// serverBinaryCandidates 返回从 GUI 可执行文件目录推导出的后端候选路径。
+// serverBinaryCandidates returns backend candidates derived from the GUI executable dir.
+func serverBinaryCandidates(dir string) []string {
+	name := serverBinaryName()
+	candidates := []string{
+		filepath.Join(dir, name),
+		filepath.Join(dir, "..", name),
+		filepath.Join(dir, "..", "..", name),
+	}
+	if runtime.GOOS == "darwin" {
+		// macOS .app: GUI 在 Contents/MacOS，附带二进制放在 Resources。
+		// macOS .app: pchat-gui lives in Contents/MacOS; side binaries live in Resources.
+		candidates = append([]string{filepath.Join(dir, "..", "Resources", name)}, candidates...)
+	}
+	return candidates
+}
+
+// findServerBinary 按平台查找 GUI 要拉起的后端二进制。
+// findServerBinary searches common locations for the platform server binary, in order:
+//  1. The directory of the running pchat-gui binary
 //  2. The repository `bin/` directory (from CWD — covers `wails dev`)
 //  3. PATH
 func findServerBinary() (string, error) {
 	// Resolve from executable directory first.
 	if exe, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exe)
-		candidates := []string{
-			filepath.Join(dir, "pchat-server.exe"),
-			filepath.Join(dir, "..", "pchat-server.exe"),
-			filepath.Join(dir, "..", "..", "pchat-server.exe"),
-		}
-		for _, c := range candidates {
+		for _, c := range serverBinaryCandidates(dir) {
 			if _, statErr := os.Stat(c); statErr == nil {
 				abs, _ := filepath.Abs(c)
 				log.Printf("findServerBinary: found at %s (exe=%s)", abs, exe)
@@ -1149,12 +1171,12 @@ func findServerBinary() (string, error) {
 	// the exe-relative candidates above miss the project's bin/.
 	// Fall back to CWD-relative search.
 	if cwd, err := os.Getwd(); err == nil {
-		// Walk up to 5 levels looking for bin/pchat-server.exe
+		// Walk up to 5 levels looking for bin/<server binary>
 		// to cover wails dev (CWD=cmd/pchat-gui) and running
 		// from anywhere in the project tree.
 		d := cwd
 		for i := 0; i < 5; i++ {
-			cand := filepath.Join(d, "bin", "pchat-server.exe")
+			cand := filepath.Join(d, "bin", serverBinaryName())
 			if _, statErr := os.Stat(cand); statErr == nil {
 				abs, _ := filepath.Abs(cand)
 				log.Printf("findServerBinary: found at %s (cwd=%s, levels=%d)", abs, cwd, i)
@@ -1168,11 +1190,12 @@ func findServerBinary() (string, error) {
 		}
 	}
 
-	if path, err := exec.LookPath("pchat-server.exe"); err == nil {
+	name := serverBinaryName()
+	if path, err := exec.LookPath(name); err == nil {
 		log.Printf("findServerBinary: found in PATH: %s", path)
 		return path, nil
 	}
-	return "", fmt.Errorf("pchat-server.exe not found next to pchat-gui.exe and not in PATH")
+	return "", fmt.Errorf("%s not found next to pchat-gui and not in PATH", name)
 }
 
 const (

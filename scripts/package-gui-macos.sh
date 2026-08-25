@@ -16,8 +16,8 @@
 #
 # Output:
 #   build/bin/pchat-gui-macos/
-#     ├── pchat-gui.app/
-#     ├── pchat-server
+#     ├── pchat-gui.app/            (contains Contents/Resources/pchat-server)
+#     ├── pchat-server              (CLI convenience copy)
 #     ├── pchat                       (optional, if cross-compiled)
 #     ├── web/                        (SPA — also embedded in pchat-server)
 #     ├── browser-extension.zip
@@ -53,6 +53,12 @@ mkdir -p "$BIN_DIR"
 cp -R "$SRC_APP" "$BIN_DIR/"
 echo "[package-gui-macos] copied pchat-gui.app"
 
+APP_RESOURCES="$BIN_DIR/pchat-gui.app/Contents/Resources"
+mkdir -p "$APP_RESOURCES"
+cp "$ROOT/bin/pchat-server-darwin-amd64" "$APP_RESOURCES/pchat-server"
+chmod +x "$APP_RESOURCES/pchat-server"
+echo "[package-gui-macos] embedded pchat-server into app Resources"
+
 # --- server binary ---
 cp "$ROOT/bin/pchat-server-darwin-amd64" "$BIN_DIR/pchat-server"
 chmod +x "$BIN_DIR/pchat-server"
@@ -76,6 +82,7 @@ fi
 # --- browser extension ---
 if [[ -f "$ROOT/cmd/pchat-server/browser-extension.zip" ]]; then
     cp "$ROOT/cmd/pchat-server/browser-extension.zip" "$BIN_DIR/browser-extension.zip"
+    cp "$ROOT/cmd/pchat-server/browser-extension.zip" "$APP_RESOURCES/browser-extension.zip"
     echo "[package-gui-macos] copied browser-extension.zip"
 fi
 

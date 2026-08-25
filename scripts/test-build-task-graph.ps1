@@ -27,8 +27,12 @@ $expectedCounts = [ordered]@{
     'build:all'                    = 1
     'build'                        = 1
     'build:gui'                    = 1
+    'build:gui:win'                = 1
+    'build:gui:mac'                = 1
     'build:setup'                  = 1
     'package:gui'                  = 1
+    'package:gui:win'              = 1
+    'package:gui:mac'              = 1
     'package:gui:linux'            = 1
     'package:gui:linux:prepared'   = 0
     'package:gui:macos'            = 1
@@ -52,4 +56,12 @@ foreach ($taskName in $preparedPlatformTasks) {
     }
 
     Write-Host "[test-build-task-graph] build:all invokes $taskName" -ForegroundColor Green
+}
+
+foreach ($platformName in 'linux', 'mac') {
+    if (-not $buildAllOutput.Contains("-Platform `"$platformName`"")) {
+        throw "Expected 'build:all' to pass platform name '$platformName'."
+    }
+
+    Write-Host "[test-build-task-graph] build:all passes platform name $platformName" -ForegroundColor Green
 }

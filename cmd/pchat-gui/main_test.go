@@ -16,11 +16,12 @@ import (
 
 func TestFindServerBinary_FindsSibling(t *testing.T) {
 	dir := t.TempDir()
-	// Create a fake pchat-server.exe beside a fake "self" path.
+	// Create a fake platform server binary beside a fake "self" path.
 	// findServerBinary() uses os.Executable() so we can only test the
 	// "PATH" branch deterministically; the sibling branch is exercised
 	// by the smoke test that actually launches the real binary.
-	fake := filepath.Join(dir, "pchat-server.exe")
+	name := serverBinaryName()
+	fake := filepath.Join(dir, name)
 	if err := os.WriteFile(fake, []byte("MZ"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -31,14 +32,46 @@ func TestFindServerBinary_FindsSibling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("findServerBinary: %v", err)
 	}
-	if !strings.EqualFold(filepath.Base(got), "pchat-server.exe") {
-		t.Fatalf("expected pchat-server.exe, got %q", got)
+	if !strings.EqualFold(filepath.Base(got), name) {
+		t.Fatalf("expected %s, got %q", name, got)
+	}
+}
+
+func TestServerBinaryName_MatchesPlatform(t *testing.T) {
+	got := serverBinaryName()
+	if runtime.GOOS == "windows" {
+		if got != "pchat-server.exe" {
+			t.Fatalf("serverBinaryName() = %q, want pchat-server.exe", got)
+		}
+		return
+	}
+	if got != "pchat-server" {
+		t.Fatalf("serverBinaryName() = %q, want pchat-server", got)
+	}
+}
+
+func TestServerBinaryCandidates_IncludesMacResourcesWhenDarwin(t *testing.T) {
+	dir := filepath.Join("P-Chat.app", "Contents", "MacOS")
+	candidates := serverBinaryCandidates(dir)
+	resources := filepath.Join("P-Chat.app", "Contents", "Resources", serverBinaryName())
+	found := false
+	for _, c := range candidates {
+		if c == resources {
+			found = true
+			break
+		}
+	}
+	if runtime.GOOS == "darwin" && !found {
+		t.Fatalf("darwin candidates should include %q: %#v", resources, candidates)
+	}
+	if runtime.GOOS != "darwin" && found {
+		t.Fatalf("non-darwin candidates should not include macOS Resources path: %#v", candidates)
 	}
 }
 
 func TestFindServerBinary_NotFound(t *testing.T) {
 	// findServerBinary walks CWD up to 5 levels looking for
-	// bin/pchat-server.exe (dev-mode fallback). If the test binary
+	// bin/<server binary> (dev-mode fallback). If the test binary
 	// runs from inside the project tree, the walk will find it and
 	// defeat the "not found" probe. Chdir to a temp dir so the walk
 	// has no chance of finding a matching file.

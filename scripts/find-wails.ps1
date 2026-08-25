@@ -48,13 +48,15 @@ try {
 
 # 2. Candidate directories, in priority order. Each entry
 #    is a fully-qualified path to a directory that should
-#    contain wails.exe.
+#    contain the wails executable.
+$pathSep = [System.IO.Path]::DirectorySeparatorChar
+$wailsExe = if ($IsWindows -or $env:OS -eq 'Windows_NT') { 'wails.exe' } else { 'wails' }
 $candidates = @(
     # `go env GOPATH` may not be available (e.g. when the
     # task runner uses a different Go install). Wrap in
     # try/catch so the script still tries the other
     # candidates.
-    (try { (go env GOPATH 2>$null) + '\bin' } catch { $null })
+    (try { (go env GOPATH 2>$null) + "${pathSep}bin" } catch { $null })
     # 3. %GOBIN% if explicitly set
     $env:GOBIN
     # 4. %USERPROFILE%\go\bin (default GOPATH for the
@@ -74,7 +76,7 @@ $candidates = @(
 ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
 
 foreach ($dir in $candidates) {
-    $exe = Join-Path $dir 'wails.exe'
+    $exe = Join-Path $dir $wailsExe
     if (Test-Path $exe) {
         Write-Output $dir
         exit 0
