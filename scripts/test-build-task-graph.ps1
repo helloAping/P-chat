@@ -29,6 +29,9 @@ $expectedCounts = [ordered]@{
     'build:gui'                    = 1
     'build:gui:win'                = 1
     'build:gui:mac'                = 1
+    'build:win'                    = 1
+    'build:linux'                  = 1
+    'build:mac'                    = 1
     'build:setup'                  = 1
     'package:gui'                  = 1
     'package:gui:win'              = 1
@@ -49,7 +52,7 @@ foreach ($entry in $expectedCounts.GetEnumerator()) {
 }
 
 $buildAllOutput = @(Invoke-TaskDryRun -TaskName 'build:all') -join [Environment]::NewLine
-$preparedPlatformTasks = 'package:gui:linux:prepared', 'package:gui:macos:prepared'
+$preparedPlatformTasks = 'build:gui:linux:binary', 'build:gui:macos:binary'
 foreach ($taskName in $preparedPlatformTasks) {
     if (-not $buildAllOutput.Contains("-Task `"$taskName`"")) {
         throw "Expected 'build:all' to invoke prepared platform task '$taskName'."
@@ -64,4 +67,12 @@ foreach ($platformName in 'linux', 'mac') {
     }
 
     Write-Host "[test-build-task-graph] build:all passes platform name $platformName" -ForegroundColor Green
+}
+
+foreach ($platformName in 'linux', 'mac') {
+    if (-not $buildAllOutput.Contains("-File `"scripts/package-platform-archive.ps1`" -Platform `"$platformName`"")) {
+        throw "Expected 'build:all' to archive platform '$platformName'."
+    }
+
+    Write-Host "[test-build-task-graph] build:all archives platform $platformName" -ForegroundColor Green
 }
