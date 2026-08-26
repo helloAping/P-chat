@@ -63,7 +63,7 @@ func MakeExecHandler(spec Spec) tool.ToolHandler {
 		// /dev/zero` doesn't OOM the chat. The LLM doesn't
 		// need 100 MB of binary garbage in its context.
 		const maxOut = 32 * 1024
-		content := out.String()
+		content := tool.DecodeCommandOutput(out.Bytes())
 		if len(content) > maxOut {
 			content = content[:maxOut] + "\n... (truncated)"
 		}

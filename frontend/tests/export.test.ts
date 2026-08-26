@@ -14,23 +14,23 @@ import {
 // the filename helpers the SPA still calls client-side.
 
 test('suggestFilename strips filesystem-unsafe characters', () => {
-  const f = suggestFilename('a/b\\c:d*e?f"g<h>i|j', 'markdown')
+  const f = suggestFilename('a/b\\c:d*e?f"g<h>i|j', 'html')
   // All of the 9 reserved characters should be replaced.
   // The exact substitute doesn't matter as long as none
   // of the originals survive.
   assert.equal(/[\\/:*?"<>|]/.test(f), false)
-  assert.match(f, /\.md$/)
+  assert.match(f, /\.html$/)
 })
 
 test('suggestFilename picks the right extension per format', () => {
-  assert.match(suggestFilename('s', 'markdown'), /\.md$/)
-  assert.match(suggestFilename('s', 'json'), /\.json$/)
+  assert.match(suggestFilename('s', 'html'), /\.html$/)
+  assert.match(suggestFilename('s', 'pdf'), /\.pdf$/)
 })
 
 test('suggestFilename falls back to a safe default', () => {
-  const f = suggestFilename('', 'markdown')
+  const f = suggestFilename('', 'pdf')
   assert.match(f, /^pchat-session-/)
-  assert.match(f, /\.md$/)
+  assert.match(f, /\.pdf$/)
 })
 
 test('dedupeFilename appends -2, -3, ... on collision', () => {
@@ -47,11 +47,11 @@ test('dedupeFilename passes through when the path is free', () => {
   assert.equal(dedupeFilename('foo.md', (p) => taken.has(p)), 'foo.md')
 })
 
-// Type-level sanity: the supported ExportFormat values
-// are exactly the two strings we ship. Adding a third
-// without updating the menu + backend is a deliberate
-// action.
-test('ExportFormat is restricted to markdown | json', () => {
-  const formats: ExportFormat[] = ['markdown', 'json']
+// Type-level sanity: the supported GUI ExportFormat values
+// are exactly the two strings we ship. The backend keeps older
+// markdown/json formats for compatibility, but the GUI export
+// flow now offers styled HTML and PDF only.
+test('ExportFormat is restricted to html | pdf', () => {
+  const formats: ExportFormat[] = ['html', 'pdf']
   assert.equal(formats.length, 2)
 })

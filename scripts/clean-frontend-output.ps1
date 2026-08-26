@@ -12,13 +12,11 @@
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 
-$webIndex = Join-Path $root "web\index.html"
-$webAssets = Join-Path $root "web\assets"
+$webDir = Join-Path $root "web"
 
-if (Test-Path -LiteralPath $webIndex) {
-    Remove-Item -LiteralPath $webIndex -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $webDir) {
+    Get-ChildItem -LiteralPath $webDir -Force |
+        Where-Object { $_.Name -ne ".gitkeep" -and $_.Name -ne "favicon.png" } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 }
-if (Test-Path -LiteralPath $webAssets) {
-    Remove-Item -LiteralPath $webAssets -Recurse -Force -ErrorAction SilentlyContinue
-}
-Write-Host "[clean-frontend-output] wiped web/index.html + web/assets"
+Write-Host "[clean-frontend-output] wiped web output"

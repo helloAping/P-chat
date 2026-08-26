@@ -7,6 +7,9 @@ vars:
   GIT_COMMIT:
     sh: powershell -NoProfile -Command "try { (git rev-parse --short HEAD).Trim() } catch { '' }"
 
+env:
+  GOTOOLCHAIN: auto
+
 tasks:
   sync:version:
     desc: 读取 VERSION 文件，同步写入 wails.json + install.ps1
@@ -100,7 +103,7 @@ tasks:
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
-      - cmd: powershell -NoProfile -Command "Copy-Item -LiteralPath 'build\bin\pchat-gui.exe' -Destination '..\..\bin\pchat-gui.exe' -Force"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\copy-build-artifact.ps1" -Source "build\bin\pchat-gui.exe" -Destination "..\..\bin\pchat-gui.exe"
     silent: false
 
   build:gui:linux:
@@ -397,7 +400,7 @@ tasks:
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
-      - cmd: powershell -NoProfile -Command "Copy-Item -LiteralPath 'build\bin\pchat-gui.exe' -Destination '..\..\dev-bin\pchat-gui.exe' -Force"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\copy-build-artifact.ps1" -Source "build\bin\pchat-gui.exe" -Destination "..\..\dev-bin\pchat-gui.exe"
 
   install:gui:
     desc: 安装桌面端到 %LOCALAPPDATA%\Programs\P-Chat\

@@ -34,6 +34,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -267,6 +268,59 @@ func (a *App) OpenTerminal(path string) {
 func (a *App) OpenURL(rawURL string) {
 	if err := openExternalURL(rawURL); err != nil {
 		log.Printf("OpenURL %q: %v", rawURL, err)
+	}
+}
+
+// SaveExportFile opens the OS-native save dialog and writes an exported
+// conversation file to the selected path. The frontend passes base64 so
+// binary PDF bytes and text HTML/Markdown bytes can share one binding.
+func (a *App) SaveExportFile(defaultFilename string, format string, dataBase64 string) (string, error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("wails context is not ready")
+	}
+	data, err := base64.StdEncoding.DecodeString(dataBase64)
+	if err != nil {
+		return "", fmt.Errorf("decode export data: %w", err)
+	}
+	ext, filters := exportFileDialogFilters(format)
+	if defaultFilename == "" {
+		defaultFilename = "pchat-export." + ext
+	}
+	defaultFilename = filepath.Base(defaultFilename)
+	if filepath.Ext(defaultFilename) == "" {
+		defaultFilename += "." + ext
+	}
+	path, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
+		Title:                "保存对话导出",
+		DefaultFilename:      defaultFilename,
+		CanCreateDirectories: true,
+		Filters:              filters,
+	})
+	if err != nil {
+		return "", fmt.Errorf("save dialog: %w", err)
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", nil
+	}
+	if filepath.Ext(path) == "" {
+		path += "." + ext
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("write export file: %w", err)
+	}
+	return path, nil
+}
+
+func exportFileDialogFilters(format string) (string, []wailsruntime.FileFilter) {
+	switch strings.ToLower(format) {
+	case "pdf":
+		return "pdf", []wailsruntime.FileFilter{{DisplayName: "PDF 文档 (*.pdf)", Pattern: "*.pdf"}}
+	case "html", "htm":
+		return "html", []wailsruntime.FileFilter{{DisplayName: "HTML 文档 (*.html)", Pattern: "*.html;*.htm"}}
+	case "markdown", "md":
+		return "md", []wailsruntime.FileFilter{{DisplayName: "Markdown 文档 (*.md)", Pattern: "*.md;*.markdown"}}
+	default:
+		return "bin", []wailsruntime.FileFilter{{DisplayName: "所有文件 (*.*)", Pattern: "*.*"}}
 	}
 }
 

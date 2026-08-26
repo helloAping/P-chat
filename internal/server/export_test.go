@@ -1,13 +1,18 @@
 package server
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/llm"
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -105,6 +110,152 @@ func TestExportSession_JSON(t *testing.T) {
 	}
 }
 
+func TestExportSession_HTML(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	store.AddMessage(llm.Message{Role: "user", Content: "hi"})
+	store.AddMessage(llm.Message{Role: "assistant", Content: "hello"})
+	_ = store.Flush()
+	sid := store.CurrentConversationID()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+sid+"/export?format=html", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"<!doctype html>", "P-Chat Export", "hi", "hello", "role-user", "role-assistant"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q in html:\n%s", want, body)
+		}
+	}
+	if !strings.HasPrefix(w.Header().Get("Content-Type"), "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", w.Header().Get("Content-Type"))
+	}
+}
+
+func TestExportSession_HTML_StringEncodedPartsFromStore(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	sid := store.CurrentConversationID()
+	partsJSON := `[{"kind":"text","text":"正文只存在于 parts"}]`
+	store.AddChatMessageWithMetaTo(sid, llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     "",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	}, map[string]string{"parts": partsJSON})
+	_ = store.Flush()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+sid+"/export?format=html", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "正文只存在于 parts") {
+		t.Fatalf("HTML export lost string-encoded parts from store:\n%s", body)
+	}
+	if strings.Contains(body, "<dd>0</dd>") {
+		t.Fatalf("HTML export should count the parts-only message as visible:\n%s", body)
+	}
+}
+
+func TestExportSession_HTML_UploadRefIsInlined(t *testing.T) {
+	s, _ := newTestServer(t)
+	dir := t.TempDir()
+	s.handler.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: dir})
+
+	store := s.store
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	sid := store.CurrentConversationID()
+	uploadID := "abcd1234567890ab"
+	raw := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'x'}
+	if err := os.WriteFile(filepath.Join(dir, uploadID+"-screen.png"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store.AddChatMessageTo(sid, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "图上说了什么",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	store.AddChatMessageTo(sid, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeImage,
+		Content:     "upl://" + uploadID,
+		Name:        "screen.png",
+		MimeType:    "image/png",
+		UploadID:    uploadID,
+		MsgType:     llm.MsgTypeImage,
+		SubmitToLLM: 1,
+	})
+	_ = store.Flush()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+sid+"/export?format=html", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	wantURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
+	if !strings.Contains(body, `<img src="`+wantURL+`"`) {
+		t.Fatalf("HTML export did not inline upload image; want %q in:\n%s", wantURL, body)
+	}
+	if strings.Contains(body, "upl://"+uploadID) {
+		t.Fatalf("HTML export leaked raw upl:// reference:\n%s", body)
+	}
+	if strings.Contains(body, "<span>tool:") {
+		t.Fatalf("HTML export rendered media filename as a tool footer:\n%s", body)
+	}
+}
+
+func TestExportSession_PDF(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	if _, err := store.NewConversation(); err != nil {
+		t.Fatal(err)
+	}
+	store.AddMessage(llm.Message{Role: "user", Content: "你好"})
+	store.AddMessage(llm.Message{Role: "assistant", Content: "这是回复"})
+	_ = store.Flush()
+	sid := store.CurrentConversationID()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/sessions/"+sid+"/export?format=pdf", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.Bytes()
+	if !bytes.HasPrefix(body, []byte("%PDF-")) {
+		t.Fatalf("expected PDF header, got %q", string(body[:min(len(body), 16)]))
+	}
+	if !bytes.Contains(body, []byte("startxref")) {
+		t.Errorf("PDF missing startxref")
+	}
+	if !strings.HasPrefix(w.Header().Get("Content-Type"), "application/pdf") {
+		t.Errorf("Content-Type = %q, want application/pdf", w.Header().Get("Content-Type"))
+	}
+}
+
 func TestExportSession_DefaultsToMarkdown(t *testing.T) {
 	s, _ := newTestServer(t)
 	store := s.store
@@ -190,6 +341,7 @@ func TestExportSession_EmptySession(t *testing.T) {
 //   - attachment_kinds: sorted, dedup'd array of the
 //     per-attachment kind values
 //   - attachment_count: total count
+//
 // and every individual attachment carries a `kind`
 // field (in addition to the existing `type` /
 // `url` / `name` / `mime`).
@@ -318,7 +470,7 @@ func TestExportSession_AttachmentsInlined(t *testing.T) {
 //   - the plain `filename="..."` parameter is
 //     pure ASCII (the session id + timestamp), so
 //     it round-trips through every HTTP client
-//   - the `filename*=UTF-8''...` parameter carries
+//   - the `filename*=UTF-8”...` parameter carries
 //     the human-readable title percent-encoded per
 //     RFC 5987, so browsers that honour the spec
 //     (all of them) use the Unicode form

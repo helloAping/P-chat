@@ -32,6 +32,8 @@ type Format string
 
 const (
 	FormatMarkdown Format = "markdown"
+	FormatHTML     Format = "html"
+	FormatPDF      Format = "pdf"
 	FormatJSON     Format = "json"
 )
 
@@ -57,15 +59,15 @@ const (
 // trip, so adding a new field to the agent's part
 // definition is a deliberate, reviewable action.
 type MessagePart struct {
-	Kind     string        `json:"kind"`
-	Text     string        `json:"text,omitempty"`
-	Name     string        `json:"name,omitempty"`
-	Args     string        `json:"args,omitempty"`
-	Status   string        `json:"status,omitempty"`
-	Result   string        `json:"result,omitempty"`
-	Error    string        `json:"error,omitempty"`
-	Task     string        `json:"task,omitempty"`
-	Parts    []MessagePart `json:"parts,omitempty"`
+	Kind   string        `json:"kind"`
+	Text   string        `json:"text,omitempty"`
+	Name   string        `json:"name,omitempty"`
+	Args   string        `json:"args,omitempty"`
+	Status string        `json:"status,omitempty"`
+	Result string        `json:"result,omitempty"`
+	Error  string        `json:"error,omitempty"`
+	Task   string        `json:"task,omitempty"`
+	Parts  []MessagePart `json:"parts,omitempty"`
 	// QuestionStatus is preserved so the markdown
 	// writer can render a brief "the LLM asked this"
 	// marker and the JSON envelope stays round-trippable.
@@ -171,12 +173,12 @@ func PartToMarkdown(p MessagePart, depth int) string {
 	indent := strings.Repeat("  ", depth)
 	switch p.Kind {
 	case "text":
-		return p.Text
+		return normalizeExportText(p.Text)
 	case "thinking":
 		// Indent subsequent lines so the details
 		// block doesn't get re-flowed by markdown
 		// list/quote rules.
-		body := strings.ReplaceAll(p.Text, "\n", "\n"+indent)
+		body := strings.ReplaceAll(normalizeExportText(p.Text), "\n", "\n"+indent)
 		return fmt.Sprintf("%s<details><summary>💭 thinking</summary>\n\n%s%s\n\n%s</details>\n\n",
 			indent, indent, body, indent)
 	case "tool":
@@ -192,7 +194,7 @@ func PartToMarkdown(p MessagePart, depth int) string {
 			head += "\n\n" + ResultBlockToMarkdown(p.Result, indent)
 		}
 		if p.Error != "" {
-			head += fmt.Sprintf("\n\n%s> ❌ %s", indent, p.Error)
+			head += fmt.Sprintf("\n\n%s> ❌ %s", indent, normalizeExportText(p.Error))
 		}
 		return head + "\n\n"
 	case "sub_agent":
@@ -220,6 +222,7 @@ func ResultBlockToMarkdown(s, indent string) string {
 	if s == "" {
 		return ""
 	}
+	s = normalizeExportText(s)
 	if strings.HasPrefix(s, "data:image/") {
 		return fmt.Sprintf("%s![tool result](%s)\n\n", indent, s)
 	}
@@ -360,10 +363,10 @@ var imageMagicPrefixes = []struct {
 	prefix string
 	mime   string
 }{
-	{"iVBORw0KGgo", "image/png"},  // \x89PNG\r\n\x1a\n
-	{"/9j/", "image/jpeg"},        // \xff\xd8\xff
-	{"R0lGOD", "image/gif"},       // GIF87a / GIF89a
-	{"UklGR", "image/webp"},       // RIFF....WEBP
+	{"iVBORw0KGgo", "image/png"}, // \x89PNG\r\n\x1a\n
+	{"/9j/", "image/jpeg"},       // \xff\xd8\xff
+	{"R0lGOD", "image/gif"},      // GIF87a / GIF89a
+	{"UklGR", "image/webp"},      // RIFF....WEBP
 }
 
 // isRawImagePayload reports whether s is a bare
@@ -578,21 +581,18 @@ func extractContentAttachments(mf memory.MessageFull) (string, []memory.Attachme
 	// string of `kind: "tool"` parts (sub-agents
 	// get their own walk; their tool calls are
 	// nested under their own parts[].result).
-	if len(mf.Parts) > 0 {
-		var parts []MessagePart
-		if err := json.Unmarshal(mf.Parts, &parts); err == nil {
-			for _, p := range parts {
-				if p.Kind == "tool" {
-					toolAtts := extractFromToolResult(p.Result)
-					atts = append(atts, toolAtts...)
-				}
-				// Sub-agents: recurse into the nested
-				// parts array so a sub-agent's tool
-				// result images are also lifted.
-				if p.Kind == "sub_agent" {
-					toolAtts := extractFromNestedParts(p.Parts)
-					atts = append(atts, toolAtts...)
-				}
+	if parts, ok := DecodeMessageParts(mf.Parts); ok {
+		for _, p := range parts {
+			if p.Kind == "tool" {
+				toolAtts := extractFromToolResult(p.Result)
+				atts = append(atts, toolAtts...)
+			}
+			// Sub-agents: recurse into the nested
+			// parts array so a sub-agent's tool
+			// result images are also lifted.
+			if p.Kind == "sub_agent" {
+				toolAtts := extractFromNestedParts(p.Parts)
+				atts = append(atts, toolAtts...)
 			}
 		}
 	}
@@ -604,6 +604,75 @@ func extractContentAttachments(mf memory.MessageFull) (string, []memory.Attachme
 	// this is purely a presentation preference.
 	atts = append(atts, mf.Attachments...)
 	return cleaned, atts
+}
+
+// DecodeMessageParts accepts both persisted parts shapes:
+// a raw JSON array (`[{"kind":"text",...}]`) and the
+// store's historical string-encoded array
+// (`"[{\"kind\":\"text\",...}]"`). Export callers use this
+// instead of json.Unmarshal directly so HTML/PDF do not
+// render empty cards when the content only lives in parts.
+func DecodeMessageParts(raw json.RawMessage) ([]MessagePart, bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, false
+	}
+	var parts []MessagePart
+	if err := json.Unmarshal([]byte(trimmed), &parts); err == nil {
+		return parts, true
+	}
+	var encoded string
+	if err := json.Unmarshal([]byte(trimmed), &encoded); err != nil {
+		return nil, false
+	}
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" || encoded == "null" {
+		return nil, false
+	}
+	if err := json.Unmarshal([]byte(encoded), &parts); err != nil {
+		return nil, false
+	}
+	return parts, true
+}
+
+func messageHasRenderableContent(mf memory.MessageFull) bool {
+	contentText, attachments := extractContentAttachments(mf)
+	if strings.TrimSpace(contentText) != "" || len(attachments) > 0 || strings.TrimSpace(mf.Thinking) != "" {
+		return true
+	}
+	if mf.Msg.Name != "" || mf.Msg.ToolCallID != "" {
+		return true
+	}
+	if parts, ok := DecodeMessageParts(mf.Parts); ok {
+		return partsHaveRenderableContent(parts)
+	}
+	return false
+}
+
+func partsHaveRenderableContent(parts []MessagePart) bool {
+	for _, p := range parts {
+		switch p.Kind {
+		case "text", "thinking":
+			if strings.TrimSpace(p.Text) != "" {
+				return true
+			}
+		case "tool":
+			if p.Name != "" || p.Args != "" || p.Result != "" || p.Error != "" || p.Status != "" {
+				return true
+			}
+		case "sub_agent":
+			if p.Task != "" || p.Status != "" || partsHaveRenderableContent(p.Parts) {
+				return true
+			}
+		case "question":
+			return true
+		default:
+			if p.Name != "" || p.Text != "" || p.Result != "" || p.Error != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // extractFromNestedParts walks a sub_agent's nested
@@ -630,6 +699,7 @@ func extractFromNestedParts(parts []MessagePart) []memory.Attachment {
 // heuristic the original /export used. Kept as a small
 // helper so the main loop reads cleanly.
 func renderBody(body string) string {
+	body = normalizeExportText(body)
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return ""
@@ -697,8 +767,7 @@ func ToMarkdown(conv *memory.Conversation, msgs []memory.MessageFull) string {
 		// Parts (assistant) when present; legacy
 		// `content` field otherwise.
 		if len(mf.Parts) > 0 {
-			var parts []MessagePart
-			if err := json.Unmarshal(mf.Parts, &parts); err == nil {
+			if parts, ok := DecodeMessageParts(mf.Parts); ok {
 				for _, p := range parts {
 					b.WriteString(PartToMarkdown(p, 0))
 				}
@@ -787,7 +856,7 @@ func SanitizeFilename(s string) string {
 }
 
 // URLEncodeFilename encodes a filename per RFC 5987
-// for the `filename*=UTF-8''…` Content-Disposition
+// for the `filename*=UTF-8”...` Content-Disposition
 // parameter. Per spec the value MUST be percent-encoded
 // (raw UTF-8 bytes are not legal in this parameter,
 // and some HTTP stacks — notably WebView2 in the
@@ -834,7 +903,7 @@ func URLEncodeFilename(s string) string {
 // isUnreserved reports whether b is in the RFC 3986
 // unreserved set: ASCII alphanumeric + `- . _`. These
 // are the only bytes that survive percent-encoding in
-// the `filename*=UTF-8''…` value per RFC 5987 §3.2.
+// the `filename*=UTF-8”...` value per RFC 5987 §3.2.
 func isUnreserved(b byte) bool {
 	return (b >= '0' && b <= '9') ||
 		(b >= 'A' && b <= 'Z') ||
@@ -882,12 +951,12 @@ type jsonEnvelope struct {
 // say (i.e. the message has zero attachments AND no
 // part-attached content).
 type jsonMessage struct {
-	Index            int                 `json:"index"`
-	Role             string              `json:"role"`
-	Content          string              `json:"content"`
-	Thinking         string              `json:"thinking,omitempty"`
-	Parts            json.RawMessage     `json:"parts,omitempty"`
-	Attachments      []memory.Attachment `json:"attachments"`
+	Index       int                 `json:"index"`
+	Role        string              `json:"role"`
+	Content     string              `json:"content"`
+	Thinking    string              `json:"thinking,omitempty"`
+	Parts       json.RawMessage     `json:"parts,omitempty"`
+	Attachments []memory.Attachment `json:"attachments"`
 	// AttachmentKinds is the dedup'd, sorted list of
 	// attachment kinds ("image" / "audio" / "video"
 	// / "text" / "file") for this message. Always
@@ -899,7 +968,7 @@ type jsonMessage struct {
 	// AttachmentCount is len(Attachments). Exposed
 	// separately so a count-only consumer doesn't
 	// have to decode the full array.
-	AttachmentCount int `json:"attachment_count"`
+	AttachmentCount int    `json:"attachment_count"`
 	ToolCallID      string `json:"tool_call_id,omitempty"`
 	Name            string `json:"name,omitempty"`
 	CreatedAt       int64  `json:"created_at,omitempty"`

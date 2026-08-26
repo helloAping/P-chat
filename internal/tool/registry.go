@@ -103,7 +103,7 @@ type SandboxChecker interface {
 	CheckWriteDecision(path, projectRoot string) SandboxDecision
 	// CheckReadDecision returns the full Decision for read.
 	// Added 2026-07 to cover read_file / read_docx / read_pdf
-	// / list_files �?previously these bypassed the sandbox
+	// / list_files - previously these bypassed the sandbox
 	// entirely, which let an LLM read /etc/passwd after a
 	// write confirm was approved. The decision table is the
 	// same as CheckWriteDecision for path classification,
@@ -633,7 +633,7 @@ func RegisterBuiltin(r *Registry) {
 	r.Register(Tool{
 		Name: "read_file",
 		Description: "Read the full contents of a TEXT file. Use for inspecting source files, configs, or any text artifact. " +
-			"DO NOT call read_file on images, audio, video, PDFs, archives, or any binary file �?" +
+			"DO NOT call read_file on images, audio, video, PDFs, archives, or any binary file - " +
 			"those will return a binary error. " +
 			"Images uploaded by the user are ALREADY available as vision input (image_url) in the user message; " +
 			"just look at them directly, do NOT call read_file on the on-disk copy.",
@@ -716,7 +716,7 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "todo_write",
-		Description: "Create and manage a structured task list for your current coding session. Use this to plan work, track progress, and show the user what you're doing. Each todo item has an id, content, and status (pending/in_progress/done/cancelled). Always include the full list when calling this tool �?it replaces the previous list entirely.",
+		Description: "Create and manage a structured task list for your current coding session. Use this to plan work, track progress, and show the user what you're doing. Each todo item has an id, content, and status (pending/in_progress/done/cancelled). Always include the full list when calling this tool - it replaces the previous list entirely.",
 		Parameters: ObjectSchema(map[string]any{
 			"todos": map[string]any{
 				"type": "array",
@@ -801,7 +801,7 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	if reason := commandReferencesUploadFile(a.Command); reason != "" {
 		return &CallResult{
 			Content: fmt.Sprintf(
-				"E_UPLOAD_DIR: command blocked �?%s is inside the chat upload directory. "+
+				"E_UPLOAD_DIR: command blocked: %s is inside the chat upload directory. "+
 					"Uploaded files are already inlined in the user message as vision/image "+
 					"content; do NOT shell out to read them. Just respond based on the "+
 					"attachment you already received.", reason),
@@ -841,7 +841,7 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	cmd, _ := buildExecCommand(ctx, a.Command, a.WorkDir, projectRootFromCtx(ctx))
 	out, err := readLimitedOutput(ctx, cmd)
 	if err != nil {
-		content := strings.TrimRight(string(out), "\r\n")
+		content := strings.TrimRight(DecodeCommandOutput(out), "\r\n")
 		if content != "" {
 			content += "\n"
 		}
@@ -864,7 +864,7 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 		}
 		return &CallResult{Content: content, IsError: true}, nil
 	}
-	return &CallResult{Content: string(out)}, nil
+	return &CallResult{Content: DecodeCommandOutput(out)}, nil
 }
 
 func buildExecCommand(ctx context.Context, command, workDir, root string) (*exec.Cmd, string) {
@@ -1097,7 +1097,7 @@ func handleReadFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 	if isInUploadDir(a.Path) {
 		return &CallResult{
 			Content: fmt.Sprintf(
-				"E_UPLOAD_DIR: read blocked �?%s is inside the chat upload directory. "+
+				"E_UPLOAD_DIR: read blocked: %s is inside the chat upload directory. "+
 					"Uploaded files are already inlined in the user message as vision/image "+
 					"content; do NOT call read_file on them. Just respond based on the "+
 					"attachment you already received.", a.Path),
@@ -1245,7 +1245,7 @@ func handleListFiles(ctx context.Context, args json.RawMessage) (*CallResult, er
 	// 2026-07: list_files also goes through the read path-class
 	// table (it's a read of directory entries, not a file read
 	// in the strict sense, but the same authorisation policy
-	// applies �?a project-internal listing is Allow, anything
+	// applies - a project-internal listing is Allow, anything
 	// else confirms).
 	if sb := sandboxFromCtx(ctx); sb != nil && sb.CheckReadDecision(a.Path, projectRootFromCtx(ctx)) == SandboxBlock {
 		return &CallResult{
@@ -1298,7 +1298,7 @@ func isInUploadDir(p string) bool {
 		return strings.HasPrefix(filepath.Clean(p), upDir)
 	}
 
-	// 2. Bare filename ("image.png", "foo/bar.png", etc.) �?match
+	// 2. Bare filename ("image.png", "foo/bar.png", etc.) - match
 	//    against the on-disk uploads directory listing. If a file
 	//    with the same name was uploaded, reject.
 	//    We strip any leading "./" and trim to the base name to
@@ -1318,7 +1318,7 @@ func isInUploadDir(p string) bool {
 		}
 	}
 
-	// 3. Path contains a separator �?try resolving it relative
+	// 3. Path contains a separator - try resolving it relative
 	//    to the upload dir. If it lands inside, reject.
 	if strings.Contains(p, string(filepath.Separator)) {
 		tryPath := filepath.Join(upDir, cleaned)
@@ -1349,7 +1349,7 @@ func handleReadDocx(ctx context.Context, args json.RawMessage) (*CallResult, err
 	if isInUploadDir(a.Path) {
 		return &CallResult{
 			Content: fmt.Sprintf(
-				"E_UPLOAD_DIR: read blocked �?%s is inside the chat upload directory. "+
+				"E_UPLOAD_DIR: read blocked: %s is inside the chat upload directory. "+
 					"Uploaded files are already inlined in the user message; do NOT call "+
 					"read_docx on them.", a.Path),
 			IsError: true,
@@ -1381,7 +1381,7 @@ func handleReadPdf(ctx context.Context, args json.RawMessage) (*CallResult, erro
 	if isInUploadDir(a.Path) {
 		return &CallResult{
 			Content: fmt.Sprintf(
-				"E_UPLOAD_DIR: read blocked �?%s is inside the chat upload directory. "+
+				"E_UPLOAD_DIR: read blocked: %s is inside the chat upload directory. "+
 					"Uploaded files are already inlined in the user message; do NOT call "+
 					"read_pdf on them.", a.Path),
 			IsError: true,
@@ -1421,7 +1421,7 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 	if strings.HasPrefix(lower, "http://[::1]") || strings.HasPrefix(lower, "http://[::ffff:127.") || strings.HasPrefix(lower, "http://[0:0:0:0:0:0:0:1]") {
 		return &CallResult{Content: "E_PROTO: fetching from IPv6 loopback is not allowed for security", IsError: true}, nil
 	}
-	// Link-local (169.254/16) �?used by cloud-instance
+	// Link-local (169.254/16) - used by cloud-instance
 	// metadata services like http://169.254.169.254 (AWS,
 	// GCP, Azure). Without this check the LLM can exfiltrate
 	// instance metadata and short-lived credentials.

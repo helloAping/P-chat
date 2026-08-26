@@ -32,9 +32,8 @@
  * localStorage (P-Chat is local-first, the server doesn't track
  * this; a future schema migration could move it to the DB).
  */
-import { computed, ref, onMounted, watch } from 'vue'
+import { computed, ref, onMounted, watch, h, type Component } from 'vue'
 import { NButton, NInput, NScrollbar, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
-import { h } from 'vue'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
@@ -50,8 +49,8 @@ import BrandLogo from './BrandLogo.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
-  Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff,
-  ChevronDown, ChevronRight, Circle, MessageSquare, Download as DownloadIcon,
+  Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
+  ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
 } from './icons'
 
 const APP_VERSION = __APP_VERSION__
@@ -81,6 +80,10 @@ const showAbout = ref(false)
 const showRename = ref(false)
 const renameId = ref('')
 const renameTitle = ref('')
+const showExport = ref(false)
+const exportSessionId = ref('')
+const exportFormat = ref<ExportFormat>('pdf')
+const exportSaving = ref(false)
 const updateInfo = ref<UpdateInfo | null>(null)
 const pendingDeleteSessionId = ref('')
 const showConfirmDeleteSession = ref(false)
@@ -199,39 +202,47 @@ function shortTime(ts: number, group: string): string {
 
 // ---------------------------------------------------------------------------
 // Header menu: project actions + app actions.
+//
+// Labels render icon+text in one `.app-action-item` row. We do not
+// use NDropdown's `icon` slot — Naive reserves a 36px prefix column
+// plus an empty suffix gutter, which is what made the session ⋯
+// menu look sparse and misaligned.
 // ---------------------------------------------------------------------------
+function actionOption(
+  key: string,
+  label: string,
+  icon: Component,
+  extra: Partial<DropdownOption> = {},
+): DropdownOption {
+  return {
+    key,
+    label: () =>
+      h('span', { class: 'app-action-item' }, [
+        h(icon, { size: 16, class: 'app-action-item__icon' }),
+        h('span', { class: 'app-action-item__label' }, label),
+      ]),
+    ...extra,
+  }
+}
+
 const menuOptions = computed<DropdownOption[]>(() => [
-  {
-    label: '添加项目',
-    key: 'add-project',
-    icon: () => h(Plus, { size: 16 }),
-  },
-  ...(state.activeProjectPath ? [{
-    label: '移除当前项目',
-    key: 'remove-project',
-    icon: () => h(XIcon, { size: 16 }),
-  }] : []),
+  actionOption('add-project', '添加项目', Plus),
+  ...(state.activeProjectPath
+    ? [actionOption('remove-project', '移除当前项目', XIcon)]
+    : []),
   { type: 'divider' as const, key: 'project-divider' },
-  {
-    label: 'Token 用量',
-    key: 'token-stats',
-    icon: () => h(BarChart3, { size: 16 }),
-  },
-  {
-    label: '设置',
-    key: 'settings',
-    icon: () => h(Settings, { size: 16 }),
-  },
+  actionOption('token-stats', 'Token 用量', BarChart3),
+  actionOption('settings', '设置', Settings),
   { type: 'divider' as const, key: 'd1' },
-  {
-    label: updateInfo.value?.hasUpdate ? `关于 (新版本 ${updateInfo.value.latest})` : '关于',
-    key: 'about',
-    icon: () => h(updateInfo.value?.hasUpdate ? Bell : Info, { size: 16 }),
-  },
+  actionOption(
+    'about',
+    updateInfo.value?.hasUpdate ? `关于 (新版本 ${updateInfo.value.latest})` : '关于',
+    updateInfo.value?.hasUpdate ? Bell : Info,
+  ),
 ])
 
-const projectActionMenuProps: DropdownMenuProps = () => ({
-  class: 'project-action-menu',
+const actionMenuProps: DropdownMenuProps = () => ({
+  class: 'app-action-menu',
 })
 
 function handleMenuSelect(key: string) {
@@ -307,33 +318,12 @@ function jumpToResult(r: SearchResult) {
 function sessionMenuOptions(id: string) {
   const pinned = isPinned(id)
   return [
-    {
-      key: 'pin',
-      label: pinned ? '取消置顶' : '置顶',
-      icon: () => h(pinned ? PinOff : Pin, { size: 14 }),
-    },
-    {
-      key: 'rename',
-      label: '重命名',
-      icon: () => h(Pencil, { size: 14 }),
-    },
+    actionOption('pin', pinned ? '取消置顶' : '置顶', pinned ? PinOff : Pin),
+    actionOption('rename', '重命名', Pencil),
     { type: 'divider' as const, key: 'd' },
-    {
-      key: 'export-md',
-      label: '导出 Markdown',
-      icon: () => h(DownloadIcon, { size: 14 }),
-    },
-    {
-      key: 'export-json',
-      label: '导出 JSON',
-      icon: () => h(DownloadIcon, { size: 14 }),
-    },
+    actionOption('export', '导出对话', FileText),
     { type: 'divider' as const, key: 'd2' },
-    {
-      key: 'delete',
-      label: '归档',
-      icon: () => h(XIcon, { size: 14 }),
-    },
+    actionOption('delete', '归档', Archive, { props: { class: 'app-action-danger' } }),
   ]
 }
 
@@ -348,46 +338,49 @@ function onSessionMenu(key: string, id: string) {
       onDelete(id, new MouseEvent('click'))
       break
     }
-    case 'export-md':
-    case 'export-json': {
-      const fmt = key.slice('export-'.length) as ExportFormat
-      doExport(id, fmt)
+    case 'export': {
+      openExportModal(id)
       break
     }
   }
 }
 
-// downloadSession triggers a server-side export. The
-// rendering lives in pchat-server (internal/export +
-// internal/server.ExportSession) and reads straight
-// from the memory store, so the output is always
-// self-contained — no in-memory blob: URLs to break,
-// no dependency on what the SPA happens to have in
-// memory. The frontend just downloads the response.
+// doExport triggers a server-side export. The rendering
+// lives in pchat-server (internal/export +
+// internal/server.ExportSession) and reads straight from
+// the memory store, so the output is self-contained: no
+// in-memory blob URLs to break, no dependency on what the
+// SPA has hydrated.
 //
 // Format / size guards:
 //   * sessions with > 5k messages show a confirmation
-//     dialog — exporting tens of MB of markdown
-//     synchronously (with attachment data: URLs inlined)
-//     on the main thread will jank the UI. The dialog
+//     dialog. Large HTML/PDF exports can take a few
+//     seconds when attachment data URLs are inlined.
+//     The dialog
 //     uses `useDialog().warning` so the user explicitly
 //     approves.
 //   * filename collisions are deduplicated (-2, -3, …)
 //     by probing the suggested name against an in-memory
 //     set of filenames we've already offered this
-//     session. We can't enumerate the user's downloads
-//     folder, so we just guard against the rapid
-//     double-click case where two exports would
-//     otherwise write the same name.
-//   * the actual download uses a transient <a download>
-//     link + URL.createObjectURL, the standard SPA
-//     pattern.
+//     session.
+//   * Wails desktop uses SaveExportFile, which opens the
+//     OS-native save dialog and writes to the chosen path.
+//     Browser preview falls back to the normal download
+//     link because it cannot write arbitrary local paths.
 
 // Module-level dedup cache. Reset on page reload;
-// that's fine — the worst case is one overwritten file
-// across reloads, and the user can rename in their
-// downloads folder.
+// that's fine — it only guards rapid repeated exports in
+// the same renderer process.
 const recentlyExported = new Set<string>()
+
+const exportTarget = computed(() => state.sessions.find(s => s.id === exportSessionId.value) || null)
+const exportFilename = computed(() => suggestFilename(exportTarget.value?.title || '', exportFormat.value))
+
+function openExportModal(id: string) {
+  exportSessionId.value = id
+  exportFormat.value = 'pdf'
+  showExport.value = true
+}
 
 async function doExport(id: string, format: ExportFormat) {
   try {
@@ -418,10 +411,9 @@ async function doExport(id: string, format: ExportFormat) {
     }
     const title = state.sessions.find(s => s.id === id)?.title ?? ''
     // The server is the source of truth: it reads from
-    // the store, renders to markdown/JSON, and returns
-    // the file with Content-Disposition. The browser
-    // just downloads.
-    const fmtQuery = format === 'json' ? 'json' : 'md'
+    // the store, renders the selected archive format, and
+    // returns the file with Content-Disposition.
+    const fmtQuery = format
     const resp = await fetch(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`, {
       method: 'GET',
     })
@@ -439,6 +431,36 @@ async function doExport(id: string, format: ExportFormat) {
     const baseFilename = serverName || suggestFilename(title, format)
     const filename = dedupeFilename(baseFilename, (p) => recentlyExported.has(p))
     recentlyExported.add(filename)
+    const savedPath = await saveBlobWithPicker(blob, filename, format)
+    if (!savedPath) return
+    message.success(`已导出到 ${savedPath}`)
+    showExport.value = false
+  } catch (e) {
+    console.error('[export] failed:', e)
+    message.error('导出失败: ' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+async function confirmExport() {
+  if (!exportSessionId.value || exportSaving.value) return
+  exportSaving.value = true
+  try {
+    await doExport(exportSessionId.value, exportFormat.value)
+  } finally {
+    exportSaving.value = false
+  }
+}
+
+async function saveBlobWithPicker(blob: Blob, filename: string, format: ExportFormat): Promise<string> {
+  try {
+    const { SaveExportFile } = await import('../../wailsjs/go/main/App')
+    const dataBase64 = await blobToBase64(blob)
+    const path = await SaveExportFile(filename, format, dataBase64)
+    return path || ''
+  } catch (e) {
+    // Browser preview has no Wails binding. Keep a fallback so
+    // the web build remains usable outside the desktop shell.
+    console.warn('[export] Wails save unavailable, falling back to browser download:', e)
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -447,11 +469,21 @@ async function doExport(id: string, format: ExportFormat) {
     a.click()
     document.body.removeChild(a)
     setTimeout(() => URL.revokeObjectURL(url), 1000)
-    message.success(`已导出 ${filename}`)
-  } catch (e) {
-    console.error('[export] failed:', e)
-    message.error('导出失败: ' + (e instanceof Error ? e.message : String(e)))
+    return filename
   }
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const value = String(reader.result || '')
+      const comma = value.indexOf(',')
+      resolve(comma >= 0 ? value.slice(comma + 1) : value)
+    }
+    reader.onerror = () => reject(reader.error || new Error('read export blob failed'))
+    reader.readAsDataURL(blob)
+  })
 }
 
 // parseContentDispositionFilename pulls a usable
@@ -801,8 +833,9 @@ onMounted(() => {
           <NDropdown
             trigger="click"
             placement="bottom-end"
+            size="small"
             :options="menuOptions"
-            :menu-props="projectActionMenuProps"
+            :menu-props="actionMenuProps"
             @select="(key) => handleMenuSelect(String(key))"
           >
             <NButton size="small" quaternary title="更多" aria-label="更多">
@@ -887,7 +920,9 @@ onMounted(() => {
                       :ref="bindSessionMenuRef(s.id)"
                       trigger="click"
                       placement="bottom-end"
+                      size="small"
                       :options="sessionMenuOptions(s.id)"
+                      :menu-props="actionMenuProps"
                       @select="(key) => onSessionMenu(String(key), s.id)"
                     >
                       <button
@@ -1030,6 +1065,51 @@ onMounted(() => {
       <template #footer>
         <NButton size="small" @click="showRename = false">取消</NButton>
         <NButton size="small" type="primary" @click="confirmRename">确认</NButton>
+      </template>
+    </AppModal>
+
+    <AppModal
+      v-model:show="showExport"
+      title="导出对话"
+      size="md"
+      accent-top
+    >
+      <div class="export-dialog">
+        <div class="export-session">
+          <span class="export-session-label">会话</span>
+          <strong>{{ exportTarget?.title || '未命名会话' }}</strong>
+          <code>{{ exportFilename }}</code>
+        </div>
+        <div class="export-format-grid">
+          <button
+            type="button"
+            class="export-format-card"
+            :class="{ active: exportFormat === 'pdf' }"
+            @click="exportFormat = 'pdf'"
+          >
+            <span class="export-format-icon"><File :size="18" /></span>
+            <span class="export-format-main">
+              <strong>PDF</strong>
+              <span>分页归档，适合发送和长期保存</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            class="export-format-card"
+            :class="{ active: exportFormat === 'html' }"
+            @click="exportFormat = 'html'"
+          >
+            <span class="export-format-icon"><FileText :size="18" /></span>
+            <span class="export-format-main">
+              <strong>HTML</strong>
+              <span>保留更完整样式，适合浏览器查看和打印</span>
+            </span>
+          </button>
+        </div>
+      </div>
+      <template #footer>
+        <NButton size="small" :disabled="exportSaving" @click="showExport = false">取消</NButton>
+        <NButton size="small" type="primary" :loading="exportSaving" @click="confirmExport">选择路径并保存</NButton>
       </template>
     </AppModal>
 
@@ -1435,25 +1515,8 @@ onMounted(() => {
 }
 .older-toggle:hover { color: var(--text-primary); background: var(--surface-3); }
 
-/* --- Per-session NDropdown style overrides --------------------------- */
-/* NDropdown teleports the menu to body, so scoped styles don't
- * reach it. NDropdown already styles its options reasonably
- * (uses our --text-primary etc. via the theme overrides), but
- * we tighten the icon-text gap and the hover background to
- * match the rest of the sidebar. */
-:deep(.n-dropdown-option) {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-:deep(.n-dropdown-option .n-dropdown-option-body__prefix) {
-  width: 14px;
-  height: 14px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-tertiary);
-}
+/* Session / project NDropdowns teleport to <body>; their layout
+ * lives on the shared `.app-action-menu` class in style.css. */
 
 /* --- Search results --------------------------------------------------- */
 .search-results { padding: 8px; }
@@ -1528,6 +1591,102 @@ onMounted(() => {
   color: var(--error-500);
   font-size: 12px;
   line-height: 1.35;
+}
+.export-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.export-session {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.export-session-label {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+}
+.export-session strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.export-session code {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.export-format-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+.export-format-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition-colors),
+              transform var(--dur-fast) var(--ease-out);
+}
+.export-format-card:hover {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  transform: translateY(-1px);
+}
+.export-format-card.active {
+  border-color: var(--brand-500);
+  background: var(--brand-50);
+  color: var(--text-primary);
+}
+.export-format-icon {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--brand-500);
+}
+.export-format-card.active .export-format-icon {
+  background: var(--brand-100);
+}
+.export-format-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.export-format-main strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.3;
+}
+.export-format-main span {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+@media (max-width: 520px) {
+  .export-format-grid {
+    grid-template-columns: 1fr;
+  }
 }
 .about-body { padding: 4px 0; }
 .about-name { font-size: 18px; font-weight: 600; margin: 0 0 4px; }

@@ -318,6 +318,10 @@ html, body, #app {
  * component rules cannot reliably style them. Keep the shared
  * floating-menu treatment here so sidebar actions, KB selection,
  * settings selects, and tool enum selects read as one UI family.
+ *
+ * Icon+label action menus (session ⋯, project ⋯) add `.app-action-menu`
+ * via NDropdown menu-props. Items render `.app-action-item` (icon +
+ * label on one row) and Naive's empty prefix/suffix columns are hidden.
  */
 .n-dropdown-menu,
 .n-base-select-menu {
@@ -383,103 +387,155 @@ html, body, #app {
   white-space: nowrap;
 }
 
-.project-action-menu.n-dropdown-menu {
-  width: calc(var(--space-8) * 4);
+.app-action-menu.n-dropdown-menu {
+  /* Collapse Naive's reserved prefix (36px) and suffix gutter
+     so the custom `.app-action-item` row owns icon+label spacing. */
+  --n-padding: var(--space-1);
+  --n-option-height: var(--space-7);
+  --n-option-prefix-width: 0px;
+  --n-option-icon-prefix-width: 0px;
+  --n-option-suffix-width: 0px;
+  --n-option-icon-suffix-width: 0px;
+  --n-font-size: 13px;
+  min-width: calc(var(--space-8) * 4);
+  width: max-content;
   max-width: calc(100vw - var(--space-6));
-  padding: var(--space-2) !important;
+  padding: var(--space-1) !important;
   border-radius: var(--radius-lg) !important;
   background: var(--surface-1) !important;
-  box-shadow: var(--shadow-lg) !important;
+  box-shadow: var(--shadow-md) !important;
 }
 
-.project-action-menu .n-dropdown-option {
+.app-action-menu .n-dropdown-option {
   margin: 0 !important;
 }
 
-.project-action-menu .n-dropdown-option + .n-dropdown-option {
-  margin-top: var(--space-1) !important;
-}
-
-.project-action-menu .n-dropdown-option .n-dropdown-option-body {
+.app-action-menu .n-dropdown-option .n-dropdown-option-body {
   box-sizing: border-box;
-  height: calc(var(--space-8) - var(--space-1)) !important;
-  min-height: calc(var(--space-8) - var(--space-1)) !important;
-  padding: 0 var(--space-3) !important;
+  height: var(--space-7) !important;
+  min-height: var(--space-7) !important;
+  padding: 0 var(--space-2) !important;
   display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 0;
   overflow: hidden;
-  border-radius: var(--radius-md) !important;
+  border-radius: var(--radius-sm) !important;
   color: var(--text-secondary) !important;
   line-height: 1.3 !important;
 }
 
-.project-action-menu .n-dropdown-option .n-dropdown-option-body::before {
+.app-action-menu .n-dropdown-option .n-dropdown-option-body::before {
   inset: 0 !important;
   border-radius: inherit !important;
 }
 
-.project-action-menu .n-dropdown-option .n-dropdown-option-body:hover,
-.project-action-menu .n-dropdown-option .n-dropdown-option-body--pending {
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:hover,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body--pending {
   color: var(--text-primary) !important;
 }
 
-.project-action-menu .n-dropdown-option .n-dropdown-option-body:hover::before,
-.project-action-menu .n-dropdown-option .n-dropdown-option-body--pending::before {
-  background: var(--surface-2) !important;
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:hover::before,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body--pending::before {
+  background: var(--surface-3) !important;
 }
 
-.project-action-menu .n-dropdown-option .n-dropdown-option-body:active {
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:active {
   color: var(--brand-600) !important;
 }
 
-.project-action-menu .n-dropdown-option .n-dropdown-option-body:active::before {
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:active::before {
   background: var(--brand-50) !important;
 }
 
-.project-action-menu .n-dropdown-option .n-dropdown-option-body__prefix {
-  width: var(--space-5) !important;
-  height: var(--space-5) !important;
-  margin-right: var(--space-2) !important;
-  display: inline-flex !important;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 var(--space-5);
-  color: var(--text-tertiary) !important;
+.app-action-menu .n-dropdown-option .n-dropdown-option-body__prefix,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body__prefix--show-icon,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body__suffix {
+  display: none !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  flex: 0 0 0;
+  overflow: hidden;
 }
 
-.project-action-menu .n-dropdown-option .n-dropdown-option-body__prefix--show-icon {
-  width: var(--space-5) !important;
-}
-
-.project-action-menu .n-dropdown-option .n-dropdown-option-body__prefix svg {
-  display: block;
-  width: var(--space-4);
-  height: var(--space-4);
-}
-
-.project-action-menu .n-dropdown-option .n-dropdown-option-body:hover .n-dropdown-option-body__prefix,
-.project-action-menu .n-dropdown-option .n-dropdown-option-body--pending .n-dropdown-option-body__prefix {
-  color: var(--brand-500) !important;
-}
-
-.project-action-menu .n-dropdown-option .n-dropdown-option-body__label {
+.app-action-menu .n-dropdown-option .n-dropdown-option-body__label {
+  flex: 1 1 auto;
   min-width: 0;
   color: inherit !important;
   font-size: 13px;
   font-weight: 500;
   line-height: 1.3;
+  white-space: nowrap;
 }
 
-.project-action-menu .n-dropdown-option .n-dropdown-option-body__suffix {
-  width: 0 !important;
-  min-width: 0 !important;
-  padding: 0 !important;
+.app-action-item {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  width: 100%;
 }
 
-.project-action-menu .n-dropdown-divider {
-  margin: var(--space-2) var(--space-3) !important;
-  border-color: var(--border-subtle) !important;
+.app-action-item__icon {
+  display: block;
+  flex: 0 0 var(--space-4);
+  width: var(--space-4);
+  height: var(--space-4);
+  color: var(--text-tertiary);
+}
+
+.app-action-item__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:hover .app-action-item__icon,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body--pending .app-action-item__icon {
+  color: var(--brand-500);
+}
+
+.app-action-menu .n-dropdown-divider {
+  margin: var(--space-1) var(--space-2) !important;
+  background-color: var(--border-default) !important;
+  height: 1px !important;
+  border: none !important;
+}
+
+/* Destructive row (archive / remove). Naive may stamp option.props
+ * onto either the wrapper or the body, so both selectors are covered. */
+.app-action-menu .app-action-danger .n-dropdown-option-body,
+.app-action-menu .n-dropdown-option-body.app-action-danger {
+  color: var(--error-500) !important;
+}
+.app-action-menu .app-action-danger .app-action-item__icon,
+.app-action-menu .n-dropdown-option-body.app-action-danger .app-action-item__icon {
+  color: var(--error-500);
+}
+.app-action-menu .app-action-danger .n-dropdown-option-body:hover,
+.app-action-menu .app-action-danger .n-dropdown-option-body--pending,
+.app-action-menu .n-dropdown-option-body.app-action-danger:hover,
+.app-action-menu .n-dropdown-option-body.app-action-danger.n-dropdown-option-body--pending {
+  color: var(--error-500) !important;
+}
+.app-action-menu .app-action-danger .n-dropdown-option-body:hover::before,
+.app-action-menu .app-action-danger .n-dropdown-option-body--pending::before,
+.app-action-menu .n-dropdown-option-body.app-action-danger:hover::before,
+.app-action-menu .n-dropdown-option-body.app-action-danger.n-dropdown-option-body--pending::before {
+  background: var(--error-50) !important;
+}
+.app-action-menu .app-action-danger .n-dropdown-option-body:hover .app-action-item__icon,
+.app-action-menu .app-action-danger .n-dropdown-option-body--pending .app-action-item__icon,
+.app-action-menu .n-dropdown-option-body.app-action-danger:hover .app-action-item__icon,
+.app-action-menu .n-dropdown-option-body.app-action-danger.n-dropdown-option-body--pending .app-action-item__icon {
+  color: var(--error-500);
 }
 
 /* --- 8c. Shared Vue transitions ------------------------------------

@@ -1,6 +1,7 @@
 package export
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -212,6 +213,105 @@ func TestToMarkdown_PartsTool(t *testing.T) {
 	}
 }
 
+func TestNormalizeExportTextRepairsLegacyWindowsMojibake(t *testing.T) {
+	input := "������ D �еľ��� Data �������к��� 9A67-7C23\n" +
+		"D:\\develop\\project\\P-chat\\dev-bin\\.p-chat\\workspace ��Ŀ¼\n" +
+		"1 ���ļ� 120 �ֽ� 2 ��Ŀ¼ 451,641,810,944 �����ֽ�\n" +
+		"Tool exec_command returned an error: ϵͳ�Ҳ���ָ����·���� exit status 1"
+	got := normalizeExportText(input)
+	for _, want := range []string{
+		"驱动器 D 中的卷是 Data 卷的序列号是 9A67-7C23",
+		"D:\\develop\\project\\P-chat\\dev-bin\\.p-chat\\workspace 的目录",
+		"1 个文件 120 字节 2 个目录 451,641,810,944 可用字节",
+		"Tool exec_command returned an error: 系统找不到指定的路径。 exit status 1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("normalizeExportText() missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.ContainsRune(got, '\uFFFD') {
+		t.Fatalf("normalizeExportText() still contains replacement rune:\n%s", got)
+	}
+}
+
+func TestToHTMLRepairsLegacyToolOutputMojibake(t *testing.T) {
+	conv := &memory.Conversation{ID: "c", Title: "T"}
+	msgs := []memory.MessageFull{
+		{
+			Msg: llm.Message{
+				Role:    "tool",
+				Name:    "exec_command",
+				Content: "������ D �еľ��� Data �������к��� 9A67-7C23\n1 ���ļ� 120 �ֽ�",
+			},
+		},
+	}
+	got := ToHTML(conv, msgs)
+	if !strings.Contains(got, "驱动器 D 中的卷是 Data 卷的序列号是 9A67-7C23") {
+		t.Fatalf("HTML export did not repair legacy output:\n%s", got)
+	}
+	if strings.Contains(got, "������") {
+		t.Fatalf("HTML export still contains legacy mojibake:\n%s", got)
+	}
+}
+
+func TestToHTMLDecodesStringEncodedParts(t *testing.T) {
+	conv := &memory.Conversation{ID: "c", Title: "T"}
+	partsJSON := `[{"kind":"text","text":"来自 parts 的正文"}]`
+	quotedParts, _ := json.Marshal(partsJSON)
+	msgs := []memory.MessageFull{
+		{Msg: llm.Message{Role: "assistant"}, Parts: quotedParts},
+	}
+
+	got := ToHTML(conv, msgs)
+	if !strings.Contains(got, "来自 parts 的正文") {
+		t.Fatalf("HTML export did not render string-encoded parts:\n%s", got)
+	}
+}
+
+func TestToHTMLSkipsEmptyPlaceholderMessages(t *testing.T) {
+	conv := &memory.Conversation{ID: "c", Title: "T"}
+	msgs := []memory.MessageFull{
+		{Msg: llm.Message{Role: "assistant"}},
+	}
+
+	got := ToHTML(conv, msgs)
+	if strings.Contains(got, "<article class=\"message role-assistant\"") {
+		t.Fatalf("HTML export rendered an empty assistant placeholder:\n%s", got)
+	}
+	if !strings.Contains(got, "<dd>0</dd>") {
+		t.Fatalf("HTML export should count only visible messages:\n%s", got)
+	}
+}
+
+func TestMessagePlainLinesRepairsLegacyToolOutputMojibake(t *testing.T) {
+	lines := messagePlainLines(memory.MessageFull{
+		Msg: llm.Message{
+			Role:    "tool",
+			Content: "Tool exec_command returned an error: ϵͳ�Ҳ���ָ����·���� exit status 1",
+		},
+	})
+	got := strings.Join(lines, "\n")
+	if !strings.Contains(got, "系统找不到指定的路径。") {
+		t.Fatalf("PDF plain lines did not repair legacy output:\n%s", got)
+	}
+}
+
+func TestMessagePlainLinesDecodesStringEncodedParts(t *testing.T) {
+	partsJSON := `[{"kind":"text","text":"PDF 正文来自 parts"}]`
+	quotedParts, _ := json.Marshal(partsJSON)
+	lines := messagePlainLines(memory.MessageFull{
+		Msg:   llm.Message{Role: "assistant"},
+		Parts: quotedParts,
+	})
+	got := strings.Join(lines, "\n")
+	if !strings.Contains(got, "PDF 正文来自 parts") {
+		t.Fatalf("PDF plain lines did not render string-encoded parts:\n%s", got)
+	}
+	if strings.Contains(got, "(empty message)") {
+		t.Fatalf("PDF plain lines should not fall back to empty message:\n%s", got)
+	}
+}
+
 func TestToMarkdown_PartsThinking(t *testing.T) {
 	conv := &memory.Conversation{ID: "c"}
 	partsJSON := []byte(`[{"kind":"text","text":"answer"},{"kind":"thinking","text":"let me think"}]`)
@@ -268,9 +368,9 @@ func TestToJSON_Shape(t *testing.T) {
 	}
 
 	var got struct {
-		Version    string         `json:"version"`
-		ExportedAt string         `json:"exported_at"`
-		Session    map[string]any `json:"session"`
+		Version    string           `json:"version"`
+		ExportedAt string           `json:"exported_at"`
+		Session    map[string]any   `json:"session"`
 		Messages   []map[string]any `json:"messages"`
 	}
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
@@ -347,6 +447,7 @@ func TestToJSON_AttachmentsPresent(t *testing.T) {
 //   - attachment_kinds: sorted, deduplicated list
 //     of the per-attachment `kind` values
 //   - attachment_count: len(attachments)
+//
 // Both are always emitted (even when zero) so a
 // consumer doesn't have to nil-check before reading.
 func TestToJSON_AttachmentKindsSummary(t *testing.T) {
@@ -873,7 +974,7 @@ func TestIsRawPNGPayload(t *testing.T) {
 // The output must contain ONLY ASCII bytes (the
 // percent-encoding result); raw UTF-8 bytes for
 // Chinese / emoji / accented chars are illegal in the
-// `filename*=UTF-8''…` parameter per RFC 5987, and
+// `filename*=UTF-8”…` parameter per RFC 5987, and
 // WebView2 specifically mangles them. The previous
 // implementation wrote the rune's UTF-8 bytes through
 // when r >= 0x80, so the test that previously
@@ -883,13 +984,13 @@ func TestIsRawPNGPayload(t *testing.T) {
 func TestURLEncodeFilename_ASCIIOnly(t *testing.T) {
 	cases := []string{
 		"plain-ascii",
-		"调试记录",                  // Chinese
-		"déjà vu",                  // French accents
-		"emoji 🛠",                 // Emoji
-		"mixed 调试 .md",           // Mixed
-		"a/b\\c",                   // Unsafe chars
-		"",                         // Empty
-		"x",                        // Single byte
+		"调试记录",         // Chinese
+		"déjà vu",      // French accents
+		"emoji 🛠",      // Emoji
+		"mixed 调试 .md", // Mixed
+		"a/b\\c",       // Unsafe chars
+		"",             // Empty
+		"x",            // Single byte
 	}
 	for _, in := range cases {
 		got := URLEncodeFilename(in)
@@ -1334,7 +1435,7 @@ func TestToJSON_CombinedSources(t *testing.T) {
 			Attachments: []memory.Attachment{
 				{
 					Type: "image_url", Kind: "image",
-					URL: "data:image/png;base64,STRUCTURED",
+					URL:  "data:image/png;base64,STRUCTURED",
 					Name: "structured.png", Mime: "image/png",
 				},
 			},
@@ -1362,5 +1463,75 @@ func TestToJSON_CombinedSources(t *testing.T) {
 	// entry in the summary array.
 	if kinds, _ := got.Messages[0]["attachment_kinds"].([]any); len(kinds) != 1 || kinds[0] != "image" {
 		t.Errorf("attachment_kinds = %v, want [image] (dedup'd)", got.Messages[0]["attachment_kinds"])
+	}
+}
+
+func TestToPDF_EmbedsUnicodeFont(t *testing.T) {
+	probe := map[rune]struct{}{'中': {}, '文': {}, '测': {}, '试': {}}
+	if _, err := loadPDFUnicodeFont(probe); err != nil {
+		t.Skipf("no Unicode font available for PDF regression: %v", err)
+	}
+
+	conv := &memory.Conversation{
+		ID:        "conv_pdf",
+		Title:     "中文导出测试",
+		CreatedAt: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 8, 26, 10, 1, 0, 0, time.UTC),
+	}
+	msgs := toFullMFs([]llm.Message{
+		{Role: "user", Content: "请导出这段中文，不要乱码。"},
+		{Role: "assistant", Content: "PDF 应嵌入 Unicode 字体。"},
+	})
+
+	got := ToPDF(conv, msgs)
+	if !bytes.HasPrefix(got, []byte("%PDF-")) {
+		t.Fatalf("PDF header missing")
+	}
+	for _, want := range [][]byte{
+		[]byte("/Encoding /Identity-H"),
+		[]byte("/FontFile2"),
+		[]byte("/CIDToGIDMap"),
+		[]byte("/ToUnicode"),
+		[]byte("<4E2D> <4E2D>"),
+	} {
+		if !bytes.Contains(got, want) {
+			t.Errorf("PDF missing %q", want)
+		}
+	}
+	if bytes.Contains(got, []byte("/STSong-Light")) {
+		t.Errorf("PDF should not rely on viewer-provided STSong-Light")
+	}
+}
+
+func TestPDFUnicodeFontCoversWindowsCommandChinese(t *testing.T) {
+	probe := map[rune]struct{}{}
+	collectPDFRunes(probe, "驱动器中的卷是 Data 卷的序列号 目录 字节 可用")
+	font, err := loadPDFUnicodeFont(probe)
+	if err != nil {
+		t.Skipf("no Unicode font available for PDF regression: %v", err)
+	}
+	for rr := range probe {
+		if rr == ' ' {
+			continue
+		}
+		if font.glyphs[rr] == 0 {
+			t.Fatalf("font selected for PDF is missing glyph for %q (%U)", rr, rr)
+		}
+	}
+}
+
+func TestPDFUnicodeFontDoesNotFallbackForNonCriticalMissingGlyph(t *testing.T) {
+	probe := map[rune]struct{}{}
+	collectPDFRunes(probe, "中文导出")
+	probe['\u0378'] = struct{}{}
+	font, err := loadPDFUnicodeFont(probe)
+	if err != nil {
+		t.Skipf("no Unicode font available for PDF regression: %v", err)
+	}
+	if font.glyphs['中'] == 0 {
+		t.Fatalf("font selected for PDF is missing critical CJK glyph")
+	}
+	if font.glyphs['\u0378'] == 0 {
+		t.Fatalf("missing non-critical glyph should map to a fallback glyph")
 	}
 }

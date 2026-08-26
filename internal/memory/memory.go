@@ -1722,6 +1722,25 @@ type MessageFull struct {
 	CreatedAt   int64           `json:"created_at"`
 }
 
+func normalizePartsRawMessage(raw json.RawMessage) json.RawMessage {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "[") {
+		return raw
+	}
+	var encoded string
+	if err := json.Unmarshal([]byte(trimmed), &encoded); err != nil {
+		return raw
+	}
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" || encoded == "null" {
+		return nil
+	}
+	return json.RawMessage(encoded)
+}
+
 // GetMessagesFull is like GetMessages but returns the
 // rich shape the CLI /export path needs. It re-hydrates
 // the assistant message's `parts` (thinking / tool cards /
@@ -1845,8 +1864,8 @@ func (s *Store) GetMessagesFull() []MessageFull {
 		if err := json.Unmarshal([]byte(r.meta), &meta); err != nil {
 			continue
 		}
-		if v, ok := meta["parts"]; ok && len(v) > 0 && string(v) != "null" {
-			out[i].Parts = v
+		if v, ok := meta["parts"]; ok {
+			out[i].Parts = normalizePartsRawMessage(v)
 		}
 		if v, ok := meta["thinking"]; ok {
 			// Thinking is stored as a JSON string
@@ -2064,8 +2083,8 @@ func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
 		if err := json.Unmarshal([]byte(r.meta), &meta); err != nil {
 			continue
 		}
-		if v, ok := meta["parts"]; ok && len(v) > 0 && string(v) != "null" {
-			out[i].Parts = v
+		if v, ok := meta["parts"]; ok {
+			out[i].Parts = normalizePartsRawMessage(v)
 		}
 		if v, ok := meta["thinking"]; ok {
 			var thinkingText string
