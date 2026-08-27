@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/style"
@@ -32,9 +33,11 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	if sessionID == "" {
 		return fmt.Errorf("im event missing session key")
 	}
-	if err := h.store.EnsureConversation(sessionID, imConversationTitle(ev)); err != nil {
+	title := imConversationTitle(ev)
+	if err := h.store.EnsureConversation(sessionID, title); err != nil {
 		return fmt.Errorf("ensure im conversation: %w", err)
 	}
+	h.ensureIMConversationTitle(sessionID, ev, title)
 	if _, loaded := h.sessionLocks.LoadOrStore(sessionID, struct{}{}); loaded {
 		return fmt.Errorf("a message is already being processed for this session")
 	}
@@ -49,11 +52,7 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	h.hydrateSessionTodos(sessionID)
 	meta := h.ensureMetaLoaded(sessionID)
 	persona := plan.Persona
-	provider := h.sessionProvider(sessionID)
-	model := h.sessionModel(sessionID, provider)
-	if strings.TrimSpace(persona.Model) != "" {
-		model = strings.TrimSpace(persona.Model)
-	}
+	provider, model := h.imProviderModel(persona)
 	reqStyle := style.Style(h.sessionStyle(sessionID))
 	if strings.TrimSpace(persona.Style) != "" {
 		reqStyle = style.Style(strings.TrimSpace(persona.Style))
@@ -139,12 +138,15 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	return nil
 }
 
-func imConversationTitle(ev im.IMEvent) string {
-	if name := strings.TrimSpace(ev.Sender.DisplayName); name != "" {
-		return name
+func (h *Handler) imProviderModel(persona config.IMPersona) (string, string) {
+	cfg := h.getCfg()
+	if cfg == nil {
+		return "", ""
 	}
-	if ev.Chat.ChatID != "" {
-		return ev.Chat.ChatID
+	provider := strings.TrimSpace(cfg.LLM.Default)
+	model := h.defaultModelForProvider(provider)
+	if override := strings.TrimSpace(persona.Model); override != "" {
+		model = override
 	}
-	return ev.Platform
+	return provider, model
 }

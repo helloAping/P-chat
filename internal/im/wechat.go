@@ -24,12 +24,13 @@ import (
 
 const (
 	defaultWeChatAPIBase       = "https://ilinkai.weixin.qq.com"
-	wechatDefaultAppID         = "wx95125f84d7df0295"
-	wechatDefaultClientVersion = "1"
+	wechatDefaultAppID         = "bot"
+	wechatDefaultClientVersion = "132102"
 	wechatChannelVersion       = "2.0.0"
 	wechatBotAgent             = "P-Chat/1.0"
 	wechatPollInterval         = 2 * time.Second
 	wechatRequestTimeout       = 40 * time.Second
+	wechatNotifyTimeout        = 5 * time.Second
 	wechatStateFileName        = "wechat-state.json"
 	wechatLongPollPath         = "/ilink/bot/getupdates"
 	wechatSendMessagePath      = "/ilink/bot/sendmessage"
@@ -226,8 +227,8 @@ func (a *WeChatAdapter) MaxTextLen() int { return 2000 }
 func (a *WeChatAdapter) MarkdownDialect() MarkdownDialect { return MarkdownPlain }
 
 func (a *WeChatAdapter) pollLoop(ctx context.Context, in chan<- IMEvent) {
-	a.notifyState(ctx, wechatNotifyStartPath)
-	defer a.notifyState(context.Background(), wechatNotifyStopPath)
+	a.notifyStateAsync(ctx, wechatNotifyStartPath)
+	defer a.notifyStateAsync(context.Background(), wechatNotifyStopPath)
 
 	cursor := a.currentCursor()
 	backoff := wechatPollInterval
@@ -332,9 +333,25 @@ func (a *WeChatAdapter) sendMessage(ctx context.Context, chunk IMOutChunk) error
 	return nil
 }
 
-func (a *WeChatAdapter) notifyState(ctx context.Context, path string) {
+func (a *WeChatAdapter) notifyStateAsync(ctx context.Context, path string) {
+	go func() {
+		if err := a.notifyState(ctx, path); err != nil {
+			a.rememberLastError(err)
+		}
+	}()
+}
+
+func (a *WeChatAdapter) notifyState(ctx context.Context, path string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, wechatNotifyTimeout)
+	defer cancel()
 	var noop map[string]any
-	_ = a.postJSON(ctx, path, map[string]any{}, &noop)
+	if err := a.postJSON(ctx, path, map[string]any{}, &noop); err != nil {
+		return fmt.Errorf("wechat notify %s: %w", path, err)
+	}
+	return nil
 }
 
 func (a *WeChatAdapter) getUpdates(ctx context.Context, cursor string) (wechatUpdatesResponse, error) {
@@ -499,6 +516,15 @@ func (a *WeChatAdapter) setError(err error) {
 	a.mu.Unlock()
 }
 
+func (a *WeChatAdapter) rememberLastError(err error) {
+	if err == nil {
+		return
+	}
+	a.mu.Lock()
+	a.lastError = err.Error()
+	a.mu.Unlock()
+}
+
 func (a *WeChatAdapter) markPollAttempt() {
 	a.mu.Lock()
 	a.lastPollAt = time.Now()
@@ -556,15 +582,32 @@ func (a *WeChatAdapter) saveStateLocked() error {
 }
 
 type wechatUpdatesResponse struct {
-	Ret      int               `json:"ret,omitempty"`
-	ErrCode  int               `json:"errcode,omitempty"`
-	Cursor   string            `json:"get_updates_buf,omitempty"`
-	Messages []json.RawMessage `json:"msgs,omitempty"`
-	Data     map[string]any    `json:"data,omitempty"`
+	Ret              int               `json:"ret,omitempty"`
+	ErrCode          int               `json:"errcode,omitempty"`
+	Cursor           string            `json:"get_updates_buf,omitempty"`
+	CursorAlias      string            `json:"cursor,omitempty"`
+	NextCursor       string            `json:"next_cursor,omitempty"`
+	Messages         []json.RawMessage `json:"-"`
+	MessagesRaw      json.RawMessage   `json:"msgs,omitempty"`
+	MessagesAliasRaw json.RawMessage   `json:"messages,omitempty"`
+	MsgListRaw       json.RawMessage   `json:"msg_list,omitempty"`
+	MessageListRaw   json.RawMessage   `json:"message_list,omitempty"`
+	UpdatesRaw       json.RawMessage   `json:"updates,omitempty"`
+	ListRaw          json.RawMessage   `json:"list,omitempty"`
+	Data             map[string]any    `json:"data,omitempty"`
 }
 
 func (r *wechatUpdatesResponse) normalize() {
-	if r == nil || len(r.Data) == 0 {
+	if r == nil {
+		return
+	}
+	if r.Cursor == "" {
+		r.Cursor = firstNonEmptyString(r.CursorAlias, r.NextCursor)
+	}
+	if len(r.Messages) == 0 {
+		r.Messages = firstRawMessages(r.MessagesRaw, r.MessagesAliasRaw, r.MsgListRaw, r.MessageListRaw, r.UpdatesRaw, r.ListRaw)
+	}
+	if len(r.Data) == 0 {
 		return
 	}
 	if r.Cursor == "" {
@@ -594,6 +637,44 @@ func (r *wechatUpdatesResponse) normalize() {
 	if len(r.Messages) == 0 {
 		r.Messages = rawMessagesFromAny(r.Data["list"])
 	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstRawMessages(values ...json.RawMessage) []json.RawMessage {
+	for _, value := range values {
+		if out := rawMessagesFromJSON(value); len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+func rawMessagesFromJSON(value json.RawMessage) []json.RawMessage {
+	if len(value) == 0 {
+		return nil
+	}
+	var messages []json.RawMessage
+	if err := json.Unmarshal(value, &messages); err == nil {
+		return messages
+	}
+	var wrapped map[string]any
+	if err := json.Unmarshal(value, &wrapped); err != nil {
+		return nil
+	}
+	for _, key := range []string{"msgs", "messages", "msg_list", "message_list", "updates", "list"} {
+		if out := rawMessagesFromAny(wrapped[key]); len(out) > 0 {
+			return out
+		}
+	}
+	return nil
 }
 
 func rawMessagesFromAny(value any) []json.RawMessage {
@@ -632,7 +713,7 @@ func parseWeChatEvent(raw json.RawMessage, cfg config.IMPlatformConfig) (IMEvent
 	if senderID == "" {
 		senderID = firstString(mapValue(payload, "sender"), "id", "user_id", "open_id")
 	}
-	if isWeChatSelfSender(senderID, cfg) {
+	if isWeChatBotMessage(payload, senderID, cfg) {
 		return IMEvent{}, false, nil
 	}
 	chatID := firstString(payload, "chat_id", "room_id", "group_id", "conversation_id")
@@ -689,20 +770,31 @@ func parseWeChatEvent(raw json.RawMessage, cfg config.IMPlatformConfig) (IMEvent
 }
 
 func unwrapWeChatPayload(payload map[string]any) map[string]any {
-	for _, key := range []string{"data", "msg", "message"} {
-		if next := mapValue(payload, key); len(next) > 0 {
-			payload = next
+	for i := 0; i < 4; i++ {
+		changed := false
+		for _, key := range []string{"data", "msg", "message"} {
+			if next := mapValue(payload, key); len(next) > 0 {
+				payload = next
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			break
 		}
 	}
 	return payload
 }
 
-func isWeChatSelfSender(senderID string, cfg config.IMPlatformConfig) bool {
+func isWeChatBotMessage(payload map[string]any, senderID string, cfg config.IMPlatformConfig) bool {
+	if messageType := firstInt64(payload, "message_type", "msg_type"); messageType == 2 {
+		return true
+	}
 	senderID = strings.TrimSpace(senderID)
 	if senderID == "" {
 		return false
 	}
-	for _, key := range []string{"ilink_bot_id", "bot_id", "ilink_user_id"} {
+	for _, key := range []string{"ilink_bot_id", "bot_id"} {
 		if senderID == strings.TrimSpace(stringFromExtra(cfg.Extra, key)) {
 			return true
 		}

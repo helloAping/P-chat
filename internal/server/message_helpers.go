@@ -1198,7 +1198,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 	model := h.sessionModel(cv.ID, provider)
 	return SessionResponse{
 		ID:                  cv.ID,
-		Title:               cv.Title,
+		Title:               imConversationResponseTitle(cv.ID, cv.Title),
 		Provider:            provider,
 		Model:               model,
 		Style:               m.Style,

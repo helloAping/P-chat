@@ -5,7 +5,13 @@ import {
 } from 'naive-ui'
 import { Bot, Key, MessageSquare, RotateCw } from './icons'
 import * as api from '../api/client'
-import { hasWeChatQRPayload, resolveWeChatQRImageSource, resolveWeChatQRValue } from '../im/wechatQr'
+import {
+  hasWeChatQRPayload,
+  isTerminalWeChatQRStatus,
+  isWeChatQRSessionMissingMessage,
+  resolveWeChatQRImageSource,
+  resolveWeChatQRValue,
+} from '../im/wechatQr'
 
 const message = useMessage()
 
@@ -66,9 +72,12 @@ const wechatQRStatusText = computed(() => {
 })
 const wechatQRHint = computed(() => {
   if (wechatQRError.value) return wechatQRError.value
+  const currentStatus = wechatQRStatus.value
+  const currentMessage = wechatQRSession.value?.message?.trim()
+  if ((currentStatus === 'waiting' || currentStatus === 'scanned') && currentMessage && currentMessage !== '等待扫码') return currentMessage
   if (wechatQRValue.value && !wechatQRSource.value) return '已在本地生成二维码，使用微信扫码即可连接。'
   if (wechatQRPayloadAvailable.value && !wechatQRSource.value) return '微信返回的二维码内容暂时不可显示，请点击重新获取。'
-  switch (wechatQRStatus.value) {
+  switch (currentStatus) {
     case 'waiting': return '打开微信扫码登录，扫码后请在手机上确认。'
     case 'scanned': return '请在手机微信中确认登录，确认后这里会自动完成连接。'
     case 'confirmed': return '微信 Bot 登录态已保存，消息通道启动后状态会显示为轮询中。'
@@ -416,14 +425,26 @@ async function pollWechatQR() {
     }
     scheduleWechatQRPoll(session)
   } catch (err: any) {
-    wechatQRError.value = friendlyAPIError(err)
+    const friendly = friendlyAPIError(err)
+    const current = wechatQRSession.value
+    if (current?.id && !isTerminalWeChatQRStatus(current.status) && !isWeChatQRSessionMissingMessage(friendly)) {
+      wechatQRError.value = ''
+      wechatQRSession.value = {
+        ...current,
+        message: friendly || '微信扫码服务暂时无响应，正在继续等待',
+        poll_after_ms: Math.max(current.poll_after_ms || 2000, 2000),
+      }
+      scheduleWechatQRPoll(wechatQRSession.value)
+      return
+    }
+    wechatQRError.value = friendly
     stopWechatQRPoll()
   }
 }
 
 function scheduleWechatQRPoll(session: api.WeChatQRSession) {
   stopWechatQRPoll()
-  if (!session.id || session.status === 'confirmed' || session.status === 'expired' || session.status === 'canceled') return
+  if (!session.id || isTerminalWeChatQRStatus(session.status)) return
   const delay = Math.max(1000, Math.min(session.poll_after_ms || 2000, 5000))
   wechatQRTimer = setTimeout(() => {
     void pollWechatQR()

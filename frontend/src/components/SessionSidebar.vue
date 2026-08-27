@@ -42,11 +42,12 @@ import * as api from '../api/client'
 import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
 import { checkUpdate } from '../api/update'
 import type { UpdateInfo } from '../api/update'
-import type { SearchResult } from '../api/client'
+import type { SearchResult, Session } from '../api/client'
 import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
 import BrandLogo from './BrandLogo.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
+import { displaySessionTitle, sessionSourceFromID } from '../im/sessionSource'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
@@ -198,6 +199,15 @@ function shortTime(ts: number, group: string): string {
     default:
       return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`
   }
+}
+
+function sessionDisplayTitle(s: Session): string {
+  return displaySessionTitle(s.title || '', s.id)
+}
+
+function sessionSourceTitle(id: string): string {
+  const source = sessionSourceFromID(id)
+  return source ? `${source.label} 会话` : ''
 }
 
 // ---------------------------------------------------------------------------
@@ -909,7 +919,17 @@ onMounted(() => {
                     <span v-if="isPinned(s.id)" class="item-pin" :title="'已置顶'" aria-label="已置顶">
                       <Pin :size="11" />
                     </span>
-                    <span class="item-title">{{ s.title || '(无标题)' }}</span>
+                    <span
+                      v-if="sessionSourceFromID(s.id)"
+                      class="item-source-badge"
+                      :class="`item-source-badge--${sessionSourceFromID(s.id)?.platform}`"
+                      :title="sessionSourceTitle(s.id)"
+                      :aria-label="sessionSourceTitle(s.id)"
+                    >
+                      <MessageSquare :size="10" />
+                      <span>{{ sessionSourceFromID(s.id)?.label }}</span>
+                    </span>
+                    <span class="item-title">{{ sessionDisplayTitle(s) }}</span>
                     <span v-if="state.streaming[s.id]" class="streaming-dot" title="正在生成" aria-label="正在生成">
                       <Circle :size="7" fill="currentColor" />
                     </span>
@@ -1438,7 +1458,28 @@ onMounted(() => {
   flex-shrink: 0;
   display: inline-flex;
 }
+.item-source-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--brand-50);
+  color: var(--brand-600);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.item-source-badge svg {
+  flex-shrink: 0;
+}
+.item-source-badge--wechat {
+  background: var(--success-50);
+  color: var(--success-500);
+}
 .item-title {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

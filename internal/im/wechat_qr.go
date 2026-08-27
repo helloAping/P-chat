@@ -1,6 +1,7 @@
 package im
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 )
 
 const defaultWeChatQRBaseURL = "https://ilinkai.weixin.qq.com"
+const wechatQRTransientPollMessage = "微信扫码服务暂时无响应，正在继续等待"
 
 // WeChatQRServiceError is returned when the QR service cannot be reached.
 type WeChatQRServiceError struct {
@@ -35,21 +37,25 @@ type WeChatQRClient struct {
 	BaseURL       string
 	AppID         string
 	ClientVersion string
+	LocalTokens   []string
 	HTTPClient    *http.Client
 }
 
 // WeChatQRSession is the user-facing snapshot of a QR login flow.
 type WeChatQRSession struct {
-	ID          string            `json:"id"`
-	Status      string            `json:"status"`
-	QRCode      string            `json:"qrcode,omitempty"`
-	QRData      string            `json:"qr_data,omitempty"`
-	QRURL       string            `json:"qr_url,omitempty"`
-	Message     string            `json:"message,omitempty"`
-	ExpiresAt   time.Time         `json:"expires_at,omitempty"`
-	PollAfterMS int               `json:"poll_after_ms"`
-	Account     map[string]string `json:"account,omitempty"`
-	BaseURL     string            `json:"-"`
+	ID            string            `json:"id"`
+	Status        string            `json:"status"`
+	QRCode        string            `json:"qrcode,omitempty"`
+	QRData        string            `json:"qr_data,omitempty"`
+	QRURL         string            `json:"qr_url,omitempty"`
+	Message       string            `json:"message,omitempty"`
+	ExpiresAt     time.Time         `json:"expires_at,omitempty"`
+	PollAfterMS   int               `json:"poll_after_ms"`
+	Account       map[string]string `json:"account,omitempty"`
+	BaseURL       string            `json:"-"`
+	AppID         string            `json:"-"`
+	ClientVersion string            `json:"-"`
+	LocalTokens   []string          `json:"-"`
 }
 
 // WeChatCredential contains the persisted credential returned after scan.
@@ -71,7 +77,7 @@ type WeChatQRManager struct {
 // NewWeChatQRManager creates a manager for WeChat Bot QR login.
 func NewWeChatQRManager(client WeChatQRClient) *WeChatQRManager {
 	if client.HTTPClient == nil {
-		client.HTTPClient = &http.Client{Timeout: 12 * time.Second}
+		client.HTTPClient = &http.Client{Timeout: wechatRequestTimeout}
 	}
 	return &WeChatQRManager{
 		client:   client,
@@ -102,6 +108,9 @@ func (m *WeChatQRManager) Start(ctx context.Context, platform config.IMPlatformC
 		qr.ExpiresAt = time.Now().Add(3 * time.Minute)
 	}
 	qr.BaseURL = client.baseURL()
+	qr.AppID = client.appID()
+	qr.ClientVersion = client.clientVersion()
+	qr.LocalTokens = client.localTokens()
 	m.mu.Lock()
 	m.sessions[qr.ID] = qr
 	m.mu.Unlock()
@@ -118,11 +127,28 @@ func (m *WeChatQRManager) Poll(ctx context.Context, id string) (WeChatQRSession,
 	}
 	client := m.client
 	client.BaseURL = session.BaseURL
+	client.AppID = session.AppID
+	client.ClientVersion = session.ClientVersion
+	client.LocalTokens = append([]string(nil), session.LocalTokens...)
 	if client.HTTPClient == nil {
-		client.HTTPClient = &http.Client{Timeout: 12 * time.Second}
+		client.HTTPClient = &http.Client{Timeout: wechatRequestTimeout}
 	}
 	next, cred, err := client.Poll(ctx, session.QRCode)
 	if err != nil {
+		var unavailable WeChatQRServiceError
+		if errors.As(err, &unavailable) {
+			session.Message = wechatQRTransientPollMessage
+			if session.Status == "" {
+				session.Status = "waiting"
+			}
+			if session.PollAfterMS <= 0 {
+				session.PollAfterMS = 2000
+			}
+			m.mu.Lock()
+			m.sessions[id] = session
+			m.mu.Unlock()
+			return session, WeChatCredential{}, nil
+		}
 		return session, WeChatCredential{}, err
 	}
 	next.ID = session.ID
@@ -141,7 +167,12 @@ func (m *WeChatQRManager) Poll(ctx context.Context, id string) (WeChatQRSession,
 	if next.PollAfterMS <= 0 {
 		next.PollAfterMS = 2000
 	}
-	next.BaseURL = session.BaseURL
+	if next.BaseURL == "" {
+		next.BaseURL = session.BaseURL
+	}
+	next.AppID = session.AppID
+	next.ClientVersion = session.ClientVersion
+	next.LocalTokens = append([]string(nil), session.LocalTokens...)
 	m.mu.Lock()
 	m.sessions[id] = next
 	if next.Status == "confirmed" || next.Status == "expired" || next.Status == "canceled" {
@@ -168,15 +199,27 @@ func (m *WeChatQRManager) clientFor(platform config.IMPlatformConfig) WeChatQRCl
 	if version := stringFromExtra(platform.Extra, "client_version", "ilink_client_version"); version != "" {
 		client.ClientVersion = version
 	}
+	client.LocalTokens = appendUniqueStrings(client.LocalTokens, platform.Token)
+	client.LocalTokens = appendUniqueStrings(client.LocalTokens, stringFromExtra(platform.Extra, "bot_token", "local_token", "token"))
+	client.LocalTokens = appendUniqueStrings(client.LocalTokens, stringsFromExtra(platform.Extra, "local_token_list", "local_tokens")...)
 	return client
 }
 
 func (c WeChatQRClient) Start(ctx context.Context) (WeChatQRSession, error) {
 	endpoint := strings.TrimRight(c.baseURL(), "/") + "/ilink/bot/get_bot_qrcode?bot_type=3"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	localTokens := c.localTokens()
+	if localTokens == nil {
+		localTokens = []string{}
+	}
+	encoded, err := json.Marshal(map[string]any{"local_token_list": localTokens})
+	if err != nil {
+		return WeChatQRSession{}, fmt.Errorf("encode wechat qr request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(encoded))
 	if err != nil {
 		return WeChatQRSession{}, err
 	}
+	req.Header.Set("Content-Type", "application/json")
 	c.setCommonHeaders(req)
 	var raw map[string]any
 	if err := c.doJSON(req, &raw); err != nil {
@@ -193,14 +236,18 @@ func (c WeChatQRClient) Start(ctx context.Context) (WeChatQRSession, error) {
 		return WeChatQRSession{}, errors.New("wechat qr response did not include qrcode")
 	}
 	return WeChatQRSession{
-		ID:          qrcode,
-		Status:      "waiting",
-		QRCode:      qrcode,
-		QRData:      qrData,
-		QRURL:       img,
-		Message:     "等待扫码",
-		PollAfterMS: 2000,
-		ExpiresAt:   time.Now().Add(3 * time.Minute),
+		ID:            qrcode,
+		Status:        "waiting",
+		QRCode:        qrcode,
+		QRData:        qrData,
+		QRURL:         img,
+		Message:       "等待扫码",
+		PollAfterMS:   2000,
+		ExpiresAt:     time.Now().Add(3 * time.Minute),
+		BaseURL:       c.baseURL(),
+		AppID:         c.appID(),
+		ClientVersion: c.clientVersion(),
+		LocalTokens:   c.localTokens(),
 	}, nil
 }
 
@@ -222,8 +269,10 @@ func (c WeChatQRClient) Poll(ctx context.Context, qrcode string) (WeChatQRSessio
 	if len(data) == 0 {
 		data = raw
 	}
-	status := normalizeWeChatQRStatus(firstString(data, "status", "state", "qrcode_status", "qr_status"))
+	rawStatus := firstString(data, "status", "state", "qrcode_status", "qr_status")
+	status := normalizeWeChatQRStatus(rawStatus)
 	msg := firstString(data, "message", "msg", "errmsg")
+	redirectBaseURL := resolveWeChatRedirectBaseURL(firstString(data, "redirect_host", "redirectHost", "redirect_url", "redirectUrl", "redirect_base_url", "redirectBaseURL"), c.baseURL())
 	cred := WeChatCredential{
 		Token:    firstString(data, "bot_token", "botToken", "bot_access_token", "botAccessToken", "token", "access_token", "accessToken"),
 		BotID:    firstString(data, "ilink_bot_id", "bot_id", "account_id"),
@@ -241,9 +290,24 @@ func (c WeChatQRClient) Poll(ctx context.Context, qrcode string) (WeChatQRSessio
 				if cred.UserID == "" {
 					cred.UserID = firstString(nested, "ilink_user_id", "user_id")
 				}
+				if cred.BaseURL == "" {
+					cred.BaseURL = firstString(nested, "baseurl", "base_url")
+				}
+				if cred.Nickname == "" {
+					cred.Nickname = firstString(nested, "nickname", "name")
+				}
 				if cred.Token != "" {
 					break
 				}
+			}
+		}
+	}
+	if isWeChatBoundRedirect(rawStatus) && cred.Token == "" {
+		if tokens := c.localTokens(); len(tokens) > 0 {
+			cred.Token = tokens[0]
+			status = "confirmed"
+			if msg == "" {
+				msg = "微信已绑定当前 Bot，已复用本地连接凭证"
 			}
 		}
 	}
@@ -254,10 +318,14 @@ func (c WeChatQRClient) Poll(ctx context.Context, qrcode string) (WeChatQRSessio
 		status = "waiting"
 	}
 	session := WeChatQRSession{
-		Status:      status,
-		QRCode:      qrcode,
-		Message:     msg,
-		PollAfterMS: 2000,
+		Status:        status,
+		QRCode:        qrcode,
+		Message:       msg,
+		PollAfterMS:   2000,
+		BaseURL:       redirectBaseURL,
+		AppID:         c.appID(),
+		ClientVersion: c.clientVersion(),
+		LocalTokens:   c.localTokens(),
 	}
 	if cred.Token != "" {
 		session.Account = map[string]string{
@@ -281,7 +349,11 @@ func (c WeChatQRClient) doJSON(req *http.Request, out any) error {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("wechat qr HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		err := fmt.Errorf("wechat qr HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		if isTransientWeChatQRHTTPStatus(resp.StatusCode) {
+			return WeChatQRServiceError{Err: err}
+		}
+		return err
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("decode wechat qr response: %w", err)
@@ -327,12 +399,18 @@ func (c WeChatQRClient) clientVersion() string {
 	return wechatDefaultClientVersion
 }
 
+func (c WeChatQRClient) localTokens() []string {
+	return appendUniqueStrings(nil, c.LocalTokens...)
+}
+
 func normalizeWeChatQRStatus(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "confirmed", "confirm", "success", "login_success", "logged_in":
 		return "confirmed"
-	case "scaned", "scanned", "scanned_wait_confirm", "wait_confirm":
+	case "scaned", "scanned", "scanned_wait_confirm", "wait_confirm", "scaned_but_redirect", "scanned_but_redirect":
 		return "scanned"
+	case "binded_redirect", "bound_redirect", "already_connected", "already_binded":
+		return "confirmed"
 	case "expired", "expire", "timeout":
 		return "expired"
 	case "canceled", "cancelled", "cancel":
@@ -341,6 +419,24 @@ func normalizeWeChatQRStatus(raw string) string {
 		return "waiting"
 	default:
 		return raw
+	}
+}
+
+func isWeChatBoundRedirect(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "binded_redirect", "bound_redirect", "already_connected", "already_binded":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTransientWeChatQRHTTPStatus(code int) bool {
+	switch code {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 524:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -381,6 +477,83 @@ func stringFromExtra(extra map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func stringsFromExtra(extra map[string]any, keys ...string) []string {
+	if extra == nil {
+		return nil
+	}
+	var out []string
+	for _, key := range keys {
+		value, ok := extra[key]
+		if !ok {
+			continue
+		}
+		switch v := value.(type) {
+		case []string:
+			out = appendUniqueStrings(out, v...)
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					out = appendUniqueStrings(out, s)
+				}
+			}
+		case string:
+			for _, part := range strings.Split(v, ",") {
+				out = appendUniqueStrings(out, part)
+			}
+		}
+	}
+	return out
+}
+
+func appendUniqueStrings(base []string, values ...string) []string {
+	out := append([]string(nil), base...)
+	seen := map[string]struct{}{}
+	for _, value := range out {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			seen[trimmed] = struct{}{}
+		}
+	}
+	out = out[:0]
+	for _, value := range base {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func resolveWeChatRedirectBaseURL(raw, currentBaseURL string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if u, err := url.Parse(raw); err == nil && u.IsAbs() {
+		return strings.TrimRight(raw, "/")
+	}
+	scheme := "https"
+	if current, err := url.Parse(strings.TrimSpace(currentBaseURL)); err == nil && current.Scheme != "" {
+		scheme = current.Scheme
+	}
+	host := strings.Trim(strings.TrimPrefix(raw, "//"), "/")
+	if host == "" {
+		return ""
+	}
+	return scheme + "://" + host
 }
 
 func normalizeWeChatQRAssetURL(raw, baseURL string) string {
