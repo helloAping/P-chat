@@ -170,6 +170,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/providers", h.Providers)
 		api.GET("/providers/:name", h.GetProvider)
 		api.POST("/providers", h.AddProvider)
+		// Probe before a provider exists (add-provider dialog).
+		api.POST("/providers/probe-models", h.ProbeUpstreamModels)
 		api.DELETE("/providers/:name", h.DeleteProvider)
 		api.PATCH("/providers/:name", h.UpdateProvider)
 		api.POST("/providers/:name/default", h.SetDefaultProvider)

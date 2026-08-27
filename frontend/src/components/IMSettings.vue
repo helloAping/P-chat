@@ -719,7 +719,7 @@ onBeforeUnmount(() => {
         <div class="im-section-header">
           <h3 class="im-section-title">高级配置</h3>
         </div>
-        <NCollapse arrow-placement="right">
+        <NCollapse class="settings-collapse" arrow-placement="right">
           <NCollapseItem title="平台连接 JSON" name="platforms">
             <label class="im-json-field">
               <span>platforms</span>

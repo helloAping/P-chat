@@ -18,7 +18,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 | `message_helpers.go` | 历史消息响应整形、parts 解码、内部行过滤、附件合并 | `ListMessages()`, `buildMessageResponse()` |
 | `handler_test.go` | Handler 单元测试 | |
 | `knowledge_api.go` | 知识库 CRUD + 扫描管道 + 三层索引 | `ListSections`, `ListNodes`, `GetNodeContent`, `ClearKnowledgeBase`, `indexScan` |
-| `provider_api.go` | Provider/Model CRUD + 上游模型查询 | |
+| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe | `FetchUpstreamModels`, `ProbeUpstreamModels` |
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
 | `command_api.go` | 斜杠命令执行 | |

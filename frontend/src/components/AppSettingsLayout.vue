@@ -359,10 +359,9 @@ function isActive(name: string) {
 }
 
 /* Content column — fills the remaining space.
- * The active settings pane owns vertical scrolling. Keeping
- * this shell overflow-hidden avoids nested scroll containers
- * and prevents short tabs from leaving a dead-looking blank
- * band below their content. */
+ * Active pane owns vertical scrolling. surface-0 keeps a
+ * clear contrast against surface-1 cards / collapse items
+ * so each settings section reads as a card, not a flat sheet. */
 .settings-content {
   flex: 1;
   display: flex;

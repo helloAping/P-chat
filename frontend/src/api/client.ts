@@ -1103,6 +1103,17 @@ export const fetchUpstreamModels = (provider: string) =>
     `/api/v1/providers/${encodeURIComponent(provider)}/upstream-models`,
   )
 
+/** Probe upstream /models with ephemeral credentials (add-provider dialog). */
+export const probeUpstreamModels = (body: {
+  base_url?: string
+  api_key: string
+  protocol?: string
+}) =>
+  jsonFetch<{ models: UpstreamModelItem[]; base_url: string }>(
+    '/api/v1/providers/probe-models',
+    { method: 'POST', body: JSON.stringify(body) },
+  )
+
 // --- Streaming send ---
 export interface InlineAttachment {
   // 'image_url' for images, 'audio_url' / 'video_url' for media
