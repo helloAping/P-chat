@@ -18,6 +18,10 @@ export function GetBackendURL() {
   return window['go']['main']['App']['GetBackendURL']();
 }
 
+export function InstallUpdate(arg1, arg2) {
+  return window['go']['main']['App']['InstallUpdate'](arg1, arg2);
+}
+
 export function OpenExplorer(arg1) {
   return window['go']['main']['App']['OpenExplorer'](arg1);
 }

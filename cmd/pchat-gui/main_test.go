@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
@@ -66,6 +68,81 @@ func TestServerBinaryCandidates_IncludesMacResourcesWhenDarwin(t *testing.T) {
 	}
 	if runtime.GOOS != "darwin" && found {
 		t.Fatalf("non-darwin candidates should not include macOS Resources path: %#v", candidates)
+	}
+}
+
+func TestUpdaterBinaryName_MatchesPlatform(t *testing.T) {
+	got := updaterBinaryName()
+	if runtime.GOOS == "windows" {
+		if got != "pchat-updater.exe" {
+			t.Fatalf("updaterBinaryName() = %q, want pchat-updater.exe", got)
+		}
+		return
+	}
+	if got != "pchat-updater" {
+		t.Fatalf("updaterBinaryName() = %q, want pchat-updater", got)
+	}
+}
+
+func TestUpdaterBinaryCandidates_IncludesMacResourcesWhenDarwin(t *testing.T) {
+	dir := filepath.Join("P-Chat.app", "Contents", "MacOS")
+	candidates := updaterBinaryCandidates(dir)
+	resources := filepath.Join("P-Chat.app", "Contents", "Resources", updaterBinaryName())
+	found := false
+	for _, c := range candidates {
+		if c == resources {
+			found = true
+			break
+		}
+	}
+	if runtime.GOOS == "darwin" && !found {
+		t.Fatalf("darwin candidates should include %q: %#v", resources, candidates)
+	}
+	if runtime.GOOS != "darwin" && found {
+		t.Fatalf("non-darwin candidates should not include macOS Resources path: %#v", candidates)
+	}
+}
+
+func TestValidateUpdatePackageChecksSHA256(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "pchat-update-windows-amd64-v1.0.13.zip")
+	body := []byte("zip")
+	if err := os.WriteFile(file, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	got, err := validateUpdatePackage(file, hex.EncodeToString(sum[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == "" {
+		t.Fatal("validated path is empty")
+	}
+	bad := sha256.Sum256([]byte("other"))
+	if _, err := validateUpdatePackage(file, hex.EncodeToString(bad[:])); err == nil {
+		t.Fatal("expected sha mismatch error")
+	}
+}
+
+func TestStageUpdaterBinaryCopiesToDataRunnerDir(t *testing.T) {
+	dataHome := filepath.Join(t.TempDir(), ".p-chat")
+	t.Setenv("PCHAT_DATA_HOME", dataHome)
+	src := filepath.Join(t.TempDir(), updaterBinaryName())
+	if err := os.WriteFile(src, []byte("updater"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := stageUpdaterBinary(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(got) != filepath.Join(dataHome, "updates", "runner") {
+		t.Fatalf("runner dir = %q", filepath.Dir(got))
+	}
+	body, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "updater" {
+		t.Fatalf("runner body = %q", body)
 	}
 }
 

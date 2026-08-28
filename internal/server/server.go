@@ -154,6 +154,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	{
 		api.GET("/health", h.Health)
 		api.GET("/version", h.VersionHandler)
+		api.GET("/updates/check", h.CheckUpdate)
+		api.POST("/updates/download", h.DownloadUpdate)
 		api.GET("/migrations", h.MigrationStatus)
 		api.POST("/migrations/rollback", h.MigrationRollback)
 		api.GET("/styles", h.Styles)

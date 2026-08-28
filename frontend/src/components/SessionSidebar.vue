@@ -40,8 +40,8 @@ import {
 } from '../stores/chat'
 import * as api from '../api/client'
 import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
-import { checkUpdate } from '../api/update'
-import type { UpdateInfo } from '../api/update'
+import { checkUpdate, downloadUpdate, installDownloadedUpdate } from '../api/update'
+import type { UpdateDownloadResult, UpdateInfo } from '../api/update'
 import type { SearchResult, Session } from '../api/client'
 import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
@@ -52,6 +52,7 @@ import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
   ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
+  Download, RotateCw,
 } from './icons'
 
 const APP_VERSION = __APP_VERSION__
@@ -86,6 +87,9 @@ const exportSessionId = ref('')
 const exportFormat = ref<ExportFormat>('pdf')
 const exportSaving = ref(false)
 const updateInfo = ref<UpdateInfo | null>(null)
+const downloadedUpdate = ref<UpdateDownloadResult | null>(null)
+const updateDownloading = ref(false)
+const updateInstalling = ref(false)
 const pendingDeleteSessionId = ref('')
 const showConfirmDeleteSession = ref(false)
 const showOlderExpanded = ref(false)
@@ -759,21 +763,122 @@ function projectHasStreaming(path: string): boolean {
   return sessions.some(s => !!state.streaming[s.id])
 }
 
+const hasUpdateBlockingWork = computed(() =>
+  Object.keys(state.streaming).length > 0 ||
+  Object.values(state.sessionWorking).some(Boolean) ||
+  Object.values(state.sessionBackgroundSubAgentJobs).some(count => count > 0) ||
+  Object.values(state.sessionBackgroundHookMerging).some(Boolean),
+)
+
 function toggleTheme() {
   themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
 }
 
-function openAbout() {
-  showAbout.value = true
-  checkUpdate().then(info => {
-    if (info) updateInfo.value = info
+function versionLabel(value: string): string {
+  if (!value) return 'v' + APP_VERSION
+  return value.startsWith('v') || value.startsWith('V') ? value : `v${value}`
+}
+
+function updateSizeLabel(size?: number): string {
+  if (!size || size <= 0) return ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = size
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value = value / 1024
+    unit++
+  }
+  const digits = value >= 10 || unit === 0 ? 0 : 1
+  return `${value.toFixed(digits)} ${units[unit]}`
+}
+
+function updatePackageSize(info: UpdateInfo): string {
+  return updateSizeLabel(info.artifact?.size || info.patch?.size || info.full?.size)
+}
+
+function updateErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message
+  if (typeof err === 'string' && err) return err
+  return '未知错误'
+}
+
+async function refreshUpdate(force = false) {
+  const info = await checkUpdate(force)
+  if (!info) return
+  updateInfo.value = info
+  if (!info.hasUpdate || info.latest !== downloadedUpdate.value?.latest) {
+    downloadedUpdate.value = null
+  }
+}
+
+async function openUpdateURL() {
+  const url = updateInfo.value?.url
+  if (!url) {
+    message.warning('当前更新源没有提供下载地址')
+    return
+  }
+  try {
+    await api.openExternalURL(url)
+  } catch (err) {
+    message.error(`打开下载地址失败: ${updateErrorMessage(err)}`)
+  }
+}
+
+async function onDownloadUpdate() {
+  const info = updateInfo.value
+  if (!info?.hasUpdate) return
+  if (!info.installable) {
+    await openUpdateURL()
+    return
+  }
+
+  updateDownloading.value = true
+  try {
+    const result = await downloadUpdate()
+    downloadedUpdate.value = result
+    updateInfo.value = result
+    message.success('更新压缩包已下载并校验')
+    confirmRestartUpdate(result)
+  } catch (err) {
+    message.error(`下载更新失败: ${updateErrorMessage(err)}`)
+  } finally {
+    updateDownloading.value = false
+  }
+}
+
+function confirmRestartUpdate(update = downloadedUpdate.value) {
+  if (!update) return
+  const busyText = hasUpdateBlockingWork.value
+    ? '当前仍有会话或后台任务运行，重启会中断这些任务。'
+    : ''
+  dialog.warning({
+    title: '重启并更新 P-Chat',
+    content: `${update.fileName || '更新压缩包'} 已下载并通过校验。${busyText}是否现在重启并替换为最新版本 ${versionLabel(update.latest)}？`,
+    positiveText: '立即重启并更新',
+    negativeText: '稍后',
+    onPositiveClick: () => installUpdateNow(update),
   })
 }
 
+async function installUpdateNow(update = downloadedUpdate.value) {
+  if (!update) return
+  updateInstalling.value = true
+  try {
+    await installDownloadedUpdate(update)
+    message.info('正在重启并更新 P-Chat')
+  } catch (err) {
+    updateInstalling.value = false
+    message.error(`启动更新失败: ${updateErrorMessage(err)}`)
+  }
+}
+
+function openAbout() {
+  showAbout.value = true
+  void refreshUpdate()
+}
+
 onMounted(() => {
-  checkUpdate().then(info => {
-    if (info) updateInfo.value = info
-  })
+  void refreshUpdate()
 })
 </script>
 
@@ -1144,9 +1249,42 @@ onMounted(() => {
         <template v-if="updateInfo">
           <div v-if="updateInfo.hasUpdate" class="update-banner">
             <NTag type="warning" size="small">发现新版本</NTag>
-            <p>发现新版本 <strong>{{ updateInfo.latest }}</strong> · 当前 {{ APP_VERSION }}</p>
+            <p>最新版本 <strong>{{ versionLabel(updateInfo.latest) }}</strong></p>
             <p class="update-body" v-if="updateInfo.body">{{ updateInfo.body }}</p>
-            <NButton size="small" type="primary" tag="a" :href="updateInfo.url" target="_blank">前往下载</NButton>
+            <p class="update-meta" v-if="updatePackageSize(updateInfo)">更新压缩包 {{ updatePackageSize(updateInfo) }}</p>
+            <p class="update-meta" v-if="downloadedUpdate">已下载 {{ downloadedUpdate.fileName || '更新压缩包' }}</p>
+            <div class="update-actions">
+              <NButton
+                v-if="downloadedUpdate"
+                size="small"
+                type="primary"
+                :loading="updateInstalling"
+                :disabled="updateDownloading"
+                @click="confirmRestartUpdate()"
+              >
+                <template #icon><RotateCw :size="14" /></template>
+                立即重启并更新
+              </NButton>
+              <NButton
+                v-else-if="updateInfo.installable"
+                size="small"
+                type="primary"
+                :loading="updateDownloading"
+                :disabled="updateInstalling"
+                @click="onDownloadUpdate"
+              >
+                <template #icon><Download :size="14" /></template>
+                下载更新压缩包
+              </NButton>
+              <NButton
+                v-else
+                size="small"
+                type="primary"
+                @click="openUpdateURL"
+              >
+                前往下载
+              </NButton>
+            </div>
           </div>
           <p v-else class="update-ok">当前已是最新版本 {{ APP_VERSION }}</p>
         </template>
@@ -1734,15 +1872,22 @@ onMounted(() => {
 .about-version { font-size: 13px; color: var(--text-tertiary); margin: 0 0 12px; }
 .about-desc { font-size: 13px; color: var(--text-secondary); margin: 0 0 4px; }
 .update-banner {
-  margin: 12px 0;
-  padding: 12px;
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
   background: var(--warn-50);
   border: 1px solid var(--warn-500);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
-.update-banner p { margin: 4px 0; font-size: 13px; }
+.update-banner p { margin: var(--space-1) 0; font-size: 13px; }
 .update-body { color: var(--text-tertiary); font-size: 12px !important; max-height: 120px; overflow: auto; white-space: pre-wrap; }
-.update-ok { font-size: 13px; color: var(--text-tertiary); margin: 12px 0; }
+.update-meta { color: var(--text-tertiary); font-size: 12px !important; }
+.update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.update-ok { font-size: 13px; color: var(--text-tertiary); margin: var(--space-3) 0; }
 
 /* Usage documentation button — primary action of the About dialog.
  * Brand-filled so it reads as the main thing to do here. */

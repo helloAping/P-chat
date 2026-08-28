@@ -10,6 +10,8 @@ export function ConfirmWindowClose(arg1:string):Promise<void>;
 
 export function GetBackendURL():Promise<string>;
 
+export function InstallUpdate(arg1:string,arg2:string):Promise<void>;
+
 export function OpenExplorer(arg1:string):Promise<void>;
 
 export function OpenTerminal(arg1:string):Promise<void>;

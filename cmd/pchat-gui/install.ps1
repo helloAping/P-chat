@@ -40,8 +40,8 @@
 # If PCHAT_HOME is set, install.ps1 installs into that
 # directory (creating it if needed), overwriting the
 # previous binaries in place. The user can always override
-# with -InstallDir. Any pchat-gui / pchat-server / pchat
-# processes whose executable lives in the target dir are
+# with -InstallDir. Any pchat-gui / pchat-server / pchat /
+# pchat-updater processes whose executable lives in the target dir are
 # stopped first — otherwise the Copy-Item would fail with
 # "file in use" on the running binary.
 #
@@ -73,10 +73,12 @@ $here      = (Resolve-Path -LiteralPath $scriptDir).Path
 $srcGui    = Join-Path $here "pchat-gui.exe"
 $srcServer = Join-Path $here "pchat-server.exe"
 $srcCli    = Join-Path $here "pchat.exe"
+$srcUpdater = Join-Path $here "pchat-updater.exe"
 
 if (-not (Test-Path -LiteralPath $srcGui))    { throw "pchat-gui.exe not found next to install.ps1 ($here)" }
 if (-not (Test-Path -LiteralPath $srcServer)) { throw "pchat-server.exe not found next to install.ps1 ($here)" }
 if (-not (Test-Path -LiteralPath $srcCli))    { throw "pchat.exe not found next to install.ps1 ($here)" }
+if (-not (Test-Path -LiteralPath $srcUpdater)) { throw "pchat-updater.exe not found next to install.ps1 ($here)" }
 
 function New-PChatShortcut {
     param(
@@ -556,8 +558,8 @@ if ($AddToPath -and $RemoveFromPath) {
     throw "Use either -AddToPath or -RemoveFromPath, not both."
 }
 
-# --- stop any running pchat-gui / pchat-server / pchat from the target dir -------
-# Stopping a running pchat-gui.exe / pchat-server.exe / pchat.exe
+# --- stop any running pchat-gui / pchat-server / pchat / pchat-updater from the target dir -------
+# Stopping a running pchat-gui.exe / pchat-server.exe / pchat.exe / pchat-updater.exe
 # is required before the Copy-Item below, otherwise the
 # in-use mapping on Windows would refuse the copy with
 # "file in use". We only kill processes whose executable
@@ -569,7 +571,7 @@ if ($AddToPath -and $RemoveFromPath) {
 # install in another path alone — the user might have
 # pinned a particular version there.
 $stoppedAny = $false
-Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue |
+Get-Process -Name "pchat-gui","pchat-server","pchat","pchat-updater" -ErrorAction SilentlyContinue |
     ForEach-Object {
         $p = $null
         try {
@@ -596,11 +598,14 @@ if ($stoppedAny) {
 # (the CLI / REPL) is also copied so that -AddToPath can expose
 # `pchat` as a global command — the user wants to type `pchat`
 # in any terminal and have it land in the CLI REPL.
+# pchat-updater.exe is copied so the GUI can apply downloaded
+# update zips by restarting into the standalone updater.
 New-Item -ItemType Directory -Path $target -Force | Out-Null
 if ((Resolve-Path -LiteralPath $target).Path -ne $here) {
     Copy-Item -LiteralPath $srcGui    -Destination (Join-Path $target "pchat-gui.exe")    -Force
     Copy-Item -LiteralPath $srcServer -Destination (Join-Path $target "pchat-server.exe") -Force
     Copy-Item -LiteralPath $srcCli    -Destination (Join-Path $target "pchat.exe")        -Force
+    Copy-Item -LiteralPath $srcUpdater -Destination (Join-Path $target "pchat-updater.exe") -Force
     Copy-Item -LiteralPath (Join-Path $scriptDir "uninstall.ps1") -Destination (Join-Path $target "uninstall.ps1") -Force
     Write-Host "[install] copied binaries to $target"
 } else {
@@ -658,7 +663,7 @@ if (-not $Portable) {
     $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\P-Chat"
     New-Item -Path $regPath -Force | Out-Null
     Set-ItemProperty -LiteralPath $regPath -Name "DisplayName"     -Value "P-Chat"
-    Set-ItemProperty -LiteralPath $regPath -Name "DisplayVersion"  -Value "0.1.0"
+    Set-ItemProperty -LiteralPath $regPath -Name "DisplayVersion"  -Value "1.0.12"
     Set-ItemProperty -LiteralPath $regPath -Name "Publisher"       -Value "P-Chat"
     Set-ItemProperty -LiteralPath $regPath -Name "InstallLocation" -Value $target
     Set-ItemProperty -LiteralPath $regPath -Name "UninstallString" -Value "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$target\uninstall.ps1`""

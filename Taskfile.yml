@@ -64,6 +64,7 @@ tasks:
     cmds:
       - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat.exe ./cmd/pchat
       - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server.exe ./cmd/pchat-server
+      - go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-updater.exe ./cmd/pchat-updater
       - powershell -NoProfile -Command "Copy-Item -Force cmd\pchat-server\browser-extension.zip bin\browser-extension.zip"
     silent: false
 
@@ -238,6 +239,7 @@ tasks:
     deps: [build:windows:artifacts]
     cmds:
       - task: build:setup:installer
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-update-zip.ps1 -RequireSetup
     silent: false
 
   build:linux:
@@ -300,6 +302,14 @@ tasks:
     desc: 打包 Windows 桌面端别名
     cmds:
       - task: package:gui
+    silent: false
+
+  package:update:win:
+    desc: 打包 Windows 自动更新压缩包 bin/pchat-update-windows-amd64-v{version}.zip
+    cmds:
+      - task: build:frontend
+      - task: build:windows:artifacts
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-update-zip.ps1
     silent: false
 
   package:gui:linux:
@@ -387,6 +397,7 @@ tasks:
       - powershell -NoProfile -Command "New-Item -ItemType Directory -Path dev-bin -Force | Out-Null"
       - go build -o dev-bin/pchat-server.exe ./cmd/pchat-server
       - go build -o dev-bin/pchat.exe ./cmd/pchat
+      - go build -o dev-bin/pchat-updater.exe ./cmd/pchat-updater
       - powershell -NoProfile -Command "Copy-Item -Force cmd\pchat-server\browser-extension.zip dev-bin\browser-extension.zip"
       - task: build:dev:gui
       - powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name 'pchat-gui' -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name 'pchat-server' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 500"

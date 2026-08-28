@@ -10,8 +10,8 @@
      Runs `go build` for the GUI installer.
 
   Prerequisites: `task build` and `task build:gui` must have run
-  first so bin/pchat.exe / bin/pchat-server.exe / bin/pchat-gui.exe
-  exist. The script verifies all three before proceeding.
+  first so bin/pchat.exe / bin/pchat-server.exe / pchat-updater.exe /
+  bin/pchat-gui.exe exist. The script verifies them before proceeding.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -33,13 +33,14 @@ $assets    = Join-Path $root "cmd\pchat-installer\assets"
 $guiExe    = Join-Path $bin "pchat-gui.exe"
 $serverExe = Join-Path $bin "pchat-server.exe"
 $cliExe    = Join-Path $bin "pchat.exe"
+$updaterExe = Join-Path $bin "pchat-updater.exe"
 
 $webDir    = Join-Path $root "web"
 $installPs = Join-Path $root "cmd\pchat-gui\install.ps1"
 $uninstPs  = Join-Path $root "cmd\pchat-gui\uninstall.ps1"
 
 # --- validation ---
-foreach ($f in @($guiExe, $serverExe, $cliExe)) {
+foreach ($f in @($guiExe, $serverExe, $cliExe, $updaterExe)) {
     if (-not (Test-Path -LiteralPath $f)) {
         Write-Error "Missing binary: $f -- run 'task build && task build:gui' first"
         exit 1
@@ -52,6 +53,7 @@ Write-Host "[build-installer] Copy binaries -> $assets"
 Copy-Item -LiteralPath $guiExe    -Destination "$assets\pchat-gui.exe"    -Force
 Copy-Item -LiteralPath $serverExe -Destination "$assets\pchat-server.exe" -Force
 Copy-Item -LiteralPath $cliExe    -Destination "$assets\pchat.exe"        -Force
+Copy-Item -LiteralPath $updaterExe -Destination "$assets\pchat-updater.exe" -Force
 
 Write-Host "[build-installer] Copy web/ -> $assets\web"
 if (Test-Path -LiteralPath "$assets\web") { Remove-Item -Recurse -Force "$assets\web" }

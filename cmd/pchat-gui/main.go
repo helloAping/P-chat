@@ -26,6 +26,7 @@
 //	%LOCALAPPDATA%\Programs\P-Chat\
 //	鈹溾攢鈹€ pchat-gui.exe        (this binary)
 //	鈹溾攢鈹€ pchat-server.exe     (the HTTP API + web UI)
+//	鈹溾攢鈹€ pchat-updater.exe    (standalone self-update applier)
 //	鈹溾攢鈹€ install.ps1
 //	鈹斺攢鈹€ uninstall.ps1
 package main
@@ -34,7 +35,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -269,6 +272,51 @@ func (a *App) OpenURL(rawURL string) {
 	if err := openExternalURL(rawURL); err != nil {
 		log.Printf("OpenURL %q: %v", rawURL, err)
 	}
+}
+
+// InstallUpdate starts the standalone updater and exits this GUI so the
+// updater can replace files in the install directory.
+func (a *App) InstallUpdate(packagePath string, expectedSHA256 string) error {
+	pkg, err := validateUpdatePackage(packagePath, expectedSHA256)
+	if err != nil {
+		return err
+	}
+	updater, err := findUpdaterBinary()
+	if err != nil {
+		return err
+	}
+	updaterRunner, err := stageUpdaterBinary(updater)
+	if err != nil {
+		return err
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve gui executable: %w", err)
+	}
+	installDir := filepath.Dir(exe)
+	logPath := filepath.Join(resolveHomeDir(), "updates", "update.log")
+	args := []string{
+		"--install-dir", installDir,
+		"--package", pkg,
+		"--launch", filepath.Base(exe),
+		"--parent-pid", strconv.Itoa(os.Getpid()),
+		"--log", logPath,
+	}
+	if strings.TrimSpace(expectedSHA256) != "" {
+		args = append(args, "--expected-sha256", strings.ToLower(strings.TrimSpace(expectedSHA256)))
+	}
+	cmd := exec.Command(updaterRunner, args...)
+	cmd.Dir = installDir
+	hideChildConsole(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start updater: %w", err)
+	}
+	log.Printf("started pchat-updater pid=%d runner=%s package=%s install_dir=%s", cmd.Process.Pid, updaterRunner, pkg, installDir)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		a.quitApp()
+	}()
+	return nil
 }
 
 // SaveExportFile opens the OS-native save dialog and writes an exported
@@ -579,6 +627,88 @@ func openExternalURL(rawURL string) error {
 	}
 	hideChildConsole(cmd)
 	return cmd.Start()
+}
+
+func validateUpdatePackage(packagePath string, expectedSHA256 string) (string, error) {
+	pkg := strings.TrimSpace(packagePath)
+	if pkg == "" {
+		return "", fmt.Errorf("update package path is empty")
+	}
+	abs, err := filepath.Abs(pkg)
+	if err != nil {
+		return "", fmt.Errorf("resolve update package: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("stat update package: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("update package is a directory: %s", abs)
+	}
+	if !strings.EqualFold(filepath.Ext(abs), ".zip") {
+		return "", fmt.Errorf("update package must be a zip file: %s", abs)
+	}
+	expectedSHA256 = strings.ToLower(strings.TrimSpace(expectedSHA256))
+	if expectedSHA256 == "" {
+		return abs, nil
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return "", fmt.Errorf("open update package: %w", err)
+	}
+	defer f.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return "", fmt.Errorf("hash update package: %w", err)
+	}
+	got := hex.EncodeToString(hash.Sum(nil))
+	if got != expectedSHA256 {
+		return "", fmt.Errorf("update package sha256 mismatch: got %s, want %s", got, expectedSHA256)
+	}
+	return abs, nil
+}
+
+func stageUpdaterBinary(updaterPath string) (string, error) {
+	src := strings.TrimSpace(updaterPath)
+	if src == "" {
+		return "", fmt.Errorf("updater path is empty")
+	}
+	abs, err := filepath.Abs(src)
+	if err != nil {
+		return "", fmt.Errorf("resolve updater path: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("stat updater binary: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("updater path is a directory: %s", abs)
+	}
+	runnerDir := filepath.Join(resolveHomeDir(), "updates", "runner")
+	if err := os.MkdirAll(runnerDir, 0o755); err != nil {
+		return "", fmt.Errorf("create updater runner dir: %w", err)
+	}
+	dst := filepath.Join(runnerDir, fmt.Sprintf("pchat-updater-%d%s", os.Getpid(), filepath.Ext(abs)))
+	in, err := os.Open(abs)
+	if err != nil {
+		return "", fmt.Errorf("open updater binary: %w", err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+	if err != nil {
+		return "", fmt.Errorf("create updater runner: %w", err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return "", fmt.Errorf("copy updater runner: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return "", fmt.Errorf("close updater runner: %w", err)
+	}
+	if err := os.Chmod(dst, info.Mode()); err != nil {
+		return "", fmt.Errorf("chmod updater runner: %w", err)
+	}
+	return dst, nil
 }
 
 func writeLoading(w http.ResponseWriter) {
@@ -1247,6 +1377,61 @@ func findServerBinary() (string, error) {
 	name := serverBinaryName()
 	if path, err := exec.LookPath(name); err == nil {
 		log.Printf("findServerBinary: found in PATH: %s", path)
+		return path, nil
+	}
+	return "", fmt.Errorf("%s not found next to pchat-gui and not in PATH", name)
+}
+
+func updaterBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "pchat-updater.exe"
+	}
+	return "pchat-updater"
+}
+
+func updaterBinaryCandidates(dir string) []string {
+	name := updaterBinaryName()
+	candidates := []string{
+		filepath.Join(dir, name),
+		filepath.Join(dir, "..", name),
+		filepath.Join(dir, "..", "..", name),
+	}
+	if runtime.GOOS == "darwin" {
+		candidates = append([]string{filepath.Join(dir, "..", "Resources", name)}, candidates...)
+	}
+	return candidates
+}
+
+func findUpdaterBinary() (string, error) {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, c := range updaterBinaryCandidates(dir) {
+			if _, statErr := os.Stat(c); statErr == nil {
+				abs, _ := filepath.Abs(c)
+				log.Printf("findUpdaterBinary: found at %s (exe=%s)", abs, exe)
+				return abs, nil
+			}
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		d := cwd
+		for i := 0; i < 5; i++ {
+			cand := filepath.Join(d, "bin", updaterBinaryName())
+			if _, statErr := os.Stat(cand); statErr == nil {
+				abs, _ := filepath.Abs(cand)
+				log.Printf("findUpdaterBinary: found at %s (cwd=%s, levels=%d)", abs, cwd, i)
+				return abs, nil
+			}
+			parent := filepath.Dir(d)
+			if parent == d {
+				break
+			}
+			d = parent
+		}
+	}
+	name := updaterBinaryName()
+	if path, err := exec.LookPath(name); err == nil {
+		log.Printf("findUpdaterBinary: found in PATH: %s", path)
 		return path, nil
 	}
 	return "", fmt.Errorf("%s not found next to pchat-gui and not in PATH", name)

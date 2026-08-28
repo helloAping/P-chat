@@ -43,6 +43,9 @@ Copy-Item -LiteralPath (Join-Path $binDir "pchat-server.exe") -Destination (Join
 # available on the user PATH after `-AddToPath`.
 Copy-Item -LiteralPath (Join-Path $binDir "pchat.exe") -Destination (Join-Path $srcGui "pchat.exe") -Force
 
+# --- Standalone updater ---
+Copy-Item -LiteralPath (Join-Path $binDir "pchat-updater.exe") -Destination (Join-Path $srcGui "pchat-updater.exe") -Force
+
 # --- 安装脚本运行副本 / Install script runtime copies ---
 Copy-PowerShellScriptForWindowsPowerShell -Source (Join-Path $root "cmd\pchat-gui\install.ps1") -Destination (Join-Path $srcGui "install.ps1")
 Copy-PowerShellScriptForWindowsPowerShell -Source (Join-Path $root "cmd\pchat-gui\uninstall.ps1") -Destination (Join-Path $srcGui "uninstall.ps1")

@@ -186,6 +186,7 @@ $RECYCLE.BIN/
 # -----------------------------------------------------------------------------
 # release.yml writes to dist/ on the runner; we never want to commit
 # that locally either.
+/build/
 dist/
 artifacts/
 *.tar.gz

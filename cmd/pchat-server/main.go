@@ -55,10 +55,19 @@ var rootCmd = &cobra.Command{
 	RunE:  runServer,
 }
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "显示版本信息",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Println("P-Chat Server " + version.FullString())
+	},
+}
+
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "配置文件路径")
 	rootCmd.PersistentFlags().BoolVar(&imEnable, "im.enable", false, "启用 IM 桥接")
 	rootCmd.PersistentFlags().StringVar(&imPlatforms, "im.platforms", "", "启用的 IM 平台列表，例如 feishu:bot,telegram:polling")
+	rootCmd.AddCommand(versionCmd)
 }
 
 func main() {

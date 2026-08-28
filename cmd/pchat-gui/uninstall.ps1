@@ -55,9 +55,9 @@ if (-not $InstallDir) {
 
 Write-Host "[uninstall] target: $InstallDir"
 
-# 1. Kill any running pchat-gui / pchat-server / pchat (CLI REPL)
+# 1. Kill any running pchat-gui / pchat-server / pchat (CLI REPL) / pchat-updater
 #    from this install.
-Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue |
+Get-Process -Name "pchat-gui","pchat-server","pchat","pchat-updater" -ErrorAction SilentlyContinue |
     Where-Object {
         try {
             $p = (Resolve-Path -LiteralPath (Split-Path -LiteralPath $_.MainModule.FileName -Parent) -ErrorAction Stop).Path
