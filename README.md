@@ -51,12 +51,12 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 
 ## 快速启动
 
-### 方式 A — Windows 安装包（推荐新用户）
+### 方式 A — 全平台安装包（推荐新用户）
 
-1. 从 [Releases](../../releases) 下载 `pchat-setup.exe`
-2. 双击运行，弹出目录选择框，选择或者创建pchat目录
-3. 安装程序会解压 `pchat-gui.exe` / `pchat-server.exe` / `pchat.exe` + `web/`，写入开始菜单和桌面快捷方式
-4. 从开始菜单启动 **P-Chat**
+1. 从 [P-Chat 软件发布页](http://www.08ms.cn/software/p-chat) 下载当前版本对应系统的安装包，Windows / Linux / macOS 均在该页面提供；需要手动更新时，也在该页面下载增量更新包或全量包
+2. Windows 下载 `pchat-setup-v*.exe` 后双击运行；Linux 下载 `pchat-linux-setup-v*.tar.gz` 后解压并执行 `./install.sh`；macOS 下载 `pchat-mac-setup-v*.tar.gz` 后解压并执行 `./install.sh`
+3. 安装程序会解压 GUI / server / CLI / updater 二进制和 `web/` 资源，并按系统创建对应的快捷入口或命令入口
+4. 安装完成后启动 **P-Chat**
 
 首次启动时 GUI 会自动拉起 server 子进程，关窗自动结束子进程，不需要手动管理。
 
@@ -629,6 +629,7 @@ cd frontend && npx vue-tsc -b
 | 文档 | 什么时候改 |
 | --- | --- |
 | `README.md` | 用户入口、GUI 操作步骤、常见问题、当前进度摘要变化 |
+| [软件下载页](http://www.08ms.cn/software/p-chat) | 下载当前版本 setup 安装包、增量更新包和全量包 |
 | [网页版说明文档](http://www.08ms.cn/article/p-chat) | 安装、API 厂商接入、CLI/GUI 使用指南（与官网说明同步） |
 | `docs/feature-opportunities.md` | 功能从待办变为已落地、backlog 优先级变化、废弃历史计划 |
 | `CHANGELOG.md` | 版本交付、升级说明、重要 bug 修复和测试覆盖 |
