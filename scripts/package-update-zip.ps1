@@ -166,7 +166,7 @@ Get-ChildItem -LiteralPath $stage -File -Recurse |
 $updateManifest = [ordered]@{
     name           = "P-Chat"
     slug           = "p-chat"
-    kind           = "full"
+    kind           = "patch"
     version        = $version
     platform       = $Platform
     arch           = $Arch
@@ -179,12 +179,14 @@ if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zipPath -Force
-$updateArtifact = New-ArtifactEntry -Kind "full" -Path $zipPath
+$updateArtifact = New-ArtifactEntry -Kind "patch" -Path $zipPath
 
 $artifacts = @()
+$setupArtifact = $null
 $setupPath = Join-Path $bin ("pchat-setup-v{0}.exe" -f $version)
 if (Test-Path -LiteralPath $setupPath) {
-    $artifacts += New-ArtifactEntry -Kind "setup" -Path $setupPath
+    $setupArtifact = New-ArtifactEntry -Kind "full" -Path $setupPath
+    $artifacts += $setupArtifact
 } elseif ($RequireSetup) {
     throw "Setup installer is required but missing: $setupPath"
 }
@@ -192,6 +194,8 @@ $artifacts += $updateArtifact
 
 $createdAtUTC = (Get-Date).ToUniversalTime().ToString("s") + "Z"
 $updateURL = "<upload-url>/" + $updateArtifact.file
+$primaryArtifact = if ($setupArtifact) { $setupArtifact } else { $updateArtifact }
+$primaryURL = "<upload-url>/" + $primaryArtifact.file
 $latestJson = [ordered]@{
     name          = "P-Chat"
     slug          = "p-chat"
@@ -201,16 +205,26 @@ $latestJson = [ordered]@{
     published_at  = $createdAtUTC
     platform      = $Platform
     arch          = $Arch
-    size          = $updateArtifact.size
-    sha256        = $updateArtifact.sha256
-    url           = $updateURL
-    full          = [ordered]@{
-        kind     = "full"
+    size          = $primaryArtifact.size
+    sha256        = $primaryArtifact.sha256
+    url           = $primaryURL
+    patch         = [ordered]@{
+        kind     = "patch"
         platform = $Platform
         arch     = $Arch
         size     = $updateArtifact.size
         sha256   = $updateArtifact.sha256
         url      = $updateURL
+    }
+}
+if ($setupArtifact) {
+    $latestJson["full"] = [ordered]@{
+        kind     = "full"
+        platform = $Platform
+        arch     = $Arch
+        size     = $setupArtifact.size
+        sha256   = $setupArtifact.sha256
+        url      = "<upload-url>/" + $setupArtifact.file
     }
 }
 Write-JsonNoBom -Value $latestJson -Path $latestJsonPath

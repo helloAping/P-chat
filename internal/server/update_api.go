@@ -19,7 +19,7 @@ type downloadUpdateRequest struct {
 func (h *Handler) CheckUpdate(c *gin.Context) {
 	current := strings.TrimSpace(c.Query("current_version"))
 	if current == "" {
-		current = version.String()
+		current = version.ReleaseString()
 	}
 	res, err := pchatupdate.NewService(pchatupdate.Options{}).Check(c.Request.Context(), current)
 	if err != nil {
@@ -43,7 +43,7 @@ func (h *Handler) DownloadUpdate(c *gin.Context) {
 		current = strings.TrimSpace(req.CurrentVersion)
 	}
 	if current == "" {
-		current = version.String()
+		current = version.ReleaseString()
 	}
 	res, err := pchatupdate.NewService(pchatupdate.Options{}).Download(c.Request.Context(), current)
 	if err != nil {

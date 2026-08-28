@@ -58,7 +58,7 @@ func TestCheckUpdateEndpoint(t *testing.T) {
 	}
 }
 
-func TestCheckUpdateEndpointUsesRuntimeVersionWhenNoQuery(t *testing.T) {
+func TestCheckUpdateEndpointUsesReleaseVersionWhenNoQuery(t *testing.T) {
 	oldVersion := version.Version
 	version.Version = "1.0.12"
 	t.Cleanup(func() { version.Version = oldVersion })

@@ -821,6 +821,18 @@ function updateDownloadButtonText(info: UpdateInfo): string {
   return `下载${updateArtifactLabel(info)}`
 }
 
+function externalUpdateButtonText(info: UpdateInfo): string {
+  return selectedUpdateArtifact(info)?.kind === 'full' ? '下载全量包' : '前往下载'
+}
+
+function updatePackageSummary(info: UpdateInfo): string {
+  const size = updatePackageSize(info)
+  const suffix = size ? ` · ${size}` : ''
+  if (info.installable) return `自动更新将使用 ${updateArtifactLabel(info)}${suffix}`
+  if (!info.patch?.url) return `更新源未返回当前版本可用的差分包，将提供全量包下载${suffix}`
+  return `更新源返回的${updateArtifactLabel(info)}无法自动安装，将前往下载${suffix}`
+}
+
 function fullPackageURL(info: UpdateInfo): string {
   return info.full?.url || ''
 }
@@ -1369,10 +1381,7 @@ onMounted(() => {
             <NTag type="warning" size="small">发现新版本</NTag>
             <p>最新版本 <strong>{{ versionLabel(updateInfo.latest) }}</strong></p>
             <p class="update-body" v-if="updateInfo.body">{{ updateInfo.body }}</p>
-            <p class="update-meta">
-              自动更新将使用 {{ updateArtifactLabel(updateInfo) }}
-              <template v-if="updatePackageSize(updateInfo)"> · {{ updatePackageSize(updateInfo) }}</template>
-            </p>
+            <p class="update-meta">{{ updatePackageSummary(updateInfo) }}</p>
             <p class="update-meta" v-if="hasSeparateFullPackage(updateInfo)">
               也可下载全量包，或打开软件发布页选择需要的软件包。
             </p>
@@ -1408,7 +1417,8 @@ onMounted(() => {
                 type="primary"
                 @click="openUpdateURL"
               >
-                前往下载
+                <template #icon><ExternalLink :size="14" /></template>
+                {{ externalUpdateButtonText(updateInfo) }}
               </NButton>
               <NButton
                 v-if="hasSeparateFullPackage(updateInfo)"
