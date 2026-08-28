@@ -153,6 +153,10 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	if req.WorkMode != "" {
 		h.setSessionMetaWorkMode(id, string(workMode))
 	}
+	useImageRecognition := h.sessionUseImageRecognition(id)
+	if req.UseImageRecognition != nil {
+		useImageRecognition = h.getCfg().Vision.Enabled && *req.UseImageRecognition
+	}
 
 	// Hydrate the durable plan before the agent builds its prompt. A
 	// resume request must see the interrupted in_progress item even after
@@ -200,6 +204,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		Messages:            msgs,
 		HistoryMessageCount: historyMessageCount,
 		Attachments:         req.Attachments,
+		UseImageRecognition: useImageRecognition,
 		// Forward the frontend's client-minted row id. The
 		// agent uses it as the explicit SQLite row id for
 		// this turn's user message, so rollback/regen
@@ -291,7 +296,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		var retryNotice string
 		switch {
 		case attempt < maxRetries:
-			retryNotice = fmt.Sprintf("⏱ 回合超出最长执行时间，自动重试（第 %d/%d 次）——相当于自动发送“继续”…", attempt+1, maxRetries)
+			retryNotice = fmt.Sprintf("⏱ 回合超出最长执行时间，自动重试并接续当前任务（第 %d/%d 次）…", attempt+1, maxRetries)
 		case agent.HasPendingTodos(id):
 			retryNotice = "⏱ 回合超出最长执行时间，检测到未完成任务，自动继续…"
 		}
@@ -329,6 +334,10 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			Content:     agent.BuildAutoResumePrompt(id, resumeReason),
 			MsgType:     llm.MsgTypeText,
 			SubmitToLLM: 1,
+			Meta: map[string]any{
+				"origin":    "auto_resume",
+				"ui_hidden": true,
+			},
 		})
 		chatReq.Messages = resumeMsgs
 		chatReq.HistoryMessageCount = len(resumeMsgs) - 1
@@ -425,6 +434,11 @@ func (h *Handler) GetToolResult(c *gin.Context) {
 }
 
 func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model string) ([]llm.ChatMessage, string) {
+	histMsgs, _, compSummary := h.loadHistoryForSendWithIDs(ctx, id, provider, model)
+	return histMsgs, compSummary
+}
+
+func (h *Handler) loadHistoryForSendWithIDs(ctx context.Context, id, provider, model string) ([]llm.ChatMessage, []int64, string) {
 	_ = h.store.Flush()
 	lastComp := h.store.LastCompressedIDFor(id)
 	contextCap := h.contextMessageLimit(provider, model)
@@ -440,9 +454,10 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 	}
 
 	var histMsgs []llm.ChatMessage
+	var rowIDs []int64
 	var compSummary string
 	if lastComp > 0 {
-		histMsgs, _, _ = h.store.GetChatMessagesAfterIDFor(id, contextCap, lastComp)
+		histMsgs, _, _, rowIDs = h.store.GetChatMessagesAfterIDForWithIDs(id, contextCap, lastComp)
 		// Carry the pre-summarized history so the agent can inject
 		// "[前文摘要]" into the system prompt — the LLM must know
 		// what the compressed-away history contained. Dropping this
@@ -454,7 +469,7 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 		if h.store.CountChatMessages(id) > contextCap {
 			limit = contextCap
 		}
-		histMsgs = h.store.GetChatMessagesFor(id, limit)
+		histMsgs, _, _, rowIDs, _, _, _ = h.store.GetChatMessagesWithMetaPage(id, 0, limit)
 	}
 	// Media rows persisted as "upl://<id>" references must come
 	// back as base64 for the LLM request; the disk read replaces
@@ -462,7 +477,7 @@ func (h *Handler) loadHistoryForSend(ctx context.Context, id, provider, model st
 	// intact. Best-effort: a missing file degrades to a text
 	// marker instead of breaking the turn.
 	histMsgs = resolveHistoryUploads(histMsgs, h.attachResolver)
-	return histMsgs, compSummary
+	return histMsgs, rowIDs, compSummary
 }
 
 // turnStreamResult tells SendMessage how a chat stream ended so it can
@@ -597,14 +612,16 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 		}()
 		chunk, ok := <-stream
 		if !ok {
-			// Stream closed without a done event. If the turn was
-			// interrupted by its hard deadline, either auto-resume
-			// (signal SendMessage to re-run the loop with a "继续"
-			// nudge) or surface a terminal turn_timeout error frame
-			// when the retry budget is exhausted.
+			// 流关闭但没有 done：回合超时，或仍有追踪任务时被取消，都应进入自动续跑。
+			// Stream closed without a done event. If the turn was interrupted
+			// by its hard deadline, or it was canceled while tracked work is
+			// still pending, either auto-resume (signal SendMessage to re-run
+			// the loop with a "继续" nudge) or surface a terminal turn_timeout
+			// error frame when the retry budget is exhausted.
 			if !terminalEmitted {
 				if err := c.Request.Context().Err(); err != nil {
-					if errors.Is(err, context.DeadlineExceeded) && retryNotice != "" {
+					interruptedWithPendingTodos := errors.Is(err, context.Canceled) && agent.HasPendingTodos(sessionID)
+					if (errors.Is(err, context.DeadlineExceeded) || interruptedWithPendingTodos) && retryNotice != "" {
 						// Auto-resume: keep the stream open, tell the
 						// user a retry is starting, and re-mark the
 						// session busy (the agent loop already sent an

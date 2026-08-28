@@ -440,6 +440,80 @@ func (s *Store) AddChatMessageWithMetaTo(convID string, msg llm.ChatMessage, ext
 	s.AddChatMessageWithMetaToRegen(convID, msg, extraMeta, "", false)
 }
 
+// AddChatMessageWithMetaToNow writes a ChatMessage immediately and returns
+// its SQLite row id. It is for callers that need a durable row anchor they
+// can update later (for example a background sub-agent card).
+func (s *Store) AddChatMessageWithMetaToNow(convID string, msg llm.ChatMessage, extraMeta map[string]string) (int64, error) {
+	if convID == "" {
+		return 0, fmt.Errorf("conversation id is required")
+	}
+	if err := s.Flush(); err != nil {
+		return 0, err
+	}
+	m := encodeChatMeta(msg)
+	for k, v := range extraMeta {
+		m[k] = v
+	}
+	b, _ := json.Marshal(m)
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var maxSeq sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(seq) FROM messages WHERE conversation_id = ?`, convID).Scan(&maxSeq); err != nil {
+		return 0, err
+	}
+	nextSeq := int64(1)
+	if maxSeq.Valid {
+		nextSeq = maxSeq.Int64 + 1
+	}
+	res, err := s.db.Exec(
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq, is_archived)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+		convID, msg.Role, msg.Content, now.Unix(), string(b), msg.MsgType, msg.SubmitToLLM, nextSeq,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.db.Exec(`UPDATE conversations SET updated_at = ? WHERE id = ?`, now.Unix(), convID); err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// UpdateChatMessageContentAndMeta updates one existing message row's visible
+// content and metadata. It intentionally does not create a new row: callers
+// use it to keep long-running background cards stable across refreshes.
+func (s *Store) UpdateChatMessageContentAndMeta(rowID int64, content string, meta map[string]string) error {
+	if rowID <= 0 {
+		return fmt.Errorf("message row id is required")
+	}
+	if err := s.Flush(); err != nil {
+		return err
+	}
+	b, _ := json.Marshal(meta)
+	now := time.Now().Unix()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.db.Exec(`UPDATE messages SET content = ?, metadata = ? WHERE id = ?`, content, string(b), rowID); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(
+		`UPDATE conversations
+		    SET updated_at = ?
+		  WHERE id = (SELECT conversation_id FROM messages WHERE id = ?)`,
+		now, rowID,
+	)
+	return err
+}
+
 // AddChatMessageWithMetaToRegen is the P1-4 regen-aware
 // variant of AddChatMessageWithMetaTo. regenGroupID is the
 // string form of the user message id that this assistant
@@ -943,6 +1017,22 @@ func (s *Store) GetAssistantMessagesAfterSeq(convID string, afterSeq int64) ([]l
 // ChatMessage.
 func encodeChatMeta(msg llm.ChatMessage) map[string]string {
 	m := make(map[string]string)
+	for k, v := range msg.Meta {
+		switch x := v.(type) {
+		case string:
+			m[k] = x
+		case bool:
+			if x {
+				m[k] = "true"
+			} else {
+				m[k] = "false"
+			}
+		case fmt.Stringer:
+			m[k] = x.String()
+		default:
+			m[k] = fmt.Sprint(x)
+		}
+	}
 	if msg.Type != "" {
 		m["type"] = msg.Type
 	}
@@ -1632,6 +1722,25 @@ type MessageFull struct {
 	CreatedAt   int64           `json:"created_at"`
 }
 
+func normalizePartsRawMessage(raw json.RawMessage) json.RawMessage {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "[") {
+		return raw
+	}
+	var encoded string
+	if err := json.Unmarshal([]byte(trimmed), &encoded); err != nil {
+		return raw
+	}
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" || encoded == "null" {
+		return nil
+	}
+	return json.RawMessage(encoded)
+}
+
 // GetMessagesFull is like GetMessages but returns the
 // rich shape the CLI /export path needs. It re-hydrates
 // the assistant message's `parts` (thinking / tool cards /
@@ -1755,8 +1864,8 @@ func (s *Store) GetMessagesFull() []MessageFull {
 		if err := json.Unmarshal([]byte(r.meta), &meta); err != nil {
 			continue
 		}
-		if v, ok := meta["parts"]; ok && len(v) > 0 && string(v) != "null" {
-			out[i].Parts = v
+		if v, ok := meta["parts"]; ok {
+			out[i].Parts = normalizePartsRawMessage(v)
 		}
 		if v, ok := meta["thinking"]; ok {
 			// Thinking is stored as a JSON string
@@ -1974,8 +2083,8 @@ func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
 		if err := json.Unmarshal([]byte(r.meta), &meta); err != nil {
 			continue
 		}
-		if v, ok := meta["parts"]; ok && len(v) > 0 && string(v) != "null" {
-			out[i].Parts = v
+		if v, ok := meta["parts"]; ok {
+			out[i].Parts = normalizePartsRawMessage(v)
 		}
 		if v, ok := meta["thinking"]; ok {
 			var thinkingText string
@@ -2961,9 +3070,18 @@ func (s *Store) GetChatMessagesAfterID(limit int, afterID int64) ([]llm.ChatMess
 // GetChatMessagesAfterIDFor is the multi-session-safe variant of
 // GetChatMessagesAfterID. Pass the conversation id explicitly.
 func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int64) ([]llm.ChatMessage, []string, []int64) {
+	msgs, metas, createds, _ := s.GetChatMessagesAfterIDForWithIDs(convID, limit, afterID)
+	return msgs, metas, createds
+}
+
+// GetChatMessagesAfterIDForWithIDs is the multi-session-safe after-id
+// history loader plus the SQLite row ids parallel to the decoded messages.
+// When one database row decodes into multiple ChatMessage values, the same
+// row id is repeated so callers can still find the source row.
+func (s *Store) GetChatMessagesAfterIDForWithIDs(convID string, limit int, afterID int64) ([]llm.ChatMessage, []string, []int64, []int64) {
 	_ = s.Flush()
 	if convID == "" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	rows, err := s.db.Query(
 		`SELECT id, role, content, metadata, created_at, msg_type, submit_to_llm FROM messages
@@ -2972,11 +3090,12 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 		convID, afterID, limitOrHuge(limit),
 	)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	defer rows.Close()
 
 	type row struct {
+		id      int64
 		msg     llm.ChatMessage
 		meta    string
 		created int64
@@ -2999,7 +3118,7 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 		}
 		msgs := decodeChatMessages(role, content, meta, msgType, submitToLLM)
 		for _, m := range msgs {
-			rev = append(rev, row{msg: m, meta: meta, created: created})
+			rev = append(rev, row{id: id, msg: m, meta: meta, created: created})
 		}
 	}
 	// Reverse to ASC order.
@@ -3007,12 +3126,14 @@ func (s *Store) GetChatMessagesAfterIDFor(convID string, limit int, afterID int6
 	out := make([]llm.ChatMessage, n)
 	metas := make([]string, n)
 	createds := make([]int64, n)
+	ids := make([]int64, n)
 	for i, r := range rev {
 		out[n-1-i] = r.msg
 		metas[n-1-i] = r.meta
 		createds[n-1-i] = r.created
+		ids[n-1-i] = r.id
 	}
-	return out, metas, createds
+	return out, metas, createds, ids
 }
 
 // ConversationMessageCount returns the number of messages in the current

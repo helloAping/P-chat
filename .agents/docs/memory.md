@@ -14,6 +14,7 @@ Memory 模块管理 P-Chat 的持久化存储——SQLite 数据库存储对话�
 |---|---|---|
 | `memory.go` | SQLite 数据库操作、CRUD、迁移入口 | `Store`, `Open()`, `OpenAt()`, `AddChatMessageTo()` |
 | `migrations.go` | **Schema 迁移引擎** — 版本表 + 所有迁移定义 | `Migrate()`, `Rollback()`, `allMigrations` |
+| `subagent_jobs.go` | 异步子代理 job 状态 CRUD | `SubagentJob`, `CreateSubagentJob()`, `ListSubagentJobs()` |
 | `summarizer.go` | LLM 驱动的对话压缩 | `Summarizer`, `Compress()` |
 | `fileio.go` | 旧版 JSON 文件导入 | `migrateFromLegacyJSON()` |
 
@@ -60,6 +61,7 @@ summaries: conversation_id, range_start, range_end, summary, created_at
 todo_items: session_id, item_id, content, status, sort_order
 chunks: id, source, content, metadata, created_at
 embeddings: chunk_id, model, vector, dim, created_at
+subagent_jobs: id, task_id, session_id, status, subagent_type, model, description, result, error, progress_json, created_at, started_at, finished_at, cancelled_at
 ```
 
 **Schema 变更规则** → 详见 [versioning.md §二](versioning.md#二schema-迁移规范)。
@@ -85,8 +87,14 @@ embeddings: chunk_id, model, vector, dim, created_at
 `messages.metadata` 列存储 JSON `map[string]string`，常用键：
 - `role` — 消息角色
 - `reason` — 来源 ("user" / "assistant" / "compression")
+- `origin` — 内部来源标记；例如服务端自动续跑注入给 LLM 的 nudge 使用 `"auto_resume"`
+- `ui_hidden` — `"true"` 表示该消息只参与 LLM 上下文，不应通过历史 API 渲染给用户
 - `thinking` — 完整思考文本（非 parts 路径）
 - `parts` — 结构化 parts JSON（tool + sub_agent）
+
+`encodeChatMeta()` 会先把 `llm.ChatMessage.Meta` 合并进 metadata，再补充规范字段。
+`bool true` 会编码成字符串 `"true"`，用于兼容 `messages.metadata` 的
+`map[string]string` 存储形态。服务端历史响应根据 `ui_hidden` 过滤内部续跑行。
 
 ### 5. Summarizer（对话压缩）
 
@@ -116,6 +124,7 @@ embeddings: chunk_id, model, vector, dim, created_at
 
 ### 要修改消息持久化格式
 - `AddChatMessageWithMetaTo()` (memory.go)
+- `encodeChatMeta()` (memory.go) — `ChatMessage.Meta` 到 `messages.metadata` 的规范化入口
 - `decodePartsFromMeta()` (handler.go:1280) — 服务端还原
 
 ### 要修改批量写入策略

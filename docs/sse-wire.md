@@ -149,6 +149,9 @@ and the OK/error icon; `tool_result_full` is preferred over
 | `sub_agent_ok` | Sub-agent run finished successfully |
 | `sub_agent_err` | Sub-agent run failed; check `sub_agent_failure_reason` |
 | `auto-continue` | P0-3 guard re-injected a "未完成" prompt; `message` is the user-facing line |
+| `system` + `step="turn-retry"` | The server is auto-resuming after a turn timeout; keep the same SSE stream open |
+| `system` + `step="todo-auto-continue"` | The server is auto-resuming because persisted todos are still pending |
+| `system` + `step="auto-resume-stopped"` | Auto-resume no-progress breaker stopped the retry chain; user intervention is needed |
 | `system`, `memory`, `plan` | Internal bookkeeping; safe to ignore |
 
 ### 3.5 `error` — LLM or transport error
@@ -216,6 +219,13 @@ The frontend uses this to drive the TodoPanel state machine: a
 it. Without this signal, the UI has no way to distinguish "the LLM
 is mid-turn, don't clear stale todos" from "the LLM stopped and
 forgot to clear them".
+
+During server auto-resume, the stream may emit a `phase` notice and
+then a `session_status: "retry"` / `busy` transition before the next
+attempt starts. The hidden resume nudge is persisted as a user-role
+message with `metadata.origin="auto_resume"` and
+`metadata.ui_hidden=true`; `GET /messages` and snapshot recovery must
+not render it as a user bubble.
 
 ### 3.9 `question` — LLM asks the user a question
 

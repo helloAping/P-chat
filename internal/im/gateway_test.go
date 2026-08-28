@@ -127,7 +127,7 @@ func TestGatewayStartsAndStopsRegisteredAdapter(t *testing.T) {
 	}
 }
 
-func TestGatewayTreatsWeChatTokenAsAuthenticated(t *testing.T) {
+func TestGatewayDoesNotTreatWeChatTokenAsConnectedWithoutAdapter(t *testing.T) {
 	cfg := config.DefaultIMConfig()
 	cfg.Enabled = true
 	cfg.Platforms = []config.IMPlatformConfig{{Type: "wechat", Variant: "wechatbot", Enabled: true, Token: "wx-token"}}
@@ -137,12 +137,12 @@ func TestGatewayTreatsWeChatTokenAsAuthenticated(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	health := g.Health()
-	if len(health.Platforms) != 1 || health.Platforms[0].Status != "authenticated" || health.Platforms[0].Error != "" {
-		t.Fatalf("health = %+v, want authenticated without adapter error", health.Platforms)
+	if len(health.Platforms) != 1 || health.Platforms[0].Status != "unavailable" || health.Platforms[0].Error == "" {
+		t.Fatalf("health = %+v, want unavailable with adapter error", health.Platforms)
 	}
 	result := g.TestConnection("wechat", "wechatbot")
-	if !result.OK || result.Status != "authenticated" {
-		t.Fatalf("test result = %+v, want authenticated ok", result)
+	if result.OK || result.Status != "not_implemented" {
+		t.Fatalf("test result = %+v, want not_implemented", result)
 	}
 }
 

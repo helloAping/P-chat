@@ -14,7 +14,7 @@ import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
   Lock, Unlock, Key, Database, Copy, Scissors, ClipboardPaste, TextCursorInput,
-  Settings,
+  Settings, HelpCircle,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -138,6 +138,9 @@ async function onChangePermissionLevel(val: string) {
       ...state.sessionMeta[state.currentID],
       permission_level: val,
     }
+    if (val === 'ask' || val === 'auto' || val === 'full') {
+      state.lastPermissionLevel = val
+    }
     if ((val === 'auto' || val === 'full') && currentPendingConfirm.value) {
       submitToolConfirm('once')
       message.info('已按新的权限设置通过当前沙箱请求')
@@ -231,10 +234,11 @@ onMounted(async () => {
   }
   loadSkillCommands()
 })
+watch(() => state.currentID, () => { loadSkillCommands() })
 
 async function loadSkillCommands() {
   try {
-    const r = await api.listSkills()
+    const r = await api.listSkills(state.currentID ? { sessionId: state.currentID } : undefined)
     skillCommands.value = (r.skills || []).map(s => ({
       name: s.name,
       description: s.description || '加载技能上下文',
@@ -742,7 +746,7 @@ async function renderStyles(): Promise<string> {
 
 async function renderSkills(): Promise<string> {
   try {
-    const r = await api.listSkills()
+    const r = await api.listSkills(state.currentID ? { sessionId: state.currentID } : undefined)
     const skills = r.skills || []
     if (!skills.length) return '<div class="cmd-info">暂无已安装的技能。使用 /skills 搜索安装。</div>'
     let html = '<div class="cmd-skills">'
@@ -881,7 +885,7 @@ async function send() {
       if (skillCommands.value.some(c => c.name === parsed.name)) {
         sending.value = true
         try {
-          const r = await api.getSkill(parsed.name)
+          const r = await api.getSkill(parsed.name, state.currentID ? { sessionId: state.currentID } : undefined)
           const skillContent = r.skill.content || ''
           const userInput = parsed.args || ''
           pendingSkillContext = skillContent
@@ -974,7 +978,7 @@ async function send() {
       let uploadID: string | undefined
       try {
         const up = await api.uploadFile((a as PendingAttachment)._file as File)
-        uploadID = up.id
+        if (up.size > 0) uploadID = up.id
       } catch { /* inline fallback below */ }
       inlineAttachments.push({ type: 'image_url', url: uploadID ? undefined : data, upload_id: uploadID, name: a.name, kind: a.kind, mime: a.mime })
       bubbleAttachments.push({ type: 'image_url', url: data, name: a.name, kind: a.kind, mime: a.mime })
@@ -1066,10 +1070,11 @@ async function send() {
       // the SQLite row id in lockstep, so rollback and
       // regenerate work the instant the user clicks them.
       clientMsgID: clientMsgId,
-      provider: meta.provider,
-      model: meta.model,
-      style: meta.style,
-      workMode: meta.workMode,
+    provider: meta.provider,
+    model: meta.model,
+    style: meta.style,
+    workMode: meta.workMode,
+    useImageRecognition: imageRecognitionEnabled.value,
       todoMode,
       attachments: inlineAttachments,
       skillContext: pendingSkillContext || undefined,
@@ -1154,6 +1159,7 @@ async function loadConfig() {
     loadKBases()
     const sc = await api.getSystemConfig()
     state.globalWorkMode = sc.work_mode?.default || 'coding'
+    state.visionRecognitionEnabled = !!sc.vision_recognition?.enabled
     const st = await api.getStyles()
     styleOptions.value = [
       { label: '关闭', value: 'off' },
@@ -1242,6 +1248,37 @@ async function onTodoLongRunPick(v: 'off' | 'adaptive' | 'unlimited') {
   }
 }
 
+const imageRecognitionAvailable = computed(() => !!state.visionRecognitionEnabled)
+
+const imageRecognitionEnabled = computed(() =>
+  imageRecognitionAvailable.value && !!state.sessionMeta[state.currentID]?.use_image_recognition,
+)
+
+const imageRecognitionLabel = computed(() =>
+  imageRecognitionAvailable.value ? (imageRecognitionEnabled.value ? '开' : '关') : '不可用',
+)
+
+async function onImageRecognitionPick(v: boolean) {
+  if (!state.currentID) return
+  if (v && !imageRecognitionAvailable.value) {
+    message.warning('请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。', { duration: 5000 })
+    return
+  }
+  try {
+    const resp = await api.updateSessionMeta(state.currentID, { use_image_recognition: v })
+    const id = state.currentID
+    const enabled = resp.use_image_recognition ?? v
+    state.sessionMeta[id] = {
+      ...(state.sessionMeta[id] || currentMeta.value),
+      use_image_recognition: enabled,
+    }
+    const session = state.sessions.find(s => s.id === id)
+    if (session) session.use_image_recognition = enabled
+  } catch (e: any) {
+    message.error(`图像识别设置失败：${e?.message || e}`)
+  }
+}
+
 const currentWorkModeValue = computed({
   get: () => currentMeta.value.workMode || state.globalWorkMode || 'coding',
   set: (v: string) => onWorkModePick(v),
@@ -1268,7 +1305,7 @@ const currentReasoningLabel = computed(() => {
 })
 
 const sessionConfigSummary = computed(() =>
-  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 风格${currentStyleLabel.value}`,
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 识图${imageRecognitionLabel.value} · 风格${currentStyleLabel.value}`,
 )
 
 // Display label for the knowledge base picker. The "off"
@@ -1498,7 +1535,7 @@ onMounted(() => {
             >
               <Settings :size="13" />
               <span class="ctrl-btn-label">会话设置</span>
-              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }}</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 识图{{ imageRecognitionLabel }}</span>
             </button>
           </template>
           <div class="session-config-popover">
@@ -1508,7 +1545,31 @@ onMounted(() => {
             </div>
 
             <div class="session-config-row">
-              <div class="session-config-label">风格</div>
+              <div class="session-config-label">
+                <span>风格</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="风格说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">风格</div>
+                    <p>决定助手在当前会话里的说话方式，比如更活泼、更简洁，或按某个角色来回复。</p>
+                    <p>右上角的“生成风格”按钮可以根据当前对话自动整理一个新风格，也可以优化已有风格，并把相关备注一起保存。</p>
+                    <p>这里选中的风格只影响当前会话。想查看、编辑或手动新增风格，可以到“应用设置 > 风格”。</p>
+                  </div>
+                </NPopover>
+              </div>
               <div class="session-config-options">
                 <button
                   v-for="opt in styleOptions"
@@ -1540,7 +1601,31 @@ onMounted(() => {
             </div>
 
             <div class="session-config-row">
-              <div class="session-config-label">思考</div>
+              <div class="session-config-label">
+                <span>思考</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="思考说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">思考</div>
+                    <p>控制助手回答前要不要多想一会儿。问题越复杂，适当调高越容易得到更稳的结果。</p>
+                    <p>调高后回复可能更慢，也可能消耗更多额度；普通聊天、简单改写建议保持关闭或低。</p>
+                    <p>这里设置只影响当前会话，并且是否生效取决于当前模型是否支持。</p>
+                  </div>
+                </NPopover>
+              </div>
               <div class="session-config-options">
                 <button
                   v-for="opt in reasoningEffortOptions[0]?.children || []"
@@ -1556,7 +1641,82 @@ onMounted(() => {
             </div>
 
             <div class="session-config-row">
-              <div class="session-config-label">长任务</div>
+              <div class="session-config-label">
+                <span>图像识别</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="图像识别说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">图像识别</div>
+                    <p>开启后，助手可以在需要时“看”你上传的图片，比如读图中文字、描述画面、找物体或比较多张图片。</p>
+                    <p>需要先到“应用设置 > 系统 > 图像识别”开启，并选择一个负责看图的模型。</p>
+                    <p>看图会多走一步，可能比普通文字聊天慢一些；如果全局没有配置，这里不能启用。</p>
+                  </div>
+                </NPopover>
+              </div>
+              <div class="session-config-options">
+                <button
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': !imageRecognitionEnabled }"
+                  @click="onImageRecognitionPick(false)"
+                >
+                  关闭
+                </button>
+                <button
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': imageRecognitionEnabled }"
+                  :disabled="!imageRecognitionAvailable"
+                  :title="imageRecognitionAvailable ? '使用 image_recognize 工具识别图片' : '请先到“应用设置 > 系统 > 图像识别”启用工具'"
+                  @click="onImageRecognitionPick(true)"
+                >
+                  使用工具
+                </button>
+                <div v-if="!imageRecognitionAvailable" class="session-config-hint">
+                  请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。
+                </div>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">
+                <span>长任务</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="长任务说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">长任务</div>
+                    <p>控制助手处理多步骤任务时，完成一轮后要不要继续往下做。</p>
+                    <p>“自适应”适合大多数情况；“不限轮次”适合整理大量资料、批量修改这类长流程，但可能运行更久。</p>
+                    <p>如果你希望助手每一步都先停下来等你确认，可以选择“关闭”。</p>
+                  </div>
+                </NPopover>
+              </div>
               <div class="session-config-options">
                 <button
                   v-for="opt in todoLongRunOptions"
@@ -1756,13 +1916,13 @@ onMounted(() => {
    * The chip-appear keyframe on individual chips is the
    * primary feedback; this just makes the wrap itself
    * glide rather than pop. */
-  transition: max-height 0.2s var(--ease-out);
+  transition: max-height var(--dur-base) var(--ease-out);
 }
 .attach-chip {
   display: inline-flex; align-items: center; gap: 6px;
   background: var(--bg-3);
   border: 1px solid var(--border-2);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 4px 6px 4px 4px;
   font-size: 12px;
   flex: 0 0 auto;
@@ -1773,8 +1933,9 @@ onMounted(() => {
    * translateY direction is "from above" so the chip looks
    * like it dropped in from the input above it — coherent
    * with the new "below the input" position. */
-  animation: chip-appear 0.22s var(--ease-out);
-  transition: border-color 0.15s, background 0.15s;
+  animation: chip-appear var(--dur-base) var(--ease-out);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
 }
 .attach-chip:hover {
   border-color: var(--accent);
@@ -1860,14 +2021,19 @@ onMounted(() => {
 .input-wrap {
   background: var(--bg-input);
   border: 1px solid var(--border-2);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   padding: 0 12px 0 12px;
-  transition: border-color 0.15s;
+  transition: border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
   display: flex;
   flex-direction: column;
 }
 .input-wrap.has-attachments { padding-top: 0; }
-.input-wrap:focus-within { border-color: var(--accent); }
+.input-wrap:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--brand-50);
+}
 .input-wrap.dragover { border-color: var(--accent-2); background: var(--bg-3); }
 .input-row {
   display: flex;
@@ -1876,13 +2042,14 @@ onMounted(() => {
 }
 .attach-icon-btn {
   width: 32px; height: 32px;
-  border: none; border-radius: 8px;
+  border: none; border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-3);
   font-size: 16px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   flex-shrink: 0;
-  transition: color 0.15s, background 0.15s;
+  transition: color var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
 }
 .attach-icon-btn:hover { color: var(--accent); background: var(--bg-3); }
 .textarea {
@@ -1968,12 +2135,15 @@ onMounted(() => {
 }
 .send-btn, .stop-btn {
   width: 32px; height: 32px;
-  border: none; border-radius: 8px;
+  border: none; border-radius: var(--radius-md);
   font-size: 14px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   background: var(--accent); color: var(--on-accent);
   flex-shrink: 0;
   margin-left: 8px;
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              opacity var(--dur-fast) var(--ease-out);
 }
 .send-btn:disabled { background: var(--bg-3); color: var(--text-4); cursor: not-allowed; }
 .send-btn:hover:not(:disabled) { background: var(--accent-2); }
@@ -2046,10 +2216,14 @@ onMounted(() => {
 /* Slide-down transition for the advanced row. Tied to the
  * <Transition name="row-slide"> in the template. The classes
  * are named in the Vue 2 / 3 transition convention. */
-.row-slide-enter-active,
-.row-slide-leave-active {
+.row-slide-enter-active {
   transition: max-height var(--dur-base) var(--ease-out),
               opacity var(--dur-base) var(--ease-out);
+  overflow: hidden;
+}
+.row-slide-leave-active {
+  transition: max-height var(--dur-fast) var(--ease-in),
+              opacity var(--dur-fast) var(--ease-in);
   overflow: hidden;
 }
 .row-slide-enter-from,
@@ -2177,56 +2351,115 @@ onMounted(() => {
   text-overflow: ellipsis;
 }
 .session-config-popover {
-  width: min(420px, calc(100vw - 32px));
+  width: min(520px, calc(100vw - 32px));
   background: var(--surface-1);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
-  padding: 8px;
+  overflow: hidden;
 }
 .session-config-head {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
-  padding: 4px 6px 8px;
+  padding: var(--space-4) var(--space-5) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
 }
 .session-config-row {
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr);
-  gap: 8px;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: var(--space-3);
   align-items: start;
-  padding: 8px 6px;
-  border-top: 1px solid var(--border-subtle);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.session-config-row:last-child {
+  border-bottom: none;
 }
 .session-config-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 30px;
+  white-space: nowrap;
+}
+.session-config-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
   color: var(--text-tertiary);
+  cursor: help;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.session-config-help:hover {
+  background: var(--surface-3);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+.session-config-help-popover {
+  width: 300px;
+  padding: var(--space-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  color: var(--text-secondary);
   font-size: 12px;
-  line-height: 26px;
+  line-height: 1.5;
+}
+.session-config-help-title {
+  margin-bottom: var(--space-2);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+.session-config-help-popover p {
+  margin: 0;
+}
+.session-config-help-popover p + p {
+  margin-top: var(--space-2);
+}
+.session-config-help-popover code {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
 }
 .session-config-options {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--space-2);
   min-width: 0;
 }
 .session-config-choice {
-  height: 26px;
-  padding: 0 9px;
-  background: transparent;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
+  min-height: 30px;
+  padding: 0 var(--space-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
   transition: background var(--dur-fast) var(--ease-out),
               border-color var(--dur-fast) var(--ease-out),
               color var(--dur-fast) var(--ease-out);
 }
-.session-config-choice:hover {
+.session-config-choice:hover:not(:disabled) {
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -2235,9 +2468,22 @@ onMounted(() => {
   border-color: var(--brand-100);
   color: var(--brand-600);
 }
-.session-config-choice--active:hover {
+.session-config-choice--active:hover:not(:disabled) {
   background: var(--brand-100);
   color: var(--brand-700);
+}
+.session-config-choice:disabled {
+  background: var(--surface-2);
+  border-color: var(--border-subtle);
+  color: var(--text-quaternary);
+  cursor: not-allowed;
+}
+.session-config-hint {
+  flex-basis: 100%;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding-top: var(--space-1);
 }
 
 /* --- Permission popover ---------------------------------------- */

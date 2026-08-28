@@ -17,7 +17,6 @@ package server
 // Split from handler.go in T04. Behaviour unchanged.
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 
@@ -70,10 +69,7 @@ func (h *Handler) SetReasoningEffort(c *gin.Context) {
 	m.ReasoningEffort = req.Level
 	h.meta[id] = m
 	h.metaMu.Unlock()
-	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: m.PlanMode, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
-		_ = h.store.UpdateConversationMeta(id, string(blob))
-	}
+	h.persistSessionMeta(id, m)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "reasoning_effort": req.Level})
 }
 
@@ -254,10 +250,7 @@ func (h *Handler) ExecutePlan(c *gin.Context) {
 	m.PlanMode = false
 	h.meta[id] = m
 	h.metaMu.Unlock()
-	if h.store != nil {
-		blob, _ := json.Marshal(sessionMetaBlob{Style: m.Style, Provider: m.Provider, Model: m.Model, ReasoningEffort: m.ReasoningEffort, ProjectPath: m.ProjectPath, PlanMode: false, PermissionLevel: m.PermissionLevel, KnowledgeBase: m.KnowledgeBase})
-		_ = h.store.UpdateConversationMeta(id, string(blob))
-	}
+	h.persistSessionMeta(id, m)
 
 	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id})
 }

@@ -40,12 +40,21 @@ for round := 1; maxRounds==0 || round<=maxRounds; round++ {
 
 | 条件 | 阶段 | 行为 |
 |---|---|---|
-| `len(toolCalls) == 0` | `done` | LLM 自然完成 |
+| `len(toolCalls) == 0` + todo 全 done | `done` | LLM 自然完成 |
+| `len(toolCalls) == 0` + todo 未完成 + `autoContinueCount < 3` | `auto-continue` | 注入内部 user-style nudge，循环续 |
+| `len(toolCalls) == 0` + todo 未完成 + `autoContinueCount >= 3` | `done` | 兜底退出，不再续 |
 | `meaningful > 80` | `context_warn` | 仅警告 |
 | `meaningful > 120` | `context_warn` | 自动停止，建议 /compress |
 | `ctx.Err() != nil` | (错误路径) | 用户取消 |
 | `maxRounds` 达到 | `limit` | 强制停止 |
 | `stuckStreak >= 3` | `stuck` | 连续 3 轮相同失败工具调用 |
+
+#### P0-3 自动续 LLM 守卫
+
+当 LLM 没有继续调用工具，但当前会话 todo 仍有未完成项时，`ChatWithTools()`
+会追加一条给 LLM 看的内部 user-style nudge 并进入下一轮，最多 3 次。
+这条 nudge 不代表用户真的发送了新消息；若服务端续跑路径把类似 nudge 持久化，
+必须带 `Meta{"origin":"auto_resume","ui_hidden":true}`，历史接口不得把它渲染成用户气泡。
 
 ### 2. 工具执行的并行派发 (`agent.go:1185-1471`)
 
@@ -80,6 +89,17 @@ forwarder goroutine:
 - **Done** — 清除所有 thinking streaming flag
 
 `persistAssistant()` 调用 `snapshotStructural()` 将 part 持久化到 SQLite（工具和子代理 part → meta["parts"] JSON）。
+
+### 3.5 图片提交与历史回看边界
+
+Agent 在 `ChatWithTools()` 中用 `HistoryMessageCount` 区分“已入库历史前缀”和“当前轮后缀”，图片提交遵循以下规则：
+
+- 当前轮新上传图片：通过 `ExpandAttachmentsCM()` 展开；普通多模态模式下作为 `TypeImage` 直接提交给当前模型；开启 `use_image_recognition` 时先由识图模型 preflight，主模型只拿识别文本。
+- 重答目标图片：`buildRegenerateMessages()` 会把目标用户消息后面紧跟的图片并入当前轮后缀，因此按当前轮图片处理，会重新提交或重新识别。
+- 历史图片：不再作为原图 payload 反复提交给主模型，`replaceHistoricalImagesWithPlaceholders()` 会把它替换成 system 占位。若有 `upload_id` 且存在可用视觉能力，占位提示 LLM 调 `image_recognize`；否则提示用户重新上传或切换/配置视觉模型。
+- 图像识别工具：没有当前轮图片 preflight 时，历史图片后续追问可以暴露 `image_recognize`。会话开启专门识图配置时用配置模型；未开启时，如果当前对话模型支持视觉，则工具 fallback 到当前 provider/model。
+
+这保证“围绕同一张历史图片连续纠正/追问”可以通过工具继续识别，同时避免每一轮都把历史图片二进制塞进 LLM 上下文。
 
 ### 4. 计划模式 (Plan Mode)
 

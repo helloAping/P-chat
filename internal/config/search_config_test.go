@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/paths"
 )
 
 // withTempHome redirects the user's home directory (via the
@@ -29,6 +31,9 @@ func withTempHome(t *testing.T) string {
 	} else {
 		t.Setenv("HOME", dir)
 	}
+	t.Setenv("PCHAT_DATA_HOME", "")
+	paths.SetHomeForTest(filepath.Join(dir, ".p-chat"))
+	t.Cleanup(func() { paths.SetHomeForTest("") })
 	return dir
 }
 
@@ -74,8 +79,8 @@ func TestUpdateSearchConfig_ProviderValidation(t *testing.T) {
 	}{
 		{"tavily", false},
 		{"openai_compat", false},
-		{"", false}, // empty normalises to "tavily"
-		{"TAVILY", false}, // case-insensitive
+		{"", false},                  // empty normalises to "tavily"
+		{"TAVILY", false},            // case-insensitive
 		{"  openai_compat  ", false}, // trimmed
 		{"bing", true},
 		{"google", true},
@@ -102,10 +107,10 @@ func TestUpdateSearchConfig_BaseURLValidation(t *testing.T) {
 	}{
 		{"https://api.tavily.com", false},
 		{"https://s.jina.ai", false},
-		{"http://127.0.0.1:8080", false},      // loopback
-		{"http://localhost:9000", false},      // loopback
-		{"http://api.example.com", true},      // non-loopback http
-		{"ftp://example.com", true},           // wrong scheme
+		{"http://127.0.0.1:8080", false}, // loopback
+		{"http://localhost:9000", false}, // loopback
+		{"http://api.example.com", true}, // non-loopback http
+		{"ftp://example.com", true},      // wrong scheme
 		{"javascript:alert(1)", true},
 		{"", false}, // empty allowed (means "use default")
 	}
@@ -144,12 +149,12 @@ func TestUpdateSearchConfig_TimeoutValidation(t *testing.T) {
 		raw     string
 		wantErr bool
 	}{
-		{"", false},     // empty → 0 (default)
+		{"", false}, // empty → 0 (default)
 		{"20s", false},
 		{"500ms", false},
 		{"60s", false},
-		{"61s", true},   // capped
-		{"5m", true},    // capped
+		{"61s", true}, // capped
+		{"5m", true},  // capped
 		{"abc", true},
 		{"-1s", true},
 	}
@@ -283,6 +288,6 @@ func TestUpdateSearchConfig_Partial(t *testing.T) {
 // Tiny helpers
 // ====================================================================
 
-func ptrBool(b bool) *bool       { return &b }
-func ptrStr(s string) *string    { return &s }
-func ptrInt(i int) *int          { return &i }
+func ptrBool(b bool) *bool    { return &b }
+func ptrStr(s string) *string { return &s }
+func ptrInt(i int) *int       { return &i }

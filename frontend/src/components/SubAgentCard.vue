@@ -1,13 +1,8 @@
 <script setup lang="ts">
-// Nested card for a sub-agent's stream. The header
-// shows the task description, the agent name (e.g.
-// "explore"), the model in use, the status, and the
-// running / ok / err indicator. While the sub-agent is
-// running, the header has a shimmer gradient animation;
-// once finished, the user can click to expand the full
-// sub-agent message stream (text + thinking +
-// tool calls) — same structure as the parent
-// bubble, just indented.
+// Nested card for a sub-agent's stream. The header is a compact
+// process row: "agentType · task" plus model/status/progress chips.
+// The detailed stream stays collapsed by default, including while
+// running, so a busy sub-agent does not take over the chat surface.
 //
 // The agent's accent color (sub_agent_color) drives
 // the left-border tint, the icon background, and the
@@ -24,14 +19,17 @@ import type { SubAgentPart, MessagePart } from '../api/client'
 import { Check, X, Clipboard, ChevronDown, ChevronRight } from './icons'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
+import ToolCallGroup from './ToolCallGroup.vue'
 import LoadingDots from './LoadingDots.vue'
 import TypedText from './TypedText.vue'
+import { groupConsecutiveToolParts } from '../utils/toolPartGrouping'
 
 const props = defineProps<{ part: SubAgentPart }>()
 
-// Default-open while running, default-closed once
-// finished. The user can override either way.
-const open = ref(props.part.status === 'start')
+// Keep sub-agent detail collapsed by default, even while running.
+// The header shows live progress, and the user can open the body
+// only when they need the full nested stream.
+const open = ref(false)
 const userToggled = ref(false)
 function toggle() {
   userToggled.value = true
@@ -53,6 +51,7 @@ const visibleParts = computed(() => {
   const start = partWindowStart.value
   return props.part.parts.slice(start).map((part, offset) => ({ part, index: start + offset }))
 })
+const visibleRenderEntries = computed(() => groupConsecutiveToolParts(visibleParts.value))
 function showEarlierParts() {
   revealedEarlierParts.value += SUB_PART_RENDER_WINDOW
 }
@@ -75,7 +74,33 @@ const accentStyle = computed(() => {
   if (!c) return {}
   return {
     '--sub-accent': c,
-    '--sub-accent-soft': `color-mix(in srgb, ${c} 14%, var(--bg-2))`,
+    '--sub-accent-soft': `color-mix(in srgb, ${c} 14%, var(--surface-2))`,
+  }
+})
+
+const titleLabel = computed(() => `${agentLabel.value} · ${props.part.task || '未命名子任务'}`)
+
+const runModeLabel = computed(() => props.part.runMode === 'async' ? '后台子代理' : '常规子代理')
+
+const toolCount = computed(() => props.part.parts.filter(p => p.kind === 'tool').length)
+
+const latestActivity = computed(() => {
+  const parts = props.part.parts
+  const last = parts[parts.length - 1]
+  if (!last) return props.part.status === 'start' ? '等待子代理输出' : ''
+  switch (last.kind) {
+    case 'tool':
+      return last.status === 'start' ? `正在执行 ${last.name}` : `最近执行 ${last.name}`
+    case 'thinking':
+      return props.part.status === 'start' ? '正在分析任务' : '已完成分析'
+    case 'text':
+      return props.part.status === 'start' ? '正在生成内容' : '已生成回复'
+    case 'question':
+      return '等待用户选择'
+    case 'sub_agent':
+      return '子任务更新'
+    default:
+      return ''
   }
 })
 
@@ -121,18 +146,15 @@ async function copyTaskId() {
 // still read whatever text the sub-agent did produce.
 // STUCK_TIMEOUT_MS is a last-resort client-side safety net
 // for when the server never sends the sub-agent close event
-// (e.g. server crash mid-run). The server's wall-clock cap is
-// 30 minutes by default (config subagent.timeout) — but real
-// hangs are caught far earlier by the LLM stream idle timeout
-// (120s) and per-tool timeouts, so a legit sub-agent either
-// finishes or the server closes it well within 6 minutes. We
-// use 6 minutes here so the client never force-closes BEFORE
-// the server's natural close event lands — otherwise the
-// client would mark the sub-agent as failed even when the
-// server actually completed successfully. If the server
-// timeout is configured differently, the user's server
-// already enforces it; this client-side timer is purely a
-// backstop.
+// (e.g. server crash mid-run). The server does not install a
+// default sub-agent wall-clock cap (`subagent.timeout` empty
+// = none). Real hangs are caught by LLM stream idle (120s),
+// per-tool timeouts, and the turn deadline (MaxTurnSeconds,
+// default 15 min). 6 minutes sits above typical tool/LLM
+// stalls so the client does not force-close a still-running
+// sub-agent that the server will close itself. If the user
+// sets `subagent.timeout`, the server already enforces it;
+// this timer is purely a UI backstop.
 const STUCK_TIMEOUT_MS = 6 * 60 * 1000 // 6 minutes
 
 // renderSubText runs the sub-agent's *static* text part through the
@@ -230,15 +252,21 @@ onBeforeUnmount(() => clearStuckTimer())
       class="sub-header"
       :class="{ running: part.status === 'start' }"
       @click="toggle"
-      :title="open ? '收起子代消息' : '展开子代消息'"
+      :title="open ? '收起子代理消息' : '展开子代理消息'"
     >
       <span class="sub-icon">{{ agentLabel.charAt(0).toUpperCase() }}</span>
       <span
-        v-if="part.agentType"
-        class="sub-agent-name"
-        :title="part.agentDescription || agentLabel"
-      >{{ agentLabel }}</span>
-      <span class="sub-task">{{ part.task }}</span>
+        class="sub-run-mode"
+        :class="'mode-' + (part.runMode === 'async' ? 'async' : 'sync')"
+        :title="part.runMode === 'async' ? '后台异步执行的子代理' : '当前对话内执行的常规子代理'"
+      >{{ runModeLabel }}</span>
+      <span class="sub-title-wrap">
+        <span
+          class="sub-title"
+          :title="part.agentDescription ? `${titleLabel} - ${part.agentDescription}` : titleLabel"
+        >{{ titleLabel }}</span>
+        <span v-if="!open && latestActivity" class="sub-activity">{{ latestActivity }}</span>
+      </span>
       <span v-if="part.agentModel" class="sub-model" :title="'model: ' + part.agentModel">{{ part.agentModel }}</span>
       <!-- P1-2 live event counter. Shows the running parts
            count so the user sees the sub-agent making
@@ -252,16 +280,37 @@ onBeforeUnmount(() => clearStuckTimer())
         v-if="part.parts.length > 0 || part.status === 'start'"
         class="sub-parts-count"
         :title="'已发出 ' + part.parts.length + ' 个 part'"
-      >{{ part.parts.length }}</span>
+      >{{ part.parts.length }} parts</span>
+      <span
+        v-if="toolCount > 0"
+        class="sub-tools-count"
+        :title="'已调用 ' + toolCount + ' 个工具'"
+      >{{ toolCount }} tools</span>
       <span
         class="sub-status"
+        :class="'status-' + part.status"
         :title="part.status === 'err' && part.failureReason ? part.failureReason : statusLabel()"
       >{{ statusLabel() }}</span>
       <span v-if="part.elapsed" class="sub-elapsed">{{ part.elapsed }}</span>
       <component :is="open ? ChevronDown : ChevronRight" :size="12" class="sub-caret" />
     </button>
     <div v-if="open" class="sub-body">
-      <LoadingDots v-if="part.status === 'start' && part.parts.length === 0" />
+      <div class="sub-body-summary">
+        <div class="sub-summary-main">
+          <span class="sub-summary-title">{{ titleLabel }}</span>
+          <span class="sub-summary-status" :class="'status-' + part.status">{{ statusLabel() }}</span>
+        </div>
+        <div class="sub-summary-meta">
+          <span>{{ runModeLabel }}</span>
+          <span>{{ part.parts.length }} parts</span>
+          <span v-if="toolCount > 0">{{ toolCount }} tools</span>
+          <span v-if="part.elapsed">{{ part.elapsed }}</span>
+          <span v-if="latestActivity">{{ latestActivity }}</span>
+        </div>
+      </div>
+      <div v-if="part.status === 'start' && part.parts.length === 0" class="sub-empty-progress">
+        <LoadingDots />
+      </div>
       <button
         v-if="hiddenPartCount"
         type="button"
@@ -269,21 +318,45 @@ onBeforeUnmount(() => clearStuckTimer())
         :title="`展开更早的 ${hiddenPartCount} 条子代理记录`"
         @click.stop="showEarlierParts"
       >已折叠 {{ hiddenPartCount }} 条过程记录</button>
-      <template v-for="entry in visibleParts" :key="entry.index">
-        <ThinkingBlock
-          v-if="entry.part.kind === 'thinking'"
-          :part="entry.part"
-          :default-open="false"
-        />
-        <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
-        <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
-        <TypedText
-          v-else-if="entry.part.kind === 'text' && isLiveTextPart(entry.index, entry.part)"
-          :text="entry.part.text || ''"
-          :active="true"
-        />
-        <div v-else-if="entry.part.kind === 'text'" class="sub-text" v-html="renderSubText(entry.part.text)" />
-      </template>
+      <div v-if="visibleRenderEntries.length" class="sub-stream">
+        <div
+          v-for="entry in visibleRenderEntries"
+          :key="entry.kind === 'tool_group' ? `tool-group-${entry.startIndex}` : entry.index"
+          class="sub-stream-item"
+          :class="entry.kind === 'tool_group' ? 'stream-tool' : `stream-${entry.part.kind}`"
+        >
+          <div class="sub-stream-rail" aria-hidden="true">
+            <span class="sub-stream-dot"></span>
+          </div>
+          <div class="sub-stream-content">
+            <ToolCallGroup
+              v-if="entry.kind === 'tool_group'"
+              :parts="entry.parts"
+            />
+            <template v-else>
+              <ThinkingBlock
+                v-if="entry.part.kind === 'thinking'"
+                :part="entry.part"
+                :default-open="false"
+              />
+              <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
+              <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
+              <div
+                v-else-if="entry.part.kind === 'text' && isLiveTextPart(entry.index, entry.part)"
+                class="sub-text-block live"
+              >
+                <TypedText
+                  :text="entry.part.text || ''"
+                  :active="true"
+                />
+              </div>
+              <div v-else-if="entry.part.kind === 'text'" class="sub-text-block">
+                <div class="sub-text" v-html="renderSubText(entry.part.text)" />
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
       <!-- task_id footer: stable identifier the LLM can pass back
            to resume this run. Click to copy. -->
       <div v-if="part.taskId" class="sub-taskid" @click.stop="copyTaskId">
@@ -329,11 +402,11 @@ onBeforeUnmount(() => clearStuckTimer())
 .sub-header {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
   width: 100%;
   background: transparent;
   border: 0;
-  padding: 5px 12px;
+  padding: var(--space-2) var(--space-3);
   text-align: left;
   cursor: pointer;
   color: var(--text-secondary);
@@ -361,20 +434,43 @@ onBeforeUnmount(() => clearStuckTimer())
   background: var(--sub-accent-soft, var(--brand-50));
   flex-shrink: 0;
 }
-.sub-agent-name {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--sub-accent, var(--text-tertiary));
+.sub-run-mode {
+  display: inline-flex;
+  align-items: center;
   padding: 1px 6px;
-  background: var(--sub-accent-soft, var(--surface-3));
-  border-radius: 3px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-3);
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  line-height: 1.35;
+  white-space: nowrap;
   flex-shrink: 0;
 }
-.sub-task {
+.sub-run-mode.mode-async {
+  border-color: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 24%, var(--border-subtle));
+  background: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 12%, var(--surface-2));
+  color: var(--sub-accent, var(--brand-500));
+}
+.sub-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
   flex: 1;
   min-width: 0;
+}
+.sub-title {
   color: var(--text-primary);
   font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+.sub-activity {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.3;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -384,7 +480,7 @@ onBeforeUnmount(() => clearStuckTimer())
   color: var(--text-tertiary);
   padding: 1px 5px;
   background: var(--surface-3);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   flex-shrink: 0;
   max-width: 140px;
@@ -392,7 +488,24 @@ onBeforeUnmount(() => clearStuckTimer())
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sub-status { color: var(--text-tertiary); font-size: 11px; flex-shrink: 0; }
+.sub-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-tertiary);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.sub-status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--text-quaternary);
+}
+.sub-status.status-start::before { background: var(--brand-500); }
+.sub-status.status-ok::before { background: var(--success-500); }
+.sub-status.status-err::before { background: var(--error-500); }
 .sub-elapsed {
   color: var(--text-quaternary);
   font-size: 11px;
@@ -408,13 +521,25 @@ onBeforeUnmount(() => clearStuckTimer())
   display: inline-flex;
   align-items: center;
   padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--surface-3, rgba(0, 0, 0, 0.05));
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
   color: var(--text-tertiary);
   font-size: 10.5px;
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
-  transition: background var(--dur-fast, 120ms) var(--ease-out, ease);
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
+}
+.sub-tools-count {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
 .sub-header.running .sub-parts-count {
   background: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 16%, var(--surface-2));
@@ -424,16 +549,80 @@ onBeforeUnmount(() => clearStuckTimer())
 
 .sub-body {
   border-top: 1px dashed var(--border-subtle);
-  padding: 6px 12px 8px;
-  margin-left: 4px;
-  border-left: 1px solid var(--border-subtle);
+  padding: var(--space-3) var(--space-4) var(--space-4);
   background: var(--surface-1);
+}
+.sub-body-summary {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.sub-summary-main,
+.sub-summary-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.sub-summary-title {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sub-summary-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-tertiary);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.sub-summary-status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--text-quaternary);
+}
+.sub-summary-status.status-start::before { background: var(--brand-500); }
+.sub-summary-status.status-ok::before { background: var(--success-500); }
+.sub-summary-status.status-err::before { background: var(--error-500); }
+.sub-summary-meta {
+  flex-wrap: wrap;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.sub-summary-meta span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+.sub-summary-meta span:not(:last-child)::after {
+  content: "";
+  width: 3px;
+  height: 3px;
+  margin-left: var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--border-strong);
+}
+.sub-empty-progress {
+  padding: var(--space-3) 0;
 }
 .sub-part-window-toggle {
   display: block;
   width: 100%;
-  margin-bottom: 8px;
-  padding: 5px 8px;
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
   border: 1px dashed var(--border-subtle);
   border-radius: var(--radius-sm);
   background: transparent;
@@ -447,45 +636,128 @@ onBeforeUnmount(() => clearStuckTimer())
   border-color: var(--border-default);
   color: var(--text-secondary);
 }
-/* Inner markdown text — same .md-body class as the parent
- * MessageBubble uses, scoped to this card. Keeps the
- * sub-agent's text aligned with the main chat's rendering
- * (headings, code blocks, lists, links). */
-.sub-text {
-  margin: 4px 0;
-  color: var(--text-primary);
-  font-size: 13px;
-  line-height: 1.55;
+
+.sub-stream {
+  display: grid;
+  gap: var(--space-4);
 }
-.sub-text :deep(p) { margin: 0 0 6px 0; }
+.sub-stream-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: var(--space-3);
+  position: relative;
+}
+.sub-stream-rail {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+.sub-stream-rail::before {
+  content: "";
+  position: absolute;
+  top: 14px;
+  bottom: calc(-1 * var(--space-4));
+  width: 1px;
+  background: var(--border-subtle);
+}
+.sub-stream-item:last-child .sub-stream-rail::before {
+  display: none;
+}
+.sub-stream-dot {
+  width: 9px;
+  height: 9px;
+  margin-top: var(--space-2);
+  border: 2px solid var(--surface-1);
+  border-radius: var(--radius-pill);
+  background: var(--text-quaternary);
+  z-index: 1;
+}
+.stream-thinking .sub-stream-dot { background: var(--brand-500); }
+.stream-tool .sub-stream-dot { background: var(--success-500); }
+.stream-question .sub-stream-dot { background: var(--warn-500); }
+.stream-text .sub-stream-dot { background: var(--sub-accent, var(--brand-500)); }
+.sub-stream-content {
+  min-width: 0;
+}
+.sub-text-block {
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--sub-accent, var(--brand-500));
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+}
+.sub-text-block.live {
+  border-left-color: var(--brand-500);
+}
+.sub-text {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+.sub-text :deep(p) { margin: 0 0 var(--space-3) 0; }
 .sub-text :deep(p:last-child) { margin-bottom: 0; }
 .sub-text :deep(code) {
   background: var(--surface-2);
-  padding: 1px 4px;
-  border-radius: 3px;
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: 12px;
 }
 .sub-text :deep(pre) {
-  background: var(--surface-0);
+  background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  padding: 8px 10px;
+  padding: var(--space-3);
   overflow-x: auto;
-  margin: 6px 0;
+  margin: var(--space-3) 0;
 }
 .sub-text :deep(pre code) { background: none; padding: 0; }
 .sub-text :deep(a) { color: var(--brand-600); }
 .sub-text :deep(ul),
-.sub-text :deep(ol) { padding-left: 22px; margin: 4px 0; }
+.sub-text :deep(ol) { padding-left: var(--space-6); margin: var(--space-2) 0 var(--space-3); }
 .sub-text :deep(strong) { color: var(--text-primary); font-weight: 600; }
 .sub-text :deep(em) { color: var(--text-secondary); }
+
+.sub-stream-content :deep(.tool-group) {
+  margin: 0;
+  background: var(--surface-2);
+}
+.sub-stream-content :deep(.tool-group-header) {
+  padding: var(--space-3) var(--space-4);
+}
+.sub-stream-content :deep(.tool-group-preview) {
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+}
+.sub-stream-content :deep(.tool-group-row) {
+  min-height: 28px;
+  gap: var(--space-3);
+}
+.sub-stream-content :deep(.tool-group-body) {
+  padding: var(--space-3) var(--space-4);
+}
+.sub-stream-content :deep(.tool-card) {
+  margin: 0 0 var(--space-2);
+}
+.sub-stream-content :deep(.tool-card:last-child) {
+  margin-bottom: 0;
+}
+.sub-stream-content :deep(.tool-body) {
+  padding: var(--space-3) var(--space-4);
+}
+.sub-stream-content :deep(.tool-args pre),
+.sub-stream-content :deep(.tool-result pre),
+.sub-stream-content :deep(.tool-error pre) {
+  padding: var(--space-3);
+  max-height: 320px;
+}
 .sub-taskid {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-top: 6px;
-  padding: 4px 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  padding: var(--space-2) var(--space-3);
   background: var(--surface-3);
   border-radius: var(--radius-sm);
   cursor: pointer;

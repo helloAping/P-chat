@@ -63,6 +63,9 @@ func storeTruncatedResult(sessionID, toolID, content string) {
 	}
 	truncatedCache.mu.Lock()
 	defer truncatedCache.mu.Unlock()
+	if old, ok := truncatedCache.entries[toolID]; ok {
+		truncatedCache.curBytes -= len(old.content)
+	}
 	truncatedCache.entries[toolID] = truncatedResult{
 		content:   content,
 		storedAt:  time.Now(),

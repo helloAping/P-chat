@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -2381,7 +2382,43 @@ func cmdTools(ctx cliContext, args string) error {
 			if len(desc) > 80 {
 				desc = desc[:77] + "..."
 			}
-			fmt.Printf("    %s\033[1m%-16s\033[0m  %s\n", marker, t.Name, desc)
+			scope := toolScopeLabel(t)
+			if scope != "" {
+				scope = color.HiBlackString("[%s]", scope)
+			}
+			fmt.Printf("    %s\033[1m%-16s\033[0m  %s %s\n", marker, t.Name, desc, scope)
+			if t.Dynamic && t.Source != "" {
+				color.HiBlack("      source: %s", compactToolPath(t.Source))
+			}
+			if t.Scope == "project" && t.ProjectRoot != "" {
+				color.HiBlack("      project: %s", compactToolPath(t.ProjectRoot))
+			}
+		}
+	}
+
+	if diagnostics := ctx.ListToolDiagnostics(); len(diagnostics) > 0 {
+		fmt.Println()
+		color.Cyan("  动态工具诊断 (%d):", len(diagnostics))
+		for _, d := range diagnostics {
+			name := d.Name
+			if name == "" {
+				name = filepath.Base(d.Source)
+			}
+			status := d.Status
+			if status == "" {
+				status = "unknown"
+			}
+			if status == "error" {
+				color.Red("    ✗ %s  [%s]", name, d.Scope)
+				if d.Error != "" {
+					color.HiBlack("      %s", d.Error)
+				}
+			} else {
+				color.Green("    ✓ %s  [%s]", name, d.Scope)
+			}
+			if d.Source != "" {
+				color.HiBlack("      source: %s", compactToolPath(d.Source))
+			}
 		}
 	}
 
@@ -2398,7 +2435,8 @@ func cmdTools(ctx cliContext, args string) error {
 		color.Magenta("  ◆ task 工具：派生子 agent")
 		color.HiBlack("    - 子 agent 获得独立的 system prompt + 工具集")
 		color.HiBlack("    - 排除 task 自身（防止无限递归）")
-		color.HiBlack("    - 默认 30 分钟 wall-clock 兜底（防卡死靠 LLM idle/工具超时），父 ctx 取消会传播")
+		color.HiBlack("    - 支持 sync / async 运行模式，父 ctx 取消会传播")
+		color.HiBlack("    - 防卡死依赖 LLM idle、工具超时、失败熔断和可配置回合上限")
 		color.HiBlack("    - 5 分钟内同 (description, style, provider) 命中缓存")
 	}
 
@@ -2406,6 +2444,38 @@ func cmdTools(ctx cliContext, args string) error {
 	color.HiBlack("  使用 /tools on|off 切换工具调用")
 	fmt.Println()
 	return nil
+}
+
+func toolScopeLabel(t ToolView) string {
+	switch {
+	case t.Scope == "project":
+		return "project"
+	case t.Scope == "global":
+		return "global"
+	case t.Dynamic:
+		return "dynamic"
+	case t.Scope == "builtin" || t.Scope == "":
+		return "builtin"
+	default:
+		return t.Scope
+	}
+}
+
+func compactToolPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if len(path) <= 96 {
+		return path
+	}
+	base := filepath.Base(path)
+	dir := filepath.Dir(path)
+	parent := filepath.Base(dir)
+	if parent == "." || parent == string(filepath.Separator) {
+		return "..." + string(filepath.Separator) + base
+	}
+	return "..." + string(filepath.Separator) + parent + string(filepath.Separator) + base
 }
 
 func cmdCompress(ctx cliContext, args string) error {

@@ -176,6 +176,104 @@ type UpstreamModelsItem struct {
 	Added   bool   `json:"added"` // already exists in this provider
 }
 
+// ProbeUpstreamModelsRequest is the body of
+// POST /api/v1/providers/probe-models. Used by the "add
+// provider" dialog before a provider row exists — the UI
+// supplies ephemeral base_url + api_key to list upstream
+// models for the default-model picker.
+type ProbeUpstreamModelsRequest struct {
+	BaseURL  string `json:"base_url"`
+	APIKey   string `json:"api_key"`
+	Protocol string `json:"protocol"`
+}
+
+// fetchUpstreamModelList GETs {baseURL}/models with the given
+// API key and maps the OpenAI-shaped response into
+// UpstreamModelsItem. existing marks ids already configured
+// locally (nil = none).
+func fetchUpstreamModelList(baseURL, apiKey string, existing map[string]bool) ([]UpstreamModelsItem, int, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return nil, http.StatusBadRequest, fmt.Errorf("base_url is required")
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		return nil, http.StatusBadRequest, fmt.Errorf("api_key is required")
+	}
+
+	url := baseURL + "/models"
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+	// Anthropic-compatible gateways often accept either; set
+	// both so official Anthropic /v1/models works too.
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, http.StatusBadGateway, fmt.Errorf("upstream request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, http.StatusBadGateway, fmt.Errorf("upstream returned %d", resp.StatusCode)
+	}
+
+	var parsed upstreamModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("parse upstream response: %w", err)
+	}
+
+	if existing == nil {
+		existing = map[string]bool{}
+	}
+	out := make([]UpstreamModelsItem, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		out = append(out, UpstreamModelsItem{
+			ID:      m.ID,
+			Created: m.Created,
+			OwnedBy: m.OwnedBy,
+			Added:   existing[m.ID],
+		})
+	}
+	return out, http.StatusOK, nil
+}
+
+func defaultProbeBaseURL(protocol, baseURL string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL != "" {
+		return baseURL
+	}
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "anthropic":
+		return "https://api.anthropic.com/v1"
+	default:
+		return "https://api.openai.com/v1"
+	}
+}
+
+// ProbeUpstreamModels POST /api/v1/providers/probe-models
+// Lists models from an upstream endpoint using credentials
+// supplied in the request body (no saved provider required).
+func (h *Handler) ProbeUpstreamModels(c *gin.Context) {
+	var req ProbeUpstreamModelsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+	baseURL := defaultProbeBaseURL(req.Protocol, req.BaseURL)
+	out, status, err := fetchUpstreamModelList(baseURL, req.APIKey, nil)
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"models": out, "base_url": baseURL})
+}
+
 // FetchUpstreamModels GET /api/v1/providers/:name/upstream-models
 // Calls the upstream provider's GET /v1/models with the stored API key
 // and returns the model list so the user can pick which to add.
@@ -202,51 +300,15 @@ func (h *Handler) FetchUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	baseURL := strings.TrimRight(provider.BaseURL, "/")
-	url := baseURL + "/models"
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("build request: %v", err)})
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("upstream request failed: %v", err)})
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("upstream returned %d", resp.StatusCode)})
-		return
-	}
-
-	var parsed upstreamModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("parse upstream response: %v", err)})
-		return
-	}
-
-	// Build index of already-added models.
 	existing := map[string]bool{}
 	for _, m := range provider.AllModels() {
 		existing[m.Name] = true
 	}
 
-	out := make([]UpstreamModelsItem, 0, len(parsed.Data))
-	for _, m := range parsed.Data {
-		out = append(out, UpstreamModelsItem{
-			ID:      m.ID,
-			Created: m.Created,
-			OwnedBy: m.OwnedBy,
-			Added:   existing[m.ID],
-		})
+	out, status, err := fetchUpstreamModelList(provider.BaseURL, provider.APIKey, existing)
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{"models": out})
 }

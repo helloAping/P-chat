@@ -77,6 +77,11 @@ func TestTruncatedResultCache_EvictsOldestOnByteCap(t *testing.T) {
 	t.Cleanup(func() { truncatedCache = old })
 
 	storeTruncatedResult("sess-1", "call_big1", strings.Repeat("a", 80))
+	truncatedCache.mu.Lock()
+	e := truncatedCache.entries["call_big1"]
+	e.storedAt = time.Now().Add(-time.Second)
+	truncatedCache.entries["call_big1"] = e
+	truncatedCache.mu.Unlock()
 	storeTruncatedResult("sess-1", "call_big2", strings.Repeat("b", 80))
 	// 160 bytes > 100 cap → at least one entry evicted.
 	if _, ok := LookupTruncatedResult("sess-1", "call_big1"); ok {
@@ -84,5 +89,24 @@ func TestTruncatedResultCache_EvictsOldestOnByteCap(t *testing.T) {
 	}
 	if _, ok := LookupTruncatedResult("sess-1", "call_big2"); !ok {
 		t.Fatal("newest entry should survive")
+	}
+}
+
+func TestTruncatedResultCache_ReplacingToolIDKeepsByteCount(t *testing.T) {
+	old := truncatedCache
+	truncatedCache = &toolResultCache{
+		entries:    make(map[string]truncatedResult),
+		maxEntries: 10,
+		maxBytes:   100,
+	}
+	t.Cleanup(func() { truncatedCache = old })
+
+	storeTruncatedResult("sess-1", "call_same", strings.Repeat("a", 80))
+	storeTruncatedResult("sess-1", "call_same", strings.Repeat("b", 80))
+	if _, ok := LookupTruncatedResult("sess-1", "call_same"); !ok {
+		t.Fatal("replacement of same tool id should not self-evict by double-counting bytes")
+	}
+	if truncatedCache.curBytes != 80 {
+		t.Fatalf("curBytes = %d, want 80", truncatedCache.curBytes)
 	}
 }

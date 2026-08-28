@@ -247,8 +247,8 @@ onMounted(loadSettings)
       </div>
     </div>
 
-    <!-- Edit form -->
-    <NCollapse default-expanded-names="basic" class="form-collapse">
+    <!-- Edit form: per-item cards via shared .settings-collapse -->
+    <NCollapse default-expanded-names="basic" class="settings-collapse">
       <NCollapseItem title="基本设置" name="basic">
         <div class="form-grid">
           <!-- Enable toggle -->
@@ -508,61 +508,34 @@ onMounted(loadSettings)
 .quota-bar-fill {
   height: 100%;
   background: var(--brand-500);
-  transition: width 0.2s ease;
+  transition: width var(--dur-base) var(--ease-out);
 }
 
-/* ---- Form (NCollapse wrapper) ----
- * The form-collapse NCollapse groups the three NCollapseItems
- * (基本设置 / 凭据 / 配额与超时). Same surface-1 + 1px
- * border treatment as the system tab's .sys-collapse. */
-.form-collapse {
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-1);
-  --n-collapse-item-margin: 0;
-}
-.form-collapse :deep(.n-collapse-item__header) {
-  padding: 12px 18px;
-  border-color: var(--border-subtle);
-}
-.form-collapse :deep(.n-collapse-item__header-main) {
-  font-size: 13.5px;
-  font-weight: 600;
-  color: var(--text-primary);
-  letter-spacing: -0.005em;
-}
-.form-collapse :deep(.n-collapse-item .n-collapse-item__content-inner) {
-  padding: 16px 18px 18px;
-}
-
-/* ---- Form grid + row (PR #9 follow-up) ----
- * Same pattern as the system tab: 8px vertical padding per
- * row, 1px border-top divider (except the first row), 12.5px
- * label, 11.5px hint, 12px column gap. The 110px label
- * width is wide enough for the longer Chinese labels
- * (Tavily 专用, 请求超时). */
+/* ---- Form grid + row ----
+ * Card chrome is provided by global .settings-collapse.
+ * Rows keep the same label/hint rhythm as the system tab. */
 .form-grid {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 0;
 }
 .form-row {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 0;
+  padding: 10px 0;
   border-top: 1px solid var(--border-subtle);
 }
 .form-row:first-child {
   border-top: none;
-  padding-top: 4px;
+  padding-top: 2px;
 }
 .form-row:last-child {
-  padding-bottom: 4px;
+  padding-bottom: 2px;
 }
 .form-label {
   font-size: 12.5px;
-  color: var(--text-secondary);
+  color: var(--text-primary);
   font-weight: 500;
   width: 110px;
   flex-shrink: 0;

@@ -97,3 +97,109 @@ func TestMergeAssistantRun_SingleMessage(t *testing.T) {
 		t.Errorf("Parts len = %d, want 1", len(got.Parts))
 	}
 }
+
+func TestMergeAssistantRun_AsyncSubAgentsFollowTaskToolsInCallOrder(t *testing.T) {
+	run := []MessageResponse{
+		{
+			Role: "assistant",
+			Parts: []MessagePart{
+				{Kind: "sub_agent", Task: "second background task", TaskID: "task-b", RunMode: "async"},
+				{Kind: "sub_agent", Task: "first background task", TaskID: "task-a", RunMode: "async"},
+			},
+		},
+		{
+			Role: "assistant",
+			Parts: []MessagePart{
+				{Kind: "thinking", Text: "decide to launch tasks"},
+				{Kind: "tool", Name: "task", Status: "ok", Args: `{"mode":"async","description":"first background task"}`, Result: "sub-agent launched in background: task_id=task-a, status=running"},
+				{Kind: "tool", Name: "task", Status: "ok", Args: `{"mode":"async","description":"second background task"}`, Result: "sub-agent launched in background: task_id=task-b, status=running"},
+				{Kind: "thinking", Text: "wait for one result"},
+				{Kind: "tool", Name: "task_wait", Status: "ok", Result: "task-a completed"},
+			},
+		},
+	}
+
+	got := mergeAssistantRun(run)
+	kinds := make([]string, 0, len(got.Parts))
+	for _, p := range got.Parts {
+		if p.Kind == "tool" {
+			kinds = append(kinds, "tool:"+p.Name)
+			continue
+		}
+		if p.Kind == "sub_agent" {
+			kinds = append(kinds, "sub:"+p.TaskID)
+			continue
+		}
+		kinds = append(kinds, p.Kind)
+	}
+	want := []string{
+		"thinking",
+		"tool:task",
+		"tool:task",
+		"sub:task-a",
+		"sub:task-b",
+		"thinking",
+		"tool:task_wait",
+	}
+	if len(kinds) != len(want) {
+		t.Fatalf("parts order len = %d (%v), want %d (%v)", len(kinds), kinds, len(want), want)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("parts order = %v, want %v", kinds, want)
+		}
+	}
+}
+
+func TestMergeUserAttachmentRows_TextAndImageRenderAsOneBubble(t *testing.T) {
+	msgs := []MessageResponse{
+		{
+			ID:      10,
+			Role:    "user",
+			Content: "图片说什么",
+		},
+		{
+			ID:      11,
+			Role:    "user",
+			Content: "",
+			Attachments: []AttachmentPart{{
+				Type: "image_url",
+				URL:  "/api/v1/uploads/upl1",
+				Name: "screen.png",
+				Kind: "image",
+				MIME: "image/png",
+			}},
+		},
+		{
+			ID:      12,
+			Role:    "assistant",
+			Content: "图片里有龙眼和小猫。",
+		},
+	}
+
+	got := mergeUserAttachmentRows(msgs)
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0].ID != 10 || got[0].Content != "图片说什么" {
+		t.Fatalf("merged user base = %+v, want text row kept", got[0])
+	}
+	if len(got[0].Attachments) != 1 || got[0].Attachments[0].Name != "screen.png" {
+		t.Fatalf("attachments = %+v, want image moved onto text row", got[0].Attachments)
+	}
+	if got[1].Role != "assistant" {
+		t.Fatalf("second row = %+v, want assistant preserved", got[1])
+	}
+}
+
+func TestMergeUserAttachmentRows_DoesNotMergeTwoTextMessages(t *testing.T) {
+	msgs := []MessageResponse{
+		{ID: 1, Role: "user", Content: "first"},
+		{ID: 2, Role: "user", Content: "second", Attachments: []AttachmentPart{{Type: "image_url", Kind: "image"}}},
+	}
+
+	got := mergeUserAttachmentRows(msgs)
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2; got=%+v", len(got), got)
+	}
+}

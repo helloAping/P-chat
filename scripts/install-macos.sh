@@ -5,7 +5,8 @@
 # script's location:
 #
 #   ./pchat-gui.app/                    # Wails .app bundle
-#   ./pchat-server                      # server binary (universal)
+#   ./pchat-server                      # server binary
+#   ./pchat-updater                     # self-update applier
 #   ./pchat                             # CLI binary
 #   ./web/                              # embedded SPA assets
 #   ./uninstall.sh
@@ -27,6 +28,7 @@ USER_PREFIX="$HOME"
 SYSTEM=false
 PREFIX=""
 PORTABLE=false
+SUDO=""
 EXEC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 while [[ $# -gt 0 ]]; do
@@ -40,12 +42,20 @@ done
 
 # --- locate bundle contents ---
 SRC_APP="$EXEC_DIR/pchat-gui.app"
-SRC_SERVER="$EXEC_DIR/pchat-server"
+SRC_SERVER="$SRC_APP/Contents/Resources/pchat-server"
+if [[ ! -f "$SRC_SERVER" ]]; then
+  SRC_SERVER="$EXEC_DIR/pchat-server"
+fi
+SRC_UPDATER="$SRC_APP/Contents/Resources/pchat-updater"
+if [[ ! -f "$SRC_UPDATER" ]]; then
+  SRC_UPDATER="$EXEC_DIR/pchat-updater"
+fi
 SRC_CLI="$EXEC_DIR/pchat"
 SRC_UNINSTALL="$EXEC_DIR/uninstall.sh"
 
 [[ -d "$SRC_APP" ]] || { echo "ERROR: pchat-gui.app not found at $SRC_APP"; exit 1; }
 [[ -f "$SRC_SERVER" ]] || { echo "ERROR: pchat-server not found at $SRC_SERVER"; exit 1; }
+[[ -f "$SRC_UPDATER" ]] || { echo "ERROR: pchat-updater not found at $SRC_UPDATER"; exit 1; }
 HAVE_CLI=false
 [[ -f "$SRC_CLI" ]] && HAVE_CLI=true
 
@@ -77,7 +87,7 @@ fi
 echo "[install] app dir: $APP_DIR"
 echo "[install] bin dir: $BIN_DIR"
 
-mkdir -p "$APP_DIR" "$BIN_DIR"
+$SUDO mkdir -p "$APP_DIR" "$BIN_DIR"
 
 # --- install .app bundle ---
 # Use `rsync -a --delete` to refresh existing installs without
@@ -93,23 +103,23 @@ fi
 echo "[install] installed $DST_APP"
 
 # --- install side binaries ---
-# pchat-server is colocated with the .app on /Applications (next to
-# the Wails MacOS/pchat-gui binary reads it via the same parent dir
-# at runtime); the bin/ symlinks below are just for the CLI + manual
-# server invocation.
+# pchat-server is embedded in the installed .app Resources directory;
+# the bin/ symlink below is only for manual server invocation.
 if $HAVE_CLI; then
-  ln -sf "$SRC_CLI" "$BIN_DIR/pchat"
-  echo "[install] symlink $BIN_DIR/pchat -> $SRC_CLI"
+  $SUDO cp -f "$SRC_CLI" "$BIN_DIR/pchat"
+  $SUDO chmod +x "$BIN_DIR/pchat"
+  echo "[install] copied CLI to $BIN_DIR/pchat"
 fi
-ln -sf "$SRC_SERVER" "$BIN_DIR/pchat-server"
-echo "[install] symlink $BIN_DIR/pchat-server -> $SRC_SERVER"
+INSTALLED_SERVER="$DST_APP/Contents/Resources/pchat-server"
+$SUDO ln -sf "$INSTALLED_SERVER" "$BIN_DIR/pchat-server"
+echo "[install] symlink $BIN_DIR/pchat-server -> $INSTALLED_SERVER"
 
 # --- copy uninstall script next to the .app ---
 # Same convention as install-linux.sh: the uninstall script is a
 # pure data file inside the install target, so users always know
 # where to find it.
-cp -f "$SRC_UNINSTALL" "$APP_DIR/pchat-uninstall.sh" 2>/dev/null || true
-chmod +x "$APP_DIR/pchat-uninstall.sh" 2>/dev/null || true
+$SUDO cp -f "$SRC_UNINSTALL" "$APP_DIR/pchat-uninstall.sh" 2>/dev/null || true
+$SUDO chmod +x "$APP_DIR/pchat-uninstall.sh" 2>/dev/null || true
 
 echo ""
 echo "[install] done."

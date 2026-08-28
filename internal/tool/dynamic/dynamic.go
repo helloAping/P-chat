@@ -109,10 +109,12 @@ func Preview(spec Spec, args json.RawMessage) (*tool.CallResult, error) {
 // assembles the metadata (Name / Description / Parameters)
 // and leaves the actual call logic to the handler.
 func (s Spec) AsTool() tool.Tool {
+	timeoutMS := int(s.Template.Timeout.Std() / time.Millisecond)
 	return tool.Tool{
 		Name:        s.Name,
 		Description: s.Description,
 		Parameters:  s.Parameters,
+		Policy:      &tool.ToolPolicy{TimeoutMS: timeoutMS},
 	}
 }
 

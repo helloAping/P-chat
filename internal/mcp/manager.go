@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sync"
 	"time"
@@ -39,27 +40,34 @@ type ServerInfo struct {
 }
 
 type managerServer struct {
-	cfg      ServerConfig
-	state    ServerState
-	errMsg   string
-	tools    []string
-	client   *Client
-	callMu   sync.Mutex
-	cancel   context.CancelFunc
+	cfg    ServerConfig
+	state  ServerState
+	errMsg string
+	tools  []string
+	client *Client
+	callMu sync.Mutex
+	cancel context.CancelFunc
+}
+
+type toolRoute struct {
+	server string
+	tool   string
 }
 
 type Manager struct {
-	mu       sync.RWMutex
-	servers  map[string]*managerServer
-	registry *tool.Registry
-	globalOn bool
+	mu         sync.RWMutex
+	servers    map[string]*managerServer
+	toolRoutes map[string]toolRoute
+	registry   *tool.Registry
+	globalOn   bool
 }
 
 func NewManager(registry *tool.Registry) *Manager {
 	return &Manager{
-		servers:  make(map[string]*managerServer),
-		registry: registry,
-		globalOn: true,
+		servers:    make(map[string]*managerServer),
+		toolRoutes: make(map[string]toolRoute),
+		registry:   registry,
+		globalOn:   true,
 	}
 }
 
@@ -209,32 +217,38 @@ func (m *Manager) GetServer(name string) (ServerConfig, bool) {
 }
 
 func (m *Manager) CallTool(ctx context.Context, mcpToolName string, args map[string]any) (*CallToolResult, error) {
-	serverName, toolName, ok := parseMCPToolName(mcpToolName)
+	m.mu.RLock()
+	route, ok := m.toolRoutes[mcpToolName]
 	if !ok {
+		m.mu.RUnlock()
 		return nil, fmt.Errorf("invalid MCP tool name: %s", mcpToolName)
 	}
-
-	m.mu.RLock()
-	srv, ok := m.servers[serverName]
+	srv, ok := m.servers[route.server]
+	state := StateStopped
+	timeout := 60 * time.Second
+	if ok {
+		state = srv.state
+		timeout = srv.cfg.Timeout
+	}
 	m.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("MCP server %q not found", serverName)
+		return nil, fmt.Errorf("MCP server %q not found", route.server)
 	}
-	if srv.state != StateRunning {
-		return nil, fmt.Errorf("MCP server %q is %s", serverName, srv.state)
+	if state != StateRunning {
+		return nil, fmt.Errorf("MCP server %q is %s", route.server, state)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, srv.cfg.Timeout)
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	srv.callMu.Lock()
 	defer srv.callMu.Unlock()
 
 	if srv.client == nil {
-		return nil, fmt.Errorf("MCP server %q client is nil", serverName)
+		return nil, fmt.Errorf("MCP server %q client is nil", route.server)
 	}
 
-	return srv.client.CallTool(callCtx, toolName, args)
+	return srv.client.CallTool(callCtx, route.tool, args)
 }
 
 func (m *Manager) startLocked(name string) {
@@ -258,15 +272,20 @@ func (m *Manager) stopLocked(name string) {
 		srv.cancel = nil
 	}
 	if srv.client != nil {
+		srv.callMu.Lock()
 		srv.client.Close()
 		srv.client = nil
+		srv.callMu.Unlock()
 	}
 	srv.state = StateStopped
 }
 
 func (m *Manager) unregisterTools(srv *managerServer) {
 	for _, tn := range srv.tools {
-		m.registry.Unregister(tn)
+		if m.registry != nil {
+			m.registry.Unregister(tn)
+		}
+		delete(m.toolRoutes, tn)
 	}
 	srv.tools = nil
 }
@@ -295,8 +314,10 @@ func (m *Manager) runServer(ctx context.Context, name string) {
 				if s, ok := m.servers[name]; ok {
 					m.unregisterTools(s)
 					if s.client != nil {
+						s.callMu.Lock()
 						s.client.Close()
 						s.client = nil
+						s.callMu.Unlock()
 					}
 					if s.state != StateError {
 						s.state = StateStopped
@@ -335,24 +356,24 @@ func (m *Manager) connectServer(ctx context.Context, name string, cfg ServerConf
 	if cfg.Type == "sse" && cfg.URL != "" {
 		transport = NewSSETransport(cfg.URL)
 	} else {
-		transport = NewStdioTransport(cfg.Command, cfg.Args)
+		transport = NewStdioTransport(cfg.Command, cfg.Args, cfg.Env)
 	}
 	client := NewClient(transport)
 
-	startCtx, startCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer startCancel()
-
-	if err := client.Start(startCtx); err != nil {
+	if err := client.Start(ctx); err != nil {
 		client.Close()
 		return fmt.Errorf("start process: %w", err)
 	}
 
-	if err := client.Initialize(startCtx); err != nil {
+	initCtx, initCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer initCancel()
+
+	if err := client.Initialize(initCtx); err != nil {
 		client.Close()
 		return fmt.Errorf("initialize: %w", err)
 	}
 
-	tools, err := client.ListTools(startCtx)
+	tools, err := client.ListTools(initCtx)
 	if err != nil {
 		client.Close()
 		return fmt.Errorf("list tools: %w", err)
@@ -383,7 +404,20 @@ func (m *Manager) setError(name string, msg string) {
 }
 
 func (m *Manager) registerMCPTools(serverName string, tools []Tool) {
+	var oldTools []string
+	m.mu.RLock()
+	if s, ok := m.servers[serverName]; ok {
+		oldTools = append(oldTools, s.tools...)
+	}
+	m.mu.RUnlock()
+	for _, old := range oldTools {
+		if m.registry != nil {
+			m.registry.Unregister(old)
+		}
+	}
+
 	var registered []string
+	routes := make(map[string]toolRoute, len(tools))
 	for _, t := range tools {
 		toolName := mcpToolName(serverName, t.Name)
 		handler := MakeMCPHandler(m, toolName)
@@ -391,42 +425,55 @@ func (m *Manager) registerMCPTools(serverName string, tools []Tool) {
 		if len(params) == 0 {
 			params = json.RawMessage(`{"type":"object","properties":{}}`)
 		}
-		m.registry.Register(tool.Tool{
-			Name:        toolName,
-			Description: fmt.Sprintf("[MCP:%s] %s", serverName, t.Description),
-			Parameters:  params,
-		}, handler)
+		if m.registry != nil {
+			m.registry.Register(tool.Tool{
+				Name:        toolName,
+				Description: fmt.Sprintf("[MCP:%s] %s", serverName, t.Description),
+				Parameters:  params,
+			}, handler)
+		}
 		registered = append(registered, toolName)
+		routes[toolName] = toolRoute{server: serverName, tool: t.Name}
 	}
 
 	m.mu.Lock()
 	if s, ok := m.servers[serverName]; ok {
+		for _, old := range s.tools {
+			delete(m.toolRoutes, old)
+		}
 		s.tools = registered
+		for name, route := range routes {
+			m.toolRoutes[name] = route
+		}
 	}
 	m.mu.Unlock()
 }
 
 func mcpToolName(server, tool string) string {
-	return "mcp-" + server + "_" + tool
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(server))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(tool))
+	return fmt.Sprintf("mcp__%s__%s__%08x", safeToolIdent(server, 20), safeToolIdent(tool, 27), hash.Sum32())
 }
 
-func parseMCPToolName(full string) (server, tool string, ok bool) {
-	if len(full) < 5 || full[:4] != "mcp-" {
-		return "", "", false
-	}
-	rest := full[4:]
-	idx := lastIndexByte(rest, '_')
-	if idx < 0 {
-		return "", "", false
-	}
-	return rest[:idx], rest[idx+1:], true
-}
-
-func lastIndexByte(s string, c byte) int {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == c {
-			return i
+func safeToolIdent(s string, max int) string {
+	var b []byte
+	for i := 0; i < len(s) && len(b) < max; i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			b = append(b, c)
+		case c >= 'A' && c <= 'Z':
+			b = append(b, c)
+		case c >= '0' && c <= '9':
+			b = append(b, c)
+		default:
+			b = append(b, '_')
 		}
 	}
-	return -1
+	if len(b) == 0 {
+		return "x"
+	}
+	return string(b)
 }

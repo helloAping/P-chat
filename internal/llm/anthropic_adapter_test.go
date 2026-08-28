@@ -168,6 +168,57 @@ func TestAnthropicBuild_ToolResultResetsAssistant(t *testing.T) {
 	}
 }
 
+func TestAnthropicBuild_ToolCallInputIsSafeJSONObject(t *testing.T) {
+	a := NewAnthropicAdapter("https://api.example.com", "sk-test", "test")
+	msgs := []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "run tests"},
+		{Role: RoleAssistant, Type: TypeToolCall, ToolID: "toolu_bad", ToolName: "exec_command", ToolInput: `go test ./...`},
+		{Role: RoleTool, Type: TypeToolResult, ToolID: "toolu_bad", ToolName: "exec_command", Content: "ok"},
+	}
+	out := mustBuildAnthropic(t, a, msgs, "")
+	blocks := extractBlocks(t, out.Messages[1].Content)
+	if len(blocks) != 1 || blocks[0].Type != "tool_use" {
+		t.Fatalf("assistant blocks = %+v, want one tool_use", blocks)
+	}
+	if got := strings.TrimSpace(string(blocks[0].Input)); got != `{}` {
+		t.Fatalf("tool_use input = %q, want sanitized empty object for malformed history", got)
+	}
+}
+
+func TestAnthropicBuild_UserTextAndMultipleImages_Merged(t *testing.T) {
+	a := NewAnthropicAdapter("https://api.example.com", "sk-test", "test")
+	msgs := []ChatMessage{
+		{Role: RoleUser, Type: TypeText, Content: "compare these images"},
+		{Role: RoleUser, Type: TypeImage, Content: "AAA", MimeType: "image/png", Name: "a.png"},
+		{Role: RoleUser, Type: TypeImage, Content: "BBB", MimeType: "image/jpeg", Name: "b.jpg"},
+	}
+	out := mustBuildAnthropic(t, a, msgs, "")
+
+	if got := len(out.Messages); got != 1 {
+		t.Fatalf("messages count = %d, want 1 combined user message. body=%s", got, string(mustBodyAnthropic(a, msgs, "")))
+	}
+	user := out.Messages[0]
+	if user.Role != "user" {
+		t.Fatalf("role = %q, want user", user.Role)
+	}
+	blocks := extractBlocks(t, user.Content)
+	if len(blocks) != 3 {
+		t.Fatalf("blocks = %d, want text + 2 images. body=%s", len(blocks), string(mustBodyAnthropic(a, msgs, "")))
+	}
+	if blocks[0].Type != "text" || blocks[0].Text != "compare these images" {
+		t.Fatalf("block[0] = %+v, want text", blocks[0])
+	}
+	if blocks[1].Type != "image" || blocks[2].Type != "image" {
+		t.Fatalf("image blocks = %+v / %+v, want image", blocks[1], blocks[2])
+	}
+	if blocks[1].Source.MediaType != "image/png" || blocks[1].Source.Data != "AAA" {
+		t.Fatalf("block[1].Source = %+v", blocks[1].Source)
+	}
+	if blocks[2].Source.MediaType != "image/jpeg" || blocks[2].Source.Data != "BBB" {
+		t.Fatalf("block[2].Source = %+v", blocks[2].Source)
+	}
+}
+
 // mustBodyAnthropic returns the raw request body bytes for the
 // given input. Used in error messages only.
 func mustBodyAnthropic(a *AnthropicAdapter, msgs []ChatMessage, system string) []byte {

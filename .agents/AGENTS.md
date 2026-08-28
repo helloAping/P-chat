@@ -358,6 +358,8 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 工作模式 `work_mode` 配置 | `internal/config/config.go` `WorkModeConfig` |
 | `work_mode` 提示词段 | `internal/agent/prompt.go` `buildWorkModeBlock()` |
 | `work_mode` per-session 覆盖 | `internal/server/handler.go` `sessionMeta.WorkMode` |
+| 图片识别工具 | `internal/tool/image_recognize.go` + `internal/agent/attachment.go`（当前轮 preflight、历史图片 `upload_id` 工具回看、当前视觉模型 fallback） |
+| 图片识别系统配置 | `internal/config/config.go` `VisionRecognitionConfig` + `internal/server/system_config.go` |
 | CLI `/mode` 命令 | `internal/cli/commands.go` `cmdMode()` |
 | 子 agent runner | `internal/subagent/subagent.go:511-832` `Run()` |
 | 子 agent 事件转发 | `internal/subagent/subagent.go:837-842` `tryForward()` |
@@ -372,6 +374,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | sendOrDrop 逃生 | `internal/agent/agent.go`（`sendOrDropTimeout`，channel 满 30s 丢非关键事件） |
 | 大 tool 结果截断 + 有界缓存 | `internal/agent/agent.go`（`MaxToolResultFullBytes`）+ `internal/agent/tool_result_cache.go` |
 | cancel-stream / tool-result 端点 | `internal/server/messages.go` + `server.go` |
+| 自动续跑隐藏消息 | `internal/server/messages.go`（`origin=auto_resume` / `ui_hidden=true`）+ `internal/server/message_helpers.go`（历史响应过滤）+ `internal/memory/memory.go`（`ChatMessage.Meta` 持久化） |
 | **图片实体化（upl://）** | `internal/agent/attachment.go`（`ExpandAttachmentsCM`）+ `internal/server/message_helpers.go`（`buildMessageResponse` / `resolveHistoryUploads`）+ `internal/server/upload.go` |
 | **子代理超时/部分结果** | `internal/subagent/subagent.go` `Run()`（`Result.Interrupted`）+ `internal/agent/auto_continue.go`（`CumToolErrMax`） |
 | **子代理失败熔断** | `internal/agent/agent.go`（same-tool / stuck-loop / cumulative breaker）+ `internal/subagent/subagent.go`（`buildSubAgentChatRequest` MaxRounds） |

@@ -1,7 +1,6 @@
 package tool
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -263,7 +262,7 @@ func (p *managedProcess) snapshot(maxBytes int) processSnapshot {
 		StartedAt: p.startedAt.Format(time.RFC3339),
 		Running:   !p.exited,
 		ExitText:  p.exitText,
-		Output:    string(bytes.TrimRight(out, "\x00")),
+		Output:    DecodeCommandOutput(out),
 	}
 }
 

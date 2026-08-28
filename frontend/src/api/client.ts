@@ -3,7 +3,7 @@
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
 
-import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, type StreamEventLike } from './sse'
+import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, STREAM_IDLE_AFTER_LLM_MS, type StreamEventLike } from './sse'
 
 const BASE = '' // same origin; pchat-server serves both UI and API
 
@@ -98,6 +98,7 @@ export interface Session {
   // slash command toggles this per session.
   auto_continue?: boolean
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
+  use_image_recognition?: boolean
 }
 
 export interface Attachment {
@@ -160,6 +161,7 @@ export type MessagePart =
       agentColor?: string
       agentModel?: string
       taskId?: string
+      runMode?: 'sync' | 'async' | string
       agentDescription?: string
       failureReason?: string
     }
@@ -309,6 +311,7 @@ export interface UpdateSessionMetaResponse {
   vector_store?: string
   knowledge_base?: string
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
+  use_image_recognition?: boolean
   created_at?: number
   updated_at?: number
 }
@@ -376,10 +379,26 @@ export const listSessions = (projectPath: string) =>
 export const getSession = (id: string) =>
   jsonFetch<Session>(`/api/v1/sessions/${encodeURIComponent(id)}`)
 
-export const createSession = (projectPath?: string, workMode?: string) =>
-  jsonFetch<{ id: string }>(
+export interface CreateSessionOptions {
+  project_path?: string
+  work_mode?: string
+  provider?: string
+  model?: string
+  style?: string
+  plan_mode?: boolean
+  permission_level?: string
+  reasoning_effort?: string
+  vector_store?: string
+  knowledge_base?: string
+  auto_continue?: boolean
+  todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
+  use_image_recognition?: boolean
+}
+
+export const createSession = (options: CreateSessionOptions = {}) =>
+  jsonFetch<Session>(
     '/api/v1/sessions',
-    { method: 'POST', body: JSON.stringify({ project_path: projectPath || '', work_mode: workMode || '' }) },
+    { method: 'POST', body: JSON.stringify(options) },
   )
 
 export const deleteSession = (id: string) =>
@@ -393,7 +412,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited' }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -511,20 +530,39 @@ export interface SearchSkillItem {
   url: string
 }
 
-export const listSkills = () =>
-  jsonFetch<{ skills: SkillItem[] }>('/api/v1/skills')
+export interface SkillScopeOptions {
+  sessionId?: string
+  projectPath?: string
+}
 
-export const getSkill = (name: string) =>
-  jsonFetch<{ skill: SkillItem }>(`/api/v1/skills/${encodeURIComponent(name)}`)
+function skillScopeQuery(opts?: SkillScopeOptions) {
+  const q = new URLSearchParams()
+  if (opts?.sessionId) q.set('session_id', opts.sessionId)
+  if (opts?.projectPath) q.set('project_path', opts.projectPath)
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
 
-export const installSkill = (name: string, url: string) =>
+export const listSkills = (opts?: SkillScopeOptions) =>
+  jsonFetch<{ skills: SkillItem[] }>(`/api/v1/skills${skillScopeQuery(opts)}`)
+
+export const getSkill = (name: string, opts?: SkillScopeOptions) =>
+  jsonFetch<{ skill: SkillItem }>(`/api/v1/skills/${encodeURIComponent(name)}${skillScopeQuery(opts)}`)
+
+export const installSkill = (name: string, url: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
   jsonFetch<{ ok: boolean; name: string }>('/api/v1/skills/install', {
     method: 'POST',
-    body: JSON.stringify({ name, url }),
+    body: JSON.stringify({
+      name,
+      url,
+      scope: opts?.scope,
+      session_id: opts?.sessionId,
+      project_path: opts?.projectPath,
+    }),
   })
 
-export const deleteSkill = (name: string) =>
-  jsonFetch<{ ok: boolean }>(`/api/v1/skills/${encodeURIComponent(name)}`, { method: 'DELETE' })
+export const deleteSkill = (name: string, opts?: SkillScopeOptions) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/skills/${encodeURIComponent(name)}${skillScopeQuery(opts)}`, { method: 'DELETE' })
 
 export const searchSkills = (q: string) =>
   jsonFetch<{ results: SearchSkillItem[] }>(`/api/v1/skills/search?q=${encodeURIComponent(q)}`)
@@ -578,6 +616,12 @@ export const addMCPServer = (cfg: {
 export const removeMCPServer = (name: string) =>
   jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}`, { method: 'DELETE' })
 
+export const startMCPServer = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}/start`, { method: 'POST' })
+
+export const stopMCPServer = (name: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}/stop`, { method: 'POST' })
+
 export const restartMCPServer = (name: string) =>
   jsonFetch<{ ok: boolean }>(`/api/v1/mcp/servers/${encodeURIComponent(name)}/restart`, { method: 'POST' })
 
@@ -618,6 +662,37 @@ export interface ListMessagesResult {
   oldest_id: number
 }
 
+export interface SubAgentJob {
+  id: string
+  task_id: string
+  session_id: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | string
+  subagent_type?: string
+  model?: string
+  description?: string
+  result?: string
+  error?: string
+  progress_json?: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  cancelled_at?: string
+}
+
+export interface SubAgentJobListResponse {
+  jobs: SubAgentJob[]
+}
+
+export interface SubAgentJobCancelResponse {
+  job: SubAgentJob
+  cancelled_live: boolean
+}
+
+export interface SubAgentJobEvent extends StreamEventLike {
+  type: 'created' | 'updated' | 'heartbeat' | string
+  job?: SubAgentJob
+}
+
 // listMessages fetches a page of session history. Omit
 // `opts` to get the full history (first open after reload —
 // the server applies the context-window cap automatically).
@@ -633,6 +708,44 @@ export const listMessages = (id: string, opts?: PageOpts) => {
   return jsonFetch<ListMessagesResult>(
     `/api/v1/sessions/${id}/messages${qs ? '?' + qs : ''}`,
   )
+}
+
+export const listSubAgentJobs = (sessionId: string, limit = 20) =>
+  jsonFetch<SubAgentJobListResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs?limit=${limit}`,
+  )
+
+export const getSubAgentJob = (sessionId: string, taskId: string) =>
+  jsonFetch<SubAgentJob>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs/${encodeURIComponent(taskId)}`,
+  )
+
+export const cancelSubAgentJob = (sessionId: string, taskId: string) =>
+  jsonFetch<SubAgentJobCancelResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs/${encodeURIComponent(taskId)}/cancel`,
+    { method: 'POST' },
+  )
+
+export async function streamSubAgentJobEvents(
+  sessionId: string,
+  onEvent: (ev: SubAgentJobEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = await waitForDirectBackend()
+  const resp = await fetch(`${base}/api/v1/sessions/${encodeURIComponent(sessionId)}/subagent-jobs/events`, {
+    method: 'GET',
+    headers: { Accept: 'text/event-stream' },
+    signal,
+  })
+  if (!resp.ok || !resp.body) {
+    throw new Error(`subagent job events: HTTP ${resp.status}: ${resp.statusText}`)
+  }
+  await consumeSSEStream<SubAgentJobEvent>({
+    reader: resp.body.getReader(),
+    signal,
+    label: 'subagent-job-events',
+    onEvent,
+  })
 }
 
 // --- Archive ---
@@ -680,12 +793,17 @@ export const forkSession = (sessionId: string, beforeId: number) =>
 export async function uploadFile(file: File): Promise<UploadMeta> {
   const fd = new FormData()
   fd.append('file', file)
-  const res = await fetch(BASE + '/api/v1/uploads', { method: 'POST', body: fd })
+  const backend = await waitForDirectBackend()
+  const res = await fetch(`${backend}/api/v1/uploads`, { method: 'POST', body: fd, credentials: 'omit' })
   if (!res.ok) {
     const t = await res.text()
     throw new Error(`HTTP ${res.status}: ${t}`)
   }
-  return res.json() as Promise<UploadMeta>
+  const meta = await res.json() as UploadMeta
+  if (!meta || meta.size <= 0) {
+    throw new Error('upload returned empty file')
+  }
+  return meta
 }
 
 export function uploadURL(id: string): string {
@@ -985,6 +1103,17 @@ export const fetchUpstreamModels = (provider: string) =>
     `/api/v1/providers/${encodeURIComponent(provider)}/upstream-models`,
   )
 
+/** Probe upstream /models with ephemeral credentials (add-provider dialog). */
+export const probeUpstreamModels = (body: {
+  base_url?: string
+  api_key: string
+  protocol?: string
+}) =>
+  jsonFetch<{ models: UpstreamModelItem[]; base_url: string }>(
+    '/api/v1/providers/probe-models',
+    { method: 'POST', body: JSON.stringify(body) },
+  )
+
 // --- Streaming send ---
 export interface InlineAttachment {
   // 'image_url' for images, 'audio_url' / 'video_url' for media
@@ -1039,6 +1168,7 @@ export interface SendOptions {
   model?: string
   style?: string
   workMode?: string
+  useImageRecognition?: boolean
   // Inline attachments carry the bytes up front so the message
   // is self-contained: the chat bubble shows the image
   // immediately, the backend doesn't need to re-read the file
@@ -1126,6 +1256,7 @@ export interface StreamEvent {
   sub_agent_color?: string
   sub_agent_model?: string
   sub_agent_task_id?: string
+  sub_agent_run_mode?: 'sync' | 'async' | string
   sub_agent_description?: string
   sub_agent_failure_reason?: string
   // thinking_rewrite is the post-stream redactor's
@@ -1279,6 +1410,7 @@ async function streamMessagesViaFetch(
     style: opts.style,
     work_mode: opts.workMode,
     attachments: opts.attachments,
+    use_image_recognition: opts.useImageRecognition,
     skill_context: opts.skill_context || '',
   })
   return consumeStreamRequest({
@@ -1288,10 +1420,11 @@ async function streamMessagesViaFetch(
     label: 'stream',
     onEvent: opts.onEvent,
     onStreamDrop: opts.onStreamDrop,
-    // 150s of silence → the turn is stuck (server LLM idle timeout
-    // is 120s; its error would have arrived by then). Cancel and
-    // recover via P0-1 instead of spinning forever.
-    idleTimeoutMs: 150_000,
+    // Default idle sits above the server stall watchdog (180s).
+    // consumeSSEStream stretches this to STREAM_IDLE_AFTER_TOOL_MS
+    // after a tool/sub-agent start so long exec/task runs are not
+    // mistaken for a stuck turn.
+    idleTimeoutMs: STREAM_IDLE_AFTER_LLM_MS,
   })
 }
 
@@ -1854,11 +1987,20 @@ export interface UIConfig {
   close_behavior: 'exit' | 'tray' | string
 }
 
+export interface VisionRecognitionConfig {
+  enabled: boolean
+  provider: string
+  model: string
+  timeout_seconds: number
+  max_image_bytes: number
+}
+
 export interface SystemConfig {
   limits: LimitsConfig
   sub_agent: SubAgentConfig
   work_mode: WorkModeConfig
   ui: UIConfig
+  vision_recognition: VisionRecognitionConfig
 }
 
 export const getSystemConfig = () =>

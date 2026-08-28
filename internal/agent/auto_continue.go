@@ -53,7 +53,7 @@ const MaxStreamBytesPerRound = 1 << 20
 // resets on ANY transport byte, so a proxy that pads a dead upstream with
 // SSE keep-alive lines can keep it "alive" indefinitely. Without this
 // backstop the round's select would block until the turn deadline
-// (MaxTurnSeconds, default 3600s) and the UI would show a permanently
+// (MaxTurnSeconds, default 900s) and the UI would show a permanently
 // spinning tool / sub-agent card.
 //
 // 3 minutes sits safely above the default 120s client-side idle watchdog

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onBeforeUnmount } from 'vue'
-import { NSpin, useMessage } from 'naive-ui'
-import { ArrowDown, ArrowUp, MessageSquare } from './icons'
+import { useMessage } from 'naive-ui'
+import { ArrowDown, ArrowUp, MessageSquare, Loader2 } from './icons'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
+import SubAgentJobsPanel from './SubAgentJobsPanel.vue'
 import StreamingBar from './StreamingBar.vue'
 import QuestionModal from './QuestionModal.vue'
 // QuestionPanel removed in 2026-07-09 — it duplicated
@@ -12,7 +13,7 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging } from '../stores/chat'
 
 // isRecoveringCurrent mirrors state.isRecovering[currentID].
 // Watched reactively by the recovery-in-progress banner
@@ -281,6 +282,12 @@ watch(() => state.currentID, () => {
   scrollToBottom()
 })
 
+watch(() => state.viewLoading, (loading) => {
+  if (loading) return
+  isAtBottom.value = true
+  scrollToBottom()
+})
+
 onMounted(() => {
   scrollToBottom()
   // Bridge Naive UI's useMessage() to the chat store. The store
@@ -329,6 +336,17 @@ async function handleFork(index: number) {
   }
 }
 
+async function handleSubAgentJobTerminal() {
+  if (!state.currentID) return
+  const sessionID = state.currentID
+  setSessionBackgroundHookMerging(sessionID, true)
+  try {
+    await refreshLatestMessages(sessionID)
+  } finally {
+    setSessionBackgroundHookMerging(sessionID, false)
+  }
+}
+
 // messageKey produces a stable Vue :key for a message in the
 // v-for list. We prefer seq (the per-conversation logical
 // position, stable across rollback/undo) and fall back to
@@ -363,11 +381,12 @@ function messageKey(m: any, i: number): string | number {
       <div
         v-if="currentRecoveryBanner"
         class="recovery-banner"
+        :class="{ 'recovery-banner--interrupt': currentRecoveryBanner.kind === 'interrupt' }"
         :key="currentRecoveryBanner.shownAt"
       >
-        <span class="recovery-icon">📥</span>
+        <span class="recovery-icon">{{ currentRecoveryBanner.kind === 'interrupt' ? '⚠' : '📥' }}</span>
         <span class="recovery-text">
-          已恢复 {{ currentRecoveryBanner.recovered }} 条消息
+          {{ currentRecoveryBanner.kind === 'interrupt' ? '对话已中断' : `已恢复 ${currentRecoveryBanner.recovered} 条消息` }}
         </span>
         <span class="recovery-reason">{{ currentRecoveryBanner.reason }}</span>
       </div>
@@ -403,13 +422,15 @@ function messageKey(m: any, i: number): string | number {
          scroll-listener attach in onMounted) and the input
          below stays pinned to the bottom of the viewport
          even when the message list is short. -->
-    <div
-      ref="messagesEl"
-      class="messages-scroll"
-      @scroll="onScroll"
-    >
-      <div class="messages">
-        <div v-if="currentMessages.length === 0" class="empty">
+    <div class="messages-pane">
+      <div
+        ref="messagesEl"
+        class="messages-scroll"
+        :aria-busy="state.viewLoading ? 'true' : undefined"
+        @scroll="onScroll"
+      >
+      <div class="messages" :class="{ 'messages--switching': state.viewLoading }">
+        <div v-if="!state.viewLoading && currentMessages.length === 0" class="empty">
           <div class="empty-icon">
             <MessageSquare :size="48" />
           </div>
@@ -429,9 +450,22 @@ function messageKey(m: any, i: number): string | number {
           @fork="handleFork(i)"
         />
       </div>
+      </div>
+      <Transition name="view-loading">
+        <div
+          v-if="state.viewLoading"
+          class="view-loading"
+          role="status"
+          aria-live="polite"
+        >
+          <Loader2 :size="18" class="view-loading-spin" />
+          <span class="view-loading-hint">{{ state.viewLoadingHint || '正在加载对话…' }}</span>
+        </div>
+      </Transition>
     </div>
     <QuestionModal @locate-question="locateOpenQuestion" />
     <TodoPanel />
+    <SubAgentJobsPanel :session-id="state.currentID" @job-terminal="handleSubAgentJobTerminal" />
     <InputArea />
     <!-- P1-4: 锚定 FAB (jump-to-user-message). Shown
          when the user is scrolled up beyond the 50px
@@ -503,6 +537,9 @@ function messageKey(m: any, i: number): string | number {
   animation: recovery-pulse 1.4s ease-in-out infinite;
   display: inline-block;
 }
+.recovery-banner--interrupt {
+  border-bottom-color: var(--warning);
+}
 @keyframes recovery-pulse {
   0%, 100% { opacity: 0.5; transform: scale(0.95); }
   50%      { opacity: 1.0; transform: scale(1.05); }
@@ -522,10 +559,13 @@ function messageKey(m: any, i: number): string | number {
 .recovery-banner-leave-to {
   opacity: 0;
 }
-.recovery-banner-enter-active,
+.recovery-banner-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
 .recovery-banner-leave-active {
-  transition: opacity 200ms var(--ease-out, ease),
-              transform 200ms var(--ease-out, ease);
+  transition: opacity var(--dur-fast) var(--ease-in),
+              transform var(--dur-fast) var(--ease-in);
 }
 .chat-main {
   flex: 1;
@@ -547,6 +587,14 @@ function messageKey(m: any, i: number): string | number {
    * against the nearest other positioned ancestor and could
    * drift outside the chat column. */
   position: relative;
+}
+.messages-pane {
+  flex: 1 1 0;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .messages-scroll {
   /* `flex: 1` makes the message list grow to fill the space
@@ -591,6 +639,51 @@ function messageKey(m: any, i: number): string | number {
   padding: 12px 0;
   display: flex;
   flex-direction: column;
+  transition: opacity var(--dur-slow) var(--ease-out),
+              transform var(--dur-slow) var(--ease-out);
+}
+.messages--switching {
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+}
+
+/* Session/project switch veil. Covers the transcript so the
+ * previous conversation does not hard-cut into the next one.
+ * Opacity-only enter/leave; the spinner is compositor-only
+ * transform (see frontend-design.md §8.4). */
+.view-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  background: var(--surface-0);
+  color: var(--text-tertiary);
+  z-index: 4;
+}
+.view-loading-hint {
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+}
+.view-loading-spin {
+  color: var(--brand-500);
+  animation: view-load-spin 0.85s linear infinite;
+}
+@keyframes view-load-spin {
+  to { transform: rotate(360deg); }
+}
+.view-loading-enter-active {
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.view-loading-leave-active {
+  transition: opacity var(--dur-slow) var(--ease-out);
+}
+.view-loading-enter-from,
+.view-loading-leave-to {
+  opacity: 0;
 }
 
 /* Messages are virtualized via CSS `content-visibility: auto`:
@@ -644,7 +737,7 @@ function messageKey(m: any, i: number): string | number {
   bottom: 130px;
   width: 36px;
   height: 36px;
-  border-radius: 50%;
+  border-radius: var(--radius-pill);
   background: var(--bg-2);
   border: 1px solid var(--border-default);
   color: var(--text-2);
@@ -652,9 +745,10 @@ function messageKey(m: any, i: number): string | number {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--shadow-md);
   z-index: 10;
-  transition: background 0.15s var(--ease-out, ease), color 0.15s var(--ease-out, ease), transform 0.15s var(--ease-out, ease);
+  transition: var(--transition-colors),
+              transform var(--dur-fast) var(--ease-out);
 }
 .jump-to-bottom:hover {
   background: var(--bg-3);
@@ -666,9 +760,13 @@ function messageKey(m: any, i: number): string | number {
 }
 /* Fade in from below when the user first scrolls up, fade out
  * when they scroll back to the bottom. */
-.jump-btn-enter-active,
+.jump-btn-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
 .jump-btn-leave-active {
-  transition: opacity 0.2s var(--ease-out, ease), transform 0.2s var(--ease-out, ease);
+  transition: opacity var(--dur-fast) var(--ease-in),
+              transform var(--dur-fast) var(--ease-in);
 }
 .jump-btn-enter-from,
 .jump-btn-leave-to {
@@ -693,7 +791,7 @@ function messageKey(m: any, i: number): string | number {
   bottom: 178px;
   width: 36px;
   height: 36px;
-  border-radius: 50%;
+  border-radius: var(--radius-pill);
   background: var(--brand-50);
   border: 1px solid var(--brand-100);
   color: var(--brand-700);
@@ -701,13 +799,14 @@ function messageKey(m: any, i: number): string | number {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--shadow-md);
   z-index: 10;
-  transition: background 0.15s var(--ease-out, ease), color 0.15s var(--ease-out, ease), transform 0.15s var(--ease-out, ease);
+  transition: var(--transition-colors),
+              transform var(--dur-fast) var(--ease-out);
 }
 .anchor-fab:hover {
   background: var(--brand-100);
-  color: var(--brand-800);
+  color: var(--brand-700);
   transform: translateY(-1px);
 }
 .anchor-fab:active {
@@ -717,9 +816,13 @@ function messageKey(m: any, i: number): string | number {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-.anchor-btn-enter-active,
+.anchor-btn-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
 .anchor-btn-leave-active {
-  transition: opacity 0.2s var(--ease-out, ease), transform 0.2s var(--ease-out, ease);
+  transition: opacity var(--dur-fast) var(--ease-in),
+              transform var(--dur-fast) var(--ease-in);
 }
 .anchor-btn-enter-from,
 .anchor-btn-leave-to {

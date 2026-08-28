@@ -40,7 +40,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 <style scoped>
 .lightbox {
   position: fixed; inset: 0;
-  background: rgba(0, 0, 0, 0.9);
+  background: rgba(0, 0, 0, 0.88);
   display: flex; align-items: center; justify-content: center;
   z-index: 1000;
   cursor: zoom-out;
@@ -49,22 +49,44 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
   max-width: 95vw;
   max-height: 95vh;
   object-fit: contain;
-  border-radius: 6px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
   cursor: default;
   background: #000;
 }
 .close-btn {
-  position: absolute; top: 16px; right: 16px;
+  position: absolute; top: var(--space-4); right: var(--space-4);
   width: 40px; height: 40px;
   background: rgba(255, 255, 255, 0.15);
-  color: #fff; border: none; border-radius: 50%;
+  color: var(--on-brand); border: none; border-radius: var(--radius-pill);
   font-size: 24px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   z-index: 1;
+  transition: background var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
-.close-btn:hover { background: rgba(255, 255, 255, 0.25); }
+.close-btn:hover {
+  background: rgba(255, 255, 255, 0.28);
+  transform: scale(1.04);
+}
 
-.fade-enter-active, .fade-leave-active { transition: opacity 0.2s; }
+.fade-enter-active {
+  transition: opacity var(--dur-slow) var(--ease-out);
+}
+.fade-leave-active {
+  transition: opacity var(--dur-base) var(--ease-in);
+}
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+.fade-enter-active .lightbox-media,
+.fade-leave-active .lightbox-media {
+  transition: transform var(--dur-slow) var(--ease-out);
+}
+.fade-leave-active .lightbox-media {
+  transition-timing-function: var(--ease-in);
+  transition-duration: var(--dur-base);
+}
+.fade-enter-from .lightbox-media,
+.fade-leave-to .lightbox-media {
+  transform: scale(0.96);
+}
 </style>

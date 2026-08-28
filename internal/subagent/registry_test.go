@@ -17,7 +17,7 @@ name: explore
 description: Fast read-only file search specialist.
 model: gpt-4o-mini
 color: "#44BA81"
-tools: [read_file, list_files, exec_command]
+tools: [read_file, list_files, grep]
 hidden: false
 ---
 You are a file search specialist.
@@ -44,7 +44,7 @@ Use the grep tool for regex searches.
 	if a.Color != "#44BA81" {
 		t.Errorf("Color = %q", a.Color)
 	}
-	if got, want := strings.Join(a.Tools, ","), "read_file,list_files,exec_command"; got != want {
+	if got, want := strings.Join(a.Tools, ","), "read_file,list_files,grep"; got != want {
 		t.Errorf("Tools = %q, want %q", got, want)
 	}
 	if a.Hidden {
@@ -349,19 +349,26 @@ func TestBuiltins_HasCoreAgents(t *testing.T) {
 			t.Errorf("Builtins %q has empty color (required for the card tint)", b.Name)
 		}
 	}
-	// Read-only agents must not include write tools in
-	// their whitelist — the per-agent Tools list is the
-	// second line of defense after the global
-	// subagent.denied_tools. exec_command is INTENTIONALLY
-	// allowed for read-only shell commands (ls, grep, cat,
-	// find) per the agent's prompt; the prompt is the
-	// policy, the whitelist is just a backstop.
+	// Read-only agents stay on the local read set. Shell, write,
+	// and network tools belong to the parent (or general-purpose
+	// for public GET fetch / search).
+	wantReadTools := map[string]bool{
+		"read_file": true, "list_files": true, "grep": true,
+		"read_docx": true, "read_pdf": true,
+	}
 	for _, b := range bs {
-		if b.Name == "explore" || b.Name == "plan" {
-			for _, tn := range b.Tools {
-				if tn == "write_file" {
-					t.Errorf("read-only agent %q has write tool %q in whitelist", b.Name, tn)
-				}
+		if b.Name != "explore" && b.Name != "plan" {
+			continue
+		}
+		if len(b.Tools) != len(wantReadTools) {
+			t.Errorf("read-only agent %q tools = %v, want %d local-read tools", b.Name, b.Tools, len(wantReadTools))
+		}
+		for _, tn := range b.Tools {
+			if !wantReadTools[tn] {
+				t.Errorf("read-only agent %q has unexpected tool %q in whitelist", b.Name, tn)
+			}
+			if tn == "write_file" || tn == "exec_command" || tn == "web_fetch" {
+				t.Errorf("read-only agent %q must not expose %q", b.Name, tn)
 			}
 		}
 	}

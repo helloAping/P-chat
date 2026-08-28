@@ -51,12 +51,12 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 
 ## 快速启动
 
-### 方式 A — Windows 安装包（推荐新用户）
+### 方式 A — 全平台安装包（推荐新用户）
 
-1. 从 [Releases](../../releases) 下载 `pchat-setup.exe`
-2. 双击运行，弹出目录选择框，选择或者创建pchat目录
-3. 安装程序会解压 `pchat-gui.exe` / `pchat-server.exe` / `pchat.exe` + `web/`，写入开始菜单和桌面快捷方式
-4. 从开始菜单启动 **P-Chat**
+1. 从 [P-Chat 软件发布页](http://www.08ms.cn/software/p-chat) 下载当前版本对应系统的安装包，Windows / Linux / macOS 均在该页面提供；需要手动更新时，也在该页面下载增量更新包或全量包
+2. Windows 下载 `pchat-setup-v*.exe` 后双击运行；Linux 下载 `pchat-linux-setup-v*.tar.gz` 后解压并执行 `./install.sh`；macOS 下载 `pchat-mac-setup-v*.tar.gz` 后解压并执行 `./install.sh`
+3. 安装程序会解压 GUI / server / CLI / updater 二进制和 `web/` 资源，并按系统创建对应的快捷入口或命令入口
+4. 安装完成后启动 **P-Chat**
 
 首次启动时 GUI 会自动拉起 server 子进程，关窗自动结束子进程，不需要手动管理。
 
@@ -102,16 +102,16 @@ pchat-server.exe
 
 ```powershell
 # 依赖：Go 1.21.13 / Node 24.11 / Wails v2.12
-task build:all      # pchat.exe + pchat-server.exe + 前端
+task build:all      # Windows / Linux / macOS setup 包 + 增量更新 zip
 task build:gui      # 额外：pchat-gui.exe
-task package:gui    # 完整 bundle（含 web/）
+task package:gui    # Windows setup 包 + 增量更新 zip
 ```
 
-Windows installer 由 `cmd/pchat-installer/main.go` 编译产出，资源在 `cmd/pchat-installer/assets/`，打包脚本在 `scripts/build-installer.ps1`。
+Windows installer 由 `cmd/pchat-installer/main.go` 编译产出，资源在 `cmd/pchat-installer/assets/`，打包脚本在 `scripts/build-installer.ps1`。Linux/macOS setup 归档由 `scripts/package-platform-archive.ps1` 生成；各平台增量更新 zip 和 `latest.json`/release manifest 由 `scripts/package-update-zip.ps1` 生成。
 
 #### 开发模式（dev-bin/）
 
-日常开发不用 `task package:gui` 整套打包，用 `task build:dev` 编译到仓库根的 `dev-bin/` 目录，然后直接跑：
+日常开发不用 `task package:gui` 整套 release 打包，用 `task build:dev` 编译到仓库根的 `dev-bin/` 目录，然后直接跑：
 
 ```powershell
 task build:dev
@@ -151,9 +151,10 @@ task build:dev
 | `cmd/pchat-installer/assets/pchat-gui.exe` | 待分发 | Wails 桌面端 |
 | `cmd/pchat-installer/assets/pchat-server.exe` | 待分发 | HTTP server |
 | `cmd/pchat-installer/assets/pchat.exe` | 待分发 | CLI |
+| `cmd/pchat-installer/assets/pchat-updater.exe` | 待分发 | 重启后替换文件的自动更新器 |
 | `cmd/pchat-installer/assets/web/` | 前端 | 由 `scripts/sync-web.ps1` 从 `frontend/dist/` 同步 |
 
-setup.exe 把上面 5 项（`install.ps1` + 3 个二进制 + `web/`）打进 `//go:embed` 资源里，安装时统一解压。
+setup.exe 把上面资源（`install.ps1` + `uninstall.ps1` + GUI/server/CLI/updater 二进制 + `web/`）打进 `//go:embed` 里，安装时统一解压。
 
 ### 安装流程
 
@@ -163,7 +164,7 @@ setup.exe
      └─ 解压 assets/*
         └─ 弹出 FolderBrowserDialog 选安装目录
            └─ 执行 install.ps1 -InstallDir <选中的目录> -AddToPath
-              ├─ 复制 3 个二进制 + web/ 到目标目录
+              ├─ 复制 GUI/server/CLI/updater 二进制 + web/ 到目标目录
               ├─ 创建开始菜单快捷方式（P-Chat.lnk → pchat-gui.exe）
               ├─ 创建桌面快捷方式
               ├─ 写注册表卸载项（HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\P-Chat）
@@ -192,10 +193,14 @@ setup.exe
 
 ### 手动安装（不开 setup.exe）
 
-解压 release 压缩包后直接跑 `install.ps1` 也行：
+解压 Windows release 压缩包后直接跑 `install.ps1` 也行；Linux/macOS setup 压缩包对应运行 `./install.sh`：
 
 ```powershell
 .\install.ps1 -InstallDir C:\Tools\P-Chat -AddToPath
+```
+
+```bash
+./install.sh
 ```
 
 可选参数：
@@ -603,7 +608,8 @@ assistant 消息底部「重答」会保留所有历史版本，消息下方出�
 # 编译
 task build:all
 task build:gui
-task package:gui
+task package:gui        # Windows setup + 增量 zip
+task package:update:all # 三个平台 setup + 增量 zip
 
 # 测试
 go test -count=1 ./...
@@ -623,6 +629,7 @@ cd frontend && npx vue-tsc -b
 | 文档 | 什么时候改 |
 | --- | --- |
 | `README.md` | 用户入口、GUI 操作步骤、常见问题、当前进度摘要变化 |
+| [软件下载页](http://www.08ms.cn/software/p-chat) | 下载当前版本 setup 安装包、增量更新包和全量包 |
 | [网页版说明文档](http://www.08ms.cn/article/p-chat) | 安装、API 厂商接入、CLI/GUI 使用指南（与官网说明同步） |
 | `docs/feature-opportunities.md` | 功能从待办变为已落地、backlog 优先级变化、废弃历史计划 |
 | `CHANGELOG.md` | 版本交付、升级说明、重要 bug 修复和测试覆盖 |

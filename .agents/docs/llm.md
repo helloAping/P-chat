@@ -65,10 +65,15 @@ type ChatMessage struct {
 
 `Type` 枚举：
 - `text` — 普通文本
-- `image` — 图片（base64 或 URL）
+- `image` — 图片（base64 或 URL）；OpenAI-compatible 请求会在 `image_url.url` 放 data URL，同时补 `image_url.data` raw base64 兼容需要 data 字段的代理。
 - `tool_call` — LLM 发出的工具调用（OpenAI native）
 - `tool_result` — 工具执行结果
 - `thinking` — 代理内部思考（不发送给 LLM）
+
+图片消息的提交边界由 Agent 决定，而不是 LLM adapter 决定：
+- 当前轮图片和重答目标图片可以保留为 `TypeImage`，adapter 才会把它转为 OpenAI `image_url` 或 Anthropic `image` block。
+- 历史图片在进入 adapter 前会被 Agent 替换成文本占位，不会反复提交原图 payload。
+- 如果历史图片带 `upload_id` 且存在可用视觉能力，LLM 可通过 `image_recognize` 工具按需重新读取；工具返回文本结果后再进入后续 LLM 轮次。
 
 ### 3. StreamChunk（流式增量）
 

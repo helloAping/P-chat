@@ -45,6 +45,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $install "pchat.exe"))) {
     Get-Content -LiteralPath $log -Raw | Out-String
     exit 1
 }
+if (-not (Test-Path -LiteralPath (Join-Path $install "pchat-updater.exe"))) {
+    Write-Host "FAIL: pchat-updater.exe missing after install" -ForegroundColor Red
+    Get-Content -LiteralPath $log -Raw | Out-String
+    exit 1
+}
 if (-not (Test-Path -LiteralPath (Join-Path $install "uninstall.ps1"))) {
     Write-Host "FAIL: uninstall.ps1 missing after install" -ForegroundColor Red
     exit 1
@@ -252,6 +257,7 @@ if ($stillRunning) {
     & taskkill /T /F /IM "pchat-server.exe" 2>&1 | Out-Null
     & taskkill /T /F /IM "pchat-gui.exe"    2>&1 | Out-Null
     & taskkill /T /F /IM "pchat.exe"        2>&1 | Out-Null
+    & taskkill /T /F /IM "pchat-updater.exe" 2>&1 | Out-Null
 }
 Write-Host "OK: cleanup done" -ForegroundColor Green
 

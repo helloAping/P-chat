@@ -104,7 +104,7 @@ func (h *Handler) Regenerate(c *gin.Context) {
 	// does, so regenerated turns cannot silently skip active work.
 	h.hydrateSessionTodos(id)
 	meta := h.ensureMetaLoaded(id)
-	histMsgs, compSummary := h.loadHistoryForSend(c.Request.Context(), id, provider, model)
+	histMsgs, rowIDs, compSummary := h.loadHistoryForSendWithIDs(c.Request.Context(), id, provider, model)
 	// Note: the user message at UserMessageID is still in
 	// histMsgs (we only archived sibling assistant rows).
 	// The agent loop sees it as the latest message and
@@ -120,25 +120,31 @@ func (h *Handler) Regenerate(c *gin.Context) {
 	// + every earlier turn that wasn't regenerated),
 	// exactly as the user expects from a "give me a
 	// different answer" action.
-	msgs := buildLLMMessages(histMsgs)
+	msgs, historyMessageCount, ok := buildRegenerateMessages(histMsgs, rowIDs, req.UserMessageID)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_message_id is outside the loaded conversation context"})
+		return
+	}
 
 	chatReq := agent.ChatRequest{
-		Style:               style.Style(styleStr),
-		WorkMode:            h.sessionWorkMode(id),
-		Provider:            provider,
-		Model:               model,
-		Messages:            msgs,
-		HistoryMessageCount: len(msgs),
-		ReasoningEffort:     meta.ReasoningEffort,
-		CompressedSummary:   compSummary,
-		SessionID:           id,
-		ProjectRoot:         meta.ProjectPath,
-		SkillContext:        "",
-		PlanMode:            meta.PlanMode,
-		PermissionLevel:     meta.PermissionLevel,
-		KBBase:              meta.KnowledgeBase,
-		AutoContinue:        h.sessionAutoContinue(id),
-		TodoLongRunMode:     h.sessionTodoLongRunMode(id),
+		Style:                       style.Style(styleStr),
+		WorkMode:                    h.sessionWorkMode(id),
+		Provider:                    provider,
+		Model:                       model,
+		Messages:                    msgs,
+		HistoryMessageCount:         historyMessageCount,
+		CurrentTurnAlreadyPersisted: true,
+		UseImageRecognition:         h.sessionUseImageRecognition(id),
+		ReasoningEffort:             meta.ReasoningEffort,
+		CompressedSummary:           compSummary,
+		SessionID:                   id,
+		ProjectRoot:                 meta.ProjectPath,
+		SkillContext:                "",
+		PlanMode:                    meta.PlanMode,
+		PermissionLevel:             meta.PermissionLevel,
+		KBBase:                      meta.KnowledgeBase,
+		AutoContinue:                h.sessionAutoContinue(id),
+		TodoLongRunMode:             h.sessionTodoLongRunMode(id),
 		// P1-4: the agent loop reads this and stamps the
 		// new assistant row's regen_group_id, joining the
 		// user message's regen group. Empty for normal
@@ -169,6 +175,34 @@ func (h *Handler) Regenerate(c *gin.Context) {
 	// No auto-resume for an explicit regenerate: the user just asked for
 	// a fresh answer, so a timeout should surface as-is (empty retryNotice).
 	h.respondSSE(c, stream, id, provider, model, "")
+}
+
+func buildRegenerateMessages(histMsgs []llm.ChatMessage, rowIDs []int64, userMessageID int64) ([]llm.ChatMessage, int, bool) {
+	target := -1
+	for i, rowID := range rowIDs {
+		if rowID == userMessageID && i < len(histMsgs) && histMsgs[i].Role == llm.RoleUser {
+			target = i
+			break
+		}
+	}
+	if target < 0 {
+		return nil, 0, false
+	}
+
+	history := buildLLMMessages(histMsgs[:target])
+	current := []llm.ChatMessage{histMsgs[target]}
+	for i := target + 1; i < len(histMsgs); i++ {
+		m := histMsgs[i]
+		if m.Role != llm.RoleUser || !isMediaType(m.Type) {
+			break
+		}
+		current = append(current, m)
+	}
+
+	msgs := make([]llm.ChatMessage, 0, len(history)+len(current))
+	msgs = append(msgs, history...)
+	msgs = append(msgs, current...)
+	return msgs, len(history), true
 }
 
 // UserMessageSummary is the wire shape of the parent user

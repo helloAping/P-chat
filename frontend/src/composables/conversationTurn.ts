@@ -9,6 +9,7 @@ export type ConversationTurnInput = {
   model?: string
   style?: string
   workMode?: string
+  useImageRecognition?: boolean
   todoMode: 'auto' | 'resume' | 'clear'
   attachments?: api.InlineAttachment[]
   skillContext?: string
@@ -81,7 +82,6 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
     }
   }
 
-  let streamSucceeded = false
   const deferredDrop: { current: { lastSeq: number; reason: string } | null } = { current: null }
   try {
     await api.streamMessagesRetry(input.sessionId, {
@@ -91,6 +91,7 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       model: input.model,
       style: input.style,
       workMode: input.workMode,
+      useImageRecognition: input.useImageRecognition,
       todo_mode: input.todoMode,
       attachments: input.attachments,
       signal: ctrl.signal,
@@ -100,12 +101,11 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       },
       onEvent: enqueueEvent,
     })
-    streamSucceeded = true
   } finally {
     flushPendingDeltas()
     endStream(input.sessionId, ctrl)
     const drop = deferredDrop.current
-    if (!streamSucceeded && drop && !ctrl.signal.aborted) {
+    if (drop && !ctrl.signal.aborted) {
       recoverMissingParts(input.sessionId, drop.lastSeq, drop.reason).catch((error) => {
         console.warn('[stream] recovery failed:', error)
       })

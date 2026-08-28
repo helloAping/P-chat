@@ -34,10 +34,15 @@ type Handler struct {
 	// JobManager). May be nil in tests that don't wire it; handlers
 	// return 503 in that case.
 	styleGenMgr *stylegen.JobManager
-	mcpMgr      *mcp.Manager
-	browserMgr *browser.Manager
-	imGateway  *im.Gateway
-	wechatQR   *im.WeChatQRManager
+	// subagentJobs cancels process-local async subagent jobs. Durable
+	// job state lives in the memory store; this hook only covers jobs
+	// that are still running in this server process.
+	subagentJobs      subagentJobCanceller
+	subagentJobEvents subagentJobEventSource
+	mcpMgr            *mcp.Manager
+	browserMgr        *browser.Manager
+	imGateway         *im.Gateway
+	wechatQR          *im.WeChatQRManager
 	// attachResolver reads upload files by id. Used to re-hydrate
 	// "upl://<id>" media rows from disk when building the LLM
 	// context (the agent holds the same resolver for the current
@@ -81,15 +86,16 @@ type Handler struct {
 }
 
 type sessionMeta struct {
-	Style           string
-	WorkMode        string
-	Provider        string
-	Model           string
-	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
-	ProjectPath     string // project root directory, "" = global
-	PlanMode        bool   // plan mode (no tools, single turn)
-	PermissionLevel string // "ask" | "auto" | "full"
-	KnowledgeBase   string // "" = off, "__all__" = all bases, or a specific base name
+	Style               string
+	WorkMode            string
+	Provider            string
+	Model               string
+	ReasoningEffort     string // "off" | "low" | "medium" | "high" | "max"
+	ProjectPath         string // project root directory, "" = global
+	PlanMode            bool   // plan mode (no tools, single turn)
+	PermissionLevel     string // "ask" | "auto" | "full"
+	KnowledgeBase       string // "" = off, "__all__" = all bases, or a specific base name
+	UseImageRecognition bool   // true = uploaded images are recognized through image_recognize
 	// AutoContinue is a pointer so we can distinguish "user
 	// never set" (nil → default true) from "user explicitly
 	// disabled" (*bool == false). The P0-3 auto-continue
@@ -104,15 +110,16 @@ type sessionMeta struct {
 // conversations.metadata. The field names are JSON lower-case so
 // the web side can pass them straight back to the PATCH endpoint.
 type sessionMetaBlob struct {
-	Style           string `json:"style,omitempty"`
-	WorkMode        string `json:"work_mode,omitempty"`
-	Provider        string `json:"provider,omitempty"`
-	Model           string `json:"model,omitempty"`
-	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	ProjectPath     string `json:"project_path,omitempty"`
-	PlanMode        bool   `json:"plan_mode,omitempty"`
-	PermissionLevel string `json:"permission_level,omitempty"`
-	KnowledgeBase   string `json:"knowledge_base,omitempty"`
+	Style               string `json:"style,omitempty"`
+	WorkMode            string `json:"work_mode,omitempty"`
+	Provider            string `json:"provider,omitempty"`
+	Model               string `json:"model,omitempty"`
+	ReasoningEffort     string `json:"reasoning_effort,omitempty"`
+	ProjectPath         string `json:"project_path,omitempty"`
+	PlanMode            bool   `json:"plan_mode,omitempty"`
+	PermissionLevel     string `json:"permission_level,omitempty"`
+	KnowledgeBase       string `json:"knowledge_base,omitempty"`
+	UseImageRecognition bool   `json:"use_image_recognition,omitempty"`
 	// AutoContinue mirrors sessionMeta.AutoContinue. Pointer
 	// so JSON omits it when never set, instead of
 	// round-tripping "false" as if the user had disabled it.
@@ -147,17 +154,18 @@ func (h *Handler) SetAttachmentResolver(r *agent.DiskAttachmentResolver) {
 
 func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
 	return sessionMetaBlob{
-		Style:           m.Style,
-		WorkMode:        m.WorkMode,
-		Provider:        m.Provider,
-		Model:           m.Model,
-		ReasoningEffort: m.ReasoningEffort,
-		ProjectPath:     m.ProjectPath,
-		PlanMode:        m.PlanMode,
-		PermissionLevel: m.PermissionLevel,
-		KnowledgeBase:   m.KnowledgeBase,
-		AutoContinue:    m.AutoContinue,
-		TodoLongRunMode: m.TodoLongRunMode,
+		Style:               m.Style,
+		WorkMode:            m.WorkMode,
+		Provider:            m.Provider,
+		Model:               m.Model,
+		ReasoningEffort:     m.ReasoningEffort,
+		ProjectPath:         m.ProjectPath,
+		PlanMode:            m.PlanMode,
+		PermissionLevel:     m.PermissionLevel,
+		KnowledgeBase:       m.KnowledgeBase,
+		UseImageRecognition: m.UseImageRecognition,
+		AutoContinue:        m.AutoContinue,
+		TodoLongRunMode:     m.TodoLongRunMode,
 	}
 }
 
@@ -240,6 +248,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.PlanMode = blob.PlanMode
 				m.PermissionLevel = blob.PermissionLevel
 				m.KnowledgeBase = blob.KnowledgeBase
+				m.UseImageRecognition = blob.UseImageRecognition
 				m.AutoContinue = blob.AutoContinue
 				m.TodoLongRunMode = blob.TodoLongRunMode
 			}
@@ -284,6 +293,10 @@ func (h *Handler) sessionTodoLongRunMode(id string) config.TodoLongRunMode {
 		return config.NormalizeTodoLongRunMode(*m.TodoLongRunMode)
 	}
 	return config.NormalizeTodoLongRunMode(h.getCfg().Limits.TodoLongRunMode)
+}
+
+func (h *Handler) sessionUseImageRecognition(id string) bool {
+	return h.getCfg().Vision.Enabled && h.ensureMetaLoaded(id).UseImageRecognition
 }
 
 func (h *Handler) sessionProvider(id string) string {
@@ -412,7 +425,8 @@ type SendMessageRequest struct {
 	// multi-part trailing user message before the LLM call.
 	// The protocol-specific serialisation (OpenAI image_url vs
 	// Anthropic image+source) is handled by the LLM client.
-	Attachments []agent.Attachment `json:"attachments,omitempty"`
+	Attachments         []agent.Attachment `json:"attachments,omitempty"`
+	UseImageRecognition *bool              `json:"use_image_recognition,omitempty"`
 	// SkillContext is the full SKILL.md content for a skill
 	// activated via /skillname slash command.
 	SkillContext string `json:"skill_context,omitempty"`
@@ -420,12 +434,20 @@ type SendMessageRequest struct {
 
 // CreateSessionRequest is the body of POST /sessions.
 type CreateSessionRequest struct {
-	Style       string `json:"style,omitempty"`
-	WorkMode    string `json:"work_mode,omitempty"`
-	Provider    string `json:"provider,omitempty"`
-	Model       string `json:"model,omitempty"`
-	Title       string `json:"title,omitempty"`
-	ProjectPath string `json:"project_path,omitempty"`
+	Style               string                  `json:"style,omitempty"`
+	WorkMode            string                  `json:"work_mode,omitempty"`
+	Provider            string                  `json:"provider,omitempty"`
+	Model               string                  `json:"model,omitempty"`
+	Title               string                  `json:"title,omitempty"`
+	ProjectPath         string                  `json:"project_path,omitempty"`
+	PlanMode            *bool                   `json:"plan_mode,omitempty"`
+	PermissionLevel     string                  `json:"permission_level,omitempty"`
+	ReasoningEffort     string                  `json:"reasoning_effort,omitempty"`
+	VectorStore         string                  `json:"vector_store,omitempty"`
+	KnowledgeBase       string                  `json:"knowledge_base,omitempty"`
+	AutoContinue        *bool                   `json:"auto_continue,omitempty"`
+	TodoLongRunMode     *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	UseImageRecognition *bool                   `json:"use_image_recognition,omitempty"`
 }
 
 // RenameSessionRequest is the body of PATCH /sessions/:id when the
@@ -458,8 +480,9 @@ type UpdateSessionMetaRequest struct {
 	// distinct from `false`: when omitted, the per-session
 	// setting is left unchanged; when present, it overrides
 	// whatever was there before (including the default-true).
-	AutoContinue    *bool                   `json:"auto_continue,omitempty"`
-	TodoLongRunMode *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	AutoContinue        *bool                   `json:"auto_continue,omitempty"`
+	TodoLongRunMode     *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	UseImageRecognition *bool                   `json:"use_image_recognition,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -485,8 +508,9 @@ type SessionResponse struct {
 	// LLM" guard toggle, default true. Surface so the UI can
 	// show a status pill ("auto-continue on/off") next to the
 	// todo panel.
-	AutoContinue    bool   `json:"auto_continue"`
-	TodoLongRunMode string `json:"todo_long_run_mode"`
+	AutoContinue        bool   `json:"auto_continue"`
+	TodoLongRunMode     string `json:"todo_long_run_mode"`
+	UseImageRecognition bool   `json:"use_image_recognition"`
 }
 
 // MessageResponse is the JSON form of a single message in a
@@ -610,7 +634,9 @@ type MessagePart struct {
 	AgentColor       string `json:"agent_color,omitempty"`
 	AgentModel       string `json:"agent_model,omitempty"`
 	TaskID           string `json:"task_id,omitempty"`
+	RunMode          string `json:"run_mode,omitempty"`
 	AgentDescription string `json:"agent_description,omitempty"`
+	FailureReason    string `json:"failure_reason,omitempty"`
 }
 
 // messagePartWire is the on-the-wire shape of MessagePart,
@@ -642,7 +668,9 @@ type messagePartWire struct {
 	AgentColor       string `json:"agentColor,omitempty"`
 	AgentModel       string `json:"agentModel,omitempty"`
 	TaskID           string `json:"taskId,omitempty"`
+	RunMode          string `json:"runMode,omitempty"`
 	AgentDescription string `json:"agentDescription,omitempty"`
+	FailureReason    string `json:"failureReason,omitempty"`
 }
 
 // MarshalJSON emits the wire format for MessagePart. The
@@ -671,9 +699,55 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 		AgentColor:       p.AgentColor,
 		AgentModel:       p.AgentModel,
 		TaskID:           p.TaskID,
+		RunMode:          p.RunMode,
 		AgentDescription: p.AgentDescription,
+		FailureReason:    p.FailureReason,
 	}
 	return json.Marshal(w)
+}
+
+// UnmarshalJSON accepts both storage JSON (snake_case sub-agent
+// metadata) and wire JSON (camelCase sub-agent metadata). The storage
+// path is used when reloading meta["parts"]; the wire shape appears in
+// tests and older client round-trips.
+func (p *MessagePart) UnmarshalJSON(data []byte) error {
+	type messagePartStorage MessagePart
+	var v struct {
+		messagePartStorage
+		AgentTypeCamel        string `json:"agentType,omitempty"`
+		AgentColorCamel       string `json:"agentColor,omitempty"`
+		AgentModelCamel       string `json:"agentModel,omitempty"`
+		TaskIDCamel           string `json:"taskId,omitempty"`
+		RunModeCamel          string `json:"runMode,omitempty"`
+		AgentDescriptionCamel string `json:"agentDescription,omitempty"`
+		FailureReasonCamel    string `json:"failureReason,omitempty"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	*p = MessagePart(v.messagePartStorage)
+	if v.AgentTypeCamel != "" {
+		p.AgentType = v.AgentTypeCamel
+	}
+	if v.AgentColorCamel != "" {
+		p.AgentColor = v.AgentColorCamel
+	}
+	if v.AgentModelCamel != "" {
+		p.AgentModel = v.AgentModelCamel
+	}
+	if v.TaskIDCamel != "" {
+		p.TaskID = v.TaskIDCamel
+	}
+	if v.RunModeCamel != "" {
+		p.RunMode = v.RunModeCamel
+	}
+	if v.AgentDescriptionCamel != "" {
+		p.AgentDescription = v.AgentDescriptionCamel
+	}
+	if v.FailureReasonCamel != "" {
+		p.FailureReason = v.FailureReasonCamel
+	}
+	return nil
 }
 
 // AttachmentPart is a single part of a multi-content message,
@@ -735,9 +809,9 @@ type StreamEvent struct {
 	ToolResultTruncated bool `json:"tool_result_truncated,omitempty"`
 	// ToolResultFullLen is the byte length of the untruncated
 	// result (surfaceable as "完整输出 1.2 MB" without a fetch).
-	ToolResultFullLen int `json:"tool_result_full_len,omitempty"`
-	ToolError      string `json:"tool_error,omitempty"`
-	ToolElapsed    string `json:"tool_elapsed,omitempty"`
+	ToolResultFullLen int    `json:"tool_result_full_len,omitempty"`
+	ToolError         string `json:"tool_error,omitempty"`
+	ToolElapsed       string `json:"tool_elapsed,omitempty"`
 	// Structured tool result fields supplement the legacy tool_result preview.
 	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
 	ToolSummary      string   `json:"tool_summary,omitempty"`
@@ -777,6 +851,9 @@ type StreamEvent struct {
 	// SubAgentTaskID is the resume-by-id key. Surfaced as
 	// a monospace badge in the card footer.
 	SubAgentTaskID string `json:"sub_agent_task_id,omitempty"`
+	// SubAgentRunMode is "sync" for an in-turn sub-agent and
+	// "async" for a durable background sub-agent job.
+	SubAgentRunMode string `json:"sub_agent_run_mode,omitempty"`
 	// SubAgentDescription is the agent's "when to use" hint.
 	// Surfaced as a hover tooltip on the agent-name badge
 	// in the SubAgentCard so the user can read the full
@@ -1066,6 +1143,7 @@ func (h *Handler) reloadAfterConfigChange() {
 	if err != nil {
 		return
 	}
+	h.agent.SetConfig(cfg)
 	h.agent.SetLLM(newClient)
 }
 

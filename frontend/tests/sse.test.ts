@@ -7,9 +7,12 @@ import {
   decodeStreamEvent,
   emitStreamEvent,
   isDuplicateClientMessageError,
+  nextStreamIdleTimeoutMs,
   parseSSEFrame,
   shouldRetryStreamError,
   streamErrorStatus,
+  STREAM_IDLE_AFTER_LLM_MS,
+  STREAM_IDLE_AFTER_TOOL_MS,
   type StreamEventLike,
 } from '../src/api/sse.ts'
 
@@ -162,6 +165,44 @@ test('consumeSSEStream reports the last observed seq when the stream drops', asy
   )
 
   assert.deepEqual(drop, { lastSeq: 9, reason: 'network gone' })
+})
+
+test('consumeSSEStream reports a drop when the stream closes without a done event', async () => {
+  const drops: Array<{ lastSeq: number; reason: string }> = []
+
+  await consumeSSEStream({
+    reader: readerFromChunks(['data: {"type":"content","content":"hi"}\nid: 3\n\n']),
+    label: 'test',
+    onEvent() {},
+    onStreamDrop: drop => drops.push(drop),
+  })
+
+  assert.equal(drops.length, 1, 'closing without done must look like an interrupt, not a clean finish')
+  assert.equal(drops[0].lastSeq, 3)
+  assert.match(drops[0].reason, /without done/)
+})
+
+test('nextStreamIdleTimeoutMs stretches while a tool or sub-agent is running', () => {
+  const afterToolStart = nextStreamIdleTimeoutMs(
+    { type: 'tool', tool_status: 'start' },
+    STREAM_IDLE_AFTER_LLM_MS,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterToolStart, STREAM_IDLE_AFTER_TOOL_MS)
+
+  const afterHeartbeat = nextStreamIdleTimeoutMs(
+    { type: 'phase', step: 'tool-heartbeat' },
+    STREAM_IDLE_AFTER_TOOL_MS,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterHeartbeat, STREAM_IDLE_AFTER_TOOL_MS)
+
+  const afterToolOk = nextStreamIdleTimeoutMs(
+    { type: 'tool', tool_status: 'ok' },
+    STREAM_IDLE_AFTER_TOOL_MS,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterToolOk, STREAM_IDLE_AFTER_LLM_MS)
 })
 
 test('consumeSSEStream drops buffered events after cancellation', async () => {

@@ -258,6 +258,7 @@ const sizeMap: Record<Size, number> = {
 }
 .n-modal-mask {
   background: var(--surface-overlay) !important;
-  backdrop-filter: blur(4px) !important;
+  backdrop-filter: blur(6px) !important;
+  transition: opacity var(--dur-slow) var(--ease-out) !important;
 }
 </style>

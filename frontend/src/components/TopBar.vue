@@ -492,7 +492,7 @@ const ctxTip = computed(() => {
   height: 100%;
   border-radius: 2px;
   background: currentColor;
-  transition: width var(--dur-base, 200ms) var(--ease-out);
+  transition: width var(--dur-base) var(--ease-out);
 }
 .ctx-badge-pct {
   font-size: 11px;

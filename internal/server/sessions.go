@@ -121,6 +121,21 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		// Allow empty body for "create with defaults"
 		req = CreateSessionRequest{}
 	}
+	if req.PermissionLevel != "" && req.PermissionLevel != tool.PermissionAsk && req.PermissionLevel != tool.PermissionAuto && req.PermissionLevel != tool.PermissionFull {
+		c.JSON(http.StatusBadRequest, gin.H{"error": `permission_level must be "ask", "auto", or "full"`})
+		return
+	}
+	if req.ReasoningEffort != "" {
+		valid := map[string]bool{"off": true, "low": true, "medium": true, "high": true, "max": true}
+		if !valid[req.ReasoningEffort] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "reasoning_effort must be off, low, medium, high, or max"})
+			return
+		}
+	}
+	if req.UseImageRecognition != nil && *req.UseImageRecognition && !h.getCfg().Vision.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "image recognition is disabled globally; enable it in App Settings > System > Image Recognition first"})
+		return
+	}
 
 	id, err := h.store.NewConversation()
 	if err != nil {
@@ -160,6 +175,38 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	// Store project path if provided.
 	if req.ProjectPath != "" {
 		h.setSessionMetaProjectPath(id, req.ProjectPath)
+	}
+	if req.PermissionLevel != "" {
+		h.setSessionPermissionLevel(id, req.PermissionLevel)
+	}
+	if req.VectorStore != "" {
+		_ = h.store.SetConversationVectorStore(id, req.VectorStore)
+	}
+	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		if req.PlanMode != nil {
+			m.PlanMode = *req.PlanMode
+		}
+		if req.ReasoningEffort != "" {
+			m.ReasoningEffort = req.ReasoningEffort
+		}
+		if req.KnowledgeBase != "" {
+			m.KnowledgeBase = req.KnowledgeBase
+		}
+		if req.AutoContinue != nil {
+			m.AutoContinue = req.AutoContinue
+		}
+		if req.TodoLongRunMode != nil {
+			mode := config.NormalizeTodoLongRunMode(*req.TodoLongRunMode)
+			m.TodoLongRunMode = &mode
+		}
+		if req.UseImageRecognition != nil {
+			m.UseImageRecognition = *req.UseImageRecognition
+		}
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
 	}
 
 	// Re-fetch and return the full session record.
@@ -723,6 +770,18 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		m.TodoLongRunMode = &mode
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
+	if req.UseImageRecognition != nil {
+		if *req.UseImageRecognition && !h.getCfg().Vision.Enabled {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "image recognition is disabled globally; enable it in App Settings > System > Image Recognition first"})
+			return
+		}
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.UseImageRecognition = *req.UseImageRecognition
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)

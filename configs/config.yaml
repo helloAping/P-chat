@@ -119,24 +119,47 @@ sandbox:
 #   to the sub-agent (in addition to excluding `task` itself).
 # - `denied_tools`: blacklist; when `allowed_tools` is empty, these are
 #   excluded from the parent's tool set when building the sub-agent.
-#   Default: `["exec_command"]` for safety.
-# - `timeout`: per-sub-agent wall-clock cap (LAST-RESORT backstop).
-#   Default: "30m". Real hangs are caught earlier by the LLM stream
-#   idle timeout (120s), per-tool timeouts, the cumulative failure
-#   breaker, and the round cap — a legit long sub-agent (slow local
-#   model, many files) can take 10-20m, so keep this generous.
+#   Default: `["exec_command"]` (defense in depth; the execution-safe
+#   filter already hides write/exec/interactive tools).
+#   explore/plan use grep + file reads, not shell.
+#   general-purpose may use web_search and web_fetch when the
+#   parent has those tools registered.
+# - `timeout`: optional per-sub-agent wall-clock cap. Default is disabled
+#   (empty/0). Prefer hook-based cancellation: user stop, parent turn
+#   cancellation, LLM stream stall detection, per-tool timeouts,
+#   cumulative failure breaker, and the sub-agent round cap.
 # - `cache_ttl`: how long identical (description, style, provider) results
 #   are reused. Default: "5m". Set to "0s" to disable caching.
 subagent:
   denied_tools:
     - "exec_command"
-  timeout: "30m"
+  timeout: ""
   cache_ttl: "5m"
-  # Example: only allow safe tools (whitelist mode)
+  # Example: only allow local read tools (whitelist mode)
   # allowed_tools:
   #   - "read_file"
-  #   - "write_file"
   #   - "list_files"
+  #   - "grep"
+
+# MCP (Model Context Protocol) tools. Disabled by default.
+# Stdio commands run directly without a shell, so use an absolute executable
+# path (for example C:\Program Files\nodejs\npx.cmd on Windows).
+mcp:
+  enabled: false
+  servers: []
+  # servers:
+  #   - name: "playwright"
+  #     type: "stdio"
+  #     command: "C:\\Program Files\\nodejs\\npx.cmd"
+  #     args: ["-y", "@playwright/mcp"]
+  #     env: {}
+  #     enabled: true
+  #     timeout: "60s"
+  #   - name: "local-sse"
+  #     type: "sse"
+  #     url: "http://127.0.0.1:3001"
+  #     enabled: true
+  #     timeout: "60s"
 
 # Web search tool. The `web_search` tool is registered
 # only when `enabled: true` AND a usable API key is set;

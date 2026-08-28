@@ -14,9 +14,11 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 |---|---|---|
 | `server.go` | Gin 引擎构建、路由注册、CORS 中间件 + trace id middleware | `New()`, `NewWithStaticFS()`, `corsMiddleware()`, `traceIDMiddleware()` |
 | `handler.go` | 所有 API handler 实现（~2130行） | `SendMessage()`, `ListMessages()`, `chunkToEvent()` 等 |
+| `messages.go` | 消息发送 / 重答 / SSE 写循环 / 自动续跑控制 | `SendMessage()`, `respondSSE()` |
+| `message_helpers.go` | 历史消息响应整形、parts 解码、内部行过滤、附件合并 | `ListMessages()`, `buildMessageResponse()` |
 | `handler_test.go` | Handler 单元测试 | |
 | `knowledge_api.go` | 知识库 CRUD + 扫描管道 + 三层索引 | `ListSections`, `ListNodes`, `GetNodeContent`, `ClearKnowledgeBase`, `indexScan` |
-| `provider_api.go` | Provider/Model CRUD + 上游模型查询 | |
+| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe | `FetchUpstreamModels`, `ProbeUpstreamModels` |
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
 | `command_api.go` | 斜杠命令执行 | |
@@ -101,6 +103,7 @@ Chunk 字段检查顺序（优先级从高到低）:
 - 消息通过 `memory.Store.AddChatMessageTo()` 持久化
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
+- `buildMessageResponse()` 会过滤不应渲染的内部行：tool_call/tool_result、媒体附件独立行、`metadata.ui_hidden=true` 的消息，以及旧库中以 `⏱ 上一回合因` / `⚠ 系统检测：你刚才的回复没有调用任何工具` 开头的自动续跑 user-style nudge。内部续跑提示只能影响下一次 LLM 输入，不应在 GUI 里表现成用户重复发送消息。
 
 ### 6. P0-1 / P1-3 增量端点 (round 2, 2026-07-15)
 
@@ -156,6 +159,10 @@ SendMessage 和 Regenerate 共享的 SSE 写循环：
   无 todo 时退化为纯 "继续"
 - 整条重试序列在**同一个 HTTP 请求 / 同一个 SSE 流**内完成，`sessionLocks`
   全程持有，前端看到一条连续流（中间一个 `phase` 通知 + `session_status: "retry"`）
+- 重试时追加给 LLM 的 "继续" user-style nudge 会入库，但必须带
+  `Meta{"origin":"auto_resume","ui_hidden":true}`。`ListMessages` / `SnapshotRecovery`
+  通过 `buildMessageResponse()` 过滤该行；用户只看到 `phase` / `session_status`
+  表示系统自动接续，不会看到一条伪造的用户气泡。
 - 重试耗尽后（或非截止时间中断）才输出 "回合超出最长执行时间被终止" 终止帧
 
 #### ContextInspector (P2-3)

@@ -150,12 +150,24 @@
   --shadow-md:        0 4px 12px rgba(0, 0, 0, 0.28);
   --shadow-lg:        0 12px 32px rgba(0, 0, 0, 0.36);
 
-  /* 2.11 Motion */
+  /* 2.11 Motion
+   * --ease-out   : enter / hover settle (decelerate into rest)
+   * --ease-in    : leave / dismiss (accelerate out)
+   * --ease-in-out: bidirectional layout (sidebar width, docks)
+   * --transition-colors: hover/focus shorthand for interactive surfaces
+   */
   --ease-out:         cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in:          cubic-bezier(0.4, 0, 1, 1);
   --ease-in-out:      cubic-bezier(0.4, 0, 0.2, 1);
   --dur-fast:         120ms;
   --dur-base:         200ms;
   --dur-slow:         320ms;
+  --transition-colors:
+    background-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    opacity var(--dur-fast) var(--ease-out);
 
   color-scheme: dark;
 }
@@ -306,13 +318,17 @@ html, body, #app {
  * component rules cannot reliably style them. Keep the shared
  * floating-menu treatment here so sidebar actions, KB selection,
  * settings selects, and tool enum selects read as one UI family.
+ *
+ * Icon+label action menus (session ⋯, project ⋯) add `.app-action-menu`
+ * via NDropdown menu-props. Items render `.app-action-item` (icon +
+ * label on one row) and Naive's empty prefix/suffix columns are hidden.
  */
 .n-dropdown-menu,
 .n-base-select-menu {
-  padding: 5px !important;
+  padding: var(--space-1) !important;
   background: var(--surface-1) !important;
   border: 1px solid var(--border-default) !important;
-  border-radius: 8px !important;
+  border-radius: var(--radius-md) !important;
   box-shadow: var(--shadow-lg) !important;
   color: var(--text-primary) !important;
 }
@@ -324,14 +340,12 @@ html, body, #app {
 
 .n-dropdown-option .n-dropdown-option-body,
 .n-base-select-option {
-  min-height: 30px !important;
-  padding: 5px 8px !important;
+  min-height: var(--space-7) !important;
+  padding: var(--space-1) var(--space-2) !important;
   border-radius: var(--radius-sm) !important;
   color: var(--text-secondary) !important;
   font-size: 12.5px !important;
-  transition:
-    background var(--dur-fast) var(--ease-out),
-    color var(--dur-fast) var(--ease-out) !important;
+  transition: var(--transition-colors) !important;
 }
 
 .n-dropdown-option .n-dropdown-option-body:hover,
@@ -373,6 +387,242 @@ html, body, #app {
   white-space: nowrap;
 }
 
+.app-action-menu.n-dropdown-menu {
+  /* Collapse Naive's reserved prefix (36px) and suffix gutter
+     so the custom `.app-action-item` row owns icon+label spacing. */
+  --n-padding: var(--space-1);
+  --n-option-height: var(--space-7);
+  --n-option-prefix-width: 0px;
+  --n-option-icon-prefix-width: 0px;
+  --n-option-suffix-width: 0px;
+  --n-option-icon-suffix-width: 0px;
+  --n-font-size: 13px;
+  min-width: calc(var(--space-8) * 4);
+  width: max-content;
+  max-width: calc(100vw - var(--space-6));
+  padding: var(--space-1) !important;
+  border-radius: var(--radius-lg) !important;
+  background: var(--surface-1) !important;
+  box-shadow: var(--shadow-md) !important;
+}
+
+.app-action-menu .n-dropdown-option {
+  margin: 0 !important;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body {
+  box-sizing: border-box;
+  height: var(--space-7) !important;
+  min-height: var(--space-7) !important;
+  padding: 0 var(--space-2) !important;
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0;
+  overflow: hidden;
+  border-radius: var(--radius-sm) !important;
+  color: var(--text-secondary) !important;
+  line-height: 1.3 !important;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body::before {
+  inset: 0 !important;
+  border-radius: inherit !important;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:hover,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body--pending {
+  color: var(--text-primary) !important;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:hover::before,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body--pending::before {
+  background: var(--surface-3) !important;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:active {
+  color: var(--brand-600) !important;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:active::before {
+  background: var(--brand-50) !important;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body__prefix,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body__prefix--show-icon,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body__suffix {
+  display: none !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  flex: 0 0 0;
+  overflow: hidden;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: inherit !important;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.app-action-item {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  width: 100%;
+}
+
+.app-action-item__icon {
+  display: block;
+  flex: 0 0 var(--space-4);
+  width: var(--space-4);
+  height: var(--space-4);
+  color: var(--text-tertiary);
+}
+
+.app-action-item__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-action-menu .n-dropdown-option .n-dropdown-option-body:hover .app-action-item__icon,
+.app-action-menu .n-dropdown-option .n-dropdown-option-body--pending .app-action-item__icon {
+  color: var(--brand-500);
+}
+
+.app-action-menu .n-dropdown-divider {
+  margin: var(--space-1) var(--space-2) !important;
+  background-color: var(--border-default) !important;
+  height: 1px !important;
+  border: none !important;
+}
+
+/* Destructive row (archive / remove). Naive may stamp option.props
+ * onto either the wrapper or the body, so both selectors are covered. */
+.app-action-menu .app-action-danger .n-dropdown-option-body,
+.app-action-menu .n-dropdown-option-body.app-action-danger {
+  color: var(--error-500) !important;
+}
+.app-action-menu .app-action-danger .app-action-item__icon,
+.app-action-menu .n-dropdown-option-body.app-action-danger .app-action-item__icon {
+  color: var(--error-500);
+}
+.app-action-menu .app-action-danger .n-dropdown-option-body:hover,
+.app-action-menu .app-action-danger .n-dropdown-option-body--pending,
+.app-action-menu .n-dropdown-option-body.app-action-danger:hover,
+.app-action-menu .n-dropdown-option-body.app-action-danger.n-dropdown-option-body--pending {
+  color: var(--error-500) !important;
+}
+.app-action-menu .app-action-danger .n-dropdown-option-body:hover::before,
+.app-action-menu .app-action-danger .n-dropdown-option-body--pending::before,
+.app-action-menu .n-dropdown-option-body.app-action-danger:hover::before,
+.app-action-menu .n-dropdown-option-body.app-action-danger.n-dropdown-option-body--pending::before {
+  background: var(--error-50) !important;
+}
+.app-action-menu .app-action-danger .n-dropdown-option-body:hover .app-action-item__icon,
+.app-action-menu .app-action-danger .n-dropdown-option-body--pending .app-action-item__icon,
+.app-action-menu .n-dropdown-option-body.app-action-danger:hover .app-action-item__icon,
+.app-action-menu .n-dropdown-option-body.app-action-danger.n-dropdown-option-body--pending .app-action-item__icon {
+  color: var(--error-500);
+}
+
+/* --- 8c. Shared Vue transitions ------------------------------------
+ * Enter decelerates into rest (--ease-out, a touch slower).
+ * Leave accelerates out (--ease-in, a touch faster). That
+ * asymmetry is what makes overlays feel like they settle,
+ * rather than bouncing in and out on the same curve.
+ */
+.fade-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out);
+}
+.fade-leave-active {
+  transition: opacity var(--dur-fast) var(--ease-in);
+}
+.fade-enter-from,
+.fade-leave-to { opacity: 0; }
+
+.fade-scale-enter-active {
+  transition: opacity var(--dur-slow) var(--ease-out),
+              transform var(--dur-slow) var(--ease-out);
+}
+.fade-scale-leave-active {
+  transition: opacity var(--dur-base) var(--ease-in),
+              transform var(--dur-base) var(--ease-in);
+}
+.fade-scale-enter-from,
+.fade-scale-leave-to {
+  opacity: 0;
+  transform: scale(0.96);
+}
+
+.fade-up-enter-active {
+  transition: opacity var(--dur-base) var(--ease-out),
+              transform var(--dur-base) var(--ease-out);
+}
+.fade-up-leave-active {
+  transition: opacity var(--dur-fast) var(--ease-in),
+              transform var(--dur-fast) var(--ease-in);
+}
+.fade-up-enter-from,
+.fade-up-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+/* Naive UI's built-in transitions (NModal / NDrawer / NPopover
+ * / NDropdown). Duration + easing are inlined by the library;
+ * override so they share the same motion language as hand-
+ * rolled Vue <Transition>s. */
+.fade-in-scale-up-transition-enter-active,
+.fade-in-scale-up-transition-enter-active-from,
+.fade-in-scale-up-transition-leave-active {
+  transform-origin: inherit;
+}
+.fade-in-scale-up-transition-enter-active {
+  transition-duration: var(--dur-slow) !important;
+  transition-timing-function: var(--ease-out) !important;
+}
+.fade-in-scale-up-transition-leave-active {
+  transition-duration: var(--dur-base) !important;
+  transition-timing-function: var(--ease-in) !important;
+}
+.fade-in-height-expand-transition-enter-active,
+.fade-in-height-expand-transition-leave-active,
+.fade-in-width-expand-transition-enter-active,
+.fade-in-width-expand-transition-leave-active {
+  transition-timing-function: var(--ease-in-out) !important;
+}
+.fade-in-transition-enter-active {
+  transition-duration: var(--dur-base) !important;
+  transition-timing-function: var(--ease-out) !important;
+}
+.fade-in-transition-leave-active {
+  transition-duration: var(--dur-fast) !important;
+  transition-timing-function: var(--ease-in) !important;
+}
+.slide-in-from-right-transition-enter-active,
+.slide-in-from-left-transition-enter-active {
+  transition-duration: var(--dur-slow) !important;
+  transition-timing-function: var(--ease-out) !important;
+}
+.slide-in-from-right-transition-leave-active,
+.slide-in-from-left-transition-leave-active {
+  transition-duration: var(--dur-base) !important;
+  transition-timing-function: var(--ease-in) !important;
+}
+
 /* --- 9. Reduced motion ------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -390,7 +640,10 @@ html, body, #app {
 .md-body code { background: var(--surface-2); padding: 2px 6px; border-radius: 3px; font-family: var(--font-mono); font-size: 0.9em; }
 .md-body pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; overflow-x: auto; }
 .md-body pre code { background: none; padding: 0; }
-.md-body a { color: var(--brand-600); }
+.md-body a {
+  color: var(--brand-600);
+  transition: color var(--dur-fast) var(--ease-out);
+}
 .md-body a:hover { color: var(--brand-500); }
 .md-body ul, .md-body ol { padding-left: 24px; }
 .md-body blockquote { border-left: 3px solid var(--border-strong); padding-left: 12px; color: var(--text-secondary); margin: 8px 0; }
@@ -606,4 +859,124 @@ pre {
 .hljs-link {
   color: var(--code-fg);
   text-decoration: underline;
+}
+
+/* --- Settings collapse (NCollapse) ----------------------------------
+ * Shared accordion card style for App Settings tabs.
+ *
+ * Problem this solves: wrapping all NCollapseItems in one bordered
+ * shell made each item's title float above a nested content block
+ * ("顶部样式错乱"). Each item is now its own card so header + body
+ * share one continuous surface and radius.
+ *
+ * Usage: <NCollapse class="settings-collapse">…</NCollapse>
+ * Modifier: .settings-collapse--inset  when already inside a card
+ *           (no per-item border; only divider between header/body).
+ */
+.settings-collapse {
+  --n-collapse-item-margin: 0;
+  --n-title-padding: 12px 16px;
+  --n-item-margin: 0;
+  /* Kill Naive's inter-item divider; each item is its own card. */
+  --n-divider-color: transparent;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  background: transparent;
+  border: none;
+}
+
+.settings-collapse .n-collapse-item {
+  margin: 0 !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  overflow: hidden;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+.settings-collapse .n-collapse-item:hover {
+  border-color: var(--border-strong) !important;
+}
+
+/* Naive zeros padding-top on the first item header
+ * (`&:first-child > header { padding-top: 0 }`), which made
+ * every accordion's top title look clipped / disconnected
+ * from the card edge. Restore equal padding. */
+.settings-collapse .n-collapse-item:first-child > .n-collapse-item__header,
+.settings-collapse .n-collapse-item__header {
+  padding: 12px 16px !important;
+  background: var(--surface-1);
+  /* Transparent until expanded — avoids a leftover divider
+   * under collapsed headers that looked like a broken top. */
+  border-bottom: 1px solid transparent !important;
+  align-items: center;
+  transition: background-color var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
+}
+
+.settings-collapse .n-collapse-item__header--active {
+  border-bottom-color: var(--border-subtle) !important;
+  background: var(--surface-2);
+}
+
+.settings-collapse .n-collapse-item__header-main {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+  line-height: 1.3;
+}
+
+.settings-collapse .n-collapse-item__header .n-base-icon,
+.settings-collapse .n-collapse-item__header .n-collapse-item-arrow {
+  color: var(--text-tertiary);
+}
+
+.settings-collapse .n-collapse-item__content-wrapper {
+  background: var(--surface-1);
+}
+
+.settings-collapse .n-collapse-item__content {
+  padding: 0 !important;
+}
+
+.settings-collapse .n-collapse-item__content-inner {
+  padding: 12px 16px 16px !important;
+  background: var(--surface-1);
+}
+
+/* Inset variant: collapse lives inside an existing card —
+ * skip per-item chrome so we don't get boxes-in-boxes. */
+.settings-collapse--inset {
+  gap: 0;
+}
+
+.settings-collapse--inset .n-collapse-item {
+  border: none !important;
+  border-radius: 0;
+  background: transparent;
+}
+
+.settings-collapse--inset .n-collapse-item:hover {
+  border-color: transparent !important;
+}
+
+.settings-collapse--inset .n-collapse-item__header,
+.settings-collapse--inset .n-collapse-item__header--active,
+.settings-collapse--inset .n-collapse-item__content-wrapper,
+.settings-collapse--inset .n-collapse-item__content-inner {
+  background: transparent;
+}
+
+.settings-collapse--inset .n-collapse-item__header {
+  padding: 12px 0 !important;
+}
+
+.settings-collapse--inset .n-collapse-item__content-inner {
+  padding: 8px 0 4px !important;
+}
+
+.settings-collapse--inset .n-collapse-item + .n-collapse-item {
+  border-top: 1px solid var(--border-subtle) !important;
 }

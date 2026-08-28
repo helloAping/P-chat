@@ -25,15 +25,39 @@ $ErrorActionPreference = "SilentlyContinue"
 $scriptDir = $PSCommandPath | Split-Path -Parent
 $here = (Resolve-Path -LiteralPath $scriptDir).Path
 
+function Test-SamePathText {
+    param(
+        [Parameter(Mandatory = $true)][string] $Left,
+        [Parameter(Mandatory = $true)][string] $Right
+    )
+
+    return $Left.TrimEnd('\').Equals($Right.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Remove-PChatShortcutForInstall {
+    param(
+        [Parameter(Mandatory = $true)][string] $LinkPath,
+        [Parameter(Mandatory = $true)][string] $InstallRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $LinkPath)) { return }
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($LinkPath)
+    $targetPath = $shortcut.TargetPath
+    if ($targetPath -and (Test-SamePathText -Left $targetPath -Right (Join-Path $InstallRoot "pchat-gui.exe"))) {
+        Remove-Item -LiteralPath $LinkPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if (-not $InstallDir) {
     $InstallDir = $here
 }
 
 Write-Host "[uninstall] target: $InstallDir"
 
-# 1. Kill any running pchat-gui / pchat-server / pchat (CLI REPL)
+# 1. Kill any running pchat-gui / pchat-server / pchat (CLI REPL) / pchat-updater
 #    from this install.
-Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue |
+Get-Process -Name "pchat-gui","pchat-server","pchat","pchat-updater" -ErrorAction SilentlyContinue |
     Where-Object {
         try {
             $p = (Resolve-Path -LiteralPath (Split-Path -LiteralPath $_.MainModule.FileName -Parent) -ErrorAction Stop).Path
@@ -46,33 +70,39 @@ Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContin
     }
 Start-Sleep -Milliseconds 500
 
-# 2. Remove Start Menu shortcuts
+# 2. 删除开始菜单快捷方式 / Remove Start Menu shortcuts
 $startMenu = [Environment]::GetFolderPath("Programs")
 Remove-Item -LiteralPath (Join-Path $startMenu "P-Chat.lnk")             -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $startMenu "P-Chat Uninstall.lnk")   -Force -ErrorAction SilentlyContinue
 Write-Host "[uninstall] removed Start Menu shortcuts"
 
+# 2a. 删除指向当前安装目录的桌面快捷方式 / Remove Desktop shortcut for this install
+$desktop = [Environment]::GetFolderPath("Desktop")
+Remove-PChatShortcutForInstall -LinkPath (Join-Path $desktop "P-Chat.lnk") -InstallRoot $InstallDir
+Write-Host "[uninstall] removed Desktop shortcut"
+
 # 3. Remove registry uninstall entry
 Remove-Item -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\P-Chat" -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "[uninstall] removed registry entry"
 
-# 3a. Clean up PATH / PCHAT_HOME that install.ps1 -AddToPath
-#     may have set. We only remove PCHAT_HOME if it still
-#     points at this install dir — the user may have set it
-#     to point somewhere else and we'd be stomping that.
+# 3a. 清理 install.ps1 -AddToPath 写入的 PATH/PCHAT_HOME / Clean PATH/PCHAT_HOME set by install.ps1 -AddToPath
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $pchatHome = [Environment]::GetEnvironmentVariable("PCHAT_HOME", "User")
 $installRoot = $InstallDir.TrimEnd('\')
 
-# Strip the %PCHAT_HOME% token from PATH (and any literal
-# $InstallDir leftovers from older installs that didn't
-# migrate to the variable form).
-$segments = $userPath -split ';' | Where-Object {
-    $s = $_.Trim()
-    $s -ne '' -and
-    $s -ne '%PCHAT_HOME%' -and
-    $s -ne '%PCHAT_HOME%\bin' -and
-    $s -ne $installRoot
+# 按 PATH 段精确移除，避免误删前缀相似目录 / Remove exact PATH segments to avoid touching prefix-matched directories.
+$segments = @()
+if (-not [string]::IsNullOrWhiteSpace($userPath)) {
+    $segments = $userPath -split ';' | Where-Object {
+        $s = $_.Trim()
+        $keep = $true
+        if (-not $s) { $keep = $false }
+        if ($s.Equals('%PCHAT_HOME%', [System.StringComparison]::OrdinalIgnoreCase)) { $keep = $false }
+        if ($s.Equals('%PCHAT_HOME%\bin', [System.StringComparison]::OrdinalIgnoreCase)) { $keep = $false }
+        $expanded = [Environment]::ExpandEnvironmentVariables($s)
+        if ($expanded -and (Test-SamePathText -Left $expanded -Right $installRoot)) { $keep = $false }
+        $keep
+    }
 }
 $newPath = ($segments -join ';').TrimEnd(';')
 if ($newPath -ne $userPath) {
@@ -82,7 +112,7 @@ if ($newPath -ne $userPath) {
     Write-Host "[uninstall] PCHAT_HOME entry not in user PATH"
 }
 
-if ($pchatHome -and ($pchatHome.TrimEnd('\') -eq $installRoot)) {
+if ($pchatHome -and (Test-SamePathText -Left $pchatHome -Right $installRoot)) {
     [Environment]::SetEnvironmentVariable("PCHAT_HOME", $null, "User")
     Write-Host "[uninstall] cleared PCHAT_HOME (was $pchatHome)"
 } else {

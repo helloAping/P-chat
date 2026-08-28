@@ -18,11 +18,13 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -166,6 +168,11 @@ func (a *Agent) LLM() *llm.Client { return a.llm }
 // a config change so new providers / API keys take effect immediately.
 func (a *Agent) SetLLM(c *llm.Client) {
 	a.llm = c
+}
+
+// SetConfig swaps the agent's config pointer after a system config change.
+func (a *Agent) SetConfig(cfg *config.Config) {
+	a.cfg = cfg
 }
 
 // BypassSandboxOnce makes the next tool call skip sandbox checks.
@@ -366,6 +373,272 @@ func (a *Agent) visionGatedTools(providerName, modelName string, tools []tool.To
 	return filterVisionTools(tools)
 }
 
+func filterImageRecognitionTools(tools []tool.Tool) []tool.Tool {
+	out := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		if t.Name == "image_recognize" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+func filterAllowedTools(tools []tool.Tool, allow []string) []tool.Tool {
+	if len(allow) == 0 {
+		return tools
+	}
+	allowed := make(map[string]struct{}, len(allow))
+	for _, name := range allow {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			allowed[name] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	out := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		if _, ok := allowed[t.Name]; ok {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (a *Agent) imageRecognitionAvailable() bool {
+	if a == nil || a.cfg == nil || a.llm == nil {
+		return false
+	}
+	vc := a.cfg.Vision
+	vc.Normalize()
+	if !vc.Enabled || strings.TrimSpace(vc.Provider) == "" || strings.TrimSpace(vc.Model) == "" {
+		return false
+	}
+	for _, p := range a.cfg.LLM.Providers {
+		if p.Name != vc.Provider {
+			continue
+		}
+		for _, m := range p.AllModels() {
+			if m.Name == vc.Model {
+				return true
+			}
+		}
+		return p.Model == vc.Model
+	}
+	return false
+}
+
+func (a *Agent) currentModelImageRecognitionAvailable(providerName, modelName string) bool {
+	return a != nil && a.store != nil && a.attach != nil && a.llm != nil && a.modelSupportsVision(providerName, modelName)
+}
+
+func (a *Agent) imageRecognitionGatedTools(enabled bool, tools []tool.Tool) []tool.Tool {
+	if enabled {
+		return tools
+	}
+	return filterImageRecognitionTools(tools)
+}
+
+func dropDisplayOnlyMediaMessages(msgs []llm.ChatMessage) []llm.ChatMessage {
+	out := msgs[:0]
+	for _, m := range msgs {
+		if m.SubmitToLLM == 0 && (m.Type == llm.TypeImage || m.Type == llm.TypeAudio || m.Type == llm.TypeVideo) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func replaceHistoricalImagesWithPlaceholders(msgs []llm.ChatMessage, currentTurnStart int, imageToolAvailable bool) []llm.ChatMessage {
+	currentTurnStart = clampHistoryMessageCount(currentTurnStart, len(msgs))
+	out := make([]llm.ChatMessage, 0, len(msgs))
+	for i, m := range msgs {
+		if i >= currentTurnStart || m.Type != llm.TypeImage {
+			out = append(out, m)
+			continue
+		}
+		name := strings.TrimSpace(m.Name)
+		if name == "" {
+			name = "未命名图片"
+		}
+		mime := strings.TrimSpace(m.MimeType)
+		if mime == "" {
+			mime = "未知类型"
+		}
+		content := fmt.Sprintf("[历史图片：%s，MIME=%s。该图片未随本次请求重新发送，当前模型无法直接查看图片内容。若用户要求查看、分析或回看这张图片，请明确说明需要用户重新上传图片后才能继续。]", name, mime)
+		if imageToolAvailable && strings.TrimSpace(m.UploadID) != "" {
+			content = fmt.Sprintf("[历史图片：%s，upload_id=%s，MIME=%s。该图片已保存在当前会话中，但未随本次请求直接发送，当前模型不能直接查看图片内容。若用户需要继续查看、纠正、比较或分析这张图片，请调用 image_recognize 工具读取该 upload_id；不要声称已经直接看到了图片。]", name, strings.TrimSpace(m.UploadID), mime)
+		}
+		out = append(out, llm.ChatMessage{
+			Role:        llm.RoleSystem,
+			Type:        llm.TypeText,
+			Content:     content,
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+	}
+	return out
+}
+
+func replaceImagesWithRecognitionRefs(msgs []llm.ChatMessage) []llm.ChatMessage {
+	out := make([]llm.ChatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if m.Type != llm.TypeImage {
+			out = append(out, m)
+			continue
+		}
+		name := strings.TrimSpace(m.Name)
+		if name == "" {
+			name = "uploaded image"
+		}
+		if m.UploadID != "" {
+			out = append(out, llm.ChatMessage{
+				Role:        llm.RoleSystem,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("Uploaded image available for tool-based recognition: name=%q, upload_id=%q, MIME=%s. Do not claim to see the image directly. If image details are needed, call image_recognize with this upload_id, or include it in upload_ids with the other images.", name, m.UploadID, m.MimeType),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
+			})
+			continue
+		}
+		out = append(out, llm.ChatMessage{
+			Role:        llm.RoleSystem,
+			Type:        llm.TypeText,
+			Content:     fmt.Sprintf("An earlier image named %q is not sent to the main model because image recognition mode is enabled, but it has no upload_id for image_recognize.", name),
+			MsgType:     llm.MsgTypeText,
+			SubmitToLLM: 1,
+		})
+	}
+	return out
+}
+
+func (a *Agent) resolveImageForRecognition(ctx context.Context, sessionID, uploadID string) (tool.ImageRecognitionImage, error) {
+	if a == nil || a.store == nil || a.attach == nil {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("image storage is not available")
+	}
+	allowed := false
+	for _, ref := range a.store.UploadRefsForConversation(sessionID) {
+		if ref == uploadID {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("upload_id %q is not referenced by this conversation", uploadID)
+	}
+	path, size := a.attach.Resolve(Attachment{ID: uploadID})
+	if path == "" {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("upload %q not found", uploadID)
+	}
+	vc := a.cfg.Vision
+	vc.Normalize()
+	if size > vc.MaxImageBytes {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("image is too large: %d bytes (max %d)", size, vc.MaxImageBytes)
+	}
+	select {
+	case <-ctx.Done():
+		return tool.ImageRecognitionImage{}, ctx.Err()
+	default:
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return tool.ImageRecognitionImage{}, err
+	}
+	if int64(len(data)) > vc.MaxImageBytes {
+		return tool.ImageRecognitionImage{}, fmt.Errorf("image is too large: %d bytes (max %d)", len(data), vc.MaxImageBytes)
+	}
+	name := filepath.Base(path)
+	prefix := uploadID + "-"
+	if strings.HasPrefix(name, prefix) {
+		name = strings.TrimPrefix(name, prefix)
+	}
+	return tool.ImageRecognitionImage{
+		UploadID: uploadID,
+		Name:     name,
+		MIME:     imageMIME(name, ""),
+		Data:     data,
+	}, nil
+}
+
+func (a *Agent) recognizeImageWithConfiguredModel(ctx context.Context, req tool.ImageRecognitionRequest) (string, error) {
+	if !a.imageRecognitionAvailable() {
+		return "", fmt.Errorf("vision_recognition is not configured")
+	}
+	vc := a.cfg.Vision
+	vc.Normalize()
+	timeout := time.Duration(vc.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	return a.recognizeImageWithModel(ctx, vc.Provider, vc.Model, timeout, req)
+}
+
+func (a *Agent) recognizeImageWithCurrentModel(providerName, modelName string) tool.ImageRecognizer {
+	return func(ctx context.Context, req tool.ImageRecognitionRequest) (string, error) {
+		if !a.currentModelImageRecognitionAvailable(providerName, modelName) {
+			return "", fmt.Errorf("current model %s/%s is not available for image recognition", providerName, modelName)
+		}
+		timeout := 60 * time.Second
+		if a != nil && a.cfg != nil {
+			vc := a.cfg.Vision
+			vc.Normalize()
+			if vc.TimeoutSeconds > 0 {
+				timeout = time.Duration(vc.TimeoutSeconds) * time.Second
+			}
+		}
+		return a.recognizeImageWithModel(ctx, providerName, modelName, timeout, req)
+	}
+}
+
+func (a *Agent) recognizeImageWithModel(ctx context.Context, providerName, modelName string, timeout time.Duration, req tool.ImageRecognitionRequest) (string, error) {
+	if a == nil || a.llm == nil {
+		return "", fmt.Errorf("LLM client is not available")
+	}
+	providerName = strings.TrimSpace(providerName)
+	modelName = strings.TrimSpace(modelName)
+	if providerName == "" || modelName == "" {
+		return "", fmt.Errorf("image recognition model is not configured")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	question := strings.TrimSpace(req.Question)
+	if question == "" {
+		question = "Describe this image in detail."
+	}
+	images := req.Images
+	if len(images) == 0 && req.Image.UploadID != "" {
+		images = []tool.ImageRecognitionImage{req.Image}
+	}
+	if len(images) == 0 {
+		return "", fmt.Errorf("no images provided")
+	}
+	msgs := []llm.ChatMessage{
+		{
+			Role:    llm.RoleSystem,
+			Type:    llm.TypeText,
+			Content: "You are an image recognition tool for P-Chat. Return only factual visual observations and visible text. If uncertain, say so. Match the user's language when possible.",
+		},
+		{
+			Role:    llm.RoleUser,
+			Type:    llm.TypeText,
+			Content: question,
+		},
+	}
+	for _, img := range images {
+		msgs = append(msgs, llm.ChatMessage{
+			Role:     llm.RoleUser,
+			Type:     llm.TypeImage,
+			Content:  base64.StdEncoding.EncodeToString(img.Data),
+			Name:     img.Name,
+			MimeType: img.MIME,
+		})
+	}
+	return a.llm.ChatCM(callCtx, providerName, modelName, msgs, llm.ChatOptions{})
+}
+
 // visionCapableByHeuristic returns a best-guess vision
 // capability for an unknown (provider, model) pair. The
 // goal is to NOT trust the LLM API to surface the error
@@ -437,11 +710,21 @@ type ChatRequest struct {
 	HistoryMessageCount int    `json:"history_message_count,omitempty"`
 	Provider            string `json:"provider,omitempty"`
 	Model               string `json:"model,omitempty"`
+	// CurrentTurnAlreadyPersisted marks regeneration-style requests where
+	// Messages[HistoryMessageCount:] is the current user turn read back from
+	// storage. The agent should use that suffix for current-turn semantics
+	// (for example image preflight) but must not write those rows again.
+	CurrentTurnAlreadyPersisted bool `json:"current_turn_already_persisted,omitempty"`
 	// Attachments are file ids the user attached to this turn.
 	// Expanded into the message list as separate ChatMessage
 	// entries (text + image/file) before being sent to the LLM.
 	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// UseImageRecognition keeps uploaded images out of the main model.
+	// Current-turn image attachments are recognized before the main model call
+	// and injected as text context; follow-up turns can still expose
+	// image_recognize for historical upload_ids.
+	UseImageRecognition bool `json:"use_image_recognition,omitempty"`
 	// ClientMsgID, when non-zero, is the row id the frontend
 	// minted at send time (Date.now() × 1000 + random, well
 	// outside SQLite's AUTOINCREMENT range). The agent uses
@@ -476,6 +759,9 @@ type ChatRequest struct {
 	// activated via slash command. It is appended to the system
 	// prompt so the LLM sees it without cluttering the chat.
 	SkillContext string `json:"skill_context,omitempty"`
+	// AllowedTools 限制本次请求可见和可执行的工具集合。
+	// AllowedTools limits the tool set exposed to and executable by this request.
+	AllowedTools []string `json:"allowed_tools,omitempty"`
 	// PermissionLevel overrides the sandbox confirm behaviour for
 	// this session. Values: "ask", "auto", "full". Default "ask".
 	PermissionLevel string `json:"permission_level,omitempty"`
@@ -656,6 +942,11 @@ type ChatStreamChunk struct {
 	// LLM can pass back to resume / dedupe the sub-agent
 	// run. Opaque string; currently SHA-256 truncated.
 	SubAgentTaskID string `json:"sub_agent_task_id,omitempty"`
+	// SubAgentRunMode is "sync" for normal task calls and
+	// "async" for durable background jobs. The UI uses this
+	// to label the same SubAgentCard chrome without changing
+	// the event routing model.
+	SubAgentRunMode string `json:"sub_agent_run_mode,omitempty"`
 	// SubAgentDescription is the one-line "when to use" hint
 	// for the agent (e.g. "Fast read-only file search.").
 	// Surfaced as a hover tooltip on the agent-name badge in
@@ -855,6 +1146,49 @@ func GetToolEventChan(ctx context.Context) chan<- ChatStreamChunk {
 	return nil
 }
 
+// AsyncSubagentLiveSink is a best-effort live bridge for durable async
+// sub-agent jobs. It returns false when the parent SSE turn is no longer
+// available; callers must still persist progress independently.
+type AsyncSubagentLiveSink func(ChatStreamChunk) bool
+
+type asyncSubagentLiveSinkKey struct{}
+
+// WithAsyncSubagentLiveSink stores the current parent turn's live event sink.
+func WithAsyncSubagentLiveSink(ctx context.Context, sink AsyncSubagentLiveSink) context.Context {
+	if sink == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, asyncSubagentLiveSinkKey{}, sink)
+}
+
+// GetAsyncSubagentLiveSink returns the parent turn's async sub-agent live sink.
+func GetAsyncSubagentLiveSink(ctx context.Context) AsyncSubagentLiveSink {
+	if v, ok := ctx.Value(asyncSubagentLiveSinkKey{}).(AsyncSubagentLiveSink); ok {
+		return v
+	}
+	return nil
+}
+
+type parentToolCallIDKey struct{}
+
+// WithParentToolCallID publishes the parent LLM tool_call id to a tool
+// handler. The task tool uses it as a generated sub-agent identity when
+// the model did not provide task_id explicitly.
+func WithParentToolCallID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, parentToolCallIDKey{}, id)
+}
+
+// GetParentToolCallID returns the current parent tool_call id, if any.
+func GetParentToolCallID(ctx context.Context) string {
+	if v, ok := ctx.Value(parentToolCallIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // parentModelCtxKey is the context key under which the agent publishes
 // the *current turn's* (provider, model) pair. Sub-agents read this via
 // GetParentModel(ctx) so the child session inherits the same model the
@@ -989,6 +1323,12 @@ func attachToolResultMetadata(chunk *ChatStreamChunk, result *tool.CallResult) {
 // write-timeout in respondSSE is the backstop for those).
 const sendOrDropTimeout = 30 * time.Second
 
+// toolWaitHeartbeatInterval keeps the SSE stream alive while tools
+// run with no output. The GUI idle watchdog used to treat that
+// silence as a stuck turn, cancel the reader, and drop in-progress
+// todo work with no error in the bubble.
+const toolWaitHeartbeatInterval = 30 * time.Second
+
 func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, chunk ChatStreamChunk) {
 	if nextSeq != nil {
 		chunk.Seq = nextSeq()
@@ -1011,6 +1351,52 @@ func sendOrDrop(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() u
 	case <-time.After(sendOrDropTimeout):
 		log.Printf("sendOrDrop: dropped chunk (type=%q phase=%q) after %s — consumer not reading", chunk.Phase, chunk.Step, sendOrDropTimeout)
 	}
+}
+
+// waitToolsWithHeartbeat blocks until every tool goroutine finishes,
+// emitting a phase heartbeat on interval so the SSE consumer (and the
+// GUI idle watchdog) can tell the turn is still alive. ctx cancel
+// returns immediately so a user stop does not wait out a hung tool.
+func waitToolsWithHeartbeat(ctx context.Context, toolsDone <-chan struct{}, ch chan<- ChatStreamChunk, nextSeq func() uint64, interval time.Duration) error {
+	if interval <= 0 {
+		interval = toolWaitHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-toolsDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+				Phase:   "system",
+				Step:    "tool-heartbeat",
+				Message: "工具仍在执行…",
+			})
+		}
+	}
+}
+
+func detachTurnDeadlineForTask(ctx context.Context) (context.Context, bool) {
+	abortCtx := AbortContextFrom(ctx)
+	if abortCtx == nil {
+		return ctx, false
+	}
+	if tid := trace.FromContext(ctx); tid != "" {
+		abortCtx = trace.WithID(abortCtx, tid)
+	}
+	return WithAbortContext(abortCtx, abortCtx), true
+}
+
+func hasTaskToolCall(toolCalls []nativeToolCall) bool {
+	for _, tc := range toolCalls {
+		if tc.Name == "task" || tc.Name == "task_wait" {
+			return true
+		}
+	}
+	return false
 }
 
 // ChatWithTools performs a ReAct-style loop: send messages to the LLM with
@@ -1051,6 +1437,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 	go func() {
 		defer close(ch)
+		var asyncLiveClosed atomic.Bool
+		defer asyncLiveClosed.Store(true)
 		// Global default working directory: when the session has no
 		// project path, anchor all file/command/grep operations to
 		// ~/.p-chat/workspace/ so the agent always has a fixed,
@@ -1067,6 +1455,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// metadata under "parts" so the same view comes back
 		// when the user reopens the session.
 		partsAcc := newPartsAccumulator()
+		asyncLiveSink := AsyncSubagentLiveSink(func(ev ChatStreamChunk) (ok bool) {
+			if asyncLiveClosed.Load() || ctx.Err() != nil {
+				return false
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					ok = false
+				}
+			}()
+			sendOrDrop(ctx, ch, nextSeq, ev)
+			return ctx.Err() == nil && !asyncLiveClosed.Load()
+		})
 		todoMode := todoModeFromRequest(req.TodoMode)
 		// T4: per-session cross-turn tool-failure breaker. Auto-resume
 		// turns keep accumulating across turn boundaries (that is the
@@ -1156,6 +1556,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
 		a.loadProjectDynamicTools(req.ProjectRoot)
 		availableTools := a.tools.ListForProject(req.ProjectRoot)
+		availableTools = filterAllowedTools(availableTools, req.AllowedTools)
+		useImageRecognition := req.UseImageRecognition && a.imageRecognitionAvailable()
+		requestHistoryCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
+		historyHasImageRefs := hasImageUploadRefs(req.Messages[:requestHistoryCount])
+		currentTurnImageRecognition := useImageRecognition && ((a.attach != nil && hasImageAttachments(req.Attachments)) || hasImageMessages(req.Messages[requestHistoryCount:]))
+		historyImageRecognitionAvailable := historyHasImageRefs && a.store != nil && a.attach != nil && (useImageRecognition || a.currentModelImageRecognitionAvailable(req.Provider, req.Model))
+		imageRecognitionToolAvailable := historyImageRecognitionAvailable && !currentTurnImageRecognition
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
 		kbEnabled := req.KBBase != "" && req.KBBase != "__off__"
@@ -1179,6 +1586,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// (before toolDefs / prompt / subagent wiring) keeps
 		// every downstream consumer consistent.
 		availableTools = a.visionGatedTools(req.Provider, req.Model, availableTools)
+		// Current-turn uploads are recognized before the main LLM call and
+		// injected as bounded context. Keep image_recognize available only for
+		// follow-up turns that need to revisit historical upload_ids.
+		availableTools = a.imageRecognitionGatedTools(imageRecognitionToolAvailable, availableTools)
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -1229,6 +1640,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if req.ProjectRoot != "" {
 			systemPrompt += appendWorkingDirectoryBlock(req.ProjectRoot)
 		}
+		if req.SubagentType != "" {
+			systemPrompt += "\n\n" + buildSubagentGuardPrompt(req.SubagentType, req.SubagentTaskID)
+		}
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "ok", Message: fmt.Sprintf("系统提示已就绪 (%d 字符)", len(systemPrompt)), Duration: formatElapsed(time.Since(start))})
 		// P3-1: announce "busy" now that the system prompt
 		// is assembled and the first LLM call is imminent.
@@ -1267,13 +1681,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if todoGuardActive(todoMode, initialTodos) {
 			upsertTodoGuard(&msgs, todoMode, initialTodos, false)
 		}
-		historyCount := req.HistoryMessageCount
-		if historyCount < 0 {
-			historyCount = 0
-		}
-		if historyCount > len(req.Messages) {
-			historyCount = len(req.Messages)
-		}
+		historyCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
 		history := req.Messages[:historyCount]
 		newMessages := req.Messages[historyCount:]
 		// When knowledge base is off, strip wiki-related messages
@@ -1309,7 +1717,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if len(req.Attachments) > 0 && a.attach != nil {
 			protocol := a.protocolFor(req.Provider)
 			vision := func() bool { return a.modelSupportsVision(req.Provider, req.Model) }
-			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision)
+			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision, useImageRecognition)
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))})
 		}
 
@@ -1343,6 +1751,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// This history row is already in storage.
 					continue
 				}
+				if req.CurrentTurnAlreadyPersisted {
+					// 重答会把原用户消息及其附件作为当前轮后缀重放。
+					// They drive the retry and image preflight, but already
+					// exist in the database and must not be duplicated.
+					continue
+				}
 				// Images uploaded via the SPA are persisted as a
 				// "upl://<id>" reference instead of base64: the
 				// bytes live in ~/.p-chat/uploads and the DB row
@@ -1364,6 +1778,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					continue
 				}
 				a.store.AddChatMessageTo(req.SessionID, m)
+			}
+		}
+		if currentTurnImageRecognition {
+			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, latestUserText(newMessages), ch, nextSeq)
+		}
+		msgs = replaceHistoricalImagesWithPlaceholders(msgs, persistStart, imageRecognitionToolAvailable)
+		msgs = dropDisplayOnlyMediaMessages(msgs)
+		if useImageRecognition {
+			if currentTurnImageRecognition {
+				msgs = replaceImagesWithHeldRefs(msgs)
+			} else {
+				msgs = replaceImagesWithRecognitionRefs(msgs)
 			}
 		}
 
@@ -1516,6 +1942,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// text-only round via forceSummaryRound.
 			roundLimit := resolveRoundLimit(maxRounds, longRunMode, len(currentTodos) > 0)
 			isLastRound := req.PlanMode || forceSummaryRound || (roundLimit > 0 && round >= roundLimit)
+
+			if req.SubagentType != "" && !isLastRound && subagentProgressReminderDue(round) {
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    llm.RoleSystem,
+					Type:    llm.TypeText,
+					Content: buildSubagentProgressReminder(req, round),
+				})
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:    "llm",
+					Step:     "subagent-progress-reminder",
+					Message:  fmt.Sprintf("子代理已运行 %d 轮，已注入聚焦与进度提醒。", round),
+					Round:    roundNum,
+					MaxRound: roundLimit,
+				})
+			}
 
 			// Pre-limit warning: when within 10 rounds of the
 			// cap, inject a gentle heads-up so the LLM can wrap
@@ -1888,6 +2329,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if len(toolCalls) > 0 {
 				fullContent = cleanMarkdownToolCalls(fullContent)
 			}
+			if hasTaskToolCall(toolCalls) {
+				if detached, ok := detachTurnDeadlineForTask(ctx); ok {
+					ctx = detached
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:    "tool",
+						Step:     "task-detached",
+						Message:  "检测到子代理编排/等待任务，已切换为仅受用户取消/连接断开控制，避免父回合 wall-clock 截断。",
+						Round:    roundNum,
+						MaxRound: maxRounds,
+					})
+				}
+			}
 
 			// Post-stream redactor: catch phantom "ERROR: Cannot read
 			// image.png ... Inform the user." style responses that
@@ -1995,6 +2448,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// card key) so this is a transparent change.
 			seenIDs := make(map[string]bool, len(toolCalls))
 			normalizeToolCallIDs(toolCalls, seenIDs)
+			normalizeToolCallArgs(toolCalls)
 			for i := range toolCalls {
 				tc := &toolCalls[i]
 				tcm := llm.ChatMessage{
@@ -2013,6 +2467,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 
 			if len(toolCalls) == 0 {
+				if jobs, err := activeAsyncSubagentJobs(a.store, req.SessionID); err == nil && len(jobs) > 0 && !isLastRound && toolAvailable(availableTools, "task_wait") {
+					msgs = append(msgs, llm.ChatMessage{
+						Role:    llm.RoleUser,
+						Type:    llm.TypeText,
+						Content: buildAsyncSubagentWaitPrompt(jobs),
+					})
+					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+						Phase:    "subagent",
+						Step:     "async-wait",
+						Message:  fmt.Sprintf("检测到 %d 个后台子代理仍在执行，阻塞等待完成后再总结。", len(jobs)),
+						Round:    roundNum,
+						MaxRound: maxRounds,
+					})
+					continue
+				}
 				// P0-3: auto-continue guard. The LLM often
 				// finishes a real tool run but emits a
 				// "ready to continue" text block instead of
@@ -2130,6 +2599,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				partsAcc.update(startChunk)
 				sendOrDrop(ctx, ch, nextSeq, startChunk)
 			}
+			compressionPlan := buildSubagentToolCompressionPlan(req, toolCalls)
+			if len(compressionPlan) > 0 {
+				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+					Phase:    "tool",
+					Step:     "subagent-tool-compression",
+					Message:  fmt.Sprintf("子代理本轮检测到 %d 个相近只读命令，已压缩为复用代表工具结果。", len(compressionPlan)),
+					Round:    roundNum,
+					MaxRound: maxRounds,
+				})
+			}
 
 			// Each tool call gets its own event channel. The agent loop
 			// launches a forwarder per channel and collects the done
@@ -2164,6 +2643,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// forwarder will drain it before the next push.
 				eventCh := make(chan ChatStreamChunk, 64)
 				tctx := context.WithValue(ctx, toolEventChanKey{}, eventCh)
+				tctx = WithParentToolCallID(tctx, tc.ID)
+				tctx = WithAsyncSubagentLiveSink(tctx, asyncLiveSink)
 				if a.subagentRegistry != nil {
 					tctx = WithSubagentRegistry(tctx, a.subagentRegistry)
 				}
@@ -2179,6 +2660,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
 				}
+				if imageRecognitionToolAvailable {
+					tctx = tool.WithImageResolver(tctx, a.resolveImageForRecognition)
+					recognizer := tool.ImageRecognizer(a.recognizeImageWithConfiguredModel)
+					if !useImageRecognition {
+						recognizer = a.recognizeImageWithCurrentModel(req.Provider, req.Model)
+					}
+					tctx = tool.WithImageRecognizer(tctx, recognizer)
+				}
 				if a.store != nil {
 					// Persist todo writes through the request context so each
 					// agent uses its own store without a process-global callback.
@@ -2190,7 +2679,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						return a.store.SaveTodos(sessionID, stored)
 					})
 				}
-				if req.PermissionLevel != "" {
+				if req.SubagentType != "" {
+					// Child agents do not inherit the parent conversation's live
+					// permission state. They can only run calls allowed by the
+					// sub-agent authority gate below; anything requiring approval
+					// must be handed back to the parent conversation.
+					tctx = tool.WithParentAuthorityOnly(tool.WithIsolatedPermissionLevel(tctx, tool.PermissionAsk))
+				} else if req.PermissionLevel != "" {
 					tctx = tool.WithPermissionLevel(tctx, req.PermissionLevel)
 				}
 				if req.ProjectRoot != "" {
@@ -2232,11 +2727,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					case <-tctx.Done():
 					}
 				})
-				toolTimeout := 5 * time.Minute
+				// User-facing waits (sandbox confirm, question, browser
+				// RequireConfirm) must not share the per-tool execution
+				// deadline — otherwise write_file's 60s budget expires
+				// while the confirm modal is still on screen. The turn
+				// ctx still cancels those waits on user stop / turn
+				// timeout; ConfirmWaitTimeout / QuestionWaitTimeout are
+				// the interactive caps.
+				tctx = tool.WithInteractiveContext(tctx, ctx)
+				toolTimeout := tool.DefaultToolTimeout
 				if meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot); ok {
 					toolTimeout = meta.EffectivePolicy().Timeout()
 				}
-				tctx, cancel := context.WithTimeout(tctx, toolTimeout)
 
 				fwd := forwarder{done: make(chan struct{})}
 				forwarders = append(forwarders, fwd)
@@ -2291,7 +2793,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 				go func(i int, tc nativeToolCall) {
 					defer wg.Done()
-					defer cancel()
 					defer close(eventCh)
 					// Tool definitions are intentionally restricted during a
 					// checkpoint, but markdown-format calls are parsed locally and
@@ -2306,6 +2807,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 								IsError: true,
 							},
 							err: fmt.Errorf("tool %q is not allowed during todo checkpoint", tc.Name),
+						}
+						return
+					}
+					if compressed, ok := compressionPlan[i]; ok {
+						outcomes[i] = toolOutcome{
+							idx:     i,
+							tc:      tc,
+							result:  compressedToolResult(compressed),
+							elapsed: 0,
 						}
 						return
 					}
@@ -2331,7 +2841,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						}
 					}
 
-					handler, ok := a.tools.GetForProject(tc.Name, req.ProjectRoot)
+					if !toolAvailable(availableTools, tc.Name) {
+						errMsg := fmt.Sprintf("error: tool %q is not allowed for this request", tc.Name)
+						outcomes[i] = toolOutcome{
+							idx:    i,
+							tc:     tc,
+							result: &tool.CallResult{Content: errMsg, IsError: true},
+							err:    fmt.Errorf("tool not allowed"),
+						}
+						return
+					}
+
+					meta, handler, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot)
 					if !ok {
 						errMsg := fmt.Sprintf("error: tool %q not found (available: %s)", tc.Name, availableToolNames(a.tools.ListForProject(req.ProjectRoot)))
 						// Browser tools may have been unregistered at runtime.
@@ -2393,7 +2914,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					//   "ask"  — normal confirm flow (default)
 					toolCtx := tctx
 					permLevel := tool.PermissionLevelFromCtx(tctx)
-					bypass := a.bypassOnce.Swap(false)
+					bypass := false
+					if req.SubagentType == "" {
+						bypass = a.bypassOnce.Swap(false)
+					}
 					// /unsafe once → treat this single call as
 					// permission=full so browser_* confirm gates
 					// (BR-04 RequireConfirm) and path sandbox
@@ -2401,6 +2925,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if bypass {
 						toolCtx = tool.WithPermissionLevel(tctx, tool.PermissionFull)
 						permLevel = tool.PermissionFull
+					}
+					if authResult, handled := subagentToolAuthorizationResult(req, tc, meta, a.sandbox); handled {
+						outcomes[i] = toolOutcome{
+							idx:     i,
+							tc:      tc,
+							result:  authResult,
+							elapsed: time.Since(toolStart),
+						}
+						return
 					}
 					sandboxActive := a.sandbox != nil && !bypass && permLevel != tool.PermissionFull
 					if sandboxActive {
@@ -2510,7 +3043,21 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// The handler still BLOCKS here for the
 					// user to answer (the result carries
 					// {"questions":..., "answers":...}).
-					result, err := handler(toolCtx, argsRaw)
+					//
+					// Apply the per-tool execution deadline only
+					// after sandbox confirm so the user wait is
+					// not billed against write_file's 60s (etc.).
+					// question / RequireConfirm still honor
+					// InteractiveContextFrom for their own caps.
+					execCtx := toolCtx
+					execCancel := func() {}
+					if toolTimeout > 0 {
+						execCtx, execCancel = context.WithTimeout(toolCtx, toolTimeout)
+					} else {
+						execCtx, execCancel = context.WithCancel(toolCtx)
+					}
+					defer execCancel()
+					result, err := handler(execCtx, argsRaw)
 					outcomes[i] = toolOutcome{
 						idx:     i,
 						tc:      tc,
@@ -2524,15 +3071,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// stream immediately on cancellation. Third-party and dynamic
 			// tools are expected to honor ctx, yet one broken handler must
 			// not retain the entire conversation and keep the SSE request
-			// alive until the five-minute tool timeout expires.
+			// alive until the per-tool timeout expires.
 			toolsDone := make(chan struct{})
 			go func() {
 				wg.Wait()
 				close(toolsDone)
 			}()
-			select {
-			case <-toolsDone:
-			case <-ctx.Done():
+			if err := waitToolsWithHeartbeat(ctx, toolsDone, ch, nextSeq, toolWaitHeartbeatInterval); err != nil {
 				return
 			}
 			// All tools completed normally. Drain their final events before
@@ -3317,6 +3862,47 @@ func toolCallSignature(calls []nativeToolCall) string {
 		b.WriteByte(';')
 	}
 	return b.String()
+}
+
+func activeAsyncSubagentJobs(store *memory.Store, sessionID string) ([]memory.SubagentJob, error) {
+	if store == nil || strings.TrimSpace(sessionID) == "" {
+		return nil, nil
+	}
+	jobs, err := store.ListSubagentJobs(sessionID, 100)
+	if err != nil {
+		return nil, err
+	}
+	active := make([]memory.SubagentJob, 0, len(jobs))
+	for _, job := range jobs {
+		if job.Status == memory.SubagentJobQueued || job.Status == memory.SubagentJobRunning {
+			active = append(active, job)
+		}
+	}
+	return active, nil
+}
+
+func toolAvailable(tools []tool.Tool, name string) bool {
+	for _, t := range tools {
+		if t.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func buildAsyncSubagentWaitPrompt(jobs []memory.SubagentJob) string {
+	taskIDs := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		if id := strings.TrimSpace(job.TaskID); id != "" {
+			taskIDs = append(taskIDs, id)
+		}
+	}
+	if len(taskIDs) == 0 {
+		return "当前仍有后台子代理任务在运行。不要结束本轮对话；请调用 task_wait 等待任一后台任务完成，然后基于完成结果继续总结。"
+	}
+	encoded, _ := json.Marshal(taskIDs)
+	return fmt.Sprintf("当前仍有后台子代理任务在运行：%s。不要结束本轮对话；请调用 task_wait，传入 task_ids=%s 等待任一后台任务完成。task_wait 返回完成结果后，基于结果继续总结；如果还有未完成后台任务，继续等待或处理下一项。",
+		strings.Join(taskIDs, ", "), string(encoded))
 }
 
 // MaxStepsPrompt is injected as a fake assistant message right

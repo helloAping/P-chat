@@ -32,26 +32,27 @@
  * localStorage (P-Chat is local-first, the server doesn't track
  * this; a future schema migration could move it to the DB).
  */
-import { computed, ref, onMounted, watch } from 'vue'
-import { NButton, NInput, NScrollbar, NSpace, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
-import { h } from 'vue'
+import { computed, ref, onMounted, watch, h, type Component } from 'vue'
+import { NButton, NInput, NScrollbar, NModal, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
 } from '../stores/chat'
 import * as api from '../api/client'
-import type { DropdownOption } from 'naive-ui'
-import { checkUpdate } from '../api/update'
-import type { UpdateInfo } from '../api/update'
-import type { SearchResult } from '../api/client'
+import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
+import { checkUpdate, downloadUpdate, installDownloadedUpdate, SOFTWARE_RELEASE_PAGE } from '../api/update'
+import type { UpdateArtifact, UpdateDownloadResult, UpdateInfo } from '../api/update'
+import type { SearchResult, Session } from '../api/client'
 import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
 import BrandLogo from './BrandLogo.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
+import { displaySessionTitle, sessionSourceFromID } from '../im/sessionSource'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
-  Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff,
-  ChevronDown, ChevronRight, Circle, MessageSquare, Download as DownloadIcon,
+  Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
+  ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
+  Download, RotateCw, ExternalLink,
 } from './icons'
 
 const APP_VERSION = __APP_VERSION__
@@ -71,6 +72,7 @@ const showTokenStats = ref(false)
 
 const message = useMessage()
 const dialog = useDialog()
+const notification = useNotification()
 const showAddProject = ref(false)
 const newProjectName = ref('')
 const newProjectPath = ref('')
@@ -81,7 +83,14 @@ const showAbout = ref(false)
 const showRename = ref(false)
 const renameId = ref('')
 const renameTitle = ref('')
+const showExport = ref(false)
+const exportSessionId = ref('')
+const exportFormat = ref<ExportFormat>('pdf')
+const exportSaving = ref(false)
 const updateInfo = ref<UpdateInfo | null>(null)
+const downloadedUpdate = ref<UpdateDownloadResult | null>(null)
+const updateDownloading = ref(false)
+const updateInstalling = ref(false)
 const pendingDeleteSessionId = ref('')
 const showConfirmDeleteSession = ref(false)
 const showOlderExpanded = ref(false)
@@ -97,6 +106,7 @@ const showOlderExpanded = ref(false)
 // is mostly personal organization.
 // ---------------------------------------------------------------------------
 const PINNED_KEY = 'pchat-pinned-sessions'
+const UPDATE_NOTIFY_KEY = 'pchat-update-notified-version'
 const pinnedIds = ref<Set<string>>(new Set())
 
 function loadPinned() {
@@ -197,38 +207,59 @@ function shortTime(ts: number, group: string): string {
   }
 }
 
+function sessionDisplayTitle(s: Session): string {
+  return displaySessionTitle(s.title || '', s.id)
+}
+
+function sessionSourceTitle(id: string): string {
+  const source = sessionSourceFromID(id)
+  return source ? `${source.label} 会话` : ''
+}
+
 // ---------------------------------------------------------------------------
 // Header menu: project actions + app actions.
+//
+// Labels render icon+text in one `.app-action-item` row. We do not
+// use NDropdown's `icon` slot — Naive reserves a 36px prefix column
+// plus an empty suffix gutter, which is what made the session ⋯
+// menu look sparse and misaligned.
 // ---------------------------------------------------------------------------
+function actionOption(
+  key: string,
+  label: string,
+  icon: Component,
+  extra: Partial<DropdownOption> = {},
+): DropdownOption {
+  return {
+    key,
+    label: () =>
+      h('span', { class: 'app-action-item' }, [
+        h(icon, { size: 16, class: 'app-action-item__icon' }),
+        h('span', { class: 'app-action-item__label' }, label),
+      ]),
+    ...extra,
+  }
+}
+
 const menuOptions = computed<DropdownOption[]>(() => [
-  {
-    label: '添加项目',
-    key: 'add-project',
-    icon: () => h(Plus, { size: 16 }),
-  },
-  ...(state.activeProjectPath ? [{
-    label: '移除当前项目',
-    key: 'remove-project',
-    icon: () => h(XIcon, { size: 16 }),
-  }] : []),
+  actionOption('add-project', '添加项目', Plus),
+  ...(state.activeProjectPath
+    ? [actionOption('remove-project', '移除当前项目', XIcon)]
+    : []),
   { type: 'divider' as const, key: 'project-divider' },
-  {
-    label: 'Token 用量',
-    key: 'token-stats',
-    icon: () => h(BarChart3, { size: 16 }),
-  },
-  {
-    label: '设置',
-    key: 'settings',
-    icon: () => h(Settings, { size: 16 }),
-  },
+  actionOption('token-stats', 'Token 用量', BarChart3),
+  actionOption('settings', '设置', Settings),
   { type: 'divider' as const, key: 'd1' },
-  {
-    label: updateInfo.value?.hasUpdate ? `关于 (新版本 ${updateInfo.value.latest})` : '关于',
-    key: 'about',
-    icon: () => h(updateInfo.value?.hasUpdate ? Bell : Info, { size: 16 }),
-  },
+  actionOption(
+    'about',
+    updateInfo.value?.hasUpdate ? `关于 (新版本 ${updateInfo.value.latest})` : '关于',
+    updateInfo.value?.hasUpdate ? Bell : Info,
+  ),
 ])
+
+const actionMenuProps: DropdownMenuProps = () => ({
+  class: 'app-action-menu',
+})
 
 function handleMenuSelect(key: string) {
   switch (key) {
@@ -303,33 +334,12 @@ function jumpToResult(r: SearchResult) {
 function sessionMenuOptions(id: string) {
   const pinned = isPinned(id)
   return [
-    {
-      key: 'pin',
-      label: pinned ? '取消置顶' : '置顶',
-      icon: () => h(pinned ? PinOff : Pin, { size: 14 }),
-    },
-    {
-      key: 'rename',
-      label: '重命名',
-      icon: () => h(Pencil, { size: 14 }),
-    },
+    actionOption('pin', pinned ? '取消置顶' : '置顶', pinned ? PinOff : Pin),
+    actionOption('rename', '重命名', Pencil),
     { type: 'divider' as const, key: 'd' },
-    {
-      key: 'export-md',
-      label: '导出 Markdown',
-      icon: () => h(DownloadIcon, { size: 14 }),
-    },
-    {
-      key: 'export-json',
-      label: '导出 JSON',
-      icon: () => h(DownloadIcon, { size: 14 }),
-    },
+    actionOption('export', '导出对话', FileText),
     { type: 'divider' as const, key: 'd2' },
-    {
-      key: 'delete',
-      label: '归档',
-      icon: () => h(XIcon, { size: 14 }),
-    },
+    actionOption('delete', '归档', Archive, { props: { class: 'app-action-danger' } }),
   ]
 }
 
@@ -344,46 +354,49 @@ function onSessionMenu(key: string, id: string) {
       onDelete(id, new MouseEvent('click'))
       break
     }
-    case 'export-md':
-    case 'export-json': {
-      const fmt = key.slice('export-'.length) as ExportFormat
-      doExport(id, fmt)
+    case 'export': {
+      openExportModal(id)
       break
     }
   }
 }
 
-// downloadSession triggers a server-side export. The
-// rendering lives in pchat-server (internal/export +
-// internal/server.ExportSession) and reads straight
-// from the memory store, so the output is always
-// self-contained — no in-memory blob: URLs to break,
-// no dependency on what the SPA happens to have in
-// memory. The frontend just downloads the response.
+// doExport triggers a server-side export. The rendering
+// lives in pchat-server (internal/export +
+// internal/server.ExportSession) and reads straight from
+// the memory store, so the output is self-contained: no
+// in-memory blob URLs to break, no dependency on what the
+// SPA has hydrated.
 //
 // Format / size guards:
 //   * sessions with > 5k messages show a confirmation
-//     dialog — exporting tens of MB of markdown
-//     synchronously (with attachment data: URLs inlined)
-//     on the main thread will jank the UI. The dialog
+//     dialog. Large HTML/PDF exports can take a few
+//     seconds when attachment data URLs are inlined.
+//     The dialog
 //     uses `useDialog().warning` so the user explicitly
 //     approves.
 //   * filename collisions are deduplicated (-2, -3, …)
 //     by probing the suggested name against an in-memory
 //     set of filenames we've already offered this
-//     session. We can't enumerate the user's downloads
-//     folder, so we just guard against the rapid
-//     double-click case where two exports would
-//     otherwise write the same name.
-//   * the actual download uses a transient <a download>
-//     link + URL.createObjectURL, the standard SPA
-//     pattern.
+//     session.
+//   * Wails desktop uses SaveExportFile, which opens the
+//     OS-native save dialog and writes to the chosen path.
+//     Browser preview falls back to the normal download
+//     link because it cannot write arbitrary local paths.
 
 // Module-level dedup cache. Reset on page reload;
-// that's fine — the worst case is one overwritten file
-// across reloads, and the user can rename in their
-// downloads folder.
+// that's fine — it only guards rapid repeated exports in
+// the same renderer process.
 const recentlyExported = new Set<string>()
+
+const exportTarget = computed(() => state.sessions.find(s => s.id === exportSessionId.value) || null)
+const exportFilename = computed(() => suggestFilename(exportTarget.value?.title || '', exportFormat.value))
+
+function openExportModal(id: string) {
+  exportSessionId.value = id
+  exportFormat.value = 'pdf'
+  showExport.value = true
+}
 
 async function doExport(id: string, format: ExportFormat) {
   try {
@@ -414,10 +427,9 @@ async function doExport(id: string, format: ExportFormat) {
     }
     const title = state.sessions.find(s => s.id === id)?.title ?? ''
     // The server is the source of truth: it reads from
-    // the store, renders to markdown/JSON, and returns
-    // the file with Content-Disposition. The browser
-    // just downloads.
-    const fmtQuery = format === 'json' ? 'json' : 'md'
+    // the store, renders the selected archive format, and
+    // returns the file with Content-Disposition.
+    const fmtQuery = format
     const resp = await fetch(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`, {
       method: 'GET',
     })
@@ -435,6 +447,36 @@ async function doExport(id: string, format: ExportFormat) {
     const baseFilename = serverName || suggestFilename(title, format)
     const filename = dedupeFilename(baseFilename, (p) => recentlyExported.has(p))
     recentlyExported.add(filename)
+    const savedPath = await saveBlobWithPicker(blob, filename, format)
+    if (!savedPath) return
+    message.success(`已导出到 ${savedPath}`)
+    showExport.value = false
+  } catch (e) {
+    console.error('[export] failed:', e)
+    message.error('导出失败: ' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+async function confirmExport() {
+  if (!exportSessionId.value || exportSaving.value) return
+  exportSaving.value = true
+  try {
+    await doExport(exportSessionId.value, exportFormat.value)
+  } finally {
+    exportSaving.value = false
+  }
+}
+
+async function saveBlobWithPicker(blob: Blob, filename: string, format: ExportFormat): Promise<string> {
+  try {
+    const { SaveExportFile } = await import('../../wailsjs/go/main/App')
+    const dataBase64 = await blobToBase64(blob)
+    const path = await SaveExportFile(filename, format, dataBase64)
+    return path || ''
+  } catch (e) {
+    // Browser preview has no Wails binding. Keep a fallback so
+    // the web build remains usable outside the desktop shell.
+    console.warn('[export] Wails save unavailable, falling back to browser download:', e)
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -443,11 +485,21 @@ async function doExport(id: string, format: ExportFormat) {
     a.click()
     document.body.removeChild(a)
     setTimeout(() => URL.revokeObjectURL(url), 1000)
-    message.success(`已导出 ${filename}`)
-  } catch (e) {
-    console.error('[export] failed:', e)
-    message.error('导出失败: ' + (e instanceof Error ? e.message : String(e)))
+    return filename
   }
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const value = String(reader.result || '')
+      const comma = value.indexOf(',')
+      resolve(comma >= 0 ? value.slice(comma + 1) : value)
+    }
+    reader.onerror = () => reject(reader.error || new Error('read export blob failed'))
+    reader.readAsDataURL(blob)
+  })
 }
 
 // parseContentDispositionFilename pulls a usable
@@ -713,21 +765,250 @@ function projectHasStreaming(path: string): boolean {
   return sessions.some(s => !!state.streaming[s.id])
 }
 
+const hasUpdateBlockingWork = computed(() =>
+  Object.keys(state.streaming).length > 0 ||
+  Object.values(state.sessionWorking).some(Boolean) ||
+  Object.values(state.sessionBackgroundSubAgentJobs).some(count => count > 0) ||
+  Object.values(state.sessionBackgroundHookMerging).some(Boolean),
+)
+
 function toggleTheme() {
   themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
 }
 
-function openAbout() {
-  showAbout.value = true
-  checkUpdate().then(info => {
-    if (info) updateInfo.value = info
+function versionLabel(value: string): string {
+  if (!value) return 'v' + APP_VERSION
+  return value.startsWith('v') || value.startsWith('V') ? value : `v${value}`
+}
+
+function updateSizeLabel(size?: number): string {
+  if (!size || size <= 0) return ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = size
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value = value / 1024
+    unit++
+  }
+  const digits = value >= 10 || unit === 0 ? 0 : 1
+  return `${value.toFixed(digits)} ${units[unit]}`
+}
+
+function updatePackageSize(info: UpdateInfo): string {
+  return updateSizeLabel(selectedUpdateArtifact(info)?.size || info.patch?.size || info.full?.size)
+}
+
+function selectedUpdateArtifact(info: UpdateInfo): UpdateArtifact | undefined {
+  return info.artifact || info.patch || info.full
+}
+
+function selectedUpdateURL(info: UpdateInfo): string {
+  return selectedUpdateArtifact(info)?.url || info.url || ''
+}
+
+function updateArtifactLabel(info: UpdateInfo): string {
+  switch (selectedUpdateArtifact(info)?.kind) {
+    case 'patch':
+      return '差分更新包'
+    case 'full':
+      return '全量更新包'
+    default:
+      return '更新压缩包'
+  }
+}
+
+function updateDownloadButtonText(info: UpdateInfo): string {
+  return `下载${updateArtifactLabel(info)}`
+}
+
+function externalUpdateButtonText(info: UpdateInfo): string {
+  return selectedUpdateArtifact(info)?.kind === 'full' ? '下载全量包' : '前往下载'
+}
+
+function updatePackageSummary(info: UpdateInfo): string {
+  const size = updatePackageSize(info)
+  const suffix = size ? ` · ${size}` : ''
+  if (info.installable) return `自动更新将使用 ${updateArtifactLabel(info)}${suffix}`
+  if (!info.patch?.url) return `更新源未返回当前版本可用的差分包，将提供全量包下载${suffix}`
+  return `更新源返回的${updateArtifactLabel(info)}无法自动安装，将前往下载${suffix}`
+}
+
+function fullPackageURL(info: UpdateInfo): string {
+  return info.full?.url || ''
+}
+
+function hasSeparateFullPackage(info: UpdateInfo): boolean {
+  const full = fullPackageURL(info)
+  return !!full && full !== selectedUpdateURL(info)
+}
+
+function updateErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message
+  if (typeof err === 'string' && err) return err
+  return '未知错误'
+}
+
+function notifyUpdateAvailable(info: UpdateInfo) {
+  if (!info.hasUpdate) return
+  const latest = info.latest || APP_VERSION
+  try {
+    if (localStorage.getItem(UPDATE_NOTIFY_KEY) === latest) return
+    localStorage.setItem(UPDATE_NOTIFY_KEY, latest)
+  } catch {
+    // ignore
+  }
+
+  let close: (() => void) | null = null
+  const fullPackageHint = hasSeparateFullPackage(info) ? '，也可下载全量包' : ''
+  const notice = notification.info({
+    title: '发现可用更新',
+    content: `最新版本 ${versionLabel(latest)} 可以更新，关于页可下载${updateArtifactLabel(info)}${fullPackageHint}。`,
+    duration: 8000,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'primary',
+        onClick: () => {
+          close?.()
+          openAbout()
+        },
+      },
+      { default: () => '查看更新' },
+    ),
+  })
+  close = () => notice.destroy()
+}
+
+function notifyDownloadedUpdate(update: UpdateDownloadResult) {
+  const packageLabel = updateArtifactLabel(update)
+  let close: (() => void) | null = null
+  const notice = notification.success({
+    title: `${packageLabel}已下载`,
+    content: `${update.fileName || packageLabel} 已通过校验。点击重启后会自动替换为最新版本 ${versionLabel(update.latest)}。`,
+    duration: 0,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'primary',
+        disabled: updateInstalling.value,
+        onClick: () => {
+          close?.()
+          confirmRestartUpdate(update)
+        },
+      },
+      {
+        icon: () => h(RotateCw, { size: 14 }),
+        default: () => '重启并更新',
+      },
+    ),
+  })
+  close = () => notice.destroy()
+}
+
+async function refreshUpdate(force = false, notify = false) {
+  const info = await checkUpdate(force)
+  if (!info) return
+  updateInfo.value = info
+  if (!info.hasUpdate || info.latest !== downloadedUpdate.value?.latest) {
+    downloadedUpdate.value = null
+  }
+  if (notify) notifyUpdateAvailable(info)
+}
+
+async function openUpdateURL() {
+  const info = updateInfo.value
+  const url = info ? selectedUpdateURL(info) : ''
+  if (!url) {
+    message.warning('当前更新源没有提供下载地址')
+    return
+  }
+  try {
+    await api.openExternalURL(url)
+  } catch (err) {
+    message.error(`打开下载地址失败: ${updateErrorMessage(err)}`)
+  }
+}
+
+async function openFullPackageURL() {
+  const info = updateInfo.value
+  const url = info ? fullPackageURL(info) : ''
+  if (!url) {
+    message.warning('当前更新源没有提供全量包下载地址')
+    return
+  }
+  try {
+    await api.openExternalURL(url)
+  } catch (err) {
+    message.error(`打开全量包下载地址失败: ${updateErrorMessage(err)}`)
+  }
+}
+
+async function openReleasePage() {
+  try {
+    await api.openExternalURL(SOFTWARE_RELEASE_PAGE)
+  } catch (err) {
+    message.error(`打开软件发布页失败: ${updateErrorMessage(err)}`)
+  }
+}
+
+async function onDownloadUpdate() {
+  const info = updateInfo.value
+  if (!info?.hasUpdate) return
+  if (!info.installable) {
+    await openUpdateURL()
+    return
+  }
+
+  updateDownloading.value = true
+  try {
+    const result = await downloadUpdate()
+    downloadedUpdate.value = result
+    updateInfo.value = result
+    notifyDownloadedUpdate(result)
+  } catch (err) {
+    message.error(`下载更新失败: ${updateErrorMessage(err)}`)
+  } finally {
+    updateDownloading.value = false
+  }
+}
+
+function confirmRestartUpdate(update = downloadedUpdate.value) {
+  if (!update) return
+  const busyText = hasUpdateBlockingWork.value
+    ? '当前仍有会话或后台任务运行，重启会中断这些任务。'
+    : ''
+  dialog.warning({
+    title: '重启并更新 P-Chat',
+    content: `${update.fileName || updateArtifactLabel(update)} 已下载并通过校验。${busyText}是否现在重启并替换为最新版本 ${versionLabel(update.latest)}？`,
+    positiveText: '立即重启并更新',
+    negativeText: '稍后',
+    onPositiveClick: () => installUpdateNow(update),
   })
 }
 
+async function installUpdateNow(update = downloadedUpdate.value) {
+  if (!update) return
+  updateInstalling.value = true
+  try {
+    await installDownloadedUpdate(update)
+    message.info('正在重启并更新 P-Chat')
+  } catch (err) {
+    updateInstalling.value = false
+    message.error(`启动更新失败: ${updateErrorMessage(err)}`)
+  }
+}
+
+function openAbout() {
+  showAbout.value = true
+  void refreshUpdate()
+}
+
 onMounted(() => {
-  checkUpdate().then(info => {
-    if (info) updateInfo.value = info
-  })
+  void refreshUpdate(false, true)
 })
 </script>
 
@@ -790,21 +1071,23 @@ onMounted(() => {
             <span class="project-summary-path">{{ activeProjectTab.shortPath }}</span>
           </span>
         </div>
-        <NSpace size="small">
+        <div class="sidebar-actions">
           <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'" aria-label="切换主题">
             <component :is="themeName === 'dark' ? Sun : Moon" :size="16" />
           </NButton>
           <NDropdown
             trigger="click"
             placement="bottom-end"
+            size="small"
             :options="menuOptions"
+            :menu-props="actionMenuProps"
             @select="(key) => handleMenuSelect(String(key))"
           >
             <NButton size="small" quaternary title="更多" aria-label="更多">
               <MoreHorizontal :size="16" />
             </NButton>
           </NDropdown>
-        </NSpace>
+        </div>
       </div>
 
       <!-- Search bar (filters across all sessions in current project). -->
@@ -871,7 +1154,17 @@ onMounted(() => {
                     <span v-if="isPinned(s.id)" class="item-pin" :title="'已置顶'" aria-label="已置顶">
                       <Pin :size="11" />
                     </span>
-                    <span class="item-title">{{ s.title || '(无标题)' }}</span>
+                    <span
+                      v-if="sessionSourceFromID(s.id)"
+                      class="item-source-badge"
+                      :class="`item-source-badge--${sessionSourceFromID(s.id)?.platform}`"
+                      :title="sessionSourceTitle(s.id)"
+                      :aria-label="sessionSourceTitle(s.id)"
+                    >
+                      <MessageSquare :size="10" />
+                      <span>{{ sessionSourceFromID(s.id)?.label }}</span>
+                    </span>
+                    <span class="item-title">{{ sessionDisplayTitle(s) }}</span>
                     <span v-if="state.streaming[s.id]" class="streaming-dot" title="正在生成" aria-label="正在生成">
                       <Circle :size="7" fill="currentColor" />
                     </span>
@@ -882,7 +1175,9 @@ onMounted(() => {
                       :ref="bindSessionMenuRef(s.id)"
                       trigger="click"
                       placement="bottom-end"
+                      size="small"
                       :options="sessionMenuOptions(s.id)"
+                      :menu-props="actionMenuProps"
                       @select="(key) => onSessionMenu(String(key), s.id)"
                     >
                       <button
@@ -1028,10 +1323,55 @@ onMounted(() => {
       </template>
     </AppModal>
 
+    <AppModal
+      v-model:show="showExport"
+      title="导出对话"
+      size="md"
+      accent-top
+    >
+      <div class="export-dialog">
+        <div class="export-session">
+          <span class="export-session-label">会话</span>
+          <strong>{{ exportTarget?.title || '未命名会话' }}</strong>
+          <code>{{ exportFilename }}</code>
+        </div>
+        <div class="export-format-grid">
+          <button
+            type="button"
+            class="export-format-card"
+            :class="{ active: exportFormat === 'pdf' }"
+            @click="exportFormat = 'pdf'"
+          >
+            <span class="export-format-icon"><File :size="18" /></span>
+            <span class="export-format-main">
+              <strong>PDF</strong>
+              <span>分页归档，适合发送和长期保存</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            class="export-format-card"
+            :class="{ active: exportFormat === 'html' }"
+            @click="exportFormat = 'html'"
+          >
+            <span class="export-format-icon"><FileText :size="18" /></span>
+            <span class="export-format-main">
+              <strong>HTML</strong>
+              <span>保留更完整样式，适合浏览器查看和打印</span>
+            </span>
+          </button>
+        </div>
+      </div>
+      <template #footer>
+        <NButton size="small" :disabled="exportSaving" @click="showExport = false">取消</NButton>
+        <NButton size="small" type="primary" :loading="exportSaving" @click="confirmExport">选择路径并保存</NButton>
+      </template>
+    </AppModal>
+
     <NModal v-model:show="showAbout" preset="card" title="关于 P-Chat" style="width: 380px">
       <div class="about-body">
         <p class="about-name">P-Chat</p>
-        <p class="about-version">版本 v{{ APP_VERSION }}</p>
+        <p class="about-version">版本 {{ versionLabel(updateInfo?.current || APP_VERSION) }}</p>
         <p class="about-desc">对话式 AI Agent · CLI / HTTP / 桌面端三端同源</p>
         <p class="about-desc">Go + Vue 3 + Vite + SQLite · Wails v2</p>
         <p class="about-desc">OpenAI / Anthropic 双协议 · ReAct 工具调用循环</p>
@@ -1039,11 +1379,67 @@ onMounted(() => {
         <template v-if="updateInfo">
           <div v-if="updateInfo.hasUpdate" class="update-banner">
             <NTag type="warning" size="small">发现新版本</NTag>
-            <p>发现新版本 <strong>{{ updateInfo.latest }}</strong> · 当前 {{ APP_VERSION }}</p>
+            <p>最新版本 <strong>{{ versionLabel(updateInfo.latest) }}</strong></p>
             <p class="update-body" v-if="updateInfo.body">{{ updateInfo.body }}</p>
-            <NButton size="small" type="primary" tag="a" :href="updateInfo.url" target="_blank">前往下载</NButton>
+            <p class="update-meta">{{ updatePackageSummary(updateInfo) }}</p>
+            <p class="update-meta" v-if="hasSeparateFullPackage(updateInfo)">
+              也可下载全量包，或打开软件发布页选择需要的软件包。
+            </p>
+            <p class="update-meta" v-if="downloadedUpdate">
+              已下载 {{ downloadedUpdate.fileName || updateArtifactLabel(downloadedUpdate) }}，重启后会自动替换为最新版本。
+            </p>
+            <div class="update-actions">
+              <NButton
+                v-if="downloadedUpdate"
+                size="small"
+                type="primary"
+                :loading="updateInstalling"
+                :disabled="updateDownloading"
+                @click="confirmRestartUpdate()"
+              >
+                <template #icon><RotateCw :size="14" /></template>
+                立即重启并更新
+              </NButton>
+              <NButton
+                v-else-if="updateInfo.installable"
+                size="small"
+                type="primary"
+                :loading="updateDownloading"
+                :disabled="updateInstalling"
+                @click="onDownloadUpdate"
+              >
+                <template #icon><Download :size="14" /></template>
+                {{ updateDownloadButtonText(updateInfo) }}
+              </NButton>
+              <NButton
+                v-else
+                size="small"
+                type="primary"
+                @click="openUpdateURL"
+              >
+                <template #icon><ExternalLink :size="14" /></template>
+                {{ externalUpdateButtonText(updateInfo) }}
+              </NButton>
+              <NButton
+                v-if="hasSeparateFullPackage(updateInfo)"
+                size="small"
+                secondary
+                @click="openFullPackageURL"
+              >
+                <template #icon><ExternalLink :size="14" /></template>
+                下载全量包
+              </NButton>
+              <NButton
+                size="small"
+                quaternary
+                @click="openReleasePage"
+              >
+                <template #icon><Globe :size="14" /></template>
+                软件发布页
+              </NButton>
+            </div>
           </div>
-          <p v-else class="update-ok">当前已是最新版本 {{ APP_VERSION }}</p>
+          <p v-else class="update-ok">当前已是最新版本 {{ versionLabel(updateInfo.current || APP_VERSION) }}</p>
         </template>
         <p v-else class="update-ok">正在检查更新…</p>
 
@@ -1070,11 +1466,19 @@ onMounted(() => {
 <style scoped>
 .sidebar {
   width: 320px;
+  min-width: 0;
   background: var(--surface-1);
   border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-shrink: 0;
-  transition: width var(--dur-base) var(--ease-out);
+  overflow: hidden;
+  transition: width var(--dur-slow) var(--ease-in-out),
+              border-color var(--dur-slow) var(--ease-in-out);
+}
+.sidebar.sidebar-collapsed {
+  width: 0;
+  border-right-color: transparent;
+  pointer-events: none;
 }
 
 /* --- Project rail ------------------------------------------------------ */
@@ -1186,6 +1590,7 @@ onMounted(() => {
 }
 .project-summary {
   min-width: 0;
+  flex: 1 1 auto;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -1209,7 +1614,6 @@ onMounted(() => {
 }
 .project-summary-name {
   min-width: 0;
-  max-width: 150px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1220,7 +1624,6 @@ onMounted(() => {
 }
 .project-summary-path {
   min-width: 0;
-  max-width: 150px;
   color: var(--text-tertiary);
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1228,6 +1631,17 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.sidebar-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+.sidebar-actions :deep(.n-button) {
+  flex: 0 0 auto;
 }
 
 /* --- Search bar -------------------------------------------------------- */
@@ -1335,7 +1749,28 @@ onMounted(() => {
   flex-shrink: 0;
   display: inline-flex;
 }
+.item-source-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--brand-50);
+  color: var(--brand-600);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.item-source-badge svg {
+  flex-shrink: 0;
+}
+.item-source-badge--wechat {
+  background: var(--success-50);
+  color: var(--success-500);
+}
 .item-title {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1412,31 +1847,14 @@ onMounted(() => {
 }
 .older-toggle:hover { color: var(--text-primary); background: var(--surface-3); }
 
-/* --- Per-session NDropdown style overrides --------------------------- */
-/* NDropdown teleports the menu to body, so scoped styles don't
- * reach it. NDropdown already styles its options reasonably
- * (uses our --text-primary etc. via the theme overrides), but
- * we tighten the icon-text gap and the hover background to
- * match the rest of the sidebar. */
-:deep(.n-dropdown-option) {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-:deep(.n-dropdown-option .n-dropdown-option-body__prefix) {
-  width: 14px;
-  height: 14px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-tertiary);
-}
+/* Session / project NDropdowns teleport to <body>; their layout
+ * lives on the shared `.app-action-menu` class in style.css. */
 
 /* --- Search results --------------------------------------------------- */
 .search-results { padding: 8px; }
 .search-result-item {
   padding: 10px 12px; margin-bottom: 6px; border-radius: 6px;
-  cursor: pointer; background: var(--surface-2); transition: background 0.1s;
+  cursor: pointer; background: var(--surface-2); transition: background var(--dur-fast) var(--ease-out);
 }
 .search-result-item:hover { background: var(--surface-3); }
 .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
@@ -1506,20 +1924,123 @@ onMounted(() => {
   font-size: 12px;
   line-height: 1.35;
 }
+.export-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.export-session {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.export-session-label {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+}
+.export-session strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.export-session code {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.export-format-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+.export-format-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition-colors),
+              transform var(--dur-fast) var(--ease-out);
+}
+.export-format-card:hover {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  transform: translateY(-1px);
+}
+.export-format-card.active {
+  border-color: var(--brand-500);
+  background: var(--brand-50);
+  color: var(--text-primary);
+}
+.export-format-icon {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--brand-500);
+}
+.export-format-card.active .export-format-icon {
+  background: var(--brand-100);
+}
+.export-format-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.export-format-main strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.3;
+}
+.export-format-main span {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+@media (max-width: 520px) {
+  .export-format-grid {
+    grid-template-columns: 1fr;
+  }
+}
 .about-body { padding: 4px 0; }
 .about-name { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
 .about-version { font-size: 13px; color: var(--text-tertiary); margin: 0 0 12px; }
 .about-desc { font-size: 13px; color: var(--text-secondary); margin: 0 0 4px; }
 .update-banner {
-  margin: 12px 0;
-  padding: 12px;
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
   background: var(--warn-50);
   border: 1px solid var(--warn-500);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
-.update-banner p { margin: 4px 0; font-size: 13px; }
+.update-banner p { margin: var(--space-1) 0; font-size: 13px; }
 .update-body { color: var(--text-tertiary); font-size: 12px !important; max-height: 120px; overflow: auto; white-space: pre-wrap; }
-.update-ok { font-size: 13px; color: var(--text-tertiary); margin: 12px 0; }
+.update-meta { color: var(--text-tertiary); font-size: 12px !important; }
+.update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.update-ok { font-size: 13px; color: var(--text-tertiary); margin: var(--space-3) 0; }
 
 /* Usage documentation button — primary action of the About dialog.
  * Brand-filled so it reads as the main thing to do here. */

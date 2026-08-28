@@ -2,7 +2,7 @@
 //
 // Architecture:
 //   - This is a Wails v2 app that opens a WebView2 window.
-//   - On startup, it spawns pchat-server.exe as a child process on a
+//   - On startup, it spawns pchat-server as a child process on a
 //     stable preferred port on 127.0.0.1, falling back only if needed.
 //   - The webview serves ALL content from a reverse proxy: when the user
 //     navigates to http://wails.localhost/..., we forward the request to
@@ -26,6 +26,7 @@
 //	%LOCALAPPDATA%\Programs\P-Chat\
 //	鈹溾攢鈹€ pchat-gui.exe        (this binary)
 //	鈹溾攢鈹€ pchat-server.exe     (the HTTP API + web UI)
+//	鈹溾攢鈹€ pchat-updater.exe    (standalone self-update applier)
 //	鈹溾攢鈹€ install.ps1
 //	鈹斺攢鈹€ uninstall.ps1
 package main
@@ -34,6 +35,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -267,6 +271,124 @@ func (a *App) OpenTerminal(path string) {
 func (a *App) OpenURL(rawURL string) {
 	if err := openExternalURL(rawURL); err != nil {
 		log.Printf("OpenURL %q: %v", rawURL, err)
+	}
+}
+
+// InstallUpdate starts the standalone updater and exits this GUI so the
+// updater can replace files in the install directory.
+func (a *App) InstallUpdate(packagePath string, expectedSHA256 string) error {
+	pkg, err := validateUpdatePackage(packagePath, expectedSHA256)
+	if err != nil {
+		return err
+	}
+	updater, err := findUpdaterBinary()
+	if err != nil {
+		return err
+	}
+	updaterRunner, err := stageUpdaterBinary(updater)
+	if err != nil {
+		return err
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve gui executable: %w", err)
+	}
+	installDir, launch := updateTargetForExecutable(exe)
+	logPath := filepath.Join(resolveHomeDir(), "updates", "update.log")
+	args := []string{
+		"--install-dir", installDir,
+		"--package", pkg,
+		"--launch", launch,
+		"--parent-pid", strconv.Itoa(os.Getpid()),
+		"--log", logPath,
+	}
+	if strings.TrimSpace(expectedSHA256) != "" {
+		args = append(args, "--expected-sha256", strings.ToLower(strings.TrimSpace(expectedSHA256)))
+	}
+	cmd := exec.Command(updaterRunner, args...)
+	cmd.Dir = installDir
+	hideChildConsole(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start updater: %w", err)
+	}
+	log.Printf("started pchat-updater pid=%d runner=%s package=%s install_dir=%s", cmd.Process.Pid, updaterRunner, pkg, installDir)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		a.quitApp()
+	}()
+	return nil
+}
+
+func updateTargetForExecutable(exe string) (string, string) {
+	return updateTargetForExecutableOS(exe, runtime.GOOS)
+}
+
+func updateTargetForExecutableOS(exe string, goos string) (string, string) {
+	dir := filepath.Dir(exe)
+	launch := filepath.Base(exe)
+	if goos != "darwin" {
+		return dir, launch
+	}
+	contentsDir := filepath.Dir(dir)
+	appDir := filepath.Dir(contentsDir)
+	if filepath.Base(dir) == "MacOS" &&
+		filepath.Base(contentsDir) == "Contents" &&
+		strings.HasSuffix(strings.ToLower(filepath.Base(appDir)), ".app") {
+		return appDir, filepath.Join("Contents", "MacOS", launch)
+	}
+	return dir, launch
+}
+
+// SaveExportFile opens the OS-native save dialog and writes an exported
+// conversation file to the selected path. The frontend passes base64 so
+// binary PDF bytes and text HTML/Markdown bytes can share one binding.
+func (a *App) SaveExportFile(defaultFilename string, format string, dataBase64 string) (string, error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("wails context is not ready")
+	}
+	data, err := base64.StdEncoding.DecodeString(dataBase64)
+	if err != nil {
+		return "", fmt.Errorf("decode export data: %w", err)
+	}
+	ext, filters := exportFileDialogFilters(format)
+	if defaultFilename == "" {
+		defaultFilename = "pchat-export." + ext
+	}
+	defaultFilename = filepath.Base(defaultFilename)
+	if filepath.Ext(defaultFilename) == "" {
+		defaultFilename += "." + ext
+	}
+	path, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
+		Title:                "保存对话导出",
+		DefaultFilename:      defaultFilename,
+		CanCreateDirectories: true,
+		Filters:              filters,
+	})
+	if err != nil {
+		return "", fmt.Errorf("save dialog: %w", err)
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", nil
+	}
+	if filepath.Ext(path) == "" {
+		path += "." + ext
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("write export file: %w", err)
+	}
+	return path, nil
+}
+
+func exportFileDialogFilters(format string) (string, []wailsruntime.FileFilter) {
+	switch strings.ToLower(format) {
+	case "pdf":
+		return "pdf", []wailsruntime.FileFilter{{DisplayName: "PDF 文档 (*.pdf)", Pattern: "*.pdf"}}
+	case "html", "htm":
+		return "html", []wailsruntime.FileFilter{{DisplayName: "HTML 文档 (*.html)", Pattern: "*.html;*.htm"}}
+	case "markdown", "md":
+		return "md", []wailsruntime.FileFilter{{DisplayName: "Markdown 文档 (*.md)", Pattern: "*.md;*.markdown"}}
+	default:
+		return "bin", []wailsruntime.FileFilter{{DisplayName: "所有文件 (*.*)", Pattern: "*.*"}}
 	}
 }
 
@@ -525,6 +647,88 @@ func openExternalURL(rawURL string) error {
 	}
 	hideChildConsole(cmd)
 	return cmd.Start()
+}
+
+func validateUpdatePackage(packagePath string, expectedSHA256 string) (string, error) {
+	pkg := strings.TrimSpace(packagePath)
+	if pkg == "" {
+		return "", fmt.Errorf("update package path is empty")
+	}
+	abs, err := filepath.Abs(pkg)
+	if err != nil {
+		return "", fmt.Errorf("resolve update package: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("stat update package: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("update package is a directory: %s", abs)
+	}
+	if !strings.EqualFold(filepath.Ext(abs), ".zip") {
+		return "", fmt.Errorf("update package must be a zip file: %s", abs)
+	}
+	expectedSHA256 = strings.ToLower(strings.TrimSpace(expectedSHA256))
+	if expectedSHA256 == "" {
+		return abs, nil
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return "", fmt.Errorf("open update package: %w", err)
+	}
+	defer f.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return "", fmt.Errorf("hash update package: %w", err)
+	}
+	got := hex.EncodeToString(hash.Sum(nil))
+	if got != expectedSHA256 {
+		return "", fmt.Errorf("update package sha256 mismatch: got %s, want %s", got, expectedSHA256)
+	}
+	return abs, nil
+}
+
+func stageUpdaterBinary(updaterPath string) (string, error) {
+	src := strings.TrimSpace(updaterPath)
+	if src == "" {
+		return "", fmt.Errorf("updater path is empty")
+	}
+	abs, err := filepath.Abs(src)
+	if err != nil {
+		return "", fmt.Errorf("resolve updater path: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("stat updater binary: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("updater path is a directory: %s", abs)
+	}
+	runnerDir := filepath.Join(resolveHomeDir(), "updates", "runner")
+	if err := os.MkdirAll(runnerDir, 0o755); err != nil {
+		return "", fmt.Errorf("create updater runner dir: %w", err)
+	}
+	dst := filepath.Join(runnerDir, fmt.Sprintf("pchat-updater-%d%s", os.Getpid(), filepath.Ext(abs)))
+	in, err := os.Open(abs)
+	if err != nil {
+		return "", fmt.Errorf("open updater binary: %w", err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+	if err != nil {
+		return "", fmt.Errorf("create updater runner: %w", err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return "", fmt.Errorf("copy updater runner: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return "", fmt.Errorf("close updater runner: %w", err)
+	}
+	if err := os.Chmod(dst, info.Mode()); err != nil {
+		return "", fmt.Errorf("chmod updater runner: %w", err)
+	}
+	return dst, nil
 }
 
 func writeLoading(w http.ResponseWriter) {
@@ -803,7 +1007,7 @@ func (t *dialFallbackTransport) RoundTrip(req *http.Request) (*http.Response, er
 	}, nil
 }
 
-// startup is called when the app starts. We spawn pchat-server.exe in a
+// startup is called when the app starts. We spawn pchat-server in a
 // background goroutine and install the reverse proxy once it's healthy,
 // at which point we also show the window.
 func (a *App) startup(ctx context.Context) {
@@ -1005,7 +1209,7 @@ func (a *App) quitApp() {
 
 // ---------- server spawning ----------
 
-// spawnAndWatch locates pchat-server.exe, picks a preferred port, starts it
+// spawnAndWatch locates pchat-server, picks a preferred port, starts it
 // as a child process, installs the reverse proxy, waits for it to be
 // healthy, and finally shows the window.
 func (a *App) spawnAndWatch() {
@@ -1123,20 +1327,42 @@ func (a *App) spawnAndWatch() {
 	a.showMainWindow()
 }
 
-// findServerBinary searches common locations for pchat-server.exe, in order:
-//  1. The directory of the running pchat-gui.exe
+// serverBinaryName 返回当前平台的 pchat-server 文件名。
+// serverBinaryName returns the platform-native pchat-server filename.
+func serverBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "pchat-server.exe"
+	}
+	return "pchat-server"
+}
+
+// serverBinaryCandidates 返回从 GUI 可执行文件目录推导出的后端候选路径。
+// serverBinaryCandidates returns backend candidates derived from the GUI executable dir.
+func serverBinaryCandidates(dir string) []string {
+	name := serverBinaryName()
+	candidates := []string{
+		filepath.Join(dir, name),
+		filepath.Join(dir, "..", name),
+		filepath.Join(dir, "..", "..", name),
+	}
+	if runtime.GOOS == "darwin" {
+		// macOS .app: GUI 在 Contents/MacOS，附带二进制放在 Resources。
+		// macOS .app: pchat-gui lives in Contents/MacOS; side binaries live in Resources.
+		candidates = append([]string{filepath.Join(dir, "..", "Resources", name)}, candidates...)
+	}
+	return candidates
+}
+
+// findServerBinary 按平台查找 GUI 要拉起的后端二进制。
+// findServerBinary searches common locations for the platform server binary, in order:
+//  1. The directory of the running pchat-gui binary
 //  2. The repository `bin/` directory (from CWD — covers `wails dev`)
 //  3. PATH
 func findServerBinary() (string, error) {
 	// Resolve from executable directory first.
 	if exe, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exe)
-		candidates := []string{
-			filepath.Join(dir, "pchat-server.exe"),
-			filepath.Join(dir, "..", "pchat-server.exe"),
-			filepath.Join(dir, "..", "..", "pchat-server.exe"),
-		}
-		for _, c := range candidates {
+		for _, c := range serverBinaryCandidates(dir) {
 			if _, statErr := os.Stat(c); statErr == nil {
 				abs, _ := filepath.Abs(c)
 				log.Printf("findServerBinary: found at %s (exe=%s)", abs, exe)
@@ -1149,12 +1375,12 @@ func findServerBinary() (string, error) {
 	// the exe-relative candidates above miss the project's bin/.
 	// Fall back to CWD-relative search.
 	if cwd, err := os.Getwd(); err == nil {
-		// Walk up to 5 levels looking for bin/pchat-server.exe
+		// Walk up to 5 levels looking for bin/<server binary>
 		// to cover wails dev (CWD=cmd/pchat-gui) and running
 		// from anywhere in the project tree.
 		d := cwd
 		for i := 0; i < 5; i++ {
-			cand := filepath.Join(d, "bin", "pchat-server.exe")
+			cand := filepath.Join(d, "bin", serverBinaryName())
 			if _, statErr := os.Stat(cand); statErr == nil {
 				abs, _ := filepath.Abs(cand)
 				log.Printf("findServerBinary: found at %s (cwd=%s, levels=%d)", abs, cwd, i)
@@ -1168,11 +1394,67 @@ func findServerBinary() (string, error) {
 		}
 	}
 
-	if path, err := exec.LookPath("pchat-server.exe"); err == nil {
+	name := serverBinaryName()
+	if path, err := exec.LookPath(name); err == nil {
 		log.Printf("findServerBinary: found in PATH: %s", path)
 		return path, nil
 	}
-	return "", fmt.Errorf("pchat-server.exe not found next to pchat-gui.exe and not in PATH")
+	return "", fmt.Errorf("%s not found next to pchat-gui and not in PATH", name)
+}
+
+func updaterBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "pchat-updater.exe"
+	}
+	return "pchat-updater"
+}
+
+func updaterBinaryCandidates(dir string) []string {
+	name := updaterBinaryName()
+	candidates := []string{
+		filepath.Join(dir, name),
+		filepath.Join(dir, "..", name),
+		filepath.Join(dir, "..", "..", name),
+	}
+	if runtime.GOOS == "darwin" {
+		candidates = append([]string{filepath.Join(dir, "..", "Resources", name)}, candidates...)
+	}
+	return candidates
+}
+
+func findUpdaterBinary() (string, error) {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, c := range updaterBinaryCandidates(dir) {
+			if _, statErr := os.Stat(c); statErr == nil {
+				abs, _ := filepath.Abs(c)
+				log.Printf("findUpdaterBinary: found at %s (exe=%s)", abs, exe)
+				return abs, nil
+			}
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		d := cwd
+		for i := 0; i < 5; i++ {
+			cand := filepath.Join(d, "bin", updaterBinaryName())
+			if _, statErr := os.Stat(cand); statErr == nil {
+				abs, _ := filepath.Abs(cand)
+				log.Printf("findUpdaterBinary: found at %s (cwd=%s, levels=%d)", abs, cwd, i)
+				return abs, nil
+			}
+			parent := filepath.Dir(d)
+			if parent == d {
+				break
+			}
+			d = parent
+		}
+	}
+	name := updaterBinaryName()
+	if path, err := exec.LookPath(name); err == nil {
+		log.Printf("findUpdaterBinary: found in PATH: %s", path)
+		return path, nil
+	}
+	return "", fmt.Errorf("%s not found next to pchat-gui and not in PATH", name)
 }
 
 const (

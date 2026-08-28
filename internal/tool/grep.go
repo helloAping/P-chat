@@ -76,11 +76,34 @@ func makeGrepHandler(cfg *config.Config) ToolHandler {
 		// Search the working directory (project root).
 		searchDir := root
 		if a.Path != "" {
-			searchDir = filepath.Join(root, a.Path)
+			if filepath.IsAbs(a.Path) {
+				searchDir = filepath.Clean(a.Path)
+			} else {
+				searchDir = filepath.Clean(filepath.Join(root, a.Path))
+			}
+			if !pathInsideRoot(searchDir, root) {
+				return &CallResult{Content: "path 超出项目根目录，已拒绝搜索", IsError: true}, nil
+			}
 		}
 		results := grepWorkingDir(ctx, searchDir, root, a.Pattern, a.CaseSensitive, a.TopK)
 		return formatGrepResults(a.Pattern, results), nil
 	}
+}
+
+// pathInsideRoot reports whether path equals or is contained in root
+// after cleaning. Absolute path arguments are accepted only when they
+// stay inside the project.
+func pathInsideRoot(path, root string) bool {
+	if path == "" || root == "" {
+		return false
+	}
+	cleanPath := filepath.Clean(path)
+	cleanRoot := filepath.Clean(root)
+	rel, err := filepath.Rel(cleanRoot, cleanPath)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // grepWorkingDir walks searchDir (which must be under root) and returns

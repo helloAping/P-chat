@@ -18,17 +18,17 @@ import (
 // uploadKind classifies an uploaded file for the UI. The LLM layer
 // uses this to decide how to feed the file to the model:
 //
-//   image  → OpenAI image_url content block (vision)
-//   audio  → text marker (no native audio wire block in the
-//            adapters yet — see ExpandAttachmentsCM)
-//   video  → text marker (no native video wire block in any
-//            adapter today; rendered in the chat bubble as a
-//            <video> element so the user can still preview it)
-//   text   → text/* or anything we can read as text; appended to
-//            the user message as a code-fenced block
-//   file   → unknown binary; also appended as a textual marker
-//            "filename: <name>, size: N" so the model at least
-//            knows the user attached something.
+//	image  → OpenAI image_url content block (vision)
+//	audio  → text marker (no native audio wire block in the
+//	         adapters yet — see ExpandAttachmentsCM)
+//	video  → text marker (no native video wire block in any
+//	         adapter today; rendered in the chat bubble as a
+//	         <video> element so the user can still preview it)
+//	text   → text/* or anything we can read as text; appended to
+//	         the user message as a code-fenced block
+//	file   → unknown binary; also appended as a textual marker
+//	         "filename: <name>, size: N" so the model at least
+//	         knows the user attached something.
 type uploadKind string
 
 const (
@@ -175,6 +175,11 @@ func (h *Handler) Upload(c *gin.Context) {
 	if err != nil {
 		_ = os.Remove(stored)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write: " + err.Error()})
+		return
+	}
+	if written == 0 {
+		_ = os.Remove(stored)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "empty file"})
 		return
 	}
 

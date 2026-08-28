@@ -203,7 +203,7 @@ onBeforeUnmount(() => {
         </NTag>
       </div>
 
-      <NCollapse default-expanded-names="monitor" class="form-collapse">
+      <NCollapse default-expanded-names="monitor" class="settings-collapse settings-collapse--inset">
         <NCollapseItem title="内存监控" name="monitor">
           <div class="form-grid">
             <div class="form-row">
@@ -329,14 +329,10 @@ onBeforeUnmount(() => {
   border-radius: 4px;
 }
 
-.form-collapse {
-  margin-top: 4px;
-}
-
 .form-grid {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 0;
 }
 
 .form-row {
@@ -344,17 +340,27 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  padding: 10px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.form-row:first-child {
+  border-top: none;
+  padding-top: 2px;
 }
 
 .form-label {
   width: 150px;
   flex-shrink: 0;
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-primary);
 }
 
 .form-hint {
-  font-size: 11px;
-  opacity: 0.6;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
 }
 
 .status-val {

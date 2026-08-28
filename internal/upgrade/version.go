@@ -41,7 +41,12 @@ const (
 	// missing values, so no data migration is required.
 	V5 AppVersion = 5
 
+	// V6 — vision_recognition added to config and per-session
+	// image-recognition metadata. JSON fields are backward compatible
+	// and Normalize() handles missing values, so no data migration is required.
+	V6 AppVersion = 6
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V5
+	Current AppVersion = V6
 )

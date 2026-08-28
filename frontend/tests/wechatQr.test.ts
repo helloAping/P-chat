@@ -4,6 +4,8 @@ import test from 'node:test'
 import {
   hasWeChatQRPayload,
   isWeChatQRImageSource,
+  isTerminalWeChatQRStatus,
+  isWeChatQRSessionMissingMessage,
   resolveWeChatQRImageSource,
   resolveWeChatQRValue,
 } from '../src/im/wechatQr.ts'
@@ -67,4 +69,20 @@ test('resolveWeChatQRValue falls back to QR payload for local rendering', () => 
 test('hasWeChatQRPayload reports QR data even when it is not image-renderable', () => {
   assert.equal(hasWeChatQRPayload({ id: 'qr-1', status: 'waiting', qr_data: 'raw-token', poll_after_ms: 2000 }), true)
   assert.equal(hasWeChatQRPayload({ id: '', status: 'waiting', poll_after_ms: 2000 }), false)
+})
+
+test('terminal wechat QR statuses stop polling', () => {
+  assert.equal(isTerminalWeChatQRStatus('confirmed'), true)
+  assert.equal(isTerminalWeChatQRStatus('confirmed_without_token'), true)
+  assert.equal(isTerminalWeChatQRStatus('expired'), true)
+  assert.equal(isTerminalWeChatQRStatus('canceled'), true)
+  assert.equal(isTerminalWeChatQRStatus('unavailable'), true)
+  assert.equal(isTerminalWeChatQRStatus('waiting'), false)
+  assert.equal(isTerminalWeChatQRStatus('scanned'), false)
+})
+
+test('wechat QR session missing errors are terminal', () => {
+  assert.equal(isWeChatQRSessionMissingMessage('wechat qr session not found'), true)
+  assert.equal(isWeChatQRSessionMissingMessage('二维码会话不存在'), true)
+  assert.equal(isWeChatQRSessionMissingMessage('微信扫码服务暂时无法访问，请检查网络后重试'), false)
 })

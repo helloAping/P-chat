@@ -15,6 +15,7 @@ test('conversation turn owns stream dispatch, completion, and recovery', () => {
   assert.match(source, /appendStreamEvent\(input\.sessionId, event\)/)
   assert.match(source, /endStream\(input\.sessionId, ctrl\)/)
   assert.match(source, /recoverMissingParts\(input\.sessionId, drop\.lastSeq, drop\.reason\)/)
+  assert.match(source, /if \(drop && !ctrl\.signal\.aborted\)/)
 })
 
 test('input delegates chat streaming to the conversation turn seam', () => {

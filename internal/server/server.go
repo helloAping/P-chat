@@ -154,6 +154,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	{
 		api.GET("/health", h.Health)
 		api.GET("/version", h.VersionHandler)
+		api.GET("/updates/check", h.CheckUpdate)
+		api.POST("/updates/download", h.DownloadUpdate)
 		api.GET("/migrations", h.MigrationStatus)
 		api.POST("/migrations/rollback", h.MigrationRollback)
 		api.GET("/styles", h.Styles)
@@ -170,6 +172,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/providers", h.Providers)
 		api.GET("/providers/:name", h.GetProvider)
 		api.POST("/providers", h.AddProvider)
+		// Probe before a provider exists (add-provider dialog).
+		api.POST("/providers/probe-models", h.ProbeUpstreamModels)
 		api.DELETE("/providers/:name", h.DeleteProvider)
 		api.PATCH("/providers/:name", h.UpdateProvider)
 		api.POST("/providers/:name/default", h.SetDefaultProvider)
@@ -270,6 +274,10 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)
 		api.GET("/sessions/:id/todos", h.GetTodos)
 		api.DELETE("/sessions/:id/todos", h.ClearTodos)
+		api.GET("/sessions/:id/subagent-jobs", h.ListSubagentJobs)
+		api.GET("/sessions/:id/subagent-jobs/events", h.SubagentJobEvents)
+		api.GET("/sessions/:id/subagent-jobs/:task_id", h.GetSubagentJob)
+		api.POST("/sessions/:id/subagent-jobs/:task_id/cancel", h.CancelSubagentJob)
 		api.POST("/sessions/:id/question-response", h.QuestionResponse)
 		api.POST("/sessions/:id/confirm-response", h.ConfirmResponse)
 		api.POST("/sessions/:id/execute-plan", h.ExecutePlan)
@@ -316,6 +324,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/mcp/servers", h.ListMCPServers)
 		api.POST("/mcp/servers", h.AddMCPServer)
 		api.DELETE("/mcp/servers/:name", h.RemoveMCPServer)
+		api.POST("/mcp/servers/:name/start", h.StartMCPServer)
+		api.POST("/mcp/servers/:name/stop", h.StopMCPServer)
 		api.POST("/mcp/servers/:name/restart", h.RestartMCPServer)
 		api.PATCH("/mcp/global", h.SetMCPGlobal)
 

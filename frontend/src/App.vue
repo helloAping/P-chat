@@ -60,6 +60,25 @@ function readFontFamily(): string {
   return v || 'system-ui, sans-serif'
 }
 
+// Motion curves used by Naive UI's built-in transitions
+// (dropdowns, drawers, tooltips, NModal). Read from the
+// same CSS tokens as the hand-rolled Vue <Transition>s so
+// the two families settle on the same timing language.
+function readMotion(): { easeOut: string; easeIn: string; easeInOut: string } {
+  const fallback = {
+    easeOut: 'cubic-bezier(0.16, 1, 0.3, 1)',
+    easeIn: 'cubic-bezier(0.4, 0, 1, 1)',
+    easeInOut: 'cubic-bezier(0.4, 0, 0.2, 1)',
+  }
+  if (typeof window === 'undefined') return fallback
+  const cs = getComputedStyle(document.documentElement)
+  return {
+    easeOut: cs.getPropertyValue('--ease-out').trim() || fallback.easeOut,
+    easeIn: cs.getPropertyValue('--ease-in').trim() || fallback.easeIn,
+    easeInOut: cs.getPropertyValue('--ease-in-out').trim() || fallback.easeInOut,
+  }
+}
+
 // Apply the chosen theme to <html data-theme=…> so the CSS
 // variables in style.css cascade into all components.
 function applyDocumentTheme(name: 'dark' | 'light') {
@@ -79,6 +98,7 @@ const themeOverrides = computed(() => {
   const _t = themeName.value
   void _t
   const brand = readBrand()
+  const motion = readMotion()
   return {
     common: {
       primaryColor: brand,
@@ -86,6 +106,9 @@ const themeOverrides = computed(() => {
       primaryColorPressed: brand,
       primaryColorSuppl: brand,
       fontFamily: readFontFamily(),
+      cubicBezierEaseOut: motion.easeOut,
+      cubicBezierEaseIn: motion.easeIn,
+      cubicBezierEaseInOut: motion.easeInOut,
     },
   }
 })
@@ -139,10 +162,10 @@ onMounted(async () => {
   // sidebar needs it.
   ;(window as any).openAppSettings = () => { showAppSettings.value = true }
   try {
-    // Providers must load before the chat NSelect first
-    // renders, so currentMeta() has something to fall back
-    // to. Run in parallel with loadSessions.
-    await Promise.all([loadSessions(), loadProviders(), loadProjects()])
+    // Projects must load before sessions so the store can restore
+    // the last active project, then pick that project's last session.
+    await Promise.all([loadProviders(), loadProjects()])
+    await loadSessions()
   } catch (e) {
     console.error('init failed', e)
   }
@@ -206,13 +229,9 @@ onUnmounted(() => {
   background: var(--bg);
 }
 
-/* Sidebar collapse: when the user toggles the sidebar closed,
- * the SessionSidebar hides itself (the component owns its own
- * collapsed visuals). The main column then expands to fill the
- * available space. The transition is a brief width fade; the
- * chat canvas reflows immediately so the user sees the new
- * layout without waiting for the sidebar's exit animation. */
-.sidebar-collapsed {
-  display: none;
-}
+/* Sidebar collapse: SessionSidebar animates its own width
+ * (320px → 0) via the `.sidebar-collapsed` class on its
+ * root. The main column flex-grows into the freed space on
+ * the same --dur-slow / --ease-in-out curve, so the chat
+ * canvas and the rail move together instead of snapping. */
 </style>

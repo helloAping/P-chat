@@ -207,6 +207,47 @@ func TestClient_ListTools(t *testing.T) {
 	}
 }
 
+func TestClient_ListToolsDetailed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/tools" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("session_id"); got != "conv_x" {
+			t.Errorf("session_id = %q, want conv_x", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tools": []map[string]any{{
+				"name":         "deploy",
+				"description":  "Deploy project",
+				"dynamic":      true,
+				"scope":        "project",
+				"source":       "D:/repo/.p-chat/tools/deploy.yaml",
+				"project_root": "D:/repo",
+			}},
+			"diagnostics": []map[string]any{{
+				"source":       "D:/repo/.p-chat/tools/bad.yaml",
+				"status":       "error",
+				"error":        "name is required",
+				"scope":        "project",
+				"project_root": "D:/repo",
+				"mod_at":       "2026-08-25T11:00:00Z",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	resp, err := NewClient(srv.URL).ListToolsDetailed(context.Background(), "conv_x")
+	if err != nil {
+		t.Fatalf("list tools detailed: %v", err)
+	}
+	if len(resp.Tools) != 1 || resp.Tools[0].Source == "" || resp.Tools[0].ProjectRoot != "D:/repo" {
+		t.Fatalf("tool metadata not decoded: %+v", resp.Tools)
+	}
+	if len(resp.Diagnostics) != 1 || resp.Diagnostics[0].Error != "name is required" {
+		t.Fatalf("diagnostics not decoded: %+v", resp.Diagnostics)
+	}
+}
+
 func TestClient_SendMessage_NoRealLLM(t *testing.T) {
 	// We can't easily run a real LLM in a unit test, so we verify
 	// the wire-up: a missing provider returns an error quickly,

@@ -18,6 +18,10 @@ export function GetBackendURL() {
   return window['go']['main']['App']['GetBackendURL']();
 }
 
+export function InstallUpdate(arg1, arg2) {
+  return window['go']['main']['App']['InstallUpdate'](arg1, arg2);
+}
+
 export function OpenExplorer(arg1) {
   return window['go']['main']['App']['OpenExplorer'](arg1);
 }
@@ -28,6 +32,10 @@ export function OpenTerminal(arg1) {
 
 export function OpenURL(arg1) {
   return window['go']['main']['App']['OpenURL'](arg1);
+}
+
+export function SaveExportFile(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SaveExportFile'](arg1, arg2, arg3);
 }
 
 export function ServeHTTP(arg1, arg2) {

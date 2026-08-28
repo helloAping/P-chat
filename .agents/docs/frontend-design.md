@@ -122,17 +122,22 @@
 
 | Token | 值 | 用途 |
 |---|---|---|
-| `--ease-out` | `cubic-bezier(0.16, 1, 0.3, 1)` | 进入动画（"out" 曲线） |
-| `--ease-in-out` | `cubic-bezier(0.4, 0, 0.2, 1)` | 状态变化 |
+| `--ease-out` | `cubic-bezier(0.16, 1, 0.3, 1)` | 进入 / hover 落定（减速入位） |
+| `--ease-in` | `cubic-bezier(0.4, 0, 1, 1)` | 离开 / 关闭（加速离场） |
+| `--ease-in-out` | `cubic-bezier(0.4, 0, 0.2, 1)` | 双向布局（侧边栏宽度、dock） |
 | `--dur-fast` | `120ms` | hover、focus |
-| `--dur-base` | `200ms` | 默认 transition |
-| `--dur-slow` | `320ms` | modal 出现/消失 |
+| `--dur-base` | `200ms` | 默认 transition；离开动画 |
+| `--dur-slow` | `320ms` | modal / 侧边栏 / 大面板进入 |
+| `--transition-colors` | shorthand | hover/focus 的颜色族一次性声明 |
+
+**进入慢、离开快**：enter 用 `--dur-slow/--dur-base` + `--ease-out`，leave 用 `--dur-base/--dur-fast` + `--ease-in`。不要进出共用同一条曲线。
 
 **标准 transition 写法**：
 ```css
-transition: background var(--dur-fast) var(--ease-out),
-            color var(--dur-fast) var(--ease-out),
-            border-color var(--dur-fast) var(--ease-out);
+transition: var(--transition-colors);
+/* 需要位移时再叠 transform */
+transition: var(--transition-colors),
+            transform var(--dur-fast) var(--ease-out);
 ```
 
 ### 1.10 Typography
@@ -271,13 +276,40 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 - `.settings-section` 之间 `margin-bottom: 24px`
 - `.settings-section` 内部 `padding: 4px 0`（配合外层 `.provider-detail` 的 16-18px padding）
 - `.settings-form` 行间距 18px（label → input 8px，input → hint 1px）
+- `.settings-form--grid`：两列字段网格（名称/协议并排）；整行字段加 `.settings-form-row--span2`
 - label 字号 13px `var(--text-primary)` 500 weight（**不是 secondary**）
 - hint 字号 11.5px `var(--text-tertiary)` line-height 1.5
+
+**LLM 提供商 tab**：
+- 左侧只做列表；「+ 新增」打开弹窗（不要塞进左侧窄栏或右侧详情）
+- 模型添加/编辑用 `NModal`；列表里点编辑打开弹窗
+- 新增弹窗的默认模型支持「加载模型」→ `POST /api/v1/providers/probe-models`
 
 **禁止**：
 - 用 `style="margin: 0;"` 内联覆盖（用专门的 modifier class）
 - 用 `var(--text-secondary)` 写 label（label 必须是 `--text-primary`）
 - 把 toggle 写成 `flex-direction: row` 散在 row 里（统一用 `.settings-form-toggle` 包装）
+
+### 3.3b `.settings-collapse` — 设置页收缩面板
+
+**用途**：应用设置里所有 `NCollapse`（系统 / 网络搜索 / 知识库 / IM / 诊断）。
+
+**结构**：
+```html
+<NCollapse class="settings-collapse">
+  <NCollapseItem title="工作模式" name="work-mode">…</NCollapseItem>
+  <NCollapseItem title="图像识别" name="vision">…</NCollapseItem>
+</NCollapse>
+
+<!-- 已在 .settings-card 内时用 inset，避免双层边框 -->
+<NCollapse class="settings-collapse settings-collapse--inset">…</NCollapse>
+```
+
+**规则**：
+- **每项独立卡片**（`border` + `radius-md` + `surface-1` + `overflow: hidden`），禁止把多个 item 包进同一个外框
+- Header / content 共用同一表面；展开时 header 用 `surface-2` + 底部分割线
+- **必须覆盖** Naive 默认的 `first-child > header { padding-top: 0 }`（否则顶部标题会贴边，看起来像「顶部样式错乱」）
+- 样式定义在 `frontend/src/style.css`（全局），组件里不要再复制一套 `.sys-collapse` / `.form-collapse`
 
 ### 3.4 `.model-card` / `.provider-item` / `.kb-node-*` — 列表项
 
@@ -483,35 +515,30 @@ import { Send } from 'lucide-vue-next'  // 绕过 barrel，破坏 tree-shaking
 
 ```css
 .foo {
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out);
+  transition: var(--transition-colors);
 }
 ```
 
 ### 8.2 Enter / Leave 动画
 
-Modal、tooltip 用 Vue `<Transition>`：
+优先复用 `style.css` 里已经注册的全局 name，不要再在组件里复制一份：
+
+| name | 用途 |
+|---|---|
+| `fade` | 纯透明度（lightbox 蒙层、轻提示） |
+| `fade-scale` | 弹层 / 卡片出现（scale 0.96） |
+| `fade-up` | 从下方 8px 浮入（FAB、dock） |
+| `row-slide` | 输入区 advanced row（max-height + opacity） |
+
+Enter 用 `--ease-out`（稍慢），leave 用 `--ease-in`（稍快）。Naive UI 的 `fade-in-scale-up` / `slide-in-from-right` 已在 `style.css` 覆盖成同一套节奏。
+
 ```vue
 <Transition name="fade-scale">
   <div v-if="show">...</div>
 </Transition>
 ```
 
-```css
-.fade-scale-enter-active,
-.fade-scale-leave-active {
-  transition: opacity var(--dur-base) var(--ease-out),
-              transform var(--dur-base) var(--ease-out);
-}
-.fade-scale-enter-from,
-.fade-scale-leave-to {
-  opacity: 0;
-  transform: scale(0.96);
-}
-```
-
-**已有的 transition name**：`.fade` (default)、`.row-slide` (max-height + opacity)。新增前先查重。
+**新增前先查重**，不要发明第四种 fade。
 
 ### 8.3 Reduced Motion
 

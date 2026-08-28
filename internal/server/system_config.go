@@ -31,11 +31,20 @@ type uiResponse struct {
 	CloseBehavior string `json:"close_behavior"`
 }
 
+type visionRecognitionResponse struct {
+	Enabled        bool   `json:"enabled"`
+	Provider       string `json:"provider"`
+	Model          string `json:"model"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	MaxImageBytes  int64  `json:"max_image_bytes"`
+}
+
 type systemConfigResponse struct {
-	Limits   limitsResponse   `json:"limits"`
-	SubAgent subAgentResponse `json:"sub_agent"`
-	WorkMode workModeResponse `json:"work_mode"`
-	UI       uiResponse       `json:"ui"`
+	Limits   limitsResponse            `json:"limits"`
+	SubAgent subAgentResponse          `json:"sub_agent"`
+	WorkMode workModeResponse          `json:"work_mode"`
+	UI       uiResponse                `json:"ui"`
+	Vision   visionRecognitionResponse `json:"vision_recognition"`
 }
 
 func limitsToResp(l config.LimitsConfig) limitsResponse {
@@ -48,6 +57,17 @@ func limitsToResp(l config.LimitsConfig) limitsResponse {
 		MaxRounds:            l.MaxRounds,
 		TodoLongRunMode:      string(config.NormalizeTodoLongRunMode(l.TodoLongRunMode)),
 		MaxStoredMessages:    l.MaxStoredMessages,
+	}
+}
+
+func visionRecognitionToResp(v config.VisionRecognitionConfig) visionRecognitionResponse {
+	v.Normalize()
+	return visionRecognitionResponse{
+		Enabled:        v.Enabled,
+		Provider:       v.Provider,
+		Model:          v.Model,
+		TimeoutSeconds: v.TimeoutSeconds,
+		MaxImageBytes:  v.MaxImageBytes,
 	}
 }
 
@@ -69,6 +89,7 @@ func (h *Handler) GetSystemConfig(c *gin.Context) {
 		UI: uiResponse{
 			CloseBehavior: string(h.getCfg().UI.CloseBehavior.Normalize()),
 		},
+		Vision: visionRecognitionToResp(h.getCfg().Vision),
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -95,6 +116,7 @@ func (h *Handler) UpdateSystemConfig(c *gin.Context) {
 		SubAgent: subAgentResponse{CacheTTL: updated.SubAgent.CacheTTL, Timeout: updated.SubAgent.Timeout},
 		WorkMode: workModeResponse{Default: string(updated.WorkMode.Default.Normalize())},
 		UI:       uiResponse{CloseBehavior: string(updated.UI.CloseBehavior.Normalize())},
+		Vision:   visionRecognitionToResp(updated.Vision),
 	}
 	c.JSON(http.StatusOK, resp)
 }

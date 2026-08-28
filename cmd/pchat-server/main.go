@@ -55,10 +55,19 @@ var rootCmd = &cobra.Command{
 	RunE:  runServer,
 }
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "显示版本信息",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Println("P-Chat Server " + version.FullString())
+	},
+}
+
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "配置文件路径")
 	rootCmd.PersistentFlags().BoolVar(&imEnable, "im.enable", false, "启用 IM 桥接")
 	rootCmd.PersistentFlags().StringVar(&imPlatforms, "im.platforms", "", "启用的 IM 平台列表，例如 feishu:bot,telegram:polling")
+	rootCmd.AddCommand(versionCmd)
 }
 
 func main() {
@@ -193,18 +202,27 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// runner, but the server is the canonical path. Wiring
 	// happens here so the `task` tool is live for every
 	// session from the first turn.
+	asyncMgr := subagent.NewAsyncManager()
 	runner := &subagent.Default{
 		Cfg:            cfg,
 		LLM:            llmClient,
 		StyleMgr:       styleMgr,
+		JobStore:       memStore,
 		ParentTools:    toolReg,
 		ParentStyle:    style.Style(currentStyleName(cfg)),
 		ParentProvider: defaultProviderName(cfg),
 		Registry:       subagentReg,
 		Cache:          subagent.NewCache(cfg.SubAgent.CacheTTLDuration()),
+		Async:          asyncMgr,
 	}
 	tt, hh := runner.Tool()
 	toolReg.Register(tt, hh)
+	tst, tsh := runner.TaskStatusTool()
+	toolReg.Register(tst, tsh)
+	twt, twh := runner.TaskWaitTool()
+	toolReg.Register(twt, twh)
+	tct, tch := runner.TaskCancelTool()
+	toolReg.Register(tct, tch)
 	log.Printf("[subagent] task tool registered (timeout=%s cache_ttl=%s)",
 		cfg.SubAgent.TimeoutDuration(), cfg.SubAgent.CacheTTLDuration())
 
@@ -266,6 +284,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
+	srv.Handler().SetSubagentJobCanceller(asyncMgr)
+	srv.Handler().SetSubagentJobEvents(asyncMgr)
 
 	// Wire the stylegen background job manager (generate / optimize an
 	// AI style from the current conversation). It reads the store

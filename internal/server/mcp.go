@@ -5,6 +5,8 @@ package server
 //   GET    /api/v1/mcp/servers
 //   POST   /api/v1/mcp/servers
 //   DELETE /api/v1/mcp/servers/:name
+//   POST   /api/v1/mcp/servers/:name/start
+//   POST   /api/v1/mcp/servers/:name/stop
 //   POST   /api/v1/mcp/servers/:name/restart
 //   PATCH  /api/v1/mcp/servers/:name/global
 //
@@ -144,6 +146,36 @@ func (h *Handler) RemoveMCPServer(c *gin.Context) {
 	}
 	name := c.Param("name")
 	if err := h.mcpMgr.RemoveServer(name); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	h.persistMCPServers()
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// StartMCPServer POST /api/v1/mcp/servers/:name/start
+func (h *Handler) StartMCPServer(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+	name := c.Param("name")
+	if err := h.mcpMgr.Start(name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	h.persistMCPServers()
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// StopMCPServer POST /api/v1/mcp/servers/:name/stop
+func (h *Handler) StopMCPServer(c *gin.Context) {
+	if h.mcpMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP manager not available"})
+		return
+	}
+	name := c.Param("name")
+	if err := h.mcpMgr.Stop(name); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}

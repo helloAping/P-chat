@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/p-chat/pchat/internal/paths"
+	"gopkg.in/yaml.v3"
 )
 
 type Skill struct {
@@ -134,7 +135,17 @@ func loadSkill(dir, name string) (*Skill, error) {
 }
 
 func extractDescription(content string) string {
-	lines := strings.Split(content, "\n")
+	body := content
+	if meta, rest, ok := splitFrontmatter(content); ok {
+		var fm struct {
+			Description string `yaml:"description"`
+		}
+		if err := yaml.Unmarshal([]byte(meta), &fm); err == nil && strings.TrimSpace(fm.Description) != "" {
+			return strings.TrimSpace(fm.Description)
+		}
+		body = rest
+	}
+	lines := strings.Split(body, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -144,6 +155,26 @@ func extractDescription(content string) string {
 		return line
 	}
 	return ""
+}
+
+func splitFrontmatter(content string) (meta, rest string, ok bool) {
+	normalized := strings.ReplaceAll(content, "\r\n", "\n")
+	if !strings.HasPrefix(normalized, "---\n") {
+		return "", content, false
+	}
+	end := strings.Index(normalized[4:], "\n---")
+	if end < 0 {
+		return "", content, false
+	}
+	metaEnd := 4 + end
+	restStart := metaEnd + len("\n---")
+	if restStart < len(normalized) {
+		if normalized[restStart] != '\n' {
+			return "", content, false
+		}
+		restStart++
+	}
+	return normalized[4:metaEnd], normalized[restStart:], true
 }
 
 // BuildSkillContext builds the skill context for system prompt.

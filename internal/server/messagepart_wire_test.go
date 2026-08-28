@@ -9,7 +9,7 @@ import (
 // TestMessagePartSubAgentRoundTrip locks in the wire format
 // contract: a MessagePart with sub-agent metadata, when
 // JSON-marshaled for the client, emits camelCase keys
-// (agentType, agentColor, agentModel, taskId,
+// (agentType, agentColor, agentModel, taskId, runMode,
 // agentDescription) — matching the frontend's TypeScript
 // MessagePart type (src/api/client.ts:121-132). Without the
 // custom MarshalJSON, the snake_case storage tags
@@ -34,6 +34,7 @@ func TestMessagePartSubAgentRoundTrip(t *testing.T) {
 		"agent_color": "#44BA81",
 		"agent_model": "gpt-4o-mini",
 		"task_id": "audit-2025-01-15",
+		"run_mode": "async",
 		"agent_description": "Fast read-only file search.",
 		"elapsed": "12.3s"
 	}`
@@ -55,6 +56,9 @@ func TestMessagePartSubAgentRoundTrip(t *testing.T) {
 	}
 	if p.TaskID != "audit-2025-01-15" {
 		t.Errorf("TaskID = %q, want audit-2025-01-15", p.TaskID)
+	}
+	if p.RunMode != "async" {
+		t.Errorf("RunMode = %q, want async", p.RunMode)
 	}
 	if p.AgentDescription != "Fast read-only file search." {
 		t.Errorf("AgentDescription = %q", p.AgentDescription)
@@ -79,6 +83,7 @@ func TestMessagePartSubAgentRoundTrip(t *testing.T) {
 		`"agentColor":"#44BA81"`,
 		`"agentModel":"gpt-4o-mini"`,
 		`"taskId":"audit-2025-01-15"`,
+		`"runMode":"async"`,
 		`"agentDescription":"Fast read-only file search."`,
 	}
 	for _, want := range mustContain {
@@ -88,7 +93,7 @@ func TestMessagePartSubAgentRoundTrip(t *testing.T) {
 	}
 	mustNotContain := []string{
 		`"agent_type"`, `"agent_color"`, `"agent_model"`,
-		`"task_id"`, `"agent_description"`,
+		`"task_id"`, `"run_mode"`, `"agent_description"`,
 	}
 	for _, banned := range mustNotContain {
 		if strings.Contains(wire, banned) {
@@ -148,9 +153,9 @@ func TestMessagePartEmptyFieldsOmitted(t *testing.T) {
 	wire := string(out)
 	for _, banned := range []string{
 		`"agentType"`, `"agentColor"`, `"agentModel"`,
-		`"taskId"`, `"agentDescription"`, `"question_status"`,
+		`"taskId"`, `"runMode"`, `"agentDescription"`, `"question_status"`,
 		`"agent_type"`, `"agent_color"`, `"agent_model"`,
-		`"task_id"`, `"agent_description"`,
+		`"task_id"`, `"run_mode"`, `"agent_description"`,
 	} {
 		if strings.Contains(wire, banned) {
 			t.Errorf("empty metadata leaked: wire contains %q\n  wire: %s", banned, wire)
@@ -162,5 +167,39 @@ func TestMessagePartEmptyFieldsOmitted(t *testing.T) {
 	}
 	if !strings.Contains(wire, `"task":"audit"`) {
 		t.Errorf("wire missing task\n  wire: %s", wire)
+	}
+}
+
+func TestDecodePartsFromMetaTreatsNestedSubAgentTextAsFullSnapshot(t *testing.T) {
+	parts := []MessagePart{
+		{
+			Kind:    "sub_agent",
+			Task:    "background work",
+			Status:  "ok",
+			RunMode: "async",
+			Parts: []MessagePart{
+				{Kind: "tool", Name: "read_file", Status: "ok"},
+				{Kind: "text", Text: "async result"},
+			},
+		},
+	}
+	partsJSON, err := json.Marshal(parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaJSON, err := json.Marshal(map[string]string{"parts": string(partsJSON)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := decodePartsFromMeta(string(metaJSON), "legacy plain content should not render")
+	if len(got) != 1 {
+		t.Fatalf("parts len = %d, want only sub_agent card: %+v", len(got), got)
+	}
+	if got[0].Kind != "sub_agent" || got[0].RunMode != "async" {
+		t.Fatalf("sub_agent part not preserved: %+v", got[0])
+	}
+	if len(got[0].Parts) != 2 || got[0].Parts[1].Text != "async result" {
+		t.Fatalf("nested sub_agent parts not preserved: %+v", got[0].Parts)
 	}
 }

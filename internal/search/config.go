@@ -46,9 +46,9 @@ func BuildProvider(cfg config.SearchConfig) Provider {
 }
 
 // pickTimeout normalizes a possibly-zero/negative duration. The
-// default 20s matches Tavily's typical p95 and is short enough
-// that the agent loop doesn't block a full minute on a stuck
-// network call.
+// default 20s matches Tavily's typical p95. The 60s cap is the
+// scheduler ceiling for web_search (tool.WebSearchTimeout) so a
+// stuck HTTP call cannot outlive the advertised per-tool budget.
 func pickTimeout(d time.Duration) time.Duration {
 	if d <= 0 {
 		return tavilyDefaultTimeout

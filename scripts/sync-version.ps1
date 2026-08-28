@@ -10,6 +10,7 @@ if (-not $Root) {
     $Root = Join-Path $PSScriptRoot ".."
 }
 $Root = (Resolve-Path $Root).Path
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 $versionFile = Join-Path $Root "VERSION"
 if (-not (Test-Path $versionFile)) {
@@ -24,12 +25,11 @@ if (-not $v) {
 
 $wailsJson = Join-Path $Root "cmd\pchat-gui\wails.json"
 if (Test-Path $wailsJson) {
-    $content = Get-Content $wailsJson -Raw
+    $content = [System.IO.File]::ReadAllText($wailsJson, [System.Text.Encoding]::UTF8)
     $pat = '"productVersion"\s*:\s*"[^"]*"'
     $repl = '"productVersion": "' + $v + '"'
     $newContent = $content -replace $pat, $repl
     if ($newContent -ne $content) {
-        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($wailsJson, $newContent, $utf8NoBom)
         Write-Host "[sync:version] wails.json -> $v"
     } else {
@@ -39,12 +39,12 @@ if (Test-Path $wailsJson) {
 
 $installPs1 = Join-Path $Root "cmd\pchat-gui\install.ps1"
 if (Test-Path $installPs1) {
-    $content = Get-Content $installPs1 -Raw
-    $pat = 'DisplayVersion\s+-Value\s+"[^"]*"'
-    $repl = 'DisplayVersion  -Value "' + $v + '"'
-    $newContent = $content -replace $pat, $repl
+    $content = [System.IO.File]::ReadAllText($installPs1, [System.Text.Encoding]::UTF8)
+    $pat = '(-Name\s+"DisplayVersion"\s+-Value\s+)"[^"]*"'
+    $repl = '${1}"' + $v + '"'
+    $newContent = [regex]::Replace($content, $pat, $repl)
     if ($newContent -ne $content) {
-        Set-Content $installPs1 -Value $newContent -Encoding UTF8
+        [System.IO.File]::WriteAllText($installPs1, $newContent, $utf8NoBom)
         Write-Host "[sync:version] install.ps1 -> $v"
     } else {
         Write-Host "[sync:version] install.ps1 already $v (no change)"

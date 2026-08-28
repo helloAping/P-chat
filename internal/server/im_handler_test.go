@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/im"
 )
 
@@ -58,6 +59,137 @@ func TestIMHealthWithoutGatewayUsesConfig(t *testing.T) {
 	}
 	if body.Running {
 		t.Fatal("running = true, want false without gateway")
+	}
+}
+
+func TestIMProviderModelUsesGlobalDefaultInsteadOfSessionMeta(t *testing.T) {
+	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+	sessionID := "im:wechat:u:user-1"
+	s.handler.metaMu.Lock()
+	s.handler.meta[sessionID] = sessionMeta{Provider: "openai", Model: "gpt-4o"}
+	s.handler.metaMu.Unlock()
+
+	provider, model := s.handler.imProviderModel(config.IMPersona{})
+	if provider != "cs" || model != "doubao-seed-2.0-lite" {
+		t.Fatalf("provider/model = %q/%q, want global default cs/doubao-seed-2.0-lite", provider, model)
+	}
+
+	provider, model = s.handler.imProviderModel(config.IMPersona{Model: "doubao-pro"})
+	if provider != "cs" || model != "doubao-pro" {
+		t.Fatalf("persona provider/model = %q/%q, want cs/doubao-pro", provider, model)
+	}
+}
+
+func TestIMConversationTitlePrefixesWeChatDisplayName(t *testing.T) {
+	got := imConversationTitle(im.IMEvent{
+		Platform: "wechat",
+		Variant:  "wechatbot",
+		Chat:     im.ChatRef{Platform: "wechat", Variant: "wechatbot", ChatID: "wx-user-1", ChatType: "private"},
+		Sender:   im.SenderRef{ID: "wx-user-1", DisplayName: "张三"},
+	})
+	if got != "微信 · 张三" {
+		t.Fatalf("title = %q, want 微信 · 张三", got)
+	}
+}
+
+func TestIMConversationTitleShortensWeChatRawID(t *testing.T) {
+	rawID := "o9cq80y1DXkot94pBWNtdN9YcvnQ@im.wechat"
+	got := imConversationTitle(im.IMEvent{
+		Platform: "wechat",
+		Variant:  "wechatbot",
+		Chat:     im.ChatRef{Platform: "wechat", Variant: "wechatbot", ChatID: rawID, ChatType: "private"},
+		Sender:   im.SenderRef{ID: rawID},
+	})
+	if !strings.HasPrefix(got, "微信 · o9cq80y1DXkot94p") {
+		t.Fatalf("title = %q, want wechat-prefixed shortened raw id", got)
+	}
+	if strings.Contains(got, "@im.wechat") {
+		t.Fatalf("title = %q, should not expose @im.wechat suffix", got)
+	}
+	if len([]rune(strings.TrimPrefix(got, "微信 · "))) > 17 {
+		t.Fatalf("title = %q, raw id should be shortened", got)
+	}
+}
+
+func TestEnsureIMConversationTitleRenamesRawWeChatID(t *testing.T) {
+	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+	rawID := "o9cq80y1DXkot94pBWNtdN9YcvnQ@im.wechat"
+	sessionID := "im:wechat:u:" + rawID
+	if err := s.store.EnsureConversation(sessionID, rawID); err != nil {
+		t.Fatal(err)
+	}
+	ev := im.IMEvent{
+		Platform: "wechat",
+		Variant:  "wechatbot",
+		Chat:     im.ChatRef{Platform: "wechat", Variant: "wechatbot", ChatID: rawID, ChatType: "private"},
+		Sender:   im.SenderRef{ID: rawID},
+	}
+	want := imConversationTitle(ev)
+
+	s.handler.ensureIMConversationTitle(sessionID, ev, want)
+
+	got, err := s.store.GetConversation(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != want {
+		t.Fatalf("title = %q, want %q", got.Title, want)
+	}
+}
+
+func TestEnsureIMConversationTitlePrefixesLegacyDisplayName(t *testing.T) {
+	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+	sessionID := "im:wechat:u:user-1"
+	if err := s.store.EnsureConversation(sessionID, "张三"); err != nil {
+		t.Fatal(err)
+	}
+	ev := im.IMEvent{
+		Platform: "wechat",
+		Variant:  "wechatbot",
+		Chat:     im.ChatRef{Platform: "wechat", Variant: "wechatbot", ChatID: "user-1", ChatType: "private"},
+		Sender:   im.SenderRef{ID: "user-1", DisplayName: "张三"},
+	}
+
+	s.handler.ensureIMConversationTitle(sessionID, ev, imConversationTitle(ev))
+
+	got, err := s.store.GetConversation(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "微信 · 张三" {
+		t.Fatalf("title = %q, want 微信 · 张三", got.Title)
+	}
+}
+
+func TestEnsureIMConversationTitleKeepsUserRename(t *testing.T) {
+	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+	sessionID := "im:wechat:u:user-1"
+	if err := s.store.EnsureConversation(sessionID, "客户 A"); err != nil {
+		t.Fatal(err)
+	}
+	ev := im.IMEvent{
+		Platform: "wechat",
+		Variant:  "wechatbot",
+		Chat:     im.ChatRef{Platform: "wechat", Variant: "wechatbot", ChatID: "user-1", ChatType: "private"},
+		Sender:   im.SenderRef{ID: "user-1", DisplayName: "张三"},
+	}
+
+	s.handler.ensureIMConversationTitle(sessionID, ev, imConversationTitle(ev))
+
+	got, err := s.store.GetConversation(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "客户 A" {
+		t.Fatalf("title = %q, want user rename to stay", got.Title)
+	}
+}
+
+func TestIMConversationResponseTitleLabelsStoredRawTitle(t *testing.T) {
+	rawID := "o9cq80y1DXkot94pBWNtdN9YcvnQ@im.wechat"
+	got := imConversationResponseTitle("im:wechat:u:"+rawID, rawID)
+	if !strings.HasPrefix(got, "微信 · o9cq80y1DXkot94p") {
+		t.Fatalf("title = %q, want wechat-prefixed shortened response title", got)
 	}
 }
 
@@ -169,11 +301,17 @@ func TestWeChatQRFlowPersistsConfirmedCredential(t *testing.T) {
 		switch r.URL.Path {
 		case "/ilink/bot/get_bot_qrcode":
 			gotStart = true
-			if r.Method != http.MethodGet {
-				t.Fatalf("qr method = %s, want GET", r.Method)
+			if r.Method != http.MethodPost {
+				t.Fatalf("qr method = %s, want POST", r.Method)
 			}
 			if r.URL.Query().Get("bot_type") != "3" {
 				t.Fatalf("bot_type = %q, want 3", r.URL.Query().Get("bot_type"))
+			}
+			var body struct {
+				LocalTokenList []string `json:"local_token_list"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode qr request body: %v", err)
 			}
 			_, _ = w.Write([]byte(`{"code":0,"data":{"qrcode":"qr-123","qrcode_img_content":"data:image/png;base64,abc"}}`))
 		case "/ilink/bot/get_qrcode_status":
@@ -243,6 +381,7 @@ func TestWeChatQRFlowPersistsConfirmedCredential(t *testing.T) {
 	var body struct {
 		Platforms []struct {
 			Type    string         `json:"type"`
+			Mode    string         `json:"mode"`
 			Token   string         `json:"token"`
 			Extra   map[string]any `json:"extra"`
 			Enabled bool           `json:"enabled"`
@@ -253,6 +392,9 @@ func TestWeChatQRFlowPersistsConfirmedCredential(t *testing.T) {
 	}
 	if len(body.Platforms) != 1 || body.Platforms[0].Type != "wechat" || body.Platforms[0].Token != "wx-token" || !body.Platforms[0].Enabled {
 		t.Fatalf("persisted platforms = %+v, want enabled wechat token", body.Platforms)
+	}
+	if body.Platforms[0].Mode != "polling" {
+		t.Fatalf("mode = %q, want polling", body.Platforms[0].Mode)
 	}
 	if body.Platforms[0].Extra["ilink_bot_id"] != "bot-1" {
 		t.Fatalf("extra = %+v, want ilink_bot_id", body.Platforms[0].Extra)

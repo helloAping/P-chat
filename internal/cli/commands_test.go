@@ -114,16 +114,17 @@ func (mockBase) ListAllStyles(context.Context) []StyleView { return nil }
 func (mockBase) StyleGen(context.Context, string, string, string, string) (*StyleGenResult, error) {
 	return nil, nil
 }
-func (mockBase) ListModes() []config.WorkMode { return nil }
-func (mockBase) ModeName() string             { return "" }
-func (mockBase) SetMode(string) error         { return nil }
-func (mockBase) ListTools() []ToolView        { return nil }
-func (mockBase) ToolsEnabled() bool           { return false }
-func (mockBase) SetToolsEnabled(bool)         {}
-func (mockBase) SetSandbox(bool)              {}
-func (mockBase) BypassSandboxOnce()           {}
-func (mockBase) RebuildSandbox() error        { return nil }
-func (mockBase) ExpandList() []ToolResultView { return nil }
+func (mockBase) ListModes() []config.WorkMode              { return nil }
+func (mockBase) ModeName() string                          { return "" }
+func (mockBase) SetMode(string) error                      { return nil }
+func (mockBase) ListTools() []ToolView                     { return nil }
+func (mockBase) ListToolDiagnostics() []ToolDiagnosticView { return nil }
+func (mockBase) ToolsEnabled() bool                        { return false }
+func (mockBase) SetToolsEnabled(bool)                      {}
+func (mockBase) SetSandbox(bool)                           {}
+func (mockBase) BypassSandboxOnce()                        {}
+func (mockBase) RebuildSandbox() error                     { return nil }
+func (mockBase) ExpandList() []ToolResultView              { return nil }
 func (mockBase) ExpandByIndex(int) (ToolResultView, bool) {
 	return ToolResultView{}, false
 }

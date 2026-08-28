@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/style"
@@ -18,16 +19,25 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	if h == nil || h.agent == nil || h.store == nil {
 		return nil
 	}
-	if h.getCfg() == nil {
+	cfg := h.getCfg()
+	if cfg == nil {
 		return fmt.Errorf("config not available")
 	}
-	sessionID := imConversationID(ev)
+	imCfg := cfg.IM
+	imCfg.Normalize()
+	plan := im.PlanInbound(imCfg, ev)
+	if !plan.Process {
+		return nil
+	}
+	sessionID := plan.SessionID
 	if sessionID == "" {
 		return fmt.Errorf("im event missing session key")
 	}
-	if err := h.store.EnsureConversation(sessionID, imConversationTitle(ev)); err != nil {
+	title := imConversationTitle(ev)
+	if err := h.store.EnsureConversation(sessionID, title); err != nil {
 		return fmt.Errorf("ensure im conversation: %w", err)
 	}
+	h.ensureIMConversationTitle(sessionID, ev, title)
 	if _, loaded := h.sessionLocks.LoadOrStore(sessionID, struct{}{}); loaded {
 		return fmt.Errorf("a message is already being processed for this session")
 	}
@@ -41,8 +51,16 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	// interrupted plan before the agent constructs its guard prompt.
 	h.hydrateSessionTodos(sessionID)
 	meta := h.ensureMetaLoaded(sessionID)
-	provider := h.sessionProvider(sessionID)
-	model := h.sessionModel(sessionID, provider)
+	persona := plan.Persona
+	provider, model := h.imProviderModel(persona)
+	reqStyle := style.Style(h.sessionStyle(sessionID))
+	if strings.TrimSpace(persona.Style) != "" {
+		reqStyle = style.Style(strings.TrimSpace(persona.Style))
+	}
+	reqWorkMode := h.sessionWorkMode(sessionID)
+	if persona.WorkMode != "" {
+		reqWorkMode = persona.WorkMode.Normalize()
+	}
 	histMsgs, compSummary := h.loadHistoryForSend(ctx, sessionID, provider, model)
 	msgs := buildLLMMessages(histMsgs)
 	historyMessageCount := len(msgs)
@@ -55,8 +73,8 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	})
 
 	req := agent.ChatRequest{
-		Style:               style.Style(h.sessionStyle(sessionID)),
-		WorkMode:            h.sessionWorkMode(sessionID),
+		Style:               reqStyle,
+		WorkMode:            reqWorkMode,
 		Provider:            provider,
 		Model:               model,
 		Messages:            msgs,
@@ -70,6 +88,10 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 		AutoContinue:        h.sessionAutoContinue(sessionID),
 		TodoLongRunMode:     h.sessionTodoLongRunMode(sessionID),
 		TraceID:             ev.TraceID,
+		AllowedTools:        plan.AllowedTools,
+	}
+	if inject := strings.TrimSpace(persona.PromptInject); inject != "" {
+		req.SkillContext = "## IM Persona\n\n" + inject
 	}
 
 	stream := h.agent.ChatStream(ctx, req)
@@ -116,23 +138,15 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 	return nil
 }
 
-func imConversationID(ev im.IMEvent) string {
-	chatID := strings.TrimSpace(ev.Chat.ChatID)
-	if chatID == "" {
-		chatID = strings.TrimSpace(ev.Sender.ID)
+func (h *Handler) imProviderModel(persona config.IMPersona) (string, string) {
+	cfg := h.getCfg()
+	if cfg == nil {
+		return "", ""
 	}
-	if chatID == "" || ev.Platform == "" {
-		return ""
+	provider := strings.TrimSpace(cfg.LLM.Default)
+	model := h.defaultModelForProvider(provider)
+	if override := strings.TrimSpace(persona.Model); override != "" {
+		model = override
 	}
-	return fmt.Sprintf("im:%s:%s", ev.Platform, chatID)
-}
-
-func imConversationTitle(ev im.IMEvent) string {
-	if name := strings.TrimSpace(ev.Sender.DisplayName); name != "" {
-		return name
-	}
-	if ev.Chat.ChatID != "" {
-		return ev.Chat.ChatID
-	}
-	return ev.Platform
+	return provider, model
 }

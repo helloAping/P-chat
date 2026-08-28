@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/p-chat/pchat/internal/llm"
@@ -184,7 +185,7 @@ func TestExpandAttachmentsCM_UploadImage(t *testing.T) {
 	}
 	out := ExpandAttachmentsCM("openai", in, []Attachment{
 		{UploadID: id, Name: "test.png", Kind: "image", MIME: "image/png"},
-	}, resolver, func() bool { return true })
+	}, resolver, func() bool { return true }, false)
 	if len(out) != 2 {
 		t.Fatalf("len(out) = %d, want 2 (text + image)", len(out))
 	}
@@ -201,6 +202,132 @@ func TestExpandAttachmentsCM_UploadImage(t *testing.T) {
 	}
 	if img.Name != "test.png" || img.MimeType != "image/png" {
 		t.Errorf("img metadata = (%q, %q), want (test.png, image/png)", img.Name, img.MimeType)
+	}
+}
+
+func TestExpandAttachmentsCM_EmptyUploadImageDegradesToText(t *testing.T) {
+	dir := t.TempDir()
+	id := "abcd1234567890ab"
+	if err := os.WriteFile(filepath.Join(dir, id+"-empty.png"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &DiskAttachmentResolver{BaseDir: dir}
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "look at this", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+	}
+	out := ExpandAttachmentsCM("openai", in, []Attachment{
+		{UploadID: id, Name: "empty.png", Kind: "image", MIME: "image/png"},
+	}, resolver, func() bool { return true }, false)
+	if len(out) != 2 {
+		t.Fatalf("len(out) = %d, want text + marker", len(out))
+	}
+	if out[1].Type != llm.TypeText {
+		t.Fatalf("out[1].Type = %q, want text marker", out[1].Type)
+	}
+	if !strings.Contains(out[1].Content, "empty.png") {
+		t.Fatalf("marker missing filename: %#v", out[1])
+	}
+}
+
+func TestExpandAttachmentsCM_ImageRecognitionMode(t *testing.T) {
+	dir := t.TempDir()
+	id := "abcd1234567890ab"
+	raw := []byte("fake-png-bytes")
+	if err := os.WriteFile(filepath.Join(dir, id+"-test.png"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &DiskAttachmentResolver{BaseDir: dir}
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "look at this", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+	}
+	out := ExpandAttachmentsCM("openai", in, []Attachment{
+		{UploadID: id, Name: "test.png", Kind: "image", MIME: "image/png"},
+	}, resolver, func() bool { return false }, true)
+	if len(out) != 3 {
+		t.Fatalf("len(out) = %d, want 3 (text + display image + system ref)", len(out))
+	}
+	img := out[1]
+	if img.Type != llm.TypeImage || img.SubmitToLLM != 0 {
+		t.Fatalf("image = %#v, want display-only image", img)
+	}
+	if img.UploadID != id {
+		t.Fatalf("img.UploadID = %q, want %q", img.UploadID, id)
+	}
+	ref := out[2]
+	if ref.Role != llm.RoleSystem || !strings.Contains(ref.Content, id) || !strings.Contains(ref.Content, "image_recognize") {
+		t.Fatalf("system ref = %#v, want upload_id image_recognize hint", ref)
+	}
+}
+
+func TestReplaceImagesWithRecognitionRefs(t *testing.T) {
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "compare", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "AAA", Name: "a.png", MimeType: "image/png", UploadID: "upl1", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "BBB", Name: "b.png", MimeType: "image/png", UploadID: "upl2", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+	}
+	out := replaceImagesWithRecognitionRefs(in)
+	if len(out) != 3 {
+		t.Fatalf("len(out) = %d, want 3", len(out))
+	}
+	for i, m := range out {
+		if m.Type == llm.TypeImage {
+			t.Fatalf("out[%d] is still image: %#v", i, m)
+		}
+	}
+	if !strings.Contains(out[1].Content, "upl1") || !strings.Contains(out[2].Content, "upl2") {
+		t.Fatalf("refs missing upload ids: %#v", out)
+	}
+	if !strings.Contains(out[1].Content, "image_recognize") || !strings.Contains(out[2].Content, "image_recognize") {
+		t.Fatalf("refs missing tool hint: %#v", out)
+	}
+}
+
+func TestReplaceHistoricalImagesWithToolPlaceholders(t *testing.T) {
+	in := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "system", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "old text", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "OLD_IMAGE_BASE64", Name: "old.png", MimeType: "image/png", UploadID: "old-upl", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "current text", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "CURRENT_IMAGE_BASE64", Name: "current.png", MimeType: "image/png", UploadID: "current-upl", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+	}
+
+	out := replaceHistoricalImagesWithPlaceholders(in, 3, true)
+	if len(out) != len(in) {
+		t.Fatalf("len(out) = %d, want %d", len(out), len(in))
+	}
+	histImage := out[2]
+	if histImage.Type != llm.TypeText {
+		t.Fatalf("historical image Type = %q, want text placeholder", histImage.Type)
+	}
+	if strings.Contains(histImage.Content, "OLD_IMAGE_BASE64") {
+		t.Fatalf("historical image placeholder leaked image bytes: %q", histImage.Content)
+	}
+	if !strings.Contains(histImage.Content, "old.png") || !strings.Contains(histImage.Content, "old-upl") || !strings.Contains(histImage.Content, "image_recognize") {
+		t.Fatalf("historical image placeholder missing filename/upload_id/tool guidance: %q", histImage.Content)
+	}
+	currentImage := out[4]
+	if currentImage.Type != llm.TypeImage || currentImage.Content != "CURRENT_IMAGE_BASE64" {
+		t.Fatalf("current image = %#v, want unchanged image payload", currentImage)
+	}
+}
+
+func TestReplaceHistoricalImagesWithReuploadPlaceholdersWhenToolUnavailable(t *testing.T) {
+	in := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "OLD_IMAGE_BASE64", Name: "old.png", MimeType: "image/png", UploadID: "old-upl", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+	}
+
+	out := replaceHistoricalImagesWithPlaceholders(in, 1, false)
+	if len(out) != 1 {
+		t.Fatalf("len(out) = %d, want 1", len(out))
+	}
+	if out[0].Type != llm.TypeText {
+		t.Fatalf("historical image Type = %q, want text placeholder", out[0].Type)
+	}
+	if strings.Contains(out[0].Content, "OLD_IMAGE_BASE64") || strings.Contains(out[0].Content, "image_recognize") {
+		t.Fatalf("unavailable-tool placeholder leaked bytes/tool hint: %q", out[0].Content)
+	}
+	if !strings.Contains(out[0].Content, "重新上传") {
+		t.Fatalf("unavailable-tool placeholder missing reupload guidance: %q", out[0].Content)
 	}
 }
 

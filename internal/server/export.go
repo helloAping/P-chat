@@ -1,13 +1,16 @@
 package server
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/export"
 	"github.com/p-chat/pchat/internal/memory"
 )
@@ -21,7 +24,7 @@ import (
 //
 // URL shape:
 //
-//	GET /api/v1/sessions/:id/export?format=md|markdown|json
+//	GET /api/v1/sessions/:id/export?format=md|markdown|html|pdf|json
 //
 // Defaults: format=markdown.
 //
@@ -77,6 +80,7 @@ func (h *Handler) ExportSession(c *gin.Context) {
 	}
 
 	msgs := h.store.GetMessagesFullByID(id)
+	msgs = h.resolveExportUploads(msgs)
 	if len(msgs) == 0 {
 		// Empty session still produces a valid
 		// header-only file; the user almost
@@ -85,18 +89,28 @@ func (h *Handler) ExportSession(c *gin.Context) {
 	}
 
 	var (
-		body    string
-		ext     string
-		mime    string
+		body      []byte
+		ext       string
+		mime      string
 		renderErr error
 	)
 	switch format {
 	case export.FormatMarkdown:
-		body = export.ToMarkdown(conv, msgs)
+		body = []byte(export.ToMarkdown(conv, msgs))
 		ext = "md"
 		mime = "text/markdown; charset=utf-8"
+	case export.FormatHTML:
+		body = []byte(export.ToHTML(conv, msgs))
+		ext = "html"
+		mime = "text/html; charset=utf-8"
+	case export.FormatPDF:
+		body = export.ToPDF(conv, msgs)
+		ext = "pdf"
+		mime = "application/pdf"
 	case export.FormatJSON:
-		body, renderErr = export.ToJSON(conv, msgs)
+		var text string
+		text, renderErr = export.ToJSON(conv, msgs)
+		body = []byte(text)
 		ext = "json"
 		mime = "application/json; charset=utf-8"
 	}
@@ -123,7 +137,83 @@ func (h *Handler) ExportSession(c *gin.Context) {
 		fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`,
 			asciiName, export.URLEncodeFilename(unicodeName)))
 	c.Header("Content-Length", fmt.Sprintf("%d", len(body)))
-	c.String(http.StatusOK, body)
+	c.Data(http.StatusOK, mime, body)
+}
+
+func (h *Handler) resolveExportUploads(msgs []memory.MessageFull) []memory.MessageFull {
+	if len(msgs) == 0 || h.attachResolver == nil {
+		return msgs
+	}
+	out := make([]memory.MessageFull, len(msgs))
+	copy(out, msgs)
+	for i := range out {
+		mf := &out[i]
+		if uploadID, ok := uploadIDFromContent(strings.TrimSpace(mf.Msg.Content)); ok {
+			if att, ok := h.uploadAttachmentForExport(uploadID, mf.Msg.Name, ""); ok {
+				mf.Attachments = append([]memory.Attachment{att}, mf.Attachments...)
+				mf.Msg.Content = ""
+				mf.Msg.Name = ""
+				mf.Msg.ToolCallID = ""
+			}
+		}
+		for j := range mf.Attachments {
+			if uploadID, ok := uploadIDFromContent(strings.TrimSpace(mf.Attachments[j].URL)); ok {
+				name := mf.Attachments[j].Name
+				mime := mf.Attachments[j].Mime
+				if att, ok := h.uploadAttachmentForExport(uploadID, name, mime); ok {
+					mf.Attachments[j] = att
+				}
+			}
+		}
+	}
+	return out
+}
+
+func (h *Handler) uploadAttachmentForExport(uploadID, name, mime string) (memory.Attachment, bool) {
+	path, _ := h.attachResolver.Resolve(agent.Attachment{ID: uploadID, Name: name})
+	if path == "" {
+		return memory.Attachment{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return memory.Attachment{}, false
+	}
+	if name == "" {
+		name = filepath.Base(path)
+		if strings.HasPrefix(name, uploadID+"-") {
+			name = strings.TrimPrefix(name, uploadID+"-")
+		}
+	}
+	if mime == "" {
+		mime = mimeByExt(strings.ToLower(filepath.Ext(path)))
+	}
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	typ, kind := exportAttachmentTypeAndKind(mime)
+	url := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return memory.Attachment{
+		Type: typ,
+		Kind: kind,
+		URL:  url,
+		Name: name,
+		Mime: mime,
+	}, true
+}
+
+func exportAttachmentTypeAndKind(mime string) (string, string) {
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return "image_url", "image"
+	case strings.HasPrefix(mime, "audio/"):
+		return "audio_url", "audio"
+	case strings.HasPrefix(mime, "video/"):
+		return "video_url", "video"
+	case strings.HasPrefix(mime, "text/") || strings.Contains(mime, "json"):
+		return "text", "text"
+	default:
+		return "file", "file"
+	}
 }
 
 // parseExportFormat normalises the ?format= query value.
@@ -133,10 +223,14 @@ func parseExportFormat(s string) (export.Format, error) {
 	switch s {
 	case "markdown", "md", "":
 		return export.FormatMarkdown, nil
+	case "html", "htm":
+		return export.FormatHTML, nil
+	case "pdf":
+		return export.FormatPDF, nil
 	case "json":
 		return export.FormatJSON, nil
 	default:
-		return "", fmt.Errorf("unknown export format: %q (want markdown | json)", s)
+		return "", fmt.Errorf("unknown export format: %q (want markdown | html | pdf | json)", s)
 	}
 }
 
@@ -156,7 +250,7 @@ func asciiFilename(conv *memory.Conversation, ext string) string {
 
 // unicodeFilename produces the human-readable filename
 // (session title + timestamp) for the
-// `filename*=UTF-8''...` parameter. The title is
+// `filename*=UTF-8”...` parameter. The title is
 // sanitised (filesystem-unsafe characters replaced)
 // and capped at 60 chars so a pathological 5KB title
 // doesn't blow up the header. The whole filename is

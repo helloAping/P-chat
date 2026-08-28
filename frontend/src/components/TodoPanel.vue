@@ -223,7 +223,7 @@ function toggleExpand() {
   display: flex;
   flex-direction: column;
   max-height: 36px;
-  transition: max-height 0.32s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: max-height var(--dur-slow) var(--ease-in-out);
   overflow: hidden;
 }
 .todo-dock--expanded {
@@ -249,9 +249,10 @@ function toggleExpand() {
   cursor: pointer;
   user-select: none;
   flex-shrink: 0;
+  transition: background var(--dur-fast) var(--ease-out);
 }
 .todo-dock-header:hover {
-  background: var(--bg-3, rgba(255, 255, 255, 0.04));
+  background: var(--surface-3);
 }
 .todo-dock-caret {
   color: var(--text-tertiary);
@@ -288,7 +289,7 @@ function toggleExpand() {
   border-radius: 50%;
   background: var(--warn-500);
   flex-shrink: 0;
-  animation: todo-pulse 1.2s ease-in-out infinite;
+  animation: todo-pulse 1.2s var(--ease-in-out) infinite;
 }
 @keyframes todo-pulse {
   0%, 100% { opacity: 0.4; transform: scale(0.85); }
@@ -301,7 +302,7 @@ function toggleExpand() {
   font-variant-numeric: tabular-nums;
   background: var(--bg-3, rgba(255, 255, 255, 0.06));
   padding: 2px 8px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
 }
 .todo-dock-scroll {
   flex: 1;

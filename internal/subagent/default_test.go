@@ -3,19 +3,37 @@ package subagent
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 )
 
 func noopHandler(_ context.Context, _ json.RawMessage) (*tool.CallResult, error) {
 	return &tool.CallResult{Content: "ok"}, nil
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ok() {
+		return
+	}
+	t.Fatalf("condition not satisfied within %s", timeout)
 }
 
 func TestNewSubAgentStore_IsEphemeral(t *testing.T) {
@@ -62,6 +80,9 @@ func TestNewSubAgentStore_IsEphemeral(t *testing.T) {
 func TestDefault_ExcludesTaskTool(t *testing.T) {
 	parent := tool.NewRegistry()
 	parent.Register(tool.Tool{Name: "task", Description: "spawn sub"}, noopHandler)
+	parent.Register(tool.Tool{Name: "task_status", Description: "status"}, noopHandler)
+	parent.Register(tool.Tool{Name: "task_wait", Description: "wait"}, noopHandler)
+	parent.Register(tool.Tool{Name: "task_cancel", Description: "cancel"}, noopHandler)
 	parent.Register(tool.Tool{Name: "read_file", Description: "r"}, noopHandler)
 	parent.Register(tool.Tool{Name: "recall", Description: "r"}, noopHandler)
 
@@ -69,7 +90,7 @@ func TestDefault_ExcludesTaskTool(t *testing.T) {
 
 	subTools := tool.NewRegistry()
 	for _, name := range d.ParentTools.Names() {
-		if name == "task" || name == "recall" {
+		if name == "task" || name == "task_status" || name == "task_wait" || name == "task_cancel" || name == "recall" {
 			continue
 		}
 		if tt, h, ok := d.ParentTools.Lookup(name); ok {
@@ -80,12 +101,339 @@ func TestDefault_ExcludesTaskTool(t *testing.T) {
 	if _, ok := subTools.Get("task"); ok {
 		t.Error("task must NOT be in sub-agent registry")
 	}
+	if _, ok := subTools.Get("task_status"); ok {
+		t.Error("task_status must NOT be in sub-agent registry")
+	}
+	if _, ok := subTools.Get("task_wait"); ok {
+		t.Error("task_wait must NOT be in sub-agent registry")
+	}
+	if _, ok := subTools.Get("task_cancel"); ok {
+		t.Error("task_cancel must NOT be in sub-agent registry")
+	}
 	if _, ok := subTools.Get("recall"); ok {
 		t.Error("recall must NOT be in sub-agent registry")
 	}
 	if _, ok := subTools.Get("read_file"); !ok {
 		t.Error("read_file SHOULD be in sub-agent registry")
 	}
+}
+
+func TestTaskAsyncLaunchCompletesJobAndSyntheticMessage(t *testing.T) {
+	store, err := memory.OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureConversation("session-1", ""); err != nil {
+		t.Fatalf("EnsureConversation: %v", err)
+	}
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	var liveMu sync.Mutex
+	var liveEvents []agent.ChatStreamChunk
+	d := &Default{
+		JobStore:    store,
+		ParentTools: tool.NewRegistry(),
+		Async:       NewAsyncManager(),
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			ch := make(chan agent.ChatStreamChunk, 4)
+			go func() {
+				defer close(ch)
+				select {
+				case <-ctx.Done():
+					return
+				case <-release:
+				}
+				ch <- agent.ChatStreamChunk{Phase: "tool", Step: "call-1-start", ToolName: "read_file", ToolArgs: `{"path":"a.go"}`}
+				ch <- agent.ChatStreamChunk{Phase: "tool", Step: "call-1-ok", ToolName: "read_file", ToolResult: "file body", ToolElapsed: "2ms"}
+				ch <- agent.ChatStreamChunk{Content: "async result"}
+				ch <- agent.ChatStreamChunk{Done: true, TokensIn: 3, TokensOut: 4, Round: 1}
+			}()
+			return ch
+		},
+	}
+	_, taskHandler := d.Tool()
+	ctx := agent.WithAsyncSubagentLiveSink(tool.WithSessionID(context.Background(), "session-1"), func(c agent.ChatStreamChunk) bool {
+		liveMu.Lock()
+		defer liveMu.Unlock()
+		liveEvents = append(liveEvents, c)
+		return true
+	})
+	result, err := taskHandler(
+		ctx,
+		json.RawMessage(`{"mode":"async","description":"background work","task_id":"task-1"}`),
+	)
+	if err != nil {
+		t.Fatalf("task async handler: %v", err)
+	}
+	if result == nil || result.IsError || !strings.Contains(result.Content, "task_id=task-1") {
+		t.Fatalf("async launch result = %+v", result)
+	}
+
+	liveMu.Lock()
+	if len(liveEvents) == 0 || liveEvents[0].SubAgentStatus != "start" || liveEvents[0].SubAgentRunMode != "async" || liveEvents[0].SubAgentTaskID != "task-1" {
+		t.Fatalf("async launch did not emit live start event: %+v", liveEvents)
+	}
+	liveMu.Unlock()
+
+	runningJob, ok, err := store.GetSubagentJob("session-1", "task-1")
+	if err != nil || !ok {
+		t.Fatalf("running job not found: ok=%v err=%v", ok, err)
+	}
+	messageID := asyncProgressMessageID(runningJob.ProgressJSON)
+	if messageID == 0 {
+		t.Fatalf("running job progress missing anchor message id: %+v", runningJob)
+	}
+	msgs, metas, _ := store.GetChatMessagesWithMetaFor("session-1", 10)
+	foundRunningAnchor := false
+	for i, msg := range msgs {
+		var meta map[string]string
+		if err := json.Unmarshal([]byte(metas[i]), &meta); err != nil {
+			t.Fatalf("decode running meta: %v", err)
+		}
+		if meta["reason"] != "subagent_async" || meta["task_id"] != "task-1" {
+			continue
+		}
+		if msg.Content != "" || meta["status"] != memory.SubagentJobRunning {
+			t.Fatalf("running anchor should be empty/running, msg=%+v meta=%+v", msg, meta)
+		}
+		var parts []agent.MessagePart
+		if err := json.Unmarshal([]byte(meta["parts"]), &parts); err != nil {
+			t.Fatalf("decode running anchor parts: %v", err)
+		}
+		if len(parts) != 1 || parts[0].Kind != "sub_agent" || parts[0].Status != "start" || parts[0].RunMode != "async" {
+			t.Fatalf("running anchor parts wrong: %+v", parts)
+		}
+		foundRunningAnchor = true
+	}
+	if !foundRunningAnchor {
+		t.Fatalf("running async anchor message not found: msgs=%+v metas=%+v", msgs, metas)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	var job memory.SubagentJob
+	waitUntil(t, time.Second, func() bool {
+		got, ok, err := store.GetSubagentJob("session-1", "task-1")
+		if err != nil || !ok {
+			return false
+		}
+		job = got
+		return got.Status == memory.SubagentJobSucceeded
+	})
+	if !strings.Contains(job.Result, "async result") {
+		t.Fatalf("job result missing async output: %+v", job)
+	}
+	if strings.Contains(job.Result, "subagent stats") {
+		t.Fatalf("job result leaked stats footer: %+v", job)
+	}
+
+	_, statusHandler := d.TaskStatusTool()
+	status, err := statusHandler(
+		tool.WithSessionID(context.Background(), "session-1"),
+		json.RawMessage(`{"task_id":"task-1"}`),
+	)
+	if err != nil {
+		t.Fatalf("task_status handler: %v", err)
+	}
+	if status == nil || !strings.Contains(status.Content, "status: succeeded") || !strings.Contains(status.Content, "async result") {
+		t.Fatalf("unexpected task_status result: %+v", status)
+	}
+
+	msgs, metas, _ = store.GetChatMessagesWithMetaFor("session-1", 10)
+	foundAnchorCompletion := false
+	foundStructuredPart := false
+	asyncMessageCount := 0
+	for i, msg := range msgs {
+		var meta map[string]string
+		if err := json.Unmarshal([]byte(metas[i]), &meta); err != nil {
+			t.Fatalf("decode message meta: %v", err)
+		}
+		if meta["reason"] == "subagent_async" && meta["task_id"] == "task-1" {
+			asyncMessageCount++
+		}
+		if strings.Contains(msg.Content, "Async sub-agent task `task-1` completed") &&
+			strings.Contains(msg.Content, "async result") {
+			foundAnchorCompletion = true
+			var parts []agent.MessagePart
+			if err := json.Unmarshal([]byte(meta["parts"]), &parts); err != nil {
+				t.Fatalf("decode synthetic parts: %v", err)
+			}
+			if len(parts) != 1 || parts[0].Kind != "sub_agent" {
+				t.Fatalf("synthetic parts = %+v, want one sub_agent part", parts)
+			}
+			if parts[0].Status != "ok" || parts[0].TaskID != "task-1" || parts[0].Task != "background work" || parts[0].RunMode != "async" {
+				t.Fatalf("synthetic sub_agent metadata wrong: %+v", parts[0])
+			}
+			if len(parts[0].Parts) < 2 {
+				t.Fatalf("synthetic sub_agent should include internal tool/text parts: %+v", parts[0].Parts)
+			}
+			if parts[0].Parts[0].Kind != "tool" || parts[0].Parts[0].Name != "read_file" || parts[0].Parts[0].Status != "ok" {
+				t.Fatalf("synthetic sub_agent tool part missing: %+v", parts[0].Parts)
+			}
+			if !strings.Contains(parts[0].Parts[len(parts[0].Parts)-1].Text, "async result") {
+				t.Fatalf("synthetic sub_agent result missing: %+v", parts[0].Parts)
+			}
+			if strings.Contains(msg.Content, "subagent stats") {
+				t.Fatalf("synthetic async completion message leaked stats footer: %q", msg.Content)
+			}
+			foundStructuredPart = true
+		}
+	}
+	if !foundAnchorCompletion {
+		t.Fatalf("async anchor completion message not found: %+v", msgs)
+	}
+	if !foundStructuredPart {
+		t.Fatalf("async anchor completion message missing structured sub_agent part: metas=%+v", metas)
+	}
+	if asyncMessageCount != 1 {
+		t.Fatalf("async completion should update one anchor message, got %d messages: %+v", asyncMessageCount, msgs)
+	}
+}
+
+func TestTaskWaitReturnsFirstCompletedAsyncJob(t *testing.T) {
+	store, err := memory.OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureConversation("session-1", ""); err != nil {
+		t.Fatalf("EnsureConversation: %v", err)
+	}
+
+	manager := NewAsyncManager()
+	d := &Default{JobStore: store, Async: manager}
+	job1, err := store.CreateSubagentJob(memory.SubagentJob{
+		TaskID:      "task-wait-1",
+		SessionID:   "session-1",
+		Status:      memory.SubagentJobRunning,
+		Description: "slow job",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job2, err := store.CreateSubagentJob(memory.SubagentJob{
+		TaskID:      "task-wait-2",
+		SessionID:   "session-1",
+		Status:      memory.SubagentJobRunning,
+		Description: "fast job",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, waitHandler := d.TaskWaitTool()
+	resultCh := make(chan *tool.CallResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		res, err := waitHandler(
+			tool.WithSessionID(context.Background(), "session-1"),
+			json.RawMessage(`{"task_ids":["task-wait-1","task-wait-2"],"timeout_ms":1000}`),
+		)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- res
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := store.CompleteSubagentJob(job2.ID, "fast result"); err != nil {
+		t.Fatal(err)
+	}
+	updated, ok, err := store.GetSubagentJobByID(job2.ID)
+	if err != nil || !ok {
+		t.Fatalf("load completed job: ok=%v err=%v", ok, err)
+	}
+	manager.PublishJob("updated", updated)
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("task_wait returned error: %v", err)
+	case res := <-resultCh:
+		if res == nil || res.IsError {
+			t.Fatalf("task_wait result = %+v", res)
+		}
+		if !strings.Contains(res.Content, "task_id=task-wait-2") {
+			t.Fatalf("task_wait did not return completed job2: %+v", res)
+		}
+		if !strings.Contains(res.Content, "fast result") {
+			t.Fatalf("task_wait did not include completed result: %+v", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("task_wait did not wake after job completion")
+	}
+
+	unchanged, ok, err := store.GetSubagentJobByID(job1.ID)
+	if err != nil || !ok {
+		t.Fatalf("load job1: ok=%v err=%v", ok, err)
+	}
+	if unchanged.Status != memory.SubagentJobRunning {
+		t.Fatalf("job1 status changed unexpectedly: %+v", unchanged)
+	}
+}
+
+func TestTaskCancelStopsRunningAsyncJob(t *testing.T) {
+	store, err := memory.OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureConversation("session-1", ""); err != nil {
+		t.Fatalf("EnsureConversation: %v", err)
+	}
+
+	started := make(chan struct{})
+	d := &Default{
+		JobStore:    store,
+		ParentTools: tool.NewRegistry(),
+		Async:       NewAsyncManager(),
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			ch := make(chan agent.ChatStreamChunk)
+			go func() {
+				defer close(ch)
+				close(started)
+				<-ctx.Done()
+			}()
+			return ch
+		},
+	}
+	_, taskHandler := d.Tool()
+	if _, err := taskHandler(
+		tool.WithSessionID(context.Background(), "session-1"),
+		json.RawMessage(`{"mode":"async","description":"cancel me","task_id":"task-cancel"}`),
+	); err != nil {
+		t.Fatalf("task async handler: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("async job did not start")
+	}
+
+	_, cancelHandler := d.TaskCancelTool()
+	cancelResult, err := cancelHandler(
+		tool.WithSessionID(context.Background(), "session-1"),
+		json.RawMessage(`{"task_id":"task-cancel"}`),
+	)
+	if err != nil {
+		t.Fatalf("task_cancel handler: %v", err)
+	}
+	if cancelResult == nil || cancelResult.IsError || !strings.Contains(cancelResult.Content, "cancelled") {
+		t.Fatalf("unexpected cancel result: %+v", cancelResult)
+	}
+
+	waitUntil(t, time.Second, func() bool {
+		job, ok, err := store.GetSubagentJob("session-1", "task-cancel")
+		return err == nil && ok && job.Status == memory.SubagentJobCancelled
+	})
+	waitUntil(t, time.Second, func() bool {
+		d.Async.mu.Lock()
+		defer d.Async.mu.Unlock()
+		return len(d.Async.cancels) == 0
+	})
 }
 
 // TestDefault_AppliesAllowDenyFilter mirrors the production
@@ -150,70 +498,81 @@ func TestDefault_AppliesAllowDenyFilter(t *testing.T) {
 // the filter tests below.
 func newFilterTestRegistry() *tool.Registry {
 	r := tool.NewRegistry()
-	for _, name := range []string{"task", "recall", "read_file", "list_files", "exec_command", "write_file"} {
+	for _, name := range []string{
+		"task", "recall", "read_file", "list_files", "grep", "read_docx", "read_pdf",
+		"exec_command", "write_file", "web_search", "web_fetch", "todo_write", "question",
+	} {
 		r.Register(tool.Tool{Name: name, Description: name}, noopHandler)
 	}
 	return r
 }
 
-// TestFilterSubAgentTools_PerAgentWhitelistBeatsGlobalDeny pins the
-// fix for the "explore spins forever then fails" bug. explore/plan
-// whitelist exec_command for read-only shell use (builtins.go), but the
-// default config denies exec_command globally (config.go). The per-agent
-// whitelist must WIN — otherwise the agent calls a tool it can never
-// use and loops until the sub-agent timeout.
-func TestFilterSubAgentTools_PerAgentWhitelistBeatsGlobalDeny(t *testing.T) {
-	parent := newFilterTestRegistry()
-	globalDenyExec := func(name string) bool {
-		if name == "task" {
-			return false
-		}
-		if name == "exec_command" {
-			return false
-		}
-		return true
+func allowAllExcept(denied ...string) func(string) bool {
+	deny := map[string]bool{}
+	for _, n := range denied {
+		deny[n] = true
 	}
+	return func(name string) bool {
+		return !deny[name]
+	}
+}
 
-	// explore: whitelist = {read_file, list_files, exec_command}
-	sub := filterSubAgentTools(parent, true, []string{"read_file", "list_files", "exec_command"}, globalDenyExec)
+// TestFilterSubAgentTools_WhitelistCannotWidenPastSafeSet pins that
+// putting exec_command on a per-agent whitelist no longer exposes it.
+// The execution-safe predicate is the hard ceiling; whitelist may only
+// narrow.
+func TestFilterSubAgentTools_WhitelistCannotWidenPastSafeSet(t *testing.T) {
+	parent := newFilterTestRegistry()
+	sub := filterSubAgentTools(parent, true, []string{"read_file", "list_files", "grep", "exec_command"}, allowAllExcept("exec_command"))
 	got := strings.Join(sub.Names(), ",")
-	for _, want := range []string{"read_file", "list_files", "exec_command"} {
+	for _, want := range []string{"read_file", "list_files", "grep"} {
 		if !strings.Contains(got, want) {
-			t.Errorf("explore sub-agent tools = %q, missing whitelisted %q (global deny must not veto whitelist)", got, want)
+			t.Errorf("explore sub-agent tools = %q, missing whitelisted %q", got, want)
 		}
 	}
-	if strings.Contains(got, "write_file") {
-		t.Errorf("explore sub-agent tools = %q, must not contain write_file (not on whitelist)", got)
+	if strings.Contains(got, "exec_command") {
+		t.Errorf("explore sub-agent tools = %q, must not contain exec_command even when whitelisted", got)
+	}
+	if strings.Contains(got, "write_file") || strings.Contains(got, "web_search") {
+		t.Errorf("explore sub-agent tools = %q, must not contain tools off the whitelist", got)
 	}
 	if strings.Contains(got, "task") || strings.Contains(got, "recall") {
 		t.Errorf("explore sub-agent tools = %q, must not contain task/recall (hard exclusion)", got)
 	}
 }
 
+// TestFilterSubAgentTools_WhitelistBeatsGlobalDenyForSafeTools covers
+// a custom/research agent that opts into web_search even when the
+// global denylist includes it.
+func TestFilterSubAgentTools_WhitelistBeatsGlobalDenyForSafeTools(t *testing.T) {
+	parent := newFilterTestRegistry()
+	sub := filterSubAgentTools(parent, true, []string{"web_search", "web_fetch"}, allowAllExcept("web_search", "web_fetch"))
+	got := strings.Join(sub.Names(), ",")
+	if !strings.Contains(got, "web_search") || !strings.Contains(got, "web_fetch") {
+		t.Errorf("whitelisted network tools = %q, want web_search and web_fetch despite global deny", got)
+	}
+	if strings.Contains(got, "read_file") {
+		t.Errorf("whitelisted network tools = %q, must not inherit unlisted read_file", got)
+	}
+}
+
 // TestFilterSubAgentTools_GlobalDenyAppliesWhenNoWhitelist covers
-// general-purpose / custom agents with an empty whitelist: the global
-// allow/deny still governs, so the default deny of exec_command keeps
-// blocking it.
+// general-purpose / custom agents with an empty whitelist: they inherit
+// the execution-safe parent set, minus global denials, and never see
+// write/exec/question tools.
 func TestFilterSubAgentTools_GlobalDenyAppliesWhenNoWhitelist(t *testing.T) {
 	parent := newFilterTestRegistry()
-	globalDenyExec := func(name string) bool {
-		if name == "task" {
-			return false
-		}
-		if name == "exec_command" {
-			return false
-		}
-		return true
-	}
-
-	// general-purpose: no per-agent whitelist
-	sub := filterSubAgentTools(parent, true, nil, globalDenyExec)
+	sub := filterSubAgentTools(parent, true, nil, allowAllExcept("exec_command"))
 	got := strings.Join(sub.Names(), ",")
-	if strings.Contains(got, "exec_command") {
-		t.Errorf("general-purpose sub-agent tools = %q, must NOT contain exec_command (global deny still applies when no whitelist)", got)
+	for _, want := range []string{"read_file", "grep", "web_search", "web_fetch", "todo_write"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("general-purpose sub-agent tools = %q, missing %q", got, want)
+		}
 	}
-	if !strings.Contains(got, "read_file") {
-		t.Errorf("general-purpose sub-agent tools = %q, should contain read_file", got)
+	for _, deny := range []string{"exec_command", "write_file", "question", "task", "recall"} {
+		if strings.Contains(got, deny) {
+			t.Errorf("general-purpose sub-agent tools = %q, must NOT contain %q", got, deny)
+		}
 	}
 }
 
@@ -288,6 +647,38 @@ func TestTryForward_NilOnEvent(t *testing.T) {
 	// Multiple calls in a row also fine.
 	for i := 0; i < 5; i++ {
 		tryForward(agent.ChatStreamChunk{Content: "x"}, nil)
+	}
+}
+
+func TestBuildSubAgentChatRequestUsesIsolatedSession(t *testing.T) {
+	const parentSession = "parent-session"
+	req := Request{
+		Description: "audit frontend",
+		TaskID:      "call_child_1",
+		ProjectRoot: `D:\develop\project\my-blog`,
+	}
+
+	chatReq := buildSubAgentChatRequest(
+		req,
+		style.Tech,
+		"openai",
+		"gpt-4o-mini",
+		"",
+		"explore",
+		"#44BA81",
+	)
+
+	if chatReq.SessionID != "subagent-explore-call_child_1" {
+		t.Fatalf("SessionID = %q, want isolated subagent session", chatReq.SessionID)
+	}
+	if chatReq.SessionID == parentSession {
+		t.Fatal("sub-agent must never reuse the parent session id")
+	}
+	if chatReq.SubagentTaskID != req.TaskID {
+		t.Fatalf("SubagentTaskID = %q, want %q", chatReq.SubagentTaskID, req.TaskID)
+	}
+	if chatReq.ProjectRoot != req.ProjectRoot {
+		t.Fatalf("ProjectRoot = %q, want %q", chatReq.ProjectRoot, req.ProjectRoot)
 	}
 }
 
@@ -383,6 +774,56 @@ func newRunTestDefault(chunks []agent.ChatStreamChunk) (*Default, *[]agent.ChatS
 		},
 	}
 	return d, &events
+}
+
+func TestDefault_RunDoesNotInstallDeadlineWhenSubagentTimeoutDisabled(t *testing.T) {
+	parent := tool.NewRegistry()
+	parent.Register(tool.Tool{Name: "read_file", Description: "r"}, noopHandler)
+
+	var sawDeadline bool
+	d := &Default{
+		ParentTools: parent,
+		Cfg:         &config.Config{SubAgent: config.SubAgentConfig{}},
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			_, sawDeadline = ctx.Deadline()
+			ch := make(chan agent.ChatStreamChunk, 1)
+			ch <- agent.ChatStreamChunk{Done: true}
+			close(ch)
+			return ch
+		},
+	}
+
+	if _, err := d.Run(context.Background(), Request{Description: "explore src/"}); err != nil {
+		t.Fatalf("Run() returned err: %v", err)
+	}
+	if sawDeadline {
+		t.Fatal("subagent timeout disabled should not install a child context deadline")
+	}
+}
+
+func TestDefault_RunInstallsDeadlineWhenSubagentTimeoutConfigured(t *testing.T) {
+	parent := tool.NewRegistry()
+	parent.Register(tool.Tool{Name: "read_file", Description: "r"}, noopHandler)
+
+	var sawDeadline bool
+	d := &Default{
+		ParentTools: parent,
+		Cfg:         &config.Config{SubAgent: config.SubAgentConfig{Timeout: "30s"}},
+		runChat: func(ctx context.Context, req agent.ChatRequest) <-chan agent.ChatStreamChunk {
+			_, sawDeadline = ctx.Deadline()
+			ch := make(chan agent.ChatStreamChunk, 1)
+			ch <- agent.ChatStreamChunk{Done: true}
+			close(ch)
+			return ch
+		},
+	}
+
+	if _, err := d.Run(context.Background(), Request{Description: "explore src/"}); err != nil {
+		t.Fatalf("Run() returned err: %v", err)
+	}
+	if !sawDeadline {
+		t.Fatal("positive subagent timeout should install a child context deadline")
+	}
 }
 
 // TestDefault_SilentCloseIsFailure is the regression test for the
@@ -555,13 +996,7 @@ func TestToolHandler_InterruptedResultCarriesPartialContent(t *testing.T) {
 		Model:       "gpt-4o",
 		Interrupted: "interrupted",
 	}
-	content := res.Content
-	if res.Interrupted != "" {
-		content = "[sub-agent was " + res.Interrupted + " and did not finish; the content below is PARTIAL — summarise what it did accomplish and continue the remaining work]\n\n" + content
-	}
-	stats := fmt.Sprintf("\n\n---\n[subagent stats: model=%s, elapsed=%s, rounds=%d, tokens=%d/%d]",
-		res.Model, res.Elapsed.Round(10*time.Millisecond), res.Rounds, res.TokensIn, res.TokensOut)
-	content += stats
+	content := formatSubagentToolResult(res)
 
 	if !strings.Contains(content, "PARTIAL") {
 		t.Errorf("tool result must carry the PARTIAL marker: %q", content)
@@ -569,8 +1004,8 @@ func TestToolHandler_InterruptedResultCarriesPartialContent(t *testing.T) {
 	if !strings.Contains(content, "已梳理 12 个模块") {
 		t.Errorf("tool result must carry the partial content: %q", content)
 	}
-	if !strings.Contains(content, "subagent stats") {
-		t.Errorf("tool result must keep the stats footer: %q", content)
+	if strings.Contains(content, "subagent stats") {
+		t.Errorf("tool result must not expose stats footer: %q", content)
 	}
 }
 

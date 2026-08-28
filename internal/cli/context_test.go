@@ -101,10 +101,13 @@ func TestHTTPEventToChunk_PreservesRichStreamFields(t *testing.T) {
 		ToolID:                "call_1",
 		ToolArgs:              `{"path":"a.go"}`,
 		ToolResultFull:        "full result",
+		ToolResultTruncated:   true,
+		ToolResultFullLen:     1234,
 		ToolChangedPaths:      []string{"a.go"},
 		SubAgent:              true,
 		SubAgentTask:          "inspect code",
 		SubAgentType:          "explore",
+		SubAgentRunMode:       "async",
 		SubAgentFailureReason: "timeout",
 		TraceID:               "T-12345678",
 		ToolConfirmJSON:       `{"action":"edit"}`,
@@ -118,6 +121,9 @@ func TestHTTPEventToChunk_PreservesRichStreamFields(t *testing.T) {
 	}
 	if !chunk.SubAgent || chunk.SubAgentTask != "inspect code" || chunk.SubAgentType != "explore" {
 		t.Errorf("sub-agent fields were lost: %+v", chunk)
+	}
+	if chunk.SubAgentRunMode != "async" || !chunk.ToolResultTruncated || chunk.ToolResultFullLen != 1234 {
+		t.Errorf("new rich fields were lost: %+v", chunk)
 	}
 	if chunk.ToolConfirmJSON == "" || chunk.ContentRewrite != "replacement" || chunk.SessionStatus != "busy" {
 		t.Errorf("rich stream fields were lost: %+v", chunk)

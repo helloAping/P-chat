@@ -52,6 +52,18 @@ LLMConfig 核心字段：
 
 `Manager.Reload()` 重新加载配置文件并更新内存中的 Agent `SetLLM()`。
 
+### 5. VisionRecognitionConfig
+
+`vision_recognition` 是全局系统配置，用于给不支持多模态的主对话模型外接一个多模态模型：
+- `enabled` — 是否允许会话启用专门的图片识别模式。
+- `provider` / `model` — 使用已配置 LLM provider 中的模型。
+- `timeout_seconds` — 单次识别超时，默认 60 秒。
+- `max_image_bytes` — 单张图片大小上限，默认 10 MiB。
+
+单会话是否优先使用该能力存放在 `conversations.metadata.use_image_recognition`。当系统配置和会话开关都开启时，当前轮图片先由配置模型识别，主模型只接收识别文本。
+
+`image_recognize` 的历史图片回看能力不只依赖该开关：如果会话没有开启专门识图，但历史上下文里有带 `upload_id` 的图片引用，并且当前对话模型支持视觉输入，Agent 也可以暴露 `image_recognize`，由工具 fallback 到当前 provider/model 做一次非流式识别。没有任何可用视觉能力时，历史图片占位会提示用户重新上传图片或切换/配置视觉模型。
+
 ## 修改指南
 
 ### 要添加新的配置字段

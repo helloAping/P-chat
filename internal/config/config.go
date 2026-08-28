@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -19,21 +20,22 @@ import (
 // been removed. The loader still accepts a legacy config.yaml as
 // a one-shot migration source — see Load.
 type Config struct {
-	Server    ServerConfig    `json:"server"`
-	LLM       LLMConfig       `json:"llm"`
-	Style     StyleConfig     `json:"style"`
-	UI        UIConfig        `json:"ui"`
-	WorkMode  WorkModeConfig  `json:"work_mode"`
-	Tools     ToolsConfig     `json:"tools"`
-	Memory    MemoryConfig    `json:"memory"`
-	Sandbox   SandboxConfig   `json:"sandbox"`
-	SubAgent  SubAgentConfig  `json:"subagent"`
-	MCP       MCPConfig       `json:"mcp"`
-	Knowledge KnowledgeConfig `json:"knowledge"`
-	Limits    LimitsConfig    `json:"limits"`
-	Search    SearchConfig    `json:"search"`
-	Browser   BrowserConfig   `json:"browser"`
-	IM        IMConfig        `json:"im"`
+	Server    ServerConfig            `json:"server"`
+	LLM       LLMConfig               `json:"llm"`
+	Style     StyleConfig             `json:"style"`
+	UI        UIConfig                `json:"ui"`
+	WorkMode  WorkModeConfig          `json:"work_mode"`
+	Tools     ToolsConfig             `json:"tools"`
+	Memory    MemoryConfig            `json:"memory"`
+	Sandbox   SandboxConfig           `json:"sandbox"`
+	SubAgent  SubAgentConfig          `json:"subagent"`
+	MCP       MCPConfig               `json:"mcp"`
+	Knowledge KnowledgeConfig         `json:"knowledge"`
+	Limits    LimitsConfig            `json:"limits"`
+	Search    SearchConfig            `json:"search"`
+	Browser   BrowserConfig           `json:"browser"`
+	Vision    VisionRecognitionConfig `json:"vision_recognition"`
+	IM        IMConfig                `json:"im"`
 	// Dynamic is the P3-2 per-tool config table. The
 	// user writes `dynamic.<tool_name>.config: {…}`
 	// in their config.json and the dynamic tool's
@@ -151,31 +153,28 @@ func (m TodoLongRunMode) AllowsUnlimitedRounds(hasActiveTodos bool) bool {
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
 //
-// AllowedTools is a whitelist: when non-empty, only these tool names
-// are passed to the sub-agent. The `task` tool itself is always excluded
-// to prevent recursion. When the list is empty, all non-task tools
-// (excluding any listed in DeniedTools) are passed.
+// Visibility is first capped by the execution-safe set
+// (tool.SubagentMayExpose): local reads, todo_write, web_search, and
+// web_fetch. AllowedTools then further restricts that set; when
+// empty, all execution-safe parent tools except DeniedTools are
+// passed. The `task` family and `recall` are always excluded.
 //
-// DeniedTools is a blacklist applied after AllowedTools. Useful for
-// blocking dangerous tools like `exec_command` while keeping the rest.
+// DeniedTools is a blacklist applied when AllowedTools is empty.
+// Default denies `exec_command` as defense in depth.
 type SubAgentConfig struct {
 	AllowedTools []string `json:"allowed_tools,omitempty"`
 	DeniedTools  []string `json:"denied_tools,omitempty"`
 
-	// Timeout is the per-sub-agent wall-clock execution cap. Parsed
-	// from JSON (e.g. "30m", "5m"). Zero means no explicit cap (the
-	// runner applies a sensible default of 30 minutes).
+	// Timeout is the optional per-sub-agent wall-clock execution cap.
+	// Parsed from JSON (e.g. "30m", "5m"). Empty, zero, or invalid
+	// means no sub-agent-specific deadline; the runner relies on parent
+	// cancellation plus fine-grained guards instead.
 	//
-	// This is a LAST-RESORT backstop, not the primary hang guard. A
-	// normal long sub-agent (e.g. explore reading 50 files, or a
-	// multi-round plan on a slow local model) can legitimately run
-	// 10-20 minutes; cutting it at 5m discards useful work. Actual
-	// hangs are caught earlier by finer-grained guards: the LLM
-	// stream idle timeout (120s of no bytes → cancel), per-tool
-	// timeouts (exec_command 5m, read_file 60s), the cumulative
-	// tool-failure breaker (CumToolErrMax) and the sub-agent round
-	// cap (MaxRounds 30). The wall clock is only reached when every
-	// one of those failed.
+	// This should only be set as an explicit deployment policy. Normal
+	// long sub-agents can legitimately run for a long time; hangs are
+	// bounded by finer-grained guards: LLM stream stall detection,
+	// per-tool timeouts, the cumulative tool-failure breaker, and the
+	// sub-agent round cap.
 	Timeout string `json:"timeout,omitempty"`
 
 	// CacheTTL is how long a sub-agent result stays cached. Parsed
@@ -183,14 +182,16 @@ type SubAgentConfig struct {
 	CacheTTL string `json:"cache_ttl,omitempty"`
 }
 
-// TimeoutDuration returns the parsed timeout, or 30m if unset/invalid.
+// TimeoutDuration returns the parsed timeout. A non-positive result means
+// no sub-agent-specific deadline should be installed.
 func (s SubAgentConfig) TimeoutDuration() time.Duration {
-	if s.Timeout == "" {
-		return 30 * time.Minute
+	raw := strings.TrimSpace(s.Timeout)
+	if raw == "" || raw == "0" {
+		return 0
 	}
-	d, err := time.ParseDuration(s.Timeout)
+	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
-		return 30 * time.Minute
+		return 0
 	}
 	return d
 }
@@ -488,6 +489,28 @@ func (w WorkMode) IsValid() bool {
 
 type WorkModeConfig struct {
 	Default WorkMode `json:"default"`
+}
+
+// VisionRecognitionConfig selects the external multimodal model used by
+// the image_recognize tool. The main chat model can stay text-only; when
+// a session opts in, uploaded images are described through this model and
+// returned to the main conversation as tool text.
+type VisionRecognitionConfig struct {
+	Enabled        bool   `json:"enabled"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	MaxImageBytes  int64  `json:"max_image_bytes,omitempty"`
+}
+
+// Normalize fills conservative defaults for unset numeric limits.
+func (v *VisionRecognitionConfig) Normalize() {
+	if v.TimeoutSeconds <= 0 {
+		v.TimeoutSeconds = 60
+	}
+	if v.MaxImageBytes <= 0 {
+		v.MaxImageBytes = 10 << 20
+	}
 }
 
 type ToolsConfig struct {
@@ -888,6 +911,7 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	migrateKnowledgeDefaults(cfg)
 	cfg.UI.CloseBehavior = cfg.UI.CloseBehavior.Normalize()
 	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
+	cfg.Vision.Normalize()
 
 	return cfg, nil
 }
@@ -973,11 +997,11 @@ func Default() *Config {
 			MaxHistory: 0,
 		},
 		Limits: LimitsConfig{
-			MaxRounds:              500,
-			TodoLongRunMode:        TodoLongRunAdaptive,
-			MaxTurnSeconds:         900,
-			MaxTurnRetries:         2,
-			LLMRetryBackoffs:       []int{5, 60, 180, 300, 600},
+			MaxRounds:               500,
+			TodoLongRunMode:         TodoLongRunAdaptive,
+			MaxTurnSeconds:          900,
+			MaxTurnRetries:          2,
+			LLMRetryBackoffs:        []int{5, 60, 180, 300, 600},
 			RoundStreamStallSeconds: 180,
 		},
 		Sandbox: SandboxConfig{
@@ -988,15 +1012,11 @@ func Default() *Config {
 			ExecDangerousPatterns: defaultDangerousPatterns(),
 		},
 		SubAgent: SubAgentConfig{
-			// Default safety stance: deny exec_command for sub-agents
-			// that inherit the parent's full tool set (general-purpose,
-			// custom agents with no whitelist). Built-in read-only
-			// agents (explore/plan) list exec_command on their own
-			// whitelist for read-only shell use — that per-agent
-			// whitelist takes priority over this global deny (see
-			// subagent.filterSubAgentTools), and the sandbox still
-			// guards dangerous commands at dispatch time. Users can
-			// override by setting allowed_tools explicitly.
+			// Defense in depth: deny exec_command for any sub-agent
+			// that somehow inherits a parent tool the execution-safe
+			// filter missed. Built-in explore/plan no longer opt into
+			// shell; they use grep + file reads. Users can still
+			// narrow further with allowed_tools.
 			DeniedTools: []string{"exec_command"},
 			// Enable result caching by default so repeated sub-agent
 			// tasks (e.g. searching the same file) hit the cache.
@@ -1028,6 +1048,11 @@ func Default() *Config {
 				"*.alipay.com",
 				"*.paypal.com",
 			},
+		},
+		Vision: VisionRecognitionConfig{
+			Enabled:        false,
+			TimeoutSeconds: 60,
+			MaxImageBytes:  10 << 20,
 		},
 		IM: DefaultIMConfig(),
 	}

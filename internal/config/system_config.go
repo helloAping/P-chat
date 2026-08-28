@@ -30,13 +30,24 @@ type UIConfigPatch struct {
 	CloseBehavior *CloseBehavior `json:"close_behavior,omitempty"`
 }
 
+// VisionRecognitionConfigPatch is a partial update for the external image
+// recognition model used by the image_recognize tool.
+type VisionRecognitionConfigPatch struct {
+	Enabled        *bool   `json:"enabled,omitempty"`
+	Provider       *string `json:"provider,omitempty"`
+	Model          *string `json:"model,omitempty"`
+	TimeoutSeconds *int    `json:"timeout_seconds,omitempty"`
+	MaxImageBytes  *int64  `json:"max_image_bytes,omitempty"`
+}
+
 // SystemConfigPatch is a partial update for system-level config
-// (limits + subagent + work_mode + ui).
+// (limits + subagent + work_mode + ui + vision_recognition).
 type SystemConfigPatch struct {
-	Limits   *LimitsConfigPatch   `json:"limits,omitempty"`
-	SubAgent *SubAgentConfigPatch `json:"sub_agent,omitempty"`
-	WorkMode *WorkModeConfigPatch `json:"work_mode,omitempty"`
-	UI       *UIConfigPatch       `json:"ui,omitempty"`
+	Limits   *LimitsConfigPatch            `json:"limits,omitempty"`
+	SubAgent *SubAgentConfigPatch          `json:"sub_agent,omitempty"`
+	WorkMode *WorkModeConfigPatch          `json:"work_mode,omitempty"`
+	UI       *UIConfigPatch                `json:"ui,omitempty"`
+	Vision   *VisionRecognitionConfigPatch `json:"vision_recognition,omitempty"`
 }
 
 // UpdateSystemConfig merges a SystemConfigPatch into the persisted config.
@@ -57,6 +68,9 @@ func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
 	}
 	if patch.UI != nil {
 		mergeUI(&cfg.UI, patch.UI)
+	}
+	if patch.Vision != nil {
+		mergeVisionRecognition(&cfg.Vision, patch.Vision)
 	}
 
 	mgr := NewManager()
@@ -112,4 +126,23 @@ func mergeUI(u *UIConfig, p *UIConfigPatch) {
 	if p.CloseBehavior != nil {
 		u.CloseBehavior = p.CloseBehavior.Normalize()
 	}
+}
+
+func mergeVisionRecognition(v *VisionRecognitionConfig, p *VisionRecognitionConfigPatch) {
+	if p.Enabled != nil {
+		v.Enabled = *p.Enabled
+	}
+	if p.Provider != nil {
+		v.Provider = *p.Provider
+	}
+	if p.Model != nil {
+		v.Model = *p.Model
+	}
+	if p.TimeoutSeconds != nil {
+		v.TimeoutSeconds = *p.TimeoutSeconds
+	}
+	if p.MaxImageBytes != nil {
+		v.MaxImageBytes = *p.MaxImageBytes
+	}
+	v.Normalize()
 }

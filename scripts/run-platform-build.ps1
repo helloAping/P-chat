@@ -26,23 +26,22 @@
     sees a clean exit and the next cmd runs.
 
 .PARAMETER RequiredOS
-  One of: darwin, linux, windows. If the host is not this OS,
+  One of: mac, linux, win. If the host is not this OS,
   the wrapper skips with a warning. Empty = no platform check.
 
 .PARAMETER Task
   The Task task to invoke, e.g. "package:gui:linux".
 
 .PARAMETER Platform
-  Human-readable platform label (e.g. "linux/amd64",
-  "darwin/universal") for the failure hint. Optional.
+  Human-readable platform name (win, linux, mac) for the failure hint. Optional.
 
 .EXAMPLE
-  powershell -File run-platform-build.ps1 -Task "package:gui:linux" -Platform "linux/amd64"
+  powershell -File run-platform-build.ps1 -Task "package:gui:linux" -Platform "linux"
   # Tries to package the Linux GUI. Skips on macOS host only if
   # -RequiredOS is also darwin. Best-effort on Windows.
 
 .EXAMPLE
-  powershell -File run-platform-build.ps1 -RequiredOS darwin -Task "package:gui:macos" -Platform "darwin/universal"
+  powershell -File run-platform-build.ps1 -RequiredOS mac -Task "package:gui:macos" -Platform "mac"
   # Skips on Windows/Linux hosts; on macOS runs the task.
 #>
 
@@ -69,8 +68,34 @@ $currentOS = switch ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPl
     }
 }
 
-if ($RequiredOS -and $currentOS -ne $RequiredOS) {
-    Write-Host "[run-platform-build] skip: $Task requires $RequiredOS host (current: $currentOS)" -ForegroundColor Yellow
+$requiredOSLabel = ''
+if ($RequiredOS) {
+    try {
+        $requiredOSLabel = & "$PSScriptRoot\resolve-platform.ps1" -Name $RequiredOS -Format label
+        $requiredOS = & "$PSScriptRoot\resolve-platform.ps1" -Name $RequiredOS -Format os
+    } catch {
+        Write-Host "[run-platform-build] invalid RequiredOS: $RequiredOS" -ForegroundColor Red
+        exit 1
+    }
+    if (-not $requiredOS) {
+        exit 1
+    }
+} else {
+    $requiredOS = ''
+}
+
+$platformLabel = ''
+if ($Platform) {
+    try {
+        $platformLabel = & "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format label
+    } catch {
+        Write-Host "[run-platform-build] invalid Platform: $Platform" -ForegroundColor Red
+        exit 1
+    }
+}
+
+if ($requiredOS -and $currentOS -ne $requiredOS) {
+    Write-Host "[run-platform-build] skip: $Task requires $requiredOSLabel host (current: $currentOS)" -ForegroundColor Yellow
     exit 0
 }
 
@@ -90,8 +115,8 @@ $code = $LASTEXITCODE
 
 if ($code -ne 0) {
     Write-Host "[run-platform-build] best-effort failure: $Task exited $code" -ForegroundColor Yellow
-    if ($Platform) {
-        Write-Host "[run-platform-build] hint: $Platform build typically needs a native host or a working cross-compile toolchain" -ForegroundColor Yellow
+    if ($platformLabel) {
+        Write-Host "[run-platform-build] hint: $platformLabel build typically needs a native host or a working cross-compile toolchain" -ForegroundColor Yellow
     }
     exit 0
 }

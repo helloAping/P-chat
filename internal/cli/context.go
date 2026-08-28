@@ -130,6 +130,7 @@ type cliContext interface {
 	ModeName() string
 	SetMode(name string) error
 	ListTools() []ToolView
+	ListToolDiagnostics() []ToolDiagnosticView
 	ToolsEnabled() bool
 	SetToolsEnabled(on bool)
 
@@ -238,6 +239,21 @@ type ToolView struct {
 	Name        string
 	Description string
 	Highlight   bool // e.g. true for `task` (sub-agent spawner)
+	Dynamic     bool
+	Scope       string
+	Source      string
+	ProjectRoot string
+}
+
+// ToolDiagnosticView is a dynamic-tool loader diagnostic shown by /tools.
+type ToolDiagnosticView struct {
+	Source      string
+	Name        string
+	Status      string
+	Error       string
+	Scope       string
+	ProjectRoot string
+	ModAt       string
 }
 
 // ToolResultView is a snapshot of a cached tool call result.
@@ -816,10 +832,13 @@ func (c *localContext) ListTools() []ToolView {
 			Name:        t.Name,
 			Description: t.Description,
 			Highlight:   t.Name == "task",
+			Scope:       "builtin",
 		})
 	}
 	return out
 }
+
+func (c *localContext) ListToolDiagnostics() []ToolDiagnosticView { return nil }
 
 func (c *localContext) ToolsEnabled() bool      { return c.r.useTools }
 func (c *localContext) SetToolsEnabled(on bool) { c.r.useTools = on }
@@ -1306,16 +1325,39 @@ func (c *httpContext) SetMode(name string) error {
 	return nil
 }
 func (c *httpContext) ListTools() []ToolView {
-	tools, err := c.c.ListTools(context.Background(), c.curSess)
+	resp, err := c.c.ListToolsDetailed(context.Background(), c.curSess)
 	if err != nil {
 		return nil
 	}
-	out := make([]ToolView, 0, len(tools))
-	for _, t := range tools {
+	out := make([]ToolView, 0, len(resp.Tools))
+	for _, t := range resp.Tools {
 		out = append(out, ToolView{
 			Name:        t.Name,
 			Description: t.Description,
 			Highlight:   t.Name == "task",
+			Dynamic:     t.Dynamic,
+			Scope:       t.Scope,
+			Source:      t.Source,
+			ProjectRoot: t.ProjectRoot,
+		})
+	}
+	return out
+}
+func (c *httpContext) ListToolDiagnostics() []ToolDiagnosticView {
+	resp, err := c.c.ListToolsDetailed(context.Background(), c.curSess)
+	if err != nil {
+		return nil
+	}
+	out := make([]ToolDiagnosticView, 0, len(resp.Diagnostics))
+	for _, d := range resp.Diagnostics {
+		out = append(out, ToolDiagnosticView{
+			Source:      d.Source,
+			Name:        d.Name,
+			Status:      d.Status,
+			Error:       d.Error,
+			Scope:       d.Scope,
+			ProjectRoot: d.ProjectRoot,
+			ModAt:       d.ModAt,
 		})
 	}
 	return out
@@ -1405,6 +1447,8 @@ func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 		ToolArgs:              ev.ToolArgs,
 		ToolResult:            ev.ToolResult,
 		ToolResultFull:        ev.ToolResultFull,
+		ToolResultTruncated:   ev.ToolResultTruncated,
+		ToolResultFullLen:     ev.ToolResultFullLen,
 		ToolError:             ev.ToolError,
 		ToolElapsed:           ev.ToolElapsed,
 		ToolCallStatus:        ev.ToolCallStatus,
@@ -1422,6 +1466,7 @@ func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 		SubAgentColor:         ev.SubAgentColor,
 		SubAgentModel:         ev.SubAgentModel,
 		SubAgentTaskID:        ev.SubAgentTaskID,
+		SubAgentRunMode:       ev.SubAgentRunMode,
 		SubAgentDescription:   ev.SubAgentDescription,
 		SubAgentFailureReason: ev.SubAgentFailureReason,
 		TraceID:               ev.TraceID,

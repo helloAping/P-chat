@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"sort"
 	"sync"
 )
 
@@ -20,6 +22,7 @@ type Transport interface {
 type StdioTransport struct {
 	command string
 	args    []string
+	env     map[string]string
 
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -32,10 +35,11 @@ type StdioTransport struct {
 	closed  bool
 }
 
-func NewStdioTransport(command string, args []string) *StdioTransport {
+func NewStdioTransport(command string, args []string, env map[string]string) *StdioTransport {
 	return &StdioTransport{
 		command: command,
 		args:    args,
+		env:     env,
 		outCh:   make(chan JSONRPCResponse, 64),
 		done:    make(chan struct{}),
 	}
@@ -43,18 +47,36 @@ func NewStdioTransport(command string, args []string) *StdioTransport {
 
 func (t *StdioTransport) Start(ctx context.Context) error {
 	t.cmd = exec.CommandContext(ctx, t.command, t.args...)
+	if len(t.env) > 0 {
+		keys := make([]string, 0, len(t.env))
+		for k := range t.env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		env := os.Environ()
+		for _, k := range keys {
+			env = append(env, k+"="+t.env[k])
+		}
+		t.cmd.Env = env
+	}
 
 	var err error
 	t.stdin, err = t.cmd.StdinPipe()
 	if err != nil {
+		close(t.done)
+		close(t.outCh)
 		return fmt.Errorf("stdin pipe: %w", err)
 	}
 	t.stdout, err = t.cmd.StdoutPipe()
 	if err != nil {
+		close(t.done)
+		close(t.outCh)
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
 
 	if err := t.cmd.Start(); err != nil {
+		close(t.done)
+		close(t.outCh)
 		return fmt.Errorf("start process: %w", err)
 	}
 

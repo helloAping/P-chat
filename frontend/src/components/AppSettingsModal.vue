@@ -222,15 +222,18 @@ const editIsDefault = ref(false)
 // source of truth for the request body.
 const dirty = ref<Set<string>>(new Set())
 
-// Add-provider form
+// Add-provider form (shown in NModal)
 const showAddProvider = ref(false)
 const newName = ref('')
 const newProtocol = ref<'openai' | 'anthropic'>('openai')
 const newBaseURL = ref('')
 const newAPIKey = ref('')
 const newModel = ref('')
+const probingModels = ref(false)
+const probeModelOptions = ref<{ label: string; value: string }[]>([])
+const probeModelsError = ref('')
 
-// Add-model form
+// Add/edit model form (shown in NModal)
 const showAddModel = ref(false)
 
 // Single model form backing the add/edit panel. The form
@@ -280,6 +283,13 @@ const sysSubAgent = ref<api.SubAgentConfig>({
   cache_ttl: '',
   timeout: '',
 })
+const sysVision = ref<api.VisionRecognitionConfig>({
+  enabled: false,
+  provider: '',
+  model: '',
+  timeout_seconds: 60,
+  max_image_bytes: 10 * 1024 * 1024,
+})
 const sysWorkMode = ref('coding')
 const sysCloseBehavior = ref<'exit' | 'tray'>('exit')
 const sysDirty = ref(false)
@@ -294,9 +304,17 @@ async function loadSystemConfig() {
     const sc = await api.getSystemConfig()
     sysLimits.value = sc.limits
     sysSubAgent.value = sc.sub_agent
+    sysVision.value = sc.vision_recognition || {
+      enabled: false,
+      provider: '',
+      model: '',
+      timeout_seconds: 60,
+      max_image_bytes: 10 * 1024 * 1024,
+    }
     sysWorkMode.value = sc.work_mode?.default || 'coding'
     sysCloseBehavior.value = normalizeCloseBehavior(sc.ui?.close_behavior)
     chatState.globalWorkMode = sysWorkMode.value
+    chatState.visionRecognitionEnabled = !!sysVision.value.enabled
     sysDirty.value = false
   } catch { /* ignore */ }
 }
@@ -325,10 +343,21 @@ async function saveSystemConfig() {
     patch.sub_agent = sa
     patch.work_mode = { default: sysWorkMode.value }
     patch.ui = { close_behavior: sysCloseBehavior.value }
+    patch.vision_recognition = {
+      enabled: sysVision.value.enabled,
+      provider: sysVision.value.provider,
+      model: sysVision.value.model,
+      timeout_seconds: sysVision.value.timeout_seconds,
+      max_image_bytes: sysVision.value.max_image_bytes,
+    }
 
     const updated = await api.updateSystemConfig(patch)
     chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
     sysCloseBehavior.value = normalizeCloseBehavior(updated.ui?.close_behavior)
+    if (updated.vision_recognition) {
+      sysVision.value = updated.vision_recognition
+      chatState.visionRecognitionEnabled = !!updated.vision_recognition.enabled
+    }
     sysDirty.value = false
     message.success('系统配置已保存')
   } catch (e: any) {
@@ -350,6 +379,13 @@ function resetSystemConfig() {
     max_stored_messages: 0,
   }
   sysSubAgent.value = { cache_ttl: '', timeout: '' }
+  sysVision.value = {
+    enabled: false,
+    provider: '',
+    model: '',
+    timeout_seconds: 60,
+    max_image_bytes: 10 * 1024 * 1024,
+  }
   sysWorkMode.value = 'coding'
   sysCloseBehavior.value = 'exit'
   sysDirty.value = true
@@ -442,6 +478,63 @@ async function selectProvider(name: string) {
   }
 }
 
+function openAddProvider() {
+  showAddProvider.value = true
+  newName.value = ''
+  newProtocol.value = 'openai'
+  newBaseURL.value = ''
+  newAPIKey.value = ''
+  newModel.value = ''
+  probeModelOptions.value = []
+  probeModelsError.value = ''
+}
+
+function cancelAddProvider() {
+  showAddProvider.value = false
+  newName.value = ''
+  newBaseURL.value = ''
+  newAPIKey.value = ''
+  newModel.value = ''
+  probeModelOptions.value = []
+  probeModelsError.value = ''
+}
+
+async function onProbeAddProviderModels() {
+  if (!newAPIKey.value.trim()) {
+    message.warning('请先填写 API Key，再加载模型列表')
+    return
+  }
+  probingModels.value = true
+  probeModelsError.value = ''
+  try {
+    const res = await api.probeUpstreamModels({
+      base_url: newBaseURL.value.trim() || undefined,
+      api_key: newAPIKey.value.trim(),
+      protocol: newProtocol.value,
+    })
+    const models = res.models || []
+    probeModelOptions.value = models.map(m => ({
+      label: m.owned_by ? `${m.id} · ${m.owned_by}` : m.id,
+      value: m.id,
+    }))
+    if (!models.length) {
+      probeModelsError.value = '上游未返回模型'
+      message.info('上游未返回模型，可手动输入模型 ID')
+    } else {
+      message.success(`已加载 ${models.length} 个模型`)
+      // If the user hasn't picked a default yet, prefill the first.
+      if (!newModel.value.trim()) {
+        newModel.value = models[0].id
+      }
+    }
+  } catch (e: any) {
+    probeModelsError.value = e.message || '加载失败'
+    message.error(`加载模型失败: ${e.message || '未知错误'}`)
+  } finally {
+    probingModels.value = false
+  }
+}
+
 // hydrateEditForm copies the server-resolved fields into the
 // edit form. dirty is reset so an out-of-band server change
 // doesn't get clobbered. The second `p` argument lets the
@@ -482,8 +575,7 @@ async function onAddProvider() {
       model: newModel.value.trim(),
     })
     message.success('已添加')
-    showAddProvider.value = false
-    newName.value = ''; newBaseURL.value = ''; newAPIKey.value = ''; newModel.value = ''
+    cancelAddProvider()
     await refreshProviders()
     await selectProvider(addedName)
   } catch (e: any) {
@@ -558,7 +650,7 @@ function resetModelForm() {
 
 function onShowAddModel() {
   resetModelForm()
-  showAddModel.value = !showAddModel.value
+  showAddModel.value = true
 }
 
 async function onAddModel() {
@@ -988,6 +1080,35 @@ const protocolOptions = [
   { label: 'Anthropic (Claude)', value: 'anthropic' },
 ]
 
+const visionProviderOptions = computed(() =>
+  providers.value.map(p => ({ label: p.name, value: p.name })),
+)
+
+const visionModelOptions = computed(() => {
+  const p = providers.value.find(x => x.name === sysVision.value.provider)
+  if (!p) return []
+  return (p.models || []).map(m => {
+    const suffix = m.capabilities?.supports_vision ? ' · 视觉' : ''
+    const label = m.display_name ? `${m.display_name} (${m.name})${suffix}` : `${m.name}${suffix}`
+    return { label, value: m.name }
+  })
+})
+
+function onVisionProviderUpdate(provider: string) {
+  sysVision.value.provider = provider || ''
+  const p = providers.value.find(x => x.name === provider)
+  const models = p?.models || []
+  if (!models.some(m => m.name === sysVision.value.model)) {
+    sysVision.value.model = models.find(m => m.default)?.name || models[0]?.name || ''
+  }
+  markSysDirty()
+}
+
+function onVisionModelUpdate(model: string) {
+  sysVision.value.model = model || ''
+  markSysDirty()
+}
+
 // model-table row helpers
 function fmtContext(n?: number) {
   if (!n || n <= 0) return '—'
@@ -1029,13 +1150,9 @@ async function onToggleMCPGlobal(v: boolean) {
 async function onToggleMCPServer(name: string, enabled: boolean) {
   try {
     if (enabled) {
-      await api.addMCPServer({
-        name,
-        command: '', // use existing config, server restores from persisted config
-        enabled: true,
-      })
+      await api.startMCPServer(name)
     } else {
-      await api.removeMCPServer(name)
+      await api.stopMCPServer(name)
     }
     await refreshMCP()
   } catch (e: any) {
@@ -1667,37 +1784,28 @@ function kbModelSupportsVision(scanModel: string) {
       animated
       class="settings-no-bar"
     >
-      <NTabPane name="providers" tab="LLM 提供商" style="flex: 1; min-height: 0; overflow: auto">
+      <NTabPane name="providers" tab="LLM 提供商" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
         <div class="providers-split">
           <!-- Left: provider list -->
-          <div class="provider-list">
+          <aside class="provider-list">
             <div class="provider-list-header">
-              <span class="list-title">提供商 ({{ providers.length }})</span>
-              <NButton size="tiny" type="primary" ghost @click="showAddProvider = !showAddProvider">
-                {{ showAddProvider ? '取消' : '+ 新增' }}
+              <span class="list-title">提供商</span>
+              <NButton size="tiny" type="primary" ghost @click="openAddProvider">
+                + 新增
               </NButton>
             </div>
-            <div v-if="showAddProvider" class="add-form">
-              <NSpace vertical size="small">
-                <NInput v-model:value="newName" placeholder="名称" size="tiny" />
-                <NSelect v-model:value="newProtocol" :options="protocolOptions" size="tiny" />
-                <NInput v-model:value="newBaseURL" placeholder="Base URL" size="tiny" />
-                <NInput v-model:value="newAPIKey" placeholder="API Key" type="password" size="tiny" show-password-on="click" />
-                <NInput v-model:value="newModel" placeholder="默认模型" size="tiny" />
-                <NButton type="primary" size="tiny" @click="onAddProvider">提交</NButton>
-              </NSpace>
-            </div>
             <div class="provider-items">
-              <div
+              <button
                 v-for="p in providers"
                 :key="p.name"
+                type="button"
                 class="provider-item"
                 :class="{ active: p.name === selectedName }"
                 @click="selectProvider(p.name)"
               >
                 <div class="provider-item-head">
-                  <NTag v-if="p.is_default" type="success" size="tiny" :bordered="false">默认</NTag>
                   <strong class="provider-item-name">{{ p.name }}</strong>
+                  <NTag v-if="p.is_default" type="success" size="tiny" :bordered="false">默认</NTag>
                   <NPopconfirm
                     v-if="!p.is_default"
                     @positive-click="(e: Event) => { e.stopPropagation(); onDeleteProvider(p.name) }"
@@ -1713,40 +1821,42 @@ function kbModelSupportsVision(scanModel: string) {
                   </NPopconfirm>
                 </div>
                 <div class="provider-item-sub">
-                  <NTag size="tiny" :bordered="false">{{ p.protocol }}</NTag>
-                  <span class="muted">{{ p.models?.length || 0 }} 模型</span>
+                  <span class="provider-item-protocol">{{ p.protocol }}</span>
+                  <span class="provider-item-count">{{ p.models?.length || 0 }} 模型</span>
                 </div>
+              </button>
+              <div v-if="providers.length === 0" class="settings-empty provider-list-empty">
+                还没有提供商，点击上方「+ 新增」开始配置
               </div>
-              <div v-if="providers.length === 0" class="settings-empty">还没有 provider</div>
             </div>
-          </div>
+          </aside>
 
-          <!-- Right: detail pane -->
+          <!-- Right: detail / empty -->
           <div class="provider-detail">
-            <div v-if="!selected" class="settings-empty">← 选择左侧的 provider</div>
+            <div v-if="!selected" class="settings-empty provider-detail-empty">
+              ← 选择左侧提供商，或点击「+ 新增」
+            </div>
+
             <template v-else>
-              <!-- Basic info form. PR #9: refactored to use
-                   the unified .settings-section +
-                   .settings-form pattern. The old
-                   .detail-section / .detail-form / NSpace
-                   wrappers produced inconsistent spacing;
-                   the new classes give 14px row gap, 6px
-                   label-to-input gap, and a 1px border under
-                   the section header. -->
-              <div class="settings-section">
+              <!-- Provider editor -->
+              <div class="settings-section provider-editor">
                 <div class="settings-section-header">
-                  <h3 class="settings-section-title">基本信息</h3>
+                  <div class="provider-editor-title">
+                    <h3 class="settings-section-title">{{ selected.name }}</h3>
+                    <NTag size="tiny" :bordered="false">{{ selected.protocol }}</NTag>
+                    <NTag v-if="selected.is_default" type="success" size="tiny" :bordered="false">默认</NTag>
+                  </div>
                   <div class="settings-form-actions">
                     <NButton size="small" @click="hydrateEditForm(selected.name)" :disabled="dirty.size === 0">重置</NButton>
                     <NButton size="small" @click="onSaveProvider" type="primary" :disabled="dirty.size === 0">
-                      保存
+                      保存{{ dirty.size > 0 ? ` (${dirty.size})` : '' }}
                     </NButton>
                   </div>
                 </div>
                 <p class="settings-section-description">
-                  提供商的基础信息。点击「保存」将修改持久化到本地数据库。
+                  修改连接信息后点「保存」写入本地。API Key 留空表示保持原值不变。
                 </p>
-                <div class="settings-form">
+                <div class="settings-form settings-form--grid">
                   <div class="settings-form-row">
                     <label class="settings-form-label">名称</label>
                     <NInput
@@ -1755,7 +1865,7 @@ function kbModelSupportsVision(scanModel: string) {
                       :status="dirty.has('name') && editName.trim() === selected.name ? 'warning' : undefined"
                       @update:value="markDirty('name')"
                     />
-                    <span class="settings-form-hint">本地唯一标识，新建后不可改</span>
+                    <span class="settings-form-hint">本地唯一标识，可重命名</span>
                   </div>
                   <div class="settings-form-row">
                     <label class="settings-form-label">协议</label>
@@ -1767,7 +1877,7 @@ function kbModelSupportsVision(scanModel: string) {
                     />
                     <span class="settings-form-hint">OpenAI 兼容 / Anthropic / 自定义</span>
                   </div>
-                  <div class="settings-form-row">
+                  <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">Base URL</label>
                     <NInput
                       v-model:value="editBaseURL"
@@ -1777,39 +1887,34 @@ function kbModelSupportsVision(scanModel: string) {
                     />
                     <span class="settings-form-hint">API endpoint，OpenAI 兼容服务可填自有地址</span>
                   </div>
-                  <div class="settings-form-row">
+                  <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">API Key</label>
                     <NInput
                       v-model:value="editAPIKey"
                       size="small"
                       type="password"
                       show-password-on="click"
-                      placeholder="sk-..."
+                      placeholder="sk-...（留空保留原值）"
                       @update:value="markDirty('api_key')"
                     />
-                    <span class="settings-form-hint">留空保留原值，点击眼睛图标可临时显示</span>
+                    <span class="settings-form-hint">点击眼睛图标可临时显示明文</span>
                   </div>
-                  <div class="settings-form-row">
+                  <div class="settings-form-row settings-form-row--span2 settings-form-row--inline">
                     <div class="settings-form-toggle">
                       <NSwitch
                         :value="editIsDefault"
                         :disabled="selected.is_default"
                         @update:value="(v: boolean) => { editIsDefault = v; markDirty('is_default') }"
                       />
-                      <label class="settings-form-label" for="provider-default-switch">设为默认</label>
+                      <label class="settings-form-label" for="provider-default-switch">设为默认提供商</label>
                     </div>
                     <span v-if="selected.is_default" class="settings-form-hint">当前已是默认</span>
-                    <span v-else class="settings-form-hint">未选 provider 时使用第一个可用的</span>
+                    <span v-else class="settings-form-hint">未指定时优先使用默认提供商</span>
                   </div>
                 </div>
               </div>
 
-              <!-- Model table -->
-              <!-- Model table. PR #9: same .settings-section
-                   treatment as the basic info form. The
-                   add-model form is wrapped in a
-                   .settings-card so it visually separates
-                   from the existing model list below it. -->
+              <!-- Model list -->
               <div class="settings-section">
                 <div class="settings-section-header">
                   <h3 class="settings-section-title">模型 ({{ selected.models?.length || 0 }})</h3>
@@ -1818,49 +1923,11 @@ function kbModelSupportsVision(scanModel: string) {
                       获取模型
                     </NButton>
                     <NButton size="small" type="primary" ghost @click="onShowAddModel">
-                      {{ showAddModel ? '取消' : '+ 添加模型' }}
+                      + 添加模型
                     </NButton>
                   </div>
                 </div>
-                <div v-if="showAddModel" class="settings-card">
-                  <div class="settings-form">
-                    <div v-if="editingModelName" class="settings-form-hint">编辑模型: <code>{{ editingModelName }}</code></div>
-                    <div class="settings-form-row">
-                      <label class="settings-form-label">模型 ID</label>
-                      <NInput
-                        v-model:value="editModelName"
-                        :disabled="!!editingModelName"
-                        placeholder="例: gpt-4o-mini"
-                        size="small"
-                      />
-                    </div>
-                    <div class="settings-form-row">
-                      <label class="settings-form-label">显示名</label>
-                      <NInput v-model:value="editModelDisplay" placeholder="例: GPT-4o mini" size="small" />
-                    </div>
-                    <div class="settings-form-row">
-                      <label class="settings-form-label">上下文 (tokens)</label>
-                      <NInputNumber v-model:value="editModelCtx" :min="0" :step="1024" placeholder="例: 128000" size="small" />
-                    </div>
-                    <div class="settings-form-row">
-                      <label class="settings-form-label">最大输出 (tokens)</label>
-                      <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="例: 4096" size="small" />
-                    </div>
-                    <div class="settings-form-row">
-                      <div class="settings-form-toggle">
-                        <NSwitch v-model:value="editModelVision" />
-                        <label class="settings-form-label" for="model-vision-switch">支持视觉输入</label>
-                      </div>
-                      <span class="settings-form-hint">开启后用户可发送图片附件</span>
-                    </div>
-                    <div class="settings-form-actions">
-                      <NButton size="small" @click="onCancelEditModel">取消</NButton>
-                      <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">
-                        {{ editingModelName ? '保存修改' : '添加模型' }}
-                      </NButton>
-                    </div>
-                  </div>
-                </div>
+
                 <div v-if="selected.models && selected.models.length" class="model-list">
                   <div
                     v-for="m in selected.models"
@@ -1868,15 +1935,17 @@ function kbModelSupportsVision(scanModel: string) {
                     class="model-card"
                     :class="{ 'is-default': m.default }"
                   >
-                    <div class="model-card-top">
-                      <span class="model-card-name">{{ m.name }}</span>
-                      <NTag v-if="m.default" type="success" size="tiny" :bordered="false">默认</NTag>
-                      <NTag v-if="m.capabilities?.supports_vision" size="tiny" :bordered="false" type="info">视觉</NTag>
-                    </div>
-                    <div class="model-card-meta" v-if="m.display_name || m.max_tokens_context || m.max_tokens_output">
-                      <span v-if="m.display_name" class="model-meta-item">{{ m.display_name }}</span>
-                      <span v-if="m.max_tokens_context" class="model-meta-item">上下文 {{ fmtContext(m.max_tokens_context) }}</span>
-                      <span v-if="m.max_tokens_output" class="model-meta-item">输出 {{ m.max_tokens_output }}</span>
+                    <div class="model-card-main">
+                      <div class="model-card-top">
+                        <span class="model-card-name">{{ m.name }}</span>
+                        <NTag v-if="m.default" type="success" size="tiny" :bordered="false">默认</NTag>
+                        <NTag v-if="m.capabilities?.supports_vision" size="tiny" :bordered="false" type="info">视觉</NTag>
+                      </div>
+                      <div class="model-card-meta" v-if="m.display_name || m.max_tokens_context || m.max_tokens_output">
+                        <span v-if="m.display_name" class="model-meta-item">{{ m.display_name }}</span>
+                        <span v-if="m.max_tokens_context" class="model-meta-item">上下文 {{ fmtContext(m.max_tokens_context) }}</span>
+                        <span v-if="m.max_tokens_output" class="model-meta-item">输出 {{ m.max_tokens_output }}</span>
+                      </div>
                     </div>
                     <div class="model-card-actions">
                       <NButton size="tiny" quaternary @click="onEditModel(m)" title="编辑" aria-label="编辑">
@@ -1885,7 +1954,7 @@ function kbModelSupportsVision(scanModel: string) {
                       <NButton v-if="!m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认" aria-label="设为默认">
                         <Star :size="12" />
                       </NButton>
-                        <NPopconfirm @positive-click="onDeleteModel(m.name)" positive-text="删除" negative-text="取消">
+                      <NPopconfirm @positive-click="onDeleteModel(m.name)" positive-text="删除" negative-text="取消">
                         <template #trigger>
                           <NButton size="tiny" quaternary type="error" title="删除" aria-label="删除">
                             <X :size="12" />
@@ -1896,11 +1965,141 @@ function kbModelSupportsVision(scanModel: string) {
                     </div>
                   </div>
                 </div>
-                <div v-else class="settings-empty">还没有模型。点击「+ 添加模型」配置。</div>
+                <div v-else class="settings-empty">还没有模型。点击「+ 添加模型」或「获取模型」配置。</div>
               </div>
             </template>
           </div>
         </div>
+
+        <!-- Add provider modal -->
+        <NModal
+          v-model:show="showAddProvider"
+          preset="card"
+          title="新增提供商"
+          :style="{ width: 'min(560px, calc(100vw - 32px))' }"
+          :mask-closable="false"
+        >
+          <p class="modal-lead">填写连接信息。默认模型可手动输入，或用 API Key 从接口加载后选择。</p>
+          <div class="settings-form settings-form--grid modal-form">
+            <div class="settings-form-row">
+              <label class="settings-form-label">名称 <span class="settings-required">*</span></label>
+              <NInput v-model:value="newName" placeholder="例: openai / deepseek" size="small" />
+            </div>
+            <div class="settings-form-row">
+              <label class="settings-form-label">协议 <span class="settings-required">*</span></label>
+              <NSelect
+                v-model:value="newProtocol"
+                :options="protocolOptions"
+                size="small"
+                @update:value="() => { probeModelOptions = []; probeModelsError = '' }"
+              />
+            </div>
+            <div class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">Base URL</label>
+              <NInput
+                v-model:value="newBaseURL"
+                :placeholder="newProtocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
+                size="small"
+              />
+              <span class="settings-form-hint">可留空使用协议默认地址</span>
+            </div>
+            <div class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">API Key</label>
+              <NInput
+                v-model:value="newAPIKey"
+                placeholder="sk-..."
+                type="password"
+                size="small"
+                show-password-on="click"
+              />
+            </div>
+            <div class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">默认模型 <span class="settings-required">*</span></label>
+              <div class="model-pick-row">
+                <NSelect
+                  v-model:value="newModel"
+                  filterable
+                  tag
+                  clearable
+                  :options="probeModelOptions"
+                  :loading="probingModels"
+                  placeholder="输入或从列表选择模型 ID"
+                  size="small"
+                  class="model-pick-select"
+                />
+                <NButton
+                  size="small"
+                  :loading="probingModels"
+                  :disabled="!newAPIKey.trim()"
+                  @click="onProbeAddProviderModels"
+                >
+                  加载模型
+                </NButton>
+              </div>
+              <span v-if="probeModelsError" class="settings-form-hint settings-form-hint--error">{{ probeModelsError }}</span>
+              <span v-else class="settings-form-hint">先填 API Key，再点「加载模型」从上游 /models 拉取；也可直接输入</span>
+            </div>
+          </div>
+          <template #footer>
+            <div class="modal-footer-actions">
+              <NButton size="small" @click="cancelAddProvider">取消</NButton>
+              <NButton size="small" type="primary" @click="onAddProvider">创建</NButton>
+            </div>
+          </template>
+        </NModal>
+
+        <!-- Add / edit model modal -->
+        <NModal
+          v-model:show="showAddModel"
+          preset="card"
+          :title="editingModelName ? '编辑模型' : '添加模型'"
+          :style="{ width: 'min(520px, calc(100vw - 32px))' }"
+          :mask-closable="false"
+          @after-leave="onCancelEditModel"
+        >
+          <p v-if="editingModelName" class="modal-lead">
+            正在编辑 <code class="model-editor-id">{{ editingModelName }}</code>
+          </p>
+          <div class="settings-form settings-form--grid modal-form">
+            <div class="settings-form-row">
+              <label class="settings-form-label">模型 ID <span v-if="!editingModelName" class="settings-required">*</span></label>
+              <NInput
+                v-model:value="editModelName"
+                :disabled="!!editingModelName"
+                placeholder="例: gpt-4o-mini"
+                size="small"
+              />
+              <span v-if="editingModelName" class="settings-form-hint">创建后不可更改</span>
+            </div>
+            <div class="settings-form-row">
+              <label class="settings-form-label">显示名</label>
+              <NInput v-model:value="editModelDisplay" placeholder="例: GPT-4o mini" size="small" />
+            </div>
+            <div class="settings-form-row">
+              <label class="settings-form-label">上下文 (tokens)</label>
+              <NInputNumber v-model:value="editModelCtx" :min="0" :step="1024" placeholder="128000" size="small" class="model-num-input" />
+            </div>
+            <div class="settings-form-row">
+              <label class="settings-form-label">最大输出 (tokens)</label>
+              <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="4096" size="small" class="model-num-input" />
+            </div>
+            <div class="settings-form-row settings-form-row--span2 settings-form-row--inline">
+              <div class="settings-form-toggle">
+                <NSwitch v-model:value="editModelVision" />
+                <label class="settings-form-label" for="model-vision-switch">支持视觉输入</label>
+              </div>
+              <span class="settings-form-hint">开启后用户可发送图片附件</span>
+            </div>
+          </div>
+          <template #footer>
+            <div class="modal-footer-actions">
+              <NButton size="small" @click="onCancelEditModel">取消</NButton>
+              <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">
+                {{ editingModelName ? '保存修改' : '添加模型' }}
+              </NButton>
+            </div>
+          </template>
+        </NModal>
 
         <!-- Upstream models modal -->
         <NModal v-model:show="showUpstreamModels" preset="card" title="上游模型列表" style="width: 500px">
@@ -1944,8 +2143,29 @@ function kbModelSupportsVision(scanModel: string) {
               </div>
             </div>
             <p class="settings-section-description">
-              风格定义 LLM 的人设与记忆。内置风格不可编辑，可复制后创建自定义版本。
+              风格决定助手的语气、角色和长期备注。内置风格不可编辑，可复制后创建自定义版本。
             </p>
+            <div class="style-usage">
+              <div class="style-usage-title">使用说明</div>
+              <div class="style-usage-grid">
+                <div class="style-usage-item">
+                  <div class="style-usage-item-title">当前会话怎么用</div>
+                  <p>在聊天输入框下方打开“会话设置”，选择一个风格后，只会影响当前会话。</p>
+                </div>
+                <div class="style-usage-item">
+                  <div class="style-usage-item-title">自动生成风格</div>
+                  <p>聊天页右上角有“生成风格”按钮，可根据当前对话总结出新的回复风格，也可以优化已有风格。</p>
+                </div>
+                <div class="style-usage-item">
+                  <div class="style-usage-item-title">备注会一起保存</div>
+                  <p>生成风格时会同步整理备注/记忆，例如称呼偏好、常用表达和需要长期记住的背景信息。</p>
+                </div>
+                <div class="style-usage-item">
+                  <div class="style-usage-item-title">手动维护</div>
+                  <p>点击“查看/编辑”可以调整风格内容；点击“新增风格”可以从空白模板手动创建。</p>
+                </div>
+              </div>
+            </div>
           </div>
           <div class="style-grid">
             <div v-for="s in styles" :key="s.id" class="style-card">
@@ -1989,12 +2209,12 @@ function kbModelSupportsVision(scanModel: string) {
               <div class="settings-section">
                 <div class="settings-section-header">
                   <h3 class="settings-section-title">系统行为</h3>
-                  <p class="settings-section-description" style="margin: 0; flex: 1">
-                    上下文、Agent 循环、子代理的全局行为。修改后点击右下「保存」生效。
-                  </p>
                 </div>
+                <p class="settings-section-description">
+                  上下文、Agent 循环、子代理的全局行为。修改后点击右下「保存」生效。
+                </p>
               </div>
-              <NCollapse class="sys-collapse" :default-expanded-names="['work-mode', 'window', 'context', 'agent', 'subagent']">
+              <NCollapse class="settings-collapse" :default-expanded-names="['work-mode', 'vision', 'window', 'context', 'agent', 'subagent']">
                 <NCollapseItem title="工作模式" name="work-mode">
                   <div class="sys-form-grid">
                     <div class="sys-form-row">
@@ -2004,6 +2224,51 @@ function kbModelSupportsVision(scanModel: string) {
                         <NRadioButton value="daily">日常工作</NRadioButton>
                       </NRadioGroup>
                       <span class="sys-hint">风格只决定怎么说；工作模式决定优先处理哪类任务。</span>
+                    </div>
+                  </div>
+                </NCollapseItem>
+
+                <NCollapseItem title="图像识别" name="vision">
+                  <div class="sys-form-grid">
+                    <div class="sys-form-row">
+                      <span class="sys-label">启用工具</span>
+                      <NSwitch v-model:value="sysVision.enabled" size="small" @update:value="markSysDirty" />
+                      <span class="sys-hint">启用后，会话可选择通过 image_recognize 调用外部多模态模型。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">供应商</span>
+                      <NSelect
+                        :value="sysVision.provider"
+                        :options="visionProviderOptions"
+                        size="small"
+                        style="width: 180px"
+                        clearable
+                        @update:value="onVisionProviderUpdate"
+                      />
+                      <span class="sys-hint">从已添加的 LLM 提供商中选择。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">模型</span>
+                      <NSelect
+                        :value="sysVision.model"
+                        :options="visionModelOptions"
+                        size="small"
+                        style="width: 240px"
+                        clearable
+                        :disabled="!sysVision.provider"
+                        @update:value="onVisionModelUpdate"
+                      />
+                      <span class="sys-hint">建议选择已标记支持视觉输入的模型。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">超时</span>
+                      <NInputNumber v-model:value="sysVision.timeout_seconds" :min="5" :step="5" size="small" style="width:100px" @update:value="markSysDirty" />
+                      <span class="sys-hint">秒，默认 60。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">图片大小</span>
+                      <NInputNumber v-model:value="sysVision.max_image_bytes" :min="1024" :step="1048576" size="small" style="width:140px" @update:value="markSysDirty" />
+                      <span class="sys-hint">bytes，默认 10485760。</span>
                     </div>
                   </div>
                 </NCollapseItem>
@@ -2263,7 +2528,7 @@ function kbModelSupportsVision(scanModel: string) {
               <template v-if="newMCPType === 'stdio'">
                 <div class="settings-form-row">
                   <label class="settings-form-label">命令</label>
-                  <NInput v-model:value="newMCPCommand" placeholder="如：npx" size="small" style="max-width: 320px" />
+                  <NInput v-model:value="newMCPCommand" placeholder="如：C:\\Program Files\\nodejs\\npx.cmd" size="small" style="max-width: 320px" />
                 </div>
                 <div class="settings-form-row">
                   <label class="settings-form-label">参数</label>
@@ -2420,7 +2685,7 @@ function kbModelSupportsVision(scanModel: string) {
                 </div>
 
                 <!-- AI Scan Settings -->
-                <NCollapse class="kb-collapse-card">
+                <NCollapse class="settings-collapse">
                   <NCollapseItem title="AI 扫描设置" name="scan">
                     <div class="kb-settings-grid">
                       <div class="kb-settings-row">
@@ -3007,6 +3272,31 @@ function kbModelSupportsVision(scanModel: string) {
   flex-direction: column;
   gap: 18px;
 }
+/* Two-column field grid for provider / model editors.
+ * Full-width rows opt in via .settings-form-row--span2. */
+.settings-form--grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px 18px;
+  align-items: start;
+}
+.settings-form--grid .settings-form-row {
+  margin: 0;
+}
+.settings-form--grid .settings-form-row--span2,
+.settings-form--grid .settings-form-actions {
+  grid-column: 1 / -1;
+}
+@media (max-width: 900px) {
+  .settings-form--grid {
+    grid-template-columns: 1fr;
+  }
+}
+.settings-required {
+  color: var(--error-500);
+  font-weight: 600;
+  margin-left: 2px;
+}
 .settings-form-row {
   display: flex;
   flex-direction: column;
@@ -3257,126 +3547,242 @@ function kbModelSupportsVision(scanModel: string) {
 /* Providers tab — left/right split */
 .providers-split {
   display: grid;
-  grid-template-columns: 240px 1fr;
-  gap: 12px;
-  /* No fixed height. The grid sizes to its content; if
-   * content overflows, the parent .n-tab-pane (which has
-   * overflow: auto via AppSettingsLayout's content area)
-   * provides the scroll. The 60vh / 480px min was
-   * creating a visible empty band at the bottom of the
-   * settings dialog when the actual content (form +
-   * model list) was shorter than 60vh. */
+  grid-template-columns: 248px 1fr;
+  gap: 16px;
+  flex: 1;
+  /* Prefer filling the pane when the parent is a flex
+   * column (providers tab). Knowledge tab scrolls the pane
+   * itself, so min-height keeps the split readable. */
+  min-height: min(100%, 520px);
+  height: 100%;
 }
 .provider-list {
-  border: 1px solid var(--border-2);
-  border-radius: 6px;
-  background: var(--bg-2);
-  display: flex; flex-direction: column;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
+  min-height: 0;
 }
 .provider-list-header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border-2);
-  background: var(--bg-3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+  flex-shrink: 0;
 }
-.list-title { font-size: 12px; font-weight: 600; }
-.provider-items { flex: 1; overflow: auto; padding: 4px; }
+.list-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+.provider-items {
+  flex: 1;
+  overflow: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.provider-list-empty {
+  margin: 8px 4px;
+  padding: 16px 12px;
+}
 .provider-item {
-  padding: 8px 10px;
-  border-radius: 4px;
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
   cursor: pointer;
-  margin-bottom: 2px;
-  transition: background 0.15s;
+  box-sizing: border-box;
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out);
 }
-.provider-item:hover { background: var(--bg-3); }
+.provider-item:hover {
+  background: var(--surface-2);
+}
 .provider-item.active {
-  background: var(--accent);
-  color: var(--on-accent);
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-700);
 }
-.provider-item.active .muted { color: rgba(255, 255, 255, 0.85); }
+.provider-item.active .provider-item-protocol,
+.provider-item.active .provider-item-count {
+  color: var(--brand-600);
+}
 .provider-item-head {
-  display: flex; align-items: center; gap: 6px;
-  margin-bottom: 2px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  min-width: 0;
 }
-.provider-item-name { font-size: 13px; }
+.provider-item-name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
 .provider-del-btn {
   opacity: 0;
   margin-left: auto;
-  transition: opacity 0.15s;
+  flex-shrink: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
 }
-.provider-item:hover .provider-del-btn { opacity: 1; }
+.provider-item:hover .provider-del-btn,
+.provider-item:focus-within .provider-del-btn {
+  opacity: 1;
+}
 .provider-item-sub {
-  display: flex; align-items: center; gap: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+.provider-item-protocol {
+  font-family: var(--font-mono);
   font-size: 11px;
+  text-transform: lowercase;
+}
+.provider-item-count {
+  font-variant-numeric: tabular-nums;
 }
 
 .provider-detail {
-  border: 1px solid var(--border-2);
-  border-radius: 6px;
-  background: var(--bg-2);
-  display: flex; flex-direction: column;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
-  /* Outer padding so form fields don't sit on the border.
-   * The basic info / model sections use .settings-section
-   * which adds its own internal padding, so this is the
-   * main visual buffer between the card edge and any
-   * direct children. 16px is the standard settings-card
-   * padding (matches .settings-card in line ~2615). */
-  padding: 16px 18px;
+  min-height: 0;
+  padding: 18px 20px;
   gap: 4px;
 }
-.detail-section {
-  border-bottom: 1px solid var(--border-2);
-  padding: 12px 14px;
+.provider-detail-empty {
+  margin: auto;
+  max-width: 280px;
 }
-.detail-section:last-child { border-bottom: none; flex: 1; overflow: auto; }
-.detail-section-head {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 10px;
+.provider-editor-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
-.detail-form { padding: 4px 0; }
+.provider-editor-title .settings-section-title {
+  margin: 0;
+}
+.provider-editor .settings-section-header .settings-form-actions {
+  margin-top: 0;
+}
 
-.form-row {
-  display: flex; align-items: center; gap: 10px;
+/* Model editor card (add / edit) */
+.model-editor {
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  border-color: var(--border-default);
+  background: var(--surface-2);
 }
-.form-label {
+.model-editor .settings-card-header {
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.model-editor-id {
+  font-family: var(--font-mono);
   font-size: 12px;
-  width: 100px;
-  color: var(--text-2);
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: var(--surface-1);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  margin-left: 6px;
 }
-.form-hint { font-size: 11px; }
+.model-num-input {
+  width: 100%;
+  max-width: 200px;
+}
+.model-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.model-pick-select {
+  flex: 1;
+  min-width: 0;
+}
+.modal-lead {
+  margin: 0 0 14px;
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+.modal-form {
+  margin-bottom: 4px;
+}
+.modal-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 
 /* Model cards */
 .model-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 .model-card {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 12px;
+  padding: 12px 14px;
   border-radius: var(--radius-md);
-  background: var(--surface-1);
+  background: var(--surface-0);
   border: 1px solid var(--border-subtle);
   font-size: 13px;
-  transition: border-color var(--dur-fast) var(--ease-out);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
 }
 .model-card:hover {
   border-color: var(--border-default);
 }
 .model-card.is-default {
-  border-color: var(--success-500);
+  border-color: color-mix(in srgb, var(--success-500) 35%, var(--border-subtle));
   background: var(--success-50);
+}
+.model-card.is-editing {
+  border-color: var(--brand-100);
+  background: var(--brand-50);
+  box-shadow: inset 3px 0 0 var(--brand-500);
+}
+.model-card-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 .model-card-top {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 140px;
-  flex-shrink: 0;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 .model-card-name {
   font-family: var(--font-mono);
@@ -3388,11 +3794,11 @@ function kbModelSupportsVision(scanModel: string) {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex: 1;
   min-width: 0;
   color: var(--text-tertiary);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
+  flex-wrap: wrap;
 }
 .model-meta-item {
   white-space: nowrap;
@@ -3401,8 +3807,14 @@ function kbModelSupportsVision(scanModel: string) {
 }
 .model-card-actions {
   display: flex;
-  gap: 4px;
+  gap: 2px;
   flex-shrink: 0;
+  opacity: 0.55;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.model-card:hover .model-card-actions,
+.model-card.is-editing .model-card-actions {
+  opacity: 1;
 }
 .model-id {
   background: var(--surface-2);
@@ -3415,16 +3827,54 @@ function kbModelSupportsVision(scanModel: string) {
 
 .muted { color: var(--text-3); font-size: 12px; }
 .empty-hint { padding: 20px; text-align: center; }
+/* Compact inline add form (knowledge-base list). Provider
+ * add now uses the right detail pane instead. */
 .add-form {
-  margin-top: 8px;
-  padding: 10px;
-  background: var(--bg-2);
-  border: 1px solid var(--border-2);
-  border-radius: 6px;
+  margin: 0 8px 8px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 .styles-tab-body {
   min-height: 100%;
   overflow: visible;
+}
+.style-usage {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.style-usage-title {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: var(--space-2);
+}
+.style-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+.style-usage-item {
+  min-width: 0;
+}
+.style-usage-item-title {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 500;
+  margin-bottom: var(--space-1);
+}
+.style-usage-item p {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.5;
 }
 /* ---- 风格卡片网格 ---- */
 .style-grid {
@@ -3438,7 +3888,7 @@ function kbModelSupportsVision(scanModel: string) {
   border-radius: 8px;
   padding: 14px 16px;
   display: flex; flex-direction: column; gap: 8px;
-  transition: border-color .15s;
+  transition: border-color var(--dur-fast) var(--ease-out);
 }
 .style-card:hover { border-color: var(--accent); }
 .style-card-top { display: flex; align-items: center; gap: 8px; }
@@ -3648,7 +4098,7 @@ code {
 .scan-progress { padding: 8px 0; }
 .scan-info { display: flex; gap: 12px; align-items: center; font-size: 13px; }
 .scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; flex: 1; }
-.scan-bar-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
+.scan-bar-fill { height: 100%; background: var(--accent); transition: width var(--dur-slow) var(--ease-out); }
 .scan-bar-pct { font-size: 10px; color: var(--text-4); margin-left: 6px; white-space: nowrap; }
 .scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
 
@@ -3659,11 +4109,6 @@ code {
 }
 .kb-header-left { display: flex; align-items: center; gap: 8px; }
 
-.kb-collapse-card {
-  border: 1px solid var(--border-2);
-  border-radius: 6px;
-  margin-bottom: 8px;
-}
 .kb-config-row {
   display: flex; align-items: center; gap: 10px; padding: 3px 0;
 }
@@ -3784,8 +4229,8 @@ code {
 /* Child rows in L2 detail */
 .kb-node-child-row {
   display: flex; align-items: center; gap: 6px;
-  padding: 5px 8px; border-radius: 4px; cursor: pointer;
-  transition: background 0.15s;
+  padding: 5px 8px; border-radius: var(--radius-sm); cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
 }
 .kb-node-child-row:hover { background: var(--bg-3); }
 .kb-node-child-row.active { background: var(--bg-3); }
@@ -3805,25 +4250,14 @@ code {
 
 /* System config tab.
  *
- * PR #9 follow-up: refactored for the unified form rhythm.
- * The previous version forced a `height: 58vh` on the shell
- * to give the NCollapse groups room to breathe, but that
- * caused a visible empty band at the bottom of the settings
- * dialog when the content (3 NCollapse groups) was shorter
- * than 58vh. The fix: drop the fixed height, let the
- * NTabPane size naturally, and put the vertical breathing
- * room into the form rows + gap between NCollapse items
- * instead. Now the dialog fills the available space only
- * to the extent the content needs, and the scrollbar
- * appears only when content actually overflows.
- */
+ * Collapse chrome lives in global `.settings-collapse`
+ * (per-item cards). This shell only owns scroll + footer. */
 .system-config-shell {
-  /* No fixed height — let the NTabPane's flex sizing
-   * determine the height. The NTabPane already has
-   * `flex: 1; min-height: 0` so this fills the available
-   * layout dialog height. */
   display: flex;
   flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
 }
 .system-config-scroll {
   flex: 1;
@@ -3831,86 +4265,42 @@ code {
   overflow-y: auto;
 }
 .system-config-body {
-  padding: 4px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.system-config-body > .settings-section {
+  margin-bottom: var(--space-4);
 }
 
-/* Outer wrapper around the 3 NCollapse groups. Gap gives
- * 16px between groups (matching the standard form-row
- * gap) so they feel like distinct sections rather than
- * one glued-together block. */
-.sys-collapse {
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-1);
-  /* NCollapse itself has its own internal margin; we
-   * tighten it to 0 so our .sys-collapse + {margin-top}
-   * below is the only vertical rhythm. */
-  --n-collapse-item-margin: 0;
-  /* 16px between groups. */
-  margin-bottom: 16px;
-}
-.sys-collapse:last-child {
-  margin-bottom: 0;
-}
-
-/* NCollapse title row. The default has minimal padding
- * (12px 16px) which makes the title look cramped against
- * the border. Bump to 14px/18px to match our spacing
- * scale. Also tighten the title font to 13px medium
- * (instead of the default 14px) so it matches the
- * .settings-section-title rhythm. */
-.sys-collapse :deep(.n-collapse-item__header-main) {
-  font-size: 13.5px;
-  font-weight: 600;
-  color: var(--text-primary);
-  letter-spacing: -0.005em;
-}
-.sys-collapse :deep(.n-collapse-item) {
-  /* Header padding: more horizontal, more vertical. */
-}
-.sys-collapse :deep(.n-collapse-item__header) {
-  padding: 12px 18px;
-  border-color: var(--border-subtle);
-}
-.sys-collapse :deep(.n-collapse-item .n-collapse-item__content-inner) {
-  /* Inner content area: 18px horizontal to align with the
-   * header, 18px vertical for breathing room. The default
-   * NCollapse is 16px which feels tight next to our 14px
-   * form-label font. */
-  padding: 16px 18px 18px;
-}
-
-/* Form grid + row inside the NCollapse items. PR #9
- * follow-up: 10px vertical padding per row, 16px row gap,
- * upgraded typography. Previously rows were crammed with
- * only 3px padding + 2px row gap, which made the
- * configuration dense and hard to scan. */
+/* Form grid + row inside settings-collapse items.
+ * Row dividers only — card chrome comes from .settings-collapse
+ * in style.css (per-item cards, continuous header/body). */
 .sys-form-grid {
   display: flex;
   flex-direction: column;
-  gap: 4px;  /* extra padding via .sys-form-row vertical handles the rest */
+  gap: 0;
 }
 .sys-form-row {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 0;
-  /* Subtle divider between rows. The first row in each
-   * group drops the top border via :first-child. */
+  padding: 10px 0;
   border-top: 1px solid var(--border-subtle);
 }
 .sys-form-row:first-child {
   border-top: none;
-  padding-top: 4px;
+  padding-top: 2px;
 }
 .sys-form-row:last-child {
-  padding-bottom: 4px;
+  padding-bottom: 2px;
 }
 .sys-label {
-  /* Widened from 130px to 150px so longer Chinese labels
+  /* Widened so longer Chinese labels
    * ("自动压缩缓冲区", "工具结果截断轮次") don't wrap. */
   font-size: 12.5px;
-  color: var(--text-secondary);
+  color: var(--text-primary);
   font-weight: 500;
   width: 160px;
   flex-shrink: 0;
@@ -3922,9 +4312,6 @@ code {
   color: var(--text-tertiary);
   flex: 1;
   line-height: 1.5;
-  /* Keep the hint on the same line as the input for
-   * compact rows, but allow wrap if the message is
-   * long (e.g. "bytes，默认 6000（含子代理/task 结果）") */
   white-space: normal;
   min-width: 0;
 }
@@ -3933,17 +4320,10 @@ code {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 16px 0 8px;
-  /* Subtle top border to separate from the content. */
+  padding: 16px 0 0;
   border-top: 1px solid var(--border-subtle);
-  margin-top: 8px;
-}
-
-/* NCollapse arrow icon color — default is a hard
- * `--text-3`; we soften it to `--text-tertiary` for
- * visual consistency. */
-.sys-collapse :deep(.n-collapse-item__header .n-base-icon) {
-  color: var(--text-tertiary);
+  margin-top: 16px;
+  flex-shrink: 0;
 }
 
 .browser-ext-download-link {

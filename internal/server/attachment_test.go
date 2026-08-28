@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,7 +106,7 @@ func TestResolveHistoryUploads_RehydratesBase64(t *testing.T) {
 
 	msgs := []llm.ChatMessage{
 		{Role: llm.RoleUser, Type: llm.TypeText, Content: "plain", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
-		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "upl://" + id, Name: "a.png", MimeType: "image/png", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "upl://" + id, Name: "a.png", MimeType: "image/png", UploadID: id, MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
 		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "upl://" + "deadbeefcafebabe", Name: "gone.png", MimeType: "image/png", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
 	}
 	out := resolveHistoryUploads(msgs, resolver)
@@ -123,6 +124,29 @@ func TestResolveHistoryUploads_RehydratesBase64(t *testing.T) {
 	}
 	if out[2].Type != llm.TypeText || out[2].Content == "upl://deadbeefcafebabe" {
 		t.Errorf("missing file should degrade to a text marker: %+v", out[2])
+	}
+}
+
+func TestResolveHistoryUploads_EmptyUploadDegradesToText(t *testing.T) {
+	dir := t.TempDir()
+	id := "abcd1234567890ab"
+	if err := os.WriteFile(filepath.Join(dir, id+"-empty.png"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &agent.DiskAttachmentResolver{BaseDir: dir}
+
+	msgs := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeImage, Content: "upl://" + id, Name: "empty.png", MimeType: "image/png", MsgType: llm.MsgTypeImage, SubmitToLLM: 1},
+	}
+	out := resolveHistoryUploads(msgs, resolver)
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	if out[0].Type != llm.TypeText {
+		t.Fatalf("Type = %q, want text marker", out[0].Type)
+	}
+	if out[0].Content == "" || out[0].Content == "upl://"+id {
+		t.Fatalf("Content = %q, want non-empty marker", out[0].Content)
 	}
 }
 
@@ -179,6 +203,28 @@ func TestUploadAndSend_Image(t *testing.T) {
 	wantPath := filepath.Join(UploadDir(), up.ID+"-"+up.Name)
 	if _, err := os.Stat(wantPath); err != nil {
 		t.Errorf("uploaded file missing at %s: %v", wantPath, err)
+	}
+}
+
+func TestUploadRejectsEmptyFile(t *testing.T) {
+	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	if _, err := mw.CreateFormFile("file", "empty.png"); err != nil {
+		t.Fatal(err)
+	}
+	_ = mw.Close()
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/v1/uploads", body)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	s.engine.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("upload: status=%d body=%s, want 400", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "empty file") {
+		t.Fatalf("body = %q, want empty file error", w.Body.String())
 	}
 }
 

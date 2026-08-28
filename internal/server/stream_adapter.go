@@ -27,6 +27,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		SubAgentColor:         chunk.SubAgentColor,
 		SubAgentModel:         chunk.SubAgentModel,
 		SubAgentTaskID:        chunk.SubAgentTaskID,
+		SubAgentRunMode:       chunk.SubAgentRunMode,
 		SubAgentDescription:   chunk.SubAgentDescription,
 		SubAgentFailureReason: chunk.SubAgentFailureReason,
 		ThinkingRewrite:       chunk.ThinkingRewrite,

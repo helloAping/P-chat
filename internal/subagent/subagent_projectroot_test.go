@@ -26,6 +26,21 @@ func TestBuildSubAgentChatRequest_PropagatesProjectRoot(t *testing.T) {
 	}
 }
 
+// TestBuildSubAgentChatRequest_InheritsRoundPolicy verifies that
+// sub-agents no longer have a shorter child-only round cap. MaxRounds
+// must stay unset so agent.ChatWithTools resolves the same configured
+// policy used by the parent conversation.
+func TestBuildSubAgentChatRequest_InheritsRoundPolicy(t *testing.T) {
+	req := Request{
+		Description: "inspect a large module",
+		TaskID:      "t2",
+	}
+	cr := buildSubAgentChatRequest(req, style.Tech, "cs", "mimo-v2.5", "you are an explore agent", "explore", "#5AAE5A")
+	if cr.MaxRounds != 0 {
+		t.Fatalf("MaxRounds = %d, want 0 so sub-agent inherits parent/config policy", cr.MaxRounds)
+	}
+}
+
 // TestTool_ProjectRootFromCtx_Roundtrip ensures the exported
 // accessor added for sub-agent consumption reads back what
 // WithProjectRoot wrote, so the task handler can pull the

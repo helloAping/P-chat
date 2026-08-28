@@ -13,6 +13,9 @@ package agent
 // Split from agent.go in T05. Behaviour unchanged.
 
 import (
+	"encoding/json"
+	"strings"
+
 	"github.com/google/uuid"
 
 	"github.com/p-chat/pchat/internal/llm"
@@ -47,6 +50,84 @@ func normalizeToolCallIDs(toolCalls []nativeToolCall, seen map[string]bool) {
 			tc.ID = "call_" + uuid.NewString()
 		}
 		seen[tc.ID] = true
+	}
+}
+
+// normalizeToolCallArgsJSON ensures tool call arguments are a JSON object before
+// the call is persisted, displayed, executed, or replayed to the next LLM round.
+// Some OpenAI-compatible providers reject the entire request when an assistant
+// tool_call carries function.arguments that is not valid JSON.
+func normalizeToolCallArgsJSON(toolName, argsJSON string) string {
+	s := strings.TrimSpace(argsJSON)
+	if s == "" || s == "null" {
+		return "{}"
+	}
+
+	var v any
+	if err := json.Unmarshal([]byte(s), &v); err == nil {
+		if _, ok := v.(map[string]any); ok {
+			return s
+		}
+		if str, ok := v.(string); ok {
+			return singleStringToolArgs(toolName, str)
+		}
+		return "{}"
+	}
+	if looksLikeJSON(s) {
+		return "{}"
+	}
+
+	return singleStringToolArgs(toolName, s)
+}
+
+func looksLikeJSON(s string) bool {
+	if s == "" {
+		return false
+	}
+	switch s[0] {
+	case '{', '[', '"':
+		return true
+	default:
+		return false
+	}
+}
+
+func singleStringToolArgs(toolName, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "{}"
+	}
+	key := ""
+	switch toolName {
+	case "exec_command", "start_process":
+		key = "command"
+	case "read_file", "read_docx", "read_pdf", "list_files":
+		key = "path"
+	case "web_fetch":
+		key = "url"
+	case "grep", "web_search", "wiki_lookup":
+		key = "query"
+	case "read_process_output", "stop_process":
+		key = "process_id"
+	case "task_status", "task_cancel", "task_wait":
+		key = "task_id"
+	case "task":
+		data, _ := json.Marshal(map[string]string{
+			"description": value,
+			"prompt":      value,
+		})
+		return string(data)
+	}
+	if key == "" {
+		return "{}"
+	}
+	data, _ := json.Marshal(map[string]string{key: value})
+	return string(data)
+}
+
+func normalizeToolCallArgs(toolCalls []nativeToolCall) {
+	for i := range toolCalls {
+		toolCalls[i].ArgsJSON = normalizeToolCallArgsJSON(toolCalls[i].Name, toolCalls[i].ArgsJSON)
 	}
 }
 
@@ -117,4 +198,3 @@ func normalizeToolResults(msgs []llm.ChatMessage) []llm.ChatMessage {
 	}
 	return out
 }
-

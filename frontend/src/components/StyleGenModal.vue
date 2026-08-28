@@ -398,7 +398,15 @@ function errorHint(kind: string): string {
             <span>memory {{ result.memory?.length || 0 }} 字符</span>
             <span>可去「设置 → 风格」进一步编辑</span>
           </div>
-          <pre class="sg-result-preview">{{ result.prompt }}</pre>
+          <div class="sg-result-section">
+            <div class="sg-result-section-title">提示词（Prompt）</div>
+            <pre class="sg-result-preview">{{ result.prompt }}</pre>
+          </div>
+          <div class="sg-result-section">
+            <div class="sg-result-section-title">记忆（Memory）</div>
+            <pre v-if="result.memory" class="sg-result-preview">{{ result.memory }}</pre>
+            <div v-else class="sg-result-empty">（本次未生成记忆，可去「设置 → 风格」补充）</div>
+          </div>
         </div>
 
         <div class="sg-actions">
@@ -621,6 +629,17 @@ function errorHint(kind: string): string {
   font-size: 12px;
   color: var(--text-tertiary);
 }
+.sg-result-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.sg-result-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  letter-spacing: 0.02em;
+}
 .sg-result-preview {
   margin: 0;
   max-height: 180px;
@@ -633,6 +652,14 @@ function errorHint(kind: string): string {
   word-break: break-word;
   background: var(--surface-1);
   border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+}
+.sg-result-empty {
+  font-size: 12.5px;
+  color: var(--text-quaternary);
+  background: var(--surface-1);
+  border: 1px dashed var(--border-subtle);
   border-radius: var(--radius-sm);
   padding: var(--space-3);
 }

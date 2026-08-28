@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -163,6 +164,11 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// question tool's tool_call/tool_result row (msg_type=4),
 	// which buildMessageResponse already filters out below.
 
+	// Merge user attachment rows back into the text row from the same
+	// turn. Live streaming renders text+uploads as one local message;
+	// storage keeps them as separate rows so uploads can stay typed.
+	out = mergeUserAttachmentRows(out)
+
 	// Merge consecutive assistant messages that belong to the
 	// same user turn. During live streaming the frontend
 	// accumulates all ReAct-round outputs into a single message
@@ -177,6 +183,35 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		"oldest_id":  oldestID,
 		"oldest_seq": oldestSeq,
 	})
+}
+
+func mergeUserAttachmentRows(msgs []MessageResponse) []MessageResponse {
+	if len(msgs) <= 1 {
+		return msgs
+	}
+	merged := make([]MessageResponse, 0, len(msgs))
+	for _, msg := range msgs {
+		if len(merged) > 0 && shouldMergeUserAttachmentRow(merged[len(merged)-1], msg) {
+			prev := &merged[len(merged)-1]
+			prev.Attachments = append(prev.Attachments, msg.Attachments...)
+			if strings.TrimSpace(prev.Content) == "" && strings.TrimSpace(msg.Content) != "" {
+				prev.Content = msg.Content
+			}
+			continue
+		}
+		merged = append(merged, msg)
+	}
+	return merged
+}
+
+func shouldMergeUserAttachmentRow(prev, curr MessageResponse) bool {
+	if prev.Role != "user" || curr.Role != "user" {
+		return false
+	}
+	if len(curr.Attachments) == 0 {
+		return false
+	}
+	return strings.TrimSpace(curr.Content) == ""
 }
 
 // SnapshotRecovery (P0-1) returns the delta of assistant
@@ -289,12 +324,12 @@ type ContextMessage struct {
 // snapshot of the current conversation's footprint so
 // the chat UI can render the "上下文" tab/drawer.
 type ContextInspectorResponse struct {
-	SessionID         string           `json:"session_id"`
-	Provider          string           `json:"provider"`
-	Model             string           `json:"model"`
-	ContextWindow     int              `json:"context_window"`
-	EstimatedTokens   int              `json:"estimated_tokens"`
-	UsableTokens      int              `json:"usable_tokens"`
+	SessionID       string `json:"session_id"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	ContextWindow   int    `json:"context_window"`
+	EstimatedTokens int    `json:"estimated_tokens"`
+	UsableTokens    int    `json:"usable_tokens"`
 	// UtilizationPct is estimated_tokens / usable_tokens * 100 —
 	// the denominator the auto-compact logic actually triggers on.
 	UtilizationPct float64 `json:"utilization_pct"`
@@ -378,10 +413,10 @@ func (h *Handler) ContextInspector(c *gin.Context) {
 	// Per-message breakdown for the UI list. We use
 	// the RAW (un-bound) messages here so each row
 	// corresponds to a single database row the user
-	// can mentally map. The token count is the
-	// `EstimateTokens` of the content (no per-
-	// message overhead at the row level — that
-	// overhead is rolled into the total below).
+	// can mentally map. The token count uses the
+	// same single-message estimator as the agent, so
+	// media rows are bounded multimodal parts rather
+	// than raw base64 text.
 	const previewMax = 100
 	out := make([]ContextMessage, 0, len(histMsgs))
 	for _, m := range histMsgs {
@@ -402,7 +437,7 @@ func (h *Handler) ContextInspector(c *gin.Context) {
 		}
 		out = append(out, ContextMessage{
 			Role:         m.Role,
-			Tokens:       llm.EstimateTokens(m.Content),
+			Tokens:       llm.EstimateMessageTokens(m),
 			Preview:      preview,
 			IsToolResult: m.Role == "tool",
 		})
@@ -503,7 +538,7 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 		parts = append(parts, m.Parts...)
 	}
 
-	base.Parts = parts
+	base.Parts = reorderAsyncSubAgentsAfterTaskTools(parts)
 	// `base.Content` is intentionally NOT regenerated from
 	// parts. The MessageBubble component (frontend/src/components/
 	// MessageBubble.vue) renders assistant messages off
@@ -515,6 +550,158 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 	// recomputing Content here would diverge from the
 	// user-visible streaming bubble.
 	return base
+}
+
+func reorderAsyncSubAgentsAfterTaskTools(parts []MessagePart) []MessagePart {
+	if len(parts) <= 1 {
+		return parts
+	}
+
+	rest := make([]MessagePart, 0, len(parts))
+	asyncSubs := make([]MessagePart, 0)
+	for _, p := range parts {
+		if isAsyncSubAgentPart(p) {
+			asyncSubs = append(asyncSubs, p)
+			continue
+		}
+		rest = append(rest, p)
+	}
+	if len(asyncSubs) == 0 {
+		return parts
+	}
+
+	insertAfter := -1
+	taskOrder := make([]string, 0, len(asyncSubs))
+	seen := make(map[string]struct{})
+	for i, p := range rest {
+		if !isTaskToolPart(p) {
+			continue
+		}
+		insertAfter = i
+		for _, key := range taskToolOrderKeys(p) {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			taskOrder = append(taskOrder, key)
+		}
+	}
+	if insertAfter < 0 {
+		return parts
+	}
+
+	orderedSubs := orderAsyncSubAgents(asyncSubs, taskOrder)
+	out := make([]MessagePart, 0, len(parts))
+	out = append(out, rest[:insertAfter+1]...)
+	out = append(out, orderedSubs...)
+	out = append(out, rest[insertAfter+1:]...)
+	return out
+}
+
+func isAsyncSubAgentPart(p MessagePart) bool {
+	return p.Kind == "sub_agent" && p.RunMode == "async"
+}
+
+func isTaskToolPart(p MessagePart) bool {
+	return p.Kind == "tool" && p.Name == "task"
+}
+
+func taskToolOrderKeys(p MessagePart) []string {
+	keys := make([]string, 0, 3)
+	for _, key := range []string{
+		taskIDFromJSON(p.Args),
+		taskIDFromText(p.Result),
+		taskDescriptionFromJSON(p.Args),
+	} {
+		key = normalizeTaskOrderKey(key)
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func orderAsyncSubAgents(parts []MessagePart, taskOrder []string) []MessagePart {
+	if len(parts) <= 1 || len(taskOrder) == 0 {
+		return parts
+	}
+	order := make(map[string]int, len(taskOrder))
+	for i, key := range taskOrder {
+		if _, ok := order[key]; !ok {
+			order[key] = i
+		}
+	}
+	type rankedPart struct {
+		part  MessagePart
+		rank  int
+		index int
+	}
+	ranked := make([]rankedPart, 0, len(parts))
+	for i, p := range parts {
+		rank := len(taskOrder) + i
+		for _, key := range []string{p.TaskID, p.Task} {
+			if n, ok := order[normalizeTaskOrderKey(key)]; ok {
+				rank = n
+				break
+			}
+		}
+		ranked = append(ranked, rankedPart{part: p, rank: rank, index: i})
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].rank != ranked[j].rank {
+			return ranked[i].rank < ranked[j].rank
+		}
+		return ranked[i].index < ranked[j].index
+	})
+	out := make([]MessagePart, 0, len(parts))
+	for _, item := range ranked {
+		out = append(out, item.part)
+	}
+	return out
+}
+
+func taskIDFromJSON(raw string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+	if v, ok := payload["task_id"].(string); ok {
+		return v
+	}
+	if v, ok := payload["taskId"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func taskDescriptionFromJSON(raw string) string {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+	if v, ok := payload["description"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func taskIDFromText(s string) string {
+	const marker = "task_id="
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(marker):]
+	for j, r := range rest {
+		if r == ',' || r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			return rest[:j]
+		}
+	}
+	return rest
+}
+
+func normalizeTaskOrderKey(s string) string {
+	return strings.TrimSpace(s)
 }
 
 // buildMessageResponse shapes one ChatMessage row into the
@@ -537,6 +724,12 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 // (groupID, true) rows.
 
 func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64, seq int64, regenGroupID string, isArchived bool) *MessageResponse {
+	if i < len(metas) && isUIHiddenMessageMeta(metas[i]) {
+		return nil
+	}
+	if isLegacyInternalResumeMessage(m) {
+		return nil
+	}
 	created := time.Now().Unix()
 	if i < len(createds) && createds[i] != 0 {
 		created = createds[i]
@@ -633,6 +826,33 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 	return &resp
 }
 
+func isUIHiddenMessageMeta(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+		return false
+	}
+	switch v := meta["ui_hidden"].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	default:
+		return false
+	}
+}
+
+func isLegacyInternalResumeMessage(m llm.ChatMessage) bool {
+	if m.Role != llm.RoleUser || m.MsgType != llm.MsgTypeText {
+		return false
+	}
+	content := strings.TrimSpace(m.Content)
+	return strings.HasPrefix(content, "⏱ 上一回合因") ||
+		strings.HasPrefix(content, "⚠ 系统检测：你刚才的回复没有调用任何工具")
+}
+
 // parseInt64Query returns the int64 value of a query string
 // parameter, or `def` if the parameter is missing or invalid.
 
@@ -700,7 +920,7 @@ func resolveHistoryUploads(msgs []llm.ChatMessage, r *agent.DiskAttachmentResolv
 	}
 	for i, m := range msgs {
 		id, ok := uploadIDFromContent(m.Content)
-		if !ok || m.UploadID != "" {
+		if !ok {
 			continue
 		}
 		path, _ := r.Resolve(agent.Attachment{ID: id})
@@ -715,6 +935,16 @@ func resolveHistoryUploads(msgs []llm.ChatMessage, r *agent.DiskAttachmentResolv
 				Role:        m.Role,
 				Type:        llm.TypeText,
 				Content:     fmt.Sprintf("(attached image %s — file not found on server)", m.Name),
+				MsgType:     llm.MsgTypeText,
+				SubmitToLLM: 1,
+			}
+			continue
+		}
+		if len(data) == 0 {
+			msgs[i] = llm.ChatMessage{
+				Role:        m.Role,
+				Type:        llm.TypeText,
+				Content:     fmt.Sprintf("(attached image %s — upload file is empty)", m.Name),
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
 			}
@@ -817,7 +1047,10 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 //  1. Filter out display-only rows (SubmitToLLM == 0): the
 //     system prompt, thinking blocks, raw exec_command output,
 //     etc. — anything the user sees in the chat but the LLM
-//     doesn't need in its context.
+//     doesn't need in its context. Historical image rows with
+//     upload_id are the exception: the agent needs their
+//     references so it can replace them with safe placeholders
+//     or image_recognize tool hints before the LLM request.
 //
 //  2. Rewrite `task` tool results from role=tool to role=user.
 //     The `task` tool is the sub-agent system entry point.
@@ -843,7 +1076,7 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 func buildLLMMessages(histMsgs []llm.ChatMessage) []llm.ChatMessage {
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
-		if m.SubmitToLLM == 0 {
+		if m.SubmitToLLM == 0 && !isHistoricalImageReference(m) {
 			continue
 		}
 		if m.MsgType == llm.MsgTypeTool && m.Role == llm.RoleTool && m.ToolName == "task" {
@@ -852,6 +1085,10 @@ func buildLLMMessages(histMsgs []llm.ChatMessage) []llm.ChatMessage {
 		msgs = append(msgs, m)
 	}
 	return msgs
+}
+
+func isHistoricalImageReference(m llm.ChatMessage) bool {
+	return m.Type == llm.TypeImage && strings.TrimSpace(m.UploadID) != ""
 }
 
 // decodePartsFromMeta pulls the assistant message's `parts`
@@ -935,6 +1172,9 @@ func hasTextOrThinking(parts []MessagePart) bool {
 		if p.Kind == "text" || p.Kind == "thinking" {
 			return true
 		}
+		if len(p.Parts) > 0 && hasTextOrThinking(p.Parts) {
+			return true
+		}
 	}
 	return false
 }
@@ -957,22 +1197,23 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 	}
 	model := h.sessionModel(cv.ID, provider)
 	return SessionResponse{
-		ID:              cv.ID,
-		Title:           cv.Title,
-		Provider:        provider,
-		Model:           model,
-		Style:           m.Style,
-		WorkMode:        string(h.sessionWorkMode(cv.ID)),
-		ProjectPath:     m.ProjectPath,
-		PlanMode:        m.PlanMode,
-		PermissionLevel: m.PermissionLevel,
-		ReasoningEffort: m.ReasoningEffort,
-		VectorStore:     cv.VectorStore,
-		KnowledgeBase:   m.KnowledgeBase,
-		AutoContinue:    h.sessionAutoContinue(cv.ID),
-		TodoLongRunMode: string(h.sessionTodoLongRunMode(cv.ID)),
-		CreatedAt:       cv.CreatedAt.Unix(),
-		UpdatedAt:       cv.UpdatedAt.Unix(),
+		ID:                  cv.ID,
+		Title:               imConversationResponseTitle(cv.ID, cv.Title),
+		Provider:            provider,
+		Model:               model,
+		Style:               m.Style,
+		WorkMode:            string(h.sessionWorkMode(cv.ID)),
+		ProjectPath:         m.ProjectPath,
+		PlanMode:            m.PlanMode,
+		PermissionLevel:     m.PermissionLevel,
+		ReasoningEffort:     m.ReasoningEffort,
+		VectorStore:         cv.VectorStore,
+		KnowledgeBase:       m.KnowledgeBase,
+		AutoContinue:        h.sessionAutoContinue(cv.ID),
+		TodoLongRunMode:     string(h.sessionTodoLongRunMode(cv.ID)),
+		UseImageRecognition: m.UseImageRecognition,
+		CreatedAt:           cv.CreatedAt.Unix(),
+		UpdatedAt:           cv.UpdatedAt.Unix(),
 	}
 }
 

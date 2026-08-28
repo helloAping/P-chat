@@ -27,12 +27,24 @@ $expectedCounts = [ordered]@{
     'build:all'                    = 1
     'build'                        = 1
     'build:gui'                    = 1
+    'build:gui:win'                = 1
+    'build:gui:mac'                = 1
+    'build:win'                    = 1
+    'build:linux'                  = 1
+    'build:mac'                    = 1
     'build:setup'                  = 1
     'package:gui'                  = 1
+    'package:gui:win'              = 1
+    'package:gui:mac'              = 1
     'package:gui:linux'            = 1
     'package:gui:linux:prepared'   = 0
     'package:gui:macos'            = 1
     'package:gui:macos:prepared'   = 0
+    'package:update:win'           = 1
+    'package:update:linux'         = 1
+    'package:update:macos'         = 1
+    'package:update:mac'           = 1
+    'package:update:all'           = 1
 }
 
 foreach ($entry in $expectedCounts.GetEnumerator()) {
@@ -45,11 +57,40 @@ foreach ($entry in $expectedCounts.GetEnumerator()) {
 }
 
 $buildAllOutput = @(Invoke-TaskDryRun -TaskName 'build:all') -join [Environment]::NewLine
-$preparedPlatformTasks = 'package:gui:linux:prepared', 'package:gui:macos:prepared'
+$preparedPlatformTasks = 'build:gui:linux:binary', 'build:gui:macos:binary'
 foreach ($taskName in $preparedPlatformTasks) {
     if (-not $buildAllOutput.Contains("-Task `"$taskName`"")) {
         throw "Expected 'build:all' to invoke prepared platform task '$taskName'."
     }
 
     Write-Host "[test-build-task-graph] build:all invokes $taskName" -ForegroundColor Green
+}
+
+foreach ($platformName in 'linux', 'mac') {
+    if (-not $buildAllOutput.Contains("-Platform `"$platformName`"")) {
+        throw "Expected 'build:all' to pass platform name '$platformName'."
+    }
+
+    Write-Host "[test-build-task-graph] build:all passes platform name $platformName" -ForegroundColor Green
+}
+
+foreach ($platformName in 'linux', 'mac') {
+    if (-not $buildAllOutput.Contains("-File `"scripts/package-platform-archive.ps1`" -Platform `"$platformName`"")) {
+        throw "Expected 'build:all' to archive platform '$platformName'."
+    }
+
+    Write-Host "[test-build-task-graph] build:all archives platform $platformName" -ForegroundColor Green
+}
+
+if (-not $buildAllOutput.Contains("-File scripts/package-update-zip.ps1 -RequireSetup")) {
+    throw "Expected 'build:all' to create the Windows update zip after the setup installer."
+}
+Write-Host "[test-build-task-graph] build:all creates Windows update zip" -ForegroundColor Green
+
+foreach ($platformName in 'linux', 'mac') {
+    if (-not $buildAllOutput.Contains("-File scripts/package-update-zip.ps1 -Platform `"$platformName`" -RequireSetup -AllowMissingGui")) {
+        throw "Expected 'build:all' to create update zip for platform '$platformName'."
+    }
+
+    Write-Host "[test-build-task-graph] build:all creates update zip for $platformName" -ForegroundColor Green
 }

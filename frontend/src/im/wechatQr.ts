@@ -47,6 +47,25 @@ export function hasWeChatQRPayload(session?: WeChatQRSession | null): boolean {
   )
 }
 
+export function isTerminalWeChatQRStatus(status?: string): boolean {
+  switch ((status || '').trim().toLowerCase()) {
+    case 'confirmed':
+    case 'confirmed_without_token':
+    case 'expired':
+    case 'canceled':
+    case 'cancelled':
+    case 'unavailable':
+      return true
+    default:
+      return false
+  }
+}
+
+export function isWeChatQRSessionMissingMessage(raw: unknown): boolean {
+  const value = stringValue(raw).toLowerCase()
+  return value.includes('wechat qr session not found') || value.includes('二维码会话不存在')
+}
+
 function isWeChatQRPollURL(path: string): boolean {
   const value = path.trim()
   if (!value) return false

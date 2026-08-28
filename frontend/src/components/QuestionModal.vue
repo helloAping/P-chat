@@ -359,11 +359,15 @@ const displayOptions = computed(() => {
   margin-top: var(--space-3);
   flex-shrink: 0;
 }
-.question-dock-enter-active,
-.question-dock-leave-active {
+.question-dock-enter-active {
   transition:
     opacity var(--dur-base) var(--ease-out),
     transform var(--dur-base) var(--ease-out);
+}
+.question-dock-leave-active {
+  transition:
+    opacity var(--dur-fast) var(--ease-in),
+    transform var(--dur-fast) var(--ease-in);
 }
 .question-dock-enter-from,
 .question-dock-leave-to {

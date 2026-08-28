@@ -78,8 +78,21 @@ The sub-agent gets:
   agent's `Prompt` field, OR the request's `prompt` override
   when set). The system prompt is the only piece of context
   the sub-agent sees from the parent.
-- **A per-call timeout** (default 5 minutes, configurable via
-  `subagent.timeout` in `~/.p-chat/config.json`).
+- **Optional per-call timeout** via `subagent.timeout` in
+  `~/.p-chat/config.json`. Empty / `"0"` / invalid values disable
+  the sub-agent-specific wall-clock deadline; normal cancellation is
+  driven by user stop, parent turn cancellation, stream stall
+  detection, per-tool timeouts, failure breakers, no-progress guards,
+  and the shared round policy inherited from the parent/config. The
+  `task` orchestration tool itself also has no default per-tool
+  deadline, so it no longer inherits the ordinary 5-minute tool
+  timeout.
+- **A shared sub-agent execution contract** appended by the agent loop:
+  stay within the delegated task, avoid repeated failed paths, keep
+  progress compact, and return partial findings if interrupted. Long
+  child runs receive soft progress reminders at round 50 and every 50
+  rounds after that; these reminders guide behavior but do not stop the
+  run.
 - **A fresh event channel** so the parent's UI can stream
   the sub-agent's progress in real time.
 
@@ -327,37 +340,47 @@ shows:
 
 ## 6. Permission model
 
-Three layers of tool isolation, applied in priority order
-(each can further narrow but not widen):
+Four layers of tool isolation, applied in priority order
+(each can further narrow; only the execution-safe set can
+define the ceiling):
 
 1. **Hard exclusions** (always applied):
-   - `task` — prevents sub-agents from spawning sub-agents
-   - `recall` — coordination tool that should stay at the
-     top level (not yet implemented; reservation)
+   - `task` / `task_status` / `task_wait` / `task_cancel` — no nested sub-agents
+   - `recall` — coordination tool that stays at the top level
 
-2. **Global allow/deny** (`subagent.allowed_tools` /
+2. **Execution-safe set** (`tool.SubagentMayExpose`):
+   - Local reads: `read_file`, `list_files`, `grep`, `read_docx`, `read_pdf`, wiki
+   - Private checklist: `todo_write`
+   - Public network: `web_search`, `web_fetch` (GET or POST to public URLs)
+   - A per-agent whitelist cannot add write / exec / interactive / browser / MCP tools
+
+3. **Global allow/deny** (`subagent.allowed_tools` /
    `subagent.denied_tools` in `~/.p-chat/config.json`):
    - If `allowed_tools` is non-empty, only those tools
-     pass (whitelist wins).
+     pass (still capped by layer 2).
    - Otherwise, `denied_tools` removes the listed tools
      (blacklist).
-   - Default `denied_tools`: `["exec_command"]` (sub-agents
-     can't shell out by default; `explore` / `plan` opt
-     back in via their per-agent `Tools` list).
+   - Default `denied_tools`: `["exec_command"]` (defense in depth).
 
-3. **Per-agent whitelist** (`Tools` field in the agent's
+4. **Per-agent whitelist** (`Tools` field in the agent's
    `.md` frontmatter or `Builtins()`): when non-empty,
-   only those tools are exposed (still minus the hard
-   exclusions in layer 1).
+   only those tools are exposed (still minus layers 1-2).
+   A tool on the whitelist bypasses the global deny, but
+   only if it is execution-safe.
 
    ```yaml
-   # Example: a research agent that can ONLY read.
+   # Example: a local-only research agent.
    ---
    name: research
    description: Read-only research agent.
-   tools: [read_file, list_files, exec_command]
+   tools: [read_file, list_files, grep]
    ---
    ```
+
+Execution is checked again in `subagentToolAuthorizationResult`:
+project-local reads, `web_search`, and public `web_fetch` (GET or POST)
+run; private / loopback URLs and all mutate/exec/interactive tools
+return `SUBAGENT_PARENT_APPROVAL_REQUIRED` (or a sandbox block).
 
 ### Recursion depth
 
@@ -377,7 +400,7 @@ a **per-tool event channel** (`toolEventChanKey{}` in
 1. Tagged with `SubAgent=true`, `SubAgentTask=<description>`,
    `SubAgentType=<agent name>`, `SubAgentColor=<color>`,
    `SubAgentModel=<model>`, `SubAgentTaskID=<id>`.
-2. Pushed to the parent's per-tool `eventCh` (buffer 16).
+2. Pushed to the parent's per-tool `eventCh` (buffer 64).
 3. Picked up by a per-tool forwarder goroutine in the
    parent loop.
 4. Fed into the parent's `partsAccumulator` (so the
@@ -463,11 +486,11 @@ doesn't drown out the parent's stream.
 | **Markdown frontmatter**            | name, description, tools, model, color, maxTurns, permissionMode, skills, mcpServers, hooks, memory, isolation | name, description, prompt, model, temperature, top_p, tools, color, mode, hidden, steps, options, permission | name, description, model, color, tools, hidden |
 | **Model per sub-agent**              | `model: sonnet\|opus\|haiku\|inherit\|...` | `model: providerID/modelID` (e.g. `opencode/claude-haiku-4-5`) | `model: <model name>` (no provider prefix) |
 | **Per-agent system prompt**          | `getSystemPrompt(agent)` (body of .md) | body of .md → `prompt` field | body of .md → `Prompt` field |
-| **Per-agent tool filter**            | `tools: ["*"]` + `disallowedTools: ["Agent", "Edit", "Write", ...]` | legacy `tools: { "*": false, "github-pr-search": true }` (migrated to permission) OR `permission:` ruleset | `tools: ["read_file", "list_files"]` (whitelist) |
+| **Per-agent tool filter**            | `tools: ["*"]` + `disallowedTools: ["Agent", "Edit", "Write", ...]` | legacy `tools: { "*": false, "github-pr-search": true }` (migrated to permission) OR `permission:` ruleset | `tools: ["read_file", "list_files", "grep"]` (whitelist, capped by execution-safe set) |
 | **Permission model**                 | per-agent `permissionMode` (default, acceptEdits, plan, dontAsk, bubble, bypassPermissions) | permission ruleset (allow/deny/ask by pattern) + `deriveSubagentSessionPermission` (parent deny + external_directory + subagent's own) | hard exclusions + global allow/deny + per-agent whitelist |
 | **Recursion depth**                  | 1 (hard-coded via `ALL_AGENT_DISALLOWED_TOOLS`) | 1 by default (opt-in via `task: allow`) | 1 (hard exclusion) |
-| **Async / background mode**          | ✅ `run_in_background: true` → `status: 'async_launched'` + output file + `task-notification` injected back | ✅ `background: true` → `BackgroundJob` + `injectBackgroundResult` synthetic assistant text | ❌ not yet (roadmap) |
-| **Resumption by task_id**            | ✅ `task_id` resumes from disk JSONL sidechain transcript | ✅ `task_id` resumes the same `Session` row (linked via `parentID`) | ✅ `task_id` resumes from in-process cache (no disk persistence yet) |
+| **Async / background mode**          | ✅ `run_in_background: true` → `status: 'async_launched'` + output file + `task-notification` injected back | ✅ `background: true` → `BackgroundJob` + `injectBackgroundResult` synthetic assistant text | ✅ `mode:"async"` → `subagent_jobs` + `task_status`/`task_cancel` + synthetic assistant result |
+| **Resumption by task_id**            | ✅ `task_id` resumes from disk JSONL sidechain transcript | ✅ `task_id` resumes the same `Session` row (linked via `parentID`) | partial — sync uses in-process cache; async persists job status/result by `task_id` |
 | **Clickable card → child session**   | ✅ full child session in sidebar; tab routing | ✅ child session in sidebar; `task-tool-card` has chevron → navigate | ❌ card shows metadata but doesn't navigate (cache-only, no child session) |
 | **Worktree isolation**               | ✅ `isolation: 'worktree'` → temporary git worktree | ❌ | ❌ (roadmap) |
 | **Per-agent memory**                 | ✅ `memory: user\|project\|local` → persistent file in `~/.claude/agent-memory/<name>/` | ❌ | ❌ (roadmap) |
@@ -494,10 +517,10 @@ is 8 lines.
 registry is small (~12 names). An explicit `tools: [...]`
 whitelist is easier to audit and translate to `/agents`
 than the opencode "deny everything, then allow X" pattern.
-The `explore` and `plan` agents explicitly include
-`exec_command` so they can run `ls`/`grep`/`cat` — the
-prompt forbids write operations, the whitelist is just a
-backstop.
+The `explore` and `plan` agents whitelist
+`read_file` / `list_files` / `grep` / `read_docx` / `read_pdf`.
+They do not get shell. `general-purpose` may also use
+`todo_write`, `web_search`, and `web_fetch` for public URLs.
 
 **No model = "provider/model".** opencode's `Model.parseModel`
 splits a "providerID/modelID" string. P-Chat's LLM client
@@ -515,16 +538,15 @@ memory — the sub-agent starts fresh every call. We can
 add this later if it becomes a pain point (likely yes for
 code-review / code-audit agents).
 
-**In-process cache only.** Claude Code persists the
+**Sync cache + async job persistence.** Claude Code persists the
 sub-agent's full transcript to a sidechain JSONL file on
 disk and reloads it on `task_id` resume. opencode links
 the child to the parent via `Session.parentID` so the
-child is a real session row in the DB. P-Chat's cache
-is in-process (`subagent.Cache`, a `map[string]cacheEntry`
-behind a mutex). Survives a server restart? No. The
-trade-off: simpler code, but resuming a sub-agent after
-a server restart is a cache miss. We can add disk
-persistence when the user actually needs it.
+child is a real session row in the DB. P-Chat keeps sync
+sub-agent result reuse in-process (`subagent.Cache`), while
+async `mode:"async"` jobs persist status/result in
+`subagent_jobs` and can be queried after a server restart.
+The remaining gap is full child transcript/session navigation.
 
 ---
 
@@ -536,15 +558,12 @@ overall roadmap.
 
 ### Phase A (low effort, high value)
 
-1. **Async / background mode** (opencode `background: true`).
-   - The sub-agent tool emits an `async_launched` chunk with
-     a `task_id` immediately and returns. The actual work
-     happens in a goroutine.
-   - When the background sub-agent finishes, the result is
-     injected back into the parent as a synthetic assistant
-     text part (`injectBackgroundResult`-style).
-   - The card shows a "running in background" pill that the
-     user can click to navigate to / wait for.
+1. **Async / background mode UI** (backend done).
+   - Backend supports `task mode="async"`, `task_status`,
+     `task_cancel`, durable `subagent_jobs`, and synthetic
+     assistant completion messages.
+   - Remaining work: the card shows a "running in background"
+     pill, refresh/cancel buttons, and completion notification.
 
 2. **Tool count + token count in the card** (Claude Code
    `AgentProgressLine`).

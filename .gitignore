@@ -42,6 +42,15 @@ coverage.html
 # Go workspace (multi-module) — only relevant if a developer opts in locally.
 /go.work
 /go.work.sum
+# Legacy project-local Go caches. Taskfile builds use the normal Go cache locations
+# so GoLand, `go build`, and `task build:*` share downloaded modules.
+/_tmp-go-cache/
+/_tmp-go-modcache/
+/_legacy-tmp-go-modcache/
+# Legacy local cache names; if these directories exist, delete them before `go test ./...`.
+/tmp-go-cache/
+/tmp-go-cache-final/
+/tmp-go-modcache/
 
 # -----------------------------------------------------------------------------
 # Vendored / downloaded dependencies
@@ -177,6 +186,7 @@ $RECYCLE.BIN/
 # -----------------------------------------------------------------------------
 # release.yml writes to dist/ on the runner; we never want to commit
 # that locally either.
+/build/
 dist/
 artifacts/
 *.tar.gz

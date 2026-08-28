@@ -214,9 +214,7 @@ func (h *Handler) persistWeChatCredential(cred im.WeChatCredential) error {
 	if platform.Variant == "" {
 		platform.Variant = "wechatbot"
 	}
-	if platform.Mode == "" {
-		platform.Mode = "polling"
-	}
+	platform.Mode = "polling"
 	platform.Enabled = true
 	platform.Token = cred.Token
 	if platform.Extra == nil {

@@ -112,7 +112,7 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 				Type: openai.ToolTypeFunction,
 				Function: openai.FunctionCall{
 					Name:      msg.ToolName,
-					Arguments: msg.ToolInput,
+					Arguments: SafeToolInputJSON(msg.ToolInput),
 				},
 			}
 			if la := lastAssistant(); la != nil {
@@ -144,8 +144,23 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 			})
 
 		case TypeImage:
-			flushPending()
 			lastAssistantIdx = -1
+			if strings.TrimSpace(msg.Content) == "" {
+				part := openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: fmt.Sprintf("(attached image %s is empty; upload bytes were not available)", msg.Name),
+				}
+				if pending != nil && pending.Role == openai.ChatMessageRoleUser {
+					pending.MultiContent = append(pending.MultiContent, part)
+				} else {
+					flushPending()
+					pending = &openai.ChatCompletionMessage{
+						Role:         openai.ChatMessageRoleUser,
+						MultiContent: []openai.ChatMessagePart{part},
+					}
+				}
+				continue
+			}
 			part := openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeImageURL,
 				ImageURL: &openai.ChatMessageImageURL{
@@ -270,6 +285,7 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 	if err != nil {
 		return nil, fmt.Errorf("marshal openai request: %w", err)
 	}
+	body = addOpenAIImageDataFields(body)
 
 	url := strings.TrimRight(a.baseURL, "/") + "/chat/completions"
 
@@ -289,6 +305,78 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 		Body:    body,
 		Headers: headers,
 	}, nil
+}
+
+func addOpenAIImageDataFields(body []byte) []byte {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return body
+	}
+	changed := false
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok || part["type"] != "image_url" {
+				continue
+			}
+			imageURL, ok := part["image_url"].(map[string]any)
+			if !ok {
+				continue
+			}
+			url, _ := imageURL["url"].(string)
+			mime, data, ok := splitOpenAIDataURL(url)
+			if !ok {
+				continue
+			}
+			if imageURL["data"] != data {
+				imageURL["data"] = data
+				changed = true
+			}
+			if mime != "" && imageURL["mime_type"] != mime {
+				imageURL["mime_type"] = mime
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func splitOpenAIDataURL(s string) (mime string, data string, ok bool) {
+	const prefix = "data:"
+	const marker = ";base64,"
+	if !strings.HasPrefix(s, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(s, prefix)
+	idx := strings.Index(rest, marker)
+	if idx < 0 {
+		return "", "", false
+	}
+	mime = rest[:idx]
+	data = rest[idx+len(marker):]
+	if data == "" {
+		return "", "", false
+	}
+	return mime, data, true
 }
 
 // ParseStream reads an OpenAI SSE stream and emits StreamChunk

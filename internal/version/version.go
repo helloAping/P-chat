@@ -50,6 +50,18 @@ func String() string {
 	return "dev"
 }
 
+// ReleaseString 返回用于更新检测的正式版本号。
+// ReleaseString returns the release version used by update checks.
+func ReleaseString() string {
+	if looksReleaseVersion(Version) {
+		return strings.TrimSpace(Version)
+	}
+	if v := fileVersion(); looksReleaseVersion(v) {
+		return v
+	}
+	return String()
+}
+
 // FullString 返回含 git hash 的完整版本字符串，用于日志和诊断。
 func FullString() string {
 	v := String()
@@ -62,6 +74,31 @@ func FullString() string {
 		return v
 	}
 	return fmt.Sprintf("%s (%s)", v, hash)
+}
+
+func looksReleaseVersion(v string) bool {
+	v = strings.TrimSpace(v)
+	if strings.HasPrefix(v, "v") || strings.HasPrefix(v, "V") {
+		v = v[1:]
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 {
+		return false
+	}
+	for i := 0; i < len(parts) && i < 3; i++ {
+		p := parts[i]
+		if p == "" {
+			return false
+		}
+		digits := 0
+		for digits < len(p) && p[digits] >= '0' && p[digits] <= '9' {
+			digits++
+		}
+		if digits == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func gitCommit() string {

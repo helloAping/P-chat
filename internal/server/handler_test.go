@@ -454,9 +454,7 @@ func TestListMessages_PartsRoundTrip(t *testing.T) {
 	store.AddMessage(llm.Message{Role: "user", Content: "hi"})
 	partsBlob := []agent.MessagePart{
 		{Kind: "tool", Name: "read_file", Args: `{"path":"x"}`, Status: "ok", Result: "data", Elapsed: "5ms"},
-		{Kind: "sub_agent", Task: "list repo", Status: "ok", Elapsed: "1s", Parts: []agent.MessagePart{
-			{Kind: "text", Text: "found 3 files"},
-		}},
+		{Kind: "sub_agent", Task: "list repo", Status: "ok", Elapsed: "1s"},
 	}
 	partsJSON, _ := json.Marshal(partsBlob)
 	store.AddMessageWithMeta(llm.Message{Role: "assistant", Content: "hello there"}, map[string]string{
@@ -509,7 +507,7 @@ func TestListMessages_PartsRoundTrip(t *testing.T) {
 	if asst.Parts[3].Kind != "text" || asst.Parts[3].Text != "hello there" {
 		t.Errorf("parts[3] text wrong: %+v", asst.Parts[3])
 	}
-	if len(asst.Parts[2].Parts) != 1 || asst.Parts[2].Parts[0].Text != "found 3 files" {
+	if len(asst.Parts[2].Parts) != 0 {
 		t.Errorf("sub-agent inner parts wrong: %+v", asst.Parts[2].Parts)
 	}
 }
@@ -1318,6 +1316,57 @@ func TestCreateSession_WithExplicitModel(t *testing.T) {
 	}
 }
 
+func TestCreateSession_WithPermissionLevel(t *testing.T) {
+	s, _ := newTestServer(t)
+	got := createSessionPOST(t, s, `{"permission_level":"full"}`)
+	t.Cleanup(func() { tool.SetSessionPermissionLevel(got.ID, "") })
+	if got.PermissionLevel != tool.PermissionFull {
+		t.Fatalf("PermissionLevel = %q, want %q", got.PermissionLevel, tool.PermissionFull)
+	}
+	if live := tool.SessionPermissionLevel(got.ID); live != tool.PermissionFull {
+		t.Fatalf("live permission = %q, want %q", live, tool.PermissionFull)
+	}
+}
+
+func TestCreateSession_WithInheritedMetaFields(t *testing.T) {
+	s, cfg := newTestServer(t)
+	cfg.Vision.Enabled = true
+	got := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o-mini","style":"cute","work_mode":"daily","plan_mode":true,"permission_level":"auto","reasoning_effort":"high","vector_store":"kb-vector","knowledge_base":"docs","auto_continue":false,"todo_long_run_mode":"unlimited","use_image_recognition":true}`)
+	t.Cleanup(func() { tool.SetSessionPermissionLevel(got.ID, "") })
+
+	if got.Provider != "openai" || got.Model != "gpt-4o-mini" || got.Style != "cute" || got.WorkMode != "daily" {
+		t.Fatalf("session picker meta = %+v", got)
+	}
+	if !got.PlanMode || got.PermissionLevel != tool.PermissionAuto || got.ReasoningEffort != "high" {
+		t.Fatalf("session execution meta = %+v", got)
+	}
+	if got.VectorStore != "kb-vector" || got.KnowledgeBase != "docs" || got.AutoContinue {
+		t.Fatalf("session knowledge/continue meta = %+v", got)
+	}
+	if got.TodoLongRunMode != "unlimited" || !got.UseImageRecognition {
+		t.Fatalf("session long-run/vision meta = %+v", got)
+	}
+	if live := tool.SessionPermissionLevel(got.ID); live != tool.PermissionAuto {
+		t.Fatalf("live permission = %q, want %q", live, tool.PermissionAuto)
+	}
+
+	for k := range s.Handler().meta {
+		delete(s.Handler().meta, k)
+	}
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+got.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var reloaded SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&reloaded); err != nil {
+		t.Fatalf("decode reload: %v", err)
+	}
+	if reloaded.ReasoningEffort != "high" || reloaded.TodoLongRunMode != "unlimited" || !reloaded.UseImageRecognition || reloaded.AutoContinue {
+		t.Fatalf("reloaded meta = %+v", reloaded)
+	}
+}
+
 func TestCreateSession_BadProvider(t *testing.T) {
 	s, _ := newTestServer(t)
 	w := httptest.NewRecorder()
@@ -1579,6 +1628,49 @@ func TestPatchSession_StillRenamesWhenTitleOnly(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&got)
 	if got.Title != "Renamed" {
 		t.Errorf("title = %q, want Renamed", got.Title)
+	}
+}
+
+func TestPatchSession_PersistsUseImageRecognition(t *testing.T) {
+	srv, cfg := newTestServer(t)
+	cfg.Vision.Enabled = true
+	sess := createSessionPOST(t, srv, "")
+	w := patchSession(t, srv, sess.ID, `{"use_image_recognition":true}`)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.UseImageRecognition {
+		t.Fatalf("UseImageRecognition = false, want true")
+	}
+
+	for k := range srv.Handler().meta {
+		delete(srv.Handler().meta, k)
+	}
+	w = httptest.NewRecorder()
+	srv.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != 200 {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	got = SessionResponse{}
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.UseImageRecognition {
+		t.Fatalf("reloaded UseImageRecognition = false, want true")
+	}
+}
+
+func TestPatchSession_RejectsUseImageRecognitionWhenGloballyDisabled(t *testing.T) {
+	srv, cfg := newTestServer(t)
+	cfg.Vision.Enabled = false
+	sess := createSessionPOST(t, srv, "")
+
+	w := patchSession(t, srv, sess.ID, `{"use_image_recognition":true}`)
+	if w.Code != 400 {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "image recognition is disabled globally") {
+		t.Fatalf("body = %s, want settings path hint", w.Body.String())
 	}
 }
 

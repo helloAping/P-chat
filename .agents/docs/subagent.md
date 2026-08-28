@@ -12,7 +12,7 @@
 
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
-| `subagent.go` | Runner 实现 + task 工具入口 | `Tool()`, `Default.Run()`, `Result` |
+| `subagent.go` | Runner 实现 + task 工具入口 + async job 工具 | `Tool()`, `TaskStatusTool()`, `TaskCancelTool()`, `Default.Run()`, `Result` |
 | `registry.go` | 子代理目录（合并内置 + 用户自定义） | `Registry`, `AgentInfo`, `NewRegistry()` |
 | `builtins.go` | 内置子代理定义（general-purpose/explore/plan） | Built-in prompts |
 | `markdown.go` | 用户自定义代理加载（.p-chat/agent/*.md） | `loadFromDir()` |
@@ -26,7 +26,7 @@
 ```
 1. 缓存检查 (task_id 命中 → 直接返回缓存)
 2. 发出 sub_agent_start 事件 (Phase="sub_agent_start", SubAgentStatus="start")
-3. 构建子工具注册表 (过滤: 移除 task/recall, 应用全局 allow/deny, 应用 agent 白名单)
+3. 构建子工具注册表 (过滤: 硬排除 task/recall、执行安全集、全局 allow/deny、agent 白名单)
 4. 创建独立 agent 实例 (独立 memory.Store, 独立事件系统)
 5. 调用 subAgent.ChatWithTools(runCtx, chatReq) → stream channel
 6. 转发每个 chunk 到父级 (tryForward → OnEvent → eventCh)
@@ -44,6 +44,8 @@
 - **★ Done=true** — 本地消费，不转发（防止触发父 SSE 关闭）
 - **sub_agent_ok/err** — 关闭 SubAgentCard，status="ok"/"err"
 
+隔离约束：子代理内部工具事件只能更新嵌套 SubAgentCard。即使子代理暴露并调用 `todo_write`，它也只能维护子代理自己的私有 todo，不得驱动父会话 TodoPanel、父会话持久化 todo 或任何主对话控制状态。
+
 ### 3. 关闭事件的重要性
 
 `sub_agent_ok/err` 事件是子代理的**唯一外部结束信号**：
@@ -51,27 +53,53 @@
 - partsAcc 更新 Status 和 Elapsed
 - 持久化时 status 正确写入
 
-### 4. 三层工具隔离
+### 4. 工具隔离与父级授权
 
-1. **硬排除**：task, recall 强制移除
-2. **全局配置过滤**：`subagent.allowed_tools` / `denied_tools`
-3. **Per-agent 白名单**：`agentInfo.Tools` 非空时只暴露列表中的
+子代理隔离分成两层：工具可见性只决定模型能看到什么；执行授权在 `agent.ChatWithTools` 的工具派发前再次判断，不能只依赖白名单。
+
+工具可见性：
+1. **硬排除**：`task`, `task_status`, `task_cancel`, `recall` 强制移除
+2. **执行安全集**：`tool.SubagentMayExpose` — 只读本地工具、`todo_write`、`web_search`、`web_fetch`。白名单不能放宽到写文件 / 执行 / 交互 / 浏览器 / MCP
+3. **全局配置过滤**：`subagent.allowed_tools` / `denied_tools`（不能越过安全集）
+4. **Per-agent 白名单**：`agentInfo.Tools` 非空时只暴露列表中的（仍受安全集约束；白名单可绕过全局 deny）
+
+执行授权：
+1. 子代理强制使用隔离的 `permission_level=ask`，不继承父会话的 `auto` / `full` / live session override
+2. 子代理不能消费 `/unsafe once`
+3. 子代理不能打开自己的 confirm flow；`tool.RequireConfirm` 在子代理上下文中 fail-closed
+4. 子代理可执行项目内只读工具（`read_file` / `list_files` / `grep` / `read_docx` / `read_pdf` / wiki）、私有 `todo_write`、`web_search`，以及公网 `web_fetch`（GET / POST）
+5. 写文件、编辑文件、启动进程、执行 shell、私网/回环 URL、交互提问、项目外读取、动态高风险工具调用返回 `SUBAGENT_PARENT_APPROVAL_REQUIRED`（或对私网 URL 直接 block），由父对话决定后续动作
+
+内置 `explore` / `plan` 暴露 `read_file`、`list_files`、`grep`、`read_docx`、`read_pdf`。git / 测试 / 进程执行应在最终结果中向父对话提出，而不是自行执行。`general-purpose` 额外可使用 `todo_write`、`web_search` 和公网 `web_fetch`。
 
 ### 5. 缓存
 
 `agentCache` 按 `(description, subagent_type, model)` 缓存结果。通过 `task_id` 参数可恢复缓存（不重新执行）。
 
-### 6. 超时与部分结果（2026-08-03 起）
+### 6. 异步 job（2026-08-21 起）
 
-**超时来源**：`subagent.timeout`（默认 **30 分钟**）是 wall-clock **兜底**（不是主防卡死）。`runCtx` 超时后子代理 ReAct 循环可能**静默关闭**（无 Done、无 Error chunk）。
+`task` 参数支持 `mode: "sync" | "async"`：
 
-**防卡死依赖的细粒度守卫**（都早于 30m wall-clock 触发）：
+- `sync` 是默认行为：父对话等待子代理完成，并把最终结果作为当前 tool result 回填给父 LLM。
+- `async` 会立即创建 `subagent_jobs` 记录并返回 `task_id`，后台 goroutine 使用独立 context 执行，不依赖当前 HTTP/SSE turn 生命周期。
+- `task_status` 查询当前 session 的 job 列表或单个 `task_id` 详情。
+- `task_cancel` 取消当前 server 进程内仍在运行的后台 job，并把 durable 状态标记为 `cancelled`。
+- job 启动时会立即在主会话创建一条 assistant 锚点消息，使用与常规子代理相同的 `sub_agent` part 卡片结构；卡片用 `run_mode=async` 标记为后台子代理，并通过 live SSE 与 `progress_json` 持续更新内部 parts。job 完成/失败/取消时只更新这条锚点消息；只有旧数据或锚点缺失时才 fallback 追加 synthetic message。stats 只保留在结构化 Result / job 元数据中，不作为聊天可见文本展示。
+
+### 7. 超时与部分结果（2026-08-21 起）
+
+**超时来源**：默认不再给 `task` 工具或子代理安装独立 wall-clock deadline。`task` 工具不再继承普通工具 5 分钟 per-tool timeout；`subagent.timeout` 为空、`"0"` 或非法时表示禁用。只有配置为正数 Go duration（如 `"30m"`）时，才作为显式部署策略生效。
+
+同步 `task` 检测到后，父 agent 会将工具执行、子代理事件转发、工具结果回填后的 continuation LLM 调用切换到 deadline-free abort context。它不再被 `limits.max_turn_seconds` 截断，但仍响应用户取消、`cancel-stream`、客户端断开，以及内部 LLM/tool/failure/round 守卫。
+
+**防卡死依赖的细粒度守卫**：
 - LLM stream idle timeout **120s**（上游 120s 无字节 → cancel）
 - 工具超时：exec_command 5m、read_file 60s、question 10m
 - 累计失败熔断 `CumToolErrMax=8`（打地鼠式不同命令失败）
-- 子代理轮数上限 `MaxRounds=30`
+- 轮次策略继承主对话配置：子代理 `ChatRequest.MaxRounds=0`，由 `limits.max_rounds` / `todo_long_run_mode` 统一解析
+- 子代理公共守则与长轮次软提醒：仅引导聚焦、总结进度、停止重复路径，不作为硬停止条件
 
-**为什么默认从 5m 调到 30m**：正常长任务（explore 读 50 文件 / 慢速本地模型多轮）可合法跑 10-20 分钟，5m 会误杀已产出的有效工作。真卡死已被上面的细粒度守卫提前拦截，wall-clock 只在全部失效时才兜底。
+**为什么取消默认 wall-clock**：正常长任务（explore 读 50 文件 / 慢速本地模型多轮）可能合法运行很久。固定 wall-clock 会把“正常但慢”的子代理误判为失败；真实卡死应由上面的细粒度守卫、用户取消、父 turn 取消或异步 job 取消 hook 处理。
 
 **部分结果策略**：超时/中断时，若子代理已产出部分内容（如 explore 已完成一半调研），不再整段丢弃——`Default.Run` 把部分内容作为 `Result.Content` 返回（带 `Interrupted` 标记），`task` 工具 handler 把它包装成带 "PARTIAL" 前缀的 tool result 传给父 LLM。父 LLM 据此**总结子代理已完成的工作并继续剩余部分**，而不是收到 `(sub-agent returned no content)` 后无从下手。
 
@@ -91,6 +119,11 @@
 - `tryForward()` (subagent.go:837-842)
 - `OnEvent` 回调构造 (subagent.go 的 Tool handler)
 
+### 要修改异步子代理
+- `TaskStatusTool()` / `TaskCancelTool()` / `launchAsyncTask()` (subagent.go)
+- `SubagentJob` CRUD (memory/subagent_jobs.go)
+- `subagent_jobs` schema (memory/migrations.go migration v11)
+
 ### 要添加新的内置子代理
 1. 在 `builtins.go` 定义 Prompt 常量
 2. 在 `NewRegistry()` (registry.go) 中注册
@@ -99,13 +132,14 @@
 - `agentCache` 定义和 `Cache.Get/Set` (subagent.go)
 
 ### 要修改子代理超时
-- `timeout` 变量 (subagent.go:566-568)
+- `timeout` / `runCtx` 构造 (subagent.go `Default.Run`)
 - config 中的 `subagent.timeout` 字段
 
 ### 要修改子代理空转熔断
 - `CumToolErrMax` (agent/auto_continue.go) — 累计工具失败熔断阈值（默认 8，跨不同命令）
-- `MaxRounds: 30` (subagent.go `buildSubAgentChatRequest`) — 子代理轮数硬上限
-- `sameToolErrMax` / stuck-loop 守卫 (agent/agent.go) — 同工具/同签名失败熔断
+- `buildSubAgentChatRequest` 保持 `MaxRounds=0` — 子代理继承主对话 / 全局轮次策略
+- `subagent_guard.go` — 子代理公共守则与第 50/100/150… 轮软提醒
+- `sameToolErrMax` / stuck-loop / no-progress 守卫 (agent/agent.go) — 同工具、同签名失败或只读无进展熔断
 
 ## 相关模块
 

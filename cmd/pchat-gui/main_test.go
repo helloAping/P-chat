@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,11 +18,12 @@ import (
 
 func TestFindServerBinary_FindsSibling(t *testing.T) {
 	dir := t.TempDir()
-	// Create a fake pchat-server.exe beside a fake "self" path.
+	// Create a fake platform server binary beside a fake "self" path.
 	// findServerBinary() uses os.Executable() so we can only test the
 	// "PATH" branch deterministically; the sibling branch is exercised
 	// by the smoke test that actually launches the real binary.
-	fake := filepath.Join(dir, "pchat-server.exe")
+	name := serverBinaryName()
+	fake := filepath.Join(dir, name)
 	if err := os.WriteFile(fake, []byte("MZ"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -31,14 +34,143 @@ func TestFindServerBinary_FindsSibling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("findServerBinary: %v", err)
 	}
-	if !strings.EqualFold(filepath.Base(got), "pchat-server.exe") {
-		t.Fatalf("expected pchat-server.exe, got %q", got)
+	if !strings.EqualFold(filepath.Base(got), name) {
+		t.Fatalf("expected %s, got %q", name, got)
+	}
+}
+
+func TestServerBinaryName_MatchesPlatform(t *testing.T) {
+	got := serverBinaryName()
+	if runtime.GOOS == "windows" {
+		if got != "pchat-server.exe" {
+			t.Fatalf("serverBinaryName() = %q, want pchat-server.exe", got)
+		}
+		return
+	}
+	if got != "pchat-server" {
+		t.Fatalf("serverBinaryName() = %q, want pchat-server", got)
+	}
+}
+
+func TestServerBinaryCandidates_IncludesMacResourcesWhenDarwin(t *testing.T) {
+	dir := filepath.Join("P-Chat.app", "Contents", "MacOS")
+	candidates := serverBinaryCandidates(dir)
+	resources := filepath.Join("P-Chat.app", "Contents", "Resources", serverBinaryName())
+	found := false
+	for _, c := range candidates {
+		if c == resources {
+			found = true
+			break
+		}
+	}
+	if runtime.GOOS == "darwin" && !found {
+		t.Fatalf("darwin candidates should include %q: %#v", resources, candidates)
+	}
+	if runtime.GOOS != "darwin" && found {
+		t.Fatalf("non-darwin candidates should not include macOS Resources path: %#v", candidates)
+	}
+}
+
+func TestUpdaterBinaryName_MatchesPlatform(t *testing.T) {
+	got := updaterBinaryName()
+	if runtime.GOOS == "windows" {
+		if got != "pchat-updater.exe" {
+			t.Fatalf("updaterBinaryName() = %q, want pchat-updater.exe", got)
+		}
+		return
+	}
+	if got != "pchat-updater" {
+		t.Fatalf("updaterBinaryName() = %q, want pchat-updater", got)
+	}
+}
+
+func TestUpdaterBinaryCandidates_IncludesMacResourcesWhenDarwin(t *testing.T) {
+	dir := filepath.Join("P-Chat.app", "Contents", "MacOS")
+	candidates := updaterBinaryCandidates(dir)
+	resources := filepath.Join("P-Chat.app", "Contents", "Resources", updaterBinaryName())
+	found := false
+	for _, c := range candidates {
+		if c == resources {
+			found = true
+			break
+		}
+	}
+	if runtime.GOOS == "darwin" && !found {
+		t.Fatalf("darwin candidates should include %q: %#v", resources, candidates)
+	}
+	if runtime.GOOS != "darwin" && found {
+		t.Fatalf("non-darwin candidates should not include macOS Resources path: %#v", candidates)
+	}
+}
+
+func TestUpdateTargetForExecutableOS_UsesAppRootOnDarwin(t *testing.T) {
+	exe := filepath.Join("Applications", "pchat-gui.app", "Contents", "MacOS", "pchat-gui")
+	installDir, launch := updateTargetForExecutableOS(exe, "darwin")
+	if installDir != filepath.Join("Applications", "pchat-gui.app") {
+		t.Fatalf("installDir = %q", installDir)
+	}
+	if launch != filepath.Join("Contents", "MacOS", "pchat-gui") {
+		t.Fatalf("launch = %q", launch)
+	}
+}
+
+func TestUpdateTargetForExecutableOS_UsesExecutableDirOutsideDarwinApp(t *testing.T) {
+	exe := filepath.Join("opt", "pchat", "pchat-gui")
+	installDir, launch := updateTargetForExecutableOS(exe, "linux")
+	if installDir != filepath.Join("opt", "pchat") {
+		t.Fatalf("installDir = %q", installDir)
+	}
+	if launch != "pchat-gui" {
+		t.Fatalf("launch = %q", launch)
+	}
+}
+
+func TestValidateUpdatePackageChecksSHA256(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "pchat-update-windows-amd64-v1.0.13.zip")
+	body := []byte("zip")
+	if err := os.WriteFile(file, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	got, err := validateUpdatePackage(file, hex.EncodeToString(sum[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == "" {
+		t.Fatal("validated path is empty")
+	}
+	bad := sha256.Sum256([]byte("other"))
+	if _, err := validateUpdatePackage(file, hex.EncodeToString(bad[:])); err == nil {
+		t.Fatal("expected sha mismatch error")
+	}
+}
+
+func TestStageUpdaterBinaryCopiesToDataRunnerDir(t *testing.T) {
+	dataHome := filepath.Join(t.TempDir(), ".p-chat")
+	t.Setenv("PCHAT_DATA_HOME", dataHome)
+	src := filepath.Join(t.TempDir(), updaterBinaryName())
+	if err := os.WriteFile(src, []byte("updater"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := stageUpdaterBinary(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(got) != filepath.Join(dataHome, "updates", "runner") {
+		t.Fatalf("runner dir = %q", filepath.Dir(got))
+	}
+	body, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "updater" {
+		t.Fatalf("runner body = %q", body)
 	}
 }
 
 func TestFindServerBinary_NotFound(t *testing.T) {
 	// findServerBinary walks CWD up to 5 levels looking for
-	// bin/pchat-server.exe (dev-mode fallback). If the test binary
+	// bin/<server binary> (dev-mode fallback). If the test binary
 	// runs from inside the project tree, the walk will find it and
 	// defeat the "not found" probe. Chdir to a temp dir so the walk
 	// has no chance of finding a matching file.

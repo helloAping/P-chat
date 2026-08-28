@@ -20,7 +20,7 @@
 // from the memory store and returns a self-contained
 // file.
 
-export type ExportFormat = 'markdown' | 'json'
+export type ExportFormat = 'html' | 'pdf'
 
 /** Suggest a filename for the download based on session
  *  title + format. Strips characters that some
@@ -34,7 +34,7 @@ export function suggestFilename(
     .replace(/\s+/g, '-')
     .slice(0, 60)
   const stamp = new Date().toISOString().slice(0, 10)
-  return `${safe}-${stamp}.${format === 'markdown' ? 'md' : format}`
+  return `${safe}-${stamp}.${format}`
 }
 
 /** Make a unique filename by appending -2, -3, ... when

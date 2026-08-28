@@ -249,3 +249,33 @@ func TestWaitForAnswerSkipsSecondSendFnWhenAnswersEmpty(t *testing.T) {
 		t.Errorf("sendFn called %d times, want 1 (empty-answers path should skip the result event)", len(calls))
 	}
 }
+
+func TestWaitForAnswerIgnoresShortToolDeadline(t *testing.T) {
+	sessionID := "test-question-interactive"
+	defer clearQuestionState(t, sessionID)()
+
+	toolCtx, toolCancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer toolCancel()
+	turnCtx, turnCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer turnCancel()
+	ctx := WithInteractiveContext(toolCtx, turnCtx)
+
+	questions := []Question{{Header: "心情", Question: "你今天心情怎么样？"}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := WaitForAnswer(ctx, sessionID, questions, nil)
+		done <- err
+	}()
+	time.Sleep(120 * time.Millisecond)
+	if !SubmitAnswer(sessionID, QuestionResponse{Questions: questions, Answers: map[string]string{"心情": "好"}}) {
+		t.Fatal("SubmitAnswer returned false after tool deadline")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForAnswer failed after short tool deadline: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForAnswer did not unblock")
+	}
+}
