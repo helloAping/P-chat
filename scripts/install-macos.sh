@@ -5,7 +5,8 @@
 # script's location:
 #
 #   ./pchat-gui.app/                    # Wails .app bundle
-#   ./pchat-server                      # server binary (universal)
+#   ./pchat-server                      # server binary
+#   ./pchat-updater                     # self-update applier
 #   ./pchat                             # CLI binary
 #   ./web/                              # embedded SPA assets
 #   ./uninstall.sh
@@ -45,11 +46,16 @@ SRC_SERVER="$SRC_APP/Contents/Resources/pchat-server"
 if [[ ! -f "$SRC_SERVER" ]]; then
   SRC_SERVER="$EXEC_DIR/pchat-server"
 fi
+SRC_UPDATER="$SRC_APP/Contents/Resources/pchat-updater"
+if [[ ! -f "$SRC_UPDATER" ]]; then
+  SRC_UPDATER="$EXEC_DIR/pchat-updater"
+fi
 SRC_CLI="$EXEC_DIR/pchat"
 SRC_UNINSTALL="$EXEC_DIR/uninstall.sh"
 
 [[ -d "$SRC_APP" ]] || { echo "ERROR: pchat-gui.app not found at $SRC_APP"; exit 1; }
 [[ -f "$SRC_SERVER" ]] || { echo "ERROR: pchat-server not found at $SRC_SERVER"; exit 1; }
+[[ -f "$SRC_UPDATER" ]] || { echo "ERROR: pchat-updater not found at $SRC_UPDATER"; exit 1; }
 HAVE_CLI=false
 [[ -f "$SRC_CLI" ]] && HAVE_CLI=true
 

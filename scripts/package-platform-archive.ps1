@@ -94,6 +94,7 @@ switch ($platformLabel) {
     'linux' {
         Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-server-linux') -Destination (Join-Path $stage 'pchat-server') -Hint "run 'task build:server:linux'"
         Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-linux') -Destination (Join-Path $stage 'pchat') -Hint "run 'task build:cli:linux'"
+        Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-updater-linux') -Destination (Join-Path $stage 'pchat-updater') -Hint "run 'task build:updater:linux'"
         Copy-RequiredFile -Source (Join-Path $root 'scripts\install-linux.sh') -Destination (Join-Path $stage 'install.sh') -Hint 'missing install script'
         Copy-RequiredFile -Source (Join-Path $root 'scripts\uninstall-linux.sh') -Destination (Join-Path $stage 'uninstall.sh') -Hint 'missing uninstall script'
         Copy-WebAssets
@@ -115,6 +116,7 @@ switch ($platformLabel) {
     'mac' {
         Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-server-darwin-amd64') -Destination (Join-Path $stage 'pchat-server') -Hint "run 'task build:server:macos'"
         Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-darwin-amd64') -Destination (Join-Path $stage 'pchat') -Hint "run 'task build:cli:macos'"
+        Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-updater-darwin-amd64') -Destination (Join-Path $stage 'pchat-updater') -Hint "run 'task build:updater:macos'"
         Copy-RequiredFile -Source (Join-Path $root 'scripts\install-macos.sh') -Destination (Join-Path $stage 'install.sh') -Hint 'missing install script'
         Copy-RequiredFile -Source (Join-Path $root 'scripts\uninstall-macos.sh') -Destination (Join-Path $stage 'uninstall.sh') -Hint 'missing uninstall script'
         Copy-WebAssets
@@ -131,6 +133,8 @@ switch ($platformLabel) {
             $resources = Join-Path $dstApp 'Contents\Resources'
             New-Item -ItemType Directory -Path $resources -Force | Out-Null
             Copy-Item -LiteralPath (Join-Path $stage 'pchat-server') -Destination (Join-Path $resources 'pchat-server') -Force
+            Copy-Item -LiteralPath (Join-Path $stage 'pchat-updater') -Destination (Join-Path $resources 'pchat-updater') -Force
+            Copy-OptionalFile -Source (Join-Path $stage 'pchat') -Destination (Join-Path $resources 'pchat') | Out-Null
             Copy-OptionalFile -Source (Join-Path $stage 'browser-extension.zip') -Destination (Join-Path $resources 'browser-extension.zip') | Out-Null
             $guiIncluded = $true
         } else {

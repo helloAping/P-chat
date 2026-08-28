@@ -103,6 +103,28 @@ func TestUpdaterBinaryCandidates_IncludesMacResourcesWhenDarwin(t *testing.T) {
 	}
 }
 
+func TestUpdateTargetForExecutableOS_UsesAppRootOnDarwin(t *testing.T) {
+	exe := filepath.Join("Applications", "pchat-gui.app", "Contents", "MacOS", "pchat-gui")
+	installDir, launch := updateTargetForExecutableOS(exe, "darwin")
+	if installDir != filepath.Join("Applications", "pchat-gui.app") {
+		t.Fatalf("installDir = %q", installDir)
+	}
+	if launch != filepath.Join("Contents", "MacOS", "pchat-gui") {
+		t.Fatalf("launch = %q", launch)
+	}
+}
+
+func TestUpdateTargetForExecutableOS_UsesExecutableDirOutsideDarwinApp(t *testing.T) {
+	exe := filepath.Join("opt", "pchat", "pchat-gui")
+	installDir, launch := updateTargetForExecutableOS(exe, "linux")
+	if installDir != filepath.Join("opt", "pchat") {
+		t.Fatalf("installDir = %q", installDir)
+	}
+	if launch != "pchat-gui" {
+		t.Fatalf("launch = %q", launch)
+	}
+}
+
 func TestValidateUpdatePackageChecksSHA256(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "pchat-update-windows-amd64-v1.0.13.zip")
 	body := []byte("zip")

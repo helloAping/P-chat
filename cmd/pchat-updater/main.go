@@ -208,8 +208,9 @@ func applyUpdateZip(packagePath string, installDir string, waitTimeout time.Dura
 		if err != nil {
 			return "", fmt.Errorf("stat staged file: %w", err)
 		}
+		mode := updateFileMode(rel, info.Mode())
 		replaced = append(replaced, rel)
-		if err := replaceFileWithRetry(src, dst, info.Mode(), waitTimeout); err != nil {
+		if err := replaceFileWithRetry(src, dst, mode, waitTimeout); err != nil {
 			rollbackFiles(backupDir, installDir, replaced, logger)
 			return "", err
 		}
@@ -256,6 +257,32 @@ func backupExistingFile(dst string, backupDir string, rel string) error {
 		return fmt.Errorf("create backup dir: %w", err)
 	}
 	return copyFile(dst, backupPath, info.Mode())
+}
+
+func updateFileMode(rel string, mode os.FileMode) os.FileMode {
+	return updateFileModeForOS(rel, mode, runtime.GOOS)
+}
+
+func updateFileModeForOS(rel string, mode os.FileMode, goos string) os.FileMode {
+	if goos == "windows" {
+		return mode
+	}
+	cleaned := path.Clean(strings.ReplaceAll(rel, "\\", "/"))
+	base := path.Base(cleaned)
+	switch base {
+	case "pchat", "pchat-gui", "pchat-server", "pchat-updater", "install.sh", "uninstall.sh":
+		return executableMode(mode)
+	}
+	if goos == "darwin" &&
+		(strings.HasPrefix(cleaned, "Contents/MacOS/") ||
+			strings.HasPrefix(cleaned, "Contents/Resources/pchat")) {
+		return executableMode(mode)
+	}
+	return mode
+}
+
+func executableMode(mode os.FileMode) os.FileMode {
+	return (mode &^ os.ModePerm) | 0o755
 }
 
 func replaceFileWithRetry(src string, dst string, mode os.FileMode, timeout time.Duration) error {

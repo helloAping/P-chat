@@ -29,6 +29,7 @@ done
 SRC_GUI="$EXEC_DIR/pchat-gui"
 SRC_SERVER="$EXEC_DIR/pchat-server"
 SRC_CLI="$EXEC_DIR/pchat"
+SRC_UPDATER="$EXEC_DIR/pchat-updater"
 SRC_UNINSTALL="$EXEC_DIR/uninstall.sh"
 
 if [[ ! -f "$SRC_GUI" ]]; then
@@ -37,6 +38,10 @@ if [[ ! -f "$SRC_GUI" ]]; then
 fi
 if [[ ! -f "$SRC_SERVER" ]]; then
   echo "ERROR: pchat-server not found next to install.sh ($EXEC_DIR)"
+  exit 1
+fi
+if [[ ! -f "$SRC_UPDATER" ]]; then
+  echo "ERROR: pchat-updater not found next to install.sh ($EXEC_DIR)"
   exit 1
 fi
 # SRC_CLI is optional — older bundles may not have it. Skip
@@ -71,12 +76,14 @@ install_bin() {
 if ! $PORTABLE; then
   install_bin "$SRC_GUI"    "$BIN_DIR/pchat-gui"
   install_bin "$SRC_SERVER" "$BIN_DIR/pchat-server"
+  install_bin "$SRC_UPDATER" "$BIN_DIR/pchat-updater"
   if $HAVE_CLI; then
     install_bin "$SRC_CLI"  "$BIN_DIR/pchat"
   fi
 else
   install_bin "$SRC_GUI"    "$EXEC_DIR/pchat-gui"
   install_bin "$SRC_SERVER" "$EXEC_DIR/pchat-server"
+  install_bin "$SRC_UPDATER" "$EXEC_DIR/pchat-updater"
   if $HAVE_CLI; then
     install_bin "$SRC_CLI"  "$EXEC_DIR/pchat"
   fi

@@ -48,6 +48,14 @@ if (-not (Test-Path -LiteralPath $serverSrc)) {
 Copy-Item -LiteralPath $serverSrc -Destination (Join-Path $binOut 'pchat-server') -Force
 Write-Host '[package-gui-linux] pchat-server copied' -ForegroundColor Green
 
+# --- Updater binary (mandatory for self-update) ---
+$updaterSrc = Join-Path $root 'bin\pchat-updater-linux'
+if (-not (Test-Path -LiteralPath $updaterSrc)) {
+    throw "Linux updater binary not found at $updaterSrc -- run 'task build:updater:linux' first"
+}
+Copy-Item -LiteralPath $updaterSrc -Destination (Join-Path $binOut 'pchat-updater') -Force
+Write-Host '[package-gui-linux] pchat-updater copied' -ForegroundColor Green
+
 # --- CLI binary (optional) ---
 Copy-IfExists -Src (Join-Path $root 'bin\pchat-linux') -Dst (Join-Path $binOut 'pchat') -Label 'pchat (CLI)'
 

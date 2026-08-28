@@ -1,23 +1,26 @@
 <#
 .SYNOPSIS
-  Build the Windows update zip and upload manifest for 08ms releases.
+  Build platform update zips and upload manifests for 08ms releases.
 
 .DESCRIPTION
-  The update zip is a full latest install-root payload. The client can
-  download it, verify SHA-256, restart into pchat-updater.exe, and overwrite
-  the existing install directory without running the setup installer.
+  The update zip is a latest install-root payload marked as a patch artifact.
+  The client can download it, verify SHA-256, restart into pchat-updater, and
+  overwrite the existing install files without running the setup installer.
 #>
 
 [CmdletBinding()]
 param(
     [string]$Platform = "windows",
     [string]$Arch = "amd64",
-    [switch]$RequireSetup
+    [switch]$RequireSetup,
+    [switch]$AllowMissingGui
 )
 
 $ErrorActionPreference = "Stop"
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$platformOS = (& "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format os).Trim()
+$packagePlatform = if ($platformOS -eq "darwin") { "macos" } else { $platformOS }
 $version = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw).Trim()
 if (-not ($version -match '^\d+\.\d+\.\d+$')) {
     throw "VERSION must be MAJOR.MINOR.PATCH for update detection; got '$version'"
@@ -25,16 +28,31 @@ if (-not ($version -match '^\d+\.\d+\.\d+$')) {
 
 $bin = Join-Path $root "bin"
 $stageRoot = Join-Path $root "build\package"
-$stage = Join-Path $stageRoot ("pchat-update-{0}-{1}-v{2}" -f $Platform, $Arch, $version)
-$zipPath = Join-Path $bin ("pchat-update-{0}-{1}-v{2}.zip" -f $Platform, $Arch, $version)
-$releaseManifestPath = Join-Path $bin ("pchat-release-manifest-v{0}.json" -f $version)
-$latestJsonPath = Join-Path $bin ("pchat-latest-{0}-{1}-v{2}.json" -f $Platform, $Arch, $version)
+$stage = Join-Path $stageRoot ("pchat-update-{0}-{1}-v{2}" -f $packagePlatform, $Arch, $version)
+$zipPath = Join-Path $bin ("pchat-update-{0}-{1}-v{2}.zip" -f $packagePlatform, $Arch, $version)
+$releaseManifestPath = Join-Path $bin ("pchat-release-manifest-{0}-{1}-v{2}.json" -f $packagePlatform, $Arch, $version)
+$latestJsonPath = Join-Path $bin ("pchat-latest-{0}-{1}-v{2}.json" -f $packagePlatform, $Arch, $version)
 
 function Assert-File {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Missing required file: $Path"
     }
+}
+
+function Assert-OptionalFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    if (Test-Path -LiteralPath $Path) {
+        return $true
+    }
+    if ($AllowMissingGui) {
+        Write-Host "[package-update-zip] WARNING: $Label missing at $Path (skipped)" -ForegroundColor Yellow
+        return $false
+    }
+    throw "Missing required file: $Path"
 }
 
 function Assert-VersionText {
@@ -46,6 +64,33 @@ function Assert-VersionText {
     if ($Text -notmatch [regex]::Escape($Expected)) {
         throw "$Label version mismatch: expected '$Expected', got '$Text'"
     }
+}
+
+function Get-HostOS {
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        return "windows"
+    }
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) {
+        return "linux"
+    }
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) {
+        return "darwin"
+    }
+    return "unknown"
+}
+
+function Assert-BinaryVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    Assert-File $Path
+    if ((Get-HostOS) -ne $platformOS) {
+        Write-Host "[package-update-zip] skip version check for $Label (target=$platformOS host=$(Get-HostOS))" -ForegroundColor Yellow
+        return
+    }
+    $text = (& $Path version 2>&1 | Out-String).Trim()
+    Assert-VersionText -Label $Label -Text $text -Expected $version
 }
 
 function Get-RelativePath {
@@ -91,7 +136,7 @@ function New-ArtifactEntry {
     $file = Get-Item -LiteralPath $Path
     return [ordered]@{
         kind     = $Kind
-        platform = $Platform
+        platform = $packagePlatform
         arch     = $Arch
         version  = $version
         file     = $file.Name
@@ -100,30 +145,36 @@ function New-ArtifactEntry {
     }
 }
 
-Assert-File (Join-Path $bin "pchat.exe")
-Assert-File (Join-Path $bin "pchat-server.exe")
-Assert-File (Join-Path $bin "pchat-gui.exe")
-Assert-File (Join-Path $bin "pchat-updater.exe")
-
-$wailsJson = Get-Content -LiteralPath (Join-Path $root "cmd\pchat-gui\wails.json") -Raw | ConvertFrom-Json
-if ($wailsJson.info.productVersion -ne $version) {
-    throw "wails.json productVersion mismatch: expected '$version', got '$($wailsJson.info.productVersion)'"
+function Find-FirstExisting {
+    param([Parameter(Mandatory = $true)][string[]]$Candidates)
+    foreach ($candidate in $Candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    return ""
 }
 
-$installPs1 = Get-Content -LiteralPath (Join-Path $root "cmd\pchat-gui\install.ps1") -Raw
-$displayVersionPattern = 'DisplayVersion"\s+-Value\s+"' + [regex]::Escape($version) + '"'
-if ($installPs1 -notmatch $displayVersionPattern) {
-    throw "install.ps1 DisplayVersion mismatch: expected '$version'"
+function Find-SetupPackage {
+    switch ($platformOS) {
+        "windows" {
+            return Find-FirstExisting @((Join-Path $bin ("pchat-setup-v{0}.exe" -f $version)))
+        }
+        "linux" {
+            return Find-FirstExisting @(
+                (Join-Path $bin ("pchat-linux-setup-v{0}.tar.gz" -f $version)),
+                (Join-Path $bin ("pchat-linux-setup-v{0}.zip" -f $version))
+            )
+        }
+        "darwin" {
+            return Find-FirstExisting @(
+                (Join-Path $bin ("pchat-mac-setup-v{0}.tar.gz" -f $version)),
+                (Join-Path $bin ("pchat-mac-setup-v{0}.zip" -f $version))
+            )
+        }
+    }
+    return ""
 }
-
-$cliVersion = (& (Join-Path $bin "pchat.exe") version 2>&1 | Out-String).Trim()
-Assert-VersionText -Label "pchat.exe" -Text $cliVersion -Expected $version
-
-$serverVersion = (& (Join-Path $bin "pchat-server.exe") version 2>&1 | Out-String).Trim()
-Assert-VersionText -Label "pchat-server.exe" -Text $serverVersion -Expected $version
-
-$updaterVersion = (& (Join-Path $bin "pchat-updater.exe") version 2>&1 | Out-String).Trim()
-Assert-VersionText -Label "pchat-updater.exe" -Text $updaterVersion -Expected $version
 
 New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
 if (Test-Path -LiteralPath $stage) {
@@ -136,20 +187,95 @@ if (Test-Path -LiteralPath $stage) {
 }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
-Copy-Item -LiteralPath (Join-Path $bin "pchat-gui.exe") -Destination (Join-Path $stage "pchat-gui.exe") -Force
-Copy-Item -LiteralPath (Join-Path $bin "pchat-server.exe") -Destination (Join-Path $stage "pchat-server.exe") -Force
-Copy-Item -LiteralPath (Join-Path $bin "pchat.exe") -Destination (Join-Path $stage "pchat.exe") -Force
-Copy-Item -LiteralPath (Join-Path $bin "pchat-updater.exe") -Destination (Join-Path $stage "pchat-updater.exe") -Force
-Copy-Item -LiteralPath (Join-Path $root "cmd\pchat-gui\uninstall.ps1") -Destination (Join-Path $stage "uninstall.ps1") -Force
+switch ($platformOS) {
+    "windows" {
+        $wailsJson = Get-Content -LiteralPath (Join-Path $root "cmd\pchat-gui\wails.json") -Raw | ConvertFrom-Json
+        if ($wailsJson.info.productVersion -ne $version) {
+            throw "wails.json productVersion mismatch: expected '$version', got '$($wailsJson.info.productVersion)'"
+        }
 
-$browserExt = Join-Path $bin "browser-extension.zip"
-if (Test-Path -LiteralPath $browserExt) {
-    Copy-Item -LiteralPath $browserExt -Destination (Join-Path $stage "browser-extension.zip") -Force
-}
+        $installPs1 = Get-Content -LiteralPath (Join-Path $root "cmd\pchat-gui\install.ps1") -Raw
+        $displayVersionPattern = 'DisplayVersion"\s+-Value\s+"' + [regex]::Escape($version) + '"'
+        if ($installPs1 -notmatch $displayVersionPattern) {
+            throw "install.ps1 DisplayVersion mismatch: expected '$version'"
+        }
 
-$webDir = Join-Path $root "web"
-if (Test-Path -LiteralPath $webDir) {
-    Copy-Item -LiteralPath $webDir -Destination (Join-Path $stage "web") -Recurse -Force
+        Assert-BinaryVersion -Label "pchat.exe" -Path (Join-Path $bin "pchat.exe")
+        Assert-BinaryVersion -Label "pchat-server.exe" -Path (Join-Path $bin "pchat-server.exe")
+        Assert-BinaryVersion -Label "pchat-updater.exe" -Path (Join-Path $bin "pchat-updater.exe")
+        Assert-File (Join-Path $bin "pchat-gui.exe")
+
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-gui.exe") -Destination (Join-Path $stage "pchat-gui.exe") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-server.exe") -Destination (Join-Path $stage "pchat-server.exe") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat.exe") -Destination (Join-Path $stage "pchat.exe") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-updater.exe") -Destination (Join-Path $stage "pchat-updater.exe") -Force
+        Copy-Item -LiteralPath (Join-Path $root "cmd\pchat-gui\uninstall.ps1") -Destination (Join-Path $stage "uninstall.ps1") -Force
+
+        $browserExt = Join-Path $bin "browser-extension.zip"
+        if (Test-Path -LiteralPath $browserExt) {
+            Copy-Item -LiteralPath $browserExt -Destination (Join-Path $stage "browser-extension.zip") -Force
+        }
+
+        $webDir = Join-Path $root "web"
+        if (Test-Path -LiteralPath $webDir) {
+            Copy-Item -LiteralPath $webDir -Destination (Join-Path $stage "web") -Recurse -Force
+        }
+    }
+    "linux" {
+        $guiPath = Find-FirstExisting @(
+            (Join-Path $root "cmd\pchat-gui\build\bin\pchat-gui"),
+            (Join-Path $root "build\artifacts\linux\pchat-gui"),
+            (Join-Path $root "artifacts\linux\pchat-gui")
+        )
+        if ($guiPath -or (Assert-OptionalFile -Path (Join-Path $root "cmd\pchat-gui\build\bin\pchat-gui") -Label "Linux pchat-gui")) {
+            if (-not $guiPath) {
+                $guiPath = Join-Path $root "cmd\pchat-gui\build\bin\pchat-gui"
+            }
+            Copy-Item -LiteralPath $guiPath -Destination (Join-Path $stage "pchat-gui") -Force
+        }
+        Assert-BinaryVersion -Label "pchat-server-linux" -Path (Join-Path $bin "pchat-server-linux")
+        Assert-BinaryVersion -Label "pchat-linux" -Path (Join-Path $bin "pchat-linux")
+        Assert-BinaryVersion -Label "pchat-updater-linux" -Path (Join-Path $bin "pchat-updater-linux")
+
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-server-linux") -Destination (Join-Path $stage "pchat-server") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-linux") -Destination (Join-Path $stage "pchat") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-updater-linux") -Destination (Join-Path $stage "pchat-updater") -Force
+        Copy-Item -LiteralPath (Join-Path $root "scripts\uninstall-linux.sh") -Destination (Join-Path $stage "uninstall.sh") -Force
+    }
+    "darwin" {
+        $appPath = Find-FirstExisting @(
+            (Join-Path $root "cmd\pchat-gui\build\bin\pchat-gui.app"),
+            (Join-Path $root "build\artifacts\mac\pchat-gui.app"),
+            (Join-Path $root "artifacts\mac\pchat-gui.app")
+        )
+        $resources = Join-Path $stage "Contents\Resources"
+        New-Item -ItemType Directory -Path $resources -Force | Out-Null
+        if ($appPath) {
+            Get-ChildItem -LiteralPath $appPath -Force | ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force
+            }
+        } elseif (-not $AllowMissingGui) {
+            throw "Missing required macOS app bundle: cmd\pchat-gui\build\bin\pchat-gui.app"
+        } else {
+            Write-Host "[package-update-zip] WARNING: macOS pchat-gui.app missing (patch zip will not contain GUI)" -ForegroundColor Yellow
+        }
+
+        Assert-BinaryVersion -Label "pchat-server-darwin-amd64" -Path (Join-Path $bin "pchat-server-darwin-amd64")
+        Assert-BinaryVersion -Label "pchat-darwin-amd64" -Path (Join-Path $bin "pchat-darwin-amd64")
+        Assert-BinaryVersion -Label "pchat-updater-darwin-amd64" -Path (Join-Path $bin "pchat-updater-darwin-amd64")
+
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-server-darwin-amd64") -Destination (Join-Path $resources "pchat-server") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-darwin-amd64") -Destination (Join-Path $resources "pchat") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-updater-darwin-amd64") -Destination (Join-Path $resources "pchat-updater") -Force
+
+        $browserExt = Join-Path $root "cmd\pchat-server\browser-extension.zip"
+        if (Test-Path -LiteralPath $browserExt) {
+            Copy-Item -LiteralPath $browserExt -Destination (Join-Path $resources "browser-extension.zip") -Force
+        }
+    }
+    default {
+        throw "Unsupported platform: $Platform"
+    }
 }
 
 $files = @()
@@ -168,7 +294,7 @@ $updateManifest = [ordered]@{
     slug           = "p-chat"
     kind           = "patch"
     version        = $version
-    platform       = $Platform
+    platform       = $packagePlatform
     arch           = $Arch
     created_at_utc = (Get-Date).ToUniversalTime().ToString("s") + "Z"
     files          = $files
@@ -183,12 +309,12 @@ $updateArtifact = New-ArtifactEntry -Kind "patch" -Path $zipPath
 
 $artifacts = @()
 $setupArtifact = $null
-$setupPath = Join-Path $bin ("pchat-setup-v{0}.exe" -f $version)
-if (Test-Path -LiteralPath $setupPath) {
+$setupPath = Find-SetupPackage
+if ($setupPath) {
     $setupArtifact = New-ArtifactEntry -Kind "full" -Path $setupPath
     $artifacts += $setupArtifact
 } elseif ($RequireSetup) {
-    throw "Setup installer is required but missing: $setupPath"
+    throw "Setup package is required but missing for platform=$packagePlatform version=$version"
 }
 $artifacts += $updateArtifact
 
@@ -203,14 +329,14 @@ $latestJson = [ordered]@{
     channel       = "stable"
     release_notes = ""
     published_at  = $createdAtUTC
-    platform      = $Platform
+    platform      = $packagePlatform
     arch          = $Arch
     size          = $primaryArtifact.size
     sha256        = $primaryArtifact.sha256
     url           = $primaryURL
     patch         = [ordered]@{
         kind     = "patch"
-        platform = $Platform
+        platform = $packagePlatform
         arch     = $Arch
         size     = $updateArtifact.size
         sha256   = $updateArtifact.sha256
@@ -220,7 +346,7 @@ $latestJson = [ordered]@{
 if ($setupArtifact) {
     $latestJson["full"] = [ordered]@{
         kind     = "full"
-        platform = $Platform
+        platform = $packagePlatform
         arch     = $Arch
         size     = $setupArtifact.size
         sha256   = $setupArtifact.sha256
@@ -234,7 +360,7 @@ $releaseManifest = [ordered]@{
     slug             = "p-chat"
     version          = $version
     channel          = "stable"
-    platform         = $Platform
+    platform         = $packagePlatform
     arch             = $Arch
     created_at_utc   = $createdAtUTC
     artifacts        = $artifacts

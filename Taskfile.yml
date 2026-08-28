@@ -160,6 +160,16 @@ tasks:
           CGO_ENABLED: 0
     silent: false
 
+  build:updater:linux:
+    desc: 交叉编译 Linux 自动更新器
+    cmds:
+      - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-updater-linux ./cmd/pchat-updater
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+    silent: false
+
   build:im_qq:
     desc: 编译带 QQ IM adapter build tag 的 Server
     cmds:
@@ -176,6 +186,16 @@ tasks:
     desc: 交叉编译 macOS Server 二进制 (amd64)
     cmds:
       - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-server-darwin-amd64 ./cmd/pchat-server
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: 0
+    silent: false
+
+  build:updater:macos:
+    desc: 交叉编译 macOS 自动更新器 (amd64)
+    cmds:
+      - cmd: go build -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}" -o bin/pchat-updater-darwin-amd64 ./cmd/pchat-updater
         env:
           GOOS: darwin
           GOARCH: amd64
@@ -228,7 +248,7 @@ tasks:
     deps: [build:binaries, build:gui:binary]
 
   build:win:
-    desc: 打包 Windows GUI setup 安装包
+    desc: 打包 Windows GUI setup 安装包 + 自动更新增量包
     cmds:
       - task: build:frontend
       - task: build:win:prepared
@@ -243,7 +263,7 @@ tasks:
     silent: false
 
   build:linux:
-    desc: 打包 Linux GUI setup 压缩包（Windows 下可生成，GUI 二进制 best-effort）
+    desc: 打包 Linux GUI setup 压缩包 + 自动更新增量包（Windows 下 GUI 二进制 best-effort）
     cmds:
       - task: build:frontend
       - task: build:linux:prepared
@@ -251,14 +271,15 @@ tasks:
 
   build:linux:prepared:
     internal: true
-    deps: [build:server:linux, build:cli:linux]
+    deps: [build:server:linux, build:cli:linux, build:updater:linux]
     cmds:
       - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -Task "build:gui:linux:binary" -Platform "linux"
       - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/package-platform-archive.ps1" -Platform "linux" -AllowMissingGui
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-update-zip.ps1 -Platform "linux" -RequireSetup -AllowMissingGui
     silent: false
 
   build:mac:
-    desc: 打包 macOS GUI setup 压缩包（Windows 下可生成，GUI .app best-effort）
+    desc: 打包 macOS GUI setup 压缩包 + 自动更新增量包（Windows 下 GUI .app best-effort）
     cmds:
       - task: build:frontend
       - task: build:mac:prepared
@@ -266,14 +287,15 @@ tasks:
 
   build:mac:prepared:
     internal: true
-    deps: [build:server:macos, build:cli:macos]
+    deps: [build:server:macos, build:cli:macos, build:updater:macos]
     cmds:
       - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/run-platform-build.ps1" -RequiredOS mac -Task "build:gui:macos:binary" -Platform "mac"
       - powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/package-platform-archive.ps1" -Platform "mac" -AllowMissingGui
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-update-zip.ps1 -Platform "mac" -RequireSetup -AllowMissingGui
     silent: false
 
   build:all:
-    desc: 同时打包 Windows / macOS / Linux GUI setup 安装包
+    desc: 同时打包 Windows / macOS / Linux GUI setup 安装包 + 自动更新增量包
     cmds:
       # 前端只构建并同步一次。Build and sync the SPA exactly once.
       # 后续阶段直接消费已有产物。Following stages consume the existing output.
@@ -283,15 +305,13 @@ tasks:
       - task: build:mac:prepared
 
   package:gui:
-    desc: 把桌面端打包到 bin\（含前端 SPA + pchat-server.exe + install/uninstall 脚本）
+    desc: 打包 Windows GUI setup 安装包 + 自动更新增量包
     cmds:
-      - task: build:frontend
-      - task: build:windows:artifacts
-      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-gui.ps1
+      - task: build:win
     silent: false
 
   package:gui:platform:
-    desc: 打包指定平台桌面端。用法：task package:gui:platform PLATFORM=win|linux|mac
+    desc: 打包指定平台 setup + 增量包。用法：task package:gui:platform PLATFORM=win|linux|mac
     vars:
       PLATFORM: '{{default "win" .PLATFORM}}'
     cmds:
@@ -299,31 +319,52 @@ tasks:
     silent: false
 
   package:gui:win:
-    desc: 打包 Windows 桌面端别名
+    desc: 打包 Windows setup + 增量包别名
     cmds:
-      - task: package:gui
+      - task: build:win
     silent: false
 
   package:update:win:
-    desc: 打包 Windows 自动更新压缩包 bin/pchat-update-windows-amd64-v{version}.zip
+    desc: 打包 Windows setup + 自动更新增量压缩包
     cmds:
-      - task: build:frontend
-      - task: build:windows:artifacts
-      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-update-zip.ps1
+      - task: build:win
+    silent: false
+
+  package:update:linux:
+    desc: 打包 Linux setup + 自动更新增量压缩包
+    cmds:
+      - task: build:linux
+    silent: false
+
+  package:update:macos:
+    desc: 打包 macOS setup + 自动更新增量压缩包
+    cmds:
+      - task: build:mac
+    silent: false
+
+  package:update:mac:
+    desc: 打包 macOS setup + 自动更新增量压缩包别名
+    cmds:
+      - task: package:update:macos
+    silent: false
+
+  package:update:all:
+    desc: 打包 Windows / macOS / Linux setup + 自动更新增量压缩包
+    cmds:
+      - task: build:all
     silent: false
 
   package:gui:linux:
-    desc: 打包 Linux 安装包到 build/bin/（含 Linux server/CLI 二进制，非 Windows .exe）
+    desc: 打包 Linux setup + 增量包别名
     cmds:
-      - task: build:frontend
-      - task: package:gui:linux:prepared
+      - task: build:linux
     silent: false
 
   # build:all 在前端就绪后调用的隐藏入口。Hidden entry point used after build:frontend.
   # 平台包装脚本会启动子 Task 进程，因此此任务需保持可调用。
   # The platform wrapper starts a child Task process, so this task stays callable.
   package:gui:linux:prepared:
-    deps: [build:server:linux, build:cli:linux]
+    deps: [build:server:linux, build:cli:linux, build:updater:linux]
     cmds:
       # Wails v2 does not support Windows→Linux cross-compile. The
       # build step is best-effort: when it fails (or is run on
@@ -342,21 +383,20 @@ tasks:
     silent: false
 
   package:gui:macos:
-    desc: 打包 macOS 安装包到 build/bin/pchat-gui-macos/ — 需要在 macOS 主机上运行
+    desc: 打包 macOS setup + 增量包别名
     cmds:
-      - task: build:frontend
-      - task: package:gui:macos:prepared
+      - task: build:mac
     silent: false
 
   package:gui:mac:
-    desc: 打包 macOS 桌面端别名
+    desc: 打包 macOS setup + 增量包别名
     cmds:
       - task: package:gui:macos
     silent: false
 
   # build:all 在共享前端构建后调用的隐藏入口。Hidden entry point used after the shared SPA build.
   package:gui:macos:prepared:
-    deps: [build:server:macos, build:cli:macos]
+    deps: [build:server:macos, build:cli:macos, build:updater:macos]
     cmds:
       # Wails v2 cannot cross-compile to darwin from Windows/Linux.
       # Skip with a clear message on non-macOS hosts; the actual

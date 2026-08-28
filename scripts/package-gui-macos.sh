@@ -9,6 +9,7 @@
 # Inputs (must already exist):
 #   - cmd/pchat-gui/build/bin/pchat-gui.app   (from `task build:gui:macos`)
 #   - bin/pchat-server-darwin-amd64           (from `task build:server:macos`)
+#   - bin/pchat-updater-darwin-amd64          (from `task build:updater:macos`)
 #   - bin/pchat-darwin-amd64                  (from `task build:cli:macos`, optional)
 #   - web/                                    (from `task build:frontend`)
 #   - cmd/pchat-server/browser-extension.zip  (from `task build:frontend`)
@@ -18,6 +19,7 @@
 #   build/bin/pchat-gui-macos/
 #     ├── pchat-gui.app/            (contains Contents/Resources/pchat-server)
 #     ├── pchat-server              (CLI convenience copy)
+#     ├── pchat-updater             (self-update applier)
 #     ├── pchat                       (optional, if cross-compiled)
 #     ├── web/                        (SPA — also embedded in pchat-server)
 #     ├── browser-extension.zip
@@ -42,6 +44,12 @@ if [[ ! -f "$ROOT/bin/pchat-server-darwin-amd64" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$ROOT/bin/pchat-updater-darwin-amd64" ]]; then
+    echo "ERROR: macOS updater binary not found at bin/pchat-updater-darwin-amd64" >&2
+    echo "       run 'task build:updater:macos' first" >&2
+    exit 1
+fi
+
 # Wipe + recreate the bundle dir so removed/renamed files from a
 # prior build don't linger (cp -R doesn't delete stale entries).
 if [[ -d "$BIN_DIR" ]]; then
@@ -59,15 +67,26 @@ cp "$ROOT/bin/pchat-server-darwin-amd64" "$APP_RESOURCES/pchat-server"
 chmod +x "$APP_RESOURCES/pchat-server"
 echo "[package-gui-macos] embedded pchat-server into app Resources"
 
+cp "$ROOT/bin/pchat-updater-darwin-amd64" "$APP_RESOURCES/pchat-updater"
+chmod +x "$APP_RESOURCES/pchat-updater"
+echo "[package-gui-macos] embedded pchat-updater into app Resources"
+
 # --- server binary ---
 cp "$ROOT/bin/pchat-server-darwin-amd64" "$BIN_DIR/pchat-server"
 chmod +x "$BIN_DIR/pchat-server"
 echo "[package-gui-macos] copied pchat-server"
 
+# --- updater binary ---
+cp "$ROOT/bin/pchat-updater-darwin-amd64" "$BIN_DIR/pchat-updater"
+chmod +x "$BIN_DIR/pchat-updater"
+echo "[package-gui-macos] copied pchat-updater"
+
 # --- CLI (optional) ---
 if [[ -f "$ROOT/bin/pchat-darwin-amd64" ]]; then
     cp "$ROOT/bin/pchat-darwin-amd64" "$BIN_DIR/pchat"
     chmod +x "$BIN_DIR/pchat"
+    cp "$ROOT/bin/pchat-darwin-amd64" "$APP_RESOURCES/pchat"
+    chmod +x "$APP_RESOURCES/pchat"
     echo "[package-gui-macos] copied pchat (CLI)"
 fi
 

@@ -40,6 +40,11 @@ $expectedCounts = [ordered]@{
     'package:gui:linux:prepared'   = 0
     'package:gui:macos'            = 1
     'package:gui:macos:prepared'   = 0
+    'package:update:win'           = 1
+    'package:update:linux'         = 1
+    'package:update:macos'         = 1
+    'package:update:mac'           = 1
+    'package:update:all'           = 1
 }
 
 foreach ($entry in $expectedCounts.GetEnumerator()) {
@@ -75,4 +80,17 @@ foreach ($platformName in 'linux', 'mac') {
     }
 
     Write-Host "[test-build-task-graph] build:all archives platform $platformName" -ForegroundColor Green
+}
+
+if (-not $buildAllOutput.Contains("-File scripts/package-update-zip.ps1 -RequireSetup")) {
+    throw "Expected 'build:all' to create the Windows update zip after the setup installer."
+}
+Write-Host "[test-build-task-graph] build:all creates Windows update zip" -ForegroundColor Green
+
+foreach ($platformName in 'linux', 'mac') {
+    if (-not $buildAllOutput.Contains("-File scripts/package-update-zip.ps1 -Platform `"$platformName`" -RequireSetup -AllowMissingGui")) {
+        throw "Expected 'build:all' to create update zip for platform '$platformName'."
+    }
+
+    Write-Host "[test-build-task-graph] build:all creates update zip for $platformName" -ForegroundColor Green
 }

@@ -93,6 +93,40 @@ func TestRunRejectsPackageHashMismatch(t *testing.T) {
 	}
 }
 
+func TestUpdateFileModeForOS_MarksUnixPayloadExecutables(t *testing.T) {
+	cases := []struct {
+		name string
+		goos string
+		rel  string
+	}{
+		{name: "linux-gui", goos: "linux", rel: "pchat-gui"},
+		{name: "linux-server", goos: "linux", rel: "pchat-server"},
+		{name: "linux-cli", goos: "linux", rel: "pchat"},
+		{name: "linux-updater", goos: "linux", rel: "pchat-updater"},
+		{name: "linux-script", goos: "linux", rel: "uninstall.sh"},
+		{name: "mac-main-binary", goos: "darwin", rel: "Contents/MacOS/pchat-gui"},
+		{name: "mac-resource-server", goos: "darwin", rel: "Contents/Resources/pchat-server"},
+		{name: "mac-resource-updater-backslash", goos: "darwin", rel: `Contents\Resources\pchat-updater`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := updateFileModeForOS(tc.rel, 0o644, tc.goos)
+			if got.Perm() != 0o755 {
+				t.Fatalf("mode = %v, want 0755", got.Perm())
+			}
+		})
+	}
+}
+
+func TestUpdateFileModeForOS_LeavesAssetsAndWindowsModesAlone(t *testing.T) {
+	if got := updateFileModeForOS("web/index.html", 0o644, "linux"); got.Perm() != 0o644 {
+		t.Fatalf("linux asset mode = %v, want 0644", got.Perm())
+	}
+	if got := updateFileModeForOS("pchat.exe", 0o644, "windows"); got.Perm() != 0o644 {
+		t.Fatalf("windows mode = %v, want 0644", got.Perm())
+	}
+}
+
 func writeZip(t *testing.T, filePath string, files map[string]string) {
 	t.Helper()
 	f, err := os.Create(filePath)

@@ -293,12 +293,12 @@ func (a *App) InstallUpdate(packagePath string, expectedSHA256 string) error {
 	if err != nil {
 		return fmt.Errorf("resolve gui executable: %w", err)
 	}
-	installDir := filepath.Dir(exe)
+	installDir, launch := updateTargetForExecutable(exe)
 	logPath := filepath.Join(resolveHomeDir(), "updates", "update.log")
 	args := []string{
 		"--install-dir", installDir,
 		"--package", pkg,
-		"--launch", filepath.Base(exe),
+		"--launch", launch,
 		"--parent-pid", strconv.Itoa(os.Getpid()),
 		"--log", logPath,
 	}
@@ -317,6 +317,26 @@ func (a *App) InstallUpdate(packagePath string, expectedSHA256 string) error {
 		a.quitApp()
 	}()
 	return nil
+}
+
+func updateTargetForExecutable(exe string) (string, string) {
+	return updateTargetForExecutableOS(exe, runtime.GOOS)
+}
+
+func updateTargetForExecutableOS(exe string, goos string) (string, string) {
+	dir := filepath.Dir(exe)
+	launch := filepath.Base(exe)
+	if goos != "darwin" {
+		return dir, launch
+	}
+	contentsDir := filepath.Dir(dir)
+	appDir := filepath.Dir(contentsDir)
+	if filepath.Base(dir) == "MacOS" &&
+		filepath.Base(contentsDir) == "Contents" &&
+		strings.HasSuffix(strings.ToLower(filepath.Base(appDir)), ".app") {
+		return appDir, filepath.Join("Contents", "MacOS", launch)
+	}
+	return dir, launch
 }
 
 // SaveExportFile opens the OS-native save dialog and writes an exported
