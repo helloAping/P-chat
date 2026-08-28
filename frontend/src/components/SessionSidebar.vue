@@ -869,6 +869,34 @@ function notifyUpdateAvailable(info: UpdateInfo) {
   close = () => notice.destroy()
 }
 
+function notifyDownloadedUpdate(update: UpdateDownloadResult) {
+  const packageLabel = updateArtifactLabel(update)
+  let close: (() => void) | null = null
+  const notice = notification.success({
+    title: `${packageLabel}已下载`,
+    content: `${update.fileName || packageLabel} 已通过校验。点击重启后会自动替换为最新版本 ${versionLabel(update.latest)}。`,
+    duration: 0,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'primary',
+        disabled: updateInstalling.value,
+        onClick: () => {
+          close?.()
+          confirmRestartUpdate(update)
+        },
+      },
+      {
+        icon: () => h(RotateCw, { size: 14 }),
+        default: () => '重启并更新',
+      },
+    ),
+  })
+  close = () => notice.destroy()
+}
+
 async function refreshUpdate(force = false, notify = false) {
   const info = await checkUpdate(force)
   if (!info) return
@@ -928,8 +956,7 @@ async function onDownloadUpdate() {
     const result = await downloadUpdate()
     downloadedUpdate.value = result
     updateInfo.value = result
-    message.success(`${updateArtifactLabel(result)}已下载并校验`)
-    confirmRestartUpdate(result)
+    notifyDownloadedUpdate(result)
   } catch (err) {
     message.error(`下载更新失败: ${updateErrorMessage(err)}`)
   } finally {
@@ -1349,7 +1376,9 @@ onMounted(() => {
             <p class="update-meta" v-if="hasSeparateFullPackage(updateInfo)">
               也可下载全量包，或打开软件发布页选择需要的软件包。
             </p>
-            <p class="update-meta" v-if="downloadedUpdate">已下载 {{ downloadedUpdate.fileName || updateArtifactLabel(downloadedUpdate) }}</p>
+            <p class="update-meta" v-if="downloadedUpdate">
+              已下载 {{ downloadedUpdate.fileName || updateArtifactLabel(downloadedUpdate) }}，重启后会自动替换为最新版本。
+            </p>
             <div class="update-actions">
               <NButton
                 v-if="downloadedUpdate"
