@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/version"
 )
 
 func TestCheckUpdateEndpoint(t *testing.T) {
@@ -53,6 +55,43 @@ func TestCheckUpdateEndpoint(t *testing.T) {
 	}
 	if body["installable"] != true {
 		t.Fatalf("installable = %v, want true", body["installable"])
+	}
+}
+
+func TestCheckUpdateEndpointUsesRuntimeVersionWhenNoQuery(t *testing.T) {
+	oldVersion := version.Version
+	version.Version = "1.0.12"
+	t.Cleanup(func() { version.Version = oldVersion })
+
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("current_version") != "1.0.12" {
+			t.Fatalf("current_version = %q, want 1.0.12", r.URL.Query().Get("current_version"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{
+			"version":"1.0.13",
+			"platform":"windows",
+			"arch":"amd64",
+			"full":{
+				"kind":"full",
+				"platform":"windows",
+				"arch":"amd64",
+				"size":3,
+				"sha256":%q,
+				"url":%q
+			}
+		}`, sha256HexString([]byte("zip")), upstream.URL+"/pchat-update-windows-amd64-v1.0.13.zip")
+	}))
+	defer upstream.Close()
+	t.Setenv("PCHAT_UPDATE_URL", upstream.URL)
+
+	s, _ := newTestServer(t)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/updates/check", nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
 	}
 }
 

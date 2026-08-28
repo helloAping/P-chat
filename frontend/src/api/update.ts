@@ -1,5 +1,7 @@
 const BASE = ''
 
+export const SOFTWARE_RELEASE_PAGE = 'http://www.08ms.cn/software/p-chat/'
+
 export interface UpdateArtifact {
   artifact_id?: number
   kind?: string
@@ -92,7 +94,7 @@ function normalizeUpdateInfo(raw: RawUpdateInfo): UpdateInfo {
     latest: raw.latest || __APP_VERSION__,
     hasUpdate: !!raw.has_update,
     installable: !!raw.installable,
-    url: raw.url || artifact?.url || raw.patch?.url || raw.full?.url || '',
+    url: artifact?.url || raw.patch?.url || raw.full?.url || raw.url || '',
     body: raw.release_notes || '',
     publishedAt: raw.published_at || '',
     artifact,
@@ -138,10 +140,7 @@ export async function checkUpdate(force = false): Promise<UpdateInfo | null> {
   checking = true
   try {
     const base = await waitForDirectBackend()
-    const res = await fetch(
-      `${base}/api/v1/updates/check?current_version=${encodeURIComponent(__APP_VERSION__)}`,
-      { headers: { Accept: 'application/json' } },
-    )
+    const res = await fetch(`${base}/api/v1/updates/check`, { headers: { Accept: 'application/json' } })
     if (!res.ok) return null
     cached = normalizeUpdateInfo(await res.json())
     return cached
@@ -154,13 +153,10 @@ export async function checkUpdate(force = false): Promise<UpdateInfo | null> {
 
 export async function downloadUpdate(): Promise<UpdateDownloadResult> {
   const base = await waitForDirectBackend()
-  const res = await fetch(
-    `${base}/api/v1/updates/download?current_version=${encodeURIComponent(__APP_VERSION__)}`,
-    {
-      method: 'POST',
-      headers: { Accept: 'application/json' },
-    },
-  )
+  const res = await fetch(`${base}/api/v1/updates/download`, {
+    method: 'POST',
+    headers: { Accept: 'application/json' },
+  })
   if (!res.ok) throw new Error(await readError(res))
 
   const result = normalizeDownloadResult(await res.json())

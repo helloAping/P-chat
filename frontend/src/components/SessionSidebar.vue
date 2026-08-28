@@ -40,8 +40,8 @@ import {
 } from '../stores/chat'
 import * as api from '../api/client'
 import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
-import { checkUpdate, downloadUpdate, installDownloadedUpdate } from '../api/update'
-import type { UpdateDownloadResult, UpdateInfo } from '../api/update'
+import { checkUpdate, downloadUpdate, installDownloadedUpdate, SOFTWARE_RELEASE_PAGE } from '../api/update'
+import type { UpdateArtifact, UpdateDownloadResult, UpdateInfo } from '../api/update'
 import type { SearchResult, Session } from '../api/client'
 import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
@@ -52,7 +52,7 @@ import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
   ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
-  Download, RotateCw,
+  Download, RotateCw, ExternalLink,
 } from './icons'
 
 const APP_VERSION = __APP_VERSION__
@@ -795,7 +795,39 @@ function updateSizeLabel(size?: number): string {
 }
 
 function updatePackageSize(info: UpdateInfo): string {
-  return updateSizeLabel(info.artifact?.size || info.patch?.size || info.full?.size)
+  return updateSizeLabel(selectedUpdateArtifact(info)?.size || info.patch?.size || info.full?.size)
+}
+
+function selectedUpdateArtifact(info: UpdateInfo): UpdateArtifact | undefined {
+  return info.artifact || info.patch || info.full
+}
+
+function selectedUpdateURL(info: UpdateInfo): string {
+  return selectedUpdateArtifact(info)?.url || info.url || ''
+}
+
+function updateArtifactLabel(info: UpdateInfo): string {
+  switch (selectedUpdateArtifact(info)?.kind) {
+    case 'patch':
+      return '差分更新包'
+    case 'full':
+      return '全量更新包'
+    default:
+      return '更新压缩包'
+  }
+}
+
+function updateDownloadButtonText(info: UpdateInfo): string {
+  return `下载${updateArtifactLabel(info)}`
+}
+
+function fullPackageURL(info: UpdateInfo): string {
+  return info.full?.url || ''
+}
+
+function hasSeparateFullPackage(info: UpdateInfo): boolean {
+  const full = fullPackageURL(info)
+  return !!full && full !== selectedUpdateURL(info)
 }
 
 function updateErrorMessage(err: unknown): string {
@@ -815,9 +847,10 @@ function notifyUpdateAvailable(info: UpdateInfo) {
   }
 
   let close: (() => void) | null = null
+  const fullPackageHint = hasSeparateFullPackage(info) ? '，也可下载全量包' : ''
   const notice = notification.info({
     title: '发现可用更新',
-    content: `最新版本 ${versionLabel(latest)} 可以更新。`,
+    content: `最新版本 ${versionLabel(latest)} 可以更新，关于页可下载${updateArtifactLabel(info)}${fullPackageHint}。`,
     duration: 8000,
     keepAliveOnHover: true,
     action: () => h(
@@ -847,7 +880,8 @@ async function refreshUpdate(force = false, notify = false) {
 }
 
 async function openUpdateURL() {
-  const url = updateInfo.value?.url
+  const info = updateInfo.value
+  const url = info ? selectedUpdateURL(info) : ''
   if (!url) {
     message.warning('当前更新源没有提供下载地址')
     return
@@ -856,6 +890,28 @@ async function openUpdateURL() {
     await api.openExternalURL(url)
   } catch (err) {
     message.error(`打开下载地址失败: ${updateErrorMessage(err)}`)
+  }
+}
+
+async function openFullPackageURL() {
+  const info = updateInfo.value
+  const url = info ? fullPackageURL(info) : ''
+  if (!url) {
+    message.warning('当前更新源没有提供全量包下载地址')
+    return
+  }
+  try {
+    await api.openExternalURL(url)
+  } catch (err) {
+    message.error(`打开全量包下载地址失败: ${updateErrorMessage(err)}`)
+  }
+}
+
+async function openReleasePage() {
+  try {
+    await api.openExternalURL(SOFTWARE_RELEASE_PAGE)
+  } catch (err) {
+    message.error(`打开软件发布页失败: ${updateErrorMessage(err)}`)
   }
 }
 
@@ -872,7 +928,7 @@ async function onDownloadUpdate() {
     const result = await downloadUpdate()
     downloadedUpdate.value = result
     updateInfo.value = result
-    message.success('更新压缩包已下载并校验')
+    message.success(`${updateArtifactLabel(result)}已下载并校验`)
     confirmRestartUpdate(result)
   } catch (err) {
     message.error(`下载更新失败: ${updateErrorMessage(err)}`)
@@ -888,7 +944,7 @@ function confirmRestartUpdate(update = downloadedUpdate.value) {
     : ''
   dialog.warning({
     title: '重启并更新 P-Chat',
-    content: `${update.fileName || '更新压缩包'} 已下载并通过校验。${busyText}是否现在重启并替换为最新版本 ${versionLabel(update.latest)}？`,
+    content: `${update.fileName || updateArtifactLabel(update)} 已下载并通过校验。${busyText}是否现在重启并替换为最新版本 ${versionLabel(update.latest)}？`,
     positiveText: '立即重启并更新',
     negativeText: '稍后',
     onPositiveClick: () => installUpdateNow(update),
@@ -1276,7 +1332,7 @@ onMounted(() => {
     <NModal v-model:show="showAbout" preset="card" title="关于 P-Chat" style="width: 380px">
       <div class="about-body">
         <p class="about-name">P-Chat</p>
-        <p class="about-version">版本 v{{ APP_VERSION }}</p>
+        <p class="about-version">版本 {{ versionLabel(updateInfo?.current || APP_VERSION) }}</p>
         <p class="about-desc">对话式 AI Agent · CLI / HTTP / 桌面端三端同源</p>
         <p class="about-desc">Go + Vue 3 + Vite + SQLite · Wails v2</p>
         <p class="about-desc">OpenAI / Anthropic 双协议 · ReAct 工具调用循环</p>
@@ -1286,8 +1342,14 @@ onMounted(() => {
             <NTag type="warning" size="small">发现新版本</NTag>
             <p>最新版本 <strong>{{ versionLabel(updateInfo.latest) }}</strong></p>
             <p class="update-body" v-if="updateInfo.body">{{ updateInfo.body }}</p>
-            <p class="update-meta" v-if="updatePackageSize(updateInfo)">更新压缩包 {{ updatePackageSize(updateInfo) }}</p>
-            <p class="update-meta" v-if="downloadedUpdate">已下载 {{ downloadedUpdate.fileName || '更新压缩包' }}</p>
+            <p class="update-meta">
+              自动更新将使用 {{ updateArtifactLabel(updateInfo) }}
+              <template v-if="updatePackageSize(updateInfo)"> · {{ updatePackageSize(updateInfo) }}</template>
+            </p>
+            <p class="update-meta" v-if="hasSeparateFullPackage(updateInfo)">
+              也可下载全量包，或打开软件发布页选择需要的软件包。
+            </p>
+            <p class="update-meta" v-if="downloadedUpdate">已下载 {{ downloadedUpdate.fileName || updateArtifactLabel(downloadedUpdate) }}</p>
             <div class="update-actions">
               <NButton
                 v-if="downloadedUpdate"
@@ -1309,7 +1371,7 @@ onMounted(() => {
                 @click="onDownloadUpdate"
               >
                 <template #icon><Download :size="14" /></template>
-                下载更新压缩包
+                {{ updateDownloadButtonText(updateInfo) }}
               </NButton>
               <NButton
                 v-else
@@ -1319,9 +1381,26 @@ onMounted(() => {
               >
                 前往下载
               </NButton>
+              <NButton
+                v-if="hasSeparateFullPackage(updateInfo)"
+                size="small"
+                secondary
+                @click="openFullPackageURL"
+              >
+                <template #icon><ExternalLink :size="14" /></template>
+                下载全量包
+              </NButton>
+              <NButton
+                size="small"
+                quaternary
+                @click="openReleasePage"
+              >
+                <template #icon><Globe :size="14" /></template>
+                软件发布页
+              </NButton>
             </div>
           </div>
-          <p v-else class="update-ok">当前已是最新版本 {{ APP_VERSION }}</p>
+          <p v-else class="update-ok">当前已是最新版本 {{ versionLabel(updateInfo.current || APP_VERSION) }}</p>
         </template>
         <p v-else class="update-ok">正在检查更新…</p>
 

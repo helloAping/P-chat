@@ -93,6 +93,64 @@ func TestCheckSelectsInstallableFullZip(t *testing.T) {
 	}
 }
 
+func TestCheckPrefersPatchZipWhenAvailable(t *testing.T) {
+	patch := []byte("fake patch zip bytes")
+	patchSum := sha256Hex(patch)
+	full := []byte("fake setup bytes")
+	fullSum := sha256Hex(full)
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("current_version") != "1.0.12" {
+			t.Fatalf("current_version query = %q", r.URL.Query().Get("current_version"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{
+			"name":"P-Chat",
+			"slug":"p-chat",
+			"version":"1.0.13",
+			"platform":"windows",
+			"arch":"amd64",
+			"full":{
+				"kind":"full",
+				"platform":"windows",
+				"arch":"amd64",
+				"size":%d,
+				"sha256":%q,
+				"url":%q
+			},
+			"patch":{
+				"kind":"patch",
+				"platform":"windows",
+				"arch":"amd64",
+				"from_version":"1.0.12",
+				"size":%d,
+				"sha256":%q,
+				"url":%q
+			}
+		}`, len(full), fullSum, srv.URL+"/pchat-setup-v1.0.13.exe", len(patch), patchSum, srv.URL+"/pchat-update-windows-amd64-v1.0.13.zip")
+	}))
+	defer srv.Close()
+
+	svc := NewService(Options{
+		LatestURL: srv.URL + "/latest.json",
+		Platform:  "windows",
+		Arch:      "amd64",
+	})
+	res, err := svc.Check(t.Context(), "1.0.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Installable {
+		t.Fatal("Installable = false, want true for selected patch zip")
+	}
+	if res.Artifact == nil || res.Artifact.Kind != "patch" {
+		t.Fatalf("artifact = %#v, want patch artifact", res.Artifact)
+	}
+	if res.URL != srv.URL+"/pchat-update-windows-amd64-v1.0.13.zip" {
+		t.Fatalf("url = %q, want patch url", res.URL)
+	}
+}
+
 func TestCheck404MeansNoUpdate(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	defer srv.Close()
