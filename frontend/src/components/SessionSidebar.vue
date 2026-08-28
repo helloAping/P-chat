@@ -33,7 +33,7 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch, h, type Component } from 'vue'
-import { NButton, NInput, NScrollbar, NModal, NTag, NSpin, NDropdown, useMessage, useDialog } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NModal, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
@@ -72,6 +72,7 @@ const showTokenStats = ref(false)
 
 const message = useMessage()
 const dialog = useDialog()
+const notification = useNotification()
 const showAddProject = ref(false)
 const newProjectName = ref('')
 const newProjectPath = ref('')
@@ -105,6 +106,7 @@ const showOlderExpanded = ref(false)
 // is mostly personal organization.
 // ---------------------------------------------------------------------------
 const PINNED_KEY = 'pchat-pinned-sessions'
+const UPDATE_NOTIFY_KEY = 'pchat-update-notified-version'
 const pinnedIds = ref<Set<string>>(new Set())
 
 function loadPinned() {
@@ -802,13 +804,46 @@ function updateErrorMessage(err: unknown): string {
   return '未知错误'
 }
 
-async function refreshUpdate(force = false) {
+function notifyUpdateAvailable(info: UpdateInfo) {
+  if (!info.hasUpdate) return
+  const latest = info.latest || APP_VERSION
+  try {
+    if (localStorage.getItem(UPDATE_NOTIFY_KEY) === latest) return
+    localStorage.setItem(UPDATE_NOTIFY_KEY, latest)
+  } catch {
+    // ignore
+  }
+
+  let close: (() => void) | null = null
+  const notice = notification.info({
+    title: '发现可用更新',
+    content: `最新版本 ${versionLabel(latest)} 可以更新。`,
+    duration: 8000,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'primary',
+        onClick: () => {
+          close?.()
+          openAbout()
+        },
+      },
+      { default: () => '查看更新' },
+    ),
+  })
+  close = () => notice.destroy()
+}
+
+async function refreshUpdate(force = false, notify = false) {
   const info = await checkUpdate(force)
   if (!info) return
   updateInfo.value = info
   if (!info.hasUpdate || info.latest !== downloadedUpdate.value?.latest) {
     downloadedUpdate.value = null
   }
+  if (notify) notifyUpdateAvailable(info)
 }
 
 async function openUpdateURL() {
@@ -878,7 +913,7 @@ function openAbout() {
 }
 
 onMounted(() => {
-  void refreshUpdate()
+  void refreshUpdate(false, true)
 })
 </script>
 
