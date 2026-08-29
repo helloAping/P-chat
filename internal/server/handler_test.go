@@ -1331,7 +1331,7 @@ func TestCreateSession_WithPermissionLevel(t *testing.T) {
 func TestCreateSession_WithInheritedMetaFields(t *testing.T) {
 	s, cfg := newTestServer(t)
 	cfg.Vision.Enabled = true
-	got := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o-mini","style":"cute","work_mode":"daily","plan_mode":true,"permission_level":"auto","reasoning_effort":"high","vector_store":"kb-vector","knowledge_base":"docs","auto_continue":false,"todo_long_run_mode":"unlimited","use_image_recognition":true}`)
+	got := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o-mini","style":"cute","work_mode":"daily","plan_mode":true,"permission_level":"auto","reasoning_effort":"high","vector_store":"kb-vector","knowledge_base":"docs","auto_continue":false,"todo_long_run_mode":"unlimited","use_image_recognition":true,"sub_agent_model_enabled":true,"sub_agent_provider":"cs","sub_agent_model":"doubao-pro"}`)
 	t.Cleanup(func() { tool.SetSessionPermissionLevel(got.ID, "") })
 
 	if got.Provider != "openai" || got.Model != "gpt-4o-mini" || got.Style != "cute" || got.WorkMode != "daily" {
@@ -1345,6 +1345,9 @@ func TestCreateSession_WithInheritedMetaFields(t *testing.T) {
 	}
 	if got.TodoLongRunMode != "unlimited" || !got.UseImageRecognition {
 		t.Fatalf("session long-run/vision meta = %+v", got)
+	}
+	if !got.SubAgentModelEnabled || got.SubAgentProvider != "cs" || got.SubAgentModel != "doubao-pro" {
+		t.Fatalf("session sub-agent model meta = %+v", got)
 	}
 	if live := tool.SessionPermissionLevel(got.ID); live != tool.PermissionAuto {
 		t.Fatalf("live permission = %q, want %q", live, tool.PermissionAuto)
@@ -1364,6 +1367,9 @@ func TestCreateSession_WithInheritedMetaFields(t *testing.T) {
 	}
 	if reloaded.ReasoningEffort != "high" || reloaded.TodoLongRunMode != "unlimited" || !reloaded.UseImageRecognition || reloaded.AutoContinue {
 		t.Fatalf("reloaded meta = %+v", reloaded)
+	}
+	if !reloaded.SubAgentModelEnabled || reloaded.SubAgentProvider != "cs" || reloaded.SubAgentModel != "doubao-pro" {
+		t.Fatalf("reloaded sub-agent model meta = %+v", reloaded)
 	}
 }
 
@@ -1657,6 +1663,85 @@ func TestPatchSession_PersistsUseImageRecognition(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&got)
 	if !got.UseImageRecognition {
 		t.Fatalf("reloaded UseImageRecognition = false, want true")
+	}
+}
+
+func TestPatchSession_PersistsSubAgentModel(t *testing.T) {
+	srv, _ := newTestServer(t)
+	sess := createSessionPOST(t, srv, "")
+	w := patchSession(t, srv, sess.ID, `{"sub_agent_model_enabled":true,"sub_agent_provider":"cs","sub_agent_model":"doubao-pro"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.SubAgentModelEnabled || got.SubAgentProvider != "cs" || got.SubAgentModel != "doubao-pro" {
+		t.Fatalf("patched sub-agent model meta = %+v", got)
+	}
+
+	for k := range srv.Handler().meta {
+		delete(srv.Handler().meta, k)
+	}
+	w = httptest.NewRecorder()
+	srv.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	got = SessionResponse{}
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.SubAgentModelEnabled || got.SubAgentProvider != "cs" || got.SubAgentModel != "doubao-pro" {
+		t.Fatalf("reloaded sub-agent model meta = %+v", got)
+	}
+}
+
+func TestPatchSession_RejectsBadSubAgentModel(t *testing.T) {
+	srv, _ := newTestServer(t)
+	sess := createSessionPOST(t, srv, "")
+
+	w := patchSession(t, srv, sess.ID, `{"sub_agent_model_enabled":true,"sub_agent_provider":"openai","sub_agent_model":"doubao-pro"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "sub-agent model") {
+		t.Fatalf("body = %s, want sub-agent model validation error", w.Body.String())
+	}
+}
+
+func TestSystemConfig_SubAgentModelRoundTrip(t *testing.T) {
+	srv, _ := newTestServer(t)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", bytes.NewBufferString(`{"sub_agent":{"model":{"enabled":true,"provider":"cs","model":"doubao-pro"}}}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got systemConfigResponse
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.SubAgent.Model.Enabled || got.SubAgent.Model.Provider != "cs" || got.SubAgent.Model.Model != "doubao-pro" {
+		t.Fatalf("system sub-agent model response = %+v", got.SubAgent.Model)
+	}
+
+	reloaded, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.SubAgent.Model.Enabled || reloaded.SubAgent.Model.Provider != "cs" || reloaded.SubAgent.Model.Model != "doubao-pro" {
+		t.Fatalf("persisted sub-agent model config = %+v", reloaded.SubAgent.Model)
+	}
+}
+
+func TestSystemConfig_RejectsBadSubAgentModel(t *testing.T) {
+	srv, _ := newTestServer(t)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", bytes.NewBufferString(`{"sub_agent":{"model":{"enabled":true,"provider":"openai","model":"doubao-pro"}}}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "sub-agent model") {
+		t.Fatalf("body = %s, want sub-agent model validation error", w.Body.String())
 	}
 }
 

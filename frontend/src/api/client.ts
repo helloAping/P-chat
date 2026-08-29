@@ -99,6 +99,9 @@ export interface Session {
   auto_continue?: boolean
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
 }
 
 export interface Attachment {
@@ -312,6 +315,9 @@ export interface UpdateSessionMetaResponse {
   knowledge_base?: string
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
   created_at?: number
   updated_at?: number
 }
@@ -393,6 +399,9 @@ export interface CreateSessionOptions {
   auto_continue?: boolean
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
 }
 
 export const createSession = (options: CreateSessionOptions = {}) =>
@@ -412,7 +421,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -1169,6 +1178,9 @@ export interface SendOptions {
   style?: string
   workMode?: string
   useImageRecognition?: boolean
+  subAgentModelEnabled?: boolean
+  subAgentProvider?: string
+  subAgentModel?: string
   // Inline attachments carry the bytes up front so the message
   // is self-contained: the chat bubble shows the image
   // immediately, the backend doesn't need to re-read the file
@@ -1411,6 +1423,9 @@ async function streamMessagesViaFetch(
     work_mode: opts.workMode,
     attachments: opts.attachments,
     use_image_recognition: opts.useImageRecognition,
+    sub_agent_model_enabled: opts.subAgentModelEnabled,
+    sub_agent_provider: opts.subAgentProvider,
+    sub_agent_model: opts.subAgentModel,
     skill_context: opts.skill_context || '',
   })
   return consumeStreamRequest({
@@ -1977,6 +1992,11 @@ export interface LimitsConfig {
 export interface SubAgentConfig {
   cache_ttl: string
   timeout: string
+  model: {
+    enabled: boolean
+    provider: string
+    model: string
+  }
 }
 
 export interface WorkModeConfig {

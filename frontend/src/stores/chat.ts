@@ -55,6 +55,9 @@ type SessionMetaState = {
   auto_continue?: boolean
   todo_long_run_mode?: TodoLongRunMode
   use_image_recognition?: boolean
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
 }
 
 const LAST_PROJECT_KEY = 'pchat:last-project-path'
@@ -373,6 +376,9 @@ export const currentMeta = computed(() => {
     auto_continue: true,
     todo_long_run_mode: 'adaptive' as TodoLongRunMode,
     use_image_recognition: false,
+    sub_agent_model_enabled: false,
+    sub_agent_provider: '',
+    sub_agent_model: '',
   }
 })
 
@@ -728,6 +734,9 @@ async function switchSessionBody(id: string) {
       auto_continue: s.auto_continue ?? true,
       todo_long_run_mode: s.todo_long_run_mode || 'adaptive',
       use_image_recognition: s.use_image_recognition || false,
+      sub_agent_model_enabled: s.sub_agent_model_enabled || false,
+      sub_agent_provider: s.sub_agent_provider || '',
+      sub_agent_model: s.sub_agent_model || '',
     }
     state.lastPermissionLevel = normalizePermissionLevel(state.sessionMeta[id].permission_level)
   }
@@ -879,6 +888,9 @@ function buildCreateSessionOptions(): api.CreateSessionOptions {
     auto_continue: meta.auto_continue ?? true,
     todo_long_run_mode: meta.todo_long_run_mode || 'adaptive',
     use_image_recognition: !!meta.use_image_recognition,
+    sub_agent_model_enabled: !!meta.sub_agent_model_enabled,
+    sub_agent_provider: meta.sub_agent_provider || '',
+    sub_agent_model: meta.sub_agent_model || '',
   }
 }
 
@@ -981,6 +993,9 @@ export async function renameSession(id: string, title: string) {
     s.provider = resp.provider ?? s.provider
     s.model = resp.model ?? s.model
     s.use_image_recognition = resp.use_image_recognition ?? s.use_image_recognition
+    s.sub_agent_model_enabled = resp.sub_agent_model_enabled ?? s.sub_agent_model_enabled
+    s.sub_agent_provider = resp.sub_agent_provider ?? s.sub_agent_provider
+    s.sub_agent_model = resp.sub_agent_model ?? s.sub_agent_model
   }
   if (state.sessionMeta[id]) {
     state.sessionMeta[id] = {
@@ -996,6 +1011,9 @@ export async function renameSession(id: string, title: string) {
       knowledge_base: resp.knowledge_base ?? state.sessionMeta[id].knowledge_base,
       todo_long_run_mode: resp.todo_long_run_mode ?? state.sessionMeta[id].todo_long_run_mode,
       use_image_recognition: resp.use_image_recognition ?? state.sessionMeta[id].use_image_recognition,
+      sub_agent_model_enabled: resp.sub_agent_model_enabled ?? state.sessionMeta[id].sub_agent_model_enabled,
+      sub_agent_provider: resp.sub_agent_provider ?? state.sessionMeta[id].sub_agent_provider,
+      sub_agent_model: resp.sub_agent_model ?? state.sessionMeta[id].sub_agent_model,
     }
   }
 }

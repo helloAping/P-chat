@@ -500,7 +500,7 @@ func newFilterTestRegistry() *tool.Registry {
 	r := tool.NewRegistry()
 	for _, name := range []string{
 		"task", "recall", "read_file", "list_files", "grep", "read_docx", "read_pdf",
-		"exec_command", "write_file", "web_search", "web_fetch", "todo_write", "question",
+		"exec_command", "write_file", "web_search", "web_fetch", "image_recognize", "todo_write", "question",
 	} {
 		r.Register(tool.Tool{Name: name, Description: name}, noopHandler)
 	}
@@ -546,10 +546,12 @@ func TestFilterSubAgentTools_WhitelistCannotWidenPastSafeSet(t *testing.T) {
 // global denylist includes it.
 func TestFilterSubAgentTools_WhitelistBeatsGlobalDenyForSafeTools(t *testing.T) {
 	parent := newFilterTestRegistry()
-	sub := filterSubAgentTools(parent, true, []string{"web_search", "web_fetch"}, allowAllExcept("web_search", "web_fetch"))
+	sub := filterSubAgentTools(parent, true, []string{"web_search", "web_fetch", "image_recognize"}, allowAllExcept("web_search", "web_fetch", "image_recognize"))
 	got := strings.Join(sub.Names(), ",")
-	if !strings.Contains(got, "web_search") || !strings.Contains(got, "web_fetch") {
-		t.Errorf("whitelisted network tools = %q, want web_search and web_fetch despite global deny", got)
+	for _, want := range []string{"web_search", "web_fetch", "image_recognize"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("whitelisted tools = %q, want %q despite global deny", got, want)
+		}
 	}
 	if strings.Contains(got, "read_file") {
 		t.Errorf("whitelisted network tools = %q, must not inherit unlisted read_file", got)
@@ -564,7 +566,7 @@ func TestFilterSubAgentTools_GlobalDenyAppliesWhenNoWhitelist(t *testing.T) {
 	parent := newFilterTestRegistry()
 	sub := filterSubAgentTools(parent, true, nil, allowAllExcept("exec_command"))
 	got := strings.Join(sub.Names(), ",")
-	for _, want := range []string{"read_file", "grep", "web_search", "web_fetch", "todo_write"} {
+	for _, want := range []string{"read_file", "grep", "web_search", "web_fetch", "image_recognize", "todo_write"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("general-purpose sub-agent tools = %q, missing %q", got, want)
 		}
@@ -679,6 +681,89 @@ func TestBuildSubAgentChatRequestUsesIsolatedSession(t *testing.T) {
 	}
 	if chatReq.ProjectRoot != req.ProjectRoot {
 		t.Fatalf("ProjectRoot = %q, want %q", chatReq.ProjectRoot, req.ProjectRoot)
+	}
+}
+
+func TestResolveSubAgentProviderModelPriority(t *testing.T) {
+	cfg := &config.Config{SubAgent: config.SubAgentConfig{
+		Model: config.SubAgentModelConfig{
+			Enabled:  true,
+			Provider: "global",
+			Model:    "global-model",
+		},
+	}}
+
+	cases := []struct {
+		name       string
+		req        Request
+		agentModel string
+		wantProv   string
+		wantModel  string
+	}{
+		{
+			name: "task override wins",
+			req: Request{
+				Provider: "task-provider",
+				Model:    "task-model",
+				SubagentModel: agent.SubagentModelPreference{
+					Enabled:  true,
+					Provider: "session",
+					Model:    "session-model",
+				},
+			},
+			agentModel: "agent-model",
+			wantProv:   "task-provider",
+			wantModel:  "task-model",
+		},
+		{
+			name: "agent model beats session and global",
+			req: Request{
+				SubagentModel: agent.SubagentModelPreference{
+					Enabled:  true,
+					Provider: "session",
+					Model:    "session-model",
+				},
+			},
+			agentModel: "agent-model",
+			wantProv:   "parent",
+			wantModel:  "agent-model",
+		},
+		{
+			name: "session model beats global",
+			req: Request{
+				SubagentModel: agent.SubagentModelPreference{
+					Enabled:  true,
+					Provider: "session",
+					Model:    "session-model",
+				},
+			},
+			wantProv:  "session",
+			wantModel: "session-model",
+		},
+		{
+			name:      "global model beats parent",
+			req:       Request{},
+			wantProv:  "global",
+			wantModel: "global-model",
+		},
+		{
+			name:      "inherits parent when overrides disabled",
+			req:       Request{},
+			wantProv:  "parent",
+			wantModel: "parent-model",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			useCfg := cfg
+			if tc.name == "inherits parent when overrides disabled" {
+				useCfg = &config.Config{}
+			}
+			gotProv, gotModel := resolveSubAgentProviderModel(tc.req, useCfg, "parent", "parent-model", tc.agentModel)
+			if gotProv != tc.wantProv || gotModel != tc.wantModel {
+				t.Fatalf("provider/model = %s/%s, want %s/%s", gotProv, gotModel, tc.wantProv, tc.wantModel)
+			}
+		})
 	}
 }
 

@@ -46,7 +46,12 @@ const (
 	// and Normalize() handles missing values, so no data migration is required.
 	V6 AppVersion = 6
 
+	// V7 — sub_agent.model added to config and per-session sub-agent
+	// model metadata. JSON fields are backward compatible and
+	// Normalize() handles missing values, so no data migration is required.
+	V7 AppVersion = 7
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V6
+	Current AppVersion = V7
 )

@@ -136,6 +136,14 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "image recognition is disabled globally; enable it in App Settings > System > Image Recognition first"})
 		return
 	}
+	subAgentModelEnabled := false
+	if req.SubAgentModelEnabled != nil {
+		subAgentModelEnabled = *req.SubAgentModelEnabled
+	}
+	if err := h.validateSubAgentModelSelection(subAgentModelEnabled, req.SubAgentProvider, req.SubAgentModel); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	id, err := h.store.NewConversation()
 	if err != nil {
@@ -182,7 +190,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	if req.VectorStore != "" {
 		_ = h.store.SetConversationVectorStore(id, req.VectorStore)
 	}
-	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil {
+	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil || req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		if req.PlanMode != nil {
@@ -203,6 +211,15 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		}
 		if req.UseImageRecognition != nil {
 			m.UseImageRecognition = *req.UseImageRecognition
+		}
+		if req.SubAgentModelEnabled != nil {
+			m.SubAgentModelEnabled = *req.SubAgentModelEnabled
+		}
+		if req.SubAgentProvider != "" {
+			m.SubAgentProvider = strings.TrimSpace(req.SubAgentProvider)
+		}
+		if req.SubAgentModel != "" {
+			m.SubAgentModel = strings.TrimSpace(req.SubAgentModel)
 		}
 		h.meta[id] = m
 		h.metaMu.Unlock()
@@ -786,6 +803,12 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)
 	}
+	if req.SubAgentModelEnabled != nil || req.SubAgentProvider != nil || req.SubAgentModel != nil {
+		if err := h.applySessionSubAgentModelPatch(id, req.SubAgentModelEnabled, req.SubAgentProvider, req.SubAgentModel); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
 	// Re-read so the response reflects the on-disk truth.
 	cv, err = h.store.GetConversation(id)
@@ -801,6 +824,71 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func (h *Handler) validateSystemConfigPatch(patch config.SystemConfigPatch) error {
+	if patch.SubAgent == nil || patch.SubAgent.Model == nil {
+		return nil
+	}
+	next := h.getCfg().SubAgent.Model
+	model := patch.SubAgent.Model
+	if model.Enabled != nil {
+		next.Enabled = *model.Enabled
+	}
+	if model.Provider != nil {
+		next.Provider = *model.Provider
+	}
+	if model.Model != nil {
+		next.Model = *model.Model
+	}
+	next.Normalize()
+	return h.validateSubAgentModelSelection(next.Enabled, next.Provider, next.Model)
+}
+
+func (h *Handler) validateSubAgentModelSelection(enabled bool, provider, model string) error {
+	if !enabled {
+		return nil
+	}
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return fmt.Errorf("sub-agent model override requires provider and model")
+	}
+	if !h.validProvider(provider) {
+		return fmt.Errorf("unknown sub-agent provider %q", provider)
+	}
+	if !h.validModel(provider, model) {
+		return fmt.Errorf("sub-agent model %q not found under provider %q", model, provider)
+	}
+	return nil
+}
+
+func (h *Handler) applySessionSubAgentModelPatch(
+	id string,
+	enabled *bool,
+	provider *string,
+	model *string,
+) error {
+	_ = h.ensureMetaLoaded(id)
+	h.metaMu.Lock()
+	m := h.meta[id]
+	if enabled != nil {
+		m.SubAgentModelEnabled = *enabled
+	}
+	if provider != nil {
+		m.SubAgentProvider = strings.TrimSpace(*provider)
+	}
+	if model != nil {
+		m.SubAgentModel = strings.TrimSpace(*model)
+	}
+	if err := h.validateSubAgentModelSelection(m.SubAgentModelEnabled, m.SubAgentProvider, m.SubAgentModel); err != nil {
+		h.metaMu.Unlock()
+		return err
+	}
+	h.meta[id] = m
+	h.metaMu.Unlock()
+	h.persistSessionMeta(id, m)
+	return nil
 }
 
 // --- Messages ---

@@ -50,13 +50,15 @@ import (
 // resolves SubagentType, Model, and PromptOverride against the
 // registry / parent context before invoking the child.
 type Request struct {
-	Description    string
-	SubagentType   string
-	Model          string
-	PromptOverride string
-	Style          style.Style
-	Provider       string
-	TaskID         string
+	Description         string
+	SubagentType        string
+	Model               string
+	PromptOverride      string
+	Style               style.Style
+	Provider            string
+	SubagentModel       agent.SubagentModelPreference
+	UseImageRecognition bool
+	TaskID              string
 	// RunMode is "sync" for a regular in-turn sub-agent and
 	// "async" for a durable background job.
 	RunMode string
@@ -704,6 +706,8 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 			runner.ParentProvider = pp
 			runner.ParentProviderModel = pm
 		}
+		subagentModel, _ := agent.GetSubagentModelPreference(ctx)
+		sharedImages, _ := agent.GetSharedImageRecognition(ctx)
 
 		// Inherit the session's project root (working directory).
 		// Without this, the sub-agent's tool calls (exec_command,
@@ -718,14 +722,16 @@ func (d *Default) Tool() (tool.Tool, tool.ToolHandler) {
 			taskID = agent.GetParentToolCallID(ctx)
 		}
 		req := Request{
-			Description:    a.Description,
-			SubagentType:   strings.TrimSpace(a.SubagentType),
-			Model:          strings.TrimSpace(a.Model),
-			PromptOverride: a.Prompt,
-			Style:          style.Style(strings.ToLower(strings.TrimSpace(a.Style))),
-			Provider:       strings.TrimSpace(a.Provider),
-			TaskID:         taskID,
-			ProjectRoot:    projectRoot,
+			Description:         a.Description,
+			SubagentType:        strings.TrimSpace(a.SubagentType),
+			Model:               strings.TrimSpace(a.Model),
+			PromptOverride:      a.Prompt,
+			Style:               style.Style(strings.ToLower(strings.TrimSpace(a.Style))),
+			Provider:            strings.TrimSpace(a.Provider),
+			SubagentModel:       subagentModel,
+			UseImageRecognition: sharedImages.UseConfiguredModel,
+			TaskID:              taskID,
+			ProjectRoot:         projectRoot,
 		}
 
 		if mode == "async" {
@@ -1450,7 +1456,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 	if s == "" {
 		s = d.ParentStyle
 	}
-	prov := req.Provider
+	prov := strings.TrimSpace(req.Provider)
 	if prov == "" {
 		prov = d.ParentProvider
 	}
@@ -1468,7 +1474,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 		agentInfo  AgentInfo
 		agentKnown bool
 		promptOv   = req.PromptOverride
-		modelOv    = req.Model
+		agentModel string
 		color      string
 	)
 	if d.Registry != nil {
@@ -1485,22 +1491,14 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 			// Per-agent model: same priority rule. The
 			// request-level override beats the agent's
 			// default.
-			if modelOv == "" && a.Model != "" {
-				modelOv = a.Model
+			if strings.TrimSpace(req.Model) == "" && strings.TrimSpace(a.Model) != "" {
+				agentModel = strings.TrimSpace(a.Model)
 			}
 		}
 	}
 
-	// 在构成缓存 identity 前解析有效模型。
-	// A request override wins, followed by the sub-agent definition and parent
-	// model.
-	chatModel := modelOv
-	if chatModel == "" {
-		chatModel = d.ParentProviderModel
-	}
-	if chatModel == "" {
-		chatModel = prov
-	}
+	// Resolve the effective child provider/model before building the cache key.
+	prov, chatModel := resolveSubAgentProviderModel(req, d.Cfg, d.ParentProvider, d.ParentProviderModel, agentModel)
 	runMode := strings.TrimSpace(req.RunMode)
 	if runMode == "" {
 		runMode = "sync"
@@ -1521,6 +1519,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 			SubAgentStatus:      "start",
 			SubAgentType:        subType,
 			SubAgentColor:       color,
+			SubAgentModel:       chatModel,
 			SubAgentDescription: agentInfo.Description,
 			SubAgentTaskID:      req.TaskID,
 			SubAgentRunMode:     runMode,
@@ -1973,6 +1972,46 @@ func buildSubAgentSessionID(subType, taskID string) string {
 	return "subagent-" + subType + "-" + taskID
 }
 
+func resolveSubAgentProviderModel(
+	req Request,
+	cfg *config.Config,
+	parentProvider, parentModel, agentModel string,
+) (string, string) {
+	provider := strings.TrimSpace(req.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(parentProvider)
+	}
+
+	if model := strings.TrimSpace(req.Model); model != "" {
+		if provider == "" {
+			provider = strings.TrimSpace(parentProvider)
+		}
+		return provider, model
+	}
+	if model := strings.TrimSpace(agentModel); model != "" {
+		if provider == "" {
+			provider = strings.TrimSpace(parentProvider)
+		}
+		return provider, model
+	}
+	if pref := req.SubagentModel.Normalize(); pref.Active() {
+		return pref.Provider, pref.Model
+	}
+	if cfg != nil {
+		modelCfg := cfg.SubAgent.Model
+		modelCfg.Normalize()
+		if modelCfg.Enabled && modelCfg.Provider != "" && modelCfg.Model != "" {
+			return modelCfg.Provider, modelCfg.Model
+		}
+	}
+
+	model := strings.TrimSpace(parentModel)
+	if model == "" {
+		model = provider
+	}
+	return provider, model
+}
+
 // buildSubAgentChatRequest assembles the ChatRequest the sub-agent
 // runner hands to agent.ChatWithTools. Extracted from Default.Run
 // so the field wiring (notably ProjectRoot, which silently dropped
@@ -1984,15 +2023,16 @@ func buildSubAgentChatRequest(
 	prov, chatModel, promptOv, subType, color string,
 ) agent.ChatRequest {
 	return agent.ChatRequest{
-		Style:          s,
-		Provider:       prov,
-		Model:          chatModel,
-		PromptOv:       promptOv,
-		SubagentType:   subType,
-		SubagentColor:  color,
-		SubagentTaskID: req.TaskID,
-		ProjectRoot:    req.ProjectRoot,
-		SessionID:      buildSubAgentSessionID(subType, req.TaskID),
+		Style:               s,
+		Provider:            prov,
+		Model:               chatModel,
+		PromptOv:            promptOv,
+		SubagentType:        subType,
+		SubagentColor:       color,
+		SubagentTaskID:      req.TaskID,
+		ProjectRoot:         req.ProjectRoot,
+		SessionID:           buildSubAgentSessionID(subType, req.TaskID),
+		UseImageRecognition: req.UseImageRecognition,
 		// Leave MaxRounds unset so the child inherits the same
 		// configured round policy as the parent conversation. Long
 		// sub-agents are guided by the shared guards in agent.ChatWithTools

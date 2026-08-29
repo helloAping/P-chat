@@ -19,8 +19,15 @@ type limitsResponse struct {
 }
 
 type subAgentResponse struct {
-	CacheTTL string `json:"cache_ttl"`
-	Timeout  string `json:"timeout"`
+	CacheTTL string                `json:"cache_ttl"`
+	Timeout  string                `json:"timeout"`
+	Model    subAgentModelResponse `json:"model"`
+}
+
+type subAgentModelResponse struct {
+	Enabled  bool   `json:"enabled"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
 }
 
 type workModeResponse struct {
@@ -71,6 +78,20 @@ func visionRecognitionToResp(v config.VisionRecognitionConfig) visionRecognition
 	}
 }
 
+func subAgentToResp(s config.SubAgentConfig) subAgentResponse {
+	model := s.Model
+	model.Normalize()
+	return subAgentResponse{
+		CacheTTL: s.CacheTTL,
+		Timeout:  s.Timeout,
+		Model: subAgentModelResponse{
+			Enabled:  model.Enabled,
+			Provider: model.Provider,
+			Model:    model.Model,
+		},
+	}
+}
+
 // GetSystemConfig GET /api/v1/config
 func (h *Handler) GetSystemConfig(c *gin.Context) {
 	if h.getCfg() == nil {
@@ -78,11 +99,8 @@ func (h *Handler) GetSystemConfig(c *gin.Context) {
 		return
 	}
 	resp := systemConfigResponse{
-		Limits: limitsToResp(h.getCfg().Limits),
-		SubAgent: subAgentResponse{
-			CacheTTL: h.getCfg().SubAgent.CacheTTL,
-			Timeout:  h.getCfg().SubAgent.Timeout,
-		},
+		Limits:   limitsToResp(h.getCfg().Limits),
+		SubAgent: subAgentToResp(h.getCfg().SubAgent),
 		WorkMode: workModeResponse{
 			Default: string(h.getCfg().WorkMode.Default.Normalize()),
 		},
@@ -105,6 +123,10 @@ func (h *Handler) UpdateSystemConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
+	if err := h.validateSystemConfigPatch(patch); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	updated, err := config.UpdateSystemConfig(patch)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -113,7 +135,7 @@ func (h *Handler) UpdateSystemConfig(c *gin.Context) {
 	h.reloadAfterConfigChange()
 	resp := systemConfigResponse{
 		Limits:   limitsToResp(updated.Limits),
-		SubAgent: subAgentResponse{CacheTTL: updated.SubAgent.CacheTTL, Timeout: updated.SubAgent.Timeout},
+		SubAgent: subAgentToResp(updated.SubAgent),
 		WorkMode: workModeResponse{Default: string(updated.WorkMode.Default.Normalize())},
 		UI:       uiResponse{CloseBehavior: string(updated.UI.CloseBehavior.Normalize())},
 		Vision:   visionRecognitionToResp(updated.Vision),

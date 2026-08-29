@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/p-chat/pchat/internal/search"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/stylegen"
+	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/version"
 )
@@ -39,6 +41,7 @@ type Handler struct {
 	// that are still running in this server process.
 	subagentJobs      subagentJobCanceller
 	subagentJobEvents subagentJobEventSource
+	subagentRunner    *subagent.Default
 	mcpMgr            *mcp.Manager
 	browserMgr        *browser.Manager
 	imGateway         *im.Gateway
@@ -86,16 +89,19 @@ type Handler struct {
 }
 
 type sessionMeta struct {
-	Style               string
-	WorkMode            string
-	Provider            string
-	Model               string
-	ReasoningEffort     string // "off" | "low" | "medium" | "high" | "max"
-	ProjectPath         string // project root directory, "" = global
-	PlanMode            bool   // plan mode (no tools, single turn)
-	PermissionLevel     string // "ask" | "auto" | "full"
-	KnowledgeBase       string // "" = off, "__all__" = all bases, or a specific base name
-	UseImageRecognition bool   // true = uploaded images are recognized through image_recognize
+	Style                string
+	WorkMode             string
+	Provider             string
+	Model                string
+	ReasoningEffort      string // "off" | "low" | "medium" | "high" | "max"
+	ProjectPath          string // project root directory, "" = global
+	PlanMode             bool   // plan mode (no tools, single turn)
+	PermissionLevel      string // "ask" | "auto" | "full"
+	KnowledgeBase        string // "" = off, "__all__" = all bases, or a specific base name
+	UseImageRecognition  bool   // true = uploaded images are recognized through image_recognize
+	SubAgentModelEnabled bool   // true = sub-agents use SubAgentProvider/SubAgentModel by default
+	SubAgentProvider     string // provider for per-session sub-agent model override
+	SubAgentModel        string // model for per-session sub-agent model override
 	// AutoContinue is a pointer so we can distinguish "user
 	// never set" (nil → default true) from "user explicitly
 	// disabled" (*bool == false). The P0-3 auto-continue
@@ -110,16 +116,19 @@ type sessionMeta struct {
 // conversations.metadata. The field names are JSON lower-case so
 // the web side can pass them straight back to the PATCH endpoint.
 type sessionMetaBlob struct {
-	Style               string `json:"style,omitempty"`
-	WorkMode            string `json:"work_mode,omitempty"`
-	Provider            string `json:"provider,omitempty"`
-	Model               string `json:"model,omitempty"`
-	ReasoningEffort     string `json:"reasoning_effort,omitempty"`
-	ProjectPath         string `json:"project_path,omitempty"`
-	PlanMode            bool   `json:"plan_mode,omitempty"`
-	PermissionLevel     string `json:"permission_level,omitempty"`
-	KnowledgeBase       string `json:"knowledge_base,omitempty"`
-	UseImageRecognition bool   `json:"use_image_recognition,omitempty"`
+	Style                string `json:"style,omitempty"`
+	WorkMode             string `json:"work_mode,omitempty"`
+	Provider             string `json:"provider,omitempty"`
+	Model                string `json:"model,omitempty"`
+	ReasoningEffort      string `json:"reasoning_effort,omitempty"`
+	ProjectPath          string `json:"project_path,omitempty"`
+	PlanMode             bool   `json:"plan_mode,omitempty"`
+	PermissionLevel      string `json:"permission_level,omitempty"`
+	KnowledgeBase        string `json:"knowledge_base,omitempty"`
+	UseImageRecognition  bool   `json:"use_image_recognition,omitempty"`
+	SubAgentModelEnabled bool   `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider     string `json:"sub_agent_provider,omitempty"`
+	SubAgentModel        string `json:"sub_agent_model,omitempty"`
 	// AutoContinue mirrors sessionMeta.AutoContinue. Pointer
 	// so JSON omits it when never set, instead of
 	// round-tripping "false" as if the user had disabled it.
@@ -154,18 +163,21 @@ func (h *Handler) SetAttachmentResolver(r *agent.DiskAttachmentResolver) {
 
 func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
 	return sessionMetaBlob{
-		Style:               m.Style,
-		WorkMode:            m.WorkMode,
-		Provider:            m.Provider,
-		Model:               m.Model,
-		ReasoningEffort:     m.ReasoningEffort,
-		ProjectPath:         m.ProjectPath,
-		PlanMode:            m.PlanMode,
-		PermissionLevel:     m.PermissionLevel,
-		KnowledgeBase:       m.KnowledgeBase,
-		UseImageRecognition: m.UseImageRecognition,
-		AutoContinue:        m.AutoContinue,
-		TodoLongRunMode:     m.TodoLongRunMode,
+		Style:                m.Style,
+		WorkMode:             m.WorkMode,
+		Provider:             m.Provider,
+		Model:                m.Model,
+		ReasoningEffort:      m.ReasoningEffort,
+		ProjectPath:          m.ProjectPath,
+		PlanMode:             m.PlanMode,
+		PermissionLevel:      m.PermissionLevel,
+		KnowledgeBase:        m.KnowledgeBase,
+		UseImageRecognition:  m.UseImageRecognition,
+		SubAgentModelEnabled: m.SubAgentModelEnabled,
+		SubAgentProvider:     m.SubAgentProvider,
+		SubAgentModel:        m.SubAgentModel,
+		AutoContinue:         m.AutoContinue,
+		TodoLongRunMode:      m.TodoLongRunMode,
 	}
 }
 
@@ -249,6 +261,9 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.PermissionLevel = blob.PermissionLevel
 				m.KnowledgeBase = blob.KnowledgeBase
 				m.UseImageRecognition = blob.UseImageRecognition
+				m.SubAgentModelEnabled = blob.SubAgentModelEnabled
+				m.SubAgentProvider = blob.SubAgentProvider
+				m.SubAgentModel = blob.SubAgentModel
 				m.AutoContinue = blob.AutoContinue
 				m.TodoLongRunMode = blob.TodoLongRunMode
 			}
@@ -297,6 +312,24 @@ func (h *Handler) sessionTodoLongRunMode(id string) config.TodoLongRunMode {
 
 func (h *Handler) sessionUseImageRecognition(id string) bool {
 	return h.getCfg().Vision.Enabled && h.ensureMetaLoaded(id).UseImageRecognition
+}
+
+func (h *Handler) sessionSubAgentModelPreference(id string) agent.SubagentModelPreference {
+	m := h.ensureMetaLoaded(id)
+	if !m.SubAgentModelEnabled {
+		return agent.SubagentModelPreference{}
+	}
+	if strings.TrimSpace(m.SubAgentProvider) == "" || strings.TrimSpace(m.SubAgentModel) == "" {
+		return agent.SubagentModelPreference{}
+	}
+	if !h.validModel(m.SubAgentProvider, m.SubAgentModel) {
+		return agent.SubagentModelPreference{}
+	}
+	return agent.SubagentModelPreference{
+		Enabled:  true,
+		Provider: strings.TrimSpace(m.SubAgentProvider),
+		Model:    strings.TrimSpace(m.SubAgentModel),
+	}
 }
 
 func (h *Handler) sessionProvider(id string) string {
@@ -425,8 +458,11 @@ type SendMessageRequest struct {
 	// multi-part trailing user message before the LLM call.
 	// The protocol-specific serialisation (OpenAI image_url vs
 	// Anthropic image+source) is handled by the LLM client.
-	Attachments         []agent.Attachment `json:"attachments,omitempty"`
-	UseImageRecognition *bool              `json:"use_image_recognition,omitempty"`
+	Attachments          []agent.Attachment `json:"attachments,omitempty"`
+	UseImageRecognition  *bool              `json:"use_image_recognition,omitempty"`
+	SubAgentModelEnabled *bool              `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider     string             `json:"sub_agent_provider,omitempty"`
+	SubAgentModel        string             `json:"sub_agent_model,omitempty"`
 	// SkillContext is the full SKILL.md content for a skill
 	// activated via /skillname slash command.
 	SkillContext string `json:"skill_context,omitempty"`
@@ -434,20 +470,23 @@ type SendMessageRequest struct {
 
 // CreateSessionRequest is the body of POST /sessions.
 type CreateSessionRequest struct {
-	Style               string                  `json:"style,omitempty"`
-	WorkMode            string                  `json:"work_mode,omitempty"`
-	Provider            string                  `json:"provider,omitempty"`
-	Model               string                  `json:"model,omitempty"`
-	Title               string                  `json:"title,omitempty"`
-	ProjectPath         string                  `json:"project_path,omitempty"`
-	PlanMode            *bool                   `json:"plan_mode,omitempty"`
-	PermissionLevel     string                  `json:"permission_level,omitempty"`
-	ReasoningEffort     string                  `json:"reasoning_effort,omitempty"`
-	VectorStore         string                  `json:"vector_store,omitempty"`
-	KnowledgeBase       string                  `json:"knowledge_base,omitempty"`
-	AutoContinue        *bool                   `json:"auto_continue,omitempty"`
-	TodoLongRunMode     *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
-	UseImageRecognition *bool                   `json:"use_image_recognition,omitempty"`
+	Style                string                  `json:"style,omitempty"`
+	WorkMode             string                  `json:"work_mode,omitempty"`
+	Provider             string                  `json:"provider,omitempty"`
+	Model                string                  `json:"model,omitempty"`
+	Title                string                  `json:"title,omitempty"`
+	ProjectPath          string                  `json:"project_path,omitempty"`
+	PlanMode             *bool                   `json:"plan_mode,omitempty"`
+	PermissionLevel      string                  `json:"permission_level,omitempty"`
+	ReasoningEffort      string                  `json:"reasoning_effort,omitempty"`
+	VectorStore          string                  `json:"vector_store,omitempty"`
+	KnowledgeBase        string                  `json:"knowledge_base,omitempty"`
+	AutoContinue         *bool                   `json:"auto_continue,omitempty"`
+	TodoLongRunMode      *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	UseImageRecognition  *bool                   `json:"use_image_recognition,omitempty"`
+	SubAgentModelEnabled *bool                   `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider     string                  `json:"sub_agent_provider,omitempty"`
+	SubAgentModel        string                  `json:"sub_agent_model,omitempty"`
 }
 
 // RenameSessionRequest is the body of PATCH /sessions/:id when the
@@ -480,9 +519,12 @@ type UpdateSessionMetaRequest struct {
 	// distinct from `false`: when omitted, the per-session
 	// setting is left unchanged; when present, it overrides
 	// whatever was there before (including the default-true).
-	AutoContinue        *bool                   `json:"auto_continue,omitempty"`
-	TodoLongRunMode     *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
-	UseImageRecognition *bool                   `json:"use_image_recognition,omitempty"`
+	AutoContinue         *bool                   `json:"auto_continue,omitempty"`
+	TodoLongRunMode      *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	UseImageRecognition  *bool                   `json:"use_image_recognition,omitempty"`
+	SubAgentModelEnabled *bool                   `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider     *string                 `json:"sub_agent_provider,omitempty"`
+	SubAgentModel        *string                 `json:"sub_agent_model,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -508,9 +550,12 @@ type SessionResponse struct {
 	// LLM" guard toggle, default true. Surface so the UI can
 	// show a status pill ("auto-continue on/off") next to the
 	// todo panel.
-	AutoContinue        bool   `json:"auto_continue"`
-	TodoLongRunMode     string `json:"todo_long_run_mode"`
-	UseImageRecognition bool   `json:"use_image_recognition"`
+	AutoContinue         bool   `json:"auto_continue"`
+	TodoLongRunMode      string `json:"todo_long_run_mode"`
+	UseImageRecognition  bool   `json:"use_image_recognition"`
+	SubAgentModelEnabled bool   `json:"sub_agent_model_enabled"`
+	SubAgentProvider     string `json:"sub_agent_provider,omitempty"`
+	SubAgentModel        string `json:"sub_agent_model,omitempty"`
 }
 
 // MessageResponse is the JSON form of a single message in a
@@ -1089,6 +1134,12 @@ func (h *Handler) SetIMGateway(gateway *im.Gateway) {
 	h.imGateway = gateway
 }
 
+// SetSubagentRunner wires the production sub-agent runner so runtime config
+// reloads can update the task tool closure without restarting the server.
+func (h *Handler) SetSubagentRunner(runner *subagent.Default) {
+	h.subagentRunner = runner
+}
+
 // SetListenAddr records the real listen address so the browser
 // extension UI can display the correct WebSocket URL. Must be
 // called before Run/RunAt starts accepting connections.
@@ -1145,6 +1196,30 @@ func (h *Handler) reloadAfterConfigChange() {
 	}
 	h.agent.SetConfig(cfg)
 	h.agent.SetLLM(newClient)
+	if h.subagentRunner != nil {
+		parentProvider, parentModel := defaultProviderModelFromConfig(cfg)
+		h.subagentRunner.Cfg = cfg
+		h.subagentRunner.LLM = newClient
+		h.subagentRunner.Cache = subagent.NewCache(cfg.SubAgent.CacheTTLDuration())
+		h.subagentRunner.ParentProvider = parentProvider
+		h.subagentRunner.ParentProviderModel = parentModel
+	}
+}
+
+func defaultProviderModelFromConfig(cfg *config.Config) (string, string) {
+	if cfg == nil {
+		return "", ""
+	}
+	provider := strings.TrimSpace(cfg.LLM.Default)
+	if provider == "" && len(cfg.LLM.Providers) > 0 {
+		provider = strings.TrimSpace(cfg.LLM.Providers[0].Name)
+	}
+	for _, p := range cfg.LLM.Providers {
+		if p.Name == provider {
+			return provider, p.EffectiveModel()
+		}
+	}
+	return provider, ""
 }
 
 // PickFolder opens the native OS folder picker dialog and returns

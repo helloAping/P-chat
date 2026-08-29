@@ -203,17 +203,19 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// happens here so the `task` tool is live for every
 	// session from the first turn.
 	asyncMgr := subagent.NewAsyncManager()
+	parentProvider := defaultProviderName(cfg)
 	runner := &subagent.Default{
-		Cfg:            cfg,
-		LLM:            llmClient,
-		StyleMgr:       styleMgr,
-		JobStore:       memStore,
-		ParentTools:    toolReg,
-		ParentStyle:    style.Style(currentStyleName(cfg)),
-		ParentProvider: defaultProviderName(cfg),
-		Registry:       subagentReg,
-		Cache:          subagent.NewCache(cfg.SubAgent.CacheTTLDuration()),
-		Async:          asyncMgr,
+		Cfg:                 cfg,
+		LLM:                 llmClient,
+		StyleMgr:            styleMgr,
+		JobStore:            memStore,
+		ParentTools:         toolReg,
+		ParentStyle:         style.Style(currentStyleName(cfg)),
+		ParentProvider:      parentProvider,
+		ParentProviderModel: defaultProviderModel(cfg, parentProvider),
+		Registry:            subagentReg,
+		Cache:               subagent.NewCache(cfg.SubAgent.CacheTTLDuration()),
+		Async:               asyncMgr,
 	}
 	tt, hh := runner.Tool()
 	toolReg.Register(tt, hh)
@@ -284,6 +286,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
+	srv.SetSubagentRunner(runner)
 	srv.Handler().SetSubagentJobCanceller(asyncMgr)
 	srv.Handler().SetSubagentJobEvents(asyncMgr)
 
@@ -458,6 +461,21 @@ func defaultProviderName(cfg *config.Config) string {
 	}
 	if len(cfg.LLM.Providers) > 0 {
 		return cfg.LLM.Providers[0].Name
+	}
+	return ""
+}
+
+func defaultProviderModel(cfg *config.Config, provider string) string {
+	if cfg == nil {
+		return ""
+	}
+	if provider == "" {
+		provider = defaultProviderName(cfg)
+	}
+	for _, p := range cfg.LLM.Providers {
+		if p.Name == provider {
+			return p.EffectiveModel()
+		}
 	}
 	return ""
 }

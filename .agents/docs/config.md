@@ -31,7 +31,7 @@ type Config struct {
     Server ServerConfig  // HTTP 服务器设置
     UI     UIConfig     // 前端主题/布局
     Sandbox SandboxConfig // 命令/文件写入保护模式
-    SubAgent SubAgentConfig // 子代理超时/工具过滤
+    SubAgent SubAgentConfig // 子代理超时/工具过滤/默认模型
     WorkMode WorkModeConfig // 默认工作侧重点：coding / daily
     Vision VisionRecognitionConfig // 外接图片识别模型设置
 }
@@ -76,6 +76,16 @@ LLMConfig 核心字段：
 单会话是否优先使用该能力存放在 `conversations.metadata.use_image_recognition`。当系统配置和会话开关都开启时，当前轮图片先由配置模型识别，主模型只接收识别文本。
 
 `image_recognize` 的历史图片回看能力不只依赖该开关：如果会话没有开启专门识图，但历史上下文里有带 `upload_id` 的图片引用，并且当前对话模型支持视觉输入，Agent 也可以暴露 `image_recognize`，由工具 fallback 到当前 provider/model 做一次非流式识别。没有任何可用视觉能力时，历史图片占位会提示用户重新上传图片或切换/配置视觉模型。
+
+### 7. SubAgentConfig
+
+`subagent` 控制 `task` 子代理：
+- `cache_ttl` / `timeout` — 子代理缓存和显式 wall-clock 超时策略。
+- `allowed_tools` / `denied_tools` — 在子代理安全集内进一步收窄可见工具。
+- `model.enabled` — 是否给子代理指定默认模型；关闭时默认继承父对话 provider/model。
+- `model.provider` / `model.model` — 启用后使用已配置 LLM provider 中的模型。
+
+单会话可通过 `conversations.metadata.sub_agent_model_enabled`、`sub_agent_provider`、`sub_agent_model` 覆盖全局默认。子代理最终模型优先级是：`task` 工具显式参数 → 专用 agent 定义的模型 → 会话覆盖 → 全局 `subagent.model` → 父对话模型。
 
 ## 修改指南
 

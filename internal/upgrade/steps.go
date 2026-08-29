@@ -31,6 +31,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V3: stepV3toV4,
 	V4: stepV4toV5,
 	V5: stepV5toV6,
+	V6: stepV6toV7,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -429,5 +430,12 @@ func stepV4toV5(_ *sql.DB) error {
 
 func stepV5toV6(_ *sql.DB) error {
 	log.Print("[upgrade] V5 → V6: add vision_recognition config metadata (noop)")
+	return nil
+}
+
+// ---- V6 → V7 ----
+
+func stepV6toV7(_ *sql.DB) error {
+	log.Print("[upgrade] V6 → V7: add sub_agent model config metadata (noop)")
 	return nil
 }

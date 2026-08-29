@@ -23,6 +23,7 @@ import (
 	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/tool/dynamic"
 	"github.com/p-chat/pchat/internal/trace"
@@ -72,6 +73,11 @@ func (s *Server) SetBrowserManager(bm *browser.Manager) {
 // SetIMGateway wires the IM Gateway into server handlers.
 func (s *Server) SetIMGateway(gateway *im.Gateway) {
 	s.handler.SetIMGateway(gateway)
+}
+
+// SetSubagentRunner wires the sub-agent runner for config hot reloads.
+func (s *Server) SetSubagentRunner(runner *subagent.Default) {
+	s.handler.SetSubagentRunner(runner)
 }
 
 // New builds the HTTP server. The store is used for session/message

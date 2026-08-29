@@ -362,12 +362,10 @@ func filterVisionTools(tools []tool.Tool) []tool.Tool {
 }
 
 // visionGatedTools drops browser_screenshot from a tool list unless
-// the active (provider, model) pair is explicitly marked
-// vision-capable. Convenience wrapper used at tool-load time in
-// ChatWithTools so the screenshot tool and the injection logic stay
-// in lockstep.
-func (a *Agent) visionGatedTools(providerName, modelName string, tools []tool.Tool) []tool.Tool {
-	if a.modelExplicitlySupportsVision(providerName, modelName) {
+// the active model can see it directly or the session routes tool-produced
+// images through the configured image-recognition model.
+func (a *Agent) visionGatedTools(providerName, modelName string, imageRecognitionEnabled bool, tools []tool.Tool) []tool.Tool {
+	if a.modelExplicitlySupportsVision(providerName, modelName) || imageRecognitionEnabled {
 		return tools
 	}
 	return filterVisionTools(tools)
@@ -725,6 +723,9 @@ type ChatRequest struct {
 	// and injected as text context; follow-up turns can still expose
 	// image_recognize for historical upload_ids.
 	UseImageRecognition bool `json:"use_image_recognition,omitempty"`
+	// SubagentModel is the per-session default child model override.
+	// Task-call and specialized-agent model overrides still take priority.
+	SubagentModel SubagentModelPreference `json:"subagent_model,omitempty"`
 	// ClientMsgID, when non-zero, is the row id the frontend
 	// minted at send time (Date.now() × 1000 + random, well
 	// outside SQLite's AUTOINCREMENT range). The agent uses
@@ -1561,8 +1562,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		requestHistoryCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
 		historyHasImageRefs := hasImageUploadRefs(req.Messages[:requestHistoryCount])
 		currentTurnImageRecognition := useImageRecognition && ((a.attach != nil && hasImageAttachments(req.Attachments)) || hasImageMessages(req.Messages[requestHistoryCount:]))
-		historyImageRecognitionAvailable := historyHasImageRefs && a.store != nil && a.attach != nil && (useImageRecognition || a.currentModelImageRecognitionAvailable(req.Provider, req.Model))
+		sharedImages, sharedImagesAvailable := GetSharedImageRecognition(ctx)
+		sharedUseConfiguredRecognition := sharedImagesAvailable && sharedImages.UseConfiguredModel && a.imageRecognitionAvailable()
+		sharedImageRecognitionAvailable := req.SubagentType != "" && sharedImagesAvailable && (sharedUseConfiguredRecognition || (a != nil && a.llm != nil && a.modelSupportsVision(req.Provider, req.Model)))
+		historyImageRecognitionAvailable := (historyHasImageRefs && a.store != nil && a.attach != nil && (useImageRecognition || a.currentModelImageRecognitionAvailable(req.Provider, req.Model))) || sharedImageRecognitionAvailable
 		imageRecognitionToolAvailable := historyImageRecognitionAvailable && !currentTurnImageRecognition
+		parentImageRefsForChildren := req.SubagentType == "" && req.SessionID != "" && a.store != nil && a.attach != nil &&
+			(historyHasImageRefs || hasImageUploadRefs(req.Messages[requestHistoryCount:]) || hasImageAttachmentUploadRefs(req.Attachments))
 		// Remove wiki tools when knowledge base is off. grep is a
 		// general-purpose search tool and remains available.
 		kbEnabled := req.KBBase != "" && req.KBBase != "__off__"
@@ -1576,16 +1582,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 			availableTools = filtered
 		}
-		// Gate browser_screenshot on the active model's vision
-		// capability. Screenshots only help the agent when the
-		// model can actually see the image; for a text-only
-		// model the ~100KB+ base64 payload is pure overhead (and
-		// a silent context-window tax). Text-only models fall
-		// back to browser_extract, which returns the rendered
-		// page's text without needing vision. Filtering here
-		// (before toolDefs / prompt / subagent wiring) keeps
-		// every downstream consumer consistent.
-		availableTools = a.visionGatedTools(req.Provider, req.Model, availableTools)
+		// Gate browser_screenshot on an available visual analysis path:
+		// either the active model is explicitly vision-capable, or the
+		// session routes tool-produced images through the configured
+		// image-recognition model. Text-only sessions without either path
+		// fall back to browser_extract.
+		availableTools = a.visionGatedTools(req.Provider, req.Model, useImageRecognition, availableTools)
 		// Current-turn uploads are recognized before the main LLM call and
 		// injected as bounded context. Keep image_recognize available only for
 		// follow-up turns that need to revisit historical upload_ids.
@@ -2657,13 +2659,30 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// selection when the user has switched models
 				// mid-session.
 				tctx = WithParentModel(tctx, req.Provider, req.Model)
+				tctx = WithSubagentModelPreference(tctx, req.SubagentModel)
+				if parentImageRefsForChildren {
+					parentSessionID := req.SessionID
+					tctx = WithSharedImageRecognition(tctx, SharedImageRecognition{
+						SessionID:          parentSessionID,
+						HasImageRefs:       true,
+						UseConfiguredModel: useImageRecognition,
+						Resolver: func(ctx context.Context, _ string, uploadID string) (tool.ImageRecognitionImage, error) {
+							return a.resolveImageForRecognition(ctx, parentSessionID, uploadID)
+						},
+					})
+				}
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
 				}
 				if imageRecognitionToolAvailable {
-					tctx = tool.WithImageResolver(tctx, a.resolveImageForRecognition)
+					resolver := tool.ImageResolver(a.resolveImageForRecognition)
+					if req.SubagentType != "" && sharedImages.Available() {
+						resolver = sharedImages.Resolver
+					}
+					tctx = tool.WithImageResolver(tctx, resolver)
 					recognizer := tool.ImageRecognizer(a.recognizeImageWithConfiguredModel)
-					if !useImageRecognition {
+					configuredRecognizer := useImageRecognition || (req.SubagentType != "" && sharedUseConfiguredRecognition)
+					if !configuredRecognizer {
 						recognizer = a.recognizeImageWithCurrentModel(req.Provider, req.Model)
 					}
 					tctx = tool.WithImageRecognizer(tctx, recognizer)
@@ -3218,7 +3237,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// user-facing error messages.
 					llmContent = fmt.Sprintf("Tool %s returned an error: %s", tc.Name, result.Content)
 				} else {
-					llmContent = a.truncateToolResultForProject(tc.Name, req.ProjectRoot, result.Content)
+					if result.Image != nil && useImageRecognition {
+						llmContent = a.recognizeToolResultImageWithConfiguredModel(ctx, tc.Name, latestUserText(msgs), result.Image, ch, nextSeq)
+					} else {
+						llmContent = a.truncateToolResultForProject(tc.Name, req.ProjectRoot, result.Content)
+					}
 				}
 				toolMsg := llm.ChatMessage{
 					Role:      llm.RoleTool,
@@ -3302,7 +3325,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// When the model doesn't support vision, skip the
 			// injection entirely — the tool_result's text
 			// placeholder is all the LLM will see.
-			visionCapable := a.modelSupportsVision(req.Provider, req.Model)
+			visionCapable := !useImageRecognition && a.modelSupportsVision(req.Provider, req.Model)
 			for _, o := range outcomes {
 				if o.result == nil || o.result.Image == nil || !visionCapable {
 					continue

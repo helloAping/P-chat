@@ -8,7 +8,7 @@ import (
 func TestSubagentMayExpose(t *testing.T) {
 	allow := []string{
 		"read_file", "list_files", "read_docx", "read_pdf", "grep",
-		"wiki_lookup", "wiki_list", "todo_write", "web_search", "web_fetch",
+		"wiki_lookup", "wiki_list", "image_recognize", "todo_write", "web_search", "web_fetch",
 	}
 	for _, name := range allow {
 		if !SubagentMayExpose(name) {
@@ -17,7 +17,7 @@ func TestSubagentMayExpose(t *testing.T) {
 	}
 	deny := []string{
 		"write_file", "edit_file", "exec_command", "start_process",
-		"question", "browser_click", "image_recognize", "task",
+		"question", "browser_click", "task",
 		"mcp__demo__tool__00000000", "custom_dynamic",
 	}
 	for _, name := range deny {

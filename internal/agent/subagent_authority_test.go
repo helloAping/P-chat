@@ -100,6 +100,18 @@ func TestSubagentToolAuthorizationAllowsWebSearch(t *testing.T) {
 	}
 }
 
+func TestSubagentToolAuthorizationAllowsImageRecognize(t *testing.T) {
+	result, handled := subagentToolAuthorizationResult(
+		ChatRequest{SubagentType: "general-purpose", ProjectRoot: `D:\projects\app`},
+		nativeToolCall{Name: "image_recognize", ArgsJSON: `{"upload_id":"upl-1"}`},
+		tool.Tool{Name: "image_recognize"},
+		nil,
+	)
+	if handled || result != nil {
+		t.Fatalf("image_recognize was handled=%v result=%#v, want pass-through", handled, result)
+	}
+}
+
 func TestSubagentToolAuthorizationAllowsPublicWebFetch(t *testing.T) {
 	cases := []string{
 		`{"url":"https://example.com/docs"}`,

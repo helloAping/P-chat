@@ -282,7 +282,25 @@ const sysLimits = ref<api.LimitsConfig>({
 const sysSubAgent = ref<api.SubAgentConfig>({
   cache_ttl: '',
   timeout: '',
+  model: {
+    enabled: false,
+    provider: '',
+    model: '',
+  },
 })
+
+function normalizeSubAgentConfig(sa?: Partial<api.SubAgentConfig>): api.SubAgentConfig {
+  const raw = (sa || {}) as any
+  return {
+    cache_ttl: raw.cache_ttl || '',
+    timeout: raw.timeout || '',
+    model: {
+      enabled: !!raw.model?.enabled,
+      provider: raw.model?.provider || '',
+      model: raw.model?.model || '',
+    },
+  }
+}
 const sysVision = ref<api.VisionRecognitionConfig>({
   enabled: false,
   provider: '',
@@ -303,7 +321,7 @@ async function loadSystemConfig() {
   try {
     const sc = await api.getSystemConfig()
     sysLimits.value = sc.limits
-    sysSubAgent.value = sc.sub_agent
+    sysSubAgent.value = normalizeSubAgentConfig(sc.sub_agent)
     sysVision.value = sc.vision_recognition || {
       enabled: false,
       provider: '',
@@ -340,6 +358,11 @@ async function saveSystemConfig() {
 
     sa.cache_ttl = sysSubAgent.value.cache_ttl
     sa.timeout = sysSubAgent.value.timeout
+    sa.model = {
+      enabled: sysSubAgent.value.model?.enabled || false,
+      provider: sysSubAgent.value.model?.provider || '',
+      model: sysSubAgent.value.model?.model || '',
+    }
     patch.sub_agent = sa
     patch.work_mode = { default: sysWorkMode.value }
     patch.ui = { close_behavior: sysCloseBehavior.value }
@@ -354,6 +377,9 @@ async function saveSystemConfig() {
     const updated = await api.updateSystemConfig(patch)
     chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
     sysCloseBehavior.value = normalizeCloseBehavior(updated.ui?.close_behavior)
+    if (updated.sub_agent) {
+      sysSubAgent.value = normalizeSubAgentConfig(updated.sub_agent)
+    }
     if (updated.vision_recognition) {
       sysVision.value = updated.vision_recognition
       chatState.visionRecognitionEnabled = !!updated.vision_recognition.enabled
@@ -378,7 +404,7 @@ function resetSystemConfig() {
     todo_long_run_mode: 'adaptive',
     max_stored_messages: 0,
   }
-  sysSubAgent.value = { cache_ttl: '', timeout: '' }
+  sysSubAgent.value = normalizeSubAgentConfig()
   sysVision.value = {
     enabled: false,
     provider: '',
@@ -1094,6 +1120,34 @@ const visionModelOptions = computed(() => {
   })
 })
 
+const subAgentProviderOptions = computed(() =>
+  providers.value.map(p => ({ label: p.name, value: p.name })),
+)
+
+const subAgentModelOptions = computed(() => {
+  const p = providers.value.find(x => x.name === sysSubAgent.value.model?.provider)
+  if (!p) return []
+  return (p.models || []).map(m => {
+    const suffix = m.capabilities?.supports_vision ? ' · 视觉' : ''
+    const label = m.display_name ? `${m.display_name} (${m.name})${suffix}` : `${m.name}${suffix}`
+    return { label, value: m.name }
+  })
+})
+
+function firstSubAgentModelSelection(): { provider: string; model: string } | null {
+  for (const p of providers.value) {
+    const models = p.models || []
+    const m = models.find(x => x.default) || models[0]
+    if (m?.name) return { provider: p.name, model: m.name }
+  }
+  return null
+}
+
+function subAgentModelSelectionValid(provider: string, model: string): boolean {
+  const p = providers.value.find(x => x.name === provider)
+  return !!p && (p.models || []).some(m => m.name === model)
+}
+
 function onVisionProviderUpdate(provider: string) {
   sysVision.value.provider = provider || ''
   const p = providers.value.find(x => x.name === provider)
@@ -1106,6 +1160,42 @@ function onVisionProviderUpdate(provider: string) {
 
 function onVisionModelUpdate(model: string) {
   sysVision.value.model = model || ''
+  markSysDirty()
+}
+
+function onSubAgentModelEnabledUpdate(enabled: boolean) {
+  if (!sysSubAgent.value.model) {
+    sysSubAgent.value.model = { enabled: false, provider: '', model: '' }
+  }
+  sysSubAgent.value.model.enabled = !!enabled
+  if (enabled && !subAgentModelSelectionValid(sysSubAgent.value.model.provider, sysSubAgent.value.model.model)) {
+    const picked = firstSubAgentModelSelection()
+    if (picked) {
+      sysSubAgent.value.model.provider = picked.provider
+      sysSubAgent.value.model.model = picked.model
+    }
+  }
+  markSysDirty()
+}
+
+function onSubAgentProviderUpdate(provider: string) {
+  if (!sysSubAgent.value.model) {
+    sysSubAgent.value.model = { enabled: false, provider: '', model: '' }
+  }
+  sysSubAgent.value.model.provider = provider || ''
+  const p = providers.value.find(x => x.name === provider)
+  const models = p?.models || []
+  if (!models.some(m => m.name === sysSubAgent.value.model?.model)) {
+    sysSubAgent.value.model.model = models.find(m => m.default)?.name || models[0]?.name || ''
+  }
+  markSysDirty()
+}
+
+function onSubAgentModelUpdate(model: string) {
+  if (!sysSubAgent.value.model) {
+    sysSubAgent.value.model = { enabled: false, provider: '', model: '' }
+  }
+  sysSubAgent.value.model.model = model || ''
   markSysDirty()
 }
 
@@ -2343,6 +2433,36 @@ function kbModelSupportsVision(scanModel: string) {
                 <NCollapseItem title="子代理" name="subagent">
                   <div class="sys-form-grid">
                     <div class="sys-form-row">
+                      <span class="sys-label">默认模型</span>
+                      <NSwitch :value="sysSubAgent.model.enabled" size="small" @update:value="onSubAgentModelEnabledUpdate" />
+                      <span class="sys-hint">开启后，未设置会话自定义模型的子代理默认使用下方模型。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">供应商</span>
+                      <NSelect
+                        :value="sysSubAgent.model.provider"
+                        :options="subAgentProviderOptions"
+                        size="small"
+                        style="width: 180px"
+                        clearable
+                        @update:value="onSubAgentProviderUpdate"
+                      />
+                      <span class="sys-hint">task 调用或专用子代理显式指定模型时仍会优先使用它们。</span>
+                    </div>
+                    <div class="sys-form-row">
+                      <span class="sys-label">模型</span>
+                      <NSelect
+                        :value="sysSubAgent.model.model"
+                        :options="subAgentModelOptions"
+                        size="small"
+                        style="width: 240px"
+                        clearable
+                        :disabled="!sysSubAgent.model.provider"
+                        @update:value="onSubAgentModelUpdate"
+                      />
+                      <span class="sys-hint">可选择更快或更便宜的模型承担探索、规划等子任务。</span>
+                    </div>
+                    <div class="sys-form-row">
                       <span class="sys-label">结果缓存 TTL</span>
                       <NInput v-model:value="sysSubAgent.cache_ttl" size="small" placeholder="例如: 10m" style="width:140px" @update:value="markSysDirty" />
                       <span class="sys-hint">留空 = 禁用缓存</span>
@@ -2350,7 +2470,7 @@ function kbModelSupportsVision(scanModel: string) {
                     <div class="sys-form-row">
                       <span class="sys-label">超时时间</span>
                       <NInput v-model:value="sysSubAgent.timeout" size="small" placeholder="例如: 30m" style="width:140px" @update:value="markSysDirty" />
-                      <span class="sys-hint">留空 = 默认 30 分钟（兜底；卡死由 LLM idle / 工具超时提前拦截）</span>
+                      <span class="sys-hint">留空/0 = 不设置子代理墙钟超时；卡死由 LLM idle / 工具超时拦截</span>
                     </div>
                   </div>
                 </NCollapseItem>

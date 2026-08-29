@@ -502,7 +502,7 @@ func TestVisionGatedTools(t *testing.T) {
 	}
 
 	// Text-only model: screenshot dropped, everything else kept.
-	got := a.visionGatedTools("cs", "deepseek-v4-flash", base)
+	got := a.visionGatedTools("cs", "deepseek-v4-flash", false, base)
 	if hasShot(got) {
 		t.Error("deepseek-v4-flash (capabilities: {}) must NOT get browser_screenshot")
 	}
@@ -512,7 +512,7 @@ func TestVisionGatedTools(t *testing.T) {
 
 	// Vision models: screenshot stays.
 	for _, m := range []string{"mimo-v2.5", "minimax-m3"} {
-		got := a.visionGatedTools("cs", m, base)
+		got := a.visionGatedTools("cs", m, false, base)
 		if !hasShot(got) {
 			t.Errorf("%s (supports_vision: true) must keep browser_screenshot", m)
 		}
@@ -521,11 +521,15 @@ func TestVisionGatedTools(t *testing.T) {
 		}
 	}
 
+	if !hasShot(a.visionGatedTools("cs", "deepseek-v4-flash", true, base)) {
+		t.Error("image-recognition mode must keep browser_screenshot for text-only main models")
+	}
+
 	// Unknown model / provider: conservative deny.
-	if hasShot(a.visionGatedTools("cs", "some-unknown-model", base)) {
+	if hasShot(a.visionGatedTools("cs", "some-unknown-model", false, base)) {
 		t.Error("unknown model must not get browser_screenshot")
 	}
-	if hasShot(a.visionGatedTools("unknown-provider", "mimo-v2.5", base)) {
+	if hasShot(a.visionGatedTools("unknown-provider", "mimo-v2.5", false, base)) {
 		t.Error("unknown provider must not get browser_screenshot")
 	}
 }

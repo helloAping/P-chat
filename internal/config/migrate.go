@@ -99,10 +99,17 @@ type yamlSandboxConfig struct {
 }
 
 type yamlSubAgentConfig struct {
-	AllowedTools []string `yaml:"allowed_tools,omitempty"`
-	DeniedTools  []string `yaml:"denied_tools,omitempty"`
-	Timeout      string   `yaml:"timeout,omitempty"`
-	CacheTTL     string   `yaml:"cache_ttl,omitempty"`
+	AllowedTools []string                `yaml:"allowed_tools,omitempty"`
+	DeniedTools  []string                `yaml:"denied_tools,omitempty"`
+	Timeout      string                  `yaml:"timeout,omitempty"`
+	CacheTTL     string                  `yaml:"cache_ttl,omitempty"`
+	Model        yamlSubAgentModelConfig `yaml:"model,omitempty"`
+}
+
+type yamlSubAgentModelConfig struct {
+	Enabled  bool   `yaml:"enabled,omitempty"`
+	Provider string `yaml:"provider,omitempty"`
+	Model    string `yaml:"model,omitempty"`
 }
 
 // unmarshalYAML decodes legacy YAML bytes into the Config struct.
@@ -157,6 +164,11 @@ func unmarshalYAML(data []byte, cfg *Config) error {
 			DeniedTools:  y.SubAgent.DeniedTools,
 			Timeout:      y.SubAgent.Timeout,
 			CacheTTL:     y.SubAgent.CacheTTL,
+			Model: SubAgentModelConfig{
+				Enabled:  y.SubAgent.Model.Enabled,
+				Provider: y.SubAgent.Model.Provider,
+				Model:    y.SubAgent.Model.Model,
+			},
 		},
 	}
 

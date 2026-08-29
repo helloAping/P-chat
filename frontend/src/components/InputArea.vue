@@ -69,6 +69,7 @@ onMounted(() => nextTick(resizeTextarea))
 const sending = ref(false)
 const sendPreflightSessions = new Set<string>()
 const showSessionConfig = ref(false)
+const showSubAgentModelPicker = ref(false)
 const message = useMessage()
 const dialog = useDialog()
 
@@ -1070,11 +1071,14 @@ async function send() {
       // the SQLite row id in lockstep, so rollback and
       // regenerate work the instant the user clicks them.
       clientMsgID: clientMsgId,
-    provider: meta.provider,
-    model: meta.model,
-    style: meta.style,
-    workMode: meta.workMode,
-    useImageRecognition: imageRecognitionEnabled.value,
+      provider: meta.provider,
+      model: meta.model,
+      style: meta.style,
+      workMode: meta.workMode,
+      useImageRecognition: imageRecognitionEnabled.value,
+      subAgentModelEnabled: !!meta.sub_agent_model_enabled,
+      subAgentProvider: meta.sub_agent_provider || '',
+      subAgentModel: meta.sub_agent_model || '',
       todoMode,
       attachments: inlineAttachments,
       skillContext: pendingSkillContext || undefined,
@@ -1279,6 +1283,98 @@ async function onImageRecognitionPick(v: boolean) {
   }
 }
 
+function providerHasModel(provider: string, model: string): boolean {
+  const p = state.providers.find(x => x.name === provider)
+  const models = (p?.models || []) as api.ModelInfo[]
+  return models.some((m: api.ModelInfo) => m.name === model)
+}
+
+function firstConfiguredModel(): { provider: string; model: string } | null {
+  const meta = currentMeta.value
+  if (meta.provider && meta.model && providerHasModel(meta.provider, meta.model)) {
+    return { provider: meta.provider, model: meta.model }
+  }
+  if (state.defaultModel?.provider && state.defaultModel?.model) {
+    return { provider: state.defaultModel.provider, model: state.defaultModel.model }
+  }
+  for (const p of state.providers) {
+    const models = (p.models || []) as api.ModelInfo[]
+    const m = models.find((x: api.ModelInfo) => x.default) || models[0]
+    if (m?.name) return { provider: p.name, model: m.name }
+  }
+  return null
+}
+
+const subAgentModelEnabled = computed(() =>
+  !!state.sessionMeta[state.currentID]?.sub_agent_model_enabled,
+)
+
+const subAgentModelProvider = computed(() =>
+  state.sessionMeta[state.currentID]?.sub_agent_provider || currentMeta.value.provider || '',
+)
+
+const subAgentModelName = computed(() =>
+  state.sessionMeta[state.currentID]?.sub_agent_model || currentMeta.value.model || '',
+)
+
+const subAgentModelLabel = computed(() =>
+  subAgentModelEnabled.value ? (subAgentModelName.value || '未选择') : '继承',
+)
+
+async function updateSubAgentModelMeta(enabled: boolean, provider: string, modelName: string) {
+  if (!state.currentID) return
+  const resp = await api.updateSessionMeta(state.currentID, {
+    sub_agent_model_enabled: enabled,
+    sub_agent_provider: provider,
+    sub_agent_model: modelName,
+  })
+  const id = state.currentID
+  const nextEnabled = resp.sub_agent_model_enabled ?? enabled
+  const nextProvider = resp.sub_agent_provider ?? provider
+  const nextModel = resp.sub_agent_model ?? modelName
+  state.sessionMeta[id] = {
+    ...(state.sessionMeta[id] || currentMeta.value),
+    sub_agent_model_enabled: nextEnabled,
+    sub_agent_provider: nextProvider,
+    sub_agent_model: nextModel,
+  }
+  const session = state.sessions.find(s => s.id === id)
+  if (session) {
+    session.sub_agent_model_enabled = nextEnabled
+    session.sub_agent_provider = nextProvider
+    session.sub_agent_model = nextModel
+  }
+}
+
+async function onSubAgentModelModePick(enabled: boolean) {
+  if (!state.currentID) return
+  const picked = firstConfiguredModel()
+  let provider = subAgentModelProvider.value || picked?.provider || ''
+  let modelName = subAgentModelName.value || picked?.model || ''
+  if (enabled && !providerHasModel(provider, modelName) && picked) {
+    provider = picked.provider
+    modelName = picked.model
+  }
+  if (enabled && (!provider || !modelName)) {
+    message.warning('请先添加至少一个可用模型。', { duration: 4000 })
+    return
+  }
+  try {
+    await updateSubAgentModelMeta(enabled, provider, modelName)
+  } catch (e: any) {
+    message.error(`子代理模型设置失败：${e?.message || e}`)
+  }
+}
+
+async function onSubAgentModelSelect(sel: { provider: string; model: string }) {
+  if (!state.currentID) return
+  try {
+    await updateSubAgentModelMeta(true, sel.provider, sel.model)
+  } catch (e: any) {
+    message.error(`子代理模型设置失败：${e?.message || e}`)
+  }
+}
+
 const currentWorkModeValue = computed({
   get: () => currentMeta.value.workMode || state.globalWorkMode || 'coding',
   set: (v: string) => onWorkModePick(v),
@@ -1305,7 +1401,7 @@ const currentReasoningLabel = computed(() => {
 })
 
 const sessionConfigSummary = computed(() =>
-  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 识图${imageRecognitionLabel.value} · 风格${currentStyleLabel.value}`,
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 识图${imageRecognitionLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
 )
 
 // Display label for the knowledge base picker. The "off"
@@ -1535,7 +1631,7 @@ onMounted(() => {
             >
               <Settings :size="13" />
               <span class="ctrl-btn-label">会话设置</span>
-              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 识图{{ imageRecognitionLabel }}</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 识图{{ imageRecognitionLabel }} · 子代理{{ subAgentModelLabel }}</span>
             </button>
           </template>
           <div class="session-config-popover">
@@ -1688,6 +1784,72 @@ onMounted(() => {
                 <div v-if="!imageRecognitionAvailable" class="session-config-hint">
                   请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。
                 </div>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">
+                <span>子代理模型</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="子代理模型说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">子代理模型</div>
+                    <p>默认继承当前主对话模型。开启自定义后，子代理会优先使用这里选择的模型，除非 task 调用或专用子代理自己指定了模型。</p>
+                    <p>适合把探索、规划这类子任务交给更快或更便宜的模型，同时主对话继续使用当前模型。</p>
+                  </div>
+                </NPopover>
+              </div>
+              <div class="session-config-options">
+                <button
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': !subAgentModelEnabled }"
+                  @click="onSubAgentModelModePick(false)"
+                >
+                  继承主模型
+                </button>
+                <button
+                  type="button"
+                  class="session-config-choice"
+                  :class="{ 'session-config-choice--active': subAgentModelEnabled }"
+                  @click="onSubAgentModelModePick(true)"
+                >
+                  自定义
+                </button>
+                <ModelPicker
+                  v-if="subAgentModelEnabled"
+                  v-model:show="showSubAgentModelPicker"
+                  :provider="subAgentModelProvider"
+                  :model="subAgentModelName"
+                  :providers="state.providers as any"
+                  @select="onSubAgentModelSelect"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-choice session-config-choice--model"
+                      :title="`${subAgentModelProvider}/${subAgentModelName}`"
+                      @click="showSubAgentModelPicker = true"
+                    >
+                      <Sparkles :size="12" />
+                      <span class="session-config-choice-label">{{ subAgentModelName || '选择模型' }}</span>
+                      <ChevronDown :size="11" />
+                    </button>
+                  </template>
+                </ModelPicker>
               </div>
             </div>
 
@@ -2477,6 +2639,19 @@ onMounted(() => {
   border-color: var(--border-subtle);
   color: var(--text-quaternary);
   cursor: not-allowed;
+}
+.session-config-choice--model {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  min-width: 0;
+}
+.session-config-choice-label {
+  min-width: 0;
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .session-config-hint {
   flex-basis: 100%;

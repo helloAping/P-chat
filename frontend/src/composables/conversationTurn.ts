@@ -10,6 +10,9 @@ export type ConversationTurnInput = {
   style?: string
   workMode?: string
   useImageRecognition?: boolean
+  subAgentModelEnabled?: boolean
+  subAgentProvider?: string
+  subAgentModel?: string
   todoMode: 'auto' | 'resume' | 'clear'
   attachments?: api.InlineAttachment[]
   skillContext?: string
@@ -92,6 +95,9 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       style: input.style,
       workMode: input.workMode,
       useImageRecognition: input.useImageRecognition,
+      subAgentModelEnabled: input.subAgentModelEnabled,
+      subAgentProvider: input.subAgentProvider,
+      subAgentModel: input.subAgentModel,
       todo_mode: input.todoMode,
       attachments: input.attachments,
       signal: ctrl.signal,

@@ -59,7 +59,7 @@
 
 工具可见性：
 1. **硬排除**：`task`, `task_status`, `task_cancel`, `recall` 强制移除
-2. **执行安全集**：`tool.SubagentMayExpose` — 只读本地工具、`todo_write`、`web_search`、`web_fetch`。白名单不能放宽到写文件 / 执行 / 交互 / 浏览器 / MCP
+2. **执行安全集**：`tool.SubagentMayExpose` — 只读本地工具、`todo_write`、`image_recognize`、`web_search`、`web_fetch`。白名单不能放宽到写文件 / 执行 / 交互 / 浏览器 / MCP
 3. **全局配置过滤**：`subagent.allowed_tools` / `denied_tools`（不能越过安全集）
 4. **Per-agent 白名单**：`agentInfo.Tools` 非空时只暴露列表中的（仍受安全集约束；白名单可绕过全局 deny）
 
@@ -67,10 +67,26 @@
 1. 子代理强制使用隔离的 `permission_level=ask`，不继承父会话的 `auto` / `full` / live session override
 2. 子代理不能消费 `/unsafe once`
 3. 子代理不能打开自己的 confirm flow；`tool.RequireConfirm` 在子代理上下文中 fail-closed
-4. 子代理可执行项目内只读工具（`read_file` / `list_files` / `grep` / `read_docx` / `read_pdf` / wiki）、私有 `todo_write`、`web_search`，以及公网 `web_fetch`（GET / POST）
+4. 子代理可执行项目内只读工具（`read_file` / `list_files` / `grep` / `read_docx` / `read_pdf` / wiki）、`image_recognize`、私有 `todo_write`、`web_search`，以及公网 `web_fetch`（GET / POST）
 5. 写文件、编辑文件、启动进程、执行 shell、私网/回环 URL、交互提问、项目外读取、动态高风险工具调用返回 `SUBAGENT_PARENT_APPROVAL_REQUIRED`（或对私网 URL 直接 block），由父对话决定后续动作
 
 内置 `explore` / `plan` 暴露 `read_file`、`list_files`、`grep`、`read_docx`、`read_pdf`。git / 测试 / 进程执行应在最终结果中向父对话提出，而不是自行执行。`general-purpose` 额外可使用 `todo_write`、`web_search` 和公网 `web_fetch`。
+
+### 4.1 子代理模型选择
+
+子代理最终使用的 provider/model 由 `resolveSubAgentProviderModel()` 统一解析，优先级如下：
+
+1. `task` 工具参数显式传入的 `provider` / `model`
+2. 子代理定义文件中的专用 `model`
+3. 当前会话元数据 `sub_agent_model_enabled=true` 时的 `sub_agent_provider` / `sub_agent_model`
+4. 全局配置 `subagent.model.enabled=true` 时的 `subagent.model.provider` / `subagent.model.model`
+5. 父对话 provider/model
+
+会话级和全局级开关关闭时只保存配置值，不参与解析。所有启用状态都会经过已配置 provider/model 校验，避免子代理启动后才发现模型不可用。
+
+### 4.2 图片识别共享
+
+父对话有历史或当前轮图片引用时，会把父会话的图片解析器注入到 `task` 工具 context。子代理可以在自己的隔离工具集中调用 `image_recognize` 读取父会话图片；如果父会话开启了 `use_image_recognition`，子代理复用系统识图模型；否则在子代理当前模型支持视觉时 fallback 到子代理模型识别。
 
 ### 5. 缓存
 

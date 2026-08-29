@@ -157,6 +157,20 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	if req.UseImageRecognition != nil {
 		useImageRecognition = h.getCfg().Vision.Enabled && *req.UseImageRecognition
 	}
+	if req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
+		var provider *string
+		var model *string
+		if req.SubAgentProvider != "" {
+			provider = &req.SubAgentProvider
+		}
+		if req.SubAgentModel != "" {
+			model = &req.SubAgentModel
+		}
+		if err := h.applySessionSubAgentModelPatch(id, req.SubAgentModelEnabled, provider, model); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
 	// Hydrate the durable plan before the agent builds its prompt. A
 	// resume request must see the interrupted in_progress item even after
@@ -205,6 +219,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		HistoryMessageCount: historyMessageCount,
 		Attachments:         req.Attachments,
 		UseImageRecognition: useImageRecognition,
+		SubagentModel:       h.sessionSubAgentModelPreference(id),
 		// Forward the frontend's client-minted row id. The
 		// agent uses it as the explicit SQLite row id for
 		// this turn's user message, so rollback/regen
