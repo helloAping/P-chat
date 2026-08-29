@@ -685,14 +685,6 @@ func TestBuildSubAgentChatRequestUsesIsolatedSession(t *testing.T) {
 }
 
 func TestResolveSubAgentProviderModelPriority(t *testing.T) {
-	cfg := &config.Config{SubAgent: config.SubAgentConfig{
-		Model: config.SubAgentModelConfig{
-			Enabled:  true,
-			Provider: "global",
-			Model:    "global-model",
-		},
-	}}
-
 	cases := []struct {
 		name       string
 		req        Request
@@ -741,12 +733,6 @@ func TestResolveSubAgentProviderModelPriority(t *testing.T) {
 			wantModel: "session-model",
 		},
 		{
-			name:      "global model beats parent",
-			req:       Request{},
-			wantProv:  "global",
-			wantModel: "global-model",
-		},
-		{
 			name:      "inherits parent when overrides disabled",
 			req:       Request{},
 			wantProv:  "parent",
@@ -755,11 +741,7 @@ func TestResolveSubAgentProviderModelPriority(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			useCfg := cfg
-			if tc.name == "inherits parent when overrides disabled" {
-				useCfg = &config.Config{}
-			}
-			gotProv, gotModel := resolveSubAgentProviderModel(tc.req, useCfg, "parent", "parent-model", tc.agentModel)
+			gotProv, gotModel := resolveSubAgentProviderModel(tc.req, "parent", "parent-model", tc.agentModel)
 			if gotProv != tc.wantProv || gotModel != tc.wantModel {
 				t.Fatalf("provider/model = %s/%s, want %s/%s", gotProv, gotModel, tc.wantProv, tc.wantModel)
 			}

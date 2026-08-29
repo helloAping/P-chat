@@ -1498,7 +1498,7 @@ func (d *Default) Run(ctx context.Context, req Request) (_ Result, retErr error)
 	}
 
 	// Resolve the effective child provider/model before building the cache key.
-	prov, chatModel := resolveSubAgentProviderModel(req, d.Cfg, d.ParentProvider, d.ParentProviderModel, agentModel)
+	prov, chatModel := resolveSubAgentProviderModel(req, d.ParentProvider, d.ParentProviderModel, agentModel)
 	runMode := strings.TrimSpace(req.RunMode)
 	if runMode == "" {
 		runMode = "sync"
@@ -1974,7 +1974,6 @@ func buildSubAgentSessionID(subType, taskID string) string {
 
 func resolveSubAgentProviderModel(
 	req Request,
-	cfg *config.Config,
 	parentProvider, parentModel, agentModel string,
 ) (string, string) {
 	provider := strings.TrimSpace(req.Provider)
@@ -1996,13 +1995,6 @@ func resolveSubAgentProviderModel(
 	}
 	if pref := req.SubagentModel.Normalize(); pref.Active() {
 		return pref.Provider, pref.Model
-	}
-	if cfg != nil {
-		modelCfg := cfg.SubAgent.Model
-		modelCfg.Normalize()
-		if modelCfg.Enabled && modelCfg.Provider != "" && modelCfg.Model != "" {
-			return modelCfg.Provider, modelCfg.Model
-		}
 	}
 
 	model := strings.TrimSpace(parentModel)

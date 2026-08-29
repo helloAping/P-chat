@@ -436,6 +436,6 @@ func stepV5toV6(_ *sql.DB) error {
 // ---- V6 → V7 ----
 
 func stepV6toV7(_ *sql.DB) error {
-	log.Print("[upgrade] V6 → V7: add sub_agent model config metadata (noop)")
+	log.Print("[upgrade] V6 → V7: add per-session sub-agent model metadata (noop)")
 	return nil
 }

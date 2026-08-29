@@ -31,7 +31,7 @@ type Config struct {
     Server ServerConfig  // HTTP 服务器设置
     UI     UIConfig     // 前端主题/布局
     Sandbox SandboxConfig // 命令/文件写入保护模式
-    SubAgent SubAgentConfig // 子代理超时/工具过滤/默认模型
+    SubAgent SubAgentConfig // 子代理超时/工具过滤
     WorkMode WorkModeConfig // 默认工作侧重点：coding / daily
     Vision VisionRecognitionConfig // 外接图片识别模型设置
 }
@@ -82,10 +82,8 @@ LLMConfig 核心字段：
 `subagent` 控制 `task` 子代理：
 - `cache_ttl` / `timeout` — 子代理缓存和显式 wall-clock 超时策略。
 - `allowed_tools` / `denied_tools` — 在子代理安全集内进一步收窄可见工具。
-- `model.enabled` — 是否给子代理指定默认模型；关闭时默认继承父对话 provider/model。
-- `model.provider` / `model.model` — 启用后使用已配置 LLM provider 中的模型。
 
-单会话可通过 `conversations.metadata.sub_agent_model_enabled`、`sub_agent_provider`、`sub_agent_model` 覆盖全局默认。子代理最终模型优先级是：`task` 工具显式参数 → 专用 agent 定义的模型 → 会话覆盖 → 全局 `subagent.model` → 父对话模型。
+单会话可通过 `conversations.metadata.sub_agent_model_enabled`、`sub_agent_provider`、`sub_agent_model` 指定子代理模型。默认关闭时继承父对话 provider/model；用户在会话设置里开启自定义后才选择模型。子代理最终模型优先级是：`task` 工具显式参数 → 专用 agent 定义的模型 → 会话自定义 → 父对话模型。
 
 ## 修改指南
 

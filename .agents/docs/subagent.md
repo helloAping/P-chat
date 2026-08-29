@@ -79,10 +79,9 @@
 1. `task` 工具参数显式传入的 `provider` / `model`
 2. 子代理定义文件中的专用 `model`
 3. 当前会话元数据 `sub_agent_model_enabled=true` 时的 `sub_agent_provider` / `sub_agent_model`
-4. 全局配置 `subagent.model.enabled=true` 时的 `subagent.model.provider` / `subagent.model.model`
-5. 父对话 provider/model
+4. 父对话 provider/model
 
-会话级和全局级开关关闭时只保存配置值，不参与解析。所有启用状态都会经过已配置 provider/model 校验，避免子代理启动后才发现模型不可用。
+会话级开关关闭时只保存配置值，不参与解析。启用状态会经过已配置 provider/model 校验，避免子代理启动后才发现模型不可用。
 
 ### 4.2 图片识别共享
 

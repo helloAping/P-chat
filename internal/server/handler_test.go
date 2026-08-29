@@ -1707,44 +1707,6 @@ func TestPatchSession_RejectsBadSubAgentModel(t *testing.T) {
 	}
 }
 
-func TestSystemConfig_SubAgentModelRoundTrip(t *testing.T) {
-	srv, _ := newTestServer(t)
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", bytes.NewBufferString(`{"sub_agent":{"model":{"enabled":true,"provider":"cs","model":"doubao-pro"}}}`))
-	req.Header.Set("Content-Type", "application/json")
-	srv.engine.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
-	}
-	var got systemConfigResponse
-	_ = json.NewDecoder(w.Body).Decode(&got)
-	if !got.SubAgent.Model.Enabled || got.SubAgent.Model.Provider != "cs" || got.SubAgent.Model.Model != "doubao-pro" {
-		t.Fatalf("system sub-agent model response = %+v", got.SubAgent.Model)
-	}
-
-	reloaded, err := config.Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reloaded.SubAgent.Model.Enabled || reloaded.SubAgent.Model.Provider != "cs" || reloaded.SubAgent.Model.Model != "doubao-pro" {
-		t.Fatalf("persisted sub-agent model config = %+v", reloaded.SubAgent.Model)
-	}
-}
-
-func TestSystemConfig_RejectsBadSubAgentModel(t *testing.T) {
-	srv, _ := newTestServer(t)
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", bytes.NewBufferString(`{"sub_agent":{"model":{"enabled":true,"provider":"openai","model":"doubao-pro"}}}`))
-	req.Header.Set("Content-Type", "application/json")
-	srv.engine.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "sub-agent model") {
-		t.Fatalf("body = %s, want sub-agent model validation error", w.Body.String())
-	}
-}
-
 func TestPatchSession_RejectsUseImageRecognitionWhenGloballyDisabled(t *testing.T) {
 	srv, cfg := newTestServer(t)
 	cfg.Vision.Enabled = false

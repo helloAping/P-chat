@@ -1992,11 +1992,6 @@ export interface LimitsConfig {
 export interface SubAgentConfig {
   cache_ttl: string
   timeout: string
-  model: {
-    enabled: boolean
-    provider: string
-    model: string
-  }
 }
 
 export interface WorkModeConfig {

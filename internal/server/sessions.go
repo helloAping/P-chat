@@ -826,25 +826,6 @@ func deref(s *string) string {
 	return *s
 }
 
-func (h *Handler) validateSystemConfigPatch(patch config.SystemConfigPatch) error {
-	if patch.SubAgent == nil || patch.SubAgent.Model == nil {
-		return nil
-	}
-	next := h.getCfg().SubAgent.Model
-	model := patch.SubAgent.Model
-	if model.Enabled != nil {
-		next.Enabled = *model.Enabled
-	}
-	if model.Provider != nil {
-		next.Provider = *model.Provider
-	}
-	if model.Model != nil {
-		next.Model = *model.Model
-	}
-	next.Normalize()
-	return h.validateSubAgentModelSelection(next.Enabled, next.Provider, next.Model)
-}
-
 func (h *Handler) validateSubAgentModelSelection(enabled bool, provider, model string) error {
 	if !enabled {
 		return nil

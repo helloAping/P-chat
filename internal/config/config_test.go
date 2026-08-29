@@ -164,55 +164,6 @@ func TestSubAgentConfig_CacheTTL(t *testing.T) {
 	}
 }
 
-func TestUpdateSystemConfig_MergesSubAgentModel(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("USERPROFILE", dir)
-	t.Setenv("HOME", dir)
-
-	initial := `{
-  "llm": {
-    "default": "cs",
-    "providers": [
-      { "name": "cs", "protocol": "openai", "base_url": "http://example.com/v1", "api_key": "sk-x", "models": [{ "name": "base", "default": true }, { "name": "worker" }] }
-    ]
-  },
-  "subagent": { "cache_ttl": "5m", "timeout": "30m" }
-}`
-	if err := osWriteFile(filepath.Join(dir, ".p-chat", "config.json"), initial); err != nil {
-		t.Fatal(err)
-	}
-
-	enabled := true
-	provider := " cs "
-	model := " worker "
-	updated, err := UpdateSystemConfig(SystemConfigPatch{
-		SubAgent: &SubAgentConfigPatch{
-			Model: &SubAgentModelConfigPatch{
-				Enabled:  &enabled,
-				Provider: &provider,
-				Model:    &model,
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("UpdateSystemConfig: %v", err)
-	}
-	if updated.SubAgent.CacheTTL != "5m" || updated.SubAgent.Timeout != "30m" {
-		t.Fatalf("sub-agent cache/timeout should be preserved, got %+v", updated.SubAgent)
-	}
-	if !updated.SubAgent.Model.Enabled || updated.SubAgent.Model.Provider != "cs" || updated.SubAgent.Model.Model != "worker" {
-		t.Fatalf("sub-agent model config = %+v", updated.SubAgent.Model)
-	}
-
-	reloaded, err := Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reloaded.SubAgent.Model.Enabled || reloaded.SubAgent.Model.Provider != "cs" || reloaded.SubAgent.Model.Model != "worker" {
-		t.Fatalf("reloaded sub-agent model config = %+v", reloaded.SubAgent.Model)
-	}
-}
-
 func TestProviderConfig_MultiModel(t *testing.T) {
 	p := ProviderConfig{
 		Name:    "openai",
@@ -580,10 +531,6 @@ llm:
           max_tokens_context: 128000
 subagent:
   cache_ttl: 7m
-  model:
-    enabled: true
-    provider: cs
-    model: deepseek-v4-flash
 `
 	if err := osWriteFile(yamlPath, yamlContent); err != nil {
 		t.Fatal(err)
@@ -611,9 +558,6 @@ subagent:
 	}
 	if cfg.SubAgent.CacheTTL != "7m" {
 		t.Errorf("subagent cache_ttl = %q, want 7m", cfg.SubAgent.CacheTTL)
-	}
-	if !cfg.SubAgent.Model.Enabled || cfg.SubAgent.Model.Provider != "cs" || cfg.SubAgent.Model.Model != "deepseek-v4-flash" {
-		t.Errorf("subagent model not migrated: %+v", cfg.SubAgent.Model)
 	}
 
 	// After migration, the JSON file should exist.

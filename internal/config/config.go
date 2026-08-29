@@ -154,17 +154,16 @@ func (m TodoLongRunMode) AllowsUnlimitedRounds(hasActiveTodos bool) bool {
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
 //
 // Visibility is first capped by the execution-safe set
-// (tool.SubagentMayExpose): local reads, todo_write, web_search, and
-// web_fetch. AllowedTools then further restricts that set; when
+// (tool.SubagentMayExpose): local reads, todo_write, image_recognize,
+// web_search, and web_fetch. AllowedTools then further restricts that set; when
 // empty, all execution-safe parent tools except DeniedTools are
 // passed. The `task` family and `recall` are always excluded.
 //
 // DeniedTools is a blacklist applied when AllowedTools is empty.
 // Default denies `exec_command` as defense in depth.
 type SubAgentConfig struct {
-	AllowedTools []string            `json:"allowed_tools,omitempty"`
-	DeniedTools  []string            `json:"denied_tools,omitempty"`
-	Model        SubAgentModelConfig `json:"model,omitempty"`
+	AllowedTools []string `json:"allowed_tools,omitempty"`
+	DeniedTools  []string `json:"denied_tools,omitempty"`
 
 	// Timeout is the optional per-sub-agent wall-clock execution cap.
 	// Parsed from JSON (e.g. "30m", "5m"). Empty, zero, or invalid
@@ -181,24 +180,6 @@ type SubAgentConfig struct {
 	// CacheTTL is how long a sub-agent result stays cached. Parsed
 	// from JSON. Zero disables caching.
 	CacheTTL string `json:"cache_ttl,omitempty"`
-}
-
-// SubAgentModelConfig selects an optional default model for sub-agents.
-// When disabled or incomplete, sub-agents inherit the parent turn's model.
-type SubAgentModelConfig struct {
-	Enabled  bool   `json:"enabled"`
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
-}
-
-// Normalize trims string fields. Disabled configs may keep Provider/Model so
-// the UI can restore the last choice when the user re-enables the override.
-func (m *SubAgentModelConfig) Normalize() {
-	if m == nil {
-		return
-	}
-	m.Provider = strings.TrimSpace(m.Provider)
-	m.Model = strings.TrimSpace(m.Model)
 }
 
 // TimeoutDuration returns the parsed timeout. A non-positive result means
@@ -930,7 +911,6 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	migrateKnowledgeDefaults(cfg)
 	cfg.UI.CloseBehavior = cfg.UI.CloseBehavior.Normalize()
 	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
-	cfg.SubAgent.Model.Normalize()
 	cfg.Vision.Normalize()
 
 	return cfg, nil

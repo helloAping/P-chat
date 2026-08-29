@@ -130,17 +130,11 @@ sandbox:
 #   cumulative failure breaker, and the sub-agent round cap.
 # - `cache_ttl`: how long identical (description, style, provider) results
 #   are reused. Default: "5m". Set to "0s" to disable caching.
-# - `model.enabled`: when true, sub-agents use the configured provider/model
-#   unless a task call or specialized agent explicitly overrides it.
 subagent:
   denied_tools:
     - "exec_command"
   timeout: ""
   cache_ttl: "5m"
-  model:
-    enabled: false
-    provider: ""
-    model: ""
   # Example: only allow local read tools (whitelist mode)
   # allowed_tools:
   #   - "read_file"

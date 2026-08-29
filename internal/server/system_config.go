@@ -19,15 +19,8 @@ type limitsResponse struct {
 }
 
 type subAgentResponse struct {
-	CacheTTL string                `json:"cache_ttl"`
-	Timeout  string                `json:"timeout"`
-	Model    subAgentModelResponse `json:"model"`
-}
-
-type subAgentModelResponse struct {
-	Enabled  bool   `json:"enabled"`
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	CacheTTL string `json:"cache_ttl"`
+	Timeout  string `json:"timeout"`
 }
 
 type workModeResponse struct {
@@ -79,16 +72,9 @@ func visionRecognitionToResp(v config.VisionRecognitionConfig) visionRecognition
 }
 
 func subAgentToResp(s config.SubAgentConfig) subAgentResponse {
-	model := s.Model
-	model.Normalize()
 	return subAgentResponse{
 		CacheTTL: s.CacheTTL,
 		Timeout:  s.Timeout,
-		Model: subAgentModelResponse{
-			Enabled:  model.Enabled,
-			Provider: model.Provider,
-			Model:    model.Model,
-		},
 	}
 }
 
@@ -121,10 +107,6 @@ func (h *Handler) UpdateSystemConfig(c *gin.Context) {
 	var patch config.SystemConfigPatch
 	if err := c.ShouldBindJSON(&patch); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
-		return
-	}
-	if err := h.validateSystemConfigPatch(patch); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	updated, err := config.UpdateSystemConfig(patch)

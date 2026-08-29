@@ -16,16 +16,8 @@ type LimitsConfigPatch struct {
 
 // SubAgentConfigPatch is a partial update for SubAgentConfig.
 type SubAgentConfigPatch struct {
-	CacheTTL *string                   `json:"cache_ttl,omitempty"`
-	Timeout  *string                   `json:"timeout,omitempty"`
-	Model    *SubAgentModelConfigPatch `json:"model,omitempty"`
-}
-
-// SubAgentModelConfigPatch is a partial update for SubAgentModelConfig.
-type SubAgentModelConfigPatch struct {
-	Enabled  *bool   `json:"enabled,omitempty"`
-	Provider *string `json:"provider,omitempty"`
-	Model    *string `json:"model,omitempty"`
+	CacheTTL *string `json:"cache_ttl,omitempty"`
+	Timeout  *string `json:"timeout,omitempty"`
 }
 
 // WorkModeConfigPatch is a partial update for WorkModeConfig.
@@ -122,22 +114,6 @@ func mergeSubAgent(s *SubAgentConfig, p *SubAgentConfigPatch) {
 	if p.Timeout != nil {
 		s.Timeout = *p.Timeout
 	}
-	if p.Model != nil {
-		mergeSubAgentModel(&s.Model, p.Model)
-	}
-}
-
-func mergeSubAgentModel(m *SubAgentModelConfig, p *SubAgentModelConfigPatch) {
-	if p.Enabled != nil {
-		m.Enabled = *p.Enabled
-	}
-	if p.Provider != nil {
-		m.Provider = *p.Provider
-	}
-	if p.Model != nil {
-		m.Model = *p.Model
-	}
-	m.Normalize()
 }
 
 func mergeWorkMode(w *WorkModeConfig, p *WorkModeConfigPatch) {
