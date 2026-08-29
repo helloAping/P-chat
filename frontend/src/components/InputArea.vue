@@ -12,8 +12,8 @@ import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
-  Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
-  Lock, Unlock, Key, Database, Copy, Scissors, ClipboardPaste, TextCursorInput,
+  Undo2, FileText, File, Sparkles, ChevronDown,
+  Lock, Unlock, Key, Copy, Scissors, ClipboardPaste, TextCursorInput,
   Settings, HelpCircle,
 } from './icons'
 import * as api from '../api/client'
@@ -160,21 +160,11 @@ function onToggleMute() {
 // --- knowledge base selector ---
 const kbBases = ref<api.KnowledgeBaseItem[]>([])
 const kbOptions = computed(() => [
-  { label: '知识库 · 不使用', value: '__off__' },
-  { label: '知识库 · 全部', value: '__all__' },
-  ...kbBases.value.filter(b => b.enabled).map(b => ({ label: `知识库 · ${b.name}`, value: b.name })),
+  { label: '不使用', value: '__off__' },
+  { label: '全部知识库', value: '__all__' },
+  ...kbBases.value.filter(b => b.enabled).map(b => ({ label: b.name, value: b.name })),
 ])
-const kbMenuOptions = computed<DropdownOption[]>(() =>
-  kbOptions.value.map((opt) => ({
-    label: opt.value === '__off__'
-      ? '不使用知识库'
-      : opt.value === '__all__'
-        ? '全部知识库'
-        : opt.value,
-    key: opt.value,
-    icon: menuIcon(Database),
-  })),
-)
+const enabledKBCount = computed(() => kbBases.value.filter(b => b.enabled).length)
 const kbBase = computed({
   get: () => {
     if (!state.currentID) return '__off__'
@@ -1400,10 +1390,6 @@ const currentReasoningLabel = computed(() => {
   return REASONING_LABELS[v] || v
 })
 
-const sessionConfigSummary = computed(() =>
-  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 识图${imageRecognitionLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
-)
-
 // Display label for the knowledge base picker. The "off"
 // and "all" pseudo-bases get short labels so the button
 // stays narrow; a real base name shows as-is.
@@ -1416,6 +1402,10 @@ const currentKBLabel = computed(() => {
   if (KB_LABELS[v]) return KB_LABELS[v]
   return v
 })
+
+const sessionConfigSummary = computed(() =>
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 知识库${currentKBLabel.value} · 识图${imageRecognitionLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
+)
 
 // Setter wrappers for the NDropdown @select handler.
 // The handlers receive (key: string | number), but Vue's
@@ -1440,14 +1430,6 @@ function openModelPicker() {
   if (!state.currentID) return
   showModelPicker.value = true
 }
-
-// showAdvanced toggles the "更多" secondary row that
-// hosts the KB picker. Default collapsed: the KB is a
-// less-touched setting (the user usually picks one KB
-// per project and rarely changes it) so the row stays
-// out of the way. Reasoning used to live here too but
-// was promoted to the input-row in PR #10.
-const showAdvanced = ref(false)
 
 // Permission-level picker: small icon-only popover that
 // shows a 3-option list (always-ask / auto-approve /
@@ -1577,11 +1559,9 @@ onMounted(() => {
       @change="onFiles(($event.target as HTMLInputElement).files)"
     />
 
-    <!-- Bottom row: compact high-frequency controls + collapsible
-         "more" section. The four always-visible controls
-         (model / plan / permission / mute) are the ones the
-         user touches on most messages. Reasoning + KB
-         live behind the ⋯ button by default. -->
+    <!-- Bottom row: compact high-frequency controls. Session-scoped
+         settings that need more explanation live behind the
+         会话设置 popover. -->
     <div class="input-bottom">
       <div class="input-primary">
         <!-- Model badge: the current model name with a sparkle
@@ -1631,7 +1611,7 @@ onMounted(() => {
             >
               <Settings :size="13" />
               <span class="ctrl-btn-label">会话设置</span>
-              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 识图{{ imageRecognitionLabel }} · 子代理{{ subAgentModelLabel }}</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 知识库{{ currentKBLabel }} · 识图{{ imageRecognitionLabel }} · 子代理{{ subAgentModelLabel }}</span>
             </button>
           </template>
           <div class="session-config-popover">
@@ -1693,6 +1673,50 @@ onMounted(() => {
                 >
                   {{ opt.label }}
                 </button>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">
+                <span>知识库</span>
+                <NPopover
+                  trigger="hover"
+                  placement="right"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="知识库说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">知识库</div>
+                    <p>控制当前会话是否接入本地知识库检索。开启后，助手可以按需调用 wiki_lookup / wiki_list 查找已扫描资料。</p>
+                    <p>“全部知识库”会检索所有已启用知识库；选择单个知识库时，只检索那一个库。</p>
+                    <p>知识库的新增、路径、扫描和启用状态在“应用设置 > 知识库”里管理。</p>
+                  </div>
+                </NPopover>
+              </div>
+              <div class="session-config-options">
+                <button
+                  v-for="opt in kbOptions"
+                  :key="opt.value"
+                  type="button"
+                  class="session-config-choice session-config-choice--kb"
+                  :class="{ 'session-config-choice--active': kbBase === opt.value }"
+                  :title="opt.label"
+                  @click="pickKB(opt.value)"
+                >
+                  <span class="session-config-choice-label">{{ opt.label }}</span>
+                </button>
+                <div v-if="enabledKBCount === 0" class="session-config-hint">
+                  还没有启用的知识库，可到“应用设置 > 知识库”添加或启用。
+                </div>
               </div>
             </div>
 
@@ -1966,65 +1990,7 @@ onMounted(() => {
         >
           <component :is="mute ? VolumeX : Volume2" :size="13" />
         </button>
-
-        <!-- More toggle: expands the secondary row with
-             the KB picker. The chevron rotates to
-             indicate the expanded state. Reasoning used
-             to live here too but was promoted to the
-             input-row in PR #10 (next to the style
-             picker) because it's a setting the user
-             touches on most tasks; KB stays in "more"
-             because it's changed less often and the
-             label can be long ("知识库 · {name}"),
-             which would crowd the input-row. The
-             expanded state uses the same .opt-pick
-             styling as the input-row pickers so the
-             three read as a coherent family. -->
-        <button
-          type="button"
-          class="ctrl-btn ctrl-btn--more"
-          :class="{ 'ctrl-btn--expanded': showAdvanced }"
-          :title="showAdvanced ? '收起高级选项' : '展开高级选项'"
-          :aria-label="showAdvanced ? '收起高级选项' : '展开高级选项'"
-          :aria-expanded="showAdvanced"
-          @click="showAdvanced = !showAdvanced"
-        >
-          <component :is="showAdvanced ? ChevronUp : ChevronDown" :size="13" />
-          <span class="ctrl-btn-label">更多</span>
-        </button>
       </div>
-
-      <!-- Secondary row: KB picker. Collapsed by default.
-           Uses the same .opt-pick visual treatment as the
-           input-row style + reasoning pickers so it reads
-           as part of the same family, not a different
-           control. The .input-advanced wrapper still
-           provides the surface-1 background + border so
-           the row reads as visually subordinate (a
-           "secondary" surface) even though its controls
-           match the primary surface. -->
-      <Transition name="row-slide">
-        <div v-if="showAdvanced" class="input-advanced">
-          <NDropdown
-            trigger="click"
-            placement="top-end"
-            :options="kbMenuOptions"
-            @select="(key: string | number) => pickKB(String(key))"
-          >
-            <button
-              type="button"
-              class="opt-pick"
-              :disabled="!state.currentID"
-              :title="`知识库: ${currentKBLabel}`"
-              :aria-label="`知识库: ${currentKBLabel}`"
-            >
-              <Database :size="12" class="opt-pick-icon" />
-              <span class="opt-pick-label">{{ currentKBLabel }}</span>
-              <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
-            </button>
-          </NDropdown>
-        </div>
-      </Transition>
 
       <!-- Keyboard hints: live at the very bottom, always
            visible. Aligns to the right so the rest of the
@@ -2228,73 +2194,6 @@ onMounted(() => {
   margin: 0;
   padding: 8px 0 8px 0;
 }
-.opt-pick {
-  /* The session-level option pickers (style, reasoning, KB)
-   * share the same visual treatment: a compact pill button
-   * with the current value as a label and a small chevron
-   * on the right. They live in the input-row next to the
-   * textarea, so they need to be narrow and quiet — no
-   * border, no NSelect chrome, just a text label that gets
-   * a subtle background on hover.
-   *
-   * Originally named `.style-pick` (just for the style
-   * picker); renamed to `.opt-pick` in PR #10 when
-   * reasoning and KB were promoted from the "more" advanced
-   * row to the input-row. The `.opt-pick--narrow` modifier
-   * is used for reasoning because its labels (关闭/低/中/高/
-   * 最高) are very short and a smaller min-width keeps the
-   * three pickers visually balanced. */
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 28px;
-  padding: 0 8px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-family: var(--font-mono);
-  cursor: pointer;
-  flex-shrink: 0;
-  white-space: nowrap;
-  min-width: 56px;
-  justify-content: center;
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out);
-}
-.opt-pick:hover:not(:disabled) {
-  background: var(--surface-3);
-  color: var(--text-primary);
-}
-.opt-pick:disabled { opacity: 0.5; cursor: not-allowed; }
-.opt-pick-caret { color: var(--text-tertiary); flex-shrink: 0; }
-.opt-pick-label {
-  /* Cap on label width so a long KB name (e.g.
-   * "知识库 · 我的资料库") doesn't push the send button off
-   * the row. When the label overflows, ellipsis kicks in
-   * and the user can still read the full name in the
-   * dropdown. */
-  max-width: 72px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.opt-pick--narrow {
-  /* Reasoning labels are 1–2 characters, so the regular
-   * 56px min-width looks oversized. Tighter min keeps the
-   * three pickers visually balanced. */
-  min-width: 36px;
-}
-.opt-pick--narrow .opt-pick-label {
-  max-width: 28px;
-}
-/* Small inline icon (e.g. the database glyph on the KB
- * picker). Slightly muted so it doesn't compete with the
- * label. */
-.opt-pick-icon {
-  color: var(--text-tertiary);
-  flex-shrink: 0;
-}
 .send-btn, .stop-btn {
   width: 32px; height: 32px;
   border: none; border-radius: var(--radius-md);
@@ -2334,18 +2233,14 @@ onMounted(() => {
   margin-right: 2px;
 }
 
-/* NSelects in the advanced row (reasoning + KB). */
 /* The input area's height is determined by its content: the
  * textarea (capped at 4 lines by resizeTextarea()), the
- * attach-strip (capped at 96px internally), and the
- * bottom controls (primary row + the "更多" advanced row
- * when expanded). Each child caps itself, so the area as
- * a whole can grow to whatever's needed without clipping
- * the dialog or pushing the messages-scroll out of the
- * way. The `flex-shrink: 0` ensures the message list
- * above gets compressed first if the viewport is
- * genuinely too small (we'd rather show fewer messages
- * than hide the input). */
+ * attach-strip (capped internally), and the bottom controls.
+ * Each child caps itself, so the area as a whole can grow
+ * to whatever's needed without clipping the dialog or
+ * pushing the messages-scroll out of the way. The
+ * `flex-shrink: 0` ensures the message list above gets
+ * compressed first if the viewport is genuinely too small. */
 .input-area {
   border-top: 1px solid var(--border);
   background: var(--bg-2);
@@ -2364,42 +2259,8 @@ onMounted(() => {
   gap: 4px;
   flex-wrap: wrap;
 }
-.input-advanced {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding: 6px 8px;
-  background: var(--surface-1);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-}
 
-/* Slide-down transition for the advanced row. Tied to the
- * <Transition name="row-slide"> in the template. The classes
- * are named in the Vue 2 / 3 transition convention. */
-.row-slide-enter-active {
-  transition: max-height var(--dur-base) var(--ease-out),
-              opacity var(--dur-base) var(--ease-out);
-  overflow: hidden;
-}
-.row-slide-leave-active {
-  transition: max-height var(--dur-fast) var(--ease-in),
-              opacity var(--dur-fast) var(--ease-in);
-  overflow: hidden;
-}
-.row-slide-enter-from,
-.row-slide-leave-to {
-  max-height: 0;
-  opacity: 0;
-}
-.row-slide-enter-to,
-.row-slide-leave-from {
-  max-height: 80px;
-  opacity: 1;
-}
-
-/* --- Bottom-row buttons (plan / perm / mute / more) --------------- */
+/* --- Bottom-row buttons (session config / plan / perm / mute) ------ */
 /* Generic pill-button style used for the always-visible
  * bottom-row controls. The button is transparent by
  * default and picks up an active background when the
@@ -2444,10 +2305,6 @@ onMounted(() => {
 .ctrl-btn--active-warn {
   background: var(--warn-50);
   color: var(--warn-500);
-}
-.ctrl-btn--more.ctrl-btn--expanded {
-  background: var(--surface-2);
-  border-color: var(--border-subtle);
 }
 .ctrl-btn-label {
   font-size: 12px;
@@ -2640,7 +2497,8 @@ onMounted(() => {
   color: var(--text-quaternary);
   cursor: not-allowed;
 }
-.session-config-choice--model {
+.session-config-choice--model,
+.session-config-choice--kb {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);

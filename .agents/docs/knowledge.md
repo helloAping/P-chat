@@ -26,7 +26,7 @@
 ┌─────────────────────────────────────────────────────────┐
 │ 前端                                                        │
 │ ┌──────────────────────┐  ┌────────────────────────────┐ │
-│ │ AppSettingsModal      │  │ InputArea (KB 选择器)        │ │
+│ │ AppSettingsModal      │  │ InputArea 会话设置            │ │
 │ │ · 知识库 Tab           │  │ · __off__ / __all__ / base   │ │
 │ │ · 三层树视图            │  │ · 写入 sessionMeta.knowledge │ │
 │ │ · 扫描/清除按钮         │  │   _base                     │ │
@@ -434,7 +434,7 @@ func resolveBases(kc *KnowledgeConfig, name string) []KnowledgeBase
 ### 9.1 数据流
 
 ```
-InputArea KB 选择器
+InputArea 会话设置 > 知识库
     ↓ sessionMeta.knowledge_base = "__off__" / "__all__" / "base_name"
 POST /api/v1/sessions/:id/messages
     ↓ chatReq.KBBase = meta.KnowledgeBase
@@ -561,7 +561,7 @@ LLM 收到错误 → 自行决策
 - L3 节点显示 title + overview + content count
 - L1 节点以卡片形式展示 overview 概览
 
-### 11.2 KB 选择器（`InputArea.vue`）
+### 11.2 会话级 KB 选择（`InputArea.vue`）
 
 ```
 [不使用 ▾]
@@ -709,7 +709,7 @@ pchat-server 启动
 | `internal/config/knowledge_config.go` | 配置持久化操作 |
 | `internal/recall/stub.go` | recall 工具 stub |
 | `frontend/src/components/AppSettingsModal.vue` | 知识库 Tab UI（左右分栏 + 三层树视图 + NCollapse） |
-| `frontend/src/components/InputArea.vue` | KB 选择器 UI |
+| `frontend/src/components/InputArea.vue` | 会话设置 popover + KB 选择 UI |
 | `frontend/src/api/client.ts` | 前端类型 + API 调用（含 NodeTreeItem + NodeContentItem） |
 | `frontend/src/stores/chat.ts` | sessionMeta 状态管理 |
 
