@@ -27,6 +27,8 @@ import (
 	"github.com/p-chat/pchat/internal/tool"
 )
 
+const maxKBIndexPromptRunes = 2000
+
 func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolDefs []llm.ToolDef, availableTools []tool.Tool, projectRoot string, kbEnabled bool) (string, string, error) {
 	// 2026-07: if the session's projectRoot has changed
 	// since the last call (user switched projects
@@ -465,8 +467,8 @@ func appendWorkingDirectoryBlock(projectRoot string) string {
 // buildKBIndex builds the Knowledge Base section of the system prompt.
 // When KBBase is "__all__", all enabled bases are listed. When it's a
 // specific name, only that base's index is shown. If the base has no
-// sections, a placeholder is returned. The output is truncated at 3000
-// characters to avoid prompt explosion. Results are cached for 60s to
+// sections, a placeholder is returned. The output is truncated at 2000
+// characters to avoid prompt explosion. Results are cached for 30s to
 // avoid repeated full-DB scans per message turn.
 // Uses the L1 overview from the three-level index tree.
 func (a *Agent) buildKBIndex(kbBase string) string {
@@ -521,10 +523,18 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 		return result
 	}
 
-	// Append tool usage footer.
-	sb.WriteString("\n\n使用 wiki_lookup(query, base, page, size) 检索，默认 20 条/页。")
-	sb.WriteString("query=空 浏览目录；query=关键词 搜索匹配；expand=true 获取全文；继续展开节点时用 wiki_list(parent_id, base)。")
-	result := sb.String()
+	footer := "\n\n使用 wiki_lookup(query, base, page, size) 检索，默认 20 条/页。" +
+		"query=空 浏览目录；query=关键词 搜索匹配；expand=true 获取全文；继续展开节点时用 wiki_list(parent_id, base)。"
+	result := sb.String() + footer
+	if len([]rune(result)) > maxKBIndexPromptRunes {
+		notice := "\n\n[Knowledge Base index truncated; use wiki_lookup/wiki_list for details.]"
+		bodyBudget := maxKBIndexPromptRunes - len([]rune(notice)) - len([]rune(footer))
+		body, _ := knowledge.TruncateTextWithFlag(sb.String(), bodyBudget)
+		result = body + notice + footer
+		if len([]rune(result)) > maxKBIndexPromptRunes {
+			result, _ = knowledge.TruncateTextWithFlag(result, maxKBIndexPromptRunes)
+		}
+	}
 	a.kbIndexCache = result
 	a.kbIndexCacheKey = kbBase
 	a.kbIndexCacheTime = nowUnix

@@ -92,6 +92,17 @@ func TestTruncateTextIsRuneSafe(t *testing.T) {
 	}
 }
 
+func TestTruncateTextWithFlag(t *testing.T) {
+	got, truncated := TruncateTextWithFlag("你好世界", 3)
+	if got != "你好世" || !truncated {
+		t.Fatalf("TruncateTextWithFlag() = (%q, %v), want truncated prefix", got, truncated)
+	}
+	got, truncated = TruncateTextWithFlag("hi", 3)
+	if got != "hi" || truncated {
+		t.Fatalf("TruncateTextWithFlag(short) = (%q, %v), want unchanged", got, truncated)
+	}
+}
+
 func TestGetOrOpenWikiStore_Cache(t *testing.T) {
 	dir := t.TempDir()
 	ws1, err := GetOrOpenWikiStore("testcache", dir)

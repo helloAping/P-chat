@@ -1891,6 +1891,8 @@ export interface KnowledgeSearchResult {
   content: string
   similarity: number
   rank: number
+  content_truncated?: boolean
+  content_full_chars?: number
   /** KB-01: originating knowledge base name */
   base?: string
   title?: string
@@ -1904,8 +1906,27 @@ export interface KnowledgeSearchResult {
   citation?: KnowledgeCitation
 }
 
+export interface KnowledgeSearchStats {
+  top_k: number
+  requested_top_k?: number
+  top_k_capped?: boolean
+  per_base_limit?: number
+  bases?: string[]
+  bases_searched?: number
+  query_count?: number
+  raw_matches?: number
+  candidates?: number
+  merged_candidates?: number
+  returned?: number
+  grep_appended?: number
+  content_preview_chars?: number
+  content_truncated?: number
+  has_more?: boolean
+  truncated?: boolean
+}
+
 export const searchKnowledge = (query: string, topK?: number, bases?: string[]) =>
-  jsonFetch<{ query: string; queries?: string[]; results: KnowledgeSearchResult[] }>(
+  jsonFetch<{ query: string; queries?: string[]; results: KnowledgeSearchResult[]; stats?: KnowledgeSearchStats }>(
     '/api/v1/knowledge/search',
     {
       method: 'POST',

@@ -90,7 +90,7 @@ func TestIndexScanHonorsKnowledgeBaseFilters(t *testing.T) {
 		Path:            dir,
 		Enabled:         true,
 		FileTypes:       []string{".md"},
-		ExcludePatterns: []string{"ignored.md", "docs/**"},
+		ExcludePatterns: []string{"ignored.md", `docs\**`},
 		MaxFileSize:     32,
 	}
 	if got := countIndexableFiles(dir, base); got != 1 {

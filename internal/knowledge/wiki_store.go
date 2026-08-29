@@ -1517,17 +1517,23 @@ func (ws *WikiStore) MigrateBaseToIndex(ctx context.Context, base string) (int, 
 
 // TruncateText clips s to max runes, appending nothing.
 func TruncateText(s string, max int) string {
+	out, _ := TruncateTextWithFlag(s, max)
+	return out
+}
+
+// TruncateTextWithFlag clips s to max runes and reports whether it changed.
+func TruncateTextWithFlag(s string, max int) (string, bool) {
 	if max <= 0 {
-		return ""
+		return "", s != ""
 	}
 	if len(s) <= max {
-		return s
+		return s, false
 	}
 	rs := []rune(s)
 	if len(rs) <= max {
-		return s
+		return s, false
 	}
-	return string(rs[:max])
+	return string(rs[:max]), true
 }
 
 func truncateStr(s string, max int) string {

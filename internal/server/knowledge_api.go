@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -479,6 +478,11 @@ func (h *Handler) DeleteNode(c *gin.Context) {
 // always queried so a strong match in base N is not drowned by
 // weak matches in base 1.
 func (h *Handler) SearchKnowledge(c *gin.Context) {
+	const (
+		maxKnowledgeSearchTopK         = 50
+		maxKnowledgeSearchContentRunes = 2000
+	)
+
 	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
@@ -500,25 +504,41 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 	if req.TopK <= 0 {
 		req.TopK = 5
 	}
+	requestedTopK := req.TopK
+	if req.TopK > maxKnowledgeSearchTopK {
+		req.TopK = maxKnowledgeSearchTopK
+	}
 
 	kc := h.getCfg().Knowledge
 	if !kc.Enabled || len(kc.Bases) == 0 {
-		c.JSON(http.StatusOK, gin.H{"query": req.Query, "results": []any{}})
+		c.JSON(http.StatusOK, gin.H{
+			"query":   req.Query,
+			"results": []any{},
+			"stats": gin.H{
+				"top_k":      req.TopK,
+				"returned":   0,
+				"truncated":  requestedTopK > req.TopK,
+				"has_more":   false,
+				"candidates": 0,
+			},
+		})
 		return
 	}
 
 	ctx := c.Request.Context()
 	type resultItem struct {
-		Source      string             `json:"source"`
-		Content     string             `json:"content"`
-		Similarity  float64            `json:"similarity"`
-		Rank        int                `json:"rank"`
-		Base        string             `json:"base,omitempty"`
-		Title       string             `json:"title,omitempty"`
-		MatchType   string             `json:"match_type,omitempty"`
-		Query       string             `json:"query,omitempty"`
-		Explanation string             `json:"explanation,omitempty"`
-		Citation    knowledge.Citation `json:"citation"`
+		Source           string             `json:"source"`
+		Content          string             `json:"content"`
+		Similarity       float64            `json:"similarity"`
+		Rank             int                `json:"rank"`
+		Base             string             `json:"base,omitempty"`
+		Title            string             `json:"title,omitempty"`
+		MatchType        string             `json:"match_type,omitempty"`
+		Query            string             `json:"query,omitempty"`
+		Explanation      string             `json:"explanation,omitempty"`
+		Citation         knowledge.Citation `json:"citation"`
+		ContentTruncated bool               `json:"content_truncated,omitempty"`
+		ContentFullChars int                `json:"content_full_chars,omitempty"`
 	}
 
 	// Resolve which bases to search.
@@ -534,6 +554,8 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		queries = []string{req.Query}
 	}
 	var candidates []knowledge.IndexSearchItem
+	var searchedBases []string
+	rawTotal := 0
 	// Per-base window: fetch more than TopK so merge has headroom
 	// after normalisation + dedupe. Cap at 50 (LookupSearch max).
 	perBase := req.TopK * 3
@@ -555,6 +577,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 			log.Printf("[search] open wiki store %q: %v", base.Name, err)
 			continue
 		}
+		searchedBases = append(searchedBases, base.Name)
 		for _, q := range queries {
 			res, err := store.LookupSearch(ctx, q, base.Name, true, 0, 1, perBase)
 			if err != nil {
@@ -564,6 +587,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 			if res == nil {
 				continue
 			}
+			rawTotal += res.Total
 			items := knowledge.TagBase(res.Items, base.Name)
 			for i := range items {
 				if items[i].Query == "" {
@@ -574,9 +598,15 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		}
 	}
 
-	merged := knowledge.MergeAndRerank(candidates, knowledge.MergeOptions{TopK: req.TopK})
+	mergedAll := knowledge.MergeAndRerank(candidates, knowledge.MergeOptions{TopK: len(candidates)})
+	hasMore := len(mergedAll) > req.TopK || rawTotal > len(candidates)
+	merged := mergedAll
+	if len(merged) > req.TopK {
+		merged = merged[:req.TopK]
+	}
 
 	out := make([]resultItem, 0, len(merged))
+	contentTruncated := 0
 	for i, it := range merged {
 		content := it.Overview
 		if len(it.Children) > 0 {
@@ -587,24 +617,32 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		if content == "" {
 			content = it.Title
 		}
+		contentFullChars := len([]rune(content))
+		content, truncated := knowledge.TruncateTextWithFlag(content, maxKnowledgeSearchContentRunes)
+		if truncated {
+			contentTruncated++
+		}
 		citation := knowledge.BuildCitation(it)
 		out = append(out, resultItem{
-			Source:      it.Source,
-			Content:     content,
-			Similarity:  it.Rank,
-			Rank:        i + 1,
-			Base:        it.Base,
-			Title:       it.Title,
-			MatchType:   it.MatchType,
-			Query:       it.Query,
-			Explanation: citation.Explanation,
-			Citation:    citation,
+			Source:           it.Source,
+			Content:          content,
+			Similarity:       it.Rank,
+			Rank:             i + 1,
+			Base:             it.Base,
+			Title:            it.Title,
+			MatchType:        it.MatchType,
+			Query:            it.Query,
+			Explanation:      citation.Explanation,
+			Citation:         citation,
+			ContentTruncated: truncated,
+			ContentFullChars: contentFullChars,
 		})
 	}
 
 	// Grep actual files (appended after ranked hits, not re-ranked).
+	grepAppended := 0
 	if req.Grep != "" {
-		for _, gr := range grepKB(h.getCfg(), req.Grep, req.TopK) {
+		for _, gr := range grepKB(h.getCfg(), req.Grep, req.TopK, want) {
 			if len(out) >= req.TopK {
 				break
 			}
@@ -626,13 +664,36 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 				Explanation: citation.Explanation,
 				Citation:    citation,
 			})
+			grepAppended++
 		}
 	}
 
 	if len(out) > req.TopK {
 		out = out[:req.TopK]
 	}
-	c.JSON(http.StatusOK, gin.H{"query": req.Query, "queries": plan.Queries, "results": out})
+	c.JSON(http.StatusOK, gin.H{
+		"query":   req.Query,
+		"queries": plan.Queries,
+		"results": out,
+		"stats": gin.H{
+			"top_k":                 req.TopK,
+			"requested_top_k":       requestedTopK,
+			"top_k_capped":          requestedTopK > req.TopK,
+			"per_base_limit":        perBase,
+			"bases":                 searchedBases,
+			"bases_searched":        len(searchedBases),
+			"query_count":           len(queries),
+			"raw_matches":           rawTotal,
+			"candidates":            len(candidates),
+			"merged_candidates":     len(mergedAll),
+			"returned":              len(out),
+			"grep_appended":         grepAppended,
+			"content_preview_chars": maxKnowledgeSearchContentRunes,
+			"content_truncated":     contentTruncated,
+			"has_more":              hasMore,
+			"truncated":             hasMore || contentTruncated > 0 || requestedTopK > req.TopK,
+		},
+	})
 }
 
 // (removed: GetEmbedders — vector embedding system deprecated)
@@ -955,6 +1016,17 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
 				return filepath.SkipDir
 			}
+			if path != dir {
+				rel, _ := filepath.Rel(dir, path)
+				rel = filepath.ToSlash(rel)
+				var excludePatterns []string
+				if base != nil {
+					excludePatterns = base.ExcludePatterns
+				}
+				if knowledge.ExcludedByPatterns(rel, excludePatterns) {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
@@ -968,7 +1040,7 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 		if base != nil {
 			excludePatterns = base.ExcludePatterns
 		}
-		if excludedByKnowledgePatterns(rel, excludePatterns) {
+		if knowledge.ExcludedByPatterns(rel, excludePatterns) {
 			return nil
 		}
 		currentSources[rel] = true
@@ -1169,6 +1241,17 @@ func countIndexableFiles(dir string, base *config.KnowledgeBase) int {
 			if strings.HasPrefix(n, ".") || n == "node_modules" || n == "vendor" || n == ".git" {
 				return filepath.SkipDir
 			}
+			if p != dir {
+				rel, _ := filepath.Rel(dir, p)
+				rel = filepath.ToSlash(rel)
+				var excludePatterns []string
+				if base != nil {
+					excludePatterns = base.ExcludePatterns
+				}
+				if knowledge.ExcludedByPatterns(rel, excludePatterns) {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		if info.Size() > knowledgeBaseMaxFileSize(base) {
@@ -1182,7 +1265,7 @@ func countIndexableFiles(dir string, base *config.KnowledgeBase) int {
 			if base != nil {
 				excludePatterns = base.ExcludePatterns
 			}
-			if excludedByKnowledgePatterns(rel, excludePatterns) {
+			if knowledge.ExcludedByPatterns(rel, excludePatterns) {
 				return nil
 			}
 			count++
@@ -1198,7 +1281,7 @@ type grepResult struct {
 	Content string `json:"content"`
 }
 
-func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
+func grepKB(cfg *config.Config, pattern string, maxResults int, baseFilter map[string]bool) []grepResult {
 	if pattern == "" || maxResults <= 0 {
 		return nil
 	}
@@ -1207,6 +1290,9 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 	kc := cfg.Knowledge
 	for _, base := range kc.Bases {
 		if !base.Enabled {
+			continue
+		}
+		if len(baseFilter) > 0 && !baseFilter[base.Name] {
 			continue
 		}
 		absPath, err := filepath.Abs(base.Path)
@@ -1219,12 +1305,24 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 				if strings.HasPrefix(n, ".") || n == "node_modules" || n == "vendor" || n == ".git" {
 					return filepath.SkipDir
 				}
+				if walkErr == nil && info != nil && info.IsDir() && path != absPath {
+					rel, _ := filepath.Rel(absPath, path)
+					rel = filepath.ToSlash(rel)
+					if knowledge.ExcludedByPatterns(rel, base.ExcludePatterns) {
+						return filepath.SkipDir
+					}
+				}
 				return nil
 			}
 			if !knowledge.IndexableExtensions[strings.ToLower(filepath.Ext(path))] {
 				return nil
 			}
 			if info.Size() > 5*1024*1024 {
+				return nil
+			}
+			rel, _ := filepath.Rel(absPath, path)
+			rel = filepath.ToSlash(rel)
+			if knowledge.ExcludedByPatterns(rel, base.ExcludePatterns) {
 				return nil
 			}
 			f, err := os.Open(path)
@@ -1243,7 +1341,6 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 			for scanner.Scan() && len(out) < maxResults {
 				lineNum++
 				if strings.Contains(strings.ToLower(scanner.Text()), patternLower) {
-					rel, _ := filepath.Rel(absPath, path)
 					out = append(out, grepResult{
 						Path:    rel,
 						Line:    lineNum,
@@ -1287,35 +1384,6 @@ func knowledgeBaseAllowsExt(base *config.KnowledgeBase, ext string) bool {
 		}
 		if ft == ext {
 			return true
-		}
-	}
-	return false
-}
-
-func excludedByKnowledgePatterns(rel string, patterns []string) bool {
-	rel = filepath.ToSlash(strings.TrimSpace(rel))
-	if rel == "" {
-		return false
-	}
-	baseName := path.Base(rel)
-	for _, pat := range patterns {
-		pat = filepath.ToSlash(strings.TrimSpace(pat))
-		if pat == "" {
-			continue
-		}
-		if strings.HasSuffix(pat, "/**") {
-			prefix := strings.TrimSuffix(pat, "/**")
-			if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
-				return true
-			}
-		}
-		if matched, _ := path.Match(pat, rel); matched {
-			return true
-		}
-		if !strings.Contains(pat, "/") {
-			if matched, _ := path.Match(pat, baseName); matched {
-				return true
-			}
 		}
 	}
 	return false

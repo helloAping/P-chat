@@ -15,6 +15,7 @@
 | **SHA256 缓存** | 媒体描述 & LLM 文本总结均按内容哈希去重 |
 | **mtime 增量扫描** | 仅处理变更文件，未变文件跳过 |
 | **索引注入 prompt** | L1 级 overview 嵌入系统提示（≤2000 字符），LLM 有目标地检索而非盲目探索 |
+| **排除规则归一化** | `ExcludePatterns` 统一走 slash 路径匹配，扫描、统计、grep 行为一致 |
 | **双表共存** | 旧 `wiki_sections` + 新 `index_nodes` 并存，向后兼容，idempotent 迁移 |
 
 ---
@@ -169,6 +170,7 @@ func NewWikiStore(name, dir string) (*WikiStore, error)     // 打开/创建 wik
 func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) // 按规范化目录 + base name 缓存
 func (ws *WikiStore) Dir() string                          // 返回规范化目录
 func (ws *WikiStore) Close() error                         // 关闭连接
+func ExcludedByPatterns(rel string, patterns []string) bool // 统一排除规则匹配
 ```
 
 所有入口（扫描、API handler、对话工具）都应通过 `GetOrOpenWikiStore(name, dir)` 打开库，避免相对路径、`.`/`..` 或符号链接造成同一知识库对应多个 `wiki.db`/SQLite 连接。
@@ -286,7 +288,7 @@ walk directory
 ```
 walk directory
   └── process files:
-      ├── 按 file_types / exclude_patterns / max_file_size 过滤候选文件
+      ├── 按 file_types / ExcludedByPatterns / max_file_size 过滤候选文件
       ├── ScanModel 为空时走纯文本解析；配置后才调用 LLM 生成 keywords/overview
       ├── 解析 Markdown ##/### → 拆分为段
       ├── AI 解析 (如配了 ScanModel):
@@ -338,6 +340,14 @@ var MediaTypeExtensions = map[string][]string{
 - 30 分钟超时自动取消
 - 新扫描必须通过 `scanJobManager.Claim` 原子占用槽位；进度由 `scanJob.snapshot()` 共享，后台扫描写进度和前端 800ms 轮询都必须走带锁方法
 
+### 6.7 ExcludePatterns 规则
+
+- 调用入口：`knowledge.ExcludedByPatterns(rel, patterns)`
+- 路径先归一为 slash 风格：`docs\api.md`、`docs/api.md` 等价
+- 支持 basename pattern：`ignored.md`
+- 支持目录前缀：`docs/**`、`docs\**`、`docs/`
+- 扫描和 grep 遇到被排除目录时直接 `SkipDir`
+
 ---
 
 ## 7. 知识库 API 端点总览
@@ -360,7 +370,7 @@ var MediaTypeExtensions = map[string][]string{
 | `DELETE` | `/api/v1/knowledge/bases/:name/sections/:id` | 删除条目 |
 | `GET` | `/api/v1/knowledge/bases/:name/nodes` | ★ 三层索引节点列表 |
 | `GET` | `/api/v1/knowledge/bases/:name/nodes/:id/content` | ★ 节点内容块 |
-| `POST` | `/api/v1/knowledge/search` | 跨库 FTS5 + grep 联合搜索 |
+| `POST` | `/api/v1/knowledge/search` | 跨库 FTS5 + grep 联合搜索；返回 `stats` 可观测信息 |
 
 ---
 
@@ -381,6 +391,10 @@ var MediaTypeExtensions = map[string][]string{
 | `page` | 1 | — | 分页页码 |
 | `size` | 20 | 50 | 每页条数 |
 | `expand` | false | — | 展开 children + parent 引用 |
+
+输出头部会包含：
+- `检索统计`: bases / queries / raw_matches / candidates / merged / returned / has_more
+- `输出预算`: overview ≤500 字符，expanded content ≤800 字符/块，并报告被截断的 overview/content 块数量
 
 ### 8.2 `wiki_list`（★ 替代 wiki_index）
 
@@ -453,7 +467,7 @@ func buildKBIndex(cfg *config.Config, kbBase string) string
 
 1. 解析 `kbBase`，获取 L1 node overview（通过 `GetL1Overview`）
 2. 格式化为 1-2 句简介，追加到 system prompt 末尾
-3. 截断至 2000 字符
+3. 截断至 2000 字符；截断时保留 `wiki_lookup/wiki_list` 使用提示
 4. 缓存 30s（L1 overview 缓存），扫描/清除后 `Reload()` 刷新
 
 ```text
@@ -677,6 +691,7 @@ pchat-server 启动
 | 文件 | 内容 |
 |------|------|
 | `internal/knowledge/wiki_store.go` | WikiStore — SQLite 存储引擎（旧表 + 三层索引 + FTS5 + 触发器） |
+| `internal/knowledge/exclude_patterns.go` | `ExcludePatterns` slash 归一化与 glob/目录匹配 |
 | `internal/knowledge/hybrid.go` | KB-02 hybrid retrieval：lexical + FTS + content LIKE + RRF |
 | `internal/knowledge/query_plan.go` | KB-03 query decomposition：规则型派生查询 |
 | `internal/knowledge/citation.go` | KB-04 citation explainability：结构化来源和解释文本 |

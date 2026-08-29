@@ -62,6 +62,51 @@ func TestWikiLookup_DefaultPageSize(t *testing.T) {
 	}
 }
 
+func TestWikiLookup_ReportsStatsAndTruncationBudget(t *testing.T) {
+	dir := t.TempDir()
+	baseName := "test_lookup_stats"
+	store, err := knowledge.NewWikiStore(baseName, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		store.Close()
+		knowledge.CloseWikiStore()
+	})
+
+	nodes := []knowledge.IndexNode{
+		{ID: 1, ParentID: 0, Base: baseName, Level: 1, Title: baseName, Overview: "[Knowledge Base]"},
+		{ID: 2, ParentID: 1, Base: baseName, Level: 2, Source: "guide.md", Kind: "text", SortOrder: 0, Title: "guide.md", Overview: "alpha guide"},
+		{ID: 3, ParentID: 2, Base: baseName, Level: 3, Source: "guide.md", Kind: "text", SortOrder: 0, Title: "Alpha", Keywords: "alpha", Overview: strings.Repeat("概览", 400)},
+	}
+	contents := []knowledge.ContentNode{
+		{NodeID: 3, Content: strings.Repeat("正文", 500), ContentType: "text", SortOrder: 0},
+	}
+	if err := store.ReplaceBaseNodes(context.Background(), baseName, nodes, contents); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Knowledge: config.KnowledgeConfig{
+		Enabled: true,
+		Bases:   []config.KnowledgeBase{{Name: baseName, Path: dir, Enabled: true}},
+	}}
+	handler := makeWikiLookupHandler(cfg)
+	args, _ := json.Marshal(wikiLookupArgs{Query: "alpha", Expand: true, Page: 1, Size: 5})
+	res, err := handler(context.Background(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Content, "*检索统计:") {
+		t.Fatalf("missing search stats:\n%s", res.Content)
+	}
+	if !strings.Contains(res.Content, "truncated_overviews=1") {
+		t.Fatalf("missing overview truncation count:\n%s", res.Content)
+	}
+	if !strings.Contains(res.Content, "truncated_blocks=1") {
+		t.Fatalf("missing content truncation count:\n%s", res.Content)
+	}
+}
+
 func TestWikiLookup_KnowledgeDisabled(t *testing.T) {
 	cfg, cleanup := setupKnowledgeTest(t, "test_disabled")
 	defer cleanup()
