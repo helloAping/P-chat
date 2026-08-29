@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 )
 
@@ -106,6 +107,46 @@ func TestGetOrOpenWikiStore_Cache(t *testing.T) {
 	}
 	if ws1 != ws2 {
 		t.Error("expected same store from cache")
+	}
+}
+
+func TestNewWikiStore_NormalizesDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".", "nested", "..")
+	want, err := NormalizeWikiStoreDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := NewWikiStore("testnormalize", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	if ws.Dir() != want {
+		t.Fatalf("Dir() = %q, want %q", ws.Dir(), want)
+	}
+}
+
+func TestGetOrOpenWikiStore_CacheUsesNormalizedDir(t *testing.T) {
+	dir := t.TempDir()
+	ws1, err := GetOrOpenWikiStore("testnormcache", filepath.Join(dir, "."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer CloseWikiStore()
+
+	ws2, err := GetOrOpenWikiStore("testnormcache", filepath.Join(dir, "child", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws1 != ws2 {
+		t.Fatal("expected equivalent paths to resolve to the same cached store")
+	}
+	want, err := NormalizeWikiStoreDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ws1.Dir() != want {
+		t.Fatalf("Dir() = %q, want %q", ws1.Dir(), want)
 	}
 }
 

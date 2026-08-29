@@ -164,10 +164,14 @@ CREATE VIRTUAL TABLE index_fts USING fts5(
 ### 4.1 生命周期
 
 ```go
-func NewWikiStore(name, dir string) (*WikiStore, error)   // 打开/创建 wiki.db
-func GetOrOpenWikiStore(cfg *config.Config, name string)   // 单例缓存
+func NormalizeWikiStoreDir(dir string) (string, error)     // 规范化为稳定绝对目录
+func NewWikiStore(name, dir string) (*WikiStore, error)     // 打开/创建 wiki.db
+func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) // 按规范化目录 + base name 缓存
+func (ws *WikiStore) Dir() string                          // 返回规范化目录
 func (ws *WikiStore) Close() error                         // 关闭连接
 ```
+
+所有入口（扫描、API handler、对话工具）都应通过 `GetOrOpenWikiStore(name, dir)` 打开库，避免相对路径、`.`/`..` 或符号链接造成同一知识库对应多个 `wiki.db`/SQLite 连接。
 
 ### 4.2 旧表数据写入（wiki_sections）
 
@@ -332,7 +336,7 @@ var MediaTypeExtensions = map[string][]string{
 
 - 每个知识库最多一个活跃 scan job
 - 30 分钟超时自动取消
-- 进度通过 `sync.Map` 共享，前端 800ms 轮询
+- 新扫描必须通过 `scanJobManager.Claim` 原子占用槽位；进度由 `scanJob.snapshot()` 共享，后台扫描写进度和前端 800ms 轮询都必须走带锁方法
 
 ---
 
@@ -682,6 +686,7 @@ pchat-server 启动
 | `internal/tool/wiki.go` | `wiki_lookup`（hybrid+RRF + 多库合并）+ `wiki_list` 工具 |
 | `internal/tool/grep.go` | `grep` 工具 |
 | `internal/server/knowledge_api.go` | 知识库 CRUD + 扫描管道 + API 端点 + parseKWAndOverview |
+| `internal/server/knowledge_scan_jobs.go` | 扫描任务状态、快照、取消和并发保护 |
 | `internal/server/handler.go` | sessionMeta/KnowledgeBase 流、SSE 映射 |
 | `internal/server/server.go` | 路由注册（含 /nodes /clear 新路由） |
 | `internal/agent/agent.go` | ChatWithTools、buildKBIndex、4 层 KB off 守卫 |

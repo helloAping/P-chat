@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,21 +21,6 @@ import (
 	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 )
-
-var scanJobs sync.Map // map[string]*scanJob 閳?baseName 閳?job state
-
-type scanJob struct {
-	status    string
-	startedAt time.Time
-	current   int // files processed
-	total     int // total files found
-	chunks    int // chunks indexed
-	changed   int
-	skipped   int
-	deleted   int
-	failed    int
-	cancel    context.CancelFunc
-}
 
 type scanProgressResp struct {
 	Chunks  int    `json:"chunks"`
@@ -191,12 +175,12 @@ func (h *Handler) ListKnowledgeBases(c *gin.Context) {
 	for _, b := range h.getCfg().Knowledge.Bases {
 		resp := baseToResp(b)
 		// Enrich with scan job status.
-		if v, ok := scanJobs.Load(b.Name); ok {
-			j := v.(*scanJob)
-			if strings.HasPrefix(j.status, "ok: ") {
+		if j, ok := scanJobs.Load(b.Name); ok {
+			snap := j.snapshot()
+			if strings.HasPrefix(snap.Status, "ok: ") {
 				resp.Status = "ok"
-				resp.DocCount = j.chunks
-			} else if strings.Contains(j.status, "error") {
+				resp.DocCount = snap.Chunks
+			} else if strings.Contains(snap.Status, "error") {
 				resp.Status = "error"
 			} else {
 				resp.Status = "scanning"
@@ -289,7 +273,7 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	v, ok := scanJobs.Load(name)
+	j, ok := scanJobs.Load(name)
 	if !ok {
 		// No active scan — return current section count from wiki store.
 		resp := scanProgressResp{Done: false}
@@ -305,26 +289,26 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, resp)
 		return
 	}
-	j := v.(*scanJob)
+	snap := j.snapshot()
 	resp := scanProgressResp{
-		Chunks:  j.chunks,
-		Current: j.current,
-		Total:   j.total,
-		Changed: j.changed,
-		Skipped: j.skipped,
-		Deleted: j.deleted,
-		Failed:  j.failed,
+		Chunks:  snap.Chunks,
+		Current: snap.Current,
+		Total:   snap.Total,
+		Changed: snap.Changed,
+		Skipped: snap.Skipped,
+		Deleted: snap.Deleted,
+		Failed:  snap.Failed,
 	}
-	if strings.HasPrefix(j.status, "ok: ") {
+	if strings.HasPrefix(snap.Status, "ok: ") {
 		resp.Done = true
 		c.JSON(http.StatusOK, resp)
-	} else if strings.HasPrefix(j.status, "error: ") {
-		resp.Error = strings.TrimPrefix(j.status, "error: ")
+	} else if strings.HasPrefix(snap.Status, "error: ") {
+		resp.Error = strings.TrimPrefix(snap.Status, "error: ")
 		resp.Done = true
 		c.JSON(http.StatusOK, resp)
 	} else {
 		resp.Message = "扫描中..."
-		if j.status == "counting" {
+		if snap.Status == "counting" {
 			resp.Message = "正在统计文件..."
 		}
 		c.JSON(http.StatusOK, resp)
@@ -338,15 +322,12 @@ func (h *Handler) CancelScan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	v, ok := scanJobs.Load(name)
+	j, ok := scanJobs.Load(name)
 	if !ok {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "message": "没有正在进行的扫描"})
 		return
 	}
-	j := v.(*scanJob)
-	if j.cancel != nil {
-		j.cancel()
-	}
+	j.cancelJob()
 	scanJobs.Delete(name)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "scan cancelled"})
 }
@@ -679,20 +660,6 @@ func (h *Handler) AutoIndexKnowledgeBases() {
 // ---- helpers ----
 
 func (h *Handler) startScanJob(name string) error {
-	// Check if a scan is already running. Allow new scan if the
-	// previous job has finished (ok / error status) or is stale
-	// (older than 30min 閳?leftover from a crashed instance).
-	if v, ok := scanJobs.Load(name); ok {
-		j := v.(*scanJob)
-		if strings.HasPrefix(j.status, "ok: ") || strings.HasPrefix(j.status, "error: ") {
-			scanJobs.Delete(name) // completed, allow new scan
-		} else if time.Since(j.startedAt) < 30*time.Minute {
-			return fmt.Errorf("scan running")
-		} else {
-			scanJobs.Delete(name) // stale, clean up
-		}
-	}
-
 	var base *config.KnowledgeBase
 	for i := range h.getCfg().Knowledge.Bases {
 		if h.getCfg().Knowledge.Bases[i].Name == name {
@@ -726,46 +693,49 @@ func (h *Handler) startScanJob(name string) error {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	job := &scanJob{status: "counting", startedAt: time.Now(), cancel: cancel}
-	scanJobs.Store(name, job)
+	job := newScanJob("counting", cancel)
+	stale, claimed := scanJobs.Claim(name, job, time.Now(), 30*time.Minute)
+	if !claimed {
+		cancel()
+		return fmt.Errorf("scan already running")
+	}
+	if stale != nil {
+		stale.cancelJob()
+	}
 
 	go func() {
 		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("[scan %s] panic: %v", name, r)
-				job.status = fmt.Sprintf("error: panic: %v", r)
+				job.setStatus(fmt.Sprintf("error: panic: %v", r))
 			}
 		}()
 
 		store, err := knowledge.GetOrOpenWikiStore(base.Name, basePath)
 		if err != nil {
-			job.status = fmt.Sprintf("error: wiki store: %v", err)
+			job.setStatus(fmt.Sprintf("error: wiki store: %v", err))
 			log.Printf("[scan %s] wiki store: %v", name, err)
 			return
 		}
 
 		fileCount := countIndexableFiles(basePath, base)
-		job.total = fileCount
-		job.current = 0
-		job.status = "running"
+		job.startRunning(fileCount)
 
 		if fileCount == 0 {
 			log.Printf("[scan %s] no indexable files found in %s", name, basePath)
 		}
 
 		stats, idxErr := h.indexScan(ctx, store, base, basePath, name, func(current int) {
-			job.current = current
+			job.setCurrent(current)
 		})
-		job.changed = stats.Changed
-		job.skipped = stats.Skipped
-		job.deleted = stats.Deleted
-		job.failed = stats.Failed
+		job.setStats(stats)
 		if idxErr != nil {
-			job.status = fmt.Sprintf("error: %v", idxErr)
+			status := fmt.Sprintf("error: %v", idxErr)
 			if strings.Contains(idxErr.Error(), "delete") && strings.Contains(idxErr.Error(), "re-scan") {
-				job.status += " | 恢复：删除 wiki.db 后重新扫描即可重建索引"
+				status += " | 恢复：删除 wiki.db 后重新扫描即可重建索引"
 			}
+			job.setStatus(status)
 			log.Printf("[scan %s] index scan: %v", name, idxErr)
 			return
 		}
@@ -773,14 +743,7 @@ func (h *Handler) startScanJob(name string) error {
 			h.agent.Reload()
 		}
 
-		job.status = fmt.Sprintf("ok: %d changed, %d skipped, %d deleted, %d failed, %d L3 sections", stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L3)
-		job.total = fileCount
-		job.current = fileCount
-		job.chunks = stats.L3
-		job.changed = stats.Changed
-		job.skipped = stats.Skipped
-		job.deleted = stats.Deleted
-		job.failed = stats.Failed
+		job.finish(fmt.Sprintf("ok: %d changed, %d skipped, %d deleted, %d failed, %d L3 sections", stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L3), fileCount, stats)
 		log.Printf("[scan %s] done: changed=%d skipped=%d deleted=%d failed=%d L2=%d L3=%d", name, stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L2, stats.L3)
 	}()
 	return nil

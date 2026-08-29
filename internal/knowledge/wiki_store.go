@@ -85,8 +85,29 @@ type WikiStore struct {
 	name string
 }
 
+// NormalizeWikiStoreDir returns a stable absolute directory for a wiki store.
+func NormalizeWikiStoreDir(dir string) (string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return "", fmt.Errorf("wiki store dir is required")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("abs wiki store dir: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	if real, err := filepath.EvalSymlinks(abs); err == nil && real != "" {
+		abs = filepath.Clean(real)
+	}
+	return abs, nil
+}
+
 // NewWikiStore opens/creates a SQLite wiki store at the given path.
 func NewWikiStore(name, dir string) (*WikiStore, error) {
+	dir, err := NormalizeWikiStoreDir(dir)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -107,6 +128,11 @@ func NewWikiStore(name, dir string) (*WikiStore, error) {
 		}
 	}
 	return ws, nil
+}
+
+// Dir returns the normalized directory backing this store.
+func (ws *WikiStore) Dir() string {
+	return ws.dir
 }
 
 func (ws *WikiStore) migrate() error {
@@ -731,7 +757,11 @@ var (
 // GetOrOpenWikiStore returns a cached wiki store keyed by (dir, name).
 // Each unique combination gets its own SQLite database.
 func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) {
-	key := dir + "/" + name
+	dir, err := NormalizeWikiStoreDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	key := dir + "\x00" + name
 	if ws, ok := wikiStoreCache.Load(key); ok {
 		return ws.(*WikiStore), nil
 	}
@@ -784,6 +814,8 @@ func CloseWikiStore() {
 		return true
 	})
 	wikiStoreCache = sync.Map{}
+	wikiStoreOrder = make(map[string]uint64)
+	wikiStoreCounter.Store(0)
 }
 
 // ListChildren returns paginated child nodes under parentID.
