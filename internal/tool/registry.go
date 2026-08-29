@@ -296,6 +296,7 @@ func (r *Registry) Register(t Tool, h ToolHandler) {
 	defer r.mu.Unlock()
 	r.tools[t.Name] = h
 	r.meta[t.Name] = t
+	delete(r.sources, t.Name)
 }
 
 // RegisterWithSource is the compatibility wrapper for global dynamic tools.
@@ -410,6 +411,21 @@ func (r *Registry) Unregister(name string) {
 			delete(r.dynamicEntries, key)
 		}
 	}
+}
+
+// UnregisterBuiltin removes a statically registered tool without deleting a
+// dynamic tool definition with the same name. Used for config-gated built-ins
+// such as web_search and wiki_lookup.
+func (r *Registry) UnregisterBuiltin(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if src := r.sources[name]; src != "" {
+		return
+	}
+	delete(r.tools, name)
+	delete(r.meta, name)
+	delete(r.sources, name)
+	r.rebuildLegacyDynamicLocked()
 }
 
 // SourceFile returns the YAML path the dynamic watcher

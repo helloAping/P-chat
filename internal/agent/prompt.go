@@ -200,7 +200,7 @@ func buildToolSpecificHints(availableTools []tool.Tool, kbEnabled bool) string {
 			"- `wiki_lookup(query=\"\")` — 查询为空时，返回知识库中所有文件目录（L2 列表），按关联度排序。默认每页 20 条，可用 page 翻页。\n" +
 			"- `wiki_lookup(query=\"关键词\")` — 按关键词、标题或概览搜索条目，返回匹配的 L3 章节节点及其所属文件（L2 父节点）。\n" +
 			"- `wiki_lookup(query=\"...\", expand=true)` — 同时返回匹配条目的完整正文内容。\n" +
-			"- `wiki_list(parent_id=N)` — 列出父节点 N 下的所有子节点。L1（id=1）列出所有文件；L2 节点列出该文件所有章节。\n" +
+			"- `wiki_list(parent_id=N, base=\"来源库\")` — 列出父节点 N 下的所有子节点。L1（id=1）列出所有文件；L2 节点列出该文件所有章节。从 `wiki_lookup` 结果继续展开时必须传结果里的 base，避免多知识库下 node id 冲突。\n" +
 			"\n**标准流程：**\n" +
 			"1. 先看系统提示中的一级索引概览，找到可能相关的文件（L2）。\n" +
 			"2. 用 wiki_lookup 搜索关键词或浏览目录定位目标文件/章节。\n" +
@@ -522,8 +522,8 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 	}
 
 	// Append tool usage footer.
-	sb.WriteString("\n\n使用 wiki_lookup(query, page, size) 检索，默认 20 条/页。")
-	sb.WriteString("query=空 浏览目录；query=关键词 搜索匹配；expand=true 获取全文。")
+	sb.WriteString("\n\n使用 wiki_lookup(query, base, page, size) 检索，默认 20 条/页。")
+	sb.WriteString("query=空 浏览目录；query=关键词 搜索匹配；expand=true 获取全文；继续展开节点时用 wiki_list(parent_id, base)。")
 	result := sb.String()
 	a.kbIndexCache = result
 	a.kbIndexCacheKey = kbBase

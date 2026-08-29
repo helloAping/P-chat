@@ -19,7 +19,6 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/im/feishu"
-	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -143,7 +142,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
-	tool.RegisterWebSearch(toolReg, cfg.Search)
 	// Build the search provider and install it as the
 	// process-global. The tool handler reads it via
 	// search.Global() on every call, so we update it here
@@ -159,15 +157,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		log.Printf("[search] web_search disabled (no provider configured)")
 	}
 	tool.RegisterGrep(toolReg, cfg)
-	if cfg.Knowledge.Enabled {
-		tool.RegisterWiki(toolReg, cfg)
-		// Migrate legacy wiki_sections → three-level index_nodes.
-		var bases []knowledge.BaseRef
-		for _, b := range cfg.Knowledge.Bases {
-			bases = append(bases, knowledge.BaseRef{Name: b.Name, Path: b.Path, Enabled: b.Enabled})
-		}
-		knowledge.EnsureMigrated(bases)
-	}
+	server.SyncConfigDrivenTools(toolReg, cfg)
 
 	// Build the sub-agent catalog. Three sources, in priority
 	// order (last wins):

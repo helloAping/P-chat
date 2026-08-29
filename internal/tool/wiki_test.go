@@ -100,6 +100,38 @@ func TestWikiList_DisabledKnowledge(t *testing.T) {
 	}
 }
 
+func TestWikiList_UsesBaseToAvoidNodeIDCollision(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	seedWikiListBase(t, "test_list_a", dirA, "alpha.md")
+	seedWikiListBase(t, "test_list_b", dirB, "beta.md")
+	defer knowledge.CloseWikiStore()
+
+	cfg := &config.Config{Knowledge: config.KnowledgeConfig{
+		Enabled: true,
+		Bases: []config.KnowledgeBase{
+			{Name: "test_list_a", Path: dirA, Enabled: true},
+			{Name: "test_list_b", Path: dirB, Enabled: true},
+		},
+	}}
+	handler := makeWikiListHandler(cfg)
+
+	args, _ := json.Marshal(wikiListArgs{ParentID: 1, Base: "test_list_b"})
+	res, err := handler(context.Background(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("wiki_list returned error: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "beta.md") || !strings.Contains(res.Content, "base=test_list_b") {
+		t.Fatalf("expected test_list_b result, got:\n%s", res.Content)
+	}
+	if strings.Contains(res.Content, "alpha.md") {
+		t.Fatalf("wiki_list should not merge another base when base is set:\n%s", res.Content)
+	}
+}
+
 func TestResolveBases_All(t *testing.T) {
 	kc := config.KnowledgeConfig{
 		Bases: []config.KnowledgeBase{
@@ -141,5 +173,22 @@ func TestResolveBases_Specific(t *testing.T) {
 	result = resolveBases(kc, "a")
 	if len(result) != 1 || !result[0].Enabled {
 		t.Errorf("want enabled 'a', got %v", result)
+	}
+}
+
+func seedWikiListBase(t *testing.T, baseName, dir, fileTitle string) {
+	t.Helper()
+	store, err := knowledge.NewWikiStore(baseName, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	nodes := []knowledge.IndexNode{
+		{ID: 1, ParentID: 0, Base: baseName, Level: 1, Title: baseName, Overview: "[Knowledge Base]"},
+		{ID: 2, ParentID: 1, Base: baseName, Level: 2, Source: fileTitle, Kind: "text", SortOrder: 0, Title: fileTitle, Overview: fileTitle + " (1 chapters)"},
+	}
+	if err := store.ReplaceBaseNodes(context.Background(), baseName, nodes, nil); err != nil {
+		t.Fatal(err)
 	}
 }

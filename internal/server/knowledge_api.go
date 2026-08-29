@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -744,7 +745,7 @@ func (h *Handler) startScanJob(name string) error {
 			return
 		}
 
-		fileCount := countIndexableFiles(basePath, base.ExcludePatterns)
+		fileCount := countIndexableFiles(basePath, base)
 		job.total = fileCount
 		job.current = 0
 		job.status = "running"
@@ -767,6 +768,9 @@ func (h *Handler) startScanJob(name string) error {
 			}
 			log.Printf("[scan %s] index scan: %v", name, idxErr)
 			return
+		}
+		if h.agent != nil {
+			h.agent.Reload()
 		}
 
 		job.status = fmt.Sprintf("ok: %d changed, %d skipped, %d deleted, %d failed, %d L3 sections", stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L3)
@@ -976,6 +980,9 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 	var files []fileData
 
 	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if ctx.Err() != nil {
+			return filepath.SkipAll
+		}
 		if err != nil {
 			stats.Failed++
 			return nil
@@ -989,14 +996,18 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 		}
 		ext := strings.ToLower(filepath.Ext(path))
 		kind := "text"
-		if knowledge.IsMediaFile(ext, []string{}) != "" {
-			return nil
-		}
-		if !knowledge.IndexableExtensions[ext] || info.Size() > 5*1024*1024 {
+		if !knowledgeBaseAllowsExt(base, ext) || info.Size() > knowledgeBaseMaxFileSize(base) {
 			return nil
 		}
 		rel, _ := filepath.Rel(dir, path)
 		rel = filepath.ToSlash(rel)
+		var excludePatterns []string
+		if base != nil {
+			excludePatterns = base.ExcludePatterns
+		}
+		if excludedByKnowledgePatterns(rel, excludePatterns) {
+			return nil
+		}
 		currentSources[rel] = true
 		mtime := info.ModTime().UnixNano()
 		if prev, err := store.GetFileMtime(ctx, baseName, rel); err == nil && prev == mtime {
@@ -1064,6 +1075,9 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 	if walkErr != nil {
 		log.Printf("[index-scan %s] walk error: %v", baseName, walkErr)
 	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 
 	for fi, fd := range files {
 		title := fd.source
@@ -1092,6 +1106,9 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 		return stats, fmt.Errorf("remove stale sources: %w", staleErr)
 	}
 	stats.Deleted = deleted
+	if err := store.RefreshL1Overview(ctx, baseName); err != nil {
+		return stats, fmt.Errorf("refresh l1 overview: %w", err)
+	}
 	if nodes, err := store.ListNodes(ctx, baseName); err == nil {
 		stats.L2, stats.L3 = countIndexedLevels(nodes)
 	} else {
@@ -1137,24 +1154,48 @@ func buildL1Overview(l2Nodes []knowledge.IndexNode) string {
 }
 
 func parseKWAndOverview(indexed string) (keywords, overview string) {
-	// Parse "关键词: a, b, c" and "摘要: ..." from LLM output.
+	if parsed := knowledge.ParseIndexEntry(indexed); parsed != nil {
+		keywords = strings.TrimSpace(parsed.Keywords)
+		overview = strings.TrimSpace(parsed.Overview)
+		if overview == "" {
+			overview = strings.TrimSpace(parsed.SearchHints)
+		}
+		if keywords != "" || overview != "" {
+			return keywords, overview
+		}
+	}
+	// Parse legacy/free-form "关键词: a, b, c" and "摘要: ..." output.
 	for _, line := range strings.Split(indexed, "\n") {
 		line = strings.TrimSpace(line)
-		if (strings.HasPrefix(line, "关键词：") || strings.HasPrefix(line, "关键词:")) && keywords == "" {
-			keywords = strings.TrimSpace(line[strings.IndexRune(line, ':')+1:])
+		idx := strings.IndexAny(line, ":：")
+		if idx < 0 {
+			continue
 		}
-		if (strings.HasPrefix(line, "摘要：") || strings.HasPrefix(line, "摘要:")) && overview == "" {
-			overview = strings.TrimSpace(line[strings.IndexRune(line, ':')+1:])
+		sepLen := 1
+		if strings.HasPrefix(line[idx:], "：") {
+			sepLen = len("：")
+		}
+		label := strings.ToLower(strings.TrimSpace(line[:idx]))
+		value := strings.TrimSpace(line[idx+sepLen:])
+		switch label {
+		case "关键词", "关键字", "keywords":
+			if keywords == "" {
+				keywords = value
+			}
+		case "内容概览", "概览", "摘要", "overview", "summary":
+			if overview == "" {
+				overview = value
+			}
 		}
 	}
 	if overview == "" {
-		overview = truncateText(indexed, 500)
+		overview = knowledge.TruncateText(indexed, 500)
 	}
 	return
 }
 
 // countIndexableFiles walks a directory and counts files eligible for indexing.
-func countIndexableFiles(dir string, excludePatterns []string) int {
+func countIndexableFiles(dir string, base *config.KnowledgeBase) int {
 	count := 0
 	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -1167,16 +1208,19 @@ func countIndexableFiles(dir string, excludePatterns []string) int {
 			}
 			return nil
 		}
-		if info.Size() > 5*1024*1024 {
+		if info.Size() > knowledgeBaseMaxFileSize(base) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(p))
-		if knowledge.IndexableExtensions[ext] {
+		if knowledgeBaseAllowsExt(base, ext) {
 			rel, _ := filepath.Rel(dir, p)
-			for _, pat := range excludePatterns {
-				if matched, _ := filepath.Match(pat, rel); matched {
-					return nil
-				}
+			rel = filepath.ToSlash(rel)
+			var excludePatterns []string
+			if base != nil {
+				excludePatterns = base.ExcludePatterns
+			}
+			if excludedByKnowledgePatterns(rel, excludePatterns) {
+				return nil
 			}
 			count++
 		}
@@ -1252,8 +1296,64 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 }
 
 func truncateText(s string, max int) string {
-	if len(s) <= max {
-		return s
+	return knowledge.TruncateText(s, max)
+}
+
+func knowledgeBaseMaxFileSize(base *config.KnowledgeBase) int64 {
+	if base != nil && base.MaxFileSize > 0 {
+		return base.MaxFileSize
 	}
-	return s[:max]
+	return 5 * 1024 * 1024
+}
+
+func knowledgeBaseAllowsExt(base *config.KnowledgeBase, ext string) bool {
+	ext = strings.ToLower(strings.TrimSpace(ext))
+	if ext == "" || !knowledge.IndexableExtensions[ext] {
+		return false
+	}
+	if base == nil || len(base.FileTypes) == 0 {
+		return true
+	}
+	for _, ft := range base.FileTypes {
+		ft = strings.ToLower(strings.TrimSpace(ft))
+		if ft == "" || ft == "text" || ft == "*" {
+			return true
+		}
+		if !strings.HasPrefix(ft, ".") {
+			ft = "." + ft
+		}
+		if ft == ext {
+			return true
+		}
+	}
+	return false
+}
+
+func excludedByKnowledgePatterns(rel string, patterns []string) bool {
+	rel = filepath.ToSlash(strings.TrimSpace(rel))
+	if rel == "" {
+		return false
+	}
+	baseName := path.Base(rel)
+	for _, pat := range patterns {
+		pat = filepath.ToSlash(strings.TrimSpace(pat))
+		if pat == "" {
+			continue
+		}
+		if strings.HasSuffix(pat, "/**") {
+			prefix := strings.TrimSuffix(pat, "/**")
+			if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
+				return true
+			}
+		}
+		if matched, _ := path.Match(pat, rel); matched {
+			return true
+		}
+		if !strings.Contains(pat, "/") {
+			if matched, _ := path.Match(pat, baseName); matched {
+				return true
+			}
+		}
+	}
+	return false
 }

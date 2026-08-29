@@ -1187,6 +1187,7 @@ func (h *Handler) reloadAfterConfigChange() {
 	// (enable, key, provider) take effect on the very next
 	// tool call without a server restart.
 	search.SetGlobal(search.BuildProvider(cfg.Search))
+	SyncConfigDrivenTools(h.toolReg, cfg)
 	if h.agent == nil {
 		return
 	}
@@ -1196,6 +1197,7 @@ func (h *Handler) reloadAfterConfigChange() {
 	}
 	h.agent.SetConfig(cfg)
 	h.agent.SetLLM(newClient)
+	h.agent.Reload()
 	if h.subagentRunner != nil {
 		parentProvider, parentModel := defaultProviderModelFromConfig(cfg)
 		h.subagentRunner.Cfg = cfg

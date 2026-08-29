@@ -82,3 +82,55 @@ func TestRegistry_ProjectDynamicDoesNotLeak(t *testing.T) {
 		t.Fatal("project-only tool missing from its project view")
 	}
 }
+
+func TestRegistry_RegisterClearsDynamicSourceForBuiltinOverride(t *testing.T) {
+	r := NewRegistry()
+	r.RegisterWithSource(Tool{Name: "shared", Description: "dynamic"}, func(ctx context.Context, args json.RawMessage) (*CallResult, error) {
+		return &CallResult{Content: "dynamic"}, nil
+	}, "shared.yaml")
+	r.Register(Tool{Name: "shared", Description: "builtin"}, func(ctx context.Context, args json.RawMessage) (*CallResult, error) {
+		return &CallResult{Content: "builtin"}, nil
+	})
+
+	tool, handler, ok := r.Lookup("shared")
+	if !ok {
+		t.Fatal("shared should be registered")
+	}
+	if tool.Description != "builtin" {
+		t.Fatalf("description = %q, want builtin", tool.Description)
+	}
+	if _, ok := r.SourceFile("shared"); ok {
+		t.Fatal("builtin override should clear dynamic source marker")
+	}
+	res, err := handler(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "builtin" {
+		t.Fatalf("handler = %q, want builtin", res.Content)
+	}
+}
+
+func TestRegistry_UnregisterBuiltinLeavesDynamicTools(t *testing.T) {
+	r := NewRegistry()
+	r.RegisterWithSource(Tool{Name: "dynamic_only", Description: "dynamic"}, func(ctx context.Context, args json.RawMessage) (*CallResult, error) {
+		return &CallResult{Content: "dynamic"}, nil
+	}, "dynamic.yaml")
+
+	r.UnregisterBuiltin("dynamic_only")
+
+	tool, handler, ok := r.Lookup("dynamic_only")
+	if !ok {
+		t.Fatal("dynamic tool should remain")
+	}
+	if tool.Description != "dynamic" {
+		t.Fatalf("description = %q, want dynamic", tool.Description)
+	}
+	res, err := handler(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "dynamic" {
+		t.Fatalf("handler = %q, want dynamic", res.Content)
+	}
+}

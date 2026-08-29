@@ -58,7 +58,7 @@
 │ Tool 层                                                   │
 │ ┌──────────────┐  ┌──────────────┐  ┌────────────────┐ │
 │ │ wiki_lookup   │  │ wiki_list    │  │ grep           │ │
-│ │ · query/base  │  │ · parent_id  │  │ · pattern/base │ │
+│ │ · query/base  │  │ · parent/base│  │ · pattern/base │ │
 │ │ · hybrid+RRF │  │ · 分页       │  │ · filepath.Walk│ │
 │ └──────┬───────┘  └──────┬───────┘  └────────┬───────┘ │
 └────────┼──────────────────┼──────────────────┼─────────┘
@@ -190,7 +190,7 @@ func (ws *WikiStore) Close() error                         // 关闭连接
 
 | 方法 | 签名 | 用途 |
 |------|------|------|
-| `MigrateBaseToIndex` | `(ctx, base string) (bool, error)` | 创建 index_nodes/contents/index_fts 表，幂等 |
+| `MigrateBaseToIndex` | `(ctx, base string) (int, error)` | 将旧 `wiki_sections` 迁移到三层索引；新库无旧表时返回 0 |
 | `InsertNode` | `(ctx, *IndexNode) (int64, error)` | 写入节点 → 触发器自动同步 FTS |
 | `InsertContent` | `(ctx, *ContentNode) (int64, error)` | 写入内容块 |
 | `LookupSearch` | `(ctx, query, base string, expand bool, level, page, size int)` | KB-02 hybrid+RRF 搜索，返回 match_type |
@@ -198,6 +198,7 @@ func (ws *WikiStore) Close() error                         // 关闭连接
 | `ListNodes` | `(ctx, base string) ([]NodeTreeItem, error)` | 返回整棵树的扁平列表（含 child_count/content_count） |
 | `GetNodeContent` | `(ctx, nodeID int) ([]ContentNode, error)` | 读取节点的内容块 |
 | `GetL1Overview` | `(ctx, base string) (string, error)` | 读取 L1 概览 |
+| `RefreshL1Overview` | `(ctx, base string) error` | 根据当前 L2 文件节点重建 L1 概览，扫描/删除后调用 |
 | `ClearBase` | `(ctx, base string) error` | 清除知识库所有数据（wiki_sections + index 全表） |
 
 ### 4.5 增量扫描缓存
@@ -233,7 +234,7 @@ type KnowledgeBase struct {
     ScanMediaTypes  []string `json:"scan_media_types"`   // ["image","video","audio","pdf"]
     AutoScan        bool     `json:"auto_scan"`
     ExcludePatterns []string `json:"exclude_patterns"`
-    MaxFileSize     int      `json:"max_file_size"`     // 0 = 默认 5MB
+    MaxFileSize     int64    `json:"max_file_size"`     // 0 = 默认 5MB
 }
 ```
 
@@ -281,7 +282,8 @@ walk directory
 ```
 walk directory
   └── process files:
-      ├── EnsureMigrated → 建表 (幂等)
+      ├── 按 file_types / exclude_patterns / max_file_size 过滤候选文件
+      ├── ScanModel 为空时走纯文本解析；配置后才调用 LLM 生成 keywords/overview
       ├── 解析 Markdown ##/### → 拆分为段
       ├── AI 解析 (如配了 ScanModel):
       │   ├── prompt = "为以下段落生成 JSON: {title,keywords,overview}"
@@ -293,7 +295,8 @@ walk directory
       │   └── L3 (section): 一个 per-段落，Title=标题, Keywords/Overview=AI 解析结果
       ├── InsertNode(L2) + InsertNode(L3) + InsertContent(段落正文)
       ├── tokenizeForFTS → FTS5 触发器自动同步
-      └── SetFileMtime
+      ├── SetFileMtime
+      └── RefreshL1Overview
 ```
 
 ### 6.4 mediaScan — 媒体文件扫描
@@ -378,12 +381,13 @@ var MediaTypeExtensions = map[string][]string{
 ### 8.2 `wiki_list`（★ 替代 wiki_index）
 
 ```
-参数: parent_id (optional), page (1), size (50, max 100)
+参数: parent_id (required), base (optional), page (1), size (50, max 100)
 流程: resolveBases → ListChildren(parent_id, page, size) → 返回子节点列表
 ```
 
-- `parent_id=0` → 列出所有 L1（root）节点
-- 用于树形浏览，LLM 按需展开子节点
+- `parent_id=1` → 列出某个知识库 root 下的 L2 文件节点
+- 从 `wiki_lookup` 结果继续展开时传 `base`，避免多知识库下相同 `parent_id` 展开到错误库
+- 不传 `base` 时遍历全部启用知识库并合并结果，用于全库根节点浏览
 
 ### 8.3 `grep`
 

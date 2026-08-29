@@ -110,18 +110,25 @@ func fuseRRF(lists [][]searchHit) []searchHit {
 
 // lexicalPathHits finds nodes whose source path or filename contains
 // the query (case-insensitive). Exact filename equality ranks first.
-func (ws *WikiStore) lexicalPathHits(ctx context.Context, query, baseWhere, baseArg string) []searchHit {
+func (ws *WikiStore) lexicalPathHits(ctx context.Context, query, baseWhere, baseArg string, level int) []searchHit {
 	q := strings.TrimSpace(query)
 	if q == "" {
 		return nil
 	}
 	like := "%" + strings.ToLower(q) + "%"
+	levelWhere := `n.level IN (2, 3)`
+	switch level {
+	case 2:
+		levelWhere = `n.level = 2`
+	case 3:
+		levelWhere = `n.level = 3`
+	}
 
 	sqlStmt := `SELECT n.id, n.level, n.title, n.keywords, n.overview, n.source, n.kind,
 	                   n.parent_id, p.title
 	            FROM index_nodes n
 	            LEFT JOIN index_nodes p ON n.parent_id = p.id
-	            WHERE n.level IN (2, 3)
+	            WHERE ` + levelWhere + `
 	              AND (LOWER(n.source) LIKE ? OR LOWER(n.title) LIKE ?)
 	              ` + baseWhere + `
 	            ORDER BY n.level DESC, n.id
@@ -218,9 +225,9 @@ func (ws *WikiStore) collectFTSList(ctx context.Context, query, baseWhere, baseA
 
 // collectContentLikeList always runs content LIKE (not only as empty
 // fallback) so exact body terms still contribute to hybrid ranking.
-func (ws *WikiStore) collectContentLikeList(ctx context.Context, query, baseWhere, baseArg string) []searchHit {
+func (ws *WikiStore) collectContentLikeList(ctx context.Context, query, baseWhere, baseArg string, level int) []searchHit {
 	seen := map[int]bool{}
-	hits := ws.addContentLikeHits(ctx, nil, &seen, query, baseWhere, baseArg, weightContent)
+	hits := ws.addContentLikeHits(ctx, nil, &seen, query, baseWhere, baseArg, weightContent, level)
 	for i := range hits {
 		hits[i].item.MatchType = MatchContent
 	}

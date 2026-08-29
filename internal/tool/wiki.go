@@ -20,9 +20,10 @@ type wikiLookupArgs struct {
 }
 
 type wikiListArgs struct {
-	ParentID int `json:"parent_id"`
-	Page     int `json:"page,omitempty"`
-	Size     int `json:"size,omitempty"`
+	ParentID int    `json:"parent_id"`
+	Base     string `json:"base,omitempty"`
+	Page     int    `json:"page,omitempty"`
+	Size     int    `json:"size,omitempty"`
 }
 
 // RegisterWiki registers wiki_lookup and wiki_list tools.
@@ -66,6 +67,7 @@ func RegisterWiki(r *Registry, cfg *config.Config) {
 				"type":        "integer",
 				"description": "父节点 id（L1=1 列出所有文件，L2 节点的 id 列出该文件所有章节）",
 			},
+			"base": StringProp("知识库名称（可选；从 wiki_lookup 结果继续展开时应传来源库，避免多库 node id 冲突）"),
 			"page": map[string]any{
 				"type":        "integer",
 				"description": "页码（默认 1）",
@@ -253,9 +255,14 @@ func makeWikiListHandler(cfg *config.Config) ToolHandler {
 			return &CallResult{Content: "知识库未启用", IsError: true}, nil
 		}
 
-		// Search across all enabled bases.
+		basesToList := resolveBases(kc, a.Base)
+		if len(basesToList) == 0 {
+			return &CallResult{Content: "知识库未配置或不可用", IsError: true}, nil
+		}
+
+		// Search across selected bases.
 		var merged *knowledge.IndexSearchResult
-		for _, base := range kc.Bases {
+		for _, base := range basesToList {
 			if !base.Enabled {
 				continue
 			}
@@ -270,6 +277,7 @@ func makeWikiListHandler(cfg *config.Config) ToolHandler {
 			if res.Total == 0 {
 				continue
 			}
+			res.Items = knowledge.TagBase(res.Items, base.Name)
 			if merged == nil {
 				merged = res
 			} else {
@@ -307,7 +315,11 @@ func makeWikiListHandler(cfg *config.Config) ToolHandler {
 				}
 				fmt.Fprintf(&b, " — %s", overview)
 			}
-			fmt.Fprintf(&b, " *(id=%d, source=%s)*\n", it.ID, it.Source)
+			if it.Base != "" {
+				fmt.Fprintf(&b, " *(id=%d, base=%s, source=%s)*\n", it.ID, it.Base, it.Source)
+			} else {
+				fmt.Fprintf(&b, " *(id=%d, source=%s)*\n", it.ID, it.Source)
+			}
 		}
 		if merged.HasMore {
 			fmt.Fprintf(&b, "\n*(共 %d 条，继续翻页 page=%d)*\n", merged.Total, merged.Page+1)

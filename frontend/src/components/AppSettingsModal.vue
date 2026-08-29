@@ -1432,7 +1432,19 @@ const newKBName = ref('')
 const newKBPath = ref('')
 const kbModels = ref<api.KnowledgeModel[]>([])
 const scanningKBs = ref<Set<string>>(new Set())
-const kbScanStatus = ref<Map<string, { current: number; total: number; chunks: number; done: boolean; error?: string }>>(new Map())
+type KBScanStatus = {
+  current: number
+  total: number
+  chunks: number
+  done: boolean
+  error?: string
+  changed?: number
+  skipped?: number
+  deleted?: number
+  failed?: number
+  message?: string
+}
+const kbScanStatus = ref<Map<string, KBScanStatus>>(new Map())
 let kbScanTimers: Record<string, ReturnType<typeof setInterval>> = {}
 
 // Three-level index nodes tree view
@@ -1606,7 +1618,7 @@ async function onScanKB(name: string) {
   try {
     await api.scanKnowledgeBase(name)
     scanningKBs.value = new Set(scanningKBs.value).add(name)
-    kbScanStatus.value.set(name, { current: 0, total: 0, chunks: 0, done: false })
+    kbScanStatus.value.set(name, { current: 0, total: 0, chunks: 0, done: false, changed: 0, skipped: 0, deleted: 0, failed: 0 })
     pollScan(name)
   } catch (e: any) { message.error(`扫描失败: ${e.message}`) }
 }
@@ -1615,7 +1627,18 @@ function pollScan(name: string) {
   const timer = setInterval(async () => {
     try {
       const s = await api.getScanStatus(name)
-      kbScanStatus.value.set(name, { current: s.current, total: s.total, chunks: s.chunks, done: s.done, error: s.error })
+      kbScanStatus.value.set(name, {
+        current: s.current,
+        total: s.total,
+        chunks: s.chunks,
+        done: s.done,
+        error: s.error,
+        changed: s.changed ?? 0,
+        skipped: s.skipped ?? 0,
+        deleted: s.deleted ?? 0,
+        failed: s.failed ?? 0,
+        message: s.message,
+      })
       if (s.done) {
         clearInterval(timer)
         scanningKBs.value = new Set([...scanningKBs.value].filter(n => n !== name))
@@ -1762,8 +1785,11 @@ function scanLabel(name: string) {
   const s = kbScanStatus.value.get(name)
   if (!s) return '开始扫描'
   if (s.error) return '扫描失败'
-  if (s.done) return `✓ ${s.chunks} sections`
-  return `扫描中 ${s.current}/${s.total}`
+  const stats = `更新 ${s.changed ?? 0} / 跳过 ${s.skipped ?? 0} / 删除 ${s.deleted ?? 0} / 失败 ${s.failed ?? 0}`
+  if (s.done) return `完成 ${s.chunks} 章节 (${stats})`
+  const phase = s.message || '扫描中'
+  if (s.total <= 0) return `${phase} (${stats})`
+  return `${phase} ${s.current}/${s.total} (${stats})`
 }
 
 function kbModelSupportsVision(scanModel: string) {
@@ -2668,7 +2694,7 @@ function kbModelSupportsVision(scanModel: string) {
                     <span class="muted" style="font-size:11px">{{ kbSelected.doc_count || 0 }} 条索引</span>
                   </div>
                   <NSpace size="small">
-                    <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name) || !kbSelected.scan_model">
+                    <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name)">
                       {{ scanningKBs.has(kbSelected.name) ? '扫描中...' : '扫描' }}
                     </NButton>
                     <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>

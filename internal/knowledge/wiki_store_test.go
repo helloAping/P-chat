@@ -67,6 +67,30 @@ func TestFileMtime(t *testing.T) {
 	}
 }
 
+func TestClearBaseWithoutLegacyTables(t *testing.T) {
+	ws := newTestWikiStore(t)
+	if err := ws.ClearBase(context.Background(), "test"); err != nil {
+		t.Fatalf("ClearBase on fresh schema: %v", err)
+	}
+}
+
+func TestMigrateBaseToIndexWithoutLegacyTables(t *testing.T) {
+	ws := newTestWikiStore(t)
+	n, err := ws.MigrateBaseToIndex(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("MigrateBaseToIndex on fresh schema: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("MigrateBaseToIndex = %d, want 0", n)
+	}
+}
+
+func TestTruncateTextIsRuneSafe(t *testing.T) {
+	if got := TruncateText("你好世界", 2); got != "你好" {
+		t.Fatalf("TruncateText() = %q", got)
+	}
+}
+
 func TestGetOrOpenWikiStore_Cache(t *testing.T) {
 	dir := t.TempDir()
 	ws1, err := GetOrOpenWikiStore("testcache", dir)
@@ -151,6 +175,25 @@ func TestIndexStore_LookupSearch_EmptyQuery_ListsL2(t *testing.T) {
 	}
 }
 
+func TestIndexStore_LookupSearch_EmptyQuery_Level3ListsSections(t *testing.T) {
+	ws := newTestWikiStore(t)
+	defer ws.Close()
+	createTestIndexData(t, ws, "testlevel3")
+
+	res, err := ws.LookupSearch(context.Background(), "", "testlevel3", false, 3, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Total != 3 {
+		t.Fatalf("want 3 L3 items, got %d", res.Total)
+	}
+	for _, it := range res.Items {
+		if it.Level != 3 {
+			t.Fatalf("level=3 should only return L3 nodes, got %+v", it)
+		}
+	}
+}
+
 func TestIndexStore_LookupSearch_KeywordMatch(t *testing.T) {
 	ws := newTestWikiStore(t)
 	defer ws.Close()
@@ -173,6 +216,38 @@ func TestIndexStore_LookupSearch_KeywordMatch(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("keyword search for 'oauth' should find Authentication: %+v", res.Items)
+	}
+}
+
+func TestIndexStore_LookupSearch_LevelFilter(t *testing.T) {
+	ws := newTestWikiStore(t)
+	defer ws.Close()
+	createTestIndexData(t, ws, "testlevels")
+
+	res, err := ws.LookupSearch(context.Background(), "guide", "testlevels", false, 2, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Items) == 0 {
+		t.Fatal("expected level=2 search results")
+	}
+	for _, it := range res.Items {
+		if it.Level != 2 {
+			t.Fatalf("level=2 should only return L2 nodes, got %+v", it)
+		}
+	}
+
+	res, err = ws.LookupSearch(context.Background(), "guide", "testlevels", false, 3, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Items) == 0 {
+		t.Fatal("expected level=3 search results")
+	}
+	for _, it := range res.Items {
+		if it.Level != 3 {
+			t.Fatalf("level=3 should only return L3 nodes, got %+v", it)
+		}
 	}
 }
 
