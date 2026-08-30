@@ -41,6 +41,7 @@ test('input send queues messages while current session streams', () => {
 
   assert.doesNotMatch(match[1], /if \(isStreaming\.value\) \{[\s\S]*?return[\s\S]*?\}/)
   assert.match(source, /const currentConversationBusy = computed\(\(\) =>[\s\S]*?!!state\.turnQueueDraining\[state\.currentID\]/)
+  assert.match(source, /currentSessionWorking\.value/)
   assert.match(source, /const shouldQueue = currentConversationBusy\.value \|\| currentTurnQueue\.value\.length > 0/)
   assert.match(source, /await enqueueTurnQueue\(id, turnPayload\)/)
   assert.match(source, /消息已加入队列/)
@@ -79,6 +80,16 @@ test('turn queue view only shows waiting or failed items', () => {
   assert.match(match[1], /item\.status === 'queued'/)
   assert.match(match[1], /item\.status === 'failed'/)
   assert.doesNotMatch(match[1], /item\.status === 'running'/)
+})
+
+test('session working state includes background work for queue gating', () => {
+  const source = readStoreSource()
+
+  assert.match(source, /export function isSessionWorking\(id: string\): boolean/)
+  assert.match(source, /state\.sessionBackgroundSubAgentJobs\[id\]/)
+  assert.match(source, /state\.sessionBackgroundHookMerging\[id\]/)
+  assert.match(source, /state\.isRecovering\[id\]/)
+  assert.match(source, /export const currentSessionWorking = computed\(\(\) => isSessionWorking\(state\.currentID\)\)/)
 })
 
 test('input textarea has a manual right-click edit menu with feedback actions', () => {

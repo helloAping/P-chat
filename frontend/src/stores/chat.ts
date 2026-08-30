@@ -312,15 +312,19 @@ export const currentRecoveryBanner = computed(() => {
   return b
 })
 
-// currentSessionWorking — true while the LLM is mid-turn
-// for the current session. The TodoPanel state machine
-// combines this with currentTodos to decide whether to
-// show, hide, or clear the dock.
-export const currentSessionWorking = computed(() =>
-  !!state.sessionWorking[state.currentID] ||
-  (state.sessionBackgroundSubAgentJobs[state.currentID] || 0) > 0 ||
-  !!state.sessionBackgroundHookMerging[state.currentID],
-)
+export function isSessionWorking(id: string): boolean {
+  if (!id) return false
+  return !!state.sessionWorking[id] ||
+    (state.sessionBackgroundSubAgentJobs[id] || 0) > 0 ||
+    !!state.sessionBackgroundHookMerging[id] ||
+    !!state.isRecovering[id]
+}
+
+// currentSessionWorking — true while the current session
+// is still producing or merging turn output. The TodoPanel
+// and input queue both use this single gate so queued
+// messages only run after the whole visible turn settles.
+export const currentSessionWorking = computed(() => isSessionWorking(state.currentID))
 
 export function setSessionBackgroundSubAgentJobs(id: string, count: number) {
   if (!id) return

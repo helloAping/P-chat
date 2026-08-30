@@ -24,7 +24,7 @@ import {
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
-  deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn,
+  deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
 } from '../stores/chat'
 import type { PendingAttachment } from '../stores/chat'
 import { drainQueuedConversationTurns, stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
@@ -1478,7 +1478,7 @@ const queueSignature = computed(() => queuedTurns.value.map(item => `${item.id}:
 const queueDraining = computed(() => !!state.turnQueueDraining[state.currentID])
 const currentConversationBusy = computed(() =>
   isStreaming.value ||
-  !!state.sessionWorking[state.currentID] ||
+  currentSessionWorking.value ||
   !!state.turnQueueDraining[state.currentID],
 )
 

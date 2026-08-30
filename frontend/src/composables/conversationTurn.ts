@@ -9,6 +9,7 @@ import {
   hasBlockingTurnQueueFailure,
   hasQueuedTurns,
   isActiveStream,
+  isSessionWorking,
   loadTurnQueue,
   recoverMissingParts,
   setTurnQueueDraining,
@@ -154,7 +155,7 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
 
 export async function drainQueuedConversationTurns(sessionId: string): Promise<void> {
   if (!sessionId || drainingSessions.has(sessionId)) return
-  if (state.streaming[sessionId]) return
+  if (state.streaming[sessionId] || isSessionWorking(sessionId)) return
   if (hasBlockingTurnQueueFailure(sessionId)) return
   if (state.pendingQuestion[sessionId]) return
   if ((state.pendingConfirm[sessionId] || []).length > 0) return
@@ -164,7 +165,7 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
   try {
     await loadTurnQueue(sessionId)
     while (hasQueuedTurns(sessionId) && !hasBlockingTurnQueueFailure(sessionId)) {
-      if (state.streaming[sessionId]) break
+      if (state.streaming[sessionId] || isSessionWorking(sessionId)) break
       if (state.pendingQuestion[sessionId]) break
       if ((state.pendingConfirm[sessionId] || []).length > 0) break
 

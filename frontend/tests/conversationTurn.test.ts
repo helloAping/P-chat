@@ -32,8 +32,11 @@ test('conversation turn drains queued turns after a completed stream', () => {
   const source = readTurnSource()
 
   assert.match(source, /export async function drainQueuedConversationTurns\(sessionId: string\)/)
+  assert.match(source, /isSessionWorking/)
   assert.match(source, /const drainingSessions = new Set<string>\(\)/)
   assert.match(source, /streamReturned && !drainingSessions\.has\(input\.sessionId\)/)
+  assert.match(source, /if \(state\.streaming\[sessionId\] \|\| isSessionWorking\(sessionId\)\) return/)
+  assert.match(source, /if \(state\.streaming\[sessionId\] \|\| isSessionWorking\(sessionId\)\) break/)
   assert.match(source, /await claimNextQueuedTurnForDrain\(sessionId\)/)
   assert.match(source, /appendLocalUserMessage\(sessionId/)
   assert.match(source, /const completed = await submitConversationTurn/)
