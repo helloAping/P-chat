@@ -293,7 +293,7 @@ export const currentTodos = computed(() =>
 
 export const currentTurnQueue = computed(() =>
   (state.turnQueue[state.currentID] || []).filter(item =>
-    item.status === 'queued' || item.status === 'running' || item.status === 'failed',
+    item.status === 'queued' || item.status === 'failed',
   ),
 )
 

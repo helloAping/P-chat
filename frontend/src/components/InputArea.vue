@@ -1484,7 +1484,6 @@ const currentConversationBusy = computed(() =>
 
 function queuedTurnStatusLabel(status: string): string {
   if (status === 'failed') return '失败'
-  if (status === 'running') return '执行中'
   return '等待'
 }
 
@@ -1608,7 +1607,6 @@ onMounted(() => {
               <RotateCcw :size="13" />
             </button>
             <button
-              v-if="item.status !== 'running'"
               type="button"
               class="turn-queue-icon"
               title="删除"

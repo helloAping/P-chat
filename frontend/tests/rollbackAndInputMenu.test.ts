@@ -45,7 +45,6 @@ test('input send queues messages while current session streams', () => {
   assert.match(source, /await enqueueTurnQueue\(id, turnPayload\)/)
   assert.match(source, /消息已加入队列/)
   assert.match(source, /:title="currentConversationBusy \? '加入队列 \(Enter\)' : '发送 \(Enter\)'"/)
-  assert.match(source, /v-if="item\.status !== 'running'"/)
 })
 
 test('input confirms and clears unfinished todos before sending a new message', () => {
@@ -72,10 +71,14 @@ test('initial session load preserves messages created while history is in flight
   )
 })
 
-test('turn queue view keeps running items visible', () => {
+test('turn queue view only shows waiting or failed items', () => {
   const source = readStoreSource()
 
-  assert.match(source, /export const currentTurnQueue = computed\(\(\) =>[\s\S]*?item\.status === 'running'/)
+  const match = source.match(/export const currentTurnQueue = computed\(\(\) =>([\s\S]*?)\n\)/)
+  assert.ok(match, 'currentTurnQueue computed should exist')
+  assert.match(match[1], /item\.status === 'queued'/)
+  assert.match(match[1], /item\.status === 'failed'/)
+  assert.doesNotMatch(match[1], /item\.status === 'running'/)
 })
 
 test('input textarea has a manual right-click edit menu with feedback actions', () => {
