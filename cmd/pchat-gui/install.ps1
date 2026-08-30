@@ -663,7 +663,7 @@ if (-not $Portable) {
     $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\P-Chat"
     New-Item -Path $regPath -Force | Out-Null
     Set-ItemProperty -LiteralPath $regPath -Name "DisplayName"     -Value "P-Chat"
-    Set-ItemProperty -LiteralPath $regPath -Name "DisplayVersion"  -Value "1.0.12"
+    Set-ItemProperty -LiteralPath $regPath -Name "DisplayVersion"  -Value "1.0.13"
     Set-ItemProperty -LiteralPath $regPath -Name "Publisher"       -Value "P-Chat"
     Set-ItemProperty -LiteralPath $regPath -Name "InstallLocation" -Value $target
     Set-ItemProperty -LiteralPath $regPath -Name "UninstallString" -Value "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$target\uninstall.ps1`""

@@ -1620,12 +1620,13 @@ onMounted(() => {
               <span>会话设置</span>
             </div>
 
+            <div class="session-config-grid">
             <div class="session-config-row">
               <div class="session-config-label">
                 <span>风格</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1676,12 +1677,15 @@ onMounted(() => {
               </div>
             </div>
 
-            <div class="session-config-row">
+            <div
+              class="session-config-row"
+              :class="{ 'session-config-row--span2': kbOptions.length > 3 }"
+            >
               <div class="session-config-label">
                 <span>知识库</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1725,7 +1729,7 @@ onMounted(() => {
                 <span>思考</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1765,7 +1769,7 @@ onMounted(() => {
                 <span>图像识别</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1816,7 +1820,7 @@ onMounted(() => {
                 <span>子代理模型</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1877,12 +1881,12 @@ onMounted(() => {
               </div>
             </div>
 
-            <div class="session-config-row">
+            <div class="session-config-row session-config-row--span2">
               <div class="session-config-label">
                 <span>长任务</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1915,6 +1919,7 @@ onMounted(() => {
                   {{ opt.label }}
                 </button>
               </div>
+            </div>
             </div>
           </div>
         </NPopover>
@@ -2370,7 +2375,7 @@ onMounted(() => {
   text-overflow: ellipsis;
 }
 .session-config-popover {
-  width: min(520px, calc(100vw - 32px));
+  width: min(560px, calc(100vw - 32px));
   background: var(--surface-1);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
@@ -2384,36 +2389,48 @@ onMounted(() => {
   color: var(--text-primary);
   font-size: 13px;
   font-weight: 600;
-  padding: var(--space-4) var(--space-5) var(--space-3);
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border-subtle);
+}
+.session-config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--border-subtle);
 }
 .session-config-row {
-  display: grid;
-  grid-template-columns: 88px minmax(0, 1fr);
-  gap: var(--space-3);
-  align-items: start;
-  padding: var(--space-3) var(--space-5);
-  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: stretch;
+  padding: var(--space-3);
+  background: var(--surface-1);
+  min-width: 0;
 }
-.session-config-row:last-child {
-  border-bottom: none;
+.session-config-row--span2 {
+  grid-column: 1 / -1;
+}
+@media (max-width: 560px) {
+  .session-config-grid {
+    grid-template-columns: 1fr;
+  }
 }
 .session-config-label {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-1);
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
-  line-height: 30px;
+  line-height: 1.2;
   white-space: nowrap;
 }
 .session-config-help {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   padding: 0;
   background: transparent;
   border: 1px solid transparent;
@@ -2430,7 +2447,7 @@ onMounted(() => {
   color: var(--text-primary);
 }
 .session-config-help-popover {
-  width: 300px;
+  width: 280px;
   padding: var(--space-3);
   background: var(--surface-1);
   border: 1px solid var(--border-default);
@@ -2460,17 +2477,17 @@ onMounted(() => {
 .session-config-options {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-2);
+  gap: var(--space-1);
   min-width: 0;
 }
 .session-config-choice {
-  min-height: 30px;
-  padding: 0 var(--space-3);
-  background: var(--surface-1);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  min-height: 26px;
+  padding: 0 var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
@@ -2507,7 +2524,7 @@ onMounted(() => {
 }
 .session-config-choice-label {
   min-width: 0;
-  max-width: 16rem;
+  max-width: 10rem;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -2515,8 +2532,7 @@ onMounted(() => {
   flex-basis: 100%;
   color: var(--text-tertiary);
   font-size: 11.5px;
-  line-height: 1.5;
-  padding-top: var(--space-1);
+  line-height: 1.4;
 }
 
 /* --- Permission popover ---------------------------------------- */

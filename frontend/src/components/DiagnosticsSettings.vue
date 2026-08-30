@@ -260,13 +260,13 @@ onBeforeUnmount(() => {
 .diagnostics-body {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: var(--space-4);
 }
 
 .settings-card {
-  background: var(--bg-2);
-  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.2));
-  border-radius: 10px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
   padding: 14px 16px;
 }
 
@@ -274,34 +274,35 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 12px;
+  margin-bottom: var(--space-3);
 }
 
 .card-title {
   font-weight: 600;
   font-size: 13px;
+  color: var(--text-primary);
 }
 
 .goroutine-tag {
-  margin-bottom: 10px;
+  margin-bottom: var(--space-3);
 }
 
 .mem-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 10px 16px;
-  margin-bottom: 14px;
+  gap: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
 }
 
 .mem-cell {
-  background: var(--bg-1, rgba(128, 128, 128, 0.08));
-  border-radius: 8px;
-  padding: 8px 10px;
+  background: var(--surface-2);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
 }
 
 .mem-label {
-  font-size: 11px;
-  opacity: 0.65;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
 }
 
 .mem-value {
@@ -309,24 +310,26 @@ onBeforeUnmount(() => {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   margin-top: 2px;
+  color: var(--text-primary);
 }
 
 .snapshot-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-3);
   flex-wrap: wrap;
 }
 
 .snapshot-hint {
-  font-size: 11px;
-  opacity: 0.6;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
 }
 
 .snapshot-hint code {
-  background: var(--bg-1, rgba(128, 128, 128, 0.12));
+  background: var(--surface-2);
   padding: 1px 4px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
 }
 
 .form-grid {
@@ -382,12 +385,11 @@ onBeforeUnmount(() => {
 }
 
 .save-hint {
-  font-size: 11px;
-  opacity: 0.5;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
 }
 
 .save-hint.dirty {
-  opacity: 1;
-  color: var(--accent);
+  color: var(--brand-600);
 }
 </style>

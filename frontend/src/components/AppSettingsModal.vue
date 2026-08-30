@@ -28,7 +28,7 @@ import {
   NRadioGroup, NRadioButton, useMessage,
 } from 'naive-ui'
 import {
-  X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash,
+  X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash, Folder,
   Cpu, Activity, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
   MessageSquare,
 } from './icons'
@@ -189,17 +189,17 @@ const show = ref(true)
 // content — the rest of the layout picks it up
 // automatically.
 const settingsTabs = [
-  { name: 'providers', label: 'LLM 提供商',  icon: Cpu,      description: 'API key 与模型管理' },
-  { name: 'styles',    label: '风格',          icon: Palette,  description: '人格与记忆模板' },
-  { name: 'system',    label: '系统',          icon: SettingsIcon, description: '限额、子代理、行为' },
-  { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话' },
-  { name: 'skills',    label: '技能',          icon: Wrench,   description: '可加载的技能包' },
-  { name: 'mcp',       label: 'MCP',           icon: Terminal, description: 'Model Context Protocol 服务器' },
-  { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索' },
-  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商' },
-  { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制' },
-  { name: 'im',        label: 'IM 桥接',      icon: MessageSquare, description: '飞书 / Telegram / 企微 / QQ / 微信' },
-  { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照' },
+  { name: 'providers', label: 'LLM 提供商',  icon: Cpu,      description: 'API key 与模型管理', group: '对话' },
+  { name: 'styles',    label: '风格',          icon: Palette,  description: '人格与记忆模板', group: '对话' },
+  { name: 'system',    label: '系统',          icon: SettingsIcon, description: '限额、子代理、行为', group: '对话' },
+  { name: 'skills',    label: '技能',          icon: Wrench,   description: '可加载的技能包', group: '能力' },
+  { name: 'mcp',       label: 'MCP',           icon: Terminal, description: 'Model Context Protocol 服务器', group: '能力' },
+  { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索', group: '能力' },
+  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商', group: '能力' },
+  { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制', group: '能力' },
+  { name: 'im',        label: 'IM 桥接',      icon: MessageSquare, description: '飞书 / Telegram / 企微 / QQ / 微信', group: '能力' },
+  { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话', group: '数据' },
+  { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照', group: '数据' },
 ]
 
 // --- Provider state ---
@@ -1792,6 +1792,20 @@ function scanLabel(name: string) {
   return `${phase} ${s.current}/${s.total} (${stats})`
 }
 
+function scanPhase(name: string) {
+  const s = kbScanStatus.value.get(name)
+  if (!s) return ''
+  if (s.error) return '扫描失败'
+  if (s.done) return s.chunks > 0 ? `扫描完成 · ${s.chunks} 章节` : '扫描完成'
+  return s.message || '扫描中'
+}
+
+function scanProgressPct(name: string) {
+  const s = kbScanStatus.value.get(name)
+  if (!s || s.total <= 0) return 0
+  return Math.min(100, Math.round((s.current / s.total) * 100))
+}
+
 function kbModelSupportsVision(scanModel: string) {
   const parts = scanModel.split('/')
   if (parts.length !== 2) return false
@@ -1822,7 +1836,7 @@ function kbModelSupportsVision(scanModel: string) {
       class="settings-no-bar"
     >
       <NTabPane name="providers" tab="LLM 提供商" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
-        <div class="providers-split">
+        <div class="providers-split settings-split">
           <!-- Left: provider list -->
           <aside class="provider-list">
             <div class="provider-list-header">
@@ -2239,18 +2253,9 @@ function kbModelSupportsVision(scanModel: string) {
         <div class="system-config-shell">
           <div class="system-config-scroll">
             <div class="system-config-body">
-              <!-- PR #9: top-level section header for the
-                   system config. The inner NCollapse groups
-                   still use the existing .sys-* class names
-                   for backward compat. -->
-              <div class="settings-section">
-                <div class="settings-section-header">
-                  <h3 class="settings-section-title">系统行为</h3>
-                </div>
-                <p class="settings-section-description">
-                  上下文、Agent 循环、子代理的全局行为。修改后点击右下「保存」生效。
-                </p>
-              </div>
+              <p class="settings-section-description sys-lead">
+                上下文、Agent 循环、子代理的全局行为。修改后点击右下「保存」生效。
+              </p>
               <NCollapse class="settings-collapse" :default-expanded-names="['work-mode', 'vision', 'window', 'context', 'agent', 'subagent']">
                 <NCollapseItem title="工作模式" name="work-mode">
                   <div class="sys-form-grid">
@@ -2403,86 +2408,87 @@ function kbModelSupportsVision(scanModel: string) {
       </NTabPane>
 
       <NTabPane name="archive" tab="归档" style="flex: 1; min-height: 0; overflow: auto">
-        <div v-if="!archivedSessions.length && !loadingArchived" class="empty-hint">
-          暂无归档对话
-        </div>
-        <div v-else v-for="[project, sessions] in archivedGroups" :key="project" class="archive-group">
-          <div class="archive-group-title">{{ project }}</div>
-          <div v-for="s in (sessions as Session[])" :key="s.id" class="archive-row">
-            <span class="archive-title">{{ s.title || '(无标题)' }}</span>
-            <span class="archive-meta">{{ formatArchiveTime(s.updated_at) }}</span>
-            <NButton size="tiny" quaternary @click="onUnarchive(s.id)">恢复</NButton>
-            <NButton size="tiny" quaternary @click="onPermDelete(s.id)" style="color: var(--warn)">删除</NButton>
+        <div class="archive-tab">
+          <div v-if="!archivedSessions.length && !loadingArchived" class="settings-empty">
+            暂无归档对话
+          </div>
+          <div v-else v-for="[project, sessions] in archivedGroups" :key="project" class="archive-group">
+            <div class="archive-group-title">{{ project }}</div>
+            <div v-for="s in (sessions as Session[])" :key="s.id" class="archive-row">
+              <span class="archive-title">{{ s.title || '(无标题)' }}</span>
+              <span class="archive-meta">{{ formatArchiveTime(s.updated_at) }}</span>
+              <NButton size="tiny" quaternary @click="onUnarchive(s.id)">恢复</NButton>
+              <NButton size="tiny" quaternary type="error" @click="onPermDelete(s.id)">删除</NButton>
+            </div>
           </div>
         </div>
       </NTabPane>
 
-      <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; display: flex; flex-direction: column">
-        <!-- Repo chips (top bar) -->
-        <div class="skill-repos-bar">
-          <span class="skill-hint" style="white-space:nowrap">官方仓库</span>
-          <div class="repo-chips">
-            <NButton v-for="r in builtInRepos" :key="r.url" size="tiny"
-              :type="activeRepoUrl === r.url ? 'primary' : 'default'"
-              @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
-          </div>
-          <span v-if="savedRepos.length" class="skill-hint" style="margin-left:8px">我的</span>
-          <div v-if="savedRepos.length" class="repo-chips">
-            <template v-for="r in savedRepos" :key="r.url">
-              <NButton size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'"
+      <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
+        <div class="skills-shell settings-split">
+          <div class="skill-repos-bar">
+            <span class="skill-hint">官方仓库</span>
+            <div class="repo-chips">
+              <NButton v-for="r in builtInRepos" :key="r.url" size="tiny"
+                :type="activeRepoUrl === r.url ? 'primary' : 'default'"
                 @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
-              <NButton size="tiny" quaternary @click="onRemoveRepo(r.url)"
-                style="color:var(--warn);font-size:10px;min-width:16px;padding:0 2px">×</NButton>
-            </template>
-          </div>
-          <NButton size="tiny" quaternary @click="showAddRepo = true" style="margin-left:2px">+添加</NButton>
-          <span v-if="searching" style="font-size:11px;color:var(--text-4);margin-left:8px">加载中…</span>
-        </div>
-
-        <!-- Two-column body -->
-        <div class="skill-columns">
-          <!-- Left: repo search results -->
-          <div class="skill-col skill-col-left">
-            <div class="skill-col-header">
-              <span class="skill-section-title">仓库技能</span>
-              <NInput v-model:value="repoSkillFilter" placeholder="筛选…" size="tiny" clearable style="width:130px" />
             </div>
-            <div class="skill-col-body">
-              <div v-if="!activeRepoUrl" class="empty-hint">选择上方仓库查看可安装的技能</div>
-              <div v-else-if="searching" class="empty-hint">正在加载…</div>
-              <div v-else-if="!filteredSearchResults.length" class="empty-hint">
-                {{ searchResults.length ? '无匹配' : '该仓库无可安装技能' }}
+            <span v-if="savedRepos.length" class="skill-hint">我的</span>
+            <div v-if="savedRepos.length" class="repo-chips">
+              <template v-for="r in savedRepos" :key="r.url">
+                <NButton size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'"
+                  @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+                <NButton size="tiny" quaternary type="error" @click="onRemoveRepo(r.url)" title="移除仓库">
+                  <X :size="12" />
+                </NButton>
+              </template>
+            </div>
+            <NButton size="tiny" quaternary @click="showAddRepo = true">+ 添加</NButton>
+            <span v-if="searching" class="skill-hint">加载中…</span>
+          </div>
+
+          <div class="skill-columns">
+            <div class="skill-col skill-col-left">
+              <div class="skill-col-header">
+                <span class="skill-section-title">仓库技能</span>
+                <NInput v-model:value="repoSkillFilter" placeholder="筛选…" size="tiny" clearable class="skill-filter" />
               </div>
-              <template v-else>
-                <div v-for="r in filteredSearchResults" :key="r.name" class="skill-result-row">
-                  <div class="skill-result-info">
-                    <span class="skill-result-name">{{ r.name }}</span>
-                    <span class="skill-result-desc">{{ r.description }}</span>
-                  </div>
-                  <NButton size="tiny" type="primary" :loading="installing === r.name"
-                    @click="onInstallSkill(r.name, r.url)">安装</NButton>
+              <div class="skill-col-body">
+                <div v-if="!activeRepoUrl" class="settings-empty">选择上方仓库查看可安装的技能</div>
+                <div v-else-if="searching" class="settings-empty">正在加载…</div>
+                <div v-else-if="!filteredSearchResults.length" class="settings-empty">
+                  {{ searchResults.length ? '无匹配' : '该仓库无可安装技能' }}
                 </div>
-              </template>
+                <template v-else>
+                  <div v-for="r in filteredSearchResults" :key="r.name" class="skill-result-row">
+                    <div class="skill-result-info">
+                      <span class="skill-result-name">{{ r.name }}</span>
+                      <span class="skill-result-desc">{{ r.description }}</span>
+                    </div>
+                    <NButton size="tiny" type="primary" :loading="installing === r.name"
+                      @click="onInstallSkill(r.name, r.url)">安装</NButton>
+                  </div>
+                </template>
+              </div>
             </div>
-          </div>
 
-          <!-- Right: installed skills -->
-          <div class="skill-col skill-col-right">
-            <div class="skill-col-header">
-              <span class="skill-section-title">已安装（{{ loadedSkills.length }}）</span>
-              <NInput v-model:value="installedSkillFilter" placeholder="筛选…" size="tiny" clearable style="width:130px" />
-            </div>
-            <div class="skill-col-body">
-              <div v-if="!filteredSkills.length" class="empty-hint">{{ installedSkillFilter ? '无匹配' : '暂无已安装技能' }}</div>
-              <template v-else>
-                <div v-for="s in filteredSkills" :key="s.name" class="skill-result-row">
-                  <div class="skill-result-info">
-                    <span class="skill-result-name">{{ s.name }}</span>
-                    <span class="skill-result-desc">{{ s.description }}</span>
+            <div class="skill-col skill-col-right">
+              <div class="skill-col-header">
+                <span class="skill-section-title">已安装（{{ loadedSkills.length }}）</span>
+                <NInput v-model:value="installedSkillFilter" placeholder="筛选…" size="tiny" clearable class="skill-filter" />
+              </div>
+              <div class="skill-col-body">
+                <div v-if="!filteredSkills.length" class="settings-empty">{{ installedSkillFilter ? '无匹配' : '暂无已安装技能' }}</div>
+                <template v-else>
+                  <div v-for="s in filteredSkills" :key="s.name" class="skill-result-row">
+                    <div class="skill-result-info">
+                      <span class="skill-result-name">{{ s.name }}</span>
+                      <span class="skill-result-desc">{{ s.description }}</span>
+                    </div>
+                    <NButton size="tiny" quaternary type="error" @click="onDeleteSkill(s.name)">删除</NButton>
                   </div>
-                  <NButton size="tiny" quaternary @click="onDeleteSkill(s.name)" style="color:var(--warn)">删除</NButton>
-                </div>
-              </template>
+                </template>
+              </div>
             </div>
           </div>
         </div>
@@ -2633,10 +2639,9 @@ function kbModelSupportsVision(scanModel: string) {
         </div>
       </NTabPane>
 
-      <NTabPane name="knowledge" tab="知识库" style="flex: 1; min-height: 0; overflow: auto">
-        <div class="providers-split">
-          <!-- Left: KB list -->
-          <div class="provider-list">
+      <NTabPane name="knowledge" tab="知识库" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
+        <div class="providers-split settings-split">
+          <aside class="provider-list">
             <div class="provider-list-header">
               <span class="list-title">知识库 ({{ kbBases.length }})</span>
               <NButton size="tiny" type="primary" ghost @click="showAddKB = !showAddKB">
@@ -2644,200 +2649,248 @@ function kbModelSupportsVision(scanModel: string) {
               </NButton>
             </div>
             <div v-if="showAddKB" class="add-form">
-              <NSpace vertical size="small">
-                <NInput v-model:value="newKBName" placeholder="名称" size="tiny" />
-                <NInput v-model:value="newKBPath" placeholder="路径" size="tiny" />
-                <NButton type="primary" size="tiny" @click="onAddKB">提交</NButton>
-              </NSpace>
+              <NInput v-model:value="newKBName" placeholder="名称" size="tiny" />
+              <NInput v-model:value="newKBPath" placeholder="本地路径" size="tiny" />
+              <NButton type="primary" size="tiny" block @click="onAddKB">添加知识库</NButton>
             </div>
             <div class="provider-items">
-              <div
+              <button
                 v-for="b in kbBases"
                 :key="b.name"
-                class="provider-item"
+                type="button"
+                class="provider-item kb-list-item"
                 :class="{ active: b.name === kbSelectedName }"
                 @click="kbSelectedName = b.name"
               >
-                <div class="provider-item-head">
-                  <NTag v-if="b.enabled" type="success" size="tiny" :bordered="false">启用</NTag>
-                  <strong class="provider-item-name">{{ b.name }}</strong>
-                  <NPopconfirm @positive-click="onDeleteKB(b.name)" positive-text="删除" negative-text="取消">
-                    <template #trigger>
-                      <NButton size="tiny" quaternary type="error" @click.stop class="provider-del-btn">
-                        <X :size="12" />
-                      </NButton>
-                    </template>
-                    确定删除知识库「{{ b.name }}」？此操作不可撤销。
-                  </NPopconfirm>
-                </div>
-                <div class="provider-item-sub">
-                  <span class="muted">{{ b.path }}</span>
-                  <span v-if="b.status === 'scanning' || scanningKBs.has(b.name)" style="font-size:10px;color:var(--accent)"> 扫描中</span>
-                  <span v-else-if="b.status === 'ok' && b.doc_count" style="font-size:10px;color:var(--text-3)"> · {{ b.doc_count }} sections</span>
-                  <span v-else-if="b.status === 'error'" style="font-size:10px;color:var(--warn)"> · 错误</span>
-                </div>
-              </div>
-              <div v-if="kbBases.length === 0" class="muted empty-hint">还没有知识库</div>
-            </div>
-          </div>
-
-          <!-- Right: detail pane -->
-          <div class="provider-detail">
-            <div v-if="!kbSelected" class="muted empty-hint">← 选择左侧的知识库</div>
-            <template v-else>
-              <div class="detail-section kb-detail-scroll">
-                <!-- Header -->
-                <div class="kb-header">
-                  <div class="kb-header-left">
-                    <h3 class="section-title">{{ kbSelected.name }}</h3>
-                    <NTag :type="kbSelected.enabled ? 'success' : 'default'" size="tiny" :bordered="false">{{ kbSelected.enabled ? '启用' : '禁用' }}</NTag>
-                    <span class="muted" style="font-size:11px">{{ kbSelected.doc_count || 0 }} 条索引</span>
-                  </div>
-                  <NSpace size="small">
-                    <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name)">
-                      {{ scanningKBs.has(kbSelected.name) ? '扫描中...' : '扫描' }}
-                    </NButton>
-                    <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>
-                    <NPopconfirm @positive-click="onClearKB(kbSelected.name)" positive-text="确定清除" negative-text="取消" placement="left-start">
+                <span class="kb-list-avatar" aria-hidden="true">{{ (b.name || '?').slice(0, 1).toUpperCase() }}</span>
+                <div class="kb-list-body">
+                  <div class="provider-item-head">
+                    <strong class="provider-item-name">{{ b.name }}</strong>
+                    <NTag v-if="b.enabled" type="success" size="tiny" :bordered="false">启用</NTag>
+                    <NPopconfirm @positive-click="onDeleteKB(b.name)" positive-text="删除" negative-text="取消">
                       <template #trigger>
-                        <NButton size="small" type="error" ghost :disabled="scanningKBs.has(kbSelected.name)">清除</NButton>
+                        <NButton size="tiny" quaternary type="error" @click.stop class="provider-del-btn">
+                          <X :size="12" />
+                        </NButton>
                       </template>
-                      确定清除知识库「{{ kbSelected.name }}」的所有扫描数据？此操作不可撤销。
+                      确定删除知识库「{{ b.name }}」？此操作不可撤销。
                     </NPopconfirm>
-                  </NSpace>
-                </div>
-
-                <!-- Scan progress -->
-                <div v-if="kbScanStatus.has(kbSelected.name)" class="scan-progress">
-                  <div class="scan-info">
-                    <span>{{ scanLabel(kbSelected.name) }}</span>
-                    <span v-if="kbScanStatus.get(kbSelected.name)?.error" style="color:var(--warn);font-size:11px">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
                   </div>
-                  <div v-if="!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error" style="display:flex;align-items:center">
-                    <div class="scan-bar">
-                      <div class="scan-bar-fill" :style="{ width: kbScanStatus.get(kbSelected.name)!.total > 0 ? ((kbScanStatus.get(kbSelected.name)!.current / kbScanStatus.get(kbSelected.name)!.total) * 100) + '%' : '0%' }"></div>
-                    </div>
-                    <span class="scan-bar-pct">{{ kbScanStatus.get(kbSelected.name)!.total > 0 ? Math.round((kbScanStatus.get(kbSelected.name)!.current / kbScanStatus.get(kbSelected.name)!.total) * 100) : 0 }}%</span>
+                  <div class="provider-item-sub">
+                    <span class="provider-item-path" :title="b.path">{{ b.path }}</span>
+                    <span v-if="b.status === 'scanning' || scanningKBs.has(b.name)" class="kb-item-status is-scan">扫描中</span>
+                    <span v-else-if="b.status === 'ok' && b.doc_count" class="kb-item-status">{{ b.doc_count }} 条</span>
+                    <span v-else-if="b.status === 'error'" class="kb-item-status is-error">错误</span>
                   </div>
                 </div>
+              </button>
+              <div v-if="kbBases.length === 0" class="settings-empty provider-list-empty">
+                <Database :size="20" />
+                <span>还没有知识库</span>
+                <span class="settings-form-hint">点击「+ 新增」添加本地目录</span>
+              </div>
+            </div>
+          </aside>
 
-                <!-- AI Scan Settings -->
-                <NCollapse class="settings-collapse">
-                  <NCollapseItem title="AI 扫描设置" name="scan">
-                    <div class="kb-settings-grid">
-                      <div class="kb-settings-row">
-                        <div class="kb-settings-card">
-                          <div class="kb-settings-card-title">解析引擎</div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">模型</span>
-                            <NSelect
-                              :value="kbSelected.scan_model || ''"
-                              :options="kbModelOptions"
-                              size="small"
-                              placeholder="纯文本解析"
-                              style="flex:1"
-                              @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'scan_model', v)"
-                            />
-                          </div>
-                          <div v-if="kbSelected.scan_model" class="kb-config-hint">
-                            <span v-if="kbModelSupportsVision(kbSelected.scan_model)" class="kb-hint-accent">视觉模型 — 可处理图片/视频/PDF</span>
-                            <span v-else class="kb-hint-muted">纯文本模型 — 仅处理文本</span>
-                          </div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">媒体类型</span>
-                            <NSelect
-                              :value="kbSelected.scan_media_types || []"
-                              :options="mediaTypeOptions"
-                              size="small"
-                              multiple
-                              placeholder="选择可 AI 处理的媒体"
-                              style="flex:1"
-                              @update:value="(v: string[]) => onUpdateKBField(kbSelected!.name, 'scan_media_types', v)"
-                            />
-                          </div>
+          <div class="provider-detail kb-detail">
+            <div v-if="!kbSelected" class="settings-empty provider-detail-empty">
+              <Database :size="28" />
+              <span>选择左侧知识库</span>
+              <span class="settings-form-hint">查看扫描进度、配置与索引数据</span>
+            </div>
+            <template v-else>
+              <div class="kb-detail-body">
+                <header class="kb-header">
+                  <div class="kb-header-main">
+                    <div class="kb-header-top">
+                      <div class="kb-header-left">
+                        <h3 class="settings-section-title">{{ kbSelected.name }}</h3>
+                        <NTag :type="kbSelected.enabled ? 'success' : 'default'" size="tiny" :bordered="false">
+                          {{ kbSelected.enabled ? '启用' : '禁用' }}
+                        </NTag>
+                        <span class="kb-header-meta">{{ kbSelected.doc_count || 0 }} 条索引</span>
+                      </div>
+                      <div class="kb-header-actions">
+                        <div class="settings-form-toggle kb-enable-toggle">
+                          <NSwitch
+                            size="small"
+                            :value="kbSelected.enabled"
+                            @update:value="(v: boolean) => onToggleKBSwitch(kbSelected!.name, v)"
+                          />
+                          <label class="settings-form-label">启用</label>
                         </div>
-                        <div class="kb-settings-card">
-                          <div class="kb-settings-card-title">自动化</div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">自动扫描</span>
-                            <NSwitch size="small" :value="kbSelected.auto_scan" @update:value="(v: boolean) => onUpdateKBField(kbSelected!.name, 'auto_scan', v)" />
-                          </div>
-                          <div class="kb-config-hint">启动时自动扫描变更</div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">排除模式</span>
-                            <NInput
-                              :value="(kbSelected.exclude_patterns || []).join(', ')"
-                              size="small"
-                              placeholder="*.log, *.tmp"
-                              style="flex:1"
-                              @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'exclude_patterns', v.split(',').map(s => s.trim()).filter(Boolean))"
-                            />
-                          </div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">文件上限</span>
-                            <NInputNumber
-                              :value="kbSelected.max_file_size ? kbSelected.max_file_size / 1048576 : 5"
-                              :min="1" :step="1"
-                              size="small"
-                              style="width:80px"
-                              @update:value="(v: number | null) => onUpdateKBField(kbSelected!.name, 'max_file_size', (v || 5) * 1048576)"
-                            />
-                            <span class="kb-unit">MB</span>
-                          </div>
+                        <div class="settings-form-actions">
+                          <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name)">
+                            {{ scanningKBs.has(kbSelected.name) ? '扫描中…' : '扫描' }}
+                          </NButton>
+                          <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>
+                          <NPopconfirm @positive-click="onClearKB(kbSelected.name)" positive-text="确定清除" negative-text="取消" placement="left-start">
+                            <template #trigger>
+                              <NButton size="small" type="error" ghost :disabled="scanningKBs.has(kbSelected.name)">清除</NButton>
+                            </template>
+                            确定清除知识库「{{ kbSelected.name }}」的所有扫描数据？此操作不可撤销。
+                          </NPopconfirm>
                         </div>
                       </div>
-                      <div class="kb-settings-card">
-                        <div class="kb-settings-card-title">存储</div>
-                        <div class="kb-config-row">
-                          <span class="kb-config-label">路径</span>
-                          <span class="kb-config-val path">{{ kbSelected.path }}</span>
+                    </div>
+                    <div class="kb-header-path" :title="kbSelected.path">
+                      <Folder :size="12" class="kb-header-path-icon" />
+                      <span>{{ kbSelected.path }}</span>
+                    </div>
+                  </div>
+                </header>
+
+                <div
+                  v-if="kbScanStatus.has(kbSelected.name)"
+                  class="scan-progress"
+                  :class="{
+                    'is-error': !!kbScanStatus.get(kbSelected.name)?.error,
+                    'is-done': !!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error,
+                  }"
+                >
+                  <div class="scan-info">
+                    <span class="scan-phase">{{ scanPhase(kbSelected.name) }}</span>
+                    <span
+                      v-if="(kbScanStatus.get(kbSelected.name)?.total ?? 0) > 0 && !kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error"
+                      class="scan-count"
+                    >
+                      {{ kbScanStatus.get(kbSelected.name)!.current }}/{{ kbScanStatus.get(kbSelected.name)!.total }}
+                    </span>
+                    <span v-if="kbScanStatus.get(kbSelected.name)?.error" class="scan-error">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
+                  </div>
+                  <div
+                    v-if="!kbScanStatus.get(kbSelected.name)?.error"
+                    class="scan-stats"
+                    :aria-label="scanLabel(kbSelected.name)"
+                  >
+                    <span class="scan-stat">更新 {{ kbScanStatus.get(kbSelected.name)?.changed ?? 0 }}</span>
+                    <span class="scan-stat">跳过 {{ kbScanStatus.get(kbSelected.name)?.skipped ?? 0 }}</span>
+                    <span class="scan-stat">删除 {{ kbScanStatus.get(kbSelected.name)?.deleted ?? 0 }}</span>
+                    <span class="scan-stat" :class="{ 'is-fail': (kbScanStatus.get(kbSelected.name)?.failed ?? 0) > 0 }">
+                      失败 {{ kbScanStatus.get(kbSelected.name)?.failed ?? 0 }}
+                    </span>
+                  </div>
+                  <div
+                    v-if="!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error"
+                    class="scan-bar-row"
+                  >
+                    <div class="scan-bar">
+                      <div class="scan-bar-fill" :style="{ width: scanProgressPct(kbSelected.name) + '%' }"></div>
+                    </div>
+                    <span class="scan-bar-pct">{{ scanProgressPct(kbSelected.name) }}%</span>
+                  </div>
+                </div>
+
+                <NCollapse class="settings-collapse settings-collapse--inset kb-scan-collapse" :default-expanded-names="[]">
+                  <NCollapseItem title="AI 扫描设置" name="scan">
+                    <div class="settings-form settings-form--grid kb-scan-form">
+                      <div class="settings-form-row settings-form-row--span2">
+                        <label class="settings-form-label">解析模型</label>
+                        <NSelect
+                          :value="kbSelected.scan_model || ''"
+                          :options="kbModelOptions"
+                          size="small"
+                          placeholder="纯文本解析"
+                          @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'scan_model', v)"
+                        />
+                        <span v-if="kbSelected.scan_model && kbModelSupportsVision(kbSelected.scan_model)" class="settings-form-hint kb-hint-accent">视觉模型 — 可处理图片 / 视频 / PDF</span>
+                        <span v-else-if="kbSelected.scan_model" class="settings-form-hint">纯文本模型 — 仅处理文本</span>
+                        <span v-else class="settings-form-hint">不选则按纯文本解析</span>
+                      </div>
+                      <div class="settings-form-row">
+                        <label class="settings-form-label">媒体类型</label>
+                        <NSelect
+                          :value="kbSelected.scan_media_types || []"
+                          :options="mediaTypeOptions"
+                          size="small"
+                          multiple
+                          placeholder="选择可 AI 处理的媒体"
+                          @update:value="(v: string[]) => onUpdateKBField(kbSelected!.name, 'scan_media_types', v)"
+                        />
+                      </div>
+                      <div class="settings-form-row">
+                        <label class="settings-form-label">文件上限</label>
+                        <div class="kb-size-row">
+                          <NInputNumber
+                            :value="kbSelected.max_file_size ? kbSelected.max_file_size / 1048576 : 5"
+                            :min="1" :step="1"
+                            size="small"
+                            class="kb-size-input"
+                            @update:value="(v: number | null) => onUpdateKBField(kbSelected!.name, 'max_file_size', (v || 5) * 1048576)"
+                          />
+                          <span class="kb-unit">MB</span>
                         </div>
-                        <div class="kb-config-row">
-                          <span class="kb-config-label">状态</span>
-                          <NSwitch size="small" :value="kbSelected.enabled" @update:value="(v: boolean) => onToggleKBSwitch(kbSelected!.name, v)" />
+                      </div>
+                      <div class="settings-form-row settings-form-row--span2">
+                        <label class="settings-form-label">排除模式</label>
+                        <NInput
+                          :value="(kbSelected.exclude_patterns || []).join(', ')"
+                          size="small"
+                          placeholder="*.log, *.tmp"
+                          @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'exclude_patterns', v.split(',').map(s => s.trim()).filter(Boolean))"
+                        />
+                        <span class="settings-form-hint">逗号分隔的 glob，匹配文件将被跳过</span>
+                      </div>
+                      <div class="settings-form-row settings-form-row--span2 settings-form-row--inline kb-scan-toggle-row">
+                        <div class="settings-form-toggle">
+                          <NSwitch size="small" :value="kbSelected.auto_scan" @update:value="(v: boolean) => onUpdateKBField(kbSelected!.name, 'auto_scan', v)" />
+                          <label class="settings-form-label">自动扫描</label>
                         </div>
+                        <span class="settings-form-hint">启动或路径变更时扫描更新</span>
                       </div>
                     </div>
                   </NCollapseItem>
                 </NCollapse>
 
-                <!-- Tree + Detail split -->
-                <div class="kb-tree-panel">
-                  <div class="kb-tree-left">
-                    <div class="kb-tree-toolbar">
-                      <NInput v-model:value="kbNodeFilter" placeholder="筛选节点..." size="tiny" clearable style="flex:1" />
-                      <NButton size="tiny" quaternary @click="loadKBNodes(kbSelected!.name)" title="刷新" aria-label="刷新">
-                        <RotateCw :size="12" />
-                      </NButton>
-                    </div>
-                    <div class="kb-tree-scroll">
-                      <div v-if="kbNodesLoading" class="muted" style="padding:16px;text-align:center">加载中...</div>
-                      <NTree
-                        v-else-if="kbTreeNodeData.length > 0"
-                        :data="kbTreeNodeData"
-                        :selected-keys="kbSelectedNodeKeys"
-                        :expanded-keys="kbExpandedNodeKeys"
-                        :pattern="kbNodeFilter"
-                        block-node
-                        selectable
-                        :render-label="renderTreeLabel"
-                        :render-suffix="renderTreeSuffix"
-                        @update:selected-keys="onTreeNodeSelect"
-                        @update:expanded-keys="onTreeNodeExpand"
-                        virtual-scroll
-                        style="max-height:100%"
-                      />
-                      <div v-else class="muted" style="padding:16px;text-align:center;font-size:11px">（暂无索引节点，请先扫描）</div>
-                    </div>
+                <section class="kb-explorer">
+                  <div class="kb-explorer-head">
+                    <span class="kb-explorer-title">索引数据</span>
+                    <span v-if="kbNodes.length > 0" class="kb-explorer-meta">{{ kbNodes.length }} 节点</span>
                   </div>
+                  <div class="kb-tree-panel">
+                    <div class="kb-tree-left">
+                      <div class="kb-tree-toolbar">
+                        <NInput v-model:value="kbNodeFilter" placeholder="筛选节点…" size="tiny" clearable class="kb-tree-filter" />
+                        <NButton size="tiny" quaternary @click="loadKBNodes(kbSelected!.name)" title="刷新" aria-label="刷新">
+                          <RotateCw :size="12" />
+                        </NButton>
+                      </div>
+                      <div class="kb-tree-scroll">
+                        <div v-if="kbNodesLoading" class="kb-panel-empty">加载中…</div>
+                        <NTree
+                          v-else-if="kbTreeNodeData.length > 0"
+                          :data="kbTreeNodeData"
+                          :selected-keys="kbSelectedNodeKeys"
+                          :expanded-keys="kbExpandedNodeKeys"
+                          :pattern="kbNodeFilter"
+                          block-node
+                          selectable
+                          :render-label="renderTreeLabel"
+                          :render-suffix="renderTreeSuffix"
+                          @update:selected-keys="onTreeNodeSelect"
+                          @update:expanded-keys="onTreeNodeExpand"
+                          virtual-scroll
+                          class="kb-tree"
+                        />
+                        <div v-else class="kb-panel-empty">
+                          <Database :size="22" />
+                          <span>暂无索引节点</span>
+                          <span class="settings-form-hint">点击上方「扫描」建立索引</span>
+                        </div>
+                      </div>
+                    </div>
 
-                  <div class="kb-tree-right">
-                    <div v-if="!kbActiveNode" class="muted" style="padding:24px;text-align:center;font-size:12px">选择左侧节点查看详情</div>
+                    <div class="kb-tree-right">
+                      <div v-if="!kbActiveNode" class="kb-panel-empty">
+                        <FileText :size="22" />
+                        <span>选择左侧节点</span>
+                        <span class="settings-form-hint">查看概览、章节与内容块</span>
+                      </div>
                     <template v-else>
                       <div class="kb-node-detail">
                         <div class="kb-node-detail-header">
                           <div class="kb-node-detail-title">
-                            <span class="kb-node-icon">{{ nodeIcon(kbActiveNode.level) }}</span>
+                            <component :is="nodeIcon(kbActiveNode.level)" :size="16" class="kb-node-icon" />
                             <span class="kb-node-title-text">{{ kbActiveNode.title }}</span>
                           </div>
                           <NSpace size="small">
@@ -2899,7 +2952,7 @@ function kbModelSupportsVision(scanModel: string) {
                             :class="{ active: kbActiveChildId === ch.id }"
                             @click="selectChildNode(ch)"
                           >
-                            <span class="kb-node-child-icon">§</span>
+                            <Hash :size="12" class="kb-node-child-icon" />
                             <span class="kb-node-child-title">{{ ch.title || '(无标题)' }}</span>
                             <span v-if="ch.content_count > 0" class="kb-node-child-meta">{{ ch.content_count }} 块</span>
                             <NPopconfirm
@@ -2921,12 +2974,14 @@ function kbModelSupportsVision(scanModel: string) {
                       </div>
                     </template>
                   </div>
-                </div>
+                  </div>
+                </section>
               </div>
             </template>
           </div>
         </div>
       </NTabPane>
+
 
       <NTabPane name="websearch" tab="网络搜索" style="flex: 1; min-height: 0; overflow: auto">
         <WebSearchSettings />
@@ -3459,6 +3514,14 @@ function kbModelSupportsVision(scanModel: string) {
   background: var(--surface-1);
   border: 1px dashed var(--border-subtle);
   border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+.settings-empty :deep(svg) {
+  color: var(--text-quaternary);
 }
 
 /* --- Hide the NTabs top bar (unchanged from PR #8) --------------
@@ -3502,6 +3565,20 @@ function kbModelSupportsVision(scanModel: string) {
   padding: 24px 28px;
   max-width: 100%;
   box-sizing: border-box;
+}
+/* Split / fill tabs own their height so list+detail columns
+ * stretch to the pane instead of sitting in a short strip. */
+.settings-no-bar :deep(.n-tab-pane) > .settings-split {
+  padding: var(--space-4);
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.settings-no-bar :deep(.n-tab-pane) > .system-config-shell {
+  padding: var(--space-4) var(--space-5);
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 /* --- MCP server row (used inside the MCP tab's .settings-card
@@ -3585,12 +3662,9 @@ function kbModelSupportsVision(scanModel: string) {
 .providers-split {
   display: grid;
   grid-template-columns: 248px 1fr;
-  gap: 16px;
+  gap: 12px;
   flex: 1;
-  /* Prefer filling the pane when the parent is a flex
-   * column (providers tab). Knowledge tab scrolls the pane
-   * itself, so min-height keeps the split readable. */
-  min-height: min(100%, 520px);
+  min-height: 0;
   height: 100%;
 }
 .provider-list {
@@ -3705,8 +3779,12 @@ function kbModelSupportsVision(scanModel: string) {
   flex-direction: column;
   overflow-y: auto;
   min-height: 0;
-  padding: 18px 20px;
+  padding: 16px 18px;
   gap: 4px;
+}
+.kb-detail {
+  overflow: hidden;
+  padding-bottom: 0;
 }
 .provider-detail-empty {
   margin: auto;
@@ -3882,10 +3960,9 @@ function kbModelSupportsVision(scanModel: string) {
 }
 .style-usage {
   margin-top: var(--space-3);
-  padding: var(--space-3);
-  background: var(--surface-1);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
+  padding: 0;
+  background: transparent;
+  border: none;
 }
 .style-usage-title {
   color: var(--text-primary);
@@ -3896,10 +3973,13 @@ function kbModelSupportsVision(scanModel: string) {
 .style-usage-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-2);
+  gap: var(--space-3);
 }
 .style-usage-item {
   min-width: 0;
+  padding: var(--space-3);
+  background: var(--surface-2);
+  border-radius: var(--radius-md);
 }
 .style-usage-item-title {
   color: var(--text-primary);
@@ -3913,31 +3993,40 @@ function kbModelSupportsVision(scanModel: string) {
   font-size: 11.5px;
   line-height: 1.5;
 }
-/* ---- 风格卡片网格 ---- */
 .style-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 10px;
+  gap: var(--space-3);
 }
 .style-card {
-  background: var(--bg-3);
-  border: 1px solid var(--border-2);
-  border-radius: 8px;
-  padding: 14px 16px;
-  display: flex; flex-direction: column; gap: 8px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
   transition: border-color var(--dur-fast) var(--ease-out);
 }
-.style-card:hover { border-color: var(--accent); }
-.style-card-top { display: flex; align-items: center; gap: 8px; }
-.style-card-id { font-size: 12px; color: var(--text-3); }
-.style-card-label { font-size: 16px; font-weight: 600; }
+.style-card:hover { border-color: var(--border-strong); }
+.style-card-top { display: flex; align-items: center; gap: var(--space-2); }
+.style-card-id { font-size: 12px; color: var(--text-tertiary); }
+.style-card-label { font-size: 15px; font-weight: 600; color: var(--text-primary); }
 .style-card-desc {
-  font-size: 12px; color: var(--text-3); line-height: 1.5;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .style-card-actions {
-  display: flex; gap: 4px; margin-top: 4px;
-  border-top: 1px solid var(--border-2); padding-top: 10px;
+  display: flex;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-3);
 }
 /* ---- 风格编辑器弹窗 ---- */
 .style-editor-dialog {
@@ -4058,61 +4147,113 @@ function kbModelSupportsVision(scanModel: string) {
 code {
   background: var(--bg-3); padding: 1px 6px; border-radius: 3px;
   font-family: ui-monospace, Menlo, monospace; font-size: 12px;}
-.archive-group { margin-bottom: 16px; }
+.archive-tab { max-width: 720px; }
+.archive-group { margin-bottom: var(--space-4); }
 .archive-group-title {
-  font-weight: 600; font-size: 13px;
-  padding: 4px 0 8px; border-bottom: 1px solid var(--border-2);
-  margin-bottom: 8px; color: var(--text-2);
+  font-weight: 600;
+  font-size: 13px;
+  padding: 0 0 var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: var(--space-2);
+  color: var(--text-secondary);
 }
 .archive-row {
-  display: flex; align-items: center; gap: 12px;
-  padding: 6px 8px; border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 8px var(--space-2);
+  border-radius: var(--radius-md);
 }
-.archive-row:hover { background: var(--bg-3); }
-.archive-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.archive-meta { font-size: 11px; color: var(--text-4); white-space: nowrap; }
+.archive-row:hover { background: var(--surface-2); }
+.archive-title {
+  flex: 1;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.archive-meta {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .confirm-body { padding: 8px 0; }
 .confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.skill-repos-bar {
-  display: flex; align-items: center; gap: 6px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--border-2);
-  flex-shrink: 0;
+.skills-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: var(--space-3);
 }
-.repo-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.skill-repos-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.repo-chips { display: flex; gap: var(--space-1); flex-wrap: wrap; align-items: center; }
 .skill-columns {
-  flex: 1; min-height: 0;
-  display: flex; gap: 0;
-  margin-top: 8px;
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
 }
 .skill-col {
-  flex: 1; min-width: 0;
-  display: flex; flex-direction: column;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
 }
-.skill-col-left { border-right: 1px solid var(--border-2); padding-right: 12px; }
-.skill-col-right { padding-left: 12px; }
 .skill-col-header {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-bottom: 6px; gap: 8px; flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-2) var(--space-3);
+  gap: var(--space-2);
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-2);
 }
 .skill-col-body {
-  flex: 1 1 auto; min-height: 0;
-  max-height: calc(80vh - 220px);
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  padding: var(--space-2);
 }
-.skill-section-title { font-size: 12px; color: var(--text-3); white-space: nowrap; }
-.skill-hint { font-size: 12px; color: var(--text-3); }
+.skill-col-body .settings-empty {
+  margin: var(--space-2);
+  background: transparent;
+  border-style: none;
+}
+.skill-section-title { font-size: 12.5px; color: var(--text-primary); font-weight: 600; white-space: nowrap; }
+.skill-hint { font-size: 12px; color: var(--text-tertiary); white-space: nowrap; }
+.skill-filter { width: 132px; }
 .skill-result-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 5px 8px; border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 8px var(--space-2);
+  border-radius: var(--radius-md);
 }
-.skill-result-row:hover { background: var(--bg-3); }
-.skill-result-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.skill-result-name { font-size: 12.5px; font-weight: 500; }
+.skill-result-row:hover { background: var(--surface-2); }
+.skill-result-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.skill-result-name { font-size: 12.5px; font-weight: 500; color: var(--text-primary); }
 .skill-result-desc {
-  font-size: 11px; color: var(--text-4);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .skill-search { display: flex; gap: 8px; margin-bottom: 12px; }
 .skill-search-results { margin-bottom: 12px; }
@@ -4131,76 +4272,320 @@ code {
 .upstream-owner { color: var(--text-4); font-size: 11px; }
 .upstream-item.added { opacity: 0.6; }
 /* ---- Knowledge Base ---- */
-.kb-detail-scroll { flex: 1; overflow-y: auto; }
-.scan-progress { padding: 8px 0; }
-.scan-info { display: flex; gap: 12px; align-items: center; font-size: 13px; }
-.scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; flex: 1; }
-.scan-bar-fill { height: 100%; background: var(--accent); transition: width var(--dur-slow) var(--ease-out); }
-.scan-bar-pct { font-size: 10px; color: var(--text-4); margin-left: 6px; white-space: nowrap; }
-.scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
+.provider-item-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.kb-list-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+}
+.kb-list-avatar {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  letter-spacing: -0.02em;
+  margin-top: 1px;
+}
+.kb-list-item.active .kb-list-avatar {
+  background: var(--brand-100);
+  color: var(--brand-700);
+}
+.kb-list-body {
+  flex: 1;
+  min-width: 0;
+}
+.kb-list-item .provider-item-head {
+  margin-bottom: var(--space-1);
+}
+.kb-item-status {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+.kb-item-status.is-scan { color: var(--brand-600); }
+.kb-item-status.is-error { color: var(--error-500); }
 
-/* ---- Knowledge Base Cards ---- */
+.kb-detail-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: var(--space-3);
+  padding-bottom: var(--space-3);
+}
 .kb-header {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 10px;
+  flex-shrink: 0;
 }
-.kb-header-left { display: flex; align-items: center; gap: 8px; }
-
-.kb-config-row {
-  display: flex; align-items: center; gap: 10px; padding: 3px 0;
+.kb-header-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
 }
-.kb-config-label {
-  font-size: 12px; color: var(--text-3); width: 56px; flex-shrink: 0;
+.kb-header-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.kb-header .settings-form-actions {
+  margin-top: 0;
+  flex-wrap: wrap;
+}
+.kb-header-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.kb-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.kb-enable-toggle {
+  padding-right: var(--space-3);
+  border-right: 1px solid var(--border-subtle);
+}
+.kb-enable-toggle .settings-form-label {
+  font-size: 12.5px;
+  margin: 0;
+}
+.kb-header-meta {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.kb-header-path {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-tertiary);
   line-height: 1.4;
 }
-.kb-config-val { font-size: 12px; color: var(--text-2); }
-.kb-config-val.path { word-break: break-all; font-family: ui-monospace, monospace; font-size: 11.5px; }
-.kb-config-hint { font-size: 11px; color: var(--text-4); padding: 1px 0 3px 66px; line-height: 1.4; }
-.kb-hint-accent { color: var(--accent); }
-.kb-hint-muted { color: var(--text-4); }
-.kb-unit { font-size: 11px; color: var(--text-4); margin-left: 4px; }
-
-/* AI scan settings layout */
-.kb-settings-grid { margin-top: 2px; }
-.kb-settings-row {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-  margin-bottom: 10px;
-}
-.kb-settings-card {
-  border: 1px solid var(--border-2);
-  border-radius: 6px;
-  padding: 10px 12px;
-  background: var(--bg-2);
-}
-.kb-settings-card-title {
-  font-size: 12px; font-weight: 600; color: var(--text-1);
-  margin-bottom: 6px;
-}
-
-/* Tree panel split layout */
-.kb-tree-panel {
-  display: flex; gap: 0; min-height: 300px; max-height: 400px;
-  border: 1px solid var(--border-2); border-radius: 6px;
+.kb-header-path span {
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.kb-header-path-icon {
+  flex-shrink: 0;
+  color: var(--text-quaternary);
+}
+
+.scan-progress {
+  padding: var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.scan-progress.is-done {
+  border-color: var(--border-subtle);
+  background: var(--success-50);
+}
+.scan-progress.is-error {
+  border-color: var(--border-subtle);
+  background: var(--error-50);
+}
+.scan-info {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.scan-phase {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+.scan-count {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+.scan-error {
+  color: var(--error-500);
+  font-size: 11.5px;
+}
+.scan-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.scan-stat {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 2px var(--space-2);
+  font-variant-numeric: tabular-nums;
+}
+.scan-stat.is-fail {
+  color: var(--error-500);
+  border-color: var(--error-50);
+  background: var(--error-50);
+}
+.scan-bar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.scan-bar {
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  overflow: hidden;
+  flex: 1;
+}
+.scan-bar-fill {
+  height: 100%;
+  background: var(--brand-500);
+  border-radius: var(--radius-pill);
+  transition: width var(--dur-slow) var(--ease-out);
+}
+.scan-bar-pct {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  min-width: 2.5em;
+  text-align: right;
+}
+
+.kb-scan-collapse { flex-shrink: 0; }
+.kb-scan-form { gap: var(--space-3) var(--space-4); }
+.kb-scan-toggle-row {
+  padding-top: var(--space-1);
+  border-top: 1px solid var(--border-subtle);
+  margin-top: var(--space-1);
+}
+.kb-hint-accent { color: var(--brand-600); }
+.kb-size-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.kb-size-input {
+  width: 100%;
+  max-width: 140px;
+}
+.kb-unit {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.kb-explorer {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: var(--space-2);
+}
+.kb-explorer-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+.kb-explorer-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+.kb-explorer-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.kb-tree-panel {
+  display: flex;
+  flex: 1;
+  min-height: 200px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--surface-0);
 }
 .kb-tree-left {
-  width: 260px; flex-shrink: 0; display: flex; flex-direction: column;
-  border-right: 1px solid var(--border-2); background: var(--bg-2);
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--surface-1);
 }
 .kb-tree-right {
-  flex: 1; min-width: 0; overflow-y: auto;
-  background: var(--bg-1);
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  background: var(--surface-1);
 }
 .kb-tree-toolbar {
-  display: flex; align-items: center; gap: 4px;
-  padding: 6px 8px; border-bottom: 1px solid var(--border-2);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
 }
-.kb-tree-scroll { flex: 1; overflow-y: auto; padding: 4px 0; }
+.kb-tree-filter { flex: 1; min-width: 0; }
+.kb-tree-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-1) 0; }
+.kb-tree { height: 100%; }
+.kb-panel-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 100%;
+  min-height: 140px;
+  padding: var(--space-6);
+  color: var(--text-tertiary);
+  font-size: 12.5px;
+  text-align: center;
+}
+.kb-panel-empty :deep(svg) { color: var(--text-quaternary); }
 
-/* Tree node label styles */
 .kb-tree-label {
-  display: inline-flex; align-items: center; gap: 4px;
-  font-size: 12px; min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 12px;
+  min-width: 0;
 }
 .kb-tree-label.l1 { font-weight: 600; color: var(--text-primary); }
 .kb-tree-label.l2 { color: var(--text-secondary); }
@@ -4208,81 +4593,126 @@ code {
 .kb-tree-icon { flex-shrink: 0; color: var(--text-tertiary); }
 .kb-tree-label.l1 .kb-tree-icon { color: var(--brand-500); }
 .kb-tree-label-text {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .kb-tree-label-tag {
-  font-size: 9px; color: var(--text-4); background: var(--bg-3);
-  padding: 0 4px; border-radius: 3px; flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  background: var(--surface-2);
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
 }
 .kb-tree-label-cnt {
-  font-size: 10px; color: var(--text-4); flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
 }
 
-/* Node detail panel */
-.kb-node-detail { padding: 12px; }
+.kb-node-detail { padding: var(--space-4); }
 .kb-node-detail-header {
-  display: flex; align-items: flex-start; justify-content: space-between;
-  gap: 8px; margin-bottom: 8px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
 }
 .kb-node-detail-title {
-  display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
 }
-.kb-node-icon { flex-shrink: 0; font-size: 16px; }
+.kb-node-icon { flex-shrink: 0; color: var(--text-tertiary); }
 .kb-node-title-text {
-  font-size: 13px; font-weight: 600; line-height: 1.3;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-primary);
 }
 .kb-node-meta {
-  display: flex; gap: 8px; font-size: 11px; padding: 2px 0;
+  display: flex;
+  gap: var(--space-2);
+  font-size: 11.5px;
+  padding: 2px 0;
 }
-.kb-node-meta-label { color: var(--text-4); flex-shrink: 0; }
+.kb-node-meta-label { color: var(--text-tertiary); flex-shrink: 0; }
 .kb-node-meta-val {
-  color: var(--text-2); word-break: break-all;
-  font-family: ui-monospace, monospace; font-size: 10.5px;
+  color: var(--text-secondary);
+  word-break: break-all;
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
-
-/* Statistics cards */
 .kb-node-stats {
-  display: flex; gap: 12px; padding: 10px 0; margin: 8px 0;
-  border-top: 1px solid var(--border-2);
-  border-bottom: 1px solid var(--border-2);
+  display: flex;
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
+  margin: var(--space-2) 0;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
 }
-.kb-stat-item { text-align: center; min-width: 50px; }
-.kb-stat-num { display: block; font-size: 18px; font-weight: 700; color: var(--accent); }
-.kb-stat-label { font-size: 10px; color: var(--text-4); }
-
-/* Sections in detail */
-.kb-node-section { margin-top: 10px; }
+.kb-stat-item { text-align: center; min-width: 48px; }
+.kb-stat-num {
+  display: block;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--brand-600);
+  font-variant-numeric: tabular-nums;
+}
+.kb-stat-label { font-size: 11px; color: var(--text-tertiary); }
+.kb-node-section { margin-top: var(--space-3); }
 .kb-node-section-title {
-  font-size: 11px; font-weight: 600; color: var(--text-3);
-  margin-bottom: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: var(--space-2);
 }
 .kb-node-overview {
-  font-size: 12px; color: var(--text-2); white-space: pre-wrap;
-  line-height: 1.5; background: var(--bg-2); padding: 8px 10px;
-  border-radius: 4px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  line-height: 1.5;
+  background: var(--surface-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
 }
-.kb-node-content-block { margin-bottom: 6px; }
-
-/* Child rows in L2 detail */
+.kb-node-content-block { margin-bottom: var(--space-2); }
 .kb-node-child-row {
-  display: flex; align-items: center; gap: 6px;
-  padding: 5px 8px; border-radius: var(--radius-sm); cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px var(--space-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
   transition: background var(--dur-fast) var(--ease-out);
 }
-.kb-node-child-row:hover { background: var(--bg-3); }
-.kb-node-child-row.active { background: var(--bg-3); }
-.kb-node-child-icon { font-size: 11px; color: var(--text-4); flex-shrink: 0; }
+.kb-node-child-row:hover,
+.kb-node-child-row.active { background: var(--surface-2); }
+.kb-node-child-icon { color: var(--text-tertiary); flex-shrink: 0; }
 .kb-node-child-title {
-  flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; min-width: 0;
+  flex: 1;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
-.kb-node-child-meta { font-size: 10px; color: var(--text-4); flex-shrink: 0; }
-
-/* Content pre blocks */
+.kb-node-child-meta { font-size: 11px; color: var(--text-tertiary); flex-shrink: 0; }
 .kb-tree-pre {
-  margin: 0; padding: 6px 8px; background: var(--bg-3); border-radius: 4px;
-  font-size: 10.5px; line-height: 1.4; white-space: pre-wrap; word-break: break-word;
-  max-height: 120px; overflow-y: auto; font-family: ui-monospace, monospace;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
 }
 
 /* System config tab.
@@ -4305,10 +4735,10 @@ code {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: var(--space-3);
 }
-.system-config-body > .settings-section {
-  margin-bottom: var(--space-4);
+.sys-lead {
+  margin: 0 0 var(--space-1);
 }
 
 /* Form grid + row inside settings-collapse items.
@@ -4364,11 +4794,11 @@ code {
 }
 
 .browser-ext-download-link {
-  color: var(--accent);
+  color: var(--brand-500);
   text-decoration: underline;
 }
 .browser-ext-download-link:hover {
-  opacity: 0.8;
+  color: var(--brand-600);
 }
 .browser-server-url-box {
   display: inline-flex;
@@ -4376,13 +4806,13 @@ code {
   gap: 6px;
   margin-top: 4px;
   padding: 4px 8px;
-  background: var(--surface-2, #1e1e1e);
-  border: 1px solid var(--border, #333);
-  border-radius: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
   font-size: 12px;
 }
 .browser-server-url-box code {
-  color: var(--accent);
+  color: var(--brand-600);
   user-select: all;
 }
 .browser-diagnostics {
@@ -4412,7 +4842,7 @@ code {
   word-break: break-all;
 }
 .browser-diagnostic-value.is-error {
-  color: var(--danger, #dc2626);
+  color: var(--error-500);
 }
 
 .browser-conn-card {
@@ -4421,7 +4851,7 @@ code {
   gap: 10px;
 }
 .browser-tabs-panel {
-  border-top: 1px solid var(--border, rgba(255,255,255,0.08));
+  border-top: 1px solid var(--border-subtle);
   padding-top: 10px;
   display: flex;
   flex-direction: column;

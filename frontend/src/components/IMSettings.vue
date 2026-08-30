@@ -826,7 +826,7 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 20px;
+  padding: 0;
 }
 .im-section,
 .im-connect-card {
