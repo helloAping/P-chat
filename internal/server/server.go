@@ -120,8 +120,9 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	// the route. Handlers that need a smaller cap (e.g.
 	// SendMessage) layer their own MaxBytesReader on top.
 	r.Use(maxBodyMiddleware(25 << 20))
-	// Per-IP rate limit. 10 req/s sustained, burst 20.
-	// Generous for human use; rejects runaway clients.
+	// Per-IP rate limit. 10 req/s sustained, burst 20 for non-loopback
+	// clients. Local GUI/CLI traffic can legitimately burst during
+	// startup, queue draining, and shutdown, so loopback requests skip it.
 	r.Use(rateLimitMiddleware())
 
 	// CORS: pchat-server is normally hit same-origin (browser at
@@ -756,11 +757,11 @@ func (r *rateLimiter) evictExpired(maxIdle time.Duration) {
 	}
 }
 
-// rateLimitMiddleware rejects (with 429) requests from IPs that
-// exceed the per-second budget. A 10 req/s burst with 20 burst
-// capacity is generous for human use and the CLI; a script
-// spamming at 100 req/s will start to be rejected within a
-// second.
+// rateLimitMiddleware rejects (with 429) non-loopback requests from IPs that
+// exceed the per-second budget. Loopback is the desktop app's normal control
+// path; startup, queue draining, and shutdown can legitimately fan out dozens
+// of same-process requests in one second, and the body cap plus per-session
+// locks are the relevant local protections.
 func rateLimitMiddleware() gin.HandlerFunc {
 	rl := newRateLimiter(10, 20)
 	go func() {
@@ -775,6 +776,10 @@ func rateLimitMiddleware() gin.HandlerFunc {
 		if err != nil {
 			ip = c.Request.RemoteAddr
 		}
+		if isLoopbackIP(ip) {
+			c.Next()
+			return
+		}
 		if !rl.allow(ip) {
 			c.Header("Retry-After", "1")
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
@@ -784,4 +789,9 @@ func rateLimitMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func isLoopbackIP(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	return ip != nil && ip.IsLoopback()
 }
