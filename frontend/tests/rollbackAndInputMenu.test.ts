@@ -34,12 +34,18 @@ test('rollback keeps a local fallback for undo banner and input refill', () => {
   assert.match(source, /\[\.\.\.deletedMessages\]\.reverse\(\)\.find\(m => m\.role === 'user'\)/)
 })
 
-test('input send ignores duplicate sends while current session streams', () => {
+test('input send queues messages while current session streams', () => {
   const source = readInputAreaSource()
   const match = source.match(/async function send\(\) \{([\s\S]*?)\n  if \(isSlashLine\(\)\)/)
   assert.ok(match, 'send() should exist and reach slash-command handling')
 
-  assert.match(match[1], /if \(isStreaming\.value\) \{[\s\S]*?return[\s\S]*?\}/)
+  assert.doesNotMatch(match[1], /if \(isStreaming\.value\) \{[\s\S]*?return[\s\S]*?\}/)
+  assert.match(source, /const currentConversationBusy = computed\(\(\) =>[\s\S]*?!!state\.turnQueueDraining\[state\.currentID\]/)
+  assert.match(source, /const shouldQueue = currentConversationBusy\.value \|\| currentTurnQueue\.value\.length > 0/)
+  assert.match(source, /await enqueueTurnQueue\(id, turnPayload\)/)
+  assert.match(source, /消息已加入队列/)
+  assert.match(source, /:title="currentConversationBusy \? '加入队列 \(Enter\)' : '发送 \(Enter\)'"/)
+  assert.match(source, /v-if="item\.status !== 'running'"/)
 })
 
 test('input confirms and clears unfinished todos before sending a new message', () => {
@@ -64,6 +70,12 @@ test('initial session load preserves messages created while history is in flight
     source,
     /const liveMessages = \(state\.sessionMessages\[id\] as Message\[\] \| undefined\) \?\? \[\][\s\S]*?state\.sessionMessages\[id\] = \[\.\.\.history, \.\.\.liveMessages\]/,
   )
+})
+
+test('turn queue view keeps running items visible', () => {
+  const source = readStoreSource()
+
+  assert.match(source, /export const currentTurnQueue = computed\(\(\) =>[\s\S]*?item\.status === 'running'/)
 })
 
 test('input textarea has a manual right-click edit menu with feedback actions', () => {

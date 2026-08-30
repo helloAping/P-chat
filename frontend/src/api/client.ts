@@ -1200,6 +1200,131 @@ export interface SendOptions {
   skill_context?: string
 }
 
+export interface TurnQueuePayload {
+  message: string
+  todo_mode?: 'auto' | 'resume' | 'clear'
+  client_msg_id?: number
+  provider?: string
+  model?: string
+  style?: string
+  work_mode?: string
+  attachments?: InlineAttachment[]
+  use_image_recognition?: boolean
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
+  skill_context?: string
+}
+
+export interface TurnQueueItem {
+  id: number
+  session_id: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
+  message: string
+  client_msg_id: number
+  attachment_count: number
+  error?: string
+  created_at: number
+  updated_at: number
+  started_at?: number
+  finished_at?: number
+  payload?: TurnQueuePayload
+}
+
+export interface TurnQueueListResponse {
+  items: TurnQueueItem[]
+}
+
+export interface TurnQueueItemEnvelope {
+  item: TurnQueueItem
+}
+
+type SendPayloadSource = Pick<SendOptions,
+  | 'message'
+  | 'todo_mode'
+  | 'client_msg_id'
+  | 'provider'
+  | 'model'
+  | 'style'
+  | 'workMode'
+  | 'attachments'
+  | 'useImageRecognition'
+  | 'subAgentModelEnabled'
+  | 'subAgentProvider'
+  | 'subAgentModel'
+  | 'skill_context'
+>
+
+export function sendPayloadFromOptions(opts: SendPayloadSource): TurnQueuePayload {
+  return {
+    message: opts.message,
+    todo_mode: opts.todo_mode,
+    // client_msg_id is the integer the frontend minted at
+    // send time and stamped onto the local Message as
+    // `msg.id`. The backend uses it as the SQLite row id
+    // for this turn's user message, so rollback/regen
+    // always have a valid id to target.
+    client_msg_id: opts.client_msg_id,
+    provider: opts.provider,
+    model: opts.model,
+    style: opts.style,
+    work_mode: opts.workMode,
+    attachments: opts.attachments,
+    use_image_recognition: opts.useImageRecognition,
+    sub_agent_model_enabled: opts.subAgentModelEnabled,
+    sub_agent_provider: opts.subAgentProvider,
+    sub_agent_model: opts.subAgentModel,
+    skill_context: opts.skill_context || '',
+  }
+}
+
+export const listTurnQueue = (sessionId: string) =>
+  jsonFetch<TurnQueueListResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue`,
+  )
+
+export const enqueueTurnQueueItem = (sessionId: string, payload: TurnQueuePayload) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  )
+
+export const claimNextTurnQueueItem = (sessionId: string) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/claim`,
+    { method: 'POST' },
+  )
+
+export const completeTurnQueueItem = (sessionId: string, queueId: number) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}/complete`,
+    { method: 'POST' },
+  )
+
+export const failTurnQueueItem = (sessionId: string, queueId: number, error: string) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}/fail`,
+    { method: 'POST', body: JSON.stringify({ error }) },
+  )
+
+export const retryTurnQueueItem = (sessionId: string, queueId: number) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}/retry`,
+    { method: 'POST' },
+  )
+
+export const deleteTurnQueueItem = (sessionId: string, queueId: number) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}`,
+    { method: 'DELETE' },
+  )
+
+export const clearTurnQueue = (sessionId: string) =>
+  jsonFetch<{ ok: boolean; cleared: number }>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue`,
+    { method: 'DELETE' },
+  )
+
 export interface StreamEvent {
   type?: string
   phase?: string
@@ -1406,28 +1531,7 @@ async function streamMessagesViaFetch(
   opts: SendOptions,
   backend = directBackendURL(),
 ): Promise<void> {
-  const body = JSON.stringify({
-    message: opts.message,
-    todo_mode: opts.todo_mode,
-    // client_msg_id is the integer the frontend minted at
-    // send time and stamped onto the local Message as
-    // `msg.id`. The backend uses it as the SQLite row id
-    // for this turn's user message, so rollback/regen
-    // always have a valid id to target — even when the
-    // SSE `done` event never lands (LLM error, network
-    // drop, quota exhausted, etc.).
-    client_msg_id: opts.client_msg_id,
-    provider: opts.provider,
-    model: opts.model,
-    style: opts.style,
-    work_mode: opts.workMode,
-    attachments: opts.attachments,
-    use_image_recognition: opts.useImageRecognition,
-    sub_agent_model_enabled: opts.subAgentModelEnabled,
-    sub_agent_provider: opts.subAgentProvider,
-    sub_agent_model: opts.subAgentModel,
-    skill_context: opts.skill_context || '',
-  })
+  const body = JSON.stringify(sendPayloadFromOptions(opts))
   return consumeStreamRequest({
     url: `${backend}/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
     body,

@@ -32,6 +32,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V4: stepV4toV5,
 	V5: stepV5toV6,
 	V6: stepV6toV7,
+	V7: stepV7toV8,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -133,6 +134,33 @@ func stepV2toV3(db *sql.DB) error {
 	}
 	if err := importLegacyStyles(db); err != nil {
 		return fmt.Errorf("import legacy styles: %w", err)
+	}
+	return nil
+}
+
+// ---- V7 → V8 ----
+
+func stepV7toV8(db *sql.DB) error {
+	// 创建持久化回合队列表。
+	// Create the durable turn queue table.
+	log.Print("[upgrade] V7 → V8: creating durable turn queue table")
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS turn_queue (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    status           TEXT NOT NULL DEFAULT 'queued',
+    message          TEXT NOT NULL DEFAULT '',
+    payload_json     TEXT NOT NULL DEFAULT '',
+    client_msg_id    INTEGER NOT NULL DEFAULT 0,
+    attachment_count INTEGER NOT NULL DEFAULT 0,
+    error            TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    started_at       INTEGER,
+    finished_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_turn_queue_session_status ON turn_queue(session_id, status, id);`)
+	if err != nil {
+		return fmt.Errorf("create turn_queue: %w", err)
 	}
 	return nil
 }

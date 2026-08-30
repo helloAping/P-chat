@@ -7,7 +7,7 @@ import * as api from '../api/client'
 import { notifyManager } from '../utils/notify'
 import { dedupMessagesByKey } from '../utils/messageDedup'
 import { insertAsyncSubAgentAfterTaskTools } from '../utils/subAgentOrder'
-import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
+import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem, TurnQueueItem, TurnQueuePayload } from '../api/client'
 import { isCurrentStream } from './streamLifecycle'
 import {
   buildInterruptNotice,
@@ -166,6 +166,11 @@ export const state = reactive({
   visionRecognitionEnabled: false,
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
+  // turnQueue 保存当前会话尚未执行的用户消息。
+  // turnQueue stores pending user turns that should run FIFO after streaming ends.
+  turnQueue: {} as Record<string, TurnQueueItem[]>,
+  turnQueueLoading: {} as Record<string, boolean>,
+  turnQueueDraining: {} as Record<string, boolean>,
   // sessionWorking is the per-session "is the LLM mid-turn"
   // flag, derived from the `session_status` SSE event. The
   // TodoPanel state machine reads this to decide whether
@@ -286,6 +291,12 @@ export const currentTodos = computed(() =>
   state.sessionTodos[state.currentID] || [],
 )
 
+export const currentTurnQueue = computed(() =>
+  (state.turnQueue[state.currentID] || []).filter(item =>
+    item.status === 'queued' || item.status === 'running' || item.status === 'failed',
+  ),
+)
+
 function normalizePermissionLevel(level: string | undefined): SessionPermissionLevel {
   if (level === 'auto' || level === 'full') return level
   return 'ask'
@@ -318,6 +329,92 @@ export function setSessionBackgroundSubAgentJobs(id: string, count: number) {
   } else {
     delete state.sessionBackgroundSubAgentJobs[id]
   }
+}
+
+function sortTurnQueueItems(items: TurnQueueItem[]): TurnQueueItem[] {
+  return [...items].sort((a, b) => a.id - b.id)
+}
+
+function upsertTurnQueueItem(sessionId: string, item: TurnQueueItem) {
+  if (!sessionId) return
+  const list = state.turnQueue[sessionId] || []
+  const next = list.filter(existing => existing.id !== item.id)
+  if (item.status !== 'done' && item.status !== 'cancelled') {
+    next.push(item)
+  }
+  state.turnQueue[sessionId] = sortTurnQueueItems(next)
+}
+
+export function hasQueuedTurns(sessionId: string): boolean {
+  return (state.turnQueue[sessionId] || []).some(item => item.status === 'queued')
+}
+
+export function hasBlockingTurnQueueFailure(sessionId: string): boolean {
+  return (state.turnQueue[sessionId] || []).some(item => item.status === 'failed')
+}
+
+export function setTurnQueueDraining(sessionId: string, draining: boolean) {
+  if (!sessionId) return
+  if (draining) state.turnQueueDraining[sessionId] = true
+  else delete state.turnQueueDraining[sessionId]
+}
+
+export async function loadTurnQueue(sessionId: string): Promise<TurnQueueItem[]> {
+  if (!sessionId) return []
+  state.turnQueueLoading[sessionId] = true
+  try {
+    const response = await api.listTurnQueue(sessionId)
+    const items = sortTurnQueueItems(response.items || [])
+    state.turnQueue[sessionId] = items
+    return items
+  } catch (e) {
+    console.warn('loadTurnQueue failed:', e)
+    return state.turnQueue[sessionId] || []
+  } finally {
+    delete state.turnQueueLoading[sessionId]
+  }
+}
+
+export async function enqueueTurnQueue(sessionId: string, payload: TurnQueuePayload): Promise<TurnQueueItem> {
+  const response = await api.enqueueTurnQueueItem(sessionId, payload)
+  upsertTurnQueueItem(sessionId, response.item)
+  return response.item
+}
+
+export async function claimNextQueuedTurn(sessionId: string): Promise<TurnQueueItem | null> {
+  try {
+    const response = await api.claimNextTurnQueueItem(sessionId)
+    upsertTurnQueueItem(sessionId, response.item)
+    return response.item
+  } catch (e: any) {
+    if (String(e?.message || e).includes('HTTP 404')) return null
+    throw e
+  }
+}
+
+export async function completeQueuedTurn(sessionId: string, queueId: number): Promise<void> {
+  const response = await api.completeTurnQueueItem(sessionId, queueId)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function failQueuedTurn(sessionId: string, queueId: number, error: string): Promise<void> {
+  const response = await api.failTurnQueueItem(sessionId, queueId, error)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function retryQueuedTurn(sessionId: string, queueId: number): Promise<void> {
+  const response = await api.retryTurnQueueItem(sessionId, queueId)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function deleteQueuedTurn(sessionId: string, queueId: number): Promise<void> {
+  const response = await api.deleteTurnQueueItem(sessionId, queueId)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function clearQueuedTurns(sessionId: string): Promise<void> {
+  await api.clearTurnQueue(sessionId)
+  state.turnQueue[sessionId] = (state.turnQueue[sessionId] || []).filter(item => item.status === 'running')
 }
 
 export function setSessionBackgroundHookMerging(id: string, merging: boolean) {
@@ -747,6 +844,7 @@ async function switchSessionBody(id: string) {
       state.sessionTodos[id] = t.todos || []
     } catch { /* ignore — server may not have todos yet */ }
   }
+  await loadTurnQueue(id)
   // P4-x: keep the TopBar context badge in sync with the newly
   // active session. Silent fetch — the drawer stays closed.
   void refreshContextUsage(id)
@@ -947,6 +1045,9 @@ export async function deleteSessionById(id: string) {
   delete _loadedSessions[id]
   delete state.sessionMeta[id]
   delete state.sessionTodos[id]
+  delete state.turnQueue[id]
+  delete state.turnQueueLoading[id]
+  delete state.turnQueueDraining[id]
   delete state.sessionWorking[id]
   delete state.sessionBackgroundSubAgentJobs[id]
   delete state.sessionBackgroundHookMerging[id]
@@ -1316,6 +1417,14 @@ function revokeSessionBlobUrls(sessionId: string) {
 // reachable), and `appendStreamEvent` is the only entry
 // point that mutates the message body. Anything that wants
 // to feed a stream into the chat goes through this.
+
+export function appendLocalUserMessage(sessionId: string, message: Message) {
+  if (!sessionId) return
+  if (!state.sessionMessages[sessionId]) state.sessionMessages[sessionId] = []
+  state.sessionMessages[sessionId].push(message)
+  capSessionMessages(sessionId)
+  state.streamRevision[sessionId] = (state.streamRevision[sessionId] || 0) + 1
+}
 
 export function startStream(id: string, ctrl: AbortController) {
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []

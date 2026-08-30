@@ -14,7 +14,7 @@ import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown,
   Lock, Unlock, Key, Copy, Scissors, ClipboardPaste, TextCursorInput,
-  Settings, HelpCircle,
+  Settings, HelpCircle, Trash2, RotateCcw, CornerDownLeft,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -23,10 +23,11 @@ import {
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
-  currentPendingConfirm, submitToolConfirm,
+  currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
+  deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn,
 } from '../stores/chat'
 import type { PendingAttachment } from '../stores/chat'
-import { stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
+import { drainQueuedConversationTurns, stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
 import { notifyManager } from '../utils/notify'
 import { copyText } from '../utils/clipboard'
 
@@ -854,19 +855,13 @@ async function clearUnfinishedTodosBeforeSend(id: string): Promise<TodoSendMode 
 async function send() {
   const raw = inputText.value.trim()
   if (!raw) return
-  if (isStreaming.value) {
-    // 当前会话已有流在进行，直接忽略重复发送。
-    // The active session already has a stream; ignore duplicate sends.
-    return
-  }
   // NOTE: we intentionally do NOT gate on `sending.value`
   // here. That ref is local to this InputArea instance, but
   // multiple conversations can stream in parallel. If session
-  // A is mid-stream, `sending` is true; the user switching to
-  // session B (which is not streaming) should still be able to
-  // send. The send/stop button is already gated on
-  // `isStreaming` (per-session), so double-clicks within the
-  // same session are already impossible.
+  // A is mid-stream, the user switching to session B should
+  // still be able to send. When the current session is already
+  // streaming, this send path persists the new message as a
+  // queued turn instead of dropping it.
 
   if (isSlashLine()) {
     const parsed = parseSlashLine()
@@ -907,7 +902,8 @@ async function send() {
 
   const preflightSessionID = state.currentID
   let todoMode: TodoSendMode = 'auto'
-  if (preflightSessionID) {
+  const shouldQueueBeforePreflight = currentConversationBusy.value || currentTurnQueue.value.length > 0
+  if (preflightSessionID && !shouldQueueBeforePreflight) {
     if (sendPreflightSessions.has(preflightSessionID)) return
     sendPreflightSessions.add(preflightSessionID)
     let selectedMode: TodoSendMode | null = null
@@ -998,6 +994,35 @@ async function send() {
   // colliding with anything autoincrement produces for
   // assistant messages later in the same session.
   const clientMsgId = Date.now() * 1000 + Math.floor(Math.random() * 1000)
+  const turnPayload = api.sendPayloadFromOptions({
+    message: text,
+    client_msg_id: clientMsgId,
+    provider: meta.provider,
+    model: meta.model,
+    style: meta.style,
+    workMode: meta.workMode,
+    useImageRecognition: imageRecognitionEnabled.value,
+    subAgentModelEnabled: !!meta.sub_agent_model_enabled,
+    subAgentProvider: meta.sub_agent_provider || '',
+    subAgentModel: meta.sub_agent_model || '',
+    todo_mode: todoMode,
+    attachments: inlineAttachments,
+    skill_context: pendingSkillContext || undefined,
+  })
+  const shouldQueue = currentConversationBusy.value || currentTurnQueue.value.length > 0
+  if (shouldQueue) {
+    try {
+      await enqueueTurnQueue(id, turnPayload)
+      clearAttachments()
+      pendingSkillContext = ''
+      notifyManager.unlock()
+      message.info('消息已加入队列')
+      maybeDrainTurnQueue()
+    } catch (e: any) {
+      message.error(`加入队列失败：${e?.message || e}`)
+    }
+    return
+  }
   // Push the user message WITH id + attachments so the
   // bubble renders correctly without waiting for the
   // next history fetch, and so rollback can target the
@@ -1447,10 +1472,75 @@ const permLabel = computed(() => {
   return '始终询问'
 })
 
+const queuedTurns = computed(() => currentTurnQueue.value)
+const hasFailedQueuedTurn = computed(() => queuedTurns.value.some(item => item.status === 'failed'))
+const queueSignature = computed(() => queuedTurns.value.map(item => `${item.id}:${item.status}`).join('|'))
+const queueDraining = computed(() => !!state.turnQueueDraining[state.currentID])
+const currentConversationBusy = computed(() =>
+  isStreaming.value ||
+  !!state.sessionWorking[state.currentID] ||
+  !!state.turnQueueDraining[state.currentID],
+)
+
+function queuedTurnStatusLabel(status: string): string {
+  if (status === 'failed') return '失败'
+  if (status === 'running') return '执行中'
+  return '等待'
+}
+
+function queuedTurnTitle(item: api.TurnQueueItem): string {
+  const parts = [item.message]
+  if (item.attachment_count > 0) parts.push(`${item.attachment_count} 个附件`)
+  if (item.error) parts.push(item.error)
+  return parts.join('\n')
+}
+
+async function onDeleteQueuedTurn(queueId: number) {
+  if (!state.currentID) return
+  try {
+    await deleteQueuedTurn(state.currentID, queueId)
+    maybeDrainTurnQueue()
+  } catch (e: any) {
+    message.error(`删除排队消息失败：${e?.message || e}`)
+  }
+}
+
+async function onClearQueuedTurns() {
+  if (!state.currentID) return
+  try {
+    await clearQueuedTurns(state.currentID)
+  } catch (e: any) {
+    message.error(`清空队列失败：${e?.message || e}`)
+  }
+}
+
+async function onRetryQueuedTurn(queueId: number) {
+  if (!state.currentID) return
+  try {
+    await retryQueuedTurn(state.currentID, queueId)
+    maybeDrainTurnQueue()
+  } catch (e: any) {
+    message.error(`重试排队消息失败：${e?.message || e}`)
+  }
+}
+
+function maybeDrainTurnQueue() {
+  if (!state.currentID) return
+  if (currentConversationBusy.value || hasFailedQueuedTurn.value) return
+  void drainQueuedConversationTurns(state.currentID).catch((e) => {
+    console.warn('[turn-queue] drain failed:', e)
+  })
+}
+
+watch([() => state.currentID, queueSignature, currentConversationBusy, () => !!currentPendingConfirm.value], () => {
+  maybeDrainTurnQueue()
+})
+
 // Load the model/style lists once on mount so the two dropdowns
 // are populated even before the user opens any session.
 onMounted(() => {
   loadConfig()
+  maybeDrainTurnQueue()
 })
 </script>
 
@@ -1473,6 +1563,64 @@ onMounted(() => {
       <button class="rollback-banner-undo" @click="undoRollback(state.currentID)">撤销</button>
       <button class="rollback-banner-dismiss" @click="dismissRollback(state.currentID)" aria-label="关闭">×</button>
     </div>
+
+    <Transition name="fade-up">
+      <div v-if="queuedTurns.length > 0" class="turn-queue" :class="{ 'turn-queue--blocked': hasFailedQueuedTurn }">
+        <div class="turn-queue-head">
+          <div class="turn-queue-title">
+            <CornerDownLeft :size="13" />
+            <span>{{ queueDraining ? '正在出队' : '排队中' }}</span>
+            <span class="turn-queue-count">{{ queuedTurns.length }}</span>
+          </div>
+          <button
+            type="button"
+            class="turn-queue-icon"
+            :disabled="queueDraining"
+            title="清空队列"
+            aria-label="清空队列"
+            @click="onClearQueuedTurns"
+          >
+            <Trash2 :size="13" />
+          </button>
+        </div>
+        <div class="turn-queue-list">
+          <div
+            v-for="(item, index) in queuedTurns"
+            :key="item.id"
+            class="turn-queue-item"
+            :class="{ 'turn-queue-item--failed': item.status === 'failed' }"
+            :title="queuedTurnTitle(item)"
+          >
+            <span class="turn-queue-index">{{ index + 1 }}</span>
+            <span class="turn-queue-message">{{ item.message }}</span>
+            <span v-if="item.attachment_count > 0" class="turn-queue-attachments">
+              {{ item.attachment_count }} 附件
+            </span>
+            <span class="turn-queue-status">{{ queuedTurnStatusLabel(item.status) }}</span>
+            <button
+              v-if="item.status === 'failed'"
+              type="button"
+              class="turn-queue-icon"
+              title="重试"
+              aria-label="重试排队消息"
+              @click="onRetryQueuedTurn(item.id)"
+            >
+              <RotateCcw :size="13" />
+            </button>
+            <button
+              v-if="item.status !== 'running'"
+              type="button"
+              class="turn-queue-icon"
+              title="删除"
+              aria-label="删除排队消息"
+              @click="onDeleteQueuedTurn(item.id)"
+            >
+              <Trash2 :size="13" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
 
     <!-- Attachments live INSIDE the same input-wrap as the
          textarea but BELOW the input-row, so a pasted image
@@ -1507,23 +1655,22 @@ onMounted(() => {
           @contextmenu="onInputContextMenu"
         ></textarea>
         <button
-          v-if="!isStreaming"
-          class="send-btn"
-          :disabled="!inputText.trim()"
-          @click="send"
-          title="发送 (Enter)"
-          aria-label="发送"
-        >
-          <Send :size="16" />
-        </button>
-        <button
-          v-else
+          v-if="isStreaming"
           class="stop-btn"
           @click="stop"
           title="停止 (Esc)"
           aria-label="停止"
         >
           <Square :size="14" fill="currentColor" />
+        </button>
+        <button
+          class="send-btn"
+          :disabled="!inputText.trim()"
+          @click="send"
+          :title="currentConversationBusy ? '加入队列 (Enter)' : '发送 (Enter)'"
+          :aria-label="currentConversationBusy ? '加入队列' : '发送'"
+        >
+          <Send :size="16" />
         </button>
       </div>
       <div v-if="currentAttachments.length > 0" class="attach-strip">
@@ -2001,7 +2148,7 @@ onMounted(() => {
            visible. Aligns to the right so the rest of the
            row has the user's eye path. -->
       <div class="hints">
-        <span><kbd>Enter</kbd> 发送</span>
+        <span><kbd>Enter</kbd> {{ currentConversationBusy ? '排队' : '发送' }}</span>
         <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
         <span><kbd>Esc</kbd> 停止</span>
       </div>
@@ -2144,6 +2291,117 @@ onMounted(() => {
 }
 .rollback-banner-dismiss:hover {
   color: var(--text);
+}
+
+.turn-queue {
+  margin-bottom: var(--space-2);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.turn-queue--blocked {
+  border-color: var(--warn-500);
+}
+.turn-queue-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.turn-queue-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  min-width: 0;
+}
+.turn-queue-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--brand-50);
+  color: var(--brand-600);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.turn-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: min(24vh, calc(var(--space-8) * 4));
+  overflow-y: auto;
+  background: var(--border-subtle);
+}
+.turn-queue-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: calc(var(--space-4) * 2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-1);
+}
+.turn-queue-item--failed {
+  background: var(--warn-50);
+}
+.turn-queue-index {
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--text-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.turn-queue-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.turn-queue-attachments,
+.turn-queue-status {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.turn-queue-item--failed .turn-queue-status {
+  color: var(--warn-500);
+}
+.turn-queue-icon {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+.turn-queue-icon:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.turn-queue-icon:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* The dialog "box": textarea + optional attach strip share a

@@ -50,7 +50,11 @@ const (
 	// backward compatible, so no data migration is required.
 	V7 AppVersion = 7
 
+	// V8 — durable per-session turn queue table for messages sent while
+	// a conversation is already streaming.
+	V8 AppVersion = 8
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V7
+	Current AppVersion = V8
 )

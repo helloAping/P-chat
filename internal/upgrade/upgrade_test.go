@@ -82,6 +82,37 @@ func TestRun_Idempotent(t *testing.T) {
 	}
 }
 
+func TestRun_V7ToV8CreatesTurnQueue(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755)
+
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db")+
+		"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := writeUserVersion(V7); err != nil {
+		t.Fatalf("write V7: %v", err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V7: %v", err)
+	}
+	if v := readUserVersion(); v != V8 {
+		t.Fatalf("version = %d, want V8", v)
+	}
+	var tableName string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='turn_queue'`).Scan(&tableName); err != nil {
+		t.Fatalf("turn_queue table missing: %v", err)
+	}
+	var indexName string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_turn_queue_session_status'`).Scan(&indexName); err != nil {
+		t.Fatalf("turn_queue index missing: %v", err)
+	}
+}
+
 func TestUserVersion(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)

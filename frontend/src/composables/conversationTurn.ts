@@ -1,5 +1,21 @@
 import * as api from '../api/client'
-import { appendStreamEvent, endStream, isActiveStream, recoverMissingParts, startStream, stopStream } from '../stores/chat'
+import {
+  appendLocalUserMessage,
+  appendStreamEvent,
+  claimNextQueuedTurn,
+  completeQueuedTurn,
+  endStream,
+  failQueuedTurn,
+  hasBlockingTurnQueueFailure,
+  hasQueuedTurns,
+  isActiveStream,
+  loadTurnQueue,
+  recoverMissingParts,
+  setTurnQueueDraining,
+  startStream,
+  state,
+  stopStream,
+} from '../stores/chat'
 
 export type ConversationTurnInput = {
   sessionId: string
@@ -20,9 +36,12 @@ export type ConversationTurnInput = {
   onFirstEvent?: () => void
 }
 
+const drainingSessions = new Set<string>()
+const queueClaimRetryDelays = [120, 240, 480, 800]
+
 // submitConversationTurn 集中一个聊天回合的流生命周期。
 // submitConversationTurn owns one chat turn's streaming lifecycle.
-export async function submitConversationTurn(input: ConversationTurnInput): Promise<void> {
+export async function submitConversationTurn(input: ConversationTurnInput): Promise<boolean> {
   const ctrl = new AbortController()
   startStream(input.sessionId, ctrl)
 
@@ -86,6 +105,7 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
   }
 
   const deferredDrop: { current: { lastSeq: number; reason: string } | null } = { current: null }
+  let streamReturned = false
   try {
     await api.streamMessagesRetry(input.sessionId, {
       message: input.message,
@@ -107,6 +127,8 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       },
       onEvent: enqueueEvent,
     })
+    streamReturned = !ctrl.signal.aborted
+    return !ctrl.signal.aborted
   } finally {
     flushPendingDeltas()
     endStream(input.sessionId, ctrl)
@@ -122,6 +144,163 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       // until MaxTurnSeconds).
       api.cancelStream(input.sessionId)
     }
+    if (streamReturned && !drainingSessions.has(input.sessionId)) {
+      void drainQueuedConversationTurns(input.sessionId).catch((error) => {
+        console.warn('[turn-queue] drain failed:', error)
+      })
+    }
+  }
+}
+
+export async function drainQueuedConversationTurns(sessionId: string): Promise<void> {
+  if (!sessionId || drainingSessions.has(sessionId)) return
+  if (state.streaming[sessionId]) return
+  if (hasBlockingTurnQueueFailure(sessionId)) return
+  if (state.pendingQuestion[sessionId]) return
+  if ((state.pendingConfirm[sessionId] || []).length > 0) return
+
+  drainingSessions.add(sessionId)
+  setTurnQueueDraining(sessionId, true)
+  try {
+    await loadTurnQueue(sessionId)
+    while (hasQueuedTurns(sessionId) && !hasBlockingTurnQueueFailure(sessionId)) {
+      if (state.streaming[sessionId]) break
+      if (state.pendingQuestion[sessionId]) break
+      if ((state.pendingConfirm[sessionId] || []).length > 0) break
+
+      const item = await claimNextQueuedTurnForDrain(sessionId)
+      if (!item) break
+      const payload = item.payload
+      if (!payload?.message || !payload.client_msg_id) {
+        await failQueuedTurn(sessionId, item.id, 'queued payload is missing message or client_msg_id')
+        break
+      }
+
+      appendLocalUserMessage(sessionId, {
+        id: payload.client_msg_id,
+        role: 'user',
+        content: payload.message,
+        created_at: Date.now() / 1000,
+        attachments: bubbleAttachmentsFromQueuedPayload(payload.attachments),
+      })
+
+      try {
+        const completed = await submitConversationTurn({
+          sessionId,
+          message: payload.message,
+          clientMsgID: payload.client_msg_id,
+          provider: payload.provider,
+          model: payload.model,
+          style: payload.style,
+          workMode: payload.work_mode,
+          useImageRecognition: payload.use_image_recognition,
+          subAgentModelEnabled: !!payload.sub_agent_model_enabled,
+          subAgentProvider: payload.sub_agent_provider || '',
+          subAgentModel: payload.sub_agent_model || '',
+          todoMode: payload.todo_mode || 'auto',
+          attachments: payload.attachments,
+          skillContext: payload.skill_context || undefined,
+        })
+        if (!completed) {
+          await failQueuedTurn(sessionId, item.id, 'queued turn was stopped by the user')
+          break
+        }
+        await completeQueuedTurn(sessionId, item.id)
+      } catch (e: any) {
+        await failQueuedTurn(sessionId, item.id, e?.message || String(e))
+        break
+      }
+      await loadTurnQueue(sessionId)
+    }
+  } finally {
+    setTurnQueueDraining(sessionId, false)
+    drainingSessions.delete(sessionId)
+  }
+}
+
+async function claimNextQueuedTurnForDrain(sessionId: string): Promise<api.TurnQueueItem | null> {
+  for (let attempt = 0; attempt <= queueClaimRetryDelays.length; attempt++) {
+    try {
+      return await claimNextQueuedTurn(sessionId)
+    } catch (e: any) {
+      if (isQueueClaimFailedHead(e)) {
+        await loadTurnQueue(sessionId)
+        return null
+      }
+      if (!isQueueClaimTemporarilyBlocked(e)) throw e
+      if (attempt >= queueClaimRetryDelays.length) {
+        await loadTurnQueue(sessionId)
+        scheduleQueueDrainRetry(sessionId)
+        return null
+      }
+      await delay(queueClaimRetryDelays[attempt])
+    }
+  }
+  return null
+}
+
+function isQueueClaimTemporarilyBlocked(error: unknown): boolean {
+  const message = String((error as any)?.message || error)
+  return message.includes('HTTP 409') && (
+    message.includes('already being processed') ||
+    message.includes('already running')
+  )
+}
+
+function isQueueClaimFailedHead(error: unknown): boolean {
+  const message = String((error as any)?.message || error)
+  return message.includes('HTTP 409') && message.includes('failed item')
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function scheduleQueueDrainRetry(sessionId: string) {
+  window.setTimeout(() => {
+    void drainQueuedConversationTurns(sessionId).catch((error) => {
+      console.warn('[turn-queue] delayed drain failed:', error)
+    })
+  }, 1000)
+}
+
+function bubbleAttachmentsFromQueuedPayload(attachments?: api.InlineAttachment[]): api.MessageAttachment[] | undefined {
+  if (!attachments?.length) return undefined
+  const out: api.MessageAttachment[] = []
+  for (const att of attachments) {
+    if (att.type === 'image_url' || att.type === 'audio_url' || att.type === 'video_url') {
+      out.push({
+        type: att.type,
+        url: dataImageToBlobURL(att.upload_id ? api.uploadURL(att.upload_id) : att.url),
+        name: att.name,
+        kind: att.kind,
+        mime: att.mime,
+      })
+      continue
+    }
+    out.push({
+      type: 'text',
+      text: att.text,
+      name: att.name,
+      kind: att.kind,
+      mime: att.mime,
+    })
+  }
+  return out
+}
+
+function dataImageToBlobURL(url: string | undefined): string | undefined {
+  if (!url?.startsWith('data:image/')) return url
+  try {
+    const commaIdx = url.indexOf(',')
+    const mime = url.slice(5, commaIdx).split(';')[0]
+    const b64 = url.slice(commaIdx + 1)
+    const byteChars = atob(b64)
+    const bytes = new Uint8Array(byteChars.length)
+    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
+    return URL.createObjectURL(new Blob([bytes], { type: mime }))
+  } catch {
+    return url
   }
 }
 
