@@ -37,12 +37,17 @@ export type ConversationTurnInput = {
   onFirstEvent?: () => void
 }
 
+export type ConversationTurnResult = {
+  completed: boolean
+  aborted: boolean
+}
+
 const drainingSessions = new Set<string>()
 const queueClaimRetryDelays = [120, 240, 480, 800]
 
 // submitConversationTurn 集中一个聊天回合的流生命周期。
 // submitConversationTurn owns one chat turn's streaming lifecycle.
-export async function submitConversationTurn(input: ConversationTurnInput): Promise<boolean> {
+export async function submitConversationTurn(input: ConversationTurnInput): Promise<ConversationTurnResult> {
   const ctrl = new AbortController()
   startStream(input.sessionId, ctrl)
 
@@ -50,9 +55,11 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
   type PendingDelta = { event: api.StreamEvent; field: DeltaField; chunks: string[] }
   const pendingDeltas: PendingDelta[] = []
   let deltaFrame: number | null = null
+  let sawDone = false
 
   const applyEvent = (event: api.StreamEvent) => {
     if (!isActiveStream(input.sessionId, ctrl)) return
+    if (event.type === 'done') sawDone = true
     input.onFirstEvent?.()
     if (event.type === 'error' && event.error) input.onServerError?.(event)
     appendStreamEvent(input.sessionId, event)
@@ -106,7 +113,7 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
   }
 
   const deferredDrop: { current: { lastSeq: number; reason: string } | null } = { current: null }
-  let streamReturned = false
+  let streamCompleted = false
   try {
     await api.streamMessagesRetry(input.sessionId, {
       message: input.message,
@@ -128,8 +135,8 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       },
       onEvent: enqueueEvent,
     })
-    streamReturned = !ctrl.signal.aborted
-    return !ctrl.signal.aborted
+    streamCompleted = sawDone && !ctrl.signal.aborted
+    return { completed: streamCompleted, aborted: ctrl.signal.aborted }
   } finally {
     flushPendingDeltas()
     endStream(input.sessionId, ctrl)
@@ -145,7 +152,7 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       // until MaxTurnSeconds).
       api.cancelStream(input.sessionId)
     }
-    if (streamReturned && !drainingSessions.has(input.sessionId)) {
+    if (streamCompleted && !drainingSessions.has(input.sessionId)) {
       void drainQueuedConversationTurns(input.sessionId).catch((error) => {
         console.warn('[turn-queue] drain failed:', error)
       })
@@ -186,7 +193,7 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
       })
 
       try {
-        const completed = await submitConversationTurn({
+        const result = await submitConversationTurn({
           sessionId,
           message: payload.message,
           clientMsgID: payload.client_msg_id,
@@ -202,8 +209,12 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
           attachments: payload.attachments,
           skillContext: payload.skill_context || undefined,
         })
-        if (!completed) {
-          await failQueuedTurn(sessionId, item.id, 'queued turn was stopped by the user')
+        if (!result.completed) {
+          await failQueuedTurn(
+            sessionId,
+            item.id,
+            result.aborted ? 'queued turn was stopped by the user' : 'queued turn did not finish',
+          )
           break
         }
         await completeQueuedTurn(sessionId, item.id)

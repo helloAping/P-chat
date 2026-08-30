@@ -136,6 +136,29 @@ func (s *Store) ListSubagentJobs(sessionID string, limit int) ([]SubagentJob, er
 	return out, rows.Err()
 }
 
+// HasActiveSubagentJobs reports whether a session still has queued or running
+// asynchronous subagent jobs.
+func (s *Store) HasActiveSubagentJobs(sessionID string) (bool, error) {
+	if sessionID == "" {
+		return false, nil
+	}
+	var found int
+	err := s.db.QueryRow(
+		`SELECT 1
+		   FROM subagent_jobs
+		  WHERE session_id = ? AND status IN (?, ?)
+		  LIMIT 1`,
+		sessionID, SubagentJobQueued, SubagentJobRunning,
+	).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return found == 1, nil
+}
+
 // MarkSubagentJobRunning records that a background subagent started.
 func (s *Store) MarkSubagentJobRunning(id string) error {
 	if id == "" {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { NButton, NCheckbox, useMessage } from 'naive-ui'
+import { NButton, NCheckbox } from 'naive-ui'
 import AppModal from './AppModal.vue'
 
 type CloseRequestPayload = {
@@ -10,7 +10,6 @@ type CloseRequestPayload = {
 const show = ref(false)
 const minimizeToTray = ref(true)
 const noMoreReminders = ref(false)
-const message = useMessage()
 
 let cleanupRuntimeEvent: (() => void) | null = null
 
@@ -51,11 +50,14 @@ async function confirm() {
   noMoreReminders.value = false
   try {
     const app = await import('../../wailsjs/go/main/App')
-    await app.ConfirmWindowClose(choice)
+    void app.ConfirmWindowClose(choice).catch((e) => {
+      // Wails may reject this promise while the native side is already
+      // hiding or quitting the window. The user's close choice has been
+      // dispatched, so surfacing a modal error here is misleading.
+      console.warn('ConfirmWindowClose failed after dispatch', e)
+    })
   } catch (e) {
-    console.warn('ConfirmWindowClose failed', e)
-    message.error('关闭操作没有完成')
-    show.value = true
+    console.warn('ConfirmWindowClose import failed', e)
   }
 }
 

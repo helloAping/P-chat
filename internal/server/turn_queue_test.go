@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/memory"
 )
 
 func TestTurnQueue_EnqueueListAndClaim(t *testing.T) {
@@ -84,6 +86,40 @@ func TestTurnQueue_ClaimRejectsBusySession(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Status != "queued" {
 		t.Fatalf("busy claim should not mutate queue: %+v", items)
+	}
+}
+
+func TestTurnQueue_ClaimRejectsActiveBackgroundSubagent(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, err := s.store.NewConversation()
+	if err != nil {
+		t.Fatalf("NewConversation: %v", err)
+	}
+	_ = doTurnQueueRequest(t, s, http.MethodPost, "/api/v1/sessions/"+sessionID+"/turn-queue",
+		`{"message":"queued","client_msg_id":1730000000002501}`)
+	if _, err := s.store.CreateSubagentJob(memory.SubagentJob{
+		ID:        "job-running-1",
+		TaskID:    "task-running-1",
+		SessionID: sessionID,
+		Status:    memory.SubagentJobRunning,
+	}); err != nil {
+		t.Fatalf("CreateSubagentJob: %v", err)
+	}
+
+	claimed := doTurnQueueRequest(t, s, http.MethodPost, "/api/v1/sessions/"+sessionID+"/turn-queue/claim", "")
+	if claimed.Code != http.StatusConflict {
+		t.Fatalf("claim status = %d, want 409; body=%s", claimed.Code, claimed.Body.String())
+	}
+	if !strings.Contains(claimed.Body.String(), "background subagent") {
+		t.Fatalf("claim response should explain active background work: %s", claimed.Body.String())
+	}
+
+	items, err := s.store.ListTurnQueueItems(sessionID)
+	if err != nil {
+		t.Fatalf("ListTurnQueueItems: %v", err)
+	}
+	if len(items) != 1 || items[0].Status != "queued" {
+		t.Fatalf("active background job should not mutate queue: %+v", items)
 	}
 }
 

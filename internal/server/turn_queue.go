@@ -122,6 +122,15 @@ func (h *Handler) ClaimNextTurnQueueItem(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "a message is already being processed for this session"})
 		return
 	}
+	activeSubagents, err := h.store.HasActiveSubagentJobs(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("check background subagent jobs: %v", err)})
+		return
+	}
+	if activeSubagents {
+		c.JSON(http.StatusConflict, gin.H{"error": "background subagent jobs are still running for this session"})
+		return
+	}
 	item, found, err := h.store.ClaimNextTurnQueueItem(id)
 	if errors.Is(err, memory.ErrTurnQueueBlocked) {
 		c.JSON(http.StatusConflict, gin.H{"error": "turn queue is blocked by a failed item"})
