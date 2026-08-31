@@ -63,6 +63,76 @@ func TestTurnQueue_EnqueueListAndClaim(t *testing.T) {
 	}
 }
 
+func TestTurnQueue_EditQueuedMessageChangesClaimedPayload(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, err := s.store.NewConversation()
+	if err != nil {
+		t.Fatalf("NewConversation: %v", err)
+	}
+
+	enqueued := doTurnQueueRequest(t, s, http.MethodPost, "/api/v1/sessions/"+sessionID+"/turn-queue",
+		`{"message":"before","client_msg_id":1730000000001501,"style":"tech"}`)
+	var env TurnQueueItemEnvelope
+	if err := json.NewDecoder(enqueued.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+
+	edited := doTurnQueueRequest(t, s, http.MethodPatch,
+		"/api/v1/sessions/"+sessionID+"/turn-queue/"+strconvInt(env.Item.ID),
+		`{"message":"after"}`)
+	if edited.Code != http.StatusOK {
+		t.Fatalf("edit status = %d, want 200; body=%s", edited.Code, edited.Body.String())
+	}
+	var editedEnv TurnQueueItemEnvelope
+	if err := json.NewDecoder(edited.Body).Decode(&editedEnv); err != nil {
+		t.Fatal(err)
+	}
+	if editedEnv.Item.Message != "after" || editedEnv.Item.Status != memory.TurnQueueStatusQueued {
+		t.Fatalf("unexpected edited response: %+v", editedEnv.Item)
+	}
+
+	claimed := doTurnQueueRequest(t, s, http.MethodPost, "/api/v1/sessions/"+sessionID+"/turn-queue/claim", "")
+	var claimedEnv TurnQueueItemEnvelope
+	if err := json.NewDecoder(claimed.Body).Decode(&claimedEnv); err != nil {
+		t.Fatal(err)
+	}
+	if claimedEnv.Item.Payload == nil || claimedEnv.Item.Payload.Message != "after" || claimedEnv.Item.Payload.Style != "tech" {
+		t.Fatalf("claim did not preserve edited payload: %+v", claimedEnv.Item.Payload)
+	}
+}
+
+func TestTurnQueue_EditRejectsClaimedOrEmptyMessage(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, err := s.store.NewConversation()
+	if err != nil {
+		t.Fatalf("NewConversation: %v", err)
+	}
+	enqueued := doTurnQueueRequest(t, s, http.MethodPost, "/api/v1/sessions/"+sessionID+"/turn-queue",
+		`{"message":"before","client_msg_id":1730000000001701}`)
+	var env TurnQueueItemEnvelope
+	if err := json.NewDecoder(enqueued.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+
+	empty := doTurnQueueRequest(t, s, http.MethodPatch,
+		"/api/v1/sessions/"+sessionID+"/turn-queue/"+strconvInt(env.Item.ID),
+		`{"message":"   "}`)
+	if empty.Code != http.StatusBadRequest {
+		t.Fatalf("empty edit status = %d, want 400; body=%s", empty.Code, empty.Body.String())
+	}
+
+	claimed := doTurnQueueRequest(t, s, http.MethodPost, "/api/v1/sessions/"+sessionID+"/turn-queue/claim", "")
+	if claimed.Code != http.StatusOK {
+		t.Fatalf("claim status = %d, want 200; body=%s", claimed.Code, claimed.Body.String())
+	}
+	conflict := doTurnQueueRequest(t, s, http.MethodPatch,
+		"/api/v1/sessions/"+sessionID+"/turn-queue/"+strconvInt(env.Item.ID),
+		`{"message":"too late"}`)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("claimed edit status = %d, want 409; body=%s", conflict.Code, conflict.Body.String())
+	}
+}
+
 func TestTurnQueue_ClaimRejectsBusySession(t *testing.T) {
 	s, _ := newTestServer(t)
 	sessionID, err := s.store.NewConversation()

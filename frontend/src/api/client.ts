@@ -1313,6 +1313,12 @@ export const retryTurnQueueItem = (sessionId: string, queueId: number) =>
     { method: 'POST' },
   )
 
+export const editTurnQueueItem = (sessionId: string, queueId: number, message: string) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}`,
+    { method: 'PATCH', body: JSON.stringify({ message }) },
+  )
+
 export const deleteTurnQueueItem = (sessionId: string, queueId: number) =>
   jsonFetch<TurnQueueItemEnvelope>(
     `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}`,

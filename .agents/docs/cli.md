@@ -50,6 +50,26 @@ CLI 通过 `httpcli.Client` 连接 pchat-server，消费 SSE 事件流。事件�
 
 `serverproc.Start()` 自动启动 pchat-server 子进程，通过环境变量 `PCHAT_PORT` 通信。
 
+### 4. 会话回合队列
+
+CLI 用 `/queue` 管理与 GUI 相同的持久化 FIFO：
+
+```text
+/queue                         # 列表
+/queue add <消息>              # 入队
+/queue edit <id> <新消息>      # 编辑 queued 项
+/queue run                     # 按 FIFO 连续发送
+/queue retry <id>              # 重试 failed 项
+/queue delete <id>             # 删除 queued/failed 项
+/queue clear                   # 清空 queued/failed 项
+```
+
+`/queue run` 通过 claim/complete/fail 生命周期执行，沿用入队时保存的 provider、
+model、style、work_mode、附件、skill context 等发送参数。遇到 failed/running 队首
+会停止，不越过队首；显式 `false` 的图像识别和子代理开关也按三态值原样转发。
+local / HTTP 两种 `cliContext` adapter 使用同一组命令处理器。local CLI 列表时会恢复
+超过安全窗口的陈旧 running 项，避免上次进程中断后永久卡住队首。
+
 ## 修改指南
 
 ### 要修改 REPL 输入处理
@@ -57,6 +77,7 @@ CLI 通过 `httpcli.Client` 连接 pchat-server，消费 SSE 事件流。事件�
 
 ### 要添加新斜杠命令
 - `commands.go` 中的命令映射表
+- 需要跨 local / HTTP 模式时，同步扩展 `context.go` 与 `internal/httpcli/client.go`
 
 ### 要修改终端渲染
 - `progress.go` (工具调用渲染)

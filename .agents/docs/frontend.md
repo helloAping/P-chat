@@ -276,6 +276,17 @@ flag + `source` 路径）。`GET /api/v1/tools` 同时返回 `diagnostics[]`，
 流式 renderer 20.5%→10.3%、GPU 11.7%→8.1%。卡死流（`done` 丢失）由传输层
 150s idle watchdog（`idleTimeoutMs`）兜底，无需额外前端看门狗。
 
+### 12. 会话回合队列
+
+- 会话忙碌或已有待处理项时，`InputArea.send()` 把完整发送参数持久化到
+  `/turn-queue`，不提前渲染 user bubble。
+- 队列条默认显示一行摘要；展开后支持编辑 queued 消息、删除、失败重试和清空。
+- 编辑调用 `PATCH /turn-queue/:queue_id`；保存时保留队列 ID、FIFO 位置、附件和
+  模型/风格等 payload，只改消息文本。
+- 进入编辑态会暂停客户端自动出队；保存或取消后恢复。服务端仍以
+  `status=queued` 条件更新，兜底处理多客户端领取竞态。
+- failed 项不可直接编辑，需先重试回到 queued；running 项不会出现在可编辑列表。
+
 对话页顶部的 `StreamingBar.vue`（"对话进行中"加载条）同样遵循
 compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
 重复模式实现无缝滚动，无 `background-position` 动画（见 §8.4 例外）。

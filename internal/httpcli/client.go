@@ -401,11 +401,186 @@ func (c *Client) ListMessages(ctx context.Context, id string) ([]Message, error)
 
 // SendMessageOptions configures a chat call.
 type SendMessageOptions struct {
-	Message  string `json:"message" binding:"required"`
-	Style    string `json:"style,omitempty"`
-	WorkMode string `json:"work_mode,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model,omitempty"`
+	Message              string                `json:"message" binding:"required"`
+	Style                string                `json:"style,omitempty"`
+	WorkMode             string                `json:"work_mode,omitempty"`
+	TodoMode             string                `json:"todo_mode,omitempty"`
+	Provider             string                `json:"provider,omitempty"`
+	Model                string                `json:"model,omitempty"`
+	ClientMsgID          int64                 `json:"client_msg_id,omitempty"`
+	Attachments          []TurnQueueAttachment `json:"attachments,omitempty"`
+	UseImageRecognition  *bool                 `json:"use_image_recognition,omitempty"`
+	SubAgentModelEnabled *bool                 `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider     string                `json:"sub_agent_provider,omitempty"`
+	SubAgentModel        string                `json:"sub_agent_model,omitempty"`
+	SkillContext         string                `json:"skill_context,omitempty"`
+}
+
+// TurnQueuePayload 镜像 server.SendMessageRequest 中需要持久化排队的字段。
+// TurnQueuePayload mirrors the queued subset of server.SendMessageRequest.
+type TurnQueuePayload struct {
+	Message              string                `json:"message"`
+	TodoMode             string                `json:"todo_mode,omitempty"`
+	ClientMsgID          int64                 `json:"client_msg_id"`
+	Style                string                `json:"style,omitempty"`
+	WorkMode             string                `json:"work_mode,omitempty"`
+	Provider             string                `json:"provider,omitempty"`
+	Model                string                `json:"model,omitempty"`
+	Attachments          []TurnQueueAttachment `json:"attachments,omitempty"`
+	UseImageRecognition  *bool                 `json:"use_image_recognition,omitempty"`
+	SubAgentModelEnabled *bool                 `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider     string                `json:"sub_agent_provider,omitempty"`
+	SubAgentModel        string                `json:"sub_agent_model,omitempty"`
+	SkillContext         string                `json:"skill_context,omitempty"`
+}
+
+// TurnQueueAttachment 镜像 agent.Attachment，避免 HTTP 适配层依赖 agent 包。
+// TurnQueueAttachment mirrors agent.Attachment without coupling the HTTP adapter to agent.
+type TurnQueueAttachment struct {
+	Type     string `json:"type,omitempty"`
+	ID       string `json:"id,omitempty"`
+	UploadID string `json:"upload_id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Size     int64  `json:"size,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+	MIME     string `json:"mime,omitempty"`
+	Data     string `json:"data,omitempty"`
+	Text     string `json:"text,omitempty"`
+	URL      string `json:"url,omitempty"`
+}
+
+// TurnQueueItem 表示会话 FIFO 队列中的一个未完成用户回合。
+// TurnQueueItem is one unfinished user turn in a session FIFO queue.
+type TurnQueueItem struct {
+	ID              int64             `json:"id"`
+	SessionID       string            `json:"session_id"`
+	Status          string            `json:"status"`
+	Message         string            `json:"message"`
+	ClientMsgID     int64             `json:"client_msg_id"`
+	AttachmentCount int               `json:"attachment_count"`
+	Error           string            `json:"error,omitempty"`
+	CreatedAt       int64             `json:"created_at"`
+	UpdatedAt       int64             `json:"updated_at"`
+	StartedAt       int64             `json:"started_at,omitempty"`
+	FinishedAt      int64             `json:"finished_at,omitempty"`
+	Payload         *TurnQueuePayload `json:"payload,omitempty"`
+}
+
+// ListTurnQueueItems 返回当前会话 queued、running 和 failed 状态的回合。
+// ListTurnQueueItems returns the current session's queued, running, and failed turns.
+func (c *Client) ListTurnQueueItems(ctx context.Context, sessionID string) ([]TurnQueueItem, error) {
+	var resp struct {
+		Items []TurnQueueItem `json:"items"`
+	}
+	path := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/turn-queue"
+	if err := c.doJSON(ctx, "GET", path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Items, nil
+}
+
+// EnqueueTurnQueueItem 将用户回合追加到持久化会话队列。
+// EnqueueTurnQueueItem appends a user turn to the durable session queue.
+func (c *Client) EnqueueTurnQueueItem(ctx context.Context, sessionID string, payload TurnQueuePayload) (TurnQueueItem, error) {
+	var resp struct {
+		Item TurnQueueItem `json:"item"`
+	}
+	path := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/turn-queue"
+	if err := c.doJSON(ctx, "POST", path, payload, &resp); err != nil {
+		return TurnQueueItem{}, err
+	}
+	return resp.Item, nil
+}
+
+// EditTurnQueueItem 修改仍处于 queued 状态的回合文本。
+// EditTurnQueueItem changes the text of a turn that is still queued.
+func (c *Client) EditTurnQueueItem(ctx context.Context, sessionID string, queueID int64, message string) (TurnQueueItem, error) {
+	var resp struct {
+		Item TurnQueueItem `json:"item"`
+	}
+	path := fmt.Sprintf("/api/v1/sessions/%s/turn-queue/%d", url.PathEscape(sessionID), queueID)
+	if err := c.doJSON(ctx, "PATCH", path, map[string]string{"message": message}, &resp); err != nil {
+		return TurnQueueItem{}, err
+	}
+	return resp.Item, nil
+}
+
+// ClaimNextTurnQueueItem 原子地将 FIFO 队首转为 running 并返回完整载荷。
+// ClaimNextTurnQueueItem atomically moves the FIFO head to running and returns its payload.
+func (c *Client) ClaimNextTurnQueueItem(ctx context.Context, sessionID string) (TurnQueueItem, error) {
+	var resp struct {
+		Item TurnQueueItem `json:"item"`
+	}
+	path := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/turn-queue/claim"
+	if err := c.doJSON(ctx, "POST", path, nil, &resp); err != nil {
+		return TurnQueueItem{}, err
+	}
+	return resp.Item, nil
+}
+
+// CompleteTurnQueueItem 将 running 回合标记为 done。
+// CompleteTurnQueueItem marks a running queued turn done.
+func (c *Client) CompleteTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (TurnQueueItem, error) {
+	var resp struct {
+		Item TurnQueueItem `json:"item"`
+	}
+	path := fmt.Sprintf("/api/v1/sessions/%s/turn-queue/%d/complete", url.PathEscape(sessionID), queueID)
+	if err := c.doJSON(ctx, "POST", path, nil, &resp); err != nil {
+		return TurnQueueItem{}, err
+	}
+	return resp.Item, nil
+}
+
+// FailTurnQueueItem 将 running 回合标记为 failed，并暂停 FIFO 出队。
+// FailTurnQueueItem marks a running queued turn failed and pauses FIFO draining.
+func (c *Client) FailTurnQueueItem(ctx context.Context, sessionID string, queueID int64, message string) (TurnQueueItem, error) {
+	var resp struct {
+		Item TurnQueueItem `json:"item"`
+	}
+	path := fmt.Sprintf("/api/v1/sessions/%s/turn-queue/%d/fail", url.PathEscape(sessionID), queueID)
+	if err := c.doJSON(ctx, "POST", path, map[string]string{"error": message}, &resp); err != nil {
+		return TurnQueueItem{}, err
+	}
+	return resp.Item, nil
+}
+
+// RetryTurnQueueItem 将 failed 回合重新放回 queued 状态。
+// RetryTurnQueueItem moves a failed turn back to queued.
+func (c *Client) RetryTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (TurnQueueItem, error) {
+	var resp struct {
+		Item TurnQueueItem `json:"item"`
+	}
+	path := fmt.Sprintf("/api/v1/sessions/%s/turn-queue/%d/retry", url.PathEscape(sessionID), queueID)
+	if err := c.doJSON(ctx, "POST", path, nil, &resp); err != nil {
+		return TurnQueueItem{}, err
+	}
+	return resp.Item, nil
+}
+
+// DeleteTurnQueueItem 取消 queued 或 failed 回合。
+// DeleteTurnQueueItem cancels a queued or failed turn.
+func (c *Client) DeleteTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (TurnQueueItem, error) {
+	var resp struct {
+		Item TurnQueueItem `json:"item"`
+	}
+	path := fmt.Sprintf("/api/v1/sessions/%s/turn-queue/%d", url.PathEscape(sessionID), queueID)
+	if err := c.doJSON(ctx, "DELETE", path, nil, &resp); err != nil {
+		return TurnQueueItem{}, err
+	}
+	return resp.Item, nil
+}
+
+// ClearTurnQueue 取消会话中所有 queued 或 failed 回合。
+// ClearTurnQueue cancels all queued or failed turns in a session.
+func (c *Client) ClearTurnQueue(ctx context.Context, sessionID string) (int64, error) {
+	var resp struct {
+		Cleared int64 `json:"cleared"`
+	}
+	path := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/turn-queue"
+	if err := c.doJSON(ctx, "DELETE", path, nil, &resp); err != nil {
+		return 0, err
+	}
+	return resp.Cleared, nil
 }
 
 // SendMessage streams the LLM response back via SSE. Each event

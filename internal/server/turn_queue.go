@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -43,6 +44,10 @@ type TurnQueueItemEnvelope struct {
 
 type turnQueueFailRequest struct {
 	Error string `json:"error"`
+}
+
+type turnQueueEditRequest struct {
+	Message string `json:"message"`
 }
 
 func (h *Handler) turnQueueSession(c *gin.Context) (string, bool) {
@@ -109,6 +114,44 @@ func (h *Handler) ListTurnQueueItems(c *gin.Context) {
 		resp = append(resp, turnQueueItemResponse(item, nil))
 	}
 	c.JSON(http.StatusOK, TurnQueueListResponse{Items: resp})
+}
+
+// EditTurnQueueItem 修改尚未领取的排队消息。
+// EditTurnQueueItem updates the text of an unclaimed queued turn.
+func (h *Handler) EditTurnQueueItem(c *gin.Context) {
+	id, ok := h.turnQueueSession(c)
+	if !ok {
+		return
+	}
+	queueID, ok := parseTurnQueueID(c)
+	if !ok {
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+	var req turnQueueEditRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.Message = strings.TrimSpace(req.Message)
+	if req.Message == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "message is required"})
+		return
+	}
+	item, found, err := h.store.EditTurnQueueItem(id, queueID, req.Message)
+	if errors.Is(err, memory.ErrTurnQueueNotEditable) {
+		c.JSON(http.StatusConflict, gin.H{"error": "turn queue item is no longer editable"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("edit turn queue item: %v", err)})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "queued turn not found"})
+		return
+	}
+	c.JSON(http.StatusOK, TurnQueueItemEnvelope{Item: turnQueueItemResponse(item, nil)})
 }
 
 // ClaimNextTurnQueueItem 领取下一条 queued 项用于执行。

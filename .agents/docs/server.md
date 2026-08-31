@@ -98,6 +98,23 @@ Chunk 字段检查顺序（优先级从高到低）:
 - `SaveSystemMessage` — 保存自定义系统提示词
 - `GetTodos` — 获取待办列表
 
+#### 会话回合队列
+
+`turn_queue` 是忙碌会话的持久化 FIFO。客户端先入队，空闲后通过 `claim`
+领取队首，再复用 `/messages` 执行，最后标记 `complete` 或 `fail`。队首为
+`running` / `failed` 时会阻塞后续领取，避免跳过用户消息。
+
+| 方法 | 路径 | 行为 |
+| --- | --- | --- |
+| `GET/POST/DELETE` | `/sessions/:id/turn-queue` | 列表、入队、清空 queued/failed |
+| `PATCH` | `/sessions/:id/turn-queue/:queue_id` | 仅编辑尚未领取的 queued 消息；同步 `message` 与 `payload_json.message` |
+| `POST` | `/sessions/:id/turn-queue/claim` | 原子领取 FIFO 队首并返回完整发送 payload |
+| `POST` | `/sessions/:id/turn-queue/:queue_id/complete|fail|retry` | 完成、失败、重试 |
+| `DELETE` | `/sessions/:id/turn-queue/:queue_id` | 取消 queued/failed 项 |
+
+编辑和领取共享 Store 锁与状态条件；一旦队列项已变成 `running`，编辑返回
+`409 Conflict`，防止已经进入 agent 上下文的消息被事后改写。
+
 ### 5. 消息持久化
 
 - 消息通过 `memory.Store.AddChatMessageTo()` 持久化

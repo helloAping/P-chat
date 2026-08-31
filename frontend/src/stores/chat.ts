@@ -171,6 +171,7 @@ export const state = reactive({
   turnQueue: {} as Record<string, TurnQueueItem[]>,
   turnQueueLoading: {} as Record<string, boolean>,
   turnQueueDraining: {} as Record<string, boolean>,
+  turnQueueEditing: {} as Record<string, boolean>,
   // sessionWorking is the per-session "is the LLM mid-turn"
   // flag, derived from the `session_status` SSE event. The
   // TodoPanel state machine reads this to decide whether
@@ -363,6 +364,12 @@ export function setTurnQueueDraining(sessionId: string, draining: boolean) {
   else delete state.turnQueueDraining[sessionId]
 }
 
+export function setTurnQueueEditing(sessionId: string, editing: boolean) {
+  if (!sessionId) return
+  if (editing) state.turnQueueEditing[sessionId] = true
+  else delete state.turnQueueEditing[sessionId]
+}
+
 export async function loadTurnQueue(sessionId: string): Promise<TurnQueueItem[]> {
   if (!sessionId) return []
   state.turnQueueLoading[sessionId] = true
@@ -408,6 +415,11 @@ export async function failQueuedTurn(sessionId: string, queueId: number, error: 
 
 export async function retryQueuedTurn(sessionId: string, queueId: number): Promise<void> {
   const response = await api.retryTurnQueueItem(sessionId, queueId)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function editQueuedTurn(sessionId: string, queueId: number, message: string): Promise<void> {
+  const response = await api.editTurnQueueItem(sessionId, queueId, message)
   upsertTurnQueueItem(sessionId, response.item)
 }
 
@@ -1052,6 +1064,7 @@ export async function deleteSessionById(id: string) {
   delete state.turnQueue[id]
   delete state.turnQueueLoading[id]
   delete state.turnQueueDraining[id]
+  delete state.turnQueueEditing[id]
   delete state.sessionWorking[id]
   delete state.sessionBackgroundSubAgentJobs[id]
   delete state.sessionBackgroundHookMerging[id]

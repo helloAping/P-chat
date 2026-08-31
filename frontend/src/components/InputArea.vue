@@ -27,6 +27,8 @@ import {
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
 } from '../stores/chat'
 import type { PendingAttachment } from '../stores/chat'
+import { Pencil, Check, X } from './icons'
+import { editQueuedTurn, setTurnQueueEditing } from '../stores/chat'
 import { drainQueuedConversationTurns, stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
 import { notifyManager } from '../utils/notify'
 import { copyText } from '../utils/clipboard'
@@ -1481,6 +1483,10 @@ const currentConversationBusy = computed(() =>
   currentSessionWorking.value ||
   !!state.turnQueueDraining[state.currentID],
 )
+const editingQueueId = ref<number | null>(null)
+const editingQueueText = ref('')
+const editingQueueSessionID = ref('')
+const queueEditSaving = ref(false)
 
 function queuedTurnStatusLabel(status: string): string {
   if (status === 'failed') return '失败'
@@ -1523,8 +1529,55 @@ async function onRetryQueuedTurn(queueId: number) {
   }
 }
 
+function startEditingQueuedTurn(item: api.TurnQueueItem) {
+  if (item.status !== 'queued') return
+  if (editingQueueSessionID.value && editingQueueSessionID.value !== item.session_id) {
+    setTurnQueueEditing(editingQueueSessionID.value, false)
+  }
+  editingQueueId.value = item.id
+  editingQueueText.value = item.message
+  editingQueueSessionID.value = item.session_id
+  setTurnQueueEditing(item.session_id, true)
+}
+
+function clearQueueEditing() {
+  if (editingQueueSessionID.value) {
+    setTurnQueueEditing(editingQueueSessionID.value, false)
+  }
+  editingQueueId.value = null
+  editingQueueText.value = ''
+  editingQueueSessionID.value = ''
+}
+
+function stopEditingQueuedTurn() {
+  clearQueueEditing()
+  maybeDrainTurnQueue()
+}
+
+async function saveEditingQueuedTurn() {
+  const sessionID = editingQueueSessionID.value
+  if (!sessionID || editingQueueId.value === null || queueEditSaving.value) return
+  const messageText = editingQueueText.value.trim()
+  if (!messageText) {
+    message.warning('排队消息不能为空')
+    return
+  }
+  queueEditSaving.value = true
+  try {
+    await editQueuedTurn(sessionID, editingQueueId.value, messageText)
+    message.success('排队消息已更新')
+    clearQueueEditing()
+    if (state.currentID === sessionID) maybeDrainTurnQueue()
+  } catch (e: any) {
+    message.error(`编辑排队消息失败：${e?.message || e}`)
+  } finally {
+    queueEditSaving.value = false
+  }
+}
+
 function maybeDrainTurnQueue() {
   if (!state.currentID) return
+  if (editingQueueId.value !== null) return
   if (currentConversationBusy.value || hasFailedQueuedTurn.value) return
   void drainQueuedConversationTurns(state.currentID).catch((e) => {
     console.warn('[turn-queue] drain failed:', e)
@@ -1540,6 +1593,12 @@ watch([() => state.currentID, queueSignature, currentConversationBusy, () => !!c
 onMounted(() => {
   loadConfig()
   maybeDrainTurnQueue()
+})
+
+watch([() => state.currentID, queueSignature], () => {
+  const sessionChanged = !!editingQueueSessionID.value && editingQueueSessionID.value !== state.currentID
+  const itemMissing = editingQueueId.value !== null && !queuedTurns.value.some(item => item.id === editingQueueId.value)
+  if (sessionChanged || itemMissing) clearQueueEditing()
 })
 </script>
 
@@ -1591,13 +1650,46 @@ onMounted(() => {
             :title="queuedTurnTitle(item)"
           >
             <span class="turn-queue-index">{{ index + 1 }}</span>
-            <span class="turn-queue-message">{{ item.message }}</span>
+            <NInput
+              v-if="editingQueueId === item.id"
+              v-model:value="editingQueueText"
+              class="turn-queue-editor"
+              type="textarea"
+              size="small"
+              :autosize="{ minRows: 1, maxRows: 3 }"
+              :disabled="queueEditSaving"
+              @keydown.enter.exact.prevent="saveEditingQueuedTurn"
+              @keydown.esc.prevent="stopEditingQueuedTurn"
+            />
+            <span v-else class="turn-queue-message">{{ item.message }}</span>
             <span v-if="item.attachment_count > 0" class="turn-queue-attachments">
               {{ item.attachment_count }} 附件
             </span>
             <span class="turn-queue-status">{{ queuedTurnStatusLabel(item.status) }}</span>
             <button
-              v-if="item.status === 'failed'"
+              v-if="editingQueueId === item.id"
+              type="button"
+              class="turn-queue-icon"
+              :disabled="queueEditSaving"
+              title="保存"
+              aria-label="保存排队消息"
+              @click="saveEditingQueuedTurn"
+            >
+              <Check :size="13" />
+            </button>
+            <button
+              v-if="editingQueueId === item.id"
+              type="button"
+              class="turn-queue-icon"
+              :disabled="queueEditSaving"
+              title="取消编辑"
+              aria-label="取消编辑排队消息"
+              @click="stopEditingQueuedTurn"
+            >
+              <X :size="13" />
+            </button>
+            <button
+              v-else-if="item.status === 'failed'"
               type="button"
               class="turn-queue-icon"
               title="重试"
@@ -1607,6 +1699,17 @@ onMounted(() => {
               <RotateCcw :size="13" />
             </button>
             <button
+              v-else
+              type="button"
+              class="turn-queue-icon"
+              title="编辑"
+              aria-label="编辑排队消息"
+              @click="startEditingQueuedTurn(item)"
+            >
+              <Pencil :size="13" />
+            </button>
+            <button
+              v-if="editingQueueId !== item.id"
               type="button"
               class="turn-queue-icon"
               title="删除"
@@ -2370,6 +2473,13 @@ onMounted(() => {
   white-space: nowrap;
   color: var(--text-primary);
   font-size: 12.5px;
+}
+.turn-queue-editor {
+  min-width: 0;
+}
+.turn-queue-editor :deep(.n-input__textarea-el) {
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 .turn-queue-attachments,
 .turn-queue-status {

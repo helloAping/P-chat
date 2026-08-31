@@ -285,6 +285,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/sessions/:id/turn-queue", h.EnqueueTurnQueueItem)
 		api.DELETE("/sessions/:id/turn-queue", h.ClearTurnQueue)
 		api.POST("/sessions/:id/turn-queue/claim", h.ClaimNextTurnQueueItem)
+		api.PATCH("/sessions/:id/turn-queue/:queue_id", h.EditTurnQueueItem)
 		api.POST("/sessions/:id/turn-queue/:queue_id/complete", h.CompleteTurnQueueItem)
 		api.POST("/sessions/:id/turn-queue/:queue_id/fail", h.FailTurnQueueItem)
 		api.POST("/sessions/:id/turn-queue/:queue_id/retry", h.RetryTurnQueueItem)

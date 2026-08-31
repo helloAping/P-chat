@@ -211,6 +211,27 @@ func init() {
 			Handler: cmdReasoning,
 		},
 		{
+			Name: "/queue", Aliases: []string{"/qmsg"}, Description: "管理当前会话的排队消息",
+			Usage: "/queue [list|add|edit|run|retry|delete|clear] [参数]",
+			Args: "无参/list            - 列出 queued/running/failed 项\n" +
+				"      add <消息>           - 新增一条待发送消息\n" +
+				"      edit <id> <消息>     - 编辑尚未领取的消息\n" +
+				"      run                  - 按 FIFO 顺序发送全部可执行项\n" +
+				"      retry <id>           - 将失败项重新放回队列\n" +
+				"      delete <id>          - 删除 queued/failed 项（别名: rm）\n" +
+				"      clear                - 清空 queued/failed 项",
+			Examples: []string{
+				"/queue",
+				"/queue add 处理完当前回合后再检查测试",
+				"/queue edit 42 改为只运行单元测试",
+				"/queue run",
+				"/queue retry 42",
+				"/queue delete 42",
+				"/queue clear",
+			},
+			Handler: cmdQueue,
+		},
+		{
 			Name: "/regen", Aliases: []string{"/regenerate"}, Description: "重新生成指定用户消息之后的回复",
 			Usage: "/regen <user-message-id>",
 			Args:  "<user-message-id>  - 用户消息的数据库 ID；可通过 /history 或消息记录定位。",
@@ -2554,6 +2575,289 @@ func cmdReasoning(ctx cliContext, args string) error {
 	}
 	color.Green("  ✓ 推理强度已设为: %s", actual)
 	return nil
+}
+
+func cmdQueue(ctx cliContext, args string) error {
+	sessionID := ctx.GetCurrentSessionID()
+	if sessionID == "" {
+		return fmt.Errorf("当前没有活动会话")
+	}
+	args = strings.TrimSpace(args)
+	if args == "" || strings.EqualFold(args, "list") || strings.EqualFold(args, "ls") {
+		return printTurnQueue(ctx, sessionID)
+	}
+
+	parts := strings.SplitN(args, " ", 2)
+	action := strings.ToLower(parts[0])
+	rest := ""
+	if len(parts) == 2 {
+		rest = strings.TrimSpace(parts[1])
+	}
+	switch action {
+	case "add":
+		if rest == "" {
+			color.HiBlack("  用法: /queue add <消息>")
+			return nil
+		}
+		now := time.Now()
+		item, err := ctx.EnqueueTurnQueueItem(context.Background(), sessionID, httpcli.TurnQueuePayload{
+			Message:     rest,
+			ClientMsgID: now.UnixMilli()*1000 + now.UnixNano()%1000,
+			Style:       ctx.StyleName(),
+			WorkMode:    ctx.ModeName(),
+			Provider:    ctx.GetCurrentProvider(),
+			Model:       ctx.GetCurrentModel(),
+		})
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已加入队列 #%d", item.ID)
+		color.HiBlack("    使用 /queue run 按顺序发送")
+		return nil
+	case "edit":
+		editArgs := strings.SplitN(rest, " ", 2)
+		if len(editArgs) != 2 || strings.TrimSpace(editArgs[1]) == "" {
+			color.HiBlack("  用法: /queue edit <id> <消息>")
+			return nil
+		}
+		queueID, err := parseQueueID(editArgs[0])
+		if err != nil {
+			color.HiBlack("  用法: /queue edit <id> <消息>")
+			return nil
+		}
+		item, err := ctx.EditTurnQueueItem(context.Background(), sessionID, queueID, strings.TrimSpace(editArgs[1]))
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已更新队列 #%d", item.ID)
+		return nil
+	case "run", "drain":
+		if rest != "" {
+			color.HiBlack("  用法: /queue run")
+			return nil
+		}
+		return runTurnQueue(ctx, sessionID)
+	case "retry":
+		queueID, err := parseQueueID(rest)
+		if err != nil {
+			color.HiBlack("  用法: /queue retry <id>")
+			return nil
+		}
+		item, err := ctx.RetryTurnQueueItem(context.Background(), sessionID, queueID)
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已重新排队 #%d", item.ID)
+		return nil
+	case "delete", "remove", "rm", "del":
+		queueID, err := parseQueueID(rest)
+		if err != nil {
+			color.HiBlack("  用法: /queue delete <id>")
+			return nil
+		}
+		item, err := ctx.DeleteTurnQueueItem(context.Background(), sessionID, queueID)
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已删除队列 #%d", item.ID)
+		return nil
+	case "clear":
+		if rest != "" {
+			color.HiBlack("  用法: /queue clear")
+			return nil
+		}
+		count, err := ctx.ClearTurnQueue(context.Background(), sessionID)
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已清空 %d 条排队消息", count)
+		return nil
+	default:
+		color.HiBlack("  用法: /queue [list|add|edit|run|retry|delete|clear]")
+		return nil
+	}
+}
+
+func printTurnQueue(ctx cliContext, sessionID string) error {
+	items, err := ctx.ListTurnQueueItems(context.Background(), sessionID)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		color.HiBlack("  当前会话没有排队消息")
+		return nil
+	}
+	fmt.Println()
+	color.Cyan("  排队消息 (%d)", len(items))
+	for _, item := range items {
+		status := turnQueueStatusLabel(item.Status)
+		fmt.Printf("    #%-5d [%-6s] %s\n", item.ID, status, compactTurnQueueMessage(item.Message))
+		if item.AttachmentCount > 0 {
+			color.HiBlack("             %d 个附件", item.AttachmentCount)
+		}
+		if item.Error != "" {
+			color.Red("             %s", item.Error)
+		}
+	}
+	fmt.Println()
+	return nil
+}
+
+func runTurnQueue(ctx cliContext, sessionID string) error {
+	for {
+		items, err := ctx.ListTurnQueueItems(context.Background(), sessionID)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			color.Green("  ✓ 队列已发送完毕")
+			return nil
+		}
+		head := items[0]
+		if head.Status == "failed" {
+			color.HiBlack("  队列暂停在失败项 #%d；先使用 /queue retry %d 或 /queue delete %d", head.ID, head.ID, head.ID)
+			return nil
+		}
+		if head.Status == "running" {
+			color.HiBlack("  队列项 #%d 正在由其他客户端发送", head.ID)
+			return nil
+		}
+
+		claimed, err := ctx.ClaimNextTurnQueueItem(context.Background(), sessionID)
+		if err != nil {
+			return err
+		}
+		if claimed.Payload == nil {
+			_, _, failErr := failQueueRun(ctx, sessionID, claimed.ID, "queued payload is missing")
+			return failErr
+		}
+		payload := claimed.Payload
+		req := queuedTurnChatRequest(*payload, ctx, sessionID)
+		ui := NewChatUI(req.Provider, req.Model)
+		streamCtx := context.Background()
+		ui.SetQuestionHandler(sessionID, func(sid string, answers map[string]string) error {
+			return ctx.SubmitQuestionAnswer(streamCtx, sid, answers)
+		})
+		ui.SetConfirmHandler(sessionID, func(sid string, approved bool, action string) error {
+			return ctx.SubmitToolConfirm(streamCtx, sid, approved, action)
+		})
+		ui.PrintBannerHeader(payload.Message)
+
+		stream, err := ctx.ChatQueuedTurn(streamCtx, sessionID, *payload)
+		if err != nil {
+			_, _, _ = failQueueRun(ctx, sessionID, claimed.ID, err.Error())
+			return err
+		}
+		completed := false
+		failure := ""
+		for chunk := range stream {
+			ui.Handle(chunk)
+			if chunk.Error != "" {
+				failure = chunk.Error
+			}
+			if chunk.Done && chunk.Error == "" {
+				completed = true
+			}
+		}
+		ui.Finish()
+		if failure != "" || !completed {
+			if failure == "" {
+				failure = "queued turn did not complete"
+			}
+			_, _, err = failQueueRun(ctx, sessionID, claimed.ID, failure)
+			return err
+		}
+		if _, err := ctx.CompleteTurnQueueItem(context.Background(), sessionID, claimed.ID); err != nil {
+			return err
+		}
+	}
+}
+
+func failQueueRun(ctx cliContext, sessionID string, queueID int64, message string) (httpcli.TurnQueueItem, bool, error) {
+	item, err := ctx.FailTurnQueueItem(context.Background(), sessionID, queueID, message)
+	if err == nil {
+		color.Red("  ✗ 队列 #%d 发送失败：%s", queueID, message)
+	}
+	return item, err == nil, err
+}
+
+func queuedTurnChatRequest(payload httpcli.TurnQueuePayload, ctx cliContext, sessionID string) agent.ChatRequest {
+	provider := strings.TrimSpace(payload.Provider)
+	if provider == "" {
+		provider = ctx.GetCurrentProvider()
+	}
+	model := strings.TrimSpace(payload.Model)
+	if model == "" {
+		model = ctx.GetCurrentModel()
+	}
+	styleName := strings.TrimSpace(payload.Style)
+	if styleName == "" {
+		styleName = ctx.StyleName()
+	}
+	modeName := strings.TrimSpace(payload.WorkMode)
+	if modeName == "" {
+		modeName = ctx.ModeName()
+	}
+	attachments := make([]agent.Attachment, 0, len(payload.Attachments))
+	for _, attachment := range payload.Attachments {
+		data := attachment.Data
+		if data == "" {
+			data = attachment.Text
+		}
+		attachments = append(attachments, agent.Attachment{
+			ID: attachment.ID, UploadID: attachment.UploadID, Name: attachment.Name,
+			Size: attachment.Size, Kind: attachment.Kind, MIME: attachment.MIME,
+			Data: data, URL: attachment.URL,
+		})
+	}
+	useImageRecognition := payload.UseImageRecognition != nil && *payload.UseImageRecognition
+	subAgentEnabled := payload.SubAgentModelEnabled != nil && *payload.SubAgentModelEnabled
+	return agent.ChatRequest{
+		SessionID:           sessionID,
+		Style:               style.Style(styleName),
+		WorkMode:            config.WorkMode(modeName).Normalize(),
+		Provider:            provider,
+		Model:               model,
+		Messages:            []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: payload.Message}},
+		Attachments:         attachments,
+		UseImageRecognition: useImageRecognition,
+		SubagentModel: agent.SubagentModelPreference{
+			Enabled: subAgentEnabled, Provider: payload.SubAgentProvider, Model: payload.SubAgentModel,
+		},
+		ClientMsgID:  payload.ClientMsgID,
+		SkillContext: payload.SkillContext,
+		TodoMode:     agent.NormalizeTodoMode(payload.TodoMode),
+	}
+}
+
+func parseQueueID(value string) (int64, error) {
+	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("invalid queue id")
+	}
+	return id, nil
+}
+
+func compactTurnQueueMessage(message string) string {
+	message = strings.Join(strings.Fields(message), " ")
+	runes := []rune(message)
+	if len(runes) <= 80 {
+		return message
+	}
+	return string(runes[:77]) + "..."
+}
+
+func turnQueueStatusLabel(status string) string {
+	switch status {
+	case "queued":
+		return "等待"
+	case "running":
+		return "发送中"
+	case "failed":
+		return "失败"
+	default:
+		return status
+	}
 }
 
 func cmdRegen(ctx cliContext, args string) error {

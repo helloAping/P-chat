@@ -1,9 +1,11 @@
 package memory
 
 import (
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMigration_TurnQueue_Schema(t *testing.T) {
@@ -152,6 +154,80 @@ func TestTurnQueue_CRUDLifecycle(t *testing.T) {
 	}
 	if len(items) != 0 {
 		t.Fatalf("cancelled/done items should be hidden, got %+v", items)
+	}
+}
+
+func TestTurnQueue_EditQueuedMessageUpdatesStoredPayload(t *testing.T) {
+	s, err := OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer s.Close()
+
+	sessionID, err := s.NewConversation()
+	if err != nil {
+		t.Fatalf("NewConversation: %v", err)
+	}
+	item, err := s.CreateTurnQueueItem(
+		sessionID,
+		[]byte(`{"message":"before","client_msg_id":6001,"provider":"test-provider"}`),
+		"before",
+		6001,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("CreateTurnQueueItem: %v", err)
+	}
+
+	edited, found, err := s.EditTurnQueueItem(sessionID, item.ID, "after")
+	if err != nil {
+		t.Fatalf("EditTurnQueueItem: %v", err)
+	}
+	if !found || edited.Message != "after" {
+		t.Fatalf("unexpected edited item: found=%v item=%+v", found, edited)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(edited.PayloadJSON), &payload); err != nil {
+		t.Fatalf("decode edited payload: %v", err)
+	}
+	if payload["message"] != "after" || payload["provider"] != "test-provider" {
+		t.Fatalf("edited payload lost fields: %#v", payload)
+	}
+}
+
+func TestTurnQueue_RequeuesStaleRunningItemAfterClientRestart(t *testing.T) {
+	s, err := OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer s.Close()
+
+	sessionID, err := s.NewConversation()
+	if err != nil {
+		t.Fatalf("NewConversation: %v", err)
+	}
+	created, err := s.CreateTurnQueueItem(sessionID, []byte(`{"message":"queued","client_msg_id":7001}`), "queued", 7001, 0)
+	if err != nil {
+		t.Fatalf("CreateTurnQueueItem: %v", err)
+	}
+	if _, found, err := s.ClaimNextTurnQueueItem(sessionID); err != nil || !found {
+		t.Fatalf("ClaimNextTurnQueueItem: found=%v err=%v", found, err)
+	}
+	staleStartedAt := time.Now().Add(-turnQueueRunningRecoveryAge - time.Second).Unix()
+	if _, err := s.db.Exec(`UPDATE turn_queue SET started_at = ? WHERE id = ?`, staleStartedAt, created.ID); err != nil {
+		t.Fatalf("age running item: %v", err)
+	}
+
+	if err := s.RequeueRunningTurnQueueItems(sessionID); err != nil {
+		t.Fatalf("RequeueRunningTurnQueueItems: %v", err)
+	}
+	items, err := s.ListTurnQueueItems(sessionID)
+	if err != nil {
+		t.Fatalf("ListTurnQueueItems: %v", err)
+	}
+	if len(items) != 1 || items[0].Status != TurnQueueStatusQueued {
+		t.Fatalf("stale running item was not recovered: %+v", items)
 	}
 }
 

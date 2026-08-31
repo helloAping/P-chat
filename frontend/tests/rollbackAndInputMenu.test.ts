@@ -10,6 +10,14 @@ function readInputAreaSource(): string {
   return readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
 }
 
+function readClientSource(): string {
+  return readFileSync(new URL('../src/api/client.ts', import.meta.url), 'utf8')
+}
+
+function readConversationTurnSource(): string {
+  return readFileSync(new URL('../src/composables/conversationTurn.ts', import.meta.url), 'utf8')
+}
+
 function readMessageBubbleSource(): string {
   return readFileSync(new URL('../src/components/MessageBubble.vue', import.meta.url), 'utf8')
 }
@@ -80,6 +88,28 @@ test('turn queue view only shows waiting or failed items', () => {
   assert.match(match[1], /item\.status === 'queued'/)
   assert.match(match[1], /item\.status === 'failed'/)
   assert.doesNotMatch(match[1], /item\.status === 'running'/)
+})
+
+test('queued messages can be edited before they are claimed', () => {
+  const client = readClientSource()
+  const store = readStoreSource()
+  const input = readInputAreaSource()
+  const conversationTurn = readConversationTurnSource()
+
+  assert.match(client, /export const editTurnQueueItem = \(sessionId: string, queueId: number, message: string\)/)
+  assert.match(client, /method: 'PATCH', body: JSON\.stringify\(\{ message \}\)/)
+  assert.match(store, /export async function editQueuedTurn\(sessionId: string, queueId: number, message: string\)/)
+  assert.match(store, /turnQueueEditing: \{\} as Record<string, boolean>/)
+  assert.match(store, /export function setTurnQueueEditing\(sessionId: string, editing: boolean\)/)
+  assert.match(input, /function startEditingQueuedTurn\(item: api\.TurnQueueItem\)/)
+  assert.match(input, /if \(item\.status !== 'queued'\) return/)
+  assert.doesNotMatch(input, /item\.status !== 'queued' \|\| queueDraining\.value/)
+  assert.match(input, /setTurnQueueEditing\(item\.session_id, true\)/)
+  assert.match(input, /await editQueuedTurn\(sessionID, editingQueueId\.value, messageText\)/)
+  assert.match(input, /aria-label="编辑排队消息"/)
+  assert.match(input, /aria-label="保存排队消息"/)
+  assert.match(conversationTurn, /if \(state\.turnQueueEditing\[sessionId\]\) return/)
+  assert.match(conversationTurn, /while \(hasQueuedTurns\(sessionId\)[\s\S]*?if \(state\.turnQueueEditing\[sessionId\]\) break[\s\S]*?claimNextQueuedTurnForDrain/)
 })
 
 test('session working state includes background work for queue gating', () => {

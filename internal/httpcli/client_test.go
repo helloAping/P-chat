@@ -135,6 +135,40 @@ func TestClient_CreateListDeleteCycle(t *testing.T) {
 	}
 }
 
+func TestClient_TurnQueueEditCycle(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+
+	sess, err := c.CreateSession(ctx, CreateSessionOpts{Title: "queue"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	item, err := c.EnqueueTurnQueueItem(ctx, sess.ID, TurnQueuePayload{
+		Message:     "before",
+		ClientMsgID: 1730000000001601,
+		Style:       "tech",
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	edited, err := c.EditTurnQueueItem(ctx, sess.ID, item.ID, "after")
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if edited.Message != "after" || edited.Status != "queued" {
+		t.Fatalf("unexpected edited item: %+v", edited)
+	}
+	items, err := c.ListTurnQueueItems(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(items) != 1 || items[0].Message != "after" {
+		t.Fatalf("unexpected queue list: %+v", items)
+	}
+}
+
 func TestClient_ListMessages_Empty(t *testing.T) {
 	srv := newTestServer(t)
 	defer srv.Close()
