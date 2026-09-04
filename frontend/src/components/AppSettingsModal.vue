@@ -2801,27 +2801,29 @@ function kbModelSupportsVision(scanModel: string) {
                     'is-done': !!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error,
                   }"
                 >
-                  <div class="scan-info">
-                    <span class="scan-phase">{{ scanPhase(kbSelected.name) }}</span>
-                    <span
-                      v-if="(kbScanStatus.get(kbSelected.name)?.total ?? 0) > 0 && !kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error"
-                      class="scan-count"
+                  <div class="scan-progress-top">
+                    <div class="scan-info">
+                      <span class="scan-phase">{{ scanPhase(kbSelected.name) }}</span>
+                      <span
+                        v-if="(kbScanStatus.get(kbSelected.name)?.total ?? 0) > 0 && !kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error"
+                        class="scan-count"
+                      >
+                        {{ kbScanStatus.get(kbSelected.name)!.current }}/{{ kbScanStatus.get(kbSelected.name)!.total }}
+                      </span>
+                      <span v-if="kbScanStatus.get(kbSelected.name)?.error" class="scan-error">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
+                    </div>
+                    <div
+                      v-if="!kbScanStatus.get(kbSelected.name)?.error"
+                      class="scan-stats"
+                      :aria-label="scanLabel(kbSelected.name)"
                     >
-                      {{ kbScanStatus.get(kbSelected.name)!.current }}/{{ kbScanStatus.get(kbSelected.name)!.total }}
-                    </span>
-                    <span v-if="kbScanStatus.get(kbSelected.name)?.error" class="scan-error">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
-                  </div>
-                  <div
-                    v-if="!kbScanStatus.get(kbSelected.name)?.error"
-                    class="scan-stats"
-                    :aria-label="scanLabel(kbSelected.name)"
-                  >
-                    <span class="scan-stat">更新 {{ kbScanStatus.get(kbSelected.name)?.changed ?? 0 }}</span>
-                    <span class="scan-stat">跳过 {{ kbScanStatus.get(kbSelected.name)?.skipped ?? 0 }}</span>
-                    <span class="scan-stat">删除 {{ kbScanStatus.get(kbSelected.name)?.deleted ?? 0 }}</span>
-                    <span class="scan-stat" :class="{ 'is-fail': (kbScanStatus.get(kbSelected.name)?.failed ?? 0) > 0 }">
-                      失败 {{ kbScanStatus.get(kbSelected.name)?.failed ?? 0 }}
-                    </span>
+                      <span class="scan-stat">更新 {{ kbScanStatus.get(kbSelected.name)?.changed ?? 0 }}</span>
+                      <span class="scan-stat">跳过 {{ kbScanStatus.get(kbSelected.name)?.skipped ?? 0 }}</span>
+                      <span class="scan-stat">删除 {{ kbScanStatus.get(kbSelected.name)?.deleted ?? 0 }}</span>
+                      <span class="scan-stat" :class="{ 'is-fail': (kbScanStatus.get(kbSelected.name)?.failed ?? 0) > 0 }">
+                        失败 {{ kbScanStatus.get(kbSelected.name)?.failed ?? 0 }}
+                      </span>
+                    </div>
                   </div>
                   <div
                     v-if="!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error"
@@ -3836,8 +3838,12 @@ function kbModelSupportsVision(scanModel: string) {
   gap: 4px;
 }
 .kb-detail {
+  /* Clip to pane; scrolling lives on .kb-detail-body so
+   * header / progress / settings / explorer can stack without
+   * being permanently clipped when scan progress appears. */
   overflow: hidden;
-  padding-bottom: 0;
+  padding-bottom: var(--space-3);
+  min-height: 0;
 }
 .provider-detail-empty {
   margin: auto;
@@ -4379,10 +4385,21 @@ code {
   flex: 1;
   min-height: 0;
   gap: var(--space-3);
-  padding-bottom: var(--space-3);
+  /* Primary scrollport for the knowledge detail pane.
+   * When scan progress + expanded settings exceed the pane,
+   * this scrolls instead of clipping children. */
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .kb-header {
   flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface-1);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
 }
 .kb-header-main {
   display: flex;
@@ -4392,14 +4409,14 @@ code {
 }
 .kb-header-top {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
   flex-wrap: wrap;
 }
 .kb-header .settings-form-actions {
   margin-top: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 .kb-header-left {
   display: flex;
@@ -4418,6 +4435,7 @@ code {
 .kb-enable-toggle {
   padding-right: var(--space-3);
   border-right: 1px solid var(--border-subtle);
+  flex-shrink: 0;
 }
 .kb-enable-toggle .settings-form-label {
   font-size: 12.5px;
@@ -4450,7 +4468,7 @@ code {
 }
 
 .scan-progress {
-  padding: var(--space-3);
+  padding: var(--space-2) var(--space-3);
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
@@ -4467,11 +4485,19 @@ code {
   border-color: var(--border-subtle);
   background: var(--error-50);
 }
+.scan-progress-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
 .scan-info {
   display: flex;
   gap: var(--space-2);
   align-items: baseline;
   flex-wrap: wrap;
+  min-width: 0;
 }
 .scan-phase {
   font-size: 12.5px;
@@ -4493,6 +4519,7 @@ code {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-1);
+  justify-content: flex-end;
 }
 .scan-stat {
   font-size: 11px;
@@ -4500,8 +4527,9 @@ code {
   background: var(--surface-1);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  padding: 2px var(--space-2);
+  padding: 1px var(--space-2);
   font-variant-numeric: tabular-nums;
+  line-height: 1.4;
 }
 .scan-stat.is-fail {
   color: var(--error-500);
@@ -4514,7 +4542,7 @@ code {
   gap: var(--space-2);
 }
 .scan-bar {
-  height: 6px;
+  height: 5px;
   border-radius: var(--radius-pill);
   background: var(--surface-3);
   overflow: hidden;
@@ -4561,8 +4589,11 @@ code {
 .kb-explorer {
   display: flex;
   flex-direction: column;
-  flex: 1;
-  min-height: 0;
+  /* Grow to fill leftover space; keep a floor so the tree
+   * stays usable. When upper blocks (scan + settings) eat
+   * the pane, parent .kb-detail-body scrolls instead. */
+  flex: 1 1 auto;
+  min-height: 180px;
   gap: var(--space-2);
 }
 .kb-explorer-head {
@@ -4586,7 +4617,7 @@ code {
 .kb-tree-panel {
   display: flex;
   flex: 1;
-  min-height: 200px;
+  min-height: 0;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   overflow: hidden;

@@ -1,6 +1,8 @@
 # 知识库体系完善任务文档
 
-> TAPD 风格任务分解，每阶段独立可验证
+> TAPD 风格任务分解，每阶段独立可验证。
+>
+> 状态说明：这是早期向量库方案的历史任务稿，不是当前知识库实现真源。当前实现已转向 SQLite Wiki/FTS5 + 混合检索 + 多库合并重排；维护和用户说明以 [knowledge.md](knowledge.md) 与 [../../docs/knowledge.md](../../docs/knowledge.md) 为准。
 
 ---
 
@@ -158,7 +160,7 @@
 
 ## S7: 前端（1.5d）
 
-**目录**：`cmd/pchat-gui/frontend/src/`
+**目录**：`frontend/src/`（Wails 通过 `cmd/pchat-gui/wails.json` 指向该目录）
 
 ### 任务
 - [ ] `AppSettingsModal.vue`：

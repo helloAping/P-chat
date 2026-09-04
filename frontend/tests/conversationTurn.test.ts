@@ -19,8 +19,9 @@ test('conversation turn owns stream dispatch, completion, and recovery', () => {
   assert.match(source, /endStream\(input\.sessionId, ctrl\)/)
   assert.match(source, /recoverMissingParts\(input\.sessionId, drop\.lastSeq, drop\.reason\)/)
   assert.match(source, /if \(drop && !ctrl\.signal\.aborted\)/)
-  assert.match(source, /streamCompleted = sawDone && !ctrl\.signal\.aborted/)
-  assert.match(source, /return \{ completed: streamCompleted, aborted: ctrl\.signal\.aborted \}/)
+  assert.match(source, /streamCompleted = \(sawDone \|\| duplicateAccepted\) && !ctrl\.signal\.aborted/)
+  assert.match(source, /duplicate_client_message/)
+  assert.match(source, /return \{[\s\S]*completed: streamCompleted[\s\S]*aborted: ctrl\.signal\.aborted[\s\S]*duplicateAccepted/)
 })
 
 test('input delegates chat streaming to the conversation turn seam', () => {
@@ -43,7 +44,7 @@ test('conversation turn drains queued turns after a completed stream', () => {
   assert.match(source, /await claimNextQueuedTurnForDrain\(sessionId\)/)
   assert.match(source, /appendLocalUserMessage\(sessionId/)
   assert.match(source, /const result = await submitConversationTurn/)
-  assert.match(source, /if \(!result\.completed\) \{[\s\S]*?result\.aborted[\s\S]*?queued turn was stopped by the user[\s\S]*?queued turn did not finish/)
+  assert.match(source, /if \(!result\.completed && !result\.duplicateAccepted\) \{[\s\S]*?result\.aborted[\s\S]*?queued turn was stopped by the user[\s\S]*?queued turn did not finish/)
   assert.match(source, /await completeQueuedTurn\(sessionId, item\.id\)/)
   assert.match(source, /await failQueuedTurn\(sessionId, item\.id/)
   assert.match(source, /function isQueueClaimTemporarilyBlocked\(error: unknown\)/)

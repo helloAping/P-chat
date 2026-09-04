@@ -9,7 +9,7 @@ import {
   type SubAgentJob,
   type SubAgentJobEvent,
 } from '../api/client'
-import { setSessionBackgroundSubAgentJobs } from '../stores/chat'
+import { setSessionBackgroundSubAgentJobs, currentPendingQuestion, state, setComposerExpandedDock } from '../stores/chat'
 
 const props = defineProps<{
   sessionId?: string
@@ -27,6 +27,14 @@ const cancelling = ref<Record<string, boolean>>({})
 const collapsed = ref(readCollapsedState())
 const dismissed = ref(false)
 const eventConnected = ref(false)
+const hasPendingQuestion = computed(() => !!currentPendingQuestion.value)
+// Visual expand is driven by the shared composer dock slot so Todo /
+// Queue / SubAgent stay mutually exclusive. Question forces collapse.
+const panelExpanded = computed(() =>
+  !collapsed.value &&
+  !hasPendingQuestion.value &&
+  state.composerExpandedDock === 'subagent',
+)
 let pollTimer: number | null = null
 let retryTimer: number | null = null
 let clearTimer: number | null = null
@@ -175,6 +183,7 @@ function handleJobEvent(ev: SubAgentJobEvent) {
   if (isTerminalJob(ev.job) && (wasActive || !previous)) {
     if (activeJobs.value.length === 0) {
       collapsed.value = true
+      if (state.composerExpandedDock === 'subagent') setComposerExpandedDock(null)
     }
     notifyTerminal(ev.job)
     scheduleClearIfIdle()
@@ -223,11 +232,24 @@ async function cancelJob(job: SubAgentJob) {
 }
 
 function toggleCollapsed() {
-  collapsed.value = !collapsed.value
+  if (hasPendingQuestion.value) {
+    collapsed.value = true
+    if (state.composerExpandedDock === 'subagent') setComposerExpandedDock(null)
+    return
+  }
+  if (panelExpanded.value) {
+    collapsed.value = true
+    setComposerExpandedDock(null)
+    return
+  }
+  collapsed.value = false
+  setComposerExpandedDock('subagent')
 }
 
 function hidePanel() {
   dismissed.value = true
+  collapsed.value = true
+  if (state.composerExpandedDock === 'subagent') setComposerExpandedDock(null)
 }
 
 function clearPoll() {
@@ -310,6 +332,22 @@ watch(
   },
 )
 
+watch(hasPendingQuestion, (pending) => {
+  if (!pending) return
+  collapsed.value = true
+  if (state.composerExpandedDock === 'subagent') setComposerExpandedDock(null)
+})
+
+// If the user prefers the panel expanded (localStorage) and no other
+// dock owns the slot, claim it when the panel appears.
+watch(panelVisible, (vis) => {
+  if (!vis) return
+  if (collapsed.value || hasPendingQuestion.value) return
+  if (state.composerExpandedDock === null) {
+    setComposerExpandedDock('subagent')
+  }
+})
+
 watch(collapsed, (value) => {
   if (typeof window !== 'undefined') {
     window.localStorage.setItem('pchat.subagentJobs.collapsed', value ? '1' : '0')
@@ -330,22 +368,22 @@ onBeforeUnmount(() => {
     <section
       v-if="panelVisible"
       class="subagent-jobs"
-      :class="{ 'subagent-jobs--collapsed': collapsed }"
+      :class="{ 'subagent-jobs--collapsed': !panelExpanded }"
       aria-label="后台子代理任务"
     >
       <div class="jobs-header">
         <button
           class="jobs-title jobs-title-button"
           type="button"
-          :aria-expanded="!collapsed"
-          :title="collapsed ? '展开后台子代理任务' : '收缩后台子代理任务'"
+          :aria-expanded="panelExpanded"
+          :title="panelExpanded ? '收缩后台子代理任务' : '展开后台子代理任务'"
           @click="toggleCollapsed"
         >
           <Bot :size="15" />
           <span>后台子代理</span>
           <span v-if="activeJobs.length" class="active-count">{{ activeJobs.length }}</span>
-          <span v-if="collapsed" class="jobs-summary">{{ summaryText }}</span>
-          <ChevronDown v-if="collapsed" :size="14" class="jobs-caret" />
+          <span v-if="!panelExpanded" class="jobs-summary">{{ summaryText }}</span>
+          <ChevronDown v-if="!panelExpanded" :size="14" class="jobs-caret" />
           <ChevronUp v-else :size="14" class="jobs-caret" />
         </button>
         <div class="jobs-actions">
@@ -370,11 +408,11 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </div>
-      <div v-if="error && !collapsed" class="jobs-error">
+      <div v-if="error && panelExpanded" class="jobs-error">
         <AlertCircle :size="14" />
         <span>{{ error }}</span>
       </div>
-      <div v-else-if="!collapsed" class="jobs-list">
+      <div v-else-if="panelExpanded" class="jobs-list">
         <div
           v-for="job in visibleJobs"
           :key="job.id"

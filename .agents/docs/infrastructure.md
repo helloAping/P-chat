@@ -7,17 +7,18 @@
 **位置**：`internal/style/`  
 **文件**：`manager.go`
 
-管理 LLM 人格风格。每个风格由三部分组成，存储为独立文件：
+管理 LLM 人格风格。当前风格数据存储在 SQLite `styles` 表中：
 
-| 组件 | 文件路径 | 注入方式 |
+| 字段 | 含义 | 注入方式 |
 |---|---|---|
-| Identity | `prompts/identity/{id}.md` | staticPrompt 缓存 |
-| Soul | `prompts/soul/{id}.md` | staticPrompt 缓存 |
-| **Memory** | `prompts/memory/{id}.md` | **每轮动态追加** |
+| `id` / `label` | 风格 ID 与显示名 | GUI/CLI 展示 |
+| `prompt` | 完整人格系统提示词 | staticPrompt 缓存 |
+| `memory` | 用户维护的风格记忆 | 每轮动态追加 |
+| `is_builtin` | 内置风格标记 | 内置风格只读 |
 
-**风格即记忆**：不同人设 = 不同 Identity + Soul + Memory。Memory 修改即时生效，不破坏 LLM prefix-cache。
+内置风格 `cute` / `guofeng` / `tech` 由 `internal/upgrade/prompts/*.md` embed 进二进制，并在升级步骤 V2→V3 seed 到 SQLite。旧版 `prompts/identity`、`prompts/soul`、`prompts/style` 只作为迁移导入来源，不再是当前运行时真源。
 
-`styleMgr.GetMemory(s)` → 读取 → agent.go 动态注入 systemPrompt 末尾（`## 我的上下文`）。
+`styleMgr.GetSystemPrompt(s)` 读取 prompt 进入静态系统提示词；`styleMgr.GetMemory(s)` 读取 memory，在 `agent.go` 中动态注入 systemPrompt 末尾。`style=off` 不注入 prompt，也不注入 memory。
 
 ## 沙箱 (Sandbox)
 
@@ -47,17 +48,6 @@
 - `Delete(name)` — 卸载
 - Skill 内容被注入到系统提示词
 - 合并策略：全局 + 项目都加载，项目同名覆盖全局
-
-## Style 风格管理
-
-**位置**：`internal/style/`  
-**文件**：`manager.go`
-
-管理 LLM 人格风格：
-- "tech" — 技术专家风格（默认）
-- 用户可定义自定义风格
-- 风格定义加载自 `~/.p-chat/styles/`
-- 风格通过 `Style` 字段嵌入系统提示词
 
 ## MCP 服务器集成
 
@@ -117,19 +107,22 @@ API：
 ## Knowledge 知识检索
 
 **位置**：`internal/knowledge/`  
-**文件**：`index.go`, `embed_openai.go`, `embed_local.go`, `embedding.go`, `bits.go`
+**文件**：`index.go`, `indexer.go`, `wiki_store.go`, `hybrid.go`, `merge.go`, `query_plan.go`, `bits.go`
 
 RAG (检索增强生成) 实现：
-- 文本嵌入（OpenAI embedding 或本地模型）
-- 向量索引和相似度搜索
-- 知识分块存储
+- Wiki/FTS5 三层索引
+- 路径、标题、正文、关键词混合检索
+- 多知识库合并重排与引用解释
+- 增量扫描和删除文件清理
+
+知识库细节以 [knowledge.md](knowledge.md) 为准，本文件只保留基础设施入口。
 
 ## Recall 记忆召回
 
 **位置**：`internal/recall/`  
-**文件**：`recall.go`
+**文件**：`engine.go`
 
-从历史对话中召回相关信息，增强 LLM 上下文。
+把知识库搜索结果转换为 Agent 可用上下文，负责查询分解、多库召回、去重和重排。
 
 ## Paths 路径解析
 

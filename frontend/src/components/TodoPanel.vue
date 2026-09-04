@@ -8,12 +8,13 @@ import {
   currentPendingQuestion,
   state,
   clearSessionTodos,
+  setComposerExpandedDock,
+  toggleComposerExpandedDock,
 } from '../stores/chat'
 import type { TodoItem } from '../api/client'
 
 type DockState = 'hide' | 'clear' | 'open' | 'close'
 
-const expanded = ref(false)
 const dockVisible = ref(false)
 const closing = ref(false)
 let closeTimer: ReturnType<typeof setTimeout> | null = null
@@ -28,6 +29,7 @@ const doneCount = computed(() => doneTodos.value.length)
 const progressLabel = computed(() => `${doneCount.value} / ${total.value}`)
 const isLive = computed(() => currentSessionWorking.value)
 const hasPendingQuestion = computed(() => !!currentPendingQuestion.value)
+const expanded = computed(() => state.composerExpandedDock === 'todo' && !hasPendingQuestion.value)
 
 const allDone = computed(() => {
   const list = visibleTodos.value
@@ -61,7 +63,7 @@ watch(
   [() => state.currentID, () => total.value, () => isLive.value, () => allDone.value, () => hasPendingQuestion.value],
   () => {
     if (hasPendingQuestion.value) {
-      expanded.value = false
+      if (state.composerExpandedDock === 'todo') setComposerExpandedDock(null)
     }
     const id = state.currentID
     if (!id) {
@@ -74,6 +76,7 @@ watch(
       clearCloseTimer()
       dockVisible.value = false
       closing.value = false
+      if (state.composerExpandedDock === 'todo') setComposerExpandedDock(null)
       return
     }
     if (next === 'clear') {
@@ -81,6 +84,7 @@ watch(
       clearSessionTodos(id)
       dockVisible.value = false
       closing.value = false
+      if (state.composerExpandedDock === 'todo') setComposerExpandedDock(null)
       return
     }
     if (next === 'open') {
@@ -91,6 +95,7 @@ watch(
     }
     dockVisible.value = true
     closing.value = true
+    if (state.composerExpandedDock === 'todo') setComposerExpandedDock(null)
     scheduleClose()
   },
   { immediate: true },
@@ -115,10 +120,10 @@ function statusLabel(status: string): string {
 
 function toggleExpand() {
   if (hasPendingQuestion.value) {
-    expanded.value = false
+    if (state.composerExpandedDock === 'todo') setComposerExpandedDock(null)
     return
   }
-  expanded.value = !expanded.value
+  toggleComposerExpandedDock('todo')
 }
 </script>
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 )
@@ -219,11 +220,17 @@ func (s *Store) ClaimNextTurnQueueItem(sessionID string) (TurnQueueItem, bool, e
 	}
 
 	now := time.Now().Unix()
+	newMsgID := mintTurnQueueClientMsgID()
+	payloadJSON, err := remintTurnQueuePayloadClientMsgID(item.PayloadJSON, newMsgID)
+	if err != nil {
+		return TurnQueueItem{}, false, fmt.Errorf("remint queue payload client_msg_id: %w", err)
+	}
 	if _, err := tx.Exec(
 		`UPDATE turn_queue
-		    SET status = ?, started_at = COALESCE(started_at, ?), updated_at = ?, error = ''
+		    SET status = ?, started_at = COALESCE(started_at, ?), updated_at = ?, error = '',
+		        client_msg_id = ?, payload_json = ?
 		  WHERE id = ? AND status = ?`,
-		TurnQueueStatusRunning, now, now, item.ID, TurnQueueStatusQueued,
+		TurnQueueStatusRunning, now, now, newMsgID, payloadJSON, item.ID, TurnQueueStatusQueued,
 	); err != nil {
 		return TurnQueueItem{}, false, err
 	}
@@ -272,8 +279,10 @@ func (s *Store) finishTurnQueueItem(sessionID string, id int64, status, message,
 	return item, true, err
 }
 
-// RequeueFailedTurnQueueItem 将失败项放回队列，供用户重试。
-// RequeueFailedTurnQueueItem moves a failed item back to queued.
+// RequeueFailedTurnQueueItem 将失败项放回队列，并重新签发 client_msg_id。
+// RequeueFailedTurnQueueItem moves a failed item back to queued and remints
+// client_msg_id so retry does not hit duplicate_client_message (the previous
+// attempt may already have persisted that id before the stream dropped).
 func (s *Store) RequeueFailedTurnQueueItem(sessionID string, id int64) (TurnQueueItem, bool, error) {
 	if sessionID == "" || id <= 0 {
 		return TurnQueueItem{}, false, nil
@@ -281,11 +290,31 @@ func (s *Store) RequeueFailedTurnQueueItem(sessionID string, id int64) (TurnQueu
 	now := time.Now().Unix()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	item, err := s.getTurnQueueItemByIDLocked(id)
+	if err == sql.ErrNoRows {
+		return TurnQueueItem{}, false, nil
+	}
+	if err != nil {
+		return TurnQueueItem{}, false, err
+	}
+	if item.SessionID != sessionID || item.Status != TurnQueueStatusFailed {
+		return TurnQueueItem{}, false, nil
+	}
+
+	newMsgID := mintTurnQueueClientMsgID()
+	payloadJSON, err := remintTurnQueuePayloadClientMsgID(item.PayloadJSON, newMsgID)
+	if err != nil {
+		return TurnQueueItem{}, false, fmt.Errorf("remint queue payload client_msg_id: %w", err)
+	}
+
 	res, err := s.db.Exec(
 		`UPDATE turn_queue
-		    SET status = ?, error = '', started_at = NULL, finished_at = NULL, updated_at = ?
+		    SET status = ?, error = '', started_at = NULL, finished_at = NULL,
+		        client_msg_id = ?, payload_json = ?, updated_at = ?
 		  WHERE id = ? AND session_id = ? AND status = ?`,
-		TurnQueueStatusQueued, now, id, sessionID, TurnQueueStatusFailed,
+		TurnQueueStatusQueued, newMsgID, payloadJSON, now,
+		id, sessionID, TurnQueueStatusFailed,
 	)
 	if err != nil {
 		return TurnQueueItem{}, false, err
@@ -293,11 +322,34 @@ func (s *Store) RequeueFailedTurnQueueItem(sessionID string, id int64) (TurnQueu
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
 		return TurnQueueItem{}, false, nil
 	}
-	item, err := s.getTurnQueueItemByIDLocked(id)
+	item, err = s.getTurnQueueItemByIDLocked(id)
 	if err == sql.ErrNoRows {
 		return TurnQueueItem{}, false, nil
 	}
 	return item, true, err
+}
+
+// mintTurnQueueClientMsgID mirrors the frontend scheme: Date.now()*1000 + 0..999.
+// mintTurnQueueClientMsgID mirrors the GUI id scheme used by InputArea.send().
+func mintTurnQueueClientMsgID() int64 {
+	return time.Now().UnixMilli()*1000 + int64(rand.Intn(1000))
+}
+
+func remintTurnQueuePayloadClientMsgID(payloadJSON string, clientMsgID int64) (string, error) {
+	if payloadJSON == "" {
+		raw, err := json.Marshal(map[string]any{"client_msg_id": clientMsgID})
+		return string(raw), err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		return "", err
+	}
+	payload["client_msg_id"] = clientMsgID
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 func rewriteTurnQueuePayloadMessage(payloadJSON, message string) (string, error) {

@@ -603,6 +603,31 @@ watch(themeName, (n) => {
 
 ---
 
+## 9.5 Composer Dock Stack（输入区上方面板栈）
+
+聊天主列底部（[`ChatWindow.vue`](../../frontend/src/components/ChatWindow.vue)）在消息列表与输入框之间叠一组 dock。**顺序固定，不要随意插入或换位**：
+
+| 自上而下 | 组件 | 角色 | 高度预算 |
+|---|---|---|---|
+| 1 | `QuestionModal` | LLM 提问（需立即回答） | `max-height: min(42vh, 420px)` |
+| 2 | `TodoPanel` | 会话待办进度 | 折叠 36px；展开 `min(50vh, 320px)` |
+| 3 | `SubAgentJobsPanel` | 后台子代理状态 | 默认折叠；展开列最多 5 条 |
+| 4 | `InputArea` 内 `.turn-queue` | 用户排队待发 | 默认一行摘要；展开约 3 行（`calc(var(--space-8) * 2.5)`） |
+| 5 | `InputArea` 输入框 + 底栏 | 输入 | 自身内容高度，`flex-shrink: 0` |
+
+全屏模态（`ToolConfirmModal` / 设置 / `ImageLightbox`）**不进此栈**，走独立 mask。
+
+### 互斥与让路规则
+
+- Todo / SubAgent / TurnQueue **同时只允许一个展开**，由 `state.composerExpandedDock`（`'todo' | 'subagent' | 'queue' | null`）协调：`setComposerExpandedDock` / `toggleComposerExpandedDock`。
+- **Question 打开时**：Todo 禁展开、SubAgent 强制折叠、TurnQueue 收成摘要条；若队列里有 **失败项**，TurnQueue 仍可展开以便重试/删除。
+- 切会话时清空 `composerExpandedDock`。
+- 跳转 FAB（`jump-to-bottom` / `anchor-fab`）按「折叠 Todo + 排队摘要 + 输入」估算 `bottom`，不随展开动态测高。
+
+新增底部面板前：先确认属于交互阻断 / 进度 / 后台状态 / 贴输入哪一类，再决定插入位置与是否参与互斥。
+
+---
+
 ## 10. 强制约束（改动前先读）
 
 ### 10.1 必须遵守
@@ -666,6 +691,7 @@ watch(themeName, (n) => {
 | opt-pick / ctrl-btn | `frontend/src/components/InputArea.vue` |
 | settings-section / settings-form | `frontend/src/components/AppSettingsModal.vue:2533-2602` |
 | chat 布局 | `frontend/src/components/ChatWindow.vue:142-170` |
+| Composer Dock Stack | `frontend/src/components/ChatWindow.vue`（Question → Todo → SubAgent → Queue → Input）；互斥见 `stores/chat.ts` `composerExpandedDock` |
 | 输入区高度管理 | `frontend/src/components/InputArea.vue:1402-1415` |
 | MessageBubble parts | `frontend/src/components/MessageBubble.vue` |
 | Markdown 渲染样式 | `frontend/src/style.css:246-304` |

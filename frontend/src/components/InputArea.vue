@@ -14,7 +14,7 @@ import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
   Undo2, FileText, File, Sparkles, ChevronDown,
   Lock, Unlock, Key, Copy, Scissors, ClipboardPaste, TextCursorInput,
-  Settings, HelpCircle, Trash2, RotateCcw, CornerDownLeft,
+  Settings, HelpCircle, Trash2, RotateCcw, CornerDownLeft, ChevronRight,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -25,6 +25,7 @@ import {
   currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
+  currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
 } from '../stores/chat'
 import type { PendingAttachment } from '../stores/chat'
 import { Pencil, Check, X } from './icons'
@@ -1487,6 +1488,20 @@ const queuedTurns = computed(() => currentTurnQueue.value)
 const hasFailedQueuedTurn = computed(() => queuedTurns.value.some(item => item.status === 'failed'))
 const queueSignature = computed(() => queuedTurns.value.map(item => `${item.id}:${item.status}`).join('|'))
 const queueDraining = computed(() => !!state.turnQueueDraining[state.currentID])
+const hasPendingQuestion = computed(() => !!currentPendingQuestion.value)
+// Failed items stay expandable even during a question so the user can
+// retry/delete; otherwise question forces the queue into a one-line strip.
+const queueExpanded = computed(() => {
+  if (queuedTurns.value.length === 0) return false
+  if (hasPendingQuestion.value && !hasFailedQueuedTurn.value) return false
+  return state.composerExpandedDock === 'queue'
+})
+const queuePreview = computed(() => {
+  const first = queuedTurns.value[0]
+  if (!first) return ''
+  const text = (first.message || '').trim() || (first.attachment_count > 0 ? `${first.attachment_count} 个附件` : '（空消息）')
+  return text
+})
 const currentConversationBusy = computed(() =>
   isStreaming.value ||
   currentSessionWorking.value ||
@@ -1509,6 +1524,14 @@ function queuedTurnTitle(item: api.TurnQueueItem): string {
   return parts.join('\n')
 }
 
+function toggleQueueExpand() {
+  if (hasPendingQuestion.value && !hasFailedQueuedTurn.value) {
+    if (state.composerExpandedDock === 'queue') setComposerExpandedDock(null)
+    return
+  }
+  toggleComposerExpandedDock('queue')
+}
+
 async function onDeleteQueuedTurn(queueId: number) {
   if (!state.currentID) return
   try {
@@ -1523,6 +1546,7 @@ async function onClearQueuedTurns() {
   if (!state.currentID) return
   try {
     await clearQueuedTurns(state.currentID)
+    if (state.composerExpandedDock === 'queue') setComposerExpandedDock(null)
   } catch (e: any) {
     message.error(`清空队列失败：${e?.message || e}`)
   }
@@ -1597,6 +1621,23 @@ watch([() => state.currentID, queueSignature, currentConversationBusy, () => !!c
   maybeDrainTurnQueue()
 })
 
+// Auto-expand when a queued turn fails so the user can retry/delete.
+watch(hasFailedQueuedTurn, (failed) => {
+  if (failed) setComposerExpandedDock('queue')
+})
+
+// Collapse the queue strip when the list empties or a question takes over
+// (unless a failed item still needs attention).
+watch([() => queuedTurns.value.length, hasPendingQuestion, hasFailedQueuedTurn], () => {
+  if (queuedTurns.value.length === 0 && state.composerExpandedDock === 'queue') {
+    setComposerExpandedDock(null)
+    return
+  }
+  if (hasPendingQuestion.value && !hasFailedQueuedTurn.value && state.composerExpandedDock === 'queue') {
+    setComposerExpandedDock(null)
+  }
+})
+
 // Load the model/style lists once on mount so the two dropdowns
 // are populated even before the user opens any session.
 onMounted(() => {
@@ -1612,7 +1653,7 @@ watch([() => state.currentID, queueSignature], () => {
 </script>
 
 <template>
-  <div class="input-area">
+  <div class="input-area" :class="{ 'input-area--has-queue': queuedTurns.length > 0 && !currentRollbackBanner }">
     <NDropdown
       trigger="manual"
       placement="bottom-start"
@@ -1632,25 +1673,46 @@ watch([() => state.currentID, queueSignature], () => {
     </div>
 
     <Transition name="fade-up">
-      <div v-if="queuedTurns.length > 0" class="turn-queue" :class="{ 'turn-queue--blocked': hasFailedQueuedTurn }">
-        <div class="turn-queue-head">
-          <div class="turn-queue-title">
-            <CornerDownLeft :size="13" />
-            <span>{{ queueDraining ? '正在出队' : '排队中' }}</span>
-            <span class="turn-queue-count">{{ queuedTurns.length }}</span>
-          </div>
+      <div
+        v-if="queuedTurns.length > 0"
+        class="turn-queue"
+        :class="{
+          'turn-queue--blocked': hasFailedQueuedTurn,
+          'turn-queue--expanded': queueExpanded,
+          'turn-queue--question-pending': hasPendingQuestion && !hasFailedQueuedTurn,
+        }"
+      >
+        <div
+          class="turn-queue-summary"
+          role="button"
+          tabindex="0"
+          :aria-expanded="queueExpanded"
+          :title="queueExpanded ? '点击收起' : '点击展开'"
+          @click="toggleQueueExpand"
+          @keydown.enter.prevent="toggleQueueExpand"
+          @keydown.space.prevent="toggleQueueExpand"
+        >
+          <ChevronRight
+            :size="12"
+            class="turn-queue-caret"
+            :class="{ 'turn-queue-caret--open': queueExpanded }"
+          />
+          <CornerDownLeft :size="13" class="turn-queue-icon-static" />
+          <span class="turn-queue-label">{{ queueDraining ? '正在出队' : '排队中' }}</span>
+          <span class="turn-queue-count">{{ queuedTurns.length }}</span>
+          <span class="turn-queue-preview">{{ queuePreview }}</span>
           <button
             type="button"
             class="turn-queue-icon"
             :disabled="queueDraining"
             title="清空队列"
             aria-label="清空队列"
-            @click="onClearQueuedTurns"
+            @click.stop="onClearQueuedTurns"
           >
             <Trash2 :size="13" />
           </button>
         </div>
-        <div class="turn-queue-list">
+        <div v-if="queueExpanded" class="turn-queue-list">
           <div
             v-for="(item, index) in queuedTurns"
             :key="item.id"
@@ -2412,31 +2474,50 @@ watch([() => state.currentID, queueSignature], () => {
 }
 
 .turn-queue {
-  margin-bottom: var(--space-2);
+  margin: 0 calc(var(--space-3) * -1) var(--space-2);
   background: var(--surface-1);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  border-bottom: 1px solid var(--border-subtle);
   overflow: hidden;
 }
 .turn-queue--blocked {
-  border-color: var(--warn-500);
+  border-bottom-color: var(--warn-500);
 }
-.turn-queue-head {
+.turn-queue--question-pending .turn-queue-summary {
+  cursor: default;
+}
+.turn-queue--question-pending .turn-queue-caret {
+  opacity: 0.45;
+}
+.turn-queue-summary {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
+  min-height: calc(var(--space-8) - var(--space-2));
+  padding: 0 var(--space-3);
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--dur-fast) var(--ease-out);
 }
-.turn-queue-title {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
+.turn-queue-summary:hover {
+  background: var(--surface-3);
+}
+.turn-queue-caret {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.turn-queue-caret--open {
+  transform: rotate(90deg);
+}
+.turn-queue-icon-static {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+.turn-queue-label {
   color: var(--text-secondary);
   font-size: 12px;
   font-weight: 500;
-  min-width: 0;
+  flex-shrink: 0;
 }
 .turn-queue-count {
   min-width: 18px;
@@ -2450,30 +2531,41 @@ watch([() => state.currentID, queueSignature], () => {
   justify-content: center;
   font-family: var(--font-mono);
   font-size: 11px;
+  flex-shrink: 0;
+}
+.turn-queue-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+  font-size: 12px;
 }
 .turn-queue-list {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  max-height: min(24vh, calc(var(--space-8) * 4));
+  max-height: calc(var(--space-8) * 2.5);
   overflow-y: auto;
   background: var(--border-subtle);
+  border-top: 1px solid var(--border-subtle);
 }
 .turn-queue-item {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
   align-items: center;
   gap: var(--space-2);
-  min-height: calc(var(--space-4) * 2);
-  padding: var(--space-2) var(--space-3);
+  min-height: calc(var(--space-8));
+  padding: 0 var(--space-3);
   background: var(--surface-1);
 }
 .turn-queue-item--failed {
   background: var(--warn-50);
 }
 .turn-queue-index {
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   border-radius: var(--radius-pill);
   background: var(--surface-2);
   color: var(--text-tertiary);
@@ -2518,6 +2610,7 @@ watch([() => state.currentID, queueSignature], () => {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  flex-shrink: 0;
   transition: var(--transition-colors);
 }
 .turn-queue-icon:hover:not(:disabled) {
@@ -2634,6 +2727,9 @@ watch([() => state.currentID, queueSignature], () => {
   background: var(--bg-2);
   padding: 8px 12px;
   flex-shrink: 0;
+}
+.input-area--has-queue {
+  padding-top: 0;
 }
 .input-bottom {
   display: flex;

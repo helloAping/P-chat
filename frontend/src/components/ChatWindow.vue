@@ -724,17 +724,15 @@ function messageKey(m: any, i: number): string | number {
 .empty-hint { font-size: 12px; color: var(--text-4); }
 
 /* Floating "jump to latest" button. Anchored to .chat-main's
- * right edge, hovering above the input area. The 130px bottom
- * clears the collapsed TodoPanel (36px) + the typical input
- * area (~82px) + a small visual margin. When the rollback
- * banner is showing or advanced inputs are expanded the input
- * area grows and the button visually sits a bit closer to the
- * top edge of the input — acceptable trade-off vs. measuring
- * the input height from JS. */
+ * right edge, hovering above the input area. The 168px bottom
+ * clears collapsed Todo (~36px) + queue summary strip (~32px) +
+ * typical input (~82px) + a small visual margin. When docks
+ * expand the button sits closer to the input top — acceptable
+ * trade-off vs. measuring the composer height from JS. */
 .jump-to-bottom {
   position: absolute;
   right: 16px;
-  bottom: 130px;
+  bottom: 168px;
   width: 36px;
   height: 36px;
   border-radius: var(--radius-pill);
@@ -775,7 +773,7 @@ function messageKey(m: any, i: number): string | number {
 }
 
 /* P1-4: 锚定 FAB. Sits stacked above the jump-to-bottom
- * button (bottom: 178px) so the two never overlap. Same
+ * button (bottom: 216px) so the two never overlap. Same
  * size + shape + surface as the jump-to-bottom button
  * (visually consistent floating-button row) but uses
  * ArrowUp — pointing up to "the user message that
@@ -788,7 +786,7 @@ function messageKey(m: any, i: number): string | number {
 .anchor-fab {
   position: absolute;
   right: 16px;
-  bottom: 178px;
+  bottom: 216px;
   width: 36px;
   height: 36px;
   border-radius: var(--radius-pill);

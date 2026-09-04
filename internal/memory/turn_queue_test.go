@@ -3,7 +3,9 @@ package memory
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -104,6 +106,9 @@ func TestTurnQueue_CRUDLifecycle(t *testing.T) {
 	if claimed.ID != first.ID || claimed.Status != TurnQueueStatusRunning {
 		t.Fatalf("unexpected claimed item: %+v", claimed)
 	}
+	if claimed.ClientMsgID == 0 || claimed.ClientMsgID == first.ClientMsgID {
+		t.Fatalf("claim should remint client_msg_id: original=%d claimed=%d", first.ClientMsgID, claimed.ClientMsgID)
+	}
 	if claimed.StartedAt.IsZero() {
 		t.Fatalf("claimed item missing StartedAt: %+v", claimed)
 	}
@@ -138,6 +143,12 @@ func TestTurnQueue_CRUDLifecycle(t *testing.T) {
 	}
 	if !found || requeued.Status != TurnQueueStatusQueued || requeued.Error != "" || !requeued.StartedAt.IsZero() {
 		t.Fatalf("unexpected requeued item: found=%v item=%+v", found, requeued)
+	}
+	if requeued.ClientMsgID == failed.ClientMsgID || requeued.ClientMsgID == 0 {
+		t.Fatalf("retry should remint client_msg_id: failed=%d requeued=%d", failed.ClientMsgID, requeued.ClientMsgID)
+	}
+	if !strings.Contains(requeued.PayloadJSON, fmt.Sprintf(`"client_msg_id":%d`, requeued.ClientMsgID)) {
+		t.Fatalf("payload should carry reminted client_msg_id: %s", requeued.PayloadJSON)
 	}
 
 	canceled, found, err := s.CancelTurnQueueItem(sessionID, requeued.ID)

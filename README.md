@@ -17,7 +17,7 @@
 
 ## 当前进度快照
 
-> 快照日期：2026-07-31。仓库 `VERSION` 当前为 `1.0.8-dev`；`CHANGELOG.md` 已记录到 v1.0.9 的开发项，正式分发版本以 `VERSION` 和 release tag 为准。
+> 快照日期：2026-08-31。仓库 `VERSION` 当前为 `1.0.13`；正式分发版本以 `VERSION` 和 release tag 为准。
 
 P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手形成了比较完整的桌面工作台：
 
@@ -32,12 +32,13 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 | 工具体系 | 已落地 | 内置文件/命令/搜索/文档/问题/todo 工具；动态 YAML 工具支持全局与项目级加载 |
 | 浏览器控制 | 已落地 | Chrome/Edge 扩展连接、真实页面导航/点击/输入/截图、多 tab 目标、域名权限策略 |
 | 可观测性 | 已落地 | 端到端 trace id、上下文检查器、工具列表抽屉、动态工具加载诊断 |
-| IM 桥接 | 骨架进行中 | `internal/im` 后端抽象、飞书部分入站/出站、Gateway/adapter 基础已在代码中；GUI 设置和完整入站 agent 流程仍需推进 |
+| IM 桥接 | 实验中 / 部分可用 | Gateway/adapter 抽象、飞书 webhook、微信 QR/长轮询、出站切分、GUI 设置入口和事件流已有；跨平台 adapter、鉴权与运行体验仍需继续收口 |
 | MCP 集成 | 基础可用 / 待增强 | 已有 MCP 管理模块和设置入口，工具协议、权限和诊断体验仍在 backlog |
 | 沙箱增强 | 基础已落地 / 待增强 | 命令/写文件确认与浏览器域名策略已接入；Docker 隔离、策略可视化仍未完成 |
+| 导出与自动更新 | 已落地一部分 | 会话导出 HTML/PDF/text、更新检查/下载、updater、安装器和 release manifest 脚本已有 |
 | 发布体验 | 已落地一部分 | Windows 安装器、Linux/macOS 打包脚本、浏览器扩展打包、版本注入已有；跨平台 GUI 构建仍受 Wails/宿主环境限制 |
 
-更细的“已落地能力 + 后续可做事项”维护在 [`docs/feature-opportunities.md`](docs/feature-opportunities.md)。历史设计方案保留在 [`docs/plans/`](docs/plans/)。
+项目目录、模块职责和运行流总览见 [`docs/project-structure.md`](docs/project-structure.md)。更细的“已落地能力 + 后续可做事项”维护在 [`docs/feature-opportunities.md`](docs/feature-opportunities.md)。历史设计方案保留在 [`docs/plans/`](docs/plans/)。
 
 ### 下一步优先级
 
@@ -101,7 +102,7 @@ pchat-server.exe
 ### 方式 D — 从源码构建
 
 ```powershell
-# 依赖：Go 1.21.13 / Node 24.11 / Wails v2.12
+# 依赖：Go 1.25.0 / Node 24.11 / Wails v2.12
 task build:all      # Windows / Linux / macOS setup 包 + 增量更新 zip
 task build:gui      # 额外：pchat-gui.exe
 task package:gui    # Windows setup 包 + 增量更新 zip
@@ -261,7 +262,7 @@ setup.exe
 | **归档** | 列出已归档会话、恢复或永久删除 |
 | **技能** | 搜索 / 安装 / 卸载 SKILL.md 包，全局 + 项目双层级 |
 | **MCP** | 启停 Model Context Protocol 服务器 |
-| **知识库** | 启用 RAG、配置 embedder、添加向量库、扫描知识库目录 |
+| **知识库** | 启用 RAG、添加知识库目录、扫描 Wiki/FTS5 索引；媒体扫描可选配置模型 |
 | **网络搜索** | 切换 web_search 提供商（Tavily / OpenAI 兼容）、配置 API key、每日配额、测试连接 |
 | **浏览器** | 启用 Chrome 扩展控制、查看已连接浏览器、选择控制目标 tab、域名策略 |
 
@@ -281,12 +282,11 @@ setup.exe
 ![知识库](docs/assets/gui-knowledge-base.png)
 
 - 打开「启用知识库」开关
-- 选 embedder（选个支持 embedding 的 provider + 模型，本地可以用 `bge-m3` 之类）
-- 添加向量库（`local` 内置、Qdrant / Chroma / Pinecone 等远程库）
 - 添加知识库目录（指向你要检索的代码 / 文档根），点「扫描」后台索引
-- 回到输入区点击「会话设置」→「知识库」绑定到当前会话
+- 如需扫描图片、音频、视频或 PDF，给该知识库配置 `scan_model` 和媒体类型；纯文本/代码不需要 embedding 或额外模型
+- 回到输入区点击「会话设置」→「知识库」，选择“不使用 / 全部 / 指定知识库”
 
-LLM 在需要时调用 `recall` 工具按需检索。详见 [docs/knowledge.md](docs/knowledge.md)。
+LLM 在需要时调用 `recall` 或 `wiki_lookup` 工具按需检索。详见 [docs/knowledge.md](docs/knowledge.md)。
 
 #### 网络搜索
 
@@ -431,7 +431,7 @@ go test ./internal/browser -run E2E -count=1
   "style": { "default": "tech" },
   "memory": { "max_history": -1 },
   "sandbox": { "exec_dangerous_patterns": "...", "write_protected_paths": "..." },
-  "knowledge": { "enabled": false, "embedder": {...}, "vector_stores": [...], "bases": [...] }
+  "knowledge": { "enabled": false, "auto_index": false, "bases": [...] }
 }
 ```
 
@@ -516,6 +516,13 @@ llm:
 | GET/PATCH/DELETE | `/sessions/:id` | 获取/更新/归档 |
 | GET | `/sessions/:id/messages` | 历史 |
 | POST | `/sessions/:id/messages` | **发送消息 (SSE)** |
+| GET | `/sessions/:id/snapshot` | SSE 断线恢复快照 |
+| GET | `/sessions/:id/context` | 上下文检查器 |
+| GET | `/sessions/:id/export` | 会话导出 |
+| POST | `/sessions/:id/regenerate` | 从指定用户消息重新生成 |
+| GET/POST/DELETE | `/sessions/:id/turn-queue` | 忙碌会话的排队消息（列表/入队/清空） |
+| GET/POST | `/sessions/:id/subagent-jobs/*` | 异步子代理 job 状态、事件和取消 |
+| POST | `/sessions/:id/cancel-stream` | 停止当前生成 |
 | POST | `/sessions/:id/compress` | 压缩历史 |
 | PATCH | `/sessions/:id/reasoning-effort` | 调推理深度 |
 | DELETE | `/sessions/:id/messages` | 清空 |
@@ -526,15 +533,17 @@ llm:
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/PATCH | `/knowledge/config` | 配置读写 |
-| GET/POST | `/knowledge/stores` | 向量库 |
-| DELETE | `/knowledge/stores/:name` | 删向量库 |
-| POST | `/knowledge/stores/:name/test` | 测试连接 |
+| GET | `/knowledge/models` | 可用于媒体扫描的模型 |
 | GET/POST | `/knowledge/bases` | 知识库 |
 | DELETE | `/knowledge/bases/:name` | 删知识库 |
 | POST | `/knowledge/bases/:name/scan` | 扫描索引 |
+| DELETE | `/knowledge/bases/:name/scan` | 取消扫描 |
 | GET | `/knowledge/bases/:name/scan/status` | 扫描进度 |
-| POST | `/knowledge/search` | 语义搜索 |
-| GET | `/knowledge/embedders` | 可用 embedder |
+| DELETE | `/knowledge/bases/:name/clear` | 清空索引 |
+| GET | `/knowledge/bases/:name/nodes` | 三层索引节点 |
+| GET | `/knowledge/bases/:name/nodes/:id/content` | 节点内容 |
+| DELETE | `/knowledge/bases/:name/nodes/:id` | 删除节点 |
+| POST | `/knowledge/search` | 混合搜索 |
 
 ### 其他
 
@@ -544,9 +553,14 @@ llm:
 | GET/POST/PATCH/DELETE | `/providers` | Provider CRUD |
 | GET/POST/DELETE | `/projects` | 项目目录 |
 | GET/POST/DELETE | `/skills` | 技能 |
+| GET/POST | `/tools` / `/tools/:name/trial` | 工具列表、动态工具诊断、工具试运行 |
 | GET | `/commands` | 斜杠命令列表 |
 | POST | `/uploads` | 上传 |
 | POST | `/mcp/servers` | MCP 服务器 |
+| GET/POST/PATCH | `/browser/*` | 浏览器连接、标签页、扩展下载、域名策略 |
+| GET/PATCH/POST | `/im/*` | IM 健康状态、配置、测试、微信 QR、飞书 webhook、事件流 |
+| GET | `/diagnostics/*` | 内存、配置、heap/goroutine 快照 |
+| GET/POST | `/updates/*` | 版本检查与更新下载 |
 
 ### SSE 发送消息
 
@@ -636,6 +650,7 @@ cd frontend && npx vue-tsc -b
 | `CHANGELOG.md` | 版本交付、升级说明、重要 bug 修复和测试覆盖 |
 | `.agents/docs/*.md` | 模块实现细节、关键文件、测试方式、agent 修改入口 |
 | `.agents/docs/INDEX.md` | 新模块、新功能入口或“想改 X 读什么”路径变化 |
+| `docs/project-structure.md` | 目录结构、模块职责、关键运行流、功能状态口径变化 |
 
 `docs/plans/*.md` 只保留历史设计背景；当前状态以 `README.md` 的快照和 `docs/feature-opportunities.md` 为准。
 

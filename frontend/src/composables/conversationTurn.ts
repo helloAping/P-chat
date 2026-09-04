@@ -40,6 +40,8 @@ export type ConversationTurnInput = {
 export type ConversationTurnResult = {
   completed: boolean
   aborted: boolean
+  /** True when the server already accepted this client_msg_id (HTTP 409 duplicate). */
+  duplicateAccepted?: boolean
 }
 
 const drainingSessions = new Set<string>()
@@ -114,6 +116,7 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
 
   const deferredDrop: { current: { lastSeq: number; reason: string } | null } = { current: null }
   let streamCompleted = false
+  let duplicateAccepted = false
   try {
     await api.streamMessagesRetry(input.sessionId, {
       message: input.message,
@@ -132,11 +135,21 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       skill_context: input.skillContext,
       onStreamDrop: (drop) => {
         deferredDrop.current = drop
+        // Idempotent accept: the user row was already persisted; the SSE
+        // just never delivered `done`. Treat as success so queue drain
+        // completes instead of fail→retry→409 looping.
+        if (drop.reason === 'duplicate_client_message') {
+          duplicateAccepted = true
+        }
       },
       onEvent: enqueueEvent,
     })
-    streamCompleted = sawDone && !ctrl.signal.aborted
-    return { completed: streamCompleted, aborted: ctrl.signal.aborted }
+    streamCompleted = (sawDone || duplicateAccepted) && !ctrl.signal.aborted
+    return {
+      completed: streamCompleted,
+      aborted: ctrl.signal.aborted,
+      duplicateAccepted,
+    }
   } finally {
     flushPendingDeltas()
     endStream(input.sessionId, ctrl)
@@ -211,7 +224,9 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
           attachments: payload.attachments,
           skillContext: payload.skill_context || undefined,
         })
-        if (!result.completed) {
+        // When duplicate_client_message is accepted, drain must complete the
+  // queue item instead of failing (avoids fail→retry→409 loops).
+  if (!result.completed && !result.duplicateAccepted) {
           await failQueuedTurn(
             sessionId,
             item.id,

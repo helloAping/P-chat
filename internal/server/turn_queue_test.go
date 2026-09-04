@@ -58,8 +58,11 @@ func TestTurnQueue_EnqueueListAndClaim(t *testing.T) {
 	if claimedEnv.Item.Status != "running" || claimedEnv.Item.Payload == nil {
 		t.Fatalf("claim should return a running item with payload: %+v", claimedEnv.Item)
 	}
-	if claimedEnv.Item.Payload.Message != "first queued" || claimedEnv.Item.Payload.ClientMsgID != 1730000000001001 {
-		t.Fatalf("unexpected claimed payload: %+v", claimedEnv.Item.Payload)
+	if claimedEnv.Item.Payload.Message != "first queued" {
+		t.Fatalf("unexpected claimed payload message: %+v", claimedEnv.Item.Payload)
+	}
+	if claimedEnv.Item.Payload.ClientMsgID == 0 || claimedEnv.Item.Payload.ClientMsgID == 1730000000001001 {
+		t.Fatalf("claim should remint client_msg_id, got %d", claimedEnv.Item.Payload.ClientMsgID)
 	}
 }
 
@@ -233,6 +236,9 @@ func TestTurnQueue_CompleteFailRetryAndDelete(t *testing.T) {
 	}
 	if retriedEnv.Item.Status != "queued" || retriedEnv.Item.Error != "" {
 		t.Fatalf("unexpected retry response: %+v", retriedEnv.Item)
+	}
+	if retriedEnv.Item.ClientMsgID == 0 || retriedEnv.Item.ClientMsgID == failedEnv.Item.ClientMsgID {
+		t.Fatalf("retry should remint client_msg_id: failed=%d retried=%d", failedEnv.Item.ClientMsgID, retriedEnv.Item.ClientMsgID)
 	}
 
 	deleted := doTurnQueueRequest(t, s, http.MethodDelete,

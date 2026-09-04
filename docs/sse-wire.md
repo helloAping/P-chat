@@ -161,7 +161,7 @@ and the OK/error icon; `tool_result_full` is preferred over
   "type": "error",
   "error": "upstream returned 401",
   "error_kind": "auth_error",   // see §5
-  "suggestion": "check the API key for provider 'cs' in ~/.p-chat/config.yaml",
+  "suggestion": "check the API key for provider 'cs' in ~/.p-chat/config.json (or legacy config.yaml)",
   "seq": 14
 }
 ```

@@ -121,6 +121,9 @@ if (typeof window !== 'undefined') {
   }
 }
 
+/** Which composer dock is currently expanded (todo | subagent | queue). */
+export type ComposerExpandedDock = 'todo' | 'subagent' | 'queue' | null
+
 export const state = reactive({
   sessions: [] as Session[],
   currentID: '' as string,
@@ -172,6 +175,11 @@ export const state = reactive({
   turnQueueLoading: {} as Record<string, boolean>,
   turnQueueDraining: {} as Record<string, boolean>,
   turnQueueEditing: {} as Record<string, boolean>,
+  // Composer dock mutual-exclusion: only one of todo / subagent /
+  // turn-queue may be expanded above the input at a time.
+  // Question dock is outside this set (always takes priority).
+  // 输入区上方 Todo / 子代理 / 排队 互斥展开；Question 不参与互斥但优先让路。
+  composerExpandedDock: null as ComposerExpandedDock,
   // sessionWorking is the per-session "is the LLM mid-turn"
   // flag, derived from the `session_status` SSE event. The
   // TodoPanel state machine reads this to decide whether
@@ -297,6 +305,16 @@ export const currentTurnQueue = computed(() =>
     item.status === 'queued' || item.status === 'failed',
   ),
 )
+
+/** Expand a dock (or pass null to collapse all). Mutual-exclusive. */
+export function setComposerExpandedDock(dock: ComposerExpandedDock) {
+  state.composerExpandedDock = dock
+}
+
+/** Toggle a dock: same dock collapses, another dock takes the slot. */
+export function toggleComposerExpandedDock(dock: Exclude<ComposerExpandedDock, null>) {
+  state.composerExpandedDock = state.composerExpandedDock === dock ? null : dock
+}
 
 function normalizePermissionLevel(level: string | undefined): SessionPermissionLevel {
   if (level === 'auto' || level === 'full') return level
@@ -752,6 +770,7 @@ export async function switchSession(id: string) {
 
 async function switchSessionBody(id: string) {
   state.currentID = id
+  state.composerExpandedDock = null
   state.lastSessionByProject[state.activeProjectPath] = id
   rememberLastSession(state.activeProjectPath, id)
   rememberLastProject(state.activeProjectPath)
