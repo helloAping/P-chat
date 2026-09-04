@@ -167,6 +167,9 @@ const kbOptions = computed(() => [
   { label: '全部知识库', value: '__all__' },
   ...kbBases.value.filter(b => b.enabled).map(b => ({ label: b.name, value: b.name })),
 ])
+const kbDropdownOptions = computed<DropdownOption[]>(() =>
+  kbOptions.value.map(option => ({ label: option.label, key: option.value })),
+)
 const enabledKBCount = computed(() => kbBases.value.filter(b => b.enabled).length)
 const kbBase = computed({
   get: () => {
@@ -1228,6 +1231,9 @@ const currentStyleLabel = computed(() => {
   const v = currentStyleValue.value
   return styleOptions.value.find(o => o.value === v)?.label || v
 })
+const styleDropdownOptions = computed<DropdownOption[]>(() =>
+  styleOptions.value.map(option => ({ label: option.label, key: option.value })),
+)
 
 async function onWorkModePick(v: string) {
   if (!state.currentID) return
@@ -1443,8 +1449,11 @@ const sessionConfigSummary = computed(() =>
 function pickReasoning(v: string) {
   reasoningEffort.value = v
 }
-function pickKB(v: string) {
-  kbBase.value = v
+function pickStyle(v: string | number) {
+  onStylePick(String(v))
+}
+function pickKB(v: string | number) {
+  kbBase.value = String(v)
 }
 
 // showModelPicker drives the ModelPicker popover. Toggled by
@@ -1895,18 +1904,23 @@ watch([() => state.currentID, queueSignature], () => {
                   </div>
                 </NPopover>
               </div>
-              <div class="session-config-options">
+              <NDropdown
+                trigger="click"
+                placement="bottom-start"
+                :options="styleDropdownOptions"
+                @select="pickStyle"
+              >
                 <button
-                  v-for="opt in styleOptions"
-                  :key="opt.value"
                   type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': currentStyleValue === opt.value }"
-                  @click="onStylePick(opt.value)"
+                  class="opt-pick"
+                  data-testid="session-style-dropdown"
+                  :title="`当前风格：${currentStyleLabel}`"
+                  :aria-label="`选择风格，当前为${currentStyleLabel}`"
                 >
-                  {{ opt.label }}
+                  <span class="opt-pick-label">{{ currentStyleLabel }}</span>
+                  <ChevronDown :size="11" class="opt-pick-caret" />
                 </button>
-              </div>
+              </NDropdown>
             </div>
 
             <div class="session-config-row">
@@ -1925,10 +1939,7 @@ watch([() => state.currentID, queueSignature], () => {
               </div>
             </div>
 
-            <div
-              class="session-config-row"
-              :class="{ 'session-config-row--span2': kbOptions.length > 3 }"
-            >
+            <div class="session-config-row">
               <div class="session-config-label">
                 <span>知识库</span>
                 <NPopover
@@ -1954,18 +1965,24 @@ watch([() => state.currentID, queueSignature], () => {
                   </div>
                 </NPopover>
               </div>
-              <div class="session-config-options">
-                <button
-                  v-for="opt in kbOptions"
-                  :key="opt.value"
-                  type="button"
-                  class="session-config-choice session-config-choice--kb"
-                  :class="{ 'session-config-choice--active': kbBase === opt.value }"
-                  :title="opt.label"
-                  @click="pickKB(opt.value)"
+              <div class="session-config-options session-config-options--stacked">
+                <NDropdown
+                  trigger="click"
+                  placement="bottom-start"
+                  :options="kbDropdownOptions"
+                  @select="pickKB"
                 >
-                  <span class="session-config-choice-label">{{ opt.label }}</span>
-                </button>
+                  <button
+                    type="button"
+                    class="opt-pick"
+                    data-testid="session-knowledge-dropdown"
+                    :title="`当前知识库：${currentKBLabel}`"
+                    :aria-label="`选择知识库，当前为${currentKBLabel}`"
+                  >
+                    <span class="opt-pick-label">{{ currentKBLabel }}</span>
+                    <ChevronDown :size="11" class="opt-pick-caret" />
+                  </button>
+                </NDropdown>
                 <div v-if="enabledKBCount === 0" class="session-config-hint">
                   还没有启用的知识库，可到“应用设置 > 知识库”添加或启用。
                 </div>
@@ -2845,6 +2862,44 @@ watch([() => state.currentID, queueSignature], () => {
   flex-wrap: wrap;
   gap: var(--space-1);
   min-width: 0;
+}
+.session-config-options--stacked {
+  flex-direction: column;
+  align-items: flex-start;
+}
+.opt-pick {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: calc(var(--space-8) * 4);
+  max-width: 100%;
+  min-height: calc(var(--space-6) + var(--space-1));
+  padding: 0 var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+.opt-pick:hover {
+  background: var(--surface-3);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+.opt-pick-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.opt-pick-caret {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
 }
 .session-config-choice {
   min-height: 26px;

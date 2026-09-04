@@ -22,7 +22,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `main.ts` | 应用入口（Naive UI + Router） | `createApp()` |
 | `App.vue` | 根布局（侧边栏 + 聊天区域） | |
 | `components/ChatWindow.vue` | 聊天窗口（消息列表 + 输入区） | |
-| `components/InputArea.vue` | 输入区域（文本、附件、计划模式） | |
+| `components/InputArea.vue` | 输入区域（文本、附件、计划模式、会话设置） | 风格/知识库下拉选择器 + 回合队列 |
 | `components/MessageBubble.vue` | 单条消息渲染（parts[] 迭代） | |
 | `components/TypedText.vue` | 流式文本渲染（blinking caret） | |
 | `components/ThinkingBlock.vue` | 思考块（可折叠） | |
@@ -150,6 +150,13 @@ LLM 提供商页复用 `api.testProvider(provider, model?)`：顶部「测试默
 `model`，每个模型行的「测试」传入对应模型 ID。设置页用单一
 `testingTarget` 控制局部 loading、防止重复请求；成功 toast 展示实际模型、耗时和
 回复摘要，失败 toast 展示后端返回的标准化错误。
+
+### 8.2 会话设置下拉选择
+
+`InputArea.vue` 的会话设置中，风格与知识库复用 `NDropdown + .opt-pick`
+模式，只显示当前值和右侧箭头；展开后再列出全部选项。这样风格或知识库数量
+增加时不会撑高设置面板。知识库没有启用项时，选择器仍保留“不使用/全部”，并
+在下方显示配置引导。
 
 ### 9. Round 2 增强 (2026-07-15)
 
