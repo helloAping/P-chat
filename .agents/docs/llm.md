@@ -94,6 +94,7 @@ type StreamChunk struct {
 - HTTP 重试（指数退避，最大 3 次）
 - 自定义 HTTP 头（API key、organization 等）
 - 流式连接超时
+- `ChatCM()` 非流式调用也用于 provider/model 的无状态 `sayhi` 连接测试
 
 ### 5. 错误分类
 

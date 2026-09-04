@@ -35,7 +35,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/StreamingBar.vue` | 对话页顶部"对话进行中"加载条（transform 滚动渐变，compositor-only） | 绑定 `isStreaming`/`currentSessionWorking` |
 | `components/ImageLightbox.vue` | 全屏图片查看器 | |
 | `components/LoadingDots.vue` | 子代理加载指示器 | |
-| `components/AppSettingsModal.vue` | Provider/Model/Style/知识库管理 | 左右分栏 + KB 三层树视图 + NCollapse |
+| `components/AppSettingsModal.vue` | Provider/Model/Style/知识库管理 | 左右分栏 + provider/model 测试 + KB 三层树视图 + NCollapse |
 
 ## 核心概念
 
@@ -143,6 +143,13 @@ API: GET /api/v1/knowledge/bases/:name/nodes → NodeTreeItem[]
 ```
 
 原始条目卡片 (`wiki_sections`) 保留在树视图下方作为向后兼容层。
+
+### 8.1 Provider / Model 测试
+
+LLM 提供商页复用 `api.testProvider(provider, model?)`：顶部「测试默认模型」省略
+`model`，每个模型行的「测试」传入对应模型 ID。设置页用单一
+`testingTarget` 控制局部 loading、防止重复请求；成功 toast 展示实际模型、耗时和
+回复摘要，失败 toast 展示后端返回的标准化错误。
 
 ### 9. Round 2 增强 (2026-07-15)
 

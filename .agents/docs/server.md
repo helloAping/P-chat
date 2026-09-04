@@ -18,7 +18,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 | `message_helpers.go` | 历史消息响应整形、parts 解码、内部行过滤、附件合并 | `ListMessages()`, `buildMessageResponse()` |
 | `handler_test.go` | Handler 单元测试 | |
 | `knowledge_api.go` | 知识库 CRUD + 扫描管道 + 三层索引 | `ListSections`, `ListNodes`, `GetNodeContent`, `ClearKnowledgeBase`, `indexScan` |
-| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe | `FetchUpstreamModels`, `ProbeUpstreamModels` |
+| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe / 连接测试 | `FetchUpstreamModels`, `ProbeUpstreamModels`, `TestProvider` |
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
 | `command_api.go` | 斜杠命令执行 | |
@@ -30,6 +30,14 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 ## 核心 API 路由
 
 详见 `server.go:86-167`，所有路由以 `/api/v1` 为前缀。
+
+### Provider / Model 连接测试
+
+`POST /api/v1/providers/:name/test` 接受可选 body `{ "model": "模型 ID" }`：
+
+- 不传 `model` 时解析该 provider 的默认模型；传入时严格校验模型属于该 provider。
+- 向上游发送单条用户消息 `sayhi`，使用 30 秒超时并把输出限制为 64 token；不创建会话、不持久化消息，也不修改当前/默认模型。
+- 成功返回实际 `provider`、`model`、`response` 和 `elapsed_ms`；上游失败返回标准化 `error_kind`。
 
 ## 核心概念
 

@@ -190,6 +190,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/providers/:name/models/:model/default", h.SetDefaultModel)
 		api.PATCH("/providers/:name/models/:model/capabilities", h.SetCapabilities)
 		api.GET("/providers/:name/upstream-models", h.FetchUpstreamModels)
+		api.POST("/providers/:name/test", h.TestProvider)
 
 		// System config
 		api.GET("/config", h.GetSystemConfig)

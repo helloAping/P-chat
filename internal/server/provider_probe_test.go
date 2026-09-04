@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -77,5 +78,116 @@ func TestProbeUpstreamModelsRequiresAPIKey(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestProviderConnectionUsesDefaultModelAndSaysHi(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var gotModel string
+	var gotPrompt string
+	var gotMaxTokens int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Model     string `json:"model"`
+			MaxTokens int    `json:"max_tokens"`
+			Messages  []struct {
+				Role    string `json:"role"`
+				Content any    `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotModel = body.Model
+		gotMaxTokens = body.MaxTokens
+		if len(body.Messages) == 1 {
+			switch content := body.Messages[0].Content.(type) {
+			case string:
+				gotPrompt = content
+			case []any:
+				if len(content) == 1 {
+					if part, ok := content[0].(map[string]any); ok {
+						gotPrompt, _ = part["text"].(string)
+					}
+				}
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{"content": "hi from default"},
+			}},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := fmt.Sprintf(`{
+		"llm": {
+			"default": "test-provider",
+			"providers": [{
+				"name": "test-provider",
+				"protocol": "openai",
+				"base_url": %q,
+				"api_key": "sk-test",
+				"models": [
+					{"name": "model-a"},
+					{"name": "model-default", "default": true, "max_tokens_output": 4096}
+				]
+			}]
+		}
+	}`, upstream.URL+"/v1")
+	srv, _ := newTestServerWithConfig(t, cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/providers/test-provider/test", nil)
+	w := httptest.NewRecorder()
+	srv.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if gotModel != "model-default" {
+		t.Fatalf("upstream model = %q, want model-default", gotModel)
+	}
+	if gotPrompt != "sayhi" {
+		t.Fatalf("upstream prompt = %q, want sayhi", gotPrompt)
+	}
+	if gotMaxTokens != 64 {
+		t.Fatalf("upstream max_tokens = %d, want 64", gotMaxTokens)
+	}
+	var resp struct {
+		OK       bool   `json:"ok"`
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+		Response string `json:"response"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.OK || resp.Provider != "test-provider" || resp.Model != "model-default" || resp.Response != "hi from default" {
+		t.Fatalf("response = %#v", resp)
+	}
+
+	gotModel = ""
+	gotPrompt = ""
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/providers/test-provider/test", strings.NewReader(`{"model":"model-a"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	srv.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("explicit model status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if gotModel != "model-a" || gotPrompt != "sayhi" {
+		t.Fatalf("explicit upstream request model=%q prompt=%q", gotModel, gotPrompt)
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode explicit model response: %v", err)
+	}
+	if !resp.OK || resp.Model != "model-a" {
+		t.Fatalf("explicit model response = %#v", resp)
 	}
 }

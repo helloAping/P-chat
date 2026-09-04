@@ -257,6 +257,7 @@ const showUpstreamModels = ref(false)
 const upstreamModels = ref<api.UpstreamModelItem[]>([])
 const fetchingUpstream = ref(false)
 const upstreamError = ref('')
+const testingTarget = ref<string | null>(null)
 
 // --- Style state ---
 const styles = ref<api.StyleInfo[]>([])
@@ -774,6 +775,33 @@ async function onSetDefaultModel(model: string) {
     await refreshProviders()
   } catch (e: any) {
     message.error(`设置失败: ${e.message}`)
+  }
+}
+
+function providerTestTarget(provider: string, model?: string) {
+  return `${provider}\u0000${model || ''}`
+}
+
+function isTestingProvider(provider: string, model?: string) {
+  return testingTarget.value === providerTestTarget(provider, model)
+}
+
+async function onTestProvider(model?: string) {
+  if (!selected.value || testingTarget.value) return
+  const providerName = selected.value.name
+  testingTarget.value = providerTestTarget(providerName, model)
+  try {
+    const result = await api.testProvider(providerName, model)
+    const reply = result.response.replace(/\s+/g, ' ').trim()
+    const preview = reply.length > 80 ? `${reply.slice(0, 80)}…` : reply
+    message.success(
+      `${result.model} 测试成功 · ${result.elapsed_ms} ms${preview ? ` · ${preview}` : ''}`,
+      { duration: 5000 },
+    )
+  } catch (e: any) {
+    message.error(`测试失败: ${e.message || '未知错误'}`, { duration: 6000 })
+  } finally {
+    testingTarget.value = null
   }
 }
 
@@ -1898,6 +1926,18 @@ function kbModelSupportsVision(scanModel: string) {
                     <NTag v-if="selected.is_default" type="success" size="tiny" :bordered="false">默认</NTag>
                   </div>
                   <div class="settings-form-actions">
+                    <NButton
+                      data-testid="test-provider-default"
+                      size="small"
+                      secondary
+                      :loading="isTestingProvider(selected.name)"
+                      :disabled="testingTarget !== null || dirty.size > 0"
+                      title="使用已保存配置向默认模型发送 sayhi"
+                      @click="onTestProvider()"
+                    >
+                      <template #icon><Activity :size="12" /></template>
+                      测试默认模型
+                    </NButton>
                     <NButton size="small" @click="hydrateEditForm(selected.name)" :disabled="dirty.size === 0">重置</NButton>
                     <NButton size="small" @click="onSaveProvider" type="primary" :disabled="dirty.size === 0">
                       保存{{ dirty.size > 0 ? ` (${dirty.size})` : '' }}
@@ -1999,6 +2039,19 @@ function kbModelSupportsVision(scanModel: string) {
                       </div>
                     </div>
                     <div class="model-card-actions">
+                      <NButton
+                        :data-testid="`test-model-${m.name}`"
+                        size="tiny"
+                        quaternary
+                        :loading="isTestingProvider(selected.name, m.name)"
+                        :disabled="testingTarget !== null"
+                        title="向此模型发送 sayhi"
+                        :aria-label="`测试模型 ${m.name}`"
+                        @click="onTestProvider(m.name)"
+                      >
+                        <template #icon><Activity :size="12" /></template>
+                        测试
+                      </NButton>
                       <NButton size="tiny" quaternary @click="onEditModel(m)" title="编辑" aria-label="编辑">
                         <Pencil :size="12" />
                       </NButton>

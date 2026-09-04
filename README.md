@@ -255,7 +255,7 @@ setup.exe
 
 | Tab | 作用 |
 | --- | --- |
-| **LLM 提供商** | 增删 provider，配置 base_url / API key / 默认模型，标记模型能力（vision / thinking） |
+| **LLM 提供商** | 增删 provider，配置 base_url / API key / 默认模型，测试默认模型或指定模型，标记模型能力（vision / thinking） |
 | **风格** | 切换说话风格、上传自定义人格 prompt、查看风格记忆 |
 | **系统** | 全局工作模式（coding / daily）、自动压缩、工具结果截断、子代理策略 |
 | **归档** | 列出已归档会话、恢复或永久删除 |
@@ -273,6 +273,7 @@ setup.exe
 - **Base URL**：OpenAI 兼容用 `https://api.deepseek.com/v1` 这种带 `/v1` 的形式；Anthropic 用 `https://api.anthropic.com`
 - **API key**：从对应平台申请，粘贴进 `sk-...` 输入框
 - **模型**：在 provider 下加多个模型；`⭐` 标记默认模型
+- **连接测试**：点提供商顶部的「测试默认模型」，或模型行里的「测试」；P-Chat 会向实际选中的模型发送 `sayhi`，并显示模型、耗时和回复摘要
 - **能力标记**：vision（支持图片）/ thinking（支持推理）；标记后输入区会显示对应按钮
 
 #### 知识库

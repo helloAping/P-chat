@@ -1023,6 +1023,24 @@ export const setDefaultProvider = (name: string) =>
     method: 'POST',
   })
 
+export interface ProviderTestResult {
+  ok: boolean
+  provider: string
+  model: string
+  response: string
+  elapsed_ms: number
+}
+
+/** 使用供应商默认模型或指定模型发送 "sayhi"。Send it with the default or an explicit model. */
+export const testProvider = (provider: string, model?: string) =>
+  jsonFetch<ProviderTestResult>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/test`,
+    {
+      method: 'POST',
+      body: JSON.stringify(model ? { model } : {}),
+    },
+  )
+
 // UpdateProviderRequest is the body of the unified
 // PATCH /api/v1/providers/:name. Every field is optional;
 // the server only writes the non-empty ones. Pass set_default

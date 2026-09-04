@@ -1,14 +1,18 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/llm"
 )
 
 // ProviderFull is the rich provider view returned by
@@ -21,15 +25,135 @@ import (
 // it returns a slimmer shape (name/model/protocol only) suitable
 // for the model picker in the chat input.
 type ProviderFull struct {
-	Name     string               `json:"name"`
-	Protocol string               `json:"protocol"`
-	BaseURL  string               `json:"base_url"`
-	APIKey   string               `json:"api_key"`
-	IsDefault bool                `json:"is_default"`
-	Models   []config.ModelConfig `json:"models"`
+	Name      string               `json:"name"`
+	Protocol  string               `json:"protocol"`
+	BaseURL   string               `json:"base_url"`
+	APIKey    string               `json:"api_key"`
+	IsDefault bool                 `json:"is_default"`
+	Models    []config.ModelConfig `json:"models"`
 	// Legacy single-model form (kept for backward compat; equals
 	// the first entry of Models when populated).
 	Model string `json:"model,omitempty"`
+}
+
+const providerTestTimeout = 30 * time.Second
+
+// TestProviderRequest 是 POST /api/v1/providers/:name/test 的可选请求体；
+// Model 为空时使用供应商配置的默认模型。
+// TestProviderRequest is the optional request body; an empty Model selects
+// the provider's configured default model.
+type TestProviderRequest struct {
+	Model string `json:"model,omitempty"`
+}
+
+// TestProvider 向选中的供应商与模型发送一次无状态的 "sayhi" 小请求；
+// 它不会创建会话，也不会修改供应商的默认模型。
+// TestProvider sends a small, stateless "sayhi" request to the selected
+// provider and model without creating a conversation or changing defaults.
+func (h *Handler) TestProvider(c *gin.Context) {
+	cfg := h.getCfg()
+	if cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
+		return
+	}
+
+	var req TestProviderRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+		return
+	}
+
+	providerName := c.Param("name")
+	var provider *config.ProviderConfig
+	for i := range cfg.LLM.Providers {
+		if cfg.LLM.Providers[i].Name == providerName {
+			provider = &cfg.LLM.Providers[i]
+			break
+		}
+	}
+	if provider == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "provider not found: " + providerName})
+		return
+	}
+
+	modelName := strings.TrimSpace(req.Model)
+	if modelName == "" {
+		modelName = provider.EffectiveModel()
+	} else {
+		found := false
+		for _, model := range provider.AllModels() {
+			if model.Name == modelName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model %q not found under provider %q", modelName, providerName)})
+			return
+		}
+	}
+	if modelName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider has no model configured"})
+		return
+	}
+
+	// 构造请求级隔离客户端，避免连接测试修改在线客户端或继承过大的模型输出额度；
+	// provider 副本独占 Models 切片，并发设置请求期间配置快照保持只读。
+	// Build an isolated request-local client so the check cannot mutate the live
+	// client or inherit a large output allowance; the copied Models slice keeps
+	// the atomic config snapshot read-only during concurrent settings requests.
+	testProvider := *provider
+	testProvider.Models = append([]config.ModelConfig(nil), provider.Models...)
+	for i := range testProvider.Models {
+		if testProvider.Models[i].Name == modelName {
+			testProvider.Models[i].MaxTokensOutput = 64
+		}
+	}
+	testLLM := cfg.LLM
+	testLLM.Default = providerName
+	testLLM.Providers = []config.ProviderConfig{testProvider}
+	testLLM.MaxTokens = 64
+	client, err := llm.NewClient(&testLLM)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "create LLM client: " + err.Error()})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), providerTestTimeout)
+	defer cancel()
+	started := time.Now()
+	response, err := client.ChatCM(ctx, providerName, modelName, []llm.ChatMessage{{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "sayhi",
+		SubmitToLLM: 1,
+	}}, llm.ChatOptions{MaxTokens: 64})
+	if err != nil {
+		kind := llm.KindUnknown.String()
+		status := http.StatusBadGateway
+		var apiErr *llm.APIError
+		if errors.As(err, &apiErr) {
+			kind = apiErr.Kind.String()
+			if apiErr.Kind == llm.KindTimeout {
+				status = http.StatusGatewayTimeout
+			}
+		}
+		c.JSON(status, gin.H{
+			"error":      err.Error(),
+			"error_kind": kind,
+			"provider":   providerName,
+			"model":      modelName,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":         true,
+		"provider":   providerName,
+		"model":      modelName,
+		"response":   response,
+		"elapsed_ms": time.Since(started).Milliseconds(),
+	})
 }
 
 // GetProvider GET /api/v1/providers/:name — rich view of a single
