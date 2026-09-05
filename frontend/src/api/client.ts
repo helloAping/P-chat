@@ -99,6 +99,7 @@ export interface Session {
   auto_continue?: boolean
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  enabled_recognition_capabilities?: MediaKind[]
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
@@ -315,6 +316,7 @@ export interface UpdateSessionMetaResponse {
   knowledge_base?: string
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  enabled_recognition_capabilities?: MediaKind[]
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
@@ -399,6 +401,7 @@ export interface CreateSessionOptions {
   auto_continue?: boolean
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  enabled_recognition_capabilities?: MediaKind[]
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
@@ -421,7 +424,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -836,8 +839,11 @@ export interface ModelInfo {
     context_window?: number
     supports_vision?: boolean
     supports_audio?: boolean
+    input_modalities?: MediaKind[]
   }
 }
+
+export type MediaKind = 'image' | 'video' | 'audio'
 
 export interface ProviderInfo {
   name: string
@@ -1105,6 +1111,7 @@ export interface SetCapabilitiesRequest {
   context_window?: number
   supports_vision?: boolean
   supports_audio?: boolean
+  input_modalities?: MediaKind[]
 }
 
 export const setModelCapabilities = (
@@ -1144,8 +1151,7 @@ export const probeUpstreamModels = (body: {
 // --- Streaming send ---
 export interface InlineAttachment {
   // 'image_url' for images, 'audio_url' / 'video_url' for media
-  // the chat bubble can preview, 'text' for file bodies the
-  // model only gets to read as text.
+  // the chat bubble can preview, 'text' for documents and other files.
   type: 'image_url' | 'audio_url' | 'video_url' | 'text'
   // For image_url / audio_url / video_url: the data: URL
   // (e.g. "data:image/png;base64,...") carrying the inline
@@ -1159,7 +1165,10 @@ export interface InlineAttachment {
   // When upload_id is set, `url` is a local preview only and the
   // server reads the bytes from disk.
   upload_id?: string
-  // For text: the file body. For *_url: undefined.
+  // Inline payload used by legacy/non-upload clients. New clients should send
+  // upload_id so the server can validate and read the original attachment.
+  data?: string
+  // Legacy text payload kept for wire compatibility.
   text?: string
   // Original filename, kept around for the chat bubble label and
   // for the backend's debug logs.
@@ -2159,12 +2168,26 @@ export interface VisionRecognitionConfig {
   max_image_bytes: number
 }
 
+export interface RecognitionRouteConfig {
+  enabled: boolean
+  provider: string
+  model: string
+  timeout_seconds: number
+  max_bytes: number
+  available?: boolean
+}
+
+export interface RecognitionConfig {
+  routes: Record<MediaKind, RecognitionRouteConfig>
+}
+
 export interface SystemConfig {
   limits: LimitsConfig
   sub_agent: SubAgentConfig
   work_mode: WorkModeConfig
   ui: UIConfig
   vision_recognition: VisionRecognitionConfig
+  recognition: RecognitionConfig
 }
 
 export const getSystemConfig = () =>

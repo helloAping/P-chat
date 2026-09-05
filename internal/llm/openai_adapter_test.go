@@ -316,6 +316,30 @@ func TestOpenAIBuild_EmptyImageDegradesToText(t *testing.T) {
 	}
 }
 
+func TestOpenAIBuild_AudioAndVideoUseMediaContentParts(t *testing.T) {
+	a := NewOpenAIAdapter("https://api.example.com", "sk-test", "test")
+	req, err := a.Build([]ChatMessage{
+		{Role: RoleUser, Type: TypeAudio, Content: "AUDIO", MimeType: "audio/mpeg", Name: "voice.mp3"},
+		{Role: RoleUser, Type: TypeVideo, Content: "VIDEO", MimeType: "video/mp4", Name: "clip.mp4"},
+	}, "test-model", 0, nil, "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	audioContent := messages[0].(map[string]any)["content"].([]any)
+	videoContent := messages[1].(map[string]any)["content"].([]any)
+	if audioContent[1].(map[string]any)["type"] != "input_audio" {
+		t.Fatalf("audio content = %#v", audioContent)
+	}
+	if videoContent[1].(map[string]any)["type"] != "file" {
+		t.Fatalf("video content = %#v", videoContent)
+	}
+}
+
 // mustBody returns the raw request body bytes for the given input.
 // Used in error messages for debugging — small enough that the
 // extra marshal cost is irrelevant.

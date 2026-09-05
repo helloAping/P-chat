@@ -245,10 +245,11 @@ func (h *Handler) UpdateModel(c *gin.Context) {
 // All fields are optional — pass `{}` to clear. The server
 // validates ThinkingEffort before writing.
 type SetCapabilitiesRequest struct {
-	ThinkingEffort string `json:"thinking_effort,omitempty"`
-	ContextWindow  int    `json:"context_window,omitempty"`
-	SupportsVision bool   `json:"supports_vision,omitempty"`
-	SupportsAudio  bool   `json:"supports_audio,omitempty"`
+	ThinkingEffort  string              `json:"thinking_effort,omitempty"`
+	ContextWindow   int                 `json:"context_window,omitempty"`
+	SupportsVision  bool                `json:"supports_vision,omitempty"`
+	SupportsAudio   bool                `json:"supports_audio,omitempty"`
+	InputModalities *[]config.MediaKind `json:"input_modalities,omitempty"`
 }
 
 // SetCapabilities PATCH /api/v1/providers/:name/models/:model/capabilities
@@ -267,11 +268,28 @@ func (h *Handler) SetCapabilities(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if req.InputModalities != nil {
+		seen := make(map[config.MediaKind]struct{}, len(*req.InputModalities))
+		normalized := make([]config.MediaKind, 0, len(*req.InputModalities))
+		for _, kind := range *req.InputModalities {
+			if !kind.IsValid() {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unsupported input modality %q", kind)})
+				return
+			}
+			if _, exists := seen[kind]; exists {
+				continue
+			}
+			seen[kind] = struct{}{}
+			normalized = append(normalized, kind)
+		}
+		req.InputModalities = &normalized
+	}
 	if err := config.SetModelCapabilities(name, model, config.Capabilities{
-		ThinkingEffort: config.ThinkingEffort(req.ThinkingEffort),
-		ContextWindow:  req.ContextWindow,
-		SupportsVision: req.SupportsVision,
-		SupportsAudio:  req.SupportsAudio,
+		ThinkingEffort:  config.ThinkingEffort(req.ThinkingEffort),
+		ContextWindow:   req.ContextWindow,
+		SupportsVision:  req.SupportsVision,
+		SupportsAudio:   req.SupportsAudio,
+		InputModalities: req.InputModalities,
 	}); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

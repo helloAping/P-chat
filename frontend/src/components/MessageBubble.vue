@@ -27,13 +27,13 @@
 //     shown before the first SSE event arrives, so
 //     the user sees a blinking caret alone in the
 //     bubble as soon as they hit send.
-import { computed, h, nextTick, ref, useTemplateRef, watch } from 'vue'
+import { computed, h, nextTick, ref, useTemplateRef, watch, type Component } from 'vue'
 import { renderMarkdown } from '../utils/markdownCache'
 import { formatMessageTime } from '../utils/format'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
-  ArrowDown, ArrowUp, Pencil, MoreHorizontal, Sparkles,
+  ArrowDown, ArrowUp, MoreHorizontal, Sparkles,
   Check, Loader2, XCircle, CornerDownLeft,
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
@@ -53,7 +53,7 @@ import RoleAvatar from './RoleAvatar.vue'
 const MAX_MD_INLINE_CHARS = 32 * 1024
 
 const renderMd = renderMarkdown
-import { NDropdown, useMessage, useDialog, type DropdownOption } from 'naive-ui'
+import { NDropdown, useMessage, useDialog, type DropdownMenuProps, type DropdownOption } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import * as api from '../api/client'
 import { state, regenerateMessage, fetchReplies, activateReply } from '../stores/chat'
@@ -265,6 +265,9 @@ function showEarlierParts() {
 
 // The role check: system messages get a special icon.
 const isSystem = computed(() => (props.message.msg_type ?? 0) === 0 && props.message.role === 'system')
+const hasImageAttachment = computed(() =>
+  props.message.attachments?.some(attachment => attachment.type === 'image_url' && !!attachment.url) ?? false,
+)
 
 // For user / system messages, the markdown pipeline
 // renders the whole `content` string. For assistant
@@ -825,6 +828,45 @@ const canFork = computed(() =>
 const canRollback = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
+
+function messageActionOption(
+  key: string,
+  label: string,
+  icon: Component,
+  extra: Partial<DropdownOption> = {},
+): DropdownOption {
+  return {
+    key,
+    label: () =>
+      h('span', { class: 'app-action-item' }, [
+        h(icon, { size: 16, class: 'app-action-item__icon' }),
+        h('span', { class: 'app-action-item__label' }, label),
+      ]),
+    ...extra,
+  }
+}
+
+const messageActionMenuOptions = computed<DropdownOption[]>(() => {
+  const options: DropdownOption[] = []
+  if (canFork.value) {
+    options.push(messageActionOption('fork', '创建分支对话', GitBranch))
+  }
+  if (canRollback.value) {
+    options.push(messageActionOption('rollback', '撤回消息及后续回复', Undo2, {
+      props: { class: 'app-action-danger' },
+    }))
+  }
+  return options
+})
+
+const messageActionMenuProps: DropdownMenuProps = () => ({
+  class: 'app-action-menu',
+})
+
+function onMessageActionMenuSelect(key: string | number) {
+  if (key === 'fork') onFork()
+  if (key === 'rollback') onRollback()
+}
 // P1-3: regenerate is only meaningful on the trailing
 // assistant message — regenerating an older reply would
 // leave newer messages in an inconsistent state (the
@@ -1100,7 +1142,7 @@ function findPrecedingUserMessageId(): number {
           <!-- Attachments (user / tool) -->
           <div v-if="message.attachments && message.attachments.length" class="attachments">
             <template v-for="(a, i) in message.attachments" :key="i">
-              <div v-if="a.type === 'image_url' && a.url" class="attach-wrap">
+              <div v-if="a.type === 'image_url' && a.url" class="attach-wrap attach-wrap--image">
                 <img
                   class="msg-image"
                   :src="a.url"
@@ -1108,12 +1150,14 @@ function findPrecedingUserMessageId(): number {
                   loading="lazy"
                   @click="openLightbox(a.url, a.name || 'image', 'image')"
                 />
-                <div class="attach-actions">
-                  <button type="button" class="attach-action-btn" title="复制图片" :aria-label="'复制图片'" @click="copyAttachment(a)">
-                    <Clipboard :size="12" />
+                <div class="attachment-action-bar attachment-action-bar--image">
+                  <button type="button" class="attach-action-btn attach-action-btn--labeled" title="复制图片" aria-label="复制图片" @click="copyAttachment(a)">
+                    <Clipboard :size="14" />
+                    <span class="attach-action-label">复制</span>
                   </button>
-                  <button type="button" class="attach-action-btn" title="下载图片" :aria-label="'下载图片'" @click="downloadAttachment(a)">
-                    <Download :size="12" />
+                  <button type="button" class="attach-action-btn attach-action-btn--labeled" title="下载图片" aria-label="下载图片" @click="downloadAttachment(a)">
+                    <Download :size="14" />
+                    <span class="attach-action-label">下载</span>
                   </button>
                 </div>
               </div>
@@ -1126,7 +1170,7 @@ function findPrecedingUserMessageId(): number {
                   :title="a.name || 'video'"
                   @click.stop
                 />
-                <div class="attach-actions">
+                <div class="attachment-action-bar">
                   <button type="button" class="attach-action-btn" title="下载视频" :aria-label="'下载视频'" @click="downloadAttachment(a)">
                     <Download :size="12" />
                   </button>
@@ -1140,7 +1184,7 @@ function findPrecedingUserMessageId(): number {
                   preload="metadata"
                   :title="a.name || 'audio'"
                 />
-                <div class="attach-actions">
+                <div class="attachment-action-bar">
                   <button type="button" class="attach-action-btn" title="下载音频" :aria-label="'下载音频'" @click="downloadAttachment(a)">
                     <Download :size="12" />
                   </button>
@@ -1154,16 +1198,16 @@ function findPrecedingUserMessageId(): number {
                 <AlertTriangle :size="14" class="warn-icon" />
                 <span class="warn-text">{{ shortWarnText(a.text) }}</span>
               </div>
-              <div v-else-if="a.type === 'text'" class="msg-file-wrap">
+              <div v-else-if="a.type === 'text'" class="msg-file-wrap" :class="{ 'has-copy-action': !!a.text }">
                 <div class="msg-file" :title="a.text">
                   <component :is="thumbText(a.kind)" :size="12" class="msg-file-icon" />
                   {{ a.name || '文件' }}
                 </div>
-                <div class="attach-actions attach-actions-inline">
-                  <button type="button" class="attach-action-btn" title="复制内容" :aria-label="'复制内容'" @click="copyAttachment(a)">
+                <div class="attachment-action-bar">
+                  <button v-if="a.text" type="button" class="attach-action-btn" title="复制内容" :aria-label="'复制内容'" @click="copyAttachment(a)">
                     <Clipboard :size="12" />
                   </button>
-                  <button type="button" class="attach-action-btn" title="下载" :aria-label="'下载'" @click="downloadAttachment(a)">
+                  <button v-if="a.text || a.url" type="button" class="attach-action-btn" title="下载" :aria-label="'下载'" @click="downloadAttachment(a)">
                     <Download :size="12" />
                   </button>
                 </div>
@@ -1362,6 +1406,7 @@ function findPrecedingUserMessageId(): number {
         <div
           v-if="!isSystem && !streaming"
           class="bubble-actions"
+          :class="{ 'bubble-actions--media': hasImageAttachment }"
           :data-role="message.role"
         >
           <button
@@ -1376,27 +1421,6 @@ function findPrecedingUserMessageId(): number {
           >
             <Check v-if="isAction('copy', 'feedback')" :size="13" :key="`copy-ok-${pulseKey}`" class="bubble-action-icon" />
             <Clipboard v-else :size="13" :key="`copy-idle-${pulseKey}`" class="bubble-action-icon" />
-          </button>
-          <button
-            v-if="canFork"
-            type="button"
-            class="bubble-action-btn bubble-action-pulse"
-            :key="`fork-${pulseKey}`"
-            title="从此消息创建分支对话"
-            aria-label="创建分支对话"
-            @click="onFork"
-          >
-            <GitBranch :size="13" class="bubble-action-icon" />
-          </button>
-          <button
-            v-if="canRollback"
-            type="button"
-            class="bubble-action-btn bubble-action-rollback"
-            title="撤回此消息及之后的回复"
-            aria-label="撤回消息"
-            @click="onRollback"
-          >
-            <Undo2 :size="13" class="bubble-action-icon" />
           </button>
           <!-- P1-3 regenerate. Only shown on the trailing
                assistant message (we don't allow re-running
@@ -1427,14 +1451,25 @@ function findPrecedingUserMessageId(): number {
             <Loader2 :size="13" :class="regenerating ? 'bubble-action-icon bubble-action-icon--spin' : 'bubble-action-icon'" />
             <span v-if="!regenerating" class="bubble-action-text">重答</span>
           </button>
-          <button
-            type="button"
-            class="bubble-action-btn"
-            title="更多"
-            aria-label="更多"
+          <NDropdown
+            v-if="messageActionMenuOptions.length"
+            trigger="click"
+            placement="bottom-end"
+            size="small"
+            :options="messageActionMenuOptions"
+            :menu-props="messageActionMenuProps"
+            @select="onMessageActionMenuSelect"
           >
-            <MoreHorizontal :size="13" class="bubble-action-icon" />
-          </button>
+            <button
+              type="button"
+              class="bubble-action-btn"
+              title="更多操作"
+              aria-label="更多操作"
+              @click.stop
+            >
+              <MoreHorizontal :size="13" class="bubble-action-icon" />
+            </button>
+          </NDropdown>
         </div>
       </div>
 
@@ -1651,17 +1686,17 @@ function findPrecedingUserMessageId(): number {
  * bubble. */
 .bubble-actions {
   position: absolute;
-  top: -14px;
+  top: calc(-1 * var(--space-4));
   display: flex;
   align-items: center;
-  gap: 1px;
-  padding: 3px;
+  gap: var(--space-1);
+  padding: var(--space-1);
   background: var(--surface-1);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
   opacity: 0;
-  transform: translateY(2px);
+  transform: translateY(var(--space-1));
   transition: opacity var(--dur-fast) var(--ease-out),
               transform var(--dur-fast) var(--ease-out);
   /* z-index raised from 5 to 50 in 2026-07-09 to keep the
@@ -1672,27 +1707,34 @@ function findPrecedingUserMessageId(): number {
    * current message and does not bleed into adjacent
    * messages. */
   z-index: 50;
-  /* Light blur under the pill so it sits on top of the
-   * message content cleanly when overlapping. */
-  backdrop-filter: blur(4px);
 }
-.msg.assistant .bubble-actions { right: 8px; }
-.msg.user .bubble-actions { left: 8px; }
+.msg.assistant .bubble-actions { right: var(--space-2); }
+.msg.user .bubble-actions { left: var(--space-2); }
+.msg.user .bubble-actions--media {
+  top: var(--space-2);
+  left: calc(-1 * (var(--space-8) + var(--space-2)));
+  flex-direction: column;
+}
+.msg.assistant .bubble-actions--media {
+  top: var(--space-2);
+  right: calc(-1 * (var(--space-8) + var(--space-2)));
+  flex-direction: column;
+}
 .msg:hover .bubble-actions,
 .bubble-actions:focus-within {
   opacity: 1;
   transform: translateY(0);
 }
 .bubble-action-btn {
-  width: 26px;
-  height: 24px;
+  width: var(--space-7);
+  height: var(--space-7);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-tertiary);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 0;
   transition: background var(--dur-fast) var(--ease-out),
@@ -1700,8 +1742,9 @@ function findPrecedingUserMessageId(): number {
               transform var(--dur-fast) var(--ease-out);
 }
 .bubble-action-btn:hover {
-  background: var(--surface-3);
-  color: var(--text-primary);
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-600);
 }
 .bubble-action-btn:active {
   /* Press feedback: subtle scale-down + inset shadow so
@@ -1886,43 +1929,83 @@ function findPrecedingUserMessageId(): number {
   display: inline-block;
   max-width: 100%;
 }
-.attach-wrap:hover .attach-actions,
-.attach-wrap:focus-within .attach-actions { opacity: 1; }
-.attach-actions {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity var(--dur-fast) var(--ease-out);
-  z-index: 2;
-}
-.attach-actions-inline {
-  position: static;
-  display: inline-flex;
-  vertical-align: middle;
-  margin-left: 4px;
+.attach-wrap:hover .attachment-action-bar,
+.attach-wrap:focus-within .attachment-action-bar,
+.msg-file-wrap:hover .attachment-action-bar,
+.msg-file-wrap:focus-within .attachment-action-bar {
   opacity: 1;
+  transform: translateY(0);
+}
+.attachment-action-bar {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  transform: translateY(calc(-1 * var(--space-1)));
+  transition: opacity var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+  z-index: 3;
+}
+.attachment-action-bar--image {
+  top: auto;
+  right: var(--space-2);
+  bottom: var(--space-2);
+  transform: translateY(var(--space-1));
 }
 .attach-action-btn {
-  width: 24px;
-  height: 24px;
+  width: var(--space-7);
+  height: var(--space-7);
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--surface-overlay);
-  color: var(--on-brand);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-primary);
   cursor: pointer;
   font-size: 12px;
   line-height: 1;
   padding: 0;
-  backdrop-filter: blur(2px);
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
 .attach-action-btn:hover {
-  background: rgba(0, 0, 0, 0.8);
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-600);
+}
+.msg.user .bubble-body .attach-action-btn {
+  color: var(--text-primary);
+}
+.msg.user .bubble-body .attach-action-btn:hover {
+  color: var(--brand-600);
+}
+.attach-action-btn:active { transform: scale(0.92); }
+.attach-action-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.attach-action-btn--labeled {
+  width: auto;
+  min-width: calc(var(--space-8) + var(--space-2));
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+}
+.attach-action-label {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
 }
 .msg-file {
   background: var(--surface-2);
@@ -1941,7 +2024,31 @@ function findPrecedingUserMessageId(): number {
   color: var(--text-secondary);
 }
 .msg-file-icon { color: var(--text-tertiary); flex-shrink: 0; }
-.msg-file-wrap { display: inline-flex; align-items: center; max-width: 100%; }
+.msg-file-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+}
+.msg-file-wrap .msg-file { padding-right: var(--space-7); }
+.msg-file-wrap.has-copy-action .msg-file { padding-right: calc(var(--space-7) * 2); }
+.msg-file-wrap .attachment-action-bar {
+  top: 50%;
+  transform: translateY(calc(-50% - 2px));
+}
+.msg-file-wrap:hover .attachment-action-bar,
+.msg-file-wrap:focus-within .attachment-action-bar {
+  transform: translateY(-50%);
+}
+@media (hover: none) {
+  .attachment-action-bar {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  .msg-file-wrap .attachment-action-bar {
+    transform: translateY(-50%);
+  }
+}
 .msg-image-warn {
   display: inline-flex; align-items: center; gap: 6px;
   background: var(--warn-50);

@@ -3,6 +3,7 @@ package upgrade
 import (
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -33,6 +34,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V5: stepV5toV6,
 	V6: stepV6toV7,
 	V7: stepV7toV8,
+	V8: stepV8toV9,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -161,6 +163,151 @@ func stepV7toV8(db *sql.DB) error {
 CREATE INDEX IF NOT EXISTS idx_turn_queue_session_status ON turn_queue(session_id, status, id);`)
 	if err != nil {
 		return fmt.Errorf("create turn_queue: %w", err)
+	}
+	return nil
+}
+
+// ---- V8 → V9 ----
+
+func stepV8toV9(db *sql.DB) error {
+	log.Print("[upgrade] V8 → V9: migrating media capabilities")
+	if err := migrateMediaCapabilityConfig(); err != nil {
+		return fmt.Errorf("migrate media capability config: %w", err)
+	}
+	if err := migrateSessionRecognitionCapabilities(db); err != nil {
+		return fmt.Errorf("migrate session recognition capabilities: %w", err)
+	}
+	return nil
+}
+
+func migrateMediaCapabilityConfig() error {
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	changed := false
+	recognition, _ := root["recognition"].(map[string]any)
+	if recognition == nil {
+		recognition = map[string]any{}
+		root["recognition"] = recognition
+		changed = true
+	}
+	routes, _ := recognition["routes"].(map[string]any)
+	if routes == nil {
+		routes = map[string]any{}
+		recognition["routes"] = routes
+		changed = true
+	}
+	if _, exists := routes["image"]; !exists {
+		if legacy, ok := root["vision_recognition"].(map[string]any); ok {
+			route := map[string]any{}
+			for _, key := range []string{"enabled", "provider", "model", "timeout_seconds"} {
+				if value, found := legacy[key]; found {
+					route[key] = value
+				}
+			}
+			if value, found := legacy["max_image_bytes"]; found {
+				route["max_bytes"] = value
+			}
+			routes["image"] = route
+			changed = true
+		}
+	}
+
+	if llmDoc, ok := root["llm"].(map[string]any); ok {
+		if providers, ok := llmDoc["providers"].([]any); ok {
+			for _, providerValue := range providers {
+				provider, _ := providerValue.(map[string]any)
+				models, _ := provider["models"].([]any)
+				for _, modelValue := range models {
+					model, _ := modelValue.(map[string]any)
+					caps, _ := model["capabilities"].(map[string]any)
+					if caps == nil {
+						continue
+					}
+					if _, exists := caps["input_modalities"]; exists {
+						continue
+					}
+					modalities := make([]string, 0, 2)
+					if enabled, _ := caps["supports_vision"].(bool); enabled {
+						modalities = append(modalities, "image")
+					}
+					if enabled, _ := caps["supports_audio"].(bool); enabled {
+						modalities = append(modalities, "audio")
+					}
+					if len(modalities) > 0 {
+						caps["input_modalities"] = modalities
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return os.WriteFile(configPath, out, 0o644)
+}
+
+func migrateSessionRecognitionCapabilities(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	var exists int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='conversations'`).Scan(&exists); err != nil || exists == 0 {
+		return err
+	}
+	rows, err := db.Query(`SELECT id, metadata FROM conversations WHERE metadata <> ''`)
+	if err != nil {
+		return err
+	}
+	type update struct{ id, metadata string }
+	updates := make([]update, 0)
+	for rows.Next() {
+		var id, metadata string
+		if err := rows.Scan(&id, &metadata); err != nil {
+			rows.Close()
+			return err
+		}
+		var doc map[string]any
+		if json.Unmarshal([]byte(metadata), &doc) != nil {
+			continue
+		}
+		if _, exists := doc["enabled_recognition_capabilities"]; exists {
+			continue
+		}
+		capabilities := []string{}
+		if enabled, _ := doc["use_image_recognition"].(bool); enabled {
+			capabilities = append(capabilities, "image")
+		}
+		doc["enabled_recognition_capabilities"] = capabilities
+		encoded, err := json.Marshal(doc)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		updates = append(updates, update{id: id, metadata: string(encoded)})
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range updates {
+		if _, err := db.Exec(`UPDATE conversations SET metadata=? WHERE id=?`, item.metadata, item.id); err != nil {
+			return err
+		}
 	}
 	return nil
 }

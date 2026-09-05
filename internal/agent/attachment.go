@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/tool"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -18,18 +20,18 @@ import (
 // produces one of these from a multipart file; the agent then
 // expands it into a content block before sending to the LLM.
 //
-// Kind is one of "image", "audio", "text", "file" — see the
+// Kind is one of "image", "audio", "video", "text", "file" — see the
 // expandAttachments switch for the per-kind handling.
 type Attachment struct {
 	// ID is the server-side upload id (legacy path; the handler
 	// resolves it through AttachmentResolver). Optional when
 	// Data is set.
 	ID string `json:"id"`
-	// UploadID is the upload id the SPA posts for media
-	// attachments. The server stores "upl://<UploadID>" in the
-	// message row instead of base64, so the SQLite database holds
-	// a reference while the LLM context keeps the base64 bytes
-	// (re-read from disk). Mirrored into ID by
+	// UploadID is the upload id the SPA posts for attachments.
+	// The server stores "upl://<UploadID>" in the
+	// message row instead of base64, so SQLite holds a reference while
+	// the current native-media path or a scoped tool reads disk on demand.
+	// Mirrored into ID by
 	// UnmarshalJSON so the resolver path works unchanged.
 	UploadID string `json:"upload_id,omitempty"`
 	// Name is the original filename, used for the message bubble
@@ -39,16 +41,14 @@ type Attachment struct {
 	// Size is the file size in bytes. Computed from Data when
 	// the attachment is inlined.
 	Size int64 `json:"size,omitempty"`
-	// Kind is "image" | "audio" | "text" | "file". Drives the
+	// Kind is "image" | "audio" | "video" | "text" | "file". Drives the
 	// multi-content part type and the system prompt section.
 	Kind string `json:"kind"`
 	// MIME is the file's MIME type, when known.
 	MIME string `json:"mime,omitempty"`
-	// Data is the inline base64 (or text) payload. When set, it
-	// takes precedence over ID — the resolver path is skipped
-	// entirely. This is the path the new SPA uses: the
-	// frontend has the bytes already, no need to round-trip
-	// them through the upload + disk-read cycle.
+	// Data is the inline base64 (or text) fallback payload. When set, it
+	// takes precedence over ID. The SPA normally sends UploadID so files
+	// remain session-scoped and can be read again in later turns.
 	//
 	// The frontend often sends the inline payload as `url`
 	// (the same field the LLM wire format uses, e.g. a
@@ -56,6 +56,7 @@ type Attachment struct {
 	// part). We accept either; resolveInline() picks whichever
 	// is non-empty.
 	Data string `json:"data,omitempty"`
+	Text string `json:"text,omitempty"`
 	URL  string `json:"url,omitempty"`
 }
 
@@ -121,9 +122,9 @@ func (r *DiskAttachmentResolver) Resolve(a Attachment) (string, int64) {
 
 // ExpandAttachmentsCM converts a list of Attachment objects into
 // separate llm.ChatMessage entries (one text msg + one per
-// attachment). Each image/audio/file becomes its own row with
-// type=image/audio/file and Content as raw base64. Text
-// attachments are inlined as type=text blocks.
+// attachment). Media may be submitted natively or referenced through a
+// recognition tool; documents become TypeFile display rows plus a
+// conversation-scoped read_attachment reference.
 //
 // visionCapable is an optional callback; when it returns false,
 // image attachments are replaced with a text marker. When
@@ -131,8 +132,24 @@ func (r *DiskAttachmentResolver) Resolve(a Attachment) (string, int64) {
 // withheld from the main LLM; a system reference tells the model to call
 // image_recognize with the upload_id.
 func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachment, r AttachmentResolver, visionCapable func() bool, useImageRecognition bool) []llm.ChatMessage {
+	capabilities := []config.MediaKind(nil)
+	if useImageRecognition {
+		capabilities = []config.MediaKind{config.MediaImage}
+	}
+	return ExpandAttachmentsForCapabilitiesCM(protocol, msgs, atts, r, func(kind config.MediaKind) bool {
+		return kind == config.MediaImage && visionCapable != nil && visionCapable()
+	}, capabilities)
+}
+
+// ExpandAttachmentsForCapabilitiesCM routes attachments either to the active
+// model or to an enabled, independently configured media-recognition tool.
+func ExpandAttachmentsForCapabilitiesCM(protocol string, msgs []llm.ChatMessage, atts []Attachment, r AttachmentResolver, modelCapable func(config.MediaKind) bool, recognitionCapabilities []config.MediaKind) []llm.ChatMessage {
 	if len(atts) == 0 || r == nil {
 		return msgs
+	}
+	recognitionEnabled := make(map[config.MediaKind]bool, len(recognitionCapabilities))
+	for _, kind := range recognitionCapabilities {
+		recognitionEnabled[kind] = true
 	}
 
 	// Find the last user message and split text + attachments
@@ -159,44 +176,19 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 			continue
 		}
 
-		// Extension-driven routing for document formats that
-		// should be saved to workspace (read_docx / read_pdf).
-		ext := strings.ToLower(filepath.Ext(a.Name))
-		isDocx := ext == ".docx"
-		isPdf := ext == ".pdf"
-
-		if isDocx || isPdf {
-			path, wrote := saveToWorkspace(a.Name, data)
-			var tool string
-			if isDocx {
-				tool = "read_docx"
-			} else {
-				tool = "read_pdf"
-			}
-			if wrote {
-				result = append(result, llm.ChatMessage{
-					Role:        llm.RoleUser,
-					Type:        llm.TypeText,
-					Content:     fmt.Sprintf("文件已保存到工作区: %s (%d 字节)。使用 %s 工具读取全文。", path, len(data), tool),
-					MsgType:     llm.MsgTypeText,
-					SubmitToLLM: 1,
-				})
-			} else {
-				result = append(result, llm.ChatMessage{
-					Role:        llm.RoleUser,
-					Type:        llm.TypeText,
-					Content:     fmt.Sprintf("(收到文件: %s, %d 字节, %s — 无法保存到工作区)", a.Name, len(data), ext),
-					MsgType:     llm.MsgTypeText,
-					SubmitToLLM: 1,
-				})
-			}
+		// Non-media attachments stay in the upload store and are read
+		// through one conversation-scoped tool. This keeps project roots,
+		// arbitrary path permissions, and Office/PDF extraction out of the
+		// upload expansion layer.
+		if a.Kind == "text" || tool.SupportsAttachmentRead(a.Name, a.MIME) {
+			result = append(result, attachmentReadMessages(a, data)...)
 			continue
 		}
 
 		switch a.Kind {
 		case "image":
 			mime := imageMIME(a.Name, a.MIME)
-			if useImageRecognition {
+			if recognitionEnabled[config.MediaImage] {
 				result = append(result, llm.ChatMessage{
 					Role:        llm.RoleUser,
 					Type:        llm.TypeImage,
@@ -225,7 +217,7 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 				}
 				continue
 			}
-			if visionCapable != nil && !visionCapable() {
+			if modelCapable != nil && !modelCapable(config.MediaImage) {
 				result = append(result, llm.ChatMessage{
 					Role:        llm.RoleUser,
 					Type:        llm.TypeText,
@@ -246,6 +238,14 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 				SubmitToLLM: 1,
 			})
 		case "audio":
+			if recognitionEnabled[config.MediaAudio] {
+				result = append(result, mediaRecognitionMessages(a, data, llm.TypeAudio, llm.MsgTypeAudio)...)
+				continue
+			}
+			if modelCapable != nil && modelCapable(config.MediaAudio) {
+				result = append(result, llm.ChatMessage{Role: llm.RoleUser, Type: llm.TypeAudio, Content: base64.StdEncoding.EncodeToString(data), Name: a.Name, MimeType: a.MIME, UploadID: a.UploadID, MsgType: llm.MsgTypeAudio, SubmitToLLM: 1})
+				continue
+			}
 			result = append(result, llm.ChatMessage{
 				Role:        llm.RoleUser,
 				Type:        llm.TypeText,
@@ -254,6 +254,14 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 				SubmitToLLM: 1,
 			})
 		case "video":
+			if recognitionEnabled[config.MediaVideo] {
+				result = append(result, mediaRecognitionMessages(a, data, llm.TypeVideo, llm.MsgTypeVideo)...)
+				continue
+			}
+			if modelCapable != nil && modelCapable(config.MediaVideo) {
+				result = append(result, llm.ChatMessage{Role: llm.RoleUser, Type: llm.TypeVideo, Content: base64.StdEncoding.EncodeToString(data), Name: a.Name, MimeType: a.MIME, UploadID: a.UploadID, MsgType: llm.MsgTypeVideo, SubmitToLLM: 1})
+				continue
+			}
 			result = append(result, llm.ChatMessage{
 				Role:        llm.RoleUser,
 				Type:        llm.TypeText,
@@ -261,74 +269,79 @@ func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachm
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
 			})
-		case "text":
-			const maxInlineText = 8 << 10
-			if len(data) <= maxInlineText {
-				body := string(data)
-				result = append(result, llm.ChatMessage{
-					Role:        llm.RoleUser,
-					Type:        llm.TypeText,
-					Content:     fmt.Sprintf("--- %s ---\n%s", a.Name, body),
-					MsgType:     llm.MsgTypeText,
-					SubmitToLLM: 1,
-				})
-			} else {
-				path, wrote := saveToWorkspace(a.Name, data)
-				if wrote {
-					result = append(result, llm.ChatMessage{
-						Role:        llm.RoleUser,
-						Type:        llm.TypeText,
-						Content:     fmt.Sprintf("文件已保存到工作区: %s (%d 字符, %d 字节)。使用 read_file 工具读取全文。", path, len(data), len(data)),
-						MsgType:     llm.MsgTypeText,
-						SubmitToLLM: 1,
-					})
-				} else {
-					body := string(data)
-					const maxTextDump = 200 << 10
-					if len(body) > maxTextDump {
-						body = body[:maxTextDump] + "\n... (truncated)"
-					}
-					result = append(result, llm.ChatMessage{
-						Role:        llm.RoleUser,
-						Type:        llm.TypeText,
-						Content:     fmt.Sprintf("--- %s ---\n%s", a.Name, body),
-						MsgType:     llm.MsgTypeText,
-						SubmitToLLM: 1,
-					})
-				}
-			}
 		default:
-			result = append(result, llm.ChatMessage{
-				Role:        llm.RoleUser,
-				Type:        llm.TypeText,
-				Content:     fmt.Sprintf("(attached file: %s, %d bytes, kind=%s)", a.Name, len(data), a.Kind),
-				MsgType:     llm.MsgTypeText,
-				SubmitToLLM: 1,
-			})
+			result = append(result, unsupportedAttachmentMessages(a, data)...)
 		}
 	}
 	return result
 }
 
-// saveToWorkspace writes data to workspace/<name> (relative to
-// os.Getwd), creating directories as needed. Returns the written
-// path and whether the write succeeded.
-func saveToWorkspace(name string, data []byte) (string, bool) {
-	wd, err := os.Getwd()
-	if err != nil {
-		wd = "."
+func hasReadableAttachmentContext(msgs []llm.ChatMessage, atts []Attachment) bool {
+	for _, message := range msgs {
+		if message.Type == llm.TypeFile && strings.TrimSpace(message.UploadID) != "" &&
+			tool.SupportsAttachmentRead(message.Name, message.MimeType) {
+			return true
+		}
 	}
-	// Sanitise: always write under workspace/ so the LLM knows
-	// where uploaded files land.
-	dest := filepath.Join(wd, "workspace", filepath.Base(name))
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return "", false
+	for _, attachment := range atts {
+		if strings.TrimSpace(attachment.UploadID) == "" {
+			continue
+		}
+		if attachment.Kind == "text" || tool.SupportsAttachmentRead(attachment.Name, attachment.MIME) {
+			return true
+		}
 	}
-	if err := os.WriteFile(dest, data, 0o644); err != nil {
-		return "", false
+	return false
+}
+
+func attachmentDisplayMessage(a Attachment, data []byte) llm.ChatMessage {
+	mimeType := strings.TrimSpace(a.MIME)
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
 	}
-	// Return a path relative to workspace for clean display.
-	return "workspace/" + filepath.Base(name), true
+	return llm.ChatMessage{
+		Role: llm.RoleUser, Type: llm.TypeFile, Content: base64.StdEncoding.EncodeToString(data),
+		Name: a.Name, MimeType: mimeType, UploadID: a.UploadID, MsgType: llm.MsgTypeText, SubmitToLLM: 0,
+	}
+}
+
+func attachmentReadMessages(a Attachment, data []byte) []llm.ChatMessage {
+	display := attachmentDisplayMessage(a, data)
+	if a.UploadID == "" {
+		return []llm.ChatMessage{display, {
+			Role: llm.RoleSystem, Type: llm.TypeText, SubmitToLLM: 1,
+			Content: fmt.Sprintf("Attachment %q has no upload_id, so read_attachment cannot access it. Ask the user to upload it again if its contents are required.", a.Name),
+		}}
+	}
+	return []llm.ChatMessage{display, {
+		Role: llm.RoleSystem, Type: llm.TypeText, SubmitToLLM: 1,
+		Content: fmt.Sprintf("Uploaded attachment available through read_attachment: name=%q, upload_id=%q, size=%d bytes, MIME=%s. Call read_attachment with this upload_id when its contents are needed; do not pass a filesystem path.", a.Name, a.UploadID, len(data), display.MimeType),
+	}}
+}
+
+func unsupportedAttachmentMessages(a Attachment, data []byte) []llm.ChatMessage {
+	display := attachmentDisplayMessage(a, data)
+	return []llm.ChatMessage{display, {
+		Role: llm.RoleSystem, Type: llm.TypeText, SubmitToLLM: 1,
+		Content: fmt.Sprintf("An attachment named %q was uploaded (%d bytes, MIME=%s), but no content extractor is available for this format. Do not claim to have read it; ask the user for a supported text, PDF, Word, Excel, or PowerPoint file when its contents are required.", a.Name, len(data), display.MimeType),
+	}}
+}
+
+func mediaRecognitionMessages(a Attachment, data []byte, messageType string, messageTypeID int) []llm.ChatMessage {
+	media := llm.ChatMessage{
+		Role: llm.RoleUser, Type: messageType, Content: base64.StdEncoding.EncodeToString(data),
+		Name: a.Name, MimeType: a.MIME, UploadID: a.UploadID, MsgType: messageTypeID, SubmitToLLM: 0,
+	}
+	if a.UploadID == "" {
+		return []llm.ChatMessage{media, {
+			Role: llm.RoleSystem, Type: llm.TypeText, SubmitToLLM: 1,
+			Content: fmt.Sprintf("A %s attachment named %q has no upload_id. Ask the user to upload it again before using media_recognize.", messageType, a.Name),
+		}}
+	}
+	return []llm.ChatMessage{media, {
+		Role: llm.RoleSystem, Type: llm.TypeText, SubmitToLLM: 1,
+		Content: fmt.Sprintf("Uploaded %s available through media_recognize: name=%q, upload_id=%q, size=%d bytes, MIME=%s. The main model cannot inspect it directly in this session; call media_recognize when its contents are needed.", messageType, a.Name, a.UploadID, len(data), a.MIME),
+	}}
 }
 
 // resolveAttachmentData returns the raw bytes for an attachment.
@@ -343,6 +356,9 @@ func resolveAttachmentData(a Attachment, r AttachmentResolver) ([]byte, string) 
 		a.ID = a.UploadID
 	}
 	inlineRaw := a.Data
+	if inlineRaw == "" {
+		inlineRaw = a.Text
+	}
 	if a.URL != "" {
 		inlineRaw = a.URL
 	}

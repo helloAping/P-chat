@@ -6,7 +6,7 @@
 
 ## 概述
 
-Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工具是 LLM 可以调用的函数：执行命令、读写文件、列目录、阅读文档（PDF/DOCX）、待办管理（todo_write）、用户提问（question）、图片识别（image_recognize）。
+Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工具是 LLM 可以调用的函数：执行命令、读写项目文件、读取会话附件、待办管理（todo_write）、用户提问（question）和媒体识别。
 
 ## 文件结构
 
@@ -46,6 +46,7 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 |---|---|---|
 | `exec_command` | 执行 shell 命令 | registry.go:201, 303 |
 | `read_file` | 读取文本文件 | registry.go:211, 390 |
+| `read_attachment` | 通过本会话 `upload_id` 提取文本、PDF、Word、Excel、PowerPoint 内容 | attachment_read.go, registry.go |
 | `write_file` | 写入/创建文件 | registry.go:223, 440 |
 | `list_files` | 列出目录 | registry.go |
 | `grep` | 在项目根目录精确搜索关键词 | grep.go |
@@ -54,6 +55,7 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 | `web_fetch` | HTTP 抓取 URL（带 SSRF 防护） | registry.go:275, 749 |
 | `web_search` | 公开网络搜索（snippet+url，可插拔 provider） | websearch.go |
 | `image_recognize` | 识别会话上传图片；优先用系统识图模型，必要时 fallback 到当前视觉模型 | image_recognize.go, registry.go |
+| `media_recognize` | 按会话能力配置识别一项或多项图片、视频或音频上传 | media_recognize.go, registry.go |
 | `todo_write` | 管理待办列表 | registry.go:256, todo.go |
 | `question` | 向用户提问并等待 | registry.go:275, question.go |
 
@@ -108,6 +110,18 @@ type SandboxChecker interface {
 识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，当前轮图片二进制都不会发给主模型，避免主模型收到 `image_url` / image block。重答目标消息中的图片按“当前轮图片”处理，会重新识别或重新提交；更早的历史图片仍走占位 + 工具引用。
 
 浏览器 `browser_screenshot` 只有在当前模型支持视觉或会话启用系统识图时暴露。启用系统识图时，截图结果先由识图模型分析并以受约束的事实观察文本回填给主模型；未启用时，仍按原逻辑把截图作为视觉 payload 提交给支持多模态的当前模型。
+
+### 6.6 媒体识别工具
+
+`media_recognize` 是图片、视频、音频的统一能力工具。它只在父会话至少选择了一项可用能力时暴露，并通过 context 注入的 resolver 校验 `upload_id` 必须属于当前会话，随后根据 MIME 类型选择对应的系统识别路由。一次调用中的多个文件必须是同一种媒体类型，大小限制和超时按该类型路由执行。
+
+识别路由只有在目标模型明确声明相同输入能力时才可用；仅填写 provider/model 不足以启用工具。图片继续保留 `image_recognize` 兼容路径；音频/视频在当前模型显式声明原生输入能力时可直接提交，否则由已配置的外接路由识别。`media_recognize` 暂不向子代理暴露，避免子代理在没有父会话媒体上下文时发现不可执行工具。
+
+### 6.7 会话附件读取工具
+
+`read_attachment` 只接受 `upload_id`，不接受文件系统路径。Agent 注入的 resolver 会先确认该上传引用属于当前会话，再从上传目录解析真实文件，因此模型不能借此读取其他会话或任意本地文件。工具支持普通文本/源码、PDF、DOCX/DOCM、XLSX/XLSM、PPTX/PPTM；未知二进制、旧版 Office 二进制格式等没有确定解析器的类型会明确返回不支持，模型不得声称已读。
+
+当前轮和历史轮的文档都以显示行加 system 引用进入上下文，正文只在模型确实调用 `read_attachment` 后提取。这样附件无需复制进项目目录，也不会把整份 Office/PDF 的二进制或 data URL 塞进提示词。该工具不向子代理暴露。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

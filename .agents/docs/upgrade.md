@@ -8,6 +8,8 @@
 - **Current**：二进制内嵌的最新版本号，定义在 `internal/upgrade/version.go`。
 - **升级步骤**：一个 `func(*sql.DB) error` 函数，将数据从 `V(N)` 升级到 `V(N+1)`。
 
+当前版本为 V9：V8→V9 把旧版 `vision_recognition` 和模型 `supports_vision` / `supports_audio` 映射到媒体能力配置，并把会话 `use_image_recognition=true` 迁移为 `enabled_recognition_capabilities=["image"]`。迁移保持旧字段以兼容旧二进制。
+
 ## 启动流程
 
 ```

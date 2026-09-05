@@ -25,6 +25,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 )
@@ -707,7 +708,7 @@ func normalizeTaskOrderKey(s string) string {
 // buildMessageResponse shapes one ChatMessage row into the
 // public MessageResponse. Returns nil for rows the frontend
 // shouldn't render (tool call / tool result rows are
-// reconstructed into the assistant message's Parts; image
+// reconstructed into the assistant message's Parts; attachment
 // rows are surfaced as Attachments). rowID is the SQLite row
 // id, propagated so the client can use it as the
 // `before_id` cursor for the next page request. seq is the
@@ -747,7 +748,7 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 		IsArchived:   isArchived,
 	}
 
-	// Media messages (image / audio / video): compute a data
+	// Attachment messages (image / audio / video / file): compute a data
 	// URL for the frontend. The frontend's MessageBubble
 	// distinguishes them by the `kind` field and the wire
 	// `type` (image_url / audio_url / video_url). We keep
@@ -760,7 +761,7 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 	// bytes on demand instead of shipping them through the
 	// messages payload. Legacy base64 rows fall through to
 	// the data: URL path unchanged.
-	if isMediaType(m.Type) && m.Content != "" {
+	if isAttachmentType(m.Type) && m.Content != "" {
 		mime := m.MimeType
 		if mime == "" {
 			mime = defaultMIMEForType(m.Type)
@@ -805,10 +806,10 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 			resp.Parts = parts
 		}
 	}
-	// Media messages carry their payload as data URLs in
+	// Attachment messages carry their payload as URLs in
 	// Attachments; clear Content so the frontend doesn't
 	// render the raw base64 string as text.
-	if isMediaType(m.Type) {
+	if isAttachmentType(m.Type) {
 		resp.Content = ""
 	}
 	// Tool call / result messages are embedded in the
@@ -892,6 +893,12 @@ func isMediaType(t string) bool {
 	return t == llm.TypeImage || t == llm.TypeAudio || t == llm.TypeVideo
 }
 
+// isAttachmentType 判断消息是否作为独立附件行持久化。
+// isAttachmentType reports whether t is a standalone attachment row.
+func isAttachmentType(t string) bool {
+	return isMediaType(t) || t == llm.TypeFile
+}
+
 // uplRefPrefix marks a media row whose bytes live on disk in
 // ~/.p-chat/uploads instead of base64 in messages.content. The
 // content column stores "upl://<uploadID>"; the frontend fetches
@@ -908,9 +915,9 @@ func uploadIDFromContent(content string) (string, bool) {
 	return strings.TrimPrefix(content, uplRefPrefix), true
 }
 
-// resolveHistoryUploads replaces "upl://<id>" media rows with the
-// base64 bytes re-read from ~/.p-chat/uploads, so the LLM context
-// carries the actual image (models read URLs, not references).
+// resolveHistoryUploads replaces "upl://<id>" attachment rows with the
+// base64 bytes re-read from ~/.p-chat/uploads. The agent then decides whether
+// to send native media or expose the session-scoped attachment reader.
 // Missing files degrade to a text marker rather than dropping the
 // turn. The display path (ListMessages) is untouched — it resolves
 // references to /api/v1/uploads/<id> URLs for on-demand loading.
@@ -934,7 +941,7 @@ func resolveHistoryUploads(msgs []llm.ChatMessage, r *agent.DiskAttachmentResolv
 			msgs[i] = llm.ChatMessage{
 				Role:        m.Role,
 				Type:        llm.TypeText,
-				Content:     fmt.Sprintf("(attached image %s — file not found on server)", m.Name),
+				Content:     fmt.Sprintf("(attached file %s — file not found on server)", m.Name),
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
 			}
@@ -944,7 +951,7 @@ func resolveHistoryUploads(msgs []llm.ChatMessage, r *agent.DiskAttachmentResolv
 			msgs[i] = llm.ChatMessage{
 				Role:        m.Role,
 				Type:        llm.TypeText,
-				Content:     fmt.Sprintf("(attached image %s — upload file is empty)", m.Name),
+				Content:     fmt.Sprintf("(attached file %s — upload file is empty)", m.Name),
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
 			}
@@ -988,6 +995,8 @@ func typeURLFor(t string) string {
 		return "audio_url"
 	case llm.TypeVideo:
 		return "video_url"
+	case llm.TypeFile:
+		return "text"
 	}
 	return ""
 }
@@ -1076,7 +1085,7 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 func buildLLMMessages(histMsgs []llm.ChatMessage) []llm.ChatMessage {
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
 	for _, m := range histMsgs {
-		if m.SubmitToLLM == 0 && !isHistoricalImageReference(m) {
+		if m.SubmitToLLM == 0 && !isHistoricalAttachmentReference(m) {
 			continue
 		}
 		if m.MsgType == llm.MsgTypeTool && m.Role == llm.RoleTool && m.ToolName == "task" {
@@ -1087,8 +1096,8 @@ func buildLLMMessages(histMsgs []llm.ChatMessage) []llm.ChatMessage {
 	return msgs
 }
 
-func isHistoricalImageReference(m llm.ChatMessage) bool {
-	return m.Type == llm.TypeImage && strings.TrimSpace(m.UploadID) != ""
+func isHistoricalAttachmentReference(m llm.ChatMessage) bool {
+	return isAttachmentType(m.Type) && strings.TrimSpace(m.UploadID) != ""
 }
 
 // decodePartsFromMeta pulls the assistant message's `parts`
@@ -1197,26 +1206,27 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 	}
 	model := h.sessionModel(cv.ID, provider)
 	return SessionResponse{
-		ID:                   cv.ID,
-		Title:                imConversationResponseTitle(cv.ID, cv.Title),
-		Provider:             provider,
-		Model:                model,
-		Style:                m.Style,
-		WorkMode:             string(h.sessionWorkMode(cv.ID)),
-		ProjectPath:          m.ProjectPath,
-		PlanMode:             m.PlanMode,
-		PermissionLevel:      m.PermissionLevel,
-		ReasoningEffort:      m.ReasoningEffort,
-		VectorStore:          cv.VectorStore,
-		KnowledgeBase:        m.KnowledgeBase,
-		AutoContinue:         h.sessionAutoContinue(cv.ID),
-		TodoLongRunMode:      string(h.sessionTodoLongRunMode(cv.ID)),
-		UseImageRecognition:  m.UseImageRecognition,
-		SubAgentModelEnabled: m.SubAgentModelEnabled,
-		SubAgentProvider:     m.SubAgentProvider,
-		SubAgentModel:        m.SubAgentModel,
-		CreatedAt:            cv.CreatedAt.Unix(),
-		UpdatedAt:            cv.UpdatedAt.Unix(),
+		ID:                             cv.ID,
+		Title:                          imConversationResponseTitle(cv.ID, cv.Title),
+		Provider:                       provider,
+		Model:                          model,
+		Style:                          m.Style,
+		WorkMode:                       string(h.sessionWorkMode(cv.ID)),
+		ProjectPath:                    m.ProjectPath,
+		PlanMode:                       m.PlanMode,
+		PermissionLevel:                m.PermissionLevel,
+		ReasoningEffort:                m.ReasoningEffort,
+		VectorStore:                    cv.VectorStore,
+		KnowledgeBase:                  m.KnowledgeBase,
+		AutoContinue:                   h.sessionAutoContinue(cv.ID),
+		TodoLongRunMode:                string(h.sessionTodoLongRunMode(cv.ID)),
+		UseImageRecognition:            m.UseImageRecognition,
+		EnabledRecognitionCapabilities: append([]config.MediaKind(nil), m.RecognitionCapabilities...),
+		SubAgentModelEnabled:           m.SubAgentModelEnabled,
+		SubAgentProvider:               m.SubAgentProvider,
+		SubAgentModel:                  m.SubAgentModel,
+		CreatedAt:                      cv.CreatedAt.Unix(),
+		UpdatedAt:                      cv.UpdatedAt.Unix(),
 	}
 }
 

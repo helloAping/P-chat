@@ -136,6 +136,15 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "image recognition is disabled globally; enable it in App Settings > System > Image Recognition first"})
 		return
 	}
+	var recognitionCapabilities []config.MediaKind
+	if req.EnabledRecognitionCapabilities != nil {
+		var err error
+		recognitionCapabilities, err = h.validateRecognitionCapabilities(*req.EnabledRecognitionCapabilities)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 	subAgentModelEnabled := false
 	if req.SubAgentModelEnabled != nil {
 		subAgentModelEnabled = *req.SubAgentModelEnabled
@@ -190,7 +199,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	if req.VectorStore != "" {
 		_ = h.store.SetConversationVectorStore(id, req.VectorStore)
 	}
-	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil || req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
+	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil || req.EnabledRecognitionCapabilities != nil || req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		if req.PlanMode != nil {
@@ -211,6 +220,13 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		}
 		if req.UseImageRecognition != nil {
 			m.UseImageRecognition = *req.UseImageRecognition
+			if req.EnabledRecognitionCapabilities == nil {
+				m.RecognitionCapabilities = setRecognitionCapability(m.RecognitionCapabilities, config.MediaImage, *req.UseImageRecognition)
+			}
+		}
+		if req.EnabledRecognitionCapabilities != nil {
+			m.RecognitionCapabilities = append([]config.MediaKind(nil), recognitionCapabilities...)
+			m.UseImageRecognition = containsRecognitionCapability(recognitionCapabilities, config.MediaImage)
 		}
 		if req.SubAgentModelEnabled != nil {
 			m.SubAgentModelEnabled = *req.SubAgentModelEnabled
@@ -715,6 +731,14 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	var recognitionCapabilities []config.MediaKind
+	if req.EnabledRecognitionCapabilities != nil {
+		recognitionCapabilities, err = h.validateRecognitionCapabilities(*req.EnabledRecognitionCapabilities)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
 	// Validate provider (if specified) before touching meta.
 	provider := h.sessionProvider(id)
@@ -799,6 +823,18 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		m.UseImageRecognition = *req.UseImageRecognition
+		if req.EnabledRecognitionCapabilities == nil {
+			m.RecognitionCapabilities = setRecognitionCapability(m.RecognitionCapabilities, config.MediaImage, *req.UseImageRecognition)
+		}
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
+	if req.EnabledRecognitionCapabilities != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.RecognitionCapabilities = append([]config.MediaKind(nil), recognitionCapabilities...)
+		m.UseImageRecognition = containsRecognitionCapability(recognitionCapabilities, config.MediaImage)
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)
@@ -824,6 +860,48 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func (h *Handler) validateRecognitionCapabilities(kinds []config.MediaKind) ([]config.MediaKind, error) {
+	result := make([]config.MediaKind, 0, len(kinds))
+	seen := make(map[config.MediaKind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		if !kind.IsValid() {
+			return nil, fmt.Errorf("unsupported recognition capability %q", kind)
+		}
+		if _, exists := seen[kind]; exists {
+			continue
+		}
+		route, available := h.getCfg().Recognition.Route(kind)
+		if !available || !h.recognitionRouteAvailable(kind, route) {
+			return nil, fmt.Errorf("%s recognition is not configured or unavailable", kind)
+		}
+		seen[kind] = struct{}{}
+		result = append(result, kind)
+	}
+	return result, nil
+}
+
+func containsRecognitionCapability(kinds []config.MediaKind, target config.MediaKind) bool {
+	for _, kind := range kinds {
+		if kind == target {
+			return true
+		}
+	}
+	return false
+}
+
+func setRecognitionCapability(kinds []config.MediaKind, target config.MediaKind, enabled bool) []config.MediaKind {
+	result := make([]config.MediaKind, 0, len(kinds)+1)
+	for _, kind := range kinds {
+		if kind != target {
+			result = append(result, kind)
+		}
+	}
+	if enabled {
+		result = append(result, target)
+	}
+	return result
 }
 
 func (h *Handler) validateSubAgentModelSelection(enabled bool, provider, model string) error {

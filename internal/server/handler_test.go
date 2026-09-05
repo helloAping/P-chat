@@ -1721,6 +1721,36 @@ func TestPatchSession_RejectsUseImageRecognitionWhenGloballyDisabled(t *testing.
 	}
 }
 
+func TestSessionRecognitionCapabilitiesRequireConfiguredRoutes(t *testing.T) {
+	srv, cfg := newTestServer(t)
+	imageAndAudio := []config.MediaKind{config.MediaImage, config.MediaAudio}
+	for providerIndex := range cfg.LLM.Providers {
+		if cfg.LLM.Providers[providerIndex].Name != "openai" {
+			continue
+		}
+		for modelIndex := range cfg.LLM.Providers[providerIndex].Models {
+			if cfg.LLM.Providers[providerIndex].Models[modelIndex].Name == "gpt-4o-mini" {
+				cfg.LLM.Providers[providerIndex].Models[modelIndex].Capabilities.InputModalities = &imageAndAudio
+			}
+		}
+	}
+	cfg.Recognition = config.RecognitionConfig{Routes: map[config.MediaKind]config.RecognitionRoute{
+		config.MediaImage: {Enabled: true, Provider: "openai", Model: "gpt-4o-mini"},
+		config.MediaAudio: {Enabled: true, Provider: "openai", Model: "gpt-4o-mini"},
+		config.MediaVideo: {Enabled: true, Provider: "openai", Model: "gpt-4o-mini"},
+	}}
+
+	sess := createSessionPOST(t, srv, `{"enabled_recognition_capabilities":["image","audio"]}`)
+	if len(sess.EnabledRecognitionCapabilities) != 2 {
+		t.Fatalf("capabilities = %#v", sess.EnabledRecognitionCapabilities)
+	}
+
+	w := patchSession(t, srv, sess.ID, `{"enabled_recognition_capabilities":["video"]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestSessionMeta_PersistsAcrossNewHandler(t *testing.T) {
 	// The on-disk meta blob (conversations.metadata) is the
 	// single source of truth. A fresh *Handler reading the same

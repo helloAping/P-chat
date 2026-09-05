@@ -259,10 +259,12 @@ function isCurrent(e: ModelEntry) {
                 </span>
               </div>
               <div class="picker-item-meta">
-                <NTag v-if="e.model.capabilities?.supports_vision" size="tiny" :bordered="false" class="picker-cap-tag picker-cap-vision">
+                <NTag v-if="e.model.capabilities?.input_modalities?.includes('image') || e.model.capabilities?.supports_vision" size="tiny" :bordered="false" class="picker-cap-tag picker-cap-vision">
                   <template #icon><Eye :size="10" /></template>
                   视觉
                 </NTag>
+                <NTag v-if="e.model.capabilities?.input_modalities?.includes('video')" size="tiny" :bordered="false" class="picker-cap-tag">视频</NTag>
+                <NTag v-if="e.model.capabilities?.input_modalities?.includes('audio') || e.model.capabilities?.supports_audio" size="tiny" :bordered="false" class="picker-cap-tag">音频</NTag>
                 <span v-if="fmtContext(e.model.max_tokens_context)" class="picker-context">
                   {{ fmtContext(e.model.max_tokens_context) }}
                 </span>

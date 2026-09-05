@@ -660,6 +660,14 @@ func RegisterBuiltin(r *Registry) {
 	}, handleReadFile)
 
 	r.Register(Tool{
+		Name:        "read_attachment",
+		Description: "Extract text from a user-uploaded text, PDF, Word, Excel, or PowerPoint attachment. Pass only an upload_id explicitly shown in this conversation; arbitrary file paths are not accepted.",
+		Parameters: ObjectSchema(map[string]any{
+			"upload_id": StringProp("The upload_id of an attachment in this conversation"),
+		}, []string{"upload_id"}),
+	}, handleReadAttachment)
+
+	r.Register(Tool{
 		Name:        "write_file",
 		Description: "Write (overwrite or create) a text file with the given content. Creates parent directories if needed.",
 		Parameters: ObjectSchema(map[string]any{
@@ -729,6 +737,19 @@ func RegisterBuiltin(r *Registry) {
 			"question": StringProp("Optional focused question for the vision model, e.g. what details to extract from the image"),
 		}, nil),
 	}, handleImageRecognize)
+
+	r.Register(Tool{
+		Name:        "media_recognize",
+		Description: "Analyze one or more user-uploaded images, videos, or audio files through the media capability enabled for this session. Uploads in one call must share the same media type. Use only upload_id values explicitly shown in this chat; never pass file paths.",
+		Parameters: ObjectSchema(map[string]any{
+			"upload_id": StringProp("A single upload_id attached in this conversation"),
+			"upload_ids": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
+				"description": "Upload ids of same-type media attachments to analyze together",
+			},
+			"question": StringProp("Optional focused question for the configured recognition model"),
+		}, nil),
+	}, handleMediaRecognize)
 
 	r.Register(Tool{
 		Name:        "todo_write",

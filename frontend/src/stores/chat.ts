@@ -7,6 +7,7 @@ import * as api from '../api/client'
 import { notifyManager } from '../utils/notify'
 import { dedupMessagesByKey } from '../utils/messageDedup'
 import { insertAsyncSubAgentAfterTaskTools } from '../utils/subAgentOrder'
+import { dataURLToBlobURL } from '../utils/mediaPreview'
 import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem, TurnQueueItem, TurnQueuePayload } from '../api/client'
 import { isCurrentStream } from './streamLifecycle'
 import {
@@ -37,6 +38,9 @@ export interface PendingAttachment {
   // MessageBubble renders directly and the backend can pass
   // straight through to the LLM.
   _dataURL?: string
+  // One preparation task owns both local reading and server upload.
+  // The send path awaits this task instead of uploading the file again.
+  _ready?: Promise<void>
 }
 
 type SessionPermissionLevel = 'ask' | 'auto' | 'full'
@@ -55,6 +59,7 @@ type SessionMetaState = {
   auto_continue?: boolean
   todo_long_run_mode?: TodoLongRunMode
   use_image_recognition?: boolean
+  enabled_recognition_capabilities?: api.MediaKind[]
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
@@ -167,6 +172,7 @@ export const state = reactive({
   lastPermissionLevel: 'ask' as SessionPermissionLevel,
   globalWorkMode: 'coding' as string,
   visionRecognitionEnabled: false,
+  recognitionCapabilitiesAvailable: [] as api.MediaKind[],
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
   sessionTodos: {} as Record<string, TodoItem[]>,
   // turnQueue 保存当前会话尚未执行的用户消息。
@@ -507,6 +513,7 @@ export const currentMeta = computed(() => {
     auto_continue: true,
     todo_long_run_mode: 'adaptive' as TodoLongRunMode,
     use_image_recognition: false,
+    enabled_recognition_capabilities: [],
     sub_agent_model_enabled: false,
     sub_agent_provider: '',
     sub_agent_model: '',
@@ -866,6 +873,7 @@ async function switchSessionBody(id: string) {
       auto_continue: s.auto_continue ?? true,
       todo_long_run_mode: s.todo_long_run_mode || 'adaptive',
       use_image_recognition: s.use_image_recognition || false,
+      enabled_recognition_capabilities: s.enabled_recognition_capabilities || (s.use_image_recognition ? ['image'] : []),
       sub_agent_model_enabled: s.sub_agent_model_enabled || false,
       sub_agent_provider: s.sub_agent_provider || '',
       sub_agent_model: s.sub_agent_model || '',
@@ -1007,12 +1015,19 @@ export async function loadProviders() {
 
 function buildCreateSessionOptions(): api.CreateSessionOptions {
   const meta = state.sessionMeta[state.currentID] || currentMeta.value
+  // A new conversation inherits the style of the immediately active
+  // conversation. With no active source (fresh app/project), style is off.
+  const inheritedStyle = state.currentID
+    ? (state.sessionMeta[state.currentID]?.style || 'off')
+    : 'off'
+  const requestedCapabilities = meta.enabled_recognition_capabilities || (meta.use_image_recognition ? ['image'] : [])
+  const enabledCapabilities = requestedCapabilities.filter(kind => state.recognitionCapabilitiesAvailable.includes(kind))
   return {
     project_path: state.activeProjectPath || '',
     work_mode: meta.workMode || state.globalWorkMode || 'coding',
     provider: meta.provider || '',
     model: meta.model || '',
-    style: meta.style || 'off',
+    style: inheritedStyle,
     plan_mode: !!meta.plan_mode,
     permission_level: normalizePermissionLevel(meta.permission_level || state.lastPermissionLevel),
     reasoning_effort: meta.reasoning_effort || 'off',
@@ -1020,7 +1035,8 @@ function buildCreateSessionOptions(): api.CreateSessionOptions {
     knowledge_base: meta.knowledge_base || '',
     auto_continue: meta.auto_continue ?? true,
     todo_long_run_mode: meta.todo_long_run_mode || 'adaptive',
-    use_image_recognition: !!meta.use_image_recognition,
+    use_image_recognition: enabledCapabilities.includes('image'),
+    enabled_recognition_capabilities: enabledCapabilities,
     sub_agent_model_enabled: !!meta.sub_agent_model_enabled,
     sub_agent_provider: meta.sub_agent_provider || '',
     sub_agent_model: meta.sub_agent_model || '',
@@ -1130,6 +1146,7 @@ export async function renameSession(id: string, title: string) {
     s.provider = resp.provider ?? s.provider
     s.model = resp.model ?? s.model
     s.use_image_recognition = resp.use_image_recognition ?? s.use_image_recognition
+    s.enabled_recognition_capabilities = resp.enabled_recognition_capabilities ?? s.enabled_recognition_capabilities
     s.sub_agent_model_enabled = resp.sub_agent_model_enabled ?? s.sub_agent_model_enabled
     s.sub_agent_provider = resp.sub_agent_provider ?? s.sub_agent_provider
     s.sub_agent_model = resp.sub_agent_model ?? s.sub_agent_model
@@ -1148,6 +1165,7 @@ export async function renameSession(id: string, title: string) {
       knowledge_base: resp.knowledge_base ?? state.sessionMeta[id].knowledge_base,
       todo_long_run_mode: resp.todo_long_run_mode ?? state.sessionMeta[id].todo_long_run_mode,
       use_image_recognition: resp.use_image_recognition ?? state.sessionMeta[id].use_image_recognition,
+      enabled_recognition_capabilities: resp.enabled_recognition_capabilities ?? state.sessionMeta[id].enabled_recognition_capabilities,
       sub_agent_model_enabled: resp.sub_agent_model_enabled ?? state.sessionMeta[id].sub_agent_model_enabled,
       sub_agent_provider: resp.sub_agent_provider ?? state.sessionMeta[id].sub_agent_provider,
       sub_agent_model: resp.sub_agent_model ?? state.sessionMeta[id].sub_agent_model,
@@ -1178,9 +1196,9 @@ export function guessKind(name: string, mime: string): string {
   return 'file'
 }
 
-export async function addAttachment(file: File) {
+export function addAttachment(file: File): Promise<void> {
   const id = state.currentID
-  if (!id) return
+  if (!id) return Promise.resolve()
   if (!state.pendingAttachments[id]) state.pendingAttachments[id] = []
   const guessedKind = guessKind(file.name, file.type || '')
   const blobURL = URL.createObjectURL(file)
@@ -1191,6 +1209,12 @@ export async function addAttachment(file: File) {
     _previewURL: blobURL,
   }
   state.pendingAttachments[id].push(placeholder)
+  const ready = prepareAttachment(placeholder, file, guessedKind)
+  placeholder._ready = ready
+  return ready
+}
+
+async function prepareAttachment(placeholder: PendingAttachment, file: File, guessedKind: string): Promise<void> {
   // Cache a base64 data URL up-front so the message can be
   // displayed + sent without re-reading the file from disk.
   // For text attachments this is just the utf-8 text; for binary
@@ -1221,6 +1245,10 @@ export async function addAttachment(file: File) {
   }
 }
 
+export async function waitForPendingAttachments(attachments: PendingAttachment[]): Promise<void> {
+  await Promise.allSettled(attachments.map(attachment => attachment._ready).filter(Boolean))
+}
+
 // readAsDataURL returns a string suitable for the image_url/url
 // field of an OpenAI multi-part content. For binary files it's
 // the file's data: URL; for text files it's the file's contents
@@ -1249,8 +1277,8 @@ export function removeAttachment(idx: number) {
   arr.splice(idx, 1)
 }
 
-export function clearAttachments() {
-  const id = state.currentID
+export function clearAttachments(sessionID = state.currentID) {
+  const id = sessionID
   if (!id) return
   for (const a of (state.pendingAttachments[id] || [])) {
     if (a._blobURL) URL.revokeObjectURL(a._blobURL)
@@ -1272,21 +1300,6 @@ export function clearAttachments() {
 //      Chromium can GC independently of the JS heap.
 //   3. Session-level revocation is a simple walkParts over
 //      the messages map rather than hunting for data URLs.
-function dataUrlToBlobUrl(input: string | undefined): string | undefined {
-  if (!input || !input.startsWith('data:image/')) return input
-  try {
-    const commaIdx = input.indexOf(',')
-    const b64 = input.slice(commaIdx + 1)
-    const mime = input.slice(5, commaIdx)
-    const byteChars = atob(b64)
-    const bytes = new Uint8Array(byteChars.length)
-    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
-    return URL.createObjectURL(new Blob([bytes], { type: mime }))
-  } catch {
-    return input
-  }
-}
-
 // convertAndStripScreenshots walks ALL messages in the given
 // session, (1) converts any residual base64 screenshot data
 // URLs into blob: URLs (this happens on the very first load
@@ -1347,12 +1360,12 @@ export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERV
         if (p.kind !== 'tool' || !p.result) return
         const r = p.result as string
         if (isB64(r)) {
-          p.result = dataUrlToBlobUrl(r)
+          p.result = dataURLToBlobURL(r)
         } else {
           try {
             const obj = JSON.parse(r)
             if (typeof obj.image === 'string' && isB64(obj.image as string)) {
-              obj.image = dataUrlToBlobUrl(obj.image as string)
+              obj.image = dataURLToBlobURL(obj.image as string)
               p.result = JSON.stringify(obj)
             } else if (typeof obj.image === 'string' && obj.image === PLACEHOLDER_SCREENSHOT) {
               return
@@ -1372,7 +1385,7 @@ export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERV
       for (const att of m.attachments) {
         if (!isB64(att.url) && !isBlob(att.url)) continue
         if (isB64(att.url)) {
-          att.url = dataUrlToBlobUrl(att.url)
+          att.url = dataURLToBlobURL(att.url)
         }
         if (isBlob(att.url)) screenshotTargets.push(att)
       }
@@ -1408,21 +1421,22 @@ function revokeSessionBlobUrls(sessionId: string) {
   const msgs = state.sessionMessages[sessionId]
   if (msgs) {
     for (const m of msgs) {
-      if (!m.parts) continue
-      walkParts(m.parts, (p) => {
-        if (p.kind !== 'tool') return
-        const r = p.result
-        if (typeof r === 'string' && r.startsWith('blob:')) {
-          URL.revokeObjectURL(r)
-          return
-        }
-        try {
-          const obj = JSON.parse(r as string)
-          if (typeof obj.image === 'string' && obj.image.startsWith('blob:')) {
-            URL.revokeObjectURL(obj.image as string)
+      if (m.parts) {
+        walkParts(m.parts, (p) => {
+          if (p.kind !== 'tool') return
+          const r = p.result
+          if (typeof r === 'string' && r.startsWith('blob:')) {
+            URL.revokeObjectURL(r)
+            return
           }
-        } catch { /* not JSON */ }
-      })
+          try {
+            const obj = JSON.parse(r as string)
+            if (typeof obj.image === 'string' && obj.image.startsWith('blob:')) {
+              URL.revokeObjectURL(obj.image as string)
+            }
+          } catch { /* not JSON */ }
+        })
+      }
       if (m.attachments) {
         for (const att of m.attachments) {
           if (att.url?.startsWith('blob:')) URL.revokeObjectURL(att.url)
@@ -2091,7 +2105,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             // Convert screenshot base64 data URLs to blob URLs
             // before storing, so the reactive map never sees the
             // raw base64 payload (~200–500 KB per screenshot).
-            p.result = dataUrlToBlobUrl(ev.tool_result_full || ev.tool_result)
+            p.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
             p.error = ev.tool_error
             p.elapsed = ev.tool_elapsed
             if (ev.tool_args) p.args = ev.tool_args
@@ -2113,7 +2127,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             name: ev.tool_name,
             args: ev.tool_args,
             status: (ev.tool_status as any) || 'ok',
-            result: dataUrlToBlobUrl(ev.tool_result_full || ev.tool_result),
+            result: dataURLToBlobURL(ev.tool_result_full || ev.tool_result),
             error: ev.tool_error,
             elapsed: ev.tool_elapsed,
             result_truncated: ev.tool_result_truncated || undefined,

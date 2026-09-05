@@ -20,22 +20,26 @@ import (
 // been removed. The loader still accepts a legacy config.yaml as
 // a one-shot migration source — see Load.
 type Config struct {
-	Server    ServerConfig            `json:"server"`
-	LLM       LLMConfig               `json:"llm"`
-	Style     StyleConfig             `json:"style"`
-	UI        UIConfig                `json:"ui"`
-	WorkMode  WorkModeConfig          `json:"work_mode"`
-	Tools     ToolsConfig             `json:"tools"`
-	Memory    MemoryConfig            `json:"memory"`
-	Sandbox   SandboxConfig           `json:"sandbox"`
-	SubAgent  SubAgentConfig          `json:"subagent"`
-	MCP       MCPConfig               `json:"mcp"`
-	Knowledge KnowledgeConfig         `json:"knowledge"`
-	Limits    LimitsConfig            `json:"limits"`
-	Search    SearchConfig            `json:"search"`
-	Browser   BrowserConfig           `json:"browser"`
-	Vision    VisionRecognitionConfig `json:"vision_recognition"`
-	IM        IMConfig                `json:"im"`
+	Server    ServerConfig    `json:"server"`
+	LLM       LLMConfig       `json:"llm"`
+	Style     StyleConfig     `json:"style"`
+	UI        UIConfig        `json:"ui"`
+	WorkMode  WorkModeConfig  `json:"work_mode"`
+	Tools     ToolsConfig     `json:"tools"`
+	Memory    MemoryConfig    `json:"memory"`
+	Sandbox   SandboxConfig   `json:"sandbox"`
+	SubAgent  SubAgentConfig  `json:"subagent"`
+	MCP       MCPConfig       `json:"mcp"`
+	Knowledge KnowledgeConfig `json:"knowledge"`
+	Limits    LimitsConfig    `json:"limits"`
+	Search    SearchConfig    `json:"search"`
+	Browser   BrowserConfig   `json:"browser"`
+	// Recognition is the canonical media-recognition configuration. Each
+	// media kind can use an independent provider/model route.
+	Recognition RecognitionConfig `json:"recognition,omitempty"`
+	// Vision is retained for pre-V9 configuration compatibility.
+	Vision VisionRecognitionConfig `json:"vision_recognition,omitempty"`
+	IM     IMConfig                `json:"im"`
 	// Dynamic is the P3-2 per-tool config table. The
 	// user writes `dynamic.<tool_name>.config: {…}`
 	// in their config.json and the dynamic tool's
@@ -491,6 +495,83 @@ type WorkModeConfig struct {
 	Default WorkMode `json:"default"`
 }
 
+// MediaKind identifies a supported multimodal attachment category.
+type MediaKind string
+
+const (
+	MediaImage MediaKind = "image"
+	MediaVideo MediaKind = "video"
+	MediaAudio MediaKind = "audio"
+)
+
+// IsValid reports whether the media kind is part of the capability contract.
+func (m MediaKind) IsValid() bool {
+	switch m {
+	case MediaImage, MediaVideo, MediaAudio:
+		return true
+	default:
+		return false
+	}
+}
+
+// RecognitionRoute selects the model used to recognize one media kind.
+type RecognitionRoute struct {
+	Enabled        bool   `json:"enabled"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	MaxBytes       int64  `json:"max_bytes,omitempty"`
+}
+
+// Normalize fills conservative limits shared by recognition routes.
+func (r *RecognitionRoute) Normalize() {
+	if r.TimeoutSeconds <= 0 {
+		r.TimeoutSeconds = 60
+	}
+	if r.MaxBytes <= 0 {
+		r.MaxBytes = 10 << 20
+	}
+}
+
+// Available reports whether this route has enough configuration to be used.
+func (r RecognitionRoute) Available() bool {
+	return r.Enabled && strings.TrimSpace(r.Provider) != "" && strings.TrimSpace(r.Model) != ""
+}
+
+// RecognitionConfig stores independent routes for image, video, and audio.
+type RecognitionConfig struct {
+	Routes map[MediaKind]RecognitionRoute `json:"routes,omitempty"`
+}
+
+// Normalize validates route keys and fills route defaults.
+func (r *RecognitionConfig) Normalize() {
+	if r.Routes == nil {
+		r.Routes = make(map[MediaKind]RecognitionRoute)
+		return
+	}
+	for kind, route := range r.Routes {
+		if !kind.IsValid() {
+			delete(r.Routes, kind)
+			continue
+		}
+		route.Normalize()
+		r.Routes[kind] = route
+	}
+}
+
+// Route returns an available route for kind.
+func (r RecognitionConfig) Route(kind MediaKind) (RecognitionRoute, bool) {
+	if !kind.IsValid() {
+		return RecognitionRoute{}, false
+	}
+	route, ok := r.Routes[kind]
+	if !ok || !route.Available() {
+		return RecognitionRoute{}, false
+	}
+	route.Normalize()
+	return route, true
+}
+
 // VisionRecognitionConfig selects the external multimodal model used by
 // the image_recognize tool. The main chat model can stay text-only; when
 // a session opts in, uploaded images are described through this model and
@@ -510,6 +591,33 @@ func (v *VisionRecognitionConfig) Normalize() {
 	}
 	if v.MaxImageBytes <= 0 {
 		v.MaxImageBytes = 10 << 20
+	}
+}
+
+// NormalizeRecognition initializes canonical recognition routes and imports
+// the legacy vision route when no explicit image route exists.
+func (c *Config) NormalizeRecognition() {
+	c.Recognition.Normalize()
+	if _, exists := c.Recognition.Routes[MediaImage]; !exists {
+		legacy := c.Vision
+		legacy.Normalize()
+		if legacy.Enabled || strings.TrimSpace(legacy.Provider) != "" || strings.TrimSpace(legacy.Model) != "" {
+			c.Recognition.Routes[MediaImage] = RecognitionRoute{
+				Enabled:        legacy.Enabled,
+				Provider:       legacy.Provider,
+				Model:          legacy.Model,
+				TimeoutSeconds: legacy.TimeoutSeconds,
+				MaxBytes:       legacy.MaxImageBytes,
+			}
+		}
+	}
+	c.Recognition.Normalize()
+	if image, exists := c.Recognition.Routes[MediaImage]; exists {
+		c.Vision = VisionRecognitionConfig{
+			Enabled: image.Enabled, Provider: image.Provider, Model: image.Model,
+			TimeoutSeconds: image.TimeoutSeconds, MaxImageBytes: image.MaxBytes,
+		}
+		c.Vision.Normalize()
 	}
 }
 
@@ -912,6 +1020,7 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	cfg.UI.CloseBehavior = cfg.UI.CloseBehavior.Normalize()
 	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
 	cfg.Vision.Normalize()
+	cfg.NormalizeRecognition()
 
 	return cfg, nil
 }
@@ -1054,7 +1163,8 @@ func Default() *Config {
 			TimeoutSeconds: 60,
 			MaxImageBytes:  10 << 20,
 		},
-		IM: DefaultIMConfig(),
+		Recognition: RecognitionConfig{Routes: map[MediaKind]RecognitionRoute{}},
+		IM:          DefaultIMConfig(),
 	}
 }
 

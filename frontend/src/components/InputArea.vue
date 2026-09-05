@@ -7,7 +7,7 @@
 // path so the LLM can answer "what is /foo?" questions naturally.
 
 import { h, onMounted, ref, computed, watch, nextTick } from 'vue'
-import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useDialog, useMessage, type DropdownOption } from 'naive-ui'
+import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, NSelect, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
@@ -18,7 +18,7 @@ import {
 } from './icons'
 import * as api from '../api/client'
 import {
-  state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments,
+  state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments, waitForPendingAttachments,
   isStreaming,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
@@ -33,6 +33,7 @@ import { editQueuedTurn, setTurnQueueEditing } from '../stores/chat'
 import { drainQueuedConversationTurns, stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
 import { notifyManager } from '../utils/notify'
 import { copyText } from '../utils/clipboard'
+import { dataURLToBlobURL } from '../utils/mediaPreview'
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const inputText = ref('')
@@ -707,7 +708,10 @@ async function renderModels(args: string): Promise<string> {
       } else {
         for (const m of models) {
           const defTag = m.default ? ' <span class="cmd-tag tag-def">★</span>' : ''
-          const visionTag = m.capabilities?.supports_vision ? ' <span class="cmd-tag tag-vis">视觉</span>' : ''
+          const configuredCapabilities = m.capabilities?.input_modalities || (m.capabilities?.supports_vision ? ['image' as api.MediaKind] : [])
+          const visionTag = configuredCapabilities.length
+            ? ` <span class="cmd-tag tag-vis">${configuredCapabilities.map(kind => recognitionLabels[kind]).join('/')}</span>`
+            : ''
           const ctx = m.max_tokens_context ? `${fmtK(m.max_tokens_context)} ctx` : ''
           const out = m.max_tokens_output ? `${fmtK(m.max_tokens_output)} out` : ''
           const meta = [ctx, out].filter(Boolean).join(' · ')
@@ -858,6 +862,64 @@ async function clearUnfinishedTodosBeforeSend(id: string): Promise<TodoSendMode 
   }
 }
 
+function buildLocalBubbleAttachments(attachments: PendingAttachment[]): api.MessageAttachment[] {
+  const result: api.MessageAttachment[] = []
+  for (const a of attachments) {
+    if (a._error) continue
+    if (a.kind === 'image' || a.kind === 'audio' || a.kind === 'video') {
+      const type = a.kind === 'image' ? 'image_url' : a.kind === 'audio' ? 'audio_url' : 'video_url'
+      const url = a._file ? URL.createObjectURL(a._file) : dataURLToBlobURL(a._dataURL)
+      if (url) result.push({ type, url, name: a.name, kind: a.kind, mime: a.mime })
+      continue
+    }
+    const url = a._file
+      ? URL.createObjectURL(a._file)
+      : a.id
+        ? api.uploadURL(a.id)
+        : dataURLToBlobURL(a._dataURL)
+    result.push({
+      type: 'text',
+      url: url || undefined,
+      text: a.kind === 'text' ? a._dataURL || undefined : undefined,
+      name: a.name,
+      kind: a.kind,
+      mime: a.mime,
+    })
+  }
+  return result
+}
+
+function buildInlineAttachments(attachments: PendingAttachment[]): api.InlineAttachment[] {
+  const result: api.InlineAttachment[] = []
+  for (const a of attachments) {
+    if (a._error) continue
+    const data = a._dataURL
+    if (a.kind === 'image' || a.kind === 'audio' || a.kind === 'video') {
+      if (!a.id && !data) continue
+      const type = a.kind === 'image' ? 'image_url' : a.kind === 'audio' ? 'audio_url' : 'video_url'
+      result.push({
+        type,
+        url: a.id ? undefined : data,
+        upload_id: a.id || undefined,
+        name: a.name,
+        kind: a.kind,
+        mime: a.mime,
+      })
+      continue
+    }
+    if (!a.id && !data) continue
+    result.push({
+      type: 'text',
+      data: a.id ? undefined : data,
+      upload_id: a.id || undefined,
+      name: a.name,
+      kind: a.kind,
+      mime: a.mime,
+    })
+  }
+  return result
+}
+
 async function send() {
   const raw = inputText.value.trim()
   if (!raw) return
@@ -940,54 +1002,9 @@ async function send() {
   }
   const id = state.currentID
   const meta = currentMeta.value
-  // Build the attachment payload in two directions at once:
-  //   - inlineAttachments: what we send to the server. Images
-  //     are uploaded to /api/v1/uploads first; the wire carries
-  //     { upload_id, name, kind, mime } and NO inline bytes, so
-  //     the server persists an "upl://<id>" reference and the
-  //     request body stays small. Audio/video/text keep the
-  //     inline data URL / text body as before.
-  //   - bubbleAttachments: the same data shaped for the chat
-  //     bubble (the local data URL goes into `url`, the original
-  //     file name into `name`) so the user sees the image right
-  //     away, not after a server round-trip.
-  //
-  // Attachments are read from the *current* session's pending
-  // list — per-session storage means staging files in one
-  // conversation doesn't leak into another when the user
-  // switches.
-  const inlineAttachments: api.InlineAttachment[] = []
-  const bubbleAttachments: api.InlineAttachment[] = []
-  for (const a of currentAttachments.value) {
-    if (a._error) continue
-    const data = a._dataURL
-    if (!data) continue
-    if (a.kind === 'image') {
-      // Image bytes go through the upload endpoint so the
-      // database row stays a small reference. The upload is
-      // parallel-ready and fail-soft: on any error we fall back
-      // to shipping the inline data URL, so a blocked /uploads
-      // request never blocks the user's message.
-      let uploadID: string | undefined
-      try {
-        const up = await api.uploadFile((a as PendingAttachment)._file as File)
-        if (up.size > 0) uploadID = up.id
-      } catch { /* inline fallback below */ }
-      inlineAttachments.push({ type: 'image_url', url: uploadID ? undefined : data, upload_id: uploadID, name: a.name, kind: a.kind, mime: a.mime })
-      bubbleAttachments.push({ type: 'image_url', url: data, name: a.name, kind: a.kind, mime: a.mime })
-    } else if (a.kind === 'audio' || a.kind === 'video') {
-      // Audio and video ride the same wire path as images:
-      // base64 data URL on a *_url attachment type. The LLM
-      // can't actually hear/watch them today (no native
-      // adapter), but the chat bubble renders a player.
-      const wire = a.kind === 'audio' ? 'audio_url' : 'video_url'
-      inlineAttachments.push({ type: wire, url: data, name: a.name, kind: a.kind, mime: a.mime })
-      bubbleAttachments.push({ type: wire, url: data, name: a.name, kind: a.kind, mime: a.mime })
-    } else {
-      inlineAttachments.push({ type: 'text', text: data, name: a.name, kind: a.kind, mime: a.mime })
-      bubbleAttachments.push({ type: 'text', text: data, name: a.name, kind: a.kind, mime: a.mime })
-    }
-  }
+  // Snapshot this session's staged files. Selection owns the single upload;
+  // sending only waits for that work and reuses its upload id.
+  const stagedAttachments = currentAttachments.value.filter(a => !a._error)
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
   // Mint a row id for this user message at send time so
   // rollback and regenerate always have a valid `msg.id`
@@ -1000,6 +1017,25 @@ async function send() {
   // colliding with anything autoincrement produces for
   // assistant messages later in the same session.
   const clientMsgId = Date.now() * 1000 + Math.floor(Math.random() * 1000)
+  const shouldQueue = currentConversationBusy.value || currentTurnQueue.value.length > 0
+  if (!shouldQueue) {
+    // The bubble is optimistic: local object URLs render immediately while a
+    // just-selected attachment finishes its existing read/upload task.
+    const bubbleAttachments = buildLocalBubbleAttachments(stagedAttachments)
+    state.sessionMessages[id].push({
+      id: clientMsgId,
+      role: 'user',
+      content: text,
+      created_at: Date.now() / 1000,
+      attachments: bubbleAttachments.length ? bubbleAttachments : undefined,
+    })
+    clearAttachments(id)
+    notifyManager.unlock()
+  }
+
+  await waitForPendingAttachments(stagedAttachments)
+  const inlineAttachments = buildInlineAttachments(stagedAttachments)
+  const skillContext = pendingSkillContext || undefined
   const turnPayload = api.sendPayloadFromOptions({
     message: text,
     client_msg_id: clientMsgId,
@@ -1013,13 +1049,12 @@ async function send() {
     subAgentModel: meta.sub_agent_model || '',
     todo_mode: todoMode,
     attachments: inlineAttachments,
-    skill_context: pendingSkillContext || undefined,
+    skill_context: skillContext,
   })
-  const shouldQueue = currentConversationBusy.value || currentTurnQueue.value.length > 0
   if (shouldQueue) {
     try {
       await enqueueTurnQueue(id, turnPayload)
-      clearAttachments()
+      clearAttachments(id)
       pendingSkillContext = ''
       notifyManager.unlock()
       message.info('消息已加入队列')
@@ -1029,45 +1064,6 @@ async function send() {
     }
     return
   }
-  // Push the user message WITH id + attachments so the
-  // bubble renders correctly without waiting for the
-  // next history fetch, and so rollback can target the
-  // exact row from the moment the message is sent.
-  // created_at (Unix sec) is stamped locally so the
-  // "send time" footer renders immediately; history
-  // reloads replace it with the server's value.
-  state.sessionMessages[id].push({
-    id: clientMsgId,
-    role: 'user',
-    content: text,
-    created_at: Date.now() / 1000,
-    attachments: bubbleAttachments.length ? bubbleAttachments : undefined,
-  })
-  // Convert inline base64 data: URLs on user-sent image
-  // attachments into blob: URLs. The base64 payload has
-  // already been shipped to the server via the
-  // `inlineAttachments` wire path (a separate Array that
-  // owns the same string references until the stream
-  // completes), but the message bubble renders from
-  // `bubbleAttachments` — swapping those to blob URLs
-  // here means the reactive state holds only a short
-  // blob: reference going forward, not a multi-hundred-KB
-  // base64 string. The Blob itself stays alive via the
-  // `pendingAttachments` `_dataURL` until `clearAttachments`
-  // runs in the finally block below.
-  for (const att of bubbleAttachments) {
-    if (att.url?.startsWith('data:image/')) {
-      try {
-        const commaIdx = att.url.indexOf(',')
-        const b64 = att.url.slice(commaIdx + 1)
-        const mime = att.url.slice(5, commaIdx)
-        const byteChars = atob(b64)
-        const bytes = new Uint8Array(byteChars.length)
-        for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
-        att.url = URL.createObjectURL(new Blob([bytes], { type: mime }))
-      } catch { /* keep original data URL */ }
-    }
-  }
   if (!meta.title) {
     api.renameSession(id, text.slice(0, 40)).then(() => {
       const s = state.sessions.find(s => s.id === id)
@@ -1075,9 +1071,6 @@ async function send() {
     }).catch(() => {})
   }
   inputText.value = ''
-  clearAttachments()
-  // 首次用户交互时解锁 Web Audio（浏览器自动播放策略要求）
-  notifyManager.unlock()
 
   sending.value = true
   try {
@@ -1102,7 +1095,7 @@ async function send() {
       subAgentModel: meta.sub_agent_model || '',
       todoMode,
       attachments: inlineAttachments,
-      skillContext: pendingSkillContext || undefined,
+      skillContext,
       // 首个流事件到达后，技能上下文已经提交给服务端。
       // The first stream event confirms the skill context was submitted.
       onFirstEvent: () => {
@@ -1184,7 +1177,10 @@ async function loadConfig() {
     loadKBases()
     const sc = await api.getSystemConfig()
     state.globalWorkMode = sc.work_mode?.default || 'coding'
-    state.visionRecognitionEnabled = !!sc.vision_recognition?.enabled
+    const availableCapabilities = (['image', 'video', 'audio'] as api.MediaKind[])
+      .filter(kind => !!sc.recognition?.routes?.[kind]?.available)
+    state.recognitionCapabilitiesAvailable = availableCapabilities
+    state.visionRecognitionEnabled = availableCapabilities.includes('image') || !!sc.vision_recognition?.enabled
     const st = await api.getStyles()
     styleOptions.value = [
       { label: '关闭', value: 'off' },
@@ -1276,34 +1272,45 @@ async function onTodoLongRunPick(v: 'off' | 'adaptive' | 'unlimited') {
   }
 }
 
-const imageRecognitionAvailable = computed(() => !!state.visionRecognitionEnabled)
-
-const imageRecognitionEnabled = computed(() =>
-  imageRecognitionAvailable.value && !!state.sessionMeta[state.currentID]?.use_image_recognition,
+const recognitionLabels: Record<api.MediaKind, string> = {
+  image: '图片',
+  video: '视频',
+  audio: '音频',
+}
+const recognitionCapabilityOptions = computed(() =>
+  state.recognitionCapabilitiesAvailable.map(kind => ({ label: `${recognitionLabels[kind]}识别`, value: kind })),
 )
+const enabledRecognitionCapabilities = computed(() => {
+  const meta = state.sessionMeta[state.currentID]
+  const configured = meta?.enabled_recognition_capabilities
+    || (meta?.use_image_recognition ? ['image' as api.MediaKind] : [])
+  return configured.filter(kind => state.recognitionCapabilitiesAvailable.includes(kind))
+})
+const imageRecognitionEnabled = computed(() => enabledRecognitionCapabilities.value.includes('image'))
+const recognitionCapabilityLabel = computed(() => {
+  if (!state.recognitionCapabilitiesAvailable.length) return '不可用'
+  if (!enabledRecognitionCapabilities.value.length) return '关闭'
+  return enabledRecognitionCapabilities.value.map(kind => recognitionLabels[kind]).join('/')
+})
 
-const imageRecognitionLabel = computed(() =>
-  imageRecognitionAvailable.value ? (imageRecognitionEnabled.value ? '开' : '关') : '不可用',
-)
-
-async function onImageRecognitionPick(v: boolean) {
+async function onRecognitionCapabilitiesPick(value: api.MediaKind[]) {
   if (!state.currentID) return
-  if (v && !imageRecognitionAvailable.value) {
-    message.warning('请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。', { duration: 5000 })
-    return
-  }
   try {
-    const resp = await api.updateSessionMeta(state.currentID, { use_image_recognition: v })
+    const resp = await api.updateSessionMeta(state.currentID, { enabled_recognition_capabilities: value })
     const id = state.currentID
-    const enabled = resp.use_image_recognition ?? v
+    const enabled = resp.enabled_recognition_capabilities ?? value
     state.sessionMeta[id] = {
       ...(state.sessionMeta[id] || currentMeta.value),
-      use_image_recognition: enabled,
+      enabled_recognition_capabilities: enabled,
+      use_image_recognition: enabled.includes('image'),
     }
     const session = state.sessions.find(s => s.id === id)
-    if (session) session.use_image_recognition = enabled
+    if (session) {
+      session.enabled_recognition_capabilities = enabled
+      session.use_image_recognition = enabled.includes('image')
+    }
   } catch (e: any) {
-    message.error(`图像识别设置失败：${e?.message || e}`)
+    message.error(`能力工具设置失败：${e?.message || e}`)
   }
 }
 
@@ -1438,7 +1445,7 @@ const currentKBLabel = computed(() => {
 })
 
 const sessionConfigSummary = computed(() =>
-  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 知识库${currentKBLabel.value} · 识图${imageRecognitionLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 知识库${currentKBLabel.value} · 能力${recognitionCapabilityLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
 )
 
 // Setter wrappers for the NDropdown @select handler.
@@ -1874,7 +1881,7 @@ watch([() => state.currentID, queueSignature], () => {
       type="file"
       multiple
       style="display:none"
-      accept="image/*,audio/*,video/*,text/*,.pdf,.json,.md,.txt,.csv,.yaml,.yml,.go,.py,.js,.ts"
+      accept="image/*,audio/*,video/*,text/*,.pdf,.docx,.docm,.pptx,.pptm,.xlsx,.xlsm,.json,.md,.txt,.csv,.yaml,.yml,.go,.py,.js,.ts"
       @change="onFiles(($event.target as HTMLInputElement).files)"
     />
 
@@ -1930,7 +1937,7 @@ watch([() => state.currentID, queueSignature], () => {
             >
               <Settings :size="13" />
               <span class="ctrl-btn-label">会话设置</span>
-              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 知识库{{ currentKBLabel }} · 识图{{ imageRecognitionLabel }} · 子代理{{ subAgentModelLabel }}</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 知识库{{ currentKBLabel }} · 能力{{ recognitionCapabilityLabel }} · 子代理{{ subAgentModelLabel }}</span>
             </button>
           </template>
           <div class="session-config-popover">
@@ -2093,7 +2100,7 @@ watch([() => state.currentID, queueSignature], () => {
 
             <div class="session-config-row">
               <div class="session-config-label">
-                <span>图像识别</span>
+                <span>能力工具</span>
                 <NPopover
                   trigger="hover"
                   placement="top"
@@ -2104,40 +2111,32 @@ watch([() => state.currentID, queueSignature], () => {
                     <button
                       type="button"
                       class="session-config-help"
-                      aria-label="图像识别说明"
+                      aria-label="能力工具说明"
                     >
                       <HelpCircle :size="12" />
                     </button>
                   </template>
                   <div class="session-config-help-popover">
-                    <div class="session-config-help-title">图像识别</div>
-                    <p>开启后，助手可以在需要时“看”你上传的图片，比如读图中文字、描述画面、找物体或比较多张图片。</p>
-                    <p>需要先到“应用设置 > 系统 > 图像识别”开启，并选择一个负责看图的模型。</p>
-                    <p>看图会多走一步，可能比普通文字聊天慢一些；如果全局没有配置，这里不能启用。</p>
+                    <div class="session-config-help-title">能力工具</div>
+                    <p>选择当前会话允许使用的媒体识别能力，可同时启用图片、视频和音频。</p>
+                    <p>每种能力都需要先在“应用设置 > 系统 > 媒体识别”配置独立的供应商和模型。</p>
+                    <p>未完成系统配置的能力不会出现在选择列表中。</p>
                   </div>
                 </NPopover>
               </div>
-              <div class="session-config-options">
-                <button
-                  type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': !imageRecognitionEnabled }"
-                  @click="onImageRecognitionPick(false)"
-                >
-                  关闭
-                </button>
-                <button
-                  type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': imageRecognitionEnabled }"
-                  :disabled="!imageRecognitionAvailable"
-                  :title="imageRecognitionAvailable ? '使用 image_recognize 工具识别图片' : '请先到“应用设置 > 系统 > 图像识别”启用工具'"
-                  @click="onImageRecognitionPick(true)"
-                >
-                  使用工具
-                </button>
-                <div v-if="!imageRecognitionAvailable" class="session-config-hint">
-                  请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。
+              <div class="session-config-options session-config-options--select">
+                <NSelect
+                  :value="enabledRecognitionCapabilities"
+                  :options="recognitionCapabilityOptions"
+                  multiple
+                  clearable
+                  size="small"
+                  placeholder="关闭"
+                  :disabled="!recognitionCapabilityOptions.length"
+                  @update:value="onRecognitionCapabilitiesPick"
+                />
+                <div v-if="!recognitionCapabilityOptions.length" class="session-config-hint">
+                  请先到“应用设置 > 系统 > 媒体识别”配置至少一种能力。
                 </div>
               </div>
             </div>
@@ -2958,6 +2957,10 @@ watch([() => state.currentID, queueSignature], () => {
   flex-wrap: wrap;
   gap: var(--space-1);
   min-width: 0;
+}
+.session-config-options--select {
+  display: block;
+  width: min(320px, 100%);
 }
 .session-config-options--stacked {
   flex-direction: column;

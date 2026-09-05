@@ -40,14 +40,29 @@ type VisionRecognitionConfigPatch struct {
 	MaxImageBytes  *int64  `json:"max_image_bytes,omitempty"`
 }
 
+// RecognitionRoutePatch is a partial update for one media route.
+type RecognitionRoutePatch struct {
+	Enabled        *bool   `json:"enabled,omitempty"`
+	Provider       *string `json:"provider,omitempty"`
+	Model          *string `json:"model,omitempty"`
+	TimeoutSeconds *int    `json:"timeout_seconds,omitempty"`
+	MaxBytes       *int64  `json:"max_bytes,omitempty"`
+}
+
+// RecognitionConfigPatch updates independent media recognition routes.
+type RecognitionConfigPatch struct {
+	Routes map[MediaKind]RecognitionRoutePatch `json:"routes,omitempty"`
+}
+
 // SystemConfigPatch is a partial update for system-level config
 // (limits + subagent + work_mode + ui + vision_recognition).
 type SystemConfigPatch struct {
-	Limits   *LimitsConfigPatch            `json:"limits,omitempty"`
-	SubAgent *SubAgentConfigPatch          `json:"sub_agent,omitempty"`
-	WorkMode *WorkModeConfigPatch          `json:"work_mode,omitempty"`
-	UI       *UIConfigPatch                `json:"ui,omitempty"`
-	Vision   *VisionRecognitionConfigPatch `json:"vision_recognition,omitempty"`
+	Limits      *LimitsConfigPatch            `json:"limits,omitempty"`
+	SubAgent    *SubAgentConfigPatch          `json:"sub_agent,omitempty"`
+	WorkMode    *WorkModeConfigPatch          `json:"work_mode,omitempty"`
+	UI          *UIConfigPatch                `json:"ui,omitempty"`
+	Vision      *VisionRecognitionConfigPatch `json:"vision_recognition,omitempty"`
+	Recognition *RecognitionConfigPatch       `json:"recognition,omitempty"`
 }
 
 // UpdateSystemConfig merges a SystemConfigPatch into the persisted config.
@@ -71,6 +86,21 @@ func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
 	}
 	if patch.Vision != nil {
 		mergeVisionRecognition(&cfg.Vision, patch.Vision)
+		cfg.Recognition.Normalize()
+		cfg.Recognition.Routes[MediaImage] = RecognitionRoute{
+			Enabled: cfg.Vision.Enabled, Provider: cfg.Vision.Provider, Model: cfg.Vision.Model,
+			TimeoutSeconds: cfg.Vision.TimeoutSeconds, MaxBytes: cfg.Vision.MaxImageBytes,
+		}
+	}
+	if patch.Recognition != nil {
+		mergeRecognition(&cfg.Recognition, patch.Recognition)
+		if image, ok := cfg.Recognition.Routes[MediaImage]; ok {
+			cfg.Vision = VisionRecognitionConfig{
+				Enabled: image.Enabled, Provider: image.Provider, Model: image.Model,
+				TimeoutSeconds: image.TimeoutSeconds, MaxImageBytes: image.MaxBytes,
+			}
+			cfg.Vision.Normalize()
+		}
 	}
 
 	mgr := NewManager()
@@ -145,4 +175,31 @@ func mergeVisionRecognition(v *VisionRecognitionConfig, p *VisionRecognitionConf
 		v.MaxImageBytes = *p.MaxImageBytes
 	}
 	v.Normalize()
+}
+
+func mergeRecognition(target *RecognitionConfig, patch *RecognitionConfigPatch) {
+	target.Normalize()
+	for kind, routePatch := range patch.Routes {
+		if !kind.IsValid() {
+			continue
+		}
+		route := target.Routes[kind]
+		if routePatch.Enabled != nil {
+			route.Enabled = *routePatch.Enabled
+		}
+		if routePatch.Provider != nil {
+			route.Provider = *routePatch.Provider
+		}
+		if routePatch.Model != nil {
+			route.Model = *routePatch.Model
+		}
+		if routePatch.TimeoutSeconds != nil {
+			route.TimeoutSeconds = *routePatch.TimeoutSeconds
+		}
+		if routePatch.MaxBytes != nil {
+			route.MaxBytes = *routePatch.MaxBytes
+		}
+		route.Normalize()
+		target.Routes[kind] = route
+	}
 }

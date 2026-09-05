@@ -1,4 +1,5 @@
 import * as api from '../api/client'
+import { dataURLToBlobURL } from '../utils/mediaPreview'
 import {
   appendLocalUserMessage,
   appendStreamEvent,
@@ -301,7 +302,7 @@ function bubbleAttachmentsFromQueuedPayload(attachments?: api.InlineAttachment[]
     if (att.type === 'image_url' || att.type === 'audio_url' || att.type === 'video_url') {
       out.push({
         type: att.type,
-        url: dataImageToBlobURL(att.upload_id ? api.uploadURL(att.upload_id) : att.url),
+        url: dataURLToBlobURL(att.upload_id ? api.uploadURL(att.upload_id) : att.url),
         name: att.name,
         kind: att.kind,
         mime: att.mime,
@@ -311,27 +312,13 @@ function bubbleAttachmentsFromQueuedPayload(attachments?: api.InlineAttachment[]
     out.push({
       type: 'text',
       text: att.text,
+      url: att.upload_id ? api.uploadURL(att.upload_id) : undefined,
       name: att.name,
       kind: att.kind,
       mime: att.mime,
     })
   }
   return out
-}
-
-function dataImageToBlobURL(url: string | undefined): string | undefined {
-  if (!url?.startsWith('data:image/')) return url
-  try {
-    const commaIdx = url.indexOf(',')
-    const mime = url.slice(5, commaIdx).split(';')[0]
-    const b64 = url.slice(commaIdx + 1)
-    const byteChars = atob(b64)
-    const bytes = new Uint8Array(byteChars.length)
-    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
-    return URL.createObjectURL(new Blob([bytes], { type: mime }))
-  } catch {
-    return url
-  }
 }
 
 // stopConversationTurn 为输入区和其他触发点提供统一停止入口。

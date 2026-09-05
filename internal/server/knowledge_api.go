@@ -154,7 +154,7 @@ func (h *Handler) GetKnowledgeModels(c *gin.Context) {
 				Provider:       p.Name,
 				Protocol:       p.GetProtocol(),
 				Model:          m.Name,
-				SupportsVision: m.Capabilities.SupportsVision,
+				SupportsVision: m.Capabilities.SupportsInput(config.MediaImage),
 			})
 		}
 	}

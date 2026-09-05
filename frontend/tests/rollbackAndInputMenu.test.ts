@@ -31,6 +31,25 @@ test('message right-click copy preserves and copies the selected text', () => {
   assert.match(source, /await copyEntireMessage\(\)/)
 })
 
+test('message hover toolbar keeps primary actions and merges secondary actions into one menu', () => {
+  const source = readMessageBubbleSource()
+
+  assert.match(source, /const messageActionMenuOptions = computed<DropdownOption\[\]>/)
+  assert.match(source, /<NDropdown[\s\S]*?:options="messageActionMenuOptions"[\s\S]*?@select="onMessageActionMenuSelect"/)
+  assert.match(source, /messageActionOption\('fork',/)
+  assert.match(source, /messageActionOption\('rollback',/)
+  assert.doesNotMatch(source, /v-if="canFork"[\s\S]*?class="bubble-action-btn bubble-action-pulse"/)
+  assert.doesNotMatch(source, /v-if="canRollback"[\s\S]*?class="bubble-action-btn bubble-action-rollback"/)
+  assert.match(source, /class="attachment-action-bar"/)
+  assert.match(source, /class="attachment-action-bar attachment-action-bar--image"/)
+  assert.match(source, /class="attach-action-label">复制<\/span>/)
+  assert.match(source, /class="attach-action-label">下载<\/span>/)
+  assert.match(source, /'bubble-actions--media': hasImageAttachment/)
+  assert.match(source, /\.attachment-action-bar--image\s*\{[\s\S]*?bottom: var\(--space-2\)/)
+  assert.match(source, /\.msg\.user \.bubble-body \.attach-action-btn\s*\{[\s\S]*?color: var\(--text-primary\)/)
+  assert.match(source, /\.msg\.user \.bubble-actions--media\s*\{[\s\S]*?flex-direction: column/)
+})
+
 test('rollback keeps a local fallback for undo banner and input refill', () => {
   const source = readStoreSource()
 

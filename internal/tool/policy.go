@@ -133,6 +133,9 @@ func (p ToolPolicy) CanRunInParallel() bool {
 // interactive/browser/MCP/dynamic tools stay with the parent conversation.
 func SubagentMayExpose(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "read_attachment" || name == "media_recognize" {
+		return false
+	}
 	switch name {
 	case "todo_write", "web_search", "web_fetch", "image_recognize":
 		return true
@@ -152,7 +155,7 @@ func defaultToolPolicy(name string) ToolPolicy {
 		MaxOutputBytes: 1 << 20,
 	}
 	switch {
-	case name == "read_file" || name == "read_docx" || name == "read_pdf" || name == "list_files" || name == "grep" || name == "recall" || name == "wiki_lookup" || name == "wiki_list" || name == "task_status" || name == "image_recognize":
+	case name == "read_file" || name == "read_attachment" || name == "read_docx" || name == "read_pdf" || name == "list_files" || name == "grep" || name == "recall" || name == "wiki_lookup" || name == "wiki_list" || name == "task_status" || name == "image_recognize" || name == "media_recognize":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryRead, ToolSideEffectNone, ToolRiskLow, ToolParallelSafe
 		p.TimeoutMS = durationMS(ReadToolTimeout)
 	case name == "write_file" || name == "edit_file":

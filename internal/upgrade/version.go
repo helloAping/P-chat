@@ -54,7 +54,11 @@ const (
 	// a conversation is already streaming.
 	V8 AppVersion = 8
 
+	// V9 — model and session media capabilities plus independent
+	// image/video/audio recognition routes.
+	V9 AppVersion = 9
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V8
+	Current AppVersion = V9
 )

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/sashabaranov/go-openai"
 )
@@ -256,6 +257,99 @@ func TestExpandAttachmentsCM_ImageRecognitionMode(t *testing.T) {
 	ref := out[2]
 	if ref.Role != llm.RoleSystem || !strings.Contains(ref.Content, id) || !strings.Contains(ref.Content, "image_recognize") {
 		t.Fatalf("system ref = %#v, want upload_id image_recognize hint", ref)
+	}
+}
+
+func TestExpandAttachmentsForCapabilitiesCM_AudioRecognitionMode(t *testing.T) {
+	dir := t.TempDir()
+	id := "audio1234567890ab"
+	if err := os.WriteFile(filepath.Join(dir, id+"-voice.mp3"), []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &DiskAttachmentResolver{BaseDir: dir}
+	out := ExpandAttachmentsForCapabilitiesCM("openai", nil, []Attachment{
+		{UploadID: id, Name: "voice.mp3", Kind: "audio", MIME: "audio/mpeg"},
+	}, resolver, func(config.MediaKind) bool { return false }, []config.MediaKind{config.MediaAudio})
+	if len(out) != 2 {
+		t.Fatalf("len(out) = %d, want display media + system ref", len(out))
+	}
+	if out[0].Type != llm.TypeAudio || out[0].SubmitToLLM != 0 {
+		t.Fatalf("audio = %#v", out[0])
+	}
+	if !strings.Contains(out[1].Content, "media_recognize") || !strings.Contains(out[1].Content, id) {
+		t.Fatalf("system ref = %#v", out[1])
+	}
+}
+
+func TestExpandAttachmentsForCapabilitiesCM_DocumentUsesSessionAttachmentReader(t *testing.T) {
+	dir := t.TempDir()
+	id := "document12345678"
+	if err := os.WriteFile(filepath.Join(dir, id+"-brief.pptx"), []byte("pptx"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &DiskAttachmentResolver{BaseDir: dir}
+	out := ExpandAttachmentsForCapabilitiesCM("openai", nil, []Attachment{
+		{UploadID: id, Name: "brief.pptx", Kind: "file", MIME: "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+	}, resolver, func(config.MediaKind) bool { return false }, nil)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out) = %d, want display attachment + reader hint", len(out))
+	}
+	if out[0].Type != llm.TypeFile || out[0].UploadID != id || out[0].SubmitToLLM != 0 {
+		t.Fatalf("document row = %#v, want display-only upload reference", out[0])
+	}
+	if out[1].Role != llm.RoleSystem || !strings.Contains(out[1].Content, "read_attachment") || !strings.Contains(out[1].Content, id) {
+		t.Fatalf("reader hint = %#v, want read_attachment upload reference", out[1])
+	}
+}
+
+func TestReplaceAttachmentReferencesCoversHistoricalMediaAndFiles(t *testing.T) {
+	in := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "system", SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeAudio, Content: "AUDIO", Name: "voice.mp3", MimeType: "audio/mpeg", UploadID: "audio-ref", MsgType: llm.MsgTypeAudio, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeVideo, Content: "VIDEO", Name: "clip.mp4", MimeType: "video/mp4", UploadID: "video-ref", MsgType: llm.MsgTypeVideo, SubmitToLLM: 0},
+		{Role: llm.RoleUser, Type: llm.TypeFile, Content: "FILE", Name: "deck.pptx", MimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation", UploadID: "file-ref", SubmitToLLM: 0},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "current", SubmitToLLM: 1},
+	}
+	out := replaceAttachmentReferences(in, 4, false, true, []config.MediaKind{config.MediaAudio, config.MediaVideo})
+
+	if len(out) != len(in) {
+		t.Fatalf("len(out) = %d, want %d", len(out), len(in))
+	}
+	if out[1].Type != llm.TypeText || !strings.Contains(out[1].Content, "media_recognize") || !strings.Contains(out[1].Content, "audio-ref") {
+		t.Fatalf("historical audio reference = %#v", out[1])
+	}
+	if out[2].Type != llm.TypeText || !strings.Contains(out[2].Content, "media_recognize") || !strings.Contains(out[2].Content, "video-ref") {
+		t.Fatalf("historical video reference = %#v", out[2])
+	}
+	if out[3].Type != llm.TypeText || !strings.Contains(out[3].Content, "read_attachment") || !strings.Contains(out[3].Content, "file-ref") {
+		t.Fatalf("historical file reference = %#v", out[3])
+	}
+	for _, msg := range out[1:4] {
+		if strings.Contains(msg.Content, "AUDIO") || strings.Contains(msg.Content, "VIDEO") || strings.Contains(msg.Content, "FILE") {
+			t.Fatalf("attachment bytes leaked into historical placeholder: %#v", msg)
+		}
+	}
+}
+
+func TestHasReadableAttachmentContextRequiresSupportedConversationUpload(t *testing.T) {
+	if !hasReadableAttachmentContext([]llm.ChatMessage{{
+		Type: llm.TypeFile, Name: "report.docx", UploadID: "document12345678",
+	}}, nil) {
+		t.Fatal("supported historical document should expose read_attachment")
+	}
+	if !hasReadableAttachmentContext(nil, []Attachment{{
+		Name: "notes.md", Kind: "text", UploadID: "document87654321",
+	}}) {
+		t.Fatal("supported current attachment should expose read_attachment")
+	}
+	if hasReadableAttachmentContext(nil, []Attachment{{
+		Name: "archive.zip", Kind: "file", UploadID: "document87654321",
+	}}) {
+		t.Fatal("unsupported binary should not expose read_attachment")
+	}
+	if hasReadableAttachmentContext(nil, []Attachment{{Name: "notes.md", Kind: "text"}}) {
+		t.Fatal("inline attachment without upload_id cannot be resolved by read_attachment")
 	}
 }
 

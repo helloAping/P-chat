@@ -22,7 +22,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -251,12 +254,9 @@ func (a *Agent) protocolFor(providerName string) string {
 // modelSupportsVision reports whether the active (provider, model)
 // pair accepts image_url inputs.
 //
-// Policy: **permissive by default**, with one exception. If the
-// user has explicitly marked the model as text-only via
-// `capabilities: { supports_vision: false }` in the config, we
-// return false so the agent drops the image and writes the
-// "this model does not support image input" marker instead of
-// round-tripping a request the API will reject.
+// Policy: an explicit input_modalities selection is authoritative,
+// including an empty selection. Legacy configurations without that field
+// remain permissive and can use the model-name heuristic.
 //
 // "No opinion" (capabilities: {} or capabilities absent) keeps
 // the old permissive behaviour: send the image and let the API
@@ -276,8 +276,14 @@ func (a *Agent) modelSupportsVision(providerName, modelName string) bool {
 			if m.Name == modelName {
 				// Explicit opt-in: capabilities.supports_vision = true.
 				// The user has confirmed this model handles images.
-				if m.Capabilities.SupportsVision {
+				if m.Capabilities.SupportsInput(config.MediaImage) {
 					return true
+				}
+				// The capability multi-select is authoritative when present,
+				// including an explicitly empty selection. This prevents a
+				// model name heuristic from overriding the user's text-only choice.
+				if m.Capabilities.InputModalities != nil {
+					return false
 				}
 				// "No opinion" (capabilities: {} or capabilities
 				// absent) keeps the permissive behaviour: ask the
@@ -337,7 +343,7 @@ func (a *Agent) modelExplicitlySupportsVision(providerName, modelName string) bo
 		}
 		for _, m := range p.Models {
 			if m.Name == modelName {
-				return m.Capabilities.SupportsVision
+				return m.Capabilities.SupportsInput(config.MediaImage)
 			}
 		}
 		return false
@@ -382,6 +388,32 @@ func filterImageRecognitionTools(tools []tool.Tool) []tool.Tool {
 	return out
 }
 
+func filterMediaRecognitionTools(enabled bool, tools []tool.Tool) []tool.Tool {
+	if enabled {
+		return tools
+	}
+	out := make([]tool.Tool, 0, len(tools))
+	for _, candidate := range tools {
+		if candidate.Name != "media_recognize" {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func filterAttachmentReadTools(enabled bool, tools []tool.Tool) []tool.Tool {
+	if enabled {
+		return tools
+	}
+	out := make([]tool.Tool, 0, len(tools))
+	for _, candidate := range tools {
+		if candidate.Name != "read_attachment" {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
 func filterAllowedTools(tools []tool.Tool, allow []string) []tool.Tool {
 	if len(allow) == 0 {
 		return tools
@@ -406,30 +438,255 @@ func filterAllowedTools(tools []tool.Tool, allow []string) []tool.Tool {
 }
 
 func (a *Agent) imageRecognitionAvailable() bool {
-	if a == nil || a.cfg == nil || a.llm == nil {
-		return false
-	}
-	vc := a.cfg.Vision
-	vc.Normalize()
-	if !vc.Enabled || strings.TrimSpace(vc.Provider) == "" || strings.TrimSpace(vc.Model) == "" {
-		return false
-	}
-	for _, p := range a.cfg.LLM.Providers {
-		if p.Name != vc.Provider {
-			continue
-		}
-		for _, m := range p.AllModels() {
-			if m.Name == vc.Model {
-				return true
-			}
-		}
-		return p.Model == vc.Model
-	}
-	return false
+	_, ok := a.mediaRecognitionRoute(config.MediaImage)
+	return ok
 }
 
 func (a *Agent) currentModelImageRecognitionAvailable(providerName, modelName string) bool {
 	return a != nil && a.store != nil && a.attach != nil && a.llm != nil && a.modelSupportsVision(providerName, modelName)
+}
+
+func (a *Agent) modelSupportsInput(providerName, modelName string, kind config.MediaKind) bool {
+	if kind == config.MediaImage {
+		return a.modelSupportsVision(providerName, modelName)
+	}
+	if a == nil || a.cfg == nil || a.protocolFor(providerName) != "openai" {
+		return false
+	}
+	for _, provider := range a.cfg.LLM.Providers {
+		if provider.Name != providerName {
+			continue
+		}
+		for _, model := range provider.Models {
+			if model.Name == modelName {
+				return model.Capabilities.SupportsInput(kind)
+			}
+		}
+	}
+	return false
+}
+
+func (a *Agent) mediaRecognitionRoute(kind config.MediaKind) (config.RecognitionRoute, bool) {
+	if a == nil || a.cfg == nil || a.llm == nil || !kind.IsValid() {
+		return config.RecognitionRoute{}, false
+	}
+	route, ok := a.cfg.Recognition.Route(kind)
+	if !ok && kind == config.MediaImage {
+		legacy := a.cfg.Vision
+		legacy.Normalize()
+		route = config.RecognitionRoute{
+			Enabled: legacy.Enabled, Provider: legacy.Provider, Model: legacy.Model,
+			TimeoutSeconds: legacy.TimeoutSeconds, MaxBytes: legacy.MaxImageBytes,
+		}
+		ok = route.Available()
+	}
+	if !ok {
+		return config.RecognitionRoute{}, false
+	}
+	if kind != config.MediaImage && a.protocolFor(route.Provider) != "openai" {
+		return config.RecognitionRoute{}, false
+	}
+	if !a.modelExplicitlySupportsInput(route.Provider, route.Model, kind) {
+		return config.RecognitionRoute{}, false
+	}
+	return route, true
+}
+
+func (a *Agent) modelExplicitlySupportsInput(providerName, modelName string, kind config.MediaKind) bool {
+	if a == nil || a.cfg == nil || !kind.IsValid() {
+		return false
+	}
+	for _, provider := range a.cfg.LLM.Providers {
+		if provider.Name != providerName {
+			continue
+		}
+		for _, model := range provider.Models {
+			if model.Name == modelName {
+				return model.Capabilities.SupportsInput(kind)
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func (a *Agent) effectiveRecognitionCapabilities(requested []config.MediaKind) []config.MediaKind {
+	result := make([]config.MediaKind, 0, len(requested))
+	seen := make(map[config.MediaKind]struct{}, len(requested))
+	for _, kind := range requested {
+		if _, exists := seen[kind]; exists {
+			continue
+		}
+		if _, ok := a.mediaRecognitionRoute(kind); !ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		result = append(result, kind)
+	}
+	return result
+}
+
+func (a *Agent) resolveMediaForRecognition(ctx context.Context, sessionID, uploadID string, allowed []config.MediaKind) (tool.MediaRecognitionAsset, error) {
+	if a == nil || a.store == nil || a.attach == nil {
+		return tool.MediaRecognitionAsset{}, fmt.Errorf("media storage is not available")
+	}
+	if !containsMediaKind(allowed, config.MediaImage) && !containsMediaKind(allowed, config.MediaVideo) && !containsMediaKind(allowed, config.MediaAudio) {
+		return tool.MediaRecognitionAsset{}, fmt.Errorf("no media recognition capability is enabled")
+	}
+	if err := a.validateConversationUploadReference(sessionID, uploadID); err != nil {
+		return tool.MediaRecognitionAsset{}, err
+	}
+	path, size := a.attach.Resolve(Attachment{ID: uploadID})
+	if path == "" {
+		return tool.MediaRecognitionAsset{}, fmt.Errorf("upload %q not found", uploadID)
+	}
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+	kind := mediaKindForMIME(mimeType)
+	if mimeType == "" {
+		file, err := os.Open(path)
+		if err != nil {
+			return tool.MediaRecognitionAsset{}, err
+		}
+		header := make([]byte, 512)
+		n, readErr := file.Read(header)
+		closeErr := file.Close()
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return tool.MediaRecognitionAsset{}, readErr
+		}
+		if closeErr != nil {
+			return tool.MediaRecognitionAsset{}, closeErr
+		}
+		mimeType = http.DetectContentType(header[:n])
+		kind = mediaKindForMIME(mimeType)
+	}
+	if !kind.IsValid() {
+		return tool.MediaRecognitionAsset{}, fmt.Errorf("unsupported media type %q", mimeType)
+	}
+	if !containsMediaKind(allowed, kind) {
+		return tool.MediaRecognitionAsset{}, fmt.Errorf("%s recognition is not enabled for this session", kind)
+	}
+	route, ok := a.mediaRecognitionRoute(kind)
+	if !ok {
+		return tool.MediaRecognitionAsset{}, fmt.Errorf("%s recognition route is unavailable", kind)
+	}
+	if size > route.MaxBytes {
+		return tool.MediaRecognitionAsset{}, fmt.Errorf("media is too large: %d bytes (max %d)", size, route.MaxBytes)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return tool.MediaRecognitionAsset{}, err
+	}
+	name := filepath.Base(path)
+	if prefix := uploadID + "-"; strings.HasPrefix(name, prefix) {
+		name = strings.TrimPrefix(name, prefix)
+	}
+	return tool.MediaRecognitionAsset{UploadID: uploadID, Name: name, Kind: string(kind), MIME: mimeType, Data: data}, nil
+}
+
+func (a *Agent) validateConversationUploadReference(sessionID, uploadID string) error {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(uploadID) == "" {
+		return fmt.Errorf("session_id and upload_id are required")
+	}
+	// New attachment rows are buffered before the first LLM call. Flush here
+	// so a tool invoked in that same round can validate the freshly persisted
+	// upl:// reference instead of seeing a false "not referenced" miss.
+	if err := a.store.Flush(); err != nil {
+		return fmt.Errorf("flush attachment references: %w", err)
+	}
+	for _, ref := range a.store.UploadRefsForConversation(sessionID) {
+		if ref == uploadID {
+			return nil
+		}
+	}
+	return fmt.Errorf("upload_id %q is not referenced by this conversation", uploadID)
+}
+
+func (a *Agent) resolveAttachmentForRead(ctx context.Context, sessionID, uploadID string) (tool.AttachmentReadAsset, error) {
+	if a == nil || a.store == nil || a.attach == nil {
+		return tool.AttachmentReadAsset{}, fmt.Errorf("attachment storage is not available")
+	}
+	if err := a.validateConversationUploadReference(sessionID, uploadID); err != nil {
+		return tool.AttachmentReadAsset{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return tool.AttachmentReadAsset{}, err
+	}
+	path, size := a.attach.Resolve(Attachment{ID: uploadID})
+	if path == "" {
+		return tool.AttachmentReadAsset{}, fmt.Errorf("upload %q not found", uploadID)
+	}
+	name := filepath.Base(path)
+	if prefix := uploadID + "-"; strings.HasPrefix(name, prefix) {
+		name = strings.TrimPrefix(name, prefix)
+	}
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
+	if mimeType == "" {
+		file, err := os.Open(path)
+		if err != nil {
+			return tool.AttachmentReadAsset{}, err
+		}
+		header := make([]byte, 512)
+		n, readErr := file.Read(header)
+		closeErr := file.Close()
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return tool.AttachmentReadAsset{}, readErr
+		}
+		if closeErr != nil {
+			return tool.AttachmentReadAsset{}, closeErr
+		}
+		mimeType = http.DetectContentType(header[:n])
+	}
+	return tool.AttachmentReadAsset{UploadID: uploadID, Name: name, MIME: mimeType, Path: path, Size: size}, nil
+}
+
+func mediaKindForMIME(mimeType string) config.MediaKind {
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		return config.MediaImage
+	case strings.HasPrefix(mimeType, "video/"):
+		return config.MediaVideo
+	case strings.HasPrefix(mimeType, "audio/"):
+		return config.MediaAudio
+	default:
+		return ""
+	}
+}
+
+func containsMediaKind(kinds []config.MediaKind, target config.MediaKind) bool {
+	for _, kind := range kinds {
+		if kind == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) recognizeMediaWithConfiguredModel(ctx context.Context, req tool.MediaRecognitionRequest) (string, error) {
+	kind := config.MediaKind(req.Asset.Kind)
+	route, ok := a.mediaRecognitionRoute(kind)
+	if !ok {
+		return "", fmt.Errorf("%s recognition route is unavailable", kind)
+	}
+	assets := req.Assets
+	if len(assets) == 0 {
+		assets = []tool.MediaRecognitionAsset{req.Asset}
+	}
+	messages := []llm.ChatMessage{
+		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "You are a media recognition tool for P-Chat. Return only factual observations and extracted content. Match the user's language when possible."},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Question},
+	}
+	for _, asset := range assets {
+		if config.MediaKind(asset.Kind) != kind {
+			return "", fmt.Errorf("mixed media types are not supported in one recognition call")
+		}
+		messages = append(messages, llm.ChatMessage{
+			Role: llm.RoleUser, Type: asset.Kind, Content: base64.StdEncoding.EncodeToString(asset.Data),
+			Name: asset.Name, MimeType: asset.MIME,
+		})
+	}
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(route.TimeoutSeconds)*time.Second)
+	defer cancel()
+	return a.llm.ChatCM(callCtx, route.Provider, route.Model, messages, llm.ChatOptions{})
 }
 
 func (a *Agent) imageRecognitionGatedTools(enabled bool, tools []tool.Tool) []tool.Tool {
@@ -442,7 +699,7 @@ func (a *Agent) imageRecognitionGatedTools(enabled bool, tools []tool.Tool) []to
 func dropDisplayOnlyMediaMessages(msgs []llm.ChatMessage) []llm.ChatMessage {
 	out := msgs[:0]
 	for _, m := range msgs {
-		if m.SubmitToLLM == 0 && (m.Type == llm.TypeImage || m.Type == llm.TypeAudio || m.Type == llm.TypeVideo) {
+		if m.SubmitToLLM == 0 && (m.Type == llm.TypeImage || m.Type == llm.TypeAudio || m.Type == llm.TypeVideo || m.Type == llm.TypeFile) {
 			continue
 		}
 		out = append(out, m)
@@ -450,35 +707,87 @@ func dropDisplayOnlyMediaMessages(msgs []llm.ChatMessage) []llm.ChatMessage {
 	return out
 }
 
-func replaceHistoricalImagesWithPlaceholders(msgs []llm.ChatMessage, currentTurnStart int, imageToolAvailable bool) []llm.ChatMessage {
+func replaceAttachmentReferences(msgs []llm.ChatMessage, currentTurnStart int, imageToolAvailable, attachmentReadAvailable bool, mediaCapabilities []config.MediaKind) []llm.ChatMessage {
 	currentTurnStart = clampHistoryMessageCount(currentTurnStart, len(msgs))
 	out := make([]llm.ChatMessage, 0, len(msgs))
 	for i, m := range msgs {
-		if i >= currentTurnStart || m.Type != llm.TypeImage {
+		kind := config.MediaKind("")
+		switch m.Type {
+		case llm.TypeImage:
+			kind = config.MediaImage
+		case llm.TypeAudio:
+			kind = config.MediaAudio
+		case llm.TypeVideo:
+			kind = config.MediaVideo
+		case llm.TypeFile:
+			// File attachments always become a bounded tool reference. They
+			// are never valid native LLM payloads in the current adapters.
+		default:
 			out = append(out, m)
 			continue
 		}
+
+		historical := i < currentTurnStart
+		if !historical {
+			if m.Type == llm.TypeImage || ((m.Type == llm.TypeAudio || m.Type == llm.TypeVideo) && m.SubmitToLLM != 0) {
+				out = append(out, m)
+				continue
+			}
+			if hasFollowingAttachmentToolHint(msgs, i, m.UploadID) {
+				out = append(out, m)
+				continue
+			}
+		}
+
 		name := strings.TrimSpace(m.Name)
 		if name == "" {
-			name = "未命名图片"
+			name = "unnamed attachment"
 		}
-		mime := strings.TrimSpace(m.MimeType)
-		if mime == "" {
-			mime = "未知类型"
+		mimeType := strings.TrimSpace(m.MimeType)
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
 		}
-		content := fmt.Sprintf("[历史图片：%s，MIME=%s。该图片未随本次请求重新发送，当前模型无法直接查看图片内容。若用户要求查看、分析或回看这张图片，请明确说明需要用户重新上传图片后才能继续。]", name, mime)
-		if imageToolAvailable && strings.TrimSpace(m.UploadID) != "" {
-			content = fmt.Sprintf("[历史图片：%s，upload_id=%s，MIME=%s。该图片已保存在当前会话中，但未随本次请求直接发送，当前模型不能直接查看图片内容。若用户需要继续查看、纠正、比较或分析这张图片，请调用 image_recognize 工具读取该 upload_id；不要声称已经直接看到了图片。]", name, strings.TrimSpace(m.UploadID), mime)
+		uploadID := strings.TrimSpace(m.UploadID)
+		toolName := ""
+		switch m.Type {
+		case llm.TypeImage:
+			if imageToolAvailable {
+				toolName = "image_recognize"
+			} else if containsMediaKind(mediaCapabilities, config.MediaImage) {
+				toolName = "media_recognize"
+			}
+		case llm.TypeAudio, llm.TypeVideo:
+			if containsMediaKind(mediaCapabilities, kind) {
+				toolName = "media_recognize"
+			}
+		case llm.TypeFile:
+			if attachmentReadAvailable && tool.SupportsAttachmentRead(name, mimeType) {
+				toolName = "read_attachment"
+			}
 		}
-		out = append(out, llm.ChatMessage{
-			Role:        llm.RoleSystem,
-			Type:        llm.TypeText,
-			Content:     content,
-			MsgType:     llm.MsgTypeText,
-			SubmitToLLM: 1,
-		})
+
+		content := fmt.Sprintf("[Attachment %s (%s) is stored in this conversation but cannot be inspected by the active model. 请让用户重新上传受支持的格式，或先启用对应能力；在此之前不要声称已经读取内容。]", name, mimeType)
+		if uploadID == "" {
+			content = fmt.Sprintf("[Attachment %s (%s) has no upload_id. 请让用户重新上传后再尝试读取内容。]", name, mimeType)
+		} else if toolName != "" {
+			content = fmt.Sprintf("[Attachment reference: name=%q, upload_id=%q, MIME=%s. The attachment bytes are not included in this request. Call %s with this upload_id when its contents are needed; do not claim to have read it before the tool succeeds.]", name, uploadID, mimeType, toolName)
+		}
+		out = append(out, llm.ChatMessage{Role: llm.RoleSystem, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1})
 	}
 	return out
+}
+
+func hasFollowingAttachmentToolHint(msgs []llm.ChatMessage, index int, uploadID string) bool {
+	if index+1 >= len(msgs) || strings.TrimSpace(uploadID) == "" {
+		return false
+	}
+	next := msgs[index+1]
+	return next.Role == llm.RoleSystem && strings.Contains(next.Content, uploadID) &&
+		(strings.Contains(next.Content, "read_attachment") || strings.Contains(next.Content, "media_recognize"))
+}
+
+func replaceHistoricalImagesWithPlaceholders(msgs []llm.ChatMessage, currentTurnStart int, imageToolAvailable bool) []llm.ChatMessage {
+	return replaceAttachmentReferences(msgs, currentTurnStart, imageToolAvailable, false, nil)
 }
 
 func replaceImagesWithRecognitionRefs(msgs []llm.ChatMessage) []llm.ChatMessage {
@@ -517,15 +826,8 @@ func (a *Agent) resolveImageForRecognition(ctx context.Context, sessionID, uploa
 	if a == nil || a.store == nil || a.attach == nil {
 		return tool.ImageRecognitionImage{}, fmt.Errorf("image storage is not available")
 	}
-	allowed := false
-	for _, ref := range a.store.UploadRefsForConversation(sessionID) {
-		if ref == uploadID {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return tool.ImageRecognitionImage{}, fmt.Errorf("upload_id %q is not referenced by this conversation", uploadID)
+	if err := a.validateConversationUploadReference(sessionID, uploadID); err != nil {
+		return tool.ImageRecognitionImage{}, err
 	}
 	path, size := a.attach.Resolve(Attachment{ID: uploadID})
 	if path == "" {
@@ -723,6 +1025,8 @@ type ChatRequest struct {
 	// and injected as text context; follow-up turns can still expose
 	// image_recognize for historical upload_ids.
 	UseImageRecognition bool `json:"use_image_recognition,omitempty"`
+	// RecognitionCapabilities enables independently configured media tools.
+	RecognitionCapabilities []config.MediaKind `json:"enabled_recognition_capabilities,omitempty"`
 	// SubagentModel is the per-session default child model override.
 	// Task-call and specialized-agent model overrides still take priority.
 	SubagentModel SubagentModelPreference `json:"subagent_model,omitempty"`
@@ -1559,6 +1863,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		availableTools := a.tools.ListForProject(req.ProjectRoot)
 		availableTools = filterAllowedTools(availableTools, req.AllowedTools)
 		useImageRecognition := req.UseImageRecognition && a.imageRecognitionAvailable()
+		recognitionCapabilities := a.effectiveRecognitionCapabilities(req.RecognitionCapabilities)
+		if useImageRecognition && !containsMediaKind(recognitionCapabilities, config.MediaImage) {
+			recognitionCapabilities = append(recognitionCapabilities, config.MediaImage)
+		}
+		mediaRecognitionToolAvailable := len(recognitionCapabilities) > 0 && a.store != nil && a.attach != nil
+		attachmentReadAvailable := a.store != nil && a.attach != nil && hasReadableAttachmentContext(req.Messages, req.Attachments)
 		requestHistoryCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
 		historyHasImageRefs := hasImageUploadRefs(req.Messages[:requestHistoryCount])
 		currentTurnImageRecognition := useImageRecognition && ((a.attach != nil && hasImageAttachments(req.Attachments)) || hasImageMessages(req.Messages[requestHistoryCount:]))
@@ -1592,6 +1902,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// injected as bounded context. Keep image_recognize available only for
 		// follow-up turns that need to revisit historical upload_ids.
 		availableTools = a.imageRecognitionGatedTools(imageRecognitionToolAvailable, availableTools)
+		availableTools = filterMediaRecognitionTools(mediaRecognitionToolAvailable, availableTools)
+		availableTools = filterAttachmentReadTools(attachmentReadAvailable, availableTools)
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -1718,8 +2030,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// ChatMessage entries (text msg + image/file msgs).
 		if len(req.Attachments) > 0 && a.attach != nil {
 			protocol := a.protocolFor(req.Provider)
-			vision := func() bool { return a.modelSupportsVision(req.Provider, req.Model) }
-			msgs = ExpandAttachmentsCM(protocol, msgs, req.Attachments, a.attach, vision, useImageRecognition)
+			modelCapable := func(kind config.MediaKind) bool { return a.modelSupportsInput(req.Provider, req.Model, kind) }
+			msgs = ExpandAttachmentsForCapabilitiesCM(protocol, msgs, req.Attachments, a.attach, modelCapable, recognitionCapabilities)
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "attachments", Message: fmt.Sprintf("展开 %d 个附件", len(req.Attachments))})
 		}
 
@@ -1785,7 +2097,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if currentTurnImageRecognition {
 			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, latestUserText(newMessages), ch, nextSeq)
 		}
-		msgs = replaceHistoricalImagesWithPlaceholders(msgs, persistStart, imageRecognitionToolAvailable)
+		msgs = replaceAttachmentReferences(msgs, persistStart, imageRecognitionToolAvailable, attachmentReadAvailable, recognitionCapabilities)
 		msgs = dropDisplayOnlyMediaMessages(msgs)
 		if useImageRecognition {
 			if currentTurnImageRecognition {
@@ -2686,6 +2998,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						recognizer = a.recognizeImageWithCurrentModel(req.Provider, req.Model)
 					}
 					tctx = tool.WithImageRecognizer(tctx, recognizer)
+				}
+				if mediaRecognitionToolAvailable {
+					allowedMedia := append([]config.MediaKind(nil), recognitionCapabilities...)
+					tctx = tool.WithMediaResolver(tctx, func(ctx context.Context, sessionID, uploadID string) (tool.MediaRecognitionAsset, error) {
+						return a.resolveMediaForRecognition(ctx, sessionID, uploadID, allowedMedia)
+					})
+					tctx = tool.WithMediaRecognizer(tctx, a.recognizeMediaWithConfiguredModel)
+				}
+				if attachmentReadAvailable {
+					tctx = tool.WithAttachmentReadResolver(tctx, a.resolveAttachmentForRead)
 				}
 				if a.store != nil {
 					// Persist todo writes through the request context so each

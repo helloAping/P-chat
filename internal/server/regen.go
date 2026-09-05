@@ -135,6 +135,7 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		HistoryMessageCount:         historyMessageCount,
 		CurrentTurnAlreadyPersisted: true,
 		UseImageRecognition:         h.sessionUseImageRecognition(id),
+		RecognitionCapabilities:     h.sessionRecognitionCapabilities(id),
 		SubagentModel:               h.sessionSubAgentModelPreference(id),
 		ReasoningEffort:             meta.ReasoningEffort,
 		CompressedSummary:           compSummary,

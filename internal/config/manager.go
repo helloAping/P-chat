@@ -493,7 +493,7 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 		// tool-use, etc.). If a future caller needs to clear
 		// Capabilities, they can use clearAll and a separate
 		// reset endpoint.
-		if patch.Capabilities != (Capabilities{}) {
+		if !patch.Capabilities.IsZero() {
 			m.Capabilities = patch.Capabilities
 		}
 		cfg.LLM.Providers[i] = p
@@ -522,10 +522,37 @@ const (
 // can read at runtime. They're informational; the provider's own
 // /models endpoint is the source of truth where available.
 type Capabilities struct {
-	ThinkingEffort ThinkingEffort `json:"thinking_effort,omitempty"`
-	ContextWindow  int            `json:"context_window,omitempty"`
-	SupportsVision bool           `json:"supports_vision,omitempty"`
-	SupportsAudio  bool           `json:"supports_audio,omitempty"`
+	ThinkingEffort  ThinkingEffort `json:"thinking_effort,omitempty"`
+	ContextWindow   int            `json:"context_window,omitempty"`
+	SupportsVision  bool           `json:"supports_vision,omitempty"`
+	SupportsAudio   bool           `json:"supports_audio,omitempty"`
+	InputModalities *[]MediaKind   `json:"input_modalities,omitempty"`
+}
+
+// SupportsInput reports whether a model accepts the requested media kind.
+// Legacy vision/audio flags remain readable during the V9 transition.
+func (c Capabilities) SupportsInput(kind MediaKind) bool {
+	if c.InputModalities != nil {
+		for _, configured := range *c.InputModalities {
+			if configured == kind {
+				return true
+			}
+		}
+		return false
+	}
+	switch kind {
+	case MediaImage:
+		return c.SupportsVision
+	case MediaAudio:
+		return c.SupportsAudio
+	default:
+		return false
+	}
+}
+
+// IsZero reports whether no capability hint is configured.
+func (c Capabilities) IsZero() bool {
+	return c.ThinkingEffort == "" && c.ContextWindow == 0 && !c.SupportsVision && !c.SupportsAudio && c.InputModalities == nil
 }
 
 // SetModelCapabilities replaces the Capabilities block for a single

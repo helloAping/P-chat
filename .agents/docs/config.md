@@ -33,7 +33,8 @@ type Config struct {
     Sandbox SandboxConfig // 命令/文件写入保护模式
     SubAgent SubAgentConfig // 子代理超时/工具过滤
     WorkMode WorkModeConfig // 默认工作侧重点：coding / daily
-    Vision VisionRecognitionConfig // 外接图片识别模型设置
+    Recognition RecognitionConfig // 图片/视频/音频外接识别路由
+    Vision VisionRecognitionConfig // 旧版图片识别配置（兼容读取）
 }
 ```
 
@@ -41,7 +42,7 @@ LLMConfig 核心字段：
 - `Default` — 默认 provider 名称
 - `Providers[]` — 每个 provider 的端点、API key、模型列表
 - `Protocol` — "openai" | "anthropic"
-- `Models[]` — 每个模型的能力标记（vision, thinking）
+- `Models[]` — 每个模型的能力标记；`capabilities.input_modalities` 可显式配置 `image`、`video`、`audio`，旧版 `supports_vision` / `supports_audio` 仅作兼容回退
 
 ### 3. 项目级配置合并
 
@@ -65,17 +66,18 @@ LLMConfig 核心字段：
 
 全局默认通过 `/api/v1/config` 读写；单会话覆盖值存放在 `conversations.metadata.work_mode`。
 
-### 6. VisionRecognitionConfig
+### 6. RecognitionConfig
 
-`vision_recognition` 是全局系统配置，用于给不支持多模态的主对话模型外接一个多模态模型：
-- `enabled` — 是否允许会话启用图片识别工具。
-- `provider` / `model` — 使用已配置 LLM provider 中的模型。
+`recognition.routes` 为 `image`、`video`、`audio` 分别配置外接识别路由。每条路由包含：
+
+- `enabled` — 是否启用该能力。
+- `provider` / `model` — 使用已配置 LLM provider 中的模型；任一缺失时该能力不可用。
 - `timeout_seconds` — 单次识别超时，默认 60 秒。
-- `max_image_bytes` — 单张图片大小上限，默认 10 MiB。
+- `max_bytes` — 单个媒体文件大小上限，默认 10 MiB。
 
-单会话是否优先使用该能力存放在 `conversations.metadata.use_image_recognition`。当系统配置和会话开关都开启时，当前轮图片先由配置模型识别，主模型只接收识别文本。
+单会话选择保存在 `conversations.metadata.enabled_recognition_capabilities`，它是媒体类型数组。只有系统路由完整、协议受支持、目标模型明确声明对应输入能力且会话明确选中的能力，才会暴露给 Agent。模型的 `input_modalities: []` 是明确的“无媒体能力”，不会再被模型名启发式判断覆盖；字段完全缺失时，图片仍保留旧版兼容判断。图片兼容旧版 `vision_recognition`、`use_image_recognition` 与 `supports_vision`；V9 升级步骤把旧开关迁移为 `image` 选项。音频和视频外接识别当前要求 OpenAI 兼容协议。
 
-`image_recognize` 的历史图片回看能力不只依赖该开关：如果会话没有开启专门识图，但历史上下文里有带 `upload_id` 的图片引用，并且当前对话模型支持视觉输入，Agent 也可以暴露 `image_recognize`，由工具 fallback 到当前 provider/model 做一次非流式识别。没有任何可用视觉能力时，历史图片占位会提示用户重新上传图片或切换/配置视觉模型。
+`image_recognize` 继续承担旧版图片回看和当前视觉模型 fallback；统一的 `media_recognize` 根据上传引用解析图片、音频或视频，并严格限制为本会话已选择且系统已配置的媒体类型。
 
 ### 7. SubAgentConfig
 

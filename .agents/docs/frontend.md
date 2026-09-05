@@ -19,6 +19,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `api/client.ts` | HTTP+SSE 客户端、类型定义 | `StreamEvent`, `MessagePart`, `streamMessages()`, `sendMessage()` |
 | `stores/chat.ts` | Pinia 状态管理（会话、消息、流） | `appendStreamEvent()`, `useChatStore()` |
 | `utils/markdownCache.ts` | 共享 markdown 渲染 LRU 缓存（MessageBubble / SubAgentCard 共用） | `renderMarkdown()` |
+| `utils/mediaPreview.ts` | data URL 转短生命周期 blob URL，统一保留正确媒体 MIME | `dataURLToBlobURL()` |
 | `main.ts` | 应用入口（Naive UI + Router） | `createApp()` |
 | `App.vue` | 根布局（侧边栏 + 聊天区域） | |
 | `components/ChatWindow.vue` | 聊天窗口（消息列表 + 输入区） | |
@@ -107,6 +108,8 @@ if (ev.sub_agent && ev.sub_agent_task) {
 - `currentID` — 当前活动会话 ID
 - `sessionMessages[id]` — 消息列表
 - `sessionMeta[id].style` / `sessionMeta[id].workMode` — 单会话说话风格与工作侧重点；`style=off` 表示关闭风格 prompt 和风格记忆注入
+- `sessionMeta[id].enabled_recognition_capabilities` — 会话启用的媒体能力工具（`image` / `video` / `audio`）；新会话只继承仍有可用系统路由的选项
+- `recognitionCapabilitiesAvailable` — `/api/v1/config` 返回的可用媒体识别路由缓存，用于过滤会话多选项
 - `globalWorkMode` — `/api/v1/config.work_mode.default` 的前端缓存，新建/旧会话无覆盖时回落使用
 - `streaming[id]` — 是否正在流式传输
 - `sessionWorking[id]` — 是否忙碌（TodoPanel 控制）
@@ -157,6 +160,31 @@ LLM 提供商页复用 `api.testProvider(provider, model?)`：顶部「测试默
 模式，只显示当前值和右侧箭头；展开后再列出全部选项。这样风格或知识库数量
 增加时不会撑高设置面板。知识库没有启用项时，选择器仍保留“不使用/全部”，并
 在下方显示配置引导。
+
+风格在创建新会话时继承当前活动会话；没有活动会话时默认为 `off`。能力工具使用多选下拉，仅展示系统设置中已启用、供应商与模型完整且协议受支持的图片/视频/音频路由。
+
+模型编辑器的上下文窗口提供 32K、64K、128K、200K、256K、512K、1M、2M 预设，同时保留自定义 token 输入；原“支持视觉输入”开关改为图片/视频/音频多选能力配置。系统设置“媒体识别”为三条独立路由，每条可单独关闭或指定 provider/model；最大文件限制可用 B、KB、MB、GB 编辑，前端换算后仍以 `max_bytes` 整数字节提交。
+
+### 8.3 附件预览与发送时序
+
+`addAttachment()` 在选择文件时立即插入本地预览占位，并用同一个 `_ready`
+任务完成文件读取和 `/uploads` 上传。普通消息发送时，`InputArea.send()` 先用独立的
+本地 blob URL 插入用户气泡，再等待 `_ready`，随后复用已有 `upload_id` 组装请求；
+发送阶段不得再次调用上传接口。图片、视频、音频、PDF 和 Office 文档都携带同一
+`upload_id` 引用；只有上传失败时才回退到内联数据。非媒体附件不再把 data URL
+误放进 `text` 字段，服务端会把引用持久化并按需交给 `read_attachment`。
+
+所有 data URL 预览统一通过 `utils/mediaPreview.ts` 转换；Blob MIME 只取 data URL
+元数据中第一个分号前的媒体类型，不能把 `;base64` 当作 MIME 的一部分。会话换页、
+消息淘汰或重新加载时必须释放消息附件持有的 blob URL。
+
+消息气泡中的附件下载/复制按钮只在附件悬浮或键盘聚焦时显示，并使用统一的浮层、
+边框、阴影与焦点样式。消息级操作保留复制和重答为直接按钮，创建分支、撤回等次级
+操作合并到三点菜单，菜单复用全局 `app-action-menu`。
+
+用户气泡的出现不依赖 LLM API。启用媒体能力后，服务端仍会先执行对应能力模型的
+非流式识别，再启动主模型 SSE；前端会实时显示识别 phase，但主回复文本要到主模型
+产生首个 delta 后才出现。这是服务端串行预处理，不是前端等待完整回复后再播放。
 
 ### 9. Round 2 增强 (2026-07-15)
 

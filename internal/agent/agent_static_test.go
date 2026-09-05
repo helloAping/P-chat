@@ -317,6 +317,7 @@ func TestVisionHeuristic(t *testing.T) {
 // deepseek-v4-flash and other "modern" multimodal models the
 // user adds via the model editor.
 func TestModelSupportsVision_Config(t *testing.T) {
+	noInputModalities := []config.MediaKind{}
 	cfg := &config.Config{
 		LLM: config.LLMConfig{
 			Providers: []config.ProviderConfig{
@@ -337,6 +338,7 @@ func TestModelSupportsVision_Config(t *testing.T) {
 						// heuristic does NOT recognise as vision
 						// (e.g. an unknown local ollama name).
 						{Name: "llama3-text-only", Capabilities: config.Capabilities{}},
+						{Name: "gpt-4o-explicit-text", Capabilities: config.Capabilities{InputModalities: &noInputModalities}},
 					},
 				},
 			},
@@ -361,6 +363,9 @@ func TestModelSupportsVision_Config(t *testing.T) {
 		// ("llama3-text-only" is a synthetic name that the
 		// heuristic will not recognise as vision-capable.)
 		{"ollama", "llama3-text-only", false},
+		// An explicit empty capability selection is authoritative even when
+		// the model name would otherwise match the vision heuristic.
+		{"ollama", "gpt-4o-explicit-text", false},
 		// Empty capabilities + heuristic textOnly match → false.
 		{"ollama", "deepseek-v3", false},
 		// Provider found, model not in the configured list →
@@ -378,6 +383,32 @@ func TestModelSupportsVision_Config(t *testing.T) {
 		if got != c.want {
 			t.Errorf("modelSupportsVision(%q, %q) = %v, want %v", c.provider, c.model, got, c.want)
 		}
+	}
+}
+
+func TestMediaRecognitionRouteRequiresMatchingModelCapability(t *testing.T) {
+	imageOnly := []config.MediaKind{config.MediaImage}
+	cfg := &config.Config{
+		LLM: config.LLMConfig{Default: "media", Providers: []config.ProviderConfig{{
+			Name: "media", Protocol: "openai", BaseURL: "http://127.0.0.1:1/v1", APIKey: "test",
+			Models: []config.ModelConfig{{Name: "image-only", Default: true, Capabilities: config.Capabilities{InputModalities: &imageOnly}}},
+		}}},
+		Recognition: config.RecognitionConfig{Routes: map[config.MediaKind]config.RecognitionRoute{
+			config.MediaImage: {Enabled: true, Provider: "media", Model: "image-only"},
+			config.MediaAudio: {Enabled: true, Provider: "media", Model: "image-only"},
+		}},
+	}
+	client, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{cfg: cfg, llm: client}
+
+	if _, ok := a.mediaRecognitionRoute(config.MediaImage); !ok {
+		t.Fatal("image route should be available for an image-capable model")
+	}
+	if _, ok := a.mediaRecognitionRoute(config.MediaAudio); ok {
+		t.Fatal("audio route must not be available for an image-only model")
 	}
 }
 

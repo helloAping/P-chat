@@ -32,6 +32,24 @@ test('input delegates chat streaming to the conversation turn seam', () => {
   assert.match(source, /stopConversationTurn\(state\.currentID\)/)
 })
 
+test('input shows the local user bubble before attachment preparation and reuses uploaded files', () => {
+  const source = readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
+  const sendStart = source.indexOf('async function send()')
+  const sendEnd = source.indexOf('\nfunction stop()', sendStart)
+  const sendSource = source.slice(sendStart, sendEnd)
+
+  const appendIndex = sendSource.indexOf('state.sessionMessages[id].push({')
+  const prepareIndex = sendSource.indexOf('await waitForPendingAttachments(')
+  assert.ok(appendIndex >= 0, 'send should append the local user message')
+  assert.ok(prepareIndex >= 0, 'send should await the existing attachment preparation')
+  assert.ok(appendIndex < prepareIndex, 'the user bubble should render before attachment preparation finishes')
+  assert.doesNotMatch(sendSource, /await api\.uploadFile\(/, 'send must not upload a selected file a second time')
+  assert.match(source, /upload_id: a\.id \|\| undefined/, 'media should reuse the upload id created during selection')
+  assert.match(source, /type: 'text',[\s\S]*?upload_id: a\.id \|\| undefined/, 'documents should reuse the upload id created during selection')
+  assert.match(source, /data: a\.id \? undefined : data/, 'documents should only inline bytes when upload failed')
+  assert.match(source, /\.docx,\.docm,\.pptx,\.pptm,\.xlsx,\.xlsm/, 'the file picker should expose supported Office attachments')
+})
+
 test('conversation turn drains queued turns after a completed stream', () => {
   const source = readTurnSource()
 

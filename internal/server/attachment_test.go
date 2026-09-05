@@ -91,6 +91,37 @@ func TestBuildMessageResponse_UploadRef(t *testing.T) {
 	}
 }
 
+func TestBuildMessageResponse_FileUploadRef(t *testing.T) {
+	id := "abcd1234567890ab"
+	resp := buildMessageResponse(llm.ChatMessage{
+		Role: llm.RoleUser, Type: llm.TypeFile, Content: "upl://" + id,
+		Name: "report.docx", MimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", SubmitToLLM: 0,
+	}, nil, nil, 0, 1, 1, "", false)
+	if resp == nil || len(resp.Attachments) != 1 {
+		t.Fatalf("response = %#v, want one file attachment", resp)
+	}
+	att := resp.Attachments[0]
+	if att.Type != "text" || att.Kind != "file" || att.URL != "/api/v1/uploads/"+id || att.Name != "report.docx" {
+		t.Fatalf("attachment = %#v", att)
+	}
+	if resp.Content != "" {
+		t.Fatalf("content = %q, want hidden upl reference", resp.Content)
+	}
+}
+
+func TestBuildLLMMessagesKeepsAllUploadReferences(t *testing.T) {
+	refs := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeImage, UploadID: "image-ref", SubmitToLLM: 0},
+		{Role: llm.RoleUser, Type: llm.TypeAudio, UploadID: "audio-ref", SubmitToLLM: 0},
+		{Role: llm.RoleUser, Type: llm.TypeVideo, UploadID: "video-ref", SubmitToLLM: 0},
+		{Role: llm.RoleUser, Type: llm.TypeFile, UploadID: "file-ref", SubmitToLLM: 0},
+	}
+	out := buildLLMMessages(refs)
+	if len(out) != len(refs) {
+		t.Fatalf("len(out) = %d, want %d attachment references", len(out), len(refs))
+	}
+}
+
 // TestResolveHistoryUploads_RehydratesBase64 verifies the LLM
 // context path: upl:// rows are re-read from disk into base64 so
 // the model sees the image, and a missing file degrades to a text

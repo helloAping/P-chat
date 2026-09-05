@@ -39,6 +39,15 @@ import WebSearchSettings from './WebSearchSettings.vue'
 import IMSettings from './IMSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
+import {
+  byteSizeInputMinimum,
+  byteSizeInputStep,
+  byteSizeUnitOptions,
+  bytesToUnitValue,
+  preferredByteSizeUnit,
+  unitValueToBytes,
+  type ByteSizeUnit,
+} from '../utils/byteSize'
 
 const message = useMessage()
 
@@ -250,7 +259,30 @@ const editModelName = ref('')
 const editModelDisplay = ref('')
 const editModelCtx = ref<number | null>(null)
 const editModelOut = ref<number | null>(null)
-const editModelVision = ref(false)
+const editModelCapabilities = ref<api.MediaKind[]>([])
+const contextWindowOptions = [
+  { label: '32K', value: 32_000 },
+  { label: '64K', value: 64_000 },
+  { label: '128K', value: 128_000 },
+  { label: '200K', value: 200_000 },
+  { label: '256K', value: 256_000 },
+  { label: '512K', value: 512_000 },
+  { label: '1M', value: 1_000_000 },
+  { label: '2M', value: 2_000_000 },
+]
+const modelCapabilityOptions: Array<{ label: string; value: api.MediaKind }> = [
+  { label: '图片识别', value: 'image' },
+  { label: '视频识别', value: 'video' },
+  { label: '音频识别', value: 'audio' },
+]
+
+function modelSupportsCapability(model: api.ModelInfo, capability: api.MediaKind): boolean {
+  const configured = model.capabilities?.input_modalities
+  if (configured !== undefined) return configured.includes(capability)
+  if (capability === 'image') return !!model.capabilities?.supports_vision
+  if (capability === 'audio') return !!model.capabilities?.supports_audio
+  return false
+}
 
 // Upstream models
 const showUpstreamModels = ref(false)
@@ -292,12 +324,24 @@ function normalizeSubAgentConfig(sa?: Partial<api.SubAgentConfig>): api.SubAgent
     timeout: raw.timeout || '',
   }
 }
-const sysVision = ref<api.VisionRecognitionConfig>({
-  enabled: false,
-  provider: '',
-  model: '',
-  timeout_seconds: 60,
-  max_image_bytes: 10 * 1024 * 1024,
+function defaultRecognitionRoute(): api.RecognitionRouteConfig {
+  return { enabled: false, provider: '', model: '', timeout_seconds: 60, max_bytes: 10 * 1024 * 1024, available: false }
+}
+
+const recognitionCapabilityDefs: Array<{ kind: api.MediaKind; label: string; hint: string }> = [
+  { kind: 'image', label: '图片识别', hint: '分析截图、照片和图像附件' },
+  { kind: 'video', label: '视频识别', hint: '分析视频画面与时序内容' },
+  { kind: 'audio', label: '音频识别', hint: '分析语音、录音和音频附件' },
+]
+const sysRecognition = ref<Record<api.MediaKind, api.RecognitionRouteConfig>>({
+  image: defaultRecognitionRoute(),
+  video: defaultRecognitionRoute(),
+  audio: defaultRecognitionRoute(),
+})
+const sysRecognitionSizeUnits = ref<Record<api.MediaKind, ByteSizeUnit>>({
+  image: 'MB',
+  video: 'MB',
+  audio: 'MB',
 })
 const sysWorkMode = ref('coding')
 const sysCloseBehavior = ref<'exit' | 'tray'>('exit')
@@ -308,22 +352,52 @@ function normalizeCloseBehavior(v?: string): 'exit' | 'tray' {
   return v === 'tray' ? 'tray' : 'exit'
 }
 
+function syncRecognitionSizeUnits() {
+  for (const kind of ['image', 'video', 'audio'] as api.MediaKind[]) {
+    sysRecognitionSizeUnits.value[kind] = preferredByteSizeUnit(sysRecognition.value[kind].max_bytes)
+  }
+}
+
+function recognitionSizeValue(kind: api.MediaKind): number {
+  return bytesToUnitValue(sysRecognition.value[kind].max_bytes, sysRecognitionSizeUnits.value[kind])
+}
+
+function onRecognitionSizeUpdate(kind: api.MediaKind, value: number | null) {
+  if (value === null) return
+  sysRecognition.value[kind].max_bytes = unitValueToBytes(value, sysRecognitionSizeUnits.value[kind])
+  markSysDirty()
+}
+
+function onRecognitionSizeUnitUpdate(kind: api.MediaKind, unit: ByteSizeUnit) {
+  sysRecognitionSizeUnits.value[kind] = unit
+}
+
 async function loadSystemConfig() {
   try {
     const sc = await api.getSystemConfig()
     sysLimits.value = sc.limits
     sysSubAgent.value = normalizeSubAgentConfig(sc.sub_agent)
-    sysVision.value = sc.vision_recognition || {
-      enabled: false,
-      provider: '',
-      model: '',
-      timeout_seconds: 60,
-      max_image_bytes: 10 * 1024 * 1024,
+    const legacyVision = sc.vision_recognition
+    const routes = sc.recognition?.routes
+    sysRecognition.value = {
+      image: routes?.image || (legacyVision ? {
+        enabled: legacyVision.enabled,
+        provider: legacyVision.provider,
+        model: legacyVision.model,
+        timeout_seconds: legacyVision.timeout_seconds,
+        max_bytes: legacyVision.max_image_bytes,
+        available: legacyVision.enabled && !!legacyVision.provider && !!legacyVision.model,
+      } : defaultRecognitionRoute()),
+      video: routes?.video || defaultRecognitionRoute(),
+      audio: routes?.audio || defaultRecognitionRoute(),
     }
+    syncRecognitionSizeUnits()
     sysWorkMode.value = sc.work_mode?.default || 'coding'
     sysCloseBehavior.value = normalizeCloseBehavior(sc.ui?.close_behavior)
     chatState.globalWorkMode = sysWorkMode.value
-    chatState.visionRecognitionEnabled = !!sysVision.value.enabled
+    chatState.recognitionCapabilitiesAvailable = (['image', 'video', 'audio'] as api.MediaKind[])
+      .filter(kind => !!sysRecognition.value[kind].available)
+    chatState.visionRecognitionEnabled = chatState.recognitionCapabilitiesAvailable.includes('image')
     sysDirty.value = false
   } catch { /* ignore */ }
 }
@@ -352,13 +426,7 @@ async function saveSystemConfig() {
     patch.sub_agent = sa
     patch.work_mode = { default: sysWorkMode.value }
     patch.ui = { close_behavior: sysCloseBehavior.value }
-    patch.vision_recognition = {
-      enabled: sysVision.value.enabled,
-      provider: sysVision.value.provider,
-      model: sysVision.value.model,
-      timeout_seconds: sysVision.value.timeout_seconds,
-      max_image_bytes: sysVision.value.max_image_bytes,
-    }
+    patch.recognition = { routes: sysRecognition.value }
 
     const updated = await api.updateSystemConfig(patch)
     chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
@@ -366,9 +434,11 @@ async function saveSystemConfig() {
     if (updated.sub_agent) {
       sysSubAgent.value = normalizeSubAgentConfig(updated.sub_agent)
     }
-    if (updated.vision_recognition) {
-      sysVision.value = updated.vision_recognition
-      chatState.visionRecognitionEnabled = !!updated.vision_recognition.enabled
+    if (updated.recognition?.routes) {
+      sysRecognition.value = updated.recognition.routes
+      chatState.recognitionCapabilitiesAvailable = (['image', 'video', 'audio'] as api.MediaKind[])
+        .filter(kind => !!updated.recognition.routes[kind]?.available)
+      chatState.visionRecognitionEnabled = chatState.recognitionCapabilitiesAvailable.includes('image')
     }
     sysDirty.value = false
     message.success('系统配置已保存')
@@ -391,13 +461,12 @@ function resetSystemConfig() {
     max_stored_messages: 0,
   }
   sysSubAgent.value = normalizeSubAgentConfig()
-  sysVision.value = {
-    enabled: false,
-    provider: '',
-    model: '',
-    timeout_seconds: 60,
-    max_image_bytes: 10 * 1024 * 1024,
+  sysRecognition.value = {
+    image: defaultRecognitionRoute(),
+    video: defaultRecognitionRoute(),
+    audio: defaultRecognitionRoute(),
   }
+  sysRecognitionSizeUnits.value = { image: 'MB', video: 'MB', audio: 'MB' }
   sysWorkMode.value = 'coding'
   sysCloseBehavior.value = 'exit'
   sysDirty.value = true
@@ -657,7 +726,7 @@ function resetModelForm() {
   editModelDisplay.value = ''
   editModelCtx.value = null
   editModelOut.value = null
-  editModelVision.value = false
+  editModelCapabilities.value = []
 }
 
 function onShowAddModel() {
@@ -680,18 +749,17 @@ async function onAddModel() {
       max_tokens_context: editModelCtx.value ?? undefined,
       max_tokens_output: editModelOut.value ?? undefined,
     })
-    // The capabilities block is a separate PATCH; if it
-    // fails, the model is still created — surface the error
-    // but don't roll back.
-    if (editModelVision.value) {
-      try {
-        await api.setModelCapabilities(providerName, name, {
-          supports_vision: true,
-          context_window: editModelCtx.value ?? 0,
-        })
-      } catch (capErr: any) {
-        message.warning(`模型已添加, 但能力标记失败: ${capErr.message}`)
-      }
+    // The capabilities block is a separate PATCH. Always send it so an
+    // empty selection is persisted as an explicit text-only capability set.
+    try {
+      await api.setModelCapabilities(providerName, name, {
+        input_modalities: editModelCapabilities.value,
+        supports_vision: editModelCapabilities.value.includes('image'),
+        supports_audio: editModelCapabilities.value.includes('audio'),
+        context_window: editModelCtx.value ?? 0,
+      })
+    } catch (capErr: any) {
+      message.warning(`模型已添加, 但能力标记失败: ${capErr.message}`)
     }
     message.success('已添加模型')
     resetModelForm()
@@ -717,7 +785,12 @@ function onEditModel(m: api.ModelInfo) {
   editModelDisplay.value = m.display_name || ''
   editModelCtx.value = m.max_tokens_context ?? null
   editModelOut.value = m.max_tokens_output ?? null
-  editModelVision.value = !!m.capabilities?.supports_vision
+  editModelCapabilities.value = m.capabilities?.input_modalities !== undefined
+    ? [...m.capabilities.input_modalities]
+    : [
+        ...(m.capabilities?.supports_vision ? ['image' as api.MediaKind] : []),
+        ...(m.capabilities?.supports_audio ? ['audio' as api.MediaKind] : []),
+      ]
   showAddModel.value = true
 }
 
@@ -739,7 +812,9 @@ async function onSaveModel() {
       max_tokens_output: out,
     })
     await api.setModelCapabilities(provider, model, {
-      supports_vision: editModelVision.value,
+      input_modalities: editModelCapabilities.value,
+      supports_vision: editModelCapabilities.value.includes('image'),
+      supports_audio: editModelCapabilities.value.includes('audio'),
       context_window: editModelCtx.value ?? 0,
     })
     message.success('已保存')
@@ -1119,39 +1194,44 @@ const protocolOptions = [
   { label: 'Anthropic (Claude)', value: 'anthropic' },
 ]
 
-const visionProviderOptions = computed(() =>
+const recognitionProviderOptions = computed(() =>
   providers.value.map(p => ({ label: p.name, value: p.name })),
 )
 
-const visionModelOptions = computed(() => {
-  const p = providers.value.find(x => x.name === sysVision.value.provider)
+function recognitionModelOptions(kind: api.MediaKind) {
+  const p = providers.value.find(x => x.name === sysRecognition.value[kind].provider)
   if (!p) return []
   return (p.models || []).map(m => {
-    const suffix = m.capabilities?.supports_vision ? ' · 视觉' : ''
+    const suffix = modelSupportsCapability(m, kind) ? ' · 支持此能力' : ''
     const label = m.display_name ? `${m.display_name} (${m.name})${suffix}` : `${m.name}${suffix}`
     return { label, value: m.name }
   })
-})
+}
 
-function onVisionProviderUpdate(provider: string) {
-  sysVision.value.provider = provider || ''
+function onRecognitionProviderUpdate(kind: api.MediaKind, provider: string) {
+  const route = sysRecognition.value[kind]
+  route.provider = provider || ''
   const p = providers.value.find(x => x.name === provider)
   const models = p?.models || []
-  if (!models.some(m => m.name === sysVision.value.model)) {
-    sysVision.value.model = models.find(m => m.default)?.name || models[0]?.name || ''
+  if (!models.some(m => m.name === route.model)) {
+    route.model = models.find(m => modelSupportsCapability(m, kind))?.name
+      || models.find(m => m.default)?.name
+      || models[0]?.name
+      || ''
   }
   markSysDirty()
 }
 
-function onVisionModelUpdate(model: string) {
-  sysVision.value.model = model || ''
+function onRecognitionModelUpdate(kind: api.MediaKind, model: string) {
+  sysRecognition.value[kind].model = model || ''
   markSysDirty()
 }
 
 // model-table row helpers
 function fmtContext(n?: number) {
   if (!n || n <= 0) return '—'
-  if (n >= 1024) return `${Math.round(n / 1024)}k`
+  if (n >= 1_000_000) return `${Number((n / 1_000_000).toFixed(1))}M`
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`
   return String(n)
 }
 
@@ -2030,7 +2110,9 @@ function kbModelSupportsVision(scanModel: string) {
                       <div class="model-card-top">
                         <span class="model-card-name">{{ m.name }}</span>
                         <NTag v-if="m.default" type="success" size="tiny" :bordered="false">默认</NTag>
-                        <NTag v-if="m.capabilities?.supports_vision" size="tiny" :bordered="false" type="info">视觉</NTag>
+                        <NTag v-if="modelSupportsCapability(m, 'image')" size="tiny" :bordered="false" type="info">图片</NTag>
+                        <NTag v-if="modelSupportsCapability(m, 'video')" size="tiny" :bordered="false" type="warning">视频</NTag>
+                        <NTag v-if="modelSupportsCapability(m, 'audio')" size="tiny" :bordered="false" type="success">音频</NTag>
                       </div>
                       <div class="model-card-meta" v-if="m.display_name || m.max_tokens_context || m.max_tokens_output">
                         <span v-if="m.display_name" class="model-meta-item">{{ m.display_name }}</span>
@@ -2181,18 +2263,39 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
             <div class="settings-form-row">
               <label class="settings-form-label">上下文 (tokens)</label>
-              <NInputNumber v-model:value="editModelCtx" :min="0" :step="1024" placeholder="128000" size="small" class="model-num-input" />
+              <div class="model-context-control">
+                <NSelect
+                  v-model:value="editModelCtx"
+                  :options="contextWindowOptions"
+                  clearable
+                  placeholder="选择预设"
+                  size="small"
+                />
+                <NInputNumber
+                  v-model:value="editModelCtx"
+                  :min="0"
+                  :step="1024"
+                  placeholder="自定义 tokens"
+                  size="small"
+                  class="model-num-input"
+                />
+              </div>
             </div>
             <div class="settings-form-row">
               <label class="settings-form-label">最大输出 (tokens)</label>
               <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="4096" size="small" class="model-num-input" />
             </div>
-            <div class="settings-form-row settings-form-row--span2 settings-form-row--inline">
-              <div class="settings-form-toggle">
-                <NSwitch v-model:value="editModelVision" />
-                <label class="settings-form-label" for="model-vision-switch">支持视觉输入</label>
-              </div>
-              <span class="settings-form-hint">开启后用户可发送图片附件</span>
+            <div class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">能力配置</label>
+              <NSelect
+                v-model:value="editModelCapabilities"
+                :options="modelCapabilityOptions"
+                multiple
+                clearable
+                placeholder="选择模型支持的识别能力"
+                size="small"
+              />
+              <span class="settings-form-hint">支持多选；旧版“视觉输入”开启的模型会自动选中图片识别。</span>
             </div>
           </div>
           <template #footer>
@@ -2323,48 +2426,78 @@ function kbModelSupportsVision(scanModel: string) {
                   </div>
                 </NCollapseItem>
 
-                <NCollapseItem title="图像识别" name="vision">
-                  <div class="sys-form-grid">
-                    <div class="sys-form-row">
-                      <span class="sys-label">启用工具</span>
-                      <NSwitch v-model:value="sysVision.enabled" size="small" @update:value="markSysDirty" />
-                      <span class="sys-hint">启用后，会话可选择通过 image_recognize 调用外部多模态模型。</span>
-                    </div>
-                    <div class="sys-form-row">
-                      <span class="sys-label">供应商</span>
-                      <NSelect
-                        :value="sysVision.provider"
-                        :options="visionProviderOptions"
-                        size="small"
-                        style="width: 180px"
-                        clearable
-                        @update:value="onVisionProviderUpdate"
-                      />
-                      <span class="sys-hint">从已添加的 LLM 提供商中选择。</span>
-                    </div>
-                    <div class="sys-form-row">
-                      <span class="sys-label">模型</span>
-                      <NSelect
-                        :value="sysVision.model"
-                        :options="visionModelOptions"
-                        size="small"
-                        style="width: 240px"
-                        clearable
-                        :disabled="!sysVision.provider"
-                        @update:value="onVisionModelUpdate"
-                      />
-                      <span class="sys-hint">建议选择已标记支持视觉输入的模型。</span>
-                    </div>
-                    <div class="sys-form-row">
-                      <span class="sys-label">超时</span>
-                      <NInputNumber v-model:value="sysVision.timeout_seconds" :min="5" :step="5" size="small" style="width:100px" @update:value="markSysDirty" />
-                      <span class="sys-hint">秒，默认 60。</span>
-                    </div>
-                    <div class="sys-form-row">
-                      <span class="sys-label">图片大小</span>
-                      <NInputNumber v-model:value="sysVision.max_image_bytes" :min="1024" :step="1048576" size="small" style="width:140px" @update:value="markSysDirty" />
-                      <span class="sys-hint">bytes，默认 10485760。</span>
-                    </div>
+                <NCollapseItem title="媒体识别" name="vision">
+                  <p class="settings-section-description">
+                    每种媒体能力可以使用独立模型。未启用或未完整配置的能力不会出现在会话工具中。
+                  </p>
+                  <div class="recognition-route-list">
+                    <section v-for="capability in recognitionCapabilityDefs" :key="capability.kind" class="recognition-route-card">
+                      <div class="recognition-route-heading">
+                        <div>
+                          <strong>{{ capability.label }}</strong>
+                          <span>{{ capability.hint }}</span>
+                        </div>
+                        <NSwitch v-model:value="sysRecognition[capability.kind].enabled" size="small" @update:value="markSysDirty" />
+                      </div>
+                      <div class="recognition-route-fields">
+                        <label class="recognition-route-field">
+                          <span>供应商</span>
+                          <NSelect
+                            :value="sysRecognition[capability.kind].provider"
+                            :options="recognitionProviderOptions"
+                            size="small"
+                            clearable
+                            placeholder="选择供应商"
+                            @update:value="value => onRecognitionProviderUpdate(capability.kind, value)"
+                          />
+                        </label>
+                        <label class="recognition-route-field">
+                          <span>模型</span>
+                          <NSelect
+                            :value="sysRecognition[capability.kind].model"
+                            :options="recognitionModelOptions(capability.kind)"
+                            size="small"
+                            clearable
+                            :disabled="!sysRecognition[capability.kind].provider"
+                            placeholder="选择模型"
+                            @update:value="value => onRecognitionModelUpdate(capability.kind, value)"
+                          />
+                        </label>
+                        <label class="recognition-route-field">
+                          <span>超时（秒）</span>
+                          <NInputNumber
+                            v-model:value="sysRecognition[capability.kind].timeout_seconds"
+                            :min="5"
+                            :step="5"
+                            size="small"
+                            @update:value="markSysDirty"
+                          />
+                        </label>
+                        <div class="recognition-route-field">
+                          <span>最大文件</span>
+                          <div class="media-size-input">
+                            <NInputNumber
+                              :value="recognitionSizeValue(capability.kind)"
+                              :min="byteSizeInputMinimum(sysRecognitionSizeUnits[capability.kind])"
+                              :step="byteSizeInputStep(sysRecognitionSizeUnits[capability.kind])"
+                              :precision="sysRecognitionSizeUnits[capability.kind] === 'B' ? 0 : 3"
+                              size="small"
+                              @update:value="value => onRecognitionSizeUpdate(capability.kind, value)"
+                            />
+                            <NSelect
+                              :value="sysRecognitionSizeUnits[capability.kind]"
+                              :options="byteSizeUnitOptions"
+                              size="small"
+                              :consistent-menu-width="false"
+                              @update:value="value => onRecognitionSizeUnitUpdate(capability.kind, value)"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                      <span v-if="sysRecognition[capability.kind].enabled && (!sysRecognition[capability.kind].provider || !sysRecognition[capability.kind].model)" class="settings-form-hint settings-form-hint--error">
+                        尚未完整配置，当前能力不可用。
+                      </span>
+                    </section>
                   </div>
                 </NCollapseItem>
 
@@ -4865,6 +4998,67 @@ code {
   line-height: 1.5;
   white-space: normal;
   min-width: 0;
+}
+
+.recognition-route-list {
+  display: grid;
+  gap: var(--space-2);
+}
+.recognition-route-card {
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-2);
+}
+.recognition-route-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.recognition-route-heading > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.recognition-route-heading strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.recognition-route-heading span {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+}
+.recognition-route-fields {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(160px, 1.2fr) 104px minmax(156px, 0.8fr);
+  gap: 8px;
+}
+.recognition-route-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.recognition-route-field > span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.2;
+}
+.media-size-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 68px;
+  gap: var(--space-1);
+}
+.model-context-control {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(140px, 1fr);
+  gap: 8px;
+}
+@media (max-width: 760px) {
+  .recognition-route-fields {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 .sys-actions {
