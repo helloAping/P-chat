@@ -143,12 +143,12 @@ Agent 在 `ChatWithTools()` 中用 `HistoryMessageCount` 区分“已入库历�
 
 - 当前轮新上传图片：通过 `ExpandAttachmentsCM()` 展开；普通多模态模式下作为 `TypeImage` 直接提交给当前模型；开启 `use_image_recognition` 时先由识图模型 preflight，主模型只拿识别文本。
 - 重答目标图片：`buildRegenerateMessages()` 会把目标用户消息后面紧跟的图片并入当前轮后缀，因此按当前轮图片处理，会重新提交或重新识别。
-- 历史图片：不再作为原图 payload 反复提交给主模型，`replaceHistoricalImagesWithPlaceholders()` 会把它替换成 system 占位。若有 `upload_id` 且存在可用视觉能力，占位提示 LLM 调 `image_recognize`；否则提示用户重新上传或切换/配置视觉模型。
-- 图像识别工具：没有当前轮图片 preflight 时，历史图片后续追问可以暴露 `image_recognize`。会话开启专门识图配置时用配置模型；未开启时，如果当前对话模型支持视觉，则工具 fallback 到当前 provider/model。
-- 子代理识图：父对话存在图片引用时，`task` 工具 context 会携带父会话图片解析器，子代理内部可通过 `image_recognize` 复用父会话图片。会话开启专门识图配置时子代理复用该配置模型，否则仅在子代理当前模型支持视觉时暴露识图工具。
+- 历史图片：不再作为原图 payload 反复提交给主模型，`replaceHistoricalImagesWithPlaceholders()` 会把它替换成 system 占位。若有 `upload_id` 且存在可用视觉能力，占位提示 LLM 调 `media_recognize`；否则提示用户重新上传或切换/配置视觉模型。
+- 媒体识别工具：没有当前轮图片 preflight 时，历史图片后续追问可以暴露 `media_recognize`。会话开启专门识图配置时用配置模型；未开启时，如果当前对话模型支持视觉，则图片 fallback 到当前 provider/model。音频、视频根据媒体类型使用各自配置路由。
+- 子代理识图：父对话存在图片引用时，`task` 工具 context 会携带父会话图片解析器，子代理内部可通过 `media_recognize` 复用父会话图片。会话开启专门识图配置时子代理复用该配置模型，否则仅在子代理当前模型支持视觉时暴露识图能力。
 - 浏览器截图：`browser_screenshot` 在当前模型支持视觉或会话启用专门识图配置时可见。启用专门识图配置时，截图先由识图模型分析为事实观察文本，再回填给主模型；未启用时仍按多模态图片 payload 注入支持视觉的当前模型。
 - 当前轮音频/视频：当前模型明确声明对应输入能力时原生提交；否则仅在会话选择了可用媒体路由时保留显示行并给出 `media_recognize(upload_id)` 引用。两边都不可用时只告知模型存在附件，不允许假装识别。
-- 历史媒体：`replaceAttachmentReferences()` 将历史图片、视频、音频统一替换为不含二进制的 system 引用，根据可用能力指向 `image_recognize` / `media_recognize`；历史请求不重复携带大媒体 payload。
+- 历史媒体：`replaceAttachmentReferences()` 将历史图片、视频、音频统一替换为不含二进制的 system 引用，根据可用能力指向 `media_recognize`；历史请求不重复携带大媒体 payload。
 - 文档与普通文件：可确定提取的文本、源码、PDF、Word、Excel、PowerPoint 统一保存为 `TypeFile + upload_id` 显示行，并给模型 `read_attachment(upload_id)` 引用；工具执行前再次校验上传属于当前会话。未知二进制只生成“不支持解析”的说明，不复制到项目目录，也不作为原始字节提交给模型。
 
 这保证围绕历史媒体或文档连续追问时可以按需调用工具，同时避免每一轮都把附件二进制塞进 LLM 上下文。

@@ -58,7 +58,8 @@ type SharedImageRecognition struct {
 	Resolver           tool.ImageResolver
 }
 
-// Available reports whether a child agent can expose image_recognize against
+// Available 表示子代理是否可通过父会话图片引用暴露 media_recognize。
+// Available reports whether a child agent can expose media_recognize against
 // the parent session's image refs.
 func (s SharedImageRecognition) Available() bool {
 	return strings.TrimSpace(s.SessionID) != "" && s.HasImageRefs && s.Resolver != nil

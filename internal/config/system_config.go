@@ -30,8 +30,9 @@ type UIConfigPatch struct {
 	CloseBehavior *CloseBehavior `json:"close_behavior,omitempty"`
 }
 
+// VisionRecognitionConfigPatch 是 media_recognize 外接图片模型的部分更新。
 // VisionRecognitionConfigPatch is a partial update for the external image
-// recognition model used by the image_recognize tool.
+// recognition model used by the image strategy of media_recognize.
 type VisionRecognitionConfigPatch struct {
 	Enabled        *bool   `json:"enabled,omitempty"`
 	Provider       *string `json:"provider,omitempty"`

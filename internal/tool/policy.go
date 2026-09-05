@@ -128,16 +128,17 @@ func (p ToolPolicy) CanRunInParallel() bool {
 // share this predicate so a sub-agent cannot discover a tool it is
 // not allowed to execute.
 //
-// Allowed: project-local read tools, image_recognize, private todo_write,
+// 允许：项目内只读工具、media_recognize、私有 todo_write 和公开网络读取。
+// Allowed: project-local read tools, media_recognize, private todo_write,
 // web_search, and web_fetch (GET/POST to public URLs). Write/exec/
 // interactive/browser/MCP/dynamic tools stay with the parent conversation.
 func SubagentMayExpose(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "read_attachment" || name == "media_recognize" {
+	if name == "read_attachment" {
 		return false
 	}
 	switch name {
-	case "todo_write", "web_search", "web_fetch", "image_recognize":
+	case "todo_write", "web_search", "web_fetch", "image_recognize", "media_recognize":
 		return true
 	}
 	p := defaultToolPolicy(name)

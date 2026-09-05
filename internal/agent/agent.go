@@ -437,6 +437,29 @@ func filterAllowedTools(tools []tool.Tool, allow []string) []tool.Tool {
 	return out
 }
 
+func canonicalAllowedToolNames(registry *tool.Registry, projectRoot string, allow []string) []string {
+	if registry == nil || len(allow) == 0 {
+		return allow
+	}
+	out := make([]string, 0, len(allow))
+	seen := make(map[string]struct{}, len(allow))
+	for _, name := range allow {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if canonical, ok := registry.CanonicalNameForProject(name, projectRoot); ok {
+			name = canonical
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
 func (a *Agent) imageRecognitionAvailable() bool {
 	_, ok := a.mediaRecognitionRoute(config.MediaImage)
 	return ok
@@ -526,6 +549,14 @@ func (a *Agent) effectiveRecognitionCapabilities(requested []config.MediaKind) [
 	return result
 }
 
+func (a *Agent) effectiveToolRecognitionCapabilities(requested []config.MediaKind, imageFallback bool) []config.MediaKind {
+	result := a.effectiveRecognitionCapabilities(requested)
+	if imageFallback && !containsMediaKind(result, config.MediaImage) {
+		result = append(result, config.MediaImage)
+	}
+	return result
+}
+
 func (a *Agent) resolveMediaForRecognition(ctx context.Context, sessionID, uploadID string, allowed []config.MediaKind) (tool.MediaRecognitionAsset, error) {
 	if a == nil || a.store == nil || a.attach == nil {
 		return tool.MediaRecognitionAsset{}, fmt.Errorf("media storage is not available")
@@ -566,11 +597,24 @@ func (a *Agent) resolveMediaForRecognition(ctx context.Context, sessionID, uploa
 		return tool.MediaRecognitionAsset{}, fmt.Errorf("%s recognition is not enabled for this session", kind)
 	}
 	route, ok := a.mediaRecognitionRoute(kind)
-	if !ok {
+	maxBytes := int64(0)
+	if ok {
+		maxBytes = route.MaxBytes
+	} else if kind == config.MediaImage {
+		// 历史图片可在没有独立路由时使用当前具备视觉能力的对话模型。
+		// Historical images may use the current vision-capable conversation
+		// model even when no independent image route is configured.
+		maxBytes = 10 << 20
+		if a.cfg != nil {
+			vc := a.cfg.Vision
+			vc.Normalize()
+			maxBytes = vc.MaxImageBytes
+		}
+	} else {
 		return tool.MediaRecognitionAsset{}, fmt.Errorf("%s recognition route is unavailable", kind)
 	}
-	if size > route.MaxBytes {
-		return tool.MediaRecognitionAsset{}, fmt.Errorf("media is too large: %d bytes (max %d)", size, route.MaxBytes)
+	if size > maxBytes {
+		return tool.MediaRecognitionAsset{}, fmt.Errorf("media is too large: %d bytes (max %d)", size, maxBytes)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -661,16 +705,58 @@ func containsMediaKind(kinds []config.MediaKind, target config.MediaKind) bool {
 	return false
 }
 
+func withoutMediaKind(kinds []config.MediaKind, target config.MediaKind) []config.MediaKind {
+	out := make([]config.MediaKind, 0, len(kinds))
+	for _, kind := range kinds {
+		if kind != target {
+			out = append(out, kind)
+		}
+	}
+	return out
+}
+
 func (a *Agent) recognizeMediaWithConfiguredModel(ctx context.Context, req tool.MediaRecognitionRequest) (string, error) {
 	kind := config.MediaKind(req.Asset.Kind)
 	route, ok := a.mediaRecognitionRoute(kind)
 	if !ok {
 		return "", fmt.Errorf("%s recognition route is unavailable", kind)
 	}
+	return a.recognizeMediaWithModel(ctx, route.Provider, route.Model, time.Duration(route.TimeoutSeconds)*time.Second, req)
+}
+
+func (a *Agent) recognizeMediaWithCurrentModel(providerName, modelName string) tool.MediaRecognizer {
+	return func(ctx context.Context, req tool.MediaRecognitionRequest) (string, error) {
+		kind := config.MediaKind(req.Asset.Kind)
+		if kind != config.MediaImage {
+			return "", fmt.Errorf("current-model recognition fallback only supports images")
+		}
+		if a == nil || a.llm == nil || !a.modelSupportsVision(providerName, modelName) {
+			return "", fmt.Errorf("current model %s/%s is not available for image recognition", providerName, modelName)
+		}
+		timeout := 60 * time.Second
+		if a != nil && a.cfg != nil {
+			vc := a.cfg.Vision
+			vc.Normalize()
+			if vc.TimeoutSeconds > 0 {
+				timeout = time.Duration(vc.TimeoutSeconds) * time.Second
+			}
+		}
+		return a.recognizeMediaWithModel(ctx, providerName, modelName, timeout, req)
+	}
+}
+
+func (a *Agent) recognizeMediaWithModel(ctx context.Context, providerName, modelName string, timeout time.Duration, req tool.MediaRecognitionRequest) (string, error) {
+	if a == nil || a.llm == nil {
+		return "", fmt.Errorf("LLM client is not available")
+	}
 	assets := req.Assets
 	if len(assets) == 0 {
 		assets = []tool.MediaRecognitionAsset{req.Asset}
 	}
+	if len(assets) == 0 || !config.MediaKind(assets[0].Kind).IsValid() {
+		return "", fmt.Errorf("no supported media provided")
+	}
+	kind := config.MediaKind(assets[0].Kind)
 	messages := []llm.ChatMessage{
 		{Role: llm.RoleSystem, Type: llm.TypeText, Content: "You are a media recognition tool for P-Chat. Return only factual observations and extracted content. Match the user's language when possible."},
 		{Role: llm.RoleUser, Type: llm.TypeText, Content: req.Question},
@@ -684,9 +770,9 @@ func (a *Agent) recognizeMediaWithConfiguredModel(ctx context.Context, req tool.
 			Name: asset.Name, MimeType: asset.MIME,
 		})
 	}
-	callCtx, cancel := context.WithTimeout(ctx, time.Duration(route.TimeoutSeconds)*time.Second)
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return a.llm.ChatCM(callCtx, route.Provider, route.Model, messages, llm.ChatOptions{})
+	return a.llm.ChatCM(callCtx, providerName, modelName, messages, llm.ChatOptions{})
 }
 
 func (a *Agent) imageRecognitionGatedTools(enabled bool, tools []tool.Tool) []tool.Tool {
@@ -752,7 +838,7 @@ func replaceAttachmentReferences(msgs []llm.ChatMessage, currentTurnStart int, i
 		switch m.Type {
 		case llm.TypeImage:
 			if imageToolAvailable {
-				toolName = "image_recognize"
+				toolName = "media_recognize"
 			} else if containsMediaKind(mediaCapabilities, config.MediaImage) {
 				toolName = "media_recognize"
 			}
@@ -805,7 +891,7 @@ func replaceImagesWithRecognitionRefs(msgs []llm.ChatMessage) []llm.ChatMessage 
 			out = append(out, llm.ChatMessage{
 				Role:        llm.RoleSystem,
 				Type:        llm.TypeText,
-				Content:     fmt.Sprintf("Uploaded image available for tool-based recognition: name=%q, upload_id=%q, MIME=%s. Do not claim to see the image directly. If image details are needed, call image_recognize with this upload_id, or include it in upload_ids with the other images.", name, m.UploadID, m.MimeType),
+				Content:     fmt.Sprintf("Uploaded image available for tool-based recognition: name=%q, upload_id=%q, MIME=%s. Do not claim to see the image directly. If image details are needed, call media_recognize with this upload_id, or include it in upload_ids with the other images.", name, m.UploadID, m.MimeType),
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
 			})
@@ -814,7 +900,7 @@ func replaceImagesWithRecognitionRefs(msgs []llm.ChatMessage) []llm.ChatMessage 
 		out = append(out, llm.ChatMessage{
 			Role:        llm.RoleSystem,
 			Type:        llm.TypeText,
-			Content:     fmt.Sprintf("An earlier image named %q is not sent to the main model because image recognition mode is enabled, but it has no upload_id for image_recognize.", name),
+			Content:     fmt.Sprintf("An earlier image named %q is not sent to the main model because image recognition mode is enabled, but it has no upload_id for media_recognize.", name),
 			MsgType:     llm.MsgTypeText,
 			SubmitToLLM: 1,
 		})
@@ -1020,10 +1106,11 @@ type ChatRequest struct {
 	// entries (text + image/file) before being sent to the LLM.
 	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// UseImageRecognition 让上传图片绕过主模型；当前轮先识别，后续轮次可按 upload_id 回看。
 	// UseImageRecognition keeps uploaded images out of the main model.
 	// Current-turn image attachments are recognized before the main model call
 	// and injected as text context; follow-up turns can still expose
-	// image_recognize for historical upload_ids.
+	// media_recognize for historical upload_ids.
 	UseImageRecognition bool `json:"use_image_recognition,omitempty"`
 	// RecognitionCapabilities enables independently configured media tools.
 	RecognitionCapabilities []config.MediaKind `json:"enabled_recognition_capabilities,omitempty"`
@@ -1861,13 +1948,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Step: "load-tools", Message: "加载工具列表..."})
 		a.loadProjectDynamicTools(req.ProjectRoot)
 		availableTools := a.tools.ListForProject(req.ProjectRoot)
-		availableTools = filterAllowedTools(availableTools, req.AllowedTools)
+		availableTools = filterAllowedTools(availableTools, canonicalAllowedToolNames(a.tools, req.ProjectRoot, req.AllowedTools))
 		useImageRecognition := req.UseImageRecognition && a.imageRecognitionAvailable()
 		recognitionCapabilities := a.effectiveRecognitionCapabilities(req.RecognitionCapabilities)
 		if useImageRecognition && !containsMediaKind(recognitionCapabilities, config.MediaImage) {
 			recognitionCapabilities = append(recognitionCapabilities, config.MediaImage)
 		}
-		mediaRecognitionToolAvailable := len(recognitionCapabilities) > 0 && a.store != nil && a.attach != nil
 		attachmentReadAvailable := a.store != nil && a.attach != nil && hasReadableAttachmentContext(req.Messages, req.Attachments)
 		requestHistoryCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
 		historyHasImageRefs := hasImageUploadRefs(req.Messages[:requestHistoryCount])
@@ -1877,6 +1963,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		sharedImageRecognitionAvailable := req.SubagentType != "" && sharedImagesAvailable && (sharedUseConfiguredRecognition || (a != nil && a.llm != nil && a.modelSupportsVision(req.Provider, req.Model)))
 		historyImageRecognitionAvailable := (historyHasImageRefs && a.store != nil && a.attach != nil && (useImageRecognition || a.currentModelImageRecognitionAvailable(req.Provider, req.Model))) || sharedImageRecognitionAvailable
 		imageRecognitionToolAvailable := historyImageRecognitionAvailable && !currentTurnImageRecognition
+		toolRecognitionCapabilities := a.effectiveToolRecognitionCapabilities(recognitionCapabilities, imageRecognitionToolAvailable)
+		if currentTurnImageRecognition {
+			// 当前轮图片已完成 preflight，不再向主模型暴露相同的图片策略。
+			// Current-turn images were already preflighted, so do not advertise
+			// the same image strategy to the main model for a duplicate call.
+			toolRecognitionCapabilities = withoutMediaKind(toolRecognitionCapabilities, config.MediaImage)
+		}
+		mediaRecognitionToolAvailable := len(toolRecognitionCapabilities) > 0 && ((a.store != nil && a.attach != nil) || sharedImageRecognitionAvailable)
 		parentImageRefsForChildren := req.SubagentType == "" && req.SessionID != "" && a.store != nil && a.attach != nil &&
 			(historyHasImageRefs || hasImageUploadRefs(req.Messages[requestHistoryCount:]) || hasImageAttachmentUploadRefs(req.Attachments))
 		// Remove wiki tools when knowledge base is off. grep is a
@@ -1898,8 +1992,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// image-recognition model. Text-only sessions without either path
 		// fall back to browser_extract.
 		availableTools = a.visionGatedTools(req.Provider, req.Model, useImageRecognition, availableTools)
+		// 当前轮上传先识别并以有界上下文注入；media_recognize 只服务历史引用。
 		// Current-turn uploads are recognized before the main LLM call and
-		// injected as bounded context. Keep image_recognize available only for
+		// injected as bounded context. Keep media_recognize available only for
 		// follow-up turns that need to revisit historical upload_ids.
 		availableTools = a.imageRecognitionGatedTools(imageRecognitionToolAvailable, availableTools)
 		availableTools = filterMediaRecognitionTools(mediaRecognitionToolAvailable, availableTools)
@@ -2097,7 +2192,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if currentTurnImageRecognition {
 			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, latestUserText(newMessages), ch, nextSeq)
 		}
-		msgs = replaceAttachmentReferences(msgs, persistStart, imageRecognitionToolAvailable, attachmentReadAvailable, recognitionCapabilities)
+		msgs = replaceAttachmentReferences(msgs, persistStart, imageRecognitionToolAvailable, attachmentReadAvailable, toolRecognitionCapabilities)
 		msgs = dropDisplayOnlyMediaMessages(msgs)
 		if useImageRecognition {
 			if currentTurnImageRecognition {
@@ -3000,11 +3095,31 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					tctx = tool.WithImageRecognizer(tctx, recognizer)
 				}
 				if mediaRecognitionToolAvailable {
-					allowedMedia := append([]config.MediaKind(nil), recognitionCapabilities...)
-					tctx = tool.WithMediaResolver(tctx, func(ctx context.Context, sessionID, uploadID string) (tool.MediaRecognitionAsset, error) {
+					allowedMedia := append([]config.MediaKind(nil), toolRecognitionCapabilities...)
+					mediaResolver := func(ctx context.Context, sessionID, uploadID string) (tool.MediaRecognitionAsset, error) {
 						return a.resolveMediaForRecognition(ctx, sessionID, uploadID, allowedMedia)
+					}
+					if req.SubagentType != "" && sharedImages.Available() {
+						mediaResolver = func(ctx context.Context, _ string, uploadID string) (tool.MediaRecognitionAsset, error) {
+							image, err := sharedImages.Resolver(ctx, sharedImages.SessionID, uploadID)
+							if err != nil {
+								return tool.MediaRecognitionAsset{}, err
+							}
+							return tool.MediaRecognitionAsset{
+								UploadID: image.UploadID, Name: image.Name, Kind: string(config.MediaImage), MIME: image.MIME, Data: image.Data,
+							}, nil
+						}
+					}
+					tctx = tool.WithMediaResolver(tctx, mediaResolver)
+					configuredMedia := append([]config.MediaKind(nil), recognitionCapabilities...)
+					tctx = tool.WithMediaRecognizer(tctx, func(ctx context.Context, mediaReq tool.MediaRecognitionRequest) (string, error) {
+						kind := config.MediaKind(mediaReq.Asset.Kind)
+						configuredImage := containsMediaKind(configuredMedia, config.MediaImage) || (req.SubagentType != "" && sharedUseConfiguredRecognition)
+						if kind == config.MediaImage && !configuredImage {
+							return a.recognizeMediaWithCurrentModel(req.Provider, req.Model)(ctx, mediaReq)
+						}
+						return a.recognizeMediaWithConfiguredModel(ctx, mediaReq)
 					})
-					tctx = tool.WithMediaRecognizer(tctx, a.recognizeMediaWithConfiguredModel)
 				}
 				if attachmentReadAvailable {
 					tctx = tool.WithAttachmentReadResolver(tctx, a.resolveAttachmentForRead)
@@ -3182,7 +3297,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						}
 					}
 
-					if !toolAvailable(availableTools, tc.Name) {
+					callableName := tc.Name
+					if canonical, ok := a.tools.CanonicalNameForProject(tc.Name, req.ProjectRoot); ok {
+						callableName = canonical
+					}
+					if !toolAvailable(availableTools, callableName) {
 						errMsg := fmt.Sprintf("error: tool %q is not allowed for this request", tc.Name)
 						outcomes[i] = toolOutcome{
 							idx:    i,
@@ -3280,14 +3399,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if sandboxActive {
 						toolCtx = tool.WithSandbox(toolCtx, a.sandbox)
 
+						// 对危险工具执行确认检查，覆盖所有 I/O 工具及 read_file 的旧文档别名。
 						// Confirm-check for dangerous tools.
 						// If the sandbox returns Confirm, pause and
 						// wait for user approval before executing
 						// (unless permission level is "auto").
 						//
-						// 2026-07: the confirm branch now covers all
+						// Since 2026-07, the confirm branch covers all
 						// I/O-bearing tools (exec_command, write_file,
-						// read_file, read_docx, read_pdf, list_files)
+						// read_file and its legacy document aliases, list_files)
 						// — the read tools went through unchanged
 						// before, which let an LLM that had a write
 						// confirm approved follow up with read_file on

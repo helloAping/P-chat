@@ -499,11 +499,14 @@ func TestDefault_AppliesAllowDenyFilter(t *testing.T) {
 func newFilterTestRegistry() *tool.Registry {
 	r := tool.NewRegistry()
 	for _, name := range []string{
-		"task", "recall", "read_file", "list_files", "grep", "read_docx", "read_pdf",
-		"exec_command", "write_file", "web_search", "web_fetch", "image_recognize", "todo_write", "question",
+		"task", "recall", "read_file", "list_files", "grep",
+		"exec_command", "write_file", "web_search", "web_fetch", "media_recognize", "todo_write", "question",
 	} {
 		r.Register(tool.Tool{Name: name, Description: name}, noopHandler)
 	}
+	r.RegisterAlias("read_docx", "read_file")
+	r.RegisterAlias("read_pdf", "read_file")
+	r.RegisterAlias("image_recognize", "media_recognize")
 	return r
 }
 
@@ -546,15 +549,31 @@ func TestFilterSubAgentTools_WhitelistCannotWidenPastSafeSet(t *testing.T) {
 // global denylist includes it.
 func TestFilterSubAgentTools_WhitelistBeatsGlobalDenyForSafeTools(t *testing.T) {
 	parent := newFilterTestRegistry()
-	sub := filterSubAgentTools(parent, true, []string{"web_search", "web_fetch", "image_recognize"}, allowAllExcept("web_search", "web_fetch", "image_recognize"))
+	sub := filterSubAgentTools(parent, true, []string{"web_search", "web_fetch", "media_recognize"}, allowAllExcept("web_search", "web_fetch", "media_recognize"))
 	got := strings.Join(sub.Names(), ",")
-	for _, want := range []string{"web_search", "web_fetch", "image_recognize"} {
+	for _, want := range []string{"web_search", "web_fetch", "media_recognize"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("whitelisted tools = %q, want %q despite global deny", got, want)
 		}
 	}
 	if strings.Contains(got, "read_file") {
 		t.Errorf("whitelisted network tools = %q, must not inherit unlisted read_file", got)
+	}
+}
+
+func TestFilterSubAgentTools_LegacyWhitelistSelectsCanonicalTools(t *testing.T) {
+	parent := newFilterTestRegistry()
+	sub := filterSubAgentTools(parent, true, []string{"read_docx", "image_recognize"}, allowAllExcept())
+	got := strings.Join(sub.Names(), ",")
+	for _, want := range []string{"read_file", "media_recognize"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("legacy whitelist tools = %q, missing canonical %q", got, want)
+		}
+	}
+	for _, hidden := range []string{"read_docx", "image_recognize"} {
+		if strings.Contains(got, hidden) {
+			t.Errorf("legacy whitelist tools = %q, should not expose hidden alias %q", got, hidden)
+		}
 	}
 }
 
@@ -566,7 +585,7 @@ func TestFilterSubAgentTools_GlobalDenyAppliesWhenNoWhitelist(t *testing.T) {
 	parent := newFilterTestRegistry()
 	sub := filterSubAgentTools(parent, true, nil, allowAllExcept("exec_command"))
 	got := strings.Join(sub.Names(), ",")
-	for _, want := range []string{"read_file", "grep", "web_search", "web_fetch", "image_recognize", "todo_write"} {
+	for _, want := range []string{"read_file", "grep", "web_search", "web_fetch", "media_recognize", "todo_write"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("general-purpose sub-agent tools = %q, missing %q", got, want)
 		}

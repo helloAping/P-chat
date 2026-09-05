@@ -17,9 +17,7 @@ Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工�
 | `todo.go` | todo_write 工具的持久化钩子 | `PersistTodos`, `LoadTodos` |
 | `question.go` | question 工具（暂停→等待用户回答→恢复） | `handleQuestion()` |
 | `confirm.go` | 沙箱确认机制（阻塞等待用户批准） | `ConfirmRequest`, `WaitForConfirm()` |
-| `fileops.go` | read_file/write_file 的底层实现 | `readFileForTool()`, `writeFile()` |
-| `docx.go` | .docx 读取实现 | `readDocx()` |
-| `pdf.go` | .pdf 读取实现 | `readPdf()` |
+| `fileops.go` | read_file/write_file 的底层实现；按扩展名调用 knowledge 文档提取器 | `readFileForTool()`, `writeFile()` |
 | `dynamic/` | P3-2 用户自定义工具（YAML hot-reload） | `Watch()`, `BuildDynamicHandler()`, `ParseSpec()` |
 
 ## 核心概念
@@ -28,14 +26,17 @@ Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工�
 
 ```go
 type Registry struct {
-    tools map[string]ToolHandler  // 名称 → 处理函数
-    meta  map[string]Tool         // 名称 → 元数据（名称、描述、参数 schema）
+    tools   map[string]ToolHandler  // 名称 → 处理函数
+    meta    map[string]Tool         // 名称 → 元数据（名称、描述、参数 schema）
+    aliases map[string]toolAlias    // 旧名称 → canonical 工具
 }
 
 type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, error)
 ```
 
 - `Register(Tool, ToolHandler)` — 注册工具
+- `RegisterAlias(alias, canonical)` — 注册隐藏兼容别名；可调用但不进入模型 schema
+- `RegisterAliasHandler(alias, canonical, handler)` — 带旧参数/行为适配器的隐藏别名
 - `Get(name)` — 获取处理函数
 - `List()` — 按名称排序的所有工具元数据
 - `Names()` — 所有工具名称（用于子代理工具白名单）
@@ -44,18 +45,15 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 
 | 工具名称 | 功能 | 关键文件：行号 |
 |---|---|---|
-| `exec_command` | 执行 shell 命令 | registry.go:201, 303 |
-| `read_file` | 读取文本文件 | registry.go:211, 390 |
+| `exec_command` | 执行 shell 命令；`background=true` 时启动受管后台进程 | registry.go, process_manager.go |
+| `read_file` | 读取文本文件，并按扩展名提取 PDF、Word、Excel、PowerPoint | registry.go, fileops.go, knowledge/* |
 | `read_attachment` | 通过本会话 `upload_id` 提取文本、PDF、Word、Excel、PowerPoint 内容 | attachment_read.go, registry.go |
 | `write_file` | 写入/创建文件 | registry.go:223, 440 |
 | `list_files` | 列出目录 | registry.go |
 | `grep` | 在项目根目录精确搜索关键词 | grep.go |
-| `read_docx` | 读取 .docx | registry.go |
-| `read_pdf` | 读取 .pdf | registry.go:240, 555 |
 | `web_fetch` | HTTP 抓取 URL（带 SSRF 防护） | registry.go:275, 749 |
 | `web_search` | 公开网络搜索（snippet+url，可插拔 provider） | websearch.go |
-| `image_recognize` | 识别会话上传图片；优先用系统识图模型，必要时 fallback 到当前视觉模型 | image_recognize.go, registry.go |
-| `media_recognize` | 按会话能力配置识别一项或多项图片、视频或音频上传 | media_recognize.go, registry.go |
+| `media_recognize` | 识别一项或多项同类型图片、视频或音频；按媒体类型选择配置模型，图片可 fallback 到当前视觉模型 | media_recognize.go, agent.go |
 | `todo_write` | 管理待办列表 | registry.go:256, todo.go |
 | `question` | 向用户提问并等待 | registry.go:275, question.go |
 
@@ -95,27 +93,31 @@ type SandboxChecker interface {
 
 `todo_write` 的工具结果通过 `PersistTodos` 持久化到 SQLite。`GET /sessions/:id/todos` 可在服务器重启后重新加载。
 
-### 6.5 图片识别工具
+### 6.5 媒体识别工具
 
-`image_recognize` 在需要回看历史图片且存在可用视觉能力时暴露给 LLM：
-- 当前会话 `use_image_recognition=true`，且系统配置 `vision_recognition.enabled=true`、指定的 provider/model 已存在。
-- 或者当前会话没有开启专门的图像识别模式，但历史上下文里有带 `upload_id` 的图片引用，并且当前对话模型本身支持视觉输入；此时工具使用当前 provider/model 做一次非流式识别。
+`media_recognize` 是图片、视频、音频的唯一模型可见识别入口。handler 先校验 `upload_id` 属于当前会话，再根据 MIME 类型选择执行策略；一次调用中的多个文件必须是同一种媒体类型：
 
-本轮刚上传的图片会先走 preflight：`ExpandAttachmentsCM()` 把图片作为 `SubmitToLLM=0` 的显示/持久化消息保存，agent 随后直接调用系统配置中的多模态模型识别这些“当前轮图片”，并把识别文本作为 system 上下文注入给主模型。该上下文必须标记为视觉/OCR 观察，不是用户指令；本轮主模型不再暴露 `image_recognize`，避免它自行选择错误的历史 `upload_id` 或重复调用。
+- 图片：优先使用会话选择且配置完整的 image 路由；没有独立路由但当前模型支持视觉时，fallback 到当前 provider/model。
+- 音频 / 视频：仅使用会话选择、配置完整且目标模型明确声明对应输入能力的路由。
+- 子代理：只在父会话共享了可验证的图片引用时获得图片识别能力；解析器仍绑定父会话，不能读取任意文件。
 
-没有新图片的后续追问仍可暴露 `image_recognize`：历史图片不会作为原图 payload 反复提交给主模型，而是替换为带 `upload_id` 的安全占位。工具 handler 通过会话上传引用校验 `upload_id` / `upload_ids`，再把一张或多张图片发给系统配置里的多模态模型；如果没有启用专门识图配置，则发给当前会话模型，把识别文本返回给主对话。没有任何可用视觉能力时，占位会要求模型提示用户重新上传图片或切换/配置视觉模型。
+本轮刚上传的图片在 `use_image_recognition=true` 时仍先走 preflight：`ExpandAttachmentsCM()` 把图片作为 `SubmitToLLM=0` 的显示/持久化消息保存，agent 直接调用系统配置中的多模态模型识别，并把事实观察文本作为 system 上下文注入主模型。本轮不暴露识别工具，避免重复调用或选错历史 `upload_id`。
 
-子代理内部可见 `image_recognize`，但图片解析器仍绑定父会话上传引用，不能读取任意文件。父会话启用 `use_image_recognition` 时，子代理复用系统识图模型；否则只有子代理当前模型支持视觉时才暴露该工具。
+没有新图片的后续追问可暴露 `media_recognize`：历史媒体不会作为原始 payload 反复提交，而是替换为带 `upload_id` 的安全占位。没有任何可用识别能力时，占位会要求模型提示用户重新上传或切换/配置模型。
 
 识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，当前轮图片二进制都不会发给主模型，避免主模型收到 `image_url` / image block。重答目标消息中的图片按“当前轮图片”处理，会重新识别或重新提交；更早的历史图片仍走占位 + 工具引用。
 
 浏览器 `browser_screenshot` 只有在当前模型支持视觉或会话启用系统识图时暴露。启用系统识图时，截图结果先由识图模型分析并以受约束的事实观察文本回填给主模型；未启用时，仍按原逻辑把截图作为视觉 payload 提交给支持多模态的当前模型。
 
-### 6.6 媒体识别工具
+旧名称 `image_recognize` 是隐藏兼容别名：历史工具调用和旧白名单仍会映射到 `media_recognize`，但不会同时出现在模型 schema 中。
 
-`media_recognize` 是图片、视频、音频的统一能力工具。它只在父会话至少选择了一项可用能力时暴露，并通过 context 注入的 resolver 校验 `upload_id` 必须属于当前会话，随后根据 MIME 类型选择对应的系统识别路由。一次调用中的多个文件必须是同一种媒体类型，大小限制和超时按该类型路由执行。
+### 6.6 本地文件统一读取
 
-识别路由只有在目标模型明确声明相同输入能力时才可用；仅填写 provider/model 不足以启用工具。图片继续保留 `image_recognize` 兼容路径；音频/视频在当前模型显式声明原生输入能力时可直接提交，否则由已配置的外接路由识别。`media_recognize` 暂不向子代理暴露，避免子代理在没有父会话媒体上下文时发现不可执行工具。
+`read_file` 根据扩展名选择读取策略：普通文本直接读取；PDF 交给 `knowledge.ExtractPDFText()`；DOCX/DOCM、XLSX/XLSM、PPTX/PPTM 交给 `knowledge.ExtractOfficeText()`。结果统一限制为 1 MiB，图片、音视频、压缩包和可执行文件仍明确拒绝。
+
+旧名称 `read_docx`、`read_pdf` 是隐藏兼容别名。用户上传的会话附件仍必须使用 `read_attachment(upload_id)`，不能把上传目录路径交给 `read_file`，以保留会话归属校验。
+
+`start_process` 同样保留为隐藏兼容别名；新调用统一使用 `exec_command(background=true)`。别名使用旧 handler 适配器，因此历史 `start_process` 调用仍会强制后台运行。
 
 ### 6.7 会话附件读取工具
 

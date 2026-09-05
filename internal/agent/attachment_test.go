@@ -255,8 +255,8 @@ func TestExpandAttachmentsCM_ImageRecognitionMode(t *testing.T) {
 		t.Fatalf("img.UploadID = %q, want %q", img.UploadID, id)
 	}
 	ref := out[2]
-	if ref.Role != llm.RoleSystem || !strings.Contains(ref.Content, id) || !strings.Contains(ref.Content, "image_recognize") {
-		t.Fatalf("system ref = %#v, want upload_id image_recognize hint", ref)
+	if ref.Role != llm.RoleSystem || !strings.Contains(ref.Content, id) || !strings.Contains(ref.Content, "media_recognize") {
+		t.Fatalf("system ref = %#v, want upload_id media_recognize hint", ref)
 	}
 }
 
@@ -371,7 +371,7 @@ func TestReplaceImagesWithRecognitionRefs(t *testing.T) {
 	if !strings.Contains(out[1].Content, "upl1") || !strings.Contains(out[2].Content, "upl2") {
 		t.Fatalf("refs missing upload ids: %#v", out)
 	}
-	if !strings.Contains(out[1].Content, "image_recognize") || !strings.Contains(out[2].Content, "image_recognize") {
+	if !strings.Contains(out[1].Content, "media_recognize") || !strings.Contains(out[2].Content, "media_recognize") {
 		t.Fatalf("refs missing tool hint: %#v", out)
 	}
 }
@@ -396,7 +396,7 @@ func TestReplaceHistoricalImagesWithToolPlaceholders(t *testing.T) {
 	if strings.Contains(histImage.Content, "OLD_IMAGE_BASE64") {
 		t.Fatalf("historical image placeholder leaked image bytes: %q", histImage.Content)
 	}
-	if !strings.Contains(histImage.Content, "old.png") || !strings.Contains(histImage.Content, "old-upl") || !strings.Contains(histImage.Content, "image_recognize") {
+	if !strings.Contains(histImage.Content, "old.png") || !strings.Contains(histImage.Content, "old-upl") || !strings.Contains(histImage.Content, "media_recognize") {
 		t.Fatalf("historical image placeholder missing filename/upload_id/tool guidance: %q", histImage.Content)
 	}
 	currentImage := out[4]
@@ -417,7 +417,7 @@ func TestReplaceHistoricalImagesWithReuploadPlaceholdersWhenToolUnavailable(t *t
 	if out[0].Type != llm.TypeText {
 		t.Fatalf("historical image Type = %q, want text placeholder", out[0].Type)
 	}
-	if strings.Contains(out[0].Content, "OLD_IMAGE_BASE64") || strings.Contains(out[0].Content, "image_recognize") {
+	if strings.Contains(out[0].Content, "OLD_IMAGE_BASE64") || strings.Contains(out[0].Content, "image_recognize") || strings.Contains(out[0].Content, "media_recognize") {
 		t.Fatalf("unavailable-tool placeholder leaked bytes/tool hint: %q", out[0].Content)
 	}
 	if !strings.Contains(out[0].Content, "重新上传") {

@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"archive/zip"
 	"context"
 	"os"
 	"path/filepath"
@@ -239,6 +240,37 @@ func TestReadFile_AllowsUnknownExtensionWithText(t *testing.T) {
 	}
 }
 
+func TestReadFile_ExtractsOfficeDocument(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "brief.docx")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("word/document.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(`<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello merged reader</w:t></w:r></w:p></w:body></w:document>`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _ := handleReadFile(context.Background(), []byte(`{"path":"`+filepath.ToSlash(p)+`"}`))
+	if res.IsError {
+		t.Fatalf("Office document should be extracted, got %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "Hello merged reader") {
+		t.Fatalf("extracted content = %q, want document text", res.Content)
+	}
+}
+
 func TestIsBinary(t *testing.T) {
 	if isBinary([]byte("plain text")) {
 		t.Error("plain text shouldn't be binary")
@@ -340,6 +372,7 @@ func TestHandleExecCommand_NoErrorPrefix(t *testing.T) {
 		t.Errorf("exec_command error content should not start with 'ERROR:', got: %q", res.Content)
 	}
 }
+
 // --- P2-4 dry-run ---
 
 // TestExecCommand_DryRun verifies the dry-run flag

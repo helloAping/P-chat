@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"path"
+	"path/filepath"
 	"strings"
+
+	"github.com/p-chat/pchat/internal/knowledge"
 )
 
 // readFile is the backend for the read_file tool. It returns the
@@ -21,8 +23,9 @@ func readFile(p string) ([]byte, error) {
 	return os.ReadFile(p)
 }
 
+// ErrBinaryFile 表示目标是 read_file 不支持的二进制文件。
 // ErrBinaryFile is returned by readFileForTool when the target
-// is a binary file (image / audio / pdf / etc.). The LLM cannot
+// is an unsupported binary file (image / audio / archive / etc.). The LLM cannot
 // usefully consume such bytes; the tool result tells it so.
 var ErrBinaryFile = errors.New("binary file")
 
@@ -34,11 +37,12 @@ var ErrBinaryFile = errors.New("binary file")
 // the image is already available as vision input in the
 // conversation, so it should NOT try read_file on it.
 //
+// 检测顺序：先提取支持的文档，再拒绝已知二进制，最后嗅探内容。
 // Detection (in order):
-//  1. Extension: known binary (image / audio / video / archive /
-//     pdf / executable).
-//  2. Content sniff: NUL byte in the first 512 bytes => binary.
-//  3. Otherwise, treat as text.
+//  1. Extract supported PDF and Office documents as text.
+//  2. Extension: reject other known binary types.
+//  3. Content sniff: NUL byte in the first 512 bytes => binary.
+//  4. Otherwise, treat as text.
 //
 // The cap of 1 MiB is generous — anything bigger should be read
 // in chunks via exec_command (head / tail) anyway, not dumped into
@@ -48,6 +52,13 @@ func readFileForTool(p string) ([]byte, error) {
 		return nil, errors.New("path is required")
 	}
 	ext := strings.ToLower(path.Ext(p))
+	if isExtractableDocumentExt(ext) {
+		content, err := knowledge.ReadFileText(p)
+		if err != nil {
+			return nil, err
+		}
+		return capReadFileResult([]byte(content)), nil
+	}
 	if kind, ok := binaryKindByExt(ext); ok {
 		hint := "If you need to look at this file, ask the user to convert it to text or use a vision-capable model"
 		if kind == "image" {
@@ -67,11 +78,24 @@ func readFileForTool(p string) ([]byte, error) {
 	// Cap to 1 MiB to keep the model's context sane. A larger
 	// file would just get truncated by the model anyway, and
 	// hitting a wall here is clearer than silent truncation.
+	return capReadFileResult(data), nil
+}
+
+func isExtractableDocumentExt(ext string) bool {
+	switch ext {
+	case ".pdf", ".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm":
+		return true
+	default:
+		return false
+	}
+}
+
+func capReadFileResult(data []byte) []byte {
 	const maxRead = 1 << 20
 	if len(data) > maxRead {
-		return data[:maxRead], nil
+		return data[:maxRead]
 	}
-	return data, nil
+	return data
 }
 
 // binaryKindByExt maps a known binary file extension to a human
@@ -86,8 +110,6 @@ func binaryKindByExt(ext string) (string, bool) {
 		return "audio", true
 	case ".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv":
 		return "video", true
-	case ".pdf":
-		return "pdf", true
 	case ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war":
 		return "archive", true
 	case ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".obj", ".lib":

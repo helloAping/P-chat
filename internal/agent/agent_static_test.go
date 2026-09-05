@@ -412,6 +412,19 @@ func TestMediaRecognitionRouteRequiresMatchingModelCapability(t *testing.T) {
 	}
 }
 
+func TestEffectiveToolRecognitionCapabilitiesAddsImageFallback(t *testing.T) {
+	a := &Agent{}
+	got := a.effectiveToolRecognitionCapabilities(nil, true)
+	if len(got) != 1 || got[0] != config.MediaImage {
+		t.Fatalf("capabilities = %v, want image fallback", got)
+	}
+
+	got = a.effectiveToolRecognitionCapabilities([]config.MediaKind{config.MediaAudio}, true)
+	if len(got) != 1 || got[0] != config.MediaImage {
+		t.Fatalf("unconfigured audio plus image fallback = %v, want only image", got)
+	}
+}
+
 // TestModelExplicitlySupportsVision locks down the strict opt-in
 // used to gate browser_screenshot. Unlike modelSupportsVision, this
 // never consults the heuristic — `capabilities: {}` reads as

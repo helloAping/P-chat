@@ -296,7 +296,7 @@ func dropCurrentImageRecognitionRefs(msgs []llm.ChatMessage, start int) []llm.Ch
 
 func isCurrentImageRecognitionRef(s string) bool {
 	return strings.Contains(s, "Uploaded image available for tool-based recognition") ||
-		strings.Contains(s, "image_recognize cannot access it")
+		strings.Contains(s, "media_recognize cannot access it")
 }
 
 func replaceImagesWithHeldRefs(msgs []llm.ChatMessage) []llm.ChatMessage {

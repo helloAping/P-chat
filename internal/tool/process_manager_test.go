@@ -99,6 +99,31 @@ func TestExecCommand_NodeHelperScript_RunsInline(t *testing.T) {
 	}
 }
 
+func TestRegisterBuiltin_StartProcessIsHiddenExecCompatibilityAlias(t *testing.T) {
+	r := NewRegistry()
+	RegisterBuiltin(r)
+
+	for _, name := range r.Names() {
+		if name == "start_process" {
+			t.Fatal("start_process should not be exposed beside exec_command")
+		}
+	}
+	meta, handler, ok := r.Lookup("start_process")
+	if !ok {
+		t.Fatal("legacy start_process calls should remain callable")
+	}
+	if meta.Name != "exec_command" {
+		t.Fatalf("legacy start_process resolves to %q, want exec_command", meta.Name)
+	}
+	result, err := handler(context.Background(), []byte(`{"command":"echo alias-background"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.Contains(result.Content, `"id": "proc_`) {
+		t.Fatalf("legacy start_process should still force background execution, got: %s", result.Content)
+	}
+}
+
 // TestPruneExitedProcesses_BoundsRegistry is the regression test for the
 // 2026-08 OOM: the managed-process registry (`processes`) grew without bound
 // because exited background processes were never evicted. pruneExitedProcesses

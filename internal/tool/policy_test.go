@@ -8,7 +8,7 @@ import (
 func TestSubagentMayExpose(t *testing.T) {
 	allow := []string{
 		"read_file", "list_files", "read_docx", "read_pdf", "grep",
-		"wiki_lookup", "wiki_list", "image_recognize", "todo_write", "web_search", "web_fetch",
+		"wiki_lookup", "wiki_list", "media_recognize", "todo_write", "web_search", "web_fetch",
 	}
 	for _, name := range allow {
 		if !SubagentMayExpose(name) {

@@ -349,7 +349,8 @@ define the ceiling):
    - `recall` — coordination tool that stays at the top level
 
 2. **Execution-safe set** (`tool.SubagentMayExpose`):
-   - Local reads: `read_file`, `list_files`, `grep`, `read_docx`, `read_pdf`, wiki
+   - Local reads: `read_file` (including supported PDF/Office extraction), `list_files`, `grep`, wiki
+   - Parent-scoped image recognition: `media_recognize` when shared image refs are available
    - Private checklist: `todo_write`
    - Public network: `web_search`, `web_fetch` (GET or POST to public URLs)
    - A per-agent whitelist cannot add write / exec / interactive / browser / MCP tools
@@ -518,7 +519,7 @@ registry is small (~12 names). An explicit `tools: [...]`
 whitelist is easier to audit and translate to `/agents`
 than the opencode "deny everything, then allow X" pattern.
 The `explore` and `plan` agents whitelist
-`read_file` / `list_files` / `grep` / `read_docx` / `read_pdf`.
+`read_file` / `list_files` / `grep`; `read_file` selects supported document extractors by extension.
 They do not get shell. `general-purpose` may also use
 `todo_write`, `web_search`, and `web_fetch` for public URLs.
 

@@ -120,6 +120,8 @@ func (r *DiskAttachmentResolver) Resolve(a Attachment) (string, int64) {
 
 // --- New ChatMessage-based attachment expansion ---
 
+// ExpandAttachmentsCM 将附件展开为消息；识图模式只保留显示/持久化数据，
+// 并用包含 upload_id 的 media_recognize 引用替代主模型图片输入。
 // ExpandAttachmentsCM converts a list of Attachment objects into
 // separate llm.ChatMessage entries (one text msg + one per
 // attachment). Media may be submitted natively or referenced through a
@@ -130,7 +132,7 @@ func (r *DiskAttachmentResolver) Resolve(a Attachment) (string, int64) {
 // image attachments are replaced with a text marker. When
 // useImageRecognition is true, images are kept for display/storage but
 // withheld from the main LLM; a system reference tells the model to call
-// image_recognize with the upload_id.
+// media_recognize with the corresponding upload_id.
 func ExpandAttachmentsCM(protocol string, msgs []llm.ChatMessage, atts []Attachment, r AttachmentResolver, visionCapable func() bool, useImageRecognition bool) []llm.ChatMessage {
 	capabilities := []config.MediaKind(nil)
 	if useImageRecognition {
@@ -204,7 +206,7 @@ func ExpandAttachmentsForCapabilitiesCM(protocol string, msgs []llm.ChatMessage,
 						Role: llm.RoleSystem,
 						Type: llm.TypeText,
 						Content: fmt.Sprintf(
-							"Uploaded image available for tool-based recognition: name=%q, upload_id=%q, size=%d bytes, MIME=%s. The main model cannot see this image directly in this session. If image details are needed, call image_recognize with this upload_id, or use upload_ids to analyze multiple images in one call.",
+							"Uploaded image available for tool-based recognition: name=%q, upload_id=%q, size=%d bytes, MIME=%s. The main model cannot see this image directly in this session. If image details are needed, call media_recognize with this upload_id, or use upload_ids to analyze multiple images in one call.",
 							a.Name, a.UploadID, len(data), mime,
 						),
 					})
@@ -212,7 +214,7 @@ func ExpandAttachmentsForCapabilitiesCM(protocol string, msgs []llm.ChatMessage,
 					result = append(result, llm.ChatMessage{
 						Role:    llm.RoleSystem,
 						Type:    llm.TypeText,
-						Content: fmt.Sprintf("An image named %q was uploaded, but it has no upload_id; image_recognize cannot access it. Ask the user to upload it again if image details are required.", a.Name),
+						Content: fmt.Sprintf("An image named %q was uploaded, but it has no upload_id; media_recognize cannot access it. Ask the user to upload it again if image details are required.", a.Name),
 					})
 				}
 				continue

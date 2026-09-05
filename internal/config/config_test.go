@@ -128,6 +128,21 @@ func TestSubAgentConfig_DenyList(t *testing.T) {
 	}
 }
 
+func TestSubAgentConfig_LegacyToolNamesMatchCanonicalTools(t *testing.T) {
+	whitelist := SubAgentConfig{AllowedTools: []string{"image_recognize", "read_pdf"}}
+	if !whitelist.ToolAllowed("media_recognize") {
+		t.Error("legacy image_recognize whitelist should allow media_recognize")
+	}
+	if !whitelist.ToolAllowed("read_file") {
+		t.Error("legacy read_pdf whitelist should allow read_file")
+	}
+
+	denylist := SubAgentConfig{DeniedTools: []string{"image_recognize"}}
+	if denylist.ToolAllowed("media_recognize") {
+		t.Error("legacy image_recognize denylist should deny media_recognize")
+	}
+}
+
 func TestSubAgentConfig_Timeout(t *testing.T) {
 	c := &SubAgentConfig{}
 	if got := c.TimeoutDuration(); got != 0 {

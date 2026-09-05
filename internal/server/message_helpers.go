@@ -1050,6 +1050,7 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 	return "", "text", "text/plain"
 }
 
+// buildLLMMessages 将会话历史整理为 LLM 消息，并为历史图片保留安全的工具引用。
 // buildLLMMessages turns a session's stored history into the
 // message slice fed to the LLM. Two responsibilities:
 //
@@ -1059,7 +1060,7 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 //     doesn't need in its context. Historical image rows with
 //     upload_id are the exception: the agent needs their
 //     references so it can replace them with safe placeholders
-//     or image_recognize tool hints before the LLM request.
+//     or media_recognize tool hints before the LLM request.
 //
 //  2. Rewrite `task` tool results from role=tool to role=user.
 //     The `task` tool is the sub-agent system entry point.

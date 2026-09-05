@@ -1932,6 +1932,13 @@ func filterSubAgentTools(
 	parentAllowed func(name string) bool,
 ) *tool.Registry {
 	subTools := tool.NewRegistry()
+	canonicalWhitelist := make(map[string]struct{}, len(agentWhitelist))
+	for _, name := range agentWhitelist {
+		if canonical, ok := parent.CanonicalNameForProject(name, ""); ok {
+			name = canonical
+		}
+		canonicalWhitelist[name] = struct{}{}
+	}
 	for _, name := range parent.Names() {
 		// Sub-agents can't spawn/manage sub-agents or call recall
 		// themselves; these coordination tools stay at the top level.
@@ -1945,12 +1952,7 @@ func filterSubAgentTools(
 		// allow/deny list (see the doc comment above).
 		inWhitelist := false
 		if agentKnown && len(agentWhitelist) > 0 {
-			for _, t := range agentWhitelist {
-				if t == name {
-					inWhitelist = true
-					break
-				}
-			}
+			_, inWhitelist = canonicalWhitelist[name]
 			if !inWhitelist {
 				continue
 			}

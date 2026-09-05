@@ -101,8 +101,9 @@ type SandboxChecker interface {
 	CheckExecDecision(command string) SandboxDecision
 	// CheckWriteDecision returns the full Decision for write.
 	CheckWriteDecision(path, projectRoot string) SandboxDecision
+	// 该检查覆盖 read_file（含旧文档别名）和 list_files。
 	// CheckReadDecision returns the full Decision for read.
-	// Added 2026-07 to cover read_file / read_docx / read_pdf
+	// Added 2026-07 to cover read_file (and legacy document aliases)
 	// / list_files - previously these bypassed the sandbox
 	// entirely, which let an LLM read /etc/passwd after a
 	// write confirm was approved. The decision table is the
@@ -262,10 +263,20 @@ type dynamicToolEntry struct {
 	origin  ToolOrigin
 }
 
+type toolAlias struct {
+	canonical string
+	handler   ToolHandler
+}
+
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]ToolHandler
 	meta  map[string]Tool
+	// aliases 保存旧调用名到 canonical 工具的映射，但不向模型暴露。
+	// aliases maps legacy callable names to canonical tools. Aliases are
+	// intentionally absent from meta so List/Names expose only the canonical
+	// interface to the model while old callers can still resolve safely.
+	aliases map[string]toolAlias
 	// sources tracks the on-disk origin of each tool. The
 	// P3-2 dynamic watcher populates this so the
 	// GET /api/v1/tools endpoint can badge user-defined
@@ -286,6 +297,7 @@ func NewRegistry() *Registry {
 	return &Registry{
 		tools:          make(map[string]ToolHandler),
 		meta:           make(map[string]Tool),
+		aliases:        make(map[string]toolAlias),
 		sources:        make(map[string]string),
 		dynamicEntries: make(map[string]dynamicToolEntry),
 	}
@@ -296,7 +308,44 @@ func (r *Registry) Register(t Tool, h ToolHandler) {
 	defer r.mu.Unlock()
 	r.tools[t.Name] = h
 	r.meta[t.Name] = t
+	delete(r.aliases, t.Name)
 	delete(r.sources, t.Name)
+}
+
+// RegisterAlias 注册一个只用于兼容旧调用、不会进入模型工具列表的别名。
+// RegisterAlias keeps a legacy tool name callable without exposing it in the
+// model-facing Names or List views. Exact built-in or dynamic registrations
+// always take precedence over an alias with the same name.
+func (r *Registry) RegisterAlias(alias, canonical string) {
+	alias = strings.TrimSpace(alias)
+	canonical = strings.TrimSpace(canonical)
+	if alias == "" || canonical == "" || alias == canonical {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.meta[alias]; exists {
+		return
+	}
+	r.aliases[alias] = toolAlias{canonical: canonical}
+}
+
+// RegisterAliasHandler 注册带旧行为适配器的隐藏兼容别名。
+// RegisterAliasHandler is RegisterAlias with a compatibility adapter. The
+// adapter handles calls made through the legacy name while policy and model
+// visibility continue to come from the canonical tool metadata.
+func (r *Registry) RegisterAliasHandler(alias, canonical string, handler ToolHandler) {
+	alias = strings.TrimSpace(alias)
+	canonical = strings.TrimSpace(canonical)
+	if alias == "" || canonical == "" || alias == canonical || handler == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.meta[alias]; exists {
+		return
+	}
+	r.aliases[alias] = toolAlias{canonical: canonical, handler: handler}
 }
 
 // RegisterWithSource is the compatibility wrapper for global dynamic tools.
@@ -405,6 +454,7 @@ func (r *Registry) Unregister(name string) {
 	defer r.mu.Unlock()
 	delete(r.tools, name)
 	delete(r.meta, name)
+	delete(r.aliases, name)
 	delete(r.sources, name)
 	for key, entry := range r.dynamicEntries {
 		if entry.tool.Name == name && entry.origin.Scope == ToolOriginGlobal {
@@ -424,6 +474,7 @@ func (r *Registry) UnregisterBuiltin(name string) {
 	}
 	delete(r.tools, name)
 	delete(r.meta, name)
+	delete(r.aliases, name)
 	delete(r.sources, name)
 	r.rebuildLegacyDynamicLocked()
 }
@@ -446,12 +497,7 @@ func (r *Registry) Get(name string) (ToolHandler, bool) {
 func (r *Registry) GetForProject(name, projectRoot string) (ToolHandler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if projectRoot != "" {
-		if entry, ok := r.effectiveDynamicLocked(projectRoot)[name]; ok {
-			return entry.handler, true
-		}
-	}
-	h, ok := r.tools[name]
+	_, h, ok := r.lookupForProjectLocked(name, projectRoot)
 	return h, ok
 }
 
@@ -465,17 +511,58 @@ func (r *Registry) Lookup(name string) (Tool, ToolHandler, bool) {
 func (r *Registry) LookupForProject(name, projectRoot string) (Tool, ToolHandler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.lookupForProjectLocked(name, projectRoot)
+}
+
+func (r *Registry) lookupForProjectLocked(name, projectRoot string) (Tool, ToolHandler, bool) {
+	var dynamic map[string]dynamicToolEntry
 	if projectRoot != "" {
-		if entry, ok := r.effectiveDynamicLocked(projectRoot)[name]; ok {
+		dynamic = r.effectiveDynamicLocked(projectRoot)
+	}
+	visited := make(map[string]struct{}, len(r.aliases)+1)
+	var aliasHandler ToolHandler
+	for {
+		if _, seen := visited[name]; seen {
+			return Tool{}, nil, false
+		}
+		visited[name] = struct{}{}
+		if entry, ok := dynamic[name]; ok {
+			if aliasHandler != nil {
+				return entry.tool, aliasHandler, true
+			}
 			return entry.tool, entry.handler, true
 		}
+		h, hok := r.tools[name]
+		t, tok := r.meta[name]
+		if hok && tok {
+			if aliasHandler != nil {
+				return t, aliasHandler, true
+			}
+			return t, h, true
+		}
+		alias, ok := r.aliases[name]
+		if !ok {
+			return Tool{}, nil, false
+		}
+		if aliasHandler == nil && alias.handler != nil {
+			aliasHandler = alias.handler
+		}
+		name = alias.canonical
 	}
-	h, hok := r.tools[name]
-	t, tok := r.meta[name]
-	if !hok || !tok {
-		return Tool{}, nil, false
+}
+
+// CanonicalNameForProject 将任意可调用名称解析为项目视图中的 canonical 名称。
+// CanonicalNameForProject resolves a callable name to the name exposed by the
+// effective tool metadata. It returns false when neither a tool nor a hidden
+// compatibility alias is available in the requested project view.
+func (r *Registry) CanonicalNameForProject(name, projectRoot string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	meta, _, ok := r.lookupForProjectLocked(name, projectRoot)
+	if !ok {
+		return "", false
 	}
-	return t, h, true
+	return meta.Name, true
 }
 
 // Names returns the registered tool names in sorted order.
@@ -613,21 +700,13 @@ func RegisterBuiltin(r *Registry) {
 			"background": BoolProp("If true, start the command as a managed background process and return a process_id immediately."),
 		}, []string{"command"}),
 	}, handleExecCommand)
-
-	r.Register(Tool{
-		Name:        "start_process",
-		Description: "Start a long-running local command in the background. Returns a managed process_id. Use for dev servers, watchers, Java services, and Node servers.",
-		Parameters: ObjectSchema(map[string]any{
-			"command":  StringProp("The shell command to execute in the background"),
-			"work_dir": StringProp("Optional working directory for the command"),
-		}, []string{"command"}),
-	}, handleStartProcess)
+	r.RegisterAliasHandler("start_process", "exec_command", handleStartProcess)
 
 	r.Register(Tool{
 		Name:        "read_process_output",
-		Description: "Read buffered stdout/stderr from a process started by start_process or a backgrounded exec_command.",
+		Description: "Read buffered stdout/stderr from a managed process started by exec_command with background=true.",
 		Parameters: ObjectSchema(map[string]any{
-			"process_id": StringProp("The managed process id returned by start_process or exec_command"),
+			"process_id": StringProp("The managed process id returned by exec_command with background=true"),
 			"max_bytes":  map[string]any{"type": "integer", "description": "Optional maximum bytes to return from the tail of the buffered output"},
 		}, []string{"process_id"}),
 	}, handleReadProcessOutput)
@@ -648,9 +727,10 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name: "read_file",
-		Description: "Read the full contents of a TEXT file. Use for inspecting source files, configs, or any text artifact. " +
-			"DO NOT call read_file on images, audio, video, PDFs, archives, or any binary file - " +
+		Description: "Read text from a local project file, including source/config files, PDFs, and Word, Excel, or PowerPoint documents. " +
+			"DO NOT call read_file on images, audio, video, archives, or other unsupported binary files - " +
 			"those will return a binary error. " +
+			"For a user-uploaded attachment, use read_attachment with its upload_id instead of an on-disk path. " +
 			"Images uploaded by the user are ALREADY available as vision input (image_url) in the user message; " +
 			"just look at them directly, do NOT call read_file on the on-disk copy.",
 		Parameters: ObjectSchema(map[string]any{
@@ -658,6 +738,11 @@ func RegisterBuiltin(r *Registry) {
 			"dry_run": BoolProp("If true, return file size + first 200 chars without reading the full body."),
 		}, []string{"path"}),
 	}, handleReadFile)
+	// 旧文档工具继续可调用，模型只看到由扩展名选择解析器的 read_file。
+	// Legacy document-specific calls remain executable, while the model sees one
+	// local-reader contract and lets read_file select the extractor by extension.
+	r.RegisterAlias("read_docx", "read_file")
+	r.RegisterAlias("read_pdf", "read_file")
 
 	r.Register(Tool{
 		Name:        "read_attachment",
@@ -690,22 +775,6 @@ func RegisterBuiltin(r *Registry) {
 	}, handleEditFile)
 
 	r.Register(Tool{
-		Name:        "read_docx",
-		Description: "Extract and return the full plain text content from a .docx (Word) file. Use this for reading Word documents uploaded by the user. Returns the document text as a single string.",
-		Parameters: ObjectSchema(map[string]any{
-			"path": StringProp("Absolute or relative path to the .docx file"),
-		}, []string{"path"}),
-	}, handleReadDocx)
-
-	r.Register(Tool{
-		Name:        "read_pdf",
-		Description: "Extract and return the full plain text content from a .pdf file. Use this for reading PDF documents uploaded by the user. Returns the document text as a single string.",
-		Parameters: ObjectSchema(map[string]any{
-			"path": StringProp("Absolute or relative path to the .pdf file"),
-		}, []string{"path"}),
-	}, handleReadPdf)
-
-	r.Register(Tool{
 		Name:        "list_files",
 		Description: "List files and subdirectories in a directory. Returns names only, not recursive.",
 		Parameters: ObjectSchema(map[string]any{
@@ -724,23 +793,8 @@ func RegisterBuiltin(r *Registry) {
 	}, handleWebFetch)
 
 	r.Register(Tool{
-		Name:        "image_recognize",
-		Description: "Analyze one or more user-uploaded images and return text to the main conversation. The host may use a configured image recognition model or the current vision-capable chat model. Use upload_ids for multiple images in a single call. Use only upload_id values explicitly shown in this chat. Do not pass file paths.",
-		Parameters: ObjectSchema(map[string]any{
-			"upload_id": StringProp("The upload_id of a single image attached in this conversation. Kept for compatibility; prefer upload_ids when there is more than one image."),
-			"upload_ids": map[string]any{
-				"type":        "array",
-				"description": "Upload ids of images attached in this conversation, in the order they should be analyzed.",
-				"items":       map[string]any{"type": "string"},
-				"minItems":    1,
-			},
-			"question": StringProp("Optional focused question for the vision model, e.g. what details to extract from the image"),
-		}, nil),
-	}, handleImageRecognize)
-
-	r.Register(Tool{
 		Name:        "media_recognize",
-		Description: "Analyze one or more user-uploaded images, videos, or audio files through the media capability enabled for this session. Uploads in one call must share the same media type. Use only upload_id values explicitly shown in this chat; never pass file paths.",
+		Description: "Analyze one or more user-uploaded images, videos, or audio files through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Uploads in one call must share the same media type. Use only upload_id values explicitly shown in this chat; never pass file paths.",
 		Parameters: ObjectSchema(map[string]any{
 			"upload_id": StringProp("A single upload_id attached in this conversation"),
 			"upload_ids": map[string]any{
@@ -750,6 +804,11 @@ func RegisterBuiltin(r *Registry) {
 			"question": StringProp("Optional focused question for the configured recognition model"),
 		}, nil),
 	}, handleMediaRecognize)
+	// 旧工具调用和白名单继续生效，但模型只学习一个 canonical 媒体入口。
+	// Keep old tool calls and allowlists working without teaching the model two
+	// names for the same capability. The alias is callable but absent from
+	// Names/List and therefore from the native tool schema and prompt table.
+	r.RegisterAlias("image_recognize", "media_recognize")
 
 	r.Register(Tool{
 		Name:        "todo_write",
@@ -1365,70 +1424,6 @@ func isInUploadDir(p string) bool {
 	}
 
 	return false
-}
-
-// handleReadDocx is the tool handler for read_docx.
-func handleReadDocx(ctx context.Context, args json.RawMessage) (*CallResult, error) {
-	var a readFileArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return &CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
-	}
-	if a.Path == "" {
-		return &CallResult{Content: "path is required", IsError: true}, nil
-	}
-	a.Path = resolveToProjectRoot(ctx, a.Path)
-	if sb := sandboxFromCtx(ctx); sb != nil && sb.CheckReadDecision(a.Path, projectRootFromCtx(ctx)) == SandboxBlock {
-		return &CallResult{
-			Content: fmt.Sprintf("E_SANDBOX: read_docx blocked by sandbox policy\n  path: %s", a.Path),
-			IsError: true,
-		}, nil
-	}
-	if isInUploadDir(a.Path) {
-		return &CallResult{
-			Content: fmt.Sprintf(
-				"E_UPLOAD_DIR: read blocked: %s is inside the chat upload directory. "+
-					"Uploaded files are already inlined in the user message; do NOT call "+
-					"read_docx on them.", a.Path),
-			IsError: true,
-		}, nil
-	}
-	text, err := readDocx(a.Path)
-	if err != nil {
-		return &CallResult{Content: err.Error(), IsError: true}, nil
-	}
-	return &CallResult{Content: text}, nil
-}
-
-// handleReadPdf is the tool handler for read_pdf.
-func handleReadPdf(ctx context.Context, args json.RawMessage) (*CallResult, error) {
-	var a readFileArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return &CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
-	}
-	if a.Path == "" {
-		return &CallResult{Content: "path is required", IsError: true}, nil
-	}
-	a.Path = resolveToProjectRoot(ctx, a.Path)
-	if sb := sandboxFromCtx(ctx); sb != nil && sb.CheckReadDecision(a.Path, projectRootFromCtx(ctx)) == SandboxBlock {
-		return &CallResult{
-			Content: fmt.Sprintf("E_SANDBOX: read_pdf blocked by sandbox policy\n  path: %s", a.Path),
-			IsError: true,
-		}, nil
-	}
-	if isInUploadDir(a.Path) {
-		return &CallResult{
-			Content: fmt.Sprintf(
-				"E_UPLOAD_DIR: read blocked: %s is inside the chat upload directory. "+
-					"Uploaded files are already inlined in the user message; do NOT call "+
-					"read_pdf on them.", a.Path),
-			IsError: true,
-		}, nil
-	}
-	text, err := readPdf(a.Path)
-	if err != nil {
-		return &CallResult{Content: err.Error(), IsError: true}, nil
-	}
-	return &CallResult{Content: text}, nil
 }
 
 type webFetchArgs struct {

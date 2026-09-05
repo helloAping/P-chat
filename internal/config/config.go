@@ -157,8 +157,9 @@ func (m TodoLongRunMode) AllowsUnlimitedRounds(hasActiveTodos bool) bool {
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
 //
+// 可见性先受安全执行集限制，再由允许/拒绝列表继续收窄。
 // Visibility is first capped by the execution-safe set
-// (tool.SubagentMayExpose): local reads, todo_write, image_recognize,
+// (tool.SubagentMayExpose): local reads, todo_write, media_recognize,
 // web_search, and web_fetch. AllowedTools then further restricts that set; when
 // empty, all execution-safe parent tools except DeniedTools are
 // passed. The `task` family and `recall` are always excluded.
@@ -216,13 +217,14 @@ func (s SubAgentConfig) CacheTTLDuration() time.Duration {
 // ToolAllowed reports whether the given tool name is allowed for a
 // sub-agent. The `task` tool is never allowed (recursion prevention).
 func (s SubAgentConfig) ToolAllowed(name string) bool {
+	name = canonicalToolPolicyName(name)
 	if name == "task" {
 		return false
 	}
 	// Whitelist has priority: if set, only listed tools pass.
 	if len(s.AllowedTools) > 0 {
 		for _, t := range s.AllowedTools {
-			if t == name {
+			if canonicalToolPolicyName(t) == name {
 				return true
 			}
 		}
@@ -230,11 +232,27 @@ func (s SubAgentConfig) ToolAllowed(name string) bool {
 	}
 	// Otherwise, blacklist.
 	for _, t := range s.DeniedTools {
-		if t == name {
+		if canonicalToolPolicyName(t) == name {
 			return false
 		}
 	}
 	return true
+}
+
+// canonicalToolPolicyName 让持久化的旧允许/拒绝列表在工具合并后继续生效。
+// canonicalToolPolicyName keeps persisted allow/deny lists working after
+// several overlapping tools were collapsed behind canonical contracts.
+func canonicalToolPolicyName(name string) string {
+	switch name {
+	case "image_recognize":
+		return "media_recognize"
+	case "read_docx", "read_pdf":
+		return "read_file"
+	case "start_process":
+		return "exec_command"
+	default:
+		return name
+	}
 }
 
 type ServerConfig struct {
@@ -572,8 +590,9 @@ func (r RecognitionConfig) Route(kind MediaKind) (RecognitionRoute, bool) {
 	return route, true
 }
 
+// VisionRecognitionConfig 选择 media_recognize 图片策略使用的外接多模态模型。
 // VisionRecognitionConfig selects the external multimodal model used by
-// the image_recognize tool. The main chat model can stay text-only; when
+// the media_recognize image strategy. The main chat model can stay text-only; when
 // a session opts in, uploaded images are described through this model and
 // returned to the main conversation as tool text.
 type VisionRecognitionConfig struct {

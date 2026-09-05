@@ -111,3 +111,106 @@ func TestChatWithToolsAllowedToolsBlocksHiddenToolCalls(t *testing.T) {
 		t.Fatalf("advertised tools = %q, want read_file only", got)
 	}
 }
+
+func TestChatWithToolsAllowedToolsAcceptsHiddenCompatibilityAlias(t *testing.T) {
+	var advertised atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Tools []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		names := make([]string, 0, len(request.Tools))
+		for _, item := range request.Tools {
+			names = append(names, item.Function.Name)
+		}
+		advertised.Store(strings.Join(names, ","))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		LLM: config.LLMConfig{Default: "test", Providers: []config.ProviderConfig{{
+			Name: "test", Protocol: "openai", BaseURL: srv.URL, APIKey: "test-key", Model: "test-model",
+		}}},
+		Limits: config.LimitsConfig{MaxRounds: 2},
+	}
+	llmClient, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := tool.NewRegistry()
+	registry.RegisterForTest(tool.Tool{Name: "canonical_tool", Description: "canonical capability"})
+	registry.RegisterAlias("legacy_tool", "canonical_tool")
+
+	agt := New(cfg, llmClient, (*style.Manager)(nil), nil, registry)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for range agt.ChatWithTools(ctx, ChatRequest{
+		Style:        style.Off,
+		Provider:     "test",
+		Model:        "test-model",
+		AllowedTools: []string{"legacy_tool"},
+		Messages:     []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: "inspect image"}},
+	}) {
+	}
+
+	if got, _ := advertised.Load().(string); got != "canonical_tool" {
+		t.Fatalf("advertised tools = %q, want canonical_tool", got)
+	}
+}
+
+func TestChatWithToolsDispatchesHiddenCompatibilityAlias(t *testing.T) {
+	var requests atomic.Int32
+	var called atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := requests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if count == 1 {
+			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_legacy\",\"type\":\"function\",\"function\":{\"name\":\"legacy_tool\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		} else {
+			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		LLM: config.LLMConfig{Default: "test", Providers: []config.ProviderConfig{{
+			Name: "test", Protocol: "openai", BaseURL: srv.URL, APIKey: "test-key", Model: "test-model",
+		}}},
+		Limits: config.LimitsConfig{MaxRounds: 2},
+	}
+	llmClient, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := tool.NewRegistry()
+	registry.Register(tool.Tool{Name: "canonical_tool", Description: "canonical capability"}, func(context.Context, json.RawMessage) (*tool.CallResult, error) {
+		called.Store(true)
+		return &tool.CallResult{Content: "legacy accepted"}, nil
+	})
+	registry.RegisterAlias("legacy_tool", "canonical_tool")
+
+	agt := New(cfg, llmClient, (*style.Manager)(nil), nil, registry)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for range agt.ChatWithTools(ctx, ChatRequest{
+		Style:    style.Off,
+		Provider: "test",
+		Model:    "test-model",
+		Messages: []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: "use legacy call"}},
+	}) {
+	}
+
+	if !called.Load() {
+		t.Fatal("hidden compatibility alias was not dispatched to its canonical handler")
+	}
+}

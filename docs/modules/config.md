@@ -62,7 +62,7 @@ LLMConfig 核心字段：
 
 单会话是否优先使用该能力存放在 `conversations.metadata.use_image_recognition`。当系统配置和会话开关都开启时，当前轮图片先由配置模型识别，主模型只接收识别文本。
 
-`image_recognize` 的历史图片回看能力不只依赖该开关：如果会话没有开启专门识图，但历史上下文里有带 `upload_id` 的图片引用，并且当前对话模型支持视觉输入，Agent 也可以暴露 `image_recognize`，由工具 fallback 到当前 provider/model 做一次非流式识别。没有任何可用视觉能力时，历史图片占位会提示用户重新上传图片或切换/配置视觉模型。
+`media_recognize` 的历史图片回看能力不只依赖该开关：如果会话没有开启专门识图，但历史上下文里有带 `upload_id` 的图片引用，并且当前对话模型支持视觉输入，工具会 fallback 到当前 provider/model 做一次非流式识别。旧名 `image_recognize` 只作为隐藏兼容别名保留。
 
 ## 修改指南
 

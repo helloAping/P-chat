@@ -77,13 +77,15 @@ LLMConfig 核心字段：
 
 单会话选择保存在 `conversations.metadata.enabled_recognition_capabilities`，它是媒体类型数组。只有系统路由完整、协议受支持、目标模型明确声明对应输入能力且会话明确选中的能力，才会暴露给 Agent。模型的 `input_modalities: []` 是明确的“无媒体能力”，不会再被模型名启发式判断覆盖；字段完全缺失时，图片仍保留旧版兼容判断。图片兼容旧版 `vision_recognition`、`use_image_recognition` 与 `supports_vision`；V9 升级步骤把旧开关迁移为 `image` 选项。音频和视频外接识别当前要求 OpenAI 兼容协议。
 
-`image_recognize` 继续承担旧版图片回看和当前视觉模型 fallback；统一的 `media_recognize` 根据上传引用解析图片、音频或视频，并严格限制为本会话已选择且系统已配置的媒体类型。
+`media_recognize` 是模型可见的统一入口：根据上传引用解析图片、音频或视频，并按媒体类型选择配置路由；图片在没有独立路由时仍可 fallback 到当前视觉模型。旧名 `image_recognize` 只作为隐藏兼容别名存在。
 
 ### 7. SubAgentConfig
 
 `subagent` 控制 `task` 子代理：
 - `cache_ttl` / `timeout` — 子代理缓存和显式 wall-clock 超时策略。
 - `allowed_tools` / `denied_tools` — 在子代理安全集内进一步收窄可见工具。
+
+持久化配置中的旧工具名会在运行时映射到 canonical 名称：`image_recognize → media_recognize`、`read_docx/read_pdf → read_file`、`start_process → exec_command`，无需修改现有用户配置。
 
 单会话可通过 `conversations.metadata.sub_agent_model_enabled`、`sub_agent_provider`、`sub_agent_model` 指定子代理模型。默认关闭时继承父对话 provider/model；用户在会话设置里开启自定义后才选择模型。子代理最终模型优先级是：`task` 工具显式参数 → 专用 agent 定义的模型 → 会话自定义 → 父对话模型。
 

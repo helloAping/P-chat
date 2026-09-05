@@ -89,16 +89,18 @@ type Handler struct {
 }
 
 type sessionMeta struct {
-	Style                   string
-	WorkMode                string
-	Provider                string
-	Model                   string
-	ReasoningEffort         string             // "off" | "low" | "medium" | "high" | "max"
-	ProjectPath             string             // project root directory, "" = global
-	PlanMode                bool               // plan mode (no tools, single turn)
-	PermissionLevel         string             // "ask" | "auto" | "full"
-	KnowledgeBase           string             // "" = off, "__all__" = all bases, or a specific base name
-	UseImageRecognition     bool               // true = uploaded images are recognized through image_recognize
+	Style           string
+	WorkMode        string
+	Provider        string
+	Model           string
+	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
+	ProjectPath     string // project root directory, "" = global
+	PlanMode        bool   // plan mode (no tools, single turn)
+	PermissionLevel string // "ask" | "auto" | "full"
+	KnowledgeBase   string // "" = off, "__all__" = all bases, or a specific base name
+	// true 表示上传图片使用已配置的 media_recognize 图片策略。
+	// true means uploaded images use the configured media_recognize image strategy.
+	UseImageRecognition     bool
 	RecognitionCapabilities []config.MediaKind // enabled media-recognition tools
 	SubAgentModelEnabled    bool               // true = sub-agents use SubAgentProvider/SubAgentModel by default
 	SubAgentProvider        string             // provider for per-session sub-agent model override
