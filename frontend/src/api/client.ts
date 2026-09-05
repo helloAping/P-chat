@@ -121,6 +121,10 @@ export interface MessageAttachment {
   //             with a text marker, etc.)
   type: 'image_url' | 'audio_url' | 'video_url' | 'text'
   url?: string
+  // Present on optimistic GUI messages. History responses expose the same
+  // upload through /api/v1/uploads/:id, which the rollback adapter can parse.
+  // 前端乐观消息保留上传引用，撤回时无需重新上传附件。
+  upload_id?: string
   text?: string
   name?: string
   mime?: string

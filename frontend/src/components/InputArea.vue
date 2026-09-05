@@ -22,7 +22,8 @@ import {
   isStreaming,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
-  currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
+  currentRollbackBanner, currentPendingInput, currentPendingInputRevision, currentRollbackDraft,
+  undoRollback, dismissRollback,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
   currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
@@ -58,16 +59,34 @@ function resizeTextarea() {
 watch(inputText, () => nextTick(resizeTextarea))
 watch(() => currentAttachments.value.length, () => nextTick(resizeTextarea))
 
-// Sync rollback pending input to the textarea.
-watch(currentPendingInput, (val) => {
-  if (val) {
-    inputText.value = val
+// Sync a rollback draft to the textarea. The revision signal is required for
+// attachment-only messages and repeated rollbacks whose caption is unchanged.
+// 撤回纯附件消息时同样要清空旧文字并聚焦输入框。
+watch(
+  () => [state.currentID, currentPendingInputRevision.value] as const,
+  () => {
+    const draft = currentRollbackDraft.value
+    if (!draft) return
+    inputText.value = currentPendingInput.value
     nextTick(() => {
       inputEl.value?.focus()
       resizeTextarea()
     })
+  },
+)
+
+async function onUndoRollback() {
+  const sessionID = state.currentID
+  if (!sessionID) return
+  const draft = currentRollbackDraft.value
+  const shouldClearInjectedText = !!draft && inputText.value === draft.text
+  try {
+    await undoRollback(sessionID)
+    if (shouldClearInjectedText) inputText.value = ''
+  } catch (e: any) {
+    message.error(`撤销失败：${e?.message || e}`)
   }
-})
+}
 
 // Also sync after backspace / clear (send resets inputText to '').
 onMounted(() => nextTick(resizeTextarea))
@@ -869,7 +888,15 @@ function buildLocalBubbleAttachments(attachments: PendingAttachment[]): api.Mess
     if (a.kind === 'image' || a.kind === 'audio' || a.kind === 'video') {
       const type = a.kind === 'image' ? 'image_url' : a.kind === 'audio' ? 'audio_url' : 'video_url'
       const url = a._file ? URL.createObjectURL(a._file) : dataURLToBlobURL(a._dataURL)
-      if (url) result.push({ type, url, name: a.name, kind: a.kind, mime: a.mime })
+      const previewURL = url || (a.id ? api.uploadURL(a.id) : '')
+      if (previewURL) result.push({
+        type,
+        url: previewURL,
+        upload_id: a.id || undefined,
+        name: a.name,
+        kind: a.kind,
+        mime: a.mime,
+      })
       continue
     }
     const url = a._file
@@ -881,6 +908,7 @@ function buildLocalBubbleAttachments(attachments: PendingAttachment[]): api.Mess
       type: 'text',
       url: url || undefined,
       text: a.kind === 'text' ? a._dataURL || undefined : undefined,
+      upload_id: a.id || undefined,
       name: a.name,
       kind: a.kind,
       mime: a.mime,
@@ -1018,22 +1046,31 @@ async function send() {
   // assistant messages later in the same session.
   const clientMsgId = Date.now() * 1000 + Math.floor(Math.random() * 1000)
   const shouldQueue = currentConversationBusy.value || currentTurnQueue.value.length > 0
+  let optimisticUserMessage: api.Message | null = null
   if (!shouldQueue) {
     // The bubble is optimistic: local object URLs render immediately while a
     // just-selected attachment finishes its existing read/upload task.
     const bubbleAttachments = buildLocalBubbleAttachments(stagedAttachments)
-    state.sessionMessages[id].push({
+    optimisticUserMessage = {
       id: clientMsgId,
       role: 'user',
       content: text,
       created_at: Date.now() / 1000,
       attachments: bubbleAttachments.length ? bubbleAttachments : undefined,
-    })
+    }
+    state.sessionMessages[id].push(optimisticUserMessage)
     clearAttachments(id)
     notifyManager.unlock()
   }
 
   await waitForPendingAttachments(stagedAttachments)
+  // Uploads can finish after the optimistic bubble was inserted. Keep the
+  // durable id on that GUI message so an immediate rollback can restore the
+  // same files without reading or uploading them again.
+  optimisticUserMessage?.attachments?.forEach((attachment, index) => {
+    const uploadID = stagedAttachments[index]?.id
+    if (uploadID) attachment.upload_id = uploadID
+  })
   const inlineAttachments = buildInlineAttachments(stagedAttachments)
   const skillContext = pendingSkillContext || undefined
   const turnPayload = api.sendPayloadFromOptions({
@@ -1675,7 +1712,7 @@ watch([() => state.currentID, queueSignature], () => {
     <div v-if="currentRollbackBanner" class="rollback-banner">
       <Undo2 :size="14" class="rollback-banner-icon" />
       <span class="rollback-banner-text">已撤回 {{ currentRollbackBanner.count }} 条消息</span>
-      <button class="rollback-banner-undo" @click="undoRollback(state.currentID)">撤销</button>
+      <button class="rollback-banner-undo" @click="onUndoRollback">撤销</button>
       <button class="rollback-banner-dismiss" @click="dismissRollback(state.currentID)" aria-label="关闭">×</button>
     </div>
 

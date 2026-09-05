@@ -38,7 +38,7 @@ test('input shows the local user bubble before attachment preparation and reuses
   const sendEnd = source.indexOf('\nfunction stop()', sendStart)
   const sendSource = source.slice(sendStart, sendEnd)
 
-  const appendIndex = sendSource.indexOf('state.sessionMessages[id].push({')
+  const appendIndex = sendSource.indexOf('state.sessionMessages[id].push(optimisticUserMessage)')
   const prepareIndex = sendSource.indexOf('await waitForPendingAttachments(')
   assert.ok(appendIndex >= 0, 'send should append the local user message')
   assert.ok(prepareIndex >= 0, 'send should await the existing attachment preparation')

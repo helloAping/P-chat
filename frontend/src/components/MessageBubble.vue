@@ -34,7 +34,7 @@ import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
   ArrowDown, ArrowUp, MoreHorizontal, Sparkles,
-  Check, Loader2, XCircle, CornerDownLeft,
+  Check, Loader2, XCircle, CornerDownLeft, Maximize2, Play,
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
 
@@ -82,7 +82,7 @@ const emit = defineEmits<{
 function onRollback() {
   dialog.warning({
     title: '确认撤回',
-    content: '确定撤回此消息及之后的所有回复？此操作可撤销。',
+    content: '确定撤回此消息及之后的所有回复？文字和附件将回到输入框，此操作可撤销。',
     positiveText: '确认撤回',
     negativeText: '取消',
     onPositiveClick: () => {
@@ -265,9 +265,8 @@ function showEarlierParts() {
 
 // The role check: system messages get a special icon.
 const isSystem = computed(() => (props.message.msg_type ?? 0) === 0 && props.message.role === 'system')
-const hasImageAttachment = computed(() =>
-  props.message.attachments?.some(attachment => attachment.type === 'image_url' && !!attachment.url) ?? false,
-)
+const hasAttachments = computed(() => (props.message.attachments?.length || 0) > 0)
+const hasVisibleUserContent = computed(() => !!props.message.content?.trim())
 
 // For user / system messages, the markdown pipeline
 // renders the whole `content` string. For assistant
@@ -310,6 +309,47 @@ function expandTextPart(index: number) {
 function openLightbox(src: string, alt: string, kind: 'image' | 'video' = 'image') {
   state.lightbox = { show: true, src, alt, kind }
 }
+
+type AttachmentVisualKind = 'image' | 'video' | 'audio' | 'text' | 'file' | 'image_not_supported'
+
+const imageExtensions = new Set([
+  'avif', 'bmp', 'gif', 'heic', 'ico', 'jpeg', 'jpg', 'png', 'svg', 'tif', 'tiff', 'webp',
+])
+const videoExtensions = new Set(['avi', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'webm'])
+const audioExtensions = new Set(['aac', 'flac', 'm4a', 'mp3', 'ogg', 'opus', 'pcm', 'wav', 'wma'])
+
+function attachmentExtension(attachment: MessageAttachment): string {
+  const name = attachment.name?.trim().toLowerCase() || ''
+  const lastDot = name.lastIndexOf('.')
+  if (lastDot < 0 || lastDot === name.length - 1) return ''
+  return name.slice(lastDot + 1)
+}
+
+// Attachment records come from optimistic messages, persisted history and
+// older compatibility payloads. Their wire `type` is not always specific, so
+// rendering must use every available semantic hint before falling back to a
+// generic file card.
+function attachmentVisualKind(attachment: MessageAttachment): AttachmentVisualKind {
+  const kind = attachment.kind?.toLowerCase() || ''
+  if (kind === 'image_not_supported') return 'image_not_supported'
+  if (kind === 'image' || kind === 'video' || kind === 'audio') return kind
+
+  if (attachment.mime?.startsWith('image/')) return 'image'
+  if (attachment.mime?.startsWith('video/')) return 'video'
+  if (attachment.mime?.startsWith('audio/')) return 'audio'
+
+  const extension = attachmentExtension(attachment)
+  if (imageExtensions.has(extension)) return 'image'
+  if (videoExtensions.has(extension)) return 'video'
+  if (audioExtensions.has(extension)) return 'audio'
+
+  if (attachment.type === 'image_url') return 'image'
+  if (attachment.type === 'video_url') return 'video'
+  if (attachment.type === 'audio_url') return 'audio'
+  if (kind === 'text') return 'text'
+  return attachment.text ? 'text' : 'file'
+}
+
 function thumbText(kind?: string) {
   switch (kind) {
     case 'image': return ImageIcon
@@ -320,21 +360,44 @@ function thumbText(kind?: string) {
   }
 }
 
+function attachmentTypeLabel(attachment: MessageAttachment): string {
+  const kind = attachmentVisualKind(attachment)
+  if ((kind === 'image' || kind === 'video') && !attachment.url) return '预览不可用'
+  if (kind === 'image') return '图片'
+  if (kind === 'video') return '视频'
+  if (kind === 'audio') return '音频'
+
+  const extension = attachmentExtension(attachment)
+  const labels: Record<string, string> = {
+    pdf: 'PDF 文档',
+    doc: 'Word 文档', docx: 'Word 文档',
+    ppt: '演示文稿', pptx: '演示文稿',
+    xls: '电子表格', xlsx: '电子表格', csv: '电子表格',
+    md: 'Markdown 文档', txt: '文本附件', json: 'JSON 文件',
+    zip: '压缩文件', rar: '压缩文件', '7z': '压缩文件',
+  }
+  if (labels[extension]) return labels[extension]
+  if (extension) return `${extension.toUpperCase()} 文件`
+  return kind === 'text' ? '文本附件' : '文件附件'
+}
+
 // --- Copy / download for attachments ------------------------
 
 // friendlyAttachmentName picks a sensible filename for a
 // download when the original name is missing or weird.
 function friendlyAttachmentName(a: MessageAttachment): string {
   if (a.name && a.name.trim()) return a.name
-  const mime = a.mime || (a.kind === 'image' ? 'image/png'
-    : a.kind === 'audio' ? 'audio/mpeg'
-    : a.kind === 'video' ? 'video/mp4' : 'text/plain')
-  const stem = a.kind && a.kind !== 'file' ? a.kind : 'attachment'
+  const kind = attachmentVisualKind(a)
+  const mime = a.mime || (kind === 'image' ? 'image/png'
+    : kind === 'audio' ? 'audio/mpeg'
+    : kind === 'video' ? 'video/mp4' : 'text/plain')
+  const stem = kind !== 'file' && kind !== 'image_not_supported' ? kind : 'attachment'
   return `${stem}-${Date.now()}${extensionForMime(mime)}`
 }
 
 async function copyAttachment(a: MessageAttachment) {
-  if (a.type === 'text') {
+  const kind = attachmentVisualKind(a)
+  if (kind === 'text') {
     if (a.text) {
       const ok = await copyText(a.text)
       toast[ok ? 'success' : 'error'](ok ? '已复制' : '复制失败')
@@ -349,7 +412,7 @@ async function copyAttachment(a: MessageAttachment) {
   // via the ClipboardItem API. Audio/video fall back to
   // a regular download (no browser-side clipboard
   // support for those).
-  if (a.type === 'image_url') {
+  if (kind === 'image') {
     try {
       const blob = await fetchAsBlob(a.url)
       const ok = await copyImageToClipboard(blob)
@@ -420,7 +483,7 @@ function messageMarkdownText(): string {
 function imageAttachmentsOf(): Array<MessageAttachment & { url: string }> {
   return (props.message.attachments || []).filter(
     (a): a is MessageAttachment & { url: string } =>
-      a.type === 'image_url' && !!a.url,
+      attachmentVisualKind(a) === 'image' && !!a.url,
   )
 }
 
@@ -1136,47 +1199,83 @@ function findPrecedingUserMessageId(): number {
         <span v-if="streaming" class="bubble-stream-dot" :title="'正在生成'" aria-label="正在生成" />
       </div>
 
-      <div class="bubble">
+      <div class="bubble" :class="{ 'bubble--attachments': hasAttachments }">
         <div v-if="isSystem" class="system-icon">›</div>
         <div class="bubble-body">
           <!-- Attachments (user / tool) -->
           <div v-if="message.attachments && message.attachments.length" class="attachments">
             <template v-for="(a, i) in message.attachments" :key="i">
-              <div v-if="a.type === 'image_url' && a.url" class="attach-wrap attach-wrap--image">
+              <div
+                v-if="attachmentVisualKind(a) === 'image' && a.url"
+                class="media-thumbnail media-thumbnail--image"
+                role="button"
+                tabindex="0"
+                :aria-label="`查看图片：${a.name || '图片'}`"
+                @click="openLightbox(a.url, a.name || 'image', 'image')"
+                @keydown.enter.prevent="openLightbox(a.url, a.name || 'image', 'image')"
+                @keydown.space.prevent="openLightbox(a.url, a.name || 'image', 'image')"
+              >
                 <img
                   class="msg-image"
                   :src="a.url"
                   :alt="a.name || 'image'"
                   loading="lazy"
-                  @click="openLightbox(a.url, a.name || 'image', 'image')"
                 />
+                <div class="media-thumbnail-hint">
+                  <Maximize2 :size="14" />
+                  <span>查看大图</span>
+                </div>
                 <div class="attachment-action-bar attachment-action-bar--image">
-                  <button type="button" class="attach-action-btn attach-action-btn--labeled" title="复制图片" aria-label="复制图片" @click="copyAttachment(a)">
+                  <button type="button" class="attach-action-btn" title="复制图片" aria-label="复制图片" @click.stop="copyAttachment(a)">
                     <Clipboard :size="14" />
-                    <span class="attach-action-label">复制</span>
                   </button>
-                  <button type="button" class="attach-action-btn attach-action-btn--labeled" title="下载图片" aria-label="下载图片" @click="downloadAttachment(a)">
+                  <button type="button" class="attach-action-btn" title="下载图片" aria-label="下载图片" @click.stop="downloadAttachment(a)">
                     <Download :size="14" />
-                    <span class="attach-action-label">下载</span>
                   </button>
                 </div>
               </div>
-              <div v-else-if="a.type === 'video_url' && a.url" class="attach-wrap">
+              <div
+                v-else-if="attachmentVisualKind(a) === 'video' && a.url"
+                class="media-thumbnail media-thumbnail--video"
+                role="button"
+                tabindex="0"
+                :aria-label="`全屏播放：${a.name || '视频'}`"
+                @click="openLightbox(a.url, a.name || 'video', 'video')"
+                @keydown.enter.prevent="openLightbox(a.url, a.name || 'video', 'video')"
+                @keydown.space.prevent="openLightbox(a.url, a.name || 'video', 'video')"
+              >
                 <video
                   class="msg-video"
                   :src="a.url"
-                  controls
-                  preload="metadata"
+                  muted
+                  playsinline
+                  preload="auto"
                   :title="a.name || 'video'"
-                  @click.stop
                 />
+                <span class="media-thumbnail-play" aria-hidden="true">
+                  <Play :size="22" fill="currentColor" />
+                </span>
+                <div class="media-thumbnail-hint">
+                  <Maximize2 :size="14" />
+                  <span>全屏播放</span>
+                </div>
                 <div class="attachment-action-bar">
-                  <button type="button" class="attach-action-btn" title="下载视频" :aria-label="'下载视频'" @click="downloadAttachment(a)">
-                    <Download :size="12" />
+                  <button type="button" class="attach-action-btn" title="下载视频" aria-label="下载视频" @click.stop="downloadAttachment(a)">
+                    <Download :size="14" />
                   </button>
                 </div>
               </div>
-              <div v-else-if="a.type === 'audio_url' && a.url" class="attach-wrap">
+              <div v-else-if="attachmentVisualKind(a) === 'audio' && a.url" class="attachment-audio-card">
+                <div class="attachment-card-heading">
+                  <span class="attachment-card-icon"><Volume2 :size="18" /></span>
+                  <span class="attachment-card-info">
+                    <span class="attachment-card-name">{{ a.name || '音频' }}</span>
+                    <span class="attachment-card-meta">{{ attachmentTypeLabel(a) }}</span>
+                  </span>
+                  <button type="button" class="attach-action-btn" title="下载音频" aria-label="下载音频" @click="downloadAttachment(a)">
+                    <Download :size="14" />
+                  </button>
+                </div>
                 <audio
                   class="msg-audio"
                   :src="a.url"
@@ -1184,32 +1283,32 @@ function findPrecedingUserMessageId(): number {
                   preload="metadata"
                   :title="a.name || 'audio'"
                 />
-                <div class="attachment-action-bar">
-                  <button type="button" class="attach-action-btn" title="下载音频" :aria-label="'下载音频'" @click="downloadAttachment(a)">
-                    <Download :size="12" />
-                  </button>
-                </div>
               </div>
               <div
-                v-else-if="a.type === 'text' && a.kind === 'image_not_supported'"
+                v-else-if="attachmentVisualKind(a) === 'image_not_supported'"
                 class="msg-image-warn"
                 :title="a.text"
               >
                 <AlertTriangle :size="14" class="warn-icon" />
                 <span class="warn-text">{{ shortWarnText(a.text) }}</span>
               </div>
-              <div v-else-if="a.type === 'text'" class="msg-file-wrap" :class="{ 'has-copy-action': !!a.text }">
-                <div class="msg-file" :title="a.text">
-                  <component :is="thumbText(a.kind)" :size="12" class="msg-file-icon" />
-                  {{ a.name || '文件' }}
-                </div>
-                <div class="attachment-action-bar">
-                  <button v-if="a.text" type="button" class="attach-action-btn" title="复制内容" :aria-label="'复制内容'" @click="copyAttachment(a)">
-                    <Clipboard :size="12" />
-                  </button>
-                  <button v-if="a.text || a.url" type="button" class="attach-action-btn" title="下载" :aria-label="'下载'" @click="downloadAttachment(a)">
-                    <Download :size="12" />
-                  </button>
+              <div v-else class="msg-file-wrap">
+                <div class="attachment-file-card" :title="a.text">
+                  <span class="attachment-card-icon">
+                    <component :is="thumbText(attachmentVisualKind(a))" :size="18" />
+                  </span>
+                  <span class="attachment-card-info">
+                    <span class="attachment-card-name">{{ a.name || '文件' }}</span>
+                    <span class="attachment-card-meta">{{ attachmentTypeLabel(a) }}</span>
+                  </span>
+                  <span class="attachment-card-actions">
+                    <button v-if="a.text" type="button" class="attach-action-btn" title="复制内容" aria-label="复制内容" @click="copyAttachment(a)">
+                      <Clipboard :size="14" />
+                    </button>
+                    <button v-if="a.text || a.url" type="button" class="attach-action-btn" title="下载附件" aria-label="下载附件" @click="downloadAttachment(a)">
+                      <Download :size="14" />
+                    </button>
+                  </span>
                 </div>
               </div>
             </template>
@@ -1256,9 +1355,10 @@ function findPrecedingUserMessageId(): number {
 
           <!-- User / system: markdown of `content` -->
           <div
-            v-if="(message.msg_type ?? 0) === 0 && message.role !== 'assistant'"
+            v-if="(message.msg_type ?? 0) === 0 && message.role !== 'assistant' && (message.role !== 'user' || hasVisibleUserContent)"
             ref="mdBodyEl"
             class="md-body"
+            :class="{ 'user-message-caption': message.role === 'user' && hasAttachments }"
             v-html="userHtml"
             @click="onMarkdownClick"
           />
@@ -1396,17 +1496,19 @@ function findPrecedingUserMessageId(): number {
             >▶</button>
           </div>
         </div>
+      </div>
 
-        <!-- Floating action bar: hovers above the bubble on
-             hover, shown for non-streaming messages only. The
-             user role mirrors the action bar to the left of
-             the avatar; assistant / tool mirror to the right
-             of the bubble. Hidden for the system role (no
-             action needed). -->
+      <!-- 消息级操作统一停靠在正文下方；附件只保留预览、复制和下载。
+           Message-level actions share one quiet footer below the content;
+           attachment cards keep only preview/copy/download controls. -->
+      <div
+        v-if="(!isSystem && !streaming) || userTimeText"
+        class="message-footer"
+        :data-role="message.role"
+      >
         <div
           v-if="!isSystem && !streaming"
           class="bubble-actions"
-          :class="{ 'bubble-actions--media': hasImageAttachment }"
           :data-role="message.role"
         >
           <button
@@ -1471,12 +1573,11 @@ function findPrecedingUserMessageId(): number {
             </button>
           </NDropdown>
         </div>
-      </div>
 
-      <!-- Send time for user messages only. Sits below the
-           bubble, right-aligned to match the row-reverse user
-           bubble. Assistant / system / tool messages skip it. -->
-      <div v-if="userTimeText" class="msg-time">{{ userTimeText }}</div>
+        <!-- Send time for user messages only. It shares the footer baseline
+             with the message tools so neither can cover a small text bubble. -->
+        <div v-if="userTimeText" class="msg-time">{{ userTimeText }}</div>
+      </div>
     </div>
   </div>
 </template>
@@ -1598,6 +1699,14 @@ function findPrecedingUserMessageId(): number {
   box-shadow: var(--shadow-sm);
   max-width: 80%;
 }
+.msg.user .bubble.bubble--attachments {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+  max-width: 100%;
+  width: min(100%, calc(var(--space-8) * 12));
+}
 .msg.assistant .bubble {
   background: transparent;
   color: var(--text-primary);
@@ -1663,6 +1772,33 @@ function findPrecedingUserMessageId(): number {
  * <style> block below (see .msg.user .md-body pre). */
 .msg.user .bubble-body,
 .msg.user .bubble-body * { color: inherit; }
+.msg.user .bubble--attachments .bubble-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+  color: var(--text-primary);
+}
+.msg.user .bubble--attachments .attachments {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-8) * 5), 100%), 1fr));
+  align-items: start;
+  gap: var(--space-2);
+  margin-bottom: 0;
+  width: 100%;
+}
+.msg.user .bubble--attachments .attachments > :only-child {
+  grid-column: 1 / -1;
+}
+.msg.user .bubble--attachments .user-message-caption {
+  align-self: flex-end;
+  padding: var(--space-2) var(--space-3);
+  background: var(--brand-500);
+  color: var(--on-brand);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  max-width: 80%;
+}
 
 /* "展开全文" affordance for truncated text parts. */
 .md-expand-btn {
@@ -1677,64 +1813,45 @@ function findPrecedingUserMessageId(): number {
 }
 .md-expand-btn:hover { background: var(--brand-50); }
 
-/* --- Floating action bar -----------------------------------------
- * Anchored to the top-right of the assistant bubble (or
- * top-left of the user bubble, since user is row-reverse).
- * Pill-shaped, shadow-md, hidden until the message is
- * hovered. Renders inside .bubble (which is position:
- * relative) so the absolute offsets are scoped to the
- * bubble. */
-.bubble-actions {
-  position: absolute;
-  top: calc(-1 * var(--space-4));
+/* 消息操作与时间使用同一静态底栏，不再覆盖文字或附件。
+ * Message actions and time share one static footer, never overlaying content. */
+.message-footer {
   display: flex;
   align-items: center;
   gap: var(--space-1);
-  padding: var(--space-1);
-  background: var(--surface-1);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-md);
+  min-height: var(--space-6);
+  width: 100%;
+}
+.message-footer[data-role="user"] { justify-content: flex-end; }
+.message-footer[data-role="assistant"] { justify-content: flex-start; }
+.bubble-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0;
   opacity: 0;
-  transform: translateY(var(--space-1));
+  transform: translateY(calc(-1 * var(--space-1)));
+  pointer-events: none;
   transition: opacity var(--dur-fast) var(--ease-out),
               transform var(--dur-fast) var(--ease-out);
-  /* z-index raised from 5 to 50 in 2026-07-09 to keep the
-   * action bar above Naive UI's tooltip layer (~60) and
-   * the chat window's stream-status bar that recently
-   * started using a sticky positioning context. The
-   * .msg parent (z-index 1) ensures this is scoped to the
-   * current message and does not bleed into adjacent
-   * messages. */
-  z-index: 50;
-}
-.msg.assistant .bubble-actions { right: var(--space-2); }
-.msg.user .bubble-actions { left: var(--space-2); }
-.msg.user .bubble-actions--media {
-  top: var(--space-2);
-  left: calc(-1 * (var(--space-8) + var(--space-2)));
-  flex-direction: column;
-}
-.msg.assistant .bubble-actions--media {
-  top: var(--space-2);
-  right: calc(-1 * (var(--space-8) + var(--space-2)));
-  flex-direction: column;
 }
 .msg:hover .bubble-actions,
 .bubble-actions:focus-within {
   opacity: 1;
   transform: translateY(0);
+  pointer-events: auto;
 }
 .bubble-action-btn {
-  width: var(--space-7);
-  height: var(--space-7);
+  width: var(--space-6);
+  height: var(--space-6);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid transparent;
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  color: var(--text-secondary);
+  background: var(--surface-1);
+  color: var(--text-tertiary);
+  box-shadow: var(--shadow-sm);
   cursor: pointer;
   padding: 0;
   transition: background var(--dur-fast) var(--ease-out),
@@ -1742,9 +1859,9 @@ function findPrecedingUserMessageId(): number {
               transform var(--dur-fast) var(--ease-out);
 }
 .bubble-action-btn:hover {
-  background: var(--brand-50);
-  border-color: var(--brand-100);
-  color: var(--brand-600);
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
 }
 .bubble-action-btn:active {
   /* Press feedback: subtle scale-down + inset shadow so
@@ -1911,30 +2028,119 @@ function findPrecedingUserMessageId(): number {
 .attachments {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 6px;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
 }
-.msg-image {
-  max-width: 100%;
-  max-height: 240px;
-  border-radius: 6px;
-  cursor: zoom-in;
-  background: var(--bg);
-  display: block;
-}
-.msg-image:hover { opacity: 0.92; }
-
-.attach-wrap {
+.media-thumbnail {
   position: relative;
-  display: inline-block;
-  max-width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  aspect-ratio: 4 / 3;
+  box-sizing: border-box;
+  padding: var(--space-1);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  cursor: zoom-in;
+  transition: border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
-.attach-wrap:hover .attachment-action-bar,
-.attach-wrap:focus-within .attachment-action-bar,
-.msg-file-wrap:hover .attachment-action-bar,
-.msg-file-wrap:focus-within .attachment-action-bar {
+.media-thumbnail--video {
+  aspect-ratio: 16 / 9;
+  cursor: pointer;
+}
+.media-thumbnail:hover,
+.media-thumbnail:focus-visible {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-md);
+}
+.media-thumbnail:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.media-thumbnail:active { transform: scale(0.995); }
+.msg-image,
+.msg-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.msg-image { object-fit: contain; }
+.msg-video { object-fit: cover; }
+.media-thumbnail-hint {
+  position: absolute;
+  left: var(--space-2);
+  bottom: var(--space-2);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0;
+  transform: translateY(var(--space-1));
+  transition: opacity var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+  pointer-events: none;
+}
+.msg.user .bubble-body .media-thumbnail-hint { color: var(--text-primary); }
+.media-thumbnail:hover .media-thumbnail-hint,
+.media-thumbnail:focus-visible .media-thumbnail-hint,
+.media-thumbnail:focus-within .media-thumbnail-hint {
   opacity: 1;
   transform: translateY(0);
+}
+.media-thumbnail-play {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(var(--space-8) + var(--space-2));
+  height: calc(var(--space-8) + var(--space-2));
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-md);
+  transform: translate(-50%, -50%);
+  transition: transform var(--dur-fast) var(--ease-out);
+  pointer-events: none;
+}
+.msg.user .bubble-body .media-thumbnail-play { color: var(--text-primary); }
+.media-thumbnail--video:hover .media-thumbnail-play {
+  transform: translate(-50%, -50%) scale(1.06);
+}
+.msg.user .media-thumbnail,
+.msg.user .attachment-audio-card,
+.msg.user .msg-file-wrap,
+.msg.user .msg-image-warn {
+  justify-self: end;
+}
+.msg.user .attachment-audio-card,
+.msg.user .msg-file-wrap,
+.msg.user .msg-image-warn {
+  grid-column: 1 / -1;
+}
+.media-thumbnail:hover .attachment-action-bar,
+.media-thumbnail:focus-within .attachment-action-bar {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
 }
 .attachment-action-bar {
   position: absolute;
@@ -1950,15 +2156,22 @@ function findPrecedingUserMessageId(): number {
   box-shadow: var(--shadow-md);
   opacity: 0;
   transform: translateY(calc(-1 * var(--space-1)));
+  pointer-events: none;
   transition: opacity var(--dur-fast) var(--ease-out),
               transform var(--dur-fast) var(--ease-out);
   z-index: 3;
 }
 .attachment-action-bar--image {
-  top: auto;
+  top: var(--space-2);
   right: var(--space-2);
-  bottom: var(--space-2);
-  transform: translateY(var(--space-1));
+  bottom: auto;
+  transform: translateY(calc(-1 * var(--space-1)));
+}
+.media-thumbnail--video .attachment-action-bar {
+  top: var(--space-2);
+  right: var(--space-2);
+  bottom: auto;
+  transform: translateY(calc(-1 * var(--space-1)));
 }
 .attach-action-btn {
   width: var(--space-7);
@@ -1995,59 +2208,111 @@ function findPrecedingUserMessageId(): number {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
-.attach-action-btn--labeled {
-  width: auto;
-  min-width: calc(var(--space-8) + var(--space-2));
-  gap: var(--space-1);
-  padding: 0 var(--space-2);
+.attachment-audio-card,
+.attachment-file-card {
+  box-sizing: border-box;
+  width: min(calc(var(--space-8) * 10), 100%);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  color: var(--text-primary);
 }
-.attach-action-label {
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
-  white-space: nowrap;
+.attachment-audio-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
 }
-.msg-file {
+.attachment-card-heading,
+.attachment-file-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.attachment-file-card { padding: var(--space-2); }
+.attachment-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-8);
+  height: var(--space-8);
   background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  border-radius: 4px;
-  padding: 2px 6px;
-  font-size: 12px;
-  max-width: 100%;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.msg.user .bubble-body .attachment-card-icon { color: var(--text-secondary); }
+.attachment-card-info {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.attachment-card-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  vertical-align: middle;
-  color: var(--text-secondary);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 600;
 }
-.msg-file-icon { color: var(--text-tertiary); flex-shrink: 0; }
-.msg-file-wrap {
-  position: relative;
+.attachment-card-meta {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.msg.user .bubble-body .attachment-card-name { color: var(--text-primary); }
+.msg.user .bubble-body .attachment-card-meta { color: var(--text-tertiary); }
+.attachment-card-actions {
   display: inline-flex;
   align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+}
+.msg-audio {
+  display: block;
+  width: 100%;
+  height: var(--space-8);
+  color-scheme: light dark;
+}
+.msg-file-wrap {
+  display: flex;
+  justify-content: flex-end;
+  width: 100%;
   max-width: 100%;
 }
-.msg-file-wrap .msg-file { padding-right: var(--space-7); }
-.msg-file-wrap.has-copy-action .msg-file { padding-right: calc(var(--space-7) * 2); }
-.msg-file-wrap .attachment-action-bar {
-  top: 50%;
-  transform: translateY(calc(-50% - 2px));
+.msg.user .bubble-body .attachment-audio-card,
+.msg.user .bubble-body .attachment-file-card {
+  color: var(--text-primary);
 }
-.msg-file-wrap:hover .attachment-action-bar,
-.msg-file-wrap:focus-within .attachment-action-bar {
-  transform: translateY(-50%);
+.attachment-file-card:hover,
+.attachment-audio-card:hover {
+  border-color: var(--border-strong);
+}
+.attachment-file-card .attach-action-btn,
+.attachment-audio-card .attach-action-btn {
+  flex-shrink: 0;
 }
 @media (hover: none) {
+  .bubble-actions,
   .attachment-action-bar {
     opacity: 1;
     transform: translateY(0);
+    pointer-events: auto;
   }
-  .msg-file-wrap .attachment-action-bar {
-    transform: translateY(-50%);
+  .media-thumbnail-hint {
+    opacity: 1;
+    transform: translateY(0);
   }
+}
+@media (max-width: 560px) {
+  .attachment-audio-card,
+  .attachment-file-card {
+    width: 100%;
+  }
+  .media-thumbnail-hint span { display: none; }
 }
 .msg-image-warn {
   display: inline-flex; align-items: center; gap: 6px;
@@ -2210,7 +2475,9 @@ function findPrecedingUserMessageId(): number {
   line-height: 1.4;
   color: var(--text-quaternary);
   font-variant-numeric: tabular-nums;
-  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-1);
   user-select: none;
 }
 .msg.user .msg-time { align-self: flex-end; }

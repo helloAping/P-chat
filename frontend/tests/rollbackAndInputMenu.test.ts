@@ -22,6 +22,10 @@ function readMessageBubbleSource(): string {
   return readFileSync(new URL('../src/components/MessageBubble.vue', import.meta.url), 'utf8')
 }
 
+function readLightboxSource(): string {
+  return readFileSync(new URL('../src/components/ImageLightbox.vue', import.meta.url), 'utf8')
+}
+
 test('message right-click copy preserves and copies the selected text', () => {
   const source = readMessageBubbleSource()
 
@@ -42,23 +46,78 @@ test('message hover toolbar keeps primary actions and merges secondary actions i
   assert.doesNotMatch(source, /v-if="canRollback"[\s\S]*?class="bubble-action-btn bubble-action-rollback"/)
   assert.match(source, /class="attachment-action-bar"/)
   assert.match(source, /class="attachment-action-bar attachment-action-bar--image"/)
-  assert.match(source, /class="attach-action-label">复制<\/span>/)
-  assert.match(source, /class="attach-action-label">下载<\/span>/)
-  assert.match(source, /'bubble-actions--media': hasImageAttachment/)
-  assert.match(source, /\.attachment-action-bar--image\s*\{[\s\S]*?bottom: var\(--space-2\)/)
+  assert.match(source, /'bubble--attachments': hasAttachments/)
+  assert.match(source, /'user-message-caption': message\.role === 'user' && hasAttachments/)
+  assert.doesNotMatch(source, /attach-action-label/)
+  assert.doesNotMatch(source, /bubble-actions--media/)
+  assert.match(source, /class="message-footer"/)
+  assert.match(source, /\.message-footer\[data-role="user"\]\s*\{\s*justify-content: flex-end/)
+  const toolbarRule = source.match(/\.bubble-actions\s*\{([^}]*)\}/)
+  assert.ok(toolbarRule, 'bubble actions CSS rule should exist')
+  assert.doesNotMatch(toolbarRule[1], /position:\s*absolute/)
+  assert.match(source, /\.attachment-action-bar--image\s*\{[\s\S]*?top: var\(--space-2\)/)
+  assert.match(source, /\.msg\.user \.bubble\.bubble--attachments\s*\{[\s\S]*?background: transparent[\s\S]*?padding: 0/)
+  assert.match(source, /grid-template-columns: repeat\(auto-fit, minmax\(/)
   assert.match(source, /\.msg\.user \.bubble-body \.attach-action-btn\s*\{[\s\S]*?color: var\(--text-primary\)/)
-  assert.match(source, /\.msg\.user \.bubble-actions--media\s*\{[\s\S]*?flex-direction: column/)
 })
 
-test('rollback keeps a local fallback for undo banner and input refill', () => {
+test('media attachments use semantic thumbnails and open the full-screen viewer', () => {
+  const source = readMessageBubbleSource()
+  const lightbox = readLightboxSource()
+
+  // The wire type may be the generic `text` fallback; visual rendering must
+  // still recognise media from kind, MIME, or the filename extension.
+  assert.match(source, /function attachmentVisualKind\(attachment: MessageAttachment\)/)
+  assert.match(source, /attachment\.mime\?\.startsWith\('image\/'\)/)
+  assert.match(source, /attachment\.mime\?\.startsWith\('video\/'\)/)
+  assert.match(source, /attachmentVisualKind\(a\) === 'image'/)
+  assert.match(source, /attachmentVisualKind\(a\) === 'video'/)
+  assert.match(source, /openLightbox\(a\.url, a\.name \|\| 'video', 'video'\)/)
+  assert.match(source, /class="media-thumbnail media-thumbnail--image"/)
+  assert.match(source, /class="media-thumbnail media-thumbnail--video"/)
+
+  // Non-media attachments keep a dedicated information card rather than
+  // borrowing the media thumbnail treatment.
+  assert.match(source, /class="attachment-file-card"/)
+  assert.match(lightbox, /state\.lightbox\.kind === 'video'/)
+})
+
+test('rollback restores text and attachments as one composer draft', () => {
   const source = readStoreSource()
+  const input = readInputAreaSource()
 
   assert.match(source, /export async function rollbackTo\(sessionId: string, messageIndex: number\)/)
   assert.match(source, /const localDeleted = msgs\.slice\(messageIndex\)/)
   assert.match(source, /result\.deleted_messages\?\.length/)
   assert.match(source, /result\.deleted_count > 0 \? localDeleted/)
-  assert.match(source, /state\.rollbackUndo\[sessionId\] = \{[\s\S]*messages: deletedMessages/)
-  assert.match(source, /\[\.\.\.deletedMessages\]\.reverse\(\)\.find\(m => m\.role === 'user'\)/)
+  assert.match(source, /state\.rollbackUndo\[sessionId\] = \{[\s\S]*messages: deletedMessages,[\s\S]*displayMessages: localDeleted/)
+  assert.match(source, /rollbackDraftAttachments\(msg, deletedMessages\)/)
+  assert.match(source, /pendingAttachmentFromMessage\(attachment, rollbackSource\)/)
+  assert.match(source, /state\.pendingAttachments\[sessionId\] = restoredAttachments/)
+  assert.match(source, /state\.pendingInput\[sessionId\] = msg\.content \|\| ''/)
+  assert.match(source, /state\.pendingInputRevision\[sessionId\]/)
+  assert.match(input, /currentPendingInputRevision\.value/)
+  assert.match(input, /inputText\.value = currentPendingInput\.value/)
+})
+
+test('undo rollback removes only recalled attachments and preserves edited text', () => {
+  const store = readStoreSource()
+  const input = readInputAreaSource()
+
+  assert.match(store, /attachment\._rollbackSource === draft\.source/)
+  assert.match(store, /kept\.push\(attachment\)/)
+  assert.match(store, /msgs\.splice\(undo\.fromIndex, 0, \.\.\.undo\.displayMessages\)/)
+  assert.match(input, /inputText\.value === draft\.text/)
+  assert.match(input, /if \(shouldClearInjectedText\) inputText\.value = ''/)
+  assert.match(input, /@click="onUndoRollback"/)
+  assert.doesNotMatch(store, /function dismissRollback\(sessionId: string\) \{[\s\S]*?clearAttachments\(sessionId\)/)
+})
+
+test('composer keeps durable upload ids for rollback restoration', () => {
+  const source = readInputAreaSource()
+
+  assert.match(source, /upload_id: a\.id \|\| undefined/)
+  assert.match(source, /attachment\.upload_id = uploadID/)
 })
 
 test('input send queues messages while current session streams', () => {

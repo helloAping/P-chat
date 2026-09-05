@@ -64,6 +64,8 @@ export {
   Hammer,
   Wrench,
   Eye,
+  Maximize2,
+  Play,
   Trash2,
   Loader2,
   ChevronRight,

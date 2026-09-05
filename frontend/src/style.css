@@ -53,6 +53,10 @@
   --surface-3:        #262A36;
   --surface-input:    #1C1F29;
   --surface-overlay:  rgba(11, 13, 18, 0.72);
+  --media-backdrop:   rgba(0, 0, 0, 0.88);
+  --media-canvas:     #000000;
+  --media-control:    rgba(255, 255, 255, 0.15);
+  --media-control-hover: rgba(255, 255, 255, 0.28);
 
   /* 2.2 Text */
   --text-primary:     #F4F5F7;
@@ -180,6 +184,10 @@
   --surface-3:        #E2E5EB;
   --surface-input:    #FFFFFF;
   --surface-overlay:  rgba(255, 255, 255, 0.72);
+  --media-backdrop:   rgba(0, 0, 0, 0.88);
+  --media-canvas:     #000000;
+  --media-control:    rgba(255, 255, 255, 0.15);
+  --media-control-hover: rgba(255, 255, 255, 0.28);
 
   --text-primary:     #0F1115;
   --text-secondary:   #4A4F5C;

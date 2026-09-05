@@ -41,6 +41,15 @@ export interface PendingAttachment {
   // One preparation task owns both local reading and server upload.
   // The send path awaits this task instead of uploading the file again.
   _ready?: Promise<void>
+  // Rollback-restored attachments are tagged so undo can remove only the
+  // injected files while preserving anything the user added afterwards.
+  // 撤销撤回时只清理自动回填的附件，不误删用户后来新增的附件。
+  _rollbackSource?: string
+}
+
+type RollbackDraft = {
+  source: string
+  text: string
 }
 
 type SessionPermissionLevel = 'ask' | 'auto' | 'full'
@@ -232,9 +241,21 @@ export const state = reactive({
   // when the user switches sessions.
   currentTraceId: '' as string,
   // Rollback undo buffer — only the most recent rollback per session.
-  rollbackUndo: {} as Record<string, { messages: Message[]; fromIndex: number } | null>,
+  rollbackUndo: {} as Record<string, {
+    // Raw wire rows go back to the existing undo endpoint.
+    messages: Message[]
+    // The already-normalized GUI rows restore the exact pre-rollback layout.
+    displayMessages: Message[]
+    fromIndex: number
+  } | null>,
   // Pending text to fill into the input area after a rollback.
   pendingInput: {} as Record<string, string>,
+  // Monotonic per-session signal: unlike the text value itself, this changes
+  // even when two consecutive rollbacks restore the same (or empty) caption.
+  pendingInputRevision: {} as Record<string, number>,
+  // Identifies the draft injected by rollback. InputArea uses the text
+  // snapshot to avoid clearing user edits when "undo rollback" is clicked.
+  rollbackDraft: {} as Record<string, RollbackDraft | null>,
   // P0-1: transient banner shown for ~3s when the
   // recoverMissingParts flow successfully merged
   // server-side parts into the trailing assistant
@@ -1116,7 +1137,13 @@ export async function deleteSessionById(id: string) {
   for (const a of (state.pendingAttachments[id] || [])) {
     if (a._blobURL) URL.revokeObjectURL(a._blobURL)
   }
+  const rollbackUndo = state.rollbackUndo[id]
+  if (rollbackUndo) revokeSessionBlobUrlsForMessages(rollbackUndo.displayMessages)
   delete state.pendingAttachments[id]
+  delete state.pendingInput[id]
+  delete state.pendingInputRevision[id]
+  delete state.rollbackDraft[id]
+  delete state.rollbackUndo[id]
   delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
@@ -1194,6 +1221,86 @@ export function guessKind(name: string, mime: string): string {
   if (mime?.startsWith('video/')) return 'video'
   if (mime && (mime.startsWith('text/') || mime === 'application/json')) return 'text'
   return 'file'
+}
+
+function uploadIDFromAttachment(attachment: MessageAttachment): string {
+  if (attachment.upload_id) return attachment.upload_id
+  const match = (attachment.url || '').match(/\/api\/v1\/uploads\/([^/?#]+)/)
+  if (!match?.[1]) return ''
+  try {
+    return decodeURIComponent(match[1])
+  } catch {
+    return match[1]
+  }
+}
+
+function pendingAttachmentFromMessage(
+  attachment: MessageAttachment,
+  rollbackSource: string,
+): PendingAttachment {
+  const kind = attachment.kind || guessKind(attachment.name || '', attachment.mime || '')
+  const uploadID = uploadIDFromAttachment(attachment)
+  const originalURL = attachment.url || ''
+  const inlineData = uploadID
+    ? ''
+    : attachment.text || (originalURL.startsWith('data:') ? originalURL : '')
+  const convertedPreview = originalURL.startsWith('data:')
+    ? dataURLToBlobURL(originalURL)
+    : originalURL
+  const ownedBlobURL = convertedPreview?.startsWith('blob:')
+    ? convertedPreview
+    : undefined
+
+  return {
+    id: uploadID,
+    name: attachment.name || '附件',
+    size: 0,
+    mime: attachment.mime || '',
+    kind,
+    _blobURL: ownedBlobURL,
+    _uploading: false,
+    _error: !uploadID && !inlineData,
+    _previewURL: convertedPreview || originalURL,
+    _dataURL: inlineData || undefined,
+    _rollbackSource: rollbackSource,
+  }
+}
+
+function rollbackDraftAttachments(target: Message, deletedMessages: Message[]): MessageAttachment[] {
+  const matchesTarget = (candidate: Message) =>
+    (target.seq && candidate.seq === target.seq)
+    || (target.id && candidate.id === target.id)
+  const targetIndex = deletedMessages.findIndex(matchesTarget)
+  const collected: MessageAttachment[] = []
+
+  // The history UI merges the text row and its following attachment rows into
+  // one message. The rollback endpoint returns those rows separately, so walk
+  // the leading user run until the assistant reply starts and rebuild the same
+  // attachment group entirely on the client.
+  if (targetIndex >= 0) {
+    for (let i = targetIndex; i < deletedMessages.length; i++) {
+      const candidate = deletedMessages[i]
+      if (candidate.role !== 'user') break
+      collected.push(...(candidate.attachments || []))
+    }
+  }
+  if (!collected.length) collected.push(...(target.attachments || []))
+
+  const seen = new Set<string>()
+  return collected.filter((attachment) => {
+    // This is a display-only diagnostic emitted after a rejected image, not
+    // a file the user selected. It must never become a resendable draft item.
+    if (attachment.kind === 'image_not_supported') return false
+    const key = [
+      attachment.upload_id || uploadIDFromAttachment(attachment),
+      attachment.type,
+      attachment.url || '',
+      attachment.name || '',
+    ].join('\u0000')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 export function addAttachment(file: File): Promise<void> {
@@ -3144,11 +3251,19 @@ export const currentAttachments = computed(() =>
 export const currentRollbackBanner = computed(() => {
   const undo = state.rollbackUndo[state.currentID]
   if (!undo || !undo.messages.length) return null
-  return { count: undo.messages.length }
+  return { count: undo.displayMessages.length }
 })
 
 export const currentPendingInput = computed(() =>
   state.pendingInput[state.currentID] || '',
+)
+
+export const currentPendingInputRevision = computed(() =>
+  state.pendingInputRevision[state.currentID] || 0,
+)
+
+export const currentRollbackDraft = computed(() =>
+  state.rollbackDraft[state.currentID] || null,
 )
 
 // rollbackTo deletes the message at the given index (and all later
@@ -3229,13 +3344,26 @@ export async function rollbackTo(sessionId: string, messageIndex: number) {
 
   state.rollbackUndo[sessionId] = {
     messages: deletedMessages,
+    displayMessages: localDeleted,
     fromIndex: messageIndex,
   }
 
   msgs.splice(messageIndex)
 
-  const lastUser = [...deletedMessages].reverse().find(m => m.role === 'user')
-  state.pendingInput[sessionId] = lastUser?.content || ''
+  const rollbackSource = `rollback:${sessionId}:${msg.seq || msg.id}:${Date.now()}`
+  const restoredAttachments = rollbackDraftAttachments(msg, deletedMessages)
+    .map(attachment => pendingAttachmentFromMessage(attachment, rollbackSource))
+
+  // Rollback is an explicit "edit and resend" action, so the recalled message
+  // replaces the current attachment draft as one atomic GUI operation.
+  clearAttachments(sessionId)
+  state.pendingAttachments[sessionId] = restoredAttachments
+  state.pendingInput[sessionId] = msg.content || ''
+  state.pendingInputRevision[sessionId] = (state.pendingInputRevision[sessionId] || 0) + 1
+  state.rollbackDraft[sessionId] = {
+    source: rollbackSource,
+    text: msg.content || '',
+  }
 }
 
 // undoRollback restores the messages deleted by the most recent
@@ -3248,16 +3376,42 @@ export async function undoRollback(sessionId: string) {
 
   const msgs = state.sessionMessages[sessionId]
   if (msgs) {
-    msgs.splice(undo.fromIndex, 0, ...undo.messages)
+    msgs.splice(undo.fromIndex, 0, ...undo.displayMessages)
+  }
+  const draft = state.rollbackDraft[sessionId]
+  if (draft) {
+    const restoredMessageBlobURLs = new Set(
+      undo.displayMessages.flatMap(message =>
+        (message.attachments || [])
+          .map(attachment => attachment.url || '')
+          .filter(url => url.startsWith('blob:')),
+      ),
+    )
+    const kept: PendingAttachment[] = []
+    for (const attachment of state.pendingAttachments[sessionId] || []) {
+      if (attachment._rollbackSource === draft.source) {
+        // A local optimistic attachment can share its blob URL with the
+        // message being restored. In that case ownership returns to the
+        // message list; revoking here would render the restored card blank.
+        if (attachment._blobURL && !restoredMessageBlobURLs.has(attachment._blobURL)) {
+          URL.revokeObjectURL(attachment._blobURL)
+        }
+      } else {
+        kept.push(attachment)
+      }
+    }
+    state.pendingAttachments[sessionId] = kept
   }
   state.rollbackUndo[sessionId] = null
+  state.rollbackDraft[sessionId] = null
   state.pendingInput[sessionId] = ''
 }
 
-// dismissRollback clears the rollback undo buffer and pending
-// input without restoring the deleted messages.
+// dismissRollback only drops the undo capability. The recalled composer draft
+// remains available for editing and resending.
 export function dismissRollback(sessionId: string) {
   state.rollbackUndo[sessionId] = null
+  state.rollbackDraft[sessionId] = null
   state.pendingInput[sessionId] = ''
 }
 
