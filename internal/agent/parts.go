@@ -48,6 +48,7 @@ import (
 //   - "sub_agent" — a nested sub-agent run (Task, Status, Parts)
 //   - "question"  — a user-facing question card (Text=questions JSON,
 //     Name=answers JSON after the user picks)
+//   - "skill"     — 可见的 Skill 调用生命周期 / a visible Skill invocation lifecycle
 //
 // The JSON tags are the wire format. Anything not appropriate for
 // a given Kind is left at the zero value and is dropped by
@@ -104,6 +105,11 @@ type MessagePart struct {
 	// Defaults to empty (caller should treat as "open" if
 	// missing — old persisted data without the field).
 	QuestionStatus string `json:"question_status,omitempty"`
+	// Skill 生命周期元数据。
+	// Skill lifecycle metadata.
+	Scope        string   `json:"scope,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	Dependencies []string `json:"dependencies,omitempty"`
 }
 
 // Part kind numeric constants for dispatch.
@@ -113,6 +119,7 @@ const (
 	PartKindTool     = 2
 	PartKindSubAgent = 3
 	PartKindQuestion = 4
+	PartKindSkill    = 5
 )
 
 // PartKindMap maps numeric part kind to its string representation.
@@ -122,6 +129,7 @@ var PartKindMap = map[int]string{
 	PartKindTool:     "tool",
 	PartKindSubAgent: "sub_agent",
 	PartKindQuestion: "question",
+	PartKindSkill:    "skill",
 }
 
 // PartKindStr maps string part kind to its numeric representation.
@@ -131,6 +139,7 @@ var PartKindStr = map[string]int{
 	"tool":      PartKindTool,
 	"sub_agent": PartKindSubAgent,
 	"question":  PartKindQuestion,
+	"skill":     PartKindSkill,
 }
 
 // nativeToolCall is the parsed form of a tool call, whether it
@@ -360,6 +369,27 @@ func replacePartText(part *MessagePart, text string) {
 func (a *partsAccumulator) update(c ChatStreamChunk) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// Skill 生命周期：每个主 Skill 调用对应一张稳定卡片。
+	// Skill lifecycle: one stable card per primary Skill invocation.
+	if c.SkillName != "" {
+		for i := len(a.parts) - 1; i >= 0; i-- {
+			if a.parts[i].Kind != "skill" || a.parts[i].Name != c.SkillName {
+				continue
+			}
+			a.parts[i].Status = c.SkillStatus
+			a.parts[i].Scope = c.SkillScope
+			a.parts[i].Source = c.SkillSource
+			a.parts[i].Dependencies = append([]string(nil), c.SkillDependencies...)
+			a.parts[i].Error = c.SkillError
+			return
+		}
+		a.parts = append(a.parts, MessagePart{
+			Kind: "skill", Name: c.SkillName, Status: c.SkillStatus, Scope: c.SkillScope,
+			Source: c.SkillSource, Dependencies: append([]string(nil), c.SkillDependencies...), Error: c.SkillError,
+		})
+		return
+	}
 
 	// Sub-agent lifecycle: open / close the nested card BEFORE
 	// any nested events get routed. (Sub-agent events arrive
@@ -864,6 +894,7 @@ func cloneMaterializedParts(parts []MessagePart) []MessagePart {
 			out[i].Text = string(parts[i].textBuffer)
 			out[i].textBuffer = nil
 		}
+		out[i].Dependencies = append([]string(nil), parts[i].Dependencies...)
 		out[i].Parts = cloneMaterializedParts(parts[i].Parts)
 	}
 	return out

@@ -1342,6 +1342,35 @@ func TestCmdSkills(t *testing.T) {
 	}
 }
 
+func TestParseSkillCommandArgs(t *testing.T) {
+	name, prompt, err := parseSkillCommandArgs("lark-doc 创建一份周报")
+	if err != nil {
+		t.Fatalf("parseSkillCommandArgs: %v", err)
+	}
+	if name != "lark-doc" || prompt != "创建一份周报" {
+		t.Fatalf("got name=%q prompt=%q", name, prompt)
+	}
+
+	name, prompt, err = parseSkillCommandArgs("lark-doc")
+	if err != nil || name != "lark-doc" || prompt != "请使用 Skill「lark-doc」提供帮助" {
+		t.Fatalf("default prompt: name=%q prompt=%q err=%v", name, prompt, err)
+	}
+
+	if _, _, err := parseSkillCommandArgs(""); err == nil {
+		t.Fatal("expected missing name error")
+	}
+}
+
+func TestMatchInstalledSkillCommand(t *testing.T) {
+	name, prompt, ok := matchInstalledSkillCommand("/lark-doc 创建文档", []string{"lark-doc", "lark-shared"})
+	if !ok || name != "lark-doc" || prompt != "创建文档" {
+		t.Fatalf("got ok=%v name=%q prompt=%q", ok, name, prompt)
+	}
+	if _, _, ok := matchInstalledSkillCommand("/unknown do it", []string{"lark-doc"}); ok {
+		t.Fatal("unexpected match for unknown Skill")
+	}
+}
+
 func TestCmdSkills_Unsupported(t *testing.T) {
 	ctx := &mockErrCtx{}
 	if err := cmdSkills(ctx, ""); err != nil {

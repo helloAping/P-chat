@@ -39,15 +39,59 @@
 ## Skill 技能系统
 
 **位置**：`internal/skill/`  
-**文件**：`skill.go`
+**文件**：`manager.go`（主入口）, `skill.go`（旧接口兼容）
 
-管理可安装的 Skill 定义：
-- `LoadAllWithRoot(root)` — 加载全局 + `<root>/.p-chat/skills` 的 skills（**2026-07 项目根感知**）
-- `LoadAll()` — 旧接口，等价于 `LoadAllWithRoot("")`（向后兼容 CLI 命令）
-- `Install(repoURL)` — 从 GitHub 安装
-- `Delete(name)` — 卸载
-- Skill 内容被注入到系统提示词
-- 合并策略：全局 + 项目都加载，项目同名覆盖全局
+Skill 是包含 `SKILL.md` 及可选 `scripts/`、`references/`、`assets/` 的完整目录包。
+`Manager` 是 Agent、HTTP、CLI 和工具共用的唯一边界：
+
+```go
+type Manager interface {
+    Catalog(context.Context, CatalogQuery) (Catalog, error)
+    Load(context.Context, LoadRequest) (LoadedSkill, error)
+    Apply(context.Context, ChangeRequest) (ChangeResult, error)
+}
+```
+
+发现优先级从高到低：
+
+1. `<project>/.p-chat/skills/<name>/`（项目托管）
+2. `<project>/.agents/skills/<name>/`（Agent Skills 标准项目目录）
+3. `~/.p-chat/skills/<name>/`，实际根由 `PCHAT_HOME` / `PCHAT_DATA_HOME` 解析（P-Chat 全局托管）
+4. `~/.agents/skills/<name>/`（Agent Skills 标准用户目录）
+
+同名 Skill 只选最高优先级版本，较低版本记录在 `shadowed[]`；目录名与
+frontmatter `name` 不一致会产生诊断，但逻辑名称始终以 frontmatter 为准。
+
+`SKILL.md` frontmatter 支持 `requires` 或 `metadata.requires`：
+
+```yaml
+---
+name: lark-doc
+description: 管理飞书文档
+metadata:
+  requires:
+    skills: [lark-shared]
+    bins: [lark-cli]
+---
+```
+
+系统提示词只注入 `Catalog` 的名称、描述和依赖摘要；正文在显式激活或模型调用
+`skill(action=load)` 时按需加载。加载按依赖拓扑顺序合成上下文，并校验依赖 Skill、
+外部可执行文件和资源路径。每次 `Catalog/Load` 都重新扫描，所以外部 CLI 写入标准目录后，
+新会话无需重启即可发现。
+
+安装/导入由 `Apply` 完成：远程仅接受 HTTPS GitHub 仓库或目录 URL；本地导入复制
+完整目录包，不执行包内脚本；发布使用 staging + rename，限制文件数与总大小并拒绝
+符号链接。完成后必须再次 `Load` 验证，返回 `ready=false` 时只能说“已复制但不可用”，
+不能向用户声称安装成功。
+
+飞书 CLI 等第三方安装器的标准流程：先让它写入 `.agents/skills`；若它只写入自己的
+Agent 目录，则调用 `skill_manage(action=import, source_path=...)` 导入 P-Chat 托管目录；
+最后调用 `skill(action=doctor)` 或 `skill(action=list)` 验证 `lark-*` 及依赖。P-Chat 的
+host runtime prompt 会明确告知当前数据根和四类 Skill 目录。
+
+兼容接口 `LoadAllWithRoot()` / `LoadAll()` 仍保留，但同样通过 Manager 发现；不得再新增
+另一套安装、删除或合并逻辑。
 
 ## MCP 服务器集成
 

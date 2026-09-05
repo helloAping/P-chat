@@ -142,6 +142,15 @@ export type MessagePart =
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string; streaming?: boolean }
   | {
+      kind: 'skill'
+      name: string
+      status: 'start' | 'ready' | 'error'
+      scope?: string
+      source?: string
+      dependencies?: string[]
+      error?: string
+    }
+  | {
       kind: 'tool'
       id?: string
       tool_id?: string
@@ -188,6 +197,7 @@ export type MessagePart =
 
 export type SubAgentPart = Extract<MessagePart, { kind: 'sub_agent' }>
 export type ToolPart = Extract<MessagePart, { kind: 'tool' }>
+export type SkillPart = Extract<MessagePart, { kind: 'skill' }>
 export type TextPart = Extract<MessagePart, { kind: 'text' }>
 export type ThinkingPart = Extract<MessagePart, { kind: 'thinking' }>
 export type QuestionPart = Extract<MessagePart, { kind: 'question' }>
@@ -537,7 +547,20 @@ export interface SkillItem {
   name: string
   description: string
   path: string
+  directory?: string
+  scope?: 'project_managed' | 'project_standard' | 'global_managed' | 'user_standard' | string
+  required_skills?: string[]
+  required_bins?: string[]
+  resources?: string[]
   content?: string
+}
+
+export interface SkillDiagnostic {
+  code: string
+  severity: string
+  skill?: string
+  source?: string
+  message: string
 }
 
 export interface SearchSkillItem {
@@ -560,13 +583,13 @@ function skillScopeQuery(opts?: SkillScopeOptions) {
 }
 
 export const listSkills = (opts?: SkillScopeOptions) =>
-  jsonFetch<{ skills: SkillItem[] }>(`/api/v1/skills${skillScopeQuery(opts)}`)
+  jsonFetch<{ skills: SkillItem[]; diagnostics?: SkillDiagnostic[] }>(`/api/v1/skills${skillScopeQuery(opts)}`)
 
 export const getSkill = (name: string, opts?: SkillScopeOptions) =>
   jsonFetch<{ skill: SkillItem }>(`/api/v1/skills/${encodeURIComponent(name)}${skillScopeQuery(opts)}`)
 
 export const installSkill = (name: string, url: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
-  jsonFetch<{ ok: boolean; name: string }>('/api/v1/skills/install', {
+  jsonFetch<{ ok: boolean; ready: boolean; name: string; path: string; diagnostics?: SkillDiagnostic[] }>('/api/v1/skills/install', {
     method: 'POST',
     body: JSON.stringify({
       name,
@@ -1229,6 +1252,7 @@ export interface SendOptions {
   // called on user-initiated aborts (signal.aborted).
   onStreamDrop?: (info: { lastSeq: number; reason: string }) => void
   skill_context?: string
+  active_skills?: string[]
 }
 
 export interface TurnQueuePayload {
@@ -1245,6 +1269,7 @@ export interface TurnQueuePayload {
   sub_agent_provider?: string
   sub_agent_model?: string
   skill_context?: string
+  active_skills?: string[]
 }
 
 export interface TurnQueueItem {
@@ -1284,6 +1309,7 @@ type SendPayloadSource = Pick<SendOptions,
   | 'subAgentProvider'
   | 'subAgentModel'
   | 'skill_context'
+  | 'active_skills'
 >
 
 export function sendPayloadFromOptions(opts: SendPayloadSource): TurnQueuePayload {
@@ -1306,6 +1332,7 @@ export function sendPayloadFromOptions(opts: SendPayloadSource): TurnQueuePayloa
     sub_agent_provider: opts.subAgentProvider,
     sub_agent_model: opts.subAgentModel,
     skill_context: opts.skill_context || '',
+    active_skills: opts.active_skills?.filter(Boolean) || [],
   }
 }
 
@@ -1385,6 +1412,12 @@ export interface StreamEvent {
   // client appends it to the trailing thinking part of the
   // assistant message.
   thinking?: string
+  skill_name?: string
+  skill_status?: 'start' | 'ready' | 'error' | string
+  skill_scope?: string
+  skill_source?: string
+  skill_dependencies?: string[]
+  skill_error?: string
   tool_id?: string
   tool_name?: string
   tool_status?: string

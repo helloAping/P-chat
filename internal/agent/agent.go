@@ -56,10 +56,15 @@ type Agent struct {
 	tools    *tool.Registry
 	cfg      *config.Config
 	skills   []skill.Skill
-	rules    []rules.Rule
-	sandbox  tool.SandboxChecker // optional; nil disables sandbox enforcement
-	options  llm.ChatOptions     // per-request sampling; populated from cfg
-	attach   AttachmentResolver  // optional; turns Attachment IDs into file paths for upload expansion
+	// skillManager 解析 Skill 目录并按需加载指令。
+	// skillManager resolves Skill catalogs and loads instructions on demand.
+	// 它不缓存文件系统状态，因此第三方安装无需重启服务即可见。
+	// It is stateless over the filesystem, so third-party installs are visible without a restart.
+	skillManager skill.Manager
+	rules        []rules.Rule
+	sandbox      tool.SandboxChecker // optional; nil disables sandbox enforcement
+	options      llm.ChatOptions     // per-request sampling; populated from cfg
+	attach       AttachmentResolver  // optional; turns Attachment IDs into file paths for upload expansion
 
 	// bypassOnce, when true, makes the NEXT tool call skip the
 	// sandbox check (set by /unsafe once). Reset after the call.
@@ -200,13 +205,24 @@ func New(cfg *config.Config, llmClient *llm.Client, styleMgr *style.Manager, sto
 	rulesList, _ := rules.LoadAll()
 
 	return &Agent{
-		llm:      llmClient,
-		styleMgr: styleMgr,
-		store:    store,
-		tools:    tools,
-		cfg:      cfg,
-		skills:   skills,
-		rules:    rulesList,
+		llm:          llmClient,
+		styleMgr:     styleMgr,
+		store:        store,
+		tools:        tools,
+		cfg:          cfg,
+		skills:       skills,
+		skillManager: skill.NewManager(),
+		rules:        rulesList,
+	}
+}
+
+// SetSkillManager 替换 Skill manager，主要用于嵌入场景与测试。
+// SetSkillManager replaces the Skill manager, primarily for embedding and tests.
+func (a *Agent) SetSkillManager(manager skill.Manager) {
+	if manager != nil {
+		a.skillManager = manager
+		a.staticPrompt = ""
+		a.staticPromptID = ""
 	}
 }
 
@@ -1151,6 +1167,11 @@ type ChatRequest struct {
 	// activated via slash command. It is appended to the system
 	// prompt so the LLM sees it without cluttering the chat.
 	SkillContext string `json:"skill_context,omitempty"`
+	// ActiveSkills 包含斜杠命令或调用方选择的逻辑 Skill 名称。
+	// ActiveSkills contains logical Skill names selected by a slash command or caller.
+	// Agent 会自行解析名称，并在注入模型上下文前发送可见生命周期事件。
+	// The Agent resolves names and emits a visible lifecycle before injecting instructions.
+	ActiveSkills []string `json:"active_skills,omitempty"`
 	// AllowedTools 限制本次请求可见和可执行的工具集合。
 	// AllowedTools limits the tool set exposed to and executable by this request.
 	AllowedTools []string `json:"allowed_tools,omitempty"`
@@ -1299,6 +1320,15 @@ type ChatStreamChunk struct {
 	ToolRetryable    bool     `json:"tool_retryable,omitempty"`
 	ToolRequiresUser bool     `json:"tool_requires_user,omitempty"`
 	ToolNextAction   string   `json:"tool_next_action,omitempty"`
+
+	// Skill 字段组成一等的用户可见生命周期事件。
+	// Skill fields form a first-class user-visible lifecycle event.
+	SkillName         string   `json:"skill_name,omitempty"`
+	SkillStatus       string   `json:"skill_status,omitempty"`
+	SkillScope        string   `json:"skill_scope,omitempty"`
+	SkillSource       string   `json:"skill_source,omitempty"`
+	SkillDependencies []string `json:"skill_dependencies,omitempty"`
+	SkillError        string   `json:"skill_error,omitempty"`
 
 	TokensIn  int `json:"tokens_in,omitempty"`
 	TokensOut int `json:"tokens_out,omitempty"`
@@ -2069,6 +2099,24 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			systemPrompt = appendSummaryInjection(systemPrompt, req.CompressedSummary)
 		}
 		// Append active skill context (from /skillname slash command).
+		activeSkillEvents := make([]ChatStreamChunk, 0, len(req.ActiveSkills)*2)
+		activeSkillContext, err := a.loadActiveSkills(ctx, req, func(event ChatStreamChunk) {
+			activeSkillEvents = append(activeSkillEvents, event)
+			partsAcc.update(event)
+			sendOrDrop(ctx, ch, nextSeq, event)
+		})
+		if err != nil {
+			persistAssistant(req.SessionID, a.store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", partsAcc, 0, 0, req.RegenGroupID)
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "skill", Error: err.Error(), ErrorKind: "skill_error", Done: true})
+			return
+		}
+		if activeSkillContext != "" {
+			systemPrompt += "\n\n---\n\n## 激活的技能上下文\n\n" + activeSkillContext + "\n"
+		}
+		// 兼容仍发送完整 SKILL.md 正文的旧 GUI/CLI 客户端。
+		// Compatibility for older GUI/CLI clients that still send the full SKILL.md body.
+		// 新客户端改为发送 ActiveSkills。
+		// New clients send ActiveSkills instead.
 		if req.SkillContext != "" {
 			systemPrompt += "\n\n---\n\n## 激活的技能上下文\n\n" + req.SkillContext + "\n"
 		}
@@ -2306,10 +2354,26 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		)
 		const stuckThreshold = 3
 		const sameToolErrMax = 4
+		invokedSkills := make(map[string]struct{}, len(req.ActiveSkills))
+		announcedSkillLoads := make(map[string]struct{}, len(req.ActiveSkills))
+		skillLoads := newSkillLoadCache()
+		for _, name := range req.ActiveSkills {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				invokedSkills[name] = struct{}{}
+				announcedSkillLoads[name] = struct{}{}
+				skillLoads.markLoaded(name)
+			}
+		}
 		for round := 1; ; round++ {
 			roundStart := time.Now()
 			roundNum := round
 			partsAcc = newPartsAccumulator()
+			if round == 1 {
+				for _, event := range activeSkillEvents {
+					partsAcc.update(event)
+				}
+			}
 			currentTodos := unfinishedTodos(req.SessionID)
 			if todoGuardActive(todoMode, currentTodos) || todoCheckpoint.active() {
 				upsertTodoGuard(&msgs, todoMode, currentTodos, todoCheckpoint.active())
@@ -3007,6 +3071,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
 				partsAcc.update(startChunk)
 				sendOrDrop(ctx, ch, nextSeq, startChunk)
+				if skillName, isLoad := parseSkillLoadCall(tc.Name, tc.ArgsJSON); isLoad {
+					if _, completed := invokedSkills[skillName]; !completed {
+						if _, announced := announcedSkillLoads[skillName]; !announced {
+							announcedSkillLoads[skillName] = struct{}{}
+							skillStart := ChatStreamChunk{
+								Phase: "skill", SkillName: skillName, SkillStatus: "start",
+								Message: "当前调用 Skill：" + skillName,
+							}
+							partsAcc.update(skillStart)
+							sendOrDrop(ctx, ch, nextSeq, skillStart)
+						}
+					}
+				}
 			}
 			compressionPlan := buildSubagentToolCompressionPlan(req, toolCalls)
 			if len(compressionPlan) > 0 {
@@ -3518,7 +3595,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						execCtx, execCancel = context.WithCancel(toolCtx)
 					}
 					defer execCancel()
-					result, err := handler(execCtx, argsRaw)
+					var result *tool.CallResult
+					var err error
+					if skillName, isLoad := parseSkillLoadCall(tc.Name, tc.ArgsJSON); isLoad {
+						result, err = skillLoads.do(skillName, func() (*tool.CallResult, error) {
+							return handler(execCtx, argsRaw)
+						})
+					} else {
+						result, err = handler(execCtx, argsRaw)
+					}
 					outcomes[i] = toolOutcome{
 						idx:     i,
 						tc:      tc,
@@ -3561,6 +3646,23 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				tc := o.tc
 				if o.result != nil {
 					o.result.Normalize()
+				}
+				if invocation := o.result.GetSkillInvocation(); invocation != nil {
+					if _, alreadyVisible := invokedSkills[invocation.Name]; !alreadyVisible {
+						invokedSkills[invocation.Name] = struct{}{}
+						if _, announced := announcedSkillLoads[invocation.Name]; !announced {
+							startChunk := skillChunkFromInvocation(invocation, "start")
+							partsAcc.update(startChunk)
+							sendOrDrop(ctx, ch, nextSeq, startChunk)
+						}
+						status := invocation.Status
+						if status == "" {
+							status = "ready"
+						}
+						resultChunk := skillChunkFromInvocation(invocation, status)
+						partsAcc.update(resultChunk)
+						sendOrDrop(ctx, ch, nextSeq, resultChunk)
+					}
 				}
 				if tc.Name != "todo_write" && tc.Name != "question" {
 					ordinaryWorkCalled = true

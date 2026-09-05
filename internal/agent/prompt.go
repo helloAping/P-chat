@@ -13,6 +13,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -21,10 +23,12 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/version"
 )
 
 const maxKBIndexPromptRunes = 2000
@@ -39,6 +43,14 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 	// sig-comparison below always finds a miss and rebuilds
 	// the prompt with the new project's skills + rules.
 	a.ReloadWithRootIfChanged(projectRoot)
+	manager := a.skillManager
+	if manager == nil {
+		manager = skill.NewManager()
+	}
+	skillCatalog, err := manager.Catalog(context.Background(), skill.CatalogQuery{ProjectRoot: projectRoot})
+	if err != nil {
+		return "", "", fmt.Errorf("discover Skills: %w", err)
+	}
 	toolNames := make([]string, 0, len(toolDefs))
 	for _, t := range toolDefs {
 		toolNames = append(toolNames, t.Name)
@@ -60,7 +72,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 		string(wm),
 		agentsSignatureWithRoot(projectRoot),
 		rulesSignature(a.rules),
-		skillSignature(a.skills),
+		skillCatalogSignature(skillCatalog),
 		strings.Join(toolNames, ","),
 		lang,
 		projectRoot,
@@ -84,15 +96,25 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 	sb.WriteString(buildWorkModeBlock(wm))
 	sb.WriteString(agents.LoadAllWithRoot(projectRoot) + "\n---\n\n")
 	sb.WriteString(rules.BuildRulesContext(a.rules) + "\n---\n\n")
-	sb.WriteString(skill.BuildSkillContext(a.skills) + "\n---\n\n")
+	sb.WriteString(skill.BuildCatalogContext(skillCatalog, 8*1024) + "\n---\n\n")
 	sb.WriteString(buildToolHintBlock(availableTools, kbEnabled))
 	sb.WriteString(buildWorkingDirBlock(projectRoot))
+	sb.WriteString(buildHostRuntimeBlock(projectRoot))
 	sb.WriteString(buildLanguageBlock(lang))
 
 	prompt := sb.String()
 	a.staticPrompt = prompt
 	a.staticPromptID = sig
 	return prompt, sig, nil
+}
+
+func skillCatalogSignature(catalog skill.Catalog) string {
+	parts := make([]string, 0, len(catalog.Skills))
+	for _, item := range catalog.Skills {
+		stat, _ := os.Stat(item.Path)
+		parts = append(parts, item.Name+":"+string(item.Scope)+":"+fileSig(stat))
+	}
+	return strings.Join(parts, ",")
 }
 
 // buildStyleBlock returns section 1 (style identity + soul) plus
@@ -427,6 +449,26 @@ func buildWorkingDirBlock(projectRoot string) string {
 		"Your working directory is fixed at `%s`. exec_command runs here automatically "+
 		"(the work_dir argument is ignored). read_file and write_file resolve relative "+
 		"paths against this directory.\n", projectRoot)
+}
+
+// buildHostRuntimeBlock 明确 P-Chat 的 Skill 所有权与安装目录，使模型能正确验证第三方 CLI 安装。
+// buildHostRuntimeBlock makes Skill ownership and install paths explicit for third-party verification.
+func buildHostRuntimeBlock(projectRoot string) string {
+	home, _ := os.UserHomeDir()
+	standardGlobal := filepath.Join(home, ".agents", "skills")
+	var builder strings.Builder
+	builder.WriteString("\n\n---\n\n## Host Runtime\n\n")
+	fmt.Fprintf(&builder, "Host: P-Chat %s\n", version.String())
+	fmt.Fprintf(&builder, "P-Chat data root: `%s`\n", paths.GlobalDir())
+	fmt.Fprintf(&builder, "Managed global Skills: `%s`\n", paths.GlobalSkillsDir())
+	fmt.Fprintf(&builder, "Standard user Skills (auto-discovered): `%s`\n", standardGlobal)
+	if projectRoot != "" {
+		fmt.Fprintf(&builder, "Managed project Skills: `%s`\n", paths.ProjectSkillsDirWithRoot(projectRoot))
+		fmt.Fprintf(&builder, "Standard project Skills (auto-discovered): `%s`\n", filepath.Join(projectRoot, ".agents", "skills"))
+	}
+	builder.WriteString("Use `skill_manage` for managed imports/removals and `skill` for list/load/read_resource/doctor. ")
+	builder.WriteString("A CLI package being installed is not proof that its Skills are available: report success only after `skill` action `doctor` or `list` sees the expected Skill and its dependencies.\n")
+	return builder.String()
 }
 
 // buildLanguageBlock returns section 7 (output language hint)

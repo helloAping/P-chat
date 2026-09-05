@@ -69,6 +69,16 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolConfirmJSON = chunk.ToolConfirmJSON
 		return ev
 	}
+	if chunk.SkillName != "" {
+		ev.Type = "skill"
+		ev.SkillName = chunk.SkillName
+		ev.SkillStatus = chunk.SkillStatus
+		ev.SkillScope = chunk.SkillScope
+		ev.SkillSource = chunk.SkillSource
+		ev.SkillDependencies = append([]string(nil), chunk.SkillDependencies...)
+		ev.SkillError = chunk.SkillError
+		return ev
+	}
 	if chunk.Error != "" {
 		ev.Type = "error"
 		ev.Error = chunk.Error

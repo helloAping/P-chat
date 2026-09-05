@@ -58,6 +58,7 @@ import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import * as api from '../api/client'
 import { state, regenerateMessage, fetchReplies, activateReply } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
+import SkillCallCard from './SkillCallCard.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import ToolCallGroup from './ToolCallGroup.vue'
 import SubAgentCard from './SubAgentCard.vue'
@@ -805,7 +806,7 @@ const showTypewriterPlaceholder = computed(() => {
   if (!parts || parts.length === 0) return true
   return !parts.some(p =>
     p.kind === 'text' || p.kind === 'thinking' ||
-    p.kind === 'tool' || p.kind === 'sub_agent',
+    p.kind === 'skill' || p.kind === 'tool' || p.kind === 'sub_agent',
   )
 })
 
@@ -1396,6 +1397,7 @@ function findPrecedingUserMessageId(): number {
                     :part="entry.part"
                     :default-open="isLiveThinkingPart(entry.index, entry.part.kind, message.parts)"
                   />
+                  <SkillCallCard v-else-if="entry.part.kind === 'skill'" :part="entry.part" />
                   <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
                   <SubAgentCard v-else-if="entry.part.kind === 'sub_agent'" :part="entry.part" />
                   <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />

@@ -189,3 +189,13 @@ func TestConfirmTargetFor_ExecWorkDirInsideProject_NoBump(t *testing.T) {
 		t.Errorf("work_dir inside project should preserve Allow, got %d", got.Decision)
 	}
 }
+
+func TestConfirmTargetFor_SkillManageAlwaysRequiresConfirmation(t *testing.T) {
+	target, ok := confirmTargetFor("skill_manage", `{"action":"install","source_url":"larksuite/cli","name":"lark-doc"}`, `D:\projects\myapp`, &stubSandboxForConfirm{})
+	if !ok {
+		t.Fatal("skill_manage must participate in the confirmation flow")
+	}
+	if target.Decision != tool.SandboxConfirm || target.RiskLevel != "high" {
+		t.Fatalf("target = %+v", target)
+	}
+}

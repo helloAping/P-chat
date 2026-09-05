@@ -415,6 +415,17 @@ func init() {
 			Handler: cmdSkills,
 		},
 		{
+			Name: "/skill", Description: "明确调用一个 Skill 并发送任务",
+			Usage: "/skill <名称> [任务描述]",
+			Args: "<名称>       - 已安装 Skill 的精确名称\n" +
+				"      [任务描述] - 交给该 Skill 的请求；省略时使用默认帮助请求",
+			Examples: []string{
+				"/skill lark-doc 创建一份周报",
+				"/skill lark-calendar",
+			},
+			Handler: cmdSkillUsage,
+		},
+		{
 			Name: "/rules", Description: "列出已加载的规则",
 			Usage: "/rules",
 			Args: "无参。\n" +
@@ -2299,6 +2310,48 @@ func cmdSkills(ctx cliContext, args string) error {
 	return nil
 }
 
+func parseSkillCommandArgs(args string) (name, prompt string, err error) {
+	parts := strings.Fields(strings.TrimSpace(args))
+	if len(parts) == 0 {
+		return "", "", errors.New("用法: /skill <名称> [任务描述]")
+	}
+	name = parts[0]
+	prompt = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args), name))
+	if prompt == "" {
+		prompt = fmt.Sprintf("请使用 Skill「%s」提供帮助", name)
+	}
+	return name, prompt, nil
+}
+
+func matchInstalledSkillCommand(input string, installed []string) (name, prompt string, ok bool) {
+	trimmed := strings.TrimSpace(input)
+	if !strings.HasPrefix(trimmed, "/") {
+		return "", "", false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(trimmed, "/"), " ", 2)
+	name = strings.TrimSpace(parts[0])
+	for _, candidate := range installed {
+		if candidate != name {
+			continue
+		}
+		if len(parts) == 2 {
+			prompt = strings.TrimSpace(parts[1])
+		}
+		if prompt == "" {
+			prompt = fmt.Sprintf("请使用 Skill「%s」提供帮助", name)
+		}
+		return name, prompt, true
+	}
+	return "", "", false
+}
+
+// cmdSkillUsage 供直接 handler 测试与帮助工具使用；REPL 会拦截 /skill 以复用正常流式渲染。
+// cmdSkillUsage supports handler tests and help; the REPL intercepts /skill for streaming rendering.
+func cmdSkillUsage(_ cliContext, args string) error {
+	_, _, err := parseSkillCommandArgs(args)
+	return err
+}
+
 func cmdRules(ctx cliContext, args string) error {
 	names, err := ctx.ListRules()
 	if err != nil {
@@ -2826,6 +2879,7 @@ func queuedTurnChatRequest(payload httpcli.TurnQueuePayload, ctx cliContext, ses
 		},
 		ClientMsgID:  payload.ClientMsgID,
 		SkillContext: payload.SkillContext,
+		ActiveSkills: append([]string(nil), payload.ActiveSkills...),
 		TodoMode:     agent.NormalizeTodoMode(payload.TodoMode),
 	}
 }

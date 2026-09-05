@@ -233,6 +233,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		SessionID:         id,
 		ProjectRoot:       meta.ProjectPath,
 		SkillContext:      req.SkillContext,
+		ActiveSkills:      append([]string(nil), req.ActiveSkills...),
 		PlanMode:          meta.PlanMode,
 		PermissionLevel:   meta.PermissionLevel,
 		KBBase:            meta.KnowledgeBase,

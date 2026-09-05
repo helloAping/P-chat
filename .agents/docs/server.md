@@ -106,6 +106,17 @@ Chunk 字段检查顺序（优先级从高到低）:
 - `SaveSystemMessage` — 保存自定义系统提示词
 - `GetTodos` — 获取待办列表
 
+`POST /sessions/:id/messages` 和 turn queue payload 支持 `active_skills: string[]`。
+服务端只接收名称，由当前会话的项目根解析有效 Skill；旧 `skill_context` 字段暂时保留兼容，
+新客户端不得继续发送 Skill 正文。
+
+Skill API：
+
+- `GET /skills`：只返回 catalog 元数据及 `diagnostics[]`，不返回正文。
+- `GET /skills/:name`：按需加载正文，主要用于检查界面。
+- `POST /skills/install`：完整包安装/导入，响应含 `ready` 和诊断。
+- `DELETE /skills/:name`：只允许删除 P-Chat 托管来源，标准目录返回 `409`。
+
 #### 会话回合队列
 
 `turn_queue` 是忙碌会话的持久化 FIFO。客户端先入队，空闲后通过 `claim`
@@ -129,6 +140,8 @@ Chunk 字段检查顺序（优先级从高到低）:
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
 - `buildMessageResponse()` 会过滤不应渲染的内部行：tool_call/tool_result、媒体附件独立行、`metadata.ui_hidden=true` 的消息，以及旧库中以 `⏱ 上一回合因` / `⚠ 系统检测：你刚才的回复没有调用任何工具` 开头的自动续跑 user-style nudge。内部续跑提示只能影响下一次 LLM 输入，不应在 GUI 里表现成用户重复发送消息。
+- `type=skill` SSE 携带 `skill_name`、`skill_status=start|ready|error`、`skill_scope`、
+  `skill_source`、`skill_dependencies`、`skill_error`，并作为 `kind=skill` part 持久化。
 
 ### 6. P0-1 / P1-3 增量端点 (round 2, 2026-07-15)
 

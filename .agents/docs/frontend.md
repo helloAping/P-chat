@@ -28,6 +28,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/TypedText.vue` | 流式文本渲染（blinking caret） | |
 | `components/ThinkingBlock.vue` | 思考块（可折叠） | |
 | `components/ToolCallCard.vue` | 工具调用卡片（name/args/status/result） | |
+| `components/SkillCallCard.vue` | Skill 调用生命周期卡片，明确显示实际 Skill 名称 | |
 | `components/SubAgentCard.vue` | 子代理嵌套卡片（header + inner parts） | |
 | `components/SessionSidebar.vue` | 会话列表 + 项目选择器 + 设置 | |
 | `components/CommandPalette.vue` | `/` 斜杠命令内联自动补全 | |
@@ -48,6 +49,7 @@ Assistant 消息使用 `parts[]` 数组，每项一个逻辑单元：
 |---|---|---|
 | `text` | TypedText / static md | 流式期间用 TypedText（blinking caret）；完成后用 marked.parse |
 | `thinking` | ThinkingBlock | 可折叠面板，流式期间默认展开 |
+| `skill` | SkillCallCard | 固定显示“当前调用 Skill：name”及 start/ready/error、scope、依赖 |
 | `tool` | ToolCallCard | name, args, status(start/ok/error), result, elapsed |
 | `sub_agent` | SubAgentCard | 嵌套卡片，含自身 parts[] |
 
@@ -61,11 +63,15 @@ pchat-server SSE → fetch() ReadableStream reader
   → JSON.parse → StreamEvent
   → await setTimeout(0)  ← 关键！强制 Vue 在两帧之间 flush
   → appendStreamEvent(id, ev)
-    → 路由到匹配的 part (text/thinking/tool/sub_agent)
+    → 路由到匹配的 part (text/thinking/skill/tool/sub_agent)
     → Vue 响应式 → DOM 更新
 ```
 
 **`setTimeout(0)` 的重要性**：防止同一 TCP 包内的多事件被 Vue 批量合并为一帧渲染（导致文本一次性出现，失去打字机效果）。
+
+GUI 的动态 `/<skill-name> [请求]` 只把名称写入 `active_skills`。服务端解析、依赖检查和
+正文加载结果通过 SkillCallCard 展示；前端不得先写“已激活”系统消息，也不得调用
+`GET /skills/:name` 后把完整 `SKILL.md` 塞进 `skill_context`。
 
 ### 3. appendStreamEvent — 事件路由 (chat.ts:828-1103)
 

@@ -219,7 +219,7 @@ watch(() => state.kbConfigVersion, () => { loadKBases() })
 
 const commandList = ref<CmdSpec[]>([])
 const skillCommands = ref<CmdSpec[]>([])
-let pendingSkillContext = ''
+let pendingActiveSkills: string[] = []
 
 // Merge local commands that aren't in the server list.
 const LOCAL_COMMANDS: CmdSpec[] = [
@@ -962,27 +962,14 @@ async function send() {
   if (isSlashLine()) {
     const parsed = parseSlashLine()
     if (parsed) {
-      // Skill commands: load content, merge with user args,
-      // then send as a single message to the LLM.
+      // Skill 命令只选择名称；服务端负责解析生效包、校验依赖并发送生命周期事件。
+      // Skill commands select only a name; the server resolves, validates, and emits lifecycle events.
       if (skillCommands.value.some(c => c.name === parsed.name)) {
-        sending.value = true
-        try {
-          const r = await api.getSkill(parsed.name, state.currentID ? { sessionId: state.currentID } : undefined)
-          const skillContent = r.skill.content || ''
-          const userInput = parsed.args || ''
-          pendingSkillContext = skillContent
-          // Show a clean system note instead of dumping skill content.
-          appendSystemMessage(`已激活技能「${parsed.name}」` + (userInput ? `: ${userInput}` : ''))
-          // Use only the user's input as the visible message.
-          inputText.value = userInput || `请根据技能「${parsed.name}」的内容提供帮助`
-          sending.value = false
-          // Fall through to normal send below.
-        } catch (e: any) {
-          appendSystemMessage(`技能 /${parsed.name} 加载失败: ${e.message}`)
-          sending.value = false
-          inputText.value = ''
-          return
-        }
+        pendingActiveSkills = [parsed.name]
+        const userInput = parsed.args || ''
+        inputText.value = userInput || `请使用 Skill「${parsed.name}」提供帮助`
+        // 继续走下方正常发送流程；SkillCallCard 是 start/ready/error 的事实来源。
+        // Continue through normal send; SkillCallCard is the lifecycle source of truth.
       } else {
         inputText.value = ''
         sending.value = true
@@ -1072,7 +1059,7 @@ async function send() {
     if (uploadID) attachment.upload_id = uploadID
   })
   const inlineAttachments = buildInlineAttachments(stagedAttachments)
-  const skillContext = pendingSkillContext || undefined
+  const activeSkills = pendingActiveSkills.length ? [...pendingActiveSkills] : undefined
   const turnPayload = api.sendPayloadFromOptions({
     message: text,
     client_msg_id: clientMsgId,
@@ -1086,13 +1073,13 @@ async function send() {
     subAgentModel: meta.sub_agent_model || '',
     todo_mode: todoMode,
     attachments: inlineAttachments,
-    skill_context: skillContext,
+    active_skills: activeSkills,
   })
   if (shouldQueue) {
     try {
       await enqueueTurnQueue(id, turnPayload)
       clearAttachments(id)
-      pendingSkillContext = ''
+      pendingActiveSkills = []
       notifyManager.unlock()
       message.info('消息已加入队列')
       maybeDrainTurnQueue()
@@ -1132,11 +1119,11 @@ async function send() {
       subAgentModel: meta.sub_agent_model || '',
       todoMode,
       attachments: inlineAttachments,
-      skillContext,
-      // 首个流事件到达后，技能上下文已经提交给服务端。
-      // The first stream event confirms the skill context was submitted.
+      activeSkills,
+      // 首个流事件到达后，Skill 名称已经提交给服务端。
+      // The first stream event confirms the Skill name was submitted.
       onFirstEvent: () => {
-        pendingSkillContext = ''
+        pendingActiveSkills = []
       },
       onServerError: (event) => {
         if (event.suggestion) {

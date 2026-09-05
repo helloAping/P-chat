@@ -63,6 +63,25 @@ func TestClient_PingFails(t *testing.T) {
 	}
 }
 
+func TestClient_ListSkills(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/skills" || r.URL.Query().Get("session_id") != "conv-1" {
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"skills":[{"name":"lark-doc","description":"Lark docs","scope":"user_standard"}]}`))
+	}))
+	defer srv.Close()
+
+	items, err := NewClient(srv.URL).ListSkills(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatalf("ListSkills: %v", err)
+	}
+	if len(items) != 1 || items[0].Name != "lark-doc" || items[0].Scope != "user_standard" {
+		t.Fatalf("items = %+v", items)
+	}
+}
+
 func TestClient_ListSessions_FreshServer(t *testing.T) {
 	// pchat-server auto-creates a "current" session on startup, so a
 	// brand-new server has 1 session, not 0. We verify the list

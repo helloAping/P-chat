@@ -1417,6 +1417,7 @@ func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) 
 		SubAgentProvider: req.SubagentModel.Provider,
 		SubAgentModel:    req.SubagentModel.Model,
 		SkillContext:     req.SkillContext,
+		ActiveSkills:     append([]string(nil), req.ActiveSkills...),
 	}
 	if req.UseImageRecognition {
 		enabled := true
@@ -1448,6 +1449,7 @@ func queuedPayloadSendOptions(payload httpcli.TurnQueuePayload) httpcli.SendMess
 		SubAgentProvider:     payload.SubAgentProvider,
 		SubAgentModel:        payload.SubAgentModel,
 		SkillContext:         payload.SkillContext,
+		ActiveSkills:         append([]string(nil), payload.ActiveSkills...),
 	}
 }
 
@@ -1649,9 +1651,22 @@ func (c *httpContext) ScanKBs() (int, int, error) { return 0, 0, c.unsupported("
 func (c *httpContext) Recall(ctx context.Context, query string, topK int) error {
 	return c.unsupported("Recall")
 }
-func (c *httpContext) InitProject(dir string) error  { return c.unsupported("InitProject") }
-func (c *httpContext) ListSkills() ([]string, error) { return nil, c.unsupported("ListSkills") }
-func (c *httpContext) ListRules() ([]string, error)  { return nil, c.unsupported("ListRules") }
+func (c *httpContext) InitProject(dir string) error { return c.unsupported("InitProject") }
+func (c *httpContext) ListSkills() ([]string, error) {
+	if c.c == nil {
+		return nil, c.unsupported("ListSkills")
+	}
+	items, err := c.c.ListSkills(context.Background(), c.curSess)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item.Name)
+	}
+	return names, nil
+}
+func (c *httpContext) ListRules() ([]string, error) { return nil, c.unsupported("ListRules") }
 func (c *httpContext) AgentsContext() (string, string, error) {
 	return "", "", c.unsupported("AgentsContext")
 }
@@ -1699,6 +1714,12 @@ func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 		ToolRetryable:         ev.ToolRetryable,
 		ToolRequiresUser:      ev.ToolRequiresUser,
 		ToolNextAction:        ev.ToolNextAction,
+		SkillName:             ev.SkillName,
+		SkillStatus:           ev.SkillStatus,
+		SkillScope:            ev.SkillScope,
+		SkillSource:           ev.SkillSource,
+		SkillDependencies:     append([]string(nil), ev.SkillDependencies...),
+		SkillError:            ev.SkillError,
 		TokensIn:              ev.TokensIn,
 		TokensOut:             ev.TokensOut,
 		SubAgent:              ev.SubAgent,

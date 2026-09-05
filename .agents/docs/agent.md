@@ -15,7 +15,8 @@ Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
 | `agent.go` | ReAct 循环、LLM 调用编排、工具派发、事件流控制 | `ChatWithTools()`, `Agent`, `ReloadWithRootIfChanged()` |
-| `parts.go` | 助手消息的结构化 parts 累加器（thinking/tool/sub_agent） | `partsAccumulator`, `snapshotStructural()` |
+| `parts.go` | 助手消息的结构化 parts 累加器（thinking/skill/tool/sub_agent） | `partsAccumulator`, `snapshotStructural()` |
+| `skills.go` | 显式 Skill 加载、依赖合成和生命周期事件 | `loadActiveSkills()` |
 | `attachment.go` | 用户附件（图片/文件）扩展为 ChatMessage | `AttachmentResolver` |
 
 ## 核心概念
@@ -24,7 +25,8 @@ Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用
 
 ```
 for round := 1; maxRounds==0 || round<=maxRounds; round++ {
-    1. 构建系统提示词 (style + work_mode + AGENTS + rules + skills)
+    1. 构建系统提示词 (style + work_mode + AGENTS + rules + Skill 索引 + host runtime)
+	1a. 加载 ChatRequest.ActiveSkills，并先发送可见 skill:start 事件
     2. 规范化消息 (normalizeToolResults — DeepSeek 兼容)
     3. 调用 LLM Stream → 获取内容/思考/工具调用
     4. 解析工具调用 (原生 tool_calls 或 markdown ```tool_call 块)
@@ -131,11 +133,22 @@ forwarder goroutine:
 
 - **text** — 文本增量追加
 - **thinking** — 思考增量追加（带 streaming flag）
+- **skill** — Skill 加载卡片（start/ready/error，含名称、scope、依赖和错误）
 - **tool** — 工具调用卡片（start/ok/err 状态）
 - **sub_agent** — 嵌套子代理卡片（start/ok/err 状态，含内嵌 parts）
 - **Done** — 清除所有 thinking streaming flag
 
-`persistAssistant()` 调用 `snapshotStructural()` 将 part 持久化到 SQLite（工具和子代理 part → meta["parts"] JSON）。
+`persistAssistant()` 调用 `snapshotStructural()` 将 part 持久化到 SQLite（Skill、工具和子代理 part → meta["parts"] JSON）。
+
+### 3.1 Skill 调用可见性与加载边界
+
+- `ChatRequest.ActiveSkills` 是 GUI/CLI 显式 `/skill` 激活入口，只传名称，不传整份正文。
+- Agent 在任何 Skill 指令进入 LLM 上下文前先发 `skill:start`，用户看到固定文案
+  `当前调用 Skill：<name>`；成功后发 `ready`，失败发 `error`。
+- 模型自主调用 `skill(action=load)` 时，工具结果带 `SkillInvocation` 元数据；派发层在把
+  工具结果追加到下一轮 LLM 消息前发送同样的 start/ready/error 生命周期。
+- 单回合同名 Skill 去重；依赖正文会随主 Skill 一起加载，但主卡片的 `dependencies[]`
+  明确列出依赖，不制造多个“当前调用”提示。
 
 ### 3.5 附件提交、读取与历史回看边界
 
@@ -166,7 +179,7 @@ Agent 在 `ChatWithTools()` 中用 `HistoryMessageCount` 区分“已入库历�
 
 - `style` 只表示说话风格，以及该风格对应的记忆内容。`style=off` 时，`buildStyleBlock()` 返回空，`getStyleMemory()` 也返回空。
 - `work_mode` 表示任务侧重点。`coding` 偏向读写代码、调试、测试、构建、git、code review；`daily` 偏向文档、邮件、会议纪要、摘要、知识检索和计划整理。
-- `buildStaticSystemPrompt()` 的静态段拼装顺序是：`buildStyleBlock()` → `buildWorkModeBlock()` → AGENTS.md → rules → skills → tools → working dir → language。
+- `buildStaticSystemPrompt()` 的静态段拼装顺序是：`buildStyleBlock()` → `buildWorkModeBlock()` → AGENTS.md → rules → Skill catalog 索引 → tools → working dir → host runtime → language。
 - 静态 prompt cache 的 signature 包含 `work_mode`，所以单会话切换 coding/daily 会触发新的系统 prompt。
 
 ### 5. DeepSeek 兼容性

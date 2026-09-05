@@ -2151,6 +2151,40 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         }
       }
       break
+    case 'skill': {
+      if (!ev.skill_name) break
+      const parts = sub ? sub.parts : m.parts!
+      closeTrailingThinking(parts)
+      let existing: Extract<MessagePart, { kind: 'skill' }> | undefined
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const part = parts[i]
+        if (part.kind === 'skill' && part.name === ev.skill_name) {
+          existing = part
+          break
+        }
+      }
+      const status = ev.skill_status === 'ready' || ev.skill_status === 'error'
+        ? ev.skill_status
+        : 'start'
+      if (existing) {
+        existing.status = status
+        existing.scope = ev.skill_scope
+        existing.source = ev.skill_source
+        existing.dependencies = ev.skill_dependencies
+        existing.error = ev.skill_error
+      } else {
+        parts.push({
+          kind: 'skill',
+          name: ev.skill_name,
+          status,
+          scope: ev.skill_scope,
+          source: ev.skill_source,
+          dependencies: ev.skill_dependencies,
+          error: ev.skill_error,
+        })
+      }
+      break
+    }
     case 'tool': {
       const parts = sub ? sub.parts : m.parts!
       if (!ev.tool_name) break
@@ -2397,6 +2431,10 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       walkParts(m.parts!, (p) => {
         if (p.kind === 'sub_agent' && p.status === 'start') {
           p.status = 'err'
+        }
+        if (p.kind === 'skill' && p.status === 'start') {
+          p.status = 'error'
+          p.error = p.error || 'Skill 加载未完成'
         }
       })
       // Final phantom scrub. By the time the parent's

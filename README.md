@@ -447,11 +447,24 @@ Agent 行为指令文件，注入到 System Prompt：
 ### Skills / Rules
 
 ```
-~/.p-chat/skills/code-review/SKILL.md    # 技能
+~/.p-chat/skills/code-review/SKILL.md    # P-Chat 托管的全局 Skill
+~/.agents/skills/code-review/SKILL.md    # Agent Skills 标准用户目录
+./.p-chat/skills/code-review/SKILL.md    # P-Chat 托管的项目 Skill
+./.agents/skills/code-review/SKILL.md    # Agent Skills 标准项目目录
 ~/.p-chat/rules/code-style.md            # 规则
 ```
 
-技能是按需加载的；规则是全部拼接注入。两者都支持项目级覆盖（`.p-chat/skills/`、`.p-chat/rules/`）。
+Skill 只把名称和描述放进系统索引，正文按需加载；规则仍全部拼接注入。Skill 优先级为
+项目 `.p-chat` → 项目 `.agents` → 全局 `.p-chat` → 用户 `.agents`，同名只使用最高优先级版本。
+
+CLI 可用 `/skills` 查看，用 `/skill lark-doc 创建一份周报` 显式调用；已安装 Skill 也可直接
+使用 `/lark-doc 创建一份周报`。GUI 输入 `/` 后会列出同样的动态 Skill 命令。每次真正加载
+都会在回答前显示 `当前调用 Skill：lark-doc`，随后给出“已就绪”或具体依赖错误。
+
+飞书 CLI 等第三方安装器应优先写入 `.agents/skills`。如果 CLI 把 `lark-*` 写到了自己的
+Agent 私有目录，可让 P-Chat Agent 调用 `skill_manage` 导入完整目录包；必须再执行
+`skill(action=doctor)` / `/skills` 验证。只有 `ready=true` 才算安装完成，缺少
+`lark-shared` 或 `lark-cli` 时会标记“已复制但尚不可用”。新会话会重新扫描，无需重启。
 
 ### 人格
 
@@ -600,19 +613,25 @@ GUI：输入区「会话设置」→「风格」选「关闭」。CLI：`/style 
 **4. 怎么看可用工具？**
 GUI：顶栏 🔧 按钮。CLI：`/tools`。自定义 YAML 工具放 `~/.p-chat/tools/*.yaml` 或项目内 `.p-chat/tools/*.yaml`，加载失败时在抽屉顶部「加载诊断」里看。
 
-**5. 怎么用浏览器控制？**
+**5. 飞书 CLI 已安装，为什么新会话仍找不到 lark Skill？**
+先用 `/skills` 或让 Agent 调用 `skill(action=doctor)`。P-Chat 发现 `.agents/skills` 和
+`.p-chat/skills` 两类目录；仅安装 `lark-cli` 可执行文件不等于安装 Skill 包。如果包在
+`.claude/skills` 等私有目录，让 Agent 使用 `skill_manage(action=import, source_path=...)`
+导入，确认结果 `ready=true`。调用时界面应明确显示 `当前调用 Skill：lark-xxx`。
+
+**6. 怎么用浏览器控制？**
 见上方 [浏览器控制](#浏览器控制) 章节：装扩展 → 弹窗填服务器地址 → GUI 看到「已连接浏览器 > 0」→ LLM 自动开始用 `browser_*` 工具。15 个工具的清单、双通道截图嵌入、BR-04 域名策略、控制目标 tab 切换都在那一节。
 
-**6. trace id 在哪看？**
+**7. trace id 在哪看？**
 错误气泡上的 `trace id` 按钮直接复制；顶栏 `#` 按钮是最近一次的。日志在 `~/.p-chat/logs/`（按日期切割，保留 7 天，如 `server-debug-2026-08-02.log`）。
 
-**7. 重答后能看上一版吗？**
+**8. 重答后能看上一版吗？**
 assistant 消息底部「重答」会保留所有历史版本，消息下方出现版本切换条。
 
-**8. 知识库怎么用？**
+**9. 知识库怎么用？**
 「设置」→「知识库」→ 开开关 → 加 base → 扫描 → 输入区「会话设置」→「知识库」选择范围。LLM 自动用 `recall` 工具查。
 
-**9. 多知识库怎么排序？**
+**10. 多知识库怎么排序？**
 各库分别检索 → 分数归一化 → 合并排序 → 去重 → 标注 `base` 来源。
 
 ---

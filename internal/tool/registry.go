@@ -48,6 +48,19 @@ type CallResultImage struct {
 	Name     string `json:"name"` // display name, e.g. "browser-screenshot.jpg"
 }
 
+// SkillInvocation 是加载领域 Skill 时产生的结构化元数据。
+// SkillInvocation is structured metadata emitted when a domain Skill is loaded.
+// Agent 会先将其转换为专用 SSE 事件，再把 Skill 正文加入下一次 LLM 请求。
+// The Agent emits a dedicated SSE event before appending Skill content to the next LLM request.
+type SkillInvocation struct {
+	Name         string   `json:"name"`
+	Status       string   `json:"status"`
+	Scope        string   `json:"scope,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	Dependencies []string `json:"dependencies,omitempty"`
+	Error        string   `json:"error,omitempty"`
+}
+
 type CallResult struct {
 	Content string `json:"content"`
 	IsError bool   `json:"is_error"`
@@ -78,6 +91,20 @@ type CallResult struct {
 	// Anthropic image_url or image blocks, not as text inside the
 	// tool_result.
 	Image *CallResultImage `json:"image,omitempty"`
+	// SkillInvocation 仅由 skill(action=load) 设置。
+	// SkillInvocation is set only by skill(action=load).
+	// 列表、检查、读取资源与管理操作不属于领域 Skill 调用，因此保持 nil。
+	// Listing, inspection, resource reads, and management actions leave this field nil.
+	SkillInvocation *SkillInvocation `json:"skill_invocation,omitempty"`
+}
+
+// GetSkillInvocation 为需要处理 nil 工具结果的调用方安全返回 Skill 调用元数据。
+// GetSkillInvocation safely returns Skill invocation metadata for callers that handle nil results.
+func (r *CallResult) GetSkillInvocation() *SkillInvocation {
+	if r == nil {
+		return nil
+	}
+	return r.SkillInvocation
 }
 
 // SandboxChecker is a minimal interface satisfied by internal/sandbox.
@@ -683,6 +710,7 @@ func StringEnumProp(description string, values ...string) map[string]any {
 
 // RegisterBuiltin registers the built-in tools.
 func RegisterBuiltin(r *Registry) {
+	RegisterSkillTools(r, nil)
 	r.Register(Tool{
 		Name:        "exec_command",
 		Description: "Execute a shell command on the local system. Returns stdout+stderr combined. Use for one-off commands. Long-running dev servers are started in the background and return a process_id.",

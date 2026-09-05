@@ -57,6 +57,18 @@ func TestChunkToEvent(t *testing.T) {
 			t.Fatalf("structured tool event = %#v", ev)
 		}
 	})
+	t.Run("skill", func(t *testing.T) {
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			SkillName: "lark-doc", SkillStatus: "ready", SkillScope: "global_managed",
+			SkillSource: "skills/lark-doc/SKILL.md", SkillDependencies: []string{"lark-shared"},
+		}, "cs", "gpt-4o")
+		if ev.Type != "skill" || ev.SkillName != "lark-doc" || ev.SkillStatus != "ready" {
+			t.Fatalf("skill event = %+v", ev)
+		}
+		if len(ev.SkillDependencies) != 1 || ev.SkillDependencies[0] != "lark-shared" {
+			t.Fatalf("skill dependencies = %+v", ev.SkillDependencies)
+		}
+	})
 	t.Run("tool truncated result marker", func(t *testing.T) {
 		// The agent truncates tool results > MaxToolResultFullBytes:
 		// the SSE event must carry the truncated flag + full length

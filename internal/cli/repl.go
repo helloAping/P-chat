@@ -157,6 +157,15 @@ func (r *REPL) Run() error {
 		if isSlash || strings.HasPrefix(input, "/") {
 			cmd, args := matchCommand(input)
 			if cmd != nil {
+				if cmd.Name == "/skill" {
+					name, prompt, parseErr := parseSkillCommandArgs(args)
+					if parseErr != nil {
+						color.Red("  错误: %v", parseErr)
+						continue
+					}
+					r.chatWithSkills(prompt, []string{name})
+					continue
+				}
 				err := cmd.Handler(r.asContext(), args)
 				if errors.Is(err, errQuit) {
 					return nil
@@ -165,6 +174,12 @@ func (r *REPL) Run() error {
 					color.Red("  错误: %v", err)
 				}
 				continue
+			}
+			if installed, listErr := r.ctx.ListSkills(); listErr == nil {
+				if name, prompt, ok := matchInstalledSkillCommand(input, installed); ok {
+					r.chatWithSkills(prompt, []string{name})
+					continue
+				}
 			}
 			color.Red("  未知命令: %s  (输入 /help 查看帮助)", input)
 			continue
@@ -195,10 +210,15 @@ func (r *REPL) readMultiLine(scanner *bufio.Scanner) string {
 }
 
 func (r *REPL) chat(input string) {
+	r.chatWithSkills(input, nil)
+}
+
+func (r *REPL) chatWithSkills(input string, activeSkills []string) {
 	req := agent.ChatRequest{
-		Style:    r.style,
-		WorkMode: r.mode.Normalize(),
-		Provider: r.provider,
+		Style:        r.style,
+		WorkMode:     r.mode.Normalize(),
+		Provider:     r.provider,
+		ActiveSkills: append([]string(nil), activeSkills...),
 		Messages: []llm.ChatMessage{
 			{Role: llm.RoleUser, Type: llm.TypeText, Content: input},
 		},

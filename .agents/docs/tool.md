@@ -56,6 +56,13 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 | `media_recognize` | 识别一项或多项同类型图片、视频或音频；按媒体类型选择配置模型，图片可 fallback 到当前视觉模型 | media_recognize.go, agent.go |
 | `todo_write` | 管理待办列表 | registry.go:256, todo.go |
 | `question` | 向用户提问并等待 | registry.go:275, question.go |
+| `skill` | 合并 Skill 的 list/inspect/load/read_resource/doctor 只读操作 | skill_tools.go |
+| `skill_manage` | 合并 Skill 的 install/import/remove 变更操作；始终需要确认 | skill_tools.go |
+
+Skill 工具刻意只保留两个模型可见入口，避免把 discover/load/read/doctor/install/import/remove
+拆成大量平铺工具。`skill(action=load)` 的 `CallResult.SkillInvocation` 不是普通展示字段：
+Agent 必须先将其转换为显式 Skill 生命周期事件，再把 Skill 正文交给下一轮 LLM。
+`skill_manage` 只操作托管目录，标准 `.agents/skills` 目录为只读发现源。
 
 ### 3. 沙箱集成
 

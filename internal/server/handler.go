@@ -491,6 +491,11 @@ type SendMessageRequest struct {
 	// SkillContext is the full SKILL.md content for a skill
 	// activated via /skillname slash command.
 	SkillContext string `json:"skill_context,omitempty"`
+	// ActiveSkills 是按名称激活的新契约；Agent 从可信磁盘包解析名称。
+	// ActiveSkills is the name-based contract; the Agent resolves trusted on-disk packages.
+	// SkillContext 仅为旧客户端兼容保留，新客户端不应提交指令正文。
+	// SkillContext remains for legacy clients only; new clients must not submit instruction bodies.
+	ActiveSkills []string `json:"active_skills,omitempty"`
 }
 
 // CreateSessionRequest is the body of POST /sessions.
@@ -703,13 +708,16 @@ type MessagePart struct {
 	QuestionStatus string `json:"question_status,omitempty"`
 	// Sub-agent metadata. Snake_case to match storage;
 	// MarshalJSON below re-emits as camelCase on the wire.
-	AgentType        string `json:"agent_type,omitempty"`
-	AgentColor       string `json:"agent_color,omitempty"`
-	AgentModel       string `json:"agent_model,omitempty"`
-	TaskID           string `json:"task_id,omitempty"`
-	RunMode          string `json:"run_mode,omitempty"`
-	AgentDescription string `json:"agent_description,omitempty"`
-	FailureReason    string `json:"failure_reason,omitempty"`
+	AgentType        string   `json:"agent_type,omitempty"`
+	AgentColor       string   `json:"agent_color,omitempty"`
+	AgentModel       string   `json:"agent_model,omitempty"`
+	TaskID           string   `json:"task_id,omitempty"`
+	RunMode          string   `json:"run_mode,omitempty"`
+	AgentDescription string   `json:"agent_description,omitempty"`
+	FailureReason    string   `json:"failure_reason,omitempty"`
+	Scope            string   `json:"scope,omitempty"`
+	Source           string   `json:"source,omitempty"`
+	Dependencies     []string `json:"dependencies,omitempty"`
 }
 
 // messagePartWire is the on-the-wire shape of MessagePart,
@@ -737,13 +745,16 @@ type messagePartWire struct {
 	// doc comment.
 	QuestionStatus string `json:"question_status,omitempty"`
 	// Sub-agent metadata, camelCase wire format.
-	AgentType        string `json:"agentType,omitempty"`
-	AgentColor       string `json:"agentColor,omitempty"`
-	AgentModel       string `json:"agentModel,omitempty"`
-	TaskID           string `json:"taskId,omitempty"`
-	RunMode          string `json:"runMode,omitempty"`
-	AgentDescription string `json:"agentDescription,omitempty"`
-	FailureReason    string `json:"failureReason,omitempty"`
+	AgentType        string   `json:"agentType,omitempty"`
+	AgentColor       string   `json:"agentColor,omitempty"`
+	AgentModel       string   `json:"agentModel,omitempty"`
+	TaskID           string   `json:"taskId,omitempty"`
+	RunMode          string   `json:"runMode,omitempty"`
+	AgentDescription string   `json:"agentDescription,omitempty"`
+	FailureReason    string   `json:"failureReason,omitempty"`
+	Scope            string   `json:"scope,omitempty"`
+	Source           string   `json:"source,omitempty"`
+	Dependencies     []string `json:"dependencies,omitempty"`
 }
 
 // MarshalJSON emits the wire format for MessagePart. The
@@ -775,6 +786,9 @@ func (p MessagePart) MarshalJSON() ([]byte, error) {
 		RunMode:          p.RunMode,
 		AgentDescription: p.AgentDescription,
 		FailureReason:    p.FailureReason,
+		Scope:            p.Scope,
+		Source:           p.Source,
+		Dependencies:     append([]string(nil), p.Dependencies...),
 	}
 	return json.Marshal(w)
 }
@@ -897,6 +911,15 @@ type StreamEvent struct {
 	// surface this once the call is complete, not as a
 	// delta).
 	ToolArgs string `json:"tool_args,omitempty"`
+
+	// Skill 字段——Type 为 "skill"。
+	// Skill fields — Type "skill".
+	SkillName         string   `json:"skill_name,omitempty"`
+	SkillStatus       string   `json:"skill_status,omitempty"`
+	SkillScope        string   `json:"skill_scope,omitempty"`
+	SkillSource       string   `json:"skill_source,omitempty"`
+	SkillDependencies []string `json:"skill_dependencies,omitempty"`
+	SkillError        string   `json:"skill_error,omitempty"`
 
 	// Sub-agent fields. When SubAgent is true, the event
 	// originated from a `task` tool's child run, not the

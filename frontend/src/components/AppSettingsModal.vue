@@ -1153,8 +1153,13 @@ async function onSearchSkills() {
 async function onInstallSkill(name: string, url: string) {
   installing.value = name
   try {
-    await api.installSkill(name, url)
-    message.success(`已安装: ${name}`)
+    const result = await api.installSkill(name, url)
+    if (result.ready) {
+      message.success(`已安装并验证: ${name}`)
+    } else {
+      const detail = result.diagnostics?.find(item => item.severity === 'error')?.message || '依赖检查未通过'
+      message.warning(`Skill 已复制但尚不可用：${detail}`)
+    }
     await refreshSkills()
   } catch (e: any) {
     message.error(e.message || '安装失败')

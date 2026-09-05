@@ -175,6 +175,7 @@ D:\develop\project\P-chat\
 type MessagePart =
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string; streaming?: boolean }
+  | { kind: 'skill'; name: string; status: 'start'|'ready'|'error'; scope?: string; dependencies?: string[]; error?: string }
   | { kind: 'tool'; name: string; args?: string; status: 'start'|'ok'|'warn'|'error'; result?: string; error?: string; elapsed?: string }
   | { kind: 'sub_agent'; task: string; status: 'start'|'ok'|'err'; parts: MessagePart[]; elapsed?: string }
 ```
@@ -206,6 +207,7 @@ Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（
 | --- | --- | --- |
 | `content` | LLM 文本 delta | `content` |
 | `thinking` | reasoning delta | `thinking` |
+| `skill` | Skill 加载生命周期 | `skill_name`, `skill_status`, `skill_scope`, `skill_dependencies`, `skill_error` |
 | `tool` | 工具调用生命周期 | `tool_name`, `tool_status`, `tool_result`, `tool_args`, `tool_elapsed` |
 | `phase` | sub-agent lifecycle / system status | `phase`, `sub_agent_status` |
 | `error` | LLM/transport error | `error`, `error_kind` |
@@ -386,6 +388,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 配置加载 | `internal/config/config.go` |
 | 数据库 CRUD | `internal/memory/memory.go` |
 | `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
+| **Skill 发现/安装/加载** | `internal/skill/manager.go`（唯一 Manager 边界）+ `internal/tool/skill_tools.go`（`skill` / `skill_manage`）+ `internal/agent/skills.go`（显式生命周期） |
 | **IM Gateway 入口** | [`.agents/docs/im.md`](docs/im.md) + [`docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
 | **IM 配置文件 schema** | `internal/config/im_config.go`（落地后）`IMConfig` |
 | sendOrDrop 逃生 | `internal/agent/agent.go`（`sendOrDropTimeout`，channel 满 30s 丢非关键事件） |

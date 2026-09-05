@@ -151,10 +151,13 @@ func TestBuildSkillContext_WithSkills(t *testing.T) {
 		{Name: "b", Description: "beta desc", Content: "beta body"},
 	}
 	got := BuildSkillContext(skills)
-	for _, want := range []string{"## Available Skills", "### a", "alpha body", "### b", "beta body"} {
+	for _, want := range []string{"## Available Skills", "`a`", "alpha desc", "`b`", "beta desc"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q: %s", want, got)
 		}
+	}
+	if strings.Contains(got, "alpha body") || strings.Contains(got, "beta body") {
+		t.Fatalf("discovery context must not inject Skill bodies: %s", got)
 	}
 }
 

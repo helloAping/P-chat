@@ -34,6 +34,7 @@ export type ConversationTurnInput = {
   todoMode: 'auto' | 'resume' | 'clear'
   attachments?: api.InlineAttachment[]
   skillContext?: string
+  activeSkills?: string[]
   onServerError?: (event: api.StreamEvent) => void
   onFirstEvent?: () => void
 }
@@ -134,6 +135,7 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       attachments: input.attachments,
       signal: ctrl.signal,
       skill_context: input.skillContext,
+      active_skills: input.activeSkills,
       onStreamDrop: (drop) => {
         deferredDrop.current = drop
         // Idempotent accept: the user row was already persisted; the SSE
@@ -224,6 +226,7 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
           todoMode: payload.todo_mode || 'auto',
           attachments: payload.attachments,
           skillContext: payload.skill_context || undefined,
+          activeSkills: payload.active_skills || undefined,
         })
         // When duplicate_client_message is accepted, drain must complete the
   // queue item instead of failing (avoids fail→retry→409 loops).

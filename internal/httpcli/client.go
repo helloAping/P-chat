@@ -130,6 +130,12 @@ type StreamEvent struct {
 	ToolRequiresUser    bool     `json:"tool_requires_user,omitempty"`
 	ToolNextAction      string   `json:"tool_next_action,omitempty"`
 	ToolArgs            string   `json:"tool_args,omitempty"`
+	SkillName           string   `json:"skill_name,omitempty"`
+	SkillStatus         string   `json:"skill_status,omitempty"`
+	SkillScope          string   `json:"skill_scope,omitempty"`
+	SkillSource         string   `json:"skill_source,omitempty"`
+	SkillDependencies   []string `json:"skill_dependencies,omitempty"`
+	SkillError          string   `json:"skill_error,omitempty"`
 
 	// 子代理事件与父流交错传输。Sub-agent events are interleaved with the parent stream.
 	SubAgent              bool   `json:"sub_agent,omitempty"`
@@ -213,6 +219,18 @@ type ToolLoadDiagnostic struct {
 type ToolListResponse struct {
 	Tools       []ToolInfo           `json:"tools"`
 	Diagnostics []ToolLoadDiagnostic `json:"diagnostics"`
+}
+
+// SkillInfo 映射服务端 Skill 目录中的一个元数据条目。
+// SkillInfo mirrors one metadata-only entry in the server Skill catalog.
+type SkillInfo struct {
+	Name           string   `json:"name"`
+	Description    string   `json:"description"`
+	Path           string   `json:"path,omitempty"`
+	Directory      string   `json:"directory,omitempty"`
+	Scope          string   `json:"scope,omitempty"`
+	RequiredSkills []string `json:"required_skills,omitempty"`
+	RequiredBins   []string `json:"required_bins,omitempty"`
 }
 
 // CompressResult 映射会话压缩结果。CompressResult mirrors the session compression result.
@@ -414,6 +432,7 @@ type SendMessageOptions struct {
 	SubAgentProvider     string                `json:"sub_agent_provider,omitempty"`
 	SubAgentModel        string                `json:"sub_agent_model,omitempty"`
 	SkillContext         string                `json:"skill_context,omitempty"`
+	ActiveSkills         []string              `json:"active_skills,omitempty"`
 }
 
 // TurnQueuePayload 镜像 server.SendMessageRequest 中需要持久化排队的字段。
@@ -432,6 +451,7 @@ type TurnQueuePayload struct {
 	SubAgentProvider     string                `json:"sub_agent_provider,omitempty"`
 	SubAgentModel        string                `json:"sub_agent_model,omitempty"`
 	SkillContext         string                `json:"skill_context,omitempty"`
+	ActiveSkills         []string              `json:"active_skills,omitempty"`
 }
 
 // TurnQueueAttachment 镜像 agent.Attachment，避免 HTTP 适配层依赖 agent 包。
@@ -704,6 +724,22 @@ func (c *Client) ListTools(ctx context.Context, sessionID string) ([]ToolInfo, e
 		return nil, err
 	}
 	return resp.Tools, nil
+}
+
+// ListSkills 返回会话项目范围内可发现的 Skill 元数据。
+// ListSkills returns discoverable Skill metadata for a session's project scope.
+func (c *Client) ListSkills(ctx context.Context, sessionID string) ([]SkillInfo, error) {
+	path := "/api/v1/skills"
+	if sessionID != "" {
+		path += "?session_id=" + url.QueryEscape(sessionID)
+	}
+	var resp struct {
+		Skills []SkillInfo `json:"skills"`
+	}
+	if err := c.doJSON(ctx, "GET", path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Skills, nil
 }
 
 // CompressSession 请求服务端压缩会话历史。CompressSession requests the server to compact session history.

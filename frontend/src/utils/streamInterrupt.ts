@@ -38,6 +38,10 @@ export function closeOpenPartsOnInterrupt(parts: MessagePart[] | undefined): num
         part.status = 'error'
         if (!part.error) part.error = '对话中断，工具未完成'
         closed++
+      } else if (part.kind === 'skill' && part.status === 'start') {
+        part.status = 'error'
+        if (!part.error) part.error = '对话中断，Skill 加载未完成'
+        closed++
       } else if (part.kind === 'sub_agent' && part.status === 'start') {
         part.status = 'err'
         closed++
