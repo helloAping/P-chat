@@ -2270,7 +2270,7 @@ watch([() => state.currentID, queueSignature], () => {
               </div>
             </div>
 
-            <div class="session-config-row">
+            <div class="session-config-row session-config-row--span2 session-config-row--media-recognition">
               <div class="session-config-label">
                 <span>媒体识别</span>
                 <NPopover
@@ -2350,35 +2350,43 @@ watch([() => state.currentID, queueSignature], () => {
                 <div v-if="!generationCapabilityOptions.some(item => !item.disabled)" class="session-config-hint">
                   请先到“应用设置 > LLM 提供商”添加媒体生成模型及能力。
                 </div>
-                <div v-for="operation in enabledGenerationOperations" :key="operation" class="generation-session-route">
-                  <span>{{ generationLabels[operation] }}</span>
-                  <NSelect
-                    :value="generationModelSelection(operation)"
-                    :options="generationModelOptions(operation)"
-                    size="small"
-                    filterable
-                    placeholder="选择生成模型"
-                    @update:value="value => onGenerationModelPick(operation, value)"
-                  />
-                </div>
-                <div class="generation-prompt-assist">
-                  <span>提示词</span>
-                  <button
-                    type="button"
-                    class="session-config-choice"
-                    :class="{ 'session-config-choice--active': generationPromptAssist }"
-                    @click="onGenerationPromptAssistPick(true)"
-                  >
-                    允许提示词增强
-                  </button>
-                  <button
-                    type="button"
-                    class="session-config-choice"
-                    :class="{ 'session-config-choice--active': !generationPromptAssist }"
-                    @click="onGenerationPromptAssistPick(false)"
-                  >
-                    不做二次增强
-                  </button>
+                <div v-if="enabledGenerationOperations.length" class="generation-session-details">
+                  <div class="generation-session-details-head">
+                    <span>能力路由</span>
+                    <span>{{ enabledGenerationOperations.length }} 项已启用</span>
+                  </div>
+                  <div v-for="operation in enabledGenerationOperations" :key="operation" class="generation-session-route">
+                    <span>{{ generationLabels[operation] }}</span>
+                    <NSelect
+                      :value="generationModelSelection(operation)"
+                      :options="generationModelOptions(operation)"
+                      size="small"
+                      filterable
+                      placeholder="选择生成模型"
+                      @update:value="value => onGenerationModelPick(operation, value)"
+                    />
+                  </div>
+                  <div class="generation-prompt-assist">
+                    <span>提示词处理</span>
+                    <div class="generation-prompt-actions">
+                      <button
+                        type="button"
+                        class="session-config-choice"
+                        :class="{ 'session-config-choice--active': generationPromptAssist }"
+                        @click="onGenerationPromptAssistPick(true)"
+                      >
+                        允许增强
+                      </button>
+                      <button
+                        type="button"
+                        class="session-config-choice"
+                        :class="{ 'session-config-choice--active': !generationPromptAssist }"
+                        @click="onGenerationPromptAssistPick(false)"
+                      >
+                        保持原提示词
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2449,7 +2457,7 @@ watch([() => state.currentID, queueSignature], () => {
               </div>
             </div>
 
-            <div class="session-config-row session-config-row--span2">
+            <div class="session-config-row">
               <div class="session-config-label">
                 <span>长任务</span>
                 <NPopover
@@ -3096,13 +3104,19 @@ watch([() => state.currentID, queueSignature], () => {
 }
 .session-config-popover {
   width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - (var(--space-4) * 2));
   background: var(--surface-1);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .session-config-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -3110,6 +3124,7 @@ watch([() => state.currentID, queueSignature], () => {
   font-size: 13px;
   font-weight: 600;
   padding: var(--space-3) var(--space-4);
+  background: var(--surface-1);
   border-bottom: 1px solid var(--border-subtle);
 }
 .session-config-grid {
@@ -3206,17 +3221,44 @@ watch([() => state.currentID, queueSignature], () => {
 }
 .session-config-options--stacked {
   flex-direction: column;
+  flex-wrap: nowrap;
   align-items: flex-start;
+}
+.session-config-row--media-recognition .session-config-options--select {
+  width: 100%;
 }
 .generation-session-options {
   width: 100%;
+  gap: var(--space-2);
 }
 .generation-session-options > :deep(.n-select) {
   width: 100%;
 }
+.generation-session-details {
+  display: grid;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.generation-session-details-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.generation-session-details-head > span:last-child {
+  color: var(--text-tertiary);
+  font-weight: 400;
+}
 .generation-session-route {
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr);
+  grid-template-columns: calc((var(--space-8) * 2) + var(--space-4)) minmax(0, 1fr);
   align-items: center;
   gap: var(--space-2);
   width: 100%;
@@ -3227,15 +3269,25 @@ watch([() => state.currentID, queueSignature], () => {
   font-size: 11.5px;
 }
 .generation-prompt-assist {
-  display: flex;
+  display: grid;
+  grid-template-columns: calc((var(--space-8) * 2) + var(--space-4)) minmax(0, 1fr);
   align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+.generation-prompt-actions {
+  display: flex;
   flex-wrap: wrap;
   gap: var(--space-1);
-  width: 100%;
-  padding-top: var(--space-1);
+  min-width: 0;
 }
-.generation-prompt-assist > span {
-  width: 92px;
+@media (max-width: 560px) {
+  .generation-session-route,
+  .generation-prompt-assist {
+    grid-template-columns: 1fr;
+  }
 }
 .opt-pick {
   display: inline-flex;

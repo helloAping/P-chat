@@ -34,6 +34,13 @@ test('media generation models, defaults, and per-session hard switches are confi
   assert.match(input, /关闭后，[\s\S]*?工具内部也会直接拒绝/)
 })
 
+test('session media generation layout stays compact and does not wrap into phantom columns', () => {
+  assert.match(input, /session-config-options--stacked \{[\s\S]*?flex-wrap: nowrap/)
+  assert.match(input, /v-if="enabledGenerationOperations\.length" class="generation-session-details"/)
+  assert.match(input, /session-config-row--span2 session-config-row--media-recognition[\s\S]*?<span>媒体识别<\/span>/)
+  assert.match(input, /generation-session-details[\s\S]*?background: var\(--surface-2\)/)
+})
+
 test('media limit editor supports readable units without changing the byte API', () => {
   assert.equal(preferredByteSizeUnit(10 * 1024 * 1024), 'MB')
   assert.equal(bytesToUnitValue(10 * 1024 * 1024, 'MB'), 10)
