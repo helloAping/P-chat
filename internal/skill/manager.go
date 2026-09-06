@@ -2,6 +2,7 @@ package skill
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
@@ -21,7 +23,11 @@ const (
 	defaultMaxPackageFiles int64 = 512
 	defaultMaxPackageBytes int64 = 32 << 20
 	defaultMaxFileBytes    int64 = 8 << 20
+	defaultMaxCLIPackages  int64 = 128
+	defaultCLITimeout            = 10 * time.Minute
 )
+
+var skillFilesystemMu sync.RWMutex
 
 // Scope 标识生效 Skill 包的来源位置。
 // Scope identifies where an effective Skill package came from.
@@ -70,6 +76,7 @@ type FSManager struct {
 	maxPackageFiles  int64
 	maxPackageBytes  int64
 	maxFileBytes     int64
+	runCommand       func(context.Context, string, ...string) ([]byte, error)
 }
 
 // CatalogQuery 选择需要应用 Skill 覆盖规则的项目。
@@ -149,6 +156,7 @@ type ChangeRequest struct {
 	Action      ChangeAction
 	SourcePath  string
 	SourceURL   string
+	SourceCLI   string
 	Name        string
 	Scope       Scope
 	ProjectRoot string
@@ -161,6 +169,7 @@ type ChangeResult struct {
 	Scope       Scope        `json:"scope"`
 	Directory   string       `json:"directory"`
 	Ready       bool         `json:"ready"`
+	Installed   []string     `json:"installed,omitempty"`
 	Diagnostics []Diagnostic `json:"diagnostics,omitempty"`
 }
 
@@ -209,6 +218,7 @@ func NewFSManager(opts ManagerOptions) *FSManager {
 		maxPackageFiles:  opts.MaxPackageFiles,
 		maxPackageBytes:  opts.MaxPackageBytes,
 		maxFileBytes:     opts.MaxFileBytes,
+		runCommand:       runSkillSourceCommand,
 	}
 }
 
@@ -221,6 +231,12 @@ func NewManager() *FSManager {
 // Catalog 按优先级发现 Skills 并校验依赖。
 // Catalog discovers Skills in precedence order and validates dependencies.
 func (m *FSManager) Catalog(ctx context.Context, query CatalogQuery) (Catalog, error) {
+	skillFilesystemMu.RLock()
+	defer skillFilesystemMu.RUnlock()
+	return m.catalog(ctx, query)
+}
+
+func (m *FSManager) catalog(ctx context.Context, query CatalogQuery) (Catalog, error) {
 	type root struct {
 		dir   string
 		scope Scope
@@ -446,10 +462,16 @@ func (m *FSManager) listPackageFiles(root string) ([]string, error) {
 // Load 每次调用都重新解析选中包，使外部安装结果立即可见。
 // Load resolves the selected package on every call, so external installers are visible immediately.
 func (m *FSManager) Load(ctx context.Context, request LoadRequest) (LoadedSkill, error) {
+	skillFilesystemMu.RLock()
+	defer skillFilesystemMu.RUnlock()
+	return m.load(ctx, request)
+}
+
+func (m *FSManager) load(ctx context.Context, request LoadRequest) (LoadedSkill, error) {
 	if err := validateSkillName(request.Name); err != nil {
 		return LoadedSkill{}, err
 	}
-	catalog, err := m.Catalog(ctx, CatalogQuery{ProjectRoot: request.ProjectRoot})
+	catalog, err := m.catalog(ctx, CatalogQuery{ProjectRoot: request.ProjectRoot})
 	if err != nil {
 		return LoadedSkill{}, err
 	}
@@ -592,11 +614,21 @@ func (m *FSManager) Apply(ctx context.Context, request ChangeRequest) (ChangeRes
 	case ChangeImport:
 		return m.importPackage(ctx, request, targetRoot)
 	case ChangeInstall:
+		hasCLI := strings.TrimSpace(request.SourceCLI) != ""
+		hasURL := strings.TrimSpace(request.SourceURL) != ""
+		if hasCLI == hasURL {
+			return ChangeResult{}, errors.New("exactly one of source_url or source_cli is required for Skill install")
+		}
+		if hasCLI {
+			return m.installCLIPackage(ctx, request, targetRoot)
+		}
 		return m.installRemotePackage(ctx, request, targetRoot)
 	case ChangeRemove:
 		if err := validateSkillName(request.Name); err != nil {
 			return ChangeResult{}, err
 		}
+		skillFilesystemMu.Lock()
+		defer skillFilesystemMu.Unlock()
 		target := filepath.Join(targetRoot, request.Name)
 		if err := ensureDirectChild(targetRoot, target); err != nil {
 			return ChangeResult{}, err
@@ -604,7 +636,7 @@ func (m *FSManager) Apply(ctx context.Context, request ChangeRequest) (ChangeRes
 		if err := os.RemoveAll(target); err != nil {
 			return ChangeResult{}, fmt.Errorf("remove Skill %q: %w", request.Name, err)
 		}
-		catalog, err := m.Catalog(ctx, CatalogQuery{ProjectRoot: request.ProjectRoot})
+		catalog, err := m.catalog(ctx, CatalogQuery{ProjectRoot: request.ProjectRoot})
 		if err != nil {
 			return ChangeResult{}, err
 		}
@@ -612,6 +644,490 @@ func (m *FSManager) Apply(ctx context.Context, request ChangeRequest) (ChangeRes
 	default:
 		return ChangeResult{}, fmt.Errorf("unsupported Skill change action %q", request.Action)
 	}
+}
+
+type cliSkillList struct {
+	OK      bool   `json:"ok"`
+	Path    string `json:"path"`
+	Entries []struct {
+		Path  string `json:"path"`
+		IsDir bool   `json:"is_dir"`
+	} `json:"entries"`
+}
+
+type cliSkillCatalog struct {
+	OK     bool `json:"ok"`
+	Skills []struct {
+		Name string `json:"name"`
+	} `json:"skills"`
+}
+
+type cliSkillRead struct {
+	Skill   string `json:"skill"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+type cliMaterializeBudget struct {
+	packages    int64
+	directories int64
+	files       int64
+	bytes       int64
+}
+
+type stagedSkillPackage struct {
+	name        string
+	stage       string
+	target      string
+	backup      string
+	hadPrevious bool
+	published   bool
+}
+
+// installCLIPackage 从受支持 CLI 的内嵌 Skill 源递归导入主包及其依赖。
+// installCLIPackage imports a primary package and its dependencies from a supported CLI source.
+func (m *FSManager) installCLIPackage(ctx context.Context, request ChangeRequest, targetRoot string) (ChangeResult, error) {
+	binary := strings.TrimSpace(request.SourceCLI)
+	if binary != "lark-cli" {
+		return ChangeResult{}, fmt.Errorf("unsupported Skill source CLI %q", binary)
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, defaultCLITimeout)
+	defer cancel()
+	ctx = operationCtx
+	name := strings.TrimSpace(request.Name)
+	bulk := name == "" || name == "*"
+	requestedNames := []string{name}
+	if bulk {
+		output, err := m.executeSkillSource(ctx, binary, "skills", "list")
+		if err != nil {
+			return ChangeResult{}, err
+		}
+		var catalog cliSkillCatalog
+		if err := json.Unmarshal(output, &catalog); err != nil {
+			return ChangeResult{}, fmt.Errorf("decode CLI Skill catalog: %w", err)
+		}
+		if !catalog.OK {
+			return ChangeResult{}, errors.New("CLI Skill catalog reported failure")
+		}
+		if len(catalog.Skills) == 0 || int64(len(catalog.Skills)) > m.maxCLIPackages() {
+			return ChangeResult{}, errors.New("CLI Skill catalog is empty or exceeds configured limits")
+		}
+		requestedNames = requestedNames[:0]
+		for _, item := range catalog.Skills {
+			requestedNames = append(requestedNames, strings.TrimSpace(item.Name))
+		}
+	}
+	for _, requestedName := range requestedNames {
+		if err := validateCLISkillName(requestedName); err != nil {
+			return ChangeResult{}, fmt.Errorf("invalid Skill exposed by source_cli: %w", err)
+		}
+	}
+
+	materializedRoot, err := os.MkdirTemp("", "pchat-skill-cli-")
+	if err != nil {
+		return ChangeResult{}, fmt.Errorf("create CLI Skill staging root: %w", err)
+	}
+	defer os.RemoveAll(materializedRoot)
+
+	visiting := make(map[string]bool)
+	materialized := make(map[string]string)
+	order := make([]string, 0, 4)
+	budget := &cliMaterializeBudget{}
+	var prepare func(string) error
+	prepare = func(skillName string) error {
+		if _, ok := materialized[skillName]; ok {
+			return nil
+		}
+		if visiting[skillName] {
+			return fmt.Errorf("Skill dependency cycle through %q", skillName)
+		}
+		if err := validateCLISkillName(skillName); err != nil {
+			return err
+		}
+		budget.packages++
+		if budget.packages > m.maxCLIPackages() {
+			return errors.New("CLI Skill dependency set exceeds configured package limit")
+		}
+		visiting[skillName] = true
+		dir := filepath.Join(materializedRoot, skillName)
+		if err := m.materializeCLISkill(ctx, binary, skillName, dir, budget); err != nil {
+			return err
+		}
+		discovered, _, err := m.inspectPackage(dir, skillName, request.Scope, false)
+		if err != nil {
+			return fmt.Errorf("validate CLI Skill %q: %w", skillName, err)
+		}
+		if discovered.info.Name != skillName {
+			return fmt.Errorf("CLI Skill %q declared name %q", skillName, discovered.info.Name)
+		}
+		for _, dependency := range discovered.info.RequiredSkills {
+			if err := prepare(dependency); err != nil {
+				return fmt.Errorf("prepare dependency of %q: %w", skillName, err)
+			}
+		}
+		visiting[skillName] = false
+		materialized[skillName] = dir
+		order = append(order, skillName)
+		return nil
+	}
+	for _, requestedName := range requestedNames {
+		if err := prepare(requestedName); err != nil {
+			return ChangeResult{}, err
+		}
+	}
+
+	result := ChangeResult{Name: binary, Scope: request.Scope, Directory: targetRoot}
+	if !bulk {
+		result.Name = name
+		result.Directory = filepath.Join(targetRoot, name)
+	}
+	diagnostics, ready, err := m.publishSkillBatch(ctx, request, targetRoot, materialized, order)
+	if err != nil {
+		return ChangeResult{}, err
+	}
+	result.Ready = ready
+	result.Diagnostics = diagnostics
+	if ready {
+		result.Installed = uniqueSorted(order)
+	}
+	return result, nil
+}
+
+func (m *FSManager) maxCLIPackages() int64 {
+	if m.maxPackageFiles < defaultMaxCLIPackages {
+		return m.maxPackageFiles
+	}
+	return defaultMaxCLIPackages
+}
+
+// publishSkillBatch 先完整 staging，再统一发布并验证；任何失败都会恢复旧包。
+// publishSkillBatch stages the complete set before publishing and restores old packages on any failure.
+func (m *FSManager) publishSkillBatch(
+	ctx context.Context,
+	request ChangeRequest,
+	targetRoot string,
+	sources map[string]string,
+	order []string,
+) ([]Diagnostic, bool, error) {
+	transactionRoot, err := os.MkdirTemp(filepath.Dir(targetRoot), ".pchat-skill-transaction-")
+	if err != nil {
+		return nil, false, fmt.Errorf("create CLI Skill transaction directory: %w", err)
+	}
+	preserveTransaction := false
+	defer func() {
+		if !preserveTransaction {
+			_ = os.RemoveAll(transactionRoot)
+		}
+	}()
+	failWithRollback := func(changed []stagedSkillPackage, cause error) error {
+		if rollbackErr := rollbackSkillBatch(changed); rollbackErr != nil {
+			preserveTransaction = true
+			return fmt.Errorf("%w; rollback failed: %v; recovery data remains at %s", cause, rollbackErr, transactionRoot)
+		}
+		return cause
+	}
+
+	packages := make([]stagedSkillPackage, 0, len(order))
+	for _, name := range order {
+		target := filepath.Join(targetRoot, name)
+		if err := ensureDirectChild(targetRoot, target); err != nil {
+			return nil, false, err
+		}
+		stage := filepath.Join(transactionRoot, name+".stage")
+		if err := os.MkdirAll(stage, 0o755); err != nil {
+			return nil, false, fmt.Errorf("create staging directory for Skill %q: %w", name, err)
+		}
+		item := stagedSkillPackage{
+			name: name, stage: stage, target: target,
+			backup: filepath.Join(transactionRoot, name+".backup"),
+		}
+		packages = append(packages, item)
+		if err := m.copyPackage(ctx, sources[name], stage); err != nil {
+			return nil, false, fmt.Errorf("stage CLI Skill %q: %w", name, err)
+		}
+		discovered, _, err := m.inspectPackage(stage, name, request.Scope, false)
+		if err != nil {
+			return nil, false, fmt.Errorf("validate staged CLI Skill %q: %w", name, err)
+		}
+		if discovered.info.Name != name {
+			return nil, false, fmt.Errorf("staged CLI Skill %q declared name %q", name, discovered.info.Name)
+		}
+	}
+
+	skillFilesystemMu.Lock()
+	defer skillFilesystemMu.Unlock()
+	for i := range packages {
+		if _, err := os.Lstat(packages[i].target); err == nil {
+			if err := os.Rename(packages[i].target, packages[i].backup); err != nil {
+				cause := fmt.Errorf("back up Skill %q: %w", packages[i].name, err)
+				return nil, false, failWithRollback(packages[:i], cause)
+			}
+			packages[i].hadPrevious = true
+		} else if !os.IsNotExist(err) {
+			cause := fmt.Errorf("inspect existing Skill %q: %w", packages[i].name, err)
+			return nil, false, failWithRollback(packages[:i], cause)
+		}
+		if err := os.Rename(packages[i].stage, packages[i].target); err != nil {
+			cause := fmt.Errorf("publish CLI Skill %q: %w", packages[i].name, err)
+			return nil, false, failWithRollback(packages[:i+1], cause)
+		}
+		packages[i].published = true
+	}
+
+	diagnostics, ready, err := m.verifySkillBatch(ctx, request, packages)
+	if err != nil {
+		return nil, false, failWithRollback(packages, err)
+	}
+	if !ready {
+		if rollbackErr := rollbackSkillBatch(packages); rollbackErr != nil {
+			preserveTransaction = true
+			return nil, false, fmt.Errorf("rollback unready CLI Skill transaction: %w; recovery data remains at %s", rollbackErr, transactionRoot)
+		}
+		return diagnostics, false, nil
+	}
+	return diagnostics, true, nil
+}
+
+// verifySkillBatch 确认事务内每个包都是当前生效包且可完整加载。
+// verifySkillBatch confirms every package in the transaction is effective and fully loadable.
+func (m *FSManager) verifySkillBatch(
+	ctx context.Context,
+	request ChangeRequest,
+	packages []stagedSkillPackage,
+) ([]Diagnostic, bool, error) {
+	catalog, err := m.catalog(ctx, CatalogQuery{ProjectRoot: request.ProjectRoot})
+	if err != nil {
+		return nil, false, fmt.Errorf("scan Skills after CLI install: %w", err)
+	}
+	diagnostics := append([]Diagnostic(nil), catalog.Diagnostics...)
+	ready := true
+	for _, item := range packages {
+		var effective *SkillInfo
+		for i := range catalog.Skills {
+			if catalog.Skills[i].Name == item.name {
+				effective = &catalog.Skills[i]
+				break
+			}
+		}
+		if effective == nil || effective.Scope != request.Scope || !samePath(effective.Directory, item.target) {
+			message := "installed package is not the effective Skill in the current project context"
+			if effective != nil {
+				message = fmt.Sprintf("installed package is shadowed by %s at %s", effective.Scope, effective.Directory)
+			}
+			diagnostics = append(diagnostics, Diagnostic{
+				Code: "post_install_shadowed", Severity: "error", Skill: item.name,
+				Source: filepath.Join(item.target, "SKILL.md"), Message: message,
+			})
+			ready = false
+			continue
+		}
+		if _, loadErr := m.load(ctx, LoadRequest{ProjectRoot: request.ProjectRoot, Name: item.name}); loadErr != nil {
+			diagnostics = append(diagnostics, Diagnostic{
+				Code: "post_install_verification_failed", Severity: "error", Skill: item.name,
+				Source: filepath.Join(item.target, "SKILL.md"), Message: loadErr.Error(),
+			})
+			ready = false
+		}
+	}
+	sortDiagnostics(diagnostics)
+	return diagnostics, ready, nil
+}
+
+func rollbackSkillBatch(packages []stagedSkillPackage) error {
+	var rollbackErr error
+	for i := len(packages) - 1; i >= 0; i-- {
+		item := packages[i]
+		if item.published {
+			if err := os.RemoveAll(item.target); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove published Skill %q: %w", item.name, err))
+				continue
+			}
+		}
+		if item.hadPrevious {
+			if err := os.Rename(item.backup, item.target); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore Skill %q from %s: %w", item.name, item.backup, err))
+			}
+		}
+	}
+	return rollbackErr
+}
+
+// materializeCLISkill 把 CLI 的只读虚拟目录安全地实体化为临时 Skill 包。
+// materializeCLISkill safely materializes a CLI's read-only virtual tree into a temporary package.
+func (m *FSManager) materializeCLISkill(
+	ctx context.Context,
+	binary, name, target string,
+	budget *cliMaterializeBudget,
+) error {
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return fmt.Errorf("create materialized Skill directory: %w", err)
+	}
+	visitedDirs := make(map[string]struct{})
+	var walk func(string) error
+	walk = func(cliPath string) error {
+		if _, seen := visitedDirs[cliPath]; seen {
+			return fmt.Errorf("CLI Skill tree repeats directory %q", cliPath)
+		}
+		visitedDirs[cliPath] = struct{}{}
+		budget.directories++
+		if budget.directories > m.maxPackageFiles*2 {
+			return errors.New("CLI Skill tree exceeds configured directory limit")
+		}
+		output, err := m.executeSkillSource(ctx, binary, "skills", "list", cliPath)
+		if err != nil {
+			return err
+		}
+		var listing cliSkillList
+		if err := json.Unmarshal(output, &listing); err != nil {
+			return fmt.Errorf("decode CLI Skill listing %q: %w", cliPath, err)
+		}
+		if !listing.OK {
+			return fmt.Errorf("CLI Skill listing %q reported failure", cliPath)
+		}
+		if listing.Path != cliPath {
+			return fmt.Errorf("CLI Skill listing returned path %q for %q", listing.Path, cliPath)
+		}
+		for _, entry := range listing.Entries {
+			rel, err := cliSkillRelativePath(name, entry.Path)
+			if err != nil {
+				return err
+			}
+			if entry.IsDir {
+				if err := walk(name + "/" + filepath.ToSlash(rel)); err != nil {
+					return err
+				}
+				continue
+			}
+			readOutput, err := m.executeSkillSource(ctx, binary, "skills", "read", name, filepath.ToSlash(rel), "--json")
+			if err != nil {
+				return err
+			}
+			var read cliSkillRead
+			if err := json.Unmarshal(readOutput, &read); err != nil {
+				return fmt.Errorf("decode CLI Skill file %q: %w", entry.Path, err)
+			}
+			readRel, err := cliSkillRelativePath(name, name+"/"+read.Path)
+			if err != nil || !samePath(rel, readRel) || read.Skill != name {
+				return fmt.Errorf("CLI Skill read response does not match requested file %q", entry.Path)
+			}
+			budget.files++
+			budget.bytes += int64(len(read.Content))
+			if budget.files > m.maxPackageFiles || budget.bytes > m.maxPackageBytes || int64(len(read.Content)) > m.maxFileBytes {
+				return errors.New("CLI Skill package exceeds configured safety limits")
+			}
+			destination := filepath.Join(target, rel)
+			if !isPathWithin(target, destination) {
+				return fmt.Errorf("CLI Skill file escapes package root: %q", entry.Path)
+			}
+			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+				return fmt.Errorf("create CLI Skill resource directory: %w", err)
+			}
+			if err := os.WriteFile(destination, []byte(read.Content), 0o644); err != nil {
+				return fmt.Errorf("write CLI Skill resource %q: %w", entry.Path, err)
+			}
+		}
+		return nil
+	}
+	if err := walk(name); err != nil {
+		return fmt.Errorf("materialize CLI Skill %q: %w", name, err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "SKILL.md")); err != nil {
+		return fmt.Errorf("CLI Skill %q did not provide SKILL.md", name)
+	}
+	return nil
+}
+
+func (m *FSManager) executeSkillSource(ctx context.Context, binary string, args ...string) ([]byte, error) {
+	runner := m.runCommand
+	if runner == nil {
+		runner = runSkillSourceCommand
+	}
+	output, err := runner(ctx, binary, args...)
+	if err != nil {
+		if errors.Is(err, errCLISkillOutputLimit) {
+			return nil, err
+		}
+		message := strings.TrimSpace(string(output))
+		if len(message) > 4096 {
+			message = message[len(message)-4096:]
+		}
+		return nil, fmt.Errorf("run %s %s: %w: %s", binary, strings.Join(args, " "), err, message)
+	}
+	if int64(len(output)) > m.maxFileBytes*2 {
+		return nil, errors.New("CLI Skill command output exceeds configured safety limit")
+	}
+	return output, nil
+}
+
+var errCLISkillOutputLimit = errors.New("CLI Skill command output exceeds hard safety limit")
+
+type boundedCommandOutput struct {
+	mu       sync.Mutex
+	data     []byte
+	limit    int
+	exceeded bool
+}
+
+func (output *boundedCommandOutput) Write(data []byte) (int, error) {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	remaining := output.limit - len(output.data)
+	if remaining > 0 {
+		if remaining > len(data) {
+			remaining = len(data)
+		}
+		output.data = append(output.data, data[:remaining]...)
+	}
+	if remaining < len(data) {
+		output.exceeded = true
+	}
+	// 返回完整写入长度以继续排空子进程管道，但超出上限的数据不会驻留内存。
+	// Report the full write length to keep draining the child pipe while discarding bytes beyond the cap.
+	return len(data), nil
+}
+
+func (output *boundedCommandOutput) bytes() []byte {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	return append([]byte(nil), output.data...)
+}
+
+func runSkillSourceCommand(ctx context.Context, binary string, args ...string) ([]byte, error) {
+	commandCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	output := &boundedCommandOutput{limit: int(defaultMaxFileBytes * 2)}
+	command := exec.CommandContext(commandCtx, binary, args...)
+	command.Stdout = output
+	command.Stderr = output
+	err := command.Run()
+	data := output.bytes()
+	if output.exceeded {
+		return data, errCLISkillOutputLimit
+	}
+	return data, err
+}
+
+func cliSkillRelativePath(name, sourcePath string) (string, error) {
+	sourcePath = strings.ReplaceAll(strings.TrimSpace(sourcePath), "\\", "/")
+	prefix := name + "/"
+	if !strings.HasPrefix(sourcePath, prefix) {
+		return "", fmt.Errorf("CLI Skill path %q is outside %q", sourcePath, name)
+	}
+	rel := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(sourcePath, prefix)))
+	if filepath.IsAbs(rel) || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid CLI Skill path %q", sourcePath)
+	}
+	return rel, nil
+}
+
+func validateCLISkillName(name string) error {
+	if err := validateSkillName(name); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(name, "lark-") {
+		return fmt.Errorf("lark-cli exposed non-lark Skill name %q", name)
+	}
+	return nil
 }
 
 type githubSource struct {
@@ -750,6 +1266,8 @@ func (m *FSManager) managedRoot(scope Scope, projectRoot string) (string, error)
 }
 
 func (m *FSManager) importPackage(ctx context.Context, request ChangeRequest, targetRoot string) (ChangeResult, error) {
+	skillFilesystemMu.Lock()
+	defer skillFilesystemMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return ChangeResult{}, err
 	}
@@ -798,7 +1316,7 @@ func (m *FSManager) importPackage(ctx context.Context, request ChangeRequest, ta
 		return ChangeResult{}, fmt.Errorf("publish Skill %q: %w", name, err)
 	}
 	_ = os.RemoveAll(backup)
-	catalog, err := m.Catalog(ctx, CatalogQuery{ProjectRoot: request.ProjectRoot})
+	catalog, err := m.catalog(ctx, CatalogQuery{ProjectRoot: request.ProjectRoot})
 	if err != nil {
 		return ChangeResult{}, err
 	}
@@ -821,7 +1339,7 @@ func (m *FSManager) importPackage(ctx context.Context, request ChangeRequest, ta
 		})
 		return result, nil
 	}
-	if _, loadErr := m.Load(ctx, LoadRequest{ProjectRoot: request.ProjectRoot, Name: name}); loadErr != nil {
+	if _, loadErr := m.load(ctx, LoadRequest{ProjectRoot: request.ProjectRoot, Name: name}); loadErr != nil {
 		result.Diagnostics = append(result.Diagnostics, Diagnostic{
 			Code: "post_install_verification_failed", Severity: "error", Skill: name,
 			Source: filepath.Join(target, "SKILL.md"), Message: loadErr.Error(),

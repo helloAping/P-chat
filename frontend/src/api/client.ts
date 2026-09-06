@@ -588,12 +588,33 @@ export const listSkills = (opts?: SkillScopeOptions) =>
 export const getSkill = (name: string, opts?: SkillScopeOptions) =>
   jsonFetch<{ skill: SkillItem }>(`/api/v1/skills/${encodeURIComponent(name)}${skillScopeQuery(opts)}`)
 
+export interface SkillInstallResult {
+  ok: boolean
+  ready: boolean
+  name: string
+  path: string
+  installed?: string[]
+  diagnostics?: SkillDiagnostic[]
+}
+
 export const installSkill = (name: string, url: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
-  jsonFetch<{ ok: boolean; ready: boolean; name: string; path: string; diagnostics?: SkillDiagnostic[] }>('/api/v1/skills/install', {
+  jsonFetch<SkillInstallResult>('/api/v1/skills/install', {
     method: 'POST',
     body: JSON.stringify({
       name,
       url,
+      scope: opts?.scope,
+      session_id: opts?.sessionId,
+      project_path: opts?.projectPath,
+    }),
+  })
+
+export const installSkillsFromCLI = (name?: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
+  jsonFetch<SkillInstallResult>('/api/v1/skills/install', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: name || '',
+      source_cli: 'lark-cli',
       scope: opts?.scope,
       session_id: opts?.sessionId,
       project_path: opts?.projectPath,

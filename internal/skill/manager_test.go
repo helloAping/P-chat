@@ -2,10 +2,12 @@ package skill
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeSkillPackage(t *testing.T, root, dirName, manifest string, resources map[string]string) string {
@@ -237,6 +239,280 @@ func TestFSManagerImportDoesNotVerifyShadowedTargetAsReady(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("diagnostics = %+v, want post_install_shadowed", result.Diagnostics)
+	}
+}
+
+func TestFSManagerInstallsSkillAndDependenciesFromLarkCLI(t *testing.T) {
+	m, managed, _ := testManager(t)
+	m.runCommand = func(_ context.Context, binary string, args ...string) ([]byte, error) {
+		if binary != "lark-cli" {
+			t.Fatalf("binary = %q", binary)
+		}
+		switch strings.Join(args, " ") {
+		case "skills list lark-doc":
+			return []byte(`{"ok":true,"path":"lark-doc","entries":[{"path":"lark-doc/SKILL.md","is_dir":false},{"path":"lark-doc/references","is_dir":true}]}`), nil
+		case "skills list lark-doc/references":
+			return []byte(`{"ok":true,"path":"lark-doc/references","entries":[{"path":"lark-doc/references/guide.md","is_dir":false}]}`), nil
+		case "skills read lark-doc SKILL.md --json":
+			return []byte(`{"skill":"lark-doc","path":"SKILL.md","content":"---\nname: lark-doc\ndescription: docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n---\nDOC\n"}`), nil
+		case "skills read lark-doc references/guide.md --json":
+			return []byte(`{"skill":"lark-doc","path":"references/guide.md","content":"GUIDE"}`), nil
+		case "skills list lark-shared":
+			return []byte(`{"ok":true,"path":"lark-shared","entries":[{"path":"lark-shared/SKILL.md","is_dir":false}]}`), nil
+		case "skills read lark-shared SKILL.md --json":
+			return []byte(`{"skill":"lark-shared","path":"SKILL.md","content":"---\nname: lark-shared\ndescription: auth\n---\nSHARED\n"}`), nil
+		default:
+			t.Fatalf("unexpected lark-cli call: %s", strings.Join(args, " "))
+			return nil, nil
+		}
+	}
+
+	result, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Ready || strings.Join(result.Installed, ",") != "lark-doc,lark-shared" {
+		t.Fatalf("result = %+v", result)
+	}
+	if data, err := os.ReadFile(filepath.Join(managed, "lark-doc", "references", "guide.md")); err != nil || string(data) != "GUIDE" {
+		t.Fatalf("installed reference = %q, err=%v", data, err)
+	}
+	loaded, err := m.Load(context.Background(), LoadRequest{Name: "lark-doc"})
+	if err != nil || !strings.Contains(loaded.Context, "SHARED") || !strings.Contains(loaded.Context, "DOC") {
+		t.Fatalf("loaded = %+v, err=%v", loaded, err)
+	}
+}
+
+func TestFSManagerRejectsTraversingCLISkillEntry(t *testing.T) {
+	m, _, _ := testManager(t)
+	m.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if strings.Join(args, " ") == "skills list lark-doc" {
+			return []byte(`{"ok":true,"path":"lark-doc","entries":[{"path":"lark-doc/../outside.md","is_dir":false}]}`), nil
+		}
+		t.Fatalf("unexpected CLI call: %s", strings.Join(args, " "))
+		return nil, nil
+	}
+
+	_, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid CLI Skill path") {
+		t.Fatalf("err = %v, want traversal rejection", err)
+	}
+}
+
+func TestFSManagerInstallsAllSkillsExposedByLarkCLI(t *testing.T) {
+	m, managed, _ := testManager(t)
+	m.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		switch strings.Join(args, " ") {
+		case "skills list":
+			return []byte(`{"ok":true,"skills":[{"name":"lark-doc"},{"name":"lark-shared"}],"count":2}`), nil
+		case "skills list lark-doc":
+			return []byte(`{"ok":true,"path":"lark-doc","entries":[{"path":"lark-doc/SKILL.md","is_dir":false}]}`), nil
+		case "skills read lark-doc SKILL.md --json":
+			return []byte(`{"skill":"lark-doc","path":"SKILL.md","content":"---\nname: lark-doc\ndescription: docs\n---\nDOC\n"}`), nil
+		case "skills list lark-shared":
+			return []byte(`{"ok":true,"path":"lark-shared","entries":[{"path":"lark-shared/SKILL.md","is_dir":false}]}`), nil
+		case "skills read lark-shared SKILL.md --json":
+			return []byte(`{"skill":"lark-shared","path":"SKILL.md","content":"---\nname: lark-shared\ndescription: auth\n---\nSHARED\n"}`), nil
+		default:
+			t.Fatalf("unexpected CLI call: %s", strings.Join(args, " "))
+			return nil, nil
+		}
+	}
+
+	result, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeInstall, SourceCLI: "lark-cli", Scope: ScopeGlobalManaged,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Ready || result.Name != "lark-cli" || result.Directory != managed || strings.Join(result.Installed, ",") != "lark-doc,lark-shared" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestFSManagerRejectsMismatchedCLISkillIdentity(t *testing.T) {
+	m, managed, _ := testManager(t)
+	stubLarkCLISkillManifests(t, m, map[string]string{
+		"lark-doc": "---\nname: lark-calendar\ndescription: wrong identity\n---\nDOC\n",
+	})
+
+	_, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
+	})
+	if err == nil || !strings.Contains(err.Error(), "declared name") {
+		t.Fatalf("err = %v, want CLI Skill identity mismatch", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(managed, "lark-calendar")); !os.IsNotExist(statErr) {
+		t.Fatalf("mismatched package must not be published: %v", statErr)
+	}
+}
+
+func TestFSManagerCLINamedInstallRequiresEveryDependencyReady(t *testing.T) {
+	m, managed, _ := testManager(t)
+	project := t.TempDir()
+	writeSkillPackage(t, filepath.Join(project, ".p-chat", "skills"), "lark-shared", "---\nname: lark-shared\ndescription: project winner\n---\nPROJECT\n", nil)
+	stubLarkCLISkillManifests(t, m, map[string]string{
+		"lark-doc":    "---\nname: lark-doc\ndescription: docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n---\nDOC\n",
+		"lark-shared": "---\nname: lark-shared\ndescription: global candidate\n---\nGLOBAL\n",
+	})
+
+	result, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc",
+		Scope: ScopeGlobalManaged, ProjectRoot: project,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ready {
+		t.Fatalf("shadowed dependency must make the whole CLI install unready: %+v", result)
+	}
+	if _, statErr := os.Stat(filepath.Join(managed, "lark-doc")); !os.IsNotExist(statErr) {
+		t.Fatalf("unready CLI transaction must roll back its primary package: %v", statErr)
+	}
+}
+
+func TestFSManagerRollsBackCLIBatchWhenVerificationFails(t *testing.T) {
+	m, managed, _ := testManager(t)
+	writeSkillPackage(t, managed, "lark-shared", "---\nname: lark-shared\ndescription: old\n---\nOLD\n", nil)
+	stubLarkCLISkillManifests(t, m, map[string]string{
+		"lark-doc":    "---\nname: lark-doc\ndescription: docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n    bins: [pchat-definitely-missing-cli]\n---\nDOC\n",
+		"lark-shared": "---\nname: lark-shared\ndescription: new\n---\nNEW\n",
+	})
+
+	result, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ready {
+		t.Fatalf("missing binary must make the CLI transaction unready: %+v", result)
+	}
+	data, readErr := os.ReadFile(filepath.Join(managed, "lark-shared", "SKILL.md"))
+	if readErr != nil || !strings.Contains(string(data), "OLD") {
+		t.Fatalf("previous dependency was not restored: content=%q err=%v", data, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(managed, "lark-doc")); !os.IsNotExist(statErr) {
+		t.Fatalf("failed primary package must be removed during rollback: %v", statErr)
+	}
+}
+
+func TestFSManagerSharesSafetyBudgetAcrossCLIDependencies(t *testing.T) {
+	base := t.TempDir()
+	doc := "---\nname: lark-doc\ndescription: docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n---\nDOC\n"
+	shared := "---\nname: lark-shared\ndescription: shared\n---\nSHARED\n"
+	maxBytes := len(doc)
+	if len(shared) > maxBytes {
+		maxBytes = len(shared)
+	}
+	m := NewFSManager(ManagerOptions{
+		GlobalManagedDir: filepath.Join(base, "managed"),
+		UserStandardDir:  filepath.Join(base, "standard"),
+		MaxPackageBytes:  int64(maxBytes + 1),
+	})
+	stubLarkCLISkillManifests(t, m, map[string]string{"lark-doc": doc, "lark-shared": shared})
+
+	_, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
+	})
+	if err == nil || !strings.Contains(err.Error(), "safety limits") {
+		t.Fatalf("err = %v, want aggregate CLI byte limit", err)
+	}
+}
+
+func TestBoundedCommandOutputCapsRetainedBytes(t *testing.T) {
+	output := &boundedCommandOutput{limit: 4}
+	written, err := output.Write([]byte("123456"))
+	if err != nil || written != 6 {
+		t.Fatalf("Write = %d, %v", written, err)
+	}
+	if got := string(output.bytes()); got != "1234" || !output.exceeded {
+		t.Fatalf("retained = %q exceeded=%v", got, output.exceeded)
+	}
+}
+
+func TestFSManagerCatalogWaitsForFilesystemMutation(t *testing.T) {
+	m, _, _ := testManager(t)
+	skillFilesystemMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			skillFilesystemMu.Unlock()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Catalog(context.Background(), CatalogQuery{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Catalog returned during an active Skill mutation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	skillFilesystemMu.Unlock()
+	locked = false
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Catalog did not resume after the Skill mutation completed")
+	}
+}
+
+func stubLarkCLISkillManifests(t *testing.T, m *FSManager, manifests map[string]string) {
+	t.Helper()
+	m.runCommand = func(_ context.Context, binary string, args ...string) ([]byte, error) {
+		if binary != "lark-cli" {
+			t.Fatalf("binary = %q", binary)
+		}
+		if len(args) == 3 && args[0] == "skills" && args[1] == "list" {
+			name := args[2]
+			if _, ok := manifests[name]; !ok {
+				t.Fatalf("unexpected Skill listing: %s", name)
+			}
+			return []byte(`{"ok":true,"path":"` + name + `","entries":[{"path":"` + name + `/SKILL.md","is_dir":false}]}`), nil
+		}
+		if len(args) == 5 && args[0] == "skills" && args[1] == "read" && args[3] == "SKILL.md" && args[4] == "--json" {
+			name := args[2]
+			manifest, ok := manifests[name]
+			if !ok {
+				t.Fatalf("unexpected Skill read: %s", name)
+			}
+			encoded, err := json.Marshal(cliSkillRead{Skill: name, Path: "SKILL.md", Content: manifest})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return encoded, nil
+		}
+		t.Fatalf("unexpected lark-cli call: %s", strings.Join(args, " "))
+		return nil, nil
+	}
+}
+
+func TestFSManagerImportsRealLarkCLISkillWhenEnabled(t *testing.T) {
+	if os.Getenv("PCHAT_TEST_LARK_CLI") != "1" {
+		t.Skip("set PCHAT_TEST_LARK_CLI=1 for the host integration test")
+	}
+	m, managed, _ := testManager(t)
+	result, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Ready || len(result.Installed) < 2 {
+		t.Fatalf("result = %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(managed, "lark-doc", "references", "lark-doc-fetch.md")); err != nil {
+		t.Fatalf("real lark-doc reference missing: %v", err)
 	}
 }
 

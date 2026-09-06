@@ -81,14 +81,20 @@ metadata:
 新会话无需重启即可发现。
 
 安装/导入由 `Apply` 完成：远程仅接受 HTTPS GitHub 仓库或目录 URL；本地导入复制
-完整目录包，不执行包内脚本；发布使用 staging + rename，限制文件数与总大小并拒绝
-符号链接。完成后必须再次 `Load` 验证，返回 `ready=false` 时只能说“已复制但不可用”，
-不能向用户声称安装成功。
+完整目录包；`SourceCLI=lark-cli` 时通过 `lark-cli skills list/read` 实体化 CLI 内嵌包，
+单个安装会递归导入声明的 Skill 依赖，省略名称则批量导入 CLI 暴露的全部 Skill。
+安装过程不执行包内脚本；发布使用 staging + rename，限制整次操作的包数、文件数、总大小、
+命令输出和总时长，并拒绝符号链接。CLI 导入会先完整 staging，再按事务发布：任一包发布或
+验证失败都恢复全部旧包；发布/校验窗口由进程级读写锁隔离，`Catalog` / `Load` 不会看到
+半发布状态。完成后必须再次 `Load` 验证；CLI 事务返回 `ready=false` 表示已回滚，其他单包
+导入返回 `ready=false` 时只能说“已复制但不可用”，均不能向用户声称安装成功。
 
-飞书 CLI 等第三方安装器的标准流程：先让它写入 `.agents/skills`；若它只写入自己的
-Agent 目录，则调用 `skill_manage(action=import, source_path=...)` 导入 P-Chat 托管目录；
-最后调用 `skill(action=doctor)` 或 `skill(action=list)` 验证 `lark-*` 及依赖。P-Chat 的
-host runtime prompt 会明确告知当前数据根和四类 Skill 目录。
+安装飞书 CLI 后，Agent 应直接调用
+`skill_manage(action=install, source_cli=lark-cli)` 将 CLI 暴露的全部 `lark-*` 包导入
+P-Chat 托管目录；若只需要一个 Skill，可再传 `name=lark-doc`，其声明依赖会自动导入。
+其他第三方安装器应优先写入 `.agents/skills`；若只写入自己的 Agent 私有目录，则调用
+`skill_manage(action=import, source_path=...)`。最后用 `skill(action=doctor)` 或
+`skill(action=list)` 验证。host runtime prompt 会明确告知数据根、四类目录和飞书导入命令。
 
 兼容接口 `LoadAllWithRoot()` / `LoadAll()` 仍保留，但同样通过 Manager 发现；不得再新增
 另一套安装、删除或合并逻辑。

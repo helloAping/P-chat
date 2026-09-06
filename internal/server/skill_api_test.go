@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -42,6 +44,38 @@ func TestListSkillsUsesSessionProjectRoot(t *testing.T) {
 	}
 	if len(body.Skills) != 1 || body.Skills[0].Name != "project-only" {
 		t.Fatalf("skills = %+v, want project-only", body.Skills)
+	}
+}
+
+func TestInstallSkillRejectsAmbiguousSources(t *testing.T) {
+	body := []byte(`{"name":"lark-doc","url":"larksuite/cli","source_cli":"lark-cli"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/install", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	(&Handler{}).InstallSkill(c)
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "exactly one") {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestInstallSkillTrimsSourcesBeforeDispatch(t *testing.T) {
+	body := []byte(`{"name":"lark-doc","url":"https://example.com/skill","source_path":"   "}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/install", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+
+	(&Handler{}).InstallSkill(c)
+
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "GitHub") {
+		t.Fatalf("status = %d, body = %s, want URL source dispatch", rec.Code, rec.Body.String())
 	}
 }
 

@@ -28,3 +28,11 @@ test('Skill lifecycle has a structured part and an explicit visible name', () =>
   assert.match(client, /status: 'start' \| 'ready' \| 'error'/)
   assert.match(bubble, /<SkillCallCard v-else-if="entry\.part\.kind === 'skill'"/)
 })
+
+test('Skill client can request installation from the local lark CLI', () => {
+  const client = read('../src/api/client.ts')
+
+  assert.match(client, /installSkillsFromCLI/)
+  assert.match(client, /source_cli: 'lark-cli'/)
+  assert.match(client, /installed\?: string\[\]/)
+})

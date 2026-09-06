@@ -97,13 +97,20 @@ Assistant `parts` 新增 `kind: "skill"` 并随消息元数据持久化。GUI �
 飞书链路应按下面的事务语义执行：
 
 1. 安装并验证 `lark-cli --version`。
-2. 用 `skill_manage install/import` 将 `lark-*` 与 `lark-shared` 完整包发布到用户级目录。
+2. 用 `skill_manage(action=install, source_cli=lark-cli)` 读取 CLI 内嵌目录，将全部 `lark-*`
+   发布到用户级目录；指定单个名称时自动补齐声明依赖。
 3. 校验 frontmatter 声明、依赖 Skill、所需二进制和包内资源。
 4. 重新扫描后确认目标 Skill 出现在生效目录。
 5. doctor 无阻断错误后才向用户报告安装成功，并显示实际安装路径。
 
 若第三方安装器只写入 `$HOME/.agents/skills`，P-Chat 直接读取标准目录；若写入私有目录，
 `skill_manage import` 将其完整复制到 P-Chat 管理目录。
+
+`lark-cli` 是专用 CLI 源适配器：只允许固定可执行文件名，使用参数数组调用
+`skills list/read --json`，绑定请求名与声明名，校验每个返回路径，并限制整次操作的包数、
+文件数量、总字节数、命令输出和总时长。所有包先 staging，再整体发布和校验，失败时统一回滚；
+安装阶段不执行 Skill 脚本。当前已用本机 `lark-cli 1.0.92` 在隔离临时目录验证
+`lark-doc + lark-shared + references`。
 
 ## 7. 分阶段落地
 

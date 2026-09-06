@@ -62,7 +62,9 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 Skill 工具刻意只保留两个模型可见入口，避免把 discover/load/read/doctor/install/import/remove
 拆成大量平铺工具。`skill(action=load)` 的 `CallResult.SkillInvocation` 不是普通展示字段：
 Agent 必须先将其转换为显式 Skill 生命周期事件，再把 Skill 正文交给下一轮 LLM。
-`skill_manage` 只操作托管目录，标准 `.agents/skills` 目录为只读发现源。
+`skill_manage` 只操作托管目录，标准 `.agents/skills` 目录为只读发现源。安装飞书 CLI 后使用
+`{"action":"install","source_cli":"lark-cli"}` 一次导入全部内嵌 Skill；提供 `name` 时只导入
+指定 Skill 及其声明依赖。CLI 读取与目录实体化仍封装在 `skill.Manager` 内，不新增第三个工具。
 
 ### 3. 沙箱集成
 

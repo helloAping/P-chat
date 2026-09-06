@@ -191,3 +191,12 @@ func TestSkillLoadFailurePartsArePersisted(t *testing.T) {
 		t.Fatalf("persisted metadata = %+v", metadata)
 	}
 }
+
+func TestHostRuntimeExplainsLarkCLISkillImport(t *testing.T) {
+	prompt := buildHostRuntimeBlock(`D:\projects\demo`)
+	for _, expected := range []string{"source_cli `lark-cli`", "omit name", "skill_manage"} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("host runtime prompt missing %q: %s", expected, prompt)
+		}
+	}
+}

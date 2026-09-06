@@ -461,10 +461,11 @@ CLI 可用 `/skills` 查看，用 `/skill lark-doc 创建一份周报` 显式调
 使用 `/lark-doc 创建一份周报`。GUI 输入 `/` 后会列出同样的动态 Skill 命令。每次真正加载
 都会在回答前显示 `当前调用 Skill：lark-doc`，随后给出“已就绪”或具体依赖错误。
 
-飞书 CLI 等第三方安装器应优先写入 `.agents/skills`。如果 CLI 把 `lark-*` 写到了自己的
-Agent 私有目录，可让 P-Chat Agent 调用 `skill_manage` 导入完整目录包；必须再执行
-`skill(action=doctor)` / `/skills` 验证。只有 `ready=true` 才算安装完成，缺少
-`lark-shared` 或 `lark-cli` 时会标记“已复制但尚不可用”。新会话会重新扫描，无需重启。
+安装飞书 CLI 后，让 P-Chat Agent 调用
+`skill_manage(action=install, source_cli=lark-cli)`，即可从 CLI 内嵌目录导入全部 `lark-*`
+Skill；传 `name=lark-doc` 时只导入该 Skill 及其声明依赖（例如 `lark-shared`）。其他第三方
+安装器应优先写入 `.agents/skills`，私有 Agent 目录则用 `source_path` 完整导入。必须再执行
+`skill(action=doctor)` / `/skills` 验证；只有 `ready=true` 才算完成。新会话会重新扫描。
 
 ### 人格
 
@@ -614,10 +615,10 @@ GUI：输入区「会话设置」→「风格」选「关闭」。CLI：`/style 
 GUI：顶栏 🔧 按钮。CLI：`/tools`。自定义 YAML 工具放 `~/.p-chat/tools/*.yaml` 或项目内 `.p-chat/tools/*.yaml`，加载失败时在抽屉顶部「加载诊断」里看。
 
 **5. 飞书 CLI 已安装，为什么新会话仍找不到 lark Skill？**
-先用 `/skills` 或让 Agent 调用 `skill(action=doctor)`。P-Chat 发现 `.agents/skills` 和
-`.p-chat/skills` 两类目录；仅安装 `lark-cli` 可执行文件不等于安装 Skill 包。如果包在
-`.claude/skills` 等私有目录，让 Agent 使用 `skill_manage(action=import, source_path=...)`
-导入，确认结果 `ready=true`。调用时界面应明确显示 `当前调用 Skill：lark-xxx`。
+让 Agent 调用 `skill_manage(action=install, source_cli=lark-cli)`，P-Chat 会读取
+`lark-cli skills list/read`，把全部内嵌 Skill 发布到托管目录；也可传 `name=lark-doc` 只装
+一个及其依赖。随后调用 `skill(action=doctor)`，确认结果 `ready=true`。调用领域 Skill 时
+界面应明确显示 `当前调用 Skill：lark-xxx`。
 
 **6. 怎么用浏览器控制？**
 见上方 [浏览器控制](#浏览器控制) 章节：装扩展 → 弹窗填服务器地址 → GUI 看到「已连接浏览器 > 0」→ LLM 自动开始用 `browser_*` 工具。15 个工具的清单、双通道截图嵌入、BR-04 域名策略、控制目标 tab 切换都在那一节。

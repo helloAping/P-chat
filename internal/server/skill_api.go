@@ -131,18 +131,29 @@ type installSkillRequest struct {
 	ProjectPath string `json:"project_path,omitempty"`
 	SessionID   string `json:"session_id,omitempty"`
 	SourcePath  string `json:"source_path,omitempty"`
+	SourceCLI   string `json:"source_cli,omitempty"`
 }
 
-// InstallSkill POST /api/v1/skills/install
-// URL should be a raw SKILL.md URL (from search results).
+// InstallSkill 处理远程、本地或受支持 CLI 的 Skill 安装请求。
+// InstallSkill handles remote, local, or supported-CLI Skill installation requests.
 func (h *Handler) InstallSkill(c *gin.Context) {
 	var req installSkillRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	if req.URL == "" && req.SourcePath == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "url or source_path is required"})
+	req.Name = strings.TrimSpace(req.Name)
+	req.URL = strings.TrimSpace(req.URL)
+	req.SourcePath = strings.TrimSpace(req.SourcePath)
+	req.SourceCLI = strings.TrimSpace(req.SourceCLI)
+	sourceCount := 0
+	for _, source := range []string{req.URL, req.SourcePath, req.SourceCLI} {
+		if source != "" {
+			sourceCount++
+		}
+	}
+	if sourceCount != 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly one of url, source_path, or source_cli is required"})
 		return
 	}
 	name := req.Name
@@ -176,6 +187,7 @@ func (h *Handler) InstallSkill(c *gin.Context) {
 	} else {
 		change.Action = skill.ChangeInstall
 		change.SourceURL = req.URL
+		change.SourceCLI = req.SourceCLI
 	}
 	result, err := skill.NewManager().Apply(c.Request.Context(), change)
 	if err != nil {
@@ -187,7 +199,7 @@ func (h *Handler) InstallSkill(c *gin.Context) {
 	}
 	c.JSON(http.StatusCreated, gin.H{
 		"ok": result.Ready, "ready": result.Ready, "name": result.Name,
-		"path": result.Directory, "diagnostics": result.Diagnostics,
+		"path": result.Directory, "installed": result.Installed, "diagnostics": result.Diagnostics,
 	})
 }
 
