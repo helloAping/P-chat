@@ -191,7 +191,6 @@ const kbOptions = computed(() => [
 const kbDropdownOptions = computed<DropdownOption[]>(() =>
   kbOptions.value.map(option => ({ label: option.label, key: option.value })),
 )
-const enabledKBCount = computed(() => kbBases.value.filter(b => b.enabled).length)
 const kbBase = computed({
   get: () => {
     if (!state.currentID) return '__off__'
@@ -1324,6 +1323,15 @@ const recognitionCapabilityLabel = computed(() => {
   if (!enabledRecognitionCapabilities.value.length) return '关闭'
   return '已启用'
 })
+const recognitionCapabilityFirstLabel = computed(() => {
+  const [kind] = enabledRecognitionCapabilities.value
+  return kind ? `${recognitionLabels[kind]}识别` : ''
+})
+const recognitionCapabilityDetail = computed(() =>
+  enabledRecognitionCapabilities.value.length
+    ? enabledRecognitionCapabilities.value.map(kind => `${recognitionLabels[kind]}识别`).join('、')
+    : recognitionCapabilityLabel.value,
+)
 
 async function onRecognitionCapabilitiesPick(value: api.MediaKind[]) {
   if (!state.currentID) return
@@ -1415,6 +1423,15 @@ const generationCapabilityLabel = computed(() => {
   if (!enabledGenerationOperations.value.length) return '关闭'
   return '已启用'
 })
+const generationCapabilityFirstLabel = computed(() => {
+  const [operation] = enabledGenerationOperations.value
+  return operation ? generationLabels[operation] : ''
+})
+const generationCapabilityDetail = computed(() =>
+  enabledGenerationOperations.value.length
+    ? enabledGenerationOperations.value.map(operation => generationLabels[operation]).join('、')
+    : generationCapabilityLabel.value,
+)
 
 function syncGenerationSession(resp: api.UpdateSessionMetaResponse) {
   const id = state.currentID
@@ -2172,7 +2189,7 @@ watch([() => state.currentID, queueSignature], () => {
                     <div class="session-config-help-title">知识库</div>
                     <p>控制当前会话是否接入本地知识库检索。开启后，助手可以按需调用 wiki_lookup / wiki_list 查找已扫描资料。</p>
                     <p>“全部知识库”会检索所有已启用知识库；选择单个知识库时，只检索那一个库。</p>
-                    <p>知识库的新增、路径、扫描和启用状态在“应用设置 > 知识库”里管理。</p>
+                    <p>如果没有可用的知识库，请到“应用设置 > 知识库”添加或启用。新增、路径和扫描也在该页面管理。</p>
                   </div>
                 </NPopover>
               </div>
@@ -2195,9 +2212,6 @@ watch([() => state.currentID, queueSignature], () => {
                     <ChevronDown :size="11" class="opt-pick-caret" />
                   </button>
                 </NDropdown>
-                <div v-if="enabledKBCount === 0" class="session-config-hint">
-                  还没有启用的知识库，可到“应用设置 > 知识库”添加或启用。
-                </div>
               </div>
             </div>
 
@@ -2244,9 +2258,6 @@ watch([() => state.currentID, queueSignature], () => {
             <div class="session-config-row">
               <div class="session-config-label">
                 <span>媒体识别</span>
-                <span v-if="enabledRecognitionCapabilities.length" class="session-config-count">
-                  {{ enabledRecognitionCapabilities.length }} 项
-                </span>
                 <NPopover
                   trigger="hover"
                   placement="top"
@@ -2283,10 +2294,14 @@ watch([() => state.currentID, queueSignature], () => {
                     class="opt-pick"
                     data-testid="session-recognition-dropdown"
                     :disabled="!state.recognitionCapabilitiesAvailable.length"
-                    :title="`当前媒体识别能力：${recognitionCapabilityLabel}`"
-                    :aria-label="`选择媒体识别能力，当前为${recognitionCapabilityLabel}`"
+                    :title="`当前媒体识别能力：${recognitionCapabilityDetail}`"
+                    :aria-label="`选择媒体识别能力，当前为${recognitionCapabilityDetail}`"
                   >
-                    <span class="opt-pick-label">{{ recognitionCapabilityLabel }}</span>
+                    <span v-if="enabledRecognitionCapabilities.length" class="opt-pick-tags">
+                      <span class="opt-pick-tag opt-pick-tag--name">{{ recognitionCapabilityFirstLabel }}</span>
+                      <span class="opt-pick-tag opt-pick-tag--count">{{ enabledRecognitionCapabilities.length }}</span>
+                    </span>
+                    <span v-else class="opt-pick-label">{{ recognitionCapabilityLabel }}</span>
                     <ChevronDown :size="11" class="opt-pick-caret" />
                   </button>
                 </NDropdown>
@@ -2299,9 +2314,6 @@ watch([() => state.currentID, queueSignature], () => {
             <div class="session-config-row">
               <div class="session-config-label">
                 <span>媒体生成</span>
-                <span v-if="enabledGenerationOperations.length" class="session-config-count">
-                  {{ enabledGenerationOperations.length }} 项
-                </span>
                 <NPopover
                   trigger="hover"
                   placement="top"
@@ -2334,10 +2346,14 @@ watch([() => state.currentID, queueSignature], () => {
                     class="opt-pick"
                     data-testid="session-generation-dropdown"
                     :disabled="generationOptionsLoading || !generationOptions.some(item => item.available)"
-                    :title="`当前媒体生成能力：${generationCapabilityLabel}`"
-                    :aria-label="`选择媒体生成能力，当前为${generationCapabilityLabel}`"
+                    :title="`当前媒体生成能力：${generationCapabilityDetail}`"
+                    :aria-label="`选择媒体生成能力，当前为${generationCapabilityDetail}`"
                   >
-                    <span class="opt-pick-label">{{ generationCapabilityLabel }}</span>
+                    <span v-if="enabledGenerationOperations.length" class="opt-pick-tags">
+                      <span class="opt-pick-tag opt-pick-tag--name">{{ generationCapabilityFirstLabel }}</span>
+                      <span class="opt-pick-tag opt-pick-tag--count">{{ enabledGenerationOperations.length }}</span>
+                    </span>
+                    <span v-else class="opt-pick-label">{{ generationCapabilityLabel }}</span>
                     <ChevronDown :size="11" class="opt-pick-caret" />
                   </button>
                 </NDropdown>
@@ -3184,20 +3200,40 @@ watch([() => state.currentID, queueSignature], () => {
   width: 100%;
   gap: var(--space-2);
 }
-.session-config-count {
+.opt-pick-tags {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  gap: var(--space-1);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.opt-pick-tag {
+  display: inline-block;
   min-height: calc(var(--space-4) + var(--space-1));
   padding: 0 var(--space-1);
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-pill);
-  color: var(--text-tertiary);
-  font-family: var(--font-mono);
-  font-size: 10px;
+  overflow: hidden;
+  background: var(--brand-50);
+  border: 1px solid var(--brand-100);
+  border-radius: var(--radius-sm);
+  color: var(--brand-600);
+  font-size: 11px;
   font-weight: 500;
-  line-height: 1;
+  line-height: calc(var(--space-4) + var(--space-1));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.opt-pick-tag--name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.opt-pick-tag--count {
+  flex: 0 0 auto;
+  min-width: calc(var(--space-4) + var(--space-2));
+  background: var(--surface-3);
+  border-color: var(--border-subtle);
+  color: var(--text-tertiary);
+  text-align: center;
 }
 .opt-pick {
   display: inline-flex;
