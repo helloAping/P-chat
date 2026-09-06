@@ -2277,7 +2277,7 @@ watch([() => state.currentID, queueSignature], () => {
                     <div class="session-config-help-title">媒体识别</div>
                     <p>选择当前会话允许使用的媒体识别能力，可同时启用图片、视频和音频。</p>
                     <p>每种能力都需要先在“应用设置 > 系统 > 媒体识别”配置独立的供应商和模型。</p>
-                    <p>未完成系统配置的能力不会出现在选择列表中。</p>
+                    <p>如果没有可选能力，请先到该页面配置至少一种能力；未完成系统配置的能力不会出现在选择列表中。</p>
                   </div>
                 </NPopover>
               </div>
@@ -2305,9 +2305,6 @@ watch([() => state.currentID, queueSignature], () => {
                     <ChevronDown :size="11" class="opt-pick-caret" />
                   </button>
                 </NDropdown>
-                <div v-if="!state.recognitionCapabilitiesAvailable.length" class="session-config-hint">
-                  请先到“应用设置 > 系统 > 媒体识别”配置至少一种能力。
-                </div>
               </div>
             </div>
 
@@ -2328,7 +2325,7 @@ watch([() => state.currentID, queueSignature], () => {
                   <div class="session-config-help-popover">
                     <div class="session-config-help-title">媒体生成</div>
                     <p>只允许当前会话使用已选中的生成能力。关闭后，即使模型尝试调用工具，工具内部也会直接拒绝，不会请求厂商 API。</p>
-                    <p>会话只选择能力；每项能力直接使用应用设置中的默认模型，不提供会话级模型覆盖。</p>
+                    <p>会话只选择能力；每项能力直接使用应用设置中的默认模型，不提供会话级模型覆盖。如果显示“不可用”，请先到“应用设置 > 系统 > 媒体生成”配置能力的默认模型。</p>
                     <p>LLM 会根据用户要求与附件内容整理最终提示词，附件仍只通过上传 ID 传给生成工具。</p>
                   </div>
                 </NPopover>
@@ -2357,9 +2354,6 @@ watch([() => state.currentID, queueSignature], () => {
                     <ChevronDown :size="11" class="opt-pick-caret" />
                   </button>
                 </NDropdown>
-                <div v-if="!generationOptionsLoading && !generationOptions.some(item => item.available)" class="session-config-hint">
-                  请先到“应用设置 > 系统 > 媒体生成”配置能力的默认模型。
-                </div>
               </div>
             </div>
 
@@ -3324,13 +3318,6 @@ watch([() => state.currentID, queueSignature], () => {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.session-config-hint {
-  flex-basis: 100%;
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-  line-height: 1.4;
-}
-
 /* --- Permission popover ---------------------------------------- */
 /* The permission picker is an NPopover that anchors to the
  * perm ctrl-btn. The popover body is a list of three

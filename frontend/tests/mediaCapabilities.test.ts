@@ -44,6 +44,12 @@ test('session media multi-selects share one row and summarize selections as tags
   assert.doesNotMatch(input, /session-config-row--media-recognition|opt-pick--wide|session-config-count/)
 })
 
+test('session configuration keeps all guidance inside help popovers', () => {
+  assert.match(input, /如果没有可选能力，请先到该页面配置至少一种能力/)
+  assert.match(input, /如果显示“不可用”，请先到“应用设置 > 系统 > 媒体生成”/)
+  assert.doesNotMatch(input, /session-config-hint/)
+})
+
 test('media limit editor supports readable units without changing the byte API', () => {
   assert.equal(preferredByteSizeUnit(10 * 1024 * 1024), 'MB')
   assert.equal(bytesToUnitValue(10 * 1024 * 1024, 'MB'), 10)
