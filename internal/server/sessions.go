@@ -145,6 +145,17 @@ func (h *Handler) CreateSession(c *gin.Context) {
 			return
 		}
 	}
+	generationOperations := []config.GenerationOperation(nil)
+	if req.EnabledGenerationOperations != nil {
+		generationOperations = append(generationOperations, (*req.EnabledGenerationOperations)...)
+	}
+	generationOverrides := cloneGenerationTargets(req.GenerationModelOverrides)
+	var generationErr error
+	generationOperations, generationOverrides, generationErr = h.validateGenerationSelection(generationOperations, generationOverrides)
+	if generationErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": generationErr.Error()})
+		return
+	}
 	subAgentModelEnabled := false
 	if req.SubAgentModelEnabled != nil {
 		subAgentModelEnabled = *req.SubAgentModelEnabled
@@ -199,7 +210,7 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	if req.VectorStore != "" {
 		_ = h.store.SetConversationVectorStore(id, req.VectorStore)
 	}
-	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil || req.EnabledRecognitionCapabilities != nil || req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
+	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil || req.EnabledRecognitionCapabilities != nil || req.EnabledGenerationOperations != nil || req.GenerationModelOverrides != nil || req.GenerationPromptAssist != nil || req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		if req.PlanMode != nil {
@@ -227,6 +238,15 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		if req.EnabledRecognitionCapabilities != nil {
 			m.RecognitionCapabilities = append([]config.MediaKind(nil), recognitionCapabilities...)
 			m.UseImageRecognition = containsRecognitionCapability(recognitionCapabilities, config.MediaImage)
+		}
+		if req.EnabledGenerationOperations != nil {
+			m.GenerationOperations = append([]config.GenerationOperation(nil), generationOperations...)
+		}
+		if req.GenerationModelOverrides != nil {
+			m.GenerationModelOverrides = cloneGenerationTargets(generationOverrides)
+		}
+		if req.GenerationPromptAssist != nil {
+			m.GenerationPromptAssist = req.GenerationPromptAssist
 		}
 		if req.SubAgentModelEnabled != nil {
 			m.SubAgentModelEnabled = *req.SubAgentModelEnabled
@@ -739,6 +759,22 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 			return
 		}
 	}
+	currentGeneration := h.ensureMetaLoaded(id)
+	generationOperations := append([]config.GenerationOperation(nil), currentGeneration.GenerationOperations...)
+	generationOverrides := cloneGenerationTargets(currentGeneration.GenerationModelOverrides)
+	if req.EnabledGenerationOperations != nil {
+		generationOperations = append([]config.GenerationOperation(nil), (*req.EnabledGenerationOperations)...)
+	}
+	if req.GenerationModelOverrides != nil {
+		generationOverrides = cloneGenerationTargets(req.GenerationModelOverrides)
+	}
+	if req.EnabledGenerationOperations != nil || req.GenerationModelOverrides != nil {
+		generationOperations, generationOverrides, err = h.validateGenerationSelection(generationOperations, generationOverrides)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
 	// Validate provider (if specified) before touching meta.
 	provider := h.sessionProvider(id)
@@ -839,6 +875,22 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)
 	}
+	if req.EnabledGenerationOperations != nil || req.GenerationModelOverrides != nil || req.GenerationPromptAssist != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		if req.EnabledGenerationOperations != nil {
+			m.GenerationOperations = append([]config.GenerationOperation(nil), generationOperations...)
+		}
+		if req.GenerationModelOverrides != nil {
+			m.GenerationModelOverrides = cloneGenerationTargets(generationOverrides)
+		}
+		if req.GenerationPromptAssist != nil {
+			m.GenerationPromptAssist = req.GenerationPromptAssist
+		}
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
 	if req.SubAgentModelEnabled != nil || req.SubAgentProvider != nil || req.SubAgentModel != nil {
 		if err := h.applySessionSubAgentModelPatch(id, req.SubAgentModelEnabled, req.SubAgentProvider, req.SubAgentModel); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -889,6 +941,40 @@ func containsRecognitionCapability(kinds []config.MediaKind, target config.Media
 		}
 	}
 	return false
+}
+
+func (h *Handler) validateGenerationSelection(operations []config.GenerationOperation, overrides map[config.GenerationOperation]config.GenerationModelTarget) ([]config.GenerationOperation, map[config.GenerationOperation]config.GenerationModelTarget, error) {
+	normalizedOperations := make([]config.GenerationOperation, 0, len(operations))
+	seen := make(map[config.GenerationOperation]struct{}, len(operations))
+	for _, operation := range operations {
+		if !operation.IsValid() {
+			return nil, nil, fmt.Errorf("unsupported generation operation %q", operation)
+		}
+		if _, ok := seen[operation]; ok {
+			continue
+		}
+		seen[operation] = struct{}{}
+		normalizedOperations = append(normalizedOperations, operation)
+	}
+	normalizedOverrides := cloneGenerationTargets(overrides)
+	for operation, target := range normalizedOverrides {
+		if !operation.IsValid() {
+			return nil, nil, fmt.Errorf("unsupported generation model override %q", operation)
+		}
+		if !target.Valid() {
+			delete(normalizedOverrides, operation)
+			continue
+		}
+		if _, _, _, err := h.getCfg().ResolveGenerationTarget(operation, target); err != nil {
+			return nil, nil, err
+		}
+	}
+	for _, operation := range normalizedOperations {
+		if _, _, _, err := h.getCfg().ResolveGenerationTarget(operation, normalizedOverrides[operation]); err != nil {
+			return nil, nil, fmt.Errorf("cannot enable %s: %w", operation, err)
+		}
+	}
+	return normalizedOperations, normalizedOverrides, nil
 }
 
 func setRecognitionCapability(kinds []config.MediaKind, target config.MediaKind, enabled bool) []config.MediaKind {

@@ -507,7 +507,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	// Tool call: start / ok / warn / error.
 	if c.ToolName != "" {
 		parts, subIdx := a.activePartsFor(c)
-		status := ToolStatusFromStep(c.Step, c.ToolError)
+		status := ToolStatusFromResult(c.ToolCallStatus, c.Step, c.ToolError)
 		if status == "start" {
 			// When a ToolID is present, avoid clobbering an
 			// earlier same-name start part — the ID is the
@@ -546,6 +546,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		}
 		// ok / warn / error — exact match by ID, fallback to
 		// name for legacy streams.
+		result := persistedToolResult(c)
 		for i := len(parts) - 1; i >= 0; i-- {
 			p := parts[i]
 			if p.Kind != "tool" || p.Status != "start" {
@@ -554,7 +555,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			if c.ToolID != "" && p.ToolID == c.ToolID ||
 				c.ToolID == "" && p.Name == c.ToolName {
 				p.Status = status
-				p.Result = c.ToolResult
+				p.Result = result
 				p.Error = c.ToolError
 				p.Elapsed = c.ToolElapsed
 				if c.ToolArgs != "" {
@@ -573,7 +574,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			Name:    c.ToolName,
 			Args:    c.ToolArgs,
 			Status:  status,
-			Result:  c.ToolResult,
+			Result:  result,
 			Error:   c.ToolError,
 			Elapsed: c.ToolElapsed,
 			ToolID:  c.ToolID,
@@ -811,6 +812,16 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	}
 }
 
+func persistedToolResult(c ChatStreamChunk) string {
+	switch c.ToolName {
+	case "generate_image", "generate_video", "generate_audio":
+		if c.ToolResultFull != "" {
+			return c.ToolResultFull
+		}
+	}
+	return c.ToolResult
+}
+
 // ToolStatusFromStep is the single source of truth for mapping a
 // tool-dispatch step (e.g. "call-1-ok") to the wire status string
 // the frontend expects ("ok" / "warn" / "error" / "start").
@@ -836,6 +847,17 @@ func ToolStatusFromStep(step, errMsg string) string {
 		return "start"
 	}
 	return status
+}
+
+// ToolStatusFromResult prefers a structured terminal result over the legacy
+// step/error heuristic. In particular, a policy denial remains "blocked"
+// instead of being flattened into a generic error merely because legacy
+// callers also populate ToolError.
+func ToolStatusFromResult(callStatus, step, errMsg string) string {
+	if callStatus == "blocked" {
+		return "blocked"
+	}
+	return ToolStatusFromStep(step, errMsg)
 }
 
 // parseStepStatus extracts the trailing status segment from a

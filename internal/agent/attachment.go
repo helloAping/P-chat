@@ -278,6 +278,44 @@ func ExpandAttachmentsForCapabilitiesCM(protocol string, msgs []llm.ChatMessage,
 	return result
 }
 
+// AppendGenerationAttachmentRefs tells the conversational model which opaque
+// upload ids may be passed to enabled media generation tools. It never embeds
+// paths or bytes in tool arguments; the executor resolves and authorizes ids.
+func AppendGenerationAttachmentRefs(msgs []llm.ChatMessage, atts []Attachment, operations []config.GenerationOperation) []llm.ChatMessage {
+	requiredKinds := make(map[config.MediaKind][]config.GenerationOperation)
+	for _, operation := range operations {
+		if kind := operation.RequiredInputKind(); kind.IsValid() {
+			requiredKinds[kind] = append(requiredKinds[kind], operation)
+		}
+	}
+	if len(requiredKinds) == 0 {
+		return msgs
+	}
+	for _, attachment := range atts {
+		kind := config.MediaKind(attachment.Kind)
+		available := requiredKinds[kind]
+		if len(available) == 0 {
+			continue
+		}
+		id := strings.TrimSpace(attachment.UploadID)
+		if id == "" {
+			id = strings.TrimSpace(attachment.ID)
+		}
+		if id == "" {
+			continue
+		}
+		names := make([]string, 0, len(available))
+		for _, operation := range available {
+			names = append(names, string(operation))
+		}
+		msgs = append(msgs, llm.ChatMessage{
+			Role: llm.RoleSystem, Type: llm.TypeText, SubmitToLLM: 1,
+			Content: fmt.Sprintf("Uploaded %s may be used by enabled media generation operations %s: name=%q, input_ref=%q. Pass only this opaque id in input_refs; never pass base64, a URL, or a filesystem path. If visual details should influence the prompt, inspect the attachment first using the available vision or media_recognize path.", kind, strings.Join(names, ","), attachment.Name, id),
+		})
+	}
+	return msgs
+}
+
 func hasReadableAttachmentContext(msgs []llm.ChatMessage, atts []Attachment) bool {
 	for _, message := range msgs {
 		if message.Type == llm.TypeFile && strings.TrimSpace(message.UploadID) != "" &&

@@ -211,16 +211,19 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	})
 
 	chatReq := agent.ChatRequest{
-		Style:                   s,
-		WorkMode:                workMode,
-		Provider:                provider,
-		Model:                   model,
-		Messages:                msgs,
-		HistoryMessageCount:     historyMessageCount,
-		Attachments:             req.Attachments,
-		UseImageRecognition:     useImageRecognition,
-		RecognitionCapabilities: h.sessionRecognitionCapabilities(id),
-		SubagentModel:           h.sessionSubAgentModelPreference(id),
+		Style:                    s,
+		WorkMode:                 workMode,
+		Provider:                 provider,
+		Model:                    model,
+		Messages:                 msgs,
+		HistoryMessageCount:      historyMessageCount,
+		Attachments:              req.Attachments,
+		UseImageRecognition:      useImageRecognition,
+		RecognitionCapabilities:  h.sessionRecognitionCapabilities(id),
+		GenerationOperations:     h.sessionGenerationOperations(id),
+		GenerationModelOverrides: h.sessionGenerationModelOverrides(id),
+		GenerationPromptAssist:   h.sessionGenerationPromptAssist(id),
+		SubagentModel:            h.sessionSubAgentModelPreference(id),
 		// Forward the frontend's client-minted row id. The
 		// agent uses it as the explicit SQLite row id for
 		// this turn's user message, so rollback/regen

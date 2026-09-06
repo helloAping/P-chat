@@ -26,6 +26,7 @@ import (
 // for the model picker in the chat input.
 type ProviderFull struct {
 	Name      string               `json:"name"`
+	Vendor    string               `json:"vendor,omitempty"`
 	Protocol  string               `json:"protocol"`
 	BaseURL   string               `json:"base_url"`
 	APIKey    string               `json:"api_key"`
@@ -82,7 +83,7 @@ func (h *Handler) TestProvider(c *gin.Context) {
 	} else {
 		found := false
 		for _, model := range provider.AllModels() {
-			if model.Name == modelName {
+			if model.Name == modelName && model.EffectiveType() == config.ModelTypeLLM {
 				found = true
 				break
 			}
@@ -172,6 +173,7 @@ func (h *Handler) GetProvider(c *gin.Context) {
 		models := p.AllModels()
 		c.JSON(http.StatusOK, ProviderFull{
 			Name:      p.Name,
+			Vendor:    p.Vendor,
 			Protocol:  p.GetProtocol(),
 			BaseURL:   p.BaseURL,
 			APIKey:    p.APIKey,
@@ -194,11 +196,13 @@ func (h *Handler) GetProvider(c *gin.Context) {
 // value (e.g. -1) to clear the field. DisplayName and
 // Description accept empty string to clear.
 type UpdateModelRequest struct {
-	DisplayName      string `json:"display_name"`
-	Description      string `json:"description"`
-	MaxTokensContext int    `json:"max_tokens_context"`
-	MaxTokensOutput  int    `json:"max_tokens_output"`
-	ClearAll         bool   `json:"clear_all,omitempty"`
+	DisplayName      string                             `json:"display_name"`
+	Description      string                             `json:"description"`
+	MaxTokensContext int                                `json:"max_tokens_context"`
+	MaxTokensOutput  int                                `json:"max_tokens_output"`
+	Type             config.ModelType                   `json:"type,omitempty"`
+	Generation       *config.MediaGenerationModelConfig `json:"generation,omitempty"`
+	ClearAll         bool                               `json:"clear_all,omitempty"`
 }
 
 // UpdateModel PUT /api/v1/providers/:name/models/:model
@@ -224,9 +228,15 @@ func (h *Handler) UpdateModel(c *gin.Context) {
 		Description:      req.Description,
 		MaxTokensContext: req.MaxTokensContext,
 		MaxTokensOutput:  req.MaxTokensOutput,
+		Type:             req.Type,
+		Generation:       req.Generation,
 	}
 	updated, err := config.UpdateModel(providerName, modelName, patch, req.ClearAll)
 	if err != nil {
+		if strings.Contains(err.Error(), "used by generation default") {
+			c.JSON(http.StatusConflict, gin.H{"error": "update failed: " + err.Error()})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "update failed: " + err.Error()})
 		return
 	}

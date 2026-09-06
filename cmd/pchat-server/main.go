@@ -17,6 +17,7 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/generation"
 	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/im/feishu"
 	"github.com/p-chat/pchat/internal/llm"
@@ -241,6 +242,20 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	agt := agent.New(cfg, llmClient, styleMgr, memStore, toolReg)
+	generatedStore := generation.NewLocalAssetStore(paths.GeneratedDir(), "/api/v1/generated")
+	generationResolver := &generation.DiskInputResolver{
+		UploadDir: paths.UploadsDir(),
+		Generated: generatedStore,
+		UploadOwnedBy: func(sessionID, uploadID string) bool {
+			for _, candidate := range memStore.UploadRefsForConversation(sessionID) {
+				if candidate == uploadID {
+					return true
+				}
+			}
+			return false
+		},
+	}
+	agt.SetGenerationExecutor(generation.NewHTTPExecutor(generationResolver, generatedStore))
 	// Expose the sub-agent catalog to the agent's tool
 	// dispatcher so the `task` tool can resolve
 	// subagent_type at call time. The adapter is a thin

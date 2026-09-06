@@ -187,6 +187,7 @@ type ProviderInfo struct {
 // shape is intentionally small so it can sit in either payload.
 type Model struct {
 	Name             string `json:"name"`
+	Type             string `json:"type,omitempty"`
 	DisplayName      string `json:"display_name,omitempty"`
 	Default          bool   `json:"default,omitempty"`
 	Description      string `json:"description,omitempty"`
@@ -931,7 +932,13 @@ func (c *Client) ModelsFor(provider string) ([]Model, bool) {
 	for _, p := range providers {
 		if p.Name == provider {
 			if len(p.Models) > 0 {
-				return p.Models, true
+				models := make([]Model, 0, len(p.Models))
+				for _, model := range p.Models {
+					if model.Type == "" || model.Type == "llm" {
+						models = append(models, model)
+					}
+				}
+				return models, true
 			}
 			if p.Model != "" {
 				return []Model{{Name: p.Model, Default: true}}, true

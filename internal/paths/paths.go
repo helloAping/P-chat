@@ -134,6 +134,11 @@ func UploadsDir() string {
 	return filepath.Join(GlobalDir(), "uploads")
 }
 
+// GeneratedDir returns ~/.p-chat/generated/ (durable generated media assets).
+func GeneratedDir() string {
+	return filepath.Join(GlobalDir(), "generated")
+}
+
 // WorkspaceDir returns ~/.p-chat/workspace/ — the global default
 // working directory used when a session has no project path. All
 // file / command / grep operations for such sessions anchor here so

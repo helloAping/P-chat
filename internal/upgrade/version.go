@@ -58,7 +58,11 @@ const (
 	// image/video/audio recognition routes.
 	V9 AppVersion = 9
 
+	// V10 — provider models gain an explicit llm/media_generation type and
+	// application-level defaults for canonical media generation operations.
+	V10 AppVersion = 10
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V9
+	Current AppVersion = V10
 )

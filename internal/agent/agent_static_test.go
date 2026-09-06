@@ -617,6 +617,29 @@ func TestToolCallSignature(t *testing.T) {
 	}
 }
 
+func TestBuildGenerationPolicyBlockDescribesHardGateAndPromptMode(t *testing.T) {
+	assisted := buildGenerationPolicyBlock([]config.GenerationOperation{
+		config.GenerationImageToVideo,
+		config.GenerationImageToVideo,
+	}, true)
+	if strings.Count(assisted, string(config.GenerationImageToVideo)) != 1 {
+		t.Fatalf("operation should be listed once: %q", assisted)
+	}
+	for _, want := range []string{"执行入口会再次校验", "opaque input_ref", "prompt_mode=assist", "不可信数据"} {
+		if !strings.Contains(assisted, want) {
+			t.Fatalf("assisted policy missing %q: %q", want, assisted)
+		}
+	}
+
+	raw := buildGenerationPolicyBlock([]config.GenerationOperation{config.GenerationTextToImage}, false)
+	if !strings.Contains(raw, "prompt_mode=raw") || !strings.Contains(raw, "尽量保持用户的原始描述") {
+		t.Fatalf("raw policy is incomplete: %q", raw)
+	}
+	if got := buildGenerationPolicyBlock(nil, true); got != "" {
+		t.Fatalf("disabled generation policy = %q, want empty", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

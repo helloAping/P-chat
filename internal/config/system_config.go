@@ -55,6 +55,13 @@ type RecognitionConfigPatch struct {
 	Routes map[MediaKind]RecognitionRoutePatch `json:"routes,omitempty"`
 }
 
+// GenerationConfigPatch updates application defaults independently for each
+// canonical media operation. An empty target removes that default.
+type GenerationConfigPatch struct {
+	Defaults       map[GenerationOperation]GenerationModelTarget `json:"defaults,omitempty"`
+	RequireConfirm *bool                                         `json:"require_confirm,omitempty"`
+}
+
 // SystemConfigPatch is a partial update for system-level config
 // (limits + subagent + work_mode + ui + vision_recognition).
 type SystemConfigPatch struct {
@@ -64,6 +71,7 @@ type SystemConfigPatch struct {
 	UI          *UIConfigPatch                `json:"ui,omitempty"`
 	Vision      *VisionRecognitionConfigPatch `json:"vision_recognition,omitempty"`
 	Recognition *RecognitionConfigPatch       `json:"recognition,omitempty"`
+	Generation  *GenerationConfigPatch        `json:"generation,omitempty"`
 }
 
 // UpdateSystemConfig merges a SystemConfigPatch into the persisted config.
@@ -103,12 +111,40 @@ func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
 			cfg.Vision.Normalize()
 		}
 	}
+	if patch.Generation != nil {
+		if err := mergeGeneration(cfg, patch.Generation); err != nil {
+			return nil, err
+		}
+	}
 
 	mgr := NewManager()
 	if err := mgr.SaveGlobal(cfg); err != nil {
 		return nil, fmt.Errorf("save system config: %w", err)
 	}
 	return cfg, nil
+}
+
+func mergeGeneration(cfg *Config, patch *GenerationConfigPatch) error {
+	if cfg.Generation.Defaults == nil {
+		cfg.Generation.Defaults = make(map[GenerationOperation]GenerationModelTarget)
+	}
+	for operation, target := range patch.Defaults {
+		if !operation.IsValid() {
+			return fmt.Errorf("unsupported generation operation %q", operation)
+		}
+		if !target.Valid() {
+			delete(cfg.Generation.Defaults, operation)
+			continue
+		}
+		if _, _, _, err := cfg.ResolveGenerationTarget(operation, target); err != nil {
+			return err
+		}
+		cfg.Generation.Defaults[operation] = target
+	}
+	if patch.RequireConfirm != nil {
+		cfg.Generation.RequireConfirm = *patch.RequireConfirm
+	}
+	return nil
 }
 
 func mergeLimits(l *LimitsConfig, p *LimitsConfigPatch) {

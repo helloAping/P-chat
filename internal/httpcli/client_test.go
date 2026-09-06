@@ -436,6 +436,7 @@ func TestClient_ModelsForUsesProviderModelList(t *testing.T) {
 		Models: []Model{
 			{Name: "gpt-4o", Default: true},
 			{Name: "gpt-4o-mini", DisplayName: "GPT-4o mini"},
+			{Name: "video-model", Type: "media_generation"},
 		},
 	}})
 
@@ -444,7 +445,7 @@ func TestClient_ModelsForUsesProviderModelList(t *testing.T) {
 		t.Fatal("ModelsFor did not find provider")
 	}
 	if len(models) != 2 || models[1].Name != "gpt-4o-mini" {
-		t.Errorf("models = %#v, want complete provider list", models)
+		t.Errorf("models = %#v, want conversational provider models only", models)
 	}
 }
 

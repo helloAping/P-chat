@@ -34,6 +34,8 @@ type Config struct {
 	Limits    LimitsConfig    `json:"limits"`
 	Search    SearchConfig    `json:"search"`
 	Browser   BrowserConfig   `json:"browser"`
+	// Generation selects application defaults for vendor-neutral media tools.
+	Generation GenerationConfig `json:"generation,omitempty"`
 	// Recognition is the canonical media-recognition configuration. Each
 	// media kind can use an independent provider/model route.
 	Recognition RecognitionConfig `json:"recognition,omitempty"`
@@ -297,7 +299,10 @@ type OutputConfig struct {
 // field is still recognized for backward compat: when `models` is
 // empty the value of `model` is used as a single-model provider.
 type ProviderConfig struct {
-	Name     string        `json:"name"`
+	Name string `json:"name"`
+	// Vendor selects media-generation endpoint presets while Protocol continues
+	// to describe conversational LLM traffic. Examples: volcengine, minimax.
+	Vendor   string        `json:"vendor,omitempty"`
 	Protocol string        `json:"protocol,omitempty"` // "openai" | "anthropic"
 	Type     string        `json:"type,omitempty"`     // alias for Protocol (backward compat)
 	BaseURL  string        `json:"base_url"`
@@ -323,6 +328,11 @@ type ModelConfig struct {
 	Default bool `json:"default,omitempty"`
 	// Description is shown in /model.
 	Description string `json:"description,omitempty"`
+	// Type separates conversational models from media generation models.
+	// Empty is interpreted as llm for backward compatibility.
+	Type ModelType `json:"type,omitempty"`
+	// Generation is populated only for media_generation models.
+	Generation *MediaGenerationModelConfig `json:"generation,omitempty"`
 
 	// MaxTokensContext is the model's input context window size
 	// (informational). Examples: 8192 (gpt-3.5), 128000 (gpt-4o),
@@ -350,6 +360,14 @@ type ModelConfig struct {
 	PricePer1KOutput float64 `json:"price_per_1k_output,omitempty"`
 }
 
+// EffectiveType returns llm for legacy models with no explicit type.
+func (m ModelConfig) EffectiveType() ModelType {
+	if m.Type == "" {
+		return ModelTypeLLM
+	}
+	return m.Type
+}
+
 // GetProtocol returns the protocol, falling back to Type, then "openai".
 func (p ProviderConfig) GetProtocol() string {
 	if p.Protocol != "" {
@@ -367,14 +385,19 @@ func (p ProviderConfig) GetProtocol() string {
 // Returns the name of the first model when no default is marked.
 func (p ProviderConfig) EffectiveModel() string {
 	if len(p.Models) > 0 {
-		// Prefer the model marked default=true.
+		// Prefer the conversational model marked default=true. Media models are
+		// selected per generation operation and must never become the chat model.
 		for _, m := range p.Models {
-			if m.Default {
+			if m.EffectiveType() == ModelTypeLLM && m.Default {
 				return m.Name
 			}
 		}
-		// Otherwise the first one.
-		return p.Models[0].Name
+		for _, m := range p.Models {
+			if m.EffectiveType() == ModelTypeLLM {
+				return m.Name
+			}
+		}
+		return ""
 	}
 	return p.Model
 }
@@ -404,16 +427,19 @@ func (p *ProviderConfig) FindModel(name string) *ModelConfig {
 }
 
 // AllModels returns the list of model names for this provider, in
-// user-facing order. Always includes at least one entry (the
-// effective model).
+// user-facing order. Legacy single-model providers synthesize one entry;
+// providers created solely for media models may legitimately return none.
 func (p ProviderConfig) AllModels() []ModelConfig {
 	if len(p.Models) > 0 {
 		out := make([]ModelConfig, len(p.Models))
 		copy(out, p.Models)
 		return out
 	}
+	if strings.TrimSpace(p.Model) == "" {
+		return nil
+	}
 	// Synthesize a single-model entry from the legacy field.
-	return []ModelConfig{{Name: p.Model}}
+	return []ModelConfig{{Name: p.Model, Type: ModelTypeLLM}}
 }
 
 // DisplayModel returns a human-friendly name for the effective model
@@ -1040,6 +1066,7 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
 	cfg.Vision.Normalize()
 	cfg.NormalizeRecognition()
+	cfg.NormalizeGeneration()
 
 	return cfg, nil
 }
@@ -1183,6 +1210,7 @@ func Default() *Config {
 			MaxImageBytes:  10 << 20,
 		},
 		Recognition: RecognitionConfig{Routes: map[MediaKind]RecognitionRoute{}},
+		Generation:  GenerationConfig{Defaults: map[GenerationOperation]GenerationModelTarget{}},
 		IM:          DefaultIMConfig(),
 	}
 }

@@ -448,6 +448,22 @@ func TestExpandAttachmentsCM_UploadIDMapsToResolver(t *testing.T) {
 	}
 }
 
+func TestAppendGenerationAttachmentRefsPublishesOnlyOpaqueIDsForEnabledKinds(t *testing.T) {
+	out := AppendGenerationAttachmentRefs(nil, []Attachment{
+		{UploadID: "image-id", Name: "source.png", Kind: "image", MIME: "image/png"},
+		{UploadID: "audio-id", Name: "voice.wav", Kind: "audio", MIME: "audio/wav"},
+	}, []config.GenerationOperation{config.GenerationImageToVideo})
+	if len(out) != 1 {
+		t.Fatalf("len(out)=%d, want one image reference", len(out))
+	}
+	if !strings.Contains(out[0].Content, `input_ref="image-id"`) || !strings.Contains(out[0].Content, "image_to_video") {
+		t.Fatalf("missing opaque generation reference: %q", out[0].Content)
+	}
+	if strings.Contains(out[0].Content, "data:image") || strings.Contains(out[0].Content, "voice.wav") {
+		t.Fatalf("unexpected generation guidance: %q", out[0].Content)
+	}
+}
+
 func containsCheck(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

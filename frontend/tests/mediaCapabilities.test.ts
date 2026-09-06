@@ -23,7 +23,15 @@ test('system and session settings expose independent media capabilities', () => 
   assert.match(settings, /kind: 'image'[\s\S]*?kind: 'video'[\s\S]*?kind: 'audio'/)
   assert.match(settings, /patch\.recognition = \{ routes: sysRecognition\.value \}/)
   assert.match(input, /enabled_recognition_capabilities: value/)
-  assert.match(input, /<span>能力工具<\/span>[\s\S]*?<NSelect[\s\S]*?multiple/)
+  assert.match(input, /<span>媒体识别<\/span>[\s\S]*?<NSelect[\s\S]*?multiple/)
+})
+
+test('media generation models, defaults, and per-session hard switches are configurable', () => {
+  assert.match(settings, /value: 'media_generation'/)
+  assert.match(settings, /operation: 'text_to_image'[\s\S]*?operation: 'image_to_video'[\s\S]*?operation: 'text_to_speech'/)
+  assert.match(settings, /patch\.generation = \{[\s\S]*?defaults: generationDefaults/)
+  assert.match(input, /enabled_generation_operations: value/)
+  assert.match(input, /关闭后，[\s\S]*?工具内部也会直接拒绝/)
 })
 
 test('media limit editor supports readable units without changing the byte API', () => {

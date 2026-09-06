@@ -54,6 +54,9 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 | `web_fetch` | HTTP 抓取 URL（带 SSRF 防护） | registry.go:275, 749 |
 | `web_search` | 公开网络搜索（snippet+url，可插拔 provider） | websearch.go |
 | `media_recognize` | 识别一项或多项同类型图片、视频或音频；按媒体类型选择配置模型，图片可 fallback 到当前视觉模型 | media_recognize.go, agent.go |
+| `generate_image` | 文生图或图生图；内部按 operation 路由到配置模型 | media_generation.go, generation/* |
+| `generate_video` | 文生视频、图生视频或视频生视频 | media_generation.go, generation/* |
+| `generate_audio` | 文字转语音/音乐/音效或音频转音频 | media_generation.go, generation/* |
 | `todo_write` | 管理待办列表 | registry.go:256, todo.go |
 | `question` | 向用户提问并等待 | registry.go:275, question.go |
 | `skill` | 合并 Skill 的 list/inspect/load/read_resource/doctor 只读操作 | skill_tools.go |
@@ -134,6 +137,21 @@ type SandboxChecker interface {
 `read_attachment` 只接受 `upload_id`，不接受文件系统路径。Agent 注入的 resolver 会先确认该上传引用属于当前会话，再从上传目录解析真实文件，因此模型不能借此读取其他会话或任意本地文件。工具支持普通文本/源码、PDF、DOCX/DOCM、XLSX/XLSM、PPTX/PPTM；未知二进制、旧版 Office 二进制格式等没有确定解析器的类型会明确返回不支持，模型不得声称已读。
 
 当前轮和历史轮的文档都以显示行加 system 引用进入上下文，正文只在模型确实调用 `read_attachment` 后提取。这样附件无需复制进项目目录，也不会把整份 Office/PDF 的二进制或 data URL 塞进提示词。该工具不向子代理暴露。
+
+### 6.8 媒体生成工具与硬开关
+
+`generate_image`、`generate_video`、`generate_audio` 是模型可见的稳定接口，
+厂商差异只存在于 `internal/generation`。模型参数使用 canonical operation 与
+`input_refs`；不接受 URL、路径或 base64。
+
+工具是否出现在 schema 只是第一层体验优化。Agent 的统一派发入口会再次验证当前请求的
+工具允许列表；媒体 handler 还会在调用执行器前验证 operation 属于对应工具、会话已开启、
+目标模型有效、可信 dispatch 已由服务端注入、输入 ID 格式和必需媒体输入。任一条件失败
+返回结构化 `blocked`/`error`，不会请求厂商。不能把关闭能力只实现成 system prompt 隐藏。
+
+输入 ID 在 executor 内按会话归属解析；厂商输出实体化为本地生成资产，工具结果只返回
+`id/kind/mime_type/name/url`。详见
+[媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

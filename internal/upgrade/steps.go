@@ -35,6 +35,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V6: stepV6toV7,
 	V7: stepV7toV8,
 	V8: stepV8toV9,
+	V9: stepV9toV10,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -180,6 +181,82 @@ func stepV8toV9(db *sql.DB) error {
 	return nil
 }
 
+// ---- V9 → V10 ----
+
+func stepV9toV10(_ *sql.DB) error {
+	log.Print("[upgrade] V9 → V10: typing models and initializing media generation config")
+	if err := os.MkdirAll(paths.GeneratedDir(), 0o755); err != nil {
+		return fmt.Errorf("create generated media directory: %w", err)
+	}
+	return migrateMediaGenerationConfig()
+}
+
+func migrateMediaGenerationConfig() error {
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	changed := false
+	if _, exists := root["generation"]; !exists {
+		root["generation"] = map[string]any{"defaults": map[string]any{}}
+		changed = true
+	}
+	if llmDoc, ok := root["llm"].(map[string]any); ok {
+		if providers, ok := llmDoc["providers"].([]any); ok {
+			for _, providerValue := range providers {
+				provider, _ := providerValue.(map[string]any)
+				if provider == nil {
+					continue
+				}
+				if _, exists := provider["vendor"]; !exists {
+					baseURL, _ := provider["base_url"].(string)
+					name, _ := provider["name"].(string)
+					probe := strings.ToLower(baseURL + " " + name)
+					switch {
+					case strings.Contains(probe, "volces.com"), strings.Contains(probe, "volcengine"), strings.Contains(probe, "doubao"):
+						provider["vendor"] = "volcengine"
+						changed = true
+					case strings.Contains(probe, "minimax"):
+						provider["vendor"] = "minimax"
+						changed = true
+					case strings.Contains(probe, "openai.com"):
+						provider["vendor"] = "openai"
+						changed = true
+					}
+				}
+				models, _ := provider["models"].([]any)
+				for _, modelValue := range models {
+					model, _ := modelValue.(map[string]any)
+					if model == nil {
+						continue
+					}
+					if _, exists := model["type"]; !exists {
+						model["type"] = "llm"
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return writeUpgradeFileAtomic(configPath, out, 0o644)
+}
+
 func migrateMediaCapabilityConfig() error {
 	configPath := paths.GlobalConfig()
 	data, err := os.ReadFile(configPath)
@@ -259,7 +336,36 @@ func migrateMediaCapabilityConfig() error {
 		return err
 	}
 	out = append(out, '\n')
-	return os.WriteFile(configPath, out, 0o644)
+	return writeUpgradeFileAtomic(configPath, out, 0o644)
+}
+
+func writeUpgradeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(dir, ".upgrade-config-*")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer func() { _ = os.Remove(tempName) }()
+	if err := temp.Chmod(mode); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
 }
 
 func migrateSessionRecognitionCapabilities(db *sql.DB) error {

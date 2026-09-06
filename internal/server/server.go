@@ -195,6 +195,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// System config
 		api.GET("/config", h.GetSystemConfig)
 		api.PATCH("/config", h.UpdateSystemConfig)
+		api.GET("/generation/options", h.GenerationOptions)
 
 		// Diagnostics (GUI "诊断 / 内存监控" tab): live memory, monitor
 		// config, and on-demand heap / goroutine snapshot downloads.
@@ -207,6 +208,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// Uploads
 		api.POST("/uploads", h.Upload)
 		api.GET("/uploads/:id", h.GetUpload)
+		api.GET("/generated/:id", h.GetGeneratedAsset)
 
 		// Slash commands
 		api.GET("/commands", h.ListCommands)

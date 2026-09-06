@@ -109,6 +109,25 @@ func TestContextWindow(t *testing.T) {
 	}
 }
 
+func TestModelsForAndSetModelExcludeMediaGenerationModels(t *testing.T) {
+	c, err := NewClient(&config.LLMConfig{Default: "p", Providers: []config.ProviderConfig{{
+		Name: "p", BaseURL: "http://example.test", Models: []config.ModelConfig{
+			{Name: "chat", Type: config.ModelTypeLLM},
+			{Name: "video", Type: config.ModelTypeMediaGeneration},
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, ok := c.ModelsFor("p")
+	if !ok || len(models) != 1 || models[0].Name != "chat" {
+		t.Fatalf("conversational models = %#v, found=%v", models, ok)
+	}
+	if err := c.SetModel("p", "video"); err == nil {
+		t.Fatal("media generation model must not be selectable as the chat model")
+	}
+}
+
 // TestModelMaxTokensOutput_FallsBackToCallerWhenUnset ensures
 // that a model without a per-model MaxTokensOutput does NOT
 // override the caller's opts (so the global LLMConfig.MaxTokens
@@ -192,11 +211,11 @@ func TestPerRequestModelDoesNotRace(t *testing.T) {
 		Default: "p",
 		Providers: []config.ProviderConfig{
 			{
-				Name:    "p",
+				Name:     "p",
 				Protocol: "openai",
-				BaseURL: srv.URL,
-				Model:   "small",
-				Models:  []config.ModelConfig{{Name: "small"}, {Name: "big"}},
+				BaseURL:  srv.URL,
+				Model:    "small",
+				Models:   []config.ModelConfig{{Name: "small"}, {Name: "big"}},
 			},
 		},
 	}

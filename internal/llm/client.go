@@ -1096,7 +1096,14 @@ func (c *Client) GetProtocol(providerName string) string {
 func (c *Client) ModelsFor(providerName string) ([]config.ModelConfig, bool) {
 	for _, p := range c.cfgModels {
 		if p.Name == providerName {
-			return p.AllModels(), true
+			all := p.AllModels()
+			models := make([]config.ModelConfig, 0, len(all))
+			for _, model := range all {
+				if model.EffectiveType() == config.ModelTypeLLM {
+					models = append(models, model)
+				}
+			}
+			return models, true
 		}
 	}
 	return nil, false

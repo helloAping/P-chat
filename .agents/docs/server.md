@@ -343,6 +343,20 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 
 `go test ./internal/browser -run E2E`：模拟扩展夹具覆盖连接、导航/点击/输入/截图、断线重连、策略拦截与 Manager 动态注册。不依赖真实 Chrome。
 
+### 13. 媒体生成 API 与资产服务
+
+- `GET /api/v1/generation/options?session_id=<id>` 返回全部 canonical operation、候选
+  媒体模型、应用默认、会话覆盖、有效模型和不可用原因。
+- 会话创建/更新/读取包含 `enabled_generation_operations`、
+  `generation_model_overrides`、`generation_prompt_assist`，写入 conversations metadata。
+- `GET /api/v1/generated/:id` 提供已实体化的图片、视频或音频；文件与归属 metadata 位于
+  `~/.p-chat/generated/`，URL 在聊天历史中保持稳定。
+- Provider/Model CRUD 包含 `vendor`、`type`、`generation`；聊天模型选择和连接测试只接受
+  `type=llm`，不会把媒体模型误发到 Chat Completions。
+
+首版异步任务在一次工具调用中轮询完成，尚无重启续查/取消端点。详见
+[媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
+
 ## 修改指南
 
 ### 要添加新的 API 端点

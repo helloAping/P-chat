@@ -1338,10 +1338,158 @@ async function onRecognitionCapabilitiesPick(value: api.MediaKind[]) {
   }
 }
 
+const generationOptions = ref<api.GenerationOperationOption[]>([])
+const generationOptionsLoading = ref(false)
+const generationLabels: Record<api.GenerationOperation, string> = {
+  text_to_image: '文生图',
+  image_to_image: '图生图',
+  text_to_video: '文生视频',
+  image_to_video: '图生视频',
+  video_to_video: '视频生视频',
+  text_to_speech: '文本转语音',
+  text_to_music: '文生音乐',
+  text_to_sound: '文生音效',
+  audio_to_audio: '音频生音频',
+}
+
+async function loadGenerationOptions() {
+  const sessionID = state.currentID
+  if (!sessionID) {
+    generationOptions.value = []
+    return
+  }
+  generationOptionsLoading.value = true
+  try {
+    const response = await api.getGenerationOptions(sessionID)
+    if (state.currentID === sessionID) generationOptions.value = response.operations || []
+  } catch {
+    if (state.currentID === sessionID) generationOptions.value = []
+  } finally {
+    if (state.currentID === sessionID) generationOptionsLoading.value = false
+  }
+}
+
+watch(() => state.currentID, () => void loadGenerationOptions(), { immediate: true })
+
+const generationCapabilityOptions = computed(() => generationOptions.value.map(item => ({
+  label: generationLabels[item.operation],
+  value: item.operation,
+  disabled: item.models.length === 0,
+})))
+
+const enabledGenerationOperations = computed(() =>
+  state.sessionMeta[state.currentID]?.enabled_generation_operations || [],
+)
+
+const generationPromptAssist = computed(() =>
+  state.sessionMeta[state.currentID]?.generation_prompt_assist ?? true,
+)
+
+const generationCapabilityLabel = computed(() => {
+  if (!generationOptions.value.some(item => item.models.length > 0)) return '不可用'
+  if (!enabledGenerationOperations.value.length) return '关闭'
+  const labels = enabledGenerationOperations.value.map(operation => generationLabels[operation])
+  return labels.length > 2 ? `${labels.slice(0, 2).join('/')}等${labels.length}项` : labels.join('/')
+})
+
+function generationModelKey(target?: api.GenerationModelTarget): string | null {
+  return target?.provider && target?.model ? `${target.provider}\u0000${target.model}` : null
+}
+
+function generationModelOptions(operation: api.GenerationOperation) {
+  const item = generationOptions.value.find(candidate => candidate.operation === operation)
+  const options = (item?.models || []).map(model => ({
+    label: `${model.provider} / ${model.display_name || model.model}`,
+    value: generationModelKey(model)!,
+  }))
+  if (item?.default_target) {
+    options.unshift({
+      label: `跟随应用默认（${item.default_target.provider} / ${item.default_target.model}）`,
+      value: '__app_default__',
+    })
+  }
+  return options
+}
+
+function generationModelSelection(operation: api.GenerationOperation): string | null {
+  const item = generationOptions.value.find(candidate => candidate.operation === operation)
+  if (item?.session_override) return generationModelKey(item.session_override)
+  if (item?.default_target) return '__app_default__'
+  return generationModelKey(item?.effective_target)
+}
+
+function syncGenerationSession(resp: api.UpdateSessionMetaResponse) {
+  const id = state.currentID
+  const current = state.sessionMeta[id] || currentMeta.value
+  state.sessionMeta[id] = {
+    ...current,
+    enabled_generation_operations: resp.enabled_generation_operations ?? current.enabled_generation_operations ?? [],
+    generation_model_overrides: resp.generation_model_overrides ?? current.generation_model_overrides ?? {},
+    generation_prompt_assist: resp.generation_prompt_assist ?? current.generation_prompt_assist ?? true,
+  }
+  const session = state.sessions.find(candidate => candidate.id === id)
+  if (session) {
+    session.enabled_generation_operations = state.sessionMeta[id].enabled_generation_operations
+    session.generation_model_overrides = state.sessionMeta[id].generation_model_overrides
+    session.generation_prompt_assist = state.sessionMeta[id].generation_prompt_assist
+  }
+}
+
+async function onGenerationCapabilitiesPick(value: api.GenerationOperation[]) {
+  if (!state.currentID) return
+  const currentOverrides = { ...(state.sessionMeta[state.currentID]?.generation_model_overrides || {}) }
+  for (const operation of value) {
+    const item = generationOptions.value.find(candidate => candidate.operation === operation)
+    if (!currentOverrides[operation] && !item?.default_target && item?.models[0]) {
+      currentOverrides[operation] = { provider: item.models[0].provider, model: item.models[0].model }
+    }
+  }
+  try {
+    const response = await api.updateSessionMeta(state.currentID, {
+      enabled_generation_operations: value,
+      generation_model_overrides: currentOverrides,
+    })
+    syncGenerationSession(response)
+    await loadGenerationOptions()
+  } catch (e: any) {
+    message.error(`媒体生成设置失败：${e?.message || e}`)
+  }
+}
+
+async function onGenerationModelPick(operation: api.GenerationOperation, value: string) {
+  if (!state.currentID || !value) return
+  const overrides = {
+    ...(state.sessionMeta[state.currentID]?.generation_model_overrides || {}),
+  }
+  if (value === '__app_default__') {
+    delete overrides[operation]
+  } else {
+    const [provider, model] = value.split('\u0000')
+    overrides[operation] = { provider, model }
+  }
+  try {
+    const response = await api.updateSessionMeta(state.currentID, { generation_model_overrides: overrides })
+    syncGenerationSession(response)
+    await loadGenerationOptions()
+  } catch (e: any) {
+    message.error(`生成模型切换失败：${e?.message || e}`)
+  }
+}
+
+async function onGenerationPromptAssistPick(enabled: boolean) {
+  if (!state.currentID) return
+  try {
+    const response = await api.updateSessionMeta(state.currentID, { generation_prompt_assist: enabled })
+    syncGenerationSession(response)
+  } catch (e: any) {
+    message.error(`提示词辅助设置失败：${e?.message || e}`)
+  }
+}
+
 function providerHasModel(provider: string, model: string): boolean {
   const p = state.providers.find(x => x.name === provider)
   const models = (p?.models || []) as api.ModelInfo[]
-  return models.some((m: api.ModelInfo) => m.name === model)
+  return models.some((m: api.ModelInfo) => m.name === model && (m.type || 'llm') === 'llm')
 }
 
 function firstConfiguredModel(): { provider: string; model: string } | null {
@@ -1353,7 +1501,7 @@ function firstConfiguredModel(): { provider: string; model: string } | null {
     return { provider: state.defaultModel.provider, model: state.defaultModel.model }
   }
   for (const p of state.providers) {
-    const models = (p.models || []) as api.ModelInfo[]
+    const models = ((p.models || []) as api.ModelInfo[]).filter(m => (m.type || 'llm') === 'llm')
     const m = models.find((x: api.ModelInfo) => x.default) || models[0]
     if (m?.name) return { provider: p.name, model: m.name }
   }
@@ -1469,7 +1617,7 @@ const currentKBLabel = computed(() => {
 })
 
 const sessionConfigSummary = computed(() =>
-  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 知识库${currentKBLabel.value} · 能力${recognitionCapabilityLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 知识库${currentKBLabel.value} · 识别${recognitionCapabilityLabel.value} · 生成${generationCapabilityLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
 )
 
 // Setter wrappers for the NDropdown @select handler.
@@ -1961,7 +2109,7 @@ watch([() => state.currentID, queueSignature], () => {
             >
               <Settings :size="13" />
               <span class="ctrl-btn-label">会话设置</span>
-              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 知识库{{ currentKBLabel }} · 能力{{ recognitionCapabilityLabel }} · 子代理{{ subAgentModelLabel }}</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 知识库{{ currentKBLabel }} · 识别{{ recognitionCapabilityLabel }} · 生成{{ generationCapabilityLabel }} · 子代理{{ subAgentModelLabel }}</span>
             </button>
           </template>
           <div class="session-config-popover">
@@ -2124,7 +2272,7 @@ watch([() => state.currentID, queueSignature], () => {
 
             <div class="session-config-row">
               <div class="session-config-label">
-                <span>能力工具</span>
+                <span>媒体识别</span>
                 <NPopover
                   trigger="hover"
                   placement="top"
@@ -2135,13 +2283,13 @@ watch([() => state.currentID, queueSignature], () => {
                     <button
                       type="button"
                       class="session-config-help"
-                      aria-label="能力工具说明"
+                      aria-label="媒体识别说明"
                     >
                       <HelpCircle :size="12" />
                     </button>
                   </template>
                   <div class="session-config-help-popover">
-                    <div class="session-config-help-title">能力工具</div>
+                    <div class="session-config-help-title">媒体识别</div>
                     <p>选择当前会话允许使用的媒体识别能力，可同时启用图片、视频和音频。</p>
                     <p>每种能力都需要先在“应用设置 > 系统 > 媒体识别”配置独立的供应商和模型。</p>
                     <p>未完成系统配置的能力不会出现在选择列表中。</p>
@@ -2161,6 +2309,76 @@ watch([() => state.currentID, queueSignature], () => {
                 />
                 <div v-if="!recognitionCapabilityOptions.length" class="session-config-hint">
                   请先到“应用设置 > 系统 > 媒体识别”配置至少一种能力。
+                </div>
+              </div>
+            </div>
+
+            <div class="session-config-row session-config-row--span2">
+              <div class="session-config-label">
+                <span>媒体生成</span>
+                <NPopover
+                  trigger="hover"
+                  placement="top"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button type="button" class="session-config-help" aria-label="媒体生成说明">
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">媒体生成</div>
+                    <p>只允许当前会话使用已选中的生成能力。关闭后，即使模型尝试调用工具，工具内部也会直接拒绝，不会请求厂商 API。</p>
+                    <p>带附件时，LLM 只把上传 ID 交给生成工具；图片内容可先经媒体识别读取，再由 LLM 补充提示词。</p>
+                    <p>模型及独立 API 端点在“应用设置 > LLM 提供商 / 系统 > 媒体生成”中配置。</p>
+                  </div>
+                </NPopover>
+              </div>
+              <div class="session-config-options session-config-options--stacked generation-session-options">
+                <NSelect
+                  :value="enabledGenerationOperations"
+                  :options="generationCapabilityOptions"
+                  multiple
+                  clearable
+                  size="small"
+                  placeholder="关闭"
+                  :loading="generationOptionsLoading"
+                  :disabled="!generationCapabilityOptions.some(item => !item.disabled)"
+                  @update:value="onGenerationCapabilitiesPick"
+                />
+                <div v-if="!generationCapabilityOptions.some(item => !item.disabled)" class="session-config-hint">
+                  请先到“应用设置 > LLM 提供商”添加媒体生成模型及能力。
+                </div>
+                <div v-for="operation in enabledGenerationOperations" :key="operation" class="generation-session-route">
+                  <span>{{ generationLabels[operation] }}</span>
+                  <NSelect
+                    :value="generationModelSelection(operation)"
+                    :options="generationModelOptions(operation)"
+                    size="small"
+                    filterable
+                    placeholder="选择生成模型"
+                    @update:value="value => onGenerationModelPick(operation, value)"
+                  />
+                </div>
+                <div class="generation-prompt-assist">
+                  <span>提示词</span>
+                  <button
+                    type="button"
+                    class="session-config-choice"
+                    :class="{ 'session-config-choice--active': generationPromptAssist }"
+                    @click="onGenerationPromptAssistPick(true)"
+                  >
+                    允许提示词增强
+                  </button>
+                  <button
+                    type="button"
+                    class="session-config-choice"
+                    :class="{ 'session-config-choice--active': !generationPromptAssist }"
+                    @click="onGenerationPromptAssistPick(false)"
+                  >
+                    不做二次增强
+                  </button>
                 </div>
               </div>
             </div>
@@ -2989,6 +3207,35 @@ watch([() => state.currentID, queueSignature], () => {
 .session-config-options--stacked {
   flex-direction: column;
   align-items: flex-start;
+}
+.generation-session-options {
+  width: 100%;
+}
+.generation-session-options > :deep(.n-select) {
+  width: 100%;
+}
+.generation-session-route {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+}
+.generation-session-route > span,
+.generation-prompt-assist > span {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+}
+.generation-prompt-assist {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  width: 100%;
+  padding-top: var(--space-1);
+}
+.generation-prompt-assist > span {
+  width: 92px;
 }
 .opt-pick {
   display: inline-flex;

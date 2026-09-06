@@ -18,7 +18,7 @@ const userToggled = ref(false)
 const userOpen = ref(false)
 
 const hasRunning = computed(() => props.parts.some(part => part.status === 'start'))
-const hasError = computed(() => props.parts.some(part => part.status === 'error'))
+const hasError = computed(() => props.parts.some(part => part.status === 'error' || part.status === 'blocked'))
 const hasWarn = computed(() => props.parts.some(part => part.status === 'warn'))
 
 const open = computed(() => {
@@ -137,7 +137,7 @@ function rowLabel(part: ToolPart): string {
         <span class="tool-row-dot" :class="part.status"></span>
         <span class="tool-row-name">{{ part.name }}</span>
         <span v-if="rowLabel(part)" class="tool-row-args">{{ rowLabel(part) }}</span>
-        <span class="tool-row-status">{{ part.status === 'start' ? '执行中' : part.status === 'error' ? '失败' : part.status === 'warn' ? '警告' : '完成' }}</span>
+        <span class="tool-row-status">{{ part.status === 'start' ? '执行中' : part.status === 'blocked' ? '已关闭' : part.status === 'error' ? '失败' : part.status === 'warn' ? '警告' : '完成' }}</span>
       </div>
     </div>
 

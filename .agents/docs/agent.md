@@ -300,3 +300,13 @@ dynamic spec 走 `dynamic.SetSpecs(all)` 在 watcher 每次 reload
 - [subagent.md](subagent.md) — 子代理系统（task 工具）
 - [memory.md](memory.md) — 消息持久化
 - [server.md](server.md) — HTTP API + SSE
+### 3.6 媒体生成授权与提示词辅助
+
+`ChatRequest` 携带会话启用的 generation operations、逐能力模型覆盖和提示词辅助开关。
+Agent 先收窄工具 schema，再构造请求级 `generation.Access`，其中可信 dispatch 从服务端
+配置解析，API key 从不进入模型参数。每个工具 context 都携带这份不可变授权。
+
+当前轮附件只把可用的不透明 ID 作为 system 指引公开给模型。开启提示词辅助时，动态
+policy 允许模型先通过视觉能力或 `media_recognize` 获得事实观察，再补全有效提示词；
+关闭时要求保持用户原意并使用 `prompt_mode=raw`。无论提示词如何，handler 都会在厂商
+请求前再次验证能力开关和附件归属。

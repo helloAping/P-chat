@@ -679,8 +679,12 @@ func (c *localContext) ListProviderModels(ctx context.Context, provider string) 
 		src := p.AllModels()
 		out := make([]httpcli.Model, 0, len(src))
 		for _, m := range src {
+			if m.EffectiveType() != config.ModelTypeLLM {
+				continue
+			}
 			out = append(out, httpcli.Model{
 				Name:        m.Name,
+				Type:        string(m.EffectiveType()),
 				DisplayName: m.DisplayName,
 				Default:     m.Default,
 				Description: m.Description,

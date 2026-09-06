@@ -52,6 +52,11 @@ type recognitionResponse struct {
 	Routes map[config.MediaKind]recognitionRouteResponse `json:"routes"`
 }
 
+type generationResponse struct {
+	Defaults       map[config.GenerationOperation]config.GenerationModelTarget `json:"defaults"`
+	RequireConfirm bool                                                        `json:"require_confirm"`
+}
+
 type systemConfigResponse struct {
 	Limits      limitsResponse            `json:"limits"`
 	SubAgent    subAgentResponse          `json:"sub_agent"`
@@ -59,6 +64,15 @@ type systemConfigResponse struct {
 	UI          uiResponse                `json:"ui"`
 	Vision      visionRecognitionResponse `json:"vision_recognition"`
 	Recognition recognitionResponse       `json:"recognition"`
+	Generation  generationResponse        `json:"generation"`
+}
+
+func generationToResp(g config.GenerationConfig) generationResponse {
+	defaults := make(map[config.GenerationOperation]config.GenerationModelTarget, len(g.Defaults))
+	for operation, target := range g.Defaults {
+		defaults[operation] = target
+	}
+	return generationResponse{Defaults: defaults, RequireConfirm: g.RequireConfirm}
 }
 
 func limitsToResp(l config.LimitsConfig) limitsResponse {
@@ -146,6 +160,7 @@ func (h *Handler) GetSystemConfig(c *gin.Context) {
 		},
 		Vision:      visionRecognitionToResp(h.getCfg().Vision),
 		Recognition: h.recognitionToResp(h.getCfg().Recognition),
+		Generation:  generationToResp(h.getCfg().Generation),
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -174,6 +189,7 @@ func (h *Handler) UpdateSystemConfig(c *gin.Context) {
 		UI:          uiResponse{CloseBehavior: string(updated.UI.CloseBehavior.Normalize())},
 		Vision:      visionRecognitionToResp(updated.Vision),
 		Recognition: h.recognitionToResp(updated.Recognition),
+		Generation:  generationToResp(updated.Generation),
 	}
 	c.JSON(http.StatusOK, resp)
 }

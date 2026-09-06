@@ -190,8 +190,54 @@ func TestRun_V8ToV9MigratesMediaCapabilities(t *testing.T) {
 	if got := meta["enabled_recognition_capabilities"].([]any); len(got) != 1 || got[0] != "image" {
 		t.Fatalf("session capabilities = %#v", got)
 	}
-	if v := readUserVersion(); v != V9 {
-		t.Fatalf("version = %d, want V9", v)
+	if v := readUserVersion(); v != Current {
+		t.Fatalf("version = %d, want Current", v)
+	}
+}
+
+func TestRun_V9ToV10TypesLegacyModelsAndInitializesGeneration(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755)
+
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	legacyConfig := `{"llm":{"providers":[{"name":"minimax","base_url":"https://api.minimax.io","models":[{"name":"chat"}]}]}}`
+	if err := os.WriteFile(configPath, []byte(legacyConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V9); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V9: %v", err)
+	}
+	if err := stepV9toV10(db); err != nil {
+		t.Fatalf("second V10 migration should be idempotent: %v", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	provider := doc["llm"].(map[string]any)["providers"].([]any)[0].(map[string]any)
+	model := provider["models"].([]any)[0].(map[string]any)
+	if model["type"] != "llm" || provider["vendor"] != "minimax" {
+		t.Fatalf("migrated provider/model = %#v / %#v", provider, model)
+	}
+	if _, ok := doc["generation"].(map[string]any); !ok {
+		t.Fatalf("generation config = %#v", doc["generation"])
+	}
+	if v := readUserVersion(); v != V10 {
+		t.Fatalf("version = %d, want V10", v)
 	}
 }
 

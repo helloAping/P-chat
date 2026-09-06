@@ -114,6 +114,7 @@ const statusLabel = computed(() => {
     case 'ok':    return '完成'
     case 'warn':  return '完成 (有警告)'
     case 'error': return '失败'
+    case 'blocked': return '已关闭'
     default:      return props.part.status
   }
 })
@@ -124,6 +125,7 @@ const statusIcon = computed(() => {
     case 'ok':    return Check
     case 'warn':  return AlertTriangle
     case 'error': return X
+    case 'blocked': return X
     default:      return null
   }
 })
@@ -170,6 +172,27 @@ const screenshotURL = computed(() => {
     }
   } catch { /* not JSON */ }
   return ''
+})
+
+type GeneratedAsset = {
+  id?: string
+  kind: 'image' | 'video' | 'audio'
+  mime_type?: string
+  name?: string
+  url: string
+}
+
+const generatedAssets = computed<GeneratedAsset[]>(() => {
+  if (!props.part.name.startsWith('generate_') || !props.part.result) return []
+  try {
+    const parsed = JSON.parse(props.part.result)
+    if (!Array.isArray(parsed?.assets)) return []
+    return parsed.assets.filter((asset: any) =>
+      asset && ['image', 'video', 'audio'].includes(asset.kind) && typeof asset.url === 'string' && asset.url.startsWith('/api/v1/generated/'),
+    )
+  } catch {
+    return []
+  }
 })
 
 // Copy result to clipboard. Used both as a header
@@ -269,7 +292,18 @@ async function fetchFullResult() {
       </div>
       <div v-if="part.result" class="tool-result">
         <div class="tool-section-label">结果</div>
-        <img v-if="screenshotURL" :src="screenshotURL" class="tool-screenshot" loading="lazy" />
+        <div v-if="generatedAssets.length" class="generated-assets">
+          <figure v-for="asset in generatedAssets" :key="asset.id || asset.url" class="generated-asset">
+            <img v-if="asset.kind === 'image'" :src="asset.url" :alt="asset.name || '生成图片'" loading="lazy" />
+            <video v-else-if="asset.kind === 'video'" :src="asset.url" controls preload="metadata" />
+            <audio v-else :src="asset.url" controls preload="metadata" />
+            <figcaption>
+              <span>{{ asset.name || `生成${asset.kind === 'image' ? '图片' : asset.kind === 'video' ? '视频' : '音频'}` }}</span>
+              <a :href="asset.url" :download="asset.name || undefined">下载</a>
+            </figcaption>
+          </figure>
+        </div>
+        <img v-else-if="screenshotURL" :src="screenshotURL" class="tool-screenshot" loading="lazy" />
         <pre v-else-if="fetchState === 'ok'">{{ fullResult }}</pre>
         <pre v-else>{{ part.result }}</pre>
         <button
@@ -310,6 +344,9 @@ async function fetchFullResult() {
 .tool-card.status-ok    { border-left: 3px solid var(--success-500); }
 .tool-card.status-warn  { border-left: 3px solid var(--warn-500); }
 .tool-card.status-error { border-left: 3px solid var(--error-500); }
+.tool-card.status-blocked { border-left: 3px solid var(--warn-500); }
+.tool-card.status-blocked { border-left: 3px solid var(--warn-500); }
+.tool-card.status-blocked { border-left: 3px solid var(--warn-500); }
 
 .tool-header {
   display: flex;
@@ -446,6 +483,46 @@ async function fetchFullResult() {
 }
 .tool-screenshot:hover {
   transform: scale(1.02);
+}
+.generated-assets {
+  display: grid;
+  gap: var(--space-2);
+}
+.generated-asset {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-2);
+  background: var(--surface-0);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+.generated-asset img,
+.generated-asset video {
+  display: block;
+  width: min(100%, 640px);
+  max-height: 440px;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.generated-asset audio {
+  width: min(100%, 520px);
+}
+.generated-asset figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+}
+.generated-asset figcaption a {
+  color: var(--brand-600);
+  text-decoration: none;
+}
+.generated-asset figcaption a:hover {
+  text-decoration: underline;
 }
 
 /* P1-1 fold affordances. The foldable class is set when

@@ -147,6 +147,20 @@ func TestPartsAccumulator_ToolStartThenOk(t *testing.T) {
 	}
 }
 
+func TestPartsAccumulator_PersistsCompleteMediaGenerationResult(t *testing.T) {
+	acc := newPartsAccumulator()
+	acc.update(ChatStreamChunk{ToolID: "call-media", ToolName: "generate_video"})
+	full := `{"status":"succeeded","assets":[{"id":"asset-1","url":"/api/v1/generated/asset-1"},{"id":"asset-2","url":"/api/v1/generated/asset-2"}]}`
+	acc.update(ChatStreamChunk{
+		Phase: "tool", Step: "call-1-ok", ToolID: "call-media", ToolName: "generate_video",
+		ToolResult: `{"status":"succeeded","assets":[`, ToolResultFull: full,
+	})
+	parts := acc.snapshot()
+	if len(parts) != 1 || parts[0].Result != full {
+		t.Fatalf("media result was not persisted intact: %+v", parts)
+	}
+}
+
 func TestPartsAccumulator_ToolError(t *testing.T) {
 	acc := newPartsAccumulator()
 	acc.update(ChatStreamChunk{ToolName: "exec_command"})
@@ -155,6 +169,19 @@ func TestPartsAccumulator_ToolError(t *testing.T) {
 	parts := acc.snapshot()
 	if len(parts) != 1 || parts[0].Status != "error" || parts[0].Error != "boom" {
 		t.Errorf("want error tool part, got %+v", parts)
+	}
+}
+
+func TestPartsAccumulator_PreservesBlockedToolStatus(t *testing.T) {
+	acc := newPartsAccumulator()
+	acc.update(ChatStreamChunk{ToolID: "blocked-call", ToolName: "generate_video"})
+	acc.update(ChatStreamChunk{
+		Phase: "tool", Step: "call-1-warn", ToolID: "blocked-call", ToolName: "generate_video",
+		ToolCallStatus: "blocked", ToolError: "tool returned error", ToolResult: "已在当前会话关闭",
+	})
+	parts := acc.snapshot()
+	if len(parts) != 1 || parts[0].Status != "blocked" {
+		t.Fatalf("blocked status was flattened: %+v", parts)
 	}
 }
 

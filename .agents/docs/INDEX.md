@@ -19,6 +19,7 @@
 | **修改数据库 Schema** | [**versioning.md**](versioning.md) | memory.md |
 | **发布新版本** | [**versioning.md**](versioning.md) | — |
 | 修改配置管理（providers/models） | [config.md](config.md) | llm.md |
+| 修改媒体生成（图片/视频/音频、厂商适配、资产） | [config.md](config.md) §7 | [tool.md](tool.md) §6.8, [agent.md](agent.md) §3.6, [实现说明](../../docs/plans/media-generation-implementation.md) |
 | 修改知识库系统（扫描/搜索/三层索引） | [knowledge.md](knowledge.md) | server.md, tool.md, frontend.md |
 | 修改浏览器控制（扩展/标签页/截图/权限策略） | [server.md](server.md) §10-12 | tool.md, frontend.md, [结构总览](../../docs/project-structure.md) |
 | 修改导出、自动更新、诊断接口 | [server.md](server.md) | [结构总览](../../docs/project-structure.md), frontend.md |
@@ -54,6 +55,7 @@ P-Chat 项目
 │   ├── tool/         → 请读 [tool.md](tool.md)
 │   ├── subagent/     → 请读 [subagent.md](subagent.md)
 │   ├── config/       → 请读 [config.md](config.md)
+│   ├── generation/   → 媒体生成执行器与资产存储，先读 [实现说明](../../docs/plans/media-generation-implementation.md)
 │   ├── cli/          → 请读 [cli.md](cli.md)
 │   ├── im/           → 请读 [im.md](im.md)   # IM 桥接 Gateway（飞书 / TG / 企微 / QQ / 微信）
 │   ├── browser/      → 浏览器控制，先读 [server.md](server.md) §10-12

@@ -129,6 +129,9 @@ func AddProvider(p ProviderConfig) error {
 			return fmt.Errorf("invalid base_url %q: %w", p.BaseURL, err)
 		}
 	}
+	if p.BaseURL == "" && p.Vendor != "" {
+		p.BaseURL = DefaultGenerationBaseURL(p.Vendor)
+	}
 	cfg.LLM.Providers = append(cfg.LLM.Providers, p)
 
 	mgr := NewManager()
@@ -144,6 +147,9 @@ func RemoveProvider(name string) error {
 
 	for i, p := range cfg.LLM.Providers {
 		if p.Name == name {
+			if operation, referenced := cfg.GenerationDefaultReferenced(name, ""); referenced {
+				return fmt.Errorf("provider %q is used by generation default %s", name, operation)
+			}
 			cfg.LLM.Providers = append(cfg.LLM.Providers[:i], cfg.LLM.Providers[i+1:]...)
 			mgr := NewManager()
 			return mgr.SaveGlobal(cfg)
@@ -162,6 +168,9 @@ func SetDefaultProvider(name string) error {
 	found := false
 	for _, p := range cfg.LLM.Providers {
 		if p.Name == name {
+			if p.EffectiveModel() == "" {
+				return fmt.Errorf("provider %q has no conversational llm model", name)
+			}
 			found = true
 			break
 		}
@@ -205,6 +214,8 @@ type ProviderPatch struct {
 	// Name, if non-empty, renames the provider. A name
 	// collision with another provider returns an error.
 	Name string
+	// Vendor changes media endpoint presets for models under this provider.
+	Vendor *string
 	// Protocol, if non-empty, switches the dispatch
 	// protocol. Accepted values: "openai", "anthropic".
 	Protocol string
@@ -266,7 +277,19 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		if cfg.LLM.Default == oldName {
 			cfg.LLM.Default = patch.Name
 		}
+		for operation, target := range cfg.Generation.Defaults {
+			if target.Provider == oldName {
+				target.Provider = patch.Name
+				cfg.Generation.Defaults[operation] = target
+			}
+		}
 		p.Name = patch.Name
+	}
+	if patch.Vendor != nil {
+		p.Vendor = NormalizeGenerationVendor(*patch.Vendor)
+		if strings.TrimSpace(p.BaseURL) == "" {
+			p.BaseURL = DefaultGenerationBaseURL(p.Vendor)
+		}
 	}
 	if patch.Protocol != "" {
 		switch patch.Protocol {
@@ -289,6 +312,9 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		p.APIKey = patch.APIKey
 	}
 	if patch.IsDefault {
+		if p.EffectiveModel() == "" {
+			return nil, fmt.Errorf("provider %q has no conversational llm model", p.Name)
+		}
 		cfg.LLM.Default = p.Name
 	}
 	cfg.LLM.Providers[idx] = p
@@ -313,6 +339,9 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 	if strings.ContainsAny(m.Name, " \t/\\") || strings.ContainsRune(m.Name, 0) {
 		return nil, fmt.Errorf("model name %q contains invalid characters (no whitespace, path separators, or NUL)", m.Name)
 	}
+	if err := ValidateGenerationModel(m); err != nil {
+		return nil, err
+	}
 	for i, p := range cfg.LLM.Providers {
 		if p.Name != providerName {
 			continue
@@ -325,7 +354,7 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 			return nil, fmt.Errorf("model %q already exists as the legacy single-model form for provider %q", m.Name, providerName)
 		}
 		if len(p.Models) == 0 && p.Model != "" && p.Model != m.Name {
-			p.Models = []ModelConfig{{Name: p.Model, Default: true}}
+			p.Models = []ModelConfig{{Name: p.Model, Type: ModelTypeLLM, Default: true}}
 		}
 		// Reject duplicates by name.
 		for _, existing := range p.Models {
@@ -334,11 +363,13 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 			}
 		}
 		// First model in the list is the default unless another is marked.
-		if m.Default {
+		if m.EffectiveType() == ModelTypeLLM && m.Default {
 			for i := range p.Models {
-				p.Models[i].Default = false
+				if p.Models[i].EffectiveType() == ModelTypeLLM {
+					p.Models[i].Default = false
+				}
 			}
-		} else if len(p.Models) == 0 {
+		} else if m.EffectiveType() == ModelTypeLLM && p.EffectiveModel() == "" {
 			m.Default = true
 		}
 		p.Models = append(p.Models, m)
@@ -376,10 +407,18 @@ func RemoveModel(providerName, modelName string) error {
 		if idx < 0 {
 			return fmt.Errorf("model %q not found under provider %q", modelName, providerName)
 		}
+		if operation, referenced := cfg.GenerationDefaultReferenced(providerName, modelName); referenced {
+			return fmt.Errorf("model %q is used by generation default %s", modelName, operation)
+		}
 		p.Models = append(p.Models[:idx], p.Models[idx+1:]...)
 		// Pick a new default if we removed the old one.
-		if wasDefault && len(p.Models) > 0 {
-			p.Models[0].Default = true
+		if wasDefault {
+			for j := range p.Models {
+				if p.Models[j].EffectiveType() == ModelTypeLLM {
+					p.Models[j].Default = true
+					break
+				}
+			}
 		}
 		// If the provider is the global default, we now have a
 		// no-default state. Setting model="" would be
@@ -406,6 +445,9 @@ func SetDefaultModel(providerName, modelName string) error {
 		}
 		found := false
 		for j := range p.Models {
+			if p.Models[j].Name == modelName && p.Models[j].EffectiveType() != ModelTypeLLM {
+				return fmt.Errorf("media generation model %q cannot be the provider chat default", modelName)
+			}
 			p.Models[j].Default = p.Models[j].Name == modelName
 			if p.Models[j].Name == modelName {
 				found = true
@@ -453,7 +495,7 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 			continue
 		}
 		if len(p.Models) == 0 && p.Model != "" {
-			p.Models = []ModelConfig{{Name: p.Model, Default: true}}
+			p.Models = []ModelConfig{{Name: p.Model, Type: ModelTypeLLM, Default: true}}
 		}
 		idx := -1
 		for j := range p.Models {
@@ -466,6 +508,18 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 			return nil, fmt.Errorf("model %q not found under provider %q", modelName, providerName)
 		}
 		m := &p.Models[idx]
+		if patch.Type != "" {
+			if !patch.Type.IsValid() {
+				return nil, fmt.Errorf("invalid model type %q", patch.Type)
+			}
+			if patch.Type != m.EffectiveType() {
+				return nil, fmt.Errorf("model type cannot be changed after creation; create a new model entry instead")
+			}
+			m.Type = patch.Type
+		}
+		if patch.Generation != nil {
+			m.Generation = patch.Generation
+		}
 		if clearAll {
 			m.DisplayName = ""
 			m.Description = ""
@@ -495,6 +549,17 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 		// reset endpoint.
 		if !patch.Capabilities.IsZero() {
 			m.Capabilities = patch.Capabilities
+		}
+		if m.EffectiveType() == ModelTypeLLM {
+			m.Generation = nil
+		}
+		if err := ValidateGenerationModel(*m); err != nil {
+			return nil, err
+		}
+		for operation, target := range cfg.Generation.Defaults {
+			if target.Provider == providerName && target.Model == modelName && !m.Generation.Supports(operation) {
+				return nil, fmt.Errorf("model %q is used by generation default %s; change that default before removing the capability", modelName, operation)
+			}
 		}
 		cfg.LLM.Providers[i] = p
 		mgr := NewManager()

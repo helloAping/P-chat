@@ -78,6 +78,7 @@ const allEntries = computed<ModelEntry[]>(() => {
   const out: ModelEntry[] = []
   for (const p of props.providers) {
     for (const m of (p.models || [])) {
+      if ((m.type || 'llm') !== 'llm') continue
       out.push({
         provider: p,
         model: m as any,

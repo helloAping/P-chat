@@ -498,6 +498,47 @@ func TestUpdateModel_ClearAll(t *testing.T) {
 	}
 }
 
+func TestUpdateMediaModelRejectsRemovingDefaultedOperation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {"providers": [{
+    "name": "media", "vendor": "minimax", "base_url": "https://api.minimax.io",
+    "models": [{"name": "video", "type": "media_generation", "generation": {"adapter": "minimax", "operations": {
+      "text_to_video": {}, "image_to_video": {}
+    }}}]
+  }]},
+  "generation": {"defaults": {
+    "text_to_video": {"provider": "media", "model": "video"},
+    "image_to_video": {"provider": "media", "model": "video"}
+  }}
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	_, err := UpdateModel("media", "video", ModelConfig{
+		Type: ModelTypeMediaGeneration,
+		Generation: &MediaGenerationModelConfig{Adapter: "minimax", Operations: map[GenerationOperation]GenerationOperationConfig{
+			GenerationTextToVideo: {},
+		}},
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "generation default image_to_video") {
+		t.Fatalf("expected generation default reference error, got %v", err)
+	}
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := cfg.Generation.Defaults[GenerationImageToVideo]; !exists {
+		t.Fatal("rejected update changed the application default")
+	}
+	model := cfg.LLM.Providers[0].FindModel("video")
+	if model == nil || !model.Generation.Supports(GenerationImageToVideo) {
+		t.Fatal("rejected update changed the model capability")
+	}
+}
+
 func TestUpdateModel_NotFound(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)

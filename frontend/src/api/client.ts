@@ -70,6 +70,36 @@ async function waitForDirectBackend(): Promise<string> {
   return directBackendURL()
 }
 
+export type ModelType = 'llm' | 'media_generation'
+
+export type GenerationOperation =
+  | 'text_to_image'
+  | 'image_to_image'
+  | 'text_to_video'
+  | 'image_to_video'
+  | 'video_to_video'
+  | 'text_to_speech'
+  | 'text_to_music'
+  | 'text_to_sound'
+  | 'audio_to_audio'
+
+export interface GenerationModelTarget {
+  provider: string
+  model: string
+}
+
+export interface GenerationOperationConfig {
+  endpoint?: string
+  query_endpoint?: string
+  timeout_seconds?: number
+  default_params?: Record<string, unknown>
+}
+
+export interface MediaGenerationModelConfig {
+  adapter?: string
+  operations: Partial<Record<GenerationOperation, GenerationOperationConfig>>
+}
+
 export interface Session {
   id: string
   title: string
@@ -100,6 +130,9 @@ export interface Session {
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
   enabled_recognition_capabilities?: MediaKind[]
+  enabled_generation_operations?: GenerationOperation[]
+  generation_model_overrides?: Partial<Record<GenerationOperation, GenerationModelTarget>>
+  generation_prompt_assist?: boolean
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
@@ -156,7 +189,7 @@ export type MessagePart =
       tool_id?: string
       name: string
       args?: string
-      status: 'start' | 'ok' | 'warn' | 'error'
+      status: 'start' | 'ok' | 'warn' | 'error' | 'blocked'
       result?: string
       error?: string
       elapsed?: string
@@ -331,6 +364,9 @@ export interface UpdateSessionMetaResponse {
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
   enabled_recognition_capabilities?: MediaKind[]
+  enabled_generation_operations?: GenerationOperation[]
+  generation_model_overrides?: Partial<Record<GenerationOperation, GenerationModelTarget>>
+  generation_prompt_assist?: boolean
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
@@ -416,6 +452,9 @@ export interface CreateSessionOptions {
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
   enabled_recognition_capabilities?: MediaKind[]
+  enabled_generation_operations?: GenerationOperation[]
+  generation_model_overrides?: Partial<Record<GenerationOperation, GenerationModelTarget>>
+  generation_prompt_assist?: boolean
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
@@ -438,7 +477,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; generation_model_overrides: Partial<Record<GenerationOperation, GenerationModelTarget>>; generation_prompt_assist: boolean; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -874,6 +913,7 @@ export function uploadURL(id: string): string {
 // --- Providers / Models ---
 export interface ModelInfo {
   name: string
+  type?: ModelType
   display_name?: string
   description?: string
   default?: boolean
@@ -890,12 +930,14 @@ export interface ModelInfo {
     supports_audio?: boolean
     input_modalities?: MediaKind[]
   }
+  generation?: MediaGenerationModelConfig
 }
 
 export type MediaKind = 'image' | 'video' | 'audio'
 
 export interface ProviderInfo {
   name: string
+  vendor?: string
   protocol: 'openai' | 'anthropic' | string
   base_url: string
   api_key: string
@@ -1056,6 +1098,7 @@ export const runCommand = (name: string, args: string) =>
 // --- App-level provider configuration ---
 export interface AddProviderRequest {
   name: string
+  vendor?: string
   protocol: 'openai' | 'anthropic'
   base_url: string
   api_key: string
@@ -1102,6 +1145,7 @@ export const testProvider = (provider: string, model?: string) =>
 // (not is_default) to promote a provider to the global default.
 export interface UpdateProviderRequest {
   name?: string
+  vendor?: string
   protocol?: 'openai' | 'anthropic'
   base_url?: string
   api_key?: string
@@ -1117,10 +1161,12 @@ export const updateProvider = (name: string, req: UpdateProviderRequest) =>
 // --- Per-model CRUD ---
 export interface AddModelRequest {
   name: string
+  type?: ModelType
   display_name?: string
   description?: string
   max_tokens_context?: number
   max_tokens_output?: number
+  generation?: MediaGenerationModelConfig
 }
 
 export const addModel = (provider: string, req: AddModelRequest) =>
@@ -1130,10 +1176,12 @@ export const addModel = (provider: string, req: AddModelRequest) =>
   )
 
 export interface UpdateModelRequest {
+  type?: ModelType
   display_name?: string
   description?: string
   max_tokens_context?: number
   max_tokens_output?: number
+  generation?: MediaGenerationModelConfig
   clear_all?: boolean
 }
 
@@ -2240,6 +2288,11 @@ export interface RecognitionConfig {
   routes: Record<MediaKind, RecognitionRouteConfig>
 }
 
+export interface GenerationConfig {
+  defaults: Partial<Record<GenerationOperation, GenerationModelTarget>>
+  require_confirm: boolean
+}
+
 export interface SystemConfig {
   limits: LimitsConfig
   sub_agent: SubAgentConfig
@@ -2247,6 +2300,7 @@ export interface SystemConfig {
   ui: UIConfig
   vision_recognition: VisionRecognitionConfig
   recognition: RecognitionConfig
+  generation: GenerationConfig
 }
 
 export const getSystemConfig = () =>
@@ -2257,6 +2311,34 @@ export const updateSystemConfig = (patch: Record<string, unknown>) =>
     method: 'PATCH',
     body: JSON.stringify(patch),
   })
+
+export interface GenerationModelOption extends GenerationModelTarget {
+  display_name: string
+  vendor?: string
+}
+
+export interface GenerationOperationOption {
+  operation: GenerationOperation
+  output_kind: MediaKind
+  required_input_kind?: MediaKind
+  available: boolean
+  enabled: boolean
+  models: GenerationModelOption[]
+  default_target?: GenerationModelTarget
+  session_override?: GenerationModelTarget
+  effective_target?: GenerationModelTarget
+  unavailable_reason?: string
+}
+
+export interface GenerationOptionsResponse {
+  operations: GenerationOperationOption[]
+  prompt_assist: boolean
+}
+
+export const getGenerationOptions = (sessionId?: string) =>
+  jsonFetch<GenerationOptionsResponse>(
+    `/api/v1/generation/options${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`,
+  )
 
 // ---- IM bridge settings ----
 

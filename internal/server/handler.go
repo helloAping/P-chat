@@ -11,10 +11,12 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/generation"
 	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/search"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/stylegen"
@@ -52,6 +54,7 @@ type Handler struct {
 	// turn's attachments). May be nil in unit tests that never
 	// call loadHistoryForSend with upl:// rows.
 	attachResolver *agent.DiskAttachmentResolver
+	generatedStore *generation.LocalAssetStore
 	// toolReg is the P3-2 shared tool registry. The
 	// dynamic-tool watcher in server.go writes here; the
 	// GET /api/v1/tools endpoint reads from here. May be
@@ -100,11 +103,14 @@ type sessionMeta struct {
 	KnowledgeBase   string // "" = off, "__all__" = all bases, or a specific base name
 	// true 表示上传图片使用已配置的 media_recognize 图片策略。
 	// true means uploaded images use the configured media_recognize image strategy.
-	UseImageRecognition     bool
-	RecognitionCapabilities []config.MediaKind // enabled media-recognition tools
-	SubAgentModelEnabled    bool               // true = sub-agents use SubAgentProvider/SubAgentModel by default
-	SubAgentProvider        string             // provider for per-session sub-agent model override
-	SubAgentModel           string             // model for per-session sub-agent model override
+	UseImageRecognition      bool
+	RecognitionCapabilities  []config.MediaKind // enabled media-recognition tools
+	GenerationOperations     []config.GenerationOperation
+	GenerationModelOverrides map[config.GenerationOperation]config.GenerationModelTarget
+	GenerationPromptAssist   *bool  // nil inherits the default-on prompt assistant
+	SubAgentModelEnabled     bool   // true = sub-agents use SubAgentProvider/SubAgentModel by default
+	SubAgentProvider         string // provider for per-session sub-agent model override
+	SubAgentModel            string // model for per-session sub-agent model override
 	// AutoContinue is a pointer so we can distinguish "user
 	// never set" (nil → default true) from "user explicitly
 	// disabled" (*bool == false). The P0-3 auto-continue
@@ -119,20 +125,23 @@ type sessionMeta struct {
 // conversations.metadata. The field names are JSON lower-case so
 // the web side can pass them straight back to the PATCH endpoint.
 type sessionMetaBlob struct {
-	Style                   string             `json:"style,omitempty"`
-	WorkMode                string             `json:"work_mode,omitempty"`
-	Provider                string             `json:"provider,omitempty"`
-	Model                   string             `json:"model,omitempty"`
-	ReasoningEffort         string             `json:"reasoning_effort,omitempty"`
-	ProjectPath             string             `json:"project_path,omitempty"`
-	PlanMode                bool               `json:"plan_mode,omitempty"`
-	PermissionLevel         string             `json:"permission_level,omitempty"`
-	KnowledgeBase           string             `json:"knowledge_base,omitempty"`
-	UseImageRecognition     bool               `json:"use_image_recognition,omitempty"`
-	RecognitionCapabilities []config.MediaKind `json:"enabled_recognition_capabilities,omitempty"`
-	SubAgentModelEnabled    bool               `json:"sub_agent_model_enabled,omitempty"`
-	SubAgentProvider        string             `json:"sub_agent_provider,omitempty"`
-	SubAgentModel           string             `json:"sub_agent_model,omitempty"`
+	Style                    string                                                      `json:"style,omitempty"`
+	WorkMode                 string                                                      `json:"work_mode,omitempty"`
+	Provider                 string                                                      `json:"provider,omitempty"`
+	Model                    string                                                      `json:"model,omitempty"`
+	ReasoningEffort          string                                                      `json:"reasoning_effort,omitempty"`
+	ProjectPath              string                                                      `json:"project_path,omitempty"`
+	PlanMode                 bool                                                        `json:"plan_mode,omitempty"`
+	PermissionLevel          string                                                      `json:"permission_level,omitempty"`
+	KnowledgeBase            string                                                      `json:"knowledge_base,omitempty"`
+	UseImageRecognition      bool                                                        `json:"use_image_recognition,omitempty"`
+	RecognitionCapabilities  []config.MediaKind                                          `json:"enabled_recognition_capabilities,omitempty"`
+	GenerationOperations     []config.GenerationOperation                                `json:"enabled_generation_operations,omitempty"`
+	GenerationModelOverrides map[config.GenerationOperation]config.GenerationModelTarget `json:"generation_model_overrides,omitempty"`
+	GenerationPromptAssist   *bool                                                       `json:"generation_prompt_assist,omitempty"`
+	SubAgentModelEnabled     bool                                                        `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider         string                                                      `json:"sub_agent_provider,omitempty"`
+	SubAgentModel            string                                                      `json:"sub_agent_model,omitempty"`
 	// AutoContinue mirrors sessionMeta.AutoContinue. Pointer
 	// so JSON omits it when never set, instead of
 	// round-tripping "false" as if the user had disabled it.
@@ -152,6 +161,7 @@ func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMg
 	}
 	h.cfg.Store(cfg)
 	h.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
+	h.generatedStore = generation.NewLocalAssetStore(paths.GeneratedDir(), "/api/v1/generated")
 	return h
 }
 
@@ -167,22 +177,25 @@ func (h *Handler) SetAttachmentResolver(r *agent.DiskAttachmentResolver) {
 
 func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
 	return sessionMetaBlob{
-		Style:                   m.Style,
-		WorkMode:                m.WorkMode,
-		Provider:                m.Provider,
-		Model:                   m.Model,
-		ReasoningEffort:         m.ReasoningEffort,
-		ProjectPath:             m.ProjectPath,
-		PlanMode:                m.PlanMode,
-		PermissionLevel:         m.PermissionLevel,
-		KnowledgeBase:           m.KnowledgeBase,
-		UseImageRecognition:     m.UseImageRecognition,
-		RecognitionCapabilities: append([]config.MediaKind(nil), m.RecognitionCapabilities...),
-		SubAgentModelEnabled:    m.SubAgentModelEnabled,
-		SubAgentProvider:        m.SubAgentProvider,
-		SubAgentModel:           m.SubAgentModel,
-		AutoContinue:            m.AutoContinue,
-		TodoLongRunMode:         m.TodoLongRunMode,
+		Style:                    m.Style,
+		WorkMode:                 m.WorkMode,
+		Provider:                 m.Provider,
+		Model:                    m.Model,
+		ReasoningEffort:          m.ReasoningEffort,
+		ProjectPath:              m.ProjectPath,
+		PlanMode:                 m.PlanMode,
+		PermissionLevel:          m.PermissionLevel,
+		KnowledgeBase:            m.KnowledgeBase,
+		UseImageRecognition:      m.UseImageRecognition,
+		RecognitionCapabilities:  append([]config.MediaKind(nil), m.RecognitionCapabilities...),
+		GenerationOperations:     append([]config.GenerationOperation(nil), m.GenerationOperations...),
+		GenerationModelOverrides: cloneGenerationTargets(m.GenerationModelOverrides),
+		GenerationPromptAssist:   m.GenerationPromptAssist,
+		SubAgentModelEnabled:     m.SubAgentModelEnabled,
+		SubAgentProvider:         m.SubAgentProvider,
+		SubAgentModel:            m.SubAgentModel,
+		AutoContinue:             m.AutoContinue,
+		TodoLongRunMode:          m.TodoLongRunMode,
 	}
 }
 
@@ -270,6 +283,9 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				if len(m.RecognitionCapabilities) == 0 && blob.UseImageRecognition {
 					m.RecognitionCapabilities = []config.MediaKind{config.MediaImage}
 				}
+				m.GenerationOperations = append([]config.GenerationOperation(nil), blob.GenerationOperations...)
+				m.GenerationModelOverrides = cloneGenerationTargets(blob.GenerationModelOverrides)
+				m.GenerationPromptAssist = blob.GenerationPromptAssist
 				m.SubAgentModelEnabled = blob.SubAgentModelEnabled
 				m.SubAgentProvider = blob.SubAgentProvider
 				m.SubAgentModel = blob.SubAgentModel
@@ -337,6 +353,32 @@ func (h *Handler) sessionRecognitionCapabilities(id string) []config.MediaKind {
 		result = []config.MediaKind{config.MediaImage}
 	}
 	return result
+}
+
+func (h *Handler) sessionGenerationOperations(id string) []config.GenerationOperation {
+	m := h.ensureMetaLoaded(id)
+	return append([]config.GenerationOperation(nil), m.GenerationOperations...)
+}
+
+func (h *Handler) sessionGenerationModelOverrides(id string) map[config.GenerationOperation]config.GenerationModelTarget {
+	m := h.ensureMetaLoaded(id)
+	return cloneGenerationTargets(m.GenerationModelOverrides)
+}
+
+func (h *Handler) sessionGenerationPromptAssist(id string) bool {
+	m := h.ensureMetaLoaded(id)
+	return m.GenerationPromptAssist == nil || *m.GenerationPromptAssist
+}
+
+func cloneGenerationTargets(source map[config.GenerationOperation]config.GenerationModelTarget) map[config.GenerationOperation]config.GenerationModelTarget {
+	if source == nil {
+		return nil
+	}
+	out := make(map[config.GenerationOperation]config.GenerationModelTarget, len(source))
+	for operation, target := range source {
+		out[operation] = target
+	}
+	return out
 }
 
 func (h *Handler) sessionSubAgentModelPreference(id string) agent.SubagentModelPreference {
@@ -438,7 +480,7 @@ func (h *Handler) validModel(provider, name string) bool {
 			return true
 		}
 		for _, m := range p.Models {
-			if m.Name == name {
+			if m.Name == name && m.EffectiveType() == config.ModelTypeLLM {
 				return true
 			}
 		}
@@ -500,24 +542,27 @@ type SendMessageRequest struct {
 
 // CreateSessionRequest is the body of POST /sessions.
 type CreateSessionRequest struct {
-	Style                          string                  `json:"style,omitempty"`
-	WorkMode                       string                  `json:"work_mode,omitempty"`
-	Provider                       string                  `json:"provider,omitempty"`
-	Model                          string                  `json:"model,omitempty"`
-	Title                          string                  `json:"title,omitempty"`
-	ProjectPath                    string                  `json:"project_path,omitempty"`
-	PlanMode                       *bool                   `json:"plan_mode,omitempty"`
-	PermissionLevel                string                  `json:"permission_level,omitempty"`
-	ReasoningEffort                string                  `json:"reasoning_effort,omitempty"`
-	VectorStore                    string                  `json:"vector_store,omitempty"`
-	KnowledgeBase                  string                  `json:"knowledge_base,omitempty"`
-	AutoContinue                   *bool                   `json:"auto_continue,omitempty"`
-	TodoLongRunMode                *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
-	UseImageRecognition            *bool                   `json:"use_image_recognition,omitempty"`
-	EnabledRecognitionCapabilities *[]config.MediaKind     `json:"enabled_recognition_capabilities,omitempty"`
-	SubAgentModelEnabled           *bool                   `json:"sub_agent_model_enabled,omitempty"`
-	SubAgentProvider               string                  `json:"sub_agent_provider,omitempty"`
-	SubAgentModel                  string                  `json:"sub_agent_model,omitempty"`
+	Style                          string                                                      `json:"style,omitempty"`
+	WorkMode                       string                                                      `json:"work_mode,omitempty"`
+	Provider                       string                                                      `json:"provider,omitempty"`
+	Model                          string                                                      `json:"model,omitempty"`
+	Title                          string                                                      `json:"title,omitempty"`
+	ProjectPath                    string                                                      `json:"project_path,omitempty"`
+	PlanMode                       *bool                                                       `json:"plan_mode,omitempty"`
+	PermissionLevel                string                                                      `json:"permission_level,omitempty"`
+	ReasoningEffort                string                                                      `json:"reasoning_effort,omitempty"`
+	VectorStore                    string                                                      `json:"vector_store,omitempty"`
+	KnowledgeBase                  string                                                      `json:"knowledge_base,omitempty"`
+	AutoContinue                   *bool                                                       `json:"auto_continue,omitempty"`
+	TodoLongRunMode                *config.TodoLongRunMode                                     `json:"todo_long_run_mode,omitempty"`
+	UseImageRecognition            *bool                                                       `json:"use_image_recognition,omitempty"`
+	EnabledRecognitionCapabilities *[]config.MediaKind                                         `json:"enabled_recognition_capabilities,omitempty"`
+	EnabledGenerationOperations    *[]config.GenerationOperation                               `json:"enabled_generation_operations,omitempty"`
+	GenerationModelOverrides       map[config.GenerationOperation]config.GenerationModelTarget `json:"generation_model_overrides,omitempty"`
+	GenerationPromptAssist         *bool                                                       `json:"generation_prompt_assist,omitempty"`
+	SubAgentModelEnabled           *bool                                                       `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider               string                                                      `json:"sub_agent_provider,omitempty"`
+	SubAgentModel                  string                                                      `json:"sub_agent_model,omitempty"`
 }
 
 // RenameSessionRequest is the body of PATCH /sessions/:id when the
@@ -550,13 +595,16 @@ type UpdateSessionMetaRequest struct {
 	// distinct from `false`: when omitted, the per-session
 	// setting is left unchanged; when present, it overrides
 	// whatever was there before (including the default-true).
-	AutoContinue                   *bool                   `json:"auto_continue,omitempty"`
-	TodoLongRunMode                *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
-	UseImageRecognition            *bool                   `json:"use_image_recognition,omitempty"`
-	EnabledRecognitionCapabilities *[]config.MediaKind     `json:"enabled_recognition_capabilities,omitempty"`
-	SubAgentModelEnabled           *bool                   `json:"sub_agent_model_enabled,omitempty"`
-	SubAgentProvider               *string                 `json:"sub_agent_provider,omitempty"`
-	SubAgentModel                  *string                 `json:"sub_agent_model,omitempty"`
+	AutoContinue                   *bool                                                       `json:"auto_continue,omitempty"`
+	TodoLongRunMode                *config.TodoLongRunMode                                     `json:"todo_long_run_mode,omitempty"`
+	UseImageRecognition            *bool                                                       `json:"use_image_recognition,omitempty"`
+	EnabledRecognitionCapabilities *[]config.MediaKind                                         `json:"enabled_recognition_capabilities,omitempty"`
+	EnabledGenerationOperations    *[]config.GenerationOperation                               `json:"enabled_generation_operations,omitempty"`
+	GenerationModelOverrides       map[config.GenerationOperation]config.GenerationModelTarget `json:"generation_model_overrides,omitempty"`
+	GenerationPromptAssist         *bool                                                       `json:"generation_prompt_assist,omitempty"`
+	SubAgentModelEnabled           *bool                                                       `json:"sub_agent_model_enabled,omitempty"`
+	SubAgentProvider               *string                                                     `json:"sub_agent_provider,omitempty"`
+	SubAgentModel                  *string                                                     `json:"sub_agent_model,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -582,13 +630,16 @@ type SessionResponse struct {
 	// LLM" guard toggle, default true. Surface so the UI can
 	// show a status pill ("auto-continue on/off") next to the
 	// todo panel.
-	AutoContinue                   bool               `json:"auto_continue"`
-	TodoLongRunMode                string             `json:"todo_long_run_mode"`
-	UseImageRecognition            bool               `json:"use_image_recognition"`
-	EnabledRecognitionCapabilities []config.MediaKind `json:"enabled_recognition_capabilities"`
-	SubAgentModelEnabled           bool               `json:"sub_agent_model_enabled"`
-	SubAgentProvider               string             `json:"sub_agent_provider,omitempty"`
-	SubAgentModel                  string             `json:"sub_agent_model,omitempty"`
+	AutoContinue                   bool                                                        `json:"auto_continue"`
+	TodoLongRunMode                string                                                      `json:"todo_long_run_mode"`
+	UseImageRecognition            bool                                                        `json:"use_image_recognition"`
+	EnabledRecognitionCapabilities []config.MediaKind                                          `json:"enabled_recognition_capabilities"`
+	EnabledGenerationOperations    []config.GenerationOperation                                `json:"enabled_generation_operations"`
+	GenerationModelOverrides       map[config.GenerationOperation]config.GenerationModelTarget `json:"generation_model_overrides"`
+	GenerationPromptAssist         bool                                                        `json:"generation_prompt_assist"`
+	SubAgentModelEnabled           bool                                                        `json:"sub_agent_model_enabled"`
+	SubAgentProvider               string                                                      `json:"sub_agent_provider,omitempty"`
+	SubAgentModel                  string                                                      `json:"sub_agent_model,omitempty"`
 }
 
 // MessageResponse is the JSON form of a single message in a
@@ -1127,6 +1178,7 @@ func (h *Handler) Providers(c *gin.Context) {
 	}
 	type providerInfo struct {
 		Name      string      `json:"name"`
+		Vendor    string      `json:"vendor,omitempty"`
 		Model     string      `json:"model"`
 		Protocol  string      `json:"protocol"`
 		IsDefault bool        `json:"is_default"`
@@ -1145,6 +1197,7 @@ func (h *Handler) Providers(c *gin.Context) {
 		}
 		providers = append(providers, providerInfo{
 			Name:      p.Name,
+			Vendor:    p.Vendor,
 			Model:     p.EffectiveModel(),
 			Protocol:  p.GetProtocol(),
 			IsDefault: p.Name == h.getCfg().LLM.Default,

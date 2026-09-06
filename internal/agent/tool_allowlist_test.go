@@ -96,7 +96,7 @@ func TestChatWithToolsAllowedToolsBlocksHiddenToolCalls(t *testing.T) {
 		AllowedTools: []string{"read_file"},
 		Messages:     []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: "run danger"}},
 	}) {
-		if chunk.ToolName == "dangerous_tool" && chunk.ToolCallStatus == "error" {
+		if chunk.ToolName == "dangerous_tool" && chunk.ToolCallStatus == string(tool.CallStatusBlocked) && strings.Contains(chunk.ToolError, "当前会话关闭") {
 			sawBlocked = true
 		}
 	}

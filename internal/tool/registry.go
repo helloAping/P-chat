@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/paths"
 )
 
@@ -837,6 +838,25 @@ func RegisterBuiltin(r *Registry) {
 	// names for the same capability. The alias is callable but absent from
 	// Names/List and therefore from the native tool schema and prompt table.
 	r.RegisterAlias("image_recognize", "media_recognize")
+
+	r.Register(Tool{
+		Name:        "generate_image",
+		Description: "Generate or transform images through the media model enabled for this conversation. Use only attachment/asset IDs from the conversation as input_refs. The handler enforces the session switch even if a stale call bypasses tool visibility.",
+		Parameters:  generationToolSchema(config.GenerationTextToImage, config.GenerationImageToImage),
+		Policy:      &ToolPolicy{TimeoutMS: -1},
+	}, handleGenerateImage)
+	r.Register(Tool{
+		Name:        "generate_video",
+		Description: "Generate or transform video through the media model enabled for this conversation. Use only attachment/asset IDs from the conversation as input_refs. The handler enforces the session switch even if a stale call bypasses tool visibility.",
+		Parameters:  generationToolSchema(config.GenerationTextToVideo, config.GenerationImageToVideo, config.GenerationVideoToVideo),
+		Policy:      &ToolPolicy{TimeoutMS: -1},
+	}, handleGenerateVideo)
+	r.Register(Tool{
+		Name:        "generate_audio",
+		Description: "Generate speech, music, sound, or transformed audio through the media model enabled for this conversation. Use only attachment/asset IDs from the conversation as input_refs. The handler enforces the session switch even if a stale call bypasses tool visibility.",
+		Parameters:  generationToolSchema(config.GenerationTextToSpeech, config.GenerationTextToMusic, config.GenerationTextToSound, config.GenerationAudioToAudio),
+		Policy:      &ToolPolicy{TimeoutMS: -1},
+	}, handleGenerateAudio)
 
 	r.Register(Tool{
 		Name:        "todo_write",

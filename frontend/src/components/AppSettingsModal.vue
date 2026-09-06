@@ -220,6 +220,7 @@ const selected = computed(() =>
 
 // Edit form (top of right pane). Mirrors the unified PATCH body.
 const editName = ref('')
+const editVendor = ref('')
 const editProtocol = ref<'openai' | 'anthropic'>('openai')
 const editBaseURL = ref('')
 const editAPIKey = ref('')
@@ -234,6 +235,7 @@ const dirty = ref<Set<string>>(new Set())
 // Add-provider form (shown in NModal)
 const showAddProvider = ref(false)
 const newName = ref('')
+const newVendor = ref('')
 const newProtocol = ref<'openai' | 'anthropic'>('openai')
 const newBaseURL = ref('')
 const newAPIKey = ref('')
@@ -260,6 +262,95 @@ const editModelDisplay = ref('')
 const editModelCtx = ref<number | null>(null)
 const editModelOut = ref<number | null>(null)
 const editModelCapabilities = ref<api.MediaKind[]>([])
+const editModelType = ref<api.ModelType>('llm')
+const editGenerationOperations = ref<api.GenerationOperation[]>([])
+const generationOperationDefs: Array<{ operation: api.GenerationOperation; label: string; hint: string }> = [
+  { operation: 'text_to_image', label: '文生图', hint: '仅使用文本提示词生成图片' },
+  { operation: 'image_to_image', label: '图生图', hint: '使用上传图片 ID 作为参考图' },
+  { operation: 'text_to_video', label: '文生视频', hint: '仅使用文本提示词生成视频' },
+  { operation: 'image_to_video', label: '图生视频', hint: '使用上传图片 ID 生成视频' },
+  { operation: 'video_to_video', label: '视频生视频', hint: '使用上传视频 ID 进行转换' },
+  { operation: 'text_to_speech', label: '文本转语音', hint: '将文本合成为语音' },
+  { operation: 'text_to_music', label: '文生音乐', hint: '使用描述生成音乐' },
+  { operation: 'text_to_sound', label: '文生音效', hint: '使用描述生成音效' },
+  { operation: 'audio_to_audio', label: '音频生音频', hint: '使用上传音频 ID 进行转换' },
+]
+const generationOperationOptions = generationOperationDefs.map(item => ({ label: item.label, value: item.operation }))
+
+function emptyGenerationConfigs(): Record<api.GenerationOperation, api.GenerationOperationConfig> {
+  return Object.fromEntries(generationOperationDefs.map(item => [item.operation, {
+    endpoint: '', query_endpoint: '', timeout_seconds: 600, default_params: {},
+  }])) as Record<api.GenerationOperation, api.GenerationOperationConfig>
+}
+
+const editGenerationConfigs = ref<Record<api.GenerationOperation, api.GenerationOperationConfig>>(emptyGenerationConfigs())
+const vendorOptions = [
+  { label: '自定义 / 未指定', value: '' },
+  { label: '火山引擎 Ark', value: 'volcengine' },
+  { label: 'MiniMax', value: 'minimax' },
+  { label: 'OpenAI', value: 'openai' },
+]
+const modelTypeOptions = [
+  { label: '大语言模型', value: 'llm' },
+  { label: '媒体生成模型', value: 'media_generation' },
+]
+
+function defaultProviderBaseURL(vendor: string): string {
+  if (vendor === 'volcengine') return 'https://ark.cn-beijing.volces.com/api/v3'
+  if (vendor === 'minimax') return 'https://api.minimax.io'
+  if (vendor === 'openai') return 'https://api.openai.com/v1'
+  return ''
+}
+
+function onNewVendorUpdate(vendor: string) {
+  newVendor.value = vendor
+  if (!newBaseURL.value.trim()) newBaseURL.value = defaultProviderBaseURL(vendor)
+}
+
+function defaultGenerationEndpoint(vendor: string, operation: api.GenerationOperation): string {
+  if (vendor === 'volcengine') {
+    if (operation === 'text_to_image' || operation === 'image_to_image') return '/images/generations'
+    if (operation === 'text_to_video' || operation === 'image_to_video') return '/contents/generations/tasks'
+  }
+  if (vendor === 'minimax') {
+    if (operation === 'text_to_image' || operation === 'image_to_image') return '/v1/image_generation'
+    if (operation === 'text_to_video' || operation === 'image_to_video') return '/v1/video_generation'
+    if (operation === 'text_to_speech') return '/v1/t2a_v2'
+  }
+  if (vendor === 'openai' && operation === 'text_to_image') return '/images/generations'
+  return ''
+}
+
+function defaultGenerationQueryEndpoint(vendor: string, operation: api.GenerationOperation): string {
+  if (operation !== 'text_to_video' && operation !== 'image_to_video') return ''
+  if (vendor === 'volcengine') return '/contents/generations/tasks/{task_id}'
+  if (vendor === 'minimax') return '/v1/query/video_generation?task_id={task_id}'
+  return ''
+}
+
+function onGenerationOperationsUpdate(operations: api.GenerationOperation[]) {
+  editGenerationOperations.value = operations
+  const vendor = selected.value?.vendor || editVendor.value || ''
+  for (const operation of operations) {
+    const config = editGenerationConfigs.value[operation]
+    if (!config.endpoint) config.endpoint = defaultGenerationEndpoint(vendor, operation)
+    if (!config.query_endpoint) config.query_endpoint = defaultGenerationQueryEndpoint(vendor, operation)
+  }
+}
+
+function buildMediaGenerationConfig(): api.MediaGenerationModelConfig {
+  const operations: Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>> = {}
+  for (const operation of editGenerationOperations.value) {
+    const value = editGenerationConfigs.value[operation]
+    operations[operation] = {
+      endpoint: value.endpoint?.trim() || undefined,
+      query_endpoint: value.query_endpoint?.trim() || undefined,
+      timeout_seconds: value.timeout_seconds || 600,
+      default_params: value.default_params || {},
+    }
+  }
+  return { adapter: selected.value?.vendor || editVendor.value || '', operations }
+}
 const contextWindowOptions = [
   { label: '32K', value: 32_000 },
   { label: '64K', value: 64_000 },
@@ -338,6 +429,8 @@ const sysRecognition = ref<Record<api.MediaKind, api.RecognitionRouteConfig>>({
   video: defaultRecognitionRoute(),
   audio: defaultRecognitionRoute(),
 })
+const sysGenerationDefaults = ref<Partial<Record<api.GenerationOperation, api.GenerationModelTarget>>>({})
+const sysGenerationRequireConfirm = ref(false)
 const sysRecognitionSizeUnits = ref<Record<api.MediaKind, ByteSizeUnit>>({
   image: 'MB',
   video: 'MB',
@@ -372,6 +465,34 @@ function onRecognitionSizeUnitUpdate(kind: api.MediaKind, unit: ByteSizeUnit) {
   sysRecognitionSizeUnits.value[kind] = unit
 }
 
+function generationTargetKey(target?: api.GenerationModelTarget): string | null {
+  return target?.provider && target?.model ? `${target.provider}\u0000${target.model}` : null
+}
+
+function generationDefaultOptions(operation: api.GenerationOperation) {
+  const options: Array<{ label: string; value: string }> = []
+  for (const provider of providers.value) {
+    for (const model of provider.models || []) {
+      if ((model.type || 'llm') !== 'media_generation' || !model.generation?.operations?.[operation]) continue
+      options.push({
+        label: `${provider.name} / ${model.display_name || model.name}`,
+        value: `${provider.name}\u0000${model.name}`,
+      })
+    }
+  }
+  return options
+}
+
+function onGenerationDefaultUpdate(operation: api.GenerationOperation, value: string | null) {
+  if (!value) {
+    delete sysGenerationDefaults.value[operation]
+  } else {
+    const [provider, model] = value.split('\u0000')
+    sysGenerationDefaults.value[operation] = { provider, model }
+  }
+  markSysDirty()
+}
+
 async function loadSystemConfig() {
   try {
     const sc = await api.getSystemConfig()
@@ -391,6 +512,8 @@ async function loadSystemConfig() {
       video: routes?.video || defaultRecognitionRoute(),
       audio: routes?.audio || defaultRecognitionRoute(),
     }
+    sysGenerationDefaults.value = { ...(sc.generation?.defaults || {}) }
+    sysGenerationRequireConfirm.value = !!sc.generation?.require_confirm
     syncRecognitionSizeUnits()
     sysWorkMode.value = sc.work_mode?.default || 'coding'
     sysCloseBehavior.value = normalizeCloseBehavior(sc.ui?.close_behavior)
@@ -427,6 +550,14 @@ async function saveSystemConfig() {
     patch.work_mode = { default: sysWorkMode.value }
     patch.ui = { close_behavior: sysCloseBehavior.value }
     patch.recognition = { routes: sysRecognition.value }
+    const generationDefaults = Object.fromEntries(generationOperationDefs.map(({ operation }) => [
+      operation,
+      sysGenerationDefaults.value[operation] || { provider: '', model: '' },
+    ]))
+    patch.generation = {
+      defaults: generationDefaults,
+      require_confirm: sysGenerationRequireConfirm.value,
+    }
 
     const updated = await api.updateSystemConfig(patch)
     chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
@@ -440,6 +571,8 @@ async function saveSystemConfig() {
         .filter(kind => !!updated.recognition.routes[kind]?.available)
       chatState.visionRecognitionEnabled = chatState.recognitionCapabilitiesAvailable.includes('image')
     }
+    sysGenerationDefaults.value = { ...(updated.generation?.defaults || {}) }
+    sysGenerationRequireConfirm.value = !!updated.generation?.require_confirm
     sysDirty.value = false
     message.success('系统配置已保存')
   } catch (e: any) {
@@ -467,6 +600,8 @@ function resetSystemConfig() {
     audio: defaultRecognitionRoute(),
   }
   sysRecognitionSizeUnits.value = { image: 'MB', video: 'MB', audio: 'MB' }
+  sysGenerationDefaults.value = {}
+  sysGenerationRequireConfirm.value = false
   sysWorkMode.value = 'coding'
   sysCloseBehavior.value = 'exit'
   sysDirty.value = true
@@ -562,6 +697,7 @@ async function selectProvider(name: string) {
 function openAddProvider() {
   showAddProvider.value = true
   newName.value = ''
+  newVendor.value = ''
   newProtocol.value = 'openai'
   newBaseURL.value = ''
   newAPIKey.value = ''
@@ -573,6 +709,7 @@ function openAddProvider() {
 function cancelAddProvider() {
   showAddProvider.value = false
   newName.value = ''
+  newVendor.value = ''
   newBaseURL.value = ''
   newAPIKey.value = ''
   newModel.value = ''
@@ -626,6 +763,7 @@ function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   const src = p || providers.value.find(x => x.name === name)
   if (!src) return
   editName.value = src.name
+  editVendor.value = src.vendor || ''
   editProtocol.value = (src.protocol as 'openai' | 'anthropic') || 'openai'
   editBaseURL.value = src.base_url || ''
   editAPIKey.value = src.api_key || ''
@@ -642,14 +780,15 @@ function resetDirty() { dirty.value = new Set() }
 // --- Provider handlers ---
 
 async function onAddProvider() {
-  if (!newName.value.trim() || !newProtocol.value || !newModel.value.trim()) {
-    message.warning('名称、协议、模型为必填')
+  if (!newName.value.trim() || !newProtocol.value) {
+    message.warning('名称、协议为必填')
     return
   }
   try {
     const addedName = newName.value.trim()
     await api.addProvider({
       name: addedName,
+      vendor: newVendor.value,
       protocol: newProtocol.value,
       base_url: newBaseURL.value.trim(),
       api_key: newAPIKey.value.trim(),
@@ -691,6 +830,9 @@ async function onSaveProvider() {
   if (dirty.value.has('name') && editName.value.trim() && editName.value.trim() !== name) {
     body.name = editName.value.trim()
   }
+  if (dirty.value.has('vendor')) {
+    body.vendor = editVendor.value
+  }
   if (dirty.value.has('protocol')) {
     body.protocol = editProtocol.value
   }
@@ -727,6 +869,9 @@ function resetModelForm() {
   editModelCtx.value = null
   editModelOut.value = null
   editModelCapabilities.value = []
+  editModelType.value = 'llm'
+  editGenerationOperations.value = []
+  editGenerationConfigs.value = emptyGenerationConfigs()
 }
 
 function onShowAddModel() {
@@ -742,24 +887,32 @@ async function onAddModel() {
     return
   }
   const providerName = selected.value.name
+  if (editModelType.value === 'media_generation' && editGenerationOperations.value.length === 0) {
+    message.warning('媒体生成模型至少需要选择一种生成能力')
+    return
+  }
   try {
     await api.addModel(providerName, {
       name,
+      type: editModelType.value,
       display_name: editModelDisplay.value.trim() || undefined,
       max_tokens_context: editModelCtx.value ?? undefined,
       max_tokens_output: editModelOut.value ?? undefined,
+      generation: editModelType.value === 'media_generation' ? buildMediaGenerationConfig() : undefined,
     })
     // The capabilities block is a separate PATCH. Always send it so an
     // empty selection is persisted as an explicit text-only capability set.
-    try {
-      await api.setModelCapabilities(providerName, name, {
-        input_modalities: editModelCapabilities.value,
-        supports_vision: editModelCapabilities.value.includes('image'),
-        supports_audio: editModelCapabilities.value.includes('audio'),
-        context_window: editModelCtx.value ?? 0,
-      })
-    } catch (capErr: any) {
-      message.warning(`模型已添加, 但能力标记失败: ${capErr.message}`)
+    if (editModelType.value === 'llm') {
+      try {
+        await api.setModelCapabilities(providerName, name, {
+          input_modalities: editModelCapabilities.value,
+          supports_vision: editModelCapabilities.value.includes('image'),
+          supports_audio: editModelCapabilities.value.includes('audio'),
+          context_window: editModelCtx.value ?? 0,
+        })
+      } catch (capErr: any) {
+        message.warning(`模型已添加, 但能力标记失败: ${capErr.message}`)
+      }
     }
     message.success('已添加模型')
     resetModelForm()
@@ -782,6 +935,7 @@ function onEditModel(m: api.ModelInfo) {
   // and the submit button label.
   editingModelName.value = m.name
   editModelName.value = m.name
+  editModelType.value = m.type || 'llm'
   editModelDisplay.value = m.display_name || ''
   editModelCtx.value = m.max_tokens_context ?? null
   editModelOut.value = m.max_tokens_output ?? null
@@ -791,6 +945,14 @@ function onEditModel(m: api.ModelInfo) {
         ...(m.capabilities?.supports_vision ? ['image' as api.MediaKind] : []),
         ...(m.capabilities?.supports_audio ? ['audio' as api.MediaKind] : []),
       ]
+  editGenerationOperations.value = Object.keys(m.generation?.operations || {}) as api.GenerationOperation[]
+  editGenerationConfigs.value = emptyGenerationConfigs()
+  for (const operation of editGenerationOperations.value) {
+    editGenerationConfigs.value[operation] = {
+      ...editGenerationConfigs.value[operation],
+      ...(m.generation?.operations?.[operation] || {}),
+    }
+  }
   showAddModel.value = true
 }
 
@@ -798,6 +960,10 @@ async function onSaveModel() {
   if (!selected.value || !editingModelName.value) return
   const provider = selected.value.name
   const model = editingModelName.value
+  if (editModelType.value === 'media_generation' && editGenerationOperations.value.length === 0) {
+    message.warning('媒体生成模型至少需要选择一种生成能力')
+    return
+  }
   try {
     // updateModel semantics: 0 / "" in a numeric field means
     // "leave alone" (see internal/config/manager.go
@@ -807,16 +973,20 @@ async function onSaveModel() {
     const ctx = editModelCtx.value && editModelCtx.value > 0 ? editModelCtx.value : 0
     const out = editModelOut.value && editModelOut.value > 0 ? editModelOut.value : 0
     await api.updateModel(provider, model, {
+      type: editModelType.value,
       display_name: editModelDisplay.value,
       max_tokens_context: ctx,
       max_tokens_output: out,
+      generation: editModelType.value === 'media_generation' ? buildMediaGenerationConfig() : undefined,
     })
-    await api.setModelCapabilities(provider, model, {
-      input_modalities: editModelCapabilities.value,
-      supports_vision: editModelCapabilities.value.includes('image'),
-      supports_audio: editModelCapabilities.value.includes('audio'),
-      context_window: editModelCtx.value ?? 0,
-    })
+    if (editModelType.value === 'llm') {
+      await api.setModelCapabilities(provider, model, {
+        input_modalities: editModelCapabilities.value,
+        supports_vision: editModelCapabilities.value.includes('image'),
+        supports_audio: editModelCapabilities.value.includes('audio'),
+        context_window: editModelCtx.value ?? 0,
+      })
+    }
     message.success('已保存')
     resetModelForm()
     showAddModel.value = false
@@ -2054,6 +2224,16 @@ function kbModelSupportsVision(scanModel: string) {
                     <span class="settings-form-hint">OpenAI 兼容 / Anthropic / 自定义</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
+                    <label class="settings-form-label">厂商预设</label>
+                    <NSelect
+                      v-model:value="editVendor"
+                      :options="vendorOptions"
+                      size="small"
+                      @update:value="markDirty('vendor')"
+                    />
+                    <span class="settings-form-hint">用于填充媒体生成接口默认端点；仍可在每个媒体模型能力中单独覆盖。</span>
+                  </div>
+                  <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">Base URL</label>
                     <NInput
                       v-model:value="editBaseURL"
@@ -2079,7 +2259,7 @@ function kbModelSupportsVision(scanModel: string) {
                     <div class="settings-form-toggle">
                       <NSwitch
                         :value="editIsDefault"
-                        :disabled="selected.is_default"
+                        :disabled="selected.is_default || !selected.models?.some(model => (model.type || 'llm') === 'llm')"
                         @update:value="(v: boolean) => { editIsDefault = v; markDirty('is_default') }"
                       />
                       <label class="settings-form-label" for="provider-default-switch">设为默认提供商</label>
@@ -2114,10 +2294,20 @@ function kbModelSupportsVision(scanModel: string) {
                     <div class="model-card-main">
                       <div class="model-card-top">
                         <span class="model-card-name">{{ m.name }}</span>
+                        <NTag size="tiny" :bordered="false" :type="(m.type || 'llm') === 'media_generation' ? 'warning' : 'default'">
+                          {{ (m.type || 'llm') === 'media_generation' ? '媒体生成' : 'LLM' }}
+                        </NTag>
                         <NTag v-if="m.default" type="success" size="tiny" :bordered="false">默认</NTag>
-                        <NTag v-if="modelSupportsCapability(m, 'image')" size="tiny" :bordered="false" type="info">图片</NTag>
-                        <NTag v-if="modelSupportsCapability(m, 'video')" size="tiny" :bordered="false" type="warning">视频</NTag>
-                        <NTag v-if="modelSupportsCapability(m, 'audio')" size="tiny" :bordered="false" type="success">音频</NTag>
+                        <template v-if="(m.type || 'llm') === 'media_generation'">
+                          <NTag v-for="operation in Object.keys(m.generation?.operations || {})" :key="operation" size="tiny" :bordered="false" type="info">
+                            {{ generationOperationDefs.find(item => item.operation === operation)?.label || operation }}
+                          </NTag>
+                        </template>
+                        <template v-else>
+                          <NTag v-if="modelSupportsCapability(m, 'image')" size="tiny" :bordered="false" type="info">图片</NTag>
+                          <NTag v-if="modelSupportsCapability(m, 'video')" size="tiny" :bordered="false" type="warning">视频</NTag>
+                          <NTag v-if="modelSupportsCapability(m, 'audio')" size="tiny" :bordered="false" type="success">音频</NTag>
+                        </template>
                       </div>
                       <div class="model-card-meta" v-if="m.display_name || m.max_tokens_context || m.max_tokens_output">
                         <span v-if="m.display_name" class="model-meta-item">{{ m.display_name }}</span>
@@ -2127,6 +2317,7 @@ function kbModelSupportsVision(scanModel: string) {
                     </div>
                     <div class="model-card-actions">
                       <NButton
+                        v-if="(m.type || 'llm') === 'llm'"
                         :data-testid="`test-model-${m.name}`"
                         size="tiny"
                         quaternary
@@ -2142,7 +2333,7 @@ function kbModelSupportsVision(scanModel: string) {
                       <NButton size="tiny" quaternary @click="onEditModel(m)" title="编辑" aria-label="编辑">
                         <Pencil :size="12" />
                       </NButton>
-                      <NButton v-if="!m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认" aria-label="设为默认">
+                      <NButton v-if="(m.type || 'llm') === 'llm' && !m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认" aria-label="设为默认">
                         <Star :size="12" />
                       </NButton>
                       <NPopconfirm @positive-click="onDeleteModel(m.name)" positive-text="删除" negative-text="取消">
@@ -2186,6 +2377,11 @@ function kbModelSupportsVision(scanModel: string) {
               />
             </div>
             <div class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">厂商预设</label>
+              <NSelect :value="newVendor" :options="vendorOptions" size="small" @update:value="onNewVendorUpdate" />
+              <span class="settings-form-hint">火山、MiniMax、OpenAI 会自动带出推荐 Base URL 和媒体端点，也可保持自定义。</span>
+            </div>
+            <div class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">Base URL</label>
               <NInput
                 v-model:value="newBaseURL"
@@ -2205,7 +2401,7 @@ function kbModelSupportsVision(scanModel: string) {
               />
             </div>
             <div class="settings-form-row settings-form-row--span2">
-              <label class="settings-form-label">默认模型 <span class="settings-required">*</span></label>
+              <label class="settings-form-label">默认对话模型</label>
               <div class="model-pick-row">
                 <NSelect
                   v-model:value="newModel"
@@ -2228,7 +2424,7 @@ function kbModelSupportsVision(scanModel: string) {
                 </NButton>
               </div>
               <span v-if="probeModelsError" class="settings-form-hint settings-form-hint--error">{{ probeModelsError }}</span>
-              <span v-else class="settings-form-hint">先填 API Key，再点「加载模型」从上游 /models 拉取；也可直接输入</span>
+              <span v-else class="settings-form-hint">可选。纯媒体供应商可先创建，再添加“媒体生成模型”。</span>
             </div>
           </div>
           <template #footer>
@@ -2266,7 +2462,16 @@ function kbModelSupportsVision(scanModel: string) {
               <label class="settings-form-label">显示名</label>
               <NInput v-model:value="editModelDisplay" placeholder="例: GPT-4o mini" size="small" />
             </div>
-            <div class="settings-form-row">
+            <div class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">模型类型</label>
+              <NRadioGroup v-model:value="editModelType" size="small" :disabled="!!editingModelName">
+                <NRadioButton v-for="option in modelTypeOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </NRadioButton>
+              </NRadioGroup>
+              <span class="settings-form-hint">{{ editingModelName ? '模型类型创建后不可更改。' : '同一供应商和 API Key 可同时配置对话模型与媒体生成模型。' }}</span>
+            </div>
+            <div v-if="editModelType === 'llm'" class="settings-form-row">
               <label class="settings-form-label">上下文 (tokens)</label>
               <div class="model-context-control">
                 <NSelect
@@ -2286,11 +2491,11 @@ function kbModelSupportsVision(scanModel: string) {
                 />
               </div>
             </div>
-            <div class="settings-form-row">
+            <div v-if="editModelType === 'llm'" class="settings-form-row">
               <label class="settings-form-label">最大输出 (tokens)</label>
               <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="4096" size="small" class="model-num-input" />
             </div>
-            <div class="settings-form-row settings-form-row--span2">
+            <div v-if="editModelType === 'llm'" class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">能力配置</label>
               <NSelect
                 v-model:value="editModelCapabilities"
@@ -2301,6 +2506,44 @@ function kbModelSupportsVision(scanModel: string) {
                 size="small"
               />
               <span class="settings-form-hint">支持多选；旧版“视觉输入”开启的模型会自动选中图片识别。</span>
+            </div>
+            <div v-else class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">生成能力 <span class="settings-required">*</span></label>
+              <NSelect
+                :value="editGenerationOperations"
+                :options="generationOperationOptions"
+                multiple
+                clearable
+                placeholder="选择该模型支持的转换能力"
+                size="small"
+                @update:value="onGenerationOperationsUpdate"
+              />
+              <span class="settings-form-hint">能力决定会话中可开启哪些工具；每个能力的 API 端点互相独立。</span>
+            </div>
+            <div
+              v-for="operation in editGenerationOperations"
+              v-if="editModelType === 'media_generation'"
+              :key="operation"
+              class="settings-form-row settings-form-row--span2 generation-operation-editor"
+            >
+              <div class="generation-operation-title">
+                <strong>{{ generationOperationDefs.find(item => item.operation === operation)?.label || operation }}</strong>
+                <span>{{ generationOperationDefs.find(item => item.operation === operation)?.hint }}</span>
+              </div>
+              <div class="generation-operation-fields">
+                <label>
+                  <span>创建端点</span>
+                  <NInput v-model:value="editGenerationConfigs[operation].endpoint" size="small" placeholder="相对 Base URL 或完整 URL" />
+                </label>
+                <label>
+                  <span>查询端点（异步时）</span>
+                  <NInput v-model:value="editGenerationConfigs[operation].query_endpoint" size="small" placeholder="可使用 {task_id}" />
+                </label>
+                <label>
+                  <span>超时（秒）</span>
+                  <NInputNumber v-model:value="editGenerationConfigs[operation].timeout_seconds" :min="5" :step="5" size="small" />
+                </label>
+              </div>
             </div>
           </div>
           <template #footer>
@@ -2502,6 +2745,30 @@ function kbModelSupportsVision(scanModel: string) {
                       <span v-if="sysRecognition[capability.kind].enabled && (!sysRecognition[capability.kind].provider || !sysRecognition[capability.kind].model)" class="settings-form-hint settings-form-hint--error">
                         尚未完整配置，当前能力不可用。
                       </span>
+                    </section>
+                  </div>
+                </NCollapseItem>
+
+                <NCollapseItem title="媒体生成" name="generation">
+                  <p class="settings-section-description">
+                    为每种生成能力选择应用级默认模型。会话可单独覆盖模型；未配置默认模型的能力仍可在会话里选择其他兼容模型。
+                  </p>
+                  <div class="generation-default-list">
+                    <section v-for="item in generationOperationDefs" :key="item.operation" class="generation-default-row">
+                      <div class="generation-default-copy">
+                        <strong>{{ item.label }}</strong>
+                        <span>{{ item.hint }}</span>
+                      </div>
+                      <NSelect
+                        :value="generationTargetKey(sysGenerationDefaults[item.operation])"
+                        :options="generationDefaultOptions(item.operation)"
+                        clearable
+                        filterable
+                        size="small"
+                        placeholder="不设默认"
+                        :disabled="!generationDefaultOptions(item.operation).length"
+                        @update:value="value => onGenerationDefaultUpdate(item.operation, value)"
+                      />
                     </section>
                   </div>
                 </NCollapseItem>
@@ -4037,6 +4304,36 @@ function kbModelSupportsVision(scanModel: string) {
   flex: 1;
   min-width: 0;
 }
+.generation-operation-editor {
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.generation-operation-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.generation-operation-title strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.generation-operation-title span,
+.generation-operation-fields label > span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.generation-operation-fields {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(160px, 1fr) 100px;
+  gap: var(--space-2);
+}
+.generation-operation-fields label {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
 .modal-lead {
   margin: 0 0 14px;
   font-size: 12.5px;
@@ -5050,6 +5347,33 @@ code {
   font-size: 11px;
   line-height: 1.2;
 }
+.generation-default-list {
+  display: grid;
+  gap: var(--space-1);
+}
+.generation-default-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(240px, 1.5fr);
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.generation-default-row:first-child {
+  border-top: 0;
+}
+.generation-default-copy {
+  display: grid;
+  gap: 2px;
+}
+.generation-default-copy strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.generation-default-copy span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
 .media-size-input {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 68px;
@@ -5063,6 +5387,10 @@ code {
 @media (max-width: 760px) {
   .recognition-route-fields {
     grid-template-columns: 1fr 1fr;
+  }
+  .generation-default-row,
+  .generation-operation-fields {
+    grid-template-columns: 1fr;
   }
 }
 

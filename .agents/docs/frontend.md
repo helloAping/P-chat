@@ -349,6 +349,20 @@ flag + `source` 路径）。`GET /api/v1/tools` 同时返回 `diagnostics[]`，
 compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
 重复模式实现无缝滚动，无 `background-position` 动画（见 §8.4 例外）。
 
+### 13. 媒体生成配置与结果展示
+
+`AppSettingsModal.vue` 在 Provider 下支持厂商 preset 和 `llm/media_generation` 模型类型；
+媒体模型编辑器按 operation 保存独立端点。系统页“媒体生成”按能力选择应用默认模型。
+`ModelPicker.vue` 和 store 的聊天默认回退只显示 `llm` 模型。
+
+`InputArea.vue` 的会话设置按文生图、图生图、文生视频等 operation 独立开关，并可覆盖
+每项能力的模型。关闭后不仅从 schema 隐藏，服务端工具入口也返回 `blocked`；前端工具卡
+显示“已关闭”。提示词可选择“允许提示词增强”或“不做二次增强”。
+
+`ToolCallCard.vue` 解析 `generate_*` 的结构化结果，并用 `<img>`、`<video controls>`、
+`<audio controls>` 展示同源 `/api/v1/generated/:id`，同时提供下载链接。工具结果仍作为
+普通 part 持久化，因此重载无需新的消息类型。
+
 ## 修改指南
 
 ### 要添加新的 SSE 事件类型

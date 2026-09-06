@@ -11,7 +11,7 @@ import (
 // toolStatusFromChunkStep was the server-side mirror of
 // internal/agent.toolStatusFromStep. Removed in T06 — both
 // the parts accumulator and the wire mapper now call
-// agent.ToolStatusFromStep so the two stay in lockstep.
+// agent.ToolStatusFromResult so the two stay in lockstep.
 
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {
 	ev := StreamEvent{
@@ -115,7 +115,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		// status name can't accidentally match. See
 		// internal/agent/parts.go::ToolStatusFromStep for the
 		// single source of truth.
-		ev.ToolStatus = agent.ToolStatusFromStep(chunk.Step, chunk.ToolError)
+		ev.ToolStatus = agent.ToolStatusFromResult(chunk.ToolCallStatus, chunk.Step, chunk.ToolError)
 		return ev
 	}
 	if chunk.Thinking != "" {

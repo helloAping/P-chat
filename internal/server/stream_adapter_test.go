@@ -57,6 +57,15 @@ func TestChunkToEvent(t *testing.T) {
 			t.Fatalf("structured tool event = %#v", ev)
 		}
 	})
+	t.Run("blocked tool", func(t *testing.T) {
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			Phase: "tool", Step: "call-1-warn", ToolName: "generate_video",
+			ToolCallStatus: "blocked", ToolError: "tool returned error", ToolResult: "已在当前会话关闭",
+		}, "cs", "gpt-4o")
+		if ev.ToolStatus != "blocked" || ev.ToolCallStatus != "blocked" {
+			t.Fatalf("blocked tool event = %#v", ev)
+		}
+	})
 	t.Run("skill", func(t *testing.T) {
 		ev := chunkToEvent(agent.ChatStreamChunk{
 			SkillName: "lark-doc", SkillStatus: "ready", SkillScope: "global_managed",

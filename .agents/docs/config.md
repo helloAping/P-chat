@@ -34,6 +34,7 @@ type Config struct {
     SubAgent SubAgentConfig // 子代理超时/工具过滤
     WorkMode WorkModeConfig // 默认工作侧重点：coding / daily
     Recognition RecognitionConfig // 图片/视频/音频外接识别路由
+    Generation GenerationConfig // 媒体生成的应用级默认模型
     Vision VisionRecognitionConfig // 旧版图片识别配置（兼容读取）
 }
 ```
@@ -43,6 +44,8 @@ LLMConfig 核心字段：
 - `Providers[]` — 每个 provider 的端点、API key、模型列表
 - `Protocol` — "openai" | "anthropic"
 - `Models[]` — 每个模型的能力标记；`capabilities.input_modalities` 可显式配置 `image`、`video`、`audio`，旧版 `supports_vision` / `supports_audio` 仅作兼容回退
+- `Provider.Vendor` — `volcengine` / `minimax` / `openai` / `custom` 等厂商 preset；凭据仍由 Provider 共享
+- `Model.Type` — `llm`（缺省兼容值）或 `media_generation`
 
 ### 3. 项目级配置合并
 
@@ -79,7 +82,19 @@ LLMConfig 核心字段：
 
 `media_recognize` 是模型可见的统一入口：根据上传引用解析图片、音频或视频，并按媒体类型选择配置路由；图片在没有独立路由时仍可 fallback 到当前视觉模型。旧名 `image_recognize` 只作为隐藏兼容别名存在。
 
-### 7. SubAgentConfig
+### 7. GenerationConfig
+
+媒体生成配置定义在 `generation.go`。媒体模型通过
+`generation.operations` 显式声明规范能力；每项能力有独立的 `endpoint`、
+`query_endpoint`、`timeout_seconds` 和 `default_params`。Volcengine、MiniMax、
+OpenAI 有可编辑的默认端点，用户配置始终优先。
+
+顶层 `generation.defaults` 按 operation 选择应用默认 Provider/Model；会话的
+`enabled_generation_operations` 和 `generation_model_overrides` 存在
+`conversations.metadata`。能力默认关闭。完整结构与运行边界见
+[媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
+
+### 8. SubAgentConfig
 
 `subagent` 控制 `task` 子代理：
 - `cache_ttl` / `timeout` — 子代理缓存和显式 wall-clock 超时策略。
