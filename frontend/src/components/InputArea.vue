@@ -1322,7 +1322,7 @@ const imageRecognitionEnabled = computed(() => enabledRecognitionCapabilities.va
 const recognitionCapabilityLabel = computed(() => {
   if (!state.recognitionCapabilitiesAvailable.length) return '不可用'
   if (!enabledRecognitionCapabilities.value.length) return '关闭'
-  return enabledRecognitionCapabilities.value.map(kind => recognitionLabels[kind]).join('/')
+  return '已启用'
 })
 
 async function onRecognitionCapabilitiesPick(value: api.MediaKind[]) {
@@ -1413,8 +1413,7 @@ const generationCapabilityLabel = computed(() => {
   if (generationOptionsLoading.value) return '加载中'
   if (!generationOptions.value.some(item => item.available)) return '不可用'
   if (!enabledGenerationOperations.value.length) return '关闭'
-  const labels = enabledGenerationOperations.value.map(operation => generationLabels[operation])
-  return labels.length > 2 ? `${labels.slice(0, 2).join('/')}等${labels.length}项` : labels.join('/')
+  return '已启用'
 })
 
 function syncGenerationSession(resp: api.UpdateSessionMetaResponse) {
@@ -2242,9 +2241,12 @@ watch([() => state.currentID, queueSignature], () => {
               </div>
             </div>
 
-            <div class="session-config-row session-config-row--span2 session-config-row--media-recognition">
+            <div class="session-config-row">
               <div class="session-config-label">
                 <span>媒体识别</span>
+                <span v-if="enabledRecognitionCapabilities.length" class="session-config-count">
+                  {{ enabledRecognitionCapabilities.length }} 项
+                </span>
                 <NPopover
                   trigger="hover"
                   placement="top"
@@ -2268,7 +2270,7 @@ watch([() => state.currentID, queueSignature], () => {
                   </div>
                 </NPopover>
               </div>
-              <div class="session-config-options session-config-options--select">
+              <div class="session-config-options session-config-options--stacked">
                 <NDropdown
                   trigger="click"
                   placement="bottom-start"
@@ -2278,7 +2280,7 @@ watch([() => state.currentID, queueSignature], () => {
                 >
                   <button
                     type="button"
-                    class="opt-pick opt-pick--wide"
+                    class="opt-pick"
                     data-testid="session-recognition-dropdown"
                     :disabled="!state.recognitionCapabilitiesAvailable.length"
                     :title="`当前媒体识别能力：${recognitionCapabilityLabel}`"
@@ -2294,9 +2296,12 @@ watch([() => state.currentID, queueSignature], () => {
               </div>
             </div>
 
-            <div class="session-config-row session-config-row--span2">
+            <div class="session-config-row">
               <div class="session-config-label">
                 <span>媒体生成</span>
+                <span v-if="enabledGenerationOperations.length" class="session-config-count">
+                  {{ enabledGenerationOperations.length }} 项
+                </span>
                 <NPopover
                   trigger="hover"
                   placement="top"
@@ -2326,7 +2331,7 @@ watch([() => state.currentID, queueSignature], () => {
                 >
                   <button
                     type="button"
-                    class="opt-pick opt-pick--wide"
+                    class="opt-pick"
                     data-testid="session-generation-dropdown"
                     :disabled="generationOptionsLoading || !generationOptions.some(item => item.available)"
                     :title="`当前媒体生成能力：${generationCapabilityLabel}`"
@@ -3175,12 +3180,24 @@ watch([() => state.currentID, queueSignature], () => {
   flex-wrap: nowrap;
   align-items: flex-start;
 }
-.session-config-row--media-recognition .session-config-options--select {
-  width: 100%;
-}
 .generation-session-options {
   width: 100%;
   gap: var(--space-2);
+}
+.session-config-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(var(--space-4) + var(--space-1));
+  padding: 0 var(--space-1);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
 }
 .opt-pick {
   display: inline-flex;
@@ -3200,9 +3217,6 @@ watch([() => state.currentID, queueSignature], () => {
   font-weight: 500;
   cursor: pointer;
   transition: var(--transition-colors);
-}
-.opt-pick--wide {
-  width: 100%;
 }
 .opt-pick:hover {
   background: var(--surface-3);

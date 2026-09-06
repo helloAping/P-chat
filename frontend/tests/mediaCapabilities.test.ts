@@ -36,12 +36,14 @@ test('media generation uses app defaults with per-session hard switches', () => 
   assert.doesNotMatch(input, /generation_model_overrides|generation_prompt_assist|能力路由|提示词处理/)
 })
 
-test('session media multi-selects reuse the compact dropdown control', () => {
+test('session media multi-selects share one compact grid row and show counts by their labels', () => {
   assert.match(input, /session-config-options--stacked \{[\s\S]*?flex-wrap: nowrap/)
-  assert.match(input, /session-config-row--span2 session-config-row--media-recognition[\s\S]*?<span>媒体识别<\/span>/)
+  assert.match(input, /<span>媒体识别<\/span>\s*<span v-if="enabledRecognitionCapabilities\.length" class="session-config-count">/)
+  assert.match(input, /<span>媒体生成<\/span>\s*<span v-if="enabledGenerationOperations\.length" class="session-config-count">/)
   assert.match(input, /data-testid="session-recognition-dropdown"[\s\S]*?opt-pick-label/)
   assert.match(input, /data-testid="session-generation-dropdown"[\s\S]*?opt-pick-label/)
-  assert.match(input, /\.opt-pick--wide \{\s*width: 100%/)
+  assert.doesNotMatch(input, /session-config-row--media-recognition|opt-pick--wide/)
+  assert.match(input, /\.session-config-count \{[\s\S]*?border-radius: var\(--radius-pill\)/)
 })
 
 test('media limit editor supports readable units without changing the byte API', () => {
