@@ -131,11 +131,10 @@ type installSkillRequest struct {
 	ProjectPath string `json:"project_path,omitempty"`
 	SessionID   string `json:"session_id,omitempty"`
 	SourcePath  string `json:"source_path,omitempty"`
-	SourceCLI   string `json:"source_cli,omitempty"`
 }
 
-// InstallSkill 处理远程、本地或受支持 CLI 的 Skill 安装请求。
-// InstallSkill handles remote, local, or supported-CLI Skill installation requests.
+// InstallSkill 处理远程包或本地包/集合目录的 Skill 安装请求。
+// InstallSkill handles remote packages or local package/collection directories.
 func (h *Handler) InstallSkill(c *gin.Context) {
 	var req installSkillRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -145,15 +144,14 @@ func (h *Handler) InstallSkill(c *gin.Context) {
 	req.Name = strings.TrimSpace(req.Name)
 	req.URL = strings.TrimSpace(req.URL)
 	req.SourcePath = strings.TrimSpace(req.SourcePath)
-	req.SourceCLI = strings.TrimSpace(req.SourceCLI)
 	sourceCount := 0
-	for _, source := range []string{req.URL, req.SourcePath, req.SourceCLI} {
+	for _, source := range []string{req.URL, req.SourcePath} {
 		if source != "" {
 			sourceCount++
 		}
 	}
 	if sourceCount != 1 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly one of url, source_path, or source_cli is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly one of url or source_path is required"})
 		return
 	}
 	name := req.Name
@@ -184,10 +182,10 @@ func (h *Handler) InstallSkill(c *gin.Context) {
 	if req.SourcePath != "" {
 		change.Action = skill.ChangeImport
 		change.SourcePath = req.SourcePath
+		change.Name = req.Name
 	} else {
 		change.Action = skill.ChangeInstall
 		change.SourceURL = req.URL
-		change.SourceCLI = req.SourceCLI
 	}
 	result, err := skill.NewManager().Apply(c.Request.Context(), change)
 	if err != nil {
@@ -199,7 +197,8 @@ func (h *Handler) InstallSkill(c *gin.Context) {
 	}
 	c.JSON(http.StatusCreated, gin.H{
 		"ok": result.Ready, "ready": result.Ready, "name": result.Name,
-		"path": result.Directory, "installed": result.Installed, "diagnostics": result.Diagnostics,
+		"path": result.Directory, "installed": result.Installed, "rolled_back": result.RolledBack,
+		"diagnostics": result.Diagnostics,
 	})
 }
 

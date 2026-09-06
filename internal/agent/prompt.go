@@ -467,8 +467,8 @@ func buildHostRuntimeBlock(projectRoot string) string {
 		fmt.Fprintf(&builder, "Standard project Skills (auto-discovered): `%s`\n", filepath.Join(projectRoot, ".agents", "skills"))
 	}
 	builder.WriteString("Use `skill_manage` for managed imports/removals and `skill` for list/load/read_resource/doctor. ")
-	builder.WriteString("After installing `lark-cli`, call `skill_manage` with action `install` and source_cli `lark-cli`; omit name to import all embedded lark-* Skills, or provide one name to import it with declared dependencies. ")
-	builder.WriteString("A CLI package being installed is not proof that its Skills are available: report success only after `skill` action `doctor` or `list` sees the expected Skill and its dependencies.\n")
+	builder.WriteString("When an external CLI or tool provides Skills, first let it export complete Skill packages into a standard `.agents/skills` directory; otherwise import its exported package or collection directory with `skill_manage` action `import` and `source_path`. Omit `name` to import the whole collection, or provide a name to import that Skill with dependencies declared inside the same collection. ")
+	builder.WriteString("Installing an external executable is not proof that its Skills are available: report success only after `skill` action `doctor` or `list` sees the expected Skill and its dependencies.\n")
 	return builder.String()
 }
 

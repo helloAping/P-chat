@@ -20,7 +20,6 @@ type skillManageArgs struct {
 	Name       string `json:"name,omitempty"`
 	SourcePath string `json:"source_path,omitempty"`
 	SourceURL  string `json:"source_url,omitempty"`
-	SourceCLI  string `json:"source_cli,omitempty"`
 	Scope      string `json:"scope,omitempty"`
 }
 
@@ -46,13 +45,12 @@ func RegisterSkillTools(registry *Registry, manager skill.Manager) {
 
 	registry.Register(Tool{
 		Name:        "skill_manage",
-		Description: "Install complete Skill packages from GitHub or an installed lark-cli, import local packages, or remove managed packages. This changes installed capabilities and requires user confirmation.",
+		Description: "Install complete Skill packages from GitHub, import a local Skill package or collection directory exported by any external tool, or remove managed packages. This changes installed capabilities and requires user confirmation.",
 		Parameters: ObjectSchema(map[string]any{
 			"action":      StringEnumProp("Management operation", "install", "import", "remove"),
-			"name":        StringProp("Skill name; required for remove, optional with source_cli to install every exposed Skill"),
-			"source_path": StringProp("Local directory containing SKILL.md; required for import"),
+			"name":        StringProp("Skill name; required for remove, optional for collection import to select it and its declared dependencies"),
+			"source_path": StringProp("Local Skill package directory or collection directory; required for import"),
 			"source_url":  StringProp("HTTPS GitHub repository or Skill directory URL; required for install"),
-			"source_cli":  StringEnumProp("Installed CLI exposing embedded Skills", "lark-cli"),
 			"scope":       StringEnumProp("Install scope (default global)", "global", "project"),
 		}, []string{"action"}),
 	}, makeSkillManageHandler(manager))
@@ -142,14 +140,11 @@ func makeSkillManageHandler(manager skill.Manager) ToolHandler {
 		request := skill.ChangeRequest{Scope: scope, ProjectRoot: projectRootFromCtx(ctx)}
 		switch strings.ToLower(strings.TrimSpace(args.Action)) {
 		case "install":
-			hasURL := strings.TrimSpace(args.SourceURL) != ""
-			hasCLI := strings.TrimSpace(args.SourceCLI) != ""
-			if hasURL == hasCLI {
-				return skillToolError("exactly one of source_url or source_cli is required for install"), nil
+			if strings.TrimSpace(args.SourceURL) == "" {
+				return skillToolError("source_url is required for install"), nil
 			}
 			request.Action = skill.ChangeInstall
 			request.SourceURL = args.SourceURL
-			request.SourceCLI = args.SourceCLI
 			request.Name = args.Name
 		case "import":
 			if strings.TrimSpace(args.SourcePath) == "" {
@@ -157,6 +152,7 @@ func makeSkillManageHandler(manager skill.Manager) ToolHandler {
 			}
 			request.Action = skill.ChangeImport
 			request.SourcePath = args.SourcePath
+			request.Name = args.Name
 		case "remove":
 			request.Action = skill.ChangeRemove
 			request.Name = args.Name
@@ -171,8 +167,8 @@ func makeSkillManageHandler(manager skill.Manager) ToolHandler {
 		summary := fmt.Sprintf("Skill %s %s and verified", result.Name, args.Action)
 		changedPaths := []string{result.Directory}
 		if !result.Ready && request.Action != skill.ChangeRemove {
-			if strings.TrimSpace(request.SourceCLI) != "" {
-				summary = fmt.Sprintf("Skill %s failed verification and the CLI install was rolled back; inspect diagnostics", result.Name)
+			if result.RolledBack {
+				summary = fmt.Sprintf("Skill %s failed verification and the import was rolled back; inspect diagnostics", result.Name)
 				changedPaths = nil
 			} else {
 				summary = fmt.Sprintf("Skill %s was copied but is not ready; inspect diagnostics", result.Name)

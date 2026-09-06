@@ -67,23 +67,23 @@ func callTool(t *testing.T, registry *Registry, name string, args any) *CallResu
 
 func TestRegisterSkillToolsLoadsWithStructuredInvocation(t *testing.T) {
 	managed := t.TempDir()
-	writeToolTestSkill(t, managed, "lark-doc", "DOC INSTRUCTIONS")
+	writeToolTestSkill(t, managed, "docs-tool", "DOC INSTRUCTIONS")
 	manager := skill.NewFSManager(skill.ManagerOptions{GlobalManagedDir: managed, UserStandardDir: filepath.Join(t.TempDir(), "standard")})
 	registry := NewRegistry()
 	RegisterSkillTools(registry, manager)
 
-	result := callTool(t, registry, "skill", map[string]any{"action": "load", "name": "lark-doc"})
+	result := callTool(t, registry, "skill", map[string]any{"action": "load", "name": "docs-tool"})
 	if result.IsError || result.SkillInvocation == nil {
 		t.Fatalf("result = %+v", result)
 	}
-	if result.SkillInvocation.Name != "lark-doc" || result.SkillInvocation.Status != "ready" {
+	if result.SkillInvocation.Name != "docs-tool" || result.SkillInvocation.Status != "ready" {
 		t.Fatalf("invocation = %+v", result.SkillInvocation)
 	}
 	if !strings.Contains(result.Content, "DOC INSTRUCTIONS") {
 		t.Fatalf("content = %q", result.Content)
 	}
 
-	resource := callTool(t, registry, "skill", map[string]any{"action": "read_resource", "name": "lark-doc", "resource": "references/guide.md"})
+	resource := callTool(t, registry, "skill", map[string]any{"action": "read_resource", "name": "docs-tool", "resource": "references/guide.md"})
 	if resource.Content != "GUIDE" || resource.SkillInvocation != nil {
 		t.Fatalf("resource result = %+v", resource)
 	}
@@ -108,47 +108,47 @@ func TestRegisterSkillToolsKeepsManagementInOneTool(t *testing.T) {
 	}
 }
 
-func TestSkillManageInstallsFromLarkCLIThroughManager(t *testing.T) {
+func TestSkillManageImportsNamedSkillFromCollectionThroughManager(t *testing.T) {
 	manager := &capturingSkillManager{}
 	registry := NewRegistry()
 	RegisterSkillTools(registry, manager)
 
 	result := callTool(t, registry, "skill_manage", map[string]any{
-		"action": "install", "source_cli": "lark-cli", "name": "lark-doc", "scope": "global",
+		"action": "import", "source_path": "C:/exports/vendor-skills", "name": "docs-tool", "scope": "global",
 	})
 	if result.IsError {
 		t.Fatalf("result = %+v", result)
 	}
-	if manager.change.Action != skill.ChangeInstall || manager.change.SourceCLI != "lark-cli" || manager.change.Name != "lark-doc" {
+	if manager.change.Action != skill.ChangeImport || manager.change.SourcePath != "C:/exports/vendor-skills" || manager.change.Name != "docs-tool" {
 		t.Fatalf("change = %+v", manager.change)
 	}
 }
 
-func TestSkillManageRejectsAmbiguousInstallSources(t *testing.T) {
+func TestSkillManageRequiresURLForInstall(t *testing.T) {
 	manager := &capturingSkillManager{}
 	registry := NewRegistry()
 	RegisterSkillTools(registry, manager)
 
 	result := callTool(t, registry, "skill_manage", map[string]any{
-		"action": "install", "source_cli": "lark-cli", "source_url": "larksuite/cli",
+		"action": "install",
 	})
-	if !result.IsError || !strings.Contains(result.Content, "exactly one") {
-		t.Fatalf("result = %+v, want ambiguous source error", result)
+	if !result.IsError || !strings.Contains(result.Content, "source_url is required") {
+		t.Fatalf("result = %+v, want missing source URL error", result)
 	}
 	if manager.change.Action != "" {
-		t.Fatalf("manager must not run for ambiguous sources: %+v", manager.change)
+		t.Fatalf("manager must not run without a source URL: %+v", manager.change)
 	}
 }
 
-func TestSkillManageReportsCLIVerificationRollback(t *testing.T) {
+func TestSkillManageReportsCollectionImportRollback(t *testing.T) {
 	manager := &capturingSkillManager{result: &skill.ChangeResult{
-		Name: "lark-doc", Scope: skill.ScopeGlobalManaged, Directory: "skills/lark-doc", Ready: false,
+		Name: "docs-tool", Scope: skill.ScopeGlobalManaged, Directory: "skills", Ready: false, RolledBack: true,
 	}}
 	registry := NewRegistry()
 	RegisterSkillTools(registry, manager)
 
 	result := callTool(t, registry, "skill_manage", map[string]any{
-		"action": "install", "source_cli": "lark-cli", "name": "lark-doc",
+		"action": "import", "source_path": "C:/exports/vendor-skills", "name": "docs-tool",
 	})
 	if !result.IsError || !strings.Contains(result.Summary, "rolled back") || len(result.ChangedPaths) != 0 {
 		t.Fatalf("result = %+v, want explicit rollback without changed paths", result)

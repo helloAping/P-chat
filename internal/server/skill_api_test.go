@@ -48,7 +48,7 @@ func TestListSkillsUsesSessionProjectRoot(t *testing.T) {
 }
 
 func TestInstallSkillRejectsAmbiguousSources(t *testing.T) {
-	body := []byte(`{"name":"lark-doc","url":"larksuite/cli","source_cli":"lark-cli"}`)
+	body := []byte(`{"name":"docs-tool","url":"https://github.com/example/skills","source_path":"C:/exports/skills"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/install", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -64,7 +64,7 @@ func TestInstallSkillRejectsAmbiguousSources(t *testing.T) {
 }
 
 func TestInstallSkillTrimsSourcesBeforeDispatch(t *testing.T) {
-	body := []byte(`{"name":"lark-doc","url":"https://example.com/skill","source_path":"   "}`)
+	body := []byte(`{"name":"docs-tool","url":"https://example.com/skill","source_path":"   "}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills/install", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

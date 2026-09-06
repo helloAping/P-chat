@@ -7,7 +7,7 @@ Skill 必须是一份可被发现、完整安装、按需加载、可诊断、�
 
 完成态需满足：
 
-1. 飞书 CLI 或其他安装器写入标准目录后，新会话可直接发现相应 Skill。
+1. 任意外部 CLI 或安装器写入标准目录后，新会话可直接发现相应 Skill。
 2. P-Chat 安装 Skill 时保留 `SKILL.md`、`references/`、`scripts/`、`assets/` 等完整目录。
 3. 项目 Skill 覆盖用户级 Skill；来源与覆盖关系可查询，不依赖服务进程重启。
 4. 静态提示词只包含 Skill 名称、说明和来源；正文仅在显式激活或 `skill(load)` 时加载。
@@ -66,8 +66,8 @@ type Manager interface {
 显式斜杠命令和模型自主调用进入同一条加载路径：
 
 ```text
-请求 active_skills=["lark-doc"]
-  -> emit skill(start): 当前调用 Skill：lark-doc
+请求 active_skills=["docs-tool"]
+  -> emit skill(start): 当前调用 Skill：docs-tool
   -> Manager.Load + 依赖校验
   -> emit skill(ready|error)
   -> ready 后才把正文加入 LLM 上下文
@@ -80,11 +80,11 @@ SSE 事件：
 ```json
 {
   "type": "skill",
-  "skill_name": "lark-doc",
+  "skill_name": "docs-tool",
   "skill_status": "start|ready|error",
   "skill_scope": "project_managed|project_standard|global_managed|user_standard",
   "skill_source": ".../SKILL.md",
-  "skill_dependencies": ["lark-shared"],
+  "skill_dependencies": ["shared-auth"],
   "skill_error": ""
 }
 ```
@@ -92,25 +92,22 @@ SSE 事件：
 Assistant `parts` 新增 `kind: "skill"` 并随消息元数据持久化。GUI 与 CLI 均渲染
 `当前调用 Skill：<name>`；历史回看仍可见。结构化事件是真源，不要求模型自己复述。
 
-## 6. 飞书 CLI 完成判定
+## 6. 外部能力提供方完成判定
 
-飞书链路应按下面的事务语义执行：
+外部 CLI/工具仅作为 Skill 包的生产者，统一按下面的契约接入：
 
-1. 安装并验证 `lark-cli --version`。
-2. 用 `skill_manage(action=install, source_cli=lark-cli)` 读取 CLI 内嵌目录，将全部 `lark-*`
-   发布到用户级目录；指定单个名称时自动补齐声明依赖。
-3. 校验 frontmatter 声明、依赖 Skill、所需二进制和包内资源。
-4. 重新扫描后确认目标 Skill 出现在生效目录。
+1. 外部工具把完整 Skill 包导出到标准 `.agents/skills/<name>/`，或一个可定位的私有目录。
+2. 标准目录由 P-Chat 直接发现；私有目录通过
+   `skill_manage(action=import, source_path=<导出目录>)` 导入。
+3. `source_path` 指向含 `SKILL.md` 的目录时按单包处理；否则按集合处理，每个直接子目录为
+   一个 Skill 包。集合省略 `name` 时导入全部，指定名称时自动补齐集合内声明依赖。
+4. 校验 frontmatter、依赖 Skill、所需二进制和包内资源，重新扫描后确认目标包生效。
 5. doctor 无阻断错误后才向用户报告安装成功，并显示实际安装路径。
 
-若第三方安装器只写入 `$HOME/.agents/skills`，P-Chat 直接读取标准目录；若写入私有目录，
-`skill_manage import` 将其完整复制到 P-Chat 管理目录。
-
-`lark-cli` 是专用 CLI 源适配器：只允许固定可执行文件名，使用参数数组调用
-`skills list/read --json`，绑定请求名与声明名，校验每个返回路径，并限制整次操作的包数、
-文件数量、总字节数、命令输出和总时长。所有包先 staging，再整体发布和校验，失败时统一回滚；
-安装阶段不执行 Skill 脚本。当前已用本机 `lark-cli 1.0.92` 在隔离临时目录验证
-`lark-doc + lark-shared + references`。
+P-Chat 核心不调用供应商 CLI、不解析供应商私有协议，也不为单个产品增加 `source_cli` 分支。
+集合内所有包先 staging，再整体发布和验证，任一失败统一回滚；安装阶段不执行 Skill 脚本。
+发布/验证期间用进程级读写锁隔离，确保并发 `Catalog` / `Load` 只能看到事务前或事务后的
+完整状态。
 
 ## 7. 分阶段落地
 

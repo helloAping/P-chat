@@ -48,7 +48,7 @@ func TestLoadActiveSkillsEmitsStartBeforeInstructionsBecomeAvailable(t *testing.
 	a := &Agent{skillManager: manager}
 
 	contextText, err := a.loadActiveSkills(context.Background(), ChatRequest{
-		ActiveSkills: []string{"lark-doc", "lark-doc"},
+		ActiveSkills: []string{"docs-tool", "docs-tool"},
 	}, func(event ChatStreamChunk) { events = append(events, event) })
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +59,7 @@ func TestLoadActiveSkillsEmitsStartBeforeInstructionsBecomeAvailable(t *testing.
 	if len(events) != 2 || events[0].SkillStatus != "start" || events[1].SkillStatus != "ready" {
 		t.Fatalf("events = %+v, want one start/ready pair", events)
 	}
-	if events[0].Message != "当前调用 Skill：lark-doc" {
+	if events[0].Message != "当前调用 Skill：docs-tool" {
 		t.Fatalf("announcement = %q", events[0].Message)
 	}
 }
@@ -83,27 +83,27 @@ func TestLoadActiveSkillsEmitsStructuredError(t *testing.T) {
 
 func TestPartsAccumulatorSkillLifecycle(t *testing.T) {
 	acc := newPartsAccumulator()
-	acc.update(ChatStreamChunk{SkillName: "lark-doc", SkillStatus: "start", Message: "当前调用 Skill：lark-doc"})
+	acc.update(ChatStreamChunk{SkillName: "docs-tool", SkillStatus: "start", Message: "当前调用 Skill：docs-tool"})
 	acc.update(ChatStreamChunk{
-		SkillName: "lark-doc", SkillStatus: "ready", SkillScope: "global_managed",
-		SkillSource: "skills/lark-doc/SKILL.md", SkillDependencies: []string{"lark-shared"},
+		SkillName: "docs-tool", SkillStatus: "ready", SkillScope: "global_managed",
+		SkillSource: "skills/docs-tool/SKILL.md", SkillDependencies: []string{"shared-auth"},
 	})
 
 	parts := acc.snapshot()
-	if len(parts) != 1 || parts[0].Kind != "skill" || parts[0].Name != "lark-doc" || parts[0].Status != "ready" {
+	if len(parts) != 1 || parts[0].Kind != "skill" || parts[0].Name != "docs-tool" || parts[0].Status != "ready" {
 		t.Fatalf("parts = %+v", parts)
 	}
-	if parts[0].Scope != "global_managed" || len(parts[0].Dependencies) != 1 || parts[0].Dependencies[0] != "lark-shared" {
+	if parts[0].Scope != "global_managed" || len(parts[0].Dependencies) != 1 || parts[0].Dependencies[0] != "shared-auth" {
 		t.Fatalf("skill metadata = %+v", parts[0])
 	}
 }
 
 func TestParseSkillLoadCall(t *testing.T) {
-	name, ok := parseSkillLoadCall("skill", `{"action":"load","name":"lark-doc"}`)
-	if !ok || name != "lark-doc" {
+	name, ok := parseSkillLoadCall("skill", `{"action":"load","name":"docs-tool"}`)
+	if !ok || name != "docs-tool" {
 		t.Fatalf("parseSkillLoadCall = %q, %v", name, ok)
 	}
-	if _, ok := parseSkillLoadCall("skill", `{"action":"inspect","name":"lark-doc"}`); ok {
+	if _, ok := parseSkillLoadCall("skill", `{"action":"inspect","name":"docs-tool"}`); ok {
 		t.Fatal("inspect must not be treated as a Skill invocation")
 	}
 }
@@ -119,7 +119,7 @@ func TestSkillLoadCacheRunsOnceAndReturnsCompactDuplicate(t *testing.T) {
 		<-release
 		return &tool.CallResult{
 			Content:         "FULL SKILL BODY",
-			SkillInvocation: &tool.SkillInvocation{Name: "lark-doc", Status: "ready"},
+			SkillInvocation: &tool.SkillInvocation{Name: "docs-tool", Status: "ready"},
 		}, nil
 	}
 
@@ -128,12 +128,12 @@ func TestSkillLoadCacheRunsOnceAndReturnsCompactDuplicate(t *testing.T) {
 	wait.Add(2)
 	go func() {
 		defer wait.Done()
-		first, _ = cache.do("lark-doc", load)
+		first, _ = cache.do("docs-tool", load)
 	}()
 	<-start
 	go func() {
 		defer wait.Done()
-		second, _ = cache.do("lark-doc", load)
+		second, _ = cache.do("docs-tool", load)
 	}()
 	close(release)
 	wait.Wait()
@@ -151,9 +151,9 @@ func TestSkillLoadCacheRunsOnceAndReturnsCompactDuplicate(t *testing.T) {
 
 func TestSkillLoadCacheReusesExplicitlyActivatedSkill(t *testing.T) {
 	cache := newSkillLoadCache()
-	cache.markLoaded("lark-doc")
+	cache.markLoaded("docs-tool")
 	called := false
-	result, err := cache.do("lark-doc", func() (*tool.CallResult, error) {
+	result, err := cache.do("docs-tool", func() (*tool.CallResult, error) {
 		called = true
 		return &tool.CallResult{Content: "FULL SKILL BODY"}, nil
 	})
@@ -192,9 +192,9 @@ func TestSkillLoadFailurePartsArePersisted(t *testing.T) {
 	}
 }
 
-func TestHostRuntimeExplainsLarkCLISkillImport(t *testing.T) {
+func TestHostRuntimeExplainsExternalToolSkillImport(t *testing.T) {
 	prompt := buildHostRuntimeBlock(`D:\projects\demo`)
-	for _, expected := range []string{"source_cli `lark-cli`", "omit name", "skill_manage"} {
+	for _, expected := range []string{"external CLI or tool", "source_path", "Omit `name`", "skill_manage"} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("host runtime prompt missing %q: %s", expected, prompt)
 		}

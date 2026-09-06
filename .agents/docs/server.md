@@ -114,8 +114,9 @@ Skill API：
 
 - `GET /skills`：只返回 catalog 元数据及 `diagnostics[]`，不返回正文。
 - `GET /skills/:name`：按需加载正文，主要用于检查界面。
-- `POST /skills/install`：完整包安装/导入；支持 `url`、`source_path` 或
-  `source_cli: "lark-cli"`（三者必须且只能提供一个），响应含 `ready`、`installed[]` 和诊断。
+- `POST /skills/install`：完整包安装/导入；`url` 与 `source_path` 必须且只能提供一个。
+  `source_path` 可指向单包或集合目录，集合可用可选 `name` 选择目标及其依赖；响应含
+  `ready`、`installed[]`、`rolled_back` 和诊断。
 - `DELETE /skills/:name`：只允许删除 P-Chat 托管来源，标准目录返回 `409`。
 
 #### 会话回合队列

@@ -594,6 +594,7 @@ export interface SkillInstallResult {
   name: string
   path: string
   installed?: string[]
+  rolled_back?: boolean
   diagnostics?: SkillDiagnostic[]
 }
 
@@ -609,12 +610,12 @@ export const installSkill = (name: string, url: string, opts?: SkillScopeOptions
     }),
   })
 
-export const installSkillsFromCLI = (name?: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
+export const importSkillsFromDirectory = (sourcePath: string, name?: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
   jsonFetch<SkillInstallResult>('/api/v1/skills/install', {
     method: 'POST',
     body: JSON.stringify({
       name: name || '',
-      source_cli: 'lark-cli',
+      source_path: sourcePath,
       scope: opts?.scope,
       session_id: opts?.sessionId,
       project_path: opts?.projectPath,

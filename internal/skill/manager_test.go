@@ -2,7 +2,6 @@ package skill
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,18 +97,18 @@ func TestFSManagerBuildIndexDoesNotInjectSkillBody(t *testing.T) {
 
 func TestFSManagerLoadIncludesDependenciesAndReadsContainedResource(t *testing.T) {
 	m, managed, _ := testManager(t)
-	writeSkillPackage(t, managed, "lark-shared", "---\nname: lark-shared\ndescription: shared helpers\n---\nSHARED INSTRUCTIONS\n", map[string]string{
+	writeSkillPackage(t, managed, "shared-auth", "---\nname: shared-auth\ndescription: shared helpers\n---\nSHARED INSTRUCTIONS\n", map[string]string{
 		"references/auth.md": "AUTH REFERENCE",
 	})
-	writeSkillPackage(t, managed, "lark-doc", "---\nname: lark-doc\ndescription: manage docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n    bins: [go]\n---\nDOC INSTRUCTIONS\n", map[string]string{
+	writeSkillPackage(t, managed, "docs-tool", "---\nname: docs-tool\ndescription: manage docs\nmetadata:\n  requires:\n    skills: [shared-auth]\n    bins: [go]\n---\nDOC INSTRUCTIONS\n", map[string]string{
 		"references/create.md": "CREATE REFERENCE",
 	})
 
-	loaded, err := m.Load(context.Background(), LoadRequest{Name: "lark-doc"})
+	loaded, err := m.Load(context.Background(), LoadRequest{Name: "docs-tool"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Skills) != 2 || loaded.Skills[0].Name != "lark-shared" || loaded.Skills[1].Name != "lark-doc" {
+	if len(loaded.Skills) != 2 || loaded.Skills[0].Name != "shared-auth" || loaded.Skills[1].Name != "docs-tool" {
 		t.Fatalf("load order = %+v, want dependency before primary", loaded.Skills)
 	}
 	if !strings.Contains(loaded.Context, "SHARED INSTRUCTIONS") || !strings.Contains(loaded.Context, "DOC INSTRUCTIONS") {
@@ -119,14 +118,14 @@ func TestFSManagerLoadIncludesDependenciesAndReadsContainedResource(t *testing.T
 		t.Fatalf("required bins = %+v", loaded.RequiredBins)
 	}
 
-	resource, err := m.Load(context.Background(), LoadRequest{Name: "lark-doc", Resource: "references/create.md"})
+	resource, err := m.Load(context.Background(), LoadRequest{Name: "docs-tool", Resource: "references/create.md"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resource.ResourceContent != "CREATE REFERENCE" {
 		t.Fatalf("resource = %q", resource.ResourceContent)
 	}
-	if _, err := m.Load(context.Background(), LoadRequest{Name: "lark-doc", Resource: "../lark-shared/SKILL.md"}); err == nil {
+	if _, err := m.Load(context.Background(), LoadRequest{Name: "docs-tool", Resource: "../shared-auth/SKILL.md"}); err == nil {
 		t.Fatal("expected traversal outside the skill directory to be rejected")
 	}
 }
@@ -160,7 +159,7 @@ func TestFSManagerReadResourceRejectsSymlinkEscape(t *testing.T) {
 
 func TestFSManagerDoctorReportsMissingSkillDependency(t *testing.T) {
 	m, managed, _ := testManager(t)
-	writeSkillPackage(t, managed, "lark-doc", "---\nname: lark-doc\ndescription: manage docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n---\nDOC\n", nil)
+	writeSkillPackage(t, managed, "docs-tool", "---\nname: docs-tool\ndescription: manage docs\nmetadata:\n  requires:\n    skills: [shared-auth]\n---\nDOC\n", nil)
 
 	catalog, err := m.Catalog(context.Background(), CatalogQuery{})
 	if err != nil {
@@ -168,12 +167,12 @@ func TestFSManagerDoctorReportsMissingSkillDependency(t *testing.T) {
 	}
 	found := false
 	for _, diag := range catalog.Diagnostics {
-		if diag.Code == "missing_skill_dependency" && diag.Skill == "lark-doc" {
+		if diag.Code == "missing_skill_dependency" && diag.Skill == "docs-tool" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("diagnostics = %+v, want missing lark-shared", catalog.Diagnostics)
+		t.Fatalf("diagnostics = %+v, want missing shared-auth", catalog.Diagnostics)
 	}
 }
 
@@ -228,6 +227,9 @@ func TestFSManagerImportDoesNotVerifyShadowedTargetAsReady(t *testing.T) {
 	if result.Ready {
 		t.Fatalf("shadowed global package must not be reported ready: %+v", result)
 	}
+	if !result.RolledBack {
+		t.Fatalf("shadowed package must be rolled back: %+v", result)
+	}
 	if result.Directory != filepath.Join(managed, "shared") {
 		t.Fatalf("directory = %q", result.Directory)
 	}
@@ -240,202 +242,167 @@ func TestFSManagerImportDoesNotVerifyShadowedTargetAsReady(t *testing.T) {
 	if !found {
 		t.Fatalf("diagnostics = %+v, want post_install_shadowed", result.Diagnostics)
 	}
+	if _, err := os.Stat(filepath.Join(managed, "shared")); !os.IsNotExist(err) {
+		t.Fatalf("shadowed package must not remain in the managed directory: %v", err)
+	}
 }
 
-func TestFSManagerInstallsSkillAndDependenciesFromLarkCLI(t *testing.T) {
+func TestFSManagerImportsNamedSkillAndDependenciesFromCollection(t *testing.T) {
 	m, managed, _ := testManager(t)
-	m.runCommand = func(_ context.Context, binary string, args ...string) ([]byte, error) {
-		if binary != "lark-cli" {
-			t.Fatalf("binary = %q", binary)
-		}
-		switch strings.Join(args, " ") {
-		case "skills list lark-doc":
-			return []byte(`{"ok":true,"path":"lark-doc","entries":[{"path":"lark-doc/SKILL.md","is_dir":false},{"path":"lark-doc/references","is_dir":true}]}`), nil
-		case "skills list lark-doc/references":
-			return []byte(`{"ok":true,"path":"lark-doc/references","entries":[{"path":"lark-doc/references/guide.md","is_dir":false}]}`), nil
-		case "skills read lark-doc SKILL.md --json":
-			return []byte(`{"skill":"lark-doc","path":"SKILL.md","content":"---\nname: lark-doc\ndescription: docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n---\nDOC\n"}`), nil
-		case "skills read lark-doc references/guide.md --json":
-			return []byte(`{"skill":"lark-doc","path":"references/guide.md","content":"GUIDE"}`), nil
-		case "skills list lark-shared":
-			return []byte(`{"ok":true,"path":"lark-shared","entries":[{"path":"lark-shared/SKILL.md","is_dir":false}]}`), nil
-		case "skills read lark-shared SKILL.md --json":
-			return []byte(`{"skill":"lark-shared","path":"SKILL.md","content":"---\nname: lark-shared\ndescription: auth\n---\nSHARED\n"}`), nil
-		default:
-			t.Fatalf("unexpected lark-cli call: %s", strings.Join(args, " "))
-			return nil, nil
-		}
-	}
+	sourceRoot := t.TempDir()
+	writeSkillPackage(t, sourceRoot, "shared-auth", "---\nname: shared-auth\ndescription: shared authentication\n---\nSHARED\n", nil)
+	writeSkillPackage(t, sourceRoot, "docs-tool", "---\nname: docs-tool\ndescription: document operations\nmetadata:\n  requires:\n    skills: [shared-auth]\n---\nDOCS\n", map[string]string{
+		"references/create.md": "CREATE",
+	})
 
 	result, err := m.Apply(context.Background(), ChangeRequest{
-		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
+		Action: ChangeImport, SourcePath: sourceRoot, Name: "docs-tool", Scope: ScopeGlobalManaged,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Ready || strings.Join(result.Installed, ",") != "lark-doc,lark-shared" {
+	if !result.Ready || strings.Join(result.Installed, ",") != "docs-tool,shared-auth" {
 		t.Fatalf("result = %+v", result)
 	}
-	if data, err := os.ReadFile(filepath.Join(managed, "lark-doc", "references", "guide.md")); err != nil || string(data) != "GUIDE" {
-		t.Fatalf("installed reference = %q, err=%v", data, err)
+	if _, err := os.Stat(filepath.Join(managed, "docs-tool", "references", "create.md")); err != nil {
+		t.Fatalf("collection import did not preserve the complete package: %v", err)
 	}
-	loaded, err := m.Load(context.Background(), LoadRequest{Name: "lark-doc"})
-	if err != nil || !strings.Contains(loaded.Context, "SHARED") || !strings.Contains(loaded.Context, "DOC") {
+	loaded, err := m.Load(context.Background(), LoadRequest{Name: "docs-tool"})
+	if err != nil || !strings.Contains(loaded.Context, "SHARED") || !strings.Contains(loaded.Context, "DOCS") {
 		t.Fatalf("loaded = %+v, err=%v", loaded, err)
 	}
 }
 
-func TestFSManagerRejectsTraversingCLISkillEntry(t *testing.T) {
-	m, _, _ := testManager(t)
-	m.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		if strings.Join(args, " ") == "skills list lark-doc" {
-			return []byte(`{"ok":true,"path":"lark-doc","entries":[{"path":"lark-doc/../outside.md","is_dir":false}]}`), nil
-		}
-		t.Fatalf("unexpected CLI call: %s", strings.Join(args, " "))
-		return nil, nil
-	}
-
-	_, err := m.Apply(context.Background(), ChangeRequest{
-		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
-	})
-	if err == nil || !strings.Contains(err.Error(), "invalid CLI Skill path") {
-		t.Fatalf("err = %v, want traversal rejection", err)
-	}
-}
-
-func TestFSManagerInstallsAllSkillsExposedByLarkCLI(t *testing.T) {
+func TestFSManagerImportsAllSkillsFromCollection(t *testing.T) {
 	m, managed, _ := testManager(t)
-	m.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		switch strings.Join(args, " ") {
-		case "skills list":
-			return []byte(`{"ok":true,"skills":[{"name":"lark-doc"},{"name":"lark-shared"}],"count":2}`), nil
-		case "skills list lark-doc":
-			return []byte(`{"ok":true,"path":"lark-doc","entries":[{"path":"lark-doc/SKILL.md","is_dir":false}]}`), nil
-		case "skills read lark-doc SKILL.md --json":
-			return []byte(`{"skill":"lark-doc","path":"SKILL.md","content":"---\nname: lark-doc\ndescription: docs\n---\nDOC\n"}`), nil
-		case "skills list lark-shared":
-			return []byte(`{"ok":true,"path":"lark-shared","entries":[{"path":"lark-shared/SKILL.md","is_dir":false}]}`), nil
-		case "skills read lark-shared SKILL.md --json":
-			return []byte(`{"skill":"lark-shared","path":"SKILL.md","content":"---\nname: lark-shared\ndescription: auth\n---\nSHARED\n"}`), nil
-		default:
-			t.Fatalf("unexpected CLI call: %s", strings.Join(args, " "))
-			return nil, nil
-		}
-	}
+	sourceRoot := t.TempDir()
+	writeSkillPackage(t, sourceRoot, "alpha", "---\nname: alpha\ndescription: first\n---\nALPHA\n", nil)
+	writeSkillPackage(t, sourceRoot, "beta", "---\nname: beta\ndescription: second\n---\nBETA\n", nil)
 
 	result, err := m.Apply(context.Background(), ChangeRequest{
-		Action: ChangeInstall, SourceCLI: "lark-cli", Scope: ScopeGlobalManaged,
+		Action: ChangeImport, SourcePath: sourceRoot, Scope: ScopeGlobalManaged,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Ready || result.Name != "lark-cli" || result.Directory != managed || strings.Join(result.Installed, ",") != "lark-doc,lark-shared" {
+	if !result.Ready || strings.Join(result.Installed, ",") != "alpha,beta" {
 		t.Fatalf("result = %+v", result)
 	}
-}
-
-func TestFSManagerRejectsMismatchedCLISkillIdentity(t *testing.T) {
-	m, managed, _ := testManager(t)
-	stubLarkCLISkillManifests(t, m, map[string]string{
-		"lark-doc": "---\nname: lark-calendar\ndescription: wrong identity\n---\nDOC\n",
-	})
-
-	_, err := m.Apply(context.Background(), ChangeRequest{
-		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
-	})
-	if err == nil || !strings.Contains(err.Error(), "declared name") {
-		t.Fatalf("err = %v, want CLI Skill identity mismatch", err)
-	}
-	if _, statErr := os.Stat(filepath.Join(managed, "lark-calendar")); !os.IsNotExist(statErr) {
-		t.Fatalf("mismatched package must not be published: %v", statErr)
+	for _, name := range result.Installed {
+		if _, err := os.Stat(filepath.Join(managed, name, "SKILL.md")); err != nil {
+			t.Fatalf("Skill %q was not imported: %v", name, err)
+		}
 	}
 }
 
-func TestFSManagerCLINamedInstallRequiresEveryDependencyReady(t *testing.T) {
-	m, managed, _ := testManager(t)
-	project := t.TempDir()
-	writeSkillPackage(t, filepath.Join(project, ".p-chat", "skills"), "lark-shared", "---\nname: lark-shared\ndescription: project winner\n---\nPROJECT\n", nil)
-	stubLarkCLISkillManifests(t, m, map[string]string{
-		"lark-doc":    "---\nname: lark-doc\ndescription: docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n---\nDOC\n",
-		"lark-shared": "---\nname: lark-shared\ndescription: global candidate\n---\nGLOBAL\n",
-	})
-
-	result, err := m.Apply(context.Background(), ChangeRequest{
-		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc",
-		Scope: ScopeGlobalManaged, ProjectRoot: project,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Ready {
-		t.Fatalf("shadowed dependency must make the whole CLI install unready: %+v", result)
-	}
-	if _, statErr := os.Stat(filepath.Join(managed, "lark-doc")); !os.IsNotExist(statErr) {
-		t.Fatalf("unready CLI transaction must roll back its primary package: %v", statErr)
-	}
-}
-
-func TestFSManagerRollsBackCLIBatchWhenVerificationFails(t *testing.T) {
-	m, managed, _ := testManager(t)
-	writeSkillPackage(t, managed, "lark-shared", "---\nname: lark-shared\ndescription: old\n---\nOLD\n", nil)
-	stubLarkCLISkillManifests(t, m, map[string]string{
-		"lark-doc":    "---\nname: lark-doc\ndescription: docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n    bins: [pchat-definitely-missing-cli]\n---\nDOC\n",
-		"lark-shared": "---\nname: lark-shared\ndescription: new\n---\nNEW\n",
-	})
-
-	result, err := m.Apply(context.Background(), ChangeRequest{
-		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Ready {
-		t.Fatalf("missing binary must make the CLI transaction unready: %+v", result)
-	}
-	data, readErr := os.ReadFile(filepath.Join(managed, "lark-shared", "SKILL.md"))
-	if readErr != nil || !strings.Contains(string(data), "OLD") {
-		t.Fatalf("previous dependency was not restored: content=%q err=%v", data, readErr)
-	}
-	if _, statErr := os.Stat(filepath.Join(managed, "lark-doc")); !os.IsNotExist(statErr) {
-		t.Fatalf("failed primary package must be removed during rollback: %v", statErr)
-	}
-}
-
-func TestFSManagerSharesSafetyBudgetAcrossCLIDependencies(t *testing.T) {
+func TestFSManagerSharesSafetyBudgetAcrossCollection(t *testing.T) {
 	base := t.TempDir()
-	doc := "---\nname: lark-doc\ndescription: docs\nmetadata:\n  requires:\n    skills: [lark-shared]\n---\nDOC\n"
-	shared := "---\nname: lark-shared\ndescription: shared\n---\nSHARED\n"
-	maxBytes := len(doc)
-	if len(shared) > maxBytes {
-		maxBytes = len(shared)
+	alpha := "---\nname: alpha\ndescription: first\n---\nALPHA\n"
+	beta := "---\nname: beta\ndescription: second\n---\nBETA\n"
+	maxBytes := len(alpha)
+	if len(beta) > maxBytes {
+		maxBytes = len(beta)
 	}
 	m := NewFSManager(ManagerOptions{
 		GlobalManagedDir: filepath.Join(base, "managed"),
 		UserStandardDir:  filepath.Join(base, "standard"),
 		MaxPackageBytes:  int64(maxBytes + 1),
 	})
-	stubLarkCLISkillManifests(t, m, map[string]string{"lark-doc": doc, "lark-shared": shared})
+	sourceRoot := t.TempDir()
+	writeSkillPackage(t, sourceRoot, "alpha", alpha, nil)
+	writeSkillPackage(t, sourceRoot, "beta", beta, nil)
 
 	_, err := m.Apply(context.Background(), ChangeRequest{
-		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
+		Action: ChangeImport, SourcePath: sourceRoot, Scope: ScopeGlobalManaged,
 	})
 	if err == nil || !strings.Contains(err.Error(), "safety limits") {
-		t.Fatalf("err = %v, want aggregate CLI byte limit", err)
+		t.Fatalf("err = %v, want aggregate collection byte limit", err)
 	}
 }
 
-func TestBoundedCommandOutputCapsRetainedBytes(t *testing.T) {
-	output := &boundedCommandOutput{limit: 4}
-	written, err := output.Write([]byte("123456"))
-	if err != nil || written != 6 {
-		t.Fatalf("Write = %d, %v", written, err)
+func TestFSManagerRejectsCollectionSymlinkEntry(t *testing.T) {
+	m, _, _ := testManager(t)
+	packageRoot := t.TempDir()
+	packageDir := writeSkillPackage(t, packageRoot, "docs-tool", "---\nname: docs-tool\ndescription: docs\n---\nDOCS\n", nil)
+	collectionRoot := t.TempDir()
+	if err := os.Symlink(packageDir, filepath.Join(collectionRoot, "docs-tool")); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
 	}
-	if got := string(output.bytes()); got != "1234" || !output.exceeded {
-		t.Fatalf("retained = %q exceeded=%v", got, output.exceeded)
+
+	_, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeImport, SourcePath: collectionRoot, Scope: ScopeGlobalManaged,
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "symlink") {
+		t.Fatalf("err = %v, want collection symlink rejection", err)
 	}
 }
 
-func TestFSManagerCatalogWaitsForFilesystemMutation(t *testing.T) {
+func TestFSManagerRejectsFileReplacedAfterObservation(t *testing.T) {
+	m, _, _ := testManager(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "SKILL.md")
+	if err := os.WriteFile(path, []byte("SAFE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(outside, []byte("OUTSIDE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+
+	destination := filepath.Join(t.TempDir(), "SKILL.md")
+	err = m.copyRegularFile(path, destination, observed, &skillImportBudget{maxFiles: 1, maxBytes: 1024})
+	if err == nil || !strings.Contains(err.Error(), "changed or became linked") {
+		t.Fatalf("err = %v, want replacement rejection", err)
+	}
+	if _, statErr := os.Stat(destination); !os.IsNotExist(statErr) {
+		t.Fatalf("replaced source must not be copied: %v", statErr)
+	}
+}
+
+func TestFSManagerImportRequiresSourcePath(t *testing.T) {
+	m, _, _ := testManager(t)
+	_, err := m.Apply(context.Background(), ChangeRequest{Action: ChangeImport, Scope: ScopeGlobalManaged})
+	if err == nil || !strings.Contains(err.Error(), "source_path") {
+		t.Fatalf("err = %v, want missing source_path", err)
+	}
+}
+
+func TestFSManagerRollsBackCollectionWhenVerificationFails(t *testing.T) {
+	m, managed, _ := testManager(t)
+	writeSkillPackage(t, managed, "shared-auth", "---\nname: shared-auth\ndescription: old\n---\nOLD\n", nil)
+	sourceRoot := t.TempDir()
+	writeSkillPackage(t, sourceRoot, "shared-auth", "---\nname: shared-auth\ndescription: new\n---\nNEW\n", nil)
+	writeSkillPackage(t, sourceRoot, "docs-tool", "---\nname: docs-tool\ndescription: docs\nmetadata:\n  requires:\n    skills: [shared-auth]\n    bins: [pchat-definitely-missing-cli]\n---\nDOCS\n", nil)
+
+	result, err := m.Apply(context.Background(), ChangeRequest{
+		Action: ChangeImport, SourcePath: sourceRoot, Name: "docs-tool", Scope: ScopeGlobalManaged,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Ready || !result.RolledBack || len(result.Installed) != 0 {
+		t.Fatalf("result = %+v, want verified rollback", result)
+	}
+	data, readErr := os.ReadFile(filepath.Join(managed, "shared-auth", "SKILL.md"))
+	if readErr != nil || !strings.Contains(string(data), "OLD") {
+		t.Fatalf("previous package was not restored: content=%q err=%v", data, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(managed, "docs-tool")); !os.IsNotExist(statErr) {
+		t.Fatalf("failed collection package must not remain installed: %v", statErr)
+	}
+}
+
+func TestFSManagerCatalogWaitsForCollectionPublication(t *testing.T) {
 	m, _, _ := testManager(t)
 	skillFilesystemMu.Lock()
 	locked := true
@@ -452,7 +419,7 @@ func TestFSManagerCatalogWaitsForFilesystemMutation(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		t.Fatalf("Catalog returned during an active Skill mutation: %v", err)
+		t.Fatalf("Catalog returned during an active Skill publication: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	skillFilesystemMu.Unlock()
@@ -463,80 +430,31 @@ func TestFSManagerCatalogWaitsForFilesystemMutation(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("Catalog did not resume after the Skill mutation completed")
-	}
-}
-
-func stubLarkCLISkillManifests(t *testing.T, m *FSManager, manifests map[string]string) {
-	t.Helper()
-	m.runCommand = func(_ context.Context, binary string, args ...string) ([]byte, error) {
-		if binary != "lark-cli" {
-			t.Fatalf("binary = %q", binary)
-		}
-		if len(args) == 3 && args[0] == "skills" && args[1] == "list" {
-			name := args[2]
-			if _, ok := manifests[name]; !ok {
-				t.Fatalf("unexpected Skill listing: %s", name)
-			}
-			return []byte(`{"ok":true,"path":"` + name + `","entries":[{"path":"` + name + `/SKILL.md","is_dir":false}]}`), nil
-		}
-		if len(args) == 5 && args[0] == "skills" && args[1] == "read" && args[3] == "SKILL.md" && args[4] == "--json" {
-			name := args[2]
-			manifest, ok := manifests[name]
-			if !ok {
-				t.Fatalf("unexpected Skill read: %s", name)
-			}
-			encoded, err := json.Marshal(cliSkillRead{Skill: name, Path: "SKILL.md", Content: manifest})
-			if err != nil {
-				t.Fatal(err)
-			}
-			return encoded, nil
-		}
-		t.Fatalf("unexpected lark-cli call: %s", strings.Join(args, " "))
-		return nil, nil
-	}
-}
-
-func TestFSManagerImportsRealLarkCLISkillWhenEnabled(t *testing.T) {
-	if os.Getenv("PCHAT_TEST_LARK_CLI") != "1" {
-		t.Skip("set PCHAT_TEST_LARK_CLI=1 for the host integration test")
-	}
-	m, managed, _ := testManager(t)
-	result, err := m.Apply(context.Background(), ChangeRequest{
-		Action: ChangeInstall, SourceCLI: "lark-cli", Name: "lark-doc", Scope: ScopeGlobalManaged,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Ready || len(result.Installed) < 2 {
-		t.Fatalf("result = %+v", result)
-	}
-	if _, err := os.Stat(filepath.Join(managed, "lark-doc", "references", "lark-doc-fetch.md")); err != nil {
-		t.Fatalf("real lark-doc reference missing: %v", err)
+		t.Fatal("Catalog did not resume after Skill publication")
 	}
 }
 
 func TestParseGitHubSourceSupportsRepositoryAndSkillDirectory(t *testing.T) {
-	repo, err := parseGitHubSource("larksuite/cli", "lark-doc")
+	repo, err := parseGitHubSource("example/skill-packages", "docs-tool")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if repo.repository != "https://github.com/larksuite/cli.git" || repo.subpath != filepath.Join("skills", "lark-doc") {
+	if repo.repository != "https://github.com/example/skill-packages.git" || repo.subpath != filepath.Join("skills", "docs-tool") {
 		t.Fatalf("repository source = %+v", repo)
 	}
 
-	dir, err := parseGitHubSource("https://github.com/larksuite/cli/tree/main/skills/lark-doc", "")
+	dir, err := parseGitHubSource("https://github.com/example/skill-packages/tree/main/skills/docs-tool", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dir.branch != "main" || dir.subpath != filepath.Join("skills", "lark-doc") {
+	if dir.branch != "main" || dir.subpath != filepath.Join("skills", "docs-tool") {
 		t.Fatalf("directory source = %+v", dir)
 	}
 
 	if _, err := parseGitHubSource("ssh://example.com/repo", "x"); err == nil {
 		t.Fatal("non-HTTPS/non-GitHub source should be rejected")
 	}
-	if _, err := parseGitHubSource("https://github.com/larksuite/cli/tree/main/skills/../../outside", ""); err == nil {
+	if _, err := parseGitHubSource("https://github.com/example/skill-packages/tree/main/skills/../../outside", ""); err == nil {
 		t.Fatal("traversing GitHub package path should be rejected")
 	}
 }

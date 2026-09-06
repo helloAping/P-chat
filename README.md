@@ -457,15 +457,16 @@ Agent 行为指令文件，注入到 System Prompt：
 Skill 只把名称和描述放进系统索引，正文按需加载；规则仍全部拼接注入。Skill 优先级为
 项目 `.p-chat` → 项目 `.agents` → 全局 `.p-chat` → 用户 `.agents`，同名只使用最高优先级版本。
 
-CLI 可用 `/skills` 查看，用 `/skill lark-doc 创建一份周报` 显式调用；已安装 Skill 也可直接
-使用 `/lark-doc 创建一份周报`。GUI 输入 `/` 后会列出同样的动态 Skill 命令。每次真正加载
-都会在回答前显示 `当前调用 Skill：lark-doc`，随后给出“已就绪”或具体依赖错误。
+CLI 可用 `/skills` 查看，用 `/skill docs-tool 创建一份周报` 显式调用；已安装 Skill 也可直接
+使用 `/docs-tool 创建一份周报`。GUI 输入 `/` 后会列出同样的动态 Skill 命令。每次真正加载
+都会在回答前显示 `当前调用 Skill：docs-tool`，随后给出“已就绪”或具体依赖错误。
 
-安装飞书 CLI 后，让 P-Chat Agent 调用
-`skill_manage(action=install, source_cli=lark-cli)`，即可从 CLI 内嵌目录导入全部 `lark-*`
-Skill；传 `name=lark-doc` 时只导入该 Skill 及其声明依赖（例如 `lark-shared`）。其他第三方
-安装器应优先写入 `.agents/skills`，私有 Agent 目录则用 `source_path` 完整导入。必须再执行
-`skill(action=doctor)` / `/skills` 验证；只有 `ready=true` 才算完成。新会话会重新扫描。
+外部 CLI 或工具提供 Skill 时，应优先把完整包写入 `.agents/skills` 标准目录。如果它只能
+导出到自己的目录，让 P-Chat Agent 调用
+`skill_manage(action=import, source_path=<导出目录>)`：路径可指向单个包或包含多个包的集合；
+传 `name=docs-tool` 时只导入该 Skill 及其在集合内声明的依赖，省略时导入全部。P-Chat 不为
+具体 CLI 内置专用适配器。必须再执行 `skill(action=doctor)` / `/skills` 验证；只有
+`ready=true` 才算完成。新会话会重新扫描。
 
 ### 人格
 
@@ -614,11 +615,11 @@ GUI：输入区「会话设置」→「风格」选「关闭」。CLI：`/style 
 **4. 怎么看可用工具？**
 GUI：顶栏 🔧 按钮。CLI：`/tools`。自定义 YAML 工具放 `~/.p-chat/tools/*.yaml` 或项目内 `.p-chat/tools/*.yaml`，加载失败时在抽屉顶部「加载诊断」里看。
 
-**5. 飞书 CLI 已安装，为什么新会话仍找不到 lark Skill？**
-让 Agent 调用 `skill_manage(action=install, source_cli=lark-cli)`，P-Chat 会读取
-`lark-cli skills list/read`，把全部内嵌 Skill 发布到托管目录；也可传 `name=lark-doc` 只装
-一个及其依赖。随后调用 `skill(action=doctor)`，确认结果 `ready=true`。调用领域 Skill 时
-界面应明确显示 `当前调用 Skill：lark-xxx`。
+**5. 外部 CLI 已安装，为什么新会话仍找不到它提供的 Skill？**
+安装可执行文件不等于安装 Skill。先让该工具把完整 Skill 包导出到 `.agents/skills`，或让
+Agent 调用 `skill_manage(action=import, source_path=<导出目录>)` 导入单包/集合目录。随后调用
+`skill(action=doctor)`，确认结果 `ready=true`。真正调用时界面会明确显示
+`当前调用 Skill：<准确名称>`。
 
 **6. 怎么用浏览器控制？**
 见上方 [浏览器控制](#浏览器控制) 章节：装扩展 → 弹窗填服务器地址 → GUI 看到「已连接浏览器 > 0」→ LLM 自动开始用 `browser_*` 工具。15 个工具的清单、双通道截图嵌入、BR-04 域名策略、控制目标 tab 切换都在那一节。
