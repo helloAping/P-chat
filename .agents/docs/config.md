@@ -89,9 +89,11 @@ LLMConfig 核心字段：
 `query_endpoint`、`timeout_seconds` 和 `default_params`。Volcengine、MiniMax、
 OpenAI 有可编辑的默认端点，用户配置始终优先。
 
-顶层 `generation.defaults` 按 operation 选择应用默认 Provider/Model；会话的
-`enabled_generation_operations` 和 `generation_model_overrides` 存在
-`conversations.metadata`。能力默认关闭。完整结构与运行边界见
+顶层 `generation.defaults` 按 operation 选择应用默认 Provider/Model；会话只在
+`conversations.metadata.enabled_generation_operations` 保存能力开关，不再覆盖生成模型。
+能力默认关闭，开启后直接使用该 operation 的应用默认模型。旧 metadata 中的
+`generation_model_overrides` / `generation_prompt_assist` 仅兼容读取且不会参与运行。
+完整结构与运行边界见
 [媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
 
 ### 8. SubAgentConfig

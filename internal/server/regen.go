@@ -137,8 +137,6 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		UseImageRecognition:         h.sessionUseImageRecognition(id),
 		RecognitionCapabilities:     h.sessionRecognitionCapabilities(id),
 		GenerationOperations:        h.sessionGenerationOperations(id),
-		GenerationModelOverrides:    h.sessionGenerationModelOverrides(id),
-		GenerationPromptAssist:      h.sessionGenerationPromptAssist(id),
 		SubagentModel:               h.sessionSubAgentModelPreference(id),
 		ReasoningEffort:             meta.ReasoningEffort,
 		CompressedSummary:           compSummary,

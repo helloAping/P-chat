@@ -23,22 +23,25 @@ test('system and session settings expose independent media capabilities', () => 
   assert.match(settings, /kind: 'image'[\s\S]*?kind: 'video'[\s\S]*?kind: 'audio'/)
   assert.match(settings, /patch\.recognition = \{ routes: sysRecognition\.value \}/)
   assert.match(input, /enabled_recognition_capabilities: value/)
-  assert.match(input, /<span>媒体识别<\/span>[\s\S]*?<NSelect[\s\S]*?multiple/)
+  assert.match(input, /<span>媒体识别<\/span>[\s\S]*?data-testid="session-recognition-dropdown"/)
 })
 
-test('media generation models, defaults, and per-session hard switches are configurable', () => {
+test('media generation uses app defaults with per-session hard switches', () => {
   assert.match(settings, /value: 'media_generation'/)
   assert.match(settings, /operation: 'text_to_image'[\s\S]*?operation: 'image_to_video'[\s\S]*?operation: 'text_to_speech'/)
   assert.match(settings, /patch\.generation = \{[\s\S]*?defaults: generationDefaults/)
   assert.match(input, /enabled_generation_operations: value/)
   assert.match(input, /关闭后，[\s\S]*?工具内部也会直接拒绝/)
+  assert.match(input, /会话只选择能力；每项能力直接使用应用设置中的默认模型/)
+  assert.doesNotMatch(input, /generation_model_overrides|generation_prompt_assist|能力路由|提示词处理/)
 })
 
-test('session media generation layout stays compact and does not wrap into phantom columns', () => {
+test('session media multi-selects reuse the compact dropdown control', () => {
   assert.match(input, /session-config-options--stacked \{[\s\S]*?flex-wrap: nowrap/)
-  assert.match(input, /v-if="enabledGenerationOperations\.length" class="generation-session-details"/)
   assert.match(input, /session-config-row--span2 session-config-row--media-recognition[\s\S]*?<span>媒体识别<\/span>/)
-  assert.match(input, /generation-session-details[\s\S]*?background: var\(--surface-2\)/)
+  assert.match(input, /data-testid="session-recognition-dropdown"[\s\S]*?opt-pick-label/)
+  assert.match(input, /data-testid="session-generation-dropdown"[\s\S]*?opt-pick-label/)
+  assert.match(input, /\.opt-pick--wide \{\s*width: 100%/)
 })
 
 test('media limit editor supports readable units without changing the byte API', () => {

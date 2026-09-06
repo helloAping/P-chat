@@ -53,7 +53,7 @@ func TestSessionGenerationOperationsDefaultOffAndCanBeEnabled(t *testing.T) {
 	}
 
 	patch := httptest.NewRecorder()
-	body := `{"enabled_generation_operations":["text_to_video"],"generation_prompt_assist":false}`
+	body := `{"enabled_generation_operations":["text_to_video"]}`
 	server.engine.ServeHTTP(patch, httptest.NewRequest(http.MethodPatch, "/api/v1/sessions/"+session.ID, bytes.NewBufferString(body)))
 	if patch.Code != http.StatusOK {
 		t.Fatalf("patch status=%d body=%s", patch.Code, patch.Body.String())
@@ -65,9 +65,6 @@ func TestSessionGenerationOperationsDefaultOffAndCanBeEnabled(t *testing.T) {
 	if len(updated.EnabledGenerationOperations) != 1 || updated.EnabledGenerationOperations[0] != "text_to_video" {
 		t.Fatalf("enabled operations = %#v", updated.EnabledGenerationOperations)
 	}
-	if updated.GenerationPromptAssist {
-		t.Fatal("prompt assist should reflect the explicit false setting")
-	}
 
 	options := httptest.NewRecorder()
 	server.engine.ServeHTTP(options, httptest.NewRequest(http.MethodGet, "/api/v1/generation/options?session_id="+session.ID, nil))
@@ -75,25 +72,21 @@ func TestSessionGenerationOperationsDefaultOffAndCanBeEnabled(t *testing.T) {
 		t.Fatalf("options status=%d body=%s", options.Code, options.Body.String())
 	}
 	var payload struct {
-		PromptAssist bool `json:"prompt_assist"`
-		Operations   []struct {
-			Operation       string            `json:"operation"`
-			Enabled         bool              `json:"enabled"`
-			Available       bool              `json:"available"`
-			EffectiveTarget map[string]string `json:"effective_target"`
+		Operations []struct {
+			Operation     string            `json:"operation"`
+			Enabled       bool              `json:"enabled"`
+			Available     bool              `json:"available"`
+			DefaultTarget map[string]string `json:"default_target"`
 		} `json:"operations"`
 	}
 	if err := json.Unmarshal(options.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.PromptAssist {
-		t.Fatal("options prompt_assist should be false")
-	}
 	found := false
 	for _, operation := range payload.Operations {
 		if operation.Operation == "text_to_video" {
 			found = true
-			if !operation.Enabled || !operation.Available || operation.EffectiveTarget["model"] != "MiniMax-H3" {
+			if !operation.Enabled || !operation.Available || operation.DefaultTarget["model"] != "MiniMax-H3" {
 				t.Fatalf("text_to_video option = %#v", operation)
 			}
 		}
@@ -101,9 +94,14 @@ func TestSessionGenerationOperationsDefaultOffAndCanBeEnabled(t *testing.T) {
 	if !found {
 		t.Fatal("text_to_video option missing")
 	}
+	for _, removed := range []string{"prompt_assist", "session_override", "effective_target", "models"} {
+		if bytes.Contains(options.Body.Bytes(), []byte(`"`+removed+`"`)) {
+			t.Fatalf("generation options still expose removed session control %q: %s", removed, options.Body.String())
+		}
+	}
 }
 
-func TestSessionGenerationRejectsModelWithoutCapability(t *testing.T) {
+func TestSessionGenerationRejectsPerSessionModelOverride(t *testing.T) {
 	server, _ := newTestServerWithConfig(t, generationTestConfigJSON)
 	create := httptest.NewRecorder()
 	server.engine.ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/v1/sessions", bytes.NewBufferString(`{}`)))
@@ -115,7 +113,23 @@ func TestSessionGenerationRejectsModelWithoutCapability(t *testing.T) {
 	patch := httptest.NewRecorder()
 	body := `{"enabled_generation_operations":["text_to_video"],"generation_model_overrides":{"text_to_video":{"provider":"shared","model":"image-01"}}}`
 	server.engine.ServeHTTP(patch, httptest.NewRequest(http.MethodPatch, "/api/v1/sessions/"+session.ID, bytes.NewBufferString(body)))
-	if patch.Code != http.StatusBadRequest {
+	if patch.Code != http.StatusBadRequest || !bytes.Contains(patch.Body.Bytes(), []byte("no longer supported")) {
+		t.Fatalf("patch status=%d want 400; body=%s", patch.Code, patch.Body.String())
+	}
+}
+
+func TestSessionGenerationRejectsPromptAssistControl(t *testing.T) {
+	server, _ := newTestServerWithConfig(t, generationTestConfigJSON)
+	create := httptest.NewRecorder()
+	server.engine.ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/v1/sessions", bytes.NewBufferString(`{}`)))
+	var session SessionResponse
+	if err := json.Unmarshal(create.Body.Bytes(), &session); err != nil {
+		t.Fatal(err)
+	}
+
+	patch := httptest.NewRecorder()
+	server.engine.ServeHTTP(patch, httptest.NewRequest(http.MethodPatch, "/api/v1/sessions/"+session.ID, bytes.NewBufferString(`{"generation_prompt_assist":true}`)))
+	if patch.Code != http.StatusBadRequest || !bytes.Contains(patch.Body.Bytes(), []byte("no longer supported")) {
 		t.Fatalf("patch status=%d want 400; body=%s", patch.Code, patch.Body.String())
 	}
 }

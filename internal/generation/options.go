@@ -28,8 +28,6 @@ func NormalizeOptions(operation config.GenerationOperation, options map[string]a
 			normalized, err = boundedInteger(key, value, 1, 4)
 		case "negative_prompt":
 			normalized, err = boundedString(key, value, 4000)
-		case "prompt_optimizer":
-			normalized, err = booleanOption(key, value)
 		case "aspect_ratio", "size", "resolution", "quality", "style":
 			if operation.OutputKind() == config.MediaAudio {
 				err = fmt.Errorf("option %q is not valid for %s", key, operation)
@@ -108,14 +106,6 @@ func boundedString(key string, value any, maxRunes int) (string, error) {
 		return "", fmt.Errorf("option %q must be a non-empty string of at most %d characters", key, maxRunes)
 	}
 	return text, nil
-}
-
-func booleanOption(key string, value any) (bool, error) {
-	boolean, ok := value.(bool)
-	if !ok {
-		return false, fmt.Errorf("option %q must be a boolean", key)
-	}
-	return boolean, nil
 }
 
 func audioNumber(operation config.GenerationOperation, key string, value any, minValue, maxValue float64) (float64, error) {

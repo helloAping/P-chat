@@ -12,8 +12,8 @@
   默认参数。
 - 内置 Volcengine、MiniMax 和 OpenAI 文生图端点预设；端点输入框可按模型、按能力覆盖。
   OpenAI 图生图需要 multipart，首版不自动填充端点，避免把它误路由到文生图接口。
-- 应用设置为每项能力指定默认模型；会话设置独立开启能力并可覆盖模型。所有会话能力
-  默认关闭。
+- 应用设置为每项能力指定默认模型；会话设置只负责独立开启能力，开启后直接使用该能力
+  的应用默认模型。所有会话能力默认关闭。
 - 模型只看到三个稳定工具：`generate_image`、`generate_video`、`generate_audio`。
   工具 schema 中的 operation enum 会按会话开关收窄。
 - 工具执行入口再次校验通用工具允许列表；三个媒体 handler 还会再次校验 operation、
@@ -22,8 +22,8 @@
 - 图生图、图生视频、视频生视频和音频生音频只从工具参数接收会话内 `input_refs`。
   服务端验证附件/生成资产属于当前会话后才读取文件并在 adapter 内编码；工具参数不接收
   base64、URL 或文件路径。
-- 会话允许提示词增强时，Agent 可先用当前视觉模型或 `media_recognize` 获取事实观察，
-  再补充有效生成提示词；关闭增强时系统提示要求尽量保持用户描述并使用 `prompt_mode=raw`。
+- 对话 LLM 根据用户要求和上下文直接提供最终生成提示词；需要理解附件时，可先用当前
+  视觉模型或 `media_recognize` 获取事实观察。工具不再暴露二次提示词增强参数。
 - 同步响应和异步查询统一在 `HTTPExecutor` 内处理。厂商返回的 URL、data URI、base64
   或 MiniMax 十六进制音频最终都实体化到 `~/.p-chat/generated/`。
 - 模型可传的生成选项使用固定白名单和取值上限；`callback_url`、厂商批量参数等控制字段
@@ -45,8 +45,8 @@ GUI 推荐流程：
 2. 在该 Provider 下添加模型，类型选择“媒体生成模型”，勾选能力；需要时覆盖该能力的
    创建/查询端点和超时。
 3. 打开“应用设置 → 系统 → 媒体生成”，为每项能力选择应用默认模型。
-4. 在对话框“会话设置 → 媒体生成”中开启本会话允许的能力，并按需覆盖模型。
-   已有应用默认时，可在模型下拉框选择“跟随应用默认”清除会话覆盖。
+4. 在对话框“会话设置 → 媒体生成”中开启本会话允许的能力。模型始终使用第 3 步配置的
+   应用默认值。
 
 若编辑模型时准备移除一项正被 `generation.defaults` 引用的能力，配置 API 返回 `409`；
 需要先在“系统 → 媒体生成”修改或清除该默认项，不会静默改写用户配置。
@@ -96,17 +96,16 @@ GUI 推荐流程：
 }
 ```
 
-会话开关、模型覆盖和提示词辅助策略保存在 `conversations.metadata`：
+会话只保存能力开关：
 
 ```json
 {
-  "enabled_generation_operations": ["text_to_video", "image_to_video"],
-  "generation_model_overrides": {
-    "image_to_video": { "provider": "volc-main", "model": "video-model-id" }
-  },
-  "generation_prompt_assist": true
+  "enabled_generation_operations": ["text_to_video", "image_to_video"]
 }
 ```
+
+旧会话 metadata 中的 `generation_model_overrides` 和 `generation_prompt_assist` 为兼容字段，
+不会再参与模型路由或提示词处理。
 
 ## 运行时边界
 
@@ -124,8 +123,8 @@ GUI 推荐流程：
 
 ## API 与关键文件
 
-- `GET /api/v1/generation/options?session_id=<id>`：返回规范能力矩阵、候选模型、应用默认、
-  会话覆盖、有效模型和不可用原因。
+- `GET /api/v1/generation/options?session_id=<id>`：返回规范能力矩阵、应用默认、会话启用状态
+  和不可用原因。
 - `GET /api/v1/generated/:id`：读取本地实体化后的媒体资产。
 - Provider/Model CRUD 和 `/api/v1/config/system` 已包含 `vendor`、`type`、`generation`。
 - 配置模型：`internal/config/generation.go`

@@ -345,10 +345,10 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 
 ### 13. 媒体生成 API 与资产服务
 
-- `GET /api/v1/generation/options?session_id=<id>` 返回全部 canonical operation、候选
-  媒体模型、应用默认、会话覆盖、有效模型和不可用原因。
-- 会话创建/更新/读取包含 `enabled_generation_operations`、
-  `generation_model_overrides`、`generation_prompt_assist`，写入 conversations metadata。
+- `GET /api/v1/generation/options?session_id=<id>` 返回全部 canonical operation、应用默认、
+  会话启用状态和不可用原因；可用性只按应用默认模型解析。
+- 会话创建/更新只用 `enabled_generation_operations` 控制授权。会话级模型覆盖和提示词辅助
+  参数已停用，API 收到这两个旧字段时返回 `400`；历史 metadata 字段不会参与运行。
 - `GET /api/v1/generated/:id` 提供已实体化的图片、视频或音频；文件与归属 metadata 位于
   `~/.p-chat/generated/`，URL 在聊天历史中保持稳定。
 - Provider/Model CRUD 包含 `vendor`、`type`、`generation`；聊天模型选择和连接测试只接受

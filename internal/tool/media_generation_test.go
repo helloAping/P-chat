@@ -95,7 +95,7 @@ func TestMediaGenerationToolPassesOnlyReferencesToExecutor(t *testing.T) {
 		Executor: executor,
 	})
 
-	result, err := handleGenerateVideo(ctx, json.RawMessage(`{"operation":"image_to_video","prompt":"make it move","prompt_mode":"assist","input_refs":["upl-image-1"]}`))
+	result, err := handleGenerateVideo(ctx, json.RawMessage(`{"operation":"image_to_video","prompt":"make it move","input_refs":["upl-image-1"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,6 +107,16 @@ func TestMediaGenerationToolPassesOnlyReferencesToExecutor(t *testing.T) {
 	}
 	if len(executor.req.InputRefs) != 1 || executor.req.InputRefs[0] != "upl-image-1" {
 		t.Fatalf("input refs = %#v", executor.req.InputRefs)
+	}
+	if executor.req.Prompt != "make it move" {
+		t.Fatalf("prompt = %q, want final LLM-prepared prompt", executor.req.Prompt)
+	}
+}
+
+func TestMediaGenerationToolSchemaDoesNotExposePromptEnhancement(t *testing.T) {
+	schema := string(generationToolSchema(config.GenerationTextToVideo))
+	if strings.Contains(schema, "prompt_mode") || strings.Contains(schema, "prompt_optimizer") {
+		t.Fatalf("generation schema still exposes prompt enhancement controls: %s", schema)
 	}
 }
 

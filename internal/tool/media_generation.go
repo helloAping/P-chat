@@ -11,11 +11,10 @@ import (
 )
 
 type mediaGenerationArgs struct {
-	Operation  config.GenerationOperation `json:"operation"`
-	Prompt     string                     `json:"prompt"`
-	PromptMode generation.PromptMode      `json:"prompt_mode,omitempty"`
-	InputRefs  []string                   `json:"input_refs,omitempty"`
-	Options    map[string]any             `json:"options,omitempty"`
+	Operation config.GenerationOperation `json:"operation"`
+	Prompt    string                     `json:"prompt"`
+	InputRefs []string                   `json:"input_refs,omitempty"`
+	Options   map[string]any             `json:"options,omitempty"`
 }
 
 func handleGenerateImage(ctx context.Context, argsRaw json.RawMessage) (*CallResult, error) {
@@ -52,7 +51,7 @@ func handleMediaGeneration(ctx context.Context, toolName string, outputKind conf
 	}
 	target, ok := access.Target(args.Operation)
 	if !ok {
-		return mediaGenerationError(CallStatusError, fmt.Sprintf("媒体生成能力 %s 已启用，但没有可用模型；请在应用设置或会话设置中选择模型", args.Operation)), nil
+		return mediaGenerationError(CallStatusError, fmt.Sprintf("媒体生成能力 %s 已启用，但没有可用模型；请在应用设置中配置该能力的默认模型", args.Operation)), nil
 	}
 	dispatch, ok := access.Dispatch(args.Operation)
 	if !ok {
@@ -88,20 +87,15 @@ func handleMediaGeneration(ctx context.Context, toolName string, outputKind conf
 	}
 
 	sessionID, _ := ctx.Value(SessionIDKey{}).(string)
-	promptMode := generation.NormalizePromptMode(args.PromptMode)
-	if !access.PromptAssist {
-		promptMode = generation.PromptModeRaw
-	}
 	result, err := access.Executor.Generate(ctx, generation.Request{
-		SessionID:  sessionID,
-		ToolName:   toolName,
-		Operation:  args.Operation,
-		Target:     target,
-		Prompt:     prompt,
-		PromptMode: promptMode,
-		InputRefs:  inputRefs,
-		Options:    normalizedOptions,
-		Dispatch:   dispatch,
+		SessionID: sessionID,
+		ToolName:  toolName,
+		Operation: args.Operation,
+		Target:    target,
+		Prompt:    prompt,
+		InputRefs: inputRefs,
+		Options:   normalizedOptions,
+		Dispatch:  dispatch,
 	})
 	if err != nil {
 		return mediaGenerationError(CallStatusError, fmt.Sprintf("%s 调用失败: %v", toolName, err)), nil
@@ -177,9 +171,8 @@ func generationToolSchema(operations ...config.GenerationOperation) json.RawMess
 		values = append(values, string(operation))
 	}
 	return ObjectSchema(map[string]any{
-		"operation":   StringEnumProp("Canonical generation capability selected for this request", values...),
-		"prompt":      StringProp("Generation instruction. The host may enrich it only when prompt_mode allows."),
-		"prompt_mode": StringEnumProp("raw preserves the prompt; assist requests LLM enrichment; auto lets the host decide", "auto", "raw", "assist"),
+		"operation": StringEnumProp("Canonical generation capability selected for this request", values...),
+		"prompt":    StringProp("Final generation instruction prepared from the user's request and relevant conversation context."),
 		"input_refs": map[string]any{
 			"type": "array", "items": map[string]any{"type": "string"}, "maxItems": 4,
 			"description": "Conversation attachment or generated-asset IDs only. Never pass paths, URLs, or base64.",
@@ -191,7 +184,6 @@ func generationToolSchema(operations ...config.GenerationOperation) json.RawMess
 				"seed":             map[string]any{"type": "integer", "minimum": 0, "maximum": 2147483647},
 				"count":            map[string]any{"type": "integer", "minimum": 1, "maximum": 4},
 				"negative_prompt":  map[string]any{"type": "string", "maxLength": 4000},
-				"prompt_optimizer": map[string]any{"type": "boolean"},
 				"aspect_ratio":     map[string]any{"type": "string", "maxLength": 64},
 				"width":            map[string]any{"type": "integer", "minimum": 64, "maximum": 8192},
 				"height":           map[string]any{"type": "integer", "minimum": 64, "maximum": 8192},

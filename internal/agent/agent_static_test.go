@@ -617,25 +617,23 @@ func TestToolCallSignature(t *testing.T) {
 	}
 }
 
-func TestBuildGenerationPolicyBlockDescribesHardGateAndPromptMode(t *testing.T) {
-	assisted := buildGenerationPolicyBlock([]config.GenerationOperation{
+func TestBuildGenerationPolicyBlockDescribesHardGateAndFinalPrompt(t *testing.T) {
+	policy := buildGenerationPolicyBlock([]config.GenerationOperation{
 		config.GenerationImageToVideo,
 		config.GenerationImageToVideo,
-	}, true)
-	if strings.Count(assisted, string(config.GenerationImageToVideo)) != 1 {
-		t.Fatalf("operation should be listed once: %q", assisted)
+	})
+	if strings.Count(policy, string(config.GenerationImageToVideo)) != 1 {
+		t.Fatalf("operation should be listed once: %q", policy)
 	}
-	for _, want := range []string{"执行入口会再次校验", "opaque input_ref", "prompt_mode=assist", "不可信数据"} {
-		if !strings.Contains(assisted, want) {
-			t.Fatalf("assisted policy missing %q: %q", want, assisted)
+	for _, want := range []string{"执行入口会再次校验", "opaque input_ref", "最终生成提示词", "不可信数据"} {
+		if !strings.Contains(policy, want) {
+			t.Fatalf("generation policy missing %q: %q", want, policy)
 		}
 	}
-
-	raw := buildGenerationPolicyBlock([]config.GenerationOperation{config.GenerationTextToImage}, false)
-	if !strings.Contains(raw, "prompt_mode=raw") || !strings.Contains(raw, "尽量保持用户的原始描述") {
-		t.Fatalf("raw policy is incomplete: %q", raw)
+	if strings.Contains(policy, "prompt_mode") || strings.Contains(policy, "提示词辅助") {
+		t.Fatalf("generation policy still exposes removed prompt-assist controls: %q", policy)
 	}
-	if got := buildGenerationPolicyBlock(nil, true); got != "" {
+	if got := buildGenerationPolicyBlock(nil); got != "" {
 		t.Fatalf("disabled generation policy = %q, want empty", got)
 	}
 }

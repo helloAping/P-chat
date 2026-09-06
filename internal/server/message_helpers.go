@@ -1224,8 +1224,6 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		UseImageRecognition:            m.UseImageRecognition,
 		EnabledRecognitionCapabilities: append([]config.MediaKind(nil), m.RecognitionCapabilities...),
 		EnabledGenerationOperations:    append([]config.GenerationOperation(nil), m.GenerationOperations...),
-		GenerationModelOverrides:       cloneGenerationTargets(m.GenerationModelOverrides),
-		GenerationPromptAssist:         h.sessionGenerationPromptAssist(cv.ID),
 		SubAgentModelEnabled:           m.SubAgentModelEnabled,
 		SubAgentProvider:               m.SubAgentProvider,
 		SubAgentModel:                  m.SubAgentModel,

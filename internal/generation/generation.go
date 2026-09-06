@@ -9,26 +9,6 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 )
 
-// PromptMode controls whether the caller's prompt is preserved or may be
-// enriched before dispatch. Prompt enrichment is orchestrated above adapters.
-type PromptMode string
-
-const (
-	PromptModeAuto   PromptMode = "auto"
-	PromptModeRaw    PromptMode = "raw"
-	PromptModeAssist PromptMode = "assist"
-)
-
-// NormalizePromptMode returns auto for an empty value.
-func NormalizePromptMode(mode PromptMode) PromptMode {
-	switch mode {
-	case PromptModeRaw, PromptModeAssist:
-		return mode
-	default:
-		return PromptModeAuto
-	}
-}
-
 // Status is the vendor-neutral lifecycle state of a generation job.
 type Status string
 
@@ -64,15 +44,14 @@ type Dispatch struct {
 // Request is the complete vendor-neutral execution request. InputRefs are
 // opaque upload or generated-asset ids; tools never pass base64 or local paths.
 type Request struct {
-	SessionID  string                       `json:"session_id"`
-	ToolName   string                       `json:"tool_name"`
-	Operation  config.GenerationOperation   `json:"operation"`
-	Target     config.GenerationModelTarget `json:"target"`
-	Prompt     string                       `json:"prompt"`
-	PromptMode PromptMode                   `json:"prompt_mode"`
-	InputRefs  []string                     `json:"input_refs,omitempty"`
-	Options    map[string]any               `json:"options,omitempty"`
-	Dispatch   Dispatch                     `json:"-"`
+	SessionID string                       `json:"session_id"`
+	ToolName  string                       `json:"tool_name"`
+	Operation config.GenerationOperation   `json:"operation"`
+	Target    config.GenerationModelTarget `json:"target"`
+	Prompt    string                       `json:"prompt"`
+	InputRefs []string                     `json:"input_refs,omitempty"`
+	Options   map[string]any               `json:"options,omitempty"`
+	Dispatch  Dispatch                     `json:"-"`
 }
 
 // MaxGenerationInputBytes caps the aggregate bytes materialized for one media
@@ -109,11 +88,10 @@ type Executor interface {
 // separate from Targets so a stale/missing model selection is distinguishable
 // from an operation the user explicitly turned off.
 type Access struct {
-	Enabled      map[config.GenerationOperation]bool
-	Targets      map[config.GenerationOperation]config.GenerationModelTarget
-	Dispatches   map[config.GenerationOperation]Dispatch
-	PromptAssist bool
-	Executor     Executor
+	Enabled    map[config.GenerationOperation]bool
+	Targets    map[config.GenerationOperation]config.GenerationModelTarget
+	Dispatches map[config.GenerationOperation]Dispatch
+	Executor   Executor
 }
 
 // IsEnabled reports whether the conversation explicitly enabled an operation.

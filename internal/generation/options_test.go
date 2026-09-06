@@ -16,6 +16,9 @@ func TestNormalizeOptionsRejectsProviderControlFieldsAndExcessiveCost(t *testing
 	if _, err := NormalizeOptions(config.GenerationTextToImage, map[string]any{"count": float64(100)}); err == nil {
 		t.Fatal("an excessive image count must be rejected")
 	}
+	if _, err := NormalizeOptions(config.GenerationTextToVideo, map[string]any{"prompt_optimizer": true}); err == nil {
+		t.Fatal("prompt optimization must stay in application configuration, not tool arguments")
+	}
 }
 
 func TestNormalizeOptionsAppliesMediaSpecificBounds(t *testing.T) {

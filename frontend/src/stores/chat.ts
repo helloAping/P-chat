@@ -70,8 +70,6 @@ type SessionMetaState = {
   use_image_recognition?: boolean
   enabled_recognition_capabilities?: api.MediaKind[]
   enabled_generation_operations?: api.GenerationOperation[]
-  generation_model_overrides?: Partial<Record<api.GenerationOperation, api.GenerationModelTarget>>
-  generation_prompt_assist?: boolean
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
@@ -539,8 +537,6 @@ export const currentMeta = computed(() => {
     use_image_recognition: false,
     enabled_recognition_capabilities: [],
     enabled_generation_operations: [],
-    generation_model_overrides: {},
-    generation_prompt_assist: true,
     sub_agent_model_enabled: false,
     sub_agent_provider: '',
     sub_agent_model: '',
@@ -902,8 +898,6 @@ async function switchSessionBody(id: string) {
       use_image_recognition: s.use_image_recognition || false,
       enabled_recognition_capabilities: s.enabled_recognition_capabilities || (s.use_image_recognition ? ['image'] : []),
       enabled_generation_operations: s.enabled_generation_operations || [],
-      generation_model_overrides: s.generation_model_overrides || {},
-      generation_prompt_assist: s.generation_prompt_assist ?? true,
       sub_agent_model_enabled: s.sub_agent_model_enabled || false,
       sub_agent_provider: s.sub_agent_provider || '',
       sub_agent_model: s.sub_agent_model || '',
@@ -1070,8 +1064,6 @@ function buildCreateSessionOptions(): api.CreateSessionOptions {
     use_image_recognition: enabledCapabilities.includes('image'),
     enabled_recognition_capabilities: enabledCapabilities,
     enabled_generation_operations: meta.enabled_generation_operations || [],
-    generation_model_overrides: meta.generation_model_overrides || {},
-    generation_prompt_assist: meta.generation_prompt_assist ?? true,
     sub_agent_model_enabled: !!meta.sub_agent_model_enabled,
     sub_agent_provider: meta.sub_agent_provider || '',
     sub_agent_model: meta.sub_agent_model || '',
@@ -1189,8 +1181,6 @@ export async function renameSession(id: string, title: string) {
     s.use_image_recognition = resp.use_image_recognition ?? s.use_image_recognition
     s.enabled_recognition_capabilities = resp.enabled_recognition_capabilities ?? s.enabled_recognition_capabilities
     s.enabled_generation_operations = resp.enabled_generation_operations ?? s.enabled_generation_operations
-    s.generation_model_overrides = resp.generation_model_overrides ?? s.generation_model_overrides
-    s.generation_prompt_assist = resp.generation_prompt_assist ?? s.generation_prompt_assist
     s.sub_agent_model_enabled = resp.sub_agent_model_enabled ?? s.sub_agent_model_enabled
     s.sub_agent_provider = resp.sub_agent_provider ?? s.sub_agent_provider
     s.sub_agent_model = resp.sub_agent_model ?? s.sub_agent_model
@@ -1211,8 +1201,6 @@ export async function renameSession(id: string, title: string) {
       use_image_recognition: resp.use_image_recognition ?? state.sessionMeta[id].use_image_recognition,
       enabled_recognition_capabilities: resp.enabled_recognition_capabilities ?? state.sessionMeta[id].enabled_recognition_capabilities,
       enabled_generation_operations: resp.enabled_generation_operations ?? state.sessionMeta[id].enabled_generation_operations,
-      generation_model_overrides: resp.generation_model_overrides ?? state.sessionMeta[id].generation_model_overrides,
-      generation_prompt_assist: resp.generation_prompt_assist ?? state.sessionMeta[id].generation_prompt_assist,
       sub_agent_model_enabled: resp.sub_agent_model_enabled ?? state.sessionMeta[id].sub_agent_model_enabled,
       sub_agent_provider: resp.sub_agent_provider ?? state.sessionMeta[id].sub_agent_provider,
       sub_agent_model: resp.sub_agent_model ?? state.sessionMeta[id].sub_agent_model,

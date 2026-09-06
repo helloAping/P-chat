@@ -6,7 +6,7 @@
 
 目标：让 P-Chat 在不同会话中按需启用图片、视频、音频生成工具；一个厂商账号/API key 可以同时挂载大语言模型和媒体生成模型；每个生成模型可按 operation 使用独立且可覆盖的 API 端点；用户上传或历史生成的媒体通过会话内 ID 交给工具，由 LLM 自主决定是否作为生成输入；生成结果可在对话中预览、下载、追问，并在重启后可靠恢复。
 
-当前结论：把现有 Provider 从“LLM 接口”提升为“厂商账号与共享凭据边界”，在同一 Provider 下配置 `llm` 与 `media_generation` 两类模型。媒体模型显式声明 generation operation；应用为每个 operation 选择默认模型；会话再独立开关并可覆盖模型，运行时只取三层交集。内置厂商 preset 提供默认 API，用户可逐项覆盖。配置与密钥复用 Provider，但执行仍由独立 Generation Engine 和厂商 adapter 负责。媒体生媒体只传会话内 ID，并支持直接生成或“先获得媒体观察、再由 LLM 完善有效提示词、最后生成”的串行工作流。模型侧保留三个稳定生成工具，所有结果统一落为持久化 job 和本地 asset。
+当前结论：把现有 Provider 从“LLM 接口”提升为“厂商账号与共享凭据边界”，在同一 Provider 下配置 `llm` 与 `media_generation` 两类模型。媒体模型显式声明 generation operation；应用为每个 operation 选择默认模型；会话只独立开关能力，运行时按应用默认路由。内置厂商 preset 提供默认 API，用户可逐项覆盖。配置与密钥复用 Provider，但执行仍由独立 Generation Engine 和厂商 adapter 负责。媒体生媒体只传会话内 ID，并支持直接生成或“先获得媒体观察、再由 LLM 完善有效提示词、最后生成”的串行工作流。模型侧保留三个稳定生成工具，所有结果统一落为持久化 job 和本地 asset。
 
 ```mermaid
 flowchart LR
@@ -217,13 +217,14 @@ Status: Resolved — revised for operation routing
 
 每个工具增加必填或可推导的 `operation`。例如 `generate_video` 的 operation 只能是 `text_to_video | image_to_video | video_to_video`。Agent 为每个会话复制并收窄工具 schema：enum 只包含该会话已启用、且已有可用媒体生成模型的 operation；若只有一个 operation，可以在描述中明确默认值。
 
-公共参数：`operation`、`prompt`、`prompt_mode`、`count`、`seed`、`input_refs`。`prompt` 始终是最终提交给生成厂商的有效提示词；`prompt_mode=verbatim|llm_assisted` 表示它是按用户原意直接使用，还是由 LLM 结合媒体观察补充。`input_refs` 只携带会话内引用和语义角色：
+公共参数：`operation`、`prompt`、`count`、`seed`、`input_refs`。`prompt` 始终是对话 LLM
+根据用户要求和上下文整理后、最终提交给生成厂商的有效提示词，不再增加二次提示词增强
+模式。`input_refs` 只携带会话内引用和语义角色：
 
 ```json
 {
   "operation": "image_to_video",
   "prompt": "以画面中的山谷和云海为主体，镜头缓慢推进，云层自然向两侧移动，保持原图构图与光线风格",
-  "prompt_mode": "llm_assisted",
   "input_refs": [
     { "source": "upload", "id": "upl-abc123", "role": "start_frame" }
   ]
@@ -342,7 +343,9 @@ Status: Resolved
 
 `generation_job_inputs` 持久化 `job_id + source + source_id + role + ordinal`，不保存 base64 或绝对路径。活动任务对输入 upload/asset 形成保留引用，避免孤儿清理在异步视频尚未结束时删掉源文件；删除会话时先取消活动任务，再按引用计数清理。任务恢复时重新按 ID 解析输入，源文件缺失则稳定失败为 `input_missing`，不重新提交一个缺少输入的计费任务。
 
-`generation_jobs` 同时记录 `source_message_id`、最终 `effective_prompt` 和 `prompt_mode=verbatim|llm_assisted`。原始生成指令仍以用户消息为真源，不在 job 中复制整条用户消息；识图返回的长文本也不复制进 job。这样既能审计厂商实际收到的提示词，又不会把观察上下文重复存储。
+`generation_jobs` 同时记录 `source_message_id` 和最终 `effective_prompt`。原始生成指令仍以
+用户消息为真源，不在 job 中复制整条用户消息；识图返回的长文本也不复制进 job。这样既
+能审计厂商实际收到的提示词，又不会把观察上下文重复存储。
 
 该变更涉及配置、目录和 SQLite schema，实施时必须新增 `internal/upgrade` 版本步骤，并按现有迁移规范补充升级、幂等和回滚测试。
 
@@ -362,11 +365,11 @@ Status: Resolved
 
 1. 前端先通过上传接口保存文件，发送消息时 `attachments[]` 只携带 `upload_id/name/kind/mime/size`。SQLite 继续保存 `upl://<upload_id>` 引用，不保存附件 base64。
 2. Agent 在调用 LLM 前构造只读的 **Conversation Media Catalog**。本轮每个媒体附件都要向 LLM 暴露 `source/id/name/kind/mime/size/turn`，无论聊天模型是否能原生看图；历史上传由已有 attachment placeholder 暴露，历史生成结果由 `buildLLMMessages` 将 generation part 投影为含 `asset_id` 的短引用摘要。附件名只作为数据并做 JSON 转义/长度限制，不能被当作指令。
-3. LLM 根据用户意图、附件清单和当前可见的 `media_recognize` / `generate_*` schema 自主决定是否需要先理解媒体、是否生成、选择 operation，并在生成工具调用中给出最终 `prompt/prompt_mode/input_refs`。服务端不在工具调用后偷偷补附件，也不在 Generation Engine 中二次改写提示词。
+3. LLM 根据用户意图、附件清单和当前可见的 `media_recognize` / `generate_*` schema 自主决定是否需要先理解媒体、是否生成、选择 operation，并在生成工具调用中给出最终 `prompt/input_refs`。服务端不在工具调用后偷偷补附件，也不在 Generation Engine 中二次改写提示词。
 4. 工具 handler 把 `input_refs` 交给统一的 `GenerationInputResolver`：`source=upload` 复用现有会话引用校验与 `AttachmentResolver`；`source=generated_asset` 校验 `message_asset_refs`。解析结果是只读 path/stream 与可信元数据，不把路径或字节返回给 LLM。
 5. Resolver 在提交前校验会话归属、文件存在、MIME/魔数、媒体类型、角色、数量、大小和 operation 约束。当前轮附件可能尚在批量写入缓存，必须像现有 `validateConversationUploadReference()` 一样先 flush，保证第一次工具调用就能解析刚上传的 ID。
 6. Generation adapter 最后根据厂商协议读取输入：优先 multipart/厂商文件上传；只有厂商 API 明确要求时才在网络边界临时编码 base64/data URI。原始字节、base64、绝对路径和供应商上传凭据都不进入 LLM 工具参数、tool result、SQLite 消息、generation part 或日志。
-7. 工具结果只向模型返回结构化短摘要：`job_id`、operation、`prompt_mode`、输入引用摘要、`asset_id`、种类、尺寸/时长和状态，避免上下文膨胀。
+7. 工具结果只向模型返回结构化短摘要：`job_id`、operation、输入引用摘要、`asset_id`、种类、尺寸/时长和状态，避免上下文膨胀。
 
 Conversation Media Catalog 示例：
 
@@ -420,7 +423,7 @@ LLM 选择规则写入生成工具说明和 system prompt，而不是写死在 h
 - 有多个兼容附件时，可按用户说的文件名、顺序或“首帧/尾帧”选择；无法确定角色时先提问，不能默认全传。
 - 用户只要求“分析图片并给我一份提示词”时，识别后返回提示词文本，不调用生成工具；只有用户同时表达生成意图时才继续生成。
 
-提示词辅助采用三条理解路径，按顺序复用已有结果，避免重复识别：
+LLM 准备最终提示词时采用三条理解路径，按顺序复用已有结果，避免重复识别：
 
 | 当前状态 | 图片理解来源 | LLM 行为 |
 | --- | --- | --- |
@@ -431,11 +434,11 @@ LLM 选择规则写入生成工具说明和 system prompt，而不是写死在 h
 
 不新增一个与 `media_recognize` 重复的“提示词增强工具”。在现有工具中增加可选 `purpose=general|generation_prompt`：`generation_prompt` 使用稳定的定向问题，返回主体、构图、场景、光线、风格、可见文字、适合运动的元素和应保持不变的特征等有界事实。它只产出媒体观察，最终提示词仍由当前对话 LLM 结合用户生成指令编写。
 
-是否先理解图片由用户指令和提示词辅助偏好共同决定：
+是否先理解图片由用户指令和任务需要决定：
 
 - 用户明确说“先看图、描述画面、帮我补充提示词”时必须理解后再生成。
-- 用户明确说“提示词原样使用、不要分析图片”时使用 `prompt_mode=verbatim`，直接生成。
-- 对“让它动起来”“保持人物和场景，增加自然动作”这类依赖画面事实但提示很短的请求，自动模式下应先取得视觉观察再补充镜头、主体、动作、构图和风格约束。
+- 用户明确说“提示词原样使用、不要分析图片”时直接使用该描述生成。
+- 对“让它动起来”“保持人物和场景，增加自然动作”这类依赖画面事实但提示很短的请求，应先取得视觉观察再补充镜头、主体、动作、构图和风格约束。
 - 用户已经给出完整、与画面内容无关的动作/镜头要求时，可直接生成，避免额外识别费用和延迟。
 - `media_recognize` 结果和图片 OCR 文本都视为不可信观察数据，不是系统指令；LLM 只能提取与生成有关的事实，不能执行图片中出现的命令。
 
@@ -453,7 +456,7 @@ Status: Resolved — revised for model/app/session layering
 
 ### Question
 
-供应商添加媒体模型时怎样声明文生视频、图生视频等能力，应用怎样为每种能力选择不同默认模型，会话又怎样开关和覆盖？
+供应商添加媒体模型时怎样声明文生视频、图生视频等能力，应用怎样为每种能力选择不同默认模型，会话又怎样开关？
 
 ### Answer
 
@@ -463,51 +466,35 @@ Status: Resolved — revised for model/app/session layering
 | --- | --- | --- |
 | 供应商/模型 | `ModelConfig.Generation.Operations` | 声明该媒体模型真实支持哪些 canonical operation，以及各自端点和约束 |
 | 应用配置 | `generation.defaults[operation]` | 为每个 operation 选择默认 Provider/Model；不同能力可以选不同模型 |
-| 会话配置 | `enabled_generation_operations` + 可选 model override | 决定当前会话把哪些能力开放给 LLM，以及是否覆盖应用默认模型 |
+| 会话配置 | `enabled_generation_operations` | 只决定当前会话把哪些能力开放给 LLM |
 | 运行时 | effective target + filtered tool schema | 取前三层交集，生成本轮实际可见工具和参数范围 |
 
 会话元数据示例：
 
 ```json
 {
-  "enabled_generation_operations": ["text_to_image", "image_to_image", "image_to_video"],
-  "generation_prompt_assist": "auto",
-  "generation_model_overrides": {
-    "image_to_image": {
-      "provider": "volcengine-main",
-      "model": "<image-model-id>"
-    },
-    "image_to_video": {
-      "provider": "minimax-main",
-      "model": "<video-model-id>"
-    }
-  }
+  "enabled_generation_operations": ["text_to_image", "image_to_image", "image_to_video"]
 }
 ```
 
-`generation_prompt_assist` 是会话级行为偏好，不是新的付费授权：
-
-- `off`：除非用户明确要求，否则不为了补提示词主动识别媒体。
-- `auto`（默认）：LLM 根据请求是否依赖画面事实决定；优先复用原生视觉或已有 preflight，仅在媒体识别能力已启用时才能额外调用 `media_recognize`。
-- `always`：媒体生媒体前尽量先获得媒体观察；可能增加延迟和识别费用，GUI 需要明确提示。没有识别能力时不得绕过权限，应询问用户是直接生成还是先启用识别。
-
-用户本轮的明确指令优先级高于会话偏好，例如“不要分析，直接用这段提示词”覆盖 `always`，“请先看图再补充”覆盖 `off`。该字段进入 `ChatRequest` 和 system prompt signature，但不由 Generation Engine 强制猜测。
+对话 LLM 本身负责根据用户要求和上下文准备最终提示词，因此不再设置会话级提示词辅助
+开关，也不在生成引擎中二次改写。需要理解附件时，LLM 仍可按任务需要调用已授权的
+`media_recognize`。
 
 有效目标解析规则：
 
 1. 会话未启用 operation：直接不可见，不解析模型。
-2. 会话有显式 override：只尝试该 Provider/Model；失效时标记该能力不可用，不静默切换到可能价格不同的应用默认模型。
-3. 会话选择“跟随应用默认”：使用 `generation.defaults[operation]`。
-4. 目标模型必须存在、`type=media_generation`、显式声明该 operation、adapter 与必需端点可用，才产生 effective target；否则返回结构化不可用原因。
-5. `ChatRequest` 携带 effective targets 和 `generation_prompt_assist`；Agent 再收窄 `media_recognize` / `generate_*` 工具的 operation、`input_refs.role` 和参数 schema，并把本轮 Conversation Media Catalog 交给 LLM。
-6. 配置热更新后，失效 operation 立即从后续回合消失；正在运行的 job 继续使用创建时冻结的 Provider、Model、端点和认证引用快照。
+2. 已启用 operation 只使用 `generation.defaults[operation]`，会话不能覆盖 Provider/Model。
+3. 目标模型必须存在、`type=media_generation`、显式声明该 operation、adapter 与必需端点可用，才产生 effective target；否则返回结构化不可用原因。
+4. `ChatRequest` 只携带启用的 operations；Agent 收窄 `media_recognize` / `generate_*` 工具的 operation、`input_refs.role` 和参数 schema，并把本轮 Conversation Media Catalog 交给 LLM。
+5. 配置热更新后，失效 operation 立即从后续回合消失；正在运行的 job 继续使用创建时冻结的 Provider、Model、端点和认证引用快照。
 
 会话设置复用现有 InputArea“能力工具”交互，拆为“媒体理解”和“媒体生成”：
 
 - 媒体生成按图片、视频、音频分组，每个 operation 独立开关，例如“文生视频”“图生视频”“视频生视频”，不能只提供一个笼统的“视频生成”总开关。
-- 每行显示当前 effective Provider/Model。默认选择“跟随应用配置”；有多个可用候选时允许切换为会话专用模型，并写入 `generation_model_overrides`。
-- 没有应用默认且没有会话 override 时，开关禁用并提示“请先到应用设置 > 媒体生成选择模型”。
-- 模型或端点失效时保留用户原选择并显示具体原因，不自动改写会话元数据；用户可手工切回“跟随应用默认”。
+- 会话界面只显示能力多选，不显示模型路由；所选能力直接使用应用默认模型。
+- 没有可用应用默认时，能力不出现在可选列表，并提示“请先到应用设置 > 媒体生成选择模型”。
+- 模型或端点失效后，该 operation 立即不可用，但不自动改写会话中的能力授权记录。
 - 新会话的生成 operation 默认关闭，避免未明确授权的付费调用；应用默认只解决“用哪个模型”，不等于“所有会话自动开启”。
 
 运行时工具映射保持稳定：
@@ -516,9 +503,9 @@ Status: Resolved — revised for model/app/session layering
 - 同时启用 `text_to_video + image_to_video`：仍只暴露一个 `generate_video`，LLM 根据附件和意图选择 operation。
 - 视频 operation 全关闭：不暴露 `generate_video`；图片和音频工具不受影响。
 
-服务端增加统一发现视图 `GET /api/v1/generation/options?session_id=<id>`，供应用设置和会话设置消费。每个 operation 返回 `media_kind`、模型声明能力、应用默认目标、会话启用状态、会话覆盖、effective target、候选模型、`available` 和 `reason`。前端不自行拼接 Provider 列表推导可用性，避免与后端校验漂移。
+服务端增加统一发现视图 `GET /api/v1/generation/options?session_id=<id>`，供会话设置消费。每个 operation 返回 `media_kind`、应用默认目标、会话启用状态、`available` 和 `reason`。前端不自行拼接 Provider 列表推导可用性，避免与后端校验漂移。
 
-修改模型能力时执行引用检查：若准备移除的 operation 正被 `generation.defaults` 使用，保存返回 `409` 并指出需先修改的应用默认项；已有会话 override 不阻止模型维护，但会被实时标记为不可用。删除模型同样遵循该规则，且不会静默把历史会话切到其他收费模型。
+修改模型能力时执行引用检查：若准备移除的 operation 正被 `generation.defaults` 使用，保存返回 `409` 并指出需先修改的应用默认项。删除模型同样遵循该规则，不会静默把会话切到其他收费模型。
 
 用户不需要在每次发送前手工选择“文生视频”还是“图生视频”：会话开关只决定哪些生成操作已授权并可被 LLM 看见。一旦 `text_to_video` / `image_to_video` 等操作已启用，LLM 根据文本和 Media Catalog 自主选择；未启用的操作不能因为本轮上传了附件而被系统偷偷打开。
 
@@ -559,7 +546,7 @@ Status: Recommended
 
 建议五个阶段，厂商顺序固定为 Volcengine → MiniMax → 其他：
 
-1. **类型化配置 + Volcengine 图片闭环**：新增 Provider `vendor`、Model `type/generation.operations`、`generation.defaults`、下一配置升级步骤（当前版本基线为 V9，实施时新增 V10）、preset 默认端点与 override 解析；完成供应商模型能力表单、应用 operation→默认模型矩阵、`GET /generation/options`、会话 operation 开关/override、Conversation Media Catalog、`input_refs`、会话级 ID resolver、`generation_prompt_assist` 和识别→生成串行约束，再完成一个 Volcengine `text_to_image + image_to_image` 闭环、job/asset、`generate_image`、generation part 和图片展示。
+1. **类型化配置 + Volcengine 图片闭环**：新增 Provider `vendor`、Model `type/generation.operations`、`generation.defaults`、下一配置升级步骤（当前版本基线为 V9，实施时新增 V10）、preset 默认端点解析；完成供应商模型能力表单、应用 operation→默认模型矩阵、`GET /generation/options`、会话 operation 开关、Conversation Media Catalog、`input_refs`、会话级 ID resolver 和识别→生成串行约束，再完成一个 Volcengine `text_to_image + image_to_image` 闭环、job/asset、`generate_image`、generation part 和图片展示。
 2. **Volcengine 异步视频闭环**：基于同一个 Provider/API key 增加视频媒体模型，完成首个官方支持的视频 operation、持久 worker、轮询/取消/重启恢复和视频 Range 播放；再按官方矩阵补齐同模型支持的其他视频 operation。
 3. **MiniMax 第二厂商闭环**：接入 MiniMax adapter/preset，至少复用一个已完成的图片或视频 operation，验证“同一工具 + 切换 Provider/Model”无需修改工具协议；再扩展 MiniMax 官方支持的其他 operation。
 4. **音频与输入复用**：从 Volcengine/MiniMax 官方能力中选择首个音频 operation；完成 `media_recognize(asset_ids)` 和 upload/asset 输入统一解析。`text_to_speech`、音乐、音效和 audio-to-audio 只实现已验证的子集。
@@ -571,7 +558,7 @@ Status: Recommended
 - 前端：`api/client.ts`、`stores/chat.ts`、`InputArea.vue`、`AppSettingsModal.vue`、`MessageBubble.vue`、`GeneratedMediaCard.vue`（新增）。
 - 文档：`.agents/docs/{tool,config,agent,server,memory,frontend,frontend-design}.md` 与 README 操作入口。
 
-每阶段验收都覆盖：模型只能选择 preset 支持或自定义声明的 operation、应用默认下拉只出现支持该 operation 的媒体模型、移除被应用默认引用的能力返回 409、会话开关与 override 正确持久化、显式失效 override 不静默回退、工具 operation enum 等于当前有效启用集合、类型错误或模型不可用时工具不可见、聊天模型列表不出现媒体模型、默认端点/用户覆盖切换正确、LLM 能从单附件场景生成正确 `input_refs`、直接生成不触发多余识别、原生视觉/preflight 不重复识别、需要理解时严格按“识别完成→下一轮生成”串行、只要提示词时不误生成、`verbatim/llm_assisted` 与最终提示词可审计、多附件歧义时提问、越权/伪造/类型错误 ID 被拒绝、工具与历史中无 base64、同步/异步成功、失败/取消、重启恢复、历史重载、SSE 断流恢复、分支/重答、对话压缩保留媒体引用、活动任务输入不被清理、资产删除引用计数、密钥脱敏、Go 测试、`vue-tsc -b` 和前端 build。
+每阶段验收都覆盖：模型只能选择 preset 支持或自定义声明的 operation、应用默认下拉只出现支持该 operation 的媒体模型、移除被应用默认引用的能力返回 409、会话开关正确持久化且只能使用应用默认模型、工具 operation enum 等于当前有效启用集合、类型错误或模型不可用时工具不可见、聊天模型列表不出现媒体模型、默认端点切换正确、LLM 能从单附件场景生成正确 `input_refs`、直接生成不触发多余识别、原生视觉/preflight 不重复识别、需要理解时严格按“识别完成→下一轮生成”串行、只要提示词时不误生成、最终提示词可审计、多附件歧义时提问、越权/伪造/类型错误 ID 被拒绝、工具与历史中无 base64、同步/异步成功、失败/取消、重启恢复、历史重载、SSE 断流恢复、分支/重答、对话压缩保留媒体引用、活动任务输入不被清理、资产删除引用计数、密钥脱敏、Go 测试、`vue-tsc -b` 和前端 build。
 
 ## #11: “生成音频”具体包含什么？
 

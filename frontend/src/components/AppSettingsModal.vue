@@ -2751,7 +2751,7 @@ function kbModelSupportsVision(scanModel: string) {
 
                 <NCollapseItem title="媒体生成" name="generation">
                   <p class="settings-section-description">
-                    为每种生成能力选择应用级默认模型。会话可单独覆盖模型；未配置默认模型的能力仍可在会话里选择其他兼容模型。
+                    为每种生成能力选择应用级默认模型。会话只负责开启能力，实际调用始终使用这里配置的模型。
                   </p>
                   <div class="generation-default-list">
                     <section v-for="item in generationOperationDefs" :key="item.operation" class="generation-default-row">
