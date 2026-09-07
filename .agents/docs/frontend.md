@@ -161,7 +161,8 @@ LLM 提供商页复用 `api.testProvider(provider, model?)`：顶部「测试默
 回复摘要，失败 toast 展示后端返回的标准化错误。
 
 Provider 基础表单通过 `ProviderHeadersEditor.vue` 编辑供应商级请求头键值行。编辑器提供
-空态添加、重复/非法名称提示、删除与「填入示例」，并展示全部可用动态参数；示例包含
+空态添加、重复/非法名称提示、删除与「填入示例」，并按「会话与链路 / 请求级生成」展示
+全部可用动态参数。每个参数支持鼠标悬停查看用途、稳定范围及适用场景；示例包含
 `x-opencode-session: {{conversation_id}}`、当前消息 ID、随机 UUID 与雪花 ID。现有 Provider
 编辑只在请求头变化时 PATCH `custom_headers`，新增 Provider 随创建请求一并提交。
 

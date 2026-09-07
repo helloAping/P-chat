@@ -1,12 +1,25 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { NButton, NInput } from 'naive-ui'
-import { Plus, Trash2 } from './icons'
+import { NButton, NInput, NTooltip } from 'naive-ui'
+import { HelpCircle, Plus, Trash2 } from './icons'
 
 interface ProviderHeaderRow {
   id: string
   name: string
   value: string
+}
+
+interface HeaderPlaceholder {
+  value: string
+  label: string
+  description: string
+  scope: string
+  usage: string
+}
+
+interface HeaderPlaceholderGroup {
+  label: string
+  items: HeaderPlaceholder[]
 }
 
 const props = defineProps<{
@@ -27,15 +40,73 @@ const exampleHeaders: Array<Omit<ProviderHeaderRow, 'id'>> = [
   { name: 'x-snowflake-id', value: '{{snowflake_id}}' },
 ]
 
-const placeholderGroups = [
-  { value: '{{conversation_id}}', label: '当前对话' },
-  { value: '{{session_id}}', label: '当前对话（别名）' },
-  { value: '{{message_id}}', label: '当前消息' },
-  { value: '{{trace_id}}', label: '链路追踪' },
-  { value: '{{uuid}}', label: '随机 UUID' },
-  { value: '{{snowflake_id}}', label: '雪花 ID' },
-  { value: '{{timestamp}}', label: '秒时间戳' },
-  { value: '{{timestamp_ms}}', label: '毫秒时间戳' },
+const placeholderGroups: HeaderPlaceholderGroup[] = [
+  {
+    label: '会话与链路',
+    items: [
+      {
+        value: '{{conversation_id}}',
+        label: '对话 ID',
+        description: '当前 P-Chat 对话的稳定标识，同一对话的多轮模型调用保持不变。无会话上下文的请求可能为空。',
+        scope: '整个对话',
+        usage: '推荐用于 x-opencode-session 等需要跨轮稳定的会话请求头。',
+      },
+      {
+        value: '{{session_id}}',
+        label: '会话 ID（别名）',
+        description: 'conversation_id 的兼容别名，两者始终展开为相同值。无会话上下文的请求可能为空。',
+        scope: '整个对话',
+        usage: '用于上游接口以 session_id 命名会话标识的场景。',
+      },
+      {
+        value: '{{message_id}}',
+        label: '消息 ID',
+        description: '触发当前调用的消息标识；不同消息通常不同，连接测试或模型列表请求可能为空。',
+        scope: '当前消息',
+        usage: '适合关联一轮用户消息与对应的上游请求。',
+      },
+      {
+        value: '{{trace_id}}',
+        label: 'Trace ID',
+        description: '当前调用链路的追踪标识；未创建追踪上下文时可能为空。',
+        scope: '当前请求链路',
+        usage: '适合串联 P-Chat 日志、代理日志与上游服务日志。',
+      },
+    ],
+  },
+  {
+    label: '请求级生成',
+    items: [
+      {
+        value: '{{uuid}}',
+        label: '随机 UUID',
+        description: '每次上游 HTTP 请求生成一个新的标准 UUID；同一请求的多个请求头共享该值。',
+        scope: '单次上游请求',
+        usage: '适合作为 x-request-id，不适合作为需要跨轮稳定的会话 ID。',
+      },
+      {
+        value: '{{snowflake_id}}',
+        label: '雪花 ID',
+        description: '每次上游 HTTP 请求生成一个本地 64 位雪花 ID；同一请求的多个请求头共享该值。',
+        scope: '单次上游请求',
+        usage: '适合需要纯数字请求标识的上游接口。',
+      },
+      {
+        value: '{{timestamp}}',
+        label: '秒时间戳',
+        description: '请求发出前生成的 Unix 秒级时间戳。',
+        scope: '单次上游请求',
+        usage: '适合上游鉴权、审计或请求时效校验。',
+      },
+      {
+        value: '{{timestamp_ms}}',
+        label: '毫秒时间戳',
+        description: '请求发出前生成的 Unix 毫秒级时间戳。',
+        scope: '单次上游请求',
+        usage: '适合需要毫秒精度的鉴权、排序或审计场景。',
+      },
+    ],
+  },
 ]
 
 const duplicateNames = computed(() => {
@@ -129,17 +200,55 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
       尚未配置额外请求头，点击添加一行
     </button>
 
-    <div class="placeholder-strip">
-      <span class="placeholder-lead">动态参数</span>
-      <span
-        v-for="placeholder in placeholderGroups"
-        :key="placeholder.value"
-        class="placeholder-chip"
-        :title="placeholder.label"
-      >{{ placeholder.value }}</span>
+    <div class="placeholder-catalog">
+      <div class="placeholder-catalog-head">
+        <span class="placeholder-catalog-title">动态参数</span>
+        <span class="placeholder-catalog-hint">
+          <HelpCircle :size="12" />
+          鼠标悬停查看用途
+        </span>
+      </div>
+      <div v-for="group in placeholderGroups" :key="group.label" class="placeholder-group">
+        <span class="placeholder-group-label">{{ group.label }}</span>
+        <div class="placeholder-strip">
+          <NTooltip
+            v-for="placeholder in group.items"
+            :key="placeholder.value"
+            placement="top-start"
+            :delay="180"
+          >
+            <template #trigger>
+              <span
+                class="placeholder-chip"
+                :aria-label="`${placeholder.value}：${placeholder.label}。${placeholder.description}`"
+              >
+                <code>{{ placeholder.value }}</code>
+                <span>{{ placeholder.label }}</span>
+              </span>
+            </template>
+            <div class="placeholder-tooltip">
+              <div class="placeholder-tooltip-head">
+                <strong>{{ placeholder.label }}</strong>
+                <code>{{ placeholder.value }}</code>
+              </div>
+              <p>{{ placeholder.description }}</p>
+              <dl>
+                <div>
+                  <dt>稳定范围</dt>
+                  <dd>{{ placeholder.scope }}</dd>
+                </div>
+                <div>
+                  <dt>适用场景</dt>
+                  <dd>{{ placeholder.usage }}</dd>
+                </div>
+              </dl>
+            </div>
+          </NTooltip>
+        </div>
+      </div>
     </div>
     <p class="headers-footnote">
-      动态值在每次上游请求发出前生成；同一次请求中的多个请求头共享同一个 UUID 与雪花 ID。自定义值会覆盖同名默认请求头。
+      模板会在上游请求发出前展开；自定义值会覆盖同名默认请求头。
     </p>
   </div>
 </template>
@@ -157,6 +266,8 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 .headers-editor-head,
 .headers-editor-title,
 .headers-editor-actions,
+.placeholder-catalog-head,
+.placeholder-catalog-hint,
 .placeholder-strip {
   display: flex;
   align-items: center;
@@ -251,26 +362,117 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
   outline-offset: var(--space-1);
 }
 
+.placeholder-catalog {
+  display: grid;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.placeholder-catalog-head {
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.placeholder-catalog-title {
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.placeholder-catalog-hint {
+  gap: var(--space-1);
+  color: var(--text-quaternary);
+  font-size: 11.5px;
+}
+
+.placeholder-group {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: var(--space-2);
+  align-items: start;
+}
+
+.placeholder-group-label {
+  padding-top: var(--space-1);
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+}
+
 .placeholder-strip {
   gap: var(--space-1);
   flex-wrap: wrap;
 }
 
-.placeholder-lead {
-  margin-right: var(--space-1);
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-}
-
 .placeholder-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
   padding: var(--space-1) var(--space-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: var(--surface-1);
   color: var(--text-secondary);
-  font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.35;
+  cursor: help;
+  transition: border-color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+
+.placeholder-chip code,
+.placeholder-tooltip code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.placeholder-chip > span {
+  color: var(--text-quaternary);
+}
+
+.placeholder-chip:hover {
+  border-color: var(--brand-500);
+  background: var(--surface-3);
+  color: var(--brand-600);
+}
+
+.placeholder-tooltip {
+  display: grid;
+  gap: var(--space-2);
+  max-width: 320px;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.placeholder-tooltip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.placeholder-tooltip p,
+.placeholder-tooltip dl,
+.placeholder-tooltip dd {
+  margin: 0;
+}
+
+.placeholder-tooltip dl {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.placeholder-tooltip dl > div {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.placeholder-tooltip dt {
+  opacity: 0.68;
+}
+
+.placeholder-tooltip dd {
+  font-weight: 500;
 }
 
 @media (max-width: 720px) {
@@ -294,6 +496,11 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
   .header-row > :nth-child(3) {
     grid-column: 2;
     grid-row: 1 / span 2;
+  }
+
+  .placeholder-group {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
   }
 }
 </style>
