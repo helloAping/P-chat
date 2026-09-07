@@ -412,6 +412,57 @@ func TestRun_V11ToV12MigratesModelAPIEndpointSuffixes(t *testing.T) {
 	}
 }
 
+func TestRun_V12ToV13InitializesProviderCustomHeaders(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755)
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	legacyConfig := `{
+  "llm": {"providers": [
+    {"name":"openai","protocol":"openai","base_url":"https://api.example/v1"},
+    {"name":"custom","protocol":"openai","base_url":"https://proxy.example/v1","custom_headers":{"X-Existing":"value"}}
+  ]}
+}`
+	if err := os.WriteFile(configPath, []byte(legacyConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V12); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V12: %v", err)
+	}
+	if err := stepV12toV13(db); err != nil {
+		t.Fatalf("second V13 migration should be idempotent: %v", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	providers := doc["llm"].(map[string]any)["providers"].([]any)
+	initialized := providers[0].(map[string]any)["custom_headers"].(map[string]any)
+	if len(initialized) != 0 {
+		t.Fatalf("initialized custom_headers = %#v", initialized)
+	}
+	existing := providers[1].(map[string]any)["custom_headers"].(map[string]any)
+	if existing["X-Existing"] != "value" {
+		t.Fatalf("existing custom_headers changed: %#v", existing)
+	}
+	if v := readUserVersion(); v != Current {
+		t.Fatalf("version = %d, want Current", v)
+	}
+}
+
 func TestUserVersion(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)

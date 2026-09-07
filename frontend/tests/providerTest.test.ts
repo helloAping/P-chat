@@ -54,3 +54,18 @@ test('fetching an upstream model opens the regular model editor before persisten
 	assert.doesNotMatch(settings, /async function onImportUpstreamModel/)
 	assert.match(client, /export const fetchUpstreamModels/)
 })
+
+test('provider settings persists custom header templates and exposes dynamic examples', () => {
+	const settings = readSettingsSource()
+	const client = readClientSource()
+	const editor = readFileSync(new URL('../src/components/ProviderHeadersEditor.vue', import.meta.url), 'utf8')
+
+	assert.match(client, /custom_headers\?: Record<string, string>/)
+	assert.match(settings, /body\.custom_headers = providerHeaderRowsToRecord\(editCustomHeaders\.value\)/)
+	assert.match(settings, /custom_headers: customHeaders/)
+	assert.match(editor, /x-opencode-session/)
+	assert.match(editor, /\{\{conversation_id\}\}/)
+	assert.match(editor, /\{\{message_id\}\}/)
+	assert.match(editor, /\{\{uuid\}\}/)
+	assert.match(editor, /\{\{snowflake_id\}\}/)
+})

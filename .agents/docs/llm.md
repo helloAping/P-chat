@@ -1,7 +1,7 @@
 # LLM 模块
 
 > **位置**：`internal/llm/`  
-> **依赖**：config（类型）  
+> **依赖**：config（类型）, requestheader, trace
 > **被依赖**：agent, server, memory（Summarizer）
 
 ## 概述
@@ -93,6 +93,7 @@ type StreamChunk struct {
 - 多 provider Base URL 与按模型解析的 `api_endpoint`（请求前统一拼接成完整地址）
 - HTTP 重试（指数退避，最大 3 次）
 - 自定义 HTTP 头（API key、organization 等）
+- Provider 自定义请求头模板；协议默认头设置完成后展开并覆盖同名字段
 - 流式连接超时
 - `ChatCM()` 非流式调用也用于 provider/model 的无状态 `sayhi` 连接测试
 
@@ -101,6 +102,12 @@ Provider 只选择 `openai` 或 `anthropic` 协议，不再选择厂商 preset�
 `/chat/completions`，Anthropic 新模型默认 `/messages`。`providerEntry` 根据本次请求的
 模型解析完整 URL，避免同一 Provider 下的模型互相覆盖端点。旧完整 `api_url` 仅由兼容
 读取与 V12 升级步骤拆分。
+
+`internal/requestheader` 从 Agent 注入的请求上下文读取 `SessionID` / `ClientMsgID`，并结合
+trace、UUID、雪花 ID 与时间戳展开 `ProviderConfig.CustomHeaders`。`ChatStreamCM()`、
+`ChatCM()`、旧 OpenAI/Anthropic 流式与非流式入口都在真正发送 HTTP 请求前调用同一套
+`Apply()`，因此主对话、识别、摘要与连接测试行为一致。自定义请求头最后应用，允许兼容
+网关覆盖 `Authorization`、`x-api-key`、`Content-Type` 等协议字段；传输层字段在保存时拒绝。
 
 ### 5. 错误分类
 

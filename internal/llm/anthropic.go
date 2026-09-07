@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/p-chat/pchat/internal/requestheader"
 	"github.com/p-chat/pchat/internal/trace"
 )
 
@@ -19,10 +20,18 @@ const (
 )
 
 type AnthropicClient struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	httpClient *http.Client
+	baseURL       string
+	apiKey        string
+	model         string
+	customHeaders map[string]string
+	httpClient    *http.Client
+}
+
+// WithCustomHeaders 设置供应商级请求头模板并返回当前客户端。
+// WithCustomHeaders sets provider-level header templates and returns the client.
+func (c *AnthropicClient) WithCustomHeaders(headers map[string]string) *AnthropicClient {
+	c.customHeaders = requestheader.CloneTemplates(headers)
+	return c
 }
 
 func NewAnthropicClient(baseURL, apiKey, model string) *AnthropicClient {
@@ -241,6 +250,10 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 		if tid := trace.FromContext(ctx); tid != "" {
 			req.Header.Set("X-Trace-Id", tid)
 		}
+		if err := requestheader.Apply(ctx, req.Header, c.customHeaders); err != nil {
+			ch <- StreamChunk{Err: fmt.Errorf("apply provider custom headers: %w", err)}
+			return
+		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -423,6 +436,12 @@ func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages [
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.apiKey)
 	req.Header.Set("anthropic-version", anthropicVersion)
+	if tid := trace.FromContext(ctx); tid != "" {
+		req.Header.Set("X-Trace-Id", tid)
+	}
+	if err := requestheader.Apply(ctx, req.Header, c.customHeaders); err != nil {
+		return "", fmt.Errorf("apply provider custom headers: %w", err)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/requestheader"
 )
 
 const (
@@ -306,7 +307,7 @@ func (e *HTTPExecutor) Generate(ctx context.Context, req Request) (Result, error
 	}
 	payload := buildVendorPayload(req, inputs)
 	createURL := endpointURL(req.Dispatch.BaseURL, req.Dispatch.OperationConfig.Endpoint, "")
-	response, err := e.callJSON(ctx, http.MethodPost, createURL, req.Dispatch.APIKey, payload)
+	response, err := e.callJSON(ctx, http.MethodPost, createURL, req.Dispatch.APIKey, req.Dispatch.CustomHeaders, payload)
 	if err != nil {
 		if suggestion := suggestedAsyncCreateEndpoint(req.Dispatch.OperationConfig.Endpoint, queryEndpoint); suggestion != "" {
 			return Result{}, fmt.Errorf("%w; async endpoint configuration looks inconsistent: verify whether the creation endpoint should be %s", err, suggestion)
@@ -342,7 +343,7 @@ func (e *HTTPExecutor) Generate(ctx context.Context, req Request) (Result, error
 			return Result{}, fmt.Errorf("wait for generation task %s: %w", jobID, err)
 		}
 		queryURL := endpointURL(req.Dispatch.BaseURL, queryEndpoint, jobID)
-		polled, err := e.callJSON(ctx, http.MethodGet, queryURL, req.Dispatch.APIKey, nil)
+		polled, err := e.callJSON(ctx, http.MethodGet, queryURL, req.Dispatch.APIKey, req.Dispatch.CustomHeaders, nil)
 		if err != nil {
 			return Result{}, fmt.Errorf("query generation task %s: %w", jobID, err)
 		}
@@ -357,7 +358,7 @@ func (e *HTTPExecutor) Generate(ctx context.Context, req Request) (Result, error
 		if len(assets) == 0 && status == StatusSucceeded && effectiveAdapter(req.Dispatch) == "minimax" {
 			if fileID := firstStringForKeys(polled, "file_id", "fileId"); fileID != "" {
 				fileURL := endpointURL(req.Dispatch.BaseURL, "/v1/files/retrieve?file_id="+url.QueryEscape(fileID), "")
-				fileResponse, callErr := e.callJSON(ctx, http.MethodGet, fileURL, req.Dispatch.APIKey, nil)
+				fileResponse, callErr := e.callJSON(ctx, http.MethodGet, fileURL, req.Dispatch.APIKey, req.Dispatch.CustomHeaders, nil)
 				if callErr != nil {
 					return Result{}, callErr
 				}
@@ -476,7 +477,7 @@ func buildVendorPayload(req Request, inputs []InputSource) map[string]any {
 	return payload
 }
 
-func (e *HTTPExecutor) callJSON(ctx context.Context, method, endpoint, apiKey string, payload map[string]any) (map[string]any, error) {
+func (e *HTTPExecutor) callJSON(ctx context.Context, method, endpoint, apiKey string, customHeaders map[string]string, payload map[string]any) (map[string]any, error) {
 	if strings.TrimSpace(endpoint) == "" {
 		return nil, errors.New("generation endpoint is empty")
 	}
@@ -499,6 +500,9 @@ func (e *HTTPExecutor) callJSON(ctx context.Context, method, endpoint, apiKey st
 	if apiKey != "" {
 		request.Header.Set("Authorization", "Bearer "+apiKey)
 		request.Header.Set("x-api-key", apiKey)
+	}
+	if err := requestheader.Apply(ctx, request.Header, customHeaders); err != nil {
+		return nil, fmt.Errorf("apply generation custom headers: %w", err)
 	}
 	client := e.Client
 	if client == nil {

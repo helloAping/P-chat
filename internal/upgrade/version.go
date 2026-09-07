@@ -70,7 +70,11 @@ const (
 	// editable endpoint suffixes; vendor presets are no longer configured.
 	V12 AppVersion = 12
 
+	// V13 — providers can persist validated custom request-header templates
+	// with per-request conversation, message, UUID, and Snowflake variables.
+	V13 AppVersion = 13
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V12
+	Current AppVersion = V13
 )

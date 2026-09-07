@@ -42,6 +42,7 @@ import (
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/internal/requestheader"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
@@ -489,6 +490,7 @@ func effectiveGenerationAccess(cfg *config.Config, operations []config.Generatio
 					Vendor:          provider.Vendor,
 					BaseURL:         provider.EffectiveBaseURL(),
 					APIKey:          provider.APIKey,
+					CustomHeaders:   requestheader.CloneTemplates(provider.CustomHeaders),
 					Adapter:         adapter,
 					OperationConfig: operationConfig,
 				}
@@ -2014,6 +2016,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// caller passed it via a different layer (defensive)
 		ctx = trace.WithID(ctx, tid)
 	}
+	ctx = requestheader.WithContext(ctx, req.SessionID, req.ClientMsgID)
 
 	// Per-stream monotonic counter for P3-1. sendOrDrop
 	// stamps each emitted chunk's Seq with nextSeq() (0, 1,

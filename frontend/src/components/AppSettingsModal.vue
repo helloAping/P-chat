@@ -39,6 +39,7 @@ import WebSearchSettings from './WebSearchSettings.vue'
 import IMSettings from './IMSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
+import ProviderHeadersEditor from './ProviderHeadersEditor.vue'
 import {
   byteSizeInputMinimum,
   byteSizeInputStep,
@@ -223,6 +224,8 @@ const editName = ref('')
 const editProtocol = ref<'openai' | 'anthropic'>('openai')
 const editBaseURL = ref('')
 const editAPIKey = ref('')
+type ProviderHeaderRow = { id: string; name: string; value: string }
+const editCustomHeaders = ref<ProviderHeaderRow[]>([])
 const editIsDefault = ref(false)
 
 // Track which fields the user actually touched so we only PATCH
@@ -237,7 +240,50 @@ const newName = ref('')
 const newProtocol = ref<'openai' | 'anthropic'>('openai')
 const newBaseURL = ref('')
 const newAPIKey = ref('')
+const newCustomHeaders = ref<ProviderHeaderRow[]>([])
 const newModel = ref('')
+
+let providerHeaderRowSequence = 0
+const providerHeaderNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+const providerHeaderPlaceholders = new Set([
+  'conversation_id', 'session_id', 'message_id', 'trace_id',
+  'uuid', 'snowflake_id', 'timestamp', 'timestamp_ms',
+])
+const providerReservedHeaders = new Set([
+  'connection', 'content-length', 'host', 'proxy-connection',
+  'te', 'trailer', 'transfer-encoding', 'upgrade',
+])
+
+function providerHeadersToRows(headers?: Record<string, string>): ProviderHeaderRow[] {
+  return Object.entries(headers || {}).map(([name, value]) => {
+    providerHeaderRowSequence += 1
+    return { id: `provider-header-form-${providerHeaderRowSequence}`, name, value }
+  })
+}
+
+function providerHeaderRowsToRecord(rows: ProviderHeaderRow[]): Record<string, string> {
+  if (rows.length > 32) throw new Error('自定义请求头最多支持 32 项')
+  const headers: Record<string, string> = {}
+  const names = new Set<string>()
+  for (const row of rows) {
+    const name = row.name.trim()
+    if (!name && !row.value) continue
+    if (!name) throw new Error('请求头名称不能为空')
+    if (!providerHeaderNamePattern.test(name)) throw new Error(`请求头名称格式无效: ${name}`)
+    const normalizedName = name.toLowerCase()
+    if (providerReservedHeaders.has(normalizedName)) throw new Error(`请求头由 HTTP 传输层管理，不能自定义: ${name}`)
+    if (names.has(normalizedName)) throw new Error(`请求头名称重复: ${name}`)
+    names.add(normalizedName)
+    if (/[\r\n]/.test(row.value)) throw new Error(`请求头值不能换行: ${name}`)
+    for (const match of row.value.matchAll(/\{\{([^{}]+)\}\}/g)) {
+      if (!providerHeaderPlaceholders.has(match[1])) throw new Error(`不支持的动态参数: ${match[0]}`)
+    }
+    const withoutTemplates = row.value.replace(/\{\{([^{}]+)\}\}/g, '')
+    if (withoutTemplates.includes('{{') || withoutTemplates.includes('}}')) throw new Error(`动态参数格式不完整: ${name}`)
+    headers[name] = row.value
+  }
+  return headers
+}
 
 // Add/edit model form (shown in NModal)
 const showAddModel = ref(false)
@@ -713,6 +759,7 @@ function openAddProvider() {
   newProtocol.value = 'openai'
   newBaseURL.value = ''
   newAPIKey.value = ''
+  newCustomHeaders.value = []
   newModel.value = ''
 }
 
@@ -721,6 +768,7 @@ function cancelAddProvider() {
   newName.value = ''
   newBaseURL.value = ''
   newAPIKey.value = ''
+  newCustomHeaders.value = []
   newModel.value = ''
 }
 
@@ -737,6 +785,7 @@ function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   editProtocol.value = (src.protocol as 'openai' | 'anthropic') || 'openai'
   editBaseURL.value = src.base_url || src.api_url || ''
   editAPIKey.value = src.api_key || ''
+  editCustomHeaders.value = providerHeadersToRows(src.custom_headers)
   editIsDefault.value = !!src.is_default
   dirty.value = new Set()
 }
@@ -756,11 +805,13 @@ async function onAddProvider() {
   }
   try {
     const addedName = newName.value.trim()
+    const customHeaders = providerHeaderRowsToRecord(newCustomHeaders.value)
     await api.addProvider({
       name: addedName,
       protocol: newProtocol.value,
       base_url: newBaseURL.value.trim(),
       api_key: newAPIKey.value.trim(),
+      custom_headers: customHeaders,
       model: newModel.value.trim(),
     })
     message.success('已添加')
@@ -812,6 +863,14 @@ async function onSaveProvider() {
   }
   if (dirty.value.has('api_key')) {
     body.api_key = editAPIKey.value
+  }
+  if (dirty.value.has('custom_headers')) {
+    try {
+      body.custom_headers = providerHeaderRowsToRecord(editCustomHeaders.value)
+    } catch (error: any) {
+      message.warning(error.message || '自定义请求头格式无效')
+      return
+    }
   }
   if (dirty.value.has('is_default') && editIsDefault.value) {
     body.set_default = true
@@ -2262,6 +2321,12 @@ function kbModelSupportsVision(scanModel: string) {
                     />
                     <span class="settings-form-hint">点击眼睛图标可临时显示明文</span>
                   </div>
+                  <div class="settings-form-row settings-form-row--span2">
+                    <ProviderHeadersEditor
+                      :model-value="editCustomHeaders"
+                      @update:model-value="(value: ProviderHeaderRow[]) => { editCustomHeaders = value; markDirty('custom_headers') }"
+                    />
+                  </div>
                   <div class="settings-form-row settings-form-row--span2 settings-form-row--inline">
                     <div class="settings-form-toggle">
                       <NSwitch
@@ -2365,7 +2430,7 @@ function kbModelSupportsVision(scanModel: string) {
           v-model:show="showAddProvider"
           preset="card"
           title="新增提供商"
-          :style="{ width: 'min(560px, calc(100vw - 32px))' }"
+          :style="{ width: 'min(700px, calc(100vw - 32px))' }"
           :mask-closable="false"
         >
           <p class="modal-lead">选择协议并填写供应商公共 Base URL；模型创建时再配置请求端点后缀。</p>
@@ -2400,6 +2465,9 @@ function kbModelSupportsVision(scanModel: string) {
                 size="small"
                 show-password-on="click"
               />
+            </div>
+            <div class="settings-form-row settings-form-row--span2">
+              <ProviderHeadersEditor v-model="newCustomHeaders" />
             </div>
             <div class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">默认对话模型</label>

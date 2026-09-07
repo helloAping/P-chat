@@ -39,6 +39,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V9:  stepV9toV10,
 	V10: stepV10toV11,
 	V11: stepV11toV12,
+	V12: stepV12toV13,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -455,6 +456,50 @@ func migrateModelAPIEndpoints() error {
 				delete(provider, legacyField)
 				changed = true
 			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return writeUpgradeFileAtomic(configPath, out, 0o644)
+}
+
+// ---- V12 → V13 ----
+
+func stepV12toV13(_ *sql.DB) error {
+	log.Print("[upgrade] V12 → V13: initializing provider custom request headers")
+	return migrateProviderCustomHeaders()
+}
+
+func migrateProviderCustomHeaders() error {
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	llmDoc, _ := root["llm"].(map[string]any)
+	providers, _ := llmDoc["providers"].([]any)
+	changed := false
+	for _, providerValue := range providers {
+		provider, _ := providerValue.(map[string]any)
+		if provider == nil {
+			continue
+		}
+		if _, exists := provider["custom_headers"]; !exists {
+			provider["custom_headers"] = map[string]any{}
+			changed = true
 		}
 	}
 	if !changed {

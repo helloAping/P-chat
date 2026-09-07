@@ -938,6 +938,7 @@ export interface ProviderInfo {
   // Returned only by pre-V12 servers; the settings form reads it as a fallback.
   api_url?: string
   api_key: string
+  custom_headers?: Record<string, string>
   is_default: boolean
   // Slim view from GET /api/v1/providers.
   model: string
@@ -1098,6 +1099,7 @@ export interface AddProviderRequest {
   protocol: 'openai' | 'anthropic'
   base_url: string
   api_key: string
+  custom_headers?: Record<string, string>
   model: string
 }
 
@@ -1144,6 +1146,7 @@ export interface UpdateProviderRequest {
   protocol?: 'openai' | 'anthropic'
   base_url?: string
   api_key?: string
+  custom_headers?: Record<string, string>
   set_default?: boolean
 }
 

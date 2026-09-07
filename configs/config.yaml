@@ -53,6 +53,12 @@ llm:
       protocol: "openai"
       base_url: "http://api-convert.08ms.cn/v1"
       api_key: ""
+      # Optional provider-wide headers. Dynamic values are expanded per request.
+      # custom_headers:
+      #   x-opencode-session: "{{conversation_id}}"
+      #   x-pchat-message-id: "{{message_id}}"
+      #   x-request-id: "{{uuid}}"
+      #   x-snowflake-id: "{{snowflake_id}}"
       models:
         - name: "doubao-seed-2.0-lite"
           api_endpoint: "/chat/completions"

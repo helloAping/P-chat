@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/requestheader"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/trace"
 	openai "github.com/sashabaranov/go-openai"
@@ -81,12 +82,13 @@ type ProviderInfo struct {
 }
 
 type providerEntry struct {
-	name         string // provider name (for error messages)
-	protocol     string // "openai" or "anthropic"
-	model        string
-	apiKey       string
-	baseURL      string
-	modelAPIURLs map[string]string
+	name          string // provider name (for error messages)
+	protocol      string // "openai" or "anthropic"
+	model         string
+	apiKey        string
+	baseURL       string
+	modelAPIURLs  map[string]string
+	customHeaders map[string]string
 
 	// ResponseHeaderTimeout bounds a stalled request before the server
 	// responds. StreamIdleTimeout only applies after a response is open,
@@ -305,8 +307,12 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 			apiKey:                p.APIKey,
 			baseURL:               p.EffectiveBaseURL(),
 			modelAPIURLs:          make(map[string]string),
+			customHeaders:         requestheader.CloneTemplates(p.CustomHeaders),
 			responseHeaderTimeout: defaultResponseHeaderTimeout,
 			streamIdleTimeout:     defaultStreamIdleTimeout,
+		}
+		if err := requestheader.ValidateTemplates(entry.customHeaders); err != nil {
+			return fmt.Errorf("provider %q custom_headers: %w", p.Name, err)
 		}
 		for _, model := range p.AllModels() {
 			if model.EffectiveType() == config.ModelTypeLLM {
@@ -443,6 +449,13 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	for k, v := range req.Headers {
 		httpReq.Header.Set(k, v)
 	}
+	if err := requestheader.Apply(ctx, httpReq.Header, p.customHeaders); err != nil {
+		cancelStream()
+		ch := make(chan StreamChunk, 1)
+		ch <- StreamChunk{Err: fmt.Errorf("apply provider custom headers: %w", err)}
+		close(ch)
+		return ch
+	}
 
 	headerTimeout, idleTimeout := streamTimeouts(p)
 	httpClient := streamingHTTPClient(headerTimeout)
@@ -521,6 +534,9 @@ func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, mes
 	httpReq.Header.Del("Connection")
 	if tid := trace.FromContext(ctx); tid != "" {
 		httpReq.Header.Set("X-Trace-Id", tid)
+	}
+	if err := requestheader.Apply(ctx, httpReq.Header, p.customHeaders); err != nil {
+		return "", fmt.Errorf("apply provider custom headers: %w", err)
 	}
 
 	resp, err := NewHTTPClient().Do(httpReq)
@@ -660,7 +676,9 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelN
 		if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
 			anthMax = mt
 		}
-		return NewAnthropicClient(p.endpointForModel(model), p.apiKey, model).ChatStream(ctx, model, messages, anthMax)
+		return NewAnthropicClient(p.endpointForModel(model), p.apiKey, model).
+			WithCustomHeaders(p.customHeaders).
+			ChatStream(ctx, model, messages, anthMax)
 	}
 
 	// OpenAI protocol
@@ -742,6 +760,10 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		}
 		if p.apiKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+		}
+		if err := requestheader.Apply(ctx, httpReq.Header, p.customHeaders); err != nil {
+			ch <- StreamChunk{Err: fmt.Errorf("apply provider custom headers: %w", err)}
+			return
 		}
 		headerTimeout, idleTimeout := streamTimeouts(p)
 		httpClient := streamingHTTPClient(headerTimeout)
@@ -1035,7 +1057,9 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
 			anthMax = mt
 		}
-		return NewAnthropicClient(p.endpointForModel(model), p.apiKey, model).Chat(ctx, model, messages, anthMax)
+		return NewAnthropicClient(p.endpointForModel(model), p.apiKey, model).
+			WithCustomHeaders(p.customHeaders).
+			Chat(ctx, model, messages, anthMax)
 	}
 
 	// OpenAI protocol. The configured API URL is already the complete
@@ -1063,6 +1087,12 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 	httpReq.Header.Set("Accept", "application/json")
 	if p.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+	if tid := trace.FromContext(ctx); tid != "" {
+		httpReq.Header.Set("X-Trace-Id", tid)
+	}
+	if err := requestheader.Apply(ctx, httpReq.Header, p.customHeaders); err != nil {
+		return "", fmt.Errorf("apply provider custom headers: %w", err)
 	}
 	resp, err := NewHTTPClient().Do(httpReq)
 	if err != nil {

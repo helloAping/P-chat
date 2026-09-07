@@ -1,7 +1,7 @@
 # Config 模块
 
 > **位置**：`internal/config/`  
-> **依赖**：paths  
+> **依赖**：paths, requestheader
 > **被依赖**：agent, server, subagent, cli, llm
 
 ## 概述
@@ -44,10 +44,28 @@ LLMConfig 核心字段：
 - `Providers[]` — 每个 provider 的端点、API key、模型列表
 - `Protocol` — "openai" | "anthropic"
 - `Provider.BaseURL` — 供应商公共 `http(s)` 地址；运行时与模型端点后缀拼接
+- `Provider.CustomHeaders` — 供应商级自定义请求头模板；支持固定值和请求级动态参数
 - `Model.APIEndpoint` — LLM 请求端点后缀；新模型按协议预填且允许编辑
 - `Models[]` — 每个模型的能力标记；`capabilities.input_modalities` 可显式配置 `image`、`video`、`audio`，旧版 `supports_vision` / `supports_audio` 仅作兼容回退
 - `Provider.BaseURL` / `Provider.Vendor` — 仅用于尚未升级配置的兼容读取；V12 会从全局配置移除，新配置与 UI 不再暴露厂商 preset
 - `Model.Type` — `llm`（缺省兼容值）或 `media_generation`
+
+`custom_headers` 示例：
+
+```json
+{
+  "x-opencode-session": "{{conversation_id}}",
+  "x-pchat-message-id": "{{message_id}}",
+  "x-request-id": "{{uuid}}",
+  "x-snowflake-id": "{{snowflake_id}}"
+}
+```
+
+允许的动态参数为 `conversation_id`、`session_id`、`message_id`、`trace_id`、`uuid`、
+`snowflake_id`、`timestamp`、`timestamp_ms`，统一使用 `{{name}}` 语法。新增/更新 Provider
+时由 `requestheader.ValidateTemplates()` 校验名称、重复项、换行注入、未知参数和 HTTP 传输层
+保留字段；PATCH 使用指针 map 区分“未提交”与“提交 `{}` 清空”。V13 升级步骤为旧 Provider
+初始化空 map。
 
 ### 3. 项目级配置合并
 

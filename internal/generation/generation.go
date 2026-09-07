@@ -37,6 +37,7 @@ type Dispatch struct {
 	Vendor          string
 	BaseURL         string
 	APIKey          string
+	CustomHeaders   map[string]string
 	Adapter         string
 	OperationConfig config.GenerationOperationConfig
 }

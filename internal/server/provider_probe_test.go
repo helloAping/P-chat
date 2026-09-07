@@ -33,6 +33,9 @@ func TestProbeUpstreamModels(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
 			t.Fatalf("Authorization = %q", got)
 		}
+		if got := r.Header.Get("X-Provider-Test"); got != "probe" {
+			t.Fatalf("X-Provider-Test = %q", got)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"data": []map[string]any{
 				{"id": "gpt-4o-mini", "created": 1, "owned_by": "openai"},
@@ -46,7 +49,7 @@ func TestProbeUpstreamModels(t *testing.T) {
 	r := gin.New()
 	r.POST("/api/v1/providers/probe-models", h.ProbeUpstreamModels)
 
-	body := `{"base_url":"` + upstream.URL + `/v1","api_key":"sk-test","protocol":"openai"}`
+	body := `{"base_url":"` + upstream.URL + `/v1","api_key":"sk-test","protocol":"openai","custom_headers":{"X-Provider-Test":"probe"}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/providers/probe-models", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -88,6 +91,9 @@ func TestFetchUpstreamModelsUsesSavedProviderBaseURL(t *testing.T) {
 			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
 			return
 		}
+		if got := r.Header.Get("X-Provider-Test"); got != "saved" {
+			t.Fatalf("X-Provider-Test = %q", got)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
 			{"id": "already-added", "owned_by": "vendor"},
 			{"id": "new-model", "owned_by": "vendor"},
@@ -97,7 +103,7 @@ func TestFetchUpstreamModelsUsesSavedProviderBaseURL(t *testing.T) {
 
 	cfg := fmt.Sprintf(`{
 		"llm": {"default":"saved","providers":[{
-			"name":"saved","protocol":"openai","base_url":%q,"api_key":"sk-test",
+			"name":"saved","protocol":"openai","base_url":%q,"api_key":"sk-test","custom_headers":{"X-Provider-Test":"saved"},
 			"models":[{"name":"already-added","api_endpoint":"/chat/completions","default":true}]
 		}]}
 	}`, upstream.URL+"/api/v3")
@@ -129,6 +135,9 @@ func TestProviderConnectionUsesDefaultModelAndSaysHi(t *testing.T) {
 		if r.URL.Path != "/v1/chat/completions" {
 			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
 			return
+		}
+		if got := r.Header.Get("X-Provider-Test"); got != "connection" {
+			t.Fatalf("X-Provider-Test = %q", got)
 		}
 		var body struct {
 			Model     string `json:"model"`
@@ -172,6 +181,7 @@ func TestProviderConnectionUsesDefaultModelAndSaysHi(t *testing.T) {
 				"protocol": "openai",
 				"base_url": %q,
 				"api_key": "sk-test",
+				"custom_headers": {"X-Provider-Test":"connection"},
 				"models": [
 					{"name": "model-a"},
 					{"name": "model-default", "default": true, "max_tokens_output": 4096}

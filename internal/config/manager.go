@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/internal/requestheader"
 )
 
 // Manager handles reading and writing config files.
@@ -139,6 +140,10 @@ func AddProvider(p ProviderConfig) error {
 	if p.EffectiveModel() != "" && strings.TrimSpace(p.EffectiveBaseURL()) == "" {
 		return fmt.Errorf("base_url is required for a provider with a conversational model")
 	}
+	if err := requestheader.ValidateTemplates(p.CustomHeaders); err != nil {
+		return fmt.Errorf("invalid custom_headers: %w", err)
+	}
+	p.CustomHeaders = requestheader.CloneTemplates(p.CustomHeaders)
 	if len(p.Models) == 0 && strings.TrimSpace(p.Model) != "" {
 		p.Models = []ModelConfig{{
 			Name:        p.Model,
@@ -255,6 +260,9 @@ type ProviderPatch struct {
 	// ClearAPIKey, if true, forces the key to be emptied
 	// even when the user-supplied APIKey is "".
 	ClearAPIKey bool
+	// CustomHeaders, when non-nil, replaces the complete header template map.
+	// An explicitly supplied empty map clears all custom headers.
+	CustomHeaders *map[string]string
 	// IsDefault, if true, promotes this provider to be the
 	// global default. (False is a no-op so the UI can
 	// always include the field without unintended
@@ -354,6 +362,12 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		p.APIKey = ""
 	} else if patch.APIKey != "" {
 		p.APIKey = patch.APIKey
+	}
+	if patch.CustomHeaders != nil {
+		if err := requestheader.ValidateTemplates(*patch.CustomHeaders); err != nil {
+			return nil, fmt.Errorf("invalid custom_headers: %w", err)
+		}
+		p.CustomHeaders = requestheader.CloneTemplates(*patch.CustomHeaders)
 	}
 	if patch.IsDefault {
 		if p.EffectiveModel() == "" {

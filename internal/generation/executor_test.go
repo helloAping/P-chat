@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/requestheader"
 )
 
 type stubInputResolver struct {
@@ -81,6 +82,37 @@ func TestHTTPExecutorImmediateImageMaterializesBase64(t *testing.T) {
 	}
 	if string(got) != string(imageBytes) {
 		t.Fatalf("stored bytes = %q", got)
+	}
+}
+
+func TestHTTPExecutorAppliesProviderCustomHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Session"); got != "conversation-42" {
+			t.Errorf("X-Session = %q", got)
+		}
+		if got := r.Header.Get("X-Message"); got != "73" {
+			t.Errorf("X-Message = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"b64_json": base64.StdEncoding.EncodeToString([]byte("image"))}},
+		})
+	}))
+	defer server.Close()
+
+	executor := NewHTTPExecutor(nil, NewLocalAssetStore(t.TempDir(), "/generated"))
+	executor.Client = server.Client()
+	ctx := requestheader.WithContext(context.Background(), "conversation-42", 73)
+	_, err := executor.Generate(ctx, Request{
+		SessionID: "conversation-42", Operation: config.GenerationTextToImage,
+		Target: config.GenerationModelTarget{Provider: "custom", Model: "image-model"}, Prompt: "lake",
+		Dispatch: Dispatch{
+			Target: config.GenerationModelTarget{Provider: "custom", Model: "image-model"}, BaseURL: server.URL,
+			CustomHeaders:   map[string]string{"X-Session": "{{conversation_id}}", "X-Message": "{{message_id}}"},
+			OperationConfig: config.GenerationOperationConfig{Endpoint: "/generate", TimeoutSeconds: 10},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

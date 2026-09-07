@@ -658,6 +658,67 @@ func TestUpdateProvider_PatchBaseURL(t *testing.T) {
 	}
 }
 
+func TestProviderCustomHeadersCRUD(t *testing.T) {
+	srv := newWebServer(t)
+	defer srv.Close()
+
+	addBody := `{"name":"headers","protocol":"openai","base_url":"http://example.test/v1","api_key":"k","model":"m","custom_headers":{"x-opencode-session":"{{conversation_id}}","x-request-id":"{{uuid}}"}}`
+	added, err := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(addBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	added.Body.Close()
+	if added.StatusCode != http.StatusCreated {
+		t.Fatalf("add status = %d", added.StatusCode)
+	}
+
+	get, err := http.Get(srv.URL + "/api/v1/providers/headers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer get.Body.Close()
+	var provider struct {
+		CustomHeaders map[string]string `json:"custom_headers"`
+	}
+	if err := json.NewDecoder(get.Body).Decode(&provider); err != nil {
+		t.Fatal(err)
+	}
+	if provider.CustomHeaders["x-opencode-session"] != "{{conversation_id}}" {
+		t.Fatalf("custom_headers = %#v", provider.CustomHeaders)
+	}
+
+	clearReq, _ := http.NewRequest(http.MethodPatch, srv.URL+"/api/v1/providers/headers", strings.NewReader(`{"custom_headers":{}}`))
+	clearReq.Header.Set("Content-Type", "application/json")
+	cleared, err := http.DefaultClient.Do(clearReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleared.Body.Close()
+	if cleared.StatusCode != http.StatusOK {
+		t.Fatalf("clear status = %d", cleared.StatusCode)
+	}
+	var clearedProvider struct {
+		CustomHeaders map[string]string `json:"custom_headers"`
+	}
+	if err := json.NewDecoder(cleared.Body).Decode(&clearedProvider); err != nil {
+		t.Fatal(err)
+	}
+	if len(clearedProvider.CustomHeaders) != 0 {
+		t.Fatalf("cleared custom_headers = %#v", clearedProvider.CustomHeaders)
+	}
+
+	invalidReq, _ := http.NewRequest(http.MethodPatch, srv.URL+"/api/v1/providers/headers", strings.NewReader(`{"custom_headers":{"Content-Length":"5"}}`))
+	invalidReq.Header.Set("Content-Type", "application/json")
+	invalid, err := http.DefaultClient.Do(invalidReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer invalid.Body.Close()
+	if invalid.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid status = %d, want 400", invalid.StatusCode)
+	}
+}
+
 // TestUpdateProvider_Rename verifies the new name is
 // persisted and the global default is cascaded.
 func TestUpdateProvider_Rename(t *testing.T) {

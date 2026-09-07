@@ -304,14 +304,15 @@ type ProviderConfig struct {
 	Name string `json:"name"`
 	// Vendor and APIURL are retained only for compatibility. New configuration
 	// uses Protocol + BaseURL; request paths live on individual models.
-	Vendor   string        `json:"vendor,omitempty"`
-	Protocol string        `json:"protocol,omitempty"` // "openai" | "anthropic"
-	Type     string        `json:"type,omitempty"`     // alias for Protocol (backward compat)
-	APIURL   string        `json:"api_url,omitempty"`  // legacy complete chat endpoint
-	BaseURL  string        `json:"base_url,omitempty"`
-	APIKey   string        `json:"api_key"`
-	Model    string        `json:"model,omitempty"` // legacy: single model
-	Models   []ModelConfig `json:"models,omitempty"`
+	Vendor        string            `json:"vendor,omitempty"`
+	Protocol      string            `json:"protocol,omitempty"` // "openai" | "anthropic"
+	Type          string            `json:"type,omitempty"`     // alias for Protocol (backward compat)
+	APIURL        string            `json:"api_url,omitempty"`  // legacy complete chat endpoint
+	BaseURL       string            `json:"base_url,omitempty"`
+	APIKey        string            `json:"api_key"`
+	CustomHeaders map[string]string `json:"custom_headers,omitempty"`
+	Model         string            `json:"model,omitempty"` // legacy: single model
+	Models        []ModelConfig     `json:"models,omitempty"`
 }
 
 // ModelConfig describes a single model under a provider.

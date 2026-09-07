@@ -968,6 +968,53 @@ func TestUpdateProvider_PartialPatch(t *testing.T) {
 	}
 }
 
+func TestUpdateProvider_CustomHeadersReplaceClearAndValidate(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k", "model": "m", "custom_headers": {"X-Old":"keep"} }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := map[string]string{"X-Session": "{{conversation_id}}", "X-Request-ID": "{{uuid}}"}
+	updated, err := UpdateProvider("cs", ProviderPatch{CustomHeaders: &replacement})
+	if err != nil {
+		t.Fatalf("replace custom headers: %v", err)
+	}
+	if updated.CustomHeaders["X-Old"] != "" || updated.CustomHeaders["X-Session"] != "{{conversation_id}}" {
+		t.Fatalf("CustomHeaders = %#v", updated.CustomHeaders)
+	}
+
+	invalid := map[string]string{"Content-Length": "5"}
+	if _, err := UpdateProvider("cs", ProviderPatch{CustomHeaders: &invalid}); err == nil {
+		t.Fatal("reserved custom header should be rejected")
+	}
+	preserved, err := UpdateProvider("cs", ProviderPatch{BaseURL: "http://new"})
+	if err != nil {
+		t.Fatalf("partial update: %v", err)
+	}
+	if preserved.CustomHeaders["X-Session"] != "{{conversation_id}}" {
+		t.Fatalf("partial update cleared CustomHeaders: %#v", preserved.CustomHeaders)
+	}
+
+	empty := map[string]string{}
+	cleared, err := UpdateProvider("cs", ProviderPatch{CustomHeaders: &empty})
+	if err != nil {
+		t.Fatalf("clear custom headers: %v", err)
+	}
+	if len(cleared.CustomHeaders) != 0 {
+		t.Fatalf("CustomHeaders = %#v, want empty", cleared.CustomHeaders)
+	}
+}
+
 // TestUpdateProvider_SetDefault verifies IsDefault promotes
 // the target provider to the global default and leaves the
 // others alone.

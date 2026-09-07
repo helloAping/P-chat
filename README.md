@@ -273,6 +273,7 @@ setup.exe
 - **协议**：OpenAI 兼容（绝大多数国内模型都走这个）或 Anthropic 原生（Claude）
 - **Base URL**：填写供应商公共地址，例如 DeepSeek 为 `https://api.deepseek.com/v1`、Anthropic 为 `https://api.anthropic.com/v1`；模型端点在模型编辑器内单独配置
 - **API key**：从对应平台申请，粘贴进 `sk-...` 输入框
+- **自定义请求头**：可添加固定值或动态模板；点击「填入示例」会生成会话、消息、UUID、雪花 ID 四种常用请求头
 - **模型类型**：可添加“大语言模型”或“媒体生成模型”；同一 Provider/API key 可混合使用
 - **模型端点**：LLM 默认按协议填入 `/chat/completions` 或 `/messages`，可编辑；媒体模型同样只填写相对于 Base URL 的创建/查询端点后缀
 - **媒体能力**：媒体模型按文生图、图生图、文生视频、图生视频、视频生视频、语音/音乐/音效等能力勾选；同一模型只配置一份端点和超时，调用时按能力提交不同参数。LLM 媒体识别能力可不选，留空即仅文本
@@ -503,6 +504,11 @@ llm:
       protocol: "openai"
       base_url: "https://api.deepseek.com/v1"
       api_key: "sk-xxx"
+      custom_headers:
+        x-opencode-session: "{{conversation_id}}"
+        x-pchat-message-id: "{{message_id}}"
+        x-request-id: "{{uuid}}"
+        x-snowflake-id: "{{snowflake_id}}"
       models:
         - name: "deepseek-chat"
           api_endpoint: "/chat/completions"
@@ -526,6 +532,19 @@ llm:
           api_endpoint: "/chat/completions"
           default: true
 ```
+
+`custom_headers` 支持固定字符串，也支持在请求发出前展开以下动态参数：
+
+| 动态参数 | 含义 |
+| --- | --- |
+| `{{conversation_id}}` / `{{session_id}}` | 当前对话 ID |
+| `{{message_id}}` | 当前用户消息 ID；连接测试或模型列表请求没有消息时为空 |
+| `{{trace_id}}` | 当前 P-Chat 链路追踪 ID |
+| `{{uuid}}` | 每次上游请求生成的随机 UUID |
+| `{{snowflake_id}}` | 每次上游请求生成的本地雪花 ID |
+| `{{timestamp}}` / `{{timestamp_ms}}` | 请求时刻的秒 / 毫秒 Unix 时间戳 |
+
+同一次请求里的多个请求头共享同一个 UUID 和雪花 ID。自定义值会覆盖 P-Chat 设置的同名协议请求头，适合需要特殊认证头的兼容网关；`Host`、`Content-Length`、`Connection` 等传输层请求头禁止配置。请求头会用于对话、连接测试、`/models` 与媒体生成 API，但不会转发到生成结果的外部下载地址。
 
 ### 已知坑
 

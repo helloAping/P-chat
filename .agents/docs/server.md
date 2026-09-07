@@ -38,6 +38,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 - 不传 `model` 时解析该 provider 的默认模型；传入时严格校验模型属于该 provider。
 - 向上游发送单条用户消息 `sayhi`，使用 30 秒超时并把输出限制为 64 token；不创建会话、不持久化消息，也不修改当前/默认模型。
 - 成功返回实际 `provider`、`model`、`response` 和 `elapsed_ms`；上游失败返回标准化 `error_kind`。
+- 测试客户端继承 Provider 的 `custom_headers`；无对话/消息上下文的动态参数展开为空，UUID、雪花 ID 和时间戳仍会生成。
 
 ## 核心概念
 
@@ -352,9 +353,11 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 - `GET /api/v1/generated/:id` 提供已实体化的图片、视频或音频；文件与归属 metadata 位于
   `~/.p-chat/generated/`，URL 在聊天历史中保持稳定。
 - Provider CRUD 包含 `protocol`、公共 `base_url`，Model CRUD 包含 `api_endpoint`、
-  `type`、`generation`；LLM/媒体端点均保存相对后缀，并在执行时与 Base URL 拼接。
+  `type`、`generation`；Provider 的 `custom_headers` 是完整替换的字符串 map，提交 `{}` 可清空。
+  LLM/媒体端点均保存相对后缀，并在执行时与 Base URL 拼接。
   `GET /api/v1/providers/:name/upstream-models` 使用 `base_url + /models` 获取候选模型；
-  不再接收或返回厂商 preset。聊天模型选择和连接测试只接受
+  并携带该 Provider 的自定义请求头。新增前的 `POST /providers/probe-models` 也接受临时
+  `custom_headers`。不再接收或返回厂商 preset。聊天模型选择和连接测试只接受
   `type=llm`，不会把媒体模型误发到 Chat Completions。
 
 首版异步任务在一次工具调用中轮询完成，尚无重启续查/取消端点。详见

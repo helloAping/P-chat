@@ -10,12 +10,13 @@ import (
 
 // AddProviderRequest is the body of POST /api/v1/providers.
 type AddProviderRequest struct {
-	Name     string `json:"name" binding:"required"`
-	Protocol string `json:"protocol" binding:"required"` // "openai" | "anthropic"
-	BaseURL  string `json:"base_url"`
-	APIURL   string `json:"api_url,omitempty"` // pre-V12 compatibility
-	APIKey   string `json:"api_key"`
-	Model    string `json:"model"`
+	Name          string            `json:"name" binding:"required"`
+	Protocol      string            `json:"protocol" binding:"required"` // "openai" | "anthropic"
+	BaseURL       string            `json:"base_url"`
+	APIURL        string            `json:"api_url,omitempty"` // pre-V12 compatibility
+	APIKey        string            `json:"api_key"`
+	CustomHeaders map[string]string `json:"custom_headers,omitempty"`
+	Model         string            `json:"model"`
 }
 
 // AddProvider POST /api/v1/providers
@@ -35,12 +36,13 @@ func (h *Handler) AddProvider(c *gin.Context) {
 		return
 	}
 	if err := config.AddProvider(config.ProviderConfig{
-		Name:     req.Name,
-		Protocol: req.Protocol,
-		APIURL:   req.APIURL,
-		BaseURL:  req.BaseURL,
-		APIKey:   req.APIKey,
-		Model:    req.Model,
+		Name:          req.Name,
+		Protocol:      req.Protocol,
+		APIURL:        req.APIURL,
+		BaseURL:       req.BaseURL,
+		APIKey:        req.APIKey,
+		CustomHeaders: req.CustomHeaders,
+		Model:         req.Model,
 	}); err != nil {
 		// The most common error is "already exists"; treat
 		// that as a 409 so the UI can show a friendly
@@ -49,7 +51,7 @@ func (h *Handler) AddProvider(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
-		if strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), "base_url") || strings.Contains(err.Error(), "invalid protocol") {
+		if strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), "base_url") || strings.Contains(err.Error(), "invalid protocol") || strings.Contains(err.Error(), "custom_headers") {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -88,11 +90,12 @@ func (h *Handler) DeleteProvider(c *gin.Context) {
 // "omit means leave alone" rule still applies to the other
 // fields.
 type UpdateProviderRequest struct {
-	Name     string `json:"name,omitempty"`
-	Protocol string `json:"protocol,omitempty"`
-	BaseURL  string `json:"base_url,omitempty"`
-	APIURL   string `json:"api_url,omitempty"` // pre-V12 compatibility
-	APIKey   string `json:"api_key,omitempty"`
+	Name          string             `json:"name,omitempty"`
+	Protocol      string             `json:"protocol,omitempty"`
+	BaseURL       string             `json:"base_url,omitempty"`
+	APIURL        string             `json:"api_url,omitempty"` // pre-V12 compatibility
+	APIKey        string             `json:"api_key,omitempty"`
+	CustomHeaders *map[string]string `json:"custom_headers,omitempty"`
 	// SetDefault, when true, makes this provider the global
 	// default. False is a no-op (the UI can always include
 	// the field without accidentally demoting a provider).
@@ -121,12 +124,13 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		return
 	}
 	updated, err := config.UpdateProvider(oldName, config.ProviderPatch{
-		Name:      req.Name,
-		Protocol:  req.Protocol,
-		APIURL:    req.APIURL,
-		BaseURL:   req.BaseURL,
-		APIKey:    req.APIKey,
-		IsDefault: req.SetDefault,
+		Name:          req.Name,
+		Protocol:      req.Protocol,
+		APIURL:        req.APIURL,
+		BaseURL:       req.BaseURL,
+		APIKey:        req.APIKey,
+		CustomHeaders: req.CustomHeaders,
+		IsDefault:     req.SetDefault,
 	})
 	if err != nil {
 		// Most common failure: name collision on rename.
@@ -134,7 +138,7 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
-		if strings.Contains(err.Error(), "invalid protocol") || strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), "base_url") {
+		if strings.Contains(err.Error(), "invalid protocol") || strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), "base_url") || strings.Contains(err.Error(), "custom_headers") {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -150,13 +154,14 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 	// without a follow-up GET. Use the *new* name (which may
 	// differ from oldName when the user renamed the provider).
 	c.JSON(http.StatusOK, ProviderFull{
-		Name:      updated.Name,
-		Protocol:  updated.GetProtocol(),
-		BaseURL:   updated.EffectiveBaseURL(),
-		APIKey:    updated.APIKey,
-		IsDefault: updated.Name == h.getCfg().LLM.Default,
-		Models:    updated.AllModels(),
-		Model:     updated.EffectiveModel(),
+		Name:          updated.Name,
+		Protocol:      updated.GetProtocol(),
+		BaseURL:       updated.EffectiveBaseURL(),
+		APIKey:        updated.APIKey,
+		CustomHeaders: updated.CustomHeaders,
+		IsDefault:     updated.Name == h.getCfg().LLM.Default,
+		Models:        updated.AllModels(),
+		Model:         updated.EffectiveModel(),
 	})
 }
 

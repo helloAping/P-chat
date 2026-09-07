@@ -134,6 +134,7 @@ func (h *Handler) Regenerate(c *gin.Context) {
 		Messages:                    msgs,
 		HistoryMessageCount:         historyMessageCount,
 		CurrentTurnAlreadyPersisted: true,
+		ClientMsgID:                 req.UserMessageID,
 		UseImageRecognition:         h.sessionUseImageRecognition(id),
 		RecognitionCapabilities:     h.sessionRecognitionCapabilities(id),
 		GenerationOperations:        h.sessionGenerationOperations(id),
