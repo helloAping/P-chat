@@ -445,27 +445,46 @@ func nonEmpty(values ...string) string {
 	return ""
 }
 
-// CompareVersions compares semver-like strings numerically. Suffixes such as
-// "1.0.12-release" are ignored, so the updater stays compatible with older
-// P-Chat builds.
+// CompareVersions compares P-Chat release versions. Both the legacy dot form
+// (1.0.13.beta.2) and the SemVer-style hyphen form (1.0.13-beta.2) are
+// supported. Pre-release precedence is alpha < beta < rc < stable.
 func CompareVersions(a string, b string) int {
-	ap := parseVersionParts(a)
-	bp := parseVersionParts(b)
+	ap := parseVersion(a)
+	bp := parseVersion(b)
 	for i := 0; i < 3; i++ {
-		if ap[i] > bp[i] {
+		if ap.parts[i] > bp.parts[i] {
 			return 1
 		}
-		if ap[i] < bp[i] {
+		if ap.parts[i] < bp.parts[i] {
 			return -1
 		}
+	}
+	if ap.preReleaseRank > bp.preReleaseRank {
+		return 1
+	}
+	if ap.preReleaseRank < bp.preReleaseRank {
+		return -1
+	}
+	if ap.preReleaseSequence > bp.preReleaseSequence {
+		return 1
+	}
+	if ap.preReleaseSequence < bp.preReleaseSequence {
+		return -1
 	}
 	return 0
 }
 
-func parseVersionParts(v string) [3]int {
+type parsedVersion struct {
+	parts              [3]int
+	preReleaseRank     int
+	preReleaseSequence int
+}
+
+func parseVersion(v string) parsedVersion {
 	v = strings.TrimSpace(strings.TrimPrefix(v, "v"))
 	parts := strings.Split(v, ".")
-	var out [3]int
+	var out parsedVersion
+	out.preReleaseRank = 4 // Stable releases sort after all pre-releases.
 	for i := 0; i < len(parts) && i < 3; i++ {
 		p := parts[i]
 		end := 0
@@ -477,7 +496,46 @@ func parseVersionParts(v string) [3]int {
 		}
 		n, err := strconv.Atoi(p[:end])
 		if err == nil {
-			out[i] = n
+			out.parts[i] = n
+		}
+	}
+
+	if len(parts) < 3 {
+		return out
+	}
+	patch := parts[2]
+	patchDigits := 0
+	for patchDigits < len(patch) && patch[patchDigits] >= '0' && patch[patchDigits] <= '9' {
+		patchDigits++
+	}
+	suffixParts := make([]string, 0, 2)
+	if patchDigits < len(patch) {
+		suffixParts = append(suffixParts, strings.TrimLeft(patch[patchDigits:], "-"))
+	}
+	if len(parts) > 3 {
+		suffixParts = append(suffixParts, parts[3:]...)
+	}
+	if len(suffixParts) == 0 {
+		return out
+	}
+
+	label := strings.ToLower(strings.TrimSpace(suffixParts[0]))
+	switch label {
+	case "alpha":
+		out.preReleaseRank = 1
+	case "beta":
+		out.preReleaseRank = 2
+	case "rc":
+		out.preReleaseRank = 3
+	default:
+		// Unknown legacy suffixes (for example "release") remain stable so
+		// older P-Chat builds keep their previous comparison behaviour.
+		return out
+	}
+	if len(suffixParts) > 1 {
+		sequence, err := strconv.Atoi(strings.TrimSpace(suffixParts[1]))
+		if err == nil {
+			out.preReleaseSequence = sequence
 		}
 	}
 	return out

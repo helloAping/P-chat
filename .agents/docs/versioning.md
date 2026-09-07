@@ -7,7 +7,7 @@
 ### 唯一真源
 
 ```
-VERSION  ← 项目根目录，semver 格式，如 1.0.0
+VERSION  ← 项目根目录，稳定版或预发布版格式，如 1.0.0、1.0.1.beta
 ```
 
 - **发布前改此文件** — 所有二进制（pchat / pchat-server / pchat-gui）共享同一版本
@@ -26,9 +26,16 @@ VERSION  ← 项目根目录，semver 格式，如 1.0.0
 
 ```
 1.0.0           — 正式发布版本
+1.0.1.beta      — beta 预发布版本（兼容写法：1.0.1-beta）
+1.0.1.beta.2    — 第 2 个 beta（兼容写法：1.0.1-beta.2）
+1.0.1.rc.1      — 第 1 个 RC（兼容写法：1.0.1-rc.1）
 1.0.0 (abc1234) — 含 git hash 的完整版本
 dev-abc1234     — 开发构建
 ```
+
+预发布阶段按 `alpha < beta < rc < stable` 排序；因此 `1.0.1.beta` 会升级到
+`1.0.1.rc.1` 或 `1.0.1`，而 `1.0.1` 不会降级到同版本号的预发布版本。
+打包 manifest 的 `channel` 会根据后缀自动写为 `alpha`、`beta`、`rc` 或 `stable`。
 
 ## 二、Schema 迁移规范
 
@@ -129,7 +136,7 @@ func TestMigration_V3_Bootstrap(t *testing.T) { ... }    // 已有数据的旧 D
 ## 三、发版检查清单
 
 ```
-□ 1. 修改 VERSION 文件为新的 semver
+□ 1. 修改 VERSION 文件为稳定版或预发布版版本号
 □ 2. 如有 Schema 变更，新增迁移定义在 allMigrations 末尾
 □ 3. 迁移测试通过：go test ./internal/memory/... -run TestMigration
 □ 4. 全量测试通过：go test ./...

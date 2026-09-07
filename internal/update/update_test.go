@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestCompareVersionsIgnoresSuffix(t *testing.T) {
+func TestCompareVersions(t *testing.T) {
 	tests := []struct {
 		a    string
 		b    string
@@ -19,6 +19,13 @@ func TestCompareVersionsIgnoresSuffix(t *testing.T) {
 		{"1.0.13", "1.0.12", 1},
 		{"v1.0.12", "1.0.12-release", 0},
 		{"1.2.0", "1.10.0", -1},
+		{"1.0.13.beta", "1.0.12", 1},
+		{"1.0.13", "1.0.13.beta", 1},
+		{"1.0.13.beta", "1.0.13", -1},
+		{"1.0.13.beta.2", "1.0.13.beta.1", 1},
+		{"1.0.13-beta.2", "1.0.13.beta.2", 0},
+		{"1.0.13.rc.1", "1.0.13.beta.9", 1},
+		{"1.0.13.beta", "1.0.13.alpha", 1},
 		{"dev", "1.0.0", -1},
 	}
 	for _, tt := range tests {

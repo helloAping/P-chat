@@ -18,13 +18,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. "$PSScriptRoot\version-utils.ps1"
+
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $platformOS = (& "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format os).Trim()
 $packagePlatform = if ($platformOS -eq "darwin") { "macos" } else { $platformOS }
 $version = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw).Trim()
-if (-not ($version -match '^\d+\.\d+\.\d+$')) {
-    throw "VERSION must be MAJOR.MINOR.PATCH for update detection; got '$version'"
-}
+$versionInfo = Get-PChatVersionInfo -Version $version
+$releaseChannel = $versionInfo.Channel
 
 $bin = Join-Path $root "bin"
 $stageRoot = Join-Path $root "build\package"
@@ -326,7 +327,7 @@ $latestJson = [ordered]@{
     name          = "P-Chat"
     slug          = "p-chat"
     version       = $version
-    channel       = "stable"
+    channel       = $releaseChannel
     release_notes = ""
     published_at  = $createdAtUTC
     platform      = $packagePlatform
@@ -359,7 +360,7 @@ $releaseManifest = [ordered]@{
     name             = "P-Chat"
     slug             = "p-chat"
     version          = $version
-    channel          = "stable"
+    channel          = $releaseChannel
     platform         = $packagePlatform
     arch             = $Arch
     created_at_utc   = $createdAtUTC

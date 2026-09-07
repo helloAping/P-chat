@@ -36,11 +36,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath (Split-Path $PSScriptRoot -Parent)
+. "$PSScriptRoot\version-utils.ps1"
 
 # ── 1. Read VERSION ──────────────────────────────────────────
 if (-not (Test-Path VERSION)) { throw "VERSION file not found in current directory" }
 $version = (Get-Content VERSION -Raw).Trim()
 if (-not $version) { throw "VERSION file is empty" }
+$null = Get-PChatVersionInfo -Version $version
 $tag = "v$version"
 
 # ── 2. Pre-flight checks ────────────────────────────────────
