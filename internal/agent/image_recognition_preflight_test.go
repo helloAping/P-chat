@@ -14,12 +14,60 @@ import (
 	"testing"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/generation"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
 )
+
+func TestMaterializeToolResultImageStoresReferenceWithoutPersistingBase64(t *testing.T) {
+	assetStore := generation.NewLocalAssetStore(t.TempDir(), "/api/v1/generated")
+	agt := &Agent{toolAssetStore: assetStore}
+	encoded := base64.StdEncoding.EncodeToString([]byte("fake-jpeg"))
+	result := &tool.CallResult{
+		Content: "[截图已截取]",
+		RawFull: "data:image/jpeg;base64," + encoded,
+		Image:   &tool.CallResultImage{Data: encoded, MIMEType: "image/jpeg", Name: "browser-screenshot.jpg"},
+	}
+	if err := agt.materializeToolResultImage("session-1", "browser_screenshot", result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Image.AssetID == "" || strings.Contains(result.RawFull, encoded) {
+		t.Fatalf("materialized result still exposes inline bytes: %#v", result)
+	}
+	var payload generation.Result
+	if err := json.Unmarshal([]byte(result.RawFull), &payload); err != nil {
+		t.Fatalf("decode asset result: %v", err)
+	}
+	if len(payload.Assets) != 1 || payload.Assets[0].ID != result.Image.AssetID || payload.Assets[0].URL == "" {
+		t.Fatalf("asset payload = %#v", payload)
+	}
+	path, meta, err := assetStore.Resolve(result.Image.AssetID)
+	if err != nil || meta.SessionID != "session-1" {
+		t.Fatalf("resolve stored screenshot: path=%q meta=%#v err=%v", path, meta, err)
+	}
+}
+
+func TestResolveMediaForRecognitionAcceptsConversationOwnedToolAsset(t *testing.T) {
+	assetStore := generation.NewLocalAssetStore(t.TempDir(), "/api/v1/generated")
+	asset, err := assetStore.Save("session-1", config.MediaImage, "image/png", "browser-screenshot.png", []byte("png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agt := &Agent{cfg: &config.Config{}, toolAssetStore: assetStore}
+	resolved, err := agt.resolveMediaForRecognition(context.Background(), "session-1", asset.ID, []config.MediaKind{config.MediaImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.UploadID != asset.ID || resolved.Name != "browser-screenshot.png" || string(resolved.Data) != "png" {
+		t.Fatalf("resolved asset = %#v", resolved)
+	}
+	if _, err := agt.resolveMediaForRecognition(context.Background(), "other-session", asset.ID, []config.MediaKind{config.MediaImage}); err == nil {
+		t.Fatal("cross-conversation tool asset must be rejected")
+	}
+}
 
 func TestCurrentImageRecognitionContextTreatsImageTextAsUntrusted(t *testing.T) {
 	ctx := currentImageRecognitionContext("图片说什么", []tool.ImageRecognitionImage{

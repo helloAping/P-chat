@@ -134,6 +134,117 @@ func TestHTTPExecutorPollsVideoTaskAndStoresRemoteAsset(t *testing.T) {
 	}
 }
 
+func TestHTTPExecutorInfersVolcengineVideoDialectFromEndpoint(t *testing.T) {
+	videoBytes := []byte("video-bytes")
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v3/contents/generations/tasks":
+			var received map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := received["prompt"]; exists {
+				http.Error(w, `{"error":{"code":"InvalidParameter","message":"content is required"}}`, http.StatusBadRequest)
+				return
+			}
+			content, ok := received["content"].([]any)
+			if !ok || len(content) != 1 {
+				http.Error(w, `{"error":{"code":"InvalidParameter","message":"content is required"}}`, http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "task-1", "status": "queued"})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/contents/generations/tasks/task-1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":    "succeeded",
+				"video_url": "data:video/mp4;base64," + base64.StdEncoding.EncodeToString(videoBytes),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewHTTPExecutor(nil, NewLocalAssetStore(t.TempDir(), "/generated"))
+	executor.Client = server.Client()
+	executor.PollInterval = time.Millisecond
+
+	result, err := executor.Generate(context.Background(), Request{
+		SessionID: "session-1", Operation: config.GenerationTextToVideo,
+		Target: config.GenerationModelTarget{Provider: "ark", Model: "doubao-seedance-1-5-pro-251215"},
+		Prompt: "two characters wave",
+		Dispatch: Dispatch{
+			Target:  config.GenerationModelTarget{Provider: "ark", Model: "doubao-seedance-1-5-pro-251215"},
+			BaseURL: server.URL + "/api/v3", Adapter: "openai",
+			OperationConfig: config.GenerationOperationConfig{
+				Endpoint:       "/contents/generations/tasks",
+				QueryEndpoint:  "/contents/generations/tasks/{id}",
+				TimeoutSeconds: 10,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.JobID != "task-1" || result.Status != StatusSucceeded || len(result.Assets) != 1 {
+		t.Fatalf("unexpected Volcengine result: %#v", result)
+	}
+}
+
+func TestHTTPExecutorExplainsMismatchedAsyncCreateEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":{"code":"InvalidEndpointOrModel.NotFound"}}`, http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	executor := NewHTTPExecutor(nil, NewLocalAssetStore(t.TempDir(), "/generated"))
+	executor.Client = server.Client()
+	_, err := executor.Generate(context.Background(), Request{
+		SessionID: "session-1", Operation: config.GenerationTextToVideo,
+		Target: config.GenerationModelTarget{Provider: "ark", Model: "video-model"}, Prompt: "waves",
+		Dispatch: Dispatch{
+			Target:  config.GenerationModelTarget{Provider: "ark", Model: "video-model"},
+			BaseURL: server.URL + "/api/v3", Adapter: "openai",
+			OperationConfig: config.GenerationOperationConfig{
+				Endpoint:       "/contents/generations",
+				QueryEndpoint:  "/contents/generations/tasks/{id}",
+				TimeoutSeconds: 10,
+			},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "verify whether the creation endpoint should be /contents/generations/tasks") {
+		t.Fatalf("expected actionable endpoint suggestion, got %v", err)
+	}
+}
+
+func TestHTTPExecutorRejectsQueryWithoutTaskPlaceholderBeforeSubmit(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls.Add(1)
+	}))
+	defer server.Close()
+
+	executor := NewHTTPExecutor(nil, NewLocalAssetStore(t.TempDir(), "/generated"))
+	executor.Client = server.Client()
+	_, err := executor.Generate(context.Background(), Request{
+		SessionID: "session-1", Operation: config.GenerationTextToVideo,
+		Target: config.GenerationModelTarget{Provider: "media", Model: "video-model"}, Prompt: "waves",
+		Dispatch: Dispatch{
+			Target:  config.GenerationModelTarget{Provider: "media", Model: "video-model"},
+			BaseURL: server.URL, Adapter: "openai",
+			OperationConfig: config.GenerationOperationConfig{
+				Endpoint: "/tasks", QueryEndpoint: "/tasks/static", TimeoutSeconds: 10,
+			},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "must contain {task_id} or {id}") {
+		t.Fatalf("expected task placeholder validation error, got %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("provider was called %d times before query configuration validation", calls.Load())
+	}
+}
+
 func TestHTTPExecutorDoesNotForwardProviderCredentialsToAssetURL(t *testing.T) {
 	var assetAuthorization, assetAPIKey string
 	var providerServer *httptest.Server

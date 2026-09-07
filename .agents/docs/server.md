@@ -351,7 +351,10 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
   参数已停用，API 收到这两个旧字段时返回 `400`；历史 metadata 字段不会参与运行。
 - `GET /api/v1/generated/:id` 提供已实体化的图片、视频或音频；文件与归属 metadata 位于
   `~/.p-chat/generated/`，URL 在聊天历史中保持稳定。
-- Provider/Model CRUD 包含 `vendor`、`type`、`generation`；聊天模型选择和连接测试只接受
+- Provider CRUD 包含 `protocol`、公共 `base_url`，Model CRUD 包含 `api_endpoint`、
+  `type`、`generation`；LLM/媒体端点均保存相对后缀，并在执行时与 Base URL 拼接。
+  `GET /api/v1/providers/:name/upstream-models` 使用 `base_url + /models` 获取候选模型；
+  不再接收或返回厂商 preset。聊天模型选择和连接测试只接受
   `type=llm`，不会把媒体模型误发到 Chat Completions。
 
 首版异步任务在一次工具调用中轮询完成，尚无重启续查/取消端点。详见

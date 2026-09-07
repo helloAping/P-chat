@@ -26,7 +26,7 @@ type OpenAIAdapter struct {
 }
 
 // NewOpenAIAdapter creates an adapter for an OpenAI-compatible
-// endpoint. baseURL is the API root (e.g. https://api.openai.com).
+// endpoint. baseURL is the complete chat-completions request URL.
 func NewOpenAIAdapter(baseURL, apiKey, providerName string) *OpenAIAdapter {
 	return &OpenAIAdapter{
 		baseURL: baseURL,
@@ -300,8 +300,6 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 	}
 	body = addOpenAIImageDataFields(body)
 
-	url := strings.TrimRight(a.baseURL, "/") + "/chat/completions"
-
 	headers := map[string]string{
 		"Content-Type":  "application/json",
 		"Accept":        "text/event-stream",
@@ -314,7 +312,7 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 
 	return &ProtocolRequest{
 		Method:  http.MethodPost,
-		URL:     url,
+		URL:     strings.TrimSpace(a.baseURL),
 		Body:    body,
 		Headers: headers,
 	}, nil

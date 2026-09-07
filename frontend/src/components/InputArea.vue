@@ -26,6 +26,7 @@ import {
   undoRollback, dismissRollback,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
+  hasQueuedTurns,
   currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
 } from '../stores/chat'
 import type { PendingAttachment } from '../stores/chat'
@@ -702,7 +703,7 @@ async function renderProviders(): Promise<string> {
       const defTag = p.is_default ? ' <span class="cmd-tag tag-def">默认</span>' : ''
       html += `<div class="cmd-card">
         <div class="cmd-card-head"><strong>${p.name}</strong>${defTag}<span class="cmd-tag tag-prot">${p.protocol}</span></div>
-        <div class="cmd-card-meta">${p.base_url || ''}${modelCount ? ' · ' + modelCount : ''}</div>
+        <div class="cmd-card-meta">${p.base_url || p.api_url || ''}${modelCount ? ' · ' + modelCount : ''}</div>
       </div>`
     }
     html += '</div>'
@@ -1400,6 +1401,7 @@ async function loadGenerationOptions() {
 }
 
 watch(() => state.currentID, () => void loadGenerationOptions(), { immediate: true })
+watch(() => state.generationConfigVersion, () => void loadGenerationOptions())
 
 const enabledGenerationOperations = computed(() =>
   (state.sessionMeta[state.currentID]?.enabled_generation_operations || [])
@@ -1672,6 +1674,14 @@ const currentConversationBusy = computed(() =>
   currentSessionWorking.value ||
   !!state.turnQueueDraining[state.currentID],
 )
+// 队列 draining 本身属于 currentConversationBusy，用于输入区状态。
+// Queue draining is itself part of currentConversationBusy for composer UI.
+// 监听该聚合状态会让 drain 完成后再次触发 drain。
+// Watching that aggregate would make drain completion retrigger another drain.
+const queueDrainBlocked = computed(() =>
+  isStreaming.value ||
+  currentSessionWorking.value,
+)
 const editingQueueId = ref<number | null>(null)
 const editingQueueText = ref('')
 const editingQueueSessionID = ref('')
@@ -1777,12 +1787,13 @@ function maybeDrainTurnQueue() {
   if (!state.currentID) return
   if (editingQueueId.value !== null) return
   if (currentConversationBusy.value || hasFailedQueuedTurn.value) return
+  if (!hasQueuedTurns(state.currentID)) return
   void drainQueuedConversationTurns(state.currentID).catch((e) => {
     console.warn('[turn-queue] drain failed:', e)
   })
 }
 
-watch([() => state.currentID, queueSignature, currentConversationBusy, () => !!currentPendingConfirm.value], () => {
+watch([() => state.currentID, queueSignature, queueDrainBlocked, () => !!currentPendingConfirm.value], () => {
   maybeDrainTurnQueue()
 })
 

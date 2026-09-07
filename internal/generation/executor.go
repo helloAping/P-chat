@@ -300,10 +300,17 @@ func (e *HTTPExecutor) Generate(ctx context.Context, req Request) (Result, error
 		return Result{}, fmt.Errorf("validate generation options: %w", err)
 	}
 	req.Options = normalizedOptions
+	queryEndpoint := strings.TrimSpace(req.Dispatch.OperationConfig.QueryEndpoint)
+	if queryEndpoint != "" && !hasTaskIDPlaceholder(queryEndpoint) {
+		return Result{}, errors.New("generation query_endpoint must contain {task_id} or {id}")
+	}
 	payload := buildVendorPayload(req, inputs)
 	createURL := endpointURL(req.Dispatch.BaseURL, req.Dispatch.OperationConfig.Endpoint, "")
 	response, err := e.callJSON(ctx, http.MethodPost, createURL, req.Dispatch.APIKey, payload)
 	if err != nil {
+		if suggestion := suggestedAsyncCreateEndpoint(req.Dispatch.OperationConfig.Endpoint, queryEndpoint); suggestion != "" {
+			return Result{}, fmt.Errorf("%w; async endpoint configuration looks inconsistent: verify whether the creation endpoint should be %s", err, suggestion)
+		}
 		return Result{}, err
 	}
 	jobID := firstStringForKeys(response, "task_id", "taskId", "id", "job_id")
@@ -315,7 +322,6 @@ func (e *HTTPExecutor) Generate(ctx context.Context, req Request) (Result, error
 		return Result{JobID: jobID, Status: StatusSucceeded, Assets: assets}, nil
 	}
 
-	queryEndpoint := strings.TrimSpace(req.Dispatch.OperationConfig.QueryEndpoint)
 	if jobID == "" || queryEndpoint == "" {
 		status := normalizeVendorStatus(firstStringForKeys(response, "status", "state"))
 		if status == StatusFailed {
@@ -628,10 +634,37 @@ func (e *HTTPExecutor) downloadAsset(ctx context.Context, rawURL, trustedEndpoin
 }
 
 func effectiveAdapter(dispatch Dispatch) string {
-	if adapter := config.NormalizeGenerationVendor(dispatch.Adapter); adapter != "" {
+	adapter := config.NormalizeGenerationVendor(dispatch.Adapter)
+	// Provider protocol describes authentication and the conversational API,
+	// but media endpoints may use a provider-specific JSON dialect. Infer only
+	// from distinctive, user-configured paths so no vendor preset is required.
+	if inferred := inferAdapterFromEndpoint(dispatch.OperationConfig.Endpoint); inferred != "" && (adapter == "" || adapter == "openai" || adapter == "anthropic") {
+		return inferred
+	}
+	if adapter != "" {
 		return adapter
 	}
 	return config.NormalizeGenerationVendor(dispatch.Vendor)
+}
+
+func inferAdapterFromEndpoint(endpoint string) string {
+	path := strings.ToLower(strings.TrimSpace(endpoint))
+	if parsed, err := url.Parse(path); err == nil && parsed.Path != "" {
+		path = strings.TrimRight(parsed.Path, "/")
+	}
+	switch {
+	case strings.HasSuffix(path, "/contents/generations/tasks"):
+		return "volcengine"
+	case strings.HasSuffix(path, "/video_generation"),
+		strings.HasSuffix(path, "/image_generation"),
+		strings.HasSuffix(path, "/t2a_v2"),
+		strings.HasSuffix(path, "/music_generation"):
+		return "minimax"
+	case strings.HasSuffix(path, "/images/generations"):
+		return "openai"
+	default:
+		return ""
+	}
 }
 
 func validateRemoteAssetURL(ctx context.Context, rawURL, trustedEndpoint string) error {
@@ -856,11 +889,38 @@ func decodeDataURI(value string) (assetCandidate, bool) {
 }
 
 func endpointURL(baseURL, endpoint, taskID string) string {
-	endpoint = strings.ReplaceAll(strings.TrimSpace(endpoint), "{task_id}", url.PathEscape(taskID))
-	if parsed, err := url.Parse(endpoint); err == nil && parsed.IsAbs() {
-		return endpoint
+	escapedTaskID := url.PathEscape(taskID)
+	endpoint = strings.NewReplacer(
+		"{task_id}", escapedTaskID,
+		"{id}", escapedTaskID,
+	).Replace(strings.TrimSpace(endpoint))
+	return config.JoinAPIURL(baseURL, endpoint)
+}
+
+func hasTaskIDPlaceholder(endpoint string) bool {
+	return strings.Contains(endpoint, "{task_id}") || strings.Contains(endpoint, "{id}")
+}
+
+func suggestedAsyncCreateEndpoint(createEndpoint, queryEndpoint string) string {
+	createEndpoint = strings.TrimRight(strings.TrimSpace(createEndpoint), "/")
+	queryEndpoint = strings.TrimSpace(queryEndpoint)
+	if createEndpoint == "" || queryEndpoint == "" {
+		return ""
 	}
-	return strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/" + strings.TrimLeft(endpoint, "/")
+	placeholderIndex := -1
+	for _, placeholder := range []string{"{task_id}", "{id}"} {
+		if index := strings.Index(queryEndpoint, placeholder); index >= 0 && (placeholderIndex < 0 || index < placeholderIndex) {
+			placeholderIndex = index
+		}
+	}
+	if placeholderIndex < 0 {
+		return ""
+	}
+	taskCollection := strings.TrimRight(queryEndpoint[:placeholderIndex], "/")
+	if taskCollection != createEndpoint && strings.HasPrefix(taskCollection, createEndpoint+"/") {
+		return taskCollection
+	}
+	return ""
 }
 
 func firstStringForKeys(value any, keys ...string) string {

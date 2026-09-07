@@ -814,7 +814,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 
 func persistedToolResult(c ChatStreamChunk) string {
 	switch c.ToolName {
-	case "generate_image", "generate_video", "generate_audio":
+	case "generate_image", "generate_video", "generate_audio", "browser_screenshot":
 		if c.ToolResultFull != "" {
 			return c.ToolResultFull
 		}

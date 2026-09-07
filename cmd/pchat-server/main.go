@@ -291,6 +291,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
+	srv.Handler().SetGeneratedAssetStore(generatedStore)
 	srv.SetSubagentRunner(runner)
 	srv.Handler().SetSubagentJobCanceller(asyncMgr)
 	srv.Handler().SetSubagentJobEvents(asyncMgr)

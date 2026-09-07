@@ -256,7 +256,7 @@ setup.exe
 
 | Tab | 作用 |
 | --- | --- |
-| **LLM 提供商** | 增删 provider，共享 API key；添加对话模型或媒体生成模型，为每项生成能力单独配置 API 端点 |
+| **LLM 提供商** | 增删 provider，共享 API key；添加对话模型或媒体生成模型，为媒体模型配置一份共享 API 与多项生成能力 |
 | **风格** | 切换说话风格、上传自定义人格 prompt、查看风格记忆 |
 | **系统** | 全局工作模式、媒体识别、各生成能力的默认模型、自动压缩、工具结果截断和子代理策略 |
 | **归档** | 列出已归档会话、恢复或永久删除 |
@@ -271,10 +271,12 @@ setup.exe
 ![设置面板全貌：左侧导航 + 右侧「LLM 提供商」页](docs/images/p-chat-web/f97e9cbbe10d9058.png)
 
 - **协议**：OpenAI 兼容（绝大多数国内模型都走这个）或 Anthropic 原生（Claude）
-- **Base URL**：OpenAI 兼容用 `https://api.deepseek.com/v1` 这种带 `/v1` 的形式；Anthropic 用 `https://api.anthropic.com`
+- **Base URL**：填写供应商公共地址，例如 DeepSeek 为 `https://api.deepseek.com/v1`、Anthropic 为 `https://api.anthropic.com/v1`；模型端点在模型编辑器内单独配置
 - **API key**：从对应平台申请，粘贴进 `sk-...` 输入框
 - **模型类型**：可添加“大语言模型”或“媒体生成模型”；同一 Provider/API key 可混合使用
-- **媒体能力**：媒体模型按文生图、图生图、文生视频、图生视频、视频生视频、语音/音乐/音效等能力勾选，每项有独立创建端点、查询端点和超时
+- **模型端点**：LLM 默认按协议填入 `/chat/completions` 或 `/messages`，可编辑；媒体模型同样只填写相对于 Base URL 的创建/查询端点后缀
+- **媒体能力**：媒体模型按文生图、图生图、文生视频、图生视频、视频生视频、语音/音乐/音效等能力勾选；同一模型只配置一份端点和超时，调用时按能力提交不同参数。LLM 媒体识别能力可不选，留空即仅文本
+- **获取模型**：从 `Base URL + /models` 拉取模型列表；点击候选项会先打开模型编辑弹窗，确认能力、上下文和端点后才添加
 - **模型**：对话模型用 `⭐` 标记聊天默认；生成模型的应用默认在「系统 → 媒体生成」按能力选择
 - **连接测试**：点提供商顶部的「测试默认模型」，或模型行里的「测试」；P-Chat 会向实际选中的模型发送 `sayhi`，并显示模型、耗时和回复摘要
 - **能力标记**：vision（支持图片）/ thinking（支持推理）；标记后输入区会显示对应按钮
@@ -356,16 +358,16 @@ P-Chat 通过 Chrome / Edge 扩展操控真实浏览器。LLM 能像人一样导
 | `browser_find` | 按文本或 regex 找元素并返回 ref |
 | `browser_extract` | 抓整页渲染后的可见文本（SPA 内容也能拿到） |
 | `browser_tabs` | 列出 / 新开 / 关闭 / 切换标签页；`action=select` 切换「控制目标」 |
-| `browser_screenshot` | 截当前视口（默认）或整页（`full_page: true`），JPEG quality 80，**返回 base64 嵌入消息气泡** |
+| `browser_screenshot` | 截当前视口（默认）或整页（`full_page: true`），JPEG quality 80；保存为会话归属的本地媒体资产 |
 
 ### 截图怎么嵌入消息
 
 `browser_screenshot` 不走普通 `tool_result` 文本通道 — 它返回的结构体（`tool.CallResult.Image`）会同时干两件事：
 
-1. **给 LLM 看**：作为独立的 `role=user, type=image` ChatMessage 注入对话历史，让 LLM 能像看用户上传的图一样分析截图内容。`tool_result` 文本字段只放占位符 `[截图已截取]`，避免 base64 串把上下文挤爆。
-2. **给用户看**：截图二进制通过 SSE 事件的 `ToolResultFull` 字段送到前端，前端用 `MessageBubble` + `ImageLightbox` 渲染成可点击的缩略图，点开放大查看 / 复制 / 保存。
+1. **给当前 LLM 轮次看**：截图字节只在本次 ReAct 过程中作为 `role=user, type=image` 注入视觉模型；若会话启用了专门识图，则先转换为受约束的事实观察文本。
+2. **给用户和后续轮次用**：Agent 把截图写入本地媒体资产仓库，工具结果只保存会话归属的 `asset_id`、同源 URL 和元数据。前端复用生成媒体结果卡展示缩略图、文件名、全屏查看与下载；后续识别使用 `input_ref`，不会把 base64 反复写入 SQLite 或发送给模型。
 
-完整流程（`internal/tool/registry.go:CallResultImage` + `internal/browser/tools.go:makeHandler`）：扩展端先返回 `data:image/jpeg;base64,...` 的 data URL，后端 `splitDataURL` 拆出 MIME + payload，再走上面的双通道分发。截图的标签页同时会被 `refreshPreferredFromNavigate` 缓存为「控制目标」。
+完整流程（`internal/tool/registry.go:CallResultImage` + `internal/browser/tools.go:makeHandler`）：扩展端先返回 `data:image/jpeg;base64,...`，后端拆出 MIME + payload，Agent 随即实体化为 `/api/v1/generated/:asset_id`。旧会话中的 data/blob 截图仍可展示，但新截图不再以该形式持久化。
 
 ### 选择控制目标标签页
 
@@ -501,22 +503,33 @@ llm:
       protocol: "openai"
       base_url: "https://api.deepseek.com/v1"
       api_key: "sk-xxx"
-      model: "deepseek-chat"
+      models:
+        - name: "deepseek-chat"
+          api_endpoint: "/chat/completions"
+          default: true
 
     - name: "claude"
       protocol: "anthropic"
-      base_url: "https://api.anthropic.com"
+      base_url: "https://api.anthropic.com/v1"
       api_key: "sk-ant-xxx"
-      model: "claude-3-5-sonnet-20241022"
+      models:
+        - name: "claude-3-5-sonnet-20241022"
+          api_endpoint: "/messages"
+          default: true
 
     - name: "ollama"
       protocol: "openai"
       base_url: "http://localhost:11434/v1"
       api_key: "ollama"
-      model: "llama3"
+      models:
+        - name: "llama3"
+          api_endpoint: "/chat/completions"
+          default: true
 ```
 
 ### 已知坑
+
+- **Base URL 与端点后缀**：Provider 的 `base_url` 可以包含供应商版本前缀（例如火山方舟的 `/api/v3`）；模型的 `api_endpoint` 只填写其后的相对路径。最终请求地址严格为二者拼接，不按厂商猜测路径。
 
 - **08ms.cn 代理**：`cs` provider 走 `http://api-convert.08ms.cn/v1`。quota 耗尽时所有请求会回 5xx，不是 P-Chat 的 bug。
 - **Anthropic 协议**：自定义 header 比较严，`x-api-key` 必须是裸 key，不要带 `Bearer` 前缀。

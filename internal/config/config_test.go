@@ -345,6 +345,47 @@ func TestAddModel_SetsNewDefaultWhenFirst(t *testing.T) {
 	if !updated.Models[0].Default {
 		t.Error("first added model should be default")
 	}
+	if updated.Models[0].APIEndpoint != "/chat/completions" {
+		t.Errorf("first model API endpoint = %q", updated.Models[0].APIEndpoint)
+	}
+}
+
+func TestAddModelNormalizesCustomAPIEndpointSuffix(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{"llm":{"providers":[{"name":"p","protocol":"openai","base_url":"https://example.com/api/v3","api_key":"k"}]}}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := AddModel("p", ModelConfig{Name: "custom", APIEndpoint: "responses"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := updated.FindModel("custom")
+	if custom == nil {
+		t.Fatalf("custom model missing: %#v", updated.Models)
+	}
+	if got := custom.APIEndpoint; got != "/responses" {
+		t.Fatalf("API endpoint = %q", got)
+	}
+	if _, err := AddModel("p", ModelConfig{Name: "absolute", APIEndpoint: "https://other.example/chat"}); err == nil {
+		t.Fatal("absolute per-model API endpoint must be rejected")
+	}
+}
+
+func TestAddModel_RequiresProviderBaseURL(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	if err := AddProvider(ProviderConfig{Name: "media-only", Protocol: "openai", APIKey: "sk-x"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := AddModel("media-only", ModelConfig{Name: "chat-model"}); err == nil || !strings.Contains(err.Error(), "requires base_url") {
+		t.Fatalf("AddModel error = %v, want missing base_url validation", err)
+	}
 }
 
 func TestRemoveModel(t *testing.T) {
@@ -505,7 +546,7 @@ func TestUpdateMediaModelRejectsRemovingDefaultedOperation(t *testing.T) {
 	initial := `{
   "llm": {"providers": [{
     "name": "media", "vendor": "minimax", "base_url": "https://api.minimax.io",
-    "models": [{"name": "video", "type": "media_generation", "generation": {"adapter": "minimax", "operations": {
+    "models": [{"name": "video", "type": "media_generation", "generation": {"adapter": "minimax", "api":{"endpoint":"/video/generate"}, "operations": {
       "text_to_video": {}, "image_to_video": {}
     }}}]
   }]},
@@ -519,9 +560,13 @@ func TestUpdateMediaModelRejectsRemovingDefaultedOperation(t *testing.T) {
 	}
 	_, err := UpdateModel("media", "video", ModelConfig{
 		Type: ModelTypeMediaGeneration,
-		Generation: &MediaGenerationModelConfig{Adapter: "minimax", Operations: map[GenerationOperation]GenerationOperationConfig{
-			GenerationTextToVideo: {},
-		}},
+		Generation: &MediaGenerationModelConfig{
+			Adapter: "minimax",
+			API:     &GenerationOperationConfig{Endpoint: "/video/generate"},
+			Operations: map[GenerationOperation]GenerationOperationConfig{
+				GenerationTextToVideo: {},
+			},
+		},
 	}, false)
 	if err == nil || !strings.Contains(err.Error(), "generation default image_to_video") {
 		t.Fatalf("expected generation default reference error, got %v", err)

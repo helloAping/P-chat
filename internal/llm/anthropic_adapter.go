@@ -293,11 +293,9 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 		return nil, fmt.Errorf("marshal anthropic request: %w", err)
 	}
 
-	url := strings.TrimRight(a.baseURL, "/") + "/v1/messages"
-
 	return &ProtocolRequest{
 		Method: http.MethodPost,
-		URL:    url,
+		URL:    strings.TrimSpace(a.baseURL),
 		Body:   body,
 		Headers: map[string]string{
 			"Content-Type":      "application/json",

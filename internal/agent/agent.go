@@ -69,6 +69,10 @@ type Agent struct {
 	// generationExecutor is invoked only after the request-scoped operation
 	// switch and target have passed the media tool's internal hard gate.
 	generationExecutor generation.Executor
+	// toolAssetStore materializes binary outputs produced by ordinary tools
+	// (currently browser_screenshot). This keeps base64 out of persisted parts
+	// while reusing the same durable asset contract as media generation.
+	toolAssetStore *generation.LocalAssetStore
 
 	// bypassOnce, when true, makes the NEXT tool call skip the
 	// sandbox check (set by /unsafe once). Reset after the call.
@@ -244,6 +248,12 @@ func (a *Agent) SetAttachmentResolver(r AttachmentResolver) {
 // an operation.
 func (a *Agent) SetGenerationExecutor(executor generation.Executor) {
 	a.generationExecutor = executor
+}
+
+// SetToolAssetStore installs the durable store used for binary tool outputs.
+// Passing nil preserves the legacy inline-data fallback.
+func (a *Agent) SetToolAssetStore(store *generation.LocalAssetStore) {
+	a.toolAssetStore = store
 }
 
 // SetSummarizer wires the summarizer for auto-compression support.
@@ -465,12 +475,21 @@ func effectiveGenerationAccess(cfg *config.Config, operations []config.Generatio
 				if provider.Name != target.Provider {
 					continue
 				}
+				adapter := model.Generation.Adapter
+				if strings.TrimSpace(adapter) == "" {
+					// New models use the selected protocol. Vendor is consulted only
+					// for pre-V12 configs that carried an explicit legacy preset.
+					adapter = provider.GetProtocol()
+					if provider.Vendor != "" && provider.APIURL == "" {
+						adapter = provider.Vendor
+					}
+				}
 				access.Dispatches[operation] = generation.Dispatch{
 					Target:          target,
 					Vendor:          provider.Vendor,
-					BaseURL:         provider.BaseURL,
+					BaseURL:         provider.EffectiveBaseURL(),
 					APIKey:          provider.APIKey,
-					Adapter:         model.Generation.Adapter,
+					Adapter:         adapter,
 					OperationConfig: operationConfig,
 				}
 				break
@@ -666,21 +685,47 @@ func (a *Agent) effectiveToolRecognitionCapabilities(requested []config.MediaKin
 }
 
 func (a *Agent) resolveMediaForRecognition(ctx context.Context, sessionID, uploadID string, allowed []config.MediaKind) (tool.MediaRecognitionAsset, error) {
-	if a == nil || a.store == nil || a.attach == nil {
+	if a == nil {
 		return tool.MediaRecognitionAsset{}, fmt.Errorf("media storage is not available")
 	}
 	if !containsMediaKind(allowed, config.MediaImage) && !containsMediaKind(allowed, config.MediaVideo) && !containsMediaKind(allowed, config.MediaAudio) {
 		return tool.MediaRecognitionAsset{}, fmt.Errorf("no media recognition capability is enabled")
 	}
-	if err := a.validateConversationUploadReference(sessionID, uploadID); err != nil {
-		return tool.MediaRecognitionAsset{}, err
+	var path, name, mimeType string
+	var size int64
+	var kind config.MediaKind
+	resolvedToolAsset := false
+	if a.toolAssetStore != nil {
+		if assetPath, meta, err := a.toolAssetStore.Resolve(uploadID); err == nil {
+			resolvedToolAsset = true
+			if meta.SessionID != sessionID {
+				return tool.MediaRecognitionAsset{}, fmt.Errorf("media asset %q is not owned by this conversation", uploadID)
+			}
+			info, err := os.Stat(assetPath)
+			if err != nil {
+				return tool.MediaRecognitionAsset{}, err
+			}
+			path, size, name, mimeType, kind = assetPath, info.Size(), meta.Name, meta.MIMEType, meta.Kind
+		}
 	}
-	path, size := a.attach.Resolve(Attachment{ID: uploadID})
-	if path == "" {
-		return tool.MediaRecognitionAsset{}, fmt.Errorf("upload %q not found", uploadID)
+	if !resolvedToolAsset {
+		if a.store == nil || a.attach == nil {
+			return tool.MediaRecognitionAsset{}, fmt.Errorf("media storage is not available")
+		}
+		if err := a.validateConversationUploadReference(sessionID, uploadID); err != nil {
+			return tool.MediaRecognitionAsset{}, err
+		}
+		path, size = a.attach.Resolve(Attachment{ID: uploadID})
+		if path == "" {
+			return tool.MediaRecognitionAsset{}, fmt.Errorf("media reference %q not found", uploadID)
+		}
+		name = filepath.Base(path)
+		if prefix := uploadID + "-"; strings.HasPrefix(name, prefix) {
+			name = strings.TrimPrefix(name, prefix)
+		}
+		mimeType = mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+		kind = mediaKindForMIME(mimeType)
 	}
-	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
-	kind := mediaKindForMIME(mimeType)
 	if mimeType == "" {
 		file, err := os.Open(path)
 		if err != nil {
@@ -728,9 +773,8 @@ func (a *Agent) resolveMediaForRecognition(ctx context.Context, sessionID, uploa
 	if err != nil {
 		return tool.MediaRecognitionAsset{}, err
 	}
-	name := filepath.Base(path)
-	if prefix := uploadID + "-"; strings.HasPrefix(name, prefix) {
-		name = strings.TrimPrefix(name, prefix)
+	if name == "" {
+		name = filepath.Base(path)
 	}
 	return tool.MediaRecognitionAsset{UploadID: uploadID, Name: name, Kind: string(kind), MIME: mimeType, Data: data}, nil
 }
@@ -1017,15 +1061,45 @@ func replaceImagesWithRecognitionRefs(msgs []llm.ChatMessage) []llm.ChatMessage 
 }
 
 func (a *Agent) resolveImageForRecognition(ctx context.Context, sessionID, uploadID string) (tool.ImageRecognitionImage, error) {
-	if a == nil || a.store == nil || a.attach == nil {
+	if a == nil {
 		return tool.ImageRecognitionImage{}, fmt.Errorf("image storage is not available")
 	}
-	if err := a.validateConversationUploadReference(sessionID, uploadID); err != nil {
-		return tool.ImageRecognitionImage{}, err
+	var path, name, mimeType string
+	var size int64
+	resolvedToolAsset := false
+	if a.toolAssetStore != nil {
+		if assetPath, meta, err := a.toolAssetStore.Resolve(uploadID); err == nil {
+			resolvedToolAsset = true
+			if meta.SessionID != sessionID {
+				return tool.ImageRecognitionImage{}, fmt.Errorf("image asset %q is not owned by this conversation", uploadID)
+			}
+			if meta.Kind != config.MediaImage {
+				return tool.ImageRecognitionImage{}, fmt.Errorf("media asset %q is %s, expected image", uploadID, meta.Kind)
+			}
+			info, err := os.Stat(assetPath)
+			if err != nil {
+				return tool.ImageRecognitionImage{}, err
+			}
+			path, size, name, mimeType = assetPath, info.Size(), meta.Name, meta.MIMEType
+		}
 	}
-	path, size := a.attach.Resolve(Attachment{ID: uploadID})
-	if path == "" {
-		return tool.ImageRecognitionImage{}, fmt.Errorf("upload %q not found", uploadID)
+	if !resolvedToolAsset {
+		if a.store == nil || a.attach == nil {
+			return tool.ImageRecognitionImage{}, fmt.Errorf("image storage is not available")
+		}
+		if err := a.validateConversationUploadReference(sessionID, uploadID); err != nil {
+			return tool.ImageRecognitionImage{}, err
+		}
+		path, size = a.attach.Resolve(Attachment{ID: uploadID})
+		if path == "" {
+			return tool.ImageRecognitionImage{}, fmt.Errorf("image reference %q not found", uploadID)
+		}
+		name = filepath.Base(path)
+		prefix := uploadID + "-"
+		if strings.HasPrefix(name, prefix) {
+			name = strings.TrimPrefix(name, prefix)
+		}
+		mimeType = imageMIME(name, "")
 	}
 	vc := a.cfg.Vision
 	vc.Normalize()
@@ -1044,15 +1118,16 @@ func (a *Agent) resolveImageForRecognition(ctx context.Context, sessionID, uploa
 	if int64(len(data)) > vc.MaxImageBytes {
 		return tool.ImageRecognitionImage{}, fmt.Errorf("image is too large: %d bytes (max %d)", len(data), vc.MaxImageBytes)
 	}
-	name := filepath.Base(path)
-	prefix := uploadID + "-"
-	if strings.HasPrefix(name, prefix) {
-		name = strings.TrimPrefix(name, prefix)
+	if name == "" {
+		name = filepath.Base(path)
+	}
+	if mimeType == "" {
+		mimeType = imageMIME(name, "")
 	}
 	return tool.ImageRecognitionImage{
 		UploadID: uploadID,
 		Name:     name,
-		MIME:     imageMIME(name, ""),
+		MIME:     mimeType,
 		Data:     data,
 	}, nil
 }
@@ -3810,6 +3885,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 
 				result := o.result
+				if result.Image != nil {
+					if err := a.materializeToolResultImage(req.SessionID, tc.Name, result); err != nil {
+						// Keep the legacy RawFull/data-url path as a safe fallback. A
+						// storage quota or disk failure must not turn an otherwise
+						// successful browser screenshot into a failed browser action.
+						log.Printf("%s[agent] tool image materialization failed for %s: %v", trace.LogPrefix(ctx), tc.Name, err)
+					}
+				}
 				resultPreview := truncatePreview(result.Content, 300)
 				resultPreview = strings.Map(func(r rune) rune {
 					if r == '\n' || r == '\r' {
@@ -3885,6 +3968,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				} else {
 					if result.Image != nil && useImageRecognition {
 						llmContent = a.recognizeToolResultImageWithConfiguredModel(ctx, tc.Name, latestUserText(msgs), result.Image, ch, nextSeq)
+						if result.Image.AssetID != "" {
+							llmContent += fmt.Sprintf("\n\nStored media reference: asset_id=%q. Reuse this opaque id as media_recognize input_ref instead of image bytes.", result.Image.AssetID)
+						}
 					} else {
 						llmContent = a.truncateToolResultForProject(tc.Name, req.ProjectRoot, result.Content)
 					}
@@ -3961,12 +4047,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// in the tool_result. This mirrors how user-uploaded
 			// attachments are handled via ExpandAttachmentsCM.
 			//
-			// Each image is persisted as its own row so it
-			// survives reload / rollback and appears as a
-			// standalone image bubble in the chat history. The
-			// base64 is kept verbatim in the LLM context so the
-			// model can still see the image on every round; the
-			// overall context size is managed by tryAutoCompact.
+			// The image bytes remain in this in-memory request only. The durable
+			// asset reference already lives in the tool result, so persisting a
+			// second standalone base64 image row would duplicate the UI and bloat
+			// SQLite. Future turns receive only the opaque asset id.
 			//
 			// When the model doesn't support vision, skip the
 			// injection entirely — the tool_result's text
@@ -3987,9 +4071,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					SubmitToLLM: 1,
 				}
 				msgs = append(msgs, imgMsg)
-				if a.store != nil {
-					a.store.AddChatMessageTo(req.SessionID, imgMsg)
-				}
 			}
 			// Persist assistant message now that tool
 			// results are captured in partsAcc.

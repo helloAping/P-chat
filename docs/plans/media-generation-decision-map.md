@@ -4,20 +4,20 @@
 > 对话预览的首个纵向切片已完成。与最初目标的差异及后续任务见
 > [media-generation-implementation.md](media-generation-implementation.md)。
 
-目标：让 P-Chat 在不同会话中按需启用图片、视频、音频生成工具；一个厂商账号/API key 可以同时挂载大语言模型和媒体生成模型；每个生成模型可按 operation 使用独立且可覆盖的 API 端点；用户上传或历史生成的媒体通过会话内 ID 交给工具，由 LLM 自主决定是否作为生成输入；生成结果可在对话中预览、下载、追问，并在重启后可靠恢复。
+目标：让 P-Chat 在不同会话中按需启用图片、视频、音频生成工具；一个厂商账号/API key 可以同时挂载大语言模型和媒体生成模型；每个生成模型只保存一份可覆盖的 API 配置，各 operation 通过不同请求参数表达；用户上传或历史生成的媒体通过会话内 ID 交给工具，由 LLM 自主决定是否作为生成输入；生成结果可在对话中预览、下载、追问，并在重启后可靠恢复。
 
-当前结论：把现有 Provider 从“LLM 接口”提升为“厂商账号与共享凭据边界”，在同一 Provider 下配置 `llm` 与 `media_generation` 两类模型。媒体模型显式声明 generation operation；应用为每个 operation 选择默认模型；会话只独立开关能力，运行时按应用默认路由。内置厂商 preset 提供默认 API，用户可逐项覆盖。配置与密钥复用 Provider，但执行仍由独立 Generation Engine 和厂商 adapter 负责。媒体生媒体只传会话内 ID，并支持直接生成或“先获得媒体观察、再由 LLM 完善有效提示词、最后生成”的串行工作流。模型侧保留三个稳定生成工具，所有结果统一落为持久化 job 和本地 asset。
+当前结论：把现有 Provider 从“LLM 接口”提升为“账号与共享凭据边界”，在同一 Provider 下配置 `llm` 与 `media_generation` 两类模型。Provider 只选择 OpenAI 兼容或 Anthropic 协议，并保存公共 Base URL 与 API key；不再选择厂商 preset。LLM 与媒体模型分别保存相对 API 端点后缀，运行时通过统一拼接接口得到完整请求地址。媒体模型显式声明 generation operation，并只保存一份模型级 API 配置；应用为每个 operation 选择默认模型；会话只独立开关能力，运行时按应用默认路由。配置与密钥复用 Provider，但执行仍由独立 Generation Engine 和协议 adapter 负责。媒体生媒体只传会话内 ID，并支持直接生成或“先获得媒体观察、再由 LLM 完善有效提示词、最后生成”的串行工作流。模型侧保留三个稳定生成工具，所有结果统一落为持久化 job 和本地 asset。
 
 ```mermaid
 flowchart LR
     U[用户文本 + attachment upload_id] --> C0[Conversation Media Catalog]
-    C[Provider: vendor + shared credentials] --> M[Typed Models: llm / media_generation]
+    C[Provider: protocol + Base URL + credentials] --> M[Typed Models + endpoint suffix]
     M --> S[会话 operation 与生成模型选择]
     C0 --> S
     S --> F[Agent 工具与 operation schema 过滤]
     F --> T[generate_image / generate_video / generate_audio]
     T --> E[Generation Engine]
-    E --> D[Vendor Adapter + operation endpoint]
+    E --> D[Protocol Adapter + resolved model API]
     D --> V[厂商 API]
     E --> J[(generation_jobs)]
     V --> E
@@ -44,13 +44,13 @@ Status: Resolved
 
 采用“配置统一、运行时分离”：
 
-- 复用现有 `llm.providers` 作为 Provider 列表，但概念和 GUI 名称改为“模型供应商”。Provider 表示厂商账号、共享 API key 和厂商标识，不再等于聊天 API。
+- 复用现有 `llm.providers` 作为 Provider 列表，但概念和 GUI 名称改为“模型供应商”。Provider 表示共享 API key、协议和公共 Base URL，不再保存厂商标识。
 - 在 `ModelConfig` 增加 `type: llm | media_generation`。旧模型缺少 `type` 时视为 `llm`，并通过 `internal/upgrade` 的下一版本步骤完成配置迁移。
 - `generation` 顶层配置只保存确认策略、限额、全局默认生成模型等跨模型运行策略，不再新增一套厂商连接和 API key。
 - Generation Engine、持久任务和资产库保持独立于 `internal/llm.Client`。共享配置不等于共享请求客户端。
 - `recognition.routes` 仍只负责“媒体 → 描述”；动态工具可验证接口，但不承担生产级任务恢复、下载和展示。
 
-现有代码中的 `ProviderConfig.Type` 是 `Protocol` 的兼容别名，不能复用为新的供应商类型。新增 `ProviderConfig.Vendor` 表示 `volcengine | minimax | openai | alibaba | custom`，新增的模型类型字段放在 `ModelConfig.Type`。
+现有代码中的 `ProviderConfig.Type` 是 `Protocol` 的兼容别名，不能复用为新的供应商类型。模型类型字段放在 `ModelConfig.Type`。旧 `vendor` 与完整 `api_url` 仅由 V12 升级和兼容读取路径处理，不再进入新增或编辑配置。
 
 ## #2: 如何表达不同厂商、端点和模型？
 
@@ -60,17 +60,17 @@ Status: Resolved
 
 ### Question
 
-怎样既允许每种生成操作配置独立厂商、模型和端点，又不把厂商协议细节泄漏到工具层？
+怎样让不同生成模型配置各自 API，同时不把厂商协议和 operation 参数差异泄漏到工具层？
 
 ### Answer
 
 配置拆成三层，不再新增独立的生成连接器或命名路由实体：
 
-1. **Provider**：厂商账号与共享凭据，例如一个火山 Provider 下共用一个 API key。
+1. **Provider**：共享协议、凭据与 Base URL，例如一个火山 Provider 下共用一个 API key 和 `/api/v3` 基础路径。
 2. **Typed Model**：每个模型声明 `type=llm` 或 `type=media_generation`。聊天链路只看前者，生成链路只看后者。
-3. **Operation API**：媒体生成模型按 operation 保存端点覆盖、同步/异步模式、输入传输、默认参数和约束。同一个模型可以支持多个 operation，每个 operation 可以有不同端点。
+3. **Model API**：每个 LLM 保存可编辑 `api_endpoint`，每个媒体生成模型保存一份创建端点后缀、异步查询端点后缀、默认参数和超时。同一个模型可以支持多个 operation，adapter 根据 operation 改变请求字段；不再为每项能力重复配置 API。
 
-媒体模型的能力不是根据模型名或输出类型猜测，而是显式声明为 canonical operation。`generation.operations` 中存在的键就是该模型的 **Model Generation Capabilities**；图片/视频/音频分组由 operation 推导，不再单独保存一个可能冲突的 `output_media_kind`。例如同一个视频模型可以同时勾选 `text_to_video` 和 `image_to_video`，分别保存各自端点和约束。
+媒体模型的能力不是根据模型名或输出类型猜测，而是显式声明为 canonical operation。`generation.operations` 中存在的键就是该模型的 **Model Generation Capabilities**，值为空对象；图片/视频/音频分组由 operation 推导，不再单独保存一个可能冲突的 `output_media_kind`。例如同一个视频模型可以同时勾选 `text_to_video` 和 `image_to_video`，二者共用 `generation.api`，请求差异由 adapter 处理。
 
 首批规范化 operation 建议为：
 
@@ -96,29 +96,27 @@ operation 是 P-Chat 的稳定词汇；厂商接口里的名称只在 adapter �
     "providers": [
       {
         "name": "volcengine-main",
-        "vendor": "volcengine",
         "protocol": "openai",
-        "base_url": "<chat-api-base>",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
         "api_key": "<shared-api-key>",
         "models": [
           {
             "name": "<chat-model-id>",
             "type": "llm",
+            "api_endpoint": "/chat/completions",
             "default": true
           },
           {
             "name": "<text-video-model-id>",
             "type": "media_generation",
             "generation": {
-              "adapter": "volcengine",
+              "api": {
+                "endpoint": "<create-endpoint-suffix>",
+                "query_endpoint": "<query-endpoint-suffix-with-{task_id}>",
+                "timeout_seconds": 600
+              },
               "operations": {
-                "text_to_video": {
-                  "execution": "async_poll",
-                  "endpoints": {
-                    "submit": "<optional-user-override>",
-                    "status": "<optional-user-override>"
-                  }
-                }
+                "text_to_video": {}
               }
             }
           },
@@ -126,23 +124,14 @@ operation 是 P-Chat 的稳定词汇；厂商接口里的名称只在 adapter �
             "name": "<image-video-model-id>",
             "type": "media_generation",
             "generation": {
-              "adapter": "volcengine",
+              "api": {
+                "endpoint": "<create-endpoint-suffix>",
+                "query_endpoint": "<query-endpoint-suffix-with-{task_id}>",
+                "timeout_seconds": 600,
+                "default_params": { "duration_seconds": 5, "aspect_ratio": "16:9" }
+              },
               "operations": {
-                "image_to_video": {
-                  "execution": "async_poll",
-                  "endpoints": {
-                    "submit": "<optional-user-override>",
-                    "status": "<optional-user-override>",
-                    "cancel": "<optional-user-override>"
-                  },
-                  "input_transport": "json",
-                  "defaults": { "duration_seconds": 5, "aspect_ratio": "16:9" },
-                  "constraints": {
-                    "input_images": { "min": 1, "max": 2 },
-                    "duration_seconds": [5, 10],
-                    "aspect_ratios": ["16:9", "9:16"]
-                  }
-                }
+                "image_to_video": {}
               }
             }
           }
@@ -166,26 +155,26 @@ operation 是 P-Chat 的稳定词汇；厂商接口里的名称只在 adapter �
 }
 ```
 
-端点默认值不直接复制成不可区分的用户配置。后端维护版本化的 `ProviderPresetRegistry`：根据 `vendor + model/operation` 给出默认 adapter、base URL 和 submit/status/cancel 端点。配置只保存用户覆盖值；配置 API 同时返回 `effective_endpoints` 与 `source=vendor_default|override`。GUI 输入框默认展示有效地址，用户编辑后保存 override，并提供“恢复厂商默认值”删除 override。`vendor=custom` 没有猜测值，必须显式填写端点和映射。
+后端不维护厂商 preset，也不从厂商名称推导请求路径。GUI 对 Provider 展示公共 Base URL；LLM 和媒体模型分别展示端点后缀。运行时只做确定性的 `BaseURL + endpoint` 拼接。这样火山方舟的 `/api/v3`、标准服务的 `/v1` 和私有网关路径都由用户明确配置，协议只提供新建 LLM 时的默认后缀并决定请求与响应格式。
 
 GUI 分成两个职责明确的入口：
 
-1. **应用设置 > 模型供应商**：Provider 层维护名称、厂商 preset、共享 API key 和聊天默认 Base URL。“添加模型”第一步必选“大语言模型 / 媒体生成模型”。选择媒体生成模型后，必须在“支持能力”中按输出分组勾选 operation：
+1. **应用设置 > 模型供应商**：Provider 层维护名称、协议、共享 API key 和 Base URL。“添加模型”第一步必选“大语言模型 / 媒体生成模型”。“获取模型”调用 `Base URL + /models`，选中候选后仍需在普通模型弹窗确认配置。选择媒体生成模型后，必须在“支持能力”中按输出分组勾选 operation：
    - 图片：文生图、图生图。
    - 视频：文生视频、图生视频、视频生视频。
    - 音频：文字转语音、文生音乐、文生音效、音频转音频。
-   勾选一个 operation 后展开该能力的有效端点、执行模式、输入角色、默认参数和约束；未勾选的 operation 不可被应用或会话选择。内置厂商/已知模型由 preset 预选官方支持能力，用户只能取其子集；自定义模型由用户显式声明。
+   所有勾选的 operation 共用一组模型 API 端点后缀、异步查询端点后缀与超时；未勾选的 operation 不可被应用或会话选择。LLM 端点按协议预填但允许编辑，媒体端点不猜测。
 2. **应用设置 > 媒体生成**：展示完整 operation 矩阵，每一行选择该能力的应用默认 Provider/Model，并显示“可用/配置不完整/模型不支持/端点缺失”等状态。候选模型只包含 `type=media_generation` 且声明支持该 operation 的模型；不同 operation 可以选择完全不同的 Provider/Model，同一个模型也可以被多行复用。这里写入 `generation.defaults`，不重复编辑 API key 或端点。
 
 模型类型在首次保存后视为稳定身份。若以后允许把已有 `llm` 改成 `media_generation`，必须先检查聊天默认、会话引用和生成默认引用；首版可直接禁止跨类型修改，避免遗留两套不兼容字段。
 
-Adapter 保持轻量，职责只有组装请求、提交、可选轮询/取消、解析结果和下载输出。扩展分三级：
+Adapter 保持轻量，职责只有按协议和 operation 组装请求、提交、可选轮询/取消、解析结果和下载输出。扩展分三级：
 
-- 内置厂商 adapter：首批为 Volcengine，其次 MiniMax；处理特殊签名、错误码和异步协议。
-- `generic_http` adapter：覆盖常见 direct response 和 async poll，但只允许声明式字段映射，不允许执行任意脚本。
+- 内置协议 adapter：首批覆盖 OpenAI 兼容协议，其次覆盖 Anthropic 兼容协议；端点始终来自用户配置。
+- operation 编码层：覆盖常见 direct response 和 async poll，只允许声明式字段映射，不允许执行任意脚本。
 - MCP/插件 adapter：作为后续扩展点。
 
-配置 API 必须返回每个媒体模型/operation 的 `available`、有效端点、端点来源、规范化参数约束和具体诊断原因。可用性至少检查 Provider、共享认证、adapter、operation、model 和必需端点。API key 在响应和日志中始终脱敏，并延续现有本地 key 保存策略；环境变量引用可作为后续增强。
+配置 API 必须返回每个媒体模型/operation 的 `available` 和具体诊断原因；有效端点来自 Provider Base URL 与模型级 `generation.api` 后缀，请求参数由 adapter 按 operation 规范化。可用性至少检查 Provider、共享认证、protocol、operation、model 和可解析端点。API key 在响应和日志中始终脱敏，并延续现有本地 key 保存策略；环境变量引用可作为后续增强。
 
 Provider/Model CRUD 同步扩展 `type` 和 `generation.operations`。现有“测试模型”不能对媒体模型发送 `sayhi`：LLM 模型继续使用聊天测试；媒体模型按 operation 提供“验证配置”，默认只检查认证、有效端点和请求结构，不产生计费任务。显式“试生成”必须单独提供最小测试输入并走正常生成确认、job 和 asset 流程。
 
@@ -195,7 +184,7 @@ Provider/Model CRUD 同步扩展 `type` 和 `generation.operations`。现有“�
 - `EffectiveModel()` / `AllModels()` 的聊天用途逐步替换为类型明确的查询，例如 `EffectiveLLMModel()` / `ModelsByType()`。
 - `llm.NewClient`、`GET /providers` 的聊天视图、ModelPicker、CLI `/model` 和系统默认模型只能选择 `type=llm`。
 - 媒体模型不使用现有 `ModelConfig.Default`；每个 operation 的默认 Provider/Model 统一由 `generation.defaults` 决定。
-- 上游 OpenAI-compatible `/models` 探测结果默认按 `llm` 导入；媒体模型通过厂商 preset 目录或手工输入添加，不能仅凭模型名猜类型。
+- “获取模型”只从 Provider `base_url + /models` 获取 ID 候选；候选不会自动持久化或根据名字猜类型，仍需用户完成模型编辑弹窗。
 
 ## #3: 工具层是一个统一工具还是三个媒体工具？
 
@@ -464,7 +453,7 @@ Status: Resolved — revised for model/app/session layering
 
 | 层级 | 保存内容 | 作用 |
 | --- | --- | --- |
-| 供应商/模型 | `ModelConfig.Generation.Operations` | 声明该媒体模型真实支持哪些 canonical operation，以及各自端点和约束 |
+| 供应商/模型 | `ModelConfig.Generation.API/Operations` | API 保存模型级端点与超时；Operations 只声明该模型支持哪些 canonical operation |
 | 应用配置 | `generation.defaults[operation]` | 为每个 operation 选择默认 Provider/Model；不同能力可以选不同模型 |
 | 会话配置 | `enabled_generation_operations` | 只决定当前会话把哪些能力开放给 LLM |
 | 运行时 | effective target + filtered tool schema | 取前三层交集，生成本轮实际可见工具和参数范围 |
@@ -485,9 +474,9 @@ Status: Resolved — revised for model/app/session layering
 
 1. 会话未启用 operation：直接不可见，不解析模型。
 2. 已启用 operation 只使用 `generation.defaults[operation]`，会话不能覆盖 Provider/Model。
-3. 目标模型必须存在、`type=media_generation`、显式声明该 operation、adapter 与必需端点可用，才产生 effective target；否则返回结构化不可用原因。
+3. 目标模型必须存在、`type=media_generation`、显式声明该 operation、协议、Base URL 与端点后缀可用，才产生 effective target；否则返回结构化不可用原因。
 4. `ChatRequest` 只携带启用的 operations；Agent 收窄 `media_recognize` / `generate_*` 工具的 operation、`input_refs.role` 和参数 schema，并把本轮 Conversation Media Catalog 交给 LLM。
-5. 配置热更新后，失效 operation 立即从后续回合消失；正在运行的 job 继续使用创建时冻结的 Provider、Model、端点和认证引用快照。
+5. 配置热更新后，失效 operation 立即从后续回合消失；正在运行的 job 继续使用创建时冻结的 Provider、Model、模型 API 和认证引用快照。
 
 会话设置复用现有 InputArea“能力工具”交互，拆为“媒体理解”和“媒体生成”：
 
@@ -546,11 +535,11 @@ Status: Recommended
 
 建议五个阶段，厂商顺序固定为 Volcengine → MiniMax → 其他：
 
-1. **类型化配置 + Volcengine 图片闭环**：新增 Provider `vendor`、Model `type/generation.operations`、`generation.defaults`、下一配置升级步骤（当前版本基线为 V9，实施时新增 V10）、preset 默认端点解析；完成供应商模型能力表单、应用 operation→默认模型矩阵、`GET /generation/options`、会话 operation 开关、Conversation Media Catalog、`input_refs`、会话级 ID resolver 和识别→生成串行约束，再完成一个 Volcengine `text_to_image + image_to_image` 闭环、job/asset、`generate_image`、generation part 和图片展示。
+1. **类型化配置 + 图片闭环**：新增 Model `type/generation.operations`、`generation.defaults` 和配置升级步骤；Provider 改为协议 + Base URL，LLM 与媒体模型使用端点后缀；完成供应商模型能力表单、应用 operation→默认模型矩阵、`GET /generation/options`、会话 operation 开关、Conversation Media Catalog、`input_refs`、会话级 ID resolver 和识别→生成串行约束，再完成 `text_to_image + image_to_image` 闭环、job/asset、`generate_image`、generation part 和图片展示。
 2. **Volcengine 异步视频闭环**：基于同一个 Provider/API key 增加视频媒体模型，完成首个官方支持的视频 operation、持久 worker、轮询/取消/重启恢复和视频 Range 播放；再按官方矩阵补齐同模型支持的其他视频 operation。
-3. **MiniMax 第二厂商闭环**：接入 MiniMax adapter/preset，至少复用一个已完成的图片或视频 operation，验证“同一工具 + 切换 Provider/Model”无需修改工具协议；再扩展 MiniMax 官方支持的其他 operation。
+3. **第二服务闭环**：接入另一家 OpenAI 兼容或 Anthropic 兼容服务，至少复用一个已完成的图片或视频 operation，验证“同一工具 + 切换 Provider/Model/端点后缀”无需修改工具协议；再扩展其他 operation。
 4. **音频与输入复用**：从 Volcengine/MiniMax 官方能力中选择首个音频 operation；完成 `media_recognize(asset_ids)` 和 upload/asset 输入统一解析。`text_to_speech`、音乐、音效和 audio-to-audio 只实现已验证的子集。
-5. **自定义与其他厂商**：开放可编辑端点的 `custom` Provider、受限 `generic_http` 映射 UI；再接 OpenAI、阿里等 preset/adapter，并补导出/IM 降级、配额、清理和文档。
+5. **协议扩展**：在现有 Base URL + 端点后缀配置上补充受限的 operation 字段映射；需要新认证或请求格式时增加协议 adapter，并补导出/IM 降级、配额、清理和文档。
 
 预计主要改动面：
 
@@ -558,7 +547,7 @@ Status: Recommended
 - 前端：`api/client.ts`、`stores/chat.ts`、`InputArea.vue`、`AppSettingsModal.vue`、`MessageBubble.vue`、`GeneratedMediaCard.vue`（新增）。
 - 文档：`.agents/docs/{tool,config,agent,server,memory,frontend,frontend-design}.md` 与 README 操作入口。
 
-每阶段验收都覆盖：模型只能选择 preset 支持或自定义声明的 operation、应用默认下拉只出现支持该 operation 的媒体模型、移除被应用默认引用的能力返回 409、会话开关正确持久化且只能使用应用默认模型、工具 operation enum 等于当前有效启用集合、类型错误或模型不可用时工具不可见、聊天模型列表不出现媒体模型、默认端点切换正确、LLM 能从单附件场景生成正确 `input_refs`、直接生成不触发多余识别、原生视觉/preflight 不重复识别、需要理解时严格按“识别完成→下一轮生成”串行、只要提示词时不误生成、最终提示词可审计、多附件歧义时提问、越权/伪造/类型错误 ID 被拒绝、工具与历史中无 base64、同步/异步成功、失败/取消、重启恢复、历史重载、SSE 断流恢复、分支/重答、对话压缩保留媒体引用、活动任务输入不被清理、资产删除引用计数、密钥脱敏、Go 测试、`vue-tsc -b` 和前端 build。
+每阶段验收都覆盖：Provider 不出现厂商预设、对话与媒体请求端点均原样使用完整 URL、模型只能选择显式声明的 operation、应用默认下拉只出现支持该 operation 的媒体模型、移除被应用默认引用的能力返回 409、会话开关正确持久化且只能使用应用默认模型、工具 operation enum 等于当前有效启用集合、类型错误或模型不可用时工具不可见、聊天模型列表不出现媒体模型、LLM 能从单附件场景生成正确 `input_refs`、直接生成不触发多余识别、原生视觉/preflight 不重复识别、需要理解时严格按“识别完成→下一轮生成”串行、只要提示词时不误生成、最终提示词可审计、多附件歧义时提问、越权/伪造/类型错误 ID 被拒绝、工具与历史中无 base64、同步/异步成功、失败/取消、重启恢复、历史重载、SSE 断流恢复、分支/重答、对话压缩保留媒体引用、活动任务输入不被清理、资产删除引用计数、密钥脱敏、Go 测试、`vue-tsc -b` 和前端 build。
 
 ## #11: “生成音频”具体包含什么？
 
@@ -589,8 +578,8 @@ Status: Resolved
 优先级定为：
 
 1. **P0 Volcengine（火山）**：验证同一 API key 下同时存在 LLM、图片和视频媒体模型，也是新 Provider/Model 抽象的主验收厂商。
-2. **P1 MiniMax**：验证第二家厂商的端点、任务状态与参数差异确实被 adapter 和 operation 配置吸收。
-3. **P2 custom/generic HTTP**：支持用户自定义端点，但在两个内置 adapter 稳定后再固化通用映射能力。
+2. **P1 第二协议服务**：验证另一服务的端点、任务状态与参数差异确实被协议 adapter 和模型级 API 配置吸收。
+3. **P2 operation 映射**：在完整 URL 前提下固化受限的通用请求参数映射能力。
 4. **P3 OpenAI、阿里及其他厂商**：复用成熟抽象逐步接入。
 
 首批不要求一个厂商覆盖图片、视频、音频全部 operation；按官方能力逐项开放，未实现或配置不完整的 operation 不出现在会话工具中。
@@ -610,9 +599,9 @@ Volcengine 与 MiniMax 各选择哪些当前可用的服务/模型作为首批�
 下一步需要基于两家官方文档建立协议矩阵，至少记录：
 
 - 服务/模型名和 operation 支持矩阵。
-- 认证、区域/base URL、请求 Content-Type、输入媒体传输方式。
+- 认证、完整请求 URL、请求 Content-Type、输入媒体传输方式。
 - 同步返回或异步 task id，状态/进度/取消端点。
 - 输出是 binary、base64、永久 URL 还是临时签名 URL。
 - 尺寸、时长、数量、格式限制以及幂等能力。
 
-矩阵完成后按 operation 决定 preset 默认端点和内置 adapter 行为；没有精确服务/模型清单前不把真实 URL 或厂商字段映射写入计划。首个实现建议从 Volcengine 图片模型开始，再接该厂商视频任务，因为图片同步闭环更适合先验证工具、消息 part 和资产存储。
+矩阵完成后按 protocol + operation 决定 adapter 行为；端点始终由用户填写，不把厂商默认 URL 固化进代码。首个实现可从图片模型开始，再接视频任务，因为图片同步闭环更适合先验证工具、消息 part 和资产存储。

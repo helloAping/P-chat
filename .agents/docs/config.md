@@ -43,8 +43,10 @@ LLMConfig 核心字段：
 - `Default` — 默认 provider 名称
 - `Providers[]` — 每个 provider 的端点、API key、模型列表
 - `Protocol` — "openai" | "anthropic"
+- `Provider.BaseURL` — 供应商公共 `http(s)` 地址；运行时与模型端点后缀拼接
+- `Model.APIEndpoint` — LLM 请求端点后缀；新模型按协议预填且允许编辑
 - `Models[]` — 每个模型的能力标记；`capabilities.input_modalities` 可显式配置 `image`、`video`、`audio`，旧版 `supports_vision` / `supports_audio` 仅作兼容回退
-- `Provider.Vendor` — `volcengine` / `minimax` / `openai` / `custom` 等厂商 preset；凭据仍由 Provider 共享
+- `Provider.BaseURL` / `Provider.Vendor` — 仅用于尚未升级配置的兼容读取；V12 会从全局配置移除，新配置与 UI 不再暴露厂商 preset
 - `Model.Type` — `llm`（缺省兼容值）或 `media_generation`
 
 ### 3. 项目级配置合并
@@ -85,9 +87,19 @@ LLMConfig 核心字段：
 ### 7. GenerationConfig
 
 媒体生成配置定义在 `generation.go`。媒体模型通过
-`generation.operations` 显式声明规范能力；每项能力有独立的 `endpoint`、
-`query_endpoint`、`timeout_seconds` 和 `default_params`。Volcengine、MiniMax、
-OpenAI 有可编辑的默认端点，用户配置始终优先。
+`generation.operations` 显式声明规范能力，map value 仅作为能力标记；同一模型只在
+`generation.api` 保存一份 `endpoint`、`query_endpoint`、`timeout_seconds` 和
+`default_params`。Provider 保存公共 `base_url`；LLM 的 `api_endpoint`、媒体模型的
+`endpoint` 与可选 `query_endpoint` 都只保存相对路径后缀。运行时统一使用
+`JoinAPIURL(base_url, endpoint)` 拼接，不按厂商猜测 `/v1` 或 `/v3`。新建 LLM 会按协议
+预填 `/chat/completions` 或 `/messages`；新建媒体生成模型预填 `/images/generations`，这些
+后缀都可编辑，模型编辑器同时展示与 Base URL 拼接后的完整请求路径。V12 会将旧的完整 `api_url` 拆为
+Base URL 与模型端点后缀，并移除厂商 preset 字段。
+
+异步模型的 `query_endpoint` 必须包含 `{task_id}` 或 `{id}`。这两个占位符都表示创建接口
+响应中的任务 ID；执行器按 `task_id`、`taskId`、`id`、`job_id` 的顺序提取并替换，用户不
+需要填写某次运行的实际 ID。模型编辑器会提示占位符含义；若查询端点显示创建端点可能少了
+任务集合路径，只给出配置警告和建议，不会静默改写用户填写的 URL。
 
 顶层 `generation.defaults` 按 operation 选择应用默认 Provider/Model；会话只在
 `conversations.metadata.enabled_generation_operations` 保存能力开关，不再覆盖生成模型。

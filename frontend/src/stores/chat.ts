@@ -184,6 +184,7 @@ export const state = reactive({
   visionRecognitionEnabled: false,
   recognitionCapabilitiesAvailable: [] as api.MediaKind[],
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
+  generationConfigVersion: 0, // invalidates the session generation capability matrix after app-setting changes
   sessionTodos: {} as Record<string, TodoItem[]>,
   // turnQueue 保存当前会话尚未执行的用户消息。
   // turnQueue stores pending user turns that should run FIFO after streaming ends.
@@ -1403,8 +1404,10 @@ export function clearAttachments(sessionID = state.currentID) {
 
 // --- Blob URL helpers ---
 //
-// Browser screenshot tool results arrive as large base64
-// data: URLs (~200–500 KB each). Storing them directly in
+// Legacy browser screenshot tool results arrived as large base64
+// data: URLs (~200–500 KB each). New screenshots are durable
+// /api/v1/generated asset references and bypass this compatibility path.
+// Storing old inline results directly in
 // the reactive Vue store keeps a giant decoded bitmap in
 // WebView2's DOM / decoded-image cache and eventually
 // crashes the renderer. We convert every screenshot to a
@@ -1423,8 +1426,8 @@ export function clearAttachments(sessionID = state.currentID) {
 // globally across the session, not per message — to cap the
 // number of live blob URLs / decoded bitmaps.
 //
-// This is the SINGLE point of entry for screenshot memory
-// management. Called from:
+// This is the single compatibility entry point for legacy inline screenshot
+// memory management. Called from:
 //   - switchSession (after history load)
 //   - loadMoreMessages (after page load)
 //   - the 'done' SSE event (after stream end)
@@ -2251,9 +2254,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           if ((ev.tool_id && p.tool_id === ev.tool_id) ||
               (!ev.tool_id && p.name === ev.tool_name)) {
             p.status = (ev.tool_status as any) || 'ok'
-            // Convert screenshot base64 data URLs to blob URLs
-            // before storing, so the reactive map never sees the
-            // raw base64 payload (~200–500 KB per screenshot).
+            // New screenshots are compact asset JSON; legacy screenshot data
+            // URLs are converted before entering the reactive map.
             p.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
             p.error = ev.tool_error
             p.elapsed = ev.tool_elapsed

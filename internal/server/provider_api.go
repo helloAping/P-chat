@@ -26,7 +26,6 @@ import (
 // for the model picker in the chat input.
 type ProviderFull struct {
 	Name      string               `json:"name"`
-	Vendor    string               `json:"vendor,omitempty"`
 	Protocol  string               `json:"protocol"`
 	BaseURL   string               `json:"base_url"`
 	APIKey    string               `json:"api_key"`
@@ -173,9 +172,8 @@ func (h *Handler) GetProvider(c *gin.Context) {
 		models := p.AllModels()
 		c.JSON(http.StatusOK, ProviderFull{
 			Name:      p.Name,
-			Vendor:    p.Vendor,
 			Protocol:  p.GetProtocol(),
-			BaseURL:   p.BaseURL,
+			BaseURL:   p.EffectiveBaseURL(),
 			APIKey:    p.APIKey,
 			IsDefault: p.Name == h.getCfg().LLM.Default,
 			Models:    models,
@@ -196,6 +194,7 @@ func (h *Handler) GetProvider(c *gin.Context) {
 // value (e.g. -1) to clear the field. DisplayName and
 // Description accept empty string to clear.
 type UpdateModelRequest struct {
+	APIEndpoint      string                             `json:"api_endpoint,omitempty"`
 	DisplayName      string                             `json:"display_name"`
 	Description      string                             `json:"description"`
 	MaxTokensContext int                                `json:"max_tokens_context"`
@@ -224,6 +223,7 @@ func (h *Handler) UpdateModel(c *gin.Context) {
 		return
 	}
 	patch := config.ModelConfig{
+		APIEndpoint:      req.APIEndpoint,
 		DisplayName:      req.DisplayName,
 		Description:      req.Description,
 		MaxTokensContext: req.MaxTokensContext,
@@ -427,7 +427,7 @@ func (h *Handler) ProbeUpstreamModels(c *gin.Context) {
 }
 
 // FetchUpstreamModels GET /api/v1/providers/:name/upstream-models
-// Calls the upstream provider's GET /v1/models with the stored API key
+// Calls the upstream provider's GET {BaseURL}/models with the stored API key
 // and returns the model list so the user can pick which to add.
 func (h *Handler) FetchUpstreamModels(c *gin.Context) {
 	name := c.Param("name")
@@ -457,7 +457,7 @@ func (h *Handler) FetchUpstreamModels(c *gin.Context) {
 		existing[m.Name] = true
 	}
 
-	out, status, err := fetchUpstreamModelList(provider.BaseURL, provider.APIKey, existing)
+	out, status, err := fetchUpstreamModelList(provider.EffectiveBaseURL(), provider.APIKey, existing)
 	if err != nil {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return

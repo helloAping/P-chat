@@ -133,8 +133,10 @@ func TestProviders_AddAndDelete(t *testing.T) {
 	srv := newWebServer(t)
 	defer srv.Close()
 
-	// Add a new provider.
-	addBody := `{"name":"testprov","protocol":"openai","base_url":"http://example.com/v1","api_key":"sk-xyz","model":"gpt-4o"}`
+	// Add a new provider. The default chat endpoint belongs to the model and
+	// is joined to this reusable provider Base URL at request time.
+	baseURL := "http://example.com/api/v3"
+	addBody := `{"name":"testprov","protocol":"openai","base_url":"` + baseURL + `","api_key":"sk-xyz","model":"gpt-4o"}`
 	r, err := http.Post(srv.URL+"/api/v1/providers", "application/json", strings.NewReader(addBody))
 	if err != nil {
 		t.Fatal(err)
@@ -150,6 +152,9 @@ func TestProviders_AddAndDelete(t *testing.T) {
 	if !strings.Contains(string(data), "testprov") {
 		t.Errorf("config.json missing testprov:\n%s", data)
 	}
+	if !strings.Contains(string(data), baseURL) || !strings.Contains(string(data), `"api_endpoint": "/chat/completions"`) {
+		t.Errorf("config.json missing Base URL or model endpoint suffix:\n%s", data)
+	}
 
 	// List providers; the new one should appear.
 	r2, err := http.Get(srv.URL + "/api/v1/providers")
@@ -159,7 +164,9 @@ func TestProviders_AddAndDelete(t *testing.T) {
 	defer r2.Body.Close()
 	var listing struct {
 		Providers []struct {
-			Name string `json:"name"`
+			Name    string               `json:"name"`
+			BaseURL string               `json:"base_url"`
+			Models  []config.ModelConfig `json:"models"`
 		} `json:"providers"`
 	}
 	if err := json.NewDecoder(r2.Body).Decode(&listing); err != nil {
@@ -169,6 +176,12 @@ func TestProviders_AddAndDelete(t *testing.T) {
 	for _, p := range listing.Providers {
 		if p.Name == "testprov" {
 			found = true
+			if p.BaseURL != baseURL {
+				t.Errorf("base_url = %q, want %q", p.BaseURL, baseURL)
+			}
+			if len(p.Models) != 1 || p.Models[0].APIEndpoint != "/chat/completions" {
+				t.Errorf("models = %#v, want default endpoint suffix", p.Models)
+			}
 		}
 	}
 	if !found {

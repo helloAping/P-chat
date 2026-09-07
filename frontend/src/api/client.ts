@@ -97,6 +97,7 @@ export interface GenerationOperationConfig {
 
 export interface MediaGenerationModelConfig {
   adapter?: string
+  api?: GenerationOperationConfig
   operations: Partial<Record<GenerationOperation, GenerationOperationConfig>>
 }
 
@@ -907,6 +908,7 @@ export function uploadURL(id: string): string {
 // --- Providers / Models ---
 export interface ModelInfo {
   name: string
+  api_endpoint?: string
   type?: ModelType
   display_name?: string
   description?: string
@@ -931,9 +933,10 @@ export type MediaKind = 'image' | 'video' | 'audio'
 
 export interface ProviderInfo {
   name: string
-  vendor?: string
   protocol: 'openai' | 'anthropic' | string
   base_url: string
+  // Returned only by pre-V12 servers; the settings form reads it as a fallback.
+  api_url?: string
   api_key: string
   is_default: boolean
   // Slim view from GET /api/v1/providers.
@@ -1092,7 +1095,6 @@ export const runCommand = (name: string, args: string) =>
 // --- App-level provider configuration ---
 export interface AddProviderRequest {
   name: string
-  vendor?: string
   protocol: 'openai' | 'anthropic'
   base_url: string
   api_key: string
@@ -1139,7 +1141,6 @@ export const testProvider = (provider: string, model?: string) =>
 // (not is_default) to promote a provider to the global default.
 export interface UpdateProviderRequest {
   name?: string
-  vendor?: string
   protocol?: 'openai' | 'anthropic'
   base_url?: string
   api_key?: string
@@ -1155,6 +1156,7 @@ export const updateProvider = (name: string, req: UpdateProviderRequest) =>
 // --- Per-model CRUD ---
 export interface AddModelRequest {
   name: string
+  api_endpoint?: string
   type?: ModelType
   display_name?: string
   description?: string
@@ -1170,6 +1172,7 @@ export const addModel = (provider: string, req: AddModelRequest) =>
   )
 
 export interface UpdateModelRequest {
+  api_endpoint?: string
   type?: ModelType
   display_name?: string
   description?: string
@@ -1197,6 +1200,19 @@ export const setDefaultModel = (provider: string, model: string) =>
     { method: 'POST' },
   )
 
+// --- Upstream models ---
+export interface UpstreamModelItem {
+  id: string
+  created: number
+  owned_by: string
+  added: boolean
+}
+
+export const fetchUpstreamModels = (provider: string) =>
+  jsonFetch<{ models: UpstreamModelItem[] }>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/upstream-models`,
+  )
+
 export interface SetCapabilitiesRequest {
   thinking_effort?: 'off' | 'low' | 'medium' | 'high' | ''
   context_window?: number
@@ -1213,30 +1229,6 @@ export const setModelCapabilities = (
   jsonFetch<{ ok: boolean }>(
     `/api/v1/providers/${encodeURIComponent(provider)}/models/${encodeURIComponent(model)}/capabilities`,
     { method: 'PATCH', body: JSON.stringify(req) },
-  )
-
-// --- Upstream models ---
-export interface UpstreamModelItem {
-  id: string
-  created: number
-  owned_by: string
-  added: boolean
-}
-
-export const fetchUpstreamModels = (provider: string) =>
-  jsonFetch<{ models: UpstreamModelItem[] }>(
-    `/api/v1/providers/${encodeURIComponent(provider)}/upstream-models`,
-  )
-
-/** Probe upstream /models with ephemeral credentials (add-provider dialog). */
-export const probeUpstreamModels = (body: {
-  base_url?: string
-  api_key: string
-  protocol?: string
-}) =>
-  jsonFetch<{ models: UpstreamModelItem[]; base_url: string }>(
-    '/api/v1/providers/probe-models',
-    { method: 'POST', body: JSON.stringify(body) },
   )
 
 // --- Streaming send ---

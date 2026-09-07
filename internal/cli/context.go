@@ -733,7 +733,7 @@ func (c *localContext) ProviderConfig(name string) (ProviderConfigView, error) {
 		return ProviderConfigView{
 			Name:     p.Name,
 			Protocol: p.GetProtocol(),
-			BaseURL:  p.BaseURL,
+			BaseURL:  p.EffectiveBaseURL(),
 			APIKey:   p.APIKey,
 			Model:    p.EffectiveModel(),
 			Models:   models,

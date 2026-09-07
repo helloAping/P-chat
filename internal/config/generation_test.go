@@ -1,6 +1,30 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestProviderModelAPIURLJoinsBaseURLAndModelEndpoint(t *testing.T) {
+	configured := ProviderConfig{
+		Protocol: "openai",
+		BaseURL:  "https://ark.example/api/v3",
+		Models: []ModelConfig{{
+			Name: "chat", APIEndpoint: "/responses", Default: true,
+		}},
+	}
+	if got := configured.EffectiveAPIURL(); got != "https://ark.example/api/v3/responses" {
+		t.Fatalf("EffectiveAPIURL() = %q", got)
+	}
+	defaultOpenAI := ProviderConfig{Protocol: "openai", BaseURL: "https://proxy.example/v1"}
+	if got := defaultOpenAI.EffectiveAPIURL(); got != "https://proxy.example/v1/chat/completions" {
+		t.Fatalf("default OpenAI endpoint = %q", got)
+	}
+	defaultAnthropic := ProviderConfig{Protocol: "anthropic", BaseURL: "https://api.anthropic.com/v1"}
+	if got := defaultAnthropic.EffectiveAPIURL(); got != "https://api.anthropic.com/v1/messages" {
+		t.Fatalf("default Anthropic endpoint = %q", got)
+	}
+}
 
 func TestModelTypeDefaultsToLLMAndEffectiveModelSkipsMediaModels(t *testing.T) {
 	provider := ProviderConfig{
@@ -66,6 +90,71 @@ func TestResolveGenerationTargetRequiresEnabledModelCapability(t *testing.T) {
 	}
 }
 
+func TestResolveGenerationTargetUsesSharedModelAPIForEveryCapability(t *testing.T) {
+	sharedAPI := &GenerationOperationConfig{
+		Endpoint:       "/v1/generate",
+		QueryEndpoint:  "/v1/tasks/{task_id}",
+		TimeoutSeconds: 90,
+		DefaultParams:  map[string]any{"quality": "high"},
+	}
+	cfg := Config{
+		LLM: LLMConfig{Providers: []ProviderConfig{{
+			Name: "media", Vendor: "custom", BaseURL: "https://media.example.com",
+			Models: []ModelConfig{{
+				Name: "omni", Type: ModelTypeMediaGeneration,
+				Generation: &MediaGenerationModelConfig{
+					API: sharedAPI,
+					Operations: map[GenerationOperation]GenerationOperationConfig{
+						GenerationTextToVideo:  {},
+						GenerationImageToVideo: {},
+					},
+				},
+			}},
+		}}},
+		Generation: GenerationConfig{Defaults: map[GenerationOperation]GenerationModelTarget{
+			GenerationTextToVideo:  {Provider: "media", Model: "omni"},
+			GenerationImageToVideo: {Provider: "media", Model: "omni"},
+		}},
+	}
+
+	for _, operation := range []GenerationOperation{GenerationTextToVideo, GenerationImageToVideo} {
+		_, _, resolved, err := cfg.ResolveGenerationTarget(operation, GenerationModelTarget{})
+		if err != nil {
+			t.Fatalf("resolve %s: %v", operation, err)
+		}
+		if resolved.Endpoint != sharedAPI.Endpoint || resolved.QueryEndpoint != sharedAPI.QueryEndpoint || resolved.TimeoutSeconds != sharedAPI.TimeoutSeconds {
+			t.Fatalf("resolved %s config = %#v, want shared %#v", operation, resolved, sharedAPI)
+		}
+		if resolved.DefaultParams["quality"] != "high" {
+			t.Fatalf("resolved %s default params = %#v", operation, resolved.DefaultParams)
+		}
+	}
+}
+
+func TestNormalizeGenerationKeepsSharedAPIOperationsAsCapabilityMarkers(t *testing.T) {
+	cfg := Config{LLM: LLMConfig{Providers: []ProviderConfig{{
+		Name: "media", Vendor: "minimax", BaseURL: "https://api.minimax.io",
+		Models: []ModelConfig{{
+			Name: "video", Type: ModelTypeMediaGeneration,
+			Generation: &MediaGenerationModelConfig{
+				API: &GenerationOperationConfig{Endpoint: "/v1/video_generation", TimeoutSeconds: 600},
+				Operations: map[GenerationOperation]GenerationOperationConfig{
+					GenerationTextToVideo:  {},
+					GenerationImageToVideo: {},
+				},
+			},
+		}},
+	}}}}
+
+	cfg.NormalizeGeneration()
+	model := cfg.LLM.Providers[0].Models[0]
+	for operation, marker := range model.Generation.Operations {
+		if marker.Endpoint != "" || marker.QueryEndpoint != "" || marker.TimeoutSeconds != 0 || marker.DefaultParams != nil {
+			t.Fatalf("operation %s was expanded instead of remaining a capability marker: %#v", operation, marker)
+		}
+	}
+}
+
 func TestResolveGenerationTargetRejectsMissingCustomEndpoint(t *testing.T) {
 	cfg := Config{LLM: LLMConfig{Providers: []ProviderConfig{{
 		Name: "custom", Vendor: "custom", Models: []ModelConfig{{
@@ -85,54 +174,46 @@ func TestResolveGenerationTargetRejectsMissingCustomEndpoint(t *testing.T) {
 	}
 }
 
-func TestDefaultGenerationEndpointPresets(t *testing.T) {
-	cases := []struct {
-		vendor string
-		op     GenerationOperation
-		want   string
-	}{
-		{"volcengine", GenerationTextToImage, "/images/generations"},
-		{"volcengine", GenerationImageToVideo, "/contents/generations/tasks"},
-		{"minimax", GenerationTextToImage, "/v1/image_generation"},
-		{"minimax", GenerationTextToVideo, "/v1/video_generation"},
-		{"minimax", GenerationTextToSpeech, "/v1/t2a_v2"},
+func TestValidateGenerationModelRequiresRelativeSharedEndpoint(t *testing.T) {
+	model := ModelConfig{
+		Name: "video", Type: ModelTypeMediaGeneration,
+		Generation: &MediaGenerationModelConfig{
+			API:        &GenerationOperationConfig{Endpoint: "/v1/video_generation"},
+			Operations: map[GenerationOperation]GenerationOperationConfig{GenerationTextToVideo: {}},
+		},
 	}
-	for _, tc := range cases {
-		if got := DefaultGenerationEndpoint(tc.vendor, tc.op); got != tc.want {
-			t.Fatalf("DefaultGenerationEndpoint(%q, %q) = %q, want %q", tc.vendor, tc.op, got, tc.want)
-		}
+	if err := ValidateGenerationModel(model); err != nil {
+		t.Fatalf("relative generation endpoints rejected: %v", err)
 	}
-	if got := DefaultGenerationEndpoint("openai", GenerationImageToImage); got != "" {
-		t.Fatalf("OpenAI image-to-image requires multipart and must not use the generation preset, got %q", got)
+	model.Generation.API.Endpoint = "https://media.example/v3/generate"
+	model.Generation.API.QueryEndpoint = "https://media.example/v3/tasks/{task_id}"
+	if err := ValidateGenerationModel(model); err == nil {
+		t.Fatal("absolute generation endpoints must be rejected for new configuration")
 	}
-	if got := DefaultGenerationEndpoint("volcengine", GenerationVideoToVideo); got != "" {
-		t.Fatalf("Volcengine video-to-video has no built-in adapter preset, got %q", got)
+
+	model.Generation.API.Endpoint = "/v3/contents/generations/tasks"
+	model.Generation.API.QueryEndpoint = "/v3/contents/generations/tasks/static"
+	if err := ValidateGenerationModel(model); err == nil || !strings.Contains(err.Error(), "{task_id} or {id}") {
+		t.Fatalf("query endpoint without a task placeholder should be rejected, got %v", err)
 	}
-	if got := DefaultGenerationEndpoint("minimax", GenerationVideoToVideo); got != "" {
-		t.Fatalf("MiniMax video-to-video has no built-in adapter preset, got %q", got)
-	}
-	if got := DefaultGenerationQueryEndpoint("minimax", GenerationTextToVideo); got != "/v1/query/video_generation?task_id={task_id}" {
-		t.Fatalf("MiniMax video query endpoint = %q", got)
+	model.Generation.API.QueryEndpoint = "/v3/contents/generations/tasks/{id}"
+	if err := ValidateGenerationModel(model); err != nil {
+		t.Fatalf("documented {id} task placeholder rejected: %v", err)
 	}
 }
 
-func TestModelAdapterDrivesEndpointPresetForCustomProvider(t *testing.T) {
-	cfg := Config{LLM: LLMConfig{Providers: []ProviderConfig{{
-		Name: "custom-account", Vendor: "custom", BaseURL: "https://api.minimax.io",
-		Models: []ModelConfig{{
-			Name: "video", Type: ModelTypeMediaGeneration,
-			Generation: &MediaGenerationModelConfig{Adapter: "minimax", Operations: map[GenerationOperation]GenerationOperationConfig{
-				GenerationTextToVideo: {},
-			}},
-		}},
-	}}}, Generation: GenerationConfig{Defaults: map[GenerationOperation]GenerationModelTarget{
-		GenerationTextToVideo: {Provider: "custom-account", Model: "video"},
-	}}}
-	_, _, operationConfig, err := cfg.ResolveGenerationTarget(GenerationTextToVideo, GenerationModelTarget{})
-	if err != nil {
-		t.Fatal(err)
+func TestNormalizeMediaGenerationModelFillsEditableDefaultEndpoint(t *testing.T) {
+	model := ModelConfig{
+		Name: "image", Type: ModelTypeMediaGeneration,
+		Generation: &MediaGenerationModelConfig{
+			API:        &GenerationOperationConfig{},
+			Operations: map[GenerationOperation]GenerationOperationConfig{GenerationTextToImage: {}},
+		},
 	}
-	if operationConfig.Endpoint != "/v1/video_generation" {
-		t.Fatalf("adapter endpoint preset = %q", operationConfig.Endpoint)
+	if err := normalizeModelAPIConfig("openai", &model); err != nil {
+		t.Fatalf("normalize media model: %v", err)
+	}
+	if got := model.Generation.API.Endpoint; got != DefaultMediaGenerationAPIEndpoint {
+		t.Fatalf("media endpoint = %q, want %q", got, DefaultMediaGenerationAPIEndpoint)
 	}
 }

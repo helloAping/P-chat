@@ -3,9 +3,12 @@ package agent
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/generation"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -100,6 +103,43 @@ func toolResultImageRecognitionImage(img *tool.CallResultImage) (tool.ImageRecog
 		MIME: mime,
 		Data: data,
 	}, nil
+}
+
+// materializeToolResultImage converts a binary image returned by an ordinary
+// tool into the same durable asset contract used by media generation. The raw
+// bytes stay on CallResultImage only for the current ReAct turn; the SSE event
+// and persisted tool part contain a small asset reference.
+func (a *Agent) materializeToolResultImage(sessionID, toolName string, result *tool.CallResult) error {
+	if a == nil || a.toolAssetStore == nil || result == nil || result.Image == nil {
+		return fmt.Errorf("tool asset store is unavailable")
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("session id is required to store a tool image")
+	}
+	image, err := toolResultImageRecognitionImage(result.Image)
+	if err != nil {
+		return err
+	}
+	asset, err := a.toolAssetStore.Save(sessionID, config.MediaImage, image.MIME, image.Name, image.Data)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(generation.Result{
+		Status:  generation.StatusSucceeded,
+		Assets:  []generation.Asset{asset},
+		Message: "工具图片已保存",
+	})
+	if err != nil {
+		_ = a.toolAssetStore.Delete(asset.ID)
+		return fmt.Errorf("encode tool asset result: %w", err)
+	}
+	result.Image.AssetID = asset.ID
+	result.RawFull = string(payload)
+	result.Content = fmt.Sprintf(
+		"Tool %s produced an image stored as asset_id=%q. The current vision round receives the image bytes directly; later turns must use this opaque asset id instead of base64. The id can be passed to media generation input_refs or media_recognize input_ref.",
+		toolName, asset.ID,
+	)
+	return nil
 }
 
 func toolResultImageRecognitionQuestion(toolName, userText string) string {

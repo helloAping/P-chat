@@ -121,17 +121,40 @@ func AddProvider(p ProviderConfig) error {
 			return fmt.Errorf("invalid protocol %q (allowed: openai, anthropic)", p.Protocol)
 		}
 	}
-	// Validate the BaseURL is parseable so a typo doesn't get
-	// silently persisted and surface as a confusing error at
-	// the first LLM call.
+	// New providers persist one reusable Base URL. Individual models append
+	// their editable endpoint suffix at request time. APIURL is accepted only
+	// for older API clients and remains an exact endpoint until migration.
 	if p.BaseURL != "" {
-		if _, err := url.Parse(p.BaseURL); err != nil {
-			return fmt.Errorf("invalid base_url %q: %w", p.BaseURL, err)
+		if err := validateProviderBaseURL(p.BaseURL); err != nil {
+			return err
+		}
+		p.BaseURL = strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+		p.APIURL = ""
+	} else if p.APIURL != "" {
+		if err := validateProviderAPIURL(p.APIURL); err != nil {
+			return err
+		}
+		p.APIURL = strings.TrimSpace(p.APIURL)
+	}
+	if p.EffectiveModel() != "" && strings.TrimSpace(p.EffectiveBaseURL()) == "" {
+		return fmt.Errorf("base_url is required for a provider with a conversational model")
+	}
+	if len(p.Models) == 0 && strings.TrimSpace(p.Model) != "" {
+		p.Models = []ModelConfig{{
+			Name:        p.Model,
+			Type:        ModelTypeLLM,
+			APIEndpoint: DefaultLLMAPIEndpoint(p.GetProtocol()),
+			Default:     true,
+		}}
+		p.Model = ""
+	}
+	for modelIndex := range p.Models {
+		if err := normalizeModelAPIConfig(p.GetProtocol(), &p.Models[modelIndex]); err != nil {
+			return err
 		}
 	}
-	if p.BaseURL == "" && p.Vendor != "" {
-		p.BaseURL = DefaultGenerationBaseURL(p.Vendor)
-	}
+	p.Vendor = ""
+	p.Type = ""
 	cfg.LLM.Providers = append(cfg.LLM.Providers, p)
 
 	mgr := NewManager()
@@ -170,6 +193,9 @@ func SetDefaultProvider(name string) error {
 		if p.Name == name {
 			if p.EffectiveModel() == "" {
 				return fmt.Errorf("provider %q has no conversational llm model", name)
+			}
+			if strings.TrimSpace(p.EffectiveBaseURL()) == "" {
+				return fmt.Errorf("provider %q has no base_url for conversational llm requests", name)
 			}
 			found = true
 			break
@@ -214,12 +240,12 @@ type ProviderPatch struct {
 	// Name, if non-empty, renames the provider. A name
 	// collision with another provider returns an error.
 	Name string
-	// Vendor changes media endpoint presets for models under this provider.
-	Vendor *string
 	// Protocol, if non-empty, switches the dispatch
 	// protocol. Accepted values: "openai", "anthropic".
 	Protocol string
-	// BaseURL, if non-empty, replaces the API base URL.
+	// APIURL accepts the legacy exact protocol endpoint for compatibility.
+	APIURL string
+	// BaseURL, if non-empty, replaces the reusable provider base URL.
 	BaseURL string
 	// APIKey, if non-empty, replaces the API key. (An
 	// empty value here means "do not touch the key" — use
@@ -285,26 +311,44 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		}
 		p.Name = patch.Name
 	}
-	if patch.Vendor != nil {
-		p.Vendor = NormalizeGenerationVendor(*patch.Vendor)
-		if strings.TrimSpace(p.BaseURL) == "" {
-			p.BaseURL = DefaultGenerationBaseURL(p.Vendor)
-		}
-	}
+	oldProtocol := p.GetProtocol()
 	if patch.Protocol != "" {
 		switch patch.Protocol {
 		case "openai", "anthropic":
 			p.Protocol = patch.Protocol
+			p.Type = ""
 		default:
 			return nil, fmt.Errorf("invalid protocol %q (allowed: openai, anthropic)", patch.Protocol)
 		}
+		if oldProtocol != p.GetProtocol() {
+			oldDefault := NormalizeAPIEndpointSuffix(DefaultLLMAPIEndpoint(oldProtocol))
+			newDefault := DefaultLLMAPIEndpoint(p.GetProtocol())
+			for modelIndex := range p.Models {
+				model := &p.Models[modelIndex]
+				if model.EffectiveType() != ModelTypeLLM {
+					continue
+				}
+				if model.APIEndpoint == "" || NormalizeAPIEndpointSuffix(model.APIEndpoint) == oldDefault {
+					model.APIEndpoint = newDefault
+				}
+			}
+		}
+	}
+	if patch.APIURL != "" {
+		if err := validateProviderAPIURL(patch.APIURL); err != nil {
+			return nil, err
+		}
+		p.APIURL = strings.TrimSpace(patch.APIURL)
+		p.BaseURL = ""
+		p.Vendor = ""
 	}
 	if patch.BaseURL != "" {
-		// Validate BaseURL is parseable, same as AddProvider.
-		if _, err := url.Parse(patch.BaseURL); err != nil {
-			return nil, fmt.Errorf("invalid base_url %q: %w", patch.BaseURL, err)
+		if err := validateProviderBaseURL(patch.BaseURL); err != nil {
+			return nil, err
 		}
-		p.BaseURL = patch.BaseURL
+		p.BaseURL = strings.TrimRight(strings.TrimSpace(patch.BaseURL), "/")
+		p.APIURL = ""
+		p.Vendor = ""
 	}
 	if patch.ClearAPIKey {
 		p.APIKey = ""
@@ -315,6 +359,9 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		if p.EffectiveModel() == "" {
 			return nil, fmt.Errorf("provider %q has no conversational llm model", p.Name)
 		}
+		if strings.TrimSpace(p.EffectiveBaseURL()) == "" {
+			return nil, fmt.Errorf("provider %q has no base_url for conversational llm requests", p.Name)
+		}
 		cfg.LLM.Default = p.Name
 	}
 	cfg.LLM.Providers[idx] = p
@@ -323,6 +370,55 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		return nil, err
 	}
 	return &cfg.LLM.Providers[idx], nil
+}
+
+func validateProviderAPIURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("invalid api_url %q: %w", raw, err)
+	}
+	if !parsed.IsAbs() || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("invalid api_url %q: must be a complete http(s) endpoint", raw)
+	}
+	return nil
+}
+
+func validateProviderBaseURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("invalid base_url %q: %w", raw, err)
+	}
+	if !parsed.IsAbs() || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("invalid base_url %q: must be a complete http(s) URL", raw)
+	}
+	if parsed.Fragment != "" {
+		return fmt.Errorf("invalid base_url %q: must not contain a URL fragment", raw)
+	}
+	return nil
+}
+
+func normalizeModelAPIConfig(protocol string, model *ModelConfig) error {
+	if model.EffectiveType() == ModelTypeLLM {
+		if strings.TrimSpace(model.APIEndpoint) == "" {
+			model.APIEndpoint = DefaultLLMAPIEndpoint(protocol)
+		}
+		if err := validateAPIEndpointSuffix(model.APIEndpoint, "api_endpoint", true); err != nil {
+			return fmt.Errorf("llm model %q: %w", model.Name, err)
+		}
+		model.APIEndpoint = NormalizeAPIEndpointSuffix(model.APIEndpoint)
+		model.Generation = nil
+		return nil
+	}
+
+	model.APIEndpoint = ""
+	if model.Generation != nil && model.Generation.API != nil {
+		if strings.TrimSpace(model.Generation.API.Endpoint) == "" {
+			model.Generation.API.Endpoint = DefaultMediaGenerationAPIEndpoint
+		}
+		model.Generation.API.Endpoint = NormalizeAPIEndpointSuffix(model.Generation.API.Endpoint)
+		model.Generation.API.QueryEndpoint = NormalizeAPIEndpointSuffix(model.Generation.API.QueryEndpoint)
+	}
+	return ValidateGenerationModel(*model)
 }
 
 // AddModel appends a new model to a provider's Models list. If the
@@ -339,12 +435,15 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 	if strings.ContainsAny(m.Name, " \t/\\") || strings.ContainsRune(m.Name, 0) {
 		return nil, fmt.Errorf("model name %q contains invalid characters (no whitespace, path separators, or NUL)", m.Name)
 	}
-	if err := ValidateGenerationModel(m); err != nil {
-		return nil, err
-	}
 	for i, p := range cfg.LLM.Providers {
 		if p.Name != providerName {
 			continue
+		}
+		if strings.TrimSpace(p.EffectiveBaseURL()) == "" {
+			return nil, fmt.Errorf("provider %q requires base_url before adding a model", providerName)
+		}
+		if err := normalizeModelAPIConfig(p.GetProtocol(), &m); err != nil {
+			return nil, err
 		}
 		// Migrate legacy single-model form to multi-model.
 		// Reject the case where the new model name equals the
@@ -354,7 +453,7 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 			return nil, fmt.Errorf("model %q already exists as the legacy single-model form for provider %q", m.Name, providerName)
 		}
 		if len(p.Models) == 0 && p.Model != "" && p.Model != m.Name {
-			p.Models = []ModelConfig{{Name: p.Model, Type: ModelTypeLLM, Default: true}}
+			p.Models = []ModelConfig{{Name: p.Model, Type: ModelTypeLLM, APIEndpoint: DefaultLLMAPIEndpoint(p.GetProtocol()), Default: true}}
 		}
 		// Reject duplicates by name.
 		for _, existing := range p.Models {
@@ -443,6 +542,9 @@ func SetDefaultModel(providerName, modelName string) error {
 		if p.Name != providerName {
 			continue
 		}
+		if strings.TrimSpace(p.EffectiveBaseURL()) == "" {
+			return fmt.Errorf("provider %q has no base_url for conversational llm requests", providerName)
+		}
 		found := false
 		for j := range p.Models {
 			if p.Models[j].Name == modelName && p.Models[j].EffectiveType() != ModelTypeLLM {
@@ -495,7 +597,7 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 			continue
 		}
 		if len(p.Models) == 0 && p.Model != "" {
-			p.Models = []ModelConfig{{Name: p.Model, Type: ModelTypeLLM, Default: true}}
+			p.Models = []ModelConfig{{Name: p.Model, Type: ModelTypeLLM, APIEndpoint: DefaultLLMAPIEndpoint(p.GetProtocol()), Default: true}}
 		}
 		idx := -1
 		for j := range p.Models {
@@ -519,6 +621,9 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 		}
 		if patch.Generation != nil {
 			m.Generation = patch.Generation
+		}
+		if patch.APIEndpoint != "" {
+			m.APIEndpoint = patch.APIEndpoint
 		}
 		if clearAll {
 			m.DisplayName = ""
@@ -550,10 +655,7 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 		if !patch.Capabilities.IsZero() {
 			m.Capabilities = patch.Capabilities
 		}
-		if m.EffectiveType() == ModelTypeLLM {
-			m.Generation = nil
-		}
-		if err := ValidateGenerationModel(*m); err != nil {
+		if err := normalizeModelAPIConfig(p.GetProtocol(), m); err != nil {
 			return nil, err
 		}
 		for operation, target := range cfg.Generation.Defaults {

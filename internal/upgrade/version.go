@@ -62,7 +62,15 @@ const (
 	// application-level defaults for canonical media generation operations.
 	V10 AppVersion = 10
 
+	// V11 — media generation models gain one shared API configuration;
+	// operations now declare capabilities instead of duplicating endpoints.
+	V11 AppVersion = 11
+
+	// V12 — providers keep one Base URL while each LLM or media model stores
+	// editable endpoint suffixes; vendor presets are no longer configured.
+	V12 AppVersion = 12
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V10
+	Current AppVersion = V12
 )

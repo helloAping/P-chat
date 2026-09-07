@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -266,7 +267,7 @@ type ServerConfig struct {
 //
 // `default` selects which provider is used when no provider is
 // requested explicitly. Each provider may expose multiple models
-// (see ProviderConfig) that share the same base URL + API key.
+// (see ProviderConfig) that share the same Base URL + API key.
 type LLMConfig struct {
 	Default   string           `json:"default"`
 	Providers []ProviderConfig `json:"providers"`
@@ -293,19 +294,21 @@ type OutputConfig struct {
 
 // ProviderConfig defines an LLM provider. A single provider can
 // expose multiple models (e.g. "openai" with gpt-4o, gpt-4o-mini, gpt-3.5-turbo)
-// that share the same base URL and API key.
+// that share the same protocol, base URL, and API key. Each model can select
+// its own API endpoint suffix.
 //
 // Use `models` (multi-model) for new entries. The legacy `model`
 // field is still recognized for backward compat: when `models` is
 // empty the value of `model` is used as a single-model provider.
 type ProviderConfig struct {
 	Name string `json:"name"`
-	// Vendor selects media-generation endpoint presets while Protocol continues
-	// to describe conversational LLM traffic. Examples: volcengine, minimax.
+	// Vendor and APIURL are retained only for compatibility. New configuration
+	// uses Protocol + BaseURL; request paths live on individual models.
 	Vendor   string        `json:"vendor,omitempty"`
 	Protocol string        `json:"protocol,omitempty"` // "openai" | "anthropic"
 	Type     string        `json:"type,omitempty"`     // alias for Protocol (backward compat)
-	BaseURL  string        `json:"base_url"`
+	APIURL   string        `json:"api_url,omitempty"`  // legacy complete chat endpoint
+	BaseURL  string        `json:"base_url,omitempty"`
 	APIKey   string        `json:"api_key"`
 	Model    string        `json:"model,omitempty"` // legacy: single model
 	Models   []ModelConfig `json:"models,omitempty"`
@@ -321,6 +324,9 @@ type ProviderConfig struct {
 type ModelConfig struct {
 	// Name is the model identifier sent to the API (e.g. "gpt-4o").
 	Name string `json:"name"`
+	// APIEndpoint is appended to the provider BaseURL. Conversational models
+	// default to the selected protocol's conventional suffix when omitted.
+	APIEndpoint string `json:"api_endpoint,omitempty"`
 	// DisplayName is shown in /model and /config. Optional.
 	DisplayName string `json:"display_name,omitempty"`
 	// Default marks one of the provider's models as the default.
@@ -377,6 +383,105 @@ func (p ProviderConfig) GetProtocol() string {
 		return p.Type
 	}
 	return "openai"
+}
+
+// DefaultLLMAPIEndpoint returns the editable endpoint suffix offered for a
+// newly-created conversational model.
+func DefaultLLMAPIEndpoint(protocol string) string {
+	if strings.EqualFold(strings.TrimSpace(protocol), "anthropic") {
+		return "/messages"
+	}
+	return "/chat/completions"
+}
+
+// NormalizeAPIEndpointSuffix canonicalizes a model endpoint without turning it
+// into a full URL. Absolute endpoints remain unchanged only so older project
+// overlays can still be read and migrated.
+func NormalizeAPIEndpointSuffix(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.IsAbs() {
+		return endpoint
+	}
+	return "/" + strings.TrimLeft(endpoint, "/")
+}
+
+func validateAPIEndpointSuffix(raw, field string, required bool) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if required {
+			return fmt.Errorf("%s is required", field)
+		}
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || strings.HasPrefix(raw, "//") {
+		return fmt.Errorf("%s must be a relative API path suffix", field)
+	}
+	if parsed.Fragment != "" {
+		return fmt.Errorf("%s must not contain a URL fragment", field)
+	}
+	return nil
+}
+
+// JoinAPIURL combines a provider base URL and a model endpoint suffix. An
+// absolute endpoint is returned unchanged for backward compatibility.
+func JoinAPIURL(baseURL, endpoint string) string {
+	endpoint = NormalizeAPIEndpointSuffix(endpoint)
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.IsAbs() {
+		return endpoint
+	}
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" || endpoint == "" {
+		return baseURL + endpoint
+	}
+	return baseURL + endpoint
+}
+
+// EffectiveBaseURL returns the provider base used for model endpoint joining.
+// The legacy complete api_url form is reduced by its conventional protocol
+// suffix so settings created during the V12 transition remain editable.
+func (p ProviderConfig) EffectiveBaseURL() string {
+	if baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/"); baseURL != "" {
+		return baseURL
+	}
+	apiURL := strings.TrimRight(strings.TrimSpace(p.APIURL), "/")
+	if apiURL == "" {
+		return ""
+	}
+	suffix := strings.ToLower(DefaultLLMAPIEndpoint(p.GetProtocol()))
+	if strings.HasSuffix(strings.ToLower(apiURL), suffix) {
+		return strings.TrimRight(apiURL[:len(apiURL)-len(suffix)], "/")
+	}
+	return apiURL
+}
+
+// ModelAPIURL resolves the exact request URL for one conversational model.
+// New configuration joins BaseURL + model.api_endpoint; the legacy api_url
+// form remains exact until V12 migrates it.
+func (p ProviderConfig) ModelAPIURL(modelName string) string {
+	if strings.TrimSpace(p.BaseURL) == "" && strings.TrimSpace(p.APIURL) != "" {
+		return strings.TrimSpace(p.APIURL)
+	}
+	endpoint := ""
+	for _, model := range p.Models {
+		if model.Name == modelName && model.EffectiveType() == ModelTypeLLM {
+			endpoint = model.APIEndpoint
+			break
+		}
+	}
+	if endpoint == "" {
+		endpoint = DefaultLLMAPIEndpoint(p.GetProtocol())
+	}
+	return JoinAPIURL(p.EffectiveBaseURL(), endpoint)
+}
+
+// EffectiveAPIURL is the compatibility alias for the provider's current
+// default conversational model URL.
+func (p ProviderConfig) EffectiveAPIURL() string {
+	return p.ModelAPIURL(p.EffectiveModel())
 }
 
 // EffectiveModel returns the model identifier that should be used

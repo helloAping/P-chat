@@ -81,6 +81,45 @@ func TestProbeUpstreamModelsRequiresAPIKey(t *testing.T) {
 	}
 }
 
+func TestFetchUpstreamModelsUsesSavedProviderBaseURL(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/models" {
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+			{"id": "already-added", "owned_by": "vendor"},
+			{"id": "new-model", "owned_by": "vendor"},
+		}})
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := fmt.Sprintf(`{
+		"llm": {"default":"saved","providers":[{
+			"name":"saved","protocol":"openai","base_url":%q,"api_key":"sk-test",
+			"models":[{"name":"already-added","api_endpoint":"/chat/completions","default":true}]
+		}]}
+	}`, upstream.URL+"/api/v3")
+	srv, _ := newTestServerWithConfig(t, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/providers/saved/upstream-models", nil)
+	w := httptest.NewRecorder()
+	srv.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Models []UpstreamModelsItem `json:"models"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Models) != 2 || !response.Models[0].Added || response.Models[1].Added {
+		t.Fatalf("models = %#v", response.Models)
+	}
+}
+
 func TestProviderConnectionUsesDefaultModelAndSaysHi(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var gotModel string

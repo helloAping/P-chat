@@ -11,12 +11,17 @@ import {
 const settings = readFileSync(new URL('../src/components/AppSettingsModal.vue', import.meta.url), 'utf8')
 const input = readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
 const store = readFileSync(new URL('../src/stores/chat.ts', import.meta.url), 'utf8')
+const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
+const toolCard = readFileSync(new URL('../src/components/ToolCallCard.vue', import.meta.url), 'utf8')
 
 test('model editor exposes context presets and multi-select input capabilities', () => {
   assert.match(settings, /label: '256K', value: 256_000/)
   assert.match(settings, /label: '1M', value: 1_000_000/)
   assert.match(settings, /v-model:value="editModelCapabilities"[\s\S]*?multiple/)
   assert.match(settings, /supports_vision: editModelCapabilities\.value\.includes\('image'\)/)
+  assert.match(settings, /媒体识别能力（可选）/)
+  assert.match(settings, /默认：仅文本/)
+  assert.match(settings, /不选择（不支持媒体识别）/)
 })
 
 test('system and session settings expose independent media capabilities', () => {
@@ -34,6 +39,60 @@ test('media generation uses app defaults with per-session hard switches', () => 
   assert.match(input, /关闭后，[\s\S]*?工具内部也会直接拒绝/)
   assert.match(input, /会话只选择能力；每项能力直接使用应用设置中的默认模型/)
   assert.doesNotMatch(input, /generation_model_overrides|generation_prompt_assist|能力路由|提示词处理/)
+})
+
+test('session generation capabilities refresh after application configuration changes', () => {
+  assert.match(store, /generationConfigVersion:\s*0/)
+  assert.match(input, /watch\(\(\) => state\.generationConfigVersion,\s*\(\) => void loadGenerationOptions\(\)\)/)
+  assert.match(settings, /function notifyGenerationConfigChanged\(\)[\s\S]*?chatState\.generationConfigVersion \+= 1/)
+  assert.match(settings, /async function saveSystemConfig\(\)[\s\S]*?notifyGenerationConfigChanged\(\)/)
+  assert.match(settings, /async function onSaveModel\(\)[\s\S]*?notifyGenerationConfigChanged\(\)/)
+})
+
+test('media model capabilities share one API editor and persist as markers', () => {
+  assert.match(settings, /operations\[operation\] = \{\}/)
+  assert.match(settings, /api: \{[\s\S]*?endpoint: editGenerationAPI\.value\.endpoint/)
+  assert.match(settings, /<strong>模型 API<\/strong>/)
+  assert.match(settings, /v-model:value="editGenerationAPI\.endpoint"/)
+  assert.doesNotMatch(settings, /v-for="operation in editGenerationOperations"/)
+  assert.doesNotMatch(settings, /editGenerationConfigs/)
+  assert.match(settings, /isEndpointSuffix\(editGenerationAPI\.value\.endpoint\)/)
+  assert.match(settings, /所有生成能力共用一组端点/)
+  assert.match(settings, /return \{ endpoint: '\/images\/generations'/)
+  assert.match(settings, /完整请求：[\s\S]*?generationEndpointPreview/)
+  assert.match(settings, /completeEndpointPreview\(editGenerationAPI\.value\.endpoint\)/)
+  assert.doesNotMatch(settings, /defaultGenerationEndpoint|defaultGenerationQueryEndpoint/)
+})
+
+test('async media endpoint editor explains task ids and flags a missing task collection path', () => {
+  assert.match(settings, /function hasTaskIDPlaceholder\(/)
+  assert.match(settings, /\{task_id\}.*\{id\}/s)
+  assert.match(settings, /任务 ID 来自创建接口的响应，无需手动填写/)
+  assert.match(settings, /generationEndpointConsistencyWarning/)
+  assert.match(settings, /创建端点可能缺少任务集合路径/)
+})
+
+test('generated media cards expose a readable file identity, preview, and download actions', () => {
+  assert.match(toolCard, /function toolMediaAssetFileName\(/)
+  assert.match(toolCard, /class="generated-asset-preview"[\s\S]*?@click="openToolMediaAsset\(asset\)"/)
+  assert.match(toolCard, /class="generated-asset-footer"[\s\S]*?class="generated-asset-name"/)
+  assert.match(toolCard, /class="generated-asset-actions"[\s\S]*?Maximize2[\s\S]*?Download/)
+  assert.match(toolCard, /@click="downloadToolMediaAsset\(asset\)"/)
+})
+
+test('browser screenshots use the same durable media asset card as generated output', () => {
+  assert.match(toolCard, /const isBrowserScreenshot = computed\(\(\) => props\.part\.name === 'browser_screenshot'\)/)
+  assert.match(toolCard, /const toolMediaAssets = computed<ToolMediaAsset\[\]>/)
+  assert.match(toolCard, /source: isBrowserScreenshot\.value \? 'browser_screenshot' : 'generation'/)
+  assert.match(toolCard, /asset\.source === 'browser_screenshot' \? '浏览器截图'/)
+  assert.doesNotMatch(toolCard, /class="tool-screenshot"/)
+})
+
+test('all Naive UI selects use the session picker visual language', () => {
+  assert.match(app, /Select: \{[\s\S]*?InternalSelection: \{[\s\S]*?color: 'var\(--surface-2\)'/)
+  assert.match(app, /border: '1px solid var\(--border-subtle\)'/)
+  assert.match(app, /borderRadius: 'var\(--radius-sm\)'/)
+  assert.match(app, /InternalSelectMenu: \{[\s\S]*?optionColorPending: 'var\(--surface-3\)'/)
 })
 
 test('session media multi-selects share one row and summarize selections as tags', () => {

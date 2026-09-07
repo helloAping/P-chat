@@ -178,7 +178,7 @@ func buildToolDefs() []tool.Tool {
 		},
 		{
 			Name:        "browser_screenshot",
-			Description: "Capture a screenshot of the visible viewport (JPEG, quality 80). Returns base64-encoded image data.",
+			Description: "Capture a screenshot of the visible viewport (JPEG, quality 80). The host stores it as an opaque media asset; image bytes are available only to the current visual-analysis round.",
 			Parameters: tool.ObjectSchema(map[string]any{
 				"full_page":  map[string]any{"type": "boolean", "description": "Capture full page height instead of viewport. Default false."},
 				"browser_id": bidPropOpt,
@@ -302,8 +302,9 @@ func makeHandler(hub *BridgeHub, policyFn PolicyProvider, toolName, method strin
 
 		// browser_screenshot: Content carries a short metadata
 		// description (for the LLM — keeps base64 out of the tool
-		// result); RawFull holds the full data URL for the
-		// frontend's ToolCallCard rendering; Image carries the
+		// result); RawFull temporarily holds the full data URL as a
+		// fallback until the agent materializes it into a durable media
+		// asset; Image carries the
 		// decoded base64 + MIME so the agent can inject a
 		// separate role=user, type=image ChatMessage for the LLM.
 		// Other methods return the extension result verbatim.

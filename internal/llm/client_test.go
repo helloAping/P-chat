@@ -399,12 +399,12 @@ func newTestClient(name, baseURL string) (*Client, error) {
 	c := &Client{
 		providers: map[string]*providerEntry{
 			name: {
-				name:     name,
-				protocol: "openai",
-				model:    "test-model",
-				apiKey:   "test-key",
-				baseURL:  baseURL,
-				adapter:  NewOpenAIAdapter(baseURL, "test-key", name),
+				name:         name,
+				protocol:     "openai",
+				model:        "test-model",
+				apiKey:       "test-key",
+				baseURL:      baseURL,
+				modelAPIURLs: map[string]string{"test-model": baseURL},
 			},
 		},
 		default_: name,

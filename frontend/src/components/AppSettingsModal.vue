@@ -220,7 +220,6 @@ const selected = computed(() =>
 
 // Edit form (top of right pane). Mirrors the unified PATCH body.
 const editName = ref('')
-const editVendor = ref('')
 const editProtocol = ref<'openai' | 'anthropic'>('openai')
 const editBaseURL = ref('')
 const editAPIKey = ref('')
@@ -235,14 +234,10 @@ const dirty = ref<Set<string>>(new Set())
 // Add-provider form (shown in NModal)
 const showAddProvider = ref(false)
 const newName = ref('')
-const newVendor = ref('')
 const newProtocol = ref<'openai' | 'anthropic'>('openai')
 const newBaseURL = ref('')
 const newAPIKey = ref('')
 const newModel = ref('')
-const probingModels = ref(false)
-const probeModelOptions = ref<{ label: string; value: string }[]>([])
-const probeModelsError = ref('')
 
 // Add/edit model form (shown in NModal)
 const showAddModel = ref(false)
@@ -258,6 +253,7 @@ const showAddModel = ref(false)
 // unused `editModel*` family).
 const editingModelName = ref<string | null>(null)
 const editModelName = ref('')
+const editModelAPIEndpoint = ref('')
 const editModelDisplay = ref('')
 const editModelCtx = ref<number | null>(null)
 const editModelOut = ref<number | null>(null)
@@ -277,79 +273,91 @@ const generationOperationDefs: Array<{ operation: api.GenerationOperation; label
 ]
 const generationOperationOptions = generationOperationDefs.map(item => ({ label: item.label, value: item.operation }))
 
-function emptyGenerationConfigs(): Record<api.GenerationOperation, api.GenerationOperationConfig> {
-  return Object.fromEntries(generationOperationDefs.map(item => [item.operation, {
-    endpoint: '', query_endpoint: '', timeout_seconds: 600, default_params: {},
-  }])) as Record<api.GenerationOperation, api.GenerationOperationConfig>
+function emptyGenerationAPIConfig(): api.GenerationOperationConfig {
+  return { endpoint: '/images/generations', query_endpoint: '', timeout_seconds: 600, default_params: {} }
 }
 
-const editGenerationConfigs = ref<Record<api.GenerationOperation, api.GenerationOperationConfig>>(emptyGenerationConfigs())
-const vendorOptions = [
-  { label: '自定义 / 未指定', value: '' },
-  { label: '火山引擎 Ark', value: 'volcengine' },
-  { label: 'MiniMax', value: 'minimax' },
-  { label: 'OpenAI', value: 'openai' },
-]
+function isCompleteHTTPURL(value: string | undefined): boolean {
+  try {
+    const parsed = new URL((value || '').trim())
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function defaultLLMAPIEndpoint(protocol = selected.value?.protocol): string {
+  return protocol === 'anthropic' ? '/messages' : '/chat/completions'
+}
+
+function normalizeEndpointSuffix(value: string | undefined): string {
+  const endpoint = (value || '').trim()
+  if (!endpoint) return ''
+  return `/${endpoint.replace(/^\/+/, '')}`
+}
+
+function isEndpointSuffix(value: string | undefined, required = true): boolean {
+  const endpoint = (value || '').trim()
+  if (!endpoint) return !required
+  if (/^[a-z][a-z\d+.-]*:/i.test(endpoint) || endpoint.startsWith('//')) return false
+  return !endpoint.includes('#')
+}
+
+function hasTaskIDPlaceholder(value: string | undefined): boolean {
+  const endpoint = (value || '').trim()
+  return endpoint.includes('{task_id}') || endpoint.includes('{id}')
+}
+
+function taskCollectionEndpoint(value: string | undefined): string {
+  const endpoint = normalizeEndpointSuffix(value)
+  const indexes = ['{task_id}', '{id}']
+    .map(placeholder => endpoint.indexOf(placeholder))
+    .filter(index => index >= 0)
+  if (indexes.length === 0) return ''
+  return endpoint.slice(0, Math.min(...indexes)).replace(/\/+$/, '')
+}
+
+function completeEndpointPreview(endpointValue: string | undefined): string {
+  const baseURL = (selected.value?.base_url || selected.value?.api_url || '').replace(/\/+$/, '')
+  const endpoint = normalizeEndpointSuffix(endpointValue)
+  return baseURL && endpoint ? `${baseURL}${endpoint}` : ''
+}
+
+const editGenerationAPI = ref<api.GenerationOperationConfig>(emptyGenerationAPIConfig())
+const modelEndpointPreview = computed(() => completeEndpointPreview(editModelAPIEndpoint.value))
+const generationEndpointPreview = computed(() => completeEndpointPreview(editGenerationAPI.value.endpoint))
+const generationQueryEndpointPreview = computed(() => completeEndpointPreview(editGenerationAPI.value.query_endpoint))
+const generationEndpointConsistencyWarning = computed(() => {
+  const createEndpoint = normalizeEndpointSuffix(editGenerationAPI.value.endpoint).replace(/\/+$/, '')
+  const taskCollection = taskCollectionEndpoint(editGenerationAPI.value.query_endpoint)
+  if (!createEndpoint || !taskCollection || taskCollection === createEndpoint) return ''
+  if (!taskCollection.startsWith(`${createEndpoint}/`)) return ''
+  return `创建端点可能缺少任务集合路径；按当前查询端点，请确认是否应填写 ${taskCollection}`
+})
+
 const modelTypeOptions = [
   { label: '大语言模型', value: 'llm' },
   { label: '媒体生成模型', value: 'media_generation' },
 ]
 
-function defaultProviderBaseURL(vendor: string): string {
-  if (vendor === 'volcengine') return 'https://ark.cn-beijing.volces.com/api/v3'
-  if (vendor === 'minimax') return 'https://api.minimax.io'
-  if (vendor === 'openai') return 'https://api.openai.com/v1'
-  return ''
-}
-
-function onNewVendorUpdate(vendor: string) {
-  newVendor.value = vendor
-  if (!newBaseURL.value.trim()) newBaseURL.value = defaultProviderBaseURL(vendor)
-}
-
-function defaultGenerationEndpoint(vendor: string, operation: api.GenerationOperation): string {
-  if (vendor === 'volcengine') {
-    if (operation === 'text_to_image' || operation === 'image_to_image') return '/images/generations'
-    if (operation === 'text_to_video' || operation === 'image_to_video') return '/contents/generations/tasks'
-  }
-  if (vendor === 'minimax') {
-    if (operation === 'text_to_image' || operation === 'image_to_image') return '/v1/image_generation'
-    if (operation === 'text_to_video' || operation === 'image_to_video') return '/v1/video_generation'
-    if (operation === 'text_to_speech') return '/v1/t2a_v2'
-  }
-  if (vendor === 'openai' && operation === 'text_to_image') return '/images/generations'
-  return ''
-}
-
-function defaultGenerationQueryEndpoint(vendor: string, operation: api.GenerationOperation): string {
-  if (operation !== 'text_to_video' && operation !== 'image_to_video') return ''
-  if (vendor === 'volcengine') return '/contents/generations/tasks/{task_id}'
-  if (vendor === 'minimax') return '/v1/query/video_generation?task_id={task_id}'
-  return ''
-}
-
 function onGenerationOperationsUpdate(operations: api.GenerationOperation[]) {
   editGenerationOperations.value = operations
-  const vendor = selected.value?.vendor || editVendor.value || ''
-  for (const operation of operations) {
-    const config = editGenerationConfigs.value[operation]
-    if (!config.endpoint) config.endpoint = defaultGenerationEndpoint(vendor, operation)
-    if (!config.query_endpoint) config.query_endpoint = defaultGenerationQueryEndpoint(vendor, operation)
-  }
 }
 
 function buildMediaGenerationConfig(): api.MediaGenerationModelConfig {
   const operations: Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>> = {}
   for (const operation of editGenerationOperations.value) {
-    const value = editGenerationConfigs.value[operation]
-    operations[operation] = {
-      endpoint: value.endpoint?.trim() || undefined,
-      query_endpoint: value.query_endpoint?.trim() || undefined,
-      timeout_seconds: value.timeout_seconds || 600,
-      default_params: value.default_params || {},
-    }
+    operations[operation] = {}
   }
-  return { adapter: selected.value?.vendor || editVendor.value || '', operations }
+  return {
+    api: {
+      endpoint: editGenerationAPI.value.endpoint?.trim() || undefined,
+      query_endpoint: editGenerationAPI.value.query_endpoint?.trim() || undefined,
+      timeout_seconds: editGenerationAPI.value.timeout_seconds || 600,
+      default_params: editGenerationAPI.value.default_params || {},
+    },
+    operations,
+  }
 }
 const contextWindowOptions = [
   { label: '32K', value: 32_000 },
@@ -375,12 +383,13 @@ function modelSupportsCapability(model: api.ModelInfo, capability: api.MediaKind
   return false
 }
 
-// Upstream models
+const testingTarget = ref<string | null>(null)
+
+// Models discovered from the selected provider's BaseURL + /models.
 const showUpstreamModels = ref(false)
 const upstreamModels = ref<api.UpstreamModelItem[]>([])
 const fetchingUpstream = ref(false)
 const upstreamError = ref('')
-const testingTarget = ref<string | null>(null)
 
 // --- Style state ---
 const styles = ref<api.StyleInfo[]>([])
@@ -527,6 +536,10 @@ async function loadSystemConfig() {
 
 function markSysDirty() { sysDirty.value = true }
 
+function notifyGenerationConfigChanged() {
+  chatState.generationConfigVersion += 1
+}
+
 async function saveSystemConfig() {
   sysSaving.value = true
   try {
@@ -574,6 +587,7 @@ async function saveSystemConfig() {
     sysGenerationDefaults.value = { ...(updated.generation?.defaults || {}) }
     sysGenerationRequireConfirm.value = !!updated.generation?.require_confirm
     sysDirty.value = false
+    notifyGenerationConfigChanged()
     message.success('系统配置已保存')
   } catch (e: any) {
     message.error('保存失败: ' + (e?.message || e))
@@ -667,11 +681,10 @@ async function refreshStyles() {
 }
 
 // selectProvider switches the right pane to `name`. The
-// slim list endpoint doesn't carry base_url / api_key (those
-// are secrets kept off the wire for the list view), so we
+// The slim list endpoint doesn't carry the API key, so we
 // also fetch the rich per-provider view (GET
 // /api/v1/providers/:name) and hydrate the form from that
-// — otherwise the user would see empty Base URL / API Key
+// — otherwise the user would see empty API URL / API Key
 // fields even though the server has values for them.
 async function selectProvider(name: string) {
   selectedName.value = name
@@ -697,60 +710,18 @@ async function selectProvider(name: string) {
 function openAddProvider() {
   showAddProvider.value = true
   newName.value = ''
-  newVendor.value = ''
   newProtocol.value = 'openai'
   newBaseURL.value = ''
   newAPIKey.value = ''
   newModel.value = ''
-  probeModelOptions.value = []
-  probeModelsError.value = ''
 }
 
 function cancelAddProvider() {
   showAddProvider.value = false
   newName.value = ''
-  newVendor.value = ''
   newBaseURL.value = ''
   newAPIKey.value = ''
   newModel.value = ''
-  probeModelOptions.value = []
-  probeModelsError.value = ''
-}
-
-async function onProbeAddProviderModels() {
-  if (!newAPIKey.value.trim()) {
-    message.warning('请先填写 API Key，再加载模型列表')
-    return
-  }
-  probingModels.value = true
-  probeModelsError.value = ''
-  try {
-    const res = await api.probeUpstreamModels({
-      base_url: newBaseURL.value.trim() || undefined,
-      api_key: newAPIKey.value.trim(),
-      protocol: newProtocol.value,
-    })
-    const models = res.models || []
-    probeModelOptions.value = models.map(m => ({
-      label: m.owned_by ? `${m.id} · ${m.owned_by}` : m.id,
-      value: m.id,
-    }))
-    if (!models.length) {
-      probeModelsError.value = '上游未返回模型'
-      message.info('上游未返回模型，可手动输入模型 ID')
-    } else {
-      message.success(`已加载 ${models.length} 个模型`)
-      // If the user hasn't picked a default yet, prefill the first.
-      if (!newModel.value.trim()) {
-        newModel.value = models[0].id
-      }
-    }
-  } catch (e: any) {
-    probeModelsError.value = e.message || '加载失败'
-    message.error(`加载模型失败: ${e.message || '未知错误'}`)
-  } finally {
-    probingModels.value = false
-  }
 }
 
 // hydrateEditForm copies the server-resolved fields into the
@@ -763,9 +734,8 @@ function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   const src = p || providers.value.find(x => x.name === name)
   if (!src) return
   editName.value = src.name
-  editVendor.value = src.vendor || ''
   editProtocol.value = (src.protocol as 'openai' | 'anthropic') || 'openai'
-  editBaseURL.value = src.base_url || ''
+  editBaseURL.value = src.base_url || src.api_url || ''
   editAPIKey.value = src.api_key || ''
   editIsDefault.value = !!src.is_default
   dirty.value = new Set()
@@ -780,15 +750,14 @@ function resetDirty() { dirty.value = new Set() }
 // --- Provider handlers ---
 
 async function onAddProvider() {
-  if (!newName.value.trim() || !newProtocol.value) {
-    message.warning('名称、协议为必填')
+  if (!newName.value.trim() || !newProtocol.value || !isCompleteHTTPURL(newBaseURL.value)) {
+	message.warning('名称、协议和有效的 Base URL 为必填')
     return
   }
   try {
     const addedName = newName.value.trim()
     await api.addProvider({
       name: addedName,
-      vendor: newVendor.value,
       protocol: newProtocol.value,
       base_url: newBaseURL.value.trim(),
       api_key: newAPIKey.value.trim(),
@@ -808,6 +777,7 @@ async function onDeleteProvider(name: string) {
     await api.deleteProvider(name)
     message.success('已删除')
     await refreshProviders()
+    notifyGenerationConfigChanged()
   } catch (e: any) {
     message.error(`删除失败: ${e.message}`)
   }
@@ -820,6 +790,10 @@ async function onSaveProvider() {
     message.info('没有改动')
     return
   }
+  if (dirty.value.has('base_url') && !isCompleteHTTPURL(editBaseURL.value)) {
+    message.warning('Base URL 必须是完整的 http(s) URL')
+    return
+  }
   // Build a PATCH body with only the dirty fields. The server
   // treats empty strings as "leave alone" for every field
   // except api_key, which we always send when the user
@@ -829,9 +803,6 @@ async function onSaveProvider() {
   const body: api.UpdateProviderRequest = {}
   if (dirty.value.has('name') && editName.value.trim() && editName.value.trim() !== name) {
     body.name = editName.value.trim()
-  }
-  if (dirty.value.has('vendor')) {
-    body.vendor = editVendor.value
   }
   if (dirty.value.has('protocol')) {
     body.protocol = editProtocol.value
@@ -849,6 +820,7 @@ async function onSaveProvider() {
     const updated = await api.updateProvider(name, body)
     message.success('已保存')
     await refreshProviders()
+    notifyGenerationConfigChanged()
     // If renamed, the new name is in the response; select it
     // so the user can keep editing. selectProvider also
     // fetches the rich per-provider view, which re-hydrates
@@ -865,13 +837,14 @@ async function onSaveProvider() {
 function resetModelForm() {
   editingModelName.value = null
   editModelName.value = ''
+  editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
   editModelDisplay.value = ''
   editModelCtx.value = null
   editModelOut.value = null
   editModelCapabilities.value = []
   editModelType.value = 'llm'
   editGenerationOperations.value = []
-  editGenerationConfigs.value = emptyGenerationConfigs()
+  editGenerationAPI.value = emptyGenerationAPIConfig()
 }
 
 function onShowAddModel() {
@@ -891,10 +864,27 @@ async function onAddModel() {
     message.warning('媒体生成模型至少需要选择一种生成能力')
     return
   }
+  if (editModelType.value === 'llm' && !isEndpointSuffix(editModelAPIEndpoint.value)) {
+    message.warning('大语言模型 API 端点只能填写相对于 Base URL 的路径后缀')
+    return
+  }
+  if (editModelType.value === 'media_generation' && !isEndpointSuffix(editGenerationAPI.value.endpoint)) {
+    message.warning('媒体生成 API 端点只能填写相对于 Base URL 的路径后缀')
+    return
+  }
+  if (editModelType.value === 'media_generation' && !isEndpointSuffix(editGenerationAPI.value.query_endpoint, false)) {
+    message.warning('媒体生成查询端点只能填写相对于 Base URL 的路径后缀')
+    return
+  }
+  if (editModelType.value === 'media_generation' && editGenerationAPI.value.query_endpoint?.trim() && !hasTaskIDPlaceholder(editGenerationAPI.value.query_endpoint)) {
+    message.warning('异步查询端点必须包含 {task_id} 或 {id} 占位符')
+    return
+  }
   try {
     await api.addModel(providerName, {
       name,
       type: editModelType.value,
+      api_endpoint: editModelType.value === 'llm' ? normalizeEndpointSuffix(editModelAPIEndpoint.value) : undefined,
       display_name: editModelDisplay.value.trim() || undefined,
       max_tokens_context: editModelCtx.value ?? undefined,
       max_tokens_output: editModelOut.value ?? undefined,
@@ -915,9 +905,14 @@ async function onAddModel() {
       }
     }
     message.success('已添加模型')
+    const upstreamIndex = upstreamModels.value.findIndex(model => model.id === name)
+    if (upstreamIndex >= 0) {
+      upstreamModels.value[upstreamIndex] = { ...upstreamModels.value[upstreamIndex], added: true }
+    }
     resetModelForm()
     showAddModel.value = false
     await refreshProviders()
+    notifyGenerationConfigChanged()
   } catch (e: any) {
     message.error(`添加失败: ${e.message}`)
   }
@@ -936,6 +931,7 @@ function onEditModel(m: api.ModelInfo) {
   editingModelName.value = m.name
   editModelName.value = m.name
   editModelType.value = m.type || 'llm'
+  editModelAPIEndpoint.value = m.api_endpoint || defaultLLMAPIEndpoint()
   editModelDisplay.value = m.display_name || ''
   editModelCtx.value = m.max_tokens_context ?? null
   editModelOut.value = m.max_tokens_output ?? null
@@ -946,12 +942,13 @@ function onEditModel(m: api.ModelInfo) {
         ...(m.capabilities?.supports_audio ? ['audio' as api.MediaKind] : []),
       ]
   editGenerationOperations.value = Object.keys(m.generation?.operations || {}) as api.GenerationOperation[]
-  editGenerationConfigs.value = emptyGenerationConfigs()
-  for (const operation of editGenerationOperations.value) {
-    editGenerationConfigs.value[operation] = {
-      ...editGenerationConfigs.value[operation],
-      ...(m.generation?.operations?.[operation] || {}),
-    }
+  const legacyOperationConfig = editGenerationOperations.value
+    .map(operation => m.generation?.operations?.[operation])
+    .find(operationConfig => operationConfig && Object.keys(operationConfig).length > 0)
+  editGenerationAPI.value = {
+    ...emptyGenerationAPIConfig(),
+    ...(legacyOperationConfig || {}),
+    ...(m.generation?.api || {}),
   }
   showAddModel.value = true
 }
@@ -964,6 +961,22 @@ async function onSaveModel() {
     message.warning('媒体生成模型至少需要选择一种生成能力')
     return
   }
+  if (editModelType.value === 'llm' && !isEndpointSuffix(editModelAPIEndpoint.value)) {
+    message.warning('大语言模型 API 端点只能填写相对于 Base URL 的路径后缀')
+    return
+  }
+  if (editModelType.value === 'media_generation' && !isEndpointSuffix(editGenerationAPI.value.endpoint)) {
+    message.warning('媒体生成 API 端点只能填写相对于 Base URL 的路径后缀')
+    return
+  }
+  if (editModelType.value === 'media_generation' && !isEndpointSuffix(editGenerationAPI.value.query_endpoint, false)) {
+    message.warning('媒体生成查询端点只能填写相对于 Base URL 的路径后缀')
+    return
+  }
+  if (editModelType.value === 'media_generation' && editGenerationAPI.value.query_endpoint?.trim() && !hasTaskIDPlaceholder(editGenerationAPI.value.query_endpoint)) {
+    message.warning('异步查询端点必须包含 {task_id} 或 {id} 占位符')
+    return
+  }
   try {
     // updateModel semantics: 0 / "" in a numeric field means
     // "leave alone" (see internal/config/manager.go
@@ -974,6 +987,7 @@ async function onSaveModel() {
     const out = editModelOut.value && editModelOut.value > 0 ? editModelOut.value : 0
     await api.updateModel(provider, model, {
       type: editModelType.value,
+      api_endpoint: editModelType.value === 'llm' ? normalizeEndpointSuffix(editModelAPIEndpoint.value) : undefined,
       display_name: editModelDisplay.value,
       max_tokens_context: ctx,
       max_tokens_output: out,
@@ -991,6 +1005,7 @@ async function onSaveModel() {
     resetModelForm()
     showAddModel.value = false
     await refreshProviders()
+    notifyGenerationConfigChanged()
   } catch (e: any) {
     message.error(`保存失败: ${e.message}`)
   }
@@ -1007,6 +1022,7 @@ async function onDeleteModel(model: string) {
     await api.deleteModel(selected.value.name, model)
     message.success('已删除')
     await refreshProviders()
+    notifyGenerationConfigChanged()
   } catch (e: any) {
     message.error(`删除失败: ${e.message}`)
   }
@@ -1059,26 +1075,27 @@ async function onFetchUpstreamModels() {
     upstreamModels.value = res.models || []
     showUpstreamModels.value = true
   } catch (e: any) {
-    upstreamError.value = e.message || '获取失败'
+    upstreamError.value = e?.message || '获取失败'
+    showUpstreamModels.value = true
   } finally {
     fetchingUpstream.value = false
   }
 }
 
-async function onImportUpstreamModel(m: api.UpstreamModelItem) {
-  if (!selected.value || m.added) return
-  const providerName = selected.value.name
-  try {
-    await api.addModel(providerName, { name: m.id })
-    message.success(`已添加模型: ${m.id}`)
-    await refreshProviders()
-    // Refresh the upstream list to mark this one as added.
-    const idx = upstreamModels.value.findIndex(x => x.id === m.id)
-    if (idx >= 0) upstreamModels.value[idx] = { ...upstreamModels.value[idx], added: true }
-  } catch (e: any) {
-    message.error(`添加失败: ${e.message}`)
-  }
+function onImportUpstreamModel(model: api.UpstreamModelItem) {
+  if (model.added) return
+  resetModelForm()
+  editModelName.value = model.id
+  editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
+  showUpstreamModels.value = false
+  showAddModel.value = true
 }
+
+watch(editModelType, type => {
+  if (type === 'llm' && !editModelAPIEndpoint.value.trim()) {
+    editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
+  }
+})
 
 // --- Style handlers ---
 
@@ -2221,27 +2238,17 @@ function kbModelSupportsVision(scanModel: string) {
                       size="small"
                       @update:value="markDirty('protocol')"
                     />
-                    <span class="settings-form-hint">OpenAI 兼容 / Anthropic / 自定义</span>
-                  </div>
-                  <div class="settings-form-row settings-form-row--span2">
-                    <label class="settings-form-label">厂商预设</label>
-                    <NSelect
-                      v-model:value="editVendor"
-                      :options="vendorOptions"
-                      size="small"
-                      @update:value="markDirty('vendor')"
-                    />
-                    <span class="settings-form-hint">用于填充媒体生成接口默认端点；仍可在每个媒体模型能力中单独覆盖。</span>
+                    <span class="settings-form-hint">选择请求与响应采用 OpenAI 兼容或 Anthropic 协议</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">Base URL</label>
                     <NInput
                       v-model:value="editBaseURL"
                       size="small"
-                      placeholder="https://api.openai.com/v1"
+                      :placeholder="editProtocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
                       @update:value="markDirty('base_url')"
                     />
-                    <span class="settings-form-hint">API endpoint，OpenAI 兼容服务可填自有地址</span>
+                    <span class="settings-form-hint">供应商公共地址；实际请求地址由 Base URL 与各模型的 API 端点后缀拼接。</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">API Key</label>
@@ -2347,7 +2354,7 @@ function kbModelSupportsVision(scanModel: string) {
                     </div>
                   </div>
                 </div>
-                <div v-else class="settings-empty">还没有模型。点击「+ 添加模型」或「获取模型」配置。</div>
+                <div v-else class="settings-empty">还没有模型。可点击「获取模型」选择上游模型，或手动添加模型 ID。</div>
               </div>
             </template>
           </div>
@@ -2361,7 +2368,7 @@ function kbModelSupportsVision(scanModel: string) {
           :style="{ width: 'min(560px, calc(100vw - 32px))' }"
           :mask-closable="false"
         >
-          <p class="modal-lead">填写连接信息。默认模型可手动输入，或用 API Key 从接口加载后选择。</p>
+          <p class="modal-lead">选择协议并填写供应商公共 Base URL；模型创建时再配置请求端点后缀。</p>
           <div class="settings-form settings-form--grid modal-form">
             <div class="settings-form-row">
               <label class="settings-form-label">名称 <span class="settings-required">*</span></label>
@@ -2373,22 +2380,16 @@ function kbModelSupportsVision(scanModel: string) {
                 v-model:value="newProtocol"
                 :options="protocolOptions"
                 size="small"
-                @update:value="() => { probeModelOptions = []; probeModelsError = '' }"
               />
             </div>
             <div class="settings-form-row settings-form-row--span2">
-              <label class="settings-form-label">厂商预设</label>
-              <NSelect :value="newVendor" :options="vendorOptions" size="small" @update:value="onNewVendorUpdate" />
-              <span class="settings-form-hint">火山、MiniMax、OpenAI 会自动带出推荐 Base URL 和媒体端点，也可保持自定义。</span>
-            </div>
-            <div class="settings-form-row settings-form-row--span2">
-              <label class="settings-form-label">Base URL</label>
+              <label class="settings-form-label">Base URL <span class="settings-required">*</span></label>
               <NInput
                 v-model:value="newBaseURL"
                 :placeholder="newProtocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
                 size="small"
               />
-              <span class="settings-form-hint">可留空使用协议默认地址</span>
+              <span class="settings-form-hint">例如火山方舟可填写到 /api/v3；模型端点只填写其后的相对路径。</span>
             </div>
             <div class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">API Key</label>
@@ -2402,29 +2403,8 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
             <div class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">默认对话模型</label>
-              <div class="model-pick-row">
-                <NSelect
-                  v-model:value="newModel"
-                  filterable
-                  tag
-                  clearable
-                  :options="probeModelOptions"
-                  :loading="probingModels"
-                  placeholder="输入或从列表选择模型 ID"
-                  size="small"
-                  class="model-pick-select"
-                />
-                <NButton
-                  size="small"
-                  :loading="probingModels"
-                  :disabled="!newAPIKey.trim()"
-                  @click="onProbeAddProviderModels"
-                >
-                  加载模型
-                </NButton>
-              </div>
-              <span v-if="probeModelsError" class="settings-form-hint settings-form-hint--error">{{ probeModelsError }}</span>
-              <span v-else class="settings-form-hint">可选。纯媒体供应商可先创建，再添加“媒体生成模型”。</span>
+              <NInput v-model:value="newModel" placeholder="输入模型 ID" size="small" />
+              <span class="settings-form-hint">可选。纯媒体提供商可先创建，再添加“媒体生成模型”。</span>
             </div>
           </div>
           <template #footer>
@@ -2440,7 +2420,7 @@ function kbModelSupportsVision(scanModel: string) {
           v-model:show="showAddModel"
           preset="card"
           :title="editingModelName ? '编辑模型' : '添加模型'"
-          :style="{ width: 'min(520px, calc(100vw - 32px))' }"
+          :style="{ width: 'min(640px, calc(100vw - 32px))' }"
           :mask-closable="false"
           @after-leave="onCancelEditModel"
         >
@@ -2471,6 +2451,19 @@ function kbModelSupportsVision(scanModel: string) {
               </NRadioGroup>
               <span class="settings-form-hint">{{ editingModelName ? '模型类型创建后不可更改。' : '同一供应商和 API Key 可同时配置对话模型与媒体生成模型。' }}</span>
             </div>
+            <div v-if="editModelType === 'llm'" class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">API 端点后缀 <span class="settings-required">*</span></label>
+              <NInput
+                v-model:value="editModelAPIEndpoint"
+                :placeholder="defaultLLMAPIEndpoint()"
+                size="small"
+              />
+              <span class="settings-form-hint">
+                按协议自动填入默认值，可编辑；请求地址为
+                <code v-if="modelEndpointPreview" class="endpoint-preview">{{ modelEndpointPreview }}</code>
+                <template v-else>Base URL + 此后缀</template>。
+              </span>
+            </div>
             <div v-if="editModelType === 'llm'" class="settings-form-row">
               <label class="settings-form-label">上下文 (tokens)</label>
               <div class="model-context-control">
@@ -2496,16 +2489,19 @@ function kbModelSupportsVision(scanModel: string) {
               <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="4096" size="small" class="model-num-input" />
             </div>
             <div v-if="editModelType === 'llm'" class="settings-form-row settings-form-row--span2">
-              <label class="settings-form-label">能力配置</label>
+              <div class="capability-field-head">
+                <label class="settings-form-label">媒体识别能力（可选）</label>
+                <NTag v-if="editModelCapabilities.length === 0" size="tiny" :bordered="false">默认：仅文本</NTag>
+              </div>
               <NSelect
                 v-model:value="editModelCapabilities"
                 :options="modelCapabilityOptions"
                 multiple
                 clearable
-                placeholder="选择模型支持的识别能力"
+                placeholder="不选择（不支持媒体识别）"
                 size="small"
               />
-              <span class="settings-form-hint">支持多选；旧版“视觉输入”开启的模型会自动选中图片识别。</span>
+              <span class="settings-form-hint">留空表示该模型不支持图片、视频或音频识别；需要时可多选模型实际支持的类型。</span>
             </div>
             <div v-else class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">生成能力 <span class="settings-required">*</span></label>
@@ -2518,30 +2514,47 @@ function kbModelSupportsVision(scanModel: string) {
                 size="small"
                 @update:value="onGenerationOperationsUpdate"
               />
-              <span class="settings-form-hint">能力决定会话中可开启哪些工具；每个能力的 API 端点互相独立。</span>
+              <span class="settings-form-hint">能力决定会话中可开启哪些工具；所有能力共享下方的模型 API 配置。</span>
             </div>
             <div
-              v-for="operation in editGenerationOperations"
               v-if="editModelType === 'media_generation'"
-              :key="operation"
-              class="settings-form-row settings-form-row--span2 generation-operation-editor"
+              class="settings-form-row settings-form-row--span2 generation-api-editor"
             >
-              <div class="generation-operation-title">
-                <strong>{{ generationOperationDefs.find(item => item.operation === operation)?.label || operation }}</strong>
-                <span>{{ generationOperationDefs.find(item => item.operation === operation)?.hint }}</span>
+              <div class="generation-api-title">
+                <strong>模型 API</strong>
+                <span>所有生成能力共用一组端点；下方同步展示最终请求路径</span>
               </div>
-              <div class="generation-operation-fields">
-                <label>
-                  <span>创建端点</span>
-                  <NInput v-model:value="editGenerationConfigs[operation].endpoint" size="small" placeholder="相对 Base URL 或完整 URL" />
+              <div class="generation-api-fields">
+                <label class="generation-api-field generation-api-field--create">
+                  <span>API 端点后缀</span>
+                  <NInput v-model:value="editGenerationAPI.endpoint" size="small" placeholder="/images/generations" />
+                  <small class="generation-endpoint-preview">
+                    完整请求：
+                    <code v-if="generationEndpointPreview" class="endpoint-preview">{{ generationEndpointPreview }}</code>
+                    <template v-else>Base URL + 此后缀</template>
+                  </small>
+                  <small v-if="generationEndpointConsistencyWarning" class="generation-endpoint-warning">
+                    {{ generationEndpointConsistencyWarning }}
+                  </small>
                 </label>
-                <label>
-                  <span>查询端点（异步时）</span>
-                  <NInput v-model:value="editGenerationConfigs[operation].query_endpoint" size="small" placeholder="可使用 {task_id}" />
+                <label class="generation-api-field generation-api-field--query">
+                  <span>查询端点后缀（异步任务）</span>
+                  <NInput v-model:value="editGenerationAPI.query_endpoint" size="small" placeholder="/tasks/{task_id}" />
+                  <small v-if="editGenerationAPI.query_endpoint" class="generation-endpoint-preview">
+                    完整请求：
+                    <code v-if="generationQueryEndpointPreview" class="endpoint-preview">{{ generationQueryEndpointPreview }}</code>
+                    <template v-else>Base URL + 此后缀</template>
+                  </small>
+                  <small
+                    class="generation-task-id-help"
+                    :class="{ 'is-error': editGenerationAPI.query_endpoint && !hasTaskIDPlaceholder(editGenerationAPI.query_endpoint) }"
+                  >
+                    任务 ID 来自创建接口的响应，无需手动填写；系统会将 <code>{task_id}</code> 或 <code>{id}</code> 替换为实际 ID。同步接口可留空。
+                  </small>
                 </label>
-                <label>
+                <label class="generation-api-field generation-api-field--timeout">
                   <span>超时（秒）</span>
-                  <NInputNumber v-model:value="editGenerationConfigs[operation].timeout_seconds" :min="5" :step="5" size="small" />
+                  <NInputNumber v-model:value="editGenerationAPI.timeout_seconds" :min="5" :step="5" size="small" />
                 </label>
               </div>
             </div>
@@ -2556,29 +2569,42 @@ function kbModelSupportsVision(scanModel: string) {
           </template>
         </NModal>
 
-        <!-- Upstream models modal -->
-        <NModal v-model:show="showUpstreamModels" preset="card" title="上游模型列表" style="width: 500px">
+        <!-- Upstream model discovery only chooses an ID. The user always
+             completes the normal model editor before anything is persisted. -->
+        <NModal
+          v-model:show="showUpstreamModels"
+          preset="card"
+          title="获取模型"
+          :style="{ width: 'min(560px, calc(100vw - 32px))' }"
+        >
+          <p class="modal-lead">从 {{ selected?.name }} 的 Base URL + /models 获取。点击“配置并添加”后，可继续填写能力、上下文和 API 端点。</p>
           <div v-if="upstreamError" class="upstream-error">{{ upstreamError }}</div>
-          <template v-else>
-            <p class="upstream-hint">以下是从 {{ selected?.name }} 上游获取的可用模型，点击即可添加。</p>
-            <div v-if="!upstreamModels.length" class="muted empty-hint">未获取到模型列表</div>
-            <div v-else class="upstream-list">
-              <div
-                v-for="m in upstreamModels"
-                :key="m.id"
-                class="upstream-item"
-                :class="{ added: m.added }"
-              >
-                <span class="upstream-id">{{ m.id }}</span>
-                <span class="upstream-owner" v-if="m.owned_by">{{ m.owned_by }}</span>
-                <NButton v-if="!m.added" size="tiny" type="primary" ghost @click="onImportUpstreamModel(m)">
-                  添加
-                </NButton>
-                <NTag v-else size="tiny" type="default">已添加</NTag>
+          <div v-else-if="!upstreamModels.length" class="settings-empty upstream-empty">上游未返回可用模型。</div>
+          <div v-else class="upstream-list">
+            <div
+              v-for="model in upstreamModels"
+              :key="model.id"
+              class="upstream-item"
+              :class="{ added: model.added }"
+            >
+              <div class="upstream-model-copy">
+                <code class="upstream-id">{{ model.id }}</code>
+                <span v-if="model.owned_by" class="upstream-owner">{{ model.owned_by }}</span>
               </div>
+              <NButton
+                v-if="!model.added"
+                size="small"
+                type="primary"
+                ghost
+                @click="onImportUpstreamModel(model)"
+              >
+                配置并添加
+              </NButton>
+              <NTag v-else size="small" :bordered="false">已添加</NTag>
             </div>
-          </template>
+          </div>
         </NModal>
+
       </NTabPane>
 
       <NTabPane name="styles" tab="风格配置">
@@ -4294,45 +4320,90 @@ function kbModelSupportsVision(scanModel: string) {
   width: 100%;
   max-width: 200px;
 }
-.model-pick-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-}
-.model-pick-select {
-  flex: 1;
-  min-width: 0;
-}
-.generation-operation-editor {
+.generation-api-editor {
   padding: var(--space-3);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   background: var(--surface-2);
 }
-.generation-operation-title {
+.generation-api-title {
   display: flex;
   align-items: baseline;
   gap: var(--space-2);
+  flex-wrap: wrap;
 }
-.generation-operation-title strong {
+.generation-api-title strong {
   color: var(--text-primary);
   font-size: 12.5px;
 }
-.generation-operation-title span,
-.generation-operation-fields label > span {
+.generation-api-title span,
+.generation-api-fields label > span {
   color: var(--text-tertiary);
   font-size: 11px;
 }
-.generation-operation-fields {
+.generation-api-fields {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(160px, 1fr) 100px;
-  gap: var(--space-2);
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 0.28fr);
+  gap: var(--space-3);
 }
-.generation-operation-fields label {
+.generation-api-field {
   display: grid;
   gap: var(--space-1);
   min-width: 0;
+  align-content: start;
+}
+.generation-api-field--create {
+  grid-column: 1;
+  grid-row: 1;
+}
+.generation-api-field--timeout {
+  grid-column: 2;
+  grid-row: 1;
+}
+.generation-api-field--query {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+.generation-endpoint-preview {
+  min-width: 0;
+  color: var(--text-quaternary);
+  font-size: 10.5px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+.generation-endpoint-warning {
+  color: var(--warn-500);
+  background: var(--warn-50);
+  border: 1px solid var(--warn-500);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) var(--space-2);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+.generation-task-id-help {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+.generation-task-id-help.is-error {
+  color: var(--error-500);
+}
+.generation-task-id-help code {
+  color: inherit;
+  font-family: var(--font-mono);
+}
+.capability-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.endpoint-preview {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
 }
 .modal-lead {
   margin: 0 0 14px;
@@ -4752,19 +4823,6 @@ code {
 .skill-search { display: flex; gap: 8px; margin-bottom: 12px; }
 .skill-search-results { margin-bottom: 12px; }
 .skill-divider { border-top: 1px solid var(--border-2); margin: 12px 0; }
-.upstream-error { color: var(--warn); padding: 8px 0; }
-.upstream-hint { font-size: 13px; color: var(--text-3); margin: 0 0 12px; }
-.upstream-list { max-height: 400px; overflow: auto; }
-.upstream-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border-2);
-  font-size: 13px;
-}
-.upstream-item:hover { background: var(--bg-3); }
-.upstream-id { flex: 1; font-family: ui-monospace, monospace; font-size: 12.5px; }
-.upstream-owner { color: var(--text-4); font-size: 11px; }
-.upstream-item.added { opacity: 0.6; }
 /* ---- Knowledge Base ---- */
 .provider-item-path {
   overflow: hidden;
@@ -5301,6 +5359,56 @@ code {
   white-space: normal;
   min-width: 0;
 }
+.upstream-error {
+  color: var(--error-500);
+  padding: var(--space-3);
+  border: 1px solid var(--error-50);
+  border-radius: var(--radius-md);
+  background: var(--error-50);
+}
+.upstream-empty {
+  padding: var(--space-5) var(--space-3);
+}
+.upstream-list {
+  display: grid;
+  gap: var(--space-2);
+  max-height: min(420px, 56vh);
+  overflow-y: auto;
+}
+.upstream-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+.upstream-item:hover {
+  border-color: var(--border-default);
+  background: var(--surface-2);
+}
+.upstream-item.added {
+  opacity: 0.65;
+}
+.upstream-model-copy {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.upstream-id {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.upstream-owner {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
 
 .recognition-route-list {
   display: grid;
@@ -5389,8 +5497,14 @@ code {
     grid-template-columns: 1fr 1fr;
   }
   .generation-default-row,
-  .generation-operation-fields {
+  .generation-api-fields {
     grid-template-columns: 1fr;
+  }
+  .generation-api-field--create,
+  .generation-api-field--query,
+  .generation-api-field--timeout {
+    grid-column: 1;
+    grid-row: auto;
   }
 }
 

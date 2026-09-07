@@ -5,13 +5,13 @@
 
 ## 已实现范围
 
-- Provider 作为厂商账号和共享凭据边界，增加 `vendor`；同一个 API key 下可同时添加
-  `llm` 与 `media_generation` 两类模型。
+- Provider 作为账号和共享凭据边界，只配置协议、公共 Base URL 与 API key；同一个
+  API key 下可同时添加 `llm` 与 `media_generation` 两类模型，不再选择厂商预设。
 - 媒体模型显式选择文生图、图生图、文生视频、图生视频、视频生视频、文字转语音、
-  文生音乐、文生音效、音频转音频能力。每项能力分别配置创建端点、查询端点、超时和
-  默认参数。
-- 内置 Volcengine、MiniMax 和 OpenAI 文生图端点预设；端点输入框可按模型、按能力覆盖。
-  OpenAI 图生图需要 multipart，首版不自动填充端点，避免把它误路由到文生图接口。
+  文生音乐、文生音效、音频转音频能力；能力只作为模型支持范围，同一模型共用一份
+  创建端点、查询端点、超时和默认参数。
+- LLM 与媒体模型分别填写相对于 Provider Base URL 的端点后缀；运行时通过统一接口拼接，
+  不按厂商猜测路径；adapter 根据实际 operation 组装请求参数。
 - 应用设置为每项能力指定默认模型；会话设置只负责独立开启能力，开启后直接使用该能力
   的应用默认模型。所有会话能力默认关闭。
 - 模型只看到三个稳定工具：`generate_image`、`generate_video`、`generate_audio`。
@@ -26,6 +26,9 @@
   视觉模型或 `media_recognize` 获取事实观察。工具不再暴露二次提示词增强参数。
 - 同步响应和异步查询统一在 `HTTPExecutor` 内处理。厂商返回的 URL、data URI、base64
   或 MiniMax 十六进制音频最终都实体化到 `~/.p-chat/generated/`。
+- 异步查询后缀支持 `{task_id}` 与 `{id}`；执行器从创建响应的
+  `task_id/taskId/id/job_id` 提取实际任务 ID。已知媒体端点的请求 JSON dialect 由端点
+  形状在执行器内部识别，不要求恢复 Provider 厂商预设。
 - 模型可传的生成选项使用固定白名单和取值上限；`callback_url`、厂商批量参数等控制字段
   只能写入管理员维护的模型默认参数。下载结果 URL 时不会携带 Provider API key。
 - 媒体输入按能力限制引用数（图生图最多 4 个，其余媒体输入能力 1 个）并限制单次聚合
@@ -41,9 +44,11 @@
 
 GUI 推荐流程：
 
-1. 打开“应用设置 → LLM 提供商”，新建或编辑 Provider，选择厂商预设并填写共享 API key。
-2. 在该 Provider 下添加模型，类型选择“媒体生成模型”，勾选能力；需要时覆盖该能力的
-   创建/查询端点和超时。
+1. 打开“应用设置 → LLM 提供商”，新建或编辑 Provider，选择 OpenAI 兼容或 Anthropic
+   协议，填写共享 API key 与 Base URL。
+2. 在该 Provider 下添加模型，类型选择“媒体生成模型”，勾选能力；需要时配置该模型
+   共用的创建/查询端点和超时。创建端点默认填入 `/images/generations`，界面会同步展示
+   `Base URL + 端点后缀` 的完整请求路径；非 OpenAI 路径可直接编辑。
 3. 打开“应用设置 → 系统 → 媒体生成”，为每项能力选择应用默认模型。
 4. 在对话框“会话设置 → 媒体生成”中开启本会话允许的能力。模型始终使用第 3 步配置的
    应用默认值。
@@ -59,28 +64,23 @@ GUI 推荐流程：
     "providers": [
       {
         "name": "volc-main",
-        "vendor": "volcengine",
         "protocol": "openai",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
         "api_key": "<secret>",
         "models": [
-          { "name": "doubao-chat", "type": "llm", "default": true },
+          { "name": "doubao-chat", "type": "llm", "api_endpoint": "/chat/completions", "default": true },
           {
             "name": "video-model-id",
             "type": "media_generation",
             "generation": {
-              "adapter": "volcengine",
+              "api": {
+                "endpoint": "/contents/generations/tasks",
+                "query_endpoint": "/contents/generations/tasks/{task_id}",
+                "timeout_seconds": 600
+              },
               "operations": {
-                "text_to_video": {
-                  "endpoint": "/contents/generations/tasks",
-                  "query_endpoint": "/contents/generations/tasks/{task_id}",
-                  "timeout_seconds": 600
-                },
-                "image_to_video": {
-                  "endpoint": "/contents/generations/tasks",
-                  "query_endpoint": "/contents/generations/tasks/{task_id}",
-                  "timeout_seconds": 600
-                }
+                "text_to_video": {},
+                "image_to_video": {}
               }
             }
           }
@@ -126,7 +126,10 @@ GUI 推荐流程：
 - `GET /api/v1/generation/options?session_id=<id>`：返回规范能力矩阵、应用默认、会话启用状态
   和不可用原因。
 - `GET /api/v1/generated/:id`：读取本地实体化后的媒体资产。
-- Provider/Model CRUD 和 `/api/v1/config/system` 已包含 `vendor`、`type`、`generation`。
+- Provider CRUD 使用 `protocol`、`base_url`、`api_key`；Model CRUD 和
+  `/api/v1/config/system` 已包含 `api_endpoint`、`type`、`generation`。
+- `GET /api/v1/providers/:name/upstream-models` 请求 `base_url + /models`；选择候选模型后
+  前端先打开普通模型编辑弹窗，用户确认后才调用 AddModel。
 - 配置模型：`internal/config/generation.go`
 - 工具硬边界：`internal/tool/media_generation.go`
 - 执行与资产存储：`internal/generation/executor.go`
@@ -142,7 +145,7 @@ GUI 推荐流程：
 - 当前 adapter 覆盖 Volcengine、MiniMax、OpenAI-compatible 的常见 JSON 调用形状。
   厂商特有的 multipart、签名、复杂参考图角色或新增响应字段应留在 adapter 内扩展，
   不得把任意 vendor options 直接暴露给模型。
-- 异步响应若只返回任务 ID、但该能力没有配置 `query_endpoint`，工具会返回配置错误，
+- 异步响应若只返回任务 ID、但该模型没有配置 `query_endpoint`，工具会返回配置错误，
   不会把没有资产的任务误报为成功。
 - 生成资产当前按会话归属持久保存并受目录配额保护，但没有自动清理策略；后续应增加
   引用计数、孤儿扫描和用户可控保留期。

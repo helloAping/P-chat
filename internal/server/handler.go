@@ -163,7 +163,7 @@ func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMg
 	}
 	h.cfg.Store(cfg)
 	h.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
-	h.generatedStore = generation.NewLocalAssetStore(paths.GeneratedDir(), "/api/v1/generated")
+	h.SetGeneratedAssetStore(generation.NewLocalAssetStore(paths.GeneratedDir(), "/api/v1/generated"))
 	return h
 }
 
@@ -175,6 +175,15 @@ func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMg
 func (h *Handler) SetAttachmentResolver(r *agent.DiskAttachmentResolver) {
 	h.attachResolver = r
 	h.agent.SetAttachmentResolver(r)
+}
+
+// SetGeneratedAssetStore installs the single durable media store shared by
+// generated output serving and binary tool-result materialization.
+func (h *Handler) SetGeneratedAssetStore(store *generation.LocalAssetStore) {
+	h.generatedStore = store
+	if h.agent != nil {
+		h.agent.SetToolAssetStore(store)
+	}
 }
 
 func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
@@ -1172,9 +1181,9 @@ func (h *Handler) Providers(c *gin.Context) {
 	}
 	type providerInfo struct {
 		Name      string      `json:"name"`
-		Vendor    string      `json:"vendor,omitempty"`
 		Model     string      `json:"model"`
 		Protocol  string      `json:"protocol"`
+		BaseURL   string      `json:"base_url"`
 		IsDefault bool        `json:"is_default"`
 		Models    []modelInfo `json:"models"`
 	}
@@ -1191,9 +1200,9 @@ func (h *Handler) Providers(c *gin.Context) {
 		}
 		providers = append(providers, providerInfo{
 			Name:      p.Name,
-			Vendor:    p.Vendor,
 			Model:     p.EffectiveModel(),
 			Protocol:  p.GetProtocol(),
+			BaseURL:   p.EffectiveBaseURL(),
 			IsDefault: p.Name == h.getCfg().LLM.Default,
 			Models:    ms,
 		})

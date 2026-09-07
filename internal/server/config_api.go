@@ -11,9 +11,9 @@ import (
 // AddProviderRequest is the body of POST /api/v1/providers.
 type AddProviderRequest struct {
 	Name     string `json:"name" binding:"required"`
-	Vendor   string `json:"vendor,omitempty"`
 	Protocol string `json:"protocol" binding:"required"` // "openai" | "anthropic"
 	BaseURL  string `json:"base_url"`
+	APIURL   string `json:"api_url,omitempty"` // pre-V12 compatibility
 	APIKey   string `json:"api_key"`
 	Model    string `json:"model"`
 }
@@ -36,8 +36,8 @@ func (h *Handler) AddProvider(c *gin.Context) {
 	}
 	if err := config.AddProvider(config.ProviderConfig{
 		Name:     req.Name,
-		Vendor:   req.Vendor,
 		Protocol: req.Protocol,
+		APIURL:   req.APIURL,
 		BaseURL:  req.BaseURL,
 		APIKey:   req.APIKey,
 		Model:    req.Model,
@@ -47,6 +47,10 @@ func (h *Handler) AddProvider(c *gin.Context) {
 		// message. Other errors stay 500.
 		if strings.Contains(err.Error(), "already exists") {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), "base_url") || strings.Contains(err.Error(), "invalid protocol") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -84,11 +88,11 @@ func (h *Handler) DeleteProvider(c *gin.Context) {
 // "omit means leave alone" rule still applies to the other
 // fields.
 type UpdateProviderRequest struct {
-	Name     string  `json:"name,omitempty"`
-	Vendor   *string `json:"vendor,omitempty"`
-	Protocol string  `json:"protocol,omitempty"`
-	BaseURL  string  `json:"base_url,omitempty"`
-	APIKey   string  `json:"api_key,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+	BaseURL  string `json:"base_url,omitempty"`
+	APIURL   string `json:"api_url,omitempty"` // pre-V12 compatibility
+	APIKey   string `json:"api_key,omitempty"`
 	// SetDefault, when true, makes this provider the global
 	// default. False is a no-op (the UI can always include
 	// the field without accidentally demoting a provider).
@@ -99,7 +103,7 @@ type UpdateProviderRequest struct {
 //
 // Unified edit endpoint. Replaces the old "api_key only"
 // endpoint. Supports renaming a provider, switching its
-// protocol (openai/anthropic), updating the base URL, the API
+// protocol (openai/anthropic), updating the provider Base URL, the API
 // key, and promoting it to the global default. Every field is
 // optional; non-zero values are written, others left alone.
 //
@@ -118,8 +122,8 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 	}
 	updated, err := config.UpdateProvider(oldName, config.ProviderPatch{
 		Name:      req.Name,
-		Vendor:    req.Vendor,
 		Protocol:  req.Protocol,
+		APIURL:    req.APIURL,
 		BaseURL:   req.BaseURL,
 		APIKey:    req.APIKey,
 		IsDefault: req.SetDefault,
@@ -130,7 +134,7 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
-		if strings.Contains(err.Error(), "invalid protocol") {
+		if strings.Contains(err.Error(), "invalid protocol") || strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), "base_url") {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -147,9 +151,8 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 	// differ from oldName when the user renamed the provider).
 	c.JSON(http.StatusOK, ProviderFull{
 		Name:      updated.Name,
-		Vendor:    updated.Vendor,
 		Protocol:  updated.GetProtocol(),
-		BaseURL:   updated.BaseURL,
+		BaseURL:   updated.EffectiveBaseURL(),
 		APIKey:    updated.APIKey,
 		IsDefault: updated.Name == h.getCfg().LLM.Default,
 		Models:    updated.AllModels(),
@@ -178,6 +181,7 @@ func (h *Handler) SetDefaultProvider(c *gin.Context) {
 // AddModelRequest is the body of POST /api/v1/providers/:name/models.
 type AddModelRequest struct {
 	Name             string                             `json:"name" binding:"required"`
+	APIEndpoint      string                             `json:"api_endpoint,omitempty"`
 	DisplayName      string                             `json:"display_name"`
 	Description      string                             `json:"description"`
 	MaxTokensContext int                                `json:"max_tokens_context"`
@@ -200,6 +204,7 @@ func (h *Handler) AddModel(c *gin.Context) {
 	}
 	if _, err := config.AddModel(name, config.ModelConfig{
 		Name:             req.Name,
+		APIEndpoint:      req.APIEndpoint,
 		DisplayName:      req.DisplayName,
 		Description:      req.Description,
 		MaxTokensContext: req.MaxTokensContext,
@@ -207,7 +212,11 @@ func (h *Handler) AddModel(c *gin.Context) {
 		Type:             req.Type,
 		Generation:       req.Generation,
 	}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "endpoint") || strings.Contains(err.Error(), "media generation model") || strings.Contains(err.Error(), "unsupported generation operation") {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	h.reloadAfterConfigChange()

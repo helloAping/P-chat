@@ -68,3 +68,27 @@ test('conversation turn drains queued turns after a completed stream', () => {
   assert.match(source, /function isQueueClaimTemporarilyBlocked\(error: unknown\)/)
   assert.match(source, /scheduleQueueDrainRetry\(sessionId\)/)
 })
+
+test('idle empty turn queue cannot trigger a self-sustaining drain loop', () => {
+  const source = readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
+  const maybeDrain = source.match(/function maybeDrainTurnQueue\(\) \{([\s\S]*?)\n\}/)
+  const drainWatcher = source.match(/watch\(\[\(\) => state\.currentID, queueSignature, ([^,]+),/)
+
+  assert.ok(maybeDrain, 'maybeDrainTurnQueue should exist')
+  assert.match(
+    maybeDrain[1],
+    /if \(!hasQueuedTurns\(state\.currentID\)\) return/,
+    'an empty queue must not start a drain request',
+  )
+  assert.ok(drainWatcher, 'turn queue drain watcher should exist')
+  assert.equal(
+    drainWatcher[1].trim(),
+    'queueDrainBlocked',
+    'the drain watcher must not observe currentConversationBusy because it includes turnQueueDraining',
+  )
+  assert.match(
+    source,
+    /const queueDrainBlocked = computed\(\(\) =>\s*isStreaming\.value \|\|\s*currentSessionWorking\.value,?\s*\)/,
+    'the watcher should only react to external conversation work',
+  )
+})

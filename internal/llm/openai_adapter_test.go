@@ -27,6 +27,20 @@ func mustBuildOpenAI(t *testing.T, a *OpenAIAdapter, msgs []ChatMessage, system 
 	return out
 }
 
+func TestOpenAIAdapterUsesConfiguredEndpointVerbatim(t *testing.T) {
+	endpoint := "https://ark.example/api/v3/custom-chat"
+	req, err := NewOpenAIAdapter(endpoint, "sk-test", "ark").Build(
+		[]ChatMessage{{Role: RoleUser, Type: TypeText, Content: "hi"}},
+		"model", 0, nil, "", 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.URL != endpoint {
+		t.Fatalf("request URL = %q, want exact configured endpoint %q", req.URL, endpoint)
+	}
+}
+
 // TestOpenAIBuild_ParallelToolCalls_Merged is the regression
 // test for the 2026-07-17 incident: the agent emitted 2 parallel
 // list_files tool_calls, the previous adapter produced 2 separate

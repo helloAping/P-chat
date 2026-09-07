@@ -7,8 +7,10 @@ import (
 	"strings"
 )
 
-// MediaRecognitionAsset is a session-validated image, video, or audio upload.
+// MediaRecognitionAsset is a session-validated image, video, or audio input.
 type MediaRecognitionAsset struct {
+	// UploadID retains its historical name for API compatibility; it may hold
+	// either a user upload id or a durable tool-asset id.
 	UploadID string
 	Name     string
 	Kind     string
@@ -23,7 +25,8 @@ type MediaRecognitionRequest struct {
 	Question string
 }
 
-// MediaResolver resolves an upload only when it belongs to the active session.
+// MediaResolver resolves an opaque media reference only when it belongs to the
+// active session.
 type MediaResolver func(context.Context, string, string) (MediaRecognitionAsset, error)
 
 // MediaRecognizer analyzes resolved assets through the configured media route.
@@ -49,6 +52,10 @@ func WithMediaRecognizer(ctx context.Context, recognizer MediaRecognizer) contex
 }
 
 type mediaRecognizeArgs struct {
+	InputRef  string   `json:"input_ref,omitempty"`
+	InputRefs []string `json:"input_refs,omitempty"`
+	// UploadID/UploadIDs remain accepted for existing conversations and older
+	// model prompts. New calls should use the storage-neutral input_ref fields.
 	UploadID  string   `json:"upload_id"`
 	UploadIDs []string `json:"upload_ids,omitempty"`
 	Question  string   `json:"question,omitempty"`
@@ -59,9 +66,10 @@ func handleMediaRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 	if err := json.Unmarshal(argsRaw, &args); err != nil {
 		return &CallResult{Content: "invalid arguments: " + err.Error(), IsError: true}, nil
 	}
-	uploadIDs := normalizeImageUploadIDs(args.UploadID, args.UploadIDs)
-	if len(uploadIDs) == 0 {
-		return &CallResult{Content: "upload_id or upload_ids is required", IsError: true}, nil
+	inputRefs := normalizeImageUploadIDs(args.InputRef, args.InputRefs)
+	inputRefs = normalizeImageUploadIDs("", append(inputRefs, normalizeImageUploadIDs(args.UploadID, args.UploadIDs)...))
+	if len(inputRefs) == 0 {
+		return &CallResult{Content: "input_ref or input_refs is required", IsError: true}, nil
 	}
 	sessionID, _ := ctx.Value(SessionIDKey{}).(string)
 	resolver, _ := ctx.Value(mediaResolverKey{}).(MediaResolver)
@@ -69,12 +77,12 @@ func handleMediaRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 	if sessionID == "" || resolver == nil || recognizer == nil {
 		return &CallResult{Content: "media_recognize is not available in this session", IsError: true}, nil
 	}
-	assets := make([]MediaRecognitionAsset, 0, len(uploadIDs))
+	assets := make([]MediaRecognitionAsset, 0, len(inputRefs))
 	kind := ""
-	for _, uploadID := range uploadIDs {
-		asset, err := resolver(ctx, sessionID, uploadID)
+	for _, inputRef := range inputRefs {
+		asset, err := resolver(ctx, sessionID, inputRef)
 		if err != nil {
-			return &CallResult{Content: "media_recognize failed to resolve upload: " + err.Error(), IsError: true}, nil
+			return &CallResult{Content: "media_recognize failed to resolve media reference: " + err.Error(), IsError: true}, nil
 		}
 		if kind == "" {
 			kind = asset.Kind
@@ -96,7 +104,7 @@ func handleMediaRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 		return &CallResult{Content: "media_recognize returned an empty result", IsError: true}, nil
 	}
 	return &CallResult{
-		Content: fmt.Sprintf("%s recognition result for %s:\n%s", kind, strings.Join(uploadIDs, ","), text),
-		Summary: fmt.Sprintf("Recognized %d %s upload(s)", len(assets), kind),
+		Content: fmt.Sprintf("%s recognition result for %s:\n%s", kind, strings.Join(inputRefs, ","), text),
+		Summary: fmt.Sprintf("Recognized %d %s media asset(s)", len(assets), kind),
 	}, nil
 }

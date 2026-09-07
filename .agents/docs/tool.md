@@ -108,7 +108,10 @@ type SandboxChecker interface {
 
 ### 6.5 媒体识别工具
 
-`media_recognize` 是图片、视频、音频的唯一模型可见识别入口。handler 先校验 `upload_id` 属于当前会话，再根据 MIME 类型选择执行策略；一次调用中的多个文件必须是同一种媒体类型：
+`media_recognize` 是图片、视频、音频的唯一模型可见识别入口。新调用优先使用存储无关的
+`input_ref/input_refs`；它既可以指向用户上传，也可以指向截图/生成工具产生的本地资产。
+旧 `upload_id/upload_ids` 参数继续兼容。handler 先校验引用属于当前会话，再根据 MIME
+类型选择执行策略；一次调用中的多个文件必须是同一种媒体类型：
 
 - 图片：优先使用会话选择且配置完整的 image 路由；没有独立路由但当前模型支持视觉时，fallback 到当前 provider/model。
 - 音频 / 视频：仅使用会话选择、配置完整且目标模型明确声明对应输入能力的路由。
@@ -120,7 +123,11 @@ type SandboxChecker interface {
 
 识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，当前轮图片二进制都不会发给主模型，避免主模型收到 `image_url` / image block。重答目标消息中的图片按“当前轮图片”处理，会重新识别或重新提交；更早的历史图片仍走占位 + 工具引用。
 
-浏览器 `browser_screenshot` 只有在当前模型支持视觉或会话启用系统识图时暴露。启用系统识图时，截图结果先由识图模型分析并以受约束的事实观察文本回填给主模型；未启用时，仍按原逻辑把截图作为视觉 payload 提交给支持多模态的当前模型。
+浏览器 `browser_screenshot` 只有在当前模型支持视觉或会话启用系统识图时暴露。截图原始
+字节只用于当前视觉分析轮次，随后实体化到与媒体生成相同的会话资产仓库；工具 part 仅
+持久化 `asset_id`、同源 URL 与元数据。启用系统识图时先把截图转换为事实观察文本；未启用
+时把原图作为本轮视觉 payload 提交给主模型。后续轮次通过 `input_ref` 按需识别，不重复
+持久化或传输 base64。
 
 旧名称 `image_recognize` 是隐藏兼容别名：历史工具调用和旧白名单仍会映射到 `media_recognize`，但不会同时出现在模型 schema 中。
 
@@ -152,6 +159,13 @@ type SandboxChecker interface {
 输入 ID 在 executor 内按会话归属解析；厂商输出实体化为本地生成资产，工具结果只返回
 `id/kind/mime_type/name/url`。详见
 [媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
+
+媒体执行器不依赖 Provider 厂商预设。对于 `/contents/generations/tasks`、
+`/images/generations`、MiniMax 常见媒体端点等具有明确请求形状的路径，会在内部选择对应
+媒体 JSON dialect；其余端点回落到协议通用形状。异步创建响应中的
+`task_id/taskId/id/job_id` 会被提取并替换查询后缀中的 `{task_id}` 或 `{id}`。查询后缀
+没有占位符时会在提交计费请求前失败；创建与查询路径看起来不一致且创建请求失败时，错误
+会附带可核对的任务集合路径，但不会自动修改用户配置。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

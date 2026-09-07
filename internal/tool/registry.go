@@ -47,6 +47,10 @@ type CallResultImage struct {
 	Data     string `json:"data"`
 	MIMEType string `json:"mime_type"`
 	Name     string `json:"name"` // display name, e.g. "browser-screenshot.jpg"
+	// AssetID is populated by the agent after Data has been materialized in the
+	// durable, conversation-owned media store. Data remains available only for
+	// the current LLM round; history and the frontend use this opaque id.
+	AssetID string `json:"asset_id,omitempty"`
 }
 
 // SkillInvocation 是加载领域 Skill 时产生的结构化元数据。
@@ -823,12 +827,17 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "media_recognize",
-		Description: "Analyze one or more user-uploaded images, videos, or audio files through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Uploads in one call must share the same media type. Use only upload_id values explicitly shown in this chat; never pass file paths.",
+		Description: "Analyze one or more conversation-owned images, videos, or audio assets through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Assets in one call must share the same media type. Prefer opaque input_ref values explicitly shown in this chat; never pass bytes, URLs, or file paths.",
 		Parameters: ObjectSchema(map[string]any{
-			"upload_id": StringProp("A single upload_id attached in this conversation"),
+			"input_ref": StringProp("One opaque upload or tool-asset id from this conversation (preferred)"),
+			"input_refs": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
+				"description": "Opaque ids of same-type media assets to analyze together (preferred)",
+			},
+			"upload_id": StringProp("Backward-compatible alias for one uploaded attachment id"),
 			"upload_ids": map[string]any{
 				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
-				"description": "Upload ids of same-type media attachments to analyze together",
+				"description": "Backward-compatible aliases for uploaded attachment ids",
 			},
 			"question": StringProp("Optional focused question for the configured recognition model"),
 		}, nil),

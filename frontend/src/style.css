@@ -331,6 +331,24 @@ html, body, #app {
  * via NDropdown menu-props. Items render `.app-action-item` (icon +
  * label on one row) and Naive's empty prefix/suffix columns are hidden.
  */
+.n-base-selection {
+  font-family: var(--font-mono);
+  transition: var(--transition-colors);
+}
+
+.n-base-selection .n-tag {
+  --n-color: var(--brand-50) !important;
+  --n-border: 1px solid var(--brand-100) !important;
+  --n-text-color: var(--brand-600) !important;
+  border-radius: var(--radius-sm) !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+}
+
+.n-base-selection .n-tag__close {
+  color: var(--brand-600) !important;
+}
+
 .n-dropdown-menu,
 .n-base-select-menu {
   padding: var(--space-1) !important;

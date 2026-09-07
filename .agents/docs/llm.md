@@ -90,11 +90,17 @@ type StreamChunk struct {
 ### 4. Client 与重试
 
 `Client` 封装：
-- 多 provider 端点（从 `config.Config` 读取）
+- 多 provider Base URL 与按模型解析的 `api_endpoint`（请求前统一拼接成完整地址）
 - HTTP 重试（指数退避，最大 3 次）
 - 自定义 HTTP 头（API key、organization 等）
 - 流式连接超时
 - `ChatCM()` 非流式调用也用于 provider/model 的无状态 `sayhi` 连接测试
+
+Provider 只选择 `openai` 或 `anthropic` 协议，不再选择厂商 preset。Provider 保存公共
+`base_url`，每个 LLM 模型保存可编辑 `api_endpoint`；OpenAI 新模型默认
+`/chat/completions`，Anthropic 新模型默认 `/messages`。`providerEntry` 根据本次请求的
+模型解析完整 URL，避免同一 Provider 下的模型互相覆盖端点。旧完整 `api_url` 仅由兼容
+读取与 V12 升级步骤拆分。
 
 ### 5. 错误分类
 

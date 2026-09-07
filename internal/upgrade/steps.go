@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,16 +27,18 @@ var builtinLabels = map[string]string{
 
 // steps maps each start version to its upgrade function.
 var steps = map[AppVersion]func(*sql.DB) error{
-	V0: stepV0toV1,
-	V1: stepV1toV2,
-	V2: stepV2toV3,
-	V3: stepV3toV4,
-	V4: stepV4toV5,
-	V5: stepV5toV6,
-	V6: stepV6toV7,
-	V7: stepV7toV8,
-	V8: stepV8toV9,
-	V9: stepV9toV10,
+	V0:  stepV0toV1,
+	V1:  stepV1toV2,
+	V2:  stepV2toV3,
+	V3:  stepV3toV4,
+	V4:  stepV4toV5,
+	V5:  stepV5toV6,
+	V6:  stepV6toV7,
+	V7:  stepV7toV8,
+	V8:  stepV8toV9,
+	V9:  stepV9toV10,
+	V10: stepV10toV11,
+	V11: stepV11toV12,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -255,6 +258,283 @@ func migrateMediaGenerationConfig() error {
 	}
 	out = append(out, '\n')
 	return writeUpgradeFileAtomic(configPath, out, 0o644)
+}
+
+// ---- V10 → V11 ----
+
+func stepV10toV11(_ *sql.DB) error {
+	log.Print("[upgrade] V10 → V11: consolidating media model API configuration")
+	return migrateSharedMediaGenerationAPIConfig()
+}
+
+func migrateSharedMediaGenerationAPIConfig() error {
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	changed := false
+	llmDoc, _ := root["llm"].(map[string]any)
+	providers, _ := llmDoc["providers"].([]any)
+	for _, providerValue := range providers {
+		provider, _ := providerValue.(map[string]any)
+		models, _ := provider["models"].([]any)
+		for _, modelValue := range models {
+			model, _ := modelValue.(map[string]any)
+			generation, _ := model["generation"].(map[string]any)
+			if generation == nil {
+				continue
+			}
+			if _, exists := generation["api"]; exists {
+				continue
+			}
+			operations, _ := generation["operations"].(map[string]any)
+			if len(operations) == 0 {
+				continue
+			}
+
+			// Only collapse legacy values when every capability used the same
+			// API settings. Heterogeneous configs remain readable through the
+			// compatibility path and are consolidated when the user edits them.
+			var shared map[string]any
+			compatible := true
+			for _, value := range operations {
+				operationConfig, _ := value.(map[string]any)
+				if operationConfig == nil {
+					operationConfig = map[string]any{}
+				}
+				if shared == nil {
+					shared = make(map[string]any, len(operationConfig)+1)
+					for key, item := range operationConfig {
+						shared[key] = item
+					}
+					continue
+				}
+				if !generationAPIDocumentsEqual(shared, operationConfig) {
+					compatible = false
+					break
+				}
+			}
+			if !compatible {
+				continue
+			}
+			if shared == nil {
+				shared = map[string]any{}
+			}
+			if _, exists := shared["timeout_seconds"]; !exists {
+				shared["timeout_seconds"] = float64(600)
+			}
+			generation["api"] = shared
+			for operation := range operations {
+				operations[operation] = map[string]any{}
+			}
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return writeUpgradeFileAtomic(configPath, out, 0o644)
+}
+
+func generationAPIDocumentsEqual(left, right map[string]any) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
+// ---- V11 → V12 ----
+
+func stepV11toV12(_ *sql.DB) error {
+	log.Print("[upgrade] V11 → V12: migrating providers to Base URL plus per-model endpoint suffixes")
+	return migrateModelAPIEndpoints()
+}
+
+func migrateModelAPIEndpoints() error {
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	changed := false
+	llmDoc, _ := root["llm"].(map[string]any)
+	providers, _ := llmDoc["providers"].([]any)
+	for _, providerValue := range providers {
+		provider, _ := providerValue.(map[string]any)
+		if provider == nil {
+			continue
+		}
+		baseURL, _ := provider["base_url"].(string)
+		baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+		protocol, _ := provider["protocol"].(string)
+		if protocol == "" {
+			protocol, _ = provider["type"].(string)
+		}
+		if strings.TrimSpace(protocol) == "" {
+			protocol = "openai"
+		}
+		if configuredProtocol, _ := provider["protocol"].(string); strings.TrimSpace(configuredProtocol) == "" {
+			provider["protocol"] = protocol
+			changed = true
+		}
+		apiURL, _ := provider["api_url"].(string)
+		modelEndpoint := legacyDefaultModelEndpoint(protocol, baseURL)
+		if strings.TrimSpace(apiURL) != "" {
+			migratedBaseURL, migratedEndpoint := splitLegacyProviderAPIURL(protocol, apiURL)
+			if baseURL == "" {
+				baseURL = migratedBaseURL
+			}
+			if strings.HasPrefix(strings.TrimSpace(apiURL), baseURL) {
+				migratedEndpoint = strings.TrimPrefix(strings.TrimSpace(apiURL), baseURL)
+			}
+			if migratedEndpoint != "" {
+				modelEndpoint = normalizeEndpointSuffix(migratedEndpoint)
+			}
+			delete(provider, "api_url")
+			changed = true
+		}
+		if baseURL != "" && provider["base_url"] != baseURL {
+			provider["base_url"] = baseURL
+			changed = true
+		}
+
+		models, _ := provider["models"].([]any)
+		for _, modelValue := range models {
+			model, _ := modelValue.(map[string]any)
+			modelType, _ := model["type"].(string)
+			if modelType == "" || modelType == "llm" {
+				if endpoint, _ := model["api_endpoint"].(string); strings.TrimSpace(endpoint) == "" {
+					model["api_endpoint"] = modelEndpoint
+					changed = true
+				} else if normalized := normalizeEndpointSuffix(endpoint); normalized != endpoint {
+					model["api_endpoint"] = normalized
+					changed = true
+				}
+			}
+			generation, _ := model["generation"].(map[string]any)
+			if generation == nil {
+				continue
+			}
+			if apiConfig, ok := generation["api"].(map[string]any); ok {
+				if makeGenerationEndpointsRelative(apiConfig, baseURL) {
+					changed = true
+				}
+			}
+			if operations, ok := generation["operations"].(map[string]any); ok {
+				for _, operationValue := range operations {
+					operationConfig, _ := operationValue.(map[string]any)
+					if makeGenerationEndpointsRelative(operationConfig, baseURL) {
+						changed = true
+					}
+				}
+			}
+		}
+		// Vendor presets, legacy protocol aliases, and provider-level exact API
+		// endpoints no longer participate in routing after V12.
+		for _, legacyField := range []string{"vendor", "type", "api_url"} {
+			if _, exists := provider[legacyField]; exists {
+				delete(provider, legacyField)
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return writeUpgradeFileAtomic(configPath, out, 0o644)
+}
+
+func legacyDefaultModelEndpoint(protocol, baseURL string) string {
+	if strings.EqualFold(strings.TrimSpace(protocol), "anthropic") {
+		if strings.HasSuffix(strings.ToLower(strings.TrimRight(baseURL, "/")), "/v1") {
+			return "/messages"
+		}
+		return "/v1/messages"
+	}
+	return "/chat/completions"
+}
+
+func splitLegacyProviderAPIURL(protocol, apiURL string) (string, string) {
+	raw := strings.TrimSpace(apiURL)
+	lower := strings.ToLower(strings.TrimRight(raw, "/"))
+	candidates := []string{"/chat/completions"}
+	if strings.EqualFold(strings.TrimSpace(protocol), "anthropic") {
+		candidates = []string{"/v1/messages", "/messages"}
+	}
+	for _, suffix := range candidates {
+		if strings.HasSuffix(lower, suffix) {
+			return strings.TrimRight(raw[:len(strings.TrimRight(raw, "/"))-len(suffix)], "/"), suffix
+		}
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return "", legacyDefaultModelEndpoint(protocol, "")
+	}
+	baseURL := parsed.Scheme + "://" + parsed.Host
+	endpoint := parsed.EscapedPath()
+	if parsed.RawQuery != "" {
+		endpoint += "?" + parsed.RawQuery
+	}
+	if endpoint == "" {
+		endpoint = legacyDefaultModelEndpoint(protocol, baseURL)
+	}
+	return baseURL, endpoint
+}
+
+func normalizeEndpointSuffix(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" || strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		return endpoint
+	}
+	return "/" + strings.TrimLeft(endpoint, "/")
+}
+
+func makeGenerationEndpointsRelative(configDoc map[string]any, baseURL string) bool {
+	if configDoc == nil {
+		return false
+	}
+	changed := false
+	for _, field := range []string{"endpoint", "query_endpoint"} {
+		raw, _ := configDoc[field].(string)
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		normalized := raw
+		if strings.TrimSpace(baseURL) != "" && strings.HasPrefix(raw, strings.TrimRight(baseURL, "/")) {
+			normalized = strings.TrimPrefix(raw, strings.TrimRight(baseURL, "/"))
+		}
+		normalized = normalizeEndpointSuffix(normalized)
+		if normalized != raw {
+			configDoc[field] = normalized
+			changed = true
+		}
+	}
+	return changed
 }
 
 func migrateMediaCapabilityConfig() error {

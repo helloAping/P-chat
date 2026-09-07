@@ -13,7 +13,21 @@
 // session switch keeps the user's preference.
 import { computed, ref, watch } from 'vue'
 import type { ToolPart } from '../api/client'
-import { Check, X, AlertTriangle, Loader2, ChevronRight, ChevronDown, Clipboard } from './icons'
+import {
+  Check,
+  X,
+  AlertTriangle,
+  Loader2,
+  ChevronRight,
+  ChevronDown,
+  Clipboard,
+  Download,
+  Maximize2,
+  ImageIcon,
+  Film,
+  Volume2,
+} from './icons'
+import { downloadFromUrl, extensionForMime } from '../utils/clipboard'
 
 const props = defineProps<{ part: ToolPart }>()
 
@@ -23,11 +37,17 @@ const props = defineProps<{ part: ToolPart }>()
 // fits in a tooltip (~150 chars) is fine open.
 const FOLD_RESULT_MIN_CHARS = 200
 const FOLD_RESULT_MIN_LINES = 4
+const isGenerationTool = computed(() => props.part.name.startsWith('generate_'))
+const isBrowserScreenshot = computed(() => props.part.name === 'browser_screenshot')
+const isMediaResultTool = computed(() => isGenerationTool.value || isBrowserScreenshot.value)
 
 // Whether the result is "long enough" to warrant a
 // default-collapsed state. The args block is not folded —
 // it's typically 1-3 lines and not the noise.
 const shouldFoldResult = computed(() => {
+  // Generated media is the primary result, so keep it visible without making
+  // the user expand a JSON-shaped tool response first.
+  if (isMediaResultTool.value) return false
   const r = props.part.result || ''
   if (r.length >= FOLD_RESULT_MIN_CHARS) return true
   let lines = 0
@@ -153,47 +173,98 @@ const isDryRun = computed(() => {
   }
 })
 
-// Detect browser screenshot data in the result. The
-// extension returns images either as a raw data: URL
-// (legacy pre-blob conversion) or as
-// `{image: "data:image/jpeg;base64,..."}` JSON.
-// After the store's convertAndStripScreenshots runs,
-// these become `blob:` URLs which the browser <img>
-// handles natively with the same `:src` binding.
-const screenshotURL = computed(() => {
-  const r = props.part.result
-  if (!r) return ''
-  if (r.startsWith('data:image/') || r.startsWith('blob:')) return r
-  try {
-    const obj = JSON.parse(r)
-    if (typeof obj.image === 'string') {
-      const img = obj.image as string
-      if (img.startsWith('data:image/') || img.startsWith('blob:')) return img
-    }
-  } catch { /* not JSON */ }
-  return ''
-})
-
-type GeneratedAsset = {
+type ToolMediaAsset = {
   id?: string
   kind: 'image' | 'video' | 'audio'
   mime_type?: string
   name?: string
   url: string
+  source: 'generation' | 'browser_screenshot'
 }
 
-const generatedAssets = computed<GeneratedAsset[]>(() => {
-  if (!props.part.name.startsWith('generate_') || !props.part.result) return []
+function isRenderableMediaURL(url: string): boolean {
+  return url.startsWith('/api/v1/generated/') || url.startsWith('/api/v1/uploads/') ||
+    url.startsWith('data:image/') || url.startsWith('blob:')
+}
+
+// Tool media has one presentation contract. New browser screenshots are
+// materialized by the agent and arrive in the same {assets:[...]} envelope as
+// generated media. The data:/blob: branches keep old conversation history
+// readable without reintroducing inline bytes for new calls.
+const toolMediaAssets = computed<ToolMediaAsset[]>(() => {
+  const result = props.part.result
+  if (!result || !isMediaResultTool.value) return []
   try {
-    const parsed = JSON.parse(props.part.result)
-    if (!Array.isArray(parsed?.assets)) return []
-    return parsed.assets.filter((asset: any) =>
-      asset && ['image', 'video', 'audio'].includes(asset.kind) && typeof asset.url === 'string' && asset.url.startsWith('/api/v1/generated/'),
-    )
-  } catch {
-    return []
+    const parsed = JSON.parse(result)
+    if (Array.isArray(parsed?.assets)) {
+      return parsed.assets
+        .filter((asset: any) => asset && ['image', 'video', 'audio'].includes(asset.kind) && typeof asset.url === 'string' && isRenderableMediaURL(asset.url))
+        .map((asset: any) => ({
+          ...asset,
+          source: isBrowserScreenshot.value ? 'browser_screenshot' : 'generation',
+        }))
+    }
+    if (isBrowserScreenshot.value && typeof parsed?.image === 'string' && isRenderableMediaURL(parsed.image)) {
+      return [{ kind: 'image', mime_type: 'image/jpeg', name: 'browser-screenshot.jpg', url: parsed.image, source: 'browser_screenshot' }]
+    }
+  } catch { /* legacy raw screenshot result */ }
+  if (isBrowserScreenshot.value && isRenderableMediaURL(result)) {
+    const mime = result.startsWith('data:') ? result.slice(5, result.indexOf(';')) : 'image/jpeg'
+    return [{ kind: 'image', mime_type: mime || 'image/jpeg', name: 'browser-screenshot.jpg', url: result, source: 'browser_screenshot' }]
   }
+  return []
 })
+
+const generatedKindLabels: Record<ToolMediaAsset['kind'], string> = {
+  image: '生成图片',
+  video: '生成视频',
+  audio: '生成音频',
+}
+
+function toolMediaAssetLabel(asset: ToolMediaAsset): string {
+  return asset.source === 'browser_screenshot' ? '浏览器截图' : generatedKindLabels[asset.kind]
+}
+
+function toolMediaAssetIcon(asset: ToolMediaAsset) {
+  if (asset.kind === 'video') return Film
+  if (asset.kind === 'audio') return Volume2
+  return ImageIcon
+}
+
+function toolMediaAssetExtension(asset: ToolMediaAsset): string {
+  const mimeExtension = extensionForMime(asset.mime_type || '')
+  if (mimeExtension !== '.bin') return mimeExtension
+  const originalExtension = asset.name?.match(/\.[a-z0-9]{1,8}$/i)?.[0]
+  if (originalExtension) return originalExtension.toLowerCase()
+  if (asset.kind === 'video') return '.mp4'
+  if (asset.kind === 'audio') return '.mp3'
+  return '.png'
+}
+
+function toolMediaAssetFileName(asset: ToolMediaAsset): string {
+  const identity = (asset.id || 'result').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'result'
+  const type = asset.source === 'browser_screenshot' ? 'screenshot' : asset.kind
+  return `pchat-${type}-${identity}${toolMediaAssetExtension(asset)}`
+}
+
+function toolMediaAssetMeta(asset: ToolMediaAsset): string {
+  const format = (asset.mime_type?.split('/')[1] || toolMediaAssetExtension(asset).slice(1)).toUpperCase()
+  return `${toolMediaAssetLabel(asset)} · ${format}`
+}
+
+function openToolMediaAsset(asset: ToolMediaAsset) {
+  if (asset.kind === 'audio') return
+  state.lightbox = {
+    show: true,
+    src: asset.url,
+    alt: toolMediaAssetFileName(asset),
+    kind: asset.kind,
+  }
+}
+
+function downloadToolMediaAsset(asset: ToolMediaAsset) {
+  downloadFromUrl(asset.url, toolMediaAssetFileName(asset))
+}
 
 // Copy result to clipboard. Used both as a header
 // affordance (so the user can grab a long result without
@@ -286,24 +357,67 @@ async function fetchFullResult() {
       <component :is="open ? ChevronDown : ChevronRight" :size="12" class="tool-caret" />
     </button>
     <div v-if="open" class="tool-body">
-      <div v-if="part.args" class="tool-args">
+      <details v-if="part.args && isGenerationTool && toolMediaAssets.length" class="generation-request-details">
+        <summary>查看生成参数</summary>
+        <pre>{{ argsPretty }}</pre>
+      </details>
+      <div v-else-if="part.args" class="tool-args">
         <div class="tool-section-label">参数</div>
         <pre>{{ argsPretty }}</pre>
       </div>
       <div v-if="part.result" class="tool-result">
         <div class="tool-section-label">结果</div>
-        <div v-if="generatedAssets.length" class="generated-assets">
-          <figure v-for="asset in generatedAssets" :key="asset.id || asset.url" class="generated-asset">
-            <img v-if="asset.kind === 'image'" :src="asset.url" :alt="asset.name || '生成图片'" loading="lazy" />
-            <video v-else-if="asset.kind === 'video'" :src="asset.url" controls preload="metadata" />
-            <audio v-else :src="asset.url" controls preload="metadata" />
-            <figcaption>
-              <span>{{ asset.name || `生成${asset.kind === 'image' ? '图片' : asset.kind === 'video' ? '视频' : '音频'}` }}</span>
-              <a :href="asset.url" :download="asset.name || undefined">下载</a>
+        <div v-if="toolMediaAssets.length" class="generated-assets">
+          <figure v-for="asset in toolMediaAssets" :key="asset.id || asset.url" class="generated-asset">
+            <button
+              v-if="asset.kind === 'image'"
+              class="generated-asset-preview"
+              type="button"
+              :aria-label="`预览 ${toolMediaAssetFileName(asset)}`"
+              @click="openToolMediaAsset(asset)"
+            >
+              <img :src="asset.url" :alt="toolMediaAssetFileName(asset)" loading="lazy" />
+            </button>
+            <div v-else-if="asset.kind === 'video'" class="generated-asset-preview generated-asset-preview--video">
+              <video :src="asset.url" controls preload="metadata" />
+            </div>
+            <div v-else class="generated-asset-preview generated-asset-preview--audio">
+              <audio :src="asset.url" controls preload="metadata" />
+            </div>
+            <figcaption class="generated-asset-footer">
+              <span class="generated-asset-identity">
+                <span class="generated-asset-icon" aria-hidden="true">
+                  <component :is="toolMediaAssetIcon(asset)" :size="14" />
+                </span>
+                <span class="generated-asset-copy">
+                  <span class="generated-asset-name" :title="toolMediaAssetFileName(asset)">
+                    {{ toolMediaAssetFileName(asset) }}
+                  </span>
+                  <span class="generated-asset-meta">{{ toolMediaAssetMeta(asset) }}</span>
+                </span>
+              </span>
+              <span class="generated-asset-actions">
+                <button
+                  v-if="asset.kind !== 'audio'"
+                  class="generated-asset-action"
+                  type="button"
+                  @click="openToolMediaAsset(asset)"
+                >
+                  <Maximize2 :size="13" />
+                  <span>查看</span>
+                </button>
+                <button
+                  class="generated-asset-action generated-asset-action--download"
+                  type="button"
+                  @click="downloadToolMediaAsset(asset)"
+                >
+                  <Download :size="13" />
+                  <span>下载</span>
+                </button>
+              </span>
             </figcaption>
           </figure>
         </div>
-        <img v-else-if="screenshotURL" :src="screenshotURL" class="tool-screenshot" loading="lazy" />
         <pre v-else-if="fetchState === 'ok'">{{ fullResult }}</pre>
         <pre v-else>{{ part.result }}</pre>
         <button
@@ -451,7 +565,7 @@ async function fetchFullResult() {
   margin: 4px 0 2px;
   font-weight: 500;
 }
-.tool-args pre, .tool-result pre, .tool-error pre {
+.tool-args pre, .tool-result pre, .tool-error pre, .generation-request-details pre {
   margin: 0;
   padding: 6px 8px;
   background: var(--surface-0);
@@ -471,18 +585,20 @@ async function fetchFullResult() {
   border-color: var(--error-500);
   background: var(--error-50);
 }
-.tool-screenshot {
-  display: block;
-  max-width: 100%;
-  max-height: 400px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  margin-top: 4px;
-  cursor: pointer;
-  transition: transform var(--dur-fast) var(--ease-out);
+.generation-request-details {
+  margin-bottom: var(--space-2);
+  color: var(--text-tertiary);
+  font-size: 11.5px;
 }
-.tool-screenshot:hover {
-  transform: scale(1.02);
+.generation-request-details summary {
+  width: fit-content;
+  margin-bottom: var(--space-1);
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: var(--transition-colors);
+}
+.generation-request-details summary:hover {
+  color: var(--text-primary);
 }
 .generated-assets {
   display: grid;
@@ -490,39 +606,134 @@ async function fetchFullResult() {
 }
 .generated-asset {
   display: grid;
-  gap: var(--space-1);
   margin: 0;
-  padding: var(--space-2);
+  overflow: hidden;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+.generated-asset-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  appearance: none;
   background: var(--surface-0);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
+  border: 0;
+  color: inherit;
+  cursor: zoom-in;
 }
-.generated-asset img,
-.generated-asset video {
+.generated-asset-preview--video,
+.generated-asset-preview--audio {
+  cursor: default;
+}
+.generated-asset-preview img,
+.generated-asset-preview video {
   display: block;
-  width: min(100%, 640px);
-  max-height: 440px;
+  width: 100%;
+  max-height: calc(var(--space-8) * 11);
   object-fit: contain;
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
+  background: var(--surface-0);
 }
-.generated-asset audio {
-  width: min(100%, 520px);
+.generated-asset-preview img {
+  transition: transform var(--dur-base) var(--ease-out);
 }
-.generated-asset figcaption {
+.generated-asset-preview:hover img {
+  transform: scale(1.01);
+}
+.generated-asset-preview--audio {
+  padding: var(--space-4);
+}
+.generated-asset-preview audio {
+  width: 100%;
+}
+.generated-asset-footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: var(--space-2);
-  color: var(--text-tertiary);
-  font-size: 11.5px;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-1);
+  border-top: 1px solid var(--border-subtle);
 }
-.generated-asset figcaption a {
+.generated-asset-identity {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: var(--space-2);
+}
+.generated-asset-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(var(--space-7) - var(--space-1));
+  height: calc(var(--space-7) - var(--space-1));
+  flex: 0 0 auto;
+  border-radius: var(--radius-sm);
+  background: var(--brand-50);
   color: var(--brand-600);
-  text-decoration: none;
 }
-.generated-asset figcaption a:hover {
-  text-decoration: underline;
+.generated-asset-copy {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+.generated-asset-name {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.generated-asset-meta {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.generated-asset-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: var(--space-1);
+  margin-left: auto;
+}
+.generated-asset-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(var(--space-7) - var(--space-1));
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+.generated-asset-action:hover {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.generated-asset-action--download {
+  border-color: var(--brand-100);
+  background: var(--brand-50);
+  color: var(--brand-600);
+}
+.generated-asset-action--download:hover {
+  background: var(--brand-100);
+  color: var(--brand-600);
 }
 
 /* P1-1 fold affordances. The foldable class is set when

@@ -105,7 +105,7 @@ func init() {
 			Name: "/provider", Aliases: []string{"/p"}, Description: "查看当前提供商详情",
 			Usage: "/provider",
 			Args: "无参。显示:\n" +
-				"  - 名称 / 协议 / base_url / APIKey (前 4+ 后 4)\n" +
+				"  - 名称 / 协议 / Base URL / APIKey (前 4+ 后 4)\n" +
 				"  - 当前 model + 显示名\n" +
 				"  - 已配置模型数 (多模型时)",
 			Examples: []string{
@@ -117,8 +117,8 @@ func init() {
 			Name: "/setup", Description: "交互式配置提供商 (添加 / 删除 / 设置 Key / 测试)",
 			Usage: "/setup",
 			Args: "无参。命令菜单驱动, 步骤:\n" +
-				"  1. 选动作 (7 个): 添加预设 / 添加自定义 / 设置 Key / 删除 / 测试 / 设默认 / 返回\n" +
-				"  2. 按提示输入 name / base_url / model / key 等\n" +
+				"  1. 选动作: 添加 / 设置 Key / 删除 / 测试 / 设默认 / 返回\n" +
+				"  2. 按提示输入 name / protocol / base_url / model / key 等\n" +
 				"  3. 自动写 ~/.p-chat/config.yaml\n" +
 				"  4. 提示是否切换为新 provider",
 			Examples: []string{
@@ -130,8 +130,7 @@ func init() {
 			Name: "/config", Description: "快速配置 (命令行版本, 不进 REPL 也能用)",
 			Usage: "/config <子命令> [参数]",
 			Args: "provider 管理:\n" +
-				"  add    <name> <base_url> <protocol>   添加 provider (单模型)\n" +
-				"  add    <预设名>                       用预设 (openai/claude/deepseek/...)\n" +
+				"  add    <name> <protocol> <base_url> <model> [api_key] 添加 provider\n" +
 				"  remove <name>                          删除 provider (别名: rm)\n" +
 				"  key    <name> <key>                   设置 API key\n" +
 				"  test   [name]                          测试连接 (默认所有)\n" +
@@ -715,7 +714,7 @@ func cmdProvider(ctx cliContext, args string) error {
 	if err == nil {
 		fmt.Printf("    名称:     %s\n", view.Name)
 		fmt.Printf("    协议:     %s\n", view.Protocol)
-		fmt.Printf("    BaseURL:  %s\n", view.BaseURL)
+		fmt.Printf("    Base URL: %s\n", view.BaseURL)
 		fmt.Printf("    Model:    %s\n", view.Model)
 		keyDisplay := "(已设置)"
 		if view.APIKey == "" {
@@ -730,7 +729,7 @@ func cmdProvider(ctx cliContext, args string) error {
 		fmt.Printf("    名称:     %s\n", prov)
 		fmt.Printf("    协议:     %s\n", protocol)
 		fmt.Printf("    模型:     %s\n", model)
-		fmt.Printf("    BaseURL:  %s\n", color.HiBlackString("(无详细信息 - HTTP 模式)"))
+		fmt.Printf("    Base URL: %s\n", color.HiBlackString("(无详细信息 - HTTP 模式)"))
 		fmt.Printf("    APIKey:   %s\n", color.HiBlackString("(无详细信息 - HTTP 模式)"))
 	}
 
@@ -917,13 +916,12 @@ func cmdSetup(ctx cliContext, args string) error {
 
 		fmt.Println()
 		actionOptions := []SelectOption{
-			{Label: "添加预设提供商", Value: "1"},
-			{Label: "添加自定义提供商", Value: "2"},
-			{Label: "设置 API Key", Value: "3"},
-			{Label: "删除提供商", Value: "4"},
-			{Label: "测试连接", Value: "5"},
-			{Label: "设置默认提供商", Value: "6"},
-			{Label: "返回", Value: "7"},
+			{Label: "添加提供商", Value: "1"},
+			{Label: "设置 API Key", Value: "2"},
+			{Label: "删除提供商", Value: "3"},
+			{Label: "测试连接", Value: "4"},
+			{Label: "设置默认提供商", Value: "5"},
+			{Label: "返回", Value: "6"},
 		}
 
 		idx, err := Select("  选择操作:", actionOptions)
@@ -935,93 +933,29 @@ func cmdSetup(ctx cliContext, args string) error {
 
 		switch choice {
 		case "1":
-			if err := setupAddPreset(ctx, scanner); err != nil {
-				color.Red("  错误: %v", err)
-			}
-		case "2":
 			if err := setupAddCustom(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "3":
+		case "2":
 			if err := setupSetAPIKey(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "4":
+		case "3":
 			if err := setupRemove(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "5":
+		case "4":
 			if err := setupTest(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "6":
+		case "5":
 			if err := setupSetDefault(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "7":
+		case "6":
 			return nil
 		}
 	}
-}
-
-func setupAddPreset(ctx cliContext, scanner *bufio.Scanner) error {
-	fmt.Println()
-	color.Cyan("  可用预设:")
-	for i, t := range ProviderTemplates {
-		apiKeyMark := ""
-		if t.HasAPIKey {
-			apiKeyMark = " (需要 API Key)"
-		}
-		fmt.Printf("    %d. %-14s %s%s\n", i+1, t.Name, t.Desc, apiKeyMark)
-	}
-	fmt.Println()
-	fmt.Print("  选择预设序号: ")
-
-	if !scanner.Scan() {
-		return nil
-	}
-	idxStr := strings.TrimSpace(scanner.Text())
-	idx, err := strconv.Atoi(idxStr)
-	if err != nil || idx < 1 || idx > len(ProviderTemplates) {
-		color.HiBlack("  无效选择")
-		return nil
-	}
-
-	tmpl := ProviderTemplates[idx-1]
-
-	// Ask for API key if needed
-	apiKey := ""
-	if tmpl.HasAPIKey {
-		fmt.Printf("  输入 %s 的 API Key (留空跳过): ", tmpl.Name)
-		if !scanner.Scan() {
-			return nil
-		}
-		apiKey = strings.TrimSpace(scanner.Text())
-	}
-
-	// Ask for model selection
-	fmt.Printf("  选择模型 (默认 %s): ", tmpl.Models[0])
-	if !scanner.Scan() {
-		return nil
-	}
-	modelInput := strings.TrimSpace(scanner.Text())
-	model := tmpl.Models[0]
-	if modelInput != "" {
-		model = modelInput
-	}
-
-	if err := ctx.AddProvider(ProviderConfigInput{
-		Name:     tmpl.Name,
-		Protocol: tmpl.Protocol,
-		BaseURL:  tmpl.BaseURL,
-		APIKey:   apiKey,
-		Model:    model,
-	}); err != nil {
-		return err
-	}
-
-	color.Green("  ✓ 已添加: %s / %s [%s]", tmpl.Name, model, tmpl.Protocol)
-	return nil
 }
 
 func setupAddCustom(ctx cliContext, scanner *bufio.Scanner) error {
@@ -1280,7 +1214,7 @@ func cmdConfig(ctx cliContext, args string) error {
 		fmt.Println()
 		fmt.Println("  LLM 提供商:")
 		for _, p := range cfg.LLM.Providers {
-			fmt.Printf("    • %-14s %-28s [%s] %s\n", p.Name, p.Model, p.GetProtocol(), p.BaseURL)
+			fmt.Printf("    • %-14s %-28s [%s] %s\n", p.Name, p.Model, p.GetProtocol(), p.EffectiveBaseURL())
 		}
 		fmt.Println()
 		color.HiBlack("  用法: /config add|remove|key|test|list <args>")
@@ -1595,46 +1529,14 @@ func cmdConfigModelDefault(ctx cliContext, providerName, modelName string) error
 }
 
 func configAddQuick(ctx cliContext, args string) error {
-	// /config add <template> or /config add <name> <protocol> <base_url> <model> [api_key]
+	// /config add <name> <protocol> <base_url> <model> [api_key]
 	if args == "" {
 		color.Cyan("  用法:")
-		fmt.Println("    /config add <预设名>              使用预设添加")
 		fmt.Println("    /config add <name> <protocol> <base_url> <model> [api_key]")
-		fmt.Println()
-		fmt.Print("  可用预设: ")
-		for i, t := range ProviderTemplates {
-			if i > 0 {
-				fmt.Print(", ")
-			}
-			fmt.Print(t.Name)
-		}
-		fmt.Println()
 		return nil
 	}
 
 	parts := strings.Fields(args)
-	if len(parts) == 1 {
-		// Preset mode
-		tmpl := FindTemplate(parts[0])
-		if tmpl == nil {
-			color.Red("  未找到预设: %s", parts[0])
-			return nil
-		}
-		if err := ctx.AddProvider(ProviderConfigInput{
-			Name:     tmpl.Name,
-			Protocol: tmpl.Protocol,
-			BaseURL:  tmpl.BaseURL,
-			Model:    tmpl.Models[0],
-		}); err != nil {
-			return err
-		}
-		color.Green("  ✓ 已添加: %s / %s [%s]", tmpl.Name, tmpl.Models[0], tmpl.Protocol)
-		if tmpl.HasAPIKey {
-			color.Yellow("  提示: 使用 /config key %s <api_key> 设置 API Key", tmpl.Name)
-		}
-		return nil
-	}
-
 	if len(parts) < 4 {
 		color.Red("  参数不足: /config add <name> <protocol> <base_url> <model> [api_key]")
 		return nil

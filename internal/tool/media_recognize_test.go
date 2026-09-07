@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -27,5 +28,22 @@ func TestMediaRecognizeRoutesResolvedAttachment(t *testing.T) {
 	}
 	if result.IsError || result.Content == "" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestMediaRecognizeAcceptsStorageNeutralInputRef(t *testing.T) {
+	ctx := WithSessionID(context.Background(), "session-1")
+	ctx = WithMediaResolver(ctx, func(_ context.Context, sessionID, inputRef string) (MediaRecognitionAsset, error) {
+		if sessionID != "session-1" || inputRef != "asset-1" {
+			t.Fatalf("resolve %q/%q", sessionID, inputRef)
+		}
+		return MediaRecognitionAsset{UploadID: inputRef, Name: "browser-screenshot.jpg", Kind: "image", MIME: "image/jpeg", Data: []byte("image")}, nil
+	})
+	ctx = WithMediaRecognizer(ctx, func(_ context.Context, req MediaRecognitionRequest) (string, error) {
+		return "visible page", nil
+	})
+	result, err := handleMediaRecognize(ctx, json.RawMessage(`{"input_ref":"asset-1"}`))
+	if err != nil || result.IsError || !strings.Contains(result.Content, "asset-1") {
+		t.Fatalf("result=%#v err=%v", result, err)
 	}
 }

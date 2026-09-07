@@ -8,7 +8,7 @@
 - **Current**：二进制内嵌的最新版本号，定义在 `internal/upgrade/version.go`。
 - **升级步骤**：一个 `func(*sql.DB) error` 函数，将数据从 `V(N)` 升级到 `V(N+1)`。
 
-当前版本为 V10：V8→V9 把旧版 `vision_recognition` 和模型 `supports_vision` / `supports_audio` 映射到媒体识别能力；V9→V10 为旧模型补 `type=llm`、初始化顶层 `generation.defaults`，并创建 `~/.p-chat/generated/`。迁移保持旧字段以兼容旧二进制。
+当前版本为 V12：V8→V9 迁移媒体识别能力；V9→V10 为模型补类型并初始化媒体生成配置；V10→V11 把重复的 per-operation API 合并为模型级 API；V11→V12 将旧 Provider 完整 `api_url` 拆为公共 `base_url` 与 LLM `api_endpoint`，媒体端点统一为相对后缀，并移除 `vendor` 与 Provider 级旧 `type` 字段。加载器仍可兼容读取尚未升级的项目覆盖配置。
 
 ## 启动流程
 

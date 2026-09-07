@@ -77,6 +77,42 @@ func TestModelMaxTokensOutput_PerModelOverride(t *testing.T) {
 	}
 }
 
+func TestModelAPIEndpointIsResolvedPerRequest(t *testing.T) {
+	paths := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(&config.LLMConfig{
+		Default: "p",
+		Providers: []config.ProviderConfig{{
+			Name: "p", Protocol: "openai", BaseURL: srv.URL,
+			Models: []config.ModelConfig{
+				{Name: "chat", APIEndpoint: "/chat/completions", Default: true},
+				{Name: "responses", APIEndpoint: "/api/v3/responses"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range []string{"chat", "responses"} {
+		if _, err := client.ChatCM(context.Background(), "p", model, []ChatMessage{{Role: RoleUser, Content: "hi"}}, ChatOptions{}); err != nil {
+			t.Fatalf("ChatCM(%s): %v", model, err)
+		}
+	}
+
+	if got := <-paths; got != "/chat/completions" {
+		t.Fatalf("first request path = %q", got)
+	}
+	if got := <-paths; got != "/api/v3/responses" {
+		t.Fatalf("second request path = %q", got)
+	}
+}
+
 // TestContextWindow returns the configured context window for
 // each model under a provider.
 func TestContextWindow(t *testing.T) {

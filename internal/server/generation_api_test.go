@@ -17,14 +17,13 @@ const generationTestConfigJSON = `{
     "default": "shared",
     "providers": [{
       "name": "shared",
-      "vendor": "minimax",
       "protocol": "openai",
-      "base_url": "https://api.minimax.io",
+      "base_url": "https://api.minimax.io/v1",
       "api_key": "test",
       "models": [
-        {"name":"chat","type":"llm","default":true},
-        {"name":"MiniMax-H3","type":"media_generation","generation":{"operations":{"text_to_video":{},"image_to_video":{}}}},
-        {"name":"image-01","type":"media_generation","generation":{"operations":{"text_to_image":{},"image_to_image":{}}}}
+        {"name":"chat","type":"llm","api_endpoint":"/chat/completions","default":true},
+        {"name":"MiniMax-H3","type":"media_generation","generation":{"api":{"endpoint":"/video_generation"},"operations":{"text_to_video":{},"image_to_video":{}}}},
+        {"name":"image-01","type":"media_generation","generation":{"api":{"endpoint":"/image_generation"},"operations":{"text_to_image":{},"image_to_image":{}}}}
       ]
     }]
   },

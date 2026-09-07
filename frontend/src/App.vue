@@ -13,7 +13,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
   darkTheme, lightTheme, useOsTheme,
-  type GlobalTheme,
+  type GlobalTheme, type GlobalThemeOverrides,
 } from 'naive-ui'
 import SessionSidebar from './components/SessionSidebar.vue'
 import ChatWindow from './components/ChatWindow.vue'
@@ -93,7 +93,7 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 // Vue recompute after a toggle — readBrand() reads the
 // live CSS var, so it doesn't register as a reactive
 // dep on its own.
-const themeOverrides = computed(() => {
+const themeOverrides = computed<GlobalThemeOverrides>(() => {
   // Touch themeName so this computed re-runs on toggle.
   const _t = themeName.value
   void _t
@@ -109,6 +109,57 @@ const themeOverrides = computed(() => {
       cubicBezierEaseOut: motion.easeOut,
       cubicBezierEaseIn: motion.easeIn,
       cubicBezierEaseInOut: motion.easeInOut,
+    },
+    Select: {
+      menuBoxShadow: 'var(--shadow-lg)',
+      peers: {
+        InternalSelection: {
+          fontSizeTiny: '12px',
+          fontSizeSmall: '12px',
+          fontSizeMedium: '12.5px',
+          heightTiny: '26px',
+          heightSmall: '28px',
+          heightMedium: '32px',
+          borderRadius: 'var(--radius-sm)',
+          fontWeight: '500',
+          textColor: 'var(--text-secondary)',
+          textColorDisabled: 'var(--text-quaternary)',
+          placeholderColor: 'var(--text-tertiary)',
+          placeholderColorDisabled: 'var(--text-quaternary)',
+          color: 'var(--surface-2)',
+          colorActive: 'var(--surface-3)',
+          colorDisabled: 'var(--surface-2)',
+          border: '1px solid var(--border-subtle)',
+          borderHover: '1px solid var(--border-default)',
+          borderActive: '1px solid var(--border-default)',
+          borderFocus: '1px solid var(--brand-500)',
+          boxShadowHover: 'none',
+          boxShadowActive: '0 0 0 2px var(--brand-100)',
+          boxShadowFocus: '0 0 0 2px var(--brand-100)',
+          caretColor: 'var(--brand-500)',
+          arrowColor: 'var(--text-tertiary)',
+          arrowColorDisabled: 'var(--text-quaternary)',
+          loadingColor: 'var(--brand-500)',
+        },
+        InternalSelectMenu: {
+          borderRadius: 'var(--radius-md)',
+          color: 'var(--surface-1)',
+          optionFontSizeTiny: '12px',
+          optionFontSizeSmall: '12.5px',
+          optionFontSizeMedium: '12.5px',
+          optionHeightTiny: '28px',
+          optionHeightSmall: '32px',
+          optionHeightMedium: '32px',
+          optionTextColor: 'var(--text-secondary)',
+          optionTextColorPressed: 'var(--brand-600)',
+          optionTextColorDisabled: 'var(--text-quaternary)',
+          optionTextColorActive: 'var(--brand-600)',
+          optionCheckColor: 'var(--brand-500)',
+          optionColorPending: 'var(--surface-3)',
+          optionColorActive: 'var(--brand-50)',
+          optionColorActivePending: 'var(--brand-100)',
+        },
+      },
     },
   }
 })

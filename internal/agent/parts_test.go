@@ -161,6 +161,20 @@ func TestPartsAccumulator_PersistsCompleteMediaGenerationResult(t *testing.T) {
 	}
 }
 
+func TestPartsAccumulator_PersistsBrowserScreenshotAssetReference(t *testing.T) {
+	acc := newPartsAccumulator()
+	acc.update(ChatStreamChunk{ToolID: "call-shot", ToolName: "browser_screenshot"})
+	full := `{"status":"succeeded","assets":[{"id":"asset-1","kind":"image","url":"/api/v1/generated/asset-1"}]}`
+	acc.update(ChatStreamChunk{
+		Phase: "tool", Step: "call-1-ok", ToolID: "call-shot", ToolName: "browser_screenshot",
+		ToolResult: "Tool browser_screenshot produced an image", ToolResultFull: full,
+	})
+	parts := acc.snapshot()
+	if len(parts) != 1 || parts[0].Result != full {
+		t.Fatalf("browser screenshot asset reference was not persisted: %+v", parts)
+	}
+}
+
 func TestPartsAccumulator_ToolError(t *testing.T) {
 	acc := newPartsAccumulator()
 	acc.update(ChatStreamChunk{ToolName: "exec_command"})

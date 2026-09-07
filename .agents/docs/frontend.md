@@ -354,8 +354,17 @@ compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
 
 ### 13. 媒体生成配置与结果展示
 
-`AppSettingsModal.vue` 在 Provider 下支持厂商 preset 和 `llm/media_generation` 模型类型；
-媒体模型编辑器按 operation 保存独立端点。系统页“媒体生成”按能力选择应用默认模型。
+`AppSettingsModal.vue` 在 Provider 下只选择 OpenAI/Anthropic 协议并填写公共
+`base_url`，不再展示厂商 preset。模型可手工添加，也可通过“获取模型”请求
+`base_url + /models`；选择上游模型只会预填普通模型编辑弹窗，用户确认能力、上下文与端点
+后才持久化。它同时支持 `llm/media_generation` 模型类型；LLM 保存可编辑
+`api_endpoint`，媒体模型勾选 operation 能力并保存一份共享端点后缀配置；运行时再与
+Provider Base URL 拼接。系统页“媒体生成”按能力选择应用默认模型。
+
+媒体模型的异步查询后缀支持 `{task_id}` 和供应商文档常用的 `{id}`；界面明确说明该值
+来自创建响应、运行时自动替换，无需手填。创建端点若是查询任务集合的父路径，编辑器会以
+非阻断警告显示推导出的任务集合后缀，帮助发现漏写 `/tasks` 一类配置错误。
+
 `ModelPicker.vue` 和 store 的聊天默认回退只显示 `llm` 模型。
 
 `InputArea.vue` 的会话设置按文生图、图生图、文生视频等 operation 独立开关，选中后直接
@@ -363,9 +372,14 @@ compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
 工具入口也返回 `blocked`；前端工具卡显示“已关闭”。提示词由当前对话 LLM 根据用户要求
 和上下文一次性整理完成，不提供额外增强开关。
 
-`ToolCallCard.vue` 解析 `generate_*` 的结构化结果，并用 `<img>`、`<video controls>`、
-`<audio controls>` 展示同源 `/api/v1/generated/:id`，同时提供下载链接。工具结果仍作为
-普通 part 持久化，因此重载无需新的消息类型。
+应用设置保存生成默认项，或增删改 Provider / 媒体生成模型后，会递增共享状态中的
+`generationConfigVersion`。`InputArea.vue` 监听该版本并重新请求
+`GET /api/v1/generation/options`，因此当前会话的能力下拉无需切换会话即可同步最新能力矩阵。
+
+`ToolCallCard.vue` 把 `generate_*` 与 `browser_screenshot` 统一归一化为工具媒体资产，并用
+`<img>`、`<video controls>`、`<audio controls>` 展示同源 `/api/v1/generated/:id`。媒体结果
+始终展开为主结果卡；生成参数收进可选详情，底栏统一显示稳定的友好文件名、媒体格式、
+全屏查看和下载按钮。新截图只保存资产引用；data/blob 分支仅用于兼容旧会话。
 
 ## 修改指南
 

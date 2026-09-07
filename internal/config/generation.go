@@ -34,6 +34,11 @@ const (
 	GenerationTextToMusic  GenerationOperation = "text_to_music"
 	GenerationTextToSound  GenerationOperation = "text_to_sound"
 	GenerationAudioToAudio GenerationOperation = "audio_to_audio"
+
+	// DefaultMediaGenerationAPIEndpoint is the editable OpenAI-compatible
+	// endpoint suffix offered for a newly-created media generation model.
+	// Providers with a different route can override it per model.
+	DefaultMediaGenerationAPIEndpoint = "/images/generations"
 )
 
 var generationOperations = []GenerationOperation{
@@ -92,9 +97,9 @@ func (o GenerationOperation) RequiredInputKind() MediaKind {
 	}
 }
 
-// GenerationOperationConfig contains the vendor endpoint override and bounded
-// execution settings for one model capability. Endpoint may be absolute or
-// relative to the provider BaseURL.
+// GenerationOperationConfig contains model endpoint suffixes and bounded
+// execution settings for a media model. Endpoints are joined to the provider
+// BaseURL at dispatch time.
 type GenerationOperationConfig struct {
 	Endpoint       string         `json:"endpoint,omitempty"`
 	QueryEndpoint  string         `json:"query_endpoint,omitempty"`
@@ -102,22 +107,22 @@ type GenerationOperationConfig struct {
 	DefaultParams  map[string]any `json:"default_params,omitempty"`
 }
 
-// Normalize fills conservative defaults without changing user parameters.
-func (c *GenerationOperationConfig) Normalize(vendor string, operation GenerationOperation) {
-	if strings.TrimSpace(c.Endpoint) == "" {
-		c.Endpoint = DefaultGenerationEndpoint(vendor, operation)
-	}
-	if strings.TrimSpace(c.QueryEndpoint) == "" {
-		c.QueryEndpoint = DefaultGenerationQueryEndpoint(vendor, operation)
-	}
+// Normalize fills conservative execution defaults without changing URLs or
+// user parameters.
+func (c *GenerationOperationConfig) Normalize() {
 	if c.TimeoutSeconds <= 0 {
 		c.TimeoutSeconds = 600
 	}
 }
 
-// MediaGenerationModelConfig maps canonical operations to vendor endpoints.
+// MediaGenerationModelConfig declares the canonical operations exposed by a
+// media model and stores one shared API configuration for all of them. The
+// operation map values are retained only so pre-V11 configuration files can be
+// read without losing their per-operation settings; newly written configs use
+// empty values and keep endpoint settings in API.
 type MediaGenerationModelConfig struct {
 	Adapter    string                                            `json:"adapter,omitempty"`
+	API        *GenerationOperationConfig                        `json:"api,omitempty"`
 	Operations map[GenerationOperation]GenerationOperationConfig `json:"operations,omitempty"`
 }
 
@@ -142,6 +147,22 @@ func (c *MediaGenerationModelConfig) SupportedOperations() []GenerationOperation
 		}
 	}
 	return out
+}
+
+// EffectiveOperationConfig returns the model-level API configuration used for
+// an operation. Legacy per-operation settings remain readable until the model
+// is edited or the V11 migration can safely consolidate identical values.
+func (c *MediaGenerationModelConfig) EffectiveOperationConfig(operation GenerationOperation) GenerationOperationConfig {
+	var operationConfig GenerationOperationConfig
+	if c != nil {
+		if c.API != nil {
+			operationConfig = *c.API
+		} else {
+			operationConfig = c.Operations[operation]
+		}
+	}
+	operationConfig.Normalize()
+	return operationConfig
 }
 
 // GenerationModelTarget selects one media model without duplicating provider
@@ -187,6 +208,19 @@ func ValidateGenerationModel(model ModelConfig) error {
 			return fmt.Errorf("unsupported generation operation %q", operation)
 		}
 	}
+	if model.Generation.API == nil {
+		return fmt.Errorf("media generation model %q requires one shared API configuration", model.Name)
+	}
+	if err := validateAPIEndpointSuffix(model.Generation.API.Endpoint, "endpoint", true); err != nil {
+		return fmt.Errorf("media generation model %q: %w", model.Name, err)
+	}
+	if err := validateAPIEndpointSuffix(model.Generation.API.QueryEndpoint, "query_endpoint", false); err != nil {
+		return fmt.Errorf("media generation model %q: %w", model.Name, err)
+	}
+	if queryEndpoint := strings.TrimSpace(model.Generation.API.QueryEndpoint); queryEndpoint != "" &&
+		!strings.Contains(queryEndpoint, "{task_id}") && !strings.Contains(queryEndpoint, "{id}") {
+		return fmt.Errorf("media generation model %q: query_endpoint must contain {task_id} or {id}", model.Name)
+	}
 	return nil
 }
 
@@ -204,8 +238,8 @@ func (c *Config) GenerationDefaultReferenced(provider, model string) (Generation
 	return "", false
 }
 
-// NormalizeGeneration initializes maps and fills endpoint presets for known
-// vendors. Custom endpoint values always win.
+// NormalizeGeneration initializes maps, removes unknown capabilities, and
+// applies execution defaults without deriving endpoints from vendor names.
 func (c *Config) NormalizeGeneration() {
 	if c.Generation.Defaults == nil {
 		c.Generation.Defaults = make(map[GenerationOperation]GenerationModelTarget)
@@ -220,17 +254,15 @@ func (c *Config) NormalizeGeneration() {
 			if model.Generation.Operations == nil {
 				model.Generation.Operations = make(map[GenerationOperation]GenerationOperationConfig)
 			}
-			if strings.TrimSpace(model.Generation.Adapter) == "" {
-				model.Generation.Adapter = NormalizeGenerationVendor(provider.Vendor)
-			}
-			adapter := NormalizeGenerationVendor(model.Generation.Adapter)
 			for operation, operationConfig := range model.Generation.Operations {
 				if !operation.IsValid() {
 					delete(model.Generation.Operations, operation)
 					continue
 				}
-				operationConfig.Normalize(adapter, operation)
-				model.Generation.Operations[operation] = operationConfig
+				if model.Generation.API == nil {
+					operationConfig.Normalize()
+					model.Generation.Operations[operation] = operationConfig
+				}
 			}
 		}
 	}
@@ -263,15 +295,11 @@ func (c *Config) ResolveGenerationTarget(operation GenerationOperation, override
 			if model.EffectiveType() != ModelTypeMediaGeneration || model.Generation == nil {
 				return GenerationModelTarget{}, ModelConfig{}, GenerationOperationConfig{}, fmt.Errorf("model %s/%s is not a media generation model", target.Provider, target.Model)
 			}
-			operationConfig, ok := model.Generation.Operations[operation]
+			_, ok := model.Generation.Operations[operation]
 			if !ok {
 				return GenerationModelTarget{}, ModelConfig{}, GenerationOperationConfig{}, fmt.Errorf("model %s/%s does not support %s", target.Provider, target.Model, operation)
 			}
-			adapter := model.Generation.Adapter
-			if strings.TrimSpace(adapter) == "" {
-				adapter = provider.Vendor
-			}
-			operationConfig.Normalize(adapter, operation)
+			operationConfig := model.Generation.EffectiveOperationConfig(operation)
 			if !generationEndpointUsable(provider.BaseURL, operationConfig.Endpoint) {
 				return GenerationModelTarget{}, ModelConfig{}, GenerationOperationConfig{}, fmt.Errorf("model %s/%s has no usable endpoint for %s", target.Provider, target.Model, operation)
 			}
@@ -305,12 +333,7 @@ func (c *Config) GenerationModelsFor(operation GenerationOperation) []Generation
 			if model.EffectiveType() != ModelTypeMediaGeneration || !model.Generation.Supports(operation) {
 				continue
 			}
-			operationConfig := model.Generation.Operations[operation]
-			adapter := model.Generation.Adapter
-			if strings.TrimSpace(adapter) == "" {
-				adapter = provider.Vendor
-			}
-			operationConfig.Normalize(adapter, operation)
+			operationConfig := model.Generation.EffectiveOperationConfig(operation)
 			if !generationEndpointUsable(provider.BaseURL, operationConfig.Endpoint) {
 				continue
 			}
@@ -337,61 +360,5 @@ func NormalizeGenerationVendor(vendor string) string {
 		return "openai"
 	default:
 		return strings.ToLower(strings.TrimSpace(vendor))
-	}
-}
-
-// DefaultGenerationBaseURL returns an editable provider URL preset.
-func DefaultGenerationBaseURL(vendor string) string {
-	switch NormalizeGenerationVendor(vendor) {
-	case "volcengine":
-		return "https://ark.cn-beijing.volces.com/api/v3"
-	case "minimax":
-		return "https://api.minimax.io"
-	case "openai":
-		return "https://api.openai.com/v1"
-	default:
-		return ""
-	}
-}
-
-// DefaultGenerationEndpoint returns the create endpoint for a known vendor.
-func DefaultGenerationEndpoint(vendor string, operation GenerationOperation) string {
-	switch NormalizeGenerationVendor(vendor) {
-	case "volcengine":
-		switch operation {
-		case GenerationTextToImage, GenerationImageToImage:
-			return "/images/generations"
-		case GenerationTextToVideo, GenerationImageToVideo:
-			return "/contents/generations/tasks"
-		}
-	case "minimax":
-		switch operation {
-		case GenerationTextToImage, GenerationImageToImage:
-			return "/v1/image_generation"
-		case GenerationTextToVideo, GenerationImageToVideo:
-			return "/v1/video_generation"
-		case GenerationTextToSpeech:
-			return "/v1/t2a_v2"
-		}
-	case "openai":
-		if operation == GenerationTextToImage {
-			return "/images/generations"
-		}
-	}
-	return ""
-}
-
-// DefaultGenerationQueryEndpoint returns the async status endpoint template.
-func DefaultGenerationQueryEndpoint(vendor string, operation GenerationOperation) string {
-	if operation != GenerationTextToVideo && operation != GenerationImageToVideo {
-		return ""
-	}
-	switch NormalizeGenerationVendor(vendor) {
-	case "volcengine":
-		return "/contents/generations/tasks/{task_id}"
-	case "minimax":
-		return "/v1/query/video_generation?task_id={task_id}"
-	default:
-		return ""
 	}
 }
