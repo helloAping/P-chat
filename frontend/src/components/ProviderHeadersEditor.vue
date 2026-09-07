@@ -34,8 +34,8 @@ let rowSequence = 0
 
 const headerNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 const exampleHeaders: Array<Omit<ProviderHeaderRow, 'id'>> = [
-  { name: 'x-opencode-session', value: '{{conversation_id}}' },
-  { name: 'x-pchat-message-id', value: '{{message_id}}' },
+  { name: 'x-session-id', value: '{{session_id}}' },
+  { name: 'x-message-id', value: '{{message_id}}' },
   { name: 'x-request-id', value: '{{uuid}}' },
   { name: 'x-snowflake-id', value: '{{snowflake_id}}' },
 ]
@@ -47,9 +47,9 @@ const placeholderGroups: HeaderPlaceholderGroup[] = [
       {
         value: '{{conversation_id}}',
         label: '对话 ID',
-        description: '当前 P-Chat 对话的稳定标识，同一对话的多轮模型调用保持不变。无会话上下文的请求可能为空。',
+        description: '当前对话的稳定标识，同一对话的多轮模型调用保持不变。无会话上下文的请求可能为空。',
         scope: '整个对话',
-        usage: '推荐用于 x-opencode-session 等需要跨轮稳定的会话请求头。',
+        usage: '适合需要在多轮请求中保持一致的会话标识。',
       },
       {
         value: '{{session_id}}',
@@ -70,7 +70,7 @@ const placeholderGroups: HeaderPlaceholderGroup[] = [
         label: 'Trace ID',
         description: '当前调用链路的追踪标识；未创建追踪上下文时可能为空。',
         scope: '当前请求链路',
-        usage: '适合串联 P-Chat 日志、代理日志与上游服务日志。',
+        usage: '适合串联应用日志、代理日志与上游服务日志。',
       },
     ],
   },
@@ -182,7 +182,7 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
           :value="row.name"
           :status="rowNameInvalid(row) ? 'error' : undefined"
           size="small"
-          placeholder="x-opencode-session"
+          placeholder="x-session-id"
           @update:value="updateRow(index, 'name', $event)"
         />
         <NInput
