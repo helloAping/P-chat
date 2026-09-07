@@ -78,6 +78,17 @@ func TestApplyWithoutConversationUsesEmptyRequestValues(t *testing.T) {
 	}
 }
 
+func TestApplyAcceptsNativeStringMessageIdentifier(t *testing.T) {
+	ctx := WithIdentifiers(context.Background(), "im:feishu:chat-1", "om_native_message_1")
+	headers := http.Header{}
+	if err := Apply(ctx, headers, map[string]string{"X-Message": "{{message_id}}"}); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if got := headers.Get("X-Message"); got != "om_native_message_1" {
+		t.Fatalf("X-Message = %q", got)
+	}
+}
+
 func TestValidateTemplatesRejectsUnsafeOrUnknownValues(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -87,6 +98,7 @@ func TestValidateTemplatesRejectsUnsafeOrUnknownValues(t *testing.T) {
 		{name: "invalid name", templates: map[string]string{"Bad Header": "value"}, want: "invalid header name"},
 		{name: "reserved header", templates: map[string]string{"Content-Length": "10"}, want: "reserved header"},
 		{name: "newline", templates: map[string]string{"X-Test": "first\r\nInjected: yes"}, want: "line break"},
+		{name: "control character", templates: map[string]string{"X-Test": "value\x00"}, want: "control character"},
 		{name: "unknown placeholder", templates: map[string]string{"X-Test": "{{random_id}}"}, want: "unknown placeholder"},
 	}
 

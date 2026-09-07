@@ -2026,6 +2026,7 @@ func buildSubAgentChatRequest(
 		SubagentTaskID:      req.TaskID,
 		ProjectRoot:         req.ProjectRoot,
 		SessionID:           buildSubAgentSessionID(subType, req.TaskID),
+		UpstreamMessageID:   req.TaskID,
 		UseImageRecognition: req.UseImageRecognition,
 		// Leave MaxRounds unset so the child inherits the same
 		// configured round policy as the parent conversation. Long

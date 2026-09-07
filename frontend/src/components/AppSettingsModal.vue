@@ -250,8 +250,8 @@ const providerHeaderPlaceholders = new Set([
   'uuid', 'snowflake_id', 'timestamp', 'timestamp_ms',
 ])
 const providerReservedHeaders = new Set([
-  'connection', 'content-length', 'host', 'proxy-connection',
-  'te', 'trailer', 'transfer-encoding', 'upgrade',
+  'connection', 'content-length', 'host', 'keep-alive', 'proxy-authenticate',
+  'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade',
 ])
 
 function providerHeadersToRows(headers?: Record<string, string>): ProviderHeaderRow[] {
@@ -275,6 +275,7 @@ function providerHeaderRowsToRecord(rows: ProviderHeaderRow[]): Record<string, s
     if (names.has(normalizedName)) throw new Error(`请求头名称重复: ${name}`)
     names.add(normalizedName)
     if (/[\r\n]/.test(row.value)) throw new Error(`请求头值不能换行: ${name}`)
+    if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(row.value)) throw new Error(`请求头值包含控制字符: ${name}`)
     for (const match of row.value.matchAll(/\{\{([^{}]+)\}\}/g)) {
       if (!providerHeaderPlaceholders.has(match[1])) throw new Error(`不支持的动态参数: ${match[0]}`)
     }

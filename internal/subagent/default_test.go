@@ -701,6 +701,9 @@ func TestBuildSubAgentChatRequestUsesIsolatedSession(t *testing.T) {
 	if chatReq.ProjectRoot != req.ProjectRoot {
 		t.Fatalf("ProjectRoot = %q, want %q", chatReq.ProjectRoot, req.ProjectRoot)
 	}
+	if chatReq.UpstreamMessageID != req.TaskID {
+		t.Fatalf("UpstreamMessageID = %q, want %q", chatReq.UpstreamMessageID, req.TaskID)
+	}
 }
 
 func TestResolveSubAgentProviderModelPriority(t *testing.T) {

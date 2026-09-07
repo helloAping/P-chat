@@ -1313,9 +1313,14 @@ type ChatRequest struct {
 	// to target from the moment the user clicks send — the
 	// SSE `done` event is no longer the gating factor.
 	// Zero means "let the store autoincrement as usual"
-	// (the legacy path used by tests, the CLI, and any
-	// non-SPA caller that doesn't pre-mint an id).
+	// (the legacy path used by tests and non-SPA callers
+	// that don't pre-mint an id).
 	ClientMsgID int64 `json:"client_msg_id,omitempty"`
+	// UpstreamMessageID 为使用原生字符串消息 ID 的调用方提供 {{message_id}}；
+	// 同时存在时仍以 ClientMsgID 为准。
+	// UpstreamMessageID supplies {{message_id}} for callers with native string
+	// identifiers; ClientMsgID remains authoritative when both values are present.
+	UpstreamMessageID string `json:"-"`
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools.
 	PlanMode bool `json:"plan_mode,omitempty"`
@@ -2016,7 +2021,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// caller passed it via a different layer (defensive)
 		ctx = trace.WithID(ctx, tid)
 	}
-	ctx = requestheader.WithContext(ctx, req.SessionID, req.ClientMsgID)
+	upstreamMessageID := strings.TrimSpace(req.UpstreamMessageID)
+	if req.ClientMsgID > 0 {
+		upstreamMessageID = strconv.FormatInt(req.ClientMsgID, 10)
+	}
+	ctx = requestheader.WithIdentifiers(ctx, req.SessionID, upstreamMessageID)
 
 	// Per-stream monotonic counter for P3-1. sendOrDrop
 	// stamps each emitted chunk's Seq with nextSeq() (0, 1,

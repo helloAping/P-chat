@@ -214,10 +214,13 @@ func (r *REPL) chat(input string) {
 }
 
 func (r *REPL) chatWithSkills(input string, activeSkills []string) {
+	now := time.Now()
 	req := agent.ChatRequest{
 		Style:        r.style,
 		WorkMode:     r.mode.Normalize(),
 		Provider:     r.provider,
+		SessionID:    r.ctx.GetCurrentSessionID(),
+		ClientMsgID:  now.UnixMilli()*1000 + now.UnixNano()%1000,
 		ActiveSkills: append([]string(nil), activeSkills...),
 		Messages: []llm.ChatMessage{
 			{Role: llm.RoleUser, Type: llm.TypeText, Content: input},

@@ -88,6 +88,7 @@ func (h *Handler) ProcessIMEvent(ctx context.Context, ev im.IMEvent) error {
 		AutoContinue:        h.sessionAutoContinue(sessionID),
 		TodoLongRunMode:     h.sessionTodoLongRunMode(sessionID),
 		TraceID:             ev.TraceID,
+		UpstreamMessageID:   ev.ID,
 		AllowedTools:        plan.AllowedTools,
 	}
 	if inject := strings.TrimSpace(persona.PromptInject); inject != "" {

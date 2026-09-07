@@ -29,6 +29,7 @@ const exampleHeaders: Array<Omit<ProviderHeaderRow, 'id'>> = [
 
 const placeholderGroups = [
   { value: '{{conversation_id}}', label: '当前对话' },
+  { value: '{{session_id}}', label: '当前对话（别名）' },
   { value: '{{message_id}}', label: '当前消息' },
   { value: '{{trace_id}}', label: '链路追踪' },
   { value: '{{uuid}}', label: '随机 UUID' },
@@ -66,7 +67,11 @@ function updateRow(index: number, field: 'name' | 'value', value: string) {
 }
 
 function fillExamples() {
-  emit('update:modelValue', exampleHeaders.map(row => createRow(row.name, row.value)))
+  const existingNames = new Set(props.modelValue.map(row => row.name.trim().toLowerCase()))
+  const missingExamples = exampleHeaders
+    .filter(row => !existingNames.has(row.name.toLowerCase()))
+    .map(row => createRow(row.name, row.value))
+  emit('update:modelValue', [...props.modelValue, ...missingExamples])
 }
 
 function rowNameInvalid(row: ProviderHeaderRow): boolean {
@@ -171,21 +176,21 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 
 .headers-count {
   min-width: 20px;
-  padding: 1px 6px;
-  border-radius: 999px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
   background: var(--surface-3);
   color: var(--text-tertiary);
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   text-align: center;
 }
 
 .headers-editor-description,
 .headers-footnote {
-  margin: 3px 0 0;
+  margin: var(--space-1) 0 0;
   color: var(--text-tertiary);
-  font-size: 11px;
+  font-size: 11.5px;
   line-height: 1.5;
 }
 
@@ -208,9 +213,9 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 }
 
 .header-columns {
-  padding: 0 2px;
+  padding: 0 var(--space-1);
   color: var(--text-quaternary);
-  font-size: 10.5px;
+  font-size: 11.5px;
 }
 
 .header-row :deep(input) {
@@ -220,7 +225,7 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 
 .headers-empty {
   width: 100%;
-  padding: 12px;
+  padding: var(--space-3);
   border: 1px dashed var(--border-default);
   border-radius: var(--radius-sm);
   background: transparent;
@@ -232,9 +237,18 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 }
 
 .headers-empty:hover {
-  border-color: var(--brand-300);
+  border-color: var(--brand-500);
   background: var(--surface-1);
   color: var(--brand-600);
+}
+
+.headers-empty:active {
+  background: var(--surface-3);
+}
+
+.headers-empty:focus-visible {
+  outline: 2px solid var(--brand-500);
+  outline-offset: var(--space-1);
 }
 
 .placeholder-strip {
@@ -245,17 +259,17 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 .placeholder-lead {
   margin-right: var(--space-1);
   color: var(--text-tertiary);
-  font-size: 10.5px;
+  font-size: 11.5px;
 }
 
 .placeholder-chip {
-  padding: 2px 6px;
+  padding: var(--space-1) var(--space-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: var(--surface-1);
   color: var(--text-secondary);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 11.5px;
   line-height: 1.35;
 }
 

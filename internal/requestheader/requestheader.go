@@ -1,3 +1,4 @@
+// Package requestheader 校验并展开供应商自定义的 HTTP 请求头。
 // Package requestheader validates and expands provider-defined HTTP headers.
 package requestheader
 
@@ -38,14 +39,17 @@ var (
 		"timestamp_ms":    {},
 	}
 	reservedHeaders = map[string]struct{}{
-		"connection":        {},
-		"content-length":    {},
-		"host":              {},
-		"proxy-connection":  {},
-		"te":                {},
-		"trailer":           {},
-		"transfer-encoding": {},
-		"upgrade":           {},
+		"connection":          {},
+		"content-length":      {},
+		"host":                {},
+		"keep-alive":          {},
+		"proxy-authenticate":  {},
+		"proxy-authorization": {},
+		"proxy-connection":    {},
+		"te":                  {},
+		"trailer":             {},
+		"transfer-encoding":   {},
+		"upgrade":             {},
 	}
 	snowflakeState = struct {
 		sync.Mutex
@@ -59,12 +63,22 @@ type contextKey struct{}
 
 type requestContext struct {
 	conversationID string
-	messageID      int64
+	messageID      string
 }
 
 // WithContext 把当前对话与消息标识加入上游请求上下文。
 // WithContext attaches conversation and message identifiers to an upstream request.
 func WithContext(ctx context.Context, conversationID string, messageID int64) context.Context {
+	messageValue := ""
+	if messageID > 0 {
+		messageValue = strconv.FormatInt(messageID, 10)
+	}
+	return WithIdentifiers(ctx, conversationID, messageValue)
+}
+
+// WithIdentifiers 把字符串形式的当前对话与消息标识加入上游请求上下文。
+// WithIdentifiers attaches string-form conversation and message identifiers to an upstream request.
+func WithIdentifiers(ctx context.Context, conversationID, messageID string) context.Context {
 	return context.WithValue(ctx, contextKey{}, requestContext{
 		conversationID: conversationID,
 		messageID:      messageID,
@@ -110,6 +124,9 @@ func ValidateTemplates(templates map[string]string) error {
 		if strings.ContainsAny(value, "\r\n") {
 			return fmt.Errorf("custom header %q value must not contain a line break", name)
 		}
+		if !validHeaderValue(value) {
+			return fmt.Errorf("custom header %q value contains a control character", name)
+		}
 		matches := placeholderPattern.FindAllStringSubmatch(value, -1)
 		for _, match := range matches {
 			placeholder := strings.TrimSpace(match[1])
@@ -150,15 +167,11 @@ func Apply(ctx context.Context, destination http.Header, templates map[string]st
 
 func dynamicValues(ctx context.Context, now time.Time) map[string]string {
 	metadata, _ := ctx.Value(contextKey{}).(requestContext)
-	messageID := ""
-	if metadata.messageID > 0 {
-		messageID = strconv.FormatInt(metadata.messageID, 10)
-	}
 	requestUUID := uuid.NewString()
 	return map[string]string{
 		"conversation_id": metadata.conversationID,
 		"session_id":      metadata.conversationID,
-		"message_id":      messageID,
+		"message_id":      metadata.messageID,
 		"trace_id":        trace.FromContext(ctx),
 		"uuid":            requestUUID,
 		"snowflake_id":    nextSnowflakeID(now),
@@ -181,6 +194,17 @@ func validHeaderName(name string) bool {
 	return true
 }
 
+func validHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		character := value[i]
+		if character == '\t' || (character >= 0x20 && character != 0x7f) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func snowflakeNodeID() uint64 {
 	hasher := fnv.New32a()
 	hostname, _ := os.Hostname()
@@ -190,7 +214,8 @@ func snowflakeNodeID() uint64 {
 }
 
 func nextSnowflakeID(now time.Time) string {
-	// 2024-01-01 UTC。Use a recent custom epoch to retain the full 41-bit time range.
+	// 采用 2024-01-01 UTC 作为自定义纪元，保留完整的 41 位时间范围。
+	// Use a recent custom epoch to retain the full 41-bit time range.
 	const epochMillis int64 = 1704067200000
 	millis := now.UnixMilli() - epochMillis
 	if millis < 0 {

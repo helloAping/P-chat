@@ -260,8 +260,9 @@ type ProviderPatch struct {
 	// ClearAPIKey, if true, forces the key to be emptied
 	// even when the user-supplied APIKey is "".
 	ClearAPIKey bool
-	// CustomHeaders, when non-nil, replaces the complete header template map.
-	// An explicitly supplied empty map clears all custom headers.
+	// CustomHeaders 非 nil 时替换完整的请求头模板；显式空映射会清空配置。
+	// CustomHeaders, when non-nil, replaces the complete header template map;
+	// an explicitly supplied empty map clears all custom headers.
 	CustomHeaders *map[string]string
 	// IsDefault, if true, promotes this provider to be the
 	// global default. (False is a no-op so the UI can

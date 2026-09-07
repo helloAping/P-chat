@@ -70,8 +70,9 @@ const (
 	// editable endpoint suffixes; vendor presets are no longer configured.
 	V12 AppVersion = 12
 
-	// V13 — providers can persist validated custom request-header templates
-	// with per-request conversation, message, UUID, and Snowflake variables.
+	// V13 — 供应商可持久化经过校验的自定义请求头模板，并按请求展开动态变量。
+	// V13 — providers can persist validated custom request-header templates with
+	// per-request conversation, message, UUID, and Snowflake variables.
 	V13 AppVersion = 13
 
 	// Current is the latest AppVersion. When adding a new version,

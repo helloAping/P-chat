@@ -53,6 +53,7 @@ llm:
       protocol: "openai"
       base_url: "http://api-convert.08ms.cn/v1"
       api_key: ""
+      # 可选的供应商级请求头；动态值会在每次请求时展开。
       # Optional provider-wide headers. Dynamic values are expanded per request.
       # custom_headers:
       #   x-opencode-session: "{{conversation_id}}"
