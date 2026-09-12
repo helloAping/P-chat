@@ -92,7 +92,7 @@ function close() {
 // the modal's `style` width, NModal reads it and constrains
 // the inner card accordingly.
 const sizeMap: Record<Size, number> = {
-  sm: 400,
+  sm: 440,
   md: 560,
   lg: 720,
 }
@@ -134,7 +134,7 @@ const sizeMap: Record<Size, number> = {
       <slot />
     </div>
 
-    <template #action>
+    <template v-if="$slots.footer" #action>
       <div class="app-modal-footer">
         <slot name="footer" />
       </div>
@@ -148,35 +148,31 @@ const sizeMap: Record<Size, number> = {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0;
-  /* NModal gives the header a min-height via its preset="card"
-   * default (44px). We want a bit more breathing room for
-   * the 16px title. We can't override the preset padding, so
-   * we just give the title + close button some extra room
-   * via the inner content. */
+  gap: var(--space-3);
   width: 100%;
-  padding-right: 4px;
+  min-height: 28px;
 }
 .app-modal-title {
-  font-size: 16px;
-  font-weight: 600;
+  font-size: 15px;
+  font-weight: 650;
   color: var(--text-primary);
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
   line-height: 1.3;
 }
 .app-modal-close {
-  background: transparent;
-  border: none;
-  color: var(--text-tertiary);
-  cursor: pointer;
-  padding: 6px;
-  border-radius: var(--radius-sm);
+  width: 28px;
+  height: 28px;
+  padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: var(--transition-colors);
 }
 .app-modal-close:hover {
   background: var(--surface-3);
@@ -185,14 +181,12 @@ const sizeMap: Record<Size, number> = {
 
 /* --- Body ------------------------------------------------------------- */
 .app-modal-body {
-  /* The NModal preset="card" already gives 20px padding; we
-   * can stay thin here and just set a top border to separate
-   * from the header. */
-  font-size: 14px;
+  font-size: 13.5px;
+  line-height: 1.55;
   color: var(--text-primary);
   position: relative;
 }
-.app-modal-body :deep(p) { margin: 0 0 12px; }
+.app-modal-body :deep(p) { margin: 0 0 12px; color: var(--text-secondary); }
 .app-modal-body :deep(p:last-child) { margin-bottom: 0; }
 
 /* Accent-top variants: a 3px bar across the top of the
@@ -221,44 +215,67 @@ const sizeMap: Record<Size, number> = {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
-  /* The footer slot inside NModal's preset="card" already
-   * gives some padding; we keep that and just control the
-   * button order (cancel on the left, primary on the right). */
+  gap: var(--space-2);
   width: 100%;
+}
+.app-modal-footer :deep(.n-button) {
+  --n-height: var(--control-height);
+  min-width: 72px;
+  font-weight: 500;
 }
 </style>
 
 <style>
-/* NModal's preset="card" applies a default border-radius
- * and box-shadow that we want to override with our design
- * tokens. We use a non-scoped rule so the deep selector
- * actually reaches NModal's inner card (it's in the
- * teleported subtree, outside the scoped boundary). */
+/* Glass panel chrome for every AppModal. Mask stays heavily
+ * blurred; the card itself is high-opacity glass so form
+ * copy remains readable (design rule: no text-on-blur). */
 .n-modal-container .n-card {
+  position: relative;
   border-radius: var(--radius-lg) !important;
   box-shadow: var(--shadow-lg) !important;
-  background: var(--surface-1) !important;
-  border: 1px solid var(--border-default) !important;
+  background: var(--glass-panel-bg) !important;
+  border: 1px solid var(--glass-border) !important;
+  overflow: hidden;
+  backdrop-filter: blur(var(--glass-blur)) !important;
+  -webkit-backdrop-filter: blur(var(--glass-blur)) !important;
+}
+.n-modal-container .n-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--text-primary) 12%, transparent),
+    transparent
+  );
+  pointer-events: none;
+  z-index: 1;
+}
+.n-modal-container .n-card > .n-card-header {
+  padding: 16px 20px 12px !important;
+  background: transparent !important;
+  border-bottom: 1px solid var(--border-subtle) !important;
 }
 .n-modal-container .n-card__content,
 .n-modal-container .n-card__action {
   padding: 16px 20px !important;
-  background: var(--surface-1) !important;
+  background: transparent !important;
 }
 .n-modal-container .n-card__content {
-  /* The body is the variable-height area. Cap at a sane
-   * value so a very long form scrolls instead of
-   * running off-screen. */
   max-height: min(70vh, 600px);
   overflow-y: auto;
 }
 .n-modal-container .n-card__action {
   border-top: 1px solid var(--border-subtle) !important;
+  padding-top: 12px !important;
+  padding-bottom: 14px !important;
 }
 .n-modal-mask {
   background: var(--surface-overlay) !important;
-  backdrop-filter: blur(6px) !important;
+  backdrop-filter: blur(var(--glass-blur)) !important;
+  -webkit-backdrop-filter: blur(var(--glass-blur)) !important;
   transition: opacity var(--dur-slow) var(--ease-out) !important;
 }
 </style>

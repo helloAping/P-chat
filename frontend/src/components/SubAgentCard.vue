@@ -751,7 +751,7 @@ onBeforeUnmount(() => clearStuckTimer())
 .sub-stream-content :deep(.tool-result pre),
 .sub-stream-content :deep(.tool-error pre) {
   padding: var(--space-3);
-  max-height: 320px;
+  max-height: 160px;
 }
 .sub-taskid {
   display: flex;

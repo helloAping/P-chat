@@ -34,6 +34,14 @@ export function OpenURL(arg1) {
   return window['go']['main']['App']['OpenURL'](arg1);
 }
 
+export function RequestWindowClose() {
+  return window['go']['main']['App']['RequestWindowClose']();
+}
+
+export function SaveDownloadFile(arg1, arg2) {
+  return window['go']['main']['App']['SaveDownloadFile'](arg1, arg2);
+}
+
 export function SaveExportFile(arg1, arg2, arg3) {
   return window['go']['main']['App']['SaveExportFile'](arg1, arg2, arg3);
 }

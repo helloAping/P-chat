@@ -16,3 +16,19 @@ func TestTrayCallbackActionFor_DecodesLegacyAndVersionedEvents(t *testing.T) {
 		t.Fatalf("left double-click action = %v, want open", got)
 	}
 }
+
+func TestPreferredTrayIconResourceIDs_IncludesWailsGeneratedGroupIcon(t *testing.T) {
+	ids := preferredTrayIconResourceIDs()
+	var hasOne, hasWails bool
+	for _, id := range ids {
+		if id == 1 {
+			hasOne = true
+		}
+		if id == 3 {
+			hasWails = true
+		}
+	}
+	if !hasOne || !hasWails {
+		t.Fatalf("preferred tray icon resource IDs = %v, want 1 and 3", ids)
+	}
+}

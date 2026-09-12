@@ -154,6 +154,17 @@
   --shadow-md:        0 4px 12px rgba(0, 0, 0, 0.28);
   --shadow-lg:        0 12px 32px rgba(0, 0, 0, 0.36);
 
+  /* 2.10b Glass — titlebar / modal mask / lightbox only.
+   * Do not use for main reading surfaces (sidebar, messages). */
+  --glass-bg:         rgba(20, 23, 31, 0.72);
+  --glass-border:     rgba(255, 255, 255, 0.08);
+  --glass-blur:       16px;
+  /* Modal / dialog panel: higher opacity than chrome glass so
+   * form text stays readable while still picking up a soft blur. */
+  --glass-panel-bg:   rgba(22, 25, 34, 0.92);
+  --titlebar-height:  36px;
+  --control-height:   28px;
+
   /* 2.11 Motion
    * --ease-out   : enter / hover settle (decelerate into rest)
    * --ease-in    : leave / dismiss (accelerate out)
@@ -231,6 +242,14 @@
   --shadow-sm:        0 1px 2px rgba(0, 0, 0, 0.06);
   --shadow-md:        0 4px 12px rgba(0, 0, 0, 0.10);
   --shadow-lg:        0 12px 32px rgba(0, 0, 0, 0.16);
+
+  /* 2.10b Glass — light theme */
+  --glass-bg:         rgba(247, 248, 250, 0.78);
+  --glass-border:     rgba(0, 0, 0, 0.08);
+  --glass-blur:       16px;
+  --glass-panel-bg:   rgba(255, 255, 255, 0.94);
+  --titlebar-height:  36px;
+  --control-height:   28px;
 
   color-scheme: light;
 }
@@ -1005,4 +1024,36 @@ pre {
 
 .settings-collapse--inset .n-collapse-item + .n-collapse-item {
   border-top: 1px solid var(--border-subtle) !important;
+}
+
+/* --- Glass toasts / notifications (floating chrome) ------------------- */
+.n-message {
+  background: var(--glass-bg) !important;
+  border: 1px solid var(--glass-border) !important;
+  border-radius: var(--radius-md) !important;
+  box-shadow: var(--shadow-md) !important;
+  backdrop-filter: blur(var(--glass-blur)) !important;
+  -webkit-backdrop-filter: blur(var(--glass-blur)) !important;
+  color: var(--text-primary) !important;
+  padding: 8px 12px !important;
+  max-width: min(420px, calc(100vw - 32px)) !important;
+}
+.n-message .n-message__content {
+  font-size: 13px !important;
+  line-height: 1.45 !important;
+  color: var(--text-primary) !important;
+}
+.n-message .n-message__icon {
+  margin-right: 8px !important;
+}
+.n-notification {
+  background: var(--glass-bg) !important;
+  border: 1px solid var(--glass-border) !important;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: var(--shadow-lg) !important;
+  backdrop-filter: blur(var(--glass-blur)) !important;
+  -webkit-backdrop-filter: blur(var(--glass-blur)) !important;
+}
+.n-notification .n-notification-main-footer .n-button {
+  --n-height: var(--control-height) !important;
 }

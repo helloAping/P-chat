@@ -118,6 +118,26 @@
 
 **禁止**：写 `box-shadow: 0 2px 4px rgba(0,0,0,0.1)` 这种裸值。
 
+### 1.8b Glass + Titlebar（局部毛玻璃）
+
+| Token | 用途 |
+|---|---|
+| `--glass-bg` | 标题栏 / 浮层毛玻璃底色 |
+| `--glass-border` | 毛玻璃描边 |
+| `--glass-blur` | `backdrop-filter: blur(...)` 半径 |
+| `--glass-panel-bg` | 弹窗面板高不透明度毛玻璃（可读优先） |
+| `--titlebar-height` | 自定义标题栏高度（36px） |
+| `--control-height` | 壳层控件统一高度（28px） |
+
+**只用在**：`TitleBar`、modal mask / **modal 面板（`--glass-panel-bg`）**、lightbox mask、下载 dock、toast/notification。侧栏 / 消息列表 / 输入区仍用实心 `--surface-*`。
+
+弹窗面板用高不透明度 glass（`--glass-panel-bg` ≈ 92–94%），禁止把正文直接压在强模糊背景上。
+
+**Frameless 约束**：
+- 拖拽区：`--wails-draggable: drag`
+- 按钮命中区：`--wails-draggable: no-drag`
+- 关闭必须走 `RequestWindowClose` → `app:close-request`，禁止直接 `Quit`
+
 ### 1.9 Motion
 
 | Token | 值 | 用途 |

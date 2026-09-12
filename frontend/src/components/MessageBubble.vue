@@ -1674,25 +1674,32 @@ function findPrecedingUserMessageId(): number {
   min-width: 0;
 }
 .msg.user .bubble {
-  background: var(--brand-500);
-  color: var(--on-brand);
-  padding: 10px 14px;
-  border-radius: 14px;
-  box-shadow: var(--shadow-sm);
+  background: var(--brand-50);
+  color: var(--text-primary);
+  padding: 8px 12px;
+  border-radius: 14px 14px 4px 14px;
+  border: 1px solid var(--brand-100);
+  box-shadow: none;
   max-width: 80%;
+  font-size: 13.5px;
+  line-height: 1.55;
 }
 .msg.user .bubble.bubble--attachments {
   background: transparent;
   padding: 0;
   border-radius: 0;
   box-shadow: none;
+  border: 0;
   max-width: 100%;
   width: min(100%, calc(var(--space-8) * 12));
 }
 .msg.assistant .bubble {
   background: transparent;
   color: var(--text-primary);
-  padding: 0 4px;
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1.65;
+  letter-spacing: -0.005em;
 }
 .msg.tool .bubble {
   background: var(--surface-2);
@@ -1744,14 +1751,8 @@ function findPrecedingUserMessageId(): number {
   color: var(--text-secondary);
 }
 
-/* Force the markdown body inside a user bubble to inherit
- * the white text color (--on-brand). The default --text-primary
- * would win because of specificity, so we override here.
- * NOTE: this only reaches template-owned elements (the .md-body
- * container itself). Code blocks inside are injected via v-html
- * and carry no [data-v] attribute, so scoped rules never reach
- * their <pre>/<code> — those overrides live in the GLOBAL
- * <style> block below (see .msg.user .md-body pre). */
+/* User bubbles are quiet brand-tinted chips (not solid brand
+ * fills). Markdown inherits --text-primary via color: inherit. */
 .msg.user .bubble-body,
 .msg.user .bubble-body * { color: inherit; }
 .msg.user .bubble--attachments .bubble-body {
@@ -1775,11 +1776,12 @@ function findPrecedingUserMessageId(): number {
 .msg.user .bubble--attachments .user-message-caption {
   align-self: flex-end;
   padding: var(--space-2) var(--space-3);
-  background: var(--brand-500);
-  color: var(--on-brand);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
-  max-width: 80%;
+  background: var(--brand-50);
+  color: var(--text-primary);
+  border: 1px solid var(--brand-100);
+  border-radius: 14px 14px 4px 14px;
+  font-size: 13.5px;
+  line-height: 1.55;
 }
 
 /* "展开全文" affordance for truncated text parts. */
@@ -1824,21 +1826,21 @@ function findPrecedingUserMessageId(): number {
   pointer-events: auto;
 }
 .bubble-action-btn {
-  width: var(--space-6);
-  height: var(--space-6);
+  width: var(--control-height);
+  height: var(--control-height);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: var(--surface-1);
   color: var(--text-tertiary);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
   cursor: pointer;
   padding: 0;
   transition: background var(--dur-fast) var(--ease-out),
               color var(--dur-fast) var(--ease-out),
-              transform var(--dur-fast) var(--ease-out);
+              border-color var(--dur-fast) var(--ease-out);
 }
 .bubble-action-btn:hover {
   background: var(--surface-2);

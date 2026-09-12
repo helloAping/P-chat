@@ -39,6 +39,7 @@ import WebSearchSettings from './WebSearchSettings.vue'
 import IMSettings from './IMSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
+import AppModal from './AppModal.vue'
 import ProviderHeadersEditor from './ProviderHeadersEditor.vue'
 import {
   byteSizeInputMinimum,
@@ -2427,12 +2428,12 @@ function kbModelSupportsVision(scanModel: string) {
         </div>
 
         <!-- Add provider modal -->
-        <NModal
+        <AppModal
           v-model:show="showAddProvider"
-          preset="card"
           title="新增提供商"
-          :style="{ width: 'min(700px, calc(100vw - 32px))' }"
+          size="lg"
           :mask-closable="false"
+          @close="cancelAddProvider"
         >
           <p class="modal-lead">选择协议并填写供应商公共 Base URL；模型创建时再配置请求端点后缀。</p>
           <div class="settings-form settings-form--grid modal-form">
@@ -2477,21 +2478,18 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
           </div>
           <template #footer>
-            <div class="modal-footer-actions">
-              <NButton size="small" @click="cancelAddProvider">取消</NButton>
-              <NButton size="small" type="primary" @click="onAddProvider">创建</NButton>
-            </div>
+            <NButton size="small" quaternary @click="cancelAddProvider">取消</NButton>
+            <NButton size="small" type="primary" @click="onAddProvider">创建</NButton>
           </template>
-        </NModal>
+        </AppModal>
 
         <!-- Add / edit model modal -->
-        <NModal
+        <AppModal
           v-model:show="showAddModel"
-          preset="card"
           :title="editingModelName ? '编辑模型' : '添加模型'"
-          :style="{ width: 'min(640px, calc(100vw - 32px))' }"
+          size="lg"
           :mask-closable="false"
-          @after-leave="onCancelEditModel"
+          @close="onCancelEditModel"
         >
           <p v-if="editingModelName" class="modal-lead">
             正在编辑 <code class="model-editor-id">{{ editingModelName }}</code>
@@ -2629,22 +2627,19 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
           </div>
           <template #footer>
-            <div class="modal-footer-actions">
-              <NButton size="small" @click="onCancelEditModel">取消</NButton>
-              <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">
-                {{ editingModelName ? '保存修改' : '添加模型' }}
-              </NButton>
-            </div>
+            <NButton size="small" quaternary @click="onCancelEditModel">取消</NButton>
+            <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">
+              {{ editingModelName ? '保存修改' : '添加模型' }}
+            </NButton>
           </template>
-        </NModal>
+        </AppModal>
 
         <!-- Upstream model discovery only chooses an ID. The user always
              completes the normal model editor before anything is persisted. -->
-        <NModal
+        <AppModal
           v-model:show="showUpstreamModels"
-          preset="card"
           title="获取模型"
-          :style="{ width: 'min(560px, calc(100vw - 32px))' }"
+          size="md"
         >
           <p class="modal-lead">从 {{ selected?.name }} 的 Base URL + /models 获取。点击“配置并添加”后，可继续填写能力、上下文和 API 端点。</p>
           <div v-if="upstreamError" class="upstream-error">{{ upstreamError }}</div>
@@ -2672,7 +2667,7 @@ function kbModelSupportsVision(scanModel: string) {
               <NTag v-else size="small" :bordered="false">已添加</NTag>
             </div>
           </div>
-        </NModal>
+        </AppModal>
 
       </NTabPane>
 
@@ -3723,7 +3718,7 @@ function kbModelSupportsVision(scanModel: string) {
     :mask-closable="false"
     :auto-focus="false"
     :z-index="2600"
-    :mask-style="{ backdropFilter: 'blur(8px)', background: 'rgba(0, 0, 0, 0.42)' }"
+    :mask-style="{ backdropFilter: 'blur(var(--glass-blur))', background: 'var(--surface-overlay)' }"
     class="style-editor-modal"
     @update:show="onStyleEditorVisibleChange"
   >
@@ -3774,7 +3769,7 @@ function kbModelSupportsVision(scanModel: string) {
               </NPopover>
             </div>
             <NInput v-model:value="newStylePrompt" placeholder="人设 + 性格 + 说话风格 + 表达模板，支持 markdown"
-              type="textarea" :rows="15" size="small" class="editor-textarea" />
+              type="textarea" :rows="12" size="small" class="editor-textarea" />
           </div>
         </div>
 
@@ -3795,12 +3790,12 @@ function kbModelSupportsVision(scanModel: string) {
             </NPopover>
           </div>
           <NInput v-model:value="newStyleMemory" placeholder="背景资料、项目信息、用户偏好，每行一条"
-            type="textarea" :rows="6" size="small" class="editor-textarea" />
+            type="textarea" :rows="5" size="small" class="editor-textarea" />
         </div>
       </div>
 
       <div class="editor-actions">
-        <NButton size="small" @click="closeStyleEditor">取消</NButton>
+        <NButton size="small" quaternary @click="closeStyleEditor">取消</NButton>
         <NButton type="primary" size="small" :disabled="idConflict" @click="isEdit ? onUpdateStyle() : onCreateStyle()">
           {{ isEdit ? '保存修改' : '创建风格' }}
         </NButton>
@@ -3808,34 +3803,55 @@ function kbModelSupportsVision(scanModel: string) {
     </div>
   </NModal>
 
-  <!-- Inner confirmation modals — teleported to body by
-       NModal, so they sit on top of the settings dialog
-       regardless of where they're declared in the
-       template. Sibling of AppSettingsLayout (multi-root
-       template) — they're conceptually owned by the
-       settings dialog but rendered on top of everything. -->
-  <NModal v-model:show="showConfirmPermDelete" preset="card" title="确认永久删除" style="width: 360px">
-    <div class="confirm-body">
-      <p>确定要永久删除此会话吗？此操作不可撤销。</p>
-      <div class="confirm-actions">
-        <NButton size="small" @click="showConfirmPermDelete = false">取消</NButton>
-        <NButton size="small" type="error" @click="confirmPermDelete">永久删除</NButton>
-      </div>
-    </div>
-  </NModal>
+  <!-- Nested confirm / form dialogs — AppModal for glass chrome
+       consistency with the rest of the app. Teleported above
+       the settings sheet. -->
+  <AppModal
+    v-model:show="showConfirmPermDelete"
+    title="确认永久删除"
+    size="sm"
+    accent-top
+    accent-variant="error"
+  >
+    <p>确定要永久删除此会话吗？此操作不可撤销。</p>
+    <template #footer>
+      <NButton size="small" quaternary @click="showConfirmPermDelete = false">取消</NButton>
+      <NButton size="small" type="error" @click="confirmPermDelete">永久删除</NButton>
+    </template>
+  </AppModal>
 
-  <NModal v-model:show="showAddRepo" preset="card" title="添加技能仓库" style="width: 420px">
-    <div class="add-project-form">
-      <label>仓库名称</label>
-      <NInput v-model:value="newRepoName" placeholder="例如：我的技能仓库" />
-      <label style="margin-top: 12px">GitHub 地址</label>
-      <NInput v-model:value="newRepoUrl" placeholder="例如：https://github.com/user/repo" />
-      <div class="project-actions">
-        <NButton size="small" @click="showAddRepo = false">取消</NButton>
-        <NButton size="small" type="primary" @click="onAddRepo">添加</NButton>
+  <AppModal
+    v-model:show="showAddRepo"
+    title="添加技能仓库"
+    size="sm"
+  >
+    <div class="settings-mini-form">
+      <div class="settings-mini-field">
+        <label for="add-repo-name">仓库名称</label>
+        <NInput
+          id="add-repo-name"
+          v-model:value="newRepoName"
+          size="small"
+          placeholder="例如：我的技能仓库"
+          @keyup.enter="onAddRepo"
+        />
+      </div>
+      <div class="settings-mini-field">
+        <label for="add-repo-url">GitHub 地址</label>
+        <NInput
+          id="add-repo-url"
+          v-model:value="newRepoUrl"
+          size="small"
+          placeholder="例如：https://github.com/user/repo"
+          @keyup.enter="onAddRepo"
+        />
       </div>
     </div>
-  </NModal>
+    <template #footer>
+      <NButton size="small" quaternary @click="showAddRepo = false">取消</NButton>
+      <NButton size="small" type="primary" @click="onAddRepo">添加</NButton>
+    </template>
+  </AppModal>
 </template>
 
 <style scoped>
@@ -4662,27 +4678,29 @@ function kbModelSupportsVision(scanModel: string) {
   border-top: 1px solid var(--border-subtle);
   padding-top: var(--space-3);
 }
-/* ---- 风格编辑器弹窗 ---- */
+/* ---- 风格编辑器弹窗（glass panel + tighter density） ---- */
 .style-editor-dialog {
   width: min(920px, calc(100vw - 48px));
   max-height: min(84vh, 760px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--surface-1);
-  border: 1px solid var(--border-default);
+  background: var(--glass-panel-bg);
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
 }
 .style-editor-head {
-  min-height: 64px;
-  padding: 16px 20px;
+  min-height: 56px;
+  padding: 12px 18px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
   border-bottom: 1px solid var(--border-subtle);
-  background: var(--surface-1);
+  background: transparent;
   flex-shrink: 0;
 }
 .style-editor-title-block {
@@ -4692,10 +4710,11 @@ function kbModelSupportsVision(scanModel: string) {
   gap: 3px;
 }
 .style-editor-title {
-  font-size: 16px;
-  font-weight: 600;
+  font-size: 15px;
+  font-weight: 650;
   color: var(--text-primary);
   line-height: 1.25;
+  letter-spacing: -0.02em;
 }
 .style-editor-subtitle {
   font-size: 12px;
@@ -4705,8 +4724,8 @@ function kbModelSupportsVision(scanModel: string) {
   white-space: nowrap;
 }
 .style-editor-close {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -4726,13 +4745,13 @@ function kbModelSupportsVision(scanModel: string) {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 18px 20px 20px;
+  padding: 14px 18px 16px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  background: var(--surface-0);
+  gap: 12px;
+  background: transparent;
 }
-.editor-meta { display: flex; gap: 16px; }
+.editor-meta { display: flex; gap: 12px; }
 .meta-item { flex: 1; display: flex; flex-direction: column; gap: 4px; }
 .meta-item label { font-size: 12px; font-weight: 600; color: var(--text-2); }
 .meta-hint { font-size: 11px; color: var(--text-3); }
@@ -4744,11 +4763,17 @@ function kbModelSupportsVision(scanModel: string) {
 .editor-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 8px;
-  padding: 12px 20px 14px;
+  padding: 10px 18px 12px;
   border-top: 1px solid var(--border-subtle);
-  background: var(--surface-1);
+  background: transparent;
   flex-shrink: 0;
+}
+.editor-actions :deep(.n-button) {
+  --n-height: var(--control-height);
+  min-width: 72px;
+  font-weight: 500;
 }
 /* ---- 旧样式保留 ---- */
 .field-head {
@@ -4816,6 +4841,27 @@ code {
 .confirm-body { padding: 8px 0; }
 .confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.settings-mini-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.settings-mini-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.settings-mini-field label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.settings-mini-field :deep(.n-input) {
+  --n-height: var(--control-height);
+  --n-font-size: 13px;
+}
 .skills-shell {
   display: flex;
   flex-direction: column;

@@ -4,30 +4,22 @@
  * top-level "where am I" affordances so the chat canvas can stay
  * focused on messages.
  *
- * Layout (flex row, 56px tall):
+ * Layout (flex row, 44px tall):
  *   ┌─────────────────────────────────────────────────────────────┐
- *   │ [☰] [logo]  会话标题 · 项目路径  ·     Claude 3.5 [📂][🖥] │
+ *   │ [☰]   会话标题 · 项目路径              [ctx] [tools] [📂][🖥] │
  *   └─────────────────────────────────────────────────────────────┘
  *
- *   left:    sidebar collapse toggle + brand logo (clickable to
- *            go home / new chat)
+ *   left:    sidebar collapse toggle
  *   center:  session title (H1) + project breadcrumb separator
- *   right:   current model badge + project-level actions
- *            (open folder, open terminal — only when a project
- *            is active)
+ *   right:   context / tools / project actions
  *
- * Token count + user avatar (from the design plan) are not
- * implemented yet — the P-Chat runtime doesn't track per-session
- * token totals on the client, and there's no user-account
- * concept (it's a local app). The right section will fill in as
- * those become real.
+ * Brand mark lives in TitleBar (frameless chrome), not here.
  */
 import { computed, ref } from 'vue'
 import { NButton, NTooltip, useMessage } from 'naive-ui'
 import { state, refreshContextUsage } from '../stores/chat'
 import * as api from '../api/client'
 import { formatCompactTokens } from '../utils/format'
-import BrandLogo from './BrandLogo.vue'
 import ToolListDrawer from './ToolListDrawer.vue'
 import StyleGenModal from './StyleGenModal.vue'
 import { FolderOpen, Terminal, PanelLeftClose, PanelLeftOpen, Sparkles, BarChart3, Wrench, Hash } from './icons'
@@ -162,14 +154,8 @@ const ctxTip = computed(() => {
 
 <template>
   <header class="topbar">
-    <!-- Left section: collapse toggle + (optional) brand mark.
-         The brand mark is hidden when the sidebar is expanded
-         — the sidebar's own header already shows the logo +
-         "P-Chat" name, so showing it twice in the top bar is
-         redundant. When the sidebar is collapsed the top bar
-         becomes the only place for the brand mark, so it
-         reappears. The collapse button stays either way
-         (it's how the user gets the sidebar back). -->
+    <!-- Left: sidebar collapse only. Brand lives in TitleBar
+         (frameless chrome); repeating it here adds noise. -->
     <div class="topbar-left">
       <button
         type="button"
@@ -179,17 +165,6 @@ const ctxTip = computed(() => {
         @click="toggleSidebar"
       >
         <component :is="props.collapsed ? PanelLeftOpen : PanelLeftClose" :size="18" />
-      </button>
-      <button
-        v-if="props.collapsed"
-        type="button"
-        class="brand"
-        title="打开会话列表"
-        aria-label="打开会话列表"
-        @click="toggleSidebar"
-      >
-        <BrandLogo :size="22" />
-        <span class="brand-text">P-Chat</span>
       </button>
     </div>
 
@@ -346,12 +321,12 @@ const ctxTip = computed(() => {
 
 <style scoped>
 .topbar {
-  height: 56px;
+  height: 44px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0 16px;
+  gap: var(--space-3);
+  padding: 0 var(--space-4);
   background: var(--surface-1);
   border-bottom: 1px solid var(--border-subtle);
   z-index: 10;
@@ -365,8 +340,8 @@ const ctxTip = computed(() => {
   flex-shrink: 0;
 }
 .collapse-btn {
-  width: 32px;
-  height: 32px;
+  width: var(--control-height);
+  height: var(--control-height);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -380,31 +355,6 @@ const ctxTip = computed(() => {
 .collapse-btn:hover {
   background: var(--surface-3);
   color: var(--text-primary);
-}
-.brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 8px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  color: var(--text-primary);
-  cursor: pointer;
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-.brand:hover {
-  background: var(--surface-3);
-}
-.brand-text {
-  /* Hide the wordmark in narrow viewports — the logo alone
-   * carries the brand. The breakpoint matches Naive UI's
-   * default breakpoint for icon-only toolbars. */
-}
-@media (max-width: 720px) {
-  .brand-text { display: none; }
 }
 
 /* Center section ----------------------------------------------------- */

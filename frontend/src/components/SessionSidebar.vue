@@ -33,7 +33,7 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch, h, type Component } from 'vue'
-import { NButton, NInput, NScrollbar, NModal, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
@@ -49,7 +49,7 @@ import BrandLogo from './BrandLogo.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import { displaySessionTitle, sessionSourceFromID } from '../im/sessionSource'
 import {
-  Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
+  Plus, BarChart3, Settings, Info, Bell, Globe, Folder, FolderOpen, Sun, Moon, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
   ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
   Download, RotateCw, ExternalLink,
@@ -1239,41 +1239,62 @@ onMounted(() => {
       </div>
     </section>
 
-    <!-- Modals (PR #7: migrated to AppModal for consistent
-         styling). The about-modal is left as a raw NModal
-         for now because it has rich body content (update
-         banner, version info) that doesn't fit the
-         "header + body + footer" pattern cleanly. -->
+    <!-- Modals (PR #7: migrated to AppModal for consistent glass chrome). -->
 
     <AppModal
       v-model:show="showAddProject"
       title="添加项目"
-      size="md"
+      size="sm"
     >
       <div class="add-project-form">
-        <label>项目名称</label>
-        <NInput
-          v-model:value="newProjectName"
-          placeholder="例如：我的项目"
-          :status="projectNameError ? 'error' : undefined"
-          @update:value="projectNameError = ''"
-        />
-        <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
-        <label class="project-path-label">项目目录</label>
-        <div class="path-row">
+        <p class="add-project-lead">
+          登记本地文件夹后，会话会按项目分组，方便切换工作区。
+        </p>
+        <div class="form-field">
+          <label for="add-project-name">项目名称</label>
           <NInput
-            v-model:value="newProjectPath"
-            placeholder="例如：D:\projects\my-app"
-            class="path-input"
-            :status="projectPathError ? 'error' : undefined"
-            @update:value="projectPathError = ''"
+            id="add-project-name"
+            v-model:value="newProjectName"
+            size="small"
+            placeholder="例如：我的项目"
+            :status="projectNameError ? 'error' : undefined"
+            @update:value="projectNameError = ''"
+            @keyup.enter="onAddProject"
           />
-          <NButton size="small" @click="pickDirectory" title="选择目录">浏览</NButton>
+          <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
         </div>
-        <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
+        <div class="form-field">
+          <label for="add-project-path">项目目录</label>
+          <div class="path-row">
+            <NInput
+              id="add-project-path"
+              v-model:value="newProjectPath"
+              size="small"
+              placeholder="例如：D:\projects\my-app"
+              class="path-input"
+              :status="projectPathError ? 'error' : undefined"
+              @update:value="projectPathError = ''"
+              @keyup.enter="onAddProject"
+            />
+            <NButton
+              size="small"
+              secondary
+              class="path-browse"
+              title="选择目录"
+              @click="pickDirectory"
+            >
+              <template #icon>
+                <FolderOpen :size="14" />
+              </template>
+              浏览
+            </NButton>
+          </div>
+          <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
+          <p v-else class="field-hint">选择项目的根目录（含源代码的那一层）</p>
+        </div>
       </div>
       <template #footer>
-        <NButton size="small" @click="showAddProject = false">取消</NButton>
+        <NButton size="small" quaternary @click="showAddProject = false">取消</NButton>
         <NButton size="small" type="primary" @click="onAddProject">添加</NButton>
       </template>
     </AppModal>
@@ -1287,7 +1308,7 @@ onMounted(() => {
     >
       <p>确定要归档此会话吗？归档后可在「设置 → 归档」中恢复。</p>
       <template #footer>
-        <NButton size="small" @click="showConfirmDeleteSession = false">取消</NButton>
+        <NButton size="small" quaternary @click="showConfirmDeleteSession = false">取消</NButton>
         <NButton size="small" type="warning" @click="confirmDeleteSession">归档</NButton>
       </template>
     </AppModal>
@@ -1301,7 +1322,7 @@ onMounted(() => {
     >
       <p>确定要删除当前项目吗？该项目的会话不会被删除，但将不再关联到此项目。</p>
       <template #footer>
-        <NButton size="small" @click="showConfirmDeleteProject = false">取消</NButton>
+        <NButton size="small" quaternary @click="showConfirmDeleteProject = false">取消</NButton>
         <NButton size="small" type="error" @click="confirmDeleteProject">删除</NButton>
       </template>
     </AppModal>
@@ -1318,7 +1339,7 @@ onMounted(() => {
         autofocus
       />
       <template #footer>
-        <NButton size="small" @click="showRename = false">取消</NButton>
+        <NButton size="small" quaternary @click="showRename = false">取消</NButton>
         <NButton size="small" type="primary" @click="confirmRename">确认</NButton>
       </template>
     </AppModal>
@@ -1363,12 +1384,16 @@ onMounted(() => {
         </div>
       </div>
       <template #footer>
-        <NButton size="small" :disabled="exportSaving" @click="showExport = false">取消</NButton>
+        <NButton size="small" quaternary :disabled="exportSaving" @click="showExport = false">取消</NButton>
         <NButton size="small" type="primary" :loading="exportSaving" @click="confirmExport">选择路径并保存</NButton>
       </template>
     </AppModal>
 
-    <NModal v-model:show="showAbout" preset="card" title="关于 P-Chat" style="width: 380px">
+    <AppModal
+      v-model:show="showAbout"
+      title="关于 P-Chat"
+      size="sm"
+    >
       <div class="about-body">
         <p class="about-name">P-Chat</p>
         <p class="about-version">版本 {{ versionLabel(updateInfo?.current || APP_VERSION) }}</p>
@@ -1443,9 +1468,6 @@ onMounted(() => {
         </template>
         <p v-else class="update-ok">正在检查更新…</p>
 
-        <!-- Usage documentation — the primary action of the
-             About dialog (relocated from the Settings nav footer).
-             Opens the online doc in the system browser. -->
         <button type="button" class="about-docs" @click="openDocs">
           <Globe :size="14" class="about-docs-icon" />
           查看使用文档
@@ -1457,7 +1479,7 @@ onMounted(() => {
           <a :href="'https://github.com/' + GITHUB_REPO + '/issues'" target="_blank">反馈问题</a>
         </div>
       </div>
-    </NModal>
+    </AppModal>
 
     <TokenStatsModal v-model:show="showTokenStats" />
   </aside>
@@ -1542,10 +1564,10 @@ onMounted(() => {
   margin-bottom: var(--space-1);
 }
 .project-tab--active {
-  background: var(--brand-50);
-  border-color: var(--brand-100);
+  background: color-mix(in srgb, var(--brand-50) 70%, transparent);
+  border-color: color-mix(in srgb, var(--brand-500) 28%, transparent);
   color: var(--brand-600);
-  box-shadow: inset 3px 0 0 0 var(--brand-500);
+  box-shadow: inset 2px 0 0 0 var(--brand-500);
 }
 .project-tab-label {
   max-width: 28px;
@@ -1594,6 +1616,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  padding: 2px 0;
 }
 .project-summary-icon {
   width: 28px;
@@ -1603,8 +1626,9 @@ onMounted(() => {
   justify-content: center;
   flex: 0 0 28px;
   border-radius: var(--radius-md);
-  background: var(--brand-50);
-  color: var(--brand-500);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
 }
 .project-summary-copy {
   min-width: 0;
@@ -1621,16 +1645,17 @@ onMounted(() => {
   font-size: 13px;
   font-weight: 600;
   line-height: 1.25;
+  letter-spacing: -0.01em;
 }
 .project-summary-path {
   min-width: 0;
-  color: var(--text-tertiary);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.25;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  line-height: 1.25;
 }
 .sidebar-actions {
   flex: 0 0 auto;
@@ -1654,7 +1679,7 @@ onMounted(() => {
 
 /* --- New session CTA (top, full width) -------------------------------- */
 .new-session-bar {
-  padding: 8px 10px;
+  padding: var(--space-2) var(--space-3);
   flex-shrink: 0;
 }
 .new-session-btn {
@@ -1662,8 +1687,9 @@ onMounted(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 7px 12px;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  min-height: var(--control-height);
   background: var(--brand-500);
   color: var(--on-brand);
   border: 1px solid var(--brand-500);
@@ -1908,18 +1934,58 @@ onMounted(() => {
 }
 
 /* --- Add-project / confirm / about modals ---------------------------- */
-/* AppModal handles body padding + footer button row, so the
- * migrated modals (add-project / archive / delete-project /
- * rename) only need the form-internal styles. */
-.add-project-form label {
-  display: block; font-size: 13px; margin-bottom: 4px; color: var(--text-secondary);
-  font-weight: 500;
+.add-project-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
 }
-.project-path-label { margin-top: var(--space-3); }
-.path-row { display: flex; gap: 8px; align-items: center; }
-.path-input { flex: 1; }
+.add-project-lead {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--brand-50) 55%, var(--surface-2));
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.form-field label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.form-field :deep(.n-input) {
+  --n-height: var(--control-height);
+  --n-font-size: 13px;
+  --n-border-radius: var(--radius-sm);
+}
+.path-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  min-width: 0;
+}
+.path-input { flex: 1; min-width: 0; }
+.path-browse {
+  flex-shrink: 0;
+  height: var(--control-height) !important;
+  padding: 0 var(--space-3);
+}
+.field-hint {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
 .field-error {
-  margin: 5px 0 0;
+  margin: 0;
   color: var(--error-500);
   font-size: 12px;
   line-height: 1.35;
@@ -1933,14 +1999,16 @@ onMounted(() => {
   display: grid;
   gap: var(--space-1);
   padding: var(--space-3);
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  background: var(--surface-2);
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
 }
 .export-session-label {
   color: var(--text-tertiary);
   font-size: 11px;
   font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
 .export-session strong {
   color: var(--text-primary);
@@ -1966,24 +2034,26 @@ onMounted(() => {
   gap: var(--space-3);
   min-width: 0;
   padding: var(--space-3);
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   background: var(--surface-1);
   color: var(--text-secondary);
   text-align: left;
   cursor: pointer;
   transition: var(--transition-colors),
-              transform var(--dur-fast) var(--ease-out);
+              border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
 }
 .export-format-card:hover {
   background: var(--surface-2);
   color: var(--text-primary);
-  transform: translateY(-1px);
+  border-color: var(--border-default);
 }
 .export-format-card.active {
-  border-color: var(--brand-500);
-  background: var(--brand-50);
+  border-color: color-mix(in srgb, var(--brand-500) 45%, var(--border-subtle));
+  background: color-mix(in srgb, var(--brand-50) 75%, var(--surface-1));
   color: var(--text-primary);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand-500) 18%, transparent);
 }
 .export-format-icon {
   width: 32px;
@@ -2020,19 +2090,25 @@ onMounted(() => {
     grid-template-columns: 1fr;
   }
 }
-.about-body { padding: 4px 0; }
-.about-name { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
-.about-version { font-size: 13px; color: var(--text-tertiary); margin: 0 0 12px; }
-.about-desc { font-size: 13px; color: var(--text-secondary); margin: 0 0 4px; }
+.about-body { padding: 2px 0; }
+.about-name {
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  margin: 0 0 2px;
+  color: var(--text-primary);
+}
+.about-version { font-size: 12.5px; color: var(--text-tertiary); margin: 0 0 10px; }
+.about-desc { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 3px; line-height: 1.45; }
 .update-banner {
   margin: var(--space-3) 0;
   padding: var(--space-3);
-  background: var(--warn-50);
-  border: 1px solid var(--warn-500);
-  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warn-50) 80%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn-500) 35%, var(--border-subtle));
+  border-radius: var(--radius-md);
 }
 .update-banner p { margin: var(--space-1) 0; font-size: 13px; }
-.update-body { color: var(--text-tertiary); font-size: 12px !important; max-height: 120px; overflow: auto; white-space: pre-wrap; }
+.update-body { color: var(--text-tertiary); font-size: 12px !important; max-height: 100px; overflow: auto; white-space: pre-wrap; }
 .update-meta { color: var(--text-tertiary); font-size: 12px !important; }
 .update-actions {
   display: flex;
@@ -2040,35 +2116,44 @@ onMounted(() => {
   gap: var(--space-2);
   margin-top: var(--space-2);
 }
-.update-ok { font-size: 13px; color: var(--text-tertiary); margin: var(--space-3) 0; }
+.update-ok { font-size: 12.5px; color: var(--text-tertiary); margin: var(--space-3) 0; }
 
-/* Usage documentation button — primary action of the About dialog.
- * Brand-filled so it reads as the main thing to do here. */
+/* Docs CTA — secondary glass chip, not a heavy solid bar. */
 .about-docs {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   width: 100%;
-  margin: 14px 0 0;
-  padding: 9px 12px;
-  background: var(--brand-500);
-  color: var(--on-brand);
-  border: none;
+  margin: 12px 0 0;
+  padding: 0 var(--space-3);
+  height: var(--control-height);
+  background: color-mix(in srgb, var(--brand-50) 70%, transparent);
+  color: var(--brand-600);
+  border: 1px solid color-mix(in srgb, var(--brand-500) 28%, transparent);
   border-radius: var(--radius-md);
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 12.5px;
+  font-weight: 550;
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out);
+  transition: var(--transition-colors);
 }
-.about-docs:hover { background: var(--brand-600); }
+.about-docs:hover {
+  background: var(--brand-50);
+  color: var(--brand-700, var(--brand-600));
+  border-color: color-mix(in srgb, var(--brand-500) 45%, transparent);
+}
 .about-docs:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  outline: 2px solid var(--brand-500);
+  outline-offset: 1px;
 }
 .about-docs-icon { flex-shrink: 0; }
 
-.about-links { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-default); font-size: 13px; }
+.about-links {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+}
 .about-links a { color: var(--brand-500); text-decoration: none; }
 .about-links a:hover { text-decoration: underline; }
 .about-links .sep { color: var(--text-tertiary); margin: 0 6px; }

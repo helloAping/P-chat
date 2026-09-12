@@ -69,6 +69,8 @@ watch(
 .lightbox {
   position: fixed; inset: 0;
   background: var(--media-backdrop);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
   display: flex; align-items: center; justify-content: center;
   z-index: 1000;
   cursor: zoom-out;

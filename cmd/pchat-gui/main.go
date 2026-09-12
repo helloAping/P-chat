@@ -185,6 +185,7 @@ func main() {
 		Height:            820,
 		MinWidth:          900,
 		MinHeight:         600,
+		Frameless:         true,
 		WindowStartState:  options.Normal,
 		StartHidden:       true,
 		HideWindowOnClose: false,
@@ -375,6 +376,50 @@ func (a *App) SaveExportFile(defaultFilename string, format string, dataBase64 s
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return "", fmt.Errorf("write export file: %w", err)
+	}
+	return path, nil
+}
+
+// SaveDownloadFile opens the OS-native save dialog and writes an arbitrary
+// download payload. Prefer this over <a download> so WebView2 does not show
+// its built-in downloads flyout (ugly chrome we cannot style).
+// SaveDownloadFile 打开系统另存为对话框并写入下载内容，避免 WebView 原生下载弹层。
+func (a *App) SaveDownloadFile(defaultFilename string, dataBase64 string) (string, error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("wails context is not ready")
+	}
+	data, err := base64.StdEncoding.DecodeString(dataBase64)
+	if err != nil {
+		return "", fmt.Errorf("decode download data: %w", err)
+	}
+	defaultFilename = filepath.Base(strings.TrimSpace(defaultFilename))
+	if defaultFilename == "" || defaultFilename == "." || defaultFilename == string(filepath.Separator) {
+		defaultFilename = "download.bin"
+	}
+	ext := strings.TrimPrefix(filepath.Ext(defaultFilename), ".")
+	if ext == "" {
+		ext = "bin"
+	}
+	path, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
+		Title:                "保存文件",
+		DefaultFilename:      defaultFilename,
+		CanCreateDirectories: true,
+		Filters: []wailsruntime.FileFilter{
+			{DisplayName: strings.ToUpper(ext) + " (*." + ext + ")", Pattern: "*." + ext},
+			{DisplayName: "所有文件 (*.*)", Pattern: "*.*"},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("save dialog: %w", err)
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", nil // user cancelled
+	}
+	if filepath.Ext(path) == "" && ext != "" {
+		path += "." + ext
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("write download file: %w", err)
 	}
 	return path, nil
 }
@@ -589,18 +634,24 @@ func (a *App) unregisterStreamCancel(sessionID string, stream *activeStream) {
 }
 
 // openExplorer opens the OS file manager at the given path.
+// If path is a file, reveals/selects that file when the OS supports it.
+// openExplorer 打开资源管理器；若 path 是文件则尽量选中该文件。
 func openExplorer(path string) error {
 	stat, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("path not accessible: %w", err)
 	}
-	if !stat.IsDir() {
-		return fmt.Errorf("not a directory: %s", path)
-	}
 	switch runtime.GOOS {
 	case "windows":
-		return exec.Command("explorer", path).Start()
+		if stat.IsDir() {
+			return exec.Command("explorer", path).Start()
+		}
+		// /select, must be a single argument for explorer.exe
+		return exec.Command("explorer", "/select,"+path).Start()
 	default:
+		if !stat.IsDir() {
+			path = filepath.Dir(path)
+		}
 		return fmt.Errorf("file explorer not supported on %s", runtime.GOOS)
 	}
 }
@@ -1195,6 +1246,27 @@ func (a *App) ConfirmWindowClose(choice string) {
 // CancelWindowClose 用于用户取消关闭确认，并允许下一次点击 X 再次弹窗。
 func (a *App) CancelWindowClose() {
 	a.closePromptPending.Store(false)
+}
+
+// RequestWindowClose starts the same close-confirm / tray path as the
+// OS caption-bar close, for the frameless custom TitleBar.
+// RequestWindowClose 供无边框标题栏关闭按钮调用，复用 OnBeforeClose 确认链路。
+func (a *App) RequestWindowClose() {
+	log.Printf("RequestWindowClose called")
+	action := closeActionForWindowClose(a.quitting.Load(), a.tray != nil && a.tray.ready())
+	if action == closeActionExit {
+		a.quitApp()
+		return
+	}
+	if a.noMoreConfirm.Load() && a.tray != nil && a.tray.ready() {
+		log.Printf("RequestWindowClose: noMoreConfirm — hiding to tray")
+		a.hideMainWindow()
+		return
+	}
+	if a.requestCloseConfirmation() {
+		return
+	}
+	a.quitApp()
 }
 
 // quitApp performs a real application exit from the tray menu.

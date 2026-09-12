@@ -2645,8 +2645,8 @@ watch([() => state.currentID, queueSignature], () => {
 }
 .attach-chip {
   display: inline-flex; align-items: center; gap: 6px;
-  background: var(--bg-3);
-  border: 1px solid var(--border-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   padding: 4px 6px 4px 4px;
   font-size: 12px;
@@ -2664,13 +2664,13 @@ watch([() => state.currentID, queueSignature], () => {
 }
 .attach-chip:hover {
   border-color: var(--accent);
-  background: var(--bg-2);
+  background: var(--surface-3);
 }
 .attach-chip.uploading { opacity: 0.7; }
 .attach-chip.error { border-color: var(--error); }
 .thumb {
   width: 40px; height: 40px;
-  background: var(--bg-2);
+  background: var(--surface-3);
   border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
   overflow: hidden;
@@ -2988,9 +2988,9 @@ watch([() => state.currentID, queueSignature], () => {
  * `flex-shrink: 0` ensures the message list above gets
  * compressed first if the viewport is genuinely too small. */
 .input-area {
-  border-top: 1px solid var(--border);
-  background: var(--bg-2);
-  padding: 8px 12px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  padding: var(--space-2) var(--space-3);
   flex-shrink: 0;
 }
 .input-area--has-queue {
@@ -2999,14 +2999,16 @@ watch([() => state.currentID, queueSignature], () => {
 .input-bottom {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-top: 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 .input-primary {
   display: flex;
   align-items: center;
-  gap: 4px;
-  flex-wrap: wrap;
+  gap: var(--space-1);
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 /* --- Bottom-row buttons (session config / plan / perm / mute) ------ */
@@ -3019,9 +3021,9 @@ watch([() => state.currentID, queueSignature], () => {
 .ctrl-btn {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  height: 28px;
-  padding: 0 8px;
+  gap: var(--space-1);
+  height: var(--control-height);
+  padding: 0 var(--space-2);
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
@@ -3069,10 +3071,10 @@ watch([() => state.currentID, queueSignature], () => {
 .model-badge {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  height: 28px;
-  padding: 0 8px 0 8px;
-  background: var(--surface-1);
+  gap: var(--space-1);
+  height: var(--control-height);
+  padding: 0 var(--space-2);
+  background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   color: var(--text-primary);

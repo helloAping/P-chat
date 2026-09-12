@@ -17,12 +17,14 @@ import {
 } from 'naive-ui'
 import SessionSidebar from './components/SessionSidebar.vue'
 import ChatWindow from './components/ChatWindow.vue'
+import TitleBar from './components/TitleBar.vue'
 import TopBar from './components/TopBar.vue'
 import AppSettingsModal from './components/AppSettingsModal.vue'
 import ImageLightbox from './components/ImageLightbox.vue'
 import PlanReviewModal from './components/PlanReviewModal.vue'
 import ToolConfirmModal from './components/ToolConfirmModal.vue'
 import CloseConfirmModal from './components/CloseConfirmModal.vue'
+import DownloadDock from './components/DownloadDock.vue'
 import { loadSessions, loadProviders, loadProjects } from './stores/chat'
 import { setupTrayEventListeners } from './utils/trayEvents'
 
@@ -237,17 +239,20 @@ onUnmounted(() => {
       <NDialogProvider>
         <NNotificationProvider>
           <div class="app" :class="{ 'app--sidebar-collapsed': sidebarCollapsed }">
-            <SessionSidebar
-              :class="{ 'sidebar-collapsed': sidebarCollapsed }"
-              @open-settings="showAppSettings = true"
-              v-model:theme-name="themeName"
-            />
-            <div class="main-column">
-              <TopBar
-                :collapsed="sidebarCollapsed"
-                @toggle-sidebar="toggleSidebar"
+            <TitleBar />
+            <div class="app-body">
+              <SessionSidebar
+                :class="{ 'sidebar-collapsed': sidebarCollapsed }"
+                @open-settings="showAppSettings = true"
+                v-model:theme-name="themeName"
               />
-              <ChatWindow />
+              <div class="main-column">
+                <TopBar
+                  :collapsed="sidebarCollapsed"
+                  @toggle-sidebar="toggleSidebar"
+                />
+                <ChatWindow />
+              </div>
             </div>
             <ImageLightbox />
             <AppSettingsModal
@@ -257,6 +262,7 @@ onUnmounted(() => {
             <ToolConfirmModal />
             <PlanReviewModal />
             <CloseConfirmModal />
+            <DownloadDock />
             </div>
         </NNotificationProvider>
       </NDialogProvider>
@@ -267,9 +273,17 @@ onUnmounted(() => {
 <style scoped>
 .app {
   display: flex;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
-  background: var(--bg);
+  background: var(--surface-0);
+  min-width: 0;
+  overflow: hidden;
+}
+.app-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
   min-width: 0;
 }
 .main-column {
@@ -277,7 +291,7 @@ onUnmounted(() => {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  background: var(--bg);
+  background: var(--surface-0);
 }
 
 /* Sidebar collapse: SessionSidebar animates its own width

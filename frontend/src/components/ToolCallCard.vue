@@ -47,6 +47,9 @@ const contextRefs = computed(() => (props.part.context_refs || []).filter(Boolea
 // default-collapsed state. The args block is not folded —
 // it's typically 1-3 lines and not the noise.
 const shouldFoldResult = computed(() => {
+  // Errors default to collapsed — a long red log should not
+  // dominate the chat until the user expands it.
+  if (props.part.status === 'error' || props.part.error) return true
   if (isQuestionTool.value) return false
   // Generated media is the primary result, so keep it visible without making
   // the user expand a JSON-shaped tool response first.
@@ -501,9 +504,9 @@ async function resultForCopy(): Promise<string> {
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  margin: 4px 0;
+  margin: var(--space-1) 0;
   overflow: hidden;
-  font-size: 12.5px;
+  font-size: 12px;
   transition: border-color var(--dur-fast) var(--ease-out);
 }
 .tool-card.status-start { border-left: 3px solid var(--brand-500); }
@@ -524,11 +527,11 @@ async function resultForCopy(): Promise<string> {
 .tool-header {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
   background: transparent;
   border: 0;
-  padding: 5px 12px;
+  padding: 4px var(--space-3);
   text-align: left;
   cursor: pointer;
   color: var(--text-secondary);
@@ -668,13 +671,25 @@ async function resultForCopy(): Promise<string> {
   color: var(--text-secondary);
   white-space: pre-wrap;
   word-wrap: break-word;
-  max-height: 240px;
+  max-height: 160px;
   overflow: auto;
 }
-.tool-error pre {
+.tool-error {
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border-left: 2px solid var(--error-500);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: color-mix(in srgb, var(--error-50) 70%, transparent);
+}
+.tool-error .tool-section-label {
   color: var(--error-500);
-  border-color: var(--error-500);
-  background: var(--error-50);
+  font-weight: 600;
+}
+.tool-error pre {
+  color: var(--error-600, var(--error-500));
+  border-color: color-mix(in srgb, var(--error-500) 25%, var(--border-subtle));
+  background: var(--surface-0);
+  max-height: 140px;
 }
 .generation-request-details {
   margin-bottom: var(--space-2);

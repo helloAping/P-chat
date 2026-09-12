@@ -223,11 +223,12 @@ const navGroups = computed(() => {
   inset: 0;
   z-index: 2000;
   background: var(--surface-overlay);
-  backdrop-filter: blur(6px);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: var(--space-6);
 }
 
 /* --- Window --------------------------------------------------------- */
