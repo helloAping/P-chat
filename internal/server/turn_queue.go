@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/memory"
 )
 
@@ -337,6 +338,11 @@ func validateQueuedTurnRequest(req SendMessageRequest) error {
 	}
 	if len(req.Attachments) > 16 {
 		return fmt.Errorf("too many attachments: %d (max 16)", len(req.Attachments))
+	}
+	if req.TurnModePolicy != "" {
+		if _, ok := agent.ParseTurnModePolicy(req.TurnModePolicy); !ok {
+			return fmt.Errorf(`turn_mode_policy must be "auto", "plan", or "build"`)
+		}
 	}
 	if req.ClientMsgID <= 0 {
 		return fmt.Errorf("client_msg_id is required")

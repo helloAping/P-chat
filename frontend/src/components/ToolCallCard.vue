@@ -37,6 +37,7 @@ const props = defineProps<{ part: ToolPart }>()
 // fits in a tooltip (~150 chars) is fine open.
 const FOLD_RESULT_MIN_CHARS = 200
 const FOLD_RESULT_MIN_LINES = 4
+const isQuestionTool = computed(() => props.part.name === 'question')
 const isGenerationTool = computed(() => props.part.name.startsWith('generate_'))
 const isBrowserScreenshot = computed(() => props.part.name === 'browser_screenshot')
 const isMediaResultTool = computed(() => isGenerationTool.value || isBrowserScreenshot.value)
@@ -46,6 +47,7 @@ const contextRefs = computed(() => (props.part.context_refs || []).filter(Boolea
 // default-collapsed state. The args block is not folded —
 // it's typically 1-3 lines and not the noise.
 const shouldFoldResult = computed(() => {
+  if (isQuestionTool.value) return false
   // Generated media is the primary result, so keep it visible without making
   // the user expand a JSON-shaped tool response first.
   if (isMediaResultTool.value) return false
@@ -140,6 +142,19 @@ const statusLabel = computed(() => {
   }
 })
 
+const toolDisplayName = computed(() => isQuestionTool.value ? 'LLM 提问' : props.part.name)
+const toolStatusLabel = computed(() => {
+  if (!isQuestionTool.value) return statusLabel.value
+  switch (props.part.status) {
+    case 'start': return '等待回答…'
+    case 'ok': return '已记录'
+    case 'warn': return '已记录 (有警告)'
+    case 'error': return '失败'
+    case 'blocked': return '已关闭'
+    default: return props.part.status
+  }
+})
+
 const statusIcon = computed(() => {
   switch (props.part.status) {
     case 'start': return Loader2
@@ -155,6 +170,11 @@ const argsPretty = computed(() => {
   const a = props.part.args
   if (!a) return ''
   try { return JSON.stringify(JSON.parse(a), null, 2) } catch { return a }
+})
+
+const hasVisibleBody = computed(() => {
+  if (isQuestionTool.value) return !!props.part.error
+  return contextRefs.value.length > 0 || !!props.part.args || !!props.part.result || !!props.part.error
 })
 
 // P2-4: a dry-run call is signalled by a `dry_run: true`
@@ -336,19 +356,24 @@ async function fetchFullResult() {
 </script>
 
 <template>
-  <div class="tool-card" :class="['status-' + part.status, { foldable: shouldFoldResult, collapsed: !open }]">
-    <button class="tool-header" @click="toggle" :title="open ? '收起' : '展开'">
+  <!-- question 工具由 QuestionTable 展示；无错误时不渲染，避免双标题。 -->
+  <div
+    v-if="!isQuestionTool || part.error"
+    class="tool-card"
+    :class="['status-' + part.status, { foldable: shouldFoldResult, collapsed: !open, 'question-tool': isQuestionTool }]"
+  >
+    <button class="tool-header" @click="toggle" :title="isQuestionTool ? '问题已在下方展示' : open ? '收起' : '展开'">
       <span class="tool-icon" :class="part.status">
         <component :is="statusIcon" v-if="statusIcon" :size="11" :class="part.status === 'start' ? 'spin' : ''" />
       </span>
-      <span class="tool-name">{{ part.name }}</span>
+      <span class="tool-name">{{ toolDisplayName }}</span>
       <span v-if="isDryRun" class="tool-dry-run" title="仅预览,未实际执行">dry-run</span>
       <span
         v-if="contextRefs.length"
         class="tool-context-chip"
         :title="contextRefs.join(', ')"
       >ctx {{ contextRefs.length }}</span>
-      <span class="tool-status">{{ statusLabel }}</span>
+      <span class="tool-status">{{ toolStatusLabel }}</span>
       <span class="tool-elapsed" v-if="part.elapsed">{{ part.elapsed }}</span>
       <span
         v-if="part.result && shouldFoldResult"
@@ -360,22 +385,27 @@ async function fetchFullResult() {
         <span v-else-if="copyState === 'copied'" class="tool-copy-state">已复制</span>
         <span v-else class="tool-copy-state">失败</span>
       </span>
-      <component :is="open ? ChevronDown : ChevronRight" :size="12" class="tool-caret" />
+      <component
+        v-if="!isQuestionTool || shouldFoldResult"
+        :is="open ? ChevronDown : ChevronRight"
+        :size="12"
+        class="tool-caret"
+      />
     </button>
-    <div v-if="open" class="tool-body">
+    <div v-if="open && hasVisibleBody" class="tool-body">
       <div v-if="contextRefs.length" class="tool-context-refs">
         <span class="tool-section-label">上下文</span>
         <code v-for="ref in contextRefs" :key="ref">{{ ref }}</code>
       </div>
-      <details v-if="part.args && isGenerationTool && toolMediaAssets.length" class="generation-request-details">
+      <details v-if="!isQuestionTool && part.args && isGenerationTool && toolMediaAssets.length" class="generation-request-details">
         <summary>查看生成参数</summary>
         <pre>{{ argsPretty }}</pre>
       </details>
-      <div v-else-if="part.args" class="tool-args">
+      <div v-else-if="!isQuestionTool && part.args" class="tool-args">
         <div class="tool-section-label">参数</div>
         <pre>{{ argsPretty }}</pre>
       </div>
-      <div v-if="part.result" class="tool-result">
+      <div v-if="!isQuestionTool && part.result" class="tool-result">
         <div class="tool-section-label">结果</div>
         <div v-if="toolMediaAssets.length" class="generated-assets">
           <figure v-for="asset in toolMediaAssets" :key="asset.id || asset.url" class="generated-asset">
@@ -469,8 +499,15 @@ async function fetchFullResult() {
 .tool-card.status-warn  { border-left: 3px solid var(--warn-500); }
 .tool-card.status-error { border-left: 3px solid var(--error-500); }
 .tool-card.status-blocked { border-left: 3px solid var(--warn-500); }
-.tool-card.status-blocked { border-left: 3px solid var(--warn-500); }
-.tool-card.status-blocked { border-left: 3px solid var(--warn-500); }
+.tool-card.question-tool { border-left-width: 2px; }
+.tool-card.question-tool .tool-header { cursor: default; }
+.tool-card.question-tool .tool-name {
+  font-family: var(--font-sans);
+  font-weight: 600;
+}
+.tool-card.question-tool .tool-status {
+  margin-left: auto;
+}
 
 .tool-header {
   display: flex;

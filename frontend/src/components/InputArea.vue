@@ -26,7 +26,7 @@ import {
   undoRollback, dismissRollback,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
-  hasQueuedTurns,
+  hasQueuedTurns, markSessionActive,
   currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
 } from '../stores/chat'
 import type { PendingAttachment } from '../stores/chat'
@@ -128,22 +128,57 @@ const reasoningEffortOptions = [
   },
 ]
 
-const planMode = computed(() => {
-  if (!state.currentID) return false
-  return state.sessionMeta[state.currentID]?.plan_mode || false
+const turnModePolicy = computed<api.TurnModePolicy>(() => {
+  if (!state.currentID) return 'auto'
+  const meta = state.sessionMeta[state.currentID] || currentMeta.value
+  return meta?.turn_mode_policy || (meta?.plan_mode ? 'plan' : 'build')
 })
 
 async function togglePlanMode() {
   if (!state.currentID) return
-  const next = !planMode.value
+  const next = nextTurnModePolicy(turnModePolicy.value)
   try {
-    await api.updateSessionMeta(state.currentID, { plan_mode: next })
-    state.sessionMeta[state.currentID] = {
-      ...state.sessionMeta[state.currentID],
-      plan_mode: next,
+    const resp = await api.updateSessionMeta(state.currentID, {
+      turn_mode_policy: next,
+      plan_mode: next === 'plan',
+    })
+    const mode = resp.turn_mode_policy || next
+    const id = state.currentID
+    state.sessionMeta[id] = {
+      ...state.sessionMeta[id],
+      turn_mode_policy: mode,
+      plan_mode: resp.plan_mode ?? mode === 'plan',
+    }
+    const session = state.sessions.find(s => s.id === id)
+    if (session) {
+      session.turn_mode_policy = mode
+      session.plan_mode = resp.plan_mode ?? mode === 'plan'
     }
   } catch {}
 }
+
+function nextTurnModePolicy(policy: api.TurnModePolicy): api.TurnModePolicy {
+  if (policy === 'auto') return 'plan'
+  if (policy === 'plan') return 'build'
+  return 'auto'
+}
+
+const turnModeLabel = computed(() => {
+  if (turnModePolicy.value === 'auto') return '自动'
+  if (turnModePolicy.value === 'plan') return '计划'
+  return '构建'
+})
+const turnModeTitle = computed(() => {
+  if (turnModePolicy.value === 'auto') return '当前：自动选择计划或构建'
+  if (turnModePolicy.value === 'plan') return '当前：计划模式'
+  return '当前：构建模式'
+})
+const turnModeAria = computed(() => `模式：${turnModeLabel.value}，点击切换`)
+const turnModeIcon = computed(() => {
+  if (turnModePolicy.value === 'auto') return Sparkles
+  if (turnModePolicy.value === 'plan') return Clipboard
+  return Hammer
+})
 
 const permissionLevel = computed(() => {
   if (!state.currentID) return 'ask'
@@ -1046,8 +1081,11 @@ async function send() {
       attachments: bubbleAttachments.length ? bubbleAttachments : undefined,
     }
     state.sessionMessages[id].push(optimisticUserMessage)
+    markSessionActive(id, 'message')
     clearAttachments(id)
     notifyManager.unlock()
+  } else {
+    markSessionActive(id, 'pending')
   }
 
   await waitForPendingAttachments(stagedAttachments)
@@ -1071,6 +1109,7 @@ async function send() {
     subAgentModelEnabled: !!meta.sub_agent_model_enabled,
     subAgentProvider: meta.sub_agent_provider || '',
     subAgentModel: meta.sub_agent_model || '',
+    turnModePolicy: meta.turn_mode_policy || turnModePolicy.value,
     todo_mode: todoMode,
     attachments: inlineAttachments,
     active_skills: activeSkills,
@@ -1117,6 +1156,7 @@ async function send() {
       subAgentModelEnabled: !!meta.sub_agent_model_enabled,
       subAgentProvider: meta.sub_agent_provider || '',
       subAgentModel: meta.sub_agent_model || '',
+      turnModePolicy: meta.turn_mode_policy || turnModePolicy.value,
       todoMode,
       attachments: inlineAttachments,
       activeSkills,
@@ -2477,20 +2517,19 @@ watch([() => state.currentID, queueSignature], () => {
 	          </div>
 	        </NPopover>
 
-	        <!-- Plan mode toggle: stays inline because the user
-	             switches it often (planning vs building a feature). -->
-	        <button
-	          type="button"
-	          class="ctrl-btn"
-	          :class="{ 'ctrl-btn--active': planMode }"
-	          :disabled="!state.currentID"
-	          :title="planMode ? '当前：计划模式' : '当前：构建模式'"
-	          :aria-label="planMode ? '切换到构建模式' : '切换到计划模式'"
-	          @click="togglePlanMode"
-	        >
-	          <component :is="planMode ? Clipboard : Hammer" :size="13" />
-	          <span class="ctrl-btn-label">{{ planMode ? '计划' : '构建' }}</span>
-	        </button>
+		        <!-- Turn mode cycles auto / plan / build inline. -->
+		        <button
+		          type="button"
+		          class="ctrl-btn"
+		          :class="{ 'ctrl-btn--active': turnModePolicy !== 'build' }"
+		          :disabled="!state.currentID"
+		          :title="turnModeTitle"
+		          :aria-label="turnModeAria"
+		          @click="togglePlanMode"
+		        >
+		          <component :is="turnModeIcon" :size="13" />
+		          <span class="ctrl-btn-label">{{ turnModeLabel }}</span>
+		        </button>
 
         <!-- Permission picker: icon-only popover. Three
              states map to lock / unlock / key icons. Keeps

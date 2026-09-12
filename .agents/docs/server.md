@@ -87,8 +87,8 @@ Chunk 字段检查顺序（优先级从高到低）:
 
 ### 3. 会话管理
 
-- `ListSessions` — 列出会话（支持 `?project_path=` 过滤）
-- `CreateSession` — 创建会话
+- `ListSessions` — 列出会话（支持 `?project_path=` 过滤），返回 `conversation_state`、`has_user_messages`、`user_message_count`、`pending_turn_count`；`blank` 表示项目内可复用空白草稿。
+- `CreateSession` — 创建会话；请求体可传 `reuse_empty: true`，服务端会在同项目复用最新空白会话，避免多窗口/快速连点创建重复空会话。
 - `GetSession` — 获取单个会话元数据
 - `UpdateSessionMeta` — PATCH 更新 provider/model/style
 - `DeleteSession` — 软删除（标记 archived）

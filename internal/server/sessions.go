@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
@@ -172,16 +173,6 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		return
 	}
 
-	id, err := h.store.NewConversation()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	if req.Title != "" {
-		_ = h.store.RenameConversation(id, req.Title)
-	}
-
 	// Resolve the effective provider/model for this new session.
 	// Priority: request body → configured default provider →
 	// that provider's default model. Validate before persisting
@@ -202,6 +193,36 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model %q not found under provider %q", model, provider)})
 		return
 	}
+	turnModePolicy := agent.NormalizeTurnModePolicy(req.TurnModePolicy, req.PlanMode != nil && *req.PlanMode)
+	if req.TurnModePolicy != "" {
+		var ok bool
+		turnModePolicy, ok = agent.ParseTurnModePolicy(req.TurnModePolicy)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": `turn_mode_policy must be "auto", "plan", or "build"`})
+			return
+		}
+	}
+
+	status := http.StatusCreated
+	var id string
+	var err error
+	if req.ReuseEmpty && strings.TrimSpace(req.Title) == "" {
+		var reused bool
+		id, reused, err = h.store.NewOrReuseBlankConversation(req.ProjectPath)
+		if reused {
+			status = http.StatusOK
+		}
+	} else {
+		id, err = h.store.NewConversation()
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Title != "" {
+		_ = h.store.RenameConversation(id, req.Title)
+	}
 
 	h.setSessionMeta(id, req.Style, provider, model)
 	if req.WorkMode != "" {
@@ -217,11 +238,15 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	if req.VectorStore != "" {
 		_ = h.store.SetConversationVectorStore(id, req.VectorStore)
 	}
-	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil || req.EnabledRecognitionCapabilities != nil || req.EnabledGenerationOperations != nil || req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
+	if req.PlanMode != nil || req.TurnModePolicy != "" || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil || req.EnabledRecognitionCapabilities != nil || req.EnabledGenerationOperations != nil || req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
 		h.metaMu.Lock()
 		m := h.meta[id]
-		if req.PlanMode != nil {
+		if req.TurnModePolicy != "" {
+			m.TurnModePolicy = string(turnModePolicy)
+			m.PlanMode = turnModePolicy == agent.TurnModePlan
+		} else if req.PlanMode != nil {
 			m.PlanMode = *req.PlanMode
+			m.TurnModePolicy = string(agent.NormalizeTurnModePolicy("", *req.PlanMode))
 		}
 		if req.ReasoningEffort != "" {
 			m.ReasoningEffort = req.ReasoningEffort
@@ -263,16 +288,13 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		h.persistSessionMeta(id, m)
 	}
 
-	// Re-fetch and return the full session record.
-	convs := h.store.ListConversations()
-	for _, cv := range convs {
-		if cv.ID == id {
-			c.JSON(http.StatusCreated, h.sessionToResponse(cv))
-			return
-		}
+	cv, err := h.store.GetConversation(id)
+	if err == nil {
+		c.JSON(status, h.sessionToResponse(cv))
+		return
 	}
 	// Shouldn't happen, but fall back to just returning the id.
-	c.JSON(http.StatusCreated, gin.H{"id": id})
+	c.JSON(status, gin.H{"id": id})
 }
 
 func (h *Handler) GetSession(c *gin.Context) {
@@ -780,6 +802,15 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 			return
 		}
 	}
+	var turnModePolicy agent.TurnModePolicy
+	if req.TurnModePolicy != nil {
+		var ok bool
+		turnModePolicy, ok = agent.ParseTurnModePolicy(*req.TurnModePolicy)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": `turn_mode_policy must be "auto", "plan", or "build"`})
+			return
+		}
+	}
 
 	// Validate provider (if specified) before touching meta.
 	provider := h.sessionProvider(id)
@@ -805,6 +836,20 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 	h.setSessionMeta(id, deref(req.Style), provider, model)
 	if req.WorkMode != nil {
 		h.setSessionMetaWorkMode(id, *req.WorkMode)
+	}
+	if req.TurnModePolicy != nil || req.PlanMode != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		if req.TurnModePolicy != nil {
+			m.TurnModePolicy = string(turnModePolicy)
+			m.PlanMode = turnModePolicy == agent.TurnModePlan
+		} else if req.PlanMode != nil {
+			m.PlanMode = *req.PlanMode
+			m.TurnModePolicy = string(agent.NormalizeTurnModePolicy("", *req.PlanMode))
+		}
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
 	}
 
 	// Handle permission level separately — validate and write directly.

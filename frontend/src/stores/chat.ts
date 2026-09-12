@@ -61,6 +61,7 @@ type SessionMetaState = {
   model: string
   title: string
   plan_mode?: boolean
+  turn_mode_policy?: api.TurnModePolicy
   permission_level?: string
   reasoning_effort?: string
   vector_store?: string
@@ -218,18 +219,19 @@ export const state = reactive({
   // flag had to go.
   pendingQuestion: {} as Record<string, { questions: QuestionItem[] }>,
   pendingConfirm: {} as Record<string, Array<{
-  toolName: string
-  args: string
-  reason: string
-  // 2026-07: extended ConfirmRequest fields. All optional
-  // for backward-compat with old server versions that
-  // don't emit them.
-  resolvedPath?: string
-  pathClass?: string
-  riskLevel?: string
-  resolve: (action: api.ConfirmAction) => void
-}>>,
+    toolName: string
+    args: string
+    reason: string
+    // 2026-07: extended ConfirmRequest fields. All optional
+    // for backward-compat with old server versions that
+    // don't emit them.
+    resolvedPath?: string
+    pathClass?: string
+    riskLevel?: string
+    resolve: (action: api.ConfirmAction) => void
+  }>>,
   pendingPlanText: {} as Record<string, string>,
+  turnPlanReview: {} as Record<string, boolean>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
   projects: [] as ProjectItem[],
@@ -395,6 +397,7 @@ function upsertTurnQueueItem(sessionId: string, item: TurnQueueItem) {
     next.push(item)
   }
   state.turnQueue[sessionId] = sortTurnQueueItems(next)
+  setSessionPendingTurnCount(sessionId, state.turnQueue[sessionId].length)
 }
 
 export function hasQueuedTurns(sessionId: string): boolean {
@@ -424,6 +427,7 @@ export async function loadTurnQueue(sessionId: string): Promise<TurnQueueItem[]>
     const response = await api.listTurnQueue(sessionId)
     const items = sortTurnQueueItems(response.items || [])
     state.turnQueue[sessionId] = items
+    setSessionPendingTurnCount(sessionId, items.length)
     return items
   } catch (e) {
     console.warn('loadTurnQueue failed:', e)
@@ -436,6 +440,7 @@ export async function loadTurnQueue(sessionId: string): Promise<TurnQueueItem[]>
 export async function enqueueTurnQueue(sessionId: string, payload: TurnQueuePayload): Promise<TurnQueueItem> {
   const response = await api.enqueueTurnQueueItem(sessionId, payload)
   upsertTurnQueueItem(sessionId, response.item)
+  markSessionActive(sessionId, 'pending')
   return response.item
 }
 
@@ -478,6 +483,7 @@ export async function deleteQueuedTurn(sessionId: string, queueId: number): Prom
 export async function clearQueuedTurns(sessionId: string): Promise<void> {
   await api.clearTurnQueue(sessionId)
   state.turnQueue[sessionId] = (state.turnQueue[sessionId] || []).filter(item => item.status === 'running')
+  setSessionPendingTurnCount(sessionId, state.turnQueue[sessionId].length)
 }
 
 export function setSessionBackgroundHookMerging(id: string, merging: boolean) {
@@ -529,6 +535,7 @@ export const currentMeta = computed(() => {
     model: def?.model || '',
     title: '',
     plan_mode: false,
+    turn_mode_policy: 'auto' as api.TurnModePolicy,
     permission_level: state.lastPermissionLevel || 'ask',
     reasoning_effort: 'off',
     vector_store: '',
@@ -609,6 +616,81 @@ let _loadedSeq = 0
 // the user can still scroll older pages back in via the infinite
 // scroller.
 const MAX_MESSAGES_PER_SESSION = 300
+
+function normalizeProjectPath(path: string): string {
+  const trimmed = path.trim().replace(/[\\/]+$/, '')
+  if (!trimmed) return ''
+  const normalized = trimmed.replace(/\//g, '\\')
+  if (/^[a-zA-Z]:\\/.test(normalized) || normalized.startsWith('\\\\')) {
+    return normalized.toLowerCase()
+  }
+  return normalized
+}
+
+function isBlankSessionRecord(session: Session): boolean {
+  return session.conversation_state === 'blank'
+    && !session.id.startsWith('im:')
+    && !session.has_user_messages
+    && (session.user_message_count || 0) === 0
+    && (session.pending_turn_count || 0) === 0
+}
+
+function collapseBlankSessions(sessions: Session[]): Session[] {
+  const seenBlankProjects = new Set<string>()
+  const out: Session[] = []
+  for (const session of sessions) {
+    if (isBlankSessionRecord(session)) {
+      const key = normalizeProjectPath(session.project_path || '')
+      if (seenBlankProjects.has(key)) continue
+      seenBlankProjects.add(key)
+    }
+    out.push(session)
+  }
+  return out
+}
+
+function forEachSessionRecord(id: string, visit: (session: Session) => void) {
+  const seen = new Set<Session>()
+  for (const session of state.sessions) {
+    if (session.id === id && !seen.has(session)) {
+      seen.add(session)
+      visit(session)
+    }
+  }
+  for (const sessions of Object.values(state.projectSessions)) {
+    for (const session of sessions) {
+      if (session.id === id && !seen.has(session)) {
+        seen.add(session)
+        visit(session)
+      }
+    }
+  }
+}
+
+function setSessionPendingTurnCount(id: string, count: number) {
+  forEachSessionRecord(id, (session) => {
+    session.pending_turn_count = Math.max(0, count)
+    const hasUser = !!session.has_user_messages || (session.user_message_count || 0) > 0
+    if (!session.id.startsWith('im:') && !hasUser && session.pending_turn_count === 0) {
+      session.conversation_state = 'blank'
+    } else {
+      session.conversation_state = 'active'
+    }
+  })
+}
+
+export function markSessionActive(id: string, source: 'message' | 'pending' = 'message') {
+  if (!id) return
+  forEachSessionRecord(id, (session) => {
+    if (source === 'message') {
+      session.has_user_messages = true
+      session.user_message_count = Math.max(1, session.user_message_count || 0)
+    } else {
+      session.pending_turn_count = Math.max(1, session.pending_turn_count || 0)
+    }
+    session.conversation_state = 'active'
+  })
+}
 
 // capSessionMessages trims sessionMessages[id] to the cap and
 // advances the paging cursor past the dropped rows. Call it after
@@ -720,13 +802,14 @@ async function releaseViewLoad(startedAt: number, minMs: number): Promise<void> 
 export async function loadSessions() {
   const projectPath = state.activeProjectPath
   const { sessions } = await api.listSessions(projectPath)
-  state.projectSessions[projectPath] = sessions
+  const visibleSessions = collapseBlankSessions(sessions)
+  state.projectSessions[projectPath] = visibleSessions
   if (state.activeProjectPath !== projectPath) return
-  state.sessions = sessions
-  const currentInProject = !!state.currentID && sessions.some(s => s.id === state.currentID)
+  state.sessions = visibleSessions
+  const currentInProject = !!state.currentID && visibleSessions.some(s => s.id === state.currentID)
   if (!currentInProject) {
     const last = state.lastSessionByProject[projectPath] || readLastSession(projectPath)
-    const next = sessions.find(s => s.id === last)?.id || sessions[0]?.id || ''
+    const next = visibleSessions.find(s => s.id === last)?.id || visibleSessions[0]?.id || ''
     state.currentID = ''
     if (next) await switchSession(next)
   } else {
@@ -890,6 +973,7 @@ async function switchSessionBody(id: string) {
       model:     s.model || '',
       title:     s.title || '',
       plan_mode: s.plan_mode || false,
+      turn_mode_policy: s.turn_mode_policy || (s.plan_mode ? 'plan' : 'build'),
       permission_level: s.permission_level || 'ask',
       reasoning_effort: s.reasoning_effort || 'off',
       vector_store: s.vector_store || '',
@@ -1051,11 +1135,13 @@ function buildCreateSessionOptions(): api.CreateSessionOptions {
   const enabledCapabilities = requestedCapabilities.filter(kind => state.recognitionCapabilitiesAvailable.includes(kind))
   return {
     project_path: state.activeProjectPath || '',
+    reuse_empty: true,
     work_mode: meta.workMode || state.globalWorkMode || 'coding',
     provider: meta.provider || '',
     model: meta.model || '',
     style: inheritedStyle,
     plan_mode: !!meta.plan_mode,
+    turn_mode_policy: meta.turn_mode_policy || (meta.plan_mode ? 'plan' : 'build'),
     permission_level: normalizePermissionLevel(meta.permission_level || state.lastPermissionLevel),
     reasoning_effort: meta.reasoning_effort || 'off',
     vector_store: meta.vector_store || '',
@@ -1096,12 +1182,18 @@ export async function createSession(): Promise<string> {
     title: '(新会话)',
     created_at: Date.now() / 1000,
     updated_at: Date.now() / 1000,
+    conversation_state: 'blank',
+    has_user_messages: false,
+    user_message_count: 0,
+    pending_turn_count: 0,
   }
-  // If the server returned a session with the
-  // already-resolved title (it does — sessionToResponse
-  // always returns the persisted title), use it; otherwise
-  // keep the placeholder.
-  state.sessions.unshift(fresh)
+  // The server may return an existing blank session when
+  // reuse_empty is true. Replace any stale local copy instead of
+  // inserting a duplicate row.
+  state.sessions = collapseBlankSessions([
+    fresh,
+    ...state.sessions.filter(s => s.id !== fresh.id),
+  ])
   state.projectSessions[state.activeProjectPath] = state.sessions
   await switchSession(id)
   return id
@@ -1127,6 +1219,7 @@ export async function deleteSessionById(id: string) {
   delete state.turnQueue[id]
   delete state.turnQueueLoading[id]
   delete state.turnQueueDraining[id]
+  delete state.turnPlanReview[id]
   delete state.turnQueueEditing[id]
   delete state.sessionWorking[id]
   delete state.sessionBackgroundSubAgentJobs[id]
@@ -1179,6 +1272,8 @@ export async function renameSession(id: string, title: string) {
     s.work_mode = resp.work_mode ?? s.work_mode
     s.provider = resp.provider ?? s.provider
     s.model = resp.model ?? s.model
+    s.plan_mode = resp.plan_mode ?? s.plan_mode
+    s.turn_mode_policy = resp.turn_mode_policy ?? s.turn_mode_policy
     s.use_image_recognition = resp.use_image_recognition ?? s.use_image_recognition
     s.enabled_recognition_capabilities = resp.enabled_recognition_capabilities ?? s.enabled_recognition_capabilities
     s.enabled_generation_operations = resp.enabled_generation_operations ?? s.enabled_generation_operations
@@ -1194,6 +1289,8 @@ export async function renameSession(id: string, title: string) {
       workMode: resp.work_mode ?? state.sessionMeta[id].workMode,
       provider: resp.provider ?? state.sessionMeta[id].provider,
       model: resp.model ?? state.sessionMeta[id].model,
+      plan_mode: resp.plan_mode ?? state.sessionMeta[id].plan_mode,
+      turn_mode_policy: resp.turn_mode_policy ?? state.sessionMeta[id].turn_mode_policy,
       permission_level: resp.permission_level ?? state.sessionMeta[id].permission_level,
       reasoning_effort: resp.reasoning_effort ?? state.sessionMeta[id].reasoning_effort,
       vector_store: resp.vector_store ?? state.sessionMeta[id].vector_store,
@@ -1590,12 +1687,14 @@ export function appendLocalUserMessage(sessionId: string, message: Message) {
   if (!sessionId) return
   if (!state.sessionMessages[sessionId]) state.sessionMessages[sessionId] = []
   state.sessionMessages[sessionId].push(message)
+  markSessionActive(sessionId, 'message')
   capSessionMessages(sessionId)
   state.streamRevision[sessionId] = (state.streamRevision[sessionId] || 0) + 1
 }
 
 export function startStream(id: string, ctrl: AbortController) {
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
+  delete state.turnPlanReview[id]
   // Push a placeholder assistant message immediately. The
   // MessageBubble's loading-dots placeholder requires the
   // message object to exist *before* the first content
@@ -2259,9 +2358,9 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             p.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
             p.error = ev.tool_error
             p.elapsed = ev.tool_elapsed
-	            if (ev.tool_args) p.args = ev.tool_args
-	            if (ev.tool_context_refs) p.context_refs = ev.tool_context_refs
-	            // Server-side truncation marker: the full body (>32
+              if (ev.tool_args) p.args = ev.tool_args
+              if (ev.tool_context_refs) p.context_refs = ev.tool_context_refs
+              // Server-side truncation marker: the full body (>32
             // KiB) must be fetched on demand, never stored here.
             if (ev.tool_result_truncated) {
               ;(p as any).result_truncated = true
@@ -2282,10 +2381,10 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             result: dataURLToBlobURL(ev.tool_result_full || ev.tool_result),
             error: ev.tool_error,
             elapsed: ev.tool_elapsed,
-	            result_truncated: ev.tool_result_truncated || undefined,
-	            result_full_len: ev.tool_result_full_len,
-	            context_refs: ev.tool_context_refs,
-	          })
+              result_truncated: ev.tool_result_truncated || undefined,
+              result_full_len: ev.tool_result_full_len,
+              context_refs: ev.tool_context_refs,
+            })
         }
         // Enforce the screenshot cap as each image arrives rather
         // than waiting for `done`; a cancelled task otherwise keeps
@@ -2367,8 +2466,11 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     }
-    case 'phase':
-      // Sub-agent lifecycle: open / close the nested card.
+	    case 'phase':
+	      if (!ev.sub_agent && ev.phase === 'plan' && (ev.step === 'plan-mode' || ev.step === 'auto-plan')) {
+	        state.turnPlanReview[id] = true
+	      }
+	      // Sub-agent lifecycle: open / close the nested card.
       // The sub-agent runner emits synthetic start/ok/err
       // phase events with sub_agent=true and
       // sub_agent_status set. These are routed through
@@ -2493,12 +2595,13 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
 
       // Plan mode: when the stream ends in plan mode, capture
       // the plan text for review before execution.
-      if (!sub && state.sessionMeta[id]?.plan_mode) {
-        const planText = assembleTextContent(m.parts)
-        if (planText) {
-          state.pendingPlanText[id] = planText
-        }
-      }
+	      if (!sub && (state.sessionMeta[id]?.plan_mode || state.turnPlanReview[id])) {
+	        const planText = assembleTextContent(m.parts)
+	        if (planText) {
+	          state.pendingPlanText[id] = planText
+	        }
+	      }
+	      delete state.turnPlanReview[id]
       // P4-x: turn finished — refresh the TopBar context badge
       // so the estimate reflects the tokens this turn added.
       void refreshContextUsage(id)

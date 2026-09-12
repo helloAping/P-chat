@@ -1,4 +1,4 @@
-﻿// Lightweight HTTP client for the pchat-server API.
+// Lightweight HTTP client for the pchat-server API.
 // All requests are JSON unless noted. The streaming endpoint
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
@@ -71,6 +71,7 @@ async function waitForDirectBackend(): Promise<string> {
 }
 
 export type ModelType = 'llm' | 'media_generation'
+export type TurnModePolicy = 'auto' | 'plan' | 'build'
 
 export type GenerationOperation =
   | 'text_to_image'
@@ -116,7 +117,12 @@ export interface Session {
   provider?: string
   model?: string
   project_path?: string
+  conversation_state?: 'blank' | 'active' | string
+  has_user_messages?: boolean
+  user_message_count?: number
+  pending_turn_count?: number
   plan_mode?: boolean
+  turn_mode_policy?: TurnModePolicy
   permission_level?: string
   reasoning_effort?: string
   vector_store?: string
@@ -195,12 +201,12 @@ export type MessagePart =
       // result_truncated is true when the server omitted the full
       // payload (>32 KiB) and the full body must be fetched on
       // demand via getToolResult.
-	      result_truncated?: boolean
-	      // result_full_len is the byte length of the untruncated
-	      // result, for labeling the "查看完整输出" affordance.
-	      result_full_len?: number
-	      context_refs?: string[]
-	    }
+        result_truncated?: boolean
+        // result_full_len is the byte length of the untruncated
+        // result, for labeling the "查看完整输出" affordance.
+        result_full_len?: number
+        context_refs?: string[]
+      }
   | {
       kind: 'sub_agent'
       task: string
@@ -343,6 +349,7 @@ export interface SessionMeta {
   model: string
   project_path?: string
   plan_mode?: boolean
+  turn_mode_policy?: TurnModePolicy
   permission_level?: string
   created_at: number
   updated_at: number
@@ -357,6 +364,7 @@ export interface UpdateSessionMetaResponse {
   provider?: string
   model?: string
   plan_mode?: boolean
+  turn_mode_policy?: TurnModePolicy
   permission_level?: string
   reasoning_effort?: string
   vector_store?: string
@@ -437,11 +445,13 @@ export const getSession = (id: string) =>
 
 export interface CreateSessionOptions {
   project_path?: string
+  reuse_empty?: boolean
   work_mode?: string
   provider?: string
   model?: string
   style?: string
   plan_mode?: boolean
+  turn_mode_policy?: TurnModePolicy
   permission_level?: string
   reasoning_effort?: string
   vector_store?: string
@@ -473,7 +483,7 @@ export const renameSession = (id: string, title: string) =>
 
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; turn_mode_policy: TurnModePolicy; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -1295,6 +1305,7 @@ export interface SendOptions {
   subAgentModelEnabled?: boolean
   subAgentProvider?: string
   subAgentModel?: string
+  turnModePolicy?: TurnModePolicy
   // Inline attachments carry the bytes up front so the message
   // is self-contained: the chat bubble shows the image
   // immediately, the backend doesn't need to re-read the file
@@ -1328,6 +1339,7 @@ export interface TurnQueuePayload {
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
+  turn_mode_policy?: TurnModePolicy
   skill_context?: string
   active_skills?: string[]
 }
@@ -1368,6 +1380,7 @@ type SendPayloadSource = Pick<SendOptions,
   | 'subAgentModelEnabled'
   | 'subAgentProvider'
   | 'subAgentModel'
+  | 'turnModePolicy'
   | 'skill_context'
   | 'active_skills'
 >
@@ -1391,6 +1404,7 @@ export function sendPayloadFromOptions(opts: SendPayloadSource): TurnQueuePayloa
     sub_agent_model_enabled: opts.subAgentModelEnabled,
     sub_agent_provider: opts.subAgentProvider,
     sub_agent_model: opts.subAgentModel,
+    turn_mode_policy: opts.turnModePolicy,
     skill_context: opts.skill_context || '',
     active_skills: opts.active_skills?.filter(Boolean) || [],
   }
@@ -1503,10 +1517,10 @@ export interface StreamEvent {
   // Structured tool result metadata. These fields supplement the legacy
   // display preview above and remain optional for older servers.
   tool_call_status?: 'ok' | 'error' | 'blocked' | 'waiting' | string
-	  tool_summary?: string
-	  tool_changed_paths?: string[]
-	  tool_context_refs?: string[]
-	  tool_retryable?: boolean
+    tool_summary?: string
+    tool_changed_paths?: string[]
+    tool_context_refs?: string[]
+    tool_retryable?: boolean
   tool_requires_user?: boolean
   tool_next_action?: string
   // tool_args is the JSON-encoded arguments string the tool

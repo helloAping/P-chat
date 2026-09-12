@@ -1193,6 +1193,10 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		provider = h.getCfg().LLM.Default
 	}
 	model := h.sessionModel(cv.ID, provider)
+	state := "active"
+	if !strings.HasPrefix(cv.ID, "im:") && cv.UserMessageCount == 0 && cv.PendingTurnCount == 0 {
+		state = "blank"
+	}
 	return SessionResponse{
 		ID:                             cv.ID,
 		Title:                          imConversationResponseTitle(cv.ID, cv.Title),
@@ -1201,8 +1205,13 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		Style:                          m.Style,
 		WorkMode:                       string(h.sessionWorkMode(cv.ID)),
 		ProjectPath:                    m.ProjectPath,
-		PlanMode:                       m.PlanMode,
-		PermissionLevel:                m.PermissionLevel,
+		ConversationState:              state,
+		HasUserMessages:                cv.UserMessageCount > 0,
+			UserMessageCount:               cv.UserMessageCount,
+			PendingTurnCount:               cv.PendingTurnCount,
+			PlanMode:                       m.PlanMode,
+			TurnModePolicy:                 string(agent.NormalizeTurnModePolicy(m.TurnModePolicy, m.PlanMode)),
+			PermissionLevel:                m.PermissionLevel,
 		ReasoningEffort:                m.ReasoningEffort,
 		VectorStore:                    cv.VectorStore,
 		KnowledgeBase:                  m.KnowledgeBase,

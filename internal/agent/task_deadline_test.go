@@ -46,6 +46,11 @@ func TestChatWithTools_TaskContinuesPastTurnDeadlineOnAbortContext(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	turnCtx, turnCancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
+	defer turnCancel()
+	abortCtx, abortCancel := context.WithCancel(context.Background())
+	defer abortCancel()
+
 	registry := tool.NewRegistry()
 	var sawDeadline atomic.Bool
 	registry.Register(tool.Tool{
@@ -55,7 +60,12 @@ func TestChatWithTools_TaskContinuesPastTurnDeadlineOnAbortContext(t *testing.T)
 		if _, ok := ctx.Deadline(); ok {
 			sawDeadline.Store(true)
 		}
-		time.Sleep(700 * time.Millisecond)
+		// 取消父 turn ctx 发生在 task 已经开始之后；如果 task 没有切换到
+		// abortCtx，父回合会提前结束，后续 summary 请求不会发生。
+		// Cancel the parent turn after the task starts. Without detaching to
+		// abortCtx, the parent loop exits before it can request the final summary.
+		turnCancel()
+		time.Sleep(250 * time.Millisecond)
 		return &tool.CallResult{Content: "slow task result"}, nil
 	})
 
@@ -65,10 +75,6 @@ func TestChatWithTools_TaskContinuesPastTurnDeadlineOnAbortContext(t *testing.T)
 	agt.SetSkillManager(&recordingSkillManager{load: func(skill.LoadRequest) (skill.LoadedSkill, error) {
 		return skill.LoadedSkill{}, nil
 	}})
-	turnCtx, turnCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer turnCancel()
-	abortCtx, abortCancel := context.WithCancel(context.Background())
-	defer abortCancel()
 
 	var got strings.Builder
 	for chunk := range agt.ChatWithTools(WithAbortContext(turnCtx, abortCtx), ChatRequest{

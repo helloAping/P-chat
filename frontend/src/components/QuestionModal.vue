@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { NButton, NRadio, NCheckbox, NTag, NInput } from 'naive-ui'
+import { NButton, NRadio, NCheckbox, NInput } from 'naive-ui'
 import { submitQuestionAnswer, currentPendingQuestion } from '../stores/chat'
 import { ArrowUp, MessageSquare } from './icons'
 
@@ -62,6 +62,15 @@ function isSelected(value: string): boolean {
   return answers.value[key] === value
 }
 
+function ensureOption(value: string) {
+  if (!isSelected(value)) selectOption(value)
+}
+
+function isQuestionAnswered(q: { question: string; multi_select?: boolean }): boolean {
+  if (q.multi_select) return (multiAnswers.value[q.question] || []).length > 0
+  return !!answers.value[q.question]
+}
+
 function canProceed(): boolean {
   const q = currentQuestion.value
   if (!q) return false
@@ -105,13 +114,19 @@ function submit() {
   submitQuestionAnswer(all)
 }
 
-const displayOptions = computed(() => {
+const regularOptions = computed(() => {
   const q = currentQuestion.value
   if (!q) return []
-  return [
-    ...q.options.map(opt => ({ ...opt, value: opt.label, isCustom: false })),
-    { label: '自定义', description: '输入自己的答案', value: CUSTOM_VALUE, isCustom: true },
-  ]
+  return q.options.map(opt => ({ ...opt, value: opt.label }))
+})
+
+/** Show question text once; skip duplicate header echo. */
+const promptText = computed(() => {
+  const q = currentQuestion.value
+  if (!q) return ''
+  const text = (q.question || '').trim()
+  if (!text || text === q.header) return q.header
+  return text
 })
 </script>
 
@@ -125,11 +140,10 @@ const displayOptions = computed(() => {
     >
       <header class="qmodal-header">
         <div class="qmodal-title-wrap">
-          <MessageSquare :size="18" class="qmodal-header-icon" />
-          <div class="qmodal-title-copy">
-            <span id="qmodal-title">LLM 的提问</span>
-            <span class="qmodal-subtitle">回答前仍可滚动查看上方上下文</span>
-          </div>
+          <MessageSquare :size="14" class="qmodal-header-icon" />
+          <span id="qmodal-title" class="qmodal-title">需要你确认</span>
+          <span v-if="questions.length > 1" class="qmodal-progress">{{ currentIndex + 1 }}/{{ questions.length }}</span>
+          <span v-if="currentQuestion?.multi_select" class="qmulti">多选</span>
         </div>
         <NButton
           size="tiny"
@@ -142,73 +156,94 @@ const displayOptions = computed(() => {
         </NButton>
       </header>
 
-      <div class="qnav">
-        <NTag
+      <div v-if="questions.length > 1" class="qnav">
+        <button
           v-for="(q, i) in questions"
           :key="i"
-          :type="i === currentIndex ? 'primary' : 'default'"
-          size="small"
-          class="qnav-tag"
-          :class="{ 'qnav-answered': answers[q.question] || (q.multi_select && multiAnswers[q.question]?.length) }"
+          type="button"
+          class="qnav-chip"
+          :class="{ 'qnav-active': i === currentIndex, 'qnav-answered': isQuestionAnswered(q) }"
+          :title="q.header"
           @click="currentIndex = i"
         >
+          <span class="qnav-dot" aria-hidden="true" />
           {{ q.header }}
-        </NTag>
+        </button>
       </div>
 
       <div v-if="currentQuestion" class="qbody">
-        <div class="qtext">
-          {{ currentQuestion.question }}
-          <span v-if="currentQuestion.multi_select" class="qmulti">（多选）</span>
-        </div>
+        <div class="qprompt">{{ promptText }}</div>
+
         <div class="qopts">
           <div
-            v-for="opt in displayOptions"
+            v-for="opt in regularOptions"
             :key="opt.value"
             class="qopt"
-            :class="{
-              'qopt-sel': isSelected(opt.value),
-              'qopt-custom-row': opt.isCustom,
-              'qopt-span': opt.isCustom && isSelected(opt.value),
-            }"
-            :title="opt.description"
+            :class="{ 'qopt-sel': isSelected(opt.value) }"
+            role="button"
+            tabindex="0"
+            :title="opt.description || opt.label"
             @click="selectOption(opt.value)"
+            @keydown.enter.prevent="selectOption(opt.value)"
+            @keydown.space.prevent="selectOption(opt.value)"
           >
             <NRadio
               v-if="!currentQuestion.multi_select"
               :checked="isSelected(opt.value)"
-              class="qopt-radio"
+              tabindex="-1"
+              class="qopt-ctrl"
             />
             <NCheckbox
               v-else
               :checked="isSelected(opt.value)"
-              class="qopt-check"
+              tabindex="-1"
+              class="qopt-ctrl"
             />
-            <div class="qopt-body">
-              <div class="qopt-line">
-                <span class="qopt-label">{{ opt.label }}</span>
-                <span v-if="opt.description" class="qopt-desc">{{ opt.description }}</span>
-              </div>
-              <div
-                v-if="opt.isCustom && isSelected(opt.value)"
-                class="qopt-custom"
-                @click.stop
-              >
-                <NInput
-                  v-model:value="customInputs[currentQuestion.question]"
-                  size="small"
-                  placeholder="请输入自定义内容..."
-                  :autofocus="true"
-                />
-              </div>
-            </div>
+            <span class="qopt-label">{{ opt.label }}</span>
           </div>
+        </div>
+
+        <div
+          class="qcustom"
+          :class="{ 'qcustom-sel': isSelected(CUSTOM_VALUE) }"
+          @click="ensureOption(CUSTOM_VALUE)"
+        >
+          <button
+            type="button"
+            class="qcustom-toggle"
+            @click.stop="selectOption(CUSTOM_VALUE)"
+          >
+            <NRadio
+              v-if="!currentQuestion.multi_select"
+              :checked="isSelected(CUSTOM_VALUE)"
+              tabindex="-1"
+              class="qopt-ctrl"
+            />
+            <NCheckbox
+              v-else
+              :checked="isSelected(CUSTOM_VALUE)"
+              tabindex="-1"
+              class="qopt-ctrl"
+            />
+            <span class="qcustom-label">其他</span>
+          </button>
+          <NInput
+            v-if="isSelected(CUSTOM_VALUE)"
+            v-model:value="customInputs[currentQuestion.question]"
+            size="tiny"
+            placeholder="输入自定义回答…"
+            :autofocus="true"
+            class="qcustom-input"
+            @click.stop
+            @focus="ensureOption(CUSTOM_VALUE)"
+            @keydown.enter.stop
+          />
         </div>
       </div>
 
       <footer class="qmodal-footer">
-        <NButton v-if="currentIndex > 0" @click="prev" size="small">上一步</NButton>
-        <NButton type="primary" @click="next" :disabled="!canProceed()" size="small">
+        <NButton v-if="currentIndex > 0" size="tiny" @click="prev">上一步</NButton>
+        <NButton type="primary" size="tiny" :disabled="!canProceed()" @click="next">
           {{ isLast ? '提交' : '下一步' }}
         </NButton>
       </footer>
@@ -219,21 +254,22 @@ const displayOptions = computed(() => {
 <style scoped>
 .question-dock {
   flex: 0 0 auto;
-  margin: 0 var(--space-4) var(--space-2);
-  max-height: min(42vh, 420px);
+  margin: 0 var(--space-3) var(--space-2);
+  max-height: min(38vh, 360px);
   display: flex;
   flex-direction: column;
-  padding: var(--space-4);
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   background: var(--surface-1);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
 }
 .qmodal-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-3);
+  gap: var(--space-2);
   flex-shrink: 0;
 }
 .qmodal-title-wrap {
@@ -241,123 +277,209 @@ const displayOptions = computed(() => {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  flex-wrap: wrap;
 }
-.qmodal-title-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  font-size: 16px;
+.qmodal-title {
+  font-size: 12.5px;
   font-weight: 600;
   color: var(--text-primary);
 }
 .qmodal-header-icon { color: var(--brand-500); }
-.qmodal-subtitle {
+.qmodal-progress {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
   color: var(--text-tertiary);
-  font-size: 11.5px;
-  font-weight: 400;
-  line-height: 1.35;
+  font: 500 11px/1 var(--font-mono);
+}
+.qmulti {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--brand-50);
+  color: var(--brand-500);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
 }
 .qnav {
   display: flex;
-  gap: var(--space-2);
+  gap: 4px;
   flex-wrap: wrap;
-  margin: var(--space-3) 0;
   flex-shrink: 0;
 }
-.qnav-tag {
+.qnav-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 120px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-tertiary);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
   cursor: pointer;
-  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
 }
-.qnav-answered {
-  opacity: 1;
+.qnav-chip:hover {
+  border-color: var(--border-default);
+  color: var(--text-secondary);
+}
+.qnav-chip.qnav-active {
+  border-color: var(--brand-100);
+  background: var(--brand-50);
+  color: var(--brand-600);
+}
+.qnav-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--border-default);
+  flex-shrink: 0;
+}
+.qnav-answered .qnav-dot,
+.qnav-active .qnav-dot {
+  background: currentColor;
 }
 .qbody {
   min-height: 0;
+  flex: 1 1 auto;
   overflow: auto;
-  padding-right: var(--space-1);
+  overscroll-behavior: contain;
 }
-.qtext {
-  font-size: 14px;
-  font-weight: 600;
+.qprompt {
+  margin: 0 0 var(--space-2);
   color: var(--text-primary);
-  margin-bottom: var(--space-3);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
 }
-.qmulti {
-  font-weight: 400;
-  color: var(--text-tertiary);
-  font-size: 12px;
-}
+
+/* Dense option grid — single-line chips; desc via title tooltip. */
 .qopts {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr));
-  gap: var(--space-2);
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 6px;
 }
 .qopt {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  cursor: pointer;
+  gap: 6px;
   min-width: 0;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
   transition:
     border-color var(--dur-fast) var(--ease-out),
     background var(--dur-fast) var(--ease-out);
 }
-.qopt:hover,
+.qopt:hover {
+  border-color: var(--border-default);
+  background: var(--surface-3);
+}
 .qopt-sel {
-  border-color: var(--brand-500);
+  border-color: var(--brand-100);
   background: var(--brand-50);
 }
-.qopt-custom-row {
-  border-style: dashed;
-}
-/* Custom input row spans the full grid width once opened, so the
-   input isn't squashed into a half-width cell. */
-.qopt-span {
-  grid-column: 1 / -1;
-}
-.qopt-radio,
-.qopt-check {
+.qopt-ctrl {
   flex-shrink: 0;
-  margin-top: 0;
-}
-.qopt-body {
-  flex: 1;
-  min-width: 0;
-}
-.qopt-line {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-  min-width: 0;
+  pointer-events: none;
 }
 .qopt-label {
-  font-size: 13.5px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12.5px;
   font-weight: 500;
-  color: var(--text-primary);
+  line-height: 1.3;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.qopt-desc {
-  font-size: 12px;
-  color: var(--text-tertiary);
+.qopt-sel .qopt-label { font-weight: 600; }
+
+.qcustom {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: 6px;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+.qcustom:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-3);
+}
+.qcustom.qcustom-sel {
+  border-color: var(--brand-100);
+  border-style: solid;
+  background: var(--brand-50);
+}
+.qcustom-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  cursor: pointer;
+}
+.qcustom-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.qcustom-input {
   flex: 1;
   min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.qopt-custom {
-  margin-top: var(--space-2);
 }
 .qmodal-footer {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: var(--space-2);
-  margin-top: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
   flex-shrink: 0;
+}
+@media (max-width: 720px) {
+  .question-dock {
+    margin-inline: var(--space-2);
+    max-height: min(46vh, 400px);
+  }
+  .qopts {
+    grid-template-columns: 1fr;
+  }
 }
 .question-dock-enter-active {
   transition:

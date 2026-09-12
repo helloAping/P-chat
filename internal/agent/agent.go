@@ -1324,6 +1324,9 @@ type ChatRequest struct {
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools.
 	PlanMode bool `json:"plan_mode,omitempty"`
+	// TurnModePolicy controls whether this turn is routed as auto/plan/build.
+	// Empty keeps the legacy PlanMode boolean behavior.
+	TurnModePolicy TurnModePolicy `json:"turn_mode_policy,omitempty"`
 	// ReasoningEffort controls how much reasoning/thinking the LLM
 	// does before responding. off|low|medium|high|max. Empty means
 	// the model default.
@@ -2317,6 +2320,22 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		historyCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
 		history := req.Messages[:historyCount]
 		newMessages := req.Messages[historyCount:]
+		turnModePolicy := NormalizeTurnModePolicy(string(req.TurnModePolicy), req.PlanMode)
+		effectivePlanMode, turnModeReason := a.resolveTurnPlanMode(ctx, req)
+		req.PlanMode = effectivePlanMode
+		if turnModePolicy == TurnModeAuto {
+			step := "auto-build"
+			label := "构建"
+			if req.PlanMode {
+				step = "auto-plan"
+				label = "计划"
+			}
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+				Phase:   "plan",
+				Step:    step,
+				Message: fmt.Sprintf("自动模式选择：%s（%s）", label, turnModeReason),
+			})
+		}
 		// When knowledge base is off, strip wiki-related messages
 		// (tool calls + results) from history so the LLM doesn't
 		// learn about wiki tools from previous turns
@@ -2434,10 +2453,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		a.appendRuntimeContext(&msgs, req, "memory", a.getStyleMemory(req.Style))
 		a.appendRuntimeContext(&msgs, req, "media", a.buildRecentMediaContextBlock(req.SessionID))
 
-		// Plan mode: the LLM can use `todo_write` to break down
-		// the analysis into steps, and `question` to clarify vague
-		// requirements. Other tools are disabled — Plan Mode is
-		// for planning, not executing.
+		// Plan mode produces a reviewable text plan only. PlanExplore
+		// (read-only tools + todo/question) is a later, separate slice.
 		//
 		// Build mode uses a soft cap (MaxRoundsDefault) instead of
 		// "unlimited". The LLM normally terminates by emitting no
@@ -2463,17 +2480,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 		longRunMode = config.NormalizeTodoLongRunMode(longRunMode)
 		if req.PlanMode {
-			var planTools []llm.ToolDef
-			for _, t := range toolDefs {
-				if t.Name == "todo_write" || t.Name == "question" {
-					planTools = append(planTools, t)
-				}
-			}
-			toolDefs = planTools
+			toolDefs = nil
 			msgs[0].Content += "\n\n---\n\n## Plan Mode\n\n" +
-				"你正在 PLAN MODE：不要调用任何执行类工具 (exec_command, write_file, task 等)。\n" +
-				"你可以使用 `todo_write` 将分析/计划拆分为步骤，\n" +
-				"也可以使用 `question` 向用户澄清模糊需求。\n" +
+				"你正在 PLAN MODE：不要调用任何工具；本轮只输出可审核的文字计划。\n" +
 				"请给出 step-by-step 执行计划：\n" +
 				"1. 每一步做什么\n" +
 				"2. 每一步预期使用什么工具 (read_file, write_file, exec_command, list_files, task 等)\n" +
@@ -2481,7 +2490,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				"4. 风险 / 依赖 / 边界\n" +
 				"用户审阅后切换回构建模式执行。\n"
 			maxRounds = 1
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用 (可用 todo_write / question，最多单轮)"})
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "plan", Step: "plan-mode", Message: "Plan Mode 启用（只输出计划，最多单轮）"})
 		} else {
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "plan", Step: "plan", Message: fmt.Sprintf("构建模式 — LLM 自主决定何时终止 (上限 %d 轮)", maxRounds)})
 		}

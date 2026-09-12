@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +33,10 @@ type Conversation struct {
 	Metadata    string    `json:"metadata,omitempty"`
 	Archived    bool      `json:"archived"`
 	VectorStore string    `json:"vector_store,omitempty"`
+	// UserMessageCount is the count of visible user-authored rows.
+	UserMessageCount int `json:"user_message_count,omitempty"`
+	// PendingTurnCount counts queued/running/failed turn_queue items.
+	PendingTurnCount int `json:"pending_turn_count,omitempty"`
 }
 
 // Message is one entry in a conversation's history.
@@ -300,16 +305,27 @@ func (s *Store) mostRecentConversation() (string, error) {
 func (s *Store) NewConversation() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := newConvID()
-	now := time.Now().Unix()
-	if _, err := s.db.Exec(
-		`INSERT INTO conversations(id, created_at, updated_at) VALUES (?, ?, ?)`,
-		id, now, now,
-	); err != nil {
+	c, err := s.insertConversationLocked(time.Now())
+	if err != nil {
 		return "", err
 	}
-	s.currentID = id
-	return id, nil
+	s.currentID = c.ID
+	return c.ID, nil
+}
+
+func (s *Store) insertConversationLocked(now time.Time) (Conversation, error) {
+	id := newConvID()
+	if _, err := s.db.Exec(
+		`INSERT INTO conversations(id, created_at, updated_at) VALUES (?, ?, ?)`,
+		id, now.Unix(), now.Unix(),
+	); err != nil {
+		return Conversation{}, err
+	}
+	return Conversation{
+		ID:        id,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}, nil
 }
 
 // EnsureConversation makes sure a conversation id exists.
@@ -2144,13 +2160,54 @@ func (s *Store) ListConversations() []Conversation {
 	return s.ListConversationsLimit(0)
 }
 
+const conversationSelectWithActivity = `
+SELECT c.id, COALESCE(c.title,''), c.created_at, c.updated_at,
+       COALESCE(c.metadata,''), c.archived, COALESCE(c.vector_store,''),
+       (SELECT COUNT(*)
+          FROM messages m
+         WHERE m.conversation_id = c.id
+           AND m.role = 'user'
+           AND m.is_archived = 0) AS user_message_count,
+       (SELECT COUNT(*)
+          FROM turn_queue tq
+         WHERE tq.session_id = c.id
+           AND tq.status IN ('queued', 'running', 'failed')) AS pending_turn_count
+  FROM conversations c`
+
+type conversationScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanConversation(scanner conversationScanner) (Conversation, error) {
+	var c Conversation
+	var created, updated int64
+	var archived int
+	if err := scanner.Scan(
+		&c.ID,
+		&c.Title,
+		&created,
+		&updated,
+		&c.Metadata,
+		&archived,
+		&c.VectorStore,
+		&c.UserMessageCount,
+		&c.PendingTurnCount,
+	); err != nil {
+		return Conversation{}, err
+	}
+	c.CreatedAt = time.Unix(created, 0)
+	c.UpdatedAt = time.Unix(updated, 0)
+	c.Archived = archived != 0
+	return c, nil
+}
+
 // ListConversationsLimit returns up to `limit` active (non-archived)
 // conversations, ordered by updated_at DESC. limit <= 0 means
 // "no cap" (used by legacy callers / tests). The handler-layer
 // pagination passes limit=200 to bound the response size.
 func (s *Store) ListConversationsLimit(limit int) []Conversation {
 	_ = s.Flush()
-	q := `SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`
+	q := conversationSelectWithActivity + ` WHERE c.archived = 0 ORDER BY c.updated_at DESC, c.id DESC`
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -2161,18 +2218,99 @@ func (s *Store) ListConversationsLimit(limit int) []Conversation {
 	defer rows.Close()
 	var out []Conversation
 	for rows.Next() {
-		var c Conversation
-		var created, updated int64
-		var archived int
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore); err != nil {
+		c, err := scanConversation(rows)
+		if err != nil {
 			return out
 		}
-		c.CreatedAt = time.Unix(created, 0)
-		c.UpdatedAt = time.Unix(updated, 0)
-		c.Archived = archived != 0
 		out = append(out, c)
 	}
 	return out
+}
+
+// NewOrReuseBlankConversation returns the newest reusable blank conversation
+// for projectPath, or creates one when none exists.
+func (s *Store) NewOrReuseBlankConversation(projectPath string) (string, bool, error) {
+	_ = s.Flush()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(conversationSelectWithActivity + ` WHERE c.archived = 0 ORDER BY c.updated_at DESC, c.id DESC`)
+	if err != nil {
+		return "", false, err
+	}
+	reuseID := ""
+	for rows.Next() {
+		c, err := scanConversation(rows)
+		if err != nil {
+			_ = rows.Close()
+			return "", false, err
+		}
+		if isReusableBlankConversation(c, projectPath) {
+			reuseID = c.ID
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return "", false, err
+	}
+	if err := rows.Close(); err != nil {
+		return "", false, err
+	}
+	if reuseID != "" {
+		if _, err := s.db.Exec(`UPDATE conversations SET updated_at = ? WHERE id = ?`, time.Now().Unix(), reuseID); err != nil {
+			return "", false, err
+		}
+		s.currentID = reuseID
+		return reuseID, true, nil
+	}
+
+	c, err := s.insertConversationLocked(time.Now())
+	if err != nil {
+		return "", false, err
+	}
+	s.currentID = c.ID
+	return c.ID, false, nil
+}
+
+func isReusableBlankConversation(c Conversation, projectPath string) bool {
+	if strings.HasPrefix(c.ID, "im:") {
+		return false
+	}
+	if c.UserMessageCount != 0 || c.PendingTurnCount != 0 {
+		return false
+	}
+	return sameConversationProjectPath(conversationProjectPath(c.Metadata), projectPath)
+}
+
+func conversationProjectPath(meta string) string {
+	if strings.TrimSpace(meta) == "" {
+		return ""
+	}
+	var blob struct {
+		ProjectPath string `json:"project_path"`
+	}
+	if err := json.Unmarshal([]byte(meta), &blob); err != nil {
+		return ""
+	}
+	return blob.ProjectPath
+}
+
+func sameConversationProjectPath(a, b string) bool {
+	a = cleanConversationProjectPath(a)
+	b = cleanConversationProjectPath(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func cleanConversationProjectPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || path == "." {
+		return ""
+	}
+	return filepath.Clean(path)
 }
 
 // RenameConversation sets a human-readable title on a conversation.
@@ -2218,20 +2356,11 @@ func (s *Store) UpdateConversationMeta(id, meta string) error {
 // that into a 404.
 func (s *Store) GetConversation(id string) (Conversation, error) {
 	_ = s.Flush()
-	var c Conversation
-	var created, updated int64
-	var archived int
-	err := s.db.QueryRow(
-		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE id = ?`,
+	row := s.db.QueryRow(
+		conversationSelectWithActivity+` WHERE c.id = ?`,
 		id,
-	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore)
-	if err != nil {
-		return Conversation{}, err
-	}
-	c.CreatedAt = time.Unix(created, 0)
-	c.UpdatedAt = time.Unix(updated, 0)
-	c.Archived = archived != 0
-	return c, nil
+	)
+	return scanConversation(row)
 }
 
 // ArchiveConversation marks a conversation as archived.
@@ -2277,7 +2406,7 @@ func (s *Store) ListArchivedConversations() []Conversation {
 // "no cap" (legacy callers / tests).
 func (s *Store) ListArchivedConversationsLimit(limit int) []Conversation {
 	_ = s.Flush()
-	q := `SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`
+	q := conversationSelectWithActivity + ` WHERE c.archived = 1 ORDER BY c.updated_at DESC, c.id DESC`
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -2288,15 +2417,10 @@ func (s *Store) ListArchivedConversationsLimit(limit int) []Conversation {
 	defer rows.Close()
 	var out []Conversation
 	for rows.Next() {
-		var c Conversation
-		var created, updated int64
-		var archived int
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore); err != nil {
+		c, err := scanConversation(rows)
+		if err != nil {
 			return out
 		}
-		c.CreatedAt = time.Unix(created, 0)
-		c.UpdatedAt = time.Unix(updated, 0)
-		c.Archived = archived != 0
 		out = append(out, c)
 	}
 	return out

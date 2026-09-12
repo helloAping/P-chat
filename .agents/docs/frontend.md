@@ -113,6 +113,7 @@ if (ev.sub_agent && ev.sub_agent_task) {
 核心状态：
 - `currentID` — 当前活动会话 ID
 - `sessionMessages[id]` — 消息列表
+- `sessions[].conversation_state` — 服务端返回的会话活动状态；`blank` 会话在同项目内作为唯一空白草稿复用，前端加载列表时只展示每个项目最新的一条 blank。
 - `sessionMeta[id].style` / `sessionMeta[id].workMode` — 单会话说话风格与工作侧重点；`style=off` 表示关闭风格 prompt 和风格记忆注入
 - `sessionMeta[id].enabled_recognition_capabilities` — 会话启用的媒体能力工具（`image` / `video` / `audio`）；新会话只继承仍有可用系统路由的选项
 - `recognitionCapabilitiesAvailable` — `/api/v1/config` 返回的可用媒体识别路由缓存，用于过滤会话多选项
@@ -348,6 +349,7 @@ flag + `source` 路径）。`GET /api/v1/tools` 同时返回 `diagnostics[]`，
 
 - 会话忙碌或已有待处理项时，`InputArea.send()` 把完整发送参数持久化到
   `/turn-queue`，不提前渲染 user bubble。
+- 入队会立即把当前会话标记为 `active`，避免同项目空白会话复用逻辑把已有待发送用户意图的会话当成草稿。
 - 队列条默认显示一行摘要；展开后支持编辑 queued 消息、删除、失败重试和清空。
 - 编辑调用 `PATCH /turn-queue/:queue_id`；保存时保留队列 ID、FIFO 位置、附件和
   模型/风格等 payload，只改消息文本。

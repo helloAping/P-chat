@@ -99,6 +99,7 @@ type sessionMeta struct {
 	ReasoningEffort string // "off" | "low" | "medium" | "high" | "max"
 	ProjectPath     string // project root directory, "" = global
 	PlanMode        bool   // plan mode (no tools, single turn)
+	TurnModePolicy  string // "auto" | "plan" | "build"; empty falls back to PlanMode
 	PermissionLevel string // "ask" | "auto" | "full"
 	KnowledgeBase   string // "" = off, "__all__" = all bases, or a specific base name
 	// true 表示上传图片使用已配置的 media_recognize 图片策略。
@@ -134,6 +135,7 @@ type sessionMetaBlob struct {
 	ReasoningEffort          string                                                      `json:"reasoning_effort,omitempty"`
 	ProjectPath              string                                                      `json:"project_path,omitempty"`
 	PlanMode                 bool                                                        `json:"plan_mode,omitempty"`
+	TurnModePolicy           string                                                      `json:"turn_mode_policy,omitempty"`
 	PermissionLevel          string                                                      `json:"permission_level,omitempty"`
 	KnowledgeBase            string                                                      `json:"knowledge_base,omitempty"`
 	UseImageRecognition      bool                                                        `json:"use_image_recognition,omitempty"`
@@ -195,6 +197,7 @@ func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
 		ReasoningEffort:          m.ReasoningEffort,
 		ProjectPath:              m.ProjectPath,
 		PlanMode:                 m.PlanMode,
+		TurnModePolicy:           m.TurnModePolicy,
 		PermissionLevel:          m.PermissionLevel,
 		KnowledgeBase:            m.KnowledgeBase,
 		UseImageRecognition:      m.UseImageRecognition,
@@ -287,6 +290,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.ReasoningEffort = blob.ReasoningEffort
 				m.ProjectPath = blob.ProjectPath
 				m.PlanMode = blob.PlanMode
+				m.TurnModePolicy = blob.TurnModePolicy
 				m.PermissionLevel = blob.PermissionLevel
 				m.KnowledgeBase = blob.KnowledgeBase
 				m.UseImageRecognition = blob.UseImageRecognition
@@ -531,6 +535,9 @@ type SendMessageRequest struct {
 	SubAgentModelEnabled *bool              `json:"sub_agent_model_enabled,omitempty"`
 	SubAgentProvider     string             `json:"sub_agent_provider,omitempty"`
 	SubAgentModel        string             `json:"sub_agent_model,omitempty"`
+	// TurnModePolicy is a per-turn override used by queued turns and new UIs.
+	// Empty keeps the session-level setting.
+	TurnModePolicy string `json:"turn_mode_policy,omitempty"`
 	// SkillContext is the full SKILL.md content for a skill
 	// activated via /skillname slash command.
 	SkillContext string `json:"skill_context,omitempty"`
@@ -549,7 +556,9 @@ type CreateSessionRequest struct {
 	Model                          string                        `json:"model,omitempty"`
 	Title                          string                        `json:"title,omitempty"`
 	ProjectPath                    string                        `json:"project_path,omitempty"`
+	ReuseEmpty                     bool                          `json:"reuse_empty,omitempty"`
 	PlanMode                       *bool                         `json:"plan_mode,omitempty"`
+	TurnModePolicy                 string                        `json:"turn_mode_policy,omitempty"`
 	PermissionLevel                string                        `json:"permission_level,omitempty"`
 	ReasoningEffort                string                        `json:"reasoning_effort,omitempty"`
 	VectorStore                    string                        `json:"vector_store,omitempty"`
@@ -584,6 +593,10 @@ type UpdateSessionMetaRequest struct {
 	Model    *string `json:"model,omitempty"`
 	Style    *string `json:"style,omitempty"`
 	WorkMode *string `json:"work_mode,omitempty"`
+	// PlanMode toggles the current session between planning and building.
+	// Pointer semantics let PATCH distinguish "leave unchanged" from false.
+	PlanMode       *bool   `json:"plan_mode,omitempty"`
+	TurnModePolicy *string `json:"turn_mode_policy,omitempty"`
 	// PermissionLevel sets the sandbox permission level for this session.
 	// Values: "ask", "auto", "full". Omit to leave unchanged.
 	PermissionLevel *string `json:"permission_level,omitempty"`
@@ -617,20 +630,25 @@ type UpdateSessionMetaRequest struct {
 // (resolved from the in-memory + on-disk meta blob, with the
 // process default for unset fields).
 type SessionResponse struct {
-	ID              string `json:"id"`
-	Title           string `json:"title"`
-	Provider        string `json:"provider,omitempty"`
-	Model           string `json:"model,omitempty"`
-	Style           string `json:"style,omitempty"`
-	WorkMode        string `json:"work_mode,omitempty"`
-	ProjectPath     string `json:"project_path,omitempty"`
-	PlanMode        bool   `json:"plan_mode,omitempty"`
-	PermissionLevel string `json:"permission_level,omitempty"`
-	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	VectorStore     string `json:"vector_store,omitempty"`
-	KnowledgeBase   string `json:"knowledge_base,omitempty"`
-	CreatedAt       int64  `json:"created_at"`
-	UpdatedAt       int64  `json:"updated_at"`
+	ID                string `json:"id"`
+	Title             string `json:"title"`
+	Provider          string `json:"provider,omitempty"`
+	Model             string `json:"model,omitempty"`
+	Style             string `json:"style,omitempty"`
+	WorkMode          string `json:"work_mode,omitempty"`
+	ProjectPath       string `json:"project_path,omitempty"`
+	ConversationState string `json:"conversation_state"`
+	HasUserMessages   bool   `json:"has_user_messages"`
+	UserMessageCount  int    `json:"user_message_count"`
+	PendingTurnCount  int    `json:"pending_turn_count"`
+	PlanMode          bool   `json:"plan_mode"`
+	TurnModePolicy    string `json:"turn_mode_policy,omitempty"`
+	PermissionLevel   string `json:"permission_level,omitempty"`
+	ReasoningEffort   string `json:"reasoning_effort,omitempty"`
+	VectorStore       string `json:"vector_store,omitempty"`
+	KnowledgeBase     string `json:"knowledge_base,omitempty"`
+	CreatedAt         int64  `json:"created_at"`
+	UpdatedAt         int64  `json:"updated_at"`
 	// AutoContinue is the P0-3 "todo-incomplete → re-prompt
 	// LLM" guard toggle, default true. Surface so the UI can
 	// show a status pill ("auto-continue on/off") next to the

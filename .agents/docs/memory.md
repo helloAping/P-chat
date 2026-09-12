@@ -43,7 +43,7 @@ type Store struct {
 - `GetChatMessagesFor(convID, limit)` — 获取消息历史
 - `GetChatMessagesWithMetaPage(convID, beforeID, limit)` — 分页查询
 - `GetChatMessagesAfterIDFor(convID, limit, afterID)` — 从某 ID 之后查询
-- `ListConversations()` — 列出所有会话
+- `ListConversations()` — 列出所有会话，并通过查询聚合填充 `UserMessageCount` / `PendingTurnCount`，供服务端判断项目内可复用空白会话
 - `SetConversationMeta(convID, meta)` → 写入会话元数据
 
 ### 2. 数据库 Schema
@@ -98,6 +98,11 @@ subagent_jobs: id, task_id, session_id, status, subagent_type, model, descriptio
 
 动态快照沿用 `name=pchat_context_<name>`、`origin`、`ui_hidden` 等既有元数据键，不新增
 数据库字段。助手与工具消息按请求顺序落库，确保下次读取不会把工具结果移到助手文本之前。
+
+项目空白会话复用不新增 schema 字段。`Conversation.UserMessageCount` 来自
+`messages(role='user', is_archived=0)` 聚合，`PendingTurnCount` 来自
+`turn_queue(status in queued/running/failed)` 聚合；`NewOrReuseBlankConversation`
+在 Store 锁内完成“查找同项目空白会话 → 否则创建”，防止多窗口快速新建产生重复空白会话。
 
 ### 5. Summarizer（对话压缩）
 

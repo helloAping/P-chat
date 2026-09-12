@@ -31,6 +31,7 @@ export type ConversationTurnInput = {
   subAgentModelEnabled?: boolean
   subAgentProvider?: string
   subAgentModel?: string
+  turnModePolicy?: api.TurnModePolicy
   todoMode: 'auto' | 'resume' | 'clear'
   attachments?: api.InlineAttachment[]
   skillContext?: string
@@ -125,13 +126,14 @@ export async function submitConversationTurn(input: ConversationTurnInput): Prom
       client_msg_id: input.clientMsgID,
       provider: input.provider,
       model: input.model,
-      style: input.style,
-      workMode: input.workMode,
-      useImageRecognition: input.useImageRecognition,
-      subAgentModelEnabled: input.subAgentModelEnabled,
-      subAgentProvider: input.subAgentProvider,
-      subAgentModel: input.subAgentModel,
-      todo_mode: input.todoMode,
+	      style: input.style,
+	      workMode: input.workMode,
+	      useImageRecognition: input.useImageRecognition,
+	      subAgentModelEnabled: input.subAgentModelEnabled,
+	      subAgentProvider: input.subAgentProvider,
+	      subAgentModel: input.subAgentModel,
+	      turnModePolicy: input.turnModePolicy,
+	      todo_mode: input.todoMode,
       attachments: input.attachments,
       signal: ctrl.signal,
       skill_context: input.skillContext,
@@ -183,6 +185,7 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
   if (hasBlockingTurnQueueFailure(sessionId)) return
   if (state.pendingQuestion[sessionId]) return
   if ((state.pendingConfirm[sessionId] || []).length > 0) return
+  if (state.pendingPlanText[sessionId]) return
 
   drainingSessions.add(sessionId)
   setTurnQueueDraining(sessionId, true)
@@ -193,6 +196,7 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
       if (state.streaming[sessionId] || isSessionWorking(sessionId)) break
       if (state.pendingQuestion[sessionId]) break
       if ((state.pendingConfirm[sessionId] || []).length > 0) break
+      if (state.pendingPlanText[sessionId]) break
 
       const item = await claimNextQueuedTurnForDrain(sessionId)
       if (!item) break
@@ -217,13 +221,14 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
           clientMsgID: payload.client_msg_id,
           provider: payload.provider,
           model: payload.model,
-          style: payload.style,
-          workMode: payload.work_mode,
-          useImageRecognition: payload.use_image_recognition,
-          subAgentModelEnabled: !!payload.sub_agent_model_enabled,
-          subAgentProvider: payload.sub_agent_provider || '',
-          subAgentModel: payload.sub_agent_model || '',
-          todoMode: payload.todo_mode || 'auto',
+	          style: payload.style,
+	          workMode: payload.work_mode,
+	          useImageRecognition: payload.use_image_recognition,
+	          subAgentModelEnabled: !!payload.sub_agent_model_enabled,
+	          subAgentProvider: payload.sub_agent_provider || '',
+	          subAgentModel: payload.sub_agent_model || '',
+	          turnModePolicy: payload.turn_mode_policy,
+	          todoMode: payload.todo_mode || 'auto',
           attachments: payload.attachments,
           skillContext: payload.skill_context || undefined,
           activeSkills: payload.active_skills || undefined,
