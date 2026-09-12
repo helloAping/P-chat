@@ -23,6 +23,7 @@ import ToolCallGroup from './ToolCallGroup.vue'
 import LoadingDots from './LoadingDots.vue'
 import TypedText from './TypedText.vue'
 import { groupConsecutiveToolParts } from '../utils/toolPartGrouping'
+import { copyText } from '../utils/clipboard'
 
 const props = defineProps<{ part: SubAgentPart }>()
 
@@ -123,11 +124,11 @@ const copyState = ref<'idle' | 'copied' | 'err'>('idle')
 async function copyTaskId() {
   const id = props.part.taskId
   if (!id) return
-  try {
-    await navigator.clipboard.writeText(id)
+  const ok = await copyText(id)
+  if (ok) {
     copyState.value = 'copied'
     setTimeout(() => (copyState.value = 'idle'), 1200)
-  } catch {
+  } else {
     copyState.value = 'err'
     setTimeout(() => (copyState.value = 'idle'), 1200)
   }

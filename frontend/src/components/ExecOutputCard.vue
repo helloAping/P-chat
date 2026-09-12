@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { Clipboard, ChevronRight, ChevronDown } from './icons'
+import { copyText } from '../utils/clipboard'
 
 const props = defineProps<{ content: string; command?: string; elapsed?: string }>()
 
@@ -16,7 +17,7 @@ const filtered = computed(() => {
 })
 
 function copyAll() {
-  navigator.clipboard.writeText(props.content)
+  void copyText(props.content)
 }
 </script>
 

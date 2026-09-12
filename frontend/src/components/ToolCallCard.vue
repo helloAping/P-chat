@@ -27,7 +27,7 @@ import {
   Film,
   Volume2,
 } from './icons'
-import { downloadFromUrl, extensionForMime } from '../utils/clipboard'
+import { copyText, downloadFromUrl, extensionForMime } from '../utils/clipboard'
 
 const props = defineProps<{ part: ToolPart }>()
 
@@ -294,13 +294,13 @@ function downloadToolMediaAsset(asset: ToolMediaAsset) {
 // button doesn't toggle the fold.
 const copyState = ref<'idle' | 'copied' | 'err'>('idle')
 async function copyResult() {
-  const r = props.part.result
+  const r = await resultForCopy()
   if (!r) return
-  try {
-    await navigator.clipboard.writeText(r)
+  const ok = await copyText(r)
+  if (ok) {
     copyState.value = 'copied'
     setTimeout(() => (copyState.value = 'idle'), 1200)
-  } catch {
+  } else {
     copyState.value = 'err'
     setTimeout(() => (copyState.value = 'idle'), 1200)
   }
@@ -324,11 +324,12 @@ const truncatedLabel = computed(() => {
   const kb = (len / 1024).toFixed(len >= 1024 * 1024 ? 1 : 0)
   return len >= 1024 * 1024 ? `查看完整输出 (${(len / 1048576).toFixed(1)} MB)` : `查看完整输出 (${kb} KB)`
 })
-async function fetchFullResult() {
-  if (fetchState.value === 'loading' || fetchState.value === 'ok') return
+async function fetchFullResult(): Promise<boolean> {
+  if (fetchState.value === 'ok') return true
+  if (fetchState.value === 'loading') return false
   const sid = state.currentID
   const toolId = props.part.tool_id || props.part.id
-  if (!sid || !toolId) return
+  if (!sid || !toolId) return false
   fetchState.value = 'loading'
   try {
     // Resolve the trailing assistant message id (the SSE done
@@ -348,10 +349,21 @@ async function fetchFullResult() {
     const resp = await api.getToolResult(sid, msgId, toolId)
     fullResult.value = resp.content
     fetchState.value = 'ok'
+    return true
   } catch {
     fetchState.value = 'err'
     setTimeout(() => (fetchState.value = 'idle'), 2000)
+    return false
   }
+}
+
+async function resultForCopy(): Promise<string> {
+  if (resultTruncated.value) {
+    if (fetchState.value === 'ok' && fullResult.value) return fullResult.value
+    const ok = await fetchFullResult()
+    if (ok && fullResult.value) return fullResult.value
+  }
+  return props.part.result || ''
 }
 </script>
 

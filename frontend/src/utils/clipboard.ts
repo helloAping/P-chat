@@ -33,8 +33,9 @@ export async function copyText(text: string): Promise<boolean> {
     }
   } catch { /* fall through to legacy path */ }
 
+  let ta: HTMLTextAreaElement | null = null
   try {
-    const ta = document.createElement('textarea')
+    ta = document.createElement('textarea')
     ta.value = text
     ta.setAttribute('readonly', '')
     ta.style.position = 'fixed'
@@ -42,12 +43,15 @@ export async function copyText(text: string): Promise<boolean> {
     ta.style.left = '0'
     ta.style.opacity = '0'
     document.body.appendChild(ta)
+    ta.focus()
     ta.select()
+    ta.setSelectionRange(0, ta.value.length)
     const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
     return ok
   } catch {
     return false
+  } finally {
+    ta?.remove()
   }
 }
 

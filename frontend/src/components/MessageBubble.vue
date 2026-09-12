@@ -69,6 +69,7 @@ import {
   copyImageToClipboard, copyText, downloadBlob, downloadFromUrl,
   extensionForMime, fetchAsBlob,
 } from '../utils/clipboard'
+import { messageTextForCopy } from '../utils/messageCopy'
 import { groupConsecutiveToolParts } from '../utils/toolPartGrouping'
 
 const dialog = useDialog()
@@ -457,27 +458,6 @@ async function downloadAttachment(a: MessageAttachment) {
 
 // --- Copy whole message -------------------------------------
 
-// messageMarkdownText returns a clean text representation
-// of the message: for user messages that's the raw
-// `content`, for assistant messages it's the joined text
-   // parts. Attachments and tool calls are skipped here —
-// image attachments are picked up separately by
-// copyEntireMessage so the clipboard can carry both the
-// text and the image bytes via the ClipboardItem API.
-function messageMarkdownText(): string {
-  const m = props.message
-  if (m.role === 'user' || m.role === 'system' || m.role === 'tool') {
-    return m.content || ''
-  }
-  if (m.parts && m.parts.length) {
-    return m.parts
-      .filter((p: any) => p.kind === 'text')
-      .map((p: any) => p.text || '')
-      .join('\n\n')
-  }
-  return m.content || ''
-}
-
 // imageAttachmentsOf returns the image_url attachments
 // of the message with non-empty URLs, type-narrowed so
 // the caller can use `.url` without a null check.
@@ -579,7 +559,7 @@ async function copyEntireMessage() {
   // shouldn't cancel the feedback or restart the timer.
   if (isAction('copy', 'feedback')) return
 
-  const text = messageMarkdownText()
+  const text = messageTextForCopy(props.message)
   const images = imageAttachmentsOf()
 
   // Pure-text path: no images on this message, keep the
