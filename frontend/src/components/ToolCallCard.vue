@@ -40,6 +40,7 @@ const FOLD_RESULT_MIN_LINES = 4
 const isGenerationTool = computed(() => props.part.name.startsWith('generate_'))
 const isBrowserScreenshot = computed(() => props.part.name === 'browser_screenshot')
 const isMediaResultTool = computed(() => isGenerationTool.value || isBrowserScreenshot.value)
+const contextRefs = computed(() => (props.part.context_refs || []).filter(Boolean))
 
 // Whether the result is "long enough" to warrant a
 // default-collapsed state. The args block is not folded —
@@ -342,6 +343,11 @@ async function fetchFullResult() {
       </span>
       <span class="tool-name">{{ part.name }}</span>
       <span v-if="isDryRun" class="tool-dry-run" title="仅预览,未实际执行">dry-run</span>
+      <span
+        v-if="contextRefs.length"
+        class="tool-context-chip"
+        :title="contextRefs.join(', ')"
+      >ctx {{ contextRefs.length }}</span>
       <span class="tool-status">{{ statusLabel }}</span>
       <span class="tool-elapsed" v-if="part.elapsed">{{ part.elapsed }}</span>
       <span
@@ -357,6 +363,10 @@ async function fetchFullResult() {
       <component :is="open ? ChevronDown : ChevronRight" :size="12" class="tool-caret" />
     </button>
     <div v-if="open" class="tool-body">
+      <div v-if="contextRefs.length" class="tool-context-refs">
+        <span class="tool-section-label">上下文</span>
+        <code v-for="ref in contextRefs" :key="ref">{{ ref }}</code>
+      </div>
       <details v-if="part.args && isGenerationTool && toolMediaAssets.length" class="generation-request-details">
         <summary>查看生成参数</summary>
         <pre>{{ argsPretty }}</pre>
@@ -527,6 +537,18 @@ async function fetchFullResult() {
   margin-left: 4px;
   flex-shrink: 0;
 }
+.tool-context-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
 .tool-caret { margin-left: auto; color: var(--text-tertiary); flex-shrink: 0; }
 
 /* "查看完整输出" affordance for server-truncated results.
@@ -564,6 +586,26 @@ async function fetchFullResult() {
   color: var(--text-quaternary);
   margin: 4px 0 2px;
   font-weight: 500;
+}
+.tool-context-refs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+}
+.tool-context-refs .tool-section-label {
+  margin: 0 var(--space-1) 0 0;
+}
+.tool-context-refs code {
+  padding: 1px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
 }
 .tool-args pre, .tool-result pre, .tool-error pre, .generation-request-details pre {
   margin: 0;

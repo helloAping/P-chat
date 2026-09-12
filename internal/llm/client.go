@@ -38,6 +38,9 @@ type StreamChunk struct {
 	Err       error
 	TokensIn  int
 	TokensOut int
+	// CacheUsage 仅在上游报告缓存数据时设置，区分未报告与零命中。
+	// CacheUsage distinguishes missing cache telemetry from a reported zero hit.
+	CacheUsage *CacheUsage
 
 	// Native tool calls (from OpenAI tool_calls field).
 	// Each chunk may contain a partial tool call. Collect them via index.
@@ -923,10 +926,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			// choices; the SDK hoists it to the top of
 			// the next loop iteration's response.
 			if r.Usage != nil {
-				ch <- StreamChunk{
-					TokensIn:  r.Usage.PromptTokens,
-					TokensOut: r.Usage.CompletionTokens,
-				}
+				ch <- r.Usage.chunk()
 			}
 			// Last-resort fallback: if the standard
 			// struct parser found no content AND no
@@ -1032,9 +1032,14 @@ type openaiStreamToolCallFunc struct {
 }
 
 type openaiStreamUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int  `json:"prompt_tokens"`
+	CompletionTokens int  `json:"completion_tokens"`
+	TotalTokens      int  `json:"total_tokens"`
+	CacheHitTokens   *int `json:"prompt_cache_hit_tokens"`
+	CacheMissTokens  *int `json:"prompt_cache_miss_tokens"`
+	PromptDetails    *struct {
+		CachedTokens *int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 func (c *Client) Chat(ctx context.Context, providerName, modelName string, messages []Message) (string, error) {

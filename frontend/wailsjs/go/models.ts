@@ -124,7 +124,6 @@ export namespace http {
 		    return a;
 		}
 	}
-
 }
 
 export namespace multipart {
@@ -291,7 +290,6 @@ export namespace tls {
 	    HandshakeComplete: boolean;
 	    DidResume: boolean;
 	    CipherSuite: number;
-	    CurveID: number;
 	    NegotiatedProtocol: string;
 	    NegotiatedProtocolIsMutual: boolean;
 	    ServerName: string;
@@ -312,7 +310,6 @@ export namespace tls {
 	        this.HandshakeComplete = source["HandshakeComplete"];
 	        this.DidResume = source["DidResume"];
 	        this.CipherSuite = source["CipherSuite"];
-	        this.CurveID = source["CurveID"];
 	        this.NegotiatedProtocol = source["NegotiatedProtocol"];
 	        this.NegotiatedProtocolIsMutual = source["NegotiatedProtocolIsMutual"];
 	        this.ServerName = source["ServerName"];
@@ -414,41 +411,7 @@ export namespace url {
 }
 
 export namespace x509 {
-
-	export class PolicyMapping {
-	    // Go type: OID
-	    IssuerDomainPolicy: any;
-	    // Go type: OID
-	    SubjectDomainPolicy: any;
-
-	    static createFrom(source: any = {}) {
-	        return new PolicyMapping(source);
-	    }
 	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.IssuerDomainPolicy = this.convertValues(source["IssuerDomainPolicy"], null);
-	        this.SubjectDomainPolicy = this.convertValues(source["SubjectDomainPolicy"], null);
-	    }
-
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
 	export class OID {
 	
 	
@@ -510,13 +473,6 @@ export namespace x509 {
 	    CRLDistributionPoints: string[];
 	    PolicyIdentifiers: number[][];
 	    Policies: OID[];
-	    InhibitAnyPolicy: number;
-	    InhibitAnyPolicyZero: boolean;
-	    InhibitPolicyMapping: number;
-	    InhibitPolicyMappingZero: boolean;
-	    RequireExplicitPolicy: number;
-	    RequireExplicitPolicyZero: boolean;
-	    PolicyMappings: PolicyMapping[];
 	
 	    static createFrom(source: any = {}) {
 	        return new Certificate(source);
@@ -569,13 +525,6 @@ export namespace x509 {
 	        this.CRLDistributionPoints = source["CRLDistributionPoints"];
 	        this.PolicyIdentifiers = source["PolicyIdentifiers"];
 	        this.Policies = this.convertValues(source["Policies"], OID);
-	        this.InhibitAnyPolicy = source["InhibitAnyPolicy"];
-	        this.InhibitAnyPolicyZero = source["InhibitAnyPolicyZero"];
-	        this.InhibitPolicyMapping = source["InhibitPolicyMapping"];
-	        this.InhibitPolicyMappingZero = source["InhibitPolicyMappingZero"];
-	        this.RequireExplicitPolicy = source["RequireExplicitPolicy"];
-	        this.RequireExplicitPolicyZero = source["RequireExplicitPolicyZero"];
-	        this.PolicyMappings = this.convertValues(source["PolicyMappings"], PolicyMapping);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

@@ -113,10 +113,49 @@ func TestMediaGenerationToolPassesOnlyReferencesToExecutor(t *testing.T) {
 	}
 }
 
+func TestMediaGenerationAppendsResolvedContextToPrompt(t *testing.T) {
+	executor := &recordingGenerationExecutor{}
+	target := config.GenerationModelTarget{Provider: "provider", Model: "video-model"}
+	ctx := WithSessionID(context.Background(), "session-1")
+	ctx = generation.WithAccess(ctx, generation.Access{
+		Enabled: map[config.GenerationOperation]bool{config.GenerationTextToVideo: true},
+		Targets: map[config.GenerationOperation]config.GenerationModelTarget{
+			config.GenerationTextToVideo: target,
+		},
+		Dispatches: map[config.GenerationOperation]generation.Dispatch{
+			config.GenerationTextToVideo: {Target: target},
+		},
+		Executor: executor,
+	})
+	ctx = WithMediaContextResolver(ctx, func(_ context.Context, sessionID string, req MediaContextResolveRequest) (MediaContextExpansion, error) {
+		if sessionID != "session-1" || req.ToolName != "generate_video" || req.ContextMode != MediaContextModeContinue || strings.Join(req.ContextRefs, ",") != "mctx_prev" {
+			t.Fatalf("context req = %#v session=%q", req, sessionID)
+		}
+		return MediaContextExpansion{IDs: []string{"mctx_prev"}, Text: "prompt_or_question: previous video prompt\nsummary: keep the red title card"}, nil
+	})
+
+	result, err := handleGenerateVideo(ctx, json.RawMessage(`{"operation":"text_to_video","prompt":"add a closing shot","context_mode":"continue","context_refs":["mctx_prev"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || executor.calls != 1 {
+		t.Fatalf("result/calls = %#v / %d", result, executor.calls)
+	}
+	if !strings.Contains(executor.req.Prompt, "add a closing shot") || !strings.Contains(executor.req.Prompt, "keep the red title card") {
+		t.Fatalf("prompt did not include context:\n%s", executor.req.Prompt)
+	}
+	if strings.Join(result.ContextRefs, ",") != "mctx_prev" {
+		t.Fatalf("context refs = %#v", result.ContextRefs)
+	}
+}
+
 func TestMediaGenerationToolSchemaDoesNotExposePromptEnhancement(t *testing.T) {
 	schema := string(generationToolSchema(config.GenerationTextToVideo))
 	if strings.Contains(schema, "prompt_mode") || strings.Contains(schema, "prompt_optimizer") {
 		t.Fatalf("generation schema still exposes prompt enhancement controls: %s", schema)
+	}
+	if !strings.Contains(schema, "context_refs") || !strings.Contains(schema, "context_mode") {
+		t.Fatalf("generation schema missing media context controls: %s", schema)
 	}
 }
 

@@ -29,29 +29,26 @@ func TestNormalizeTodoMode(t *testing.T) {
 	}
 }
 
-func TestUpsertTodoGuardReplacesInPlace(t *testing.T) {
-	msgs := []llm.ChatMessage{{Role: llm.RoleSystem, Content: "base"}}
+func TestTodoGuardPreservesHistoryPrefix(t *testing.T) {
+	msgs := []llm.ChatMessage{{Role: llm.RoleSystem, Content: "base"}, {Role: llm.RoleUser, Content: "work"}}
 	items := []tool.TodoItem{{ID: "a", Content: "first", Status: "pending"}}
-
-	upsertTodoGuard(&msgs, TodoModeAuto, items, false)
-	firstLen := len(msgs[0].Content)
-	if strings.Count(msgs[0].Content, todoGuardStart) != 1 {
-		t.Fatalf("first guard marker count = %d, want 1", strings.Count(msgs[0].Content, todoGuardStart))
+	if !appendTodoGuard(&msgs, TodoModeAuto, items, false) || len(msgs) != 3 {
+		t.Fatal("expected one tail snapshot")
 	}
-
+	old := msgs[2].Content
+	if appendTodoGuard(&msgs, TodoModeAuto, items, false) {
+		t.Fatal("unchanged todo must not append another snapshot")
+	}
 	items[0].Status = "in_progress"
-	upsertTodoGuard(&msgs, TodoModeAuto, items, true)
-	if got := strings.Count(msgs[0].Content, todoGuardStart); got != 1 {
-		t.Fatalf("replacement guard marker count = %d, want 1", got)
+	appendTodoGuard(&msgs, TodoModeAuto, items, true)
+	if len(msgs) != 4 || msgs[0].Content != "base" || msgs[2].Content != old {
+		t.Fatal("updating todo changed the existing prefix")
 	}
-	if got := strings.Count(msgs[0].Content, todoGuardEnd); got != 1 {
-		t.Fatalf("replacement guard end marker count = %d, want 1", got)
+	if !strings.Contains(msgs[3].Content, "in_progress") || !strings.Contains(msgs[3].Content, "状态检查") {
+		t.Fatal("new snapshot must contain current state")
 	}
-	if !strings.Contains(msgs[0].Content, "in_progress") || !strings.Contains(msgs[0].Content, "状态检查") {
-		t.Fatalf("replacement guard did not contain current state: %q", msgs[0].Content)
-	}
-	if len(msgs[0].Content) > firstLen+len(todoGuardStart)+len(todoGuardEnd)+256 {
-		t.Fatalf("guard grew unexpectedly: first=%d current=%d", firstLen, len(msgs[0].Content))
+	if !appendTodoGuard(&msgs, TodoModeAuto, nil, false) || !strings.Contains(msgs[4].Content, "没有活动 todo") {
+		t.Fatal("completing all todos must supersede the active snapshot")
 	}
 }
 

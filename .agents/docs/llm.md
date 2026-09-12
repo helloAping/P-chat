@@ -18,6 +18,9 @@ LLM 模块封装与 LLM 提供商的 HTTP 通信，包括流式请求、协议�
 | `anthropic_adapter.go` | Anthropic Messages API 的 Build + ParseStream | `AnthropicAdapter` |
 | `anthropic.go` | Anthropic 特有类型（工具、消息结构） | (Anthropic 工具调用解析) |
 | `chat_message.go` | 协议无关的 ChatMessage 类型 | `ChatMessage`, `Role/Type` 常量 |
+| `runtime_context.go` | 动态上下文消息识别与协议包装 | `IsRuntimeContext()` |
+| `reasoning_replay.go` | DeepSeek 推理内容回传 | `deepSeekReasoningReplay()`, `messageReasoning()` |
+| `cache_usage.go` | 统一缓存命中/未命中 token | `CacheUsage` |
 | `errors.go` | API 错误分类（auth/rate_limit/vision 等） | `APIError`, `ErrorKind`, `ClassifyAPIError()` |
 | `openai_adapter_test.go` | OpenAI Build 单元测试 | 覆盖并行 tool_call 合并等 |
 | `anthropic_adapter_test.go` | Anthropic Build 单元测试 | 覆盖并行 tool_use 合并等 |
@@ -38,12 +41,16 @@ type ProtocolAdapter interface {
   - **并行 `tool_call` 合并**（P2-3）：连续的 `TypeToolCall` 消息和 assistant 文本+tool_call 组合会被合并到**单条** assistant 消息的 `tool_calls` 数组里。OpenAI 协议要求并行 tool_call 必须在同一条消息里；拆成多条 assistant 会被 `api-convert.08ms.cn` 等严格代理以 `code=invalid_request_error / "Upstream request failed"` 拒收（2026-07-17 复现）。
 - ParseStream: 逐行读取 SSE (`data: ...`)，解析为 `StreamChunk{Content, Thinking, ToolCall, Done, Error}`
 - 支持 OpenAI 的 `reasoning_content` → Thinking
+- 对 DeepSeek（模型名前缀或官方 endpoint host）且携带 tools 的请求，从助手 `Meta["thinking"]` 回传 `reasoning_content`，覆盖纯思考工具轮和历史文本轮。
+- `pchat_context_*` 系统快照在消息原位置包装为 `application_context`，不会提升到首条系统提示词。
 
 **Anthropic Adapter** (`anthropic_adapter.go`):
 - Build: 将 ChatMessage[] 转为 Anthropic `MessagesRequest` JSON
   - **assistant 消息合并**（P2-3）：连续 assistant-role 的 text 块和 `tool_use` 块合并到同一条 assistant 消息的 content 数组；连续 `tool_result` 块也合并到同一条 user 消息的 content 数组。
 - ParseStream: 逐行读取 SSE (`event: ...` → `data: ...`)，解析 content_block_start/delta/stop、thinking_delta 等事件
 - 原生支持 `thinking` 块
+- DeepSeek 带 tools 请求回传已有 thinking；其他模型不注入缺少签名的 DeepSeek thinking 块。
+- `pchat_context_*` 动态快照包装为原位置的 user 内容，不合并到顶层 system。
 
 ### 2. ChatMessage（协议无关消息）
 
@@ -68,7 +75,7 @@ type ChatMessage struct {
 - `image` — 图片（base64 或 URL）；OpenAI-compatible 请求会在 `image_url.url` 放 data URL，同时补 `image_url.data` raw base64 兼容需要 data 字段的代理。
 - `tool_call` — LLM 发出的工具调用（OpenAI native）
 - `tool_result` — 工具执行结果
-- `thinking` — 代理内部思考（不发送给 LLM）
+- `thinking` — 展示用思考行（不直接发送）；DeepSeek 需要的回传内容取自助手文本消息的 `Meta["thinking"]`
 
 图片消息的提交边界由 Agent 决定，而不是 LLM adapter 决定：
 - 当前轮图片和重答目标图片可以保留为 `TypeImage`，adapter 才会把它转为 OpenAI `image_url` 或 Anthropic `image` block。
@@ -88,6 +95,14 @@ type StreamChunk struct {
 ```
 
 ### 4. Client 与重试
+
+OpenAI 流式 usage 解析保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`；兼容
+`prompt_tokens_details.cached_tokens`。字段缺失时 `StreamChunk.CacheUsage=nil`，不会把
+“未报告”误判成零命中。Agent 输出 `[llm/cache]` 日志，含 provider/model/round/attempt
+以及 input、cache_hit、cache_miss token，不记录完整提示词。
+
+输入/输出总量在单次请求内按累计 usage 去重，跨轮次和重试按增量求和。聚合命中率用
+`sum(hit) / sum(hit + miss)`，不要平均各请求的百分比。估算上下文长度时也计入已存推理文本。
 
 `Client` 封装：
 - 多 provider Base URL 与按模型解析的 `api_endpoint`（请求前统一拼接成完整地址）

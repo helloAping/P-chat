@@ -2259,8 +2259,9 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             p.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
             p.error = ev.tool_error
             p.elapsed = ev.tool_elapsed
-            if (ev.tool_args) p.args = ev.tool_args
-            // Server-side truncation marker: the full body (>32
+	            if (ev.tool_args) p.args = ev.tool_args
+	            if (ev.tool_context_refs) p.context_refs = ev.tool_context_refs
+	            // Server-side truncation marker: the full body (>32
             // KiB) must be fetched on demand, never stored here.
             if (ev.tool_result_truncated) {
               ;(p as any).result_truncated = true
@@ -2281,9 +2282,10 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             result: dataURLToBlobURL(ev.tool_result_full || ev.tool_result),
             error: ev.tool_error,
             elapsed: ev.tool_elapsed,
-            result_truncated: ev.tool_result_truncated || undefined,
-            result_full_len: ev.tool_result_full_len,
-          })
+	            result_truncated: ev.tool_result_truncated || undefined,
+	            result_full_len: ev.tool_result_full_len,
+	            context_refs: ev.tool_context_refs,
+	          })
         }
         // Enforce the screenshot cap as each image arrives rather
         // than waiting for `done`; a cancelled task otherwise keeps

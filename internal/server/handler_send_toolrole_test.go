@@ -47,20 +47,8 @@ func TestBuildLLMMessages_PreservesDisplayOnlyImageReferences(t *testing.T) {
 	}
 }
 
-// TestBuildLLMMessages_TaskResultRoleRewrite is the bug #3
-// regression test. The historical fix (commit 51039e2)
-// flipped every tool_result to role=user so the LLM wouldn't
-// reject orphan tool messages. That scrambled the main
-// tool loop: read_file / write_file / exec_command /
-// todo_write / question results all need to keep role=tool
-// so the LLM can match them against their tool_call.
-//
-// The fix scopes the rewrite to `task` results only — the
-// sub-agent system entry. Sub-agent responses arrive as
-// tool_result on the parent's stream, but the LLM never
-// saw the tool_call (it lives in the parent's tool loop
-// only), so the role=user rewrite prevents the orphan
-// rejection strict providers would otherwise raise.
+// 已配对的 task 结果必须保留角色，旧版孤立结果仍保留兼容回退。
+// Paired task results retain their role; orphan legacy results keep the fallback.
 func TestBuildLLMMessages_TaskResultRoleRewrite(t *testing.T) {
 	in := []llm.ChatMessage{
 		// Main tool loop: tool_call + tool_result must
@@ -68,12 +56,13 @@ func TestBuildLLMMessages_TaskResultRoleRewrite(t *testing.T) {
 		{Role: llm.RoleAssistant, Type: llm.TypeToolCall, ToolID: "call_read_1", ToolName: "read_file", ToolInput: `{"path":"/tmp/x"}`, MsgType: llm.MsgTypeTool, SubmitToLLM: 1},
 		{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "call_read_1", ToolName: "read_file", Content: "file contents", MsgType: llm.MsgTypeTool, SubmitToLLM: 1},
 
-		// Sub-agent system: parent issues task call,
-		// sub-agent returns an opaque summary. The LLM
-		// only sees the result; rewriting to role=user
-		// is the workaround for orphan-tool rejection.
+		// 已配对的子代理调用与普通工具一样保留完整历史。
+		// Paired sub-agent calls preserve history just like ordinary tools.
 		{Role: llm.RoleAssistant, Type: llm.TypeToolCall, ToolID: "call_task_1", ToolName: "task", ToolInput: `{"description":"explore"}`, MsgType: llm.MsgTypeTool, SubmitToLLM: 1},
 		{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "call_task_1", ToolName: "task", Content: `{"answer":"found 3 bugs"}`, MsgType: llm.MsgTypeTool, SubmitToLLM: 1},
+		{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "orphan_task", ToolName: "task", Content: "legacy result", MsgType: llm.MsgTypeTool, SubmitToLLM: 1},
+		{Role: llm.RoleAssistant, Type: llm.TypeToolCall, ToolID: "hidden_task", ToolName: "task", SubmitToLLM: 0},
+		{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "hidden_task", ToolName: "task", Content: "hidden call result", MsgType: llm.MsgTypeTool, SubmitToLLM: 1},
 
 		// Other tool results that should keep role=tool
 		// (the historical bug scrambled these too).
@@ -81,24 +70,17 @@ func TestBuildLLMMessages_TaskResultRoleRewrite(t *testing.T) {
 		{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "call_q_1", ToolName: "question", Content: `{"questions":[],"answers":{}}`, MsgType: llm.MsgTypeTool, SubmitToLLM: 1},
 	}
 	got := buildLLMMessages(in)
-	if len(got) != len(in) {
-		t.Fatalf("got %d msgs, want %d (no display-only rows to filter)", len(got), len(in))
+	if len(got) != len(in)-1 {
+		t.Fatalf("got %d msgs, want %d (hidden call filtered)", len(got), len(in)-1)
 	}
-	for i, m := range got {
-		if m.Role != in[i].Role {
-			continue
-		}
-	}
-	// The actual assertions: read_file, exec_command, question
-	// results keep role=tool; task result becomes role=user.
 	for _, m := range got {
 		switch m.ToolID {
-		case "call_read_1", "call_exec_1", "call_q_1":
+		case "call_read_1", "call_exec_1", "call_q_1", "call_task_1":
 			if m.Type == llm.TypeToolResult && m.Role != llm.RoleTool {
 				t.Errorf("%s result role = %q, want %q (was being globally rewritten to user)",
 					m.ToolName, m.Role, llm.RoleTool)
 			}
-		case "call_task_1":
+		case "orphan_task", "hidden_task":
 			if m.Type == llm.TypeToolResult && m.Role != llm.RoleUser {
 				t.Errorf("task result role = %q, want %q (orphan sub-agent result needs user role for strict providers)",
 					m.Role, llm.RoleUser)

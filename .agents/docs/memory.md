@@ -87,14 +87,17 @@ subagent_jobs: id, task_id, session_id, status, subagent_type, model, descriptio
 `messages.metadata` 列存储 JSON `map[string]string`，常用键：
 - `role` — 消息角色
 - `reason` — 来源 ("user" / "assistant" / "compression")
-- `origin` — 内部来源标记；例如服务端自动续跑注入给 LLM 的 nudge 使用 `"auto_resume"`
+- `origin` — 内部来源标记；自动续跑 nudge 使用 `"auto_resume"`，动态上下文快照使用 `"runtime_context"`
 - `ui_hidden` — `"true"` 表示该消息只参与 LLM 上下文，不应通过历史 API 渲染给用户
-- `thinking` — 完整思考文本（非 parts 路径）
+- `thinking` — 原始模型思考文本；`decodeChatMessages()` 恢复到助手文本消息的 `Meta["thinking"]`，供 DeepSeek 回传，展示仍使用 parts
 - `parts` — 结构化 parts JSON（tool + sub_agent）
 
 `encodeChatMeta()` 会先把 `llm.ChatMessage.Meta` 合并进 metadata，再补充规范字段。
 `bool true` 会编码成字符串 `"true"`，用于兼容 `messages.metadata` 的
 `map[string]string` 存储形态。服务端历史响应根据 `ui_hidden` 过滤内部续跑行。
+
+动态快照沿用 `name=pchat_context_<name>`、`origin`、`ui_hidden` 等既有元数据键，不新增
+数据库字段。助手与工具消息按请求顺序落库，确保下次读取不会把工具结果移到助手文本之前。
 
 ### 5. Summarizer（对话压缩）
 

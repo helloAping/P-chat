@@ -463,6 +463,50 @@ func TestRun_V12ToV13InitializesProviderCustomHeaders(t *testing.T) {
 	}
 }
 
+func TestRun_V13ToV14CreatesMediaContexts(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755)
+
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db")+
+		"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE conversations (id TEXT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUserVersion(V13); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V13: %v", err)
+	}
+	if err := stepV13toV14(db); err != nil {
+		t.Fatalf("second V14 migration should be idempotent: %v", err)
+	}
+	var tableName string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='media_contexts'`).Scan(&tableName); err != nil {
+		t.Fatalf("media_contexts table missing: %v", err)
+	}
+	var indexName string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_media_contexts_session_created'`).Scan(&indexName); err != nil {
+		t.Fatalf("media_contexts index missing: %v", err)
+	}
+	var archiveReasonFound int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('media_contexts') WHERE name = 'archive_reason'`).Scan(&archiveReasonFound); err != nil {
+		t.Fatalf("query media_contexts columns: %v", err)
+	}
+	if archiveReasonFound != 1 {
+		t.Fatal("media_contexts.archive_reason column missing")
+	}
+	if v := readUserVersion(); v != Current {
+		t.Fatalf("version = %d, want Current", v)
+	}
+}
+
 func TestUserVersion(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)

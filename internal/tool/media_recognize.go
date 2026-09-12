@@ -52,8 +52,10 @@ func WithMediaRecognizer(ctx context.Context, recognizer MediaRecognizer) contex
 }
 
 type mediaRecognizeArgs struct {
-	InputRef  string   `json:"input_ref,omitempty"`
-	InputRefs []string `json:"input_refs,omitempty"`
+	InputRef    string   `json:"input_ref,omitempty"`
+	InputRefs   []string `json:"input_refs,omitempty"`
+	ContextRefs []string `json:"context_refs,omitempty"`
+	ContextMode string   `json:"context_mode,omitempty"`
 	// UploadID/UploadIDs remain accepted for existing conversations and older
 	// model prompts. New calls should use the storage-neutral input_ref fields.
 	UploadID  string   `json:"upload_id"`
@@ -68,14 +70,36 @@ func handleMediaRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 	}
 	inputRefs := normalizeImageUploadIDs(args.InputRef, args.InputRefs)
 	inputRefs = normalizeImageUploadIDs("", append(inputRefs, normalizeImageUploadIDs(args.UploadID, args.UploadIDs)...))
-	if len(inputRefs) == 0 {
-		return &CallResult{Content: "input_ref or input_refs is required", IsError: true}, nil
-	}
 	sessionID, _ := ctx.Value(SessionIDKey{}).(string)
 	resolver, _ := ctx.Value(mediaResolverKey{}).(MediaResolver)
 	recognizer, _ := ctx.Value(mediaRecognizerKey{}).(MediaRecognizer)
 	if sessionID == "" || resolver == nil || recognizer == nil {
 		return &CallResult{Content: "media_recognize is not available in this session", IsError: true}, nil
+	}
+	contextExpansion, contextMode, err := resolveToolMediaContext(ctx, sessionID, MediaContextResolveRequest{
+		ContextRefs:    args.ContextRefs,
+		ContextMode:    args.ContextMode,
+		ToolName:       "media_recognize",
+		PreferredKinds: []string{"recognition"},
+		InputRefs:      inputRefs,
+	})
+	if err != nil {
+		return &CallResult{
+			Content: fmt.Sprintf("media_recognize context rejected: %v", err),
+			IsError: true,
+			Status:  CallStatusBlocked,
+			Summary: fmt.Sprintf("media_recognize context rejected: %v", err),
+		}, nil
+	}
+	if len(inputRefs) == 0 {
+		if contextMode == MediaContextModeSummarize && strings.TrimSpace(contextExpansion.Text) != "" {
+			return &CallResult{
+				Content:     "Reusable media context summary; no fresh media was read:\n" + strings.TrimSpace(contextExpansion.Text),
+				Summary:     fmt.Sprintf("Summarized %d reusable media context(s)", len(contextExpansion.IDs)),
+				ContextRefs: contextExpansion.IDs,
+			}, nil
+		}
+		return &CallResult{Content: "input_ref or input_refs is required", IsError: true}, nil
 	}
 	assets := make([]MediaRecognitionAsset, 0, len(inputRefs))
 	kind := ""
@@ -95,6 +119,7 @@ func handleMediaRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 	if question == "" {
 		question = fmt.Sprintf("Analyze the attached %s content in detail and return factual observations relevant to the conversation.", kind)
 	}
+	question = appendMediaContextExpansion(question, contextMode, contextExpansion)
 	text, err := recognizer(ctx, MediaRecognitionRequest{Asset: assets[0], Assets: assets, Question: question})
 	if err != nil {
 		return &CallResult{Content: "media_recognize failed: " + err.Error(), IsError: true}, nil
@@ -104,7 +129,8 @@ func handleMediaRecognize(ctx context.Context, argsRaw json.RawMessage) (*CallRe
 		return &CallResult{Content: "media_recognize returned an empty result", IsError: true}, nil
 	}
 	return &CallResult{
-		Content: fmt.Sprintf("%s recognition result for %s:\n%s", kind, strings.Join(inputRefs, ","), text),
-		Summary: fmt.Sprintf("Recognized %d %s media asset(s)", len(assets), kind),
+		Content:     fmt.Sprintf("%s recognition result for %s:\n%s", kind, strings.Join(inputRefs, ","), text),
+		Summary:     fmt.Sprintf("Recognized %d %s media asset(s)", len(assets), kind),
+		ContextRefs: contextExpansion.IDs,
 	}, nil
 }

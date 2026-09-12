@@ -88,6 +88,10 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 	// a flat list so the order and the byte-exact output are
 	// easy to verify.
 	var sb strings.Builder
+	sb.WriteString(runtimeContextPolicy)
+	// 通用规则先于风格和项目内容，扩大跨会话可复用的前缀。
+	// Put shared policies before style and project content to extend reusable prefixes.
+	sb.WriteString(buildToolHintBlock(availableTools, kbEnabled))
 	styleBlock, err := a.buildStyleBlock(s)
 	if err != nil {
 		return "", sig, err
@@ -97,7 +101,6 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 	sb.WriteString(agents.LoadAllWithRoot(projectRoot) + "\n---\n\n")
 	sb.WriteString(rules.BuildRulesContext(a.rules) + "\n---\n\n")
 	sb.WriteString(skill.BuildCatalogContext(skillCatalog, 8*1024) + "\n---\n\n")
-	sb.WriteString(buildToolHintBlock(availableTools, kbEnabled))
 	sb.WriteString(buildWorkingDirBlock(projectRoot))
 	sb.WriteString(buildHostRuntimeBlock(projectRoot))
 	sb.WriteString(buildLanguageBlock(lang))
@@ -186,12 +189,12 @@ func buildToolHintBlock(availableTools []tool.Tool, kbEnabled bool) string {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString(buildToolHint(availableTools))
-	sb.WriteString(buildToolSpecificHints(availableTools, kbEnabled))
-	sb.WriteString(buildAvailableToolsSection(availableTools))
 	sb.WriteString(buildPlatformSection())
 	sb.WriteString(buildConversationContinuitySection())
 	sb.WriteString(buildAttachmentsSection())
+	sb.WriteString(buildToolHint(availableTools))
+	sb.WriteString(buildToolSpecificHints(availableTools, kbEnabled))
+	sb.WriteString(buildAvailableToolsSection(availableTools))
 	return sb.String()
 }
 
@@ -501,10 +504,7 @@ func buildLanguageBlock(lang string) string {
 // PromptOv) stays in lock-step with the main-agent wording — any
 // drift between the two will confuse the LLM.
 func appendWorkingDirectoryBlock(projectRoot string) string {
-	return fmt.Sprintf("\n\n---\n\n## Working Directory\n\n"+
-		"Your working directory is fixed at `%s`. exec_command runs here automatically "+
-		"(the work_dir argument is ignored). read_file and write_file resolve relative "+
-		"paths against this directory.\n", projectRoot)
+	return buildWorkingDirBlock(projectRoot)
 }
 
 // buildKBIndex builds the Knowledge Base section of the system prompt.

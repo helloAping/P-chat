@@ -98,6 +98,12 @@ type SandboxChecker interface {
 
 没有新图片的后续追问仍可暴露 `media_recognize`：历史图片不会作为原图 payload 反复提交给主模型，而是替换为带 `upload_id` 的安全占位。图片优先走配置路由，必要时 fallback 到当前视觉模型；音频和视频走各自配置路由。没有任何可用能力时，占位会要求模型提示用户重新上传或切换/配置模型。
 
+媒体识别和媒体生成工具都支持可选 `context_refs` / `context_mode`。默认 `fresh` 表示重新读取
+`input_refs` 或重新生成，不继承旧工具上下文；`continue`、`merge`、`verify`、`summarize`
+会通过 agent 注入的 `MediaContextResolver` 展开当前会话 active 分支上的 `media_contexts`，
+并把有界文本附加到识别问题或生成 prompt。`input_refs` 表达“使用哪个媒体/资产”，
+`context_refs` 只表达“沿用哪次工具调用的问题、prompt、结果和摘要”，两者不能互相替代。
+
 `read_file` 自动提取 PDF 和支持的 Office 文档；`exec_command(background=true)` 统一启动后台进程。`image_recognize`、`read_docx`、`read_pdf`、`start_process` 仅作为隐藏兼容别名保留，不会和 canonical 工具同时暴露给模型。
 
 识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，当前轮图片二进制都不会发给主模型，避免主模型收到 `image_url` / image block。重答目标消息中的图片按“当前轮图片”处理，会重新识别或重新提交；更早的历史图片仍走占位 + 工具引用。

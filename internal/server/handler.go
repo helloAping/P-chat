@@ -957,6 +957,7 @@ type StreamEvent struct {
 	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
 	ToolSummary      string   `json:"tool_summary,omitempty"`
 	ToolChangedPaths []string `json:"tool_changed_paths,omitempty"`
+	ToolContextRefs  []string `json:"tool_context_refs,omitempty"`
 	ToolRetryable    bool     `json:"tool_retryable,omitempty"`
 	ToolRequiresUser bool     `json:"tool_requires_user,omitempty"`
 	ToolNextAction   string   `json:"tool_next_action,omitempty"`

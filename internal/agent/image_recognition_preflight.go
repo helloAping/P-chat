@@ -364,7 +364,7 @@ func replaceImagesWithHeldRefs(msgs []llm.ChatMessage) []llm.ChatMessage {
 	return out
 }
 
-func (a *Agent) injectCurrentImageRecognition(ctx context.Context, msgs []llm.ChatMessage, imageStart int, userText string, ch chan<- ChatStreamChunk, nextSeq func() uint64) []llm.ChatMessage {
+func (a *Agent) injectCurrentImageRecognition(ctx context.Context, msgs []llm.ChatMessage, imageStart int, sessionID, regenGroupID, userText string, ch chan<- ChatStreamChunk, nextSeq func() uint64) []llm.ChatMessage {
 	images := currentTurnRecognitionImages(msgs, imageStart)
 	if len(images) == 0 {
 		return msgs
@@ -402,5 +402,6 @@ func (a *Agent) injectCurrentImageRecognition(ctx context.Context, msgs []llm.Ch
 		Type:    llm.TypeText,
 		Content: currentImageRecognitionContext(userText, images, result),
 	})
+	a.recordCurrentImageRecognitionContext(sessionID, regenGroupID, userText, images, result)
 	return dropCurrentImageRecognitionRefs(msgs, imageStart)
 }

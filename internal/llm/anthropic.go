@@ -73,9 +73,10 @@ func (b anthropicBlocksRaw) MarshalJSON() ([]byte, error) {
 }
 
 type anthropicContentBlock struct {
-	Type   string                  `json:"type"`
-	Text   string                  `json:"text,omitempty"`
-	Source *anthropicContentSource `json:"source,omitempty"`
+	Type     string                  `json:"type"`
+	Text     string                  `json:"text,omitempty"`
+	Thinking string                  `json:"thinking,omitempty"`
+	Source   *anthropicContentSource `json:"source,omitempty"`
 	// Tool use fields
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`

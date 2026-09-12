@@ -107,6 +107,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolCallStatus = chunk.ToolCallStatus
 		ev.ToolSummary = chunk.ToolSummary
 		ev.ToolChangedPaths = chunk.ToolChangedPaths
+		ev.ToolContextRefs = chunk.ToolContextRefs
 		ev.ToolRetryable = chunk.ToolRetryable
 		ev.ToolRequiresUser = chunk.ToolRequiresUser
 		ev.ToolNextAction = chunk.ToolNextAction

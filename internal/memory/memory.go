@@ -444,6 +444,12 @@ func (s *Store) AddChatMessageWithMetaTo(convID string, msg llm.ChatMessage, ext
 // its SQLite row id. It is for callers that need a durable row anchor they
 // can update later (for example a background sub-agent card).
 func (s *Store) AddChatMessageWithMetaToNow(convID string, msg llm.ChatMessage, extraMeta map[string]string) (int64, error) {
+	return s.AddChatMessageWithMetaToRegenNow(convID, msg, extraMeta, "", false)
+}
+
+// AddChatMessageWithMetaToRegenNow writes a regen-aware ChatMessage
+// immediately and returns its SQLite row id.
+func (s *Store) AddChatMessageWithMetaToRegenNow(convID string, msg llm.ChatMessage, extraMeta map[string]string, regenGroupID string, isArchived bool) (int64, error) {
 	if convID == "" {
 		return 0, fmt.Errorf("conversation id is required")
 	}
@@ -468,10 +474,18 @@ func (s *Store) AddChatMessageWithMetaToNow(convID string, msg llm.ChatMessage, 
 	if maxSeq.Valid {
 		nextSeq = maxSeq.Int64 + 1
 	}
+	var rgPtr *string
+	if regenGroupID != "" {
+		rgPtr = &regenGroupID
+	}
+	archived := 0
+	if isArchived {
+		archived = 1
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq, is_archived)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-		convID, msg.Role, msg.Content, now.Unix(), string(b), msg.MsgType, msg.SubmitToLLM, nextSeq,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq, regen_group_id, is_archived)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		convID, msg.Role, msg.Content, now.Unix(), string(b), msg.MsgType, msg.SubmitToLLM, nextSeq, rgPtr, archived,
 	)
 	if err != nil {
 		return 0, err
@@ -1084,7 +1098,7 @@ func encodeChatMeta(msg llm.ChatMessage) map[string]string {
 // + tool results), and the wire UI re-derives the parts via
 // decodePartsFromMeta on the ListMessages path. This keeps the
 // LLM context complete without changing the wire shape.
-func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbSubmitToLLM int) []llm.ChatMessage {
+func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbSubmitToLLM int) (decoded []llm.ChatMessage) {
 	if metaStr == "" || metaStr == "{}" {
 		if content != "" {
 			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1}}
@@ -1105,6 +1119,18 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 		}
 		return nil
 	}
+	// 使用既有 thinking 元数据恢复协议上下文，无需新增存储字段。
+	// Restore protocol reasoning from the existing thinking metadata without new storage fields.
+	defer func() {
+		if thinking := meta["thinking"]; thinking != "" {
+			for i := range decoded {
+				if decoded[i].Role == llm.RoleAssistant && decoded[i].Type == llm.TypeText {
+					decoded[i].Meta = map[string]any{"thinking": thinking}
+					break
+				}
+			}
+		}
+	}()
 
 	// v2 (current) format: the agent's snapshotStructural
 	// writes `meta["parts"] = "<json of []MessagePart>"` with
@@ -2552,6 +2578,14 @@ func (s *Store) ArchiveSiblings(convID, groupID string, keepActiveID int64) (del
 	); err != nil {
 		return 0, fmt.Errorf("archive siblings: %w", err)
 	}
+	if _, err := tx.Exec(
+		`UPDATE media_contexts
+			 SET archived = 1, archive_reason = 'regen'
+			 WHERE session_id = ? AND regen_group_id = ?`,
+		convID, groupID,
+	); err != nil {
+		return 0, fmt.Errorf("archive media contexts: %w", err)
+	}
 
 	// 2. Enforce MaxRegenPerGroup in the same transaction.
 	//    Count the (active + archived) rows in the group; if
@@ -2768,13 +2802,30 @@ func (s *Store) ActivateSibling(convID, groupID string, activeID int64) error {
 	// the scope tight (no accidental effect on rows from
 	// other groups even if a future refactor passes the
 	// wrong activeID past the guard above).
-	_, err = s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(
 		`UPDATE messages
-		 SET is_archived = CASE WHEN id = ? THEN 0 ELSE 1 END
-		 WHERE conversation_id = ? AND regen_group_id = ?`,
+			 SET is_archived = CASE WHEN id = ? THEN 0 ELSE 1 END
+			 WHERE conversation_id = ? AND regen_group_id = ?`,
 		activeID, convID, groupID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE media_contexts
+			 SET archived = CASE WHEN message_id = ? THEN 0 ELSE 1 END,
+			     archive_reason = CASE WHEN message_id = ? THEN '' ELSE 'regen' END
+			 WHERE session_id = ? AND regen_group_id = ?`,
+		activeID, activeID, convID, groupID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteMessagesFrom deletes all messages with id >= fromID in the
@@ -2848,10 +2899,26 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 		return nil, nil
 	}
 
-	if _, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`UPDATE media_contexts
+		 SET archived = 1, archive_reason = 'rollback'
+		 WHERE session_id = ? AND message_id >= ? AND archived = 0`,
+		conversationID, fromID,
+	); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(
 		`DELETE FROM messages WHERE conversation_id = ? AND id >= ?`,
 		conversationID, fromID,
 	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return deleted, nil
@@ -2913,6 +2980,14 @@ func (s *Store) RestoreMessages(messages []Message) error {
 			m.ID, m.ConversationID, m.Role, m.Content, m.Tokens,
 			m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM, m.Seq,
 			regenGroupArg, isArchived,
+		); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`UPDATE media_contexts
+				 SET archived = 0, archive_reason = ''
+				 WHERE session_id = ? AND message_id = ? AND archive_reason = 'rollback'`,
+			m.ConversationID, m.ID,
 		); err != nil {
 			return err
 		}

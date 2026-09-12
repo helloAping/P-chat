@@ -60,6 +60,8 @@ func NewOpenAIAdapter(baseURL, apiKey, providerName string) *OpenAIAdapter {
 func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens int, tools []ToolDef, system string, temperature float32, topP float32) (*ProtocolRequest, error) {
 	openaiMsgs := make([]openai.ChatCompletionMessage, 0, len(messages)+1)
 	mediaParts := make(map[string][]any)
+	reasoning := make(map[int]string)
+	replayReasoning := len(tools) > 0 && deepSeekReasoningReplay(model, a.baseURL)
 
 	// System prompt as first message.
 	if system != "" {
@@ -103,6 +105,9 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 
 	for i := 0; i < len(messages); i++ {
 		msg := messages[i]
+		if IsRuntimeContext(msg) {
+			msg.Content = runtimeContextContent(msg)
+		}
 
 		switch msg.Type {
 		case TypeThinking:
@@ -218,6 +223,9 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 					// same round, and both belong on the same
 					// wire message.
 					la.Content = msg.Content
+					if thinking := messageReasoning(msg); replayReasoning && thinking != "" {
+						reasoning[lastAssistantIdx] = thinking
+					}
 					continue
 				}
 			}
@@ -227,6 +235,9 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 			})
 			if role == openai.ChatMessageRoleAssistant {
 				lastAssistantIdx = len(openaiMsgs) - 1
+				if thinking := messageReasoning(msg); replayReasoning && thinking != "" {
+					reasoning[lastAssistantIdx] = thinking
+				}
 			} else {
 				lastAssistantIdx = -1
 			}
@@ -299,6 +310,10 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 		}
 	}
 	body = addOpenAIImageDataFields(body)
+	body, err = addReasoningContent(body, reasoning)
+	if err != nil {
+		return nil, fmt.Errorf("serialize reasoning context: %w", err)
+	}
 
 	headers := map[string]string{
 		"Content-Type":  "application/json",
@@ -519,10 +534,7 @@ func (a *OpenAIAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				}
 			}
 			if r.Usage != nil {
-				ch <- StreamChunk{
-					TokensIn:  r.Usage.PromptTokens,
-					TokensOut: r.Usage.CompletionTokens,
-				}
+				ch <- r.Usage.chunk()
 			}
 			if choiceCount == 0 || (contentChars == 0 && thinkingChars == 0) {
 				if v, _ := extractContent(payload); v != "" {

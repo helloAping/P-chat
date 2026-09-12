@@ -2472,25 +2472,25 @@ watch([() => state.currentID, queueSignature], () => {
                   {{ opt.label }}
                 </button>
               </div>
-            </div>
-            </div>
-          </div>
-        </NPopover>
+	            </div>
+	            </div>
+	          </div>
+	        </NPopover>
 
-        <!-- Plan mode toggle: stays inline because the user
-             switches it often (planning vs building a feature). -->
-        <button
-          type="button"
-          class="ctrl-btn"
-          :class="{ 'ctrl-btn--active': planMode }"
-          :disabled="!state.currentID"
-          :title="planMode ? '当前：计划模式' : '当前：构建模式'"
-          :aria-label="planMode ? '切换到构建模式' : '切换到计划模式'"
-          @click="togglePlanMode"
-        >
-          <component :is="planMode ? Clipboard : Hammer" :size="13" />
-          <span class="ctrl-btn-label">{{ planMode ? '计划' : '构建' }}</span>
-        </button>
+	        <!-- Plan mode toggle: stays inline because the user
+	             switches it often (planning vs building a feature). -->
+	        <button
+	          type="button"
+	          class="ctrl-btn"
+	          :class="{ 'ctrl-btn--active': planMode }"
+	          :disabled="!state.currentID"
+	          :title="planMode ? '当前：计划模式' : '当前：构建模式'"
+	          :aria-label="planMode ? '切换到构建模式' : '切换到计划模式'"
+	          @click="togglePlanMode"
+	        >
+	          <component :is="planMode ? Clipboard : Hammer" :size="13" />
+	          <span class="ctrl-btn-label">{{ planMode ? '计划' : '构建' }}</span>
+	        </button>
 
         <!-- Permission picker: icon-only popover. Three
              states map to lock / unlock / key icons. Keeps

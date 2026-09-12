@@ -55,19 +55,20 @@ import (
 // `omitempty` so e.g. a "text" part never carries a stray
 // "elapsed" field.
 type MessagePart struct {
-	Kind       string `json:"kind"`
-	Text       string `json:"text,omitempty"`
-	textBuffer []byte
-	Streaming  bool          `json:"streaming,omitempty"`
-	Name       string        `json:"name,omitempty"`
-	Args       string        `json:"args,omitempty"`
-	Status     string        `json:"status,omitempty"`
-	Result     string        `json:"result,omitempty"`
-	Error      string        `json:"error,omitempty"`
-	Elapsed    string        `json:"elapsed,omitempty"`
-	Task       string        `json:"task,omitempty"`
-	Parts      []MessagePart `json:"parts,omitempty"`
-	ToolID     string        `json:"tool_id,omitempty"`
+	Kind        string `json:"kind"`
+	Text        string `json:"text,omitempty"`
+	textBuffer  []byte
+	Streaming   bool          `json:"streaming,omitempty"`
+	Name        string        `json:"name,omitempty"`
+	Args        string        `json:"args,omitempty"`
+	Status      string        `json:"status,omitempty"`
+	Result      string        `json:"result,omitempty"`
+	Error       string        `json:"error,omitempty"`
+	Elapsed     string        `json:"elapsed,omitempty"`
+	Task        string        `json:"task,omitempty"`
+	Parts       []MessagePart `json:"parts,omitempty"`
+	ToolID      string        `json:"tool_id,omitempty"`
+	ContextRefs []string      `json:"context_refs,omitempty"`
 	// AgentType is the sub-agent's registered name
 	// ("explore", "plan", "general-purpose", or a custom
 	// agent from .p-chat/agent/*.md). Set on sub_agent
@@ -558,6 +559,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 				p.Result = result
 				p.Error = c.ToolError
 				p.Elapsed = c.ToolElapsed
+				p.ContextRefs = append([]string(nil), c.ToolContextRefs...)
 				if c.ToolArgs != "" {
 					p.Args = c.ToolArgs
 				}
@@ -570,14 +572,15 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		// part (defensive: a "ok" with no preceding "start"
 		// can happen if the stream is reset between calls).
 		parts = append(parts, MessagePart{
-			Kind:    "tool",
-			Name:    c.ToolName,
-			Args:    c.ToolArgs,
-			Status:  status,
-			Result:  result,
-			Error:   c.ToolError,
-			Elapsed: c.ToolElapsed,
-			ToolID:  c.ToolID,
+			Kind:        "tool",
+			Name:        c.ToolName,
+			Args:        c.ToolArgs,
+			Status:      status,
+			Result:      result,
+			Error:       c.ToolError,
+			Elapsed:     c.ToolElapsed,
+			ToolID:      c.ToolID,
+			ContextRefs: append([]string(nil), c.ToolContextRefs...),
 		})
 		a.setPartsFor(subIdx, parts)
 		return

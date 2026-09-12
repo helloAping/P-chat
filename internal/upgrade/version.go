@@ -75,7 +75,10 @@ const (
 	// per-request conversation, message, UUID, and Snowflake variables.
 	V13 AppVersion = 13
 
+	// V14 — media recognition and generation calls persist reusable context rows.
+	V14 AppVersion = 14
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V13
+	Current AppVersion = V14
 )

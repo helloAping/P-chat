@@ -1494,6 +1494,7 @@ type ChatStreamChunk struct {
 	ToolCallStatus   string   `json:"tool_call_status,omitempty"`
 	ToolSummary      string   `json:"tool_summary,omitempty"`
 	ToolChangedPaths []string `json:"tool_changed_paths,omitempty"`
+	ToolContextRefs  []string `json:"tool_context_refs,omitempty"`
 	ToolRetryable    bool     `json:"tool_retryable,omitempty"`
 	ToolRequiresUser bool     `json:"tool_requires_user,omitempty"`
 	ToolNextAction   string   `json:"tool_next_action,omitempty"`
@@ -1879,6 +1880,7 @@ func attachToolResultMetadata(chunk *ChatStreamChunk, result *tool.CallResult) {
 	chunk.ToolCallStatus = string(result.Status)
 	chunk.ToolSummary = result.Summary
 	chunk.ToolChangedPaths = append([]string(nil), result.ChangedPaths...)
+	chunk.ToolContextRefs = append([]string(nil), result.ContextRefs...)
 	chunk.ToolRetryable = result.Retryable
 	chunk.ToolRequiresUser = result.RequiresUser
 	chunk.ToolNextAction = result.NextAction
@@ -2238,10 +2240,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "system", Error: err.Error(), Done: true})
 			return
 		}
-		// Inject knowledge base context + index.
+		// 知识库索引作为末尾快照，变化时不改写历史前缀。
+		// Append the knowledge index as a tail snapshot without rewriting history prefixes.
+		var kbIndex string
 		if kbEnabled {
-			kbIndex := a.buildKBIndex(req.KBBase)
-			systemPrompt += kbIndex
+			kbIndex = a.buildKBIndex(req.KBBase)
 		}
 		// Sub-agent prompt override. When the sub-agent runner
 		// supplies a prompt (from the agent's own prompt or the
@@ -2250,7 +2253,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// skill context below so the child retains access to
 		// any user context that was in flight.
 		if req.PromptOv != "" {
-			systemPrompt = req.PromptOv
+			systemPrompt = req.PromptOv + "\n\n" + runtimeContextPolicy
+			kbIndex = ""
 		}
 		// Re-append the "Working Directory" section when a
 		// sub-agent overrides the system prompt. The main
@@ -2261,7 +2265,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// and read_file are anchored to. Mirrors the wording
 		// in buildStaticSystemPrompt so the LLM sees a
 		// consistent instruction in both contexts.
-		if req.ProjectRoot != "" {
+		if req.PromptOv != "" && req.ProjectRoot != "" {
 			systemPrompt += appendWorkingDirectoryBlock(req.ProjectRoot)
 		}
 		if req.SubagentType != "" {
@@ -2296,19 +2300,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "skill", Error: err.Error(), ErrorKind: "skill_error", Done: true})
 			return
 		}
-		if activeSkillContext != "" {
-			systemPrompt += "\n\n---\n\n## 激活的技能上下文\n\n" + activeSkillContext + "\n"
-		}
 		// 兼容仍发送完整 SKILL.md 正文的旧 GUI/CLI 客户端。
 		// Compatibility for older GUI/CLI clients that still send the full SKILL.md body.
 		// 新客户端改为发送 ActiveSkills。
 		// New clients send ActiveSkills instead.
 		if req.SkillContext != "" {
-			systemPrompt += "\n\n---\n\n## 激活的技能上下文\n\n" + req.SkillContext + "\n"
-		}
-		// Append style memory (动态注入，不破坏静态缓存)
-		if styleMemory := a.getStyleMemory(req.Style); styleMemory != "" {
-			systemPrompt += "\n\n---\n\n## 我的上下文\n\n" + styleMemory
+			activeSkillContext += "\n\n" + req.SkillContext
 		}
 
 		// 构造系统提示、历史上下文与本轮新消息，并明确标记历史边界。
@@ -2316,13 +2313,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// LLM context into SQLite as fresh rows.
 		msgs := []llm.ChatMessage{
 			{Role: llm.RoleSystem, Type: llm.TypeText, Content: systemPrompt},
-		}
-		// Keep one dynamic todo block inside the first system message. This
-		// survives prompt overrides and auto-compaction without appending a
-		// fresh message on every round.
-		initialTodos := unfinishedTodos(req.SessionID)
-		if todoGuardActive(todoMode, initialTodos) {
-			upsertTodoGuard(&msgs, todoMode, initialTodos, false)
 		}
 		historyCount := clampHistoryMessageCount(req.HistoryMessageCount, len(req.Messages))
 		history := req.Messages[:historyCount]
@@ -2425,7 +2415,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 		}
 		if currentTurnImageRecognition {
-			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, latestUserText(newMessages), ch, nextSeq)
+			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, req.SessionID, req.RegenGroupID, latestUserText(newMessages), ch, nextSeq)
 		}
 		msgs = replaceAttachmentReferences(msgs, persistStart, imageRecognitionToolAvailable, attachmentReadAvailable, toolRecognitionCapabilities)
 		msgs = dropDisplayOnlyMediaMessages(msgs)
@@ -2436,6 +2426,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				msgs = replaceImagesWithRecognitionRefs(msgs)
 			}
 		}
+
+		// 只追加变化的快照，并沿用普通消息持久化，跨回合保留相同前缀。
+		// Persist changed snapshots as ordinary context rows to preserve prefixes across turns.
+		a.appendRuntimeContext(&msgs, req, "knowledge", kbIndex)
+		a.appendRuntimeContext(&msgs, req, "skills", strings.TrimSpace(activeSkillContext))
+		a.appendRuntimeContext(&msgs, req, "memory", a.getStyleMemory(req.Style))
+		a.appendRuntimeContext(&msgs, req, "media", a.buildRecentMediaContextBlock(req.SessionID))
 
 		// Plan mode: the LLM can use `todo_write` to break down
 		// the analysis into steps, and `question` to clarify vague
@@ -2562,8 +2559,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 			}
 			currentTodos := unfinishedTodos(req.SessionID)
-			if todoGuardActive(todoMode, currentTodos) || todoCheckpoint.active() {
-				upsertTodoGuard(&msgs, todoMode, currentTodos, todoCheckpoint.active())
+			if appendTodoGuard(&msgs, todoMode, currentTodos, todoCheckpoint.active()) && a.store != nil && req.SessionID != "" {
+				a.store.AddChatMessageWithMetaToRegen(req.SessionID, msgs[len(msgs)-1], nil, req.RegenGroupID, false)
 			}
 
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d", roundNum), Message: fmt.Sprintf("[第 %d 轮] 调用 LLM", roundNum), Round: roundNum, MaxRound: maxRounds})
@@ -2714,6 +2711,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 		att:
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				var usage requestUsage
 				// attemptCtx is what this attempt's stream and
 				// cancellation checks run on: the initial attempt stays
 				// on the turn context (deadline backstop); retries move
@@ -2916,12 +2914,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 					streamBytes += chunkBytes
 					if chunk.TokensIn > 0 || chunk.TokensOut > 0 {
-						if chunk.TokensIn > totalIn {
-							totalIn = chunk.TokensIn
-						}
-						if chunk.TokensOut > totalOut {
-							totalOut = chunk.TokensOut
-						}
+						inDelta, outDelta := usage.add(chunk)
+						totalIn += inDelta
+						totalOut += outDelta
+					}
+					if cache := chunk.CacheUsage; cache != nil {
+						log.Printf("%s[llm/cache] provider=%s model=%s round=%d attempt=%d input_tokens=%d cache_hit_tokens=%d cache_miss_tokens=%d",
+							trace.LogPrefix(ctx), req.Provider, req.Model, roundNum, attempt, chunk.TokensIn, cache.HitTokens, cache.MissTokens)
 					}
 					if chunk.Content != "" {
 						fullContentBuilder.WriteString(chunk.Content)
@@ -2954,6 +2953,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			fullContent := fullContentBuilder.String()
 			fullThinking := fullThinkingBuilder.String()
+			modelThinking := fullThinking
 
 			// If we exhausted retries without success, surface the last
 			// error. Emit on retryCtx (the deadline-free abort context) so
@@ -2969,9 +2969,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				return
 			}
 
-			for _, t := range argsAccum {
-				toolCalls = append(toolCalls, *t)
-			}
+			toolCalls = orderedToolCalls(argsAccum)
 
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 
@@ -3035,8 +3033,45 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				Content:     fullContent,
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
+				Meta:        map[string]any{"thinking": modelThinking},
 			}
 			msgs = append(msgs, assistantMsg)
+			// 以实际请求顺序入库：助手文本，再工具调用，再工具结果。
+			// Persist the same order sent on the wire: assistant text, calls, then results.
+			var roundToolMessages []llm.ChatMessage
+			type roundMediaResult struct {
+				call   nativeToolCall
+				result *tool.CallResult
+			}
+			roundMediaResults := make(map[string]roundMediaResult)
+			roundPersisted := false
+			persistRound := func() {
+				if roundPersisted {
+					return
+				}
+				assistantRowID := persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+				if a.store != nil {
+					for _, msg := range roundToolMessages {
+						a.store.AddChatMessageTo(req.SessionID, msg)
+					}
+					if assistantRowID > 0 {
+						groupID := req.RegenGroupID
+						if groupID == "" {
+							if uid := a.store.GetLastUserMessageID(req.SessionID); uid > 0 {
+								groupID = strconv.FormatInt(uid, 10)
+							}
+						}
+						if err := a.store.AssignPendingMediaContextsToMessage(req.SessionID, groupID, assistantRowID); err != nil {
+							log.Printf("%s[agent] assign pending media contexts: %v", trace.LogPrefix(ctx), err)
+						}
+					}
+					for _, media := range roundMediaResults {
+						a.recordMediaToolContext(req.SessionID, req.RegenGroupID, assistantRowID, media.call.ID, media.call.Name, media.call.ArgsJSON, media.result)
+					}
+					roundMediaResults = nil
+				}
+				roundPersisted = true
+			}
 
 			// Late-retry success past the turn budget: the retry phase is
 			// detached from MaxTurnSeconds, so a reply can land after the
@@ -3044,7 +3079,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// tools / starting a new round on an expired context — persist
 			// the reply and end with a done event.
 			if successAttempt > 1 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+				persistRound()
 				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 					Phase:     "done",
 					Step:      "done",
@@ -3065,27 +3100,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// Token budget for repeated tool rounds is handled by
 			// tryAutoCompact.
 
-			// Persist assistant message later — after tool
-			// results are in partsAcc (see end of this round).
-
-			// P1-2: run auto-compact BEFORE appending the
-			// current round's tool_call messages. The old
-			// order (append → compact → re-append) was
-			// correct but redundant: compact could absorb
-			// the just-appended tool_call, and the
-			// re-append loop had to put it back. Moving
-			// compact ahead makes the order naturally
-			// idempotent — tool_call append happens after
-			// compaction so it always survives.
-			//
-			// The function returns true when compaction
-			// actually fired. We do NOT continue here:
-			// the LLM already decided to call these tools,
-			// the user expects them to run, and skipping
-			// execution would leak orphan tool_calls into
-			// the next round's history. Fall through to
-			// the tool execution block below.
-			a.tryAutoCompact(ctx, &msgs, req, toolDefs, ch, nextSeq, roundNum, maxRounds)
+			// 下一次请求之前再压缩，避免重载数据库时丢失尚未入库的助手输出。
+			// Compact before the next request, so a DB reload cannot lose this unpersisted response.
 
 			// Append tool_call messages for each tool call.
 			//
@@ -3121,12 +3137,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					SubmitToLLM: 1,
 				}
 				msgs = append(msgs, tcm)
-				if a.store != nil {
-					a.store.AddChatMessageTo(req.SessionID, tcm)
-				}
+				roundToolMessages = append(roundToolMessages, tcm)
 			}
 
 			if len(toolCalls) == 0 {
+				persistRound()
 				if jobs, err := activeAsyncSubagentJobs(a.store, req.SessionID); err == nil && len(jobs) > 0 && !isLastRound && toolAvailable(availableTools, "task_wait") {
 					msgs = append(msgs, llm.ChatMessage{
 						Role:    llm.RoleUser,
@@ -3215,11 +3230,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 				}
 				if pending > 0 {
-					persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+					persistRound()
 					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 					return
 				}
-				persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+				persistRound()
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
 				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 				return
@@ -3345,6 +3360,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
+				}
+				if a.store != nil && req.SessionID != "" {
+					tctx = tool.WithMediaContextResolver(tctx, a.resolveMediaContextForTool)
 				}
 				if imageRecognitionToolAvailable {
 					resolver := tool.ImageResolver(a.resolveImageForRecognition)
@@ -3813,6 +3831,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				close(toolsDone)
 			}()
 			if err := waitToolsWithHeartbeat(ctx, toolsDone, ch, nextSeq, toolWaitHeartbeatInterval); err != nil {
+				// 取消时也保留已发出的调用，后续历史修复可补齐中断结果。
+				// Preserve issued calls on cancellation so history repair can mark interrupted results.
+				persistRound()
 				return
 			}
 			// All tools completed normally. Drain their final events before
@@ -3821,6 +3842,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				select {
 				case <-f.done:
 				case <-ctx.Done():
+					persistRound()
 					return
 				}
 			}
@@ -3890,9 +3912,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						SubmitToLLM: 1,
 					}
 					msgs = append(msgs, toolMsg)
-					if a.store != nil {
-						a.store.AddChatMessageTo(req.SessionID, toolMsg)
-					}
+					roundToolMessages = append(roundToolMessages, toolMsg)
 					continue
 				}
 
@@ -3978,6 +3998,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// user-facing error messages.
 					llmContent = fmt.Sprintf("Tool %s returned an error: %s", tc.Name, result.Content)
 				} else {
+					if isMediaContextToolName(tc.Name) {
+						roundMediaResults[tc.ID] = roundMediaResult{call: tc, result: result}
+					}
 					if result.Image != nil && useImageRecognition {
 						llmContent = a.recognizeToolResultImageWithConfiguredModel(ctx, tc.Name, latestUserText(msgs), result.Image, ch, nextSeq)
 						if result.Image.AssetID != "" {
@@ -4012,9 +4035,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					SubmitToLLM: 1,
 				}
 				msgs = append(msgs, toolMsg)
-				if a.store != nil {
-					a.store.AddChatMessageTo(req.SessionID, toolMsg)
-				}
+				roundToolMessages = append(roundToolMessages, toolMsg)
 			}
 			// A successful ordinary-work round is real progress. A todo_write
 			// alone must not reset this budget, otherwise a model can alternate
@@ -4043,7 +4064,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					todoCheckpointAttempts++
 					if todoCheckpointAttempts >= MaxTodoCheckpointAttempts {
 						emitTodoIncomplete("todo_write was not completed during the required state check", roundNum)
-						persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+						persistRound()
 						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
 						return
 					}
@@ -4086,7 +4107,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			}
 			// Persist assistant message now that tool
 			// results are captured in partsAcc.
-			persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+			persistRound()
 
 			// Stuck-loop guard. Compute a stable signature of
 			// this round's tool calls and whether any errored.
@@ -4336,9 +4357,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 	return ch
 }
 
-func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int, regenGroupID string) {
+func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int, regenGroupID string) int64 {
 	if store == nil {
-		return
+		return 0
 	}
 	// P1-4: every assistant row needs a regen_group_id so
 	// a later "重答" click can find the regen group and
@@ -4379,6 +4400,11 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 	if fullThinking != "" {
 		meta["thinking"] = fullThinking
 	}
+	// 回传原始思考；UI 的展示修正只影响 parts，不改写协议历史。
+	// Replay original reasoning; display redactions affect parts, not protocol history.
+	if thinking, ok := msg.Meta["thinking"].(string); ok && thinking != "" {
+		meta["thinking"] = thinking
+	}
 	if tokensIn > 0 {
 		meta["tokens_in"] = fmt.Sprintf("%d", tokensIn)
 	}
@@ -4391,7 +4417,13 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 			meta["parts"] = string(pj)
 		}
 	}
-	store.AddChatMessageWithMetaToRegen(convID, msg, meta, regenGroupID, false)
+	id, err := store.AddChatMessageWithMetaToRegenNow(convID, msg, meta, regenGroupID, false)
+	if err != nil {
+		log.Printf("[agent] persist assistant immediate write failed: %v", err)
+		store.AddChatMessageWithMetaToRegen(convID, msg, meta, regenGroupID, false)
+		return 0
+	}
+	return id
 }
 
 // buildToolHint generates a minimal markdown-block fallback instruction
@@ -4524,6 +4556,7 @@ func (a *Agent) tryAutoCompact(
 	// append the summary to the system prompt.
 	lastComp := a.store.LastCompressedIDFor(req.SessionID)
 	if lastComp > 0 {
+		runtimeSnapshots := latestRuntimeContexts(*msgs)
 		hist, _, _ := a.store.GetChatMessagesAfterIDFor(req.SessionID, 0, lastComp)
 		compSum := a.store.CompressedSummaryFor(req.SessionID)
 
@@ -4542,12 +4575,13 @@ func (a *Agent) tryAutoCompact(
 		}
 		// Append messages from DB (after compression point).
 		for _, m := range hist {
-			if m.Role == llm.RoleSystem {
+			if m.Role == llm.RoleSystem && !llm.IsRuntimeContext(m) {
 				continue
 			}
 			newMsgs = append(newMsgs, m)
 		}
 		*msgs = newMsgs
+		a.restoreRuntimeContexts(msgs, req, runtimeSnapshots)
 	}
 
 	postTotal := llm.EstimatePromptTokens(*msgs, tools)

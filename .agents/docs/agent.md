@@ -18,6 +18,8 @@ Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用
 | `parts.go` | 助手消息的结构化 parts 累加器（thinking/skill/tool/sub_agent） | `partsAccumulator`, `snapshotStructural()` |
 | `skills.go` | 显式 Skill 加载、依赖合成和生命周期事件 | `loadActiveSkills()` |
 | `attachment.go` | 用户附件（图片/文件）扩展为 ChatMessage | `AttachmentResolver` |
+| `runtime_context.go` | 可持久化的动态上下文快照，变化时仅追加 | `appendRuntimeContext()`, `restoreRuntimeContexts()` |
+| `usage.go` | 单次请求 usage 去重、跨请求累计 | `requestUsage` |
 
 ## 核心概念
 
@@ -25,17 +27,17 @@ Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用
 
 ```
 for round := 1; maxRounds==0 || round<=maxRounds; round++ {
-    1. 构建系统提示词 (style + work_mode + AGENTS + rules + Skill 索引 + host runtime)
+    1. 构建稳定系统提示词；动态上下文作为末尾快照，变化时才追加
 	1a. 加载 ChatRequest.ActiveSkills，并先发送可见 skill:start 事件
-    2. 规范化消息 (normalizeToolResults — DeepSeek 兼容)
+    2. 检查工具调用配对；必要时在请求前压缩历史
     3. 调用 LLM Stream → 获取内容/思考/工具调用
     4. 解析工具调用 (原生 tool_calls 或 markdown ```tool_call 块)
     5. 清理 markdown tool_call 块中的文本内容
     6. 若无工具调用 → 完成，退出
     7. 并行执行工具 (goroutine + eventCh 64)
     8. 将工具结果追加到消息列表
-    9. DeepSeek 兼容：工具结果角色 → User
-    10. persistAssistant() — 持久化带 parts 的助手消息
+    9. 保留工具调用、结果的原生角色和顺序
+    10. 按助手文本 → 工具调用 → 工具结果顺序持久化，保留 parts 与原始 thinking
     11. 下一个循环轮次
 }
 ```
@@ -179,12 +181,25 @@ Agent 在 `ChatWithTools()` 中用 `HistoryMessageCount` 区分“已入库历�
 
 - `style` 只表示说话风格，以及该风格对应的记忆内容。`style=off` 时，`buildStyleBlock()` 返回空，`getStyleMemory()` 也返回空。
 - `work_mode` 表示任务侧重点。`coding` 偏向读写代码、调试、测试、构建、git、code review；`daily` 偏向文档、邮件、会议纪要、摘要、知识检索和计划整理。
-- `buildStaticSystemPrompt()` 的静态段拼装顺序是：`buildStyleBlock()` → `buildWorkModeBlock()` → AGENTS.md → rules → Skill catalog 索引 → tools → working dir → host runtime → language。
+- `buildStaticSystemPrompt()` 的静态段拼装顺序是：应用上下文规则 → tools（通用规则在前）→ `buildStyleBlock()` → `buildWorkModeBlock()` → AGENTS.md → rules → Skill catalog 索引 → working dir → host runtime → language。
 - 静态 prompt cache 的 signature 包含 `work_mode`，所以单会话切换 coding/daily 会触发新的系统 prompt。
+- 主代理 working dir 仅注入一次；只有 `PromptOv` 覆盖静态提示词时才另行补充。
+
+### 4.6 动态上下文与供应商缓存
+
+- Todo、知识库索引、显式激活 Skill、风格记忆和最近媒体摘要不再拼入首条 system 消息。它们使用 `pchat_context_<name>` 命名快照，在历史末尾追加，内容未变时不重复追加。
+- 快照仍是内部 `RoleSystem` 消息，带 `origin=runtime_context`、`ui_hidden=true`、`SubmitToLLM=1`，沿用现有消息元数据持久化。相同名字以最新快照为准；清空时追加显式撤销说明。
+- OpenAI adapter 在原位置提交带名称的 system 上下文；Anthropic adapter 将其包装为原位置的 user 内容块，避免把动态内容重新提到顶层 system。两者都使用 `application_context` 包装。
+- Todo 每轮检查，但只在状态或检查点变化时追加。自动压缩后恢复每类最新快照；压缩在下一次请求前执行，避免丢失尚未入库的模型输出。
+- 原生工具调用按流式 `index` 排序，数据库回放保持助手文本、调用和结果顺序。服务端仅对缺失调用记录的旧 `task` 结果执行角色兼容回退。
+- 这是请求前缀稳定性优化，不是本地答案缓存。切模型、工具集合/权限变化、项目规则更新和历史压缩仍可能改变前缀；不能以扩大工具权限来追求命中率。
+- 回归入口：`prompt_cache_test.go` 覆盖 Todo 连续更新与数据库重载后的请求前缀一致性；`todo_guard_test.go` 覆盖完成和清空状态。
 
 ### 5. DeepSeek 兼容性
 
-`normalizeToolResults()` (`agent.go:1531`) 将 ToolCall 类型消息移除，ToolResult 角色改为 User。这是 DeepSeek 模型接受工具结果的必要条件。
+DeepSeek 官方接口保留原生工具调用/结果配对。旧 `normalizeToolResults()` 仅作为已验证的特殊代理兼容回退，目前 `needsNormalizedToolResults()` 不对任何供应商启用。不要为 DeepSeek 全局抹掉工具角色。
+
+DeepSeek 带工具请求从助手消息的 `Meta["thinking"]` 回传原始推理内容，包括跨用户回合的历史文本助手消息；详见 [llm.md](llm.md)。
 
 ### 6. 卡死循环保护
 

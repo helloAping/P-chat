@@ -1062,34 +1062,21 @@ func inferTextPartMeta(s string) (name, kind, mime string) {
 //     references so it can replace them with safe placeholders
 //     or media_recognize tool hints before the LLM request.
 //
-//  2. Rewrite `task` tool results from role=tool to role=user.
-//     The `task` tool is the sub-agent system entry point.
-//     The PARENT agent issues the task call (so the parent
-//     sees its own tool_call), but the sub-agent's response
-//     arrives as a tool_result on the PARENT's message
-//     stream. From the parent's LLM perspective, the
-//     tool_call id never appears in the LLM context — only
-//     the result does — and a bare `role: tool` orphan
-//     would be rejected by some providers. The historical
-//     workaround (commit 51039e2) flipped ALL tool_results
-//     to `role: user`, but that's wrong for the main
-//     tool loop: read_file / write_file / exec_command /
-//     todo_write / question results all need to stay as
-//     `role: tool` so the LLM can match them against the
-//     tool_call that produced them.
-//
-//     The fix scopes the rewrite to `task` results only.
-//     `m.ToolName` is populated on the result row when the
-//     agent writes the tool_result message (see
-//     internal/agent/agent.go toolMsg construction).
+//  2. 仅将缺少调用记录的历史 task 结果改为 user；已配对结果保留工具角色和请求前缀。
+//     Rewrite only orphan historical task results to user. Paired results retain
+//     their tool role so reloading a conversation preserves the request prefix.
 
 func buildLLMMessages(histMsgs []llm.ChatMessage) []llm.ChatMessage {
 	msgs := make([]llm.ChatMessage, 0, len(histMsgs)+1)
+	callIDs := make(map[string]bool)
 	for _, m := range histMsgs {
 		if m.SubmitToLLM == 0 && !isHistoricalAttachmentReference(m) {
 			continue
 		}
-		if m.MsgType == llm.MsgTypeTool && m.Role == llm.RoleTool && m.ToolName == "task" {
+		if m.Role == llm.RoleAssistant && m.Type == llm.TypeToolCall && m.ToolID != "" {
+			callIDs[m.ToolID] = true
+		}
+		if m.MsgType == llm.MsgTypeTool && m.Role == llm.RoleTool && m.ToolName == "task" && !callIDs[m.ToolID] {
 			m.Role = llm.RoleUser
 		}
 		msgs = append(msgs, m)

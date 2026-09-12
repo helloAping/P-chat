@@ -71,6 +71,7 @@ func EstimateMessageTokens(m ChatMessage) int {
 		}
 	}
 	return contentTokens +
+		EstimateTokens(messageReasoning(m)) +
 		EstimateTokens(m.ToolInput) +
 		EstimateTokens(m.ToolName) +
 		EstimateTokens(m.ToolID) +

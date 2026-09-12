@@ -40,6 +40,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V10: stepV10toV11,
 	V11: stepV11toV12,
 	V12: stepV12toV13,
+	V13: stepV13toV14,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -474,6 +475,41 @@ func migrateModelAPIEndpoints() error {
 func stepV12toV13(_ *sql.DB) error {
 	log.Print("[upgrade] V12 → V13: initializing provider custom request headers")
 	return migrateProviderCustomHeaders()
+}
+
+// ---- V13 → V14 ----
+
+func stepV13toV14(db *sql.DB) error {
+	log.Print("[upgrade] V13 → V14: creating reusable media context table")
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS media_contexts (
+	    id                TEXT PRIMARY KEY,
+	    session_id        TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+	    kind              TEXT NOT NULL,
+	    tool_name         TEXT NOT NULL DEFAULT '',
+	    input_refs_json   TEXT NOT NULL DEFAULT '[]',
+	    output_refs_json  TEXT NOT NULL DEFAULT '[]',
+	    prompt            TEXT NOT NULL DEFAULT '',
+	    result_text       TEXT NOT NULL DEFAULT '',
+	    summary           TEXT NOT NULL DEFAULT '',
+	    structured_json   TEXT NOT NULL DEFAULT '',
+	    context_refs_json TEXT NOT NULL DEFAULT '[]',
+	    tool_call_id      TEXT NOT NULL DEFAULT '',
+	    message_id        INTEGER NOT NULL DEFAULT 0,
+	    regen_group_id    TEXT NOT NULL DEFAULT '',
+	    archived          INTEGER NOT NULL DEFAULT 0,
+	    archive_reason    TEXT NOT NULL DEFAULT '',
+	    created_at        INTEGER NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_media_contexts_session_created
+	  ON media_contexts(session_id, archived, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_media_contexts_tool_call
+	  ON media_contexts(session_id, tool_call_id);
+	CREATE INDEX IF NOT EXISTS idx_media_contexts_regen_group
+	  ON media_contexts(session_id, regen_group_id, archived);`)
+	if err != nil {
+		return fmt.Errorf("create media_contexts: %w", err)
+	}
+	return nil
 }
 
 func migrateProviderCustomHeaders() error {

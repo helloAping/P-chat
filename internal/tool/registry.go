@@ -77,6 +77,10 @@ type CallResult struct {
 	Summary string `json:"summary,omitempty"`
 	// ChangedPaths identifies workspace files touched by a successful tool.
 	ChangedPaths []string `json:"changed_paths,omitempty"`
+	// ContextRefs lists reusable media_context ids that the handler actually
+	// consumed. It is separate from arguments so auto-resolved follow-ups can be
+	// recorded precisely.
+	ContextRefs []string `json:"context_refs,omitempty"`
 	// Retryable tells the scheduler whether retrying with the same call shape
 	// can plausibly succeed. It defaults to false for safety.
 	Retryable bool `json:"retryable,omitempty"`
@@ -825,23 +829,23 @@ func RegisterBuiltin(r *Registry) {
 		}, []string{"url"}),
 	}, handleWebFetch)
 
-	r.Register(Tool{
-		Name:        "media_recognize",
-		Description: "Analyze one or more conversation-owned images, videos, or audio assets through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Assets in one call must share the same media type. Prefer opaque input_ref values explicitly shown in this chat; never pass bytes, URLs, or file paths.",
-		Parameters: ObjectSchema(map[string]any{
-			"input_ref": StringProp("One opaque upload or tool-asset id from this conversation (preferred)"),
-			"input_refs": map[string]any{
-				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
+		r.Register(Tool{
+			Name:        "media_recognize",
+			Description: "Analyze one or more conversation-owned images, videos, or audio assets through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Assets in one call must share the same media type. Use context_refs/context_mode only when the user asks to continue, merge, or verify earlier media results. Prefer opaque input_ref values explicitly shown in this chat; never pass bytes, URLs, or file paths.",
+			Parameters: ObjectSchema(withMediaContextSchema(map[string]any{
+				"input_ref": StringProp("One opaque upload or tool-asset id from this conversation (preferred)"),
+				"input_refs": map[string]any{
+					"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
 				"description": "Opaque ids of same-type media assets to analyze together (preferred)",
 			},
 			"upload_id": StringProp("Backward-compatible alias for one uploaded attachment id"),
 			"upload_ids": map[string]any{
 				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
 				"description": "Backward-compatible aliases for uploaded attachment ids",
-			},
-			"question": StringProp("Optional focused question for the configured recognition model"),
-		}, nil),
-	}, handleMediaRecognize)
+				},
+				"question": StringProp("Optional focused question for the configured recognition model"),
+			}), nil),
+		}, handleMediaRecognize)
 	// 旧工具调用和白名单继续生效，但模型只学习一个 canonical 媒体入口。
 	// Keep old tool calls and allowlists working without teaching the model two
 	// names for the same capability. The alias is callable but absent from

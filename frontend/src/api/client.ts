@@ -195,11 +195,12 @@ export type MessagePart =
       // result_truncated is true when the server omitted the full
       // payload (>32 KiB) and the full body must be fetched on
       // demand via getToolResult.
-      result_truncated?: boolean
-      // result_full_len is the byte length of the untruncated
-      // result, for labeling the "查看完整输出" affordance.
-      result_full_len?: number
-    }
+	      result_truncated?: boolean
+	      // result_full_len is the byte length of the untruncated
+	      // result, for labeling the "查看完整输出" affordance.
+	      result_full_len?: number
+	      context_refs?: string[]
+	    }
   | {
       kind: 'sub_agent'
       task: string
@@ -1502,9 +1503,10 @@ export interface StreamEvent {
   // Structured tool result metadata. These fields supplement the legacy
   // display preview above and remain optional for older servers.
   tool_call_status?: 'ok' | 'error' | 'blocked' | 'waiting' | string
-  tool_summary?: string
-  tool_changed_paths?: string[]
-  tool_retryable?: boolean
+	  tool_summary?: string
+	  tool_changed_paths?: string[]
+	  tool_context_refs?: string[]
+	  tool_retryable?: boolean
   tool_requires_user?: boolean
   tool_next_action?: string
   // tool_args is the JSON-encoded arguments string the tool

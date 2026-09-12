@@ -14,12 +14,28 @@ package agent
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/p-chat/pchat/internal/llm"
 )
+
+// orderedToolCalls 按上游 index 回放，避免 map 遍历改变模型输出前缀。
+// orderedToolCalls replays upstream indices instead of changing output prefixes through map iteration.
+func orderedToolCalls(calls map[int]*nativeToolCall) []nativeToolCall {
+	indices := make([]int, 0, len(calls))
+	for index := range calls {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	ordered := make([]nativeToolCall, 0, len(indices))
+	for _, index := range indices {
+		ordered = append(ordered, *calls[index])
+	}
+	return ordered
+}
 
 func resetGuardCounters(streak *int, prevSig *string, prevErrored *bool) {
 	*streak = 0

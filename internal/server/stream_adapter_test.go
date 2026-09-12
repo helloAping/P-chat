@@ -41,7 +41,7 @@ func TestChunkToEvent(t *testing.T) {
 	t.Run("tool", func(t *testing.T) {
 		ev := chunkToEvent(agent.ChatStreamChunk{
 			Phase: "tool", Step: "call-1-ok", ToolName: "edit_file", ToolResult: "hi",
-			ToolCallStatus: "ok", ToolSummary: "Updated one file", ToolChangedPaths: []string{"src/foo.go"},
+			ToolCallStatus: "ok", ToolSummary: "Updated one file", ToolChangedPaths: []string{"src/foo.go"}, ToolContextRefs: []string{"mctx_1"},
 			ToolRetryable: true, ToolNextAction: "verify",
 		}, "cs", "gpt-4o")
 		if ev.Type != "tool" {
@@ -53,7 +53,7 @@ func TestChunkToEvent(t *testing.T) {
 		if ev.ToolStatus != "ok" {
 			t.Errorf("ToolStatus = %q, want ok", ev.ToolStatus)
 		}
-		if ev.ToolCallStatus != "ok" || ev.ToolSummary != "Updated one file" || len(ev.ToolChangedPaths) != 1 || ev.ToolChangedPaths[0] != "src/foo.go" || !ev.ToolRetryable || ev.ToolNextAction != "verify" {
+		if ev.ToolCallStatus != "ok" || ev.ToolSummary != "Updated one file" || len(ev.ToolChangedPaths) != 1 || ev.ToolChangedPaths[0] != "src/foo.go" || len(ev.ToolContextRefs) != 1 || ev.ToolContextRefs[0] != "mctx_1" || !ev.ToolRetryable || ev.ToolNextAction != "verify" {
 			t.Fatalf("structured tool event = %#v", ev)
 		}
 	})

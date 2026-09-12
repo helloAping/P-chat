@@ -11,10 +11,12 @@ import (
 )
 
 type mediaGenerationArgs struct {
-	Operation config.GenerationOperation `json:"operation"`
-	Prompt    string                     `json:"prompt"`
-	InputRefs []string                   `json:"input_refs,omitempty"`
-	Options   map[string]any             `json:"options,omitempty"`
+	Operation   config.GenerationOperation `json:"operation"`
+	Prompt      string                     `json:"prompt"`
+	InputRefs   []string                   `json:"input_refs,omitempty"`
+	ContextRefs []string                   `json:"context_refs,omitempty"`
+	ContextMode string                     `json:"context_mode,omitempty"`
+	Options     map[string]any             `json:"options,omitempty"`
 }
 
 func handleGenerateImage(ctx context.Context, argsRaw json.RawMessage) (*CallResult, error) {
@@ -87,6 +89,17 @@ func handleMediaGeneration(ctx context.Context, toolName string, outputKind conf
 	}
 
 	sessionID, _ := ctx.Value(SessionIDKey{}).(string)
+	contextExpansion, contextMode, err := resolveToolMediaContext(ctx, sessionID, MediaContextResolveRequest{
+		ContextRefs:    args.ContextRefs,
+		ContextMode:    args.ContextMode,
+		ToolName:       toolName,
+		PreferredKinds: []string{"generation", "recognition"},
+		InputRefs:      inputRefs,
+	})
+	if err != nil {
+		return mediaGenerationError(CallStatusBlocked, fmt.Sprintf("%s 上下文已拒绝: %v", toolName, err)), nil
+	}
+	prompt = appendMediaContextExpansion(prompt, contextMode, contextExpansion)
 	result, err := access.Executor.Generate(ctx, generation.Request{
 		SessionID: sessionID,
 		ToolName:  toolName,
@@ -105,9 +118,10 @@ func handleMediaGeneration(ctx context.Context, toolName string, outputKind conf
 		return mediaGenerationError(CallStatusError, fmt.Sprintf("%s 返回结果无法编码: %v", toolName, err)), nil
 	}
 	return &CallResult{
-		Content: string(encoded),
-		Status:  CallStatusOK,
-		Summary: fmt.Sprintf("%s 已提交，状态 %s", args.Operation, result.Status),
+		Content:     string(encoded),
+		Status:      CallStatusOK,
+		Summary:     fmt.Sprintf("%s 已提交，状态 %s", args.Operation, result.Status),
+		ContextRefs: contextExpansion.IDs,
 	}, nil
 }
 
@@ -170,7 +184,7 @@ func generationToolSchema(operations ...config.GenerationOperation) json.RawMess
 	for _, operation := range operations {
 		values = append(values, string(operation))
 	}
-	return ObjectSchema(map[string]any{
+	return ObjectSchema(withMediaContextSchema(map[string]any{
 		"operation": StringEnumProp("Canonical generation capability selected for this request", values...),
 		"prompt":    StringProp("Final generation instruction prepared from the user's request and relevant conversation context."),
 		"input_refs": map[string]any{
@@ -202,5 +216,5 @@ func generationToolSchema(operations ...config.GenerationOperation) json.RawMess
 				"format":           StringEnumProp("Generated audio format", "mp3", "wav", "pcm", "flac", "aac", "ogg"),
 			},
 		},
-	}, []string{"operation", "prompt"})
+	}), []string{"operation", "prompt"})
 }

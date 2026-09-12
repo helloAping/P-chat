@@ -14,6 +14,7 @@ Memory 模块管理 P-Chat 的持久化存储——SQLite 数据库存储对话�
 |---|---|---|
 | `memory.go` | SQLite 数据库操作、CRUD、迁移入口 | `Store`, `Open()`, `OpenAt()`, `AddChatMessageTo()` |
 | `migrations.go` | **Schema 迁移引擎** — 版本表 + 所有迁移定义 | `Migrate()`, `Rollback()`, `allMigrations` |
+| `media_context.go` | 媒体识别/生成上下文持久化、最近上下文查询、引用图展开 | `AddMediaContext()`, `RecentMediaContexts()`, `ResolveMediaContextGraph()` |
 | `subagent_jobs.go` | 异步子代理 job 状态 CRUD | `SubagentJob`, `CreateSubagentJob()`, `ListSubagentJobs()` |
 | `summarizer.go` | LLM 驱动的对话压缩 | `Summarizer`, `Compress()` |
 | `fileio.go` | 旧版 JSON 文件导入 | `migrateFromLegacyJSON()` |
@@ -62,6 +63,7 @@ todo_items: session_id, item_id, content, status, sort_order
 chunks: id, source, content, metadata, created_at
 embeddings: chunk_id, model, vector, dim, created_at
 subagent_jobs: id, task_id, session_id, status, subagent_type, model, description, result, error, progress_json, created_at, started_at, finished_at, cancelled_at
+media_contexts: id, session_id, kind, tool_name, input_refs_json, output_refs_json, prompt, result_text, summary, structured_json, context_refs_json, tool_call_id, message_id, regen_group_id, archived, archive_reason, created_at
 ```
 
 **Schema 变更规则** → 详见 [versioning.md §二](versioning.md#二schema-迁移规范)。
@@ -95,6 +97,16 @@ subagent_jobs: id, task_id, session_id, status, subagent_type, model, descriptio
 `encodeChatMeta()` 会先把 `llm.ChatMessage.Meta` 合并进 metadata，再补充规范字段。
 `bool true` 会编码成字符串 `"true"`，用于兼容 `messages.metadata` 的
 `map[string]string` 存储形态。服务端历史响应根据 `ui_hidden` 过滤内部续跑行。
+
+### 5.5 媒体上下文
+
+`media_contexts` 保存成功媒体识别/生成工具调用的可复用上下文：输入资产、输出资产、问题或
+prompt、结果、摘要、上游 `context_refs` 和所属 `regen_group_id`。Agent 会把最近 active
+上下文注入后续轮次，并在工具调用中通过 resolver 展开显式引用链。
+
+生命周期与消息行绑定：重答会将同一 regen group 的旧 context 标记为 `archive_reason='regen'`；
+rollback 会将被删除消息对应 context 标记为 `archive_reason='rollback'`，undo 时恢复；
+激活历史 sibling 时按 `message_id` 切换 active context。
 
 ### 6. Summarizer（对话压缩）
 
