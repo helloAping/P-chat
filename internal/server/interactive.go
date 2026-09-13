@@ -251,8 +251,10 @@ func (h *Handler) ExecutePlan(c *gin.Context) {
 // --- Project CRUD ---
 
 type projectResponse struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Branch string `json:"branch,omitempty"`
+	Dirty  *bool  `json:"dirty,omitempty"`
 }
 
 // ListProjects GET /api/v1/projects

@@ -179,10 +179,10 @@
    * Single session sidebar + inspector; project options
    * live in the ProjectSwitcher popover, not a fixed list. */
   --rail-width:       52px;
-  --sidebar-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 340px);
+  --sidebar-default-width: 240px;
   --sidebar-width:    var(--sidebar-user-width, var(--sidebar-default-width));
-  --inspector-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 320px);
-  --inspector-width:  var(--inspector-default-width);
+  --inspector-default-width: 240px;
+  --inspector-width:  var(--inspector-user-width, var(--inspector-default-width));
   --project-switcher-width: 320px;
   --event-rail-color: var(--border-default);
 
@@ -286,10 +286,10 @@
    * Single session sidebar + inspector; project options
    * live in the ProjectSwitcher popover, not a fixed list. */
   --rail-width:       52px;
-  --sidebar-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 340px);
+  --sidebar-default-width: 240px;
   --sidebar-width:    var(--sidebar-user-width, var(--sidebar-default-width));
-  --inspector-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 320px);
-  --inspector-width:  var(--inspector-default-width);
+  --inspector-default-width: 240px;
+  --inspector-width:  var(--inspector-user-width, var(--inspector-default-width));
   --project-switcher-width: 320px;
   --event-rail-color: var(--border-default);
 
@@ -302,8 +302,8 @@
   :root,
   :root[data-theme="dark"],
   :root[data-theme="light"] {
-    --sidebar-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 300px);
-    --inspector-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 280px);
+    --sidebar-default-width: 240px;
+    --inspector-default-width: 240px;
   }
 }
 
@@ -311,7 +311,7 @@
   :root,
   :root[data-theme="dark"],
   :root[data-theme="light"] {
-    --sidebar-default-width: 260px;
+    --sidebar-default-width: 240px;
     --sidebar-width: min(var(--sidebar-user-width, var(--sidebar-default-width)), 300px);
     --inspector-default-width: 0px;
     --inspector-width: 0px;

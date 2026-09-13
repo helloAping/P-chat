@@ -40,10 +40,10 @@
 必须覆盖：
 
 - AppRail、统一侧栏、ProjectSwitcher、当前项目会话列表。
-- 默认主布局比例约为 `SessionSidebar : ChatWindow : InspectorPanel = 1 : 3 : 1`，左侧会话栏支持拖拽收缩并可恢复默认比例。
-- AppRail 是主导航，左下角保留新建项目快捷入口；ProjectSwitcher 触发器旁不再放独立 `+`；TopBar 只保留 breadcrumb、上下文占用和 Inspector 开关；文件夹/终端等当前项目动作放入 Inspector 的项目区域，trace/工具列表/生成风格放入 Inspector 的会话操作，避免重复入口。
+- 默认主布局中 `SessionSidebar` 与右侧 `InspectorPanel` 首次进入均为 240px；左侧会话栏和右侧 Inspector 都支持拖拽调整宽度并可双击恢复默认宽度；左侧需要保留合适最小宽度，避免会话标题不可读。
+- AppRail 是主导航，左下角保留新建项目快捷入口；ProjectSwitcher 触发器旁不再放独立 `+`；TopBar 只保留 breadcrumb、主题切换和 Inspector 开关；文件夹/终端等当前项目动作放入 Inspector 的项目 tab，trace/工具列表/生成风格放入 Inspector 的会话 tab，避免重复入口。会话 tab 不展示项目卡片；项目名称、路径、Git 分支和工作区状态以项目 tab 为准。
 - 新建项目、切换项目、全局会话、项目内新建对话、搜索会话。
-- TopBar 项目 breadcrumb、上下文占用、Inspector 入口；工具列表/生成风格不再占用 TopBar。
+- TopBar 项目 breadcrumb、主题切换、Inspector 入口；上下文占用进度条放入 Inspector 会话 tab 的「模型 / 上下文」卡片；工具列表/生成风格不再占用 TopBar。
 - Assistant / User 消息展示、附件展示、消息操作入口。
 - `thinking` 独立块。
 - `tool` / `skill` / `sub_agent` 执行时间线。
@@ -61,7 +61,9 @@
 - 项目列表只放在 `ProjectSwitcher` popover 中，不长期占据一整列。
 - 切换项目后，会话列表只展示该项目下的对话。
 - 全局会话是特殊空间，必须始终可进入。
-- 左侧会话栏默认宽度按 1:3:1 比例计算，用户拖拽后持久化；双击拖拽把手恢复默认比例。
+- 左侧会话栏首次默认宽度为 240px，用户拖拽后持久化；双击拖拽把手恢复默认宽度。
+- 右侧 Inspector 首次默认宽度也为 240px，用户拖拽后持久化；双击拖拽把手恢复默认宽度。
+- 项目接口应向前端提供可选的 `branch` 与 `dirty`，用于 ProjectSwitcher、TopBar 弱 metadata 和 Inspector 项目 tab 展示 Git 分支 / 工作区状态；会话 tab 不重复展示这些项目信息。
 
 ### 5.2 消息 parts
 
@@ -106,9 +108,13 @@
 
 - [ ] 新建项目可见且可用。
 - [ ] 项目切换可见且可用。
-- [ ] 默认展开时左侧会话栏、聊天区、Inspector 约为 1:3:1。
-- [ ] 左侧会话栏可拖拽收缩，双击把手可恢复默认比例。
+- [ ] 首次进入时左侧会话栏、右侧 Inspector 均为 240px，聊天区填充剩余空间。
+- [ ] 左侧会话栏可拖拽收缩，双击把手可恢复默认宽度。
+- [ ] 右侧 Inspector 可拖拽调整宽度，双击把手可恢复默认宽度。
+- [ ] Inspector 折叠 / 展开和会话/项目 tab 切换有轻量过渡动画。
 - [ ] AppRail、TopBar、Inspector 不重复堆叠文件夹/终端/设置等同一批快捷入口；项目动作统一在 Inspector 项目区域。
+- [ ] Inspector 会话 tab 不重复展示项目信息；项目名称、路径、Git 分支、工作区状态保留在项目 tab。
+- [ ] 项目 Git 分支在 ProjectSwitcher / TopBar 或 Inspector 项目 tab 中可见；工作区 clean/dirty 状态能正确表达。
 - [ ] 切换项目后只显示该项目内对话。
 - [ ] 全局会话可进入。
 - [ ] 项目内新建对话可用。
@@ -182,16 +188,17 @@ Project-Aware Calm Workbench，安静、克制、精致的桌面 AI 编程工作
 - 项目指令或 AGENTS.md 加载状态
 
 重点实现：
-1. App shell 使用 AppRail + 统一侧栏 + 中央聊天区 + 可折叠 Inspector。默认展开比例约为 1:3:1，左侧会话栏可拖拽收缩，项目列表只放到 ProjectSwitcher popover，不长期占一整列。
-2. AppRail 只承载全局、项目、设置等主导航；TopBar 只承载 breadcrumb、上下文占用和 Inspector 开关；文件夹/终端等当前项目动作放入 Inspector 项目区域。
+1. App shell 使用 AppRail + 统一侧栏 + 中央聊天区 + 可折叠 Inspector。左侧会话栏和右侧 Inspector 首次默认均为 240px，都可拖拽并持久化宽度，双击拖拽把手恢复默认宽度；项目列表只放到 ProjectSwitcher popover，不长期占一整列。
+2. AppRail 只承载全局、项目、设置等主导航；TopBar 只承载 breadcrumb、主题切换和 Inspector 开关；上下文占用进度条放入 Inspector 会话 tab 的「模型 / 上下文」卡片；文件夹/终端等当前项目动作放入 Inspector 项目 tab，trace/工具列表/生成风格放入 Inspector 会话 tab。会话 tab 不重复展示项目名称、路径、分支和工作区状态。
 3. 项目是一级上下文，会话是当前项目下的二级对象。切换项目后，会话列表只显示该项目内对话。全局会话必须始终可进入。
-4. MessageBubble 中 thinking 必须独立渲染，不进入 event-timeline。event-timeline 只包含 tool / skill / sub_agent。
-5. SubAgentCard 折叠态把 sub_agent_type 与 sub_agent_run_mode 合并成紧凑 meta（例如 `frontend_agent · 后台`），并展示任务标题、状态、耗时、模型/任务 ID；不要再拆成首字母图标、`类型` badge、`后台子代理` badge 三段。展开态按嵌套对话列表设计，包含子代理自己的消息、独立 thinking、工具/技能执行记录、结果摘要。
-6. SubAgentJobsPanel 每条后台任务展示 subagent_type 文本，并保留 queued/running/succeeded/failed/cancelled 状态。
-7. AppSettingsModal 中 Provider 的“协议”改为“请求协议”或“LLM 协议”。选项显示 OpenAI Chat / Anthropic Messages，对应配置值仍使用 openai / anthropic。不要显示 HTTP/HTTPS 作为协议选项。
-8. Base URL 单独作为网络地址字段展示，可以显示 https://api.openai.com/v1。模型 API 端点后缀继续按 Base URL + suffix 拼接说明。
-9. 模型添加/编辑弹窗移除“功能标签”字段，但保留模型 ID、显示名、模型类型、API 端点后缀、上下文、最大输出、媒体识别能力、生成能力、默认/启用等现有能力。
-10. 弹窗、抽屉、菜单、toast、空状态按设计图统一视觉，只调整样式和层级，不擅自新增业务功能。
+4. 项目数据需要可选展示 Git 分支和工作区 clean/dirty 状态；优先在 ProjectSwitcher、TopBar 弱 metadata、Inspector 项目 tab 展示，不能只在会话 tab 里出现。
+5. MessageBubble 中 thinking 必须独立渲染，不进入 event-timeline。event-timeline 只包含 tool / skill / sub_agent。
+6. SubAgentCard 折叠态把 sub_agent_type 与 sub_agent_run_mode 合并成紧凑 meta（例如 `frontend_agent · 后台`），并展示任务标题、状态、耗时、模型/任务 ID；不要再拆成首字母图标、`类型` badge、`后台子代理` badge 三段。展开态按嵌套对话列表设计，包含子代理自己的消息、独立 thinking、工具/技能执行记录、结果摘要。
+7. SubAgentJobsPanel 每条后台任务展示 subagent_type 文本，并保留 queued/running/succeeded/failed/cancelled 状态。
+8. AppSettingsModal 中 Provider 的“协议”改为“请求协议”或“LLM 协议”。选项显示 OpenAI Chat / Anthropic Messages，对应配置值仍使用 openai / anthropic。不要显示 HTTP/HTTPS 作为协议选项。
+9. Base URL 单独作为网络地址字段展示，可以显示 https://api.openai.com/v1。模型 API 端点后缀继续按 Base URL + suffix 拼接说明。
+10. 模型添加/编辑弹窗移除“功能标签”字段，但保留模型 ID、显示名、模型类型、API 端点后缀、上下文、最大输出、媒体识别能力、生成能力、默认/启用等现有能力。
+11. 弹窗、抽屉、菜单、toast、空状态按设计图统一视觉，只调整样式和层级，不擅自新增业务功能。
 
 强约束：
 - 所有颜色、间距、圆角、阴影、动效必须走 frontend/src/style.css tokens。
@@ -234,6 +241,9 @@ npm run build
 手动验收：
 - 新建项目、切换项目、全局会话、项目内新建对话都可用。
 - 切换项目后只显示当前项目会话。
+- 左侧会话栏和右侧 Inspector 都可拖拽，最小宽度下仍可读，双击把手可恢复默认宽度。
+- Inspector 会话/项目 tab 切换有轻量过渡；会话 tab 不重复展示项目名称、路径、Git 分支、工作区状态。
+- 项目 Git 分支和工作区 clean/dirty 状态可见。
 - thinking 独立显示，tool/skill/sub-agent 时间线正常。
 - 子代理卡片显示类型和运行模式，展开态像嵌套对话列表。
 - 后台子代理任务显示 subagent_type。

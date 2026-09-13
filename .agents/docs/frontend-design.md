@@ -47,11 +47,11 @@
 | 区域 | Token | 约值 | 规则 |
 |---|---|---|---|
 | AppRail | `--rail-width` | 52px | 常驻；折叠侧栏时仍可见 |
-| 统一侧栏 | `--sidebar-width` | 默认约 1/5 工作区，可拖拽 220-420px | 项目切换器 + 当前项目会话列表；项目选项只在 **ProjectSwitcher popover** 中展示，不常驻占位 |
-| 中央聊天 | flex 自适应 | 默认约 3/5 工作区 | 主阅读区；侧栏收窄后自然变宽 |
-| Inspector | `--inspector-width` | 默认约 1/5 工作区 | 可折叠；轻量 section，禁止多层卡片套娃 |
+| 统一侧栏 | `--sidebar-width` | 首次默认 240px，可拖拽 220-420px | 项目切换器 + 当前项目会话列表；项目选项只在 **ProjectSwitcher popover** 中展示，不常驻占位 |
+| 中央聊天 | flex 自适应 | 填充剩余空间 | 主阅读区；侧栏收窄后自然变宽 |
+| Inspector | `--inspector-width` | 首次默认 240px，可拖拽 240-440px | 可折叠；会话 tab 只放会话操作和上下文进度，项目 tab 承载项目信息 / Git 状态 / 项目动作；轻量 section，禁止多层卡片套娃 |
 
-默认展开时，`SessionSidebar : ChatWindow : InspectorPanel` 约为 **1 : 3 : 1**。用户可通过侧栏右缘拖拽把手调整聊天记录宽度；双击把手恢复默认比例。`AppRail` 是主导航，并保留左下角新建项目/关于快捷入口；`TopBar` 只承载 breadcrumb、上下文占用和 Inspector 开关。文件夹/终端这类当前项目动作归入 `InspectorPanel` 的项目区域；trace、工具列表、生成风格等当前会话动作归入 Inspector 的会话区域，避免顶部与侧栏重复入口。
+首次进入时，`SessionSidebar` 与 `InspectorPanel` 默认宽度均为 **240px**；用户可通过侧栏右缘拖拽把手调整聊天记录宽度，通过聊天区与 Inspector 之间的把手调整右侧面板宽度；双击任一把手恢复 240px 默认宽度。`AppRail` 是主导航，并保留左下角新建项目/关于快捷入口；`TopBar` 只承载 breadcrumb、主题切换和 Inspector 开关。上下文占用进度条归入 `InspectorPanel` 的会话 tab「模型 / 上下文」，替换纯文字 token 描述。文件夹/终端这类当前项目动作归入 `InspectorPanel` 的项目区域；trace、工具列表、生成风格等当前会话动作归入 Inspector 的会话区域，避免顶部与侧栏重复入口。会话 tab 不重复展示项目卡片；项目名称、路径、Git 分支和工作区状态只在项目 tab 或顶部 breadcrumb 的弱 metadata 中出现。
 
 ```
 TitleBar
@@ -59,7 +59,7 @@ TitleBar
    ├─ AppRail                          ← 常驻
    ├─ SessionSidebar                   ← 可折叠（不含内嵌 project-rail）
    └─ main-column
-      ├─ TopBar                        ← breadcrumb / ctx / inspector toggle
+      ├─ TopBar                        ← breadcrumb / theme / inspector toggle
       └─ workspace-row
          ├─ ChatWindow
          └─ InspectorPanel             ← 可折叠
@@ -89,6 +89,12 @@ TitleBar
 - `thinking` **永远**用 `ThinkingBlock` 独立渲染（不是 ToolCallCard），不进入 `.event-timeline` /「工具轨」。
 - **不要**在面板左侧画竖线 / 时间线轨。
 - **不改 SSE / parts 数据结构**；只改布局与样式。
+
+**附件与生成物展示规则**：
+
+- 用户多附件上传在消息气泡中使用中性 `.media-thumbnail` / `.attachment-file-card` 栅格，不与文字气泡混成一个实心色块；单附件保留舒适预览宽度，多附件自动压缩成紧凑网格。
+- `generate_*` 与 `browser_screenshot` 的 `assets[]` 统一按生成物卡片展示；图片 / 视频可预览，音频可播放，普通文件 / 文本产物使用紧凑文件行，保留名称、来源和下载动作。
+- 右侧 `InspectorPanel` 的会话 tab 必须汇总当前会话引用过的附件：用户上传、工具生成、浏览器截图，以及嵌套子代理中产生的工具生成物。默认展示前 5 条，使用展开按钮查看其余附件。
 
 ### 0.5.6 动效与密度
 
@@ -285,9 +291,9 @@ transition: var(--transition-colors),
 | Token | 用途 |
 |---|---|
 | `--rail-width` | AppRail 宽度（52px） |
-| `--sidebar-default-width` | 统一侧栏默认宽度；按 `(100vw - --rail-width) / 5` 得到 1:3:1 基准 |
+| `--sidebar-default-width` | 统一侧栏首次默认宽度（240px） |
 | `--sidebar-width` | 统一侧栏最终宽度；默认读 `--sidebar-default-width`，用户拖拽后读 `--sidebar-user-width` |
-| `--inspector-default-width` | Inspector 默认宽度；与侧栏同属 1/5 工作区 |
+| `--inspector-default-width` | Inspector 首次默认宽度（240px） |
 | `--inspector-width` | Inspector 最终宽度；小屏先归零折叠 |
 | `--project-switcher-width` | 项目切换下拉面板宽度（~320px；项目选项只在这里展开） |
 | `--event-rail-color` | 已废弃于主界面过程面板（不再画左侧竖轨）；保留 token 以免旧引用断裂 |
@@ -528,7 +534,7 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 | `ProjectSwitcher.vue` | 侧栏顶项目 popover | 触发器优先完整显示当前项目名；搜索 / 新建项目 / 全局 / 项目列表只在 popover 内展开；触发器旁不放独立 `+`；当前项 Check + 浅 wash |
 | `SessionSidebar.vue` | 统一侧栏 | 宽 `--sidebar-width`；「新建对话」outline CTA；会话 active = 浅 brand wash，**无**左边线 |
 | `TopBar.vue` | 面包屑 + ctx + inspector toggle | 克制高度；不堆叠打开目录/终端/工具列表/生成风格 |
-| `InspectorPanel.vue` | 右栏会话/项目摘要 + 归类操作 | 会话操作放 trace/工具列表/生成风格；项目区域放打开目录/终端；section 用弱分割线 |
+| `InspectorPanel.vue` | 右栏会话/项目摘要 + 归类操作 | 可折叠、可拖拽宽度；tab 切换用轻过渡；会话 tab 放 trace/工具列表/生成风格；项目 tab 放项目名、路径、Git 分支/工作区状态、AGENTS.md、打开目录/终端；section 用弱分割线 |
 | `ChatWindow.vue` | 消息列 + dock | 遵守 §3.5 flex 铁律 |
 
 ### 3.9 Thinking vs Tool 视觉分工

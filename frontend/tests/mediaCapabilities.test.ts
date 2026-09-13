@@ -13,6 +13,7 @@ const input = readFileSync(new URL('../src/components/InputArea.vue', import.met
 const store = readFileSync(new URL('../src/stores/chat.ts', import.meta.url), 'utf8')
 const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
 const toolCard = readFileSync(new URL('../src/components/ToolCallCard.vue', import.meta.url), 'utf8')
+const attachmentArtifacts = readFileSync(new URL('../src/utils/attachmentArtifacts.ts', import.meta.url), 'utf8')
 
 test('model editor exposes context presets and multi-select input capabilities', () => {
   assert.match(settings, /label: '256K', value: 256_000/)
@@ -77,14 +78,17 @@ test('generated media cards expose a readable file identity, preview, and downlo
   assert.match(toolCard, /class="generated-asset-preview"[\s\S]*?@click="openToolMediaAsset\(asset\)"/)
   assert.match(toolCard, /class="generated-asset-footer"[\s\S]*?class="generated-asset-name"/)
   assert.match(toolCard, /class="generated-asset-actions"[\s\S]*?Maximize2[\s\S]*?Download/)
+  assert.match(toolCard, /class="generated-asset-file"/)
   assert.match(toolCard, /@click="downloadToolMediaAsset\(asset\)"/)
+  assert.match(attachmentArtifacts, /export function toolGeneratedAssetsFromPart\(part: ToolPart\): ToolGeneratedAsset\[\]/)
+  assert.match(attachmentArtifacts, /kind === 'image' \|\| kind === 'video' \|\| kind === 'audio' \|\| kind === 'text' \|\| kind === 'file'/)
 })
 
 test('browser screenshots use the same durable media asset card as generated output', () => {
   assert.match(toolCard, /const isBrowserScreenshot = computed\(\(\) => props\.part\.name === 'browser_screenshot'\)/)
-  assert.match(toolCard, /const toolMediaAssets = computed<ToolMediaAsset\[\]>/)
-  assert.match(toolCard, /source: isBrowserScreenshot\.value \? 'browser_screenshot' : 'generation'/)
-  assert.match(toolCard, /asset\.source === 'browser_screenshot' \? '浏览器截图'/)
+  assert.match(toolCard, /const toolMediaAssets = computed<ToolGeneratedAsset\[\]>\(\(\) => toolGeneratedAssetsFromPart\(props\.part\)\)/)
+  assert.match(attachmentArtifacts, /source: Exclude<AttachmentArtifactSource, 'upload'> = isBrowserScreenshot \? 'browser_screenshot' : 'generation'/)
+  assert.match(attachmentArtifacts, /if \(source === 'browser_screenshot'\) return '浏览器截图'/)
   assert.doesNotMatch(toolCard, /class="tool-screenshot"/)
 })
 

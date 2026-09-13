@@ -26,8 +26,17 @@ import {
   ImageIcon,
   Film,
   Volume2,
+  FileText,
+  File,
 } from './icons'
-import { copyText, downloadFromUrl, extensionForMime } from '../utils/clipboard'
+import { copyText, downloadBlob, downloadFromUrl } from '../utils/clipboard'
+import {
+  attachmentArtifactFileName,
+  attachmentArtifactSourceLabel,
+  attachmentArtifactTypeLabel,
+  toolGeneratedAssetsFromPart,
+  type ToolGeneratedAsset,
+} from '../utils/attachmentArtifacts'
 
 const props = defineProps<{ part: ToolPart }>()
 
@@ -51,9 +60,9 @@ const shouldFoldResult = computed(() => {
   // dominate the chat until the user expands it.
   if (props.part.status === 'error' || props.part.error) return true
   if (isQuestionTool.value) return false
-  // Generated media is the primary result, so keep it visible without making
-  // the user expand a JSON-shaped tool response first.
-  if (isMediaResultTool.value) return false
+  // Generated assets are the primary result, so keep them visible without
+  // making the user expand a JSON-shaped tool response first.
+  if (toolMediaAssets.value.length || isMediaResultTool.value) return false
   const r = props.part.result || ''
   if (r.length >= FOLD_RESULT_MIN_CHARS) return true
   let lines = 0
@@ -226,87 +235,46 @@ const isDryRun = computed(() => {
   }
 })
 
-type ToolMediaAsset = {
-  id?: string
-  kind: 'image' | 'video' | 'audio'
-  mime_type?: string
-  name?: string
-  url: string
-  source: 'generation' | 'browser_screenshot'
+// Tool generated assets have one presentation contract. New browser
+// screenshots are materialized by the agent and arrive in the same
+// {assets:[...]} envelope as generated media/file outputs.
+const toolMediaAssets = computed<ToolGeneratedAsset[]>(() => toolGeneratedAssetsFromPart(props.part))
+
+function toolMediaAssetLabel(asset: ToolGeneratedAsset): string {
+  return attachmentArtifactSourceLabel(asset.source)
 }
 
-function isRenderableMediaURL(url: string): boolean {
-  return url.startsWith('/api/v1/generated/') || url.startsWith('/api/v1/uploads/') ||
-    url.startsWith('data:image/') || url.startsWith('blob:')
-}
-
-// Tool media has one presentation contract. New browser screenshots are
-// materialized by the agent and arrive in the same {assets:[...]} envelope as
-// generated media. The data:/blob: branches keep old conversation history
-// readable without reintroducing inline bytes for new calls.
-const toolMediaAssets = computed<ToolMediaAsset[]>(() => {
-  const result = props.part.result
-  if (!result || !isMediaResultTool.value) return []
-  try {
-    const parsed = JSON.parse(result)
-    if (Array.isArray(parsed?.assets)) {
-      return parsed.assets
-        .filter((asset: any) => asset && ['image', 'video', 'audio'].includes(asset.kind) && typeof asset.url === 'string' && isRenderableMediaURL(asset.url))
-        .map((asset: any) => ({
-          ...asset,
-          source: isBrowserScreenshot.value ? 'browser_screenshot' : 'generation',
-        }))
-    }
-    if (isBrowserScreenshot.value && typeof parsed?.image === 'string' && isRenderableMediaURL(parsed.image)) {
-      return [{ kind: 'image', mime_type: 'image/jpeg', name: 'browser-screenshot.jpg', url: parsed.image, source: 'browser_screenshot' }]
-    }
-  } catch { /* legacy raw screenshot result */ }
-  if (isBrowserScreenshot.value && isRenderableMediaURL(result)) {
-    const mime = result.startsWith('data:') ? result.slice(5, result.indexOf(';')) : 'image/jpeg'
-    return [{ kind: 'image', mime_type: mime || 'image/jpeg', name: 'browser-screenshot.jpg', url: result, source: 'browser_screenshot' }]
-  }
-  return []
-})
-
-const generatedKindLabels: Record<ToolMediaAsset['kind'], string> = {
-  image: '生成图片',
-  video: '生成视频',
-  audio: '生成音频',
-}
-
-function toolMediaAssetLabel(asset: ToolMediaAsset): string {
-  return asset.source === 'browser_screenshot' ? '浏览器截图' : generatedKindLabels[asset.kind]
-}
-
-function toolMediaAssetIcon(asset: ToolMediaAsset) {
+function toolMediaAssetIcon(asset: ToolGeneratedAsset) {
   if (asset.kind === 'video') return Film
   if (asset.kind === 'audio') return Volume2
+  if (asset.kind === 'text') return FileText
+  if (asset.kind === 'file') return File
   return ImageIcon
 }
 
-function toolMediaAssetExtension(asset: ToolMediaAsset): string {
-  const mimeExtension = extensionForMime(asset.mime_type || '')
-  if (mimeExtension !== '.bin') return mimeExtension
-  const originalExtension = asset.name?.match(/\.[a-z0-9]{1,8}$/i)?.[0]
-  if (originalExtension) return originalExtension.toLowerCase()
-  if (asset.kind === 'video') return '.mp4'
-  if (asset.kind === 'audio') return '.mp3'
-  return '.png'
+function toolMediaAssetFileName(asset: ToolGeneratedAsset): string {
+  return attachmentArtifactFileName({
+    ...asset,
+    mime: asset.mime_type || asset.mime,
+  })
 }
 
-function toolMediaAssetFileName(asset: ToolMediaAsset): string {
-  const identity = (asset.id || 'result').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'result'
-  const type = asset.source === 'browser_screenshot' ? 'screenshot' : asset.kind
-  return `pchat-${type}-${identity}${toolMediaAssetExtension(asset)}`
+function toolMediaAssetMeta(asset: ToolGeneratedAsset): string {
+  const type = attachmentArtifactTypeLabel({
+    kind: asset.kind,
+    name: asset.name,
+    mime: asset.mime_type || asset.mime,
+    url: asset.url,
+  })
+  return `${toolMediaAssetLabel(asset)} · ${type}`
 }
 
-function toolMediaAssetMeta(asset: ToolMediaAsset): string {
-  const format = (asset.mime_type?.split('/')[1] || toolMediaAssetExtension(asset).slice(1)).toUpperCase()
-  return `${toolMediaAssetLabel(asset)} · ${format}`
+function canPreviewToolMediaAsset(asset: ToolGeneratedAsset): asset is ToolGeneratedAsset & { url: string; kind: 'image' | 'video' } {
+  return (asset.kind === 'image' || asset.kind === 'video') && !!asset.url
 }
 
-function openToolMediaAsset(asset: ToolMediaAsset) {
-  if (asset.kind === 'audio') return
+function openToolMediaAsset(asset: ToolGeneratedAsset) {
+  if (!canPreviewToolMediaAsset(asset)) return
   state.lightbox = {
     show: true,
     src: asset.url,
@@ -315,8 +283,15 @@ function openToolMediaAsset(asset: ToolMediaAsset) {
   }
 }
 
-function downloadToolMediaAsset(asset: ToolMediaAsset) {
-  downloadFromUrl(asset.url, toolMediaAssetFileName(asset))
+function downloadToolMediaAsset(asset: ToolGeneratedAsset) {
+  const name = toolMediaAssetFileName(asset)
+  if (asset.url) {
+    downloadFromUrl(asset.url, name)
+    return
+  }
+  if (asset.text) {
+    downloadBlob(new Blob([asset.text], { type: asset.mime_type || asset.mime || 'text/plain' }), name)
+  }
 }
 
 // Copy result to clipboard. Used both as a header
@@ -466,9 +441,14 @@ async function resultForCopy(): Promise<string> {
       <div v-if="!isQuestionTool && part.result" class="tool-result">
         <div class="tool-section-label">结果</div>
         <div v-if="toolMediaAssets.length" class="generated-assets">
-          <figure v-for="asset in toolMediaAssets" :key="asset.id || asset.url" class="generated-asset">
+          <figure
+            v-for="asset in toolMediaAssets"
+            :key="asset.id || asset.url || asset.name || asset.text"
+            class="generated-asset"
+            :class="`generated-asset--${asset.kind}`"
+          >
             <button
-              v-if="asset.kind === 'image'"
+              v-if="asset.kind === 'image' && asset.url"
               class="generated-asset-preview"
               type="button"
               :aria-label="`预览 ${toolMediaAssetFileName(asset)}`"
@@ -476,11 +456,20 @@ async function resultForCopy(): Promise<string> {
             >
               <img :src="asset.url" :alt="toolMediaAssetFileName(asset)" loading="lazy" />
             </button>
-            <div v-else-if="asset.kind === 'video'" class="generated-asset-preview generated-asset-preview--video">
+            <div v-else-if="asset.kind === 'video' && asset.url" class="generated-asset-preview generated-asset-preview--video">
               <video :src="asset.url" controls preload="metadata" />
             </div>
-            <div v-else class="generated-asset-preview generated-asset-preview--audio">
+            <div v-else-if="asset.kind === 'audio' && asset.url" class="generated-asset-preview generated-asset-preview--audio">
               <audio :src="asset.url" controls preload="metadata" />
+            </div>
+            <div v-else class="generated-asset-file">
+              <span class="generated-asset-file-icon" aria-hidden="true">
+                <component :is="toolMediaAssetIcon(asset)" :size="18" />
+              </span>
+              <span class="generated-asset-file-copy">
+                <span>{{ attachmentArtifactTypeLabel({ kind: asset.kind, name: asset.name, mime: asset.mime_type || asset.mime, url: asset.url }) }}</span>
+                <span>{{ toolMediaAssetLabel(asset) }}</span>
+              </span>
             </div>
             <figcaption class="generated-asset-footer">
               <span class="generated-asset-identity">
@@ -496,7 +485,7 @@ async function resultForCopy(): Promise<string> {
               </span>
               <span class="generated-asset-actions">
                 <button
-                  v-if="asset.kind !== 'audio'"
+                  v-if="canPreviewToolMediaAsset(asset)"
                   class="generated-asset-action"
                   type="button"
                   @click="openToolMediaAsset(asset)"
@@ -793,6 +782,7 @@ async function resultForCopy(): Promise<string> {
 }
 .generated-assets {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-8) * 5), 100%), 1fr));
   gap: var(--space-2);
 }
 .generated-asset {
@@ -802,7 +792,7 @@ async function resultForCopy(): Promise<string> {
   overflow: hidden;
   background: var(--surface-1);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   box-shadow: var(--shadow-sm);
 }
 .generated-asset-preview {
@@ -847,6 +837,44 @@ async function resultForCopy(): Promise<string> {
 }
 .generated-asset-preview audio {
   width: 100%;
+}
+.generated-asset-file {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: calc(var(--space-8) + var(--space-6));
+  padding: var(--space-3);
+  background: var(--surface-0);
+}
+.generated-asset-file-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(var(--space-8) + var(--space-1));
+  height: calc(var(--space-8) + var(--space-1));
+  flex: 0 0 auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--brand-600);
+}
+.generated-asset-file-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.generated-asset-file-copy span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.generated-asset-file-copy span:first-child {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 .generated-asset-footer {
   display: flex;

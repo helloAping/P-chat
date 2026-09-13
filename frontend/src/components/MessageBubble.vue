@@ -1225,7 +1225,11 @@ function findPrecedingUserMessageId(): number {
         <div v-if="isSystem" class="system-icon">›</div>
         <div class="bubble-body">
           <!-- Attachments (user / tool) -->
-          <div v-if="message.attachments && message.attachments.length" class="attachments">
+          <div
+            v-if="message.attachments && message.attachments.length"
+            class="attachments"
+            :class="{ 'attachments--multi': message.attachments.length > 1 }"
+          >
             <template v-for="(a, i) in message.attachments" :key="i">
               <div
                 v-if="attachmentVisualKind(a) === 'image' && a.url"
@@ -1755,7 +1759,7 @@ function findPrecedingUserMessageId(): number {
   box-shadow: none;
   border: 0;
   max-width: 100%;
-  width: min(100%, calc(var(--space-8) * 12));
+  width: min(100%, clamp(calc(var(--space-8) * 9), 48vw, calc(var(--space-8) * 16)));
 }
 .msg.assistant .bubble {
   background: transparent;
@@ -1828,11 +1832,15 @@ function findPrecedingUserMessageId(): number {
 }
 .msg.user .bubble--attachments .attachments {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-8) * 5), 100%), 1fr));
+  grid-template-columns: minmax(0, min(calc(var(--space-8) * 10), 100%));
   align-items: start;
+  justify-content: end;
   gap: var(--space-2);
   margin-bottom: 0;
   width: 100%;
+}
+.msg.user .bubble--attachments .attachments--multi {
+  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-8) * 5), 100%), 1fr));
 }
 .msg.user .bubble--attachments .attachments > :only-child {
   grid-column: 1 / -1;
@@ -2120,12 +2128,12 @@ function findPrecedingUserMessageId(): number {
   gap: var(--space-1);
   width: 100%;
   min-width: 0;
-  aspect-ratio: 4 / 3;
+  aspect-ratio: 16 / 10;
   box-sizing: border-box;
   padding: var(--space-1);
   background: var(--surface-1);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   box-shadow: var(--shadow-sm);
   overflow: hidden;
   cursor: zoom-in;
@@ -2153,7 +2161,7 @@ function findPrecedingUserMessageId(): number {
   width: 100%;
   height: 100%;
   min-height: 0;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   background: var(--surface-2);
 }
 .msg-image { object-fit: contain; }
@@ -2332,10 +2340,10 @@ function findPrecedingUserMessageId(): number {
 .attachment-audio-card,
 .attachment-file-card {
   box-sizing: border-box;
-  width: min(calc(var(--space-8) * 10), 100%);
+  width: min(calc(var(--space-8) * 12), 100%);
   background: var(--surface-1);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   box-shadow: var(--shadow-sm);
   color: var(--text-primary);
 }
@@ -2360,7 +2368,7 @@ function findPrecedingUserMessageId(): number {
   height: var(--space-8);
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
   flex-shrink: 0;
 }

@@ -41,6 +41,10 @@ const SIDEBAR_COLLAPSED_KEY = 'pchat-sidebar-collapsed'
 const SIDEBAR_WIDTH_KEY = 'pchat-sidebar-width'
 const SIDEBAR_MIN_WIDTH = 220
 const SIDEBAR_MAX_WIDTH = 420
+const INSPECTOR_OPEN_KEY = 'pchat-inspector-open'
+const INSPECTOR_WIDTH_KEY = 'pchat-inspector-width'
+const INSPECTOR_MIN_WIDTH = 240
+const INSPECTOR_MAX_WIDTH = 440
 const sidebarCollapsed = ref(false)
 const sidebarWidthPx = ref<number | null>(null)
 const sidebarDragging = ref(false)
@@ -50,8 +54,11 @@ const sidebarDragStartWidth = ref(0)
 
 // Right inspector. Persisted separately so collapsing the
 // session list doesn't also hide the context panel.
-const INSPECTOR_OPEN_KEY = 'pchat-inspector-open'
 const inspectorOpen = ref(true)
+const inspectorWidthPx = ref<number | null>(null)
+const inspectorDragging = ref(false)
+const inspectorDragStartX = ref(0)
+const inspectorDragStartWidth = ref(0)
 
 const sidebarRef = ref<InstanceType<typeof SessionSidebar> | null>(null)
 
@@ -60,8 +67,14 @@ const THEME_KEY = 'pchat-theme'
 const themeName = ref<'dark' | 'light'>('dark')
 
 const appStyle = computed<CSSProperties>(() => {
-  if (sidebarWidthPx.value == null) return {}
-  return { '--sidebar-user-width': `${sidebarWidthPx.value}px` } as CSSProperties
+  const style = {} as CSSProperties & Record<string, string>
+  if (sidebarWidthPx.value != null) {
+    style['--sidebar-user-width'] = `${sidebarWidthPx.value}px`
+  }
+  if (inspectorWidthPx.value != null) {
+    style['--inspector-user-width'] = `${inspectorWidthPx.value}px`
+  }
+  return style
 })
 
 const sidebarResizeValue = computed(() =>
@@ -69,20 +82,13 @@ const sidebarResizeValue = computed(() =>
 )
 
 const sidebarResizeMax = computed(() => maxSidebarWidth())
-
-function railWidthPx(): number {
-  if (typeof window === 'undefined') return 52
-  const value = getComputedStyle(document.documentElement)
-    .getPropertyValue('--rail-width')
-    .trim()
-  const parsed = Number.parseFloat(value)
-  return Number.isFinite(parsed) ? parsed : 52
-}
+const inspectorResizeValue = computed(() =>
+  Math.round(inspectorWidthPx.value ?? defaultInspectorWidth()),
+)
+const inspectorResizeMax = computed(() => maxInspectorWidth())
 
 function defaultSidebarWidth(): number {
-  if (typeof window === 'undefined') return 280
-  const proportional = (window.innerWidth - railWidthPx()) / 5
-  return clampSidebarWidth(proportional)
+  return clampSidebarWidth(240)
 }
 
 function maxSidebarWidth(): number {
@@ -96,12 +102,36 @@ function clampSidebarWidth(width: number): number {
   return Math.round(Math.min(max, Math.max(SIDEBAR_MIN_WIDTH, width)))
 }
 
+function defaultInspectorWidth(): number {
+  return clampInspectorWidth(240)
+}
+
+function maxInspectorWidth(): number {
+  const available = appBodyRef.value?.clientWidth ?? (typeof window === 'undefined' ? 1280 : window.innerWidth)
+  const proportionalMax = Math.round(available * 0.36)
+  return Math.min(INSPECTOR_MAX_WIDTH, Math.max(INSPECTOR_MIN_WIDTH, proportionalMax))
+}
+
+function clampInspectorWidth(width: number): number {
+  const max = maxInspectorWidth()
+  return Math.round(Math.min(max, Math.max(INSPECTOR_MIN_WIDTH, width)))
+}
+
 function loadSidebarWidth() {
   try {
     const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY)
     if (!raw) return
     const parsed = Number.parseFloat(raw)
     if (Number.isFinite(parsed)) sidebarWidthPx.value = clampSidebarWidth(parsed)
+  } catch { /* ignore */ }
+}
+
+function loadInspectorWidth() {
+  try {
+    const raw = localStorage.getItem(INSPECTOR_WIDTH_KEY)
+    if (!raw) return
+    const parsed = Number.parseFloat(raw)
+    if (Number.isFinite(parsed)) inspectorWidthPx.value = clampInspectorWidth(parsed)
   } catch { /* ignore */ }
 }
 
@@ -112,11 +142,23 @@ function persistSidebarWidth() {
   } catch { /* ignore */ }
 }
 
+function persistInspectorWidth() {
+  try {
+    if (inspectorWidthPx.value == null) localStorage.removeItem(INSPECTOR_WIDTH_KEY)
+    else localStorage.setItem(INSPECTOR_WIDTH_KEY, String(inspectorWidthPx.value))
+  } catch { /* ignore */ }
+}
+
 function currentSidebarWidth(): number {
   const el = sidebarRef.value?.$el as HTMLElement | undefined
   const width = el?.getBoundingClientRect().width
   if (width && width > 0) return width
   return sidebarWidthPx.value ?? defaultSidebarWidth()
+}
+
+function currentInspectorWidth(): number {
+  if (inspectorWidthPx.value != null) return inspectorWidthPx.value
+  return defaultInspectorWidth()
 }
 
 function removeSidebarResizeListeners() {
@@ -130,6 +172,17 @@ function removeSidebarResizeListeners() {
   }
 }
 
+function removeInspectorResizeListeners() {
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('pointermove', onInspectorResize)
+    window.removeEventListener('pointerup', stopInspectorResize)
+    window.removeEventListener('pointercancel', stopInspectorResize)
+  }
+  if (typeof document !== 'undefined') {
+    document.body.classList.remove('is-resizing-inspector')
+  }
+}
+
 function startSidebarResize(event: PointerEvent) {
   if (sidebarCollapsed.value) return
   event.preventDefault()
@@ -137,7 +190,7 @@ function startSidebarResize(event: PointerEvent) {
   sidebarDragStartX.value = event.clientX
   sidebarDragStartWidth.value = currentSidebarWidth()
   const target = event.currentTarget as HTMLElement | null
-  target?.setPointerCapture?.(event.pointerId)
+  try { target?.setPointerCapture?.(event.pointerId) } catch { /* capture is optional */ }
   document.body.classList.add('is-resizing-sidebar')
   window.addEventListener('pointermove', onSidebarResize)
   window.addEventListener('pointerup', stopSidebarResize)
@@ -150,6 +203,26 @@ function onSidebarResize(event: PointerEvent) {
   sidebarWidthPx.value = clampSidebarWidth(sidebarDragStartWidth.value + delta)
 }
 
+function startInspectorResize(event: PointerEvent) {
+  if (!inspectorOpen.value) return
+  event.preventDefault()
+  inspectorDragging.value = true
+  inspectorDragStartX.value = event.clientX
+  inspectorDragStartWidth.value = currentInspectorWidth()
+  const target = event.currentTarget as HTMLElement | null
+  try { target?.setPointerCapture?.(event.pointerId) } catch { /* capture is optional */ }
+  document.body.classList.add('is-resizing-inspector')
+  window.addEventListener('pointermove', onInspectorResize)
+  window.addEventListener('pointerup', stopInspectorResize)
+  window.addEventListener('pointercancel', stopInspectorResize)
+}
+
+function onInspectorResize(event: PointerEvent) {
+  if (!inspectorDragging.value) return
+  const delta = inspectorDragStartX.value - event.clientX
+  inspectorWidthPx.value = clampInspectorWidth(inspectorDragStartWidth.value + delta)
+}
+
 function stopSidebarResize() {
   if (sidebarDragging.value) {
     sidebarDragging.value = false
@@ -158,14 +231,32 @@ function stopSidebarResize() {
   removeSidebarResizeListeners()
 }
 
+function stopInspectorResize() {
+  if (inspectorDragging.value) {
+    inspectorDragging.value = false
+    persistInspectorWidth()
+  }
+  removeInspectorResizeListeners()
+}
+
 function resetSidebarWidth() {
   sidebarWidthPx.value = null
   persistSidebarWidth()
 }
 
+function resetInspectorWidth() {
+  inspectorWidthPx.value = null
+  persistInspectorWidth()
+}
+
 function nudgeSidebarWidth(delta: number) {
   sidebarWidthPx.value = clampSidebarWidth((sidebarWidthPx.value ?? defaultSidebarWidth()) + delta)
   persistSidebarWidth()
+}
+
+function nudgeInspectorWidth(delta: number) {
+  inspectorWidthPx.value = clampInspectorWidth((inspectorWidthPx.value ?? defaultInspectorWidth()) + delta)
+  persistInspectorWidth()
 }
 
 function onSidebarResizeKeydown(event: KeyboardEvent) {
@@ -189,9 +280,38 @@ function onSidebarResizeKeydown(event: KeyboardEvent) {
   }
 }
 
-function keepSidebarWidthInBounds() {
-  if (sidebarWidthPx.value == null) return
-  sidebarWidthPx.value = clampSidebarWidth(sidebarWidthPx.value)
+function onInspectorResizeKeydown(event: KeyboardEvent) {
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault()
+    nudgeInspectorWidth(16)
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault()
+    nudgeInspectorWidth(-16)
+  } else if (event.key === 'Home') {
+    event.preventDefault()
+    inspectorWidthPx.value = INSPECTOR_MIN_WIDTH
+    persistInspectorWidth()
+  } else if (event.key === 'End') {
+    event.preventDefault()
+    inspectorWidthPx.value = inspectorResizeMax.value
+    persistInspectorWidth()
+  } else if (event.key === 'Enter') {
+    event.preventDefault()
+    resetInspectorWidth()
+  }
+}
+
+function keepPanelWidthsInBounds() {
+  if (sidebarWidthPx.value != null) {
+    sidebarWidthPx.value = clampSidebarWidth(sidebarWidthPx.value)
+  }
+  if (inspectorWidthPx.value != null) {
+    inspectorWidthPx.value = clampInspectorWidth(inspectorWidthPx.value)
+  }
+}
+
+function toggleTheme() {
+  themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
 }
 
 // Single brand color used by both Naive UI's primaryColor
@@ -393,6 +513,7 @@ onMounted(async () => {
       inspectorOpen.value = stored === '1'
     }
   } catch { /* ignore */ }
+  loadInspectorWidth()
 
   // Expose a global close handle for AppSettingsModal so it can
   // dismiss itself without prop-drilling.
@@ -409,13 +530,14 @@ onMounted(async () => {
     console.error('init failed', e)
   }
   cleanupTrayEvents = await setupTrayEventListeners()
-  window.addEventListener('resize', keepSidebarWidthInBounds)
+  window.addEventListener('resize', keepPanelWidthsInBounds)
 })
 
 onUnmounted(() => {
   removeSidebarResizeListeners()
+  removeInspectorResizeListeners()
   if (typeof window !== 'undefined') {
-    window.removeEventListener('resize', keepSidebarWidthInBounds)
+    window.removeEventListener('resize', keepPanelWidthsInBounds)
   }
   if (cleanupTrayEvents) {
     cleanupTrayEvents()
@@ -434,6 +556,7 @@ onUnmounted(() => {
             :class="{
               'app--sidebar-collapsed': sidebarCollapsed,
               'app--resizing-sidebar': sidebarDragging,
+              'app--resizing-inspector': inspectorDragging,
             }"
             :style="appStyle"
           >
@@ -449,7 +572,6 @@ onUnmounted(() => {
                 ref="sidebarRef"
                 :class="{ 'sidebar-collapsed': sidebarCollapsed }"
                 @open-settings="showAppSettings = true"
-                v-model:theme-name="themeName"
               />
               <button
                 v-if="!sidebarCollapsed"
@@ -462,8 +584,8 @@ onUnmounted(() => {
                 :aria-valuemax="sidebarResizeMax"
                 :aria-valuenow="sidebarResizeValue"
                 aria-label="调整聊天记录宽度"
-                title="拖动调整聊天记录宽度，双击恢复 1:3:1"
-                @pointerdown="startSidebarResize"
+                title="拖动调整聊天记录宽度，双击恢复默认宽度"
+                @pointerdown.capture="startSidebarResize"
                 @dblclick="resetSidebarWidth"
                 @keydown="onSidebarResizeKeydown"
               />
@@ -471,11 +593,29 @@ onUnmounted(() => {
                 <TopBar
                   :collapsed="sidebarCollapsed"
                   :inspector-open="inspectorOpen"
+                  :theme-name="themeName"
                   @toggle-sidebar="toggleSidebar"
                   @toggle-inspector="toggleInspector"
+                  @toggle-theme="toggleTheme"
                 />
                 <div class="workspace-row">
                   <ChatWindow />
+                  <button
+                    v-if="inspectorOpen"
+                    type="button"
+                    class="inspector-resize-handle"
+                    :class="{ 'inspector-resize-handle--dragging': inspectorDragging }"
+                    role="separator"
+                    aria-orientation="vertical"
+                    :aria-valuemin="INSPECTOR_MIN_WIDTH"
+                    :aria-valuemax="inspectorResizeMax"
+                    :aria-valuenow="inspectorResizeValue"
+                    aria-label="调整右侧面板宽度"
+                    title="拖动调整右侧面板宽度，双击恢复默认宽度"
+                    @pointerdown.capture="startInspectorResize"
+                    @dblclick="resetInspectorWidth"
+                    @keydown="onInspectorResizeKeydown"
+                  />
                   <InspectorPanel
                     :open="inspectorOpen"
                     @close="inspectorOpen = false"
@@ -492,7 +632,7 @@ onUnmounted(() => {
             <PlanReviewModal />
             <CloseConfirmModal />
             <DownloadDock />
-            </div>
+          </div>
         </NNotificationProvider>
       </NDialogProvider>
     </NMessageProvider>
@@ -501,6 +641,8 @@ onUnmounted(() => {
 
 <style scoped>
 .app {
+  --sidebar-width: var(--sidebar-user-width, var(--sidebar-default-width));
+  --inspector-width: var(--inspector-user-width, var(--inspector-default-width));
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -529,20 +671,28 @@ onUnmounted(() => {
   display: flex;
 }
 
-.sidebar-resize-handle {
+.sidebar-resize-handle,
+.inspector-resize-handle {
   position: relative;
-  z-index: 5;
-  flex: 0 0 var(--space-2);
-  width: var(--space-2);
-  min-width: var(--space-2);
-  margin: 0 calc(-1 * var(--space-1));
+  z-index: 20;
+  flex: 0 0 10px;
+  width: 10px;
+  min-width: 10px;
   padding: 0;
   border: 0;
   background: transparent;
   cursor: col-resize;
+  touch-action: none;
   -webkit-app-region: no-drag;
 }
-.sidebar-resize-handle::before {
+.sidebar-resize-handle {
+  margin: 0 -5px;
+}
+.inspector-resize-handle {
+  margin: 0 -5px;
+}
+.sidebar-resize-handle::before,
+.inspector-resize-handle::before {
   content: '';
   position: absolute;
   top: var(--space-3);
@@ -560,22 +710,32 @@ onUnmounted(() => {
 .sidebar-resize-handle:hover::before,
 .sidebar-resize-handle:focus-visible::before,
 .sidebar-resize-handle--dragging::before,
-.app--resizing-sidebar .sidebar-resize-handle::before {
+.app--resizing-sidebar .sidebar-resize-handle::before,
+.inspector-resize-handle:hover::before,
+.inspector-resize-handle:focus-visible::before,
+.inspector-resize-handle--dragging::before,
+.app--resizing-inspector .inspector-resize-handle::before {
   width: 2px;
   background: var(--brand-500);
   box-shadow: 0 0 0 2px var(--brand-50);
 }
-.sidebar-resize-handle:focus-visible {
+.sidebar-resize-handle:focus-visible,
+.inspector-resize-handle:focus-visible {
   outline: none;
 }
 .app--resizing-sidebar :deep(.sidebar) {
   transition: none;
 }
-:global(body.is-resizing-sidebar) {
+.app--resizing-inspector :deep(.inspector) {
+  transition: none;
+}
+:global(body.is-resizing-sidebar),
+:global(body.is-resizing-inspector) {
   cursor: col-resize;
   user-select: none;
 }
-:global(body.is-resizing-sidebar *) {
+:global(body.is-resizing-sidebar *),
+:global(body.is-resizing-inspector *) {
   cursor: col-resize !important;
 }
 
@@ -584,4 +744,18 @@ onUnmounted(() => {
  * on its root. AppRail stays visible. The main column flex-grows
  * into the freed space on the same --dur-slow / --ease-in-out
  * curve, so the chat canvas and the sidebar move together. */
+@media (max-width: 1040px) {
+  .app {
+    --sidebar-default-width: 240px;
+    --sidebar-width: min(var(--sidebar-user-width, var(--sidebar-default-width)), 300px);
+    --inspector-default-width: 0px;
+    --inspector-width: 0px;
+  }
+}
+@media (max-width: 760px) {
+  .app {
+    --sidebar-default-width: 240px;
+    --sidebar-width: min(var(--sidebar-user-width, var(--sidebar-default-width)), 280px);
+  }
+}
 </style>

@@ -6,22 +6,21 @@
  *
  * Layout (flex row, 44px tall):
  *   ┌─────────────────────────────────────────────────────────────┐
- *   │ [☰]   会话标题 · 项目路径                    [ctx] [panel] │
+ *   │ [☰]   会话标题 · 项目路径                  [theme] [panel] │
  *   └─────────────────────────────────────────────────────────────┘
  *
  *   left:    sidebar collapse toggle
  *   center:  session title (H1) + project breadcrumb separator
- *   right:   context / inspector toggle
+ *   right:   theme / inspector toggle
  *
  * Brand mark lives in TitleBar (frameless chrome), not here.
  */
 import { computed } from 'vue'
 import { NButton, NTooltip } from 'naive-ui'
-import { state, refreshContextUsage } from '../stores/chat'
-import { formatCompactTokens } from '../utils/format'
+import { state } from '../stores/chat'
 import {
   FolderOpen, PanelLeftClose, PanelLeftOpen, PanelRight, PanelRightClose,
-  BarChart3, GitBranch, CheckCircle2, AlertCircle,
+  GitBranch, CheckCircle2, AlertCircle, Sun, Moon,
 } from './icons'
 
 const props = defineProps<{
@@ -29,10 +28,13 @@ const props = defineProps<{
   collapsed?: boolean
   /** Whether the right inspector panel is open. */
   inspectorOpen?: boolean
+  /** Current application theme; the toggle lives in the top-right utility group. */
+  themeName?: 'dark' | 'light'
 }>()
 const emit = defineEmits<{
   (e: 'toggle-sidebar'): void
   (e: 'toggle-inspector'): void
+  (e: 'toggle-theme'): void
 }>()
 
 // --- Current session display ---------------------------------------------
@@ -69,57 +71,11 @@ const projectMetaItems = computed(() => {
 
 function toggleSidebar() { emit('toggle-sidebar') }
 function toggleInspector() { emit('toggle-inspector') }
+function toggleTheme() { emit('toggle-theme') }
 
-// --- Context utilisation badge (P2-3) -----------------------------
-// The badge reads the silently-refreshed context inspector data
-// (the chat store's refreshContextUsage, fired on session switch
-// and after each turn). No data, a stale session, or a missing
-// context window → the badge collapses back to a bare icon button.
-const ctxData = computed(() => {
-  const s = state.currentID
-  const d = state.contextInspector?.data
-  if (!s || !d || d.session_id !== s) return null
-  if (!d.context_window || d.context_window <= 0) return null
-  return d
-})
-
-// ctxPct is the percentage against the FULL context window — the
-// denominator the user reads as "how full the model is" (200K/1M).
-// Prefers the server's context_window_pct, falls back to a client
-// computation for older servers.
-const ctxPct = computed(() => {
-  const d = ctxData.value
-  if (!d) return 0
-  const p = d.context_window_pct
-  if (p != null && Number.isFinite(p)) return Math.min(p, 999.9)
-  return (d.estimated_tokens / d.context_window) * 100
-})
-const ctxBarPct = computed(() => Math.min(Math.max(ctxPct.value, 0), 100))
-const ctxPctText = computed(() => `${ctxPct.value.toFixed(1)}%`)
-const ctxTokensText = computed(() => {
-  const d = ctxData.value
-  if (!d) return ''
-  return `${formatCompactTokens(d.estimated_tokens)} / ${formatCompactTokens(d.context_window)}`
-})
-
-// ctxColor mirrors the drawer's thresholds (<60% green, 60-80%
-// yellow, >80% red) so the badge and the auto-compact behaviour
-// tell the same story at a glance.
-const ctxColor = computed(() => {
-  const p = ctxPct.value
-  if (p >= 80) return 'error'
-  if (p >= 60) return 'warning'
-  return 'success'
-})
-
-// ctxTip is the hover tooltip: model + full-window ratio + usable
-// number (all estimates). Plain label when no data is loaded.
-const ctxTip = computed(() => {
-  const d = ctxData.value
-  if (!d) return '上下文占用'
-  const usable = d.usable_tokens || d.context_window
-  return `上下文占用 · ${d.model || '未知模型'} · ${formatCompactTokens(d.estimated_tokens)} / ${formatCompactTokens(d.context_window)}（${ctxPct.value.toFixed(1)}%）· 可用 ${formatCompactTokens(usable)}（估算）`
-})
+const themeToggleTitle = computed(() =>
+  props.themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题',
+)
 </script>
 
 <template>
@@ -172,43 +128,22 @@ const ctxTip = computed(() => {
       </template>
     </div>
 
-    <!-- Right section: context and inspector only. Project/session utilities
+    <!-- Right section: theme and inspector only. Project/session utilities
          live in the InspectorPanel so this toolbar stays calm. -->
     <div class="topbar-right">
-      <!-- P2-3: context usage. Clicking refreshes the estimate
-           (no popup — the old drawer is gone). When the badge
-           data is loaded (silent refreshContextUsage on session
-           switch / turn end), we render a compact utilisation
-           badge so the context ratio is visible at a glance;
-           without data it falls back to a bare icon. -->
       <NTooltip>
         <template #trigger>
           <NButton
-            v-if="!ctxData"
             size="tiny"
             quaternary
-            aria-label="查看上下文占用"
-            @click="refreshContextUsage(state.currentID)"
+            :aria-label="themeToggleTitle"
+            :title="themeToggleTitle"
+            @click="toggleTheme"
           >
-            <BarChart3 :size="16" />
+            <component :is="props.themeName === 'dark' ? Sun : Moon" :size="16" />
           </NButton>
-          <button
-            v-else
-            type="button"
-            class="ctx-badge"
-            :class="ctxColor"
-            :aria-label="`查看上下文占用：${ctxTip}`"
-            @click="refreshContextUsage(state.currentID)"
-          >
-            <BarChart3 :size="15" />
-            <span class="ctx-badge-bar">
-              <span class="ctx-badge-bar-fill" :style="{ width: ctxBarPct + '%' }" />
-            </span>
-            <span class="ctx-badge-pct">{{ ctxPctText }}</span>
-            <span class="ctx-badge-tokens">{{ ctxTokensText }}</span>
-          </button>
         </template>
-        {{ ctxTip }}（点击刷新）
+        {{ themeToggleTitle }}
       </NTooltip>
       <NTooltip>
         <template #trigger>
@@ -344,60 +279,6 @@ const ctxTip = computed(() => {
   gap: 4px;
   flex-shrink: 0;
 }
-
-/* --- Context utilisation badge -----------------------------------
- * Replaces the bare context icon when badge data is loaded. The
- * fill colour follows the same thresholds as the context drawer
- * (<60% success, 60-80% warning, >80% error) so the badge and the
- * auto-compact behaviour tell one story. */
-.ctx-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 26px;
-  padding: 0 8px;
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-pill);
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out);
-}
-.ctx-badge:hover {
-  background: var(--surface-3);
-  border-color: var(--border-default);
-}
-.ctx-badge-bar {
-  width: 36px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--surface-3);
-  overflow: hidden;
-  flex-shrink: 0;
-}
-.ctx-badge-bar-fill {
-  display: block;
-  height: 100%;
-  border-radius: 2px;
-  background: currentColor;
-  transition: width var(--dur-base) var(--ease-out);
-}
-.ctx-badge-pct {
-  font-size: 11px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-.ctx-badge-tokens {
-  font-size: 10.5px;
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  color: var(--text-tertiary);
-}
-.ctx-badge.success { color: var(--success-500); }
-.ctx-badge.warning { color: var(--warn-500); }
-.ctx-badge.error   { color: var(--error-500); }
 
 @media (max-width: 960px) {
   .project-meta-group {

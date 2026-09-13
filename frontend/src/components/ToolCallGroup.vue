@@ -11,6 +11,7 @@ import {
   X,
 } from './icons'
 import ToolCallCard from './ToolCallCard.vue'
+import { toolGeneratedAssetsFromPart } from '../utils/attachmentArtifacts'
 
 const props = defineProps<{ parts: ToolPart[] }>()
 
@@ -103,19 +104,7 @@ function rowLabel(part: ToolPart): string {
 }
 
 function partHasMediaResult(part: ToolPart): boolean {
-  if (!part.result) return false
-  if (!part.name.startsWith('generate_') && part.name !== 'browser_screenshot') return false
-  try {
-    const parsed = JSON.parse(part.result)
-    return Array.isArray(parsed?.assets)
-      && parsed.assets.some((asset: any) =>
-        asset
-        && typeof asset.url === 'string'
-        && ['image', 'video', 'audio'].includes(String(asset.kind)),
-      )
-  } catch {
-    return false
-  }
+  return toolGeneratedAssetsFromPart(part).length > 0
 }
 </script>
 

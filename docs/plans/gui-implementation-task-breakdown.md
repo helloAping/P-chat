@@ -15,7 +15,7 @@
 | T3 子代理卡片与后台任务 UI | 已完成 | 子代理类型与后台/同步模式已合并为紧凑 meta，后台任务列表保留类型文本，展开态收敛为嵌套对话列表 |
 | T4 Provider / Model 设置语义 | 已完成 | Provider 请求协议显示为 `OpenAI Chat` / `Anthropic Messages`，保存值不变 |
 | T5 弹窗、抽屉、菜单、空状态统一 | 已完成 | `ToolConfirmModal` 接入 `AppModal`；`ToolListDrawer` 改用 icon barrel 和 token 化错误态；新增静态规范测试 |
-| T6 响应式与视觉 QA | 返工中 | 真实渲染截图发现侧栏比例、重复快捷入口、工具/媒体卡片与设计稿仍有差距；项目列表必须只在 `ProjectSwitcher` 下拉面板中展示，不允许作为常驻侧栏区块占位 |
+| T6 响应式与视觉 QA | 返工中 | 真实渲染截图发现侧栏比例、左右面板拖拽、重复快捷入口、工具/媒体卡片与设计稿仍有差距；项目列表必须只在 `ProjectSwitcher` 下拉面板中展示，不允许作为常驻侧栏区块占位 |
 | T7 最终整合与 build | 待复验 | 需在视觉返工后重新运行 `npm run build`、`npm run test`、相关 Go 测试与截图验收 |
 
 > Cursor Grok 4.6（非 Fast）只读审计已按用户授权尝试启动 T1/T5/T6。T1/T5/T6 进程均未返回可用审计正文（连接重试或静默退出），本轮以本地审计和测试结果收口。
@@ -41,6 +41,8 @@
 - `OpenAI Chat` 是 UI 显示语义；当前后端配置值仍是 `openai`，不是把 schema 改成 `openaichat`。除非单独做后端兼容任务，否则不要改后端枚举。
 - `Base URL` 是网络地址字段，可以出现 `https://`；Provider 的“请求协议”下拉不能出现 HTTP/HTTPS。
 - `thinking` 不仅在文档上独立，代码里也要从 `MessageBubble.vue` 的 process row 判断和 `.event-timeline` CSS 中移出。
+- 左侧会话栏和右侧 Inspector 都需要真实可拖拽；两侧首次默认均为 240px，拖拽宽度要有最小/最大值保护，并支持双击恢复默认宽度。
+- Inspector 会话 tab 不重复展示项目名称、路径、Git 分支和工作区状态；这些项目信息归到项目 tab，TopBar 只保留弱 breadcrumb metadata。
 - `SubAgentCard` 目前已有部分 metadata 字段，但展开态仍更像带竖向 rail 的内部过程流，需要收敛成设计图里的嵌套对话列表。
 - `SubAgentJobsPanel` 显示 `subagent_type` 文本即可，不再额外增加「类型」标签或强 badge。
 - 弹窗、抽屉、菜单、toast、空状态已有多个组件，任务里必须逐一核对，不要只改设置页。
@@ -110,6 +112,8 @@
 5. 核对 `createSession()` 是否使用当前 `activeProjectPath`。
 6. 核对 AppRail 保留全局、项目、设置、左下新建项目、关于入口；ProjectSwitcher 触发器旁不再额外放 `+`。
 7. 核对 sidebar collapsed 与 inspector open 的持久化是否互不影响。
+8. 核对左侧会话栏和右侧 Inspector 是否都能拖拽、受最小/最大宽度限制，并可双击恢复 240px 默认宽度。
+9. 核对 Inspector 会话 tab 是否只放会话信息/会话操作，项目名称、路径、Git 分支、工作区状态是否只在项目 tab 或 TopBar 弱 metadata 中展示。
 
 验收：
 
@@ -119,6 +123,9 @@
 - 当前项目会话列表可见。
 - 项目选项不在侧栏页面中直接列举；展开项目切换器后才显示项目列表。
 - 切换项目后不会混入其它项目会话。
+- 左侧会话栏和右侧 Inspector 都可拖拽并能双击恢复默认宽度。
+- Inspector 折叠/展开、会话/项目 tab 切换有轻量过渡。
+- Inspector 会话 tab 不重复展示项目名称、路径、Git 分支、工作区状态；项目 tab 展示这些项目信息。
 - Inspector 折叠后聊天区正常扩展。
 
 Cursor Grok 4.6 提示词：
@@ -370,10 +377,11 @@ Cursor Grok 4.6 提示词：
 
 1. 跑前端 typecheck 和 build。
 2. 使用本地 dev server 或 Wails GUI 观察 1600x1000、1366x768、1100x720、900x700。
-3. 验证 sidebar collapsed、inspector open/closed、输入区 dock stack、消息滚动区域。
+3. 验证 sidebar collapsed、sidebar resize、inspector open/closed、inspector resize、输入区 dock stack、消息滚动区域。
 4. 验证长标题、长路径、长工具名、长模型名不会挤爆布局。
-5. 验证 light / dark 主题颜色不冲突。
-6. 输出截图和问题清单。
+5. 验证 Inspector 会话 / 项目 tab 切换过渡、会话 tab 不重复展示项目信息、项目 tab 展示 Git 分支和工作区状态。
+6. 验证 light / dark 主题颜色不冲突。
+7. 输出截图和问题清单。
 
 验收：
 
@@ -381,6 +389,10 @@ Cursor Grok 4.6 提示词：
 - 消息区可滚动。
 - 侧栏折叠不遮挡主区。
 - Inspector 折叠不影响输入区。
+- 左侧会话栏和右侧 Inspector 拖拽正常，最小宽度下仍可读。
+- Inspector tab 切换和展开/折叠过渡自然。
+- 会话 tab 不重复展示项目名称、路径、分支和工作区状态。
+- 项目 Git 分支和工作区 clean/dirty 状态可见。
 - 文本不明显溢出或重叠。
 
 Cursor Grok 4.6 提示词：
@@ -398,7 +410,12 @@ Cursor Grok 4.6 提示词：
 
 重点看：
 - sidebar collapsed / expanded
+- sidebar resize
 - inspector open / closed
+- inspector resize
+- Inspector session/project tab transition
+- Inspector session tab no duplicate project info
+- project Git branch and clean/dirty state
 - ChatWindow 消息滚动
 - InputArea dock stack
 - long title/path/model/tool name
@@ -466,6 +483,10 @@ Cursor Grok 4.6 提示词：
 主目标：
 - 保持 Project-Aware Calm Workbench 风格。
 - 保留项目、全局会话、项目内会话、新建项目、新建对话、搜索、模型、上下文、会话设置、构建、终端、权限等入口。
+- 左侧会话栏和右侧 Inspector 首次默认均为 240px，都可拖拽，受宽度上下限保护，并支持双击恢复默认宽度。
+- 项目列表只在 ProjectSwitcher popover 中展示；ProjectSwitcher 触发器旁不额外放 `+` 挤压项目名，左下角新建项目按钮保留。
+- TopBar 只放 breadcrumb、主题切换和 Inspector 开关；上下文占用进度条放 Inspector 会话 tab 的「模型 / 上下文」卡片；打开目录/终端放 Inspector 项目 tab，工具列表/生成风格放 Inspector 会话 tab。
+- Inspector 会话 tab 不重复展示项目名称、路径、Git 分支和工作区状态；这些项目信息保留在项目 tab。
 - thinking 独立，不进入 event-timeline。
 - tool / skill / sub_agent 进入执行时间线。
 - SubAgentCard 合并展示子代理类型和运行模式，展开态像嵌套对话列表。

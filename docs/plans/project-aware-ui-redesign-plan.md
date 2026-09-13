@@ -44,9 +44,9 @@ P-Chat 的主界面统一为 **Project-Aware Calm Workbench**：
 - 保留 frameless titlebar / Wails 约束，不改变窗口关闭流程。
 - 主体布局建议：
   - 左侧 app rail：约 52px。
-  - 统一侧栏：使用 `--sidebar-width`，默认约占工作区 1/5，并支持拖拽收缩/展开；承载项目切换和当前项目会话。不恢复项目列表常驻独立列。
-  - 中央聊天区：flex 自适应，默认约占工作区 3/5，消息阅读列居中。
-  - 右侧 inspector：使用 `--inspector-width`，默认约占工作区 1/5；可折叠，默认可以打开但视觉必须轻。
+  - 统一侧栏：使用 `--sidebar-width`，首次默认 240px，并支持拖拽收缩/展开、双击恢复默认宽度；承载项目切换和当前项目会话。不恢复项目列表常驻独立列。
+  - 中央聊天区：flex 自适应，消息阅读列居中。
+  - 右侧 inspector：使用 `--inspector-width`，首次默认 240px；可折叠、可拖拽调整宽度、双击恢复默认宽度，默认可以打开但视觉必须轻。
 
 ### 4.2 左侧 App Rail
 
@@ -100,8 +100,8 @@ P-Chat 的主界面统一为 **Project-Aware Calm Workbench**：
 
 - 项目 breadcrumb：`P-Chat / 当前会话标题`
 - 项目路径；若项目数据提供 git branch / 工作区状态，则显示对应 metadata
-- 上下文占用 chip，例如 `4.5K / 64K`
-- inspector / 工具 / 设置等轻量图标按钮
+- 主题切换与 inspector 开关；上下文占用进度不放在 TopBar，迁入 Inspector 会话 tab 的「模型 / 上下文」卡片
+- 工具列表、生成风格、打开目录、打开终端等操作不占用 TopBar
 
 注意：
 
@@ -130,25 +130,31 @@ P-Chat 的主界面统一为 **Project-Aware Calm Workbench**：
 
 ## 6. 右侧 Inspector
 
-右侧 inspector 是轻量信息面板，不要做成一堆厚卡片。
+右侧 inspector 是轻量信息面板，不要做成一堆厚卡片；面板宽度可拖拽调整，折叠/展开和 tab 切换要使用轻量过渡动画。
 
 建议 tab：
 
 - `会话`
 - `项目`
 
+会话 tab 至少包含：
+
+- 当前会话标题 / id
+- 会话操作：复制 trace、工具列表、生成风格
+- 当前会话相关的 AGENTS.md / 模型与上下文 / 工具统计摘要
+- 不重复展示项目名称、项目路径、Git 分支或工作区状态
+
 项目 tab 至少包含：
 
 - 当前项目名、路径；若项目数据提供分支 / 工作区状态，则显示对应 metadata
 - `AGENTS.md` / 项目指令加载状态
-- 模型与上下文摘要
 - 工具调用成功 / 失败 / 运行中统计
 - 项目路径复制等轻量信息动作；打开文件夹/终端等当前项目动作由 Inspector 项目区域承载，避免入口重复。
 
 样式要求：
 
 - 使用弱 section divider，而不是一层套一层的卡片。
-- inspector 可以折叠；折叠后主聊天区自然扩展。
+- inspector 可以折叠 / 拖拽调整；折叠后主聊天区自然扩展。
 
 ## 7. 底部 Composer
 
@@ -249,7 +255,7 @@ P-Chat 的主界面统一为 **Project-Aware Calm Workbench**：
 
 建议：
 
-- 优先复用已有 context / project / tool state，避免新增后端字段。
+- 优先复用已有 context / project / tool state；若需要展示 Git 分支 / 工作区状态，可在项目列表接口补充只读字段，不引入 schema 迁移。
 - 如果当前项目数据不足，先做只读摘要和快捷入口。
 - 使用轻分隔线和紧凑 section，不做多层卡片。
 
@@ -258,6 +264,9 @@ P-Chat 的主界面统一为 **Project-Aware Calm Workbench**：
 - inspector 折叠后主区布局正常。
 - 会话 tab 与项目 tab 都有明确内容。
 - 项目指令、上下文、工具统计、项目路径复制可见。
+- 会话 tab 不重复展示项目名称、路径、分支和工作区状态。
+- 项目 tab 显示 Git 分支 / 工作区 clean-dirty 状态。
+- Inspector 拖拽、折叠/展开和 tab 切换动效正常。
 
 ### 阶段 6：供应商与模型设置语义修正
 
@@ -343,7 +352,7 @@ npm run build
 2. 会话是当前项目下的二级对象。
 3. 全局会话是特殊空间，必须始终可进入。
 4. 新建项目、切换项目、项目内新建对话、搜索项目内会话都必须在默认界面中可发现。
-5. 使用“52px app rail + 可拖拽统一侧栏 + 中央聊天区 + 可折叠右侧 inspector”的布局；默认展开比例约为 `SessionSidebar : ChatWindow : InspectorPanel = 1 : 3 : 1`。
+5. 使用“52px app rail + 可拖拽统一侧栏 + 中央聊天区 + 可折叠/可拖拽右侧 inspector”的布局；左侧会话栏和右侧 Inspector 首次默认均为 240px，两侧面板都要有宽度上下限和双击恢复默认宽度。
 6. 项目列表不要长期占一整列；放到统一侧栏顶部的 project switcher popover 中。
 
 必须保留并展示的现有能力：
@@ -371,10 +380,10 @@ npm run build
 1. 先盘点现有组件和 store 字段，不要凭空改数据模型。
 2. 优先在 SessionSidebar.vue 中重构统一侧栏；必要时拆 ProjectSwitcher.vue、ProjectMenu.vue、ConversationList.vue。
 3. 保持 ChatWindow.vue 的 flex 布局铁律：chat-main 不加 max-height，messages-scroll 保持 min-height: 0 和 overflow-y: auto，InputArea 保持 flex-shrink: 0，不使用 NScrollbar。
-4. 顶部 header 显示项目 breadcrumb、路径、上下文 chip 和 inspector toggle；branch / 工作区状态只有在项目数据提供时展示。
+4. 顶部 header 显示项目 breadcrumb、路径、主题切换和 inspector toggle；上下文占用进度条放入 Inspector 会话 tab「模型 / 上下文」卡片；branch / 工作区状态只有在项目数据提供时展示。
 5. MessageBubble.vue 中 assistant 文本默认不套厚重卡片；user 消息右对齐柔和气泡。
 6. ThinkingBlock 必须独立显示；ToolCallCard / SkillCallCard / SubAgentCard 统一为紧凑执行时间线视觉；SubAgentCard 必须合并展示子代理类型和后台/同步运行模式，展开态像嵌套对话列表；不要改变 SSE parts 数据结构。
-7. 右侧 inspector 用轻量 section 展示会话/项目信息；项目动作放在项目区域内，不要多层卡片嵌套，也不要和 AppRail / TopBar 重复堆叠入口。
+7. 右侧 inspector 用轻量 section 展示会话/项目信息；会话 tab 放 trace、工具列表、生成风格等会话操作，项目 tab 放项目名、路径、Git 分支/工作区状态、打开目录/终端等项目动作，不要多层卡片嵌套，也不要和 AppRail / TopBar 重复堆叠入口。
 8. 底部 InputArea 保留现有 composer dock stack 和控件，只做视觉收敛。
 9. 设置页供应商「协议」表示 LLM 请求协议，选项显示 OpenAI Chat / Anthropic Messages；Base URL 独立展示网络地址，模型弹窗移除「功能标签」。
 
@@ -420,7 +429,9 @@ npm run build
 - 新建项目内对话可用。
 - thinking 独立显示，tool/skill/sub-agent 执行时间线展示正常。
 - tool error 克制显示，不是大面积红色警告。
-- 右侧 inspector 可折叠。
+- 右侧 inspector 可折叠、可拖拽；tab 切换有轻量过渡。
+- Inspector 会话 tab 不重复展示项目名称、路径、分支和工作区状态。
+- 项目 Git 分支和工作区 clean/dirty 状态可见。
 - 底部输入区不漂移、不遮挡、不丢控制项。
 - light / dark 两个主题都可读。
 ```

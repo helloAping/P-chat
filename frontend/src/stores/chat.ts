@@ -281,11 +281,11 @@ export const state = reactive({
   // 未送达消息…") while this is true so the user knows
   // the system is doing work, not hanging.
   isRecovering: {} as Record<string, boolean>,
-  // P2-3: context usage snapshot for the TopBar badge. When
+  // P2-3: context usage snapshot for the Inspector context card. When
   // non-null it holds the cached payload + loading/error state
   // for the current session's context utilisation estimate.
-  // `refreshContextUsage` updates it silently; the badge reads
-  // `.data` (and hides on a failed fetch).
+  // `refreshContextUsage` updates it silently; the card reads
+  // `.data` and falls back to an empty state on failed fetches.
   contextInspector: null as null | {
     loading: boolean
     error: string | null
@@ -997,7 +997,7 @@ async function switchSessionBody(id: string) {
     } catch { /* ignore — server may not have todos yet */ }
   }
   await loadTurnQueue(id)
-  // P4-x: keep the TopBar context badge in sync with the newly
+  // P4-x: keep the Inspector context card in sync with the newly
   // active session. Silent fetch — the drawer stays closed.
   void refreshContextUsage(id)
 }
@@ -2602,7 +2602,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
 	        }
 	      }
 	      delete state.turnPlanReview[id]
-      // P4-x: turn finished — refresh the TopBar context badge
+      // P4-x: turn finished — refresh the Inspector context card
       // so the estimate reflects the tokens this turn added.
       void refreshContextUsage(id)
       break
@@ -2983,12 +2983,12 @@ export function appendSystemMessage(text: string) {
   state.sessionMessages[cid].push({ role: 'system', content: scrubPhantomError(text) })
 }
 
-// --- P2-3 context usage (TopBar badge) ---
+// --- P2-3 context usage (Inspector context card) ---
 
 // loadContextInspector pulls the current session's token
 // estimate + utilisation into `state.contextInspector.data`.
-// Errors land in `state.contextInspector.error`; the badge
-// just hides on failure (data is left intact if present).
+// Errors land in `state.contextInspector.error`; the Inspector
+// card falls back to its empty state (data is left intact if present).
 export async function loadContextInspector(sessionId: string): Promise<void> {
   if (!state.contextInspector) {
     state.contextInspector = { loading: true, error: null, data: null }
@@ -3010,14 +3010,14 @@ export async function loadContextInspector(sessionId: string): Promise<void> {
 
 // refreshContextUsage fetches the context utilisation snapshot
 // for the given session. It is the ONLY entry point now — the
-// old drawer that opened on click is gone; the TopBar badge
+// old drawer that opened on click is gone; the Inspector card
 // renders from `state.contextInspector.data`. Called on session
-// switch / after each turn (and on badge click) to keep the
-// badge current. Errors are swallowed — the badge hides.
+// switch / after each turn (and on card click) to keep the
+// estimate current. Errors are swallowed.
 export function refreshContextUsage(sessionId: string) {
   if (!sessionId) return
   if (!state.contextInspector) {
-    // Create the bucket so the badge can read data.
+    // Create the bucket so the context card can read data.
     state.contextInspector = { loading: true, error: null, data: null }
   }
   void loadContextInspector(sessionId)
@@ -3047,7 +3047,7 @@ export function endStream(id: string, ctrl?: AbortController) {
   state.sessionWorking[id] = false
   state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
   // P4-x: stop/abort/regenerate also changes what the next turn
-  // will send — refresh the TopBar context badge. (The normal
+  // will send — refresh the Inspector context card. (The normal
   // `done` path already refreshed in appendStreamEvent, so no
   // double-fetch here.)
   void refreshContextUsage(id)

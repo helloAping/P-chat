@@ -5,9 +5,7 @@
  * Layout (PR #4 of the UI refresh):
  *
  *   ┌─────────────────────────────┐
- *   │  BrandLogo  P-Chat  🌞 ⋯    │  header
- *   ├─────────────────────────────┤
- *   │  📁 项目: P-Chat       v    │  project bar
+ *   │  📁 项目: P-Chat       v    │  project switcher
  *   ├─────────────────────────────┤
  *   │  🔍 搜索会话内容…            │  search bar
  *   ├─────────────────────────────┤
@@ -22,7 +20,7 @@
  *   │  本月                        │
  *   │  更早 ▾                      │
  *   ├─────────────────────────────┤
- *   │  BrandLogo  v1.0.4    ⚙    │  user card
+ *   │  P-Chat  v1.0.4       ⋯    │  app actions
  *   └─────────────────────────────┘
  *
  * The list is grouped by relative time (pinned / today /
@@ -49,7 +47,7 @@ import TokenStatsModal from './TokenStatsModal.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import { displaySessionTitle, sessionSourceFromID } from '../im/sessionSource'
 import {
-  Plus, BarChart3, Settings, Info, Bell, Globe, Folder, FolderOpen, Sun, Moon, MoreHorizontal,
+  Plus, BarChart3, Settings, Info, Bell, Globe, Folder, FolderOpen, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
   ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
   Download, RotateCw, ExternalLink,
@@ -66,8 +64,6 @@ function openDocs() {
 }
 
 const emit = defineEmits<{ (e: 'open-settings'): void }>()
-
-const themeName = defineModel<'dark' | 'light'>('themeName', { default: 'dark' })
 const showTokenStats = ref(false)
 
 const message = useMessage()
@@ -733,10 +729,6 @@ const hasUpdateBlockingWork = computed(() =>
   Object.values(state.sessionBackgroundHookMerging).some(Boolean),
 )
 
-function toggleTheme() {
-  themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
-}
-
 function versionLabel(value: string): string {
   if (!value) return 'v' + APP_VERSION
   return value.startsWith('v') || value.startsWith('V') ? value : `v${value}`
@@ -992,29 +984,12 @@ onMounted(() => {
 <template>
   <aside class="sidebar">
     <section class="session-panel" aria-label="会话">
-      <!-- Project switcher + theme / app actions. -->
+      <!-- Project switcher only. App utilities live in TopBar / footer. -->
       <div class="sidebar-header">
         <ProjectSwitcher
           ref="projectSwitcherRef"
           @add-project="showAddProject = true"
         />
-        <div class="sidebar-actions">
-          <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'" aria-label="切换主题">
-            <component :is="themeName === 'dark' ? Sun : Moon" :size="16" />
-          </NButton>
-          <NDropdown
-            trigger="click"
-            placement="bottom-end"
-            size="small"
-            :options="menuOptions"
-            :menu-props="actionMenuProps"
-            @select="(key) => handleMenuSelect(String(key))"
-          >
-            <NButton size="small" quaternary title="更多" aria-label="更多">
-              <MoreHorizontal :size="16" />
-            </NButton>
-          </NDropdown>
-        </div>
       </div>
 
       <!-- Search bar (filters across all sessions in current project). -->
@@ -1140,7 +1115,7 @@ onMounted(() => {
         </div>
       </NScrollbar>
 
-      <!-- Footer brand card: app version + About. Settings lives in AppRail. -->
+      <!-- Footer brand card: app version + About + overflow actions. -->
       <div class="user-card">
         <button
           class="user-card-brand"
@@ -1154,6 +1129,23 @@ onMounted(() => {
             <span class="user-card-version">v{{ APP_VERSION }}</span>
           </span>
         </button>
+        <NDropdown
+          trigger="click"
+          placement="top-end"
+          size="small"
+          :options="menuOptions"
+          :menu-props="actionMenuProps"
+          @select="(key) => handleMenuSelect(String(key))"
+        >
+          <button
+            type="button"
+            class="user-card-menu-btn"
+            title="更多应用操作"
+            aria-label="更多应用操作"
+          >
+            <MoreHorizontal :size="16" />
+          </button>
+        </NDropdown>
       </div>
     </section>
 
@@ -1448,18 +1440,6 @@ onMounted(() => {
   flex-shrink: 0;
   border-bottom: 1px solid var(--border-subtle);
 }
-.sidebar-actions {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: var(--space-1);
-  white-space: nowrap;
-}
-.sidebar-actions :deep(.n-button) {
-  flex: 0 0 auto;
-}
-
 /* --- Search bar -------------------------------------------------------- */
 .search-bar {
   padding: var(--space-3) var(--space-3) var(--space-2);
@@ -1727,6 +1707,28 @@ onMounted(() => {
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
+}
+.user-card-menu-btn {
+  width: var(--control-height);
+  height: var(--control-height);
+  flex: 0 0 var(--control-height);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+.user-card-menu-btn:hover {
+  background: var(--surface-3);
+  border-color: var(--border-default);
+  color: var(--text-primary);
 }
 
 /* --- Add-project / confirm / about modals ---------------------------- */
