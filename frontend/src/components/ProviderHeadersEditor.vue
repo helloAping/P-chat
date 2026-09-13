@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { NButton, NInput, NTooltip } from 'naive-ui'
+import { NButton, NInput, NPopover } from 'naive-ui'
 import { HelpCircle, Plus, Trash2 } from './icons'
 
 interface ProviderHeaderRow {
@@ -158,7 +158,39 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
       <div>
         <div class="headers-editor-title">
           <span>自定义请求头</span>
-          <span class="headers-count">{{ modelValue.length }}</span>
+          <NPopover trigger="hover" placement="right-start" :delay="180">
+            <template #trigger>
+              <button
+                type="button"
+                class="headers-help-btn"
+                title="查看动态参数说明"
+                aria-label="查看动态参数说明"
+              >
+                <HelpCircle :size="13" />
+              </button>
+            </template>
+            <div class="placeholder-popover">
+              <div class="placeholder-popover-title">动态参数</div>
+              <p>可在请求头值中使用，发送上游请求前自动展开。</p>
+              <div v-for="group in placeholderGroups" :key="group.label" class="placeholder-popover-group">
+                <div class="placeholder-group-label">{{ group.label }}</div>
+                <div class="placeholder-popover-items">
+                  <div
+                    v-for="placeholder in group.items"
+                    :key="placeholder.value"
+                    class="placeholder-popover-item"
+                  >
+                    <code>{{ placeholder.value }}</code>
+                    <span class="placeholder-popover-item-label">{{ placeholder.label }}</span>
+                    <span class="placeholder-popover-item-desc">{{ placeholder.description }}</span>
+                    <span class="placeholder-popover-item-usage">
+                      稳定范围：{{ placeholder.scope }} · 适用场景：{{ placeholder.usage }}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </NPopover>
         </div>
         <p class="headers-editor-description">用于该供应商的模型调用、连接测试、模型列表与媒体生成请求。</p>
       </div>
@@ -200,53 +232,6 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
       尚未配置额外请求头，点击添加一行
     </button>
 
-    <div class="placeholder-catalog">
-      <div class="placeholder-catalog-head">
-        <span class="placeholder-catalog-title">动态参数</span>
-        <span class="placeholder-catalog-hint">
-          <HelpCircle :size="12" />
-          鼠标悬停查看用途
-        </span>
-      </div>
-      <div v-for="group in placeholderGroups" :key="group.label" class="placeholder-group">
-        <span class="placeholder-group-label">{{ group.label }}</span>
-        <div class="placeholder-strip">
-          <NTooltip
-            v-for="placeholder in group.items"
-            :key="placeholder.value"
-            placement="top-start"
-            :delay="180"
-          >
-            <template #trigger>
-              <span
-                class="placeholder-chip"
-                :aria-label="`${placeholder.value}：${placeholder.label}。${placeholder.description}`"
-              >
-                <code>{{ placeholder.value }}</code>
-                <span>{{ placeholder.label }}</span>
-              </span>
-            </template>
-            <div class="placeholder-tooltip">
-              <div class="placeholder-tooltip-head">
-                <strong>{{ placeholder.label }}</strong>
-                <code>{{ placeholder.value }}</code>
-              </div>
-              <p>{{ placeholder.description }}</p>
-              <dl>
-                <div>
-                  <dt>稳定范围</dt>
-                  <dd>{{ placeholder.scope }}</dd>
-                </div>
-                <div>
-                  <dt>适用场景</dt>
-                  <dd>{{ placeholder.usage }}</dd>
-                </div>
-              </dl>
-            </div>
-          </NTooltip>
-        </div>
-      </div>
-    </div>
     <p class="headers-footnote">
       模板会在上游请求发出前展开；自定义值会覆盖同名默认请求头。
     </p>
@@ -266,9 +251,7 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 .headers-editor-head,
 .headers-editor-title,
 .headers-editor-actions,
-.placeholder-catalog-head,
-.placeholder-catalog-hint,
-.placeholder-strip {
+.headers-help-btn {
   display: flex;
   align-items: center;
 }
@@ -285,16 +268,23 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
   font-weight: 600;
 }
 
-.headers-count {
-  min-width: 20px;
-  padding: 0 var(--space-2);
-  border-radius: var(--radius-pill);
-  background: var(--surface-3);
+.headers-help-btn {
+  justify-content: center;
+  width: calc(var(--space-6) - var(--space-1));
+  height: calc(var(--space-6) - var(--space-1));
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
   color: var(--text-tertiary);
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
+  cursor: help;
+  transition: var(--transition-colors);
+}
+
+.headers-help-btn:hover {
+  border-color: var(--border-default);
+  background: var(--surface-3);
+  color: var(--brand-600);
 }
 
 .headers-editor-description,
@@ -362,117 +352,74 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
   outline-offset: var(--space-1);
 }
 
-.placeholder-catalog {
+.placeholder-popover {
   display: grid;
   gap: var(--space-2);
-  padding-top: var(--space-2);
-  border-top: 1px solid var(--border-subtle);
-}
-
-.placeholder-catalog-head {
-  justify-content: space-between;
-  gap: var(--space-2);
-}
-
-.placeholder-catalog-title {
+  max-width: calc(var(--space-8) * 11);
   color: var(--text-secondary);
-  font-size: 11.5px;
-  font-weight: 600;
-}
-
-.placeholder-catalog-hint {
-  gap: var(--space-1);
-  color: var(--text-quaternary);
-  font-size: 11.5px;
-}
-
-.placeholder-group {
-  display: grid;
-  grid-template-columns: 72px minmax(0, 1fr);
-  gap: var(--space-2);
-  align-items: start;
-}
-
-.placeholder-group-label {
-  padding-top: var(--space-1);
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-}
-
-.placeholder-strip {
-  gap: var(--space-1);
-  flex-wrap: wrap;
-}
-
-.placeholder-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--surface-1);
-  color: var(--text-secondary);
-  font-size: 11.5px;
-  line-height: 1.35;
-  cursor: help;
-  transition: border-color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
-}
-
-.placeholder-chip code,
-.placeholder-tooltip code {
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-}
-
-.placeholder-chip > span {
-  color: var(--text-quaternary);
-}
-
-.placeholder-chip:hover {
-  border-color: var(--brand-500);
-  background: var(--surface-3);
-  color: var(--brand-600);
-}
-
-.placeholder-tooltip {
-  display: grid;
-  gap: var(--space-2);
-  max-width: 320px;
   font-size: 11.5px;
   line-height: 1.5;
 }
 
-.placeholder-tooltip-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-3);
+.placeholder-popover-title {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 700;
 }
 
-.placeholder-tooltip p,
-.placeholder-tooltip dl,
-.placeholder-tooltip dd {
+.placeholder-popover p {
   margin: 0;
+  color: var(--text-tertiary);
 }
 
-.placeholder-tooltip dl {
+.placeholder-popover-group {
   display: grid;
   gap: var(--space-1);
 }
 
-.placeholder-tooltip dl > div {
+.placeholder-group-label {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.placeholder-popover-items {
   display: grid;
-  grid-template-columns: 52px minmax(0, 1fr);
+  gap: var(--space-1);
+}
+
+.placeholder-popover-item {
+  display: grid;
+  grid-template-columns: minmax(calc(var(--space-8) * 3), max-content) minmax(calc(var(--space-8) * 2), max-content) minmax(0, 1fr);
   gap: var(--space-2);
+  align-items: start;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
 }
 
-.placeholder-tooltip dt {
-  opacity: 0.68;
+.placeholder-popover-item code {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
 }
 
-.placeholder-tooltip dd {
-  font-weight: 500;
+.placeholder-popover-item-label {
+  color: var(--text-primary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.placeholder-popover-item-desc {
+  min-width: 0;
+  color: var(--text-secondary);
+}
+
+.placeholder-popover-item-usage {
+  grid-column: 1 / -1;
+  color: var(--text-tertiary);
 }
 
 @media (max-width: 720px) {
@@ -498,7 +445,11 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
     grid-row: 1 / span 2;
   }
 
-  .placeholder-group {
+  .placeholder-popover {
+    max-width: calc(var(--space-8) * 8);
+  }
+
+  .placeholder-popover-item {
     grid-template-columns: 1fr;
     gap: var(--space-1);
   }
