@@ -320,3 +320,10 @@ export function collectConversationAttachments(messages: Message[]): AttachmentA
   }
   return out
 }
+
+export function collectMessageGeneratedAttachments(message: Message): AttachmentArtifact[] {
+  const out: AttachmentArtifact[] = []
+  const seen = new Set<string>()
+  walkParts(message.parts, message.id, out, seen)
+  return out
+}

@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
-    "test": "node --test tests/sse.test.ts tests/export.test.ts tests/wechatQr.test.ts tests/projectSwitch.test.ts tests/rollbackAndInputMenu.test.ts tests/sessionMenu.test.ts tests/chatMemory.test.ts tests/conversationTurn.test.ts tests/closeConfirm.test.ts tests/markdownCache.test.ts tests/toolPartGrouping.test.ts tests/messageCopy.test.ts tests/chatTodoIsolation.test.ts tests/chatMessageDedup.test.ts tests/subAgentOrder.test.ts tests/streamInterrupt.test.ts tests/viewSwitch.test.ts tests/providerTest.test.ts tests/sessionConfigDropdown.test.ts tests/mediaCapabilities.test.ts tests/mediaPreview.test.ts tests/skillLifecycle.test.ts tests/guiDesign.test.ts",
+    "test": "node --test tests/sse.test.ts tests/export.test.ts tests/wechatQr.test.ts tests/projectSwitch.test.ts tests/rollbackAndInputMenu.test.ts tests/sessionMenu.test.ts tests/chatMemory.test.ts tests/conversationTurn.test.ts tests/closeConfirm.test.ts tests/markdownCache.test.ts tests/toolPartGrouping.test.ts tests/messageGeneratedAttachments.test.ts tests/messageCopy.test.ts tests/chatTodoIsolation.test.ts tests/chatMessageDedup.test.ts tests/subAgentOrder.test.ts tests/streamInterrupt.test.ts tests/viewSwitch.test.ts tests/providerTest.test.ts tests/sessionConfigDropdown.test.ts tests/mediaCapabilities.test.ts tests/mediaPreview.test.ts tests/skillLifecycle.test.ts tests/guiDesign.test.ts",
     "test:sse": "node --test tests/sse.test.ts",
     "test:webview-memory": "node tests/webview-memory-stress.mjs"
   },

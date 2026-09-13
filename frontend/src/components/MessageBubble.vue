@@ -65,12 +65,14 @@ import SubAgentCard from './SubAgentCard.vue'
 import QuestionTable from './QuestionTable.vue'
 import ExecOutputCard from './ExecOutputCard.vue'
 import TypedText from './TypedText.vue'
+import GeneratedAssetStrip from './GeneratedAssetStrip.vue'
 import {
   copyImageToClipboard, copyText, downloadBlob, downloadFromUrl,
   extensionForMime, fetchAsBlob,
 } from '../utils/clipboard'
 import { messageTextForCopy } from '../utils/messageCopy'
 import { groupConsecutiveToolParts, type PartRenderEntry } from '../utils/toolPartGrouping'
+import { collectMessageGeneratedAttachments } from '../utils/attachmentArtifacts'
 
 const dialog = useDialog()
 
@@ -866,6 +868,11 @@ const traceIdChip = computed(() => {
   return props.message.traceId || ''
 })
 
+const generatedAttachments = computed(() => {
+  if (props.message.role !== 'assistant' || props.streaming) return []
+  return collectMessageGeneratedAttachments(props.message)
+})
+
 // copyTraceId writes the trace id to the system clipboard
 // and fires a one-off toast. Called from the chip's click
 // handler so the user can paste the id into a support
@@ -1489,6 +1496,11 @@ function findPrecedingUserMessageId(): number {
               :active="true"
             />
           </template>
+
+          <GeneratedAssetStrip
+            v-if="generatedAttachments.length"
+            :assets="generatedAttachments"
+          />
 
           <!-- P1-4: 上一版回答 chip. Only on archived
                assistant rows — the active row sits

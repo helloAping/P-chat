@@ -176,15 +176,22 @@ test('message and tool media use neutral attachment cards', () => {
   const bubble = readFileSync(new URL('../src/components/MessageBubble.vue', import.meta.url), 'utf8')
   const toolGroup = readFileSync(new URL('../src/components/ToolCallGroup.vue', import.meta.url), 'utf8')
   const toolCard = readFileSync(new URL('../src/components/ToolCallCard.vue', import.meta.url), 'utf8')
+  const generatedStrip = readFileSync(new URL('../src/components/GeneratedAssetStrip.vue', import.meta.url), 'utf8')
 
   assert.match(bubble, /class="media-thumbnail-footer"/)
   assert.match(bubble, /class="media-thumbnail-name"/)
   assert.match(bubble, /\.media-thumbnail\s*\{[\s\S]*grid-template-rows: minmax\(0, 1fr\) auto;/)
   assert.match(bubble, /\.media-thumbnail-footer\s*\{[\s\S]*border-top: 1px solid var\(--border-subtle\)/)
+  assert.match(bubble, /collectMessageGeneratedAttachments\(props\.message\)/)
+  assert.match(bubble, /<GeneratedAssetStrip[\s\S]*:assets="generatedAttachments"/)
   assert.match(toolCard, /\.generated-asset-preview\s*\{[\s\S]*aspect-ratio: 16 \/ 9;/)
   assert.match(toolCard, /\.generated-asset-footer\s*\{[\s\S]*background: color-mix\(in srgb, var\(--surface-1\) 92%, transparent\)/)
   assert.match(toolGroup, /const hasMediaResult = computed/)
   assert.match(toolGroup, /if \(!userToggled\.value\) return hasRunning\.value \|\| hasMediaResult\.value/)
+  assert.match(generatedStrip, /const DISPLAY_LIMIT = 5/)
+  assert.match(generatedStrip, /class="generated-strip-preview generated-strip-preview--video"/)
+  assert.match(generatedStrip, /state\.lightbox =/)
+  assert.match(generatedStrip, /background: color-mix\(in srgb, var\(--surface-1\) 92%, transparent\)/)
 })
 
 test('responsive shell collapses optional inspector before crowding composer', () => {
