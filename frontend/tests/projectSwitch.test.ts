@@ -33,3 +33,17 @@ test('sidebar search stays scoped to the active project', () => {
   assert.match(client, /projectPath\?: string/)
   assert.match(client, /params\.set\('project_path',\s*projectPath\)/)
 })
+
+test('new session action reuses the current project blank draft before posting', () => {
+  const source = readFileSync(new URL('../src/stores/chat.ts', import.meta.url), 'utf8')
+  const match = source.match(/export async function createSession\(\): Promise<string> \{([\s\S]*?)\n\}/)
+  assert.ok(match, 'createSession should exist')
+  const body = match[1]
+  const reuseIndex = body.indexOf('const reusableBlank = state.sessions.find(isBlankSessionRecord)')
+  const postIndex = body.indexOf('api.createSession(buildCreateSessionOptions())')
+
+  assert.ok(reuseIndex >= 0, 'createSession should look for a reusable blank session first')
+  assert.ok(postIndex >= 0, 'createSession should still POST when no blank session exists')
+  assert.ok(reuseIndex < postIndex, 'blank reuse must happen before creating a new session')
+  assert.match(body, /await switchSession\(reusableBlank\.id\)/)
+})

@@ -90,6 +90,7 @@ Chunk 字段检查顺序（优先级从高到低）:
 - `ListSessions` — 列出会话（支持 `?project_path=` 过滤），返回 `conversation_state`、`has_user_messages`、`user_message_count`、`pending_turn_count`；`blank` 表示项目内可复用空白草稿。
 - `CreateSession` — 创建会话；请求体可传 `reuse_empty: true`，服务端会在同项目复用最新空白会话，避免多窗口/快速连点创建重复空会话。
 - `GetSession` — 获取单个会话元数据
+- `GenerateSessionTitle` — `POST /sessions/:id/title`，基于当前会话前几条文本消息调用当前会话 provider/model 做一次非流式语义标题生成；只覆盖空标题或占位标题，用户手动标题不会被后台覆盖，LLM 不可用时回退到本地短标题。
 - `UpdateSessionMeta` — PATCH 更新 provider/model/style
 - `DeleteSession` — 软删除（标记 archived）
 - `ArchiveSession / UnarchiveSession` — 归档/恢复

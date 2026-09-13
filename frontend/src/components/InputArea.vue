@@ -28,6 +28,7 @@ import {
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
   hasQueuedTurns, markSessionActive,
   currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
+  generateSessionTitle,
 } from '../stores/chat'
 import type { PendingAttachment } from '../stores/chat'
 import { Pencil, Check, X } from './icons'
@@ -1127,17 +1128,11 @@ async function send() {
     }
     return
   }
-  if (!meta.title) {
-    api.renameSession(id, text.slice(0, 40)).then(() => {
-      const s = state.sessions.find(s => s.id === id)
-      if (s) s.title = text.slice(0, 40)
-    }).catch(() => {})
-  }
   inputText.value = ''
 
   sending.value = true
   try {
-    await submitConversationTurn({
+    const turnResult = await submitConversationTurn({
       sessionId: id,
       message: text,
       // The integer id minted above (and stamped on the
@@ -1173,6 +1168,9 @@ async function send() {
         }
       },
     })
+    if (!turnResult.aborted) {
+      void generateSessionTitle(id, text).catch(() => {})
+    }
   } catch (e: any) {
     if (e.name !== 'AbortError') {
       message.error(`发送失败: ${e.message}`)

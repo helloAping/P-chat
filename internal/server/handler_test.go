@@ -406,6 +406,146 @@ func TestCreateSession_ReuseEmptyNormalizesProjectPath(t *testing.T) {
 	}
 }
 
+func TestGenerateSessionTitle_UsesSemanticLLM(t *testing.T) {
+	var calls atomic.Int32
+	var requestBody struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+		Stream bool `json:"stream"`
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/v1/chat/completions" {
+			http.Error(w, "bad path", http.StatusNotFound)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"\"标题：修复缓存失效问题。\""}}]}`)
+	}))
+	defer upstream.Close()
+
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "`+upstream.URL+`/v1"`, 1)
+	s, _ := newTestServerWithConfig(t, cfgJSON)
+	created := createSessionPOST(t, s, "")
+	s.store.AddChatMessageTo(created.ID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "帮我排查设置缓存失效导致后台频繁重新加载的问题",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	s.store.AddChatMessageTo(created.ID, llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     "问题集中在 settingCache 的失效时机。",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	if err := s.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+created.ID+"/title", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "修复缓存失效问题" {
+		t.Fatalf("title = %q, want 修复缓存失效问题", got.Title)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+	if requestBody.Stream {
+		t.Fatal("title generation should use non-streaming requests")
+	}
+	joined, _ := json.Marshal(requestBody.Messages)
+	if !strings.Contains(string(joined), "设置缓存失效") {
+		t.Fatalf("title prompt did not include conversation source: %s", joined)
+	}
+}
+
+func TestGenerateSessionTitle_KeepsExistingTitle(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"Should Not Call"}}]}`)
+	}))
+	defer upstream.Close()
+
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "`+upstream.URL+`/v1"`, 1)
+	s, _ := newTestServerWithConfig(t, cfgJSON)
+	created := createSessionPOST(t, s, `{"title":"用户自定义标题"}`)
+	s.store.AddChatMessageTo(created.ID, llm.ChatMessage{Role: llm.RoleUser, Type: llm.TypeText, Content: "hello", MsgType: llm.MsgTypeText, SubmitToLLM: 1})
+	if err := s.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+created.ID+"/title", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "用户自定义标题" {
+		t.Fatalf("title = %q, want existing title", got.Title)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestGenerateSessionTitle_FallsBackWhenLLMUnavailable(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.handler.agent.SetLLM(nil)
+	created := createSessionPOST(t, s, "")
+	s.store.AddChatMessageTo(created.ID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "你好",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	if err := s.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+created.ID+"/title", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "日常对话" {
+		t.Fatalf("title = %q, want 日常对话", got.Title)
+	}
+}
+
 func TestSearchMessages_ProjectParamFiltersCurrentProject(t *testing.T) {
 	s, _ := newTestServer(t)
 	projectAPath := filepath.Join(t.TempDir(), "project-a")

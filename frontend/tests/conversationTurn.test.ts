@@ -32,6 +32,18 @@ test('input delegates chat streaming to the conversation turn seam', () => {
   assert.match(source, /stopConversationTurn\(state\.currentID\)/)
 })
 
+test('input asks the server for a semantic session title after the first turn', () => {
+  const source = readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
+  const sendStart = source.indexOf('async function send()')
+  const sendEnd = source.indexOf('\nfunction stop()', sendStart)
+  const sendSource = source.slice(sendStart, sendEnd)
+
+  assert.match(sendSource, /const turnResult = await submitConversationTurn/)
+  assert.match(sendSource, /generateSessionTitle\(id, text\)/)
+  assert.doesNotMatch(sendSource, /api\.renameSession\(id,\s*text\.slice\(0,\s*40\)/)
+  assert.doesNotMatch(sendSource, /text\.slice\(0,\s*40\)/)
+})
+
 test('input shows the local user bubble before attachment preparation and reuses uploaded files', () => {
   const source = readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
   const sendStart = source.indexOf('async function send()')
@@ -62,6 +74,7 @@ test('conversation turn drains queued turns after a completed stream', () => {
   assert.match(source, /await claimNextQueuedTurnForDrain\(sessionId\)/)
   assert.match(source, /appendLocalUserMessage\(sessionId/)
   assert.match(source, /const result = await submitConversationTurn/)
+  assert.match(source, /generateSessionTitle\(sessionId, payload\.message\)/)
   assert.match(source, /if \(!result\.completed && !result\.duplicateAccepted\) \{[\s\S]*?result\.aborted[\s\S]*?queued turn was stopped by the user[\s\S]*?queued turn did not finish/)
   assert.match(source, /await completeQueuedTurn\(sessionId, item\.id\)/)
   assert.match(source, /await failQueuedTurn\(sessionId, item\.id/)

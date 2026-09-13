@@ -232,6 +232,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// provider/model/style" (pointer fields). The handler
 		// dispatches based on the body.
 		api.PATCH("/sessions/:id", h.UpdateSessionMeta)
+		api.POST("/sessions/:id/title", h.GenerateSessionTitle)
 		api.DELETE("/sessions/:id", h.DeleteSession)
 
 		// Messages

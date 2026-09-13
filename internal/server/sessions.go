@@ -20,6 +20,7 @@ package server
 // Split from handler.go in T04. Behaviour unchanged.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -691,6 +692,235 @@ func (h *Handler) RenameSession(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"renamed": id, "title": req.Title})
+}
+
+const (
+	sessionTitleGenerateTimeout = 12 * time.Second
+	sessionTitleSourceLimit     = 12
+	sessionTitleSourceLineLimit = 8
+	sessionTitleMaxRunes        = 24
+	sessionTitleFallbackRunes   = 40
+)
+
+// GenerateSessionTitle derives and stores a short semantic title for a
+// conversation. It intentionally only overwrites empty/placeholder titles unless
+// Force is set, so user-renamed sessions stay stable.
+func (h *Handler) GenerateSessionTitle(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	cv, err := h.store.GetConversation(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	var req GenerateSessionTitleRequest
+	if err := c.ShouldBindJSON(&req); err != nil && err != io.EOF {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !req.Force && !isAutoTitlePlaceholder(cv.Title) {
+		c.JSON(http.StatusOK, h.sessionToResponse(cv))
+		return
+	}
+
+	source := h.sessionTitleSource(id, req.FallbackMessage)
+	fallback := fallbackSessionTitle(source, req.FallbackMessage)
+	if strings.TrimSpace(source) == "" && fallback == "" {
+		c.JSON(http.StatusOK, h.sessionToResponse(cv))
+		return
+	}
+
+	title := fallback
+	if generated, err := h.generateSemanticSessionTitle(c.Request.Context(), id, source); err == nil && generated != "" {
+		title = generated
+	}
+	if title != "" {
+		latest, err := h.store.GetConversation(id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if req.Force || isAutoTitlePlaceholder(latest.Title) {
+			if err := h.store.RenameConversation(id, title); err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+				return
+			}
+			latest.Title = title
+		}
+		cv = latest
+	}
+	c.JSON(http.StatusOK, h.sessionToResponse(cv))
+}
+
+func (h *Handler) generateSemanticSessionTitle(ctx context.Context, sessionID, source string) (string, error) {
+	if h == nil || h.agent == nil || h.agent.LLM() == nil || strings.TrimSpace(source) == "" {
+		return "", fmt.Errorf("title generation unavailable")
+	}
+	meta := h.ensureMetaLoaded(sessionID)
+	provider := strings.TrimSpace(meta.Provider)
+	if provider == "" {
+		provider = h.getCfg().LLM.Default
+	}
+	if provider == "" {
+		return "", fmt.Errorf("provider is not configured")
+	}
+	model := h.sessionModel(sessionID, provider)
+	ctx, cancel := context.WithTimeout(ctx, sessionTitleGenerateTimeout)
+	defer cancel()
+
+	resp, err := h.agent.LLM().ChatCM(ctx, provider, model, []llm.ChatMessage{
+		{
+			Role:        llm.RoleSystem,
+			Type:        llm.TypeText,
+			Content:     sessionTitleSystemPrompt,
+			SubmitToLLM: 1,
+		},
+		{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     "根据以下对话内容生成标题：\n---\n" + source + "\n---\n只输出标题。",
+			SubmitToLLM: 1,
+		},
+	}, llm.ChatOptions{MaxTokens: 64, ReasoningEffort: "off"})
+	if err != nil {
+		return "", err
+	}
+	title := cleanGeneratedSessionTitle(resp)
+	if title == "" {
+		return "", fmt.Errorf("empty generated title")
+	}
+	return title, nil
+}
+
+const sessionTitleSystemPrompt = `你是 P-Chat 的会话标题生成器。请根据对话内容生成一个短标题。
+要求：
+- 概括用户真正要做的事，保留项目名、错误名、文件名或关键对象。
+- 中文标题建议 6 到 18 个字；英文标题建议 2 到 6 个词；最多 24 个字符。
+- 不要输出解释、编号、Markdown、引号、句号，也不要带“标题：”前缀。
+- 如果内容只是寒暄或无法判断主题，输出“日常对话”。`
+
+func (h *Handler) sessionTitleSource(sessionID, fallbackMessage string) string {
+	if h == nil || h.store == nil {
+		return strings.TrimSpace(fallbackMessage)
+	}
+	msgs, _, _ := h.store.GetChatMessagesWithMetaFor(sessionID, sessionTitleSourceLimit)
+	lines := make([]string, 0, sessionTitleSourceLineLimit)
+	for _, msg := range msgs {
+		if len(lines) >= sessionTitleSourceLineLimit {
+			break
+		}
+		if msg.SubmitToLLM == 0 || msg.Role == llm.RoleSystem || msg.Role == llm.RoleTool {
+			continue
+		}
+		if msg.Type != "" && msg.Type != llm.TypeText {
+			continue
+		}
+		text := normalizeTitleText(msg.Content)
+		if text == "" || strings.HasPrefix(text, "upl://") {
+			continue
+		}
+		role := "用户"
+		if msg.Role == llm.RoleAssistant {
+			role = "助手"
+		} else if msg.Role != llm.RoleUser {
+			continue
+		}
+		lines = append(lines, role+": "+truncateRunes(text, 500))
+	}
+	if len(lines) == 0 {
+		if text := normalizeTitleText(fallbackMessage); text != "" {
+			lines = append(lines, "用户: "+truncateRunes(text, 500))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func isAutoTitlePlaceholder(title string) bool {
+	switch strings.TrimSpace(title) {
+	case "", "(新会话)", "新会话", "(无标题)", "无标题":
+		return true
+	default:
+		return false
+	}
+}
+
+func fallbackSessionTitle(source, fallbackMessage string) string {
+	text := normalizeTitleText(fallbackMessage)
+	if text == "" {
+		for _, line := range strings.Split(source, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if rest, ok := strings.CutPrefix(line, "用户: "); ok {
+				text = rest
+				break
+			}
+			if rest, ok := strings.CutPrefix(line, "用户："); ok {
+				text = rest
+				break
+			}
+		}
+	}
+	if text == "" {
+		return ""
+	}
+	if isGreetingOnly(text) {
+		return "日常对话"
+	}
+	return truncateRunes(cleanGeneratedSessionTitle(text), sessionTitleFallbackRunes)
+}
+
+func cleanGeneratedSessionTitle(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			s = line
+			break
+		}
+	}
+	s = normalizeTitleText(s)
+	s = strings.Trim(s, " \t\r\n\"'“”‘’`*_#[]()（）【】")
+	s = strings.TrimLeft(s, "-*#0123456789.、)） \t")
+	for _, prefix := range []string{"会话标题：", "会话标题:", "标题：", "标题:"} {
+		s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
+	}
+	s = strings.Trim(s, " \t\r\n\"'“”‘’`*_#[]()（）【】")
+	s = strings.TrimRight(s, "。.!！?？；;，,、")
+	s = normalizeTitleText(s)
+	return truncateRunes(s, sessionTitleMaxRunes)
+}
+
+func normalizeTitleText(s string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+}
+
+func isGreetingOnly(s string) bool {
+	switch strings.ToLower(strings.Trim(s, " \t\r\n。.!！?？")) {
+	case "hi", "hello", "hey", "你好", "您好", "在吗", "在么", "哈喽", "嗨":
+		return true
+	default:
+		return false
+	}
+}
+
+func truncateRunes(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= limit {
+		return s
+	}
+	return string(rs[:limit])
 }
 
 // UpdateSessionMeta is the "change provider / model / style without

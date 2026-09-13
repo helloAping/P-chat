@@ -7,6 +7,7 @@ import {
   completeQueuedTurn,
   endStream,
   failQueuedTurn,
+  generateSessionTitle,
   hasBlockingTurnQueueFailure,
   hasQueuedTurns,
   isActiveStream,
@@ -221,21 +222,21 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
           clientMsgID: payload.client_msg_id,
           provider: payload.provider,
           model: payload.model,
-	          style: payload.style,
-	          workMode: payload.work_mode,
-	          useImageRecognition: payload.use_image_recognition,
-	          subAgentModelEnabled: !!payload.sub_agent_model_enabled,
-	          subAgentProvider: payload.sub_agent_provider || '',
-	          subAgentModel: payload.sub_agent_model || '',
-	          turnModePolicy: payload.turn_mode_policy,
-	          todoMode: payload.todo_mode || 'auto',
+          style: payload.style,
+          workMode: payload.work_mode,
+          useImageRecognition: payload.use_image_recognition,
+          subAgentModelEnabled: !!payload.sub_agent_model_enabled,
+          subAgentProvider: payload.sub_agent_provider || '',
+          subAgentModel: payload.sub_agent_model || '',
+          turnModePolicy: payload.turn_mode_policy,
+          todoMode: payload.todo_mode || 'auto',
           attachments: payload.attachments,
           skillContext: payload.skill_context || undefined,
           activeSkills: payload.active_skills || undefined,
         })
         // When duplicate_client_message is accepted, drain must complete the
-  // queue item instead of failing (avoids fail→retry→409 loops).
-  if (!result.completed && !result.duplicateAccepted) {
+        // queue item instead of failing (avoids fail->retry->409 loops).
+        if (!result.completed && !result.duplicateAccepted) {
           await failQueuedTurn(
             sessionId,
             item.id,
@@ -244,6 +245,9 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
           break
         }
         await completeQueuedTurn(sessionId, item.id)
+        if (!result.aborted) {
+          void generateSessionTitle(sessionId, payload.message).catch(() => {})
+        }
       } catch (e: any) {
         await failQueuedTurn(sessionId, item.id, e?.message || String(e))
         break

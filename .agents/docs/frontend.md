@@ -124,6 +124,12 @@ if (ev.sub_agent && ev.sub_agent_task) {
 - `pendingQuestion[id]` — 待回答问题（QuestionModal）
 - `pendingConfirm[id]` — 沙箱确认
 
+新建会话按钮先在当前项目的 `state.sessions` 中查找 `conversation_state=blank` 的草稿，
+命中时直接 `switchSession()` 跳转；本地未命中才调用 `POST /sessions`，服务端仍用
+`reuse_empty=true` 做多窗口兜底。普通发送和队列 turn 完成后，前端调用
+`POST /sessions/:id/title` 生成语义标题并同步 `sessions[]` 与 `sessionMeta[id].title`；
+旧的首条消息 `slice(0, 40)` 命名逻辑不得恢复。
+
 ### 7. Phantom Error 过滤
 
 客户端防幻影错误（"Cannot read ... Inform the user"）：

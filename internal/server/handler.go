@@ -583,6 +583,14 @@ type RenameSessionRequest struct {
 	Title string `json:"title" binding:"required"`
 }
 
+// GenerateSessionTitleRequest asks the server to derive a short
+// semantic title for a conversation. FallbackMessage is only used
+// when the just-sent user message has not been flushed to storage yet.
+type GenerateSessionTitleRequest struct {
+	Force           bool   `json:"force,omitempty"`
+	FallbackMessage string `json:"fallback_message,omitempty"`
+}
+
 // UpdateSessionMetaRequest is the body of PATCH /sessions/:id when
 // the caller wants to change provider / model / style. All fields
 // are pointers so the client can send partial updates — a missing

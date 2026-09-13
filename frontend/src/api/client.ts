@@ -484,6 +484,17 @@ export const renameSession = (id: string, title: string) =>
     body: JSON.stringify({ title }),
   })
 
+export interface GenerateSessionTitleOptions {
+  force?: boolean
+  fallback_message?: string
+}
+
+export const generateSessionTitle = (id: string, options: GenerateSessionTitleOptions = {}) =>
+  jsonFetch<Session>(`/api/v1/sessions/${encodeURIComponent(id)}/title`, {
+    method: 'POST',
+    body: JSON.stringify(options),
+  })
+
 export const updateSessionMeta = (
   id: string,
   fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; turn_mode_policy: TurnModePolicy; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,

@@ -635,6 +635,15 @@ function isBlankSessionRecord(session: Session): boolean {
     && (session.pending_turn_count || 0) === 0
 }
 
+function isAutoTitlePlaceholder(title: string): boolean {
+  const value = title.trim()
+  return value === ''
+    || value === '(新会话)'
+    || value === '新会话'
+    || value === '(无标题)'
+    || value === '无标题'
+}
+
 function collapseBlankSessions(sessions: Session[]): Session[] {
   const seenBlankProjects = new Set<string>()
   const out: Session[] = []
@@ -664,6 +673,45 @@ function forEachSessionRecord(id: string, visit: (session: Session) => void) {
         visit(session)
       }
     }
+  }
+}
+
+function syncSessionResponse(session: Session) {
+  if (!session?.id) return
+  let seen = false
+  forEachSessionRecord(session.id, (s) => {
+    Object.assign(s, session)
+    seen = true
+  })
+  if (!seen) {
+    state.sessions = collapseBlankSessions([
+      session,
+      ...state.sessions.filter(s => s.id !== session.id),
+    ])
+    state.projectSessions[state.activeProjectPath] = state.sessions
+  }
+  const existingMeta = state.sessionMeta[session.id]
+  state.sessionMeta[session.id] = {
+    ...(existingMeta || {}),
+    title: session.title || '',
+    style: session.style ?? existingMeta?.style ?? 'off',
+    workMode: session.work_mode ?? existingMeta?.workMode ?? state.globalWorkMode ?? 'coding',
+    provider: session.provider ?? existingMeta?.provider ?? '',
+    model: session.model ?? existingMeta?.model ?? '',
+    plan_mode: session.plan_mode ?? existingMeta?.plan_mode ?? false,
+    turn_mode_policy: session.turn_mode_policy ?? existingMeta?.turn_mode_policy ?? (session.plan_mode ? 'plan' : 'build'),
+    permission_level: session.permission_level ?? existingMeta?.permission_level ?? 'ask',
+    reasoning_effort: session.reasoning_effort ?? existingMeta?.reasoning_effort ?? 'off',
+    vector_store: session.vector_store ?? existingMeta?.vector_store ?? '',
+    knowledge_base: session.knowledge_base ?? existingMeta?.knowledge_base ?? '',
+    auto_continue: session.auto_continue ?? existingMeta?.auto_continue ?? true,
+    todo_long_run_mode: session.todo_long_run_mode ?? existingMeta?.todo_long_run_mode ?? 'adaptive',
+    use_image_recognition: session.use_image_recognition ?? existingMeta?.use_image_recognition ?? false,
+    enabled_recognition_capabilities: session.enabled_recognition_capabilities ?? existingMeta?.enabled_recognition_capabilities ?? [],
+    enabled_generation_operations: session.enabled_generation_operations ?? existingMeta?.enabled_generation_operations ?? [],
+    sub_agent_model_enabled: session.sub_agent_model_enabled ?? existingMeta?.sub_agent_model_enabled ?? false,
+    sub_agent_provider: session.sub_agent_provider ?? existingMeta?.sub_agent_provider ?? '',
+    sub_agent_model: session.sub_agent_model ?? existingMeta?.sub_agent_model ?? '',
   }
 }
 
@@ -1158,6 +1206,12 @@ function buildCreateSessionOptions(): api.CreateSessionOptions {
 }
 
 export async function createSession(): Promise<string> {
+  const reusableBlank = state.sessions.find(isBlankSessionRecord)
+  if (reusableBlank) {
+    await switchSession(reusableBlank.id)
+    return reusableBlank.id
+  }
+
   const created = await api.createSession(buildCreateSessionOptions())
   const id = created.id
   // Fetch the freshly created session's resolved meta from
@@ -1197,6 +1251,18 @@ export async function createSession(): Promise<string> {
   state.projectSessions[state.activeProjectPath] = state.sessions
   await switchSession(id)
   return id
+}
+
+export async function generateSessionTitle(id: string, fallbackMessage = ''): Promise<void> {
+  if (!id) return
+  const currentTitle = state.sessionMeta[id]?.title
+    || state.sessions.find(s => s.id === id)?.title
+    || ''
+  if (!isAutoTitlePlaceholder(currentTitle)) return
+  const session = await api.generateSessionTitle(id, {
+    fallback_message: fallbackMessage,
+  })
+  syncSessionResponse(session)
 }
 
 export async function deleteSessionById(id: string) {
