@@ -24,7 +24,7 @@ import StyleGenModal from './StyleGenModal.vue'
 import {
   Copy, Globe, Folder, FolderOpen, Terminal, Wrench, Sparkles, Hash, X,
   GitBranch, CheckCircle2, AlertCircle, BarChart3, ImageIcon, Film, Volume2,
-  FileText, File, ChevronDown, ChevronRight, Download, Maximize2, Clipboard,
+  FileText, File, ChevronDown, ChevronRight, Download, Clipboard,
 } from './icons'
 
 const props = defineProps<{
@@ -403,16 +403,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
               </button>
               <span class="session-attachment-actions">
                 <button
-                  v-if="canPreviewSessionAttachment(item)"
-                  type="button"
-                  class="session-attachment-action"
-                  title="预览附件"
-                  aria-label="预览附件"
-                  @click="openSessionAttachment(item)"
-                >
-                  <Maximize2 :size="12" />
-                </button>
-                <button
                   type="button"
                   class="session-attachment-action"
                   title="复制引用"
@@ -782,19 +772,29 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   margin-top: var(--space-2);
 }
 .session-attachment-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-1);
+  position: relative;
+  display: block;
   min-width: 0;
   min-height: calc(var(--control-height) + var(--space-3));
   padding: var(--space-1);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: var(--surface-1);
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+.session-attachment-row:hover,
+.session-attachment-row:focus-within {
+  border-color: var(--border-default);
+  background: color-mix(in srgb, var(--surface-1) 82%, var(--surface-3));
+  box-shadow: var(--shadow-xs);
 }
 .session-attachment-main {
+  width: 100%;
   min-width: 0;
+  min-height: calc(var(--control-height) + var(--space-1));
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -833,7 +833,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 .session-attachment-copy {
   display: grid;
   min-width: 0;
-  gap: 2px;
+  gap: calc(var(--space-1) / 2);
 }
 .session-attachment-name,
 .session-attachment-meta {
@@ -854,17 +854,28 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   line-height: 1.25;
 }
 .session-attachment-actions {
+  position: absolute;
+  right: var(--space-1);
+  top: 50%;
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
+  padding: var(--space-1);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-1) 78%, transparent);
+  box-shadow: var(--shadow-sm);
   opacity: 0;
   pointer-events: none;
-  transition: opacity var(--dur-fast) var(--ease-out);
+  transform: translateY(-50%) translateX(var(--space-1));
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
 }
 .session-attachment-row:hover .session-attachment-actions,
 .session-attachment-row:focus-within .session-attachment-actions {
   opacity: 1;
   pointer-events: auto;
+  transform: translateY(-50%) translateX(0);
 }
 .session-attachment-action {
   display: inline-flex;
@@ -874,8 +885,8 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   height: calc(var(--space-6) + var(--space-1));
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-tertiary);
+  background: var(--surface-overlay);
+  color: var(--text-secondary);
   cursor: pointer;
   transition: var(--transition-colors);
 }
@@ -884,12 +895,19 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   background: var(--surface-3);
   color: var(--text-primary);
 }
+@media (hover: none) {
+  .session-attachment-actions {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(-50%) translateX(0);
+  }
+}
 .attachment-expand-btn {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
   margin-top: var(--space-2);
-  padding: 2px var(--space-1);
+  padding: calc(var(--space-1) / 2) var(--space-1);
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;

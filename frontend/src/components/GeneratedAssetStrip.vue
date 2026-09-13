@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { state } from '../stores/chat'
-import { copyText, downloadBlob, downloadFromUrl } from '../utils/clipboard'
+import { downloadBlob, downloadFromUrl } from '../utils/clipboard'
 import {
   attachmentArtifactFileName,
   attachmentArtifactSourceLabel,
@@ -12,13 +12,11 @@ import {
 import {
   ChevronDown,
   ChevronRight,
-  Clipboard,
   Download,
   File,
   FileText,
   Film,
   ImageIcon,
-  Maximize2,
   Play,
   Volume2,
 } from './icons'
@@ -62,16 +60,6 @@ function openAsset(asset: AttachmentArtifact) {
   }
 }
 
-async function copyAsset(asset: AttachmentArtifact) {
-  const text = asset.url || asset.text || ''
-  if (!text) {
-    toast.info('没有可复制的内容')
-    return
-  }
-  const ok = await copyText(text)
-  toast[ok ? 'success' : 'error'](ok ? '已复制引用' : '复制失败')
-}
-
 function downloadAsset(asset: AttachmentArtifact) {
   const name = attachmentArtifactFileName(asset)
   if (asset.url) {
@@ -85,6 +73,12 @@ function downloadAsset(asset: AttachmentArtifact) {
     return
   }
   toast.info('没有可下载的内容')
+}
+
+function assetSubtitle(asset: AttachmentArtifact): string {
+  const type = attachmentArtifactTypeLabel(asset)
+  if (asset.source === 'generation') return type
+  return `${attachmentArtifactSourceLabel(asset.source)} · ${type}`
 }
 </script>
 
@@ -145,6 +139,17 @@ function downloadAsset(asset: AttachmentArtifact) {
           </span>
         </div>
 
+        <button
+          v-if="asset.url || asset.text"
+          type="button"
+          class="generated-strip-download"
+          title="下载"
+          aria-label="下载"
+          @click="downloadAsset(asset)"
+        >
+          <Download :size="13" />
+        </button>
+
         <footer class="generated-strip-meta">
           <span class="generated-strip-identity">
             <span class="generated-strip-icon" aria-hidden="true">
@@ -155,42 +160,9 @@ function downloadAsset(asset: AttachmentArtifact) {
                 {{ attachmentArtifactFileName(asset) }}
               </span>
               <span class="generated-strip-subtitle">
-                {{ attachmentArtifactSourceLabel(asset.source) }}
-                <span class="generated-strip-dot">·</span>
-                {{ attachmentArtifactTypeLabel(asset) }}
+                {{ assetSubtitle(asset) }}
               </span>
             </span>
-          </span>
-          <span class="generated-strip-actions">
-            <button
-              v-if="canPreview(asset)"
-              type="button"
-              class="generated-strip-action"
-              title="预览"
-              aria-label="预览"
-              @click="openAsset(asset)"
-            >
-              <Maximize2 :size="12" />
-            </button>
-            <button
-              type="button"
-              class="generated-strip-action"
-              title="复制引用"
-              aria-label="复制引用"
-              @click="copyAsset(asset)"
-            >
-              <Clipboard :size="12" />
-            </button>
-            <button
-              v-if="asset.url || asset.text"
-              type="button"
-              class="generated-strip-action generated-strip-action--download"
-              title="下载"
-              aria-label="下载"
-              @click="downloadAsset(asset)"
-            >
-              <Download :size="12" />
-            </button>
           </span>
         </footer>
       </article>
@@ -220,7 +192,7 @@ function downloadAsset(asset: AttachmentArtifact) {
 .generated-strip-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: var(--space-2);
   min-width: 0;
 }
@@ -243,8 +215,8 @@ function downloadAsset(asset: AttachmentArtifact) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: calc(var(--space-6) - var(--space-1));
-  height: calc(var(--space-6) - var(--space-1));
+  min-width: calc(var(--space-5) - var(--space-1));
+  height: calc(var(--space-5) - var(--space-1));
   padding: 0 var(--space-1);
   border-radius: var(--radius-pill);
   background: var(--surface-2);
@@ -266,7 +238,8 @@ function downloadAsset(asset: AttachmentArtifact) {
 }
 
 .generated-strip-card {
-  flex: 0 0 min(calc(var(--space-8) * 4), 46vw);
+  position: relative;
+  flex: 0 0 min(calc(var(--space-8) * 5), 46vw);
   min-width: 0;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
@@ -330,8 +303,8 @@ function downloadAsset(asset: AttachmentArtifact) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: calc(var(--space-8) + var(--space-1));
-  height: calc(var(--space-8) + var(--space-1));
+  width: var(--space-8);
+  height: var(--space-8);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-pill);
   background: var(--surface-overlay);
@@ -385,7 +358,7 @@ function downloadAsset(asset: AttachmentArtifact) {
 .generated-strip-file-copy {
   display: grid;
   min-width: 0;
-  gap: 2px;
+  gap: calc(var(--space-1) / 2);
   color: var(--text-tertiary);
   font-size: 11.5px;
   line-height: 1.35;
@@ -403,13 +376,48 @@ function downloadAsset(asset: AttachmentArtifact) {
   font-weight: 600;
 }
 
-.generated-strip-meta {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+.generated-strip-download {
+  position: absolute;
+  right: var(--space-1);
+  top: var(--space-1);
+  display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
+  justify-content: center;
+  width: var(--control-height);
+  height: var(--control-height);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(calc(-1 * var(--space-1)));
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+.generated-strip-download:hover,
+.generated-strip-download:focus-visible {
+  border-color: var(--brand-100);
+  background: color-mix(in srgb, var(--brand-500) 16%, var(--surface-overlay));
+}
+
+.generated-strip-card:hover .generated-strip-download,
+.generated-strip-card:focus-within .generated-strip-download {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.generated-strip-meta {
+  display: flex;
+  align-items: center;
   min-width: 0;
-  padding: var(--space-2);
+  min-height: calc(var(--control-height) + var(--space-1));
+  padding: var(--space-1) var(--space-2);
   border-top: 1px solid var(--border-subtle);
   background: color-mix(in srgb, var(--surface-1) 92%, transparent);
 }
@@ -435,7 +443,7 @@ function downloadAsset(asset: AttachmentArtifact) {
 
 .generated-strip-copy {
   display: grid;
-  gap: 2px;
+  gap: calc(var(--space-1) / 2);
   min-width: 0;
 }
 
@@ -465,58 +473,12 @@ function downloadAsset(asset: AttachmentArtifact) {
   color: var(--text-quaternary);
 }
 
-.generated-strip-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--dur-fast) var(--ease-out);
-}
-
-.generated-strip-card:hover .generated-strip-actions,
-.generated-strip-card:focus-within .generated-strip-actions {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.generated-strip-action {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: calc(var(--space-6) + var(--space-1));
-  height: calc(var(--space-6) + var(--space-1));
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-tertiary);
-  cursor: pointer;
-  transition: var(--transition-colors);
-}
-
-.generated-strip-action:hover {
-  border-color: var(--border-default);
-  background: var(--surface-3);
-  color: var(--text-primary);
-}
-
-.generated-strip-action--download {
-  border-color: var(--brand-100);
-  background: var(--brand-50);
-  color: var(--brand-600);
-}
-
-.generated-strip-action--download:hover {
-  background: var(--brand-100);
-  color: var(--brand-600);
-}
-
 .generated-strip-expand {
   display: inline-flex;
   align-items: center;
   justify-self: start;
   gap: var(--space-1);
-  padding: 2px var(--space-1);
+  padding: calc(var(--space-1) / 2) var(--space-1);
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -533,8 +495,9 @@ function downloadAsset(asset: AttachmentArtifact) {
 }
 
 @media (hover: none) {
-  .generated-strip-actions {
+  .generated-strip-download {
     opacity: 1;
+    transform: translateY(0);
     pointer-events: auto;
   }
 }
