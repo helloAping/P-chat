@@ -158,7 +158,7 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
       <div>
         <div class="headers-editor-title">
           <span>自定义请求头</span>
-          <NPopover trigger="hover" placement="right-start" :delay="180">
+          <NPopover trigger="hover" placement="top-start" :delay="180">
             <template #trigger>
               <button
                 type="button"
@@ -175,16 +175,14 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
               <div v-for="group in placeholderGroups" :key="group.label" class="placeholder-popover-group">
                 <div class="placeholder-group-label">{{ group.label }}</div>
                 <div class="placeholder-popover-items">
-                  <div
-                    v-for="placeholder in group.items"
-                    :key="placeholder.value"
-                    class="placeholder-popover-item"
-                  >
+                  <div v-for="placeholder in group.items" :key="placeholder.value" class="placeholder-popover-item">
                     <code>{{ placeholder.value }}</code>
-                    <span class="placeholder-popover-item-label">{{ placeholder.label }}</span>
-                    <span class="placeholder-popover-item-desc">{{ placeholder.description }}</span>
-                    <span class="placeholder-popover-item-usage">
-                      稳定范围：{{ placeholder.scope }} · 适用场景：{{ placeholder.usage }}
+                    <span class="placeholder-popover-copy">
+                      <span class="placeholder-popover-item-label">{{ placeholder.label }}</span>
+                      <span class="placeholder-popover-item-desc">{{ placeholder.description }}</span>
+                      <span class="placeholder-popover-item-usage">
+                        稳定范围：{{ placeholder.scope }} · 适用场景：{{ placeholder.usage }}
+                      </span>
                     </span>
                   </div>
                 </div>
@@ -355,7 +353,11 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 .placeholder-popover {
   display: grid;
   gap: var(--space-2);
-  max-width: calc(var(--space-8) * 11);
+  width: min(calc(var(--space-8) * 10), calc(100vw - var(--space-8)));
+  max-height: min(calc(var(--space-8) * 8), calc(100vh - var(--space-8) - var(--space-8)));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: var(--space-1);
   color: var(--text-secondary);
   font-size: 11.5px;
   line-height: 1.5;
@@ -390,7 +392,7 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 
 .placeholder-popover-item {
   display: grid;
-  grid-template-columns: minmax(calc(var(--space-8) * 3), max-content) minmax(calc(var(--space-8) * 2), max-content) minmax(0, 1fr);
+  grid-template-columns: minmax(calc(var(--space-8) * 2.7), max-content) minmax(0, 1fr);
   gap: var(--space-2);
   align-items: start;
   padding: var(--space-1) var(--space-2);
@@ -406,10 +408,15 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
   white-space: nowrap;
 }
 
+.placeholder-popover-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
 .placeholder-popover-item-label {
   color: var(--text-primary);
   font-weight: 600;
-  white-space: nowrap;
 }
 
 .placeholder-popover-item-desc {
@@ -418,7 +425,6 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
 }
 
 .placeholder-popover-item-usage {
-  grid-column: 1 / -1;
   color: var(--text-tertiary);
 }
 
@@ -446,7 +452,7 @@ function rowNameInvalid(row: ProviderHeaderRow): boolean {
   }
 
   .placeholder-popover {
-    max-width: calc(var(--space-8) * 8);
+    width: min(calc(var(--space-8) * 8), calc(100vw - var(--space-6)));
   }
 
   .placeholder-popover-item {
