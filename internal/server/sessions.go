@@ -93,7 +93,14 @@ func (h *Handler) SearchMessages(c *gin.Context) {
 	if limit > 100 {
 		limit = 100
 	}
-	results := h.store.SearchMessages(q, limit)
+	projectPath := c.Query("project_path")
+	hasProjectParam := c.Request.URL.Query().Has("project_path")
+	var results []memory.SearchResult
+	if hasProjectParam {
+		results = h.store.SearchMessagesByProject(q, limit, projectPath)
+	} else {
+		results = h.store.SearchMessages(q, limit)
+	}
 	if results == nil {
 		results = []memory.SearchResult{}
 	}

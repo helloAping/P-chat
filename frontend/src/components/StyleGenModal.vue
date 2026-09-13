@@ -2,7 +2,7 @@
 /**
  * StyleGenModal — 从当前对话生成 / 优化 AI 风格。
  *
- * Opens from the TopBar's「生成风格」button. Two modes:
+ * Opens from the InspectorPanel's「生成风格」button. Two modes:
  *   - create   — a name (label) + optional requirements → a brand-new style
  *   - optimize — pick an existing style + "想改哪里" → refine it
  *                (built-in styles are read-only, so optimizing them saves

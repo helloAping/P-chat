@@ -2177,7 +2177,7 @@ watch([() => state.currentID, queueSignature], () => {
                   <div class="session-config-help-popover">
                     <div class="session-config-help-title">风格</div>
                     <p>决定助手在当前会话里的说话方式，比如更活泼、更简洁，或按某个角色来回复。</p>
-                    <p>右上角的“生成风格”按钮可以根据当前对话自动整理一个新风格，也可以优化已有风格，并把相关备注一起保存。</p>
+                    <p>右侧检查器的“会话操作”里可以根据当前对话自动整理一个新风格，也可以优化已有风格，并把相关备注一起保存。</p>
                     <p>这里选中的风格只影响当前会话。想查看、编辑或手动新增风格，可以到“应用设置 > 风格”。</p>
                   </div>
                 </NPopover>
@@ -2663,15 +2663,15 @@ watch([() => state.currentID, queueSignature], () => {
               background var(--dur-fast) var(--ease-out);
 }
 .attach-chip:hover {
-  border-color: var(--accent);
+  border-color: var(--brand-500);
   background: var(--surface-3);
 }
 .attach-chip.uploading { opacity: 0.7; }
-.attach-chip.error { border-color: var(--error); }
+.attach-chip.error { border-color: var(--error-500); }
 .thumb {
-  width: 40px; height: 40px;
+  width: var(--space-8); height: var(--space-8);
   background: var(--surface-3);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   display: flex; align-items: center; justify-content: center;
   overflow: hidden;
   font-size: 18px;
@@ -2681,11 +2681,11 @@ watch([() => state.currentID, queueSignature], () => {
 .thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; }
 .name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rm {
-  background: none; border: none; color: var(--text-3);
+  background: none; border: none; color: var(--text-tertiary);
   cursor: pointer; padding: 0 4px; font-size: 16px; line-height: 1;
   flex-shrink: 0;
 }
-.rm:hover { color: var(--error); }
+.rm:hover { color: var(--error-500); }
 
 @keyframes chip-appear {
   from { opacity: 0; transform: translateY(-4px) scale(0.95); }
@@ -2893,26 +2893,32 @@ watch([() => state.currentID, queueSignature], () => {
  * padding + textarea's top margin provides the spacing, and
  * the box's outer border wraps both). */
 .input-wrap {
-  background: var(--bg-input);
-  border: 1px solid var(--border-2);
+  background: var(--surface-input, var(--surface-1));
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  padding: 0 12px 0 12px;
+  padding: 0 var(--space-3) 0 var(--space-3);
   transition: border-color var(--dur-fast) var(--ease-out),
               box-shadow var(--dur-fast) var(--ease-out),
               background var(--dur-fast) var(--ease-out);
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 .input-wrap.has-attachments { padding-top: 0; }
 .input-wrap:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--brand-50);
+  border-color: var(--border-default);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-500) 12%, transparent);
+  background: var(--surface-input, var(--surface-1));
 }
-.input-wrap.dragover { border-color: var(--accent-2); background: var(--bg-3); }
+.input-wrap.dragover {
+  border-color: var(--brand-500);
+  background: color-mix(in srgb, var(--brand-500) 6%, var(--surface-1));
+}
 .input-row {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 .attach-icon-btn {
   width: 32px; height: 32px;
@@ -2934,6 +2940,8 @@ watch([() => state.currentID, queueSignature], () => {
   outline: none;
   resize: none;
   flex: 1;
+  min-width: 0;
+  overflow-x: hidden;
   /* Height is managed by resizeTextarea(). */
   font-family: inherit;
   line-height: 1.5;
@@ -2966,12 +2974,14 @@ watch([() => state.currentID, queueSignature], () => {
   align-items: center;
   gap: 10px;
   margin-left: auto;
-  white-space: nowrap;
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
 }
 .hints kbd {
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   padding: 1px 4px;
   font-family: var(--font-mono);
   font-size: 9.5px;
@@ -2992,6 +3002,8 @@ watch([() => state.currentID, queueSignature], () => {
   background: var(--surface-1);
   padding: var(--space-2) var(--space-3);
   flex-shrink: 0;
+  min-width: 0;
+  overflow-x: hidden;
 }
 .input-area--has-queue {
   padding-top: 0;
@@ -3001,14 +3013,15 @@ watch([() => state.currentID, queueSignature], () => {
   flex-direction: column;
   gap: var(--space-2);
   margin-top: var(--space-2);
+  min-width: 0;
 }
 .input-primary {
   display: flex;
   align-items: center;
   gap: var(--space-1);
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  scrollbar-width: thin;
+  flex-wrap: wrap;
+  min-width: 0;
+  overflow: hidden;
 }
 
 /* --- Bottom-row buttons (session config / plan / perm / mute) ------ */
@@ -3081,8 +3094,9 @@ watch([() => state.currentID, queueSignature], () => {
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
-  flex-shrink: 0;
-  max-width: 220px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 180px;
   transition: background var(--dur-fast) var(--ease-out),
               border-color var(--dur-fast) var(--ease-out);
 }
@@ -3097,7 +3111,8 @@ watch([() => state.currentID, queueSignature], () => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 160px;
+  min-width: 0;
+  flex: 1;
   font-family: var(--font-mono);
 }
 .model-badge--unset .model-badge-name { color: var(--text-tertiary); font-style: italic; }
@@ -3106,7 +3121,9 @@ watch([() => state.currentID, queueSignature], () => {
 .session-config-trigger {
   background: var(--surface-1);
   border-color: var(--border-subtle);
-  max-width: 260px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 200px;
 }
 .session-config-trigger:hover:not(:disabled) {
   background: var(--surface-2);

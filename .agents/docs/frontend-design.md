@@ -2,7 +2,9 @@
 
 > **位置**：`frontend/src/style.css`（design tokens）+ 各 `.vue` 组件的 `<style scoped>`（组件规则）
 > **目的**：固定 P-Chat 的视觉语言和编码约束，避免每个组件自由发挥造成"视觉碎片化"
+> **产品主风格（已锁定）**：**Project-Aware Calm Workbench** — 后续所有主界面 / 聊天区 / 侧栏 / Inspector / Composer 改动必须遵守本文 §0.5 + §3.8–3.10
 > **适用**：所有 Vue 3 + Naive UI 组件的样式修改
+> **关联计划**：[`docs/plans/project-aware-ui-redesign-plan.md`](../../docs/plans/project-aware-ui-redesign-plan.md)
 
 ## 0. 单一原则
 
@@ -22,6 +24,97 @@
 ```
 
 写裸值的代价：主题切换不生效、暗色对比度失控、和其它组件视觉冲突。AGENTS.md §2.3 已经写了"禁止硬编码颜色"——这个文档是它的扩展。
+
+---
+
+## 0.5 Product Visual Direction — Project-Aware Calm Workbench（已锁定）
+
+> **这是 P-Chat 主界面的唯一产品视觉方向。** 新功能、重构、视觉打磨都必须对齐本节；不要另起一套“后台风 / 营销风 / 四列拥挤风”。
+
+### 0.5.1 气质一句话
+
+安静、克制、精致的**桌面 AI 编程工作台**，接近 Raycast / 原生生产力工具 / 轻量 IDE；**不是**管理后台、仪表盘或营销落地页。
+
+### 0.5.2 信息架构（不可破坏）
+
+1. **项目是一级上下文**；会话是当前项目下的二级对象。
+2. **全局会话**是特殊空间，必须始终可进入（AppRail「全局」+ ProjectSwitcher 内固定入口）。
+3. 新建项目、切换项目、项目内新建对话、搜索项目内会话 —— **默认界面可发现**；新建项目保留 AppRail 左下角快捷入口，并在 ProjectSwitcher popover 内提供行入口；禁止在 ProjectSwitcher 触发器旁重复放 `+` 挤压项目名。
+4. **禁止**长期可见的四重竖栏把项目列表占满一整列；项目列表只活在侧栏顶部的 **ProjectSwitcher popover**。
+
+### 0.5.3 主壳布局（token 宽度）
+
+| 区域 | Token | 约值 | 规则 |
+|---|---|---|---|
+| AppRail | `--rail-width` | 52px | 常驻；折叠侧栏时仍可见 |
+| 统一侧栏 | `--sidebar-width` | 默认约 1/5 工作区，可拖拽 220-420px | 项目切换器 + 当前项目会话列表；项目选项只在 **ProjectSwitcher popover** 中展示，不常驻占位 |
+| 中央聊天 | flex 自适应 | 默认约 3/5 工作区 | 主阅读区；侧栏收窄后自然变宽 |
+| Inspector | `--inspector-width` | 默认约 1/5 工作区 | 可折叠；轻量 section，禁止多层卡片套娃 |
+
+默认展开时，`SessionSidebar : ChatWindow : InspectorPanel` 约为 **1 : 3 : 1**。用户可通过侧栏右缘拖拽把手调整聊天记录宽度；双击把手恢复默认比例。`AppRail` 是主导航，并保留左下角新建项目/关于快捷入口；`TopBar` 只承载 breadcrumb、上下文占用和 Inspector 开关。文件夹/终端这类当前项目动作归入 `InspectorPanel` 的项目区域；trace、工具列表、生成风格等当前会话动作归入 Inspector 的会话区域，避免顶部与侧栏重复入口。
+
+```
+TitleBar
+└─ app-body
+   ├─ AppRail                          ← 常驻
+   ├─ SessionSidebar                   ← 可折叠（不含内嵌 project-rail）
+   └─ main-column
+      ├─ TopBar                        ← breadcrumb / ctx / inspector toggle
+      └─ workspace-row
+         ├─ ChatWindow
+         └─ InspectorPanel             ← 可折叠
+```
+
+### 0.5.4 色彩纪律
+
+- **减少大面积高饱和蓝紫**。Brand 只用于：发送按钮、关键状态点、极轻 hover / selected wash。
+- **默认 CTA**（如「新建对话」）用 **outline / surface** 次要按钮：`var(--surface-2)` + `var(--border-default)`；hover 才允许浅 brand wash。**禁止**整栏实心 `--brand-500` 大按钮抢戏。
+- **列表 / Tab / Rail 激活态**：浅底 wash（`color-mix` brand 进 surface），**禁止**左侧或底部的 brand 竖条 / 弧线。
+- User 气泡：只用 `--user-bubble-bg` / `--user-bubble-border`（低饱和 tint），禁止实心 brand 填充。
+- Assistant 正文：**默认无厚重卡片底**；身份靠头像 / 名称，不靠整块紫色底板。
+
+### 0.5.5 消息流与 parts（强制）
+
+| Part | 视觉归属 | 规则 |
+|---|---|---|
+| `text`（assistant） | 正文流 | 无厚卡片；markdown 走 `.md-body` |
+| `text`（user） | 右对齐柔和气泡 | `--user-bubble-bg` / `--user-bubble-border` |
+| `thinking` | **独立组件，不进入 `.event-timeline`** | `ThinkingBlock` 扁平行；`--thinking-bg` 中性；**禁止**独立暖色厚卡；**禁止**左侧竖轨 |
+| `tool` / `skill` / `sub_agent` | `.event-timeline` 浅底面板 | 与 thinking 同族但独立分组；无左侧竖轨；错误行才允许细红左边框 + 短摘要 |
+| 附件 / 媒体结果 | 中性小卡片 | 不与 user 文字气泡混在一起 |
+
+**分组铁律**（`MessageBubble.vue`）：
+
+- 连续的 `tool` / `skill` / `sub_agent` 共用一个浅底 `.event-timeline` 面板，行与行扁平并列。
+- `thinking` **永远**用 `ThinkingBlock` 独立渲染（不是 ToolCallCard），不进入 `.event-timeline` /「工具轨」。
+- **不要**在面板左侧画竖线 / 时间线轨。
+- **不改 SSE / parts 数据结构**；只改布局与样式。
+
+### 0.5.6 动效与密度
+
+- 流式：只允许小 spinner / caret / 状态点；只动画 `opacity` / `transform`。
+- **禁止** thinking / tool / sub-agent 运行态的大面积 shimmer、持续背景扫光。
+- 密度：信息完整但不堆叠；用弱分割线、popover、Inspector section 组织，而不是层层嵌套卡片。
+
+### 0.5.7 UI chrome
+
+- 图标一律 `frontend/src/components/icons/index.ts` barrel。
+- **UI chrome 不用 emoji**（按钮、label、rail、侧栏、Inspector）。
+- 不删除现有功能入口；能力可搬家，不可消失。
+
+### 0.5.8 反模式（看到就改）
+
+| ❌ 不要 | ✅ 要 |
+|---|---|
+| 管理后台四列挤满 | AppRail + 单侧栏 + 可折叠 Inspector |
+| 项目列表长期占一整列 | ProjectSwitcher popover |
+| 大面积高饱和蓝紫 CTA | outline / 细 accent |
+| thinking 与 tool 混成一条时间线或共享面板 | thinking 仍是独立组件；tool / skill / sub_agent 才进入 `.event-timeline` |
+| 选中会话 / Tab 左侧或底部 brand 竖条 | 浅底 wash，无弧线 / 竖条 |
+| tool error 大红铺满 | 细红边 + 短摘要 |
+| assistant 正文厚卡片 | 透明/无底，正文直接落在画布 |
+| Inspector 多层 card 套娃 | 弱 section divider |
+| NScrollbar 包消息区 | native `overflow-y: auto` + flex 铁律 |
 
 ---
 
@@ -185,6 +278,22 @@ transition: var(--transition-colors),
 
 **新组件必须直接读新 token（`--surface-1` 而不是 `--bg-2`）**。legacy alias 只为旧组件存在，不接受新代码用它们。
 
+### 1.12 Workbench shell + message tokens（Calm Workbench）
+
+主壳与消息流专用 token（**dark / light 必须成对定义**；真源在 `frontend/src/style.css`）：
+
+| Token | 用途 |
+|---|---|
+| `--rail-width` | AppRail 宽度（52px） |
+| `--sidebar-default-width` | 统一侧栏默认宽度；按 `(100vw - --rail-width) / 5` 得到 1:3:1 基准 |
+| `--sidebar-width` | 统一侧栏最终宽度；默认读 `--sidebar-default-width`，用户拖拽后读 `--sidebar-user-width` |
+| `--inspector-default-width` | Inspector 默认宽度；与侧栏同属 1/5 工作区 |
+| `--inspector-width` | Inspector 最终宽度；小屏先归零折叠 |
+| `--project-switcher-width` | 项目切换下拉面板宽度（~320px；项目选项只在这里展开） |
+| `--event-rail-color` | 已废弃于主界面过程面板（不再画左侧竖轨）；保留 token 以免旧引用断裂 |
+| `--user-bubble-bg` / `--user-bubble-border` | 用户柔和气泡 |
+| `--thinking-bg` / `--thinking-border` / `--thinking-icon` | 独立思考块（中性 surface，与时间线同族，不进工具轨） |
+
 ---
 
 ## 2. 主题切换
@@ -304,6 +413,9 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 - 左侧只做列表；「+ 新增」打开弹窗（不要塞进左侧窄栏或右侧详情）
 - 模型添加/编辑用 `NModal`；列表里点编辑打开弹窗
 - 新增弹窗的默认模型支持「加载模型」→ `POST /api/v1/providers/probe-models`
+- 「协议」字段表示 LLM 请求/响应端点协议，不是网络传输协议；UI 文案用「请求协议」或「LLM 协议」，选项显示 `OpenAI Chat` / `Anthropic Messages`，对应配置值仍按后端约束使用 `openai` / `anthropic`
+- `Base URL` 是唯一展示 `http://` / `https://` 的位置；如需显示端点，可用只读提示 `/chat/completions` 或 `/messages`
+- 模型添加/编辑弹窗不再展示「功能标签」字段；模型列表优先展示模型 ID、显示名、上下文、输出上限和启用状态
 
 **禁止**：
 - 用 `style="margin: 0;"` 内联覆盖（用专门的 modifier class）
@@ -382,24 +494,85 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 
 ### 3.7 Message Bubble parts 渲染
 
-**结构**（`MessageBubble.vue`）：
+**结构原则**（`MessageBubble.vue`）：按 segment 渲染，**thinking 与 tool 时间线分离**。
+
 ```vue
-<div v-for="(part, i) in message.parts" :key="i">
-  <ThinkingBlock v-if="part.kind === 'thinking'" :text="part.text" :streaming="part.streaming" />
-  <TypedText v-else-if="part.kind === 'text' && streaming" :text="part.text" />
-  <div v-else-if="part.kind === 'text'" v-html="renderMd(part.text)" />
-  <ToolCallCard v-else-if="part.kind === 'tool'" :... />
-  <SubAgentCard v-else-if="part.kind === 'sub_agent'" :... />
-</div>
+<template v-for="segment in visibleTimelineSegments" :key="segment.key">
+  <!-- 仅 tool / skill / sub_agent -->
+  <div v-if="segment.kind === 'events'" class="event-timeline">
+    <ToolCallCard ... />
+    <SkillCallCard ... />
+    <SubAgentCard ... />
+  </div>
+  <template v-else>
+    <!-- thinking 独立，绝不进 event-timeline -->
+    <ThinkingBlock v-if="entry.part.kind === 'thinking'" ... />
+    <div v-else-if="entry.part.kind === 'text'" class="md-body" ... />
+  </template>
+</template>
 ```
 
-**色系**：
-- assistant 消息用 `--ai-500` 头像底色 + `--ai-50` 头像 hover
-- user 消息用 `--brand-500` 头像底色
-- thinking 块 collapsible header 用 `--surface-2`，expanded 用 `--surface-1`
-- tool call status 颜色：`start` 灰、`ok` 绿、`error` 红、`warn` 橙
+**色系 / 表面**：
+- assistant 头像：`--ai-500` / `--ai-50`；正文默认透明无厚卡片
+- user 气泡：`--user-bubble-bg` / `--user-bubble-border`（禁止实心 brand）
+- thinking：`--thinking-bg` / `--thinking-border` / `--thinking-icon`（中性独立行，与 tool 同族）
+- 过程面板：浅底 `.event-timeline`，**无左侧竖轨**；status：`start` 蓝 spinner、`ok` 绿勾、`error` 细红边、`warn` 橙；行内扁平无卡套卡
 
-**Markdown 渲染**：用 `.md-body` class（已在 style.css 集中定义），包括 p/code/pre/a/ul/ol/blockquote/table/hr/h1-h4/img/strong/em。**不要在组件里重新定义**这些 markdown 元素的样式。
+**Markdown**：用 `.md-body`（`style.css` 集中定义）。**不要在组件里重定义** p/code/pre/a/ul/ol/blockquote/table/hr/h1-h4/img/strong/em。
+
+### 3.8 App shell 组件约定
+
+| 组件 | 职责 | 样式要点 |
+|---|---|---|
+| `AppRail.vue` | 常驻 52px 导航 | active = `surface-2` 浅底，**无**左边线；禁用态降透明度 |
+| `ProjectSwitcher.vue` | 侧栏顶项目 popover | 触发器优先完整显示当前项目名；搜索 / 新建项目 / 全局 / 项目列表只在 popover 内展开；触发器旁不放独立 `+`；当前项 Check + 浅 wash |
+| `SessionSidebar.vue` | 统一侧栏 | 宽 `--sidebar-width`；「新建对话」outline CTA；会话 active = 浅 brand wash，**无**左边线 |
+| `TopBar.vue` | 面包屑 + ctx + inspector toggle | 克制高度；不堆叠打开目录/终端/工具列表/生成风格 |
+| `InspectorPanel.vue` | 右栏会话/项目摘要 + 归类操作 | 会话操作放 trace/工具列表/生成风格；项目区域放打开目录/终端；section 用弱分割线 |
+| `ChatWindow.vue` | 消息列 + dock | 遵守 §3.5 flex 铁律 |
+
+### 3.9 Thinking vs Tool 视觉分工
+
+| | ThinkingBlock | Tool / Skill / SubAgent |
+|---|---|---|
+| 容器 | 独立中性扁平块，不进入 `.event-timeline` | 浅底 `.event-timeline` 面板内的扁平行 |
+| 左边轨 | **无** | **无**（仅 error 行可用细红左边框） |
+| 错误态 | N/A | 细红左边框 + 一行摘要 |
+| 运行动效 | 仅小 spinner | 仅小 spinner / 状态点 |
+| 数据 | `part.kind === 'thinking'`（独立组件） | `tool` / `skill` / `sub_agent` |
+
+### 3.9a SubAgent 视觉与展开态
+
+`SubAgentCard` 必须把后端子代理类型显式展示出来，不只显示任务标题。
+
+- 执行时间线里的子代理行至少显示：`sub_agent_type` 与 `sub_agent_run_mode` 合并后的紧凑 meta（例如 `frontend_agent · 后台`）、任务标题、状态、耗时；避免再拆成首字母图标、`类型` badge、`后台子代理` badge 三段重复信息；有 `sub_agent_model` / `sub_agent_task_id` 时作为弱信息展示
+- 后台子代理列表（`SubAgentJobsPanel`）同样显示 `subagent_type` 文本，但不重复加「类型」标签，并区分 queued / running / done / error
+- 展开后的子代理不是普通详情面板，应表现为「嵌套对话列表」：包含子代理自己的消息流、独立 `ThinkingBlock`、工具/技能执行时间线、结果摘要和错误行
+- 嵌套对话列表内部仍遵守本节分工：thinking 独立；tool / skill / sub_agent 进入内部 `.event-timeline`；不要用卡片套卡片
+
+### 3.10 CTA / 激活态配方（Calm）
+
+```css
+/* 默认次要 CTA —— 侧栏「新建对话」等 */
+.calm-cta {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+}
+.calm-cta:hover {
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
+  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
+  color: var(--brand-600);
+}
+
+/* 列表 / Rail / Tab 激活 —— 浅 wash，不要竖条或底边条 */
+.calm-active {
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-1));
+  color: var(--text-primary);
+}
+```
+
+**唯一允许的大面积 brand 实心**：发送按钮等真正的 primary action（聊天主操作），不是侧栏列表 CTA。
 
 ---
 
@@ -654,12 +827,15 @@ watch(themeName, (n) => {
 
 1. **所有颜色/间距/圆角/阴影/动效走 token**，不写裸值
 2. **新 token 必须双主题都加**（`:root[data-theme="dark"]` 和 `:root[data-theme="light"]`）
-3. **图标用 `lucide-vue-next`**，通过 `./icons` barrel 导入
-4. **按钮优先复用 `.opt-pick` / `.ctrl-btn`**，不发明新的按钮变体
-5. **设置面板用 `.settings-section` + `.settings-form-row`** 模板
-6. **Markdown 走 `.md-body` class**，不重新定义
-7. **CSS 写在 `<style scoped>`**，不用全局 `<style>`（除非在 style.css）
-8. **改动后跑 `npm run build`**，vue-tsc 必须通过
+3. **主界面必须遵守 §0.5 Project-Aware Calm Workbench**（壳层、色彩纪律、thinking/tool 分离）
+4. **图标用 `lucide-vue-next`**，通过 `./icons` barrel 导入
+5. **按钮优先复用 `.opt-pick` / `.ctrl-btn` / §3.10 calm-cta**，不发明高饱和新变体
+6. **设置面板用 `.settings-section` + `.settings-form-row`** 模板
+7. **Markdown 走 `.md-body` class**，不重新定义
+8. **CSS 写在 `<style scoped>`**，不用全局 `<style>`（除非在 style.css）
+9. **改动后跑 `npm run build`**，vue-tsc 必须通过
+10. **子代理 UI 必须展示 `sub_agent_type` / `subagent_type` 与运行模式，但折叠态要合并为一段紧凑 meta，展开态按嵌套对话列表设计**
+11. **供应商协议字段表示 LLM 请求协议，不写成 HTTP/HTTPS**
 
 ### 10.2 禁止事项
 
@@ -673,14 +849,25 @@ watch(themeName, (n) => {
 8. ❌ `outline: none` 不替换为自定义 focus ring
 9. ❌ emoji 出现在 UI chrome（按钮、label、icon 位置）
 10. ❌ 直接从 `lucide-vue-next` 导入（绕过 barrel）
+11. ❌ 把 `thinking` 并入 `.event-timeline` / 与 tool 合并展示
+12. ❌ 侧栏主 CTA、Rail active、Inspector Tab 使用大面积高饱和 brand 实心块
+13. ❌ 恢复长期可见的四列「项目列表独占一栏」布局
+14. ❌ tool error 使用大面积红底警告块（只用细红边 + 短摘要）
+15. ❌ 删除现有功能入口而不提供等价可达路径
+16. ❌ 子代理展开态做成普通详情说明卡，缺少自己的消息列表
+17. ❌ 供应商协议字段显示 HTTPS / HTTP，或模型弹窗继续展示「功能标签」
+18. ❌ 子代理折叠态同时展示首字母图标、`类型` badge、`后台子代理` badge，造成重复噪声
+19. ❌ 在 ProjectSwitcher 触发器旁重复放「新建项目」`+` 按钮，挤压当前项目名称；AppRail 左下角快捷 `+` 需要保留
 
 ### 10.3 改动现有样式前
 
-1. 读相关组件的 `<style scoped>` 块（不是只看 template）
-2. 找到现有 token 复用 —— 不要创造并行 token（如 `my-button-bg`）
-3. 跑 `npm run build` 验证 vue-tsc
-4. 跑预览 (`scripts/preview-app.py`) 视觉验证两种主题
-5. 截图对比改动前后
+1. 先读 **§0.5**，确认不偏离 Calm Workbench
+2. 读相关组件的 `<style scoped>` 块（不是只看 template）
+3. 找到现有 token 复用 —— 不要创造并行 token（如 `my-button-bg`）
+4. 跑 `npm run build` 验证 vue-tsc
+5. 亮色 + 暗色都做视觉确认
+6. 涉及消息 parts 时，确认 thinking 仍独立于 tool 时间线
+7. 涉及设置页时，确认请求协议、Base URL、模型字段语义准确
 
 ---
 
@@ -688,15 +875,18 @@ watch(themeName, (n) => {
 
 写新 Vue 组件时按此顺序检查：
 
+- [ ] 是否落在主壳内？若是 → 对齐 §0.5 / §3.8
 - [ ] 容器用 `display: flex` 或 `display: grid`，**不用 `position: absolute`** 除非确有需求
 - [ ] 颜色全部走 token，间距全部走 `--space-*`
 - [ ] 圆角用 `--radius-sm/md/lg/xl/pill` 之一
 - [ ] 字号用 `13px / 12.5px / 11.5px` 三档（label / button / hint）
-- [ ] 按钮复用 `.opt-pick` 或 `.ctrl-btn`（不发明新变体）
+- [ ] 按钮复用 `.opt-pick` / `.ctrl-btn` / calm-cta（不发明高饱和新变体）
+- [ ] 若含 thinking / tool parts → 遵守 §0.5.5 / §3.9 分离规则
 - [ ] Hover/active/focus/disabled 四个态都有
 - [ ] 暗色 + 亮色都视觉验证
+- [ ] UI chrome 无 emoji
 - [ ] 跑 `npm run build` 通过 vue-tsc
-- [ ] 在 AGENTS.md §5 关键文件位置表里加一行（如果是新核心组件）
+- [ ] 若是新核心壳层组件，在 §12 与 AGENTS.md 速查表补一行
 
 ---
 
@@ -704,16 +894,22 @@ watch(themeName, (n) => {
 
 | 内容 | 文件 |
 |---|---|
-| 设计 tokens | `frontend/src/style.css` |
+| 设计 tokens（含 workbench） | `frontend/src/style.css` |
+| **产品视觉方向（已锁定）** | `.agents/docs/frontend-design.md` §0.5 |
 | 字体 woff2 | `frontend/src/assets/fonts/InterVariable.woff2` |
 | 图标 barrel | `frontend/src/components/icons/index.ts` |
-| TopBar 品牌显隐 | `frontend/src/components/TopBar.vue:119` |
-| opt-pick / ctrl-btn | `frontend/src/components/InputArea.vue` |
-| settings-section / settings-form | `frontend/src/components/AppSettingsModal.vue:2533-2602` |
-| chat 布局 | `frontend/src/components/ChatWindow.vue:142-170` |
-| Composer Dock Stack | `frontend/src/components/ChatWindow.vue`（Question → Todo → SubAgent → Queue → Input）；互斥见 `stores/chat.ts` `composerExpandedDock` |
-| 输入区高度管理 | `frontend/src/components/InputArea.vue:1402-1415` |
-| MessageBubble parts | `frontend/src/components/MessageBubble.vue` |
-| Markdown 渲染样式 | `frontend/src/style.css:246-304` |
-| 主题切换 | `frontend/src/App.vue:32-118` |
-| 主题持久化 | `frontend/src/App.vue:93-103` |
+| App 壳层 | `frontend/src/App.vue` |
+| AppRail | `frontend/src/components/AppRail.vue` |
+| ProjectSwitcher | `frontend/src/components/ProjectSwitcher.vue` |
+| SessionSidebar | `frontend/src/components/SessionSidebar.vue` |
+| TopBar | `frontend/src/components/TopBar.vue` |
+| InspectorPanel | `frontend/src/components/InspectorPanel.vue` |
+| Chat 布局 / Dock Stack | `frontend/src/components/ChatWindow.vue` |
+| MessageBubble parts / timeline | `frontend/src/components/MessageBubble.vue` |
+| ThinkingBlock（独立） | `frontend/src/components/ThinkingBlock.vue` |
+| ToolCallCard / SkillCallCard / SubAgentCard | `frontend/src/components/*Card.vue` |
+| opt-pick / ctrl-btn / composer | `frontend/src/components/InputArea.vue` |
+| settings-section / settings-form | `frontend/src/components/AppSettingsModal.vue` |
+| Markdown 渲染样式 | `frontend/src/style.css`（`.md-body`） |
+| 主题切换 / 持久化 | `frontend/src/App.vue` |
+| 重构计划（历史） | `docs/plans/project-aware-ui-redesign-plan.md` |

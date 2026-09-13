@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { NModal, NScrollbar, NSpin, NButton, NCard, useMessage } from 'naive-ui'
 import { ArrowDown, ArrowUp } from './icons'
 import * as api from '../api/client'
@@ -36,7 +36,9 @@ async function loadStats() {
   loading.value = false
 }
 
-onMounted(loadStats)
+watch(show, (visible) => {
+  if (visible) void loadStats()
+})
 </script>
 
 <template>

@@ -44,8 +44,8 @@ const isMediaResultTool = computed(() => isGenerationTool.value || isBrowserScre
 const contextRefs = computed(() => (props.part.context_refs || []).filter(Boolean))
 
 // Whether the result is "long enough" to warrant a
-// default-collapsed state. The args block is not folded —
-// it's typically 1-3 lines and not the noise.
+// default-collapsed state. Short tool details still remain
+// manually foldable; this only controls the initial state.
 const shouldFoldResult = computed(() => {
   // Errors default to collapsed — a long red log should not
   // dominate the chat until the user expands it.
@@ -66,21 +66,29 @@ const shouldFoldResult = computed(() => {
   return false
 })
 
+const hasVisibleBody = computed(() => {
+  if (isQuestionTool.value) return !!props.part.error
+  return contextRefs.value.length > 0 || !!props.part.args || !!props.part.result || !!props.part.error
+})
+
+const canToggleDetails = computed(() => hasVisibleBody.value)
+
 // open is the visual state. The decision tree is:
-//   1. short result → always open (no fold UI at all)
-//   2. long result + no user choice yet → default to folded
-//   3. long result + user clicked → respect their choice
+//   1. no details → closed (nothing to show)
+//   2. short result + no user choice yet → default to open
+//   3. long result + no user choice yet → default to folded
+//   4. user clicked → respect their choice
 // `userToggled` flips to true the first time the user
 // clicks the header; until then we follow the heuristic.
 const userToggled = ref(false)
 const userWantsOpen = ref(false)
 const open = computed(() => {
-  if (!shouldFoldResult.value) return true
-  if (!userToggled.value) return false
+  if (!canToggleDetails.value) return false
+  if (!userToggled.value) return !shouldFoldResult.value
   return userWantsOpen.value
 })
 function toggle() {
-  if (!shouldFoldResult.value) return
+  if (!canToggleDetails.value) return
   userToggled.value = true
   userWantsOpen.value = !open.value
 }
@@ -146,6 +154,9 @@ const statusLabel = computed(() => {
 })
 
 const toolDisplayName = computed(() => isQuestionTool.value ? 'LLM 提问' : props.part.name)
+const toolTitle = computed(() =>
+  isQuestionTool.value ? toolDisplayName.value : `工具调用 · ${toolDisplayName.value}`,
+)
 const toolStatusLabel = computed(() => {
   if (!isQuestionTool.value) return statusLabel.value
   switch (props.part.status) {
@@ -156,6 +167,29 @@ const toolStatusLabel = computed(() => {
     case 'blocked': return '已关闭'
     default: return props.part.status
   }
+})
+
+// Short one-line error for the collapsed header — avoids a
+// full-bleed red warning panel while still surfacing the failure.
+const shortErrorSummary = computed(() => {
+  const raw = (props.part.error || '').trim()
+  if (!raw) return ''
+  const firstLine = raw.split(/\r?\n/)[0].trim()
+  return firstLine.length > 72 ? `${firstLine.slice(0, 72)}…` : firstLine
+})
+
+const headerSubtitle = computed(() => {
+  if (shortErrorSummary.value) return shortErrorSummary.value
+  if (props.part.status !== 'start' || !props.part.args) return ''
+  try {
+    const parsed = JSON.parse(props.part.args) as Record<string, unknown>
+    const pick = parsed.command || parsed.cmd || parsed.query || parsed.pattern || parsed.path || parsed.url || parsed.expression
+    if (typeof pick === 'string' && pick.trim()) {
+      const one = pick.replace(/\s+/g, ' ').trim()
+      return one.length > 72 ? `${one.slice(0, 72)}…` : one
+    }
+  } catch { /* keep empty */ }
+  return ''
 })
 
 const statusIcon = computed(() => {
@@ -173,11 +207,6 @@ const argsPretty = computed(() => {
   const a = props.part.args
   if (!a) return ''
   try { return JSON.stringify(JSON.parse(a), null, 2) } catch { return a }
-})
-
-const hasVisibleBody = computed(() => {
-  if (isQuestionTool.value) return !!props.part.error
-  return contextRefs.value.length > 0 || !!props.part.args || !!props.part.result || !!props.part.error
 })
 
 // P2-4: a dry-run call is signalled by a `dry_run: true`
@@ -375,23 +404,37 @@ async function resultForCopy(): Promise<string> {
   <div
     v-if="!isQuestionTool || part.error"
     class="tool-card"
-    :class="['status-' + part.status, { foldable: shouldFoldResult, collapsed: !open, 'question-tool': isQuestionTool }]"
+    :class="['status-' + part.status, { foldable: canToggleDetails, collapsed: !open, 'question-tool': isQuestionTool }]"
   >
-    <button class="tool-header" @click="toggle" :title="isQuestionTool ? '问题已在下方展示' : open ? '收起' : '展开'">
+    <button
+      class="tool-header"
+      @click="toggle"
+      :title="isQuestionTool ? '问题已在下方展示' : canToggleDetails ? (open ? '收起' : '展开') : '无详情'"
+    >
       <span class="tool-icon" :class="part.status">
         <component :is="statusIcon" v-if="statusIcon" :size="11" :class="part.status === 'start' ? 'spin' : ''" />
       </span>
-      <span class="tool-name">{{ toolDisplayName }}</span>
-      <span v-if="isDryRun" class="tool-dry-run" title="仅预览,未实际执行">dry-run</span>
-      <span
-        v-if="contextRefs.length"
-        class="tool-context-chip"
-        :title="contextRefs.join(', ')"
-      >ctx {{ contextRefs.length }}</span>
-      <span class="tool-status">{{ toolStatusLabel }}</span>
+      <span class="tool-main">
+        <span class="tool-line">
+          <span class="tool-name">{{ toolTitle }}</span>
+          <span v-if="isDryRun" class="tool-dry-run" title="仅预览,未实际执行">dry-run</span>
+          <span
+            v-if="contextRefs.length"
+            class="tool-context-chip"
+            :title="contextRefs.join(', ')"
+          >ctx {{ contextRefs.length }}</span>
+          <span class="tool-status" :class="part.status">{{ toolStatusLabel }}</span>
+        </span>
+        <span
+          v-if="headerSubtitle && !open"
+          class="tool-subtitle"
+          :class="{ error: !!(part.status === 'error' || part.error) }"
+          :title="part.error || headerSubtitle"
+        >{{ headerSubtitle }}</span>
+      </span>
       <span class="tool-elapsed" v-if="part.elapsed">{{ part.elapsed }}</span>
       <span
-        v-if="part.result && shouldFoldResult"
+        v-if="part.result && canToggleDetails"
         class="tool-copy"
         :title="'复制结果'"
         @click.stop="copyResult"
@@ -401,7 +444,7 @@ async function resultForCopy(): Promise<string> {
         <span v-else class="tool-copy-state">失败</span>
       </span>
       <component
-        v-if="!isQuestionTool || shouldFoldResult"
+        v-if="canToggleDetails"
         :is="open ? ChevronDown : ChevronRight"
         :size="12"
         class="tool-caret"
@@ -496,25 +539,25 @@ async function resultForCopy(): Promise<string> {
 </template>
 
 <style scoped>
-/* Tool call card. Matches the unified card spec in
- * frontend-design.md §3 — 3px left status rail, surface-2
- * body, var(--radius-md) corners, dashed border-top
- * separator between header and body. */
+/* Calm timeline row — flat inside .event-timeline panel.
+ * Status via circular icon only (no per-card chrome / nested
+ * white boxes). Error = thin red left edge + short summary. */
 .tool-card {
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  margin: var(--space-1) 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  margin: 0;
   overflow: hidden;
   font-size: 12px;
-  transition: border-color var(--dur-fast) var(--ease-out);
 }
-.tool-card.status-start { border-left: 3px solid var(--brand-500); }
-.tool-card.status-ok    { border-left: 3px solid var(--success-500); }
-.tool-card.status-warn  { border-left: 3px solid var(--warn-500); }
-.tool-card.status-error { border-left: 3px solid var(--error-500); }
-.tool-card.status-blocked { border-left: 3px solid var(--warn-500); }
-.tool-card.question-tool { border-left-width: 2px; }
+.tool-card.status-error,
+.tool-card.status-blocked {
+  border-left: 2px solid var(--error-500);
+  padding-left: 2px;
+}
+.tool-card.status-blocked {
+  border-left-color: var(--warn-500);
+}
 .tool-card.question-tool .tool-header { cursor: default; }
 .tool-card.question-tool .tool-name {
   font-family: var(--font-sans);
@@ -526,23 +569,26 @@ async function resultForCopy(): Promise<string> {
 
 .tool-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--space-2);
   width: 100%;
   background: transparent;
   border: 0;
-  padding: 4px var(--space-3);
+  padding: var(--space-1) var(--space-2);
+  min-height: calc(var(--space-6) - var(--space-1));
   text-align: left;
   cursor: pointer;
   color: var(--text-secondary);
   font-family: inherit;
   font-size: inherit;
+  border-radius: var(--radius-sm);
   transition: background var(--dur-fast) var(--ease-out);
 }
 .tool-header:hover { background: var(--surface-3); }
 .tool-icon {
   display: inline-flex;
   width: 16px; height: 16px;
+  margin-top: 2px;
   align-items: center; justify-content: center;
   border-radius: 50%;
   flex-shrink: 0;
@@ -560,16 +606,57 @@ async function resultForCopy(): Promise<string> {
   to   { transform: rotate(360deg); }
 }
 .tool-name {
-  font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 500;
   color: var(--text-primary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.tool-status { color: var(--text-tertiary); font-size: 11px; }
+.tool-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tool-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.tool-status { color: var(--text-tertiary); font-size: 11px; flex-shrink: 0; }
+.tool-status.ok { color: var(--success-500); }
+.tool-status.error { color: var(--error-500); }
+.tool-subtitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.tool-subtitle.error { color: var(--error-500); }
+.tool-error-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--error-500);
+  font-size: 11px;
+  line-height: 1.3;
+}
 .tool-elapsed {
   color: var(--text-quaternary);
   font-size: 11px;
-  margin-left: 4px;
+  margin-left: auto;
+  margin-top: 2px;
   font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
 /* P2-4 dry-run chip. Pill-shaped, brand-50
  * background so it reads as "informational" — the
@@ -601,7 +688,7 @@ async function resultForCopy(): Promise<string> {
   font-weight: 500;
   flex-shrink: 0;
 }
-.tool-caret { margin-left: auto; color: var(--text-tertiary); flex-shrink: 0; }
+.tool-caret { color: var(--text-tertiary); flex-shrink: 0; margin-top: 2px; }
 
 /* "查看完整输出" affordance for server-truncated results.
  * Compact ghost button under the result body. */
@@ -628,13 +715,13 @@ async function resultForCopy(): Promise<string> {
 }
 
 .tool-body {
-  border-top: 1px dashed var(--border-subtle);
-  padding: 6px 12px 8px;
+  border-top: 1px solid var(--border-subtle);
+  margin-left: calc(var(--space-6) + var(--space-1));
+  padding: var(--space-1) var(--space-2) var(--space-2) var(--space-2);
 }
 .tool-section-label {
   font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   color: var(--text-quaternary);
   margin: 4px 0 2px;
   font-weight: 500;
@@ -651,20 +738,20 @@ async function resultForCopy(): Promise<string> {
 }
 .tool-context-refs code {
   padding: 1px 6px;
-  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  background: var(--surface-0);
+  background: color-mix(in srgb, var(--surface-3) 70%, transparent);
   color: var(--text-secondary);
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.45;
 }
+/* Flat monospace — no nested card-in-card boxes. */
 .tool-args pre, .tool-result pre, .tool-error pre, .generation-request-details pre {
   margin: 0;
-  padding: 6px 8px;
-  background: var(--surface-0);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.45;
@@ -675,11 +762,11 @@ async function resultForCopy(): Promise<string> {
   overflow: auto;
 }
 .tool-error {
-  margin-top: var(--space-2);
-  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  margin-top: var(--space-1);
+  padding: var(--space-1) 0 var(--space-1) var(--space-2);
   border-left: 2px solid var(--error-500);
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  background: color-mix(in srgb, var(--error-50) 70%, transparent);
+  border-radius: 0;
+  background: transparent;
 }
 .tool-error .tool-section-label {
   color: var(--error-500);
@@ -687,9 +774,7 @@ async function resultForCopy(): Promise<string> {
 }
 .tool-error pre {
   color: var(--error-600, var(--error-500));
-  border-color: color-mix(in srgb, var(--error-500) 25%, var(--border-subtle));
-  background: var(--surface-0);
-  max-height: 140px;
+  max-height: 120px;
 }
 .generation-request-details {
   margin-bottom: var(--space-2);
@@ -712,11 +797,12 @@ async function resultForCopy(): Promise<string> {
 }
 .generated-asset {
   display: grid;
+  min-width: 0;
   margin: 0;
   overflow: hidden;
   background: var(--surface-1);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-sm);
 }
 .generated-asset-preview {
@@ -725,6 +811,8 @@ async function resultForCopy(): Promise<string> {
   justify-content: center;
   width: 100%;
   min-width: 0;
+  min-height: calc(var(--space-8) * 4);
+  aspect-ratio: 16 / 9;
   padding: 0;
   overflow: hidden;
   appearance: none;
@@ -741,7 +829,8 @@ async function resultForCopy(): Promise<string> {
 .generated-asset-preview video {
   display: block;
   width: 100%;
-  max-height: calc(var(--space-8) * 11);
+  height: 100%;
+  max-height: calc(var(--space-8) * 10);
   object-fit: contain;
   background: var(--surface-0);
 }
@@ -752,6 +841,8 @@ async function resultForCopy(): Promise<string> {
   transform: scale(1.01);
 }
 .generated-asset-preview--audio {
+  min-height: 0;
+  aspect-ratio: auto;
   padding: var(--space-4);
 }
 .generated-asset-preview audio {
@@ -764,7 +855,7 @@ async function resultForCopy(): Promise<string> {
   flex-wrap: wrap;
   gap: var(--space-2);
   padding: var(--space-2) var(--space-3);
-  background: var(--surface-1);
+  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
   border-top: 1px solid var(--border-subtle);
 }
 .generated-asset-identity {

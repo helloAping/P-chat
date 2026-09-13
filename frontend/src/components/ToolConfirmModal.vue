@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { NModal, NButton, NSpace, NTag } from 'naive-ui'
+import { NButton, NSpace, NTag } from 'naive-ui'
 import {
   ShieldAlert, ShieldCheck, FolderOpen, Folder, Globe, Lock,
 } from './icons'
 import { currentPendingConfirm, submitToolConfirm } from '../stores/chat'
+import AppModal from './AppModal.vue'
 
 const argsExpanded = ref(false)
 
@@ -54,13 +55,13 @@ const argsPreview = computed(() => {
 </script>
 
 <template>
-  <NModal
+  <AppModal
     :show="!!currentPendingConfirm"
-    preset="card"
     :title="titleText"
-    style="width: 520px; max-width: calc(100vw - 32px)"
+    size="md"
     :closable="false"
     :mask-closable="false"
+    :close-on-esc="false"
   >
     <div class="tcm-body">
       <div class="tcm-chips">
@@ -110,18 +111,18 @@ const argsPreview = computed(() => {
         <NButton type="primary" @click="submitToolConfirm('once')">允许一次</NButton>
       </NSpace>
     </template>
-  </NModal>
+  </AppModal>
 </template>
 
 <style scoped>
 .tcm-body {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: var(--space-3);
 }
 .tcm-chips {
   display: flex;
-  gap: 6px;
+  gap: var(--space-2);
   flex-wrap: wrap;
 }
 .tcm-label {
@@ -139,10 +140,10 @@ const argsPreview = computed(() => {
 }
 .tcm-path-value {
   display: block;
-  padding: 8px 10px;
+  padding: var(--space-2) var(--space-3);
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-primary);
@@ -155,24 +156,24 @@ const argsPreview = computed(() => {
 }
 .tcm-pre {
   margin: 0;
-  padding: 8px 10px;
+  padding: var(--space-2) var(--space-3);
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: 11.5px;
   color: var(--text-secondary);
-  max-height: 160px;
+  max-height: calc(var(--space-8) * 4);
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;
 }
 .tcm-expand {
-  margin-top: 4px;
+  margin-top: var(--space-1);
   align-self: flex-end;
   background: none;
   border: none;
-  padding: 2px 4px;
+  padding: calc(var(--space-1) / 2) var(--space-1);
   font-size: 11.5px;
   color: var(--brand-500);
   cursor: pointer;
@@ -183,10 +184,10 @@ const argsPreview = computed(() => {
 .tcm-reason {
   display: flex;
   flex-direction: column;
-  padding: 8px 10px;
-  background: var(--warn-50, rgba(234, 170, 85, 0.12));
-  border: 1px dashed var(--warn-500, #EAAA55);
-  border-radius: 6px;
+  padding: var(--space-2) var(--space-3);
+  background: var(--warn-50);
+  border: 1px dashed var(--warn-500);
+  border-radius: var(--radius-sm);
 }
 .tcm-reason-text {
   font-size: 12px;

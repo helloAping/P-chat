@@ -3422,6 +3422,17 @@ func newConvID() string {
 // "100%" matches the literal substring "100%", not "100" +
 // anything.
 func (s *Store) SearchMessages(q string, limit int) []SearchResult {
+	return s.searchMessages(q, limit, "", false)
+}
+
+// SearchMessagesByProject performs the same search as SearchMessages, but
+// limits hits to conversations whose metadata project_path matches projectPath.
+// Passing an empty projectPath searches only global conversations.
+func (s *Store) SearchMessagesByProject(q string, limit int, projectPath string) []SearchResult {
+	return s.searchMessages(q, limit, projectPath, true)
+}
+
+func (s *Store) searchMessages(q string, limit int, projectPath string, filterProject bool) []SearchResult {
 	_ = s.Flush()
 	if q == "" {
 		return nil
@@ -3435,15 +3446,17 @@ func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	// each metachar with `\`.
 	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
 
-	rows, err := s.db.Query(
-		`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at
-		 FROM messages m
-		 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
-		 WHERE m.content LIKE ? ESCAPE '\'
-		 ORDER BY m.created_at DESC
-		 LIMIT ?`,
-		"%"+escaped+"%", limitOrHuge(limit),
-	)
+	query := `SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at, COALESCE(c.metadata, '')
+			 FROM messages m
+			 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
+			 WHERE m.content LIKE ? ESCAPE '\'
+			 ORDER BY m.created_at DESC`
+	args := []any{"%" + escaped + "%"}
+	if !filterProject {
+		query += ` LIMIT ?`
+		args = append(args, limitOrHuge(limit))
+	}
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil
 	}
@@ -3453,11 +3466,18 @@ func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	for rows.Next() {
 		var r SearchResult
 		var content string
-		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt); err != nil {
+		var convMeta string
+		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt, &convMeta); err != nil {
 			break
+		}
+		if filterProject && !sameConversationProjectPath(conversationProjectPath(convMeta), projectPath) {
+			continue
 		}
 		r.Snippet = snippet(content, q, 120)
 		out = append(out, r)
+		if filterProject && len(out) >= limitOrHuge(limit) {
+			break
+		}
 	}
 	return out
 }

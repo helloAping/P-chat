@@ -96,6 +96,15 @@
   --error-50:         rgba(238, 85, 85, 0.14);
   --error-500:        #EE5555;
 
+  /* Soft user bubble — light tint, not a saturated fill */
+  --user-bubble-bg:     color-mix(in srgb, var(--brand-500) 12%, var(--surface-1));
+  --user-bubble-border: color-mix(in srgb, var(--brand-500) 18%, var(--border-subtle));
+
+  /* Independent thinking block — neutral timeline family (not warm wash) */
+  --thinking-bg:        var(--surface-2);
+  --thinking-border:    var(--border-subtle);
+  --thinking-icon:      var(--text-tertiary);
+
   /* 2.6b Provider brand colors. The dot/badge next to a
    * provider in the TopBar and ModelPicker uses these.
    * Dark theme picks the deeper, more saturated brand hues
@@ -150,6 +159,7 @@
   --radius-pill:      9999px;
 
   /* 2.10 Shadow */
+  --shadow-xs:        0 1px 1px rgba(0, 0, 0, 0.16);
   --shadow-sm:        0 1px 2px rgba(0, 0, 0, 0.20);
   --shadow-md:        0 4px 12px rgba(0, 0, 0, 0.28);
   --shadow-lg:        0 12px 32px rgba(0, 0, 0, 0.36);
@@ -164,6 +174,17 @@
   --glass-panel-bg:   rgba(22, 25, 34, 0.92);
   --titlebar-height:  36px;
   --control-height:   28px;
+
+  /* Workbench shell — Project-Aware Calm layout
+   * Single session sidebar + inspector; project options
+   * live in the ProjectSwitcher popover, not a fixed list. */
+  --rail-width:       52px;
+  --sidebar-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 340px);
+  --sidebar-width:    var(--sidebar-user-width, var(--sidebar-default-width));
+  --inspector-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 320px);
+  --inspector-width:  var(--inspector-default-width);
+  --project-switcher-width: 320px;
+  --event-rail-color: var(--border-default);
 
   /* 2.11 Motion
    * --ease-out   : enter / hover settle (decelerate into rest)
@@ -215,6 +236,15 @@
   --brand-600:        #3033BF;
   --brand-700:        #2528A0;
 
+  /* Soft user bubble — light tint for light theme */
+  --user-bubble-bg:     color-mix(in srgb, var(--brand-500) 8%, var(--surface-1));
+  --user-bubble-border: color-mix(in srgb, var(--brand-500) 14%, var(--border-subtle));
+
+  /* Independent thinking block — neutral timeline family (not warm wash) */
+  --thinking-bg:        var(--surface-2);
+  --thinking-border:    var(--border-subtle);
+  --thinking-icon:      var(--text-tertiary);
+
   --ai-50:            rgba(91, 61, 187, 0.08);
   --ai-100:           rgba(91, 61, 187, 0.16);
   --ai-500:           #5B3DDB;
@@ -239,6 +269,7 @@
   --code-deletion:    #B31D28;
   --code-deletion-bg: #FFEEF0;
 
+  --shadow-xs:        0 1px 1px rgba(0, 0, 0, 0.04);
   --shadow-sm:        0 1px 2px rgba(0, 0, 0, 0.06);
   --shadow-md:        0 4px 12px rgba(0, 0, 0, 0.10);
   --shadow-lg:        0 12px 32px rgba(0, 0, 0, 0.16);
@@ -251,7 +282,49 @@
   --titlebar-height:  36px;
   --control-height:   28px;
 
+  /* Workbench shell — Project-Aware Calm layout
+   * Single session sidebar + inspector; project options
+   * live in the ProjectSwitcher popover, not a fixed list. */
+  --rail-width:       52px;
+  --sidebar-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 340px);
+  --sidebar-width:    var(--sidebar-user-width, var(--sidebar-default-width));
+  --inspector-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 320px);
+  --inspector-width:  var(--inspector-default-width);
+  --project-switcher-width: 320px;
+  --event-rail-color: var(--border-default);
+
   color-scheme: light;
+}
+
+/* Responsive shell density. Keep the project sidebar usable, then
+ * collapse the optional Inspector first so the composer keeps room. */
+@media (max-width: 1240px) {
+  :root,
+  :root[data-theme="dark"],
+  :root[data-theme="light"] {
+    --sidebar-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 300px);
+    --inspector-default-width: clamp(232px, calc((100vw - var(--rail-width)) / 5), 280px);
+  }
+}
+
+@media (max-width: 1040px) {
+  :root,
+  :root[data-theme="dark"],
+  :root[data-theme="light"] {
+    --sidebar-default-width: 260px;
+    --sidebar-width: min(var(--sidebar-user-width, var(--sidebar-default-width)), 300px);
+    --inspector-default-width: 0px;
+    --inspector-width: 0px;
+  }
+}
+
+@media (max-width: 760px) {
+  :root,
+  :root[data-theme="dark"],
+  :root[data-theme="light"] {
+    --sidebar-default-width: 240px;
+    --sidebar-width: min(var(--sidebar-user-width, var(--sidebar-default-width)), 280px);
+  }
 }
 
 /* --- 4. Font stacks (theme-independent) ---------------------------------- */
@@ -719,8 +792,8 @@ html, body, #app {
 .md-body tr:nth-child(even) td { background: var(--surface-1); }
 
 /* Headings */
-.md-body h1 { font-size: 1.4em; font-weight: 700; margin: 16px 0 10px; color: var(--text-primary); letter-spacing: -0.01em; }
-.md-body h2 { font-size: 1.25em; font-weight: 600; margin: 14px 0 8px; color: var(--text-primary); letter-spacing: -0.005em; }
+.md-body h1 { font-size: 1.4em; font-weight: 700; margin: 16px 0 10px; color: var(--text-primary); letter-spacing: 0; }
+.md-body h2 { font-size: 1.25em; font-weight: 600; margin: 14px 0 8px; color: var(--text-primary); letter-spacing: 0; }
 .md-body h3 { font-size: 1.1em; font-weight: 600; margin: 12px 0 6px; color: var(--text-secondary); }
 .md-body h4 { font-size: 1em; font-weight: 600; margin: 10px 0 6px; color: var(--text-secondary); }
 
@@ -969,7 +1042,7 @@ pre {
   font-size: 13.5px;
   font-weight: 600;
   color: var(--text-primary);
-  letter-spacing: -0.005em;
+  letter-spacing: 0;
   line-height: 1.3;
 }
 

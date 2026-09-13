@@ -9,13 +9,15 @@
 // localStorage so the user's preference survives reloads.
 // First run falls back to the OS preference (useOsTheme).
 
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch, type CSSProperties } from 'vue'
 import {
   NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider,
   darkTheme, lightTheme, useOsTheme,
   type GlobalTheme, type GlobalThemeOverrides,
 } from 'naive-ui'
 import SessionSidebar from './components/SessionSidebar.vue'
+import AppRail from './components/AppRail.vue'
+import InspectorPanel from './components/InspectorPanel.vue'
 import ChatWindow from './components/ChatWindow.vue'
 import TitleBar from './components/TitleBar.vue'
 import TopBar from './components/TopBar.vue'
@@ -36,11 +38,161 @@ let cleanupTrayEvents: (() => void) | null = null
 // the TopBar. Default 'false' (sidebar visible) — matches the
 // pre-PR-3 layout so existing users see no change on upgrade.
 const SIDEBAR_COLLAPSED_KEY = 'pchat-sidebar-collapsed'
+const SIDEBAR_WIDTH_KEY = 'pchat-sidebar-width'
+const SIDEBAR_MIN_WIDTH = 220
+const SIDEBAR_MAX_WIDTH = 420
 const sidebarCollapsed = ref(false)
+const sidebarWidthPx = ref<number | null>(null)
+const sidebarDragging = ref(false)
+const appBodyRef = ref<HTMLElement | null>(null)
+const sidebarDragStartX = ref(0)
+const sidebarDragStartWidth = ref(0)
+
+// Right inspector. Persisted separately so collapsing the
+// session list doesn't also hide the context panel.
+const INSPECTOR_OPEN_KEY = 'pchat-inspector-open'
+const inspectorOpen = ref(true)
+
+const sidebarRef = ref<InstanceType<typeof SessionSidebar> | null>(null)
 
 // 'dark' | 'light' — what the user picked. Persisted.
 const THEME_KEY = 'pchat-theme'
 const themeName = ref<'dark' | 'light'>('dark')
+
+const appStyle = computed<CSSProperties>(() => {
+  if (sidebarWidthPx.value == null) return {}
+  return { '--sidebar-user-width': `${sidebarWidthPx.value}px` } as CSSProperties
+})
+
+const sidebarResizeValue = computed(() =>
+  Math.round(sidebarWidthPx.value ?? defaultSidebarWidth()),
+)
+
+const sidebarResizeMax = computed(() => maxSidebarWidth())
+
+function railWidthPx(): number {
+  if (typeof window === 'undefined') return 52
+  const value = getComputedStyle(document.documentElement)
+    .getPropertyValue('--rail-width')
+    .trim()
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : 52
+}
+
+function defaultSidebarWidth(): number {
+  if (typeof window === 'undefined') return 280
+  const proportional = (window.innerWidth - railWidthPx()) / 5
+  return clampSidebarWidth(proportional)
+}
+
+function maxSidebarWidth(): number {
+  const available = appBodyRef.value?.clientWidth ?? (typeof window === 'undefined' ? 1280 : window.innerWidth)
+  const proportionalMax = Math.round(available * 0.34)
+  return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, proportionalMax))
+}
+
+function clampSidebarWidth(width: number): number {
+  const max = maxSidebarWidth()
+  return Math.round(Math.min(max, Math.max(SIDEBAR_MIN_WIDTH, width)))
+}
+
+function loadSidebarWidth() {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY)
+    if (!raw) return
+    const parsed = Number.parseFloat(raw)
+    if (Number.isFinite(parsed)) sidebarWidthPx.value = clampSidebarWidth(parsed)
+  } catch { /* ignore */ }
+}
+
+function persistSidebarWidth() {
+  try {
+    if (sidebarWidthPx.value == null) localStorage.removeItem(SIDEBAR_WIDTH_KEY)
+    else localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidthPx.value))
+  } catch { /* ignore */ }
+}
+
+function currentSidebarWidth(): number {
+  const el = sidebarRef.value?.$el as HTMLElement | undefined
+  const width = el?.getBoundingClientRect().width
+  if (width && width > 0) return width
+  return sidebarWidthPx.value ?? defaultSidebarWidth()
+}
+
+function removeSidebarResizeListeners() {
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('pointermove', onSidebarResize)
+    window.removeEventListener('pointerup', stopSidebarResize)
+    window.removeEventListener('pointercancel', stopSidebarResize)
+  }
+  if (typeof document !== 'undefined') {
+    document.body.classList.remove('is-resizing-sidebar')
+  }
+}
+
+function startSidebarResize(event: PointerEvent) {
+  if (sidebarCollapsed.value) return
+  event.preventDefault()
+  sidebarDragging.value = true
+  sidebarDragStartX.value = event.clientX
+  sidebarDragStartWidth.value = currentSidebarWidth()
+  const target = event.currentTarget as HTMLElement | null
+  target?.setPointerCapture?.(event.pointerId)
+  document.body.classList.add('is-resizing-sidebar')
+  window.addEventListener('pointermove', onSidebarResize)
+  window.addEventListener('pointerup', stopSidebarResize)
+  window.addEventListener('pointercancel', stopSidebarResize)
+}
+
+function onSidebarResize(event: PointerEvent) {
+  if (!sidebarDragging.value) return
+  const delta = event.clientX - sidebarDragStartX.value
+  sidebarWidthPx.value = clampSidebarWidth(sidebarDragStartWidth.value + delta)
+}
+
+function stopSidebarResize() {
+  if (sidebarDragging.value) {
+    sidebarDragging.value = false
+    persistSidebarWidth()
+  }
+  removeSidebarResizeListeners()
+}
+
+function resetSidebarWidth() {
+  sidebarWidthPx.value = null
+  persistSidebarWidth()
+}
+
+function nudgeSidebarWidth(delta: number) {
+  sidebarWidthPx.value = clampSidebarWidth((sidebarWidthPx.value ?? defaultSidebarWidth()) + delta)
+  persistSidebarWidth()
+}
+
+function onSidebarResizeKeydown(event: KeyboardEvent) {
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault()
+    nudgeSidebarWidth(-16)
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault()
+    nudgeSidebarWidth(16)
+  } else if (event.key === 'Home') {
+    event.preventDefault()
+    sidebarWidthPx.value = SIDEBAR_MIN_WIDTH
+    persistSidebarWidth()
+  } else if (event.key === 'End') {
+    event.preventDefault()
+    sidebarWidthPx.value = sidebarResizeMax.value
+    persistSidebarWidth()
+  } else if (event.key === 'Enter') {
+    event.preventDefault()
+    resetSidebarWidth()
+  }
+}
+
+function keepSidebarWidthInBounds() {
+  if (sidebarWidthPx.value == null) return
+  sidebarWidthPx.value = clampSidebarWidth(sidebarWidthPx.value)
+}
 
 // Single brand color used by both Naive UI's primaryColor
 // and the rest of the app's --brand-500. Reading the CSS var
@@ -182,8 +334,33 @@ watch(sidebarCollapsed, (v) => {
   try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, v ? '1' : '0') } catch { /* ignore */ }
 })
 
+watch(inspectorOpen, (v) => {
+  try { localStorage.setItem(INSPECTOR_OPEN_KEY, v ? '1' : '0') } catch { /* ignore */ }
+})
+
 function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
+}
+
+function toggleInspector() {
+  inspectorOpen.value = !inspectorOpen.value
+}
+
+async function focusProjects() {
+  if (sidebarCollapsed.value) sidebarCollapsed.value = false
+  // Wait a frame so the sidebar width transition has applied
+  // before opening the popover (otherwise it anchors off-screen).
+  await nextTick()
+  sidebarRef.value?.openProjectSwitcher?.()
+}
+
+function openAddProject() {
+  if (sidebarCollapsed.value) sidebarCollapsed.value = false
+  sidebarRef.value?.openAddProject?.()
+}
+
+function openAbout() {
+  sidebarRef.value?.openAbout?.()
 }
 
 onMounted(async () => {
@@ -207,6 +384,15 @@ onMounted(async () => {
       sidebarCollapsed.value = stored === '1'
     }
   } catch { /* ignore */ }
+  loadSidebarWidth()
+
+  // Inspector bootstrap: localStorage > default open.
+  try {
+    const stored = localStorage.getItem(INSPECTOR_OPEN_KEY)
+    if (stored === '1' || stored === '0') {
+      inspectorOpen.value = stored === '1'
+    }
+  } catch { /* ignore */ }
 
   // Expose a global close handle for AppSettingsModal so it can
   // dismiss itself without prop-drilling.
@@ -223,9 +409,14 @@ onMounted(async () => {
     console.error('init failed', e)
   }
   cleanupTrayEvents = await setupTrayEventListeners()
+  window.addEventListener('resize', keepSidebarWidthInBounds)
 })
 
 onUnmounted(() => {
+  removeSidebarResizeListeners()
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('resize', keepSidebarWidthInBounds)
+  }
   if (cleanupTrayEvents) {
     cleanupTrayEvents()
     cleanupTrayEvents = null
@@ -238,20 +429,58 @@ onUnmounted(() => {
     <NMessageProvider>
       <NDialogProvider>
         <NNotificationProvider>
-          <div class="app" :class="{ 'app--sidebar-collapsed': sidebarCollapsed }">
+          <div
+            class="app"
+            :class="{
+              'app--sidebar-collapsed': sidebarCollapsed,
+              'app--resizing-sidebar': sidebarDragging,
+            }"
+            :style="appStyle"
+          >
             <TitleBar />
-            <div class="app-body">
+            <div class="app-body" ref="appBodyRef">
+              <AppRail
+                @about="openAbout"
+                @focus-projects="focusProjects"
+                @open-settings="showAppSettings = true"
+                @add-project="openAddProject"
+              />
               <SessionSidebar
+                ref="sidebarRef"
                 :class="{ 'sidebar-collapsed': sidebarCollapsed }"
                 @open-settings="showAppSettings = true"
                 v-model:theme-name="themeName"
               />
+              <button
+                v-if="!sidebarCollapsed"
+                type="button"
+                class="sidebar-resize-handle"
+                :class="{ 'sidebar-resize-handle--dragging': sidebarDragging }"
+                role="separator"
+                aria-orientation="vertical"
+                :aria-valuemin="SIDEBAR_MIN_WIDTH"
+                :aria-valuemax="sidebarResizeMax"
+                :aria-valuenow="sidebarResizeValue"
+                aria-label="调整聊天记录宽度"
+                title="拖动调整聊天记录宽度，双击恢复 1:3:1"
+                @pointerdown="startSidebarResize"
+                @dblclick="resetSidebarWidth"
+                @keydown="onSidebarResizeKeydown"
+              />
               <div class="main-column">
                 <TopBar
                   :collapsed="sidebarCollapsed"
+                  :inspector-open="inspectorOpen"
                   @toggle-sidebar="toggleSidebar"
+                  @toggle-inspector="toggleInspector"
                 />
-                <ChatWindow />
+                <div class="workspace-row">
+                  <ChatWindow />
+                  <InspectorPanel
+                    :open="inspectorOpen"
+                    @close="inspectorOpen = false"
+                  />
+                </div>
               </div>
             </div>
             <ImageLightbox />
@@ -293,10 +522,66 @@ onUnmounted(() => {
   flex-direction: column;
   background: var(--surface-0);
 }
+.workspace-row {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+
+.sidebar-resize-handle {
+  position: relative;
+  z-index: 5;
+  flex: 0 0 var(--space-2);
+  width: var(--space-2);
+  min-width: var(--space-2);
+  margin: 0 calc(-1 * var(--space-1));
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  -webkit-app-region: no-drag;
+}
+.sidebar-resize-handle::before {
+  content: '';
+  position: absolute;
+  top: var(--space-3);
+  bottom: var(--space-3);
+  left: 50%;
+  width: 1px;
+  border-radius: var(--radius-pill);
+  background: var(--border-subtle);
+  transform: translateX(-50%);
+  transition:
+    width var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+.sidebar-resize-handle:hover::before,
+.sidebar-resize-handle:focus-visible::before,
+.sidebar-resize-handle--dragging::before,
+.app--resizing-sidebar .sidebar-resize-handle::before {
+  width: 2px;
+  background: var(--brand-500);
+  box-shadow: 0 0 0 2px var(--brand-50);
+}
+.sidebar-resize-handle:focus-visible {
+  outline: none;
+}
+.app--resizing-sidebar :deep(.sidebar) {
+  transition: none;
+}
+:global(body.is-resizing-sidebar) {
+  cursor: col-resize;
+  user-select: none;
+}
+:global(body.is-resizing-sidebar *) {
+  cursor: col-resize !important;
+}
 
 /* Sidebar collapse: SessionSidebar animates its own width
- * (320px → 0) via the `.sidebar-collapsed` class on its
- * root. The main column flex-grows into the freed space on
- * the same --dur-slow / --ease-in-out curve, so the chat
- * canvas and the rail move together instead of snapping. */
+ * (var(--sidebar-width) → 0) via the `.sidebar-collapsed` class
+ * on its root. AppRail stays visible. The main column flex-grows
+ * into the freed space on the same --dur-slow / --ease-in-out
+ * curve, so the chat canvas and the sidebar move together. */
 </style>

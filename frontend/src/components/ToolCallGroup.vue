@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 import type { ToolPart } from '../api/client'
 import {
   AlertTriangle,
@@ -20,15 +20,11 @@ const userOpen = ref(false)
 const hasRunning = computed(() => props.parts.some(part => part.status === 'start'))
 const hasError = computed(() => props.parts.some(part => part.status === 'error' || part.status === 'blocked'))
 const hasWarn = computed(() => props.parts.some(part => part.status === 'warn'))
+const hasMediaResult = computed(() => props.parts.some(partHasMediaResult))
 
 const open = computed(() => {
-  if (!userToggled.value && hasRunning.value) return true
-  if (!userToggled.value) return false
+  if (!userToggled.value) return hasRunning.value || hasMediaResult.value
   return userOpen.value
-})
-
-watch(hasRunning, (running) => {
-  if (running && !userToggled.value) userOpen.value = true
 })
 
 function toggle() {
@@ -105,6 +101,22 @@ function rowLabel(part: ToolPart): string {
   if (label.length <= 96) return label
   return `${label.slice(0, 96)}...`
 }
+
+function partHasMediaResult(part: ToolPart): boolean {
+  if (!part.result) return false
+  if (!part.name.startsWith('generate_') && part.name !== 'browser_screenshot') return false
+  try {
+    const parsed = JSON.parse(part.result)
+    return Array.isArray(parsed?.assets)
+      && parsed.assets.some((asset: any) =>
+        asset
+        && typeof asset.url === 'string'
+        && ['image', 'video', 'audio'].includes(String(asset.kind)),
+      )
+  } catch {
+    return false
+  }
+}
 </script>
 
 <template>
@@ -120,9 +132,10 @@ function rowLabel(part: ToolPart): string {
       </span>
       <span class="tool-group-title">
         <Terminal :size="13" />
-        <span>运行了 {{ parts.length }} 个工具</span>
+        <span>执行记录</span>
       </span>
       <span v-if="summary" class="tool-group-summary">{{ summary }}</span>
+      <span class="tool-group-status">{{ parts.length }} 项</span>
       <span class="tool-group-status">{{ statusLabel }}</span>
       <span v-if="elapsedLabel" class="tool-group-elapsed">{{ elapsedLabel }}</span>
       <component :is="open ? ChevronDown : ChevronRight" :size="12" class="tool-group-caret" />
@@ -153,19 +166,13 @@ function rowLabel(part: ToolPart): string {
 
 <style scoped>
 .tool-group {
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-left: 3px solid var(--success-500);
-  border-radius: var(--radius-md);
-  margin: var(--space-1) 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  margin: 0;
   overflow: hidden;
   font-size: 12.5px;
-  transition: border-color var(--dur-fast) var(--ease-out);
 }
-.tool-group.status-start { border-left-color: var(--brand-500); }
-.tool-group.status-ok { border-left-color: var(--success-500); }
-.tool-group.status-warn { border-left-color: var(--warn-500); }
-.tool-group.status-error { border-left-color: var(--error-500); }
 
 .tool-group-header {
   display: flex;
@@ -248,7 +255,7 @@ function rowLabel(part: ToolPart): string {
   gap: var(--space-1);
   border-top: 1px dashed var(--border-subtle);
   padding: var(--space-2) var(--space-3);
-  background: var(--surface-1);
+  background: color-mix(in srgb, var(--surface-2) 42%, transparent);
 }
 .tool-group-row {
   display: grid;
@@ -291,10 +298,10 @@ function rowLabel(part: ToolPart): string {
 .tool-group-body {
   border-top: 1px dashed var(--border-subtle);
   padding: var(--space-2) var(--space-3);
-  background: var(--surface-1);
+  background: color-mix(in srgb, var(--surface-2) 42%, transparent);
 }
 .tool-group-body :deep(.tool-card) {
   margin: var(--space-1) 0;
-  background: var(--surface-2);
+  background: transparent;
 }
 </style>

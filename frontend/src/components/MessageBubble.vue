@@ -70,7 +70,7 @@ import {
   extensionForMime, fetchAsBlob,
 } from '../utils/clipboard'
 import { messageTextForCopy } from '../utils/messageCopy'
-import { groupConsecutiveToolParts } from '../utils/toolPartGrouping'
+import { groupConsecutiveToolParts, type PartRenderEntry } from '../utils/toolPartGrouping'
 
 const dialog = useDialog()
 
@@ -231,7 +231,7 @@ function isLiveTextPart(idx: number, kind: string, parts: MessagePart[] | undefi
 // isLiveThinkingPart mirrors isLiveTextPart: only the
 // very last part AND it must be a thinking part. While
 // streaming, that trailing part renders through
-// `ThinkingBlock` with its shimmer effect; once
+// `ThinkingBlock` (open while live); once
 // streaming ends or a new round appends a non-thinking
 // part, this returns false and the block falls back to
 // its collapsed static view.
@@ -261,6 +261,47 @@ const visibleParts = computed(() => {
   return parts.slice(start).map((part, offset) => ({ part, index: start + offset }))
 })
 const visibleRenderEntries = computed(() => groupConsecutiveToolParts(visibleParts.value))
+
+// Group consecutive tool / skill / sub_agent entries into one
+// visual panel. Thinking stays independent and never enters
+// the event timeline, matching the Calm Workbench transcript.
+type TimelineSegment =
+  | { kind: 'events'; key: string; entries: PartRenderEntry[] }
+  | { kind: 'content'; key: string; entry: PartRenderEntry }
+
+function isProcessRowEntry(entry: PartRenderEntry): boolean {
+  if (entry.kind === 'tool_group') return true
+  const k = entry.part.kind
+  return k === 'skill' || k === 'tool' || k === 'sub_agent'
+}
+
+const visibleTimelineSegments = computed((): TimelineSegment[] => {
+  const segments: TimelineSegment[] = []
+  let eventBuf: PartRenderEntry[] = []
+  const flushEvents = () => {
+    if (!eventBuf.length) return
+    const first = eventBuf[0]
+    const key = first.kind === 'tool_group'
+      ? `events-${first.startIndex}`
+      : `events-${first.index}`
+    segments.push({ kind: 'events', key, entries: eventBuf })
+    eventBuf = []
+  }
+  for (const entry of visibleRenderEntries.value) {
+    if (isProcessRowEntry(entry)) {
+      eventBuf.push(entry)
+      continue
+    }
+    flushEvents()
+    const key = entry.kind === 'tool_group'
+      ? `tool-group-${entry.startIndex}`
+      : `part-${entry.index}`
+    segments.push({ kind: 'content', key, entry })
+  }
+  flushEvents()
+  return segments
+})
+
 function showEarlierParts() {
   revealedEarlierParts.value += PART_RENDER_WINDOW
 }
@@ -1196,15 +1237,22 @@ function findPrecedingUserMessageId(): number {
                 @keydown.enter.prevent="openLightbox(a.url, a.name || 'image', 'image')"
                 @keydown.space.prevent="openLightbox(a.url, a.name || 'image', 'image')"
               >
-                <img
-                  class="msg-image"
-                  :src="a.url"
-                  :alt="a.name || 'image'"
-                  loading="lazy"
-                />
-                <div class="media-thumbnail-hint">
-                  <Maximize2 :size="14" />
-                  <span>查看大图</span>
+	                <img
+	                  class="msg-image"
+	                  :src="a.url"
+	                  :alt="a.name || 'image'"
+	                  loading="lazy"
+	                />
+	                <div class="media-thumbnail-footer">
+	                  <span class="media-thumbnail-name">
+	                    <ImageIcon :size="14" />
+	                    <span>{{ a.name || '图片' }}</span>
+	                  </span>
+	                  <span class="media-thumbnail-meta">{{ attachmentTypeLabel(a) }}</span>
+	                </div>
+	                <div class="media-thumbnail-hint">
+	                  <Maximize2 :size="14" />
+	                  <span>查看大图</span>
                 </div>
                 <div class="attachment-action-bar attachment-action-bar--image">
                   <button type="button" class="attach-action-btn" title="复制图片" aria-label="复制图片" @click.stop="copyAttachment(a)">
@@ -1230,12 +1278,19 @@ function findPrecedingUserMessageId(): number {
                   :src="a.url"
                   muted
                   playsinline
-                  preload="auto"
-                  :title="a.name || 'video'"
-                />
-                <span class="media-thumbnail-play" aria-hidden="true">
-                  <Play :size="22" fill="currentColor" />
-                </span>
+	                  preload="auto"
+	                  :title="a.name || 'video'"
+	                />
+	                <div class="media-thumbnail-footer">
+	                  <span class="media-thumbnail-name">
+	                    <Film :size="14" />
+	                    <span>{{ a.name || '视频' }}</span>
+	                  </span>
+	                  <span class="media-thumbnail-meta">{{ attachmentTypeLabel(a) }}</span>
+	                </div>
+	                <span class="media-thumbnail-play" aria-hidden="true">
+	                  <Play :size="22" fill="currentColor" />
+	                </span>
                 <div class="media-thumbnail-hint">
                   <Maximize2 :size="14" />
                   <span>全屏播放</span>
@@ -1363,41 +1418,50 @@ function findPrecedingUserMessageId(): number {
               >
                 已折叠 {{ hiddenPartCount }} 条过程记录
               </button>
-              <template
-                v-for="entry in visibleRenderEntries"
-                :key="entry.kind === 'tool_group' ? `tool-group-${entry.startIndex}` : entry.index"
-              >
-                <ToolCallGroup
-                  v-if="entry.kind === 'tool_group'"
-                  :parts="entry.parts"
-                />
-                <template v-else>
-                  <ThinkingBlock
-                    v-if="entry.part.kind === 'thinking'"
-                    :part="entry.part"
-                    :default-open="isLiveThinkingPart(entry.index, entry.part.kind, message.parts)"
-                  />
-                  <SkillCallCard v-else-if="entry.part.kind === 'skill'" :part="entry.part" />
-                  <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
-                  <SubAgentCard v-else-if="entry.part.kind === 'sub_agent'" :part="entry.part" />
-                  <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
-                  <TypedText
-                    v-else-if="entry.part.kind === 'text' && isLiveTextPart(entry.index, entry.part.kind, message.parts)"
-                    :text="entry.part.text || ''"
-                    :active="true"
-                  />
-                  <div v-else-if="entry.part.kind === 'text'">
+	              <template
+	                v-for="segment in visibleTimelineSegments"
+	                :key="segment.key"
+	              >
+	                <div v-if="segment.kind === 'events'" class="event-timeline">
+	                  <template
+	                    v-for="entry in segment.entries"
+	                    :key="entry.kind === 'tool_group' ? `tool-group-${entry.startIndex}` : entry.index"
+	                  >
+	                    <ToolCallGroup
+	                      v-if="entry.kind === 'tool_group'"
+	                      :parts="entry.parts"
+	                    />
+	                    <template v-else-if="entry.kind === 'part'">
+	                      <SkillCallCard v-if="entry.part.kind === 'skill'" :part="entry.part" />
+	                      <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
+	                      <SubAgentCard v-else-if="entry.part.kind === 'sub_agent'" :part="entry.part" />
+	                    </template>
+	                  </template>
+	                </div>
+	                <template v-else>
+	                  <ThinkingBlock
+	                    v-if="segment.entry.kind === 'part' && segment.entry.part.kind === 'thinking'"
+	                    :part="segment.entry.part"
+	                    :default-open="isLiveThinkingPart(segment.entry.index, segment.entry.part.kind, message.parts)"
+	                  />
+	                  <QuestionTable v-else-if="segment.entry.kind === 'part' && segment.entry.part.kind === 'question'" :part="segment.entry.part" />
+	                  <TypedText
+	                    v-else-if="segment.entry.kind === 'part' && segment.entry.part.kind === 'text' && isLiveTextPart(segment.entry.index, segment.entry.part.kind, message.parts)"
+	                    :text="segment.entry.part.text || ''"
+	                    :active="true"
+	                  />
+                  <div v-else-if="segment.entry.kind === 'part' && segment.entry.part.kind === 'text'">
                     <div
                       ref="mdBodyEl"
                       class="md-body"
-                      v-html="renderMd(textPartForRender(entry.part))"
+                      v-html="renderMd(textPartForRender(segment.entry.part))"
                       @click="onMarkdownClick"
                     ></div>
                     <button
-                      v-if="textPartTruncated(entry.part) && !textPartExpanded(entry.index)"
+                      v-if="textPartTruncated(segment.entry.part) && !textPartExpanded(segment.entry.index)"
                       class="md-expand-btn"
-                      @click.stop="expandTextPart(entry.index)"
-                    >展开全文 ({{ textPartFullLen(entry.part) }} 字)</button>
+                      @click.stop="expandTextPart(segment.entry.index)"
+                    >展开全文 ({{ textPartFullLen(segment.entry.part) }} 字)</button>
                   </div>
                 </template>
               </template>
@@ -1674,11 +1738,11 @@ function findPrecedingUserMessageId(): number {
   min-width: 0;
 }
 .msg.user .bubble {
-  background: var(--brand-50);
+  background: var(--user-bubble-bg, color-mix(in srgb, var(--brand-500) 10%, var(--surface-1)));
   color: var(--text-primary);
-  padding: 8px 12px;
-  border-radius: 14px 14px 4px 14px;
-  border: 1px solid var(--brand-100);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
+  border: 1px solid var(--user-bubble-border, color-mix(in srgb, var(--brand-500) 16%, var(--border-subtle)));
   box-shadow: none;
   max-width: 80%;
   font-size: 13.5px;
@@ -1699,7 +1763,7 @@ function findPrecedingUserMessageId(): number {
   padding: 0 2px;
   font-size: 14px;
   line-height: 1.65;
-  letter-spacing: -0.005em;
+  letter-spacing: 0;
 }
 .msg.tool .bubble {
   background: var(--surface-2);
@@ -1776,12 +1840,44 @@ function findPrecedingUserMessageId(): number {
 .msg.user .bubble--attachments .user-message-caption {
   align-self: flex-end;
   padding: var(--space-2) var(--space-3);
-  background: var(--brand-50);
+  background: var(--user-bubble-bg, color-mix(in srgb, var(--brand-500) 10%, var(--surface-1)));
   color: var(--text-primary);
-  border: 1px solid var(--brand-100);
-  border-radius: 14px 14px 4px 14px;
+  border: 1px solid var(--user-bubble-border, color-mix(in srgb, var(--brand-500) 16%, var(--border-subtle)));
+  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
   font-size: 13.5px;
   line-height: 1.55;
+}
+
+/* Quiet process panel — tool / skill / sub-agent share one
+ * surface as flat rows. Thinking renders independently. */
+.event-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: var(--space-2) 0;
+  padding: 0;
+  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+}
+.event-timeline > :deep(.tool-card),
+.event-timeline > :deep(.skill-card),
+.event-timeline > :deep(.sub-agent-card),
+.event-timeline > :deep(.tool-group) {
+  margin: 0;
+}
+.event-timeline > :deep(.tool-card + .tool-card),
+.event-timeline > :deep(.skill-card + .skill-card),
+.event-timeline > :deep(.tool-card + .skill-card),
+.event-timeline > :deep(.skill-card + .tool-card),
+.event-timeline > :deep(.tool-card + .sub-agent-card),
+.event-timeline > :deep(.sub-agent-card + .tool-card),
+.event-timeline > :deep(.skill-card + .sub-agent-card),
+.event-timeline > :deep(.sub-agent-card + .skill-card),
+.event-timeline > :deep(.sub-agent-card + .sub-agent-card) {
+  border-top: 1px solid var(--border-subtle);
 }
 
 /* "展开全文" affordance for truncated text parts. */
@@ -2017,9 +2113,11 @@ function findPrecedingUserMessageId(): number {
 }
 .media-thumbnail {
   position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: stretch;
+  justify-content: stretch;
+  gap: var(--space-1);
   width: 100%;
   min-width: 0;
   aspect-ratio: 4 / 3;
@@ -2054,15 +2152,54 @@ function findPrecedingUserMessageId(): number {
   display: block;
   width: 100%;
   height: 100%;
+  min-height: 0;
   border-radius: var(--radius-md);
   background: var(--surface-2);
 }
 .msg-image { object-fit: contain; }
 .msg-video { object-fit: cover; }
+.media-thumbnail-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-1) var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+.media-thumbnail-name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  flex: 1;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.3;
+}
+.media-thumbnail-name svg {
+  flex-shrink: 0;
+  color: var(--brand-600);
+}
+.media-thumbnail-name span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.media-thumbnail-meta {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.3;
+}
 .media-thumbnail-hint {
   position: absolute;
   left: var(--space-2);
-  bottom: var(--space-2);
+  top: var(--space-2);
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);

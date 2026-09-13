@@ -1,0 +1,202 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import test from 'node:test'
+
+test('tool confirm uses the shared modal chrome', () => {
+  const source = readFileSync(new URL('../src/components/ToolConfirmModal.vue', import.meta.url), 'utf8')
+
+  assert.match(source, /import AppModal from '\.\/AppModal\.vue'/)
+  assert.match(source, /<AppModal[\s\S]*:mask-closable="false"[\s\S]*:close-on-esc="false"/)
+  assert.doesNotMatch(source, /<NModal/)
+  assert.doesNotMatch(source, /style="width:/)
+})
+
+test('tool drawer follows icon and token discipline', () => {
+  const source = readFileSync(new URL('../src/components/ToolListDrawer.vue', import.meta.url), 'utf8')
+
+  assert.doesNotMatch(source, /from 'lucide-vue-next'/)
+  assert.match(source, /from '\.\/icons'/)
+  assert.doesNotMatch(source, /var\(--danger|var\(--error-bg|var\(--error-border|var\(--error-text/)
+  assert.doesNotMatch(source, /#[0-9A-Fa-f]{3,8}/)
+})
+
+test('project choices live only in the project switcher popover', () => {
+  const sidebar = readFileSync(new URL('../src/components/SessionSidebar.vue', import.meta.url), 'utf8')
+  const switcher = readFileSync(new URL('../src/components/ProjectSwitcher.vue', import.meta.url), 'utf8')
+
+  assert.match(sidebar, /<ProjectSwitcher[\s\S]*@add-project=/)
+  assert.doesNotMatch(sidebar, /project-quick|visibleProjectTabs|allProjectTabs|projectRailLabel|onProjectChange/)
+  assert.doesNotMatch(sidebar, /role="tablist"[\s\S]*aria-label="项目/)
+
+  assert.match(switcher, /<NPopover/)
+  assert.match(switcher, /role="listbox" aria-label="项目列表"/)
+  assert.match(switcher, /新建项目/)
+  assert.match(switcher, /class="switcher-row" @click="onAddProject"/)
+  assert.doesNotMatch(switcher, /class="switcher-add"/)
+  assert.match(switcher, /全局会话/)
+  assert.match(switcher, /v-for="p in filteredProjects"/)
+  assert.match(switcher, /projectMeta\(p\)/)
+  assert.match(switcher, /hasProjectStatus\(p\)/)
+  assert.match(switcher, /row-status-dot/)
+  assert.match(switcher, /activePathMeta/)
+  assert.match(switcher, /activeBranch/)
+  assert.match(switcher, /switcher-status-dot/)
+})
+
+test('top bar shows optional project context without hardcoded colours', () => {
+  const source = readFileSync(new URL('../src/components/TopBar.vue', import.meta.url), 'utf8')
+
+  assert.match(source, /activeProject/)
+  assert.match(source, /projectMetaItems/)
+  assert.match(source, /p\.branch/)
+  assert.match(source, /typeof p\.dirty === 'boolean'/)
+  assert.match(source, /project-meta-chip--branch/)
+  assert.match(source, /project-meta-chip--clean/)
+  assert.match(source, /project-meta-chip--dirty/)
+  assert.match(source, /toggleInspector/)
+  assert.doesNotMatch(source, /openExplorer|openTerminal|ToolListDrawer|StyleGenModal|showStyleGen|showToolList|copyTrace/)
+  assert.doesNotMatch(source, /#[0-9A-Fa-f]{3,8}/)
+})
+
+test('app rail keeps labelled primary navigation in the fixed rail', () => {
+  const source = readFileSync(new URL('../src/components/AppRail.vue', import.meta.url), 'utf8')
+  const sidebar = readFileSync(new URL('../src/components/SessionSidebar.vue', import.meta.url), 'utf8')
+  const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
+
+  assert.match(source, /width: var\(--rail-width\)/)
+  for (const label of ['全局', '项目', '设置']) {
+    assert.match(source, new RegExp(`<span class="rail-label">${label}</span>`))
+  }
+  for (const label of ['文件', '终端', '插件']) {
+    assert.doesNotMatch(source, new RegExp(`<span class="rail-label">${label}</span>`))
+  }
+  assert.match(source, /<Info :size="18" \/>/)
+  assert.match(source, /emit\('add-project'\)/)
+  assert.match(source, /title="新建项目"/)
+  assert.match(source, /<Plus :size="18" \/>/)
+  assert.match(app, /@add-project="openAddProject"/)
+  assert.doesNotMatch(source, /User :size|User,/)
+  assert.doesNotMatch(source, /openExplorer|openTerminal|FolderOpen|Terminal|Puzzle/)
+  assert.doesNotMatch(sidebar, /actionOption\('add-project'|'添加项目'/)
+  assert.doesNotMatch(sidebar, /Footer user card: app version \+ settings/)
+  assert.doesNotMatch(sidebar, /:title="'设置'"[\s\S]*Settings :size="14"/)
+})
+
+test('inspector uses light tab chrome and exposes an in-panel close action', () => {
+  const inspector = readFileSync(new URL('../src/components/InspectorPanel.vue', import.meta.url), 'utf8')
+  const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
+
+  assert.match(inspector, /class="tab-list" role="tablist"/)
+  assert.match(inspector, /class="inspector-close"/)
+  assert.match(inspector, /@click="emit\('close'\)"/)
+  assert.match(inspector, /\.tab::after/)
+  assert.match(inspector, /\.tab--active::after/)
+  assert.match(inspector, /\.section\s*\{[\s\S]*border: 1px solid var\(--border-subtle\)/)
+  assert.match(inspector, /class="path-copy-btn"/)
+  assert.match(inspector, /\.path-copy-btn\s*\{[\s\S]*background: var\(--surface-1\)/)
+  assert.match(inspector, /ToolListDrawer/)
+  assert.match(inspector, /StyleGenModal/)
+  assert.match(inspector, /class="panel-action-grid"/)
+  assert.match(inspector, /复制 Trace/)
+  assert.match(inspector, /工具列表/)
+  assert.match(inspector, /生成风格/)
+  assert.match(inspector, /打开目录/)
+  assert.match(inspector, /打开终端/)
+  assert.doesNotMatch(inspector, /class="action-btn"|打开文件夹|>设置</)
+  assert.doesNotMatch(inspector, /text-transform: uppercase/)
+  assert.doesNotMatch(inspector, /\.tab--active\s*\{[^}]*background:\s*color-mix/)
+  assert.match(app, /@close="inspectorOpen = false"/)
+})
+
+test('new project modal matches project-aware workflow without fake controls', () => {
+  const source = readFileSync(new URL('../src/components/SessionSidebar.vue', import.meta.url), 'utf8')
+
+  assert.match(source, /title="新建项目"/)
+  assert.match(source, /size="md"/)
+  assert.match(source, /label for="add-project-path"[\s\S]*项目路径/)
+  assert.match(source, /label for="add-project-name"[\s\S]*项目名称/)
+  assert.match(source, /仅登记本地目录，不修改项目文件/)
+  assert.match(source, /新建项目<\/NButton>/)
+  assert.doesNotMatch(source, /加载 AGENTS\.md[\s\S]*NCheckbox/)
+  assert.doesNotMatch(source, /初始化工作区[\s\S]*NCheckbox/)
+})
+
+test('message process timeline stays light and thinking remains separate', () => {
+  const bubble = readFileSync(new URL('../src/components/MessageBubble.vue', import.meta.url), 'utf8')
+  const toolGroup = readFileSync(new URL('../src/components/ToolCallGroup.vue', import.meta.url), 'utf8')
+  const toolCard = readFileSync(new URL('../src/components/ToolCallCard.vue', import.meta.url), 'utf8')
+
+  assert.match(bubble, /<ThinkingBlock/)
+  assert.match(bubble, /class="event-timeline"/)
+  assert.match(bubble, /background: color-mix\(in srgb, var\(--surface-1\) 92%, transparent\)/)
+  assert.match(bubble, /\.msg\.assistant \.bubble\s*\{[^}]*letter-spacing: 0;/)
+  assert.match(toolGroup, /background: color-mix\(in srgb, var\(--surface-2\) 42%, transparent\)/)
+  assert.match(toolCard, /\.tool-section-label\s*\{[^}]*letter-spacing: 0;/)
+})
+
+test('tool cards with details can always be collapsed manually', () => {
+  const card = readFileSync(new URL('../src/components/ToolCallCard.vue', import.meta.url), 'utf8')
+
+  assert.match(card, /const canToggleDetails = computed/)
+  assert.match(card, /if \(!canToggleDetails\.value\) return false/)
+  assert.match(card, /if \(!userToggled\.value\) return !shouldFoldResult\.value/)
+  assert.match(card, /foldable: canToggleDetails/)
+  assert.match(card, /v-if="canToggleDetails"/)
+  assert.doesNotMatch(card, /if \(!shouldFoldResult\.value\) return true/)
+  assert.doesNotMatch(card, /if \(!shouldFoldResult\.value\) return\s*$/m)
+})
+
+test('message and tool media use neutral attachment cards', () => {
+  const bubble = readFileSync(new URL('../src/components/MessageBubble.vue', import.meta.url), 'utf8')
+  const toolGroup = readFileSync(new URL('../src/components/ToolCallGroup.vue', import.meta.url), 'utf8')
+  const toolCard = readFileSync(new URL('../src/components/ToolCallCard.vue', import.meta.url), 'utf8')
+
+  assert.match(bubble, /class="media-thumbnail-footer"/)
+  assert.match(bubble, /class="media-thumbnail-name"/)
+  assert.match(bubble, /\.media-thumbnail\s*\{[\s\S]*grid-template-rows: minmax\(0, 1fr\) auto;/)
+  assert.match(bubble, /\.media-thumbnail-footer\s*\{[\s\S]*border-top: 1px solid var\(--border-subtle\)/)
+  assert.match(toolCard, /\.generated-asset-preview\s*\{[\s\S]*aspect-ratio: 16 \/ 9;/)
+  assert.match(toolCard, /\.generated-asset-footer\s*\{[\s\S]*background: color-mix\(in srgb, var\(--surface-1\) 92%, transparent\)/)
+  assert.match(toolGroup, /const hasMediaResult = computed/)
+  assert.match(toolGroup, /if \(!userToggled\.value\) return hasRunning\.value \|\| hasMediaResult\.value/)
+})
+
+test('responsive shell collapses optional inspector before crowding composer', () => {
+  const style = readFileSync(new URL('../src/style.css', import.meta.url), 'utf8')
+  const inspector = readFileSync(new URL('../src/components/InspectorPanel.vue', import.meta.url), 'utf8')
+
+  assert.match(style, /--sidebar-default-width: clamp\(232px, calc\(\(100vw - var\(--rail-width\)\) \/ 5\), 340px\);/)
+  assert.match(style, /--sidebar-width:\s+var\(--sidebar-user-width, var\(--sidebar-default-width\)\);/)
+  assert.match(style, /--inspector-default-width: clamp\(232px, calc\(\(100vw - var\(--rail-width\)\) \/ 5\), 320px\);/)
+  assert.match(style, /@media \(max-width: 1040px\)[\s\S]*--sidebar-width: min\(var\(--sidebar-user-width, var\(--sidebar-default-width\)\), 300px\);[\s\S]*--inspector-width: 0px;/)
+  assert.match(inspector, /\.inspector\s*\{[\s\S]*overflow: hidden;/)
+  assert.match(inspector, /@media \(max-width: 1040px\)[\s\S]*border-left-color: transparent;/)
+})
+
+test('left session sidebar can be resized and reset to the 1:3:1 default', () => {
+  const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
+
+  assert.match(app, /SIDEBAR_WIDTH_KEY = 'pchat-sidebar-width'/)
+  assert.match(app, /class="sidebar-resize-handle"/)
+  assert.match(app, /startSidebarResize/)
+  assert.match(app, /resetSidebarWidth/)
+  assert.match(app, /--sidebar-user-width/)
+  assert.match(app, /title="拖动调整聊天记录宽度，双击恢复 1:3:1"/)
+})
+
+test('sub-agent rows keep type visible without duplicate run-mode badges', () => {
+  const card = readFileSync(new URL('../src/components/SubAgentCard.vue', import.meta.url), 'utf8')
+  const jobs = readFileSync(new URL('../src/components/SubAgentJobsPanel.vue', import.meta.url), 'utf8')
+
+  assert.match(card, /class="sub-agent-meta"/)
+  assert.match(card, /const agentMetaLabel = computed/)
+  assert.match(card, /frontend_agent|agentLabel\.value/)
+  assert.match(card, /runModeShortLabel/)
+  assert.doesNotMatch(card, /class="sub-icon"/)
+  assert.doesNotMatch(card, /class="sub-type-badge"/)
+  assert.doesNotMatch(card, /class="sub-run-mode"/)
+  assert.doesNotMatch(card, />后台子代理</)
+  assert.match(jobs, /class="job-type-text"/)
+  assert.doesNotMatch(jobs, /job-type-label/)
+  assert.doesNotMatch(jobs, />类型<\/span>/)
+})

@@ -156,7 +156,7 @@ const sizeMap: Record<Size, number> = {
   font-size: 15px;
   font-weight: 650;
   color: var(--text-primary);
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   line-height: 1.3;
 }
 .app-modal-close {

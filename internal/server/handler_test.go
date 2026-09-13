@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -402,6 +403,31 @@ func TestCreateSession_ReuseEmptyNormalizesProjectPath(t *testing.T) {
 	}
 	if second.ID != first.ID {
 		t.Fatalf("second id = %q, want reused %q", second.ID, first.ID)
+	}
+}
+
+func TestSearchMessages_ProjectParamFiltersCurrentProject(t *testing.T) {
+	s, _ := newTestServer(t)
+	projectAPath := filepath.Join(t.TempDir(), "project-a")
+	projectBPath := filepath.Join(t.TempDir(), "project-b")
+
+	global := createSessionPOST(t, s, "")
+	projectA, _ := postSessionBody(t, s, map[string]any{"project_path": projectAPath})
+	projectB, _ := postSessionBody(t, s, map[string]any{"project_path": projectBPath})
+	s.handler.store.AddChatMessageTo(global.ID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from global"})
+	s.handler.store.AddChatMessageTo(projectA.ID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from project a"})
+	s.handler.store.AddChatMessageTo(projectB.ID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from project b"})
+	if err := s.handler.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	projectResults := searchMessagesBody(t, s, "needle", projectAPath)
+	if len(projectResults) != 1 || projectResults[0].ConversationID != projectA.ID {
+		t.Fatalf("project search = %+v, want only %s", projectResults, projectA.ID)
+	}
+	globalResults := searchMessagesBody(t, s, "needle", "")
+	if len(globalResults) != 1 || globalResults[0].ConversationID != global.ID {
+		t.Fatalf("global search = %+v, want only %s", globalResults, global.ID)
 	}
 }
 
@@ -1416,6 +1442,27 @@ func postSessionBody(t *testing.T, s *Server, body map[string]any) (SessionRespo
 		_ = json.NewDecoder(w.Body).Decode(&out)
 	}
 	return out, w.Code
+}
+
+func searchMessagesBody(t *testing.T, s *Server, q, projectPath string) []memory.SearchResult {
+	t.Helper()
+	values := url.Values{}
+	values.Set("q", q)
+	values.Set("limit", "10")
+	values.Set("project_path", projectPath)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/search?"+values.Encode(), nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("search status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Results []memory.SearchResult `json:"results"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	return body.Results
 }
 
 func getSessionBody(t *testing.T, s *Server, id string) (SessionResponse, int) {

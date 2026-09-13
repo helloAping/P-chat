@@ -43,9 +43,9 @@ import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
 import { checkUpdate, downloadUpdate, installDownloadedUpdate, SOFTWARE_RELEASE_PAGE } from '../api/update'
 import type { UpdateArtifact, UpdateDownloadResult, UpdateInfo } from '../api/update'
 import type { SearchResult, Session } from '../api/client'
-import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
-import BrandLogo from './BrandLogo.vue'
+import ProjectSwitcher from './ProjectSwitcher.vue'
+import TokenStatsModal from './TokenStatsModal.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import { displaySessionTitle, sessionSourceFromID } from '../im/sessionSource'
 import {
@@ -242,11 +242,12 @@ function actionOption(
 }
 
 const menuOptions = computed<DropdownOption[]>(() => [
-  actionOption('add-project', '添加项目', Plus),
   ...(state.activeProjectPath
-    ? [actionOption('remove-project', '移除当前项目', XIcon)]
+    ? [
+        actionOption('remove-project', '移除当前项目', XIcon),
+        { type: 'divider' as const, key: 'project-divider' },
+      ]
     : []),
-  { type: 'divider' as const, key: 'project-divider' },
   actionOption('token-stats', 'Token 用量', BarChart3),
   actionOption('settings', '设置', Settings),
   { type: 'divider' as const, key: 'd1' },
@@ -263,7 +264,6 @@ const actionMenuProps: DropdownMenuProps = () => ({
 
 function handleMenuSelect(key: string) {
   switch (key) {
-    case 'add-project': showAddProject.value = true; break
     case 'remove-project': {
       if (state.activeProjectPath) showConfirmDeleteProject.value = true
       break
@@ -290,7 +290,7 @@ function doSearch() {
     return
   }
   searchLoading.value = true
-  api.searchMessages(q, 15).then(
+  api.searchMessages(q, 15, state.activeProjectPath).then(
     r => { searchResults.value = r.results; searchLoading.value = false },
     () => { searchLoading.value = false },
   )
@@ -629,10 +629,6 @@ async function confirmRename() {
   renameTitle.value = ''
 }
 
-async function onProjectChange(path: string) {
-  await setActiveProject(path)
-}
-
 async function onAddProject() {
   if (!validateProjectForm()) return
   try {
@@ -715,21 +711,6 @@ function basenameFromPath(path: string) {
   return parts[parts.length - 1] || '新项目'
 }
 
-function compactProjectPath(path: string, maxSegments = 3) {
-  const value = path.trim()
-  const parts = value.split(/[\\/]+/).filter(Boolean)
-  if (parts.length <= maxSegments) return value
-  return `...\\${parts.slice(-maxSegments).join('\\')}`
-}
-
-function projectRailLabel(name: string) {
-  const value = name.trim()
-  if (!value) return '?'
-  const ascii = value.match(/[A-Za-z0-9]+/g)
-  if (ascii?.length) return ascii[0].slice(0, 2).toUpperCase()
-  return Array.from(value).slice(0, 2).join('')
-}
-
 async function onRemoveProject(path: string) {
   try {
     await api.removeProject(path)
@@ -743,26 +724,6 @@ async function onRemoveProject(path: string) {
   } catch (e: any) {
     message.error(e.message || '移除失败')
   }
-}
-
-type ProjectTab = { name: string; path: string; shortPath: string }
-
-const allProjectTabs = computed<ProjectTab[]>(() => [
-  { name: '全局', path: '', shortPath: '所有未绑定目录的会话' },
-  ...state.projects.map(p => ({
-    name: p.name,
-    path: p.path,
-    shortPath: compactProjectPath(p.path, 2),
-  })),
-])
-
-const activeProjectTab = computed<ProjectTab>(() =>
-  allProjectTabs.value.find(p => p.path === state.activeProjectPath) || allProjectTabs.value[0],
-)
-
-function projectHasStreaming(path: string): boolean {
-  const sessions = state.projectSessions[path] || (path === state.activeProjectPath ? state.sessions : [])
-  return sessions.some(s => !!state.streaming[s.id])
 }
 
 const hasUpdateBlockingWork = computed(() =>
@@ -1007,6 +968,22 @@ function openAbout() {
   void refreshUpdate()
 }
 
+const projectSwitcherRef = ref<InstanceType<typeof ProjectSwitcher> | null>(null)
+
+function openProjectSwitcher() {
+  projectSwitcherRef.value?.open()
+}
+
+function openAddProject() {
+  showAddProject.value = true
+}
+
+defineExpose({
+  openProjectSwitcher,
+  openAddProject,
+  openAbout,
+})
+
 onMounted(() => {
   void refreshUpdate(false, true)
 })
@@ -1014,63 +991,13 @@ onMounted(() => {
 
 <template>
   <aside class="sidebar">
-    <nav class="project-rail" aria-label="项目">
-      <button
-        type="button"
-        class="rail-brand"
-        title="关于 P-Chat"
-        aria-label="关于 P-Chat"
-        @click="openAbout"
-      >
-        <BrandLogo :size="28" />
-      </button>
-
-      <div class="project-tabs" role="tablist" aria-label="项目列表">
-        <button
-          v-for="project in allProjectTabs"
-          :key="project.path || '__global__'"
-          type="button"
-          class="project-tab"
-          :class="{ 'project-tab--active': project.path === state.activeProjectPath }"
-          :title="project.path || project.shortPath"
-          :aria-label="project.path ? `切换到项目 ${project.name}` : '切换到全局会话'"
-          :aria-current="project.path === state.activeProjectPath ? 'page' : undefined"
-          @click="onProjectChange(project.path)"
-        >
-          <Globe v-if="!project.path" :size="17" />
-          <span v-else class="project-tab-label">{{ projectRailLabel(project.name) }}</span>
-          <span
-            v-if="projectHasStreaming(project.path)"
-            class="project-tab-running"
-            aria-label="运行中"
-          />
-        </button>
-      </div>
-
-      <button
-        type="button"
-        class="project-add-tab"
-        title="添加项目"
-        aria-label="添加项目"
-        @click="showAddProject = true"
-      >
-        <Plus :size="18" />
-      </button>
-    </nav>
-
     <section class="session-panel" aria-label="会话">
-      <!-- Current project summary + theme / app actions. -->
+      <!-- Project switcher + theme / app actions. -->
       <div class="sidebar-header">
-        <div class="project-summary" :title="activeProjectTab.path || activeProjectTab.shortPath">
-          <span class="project-summary-icon">
-            <Globe v-if="!activeProjectTab.path" :size="16" />
-            <Folder v-else :size="16" />
-          </span>
-          <span class="project-summary-copy">
-            <span class="project-summary-name">{{ activeProjectTab.name }}</span>
-            <span class="project-summary-path">{{ activeProjectTab.shortPath }}</span>
-          </span>
-        </div>
+        <ProjectSwitcher
+          ref="projectSwitcherRef"
+          @add-project="showAddProject = true"
+        />
         <div class="sidebar-actions">
           <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'" aria-label="切换主题">
             <component :is="themeName === 'dark' ? Sun : Moon" :size="16" />
@@ -1213,7 +1140,7 @@ onMounted(() => {
         </div>
       </NScrollbar>
 
-      <!-- Footer user card: app version + settings. -->
+      <!-- Footer brand card: app version + About. Settings lives in AppRail. -->
       <div class="user-card">
         <button
           class="user-card-brand"
@@ -1227,15 +1154,6 @@ onMounted(() => {
             <span class="user-card-version">v{{ APP_VERSION }}</span>
           </span>
         </button>
-        <NButton
-          size="small"
-          quaternary
-          :title="'设置'"
-          :aria-label="'设置'"
-          @click="emit('open-settings')"
-        >
-          <Settings :size="14" />
-        </NButton>
       </div>
     </section>
 
@@ -1243,34 +1161,21 @@ onMounted(() => {
 
     <AppModal
       v-model:show="showAddProject"
-      title="添加项目"
-      size="sm"
+      title="新建项目"
+      size="md"
     >
       <div class="add-project-form">
         <p class="add-project-lead">
-          登记本地文件夹后，会话会按项目分组，方便切换工作区。
+          选择一个本地项目根目录，后续会话会自动归入该项目空间。
         </p>
         <div class="form-field">
-          <label for="add-project-name">项目名称</label>
-          <NInput
-            id="add-project-name"
-            v-model:value="newProjectName"
-            size="small"
-            placeholder="例如：我的项目"
-            :status="projectNameError ? 'error' : undefined"
-            @update:value="projectNameError = ''"
-            @keyup.enter="onAddProject"
-          />
-          <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
-        </div>
-        <div class="form-field">
-          <label for="add-project-path">项目目录</label>
+          <label for="add-project-path">项目路径</label>
           <div class="path-row">
             <NInput
               id="add-project-path"
               v-model:value="newProjectPath"
               size="small"
-              placeholder="例如：D:\projects\my-app"
+              placeholder="例如：D:\Workspace\P-Chat"
               class="path-input"
               :status="projectPathError ? 'error' : undefined"
               @update:value="projectPathError = ''"
@@ -1292,10 +1197,33 @@ onMounted(() => {
           <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
           <p v-else class="field-hint">选择项目的根目录（含源代码的那一层）</p>
         </div>
+        <div class="form-field">
+          <label for="add-project-name">项目名称</label>
+          <NInput
+            id="add-project-name"
+            v-model:value="newProjectName"
+            size="small"
+            placeholder="输入项目名称"
+            :status="projectNameError ? 'error' : undefined"
+            @update:value="projectNameError = ''"
+            @keyup.enter="onAddProject"
+          />
+          <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
+        </div>
+        <div class="project-create-notes" aria-label="项目创建说明">
+          <div class="project-create-note">
+            <Circle :size="8" />
+            <span>仅登记本地目录，不修改项目文件</span>
+          </div>
+          <div class="project-create-note">
+            <Circle :size="8" />
+            <span>存在 AGENTS.md 时，会在项目会话中作为上下文读取</span>
+          </div>
+        </div>
       </div>
       <template #footer>
         <NButton size="small" quaternary @click="showAddProject = false">取消</NButton>
-        <NButton size="small" type="primary" @click="onAddProject">添加</NButton>
+        <NButton size="small" type="primary" @click="onAddProject">新建项目</NButton>
       </template>
     </AppModal>
 
@@ -1487,7 +1415,7 @@ onMounted(() => {
 
 <style scoped>
 .sidebar {
-  width: 320px;
+  width: var(--sidebar-width);
   min-width: 0;
   background: var(--surface-1);
   border-right: 1px solid var(--border-subtle);
@@ -1503,97 +1431,6 @@ onMounted(() => {
   pointer-events: none;
 }
 
-/* --- Project rail ------------------------------------------------------ */
-.project-rail {
-  width: 56px;
-  flex: 0 0 56px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-2);
-  background: var(--surface-0);
-  border-right: 1px solid var(--border-subtle);
-}
-.rail-brand,
-.project-tab,
-.project-add-tab {
-  width: 36px;
-  height: 36px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition:
-    background var(--dur-fast) var(--ease-out),
-    border-color var(--dur-fast) var(--ease-out),
-    color var(--dur-fast) var(--ease-out),
-    transform var(--dur-fast) var(--ease-out);
-}
-.rail-brand:hover,
-.project-tab:hover,
-.project-add-tab:hover {
-  background: var(--surface-2);
-  color: var(--text-primary);
-}
-.rail-brand {
-  color: var(--text-primary);
-}
-.project-tabs {
-  width: 100%;
-  min-height: 0;
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  overflow-y: auto;
-  padding: var(--space-1) 0;
-}
-.project-tabs::before {
-  content: '';
-  width: 24px;
-  height: 1px;
-  flex: 0 0 1px;
-  background: var(--border-subtle);
-  margin-bottom: var(--space-1);
-}
-.project-tab--active {
-  background: color-mix(in srgb, var(--brand-50) 70%, transparent);
-  border-color: color-mix(in srgb, var(--brand-500) 28%, transparent);
-  color: var(--brand-600);
-  box-shadow: inset 2px 0 0 0 var(--brand-500);
-}
-.project-tab-label {
-  max-width: 28px;
-  overflow: hidden;
-  color: inherit;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-.project-tab-running {
-  width: 6px;
-  height: 6px;
-  position: absolute;
-  right: 5px;
-  top: 5px;
-  border-radius: var(--radius-pill);
-  background: var(--brand-500);
-  box-shadow: 0 0 0 2px var(--surface-0);
-}
-.project-add-tab {
-  flex: 0 0 36px;
-  color: var(--text-tertiary);
-}
-
 /* --- Session panel + header ------------------------------------------- */
 .session-panel {
   min-width: 0;
@@ -1603,59 +1440,13 @@ onMounted(() => {
   background: var(--surface-1);
 }
 .sidebar-header {
-  padding: 10px 12px;
+  padding: var(--space-3);
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: stretch;
   gap: var(--space-2);
   flex-shrink: 0;
-}
-.project-summary {
-  min-width: 0;
-  flex: 1 1 auto;
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 2px 0;
-}
-.project-summary-icon {
-  width: 28px;
-  height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 28px;
-  border-radius: var(--radius-md);
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  color: var(--text-secondary);
-}
-.project-summary-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-.project-summary-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.25;
-  letter-spacing: -0.01em;
-}
-.project-summary-path {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-tertiary);
-  font-size: 11px;
-  font-family: var(--font-mono);
-  line-height: 1.25;
+  border-bottom: 1px solid var(--border-subtle);
 }
 .sidebar-actions {
   flex: 0 0 auto;
@@ -1671,7 +1462,7 @@ onMounted(() => {
 
 /* --- Search bar -------------------------------------------------------- */
 .search-bar {
-  padding: 6px 10px;
+  padding: var(--space-3) var(--space-3) var(--space-2);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
 }
@@ -1679,7 +1470,7 @@ onMounted(() => {
 
 /* --- New session CTA (top, full width) -------------------------------- */
 .new-session-bar {
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-2) var(--space-3) var(--space-3);
   flex-shrink: 0;
 }
 .new-session-btn {
@@ -1690,22 +1481,26 @@ onMounted(() => {
   gap: var(--space-2);
   padding: var(--space-2) var(--space-3);
   min-height: var(--control-height);
-  background: var(--brand-500);
-  color: var(--on-brand);
-  border: 1px solid var(--brand-500);
+  /* Calm outline CTA — avoid large saturated brand fill */
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
 }
 .new-session-btn:hover {
-  background: var(--brand-600);
-  border-color: var(--brand-600);
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
+  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
+  color: var(--brand-600);
 }
 .new-session-btn:active {
-  background: var(--brand-700);
-  border-color: var(--brand-700);
+  background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-2));
 }
 
 /* --- Session list (grouped) ------------------------------------------- */
@@ -1742,24 +1537,22 @@ onMounted(() => {
   border-radius: var(--radius-md);
   cursor: pointer;
   margin: 1px 0;
-  /* Selected indicator: 2px brand vertical bar drawn via
-   * box-shadow inset so we don't need to set border + offset
-   * the contents. The bar lives on the very left edge and
-   * runs the full height of the item. */
   transition: background var(--dur-fast) var(--ease-out);
 }
 .session-item:hover { background: var(--surface-3); }
 .session-item.active {
-  background: var(--surface-3);
-  box-shadow: inset 2px 0 0 0 var(--brand-500);
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-1));
+}
+.session-item.active:hover {
+  background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-1));
 }
 
 .item-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 8px 6px 10px;
-  min-height: 30px;
+  padding: var(--space-2) var(--space-3);
+  min-height: 36px;
 }
 .item-main {
   flex: 1;
@@ -1822,7 +1615,7 @@ onMounted(() => {
   font-size: 11px;
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
 }
 .session-item.active .item-time { color: var(--text-secondary); }
 .item-menu-btn {
@@ -1879,7 +1672,9 @@ onMounted(() => {
 /* --- Search results --------------------------------------------------- */
 .search-results { padding: 8px; }
 .search-result-item {
-  padding: 10px 12px; margin-bottom: 6px; border-radius: 6px;
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-sm);
   cursor: pointer; background: var(--surface-2); transition: background var(--dur-fast) var(--ease-out);
 }
 .search-result-item:hover { background: var(--surface-3); }
@@ -1904,6 +1699,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 1;
   background: transparent;
   border: none;
   padding: 4px 6px;
@@ -1937,14 +1733,10 @@ onMounted(() => {
 .add-project-form {
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-5);
 }
 .add-project-lead {
   margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--brand-50) 55%, var(--surface-2));
-  border: 1px solid var(--border-subtle);
   color: var(--text-secondary);
   font-size: 12.5px;
   line-height: 1.5;
@@ -1959,7 +1751,7 @@ onMounted(() => {
   color: var(--text-secondary);
   font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.01em;
+  letter-spacing: 0;
 }
 .form-field :deep(.n-input) {
   --n-height: var(--control-height);
@@ -1977,6 +1769,28 @@ onMounted(() => {
   flex-shrink: 0;
   height: var(--control-height) !important;
   padding: 0 var(--space-3);
+}
+.project-create-notes {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface-2) 82%, transparent);
+}
+.project-create-note {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.project-create-note svg {
+  flex: 0 0 auto;
+  color: var(--brand-500);
+  fill: currentColor;
 }
 .field-hint {
   margin: 0;
@@ -2094,7 +1908,7 @@ onMounted(() => {
 .about-name {
   font-size: 17px;
   font-weight: 650;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   margin: 0 0 2px;
   color: var(--text-primary);
 }

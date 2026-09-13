@@ -50,7 +50,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | 配置管理 | [`.agents/docs/config.md`](docs/config.md) |
 | CLI 终端 | [`.agents/docs/cli.md`](docs/cli.md) |
 | Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) |
-| **前端样式 / 设计 token** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md) |
+| **前端样式 / 设计 token / 主界面视觉** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md)（**已锁定 Project-Aware Calm Workbench，见 §0.5**） |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
 | 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
 | **IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [`.agents/docs/im.md`](docs/im.md) + [实现计划 `docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
@@ -97,7 +97,7 @@ D:\develop\project\P-chat\
 │   │   ├── config.md           #   配置管理
 │   │   ├── cli.md              #   CLI REPL
 │   │   ├── frontend.md         #   Vue 3 前端
-│   │   ├── frontend-design.md  #   设计 token + 组件样式规则 + 约束
+│   │   ├── frontend-design.md  #   设计 token + Calm Workbench 视觉规范（§0.5 已锁定）
 │   │   ├── infrastructure.md   #   基础设施模块
 │   │   ├── knowledge.md        #   知识库 / RAG
 │   │   ├── im.md               #   IM 桥接

@@ -429,10 +429,13 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 export const health = () => jsonFetch<{ status: string }>('/api/v1/health')
 
 // --- Search ---
-export const searchMessages = (q: string, limit = 20) =>
-  jsonFetch<SearchResponse>(
-    `/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`,
-  )
+export const searchMessages = (q: string, limit = 20, projectPath?: string) => {
+  const params = new URLSearchParams()
+  params.set('q', q)
+  params.set('limit', String(limit))
+  if (projectPath !== undefined) params.set('project_path', projectPath)
+  return jsonFetch<SearchResponse>(`/api/v1/search?${params.toString()}`)
+}
 
 // --- Sessions ---
 export const listSessions = (projectPath: string) =>
@@ -541,6 +544,8 @@ export const executePlan = (id: string, planText: string) =>
 export interface ProjectItem {
   name: string
   path: string
+  branch?: string
+  dirty?: boolean
 }
 
 export const listProjects = () =>

@@ -802,7 +802,7 @@ function resetDirty() { dirty.value = new Set() }
 
 async function onAddProvider() {
   if (!newName.value.trim() || !newProtocol.value || !isCompleteHTTPURL(newBaseURL.value)) {
-	message.warning('名称、协议和有效的 Base URL 为必填')
+    message.warning('名称、请求协议和有效的 Base URL 为必填')
     return
   }
   try {
@@ -1443,8 +1443,8 @@ function isBuiltIn(id: string) { return builtInStyles.has(id) }
 
 // protocol options reused in two places.
 const protocolOptions = [
-  { label: 'OpenAI 兼容', value: 'openai' },
-  { label: 'Anthropic (Claude)', value: 'anthropic' },
+  { label: 'OpenAI Chat', value: 'openai' },
+  { label: 'Anthropic Messages', value: 'anthropic' },
 ]
 
 const recognitionProviderOptions = computed(() =>
@@ -2292,14 +2292,14 @@ function kbModelSupportsVision(scanModel: string) {
                     <span class="settings-form-hint">本地唯一标识，可重命名</span>
                   </div>
                   <div class="settings-form-row">
-                    <label class="settings-form-label">协议</label>
+                    <label class="settings-form-label">请求协议</label>
                     <NSelect
                       v-model:value="editProtocol"
                       :options="protocolOptions"
                       size="small"
                       @update:value="markDirty('protocol')"
                     />
-                    <span class="settings-form-hint">选择请求与响应采用 OpenAI 兼容或 Anthropic 协议</span>
+                    <span class="settings-form-hint">选择 LLM 请求端点协议，不是 HTTP/HTTPS 网络协议。</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">Base URL</label>
@@ -2309,7 +2309,7 @@ function kbModelSupportsVision(scanModel: string) {
                       :placeholder="editProtocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
                       @update:value="markDirty('base_url')"
                     />
-                    <span class="settings-form-hint">供应商公共地址；实际请求地址由 Base URL 与各模型的 API 端点后缀拼接。</span>
+                    <span class="settings-form-hint">供应商公共网络地址；实际请求由 Base URL 与各模型的 API 端点后缀拼接。</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">API Key</label>
@@ -2435,14 +2435,14 @@ function kbModelSupportsVision(scanModel: string) {
           :mask-closable="false"
           @close="cancelAddProvider"
         >
-          <p class="modal-lead">选择协议并填写供应商公共 Base URL；模型创建时再配置请求端点后缀。</p>
+          <p class="modal-lead">选择 LLM 请求端点协议并填写供应商公共 Base URL；模型创建时再配置请求端点后缀。</p>
           <div class="settings-form settings-form--grid modal-form">
             <div class="settings-form-row">
               <label class="settings-form-label">名称 <span class="settings-required">*</span></label>
               <NInput v-model:value="newName" placeholder="例: openai / deepseek" size="small" />
             </div>
             <div class="settings-form-row">
-              <label class="settings-form-label">协议 <span class="settings-required">*</span></label>
+              <label class="settings-form-label">请求协议 <span class="settings-required">*</span></label>
               <NSelect
                 v-model:value="newProtocol"
                 :options="protocolOptions"
@@ -2456,7 +2456,7 @@ function kbModelSupportsVision(scanModel: string) {
                 :placeholder="newProtocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
                 size="small"
               />
-              <span class="settings-form-hint">例如火山方舟可填写到 /api/v3；模型端点只填写其后的相对路径。</span>
+              <span class="settings-form-hint">这里填写 http(s) 网络地址，例如火山方舟可填写到 /api/v3；模型端点只填写其后的相对路径。</span>
             </div>
             <div class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">API Key</label>
@@ -2699,7 +2699,7 @@ function kbModelSupportsVision(scanModel: string) {
                 </div>
                 <div class="style-usage-item">
                   <div class="style-usage-item-title">自动生成风格</div>
-                  <p>聊天页右上角有“生成风格”按钮，可根据当前对话总结出新的回复风格，也可以优化已有风格。</p>
+                  <p>聊天页右侧检查器的“会话操作”里有“生成风格”入口，可根据当前对话总结出新的回复风格，也可以优化已有风格。</p>
                 </div>
                 <div class="style-usage-item">
                   <div class="style-usage-item-title">备注会一起保存</div>

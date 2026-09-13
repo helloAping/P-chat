@@ -44,7 +44,7 @@ let requestSeq = 0
 const visibleJobs = computed(() => jobs.value.slice(0, 5))
 const activeJobs = computed(() => jobs.value.filter(isActiveJob))
 const hasJobs = computed(() => jobs.value.length > 0)
-const panelVisible = computed(() => (hasJobs.value || error.value) && !dismissed.value)
+const panelVisible = computed(() => hasJobs.value && !dismissed.value)
 const summaryText = computed(() => {
   if (activeJobs.value.length > 0) return `${activeJobs.value.length} 个任务运行中`
   if (jobs.value.length > 0) return `${jobs.value.length} 个最近任务`
@@ -432,7 +432,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="job-meta">
               <span>{{ statusLabel(job.status) }}</span>
-              <span v-if="job.subagent_type">{{ job.subagent_type }}</span>
+              <span v-if="job.subagent_type" class="job-type-text">{{ job.subagent_type }}</span>
               <span v-if="job.model">{{ job.model }}</span>
               <span v-if="latestProgress(job)">{{ latestProgress(job) }}</span>
               <span v-if="formatTime(job.created_at)">{{ formatTime(job.created_at) }}</span>
@@ -645,6 +645,14 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.job-meta .job-type-text {
+  display: inline-block;
+  max-width: 120px;
+  color: var(--brand-600);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
 }
 
 .spinning {

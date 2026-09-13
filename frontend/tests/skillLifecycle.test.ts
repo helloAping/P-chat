@@ -24,9 +24,10 @@ test('Skill lifecycle has a structured part and an explicit visible name', () =>
 
   assert.match(store, /case 'skill'/)
   assert.match(store, /kind: 'skill'/)
-  assert.match(card, /当前调用 Skill：<span>\{\{ part\.name \}\}<\/span>/)
+  assert.match(card, /<span class="skill-label">当前调用 Skill<\/span>/)
+  assert.match(card, /<span class="skill-name">\{\{ part\.name \}\}<\/span>/)
   assert.match(client, /status: 'start' \| 'ready' \| 'error'/)
-  assert.match(bubble, /<SkillCallCard v-else-if="entry\.part\.kind === 'skill'"/)
+  assert.match(bubble, /<SkillCallCard[\s\S]*v-if="entry\.part\.kind === 'skill'"/)
 })
 
 test('Skill client can import an external package or collection directory', () => {
