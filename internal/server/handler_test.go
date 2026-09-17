@@ -26,6 +26,7 @@ import (
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
+	"github.com/p-chat/pchat/runtimeprofile"
 )
 
 // streamRecorder wraps httptest.ResponseRecorder with a CloseNotify
@@ -148,6 +149,77 @@ func TestHealth(t *testing.T) {
 	}
 	if body["status"] != "ok" {
 		t.Errorf("status = %v, want ok", body["status"])
+	}
+}
+
+func TestHealthIdentifiesRuntimeProfileAndInstance(t *testing.T) {
+	s, _ := newTestServer(t)
+	profile, err := runtimeprofile.Resolve(filepath.Join(t.TempDir(), ".p-chat"), "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Handler().SetRuntimeIdentity(profile, "instance-test")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var body struct {
+		Status      string `json:"status"`
+		ProfileID   string `json:"profile_id"`
+		ProfileName string `json:"profile_name"`
+		InstanceID  string `json:"instance_id"`
+		PID         int    `json:"pid"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ProfileID != profile.ID || body.ProfileName != "dev" {
+		t.Fatalf("health profile = (%q, %q), want (%q, dev)", body.ProfileID, body.ProfileName, profile.ID)
+	}
+	if body.InstanceID != "instance-test" {
+		t.Fatalf("instance_id = %q, want instance-test", body.InstanceID)
+	}
+	if body.PID != os.Getpid() {
+		t.Fatalf("pid = %d, want %d", body.PID, os.Getpid())
+	}
+}
+
+func TestRunListenerServesOnAlreadyOwnedEphemeralPort(t *testing.T) {
+	s, _ := newTestServer(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Handler().SetListenAddr(listener.Addr().String())
+
+	done := make(chan error, 1)
+	go func() { done <- s.RunListener(listener) }()
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/api/v1/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunListener returned %v after shutdown", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunListener did not stop after shutdown")
 	}
 }
 

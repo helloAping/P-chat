@@ -35,6 +35,7 @@ import (
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
 	"github.com/p-chat/pchat/internal/version"
+	"github.com/p-chat/pchat/runtimeprofile"
 	"github.com/spf13/cobra"
 )
 
@@ -337,25 +338,55 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Auto-index knowledge bases on startup (if enabled).
 	srv.Handler().AutoIndexKnowledgeBases()
 
-	// PCHAT_PORT overrides the configured port. This is how the
-	// parent process (pchat / pchat-gui) tells us which ephemeral
-	// port to bind to. The host stays as configured.
-	port := cfg.Server.Port
-	if p := serverproc.PortFromEnv(); p > 0 {
-		port = p
+	// Bind once and keep ownership of the listener through Serve. In
+	// particular, PCHAT_PORT=0 now delegates allocation to the OS without
+	// the old probe-close-rebind race between the parent and this process.
+	listener, err := serverproc.Listen(cfg.Server.Host, cfg.Server.Port)
+	if err != nil {
+		return err
 	}
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, port)
+	addr := listener.Addr().String()
+	profile, err := runtimeprofile.Current(paths.GlobalDir())
+	if err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("resolve runtime profile: %w", err)
+	}
+	instanceID := strings.TrimSpace(os.Getenv(runtimeprofile.InstanceEnv))
+	if instanceID == "" {
+		instanceID, err = runtimeprofile.NewInstanceID()
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+	}
+	srv.Handler().SetRuntimeIdentity(profile, instanceID)
+	srv.Handler().SetListenAddr(addr)
+
+	runtimeFile := strings.TrimSpace(os.Getenv(runtimeprofile.RuntimeFileEnv))
+	if runtimeFile != "" {
+		announcement := runtimeprofile.Announcement{
+			ProfileID:   profile.ID,
+			ProfileName: profile.Name,
+			InstanceID:  instanceID,
+			PID:         os.Getpid(),
+			Address:     addr,
+			BaseURL:     "http://" + addr,
+		}
+		if err := runtimeprofile.WriteAnnouncement(runtimeFile, announcement); err != nil {
+			_ = listener.Close()
+			return err
+		}
+		defer os.Remove(runtimeFile)
+	}
+
 	fmt.Printf("P-Chat Server 启动于 http://%s\n", addr)
-	log.Printf("pchat-server version=%s question-tracing=enabled", version.FullString())
+	log.Printf("pchat-server version=%s profile=%s profile_id=%s instance_id=%s question-tracing=enabled",
+		version.FullString(), profile.Name, profile.ID, instanceID)
 	// Surface the active home dir + the strategy that picked
 	// it. The user can grep this in bin/pchat-server.log to
 	// verify dev/prod isolation is set up the way they expect.
 	log.Printf("home dir: %s (strategy: %s)", paths.GlobalDir(), paths.ResolveStrategy())
-	// Tell the handler the real address so the browser extension
-	// UI can display the correct WebSocket URL — critical when
-	// pchat-gui assigns a dynamic port via PCHAT_PORT.
-	srv.Handler().SetListenAddr(addr)
-	return srv.RunAt(addr)
+	return srv.RunListener(listener)
 }
 
 func configToMCP(cfg config.MCPServerConfig) mcp.ServerConfig {

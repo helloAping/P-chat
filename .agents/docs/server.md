@@ -8,6 +8,12 @@
 
 Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API 路由、SSE 流式推送、会话管理、消息持久化、配置管理、上传、项目/技能管理。
 
+### 启动身份与端口
+
+`cmd/pchat-server` 通过 `serverproc.Listen()` 直接取得 listener，再调用 `Server.RunListener()`，因此 `PCHAT_PORT=0` 和 `PCHAT_PORT_RANGE` 都不存在探测后重新绑定的竞态。若由 GUI/CLI 拉起，server 会在 `PCHAT_RUNTIME_FILE` 原子发布实际地址及 profile/instance/PID；父进程校验 announcement 后还会用 `/api/v1/health` 二次校验。
+
+`GET /api/v1/health` 成功响应包含 `status`、`profile_id`、`profile_name`、`instance_id`、`pid`。新增启动器或客户端不得只检查 `status=ok` 就认领一个动态端口。
+
 ## 文件结构
 
 | 文件 | 职责 | 关键函数/类型 |

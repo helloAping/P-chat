@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const defaultSingleInstanceMutex = `Local\PChatGuiSingleInstance`
+const defaultSingleInstanceMutexPrefix = `Local\PChatGuiSingleInstance-`
 
 var (
 	procFindWindowW = windows.NewLazySystemDLL("user32.dll").NewProc("FindWindowW")
@@ -55,7 +55,7 @@ func (l *singleInstanceLock) release() {
 // signalExistingInstance 通知已有实例恢复窗口；失败时仅记录日志，第二实例仍退出。
 // signalExistingInstance asks the already-running tray window to restore itself.
 func signalExistingInstance() bool {
-	className, _ := windows.UTF16PtrFromString(trayWindowClass)
+	className, _ := windows.UTF16PtrFromString(trayWindowClassName())
 	hwnd, _, err := procFindWindowW.Call(uintptr(unsafe.Pointer(className)), 0)
 	if hwnd == 0 {
 		log.Printf("single instance: existing mutex found, but tray window was not found: %v", err)
@@ -72,7 +72,7 @@ func singleInstanceMutexName() string {
 	if v := os.Getenv("PCHAT_SINGLE_INSTANCE_MUTEX"); v != "" {
 		return v
 	}
-	return defaultSingleInstanceMutex
+	return defaultSingleInstanceMutexPrefix + currentRuntimeProfile().ID
 }
 
 func isAlreadyExistsError(err error) bool {

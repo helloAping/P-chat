@@ -51,7 +51,7 @@ func resolvePromptDir() string {
 	if _, err := os.Stat(projectPrompts); err == nil {
 		return projectPrompts
 	}
-	return filepath.Join(os.Getenv("USERPROFILE"), ".p-chat", "prompts")
+	return paths.GlobalPromptsDir()
 }
 
 // ---- V0 → V1 ----

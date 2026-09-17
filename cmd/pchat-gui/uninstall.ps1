@@ -52,6 +52,7 @@ function Remove-PChatShortcutForInstall {
 if (-not $InstallDir) {
     $InstallDir = $here
 }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
 
 Write-Host "[uninstall] target: $InstallDir"
 
@@ -61,7 +62,7 @@ Get-Process -Name "pchat-gui","pchat-server","pchat","pchat-updater" -ErrorActio
     Where-Object {
         try {
             $p = (Resolve-Path -LiteralPath (Split-Path -LiteralPath $_.MainModule.FileName -Parent) -ErrorAction Stop).Path
-            $p -eq $InstallDir
+            Test-SamePathText -Left $p -Right $InstallDir
         } catch { $false }
     } |
     ForEach-Object {

@@ -489,6 +489,23 @@ func (s *Server) RunAt(addr string) error {
 	return s.srv.ListenAndServe()
 }
 
+// RunListener serves HTTP on a listener that the caller already owns. This is
+// the race-free startup path for port 0 and preferred ranges because the
+// selected port is never released between allocation and serving.
+func (s *Server) RunListener(listener net.Listener) error {
+	if listener == nil {
+		return fmt.Errorf("server: listener is nil")
+	}
+	s.srv = &http.Server{
+		Addr:    listener.Addr().String(),
+		Handler: s.engine,
+	}
+	if err := s.srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
 // RunWithGracefulShutdown starts the server and blocks until a
 // shutdown signal (SIGINT/SIGTERM) is received. On signal, it
 // drains active connections for up to 30s, then exits.

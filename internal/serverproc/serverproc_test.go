@@ -2,11 +2,13 @@ package serverproc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,21 +42,6 @@ func TestStop_NilSafe(t *testing.T) {
 	s.Stop()
 }
 
-func TestPortFromEnv(t *testing.T) {
-	cases := map[string]int{
-		"":          0,
-		"0":         0, // strconv.Atoi returns 0; we don't treat as "not set"
-		"18960":     18960,
-		"not a num": 0,
-	}
-	for input, want := range cases {
-		t.Setenv("PCHAT_PORT", input)
-		if got := PortFromEnv(); got != want {
-			t.Errorf("PortFromEnv(%q) = %d, want %d", input, got, want)
-		}
-	}
-}
-
 func TestWebDirFromEnv(t *testing.T) {
 	cases := map[string]string{
 		"":                           "",
@@ -70,38 +57,55 @@ func TestWebDirFromEnv(t *testing.T) {
 	}
 }
 
-func TestPickPreferredPort_FirstPreferredWhenAvailable(t *testing.T) {
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", PreferredPortStart))
-	if err != nil {
-		t.Skipf("preferred port %d is already occupied: %v", PreferredPortStart, err)
-	}
-	_ = l.Close()
-
-	port, err := PickPreferredPort()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if port != PreferredPortStart {
-		t.Fatalf("PickPreferredPort() = %d, want %d", port, PreferredPortStart)
+func TestOverrideEnvironmentReplacesInheritedRuntimeValues(t *testing.T) {
+	got := overrideEnvironment(
+		[]string{"PATH=keep", "PCHAT_PORT=15150", "pchat_profile=prod"},
+		"PCHAT_PORT=0", "PCHAT_PROFILE=dev",
+	)
+	want := []string{"PATH=keep", "PCHAT_PORT=0", "PCHAT_PROFILE=dev"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("overrideEnvironment() = %#v, want %#v", got, want)
 	}
 }
 
-func TestPickPreferredPort_SkipsOccupiedPreferredPorts(t *testing.T) {
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", PreferredPortStart))
-	if err != nil {
-		t.Skipf("preferred port %d is already occupied: %v", PreferredPortStart, err)
-	}
-	defer l.Close()
+func TestListenFromEnvZeroAtomicallyOwnsEphemeralPort(t *testing.T) {
+	t.Setenv("PCHAT_PORT", "0")
+	t.Setenv("PCHAT_PORT_RANGE", "")
 
-	port, err := PickPreferredPort()
+	listener, err := Listen("127.0.0.1", PreferredPortStart)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if port == PreferredPortStart {
-		t.Fatalf("PickPreferredPort() reused occupied port %d", PreferredPortStart)
+	defer listener.Close()
+
+	address := listener.Addr().String()
+	if listener.Addr().(*net.TCPAddr).Port == 0 {
+		t.Fatalf("listener address %q still has port zero", address)
 	}
-	if port < PreferredPortStart || port > PreferredPortEnd {
-		t.Fatalf("PickPreferredPort() = %d, want next port in %d-%d", port, PreferredPortStart+1, PreferredPortEnd)
+	second, err := net.Listen("tcp", address)
+	if err == nil {
+		second.Close()
+		t.Fatalf("allocated address %q was not held atomically", address)
+	}
+}
+
+func TestListenRangeFallsBackAtomicallyWhenRangeIsOccupied(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	occupiedPort := occupied.Addr().(*net.TCPAddr).Port
+
+	t.Setenv("PCHAT_PORT", "")
+	t.Setenv("PCHAT_PORT_RANGE", fmt.Sprintf("%d-%d", occupiedPort, occupiedPort))
+	listener, err := Listen("127.0.0.1", PreferredPortStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if got := listener.Addr().(*net.TCPAddr).Port; got == occupiedPort || got == 0 {
+		t.Fatalf("fallback port = %d, occupied=%d", got, occupiedPort)
 	}
 }
 
@@ -119,6 +123,9 @@ func TestStart_RealBinary(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("USERPROFILE", tmp)
 	t.Setenv("HOME", tmp)
+	dataHome := filepath.Join(tmp, ".p-chat")
+	t.Setenv("PCHAT_DATA_HOME", dataHome)
+	t.Setenv("PCHAT_PROFILE", "test")
 
 	// Need a config file so pchat-server can start. Since the
 	// config format moved to JSON in 0.10, write JSON.
@@ -136,16 +143,16 @@ func TestStart_RealBinary(t *testing.T) {
     ]
   }
 }`
-	if err := os.MkdirAll(filepath.Join(tmp, ".p-chat"), 0o755); err != nil {
+	if err := os.MkdirAll(dataHome, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(tmp, ".p-chat", "config.json"), []byte(cfg), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dataHome, "config.json"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	srv, err := Start(context.Background(), Options{
 		ServerBin:   bin,
-		ConfigPath:  filepath.Join(tmp, ".p-chat", "config.json"),
+		ConfigPath:  filepath.Join(dataHome, "config.json"),
 		PingTimeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -156,6 +163,12 @@ func TestStart_RealBinary(t *testing.T) {
 	if srv.BaseURL == "" {
 		t.Fatal("BaseURL not set")
 	}
+	if srv.InstanceID == "" {
+		t.Fatal("InstanceID not set from startup announcement")
+	}
+	if srv.Profile.Name != "test" || srv.Profile.DataHome != dataHome {
+		t.Fatalf("profile = %#v, want test profile at %q", srv.Profile, dataHome)
+	}
 
 	// Hit /health directly with the real http client.
 	resp, err := http.Get(srv.BaseURL + "/api/v1/health")
@@ -165,6 +178,16 @@ func TestStart_RealBinary(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Errorf("health = %d, want 200", resp.StatusCode)
+	}
+	var health struct {
+		ProfileID  string `json:"profile_id"`
+		InstanceID string `json:"instance_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatal(err)
+	}
+	if health.ProfileID != srv.Profile.ID || health.InstanceID != srv.InstanceID {
+		t.Fatalf("health identity = (%q, %q), want (%q, %q)", health.ProfileID, health.InstanceID, srv.Profile.ID, srv.InstanceID)
 	}
 }
 

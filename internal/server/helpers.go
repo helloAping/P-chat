@@ -2,7 +2,6 @@ package server
 
 import (
 	"os"
-	"path/filepath"
 
 	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
@@ -14,12 +13,8 @@ import (
 // global file is at ~/.p-chat/AGENTS.md; the project file is at
 // ./AGENTS.md (cwd-relative).
 func readAgentsContext() (global, project string, err error) {
-	home, _ := os.UserHomeDir()
-	if home != "" {
-		data, e := os.ReadFile(filepath.Join(home, ".p-chat", "AGENTS.md"))
-		if e == nil {
-			global = string(data)
-		}
+	if data, e := os.ReadFile(paths.GlobalAgents()); e == nil {
+		global = string(data)
 	}
 	data, e := os.ReadFile("AGENTS.md")
 	if e == nil {
@@ -39,7 +34,3 @@ func loadAllSkills() ([]skill.Skill, error) {
 func loadAllRules() ([]rules.Rule, error) {
 	return rules.LoadAll()
 }
-
-// ensurePaths is a no-op exported for future use; the paths
-// package is the only allowed caller of os.UserHomeDir().
-var _ = paths.GlobalDir

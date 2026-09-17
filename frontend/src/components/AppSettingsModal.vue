@@ -4127,7 +4127,7 @@ function kbModelSupportsVision(scanModel: string) {
             <div class="browser-update-desc">
               下载最新扩展包后，在 Chrome / Edge 扩展管理页重新加载已解包扩展。
             </div>
-            <NButton size="tiny" type="warning" ghost tag="a" href="/api/v1/browser/extension" download>
+            <NButton size="tiny" type="warning" ghost tag="a" :href="api.apiURL('/api/v1/browser/extension')" download>
               下载最新扩展
             </NButton>
           </div>
@@ -4206,7 +4206,7 @@ function kbModelSupportsVision(scanModel: string) {
           <div class="settings-section-header">
             <h3 class="settings-section-title">安装扩展</h3>
             <div class="settings-form-actions">
-              <NButton size="small" type="primary" ghost tag="a" href="/api/v1/browser/extension" download>
+              <NButton size="small" type="primary" ghost tag="a" :href="api.apiURL('/api/v1/browser/extension')" download>
                 下载扩展包
               </NButton>
             </div>
@@ -4214,7 +4214,7 @@ function kbModelSupportsVision(scanModel: string) {
           <div class="settings-section-description" style="margin-bottom: 0;">
             <ol style="padding-left: 18px; line-height: 1.7; margin: 0;">
               <li>
-                <a href="/api/v1/browser/extension" download class="browser-ext-download-link">
+                <a :href="api.apiURL('/api/v1/browser/extension')" download class="browser-ext-download-link">
                   下载浏览器扩展 zip
                 </a>
                 并解压到本地任意目录

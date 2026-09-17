@@ -8,7 +8,9 @@
 
 ## 概述
 
-P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片、问题模态框、设置面板等功能。与 pchat-server 通过同一域名的 `/api/v1/*` 端点通信，SSE 流通过 `fetch()` + `ReadableStream` 消费。
+P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片、问题模态框、设置面板等功能。浏览器部署默认通过同源 `/api/v1/*` 通信；Wails GUI 使用启动握手后注入的 `window.__PCHAT_BACKEND__` 动态地址，SSE 流通过 `fetch()` + `ReadableStream` 消费。
+
+`api/client.ts` 的 JSON、上传、下载和 SSE 请求都必须从 `waitForDirectBackend()` / `apiURL()` 解析目标，禁止新增固定本地端口。纯 Vite 浏览器开发如需直连独立 server，显式设置 `VITE_PCHAT_BACKEND=http://127.0.0.1:<实际端口>`；`vite.config.ts` 不提供固定端口代理。
 
 用户向 GUI 操作流程统一写在项目根目录 `README.md` 的「GUI 操作入口速查」和「常见问题」里，例如浏览器控制安装与连接诊断、知识库选择、工作模式切换、风格关闭、工具列表、动态工具 YAML 加载诊断和 trace id 复制。本文件只记录前端实现结构和维护入口。
 

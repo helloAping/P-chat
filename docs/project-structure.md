@@ -14,6 +14,7 @@
 | `browser-extension/` | 浏览器扩展源码 | Chrome / Edge 扩展桥接真实浏览器 | 打包后复制到 `cmd/pchat-server/browser-extension.zip` 和 `bin/` |
 | `configs/` | 默认配置模板 | 首次运行或迁移时参考的配置样例 | 用户运行时配置在数据目录，不在这里直接写密钥 |
 | `scripts/` | 构建/打包脚本 | 前端同步、Wails 构建、安装包、更新包、冒烟测试 | Taskfile 多数任务调用这里的脚本 |
+| `runtimeprofile/` | 共享 Go module | data home 派生运行 profile、进程 instance、server 启动握手 | 保持 Go 1.23 + 标准库，以便根模块和 Wails 子模块共同引用 |
 | `docs/` | 用户/维护文档 | 功能指南、结构说明、历史计划、报告 | 当前功能状态以 `docs/feature-opportunities.md` 为准 |
 | `.agents/` | Agent 协作规范 | canonical `AGENTS.md` 与模块维护文档 | `.opencode` / `.codex` / `.claude` 目录指向这里 |
 | `.p-chat/` | 项目级运行时配置 | 本仓库作为项目运行时的本地配置、规则、技能 | 不提交密钥；全局用户数据默认在 `~/.p-chat/` |
@@ -77,7 +78,7 @@
 | AGENTS 加载 | `internal/agents/` | 项目/全局 `AGENTS.md` 优先级解析 |
 | Style | `internal/style/` | 内置/自定义风格管理，当前风格数据在 SQLite |
 | Trace | `internal/trace/` | 端到端 trace id 生成、注入和日志前缀 |
-| ServerProc | `internal/serverproc/` | CLI/GUI 启停 server 子进程 |
+| ServerProc | `internal/serverproc/` | CLI 启停 server 子进程、原子端口绑定与身份校验；GUI 通过 `runtimeprofile/` 复用握手协议 |
 | RotateLog | `internal/rotatelog/` | 日志按日期切割和保留策略 |
 | Version | `internal/version/` | `VERSION` + ldflags + git hash 的统一版本字符串 |
 | Upgrade | `internal/upgrade/` | 用户数据目录结构版本升级，当前 `AppVersion` 为 `V8` |

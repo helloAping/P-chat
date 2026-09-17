@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/version"
+	"github.com/p-chat/pchat/runtimeprofile"
 )
 
 // Handler serves the P-Chat HTTP API. It holds references to the
@@ -72,6 +74,8 @@ type Handler struct {
 	// Safe to read without a mutex — written synchronously before
 	// any HTTP handler runs, never mutated afterwards.
 	listenAddr string
+	profile    runtimeprofile.Profile
+	instanceID string
 
 	metaMu sync.Mutex
 	// sessionLocks serialises concurrent SendMessage calls per
@@ -1131,7 +1135,13 @@ func (h *Handler) Health(c *gin.Context) {
 			return
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	c.JSON(http.StatusOK, gin.H{
+		"status":       "ok",
+		"profile_id":   h.profile.ID,
+		"profile_name": h.profile.Name,
+		"instance_id":  h.instanceID,
+		"pid":          os.Getpid(),
+	})
 }
 
 // VersionHandler GET /api/v1/version
@@ -1283,6 +1293,13 @@ func (h *Handler) SetSubagentRunner(runner *subagent.Default) {
 // called before Run/RunAt starts accepting connections.
 func (h *Handler) SetListenAddr(addr string) {
 	h.listenAddr = addr
+}
+
+// SetRuntimeIdentity records the profile and process instance exposed by the
+// health endpoint. Call it before the server accepts requests.
+func (h *Handler) SetRuntimeIdentity(profile runtimeprofile.Profile, instanceID string) {
+	h.profile = profile
+	h.instanceID = instanceID
 }
 
 // CompressConversation compresses the current conversation's history.

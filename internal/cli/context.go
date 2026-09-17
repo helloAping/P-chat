@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
@@ -1150,8 +1150,7 @@ func (c *localContext) ListRules() ([]string, error) {
 }
 
 func (c *localContext) AgentsContext() (global, project string, err error) {
-	home, _ := os.UserHomeDir()
-	globalPath := filepath.Join(home, ".p-chat", "AGENTS.md")
+	globalPath := paths.GlobalAgents()
 	projectPath := "AGENTS.md"
 
 	if data, e := os.ReadFile(globalPath); e == nil {

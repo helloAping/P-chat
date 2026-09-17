@@ -426,7 +426,8 @@ async function doExport(id: string, format: ExportFormat) {
     // the store, renders the selected archive format, and
     // returns the file with Content-Disposition.
     const fmtQuery = format
-    const resp = await fetch(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`, {
+    const exportURL = await api.waitForAPIURL(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`)
+    const resp = await fetch(exportURL, {
       method: 'GET',
     })
     if (!resp.ok) {

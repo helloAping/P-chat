@@ -17,7 +17,6 @@ import (
 )
 
 const (
-	trayWindowClass       = "PChatTrayWindow"
 	trayUID               = 1
 	trayCallbackMsg       = 0x0400 + 121
 	trayShowMainWindowMsg = 0x0400 + 122
@@ -177,7 +176,7 @@ func (t *trayHandle) run() {
 	defer runtime.UnlockOSThread()
 
 	instance := getModuleHandle()
-	className, _ := windows.UTF16PtrFromString(trayWindowClass)
+	className, _ := windows.UTF16PtrFromString(trayWindowClassName())
 	trayClassRegisterOnce.Do(func() {
 		wc := wndClassEx{
 			Size:      uint32(unsafe.Sizeof(wndClassEx{})),
@@ -263,7 +262,7 @@ func (t *trayHandle) notifyData() notifyIconData {
 		UCallbackMessage: trayCallbackMsg,
 		HIcon:            t.hicon,
 	}
-	copyUTF16(nid.SzTip[:], "P-Chat")
+	copyUTF16(nid.SzTip[:], applicationTitle())
 	return nid
 }
 

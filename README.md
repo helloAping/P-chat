@@ -121,7 +121,7 @@ task build:dev
 #   2. go build → dev-bin/pchat-server.exe
 #   3. go build → dev-bin/pchat.exe
 #   4. wails build-debug → dev-bin/pchat-gui.exe
-#   5. 杀掉旧进程，启动新的 dev-bin/pchat-gui.exe
+#   5. 只停止当前仓库 dev-bin/ 下的旧进程，启动新的 pchat-gui.exe
 ```
 
 `dev-bin/` 这个路径名是固定的 — 二进制启动时按 `internal/paths/devhome.go` 的策略解析数据目录：
@@ -130,9 +130,11 @@ task build:dev
 优先级：PCHAT_DATA_HOME 环境变量 > dev-bin/.p-chat/ > $HOME/.p-chat/
 ```
 
-也就是说跑 `dev-bin/pchat-gui.exe` 时，配置 / 会话 / 技能 / 知识库全都落在 `dev-bin/.p-chat/` 下，跟 `task build:gui` 装到 `%LOCALAPPDATA%` 用的 `$HOME/.p-chat/` 是**隔离的两份**。改源码、删 dev-bin 重跑都不会污染生产数据。改 `dev-bin/.p-chat/config.json` 也不影响安装版。
+也就是说跑 `dev-bin/pchat-gui.exe` 时，配置 / 会话 / 技能 / 知识库全都落在 `dev-bin/.p-chat/` 下，跟 `task build:gui` 装到 `%LOCALAPPDATA%` 用的 `$HOME/.p-chat/` 是**隔离的两份**。运行身份、GUI 单实例锁、托盘窗口、WebView2 本地状态和日志也按数据目录隔离，因此开发版和正式版可以同时打开。改源码、删 dev-bin 重跑都不会污染生产数据，改 `dev-bin/.p-chat/config.json` 也不影响安装版。
 
-源码改完只要再 `task build:dev` 一次就会原地热替换。
+源码改完只要再 `task build:dev` 一次就会原地热替换。重建脚本会核对可执行文件的完整路径，只结束本仓库 `dev-bin/` 下的旧进程，不会按进程名结束已安装的正式版。
+
+端口由 server 自己持有 listener 后再通知 GUI，避免并发启动时的“探测后释放”竞争。正式 GUI 优先使用 `15150-15159`，范围全满则回退到系统临时端口；dev/test 直接使用系统临时端口。GUI 会同时校验 profile、instance 和 PID，不会把另一个环境碰巧返回的 `/health` 当成本次后端。完整约定见 [`docs/plans/runtime-profile-coexistence.md`](docs/plans/runtime-profile-coexistence.md)。
 
 ### 前置
 

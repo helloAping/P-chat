@@ -200,11 +200,18 @@ CLI 使用的 HTTP + SSE 客户端，与 pchat-server 通信。
 ## Server 进程管理
 
 **位置**：`internal/serverproc/`  
-**文件**：`serverproc.go`, `detach_windows.go`, `detach_unix.go`
+**文件**：`serverproc.go`, `ports.go`, `detach_windows.go`, `detach_unix.go`
 
-- `Start()` — 自动启动 pchat-server 子进程
+**共享身份模块**：`runtimeprofile/`（独立 Go 1.23 module，供根模块和 Wails GUI 子模块共同引用）
+
+- `Start()` — 自动启动 pchat-server 子进程；传递 profile/instance 身份并等待握手文件
 - `Stop()` — 关闭子进程
+- `Listen()` — server 直接绑定显式端口、端口范围或 `:0`，不经过 probe-close-rebind
+- profile ID 由规范化 data home 派生；不同 data home 可共存，同目录 GUI 共享单实例身份
+- `/api/v1/health` 与启动 announcement 必须同时匹配 profile ID 和 instance ID
 - 跨平台进程分离（Windows `DETACHED_PROCESS` / Unix `setsid`）
+
+详细需求和端口矩阵见 [`docs/plans/runtime-profile-coexistence.md`](../../docs/plans/runtime-profile-coexistence.md)。
 
 ## 路由约定
 

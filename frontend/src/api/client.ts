@@ -5,7 +5,7 @@
 
 import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, STREAM_IDLE_AFTER_LLM_MS, type StreamEventLike } from './sse'
 
-const BASE = '' // same origin; pchat-server serves both UI and API
+const BASE = (import.meta.env?.VITE_PCHAT_BACKEND || '').replace(/\/$/, '')
 
 // mintTraceId returns a fresh P3-3 trace id (8-char hex with
 // the "T-" prefix) for outbound requests. The id flows as the
@@ -42,6 +42,18 @@ function directBackendURL(): string {
   const injected = (window as any).__PCHAT_BACKEND__
   if (typeof injected === 'string' && injected) return injected
   return BASE
+}
+
+// apiURL resolves a non-streaming or downloadable API resource against the
+// backend selected for this runtime profile.
+export function apiURL(path: string): string {
+  return directBackendURL() + path
+}
+
+// waitForAPIURL waits for the desktop host's startup handshake before
+// resolving a URL. Browser-only development can set VITE_PCHAT_BACKEND.
+export async function waitForAPIURL(path: string): Promise<string> {
+  return (await waitForDirectBackend()) + path
 }
 
 // waitForDirectBackend waits for pchat-gui to publish the child
@@ -414,7 +426,7 @@ export const fetchTokenStats = () =>
   jsonFetch<{ stats: TokenStat[] }>('/api/v1/token-stats')
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + url, {
+  const res = await fetch(await waitForAPIURL(url), {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
   })
@@ -426,7 +438,15 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 // --- Health ---
-export const health = () => jsonFetch<{ status: string }>('/api/v1/health')
+export interface RuntimeHealth {
+  status: string
+  profile_id: string
+  profile_name: string
+  instance_id: string
+  pid: number
+}
+
+export const health = () => jsonFetch<RuntimeHealth>('/api/v1/health')
 
 // --- Search ---
 export const searchMessages = (q: string, limit = 20, projectPath?: string) => {
