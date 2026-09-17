@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/config"
+	providerstrategy "github.com/p-chat/pchat/internal/provider"
 	"github.com/p-chat/pchat/internal/requestheader"
 )
 
@@ -402,18 +403,6 @@ func (e *HTTPExecutor) resolveInputs(ctx context.Context, req Request) ([]InputS
 }
 
 func buildVendorPayload(req Request, inputs []InputSource) map[string]any {
-	payload := cloneMap(req.Dispatch.OperationConfig.DefaultParams)
-	for key, value := range req.Options {
-		payload[key] = value
-	}
-	if duration, ok := payload["duration_seconds"]; ok {
-		if _, exists := payload["duration"]; !exists {
-			payload["duration"] = duration
-		}
-		delete(payload, "duration_seconds")
-	}
-	payload["model"] = req.Target.Model
-	payload["prompt"] = req.Prompt
 	dataURLs := make([]string, 0, len(inputs))
 	for _, input := range inputs {
 		mimeType := input.MIMEType
@@ -422,59 +411,16 @@ func buildVendorPayload(req Request, inputs []InputSource) map[string]any {
 		}
 		dataURLs = append(dataURLs, "data:"+mimeType+";base64,"+base64.StdEncoding.EncodeToString(input.Data))
 	}
-	vendor := effectiveAdapter(req.Dispatch)
-	if count, ok := payload["count"]; ok {
-		switch {
-		case vendor == "openai", vendor == "minimax" && req.Operation.OutputKind() == config.MediaImage:
-			payload["n"] = count
-			delete(payload, "count")
-		case vendor == "volcengine" && req.Operation.OutputKind() == config.MediaImage:
-			delete(payload, "count")
-			if numeric, ok := numericValue(count); ok && numeric > 1 {
-				payload["sequential_image_generation"] = "auto"
-				payload["sequential_image_generation_options"] = map[string]any{"max_images": int64(numeric)}
-			}
-		}
-	}
-	switch {
-	case vendor == "volcengine" && req.Operation.OutputKind() == config.MediaVideo:
-		content := []map[string]any{{"type": "text", "text": req.Prompt}}
-		for _, dataURL := range dataURLs {
-			content = append(content, map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL}})
-		}
-		delete(payload, "prompt")
-		payload["content"] = content
-	case vendor == "minimax" && req.Operation == config.GenerationTextToSpeech:
-		delete(payload, "prompt")
-		payload["text"] = req.Prompt
-	case vendor == "minimax" && req.Operation == config.GenerationImageToVideo:
-		if len(dataURLs) > 0 {
-			payload["first_frame_image"] = dataURLs[0]
-		}
-	case vendor == "minimax" && req.Operation == config.GenerationImageToImage:
-		references := make([]map[string]any, 0, len(dataURLs))
-		for _, dataURL := range dataURLs {
-			references = append(references, map[string]any{"type": "character", "image_file": dataURL})
-		}
-		payload["subject_reference"] = references
-	case vendor == "volcengine" && req.Operation == config.GenerationImageToImage:
-		if len(dataURLs) == 1 {
-			payload["image"] = dataURLs[0]
-		} else if len(dataURLs) > 1 {
-			payload["image"] = dataURLs
-		}
-	default:
-		if len(dataURLs) == 0 {
-			return payload
-		}
-		field := string(req.Operation.RequiredInputKind())
-		if len(dataURLs) == 1 {
-			payload[field] = dataURLs[0]
-		} else {
-			payload[field+"s"] = dataURLs
-		}
-	}
-	return payload
+	return providerstrategy.BuildGenerationPayload(providerstrategy.GenerationPayloadRequest{
+		Adapter:       effectiveAdapter(req.Dispatch),
+		Operation:     req.Operation,
+		Model:         req.Target.Model,
+		Prompt:        req.Prompt,
+		Endpoint:      req.Dispatch.OperationConfig.Endpoint,
+		DefaultParams: req.Dispatch.OperationConfig.DefaultParams,
+		Options:       req.Options,
+		InputDataURLs: dataURLs,
+	})
 }
 
 func (e *HTTPExecutor) callJSON(ctx context.Context, method, endpoint, apiKey string, customHeaders map[string]string, payload map[string]any) (map[string]any, error) {
@@ -639,11 +585,19 @@ func (e *HTTPExecutor) downloadAsset(ctx context.Context, rawURL, trustedEndpoin
 
 func effectiveAdapter(dispatch Dispatch) string {
 	adapter := config.NormalizeGenerationVendor(dispatch.Adapter)
-	// Provider protocol describes authentication and the conversational API,
-	// but media endpoints may use a provider-specific JSON dialect. Infer only
-	// from distinctive, user-configured paths so no vendor preset is required.
-	if inferred := inferAdapterFromEndpoint(dispatch.OperationConfig.Endpoint); inferred != "" && (adapter == "" || adapter == "openai" || adapter == "anthropic") {
-		return inferred
+	if strategyAdapter := providerstrategy.GenerationAdapter(providerstrategy.GenerationAdapterRequest{
+		ProviderID:        dispatch.ProviderID,
+		Protocol:          dispatch.Protocol,
+		ConfiguredAdapter: adapter,
+	}); strategyAdapter != "" {
+		adapter = strategyAdapter
+	}
+	if dispatch.ProviderID == "" || dispatch.ProviderID == config.ProviderIDCustom {
+		// Legacy/custom providers can still route old media endpoints without
+		// requiring the user to re-enter a model-level adapter.
+		if inferred := inferAdapterFromEndpoint(dispatch.OperationConfig.Endpoint); inferred != "" && (adapter == "" || adapter == "openai" || adapter == "anthropic") {
+			return inferred
+		}
 	}
 	if adapter != "" {
 		return adapter
@@ -986,14 +940,6 @@ func responseMessage(response map[string]any) string {
 		encoded = encoded[:1000]
 	}
 	return string(encoded)
-}
-
-func cloneMap(source map[string]any) map[string]any {
-	out := make(map[string]any, len(source)+4)
-	for key, value := range source {
-		out[key] = value
-	}
-	return out
 }
 
 func waitContext(ctx context.Context, duration time.Duration) error {

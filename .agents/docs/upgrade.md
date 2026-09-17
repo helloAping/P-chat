@@ -8,7 +8,7 @@
 - **Current**：二进制内嵌的最新版本号，定义在 `internal/upgrade/version.go`。
 - **升级步骤**：一个 `func(*sql.DB) error` 函数，将数据从 `V(N)` 升级到 `V(N+1)`。
 
-当前版本为 V13：V8→V9 迁移媒体识别能力；V9→V10 为模型补类型并初始化媒体生成配置；V10→V11 把重复的 per-operation API 合并为模型级 API；V11→V12 将旧 Provider 完整 `api_url` 拆为公共 `base_url` 与 LLM `api_endpoint`，媒体端点统一为相对后缀，并移除 `vendor` 与 Provider 级旧 `type` 字段；V12→V13 为旧 Provider 初始化 `custom_headers`，用于供应商级动态请求头模板。加载器仍可兼容读取尚未升级的项目覆盖配置。
+当前版本为 V15：V8→V9 迁移媒体识别能力；V9→V10 为模型补类型并初始化媒体生成配置；V10→V11 把重复的 per-operation API 合并为模型级 API；V11→V12 将旧 Provider 完整 `api_url` 拆为公共 `base_url` 与 LLM `api_endpoint`，媒体端点统一为相对后缀，并移除 `vendor` 与 Provider 级旧 `type` 字段；V12→V13 为旧 Provider 初始化 `custom_headers`；V13→V14 创建可复用媒体上下文表；V14→V15 为旧 Provider 初始化 `provider_id=custom`。加载器仍可兼容读取尚未升级的项目覆盖配置。
 
 ## 启动流程
 

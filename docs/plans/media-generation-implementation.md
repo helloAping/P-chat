@@ -145,6 +145,9 @@ GUI 推荐流程：
 - 当前 adapter 覆盖 Volcengine、MiniMax、OpenAI-compatible 的常见 JSON 调用形状。
   厂商特有的 multipart、签名、复杂参考图角色或新增响应字段应留在 adapter 内扩展，
   不得把任意 vendor options 直接暴露给模型。
+- MiniMax H3 / V2 视频创建接口使用 `content` 数组提交文本和可选媒体引用；执行器会把
+  `aspect_ratio` 映射为 `ratio`，并兼容 `minimax-h3` / `minimax-h3-max` 小写模型名。
+  旧 MiniMax V1 视频端点继续使用原有 `prompt` / `first_frame_image` 请求形状。
 - 异步响应若只返回任务 ID、但该模型没有配置 `query_endpoint`，工具会返回配置错误，
   不会把没有资产的任务误报为成功。
 - 生成资产当前按会话归属持久保存并受目录配额保护，但没有自动清理策略；后续应增加

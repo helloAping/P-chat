@@ -86,7 +86,7 @@ type ProviderInfo struct {
 
 type providerEntry struct {
 	name          string // provider name (for error messages)
-	protocol      string // "openai" or "anthropic"
+	protocol      string // openai/openai_chat/openai_responses/anthropic/anthropic_messages
 	model         string
 	apiKey        string
 	baseURL       string
@@ -109,8 +109,11 @@ func (p *providerEntry) endpointForModel(model string) string {
 
 func (p *providerEntry) adapterForModel(model string) ProtocolAdapter {
 	endpoint := p.endpointForModel(model)
-	if p.protocol == "anthropic" {
+	if config.ProtocolIsAnthropic(p.protocol) {
 		return NewAnthropicAdapter(endpoint, p.apiKey, p.name)
+	}
+	if config.ProtocolIsOpenAIResponses(p.protocol) {
+		return NewOpenAIResponsesAdapter(endpoint, p.apiKey, p.name)
 	}
 	return NewOpenAIAdapter(endpoint, p.apiKey, p.name)
 }
@@ -580,7 +583,7 @@ func parseNonStreamContent(protocol string, body []byte) (string, error) {
 	if proxyErr := extractProxyError(body); proxyErr != "" {
 		return "", errors.New(proxyErr)
 	}
-	if protocol == "anthropic" {
+	if config.ProtocolIsAnthropic(protocol) {
 		var resp anthropicResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
 			return "", fmt.Errorf("decode anthropic response: %w", err)
@@ -595,6 +598,9 @@ func parseNonStreamContent(protocol string, body []byte) (string, error) {
 			return text, nil
 		}
 		return "", fmt.Errorf("empty response from anthropic")
+	}
+	if config.ProtocolIsOpenAIResponses(protocol) {
+		return parseResponsesNonStreamContent(body)
 	}
 
 	var resp struct {
@@ -654,6 +660,68 @@ func ToolsFromRegistryDef(tools []tool.Tool) []ToolDef {
 	return out
 }
 
+func toolDefsFromOpenAITools(tools []openai.Tool) []ToolDef {
+	out := make([]ToolDef, 0, len(tools))
+	for _, t := range tools {
+		if t.Function == nil {
+			continue
+		}
+		params, _ := json.Marshal(t.Function.Parameters)
+		out = append(out, ToolDef{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			Parameters:  params,
+		})
+	}
+	return out
+}
+
+func chatMessagesFromOpenAI(messages []Message) []ChatMessage {
+	out := make([]ChatMessage, 0, len(messages))
+	for _, m := range messages {
+		role := m.Role
+		if role == "" {
+			role = RoleUser
+		}
+		if len(m.MultiContent) > 0 {
+			for _, part := range m.MultiContent {
+				switch part.Type {
+				case openai.ChatMessagePartTypeText:
+					out = append(out, ChatMessage{Role: role, Type: TypeText, Content: part.Text})
+				case openai.ChatMessagePartTypeImageURL:
+					content := ""
+					mimeType := ""
+					if part.ImageURL != nil {
+						if mime, data, ok := splitOpenAIDataURL(part.ImageURL.URL); ok {
+							mimeType = mime
+							content = data
+						} else {
+							content = part.ImageURL.URL
+						}
+					}
+					out = append(out, ChatMessage{Role: role, Type: TypeImage, Content: content, MimeType: mimeType})
+				}
+			}
+		} else if m.Content != "" {
+			msgType := TypeText
+			if role == openai.ChatMessageRoleTool {
+				msgType = TypeToolResult
+			}
+			out = append(out, ChatMessage{Role: role, Type: msgType, Content: m.Content, ToolID: m.ToolCallID, ToolName: m.Name})
+		}
+		for _, tc := range m.ToolCalls {
+			out = append(out, ChatMessage{
+				Role:      RoleAssistant,
+				Type:      TypeToolCall,
+				ToolID:    tc.ID,
+				ToolName:  tc.Function.Name,
+				ToolInput: tc.Function.Arguments,
+			})
+		}
+	}
+	return out
+}
+
 // disable tool calling.
 func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelName string, messages []Message, tools []openai.Tool, opts ChatOptions) <-chan StreamChunk {
 	p, ok := c.providers[providerName]
@@ -670,7 +738,11 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelN
 		model = p.model
 	}
 
-	if p.protocol == "anthropic" {
+	if config.ProtocolIsOpenAIResponses(p.protocol) {
+		return c.ChatStreamCM(ctx, providerName, model, chatMessagesFromOpenAI(messages), toolDefsFromOpenAITools(tools), opts)
+	}
+
+	if config.ProtocolIsAnthropic(p.protocol) {
 		// Anthropic support for tools is not implemented in this branch.
 		// Resolve max_tokens the same way the OpenAI branch does
 		// (per-model MaxTokensOutput > global opts.MaxTokens > 0)
@@ -1053,7 +1125,11 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		model = p.model
 	}
 
-	if p.protocol == "anthropic" {
+	if config.ProtocolIsOpenAIResponses(p.protocol) {
+		return c.ChatCM(ctx, providerName, model, chatMessagesFromOpenAI(messages), ChatOptions{})
+	}
+
+	if config.ProtocolIsAnthropic(p.protocol) {
 		// Resolve max_tokens: per-model MaxTokensOutput > 0
 		// (Anthropic's API requires a positive value; we don't
 		// consult a global default here — the non-streaming Chat
@@ -1111,7 +1187,7 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 	if resp.StatusCode >= http.StatusBadRequest {
 		return "", ClassifyAPIError(p.name, fmt.Errorf("openai http %d: %s", resp.StatusCode, string(encoded)))
 	}
-	return parseNonStreamContent("openai", encoded)
+	return parseNonStreamContent(p.protocol, encoded)
 }
 
 func (c *Client) ProviderNames() []string {
@@ -1487,10 +1563,11 @@ func injectReasoning(body []byte, protocol, level string) []byte {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return body
 	}
-	switch protocol {
-	case "openai":
+	if config.ProtocolIsOpenAIResponses(protocol) {
+		m["reasoning"] = map[string]any{"effort": level}
+	} else if config.ProtocolIsOpenAICompatible(protocol) {
 		m["reasoning_effort"] = level
-	case "anthropic":
+	} else if config.ProtocolIsAnthropic(protocol) {
 		budget := reasoningBudget(level)
 		m["thinking"] = map[string]any{
 			"type":          "enabled",

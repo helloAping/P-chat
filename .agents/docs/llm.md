@@ -6,7 +6,7 @@
 
 ## 概述
 
-LLM 模块封装与 LLM 提供商的 HTTP 通信，包括流式请求、协议适配、错误分类。支持 OpenAI 兼容 API 和 Anthropic Messages API 两种协议。
+LLM 模块封装与 LLM 提供商的 HTTP 通信，包括流式请求、协议适配、错误分类。支持 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages 三种协议；旧配置值 `openai` / `anthropic` 会分别按 OpenAI Chat / Anthropic Messages 兼容处理。
 
 ## 文件结构
 
@@ -15,6 +15,7 @@ LLM 模块封装与 LLM 提供商的 HTTP 通信，包括流式请求、协议�
 | `client.go` | HTTP 客户端、流式请求、重试/退避 | `Client`, `Stream()`, `ChatOptions` |
 | `adapter.go` | 协议适配器接口定义 | `ProtocolAdapter`, `ProtocolRequest`, `StreamChunk` |
 | `openai_adapter.go` | OpenAI 兼容协议的 Build + ParseStream | `OpenAIAdapter` |
+| `openai_responses_adapter.go` | OpenAI Responses 协议的 Build + ParseStream | `OpenAIResponsesAdapter` |
 | `anthropic_adapter.go` | Anthropic Messages API 的 Build + ParseStream | `AnthropicAdapter` |
 | `anthropic.go` | Anthropic 特有类型（工具、消息结构） | (Anthropic 工具调用解析) |
 | `chat_message.go` | 协议无关的 ChatMessage 类型 | `ChatMessage`, `Role/Type` 常量 |
@@ -43,6 +44,12 @@ type ProtocolAdapter interface {
 - 支持 OpenAI 的 `reasoning_content` → Thinking
 - 对 DeepSeek（模型名前缀或官方 endpoint host）且携带 tools 的请求，从助手 `Meta["thinking"]` 回传 `reasoning_content`，覆盖纯思考工具轮和历史文本轮。
 - `pchat_context_*` 系统快照在消息原位置包装为 `application_context`，不会提升到首条系统提示词。
+
+**OpenAI Responses Adapter** (`openai_responses_adapter.go`):
+- Build: 复用 OpenAI Chat 的协议无关消息归一逻辑，再转换为 Responses `input`、`tools`、`max_output_tokens` 请求形状。
+- ParseStream: 解析 `response.output_text.delta`、`response.refusal.delta`、reasoning summary / reasoning text、function call arguments、`response.completed` / `response.failed` 等事件。
+- 工具调用按 Responses 的 `call_id` / `output_item.done` 归一成 `ToolCallDelta`；usage 解析 `input_tokens` / `output_tokens` 与 cached tokens。
+- `reasoning_effort` 在 Responses 下会转换为顶层 `reasoning.effort`。
 
 **Anthropic Adapter** (`anthropic_adapter.go`):
 - Build: 将 ChatMessage[] 转为 Anthropic `MessagesRequest` JSON
@@ -112,9 +119,10 @@ OpenAI 流式 usage 解析保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_
 - 流式连接超时
 - `ChatCM()` 非流式调用也用于 provider/model 的无状态 `sayhi` 连接测试
 
-Provider 只选择 `openai` 或 `anthropic` 协议，不再选择厂商 preset。Provider 保存公共
-`base_url`，每个 LLM 模型保存可编辑 `api_endpoint`；OpenAI 新模型默认
-`/chat/completions`，Anthropic 新模型默认 `/messages`。`providerEntry` 根据本次请求的
+Provider 选择 `openai_chat`、`openai_responses` 或 `anthropic_messages` 协议；旧 `openai`
+与 `anthropic` 值会继续兼容。Provider 保存公共 `base_url`，每个 LLM 模型保存可编辑
+`api_endpoint`；OpenAI Chat 新模型默认 `/chat/completions`，OpenAI Responses 默认
+`/responses`，Anthropic Messages 默认 `/messages`。`providerEntry` 根据本次请求的
 模型解析完整 URL，避免同一 Provider 下的模型互相覆盖端点。旧完整 `api_url` 仅由兼容
 读取与 V12 升级步骤拆分。
 

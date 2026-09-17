@@ -18,11 +18,12 @@ const attachmentArtifacts = readFileSync(new URL('../src/utils/attachmentArtifac
 test('model editor exposes context presets and multi-select input capabilities', () => {
   assert.match(settings, /label: '256K', value: 256_000/)
   assert.match(settings, /label: '1M', value: 1_000_000/)
-  assert.match(settings, /v-model:value="editModelCapabilities"[\s\S]*?multiple/)
+  assert.match(settings, /NCheckboxGroup v-model:value="editModelCapabilities"/)
+  assert.match(settings, /capability-option-grid--llm/)
   assert.match(settings, /supports_vision: editModelCapabilities\.value\.includes\('image'\)/)
   assert.match(settings, /媒体识别能力（可选）/)
   assert.match(settings, /默认：仅文本/)
-  assert.match(settings, /不选择（不支持媒体识别）/)
+  assert.match(settings, /图片识别[\s\S]*?视频识别[\s\S]*?音频识别/)
 })
 
 test('system and session settings expose independent media capabilities', () => {
@@ -50,19 +51,25 @@ test('session generation capabilities refresh after application configuration ch
   assert.match(settings, /async function onSaveModel\(\)[\s\S]*?notifyGenerationConfigChanged\(\)/)
 })
 
-test('media model capabilities share one API editor and persist as markers', () => {
-  assert.match(settings, /operations\[operation\] = \{\}/)
-  assert.match(settings, /api: \{[\s\S]*?endpoint: editGenerationAPI\.value\.endpoint/)
+test('media model capabilities use a shared API editor with per-operation overrides', () => {
+  assert.match(settings, /operations\[operation\] = normalizeGenerationOperationOverride\(operation\)/)
+  assert.match(settings, /api: \{[\s\S]*?endpoint: sharedAPI\.endpoint/)
   assert.match(settings, /<strong>模型 API<\/strong>/)
   assert.match(settings, /v-model:value="editGenerationAPI\.endpoint"/)
-  assert.doesNotMatch(settings, /v-for="operation in editGenerationOperations"/)
+  assert.match(settings, /const editGenerationOperationAPIs/)
+  assert.match(settings, /v-for="operation in editGenerationOperations"/)
+  assert.match(settings, /按能力覆盖端点/)
+  assert.match(settings, /updateGenerationOperationAPI/)
+  assert.match(settings, /validateMediaGenerationForm/)
   assert.doesNotMatch(settings, /editGenerationConfigs/)
-  assert.match(settings, /isEndpointSuffix\(editGenerationAPI\.value\.endpoint\)/)
-  assert.match(settings, /所有生成能力共用一组端点/)
-  assert.match(settings, /return \{ endpoint: '\/images\/generations'/)
+  assert.match(settings, /validateGenerationAPIConfig\('媒体生成', editGenerationAPI\.value, true\)/)
+  assert.match(settings, /默认共享模型 API/)
+  assert.match(settings, /function defaultGenerationAPIConfig/)
+  assert.match(settings, /endpointDefaultsForSelectedProvider/)
+  assert.match(settings, /syncGenerationAPIWithDefaults/)
   assert.match(settings, /完整请求：[\s\S]*?generationEndpointPreview/)
   assert.match(settings, /completeEndpointPreview\(editGenerationAPI\.value\.endpoint\)/)
-  assert.doesNotMatch(settings, /defaultGenerationEndpoint|defaultGenerationQueryEndpoint/)
+  assert.match(settings, /defaultGenerationEndpoint|defaultGenerationQueryEndpoint/)
 })
 
 test('async media endpoint editor explains task ids and flags a missing task collection path', () => {

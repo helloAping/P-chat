@@ -114,13 +114,16 @@ func AddProvider(p ProviderConfig) error {
 	// 235-241) but AddProvider did not — a provider added with
 	// `protocol: "garbage"` would persist to disk and only fail
 	// when a real LLM call is made.
-	if p.Protocol != "" {
-		switch p.Protocol {
-		case "openai", "anthropic":
-			// ok
-		default:
-			return fmt.Errorf("invalid protocol %q (allowed: openai, anthropic)", p.Protocol)
-		}
+	if p.Protocol != "" && !IsSupportedProtocol(p.Protocol) {
+		return fmt.Errorf("invalid protocol %q (allowed: openai, openai_chat, openai_responses, anthropic, anthropic_messages)", p.Protocol)
+	}
+	p.ProviderID = NormalizeProviderID(p.ProviderID)
+	p.StrategyVariant = NormalizeStrategyVariant(p.StrategyVariant)
+	if !IsValidProviderID(p.ProviderID) {
+		return fmt.Errorf("invalid provider_id %q", p.ProviderID)
+	}
+	if !IsValidStrategyVariant(p.StrategyVariant) {
+		return fmt.Errorf("invalid strategy_variant %q", p.StrategyVariant)
 	}
 	// New providers persist one reusable Base URL. Individual models append
 	// their editable endpoint suffix at request time. APIURL is accepted only
@@ -245,9 +248,15 @@ type ProviderPatch struct {
 	// Name, if non-empty, renames the provider. A name
 	// collision with another provider returns an error.
 	Name string
-	// Protocol, if non-empty, switches the dispatch
-	// protocol. Accepted values: "openai", "anthropic".
+	// Protocol, if non-empty, switches the dispatch protocol. Accepted values:
+	// "openai", "openai_chat", "openai_responses", "anthropic",
+	// "anthropic_messages".
 	Protocol string
+	// ProviderID, if non-empty, switches the provider strategy preset.
+	ProviderID string
+	// StrategyVariant, when non-nil, switches the strategy variant. Empty means
+	// the provider strategy default.
+	StrategyVariant *string
 	// APIURL accepts the legacy exact protocol endpoint for compatibility.
 	APIURL string
 	// BaseURL, if non-empty, replaces the reusable provider base URL.
@@ -322,13 +331,11 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 	}
 	oldProtocol := p.GetProtocol()
 	if patch.Protocol != "" {
-		switch patch.Protocol {
-		case "openai", "anthropic":
-			p.Protocol = patch.Protocol
-			p.Type = ""
-		default:
-			return nil, fmt.Errorf("invalid protocol %q (allowed: openai, anthropic)", patch.Protocol)
+		if !IsSupportedProtocol(patch.Protocol) {
+			return nil, fmt.Errorf("invalid protocol %q (allowed: openai, openai_chat, openai_responses, anthropic, anthropic_messages)", patch.Protocol)
 		}
+		p.Protocol = patch.Protocol
+		p.Type = ""
 		if oldProtocol != p.GetProtocol() {
 			oldDefault := NormalizeAPIEndpointSuffix(DefaultLLMAPIEndpoint(oldProtocol))
 			newDefault := DefaultLLMAPIEndpoint(p.GetProtocol())
@@ -342,6 +349,23 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 				}
 			}
 		}
+	}
+	if patch.ProviderID != "" {
+		providerID := NormalizeProviderID(patch.ProviderID)
+		if !IsValidProviderID(providerID) {
+			return nil, fmt.Errorf("invalid provider_id %q", patch.ProviderID)
+		}
+		if providerID != p.GetProviderID() && patch.StrategyVariant == nil {
+			p.StrategyVariant = ""
+		}
+		p.ProviderID = providerID
+	}
+	if patch.StrategyVariant != nil {
+		variant := NormalizeStrategyVariant(*patch.StrategyVariant)
+		if !IsValidStrategyVariant(variant) {
+			return nil, fmt.Errorf("invalid strategy_variant %q", *patch.StrategyVariant)
+		}
+		p.StrategyVariant = variant
 	}
 	if patch.APIURL != "" {
 		if err := validateProviderAPIURL(patch.APIURL); err != nil {
@@ -432,6 +456,15 @@ func normalizeModelAPIConfig(protocol string, model *ModelConfig) error {
 		}
 		model.Generation.API.Endpoint = NormalizeAPIEndpointSuffix(model.Generation.API.Endpoint)
 		model.Generation.API.QueryEndpoint = NormalizeAPIEndpointSuffix(model.Generation.API.QueryEndpoint)
+		for operation, operationConfig := range model.Generation.Operations {
+			if strings.TrimSpace(operationConfig.Endpoint) != "" {
+				operationConfig.Endpoint = NormalizeAPIEndpointSuffix(operationConfig.Endpoint)
+			}
+			if strings.TrimSpace(operationConfig.QueryEndpoint) != "" {
+				operationConfig.QueryEndpoint = NormalizeAPIEndpointSuffix(operationConfig.QueryEndpoint)
+			}
+			model.Generation.Operations[operation] = operationConfig
+		}
 	}
 	return ValidateGenerationModel(*model)
 }

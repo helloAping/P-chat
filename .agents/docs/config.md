@@ -42,12 +42,14 @@ type Config struct {
 LLMConfig 核心字段：
 - `Default` — 默认 provider 名称
 - `Providers[]` — 每个 provider 的端点、API key、模型列表
-- `Protocol` — "openai" | "anthropic"
+- `ProviderID` — 供应商策略类型，缺省按 `custom` 处理；设置页“供应商类型”会写入 `provider_id`
+- `StrategyVariant` — 同一供应商下的端点/套餐/区域变体，缺省使用该供应商策略默认值
+- `Protocol` — `openai_chat` | `openai_responses` | `anthropic_messages`，旧 `openai` / `anthropic` 兼容读取
 - `Provider.BaseURL` — 供应商公共 `http(s)` 地址；运行时与模型端点后缀拼接
 - `Provider.CustomHeaders` — 供应商级自定义请求头模板；支持固定值和请求级动态参数
 - `Model.APIEndpoint` — LLM 请求端点后缀；新模型按协议预填且允许编辑
 - `Models[]` — 每个模型的能力标记；`capabilities.input_modalities` 可显式配置 `image`、`video`、`audio`，旧版 `supports_vision` / `supports_audio` 仅作兼容回退
-- `Provider.BaseURL` / `Provider.Vendor` — 仅用于尚未升级配置的兼容读取；V12 会从全局配置移除，新配置与 UI 不再暴露厂商 preset
+- `Provider.Vendor` — 仅用于尚未升级配置的兼容读取；新配置与 UI 不再写入旧 `vendor` 字段
 - `Model.Type` — `llm`（缺省兼容值）或 `media_generation`
 
 `custom_headers` 示例：
@@ -110,9 +112,16 @@ LLMConfig 核心字段：
 `default_params`。Provider 保存公共 `base_url`；LLM 的 `api_endpoint`、媒体模型的
 `endpoint` 与可选 `query_endpoint` 都只保存相对路径后缀。运行时统一使用
 `JoinAPIURL(base_url, endpoint)` 拼接，不按厂商猜测 `/v1` 或 `/v3`。新建 LLM 会按协议
-预填 `/chat/completions` 或 `/messages`；新建媒体生成模型预填 `/images/generations`，这些
-后缀都可编辑，模型编辑器同时展示与 Base URL 拼接后的完整请求路径。V12 会将旧的完整 `api_url` 拆为
-Base URL 与模型端点后缀，并移除厂商 preset 字段。
+预填 `/chat/completions`、`/responses` 或 `/messages`；新建媒体生成模型会按供应商策略、
+协议与勾选的生成能力预填图像/视频/音频 endpoint；没有策略默认值时再回落到通用
+`/images/generations`、`/videos/generations` 或 `/audio/speech`。媒体模型保存一份共享
+`generation.api`，并允许 `generation.operations[operation]` 覆盖单个能力的 endpoint / query
+endpoint / timeout / default params；运行时按共享配置叠加单能力覆盖。模型编辑器同时展示与
+Base URL 拼接后的完整请求路径。设置页新增 Provider 时先选择
+供应商类型（`provider_id`）与协议，再由后端 preset 带入默认 Base URL；同一供应商有多种套餐或区域时，
+`strategy_variant` 可覆盖对应协议的默认 Base URL（例如火山普通 API / Coding Plan / Agent Plan）。
+Custom 仍允许用户手动填写。
+V12 会将旧的完整 `api_url` 拆为 Base URL 与模型端点后缀，并移除旧 `vendor` 字段。
 
 异步模型的 `query_endpoint` 必须包含 `{task_id}` 或 `{id}`。这两个占位符都表示创建接口
 响应中的任务 ID；执行器按 `task_id`、`taskId`、`id`、`job_id` 的顺序提取并替换，用户不

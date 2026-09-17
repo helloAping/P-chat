@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
-	"github.com/p-chat/pchat/internal/requestheader"
+	providerstrategy "github.com/p-chat/pchat/internal/provider"
 )
 
 // ProviderFull is the rich provider view returned by
@@ -26,13 +25,15 @@ import (
 // it returns a slimmer shape (name/model/protocol only) suitable
 // for the model picker in the chat input.
 type ProviderFull struct {
-	Name          string               `json:"name"`
-	Protocol      string               `json:"protocol"`
-	BaseURL       string               `json:"base_url"`
-	APIKey        string               `json:"api_key"`
-	CustomHeaders map[string]string    `json:"custom_headers,omitempty"`
-	IsDefault     bool                 `json:"is_default"`
-	Models        []config.ModelConfig `json:"models"`
+	Name            string               `json:"name"`
+	ProviderID      string               `json:"provider_id"`
+	StrategyVariant string               `json:"strategy_variant"`
+	Protocol        string               `json:"protocol"`
+	BaseURL         string               `json:"base_url"`
+	APIKey          string               `json:"api_key"`
+	CustomHeaders   map[string]string    `json:"custom_headers,omitempty"`
+	IsDefault       bool                 `json:"is_default"`
+	Models          []config.ModelConfig `json:"models"`
 	// Legacy single-model form (kept for backward compat; equals
 	// the first entry of Models when populated).
 	Model string `json:"model,omitempty"`
@@ -173,14 +174,16 @@ func (h *Handler) GetProvider(c *gin.Context) {
 		}
 		models := p.AllModels()
 		c.JSON(http.StatusOK, ProviderFull{
-			Name:          p.Name,
-			Protocol:      p.GetProtocol(),
-			BaseURL:       p.EffectiveBaseURL(),
-			APIKey:        p.APIKey,
-			CustomHeaders: p.CustomHeaders,
-			IsDefault:     p.Name == h.getCfg().LLM.Default,
-			Models:        models,
-			Model:         p.EffectiveModel(),
+			Name:            p.Name,
+			ProviderID:      p.GetProviderID(),
+			StrategyVariant: p.GetStrategyVariant(),
+			Protocol:        p.GetProtocol(),
+			BaseURL:         p.EffectiveBaseURL(),
+			APIKey:          p.APIKey,
+			CustomHeaders:   p.CustomHeaders,
+			IsDefault:       p.Name == h.getCfg().LLM.Default,
+			Models:          models,
+			Model:           p.EffectiveModel(),
 		})
 		return
 	}
@@ -311,25 +314,8 @@ func (h *Handler) SetCapabilities(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "provider": name, "model": model})
 }
 
-// upstreamModel mirrors one entry from the OpenAI GET /v1/models response.
-type upstreamModel struct {
-	ID      string `json:"id"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
-}
-
-// upstreamModelsResponse is the OpenAI /v1/models response shape.
-type upstreamModelsResponse struct {
-	Data []upstreamModel `json:"data"`
-}
-
 // UpstreamModelsItem is the slim item returned to the frontend.
-type UpstreamModelsItem struct {
-	ID      string `json:"id"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
-	Added   bool   `json:"added"` // already exists in this provider
-}
+type UpstreamModelsItem = providerstrategy.ModelListItem
 
 // ProbeUpstreamModelsRequest is the body of
 // POST /api/v1/providers/probe-models. Used by the "add
@@ -337,69 +323,14 @@ type UpstreamModelsItem struct {
 // supplies ephemeral base_url + api_key to list upstream
 // models for the default-model picker.
 type ProbeUpstreamModelsRequest struct {
-	BaseURL       string            `json:"base_url"`
-	APIKey        string            `json:"api_key"`
-	Protocol      string            `json:"protocol"`
-	CustomHeaders map[string]string `json:"custom_headers,omitempty"`
-}
-
-// fetchUpstreamModelList GETs {baseURL}/models with the given
-// API key and maps the OpenAI-shaped response into
-// UpstreamModelsItem. existing marks ids already configured
-// locally (nil = none).
-func fetchUpstreamModelList(ctx context.Context, baseURL, apiKey string, customHeaders map[string]string, existing map[string]bool) ([]UpstreamModelsItem, int, error) {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if baseURL == "" {
-		return nil, http.StatusBadRequest, fmt.Errorf("base_url is required")
-	}
-	if strings.TrimSpace(apiKey) == "" {
-		return nil, http.StatusBadRequest, fmt.Errorf("api_key is required")
-	}
-
-	url := baseURL + "/models"
-	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, http.StatusInternalServerError, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Accept", "application/json")
-	// Anthropic-compatible gateways often accept either; set
-	// both so official Anthropic /v1/models works too.
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	if err := requestheader.Apply(ctx, req.Header, customHeaders); err != nil {
-		return nil, http.StatusBadRequest, fmt.Errorf("invalid custom_headers: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, http.StatusBadGateway, fmt.Errorf("upstream request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, http.StatusBadGateway, fmt.Errorf("upstream returned %d", resp.StatusCode)
-	}
-
-	var parsed upstreamModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return nil, http.StatusInternalServerError, fmt.Errorf("parse upstream response: %w", err)
-	}
-
-	if existing == nil {
-		existing = map[string]bool{}
-	}
-	out := make([]UpstreamModelsItem, 0, len(parsed.Data))
-	for _, m := range parsed.Data {
-		out = append(out, UpstreamModelsItem{
-			ID:      m.ID,
-			Created: m.Created,
-			OwnedBy: m.OwnedBy,
-			Added:   existing[m.ID],
-		})
-	}
-	return out, http.StatusOK, nil
+	ProviderID      string            `json:"provider_id,omitempty"`
+	StrategyVariant string            `json:"strategy_variant,omitempty"`
+	BaseURL         string            `json:"base_url"`
+	APIKey          string            `json:"api_key"`
+	Protocol        string            `json:"protocol"`
+	Capability      string            `json:"capability,omitempty"`
+	Operation       string            `json:"operation,omitempty"`
+	CustomHeaders   map[string]string `json:"custom_headers,omitempty"`
 }
 
 func defaultProbeBaseURL(protocol, baseURL string) string {
@@ -407,12 +338,10 @@ func defaultProbeBaseURL(protocol, baseURL string) string {
 	if baseURL != "" {
 		return baseURL
 	}
-	switch strings.ToLower(strings.TrimSpace(protocol)) {
-	case "anthropic":
+	if config.ProtocolIsAnthropic(protocol) {
 		return "https://api.anthropic.com/v1"
-	default:
-		return "https://api.openai.com/v1"
 	}
+	return "https://api.openai.com/v1"
 }
 
 // ProbeUpstreamModels POST /api/v1/providers/probe-models
@@ -425,12 +354,21 @@ func (h *Handler) ProbeUpstreamModels(c *gin.Context) {
 		return
 	}
 	baseURL := defaultProbeBaseURL(req.Protocol, req.BaseURL)
-	out, status, err := fetchUpstreamModelList(c.Request.Context(), baseURL, req.APIKey, req.CustomHeaders, nil)
+	result, status, err := providerstrategy.ListModels(c.Request.Context(), providerstrategy.ModelListRequest{
+		ProviderID:      req.ProviderID,
+		StrategyVariant: req.StrategyVariant,
+		Protocol:        req.Protocol,
+		BaseURL:         baseURL,
+		APIKey:          req.APIKey,
+		CustomHeaders:   req.CustomHeaders,
+		Capability:      providerstrategy.Capability(req.Capability),
+		Operation:       req.Operation,
+	})
 	if err != nil {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"models": out, "base_url": baseURL})
+	c.JSON(http.StatusOK, result)
 }
 
 // FetchUpstreamModels GET /api/v1/providers/:name/upstream-models
@@ -443,31 +381,41 @@ func (h *Handler) FetchUpstreamModels(c *gin.Context) {
 		return
 	}
 
-	var provider *config.ProviderConfig
+	var savedProvider *config.ProviderConfig
 	for i := range h.getCfg().LLM.Providers {
 		if h.getCfg().LLM.Providers[i].Name == name {
-			provider = &h.getCfg().LLM.Providers[i]
+			savedProvider = &h.getCfg().LLM.Providers[i]
 			break
 		}
 	}
-	if provider == nil {
+	if savedProvider == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "provider not found: " + name})
 		return
 	}
-	if provider.APIKey == "" {
+	if savedProvider.APIKey == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "provider has no API key configured"})
 		return
 	}
 
 	existing := map[string]bool{}
-	for _, m := range provider.AllModels() {
+	for _, m := range savedProvider.AllModels() {
 		existing[m.Name] = true
 	}
 
-	out, status, err := fetchUpstreamModelList(c.Request.Context(), provider.EffectiveBaseURL(), provider.APIKey, provider.CustomHeaders, existing)
+	result, status, err := providerstrategy.ListModels(c.Request.Context(), providerstrategy.ModelListRequest{
+		ProviderID:      savedProvider.GetProviderID(),
+		StrategyVariant: savedProvider.GetStrategyVariant(),
+		Protocol:        savedProvider.GetProtocol(),
+		BaseURL:         savedProvider.EffectiveBaseURL(),
+		APIKey:          savedProvider.APIKey,
+		CustomHeaders:   savedProvider.CustomHeaders,
+		Existing:        existing,
+		Capability:      providerstrategy.Capability(c.Query("capability")),
+		Operation:       c.Query("operation"),
+	})
 	if err != nil {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"models": out})
+	c.JSON(http.StatusOK, result)
 }

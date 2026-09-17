@@ -123,7 +123,7 @@ func (h *Handler) recognitionRouteAvailable(kind config.MediaKind, route config.
 		if provider.Name != route.Provider {
 			continue
 		}
-		if kind != config.MediaImage && provider.GetProtocol() != "openai" {
+		if kind != config.MediaImage && !config.ProtocolIsOpenAICompatible(provider.GetProtocol()) {
 			return false
 		}
 		for _, model := range provider.Models {

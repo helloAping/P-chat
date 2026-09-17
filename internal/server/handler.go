@@ -1207,12 +1207,14 @@ func (h *Handler) Providers(c *gin.Context) {
 		SupportsVision bool `json:"supports_vision"`
 	}
 	type providerInfo struct {
-		Name      string      `json:"name"`
-		Model     string      `json:"model"`
-		Protocol  string      `json:"protocol"`
-		BaseURL   string      `json:"base_url"`
-		IsDefault bool        `json:"is_default"`
-		Models    []modelInfo `json:"models"`
+		Name            string      `json:"name"`
+		ProviderID      string      `json:"provider_id"`
+		StrategyVariant string      `json:"strategy_variant"`
+		Model           string      `json:"model"`
+		Protocol        string      `json:"protocol"`
+		BaseURL         string      `json:"base_url"`
+		IsDefault       bool        `json:"is_default"`
+		Models          []modelInfo `json:"models"`
 	}
 
 	providers := []providerInfo{}
@@ -1226,12 +1228,14 @@ func (h *Handler) Providers(c *gin.Context) {
 			})
 		}
 		providers = append(providers, providerInfo{
-			Name:      p.Name,
-			Model:     p.EffectiveModel(),
-			Protocol:  p.GetProtocol(),
-			BaseURL:   p.EffectiveBaseURL(),
-			IsDefault: p.Name == h.getCfg().LLM.Default,
-			Models:    ms,
+			Name:            p.Name,
+			ProviderID:      p.GetProviderID(),
+			StrategyVariant: p.GetStrategyVariant(),
+			Model:           p.EffectiveModel(),
+			Protocol:        p.GetProtocol(),
+			BaseURL:         p.EffectiveBaseURL(),
+			IsDefault:       p.Name == h.getCfg().LLM.Default,
+			Models:          ms,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"providers": providers})

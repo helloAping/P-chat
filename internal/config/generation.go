@@ -116,10 +116,9 @@ func (c *GenerationOperationConfig) Normalize() {
 }
 
 // MediaGenerationModelConfig declares the canonical operations exposed by a
-// media model and stores one shared API configuration for all of them. The
-// operation map values are retained only so pre-V11 configuration files can be
-// read without losing their per-operation settings; newly written configs use
-// empty values and keep endpoint settings in API.
+// media model. API stores the shared/default request configuration; operation
+// entries may remain empty capability markers or override endpoint/query/
+// timeout/default params for a single capability when a vendor splits routes.
 type MediaGenerationModelConfig struct {
 	Adapter    string                                            `json:"adapter,omitempty"`
 	API        *GenerationOperationConfig                        `json:"api,omitempty"`
@@ -149,20 +148,48 @@ func (c *MediaGenerationModelConfig) SupportedOperations() []GenerationOperation
 	return out
 }
 
-// EffectiveOperationConfig returns the model-level API configuration used for
-// an operation. Legacy per-operation settings remain readable until the model
-// is edited or the V11 migration can safely consolidate identical values.
+// EffectiveOperationConfig returns the shared API configuration with any
+// per-operation override layered on top. Empty operation values remain simple
+// capability markers.
 func (c *MediaGenerationModelConfig) EffectiveOperationConfig(operation GenerationOperation) GenerationOperationConfig {
 	var operationConfig GenerationOperationConfig
 	if c != nil {
 		if c.API != nil {
 			operationConfig = *c.API
-		} else {
-			operationConfig = c.Operations[operation]
+		}
+		if override, ok := c.Operations[operation]; ok {
+			operationConfig = mergeGenerationOperationConfig(operationConfig, override)
 		}
 	}
 	operationConfig.Normalize()
 	return operationConfig
+}
+
+func mergeGenerationOperationConfig(base, override GenerationOperationConfig) GenerationOperationConfig {
+	overridesEndpoint := strings.TrimSpace(override.Endpoint) != ""
+	overridesQueryEndpoint := strings.TrimSpace(override.QueryEndpoint) != ""
+	if overridesEndpoint {
+		base.Endpoint = override.Endpoint
+	}
+	if overridesQueryEndpoint {
+		base.QueryEndpoint = override.QueryEndpoint
+	} else if overridesEndpoint {
+		base.QueryEndpoint = ""
+	}
+	if override.TimeoutSeconds > 0 {
+		base.TimeoutSeconds = override.TimeoutSeconds
+	}
+	if len(override.DefaultParams) > 0 {
+		merged := make(map[string]any, len(base.DefaultParams)+len(override.DefaultParams))
+		for key, value := range base.DefaultParams {
+			merged[key] = value
+		}
+		for key, value := range override.DefaultParams {
+			merged[key] = value
+		}
+		base.DefaultParams = merged
+	}
+	return base
 }
 
 // GenerationModelTarget selects one media model without duplicating provider
@@ -221,6 +248,18 @@ func ValidateGenerationModel(model ModelConfig) error {
 		!strings.Contains(queryEndpoint, "{task_id}") && !strings.Contains(queryEndpoint, "{id}") {
 		return fmt.Errorf("media generation model %q: query_endpoint must contain {task_id} or {id}", model.Name)
 	}
+	for operation, operationConfig := range model.Generation.Operations {
+		if err := validateAPIEndpointSuffix(operationConfig.Endpoint, fmt.Sprintf("operations.%s.endpoint", operation), false); err != nil {
+			return fmt.Errorf("media generation model %q: %w", model.Name, err)
+		}
+		if err := validateAPIEndpointSuffix(operationConfig.QueryEndpoint, fmt.Sprintf("operations.%s.query_endpoint", operation), false); err != nil {
+			return fmt.Errorf("media generation model %q: %w", model.Name, err)
+		}
+		if queryEndpoint := strings.TrimSpace(operationConfig.QueryEndpoint); queryEndpoint != "" &&
+			!strings.Contains(queryEndpoint, "{task_id}") && !strings.Contains(queryEndpoint, "{id}") {
+			return fmt.Errorf("media generation model %q: operations.%s.query_endpoint must contain {task_id} or {id}", model.Name, operation)
+		}
+	}
 	return nil
 }
 
@@ -259,7 +298,15 @@ func (c *Config) NormalizeGeneration() {
 					delete(model.Generation.Operations, operation)
 					continue
 				}
-				if model.Generation.API == nil {
+				if strings.TrimSpace(operationConfig.Endpoint) != "" {
+					operationConfig.Endpoint = NormalizeAPIEndpointSuffix(operationConfig.Endpoint)
+				}
+				if strings.TrimSpace(operationConfig.QueryEndpoint) != "" {
+					operationConfig.QueryEndpoint = NormalizeAPIEndpointSuffix(operationConfig.QueryEndpoint)
+				}
+				if model.Generation.API == nil || strings.TrimSpace(operationConfig.Endpoint) != "" ||
+					strings.TrimSpace(operationConfig.QueryEndpoint) != "" || operationConfig.TimeoutSeconds > 0 ||
+					len(operationConfig.DefaultParams) > 0 {
 					operationConfig.Normalize()
 					model.Generation.Operations[operation] = operationConfig
 				}
@@ -356,8 +403,12 @@ func NormalizeGenerationVendor(vendor string) string {
 		return "volcengine"
 	case "minimax", "hailuo":
 		return "minimax"
-	case "openai":
+	case "kling", "keling", "kuaishou":
+		return "kling"
+	case "openai", "openai_chat", "openai_responses":
 		return "openai"
+	case "anthropic", "anthropic_messages", "claude":
+		return "anthropic"
 	default:
 		return strings.ToLower(strings.TrimSpace(vendor))
 	}

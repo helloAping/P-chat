@@ -223,6 +223,143 @@ func TestHTTPExecutorInfersVolcengineVideoDialectFromEndpoint(t *testing.T) {
 	}
 }
 
+func TestHTTPExecutorUsesProviderStrategyBeforeEndpointInference(t *testing.T) {
+	videoBytes := []byte("video-bytes")
+	var received map[string]any
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/tasks":
+			if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := received["prompt"]; exists {
+				http.Error(w, `{"error":{"message":"content is required"}}`, http.StatusBadRequest)
+				return
+			}
+			content, ok := received["content"].([]any)
+			if !ok || len(content) != 1 {
+				http.Error(w, `{"error":{"message":"content is required"}}`, http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "task-1", "status": "queued"})
+		case r.Method == http.MethodGet && r.URL.Path == "/tasks/task-1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":    "succeeded",
+				"video_url": "data:video/mp4;base64," + base64.StdEncoding.EncodeToString(videoBytes),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewHTTPExecutor(nil, NewLocalAssetStore(t.TempDir(), "/generated"))
+	executor.Client = server.Client()
+	executor.PollInterval = time.Millisecond
+
+	result, err := executor.Generate(context.Background(), Request{
+		SessionID: "session-1", Operation: config.GenerationTextToVideo,
+		Target: config.GenerationModelTarget{Provider: "ark", Model: "video-model"},
+		Prompt: "two characters wave",
+		Dispatch: Dispatch{
+			Target:     config.GenerationModelTarget{Provider: "ark", Model: "video-model"},
+			ProviderID: "volcengine",
+			Protocol:   "openai_chat",
+			BaseURL:    server.URL,
+			Adapter:    "openai",
+			OperationConfig: config.GenerationOperationConfig{
+				Endpoint:       "/tasks",
+				QueryEndpoint:  "/tasks/{id}",
+				TimeoutSeconds: 10,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.JobID != "task-1" || result.Status != StatusSucceeded || len(result.Assets) != 1 {
+		t.Fatalf("unexpected strategy result: %#v", result)
+	}
+}
+
+func TestHTTPExecutorUsesMiniMaxH3ContentArray(t *testing.T) {
+	videoBytes := []byte("video-bytes")
+	var received map[string]any
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/video_generation":
+			if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := received["prompt"]; exists {
+				http.Error(w, `{"type":"error","error":{"type":"bad_request_error","message":"invalid params, binding: expr_path=content, cause=missing required parameter (2013)","http_code":"400"}}`, http.StatusBadRequest)
+				return
+			}
+			content, ok := received["content"].([]any)
+			if !ok || len(content) != 1 {
+				http.Error(w, `{"type":"error","error":{"type":"bad_request_error","message":"invalid params, binding: expr_path=content, cause=missing required parameter (2013)","http_code":"400"}}`, http.StatusBadRequest)
+				return
+			}
+			text, ok := content[0].(map[string]any)
+			if !ok || text["type"] != "text" || text["text"] != "a neon city flythrough" {
+				http.Error(w, `{"type":"error","error":{"type":"bad_request_error","message":"invalid params, content must include a non-empty text item (prompt is required) (2013)","http_code":"400"}}`, http.StatusBadRequest)
+				return
+			}
+			if received["ratio"] != "16:9" {
+				http.Error(w, `{"type":"error","error":{"type":"bad_request_error","message":"invalid ratio"}}`, http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"task_id": "task-1", "status": "queued"})
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/video_generation/task-1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"task": map[string]any{
+					"id":      "task-1",
+					"status":  "succeeded",
+					"content": map[string]any{"url": "data:video/mp4;base64," + base64.StdEncoding.EncodeToString(videoBytes)},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewHTTPExecutor(nil, NewLocalAssetStore(t.TempDir(), "/generated"))
+	executor.Client = server.Client()
+	executor.PollInterval = time.Millisecond
+
+	result, err := executor.Generate(context.Background(), Request{
+		SessionID: "session-1",
+		Operation: config.GenerationTextToVideo,
+		Target:    config.GenerationModelTarget{Provider: "minimax", Model: "minimax-h3"},
+		Prompt:    "a neon city flythrough",
+		Options:   map[string]any{"aspect_ratio": "16:9", "duration_seconds": int64(5)},
+		Dispatch: Dispatch{
+			Target:  config.GenerationModelTarget{Provider: "minimax", Model: "minimax-h3"},
+			BaseURL: server.URL,
+			OperationConfig: config.GenerationOperationConfig{
+				Endpoint:       "/v2/video_generation",
+				QueryEndpoint:  "/v2/video_generation/{task_id}",
+				TimeoutSeconds: 10,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.JobID != "task-1" || result.Status != StatusSucceeded || len(result.Assets) != 1 {
+		t.Fatalf("unexpected MiniMax H3 result: %#v", result)
+	}
+	if received["model"] != "MiniMax-H3" {
+		t.Fatalf("MiniMax H3 model alias was not canonicalized: %#v", received["model"])
+	}
+	if _, exists := received["aspect_ratio"]; exists {
+		t.Fatalf("MiniMax H3 payload should use ratio, not aspect_ratio: %#v", received)
+	}
+}
+
 func TestHTTPExecutorExplainsMismatchedAsyncCreateEndpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"error":{"code":"InvalidEndpointOrModel.NotFound"}}`, http.StatusNotFound)
@@ -545,6 +682,20 @@ func TestBuildVendorPayloadUsesVendorSpecificPromptShapes(t *testing.T) {
 	imageFile, _ := references[0]["image_file"].(string)
 	if !strings.HasPrefix(imageFile, "data:image/png;base64,") || minimaxImage["n"] != int64(2) {
 		t.Fatalf("MiniMax image payload = %#v", minimaxImage)
+	}
+
+	legacyMiniMaxVideo := buildVendorPayload(Request{
+		Operation: config.GenerationImageToVideo, Target: target, Prompt: "make it move",
+		Dispatch: Dispatch{Vendor: "minimax", OperationConfig: config.GenerationOperationConfig{Endpoint: "/v1/video_generation"}},
+	}, []InputSource{{MIMEType: "image/png", Data: []byte("frame")}})
+	if legacyMiniMaxVideo["prompt"] != "make it move" {
+		t.Fatalf("legacy MiniMax video prompt was changed: %#v", legacyMiniMaxVideo)
+	}
+	if _, exists := legacyMiniMaxVideo["content"]; exists {
+		t.Fatalf("legacy MiniMax video payload should not use H3 content array: %#v", legacyMiniMaxVideo)
+	}
+	if firstFrame, _ := legacyMiniMaxVideo["first_frame_image"].(string); !strings.HasPrefix(firstFrame, "data:image/png;base64,") {
+		t.Fatalf("legacy MiniMax video first frame = %#v", legacyMiniMaxVideo)
 	}
 
 	volcImage := buildVendorPayload(Request{

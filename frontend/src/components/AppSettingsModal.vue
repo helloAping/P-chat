@@ -25,7 +25,7 @@ import { computed, h, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from
 import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
   NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree,
-  NRadioGroup, NRadioButton, useMessage,
+  NRadioGroup, NRadioButton, NCheckbox, NCheckboxGroup, useMessage,
 } from 'naive-ui'
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash, Folder,
@@ -215,6 +215,7 @@ const settingsTabs = [
 
 // --- Provider state ---
 const providers = ref<api.ProviderInfo[]>([])
+const providerPresets = ref<api.ProviderPreset[]>([])
 const selectedName = ref<string | null>(null)
 const selected = computed(() =>
   providers.value.find(p => p.name === selectedName.value) || null,
@@ -222,7 +223,9 @@ const selected = computed(() =>
 
 // Edit form (top of right pane). Mirrors the unified PATCH body.
 const editName = ref('')
-const editProtocol = ref<'openai' | 'anthropic'>('openai')
+const editProviderID = ref('custom')
+const editStrategyVariant = ref('')
+const editProtocol = ref<api.ProviderProtocol>('openai_chat')
 const editBaseURL = ref('')
 const editAPIKey = ref('')
 type ProviderHeaderRow = { id: string; name: string; value: string }
@@ -238,7 +241,9 @@ const dirty = ref<Set<string>>(new Set())
 // Add-provider form (shown in NModal)
 const showAddProvider = ref(false)
 const newName = ref('')
-const newProtocol = ref<'openai' | 'anthropic'>('openai')
+const newProviderID = ref('custom')
+const newStrategyVariant = ref('')
+const newProtocol = ref<api.ProviderProtocol>('openai_chat')
 const newBaseURL = ref('')
 const newAPIKey = ref('')
 const newCustomHeaders = ref<ProviderHeaderRow[]>([])
@@ -308,6 +313,8 @@ const editModelOut = ref<number | null>(null)
 const editModelCapabilities = ref<api.MediaKind[]>([])
 const editModelType = ref<api.ModelType>('llm')
 const editGenerationOperations = ref<api.GenerationOperation[]>([])
+const editGenerationOperationAPIs = ref<Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>>>({})
+type CapabilityOption<T extends string> = { label: string; value: T; hint: string }
 const generationOperationDefs: Array<{ operation: api.GenerationOperation; label: string; hint: string }> = [
   { operation: 'text_to_image', label: '文生图', hint: '仅使用文本提示词生成图片' },
   { operation: 'image_to_image', label: '图生图', hint: '使用上传图片 ID 作为参考图' },
@@ -319,10 +326,14 @@ const generationOperationDefs: Array<{ operation: api.GenerationOperation; label
   { operation: 'text_to_sound', label: '文生音效', hint: '使用描述生成音效' },
   { operation: 'audio_to_audio', label: '音频生音频', hint: '使用上传音频 ID 进行转换' },
 ]
-const generationOperationOptions = generationOperationDefs.map(item => ({ label: item.label, value: item.operation }))
+const generationOperationOptions: Array<CapabilityOption<api.GenerationOperation>> = generationOperationDefs.map(item => ({
+  label: item.label,
+  value: item.operation,
+  hint: item.hint,
+}))
 
 function emptyGenerationAPIConfig(): api.GenerationOperationConfig {
-  return { endpoint: '/images/generations', query_endpoint: '', timeout_seconds: 600, default_params: {} }
+  return defaultGenerationAPIConfig([])
 }
 
 function isCompleteHTTPURL(value: string | undefined): boolean {
@@ -335,7 +346,278 @@ function isCompleteHTTPURL(value: string | undefined): boolean {
 }
 
 function defaultLLMAPIEndpoint(protocol = selected.value?.protocol): string {
-  return protocol === 'anthropic' ? '/messages' : '/chat/completions'
+  const normalized = normalizeProviderProtocol(protocol)
+  if (normalized === 'anthropic_messages') return '/messages'
+  if (normalized === 'openai_responses') return '/responses'
+  return '/chat/completions'
+}
+
+function normalizeProviderProtocol(protocol?: string): api.ProviderProtocol {
+  if (protocol === 'anthropic' || protocol === 'anthropic_messages') return 'anthropic_messages'
+  if (protocol === 'openai_responses') return 'openai_responses'
+  return 'openai_chat'
+}
+
+function isAnthropicProtocol(protocol?: string): boolean {
+  return normalizeProviderProtocol(protocol) === 'anthropic_messages'
+}
+
+function normalizeProviderID(providerID?: string): string {
+  return (providerID || '').trim().toLowerCase() || 'custom'
+}
+
+function normalizeStrategyVariant(variant?: string): string {
+  return (variant || '').trim().toLowerCase()
+}
+
+function providerPresetByID(providerID?: string): api.ProviderPreset | undefined {
+  const normalized = normalizeProviderID(providerID)
+  return providerPresets.value.find(preset => preset.id === normalized)
+}
+
+function providerDisplayName(providerID?: string): string {
+  const normalized = normalizeProviderID(providerID)
+  return providerPresetByID(normalized)?.display_name || normalized
+}
+
+function providerVariantDisplayName(providerID?: string, variant?: string): string {
+  const normalized = normalizeStrategyVariant(variant)
+  if (!normalized) return ''
+  return providerPresetByID(providerID)?.variants?.find(item => item.id === normalized)?.display_name || normalized
+}
+
+function providerVariantPreset(providerID?: string, variant?: string): api.ProviderStrategyVariant | undefined {
+  const normalized = normalizeStrategyVariant(variant) || defaultVariantForProvider(providerID)
+  if (!normalized) return undefined
+  return providerPresetByID(providerID)?.variants?.find(item => item.id === normalized)
+}
+
+function protocolDisplayName(providerID: string | undefined, protocol: api.ProviderProtocol): string {
+  const normalized = normalizeProviderProtocol(protocol)
+  return providerPresetByID(providerID)?.protocols.find(item => item.id === normalized)?.display_name
+    || protocolOptions.find(item => item.value === normalized)?.label
+    || normalized
+}
+
+function defaultVariantForProvider(providerID?: string): string {
+  const preset = providerPresetByID(providerID)
+  return normalizeStrategyVariant(preset?.default_variant)
+}
+
+function protocolPresetFor(providerID: string, protocol: api.ProviderProtocol): api.ProviderProtocolPreset | undefined {
+  const normalized = normalizeProviderProtocol(protocol)
+  return providerPresetByID(providerID)?.protocols.find(item => item.id === normalized)
+}
+
+function endpointDefaultsForSelectedProvider(): api.ProviderEndpointDefaults | undefined {
+  const providerID = normalizeProviderID(selected.value?.provider_id)
+  const protocol = normalizeProviderProtocol(selected.value?.protocol)
+  return protocolPresetFor(providerID, protocol)?.endpoint_defaults
+}
+
+function generationOutputKind(operation: api.GenerationOperation): api.MediaKind {
+  if (operation === 'text_to_video' || operation === 'image_to_video' || operation === 'video_to_video') return 'video'
+  if (operation === 'text_to_speech' || operation === 'text_to_music' || operation === 'text_to_sound' || operation === 'audio_to_audio') return 'audio'
+  return 'image'
+}
+
+function primaryGenerationKind(operations: api.GenerationOperation[]): api.MediaKind {
+  if (operations.some(operation => generationOutputKind(operation) === 'video')) return 'video'
+  if (operations.some(operation => generationOutputKind(operation) === 'audio')) return 'audio'
+  return 'image'
+}
+
+function defaultGenerationEndpoint(kind: api.MediaKind): string {
+  const defaults = endpointDefaultsForSelectedProvider()
+  if (kind === 'video' && defaults?.video_generation) return defaults.video_generation
+  if (kind === 'audio' && defaults?.audio_generation) return defaults.audio_generation
+  if (defaults?.image_generation) return defaults.image_generation
+  const protocol = normalizeProviderProtocol(selected.value?.protocol)
+  if (protocol === 'anthropic_messages') return '/messages'
+  if (protocol === 'openai_responses') return '/responses'
+  if (kind === 'video') return '/videos/generations'
+  if (kind === 'audio') return '/audio/speech'
+  return '/images/generations'
+}
+
+function defaultGenerationQueryEndpoint(kind: api.MediaKind): string {
+  const defaults = endpointDefaultsForSelectedProvider()
+  if (kind === 'video') return defaults?.video_task_query || ''
+  if (kind === 'audio') return defaults?.audio_task_query || ''
+  return defaults?.image_task_query || ''
+}
+
+function defaultGenerationTimeout(kind: api.MediaKind): number {
+  if (kind === 'video') return 600
+  if (kind === 'audio') return 180
+  return 120
+}
+
+function defaultGenerationAPIConfig(operations: api.GenerationOperation[] = editGenerationOperations.value): api.GenerationOperationConfig {
+  const kind = primaryGenerationKind(operations)
+  return {
+    endpoint: defaultGenerationEndpoint(kind),
+    query_endpoint: defaultGenerationQueryEndpoint(kind),
+    timeout_seconds: defaultGenerationTimeout(kind),
+    default_params: {},
+  }
+}
+
+function generationOperationLabel(operation: api.GenerationOperation): string {
+  return generationOperationDefs.find(item => item.operation === operation)?.label || operation
+}
+
+function operationDefaultAPIConfig(operation: api.GenerationOperation): api.GenerationOperationConfig {
+  return defaultGenerationAPIConfig([operation])
+}
+
+function normalizeGenerationAPIConfigForSave(config?: api.GenerationOperationConfig): api.GenerationOperationConfig {
+  const endpoint = normalizeEndpointSuffix(config?.endpoint)
+  const queryEndpoint = normalizeEndpointSuffix(config?.query_endpoint)
+  const timeoutSeconds = config?.timeout_seconds || 0
+  const defaultParams = config?.default_params || {}
+  return {
+    endpoint: endpoint || undefined,
+    query_endpoint: queryEndpoint || undefined,
+    timeout_seconds: timeoutSeconds || undefined,
+    default_params: Object.keys(defaultParams).length ? defaultParams : undefined,
+  }
+}
+
+function generationAPIConfigHasValue(config?: api.GenerationOperationConfig): boolean {
+  if (!config) return false
+  return !!(
+    config.endpoint?.trim()
+    || config.query_endpoint?.trim()
+    || (config.timeout_seconds && config.timeout_seconds > 0)
+    || Object.keys(config.default_params || {}).length
+  )
+}
+
+function generationAPIConfigEquals(a?: api.GenerationOperationConfig, b?: api.GenerationOperationConfig): boolean {
+  const left = normalizeGenerationAPIConfigForSave(a)
+  const right = normalizeGenerationAPIConfigForSave(b)
+  return (left.endpoint || '') === (right.endpoint || '')
+    && (left.query_endpoint || '') === (right.query_endpoint || '')
+    && (left.timeout_seconds || 0) === (right.timeout_seconds || 0)
+}
+
+function generationOperationDefaultDiffersFromShared(operation: api.GenerationOperation): boolean {
+  return !generationAPIConfigEquals(operationDefaultAPIConfig(operation), editGenerationAPI.value)
+}
+
+function normalizeGenerationOperationOverride(operation: api.GenerationOperation): api.GenerationOperationConfig {
+  const normalized = normalizeGenerationAPIConfigForSave(editGenerationOperationAPIs.value[operation])
+  return generationAPIConfigHasValue(normalized) ? normalized : {}
+}
+
+function updateGenerationOperationAPI(
+  operation: api.GenerationOperation,
+  patch: Partial<api.GenerationOperationConfig>,
+) {
+  const current = editGenerationOperationAPIs.value[operation] || {}
+  const next: api.GenerationOperationConfig = { ...current, ...patch }
+  if (!generationAPIConfigHasValue(next)) {
+    const { [operation]: _removed, ...rest } = editGenerationOperationAPIs.value
+    editGenerationOperationAPIs.value = rest
+    return
+  }
+  editGenerationOperationAPIs.value = {
+    ...editGenerationOperationAPIs.value,
+    [operation]: next,
+  }
+}
+
+function resetGenerationOperationAPI(operation: api.GenerationOperation) {
+  const { [operation]: _removed, ...rest } = editGenerationOperationAPIs.value
+  editGenerationOperationAPIs.value = rest
+}
+
+function syncGenerationOperationAPIOverrides(force = false) {
+  const selectedOperations = new Set(editGenerationOperations.value)
+  const next: Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>> = {}
+  for (const operation of editGenerationOperations.value) {
+    const existing = editGenerationOperationAPIs.value[operation]
+    const defaultForOperation = operationDefaultAPIConfig(operation)
+    if (existing && generationAPIConfigHasValue(existing) && !force) {
+      next[operation] = existing
+      continue
+    }
+    if (generationOperationDefaultDiffersFromShared(operation) && selectedOperations.has(operation)) {
+      next[operation] = { ...defaultForOperation }
+    }
+  }
+  editGenerationOperationAPIs.value = next
+}
+
+function knownGenerationEndpointDefaults(): string[] {
+  const out = new Set(['/images/generations', '/videos/generations', '/audio/speech', '/responses', '/messages'])
+  for (const preset of providerPresets.value) {
+    for (const protocol of preset.protocols) {
+      const defaults = protocol.endpoint_defaults
+      for (const endpoint of [
+        defaults.image_generation,
+        defaults.video_generation,
+        defaults.audio_generation,
+        defaults.image_task_query,
+        defaults.video_task_query,
+        defaults.audio_task_query,
+      ]) {
+        if (endpoint) out.add(normalizeEndpointSuffix(endpoint))
+      }
+    }
+  }
+  return [...out]
+}
+
+function isKnownGenerationEndpoint(value: string | undefined): boolean {
+  const endpoint = normalizeEndpointSuffix(value)
+  if (!endpoint) return true
+  return knownGenerationEndpointDefaults().includes(endpoint)
+}
+
+function syncGenerationAPIWithDefaults(force = false) {
+  const defaults = defaultGenerationAPIConfig(editGenerationOperations.value)
+  if (force || !editGenerationAPI.value.endpoint?.trim() || isKnownGenerationEndpoint(editGenerationAPI.value.endpoint)) {
+    editGenerationAPI.value.endpoint = defaults.endpoint
+  }
+  if (force || !editGenerationAPI.value.query_endpoint?.trim() || isKnownGenerationEndpoint(editGenerationAPI.value.query_endpoint)) {
+    editGenerationAPI.value.query_endpoint = defaults.query_endpoint
+  }
+  const timeout = editGenerationAPI.value.timeout_seconds || 0
+  if (force || timeout <= 0 || [120, 180, 600].includes(timeout)) {
+    editGenerationAPI.value.timeout_seconds = defaults.timeout_seconds
+  }
+  syncGenerationOperationAPIOverrides()
+}
+
+function firstProtocolForProvider(providerID?: string): api.ProviderProtocol {
+  const preset = providerPresetByID(providerID)
+  return normalizeProviderProtocol(preset?.protocols.find(item => !item.disabled_reason)?.id)
+}
+
+function defaultBaseURLFor(providerID: string, protocol: api.ProviderProtocol, variant?: string): string {
+  const normalizedProtocol = normalizeProviderProtocol(protocol)
+  const variantBaseURL = providerVariantPreset(providerID, variant)?.default_base_urls?.[normalizedProtocol]
+  if (variantBaseURL) return variantBaseURL
+  return protocolPresetFor(providerID, protocol)?.default_base_url || ''
+}
+
+function providerProtocolOptions(providerID?: string) {
+  const preset = providerPresetByID(providerID)
+  if (!preset) return protocolOptions
+  return preset.protocols.map(item => ({
+    label: item.display_name,
+    value: item.id,
+    disabled: !!item.disabled_reason,
+  }))
+}
+
+function providerVariantOptions(providerID?: string) {
+  return (providerPresetByID(providerID)?.variants || []).map(item => ({
+    label: item.display_name,
+    value: item.id,
+  }))
 }
 
 function normalizeEndpointSuffix(value: string | undefined): string {
@@ -388,25 +670,61 @@ const modelTypeOptions = [
   { label: '媒体生成模型', value: 'media_generation' },
 ]
 
-function onGenerationOperationsUpdate(operations: api.GenerationOperation[]) {
-  editGenerationOperations.value = operations
-}
-
 function buildMediaGenerationConfig(): api.MediaGenerationModelConfig {
   const operations: Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>> = {}
   for (const operation of editGenerationOperations.value) {
-    operations[operation] = {}
+    operations[operation] = normalizeGenerationOperationOverride(operation)
   }
+  const sharedAPI = normalizeGenerationAPIConfigForSave(editGenerationAPI.value)
   return {
     api: {
-      endpoint: editGenerationAPI.value.endpoint?.trim() || undefined,
-      query_endpoint: editGenerationAPI.value.query_endpoint?.trim() || undefined,
-      timeout_seconds: editGenerationAPI.value.timeout_seconds || 600,
-      default_params: editGenerationAPI.value.default_params || {},
+      endpoint: sharedAPI.endpoint,
+      query_endpoint: sharedAPI.query_endpoint,
+      timeout_seconds: sharedAPI.timeout_seconds || 600,
+      default_params: sharedAPI.default_params || {},
     },
     operations,
   }
 }
+
+function validateGenerationAPIConfig(
+  label: string,
+  config: api.GenerationOperationConfig,
+  endpointRequired: boolean,
+): boolean {
+  if (!isEndpointSuffix(config.endpoint, endpointRequired)) {
+    message.warning(`${label} API 端点只能填写相对于 Base URL 的路径后缀`)
+    return false
+  }
+  if (!isEndpointSuffix(config.query_endpoint, false)) {
+    message.warning(`${label} 查询端点只能填写相对于 Base URL 的路径后缀`)
+    return false
+  }
+  if (config.query_endpoint?.trim() && !hasTaskIDPlaceholder(config.query_endpoint)) {
+    message.warning(`${label} 异步查询端点必须包含 {task_id} 或 {id} 占位符`)
+    return false
+  }
+  return true
+}
+
+function validateMediaGenerationForm(): boolean {
+  if (editGenerationOperations.value.length === 0) {
+    message.warning('媒体生成模型至少需要选择一种生成能力')
+    return false
+  }
+  if (!validateGenerationAPIConfig('媒体生成', editGenerationAPI.value, true)) {
+    return false
+  }
+  for (const operation of editGenerationOperations.value) {
+    const override = editGenerationOperationAPIs.value[operation]
+    if (!override || !generationAPIConfigHasValue(override)) continue
+    if (!validateGenerationAPIConfig(generationOperationLabel(operation), override, false)) {
+      return false
+    }
+  }
+  return true
+}
+
 const contextWindowOptions = [
   { label: '32K', value: 32_000 },
   { label: '64K', value: 64_000 },
@@ -417,10 +735,10 @@ const contextWindowOptions = [
   { label: '1M', value: 1_000_000 },
   { label: '2M', value: 2_000_000 },
 ]
-const modelCapabilityOptions: Array<{ label: string; value: api.MediaKind }> = [
-  { label: '图片识别', value: 'image' },
-  { label: '视频识别', value: 'video' },
-  { label: '音频识别', value: 'audio' },
+const modelCapabilityOptions: Array<CapabilityOption<api.MediaKind>> = [
+  { label: '图片识别', value: 'image', hint: '支持图片、截图等视觉输入' },
+  { label: '视频识别', value: 'video', hint: '支持视频帧或视频文件输入' },
+  { label: '音频识别', value: 'audio', hint: '支持语音、音频文件输入' },
 ]
 
 function modelSupportsCapability(model: api.ModelInfo, capability: api.MediaKind): boolean {
@@ -438,6 +756,10 @@ const showUpstreamModels = ref(false)
 const upstreamModels = ref<api.UpstreamModelItem[]>([])
 const fetchingUpstream = ref(false)
 const upstreamError = ref('')
+const upstreamSource = ref('')
+const upstreamEndpoint = ref('')
+const upstreamBaseURL = ref('')
+const upstreamDefaultEndpoint = ref('')
 
 // --- Style state ---
 const styles = ref<api.StyleInfo[]>([])
@@ -693,7 +1015,17 @@ watch(tab, (v) => {
 })
 
 async function refresh() {
-  await Promise.all([refreshProviders(), refreshStyles()])
+  await Promise.all([refreshProviderPresets(), refreshProviders(), refreshStyles()])
+}
+
+async function refreshProviderPresets() {
+  try {
+    const result = await api.fetchProviderPresets()
+    providerPresets.value = result.presets || []
+  } catch (e: any) {
+    providerPresets.value = []
+    message.warning(`加载供应商类型失败，将按 Custom 配置: ${e.message}`)
+  }
 }
 
 async function refreshProviders() {
@@ -755,10 +1087,81 @@ async function selectProvider(name: string) {
   }
 }
 
+function isKnownPresetBaseURL(value: string): boolean {
+  const normalized = value.trim().replace(/\/+$/, '')
+  if (!normalized) return false
+  return providerPresets.value.some(preset =>
+    preset.protocols.some(protocol => protocol.default_base_url?.replace(/\/+$/, '') === normalized),
+  )
+}
+
+function applyNewProviderDefaults(providerID: string) {
+  const nextProviderID = normalizeProviderID(providerID)
+  newProviderID.value = nextProviderID
+  newStrategyVariant.value = defaultVariantForProvider(nextProviderID)
+  newProtocol.value = firstProtocolForProvider(nextProviderID)
+  newBaseURL.value = defaultBaseURLFor(nextProviderID, newProtocol.value, newStrategyVariant.value)
+  if (!newName.value.trim() && nextProviderID !== 'custom') {
+    newName.value = nextProviderID
+  }
+}
+
+function onNewProviderIDUpdate(providerID: string) {
+  applyNewProviderDefaults(providerID)
+}
+
+function onNewProtocolUpdate(protocol: api.ProviderProtocol) {
+  newProtocol.value = normalizeProviderProtocol(protocol)
+  newBaseURL.value = defaultBaseURLFor(newProviderID.value, newProtocol.value, newStrategyVariant.value)
+}
+
+function onNewStrategyVariantUpdate(variant: string) {
+  newStrategyVariant.value = normalizeStrategyVariant(variant)
+  newBaseURL.value = defaultBaseURLFor(newProviderID.value, newProtocol.value, newStrategyVariant.value)
+}
+
+function onEditProviderIDUpdate(providerID: string) {
+  const nextProviderID = normalizeProviderID(providerID)
+  editProviderID.value = nextProviderID
+  markDirty('provider_id')
+
+  editStrategyVariant.value = defaultVariantForProvider(nextProviderID)
+  markDirty('strategy_variant')
+
+  editProtocol.value = firstProtocolForProvider(nextProviderID)
+  markDirty('protocol')
+
+  const baseURL = defaultBaseURLFor(nextProviderID, editProtocol.value, editStrategyVariant.value)
+  if (baseURL && (!editBaseURL.value.trim() || isKnownPresetBaseURL(editBaseURL.value))) {
+    editBaseURL.value = baseURL
+    markDirty('base_url')
+  }
+}
+
+function onEditProtocolUpdate(protocol: api.ProviderProtocol) {
+  editProtocol.value = normalizeProviderProtocol(protocol)
+  markDirty('protocol')
+  const baseURL = defaultBaseURLFor(editProviderID.value, editProtocol.value, editStrategyVariant.value)
+  if (baseURL && (!editBaseURL.value.trim() || isKnownPresetBaseURL(editBaseURL.value))) {
+    editBaseURL.value = baseURL
+    markDirty('base_url')
+  }
+}
+
+function onEditStrategyVariantUpdate(variant: string) {
+  editStrategyVariant.value = normalizeStrategyVariant(variant)
+  markDirty('strategy_variant')
+  const baseURL = defaultBaseURLFor(editProviderID.value, editProtocol.value, editStrategyVariant.value)
+  if (baseURL && (!editBaseURL.value.trim() || isKnownPresetBaseURL(editBaseURL.value))) {
+    editBaseURL.value = baseURL
+    markDirty('base_url')
+  }
+}
+
 function openAddProvider() {
   showAddProvider.value = true
   newName.value = ''
-  newProtocol.value = 'openai'
+  applyNewProviderDefaults('custom')
   newBaseURL.value = ''
   newAPIKey.value = ''
   newCustomHeaders.value = []
@@ -784,7 +1187,9 @@ function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   const src = p || providers.value.find(x => x.name === name)
   if (!src) return
   editName.value = src.name
-  editProtocol.value = (src.protocol as 'openai' | 'anthropic') || 'openai'
+  editProviderID.value = normalizeProviderID(src.provider_id)
+  editStrategyVariant.value = normalizeStrategyVariant(src.strategy_variant)
+  editProtocol.value = normalizeProviderProtocol(src.protocol)
   editBaseURL.value = src.base_url || src.api_url || ''
   editAPIKey.value = src.api_key || ''
   editCustomHeaders.value = providerHeadersToRows(src.custom_headers)
@@ -810,6 +1215,8 @@ async function onAddProvider() {
     const customHeaders = providerHeaderRowsToRecord(newCustomHeaders.value)
     await api.addProvider({
       name: addedName,
+      provider_id: newProviderID.value,
+      strategy_variant: newStrategyVariant.value,
       protocol: newProtocol.value,
       base_url: newBaseURL.value.trim(),
       api_key: newAPIKey.value.trim(),
@@ -860,6 +1267,12 @@ async function onSaveProvider() {
   if (dirty.value.has('protocol')) {
     body.protocol = editProtocol.value
   }
+  if (dirty.value.has('provider_id')) {
+    body.provider_id = editProviderID.value
+  }
+  if (dirty.value.has('strategy_variant')) {
+    body.strategy_variant = editStrategyVariant.value
+  }
   if (dirty.value.has('base_url')) {
     body.base_url = editBaseURL.value.trim()
   }
@@ -906,6 +1319,7 @@ function resetModelForm() {
   editModelType.value = 'llm'
   editGenerationOperations.value = []
   editGenerationAPI.value = emptyGenerationAPIConfig()
+  editGenerationOperationAPIs.value = {}
 }
 
 function onShowAddModel() {
@@ -921,24 +1335,11 @@ async function onAddModel() {
     return
   }
   const providerName = selected.value.name
-  if (editModelType.value === 'media_generation' && editGenerationOperations.value.length === 0) {
-    message.warning('媒体生成模型至少需要选择一种生成能力')
-    return
-  }
   if (editModelType.value === 'llm' && !isEndpointSuffix(editModelAPIEndpoint.value)) {
     message.warning('大语言模型 API 端点只能填写相对于 Base URL 的路径后缀')
     return
   }
-  if (editModelType.value === 'media_generation' && !isEndpointSuffix(editGenerationAPI.value.endpoint)) {
-    message.warning('媒体生成 API 端点只能填写相对于 Base URL 的路径后缀')
-    return
-  }
-  if (editModelType.value === 'media_generation' && !isEndpointSuffix(editGenerationAPI.value.query_endpoint, false)) {
-    message.warning('媒体生成查询端点只能填写相对于 Base URL 的路径后缀')
-    return
-  }
-  if (editModelType.value === 'media_generation' && editGenerationAPI.value.query_endpoint?.trim() && !hasTaskIDPlaceholder(editGenerationAPI.value.query_endpoint)) {
-    message.warning('异步查询端点必须包含 {task_id} 或 {id} 占位符')
+  if (editModelType.value === 'media_generation' && !validateMediaGenerationForm()) {
     return
   }
   try {
@@ -1006,6 +1407,14 @@ function onEditModel(m: api.ModelInfo) {
   const legacyOperationConfig = editGenerationOperations.value
     .map(operation => m.generation?.operations?.[operation])
     .find(operationConfig => operationConfig && Object.keys(operationConfig).length > 0)
+  const operationOverrides: Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>> = {}
+  for (const operation of editGenerationOperations.value) {
+    const operationConfig = m.generation?.operations?.[operation]
+    if (generationAPIConfigHasValue(operationConfig)) {
+      operationOverrides[operation] = { ...operationConfig }
+    }
+  }
+  editGenerationOperationAPIs.value = operationOverrides
   editGenerationAPI.value = {
     ...emptyGenerationAPIConfig(),
     ...(legacyOperationConfig || {}),
@@ -1018,24 +1427,11 @@ async function onSaveModel() {
   if (!selected.value || !editingModelName.value) return
   const provider = selected.value.name
   const model = editingModelName.value
-  if (editModelType.value === 'media_generation' && editGenerationOperations.value.length === 0) {
-    message.warning('媒体生成模型至少需要选择一种生成能力')
-    return
-  }
   if (editModelType.value === 'llm' && !isEndpointSuffix(editModelAPIEndpoint.value)) {
     message.warning('大语言模型 API 端点只能填写相对于 Base URL 的路径后缀')
     return
   }
-  if (editModelType.value === 'media_generation' && !isEndpointSuffix(editGenerationAPI.value.endpoint)) {
-    message.warning('媒体生成 API 端点只能填写相对于 Base URL 的路径后缀')
-    return
-  }
-  if (editModelType.value === 'media_generation' && !isEndpointSuffix(editGenerationAPI.value.query_endpoint, false)) {
-    message.warning('媒体生成查询端点只能填写相对于 Base URL 的路径后缀')
-    return
-  }
-  if (editModelType.value === 'media_generation' && editGenerationAPI.value.query_endpoint?.trim() && !hasTaskIDPlaceholder(editGenerationAPI.value.query_endpoint)) {
-    message.warning('异步查询端点必须包含 {task_id} 或 {id} 占位符')
+  if (editModelType.value === 'media_generation' && !validateMediaGenerationForm()) {
     return
   }
   try {
@@ -1131,9 +1527,18 @@ async function onFetchUpstreamModels() {
   if (!selected.value) return
   fetchingUpstream.value = true
   upstreamError.value = ''
+  upstreamSource.value = ''
+  upstreamEndpoint.value = ''
+  upstreamBaseURL.value = ''
+  upstreamDefaultEndpoint.value = ''
   try {
     const res = await api.fetchUpstreamModels(selected.value.name)
     upstreamModels.value = res.models || []
+    upstreamError.value = res.error || ''
+    upstreamSource.value = res.source || ''
+    upstreamEndpoint.value = res.endpoint || ''
+    upstreamBaseURL.value = res.base_url || ''
+    upstreamDefaultEndpoint.value = res.default_endpoint || ''
     showUpstreamModels.value = true
   } catch (e: any) {
     upstreamError.value = e?.message || '获取失败'
@@ -1147,7 +1552,7 @@ function onImportUpstreamModel(model: api.UpstreamModelItem) {
   if (model.added) return
   resetModelForm()
   editModelName.value = model.id
-  editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
+  editModelAPIEndpoint.value = model.default_endpoint || upstreamDefaultEndpoint.value || defaultLLMAPIEndpoint()
   showUpstreamModels.value = false
   showAddModel.value = true
 }
@@ -1155,6 +1560,17 @@ function onImportUpstreamModel(model: api.UpstreamModelItem) {
 watch(editModelType, type => {
   if (type === 'llm' && !editModelAPIEndpoint.value.trim()) {
     editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
+  }
+  if (type === 'media_generation') {
+    syncGenerationAPIWithDefaults()
+  }
+})
+
+watch(editGenerationOperations, () => {
+  if (editModelType.value === 'media_generation' && !editingModelName.value) {
+    syncGenerationAPIWithDefaults()
+  } else if (editModelType.value === 'media_generation') {
+    syncGenerationOperationAPIOverrides()
   }
 })
 
@@ -1443,9 +1859,21 @@ function isBuiltIn(id: string) { return builtInStyles.has(id) }
 
 // protocol options reused in two places.
 const protocolOptions = [
-  { label: 'OpenAI Chat', value: 'openai' },
-  { label: 'Anthropic Messages', value: 'anthropic' },
+  { label: 'OpenAI Chat', value: 'openai_chat' },
+  { label: 'OpenAI Responses', value: 'openai_responses' },
+  { label: 'Anthropic Messages', value: 'anthropic_messages' },
 ]
+const providerPresetOptions = computed(() => {
+  const options = providerPresets.value.map(preset => ({
+    label: preset.display_name,
+    value: preset.id,
+  }))
+  return options.length > 0 ? options : [{ label: 'Custom', value: 'custom' }]
+})
+const editProtocolOptions = computed(() => providerProtocolOptions(editProviderID.value))
+const newProtocolOptions = computed(() => providerProtocolOptions(newProviderID.value))
+const editVariantOptions = computed(() => providerVariantOptions(editProviderID.value))
+const newVariantOptions = computed(() => providerVariantOptions(newProviderID.value))
 
 const recognitionProviderOptions = computed(() =>
   providers.value.map(p => ({ label: p.name, value: p.name })),
@@ -2233,7 +2661,9 @@ function kbModelSupportsVision(scanModel: string) {
                   </NPopconfirm>
                 </div>
                 <div class="provider-item-sub">
-                  <span class="provider-item-protocol">{{ p.protocol }}</span>
+                  <span class="provider-item-protocol">
+                    {{ providerDisplayName(p.provider_id) }} · {{ protocolDisplayName(p.provider_id, p.protocol) }}
+                  </span>
                   <span class="provider-item-count">{{ p.models?.length || 0 }} 模型</span>
                 </div>
               </button>
@@ -2255,7 +2685,11 @@ function kbModelSupportsVision(scanModel: string) {
                 <div class="settings-section-header">
                   <div class="provider-editor-title">
                     <h3 class="settings-section-title">{{ selected.name }}</h3>
-                    <NTag size="tiny" :bordered="false">{{ selected.protocol }}</NTag>
+                    <NTag size="tiny" :bordered="false">{{ providerDisplayName(selected.provider_id) }}</NTag>
+                    <NTag size="tiny" :bordered="false">{{ protocolDisplayName(selected.provider_id, selected.protocol) }}</NTag>
+                    <NTag v-if="providerVariantDisplayName(selected.provider_id, selected.strategy_variant)" size="tiny" :bordered="false">
+                      {{ providerVariantDisplayName(selected.provider_id, selected.strategy_variant) }}
+                    </NTag>
                     <NTag v-if="selected.is_default" type="success" size="tiny" :bordered="false">默认</NTag>
                   </div>
                   <div class="settings-form-actions">
@@ -2292,21 +2726,41 @@ function kbModelSupportsVision(scanModel: string) {
                     <span class="settings-form-hint">本地唯一标识，可重命名</span>
                   </div>
                   <div class="settings-form-row">
+                    <label class="settings-form-label">供应商类型</label>
+                    <NSelect
+                      :value="editProviderID"
+                      :options="providerPresetOptions"
+                      size="small"
+                      @update:value="onEditProviderIDUpdate"
+                    />
+                    <span class="settings-form-hint">决定默认 Base URL、协议和后续策略分发。</span>
+                  </div>
+                  <div class="settings-form-row">
                     <label class="settings-form-label">请求协议</label>
                     <NSelect
-                      v-model:value="editProtocol"
-                      :options="protocolOptions"
+                      :value="editProtocol"
+                      :options="editProtocolOptions"
                       size="small"
-                      @update:value="markDirty('protocol')"
+                      @update:value="onEditProtocolUpdate"
                     />
                     <span class="settings-form-hint">选择 LLM 请求端点协议，不是 HTTP/HTTPS 网络协议。</span>
+                  </div>
+                  <div v-if="editVariantOptions.length > 0" class="settings-form-row">
+                    <label class="settings-form-label">策略变体</label>
+                    <NSelect
+                      :value="editStrategyVariant"
+                      :options="editVariantOptions"
+                      size="small"
+                      @update:value="onEditStrategyVariantUpdate"
+                    />
+                    <span class="settings-form-hint">用于区分同一供应商下的 API、套餐或区域。</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">Base URL</label>
                     <NInput
                       v-model:value="editBaseURL"
                       size="small"
-                      :placeholder="editProtocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
+                      :placeholder="isAnthropicProtocol(editProtocol) ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
                       @update:value="markDirty('base_url')"
                     />
                     <span class="settings-form-hint">供应商公共网络地址；实际请求由 Base URL 与各模型的 API 端点后缀拼接。</span>
@@ -2435,25 +2889,44 @@ function kbModelSupportsVision(scanModel: string) {
           :mask-closable="false"
           @close="cancelAddProvider"
         >
-          <p class="modal-lead">选择 LLM 请求端点协议并填写供应商公共 Base URL；模型创建时再配置请求端点后缀。</p>
+          <p class="modal-lead">选择供应商类型和 LLM 请求协议后，只需填写 API Key；Base URL 会按策略默认带入，Custom 可手动填写。</p>
           <div class="settings-form settings-form--grid modal-form">
             <div class="settings-form-row">
               <label class="settings-form-label">名称 <span class="settings-required">*</span></label>
               <NInput v-model:value="newName" placeholder="例: openai / deepseek" size="small" />
             </div>
             <div class="settings-form-row">
+              <label class="settings-form-label">供应商类型 <span class="settings-required">*</span></label>
+              <NSelect
+                :value="newProviderID"
+                :options="providerPresetOptions"
+                size="small"
+                @update:value="onNewProviderIDUpdate"
+              />
+            </div>
+            <div class="settings-form-row">
               <label class="settings-form-label">请求协议 <span class="settings-required">*</span></label>
               <NSelect
-                v-model:value="newProtocol"
-                :options="protocolOptions"
+                :value="newProtocol"
+                :options="newProtocolOptions"
                 size="small"
+                @update:value="onNewProtocolUpdate"
+              />
+            </div>
+            <div v-if="newVariantOptions.length > 0" class="settings-form-row">
+              <label class="settings-form-label">策略变体</label>
+              <NSelect
+                :value="newStrategyVariant"
+                :options="newVariantOptions"
+                size="small"
+                @update:value="onNewStrategyVariantUpdate"
               />
             </div>
             <div class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">Base URL <span class="settings-required">*</span></label>
               <NInput
                 v-model:value="newBaseURL"
-                :placeholder="newProtocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
+                :placeholder="isAnthropicProtocol(newProtocol) ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
                 size="small"
               />
               <span class="settings-form-hint">这里填写 http(s) 网络地址，例如火山方舟可填写到 /api/v3；模型端点只填写其后的相对路径。</span>
@@ -2560,28 +3033,41 @@ function kbModelSupportsVision(scanModel: string) {
                 <label class="settings-form-label">媒体识别能力（可选）</label>
                 <NTag v-if="editModelCapabilities.length === 0" size="tiny" :bordered="false">默认：仅文本</NTag>
               </div>
-              <NSelect
-                v-model:value="editModelCapabilities"
-                :options="modelCapabilityOptions"
-                multiple
-                clearable
-                placeholder="不选择（不支持媒体识别）"
-                size="small"
-              />
+              <NCheckboxGroup v-model:value="editModelCapabilities">
+                <div class="capability-option-grid capability-option-grid--llm">
+                  <NCheckbox
+                    v-for="option in modelCapabilityOptions"
+                    :key="option.value"
+                    :value="option.value"
+                    class="capability-option"
+                  >
+                    <span class="capability-option-copy">
+                      <strong>{{ option.label }}</strong>
+                      <small>{{ option.hint }}</small>
+                    </span>
+                  </NCheckbox>
+                </div>
+              </NCheckboxGroup>
               <span class="settings-form-hint">留空表示该模型不支持图片、视频或音频识别；需要时可多选模型实际支持的类型。</span>
             </div>
             <div v-else class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">生成能力 <span class="settings-required">*</span></label>
-              <NSelect
-                :value="editGenerationOperations"
-                :options="generationOperationOptions"
-                multiple
-                clearable
-                placeholder="选择该模型支持的转换能力"
-                size="small"
-                @update:value="onGenerationOperationsUpdate"
-              />
-              <span class="settings-form-hint">能力决定会话中可开启哪些工具；所有能力共享下方的模型 API 配置。</span>
+              <NCheckboxGroup v-model:value="editGenerationOperations">
+                <div class="capability-option-grid capability-option-grid--generation">
+                  <NCheckbox
+                    v-for="option in generationOperationOptions"
+                    :key="option.value"
+                    :value="option.value"
+                    class="capability-option"
+                  >
+                    <span class="capability-option-copy">
+                      <strong>{{ option.label }}</strong>
+                      <small>{{ option.hint }}</small>
+                    </span>
+                  </NCheckbox>
+                </div>
+              </NCheckboxGroup>
+              <span class="settings-form-hint">能力决定会话中可开启哪些工具；默认共享模型 API，可按能力覆盖不同端点。</span>
             </div>
             <div
               v-if="editModelType === 'media_generation'"
@@ -2589,12 +3075,16 @@ function kbModelSupportsVision(scanModel: string) {
             >
               <div class="generation-api-title">
                 <strong>模型 API</strong>
-                <span>所有生成能力共用一组端点；下方同步展示最终请求路径</span>
+                <span>共享端点会作为默认值；厂商路由不一致时可在下方按能力覆盖</span>
               </div>
               <div class="generation-api-fields">
-                <label class="generation-api-field generation-api-field--create">
-                  <span>API 端点后缀</span>
-                  <NInput v-model:value="editGenerationAPI.endpoint" size="small" placeholder="/images/generations" />
+	                <label class="generation-api-field generation-api-field--create">
+	                  <span>API 端点后缀</span>
+	                  <NInput
+	                    v-model:value="editGenerationAPI.endpoint"
+	                    size="small"
+	                    :placeholder="defaultGenerationAPIConfig(editGenerationOperations).endpoint"
+	                  />
                   <small class="generation-endpoint-preview">
                     完整请求：
                     <code v-if="generationEndpointPreview" class="endpoint-preview">{{ generationEndpointPreview }}</code>
@@ -2604,9 +3094,13 @@ function kbModelSupportsVision(scanModel: string) {
                     {{ generationEndpointConsistencyWarning }}
                   </small>
                 </label>
-                <label class="generation-api-field generation-api-field--query">
-                  <span>查询端点后缀（异步任务）</span>
-                  <NInput v-model:value="editGenerationAPI.query_endpoint" size="small" placeholder="/tasks/{task_id}" />
+	                <label class="generation-api-field generation-api-field--query">
+	                  <span>查询端点后缀（异步任务）</span>
+	                  <NInput
+	                    v-model:value="editGenerationAPI.query_endpoint"
+	                    size="small"
+	                    :placeholder="defaultGenerationAPIConfig(editGenerationOperations).query_endpoint || '/tasks/{task_id}'"
+	                  />
                   <small v-if="editGenerationAPI.query_endpoint" class="generation-endpoint-preview">
                     完整请求：
                     <code v-if="generationQueryEndpointPreview" class="endpoint-preview">{{ generationQueryEndpointPreview }}</code>
@@ -2623,6 +3117,42 @@ function kbModelSupportsVision(scanModel: string) {
                   <span>超时（秒）</span>
                   <NInputNumber v-model:value="editGenerationAPI.timeout_seconds" :min="5" :step="5" size="small" />
                 </label>
+              </div>
+              <div v-if="editGenerationOperations.length" class="generation-operation-overrides">
+                <div class="generation-operation-overrides-head">
+                  <strong>按能力覆盖端点</strong>
+                  <span>留空表示继承共享 API；供应商默认端点不同的能力会自动带入覆盖值。</span>
+                </div>
+                <div class="generation-operation-override-list">
+                  <div
+                    v-for="operation in editGenerationOperations"
+                    :key="operation"
+                    class="generation-operation-row"
+                  >
+                    <span class="generation-operation-label">{{ generationOperationLabel(operation) }}</span>
+                    <NInput
+                      :value="editGenerationOperationAPIs[operation]?.endpoint || ''"
+                      size="small"
+                      :placeholder="operationDefaultAPIConfig(operation).endpoint"
+                      @update:value="value => updateGenerationOperationAPI(operation, { endpoint: value })"
+                    />
+                    <NInput
+                      :value="editGenerationOperationAPIs[operation]?.query_endpoint || ''"
+                      size="small"
+                      :placeholder="operationDefaultAPIConfig(operation).query_endpoint || '/tasks/{task_id}'"
+                      @update:value="value => updateGenerationOperationAPI(operation, { query_endpoint: value })"
+                    />
+                    <NInputNumber
+                      :value="editGenerationOperationAPIs[operation]?.timeout_seconds ?? null"
+                      :min="5"
+                      :step="5"
+                      size="small"
+                      :placeholder="String(operationDefaultAPIConfig(operation).timeout_seconds || '')"
+                      @update:value="value => updateGenerationOperationAPI(operation, { timeout_seconds: value || undefined })"
+                    />
+                    <NButton size="tiny" quaternary @click="resetGenerationOperationAPI(operation)">继承</NButton>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -2641,9 +3171,15 @@ function kbModelSupportsVision(scanModel: string) {
           title="获取模型"
           size="md"
         >
-          <p class="modal-lead">从 {{ selected?.name }} 的 Base URL + /models 获取。点击“配置并添加”后，可继续填写能力、上下文和 API 端点。</p>
+          <p class="modal-lead">
+            按 {{ providerDisplayName(selected?.provider_id) }} 策略获取模型。点击“配置并添加”后，可继续填写能力、上下文和 API 端点。
+          </p>
+          <div class="upstream-meta">
+            <NTag v-if="upstreamSource" size="tiny" :bordered="false">{{ upstreamSource }}</NTag>
+            <code v-if="upstreamEndpoint">{{ upstreamBaseURL }}{{ upstreamEndpoint }}</code>
+          </div>
           <div v-if="upstreamError" class="upstream-error">{{ upstreamError }}</div>
-          <div v-else-if="!upstreamModels.length" class="settings-empty upstream-empty">上游未返回可用模型。</div>
+          <div v-if="!upstreamModels.length" class="settings-empty upstream-empty">上游未返回可用模型，可手动添加模型 ID。</div>
           <div v-else class="upstream-list">
             <div
               v-for="model in upstreamModels"
@@ -2653,6 +3189,7 @@ function kbModelSupportsVision(scanModel: string) {
             >
               <div class="upstream-model-copy">
                 <code class="upstream-id">{{ model.id }}</code>
+                <span v-if="model.display_name" class="upstream-owner">{{ model.display_name }}</span>
                 <span v-if="model.owned_by" class="upstream-owner">{{ model.owned_by }}</span>
               </div>
               <NButton
@@ -4449,6 +4986,43 @@ function kbModelSupportsVision(scanModel: string) {
   grid-column: 1 / -1;
   grid-row: 2;
 }
+.generation-operation-overrides {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+.generation-operation-overrides-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-2);
+}
+.generation-operation-overrides-head strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.generation-operation-overrides-head span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.generation-operation-override-list {
+  display: grid;
+  gap: var(--space-2);
+}
+.generation-operation-row {
+  display: grid;
+  grid-template-columns: minmax(72px, 0.18fr) minmax(0, 1fr) minmax(0, 1fr) minmax(86px, 0.2fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+}
+.generation-operation-label {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
 .generation-endpoint-preview {
   min-width: 0;
   color: var(--text-quaternary);
@@ -4484,6 +5058,66 @@ function kbModelSupportsVision(scanModel: string) {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
+}
+.capability-option-grid {
+  display: grid;
+  gap: var(--space-2);
+}
+.capability-option-grid--llm,
+.capability-option-grid--generation {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.capability-option {
+  width: 100%;
+  min-width: 0;
+  min-height: 58px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+.capability-option:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+.capability-option.n-checkbox--checked {
+  border-color: var(--brand-500);
+  background: color-mix(in srgb, var(--brand-50) 72%, var(--surface-1));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand-500) 18%, transparent);
+}
+.capability-option :deep(.n-checkbox-box) {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.capability-option :deep(.n-checkbox__label) {
+  min-width: 0;
+  flex: 1;
+  padding-left: 8px;
+}
+.capability-option-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.capability-option-copy strong,
+.capability-option-copy small {
+  overflow-wrap: anywhere;
+}
+.capability-option-copy strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.capability-option-copy small {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.35;
+}
+.capability-option.n-checkbox--checked .capability-option-copy strong {
+  color: var(--brand-600);
 }
 .endpoint-preview {
   font-family: var(--font-mono);
@@ -5481,6 +6115,20 @@ code {
   border-radius: var(--radius-md);
   background: var(--error-50);
 }
+.upstream-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin-bottom: var(--space-3);
+}
+.upstream-meta code {
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
 .upstream-empty {
   padding: var(--space-5) var(--space-3);
 }
@@ -5611,6 +6259,10 @@ code {
   .recognition-route-fields {
     grid-template-columns: 1fr 1fr;
   }
+  .capability-option-grid--llm,
+  .capability-option-grid--generation {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
   .generation-default-row,
   .generation-api-fields {
     grid-template-columns: 1fr;
@@ -5620,6 +6272,12 @@ code {
   .generation-api-field--timeout {
     grid-column: 1;
     grid-row: auto;
+  }
+}
+@media (max-width: 560px) {
+  .capability-option-grid--llm,
+  .capability-option-grid--generation {
+    grid-template-columns: 1fr;
   }
 }
 

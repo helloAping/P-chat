@@ -35,6 +35,9 @@ type Asset struct {
 type Dispatch struct {
 	Target          config.GenerationModelTarget
 	Vendor          string
+	ProviderID      string
+	StrategyVariant string
+	Protocol        string
 	BaseURL         string
 	APIKey          string
 	CustomHeaders   map[string]string

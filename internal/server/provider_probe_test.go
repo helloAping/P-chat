@@ -15,8 +15,14 @@ func TestDefaultProbeBaseURL(t *testing.T) {
 	if got := defaultProbeBaseURL("openai", ""); got != "https://api.openai.com/v1" {
 		t.Fatalf("openai default = %q", got)
 	}
+	if got := defaultProbeBaseURL("openai_responses", ""); got != "https://api.openai.com/v1" {
+		t.Fatalf("openai_responses default = %q", got)
+	}
 	if got := defaultProbeBaseURL("anthropic", ""); got != "https://api.anthropic.com/v1" {
 		t.Fatalf("anthropic default = %q", got)
+	}
+	if got := defaultProbeBaseURL("anthropic_messages", ""); got != "https://api.anthropic.com/v1" {
+		t.Fatalf("anthropic_messages default = %q", got)
 	}
 	if got := defaultProbeBaseURL("openai", " https://proxy.example/v1 "); got != "https://proxy.example/v1" {
 		t.Fatalf("explicit base = %q", got)
@@ -59,13 +65,18 @@ func TestProbeUpstreamModels(t *testing.T) {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
 	var resp struct {
-		Models []UpstreamModelsItem `json:"models"`
+		Models   []UpstreamModelsItem `json:"models"`
+		Source   string               `json:"source"`
+		Endpoint string               `json:"endpoint"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(resp.Models) != 2 || resp.Models[0].ID != "gpt-4o-mini" {
 		t.Fatalf("models = %#v", resp.Models)
+	}
+	if resp.Source != "remote" || resp.Endpoint != "/models" {
+		t.Fatalf("metadata source=%q endpoint=%q", resp.Source, resp.Endpoint)
 	}
 }
 
@@ -116,12 +127,55 @@ func TestFetchUpstreamModelsUsesSavedProviderBaseURL(t *testing.T) {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
 	var response struct {
-		Models []UpstreamModelsItem `json:"models"`
+		Models   []UpstreamModelsItem `json:"models"`
+		Source   string               `json:"source"`
+		Endpoint string               `json:"endpoint"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
 	if len(response.Models) != 2 || !response.Models[0].Added || response.Models[1].Added {
+		t.Fatalf("models = %#v", response.Models)
+	}
+	if response.Source != "remote" || response.Endpoint != "/models" {
+		t.Fatalf("metadata source=%q endpoint=%q", response.Source, response.Endpoint)
+	}
+}
+
+func TestFetchUpstreamModelsCustomFailureAllowsManualFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "models disabled", http.StatusNotFound)
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := fmt.Sprintf(`{
+		"llm": {"default":"saved","providers":[{
+			"name":"saved","provider_id":"custom","protocol":"openai","base_url":%q,"api_key":"sk-test",
+			"models":[{"name":"manual-existing","api_endpoint":"/chat/completions","default":true}]
+		}]}
+	}`, upstream.URL+"/api/v3")
+	srv, _ := newTestServerWithConfig(t, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/providers/saved/upstream-models", nil)
+	w := httptest.NewRecorder()
+	srv.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Models        []UpstreamModelsItem `json:"models"`
+		Source        string               `json:"source"`
+		Error         string               `json:"error"`
+		ManualAllowed bool                 `json:"manual_allowed"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Source != "manual" || response.Error == "" || !response.ManualAllowed {
+		t.Fatalf("fallback response = %#v", response)
+	}
+	if len(response.Models) != 0 {
 		t.Fatalf("models = %#v", response.Models)
 	}
 }

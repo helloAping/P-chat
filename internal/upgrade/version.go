@@ -78,7 +78,10 @@ const (
 	// V14 — media recognition and generation calls persist reusable context rows.
 	V14 AppVersion = 14
 
+	// V15 — providers persist provider_id / strategy_variant for strategy presets.
+	V15 AppVersion = 15
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V14
+	Current AppVersion = V15
 )

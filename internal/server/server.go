@@ -176,6 +176,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/stylegen", h.StyleGenStart)
 		api.GET("/stylegen/:job", h.StyleGenStatus)
 		api.GET("/stylegen/:job/events", h.StyleGenEvents)
+		api.GET("/provider-presets", h.ProviderPresets)
 		api.GET("/providers", h.Providers)
 		api.GET("/providers/:name", h.GetProvider)
 		api.POST("/providers", h.AddProvider)

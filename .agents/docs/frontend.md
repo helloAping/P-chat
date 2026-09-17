@@ -175,6 +175,11 @@ Provider 基础表单通过 `ProviderHeadersEditor.vue` 编辑供应商级请求
 供应商中立，不绑定某个代理或订阅服务。现有 Provider
 编辑只在请求头变化时 PATCH `custom_headers`，新增 Provider 随创建请求一并提交。
 
+LLM 提供商新增/编辑表单包含“供应商类型”，该值保存为 `provider_id`，同供应商下的套餐或区域保存为
+`strategy_variant`。设置页从 `/api/v1/provider-presets` 读取选项和默认 Base URL；前端不得重新硬编码
+厂商 endpoint 规则，也不得恢复旧 `vendor` 字段。协议下拉只表达 LLM 请求/响应协议：
+OpenAI Chat、OpenAI Responses、Anthropic Messages。
+
 ### 8.2 会话设置下拉选择
 
 `InputArea.vue` 的会话设置中，风格与知识库复用 `NDropdown + .opt-pick`
@@ -370,11 +375,13 @@ compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
 
 ### 13. 媒体生成配置与结果展示
 
-`AppSettingsModal.vue` 在 Provider 下只选择 OpenAI/Anthropic 协议并填写公共
-`base_url`，不再展示厂商 preset。模型可手工添加，也可通过“获取模型”请求
-`base_url + /models`；选择上游模型只会预填普通模型编辑弹窗，用户确认能力、上下文与端点
+`AppSettingsModal.vue` 在 Provider 下选择供应商类型、策略变体、协议并填写公共
+`base_url`；供应商选项、默认 Base URL、模型列表与媒体 endpoint 默认值来自
+`GET /api/v1/provider-presets` 和 provider 策略。模型可手工添加，也可通过“获取模型”
+调用策略化模型发现；选择上游模型只会预填普通模型编辑弹窗，用户确认能力、上下文与端点
 后才持久化。它同时支持 `llm/media_generation` 模型类型；LLM 保存可编辑
-`api_endpoint`，媒体模型勾选 operation 能力并保存一份共享端点后缀配置；运行时再与
+`api_endpoint`，媒体模型勾选 operation 能力并保存一份共享端点后缀配置，同时可在
+`operations[operation]` 中保存单能力覆盖。默认值按供应商、协议与能力带入；运行时再与
 Provider Base URL 拼接。系统页“媒体生成”按能力选择应用默认模型。
 
 媒体模型的异步查询后缀支持 `{task_id}` 和供应商文档常用的 `{id}`；界面明确说明该值

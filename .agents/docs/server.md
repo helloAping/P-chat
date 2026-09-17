@@ -40,6 +40,11 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 - 成功返回实际 `provider`、`model`、`response` 和 `elapsed_ms`；上游失败返回标准化 `error_kind`。
 - 测试客户端继承 Provider 的 `custom_headers`；无对话/消息上下文的动态参数展开为空，UUID、雪花 ID 和时间戳仍会生成。
 
+`GET /api/v1/providers/:name/upstream-models` 与 `POST /api/v1/providers/probe-models` 通过
+`internal/provider` 策略解析模型获取方式，不再在 Handler 内写死 `Base URL + /models`。
+响应始终包含 `models`，并可附带 `base_url`、`endpoint`、`source`、`default_endpoint`
+和非致命 `error`；Custom 等允许手动兜底的策略在远程获取失败时仍返回 200，设置页继续允许手动添加模型。
+
 ## 核心概念
 
 ### 1. POST /sessions/:id/messages — 流式消息处理
@@ -356,9 +361,10 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 - Provider CRUD 包含 `protocol`、公共 `base_url`，Model CRUD 包含 `api_endpoint`、
   `type`、`generation`；Provider 的 `custom_headers` 是完整替换的字符串 map，提交 `{}` 可清空。
   LLM/媒体端点均保存相对后缀，并在执行时与 Base URL 拼接。
-  `GET /api/v1/providers/:name/upstream-models` 使用 `base_url + /models` 获取候选模型；
-  并携带该 Provider 的自定义请求头。新增前的 `POST /providers/probe-models` 也接受临时
-  `custom_headers`。不再接收或返回厂商 preset。聊天模型选择和连接测试只接受
+  `GET /api/v1/providers/:name/upstream-models` 使用 `internal/provider` 策略解析模型列表
+  endpoint、默认 Base URL、静态 fallback 与手动兜底，并携带该 Provider 的自定义请求头。
+  新增前的 `POST /providers/probe-models` 也接受临时 `custom_headers`。
+  聊天模型选择和连接测试只接受
   `type=llm`，不会把媒体模型误发到 Chat Completions。
 
 首版异步任务在一次工具调用中轮询完成，尚无重启续查/取消端点。详见

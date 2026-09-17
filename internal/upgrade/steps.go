@@ -41,6 +41,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V11: stepV11toV12,
 	V12: stepV12toV13,
 	V13: stepV13toV14,
+	V14: stepV14toV15,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -512,6 +513,13 @@ func stepV13toV14(db *sql.DB) error {
 	return nil
 }
 
+// ---- V14 → V15 ----
+
+func stepV14toV15(_ *sql.DB) error {
+	log.Print("[upgrade] V14 → V15: initializing provider strategy ids")
+	return migrateProviderStrategyIDs()
+}
+
 func migrateProviderCustomHeaders() error {
 	configPath := paths.GlobalConfig()
 	data, err := os.ReadFile(configPath)
@@ -535,6 +543,43 @@ func migrateProviderCustomHeaders() error {
 		}
 		if _, exists := provider["custom_headers"]; !exists {
 			provider["custom_headers"] = map[string]any{}
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return writeUpgradeFileAtomic(configPath, out, 0o644)
+}
+
+func migrateProviderStrategyIDs() error {
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	llmDoc, _ := root["llm"].(map[string]any)
+	providers, _ := llmDoc["providers"].([]any)
+	changed := false
+	for _, providerValue := range providers {
+		provider, _ := providerValue.(map[string]any)
+		if provider == nil {
+			continue
+		}
+		if _, exists := provider["provider_id"]; !exists {
+			provider["provider_id"] = "custom"
 			changed = true
 		}
 	}

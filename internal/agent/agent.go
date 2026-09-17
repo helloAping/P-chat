@@ -488,6 +488,9 @@ func effectiveGenerationAccess(cfg *config.Config, operations []config.Generatio
 				access.Dispatches[operation] = generation.Dispatch{
 					Target:          target,
 					Vendor:          provider.Vendor,
+					ProviderID:      provider.GetProviderID(),
+					StrategyVariant: provider.GetStrategyVariant(),
+					Protocol:        provider.GetProtocol(),
 					BaseURL:         provider.EffectiveBaseURL(),
 					APIKey:          provider.APIKey,
 					CustomHeaders:   requestheader.CloneTemplates(provider.CustomHeaders),

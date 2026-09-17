@@ -131,6 +131,94 @@ func TestResolveGenerationTargetUsesSharedModelAPIForEveryCapability(t *testing.
 	}
 }
 
+func TestResolveGenerationTargetMergesOperationOverrideWithSharedAPI(t *testing.T) {
+	sharedAPI := &GenerationOperationConfig{
+		Endpoint:       "/images/generations",
+		QueryEndpoint:  "/images/tasks/{task_id}",
+		TimeoutSeconds: 120,
+		DefaultParams: map[string]any{
+			"quality": "standard",
+			"seed":    float64(1234),
+		},
+	}
+	cfg := Config{
+		LLM: LLMConfig{Providers: []ProviderConfig{{
+			Name: "volcengine", ProviderID: "volcengine", BaseURL: "https://ark.example/api/v3",
+			Models: []ModelConfig{{
+				Name: "doubao-omni", Type: ModelTypeMediaGeneration,
+				Generation: &MediaGenerationModelConfig{
+					API: sharedAPI,
+					Operations: map[GenerationOperation]GenerationOperationConfig{
+						GenerationTextToImage: {},
+						GenerationTextToVideo: {
+							Endpoint:       "/contents/generations/tasks",
+							QueryEndpoint:  "/contents/generations/tasks/{id}",
+							TimeoutSeconds: 600,
+							DefaultParams:  map[string]any{"quality": "uhd"},
+						},
+					},
+				},
+			}},
+		}}},
+		Generation: GenerationConfig{Defaults: map[GenerationOperation]GenerationModelTarget{
+			GenerationTextToImage: {Provider: "volcengine", Model: "doubao-omni"},
+			GenerationTextToVideo: {Provider: "volcengine", Model: "doubao-omni"},
+		}},
+	}
+
+	_, _, imageConfig, err := cfg.ResolveGenerationTarget(GenerationTextToImage, GenerationModelTarget{})
+	if err != nil {
+		t.Fatalf("resolve text-to-image: %v", err)
+	}
+	if imageConfig.Endpoint != sharedAPI.Endpoint || imageConfig.QueryEndpoint != sharedAPI.QueryEndpoint || imageConfig.TimeoutSeconds != sharedAPI.TimeoutSeconds {
+		t.Fatalf("image operation config = %#v, want shared %#v", imageConfig, sharedAPI)
+	}
+
+	_, _, videoConfig, err := cfg.ResolveGenerationTarget(GenerationTextToVideo, GenerationModelTarget{})
+	if err != nil {
+		t.Fatalf("resolve text-to-video: %v", err)
+	}
+	if videoConfig.Endpoint != "/contents/generations/tasks" || videoConfig.QueryEndpoint != "/contents/generations/tasks/{id}" || videoConfig.TimeoutSeconds != 600 {
+		t.Fatalf("video operation config = %#v", videoConfig)
+	}
+	if videoConfig.DefaultParams["quality"] != "uhd" || videoConfig.DefaultParams["seed"] != float64(1234) {
+		t.Fatalf("video default params = %#v, want shared params with override", videoConfig.DefaultParams)
+	}
+}
+
+func TestResolveGenerationTargetOperationEndpointOverrideCanClearSharedQueryEndpoint(t *testing.T) {
+	cfg := Config{
+		LLM: LLMConfig{Providers: []ProviderConfig{{
+			Name: "mixed", ProviderID: "volcengine", BaseURL: "https://ark.example/api/v3",
+			Models: []ModelConfig{{
+				Name: "omni", Type: ModelTypeMediaGeneration,
+				Generation: &MediaGenerationModelConfig{
+					API: &GenerationOperationConfig{
+						Endpoint:       "/contents/generations/tasks",
+						QueryEndpoint:  "/contents/generations/tasks/{id}",
+						TimeoutSeconds: 600,
+					},
+					Operations: map[GenerationOperation]GenerationOperationConfig{
+						GenerationTextToVideo: {},
+						GenerationTextToImage: {Endpoint: "/images/generations", TimeoutSeconds: 120},
+					},
+				},
+			}},
+		}}},
+		Generation: GenerationConfig{Defaults: map[GenerationOperation]GenerationModelTarget{
+			GenerationTextToImage: {Provider: "mixed", Model: "omni"},
+		}},
+	}
+
+	_, _, imageConfig, err := cfg.ResolveGenerationTarget(GenerationTextToImage, GenerationModelTarget{})
+	if err != nil {
+		t.Fatalf("resolve text-to-image: %v", err)
+	}
+	if imageConfig.Endpoint != "/images/generations" || imageConfig.QueryEndpoint != "" || imageConfig.TimeoutSeconds != 120 {
+		t.Fatalf("image operation config = %#v, want image endpoint without inherited video query endpoint", imageConfig)
+	}
+}
+
 func TestNormalizeGenerationKeepsSharedAPIOperationsAsCapabilityMarkers(t *testing.T) {
 	cfg := Config{LLM: LLMConfig{Providers: []ProviderConfig{{
 		Name: "media", Vendor: "minimax", BaseURL: "https://api.minimax.io",
@@ -199,6 +287,21 @@ func TestValidateGenerationModelRequiresRelativeSharedEndpoint(t *testing.T) {
 	model.Generation.API.QueryEndpoint = "/v3/contents/generations/tasks/{id}"
 	if err := ValidateGenerationModel(model); err != nil {
 		t.Fatalf("documented {id} task placeholder rejected: %v", err)
+	}
+
+	model.Generation.Operations[GenerationTextToVideo] = GenerationOperationConfig{
+		Endpoint:      "https://media.example/v3/absolute",
+		QueryEndpoint: "/v3/contents/generations/tasks/{id}",
+	}
+	if err := ValidateGenerationModel(model); err == nil {
+		t.Fatal("absolute per-operation endpoint must be rejected for new configuration")
+	}
+	model.Generation.Operations[GenerationTextToVideo] = GenerationOperationConfig{
+		Endpoint:      "/v3/contents/generations/tasks",
+		QueryEndpoint: "/v3/contents/generations/tasks/static",
+	}
+	if err := ValidateGenerationModel(model); err == nil || !strings.Contains(err.Error(), "operations.text_to_video.query_endpoint") {
+		t.Fatalf("per-operation query endpoint without placeholder should be rejected, got %v", err)
 	}
 }
 

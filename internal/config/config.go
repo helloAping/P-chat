@@ -303,16 +303,18 @@ type OutputConfig struct {
 type ProviderConfig struct {
 	Name string `json:"name"`
 	// Vendor and APIURL are retained only for compatibility. New configuration
-	// uses Protocol + BaseURL; request paths live on individual models.
-	Vendor        string            `json:"vendor,omitempty"`
-	Protocol      string            `json:"protocol,omitempty"` // "openai" | "anthropic"
-	Type          string            `json:"type,omitempty"`     // alias for Protocol (backward compat)
-	APIURL        string            `json:"api_url,omitempty"`  // legacy complete chat endpoint
-	BaseURL       string            `json:"base_url,omitempty"`
-	APIKey        string            `json:"api_key"`
-	CustomHeaders map[string]string `json:"custom_headers,omitempty"`
-	Model         string            `json:"model,omitempty"` // legacy: single model
-	Models        []ModelConfig     `json:"models,omitempty"`
+	// uses ProviderID + Protocol + BaseURL; request paths live on individual models.
+	Vendor          string            `json:"vendor,omitempty"`
+	ProviderID      string            `json:"provider_id,omitempty"`
+	StrategyVariant string            `json:"strategy_variant,omitempty"`
+	Protocol        string            `json:"protocol,omitempty"` // openai/openai_chat/openai_responses/anthropic/anthropic_messages
+	Type            string            `json:"type,omitempty"`     // alias for Protocol (backward compat)
+	APIURL          string            `json:"api_url,omitempty"`  // legacy complete chat endpoint
+	BaseURL         string            `json:"base_url,omitempty"`
+	APIKey          string            `json:"api_key"`
+	CustomHeaders   map[string]string `json:"custom_headers,omitempty"`
+	Model           string            `json:"model,omitempty"` // legacy: single model
+	Models          []ModelConfig     `json:"models,omitempty"`
 }
 
 // ModelConfig describes a single model under a provider.
@@ -375,6 +377,133 @@ func (m ModelConfig) EffectiveType() ModelType {
 	return m.Type
 }
 
+const (
+	// ProviderIDCustom 是自定义供应商的稳定策略 ID。
+	// ProviderIDCustom is the stable strategy ID for custom providers.
+	ProviderIDCustom = "custom"
+)
+
+const (
+	// ProtocolOpenAI 是旧版 OpenAI Chat 协议别名。
+	// ProtocolOpenAI is the legacy OpenAI Chat protocol alias.
+	ProtocolOpenAI = "openai"
+	// ProtocolAnthropic 是旧版 Anthropic Messages 协议别名。
+	// ProtocolAnthropic is the legacy Anthropic Messages protocol alias.
+	ProtocolAnthropic = "anthropic"
+	// ProtocolOpenAIChat 表示 OpenAI-compatible Chat Completions 协议。
+	// ProtocolOpenAIChat is the OpenAI-compatible Chat Completions protocol.
+	ProtocolOpenAIChat = "openai_chat"
+	// ProtocolOpenAIResponses 表示 OpenAI Responses 协议。
+	// ProtocolOpenAIResponses is the OpenAI Responses protocol.
+	ProtocolOpenAIResponses = "openai_responses"
+	// ProtocolAnthropicMessages 表示 Anthropic Messages 协议。
+	// ProtocolAnthropicMessages is the Anthropic Messages protocol.
+	ProtocolAnthropicMessages = "anthropic_messages"
+)
+
+// NormalizeProviderID 把空供应商类型归一为 custom。
+// NormalizeProviderID maps an empty provider strategy id to custom.
+func NormalizeProviderID(providerID string) string {
+	providerID = strings.ToLower(strings.TrimSpace(providerID))
+	if providerID == "" {
+		return ProviderIDCustom
+	}
+	return providerID
+}
+
+// NormalizeStrategyVariant 归一化同一供应商下的端点/套餐变体。
+// NormalizeStrategyVariant normalizes a provider strategy variant id.
+func NormalizeStrategyVariant(variant string) string {
+	return strings.ToLower(strings.TrimSpace(variant))
+}
+
+// IsValidProviderID 判断供应商类型 ID 是否可写入配置。
+// IsValidProviderID reports whether a provider strategy id is safe to persist.
+func IsValidProviderID(providerID string) bool {
+	return isStableConfigID(NormalizeProviderID(providerID))
+}
+
+// IsValidStrategyVariant 判断策略变体 ID 是否可写入配置；空值表示默认变体。
+// IsValidStrategyVariant reports whether a strategy variant id is safe to persist.
+func IsValidStrategyVariant(variant string) bool {
+	variant = NormalizeStrategyVariant(variant)
+	return variant == "" || isStableConfigID(variant)
+}
+
+func isStableConfigID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// NormalizeProtocol 把旧协议别名归一为新协议 ID。
+// NormalizeProtocol maps legacy protocol aliases to stable protocol IDs.
+func NormalizeProtocol(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "", ProtocolOpenAI, ProtocolOpenAIChat:
+		return ProtocolOpenAIChat
+	case ProtocolOpenAIResponses:
+		return ProtocolOpenAIResponses
+	case ProtocolAnthropic, ProtocolAnthropicMessages:
+		return ProtocolAnthropicMessages
+	default:
+		return strings.ToLower(strings.TrimSpace(protocol))
+	}
+}
+
+// IsSupportedProtocol 判断 provider 配置是否接受该协议。
+// IsSupportedProtocol reports whether protocol is accepted by provider config.
+func IsSupportedProtocol(protocol string) bool {
+	switch NormalizeProtocol(protocol) {
+	case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolAnthropicMessages:
+		return true
+	default:
+		return false
+	}
+}
+
+// ProtocolIsAnthropic 判断协议是否使用 Anthropic Messages 请求/响应格式。
+// ProtocolIsAnthropic reports whether protocol uses Anthropic Messages wire shape.
+func ProtocolIsAnthropic(protocol string) bool {
+	return NormalizeProtocol(protocol) == ProtocolAnthropicMessages
+}
+
+// ProtocolIsOpenAIResponses 判断协议是否使用 OpenAI Responses 请求/响应格式。
+// ProtocolIsOpenAIResponses reports whether protocol uses OpenAI Responses wire shape.
+func ProtocolIsOpenAIResponses(protocol string) bool {
+	return NormalizeProtocol(protocol) == ProtocolOpenAIResponses
+}
+
+// ProtocolIsOpenAICompatible 判断协议是否属于 OpenAI-compatible 鉴权/请求头族。
+// ProtocolIsOpenAICompatible reports whether protocol uses an OpenAI-compatible auth/header family.
+func ProtocolIsOpenAICompatible(protocol string) bool {
+	switch NormalizeProtocol(protocol) {
+	case ProtocolOpenAIChat, ProtocolOpenAIResponses:
+		return true
+	default:
+		return false
+	}
+}
+
+// GetProviderID 返回供应商策略 ID；旧配置缺失时按 Custom 处理。
+// GetProviderID returns the provider strategy ID; legacy configs default to Custom.
+func (p ProviderConfig) GetProviderID() string {
+	return NormalizeProviderID(p.ProviderID)
+}
+
+// GetStrategyVariant 返回同一供应商下的端点/套餐变体。
+// GetStrategyVariant returns the provider strategy variant.
+func (p ProviderConfig) GetStrategyVariant() string {
+	return NormalizeStrategyVariant(p.StrategyVariant)
+}
+
 // GetProtocol returns the protocol, falling back to Type, then "openai".
 func (p ProviderConfig) GetProtocol() string {
 	if p.Protocol != "" {
@@ -386,13 +515,18 @@ func (p ProviderConfig) GetProtocol() string {
 	return "openai"
 }
 
+// DefaultLLMAPIEndpoint 返回新建对话模型默认填入的可编辑端点后缀。
 // DefaultLLMAPIEndpoint returns the editable endpoint suffix offered for a
 // newly-created conversational model.
 func DefaultLLMAPIEndpoint(protocol string) string {
-	if strings.EqualFold(strings.TrimSpace(protocol), "anthropic") {
+	switch NormalizeProtocol(protocol) {
+	case ProtocolAnthropicMessages:
 		return "/messages"
+	case ProtocolOpenAIResponses:
+		return "/responses"
+	default:
+		return "/chat/completions"
 	}
-	return "/chat/completions"
 }
 
 // NormalizeAPIEndpointSuffix canonicalizes a model endpoint without turning it

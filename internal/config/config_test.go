@@ -350,6 +350,23 @@ func TestAddModel_SetsNewDefaultWhenFirst(t *testing.T) {
 	}
 }
 
+func TestDefaultLLMAPIEndpoint_ProtocolAliases(t *testing.T) {
+	cases := map[string]string{
+		"openai":             "/chat/completions",
+		"openai_chat":        "/chat/completions",
+		"openai_responses":   "/responses",
+		"anthropic":          "/messages",
+		"anthropic_messages": "/messages",
+		"":                   "/chat/completions",
+		"OPENAI_RESPONSES":   "/responses",
+	}
+	for protocol, want := range cases {
+		if got := DefaultLLMAPIEndpoint(protocol); got != want {
+			t.Fatalf("DefaultLLMAPIEndpoint(%q) = %q, want %q", protocol, got, want)
+		}
+	}
+}
+
 func TestAddModelNormalizesCustomAPIEndpointSuffix(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
@@ -385,6 +402,47 @@ func TestAddModel_RequiresProviderBaseURL(t *testing.T) {
 
 	if _, err := AddModel("media-only", ModelConfig{Name: "chat-model"}); err == nil || !strings.Contains(err.Error(), "requires base_url") {
 		t.Fatalf("AddModel error = %v, want missing base_url validation", err)
+	}
+}
+
+func TestAddProvider_PersistsProviderStrategyFields(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	if err := AddProvider(ProviderConfig{
+		Name:            "openai-direct",
+		ProviderID:      "OpenAI",
+		StrategyVariant: "Global",
+		Protocol:        "openai_responses",
+		BaseURL:         "https://api.openai.com/v1",
+		APIKey:          "sk-x",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var provider *ProviderConfig
+	for i := range cfg.LLM.Providers {
+		if cfg.LLM.Providers[i].Name == "openai-direct" {
+			provider = &cfg.LLM.Providers[i]
+			break
+		}
+	}
+	if provider == nil {
+		t.Fatalf("openai-direct provider missing: %#v", cfg.LLM.Providers)
+	}
+	if provider.GetProviderID() != "openai" || provider.GetStrategyVariant() != "global" {
+		t.Fatalf("strategy fields = %q/%q", provider.GetProviderID(), provider.GetStrategyVariant())
+	}
+}
+
+func TestProviderConfig_DefaultProviderID(t *testing.T) {
+	provider := ProviderConfig{Name: "legacy", Protocol: "openai"}
+	if got := provider.GetProviderID(); got != ProviderIDCustom {
+		t.Fatalf("GetProviderID() = %q, want %q", got, ProviderIDCustom)
 	}
 }
 
@@ -935,6 +993,65 @@ func TestUpdateProvider_ProtocolInvalid(t *testing.T) {
 	_, err := UpdateProvider("cs", ProviderPatch{Protocol: "gopher"})
 	if err == nil {
 		t.Fatal("expected invalid protocol error")
+	}
+}
+
+func TestUpdateProvider_OpenAIResponsesProtocol(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k", "models":[{"name":"m","api_endpoint":"/chat/completions","default":true}] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := UpdateProvider("cs", ProviderPatch{Protocol: "openai_responses"})
+	if err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	if updated.GetProtocol() != "openai_responses" {
+		t.Fatalf("protocol = %q", updated.GetProtocol())
+	}
+	if got := updated.Models[0].APIEndpoint; got != "/responses" {
+		t.Fatalf("api_endpoint = %q, want /responses", got)
+	}
+}
+
+func TestUpdateProvider_StrategyFields(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	variant := "coding_plan"
+	updated, err := UpdateProvider("cs", ProviderPatch{ProviderID: "volcengine", StrategyVariant: &variant})
+	if err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	if updated.GetProviderID() != "volcengine" || updated.GetStrategyVariant() != "coding_plan" {
+		t.Fatalf("strategy fields = %q/%q", updated.GetProviderID(), updated.GetStrategyVariant())
+	}
+	empty := ""
+	updated, err = UpdateProvider("cs", ProviderPatch{StrategyVariant: &empty})
+	if err != nil {
+		t.Fatalf("clear StrategyVariant: %v", err)
+	}
+	if updated.GetStrategyVariant() != "" {
+		t.Fatalf("strategy variant after clear = %q", updated.GetStrategyVariant())
 	}
 }
 

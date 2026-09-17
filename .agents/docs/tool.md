@@ -148,7 +148,8 @@ type SandboxChecker interface {
 ### 6.8 媒体生成工具与硬开关
 
 `generate_image`、`generate_video`、`generate_audio` 是模型可见的稳定接口，
-厂商差异只存在于 `internal/generation`。模型参数使用 canonical operation 与
+厂商差异由 `internal/provider` 策略描述并生成请求 payload，`internal/generation`
+负责输入解析、HTTP 生命周期、轮询和资产落地。模型参数使用 canonical operation 与
 `input_refs`；不接受 URL、路径或 base64。
 
 工具是否出现在 schema 只是第一层体验优化。Agent 的统一派发入口会再次验证当前请求的
@@ -160,12 +161,20 @@ type SandboxChecker interface {
 `id/kind/mime_type/name/url`。详见
 [媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
 
-媒体执行器不依赖 Provider 厂商预设。对于 `/contents/generations/tasks`、
-`/images/generations`、MiniMax 常见媒体端点等具有明确请求形状的路径，会在内部选择对应
-媒体 JSON dialect；其余端点回落到协议通用形状。异步创建响应中的
+媒体执行器优先使用服务端注入的 `provider_id`/`strategy_variant` 选择媒体 JSON dialect；
+火山、MiniMax、Kling/可灵等官方 preset 不再依赖 endpoint 后缀来识别厂商。Custom 与旧配置仍保留
+兼容兜底：对于 `/contents/generations/tasks`、`/images/generations`、MiniMax 常见媒体端点等
+具有明确请求形状的路径，会在内部选择对应媒体 JSON dialect；其余端点回落到协议通用形状。
+图像、视频、音频 payload 规则已经拆到 provider 策略函数，generation 执行器不再承载
+厂商请求体分支。
+异步创建响应中的
 `task_id/taskId/id/job_id` 会被提取并替换查询后缀中的 `{task_id}` 或 `{id}`。查询后缀
 没有占位符时会在提交计费请求前失败；创建与查询路径看起来不一致且创建请求失败时，错误
 会附带可核对的任务集合路径，但不会自动修改用户配置。
+MiniMax H3 / V2 视频接口会使用 `content` 多模态数组、`ratio` 字段和官方模型名大小写；
+旧 MiniMax `/v1/video_generation` 仍保留 `prompt` / `first_frame_image` 形状。
+Kling/可灵媒体接口会使用 `model_name`，图/视频输入写入 `image` / `video` 字段，并将
+data URL 输入剥离为 base64 主体。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

@@ -412,6 +412,54 @@ func TestRun_V11ToV12MigratesModelAPIEndpointSuffixes(t *testing.T) {
 	}
 }
 
+func TestRun_V14ToV15InitializesProviderStrategyIDs(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755)
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	legacyConfig := `{
+  "llm": {"providers": [
+    {"name":"legacy","protocol":"openai","base_url":"https://proxy.example/v1"},
+    {"name":"kept","provider_id":"openai","protocol":"openai_responses","base_url":"https://api.openai.com/v1"}
+  ]}
+}`
+	if err := os.WriteFile(configPath, []byte(legacyConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V14); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V14: %v", err)
+	}
+	if err := stepV14toV15(db); err != nil {
+		t.Fatalf("second V15 migration should be idempotent: %v", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	providers := doc["llm"].(map[string]any)["providers"].([]any)
+	legacy := providers[0].(map[string]any)
+	kept := providers[1].(map[string]any)
+	if legacy["provider_id"] != "custom" {
+		t.Fatalf("legacy provider_id = %#v", legacy["provider_id"])
+	}
+	if kept["provider_id"] != "openai" {
+		t.Fatalf("kept provider_id = %#v", kept["provider_id"])
+	}
+}
+
 func TestRun_V12ToV13InitializesProviderCustomHeaders(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)

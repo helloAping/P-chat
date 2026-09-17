@@ -957,10 +957,58 @@ export interface ModelInfo {
 }
 
 export type MediaKind = 'image' | 'video' | 'audio'
+export type ProviderProtocol = 'openai' | 'anthropic' | 'openai_chat' | 'openai_responses' | 'anthropic_messages' | string
+export type ProviderCapability = 'chat' | 'models' | 'image_generation' | 'video_generation' | 'audio_generation' | string
+
+export interface ProviderEndpointDefaults {
+  model_list?: string
+  openai_chat?: string
+  openai_responses?: string
+  anthropic_messages?: string
+  image_generation?: string
+  video_generation?: string
+  audio_generation?: string
+  image_task_query?: string
+  video_task_query?: string
+  audio_task_query?: string
+}
+
+export interface ProviderProtocolPreset {
+  id: ProviderProtocol
+  display_name: string
+  default_base_url?: string
+  endpoint_defaults: ProviderEndpointDefaults
+  disabled_reason?: string
+}
+
+export interface ProviderStrategyVariant {
+  id: string
+  display_name: string
+  description?: string
+  default_base_urls?: Record<string, string>
+}
+
+export interface ProviderModelListPreset {
+  mode: string
+  default_endpoint?: string
+}
+
+export interface ProviderPreset {
+  id: string
+  display_name: string
+  description?: string
+  default_variant?: string
+  variants?: ProviderStrategyVariant[]
+  protocols: ProviderProtocolPreset[]
+  capabilities?: ProviderCapability[]
+  model_list: ProviderModelListPreset
+}
 
 export interface ProviderInfo {
   name: string
-  protocol: 'openai' | 'anthropic' | string
+  provider_id?: string
+  strategy_variant?: string
+  protocol: ProviderProtocol
   base_url: string
   // Returned only by pre-V12 servers; the settings form reads it as a fallback.
   api_url?: string
@@ -980,6 +1028,9 @@ export const listProviders = () =>
 // use the same struct.
 export const getProvider = (name: string) =>
   jsonFetch<ProviderInfo>(`/api/v1/providers/${encodeURIComponent(name)}`)
+
+export const fetchProviderPresets = () =>
+  jsonFetch<{ presets: ProviderPreset[] }>('/api/v1/provider-presets')
 
 // --- Style management (app-level CRUD) ---
 export interface StyleInfo {
@@ -1123,7 +1174,9 @@ export const runCommand = (name: string, args: string) =>
 // --- App-level provider configuration ---
 export interface AddProviderRequest {
   name: string
-  protocol: 'openai' | 'anthropic'
+  provider_id?: string
+  strategy_variant?: string
+  protocol: ProviderProtocol
   base_url: string
   api_key: string
   custom_headers?: Record<string, string>
@@ -1170,7 +1223,9 @@ export const testProvider = (provider: string, model?: string) =>
 // (not is_default) to promote a provider to the global default.
 export interface UpdateProviderRequest {
   name?: string
-  protocol?: 'openai' | 'anthropic'
+  provider_id?: string
+  strategy_variant?: string
+  protocol?: ProviderProtocol
   base_url?: string
   api_key?: string
   custom_headers?: Record<string, string>
@@ -1233,13 +1288,26 @@ export const setDefaultModel = (provider: string, model: string) =>
 // --- Upstream models ---
 export interface UpstreamModelItem {
   id: string
+  display_name?: string
   created: number
   owned_by: string
   added: boolean
+  source?: string
+  default_endpoint?: string
+}
+
+export interface UpstreamModelsResponse {
+  models: UpstreamModelItem[]
+  base_url?: string
+  endpoint?: string
+  source?: string
+  default_endpoint?: string
+  error?: string
+  manual_allowed?: boolean
 }
 
 export const fetchUpstreamModels = (provider: string) =>
-  jsonFetch<{ models: UpstreamModelItem[] }>(
+  jsonFetch<UpstreamModelsResponse>(
     `/api/v1/providers/${encodeURIComponent(provider)}/upstream-models`,
   )
 
