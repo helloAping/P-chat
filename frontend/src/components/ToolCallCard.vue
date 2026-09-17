@@ -37,6 +37,7 @@ import {
   toolGeneratedAssetsFromPart,
   type ToolGeneratedAsset,
 } from '../utils/attachmentArtifacts'
+import { markMediaContextTarget } from '../utils/mediaContext'
 
 const props = defineProps<{ part: ToolPart }>()
 
@@ -294,6 +295,16 @@ function downloadToolMediaAsset(asset: ToolGeneratedAsset) {
   }
 }
 
+function markToolMediaContextTarget(event: MouseEvent, asset: ToolGeneratedAsset) {
+  markMediaContextTarget(event, {
+    kind: asset.kind,
+    url: asset.url,
+    text: asset.text,
+    name: asset.name,
+    mime: asset.mime_type || asset.mime,
+  })
+}
+
 // Copy result to clipboard. Used both as a header
 // affordance (so the user can grab a long result without
 // expanding it) and as an in-body button on the
@@ -446,6 +457,7 @@ async function resultForCopy(): Promise<string> {
             :key="asset.id || asset.url || asset.name || asset.text"
             class="generated-asset"
             :class="`generated-asset--${asset.kind}`"
+            @contextmenu="markToolMediaContextTarget($event, asset)"
           >
             <button
               v-if="asset.kind === 'image' && asset.url"

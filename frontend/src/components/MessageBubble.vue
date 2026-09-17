@@ -72,7 +72,15 @@ import {
 } from '../utils/clipboard'
 import { messageTextForCopy } from '../utils/messageCopy'
 import { groupConsecutiveToolParts, type PartRenderEntry } from '../utils/toolPartGrouping'
-import { collectMessageGeneratedAttachments } from '../utils/attachmentArtifacts'
+import {
+  attachmentArtifactFileName,
+  collectMessageGeneratedAttachments,
+} from '../utils/attachmentArtifacts'
+import {
+  getMediaContextTarget,
+  markMediaContextTarget,
+  type MediaContextTarget,
+} from '../utils/mediaContext'
 
 const dialog = useDialog()
 
@@ -172,13 +180,73 @@ const messageContextMenuVisible = ref(false)
 const messageContextMenuX = ref(0)
 const messageContextMenuY = ref(0)
 const messageContextMenuSelection = ref('')
-const messageContextMenuOptions: DropdownOption[] = [
-  {
-    label: '复制',
-    key: 'copy',
-    icon: () => h(Clipboard, { size: 14 }),
-  },
-]
+type MessageContextMenuTarget =
+  | { kind: 'message' }
+  | { kind: 'selection' }
+  | { kind: 'media'; media: MediaContextTarget }
+
+const messageContextMenuTarget = ref<MessageContextMenuTarget>({ kind: 'message' })
+
+function contextMenuIcon(component: Component) {
+  return () => h(component, { size: 14 })
+}
+
+function contextMediaNoun(media: MediaContextTarget): string {
+  if (media.kind === 'image') return '图片'
+  if (media.kind === 'video') return '视频'
+  if (media.kind === 'audio') return '音频'
+  if (media.kind === 'text') return '附件'
+  return '文件'
+}
+
+const messageContextMenuOptions = computed<DropdownOption[]>(() => {
+  const target = messageContextMenuTarget.value
+  const copyMessage: DropdownOption = {
+    label: '复制整条消息',
+    key: 'copy-message',
+    icon: contextMenuIcon(Clipboard),
+  }
+
+  if (target.kind === 'selection') {
+    return [
+      { label: '复制所选文本', key: 'copy-selection', icon: contextMenuIcon(Clipboard) },
+      { type: 'divider', key: 'selection-divider' },
+      copyMessage,
+    ]
+  }
+
+  if (target.kind === 'media') {
+    const media = target.media
+    const noun = contextMediaNoun(media)
+    const options: DropdownOption[] = []
+    if ((media.kind === 'image' && media.url) || media.text) {
+      options.push({
+        label: media.kind === 'image' ? '复制图片' : '复制附件内容',
+        key: 'copy-media',
+        icon: contextMenuIcon(Clipboard),
+      })
+    }
+    if (media.url) {
+      options.push({
+        label: `复制${noun}引用`,
+        key: 'copy-media-reference',
+        icon: contextMenuIcon(Clipboard),
+      })
+    }
+    if (media.url || media.text) {
+      options.push({
+        label: `下载${noun}`,
+        key: 'download-media',
+        icon: contextMenuIcon(Download),
+      })
+    }
+    if (options.length) options.push({ type: 'divider', key: 'media-divider' })
+    options.push(copyMessage)
+    return options
+  }
+
+  return [copyMessage]
+})
 
 function hideMessageContextMenu() {
   messageContextMenuVisible.value = false
@@ -189,6 +257,16 @@ async function onMessageContextMenu(e: MouseEvent) {
   // 菜单显示后焦点可能改变，先保存当前选区。
   // Snapshot the selection before the menu can change focus.
   messageContextMenuSelection.value = window.getSelection()?.toString() ?? ''
+  const mediaTarget = getMediaContextTarget(e)
+  if (mediaTarget) {
+    // 媒体目标优先于页面上可能残留的文本选区。
+    // The clicked media wins over a stale text selection elsewhere on the page.
+    messageContextMenuTarget.value = { kind: 'media', media: mediaTarget }
+  } else if (messageContextMenuSelection.value.trim()) {
+    messageContextMenuTarget.value = { kind: 'selection' }
+  } else {
+    messageContextMenuTarget.value = { kind: 'message' }
+  }
   messageContextMenuVisible.value = false
   messageContextMenuX.value = e.clientX
   messageContextMenuY.value = e.clientY
@@ -198,13 +276,28 @@ async function onMessageContextMenu(e: MouseEvent) {
 
 async function onMessageContextMenuSelect(key: string | number) {
   hideMessageContextMenu()
-  if (key === 'copy') {
-    if (messageContextMenuSelection.value) {
-      const ok = await copyText(messageContextMenuSelection.value)
-      if (ok) toast.success('已复制')
-      else toast.error('复制失败')
+  const target = messageContextMenuTarget.value
+  if (key === 'copy-selection') {
+    const ok = await copyText(messageContextMenuSelection.value)
+    if (ok) toast.success('已复制所选文本')
+    else toast.error('复制失败')
+    return
+  }
+  if (target.kind === 'media') {
+    if (key === 'copy-media') {
+      await copyContextMedia(target.media)
       return
     }
+    if (key === 'copy-media-reference') {
+      await copyContextMediaReference(target.media)
+      return
+    }
+    if (key === 'download-media') {
+      downloadContextMedia(target.media)
+      return
+    }
+  }
+  if (key === 'copy-message') {
     await copyEntireMessage()
   }
 }
@@ -427,6 +520,70 @@ function attachmentTypeLabel(attachment: MessageAttachment): string {
 }
 
 // --- Copy / download for attachments ------------------------
+
+function markMessageAttachmentContextTarget(event: MouseEvent, attachment: MessageAttachment) {
+  markMediaContextTarget(event, {
+    kind: attachmentVisualKind(attachment),
+    url: attachment.url,
+    text: attachment.text,
+    name: attachment.name,
+    mime: attachment.mime,
+  })
+}
+
+function contextMediaFileName(media: MediaContextTarget): string {
+  return attachmentArtifactFileName({
+    kind: media.kind,
+    url: media.url,
+    name: media.name,
+    mime: media.mime,
+  })
+}
+
+async function copyContextMedia(media: MediaContextTarget) {
+  if (media.kind === 'image' && media.url) {
+    try {
+      const blob = await fetchAsBlob(media.url)
+      if (await copyImageToClipboard(blob)) {
+        toast.success('已复制图片')
+        return
+      }
+    } catch { /* 统一在下方反馈。 / Report through the shared feedback below. */ }
+    toast.error('图片复制失败，可复制图片引用或下载')
+    return
+  }
+
+  if (!media.text) {
+    toast.info('没有可复制的附件内容')
+    return
+  }
+  const ok = await copyText(media.text)
+  toast[ok ? 'success' : 'error'](ok ? '已复制附件内容' : '复制失败')
+}
+
+async function copyContextMediaReference(media: MediaContextTarget) {
+  if (!media.url) {
+    toast.info('没有可复制的媒体引用')
+    return
+  }
+  const ok = await copyText(media.url)
+  toast[ok ? 'success' : 'error'](ok ? `已复制${contextMediaNoun(media)}引用` : '复制失败')
+}
+
+function downloadContextMedia(media: MediaContextTarget) {
+  const filename = contextMediaFileName(media)
+  if (media.url) {
+    downloadFromUrl(media.url, filename)
+    toast.success('已开始下载')
+    return
+  }
+  if (media.text) {
+    downloadBlob(new Blob([media.text], { type: media.mime || 'text/plain' }), filename)
+    toast.success('已下载')
+    return
+  }
+  toast.info('没有可下载的内容')
+}
 
 // friendlyAttachmentName picks a sensible filename for a
 // download when the original name is missing or weird.
@@ -1244,6 +1401,7 @@ function findPrecedingUserMessageId(): number {
                 role="button"
                 tabindex="0"
                 :aria-label="`查看图片：${a.name || '图片'}`"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
                 @click="openLightbox(a.url, a.name || 'image', 'image')"
                 @keydown.enter.prevent="openLightbox(a.url, a.name || 'image', 'image')"
                 @keydown.space.prevent="openLightbox(a.url, a.name || 'image', 'image')"
@@ -1280,6 +1438,7 @@ function findPrecedingUserMessageId(): number {
                 role="button"
                 tabindex="0"
                 :aria-label="`全屏播放：${a.name || '视频'}`"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
                 @click="openLightbox(a.url, a.name || 'video', 'video')"
                 @keydown.enter.prevent="openLightbox(a.url, a.name || 'video', 'video')"
                 @keydown.space.prevent="openLightbox(a.url, a.name || 'video', 'video')"
@@ -1312,7 +1471,11 @@ function findPrecedingUserMessageId(): number {
                   </button>
                 </div>
               </div>
-              <div v-else-if="attachmentVisualKind(a) === 'audio' && a.url" class="attachment-audio-card">
+              <div
+                v-else-if="attachmentVisualKind(a) === 'audio' && a.url"
+                class="attachment-audio-card"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
+              >
                 <div class="attachment-card-heading">
                   <span class="attachment-card-icon"><Volume2 :size="18" /></span>
                   <span class="attachment-card-info">
@@ -1335,11 +1498,16 @@ function findPrecedingUserMessageId(): number {
                 v-else-if="attachmentVisualKind(a) === 'image_not_supported'"
                 class="msg-image-warn"
                 :title="a.text"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
               >
                 <AlertTriangle :size="14" class="warn-icon" />
                 <span class="warn-text">{{ shortWarnText(a.text) }}</span>
               </div>
-              <div v-else class="msg-file-wrap">
+              <div
+                v-else
+                class="msg-file-wrap"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
+              >
                 <div class="attachment-file-card" :title="a.text">
                   <span class="attachment-card-icon">
                     <component :is="thumbText(attachmentVisualKind(a))" :size="18" />

@@ -9,6 +9,7 @@ import {
   attachmentArtifactTypeLabel,
   type AttachmentArtifact,
 } from '../utils/attachmentArtifacts'
+import { markMediaContextTarget } from '../utils/mediaContext'
 import {
   ChevronDown,
   ChevronRight,
@@ -98,6 +99,7 @@ function assetSubtitle(asset: AttachmentArtifact): string {
         :key="asset.key"
         class="generated-strip-card"
         :class="`generated-strip-card--${asset.kind}`"
+        @contextmenu="markMediaContextTarget($event, asset)"
       >
         <button
           v-if="asset.kind === 'image' && asset.url"

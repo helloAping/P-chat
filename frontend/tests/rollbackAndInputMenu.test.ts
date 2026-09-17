@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
+import { getMediaContextTarget, markMediaContextTarget } from '../src/utils/mediaContext.ts'
 
 function readStoreSource(): string {
   return readFileSync(new URL('../src/stores/chat.ts', import.meta.url), 'utf8')
@@ -26,13 +27,49 @@ function readLightboxSource(): string {
   return readFileSync(new URL('../src/components/ImageLightbox.vue', import.meta.url), 'utf8')
 }
 
+function readGeneratedAssetStripSource(): string {
+  return readFileSync(new URL('../src/components/GeneratedAssetStrip.vue', import.meta.url), 'utf8')
+}
+
+function readToolCallCardSource(): string {
+  return readFileSync(new URL('../src/components/ToolCallCard.vue', import.meta.url), 'utf8')
+}
+
 test('message right-click copy preserves and copies the selected text', () => {
   const source = readMessageBubbleSource()
 
   assert.match(source, /const messageContextMenuSelection = ref\(''\)/)
   assert.match(source, /messageContextMenuSelection\.value = window\.getSelection\(\)\?\.toString\(\) \?\? ''/)
+  assert.match(source, /key: 'copy-selection'/)
   assert.match(source, /await copyText\(messageContextMenuSelection\.value\)/)
+  assert.match(source, /key: 'copy-message'/)
   assert.match(source, /await copyEntireMessage\(\)/)
+})
+
+test('message right-click copy targets one media item before the whole message', () => {
+  const bubble = readMessageBubbleSource()
+  const strip = readGeneratedAssetStripSource()
+  const toolCard = readToolCallCardSource()
+
+  assert.match(bubble, /const mediaTarget = getMediaContextTarget\(e\)/)
+  assert.match(bubble, /messageContextMenuTarget\.value = \{ kind: 'media', media: mediaTarget \}/)
+  assert.match(bubble, /key: 'copy-media'/)
+  assert.match(bubble, /key: 'copy-media-reference'/)
+  assert.match(bubble, /key: 'download-media'/)
+  assert.match(bubble, /await copyContextMedia\(target\.media\)/)
+  assert.match(bubble, /@contextmenu="markMessageAttachmentContextTarget\(\$event, a\)"/)
+  assert.match(strip, /@contextmenu="markMediaContextTarget\(\$event, asset\)"/)
+  assert.match(toolCard, /@contextmenu="markToolMediaContextTarget\(\$event, asset\)"/)
+})
+
+test('media context registry keeps the exact item attached to the bubbling event', () => {
+  const event = new Event('contextmenu')
+  const image = { kind: 'image' as const, url: '/api/v1/uploads/one.png', name: 'one.png' }
+
+  markMediaContextTarget(event, image)
+
+  assert.equal(getMediaContextTarget(event), image)
+  assert.equal(getMediaContextTarget(new Event('contextmenu')), undefined)
 })
 
 test('message hover toolbar keeps primary actions and merges secondary actions into one menu', () => {
