@@ -2,8 +2,9 @@
 //
 // Architecture:
 //   - This is a Wails v2 app that opens a WebView2 window.
-//   - On startup, it asks pchat-server to atomically bind its own port,
-//     then learns the selected address through an identity-checked handshake.
+//   - 启动时由 pchat-server 原子绑定自己的端口，GUI 再通过身份校验握手取得地址。
+//     On startup, pchat-server atomically binds its own port, then the GUI learns
+//     the selected address through an identity-checked handshake.
 //   - The webview serves ALL content from a reverse proxy: when the user
 //     navigates to http://wails.localhost/..., we forward the request to
 //     http://127.0.0.1:<port>/... (pchat-server). This keeps the webview
@@ -479,6 +480,12 @@ func (a *App) GetBackendURL() string {
 		return ""
 	}
 	return *v
+}
+
+// GetApplicationTitle 返回包含当前运行环境名称的可见应用标题。
+// GetApplicationTitle returns the visible title for the active runtime profile.
+func (a *App) GetApplicationTitle() string {
+	return applicationTitle()
 }
 
 // StreamMessages proxies a chat-completion request to pchat-server
@@ -1291,6 +1298,8 @@ func (a *App) quitApp() {
 
 // ---------- server spawning ----------
 
+// spawnAndWatch 定位 pchat-server，以 profile 级启动握手拉起进程，安装反向代理，
+// 并在健康检查通过后显示应用。
 // spawnAndWatch locates pchat-server, starts it with a profile-scoped startup
 // handshake, installs the reverse proxy, and shows the healthy application.
 func (a *App) spawnAndWatch() {
@@ -1384,7 +1393,7 @@ func (a *App) spawnAndWatch() {
 	}
 	beURL := announcement.BaseURL
 	a.backendURL.Store(&beURL)
-	if err := waitForBackendIdentity(waitCtx, beURL, profile, instanceID, 30*time.Second); err != nil {
+	if err := waitForBackendIdentity(waitCtx, beURL, profile, instanceID, cmd.Process.Pid, 30*time.Second); err != nil {
 		log.Printf("pchat-server health check: %v", err)
 		a.backendURL.Store(nil)
 		_ = cmd.Process.Kill()
@@ -1570,7 +1579,7 @@ func environmentWithout(environment []string, keys ...string) []string {
 	return filtered
 }
 
-func waitForBackendIdentity(ctx context.Context, baseURL string, profile runtimeprofile.Profile, instanceID string, timeout time.Duration) error {
+func waitForBackendIdentity(ctx context.Context, baseURL string, profile runtimeprofile.Profile, instanceID string, pid int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 2 * time.Second}
 	for {
@@ -1584,13 +1593,14 @@ func waitForBackendIdentity(ctx context.Context, baseURL string, profile runtime
 				Status     string `json:"status"`
 				ProfileID  string `json:"profile_id"`
 				InstanceID string `json:"instance_id"`
+				PID        int    `json:"pid"`
 			}
 			decodeErr := json.NewDecoder(resp.Body).Decode(&health)
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK && decodeErr == nil {
-				if health.ProfileID != profile.ID || health.InstanceID != instanceID {
-					return fmt.Errorf("backend identity mismatch: got profile=%q instance=%q, want profile=%q instance=%q",
-						health.ProfileID, health.InstanceID, profile.ID, instanceID)
+				if health.ProfileID != profile.ID || health.InstanceID != instanceID || health.PID != pid {
+					return fmt.Errorf("backend identity mismatch: got profile=%q instance=%q pid=%d, want profile=%q instance=%q pid=%d",
+						health.ProfileID, health.InstanceID, health.PID, profile.ID, instanceID, pid)
 				}
 				if health.Status == "ok" {
 					return nil

@@ -31,6 +31,7 @@ func trayWindowClassName() string {
 
 func webviewUserDataPath() string {
 	profile := currentRuntimeProfile()
+	// 默认正式数据目录继续使用 Wails 历史路径，避免升级后丢失已有的 WebView2 本地状态。
 	// Preserve Wails' historical default for the normal production data home,
 	// so an upgrade does not discard the user's existing WebView2 local state.
 	home, _ := os.UserHomeDir()

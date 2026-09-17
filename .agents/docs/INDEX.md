@@ -28,6 +28,7 @@
 | 修改沙箱/安全检查 | [infrastructure.md](infrastructure.md) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
+| 修改多环境共存、运行 profile、动态端口或 server 启动握手 | [infrastructure.md](infrastructure.md) § Server 进程管理 | [server.md](server.md), [frontend.md](frontend.md), [设计背景](../../docs/plans/runtime-profile-coexistence.md) |
 | **修改 IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [**im.md**](im.md) | [server.md](server.md), [config.md](config.md), [agent.md](agent.md), [实现计划](../../docs/plans/im-bridge-plan.md) |
 | 回答用户“agent 功能怎么用 / GUI 怎么操作” | [../../README.md](../../README.md)「GUI 操作入口速查 / 常见问题」 | agent.md, tool.md, frontend.md |
 | 梳理项目目录、模块职责、运行流 | [../../docs/project-structure.md](../../docs/project-structure.md) | 本索引 + 对应模块文档 |
@@ -81,6 +82,7 @@ P-Chat 项目
 │       └── tool/dynamic/ → P3-2 动态工具 hot-reload
 │
 ├── browser-extension/                # Chrome/Edge 扩展源码，配合 internal/browser
+├── runtimeprofile/                   # 数据目录派生的运行身份与启动公告（独立 Go 1.23 module）
 ├── docs/project-structure.md          # 项目结构、模块职责、运行流总览
 │
 └── frontend/src/       → 请读 [frontend.md](frontend.md)

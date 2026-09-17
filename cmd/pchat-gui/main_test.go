@@ -201,13 +201,27 @@ func TestWaitForBackendIdentityRejectsAnotherInstance(t *testing.T) {
 	profile := runtimeprofile.Profile{ID: "profile-dev", Name: "dev"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","profile_id":"profile-dev","instance_id":"other"}`))
+		_, _ = fmt.Fprintf(w, `{"status":"ok","profile_id":"profile-dev","instance_id":"other","pid":%d}`, os.Getpid())
 	}))
 	defer srv.Close()
 
-	err := waitForBackendIdentity(context.Background(), srv.URL, profile, "expected", time.Second)
+	err := waitForBackendIdentity(context.Background(), srv.URL, profile, "expected", os.Getpid(), time.Second)
 	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
 		t.Fatalf("waitForBackendIdentity error = %v, want identity mismatch", err)
+	}
+}
+
+func TestWaitForBackendIdentityRejectsAnotherPID(t *testing.T) {
+	profile := runtimeprofile.Profile{ID: "profile-dev", Name: "dev"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","profile_id":"profile-dev","instance_id":"expected","pid":%d}`, os.Getpid()+1)
+	}))
+	defer srv.Close()
+
+	err := waitForBackendIdentity(context.Background(), srv.URL, profile, "expected", os.Getpid(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "pid=") {
+		t.Fatalf("waitForBackendIdentity error = %v, want PID mismatch", err)
 	}
 }
 
@@ -521,5 +535,14 @@ func TestDefaultProductionKeepsHistoricalWebviewDataPath(t *testing.T) {
 
 	if got := webviewUserDataPath(); got != "" {
 		t.Fatalf("default production WebView2 path = %q, want Wails default", got)
+	}
+}
+
+func TestGetApplicationTitleExposesDevelopmentProfile(t *testing.T) {
+	t.Setenv("PCHAT_DATA_HOME", filepath.Join(t.TempDir(), ".p-chat"))
+	t.Setenv("PCHAT_PROFILE", "dev")
+
+	if got := NewApp().GetApplicationTitle(); got != "P-Chat [dev]" {
+		t.Fatalf("GetApplicationTitle() = %q, want P-Chat [dev]", got)
 	}
 }

@@ -11,6 +11,7 @@ import BrandLogo from './BrandLogo.vue'
 import { Minus, Square, Copy, X } from './icons'
 
 const maximised = ref(false)
+const applicationTitle = ref('P-Chat')
 let maximisedPoll: ReturnType<typeof setInterval> | null = null
 
 async function withRuntime<T>(
@@ -49,7 +50,20 @@ async function requestClose() {
   }
 }
 
+async function refreshApplicationTitle() {
+  const getApplicationTitle = (window as any).go?.main?.App?.GetApplicationTitle
+  if (typeof getApplicationTitle !== 'function') return
+  try {
+    const title = await getApplicationTitle()
+    if (typeof title === 'string' && title.trim()) applicationTitle.value = title
+  } catch {
+    // 浏览器预览没有桌面端绑定。
+    // Browser preview has no desktop binding.
+  }
+}
+
 onMounted(() => {
+  void refreshApplicationTitle()
   void refreshMaximised()
   maximisedPoll = setInterval(() => { void refreshMaximised() }, 800)
 })
@@ -63,7 +77,7 @@ onUnmounted(() => {
   <header class="titlebar" @dblclick="toggleMaximise">
     <div class="titlebar-brand">
       <BrandLogo :size="16" />
-      <span class="titlebar-name">P-Chat</span>
+      <span class="titlebar-name">{{ applicationTitle }}</span>
     </div>
     <div class="titlebar-drag" aria-hidden="true" />
     <div class="titlebar-controls">

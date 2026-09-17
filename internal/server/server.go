@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -489,9 +490,10 @@ func (s *Server) RunAt(addr string) error {
 	return s.srv.ListenAndServe()
 }
 
-// RunListener serves HTTP on a listener that the caller already owns. This is
-// the race-free startup path for port 0 and preferred ranges because the
-// selected port is never released between allocation and serving.
+// RunListener 在调用方已持有的 listener 上提供 HTTP 服务；端口 0 和首选
+// 范围从分配到服务期间不会释放，因此启动过程不存在重新绑定竞态。
+// RunListener serves HTTP on a caller-owned listener without releasing the
+// selected port between allocation and serving.
 func (s *Server) RunListener(listener net.Listener) error {
 	if listener == nil {
 		return fmt.Errorf("server: listener is nil")
@@ -500,8 +502,8 @@ func (s *Server) RunListener(listener net.Listener) error {
 		Addr:    listener.Addr().String(),
 		Handler: s.engine,
 	}
-	if err := s.srv.Serve(listener); err != nil && err != http.ErrServerClosed {
-		return err
+	if err := s.srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve HTTP on %s: %w", listener.Addr().String(), err)
 	}
 	return nil
 }

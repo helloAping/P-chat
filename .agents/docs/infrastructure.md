@@ -208,10 +208,11 @@ CLI 使用的 HTTP + SSE 客户端，与 pchat-server 通信。
 - `Stop()` — 关闭子进程
 - `Listen()` — server 直接绑定显式端口、端口范围或 `:0`，不经过 probe-close-rebind
 - profile ID 由规范化 data home 派生；不同 data home 可共存，同目录 GUI 共享单实例身份
-- `/api/v1/health` 与启动 announcement 必须同时匹配 profile ID 和 instance ID
+- `/api/v1/health` 与启动 announcement 必须同时匹配 profile ID、instance ID 和子进程 PID
 - 跨平台进程分离（Windows `DETACHED_PROCESS` / Unix `setsid`）
 
-详细需求和端口矩阵见 [`docs/plans/runtime-profile-coexistence.md`](../../docs/plans/runtime-profile-coexistence.md)。
+当前实现契约以本节为准；设计背景、端口矩阵和验收记录见
+[`docs/plans/runtime-profile-coexistence.md`](../../docs/plans/runtime-profile-coexistence.md)。
 
 ## 路由约定
 

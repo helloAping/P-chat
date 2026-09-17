@@ -15,10 +15,9 @@ const (
 	PreferredPortEnd = 15159
 )
 
+// Listen 只绑定一次 server 地址并返回已持有的 listener。PCHAT_PORT（含 0）
+// 优先，其次使用 PCHAT_PORT_RANGE，否则严格绑定配置端口。
 // Listen binds the server address exactly once and returns the owned listener.
-// PCHAT_PORT takes precedence when present, including the value 0 for an
-// OS-assigned ephemeral port. PCHAT_PORT_RANGE is used next; otherwise the
-// configured port is bound exactly.
 func Listen(host string, configuredPort int) (net.Listener, error) {
 	if raw, ok := os.LookupEnv("PCHAT_PORT"); ok && strings.TrimSpace(raw) != "" {
 		port, err := strconv.Atoi(strings.TrimSpace(raw))

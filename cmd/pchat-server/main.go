@@ -338,9 +338,10 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Auto-index knowledge bases on startup (if enabled).
 	srv.Handler().AutoIndexKnowledgeBases()
 
-	// Bind once and keep ownership of the listener through Serve. In
-	// particular, PCHAT_PORT=0 now delegates allocation to the OS without
-	// the old probe-close-rebind race between the parent and this process.
+	// 只绑定一次，并在 Serve 全程持有 listener。PCHAT_PORT=0 直接交给操作系统
+	// 分配端口，避免父子进程间原先“探测—关闭—重新绑定”的竞态。
+	// Bind once and retain the listener through Serve. PCHAT_PORT=0 delegates
+	// allocation to the OS without the old probe-close-rebind race.
 	listener, err := serverproc.Listen(cfg.Server.Host, cfg.Server.Port)
 	if err != nil {
 		return err

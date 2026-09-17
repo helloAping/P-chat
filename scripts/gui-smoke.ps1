@@ -181,8 +181,9 @@ try {
     exit 1
 }
 
-# 6a. exercise the upload endpoint: a tiny PNG must be accepted,
-#     classified as image, and stored under this smoke profile's data home.
+# 6a. 验证上传端点：微型 PNG 必须被接受、识别为图片，并存入 smoke profile 的数据目录。
+#     Exercise the upload endpoint: a tiny PNG must be accepted, classified as
+#     image, and stored under this smoke profile's data home.
 Step "6a" "POST /api/v1/uploads accepts a PNG and returns metadata"
 try {
     # 1x1 transparent PNG (8-byte signature + IHDR + IDAT + IEND)

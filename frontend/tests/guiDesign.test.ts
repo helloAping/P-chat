@@ -11,6 +11,14 @@ test('tool confirm uses the shared modal chrome', () => {
   assert.doesNotMatch(source, /style="width:/)
 })
 
+test('frameless title bar displays the runtime profile title', () => {
+  const source = readFileSync(new URL('../src/components/TitleBar.vue', import.meta.url), 'utf8')
+
+  assert.match(source, /GetApplicationTitle/)
+  assert.match(source, /\{\{ applicationTitle \}\}/)
+  assert.doesNotMatch(source, /class="titlebar-name">P-Chat</)
+})
+
 test('tool drawer follows icon and token discipline', () => {
   const source = readFileSync(new URL('../src/components/ToolListDrawer.vue', import.meta.url), 'utf8')
 

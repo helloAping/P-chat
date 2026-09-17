@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -220,6 +221,25 @@ func TestRunListenerServesOnAlreadyOwnedEphemeralPort(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("RunListener did not stop after shutdown")
+	}
+}
+
+func TestRunListenerWrapsListenerFailure(t *testing.T) {
+	s, _ := newTestServer(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.RunListener(listener)
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("RunListener error = %v, want wrapped net.ErrClosed", err)
+	}
+	if !strings.Contains(err.Error(), "serve HTTP on") {
+		t.Fatalf("RunListener error = %q, want serve context", err)
 	}
 }
 

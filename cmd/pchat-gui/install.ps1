@@ -10,7 +10,7 @@
 #   .\install.ps1 -RemoveFromPath       # 从用户 PATH 移除 / remove P-Chat from user PATH
 #   .\install.ps1 -Gui                  # 显示可视化安装器 / show the visual installer
 #   .\install.ps1 -Launch               # 安装后启动 / launch P-Chat after installation
-#   .\install.ps1 -Force                # allow overwrite when the recorded install path differs
+#   .\install.ps1 -Force                # 允许覆盖不同的已记录安装路径 / allow overwrite when the recorded install path differs
 #
 # Uninstall: run uninstall.ps1 next to pchat-gui.exe.
 #
@@ -566,6 +566,8 @@ if ($AddToPath -and $RemoveFromPath) {
 # lives under $target, so an install to a different path
 # doesn't accidentally quit an unrelated running install.
 #
+# -Force 可以覆盖本脚本其他位置的安装目录检查，但不会扩大到 $target 之外的进程。
+# 开发版和其他并行安装必须保持运行。
 # -Force may override install-location checks elsewhere in this script, but it
 # never broadens process termination beyond $target. Dev and parallel installs
 # must remain running.

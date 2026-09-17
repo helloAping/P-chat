@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/p-chat/pchat/runtimeprofile"
 )
 
 func TestStart_NoServerBin(t *testing.T) {
@@ -106,6 +110,58 @@ func TestListenRangeFallsBackAtomicallyWhenRangeIsOccupied(t *testing.T) {
 	defer listener.Close()
 	if got := listener.Addr().(*net.TCPAddr).Port; got == occupiedPort || got == 0 {
 		t.Fatalf("fallback port = %d, occupied=%d", got, occupiedPort)
+	}
+}
+
+func TestWaitReadyRejectsAnotherProcessPID(t *testing.T) {
+	profile, err := runtimeprofile.Resolve(filepath.Join(t.TempDir(), ".p-chat"), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const instanceID = "instance-test"
+	expectedPID := os.Getpid()
+	healthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":      "ok",
+			"profile_id":  profile.ID,
+			"instance_id": instanceID,
+			"pid":         expectedPID + 1,
+		})
+	}))
+	defer healthServer.Close()
+
+	srv := &Server{
+		Cmd:        &exec.Cmd{Process: &os.Process{Pid: expectedPID}},
+		BaseURL:    healthServer.URL,
+		Profile:    profile,
+		InstanceID: instanceID,
+	}
+	err = srv.waitReady(context.Background(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "pid=") {
+		t.Fatalf("waitReady error = %v, want PID identity mismatch", err)
+	}
+}
+
+func TestBuildCommandUsesPerAttemptInstanceIdentity(t *testing.T) {
+	profile, err := runtimeprofile.Resolve(filepath.Join(t.TempDir(), ".p-chat"), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Profile:     profile,
+		runtimeFile: filepath.Join(t.TempDir(), "runtime.json"),
+		opts: Options{
+			ServerBin: "pchat-server",
+			Port:      0,
+		},
+	}
+
+	for _, instanceID := range []string{"first-instance", "restart-instance"} {
+		cmd := srv.buildCommand(context.Background(), instanceID)
+		if !strings.Contains(strings.Join(cmd.Env, "\n"), runtimeprofile.InstanceEnv+"="+instanceID) {
+			t.Fatalf("buildCommand(%q) did not pass the attempt identity", instanceID)
+		}
 	}
 }
 

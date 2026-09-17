@@ -31,6 +31,7 @@ foreach ($process in Get-Process -Name $names -ErrorAction SilentlyContinue) {
             Write-Host "[stop-dev-processes] stopped PID=$($process.Id): $executable"
         }
         catch {
+            # GUI 退出时可能已经结束其子 server；上方已校验可执行路径，这是无害竞态。
             # GUI shutdown may already have stopped its child server.
             # The executable path was verified above, so this is a benign race.
             Write-Warning "[stop-dev-processes] PID=$($process.Id) already exited or could not be stopped: $($_.Exception.Message)"

@@ -17,13 +17,14 @@
 
 ## 当前进度快照
 
-> 快照日期：2026-08-31。仓库 `VERSION` 当前为 `1.0.13`；正式分发版本以 `VERSION` 和 release tag 为准。
+> 快照日期：2026-09-17。仓库 `VERSION` 当前为 `1.0.13`；正式分发版本以 `VERSION` 和 release tag 为准。
 
 P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手形成了比较完整的桌面工作台：
 
 | 模块 | 当前状态 | 说明 |
 | --- | --- | --- |
 | 三端形态 | 已落地 | CLI、独立 HTTP server、Wails 桌面端共用同一套 agent/server 逻辑 |
+| 运行环境隔离 | 已落地 | dev/prod 按 data home 隔离身份与数据；动态端口、启动公告和 health 校验避免端口冲突或误连 |
 | 对话流 | 已落地 | text / thinking / tool / sub-agent parts 结构化渲染，支持 SSE 流式、seq、断线恢复 |
 | Agent 执行 | 已落地 | ReAct 工具循环、并发工具派发、auto-continue、Plan/Build、todo 守卫、stuck-loop 保护 |
 | LLM 协议 | 已落地 | OpenAI 兼容 + Anthropic 原生；自定义 SSE reader 兼容 reasoning / proxy error / 非标准 delta |
@@ -134,7 +135,7 @@ task build:dev
 
 源码改完只要再 `task build:dev` 一次就会原地热替换。重建脚本会核对可执行文件的完整路径，只结束本仓库 `dev-bin/` 下的旧进程，不会按进程名结束已安装的正式版。
 
-端口由 server 自己持有 listener 后再通知 GUI，避免并发启动时的“探测后释放”竞争。正式 GUI 优先使用 `15150-15159`，范围全满则回退到系统临时端口；dev/test 直接使用系统临时端口。GUI 会同时校验 profile、instance 和 PID，不会把另一个环境碰巧返回的 `/health` 当成本次后端。完整约定见 [`docs/plans/runtime-profile-coexistence.md`](docs/plans/runtime-profile-coexistence.md)。
+端口由 server 自己持有 listener 后再通知 GUI，避免并发启动时的“探测后释放”竞争。正式 GUI 优先使用 `15150-15159`，范围全满则回退到系统临时端口；dev/test 直接使用系统临时端口。GUI 会同时校验 profile、instance 和 PID，不会把另一个环境碰巧返回的 `/health` 当成本次后端。当前维护约定见 [`.agents/docs/infrastructure.md`](.agents/docs/infrastructure.md) 的“Server 进程管理”，设计背景与验收记录见 [`docs/plans/runtime-profile-coexistence.md`](docs/plans/runtime-profile-coexistence.md)。
 
 ### 前置
 

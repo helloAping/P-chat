@@ -40,8 +40,10 @@ type Server struct {
 
 // Options configures a server launch.
 type Options struct {
-	// Port to bind the server on. 0 asks the OS for an ephemeral port.
-	// Positive values are strict and fail when already occupied.
+	// Port 是 server 绑定端口；0 表示由系统分配临时端口，正数端口被占用时
+	// 直接失败。
+	// Port binds the server; 0 requests an ephemeral OS-assigned port, while a
+	// positive value is strict.
 	Port int
 	// ConfigPath is the path passed as --config. Empty = use
 	// the data dir's config.json (preferred) or config.yaml
@@ -70,9 +72,9 @@ type Options struct {
 	RestartBackOff time.Duration
 }
 
-// Start launches pchat-server and blocks until its startup announcement and
-// HTTP health identity both match the expected profile and process instance.
-// The caller is responsible for calling Stop on the returned handle.
+// Start 启动 pchat-server，并等待启动公告与 HTTP health 的 profile、instance
+// 和 PID 均匹配；调用方负责对返回句柄调用 Stop。
+// Start launches pchat-server and waits for both startup identity checks.
 func Start(ctx context.Context, opts Options) (*Server, error) {
 	if opts.ServerBin == "" {
 		return nil, errors.New("serverproc: ServerBin is required")
@@ -194,30 +196,42 @@ func (s *Server) waitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	healthURL := s.BaseURL + "/api/v1/health"
 	client := &http.Client{Timeout: 500 * time.Millisecond}
+	s.mu.Lock()
+	cmd := s.Cmd
+	instanceID := s.InstanceID
+	s.mu.Unlock()
+	expectedPID := 0
+	if cmd != nil && cmd.Process != nil {
+		expectedPID = cmd.Process.Pid
+	}
 	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("server did not become ready within %v", timeout)
 		}
 		// If the child already exited, give up early.
-		if s.Cmd.ProcessState != nil && s.Cmd.ProcessState.Exited() {
-			return fmt.Errorf("server exited before becoming ready (code %d)", s.Cmd.ProcessState.ExitCode())
+		if cmd != nil && cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+			return fmt.Errorf("server exited before becoming ready (code %d)", cmd.ProcessState.ExitCode())
 		}
 		req, _ := http.NewRequestWithContext(ctx, "GET", healthURL, nil)
 		resp, err := client.Do(req)
 		if err == nil {
 			if resp.StatusCode == 200 {
 				var health struct {
+					Status     string `json:"status"`
 					ProfileID  string `json:"profile_id"`
 					InstanceID string `json:"instance_id"`
+					PID        int    `json:"pid"`
 				}
 				decodeErr := json.NewDecoder(resp.Body).Decode(&health)
 				_ = resp.Body.Close()
-				if decodeErr == nil && health.ProfileID == s.Profile.ID && health.InstanceID == s.InstanceID {
+				if decodeErr == nil && health.Status == "ok" && health.ProfileID == s.Profile.ID &&
+					health.InstanceID == instanceID && health.PID == expectedPID {
 					return nil
 				}
 				if decodeErr == nil {
-					return fmt.Errorf("server identity mismatch: got profile=%q instance=%q, want profile=%q instance=%q",
-						health.ProfileID, health.InstanceID, s.Profile.ID, s.InstanceID)
+					return fmt.Errorf("server identity mismatch: got status=%q profile=%q instance=%q pid=%d, want status=%q profile=%q instance=%q pid=%d",
+						health.Status, health.ProfileID, health.InstanceID, health.PID,
+						"ok", s.Profile.ID, instanceID, expectedPID)
 				}
 			} else {
 				_ = resp.Body.Close()
@@ -233,7 +247,14 @@ func (s *Server) waitReady(ctx context.Context, timeout time.Duration) error {
 }
 
 func (s *Server) waitAnnouncement(ctx context.Context, timeout time.Duration) error {
-	announcement, port, err := runtimeprofile.WaitAnnouncement(ctx, s.runtimeFile, s.Profile, s.InstanceID, s.Cmd.Process.Pid, timeout)
+	s.mu.Lock()
+	cmd := s.Cmd
+	instanceID := s.InstanceID
+	s.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return errors.New("serverproc: child process is unavailable")
+	}
+	announcement, port, err := runtimeprofile.WaitAnnouncement(ctx, s.runtimeFile, s.Profile, instanceID, cmd.Process.Pid, timeout)
 	if err != nil {
 		return err
 	}
@@ -301,7 +322,12 @@ func (s *Server) watchAndRestart(ctx context.Context) {
 			count, s.opts.MaxRestarts, backOff)
 		time.Sleep(backOff)
 
-		cmd := s.buildCommand(ctx)
+		instanceID, err := runtimeprofile.NewInstanceID()
+		if err != nil {
+			log.Printf("[serverproc] restart %d: create instance identity: %v", count, err)
+			continue
+		}
+		cmd := s.buildCommand(ctx, instanceID)
 		_ = os.Remove(s.runtimeFile)
 		if err := cmd.Start(); err != nil {
 			log.Printf("[serverproc] restart %d: start failed: %v", count, err)
@@ -309,6 +335,7 @@ func (s *Server) watchAndRestart(ctx context.Context) {
 		}
 		s.mu.Lock()
 		s.Cmd = cmd
+		s.InstanceID = instanceID
 		s.mu.Unlock()
 
 		if err := s.waitAnnouncement(ctx, s.opts.PingTimeout); err != nil {
@@ -329,9 +356,10 @@ func (s *Server) watchAndRestart(ctx context.Context) {
 	}
 }
 
-// buildCommand constructs an exec.Cmd from the saved options. An ephemeral
-// port is freshly allocated by the child on every restart when opts.Port is 0.
-func (s *Server) buildCommand(ctx context.Context) *exec.Cmd {
+// buildCommand 根据保存的选项和本次进程身份构造 exec.Cmd；当 opts.Port 为 0
+// 时，每次重启均由子进程重新分配临时端口。
+// buildCommand constructs an exec.Cmd for one restart attempt.
+func (s *Server) buildCommand(ctx context.Context, instanceID string) *exec.Cmd {
 	opts := s.opts
 	args := []string{"--config", opts.ConfigPath}
 	if opts.ConfigPath == "" {
@@ -351,7 +379,7 @@ func (s *Server) buildCommand(ctx context.Context) *exec.Cmd {
 		fmt.Sprintf("PCHAT_PORT=%d", opts.Port),
 		"PCHAT_DATA_HOME=" + s.Profile.DataHome,
 		runtimeprofile.ProfileEnv + "=" + s.Profile.Name,
-		runtimeprofile.InstanceEnv + "=" + s.InstanceID,
+		runtimeprofile.InstanceEnv + "=" + instanceID,
 		runtimeprofile.RuntimeFileEnv + "=" + s.runtimeFile,
 	}
 	if opts.WebDir != "" {

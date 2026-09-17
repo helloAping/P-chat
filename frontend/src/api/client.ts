@@ -44,14 +44,17 @@ function directBackendURL(): string {
   return BASE
 }
 
+// apiURL 使用当前运行环境选定的后端解析非流式或可下载 API 资源。
 // apiURL resolves a non-streaming or downloadable API resource against the
 // backend selected for this runtime profile.
 export function apiURL(path: string): string {
   return directBackendURL() + path
 }
 
-// waitForAPIURL waits for the desktop host's startup handshake before
-// resolving a URL. Browser-only development can set VITE_PCHAT_BACKEND.
+// waitForAPIURL 等待桌面宿主完成启动握手后再解析 URL；纯浏览器开发可设置
+// VITE_PCHAT_BACKEND。
+// waitForAPIURL waits for the desktop host's startup handshake before resolving
+// a URL. Browser-only development can set VITE_PCHAT_BACKEND.
 export async function waitForAPIURL(path: string): Promise<string> {
   return (await waitForDirectBackend()) + path
 }

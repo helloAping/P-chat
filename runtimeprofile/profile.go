@@ -1,6 +1,7 @@
+// Package runtimeprofile 为每个 P-Chat 数据目录提供稳定运行身份；不同数据目录
+// 可以共存，同一数据目录则有意共享同一个身份。
 // Package runtimeprofile gives each P-Chat data directory a stable runtime
-// identity. Processes that use different data directories may coexist, while
-// processes that use the same directory deliberately share one identity.
+// identity so different data homes can coexist safely.
 package runtimeprofile
 
 import (
@@ -14,10 +15,12 @@ import (
 )
 
 const (
+	// ProfileEnv 是可选的人类可读运行环境名称变量。
 	// ProfileEnv names the optional human-readable runtime profile.
 	ProfileEnv = "PCHAT_PROFILE"
 )
 
+// Profile 描述一个隔离的 P-Chat 运行环境。
 // Profile describes one isolated P-Chat runtime profile.
 type Profile struct {
 	Name     string `json:"name"`
@@ -25,15 +28,17 @@ type Profile struct {
 	DataHome string `json:"data_home"`
 }
 
+// Current 根据 dataHome 解析运行环境，并以 PCHAT_PROFILE 作为可选显示名。
 // Current resolves the profile for dataHome using PCHAT_PROFILE as its
 // optional display name.
 func Current(dataHome string) (Profile, error) {
 	return Resolve(dataHome, os.Getenv(ProfileEnv))
 }
 
-// Resolve canonicalizes dataHome and derives a stable identity from it. The
-// display name is intentionally excluded from the identity: renaming a profile
-// must not allow a second process to open the same data directory.
+// Resolve 规范化 dataHome 并派生稳定身份。显示名不参与身份计算，避免通过
+// 改名绕过同一数据目录的单实例约束。
+// Resolve canonicalizes dataHome and derives a stable identity from it; the
+// display name is intentionally excluded from the identity.
 func Resolve(dataHome, name string) (Profile, error) {
 	canonical, err := canonicalDataHome(dataHome)
 	if err != nil {
@@ -57,6 +62,7 @@ func Resolve(dataHome, name string) (Profile, error) {
 	}, nil
 }
 
+// WindowTitle 返回当前运行环境对用户可见的窗口标题。
 // WindowTitle returns the user-visible title for this profile.
 func (p Profile) WindowTitle() string {
 	if strings.EqualFold(strings.TrimSpace(p.Name), "prod") || strings.TrimSpace(p.Name) == "" {

@@ -1295,6 +1295,8 @@ func (h *Handler) SetListenAddr(addr string) {
 	h.listenAddr = addr
 }
 
+// SetRuntimeIdentity 记录 health 端点公开的运行环境和进程实例；必须在 server
+// 接受请求前调用。
 // SetRuntimeIdentity records the profile and process instance exposed by the
 // health endpoint. Call it before the server accepts requests.
 func (h *Handler) SetRuntimeIdentity(profile runtimeprofile.Profile, instanceID string) {

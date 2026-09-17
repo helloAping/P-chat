@@ -16,12 +16,15 @@ import (
 )
 
 const (
+	// InstanceEnv 传递父进程选定的进程实例身份。
 	// InstanceEnv carries the parent-selected process instance identity.
 	InstanceEnv = "PCHAT_INSTANCE_ID"
+	// RuntimeFileEnv 指定 pchat-server 发布实际监听地址的位置。
 	// RuntimeFileEnv tells pchat-server where to publish its bound address.
 	RuntimeFileEnv = "PCHAT_RUNTIME_FILE"
 )
 
+// Announcement 是 pchat-server 持有 listener 后、开始服务前发布的启动握手。
 // Announcement is the startup handshake published after pchat-server owns its
 // listener and before it begins serving requests.
 type Announcement struct {
@@ -33,6 +36,7 @@ type Announcement struct {
 	BaseURL     string `json:"base_url"`
 }
 
+// NewInstanceID 返回随机的进程实例标识。
 // NewInstanceID returns a random process instance identifier.
 func NewInstanceID() (string, error) {
 	buf := make([]byte, 16)
@@ -42,9 +46,10 @@ func NewInstanceID() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// NewAnnouncementPath reserves a unique temporary pathname for a single
-// parent/child startup handshake. The placeholder is removed before return so
-// the server can publish the announcement atomically with a rename.
+// NewAnnouncementPath 为一次父子进程启动握手预留唯一临时路径；返回前删除
+// 占位文件，以便 server 通过 rename 原子发布公告。
+// NewAnnouncementPath reserves a unique temporary pathname for one startup
+// handshake and removes the placeholder before returning.
 func NewAnnouncementPath() (string, error) {
 	file, err := os.CreateTemp("", "pchat-runtime-*.json")
 	if err != nil {
@@ -61,6 +66,7 @@ func NewAnnouncementPath() (string, error) {
 	return path, nil
 }
 
+// WriteAnnouncement 原子发布 server 启动公告。
 // WriteAnnouncement atomically publishes a server startup announcement.
 func WriteAnnouncement(path string, announcement Announcement) error {
 	if strings.TrimSpace(path) == "" {
@@ -96,6 +102,7 @@ func WriteAnnouncement(path string, announcement Announcement) error {
 	return nil
 }
 
+// ReadAnnouncement 读取 server 启动公告。
 // ReadAnnouncement reads a server startup announcement.
 func ReadAnnouncement(path string) (Announcement, error) {
 	payload, err := os.ReadFile(path)
@@ -109,6 +116,7 @@ func ReadAnnouncement(path string) (Announcement, error) {
 	return announcement, nil
 }
 
+// Validate 校验公告是否属于预期运行环境和进程，并返回实际 TCP 端口。
 // Validate verifies that an announcement belongs to the expected profile and
 // process, and returns its bound TCP port.
 func (a Announcement) Validate(profile Profile, instanceID string, pid int) (int, error) {
@@ -134,8 +142,9 @@ func (a Announcement) Validate(profile Profile, instanceID string, pid int) (int
 	return port, nil
 }
 
-// WaitAnnouncement waits until the expected child atomically publishes a
-// valid startup announcement or the context/timeout expires.
+// WaitAnnouncement 等待预期子进程原子发布有效启动公告，或在上下文/超时结束。
+// WaitAnnouncement waits until the expected child publishes a valid startup
+// announcement or the context/timeout expires.
 func WaitAnnouncement(ctx context.Context, path string, profile Profile, instanceID string, pid int, timeout time.Duration) (Announcement, int, error) {
 	deadline := time.Now().Add(timeout)
 	for {

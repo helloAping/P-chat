@@ -32,9 +32,10 @@ func TestNewWritesToDatedFile(t *testing.T) {
 
 func TestCleanupRemovesExpired(t *testing.T) {
 	dir := t.TempDir()
-	// Create stale files outside the writer's knowledge so cleanup
-	// must discover them on the first write. Keep a one-day margin on
-	// either side of the retention boundary to avoid midnight races.
+	// 在 writer 不知情时创建旧文件，验证首次写入会发现并清理它们；保留边界两侧
+	// 各一天余量，避免午夜日期切换造成竞态。
+	// Create stale files outside the writer's knowledge so cleanup must discover
+	// them on the first write. Keep a one-day margin around the retention boundary.
 	expired := time.Now().AddDate(0, 0, -8).Format("2006-01-02")
 	kept := time.Now().AddDate(0, 0, -6).Format("2006-01-02")
 	for _, day := range []string{expired, kept} {
