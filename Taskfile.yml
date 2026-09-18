@@ -445,13 +445,14 @@ tasks:
   build:dev:
     desc: 快速编译并启动 GUI 测试环境（绕过 wails dev，前端内嵌到 pchat-server）
     deps: [build:frontend]
+    dir: '{{.ROOT_DIR}}'
     env:
       PCHAT_PROFILE: dev
       PCHAT_DATA_HOME: '{{.ROOT_DIR}}/dev-bin/.p-chat'
       PCHAT_PORT: '0'
     cmds:
       - powershell -NoProfile -Command "New-Item -ItemType Directory -Path dev-bin -Force | Out-Null"
-      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\stop-dev-processes.ps1
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "{{.ROOT_DIR}}/scripts/stop-dev-processes.ps1"
       - go build -o dev-bin/pchat-server.exe ./cmd/pchat-server
       - go build -o dev-bin/pchat.exe ./cmd/pchat
       - go build -o dev-bin/pchat-updater.exe ./cmd/pchat-updater

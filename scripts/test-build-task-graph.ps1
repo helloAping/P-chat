@@ -94,3 +94,11 @@ foreach ($platformName in 'linux', 'mac') {
 
     Write-Host "[test-build-task-graph] build:all creates update zip for $platformName" -ForegroundColor Green
 }
+
+$buildDevOutput = @(Invoke-TaskDryRun -TaskName 'build:dev') -join [Environment]::NewLine
+$repoRoot = (Split-Path -Parent $PSScriptRoot) -replace '\\', '/'
+$expectedStopScript = "-File `"$repoRoot/scripts/stop-dev-processes.ps1`""
+if (-not $buildDevOutput.Contains($expectedStopScript)) {
+    throw "Expected 'build:dev' to use the root-anchored stop script '$expectedStopScript'."
+}
+Write-Host '[test-build-task-graph] build:dev anchors the stop script to ROOT_DIR' -ForegroundColor Green
