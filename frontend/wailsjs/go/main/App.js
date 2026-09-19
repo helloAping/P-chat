@@ -14,6 +14,10 @@ export function ConfirmWindowClose(arg1) {
   return window['go']['main']['App']['ConfirmWindowClose'](arg1);
 }
 
+export function GetApplicationTitle() {
+  return window['go']['main']['App']['GetApplicationTitle']();
+}
+
 export function GetBackendURL() {
   return window['go']['main']['App']['GetBackendURL']();
 }
