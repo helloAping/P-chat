@@ -30,7 +30,7 @@
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
 | 修改多环境共存、运行 profile、动态端口或 server 启动握手 | [infrastructure.md](infrastructure.md) § Server 进程管理 | [server.md](server.md), [frontend.md](frontend.md), [设计背景](../../docs/plans/runtime-profile-coexistence.md) |
 | **修改 IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [**im.md**](im.md) | [server.md](server.md), [config.md](config.md), [agent.md](agent.md), [实现计划](../../docs/plans/im-bridge-plan.md) |
-| 回答用户“agent 功能怎么用 / GUI 怎么操作” | [../../README.md](../../README.md)「GUI 操作入口速查 / 常见问题」 | agent.md, tool.md, frontend.md |
+| 回答用户“agent 功能怎么用 / GUI 怎么操作” | [../../README.md](../../README.md)「GUI 操作速查 / 常见问题」 | [完整图文指南](../../docs/p-chat-article-2026-09.md), agent.md, tool.md, frontend.md |
 | 梳理项目目录、模块职责、运行流 | [../../docs/project-structure.md](../../docs/project-structure.md) | 本索引 + 对应模块文档 |
 | 查看当前项目现状与可做事项 | [../../docs/feature-opportunities.md](../../docs/feature-opportunities.md) | — |
 | **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |

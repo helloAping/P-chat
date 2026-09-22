@@ -12,7 +12,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 
 `api/client.ts` 的 JSON、上传、下载和 SSE 请求都必须从 `waitForDirectBackend()` / `apiURL()` 解析目标，禁止新增固定本地端口。纯 Vite 浏览器开发如需直连独立 server，显式设置 `VITE_PCHAT_BACKEND=http://127.0.0.1:<实际端口>`；`vite.config.ts` 不提供固定端口代理。
 
-用户向 GUI 操作流程统一写在项目根目录 `README.md` 的「GUI 操作入口速查」和「常见问题」里，例如浏览器控制安装与连接诊断、知识库选择、工作模式切换、风格关闭、工具列表、动态工具 YAML 加载诊断和 trace id 复制。本文件只记录前端实现结构和维护入口。
+用户向 GUI 操作入口与排障统一写在项目根目录 `README.md` 的「GUI 操作速查」和「常见问题」里；首次配置、项目、附件、知识库、媒体、Skill/MCP 与 CLI 的完整流程写在 [`docs/p-chat-article-2026-09.md`](../../docs/p-chat-article-2026-09.md)。本文件只记录前端实现结构和维护入口。
 
 ## 文件结构
 

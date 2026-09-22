@@ -1,8 +1,8 @@
 # 项目结构总览
 
-> 快照日期：2026-08-31。当前 `VERSION` 为 `1.0.13`。
+> 快照日期：2026-09-22。当前 `VERSION` 为 `1.0.13.beta`。
 >
-> 这份文档用于回答“这个仓库每个目录负责什么、改功能先看哪里、功能状态以哪里为准”。更细的模块维护入口见 `.agents/docs/INDEX.md`，用户使用入口见 `README.md`。
+> 这份文档用于回答“这个仓库每个目录负责什么、改功能先看哪里、功能状态以哪里为准”。更细的模块维护入口见 `.agents/docs/INDEX.md`，用户入口见 `README.md`，完整图文流程见 `docs/p-chat-article-2026-09.md`。
 
 ## 1. 顶层目录
 
@@ -168,6 +168,7 @@ Chrome/Edge 扩展连接 /api/v1/browser/ws
 | 文档 | 面向对象 | 维护内容 |
 | --- | --- | --- |
 | `README.md` | 用户 | 安装、启动、GUI 操作入口、常见问题、当前能力摘要 |
+| `docs/p-chat-article-2026-09.md` | 新用户 | 从首次配置到项目、知识库、媒体、Skill/MCP、CLI 的完整图文流程 |
 | `docs/project-structure.md` | 新维护者 | 目录结构、模块职责、关键运行流、功能状态口径 |
 | `docs/feature-opportunities.md` | 排期/产品判断 | 已落地能力、可迭代任务、优先级 |
 | `.agents/AGENTS.md` | Agent | 协作规范、启动检查、编码约束、关键文件速查 |
