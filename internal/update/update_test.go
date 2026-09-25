@@ -250,3 +250,148 @@ func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
+
+// latestJSONFixture renders a latest.json body with a full and a patch
+// artifact; patchFrom is the patch's from_version floor (empty = none).
+func latestJSONFixture(srv *httptest.Server, patchFrom string) string {
+	return fmt.Sprintf(`{
+		"name":"P-Chat",
+		"version":"1.0.13",
+		"platform":"windows",
+		"arch":"amd64",
+		"full":{"kind":"full","platform":"windows","arch":"amd64","size":10,"sha256":"%s","url":"%s"},
+		"patch":{"kind":"patch","platform":"windows","arch":"amd64","from_version":%q,"size":10,"sha256":"%s","url":"%s"}
+	}`,
+		sha256Hex([]byte("full")), srv.URL+"/pchat-setup-v1.0.13.exe",
+		patchFrom, sha256Hex([]byte("patch")), srv.URL+"/pchat-update-windows-amd64-v1.0.13.zip")
+}
+
+func checkWithPatchFloor(t *testing.T, currentVersion, patchFrom string) *CheckResult {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, latestJSONFixture(srv, patchFrom))
+	}))
+	t.Cleanup(srv.Close)
+	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	res, err := svc.Check(t.Context(), currentVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.HasUpdate {
+		t.Fatalf("HasUpdate = false for current=%q, want true", currentVersion)
+	}
+	return res
+}
+
+// TestCheckPatchFromVersionCoversBeta is the regression test for the
+// 2026-09-25 report: a beta build (1.0.13-beta.1) must be allowed to use
+// a patch whose floor is from_version=1.0.0 — pre-release ordering still
+// sorts 1.0.13-beta.1 above 1.0.0.
+func TestCheckPatchFromVersionCoversBeta(t *testing.T) {
+	res := checkWithPatchFloor(t, "1.0.13-beta.1", "1.0.0")
+	if res.Artifact == nil || res.Artifact.Kind != "patch" {
+		t.Fatalf("artifact = %#v, want patch for beta above the floor", res.Artifact)
+	}
+	if !res.Installable {
+		t.Fatal("Installable = false, want true for patch zip")
+	}
+}
+
+// TestCheckPatchFromVersionFallbackToFull pins the safety behaviour: when
+// the running version is older than the patch floor, the client must fall
+// back to the full package instead of applying an inapplicable patch.
+func TestCheckPatchFromVersionFallbackToFull(t *testing.T) {
+	res := checkWithPatchFloor(t, "1.0.0", "1.0.12")
+	if res.Artifact == nil || res.Artifact.Kind != "full" {
+		t.Fatalf("artifact = %#v, want full fallback for version below the floor", res.Artifact)
+	}
+}
+
+// TestCheckPatchWithoutFromVersionKeepsLegacyBehaviour ensures a patch
+// with no declared floor is still always preferred (legacy latest.json).
+func TestCheckPatchWithoutFromVersionKeepsLegacyBehaviour(t *testing.T) {
+	res := checkWithPatchFloor(t, "1.0.12", "")
+	if res.Artifact == nil || res.Artifact.Kind != "patch" {
+		t.Fatalf("artifact = %#v, want patch when no floor declared", res.Artifact)
+	}
+}
+
+// TestCheckPatchFromVersionRejectsUnknownCurrent ensures a build with an
+// empty current version never receives a patch (its file set is
+// unknowable), falling back to the full package instead.
+func TestCheckPatchFromVersionRejectsUnknownCurrent(t *testing.T) {
+	res := checkWithPatchFloor(t, "", "1.0.0")
+	if res.Artifact == nil || res.Artifact.Kind != "full" {
+		t.Fatalf("artifact = %#v, want full fallback for unknown current version", res.Artifact)
+	}
+}
+
+// TestCheckRetriesTransientServerError drives the fetch retry: the first
+// two attempts fail with 500, the third succeeds.
+func TestCheckRetriesTransientServerError(t *testing.T) {
+	var calls int
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, latestJSONFixture(srv, "1.0.0"))
+	}))
+	defer srv.Close()
+	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	res, err := svc.Check(t.Context(), "1.0.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3 (two 500s then success)", calls)
+	}
+	if !res.HasUpdate {
+		t.Fatal("HasUpdate = false, want true after retry")
+	}
+}
+
+// TestCheckDoesNotRetryClientError ensures 4xx responses (other than the
+// 404 no-metadata case) fail immediately without burning retries.
+func TestCheckDoesNotRetryClientError(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	if _, err := svc.Check(t.Context(), "1.0.12"); err == nil {
+		t.Fatal("expected error for 400 response")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (no retry on 4xx)", calls)
+	}
+}
+
+// TestCheck404DoesNotRetry ensures the no-metadata 404 path stays a
+// single request.
+func TestCheck404DoesNotRetry(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	res, err := svc.Check(t.Context(), "1.0.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.HasUpdate {
+		t.Fatal("HasUpdate = true, want false for 404")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (no retry on 404)", calls)
+	}
+}

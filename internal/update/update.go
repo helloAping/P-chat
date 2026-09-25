@@ -197,7 +197,7 @@ func (s *Service) Check(ctx context.Context, currentVersion string) (*CheckResul
 	}
 	res.HasUpdate = CompareVersions(latest.Version, currentVersion) > 0
 	if res.HasUpdate {
-		artifact := selectArtifact(res.Full, res.Patch)
+		artifact := selectArtifact(res.Full, res.Patch, currentVersion)
 		res.Artifact = artifact
 		if artifact != nil {
 			res.URL = artifact.URL
@@ -243,7 +243,42 @@ func (s *Service) Download(ctx context.Context, currentVersion string) (*Downloa
 	}, nil
 }
 
+// fetchLatest queries the update metadata endpoint with a bounded retry
+// for transient failures. A single connection reset / 5xx used to surface
+// directly as "检查更新失败" (2026-09-25 report); the check now retries up
+// to maxFetchAttempts times with a short backoff. Non-retryable outcomes
+// (404 = no update metadata, other 4xx, undecodable bodies) return
+// immediately — retrying those cannot help.
 func (s *Service) fetchLatest(ctx context.Context, currentVersion string) (Latest, int, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxFetchAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return Latest{}, 0, ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+		latest, status, err := s.fetchLatestOnce(ctx, currentVersion)
+		if err == nil {
+			return latest, status, nil
+		}
+		lastErr = err
+		// status == 0 means the request never got a response (connection
+		// reset, timeout, DNS); 5xx means the server may recover. Both
+		// are worth another attempt.
+		if status != 0 && status < 500 {
+			break
+		}
+	}
+	return Latest{}, 0, lastErr
+}
+
+// maxFetchAttempts bounds the update-metadata fetch retries (initial
+// attempt + 2 retries with 1s / 2s backoff).
+const maxFetchAttempts = 3
+
+func (s *Service) fetchLatestOnce(ctx context.Context, currentVersion string) (Latest, int, error) {
 	u, err := url.Parse(s.latestURL)
 	if err != nil {
 		return Latest{}, 0, fmt.Errorf("parse update url: %w", err)
@@ -402,14 +437,36 @@ func normalizeArtifact(a *Artifact, defaultKind string, latest Latest) *Artifact
 	return a
 }
 
-func selectArtifact(full *Artifact, patch *Artifact) *Artifact {
-	if patch != nil && patch.URL != "" {
+// selectArtifact prefers the smaller patch package, but only when the
+// patch's declared from_version actually covers the running version. A
+// patch built "from 1.0.0" applied to anything older would produce a
+// corrupt install, so an uncovered current version falls back to the
+// full package. Pre-release versions compare normally (1.0.13-beta.1
+// satisfies from_version=1.0.0); an empty from_version keeps the legacy
+// behaviour of always preferring the patch, and an empty current version
+// (unknown build) refuses the patch because its file set is unknowable.
+func selectArtifact(full *Artifact, patch *Artifact, currentVersion string) *Artifact {
+	if patch != nil && patch.URL != "" && patchAppliesTo(patch, currentVersion) {
 		return patch
 	}
 	if full != nil && full.URL != "" {
 		return full
 	}
 	return nil
+}
+
+// patchAppliesTo reports whether the patch's from_version floor covers
+// currentVersion. The floor is inclusive: from_version=1.0.0 means any
+// build >= 1.0.0 may apply the patch.
+func patchAppliesTo(patch *Artifact, currentVersion string) bool {
+	from := strings.TrimSpace(patch.FromVersion)
+	if from == "" {
+		return true
+	}
+	if strings.TrimSpace(currentVersion) == "" {
+		return false
+	}
+	return CompareVersions(currentVersion, from) >= 0
 }
 
 func artifactFileName(artifact *Artifact, latestVersion string) (string, error) {
