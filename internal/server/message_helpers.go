@@ -1129,6 +1129,7 @@ func decodePartsFromMeta(meta string, content string) []MessagePart {
 	if raw, ok := blob["parts"]; ok && raw != "" {
 		var full []MessagePart
 		if err := json.Unmarshal([]byte(raw), &full); err == nil && hasTextOrThinking(full) {
+			scrubStreamingFlags(full)
 			return full
 		}
 	}
@@ -1155,7 +1156,29 @@ func decodePartsFromMeta(meta string, content string) []MessagePart {
 	if len(parts) == 0 {
 		return nil
 	}
+	scrubStreamingFlags(parts)
 	return parts
+}
+
+// scrubStreamingFlags recursively clears the Streaming flag on every
+// thinking part. History must never render as "still thinking": when a
+// turn is interrupted (server restart, turn deadline, process kill) the
+// final Done chunk never reaches the parts accumulator, so the persisted
+// snapshot can carry streaming=true. Replayed as-is, the UI would show a
+// permanent "思考中…" for a session that is actually idle — the ghost
+// reported on 2026-09-25. Normal Done-path cleanup (parts.go) already
+// handles the live case; this scrub is the belt-and-braces guarantee for
+// every interrupted/persisted snapshot, including ones written before
+// this fix existed.
+func scrubStreamingFlags(parts []MessagePart) {
+	for i := range parts {
+		if parts[i].Kind == "thinking" && parts[i].Streaming {
+			parts[i].Streaming = false
+		}
+		if len(parts[i].Parts) > 0 {
+			scrubStreamingFlags(parts[i].Parts)
+		}
+	}
 }
 
 // hasTextOrThinking reports whether a parts array contains at

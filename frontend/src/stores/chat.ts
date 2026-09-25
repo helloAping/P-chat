@@ -1082,6 +1082,12 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
     }
     const r = await api.listMessages(id, opts)
     if (r.messages.length > 0) {
+      // Same scrub as the first-page load: phantom text and
+      // persisted streaming flags must be cleaned on every
+      // history page, not just the initial one.
+      for (const m of r.messages) {
+        if (m.parts) scrubMessagePhantoms(m)
+      }
       // Prepend the new (older) page to the front of the
       // existing message list. The server returns messages
       // oldest-first within the page. We dedup by seq
@@ -2066,7 +2072,15 @@ function scrubPhantomError(s: string): string {
  *  phantom error patterns from text fields. Mutates the
  *  message in place. Used on session load and on the
  *  safety-net `done` handler so a stored phantom from an
- *  older version doesn't reappear. */
+ *  older version doesn't reappear.
+ *
+ *  Also clears any persisted `streaming` flag on thinking
+ *  parts: a turn interrupted before its Done chunk (server
+ *  restart, deadline, kill) could persist streaming=true,
+ *  which replays as a permanent "思考中…" on an idle session
+ *  (ghost reported 2026-09-25). The server scrubs this on
+ *  decode (message_helpers.go scrubStreamingFlags); this is
+ *  the client-side belt-and-braces for older servers. */
 function scrubMessagePhantoms(m: Message) {
   const walk = (parts: MessagePart[] | undefined) => {
     if (!parts) return
@@ -2077,7 +2091,11 @@ function scrubMessagePhantoms(m: Message) {
       } else if (p.kind === 'thinking' && p.text) {
         const scrubbed = scrubPhantomError(p.text)
         if (scrubbed !== p.text) p.text = scrubbed
-      } else if (p.kind === 'sub_agent') {
+      }
+      if (p.kind === 'thinking' && p.streaming) {
+        p.streaming = false
+      }
+      if (p.kind === 'sub_agent') {
         walk(p.parts)
       }
     }

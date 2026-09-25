@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { NScrollbar } from 'naive-ui'
+import { NScrollbar, useMessage } from 'naive-ui'
 import { ChevronRight } from './icons'
 import {
   currentTodos,
@@ -11,6 +11,7 @@ import {
   setComposerExpandedDock,
   toggleComposerExpandedDock,
 } from '../stores/chat'
+import * as api from '../api/client'
 import type { TodoItem } from '../api/client'
 
 type DockState = 'hide' | 'clear' | 'open' | 'close'
@@ -28,8 +29,15 @@ const total = computed(() => visibleTodos.value.length)
 const doneCount = computed(() => doneTodos.value.length)
 const progressLabel = computed(() => `${doneCount.value} / ${total.value}`)
 const isLive = computed(() => currentSessionWorking.value)
+// Interrupted: unfinished todos remain but no turn is actively producing
+// output (e.g. the session was reloaded after a server restart killed the
+// turn mid-flight). The dock must not look "alive" — no pulse, and the
+// expanded list offers a way to dismiss the stale plan.
+const isInterrupted = computed(() => !isLive.value && activeTodos.value.length > 0)
 const hasPendingQuestion = computed(() => !!currentPendingQuestion.value)
 const expanded = computed(() => state.composerExpandedDock === 'todo' && !hasPendingQuestion.value)
+const dismissing = ref(false)
+const message = useMessage()
 
 const allDone = computed(() => {
   const list = visibleTodos.value
@@ -125,6 +133,23 @@ function toggleExpand() {
   }
   toggleComposerExpandedDock('todo')
 }
+
+// dismissInterrupted clears a stale plan left behind by an interrupted
+// turn: server-side rows (so a reload doesn't resurrect them) and the
+// local store (so the dock hides immediately).
+async function dismissInterrupted() {
+  const id = state.currentID
+  if (!id || dismissing.value) return
+  dismissing.value = true
+  try {
+    await api.clearTodos(id)
+    clearSessionTodos(id)
+  } catch (e: any) {
+    message.error(`清除待办失败：${e?.message || e}`)
+  } finally {
+    dismissing.value = false
+  }
+}
 </script>
 
 <template>
@@ -140,15 +165,25 @@ function toggleExpand() {
     <div class="todo-dock-header" @click="toggleExpand" :title="expanded ? '点击收起' : '点击展开'">
       <ChevronRight :size="12" class="todo-dock-caret" :class="{ 'todo-dock-caret--open': expanded }" />
       <span v-if="active" class="todo-dock-active">
-        <span v-if="active.status === 'in_progress'" class="todo-dock-pulse" aria-hidden="true" />
+        <span v-if="active.status === 'in_progress' && !isInterrupted" class="todo-dock-pulse" aria-hidden="true" />
         <span class="todo-dock-active-text">{{ active.content }}</span>
       </span>
       <span v-else class="todo-dock-active todo-dock-active--empty">暂无任务</span>
+      <span v-if="isInterrupted" class="todo-dock-interrupted">已中断</span>
       <span class="todo-dock-progress">{{ progressLabel }}</span>
     </div>
 
     <NScrollbar v-if="expanded" class="todo-dock-scroll">
       <div class="todo-dock-list">
+        <div v-if="isInterrupted" class="todo-interrupted-banner">
+          <span class="todo-interrupted-text">上次任务已中断，待办不会自动继续。</span>
+          <button
+            class="todo-interrupted-btn"
+            type="button"
+            :disabled="dismissing"
+            @click.stop="dismissInterrupted"
+          >{{ dismissing ? '清除中…' : '清除待办' }}</button>
+        </div>
         <div
           v-for="t in activeTodos"
           :key="t.id"
@@ -308,6 +343,57 @@ function toggleExpand() {
   background: var(--bg-3, rgba(255, 255, 255, 0.06));
   padding: 2px 8px;
   border-radius: var(--radius-md);
+}
+.todo-dock-interrupted {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--warn-50);
+  color: var(--warn-500);
+}
+.todo-interrupted-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--warn-500);
+  border-radius: var(--radius-sm);
+  background: var(--warn-50);
+}
+.todo-interrupted-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+.todo-interrupted-btn {
+  flex-shrink: 0;
+  height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-1);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+.todo-interrupted-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--border-default);
+}
+.todo-interrupted-btn:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 .todo-dock-scroll {
   flex: 1;

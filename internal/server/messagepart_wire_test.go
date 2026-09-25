@@ -203,3 +203,60 @@ func TestDecodePartsFromMetaTreatsNestedSubAgentTextAsFullSnapshot(t *testing.T)
 		t.Fatalf("nested sub_agent parts not preserved: %+v", got[0].Parts)
 	}
 }
+
+// TestDecodePartsFromMetaScrubsStreamingFlags is the regression test for
+// the 2026-09-25 "ghost thinking" bug: a turn interrupted before its Done
+// chunk (server restart, deadline, kill) persists a parts snapshot with
+// thinking parts still marked streaming=true. Replayed as-is, the UI
+// showed a permanent "思考中…" on an idle session. History must never
+// render as still streaming, so decodePartsFromMeta scrubs the flag on
+// every thinking part, including nested sub-agent parts.
+func TestDecodePartsFromMetaScrubsStreamingFlags(t *testing.T) {
+	parts := []MessagePart{
+		{Kind: "thinking", Text: "interrupted mid-reasoning", Streaming: true},
+		{Kind: "text", Text: "partial answer"},
+		{
+			Kind:   "sub_agent",
+			Task:   "background work",
+			Status: "start",
+			Parts: []MessagePart{
+				{Kind: "thinking", Text: "nested still thinking", Streaming: true},
+				{Kind: "tool", Name: "read_file", Status: "start"},
+			},
+		},
+	}
+	partsJSON, err := json.Marshal(parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaJSON, err := json.Marshal(map[string]string{"parts": string(partsJSON)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := decodePartsFromMeta(string(metaJSON), "")
+	if len(got) != 3 {
+		t.Fatalf("parts len = %d, want 3: %+v", len(got), got)
+	}
+	assertNoStreaming(t, got)
+
+	// Content and structure must survive the scrub.
+	if got[0].Text != "interrupted mid-reasoning" {
+		t.Fatalf("thinking text lost: %+v", got[0])
+	}
+	if got[2].Parts[0].Text != "nested still thinking" {
+		t.Fatalf("nested thinking text lost: %+v", got[2].Parts[0])
+	}
+}
+
+func assertNoStreaming(t *testing.T, parts []MessagePart) {
+	t.Helper()
+	for i, p := range parts {
+		if p.Streaming {
+			t.Errorf("parts[%d] (%s) still has streaming=true after history decode", i, p.Kind)
+		}
+		if len(p.Parts) > 0 {
+			assertNoStreaming(t, p.Parts)
+		}
+	}
+}
