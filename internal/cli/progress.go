@@ -272,6 +272,8 @@ func (u *ChatUI) handlePhaseEvent(chunk agent.ChatStreamChunk) {
 		u.handleLLMEvent(chunk)
 	case "tool":
 		u.handleToolEvent(chunk)
+	case "skill":
+		u.handleSkillEvent(chunk)
 	case "done":
 		u.stopSpinner()
 		u.ensureLine()
@@ -282,6 +284,26 @@ func (u *ChatUI) handlePhaseEvent(chunk agent.ChatStreamChunk) {
 	default:
 		// Silently ignore system/memory/plan/tools phases -
 		// they're internal and don't need to be shown by default
+	}
+}
+
+func (u *ChatUI) handleSkillEvent(chunk agent.ChatStreamChunk) {
+	u.stopSpinner()
+	u.ensureLine()
+	name := strings.TrimSpace(chunk.SkillName)
+	if name == "" {
+		return
+	}
+	switch chunk.SkillStatus {
+	case "ready":
+		color.Green("  ✓ Skill 已就绪：%s", name)
+	case "error":
+		color.Red("  ✗ Skill 加载失败：%s", name)
+		if chunk.SkillError != "" {
+			color.HiBlack("    %s", oneLine(chunk.SkillError))
+		}
+	default:
+		color.Cyan("  当前调用 Skill：%s", name)
 	}
 }
 

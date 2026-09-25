@@ -1,10 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/p-chat/pchat/runtimeprofile"
 )
 
 func TestFindServerBinary_FindsSibling(t *testing.T) {
@@ -184,55 +186,43 @@ func TestFindServerBinary_NotFound(t *testing.T) {
 	}
 }
 
-func TestPickPreferredPort_FirstPreferredWhenAvailable(t *testing.T) {
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", preferredPortStart))
-	if err != nil {
-		t.Skipf("preferred port %d is already occupied: %v", preferredPortStart, err)
+func TestChildPortEnvironmentSeparatesProductionAndDevelopment(t *testing.T) {
+	prod := childPortEnvironment(runtimeprofile.Profile{Name: "prod"})
+	if strings.Join(prod, "|") != "PCHAT_PORT_RANGE=15150-15159" {
+		t.Fatalf("prod port env = %#v", prod)
 	}
-	_ = l.Close()
-
-	port, err := pickPreferredPort()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if port != preferredPortStart {
-		t.Fatalf("pickPreferredPort() = %d, want %d", port, preferredPortStart)
+	dev := childPortEnvironment(runtimeprofile.Profile{Name: "dev"})
+	if strings.Join(dev, "|") != "PCHAT_PORT=0" {
+		t.Fatalf("dev port env = %#v", dev)
 	}
 }
 
-func TestPickPreferredPort_SkipsOccupiedPreferredPorts(t *testing.T) {
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", preferredPortStart))
-	if err != nil {
-		t.Skipf("preferred port %d is already occupied: %v", preferredPortStart, err)
-	}
-	defer l.Close()
+func TestWaitForBackendIdentityRejectsAnotherInstance(t *testing.T) {
+	profile := runtimeprofile.Profile{ID: "profile-dev", Name: "dev"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","profile_id":"profile-dev","instance_id":"other","pid":%d}`, os.Getpid())
+	}))
+	defer srv.Close()
 
-	port, err := pickPreferredPort()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if port == preferredPortStart {
-		t.Fatalf("pickPreferredPort() reused occupied port %d", preferredPortStart)
-	}
-	if port < preferredPortStart || port > preferredPortEnd {
-		t.Fatalf("pickPreferredPort() = %d, want next port in %d-%d", port, preferredPortStart+1, preferredPortEnd)
+	err := waitForBackendIdentity(context.Background(), srv.URL, profile, "expected", os.Getpid(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("waitForBackendIdentity error = %v, want identity mismatch", err)
 	}
 }
 
-func TestPickFreePort_Valid(t *testing.T) {
-	p1, err := pickFreePort()
-	if err != nil {
-		t.Fatal(err)
+func TestWaitForBackendIdentityRejectsAnotherPID(t *testing.T) {
+	profile := runtimeprofile.Profile{ID: "profile-dev", Name: "dev"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","profile_id":"profile-dev","instance_id":"expected","pid":%d}`, os.Getpid()+1)
+	}))
+	defer srv.Close()
+
+	err := waitForBackendIdentity(context.Background(), srv.URL, profile, "expected", os.Getpid(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "pid=") {
+		t.Fatalf("waitForBackendIdentity error = %v, want PID mismatch", err)
 	}
-	p2, err := pickFreePort()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p1 == 0 || p2 == 0 {
-		t.Fatalf("ports should be nonzero, got %d and %d", p1, p2)
-	}
-	// The OS may reuse the same port if the previous one was closed,
-	// so we only assert both are valid.
 }
 
 func TestPickConfigPath_PrefersJSON(t *testing.T) {
@@ -498,5 +488,61 @@ func TestAcquireSingleInstance_DetectsExistingInstance(t *testing.T) {
 	}
 	if !already {
 		t.Fatal("second acquire should report an existing instance")
+	}
+}
+
+func TestSingleInstanceIdentityIsScopedToDataHome(t *testing.T) {
+	t.Setenv("PCHAT_SINGLE_INSTANCE_MUTEX", "")
+	t.Setenv("PCHAT_PROFILE", "dev")
+
+	firstHome := filepath.Join(t.TempDir(), ".p-chat")
+	secondHome := filepath.Join(t.TempDir(), ".p-chat")
+	t.Setenv("PCHAT_DATA_HOME", firstHome)
+	firstMutex := singleInstanceMutexName()
+	firstTrayClass := trayWindowClassName()
+	firstWebviewData := webviewUserDataPath()
+
+	t.Setenv("PCHAT_DATA_HOME", secondHome)
+	secondMutex := singleInstanceMutexName()
+	secondTrayClass := trayWindowClassName()
+	secondWebviewData := webviewUserDataPath()
+
+	if firstMutex == secondMutex {
+		t.Fatalf("different data homes share mutex %q", firstMutex)
+	}
+	if firstTrayClass == secondTrayClass {
+		t.Fatalf("different data homes share tray class %q", firstTrayClass)
+	}
+	if firstWebviewData == secondWebviewData {
+		t.Fatalf("different data homes share WebView2 data path %q", firstWebviewData)
+	}
+
+	t.Setenv("PCHAT_DATA_HOME", firstHome)
+	if got := singleInstanceMutexName(); got != firstMutex {
+		t.Fatalf("same data home changed mutex: %q != %q", got, firstMutex)
+	}
+	if got := trayWindowClassName(); got != firstTrayClass {
+		t.Fatalf("same data home changed tray class: %q != %q", got, firstTrayClass)
+	}
+}
+
+func TestDefaultProductionKeepsHistoricalWebviewDataPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("PCHAT_DATA_HOME", "")
+	t.Setenv("PCHAT_PROFILE", "")
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOME", home)
+
+	if got := webviewUserDataPath(); got != "" {
+		t.Fatalf("default production WebView2 path = %q, want Wails default", got)
+	}
+}
+
+func TestGetApplicationTitleExposesDevelopmentProfile(t *testing.T) {
+	t.Setenv("PCHAT_DATA_HOME", filepath.Join(t.TempDir(), ".p-chat"))
+	t.Setenv("PCHAT_PROFILE", "dev")
+
+	if got := NewApp().GetApplicationTitle(); got != "P-Chat [dev]" {
+		t.Fatalf("GetApplicationTitle() = %q, want P-Chat [dev]", got)
 	}
 }

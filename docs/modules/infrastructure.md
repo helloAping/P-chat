@@ -24,21 +24,23 @@
 **文件**：`skill.go`
 
 管理可安装的 Skill 定义：
-- `LoadAll()` — 加载安装的 skills
+- `LoadAllWithRoot(root)` — 加载全局 + `<root>/.p-chat/skills` 的 skills
+- `LoadAll()` — 旧接口，等价于 `LoadAllWithRoot("")`
 - `Install(repoURL)` — 从 GitHub 安装
 - `Delete(name)` — 卸载
 - Skill 内容被注入到系统提示词
+- 合并策略：全局 + 项目都加载，项目同名覆盖全局
 
 ## Style 风格管理
 
 **位置**：`internal/style/`  
 **文件**：`manager.go`
 
-管理 LLM 人格风格：
-- "tech" — 技术专家风格（默认）
-- 用户可定义自定义风格
-- 风格定义加载自 `~/.p-chat/styles/`
-- 风格通过 `Style` 字段嵌入系统提示词
+管理 LLM 人格风格。当前风格数据存储在 SQLite `styles` 表中：
+- 内置风格：`cute` / `guofeng` / `tech`
+- `style=off`：关闭风格 prompt 和风格记忆注入
+- 用户自定义风格：通过 `styles` 表保存 `prompt` / `memory`
+- 旧版 `prompts/identity`、`prompts/soul`、`prompts/style` 只作为升级导入来源
 
 ## MCP 服务器集成
 
@@ -64,44 +66,71 @@
 **位置**：`internal/agents/`  
 **文件**：`agents.go`
 
-- 加载全局 `AGENTS.md` 和项目级 `<project>/AGENTS.md`
-- 内容合并到系统提示词
-- `LoadAllWithRoot(root)` — 从指定根目录加载
+- `LoadAllWithRoot(root)` — 从指定项目根解析
+- 加载顺序是 OR 策略：`<root>/AGENTS.md` → `<root>/.p-chat/AGENTS.md` → `~/.p-chat/AGENTS.md`
+- 只取第一个命中的 AGENTS，避免多份指令互相冲突
 
 ## Rules 规则监听
 
 **位置**：`internal/rules/`  
 **文件**：`rules.go`
 
-- 监听 `.rules/` 目录的规则文件
+- 加载 `~/.p-chat/rules/*.md` 和 `<root>/.p-chat/rules/*.md`
 - 规则内容注入系统提示词
-- 支持项目级和全局规则
+- 支持项目级和全局规则叠加，项目规则排在全局规则之后
 
 ## Knowledge 知识检索
 
 **位置**：`internal/knowledge/`  
-**文件**：`index.go`, `embed_openai.go`, `embed_local.go`, `embedding.go`, `bits.go`
+**文件**：`index.go`, `indexer.go`, `wiki_store.go`, `hybrid.go`, `merge.go`, `query_plan.go`, `bits.go`
 
 RAG (检索增强生成) 实现：
-- 文本嵌入（OpenAI embedding 或本地模型）
-- 向量索引和相似度搜索
-- 知识分块存储
+- Wiki/FTS5 三层索引
+- 路径、标题、正文、关键词混合检索
+- 多知识库合并重排与引用解释
+- 增量扫描和删除文件清理
 
 ## Recall 记忆召回
 
 **位置**：`internal/recall/`  
-**文件**：`recall.go`
+**文件**：`engine.go`
 
-从历史对话中召回相关信息，增强 LLM 上下文。
+把知识库搜索结果转换为 Agent 可用上下文，负责查询分解、多库召回、去重和重排。
 
 ## Paths 路径解析
 
 **位置**：`internal/paths/`  
-**文件**：`paths.go`
+**文件**：`paths.go`、`devhome.go`
 
-- `~/.p-chat/` 路径解析
-- 跨平台路径处理
-- 全局目录、数据库、上传目录等
+- 数据目录解析顺序：`PCHAT_DATA_HOME` → `dev-bin/.p-chat/` → `~/.p-chat/`
+- `PCHAT_HOME` 只表示安装根目录，用于 PATH，不作为数据目录
+- 跨平台路径处理，全局目录、数据库、上传目录等
+
+## Trace 端到端追踪
+
+**位置**：`internal/trace/`
+**文件**：`trace.go`
+
+- 生成 `T-xxxxxxxx` trace id
+- 通过 HTTP header、context、SSE event、工具调用和日志贯通
+- GUI 错误气泡和顶栏可复制 trace id
+
+## Version 与 Upgrade
+
+**位置**：`internal/version/`、`internal/upgrade/`
+**文件**：`version.go`, `steps.go`
+
+- `VERSION` 是应用版本唯一真源
+- `internal/version` 负责 ldflags / git hash / VERSION 文件回退
+- `internal/upgrade` 负责用户数据目录结构升级，当前 `AppVersion` 为 `V8`
+
+## Update / Repair / Export
+
+**位置**：`internal/update/`、`internal/repair/`、`internal/export/`
+
+- `update`：更新检查、下载和 release manifest 解析
+- `repair`：本地数据或安装状态修复逻辑
+- `export`：会话导出 HTML/PDF/text
 
 ## HTTP 客户端 (CLI)
 

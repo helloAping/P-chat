@@ -413,17 +413,29 @@ tasks:
 
   cli:
     desc: 运行 CLI
+    env:
+      PCHAT_PROFILE: dev
+      PCHAT_DATA_HOME: '{{.ROOT_DIR}}/dev-bin/.p-chat'
+      PCHAT_PORT: '0'
     cmds:
       - go run ./cmd/pchat --style tech
 
   server:
     desc: 运行 HTTP Server
+    env:
+      PCHAT_PROFILE: dev
+      PCHAT_DATA_HOME: '{{.ROOT_DIR}}/dev-bin/.p-chat'
+      PCHAT_PORT: '0'
     cmds:
       - go run ./cmd/pchat-server
 
   gui:
     desc: 启动桌面端 (开发模式)
     dir: cmd\pchat-gui
+    env:
+      PCHAT_PROFILE: dev
+      PCHAT_DATA_HOME: '{{.ROOT_DIR}}/dev-bin/.p-chat'
+      PCHAT_PORT: '0'
     cmds:
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-dev.ps1" dev
         env:
@@ -433,19 +445,28 @@ tasks:
   build:dev:
     desc: 快速编译并启动 GUI 测试环境（绕过 wails dev，前端内嵌到 pchat-server）
     deps: [build:frontend]
+    dir: '{{.ROOT_DIR}}'
+    env:
+      PCHAT_PROFILE: dev
+      PCHAT_DATA_HOME: '{{.ROOT_DIR}}/dev-bin/.p-chat'
+      PCHAT_PORT: '0'
     cmds:
       - powershell -NoProfile -Command "New-Item -ItemType Directory -Path dev-bin -Force | Out-Null"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "{{.ROOT_DIR}}/scripts/stop-dev-processes.ps1"
       - go build -o dev-bin/pchat-server.exe ./cmd/pchat-server
       - go build -o dev-bin/pchat.exe ./cmd/pchat
       - go build -o dev-bin/pchat-updater.exe ./cmd/pchat-updater
       - powershell -NoProfile -Command "Copy-Item -Force cmd\pchat-server\browser-extension.zip dev-bin\browser-extension.zip"
       - task: build:dev:gui
-      - powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name 'pchat-gui' -ErrorAction SilentlyContinue | Stop-Process -Force; Get-Process -Name 'pchat-server' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 500"
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\dev-bin\pchat-gui.exe'"
 
   build:dev:gui:
     internal: true
     dir: cmd\pchat-gui
+    env:
+      PCHAT_PROFILE: dev
+      PCHAT_DATA_HOME: '{{.ROOT_DIR}}/dev-bin/.p-chat'
+      PCHAT_PORT: '0'
     cmds:
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-dev.ps1" build-debug
         env:

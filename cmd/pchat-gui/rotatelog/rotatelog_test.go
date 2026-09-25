@@ -32,11 +32,13 @@ func TestNewWritesToDatedFile(t *testing.T) {
 
 func TestCleanupRemovesExpired(t *testing.T) {
 	dir := t.TempDir()
-	// Create stale files outside the writer's knowledge so cleanup
-	// must discover them on the first write. 2026-07-20 is well
-	// beyond the 7-day retention; 2026-07-30 is within it (relative
-	// to the real "today").
-	for _, day := range []string{"2026-07-20", "2026-07-30"} {
+	// 在 writer 不知情时创建旧文件，验证首次写入会发现并清理它们；保留边界两侧
+	// 各一天余量，避免午夜日期切换造成竞态。
+	// Create stale files outside the writer's knowledge so cleanup must discover
+	// them on the first write. Keep a one-day margin around the retention boundary.
+	expired := time.Now().AddDate(0, 0, -8).Format("2006-01-02")
+	kept := time.Now().AddDate(0, 0, -6).Format("2006-01-02")
+	for _, day := range []string{expired, kept} {
 		path := filepath.Join(dir, "server-debug-"+day+".log")
 		if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
 			t.Fatalf("write %s: %v", path, err)
@@ -52,11 +54,11 @@ func TestCleanupRemovesExpired(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, "server-debug-2026-07-20.log")); !os.IsNotExist(err) {
-		t.Errorf("expected 2026-07-20 removed, err=%v", err)
+	if _, err := os.Stat(filepath.Join(dir, "server-debug-"+expired+".log")); !os.IsNotExist(err) {
+		t.Errorf("expected %s removed, err=%v", expired, err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "server-debug-2026-07-30.log")); err != nil {
-		t.Errorf("expected 2026-07-30 kept, err=%v", err)
+	if _, err := os.Stat(filepath.Join(dir, "server-debug-"+kept+".log")); err != nil {
+		t.Errorf("expected %s kept, err=%v", kept, err)
 	}
 }
 

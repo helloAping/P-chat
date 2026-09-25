@@ -40,22 +40,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 
 | 要改动的功能 | 必读文档 |
 | --- | --- |
-| Agent 循环 / 工具派发 / parts | `AGENTS.md` §1.1-1.3 + [`.agents/docs/agent.md`](docs/agent.md) |
-| LLM 调用 / 协议适配 | [`.agents/docs/llm.md`](docs/llm.md) |
-| HTTP API / SSE 流 | [`.agents/docs/server.md`](docs/server.md) |
-| 工具注册 / 实现 | [`.agents/docs/tool.md`](docs/tool.md) |
-| 子代理系统 | `.agents/AGENTS.md` §1.3 + [`.agents/docs/subagent.md`](docs/subagent.md) |
-| 数据库 / 持久化 | [`.agents/docs/memory.md`](docs/memory.md) |
-| Schema 迁移 / 版本发布 | [`.agents/docs/versioning.md`](docs/versioning.md) |
-| 配置管理 | [`.agents/docs/config.md`](docs/config.md) |
-| CLI 终端 | [`.agents/docs/cli.md`](docs/cli.md) |
-| Vue 前端 / Pinia | [`.agents/docs/frontend.md`](docs/frontend.md) |
-| **前端样式 / 设计 token** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md) |
-| 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
-| 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
-| **IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [`.agents/docs/im.md`](docs/im.md) + [实现计划 `docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
-| 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
-| 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](../README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
+| Agent 循环 / 工具派发 / parts | `AGENTS.md` §1.1-1.3 + [`.agents/docs/agent.md`](.agents/docs/agent.md) |
+| LLM 调用 / 协议适配 | [`.agents/docs/llm.md`](.agents/docs/llm.md) |
+| HTTP API / SSE 流 | [`.agents/docs/server.md`](.agents/docs/server.md) |
+| 工具注册 / 实现 | [`.agents/docs/tool.md`](.agents/docs/tool.md) |
+| 子代理系统 | `.agents/AGENTS.md` §1.3 + [`.agents/docs/subagent.md`](.agents/docs/subagent.md) |
+| 数据库 / 持久化 | [`.agents/docs/memory.md`](.agents/docs/memory.md) |
+| Schema 迁移 / 版本发布 | [`.agents/docs/versioning.md`](.agents/docs/versioning.md) |
+| 配置管理 | [`.agents/docs/config.md`](.agents/docs/config.md) |
+| CLI 终端 | [`.agents/docs/cli.md`](.agents/docs/cli.md) |
+| Vue 前端 / Pinia | [`.agents/docs/frontend.md`](.agents/docs/frontend.md) |
+| **前端样式 / 设计 token / 主界面视觉** | [**`.agents/docs/frontend-design.md`**](.agents/docs/frontend-design.md)（**已锁定 Project-Aware Calm Workbench，见 §0.5**） |
+| 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](.agents/docs/infrastructure.md) |
+| 版本升级系统 | [`.agents/docs/upgrade.md`](.agents/docs/upgrade.md) |
+| **IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [`.agents/docs/im.md`](.agents/docs/im.md) + [实现计划 `docs/plans/im-bridge-plan.md`](docs/plans/im-bridge-plan.md) |
+| 全模块索引 | [`.agents/docs/INDEX.md`](.agents/docs/INDEX.md) |
+| 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
 
 **模块文档位置**：`.agents/docs/` 目录下，每个模块一个 `.md` 文件。
 
@@ -69,20 +69,20 @@ P-Chat 是为本地使用设计的 AI 编程助手，特色是**完全本地化�
 
 | 层 | 选型 | 版本 |
 | --- | --- | --- |
-| 后端 | Go | 1.21.13 |
+| 后端 | Go | 1.25.0（根 `go.mod`） |
 | LLM 客户端 | 自定义 SSE reader（绕过 `go-openai` SDK 的 `ReasoningContent` 缺失） | — |
 | LLM SDK | `github.com/sashabaranov/go-openai` v1.30.0 | — |
 | 桌面端 | Wails v2 | 2.12.0 |
 | 前端框架 | Vue 3 + `<script setup>` + Naive UI | — |
 | 构建工具 | Vite 5 | — |
-| 运行时 | Node | 24.11 |
+| 前端运行时 | Node | 24.11 |
 | 构建编排 | Taskfile (go-task) | — |
 
 ### 目录结构
 
 ```
 D:\develop\project\P-chat\
-├── AGENTS.md                   # 根目录入口（符号链接 → .agents/AGENTS.md）
+├── AGENTS.md                   # 根目录入口（历史上可能是副本；canonical source 是 .agents/AGENTS.md）
 ├── .agents/                    # canonical agent 规范来源
 │   ├── AGENTS.md               # ★ 本文件 — 所有工具的统一规范
 │   ├── README.md               # .agents/ 目录说明
@@ -97,26 +97,38 @@ D:\develop\project\P-chat\
 │   │   ├── config.md           #   配置管理
 │   │   ├── cli.md              #   CLI REPL
 │   │   ├── frontend.md         #   Vue 3 前端
-│   │   ├── frontend-design.md  #   设计 token + 组件样式规则 + 约束
-│   │   └── infrastructure.md   #   基础设施模块
+│   │   ├── frontend-design.md  #   设计 token + Calm Workbench 视觉规范（§0.5 已锁定）
+│   │   ├── infrastructure.md   #   基础设施模块
+│   │   ├── knowledge.md        #   知识库 / RAG
+│   │   ├── im.md               #   IM 桥接
+│   │   ├── versioning.md       #   版本与 SQLite schema 迁移
+│   │   └── upgrade.md          #   用户数据目录结构升级
 │   └── scripts/
 │       ├── install.ps1         # Windows 安装脚本
 │       └── install.sh          # Unix 安装脚本
 ├── cmd/
 │   ├── pchat/                  # CLI 入口
 │   ├── pchat-server/           # 独立 HTTP server（API + web/）
-│   └── pchat-gui/              # Wails 桌面应用
-│       └── frontend/           # Vue 3 + Naive UI SPA
+│   ├── pchat-gui/              # Wails 桌面应用（frontend 指向 ../../frontend）
+│   ├── pchat-installer/        # Windows 单文件安装器
+│   └── pchat-updater/          # 自动更新替换器
+├── frontend/                   # Vue 3 + Naive UI SPA 源码
+├── browser-extension/          # Chrome / Edge 浏览器控制扩展源码
 ├── internal/                   # 业务包
 │   ├── agent/                  # ReAct 主循环，工具调度
 │   ├── llm/                    # 自定义 SSE reader + 双协议 (OpenAI/Anthropic)
 │   ├── server/                 # HTTP 路由 + SSE 端点
 │   ├── subagent/               # 子 agent 系统
 │   ├── tool/                   # 工具注册表
-│   ├── style/                  # 人格风格（cute/guofeng/tech）
+│   ├── style/                  # 人格风格管理（当前风格数据在 SQLite）
 │   ├── memory/                 # 会话记忆 (SQLite)
-│   ├── config/                 # YAML + 持久化 provider/model 配置
+│   ├── config/                 # config.json + provider/model/system 配置
 │   ├── cli/                    # 终端 REPL + ChatUI
+│   ├── browser/                # 浏览器扩展连接 + browser_* 工具
+│   ├── export/                 # 会话导出 HTML/PDF/text
+│   ├── im/                     # IM Gateway / adapter / renderer
+│   ├── search/                 # web_search provider
+│   ├── recall/                 # 知识库多 query 召回与重排
 │   ├── sandbox/                # 命令/文件安全检查
 │   ├── skill/                  # Skill 技能系统
 │   ├── mcp/                    # MCP 服务器集成
@@ -124,27 +136,32 @@ D:\develop\project\P-chat\
 │   ├── agents/                 # AGENTS.md 加载器
 │   ├── rules/                  # .rules/ 规则监听
 │   ├── knowledge/              # RAG 知识检索
+│   ├── repair/                 # 修复命令逻辑
+│   ├── stylegen/               # 风格生成任务
+│   ├── trace/                  # 端到端 trace id
+│   ├── update/                 # 自动更新检查/下载
 │   ├── upgrade/                # 版本升级系统
+│   ├── version/                # VERSION / ldflags 版本字符串
 │   ├── paths/                  # ~/.p-chat 路径解析
 │   ├── httpcli/                # CLI HTTP+SSE 客户端
 │   └── serverproc/             # 服务器进程生命周期管理
-├── prompts/                    # 人格 prompt 源文件
-│   ├── identity/{cute,guofeng,tech}.md
-│   └── soul/{cute,guofeng,tech}.md
-├── configs/config.yaml          # 默认配置模板（用户运行时覆盖在 ~/.p-chat/）
+├── configs/config.yaml          # 默认 YAML 模板（用户运行时配置为 ~/.p-chat/config.json，旧 YAML 会迁移）
 ├── scripts/                    # 平台无关工具脚本
+├── docs/project-structure.md    # 项目结构、模块职责、运行流总览
 ├── web/                        # Vite 输出（gitignored）
 ├── bin/                        # 构建产物（gitignored）
 └── Taskfile.yml                # task build:* / test:* / package:*
 ```
 
-### 三个二进制
+### 主要二进制
 
 | 二进制 | 入口 | 用途 | 大小 |
 | --- | --- | --- | --- |
 | `pchat.exe` | `cmd/pchat` | CLI 终端模式 | ~20MB |
 | `pchat-server.exe` | `cmd/pchat-server` | 独立 HTTP server + web UI | ~27MB |
 | `pchat-gui.exe` | `cmd/pchat-gui` | Wails 桌面应用（内嵌 webview + spawn pchat-server 子进程） | ~10MB |
+| `pchat-updater.exe` | `cmd/pchat-updater` | 自动更新替换器 | — |
+| `pchat-setup-v*.exe` | `cmd/pchat-installer` | Windows 单文件安装器 | — |
 
 `pchat-gui` 启动时会 `exec.Command` 拉起 `pchat-server.exe` 作为子进程，通过 PCHAT_PORT 环境变量传动态端口。
 
@@ -198,7 +215,7 @@ Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（
 
 ### 1.4 子 agent 系统
 
-详见 [`.agents/docs/subagent.md`](docs/subagent.md)。
+详见 [`.agents/docs/subagent.md`](.agents/docs/subagent.md)。
 
 核心要点：
 - 子 agent 通过 `task` 工具触发
@@ -228,11 +245,11 @@ parser 三层 fallback：
 - **响应语言**：与用户对话用中文，code comment 双语（中文 → 英文）
 - **Commit message**：英文标题 + 详细中文 body
 - **每个 PR/commit 都要**：单点改动 + 测试覆盖 + build 验证
-- **永远不要**：kill 用户的 GUI 进程 / 改用户的 `~/.p-chat/config.yaml` / 写密钥到任何文件
+- **永远不要**：kill 用户的 GUI 进程 / 改用户的 `~/.p-chat/config.json` 或旧版 `config.yaml` / 写密钥到任何文件
 
 ### 2.2 Go
 
-- 1.21.13，启用 generics，避免 `interface{}` 滥用
+- 根模块 `go.mod` 声明 Go 1.25.0；GUI 子模块 `cmd/pchat-gui/go.mod` 声明 Go 1.23.0。使用能满足两者的本地工具链，启用 generics，避免 `interface{}` 滥用
 - 所有公开函数带 godoc 注释
 - 测试放在同包的 `*_test.go`
 - 错误处理：`fmt.Errorf("...: %w", err)` 包装；`errors.Is` 判断
@@ -265,7 +282,7 @@ parser 三层 fallback：
 2. 在 `internal/upgrade/steps.go` 中注册升级函数
 3. 升级函数需满足：幂等（`IF NOT EXISTS`）、顺序性、断点续升
 
-详见 [`.agents/docs/upgrade.md`](docs/upgrade.md)。
+详见 [`.agents/docs/upgrade.md`](.agents/docs/upgrade.md)。
 
 ---
 
@@ -299,7 +316,7 @@ task build
 curl http://localhost:xxxxx/api/v1/version
 ```
 
-版本管理与 Schema 迁移完整规范 → [`.agents/docs/versioning.md`](docs/versioning.md)
+版本管理与 Schema 迁移完整规范 → [`.agents/docs/versioning.md`](.agents/docs/versioning.md)
 
 ### 3.4 测试
 
@@ -314,8 +331,8 @@ npm run build                                   # 前端 bundle
 
 | 问题 | 怎么查 |
 | --- | --- |
-| LLM 回复不显示 | `~/.p-chat/server-debug.log` |
-| 前端路由错 | `MessageBubble.vue` `parts` 数组 |
+| LLM 回复不显示 | `~/.p-chat/logs/server-debug-YYYY-MM-DD.log` |
+| 前端路由错 | `frontend/src/components/MessageBubble.vue` `parts` 数组 |
 | Wails 启动失败 | `bin/pchat-server.log` |
 | Anthropic 协议不工作 | `internal/llm/anthropic.go:130-260` |
 
@@ -366,7 +383,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 配置加载 | `internal/config/config.go` |
 | 数据库 CRUD | `internal/memory/memory.go` |
 | `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
-| **IM Gateway 入口** | [`.agents/docs/im.md`](docs/im.md) + [`docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
+| **IM Gateway 入口** | [`.agents/docs/im.md`](.agents/docs/im.md) + [`docs/plans/im-bridge-plan.md`](docs/plans/im-bridge-plan.md) |
 | **IM 配置文件 schema** | `internal/config/im_config.go`（落地后）`IMConfig` |
 | sendOrDrop 逃生 | `internal/agent/agent.go`（`sendOrDropTimeout`，channel 满 30s 丢非关键事件） |
 | 大 tool 结果截断 + 有界缓存 | `internal/agent/agent.go`（`MaxToolResultFullBytes`）+ `internal/agent/tool_result_cache.go` |
@@ -425,7 +442,7 @@ bash .agents/scripts/install.sh
 
 ### .p-chat 的特殊处理
 
-`.p-chat/` 是项目级运行时配置目录（含 `config.yaml`、`memory/` 等），保留为普通目录。安装脚本仅将 `AGENTS.md` 同步到 `.p-chat/AGENTS.md`。
+`.p-chat/` 是项目级运行时配置目录（含 `config.json`、`memory/` 等），保留为普通目录。安装脚本仅将 `AGENTS.md` 同步到 `.p-chat/AGENTS.md`。
 
 ### Windows Junction 与权限
 

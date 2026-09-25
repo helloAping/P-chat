@@ -6,6 +6,8 @@ param(
     [string]$Root = ""
 )
 
+. "$PSScriptRoot\version-utils.ps1"
+
 if (-not $Root) {
     $Root = Join-Path $PSScriptRoot ".."
 }
@@ -22,6 +24,7 @@ if (-not $v) {
     Write-Error "VERSION file is empty"
     exit 1
 }
+$null = Get-PChatVersionInfo -Version $v
 
 $wailsJson = Join-Path $Root "cmd\pchat-gui\wails.json"
 if (Test-Path $wailsJson) {

@@ -5,9 +5,7 @@
  * Layout (PR #4 of the UI refresh):
  *
  *   ┌─────────────────────────────┐
- *   │  BrandLogo  P-Chat  🌞 ⋯    │  header
- *   ├─────────────────────────────┤
- *   │  📁 项目: P-Chat       v    │  project bar
+ *   │  📁 项目: P-Chat       v    │  project switcher
  *   ├─────────────────────────────┤
  *   │  🔍 搜索会话内容…            │  search bar
  *   ├─────────────────────────────┤
@@ -22,7 +20,7 @@
  *   │  本月                        │
  *   │  更早 ▾                      │
  *   ├─────────────────────────────┤
- *   │  BrandLogo  v1.0.4    ⚙    │  user card
+ *   │  P-Chat  v1.0.4       ⋯    │  app actions
  *   └─────────────────────────────┘
  *
  * The list is grouped by relative time (pinned / today /
@@ -33,7 +31,7 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch, h, type Component } from 'vue'
-import { NButton, NInput, NScrollbar, NModal, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
+import { NButton, NInput, NScrollbar, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject,
@@ -43,13 +41,13 @@ import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
 import { checkUpdate, downloadUpdate, installDownloadedUpdate, SOFTWARE_RELEASE_PAGE } from '../api/update'
 import type { UpdateArtifact, UpdateDownloadResult, UpdateInfo } from '../api/update'
 import type { SearchResult, Session } from '../api/client'
-import TokenStatsModal from './TokenStatsModal.vue'
 import AppModal from './AppModal.vue'
-import BrandLogo from './BrandLogo.vue'
+import ProjectSwitcher from './ProjectSwitcher.vue'
+import TokenStatsModal from './TokenStatsModal.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import { displaySessionTitle, sessionSourceFromID } from '../im/sessionSource'
 import {
-  Plus, BarChart3, Settings, Info, Bell, Globe, Folder, Sun, Moon, MoreHorizontal,
+  Plus, BarChart3, Settings, Info, Bell, Globe, Folder, FolderOpen, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
   ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
   Download, RotateCw, ExternalLink,
@@ -66,8 +64,6 @@ function openDocs() {
 }
 
 const emit = defineEmits<{ (e: 'open-settings'): void }>()
-
-const themeName = defineModel<'dark' | 'light'>('themeName', { default: 'dark' })
 const showTokenStats = ref(false)
 
 const message = useMessage()
@@ -242,11 +238,12 @@ function actionOption(
 }
 
 const menuOptions = computed<DropdownOption[]>(() => [
-  actionOption('add-project', '添加项目', Plus),
   ...(state.activeProjectPath
-    ? [actionOption('remove-project', '移除当前项目', XIcon)]
+    ? [
+        actionOption('remove-project', '移除当前项目', XIcon),
+        { type: 'divider' as const, key: 'project-divider' },
+      ]
     : []),
-  { type: 'divider' as const, key: 'project-divider' },
   actionOption('token-stats', 'Token 用量', BarChart3),
   actionOption('settings', '设置', Settings),
   { type: 'divider' as const, key: 'd1' },
@@ -263,7 +260,6 @@ const actionMenuProps: DropdownMenuProps = () => ({
 
 function handleMenuSelect(key: string) {
   switch (key) {
-    case 'add-project': showAddProject.value = true; break
     case 'remove-project': {
       if (state.activeProjectPath) showConfirmDeleteProject.value = true
       break
@@ -290,7 +286,7 @@ function doSearch() {
     return
   }
   searchLoading.value = true
-  api.searchMessages(q, 15).then(
+  api.searchMessages(q, 15, state.activeProjectPath).then(
     r => { searchResults.value = r.results; searchLoading.value = false },
     () => { searchLoading.value = false },
   )
@@ -430,7 +426,8 @@ async function doExport(id: string, format: ExportFormat) {
     // the store, renders the selected archive format, and
     // returns the file with Content-Disposition.
     const fmtQuery = format
-    const resp = await fetch(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`, {
+    const exportURL = await api.waitForAPIURL(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`)
+    const resp = await fetch(exportURL, {
       method: 'GET',
     })
     if (!resp.ok) {
@@ -629,10 +626,6 @@ async function confirmRename() {
   renameTitle.value = ''
 }
 
-async function onProjectChange(path: string) {
-  await setActiveProject(path)
-}
-
 async function onAddProject() {
   if (!validateProjectForm()) return
   try {
@@ -715,21 +708,6 @@ function basenameFromPath(path: string) {
   return parts[parts.length - 1] || '新项目'
 }
 
-function compactProjectPath(path: string, maxSegments = 3) {
-  const value = path.trim()
-  const parts = value.split(/[\\/]+/).filter(Boolean)
-  if (parts.length <= maxSegments) return value
-  return `...\\${parts.slice(-maxSegments).join('\\')}`
-}
-
-function projectRailLabel(name: string) {
-  const value = name.trim()
-  if (!value) return '?'
-  const ascii = value.match(/[A-Za-z0-9]+/g)
-  if (ascii?.length) return ascii[0].slice(0, 2).toUpperCase()
-  return Array.from(value).slice(0, 2).join('')
-}
-
 async function onRemoveProject(path: string) {
   try {
     await api.removeProject(path)
@@ -745,36 +723,12 @@ async function onRemoveProject(path: string) {
   }
 }
 
-type ProjectTab = { name: string; path: string; shortPath: string }
-
-const allProjectTabs = computed<ProjectTab[]>(() => [
-  { name: '全局', path: '', shortPath: '所有未绑定目录的会话' },
-  ...state.projects.map(p => ({
-    name: p.name,
-    path: p.path,
-    shortPath: compactProjectPath(p.path, 2),
-  })),
-])
-
-const activeProjectTab = computed<ProjectTab>(() =>
-  allProjectTabs.value.find(p => p.path === state.activeProjectPath) || allProjectTabs.value[0],
-)
-
-function projectHasStreaming(path: string): boolean {
-  const sessions = state.projectSessions[path] || (path === state.activeProjectPath ? state.sessions : [])
-  return sessions.some(s => !!state.streaming[s.id])
-}
-
 const hasUpdateBlockingWork = computed(() =>
   Object.keys(state.streaming).length > 0 ||
   Object.values(state.sessionWorking).some(Boolean) ||
   Object.values(state.sessionBackgroundSubAgentJobs).some(count => count > 0) ||
   Object.values(state.sessionBackgroundHookMerging).some(Boolean),
 )
-
-function toggleTheme() {
-  themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
-}
 
 function versionLabel(value: string): string {
   if (!value) return 'v' + APP_VERSION
@@ -1007,6 +961,22 @@ function openAbout() {
   void refreshUpdate()
 }
 
+const projectSwitcherRef = ref<InstanceType<typeof ProjectSwitcher> | null>(null)
+
+function openProjectSwitcher() {
+  projectSwitcherRef.value?.open()
+}
+
+function openAddProject() {
+  showAddProject.value = true
+}
+
+defineExpose({
+  openProjectSwitcher,
+  openAddProject,
+  openAbout,
+})
+
 onMounted(() => {
   void refreshUpdate(false, true)
 })
@@ -1014,80 +984,13 @@ onMounted(() => {
 
 <template>
   <aside class="sidebar">
-    <nav class="project-rail" aria-label="项目">
-      <button
-        type="button"
-        class="rail-brand"
-        title="关于 P-Chat"
-        aria-label="关于 P-Chat"
-        @click="openAbout"
-      >
-        <BrandLogo :size="28" />
-      </button>
-
-      <div class="project-tabs" role="tablist" aria-label="项目列表">
-        <button
-          v-for="project in allProjectTabs"
-          :key="project.path || '__global__'"
-          type="button"
-          class="project-tab"
-          :class="{ 'project-tab--active': project.path === state.activeProjectPath }"
-          :title="project.path || project.shortPath"
-          :aria-label="project.path ? `切换到项目 ${project.name}` : '切换到全局会话'"
-          :aria-current="project.path === state.activeProjectPath ? 'page' : undefined"
-          @click="onProjectChange(project.path)"
-        >
-          <Globe v-if="!project.path" :size="17" />
-          <span v-else class="project-tab-label">{{ projectRailLabel(project.name) }}</span>
-          <span
-            v-if="projectHasStreaming(project.path)"
-            class="project-tab-running"
-            aria-label="运行中"
-          />
-        </button>
-      </div>
-
-      <button
-        type="button"
-        class="project-add-tab"
-        title="添加项目"
-        aria-label="添加项目"
-        @click="showAddProject = true"
-      >
-        <Plus :size="18" />
-      </button>
-    </nav>
-
     <section class="session-panel" aria-label="会话">
-      <!-- Current project summary + theme / app actions. -->
+      <!-- Project switcher only. App utilities live in TopBar / footer. -->
       <div class="sidebar-header">
-        <div class="project-summary" :title="activeProjectTab.path || activeProjectTab.shortPath">
-          <span class="project-summary-icon">
-            <Globe v-if="!activeProjectTab.path" :size="16" />
-            <Folder v-else :size="16" />
-          </span>
-          <span class="project-summary-copy">
-            <span class="project-summary-name">{{ activeProjectTab.name }}</span>
-            <span class="project-summary-path">{{ activeProjectTab.shortPath }}</span>
-          </span>
-        </div>
-        <div class="sidebar-actions">
-          <NButton size="small" quaternary @click="toggleTheme" :title="themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题'" aria-label="切换主题">
-            <component :is="themeName === 'dark' ? Sun : Moon" :size="16" />
-          </NButton>
-          <NDropdown
-            trigger="click"
-            placement="bottom-end"
-            size="small"
-            :options="menuOptions"
-            :menu-props="actionMenuProps"
-            @select="(key) => handleMenuSelect(String(key))"
-          >
-            <NButton size="small" quaternary title="更多" aria-label="更多">
-              <MoreHorizontal :size="16" />
-            </NButton>
-          </NDropdown>
-        </div>
+        <ProjectSwitcher
+          ref="projectSwitcherRef"
+          @add-project="showAddProject = true"
+        />
       </div>
 
       <!-- Search bar (filters across all sessions in current project). -->
@@ -1213,7 +1116,7 @@ onMounted(() => {
         </div>
       </NScrollbar>
 
-      <!-- Footer user card: app version + settings. -->
+      <!-- Footer brand card: app version + About + overflow actions. -->
       <div class="user-card">
         <button
           class="user-card-brand"
@@ -1227,54 +1130,93 @@ onMounted(() => {
             <span class="user-card-version">v{{ APP_VERSION }}</span>
           </span>
         </button>
-        <NButton
+        <NDropdown
+          trigger="click"
+          placement="top-end"
           size="small"
-          quaternary
-          :title="'设置'"
-          :aria-label="'设置'"
-          @click="emit('open-settings')"
+          :options="menuOptions"
+          :menu-props="actionMenuProps"
+          @select="(key) => handleMenuSelect(String(key))"
         >
-          <Settings :size="14" />
-        </NButton>
+          <button
+            type="button"
+            class="user-card-menu-btn"
+            title="更多应用操作"
+            aria-label="更多应用操作"
+          >
+            <MoreHorizontal :size="16" />
+          </button>
+        </NDropdown>
       </div>
     </section>
 
-    <!-- Modals (PR #7: migrated to AppModal for consistent
-         styling). The about-modal is left as a raw NModal
-         for now because it has rich body content (update
-         banner, version info) that doesn't fit the
-         "header + body + footer" pattern cleanly. -->
+    <!-- Modals (PR #7: migrated to AppModal for consistent glass chrome). -->
 
     <AppModal
       v-model:show="showAddProject"
-      title="添加项目"
+      title="新建项目"
       size="md"
     >
       <div class="add-project-form">
-        <label>项目名称</label>
-        <NInput
-          v-model:value="newProjectName"
-          placeholder="例如：我的项目"
-          :status="projectNameError ? 'error' : undefined"
-          @update:value="projectNameError = ''"
-        />
-        <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
-        <label class="project-path-label">项目目录</label>
-        <div class="path-row">
-          <NInput
-            v-model:value="newProjectPath"
-            placeholder="例如：D:\projects\my-app"
-            class="path-input"
-            :status="projectPathError ? 'error' : undefined"
-            @update:value="projectPathError = ''"
-          />
-          <NButton size="small" @click="pickDirectory" title="选择目录">浏览</NButton>
+        <p class="add-project-lead">
+          选择一个本地项目根目录，后续会话会自动归入该项目空间。
+        </p>
+        <div class="form-field">
+          <label for="add-project-path">项目路径</label>
+          <div class="path-row">
+            <NInput
+              id="add-project-path"
+              v-model:value="newProjectPath"
+              size="small"
+              placeholder="例如：D:\Workspace\P-Chat"
+              class="path-input"
+              :status="projectPathError ? 'error' : undefined"
+              @update:value="projectPathError = ''"
+              @keyup.enter="onAddProject"
+            />
+            <NButton
+              size="small"
+              secondary
+              class="path-browse"
+              title="选择目录"
+              @click="pickDirectory"
+            >
+              <template #icon>
+                <FolderOpen :size="14" />
+              </template>
+              浏览
+            </NButton>
+          </div>
+          <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
+          <p v-else class="field-hint">选择项目的根目录（含源代码的那一层）</p>
         </div>
-        <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
+        <div class="form-field">
+          <label for="add-project-name">项目名称</label>
+          <NInput
+            id="add-project-name"
+            v-model:value="newProjectName"
+            size="small"
+            placeholder="输入项目名称"
+            :status="projectNameError ? 'error' : undefined"
+            @update:value="projectNameError = ''"
+            @keyup.enter="onAddProject"
+          />
+          <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
+        </div>
+        <div class="project-create-notes" aria-label="项目创建说明">
+          <div class="project-create-note">
+            <Circle :size="8" />
+            <span>仅登记本地目录，不修改项目文件</span>
+          </div>
+          <div class="project-create-note">
+            <Circle :size="8" />
+            <span>存在 AGENTS.md 时，会在项目会话中作为上下文读取</span>
+          </div>
+        </div>
       </div>
       <template #footer>
-        <NButton size="small" @click="showAddProject = false">取消</NButton>
-        <NButton size="small" type="primary" @click="onAddProject">添加</NButton>
+        <NButton size="small" quaternary @click="showAddProject = false">取消</NButton>
+        <NButton size="small" type="primary" @click="onAddProject">新建项目</NButton>
       </template>
     </AppModal>
 
@@ -1287,7 +1229,7 @@ onMounted(() => {
     >
       <p>确定要归档此会话吗？归档后可在「设置 → 归档」中恢复。</p>
       <template #footer>
-        <NButton size="small" @click="showConfirmDeleteSession = false">取消</NButton>
+        <NButton size="small" quaternary @click="showConfirmDeleteSession = false">取消</NButton>
         <NButton size="small" type="warning" @click="confirmDeleteSession">归档</NButton>
       </template>
     </AppModal>
@@ -1301,7 +1243,7 @@ onMounted(() => {
     >
       <p>确定要删除当前项目吗？该项目的会话不会被删除，但将不再关联到此项目。</p>
       <template #footer>
-        <NButton size="small" @click="showConfirmDeleteProject = false">取消</NButton>
+        <NButton size="small" quaternary @click="showConfirmDeleteProject = false">取消</NButton>
         <NButton size="small" type="error" @click="confirmDeleteProject">删除</NButton>
       </template>
     </AppModal>
@@ -1318,7 +1260,7 @@ onMounted(() => {
         autofocus
       />
       <template #footer>
-        <NButton size="small" @click="showRename = false">取消</NButton>
+        <NButton size="small" quaternary @click="showRename = false">取消</NButton>
         <NButton size="small" type="primary" @click="confirmRename">确认</NButton>
       </template>
     </AppModal>
@@ -1363,12 +1305,16 @@ onMounted(() => {
         </div>
       </div>
       <template #footer>
-        <NButton size="small" :disabled="exportSaving" @click="showExport = false">取消</NButton>
+        <NButton size="small" quaternary :disabled="exportSaving" @click="showExport = false">取消</NButton>
         <NButton size="small" type="primary" :loading="exportSaving" @click="confirmExport">选择路径并保存</NButton>
       </template>
     </AppModal>
 
-    <NModal v-model:show="showAbout" preset="card" title="关于 P-Chat" style="width: 380px">
+    <AppModal
+      v-model:show="showAbout"
+      title="关于 P-Chat"
+      size="sm"
+    >
       <div class="about-body">
         <p class="about-name">P-Chat</p>
         <p class="about-version">版本 {{ versionLabel(updateInfo?.current || APP_VERSION) }}</p>
@@ -1443,9 +1389,6 @@ onMounted(() => {
         </template>
         <p v-else class="update-ok">正在检查更新…</p>
 
-        <!-- Usage documentation — the primary action of the
-             About dialog (relocated from the Settings nav footer).
-             Opens the online doc in the system browser. -->
         <button type="button" class="about-docs" @click="openDocs">
           <Globe :size="14" class="about-docs-icon" />
           查看使用文档
@@ -1457,7 +1400,7 @@ onMounted(() => {
           <a :href="'https://github.com/' + GITHUB_REPO + '/issues'" target="_blank">反馈问题</a>
         </div>
       </div>
-    </NModal>
+    </AppModal>
 
     <TokenStatsModal v-model:show="showTokenStats" />
   </aside>
@@ -1465,7 +1408,7 @@ onMounted(() => {
 
 <style scoped>
 .sidebar {
-  width: 320px;
+  width: var(--sidebar-width);
   min-width: 0;
   background: var(--surface-1);
   border-right: 1px solid var(--border-subtle);
@@ -1481,97 +1424,6 @@ onMounted(() => {
   pointer-events: none;
 }
 
-/* --- Project rail ------------------------------------------------------ */
-.project-rail {
-  width: 56px;
-  flex: 0 0 56px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-2);
-  background: var(--surface-0);
-  border-right: 1px solid var(--border-subtle);
-}
-.rail-brand,
-.project-tab,
-.project-add-tab {
-  width: 36px;
-  height: 36px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition:
-    background var(--dur-fast) var(--ease-out),
-    border-color var(--dur-fast) var(--ease-out),
-    color var(--dur-fast) var(--ease-out),
-    transform var(--dur-fast) var(--ease-out);
-}
-.rail-brand:hover,
-.project-tab:hover,
-.project-add-tab:hover {
-  background: var(--surface-2);
-  color: var(--text-primary);
-}
-.rail-brand {
-  color: var(--text-primary);
-}
-.project-tabs {
-  width: 100%;
-  min-height: 0;
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  overflow-y: auto;
-  padding: var(--space-1) 0;
-}
-.project-tabs::before {
-  content: '';
-  width: 24px;
-  height: 1px;
-  flex: 0 0 1px;
-  background: var(--border-subtle);
-  margin-bottom: var(--space-1);
-}
-.project-tab--active {
-  background: var(--brand-50);
-  border-color: var(--brand-100);
-  color: var(--brand-600);
-  box-shadow: inset 3px 0 0 0 var(--brand-500);
-}
-.project-tab-label {
-  max-width: 28px;
-  overflow: hidden;
-  color: inherit;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-.project-tab-running {
-  width: 6px;
-  height: 6px;
-  position: absolute;
-  right: 5px;
-  top: 5px;
-  border-radius: var(--radius-pill);
-  background: var(--brand-500);
-  box-shadow: 0 0 0 2px var(--surface-0);
-}
-.project-add-tab {
-  flex: 0 0 36px;
-  color: var(--text-tertiary);
-}
-
 /* --- Session panel + header ------------------------------------------- */
 .session-panel {
   min-width: 0;
@@ -1581,72 +1433,17 @@ onMounted(() => {
   background: var(--surface-1);
 }
 .sidebar-header {
-  padding: 10px 12px;
+  padding: var(--space-3);
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: stretch;
   gap: var(--space-2);
   flex-shrink: 0;
+  border-bottom: 1px solid var(--border-subtle);
 }
-.project-summary {
-  min-width: 0;
-  flex: 1 1 auto;
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-.project-summary-icon {
-  width: 28px;
-  height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 28px;
-  border-radius: var(--radius-md);
-  background: var(--brand-50);
-  color: var(--brand-500);
-}
-.project-summary-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-.project-summary-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.25;
-}
-.project-summary-path {
-  min-width: 0;
-  color: var(--text-tertiary);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.25;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.sidebar-actions {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: var(--space-1);
-  white-space: nowrap;
-}
-.sidebar-actions :deep(.n-button) {
-  flex: 0 0 auto;
-}
-
 /* --- Search bar -------------------------------------------------------- */
 .search-bar {
-  padding: 6px 10px;
+  padding: var(--space-3) var(--space-3) var(--space-2);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
 }
@@ -1654,7 +1451,7 @@ onMounted(() => {
 
 /* --- New session CTA (top, full width) -------------------------------- */
 .new-session-bar {
-  padding: 8px 10px;
+  padding: var(--space-2) var(--space-3) var(--space-3);
   flex-shrink: 0;
 }
 .new-session-btn {
@@ -1662,24 +1459,29 @@ onMounted(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 7px 12px;
-  background: var(--brand-500);
-  color: var(--on-brand);
-  border: 1px solid var(--brand-500);
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  min-height: var(--control-height);
+  /* Calm outline CTA — avoid large saturated brand fill */
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
 }
 .new-session-btn:hover {
-  background: var(--brand-600);
-  border-color: var(--brand-600);
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
+  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
+  color: var(--brand-600);
 }
 .new-session-btn:active {
-  background: var(--brand-700);
-  border-color: var(--brand-700);
+  background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-2));
 }
 
 /* --- Session list (grouped) ------------------------------------------- */
@@ -1716,24 +1518,22 @@ onMounted(() => {
   border-radius: var(--radius-md);
   cursor: pointer;
   margin: 1px 0;
-  /* Selected indicator: 2px brand vertical bar drawn via
-   * box-shadow inset so we don't need to set border + offset
-   * the contents. The bar lives on the very left edge and
-   * runs the full height of the item. */
   transition: background var(--dur-fast) var(--ease-out);
 }
 .session-item:hover { background: var(--surface-3); }
 .session-item.active {
-  background: var(--surface-3);
-  box-shadow: inset 2px 0 0 0 var(--brand-500);
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-1));
+}
+.session-item.active:hover {
+  background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-1));
 }
 
 .item-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 8px 6px 10px;
-  min-height: 30px;
+  padding: var(--space-2) var(--space-3);
+  min-height: 36px;
 }
 .item-main {
   flex: 1;
@@ -1796,7 +1596,7 @@ onMounted(() => {
   font-size: 11px;
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
 }
 .session-item.active .item-time { color: var(--text-secondary); }
 .item-menu-btn {
@@ -1853,7 +1653,9 @@ onMounted(() => {
 /* --- Search results --------------------------------------------------- */
 .search-results { padding: 8px; }
 .search-result-item {
-  padding: 10px 12px; margin-bottom: 6px; border-radius: 6px;
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-sm);
   cursor: pointer; background: var(--surface-2); transition: background var(--dur-fast) var(--ease-out);
 }
 .search-result-item:hover { background: var(--surface-3); }
@@ -1878,6 +1680,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 1;
   background: transparent;
   border: none;
   padding: 4px 6px;
@@ -1906,20 +1709,100 @@ onMounted(() => {
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
 }
+.user-card-menu-btn {
+  width: var(--control-height);
+  height: var(--control-height);
+  flex: 0 0 var(--control-height);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+.user-card-menu-btn:hover {
+  background: var(--surface-3);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
 
 /* --- Add-project / confirm / about modals ---------------------------- */
-/* AppModal handles body padding + footer button row, so the
- * migrated modals (add-project / archive / delete-project /
- * rename) only need the form-internal styles. */
-.add-project-form label {
-  display: block; font-size: 13px; margin-bottom: 4px; color: var(--text-secondary);
-  font-weight: 500;
+.add-project-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
 }
-.project-path-label { margin-top: var(--space-3); }
-.path-row { display: flex; gap: 8px; align-items: center; }
-.path-input { flex: 1; }
+.add-project-lead {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.form-field label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.form-field :deep(.n-input) {
+  --n-height: var(--control-height);
+  --n-font-size: 13px;
+  --n-border-radius: var(--radius-sm);
+}
+.path-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  min-width: 0;
+}
+.path-input { flex: 1; min-width: 0; }
+.path-browse {
+  flex-shrink: 0;
+  height: var(--control-height) !important;
+  padding: 0 var(--space-3);
+}
+.project-create-notes {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface-2) 82%, transparent);
+}
+.project-create-note {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.project-create-note svg {
+  flex: 0 0 auto;
+  color: var(--brand-500);
+  fill: currentColor;
+}
+.field-hint {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
 .field-error {
-  margin: 5px 0 0;
+  margin: 0;
   color: var(--error-500);
   font-size: 12px;
   line-height: 1.35;
@@ -1933,14 +1816,16 @@ onMounted(() => {
   display: grid;
   gap: var(--space-1);
   padding: var(--space-3);
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  background: var(--surface-2);
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
 }
 .export-session-label {
   color: var(--text-tertiary);
   font-size: 11px;
   font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
 .export-session strong {
   color: var(--text-primary);
@@ -1966,24 +1851,26 @@ onMounted(() => {
   gap: var(--space-3);
   min-width: 0;
   padding: var(--space-3);
-  border: 1px solid var(--border-default);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   background: var(--surface-1);
   color: var(--text-secondary);
   text-align: left;
   cursor: pointer;
   transition: var(--transition-colors),
-              transform var(--dur-fast) var(--ease-out);
+              border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
 }
 .export-format-card:hover {
   background: var(--surface-2);
   color: var(--text-primary);
-  transform: translateY(-1px);
+  border-color: var(--border-default);
 }
 .export-format-card.active {
-  border-color: var(--brand-500);
-  background: var(--brand-50);
+  border-color: color-mix(in srgb, var(--brand-500) 45%, var(--border-subtle));
+  background: color-mix(in srgb, var(--brand-50) 75%, var(--surface-1));
   color: var(--text-primary);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand-500) 18%, transparent);
 }
 .export-format-icon {
   width: 32px;
@@ -2020,19 +1907,25 @@ onMounted(() => {
     grid-template-columns: 1fr;
   }
 }
-.about-body { padding: 4px 0; }
-.about-name { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
-.about-version { font-size: 13px; color: var(--text-tertiary); margin: 0 0 12px; }
-.about-desc { font-size: 13px; color: var(--text-secondary); margin: 0 0 4px; }
+.about-body { padding: 2px 0; }
+.about-name {
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: 0;
+  margin: 0 0 2px;
+  color: var(--text-primary);
+}
+.about-version { font-size: 12.5px; color: var(--text-tertiary); margin: 0 0 10px; }
+.about-desc { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 3px; line-height: 1.45; }
 .update-banner {
   margin: var(--space-3) 0;
   padding: var(--space-3);
-  background: var(--warn-50);
-  border: 1px solid var(--warn-500);
-  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warn-50) 80%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn-500) 35%, var(--border-subtle));
+  border-radius: var(--radius-md);
 }
 .update-banner p { margin: var(--space-1) 0; font-size: 13px; }
-.update-body { color: var(--text-tertiary); font-size: 12px !important; max-height: 120px; overflow: auto; white-space: pre-wrap; }
+.update-body { color: var(--text-tertiary); font-size: 12px !important; max-height: 100px; overflow: auto; white-space: pre-wrap; }
 .update-meta { color: var(--text-tertiary); font-size: 12px !important; }
 .update-actions {
   display: flex;
@@ -2040,35 +1933,44 @@ onMounted(() => {
   gap: var(--space-2);
   margin-top: var(--space-2);
 }
-.update-ok { font-size: 13px; color: var(--text-tertiary); margin: var(--space-3) 0; }
+.update-ok { font-size: 12.5px; color: var(--text-tertiary); margin: var(--space-3) 0; }
 
-/* Usage documentation button — primary action of the About dialog.
- * Brand-filled so it reads as the main thing to do here. */
+/* Docs CTA — secondary glass chip, not a heavy solid bar. */
 .about-docs {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   width: 100%;
-  margin: 14px 0 0;
-  padding: 9px 12px;
-  background: var(--brand-500);
-  color: var(--on-brand);
-  border: none;
+  margin: 12px 0 0;
+  padding: 0 var(--space-3);
+  height: var(--control-height);
+  background: color-mix(in srgb, var(--brand-50) 70%, transparent);
+  color: var(--brand-600);
+  border: 1px solid color-mix(in srgb, var(--brand-500) 28%, transparent);
   border-radius: var(--radius-md);
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 12.5px;
+  font-weight: 550;
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out);
+  transition: var(--transition-colors);
 }
-.about-docs:hover { background: var(--brand-600); }
+.about-docs:hover {
+  background: var(--brand-50);
+  color: var(--brand-700, var(--brand-600));
+  border-color: color-mix(in srgb, var(--brand-500) 45%, transparent);
+}
 .about-docs:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  outline: 2px solid var(--brand-500);
+  outline-offset: 1px;
 }
 .about-docs-icon { flex-shrink: 0; }
 
-.about-links { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-default); font-size: 13px; }
+.about-links {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+}
 .about-links a { color: var(--brand-500); text-decoration: none; }
 .about-links a:hover { text-decoration: underline; }
 .about-links .sep { color: var(--text-tertiary); margin: 0 6px; }

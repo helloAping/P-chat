@@ -39,12 +39,40 @@ type visionRecognitionResponse struct {
 	MaxImageBytes  int64  `json:"max_image_bytes"`
 }
 
+type recognitionRouteResponse struct {
+	Enabled        bool   `json:"enabled"`
+	Provider       string `json:"provider"`
+	Model          string `json:"model"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	MaxBytes       int64  `json:"max_bytes"`
+	Available      bool   `json:"available"`
+}
+
+type recognitionResponse struct {
+	Routes map[config.MediaKind]recognitionRouteResponse `json:"routes"`
+}
+
+type generationResponse struct {
+	Defaults       map[config.GenerationOperation]config.GenerationModelTarget `json:"defaults"`
+	RequireConfirm bool                                                        `json:"require_confirm"`
+}
+
 type systemConfigResponse struct {
-	Limits   limitsResponse            `json:"limits"`
-	SubAgent subAgentResponse          `json:"sub_agent"`
-	WorkMode workModeResponse          `json:"work_mode"`
-	UI       uiResponse                `json:"ui"`
-	Vision   visionRecognitionResponse `json:"vision_recognition"`
+	Limits      limitsResponse            `json:"limits"`
+	SubAgent    subAgentResponse          `json:"sub_agent"`
+	WorkMode    workModeResponse          `json:"work_mode"`
+	UI          uiResponse                `json:"ui"`
+	Vision      visionRecognitionResponse `json:"vision_recognition"`
+	Recognition recognitionResponse       `json:"recognition"`
+	Generation  generationResponse        `json:"generation"`
+}
+
+func generationToResp(g config.GenerationConfig) generationResponse {
+	defaults := make(map[config.GenerationOperation]config.GenerationModelTarget, len(g.Defaults))
+	for operation, target := range g.Defaults {
+		defaults[operation] = target
+	}
+	return generationResponse{Defaults: defaults, RequireConfirm: g.RequireConfirm}
 }
 
 func limitsToResp(l config.LimitsConfig) limitsResponse {
@@ -71,6 +99,50 @@ func visionRecognitionToResp(v config.VisionRecognitionConfig) visionRecognition
 	}
 }
 
+func (h *Handler) recognitionToResp(r config.RecognitionConfig) recognitionResponse {
+	r.Normalize()
+	routes := make(map[config.MediaKind]recognitionRouteResponse, 3)
+	for _, kind := range []config.MediaKind{config.MediaImage, config.MediaVideo, config.MediaAudio} {
+		route := r.Routes[kind]
+		route.Normalize()
+		available := h.recognitionRouteAvailable(kind, route)
+		routes[kind] = recognitionRouteResponse{
+			Enabled: route.Enabled, Provider: route.Provider, Model: route.Model,
+			TimeoutSeconds: route.TimeoutSeconds, MaxBytes: route.MaxBytes,
+			Available: available,
+		}
+	}
+	return recognitionResponse{Routes: routes}
+}
+
+func (h *Handler) recognitionRouteAvailable(kind config.MediaKind, route config.RecognitionRoute) bool {
+	if !route.Available() || !h.validModel(route.Provider, route.Model) {
+		return false
+	}
+	for _, provider := range h.getCfg().LLM.Providers {
+		if provider.Name != route.Provider {
+			continue
+		}
+		if kind != config.MediaImage && !config.ProtocolIsOpenAICompatible(provider.GetProtocol()) {
+			return false
+		}
+		for _, model := range provider.Models {
+			if model.Name == route.Model {
+				return model.Capabilities.SupportsInput(kind)
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func subAgentToResp(s config.SubAgentConfig) subAgentResponse {
+	return subAgentResponse{
+		CacheTTL: s.CacheTTL,
+		Timeout:  s.Timeout,
+	}
+}
+
 // GetSystemConfig GET /api/v1/config
 func (h *Handler) GetSystemConfig(c *gin.Context) {
 	if h.getCfg() == nil {
@@ -78,18 +150,17 @@ func (h *Handler) GetSystemConfig(c *gin.Context) {
 		return
 	}
 	resp := systemConfigResponse{
-		Limits: limitsToResp(h.getCfg().Limits),
-		SubAgent: subAgentResponse{
-			CacheTTL: h.getCfg().SubAgent.CacheTTL,
-			Timeout:  h.getCfg().SubAgent.Timeout,
-		},
+		Limits:   limitsToResp(h.getCfg().Limits),
+		SubAgent: subAgentToResp(h.getCfg().SubAgent),
 		WorkMode: workModeResponse{
 			Default: string(h.getCfg().WorkMode.Default.Normalize()),
 		},
 		UI: uiResponse{
 			CloseBehavior: string(h.getCfg().UI.CloseBehavior.Normalize()),
 		},
-		Vision: visionRecognitionToResp(h.getCfg().Vision),
+		Vision:      visionRecognitionToResp(h.getCfg().Vision),
+		Recognition: h.recognitionToResp(h.getCfg().Recognition),
+		Generation:  generationToResp(h.getCfg().Generation),
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -112,11 +183,13 @@ func (h *Handler) UpdateSystemConfig(c *gin.Context) {
 	}
 	h.reloadAfterConfigChange()
 	resp := systemConfigResponse{
-		Limits:   limitsToResp(updated.Limits),
-		SubAgent: subAgentResponse{CacheTTL: updated.SubAgent.CacheTTL, Timeout: updated.SubAgent.Timeout},
-		WorkMode: workModeResponse{Default: string(updated.WorkMode.Default.Normalize())},
-		UI:       uiResponse{CloseBehavior: string(updated.UI.CloseBehavior.Normalize())},
-		Vision:   visionRecognitionToResp(updated.Vision),
+		Limits:      limitsToResp(updated.Limits),
+		SubAgent:    subAgentToResp(updated.SubAgent),
+		WorkMode:    workModeResponse{Default: string(updated.WorkMode.Default.Normalize())},
+		UI:          uiResponse{CloseBehavior: string(updated.UI.CloseBehavior.Normalize())},
+		Vision:      visionRecognitionToResp(updated.Vision),
+		Recognition: h.recognitionToResp(updated.Recognition),
+		Generation:  generationToResp(updated.Generation),
 	}
 	c.JSON(http.StatusOK, resp)
 }

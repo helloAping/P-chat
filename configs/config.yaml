@@ -17,30 +17,34 @@ llm:
     # verbose: false   # when true, UI shows full tool args/results
 
   providers:
-    # Single-model form (legacy): one `model` field
+    # Anthropic: Base URL contains /v1, so the model endpoint suffix is /messages.
     - name: "claude"
       protocol: "anthropic"
-      base_url: "https://api.anthropic.com"
+      base_url: "https://api.anthropic.com/v1"
       api_key: ""
-      model: "claude-3-5-sonnet-20241022"
+      models:
+        - name: "claude-3-5-sonnet-20241022"
+          api_endpoint: "/messages"
+          default: true
 
-    # Multi-model form: one provider, multiple model ids sharing the
-    # same base URL and API key. Set `default: true` on one of the
-    # entries to mark the provider's default; otherwise the first
-    # entry wins.
+    # Multi-model form: models share one Base URL and API key, while each model
+    # owns an editable endpoint suffix. Set `default: true` on one LLM model.
     - name: "openai"
       protocol: "openai"
       base_url: "https://api.openai.com/v1"
       api_key: ""
       models:
         - name: "gpt-4o"
+          api_endpoint: "/chat/completions"
           default: true
           display_name: "GPT-4o"
           description: "Most capable, multimodal"
         - name: "gpt-4o-mini"
+          api_endpoint: "/chat/completions"
           display_name: "GPT-4o mini"
           description: "Fast and cheap"
         - name: "o1-preview"
+          api_endpoint: "/chat/completions"
           display_name: "o1 Preview"
           description: "Reasoning model"
 
@@ -49,23 +53,39 @@ llm:
       protocol: "openai"
       base_url: "http://api-convert.08ms.cn/v1"
       api_key: ""
+      # 可选的供应商级请求头；动态值会在每次请求时展开。
+      # Optional provider-wide headers. Dynamic values are expanded per request.
+      # custom_headers:
+      #   x-opencode-session: "{{conversation_id}}"
+      #   x-pchat-message-id: "{{message_id}}"
+      #   x-request-id: "{{uuid}}"
+      #   x-snowflake-id: "{{snowflake_id}}"
       models:
         - name: "doubao-seed-2.0-lite"
+          api_endpoint: "/chat/completions"
           default: true
         - name: "doubao-pro"
+          api_endpoint: "/chat/completions"
         - name: "doubao-lite-32k"
+          api_endpoint: "/chat/completions"
 
     - name: "deepseek"
       protocol: "openai"
       base_url: "https://api.deepseek.com/v1"
       api_key: ""
-      model: "deepseek-chat"
+      models:
+        - name: "deepseek-chat"
+          api_endpoint: "/chat/completions"
+          default: true
 
     - name: "ollama"
       protocol: "openai"
       base_url: "http://localhost:11434/v1"
       api_key: "ollama"
-      model: "llama3"
+      models:
+        - name: "llama3"
+          api_endpoint: "/chat/completions"
+          default: true
 
 style:
   default: "off"

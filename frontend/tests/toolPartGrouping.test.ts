@@ -29,3 +29,23 @@ test('groupConsecutiveToolParts skips blank text without breaking tool groups', 
     assert.deepEqual(entries[0].indexes, [0, 2])
   }
 })
+
+test('groupConsecutiveToolParts hides question tools unless they have an error', () => {
+  const parts: MessagePart[] = [
+    { kind: 'tool', name: 'question', status: 'start' },
+    { kind: 'question', text: '{"questions":[]}', question_status: 'open' },
+    { kind: 'tool', name: 'question', status: 'error', error: 'timeout' },
+  ]
+
+  const entries = groupConsecutiveToolParts(parts.map((part, index) => ({ part, index })))
+
+  assert.equal(entries.length, 2)
+  assert.equal(entries[0].kind, 'part')
+  assert.equal(entries[1].kind, 'part')
+  if (entries[0].kind === 'part' && entries[1].kind === 'part') {
+    assert.equal(entries[0].part.kind, 'question')
+    assert.equal(entries[0].index, 1)
+    assert.equal(entries[1].part.kind, 'tool')
+    assert.equal(entries[1].index, 2)
+  }
+})

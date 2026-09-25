@@ -8,6 +8,12 @@
 
 Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API 路由、SSE 流式推送、会话管理、消息持久化、配置管理、上传、项目/技能管理。
 
+### 启动身份与端口
+
+`cmd/pchat-server` 通过 `serverproc.Listen()` 直接取得 listener，再调用 `Server.RunListener()`，因此 `PCHAT_PORT=0` 和 `PCHAT_PORT_RANGE` 都不存在探测后重新绑定的竞态。若由 GUI/CLI 拉起，server 会在 `PCHAT_RUNTIME_FILE` 原子发布实际地址及 profile/instance/PID；父进程校验 announcement 后还会用 `/api/v1/health` 二次校验。
+
+`GET /api/v1/health` 成功响应包含 `status`、`profile_id`、`profile_name`、`instance_id`、`pid`。新增启动器或客户端不得只检查 `status=ok` 就认领一个动态端口。
+
 ## 文件结构
 
 | 文件 | 职责 | 关键函数/类型 |
@@ -18,7 +24,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 | `message_helpers.go` | 历史消息响应整形、parts 解码、内部行过滤、附件合并 | `ListMessages()`, `buildMessageResponse()` |
 | `handler_test.go` | Handler 单元测试 | |
 | `knowledge_api.go` | 知识库 CRUD + 扫描管道 + 三层索引 | `ListSections`, `ListNodes`, `GetNodeContent`, `ClearKnowledgeBase`, `indexScan` |
-| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe | `FetchUpstreamModels`, `ProbeUpstreamModels` |
+| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe / 连接测试 | `FetchUpstreamModels`, `ProbeUpstreamModels`, `TestProvider` |
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
 | `command_api.go` | 斜杠命令执行 | |
@@ -30,6 +36,20 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 ## 核心 API 路由
 
 详见 `server.go:86-167`，所有路由以 `/api/v1` 为前缀。
+
+### Provider / Model 连接测试
+
+`POST /api/v1/providers/:name/test` 接受可选 body `{ "model": "模型 ID" }`：
+
+- 不传 `model` 时解析该 provider 的默认模型；传入时严格校验模型属于该 provider。
+- 向上游发送单条用户消息 `sayhi`，使用 30 秒超时并把输出限制为 64 token；不创建会话、不持久化消息，也不修改当前/默认模型。
+- 成功返回实际 `provider`、`model`、`response` 和 `elapsed_ms`；上游失败返回标准化 `error_kind`。
+- 测试客户端继承 Provider 的 `custom_headers`；无对话/消息上下文的动态参数展开为空，UUID、雪花 ID 和时间戳仍会生成。
+
+`GET /api/v1/providers/:name/upstream-models` 与 `POST /api/v1/providers/probe-models` 通过
+`internal/provider` 策略解析模型获取方式，不再在 Handler 内写死 `Base URL + /models`。
+响应始终包含 `models`，并可附带 `base_url`、`endpoint`、`source`、`default_endpoint`
+和非致命 `error`；Custom 等允许手动兜底的策略在远程获取失败时仍返回 200，设置页继续允许手动添加模型。
 
 ## 核心概念
 
@@ -78,9 +98,10 @@ Chunk 字段检查顺序（优先级从高到低）:
 
 ### 3. 会话管理
 
-- `ListSessions` — 列出会话（支持 `?project_path=` 过滤）
-- `CreateSession` — 创建会话
+- `ListSessions` — 列出会话（支持 `?project_path=` 过滤），返回 `conversation_state`、`has_user_messages`、`user_message_count`、`pending_turn_count`；`blank` 表示项目内可复用空白草稿。
+- `CreateSession` — 创建会话；请求体可传 `reuse_empty: true`，服务端会在同项目复用最新空白会话，避免多窗口/快速连点创建重复空会话。
 - `GetSession` — 获取单个会话元数据
+- `GenerateSessionTitle` — `POST /sessions/:id/title`，基于当前会话前几条文本消息调用当前会话 provider/model 做一次非流式语义标题生成；只覆盖空标题或占位标题，用户手动标题不会被后台覆盖，LLM 不可用时回退到本地短标题。
 - `UpdateSessionMeta` — PATCH 更新 provider/model/style
 - `DeleteSession` — 软删除（标记 archived）
 - `ArchiveSession / UnarchiveSession` — 归档/恢复
@@ -98,12 +119,44 @@ Chunk 字段检查顺序（优先级从高到低）:
 - `SaveSystemMessage` — 保存自定义系统提示词
 - `GetTodos` — 获取待办列表
 
+`POST /sessions/:id/messages` 和 turn queue payload 支持 `active_skills: string[]`。
+服务端只接收名称，由当前会话的项目根解析有效 Skill；旧 `skill_context` 字段暂时保留兼容，
+新客户端不得继续发送 Skill 正文。
+
+Skill API：
+
+- `GET /skills`：只返回 catalog 元数据及 `diagnostics[]`，不返回正文。
+- `GET /skills/:name`：按需加载正文，主要用于检查界面。
+- `POST /skills/install`：完整包安装/导入；`url` 与 `source_path` 必须且只能提供一个。
+  `source_path` 可指向单包或集合目录，集合可用可选 `name` 选择目标及其依赖；响应含
+  `ready`、`installed[]`、`rolled_back` 和诊断。
+- `DELETE /skills/:name`：只允许删除 P-Chat 托管来源，标准目录返回 `409`。
+
+#### 会话回合队列
+
+`turn_queue` 是忙碌会话的持久化 FIFO。客户端先入队，空闲后通过 `claim`
+领取队首，再复用 `/messages` 执行，最后标记 `complete` 或 `fail`。队首为
+`running` / `failed` 时会阻塞后续领取，避免跳过用户消息。
+
+| 方法 | 路径 | 行为 |
+| --- | --- | --- |
+| `GET/POST/DELETE` | `/sessions/:id/turn-queue` | 列表、入队、清空 queued/failed |
+| `PATCH` | `/sessions/:id/turn-queue/:queue_id` | 仅编辑尚未领取的 queued 消息；同步 `message` 与 `payload_json.message` |
+| `POST` | `/sessions/:id/turn-queue/claim` | 原子领取 FIFO 队首并返回完整发送 payload |
+| `POST` | `/sessions/:id/turn-queue/:queue_id/complete|fail|retry` | 完成、失败、重试 |
+| `DELETE` | `/sessions/:id/turn-queue/:queue_id` | 取消 queued/failed 项 |
+
+编辑和领取共享 Store 锁与状态条件；一旦队列项已变成 `running`，编辑返回
+`409 Conflict`，防止已经进入 agent 上下文的消息被事后改写。
+
 ### 5. 消息持久化
 
 - 消息通过 `memory.Store.AddChatMessageTo()` 持久化
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
 - `buildMessageResponse()` 会过滤不应渲染的内部行：tool_call/tool_result、媒体附件独立行、`metadata.ui_hidden=true` 的消息，以及旧库中以 `⏱ 上一回合因` / `⚠ 系统检测：你刚才的回复没有调用任何工具` 开头的自动续跑 user-style nudge。内部续跑提示只能影响下一次 LLM 输入，不应在 GUI 里表现成用户重复发送消息。
+- `type=skill` SSE 携带 `skill_name`、`skill_status=start|ready|error`、`skill_scope`、
+  `skill_source`、`skill_dependencies`、`skill_error`，并作为 `kind=skill` part 持久化。
 
 ### 6. P0-1 / P1-3 增量端点 (round 2, 2026-07-15)
 
@@ -302,6 +355,26 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 ### 12. 浏览器 E2E（BR-05）
 
 `go test ./internal/browser -run E2E`：模拟扩展夹具覆盖连接、导航/点击/输入/截图、断线重连、策略拦截与 Manager 动态注册。不依赖真实 Chrome。
+
+### 13. 媒体生成 API 与资产服务
+
+- `GET /api/v1/generation/options?session_id=<id>` 返回全部 canonical operation、应用默认、
+  会话启用状态和不可用原因；可用性只按应用默认模型解析。
+- 会话创建/更新只用 `enabled_generation_operations` 控制授权。会话级模型覆盖和提示词辅助
+  参数已停用，API 收到这两个旧字段时返回 `400`；历史 metadata 字段不会参与运行。
+- `GET /api/v1/generated/:id` 提供已实体化的图片、视频或音频；文件与归属 metadata 位于
+  `~/.p-chat/generated/`，URL 在聊天历史中保持稳定。
+- Provider CRUD 包含 `protocol`、公共 `base_url`，Model CRUD 包含 `api_endpoint`、
+  `type`、`generation`；Provider 的 `custom_headers` 是完整替换的字符串 map，提交 `{}` 可清空。
+  LLM/媒体端点均保存相对后缀，并在执行时与 Base URL 拼接。
+  `GET /api/v1/providers/:name/upstream-models` 使用 `internal/provider` 策略解析模型列表
+  endpoint、默认 Base URL、静态 fallback 与手动兜底，并携带该 Provider 的自定义请求头。
+  新增前的 `POST /providers/probe-models` 也接受临时 `custom_headers`。
+  聊天模型选择和连接测试只接受
+  `type=llm`，不会把媒体模型误发到 Chat Completions。
+
+首版异步任务在一次工具调用中轮询完成，尚无重启续查/取消端点。详见
+[媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
 
 ## 修改指南
 

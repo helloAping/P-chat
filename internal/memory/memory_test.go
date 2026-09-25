@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -90,6 +91,64 @@ func TestStore_MultipleConversations(t *testing.T) {
 	if got := s.GetMessages(); len(got) != 1 || got[0].Content != "B1" {
 		t.Errorf("conv B should have only B1, got %+v", got)
 	}
+}
+
+func TestStore_SearchMessagesByProject(t *testing.T) {
+	s := testStore(t)
+
+	globalID := s.CurrentConversationID()
+	if err := s.RenameConversation(globalID, "Global"); err != nil {
+		t.Fatal(err)
+	}
+	s.AddChatMessageTo(globalID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from global"})
+
+	projectAPath := filepath.Join(t.TempDir(), "project-a")
+	projectAID, err := s.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenameConversation(projectAID, "Project A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateConversationMeta(projectAID, projectMetaJSON(t, projectAPath)); err != nil {
+		t.Fatal(err)
+	}
+	s.AddChatMessageTo(projectAID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from project a"})
+
+	projectBPath := filepath.Join(t.TempDir(), "project-b")
+	projectBID, err := s.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenameConversation(projectBID, "Project B"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateConversationMeta(projectBID, projectMetaJSON(t, projectBPath)); err != nil {
+		t.Fatal(err)
+	}
+	s.AddChatMessageTo(projectBID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from project b"})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := s.SearchMessagesByProject("needle", 10, projectAPath); len(got) != 1 || got[0].ConversationID != projectAID {
+		t.Fatalf("project A search = %+v, want only %s", got, projectAID)
+	}
+	if got := s.SearchMessagesByProject("needle", 10, ""); len(got) != 1 || got[0].ConversationID != globalID {
+		t.Fatalf("global search = %+v, want only %s", got, globalID)
+	}
+	if got := s.SearchMessages("needle", 10); len(got) != 3 {
+		t.Fatalf("legacy search count = %d, want 3 (%+v)", len(got), got)
+	}
+}
+
+func projectMetaJSON(t *testing.T, projectPath string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]string{"project_path": projectPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func TestStore_Rename(t *testing.T) {

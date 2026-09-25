@@ -20,7 +20,7 @@ P-Chat 知识库是一个**本地优先的文档检索系统**。当前检索基
 
 ### 3. 在对话中使用
 
-在聊天输入框底部，点击「向量库」下拉选择器选择一个向量库。之后 LLM 在需要时会自动调用 `recall` 工具检索知识库。
+在聊天输入框底部打开「会话设置」→「知识库」，选择“不使用 / 全部 / 指定知识库”。之后 LLM 在需要时会自动调用 `recall` 或 `wiki_lookup` 检索知识库。
 
 > 选择「不使用」可禁用当前对话的知识检索。
 
@@ -47,7 +47,7 @@ P-Chat 知识库是一个**本地优先的文档检索系统**。当前检索基
 ### 其他
 `.csv` `.tsv` `.log` `.diff` `.patch` `.proto` `.graphql` `.gql` `.tf`
 
-**自动跳过的内容**：二进制文件、图片、音视频、压缩包、`node_modules/`、`vendor/`、点开头的隐藏目录。
+**自动跳过的内容**：二进制文件、压缩包、`node_modules/`、`vendor/`、点开头的隐藏目录。图片、音视频、PDF 等媒体文件默认不扫描；如果知识库配置了 `scan_model` 和 `scan_media_types`，扫描任务可以让模型先提取媒体内容再写入索引。
 
 ---
 
@@ -55,8 +55,8 @@ P-Chat 知识库是一个**本地优先的文档检索系统**。当前检索基
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| 检索结果数 (Top-K) | 5 | 每次检索返回的最相关片段数，范围 1-20 |
-| 最低相似度 | 0.5 | 低于此分数的结果被过滤，范围 0-1 |
+| 检索结果数 (Top-K) | 5 | 每次检索返回的最相关片段数，API 上限 50 |
+| 知识库范围 | 全部启用库 | 会话可选“不使用 / 全部 / 指定知识库”，搜索 API 也可传 `bases` |
 | 自动索引 | 关闭 | 启动时自动扫描并重新索引所有已启用的知识库 |
 
 ---
@@ -65,13 +65,14 @@ P-Chat 知识库是一个**本地优先的文档检索系统**。当前检索基
 
 ```
 添加知识库路径
-  → 扫描（分块 → 嵌入 → 存储到向量库）
-    → LLM 对话中调用 recall 工具
-      → 查询嵌入 → 向量相似度搜索 → Top-K 结果
-        → 结果注入 LLM 上下文 → 辅助回答
+  → 扫描（解析文件 → 构建 L1/L2/L3 Wiki 节点 → 写入 SQLite FTS5）
+    → LLM 对话中调用 recall / wiki_lookup 工具
+      → 查询分解 → 路径/文件名/标题/正文混合召回
+        → 多库合并重排 + citation/explanation
+          → 结果注入 LLM 上下文 → 辅助回答
 ```
 
-**分块规则**：按 800 字符分块，相邻块 100 字符重叠，保证语义连续性。切分时按段落/句子边界，不是机械截断。
+**索引规则**：文本文件零成本解析并写入 Wiki/FTS5 索引；每个知识库会形成 L1 概览、L2 文件节点、L3 章节节点和内容块。重新扫描时按文件状态增量处理，未变文件跳过，删除文件会清理索引。
 
 ---
 
@@ -83,16 +84,18 @@ P-Chat 知识库是一个**本地优先的文档检索系统**。当前检索基
 |------|------|------|
 | `GET` | `/knowledge/config` | 获取全局配置 |
 | `PATCH` | `/knowledge/config` | 更新全局配置 |
-| `GET` | `/knowledge/stores` | 列出向量库 |
-| `POST` | `/knowledge/stores` | 添加向量库 |
-| `DELETE` | `/knowledge/stores/:name` | 删除向量库 |
-| `POST` | `/knowledge/stores/:name/test` | 测试连接 |
+| `GET` | `/knowledge/models` | 列出可用于媒体扫描的模型 |
 | `GET` | `/knowledge/bases` | 列出知识库 |
 | `POST` | `/knowledge/bases` | 添加知识库 |
 | `DELETE` | `/knowledge/bases/:name` | 删除知识库 |
 | `POST` | `/knowledge/bases/:name/scan` | 扫描索引 |
-| `POST` | `/knowledge/search` | 语义搜索 |
-| `GET` | `/knowledge/embedders` | 列出可用嵌入模型 |
+| `DELETE` | `/knowledge/bases/:name/scan` | 取消扫描 |
+| `GET` | `/knowledge/bases/:name/scan/status` | 查询扫描进度 |
+| `DELETE` | `/knowledge/bases/:name/clear` | 清空该知识库索引 |
+| `GET` | `/knowledge/bases/:name/nodes` | 获取三层索引树节点 |
+| `GET` | `/knowledge/bases/:name/nodes/:id/content` | 获取节点内容块 |
+| `DELETE` | `/knowledge/bases/:name/nodes/:id` | 删除节点 |
+| `POST` | `/knowledge/search` | 混合搜索 |
 
 ### config.json 配置参考
 
@@ -100,32 +103,18 @@ P-Chat 知识库是一个**本地优先的文档检索系统**。当前检索基
 {
   "knowledge": {
     "enabled": false,
-    "default_store": "local",
     "auto_index": false,
-    "embedder": {
-      "provider": "openai",
-      "model": "text-embedding-3-small"
-    },
-    "search": {
-      "top_k": 5,
-      "min_score": 0.5
-    },
-    "vector_stores": [
-      {
-        "name": "local",
-        "type": "local",
-        "driver": "local",
-        "path": ""
-      }
-    ],
     "bases": [
       {
         "name": "项目文档",
         "path": "D:/docs/",
-        "store": "local",
-        "chunk_size": 800,
-        "chunk_overlap": 100,
-        "enabled": true
+        "enabled": true,
+        "file_types": [".md", ".go", ".ts", ".vue"],
+        "scan_model": "",
+        "scan_media_types": [],
+        "auto_scan": false,
+        "exclude_patterns": ["node_modules/**", "vendor/**"],
+        "max_file_size": 5242880
       }
     ]
   }
@@ -134,19 +123,21 @@ P-Chat 知识库是一个**本地优先的文档检索系统**。当前检索基
 
 ### 会话级绑定
 
-每个对话可以独立绑定不同的向量库，通过会话元数据 API：
+每个对话可以独立选择知识库范围，通过会话元数据 API：
 
 ```bash
-# 绑定到指定向量库
+# 使用全部启用知识库
 PATCH /api/v1/sessions/:id
-{ "vector_store": "qdrant-prod" }
+{ "knowledge_base": "__all__" }
 
-# 使用全局默认
-{ "vector_store": "" }
+# 绑定到指定知识库
+{ "knowledge_base": "项目文档" }
 
 # 禁用本对话知识检索
-{ "vector_store": "__off__" }
+{ "knowledge_base": "__off__" }
 ```
+
+旧版 `vector_store` 字段仍可能出现在类型定义里用于兼容历史数据；新功能和 GUI 入口优先使用 `knowledge_base`。
 
 ---
 
@@ -160,17 +151,13 @@ PATCH /api/v1/sessions/:id
 
 检查以下几项：
 1. 目录路径是否存在且包含支持格式的文件
-2. 嵌入模型是否配置正确（供应商有效、API Key 可用）
-3. 向量库连接是否正常（点「测试」按钮）
-4. 检索时相似度阈值是否过高（尝试调低 min_score）
+2. 知识库是否启用，当前会话是否选择了“不使用”
+3. 扫描状态里是否有 failed，失败文件通常来自编码、权限、文件过大或媒体模型缺失
+4. 查询是否过窄；可以试试文件名、函数名、配置 key 或更短关键词
 
-### Q: 嵌入 API 调用会花钱吗？
+### Q: 扫描知识库会调用 LLM 或产生费用吗？
 
-是的，如果你使用 OpenAI 等云服务的嵌入模型。参考价格（2024）：
-- `text-embedding-3-small`：$0.02 / 1M tokens
-- `text-embedding-3-large`：$0.13 / 1M tokens
-
-使用本地模型（Ollama nomic-embed-text 等）完全免费。嵌入只在**扫描索引时**产生 API 调用，后续检索是在向量库上进行，不再调用嵌入 API（仅对用户查询进行一次嵌入）。
+纯文本和代码文件走本地解析 + SQLite FTS5，不需要嵌入模型，也不会调用云端 LLM。只有当知识库配置了 `scan_model` 并启用图片、音频、视频、PDF 等媒体扫描时，扫描任务才会调用对应模型提取内容。
 
 ### Q: 如何让 LLM 更频繁地使用知识库？
 
@@ -181,22 +168,17 @@ LLM 在以下情况下会自动调用 recall：
 
 如果你想**强制**检索，可以直接在消息中说"查一下知识库中关于 XXX 的内容"，LLM 会主动调用 recall。
 
-### Q: 多个向量库可以同时使用吗？
+### Q: 多个知识库可以同时使用吗？
 
-当前设计是**每个对话绑定一个向量库**。如果你有多个知识域（如"技术文档"和"公司规章"），可以：
-1. 将它们扫描到同一个向量库（统一检索）
-2. 或分别建不同的向量库，切换对话时更换绑定
+可以。会话选择“全部”时，系统会对所有启用知识库分别召回，再归一化、去重、全局重排。也可以在会话设置里绑定某一个知识库，降低跨领域噪音。
 
-### Q: 本地向量库的 .vec 文件有多大？
+### Q: 本地索引文件有多大？
 
-估算公式：`文件大小 ≈ 文档片段数 × 向量维度 × 4 字节`
-
-例如：1000 个片段 × 1536 维 × 4B = 约 6 MB。实际会比这个略大（含元数据和索引开销），但增长是线性的。
+当前主要是 SQLite Wiki/FTS5 索引，大小取决于文件数量、文本长度和内容块数量。纯文本索引通常比原始文本大一些；启用媒体扫描时，模型提取出的描述文本也会写入索引。
 
 ### Q: 如何备份知识库？
 
-- **本地向量库**：备份 `~/.p-chat/vectors/` 目录
-- **远程向量库**：参考对应服务的备份文档（Qdrant snapshots、Milvus backup 等）
+- **本地索引**：备份 `~/.p-chat/knowledge/` 目录
 - **配置**：备份 `~/.p-chat/config.json` 中的 `knowledge` 部分
 
 ### Q: 支持增量索引吗？
@@ -207,17 +189,10 @@ LLM 在以下情况下会自动调用 recall：
 
 | | 知识库 | Rules | AGENTS.md |
 |--|--------|-------|-----------|
-| 存储方式 | 向量嵌入 | 原始 Markdown | 原始 Markdown |
-| 检索方式 | 语义相似度搜索 | 全部注入 System Prompt | 全部注入 System Prompt |
+| 存储方式 | SQLite Wiki/FTS5 索引 | 原始 Markdown | 原始 Markdown |
+| 检索方式 | 按需混合检索 | 全部注入 System Prompt | 全部注入 System Prompt |
 | 适用场景 | 大量文档/代码，按需查 | 行为约束，全局生效 | Agent 指令，全局生效 |
-| 消耗 | 嵌入 API + 少量 token | 占用上下文 token | 占用上下文 token |
-
-### Q: 目前支持哪些 LLM 供应商的嵌入模型？
-
-任何提供 OpenAI 兼容 embedding 端点的供应商都可以使用，包括 OpenAI、DeepSeek、智谱、百川、Ollama 等。配置时只需确保：
-1. 供应商的 `base_url` 指向正确的端点
-2. 模型名在 `/v1/embeddings` 端点可用
-3. API Key 有权限调用 embedding API
+| 消耗 | 纯文本零模型费用；媒体扫描可能调用模型 | 占用上下文 token | 占用上下文 token |
 
 
 ## 多知识库合并重排 (KB-01)

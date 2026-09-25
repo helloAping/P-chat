@@ -85,8 +85,29 @@ type WikiStore struct {
 	name string
 }
 
+// NormalizeWikiStoreDir returns a stable absolute directory for a wiki store.
+func NormalizeWikiStoreDir(dir string) (string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return "", fmt.Errorf("wiki store dir is required")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("abs wiki store dir: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	if real, err := filepath.EvalSymlinks(abs); err == nil && real != "" {
+		abs = filepath.Clean(real)
+	}
+	return abs, nil
+}
+
 // NewWikiStore opens/creates a SQLite wiki store at the given path.
 func NewWikiStore(name, dir string) (*WikiStore, error) {
+	dir, err := NormalizeWikiStoreDir(dir)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -107,6 +128,11 @@ func NewWikiStore(name, dir string) (*WikiStore, error) {
 		}
 	}
 	return ws, nil
+}
+
+// Dir returns the normalized directory backing this store.
+func (ws *WikiStore) Dir() string {
+	return ws.dir
 }
 
 func (ws *WikiStore) migrate() error {
@@ -656,6 +682,49 @@ func (ws *WikiStore) GetL1Overview(ctx context.Context, base string) (string, er
 	return overview, err
 }
 
+// RefreshL1Overview rebuilds the base root overview from the current L2 file
+// nodes. If the root node is absent, it creates one so prompt injection can
+// still tell the model that the base exists.
+func (ws *WikiStore) RefreshL1Overview(ctx context.Context, base string) error {
+	rows, err := ws.db.QueryContext(ctx,
+		`SELECT id, parent_id, base, level, source, kind, sort_order, title, keywords, overview
+		 FROM index_nodes
+		 WHERE base = ? AND level = 2
+		 ORDER BY sort_order, source`, base)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var l2Nodes []IndexNode
+	for rows.Next() {
+		var n IndexNode
+		if err := rows.Scan(&n.ID, &n.ParentID, &n.Base, &n.Level, &n.Source, &n.Kind, &n.SortOrder, &n.Title, &n.Keywords, &n.Overview); err != nil {
+			return err
+		}
+		l2Nodes = append(l2Nodes, n)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	overview := buildL1OverviewFromNodes(l2Nodes)
+	res, err := ws.db.ExecContext(ctx,
+		`UPDATE index_nodes SET title = ?, overview = ? WHERE base = ? AND level = 1`,
+		base, overview, base)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+	_, err = ws.db.ExecContext(ctx,
+		`INSERT INTO index_nodes (parent_id, base, level, source, kind, sort_order, title, keywords, overview)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		0, base, 1, "", "", 0, base, "", overview)
+	return err
+}
+
 // CountNodes returns the number of index_nodes at level >= 2 for a base.
 func (ws *WikiStore) CountNodes(ctx context.Context, base string) int {
 	var count int
@@ -688,7 +757,11 @@ var (
 // GetOrOpenWikiStore returns a cached wiki store keyed by (dir, name).
 // Each unique combination gets its own SQLite database.
 func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) {
-	key := dir + "/" + name
+	dir, err := NormalizeWikiStoreDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	key := dir + "\x00" + name
 	if ws, ok := wikiStoreCache.Load(key); ok {
 		return ws.(*WikiStore), nil
 	}
@@ -741,6 +814,8 @@ func CloseWikiStore() {
 		return true
 	})
 	wikiStoreCache = sync.Map{}
+	wikiStoreOrder = make(map[string]uint64)
+	wikiStoreCounter.Store(0)
 }
 
 // ListChildren returns paginated child nodes under parentID.
@@ -890,8 +965,12 @@ func (ws *WikiStore) LookupSearch(ctx context.Context, query, base string, expan
 }
 
 func (ws *WikiStore) browseL2(ctx context.Context, base string, level, page, size int) (*IndexSearchResult, error) {
+	browseLevel := 2
+	if level == 3 {
+		browseLevel = 3
+	}
 	baseCond := ``
-	args := []any{}
+	args := []any{browseLevel}
 	if base != "" && base != "__all__" {
 		baseCond = `AND base = ?`
 		args = append(args, base)
@@ -899,7 +978,7 @@ func (ws *WikiStore) browseL2(ctx context.Context, base string, level, page, siz
 
 	var total int
 	row := ws.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM index_nodes WHERE level = 2 `+baseCond, args...)
+		`SELECT COUNT(*) FROM index_nodes WHERE level = ? `+baseCond, args...)
 	if err := row.Scan(&total); err != nil {
 		return nil, err
 	}
@@ -910,7 +989,7 @@ func (ws *WikiStore) browseL2(ctx context.Context, base string, level, page, siz
 	queryArgs := append(args, size, (page-1)*size)
 	rows, err := ws.db.QueryContext(ctx,
 		`SELECT id, level, title, keywords, overview, source, kind
-		 FROM index_nodes WHERE level = 2 `+baseCond+` ORDER BY sort_order LIMIT ? OFFSET ?`,
+		 FROM index_nodes WHERE level = ? `+baseCond+` ORDER BY sort_order, source LIMIT ? OFFSET ?`,
 		queryArgs...)
 	if err != nil {
 		return nil, err
@@ -955,23 +1034,39 @@ func (ws *WikiStore) rankedSearch(ctx context.Context, query, base string, level
 
 	lists := [][]searchHit{
 		// Lexical path / filename / title (exact-term bias).
-		ws.lexicalPathHits(ctx, query, baseWhere, baseArg),
-		// FTS strategies.
-		ws.collectFTSList(ctx, query, baseWhere, baseArg, weightTitle, MatchTitle,
-			fmt.Sprintf(ftsSQL, 3),
-			func(q string) string { return fmt.Sprintf(`title:%s*`, q) }),
-		ws.collectFTSList(ctx, query, baseWhere, baseArg, weightKeyword, MatchKeywords,
-			fmt.Sprintf(ftsSQL, 3),
-			func(q string) string { return fmt.Sprintf(`keywords:%s*`, q) }),
-		ws.collectFTSList(ctx, query, baseWhere, baseArg, weightOvervw, MatchOverview,
-			fmt.Sprintf(ftsSQL, 3),
-			func(q string) string { return fmt.Sprintf(`overview:%s*`, q) }),
-		ws.collectFTSList(ctx, query, baseWhere, baseArg, weightL2, MatchL2,
-			fmt.Sprintf(ftsSQL, 2),
-			func(q string) string { return fmt.Sprintf(`%s*`, q) }),
-		// Content LIKE always contributes (not only empty-fallback).
-		ws.collectContentLikeList(ctx, query, baseWhere, baseArg),
+		ws.lexicalPathHits(ctx, query, baseWhere, baseArg, level),
 	}
+	if level == 0 || level == 3 {
+		lists = append(lists,
+			ws.collectFTSList(ctx, query, baseWhere, baseArg, weightTitle, MatchTitle,
+				fmt.Sprintf(ftsSQL, 3),
+				func(q string) string { return fmt.Sprintf(`title:%s*`, q) }),
+			ws.collectFTSList(ctx, query, baseWhere, baseArg, weightKeyword, MatchKeywords,
+				fmt.Sprintf(ftsSQL, 3),
+				func(q string) string { return fmt.Sprintf(`keywords:%s*`, q) }),
+			ws.collectFTSList(ctx, query, baseWhere, baseArg, weightOvervw, MatchOverview,
+				fmt.Sprintf(ftsSQL, 3),
+				func(q string) string { return fmt.Sprintf(`overview:%s*`, q) }),
+		)
+	}
+	if level == 0 || level == 2 {
+		lists = append(lists,
+			ws.collectFTSList(ctx, query, baseWhere, baseArg, weightTitle, MatchTitle,
+				fmt.Sprintf(ftsSQL, 2),
+				func(q string) string { return fmt.Sprintf(`title:%s*`, q) }),
+			ws.collectFTSList(ctx, query, baseWhere, baseArg, weightKeyword, MatchKeywords,
+				fmt.Sprintf(ftsSQL, 2),
+				func(q string) string { return fmt.Sprintf(`keywords:%s*`, q) }),
+			ws.collectFTSList(ctx, query, baseWhere, baseArg, weightOvervw, MatchOverview,
+				fmt.Sprintf(ftsSQL, 2),
+				func(q string) string { return fmt.Sprintf(`overview:%s*`, q) }),
+			ws.collectFTSList(ctx, query, baseWhere, baseArg, weightL2, MatchL2,
+				fmt.Sprintf(ftsSQL, 2),
+				func(q string) string { return fmt.Sprintf(`%s*`, q) }),
+		)
+	}
+	// Content LIKE always contributes (not only empty-fallback).
+	lists = append(lists, ws.collectContentLikeList(ctx, query, baseWhere, baseArg, level))
 
 	hits := fuseRRF(lists)
 
@@ -1075,20 +1170,27 @@ func escapeFTS5(q string) string {
 	return strings.Join(parts, " OR ")
 }
 
-func (ws *WikiStore) addContentLikeHits(ctx context.Context, hits []searchHit, seen *map[int]bool, query, baseWhere, baseArg string, weight float64) []searchHit {
+func (ws *WikiStore) addContentLikeHits(ctx context.Context, hits []searchHit, seen *map[int]bool, query, baseWhere, baseArg string, weight float64, level int) []searchHit {
 	var args []any
 	args = append(args, "%"+query+"%")
 	if baseWhere != "" && baseArg != "" {
 		args = append(args, baseArg)
 	}
 	args = append(args, 50)
+	levelWhere := `n.level >= 2`
+	switch level {
+	case 2:
+		levelWhere = `n.level = 2`
+	case 3:
+		levelWhere = `n.level = 3`
+	}
 
 	sqlStmt := `SELECT n.id, n.level, n.title, n.keywords, n.overview, n.source, n.kind,
 		            n.parent_id, p.title
 		     FROM contents c
 		     JOIN index_nodes n ON c.node_id = n.id
 		     LEFT JOIN index_nodes p ON n.parent_id = p.id
-		     WHERE n.level >= 2 AND c.content LIKE ? ` + baseWhere + `
+		     WHERE ` + levelWhere + ` AND c.content LIKE ? ` + baseWhere + `
 		     ORDER BY n.id LIMIT ?`
 
 	rows, err := ws.db.QueryContext(ctx, sqlStmt, args...)
@@ -1182,13 +1284,21 @@ func (ws *WikiStore) ClearBase(ctx context.Context, base string) error {
 	defer tx.Rollback()
 
 	// Delete from the old wiki_sections table (manually sync FTS).
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM wiki_fts WHERE rowid IN (SELECT id FROM wiki_sections WHERE base = ?)`, base); err != nil {
-		return fmt.Errorf("clear wiki_fts: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM wiki_sections WHERE base = ?`, base); err != nil {
-		return fmt.Errorf("clear wiki_sections: %w", err)
+	if ok, err := tableExistsTx(ctx, tx, "wiki_sections"); err != nil {
+		return err
+	} else if ok {
+		if ftsOK, err := tableExistsTx(ctx, tx, "wiki_fts"); err != nil {
+			return err
+		} else if ftsOK {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM wiki_fts WHERE rowid IN (SELECT id FROM wiki_sections WHERE base = ?)`, base); err != nil {
+				return fmt.Errorf("clear wiki_fts: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM wiki_sections WHERE base = ?`, base); err != nil {
+			return fmt.Errorf("clear wiki_sections: %w", err)
+		}
 	}
 
 	// Delete from index_nodes — FTS triggers handle index_fts automatically.
@@ -1270,6 +1380,11 @@ func (ws *WikiStore) MigrateBaseToIndex(ctx context.Context, base string) (int, 
 	if err := ws.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM index_nodes WHERE base = ?`, base).Scan(&count); err == nil && count > 0 {
 		return count, nil
+	}
+	if ok, err := tableExistsDB(ctx, ws.db, "wiki_sections"); err != nil {
+		return 0, err
+	} else if !ok {
+		return 0, nil
 	}
 
 	rows, err := ws.db.QueryContext(ctx,
@@ -1402,17 +1517,27 @@ func (ws *WikiStore) MigrateBaseToIndex(ctx context.Context, base string) (int, 
 
 // TruncateText clips s to max runes, appending nothing.
 func TruncateText(s string, max int) string {
-	if len(s) <= max {
-		return s
+	out, _ := TruncateTextWithFlag(s, max)
+	return out
+}
+
+// TruncateTextWithFlag clips s to max runes and reports whether it changed.
+func TruncateTextWithFlag(s string, max int) (string, bool) {
+	if max <= 0 {
+		return "", s != ""
 	}
-	return s[:max]
+	if len(s) <= max {
+		return s, false
+	}
+	rs := []rune(s)
+	if len(rs) <= max {
+		return s, false
+	}
+	return string(rs[:max]), true
 }
 
 func truncateStr(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max]
+	return TruncateText(s, max)
 }
 
 func mathMin(a, b int) int {
@@ -1459,4 +1584,18 @@ type BaseRef struct {
 	Name    string
 	Path    string
 	Enabled bool
+}
+
+func tableExistsDB(ctx context.Context, db *sql.DB, name string) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?`, name).Scan(&count)
+	return count > 0, err
+}
+
+func tableExistsTx(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
+	var count int
+	err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?`, name).Scan(&count)
+	return count > 0, err
 }

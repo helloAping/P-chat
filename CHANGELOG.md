@@ -8,6 +8,13 @@
 
 ## 已完成 ✅
 
+### v1.0.13.beta — 多环境运行隔离
+- dev / prod 由 data home 派生独立 runtime profile，可同时打开各自 GUI
+- GUI 单实例 mutex、托盘窗口、WebView2 状态、日志、配置和会话按 profile 隔离
+- server 原子绑定 `15150-15159` 或 OS 临时端口，父进程通过 profile/instance/PID 双重握手确认后端
+- 开发任务显式使用 `dev-bin/.p-chat`，重建只停止当前仓库 `dev-bin/` 进程
+- 前端 API 使用运行时动态后端地址，不再依赖固定 Vite 代理端口
+
 ### v0.1.0 — 基础架构
 - Go 1.22+ 项目, `go mod` + Cobra CLI
 - 三种风格人格 (可爱/古风/科技) 完整实现
@@ -900,4 +907,3 @@ frontend/src/stores/chat.ts                           +250
 - 新增 `tool.Registry.sources` map（built-in 工具永远不写）—— 对外 API 行为不变
 - P3-2 YAML 错误隔离：单个坏 YAML 只 log warn，不影响其他 dynamic / built-in 工具
 - 向后兼容：旧 client 不发 `X-Trace-Id` 也可工作，错误气泡的 trace chip 仅在用户带 id 时显示
-

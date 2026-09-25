@@ -25,10 +25,10 @@ import { computed, h, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from
 import {
   NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
   NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree,
-  NRadioGroup, NRadioButton, useMessage,
+  NRadioGroup, NRadioButton, NCheckbox, NCheckboxGroup, useMessage,
 } from 'naive-ui'
 import {
-  X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash,
+  X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash, Folder,
   Cpu, Activity, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
   MessageSquare,
 } from './icons'
@@ -38,7 +38,19 @@ import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
 import IMSettings from './IMSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
+import KnowledgeRecallPreview from './KnowledgeRecallPreview.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
+import AppModal from './AppModal.vue'
+import ProviderHeadersEditor from './ProviderHeadersEditor.vue'
+import {
+  byteSizeInputMinimum,
+  byteSizeInputStep,
+  byteSizeUnitOptions,
+  bytesToUnitValue,
+  preferredByteSizeUnit,
+  unitValueToBytes,
+  type ByteSizeUnit,
+} from '../utils/byteSize'
 
 const message = useMessage()
 
@@ -189,21 +201,22 @@ const show = ref(true)
 // content — the rest of the layout picks it up
 // automatically.
 const settingsTabs = [
-  { name: 'providers', label: 'LLM 提供商',  icon: Cpu,      description: 'API key 与模型管理' },
-  { name: 'styles',    label: '风格',          icon: Palette,  description: '人格与记忆模板' },
-  { name: 'system',    label: '系统',          icon: SettingsIcon, description: '限额、子代理、行为' },
-  { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话' },
-  { name: 'skills',    label: '技能',          icon: Wrench,   description: '可加载的技能包' },
-  { name: 'mcp',       label: 'MCP',           icon: Terminal, description: 'Model Context Protocol 服务器' },
-  { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索' },
-  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商' },
-  { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制' },
-  { name: 'im',        label: 'IM 桥接',      icon: MessageSquare, description: '飞书 / Telegram / 企微 / QQ / 微信' },
-  { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照' },
+  { name: 'providers', label: 'LLM 提供商',  icon: Cpu,      description: 'API key 与模型管理', group: '对话' },
+  { name: 'styles',    label: '风格',          icon: Palette,  description: '人格与记忆模板', group: '对话' },
+  { name: 'system',    label: '系统',          icon: SettingsIcon, description: '限额、子代理、行为', group: '对话' },
+  { name: 'skills',    label: '技能',          icon: Wrench,   description: '可加载的技能包', group: '能力' },
+  { name: 'mcp',       label: 'MCP',           icon: Terminal, description: 'Model Context Protocol 服务器', group: '能力' },
+  { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索', group: '能力' },
+  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商', group: '能力' },
+  { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制', group: '能力' },
+  { name: 'im',        label: 'IM 桥接',      icon: MessageSquare, description: '飞书 / Telegram / 企微 / QQ / 微信', group: '能力' },
+  { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话', group: '数据' },
+  { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照', group: '数据' },
 ]
 
 // --- Provider state ---
 const providers = ref<api.ProviderInfo[]>([])
+const providerPresets = ref<api.ProviderPreset[]>([])
 const selectedName = ref<string | null>(null)
 const selected = computed(() =>
   providers.value.find(p => p.name === selectedName.value) || null,
@@ -211,9 +224,13 @@ const selected = computed(() =>
 
 // Edit form (top of right pane). Mirrors the unified PATCH body.
 const editName = ref('')
-const editProtocol = ref<'openai' | 'anthropic'>('openai')
+const editProviderID = ref('custom')
+const editStrategyVariant = ref('')
+const editProtocol = ref<api.ProviderProtocol>('openai_chat')
 const editBaseURL = ref('')
 const editAPIKey = ref('')
+type ProviderHeaderRow = { id: string; name: string; value: string }
+const editCustomHeaders = ref<ProviderHeaderRow[]>([])
 const editIsDefault = ref(false)
 
 // Track which fields the user actually touched so we only PATCH
@@ -225,13 +242,56 @@ const dirty = ref<Set<string>>(new Set())
 // Add-provider form (shown in NModal)
 const showAddProvider = ref(false)
 const newName = ref('')
-const newProtocol = ref<'openai' | 'anthropic'>('openai')
+const newProviderID = ref('custom')
+const newStrategyVariant = ref('')
+const newProtocol = ref<api.ProviderProtocol>('openai_chat')
 const newBaseURL = ref('')
 const newAPIKey = ref('')
+const newCustomHeaders = ref<ProviderHeaderRow[]>([])
 const newModel = ref('')
-const probingModels = ref(false)
-const probeModelOptions = ref<{ label: string; value: string }[]>([])
-const probeModelsError = ref('')
+
+let providerHeaderRowSequence = 0
+const providerHeaderNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+const providerHeaderPlaceholders = new Set([
+  'conversation_id', 'session_id', 'message_id', 'trace_id',
+  'uuid', 'snowflake_id', 'timestamp', 'timestamp_ms',
+])
+const providerReservedHeaders = new Set([
+  'connection', 'content-length', 'host', 'keep-alive', 'proxy-authenticate',
+  'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade',
+])
+
+function providerHeadersToRows(headers?: Record<string, string>): ProviderHeaderRow[] {
+  return Object.entries(headers || {}).map(([name, value]) => {
+    providerHeaderRowSequence += 1
+    return { id: `provider-header-form-${providerHeaderRowSequence}`, name, value }
+  })
+}
+
+function providerHeaderRowsToRecord(rows: ProviderHeaderRow[]): Record<string, string> {
+  if (rows.length > 32) throw new Error('自定义请求头最多支持 32 项')
+  const headers: Record<string, string> = {}
+  const names = new Set<string>()
+  for (const row of rows) {
+    const name = row.name.trim()
+    if (!name && !row.value) continue
+    if (!name) throw new Error('请求头名称不能为空')
+    if (!providerHeaderNamePattern.test(name)) throw new Error(`请求头名称格式无效: ${name}`)
+    const normalizedName = name.toLowerCase()
+    if (providerReservedHeaders.has(normalizedName)) throw new Error(`请求头由 HTTP 传输层管理，不能自定义: ${name}`)
+    if (names.has(normalizedName)) throw new Error(`请求头名称重复: ${name}`)
+    names.add(normalizedName)
+    if (/[\r\n]/.test(row.value)) throw new Error(`请求头值不能换行: ${name}`)
+    if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(row.value)) throw new Error(`请求头值包含控制字符: ${name}`)
+    for (const match of row.value.matchAll(/\{\{([^{}]+)\}\}/g)) {
+      if (!providerHeaderPlaceholders.has(match[1])) throw new Error(`不支持的动态参数: ${match[0]}`)
+    }
+    const withoutTemplates = row.value.replace(/\{\{([^{}]+)\}\}/g, '')
+    if (withoutTemplates.includes('{{') || withoutTemplates.includes('}}')) throw new Error(`动态参数格式不完整: ${name}`)
+    headers[name] = row.value
+  }
+  return headers
+}
 
 // Add/edit model form (shown in NModal)
 const showAddModel = ref(false)
@@ -247,16 +307,460 @@ const showAddModel = ref(false)
 // unused `editModel*` family).
 const editingModelName = ref<string | null>(null)
 const editModelName = ref('')
+const editModelAPIEndpoint = ref('')
 const editModelDisplay = ref('')
 const editModelCtx = ref<number | null>(null)
 const editModelOut = ref<number | null>(null)
-const editModelVision = ref(false)
+const editModelCapabilities = ref<api.MediaKind[]>([])
+const editModelType = ref<api.ModelType>('llm')
+const editGenerationOperations = ref<api.GenerationOperation[]>([])
+const editGenerationOperationAPIs = ref<Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>>>({})
+type CapabilityOption<T extends string> = { label: string; value: T; hint: string }
+const generationOperationDefs: Array<{ operation: api.GenerationOperation; label: string; hint: string }> = [
+  { operation: 'text_to_image', label: '文生图', hint: '仅使用文本提示词生成图片' },
+  { operation: 'image_to_image', label: '图生图', hint: '使用上传图片 ID 作为参考图' },
+  { operation: 'text_to_video', label: '文生视频', hint: '仅使用文本提示词生成视频' },
+  { operation: 'image_to_video', label: '图生视频', hint: '使用上传图片 ID 生成视频' },
+  { operation: 'video_to_video', label: '视频生视频', hint: '使用上传视频 ID 进行转换' },
+  { operation: 'text_to_speech', label: '文本转语音', hint: '将文本合成为语音' },
+  { operation: 'text_to_music', label: '文生音乐', hint: '使用描述生成音乐' },
+  { operation: 'text_to_sound', label: '文生音效', hint: '使用描述生成音效' },
+  { operation: 'audio_to_audio', label: '音频生音频', hint: '使用上传音频 ID 进行转换' },
+]
+const generationOperationOptions: Array<CapabilityOption<api.GenerationOperation>> = generationOperationDefs.map(item => ({
+  label: item.label,
+  value: item.operation,
+  hint: item.hint,
+}))
 
-// Upstream models
+function emptyGenerationAPIConfig(): api.GenerationOperationConfig {
+  return defaultGenerationAPIConfig([])
+}
+
+function isCompleteHTTPURL(value: string | undefined): boolean {
+  try {
+    const parsed = new URL((value || '').trim())
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function defaultLLMAPIEndpoint(protocol = selected.value?.protocol): string {
+  const normalized = normalizeProviderProtocol(protocol)
+  if (normalized === 'anthropic_messages') return '/messages'
+  if (normalized === 'openai_responses') return '/responses'
+  return '/chat/completions'
+}
+
+function normalizeProviderProtocol(protocol?: string): api.ProviderProtocol {
+  if (protocol === 'anthropic' || protocol === 'anthropic_messages') return 'anthropic_messages'
+  if (protocol === 'openai_responses') return 'openai_responses'
+  return 'openai_chat'
+}
+
+function isAnthropicProtocol(protocol?: string): boolean {
+  return normalizeProviderProtocol(protocol) === 'anthropic_messages'
+}
+
+function normalizeProviderID(providerID?: string): string {
+  return (providerID || '').trim().toLowerCase() || 'custom'
+}
+
+function normalizeStrategyVariant(variant?: string): string {
+  return (variant || '').trim().toLowerCase()
+}
+
+function providerPresetByID(providerID?: string): api.ProviderPreset | undefined {
+  const normalized = normalizeProviderID(providerID)
+  return providerPresets.value.find(preset => preset.id === normalized)
+}
+
+function providerDisplayName(providerID?: string): string {
+  const normalized = normalizeProviderID(providerID)
+  return providerPresetByID(normalized)?.display_name || normalized
+}
+
+function providerVariantDisplayName(providerID?: string, variant?: string): string {
+  const normalized = normalizeStrategyVariant(variant)
+  if (!normalized) return ''
+  return providerPresetByID(providerID)?.variants?.find(item => item.id === normalized)?.display_name || normalized
+}
+
+function providerVariantPreset(providerID?: string, variant?: string): api.ProviderStrategyVariant | undefined {
+  const normalized = normalizeStrategyVariant(variant) || defaultVariantForProvider(providerID)
+  if (!normalized) return undefined
+  return providerPresetByID(providerID)?.variants?.find(item => item.id === normalized)
+}
+
+function protocolDisplayName(providerID: string | undefined, protocol: api.ProviderProtocol): string {
+  const normalized = normalizeProviderProtocol(protocol)
+  return providerPresetByID(providerID)?.protocols.find(item => item.id === normalized)?.display_name
+    || protocolOptions.find(item => item.value === normalized)?.label
+    || normalized
+}
+
+function defaultVariantForProvider(providerID?: string): string {
+  const preset = providerPresetByID(providerID)
+  return normalizeStrategyVariant(preset?.default_variant)
+}
+
+function protocolPresetFor(providerID: string, protocol: api.ProviderProtocol): api.ProviderProtocolPreset | undefined {
+  const normalized = normalizeProviderProtocol(protocol)
+  return providerPresetByID(providerID)?.protocols.find(item => item.id === normalized)
+}
+
+function endpointDefaultsForSelectedProvider(): api.ProviderEndpointDefaults | undefined {
+  const providerID = normalizeProviderID(selected.value?.provider_id)
+  const protocol = normalizeProviderProtocol(selected.value?.protocol)
+  return protocolPresetFor(providerID, protocol)?.endpoint_defaults
+}
+
+function generationOutputKind(operation: api.GenerationOperation): api.MediaKind {
+  if (operation === 'text_to_video' || operation === 'image_to_video' || operation === 'video_to_video') return 'video'
+  if (operation === 'text_to_speech' || operation === 'text_to_music' || operation === 'text_to_sound' || operation === 'audio_to_audio') return 'audio'
+  return 'image'
+}
+
+function primaryGenerationKind(operations: api.GenerationOperation[]): api.MediaKind {
+  if (operations.some(operation => generationOutputKind(operation) === 'video')) return 'video'
+  if (operations.some(operation => generationOutputKind(operation) === 'audio')) return 'audio'
+  return 'image'
+}
+
+function defaultGenerationEndpoint(kind: api.MediaKind): string {
+  const defaults = endpointDefaultsForSelectedProvider()
+  if (kind === 'video' && defaults?.video_generation) return defaults.video_generation
+  if (kind === 'audio' && defaults?.audio_generation) return defaults.audio_generation
+  if (defaults?.image_generation) return defaults.image_generation
+  const protocol = normalizeProviderProtocol(selected.value?.protocol)
+  if (protocol === 'anthropic_messages') return '/messages'
+  if (protocol === 'openai_responses') return '/responses'
+  if (kind === 'video') return '/videos/generations'
+  if (kind === 'audio') return '/audio/speech'
+  return '/images/generations'
+}
+
+function defaultGenerationQueryEndpoint(kind: api.MediaKind): string {
+  const defaults = endpointDefaultsForSelectedProvider()
+  if (kind === 'video') return defaults?.video_task_query || ''
+  if (kind === 'audio') return defaults?.audio_task_query || ''
+  return defaults?.image_task_query || ''
+}
+
+function defaultGenerationTimeout(kind: api.MediaKind): number {
+  if (kind === 'video') return 600
+  if (kind === 'audio') return 180
+  return 120
+}
+
+function defaultGenerationAPIConfig(operations: api.GenerationOperation[] = editGenerationOperations.value): api.GenerationOperationConfig {
+  const kind = primaryGenerationKind(operations)
+  return {
+    endpoint: defaultGenerationEndpoint(kind),
+    query_endpoint: defaultGenerationQueryEndpoint(kind),
+    timeout_seconds: defaultGenerationTimeout(kind),
+    default_params: {},
+  }
+}
+
+function generationOperationLabel(operation: api.GenerationOperation): string {
+  return generationOperationDefs.find(item => item.operation === operation)?.label || operation
+}
+
+function operationDefaultAPIConfig(operation: api.GenerationOperation): api.GenerationOperationConfig {
+  return defaultGenerationAPIConfig([operation])
+}
+
+function normalizeGenerationAPIConfigForSave(config?: api.GenerationOperationConfig): api.GenerationOperationConfig {
+  const endpoint = normalizeEndpointSuffix(config?.endpoint)
+  const queryEndpoint = normalizeEndpointSuffix(config?.query_endpoint)
+  const timeoutSeconds = config?.timeout_seconds || 0
+  const defaultParams = config?.default_params || {}
+  return {
+    endpoint: endpoint || undefined,
+    query_endpoint: queryEndpoint || undefined,
+    timeout_seconds: timeoutSeconds || undefined,
+    default_params: Object.keys(defaultParams).length ? defaultParams : undefined,
+  }
+}
+
+function generationAPIConfigHasValue(config?: api.GenerationOperationConfig): boolean {
+  if (!config) return false
+  return !!(
+    config.endpoint?.trim()
+    || config.query_endpoint?.trim()
+    || (config.timeout_seconds && config.timeout_seconds > 0)
+    || Object.keys(config.default_params || {}).length
+  )
+}
+
+function generationAPIConfigEquals(a?: api.GenerationOperationConfig, b?: api.GenerationOperationConfig): boolean {
+  const left = normalizeGenerationAPIConfigForSave(a)
+  const right = normalizeGenerationAPIConfigForSave(b)
+  return (left.endpoint || '') === (right.endpoint || '')
+    && (left.query_endpoint || '') === (right.query_endpoint || '')
+    && (left.timeout_seconds || 0) === (right.timeout_seconds || 0)
+}
+
+function generationOperationDefaultDiffersFromShared(operation: api.GenerationOperation): boolean {
+  return !generationAPIConfigEquals(operationDefaultAPIConfig(operation), editGenerationAPI.value)
+}
+
+function normalizeGenerationOperationOverride(operation: api.GenerationOperation): api.GenerationOperationConfig {
+  const normalized = normalizeGenerationAPIConfigForSave(editGenerationOperationAPIs.value[operation])
+  return generationAPIConfigHasValue(normalized) ? normalized : {}
+}
+
+function updateGenerationOperationAPI(
+  operation: api.GenerationOperation,
+  patch: Partial<api.GenerationOperationConfig>,
+) {
+  const current = editGenerationOperationAPIs.value[operation] || {}
+  const next: api.GenerationOperationConfig = { ...current, ...patch }
+  if (!generationAPIConfigHasValue(next)) {
+    const { [operation]: _removed, ...rest } = editGenerationOperationAPIs.value
+    editGenerationOperationAPIs.value = rest
+    return
+  }
+  editGenerationOperationAPIs.value = {
+    ...editGenerationOperationAPIs.value,
+    [operation]: next,
+  }
+}
+
+function resetGenerationOperationAPI(operation: api.GenerationOperation) {
+  const { [operation]: _removed, ...rest } = editGenerationOperationAPIs.value
+  editGenerationOperationAPIs.value = rest
+}
+
+function syncGenerationOperationAPIOverrides(force = false) {
+  const selectedOperations = new Set(editGenerationOperations.value)
+  const next: Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>> = {}
+  for (const operation of editGenerationOperations.value) {
+    const existing = editGenerationOperationAPIs.value[operation]
+    const defaultForOperation = operationDefaultAPIConfig(operation)
+    if (existing && generationAPIConfigHasValue(existing) && !force) {
+      next[operation] = existing
+      continue
+    }
+    if (generationOperationDefaultDiffersFromShared(operation) && selectedOperations.has(operation)) {
+      next[operation] = { ...defaultForOperation }
+    }
+  }
+  editGenerationOperationAPIs.value = next
+}
+
+function knownGenerationEndpointDefaults(): string[] {
+  const out = new Set(['/images/generations', '/videos/generations', '/audio/speech', '/responses', '/messages'])
+  for (const preset of providerPresets.value) {
+    for (const protocol of preset.protocols) {
+      const defaults = protocol.endpoint_defaults
+      for (const endpoint of [
+        defaults.image_generation,
+        defaults.video_generation,
+        defaults.audio_generation,
+        defaults.image_task_query,
+        defaults.video_task_query,
+        defaults.audio_task_query,
+      ]) {
+        if (endpoint) out.add(normalizeEndpointSuffix(endpoint))
+      }
+    }
+  }
+  return [...out]
+}
+
+function isKnownGenerationEndpoint(value: string | undefined): boolean {
+  const endpoint = normalizeEndpointSuffix(value)
+  if (!endpoint) return true
+  return knownGenerationEndpointDefaults().includes(endpoint)
+}
+
+function syncGenerationAPIWithDefaults(force = false) {
+  const defaults = defaultGenerationAPIConfig(editGenerationOperations.value)
+  if (force || !editGenerationAPI.value.endpoint?.trim() || isKnownGenerationEndpoint(editGenerationAPI.value.endpoint)) {
+    editGenerationAPI.value.endpoint = defaults.endpoint
+  }
+  if (force || !editGenerationAPI.value.query_endpoint?.trim() || isKnownGenerationEndpoint(editGenerationAPI.value.query_endpoint)) {
+    editGenerationAPI.value.query_endpoint = defaults.query_endpoint
+  }
+  const timeout = editGenerationAPI.value.timeout_seconds || 0
+  if (force || timeout <= 0 || [120, 180, 600].includes(timeout)) {
+    editGenerationAPI.value.timeout_seconds = defaults.timeout_seconds
+  }
+  syncGenerationOperationAPIOverrides()
+}
+
+function firstProtocolForProvider(providerID?: string): api.ProviderProtocol {
+  const preset = providerPresetByID(providerID)
+  return normalizeProviderProtocol(preset?.protocols.find(item => !item.disabled_reason)?.id)
+}
+
+function defaultBaseURLFor(providerID: string, protocol: api.ProviderProtocol, variant?: string): string {
+  const normalizedProtocol = normalizeProviderProtocol(protocol)
+  const variantBaseURL = providerVariantPreset(providerID, variant)?.default_base_urls?.[normalizedProtocol]
+  if (variantBaseURL) return variantBaseURL
+  return protocolPresetFor(providerID, protocol)?.default_base_url || ''
+}
+
+function providerProtocolOptions(providerID?: string) {
+  const preset = providerPresetByID(providerID)
+  if (!preset) return protocolOptions
+  return preset.protocols.map(item => ({
+    label: item.display_name,
+    value: item.id,
+    disabled: !!item.disabled_reason,
+  }))
+}
+
+function providerVariantOptions(providerID?: string) {
+  return (providerPresetByID(providerID)?.variants || []).map(item => ({
+    label: item.display_name,
+    value: item.id,
+  }))
+}
+
+function normalizeEndpointSuffix(value: string | undefined): string {
+  const endpoint = (value || '').trim()
+  if (!endpoint) return ''
+  return `/${endpoint.replace(/^\/+/, '')}`
+}
+
+function isEndpointSuffix(value: string | undefined, required = true): boolean {
+  const endpoint = (value || '').trim()
+  if (!endpoint) return !required
+  if (/^[a-z][a-z\d+.-]*:/i.test(endpoint) || endpoint.startsWith('//')) return false
+  return !endpoint.includes('#')
+}
+
+function hasTaskIDPlaceholder(value: string | undefined): boolean {
+  const endpoint = (value || '').trim()
+  return endpoint.includes('{task_id}') || endpoint.includes('{id}')
+}
+
+function taskCollectionEndpoint(value: string | undefined): string {
+  const endpoint = normalizeEndpointSuffix(value)
+  const indexes = ['{task_id}', '{id}']
+    .map(placeholder => endpoint.indexOf(placeholder))
+    .filter(index => index >= 0)
+  if (indexes.length === 0) return ''
+  return endpoint.slice(0, Math.min(...indexes)).replace(/\/+$/, '')
+}
+
+function completeEndpointPreview(endpointValue: string | undefined): string {
+  const baseURL = (selected.value?.base_url || selected.value?.api_url || '').replace(/\/+$/, '')
+  const endpoint = normalizeEndpointSuffix(endpointValue)
+  return baseURL && endpoint ? `${baseURL}${endpoint}` : ''
+}
+
+const editGenerationAPI = ref<api.GenerationOperationConfig>(emptyGenerationAPIConfig())
+const modelEndpointPreview = computed(() => completeEndpointPreview(editModelAPIEndpoint.value))
+const generationEndpointPreview = computed(() => completeEndpointPreview(editGenerationAPI.value.endpoint))
+const generationQueryEndpointPreview = computed(() => completeEndpointPreview(editGenerationAPI.value.query_endpoint))
+const generationEndpointConsistencyWarning = computed(() => {
+  const createEndpoint = normalizeEndpointSuffix(editGenerationAPI.value.endpoint).replace(/\/+$/, '')
+  const taskCollection = taskCollectionEndpoint(editGenerationAPI.value.query_endpoint)
+  if (!createEndpoint || !taskCollection || taskCollection === createEndpoint) return ''
+  if (!taskCollection.startsWith(`${createEndpoint}/`)) return ''
+  return `创建端点可能缺少任务集合路径；按当前查询端点，请确认是否应填写 ${taskCollection}`
+})
+
+const modelTypeOptions = [
+  { label: '大语言模型', value: 'llm' },
+  { label: '媒体生成模型', value: 'media_generation' },
+]
+
+function buildMediaGenerationConfig(): api.MediaGenerationModelConfig {
+  const operations: Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>> = {}
+  for (const operation of editGenerationOperations.value) {
+    operations[operation] = normalizeGenerationOperationOverride(operation)
+  }
+  const sharedAPI = normalizeGenerationAPIConfigForSave(editGenerationAPI.value)
+  return {
+    api: {
+      endpoint: sharedAPI.endpoint,
+      query_endpoint: sharedAPI.query_endpoint,
+      timeout_seconds: sharedAPI.timeout_seconds || 600,
+      default_params: sharedAPI.default_params || {},
+    },
+    operations,
+  }
+}
+
+function validateGenerationAPIConfig(
+  label: string,
+  config: api.GenerationOperationConfig,
+  endpointRequired: boolean,
+): boolean {
+  if (!isEndpointSuffix(config.endpoint, endpointRequired)) {
+    message.warning(`${label} API 端点只能填写相对于 Base URL 的路径后缀`)
+    return false
+  }
+  if (!isEndpointSuffix(config.query_endpoint, false)) {
+    message.warning(`${label} 查询端点只能填写相对于 Base URL 的路径后缀`)
+    return false
+  }
+  if (config.query_endpoint?.trim() && !hasTaskIDPlaceholder(config.query_endpoint)) {
+    message.warning(`${label} 异步查询端点必须包含 {task_id} 或 {id} 占位符`)
+    return false
+  }
+  return true
+}
+
+function validateMediaGenerationForm(): boolean {
+  if (editGenerationOperations.value.length === 0) {
+    message.warning('媒体生成模型至少需要选择一种生成能力')
+    return false
+  }
+  if (!validateGenerationAPIConfig('媒体生成', editGenerationAPI.value, true)) {
+    return false
+  }
+  for (const operation of editGenerationOperations.value) {
+    const override = editGenerationOperationAPIs.value[operation]
+    if (!override || !generationAPIConfigHasValue(override)) continue
+    if (!validateGenerationAPIConfig(generationOperationLabel(operation), override, false)) {
+      return false
+    }
+  }
+  return true
+}
+
+const contextWindowOptions = [
+  { label: '32K', value: 32_000 },
+  { label: '64K', value: 64_000 },
+  { label: '128K', value: 128_000 },
+  { label: '200K', value: 200_000 },
+  { label: '256K', value: 256_000 },
+  { label: '512K', value: 512_000 },
+  { label: '1M', value: 1_000_000 },
+  { label: '2M', value: 2_000_000 },
+]
+const modelCapabilityOptions: Array<CapabilityOption<api.MediaKind>> = [
+  { label: '图片识别', value: 'image', hint: '支持图片、截图等视觉输入' },
+  { label: '视频识别', value: 'video', hint: '支持视频帧或视频文件输入' },
+  { label: '音频识别', value: 'audio', hint: '支持语音、音频文件输入' },
+]
+
+function modelSupportsCapability(model: api.ModelInfo, capability: api.MediaKind): boolean {
+  const configured = model.capabilities?.input_modalities
+  if (configured !== undefined) return configured.includes(capability)
+  if (capability === 'image') return !!model.capabilities?.supports_vision
+  if (capability === 'audio') return !!model.capabilities?.supports_audio
+  return false
+}
+
+const testingTarget = ref<string | null>(null)
+
+// Models discovered from the selected provider's BaseURL + /models.
 const showUpstreamModels = ref(false)
 const upstreamModels = ref<api.UpstreamModelItem[]>([])
 const fetchingUpstream = ref(false)
 const upstreamError = ref('')
+const upstreamSource = ref('')
+const upstreamEndpoint = ref('')
+const upstreamBaseURL = ref('')
+const upstreamDefaultEndpoint = ref('')
 
 // --- Style state ---
 const styles = ref<api.StyleInfo[]>([])
@@ -283,12 +787,34 @@ const sysSubAgent = ref<api.SubAgentConfig>({
   cache_ttl: '',
   timeout: '',
 })
-const sysVision = ref<api.VisionRecognitionConfig>({
-  enabled: false,
-  provider: '',
-  model: '',
-  timeout_seconds: 60,
-  max_image_bytes: 10 * 1024 * 1024,
+
+function normalizeSubAgentConfig(sa?: Partial<api.SubAgentConfig>): api.SubAgentConfig {
+  const raw = (sa || {}) as any
+  return {
+    cache_ttl: raw.cache_ttl || '',
+    timeout: raw.timeout || '',
+  }
+}
+function defaultRecognitionRoute(): api.RecognitionRouteConfig {
+  return { enabled: false, provider: '', model: '', timeout_seconds: 60, max_bytes: 10 * 1024 * 1024, available: false }
+}
+
+const recognitionCapabilityDefs: Array<{ kind: api.MediaKind; label: string; hint: string }> = [
+  { kind: 'image', label: '图片识别', hint: '分析截图、照片和图像附件' },
+  { kind: 'video', label: '视频识别', hint: '分析视频画面与时序内容' },
+  { kind: 'audio', label: '音频识别', hint: '分析语音、录音和音频附件' },
+]
+const sysRecognition = ref<Record<api.MediaKind, api.RecognitionRouteConfig>>({
+  image: defaultRecognitionRoute(),
+  video: defaultRecognitionRoute(),
+  audio: defaultRecognitionRoute(),
+})
+const sysGenerationDefaults = ref<Partial<Record<api.GenerationOperation, api.GenerationModelTarget>>>({})
+const sysGenerationRequireConfirm = ref(false)
+const sysRecognitionSizeUnits = ref<Record<api.MediaKind, ByteSizeUnit>>({
+  image: 'MB',
+  video: 'MB',
+  audio: 'MB',
 })
 const sysWorkMode = ref('coding')
 const sysCloseBehavior = ref<'exit' | 'tray'>('exit')
@@ -299,27 +825,91 @@ function normalizeCloseBehavior(v?: string): 'exit' | 'tray' {
   return v === 'tray' ? 'tray' : 'exit'
 }
 
+function syncRecognitionSizeUnits() {
+  for (const kind of ['image', 'video', 'audio'] as api.MediaKind[]) {
+    sysRecognitionSizeUnits.value[kind] = preferredByteSizeUnit(sysRecognition.value[kind].max_bytes)
+  }
+}
+
+function recognitionSizeValue(kind: api.MediaKind): number {
+  return bytesToUnitValue(sysRecognition.value[kind].max_bytes, sysRecognitionSizeUnits.value[kind])
+}
+
+function onRecognitionSizeUpdate(kind: api.MediaKind, value: number | null) {
+  if (value === null) return
+  sysRecognition.value[kind].max_bytes = unitValueToBytes(value, sysRecognitionSizeUnits.value[kind])
+  markSysDirty()
+}
+
+function onRecognitionSizeUnitUpdate(kind: api.MediaKind, unit: ByteSizeUnit) {
+  sysRecognitionSizeUnits.value[kind] = unit
+}
+
+function generationTargetKey(target?: api.GenerationModelTarget): string | null {
+  return target?.provider && target?.model ? `${target.provider}\u0000${target.model}` : null
+}
+
+function generationDefaultOptions(operation: api.GenerationOperation) {
+  const options: Array<{ label: string; value: string }> = []
+  for (const provider of providers.value) {
+    for (const model of provider.models || []) {
+      if ((model.type || 'llm') !== 'media_generation' || !model.generation?.operations?.[operation]) continue
+      options.push({
+        label: `${provider.name} / ${model.display_name || model.name}`,
+        value: `${provider.name}\u0000${model.name}`,
+      })
+    }
+  }
+  return options
+}
+
+function onGenerationDefaultUpdate(operation: api.GenerationOperation, value: string | null) {
+  if (!value) {
+    delete sysGenerationDefaults.value[operation]
+  } else {
+    const [provider, model] = value.split('\u0000')
+    sysGenerationDefaults.value[operation] = { provider, model }
+  }
+  markSysDirty()
+}
+
 async function loadSystemConfig() {
   try {
     const sc = await api.getSystemConfig()
     sysLimits.value = sc.limits
-    sysSubAgent.value = sc.sub_agent
-    sysVision.value = sc.vision_recognition || {
-      enabled: false,
-      provider: '',
-      model: '',
-      timeout_seconds: 60,
-      max_image_bytes: 10 * 1024 * 1024,
+    sysSubAgent.value = normalizeSubAgentConfig(sc.sub_agent)
+    const legacyVision = sc.vision_recognition
+    const routes = sc.recognition?.routes
+    sysRecognition.value = {
+      image: routes?.image || (legacyVision ? {
+        enabled: legacyVision.enabled,
+        provider: legacyVision.provider,
+        model: legacyVision.model,
+        timeout_seconds: legacyVision.timeout_seconds,
+        max_bytes: legacyVision.max_image_bytes,
+        available: legacyVision.enabled && !!legacyVision.provider && !!legacyVision.model,
+      } : defaultRecognitionRoute()),
+      video: routes?.video || defaultRecognitionRoute(),
+      audio: routes?.audio || defaultRecognitionRoute(),
     }
+    sysGenerationDefaults.value = { ...(sc.generation?.defaults || {}) }
+    sysGenerationRequireConfirm.value = !!sc.generation?.require_confirm
+    syncRecognitionSizeUnits()
     sysWorkMode.value = sc.work_mode?.default || 'coding'
     sysCloseBehavior.value = normalizeCloseBehavior(sc.ui?.close_behavior)
     chatState.globalWorkMode = sysWorkMode.value
-    chatState.visionRecognitionEnabled = !!sysVision.value.enabled
+    chatState.recognitionCapabilitiesAvailable = (['image', 'video', 'audio'] as api.MediaKind[])
+      .filter(kind => !!sysRecognition.value[kind].available)
+    chatState.visionRecognitionEnabled = chatState.recognitionCapabilitiesAvailable.includes('image')
     sysDirty.value = false
   } catch { /* ignore */ }
 }
 
 function markSysDirty() { sysDirty.value = true }
+
+function notifyGenerationConfigChanged() {
+  chatState.generationConfigVersion += 1
+}
 
 async function saveSystemConfig() {
   sysSaving.value = true
@@ -343,22 +933,32 @@ async function saveSystemConfig() {
     patch.sub_agent = sa
     patch.work_mode = { default: sysWorkMode.value }
     patch.ui = { close_behavior: sysCloseBehavior.value }
-    patch.vision_recognition = {
-      enabled: sysVision.value.enabled,
-      provider: sysVision.value.provider,
-      model: sysVision.value.model,
-      timeout_seconds: sysVision.value.timeout_seconds,
-      max_image_bytes: sysVision.value.max_image_bytes,
+    patch.recognition = { routes: sysRecognition.value }
+    const generationDefaults = Object.fromEntries(generationOperationDefs.map(({ operation }) => [
+      operation,
+      sysGenerationDefaults.value[operation] || { provider: '', model: '' },
+    ]))
+    patch.generation = {
+      defaults: generationDefaults,
+      require_confirm: sysGenerationRequireConfirm.value,
     }
 
     const updated = await api.updateSystemConfig(patch)
     chatState.globalWorkMode = updated.work_mode?.default || sysWorkMode.value
     sysCloseBehavior.value = normalizeCloseBehavior(updated.ui?.close_behavior)
-    if (updated.vision_recognition) {
-      sysVision.value = updated.vision_recognition
-      chatState.visionRecognitionEnabled = !!updated.vision_recognition.enabled
+    if (updated.sub_agent) {
+      sysSubAgent.value = normalizeSubAgentConfig(updated.sub_agent)
     }
+    if (updated.recognition?.routes) {
+      sysRecognition.value = updated.recognition.routes
+      chatState.recognitionCapabilitiesAvailable = (['image', 'video', 'audio'] as api.MediaKind[])
+        .filter(kind => !!updated.recognition.routes[kind]?.available)
+      chatState.visionRecognitionEnabled = chatState.recognitionCapabilitiesAvailable.includes('image')
+    }
+    sysGenerationDefaults.value = { ...(updated.generation?.defaults || {}) }
+    sysGenerationRequireConfirm.value = !!updated.generation?.require_confirm
     sysDirty.value = false
+    notifyGenerationConfigChanged()
     message.success('系统配置已保存')
   } catch (e: any) {
     message.error('保存失败: ' + (e?.message || e))
@@ -378,14 +978,15 @@ function resetSystemConfig() {
     todo_long_run_mode: 'adaptive',
     max_stored_messages: 0,
   }
-  sysSubAgent.value = { cache_ttl: '', timeout: '' }
-  sysVision.value = {
-    enabled: false,
-    provider: '',
-    model: '',
-    timeout_seconds: 60,
-    max_image_bytes: 10 * 1024 * 1024,
+  sysSubAgent.value = normalizeSubAgentConfig()
+  sysRecognition.value = {
+    image: defaultRecognitionRoute(),
+    video: defaultRecognitionRoute(),
+    audio: defaultRecognitionRoute(),
   }
+  sysRecognitionSizeUnits.value = { image: 'MB', video: 'MB', audio: 'MB' }
+  sysGenerationDefaults.value = {}
+  sysGenerationRequireConfirm.value = false
   sysWorkMode.value = 'coding'
   sysCloseBehavior.value = 'exit'
   sysDirty.value = true
@@ -415,7 +1016,17 @@ watch(tab, (v) => {
 })
 
 async function refresh() {
-  await Promise.all([refreshProviders(), refreshStyles()])
+  await Promise.all([refreshProviderPresets(), refreshProviders(), refreshStyles()])
+}
+
+async function refreshProviderPresets() {
+  try {
+    const result = await api.fetchProviderPresets()
+    providerPresets.value = result.presets || []
+  } catch (e: any) {
+    providerPresets.value = []
+    message.warning(`加载供应商类型失败，将按 Custom 配置: ${e.message}`)
+  }
 }
 
 async function refreshProviders() {
@@ -451,11 +1062,10 @@ async function refreshStyles() {
 }
 
 // selectProvider switches the right pane to `name`. The
-// slim list endpoint doesn't carry base_url / api_key (those
-// are secrets kept off the wire for the list view), so we
+// The slim list endpoint doesn't carry the API key, so we
 // also fetch the rich per-provider view (GET
 // /api/v1/providers/:name) and hydrate the form from that
-// — otherwise the user would see empty Base URL / API Key
+// — otherwise the user would see empty API URL / API Key
 // fields even though the server has values for them.
 async function selectProvider(name: string) {
   selectedName.value = name
@@ -478,15 +1088,85 @@ async function selectProvider(name: string) {
   }
 }
 
+function isKnownPresetBaseURL(value: string): boolean {
+  const normalized = value.trim().replace(/\/+$/, '')
+  if (!normalized) return false
+  return providerPresets.value.some(preset =>
+    preset.protocols.some(protocol => protocol.default_base_url?.replace(/\/+$/, '') === normalized),
+  )
+}
+
+function applyNewProviderDefaults(providerID: string) {
+  const nextProviderID = normalizeProviderID(providerID)
+  newProviderID.value = nextProviderID
+  newStrategyVariant.value = defaultVariantForProvider(nextProviderID)
+  newProtocol.value = firstProtocolForProvider(nextProviderID)
+  newBaseURL.value = defaultBaseURLFor(nextProviderID, newProtocol.value, newStrategyVariant.value)
+  if (!newName.value.trim() && nextProviderID !== 'custom') {
+    newName.value = nextProviderID
+  }
+}
+
+function onNewProviderIDUpdate(providerID: string) {
+  applyNewProviderDefaults(providerID)
+}
+
+function onNewProtocolUpdate(protocol: api.ProviderProtocol) {
+  newProtocol.value = normalizeProviderProtocol(protocol)
+  newBaseURL.value = defaultBaseURLFor(newProviderID.value, newProtocol.value, newStrategyVariant.value)
+}
+
+function onNewStrategyVariantUpdate(variant: string) {
+  newStrategyVariant.value = normalizeStrategyVariant(variant)
+  newBaseURL.value = defaultBaseURLFor(newProviderID.value, newProtocol.value, newStrategyVariant.value)
+}
+
+function onEditProviderIDUpdate(providerID: string) {
+  const nextProviderID = normalizeProviderID(providerID)
+  editProviderID.value = nextProviderID
+  markDirty('provider_id')
+
+  editStrategyVariant.value = defaultVariantForProvider(nextProviderID)
+  markDirty('strategy_variant')
+
+  editProtocol.value = firstProtocolForProvider(nextProviderID)
+  markDirty('protocol')
+
+  const baseURL = defaultBaseURLFor(nextProviderID, editProtocol.value, editStrategyVariant.value)
+  if (baseURL && (!editBaseURL.value.trim() || isKnownPresetBaseURL(editBaseURL.value))) {
+    editBaseURL.value = baseURL
+    markDirty('base_url')
+  }
+}
+
+function onEditProtocolUpdate(protocol: api.ProviderProtocol) {
+  editProtocol.value = normalizeProviderProtocol(protocol)
+  markDirty('protocol')
+  const baseURL = defaultBaseURLFor(editProviderID.value, editProtocol.value, editStrategyVariant.value)
+  if (baseURL && (!editBaseURL.value.trim() || isKnownPresetBaseURL(editBaseURL.value))) {
+    editBaseURL.value = baseURL
+    markDirty('base_url')
+  }
+}
+
+function onEditStrategyVariantUpdate(variant: string) {
+  editStrategyVariant.value = normalizeStrategyVariant(variant)
+  markDirty('strategy_variant')
+  const baseURL = defaultBaseURLFor(editProviderID.value, editProtocol.value, editStrategyVariant.value)
+  if (baseURL && (!editBaseURL.value.trim() || isKnownPresetBaseURL(editBaseURL.value))) {
+    editBaseURL.value = baseURL
+    markDirty('base_url')
+  }
+}
+
 function openAddProvider() {
   showAddProvider.value = true
   newName.value = ''
-  newProtocol.value = 'openai'
+  applyNewProviderDefaults('custom')
   newBaseURL.value = ''
   newAPIKey.value = ''
+  newCustomHeaders.value = []
   newModel.value = ''
-  probeModelOptions.value = []
-  probeModelsError.value = ''
 }
 
 function cancelAddProvider() {
@@ -494,45 +1174,8 @@ function cancelAddProvider() {
   newName.value = ''
   newBaseURL.value = ''
   newAPIKey.value = ''
+  newCustomHeaders.value = []
   newModel.value = ''
-  probeModelOptions.value = []
-  probeModelsError.value = ''
-}
-
-async function onProbeAddProviderModels() {
-  if (!newAPIKey.value.trim()) {
-    message.warning('请先填写 API Key，再加载模型列表')
-    return
-  }
-  probingModels.value = true
-  probeModelsError.value = ''
-  try {
-    const res = await api.probeUpstreamModels({
-      base_url: newBaseURL.value.trim() || undefined,
-      api_key: newAPIKey.value.trim(),
-      protocol: newProtocol.value,
-    })
-    const models = res.models || []
-    probeModelOptions.value = models.map(m => ({
-      label: m.owned_by ? `${m.id} · ${m.owned_by}` : m.id,
-      value: m.id,
-    }))
-    if (!models.length) {
-      probeModelsError.value = '上游未返回模型'
-      message.info('上游未返回模型，可手动输入模型 ID')
-    } else {
-      message.success(`已加载 ${models.length} 个模型`)
-      // If the user hasn't picked a default yet, prefill the first.
-      if (!newModel.value.trim()) {
-        newModel.value = models[0].id
-      }
-    }
-  } catch (e: any) {
-    probeModelsError.value = e.message || '加载失败'
-    message.error(`加载模型失败: ${e.message || '未知错误'}`)
-  } finally {
-    probingModels.value = false
-  }
 }
 
 // hydrateEditForm copies the server-resolved fields into the
@@ -545,9 +1188,12 @@ function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   const src = p || providers.value.find(x => x.name === name)
   if (!src) return
   editName.value = src.name
-  editProtocol.value = (src.protocol as 'openai' | 'anthropic') || 'openai'
-  editBaseURL.value = src.base_url || ''
+  editProviderID.value = normalizeProviderID(src.provider_id)
+  editStrategyVariant.value = normalizeStrategyVariant(src.strategy_variant)
+  editProtocol.value = normalizeProviderProtocol(src.protocol)
+  editBaseURL.value = src.base_url || src.api_url || ''
   editAPIKey.value = src.api_key || ''
+  editCustomHeaders.value = providerHeadersToRows(src.custom_headers)
   editIsDefault.value = !!src.is_default
   dirty.value = new Set()
 }
@@ -561,17 +1207,21 @@ function resetDirty() { dirty.value = new Set() }
 // --- Provider handlers ---
 
 async function onAddProvider() {
-  if (!newName.value.trim() || !newProtocol.value || !newModel.value.trim()) {
-    message.warning('名称、协议、模型为必填')
+  if (!newName.value.trim() || !newProtocol.value || !isCompleteHTTPURL(newBaseURL.value)) {
+    message.warning('名称、请求协议和有效的 Base URL 为必填')
     return
   }
   try {
     const addedName = newName.value.trim()
+    const customHeaders = providerHeaderRowsToRecord(newCustomHeaders.value)
     await api.addProvider({
       name: addedName,
+      provider_id: newProviderID.value,
+      strategy_variant: newStrategyVariant.value,
       protocol: newProtocol.value,
       base_url: newBaseURL.value.trim(),
       api_key: newAPIKey.value.trim(),
+      custom_headers: customHeaders,
       model: newModel.value.trim(),
     })
     message.success('已添加')
@@ -588,6 +1238,7 @@ async function onDeleteProvider(name: string) {
     await api.deleteProvider(name)
     message.success('已删除')
     await refreshProviders()
+    notifyGenerationConfigChanged()
   } catch (e: any) {
     message.error(`删除失败: ${e.message}`)
   }
@@ -598,6 +1249,10 @@ async function onSaveProvider() {
   const name = selected.value.name
   if (dirty.value.size === 0) {
     message.info('没有改动')
+    return
+  }
+  if (dirty.value.has('base_url') && !isCompleteHTTPURL(editBaseURL.value)) {
+    message.warning('Base URL 必须是完整的 http(s) URL')
     return
   }
   // Build a PATCH body with only the dirty fields. The server
@@ -613,11 +1268,25 @@ async function onSaveProvider() {
   if (dirty.value.has('protocol')) {
     body.protocol = editProtocol.value
   }
+  if (dirty.value.has('provider_id')) {
+    body.provider_id = editProviderID.value
+  }
+  if (dirty.value.has('strategy_variant')) {
+    body.strategy_variant = editStrategyVariant.value
+  }
   if (dirty.value.has('base_url')) {
     body.base_url = editBaseURL.value.trim()
   }
   if (dirty.value.has('api_key')) {
     body.api_key = editAPIKey.value
+  }
+  if (dirty.value.has('custom_headers')) {
+    try {
+      body.custom_headers = providerHeaderRowsToRecord(editCustomHeaders.value)
+    } catch (error: any) {
+      message.warning(error.message || '自定义请求头格式无效')
+      return
+    }
   }
   if (dirty.value.has('is_default') && editIsDefault.value) {
     body.set_default = true
@@ -626,6 +1295,7 @@ async function onSaveProvider() {
     const updated = await api.updateProvider(name, body)
     message.success('已保存')
     await refreshProviders()
+    notifyGenerationConfigChanged()
     // If renamed, the new name is in the response; select it
     // so the user can keep editing. selectProvider also
     // fetches the rich per-provider view, which re-hydrates
@@ -642,10 +1312,15 @@ async function onSaveProvider() {
 function resetModelForm() {
   editingModelName.value = null
   editModelName.value = ''
+  editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
   editModelDisplay.value = ''
   editModelCtx.value = null
   editModelOut.value = null
-  editModelVision.value = false
+  editModelCapabilities.value = []
+  editModelType.value = 'llm'
+  editGenerationOperations.value = []
+  editGenerationAPI.value = emptyGenerationAPIConfig()
+  editGenerationOperationAPIs.value = {}
 }
 
 function onShowAddModel() {
@@ -661,20 +1336,31 @@ async function onAddModel() {
     return
   }
   const providerName = selected.value.name
+  if (editModelType.value === 'llm' && !isEndpointSuffix(editModelAPIEndpoint.value)) {
+    message.warning('大语言模型 API 端点只能填写相对于 Base URL 的路径后缀')
+    return
+  }
+  if (editModelType.value === 'media_generation' && !validateMediaGenerationForm()) {
+    return
+  }
   try {
     await api.addModel(providerName, {
       name,
+      type: editModelType.value,
+      api_endpoint: editModelType.value === 'llm' ? normalizeEndpointSuffix(editModelAPIEndpoint.value) : undefined,
       display_name: editModelDisplay.value.trim() || undefined,
       max_tokens_context: editModelCtx.value ?? undefined,
       max_tokens_output: editModelOut.value ?? undefined,
+      generation: editModelType.value === 'media_generation' ? buildMediaGenerationConfig() : undefined,
     })
-    // The capabilities block is a separate PATCH; if it
-    // fails, the model is still created — surface the error
-    // but don't roll back.
-    if (editModelVision.value) {
+    // The capabilities block is a separate PATCH. Always send it so an
+    // empty selection is persisted as an explicit text-only capability set.
+    if (editModelType.value === 'llm') {
       try {
         await api.setModelCapabilities(providerName, name, {
-          supports_vision: true,
+          input_modalities: editModelCapabilities.value,
+          supports_vision: editModelCapabilities.value.includes('image'),
+          supports_audio: editModelCapabilities.value.includes('audio'),
           context_window: editModelCtx.value ?? 0,
         })
       } catch (capErr: any) {
@@ -682,9 +1368,14 @@ async function onAddModel() {
       }
     }
     message.success('已添加模型')
+    const upstreamIndex = upstreamModels.value.findIndex(model => model.id === name)
+    if (upstreamIndex >= 0) {
+      upstreamModels.value[upstreamIndex] = { ...upstreamModels.value[upstreamIndex], added: true }
+    }
     resetModelForm()
     showAddModel.value = false
     await refreshProviders()
+    notifyGenerationConfigChanged()
   } catch (e: any) {
     message.error(`添加失败: ${e.message}`)
   }
@@ -702,10 +1393,34 @@ function onEditModel(m: api.ModelInfo) {
   // and the submit button label.
   editingModelName.value = m.name
   editModelName.value = m.name
+  editModelType.value = m.type || 'llm'
+  editModelAPIEndpoint.value = m.api_endpoint || defaultLLMAPIEndpoint()
   editModelDisplay.value = m.display_name || ''
   editModelCtx.value = m.max_tokens_context ?? null
   editModelOut.value = m.max_tokens_output ?? null
-  editModelVision.value = !!m.capabilities?.supports_vision
+  editModelCapabilities.value = m.capabilities?.input_modalities !== undefined
+    ? [...m.capabilities.input_modalities]
+    : [
+        ...(m.capabilities?.supports_vision ? ['image' as api.MediaKind] : []),
+        ...(m.capabilities?.supports_audio ? ['audio' as api.MediaKind] : []),
+      ]
+  editGenerationOperations.value = Object.keys(m.generation?.operations || {}) as api.GenerationOperation[]
+  const legacyOperationConfig = editGenerationOperations.value
+    .map(operation => m.generation?.operations?.[operation])
+    .find(operationConfig => operationConfig && Object.keys(operationConfig).length > 0)
+  const operationOverrides: Partial<Record<api.GenerationOperation, api.GenerationOperationConfig>> = {}
+  for (const operation of editGenerationOperations.value) {
+    const operationConfig = m.generation?.operations?.[operation]
+    if (generationAPIConfigHasValue(operationConfig)) {
+      operationOverrides[operation] = { ...operationConfig }
+    }
+  }
+  editGenerationOperationAPIs.value = operationOverrides
+  editGenerationAPI.value = {
+    ...emptyGenerationAPIConfig(),
+    ...(legacyOperationConfig || {}),
+    ...(m.generation?.api || {}),
+  }
   showAddModel.value = true
 }
 
@@ -713,6 +1428,13 @@ async function onSaveModel() {
   if (!selected.value || !editingModelName.value) return
   const provider = selected.value.name
   const model = editingModelName.value
+  if (editModelType.value === 'llm' && !isEndpointSuffix(editModelAPIEndpoint.value)) {
+    message.warning('大语言模型 API 端点只能填写相对于 Base URL 的路径后缀')
+    return
+  }
+  if (editModelType.value === 'media_generation' && !validateMediaGenerationForm()) {
+    return
+  }
   try {
     // updateModel semantics: 0 / "" in a numeric field means
     // "leave alone" (see internal/config/manager.go
@@ -722,18 +1444,26 @@ async function onSaveModel() {
     const ctx = editModelCtx.value && editModelCtx.value > 0 ? editModelCtx.value : 0
     const out = editModelOut.value && editModelOut.value > 0 ? editModelOut.value : 0
     await api.updateModel(provider, model, {
+      type: editModelType.value,
+      api_endpoint: editModelType.value === 'llm' ? normalizeEndpointSuffix(editModelAPIEndpoint.value) : undefined,
       display_name: editModelDisplay.value,
       max_tokens_context: ctx,
       max_tokens_output: out,
+      generation: editModelType.value === 'media_generation' ? buildMediaGenerationConfig() : undefined,
     })
-    await api.setModelCapabilities(provider, model, {
-      supports_vision: editModelVision.value,
-      context_window: editModelCtx.value ?? 0,
-    })
+    if (editModelType.value === 'llm') {
+      await api.setModelCapabilities(provider, model, {
+        input_modalities: editModelCapabilities.value,
+        supports_vision: editModelCapabilities.value.includes('image'),
+        supports_audio: editModelCapabilities.value.includes('audio'),
+        context_window: editModelCtx.value ?? 0,
+      })
+    }
     message.success('已保存')
     resetModelForm()
     showAddModel.value = false
     await refreshProviders()
+    notifyGenerationConfigChanged()
   } catch (e: any) {
     message.error(`保存失败: ${e.message}`)
   }
@@ -750,6 +1480,7 @@ async function onDeleteModel(model: string) {
     await api.deleteModel(selected.value.name, model)
     message.success('已删除')
     await refreshProviders()
+    notifyGenerationConfigChanged()
   } catch (e: any) {
     message.error(`删除失败: ${e.message}`)
   }
@@ -766,35 +1497,83 @@ async function onSetDefaultModel(model: string) {
   }
 }
 
+function providerTestTarget(provider: string, model?: string) {
+  return `${provider}\u0000${model || ''}`
+}
+
+function isTestingProvider(provider: string, model?: string) {
+  return testingTarget.value === providerTestTarget(provider, model)
+}
+
+async function onTestProvider(model?: string) {
+  if (!selected.value || testingTarget.value) return
+  const providerName = selected.value.name
+  testingTarget.value = providerTestTarget(providerName, model)
+  try {
+    const result = await api.testProvider(providerName, model)
+    const reply = result.response.replace(/\s+/g, ' ').trim()
+    const preview = reply.length > 80 ? `${reply.slice(0, 80)}…` : reply
+    message.success(
+      `${result.model} 测试成功 · ${result.elapsed_ms} ms${preview ? ` · ${preview}` : ''}`,
+      { duration: 5000 },
+    )
+  } catch (e: any) {
+    message.error(`测试失败: ${e.message || '未知错误'}`, { duration: 6000 })
+  } finally {
+    testingTarget.value = null
+  }
+}
+
 async function onFetchUpstreamModels() {
   if (!selected.value) return
   fetchingUpstream.value = true
   upstreamError.value = ''
+  upstreamSource.value = ''
+  upstreamEndpoint.value = ''
+  upstreamBaseURL.value = ''
+  upstreamDefaultEndpoint.value = ''
   try {
     const res = await api.fetchUpstreamModels(selected.value.name)
     upstreamModels.value = res.models || []
+    upstreamError.value = res.error || ''
+    upstreamSource.value = res.source || ''
+    upstreamEndpoint.value = res.endpoint || ''
+    upstreamBaseURL.value = res.base_url || ''
+    upstreamDefaultEndpoint.value = res.default_endpoint || ''
     showUpstreamModels.value = true
   } catch (e: any) {
-    upstreamError.value = e.message || '获取失败'
+    upstreamError.value = e?.message || '获取失败'
+    showUpstreamModels.value = true
   } finally {
     fetchingUpstream.value = false
   }
 }
 
-async function onImportUpstreamModel(m: api.UpstreamModelItem) {
-  if (!selected.value || m.added) return
-  const providerName = selected.value.name
-  try {
-    await api.addModel(providerName, { name: m.id })
-    message.success(`已添加模型: ${m.id}`)
-    await refreshProviders()
-    // Refresh the upstream list to mark this one as added.
-    const idx = upstreamModels.value.findIndex(x => x.id === m.id)
-    if (idx >= 0) upstreamModels.value[idx] = { ...upstreamModels.value[idx], added: true }
-  } catch (e: any) {
-    message.error(`添加失败: ${e.message}`)
-  }
+function onImportUpstreamModel(model: api.UpstreamModelItem) {
+  if (model.added) return
+  resetModelForm()
+  editModelName.value = model.id
+  editModelAPIEndpoint.value = model.default_endpoint || upstreamDefaultEndpoint.value || defaultLLMAPIEndpoint()
+  showUpstreamModels.value = false
+  showAddModel.value = true
 }
+
+watch(editModelType, type => {
+  if (type === 'llm' && !editModelAPIEndpoint.value.trim()) {
+    editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
+  }
+  if (type === 'media_generation') {
+    syncGenerationAPIWithDefaults()
+  }
+})
+
+watch(editGenerationOperations, () => {
+  if (editModelType.value === 'media_generation' && !editingModelName.value) {
+    syncGenerationAPIWithDefaults()
+  } else if (editModelType.value === 'media_generation') {
+    syncGenerationOperationAPIOverrides()
+  }
+})
 
 // --- Style handlers ---
 
@@ -1039,8 +1818,13 @@ async function onSearchSkills() {
 async function onInstallSkill(name: string, url: string) {
   installing.value = name
   try {
-    await api.installSkill(name, url)
-    message.success(`已安装: ${name}`)
+    const result = await api.installSkill(name, url)
+    if (result.ready) {
+      message.success(`已安装并验证: ${name}`)
+    } else {
+      const detail = result.diagnostics?.find(item => item.severity === 'error')?.message || '依赖检查未通过'
+      message.warning(`Skill 已复制但尚不可用：${detail}`)
+    }
     await refreshSkills()
   } catch (e: any) {
     message.error(e.message || '安装失败')
@@ -1076,43 +1860,60 @@ function isBuiltIn(id: string) { return builtInStyles.has(id) }
 
 // protocol options reused in two places.
 const protocolOptions = [
-  { label: 'OpenAI 兼容', value: 'openai' },
-  { label: 'Anthropic (Claude)', value: 'anthropic' },
+  { label: 'OpenAI Chat', value: 'openai_chat' },
+  { label: 'OpenAI Responses', value: 'openai_responses' },
+  { label: 'Anthropic Messages', value: 'anthropic_messages' },
 ]
+const providerPresetOptions = computed(() => {
+  const options = providerPresets.value.map(preset => ({
+    label: preset.display_name,
+    value: preset.id,
+  }))
+  return options.length > 0 ? options : [{ label: 'Custom', value: 'custom' }]
+})
+const editProtocolOptions = computed(() => providerProtocolOptions(editProviderID.value))
+const newProtocolOptions = computed(() => providerProtocolOptions(newProviderID.value))
+const editVariantOptions = computed(() => providerVariantOptions(editProviderID.value))
+const newVariantOptions = computed(() => providerVariantOptions(newProviderID.value))
 
-const visionProviderOptions = computed(() =>
+const recognitionProviderOptions = computed(() =>
   providers.value.map(p => ({ label: p.name, value: p.name })),
 )
 
-const visionModelOptions = computed(() => {
-  const p = providers.value.find(x => x.name === sysVision.value.provider)
+function recognitionModelOptions(kind: api.MediaKind) {
+  const p = providers.value.find(x => x.name === sysRecognition.value[kind].provider)
   if (!p) return []
   return (p.models || []).map(m => {
-    const suffix = m.capabilities?.supports_vision ? ' · 视觉' : ''
+    const suffix = modelSupportsCapability(m, kind) ? ' · 支持此能力' : ''
     const label = m.display_name ? `${m.display_name} (${m.name})${suffix}` : `${m.name}${suffix}`
     return { label, value: m.name }
   })
-})
+}
 
-function onVisionProviderUpdate(provider: string) {
-  sysVision.value.provider = provider || ''
+function onRecognitionProviderUpdate(kind: api.MediaKind, provider: string) {
+  const route = sysRecognition.value[kind]
+  route.provider = provider || ''
   const p = providers.value.find(x => x.name === provider)
   const models = p?.models || []
-  if (!models.some(m => m.name === sysVision.value.model)) {
-    sysVision.value.model = models.find(m => m.default)?.name || models[0]?.name || ''
+  if (!models.some(m => m.name === route.model)) {
+    route.model = models.find(m => modelSupportsCapability(m, kind))?.name
+      || models.find(m => m.default)?.name
+      || models[0]?.name
+      || ''
   }
   markSysDirty()
 }
 
-function onVisionModelUpdate(model: string) {
-  sysVision.value.model = model || ''
+function onRecognitionModelUpdate(kind: api.MediaKind, model: string) {
+  sysRecognition.value[kind].model = model || ''
   markSysDirty()
 }
 
 // model-table row helpers
 function fmtContext(n?: number) {
   if (!n || n <= 0) return '—'
-  if (n >= 1024) return `${Math.round(n / 1024)}k`
+  if (n >= 1_000_000) return `${Number((n / 1_000_000).toFixed(1))}M`
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`
   return String(n)
 }
 
@@ -1421,7 +2222,19 @@ const newKBName = ref('')
 const newKBPath = ref('')
 const kbModels = ref<api.KnowledgeModel[]>([])
 const scanningKBs = ref<Set<string>>(new Set())
-const kbScanStatus = ref<Map<string, { current: number; total: number; chunks: number; done: boolean; error?: string }>>(new Map())
+type KBScanStatus = {
+  current: number
+  total: number
+  chunks: number
+  done: boolean
+  error?: string
+  changed?: number
+  skipped?: number
+  deleted?: number
+  failed?: number
+  message?: string
+}
+const kbScanStatus = ref<Map<string, KBScanStatus>>(new Map())
 let kbScanTimers: Record<string, ReturnType<typeof setInterval>> = {}
 
 // Three-level index nodes tree view
@@ -1595,7 +2408,7 @@ async function onScanKB(name: string) {
   try {
     await api.scanKnowledgeBase(name)
     scanningKBs.value = new Set(scanningKBs.value).add(name)
-    kbScanStatus.value.set(name, { current: 0, total: 0, chunks: 0, done: false })
+    kbScanStatus.value.set(name, { current: 0, total: 0, chunks: 0, done: false, changed: 0, skipped: 0, deleted: 0, failed: 0 })
     pollScan(name)
   } catch (e: any) { message.error(`扫描失败: ${e.message}`) }
 }
@@ -1604,7 +2417,18 @@ function pollScan(name: string) {
   const timer = setInterval(async () => {
     try {
       const s = await api.getScanStatus(name)
-      kbScanStatus.value.set(name, { current: s.current, total: s.total, chunks: s.chunks, done: s.done, error: s.error })
+      kbScanStatus.value.set(name, {
+        current: s.current,
+        total: s.total,
+        chunks: s.chunks,
+        done: s.done,
+        error: s.error,
+        changed: s.changed ?? 0,
+        skipped: s.skipped ?? 0,
+        deleted: s.deleted ?? 0,
+        failed: s.failed ?? 0,
+        message: s.message,
+      })
       if (s.done) {
         clearInterval(timer)
         scanningKBs.value = new Set([...scanningKBs.value].filter(n => n !== name))
@@ -1751,8 +2575,25 @@ function scanLabel(name: string) {
   const s = kbScanStatus.value.get(name)
   if (!s) return '开始扫描'
   if (s.error) return '扫描失败'
-  if (s.done) return `✓ ${s.chunks} sections`
-  return `扫描中 ${s.current}/${s.total}`
+  const stats = `更新 ${s.changed ?? 0} / 跳过 ${s.skipped ?? 0} / 删除 ${s.deleted ?? 0} / 失败 ${s.failed ?? 0}`
+  if (s.done) return `完成 ${s.chunks} 章节 (${stats})`
+  const phase = s.message || '扫描中'
+  if (s.total <= 0) return `${phase} (${stats})`
+  return `${phase} ${s.current}/${s.total} (${stats})`
+}
+
+function scanPhase(name: string) {
+  const s = kbScanStatus.value.get(name)
+  if (!s) return ''
+  if (s.error) return '扫描失败'
+  if (s.done) return s.chunks > 0 ? `扫描完成 · ${s.chunks} 章节` : '扫描完成'
+  return s.message || '扫描中'
+}
+
+function scanProgressPct(name: string) {
+  const s = kbScanStatus.value.get(name)
+  if (!s || s.total <= 0) return 0
+  return Math.min(100, Math.round((s.current / s.total) * 100))
 }
 
 function kbModelSupportsVision(scanModel: string) {
@@ -1785,7 +2626,7 @@ function kbModelSupportsVision(scanModel: string) {
       class="settings-no-bar"
     >
       <NTabPane name="providers" tab="LLM 提供商" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
-        <div class="providers-split">
+        <div class="providers-split settings-split">
           <!-- Left: provider list -->
           <aside class="provider-list">
             <div class="provider-list-header">
@@ -1821,7 +2662,9 @@ function kbModelSupportsVision(scanModel: string) {
                   </NPopconfirm>
                 </div>
                 <div class="provider-item-sub">
-                  <span class="provider-item-protocol">{{ p.protocol }}</span>
+                  <span class="provider-item-protocol">
+                    {{ providerDisplayName(p.provider_id) }} · {{ protocolDisplayName(p.provider_id, p.protocol) }}
+                  </span>
                   <span class="provider-item-count">{{ p.models?.length || 0 }} 模型</span>
                 </div>
               </button>
@@ -1843,10 +2686,26 @@ function kbModelSupportsVision(scanModel: string) {
                 <div class="settings-section-header">
                   <div class="provider-editor-title">
                     <h3 class="settings-section-title">{{ selected.name }}</h3>
-                    <NTag size="tiny" :bordered="false">{{ selected.protocol }}</NTag>
+                    <NTag size="tiny" :bordered="false">{{ providerDisplayName(selected.provider_id) }}</NTag>
+                    <NTag size="tiny" :bordered="false">{{ protocolDisplayName(selected.provider_id, selected.protocol) }}</NTag>
+                    <NTag v-if="providerVariantDisplayName(selected.provider_id, selected.strategy_variant)" size="tiny" :bordered="false">
+                      {{ providerVariantDisplayName(selected.provider_id, selected.strategy_variant) }}
+                    </NTag>
                     <NTag v-if="selected.is_default" type="success" size="tiny" :bordered="false">默认</NTag>
                   </div>
                   <div class="settings-form-actions">
+                    <NButton
+                      data-testid="test-provider-default"
+                      size="small"
+                      secondary
+                      :loading="isTestingProvider(selected.name)"
+                      :disabled="testingTarget !== null || dirty.size > 0"
+                      title="使用已保存配置向默认模型发送 sayhi"
+                      @click="onTestProvider()"
+                    >
+                      <template #icon><Activity :size="12" /></template>
+                      测试默认模型
+                    </NButton>
                     <NButton size="small" @click="hydrateEditForm(selected.name)" :disabled="dirty.size === 0">重置</NButton>
                     <NButton size="small" @click="onSaveProvider" type="primary" :disabled="dirty.size === 0">
                       保存{{ dirty.size > 0 ? ` (${dirty.size})` : '' }}
@@ -1868,24 +2727,44 @@ function kbModelSupportsVision(scanModel: string) {
                     <span class="settings-form-hint">本地唯一标识，可重命名</span>
                   </div>
                   <div class="settings-form-row">
-                    <label class="settings-form-label">协议</label>
+                    <label class="settings-form-label">供应商类型</label>
                     <NSelect
-                      v-model:value="editProtocol"
-                      :options="protocolOptions"
+                      :value="editProviderID"
+                      :options="providerPresetOptions"
                       size="small"
-                      @update:value="markDirty('protocol')"
+                      @update:value="onEditProviderIDUpdate"
                     />
-                    <span class="settings-form-hint">OpenAI 兼容 / Anthropic / 自定义</span>
+                    <span class="settings-form-hint">决定默认 Base URL、协议和后续策略分发。</span>
+                  </div>
+                  <div class="settings-form-row">
+                    <label class="settings-form-label">请求协议</label>
+                    <NSelect
+                      :value="editProtocol"
+                      :options="editProtocolOptions"
+                      size="small"
+                      @update:value="onEditProtocolUpdate"
+                    />
+                    <span class="settings-form-hint">选择 LLM 请求端点协议，不是 HTTP/HTTPS 网络协议。</span>
+                  </div>
+                  <div v-if="editVariantOptions.length > 0" class="settings-form-row">
+                    <label class="settings-form-label">策略变体</label>
+                    <NSelect
+                      :value="editStrategyVariant"
+                      :options="editVariantOptions"
+                      size="small"
+                      @update:value="onEditStrategyVariantUpdate"
+                    />
+                    <span class="settings-form-hint">用于区分同一供应商下的 API、套餐或区域。</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">Base URL</label>
                     <NInput
                       v-model:value="editBaseURL"
                       size="small"
-                      placeholder="https://api.openai.com/v1"
+                      :placeholder="isAnthropicProtocol(editProtocol) ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
                       @update:value="markDirty('base_url')"
                     />
-                    <span class="settings-form-hint">API endpoint，OpenAI 兼容服务可填自有地址</span>
+                    <span class="settings-form-hint">供应商公共网络地址；实际请求由 Base URL 与各模型的 API 端点后缀拼接。</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <label class="settings-form-label">API Key</label>
@@ -1899,11 +2778,17 @@ function kbModelSupportsVision(scanModel: string) {
                     />
                     <span class="settings-form-hint">点击眼睛图标可临时显示明文</span>
                   </div>
+                  <div class="settings-form-row settings-form-row--span2">
+                    <ProviderHeadersEditor
+                      :model-value="editCustomHeaders"
+                      @update:model-value="(value: ProviderHeaderRow[]) => { editCustomHeaders = value; markDirty('custom_headers') }"
+                    />
+                  </div>
                   <div class="settings-form-row settings-form-row--span2 settings-form-row--inline">
                     <div class="settings-form-toggle">
                       <NSwitch
                         :value="editIsDefault"
-                        :disabled="selected.is_default"
+                        :disabled="selected.is_default || !selected.models?.some(model => (model.type || 'llm') === 'llm')"
                         @update:value="(v: boolean) => { editIsDefault = v; markDirty('is_default') }"
                       />
                       <label class="settings-form-label" for="provider-default-switch">设为默认提供商</label>
@@ -1938,8 +2823,20 @@ function kbModelSupportsVision(scanModel: string) {
                     <div class="model-card-main">
                       <div class="model-card-top">
                         <span class="model-card-name">{{ m.name }}</span>
+                        <NTag size="tiny" :bordered="false" :type="(m.type || 'llm') === 'media_generation' ? 'warning' : 'default'">
+                          {{ (m.type || 'llm') === 'media_generation' ? '媒体生成' : 'LLM' }}
+                        </NTag>
                         <NTag v-if="m.default" type="success" size="tiny" :bordered="false">默认</NTag>
-                        <NTag v-if="m.capabilities?.supports_vision" size="tiny" :bordered="false" type="info">视觉</NTag>
+                        <template v-if="(m.type || 'llm') === 'media_generation'">
+                          <NTag v-for="operation in Object.keys(m.generation?.operations || {})" :key="operation" size="tiny" :bordered="false" type="info">
+                            {{ generationOperationDefs.find(item => item.operation === operation)?.label || operation }}
+                          </NTag>
+                        </template>
+                        <template v-else>
+                          <NTag v-if="modelSupportsCapability(m, 'image')" size="tiny" :bordered="false" type="info">图片</NTag>
+                          <NTag v-if="modelSupportsCapability(m, 'video')" size="tiny" :bordered="false" type="warning">视频</NTag>
+                          <NTag v-if="modelSupportsCapability(m, 'audio')" size="tiny" :bordered="false" type="success">音频</NTag>
+                        </template>
                       </div>
                       <div class="model-card-meta" v-if="m.display_name || m.max_tokens_context || m.max_tokens_output">
                         <span v-if="m.display_name" class="model-meta-item">{{ m.display_name }}</span>
@@ -1948,10 +2845,24 @@ function kbModelSupportsVision(scanModel: string) {
                       </div>
                     </div>
                     <div class="model-card-actions">
+                      <NButton
+                        v-if="(m.type || 'llm') === 'llm'"
+                        :data-testid="`test-model-${m.name}`"
+                        size="tiny"
+                        quaternary
+                        :loading="isTestingProvider(selected.name, m.name)"
+                        :disabled="testingTarget !== null"
+                        title="向此模型发送 sayhi"
+                        :aria-label="`测试模型 ${m.name}`"
+                        @click="onTestProvider(m.name)"
+                      >
+                        <template #icon><Activity :size="12" /></template>
+                        测试
+                      </NButton>
                       <NButton size="tiny" quaternary @click="onEditModel(m)" title="编辑" aria-label="编辑">
                         <Pencil :size="12" />
                       </NButton>
-                      <NButton v-if="!m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认" aria-label="设为默认">
+                      <NButton v-if="(m.type || 'llm') === 'llm' && !m.default" size="tiny" quaternary @click="onSetDefaultModel(m.name)" title="设为默认" aria-label="设为默认">
                         <Star :size="12" />
                       </NButton>
                       <NPopconfirm @positive-click="onDeleteModel(m.name)" positive-text="删除" negative-text="取消">
@@ -1965,43 +2876,61 @@ function kbModelSupportsVision(scanModel: string) {
                     </div>
                   </div>
                 </div>
-                <div v-else class="settings-empty">还没有模型。点击「+ 添加模型」或「获取模型」配置。</div>
+                <div v-else class="settings-empty">还没有模型。可点击「获取模型」选择上游模型，或手动添加模型 ID。</div>
               </div>
             </template>
           </div>
         </div>
 
         <!-- Add provider modal -->
-        <NModal
+        <AppModal
           v-model:show="showAddProvider"
-          preset="card"
           title="新增提供商"
-          :style="{ width: 'min(560px, calc(100vw - 32px))' }"
+          size="lg"
           :mask-closable="false"
+          @close="cancelAddProvider"
         >
-          <p class="modal-lead">填写连接信息。默认模型可手动输入，或用 API Key 从接口加载后选择。</p>
+          <p class="modal-lead">选择供应商类型和 LLM 请求协议后，只需填写 API Key；Base URL 会按策略默认带入，Custom 可手动填写。</p>
           <div class="settings-form settings-form--grid modal-form">
             <div class="settings-form-row">
               <label class="settings-form-label">名称 <span class="settings-required">*</span></label>
               <NInput v-model:value="newName" placeholder="例: openai / deepseek" size="small" />
             </div>
             <div class="settings-form-row">
-              <label class="settings-form-label">协议 <span class="settings-required">*</span></label>
+              <label class="settings-form-label">供应商类型 <span class="settings-required">*</span></label>
               <NSelect
-                v-model:value="newProtocol"
-                :options="protocolOptions"
+                :value="newProviderID"
+                :options="providerPresetOptions"
                 size="small"
-                @update:value="() => { probeModelOptions = []; probeModelsError = '' }"
+                @update:value="onNewProviderIDUpdate"
+              />
+            </div>
+            <div class="settings-form-row">
+              <label class="settings-form-label">请求协议 <span class="settings-required">*</span></label>
+              <NSelect
+                :value="newProtocol"
+                :options="newProtocolOptions"
+                size="small"
+                @update:value="onNewProtocolUpdate"
+              />
+            </div>
+            <div v-if="newVariantOptions.length > 0" class="settings-form-row">
+              <label class="settings-form-label">策略变体</label>
+              <NSelect
+                :value="newStrategyVariant"
+                :options="newVariantOptions"
+                size="small"
+                @update:value="onNewStrategyVariantUpdate"
               />
             </div>
             <div class="settings-form-row settings-form-row--span2">
-              <label class="settings-form-label">Base URL</label>
+              <label class="settings-form-label">Base URL <span class="settings-required">*</span></label>
               <NInput
                 v-model:value="newBaseURL"
-                :placeholder="newProtocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
+                :placeholder="isAnthropicProtocol(newProtocol) ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1'"
                 size="small"
               />
-              <span class="settings-form-hint">可留空使用协议默认地址</span>
+              <span class="settings-form-hint">这里填写 http(s) 网络地址，例如火山方舟可填写到 /api/v3；模型端点只填写其后的相对路径。</span>
             </div>
             <div class="settings-form-row settings-form-row--span2">
               <label class="settings-form-label">API Key</label>
@@ -2014,48 +2943,27 @@ function kbModelSupportsVision(scanModel: string) {
               />
             </div>
             <div class="settings-form-row settings-form-row--span2">
-              <label class="settings-form-label">默认模型 <span class="settings-required">*</span></label>
-              <div class="model-pick-row">
-                <NSelect
-                  v-model:value="newModel"
-                  filterable
-                  tag
-                  clearable
-                  :options="probeModelOptions"
-                  :loading="probingModels"
-                  placeholder="输入或从列表选择模型 ID"
-                  size="small"
-                  class="model-pick-select"
-                />
-                <NButton
-                  size="small"
-                  :loading="probingModels"
-                  :disabled="!newAPIKey.trim()"
-                  @click="onProbeAddProviderModels"
-                >
-                  加载模型
-                </NButton>
-              </div>
-              <span v-if="probeModelsError" class="settings-form-hint settings-form-hint--error">{{ probeModelsError }}</span>
-              <span v-else class="settings-form-hint">先填 API Key，再点「加载模型」从上游 /models 拉取；也可直接输入</span>
+              <ProviderHeadersEditor v-model="newCustomHeaders" />
+            </div>
+            <div class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">默认对话模型</label>
+              <NInput v-model:value="newModel" placeholder="输入模型 ID" size="small" />
+              <span class="settings-form-hint">可选。纯媒体提供商可先创建，再添加“媒体生成模型”。</span>
             </div>
           </div>
           <template #footer>
-            <div class="modal-footer-actions">
-              <NButton size="small" @click="cancelAddProvider">取消</NButton>
-              <NButton size="small" type="primary" @click="onAddProvider">创建</NButton>
-            </div>
+            <NButton size="small" quaternary @click="cancelAddProvider">取消</NButton>
+            <NButton size="small" type="primary" @click="onAddProvider">创建</NButton>
           </template>
-        </NModal>
+        </AppModal>
 
         <!-- Add / edit model modal -->
-        <NModal
+        <AppModal
           v-model:show="showAddModel"
-          preset="card"
           :title="editingModelName ? '编辑模型' : '添加模型'"
-          :style="{ width: 'min(520px, calc(100vw - 32px))' }"
+          size="lg"
           :mask-closable="false"
-          @after-leave="onCancelEditModel"
+          @close="onCancelEditModel"
         >
           <p v-if="editingModelName" class="modal-lead">
             正在编辑 <code class="model-editor-id">{{ editingModelName }}</code>
@@ -2075,55 +2983,230 @@ function kbModelSupportsVision(scanModel: string) {
               <label class="settings-form-label">显示名</label>
               <NInput v-model:value="editModelDisplay" placeholder="例: GPT-4o mini" size="small" />
             </div>
-            <div class="settings-form-row">
-              <label class="settings-form-label">上下文 (tokens)</label>
-              <NInputNumber v-model:value="editModelCtx" :min="0" :step="1024" placeholder="128000" size="small" class="model-num-input" />
+            <div class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">模型类型</label>
+              <NRadioGroup v-model:value="editModelType" size="small" :disabled="!!editingModelName">
+                <NRadioButton v-for="option in modelTypeOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </NRadioButton>
+              </NRadioGroup>
+              <span class="settings-form-hint">{{ editingModelName ? '模型类型创建后不可更改。' : '同一供应商和 API Key 可同时配置对话模型与媒体生成模型。' }}</span>
             </div>
-            <div class="settings-form-row">
+            <div v-if="editModelType === 'llm'" class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">API 端点后缀 <span class="settings-required">*</span></label>
+              <NInput
+                v-model:value="editModelAPIEndpoint"
+                :placeholder="defaultLLMAPIEndpoint()"
+                size="small"
+              />
+              <span class="settings-form-hint">
+                按协议自动填入默认值，可编辑；请求地址为
+                <code v-if="modelEndpointPreview" class="endpoint-preview">{{ modelEndpointPreview }}</code>
+                <template v-else>Base URL + 此后缀</template>。
+              </span>
+            </div>
+            <div v-if="editModelType === 'llm'" class="settings-form-row">
+              <label class="settings-form-label">上下文 (tokens)</label>
+              <div class="model-context-control">
+                <NSelect
+                  v-model:value="editModelCtx"
+                  :options="contextWindowOptions"
+                  clearable
+                  placeholder="选择预设"
+                  size="small"
+                />
+                <NInputNumber
+                  v-model:value="editModelCtx"
+                  :min="0"
+                  :step="1024"
+                  placeholder="自定义 tokens"
+                  size="small"
+                  class="model-num-input"
+                />
+              </div>
+            </div>
+            <div v-if="editModelType === 'llm'" class="settings-form-row">
               <label class="settings-form-label">最大输出 (tokens)</label>
               <NInputNumber v-model:value="editModelOut" :min="0" :step="512" placeholder="4096" size="small" class="model-num-input" />
             </div>
-            <div class="settings-form-row settings-form-row--span2 settings-form-row--inline">
-              <div class="settings-form-toggle">
-                <NSwitch v-model:value="editModelVision" />
-                <label class="settings-form-label" for="model-vision-switch">支持视觉输入</label>
+            <div v-if="editModelType === 'llm'" class="settings-form-row settings-form-row--span2">
+              <div class="capability-field-head">
+                <label class="settings-form-label">媒体识别能力（可选）</label>
+                <NTag v-if="editModelCapabilities.length === 0" size="tiny" :bordered="false">默认：仅文本</NTag>
               </div>
-              <span class="settings-form-hint">开启后用户可发送图片附件</span>
+              <NCheckboxGroup v-model:value="editModelCapabilities">
+                <div class="capability-option-grid capability-option-grid--llm">
+                  <NCheckbox
+                    v-for="option in modelCapabilityOptions"
+                    :key="option.value"
+                    :value="option.value"
+                    class="capability-option"
+                  >
+                    <span class="capability-option-copy">
+                      <strong>{{ option.label }}</strong>
+                      <small>{{ option.hint }}</small>
+                    </span>
+                  </NCheckbox>
+                </div>
+              </NCheckboxGroup>
+              <span class="settings-form-hint">留空表示该模型不支持图片、视频或音频识别；需要时可多选模型实际支持的类型。</span>
+            </div>
+            <div v-else class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">生成能力 <span class="settings-required">*</span></label>
+              <NCheckboxGroup v-model:value="editGenerationOperations">
+                <div class="capability-option-grid capability-option-grid--generation">
+                  <NCheckbox
+                    v-for="option in generationOperationOptions"
+                    :key="option.value"
+                    :value="option.value"
+                    class="capability-option"
+                  >
+                    <span class="capability-option-copy">
+                      <strong>{{ option.label }}</strong>
+                      <small>{{ option.hint }}</small>
+                    </span>
+                  </NCheckbox>
+                </div>
+              </NCheckboxGroup>
+              <span class="settings-form-hint">能力决定会话中可开启哪些工具；默认共享模型 API，可按能力覆盖不同端点。</span>
+            </div>
+            <div
+              v-if="editModelType === 'media_generation'"
+              class="settings-form-row settings-form-row--span2 generation-api-editor"
+            >
+              <div class="generation-api-title">
+                <strong>模型 API</strong>
+                <span>共享端点会作为默认值；厂商路由不一致时可在下方按能力覆盖</span>
+              </div>
+              <div class="generation-api-fields">
+	                <label class="generation-api-field generation-api-field--create">
+	                  <span>API 端点后缀</span>
+	                  <NInput
+	                    v-model:value="editGenerationAPI.endpoint"
+	                    size="small"
+	                    :placeholder="defaultGenerationAPIConfig(editGenerationOperations).endpoint"
+	                  />
+                  <small class="generation-endpoint-preview">
+                    完整请求：
+                    <code v-if="generationEndpointPreview" class="endpoint-preview">{{ generationEndpointPreview }}</code>
+                    <template v-else>Base URL + 此后缀</template>
+                  </small>
+                  <small v-if="generationEndpointConsistencyWarning" class="generation-endpoint-warning">
+                    {{ generationEndpointConsistencyWarning }}
+                  </small>
+                </label>
+	                <label class="generation-api-field generation-api-field--query">
+	                  <span>查询端点后缀（异步任务）</span>
+	                  <NInput
+	                    v-model:value="editGenerationAPI.query_endpoint"
+	                    size="small"
+	                    :placeholder="defaultGenerationAPIConfig(editGenerationOperations).query_endpoint || '/tasks/{task_id}'"
+	                  />
+                  <small v-if="editGenerationAPI.query_endpoint" class="generation-endpoint-preview">
+                    完整请求：
+                    <code v-if="generationQueryEndpointPreview" class="endpoint-preview">{{ generationQueryEndpointPreview }}</code>
+                    <template v-else>Base URL + 此后缀</template>
+                  </small>
+                  <small
+                    class="generation-task-id-help"
+                    :class="{ 'is-error': editGenerationAPI.query_endpoint && !hasTaskIDPlaceholder(editGenerationAPI.query_endpoint) }"
+                  >
+                    任务 ID 来自创建接口的响应，无需手动填写；系统会将 <code>{task_id}</code> 或 <code>{id}</code> 替换为实际 ID。同步接口可留空。
+                  </small>
+                </label>
+                <label class="generation-api-field generation-api-field--timeout">
+                  <span>超时（秒）</span>
+                  <NInputNumber v-model:value="editGenerationAPI.timeout_seconds" :min="5" :step="5" size="small" />
+                </label>
+              </div>
+              <div v-if="editGenerationOperations.length" class="generation-operation-overrides">
+                <div class="generation-operation-overrides-head">
+                  <strong>按能力覆盖端点</strong>
+                  <span>留空表示继承共享 API；供应商默认端点不同的能力会自动带入覆盖值。</span>
+                </div>
+                <div class="generation-operation-override-list">
+                  <div
+                    v-for="operation in editGenerationOperations"
+                    :key="operation"
+                    class="generation-operation-row"
+                  >
+                    <span class="generation-operation-label">{{ generationOperationLabel(operation) }}</span>
+                    <NInput
+                      :value="editGenerationOperationAPIs[operation]?.endpoint || ''"
+                      size="small"
+                      :placeholder="operationDefaultAPIConfig(operation).endpoint"
+                      @update:value="value => updateGenerationOperationAPI(operation, { endpoint: value })"
+                    />
+                    <NInput
+                      :value="editGenerationOperationAPIs[operation]?.query_endpoint || ''"
+                      size="small"
+                      :placeholder="operationDefaultAPIConfig(operation).query_endpoint || '/tasks/{task_id}'"
+                      @update:value="value => updateGenerationOperationAPI(operation, { query_endpoint: value })"
+                    />
+                    <NInputNumber
+                      :value="editGenerationOperationAPIs[operation]?.timeout_seconds ?? null"
+                      :min="5"
+                      :step="5"
+                      size="small"
+                      :placeholder="String(operationDefaultAPIConfig(operation).timeout_seconds || '')"
+                      @update:value="value => updateGenerationOperationAPI(operation, { timeout_seconds: value || undefined })"
+                    />
+                    <NButton size="tiny" quaternary @click="resetGenerationOperationAPI(operation)">继承</NButton>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
           <template #footer>
-            <div class="modal-footer-actions">
-              <NButton size="small" @click="onCancelEditModel">取消</NButton>
-              <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">
-                {{ editingModelName ? '保存修改' : '添加模型' }}
-              </NButton>
-            </div>
+            <NButton size="small" quaternary @click="onCancelEditModel">取消</NButton>
+            <NButton type="primary" size="small" @click="editingModelName ? onSaveModel() : onAddModel()">
+              {{ editingModelName ? '保存修改' : '添加模型' }}
+            </NButton>
           </template>
-        </NModal>
+        </AppModal>
 
-        <!-- Upstream models modal -->
-        <NModal v-model:show="showUpstreamModels" preset="card" title="上游模型列表" style="width: 500px">
+        <!-- Upstream model discovery only chooses an ID. The user always
+             completes the normal model editor before anything is persisted. -->
+        <AppModal
+          v-model:show="showUpstreamModels"
+          title="获取模型"
+          size="md"
+        >
+          <p class="modal-lead">
+            按 {{ providerDisplayName(selected?.provider_id) }} 策略获取模型。点击“配置并添加”后，可继续填写能力、上下文和 API 端点。
+          </p>
+          <div class="upstream-meta">
+            <NTag v-if="upstreamSource" size="tiny" :bordered="false">{{ upstreamSource }}</NTag>
+            <code v-if="upstreamEndpoint">{{ upstreamBaseURL }}{{ upstreamEndpoint }}</code>
+          </div>
           <div v-if="upstreamError" class="upstream-error">{{ upstreamError }}</div>
-          <template v-else>
-            <p class="upstream-hint">以下是从 {{ selected?.name }} 上游获取的可用模型，点击即可添加。</p>
-            <div v-if="!upstreamModels.length" class="muted empty-hint">未获取到模型列表</div>
-            <div v-else class="upstream-list">
-              <div
-                v-for="m in upstreamModels"
-                :key="m.id"
-                class="upstream-item"
-                :class="{ added: m.added }"
-              >
-                <span class="upstream-id">{{ m.id }}</span>
-                <span class="upstream-owner" v-if="m.owned_by">{{ m.owned_by }}</span>
-                <NButton v-if="!m.added" size="tiny" type="primary" ghost @click="onImportUpstreamModel(m)">
-                  添加
-                </NButton>
-                <NTag v-else size="tiny" type="default">已添加</NTag>
+          <div v-if="!upstreamModels.length" class="settings-empty upstream-empty">上游未返回可用模型，可手动添加模型 ID。</div>
+          <div v-else class="upstream-list">
+            <div
+              v-for="model in upstreamModels"
+              :key="model.id"
+              class="upstream-item"
+              :class="{ added: model.added }"
+            >
+              <div class="upstream-model-copy">
+                <code class="upstream-id">{{ model.id }}</code>
+                <span v-if="model.display_name" class="upstream-owner">{{ model.display_name }}</span>
+                <span v-if="model.owned_by" class="upstream-owner">{{ model.owned_by }}</span>
               </div>
+              <NButton
+                v-if="!model.added"
+                size="small"
+                type="primary"
+                ghost
+                @click="onImportUpstreamModel(model)"
+              >
+                配置并添加
+              </NButton>
+              <NTag v-else size="small" :bordered="false">已添加</NTag>
             </div>
-          </template>
-        </NModal>
+          </div>
+        </AppModal>
+
       </NTabPane>
 
       <NTabPane name="styles" tab="风格配置">
@@ -2154,7 +3237,7 @@ function kbModelSupportsVision(scanModel: string) {
                 </div>
                 <div class="style-usage-item">
                   <div class="style-usage-item-title">自动生成风格</div>
-                  <p>聊天页右上角有“生成风格”按钮，可根据当前对话总结出新的回复风格，也可以优化已有风格。</p>
+                  <p>聊天页右侧检查器的“会话操作”里有“生成风格”入口，可根据当前对话总结出新的回复风格，也可以优化已有风格。</p>
                 </div>
                 <div class="style-usage-item">
                   <div class="style-usage-item-title">备注会一起保存</div>
@@ -2202,18 +3285,9 @@ function kbModelSupportsVision(scanModel: string) {
         <div class="system-config-shell">
           <div class="system-config-scroll">
             <div class="system-config-body">
-              <!-- PR #9: top-level section header for the
-                   system config. The inner NCollapse groups
-                   still use the existing .sys-* class names
-                   for backward compat. -->
-              <div class="settings-section">
-                <div class="settings-section-header">
-                  <h3 class="settings-section-title">系统行为</h3>
-                </div>
-                <p class="settings-section-description">
-                  上下文、Agent 循环、子代理的全局行为。修改后点击右下「保存」生效。
-                </p>
-              </div>
+              <p class="settings-section-description sys-lead">
+                上下文、Agent 循环、子代理的全局行为。修改后点击右下「保存」生效。
+              </p>
               <NCollapse class="settings-collapse" :default-expanded-names="['work-mode', 'vision', 'window', 'context', 'agent', 'subagent']">
                 <NCollapseItem title="工作模式" name="work-mode">
                   <div class="sys-form-grid">
@@ -2228,48 +3302,102 @@ function kbModelSupportsVision(scanModel: string) {
                   </div>
                 </NCollapseItem>
 
-                <NCollapseItem title="图像识别" name="vision">
-                  <div class="sys-form-grid">
-                    <div class="sys-form-row">
-                      <span class="sys-label">启用工具</span>
-                      <NSwitch v-model:value="sysVision.enabled" size="small" @update:value="markSysDirty" />
-                      <span class="sys-hint">启用后，会话可选择通过 image_recognize 调用外部多模态模型。</span>
-                    </div>
-                    <div class="sys-form-row">
-                      <span class="sys-label">供应商</span>
+                <NCollapseItem title="媒体识别" name="vision">
+                  <p class="settings-section-description">
+                    每种媒体能力可以使用独立模型。未启用或未完整配置的能力不会出现在会话工具中。
+                  </p>
+                  <div class="recognition-route-list">
+                    <section v-for="capability in recognitionCapabilityDefs" :key="capability.kind" class="recognition-route-card">
+                      <div class="recognition-route-heading">
+                        <div>
+                          <strong>{{ capability.label }}</strong>
+                          <span>{{ capability.hint }}</span>
+                        </div>
+                        <NSwitch v-model:value="sysRecognition[capability.kind].enabled" size="small" @update:value="markSysDirty" />
+                      </div>
+                      <div class="recognition-route-fields">
+                        <label class="recognition-route-field">
+                          <span>供应商</span>
+                          <NSelect
+                            :value="sysRecognition[capability.kind].provider"
+                            :options="recognitionProviderOptions"
+                            size="small"
+                            clearable
+                            placeholder="选择供应商"
+                            @update:value="value => onRecognitionProviderUpdate(capability.kind, value)"
+                          />
+                        </label>
+                        <label class="recognition-route-field">
+                          <span>模型</span>
+                          <NSelect
+                            :value="sysRecognition[capability.kind].model"
+                            :options="recognitionModelOptions(capability.kind)"
+                            size="small"
+                            clearable
+                            :disabled="!sysRecognition[capability.kind].provider"
+                            placeholder="选择模型"
+                            @update:value="value => onRecognitionModelUpdate(capability.kind, value)"
+                          />
+                        </label>
+                        <label class="recognition-route-field">
+                          <span>超时（秒）</span>
+                          <NInputNumber
+                            v-model:value="sysRecognition[capability.kind].timeout_seconds"
+                            :min="5"
+                            :step="5"
+                            size="small"
+                            @update:value="markSysDirty"
+                          />
+                        </label>
+                        <div class="recognition-route-field">
+                          <span>最大文件</span>
+                          <div class="media-size-input">
+                            <NInputNumber
+                              :value="recognitionSizeValue(capability.kind)"
+                              :min="byteSizeInputMinimum(sysRecognitionSizeUnits[capability.kind])"
+                              :step="byteSizeInputStep(sysRecognitionSizeUnits[capability.kind])"
+                              :precision="sysRecognitionSizeUnits[capability.kind] === 'B' ? 0 : 3"
+                              size="small"
+                              @update:value="value => onRecognitionSizeUpdate(capability.kind, value)"
+                            />
+                            <NSelect
+                              :value="sysRecognitionSizeUnits[capability.kind]"
+                              :options="byteSizeUnitOptions"
+                              size="small"
+                              :consistent-menu-width="false"
+                              @update:value="value => onRecognitionSizeUnitUpdate(capability.kind, value)"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                      <span v-if="sysRecognition[capability.kind].enabled && (!sysRecognition[capability.kind].provider || !sysRecognition[capability.kind].model)" class="settings-form-hint settings-form-hint--error">
+                        尚未完整配置，当前能力不可用。
+                      </span>
+                    </section>
+                  </div>
+                </NCollapseItem>
+
+                <NCollapseItem title="媒体生成" name="generation">
+                  <p class="settings-section-description">
+                    为每种生成能力选择应用级默认模型。会话只负责开启能力，实际调用始终使用这里配置的模型。
+                  </p>
+                  <div class="generation-default-list">
+                    <section v-for="item in generationOperationDefs" :key="item.operation" class="generation-default-row">
+                      <div class="generation-default-copy">
+                        <strong>{{ item.label }}</strong>
+                        <span>{{ item.hint }}</span>
+                      </div>
                       <NSelect
-                        :value="sysVision.provider"
-                        :options="visionProviderOptions"
-                        size="small"
-                        style="width: 180px"
+                        :value="generationTargetKey(sysGenerationDefaults[item.operation])"
+                        :options="generationDefaultOptions(item.operation)"
                         clearable
-                        @update:value="onVisionProviderUpdate"
-                      />
-                      <span class="sys-hint">从已添加的 LLM 提供商中选择。</span>
-                    </div>
-                    <div class="sys-form-row">
-                      <span class="sys-label">模型</span>
-                      <NSelect
-                        :value="sysVision.model"
-                        :options="visionModelOptions"
+                        filterable
                         size="small"
-                        style="width: 240px"
-                        clearable
-                        :disabled="!sysVision.provider"
-                        @update:value="onVisionModelUpdate"
+                        placeholder="不设默认"
+                        :disabled="!generationDefaultOptions(item.operation).length"
+                        @update:value="value => onGenerationDefaultUpdate(item.operation, value)"
                       />
-                      <span class="sys-hint">建议选择已标记支持视觉输入的模型。</span>
-                    </div>
-                    <div class="sys-form-row">
-                      <span class="sys-label">超时</span>
-                      <NInputNumber v-model:value="sysVision.timeout_seconds" :min="5" :step="5" size="small" style="width:100px" @update:value="markSysDirty" />
-                      <span class="sys-hint">秒，默认 60。</span>
-                    </div>
-                    <div class="sys-form-row">
-                      <span class="sys-label">图片大小</span>
-                      <NInputNumber v-model:value="sysVision.max_image_bytes" :min="1024" :step="1048576" size="small" style="width:140px" @update:value="markSysDirty" />
-                      <span class="sys-hint">bytes，默认 10485760。</span>
-                    </div>
+                    </section>
                   </div>
                 </NCollapseItem>
 
@@ -2350,7 +3478,7 @@ function kbModelSupportsVision(scanModel: string) {
                     <div class="sys-form-row">
                       <span class="sys-label">超时时间</span>
                       <NInput v-model:value="sysSubAgent.timeout" size="small" placeholder="例如: 30m" style="width:140px" @update:value="markSysDirty" />
-                      <span class="sys-hint">留空 = 默认 30 分钟（兜底；卡死由 LLM idle / 工具超时提前拦截）</span>
+                      <span class="sys-hint">留空/0 = 不设置子代理墙钟超时；卡死由 LLM idle / 工具超时拦截</span>
                     </div>
                   </div>
                 </NCollapseItem>
@@ -2366,86 +3494,87 @@ function kbModelSupportsVision(scanModel: string) {
       </NTabPane>
 
       <NTabPane name="archive" tab="归档" style="flex: 1; min-height: 0; overflow: auto">
-        <div v-if="!archivedSessions.length && !loadingArchived" class="empty-hint">
-          暂无归档对话
-        </div>
-        <div v-else v-for="[project, sessions] in archivedGroups" :key="project" class="archive-group">
-          <div class="archive-group-title">{{ project }}</div>
-          <div v-for="s in (sessions as Session[])" :key="s.id" class="archive-row">
-            <span class="archive-title">{{ s.title || '(无标题)' }}</span>
-            <span class="archive-meta">{{ formatArchiveTime(s.updated_at) }}</span>
-            <NButton size="tiny" quaternary @click="onUnarchive(s.id)">恢复</NButton>
-            <NButton size="tiny" quaternary @click="onPermDelete(s.id)" style="color: var(--warn)">删除</NButton>
+        <div class="archive-tab">
+          <div v-if="!archivedSessions.length && !loadingArchived" class="settings-empty">
+            暂无归档对话
+          </div>
+          <div v-else v-for="[project, sessions] in archivedGroups" :key="project" class="archive-group">
+            <div class="archive-group-title">{{ project }}</div>
+            <div v-for="s in (sessions as Session[])" :key="s.id" class="archive-row">
+              <span class="archive-title">{{ s.title || '(无标题)' }}</span>
+              <span class="archive-meta">{{ formatArchiveTime(s.updated_at) }}</span>
+              <NButton size="tiny" quaternary @click="onUnarchive(s.id)">恢复</NButton>
+              <NButton size="tiny" quaternary type="error" @click="onPermDelete(s.id)">删除</NButton>
+            </div>
           </div>
         </div>
       </NTabPane>
 
-      <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; display: flex; flex-direction: column">
-        <!-- Repo chips (top bar) -->
-        <div class="skill-repos-bar">
-          <span class="skill-hint" style="white-space:nowrap">官方仓库</span>
-          <div class="repo-chips">
-            <NButton v-for="r in builtInRepos" :key="r.url" size="tiny"
-              :type="activeRepoUrl === r.url ? 'primary' : 'default'"
-              @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
-          </div>
-          <span v-if="savedRepos.length" class="skill-hint" style="margin-left:8px">我的</span>
-          <div v-if="savedRepos.length" class="repo-chips">
-            <template v-for="r in savedRepos" :key="r.url">
-              <NButton size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'"
+      <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
+        <div class="skills-shell settings-split">
+          <div class="skill-repos-bar">
+            <span class="skill-hint">官方仓库</span>
+            <div class="repo-chips">
+              <NButton v-for="r in builtInRepos" :key="r.url" size="tiny"
+                :type="activeRepoUrl === r.url ? 'primary' : 'default'"
                 @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
-              <NButton size="tiny" quaternary @click="onRemoveRepo(r.url)"
-                style="color:var(--warn);font-size:10px;min-width:16px;padding:0 2px">×</NButton>
-            </template>
-          </div>
-          <NButton size="tiny" quaternary @click="showAddRepo = true" style="margin-left:2px">+添加</NButton>
-          <span v-if="searching" style="font-size:11px;color:var(--text-4);margin-left:8px">加载中…</span>
-        </div>
-
-        <!-- Two-column body -->
-        <div class="skill-columns">
-          <!-- Left: repo search results -->
-          <div class="skill-col skill-col-left">
-            <div class="skill-col-header">
-              <span class="skill-section-title">仓库技能</span>
-              <NInput v-model:value="repoSkillFilter" placeholder="筛选…" size="tiny" clearable style="width:130px" />
             </div>
-            <div class="skill-col-body">
-              <div v-if="!activeRepoUrl" class="empty-hint">选择上方仓库查看可安装的技能</div>
-              <div v-else-if="searching" class="empty-hint">正在加载…</div>
-              <div v-else-if="!filteredSearchResults.length" class="empty-hint">
-                {{ searchResults.length ? '无匹配' : '该仓库无可安装技能' }}
+            <span v-if="savedRepos.length" class="skill-hint">我的</span>
+            <div v-if="savedRepos.length" class="repo-chips">
+              <template v-for="r in savedRepos" :key="r.url">
+                <NButton size="tiny" :type="activeRepoUrl === r.url ? 'primary' : 'default'"
+                  @click="onSelectRepo(r.url)">{{ r.name }}</NButton>
+                <NButton size="tiny" quaternary type="error" @click="onRemoveRepo(r.url)" title="移除仓库">
+                  <X :size="12" />
+                </NButton>
+              </template>
+            </div>
+            <NButton size="tiny" quaternary @click="showAddRepo = true">+ 添加</NButton>
+            <span v-if="searching" class="skill-hint">加载中…</span>
+          </div>
+
+          <div class="skill-columns">
+            <div class="skill-col skill-col-left">
+              <div class="skill-col-header">
+                <span class="skill-section-title">仓库技能</span>
+                <NInput v-model:value="repoSkillFilter" placeholder="筛选…" size="tiny" clearable class="skill-filter" />
               </div>
-              <template v-else>
-                <div v-for="r in filteredSearchResults" :key="r.name" class="skill-result-row">
-                  <div class="skill-result-info">
-                    <span class="skill-result-name">{{ r.name }}</span>
-                    <span class="skill-result-desc">{{ r.description }}</span>
-                  </div>
-                  <NButton size="tiny" type="primary" :loading="installing === r.name"
-                    @click="onInstallSkill(r.name, r.url)">安装</NButton>
+              <div class="skill-col-body">
+                <div v-if="!activeRepoUrl" class="settings-empty">选择上方仓库查看可安装的技能</div>
+                <div v-else-if="searching" class="settings-empty">正在加载…</div>
+                <div v-else-if="!filteredSearchResults.length" class="settings-empty">
+                  {{ searchResults.length ? '无匹配' : '该仓库无可安装技能' }}
                 </div>
-              </template>
+                <template v-else>
+                  <div v-for="r in filteredSearchResults" :key="r.name" class="skill-result-row">
+                    <div class="skill-result-info">
+                      <span class="skill-result-name">{{ r.name }}</span>
+                      <span class="skill-result-desc">{{ r.description }}</span>
+                    </div>
+                    <NButton size="tiny" type="primary" :loading="installing === r.name"
+                      @click="onInstallSkill(r.name, r.url)">安装</NButton>
+                  </div>
+                </template>
+              </div>
             </div>
-          </div>
 
-          <!-- Right: installed skills -->
-          <div class="skill-col skill-col-right">
-            <div class="skill-col-header">
-              <span class="skill-section-title">已安装（{{ loadedSkills.length }}）</span>
-              <NInput v-model:value="installedSkillFilter" placeholder="筛选…" size="tiny" clearable style="width:130px" />
-            </div>
-            <div class="skill-col-body">
-              <div v-if="!filteredSkills.length" class="empty-hint">{{ installedSkillFilter ? '无匹配' : '暂无已安装技能' }}</div>
-              <template v-else>
-                <div v-for="s in filteredSkills" :key="s.name" class="skill-result-row">
-                  <div class="skill-result-info">
-                    <span class="skill-result-name">{{ s.name }}</span>
-                    <span class="skill-result-desc">{{ s.description }}</span>
+            <div class="skill-col skill-col-right">
+              <div class="skill-col-header">
+                <span class="skill-section-title">已安装（{{ loadedSkills.length }}）</span>
+                <NInput v-model:value="installedSkillFilter" placeholder="筛选…" size="tiny" clearable class="skill-filter" />
+              </div>
+              <div class="skill-col-body">
+                <div v-if="!filteredSkills.length" class="settings-empty">{{ installedSkillFilter ? '无匹配' : '暂无已安装技能' }}</div>
+                <template v-else>
+                  <div v-for="s in filteredSkills" :key="s.name" class="skill-result-row">
+                    <div class="skill-result-info">
+                      <span class="skill-result-name">{{ s.name }}</span>
+                      <span class="skill-result-desc">{{ s.description }}</span>
+                    </div>
+                    <NButton size="tiny" quaternary type="error" @click="onDeleteSkill(s.name)">删除</NButton>
                   </div>
-                  <NButton size="tiny" quaternary @click="onDeleteSkill(s.name)" style="color:var(--warn)">删除</NButton>
-                </div>
-              </template>
+                </template>
+              </div>
             </div>
           </div>
         </div>
@@ -2596,10 +3725,9 @@ function kbModelSupportsVision(scanModel: string) {
         </div>
       </NTabPane>
 
-      <NTabPane name="knowledge" tab="知识库" style="flex: 1; min-height: 0; overflow: auto">
-        <div class="providers-split">
-          <!-- Left: KB list -->
-          <div class="provider-list">
+      <NTabPane name="knowledge" tab="知识库" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
+        <div class="providers-split settings-split">
+          <aside class="provider-list">
             <div class="provider-list-header">
               <span class="list-title">知识库 ({{ kbBases.length }})</span>
               <NButton size="tiny" type="primary" ghost @click="showAddKB = !showAddKB">
@@ -2607,200 +3735,265 @@ function kbModelSupportsVision(scanModel: string) {
               </NButton>
             </div>
             <div v-if="showAddKB" class="add-form">
-              <NSpace vertical size="small">
-                <NInput v-model:value="newKBName" placeholder="名称" size="tiny" />
-                <NInput v-model:value="newKBPath" placeholder="路径" size="tiny" />
-                <NButton type="primary" size="tiny" @click="onAddKB">提交</NButton>
-              </NSpace>
+              <NInput v-model:value="newKBName" placeholder="名称" size="tiny" />
+              <NInput v-model:value="newKBPath" placeholder="本地路径" size="tiny" />
+              <NButton type="primary" size="tiny" block @click="onAddKB">添加知识库</NButton>
             </div>
             <div class="provider-items">
-              <div
+              <button
                 v-for="b in kbBases"
                 :key="b.name"
-                class="provider-item"
+                type="button"
+                class="provider-item kb-list-item"
                 :class="{ active: b.name === kbSelectedName }"
                 @click="kbSelectedName = b.name"
               >
-                <div class="provider-item-head">
-                  <NTag v-if="b.enabled" type="success" size="tiny" :bordered="false">启用</NTag>
-                  <strong class="provider-item-name">{{ b.name }}</strong>
-                  <NPopconfirm @positive-click="onDeleteKB(b.name)" positive-text="删除" negative-text="取消">
-                    <template #trigger>
-                      <NButton size="tiny" quaternary type="error" @click.stop class="provider-del-btn">
-                        <X :size="12" />
-                      </NButton>
-                    </template>
-                    确定删除知识库「{{ b.name }}」？此操作不可撤销。
-                  </NPopconfirm>
-                </div>
-                <div class="provider-item-sub">
-                  <span class="muted">{{ b.path }}</span>
-                  <span v-if="b.status === 'scanning' || scanningKBs.has(b.name)" style="font-size:10px;color:var(--accent)"> 扫描中</span>
-                  <span v-else-if="b.status === 'ok' && b.doc_count" style="font-size:10px;color:var(--text-3)"> · {{ b.doc_count }} sections</span>
-                  <span v-else-if="b.status === 'error'" style="font-size:10px;color:var(--warn)"> · 错误</span>
-                </div>
-              </div>
-              <div v-if="kbBases.length === 0" class="muted empty-hint">还没有知识库</div>
-            </div>
-          </div>
-
-          <!-- Right: detail pane -->
-          <div class="provider-detail">
-            <div v-if="!kbSelected" class="muted empty-hint">← 选择左侧的知识库</div>
-            <template v-else>
-              <div class="detail-section kb-detail-scroll">
-                <!-- Header -->
-                <div class="kb-header">
-                  <div class="kb-header-left">
-                    <h3 class="section-title">{{ kbSelected.name }}</h3>
-                    <NTag :type="kbSelected.enabled ? 'success' : 'default'" size="tiny" :bordered="false">{{ kbSelected.enabled ? '启用' : '禁用' }}</NTag>
-                    <span class="muted" style="font-size:11px">{{ kbSelected.doc_count || 0 }} 条索引</span>
-                  </div>
-                  <NSpace size="small">
-                    <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name) || !kbSelected.scan_model">
-                      {{ scanningKBs.has(kbSelected.name) ? '扫描中...' : '扫描' }}
-                    </NButton>
-                    <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>
-                    <NPopconfirm @positive-click="onClearKB(kbSelected.name)" positive-text="确定清除" negative-text="取消" placement="left-start">
+                <span class="kb-list-avatar" aria-hidden="true">{{ (b.name || '?').slice(0, 1).toUpperCase() }}</span>
+                <div class="kb-list-body">
+                  <div class="provider-item-head">
+                    <strong class="provider-item-name">{{ b.name }}</strong>
+                    <NTag v-if="b.enabled" type="success" size="tiny" :bordered="false">启用</NTag>
+                    <NPopconfirm @positive-click="onDeleteKB(b.name)" positive-text="删除" negative-text="取消">
                       <template #trigger>
-                        <NButton size="small" type="error" ghost :disabled="scanningKBs.has(kbSelected.name)">清除</NButton>
+                        <NButton size="tiny" quaternary type="error" @click.stop class="provider-del-btn">
+                          <X :size="12" />
+                        </NButton>
                       </template>
-                      确定清除知识库「{{ kbSelected.name }}」的所有扫描数据？此操作不可撤销。
+                      确定删除知识库「{{ b.name }}」？此操作不可撤销。
                     </NPopconfirm>
-                  </NSpace>
-                </div>
-
-                <!-- Scan progress -->
-                <div v-if="kbScanStatus.has(kbSelected.name)" class="scan-progress">
-                  <div class="scan-info">
-                    <span>{{ scanLabel(kbSelected.name) }}</span>
-                    <span v-if="kbScanStatus.get(kbSelected.name)?.error" style="color:var(--warn);font-size:11px">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
                   </div>
-                  <div v-if="!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error" style="display:flex;align-items:center">
-                    <div class="scan-bar">
-                      <div class="scan-bar-fill" :style="{ width: kbScanStatus.get(kbSelected.name)!.total > 0 ? ((kbScanStatus.get(kbSelected.name)!.current / kbScanStatus.get(kbSelected.name)!.total) * 100) + '%' : '0%' }"></div>
-                    </div>
-                    <span class="scan-bar-pct">{{ kbScanStatus.get(kbSelected.name)!.total > 0 ? Math.round((kbScanStatus.get(kbSelected.name)!.current / kbScanStatus.get(kbSelected.name)!.total) * 100) : 0 }}%</span>
+                  <div class="provider-item-sub">
+                    <span class="provider-item-path" :title="b.path">{{ b.path }}</span>
+                    <span v-if="b.status === 'scanning' || scanningKBs.has(b.name)" class="kb-item-status is-scan">扫描中</span>
+                    <span v-else-if="b.status === 'ok' && b.doc_count" class="kb-item-status">{{ b.doc_count }} 条</span>
+                    <span v-else-if="b.status === 'error'" class="kb-item-status is-error">错误</span>
                   </div>
                 </div>
+              </button>
+              <div v-if="kbBases.length === 0" class="settings-empty provider-list-empty">
+                <Database :size="20" />
+                <span>还没有知识库</span>
+                <span class="settings-form-hint">点击「+ 新增」添加本地目录</span>
+              </div>
+            </div>
+          </aside>
 
-                <!-- AI Scan Settings -->
-                <NCollapse class="settings-collapse">
-                  <NCollapseItem title="AI 扫描设置" name="scan">
-                    <div class="kb-settings-grid">
-                      <div class="kb-settings-row">
-                        <div class="kb-settings-card">
-                          <div class="kb-settings-card-title">解析引擎</div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">模型</span>
-                            <NSelect
-                              :value="kbSelected.scan_model || ''"
-                              :options="kbModelOptions"
-                              size="small"
-                              placeholder="纯文本解析"
-                              style="flex:1"
-                              @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'scan_model', v)"
-                            />
-                          </div>
-                          <div v-if="kbSelected.scan_model" class="kb-config-hint">
-                            <span v-if="kbModelSupportsVision(kbSelected.scan_model)" class="kb-hint-accent">视觉模型 — 可处理图片/视频/PDF</span>
-                            <span v-else class="kb-hint-muted">纯文本模型 — 仅处理文本</span>
-                          </div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">媒体类型</span>
-                            <NSelect
-                              :value="kbSelected.scan_media_types || []"
-                              :options="mediaTypeOptions"
-                              size="small"
-                              multiple
-                              placeholder="选择可 AI 处理的媒体"
-                              style="flex:1"
-                              @update:value="(v: string[]) => onUpdateKBField(kbSelected!.name, 'scan_media_types', v)"
-                            />
-                          </div>
+          <div class="provider-detail kb-detail">
+            <div v-if="!kbSelected" class="settings-empty provider-detail-empty">
+              <Database :size="28" />
+              <span>选择左侧知识库</span>
+              <span class="settings-form-hint">查看扫描进度、配置与索引数据</span>
+            </div>
+            <template v-else>
+              <div class="kb-detail-body">
+                <header class="kb-header">
+                  <div class="kb-header-main">
+                    <div class="kb-header-top">
+                      <div class="kb-header-left">
+                        <h3 class="settings-section-title">{{ kbSelected.name }}</h3>
+                        <NTag :type="kbSelected.enabled ? 'success' : 'default'" size="tiny" :bordered="false">
+                          {{ kbSelected.enabled ? '启用' : '禁用' }}
+                        </NTag>
+                        <span class="kb-header-meta">{{ kbSelected.doc_count || 0 }} 条索引</span>
+                      </div>
+                      <div class="kb-header-actions">
+                        <div class="settings-form-toggle kb-enable-toggle">
+                          <NSwitch
+                            size="small"
+                            :value="kbSelected.enabled"
+                            @update:value="(v: boolean) => onToggleKBSwitch(kbSelected!.name, v)"
+                          />
+                          <label class="settings-form-label">启用</label>
                         </div>
-                        <div class="kb-settings-card">
-                          <div class="kb-settings-card-title">自动化</div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">自动扫描</span>
-                            <NSwitch size="small" :value="kbSelected.auto_scan" @update:value="(v: boolean) => onUpdateKBField(kbSelected!.name, 'auto_scan', v)" />
-                          </div>
-                          <div class="kb-config-hint">启动时自动扫描变更</div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">排除模式</span>
-                            <NInput
-                              :value="(kbSelected.exclude_patterns || []).join(', ')"
-                              size="small"
-                              placeholder="*.log, *.tmp"
-                              style="flex:1"
-                              @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'exclude_patterns', v.split(',').map(s => s.trim()).filter(Boolean))"
-                            />
-                          </div>
-                          <div class="kb-config-row">
-                            <span class="kb-config-label">文件上限</span>
-                            <NInputNumber
-                              :value="kbSelected.max_file_size ? kbSelected.max_file_size / 1048576 : 5"
-                              :min="1" :step="1"
-                              size="small"
-                              style="width:80px"
-                              @update:value="(v: number | null) => onUpdateKBField(kbSelected!.name, 'max_file_size', (v || 5) * 1048576)"
-                            />
-                            <span class="kb-unit">MB</span>
-                          </div>
+                        <div class="settings-form-actions">
+                          <NButton size="small" type="primary" @click="onScanKB(kbSelected.name)" :disabled="scanningKBs.has(kbSelected.name)">
+                            {{ scanningKBs.has(kbSelected.name) ? '扫描中…' : '扫描' }}
+                          </NButton>
+                          <NButton v-if="scanningKBs.has(kbSelected.name)" size="small" @click="onCancelScan(kbSelected.name)">取消</NButton>
+                          <NPopconfirm @positive-click="onClearKB(kbSelected.name)" positive-text="确定清除" negative-text="取消" placement="left-start">
+                            <template #trigger>
+                              <NButton size="small" type="error" ghost :disabled="scanningKBs.has(kbSelected.name)">清除</NButton>
+                            </template>
+                            确定清除知识库「{{ kbSelected.name }}」的所有扫描数据？此操作不可撤销。
+                          </NPopconfirm>
                         </div>
                       </div>
-                      <div class="kb-settings-card">
-                        <div class="kb-settings-card-title">存储</div>
-                        <div class="kb-config-row">
-                          <span class="kb-config-label">路径</span>
-                          <span class="kb-config-val path">{{ kbSelected.path }}</span>
+                    </div>
+                    <div class="kb-header-path" :title="kbSelected.path">
+                      <Folder :size="12" class="kb-header-path-icon" />
+                      <span>{{ kbSelected.path }}</span>
+                    </div>
+                  </div>
+                </header>
+
+                <section class="kb-recall">
+                  <div class="kb-recall-head">
+                    <span class="kb-recall-title">召回预览</span>
+                    <span class="kb-recall-hint">验证助手实际会召回的知识片段</span>
+                  </div>
+                  <KnowledgeRecallPreview
+                    :key="kbSelected.name"
+                    :scope-options="[
+                      { label: '当前库', bases: [kbSelected.name] },
+                      { label: '全部知识库', bases: [] },
+                    ]"
+                    placeholder="输入问题，预览会召回的知识片段…"
+                  />
+                </section>
+
+                <div
+                  v-if="kbScanStatus.has(kbSelected.name)"
+                  class="scan-progress"
+                  :class="{
+                    'is-error': !!kbScanStatus.get(kbSelected.name)?.error,
+                    'is-done': !!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error,
+                  }"
+                >
+                  <div class="scan-progress-top">
+                    <div class="scan-info">
+                      <span class="scan-phase">{{ scanPhase(kbSelected.name) }}</span>
+                      <span
+                        v-if="(kbScanStatus.get(kbSelected.name)?.total ?? 0) > 0 && !kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error"
+                        class="scan-count"
+                      >
+                        {{ kbScanStatus.get(kbSelected.name)!.current }}/{{ kbScanStatus.get(kbSelected.name)!.total }}
+                      </span>
+                      <span v-if="kbScanStatus.get(kbSelected.name)?.error" class="scan-error">{{ kbScanStatus.get(kbSelected.name)?.error }}</span>
+                    </div>
+                    <div
+                      v-if="!kbScanStatus.get(kbSelected.name)?.error"
+                      class="scan-stats"
+                      :aria-label="scanLabel(kbSelected.name)"
+                    >
+                      <span class="scan-stat">更新 {{ kbScanStatus.get(kbSelected.name)?.changed ?? 0 }}</span>
+                      <span class="scan-stat">跳过 {{ kbScanStatus.get(kbSelected.name)?.skipped ?? 0 }}</span>
+                      <span class="scan-stat">删除 {{ kbScanStatus.get(kbSelected.name)?.deleted ?? 0 }}</span>
+                      <span class="scan-stat" :class="{ 'is-fail': (kbScanStatus.get(kbSelected.name)?.failed ?? 0) > 0 }">
+                        失败 {{ kbScanStatus.get(kbSelected.name)?.failed ?? 0 }}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    v-if="!kbScanStatus.get(kbSelected.name)?.done && !kbScanStatus.get(kbSelected.name)?.error"
+                    class="scan-bar-row"
+                  >
+                    <div class="scan-bar">
+                      <div class="scan-bar-fill" :style="{ width: scanProgressPct(kbSelected.name) + '%' }"></div>
+                    </div>
+                    <span class="scan-bar-pct">{{ scanProgressPct(kbSelected.name) }}%</span>
+                  </div>
+                </div>
+
+                <NCollapse class="settings-collapse settings-collapse--inset kb-scan-collapse" :default-expanded-names="[]">
+                  <NCollapseItem title="AI 扫描设置" name="scan">
+                    <div class="settings-form settings-form--grid kb-scan-form">
+                      <div class="settings-form-row settings-form-row--span2">
+                        <label class="settings-form-label">解析模型</label>
+                        <NSelect
+                          :value="kbSelected.scan_model || ''"
+                          :options="kbModelOptions"
+                          size="small"
+                          placeholder="纯文本解析"
+                          @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'scan_model', v)"
+                        />
+                        <span v-if="kbSelected.scan_model && kbModelSupportsVision(kbSelected.scan_model)" class="settings-form-hint kb-hint-accent">视觉模型 — 可处理图片 / 视频 / PDF</span>
+                        <span v-else-if="kbSelected.scan_model" class="settings-form-hint">纯文本模型 — 仅处理文本</span>
+                        <span v-else class="settings-form-hint">不选则按纯文本解析</span>
+                      </div>
+                      <div class="settings-form-row">
+                        <label class="settings-form-label">媒体类型</label>
+                        <NSelect
+                          :value="kbSelected.scan_media_types || []"
+                          :options="mediaTypeOptions"
+                          size="small"
+                          multiple
+                          placeholder="选择可 AI 处理的媒体"
+                          @update:value="(v: string[]) => onUpdateKBField(kbSelected!.name, 'scan_media_types', v)"
+                        />
+                      </div>
+                      <div class="settings-form-row">
+                        <label class="settings-form-label">文件上限</label>
+                        <div class="kb-size-row">
+                          <NInputNumber
+                            :value="kbSelected.max_file_size ? kbSelected.max_file_size / 1048576 : 5"
+                            :min="1" :step="1"
+                            size="small"
+                            class="kb-size-input"
+                            @update:value="(v: number | null) => onUpdateKBField(kbSelected!.name, 'max_file_size', (v || 5) * 1048576)"
+                          />
+                          <span class="kb-unit">MB</span>
                         </div>
-                        <div class="kb-config-row">
-                          <span class="kb-config-label">状态</span>
-                          <NSwitch size="small" :value="kbSelected.enabled" @update:value="(v: boolean) => onToggleKBSwitch(kbSelected!.name, v)" />
+                      </div>
+                      <div class="settings-form-row settings-form-row--span2">
+                        <label class="settings-form-label">排除模式</label>
+                        <NInput
+                          :value="(kbSelected.exclude_patterns || []).join(', ')"
+                          size="small"
+                          placeholder="*.log, *.tmp"
+                          @update:value="(v: string) => onUpdateKBField(kbSelected!.name, 'exclude_patterns', v.split(',').map(s => s.trim()).filter(Boolean))"
+                        />
+                        <span class="settings-form-hint">逗号分隔的 glob，匹配文件将被跳过</span>
+                      </div>
+                      <div class="settings-form-row settings-form-row--span2 settings-form-row--inline kb-scan-toggle-row">
+                        <div class="settings-form-toggle">
+                          <NSwitch size="small" :value="kbSelected.auto_scan" @update:value="(v: boolean) => onUpdateKBField(kbSelected!.name, 'auto_scan', v)" />
+                          <label class="settings-form-label">自动扫描</label>
                         </div>
+                        <span class="settings-form-hint">启动或路径变更时扫描更新</span>
                       </div>
                     </div>
                   </NCollapseItem>
                 </NCollapse>
 
-                <!-- Tree + Detail split -->
-                <div class="kb-tree-panel">
-                  <div class="kb-tree-left">
-                    <div class="kb-tree-toolbar">
-                      <NInput v-model:value="kbNodeFilter" placeholder="筛选节点..." size="tiny" clearable style="flex:1" />
-                      <NButton size="tiny" quaternary @click="loadKBNodes(kbSelected!.name)" title="刷新" aria-label="刷新">
-                        <RotateCw :size="12" />
-                      </NButton>
-                    </div>
-                    <div class="kb-tree-scroll">
-                      <div v-if="kbNodesLoading" class="muted" style="padding:16px;text-align:center">加载中...</div>
-                      <NTree
-                        v-else-if="kbTreeNodeData.length > 0"
-                        :data="kbTreeNodeData"
-                        :selected-keys="kbSelectedNodeKeys"
-                        :expanded-keys="kbExpandedNodeKeys"
-                        :pattern="kbNodeFilter"
-                        block-node
-                        selectable
-                        :render-label="renderTreeLabel"
-                        :render-suffix="renderTreeSuffix"
-                        @update:selected-keys="onTreeNodeSelect"
-                        @update:expanded-keys="onTreeNodeExpand"
-                        virtual-scroll
-                        style="max-height:100%"
-                      />
-                      <div v-else class="muted" style="padding:16px;text-align:center;font-size:11px">（暂无索引节点，请先扫描）</div>
-                    </div>
+                <section class="kb-explorer">
+                  <div class="kb-explorer-head">
+                    <span class="kb-explorer-title">索引数据</span>
+                    <span v-if="kbNodes.length > 0" class="kb-explorer-meta">{{ kbNodes.length }} 节点</span>
                   </div>
+                  <div class="kb-tree-panel">
+                    <div class="kb-tree-left">
+                      <div class="kb-tree-toolbar">
+                        <NInput v-model:value="kbNodeFilter" placeholder="筛选节点…" size="tiny" clearable class="kb-tree-filter" />
+                        <NButton size="tiny" quaternary @click="loadKBNodes(kbSelected!.name)" title="刷新" aria-label="刷新">
+                          <RotateCw :size="12" />
+                        </NButton>
+                      </div>
+                      <div class="kb-tree-scroll">
+                        <div v-if="kbNodesLoading" class="kb-panel-empty">加载中…</div>
+                        <NTree
+                          v-else-if="kbTreeNodeData.length > 0"
+                          :data="kbTreeNodeData"
+                          :selected-keys="kbSelectedNodeKeys"
+                          :expanded-keys="kbExpandedNodeKeys"
+                          :pattern="kbNodeFilter"
+                          block-node
+                          selectable
+                          :render-label="renderTreeLabel"
+                          :render-suffix="renderTreeSuffix"
+                          @update:selected-keys="onTreeNodeSelect"
+                          @update:expanded-keys="onTreeNodeExpand"
+                          virtual-scroll
+                          class="kb-tree"
+                        />
+                        <div v-else class="kb-panel-empty">
+                          <Database :size="22" />
+                          <span>暂无索引节点</span>
+                          <span class="settings-form-hint">点击上方「扫描」建立索引</span>
+                        </div>
+                      </div>
+                    </div>
 
-                  <div class="kb-tree-right">
-                    <div v-if="!kbActiveNode" class="muted" style="padding:24px;text-align:center;font-size:12px">选择左侧节点查看详情</div>
+                    <div class="kb-tree-right">
+                      <div v-if="!kbActiveNode" class="kb-panel-empty">
+                        <FileText :size="22" />
+                        <span>选择左侧节点</span>
+                        <span class="settings-form-hint">查看概览、章节与内容块</span>
+                      </div>
                     <template v-else>
                       <div class="kb-node-detail">
                         <div class="kb-node-detail-header">
                           <div class="kb-node-detail-title">
-                            <span class="kb-node-icon">{{ nodeIcon(kbActiveNode.level) }}</span>
+                            <component :is="nodeIcon(kbActiveNode.level)" :size="16" class="kb-node-icon" />
                             <span class="kb-node-title-text">{{ kbActiveNode.title }}</span>
                           </div>
                           <NSpace size="small">
@@ -2862,7 +4055,7 @@ function kbModelSupportsVision(scanModel: string) {
                             :class="{ active: kbActiveChildId === ch.id }"
                             @click="selectChildNode(ch)"
                           >
-                            <span class="kb-node-child-icon">§</span>
+                            <Hash :size="12" class="kb-node-child-icon" />
                             <span class="kb-node-child-title">{{ ch.title || '(无标题)' }}</span>
                             <span v-if="ch.content_count > 0" class="kb-node-child-meta">{{ ch.content_count }} 块</span>
                             <NPopconfirm
@@ -2884,12 +4077,14 @@ function kbModelSupportsVision(scanModel: string) {
                       </div>
                     </template>
                   </div>
-                </div>
+                  </div>
+                </section>
               </div>
             </template>
           </div>
         </div>
       </NTabPane>
+
 
       <NTabPane name="websearch" tab="网络搜索" style="flex: 1; min-height: 0; overflow: auto">
         <WebSearchSettings />
@@ -2948,7 +4143,7 @@ function kbModelSupportsVision(scanModel: string) {
             <div class="browser-update-desc">
               下载最新扩展包后，在 Chrome / Edge 扩展管理页重新加载已解包扩展。
             </div>
-            <NButton size="tiny" type="warning" ghost tag="a" href="/api/v1/browser/extension" download>
+            <NButton size="tiny" type="warning" ghost tag="a" :href="api.apiURL('/api/v1/browser/extension')" download>
               下载最新扩展
             </NButton>
           </div>
@@ -3027,7 +4222,7 @@ function kbModelSupportsVision(scanModel: string) {
           <div class="settings-section-header">
             <h3 class="settings-section-title">安装扩展</h3>
             <div class="settings-form-actions">
-              <NButton size="small" type="primary" ghost tag="a" href="/api/v1/browser/extension" download>
+              <NButton size="small" type="primary" ghost tag="a" :href="api.apiURL('/api/v1/browser/extension')" download>
                 下载扩展包
               </NButton>
             </div>
@@ -3035,7 +4230,7 @@ function kbModelSupportsVision(scanModel: string) {
           <div class="settings-section-description" style="margin-bottom: 0;">
             <ol style="padding-left: 18px; line-height: 1.7; margin: 0;">
               <li>
-                <a href="/api/v1/browser/extension" download class="browser-ext-download-link">
+                <a :href="api.apiURL('/api/v1/browser/extension')" download class="browser-ext-download-link">
                   下载浏览器扩展 zip
                 </a>
                 并解压到本地任意目录
@@ -3076,7 +4271,7 @@ function kbModelSupportsVision(scanModel: string) {
     :mask-closable="false"
     :auto-focus="false"
     :z-index="2600"
-    :mask-style="{ backdropFilter: 'blur(8px)', background: 'rgba(0, 0, 0, 0.42)' }"
+    :mask-style="{ backdropFilter: 'blur(var(--glass-blur))', background: 'var(--surface-overlay)' }"
     class="style-editor-modal"
     @update:show="onStyleEditorVisibleChange"
   >
@@ -3127,7 +4322,7 @@ function kbModelSupportsVision(scanModel: string) {
               </NPopover>
             </div>
             <NInput v-model:value="newStylePrompt" placeholder="人设 + 性格 + 说话风格 + 表达模板，支持 markdown"
-              type="textarea" :rows="15" size="small" class="editor-textarea" />
+              type="textarea" :rows="12" size="small" class="editor-textarea" />
           </div>
         </div>
 
@@ -3148,12 +4343,12 @@ function kbModelSupportsVision(scanModel: string) {
             </NPopover>
           </div>
           <NInput v-model:value="newStyleMemory" placeholder="背景资料、项目信息、用户偏好，每行一条"
-            type="textarea" :rows="6" size="small" class="editor-textarea" />
+            type="textarea" :rows="5" size="small" class="editor-textarea" />
         </div>
       </div>
 
       <div class="editor-actions">
-        <NButton size="small" @click="closeStyleEditor">取消</NButton>
+        <NButton size="small" quaternary @click="closeStyleEditor">取消</NButton>
         <NButton type="primary" size="small" :disabled="idConflict" @click="isEdit ? onUpdateStyle() : onCreateStyle()">
           {{ isEdit ? '保存修改' : '创建风格' }}
         </NButton>
@@ -3161,34 +4356,55 @@ function kbModelSupportsVision(scanModel: string) {
     </div>
   </NModal>
 
-  <!-- Inner confirmation modals — teleported to body by
-       NModal, so they sit on top of the settings dialog
-       regardless of where they're declared in the
-       template. Sibling of AppSettingsLayout (multi-root
-       template) — they're conceptually owned by the
-       settings dialog but rendered on top of everything. -->
-  <NModal v-model:show="showConfirmPermDelete" preset="card" title="确认永久删除" style="width: 360px">
-    <div class="confirm-body">
-      <p>确定要永久删除此会话吗？此操作不可撤销。</p>
-      <div class="confirm-actions">
-        <NButton size="small" @click="showConfirmPermDelete = false">取消</NButton>
-        <NButton size="small" type="error" @click="confirmPermDelete">永久删除</NButton>
-      </div>
-    </div>
-  </NModal>
+  <!-- Nested confirm / form dialogs — AppModal for glass chrome
+       consistency with the rest of the app. Teleported above
+       the settings sheet. -->
+  <AppModal
+    v-model:show="showConfirmPermDelete"
+    title="确认永久删除"
+    size="sm"
+    accent-top
+    accent-variant="error"
+  >
+    <p>确定要永久删除此会话吗？此操作不可撤销。</p>
+    <template #footer>
+      <NButton size="small" quaternary @click="showConfirmPermDelete = false">取消</NButton>
+      <NButton size="small" type="error" @click="confirmPermDelete">永久删除</NButton>
+    </template>
+  </AppModal>
 
-  <NModal v-model:show="showAddRepo" preset="card" title="添加技能仓库" style="width: 420px">
-    <div class="add-project-form">
-      <label>仓库名称</label>
-      <NInput v-model:value="newRepoName" placeholder="例如：我的技能仓库" />
-      <label style="margin-top: 12px">GitHub 地址</label>
-      <NInput v-model:value="newRepoUrl" placeholder="例如：https://github.com/user/repo" />
-      <div class="project-actions">
-        <NButton size="small" @click="showAddRepo = false">取消</NButton>
-        <NButton size="small" type="primary" @click="onAddRepo">添加</NButton>
+  <AppModal
+    v-model:show="showAddRepo"
+    title="添加技能仓库"
+    size="sm"
+  >
+    <div class="settings-mini-form">
+      <div class="settings-mini-field">
+        <label for="add-repo-name">仓库名称</label>
+        <NInput
+          id="add-repo-name"
+          v-model:value="newRepoName"
+          size="small"
+          placeholder="例如：我的技能仓库"
+          @keyup.enter="onAddRepo"
+        />
+      </div>
+      <div class="settings-mini-field">
+        <label for="add-repo-url">GitHub 地址</label>
+        <NInput
+          id="add-repo-url"
+          v-model:value="newRepoUrl"
+          size="small"
+          placeholder="例如：https://github.com/user/repo"
+          @keyup.enter="onAddRepo"
+        />
       </div>
     </div>
-  </NModal>
+    <template #footer>
+      <NButton size="small" quaternary @click="showAddRepo = false">取消</NButton>
+      <NButton size="small" type="primary" @click="onAddRepo">添加</NButton>
+    </template>
+  </AppModal>
 </template>
 
 <style scoped>
@@ -3422,6 +4638,14 @@ function kbModelSupportsVision(scanModel: string) {
   background: var(--surface-1);
   border: 1px dashed var(--border-subtle);
   border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+.settings-empty :deep(svg) {
+  color: var(--text-quaternary);
 }
 
 /* --- Hide the NTabs top bar (unchanged from PR #8) --------------
@@ -3465,6 +4689,20 @@ function kbModelSupportsVision(scanModel: string) {
   padding: 24px 28px;
   max-width: 100%;
   box-sizing: border-box;
+}
+/* Split / fill tabs own their height so list+detail columns
+ * stretch to the pane instead of sitting in a short strip. */
+.settings-no-bar :deep(.n-tab-pane) > .settings-split {
+  padding: var(--space-4);
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.settings-no-bar :deep(.n-tab-pane) > .system-config-shell {
+  padding: var(--space-4) var(--space-5);
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 /* --- MCP server row (used inside the MCP tab's .settings-card
@@ -3548,12 +4786,9 @@ function kbModelSupportsVision(scanModel: string) {
 .providers-split {
   display: grid;
   grid-template-columns: 248px 1fr;
-  gap: 16px;
+  gap: 12px;
   flex: 1;
-  /* Prefer filling the pane when the parent is a flex
-   * column (providers tab). Knowledge tab scrolls the pane
-   * itself, so min-height keeps the split readable. */
-  min-height: min(100%, 520px);
+  min-height: 0;
   height: 100%;
 }
 .provider-list {
@@ -3668,8 +4903,16 @@ function kbModelSupportsVision(scanModel: string) {
   flex-direction: column;
   overflow-y: auto;
   min-height: 0;
-  padding: 18px 20px;
+  padding: 16px 18px;
   gap: 4px;
+}
+.kb-detail {
+  /* Clip to pane; scrolling lives on .kb-detail-body so
+   * header / progress / settings / explorer can stack without
+   * being permanently clipped when scan progress appears. */
+  overflow: hidden;
+  padding-bottom: var(--space-3);
+  min-height: 0;
 }
 .provider-detail-empty {
   margin: auto;
@@ -3715,15 +4958,187 @@ function kbModelSupportsVision(scanModel: string) {
   width: 100%;
   max-width: 200px;
 }
-.model-pick-row {
+.generation-api-editor {
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.generation-api-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.generation-api-title strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.generation-api-title span,
+.generation-api-fields label > span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.generation-api-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 0.28fr);
+  gap: var(--space-3);
+}
+.generation-api-field {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+  align-content: start;
+}
+.generation-api-field--create {
+  grid-column: 1;
+  grid-row: 1;
+}
+.generation-api-field--timeout {
+  grid-column: 2;
+  grid-row: 1;
+}
+.generation-api-field--query {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+.generation-operation-overrides {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+.generation-operation-overrides-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-2);
+}
+.generation-operation-overrides-head strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.generation-operation-overrides-head span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.generation-operation-override-list {
+  display: grid;
+  gap: var(--space-2);
+}
+.generation-operation-row {
+  display: grid;
+  grid-template-columns: minmax(72px, 0.18fr) minmax(0, 1fr) minmax(0, 1fr) minmax(86px, 0.2fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+}
+.generation-operation-label {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.generation-endpoint-preview {
+  min-width: 0;
+  color: var(--text-quaternary);
+  font-size: 10.5px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+.generation-endpoint-warning {
+  color: var(--warn-500);
+  background: var(--warn-50);
+  border: 1px solid var(--warn-500);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) var(--space-2);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+.generation-task-id-help {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+.generation-task-id-help.is-error {
+  color: var(--error-500);
+}
+.generation-task-id-help code {
+  color: inherit;
+  font-family: var(--font-mono);
+}
+.capability-field-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  width: 100%;
+  justify-content: space-between;
+  gap: var(--space-2);
 }
-.model-pick-select {
-  flex: 1;
+.capability-option-grid {
+  display: grid;
+  gap: var(--space-2);
+}
+.capability-option-grid--llm,
+.capability-option-grid--generation {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.capability-option {
+  width: 100%;
   min-width: 0;
+  min-height: 58px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+.capability-option:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+.capability-option.n-checkbox--checked {
+  border-color: var(--brand-500);
+  background: color-mix(in srgb, var(--brand-50) 72%, var(--surface-1));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand-500) 18%, transparent);
+}
+.capability-option :deep(.n-checkbox-box) {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.capability-option :deep(.n-checkbox__label) {
+  min-width: 0;
+  flex: 1;
+  padding-left: 8px;
+}
+.capability-option-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.capability-option-copy strong,
+.capability-option-copy small {
+  overflow-wrap: anywhere;
+}
+.capability-option-copy strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+.capability-option-copy small {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.35;
+}
+.capability-option.n-checkbox--checked .capability-option-copy strong {
+  color: var(--brand-600);
+}
+.endpoint-preview {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
 }
 .modal-lead {
   margin: 0 0 14px;
@@ -3845,10 +5260,9 @@ function kbModelSupportsVision(scanModel: string) {
 }
 .style-usage {
   margin-top: var(--space-3);
-  padding: var(--space-3);
-  background: var(--surface-1);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
+  padding: 0;
+  background: transparent;
+  border: none;
 }
 .style-usage-title {
   color: var(--text-primary);
@@ -3859,10 +5273,13 @@ function kbModelSupportsVision(scanModel: string) {
 .style-usage-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-2);
+  gap: var(--space-3);
 }
 .style-usage-item {
   min-width: 0;
+  padding: var(--space-3);
+  background: var(--surface-2);
+  border-radius: var(--radius-md);
 }
 .style-usage-item-title {
   color: var(--text-primary);
@@ -3876,53 +5293,64 @@ function kbModelSupportsVision(scanModel: string) {
   font-size: 11.5px;
   line-height: 1.5;
 }
-/* ---- 风格卡片网格 ---- */
 .style-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 10px;
+  gap: var(--space-3);
 }
 .style-card {
-  background: var(--bg-3);
-  border: 1px solid var(--border-2);
-  border-radius: 8px;
-  padding: 14px 16px;
-  display: flex; flex-direction: column; gap: 8px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
   transition: border-color var(--dur-fast) var(--ease-out);
 }
-.style-card:hover { border-color: var(--accent); }
-.style-card-top { display: flex; align-items: center; gap: 8px; }
-.style-card-id { font-size: 12px; color: var(--text-3); }
-.style-card-label { font-size: 16px; font-weight: 600; }
+.style-card:hover { border-color: var(--border-strong); }
+.style-card-top { display: flex; align-items: center; gap: var(--space-2); }
+.style-card-id { font-size: 12px; color: var(--text-tertiary); }
+.style-card-label { font-size: 15px; font-weight: 600; color: var(--text-primary); }
 .style-card-desc {
-  font-size: 12px; color: var(--text-3); line-height: 1.5;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .style-card-actions {
-  display: flex; gap: 4px; margin-top: 4px;
-  border-top: 1px solid var(--border-2); padding-top: 10px;
+  display: flex;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-3);
 }
-/* ---- 风格编辑器弹窗 ---- */
+/* ---- 风格编辑器弹窗（glass panel + tighter density） ---- */
 .style-editor-dialog {
   width: min(920px, calc(100vw - 48px));
   max-height: min(84vh, 760px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--surface-1);
-  border: 1px solid var(--border-default);
+  background: var(--glass-panel-bg);
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
 }
 .style-editor-head {
-  min-height: 64px;
-  padding: 16px 20px;
+  min-height: 56px;
+  padding: 12px 18px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
   border-bottom: 1px solid var(--border-subtle);
-  background: var(--surface-1);
+  background: transparent;
   flex-shrink: 0;
 }
 .style-editor-title-block {
@@ -3932,10 +5360,11 @@ function kbModelSupportsVision(scanModel: string) {
   gap: 3px;
 }
 .style-editor-title {
-  font-size: 16px;
-  font-weight: 600;
+  font-size: 15px;
+  font-weight: 650;
   color: var(--text-primary);
   line-height: 1.25;
+  letter-spacing: -0.02em;
 }
 .style-editor-subtitle {
   font-size: 12px;
@@ -3945,8 +5374,8 @@ function kbModelSupportsVision(scanModel: string) {
   white-space: nowrap;
 }
 .style-editor-close {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3966,13 +5395,13 @@ function kbModelSupportsVision(scanModel: string) {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 18px 20px 20px;
+  padding: 14px 18px 16px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  background: var(--surface-0);
+  gap: 12px;
+  background: transparent;
 }
-.editor-meta { display: flex; gap: 16px; }
+.editor-meta { display: flex; gap: 12px; }
 .meta-item { flex: 1; display: flex; flex-direction: column; gap: 4px; }
 .meta-item label { font-size: 12px; font-weight: 600; color: var(--text-2); }
 .meta-hint { font-size: 11px; color: var(--text-3); }
@@ -3984,11 +5413,17 @@ function kbModelSupportsVision(scanModel: string) {
 .editor-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 8px;
-  padding: 12px 20px 14px;
+  padding: 10px 18px 12px;
   border-top: 1px solid var(--border-subtle);
-  background: var(--surface-1);
+  background: transparent;
   flex-shrink: 0;
+}
+.editor-actions :deep(.n-button) {
+  --n-height: var(--control-height);
+  min-width: 72px;
+  font-weight: 500;
 }
 /* ---- 旧样式保留 ---- */
 .field-head {
@@ -4021,149 +5456,503 @@ function kbModelSupportsVision(scanModel: string) {
 code {
   background: var(--bg-3); padding: 1px 6px; border-radius: 3px;
   font-family: ui-monospace, Menlo, monospace; font-size: 12px;}
-.archive-group { margin-bottom: 16px; }
+.archive-tab { max-width: 720px; }
+.archive-group { margin-bottom: var(--space-4); }
 .archive-group-title {
-  font-weight: 600; font-size: 13px;
-  padding: 4px 0 8px; border-bottom: 1px solid var(--border-2);
-  margin-bottom: 8px; color: var(--text-2);
+  font-weight: 600;
+  font-size: 13px;
+  padding: 0 0 var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: var(--space-2);
+  color: var(--text-secondary);
 }
 .archive-row {
-  display: flex; align-items: center; gap: 12px;
-  padding: 6px 8px; border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 8px var(--space-2);
+  border-radius: var(--radius-md);
 }
-.archive-row:hover { background: var(--bg-3); }
-.archive-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.archive-meta { font-size: 11px; color: var(--text-4); white-space: nowrap; }
+.archive-row:hover { background: var(--surface-2); }
+.archive-title {
+  flex: 1;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.archive-meta {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .confirm-body { padding: 8px 0; }
 .confirm-body p { margin: 0 0 16px; font-size: 14px; color: var(--text-2); }
 .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.skill-repos-bar {
-  display: flex; align-items: center; gap: 6px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--border-2);
-  flex-shrink: 0;
+.settings-mini-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
 }
-.repo-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.settings-mini-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.settings-mini-field label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.settings-mini-field :deep(.n-input) {
+  --n-height: var(--control-height);
+  --n-font-size: 13px;
+}
+.skills-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: var(--space-3);
+}
+.skill-repos-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.repo-chips { display: flex; gap: var(--space-1); flex-wrap: wrap; align-items: center; }
 .skill-columns {
-  flex: 1; min-height: 0;
-  display: flex; gap: 0;
-  margin-top: 8px;
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
 }
 .skill-col {
-  flex: 1; min-width: 0;
-  display: flex; flex-direction: column;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
 }
-.skill-col-left { border-right: 1px solid var(--border-2); padding-right: 12px; }
-.skill-col-right { padding-left: 12px; }
 .skill-col-header {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-bottom: 6px; gap: 8px; flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-2) var(--space-3);
+  gap: var(--space-2);
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-2);
 }
 .skill-col-body {
-  flex: 1 1 auto; min-height: 0;
-  max-height: calc(80vh - 220px);
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  padding: var(--space-2);
 }
-.skill-section-title { font-size: 12px; color: var(--text-3); white-space: nowrap; }
-.skill-hint { font-size: 12px; color: var(--text-3); }
+.skill-col-body .settings-empty {
+  margin: var(--space-2);
+  background: transparent;
+  border-style: none;
+}
+.skill-section-title { font-size: 12.5px; color: var(--text-primary); font-weight: 600; white-space: nowrap; }
+.skill-hint { font-size: 12px; color: var(--text-tertiary); white-space: nowrap; }
+.skill-filter { width: 132px; }
 .skill-result-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 5px 8px; border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 8px var(--space-2);
+  border-radius: var(--radius-md);
 }
-.skill-result-row:hover { background: var(--bg-3); }
-.skill-result-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.skill-result-name { font-size: 12.5px; font-weight: 500; }
+.skill-result-row:hover { background: var(--surface-2); }
+.skill-result-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.skill-result-name { font-size: 12.5px; font-weight: 500; color: var(--text-primary); }
 .skill-result-desc {
-  font-size: 11px; color: var(--text-4);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .skill-search { display: flex; gap: 8px; margin-bottom: 12px; }
 .skill-search-results { margin-bottom: 12px; }
 .skill-divider { border-top: 1px solid var(--border-2); margin: 12px 0; }
-.upstream-error { color: var(--warn); padding: 8px 0; }
-.upstream-hint { font-size: 13px; color: var(--text-3); margin: 0 0 12px; }
-.upstream-list { max-height: 400px; overflow: auto; }
-.upstream-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border-2);
-  font-size: 13px;
-}
-.upstream-item:hover { background: var(--bg-3); }
-.upstream-id { flex: 1; font-family: ui-monospace, monospace; font-size: 12.5px; }
-.upstream-owner { color: var(--text-4); font-size: 11px; }
-.upstream-item.added { opacity: 0.6; }
 /* ---- Knowledge Base ---- */
-.kb-detail-scroll { flex: 1; overflow-y: auto; }
-.scan-progress { padding: 8px 0; }
-.scan-info { display: flex; gap: 12px; align-items: center; font-size: 13px; }
-.scan-bar { height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 4px; flex: 1; }
-.scan-bar-fill { height: 100%; background: var(--accent); transition: width var(--dur-slow) var(--ease-out); }
-.scan-bar-pct { font-size: 10px; color: var(--text-4); margin-left: 6px; white-space: nowrap; }
-.scan-meta { font-size: 11px; color: var(--text-3); margin-top: 4px; }
+.provider-item-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.kb-list-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+}
+.kb-list-avatar {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  letter-spacing: -0.02em;
+  margin-top: 1px;
+}
+.kb-list-item.active .kb-list-avatar {
+  background: var(--brand-100);
+  color: var(--brand-700);
+}
+.kb-list-body {
+  flex: 1;
+  min-width: 0;
+}
+.kb-list-item .provider-item-head {
+  margin-bottom: var(--space-1);
+}
+.kb-item-status {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+.kb-item-status.is-scan { color: var(--brand-600); }
+.kb-item-status.is-error { color: var(--error-500); }
 
-/* ---- Knowledge Base Cards ---- */
+.kb-detail-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: var(--space-3);
+  /* Primary scrollport for the knowledge detail pane.
+   * When scan progress + expanded settings exceed the pane,
+   * this scrolls instead of clipping children. */
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* 全局库详情里的召回预览区 / recall preview section in the global detail pane. */
+.kb-recall {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.kb-recall-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.kb-recall-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+.kb-recall-hint {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
 .kb-header {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 10px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface-1);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
 }
-.kb-header-left { display: flex; align-items: center; gap: 8px; }
-
-.kb-config-row {
-  display: flex; align-items: center; gap: 10px; padding: 3px 0;
+.kb-header-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
 }
-.kb-config-label {
-  font-size: 12px; color: var(--text-3); width: 56px; flex-shrink: 0;
+.kb-header-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.kb-header .settings-form-actions {
+  margin-top: 0;
+  flex-wrap: nowrap;
+}
+.kb-header-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.kb-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.kb-enable-toggle {
+  padding-right: var(--space-3);
+  border-right: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+.kb-enable-toggle .settings-form-label {
+  font-size: 12.5px;
+  margin: 0;
+}
+.kb-header-meta {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.kb-header-path {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-tertiary);
   line-height: 1.4;
 }
-.kb-config-val { font-size: 12px; color: var(--text-2); }
-.kb-config-val.path { word-break: break-all; font-family: ui-monospace, monospace; font-size: 11.5px; }
-.kb-config-hint { font-size: 11px; color: var(--text-4); padding: 1px 0 3px 66px; line-height: 1.4; }
-.kb-hint-accent { color: var(--accent); }
-.kb-hint-muted { color: var(--text-4); }
-.kb-unit { font-size: 11px; color: var(--text-4); margin-left: 4px; }
-
-/* AI scan settings layout */
-.kb-settings-grid { margin-top: 2px; }
-.kb-settings-row {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-  margin-bottom: 10px;
-}
-.kb-settings-card {
-  border: 1px solid var(--border-2);
-  border-radius: 6px;
-  padding: 10px 12px;
-  background: var(--bg-2);
-}
-.kb-settings-card-title {
-  font-size: 12px; font-weight: 600; color: var(--text-1);
-  margin-bottom: 6px;
-}
-
-/* Tree panel split layout */
-.kb-tree-panel {
-  display: flex; gap: 0; min-height: 300px; max-height: 400px;
-  border: 1px solid var(--border-2); border-radius: 6px;
+.kb-header-path span {
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.kb-header-path-icon {
+  flex-shrink: 0;
+  color: var(--text-quaternary);
+}
+
+.scan-progress {
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.scan-progress.is-done {
+  border-color: var(--border-subtle);
+  background: var(--success-50);
+}
+.scan-progress.is-error {
+  border-color: var(--border-subtle);
+  background: var(--error-50);
+}
+.scan-progress-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.scan-info {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.scan-phase {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+.scan-count {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+.scan-error {
+  color: var(--error-500);
+  font-size: 11.5px;
+}
+.scan-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  justify-content: flex-end;
+}
+.scan-stat {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 1px var(--space-2);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+.scan-stat.is-fail {
+  color: var(--error-500);
+  border-color: var(--error-50);
+  background: var(--error-50);
+}
+.scan-bar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.scan-bar {
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  overflow: hidden;
+  flex: 1;
+}
+.scan-bar-fill {
+  height: 100%;
+  background: var(--brand-500);
+  border-radius: var(--radius-pill);
+  transition: width var(--dur-slow) var(--ease-out);
+}
+.scan-bar-pct {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  min-width: 2.5em;
+  text-align: right;
+}
+
+.kb-scan-collapse { flex-shrink: 0; }
+.kb-scan-form { gap: var(--space-3) var(--space-4); }
+.kb-scan-toggle-row {
+  padding-top: var(--space-1);
+  border-top: 1px solid var(--border-subtle);
+  margin-top: var(--space-1);
+}
+.kb-hint-accent { color: var(--brand-600); }
+.kb-size-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.kb-size-input {
+  width: 100%;
+  max-width: 140px;
+}
+.kb-unit {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.kb-explorer {
+  display: flex;
+  flex-direction: column;
+  /* Grow to fill leftover space; keep a floor so the tree
+   * stays usable. When upper blocks (scan + settings) eat
+   * the pane, parent .kb-detail-body scrolls instead. */
+  flex: 1 1 auto;
+  min-height: 180px;
+  gap: var(--space-2);
+}
+.kb-explorer-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+.kb-explorer-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+.kb-explorer-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.kb-tree-panel {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--surface-0);
 }
 .kb-tree-left {
-  width: 260px; flex-shrink: 0; display: flex; flex-direction: column;
-  border-right: 1px solid var(--border-2); background: var(--bg-2);
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--surface-1);
 }
 .kb-tree-right {
-  flex: 1; min-width: 0; overflow-y: auto;
-  background: var(--bg-1);
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  background: var(--surface-1);
 }
 .kb-tree-toolbar {
-  display: flex; align-items: center; gap: 4px;
-  padding: 6px 8px; border-bottom: 1px solid var(--border-2);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
 }
-.kb-tree-scroll { flex: 1; overflow-y: auto; padding: 4px 0; }
+.kb-tree-filter { flex: 1; min-width: 0; }
+.kb-tree-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: var(--space-1) 0; }
+.kb-tree { height: 100%; }
+.kb-panel-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 100%;
+  min-height: 140px;
+  padding: var(--space-6);
+  color: var(--text-tertiary);
+  font-size: 12.5px;
+  text-align: center;
+}
+.kb-panel-empty :deep(svg) { color: var(--text-quaternary); }
 
-/* Tree node label styles */
 .kb-tree-label {
-  display: inline-flex; align-items: center; gap: 4px;
-  font-size: 12px; min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 12px;
+  min-width: 0;
 }
 .kb-tree-label.l1 { font-weight: 600; color: var(--text-primary); }
 .kb-tree-label.l2 { color: var(--text-secondary); }
@@ -4171,81 +5960,126 @@ code {
 .kb-tree-icon { flex-shrink: 0; color: var(--text-tertiary); }
 .kb-tree-label.l1 .kb-tree-icon { color: var(--brand-500); }
 .kb-tree-label-text {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .kb-tree-label-tag {
-  font-size: 9px; color: var(--text-4); background: var(--bg-3);
-  padding: 0 4px; border-radius: 3px; flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  background: var(--surface-2);
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
 }
 .kb-tree-label-cnt {
-  font-size: 10px; color: var(--text-4); flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
 }
 
-/* Node detail panel */
-.kb-node-detail { padding: 12px; }
+.kb-node-detail { padding: var(--space-4); }
 .kb-node-detail-header {
-  display: flex; align-items: flex-start; justify-content: space-between;
-  gap: 8px; margin-bottom: 8px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
 }
 .kb-node-detail-title {
-  display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
 }
-.kb-node-icon { flex-shrink: 0; font-size: 16px; }
+.kb-node-icon { flex-shrink: 0; color: var(--text-tertiary); }
 .kb-node-title-text {
-  font-size: 13px; font-weight: 600; line-height: 1.3;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-primary);
 }
 .kb-node-meta {
-  display: flex; gap: 8px; font-size: 11px; padding: 2px 0;
+  display: flex;
+  gap: var(--space-2);
+  font-size: 11.5px;
+  padding: 2px 0;
 }
-.kb-node-meta-label { color: var(--text-4); flex-shrink: 0; }
+.kb-node-meta-label { color: var(--text-tertiary); flex-shrink: 0; }
 .kb-node-meta-val {
-  color: var(--text-2); word-break: break-all;
-  font-family: ui-monospace, monospace; font-size: 10.5px;
+  color: var(--text-secondary);
+  word-break: break-all;
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
-
-/* Statistics cards */
 .kb-node-stats {
-  display: flex; gap: 12px; padding: 10px 0; margin: 8px 0;
-  border-top: 1px solid var(--border-2);
-  border-bottom: 1px solid var(--border-2);
+  display: flex;
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
+  margin: var(--space-2) 0;
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
 }
-.kb-stat-item { text-align: center; min-width: 50px; }
-.kb-stat-num { display: block; font-size: 18px; font-weight: 700; color: var(--accent); }
-.kb-stat-label { font-size: 10px; color: var(--text-4); }
-
-/* Sections in detail */
-.kb-node-section { margin-top: 10px; }
+.kb-stat-item { text-align: center; min-width: 48px; }
+.kb-stat-num {
+  display: block;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--brand-600);
+  font-variant-numeric: tabular-nums;
+}
+.kb-stat-label { font-size: 11px; color: var(--text-tertiary); }
+.kb-node-section { margin-top: var(--space-3); }
 .kb-node-section-title {
-  font-size: 11px; font-weight: 600; color: var(--text-3);
-  margin-bottom: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: var(--space-2);
 }
 .kb-node-overview {
-  font-size: 12px; color: var(--text-2); white-space: pre-wrap;
-  line-height: 1.5; background: var(--bg-2); padding: 8px 10px;
-  border-radius: 4px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  line-height: 1.5;
+  background: var(--surface-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
 }
-.kb-node-content-block { margin-bottom: 6px; }
-
-/* Child rows in L2 detail */
+.kb-node-content-block { margin-bottom: var(--space-2); }
 .kb-node-child-row {
-  display: flex; align-items: center; gap: 6px;
-  padding: 5px 8px; border-radius: var(--radius-sm); cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px var(--space-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
   transition: background var(--dur-fast) var(--ease-out);
 }
-.kb-node-child-row:hover { background: var(--bg-3); }
-.kb-node-child-row.active { background: var(--bg-3); }
-.kb-node-child-icon { font-size: 11px; color: var(--text-4); flex-shrink: 0; }
+.kb-node-child-row:hover,
+.kb-node-child-row.active { background: var(--surface-2); }
+.kb-node-child-icon { color: var(--text-tertiary); flex-shrink: 0; }
 .kb-node-child-title {
-  flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; min-width: 0;
+  flex: 1;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
-.kb-node-child-meta { font-size: 10px; color: var(--text-4); flex-shrink: 0; }
-
-/* Content pre blocks */
+.kb-node-child-meta { font-size: 11px; color: var(--text-tertiary); flex-shrink: 0; }
 .kb-tree-pre {
-  margin: 0; padding: 6px 8px; background: var(--bg-3); border-radius: 4px;
-  font-size: 10.5px; line-height: 1.4; white-space: pre-wrap; word-break: break-word;
-  max-height: 120px; overflow-y: auto; font-family: ui-monospace, monospace;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
 }
 
 /* System config tab.
@@ -4268,10 +6102,10 @@ code {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: var(--space-3);
 }
-.system-config-body > .settings-section {
-  margin-bottom: var(--space-4);
+.sys-lead {
+  margin: 0 0 var(--space-1);
 }
 
 /* Form grid + row inside settings-collapse items.
@@ -4315,6 +6149,178 @@ code {
   white-space: normal;
   min-width: 0;
 }
+.upstream-error {
+  color: var(--error-500);
+  padding: var(--space-3);
+  border: 1px solid var(--error-50);
+  border-radius: var(--radius-md);
+  background: var(--error-50);
+}
+.upstream-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin-bottom: var(--space-3);
+}
+.upstream-meta code {
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.upstream-empty {
+  padding: var(--space-5) var(--space-3);
+}
+.upstream-list {
+  display: grid;
+  gap: var(--space-2);
+  max-height: min(420px, 56vh);
+  overflow-y: auto;
+}
+.upstream-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  transition: border-color var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+.upstream-item:hover {
+  border-color: var(--border-default);
+  background: var(--surface-2);
+}
+.upstream-item.added {
+  opacity: 0.65;
+}
+.upstream-model-copy {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.upstream-id {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.upstream-owner {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.recognition-route-list {
+  display: grid;
+  gap: var(--space-2);
+}
+.recognition-route-card {
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-2);
+}
+.recognition-route-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.recognition-route-heading > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.recognition-route-heading strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.recognition-route-heading span {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+}
+.recognition-route-fields {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(160px, 1.2fr) 104px minmax(156px, 0.8fr);
+  gap: 8px;
+}
+.recognition-route-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.recognition-route-field > span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.2;
+}
+.generation-default-list {
+  display: grid;
+  gap: var(--space-1);
+}
+.generation-default-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(240px, 1.5fr);
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.generation-default-row:first-child {
+  border-top: 0;
+}
+.generation-default-copy {
+  display: grid;
+  gap: 2px;
+}
+.generation-default-copy strong {
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.generation-default-copy span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.media-size-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 68px;
+  gap: var(--space-1);
+}
+.model-context-control {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(140px, 1fr);
+  gap: 8px;
+}
+@media (max-width: 760px) {
+  .recognition-route-fields {
+    grid-template-columns: 1fr 1fr;
+  }
+  .capability-option-grid--llm,
+  .capability-option-grid--generation {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .generation-default-row,
+  .generation-api-fields {
+    grid-template-columns: 1fr;
+  }
+  .generation-api-field--create,
+  .generation-api-field--query,
+  .generation-api-field--timeout {
+    grid-column: 1;
+    grid-row: auto;
+  }
+}
+@media (max-width: 560px) {
+  .capability-option-grid--llm,
+  .capability-option-grid--generation {
+    grid-template-columns: 1fr;
+  }
+}
 
 .sys-actions {
   display: flex;
@@ -4327,11 +6333,11 @@ code {
 }
 
 .browser-ext-download-link {
-  color: var(--accent);
+  color: var(--brand-500);
   text-decoration: underline;
 }
 .browser-ext-download-link:hover {
-  opacity: 0.8;
+  color: var(--brand-600);
 }
 .browser-server-url-box {
   display: inline-flex;
@@ -4339,13 +6345,13 @@ code {
   gap: 6px;
   margin-top: 4px;
   padding: 4px 8px;
-  background: var(--surface-2, #1e1e1e);
-  border: 1px solid var(--border, #333);
-  border-radius: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
   font-size: 12px;
 }
 .browser-server-url-box code {
-  color: var(--accent);
+  color: var(--brand-600);
   user-select: all;
 }
 .browser-diagnostics {
@@ -4375,7 +6381,7 @@ code {
   word-break: break-all;
 }
 .browser-diagnostic-value.is-error {
-  color: var(--danger, #dc2626);
+  color: var(--error-500);
 }
 
 .browser-conn-card {
@@ -4384,7 +6390,7 @@ code {
   gap: 10px;
 }
 .browser-tabs-panel {
-  border-top: 1px solid var(--border, rgba(255,255,255,0.08));
+  border-top: 1px solid var(--border-subtle);
   padding-top: 10px;
   display: flex;
   flex-direction: column;

@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { NModal, NButton, NInput, NSpace, useMessage } from 'naive-ui'
-import { state, switchSession, getPendingPlanText, clearPendingPlan, appendStreamEvent, recoverMissingParts } from '../stores/chat'
+import { NModal, NButton, NInput, useMessage } from 'naive-ui'
+import { state, getPendingPlanText, clearPendingPlan, appendLocalUserMessage } from '../stores/chat'
 import * as api from '../api/client'
+import { submitConversationTurn } from '../composables/conversationTurn'
 
 const message = useMessage()
 const editing = ref(false)
 const editedText = ref('')
+const approving = ref(false)
 
 const id = computed(() => state.currentID)
 const planText = computed(() => getPendingPlanText(id.value))
@@ -19,36 +21,63 @@ function startEdit() {
 }
 
 async function approve(planOverride?: string) {
-  const text = planOverride ?? planText.value
-  if (!text) return
-  clearPendingPlan(id.value)
+  const sessionId = id.value
+  const originalPlan = planText.value
+  const text = (planOverride ?? originalPlan).trim()
+  if (!sessionId || !text || approving.value) return
+  approving.value = true
   editing.value = false
   try {
-    await api.executePlan(id.value, text)
-    await api.updateSessionMeta(id.value, { plan_mode: false })
-    // Reload messages so the plan text appears in the chat.
-    const r = await api.listMessages(id.value, { limit: 200 })
-    state.sessionMessages[id.value] = r.messages
-    // Submit the continuation message to trigger actual execution.
-    const meta = state.sessionMeta[id.value] || {}
+    await api.executePlan(sessionId, text)
+    clearPendingPlan(sessionId)
+    const meta = state.sessionMeta[sessionId] || {}
+    state.sessionMeta[sessionId] = {
+      ...meta,
+      plan_mode: false,
+      turn_mode_policy: 'build',
+    }
+    const session = state.sessions.find(s => s.id === sessionId)
+    if (session) {
+      session.plan_mode = false
+      session.turn_mode_policy = 'build'
+    }
+
+    const executionMessage = text === originalPlan.trim()
+      ? '请按已批准计划执行'
+      : `请按以下已批准计划执行：\n\n${text}`
     const clientMsgId = Date.now() * 1000 + Math.floor(Math.random() * 1000)
-    await api.streamMessagesRetry(id.value, {
-      message: '请按计划执行',
-      client_msg_id: clientMsgId,
+    appendLocalUserMessage(sessionId, {
+      id: clientMsgId,
+      role: 'user',
+      content: executionMessage,
+      created_at: Date.now() / 1000,
+    })
+    await submitConversationTurn({
+      sessionId,
+      message: executionMessage,
+      clientMsgID: clientMsgId,
       provider: meta.provider,
       model: meta.model,
       style: meta.style || 'tech',
       workMode: meta.workMode,
-      onStreamDrop: ({ lastSeq, reason }) => {
-        // P0-1: same recovery flow as the main input
-        // path. The plan-execution stream can also drop
-        // mid-turn; merge whatever landed via snapshot.
-        recoverMissingParts(id.value, lastSeq, reason).catch(() => {})
+      useImageRecognition: meta.use_image_recognition,
+      subAgentModelEnabled: !!meta.sub_agent_model_enabled,
+      subAgentProvider: meta.sub_agent_provider || '',
+      subAgentModel: meta.sub_agent_model || '',
+      turnModePolicy: 'build',
+      todoMode: 'resume',
+      onServerError: (event) => {
+        if (event.suggestion) {
+          message.error(`${event.error}\n${event.suggestion}`, { duration: 8000 })
+        } else if (event.error) {
+          message.error(event.error)
+        }
       },
-      onEvent: (ev) => appendStreamEvent(id.value, ev),
     })
   } catch (e: any) {
     message.error('执行计划失败: ' + e.message)
+  } finally {
+    approving.value = false
   }
 }
 
@@ -63,9 +92,9 @@ function cancel() {
     <div class="plan-review">
       <div class="plan-text">{{ planText }}</div>
       <div class="plan-actions">
-        <NButton @click="cancel">取消</NButton>
-        <NButton @click="startEdit">编辑</NButton>
-        <NButton type="primary" @click="approve()">批准执行</NButton>
+        <NButton :disabled="approving" @click="cancel">取消</NButton>
+        <NButton :disabled="approving" @click="startEdit">编辑</NButton>
+        <NButton type="primary" :loading="approving" @click="approve()">批准执行</NButton>
       </div>
     </div>
   </NModal>
@@ -78,8 +107,8 @@ function cancel() {
         placeholder="编辑计划内容..."
       />
       <div class="plan-actions" style="margin-top: 16px">
-        <NButton @click="editing = false">返回</NButton>
-        <NButton type="primary" @click="approve(editedText)">保存并执行</NButton>
+        <NButton :disabled="approving" @click="editing = false">返回</NButton>
+        <NButton type="primary" :loading="approving" @click="approve(editedText)">保存并执行</NButton>
       </div>
     </div>
   </NModal>

@@ -130,30 +130,22 @@ func buildTodoGuardPrompt(mode TodoMode, items []tool.TodoItem, checkpoint bool)
 	return b.String()
 }
 
-// upsertTodoGuard replaces one marked block in the first system message. It
-// never appends per-round messages, which keeps context growth bounded even
-// when auto-continue or checkpoint rounds are used. The block also survives
-// auto-compaction because compaction preserves the first system message.
-func upsertTodoGuard(msgs *[]llm.ChatMessage, mode TodoMode, items []tool.TodoItem, checkpoint bool) {
+// appendTodoGuard 保留旧快照，仅在状态变化后追加新的 Todo 上下文。
+// appendTodoGuard preserves old snapshots and appends only changed todo state.
+func appendTodoGuard(msgs *[]llm.ChatMessage, mode TodoMode, items []tool.TodoItem, checkpoint bool) bool {
 	if msgs == nil || len(*msgs) == 0 {
-		return
+		return false
 	}
-	msg := &(*msgs)[0]
 	block := todoGuardStart + buildTodoGuardPrompt(mode, items, checkpoint) + todoGuardEnd
-	content := msg.Content
-	start := strings.Index(content, todoGuardStart)
-	if start >= 0 {
-		endOffset := strings.Index(content[start+len(todoGuardStart):], todoGuardEnd)
-		if endOffset >= 0 {
-			end := start + len(todoGuardStart) + endOffset + len(todoGuardEnd)
-			msg.Content = content[:start] + block + content[end:]
-			return
+	if !todoGuardActive(mode, items) && !checkpoint {
+		for _, msg := range *msgs {
+			if llm.IsRuntimeContext(msg) && msg.Name == llm.RuntimeContextPrefix+"todo" {
+				return appendRuntimeContext(msgs, "todo", block)
+			}
 		}
-		// A malformed/truncated marker should not accumulate another copy.
-		msg.Content = content[:start] + block
-		return
+		return false
 	}
-	msg.Content += block
+	return appendRuntimeContext(msgs, "todo", block)
 }
 
 func todoOnlyToolDefs(defs []llm.ToolDef) []llm.ToolDef {

@@ -15,11 +15,11 @@ import (
 )
 
 type grepArgs struct {
-	Pattern        string `json:"pattern"`
-	Path           string `json:"path,omitempty"`
-	CaseSensitive  bool   `json:"case_sensitive,omitempty"`
-	TopK           int    `json:"top_k,omitempty"`
-	Base           string `json:"base,omitempty"`
+	Pattern       string `json:"pattern"`
+	Path          string `json:"path,omitempty"`
+	CaseSensitive bool   `json:"case_sensitive,omitempty"`
+	TopK          int    `json:"top_k,omitempty"`
+	Base          string `json:"base,omitempty"`
 }
 
 // RegisterGrep registers the grep tool for keyword-based file search
@@ -249,6 +249,13 @@ func grepKnowledgeBases(ctx context.Context, cfg *config.Config, baseName, patte
 				if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
 					return filepath.SkipDir
 				}
+				if path != absPath {
+					rel, _ := filepath.Rel(absPath, path)
+					rel = filepath.ToSlash(rel)
+					if knowledge.ExcludedByPatterns(rel, base.ExcludePatterns) {
+						return filepath.SkipDir
+					}
+				}
 				return nil
 			}
 			if !knowledge.IndexableExtensions[strings.ToLower(filepath.Ext(path))] {
@@ -258,16 +265,10 @@ func grepKnowledgeBases(ctx context.Context, cfg *config.Config, baseName, patte
 				return nil
 			}
 			// Check base-level exclude patterns.
-			if len(base.ExcludePatterns) > 0 {
-				rel, err := filepath.Rel(absPath, path)
-				if err == nil {
-					for _, pat := range base.ExcludePatterns {
-						matched, _ := filepath.Match(pat, rel)
-						if matched {
-							return nil
-						}
-					}
-				}
+			rel, _ := filepath.Rel(absPath, path)
+			rel = filepath.ToSlash(rel)
+			if knowledge.ExcludedByPatterns(rel, base.ExcludePatterns) {
+				return nil
 			}
 			f, err := os.Open(path)
 			if err != nil {

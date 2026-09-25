@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { Clipboard, ChevronRight, ChevronDown } from './icons'
+import { copyText } from '../utils/clipboard'
 
 const props = defineProps<{ content: string; command?: string; elapsed?: string }>()
 
@@ -16,7 +17,7 @@ const filtered = computed(() => {
 })
 
 function copyAll() {
-  navigator.clipboard.writeText(props.content)
+  void copyText(props.content)
 }
 </script>
 
@@ -111,11 +112,11 @@ function copyAll() {
 .exec-search-input:focus { border-color: var(--brand-500); }
 .exec-output {
   margin: 0;
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
   font-size: 12px;
-  line-height: 1.5;
+  line-height: 1.45;
   color: var(--text-primary);
-  max-height: 400px;
+  max-height: 240px;
   overflow: auto;
   font-family: var(--font-mono);
 }

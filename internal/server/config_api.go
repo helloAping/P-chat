@@ -10,11 +10,15 @@ import (
 
 // AddProviderRequest is the body of POST /api/v1/providers.
 type AddProviderRequest struct {
-	Name     string `json:"name" binding:"required"`
-	Protocol string `json:"protocol" binding:"required"` // "openai" | "anthropic"
-	BaseURL  string `json:"base_url"`
-	APIKey   string `json:"api_key"`
-	Model    string `json:"model"`
+	Name            string            `json:"name" binding:"required"`
+	ProviderID      string            `json:"provider_id,omitempty"`
+	StrategyVariant string            `json:"strategy_variant,omitempty"`
+	Protocol        string            `json:"protocol" binding:"required"`
+	BaseURL         string            `json:"base_url"`
+	APIURL          string            `json:"api_url,omitempty"` // pre-V12 compatibility
+	APIKey          string            `json:"api_key"`
+	CustomHeaders   map[string]string `json:"custom_headers,omitempty"`
+	Model           string            `json:"model"`
 }
 
 // AddProvider POST /api/v1/providers
@@ -34,17 +38,25 @@ func (h *Handler) AddProvider(c *gin.Context) {
 		return
 	}
 	if err := config.AddProvider(config.ProviderConfig{
-		Name:     req.Name,
-		Protocol: req.Protocol,
-		BaseURL:  req.BaseURL,
-		APIKey:   req.APIKey,
-		Model:    req.Model,
+		Name:            req.Name,
+		ProviderID:      req.ProviderID,
+		StrategyVariant: req.StrategyVariant,
+		Protocol:        req.Protocol,
+		APIURL:          req.APIURL,
+		BaseURL:         req.BaseURL,
+		APIKey:          req.APIKey,
+		CustomHeaders:   req.CustomHeaders,
+		Model:           req.Model,
 	}); err != nil {
 		// The most common error is "already exists"; treat
 		// that as a 409 so the UI can show a friendly
 		// message. Other errors stay 500.
 		if strings.Contains(err.Error(), "already exists") {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		if strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), "base_url") || strings.Contains(err.Error(), "invalid protocol") || strings.Contains(err.Error(), "provider_id") || strings.Contains(err.Error(), "strategy_variant") || strings.Contains(err.Error(), "custom_headers") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -82,10 +94,14 @@ func (h *Handler) DeleteProvider(c *gin.Context) {
 // "omit means leave alone" rule still applies to the other
 // fields.
 type UpdateProviderRequest struct {
-	Name     string `json:"name,omitempty"`
-	Protocol string `json:"protocol,omitempty"`
-	BaseURL  string `json:"base_url,omitempty"`
-	APIKey   string `json:"api_key,omitempty"`
+	Name            string             `json:"name,omitempty"`
+	ProviderID      string             `json:"provider_id,omitempty"`
+	StrategyVariant *string            `json:"strategy_variant,omitempty"`
+	Protocol        string             `json:"protocol,omitempty"`
+	BaseURL         string             `json:"base_url,omitempty"`
+	APIURL          string             `json:"api_url,omitempty"` // pre-V12 compatibility
+	APIKey          string             `json:"api_key,omitempty"`
+	CustomHeaders   *map[string]string `json:"custom_headers,omitempty"`
 	// SetDefault, when true, makes this provider the global
 	// default. False is a no-op (the UI can always include
 	// the field without accidentally demoting a provider).
@@ -96,7 +112,7 @@ type UpdateProviderRequest struct {
 //
 // Unified edit endpoint. Replaces the old "api_key only"
 // endpoint. Supports renaming a provider, switching its
-// protocol (openai/anthropic), updating the base URL, the API
+// protocol (openai/anthropic), updating the provider Base URL, the API
 // key, and promoting it to the global default. Every field is
 // optional; non-zero values are written, others left alone.
 //
@@ -114,11 +130,15 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		return
 	}
 	updated, err := config.UpdateProvider(oldName, config.ProviderPatch{
-		Name:      req.Name,
-		Protocol:  req.Protocol,
-		BaseURL:   req.BaseURL,
-		APIKey:    req.APIKey,
-		IsDefault: req.SetDefault,
+		Name:            req.Name,
+		ProviderID:      req.ProviderID,
+		StrategyVariant: req.StrategyVariant,
+		Protocol:        req.Protocol,
+		APIURL:          req.APIURL,
+		BaseURL:         req.BaseURL,
+		APIKey:          req.APIKey,
+		CustomHeaders:   req.CustomHeaders,
+		IsDefault:       req.SetDefault,
 	})
 	if err != nil {
 		// Most common failure: name collision on rename.
@@ -126,7 +146,7 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
-		if strings.Contains(err.Error(), "invalid protocol") {
+		if strings.Contains(err.Error(), "invalid protocol") || strings.Contains(err.Error(), "provider_id") || strings.Contains(err.Error(), "strategy_variant") || strings.Contains(err.Error(), "api_url") || strings.Contains(err.Error(), "base_url") || strings.Contains(err.Error(), "custom_headers") {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -142,13 +162,16 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 	// without a follow-up GET. Use the *new* name (which may
 	// differ from oldName when the user renamed the provider).
 	c.JSON(http.StatusOK, ProviderFull{
-		Name:      updated.Name,
-		Protocol:  updated.GetProtocol(),
-		BaseURL:   updated.BaseURL,
-		APIKey:    updated.APIKey,
-		IsDefault: updated.Name == h.getCfg().LLM.Default,
-		Models:    updated.AllModels(),
-		Model:     updated.EffectiveModel(),
+		Name:            updated.Name,
+		ProviderID:      updated.GetProviderID(),
+		StrategyVariant: updated.GetStrategyVariant(),
+		Protocol:        updated.GetProtocol(),
+		BaseURL:         updated.EffectiveBaseURL(),
+		APIKey:          updated.APIKey,
+		CustomHeaders:   updated.CustomHeaders,
+		IsDefault:       updated.Name == h.getCfg().LLM.Default,
+		Models:          updated.AllModels(),
+		Model:           updated.EffectiveModel(),
 	})
 }
 
@@ -172,11 +195,14 @@ func (h *Handler) SetDefaultProvider(c *gin.Context) {
 
 // AddModelRequest is the body of POST /api/v1/providers/:name/models.
 type AddModelRequest struct {
-	Name             string `json:"name" binding:"required"`
-	DisplayName      string `json:"display_name"`
-	Description      string `json:"description"`
-	MaxTokensContext int    `json:"max_tokens_context"`
-	MaxTokensOutput  int    `json:"max_tokens_output"`
+	Name             string                             `json:"name" binding:"required"`
+	APIEndpoint      string                             `json:"api_endpoint,omitempty"`
+	DisplayName      string                             `json:"display_name"`
+	Description      string                             `json:"description"`
+	MaxTokensContext int                                `json:"max_tokens_context"`
+	MaxTokensOutput  int                                `json:"max_tokens_output"`
+	Type             config.ModelType                   `json:"type,omitempty"`
+	Generation       *config.MediaGenerationModelConfig `json:"generation,omitempty"`
 }
 
 // AddModel POST /api/v1/providers/:name/models
@@ -193,12 +219,19 @@ func (h *Handler) AddModel(c *gin.Context) {
 	}
 	if _, err := config.AddModel(name, config.ModelConfig{
 		Name:             req.Name,
+		APIEndpoint:      req.APIEndpoint,
 		DisplayName:      req.DisplayName,
 		Description:      req.Description,
 		MaxTokensContext: req.MaxTokensContext,
 		MaxTokensOutput:  req.MaxTokensOutput,
+		Type:             req.Type,
+		Generation:       req.Generation,
 	}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "endpoint") || strings.Contains(err.Error(), "media generation model") || strings.Contains(err.Error(), "unsupported generation operation") {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	h.reloadAfterConfigChange()
@@ -214,6 +247,10 @@ func (h *Handler) DeleteModel(c *gin.Context) {
 	name := c.Param("name")
 	model := c.Param("model")
 	if err := config.RemoveModel(name, model); err != nil {
+		if strings.Contains(err.Error(), "used by generation default") {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

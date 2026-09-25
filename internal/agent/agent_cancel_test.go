@@ -51,6 +51,10 @@ func TestChatWithTools_CancelDoesNotWaitForBlockedTool(t *testing.T) {
 	if err := upgrade.SeedForTesting(store.DB()); err != nil {
 		t.Fatal(err)
 	}
+	sessionID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
 	styleMgr, err := style.NewManager(store.DB())
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +72,7 @@ func TestChatWithTools_CancelDoesNotWaitForBlockedTool(t *testing.T) {
 	agt := New(cfg, llmClient, styleMgr, store, registry)
 	ctx, cancel := context.WithCancel(context.Background())
 	stream := agt.ChatWithTools(ctx, ChatRequest{
-		Style: style.Tech, Provider: "test", Model: "test-model", SessionID: "cancel-tool-test",
+		Style: style.Tech, Provider: "test", Model: "test-model", SessionID: sessionID,
 		Messages: []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: "start"}},
 	})
 	streamClosed := make(chan struct{})
@@ -90,4 +94,12 @@ func TestChatWithTools_CancelDoesNotWaitForBlockedTool(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("agent stream stayed open after cancellation while a tool ignored its context")
 	}
+	// 停止不能丢失已发出的调用，否则恢复后无法说明工具被中断。
+	// Cancellation must retain issued calls for interrupted-tool history recovery.
+	for _, msg := range store.GetChatMessagesFor(sessionID, 0) {
+		if msg.Type == llm.TypeToolCall && msg.ToolID == "call_block" {
+			return
+		}
+	}
+	t.Fatal("cancelled turn lost its issued tool call")
 }

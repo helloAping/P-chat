@@ -2,8 +2,9 @@
 //
 // Architecture:
 //   - This is a Wails v2 app that opens a WebView2 window.
-//   - On startup, it spawns pchat-server as a child process on a
-//     stable preferred port on 127.0.0.1, falling back only if needed.
+//   - 启动时由 pchat-server 原子绑定自己的端口，GUI 再通过身份校验握手取得地址。
+//     On startup, pchat-server atomically binds its own port, then the GUI learns
+//     the selected address through an identity-checked handshake.
 //   - The webview serves ALL content from a reverse proxy: when the user
 //     navigates to http://wails.localhost/..., we forward the request to
 //     http://127.0.0.1:<port>/... (pchat-server). This keeps the webview
@@ -42,7 +43,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -61,9 +61,11 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	windowsoptions "github.com/wailsapp/wails/v2/pkg/options/windows"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"github.com/p-chat/pchat/cmd/pchat-gui/rotatelog"
+	"github.com/p-chat/pchat/runtimeprofile"
 )
 
 // appLogDir is the directory holding the GUI's rotated log files.
@@ -180,17 +182,21 @@ func main() {
 
 	app := NewApp()
 	err := wails.Run(&options.App{
-		Title:             "P-Chat",
+		Title:             applicationTitle(),
 		Width:             1280,
 		Height:            820,
 		MinWidth:          900,
 		MinHeight:         600,
+		Frameless:         true,
 		WindowStartState:  options.Normal,
 		StartHidden:       true,
 		HideWindowOnClose: false,
 		BackgroundColour:  &options.RGBA{R: 10, G: 10, B: 10, A: 1},
 		AssetServer: &assetserver.Options{
 			Handler: app,
+		},
+		Windows: &windowsoptions.Options{
+			WebviewUserDataPath: webviewUserDataPath(),
 		},
 		OnStartup:     app.startup,
 		OnDomReady:    app.domReady,
@@ -214,6 +220,9 @@ type App struct {
 	serverCmd          *exec.Cmd
 	backendURL         atomic.Pointer[string] // "http://127.0.0.1:PORT"
 	serverMu           sync.Mutex
+	profile            runtimeprofile.Profile
+	instanceID         string
+	runtimeFile        string
 	streamMu           sync.Mutex
 	activeStreams      map[string]*activeStream
 	serverStopped      bool
@@ -379,6 +388,50 @@ func (a *App) SaveExportFile(defaultFilename string, format string, dataBase64 s
 	return path, nil
 }
 
+// SaveDownloadFile opens the OS-native save dialog and writes an arbitrary
+// download payload. Prefer this over <a download> so WebView2 does not show
+// its built-in downloads flyout (ugly chrome we cannot style).
+// SaveDownloadFile 打开系统另存为对话框并写入下载内容，避免 WebView 原生下载弹层。
+func (a *App) SaveDownloadFile(defaultFilename string, dataBase64 string) (string, error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("wails context is not ready")
+	}
+	data, err := base64.StdEncoding.DecodeString(dataBase64)
+	if err != nil {
+		return "", fmt.Errorf("decode download data: %w", err)
+	}
+	defaultFilename = filepath.Base(strings.TrimSpace(defaultFilename))
+	if defaultFilename == "" || defaultFilename == "." || defaultFilename == string(filepath.Separator) {
+		defaultFilename = "download.bin"
+	}
+	ext := strings.TrimPrefix(filepath.Ext(defaultFilename), ".")
+	if ext == "" {
+		ext = "bin"
+	}
+	path, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
+		Title:                "保存文件",
+		DefaultFilename:      defaultFilename,
+		CanCreateDirectories: true,
+		Filters: []wailsruntime.FileFilter{
+			{DisplayName: strings.ToUpper(ext) + " (*." + ext + ")", Pattern: "*." + ext},
+			{DisplayName: "所有文件 (*.*)", Pattern: "*.*"},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("save dialog: %w", err)
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", nil // user cancelled
+	}
+	if filepath.Ext(path) == "" && ext != "" {
+		path += "." + ext
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("write download file: %w", err)
+	}
+	return path, nil
+}
+
 func exportFileDialogFilters(format string) (string, []wailsruntime.FileFilter) {
 	switch strings.ToLower(format) {
 	case "pdf":
@@ -412,7 +465,7 @@ func extractTraceID(bodyJSON string) string {
 }
 
 // GetBackendURL returns the pchat-server base URL (e.g.
-// "http://127.0.0.1:18960") for the webview to use as a direct
+// "http://127.0.0.1:43210") for the webview to use as a direct
 // connection point. Returns "" if the child server hasn't
 // announced its port yet — callers should retry.
 //
@@ -427,6 +480,12 @@ func (a *App) GetBackendURL() string {
 		return ""
 	}
 	return *v
+}
+
+// GetApplicationTitle 返回包含当前运行环境名称的可见应用标题。
+// GetApplicationTitle returns the visible title for the active runtime profile.
+func (a *App) GetApplicationTitle() string {
+	return applicationTitle()
 }
 
 // StreamMessages proxies a chat-completion request to pchat-server
@@ -589,18 +648,24 @@ func (a *App) unregisterStreamCancel(sessionID string, stream *activeStream) {
 }
 
 // openExplorer opens the OS file manager at the given path.
+// If path is a file, reveals/selects that file when the OS supports it.
+// openExplorer 打开资源管理器；若 path 是文件则尽量选中该文件。
 func openExplorer(path string) error {
 	stat, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("path not accessible: %w", err)
 	}
-	if !stat.IsDir() {
-		return fmt.Errorf("not a directory: %s", path)
-	}
 	switch runtime.GOOS {
 	case "windows":
-		return exec.Command("explorer", path).Start()
+		if stat.IsDir() {
+			return exec.Command("explorer", path).Start()
+		}
+		// /select, must be a single argument for explorer.exe
+		return exec.Command("explorer", "/select,"+path).Start()
 	default:
+		if !stat.IsDir() {
+			path = filepath.Dir(path)
+		}
 		return fmt.Errorf("file explorer not supported on %s", runtime.GOOS)
 	}
 }
@@ -1128,12 +1193,15 @@ func (a *App) stopServer() {
 		return
 	}
 	cmd := a.serverCmd
-	if cmd == nil || cmd.Process == nil {
-		a.serverMu.Unlock()
-		return
-	}
+	runtimeFile := a.runtimeFile
 	a.serverStopped = true
 	a.serverMu.Unlock()
+	if runtimeFile != "" {
+		defer os.Remove(runtimeFile)
+	}
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
 
 	log.Printf("stopping pchat-server PID=%d", cmd.Process.Pid)
 	if err := cmd.Process.Kill(); err != nil {
@@ -1197,6 +1265,27 @@ func (a *App) CancelWindowClose() {
 	a.closePromptPending.Store(false)
 }
 
+// RequestWindowClose starts the same close-confirm / tray path as the
+// OS caption-bar close, for the frameless custom TitleBar.
+// RequestWindowClose 供无边框标题栏关闭按钮调用，复用 OnBeforeClose 确认链路。
+func (a *App) RequestWindowClose() {
+	log.Printf("RequestWindowClose called")
+	action := closeActionForWindowClose(a.quitting.Load(), a.tray != nil && a.tray.ready())
+	if action == closeActionExit {
+		a.quitApp()
+		return
+	}
+	if a.noMoreConfirm.Load() && a.tray != nil && a.tray.ready() {
+		log.Printf("RequestWindowClose: noMoreConfirm — hiding to tray")
+		a.hideMainWindow()
+		return
+	}
+	if a.requestCloseConfirmation() {
+		return
+	}
+	a.quitApp()
+}
+
 // quitApp performs a real application exit from the tray menu.
 // quitApp 用于托盘菜单的真正退出路径。
 func (a *App) quitApp() {
@@ -1209,9 +1298,10 @@ func (a *App) quitApp() {
 
 // ---------- server spawning ----------
 
-// spawnAndWatch locates pchat-server, picks a preferred port, starts it
-// as a child process, installs the reverse proxy, waits for it to be
-// healthy, and finally shows the window.
+// spawnAndWatch 定位 pchat-server，以 profile 级启动握手拉起进程，安装反向代理，
+// 并在健康检查通过后显示应用。
+// spawnAndWatch locates pchat-server, starts it with a profile-scoped startup
+// handshake, installs the reverse proxy, and shows the healthy application.
 func (a *App) spawnAndWatch() {
 	bin, err := findServerBinary()
 	if err != nil {
@@ -1219,27 +1309,34 @@ func (a *App) spawnAndWatch() {
 		return
 	}
 
-	port, err := pickPreferredPort()
+	profile := currentRuntimeProfile()
+	instanceID, err := runtimeprofile.NewInstanceID()
 	if err != nil {
-		log.Printf("pickPreferredPort: %v", err)
+		log.Printf("create server instance identity: %v", err)
 		return
 	}
-	log.Printf("picked port %d", port)
+	runtimeFile, err := runtimeprofile.NewAnnouncementPath()
+	if err != nil {
+		log.Printf("create server announcement path: %v", err)
+		return
+	}
+	cleanupRuntimeFile := true
+	defer func() {
+		if cleanupRuntimeFile {
+			_ = os.Remove(runtimeFile)
+		}
+	}()
 
-	// pchat-server only accepts --config; the bind port is overridden
-	// via the PCHAT_PORT env var (see internal/serverproc).
 	var args []string
 	if cfg := pickConfigPath(); cfg != "" {
 		args = append(args, "--config", cfg)
 	}
 	cmd := exec.Command(bin, args...)
-	// Forward both PCHAT_PORT and PCHAT_HOME so the child
-	// server binds to the port we picked AND uses the same
-	// home directory as the GUI (a sibling of the GUI binary
-	// when running from bin/ or dev-bin/ — see homepath.go
-	// for the resolution rules).
-	cmd.Env = append(os.Environ(),
-		"PCHAT_PORT="+strconv.Itoa(port),
+	cmd.Env = append(environmentWithout(os.Environ(),
+		"PCHAT_PORT", "PCHAT_PORT_RANGE", "PCHAT_DATA_HOME", runtimeprofile.ProfileEnv,
+		runtimeprofile.InstanceEnv, runtimeprofile.RuntimeFileEnv),
+		childPortEnvironment(profile)...)
+	cmd.Env = append(cmd.Env,
 		// PCHAT_DATA_HOME (not PCHAT_HOME) — PCHAT_HOME is
 		// the install root set by install.ps1 -AddToPath.
 		// Reading it for the data dir would cause memory /
@@ -1247,7 +1344,10 @@ func (a *App) spawnAndWatch() {
 		// the resolved data dir explicitly so the child
 		// server agrees with us regardless of what the
 		// user's PCHAT_HOME happens to be.
-		"PCHAT_DATA_HOME="+resolveHomeDir(),
+		"PCHAT_DATA_HOME="+profile.DataHome,
+		runtimeprofile.ProfileEnv+"="+profile.Name,
+		runtimeprofile.InstanceEnv+"="+instanceID,
+		runtimeprofile.RuntimeFileEnv+"="+runtimeFile,
 	)
 	// pchat-gui is a WINDOWS_GUI subsystem binary, but Go's
 	// os/exec still allocates a fresh console for child processes
@@ -1273,41 +1373,39 @@ func (a *App) spawnAndWatch() {
 	a.serverMu.Lock()
 	a.serverCmd = cmd
 	a.serverStopped = false
+	a.profile = profile
+	a.instanceID = instanceID
+	a.runtimeFile = runtimeFile
 	a.serverMu.Unlock()
-	log.Printf("spawned pchat-server PID=%d", cmd.Process.Pid)
+	log.Printf("spawned pchat-server PID=%d profile=%s profile_id=%s instance_id=%s",
+		cmd.Process.Pid, profile.Name, profile.ID, instanceID)
 
-	// Store the backend URL immediately so the loading page can
-	// start polling /api/v1/health through us. The child is starting up
-	// in the background; the first few polls will get connection
-	// refused and the JS will retry.
-	beURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	waitCtx := a.ctx
+	if waitCtx == nil {
+		waitCtx = context.Background()
+	}
+	announcement, port, err := runtimeprofile.WaitAnnouncement(waitCtx, runtimeFile, profile, instanceID, cmd.Process.Pid, 30*time.Second)
+	if err != nil {
+		log.Printf("pchat-server startup handshake: %v", err)
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return
+	}
+	beURL := announcement.BaseURL
 	a.backendURL.Store(&beURL)
-
-	// Wait for the server to be healthy (max 30s).
-	healthURL := fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", port)
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			log.Printf("pchat-server exited prematurely (code %d)", cmd.ProcessState.ExitCode())
-			return
-		}
-		client := &http.Client{Timeout: 2 * time.Second}
-		if resp, herr := client.Get(healthURL); herr == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				break
-			}
-		}
-		time.Sleep(200 * time.Millisecond)
+	if err := waitForBackendIdentity(waitCtx, beURL, profile, instanceID, cmd.Process.Pid, 30*time.Second); err != nil {
+		log.Printf("pchat-server health check: %v", err)
+		a.backendURL.Store(nil)
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return
 	}
 	if a.ctx == nil {
 		log.Printf("wails ctx disappeared before health")
 		return
 	}
-	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-		return
-	}
-	log.Printf("pchat-server is healthy at %s", healthURL)
+	cleanupRuntimeFile = false
+	log.Printf("pchat-server is healthy at %s/api/v1/health (port=%d)", beURL, port)
 	a.ready.Store(true)
 
 	// Inject the backend URL into the webview as a global. The
@@ -1316,9 +1414,8 @@ func (a *App) spawnAndWatch() {
 	// response writer buffers the entire body and only flushes when
 	// the request handler returns, which doesn't happen while the
 	// `question` tool is parked waiting for the user.
-	be := beURL
-	js := fmt.Sprintf("window.__PCHAT_BACKEND__ = %q; window.__pchat_backend_injected__ = true; console.log('[pchat-gui] injected backend URL:', window.__PCHAT_BACKEND__);", be)
-	log.Printf("[pchat-gui] injecting backend URL into webview: %s", be)
+	js := fmt.Sprintf("window.__PCHAT_BACKEND__ = %q; window.__pchat_backend_injected__ = true; console.log('[pchat-gui] injected backend URL:', window.__PCHAT_BACKEND__);", beURL)
+	log.Printf("[pchat-gui] injecting backend URL into webview: %s", beURL)
 	wailsruntime.WindowExecJS(a.ctx, js)
 
 	// Show the window. The webview is currently still rendering the
@@ -1457,31 +1554,68 @@ func findUpdaterBinary() (string, error) {
 	return "", fmt.Errorf("%s not found next to pchat-gui and not in PATH", name)
 }
 
-const (
-	preferredPortStart = 15150
-	preferredPortEnd   = 15159
-)
-
-// pickPreferredPort returns the first available port in P-Chat's stable
-// local range, falling back to an OS-assigned port only if the range is full.
-func pickPreferredPort() (int, error) {
-	for port := preferredPortStart; port <= preferredPortEnd; port++ {
-		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err == nil {
-			_ = l.Close()
-			return port, nil
-		}
+func childPortEnvironment(profile runtimeprofile.Profile) []string {
+	if strings.EqualFold(strings.TrimSpace(profile.Name), "prod") {
+		return []string{"PCHAT_PORT_RANGE=15150-15159"}
 	}
-	return pickFreePort()
+	return []string{"PCHAT_PORT=0"}
 }
 
-func pickFreePort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
+func environmentWithout(environment []string, keys ...string) []string {
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		name, _, _ := strings.Cut(entry, "=")
+		remove := false
+		for _, key := range keys {
+			if strings.EqualFold(name, key) {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			filtered = append(filtered, entry)
+		}
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+	return filtered
+}
+
+func waitForBackendIdentity(ctx context.Context, baseURL string, profile runtimeprofile.Profile, instanceID string, pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 2 * time.Second}
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/health", nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			var health struct {
+				Status     string `json:"status"`
+				ProfileID  string `json:"profile_id"`
+				InstanceID string `json:"instance_id"`
+				PID        int    `json:"pid"`
+			}
+			decodeErr := json.NewDecoder(resp.Body).Decode(&health)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && decodeErr == nil {
+				if health.ProfileID != profile.ID || health.InstanceID != instanceID || health.PID != pid {
+					return fmt.Errorf("backend identity mismatch: got profile=%q instance=%q pid=%d, want profile=%q instance=%q pid=%d",
+						health.ProfileID, health.InstanceID, health.PID, profile.ID, instanceID, pid)
+				}
+				if health.Status == "ok" {
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("backend did not become healthy within %v", timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // pickConfigPath returns the active p-chat config path. Prefers

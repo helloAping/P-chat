@@ -40,6 +40,7 @@ test('humanizeStreamDropReason maps transport tokens to readable Chinese', () =>
 
 test('closeOpenPartsOnInterrupt force-closes running tools and sub-agents', () => {
   const parts: MessagePart[] = [
+    { kind: 'skill', name: 'lark-doc', status: 'start' },
     { kind: 'tool', name: 'exec_command', status: 'start' },
     { kind: 'tool', name: 'read_file', status: 'ok', result: 'ok' },
     {
@@ -52,13 +53,15 @@ test('closeOpenPartsOnInterrupt force-closes running tools and sub-agents', () =
   ]
 
   const closed = closeOpenPartsOnInterrupt(parts)
-  assert.equal(closed, 3)
-  assert.equal(parts[0].kind === 'tool' && parts[0].status, 'error')
-  assert.equal(parts[1].kind === 'tool' && parts[1].status, 'ok')
-  assert.equal(parts[2].kind === 'sub_agent' && parts[2].status, 'err')
+  assert.equal(closed, 4)
+  assert.equal(parts[0].kind === 'skill' && parts[0].status, 'error')
+  assert.equal(parts[0].kind === 'skill' && parts[0].error, '对话中断，Skill 加载未完成')
+  assert.equal(parts[1].kind === 'tool' && parts[1].status, 'error')
+  assert.equal(parts[2].kind === 'tool' && parts[2].status, 'ok')
+  assert.equal(parts[3].kind === 'sub_agent' && parts[3].status, 'err')
   assert.equal(
-    parts[2].kind === 'sub_agent' && parts[2].parts[0].kind === 'tool' && parts[2].parts[0].status,
+    parts[3].kind === 'sub_agent' && parts[3].parts[0].kind === 'tool' && parts[3].parts[0].status,
     'error',
   )
-  assert.equal(parts[3].kind === 'thinking' && parts[3].streaming, false)
+  assert.equal(parts[4].kind === 'thinking' && parts[4].streaming, false)
 })

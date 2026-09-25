@@ -14,6 +14,10 @@ export function ConfirmWindowClose(arg1) {
   return window['go']['main']['App']['ConfirmWindowClose'](arg1);
 }
 
+export function GetApplicationTitle() {
+  return window['go']['main']['App']['GetApplicationTitle']();
+}
+
 export function GetBackendURL() {
   return window['go']['main']['App']['GetBackendURL']();
 }
@@ -32,6 +36,14 @@ export function OpenTerminal(arg1) {
 
 export function OpenURL(arg1) {
   return window['go']['main']['App']['OpenURL'](arg1);
+}
+
+export function RequestWindowClose() {
+  return window['go']['main']['App']['RequestWindowClose']();
+}
+
+export function SaveDownloadFile(arg1, arg2) {
+  return window['go']['main']['App']['SaveDownloadFile'](arg1, arg2);
 }
 
 export function SaveExportFile(arg1, arg2, arg3) {

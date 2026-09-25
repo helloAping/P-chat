@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
@@ -63,6 +63,17 @@ type cliContext interface {
 	GetSessionContext(ctx context.Context, sessionID string) (httpcli.ContextInspector, error)
 	SetReasoningEffort(ctx context.Context, sessionID, level string) (string, error)
 	Regenerate(ctx context.Context, sessionID string, userMessageID int64) (<-chan agent.ChatStreamChunk, error)
+
+	// === Turn queue ===
+	ListTurnQueueItems(ctx context.Context, sessionID string) ([]httpcli.TurnQueueItem, error)
+	EnqueueTurnQueueItem(ctx context.Context, sessionID string, payload httpcli.TurnQueuePayload) (httpcli.TurnQueueItem, error)
+	EditTurnQueueItem(ctx context.Context, sessionID string, queueID int64, message string) (httpcli.TurnQueueItem, error)
+	ClaimNextTurnQueueItem(ctx context.Context, sessionID string) (httpcli.TurnQueueItem, error)
+	CompleteTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error)
+	FailTurnQueueItem(ctx context.Context, sessionID string, queueID int64, message string) (httpcli.TurnQueueItem, error)
+	RetryTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error)
+	DeleteTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error)
+	ClearTurnQueue(ctx context.Context, sessionID string) (int64, error)
 
 	// === Rollback ===
 	RollbackMessages(ctx context.Context, conversationID string, fromID int64) ([]httpcli.Message, error)
@@ -115,6 +126,8 @@ type cliContext interface {
 	// ChatWithTools streams the assistant reply (with optional tool
 	// use). The handler is expected to push events to the ChatUI.
 	ChatWithTools(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error)
+	// ChatQueuedTurn executes a persisted payload without collapsing optional values.
+	ChatQueuedTurn(ctx context.Context, sessionID string, payload httpcli.TurnQueuePayload) (<-chan agent.ChatStreamChunk, error)
 	// ChatStream is the no-tool variant, used by /plan for the
 	// single-round plan-mode call. In local mode this routes through
 	// the agent's plain stream; in HTTP mode it sends a non-tool
@@ -466,6 +479,129 @@ func (c *localContext) Regenerate(ctx context.Context, sessionID string, userMes
 	return nil, &ErrUnsupported{Op: "Regenerate"}
 }
 
+func (c *localContext) ListTurnQueueItems(ctx context.Context, sessionID string) ([]httpcli.TurnQueueItem, error) {
+	if err := c.r.store.RequeueRunningTurnQueueItems(sessionID); err != nil {
+		return nil, fmt.Errorf("recover interrupted turn queue: %w", err)
+	}
+	items, err := c.r.store.ListTurnQueueItems(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]httpcli.TurnQueueItem, 0, len(items))
+	for _, item := range items {
+		out = append(out, cliTurnQueueItem(item))
+	}
+	return out, nil
+}
+
+func (c *localContext) EnqueueTurnQueueItem(ctx context.Context, sessionID string, payload httpcli.TurnQueuePayload) (httpcli.TurnQueueItem, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return httpcli.TurnQueueItem{}, err
+	}
+	item, err := c.r.store.CreateTurnQueueItem(sessionID, raw, payload.Message, payload.ClientMsgID, 0)
+	return cliTurnQueueItem(item), err
+}
+
+func (c *localContext) EditTurnQueueItem(ctx context.Context, sessionID string, queueID int64, message string) (httpcli.TurnQueueItem, error) {
+	item, found, err := c.r.store.EditTurnQueueItem(sessionID, queueID, message)
+	if err != nil {
+		return httpcli.TurnQueueItem{}, err
+	}
+	if !found {
+		return httpcli.TurnQueueItem{}, fmt.Errorf("queued turn %d not found", queueID)
+	}
+	return cliTurnQueueItem(item), nil
+}
+
+func (c *localContext) ClaimNextTurnQueueItem(ctx context.Context, sessionID string) (httpcli.TurnQueueItem, error) {
+	item, found, err := c.r.store.ClaimNextTurnQueueItem(sessionID)
+	if err != nil {
+		return httpcli.TurnQueueItem{}, err
+	}
+	if !found {
+		return httpcli.TurnQueueItem{}, fmt.Errorf("turn queue is empty")
+	}
+	var payload httpcli.TurnQueuePayload
+	if err := json.Unmarshal([]byte(item.PayloadJSON), &payload); err != nil {
+		return httpcli.TurnQueueItem{}, fmt.Errorf("decode queued payload: %w", err)
+	}
+	out := cliTurnQueueItem(item)
+	out.Payload = &payload
+	return out, nil
+}
+
+func (c *localContext) CompleteTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error) {
+	item, found, err := c.r.store.CompleteTurnQueueItem(sessionID, queueID)
+	if err != nil {
+		return httpcli.TurnQueueItem{}, err
+	}
+	if !found {
+		return httpcli.TurnQueueItem{}, fmt.Errorf("running turn %d not found", queueID)
+	}
+	return cliTurnQueueItem(item), nil
+}
+
+func (c *localContext) FailTurnQueueItem(ctx context.Context, sessionID string, queueID int64, message string) (httpcli.TurnQueueItem, error) {
+	item, found, err := c.r.store.FailTurnQueueItem(sessionID, queueID, message)
+	if err != nil {
+		return httpcli.TurnQueueItem{}, err
+	}
+	if !found {
+		return httpcli.TurnQueueItem{}, fmt.Errorf("running turn %d not found", queueID)
+	}
+	return cliTurnQueueItem(item), nil
+}
+
+func (c *localContext) RetryTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error) {
+	item, found, err := c.r.store.RequeueFailedTurnQueueItem(sessionID, queueID)
+	if err != nil {
+		return httpcli.TurnQueueItem{}, err
+	}
+	if !found {
+		return httpcli.TurnQueueItem{}, fmt.Errorf("failed turn %d not found", queueID)
+	}
+	return cliTurnQueueItem(item), nil
+}
+
+func (c *localContext) DeleteTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error) {
+	item, found, err := c.r.store.CancelTurnQueueItem(sessionID, queueID)
+	if err != nil {
+		return httpcli.TurnQueueItem{}, err
+	}
+	if !found {
+		return httpcli.TurnQueueItem{}, fmt.Errorf("queued turn %d not found", queueID)
+	}
+	return cliTurnQueueItem(item), nil
+}
+
+func (c *localContext) ClearTurnQueue(ctx context.Context, sessionID string) (int64, error) {
+	return c.r.store.ClearTurnQueue(sessionID)
+}
+
+func cliTurnQueueItem(item memory.TurnQueueItem) httpcli.TurnQueueItem {
+	return httpcli.TurnQueueItem{
+		ID:              item.ID,
+		SessionID:       item.SessionID,
+		Status:          item.Status,
+		Message:         item.Message,
+		ClientMsgID:     item.ClientMsgID,
+		AttachmentCount: item.AttachmentCount,
+		Error:           item.Error,
+		CreatedAt:       item.CreatedAt.Unix(),
+		UpdatedAt:       item.UpdatedAt.Unix(),
+		StartedAt:       unixTimeOrZero(item.StartedAt),
+		FinishedAt:      unixTimeOrZero(item.FinishedAt),
+	}
+}
+
+func unixTimeOrZero(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.Unix()
+}
+
 func (c *localContext) RollbackMessages(ctx context.Context, convID string, fromID int64) ([]httpcli.Message, error) {
 	deleted, err := c.r.store.DeleteMessagesFrom(convID, fromID)
 	if err != nil {
@@ -543,8 +679,12 @@ func (c *localContext) ListProviderModels(ctx context.Context, provider string) 
 		src := p.AllModels()
 		out := make([]httpcli.Model, 0, len(src))
 		for _, m := range src {
+			if m.EffectiveType() != config.ModelTypeLLM {
+				continue
+			}
 			out = append(out, httpcli.Model{
 				Name:        m.Name,
+				Type:        string(m.EffectiveType()),
 				DisplayName: m.DisplayName,
 				Default:     m.Default,
 				Description: m.Description,
@@ -593,7 +733,7 @@ func (c *localContext) ProviderConfig(name string) (ProviderConfigView, error) {
 		return ProviderConfigView{
 			Name:     p.Name,
 			Protocol: p.GetProtocol(),
-			BaseURL:  p.BaseURL,
+			BaseURL:  p.EffectiveBaseURL(),
 			APIKey:   p.APIKey,
 			Model:    p.EffectiveModel(),
 			Models:   models,
@@ -733,6 +873,10 @@ func (c *localContext) ReloadConfig() error {
 
 func (c *localContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
 	return c.r.agent.ChatWithTools(ctx, req), nil
+}
+
+func (c *localContext) ChatQueuedTurn(ctx context.Context, sessionID string, payload httpcli.TurnQueuePayload) (<-chan agent.ChatStreamChunk, error) {
+	return c.ChatWithTools(ctx, queuedTurnChatRequest(payload, c, sessionID))
 }
 
 func (c *localContext) ChatStream(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
@@ -1006,8 +1150,7 @@ func (c *localContext) ListRules() ([]string, error) {
 }
 
 func (c *localContext) AgentsContext() (global, project string, err error) {
-	home, _ := os.UserHomeDir()
-	globalPath := filepath.Join(home, ".p-chat", "AGENTS.md")
+	globalPath := paths.GlobalAgents()
 	projectPath := "AGENTS.md"
 
 	if data, e := os.ReadFile(globalPath); e == nil {
@@ -1202,18 +1345,122 @@ func (c *httpContext) Regenerate(ctx context.Context, sessionID string, userMess
 	return out, nil
 }
 
+func (c *httpContext) ListTurnQueueItems(ctx context.Context, sessionID string) ([]httpcli.TurnQueueItem, error) {
+	return c.c.ListTurnQueueItems(ctx, sessionID)
+}
+
+func (c *httpContext) EnqueueTurnQueueItem(ctx context.Context, sessionID string, payload httpcli.TurnQueuePayload) (httpcli.TurnQueueItem, error) {
+	return c.c.EnqueueTurnQueueItem(ctx, sessionID, payload)
+}
+
+func (c *httpContext) EditTurnQueueItem(ctx context.Context, sessionID string, queueID int64, message string) (httpcli.TurnQueueItem, error) {
+	return c.c.EditTurnQueueItem(ctx, sessionID, queueID, message)
+}
+
+func (c *httpContext) ClaimNextTurnQueueItem(ctx context.Context, sessionID string) (httpcli.TurnQueueItem, error) {
+	return c.c.ClaimNextTurnQueueItem(ctx, sessionID)
+}
+
+func (c *httpContext) CompleteTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error) {
+	return c.c.CompleteTurnQueueItem(ctx, sessionID, queueID)
+}
+
+func (c *httpContext) FailTurnQueueItem(ctx context.Context, sessionID string, queueID int64, message string) (httpcli.TurnQueueItem, error) {
+	return c.c.FailTurnQueueItem(ctx, sessionID, queueID, message)
+}
+
+func (c *httpContext) RetryTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error) {
+	return c.c.RetryTurnQueueItem(ctx, sessionID, queueID)
+}
+
+func (c *httpContext) DeleteTurnQueueItem(ctx context.Context, sessionID string, queueID int64) (httpcli.TurnQueueItem, error) {
+	return c.c.DeleteTurnQueueItem(ctx, sessionID, queueID)
+}
+
+func (c *httpContext) ClearTurnQueue(ctx context.Context, sessionID string) (int64, error) {
+	return c.c.ClearTurnQueue(ctx, sessionID)
+}
+
 func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
+	provider := strings.TrimSpace(req.Provider)
+	if provider == "" {
+		provider = c.prov
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = c.c.ProviderModel()
+	}
+	attachments := make([]httpcli.TurnQueueAttachment, 0, len(req.Attachments))
+	for _, attachment := range req.Attachments {
+		attachmentType := "text"
+		switch attachment.Kind {
+		case "image":
+			attachmentType = "image_url"
+		case "audio":
+			attachmentType = "audio_url"
+		case "video":
+			attachmentType = "video_url"
+		}
+		attachments = append(attachments, httpcli.TurnQueueAttachment{
+			Type: attachmentType,
+			ID:   attachment.ID, UploadID: attachment.UploadID, Name: attachment.Name,
+			Size: attachment.Size, Kind: attachment.Kind, MIME: attachment.MIME,
+			Data: attachment.Data, URL: attachment.URL,
+		})
+	}
+	opts := httpcli.SendMessageOptions{
+		Message:          lastUserContent(req.Messages),
+		Style:            string(req.Style),
+		WorkMode:         string(req.WorkMode),
+		TodoMode:         string(req.TodoMode),
+		Provider:         provider,
+		Model:            model,
+		ClientMsgID:      req.ClientMsgID,
+		Attachments:      attachments,
+		SubAgentProvider: req.SubagentModel.Provider,
+		SubAgentModel:    req.SubagentModel.Model,
+		SkillContext:     req.SkillContext,
+		ActiveSkills:     append([]string(nil), req.ActiveSkills...),
+	}
+	if req.UseImageRecognition {
+		enabled := true
+		opts.UseImageRecognition = &enabled
+	}
+	if req.SubagentModel.Enabled {
+		enabled := true
+		opts.SubAgentModelEnabled = &enabled
+	}
+	return c.streamHTTPMessage(ctx, c.curSess, opts), nil
+}
+
+func (c *httpContext) ChatQueuedTurn(ctx context.Context, sessionID string, payload httpcli.TurnQueuePayload) (<-chan agent.ChatStreamChunk, error) {
+	return c.streamHTTPMessage(ctx, sessionID, queuedPayloadSendOptions(payload)), nil
+}
+
+func queuedPayloadSendOptions(payload httpcli.TurnQueuePayload) httpcli.SendMessageOptions {
+	return httpcli.SendMessageOptions{
+		Message:              payload.Message,
+		Style:                payload.Style,
+		WorkMode:             payload.WorkMode,
+		TodoMode:             payload.TodoMode,
+		Provider:             payload.Provider,
+		Model:                payload.Model,
+		ClientMsgID:          payload.ClientMsgID,
+		Attachments:          payload.Attachments,
+		UseImageRecognition:  payload.UseImageRecognition,
+		SubAgentModelEnabled: payload.SubAgentModelEnabled,
+		SubAgentProvider:     payload.SubAgentProvider,
+		SubAgentModel:        payload.SubAgentModel,
+		SkillContext:         payload.SkillContext,
+		ActiveSkills:         append([]string(nil), payload.ActiveSkills...),
+	}
+}
+
+func (c *httpContext) streamHTTPMessage(ctx context.Context, sessionID string, opts httpcli.SendMessageOptions) <-chan agent.ChatStreamChunk {
 	out := make(chan agent.ChatStreamChunk, 16)
 	go func() {
 		defer close(out)
-		opts := httpcli.SendMessageOptions{
-			Message:  lastUserContent(req.Messages),
-			Style:    string(req.Style),
-			WorkMode: string(req.WorkMode),
-			Provider: c.prov,
-			Model:    c.c.ProviderModel(),
-		}
-		err := c.c.SendMessage(ctx, c.curSess, opts, func(ev httpcli.StreamEvent) {
+		err := c.c.SendMessage(ctx, sessionID, opts, func(ev httpcli.StreamEvent) {
 			out <- httpEventToChunk(ev)
 		})
 		if err != nil {
@@ -1222,7 +1469,7 @@ func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) 
 		}
 		out <- agent.ChatStreamChunk{Done: true}
 	}()
-	return out, nil
+	return out
 }
 
 func (c *httpContext) ChatStream(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
@@ -1407,9 +1654,22 @@ func (c *httpContext) ScanKBs() (int, int, error) { return 0, 0, c.unsupported("
 func (c *httpContext) Recall(ctx context.Context, query string, topK int) error {
 	return c.unsupported("Recall")
 }
-func (c *httpContext) InitProject(dir string) error  { return c.unsupported("InitProject") }
-func (c *httpContext) ListSkills() ([]string, error) { return nil, c.unsupported("ListSkills") }
-func (c *httpContext) ListRules() ([]string, error)  { return nil, c.unsupported("ListRules") }
+func (c *httpContext) InitProject(dir string) error { return c.unsupported("InitProject") }
+func (c *httpContext) ListSkills() ([]string, error) {
+	if c.c == nil {
+		return nil, c.unsupported("ListSkills")
+	}
+	items, err := c.c.ListSkills(context.Background(), c.curSess)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item.Name)
+	}
+	return names, nil
+}
+func (c *httpContext) ListRules() ([]string, error) { return nil, c.unsupported("ListRules") }
 func (c *httpContext) AgentsContext() (string, string, error) {
 	return "", "", c.unsupported("AgentsContext")
 }
@@ -1457,6 +1717,12 @@ func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 		ToolRetryable:         ev.ToolRetryable,
 		ToolRequiresUser:      ev.ToolRequiresUser,
 		ToolNextAction:        ev.ToolNextAction,
+		SkillName:             ev.SkillName,
+		SkillStatus:           ev.SkillStatus,
+		SkillScope:            ev.SkillScope,
+		SkillSource:           ev.SkillSource,
+		SkillDependencies:     append([]string(nil), ev.SkillDependencies...),
+		SkillError:            ev.SkillError,
 		TokensIn:              ev.TokensIn,
 		TokensOut:             ev.TokensOut,
 		SubAgent:              ev.SubAgent,

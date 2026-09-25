@@ -15,50 +15,66 @@ import (
 )
 
 type skillResponse struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Path        string `json:"path"`
-	Content     string `json:"content,omitempty"`
+	Name           string              `json:"name"`
+	Description    string              `json:"description"`
+	Path           string              `json:"path"`
+	Directory      string              `json:"directory,omitempty"`
+	Scope          skill.Scope         `json:"scope,omitempty"`
+	RequiredSkills []string            `json:"required_skills,omitempty"`
+	RequiredBins   []string            `json:"required_bins,omitempty"`
+	Resources      []string            `json:"resources,omitempty"`
+	Shadowed       []skill.SkillSource `json:"shadowed,omitempty"`
+	Content        string              `json:"content,omitempty"`
 }
 
 // ListSkills GET /api/v1/skills
 func (h *Handler) ListSkills(c *gin.Context) {
-	skills, err := skill.LoadAllWithRoot(h.skillsProjectRoot(c))
+	manager := skill.NewManager()
+	catalog, err := manager.Catalog(c.Request.Context(), skill.CatalogQuery{ProjectRoot: h.skillsProjectRoot(c)})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	out := make([]skillResponse, 0, len(skills))
-	for _, s := range skills {
+	out := make([]skillResponse, 0, len(catalog.Skills))
+	for _, s := range catalog.Skills {
 		out = append(out, skillResponse{
-			Name:        s.Name,
-			Description: s.Description,
-			Path:        s.Path,
+			Name:           s.Name,
+			Description:    s.Description,
+			Path:           s.Path,
+			Directory:      s.Directory,
+			Scope:          s.Scope,
+			RequiredSkills: append([]string(nil), s.RequiredSkills...),
+			RequiredBins:   append([]string(nil), s.RequiredBins...),
+			Resources:      append([]string(nil), s.Resources...),
+			Shadowed:       append([]skill.SkillSource(nil), s.Shadowed...),
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"skills": out})
+	c.JSON(http.StatusOK, gin.H{"skills": out, "diagnostics": catalog.Diagnostics})
 }
 
 // GetSkill GET /api/v1/skills/:name
 func (h *Handler) GetSkill(c *gin.Context) {
 	name := c.Param("name")
-	skills, err := skill.LoadAllWithRoot(h.skillsProjectRoot(c))
+	manager := skill.NewManager()
+	loaded, err := manager.Load(c.Request.Context(), skill.LoadRequest{ProjectRoot: h.skillsProjectRoot(c), Name: name})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	for _, s := range skills {
-		if s.Name == name {
-			c.JSON(http.StatusOK, gin.H{"skill": skillResponse{
-				Name:        s.Name,
-				Description: s.Description,
-				Path:        s.Path,
-				Content:     s.Content,
-			}})
-			return
-		}
+	if len(loaded.Skills) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "skill not found"})
+		return
 	}
-	c.JSON(http.StatusNotFound, gin.H{"error": "skill not found"})
+	primary := loaded.Skills[len(loaded.Skills)-1]
+	c.JSON(http.StatusOK, gin.H{"skill": skillResponse{
+		Name: primary.Name, Description: primary.Description, Path: primary.Path,
+		Directory: primary.Directory, Scope: primary.Scope,
+		RequiredSkills: append([]string(nil), primary.RequiredSkills...),
+		RequiredBins:   append([]string(nil), primary.RequiredBins...),
+		Resources:      append([]string(nil), primary.Resources...),
+		Shadowed:       append([]skill.SkillSource(nil), primary.Shadowed...),
+		Content:        primary.Content,
+	}})
 }
 
 // DeleteSkill DELETE /api/v1/skills/:name
@@ -72,14 +88,32 @@ func (h *Handler) DeleteSkill(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid skill name"})
 		return
 	}
-	dir := filepath.Join(paths.GlobalSkillsDir(), name)
-	if root := h.skillsProjectRoot(c); root != "" {
-		projectDir := filepath.Join(paths.ProjectSkillsDirWithRoot(root), name)
-		if _, err := os.Stat(projectDir); err == nil {
-			dir = projectDir
+	projectRoot := h.skillsProjectRoot(c)
+	manager := skill.NewManager()
+	catalog, err := manager.Catalog(c.Request.Context(), skill.CatalogQuery{ProjectRoot: projectRoot})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var selected *skill.SkillInfo
+	for i := range catalog.Skills {
+		if catalog.Skills[i].Name == name {
+			selected = &catalog.Skills[i]
+			break
 		}
 	}
-	if err := os.RemoveAll(dir); err != nil {
+	if selected == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "skill not found"})
+		return
+	}
+	if selected.Scope != skill.ScopeGlobalManaged && selected.Scope != skill.ScopeProjectManaged {
+		c.JSON(http.StatusConflict, gin.H{"error": "standard-directory Skills are read-only in P-Chat; import the package into a managed scope before removing it"})
+		return
+	}
+	result, err := manager.Apply(c.Request.Context(), skill.ChangeRequest{
+		Action: skill.ChangeRemove, Name: name, Scope: selected.Scope, ProjectRoot: projectRoot,
+	})
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -87,7 +121,7 @@ func (h *Handler) DeleteSkill(c *gin.Context) {
 	if h.agent != nil {
 		h.agent.Reload()
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "result": result})
 }
 
 type installSkillRequest struct {
@@ -96,56 +130,76 @@ type installSkillRequest struct {
 	Scope       string `json:"scope,omitempty"` // "global" (default) | "project"
 	ProjectPath string `json:"project_path,omitempty"`
 	SessionID   string `json:"session_id,omitempty"`
+	SourcePath  string `json:"source_path,omitempty"`
 }
 
-// InstallSkill POST /api/v1/skills/install
-// URL should be a raw SKILL.md URL (from search results).
+// InstallSkill 处理远程包或本地包/集合目录的 Skill 安装请求。
+// InstallSkill handles remote packages or local package/collection directories.
 func (h *Handler) InstallSkill(c *gin.Context) {
 	var req installSkillRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	if req.URL == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "url is required"})
+	req.Name = strings.TrimSpace(req.Name)
+	req.URL = strings.TrimSpace(req.URL)
+	req.SourcePath = strings.TrimSpace(req.SourcePath)
+	sourceCount := 0
+	for _, source := range []string{req.URL, req.SourcePath} {
+		if source != "" {
+			sourceCount++
+		}
+	}
+	if sourceCount != 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exactly one of url or source_path is required"})
 		return
 	}
 	name := req.Name
-	if name == "" {
+	if name == "" && req.URL != "" {
 		name = inferSkillName(req.URL)
 	}
-	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
-		return
-	}
-	if !validSkillName(name) {
+	if name != "" && !validSkillName(name) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid skill name"})
 		return
 	}
 
-	content, err := fetchSkillContent(req.URL)
+	scope := skill.ScopeGlobalManaged
+	projectRoot := req.ProjectPath
+	if projectRoot == "" && req.SessionID != "" {
+		projectRoot = h.sessionProjectPath(req.SessionID)
+	}
+	if req.Scope == "project" {
+		scope = skill.ScopeProjectManaged
+		if projectRoot == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "project_path or session_id is required for project skill install"})
+			return
+		}
+	} else if req.Scope != "" && req.Scope != "global" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": `scope must be "global" or "project"`})
+		return
+	}
+	change := skill.ChangeRequest{Name: name, Scope: scope, ProjectRoot: projectRoot}
+	if req.SourcePath != "" {
+		change.Action = skill.ChangeImport
+		change.SourcePath = req.SourcePath
+		change.Name = req.Name
+	} else {
+		change.Action = skill.ChangeInstall
+		change.SourceURL = req.URL
+	}
+	result, err := skill.NewManager().Apply(c.Request.Context(), change)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return
-	}
-
-	dir, err := h.skillInstallDir(req, name)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if h.agent != nil {
 		h.agent.Reload()
 	}
-	c.JSON(http.StatusCreated, gin.H{"ok": true, "name": name})
+	c.JSON(http.StatusCreated, gin.H{
+		"ok": result.Ready, "ready": result.Ready, "name": result.Name,
+		"path": result.Directory, "installed": result.Installed, "rolled_back": result.RolledBack,
+		"diagnostics": result.Diagnostics,
+	})
 }
 
 func (h *Handler) skillsProjectRoot(c *gin.Context) string {
@@ -153,23 +207,6 @@ func (h *Handler) skillsProjectRoot(c *gin.Context) string {
 		return h.sessionProjectPath(sessionID)
 	}
 	return c.Query("project_path")
-}
-
-func (h *Handler) skillInstallDir(req installSkillRequest, name string) (string, error) {
-	if req.Scope == "" || req.Scope == "global" {
-		return filepath.Join(paths.GlobalSkillsDir(), name), nil
-	}
-	if req.Scope != "project" {
-		return "", fmt.Errorf(`scope must be "global" or "project"`)
-	}
-	root := req.ProjectPath
-	if root == "" && req.SessionID != "" {
-		root = h.sessionProjectPath(req.SessionID)
-	}
-	if root == "" {
-		return "", fmt.Errorf("project_path or session_id is required for project skill install")
-	}
-	return filepath.Join(paths.ProjectSkillsDirWithRoot(root), name), nil
 }
 
 func validSkillName(name string) bool {
@@ -343,7 +380,7 @@ func searchSkills(q string) ([]searchResult, error) {
 		results = append(results, searchResult{
 			Name:        e.Name,
 			Description: desc,
-			URL:         fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/main/skills/%s/SKILL.md", owner, repo, e.Name),
+			URL:         fmt.Sprintf("https://github.com/%s/%s/tree/main/skills/%s", owner, repo, e.Name),
 		})
 	}
 	if len(results) == 0 {

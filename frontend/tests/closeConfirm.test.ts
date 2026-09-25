@@ -25,6 +25,13 @@ test('close confirm defaults to tray and offers no-more-reminders', () => {
   assert.doesNotMatch(source, /api\.updateSystemConfig/)
 })
 
+test('close confirm does not show a failure toast after dispatching native close', () => {
+  const source = readCloseConfirmSource()
+
+  assert.match(source, /void app\.ConfirmWindowClose\(choice\)\.catch/)
+  assert.doesNotMatch(source, /关闭操作没有完成/)
+})
+
 test('settings window behavior keeps only the close behavior toggle', () => {
   const source = readSettingsSource()
 

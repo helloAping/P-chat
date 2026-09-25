@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { useMessage } from 'naive-ui'
+import { computed, h, onBeforeUnmount, ref, watch } from 'vue'
+import { NButton, useMessage, useNotification } from 'naive-ui'
 import { Activity, AlertCircle, Bot, CheckCircle2, ChevronDown, ChevronUp, Loader2, RotateCw, X, XCircle } from './icons'
 import {
   cancelSubAgentJob,
@@ -9,7 +9,7 @@ import {
   type SubAgentJob,
   type SubAgentJobEvent,
 } from '../api/client'
-import { setSessionBackgroundSubAgentJobs } from '../stores/chat'
+import { setSessionBackgroundSubAgentJobs, currentPendingQuestion, state, setComposerExpandedDock } from '../stores/chat'
 
 const props = defineProps<{
   sessionId?: string
@@ -17,9 +17,11 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'job-terminal', job: SubAgentJob): void
+  (e: 'locate-result'): void
 }>()
 
 const message = useMessage()
+const notification = useNotification()
 const jobs = ref<SubAgentJob[]>([])
 const loading = ref(false)
 const error = ref('')
@@ -27,16 +29,26 @@ const cancelling = ref<Record<string, boolean>>({})
 const collapsed = ref(readCollapsedState())
 const dismissed = ref(false)
 const eventConnected = ref(false)
+const hasPendingQuestion = computed(() => !!currentPendingQuestion.value)
+// Visual expand is driven by the shared composer dock slot so Todo /
+// Queue / SubAgent stay mutually exclusive. Question forces collapse.
+const panelExpanded = computed(() =>
+  !collapsed.value &&
+  !hasPendingQuestion.value &&
+  state.composerExpandedDock === 'subagent',
+)
 let pollTimer: number | null = null
 let retryTimer: number | null = null
 let clearTimer: number | null = null
+let notifyTimer: number | null = null
+let notifyBuffer: SubAgentJob[] = []
 let eventCtrl: AbortController | null = null
 let requestSeq = 0
 
 const visibleJobs = computed(() => jobs.value.slice(0, 5))
 const activeJobs = computed(() => jobs.value.filter(isActiveJob))
 const hasJobs = computed(() => jobs.value.length > 0)
-const panelVisible = computed(() => (hasJobs.value || error.value) && !dismissed.value)
+const panelVisible = computed(() => hasJobs.value && !dismissed.value)
 const summaryText = computed(() => {
   if (activeJobs.value.length > 0) return `${activeJobs.value.length} 个任务运行中`
   if (jobs.value.length > 0) return `${jobs.value.length} 个最近任务`
@@ -155,12 +167,92 @@ function scheduleClearIfIdle() {
 }
 
 function notifyTerminal(job: SubAgentJob) {
-  if (job.status === 'succeeded') {
-    message.success(`后台子代理已完成：${jobLabel(job)}`)
-  } else if (job.status === 'failed') {
-    message.error(`后台子代理失败：${jobLabel(job)}`)
-  }
   emit('job-terminal', job)
+  // Batch terminal jobs finishing within a short window into a single
+  // notification card per outcome, so bursts don't stack toasts.
+  notifyBuffer.push(job)
+  if (notifyTimer !== null) return
+  notifyTimer = window.setTimeout(() => {
+    notifyTimer = null
+    flushNotifyBuffer()
+  }, 600)
+}
+
+function clearNotifyTimer() {
+  if (notifyTimer !== null) {
+    window.clearTimeout(notifyTimer)
+    notifyTimer = null
+  }
+  notifyBuffer = []
+}
+
+function jobNames(list: SubAgentJob[], max = 3): string {
+  const names = list.map(jobLabel)
+  if (names.length <= max) return names.join('、')
+  return `${names.slice(0, max).join('、')} 等 ${names.length} 个任务`
+}
+
+function flushNotifyBuffer() {
+  const batch = notifyBuffer
+  notifyBuffer = []
+  const succeeded = batch.filter((j) => j.status === 'succeeded')
+  const failed = batch.filter((j) => j.status === 'failed')
+  if (succeeded.length > 0) notifySucceeded(succeeded)
+  if (failed.length > 0) notifyFailed(failed)
+}
+
+function notifySucceeded(list: SubAgentJob[]) {
+  let close: (() => void) | null = null
+  const notice = notification.success({
+    title: list.length === 1 ? '后台子代理已完成' : `${list.length} 个后台子代理已完成`,
+    content: `${jobNames(list)}。结果已写入会话。`,
+    duration: 6000,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'primary',
+        onClick: () => {
+          close?.()
+          emit('locate-result')
+        },
+      },
+      { default: () => '查看结果' },
+    ),
+  })
+  close = () => notice.destroy()
+}
+
+function notifyFailed(list: SubAgentJob[]) {
+  const detail = list
+    .map((j) => {
+      const reason = latestProgress(j)
+      return reason ? `${jobLabel(j)}：${reason}` : jobLabel(j)
+    })
+    .slice(0, 3)
+    .join('；')
+  let close: (() => void) | null = null
+  const notice = notification.error({
+    title: list.length === 1 ? '后台子代理失败' : `${list.length} 个后台子代理失败`,
+    content: detail || '任务执行失败，可展开面板查看详情。',
+    duration: 0,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'error',
+        onClick: () => {
+          close?.()
+          collapsed.value = false
+          setComposerExpandedDock('subagent')
+        },
+      },
+      { default: () => '查看详情' },
+    ),
+  })
+  close = () => notice.destroy()
 }
 
 function handleJobEvent(ev: SubAgentJobEvent) {
@@ -175,6 +267,7 @@ function handleJobEvent(ev: SubAgentJobEvent) {
   if (isTerminalJob(ev.job) && (wasActive || !previous)) {
     if (activeJobs.value.length === 0) {
       collapsed.value = true
+      if (state.composerExpandedDock === 'subagent') setComposerExpandedDock(null)
     }
     notifyTerminal(ev.job)
     scheduleClearIfIdle()
@@ -223,11 +316,24 @@ async function cancelJob(job: SubAgentJob) {
 }
 
 function toggleCollapsed() {
-  collapsed.value = !collapsed.value
+  if (hasPendingQuestion.value) {
+    collapsed.value = true
+    if (state.composerExpandedDock === 'subagent') setComposerExpandedDock(null)
+    return
+  }
+  if (panelExpanded.value) {
+    collapsed.value = true
+    setComposerExpandedDock(null)
+    return
+  }
+  collapsed.value = false
+  setComposerExpandedDock('subagent')
 }
 
 function hidePanel() {
   dismissed.value = true
+  collapsed.value = true
+  if (state.composerExpandedDock === 'subagent') setComposerExpandedDock(null)
 }
 
 function clearPoll() {
@@ -292,6 +398,7 @@ watch(
     if (prev) setSessionBackgroundSubAgentJobs(prev, 0)
     stopEventStream()
     clearPoll()
+    clearNotifyTimer()
     dismissed.value = false
     refresh(true).finally(() => {
       syncBackgroundJobState()
@@ -310,6 +417,22 @@ watch(
   },
 )
 
+watch(hasPendingQuestion, (pending) => {
+  if (!pending) return
+  collapsed.value = true
+  if (state.composerExpandedDock === 'subagent') setComposerExpandedDock(null)
+})
+
+// If the user prefers the panel expanded (localStorage) and no other
+// dock owns the slot, claim it when the panel appears.
+watch(panelVisible, (vis) => {
+  if (!vis) return
+  if (collapsed.value || hasPendingQuestion.value) return
+  if (state.composerExpandedDock === null) {
+    setComposerExpandedDock('subagent')
+  }
+})
+
 watch(collapsed, (value) => {
   if (typeof window !== 'undefined') {
     window.localStorage.setItem('pchat.subagentJobs.collapsed', value ? '1' : '0')
@@ -321,6 +444,7 @@ onBeforeUnmount(() => {
   stopEventStream()
   clearPoll()
   clearAutoClearTimer()
+  clearNotifyTimer()
   requestSeq++
 })
 </script>
@@ -330,22 +454,22 @@ onBeforeUnmount(() => {
     <section
       v-if="panelVisible"
       class="subagent-jobs"
-      :class="{ 'subagent-jobs--collapsed': collapsed }"
+      :class="{ 'subagent-jobs--collapsed': !panelExpanded }"
       aria-label="后台子代理任务"
     >
       <div class="jobs-header">
         <button
           class="jobs-title jobs-title-button"
           type="button"
-          :aria-expanded="!collapsed"
-          :title="collapsed ? '展开后台子代理任务' : '收缩后台子代理任务'"
+          :aria-expanded="panelExpanded"
+          :title="panelExpanded ? '收缩后台子代理任务' : '展开后台子代理任务'"
           @click="toggleCollapsed"
         >
           <Bot :size="15" />
           <span>后台子代理</span>
           <span v-if="activeJobs.length" class="active-count">{{ activeJobs.length }}</span>
-          <span v-if="collapsed" class="jobs-summary">{{ summaryText }}</span>
-          <ChevronDown v-if="collapsed" :size="14" class="jobs-caret" />
+          <span v-if="!panelExpanded" class="jobs-summary">{{ summaryText }}</span>
+          <ChevronDown v-if="!panelExpanded" :size="14" class="jobs-caret" />
           <ChevronUp v-else :size="14" class="jobs-caret" />
         </button>
         <div class="jobs-actions">
@@ -370,11 +494,11 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </div>
-      <div v-if="error && !collapsed" class="jobs-error">
+      <div v-if="error && panelExpanded" class="jobs-error">
         <AlertCircle :size="14" />
         <span>{{ error }}</span>
       </div>
-      <div v-else-if="!collapsed" class="jobs-list">
+      <div v-else-if="panelExpanded" class="jobs-list">
         <div
           v-for="job in visibleJobs"
           :key="job.id"
@@ -394,7 +518,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="job-meta">
               <span>{{ statusLabel(job.status) }}</span>
-              <span v-if="job.subagent_type">{{ job.subagent_type }}</span>
+              <span v-if="job.subagent_type" class="job-type-text">{{ job.subagent_type }}</span>
               <span v-if="job.model">{{ job.model }}</span>
               <span v-if="latestProgress(job)">{{ latestProgress(job) }}</span>
               <span v-if="formatTime(job.created_at)">{{ formatTime(job.created_at) }}</span>
@@ -607,6 +731,14 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.job-meta .job-type-text {
+  display: inline-block;
+  max-width: 120px;
+  color: var(--brand-600);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
 }
 
 .spinning {

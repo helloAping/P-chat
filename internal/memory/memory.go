@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +33,10 @@ type Conversation struct {
 	Metadata    string    `json:"metadata,omitempty"`
 	Archived    bool      `json:"archived"`
 	VectorStore string    `json:"vector_store,omitempty"`
+	// UserMessageCount is the count of visible user-authored rows.
+	UserMessageCount int `json:"user_message_count,omitempty"`
+	// PendingTurnCount counts queued/running/failed turn_queue items.
+	PendingTurnCount int `json:"pending_turn_count,omitempty"`
 }
 
 // Message is one entry in a conversation's history.
@@ -300,16 +305,27 @@ func (s *Store) mostRecentConversation() (string, error) {
 func (s *Store) NewConversation() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := newConvID()
-	now := time.Now().Unix()
-	if _, err := s.db.Exec(
-		`INSERT INTO conversations(id, created_at, updated_at) VALUES (?, ?, ?)`,
-		id, now, now,
-	); err != nil {
+	c, err := s.insertConversationLocked(time.Now())
+	if err != nil {
 		return "", err
 	}
-	s.currentID = id
-	return id, nil
+	s.currentID = c.ID
+	return c.ID, nil
+}
+
+func (s *Store) insertConversationLocked(now time.Time) (Conversation, error) {
+	id := newConvID()
+	if _, err := s.db.Exec(
+		`INSERT INTO conversations(id, created_at, updated_at) VALUES (?, ?, ?)`,
+		id, now.Unix(), now.Unix(),
+	); err != nil {
+		return Conversation{}, err
+	}
+	return Conversation{
+		ID:        id,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}, nil
 }
 
 // EnsureConversation makes sure a conversation id exists.
@@ -444,6 +460,12 @@ func (s *Store) AddChatMessageWithMetaTo(convID string, msg llm.ChatMessage, ext
 // its SQLite row id. It is for callers that need a durable row anchor they
 // can update later (for example a background sub-agent card).
 func (s *Store) AddChatMessageWithMetaToNow(convID string, msg llm.ChatMessage, extraMeta map[string]string) (int64, error) {
+	return s.AddChatMessageWithMetaToRegenNow(convID, msg, extraMeta, "", false)
+}
+
+// AddChatMessageWithMetaToRegenNow writes a regen-aware ChatMessage
+// immediately and returns its SQLite row id.
+func (s *Store) AddChatMessageWithMetaToRegenNow(convID string, msg llm.ChatMessage, extraMeta map[string]string, regenGroupID string, isArchived bool) (int64, error) {
 	if convID == "" {
 		return 0, fmt.Errorf("conversation id is required")
 	}
@@ -468,10 +490,18 @@ func (s *Store) AddChatMessageWithMetaToNow(convID string, msg llm.ChatMessage, 
 	if maxSeq.Valid {
 		nextSeq = maxSeq.Int64 + 1
 	}
+	var rgPtr *string
+	if regenGroupID != "" {
+		rgPtr = &regenGroupID
+	}
+	archived := 0
+	if isArchived {
+		archived = 1
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq, is_archived)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-		convID, msg.Role, msg.Content, now.Unix(), string(b), msg.MsgType, msg.SubmitToLLM, nextSeq,
+		`INSERT INTO messages(conversation_id, role, content, created_at, metadata, msg_type, submit_to_llm, seq, regen_group_id, is_archived)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		convID, msg.Role, msg.Content, now.Unix(), string(b), msg.MsgType, msg.SubmitToLLM, nextSeq, rgPtr, archived,
 	)
 	if err != nil {
 		return 0, err
@@ -1084,7 +1114,7 @@ func encodeChatMeta(msg llm.ChatMessage) map[string]string {
 // + tool results), and the wire UI re-derives the parts via
 // decodePartsFromMeta on the ListMessages path. This keeps the
 // LLM context complete without changing the wire shape.
-func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbSubmitToLLM int) []llm.ChatMessage {
+func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbSubmitToLLM int) (decoded []llm.ChatMessage) {
 	if metaStr == "" || metaStr == "{}" {
 		if content != "" {
 			return []llm.ChatMessage{{Role: role, Type: llm.TypeText, Content: content, MsgType: llm.MsgTypeText, SubmitToLLM: 1}}
@@ -1105,6 +1135,18 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 		}
 		return nil
 	}
+	// 使用既有 thinking 元数据恢复协议上下文，无需新增存储字段。
+	// Restore protocol reasoning from the existing thinking metadata without new storage fields.
+	defer func() {
+		if thinking := meta["thinking"]; thinking != "" {
+			for i := range decoded {
+				if decoded[i].Role == llm.RoleAssistant && decoded[i].Type == llm.TypeText {
+					decoded[i].Meta = map[string]any{"thinking": thinking}
+					break
+				}
+			}
+		}
+	}()
 
 	// v2 (current) format: the agent's snapshotStructural
 	// writes `meta["parts"] = "<json of []MessagePart>"` with
@@ -2118,13 +2160,54 @@ func (s *Store) ListConversations() []Conversation {
 	return s.ListConversationsLimit(0)
 }
 
+const conversationSelectWithActivity = `
+SELECT c.id, COALESCE(c.title,''), c.created_at, c.updated_at,
+       COALESCE(c.metadata,''), c.archived, COALESCE(c.vector_store,''),
+       (SELECT COUNT(*)
+          FROM messages m
+         WHERE m.conversation_id = c.id
+           AND m.role = 'user'
+           AND m.is_archived = 0) AS user_message_count,
+       (SELECT COUNT(*)
+          FROM turn_queue tq
+         WHERE tq.session_id = c.id
+           AND tq.status IN ('queued', 'running', 'failed')) AS pending_turn_count
+  FROM conversations c`
+
+type conversationScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanConversation(scanner conversationScanner) (Conversation, error) {
+	var c Conversation
+	var created, updated int64
+	var archived int
+	if err := scanner.Scan(
+		&c.ID,
+		&c.Title,
+		&created,
+		&updated,
+		&c.Metadata,
+		&archived,
+		&c.VectorStore,
+		&c.UserMessageCount,
+		&c.PendingTurnCount,
+	); err != nil {
+		return Conversation{}, err
+	}
+	c.CreatedAt = time.Unix(created, 0)
+	c.UpdatedAt = time.Unix(updated, 0)
+	c.Archived = archived != 0
+	return c, nil
+}
+
 // ListConversationsLimit returns up to `limit` active (non-archived)
 // conversations, ordered by updated_at DESC. limit <= 0 means
 // "no cap" (used by legacy callers / tests). The handler-layer
 // pagination passes limit=200 to bound the response size.
 func (s *Store) ListConversationsLimit(limit int) []Conversation {
 	_ = s.Flush()
-	q := `SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 0 ORDER BY updated_at DESC, id DESC`
+	q := conversationSelectWithActivity + ` WHERE c.archived = 0 ORDER BY c.updated_at DESC, c.id DESC`
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -2135,18 +2218,99 @@ func (s *Store) ListConversationsLimit(limit int) []Conversation {
 	defer rows.Close()
 	var out []Conversation
 	for rows.Next() {
-		var c Conversation
-		var created, updated int64
-		var archived int
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore); err != nil {
+		c, err := scanConversation(rows)
+		if err != nil {
 			return out
 		}
-		c.CreatedAt = time.Unix(created, 0)
-		c.UpdatedAt = time.Unix(updated, 0)
-		c.Archived = archived != 0
 		out = append(out, c)
 	}
 	return out
+}
+
+// NewOrReuseBlankConversation returns the newest reusable blank conversation
+// for projectPath, or creates one when none exists.
+func (s *Store) NewOrReuseBlankConversation(projectPath string) (string, bool, error) {
+	_ = s.Flush()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(conversationSelectWithActivity + ` WHERE c.archived = 0 ORDER BY c.updated_at DESC, c.id DESC`)
+	if err != nil {
+		return "", false, err
+	}
+	reuseID := ""
+	for rows.Next() {
+		c, err := scanConversation(rows)
+		if err != nil {
+			_ = rows.Close()
+			return "", false, err
+		}
+		if isReusableBlankConversation(c, projectPath) {
+			reuseID = c.ID
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return "", false, err
+	}
+	if err := rows.Close(); err != nil {
+		return "", false, err
+	}
+	if reuseID != "" {
+		if _, err := s.db.Exec(`UPDATE conversations SET updated_at = ? WHERE id = ?`, time.Now().Unix(), reuseID); err != nil {
+			return "", false, err
+		}
+		s.currentID = reuseID
+		return reuseID, true, nil
+	}
+
+	c, err := s.insertConversationLocked(time.Now())
+	if err != nil {
+		return "", false, err
+	}
+	s.currentID = c.ID
+	return c.ID, false, nil
+}
+
+func isReusableBlankConversation(c Conversation, projectPath string) bool {
+	if strings.HasPrefix(c.ID, "im:") {
+		return false
+	}
+	if c.UserMessageCount != 0 || c.PendingTurnCount != 0 {
+		return false
+	}
+	return sameConversationProjectPath(conversationProjectPath(c.Metadata), projectPath)
+}
+
+func conversationProjectPath(meta string) string {
+	if strings.TrimSpace(meta) == "" {
+		return ""
+	}
+	var blob struct {
+		ProjectPath string `json:"project_path"`
+	}
+	if err := json.Unmarshal([]byte(meta), &blob); err != nil {
+		return ""
+	}
+	return blob.ProjectPath
+}
+
+func sameConversationProjectPath(a, b string) bool {
+	a = cleanConversationProjectPath(a)
+	b = cleanConversationProjectPath(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func cleanConversationProjectPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || path == "." {
+		return ""
+	}
+	return filepath.Clean(path)
 }
 
 // RenameConversation sets a human-readable title on a conversation.
@@ -2192,20 +2356,11 @@ func (s *Store) UpdateConversationMeta(id, meta string) error {
 // that into a 404.
 func (s *Store) GetConversation(id string) (Conversation, error) {
 	_ = s.Flush()
-	var c Conversation
-	var created, updated int64
-	var archived int
-	err := s.db.QueryRow(
-		`SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE id = ?`,
+	row := s.db.QueryRow(
+		conversationSelectWithActivity+` WHERE c.id = ?`,
 		id,
-	).Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore)
-	if err != nil {
-		return Conversation{}, err
-	}
-	c.CreatedAt = time.Unix(created, 0)
-	c.UpdatedAt = time.Unix(updated, 0)
-	c.Archived = archived != 0
-	return c, nil
+	)
+	return scanConversation(row)
 }
 
 // ArchiveConversation marks a conversation as archived.
@@ -2251,7 +2406,7 @@ func (s *Store) ListArchivedConversations() []Conversation {
 // "no cap" (legacy callers / tests).
 func (s *Store) ListArchivedConversationsLimit(limit int) []Conversation {
 	_ = s.Flush()
-	q := `SELECT id, COALESCE(title,''), created_at, updated_at, COALESCE(metadata,''), archived, vector_store FROM conversations WHERE archived = 1 ORDER BY updated_at DESC, id DESC`
+	q := conversationSelectWithActivity + ` WHERE c.archived = 1 ORDER BY c.updated_at DESC, c.id DESC`
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -2262,15 +2417,10 @@ func (s *Store) ListArchivedConversationsLimit(limit int) []Conversation {
 	defer rows.Close()
 	var out []Conversation
 	for rows.Next() {
-		var c Conversation
-		var created, updated int64
-		var archived int
-		if err := rows.Scan(&c.ID, &c.Title, &created, &updated, &c.Metadata, &archived, &c.VectorStore); err != nil {
+		c, err := scanConversation(rows)
+		if err != nil {
 			return out
 		}
-		c.CreatedAt = time.Unix(created, 0)
-		c.UpdatedAt = time.Unix(updated, 0)
-		c.Archived = archived != 0
 		out = append(out, c)
 	}
 	return out
@@ -2552,6 +2702,14 @@ func (s *Store) ArchiveSiblings(convID, groupID string, keepActiveID int64) (del
 	); err != nil {
 		return 0, fmt.Errorf("archive siblings: %w", err)
 	}
+	if _, err := tx.Exec(
+		`UPDATE media_contexts
+			 SET archived = 1, archive_reason = 'regen'
+			 WHERE session_id = ? AND regen_group_id = ?`,
+		convID, groupID,
+	); err != nil {
+		return 0, fmt.Errorf("archive media contexts: %w", err)
+	}
 
 	// 2. Enforce MaxRegenPerGroup in the same transaction.
 	//    Count the (active + archived) rows in the group; if
@@ -2768,13 +2926,30 @@ func (s *Store) ActivateSibling(convID, groupID string, activeID int64) error {
 	// the scope tight (no accidental effect on rows from
 	// other groups even if a future refactor passes the
 	// wrong activeID past the guard above).
-	_, err = s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(
 		`UPDATE messages
-		 SET is_archived = CASE WHEN id = ? THEN 0 ELSE 1 END
-		 WHERE conversation_id = ? AND regen_group_id = ?`,
+			 SET is_archived = CASE WHEN id = ? THEN 0 ELSE 1 END
+			 WHERE conversation_id = ? AND regen_group_id = ?`,
 		activeID, convID, groupID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`UPDATE media_contexts
+			 SET archived = CASE WHEN message_id = ? THEN 0 ELSE 1 END,
+			     archive_reason = CASE WHEN message_id = ? THEN '' ELSE 'regen' END
+			 WHERE session_id = ? AND regen_group_id = ?`,
+		activeID, activeID, convID, groupID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteMessagesFrom deletes all messages with id >= fromID in the
@@ -2848,10 +3023,26 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 		return nil, nil
 	}
 
-	if _, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`UPDATE media_contexts
+		 SET archived = 1, archive_reason = 'rollback'
+		 WHERE session_id = ? AND message_id >= ? AND archived = 0`,
+		conversationID, fromID,
+	); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(
 		`DELETE FROM messages WHERE conversation_id = ? AND id >= ?`,
 		conversationID, fromID,
 	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return deleted, nil
@@ -2913,6 +3104,14 @@ func (s *Store) RestoreMessages(messages []Message) error {
 			m.ID, m.ConversationID, m.Role, m.Content, m.Tokens,
 			m.CreatedAt.Unix(), m.Metadata, m.MsgType, m.SubmitToLLM, m.Seq,
 			regenGroupArg, isArchived,
+		); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`UPDATE media_contexts
+				 SET archived = 0, archive_reason = ''
+				 WHERE session_id = ? AND message_id = ? AND archive_reason = 'rollback'`,
+			m.ConversationID, m.ID,
 		); err != nil {
 			return err
 		}
@@ -3223,6 +3422,17 @@ func newConvID() string {
 // "100%" matches the literal substring "100%", not "100" +
 // anything.
 func (s *Store) SearchMessages(q string, limit int) []SearchResult {
+	return s.searchMessages(q, limit, "", false)
+}
+
+// SearchMessagesByProject performs the same search as SearchMessages, but
+// limits hits to conversations whose metadata project_path matches projectPath.
+// Passing an empty projectPath searches only global conversations.
+func (s *Store) SearchMessagesByProject(q string, limit int, projectPath string) []SearchResult {
+	return s.searchMessages(q, limit, projectPath, true)
+}
+
+func (s *Store) searchMessages(q string, limit int, projectPath string, filterProject bool) []SearchResult {
 	_ = s.Flush()
 	if q == "" {
 		return nil
@@ -3236,15 +3446,17 @@ func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	// each metachar with `\`.
 	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
 
-	rows, err := s.db.Query(
-		`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at
-		 FROM messages m
-		 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
-		 WHERE m.content LIKE ? ESCAPE '\'
-		 ORDER BY m.created_at DESC
-		 LIMIT ?`,
-		"%"+escaped+"%", limitOrHuge(limit),
-	)
+	query := `SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at, COALESCE(c.metadata, '')
+			 FROM messages m
+			 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
+			 WHERE m.content LIKE ? ESCAPE '\'
+			 ORDER BY m.created_at DESC`
+	args := []any{"%" + escaped + "%"}
+	if !filterProject {
+		query += ` LIMIT ?`
+		args = append(args, limitOrHuge(limit))
+	}
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil
 	}
@@ -3254,11 +3466,18 @@ func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	for rows.Next() {
 		var r SearchResult
 		var content string
-		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt); err != nil {
+		var convMeta string
+		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt, &convMeta); err != nil {
 			break
+		}
+		if filterProject && !sameConversationProjectPath(conversationProjectPath(convMeta), projectPath) {
+			continue
 		}
 		r.Snippet = snippet(content, q, 120)
 		out = append(out, r)
+		if filterProject && len(out) >= limitOrHuge(limit) {
+			break
+		}
 	}
 	return out
 }

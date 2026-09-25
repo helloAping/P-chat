@@ -13,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/requestheader"
+	"github.com/p-chat/pchat/internal/trace"
 )
 
 // readAll drains a StreamChunk channel into a slice. Used
@@ -162,6 +165,69 @@ func TestChatCM_OpenAIUsesNonStreamingJSON(t *testing.T) {
 	}
 	if !sawImage {
 		t.Fatal("non-streaming request did not include image data")
+	}
+}
+
+func TestClientAppliesProviderCustomHeadersToStreamingAndNonStreamingRequests(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.Header.Get("X-Static"); got != "configured" {
+			t.Errorf("X-Static = %q", got)
+		}
+		if got := r.Header.Get("X-Conversation"); got != "conversation-42" {
+			t.Errorf("X-Conversation = %q", got)
+		}
+		if got := r.Header.Get("X-Message"); got != "73" {
+			t.Errorf("X-Message = %q", got)
+		}
+		if got := r.Header.Get("X-Trace"); got != "trace-99" {
+			t.Errorf("X-Trace = %q", got)
+		}
+		if _, err := uuid.Parse(r.Header.Get("X-Request-ID")); err != nil {
+			t.Errorf("X-Request-ID = %q: %v", r.Header.Get("X-Request-ID"), err)
+		}
+		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": "ok"}}},
+		})
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(&config.LLMConfig{
+		Default: "custom",
+		Providers: []config.ProviderConfig{{
+			Name: "custom", Protocol: "openai", BaseURL: srv.URL, APIKey: "default-key", Model: "test-model",
+			CustomHeaders: map[string]string{
+				"X-Static":       "configured",
+				"X-Conversation": "{{conversation_id}}",
+				"X-Message":      "{{message_id}}",
+				"X-Trace":        "{{trace_id}}",
+				"X-Request-ID":   "{{uuid}}",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := requestheader.WithContext(context.Background(), "conversation-42", 73)
+	ctx = trace.WithID(ctx, "trace-99")
+	if _, err := c.ChatCM(ctx, "custom", "test-model", []ChatMessage{{Role: RoleUser, Content: "hi"}}, ChatOptions{}); err != nil {
+		t.Fatalf("ChatCM: %v", err)
+	}
+	chunks := readAll(c.ChatStreamCM(ctx, "custom", "test-model", []ChatMessage{{Role: RoleUser, Content: "hi"}}, nil, ChatOptions{}))
+	for _, chunk := range chunks {
+		if chunk.Err != nil {
+			t.Fatalf("ChatStreamCM: %v", chunk.Err)
+		}
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
 	}
 }
 
@@ -399,12 +465,12 @@ func newTestClient(name, baseURL string) (*Client, error) {
 	c := &Client{
 		providers: map[string]*providerEntry{
 			name: {
-				name:     name,
-				protocol: "openai",
-				model:    "test-model",
-				apiKey:   "test-key",
-				baseURL:  baseURL,
-				adapter:  NewOpenAIAdapter(baseURL, "test-key", name),
+				name:         name,
+				protocol:     "openai",
+				model:        "test-model",
+				apiKey:       "test-key",
+				baseURL:      baseURL,
+				modelAPIURLs: map[string]string{"test-model": baseURL},
 			},
 		},
 		default_: name,

@@ -16,11 +16,11 @@
 // the active session changes. The global watcher still polls
 // every 5s; project tools are scanned on demand from the active
 // project's .p-chat/tools directory.
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { NDrawer, NDrawerContent, NTag, NButton, NEmpty, NIcon, NList, NListItem, NThing, NInput, NInputNumber, NSwitch, NSelect, useMessage } from 'naive-ui'
-import { RefreshCw as RefreshIcon, Wrench as WrenchIcon, FileCode as FileCodeIcon, AlertTriangle as AlertTriangleIcon, Play as PlayIcon, FlaskConical as FlaskIcon } from 'lucide-vue-next'
 import { listToolsDetailed, trialTool, type Tool, type ToolLoadDiagnostic, type ToolTrialResponse } from '../api/client'
 import { state } from '../stores/chat'
+import { RotateCw as RefreshIcon, Wrench as WrenchIcon, FileCode as FileCodeIcon, AlertTriangle as AlertTriangleIcon, Play as PlayIcon, FlaskConical as FlaskIcon } from './icons'
 
 const props = defineProps<{
   show: boolean
@@ -132,7 +132,6 @@ watch(() => state.currentID, () => {
   openSource.value = null
   if (props.show) refresh()
 })
-onMounted(refresh)
 
 // builtInCount / dynamicCount drive the section
 // headers. Cheap computeds so Vue can cache the
@@ -387,26 +386,26 @@ function scopeLabel(scope?: string) {
 .drawer-header {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
 }
 .header-icon {
-  color: var(--accent);
+  color: var(--brand-500);
 }
 .tool-list {
-  padding: 0 0 24px 0;
+  padding: 0 0 var(--space-6);
 }
 .section {
-  margin-bottom: 24px;
+  margin-bottom: var(--space-6);
 }
 .section-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 4px 8px 4px;
+  gap: var(--space-2);
+  padding: 0 var(--space-1) var(--space-2);
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-2);
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -414,137 +413,137 @@ function scopeLabel(scope?: string) {
   flex: 1;
 }
 .tool-name {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   font-weight: 600;
-  color: var(--text-1);
+  color: var(--text-primary);
 }
 .badge {
-  margin-left: 6px;
+  margin-left: var(--space-2);
 }
 .source-box {
-  margin-top: 8px;
-  padding: 10px 12px;
-  background: var(--bg-2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
 }
 .source-box code {
   display: block;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--text-1);
+  color: var(--text-primary);
   word-break: break-all;
 }
 .source-hint {
-  margin: 6px 0 0 0;
+  margin: var(--space-2) 0 0;
   font-size: 11px;
-  color: var(--text-2);
+  color: var(--text-secondary);
 }
 .trial-box {
-  margin-top: 10px;
-  padding: 10px 12px;
-  background: var(--bg-2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
 }
 .trial-header,
 .trial-actions,
 .trial-result-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 .trial-header {
   justify-content: space-between;
-  margin-bottom: 8px;
+  margin-bottom: var(--space-2);
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-1);
+  color: var(--text-primary);
 }
 .trial-form {
   display: grid;
-  gap: 8px;
+  gap: var(--space-2);
 }
 .trial-field {
   display: grid;
   grid-template-columns: minmax(90px, 0.42fr) minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   min-width: 0;
 }
 .trial-field > span {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--text-2);
+  color: var(--text-secondary);
   min-width: 0;
   overflow-wrap: anywhere;
 }
 .trial-field strong {
-  color: var(--danger, #dc2626);
+  color: var(--error-500);
 }
 .trial-actions {
   justify-content: flex-end;
-  margin-top: 10px;
+  margin-top: var(--space-3);
 }
 .trial-result {
-  margin-top: 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  margin-top: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
   overflow: hidden;
-  background: var(--bg-1);
+  background: var(--surface-1);
 }
 .trial-result.status-error {
-  border-color: var(--danger, #dc2626);
+  border-color: var(--error-500);
 }
 .trial-result-head {
   justify-content: space-between;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border);
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
   font-size: 11px;
-  color: var(--text-2);
+  color: var(--text-secondary);
 }
 .trial-result pre {
   margin: 0;
-  padding: 8px;
+  padding: var(--space-2);
   max-height: 180px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.45;
-  color: var(--text-1);
+  color: var(--text-primary);
 }
 .diagnostic-body {
   display: grid;
-  gap: 6px;
+  gap: var(--space-2);
   min-width: 0;
 }
 .diagnostic-body code {
   display: block;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--text-1);
+  color: var(--text-primary);
   word-break: break-all;
 }
 .diagnostic-error {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  color: var(--danger, #dc2626);
+  gap: var(--space-2);
+  color: var(--error-500);
   font-size: 12px;
   line-height: 1.45;
 }
 .error-box {
-  padding: 12px 16px;
-  background: var(--error-bg, #fef2f2);
-  border: 1px solid var(--error-border, #fecaca);
-  border-radius: 6px;
-  color: var(--error-text, #b91c1c);
+  padding: var(--space-3) var(--space-4);
+  background: var(--error-50);
+  border: 1px solid var(--error-500);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
   font-size: 12px;
 }
 .empty {
-  padding: 48px 0;
+  padding: calc(var(--space-8) + var(--space-2)) 0;
 }
 </style>

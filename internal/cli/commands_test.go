@@ -66,6 +66,31 @@ func (mockBase) Regenerate(context.Context, string, int64) (<-chan agent.ChatStr
 	close(ch)
 	return ch, nil
 }
+func (mockBase) ListTurnQueueItems(context.Context, string) ([]httpcli.TurnQueueItem, error) {
+	return nil, nil
+}
+func (mockBase) EnqueueTurnQueueItem(context.Context, string, httpcli.TurnQueuePayload) (httpcli.TurnQueueItem, error) {
+	return httpcli.TurnQueueItem{}, nil
+}
+func (mockBase) EditTurnQueueItem(context.Context, string, int64, string) (httpcli.TurnQueueItem, error) {
+	return httpcli.TurnQueueItem{}, nil
+}
+func (mockBase) ClaimNextTurnQueueItem(context.Context, string) (httpcli.TurnQueueItem, error) {
+	return httpcli.TurnQueueItem{}, nil
+}
+func (mockBase) CompleteTurnQueueItem(context.Context, string, int64) (httpcli.TurnQueueItem, error) {
+	return httpcli.TurnQueueItem{}, nil
+}
+func (mockBase) FailTurnQueueItem(context.Context, string, int64, string) (httpcli.TurnQueueItem, error) {
+	return httpcli.TurnQueueItem{}, nil
+}
+func (mockBase) RetryTurnQueueItem(context.Context, string, int64) (httpcli.TurnQueueItem, error) {
+	return httpcli.TurnQueueItem{}, nil
+}
+func (mockBase) DeleteTurnQueueItem(context.Context, string, int64) (httpcli.TurnQueueItem, error) {
+	return httpcli.TurnQueueItem{}, nil
+}
+func (mockBase) ClearTurnQueue(context.Context, string) (int64, error) { return 0, nil }
 func (mockBase) RollbackMessages(context.Context, string, int64) ([]httpcli.Message, error) {
 	return nil, nil
 }
@@ -101,6 +126,9 @@ func (mockBase) ListAllModels(string) []ModelView                     { return n
 func (mockBase) GetModelSettings(string, string) ModelSettings        { return ModelSettings{} }
 func (mockBase) ReloadConfig() error                                  { return nil }
 func (mockBase) ChatWithTools(context.Context, agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
+	return nil, nil
+}
+func (mockBase) ChatQueuedTurn(context.Context, string, httpcli.TurnQueuePayload) (<-chan agent.ChatStreamChunk, error) {
 	return nil, nil
 }
 func (mockBase) ChatStream(context.Context, agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
@@ -388,6 +416,101 @@ func (m *mockCtx) Regenerate(_ context.Context, sessionID string, userMessageID 
 }
 func (m *mockCtx) StyleName() string               { return m.styleArg }
 func (m *mockCtx) StyleLabel(s style.Style) string { return string(s) }
+
+type queueMock struct {
+	mockBase
+	sessionID string
+	editedID  int64
+	edited    string
+}
+
+func (m *queueMock) GetCurrentSessionID() string { return m.sessionID }
+func (m *queueMock) EditTurnQueueItem(_ context.Context, _ string, id int64, message string) (httpcli.TurnQueueItem, error) {
+	m.editedID = id
+	m.edited = message
+	return httpcli.TurnQueueItem{ID: id, Status: "queued", Message: message}, nil
+}
+
+func TestCmdQueue_Edit(t *testing.T) {
+	ctx := &queueMock{sessionID: "conv_queue"}
+	if err := cmdQueue(ctx, "edit 42 更新后的排队内容"); err != nil {
+		t.Fatalf("cmdQueue edit: %v", err)
+	}
+	if ctx.editedID != 42 || ctx.edited != "更新后的排队内容" {
+		t.Fatalf("unexpected edit call: id=%d message=%q", ctx.editedID, ctx.edited)
+	}
+}
+
+type queueRunMock struct {
+	mockBase
+	item            httpcli.TurnQueueItem
+	claimed         bool
+	completedID     int64
+	receivedPayload *httpcli.TurnQueuePayload
+}
+
+func (m *queueRunMock) GetCurrentSessionID() string { return "conv_queue" }
+func (m *queueRunMock) ListTurnQueueItems(context.Context, string) ([]httpcli.TurnQueueItem, error) {
+	if m.completedID != 0 {
+		return nil, nil
+	}
+	return []httpcli.TurnQueueItem{m.item}, nil
+}
+func (m *queueRunMock) ClaimNextTurnQueueItem(context.Context, string) (httpcli.TurnQueueItem, error) {
+	m.claimed = true
+	return m.item, nil
+}
+func (m *queueRunMock) ChatWithTools(context.Context, agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
+	return nil, errors.New("queue runner should use ChatQueuedTurn")
+}
+func (m *queueRunMock) ChatQueuedTurn(_ context.Context, _ string, payload httpcli.TurnQueuePayload) (<-chan agent.ChatStreamChunk, error) {
+	m.receivedPayload = &payload
+	ch := make(chan agent.ChatStreamChunk, 1)
+	ch <- agent.ChatStreamChunk{Done: true}
+	close(ch)
+	return ch, nil
+}
+func (m *queueRunMock) CompleteTurnQueueItem(_ context.Context, _ string, id int64) (httpcli.TurnQueueItem, error) {
+	m.completedID = id
+	return httpcli.TurnQueueItem{ID: id, Status: "done"}, nil
+}
+
+func TestCmdQueue_RunCompletesClaimedTurns(t *testing.T) {
+	disabled := false
+	payload := &httpcli.TurnQueuePayload{
+		Message: "queued", Provider: "test", Model: "model",
+		UseImageRecognition: &disabled, SubAgentModelEnabled: &disabled,
+	}
+	ctx := &queueRunMock{item: httpcli.TurnQueueItem{ID: 7, Status: "queued", Message: "queued", Payload: payload}}
+	if err := cmdQueue(ctx, "run"); err != nil {
+		t.Fatalf("cmdQueue run: %v", err)
+	}
+	if !ctx.claimed || ctx.completedID != 7 {
+		t.Fatalf("queue run did not claim and complete item: claimed=%v completed=%d", ctx.claimed, ctx.completedID)
+	}
+	if ctx.receivedPayload == nil || ctx.receivedPayload.UseImageRecognition == nil || *ctx.receivedPayload.UseImageRecognition ||
+		ctx.receivedPayload.SubAgentModelEnabled == nil || *ctx.receivedPayload.SubAgentModelEnabled {
+		t.Fatalf("queue run did not preserve explicit false options: %+v", ctx.receivedPayload)
+	}
+}
+
+func TestQueuedPayloadSendOptionsPreservesExplicitFalse(t *testing.T) {
+	disabled := false
+	opts := queuedPayloadSendOptions(httpcli.TurnQueuePayload{
+		Message: "queued", UseImageRecognition: &disabled, SubAgentModelEnabled: &disabled,
+	})
+	if opts.UseImageRecognition == nil || *opts.UseImageRecognition ||
+		opts.SubAgentModelEnabled == nil || *opts.SubAgentModelEnabled {
+		t.Fatalf("explicit false options were not preserved: %+v", opts)
+	}
+}
+
+func TestQueuedTurnChatRequestKeepsSessionID(t *testing.T) {
+	req := queuedTurnChatRequest(httpcli.TurnQueuePayload{Message: "queued"}, mockBase{}, "conv_queue")
+	if req.SessionID != "conv_queue" {
+		t.Fatalf("queued request session id = %q, want conv_queue", req.SessionID)
+	}
+}
 
 // =====================================================================
 // /model
@@ -1216,6 +1339,35 @@ func TestCmdSkills(t *testing.T) {
 	ctx := &mockCtx{}
 	if err := cmdSkills(ctx, ""); err != nil {
 		t.Fatalf("cmdSkills: %v", err)
+	}
+}
+
+func TestParseSkillCommandArgs(t *testing.T) {
+	name, prompt, err := parseSkillCommandArgs("lark-doc 创建一份周报")
+	if err != nil {
+		t.Fatalf("parseSkillCommandArgs: %v", err)
+	}
+	if name != "lark-doc" || prompt != "创建一份周报" {
+		t.Fatalf("got name=%q prompt=%q", name, prompt)
+	}
+
+	name, prompt, err = parseSkillCommandArgs("lark-doc")
+	if err != nil || name != "lark-doc" || prompt != "请使用 Skill「lark-doc」提供帮助" {
+		t.Fatalf("default prompt: name=%q prompt=%q err=%v", name, prompt, err)
+	}
+
+	if _, _, err := parseSkillCommandArgs(""); err == nil {
+		t.Fatal("expected missing name error")
+	}
+}
+
+func TestMatchInstalledSkillCommand(t *testing.T) {
+	name, prompt, ok := matchInstalledSkillCommand("/lark-doc 创建文档", []string{"lark-doc", "lark-shared"})
+	if !ok || name != "lark-doc" || prompt != "创建文档" {
+		t.Fatalf("got ok=%v name=%q prompt=%q", ok, name, prompt)
+	}
+	if _, _, ok := matchInstalledSkillCommand("/unknown do it", []string{"lark-doc"}); ok {
+		t.Fatal("unexpected match for unknown Skill")
 	}
 }
 

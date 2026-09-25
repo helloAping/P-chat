@@ -26,7 +26,7 @@ type OpenAIAdapter struct {
 }
 
 // NewOpenAIAdapter creates an adapter for an OpenAI-compatible
-// endpoint. baseURL is the API root (e.g. https://api.openai.com).
+// endpoint. baseURL is the complete chat-completions request URL.
 func NewOpenAIAdapter(baseURL, apiKey, providerName string) *OpenAIAdapter {
 	return &OpenAIAdapter{
 		baseURL: baseURL,
@@ -45,7 +45,9 @@ func NewOpenAIAdapter(baseURL, apiKey, providerName string) *OpenAIAdapter {
 //	tool_call    → {role: assistant, tool_calls: [{id, type: function, function: {name, arguments}}]}
 //	tool_result  → {role: tool, content: "...", tool_call_id: "..."}
 //	thinking     → skipped (agent-internal)
-//	audio, file  → text marker
+//	audio       → input_audio (mp3/wav) or file content part
+//	video       → file content part
+//	file        → text marker
 //
 // Parallel tool_calls (and assistant text immediately followed by
 // tool_call) are merged into a single assistant message. Emitting
@@ -57,6 +59,9 @@ func NewOpenAIAdapter(baseURL, apiKey, providerName string) *OpenAIAdapter {
 // and the next round was rejected. P2-3.
 func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens int, tools []ToolDef, system string, temperature float32, topP float32) (*ProtocolRequest, error) {
 	openaiMsgs := make([]openai.ChatCompletionMessage, 0, len(messages)+1)
+	mediaParts := make(map[string][]any)
+	reasoning := make(map[int]string)
+	replayReasoning := len(tools) > 0 && deepSeekReasoningReplay(model, a.baseURL)
 
 	// System prompt as first message.
 	if system != "" {
@@ -100,6 +105,9 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 
 	for i := 0; i < len(messages); i++ {
 		msg := messages[i]
+		if IsRuntimeContext(msg) {
+			msg.Content = runtimeContextContent(msg)
+		}
 
 		switch msg.Type {
 		case TypeThinking:
@@ -215,6 +223,9 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 					// same round, and both belong on the same
 					// wire message.
 					la.Content = msg.Content
+					if thinking := messageReasoning(msg); replayReasoning && thinking != "" {
+						reasoning[lastAssistantIdx] = thinking
+					}
 					continue
 				}
 			}
@@ -224,18 +235,25 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 			})
 			if role == openai.ChatMessageRoleAssistant {
 				lastAssistantIdx = len(openaiMsgs) - 1
+				if thinking := messageReasoning(msg); replayReasoning && thinking != "" {
+					reasoning[lastAssistantIdx] = thinking
+				}
 			} else {
 				lastAssistantIdx = -1
 			}
 
-		default: // TypeAudio, TypeFile, or empty (plain message)
+		default: // TypeAudio, TypeVideo, TypeFile, or empty (plain message)
 			flushPending()
 			lastAssistantIdx = -1
 			role := openaiChatRole(msg.Role)
 			content := msg.Content
 			switch msg.Type {
 			case TypeAudio:
-				content = fmt.Sprintf("(attached audio: %s, MIME=%s)", msg.Name, msg.MimeType)
+				content = fmt.Sprintf("__pchat_media_%d__", len(mediaParts))
+				mediaParts[content] = openAIAudioContentParts(msg)
+			case TypeVideo:
+				content = fmt.Sprintf("__pchat_media_%d__", len(mediaParts))
+				mediaParts[content] = openAIFileContentParts(msg, "video")
 			case TypeFile:
 				content = fmt.Sprintf("(attached file: %s)", msg.Name)
 			}
@@ -285,9 +303,17 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 	if err != nil {
 		return nil, fmt.Errorf("marshal openai request: %w", err)
 	}
+	if len(mediaParts) > 0 {
+		body, err = replaceOpenAIMediaParts(body, mediaParts)
+		if err != nil {
+			return nil, fmt.Errorf("serialize OpenAI media content: %w", err)
+		}
+	}
 	body = addOpenAIImageDataFields(body)
-
-	url := strings.TrimRight(a.baseURL, "/") + "/chat/completions"
+	body, err = addReasoningContent(body, reasoning)
+	if err != nil {
+		return nil, fmt.Errorf("serialize reasoning context: %w", err)
+	}
 
 	headers := map[string]string{
 		"Content-Type":  "application/json",
@@ -301,10 +327,57 @@ func (a *OpenAIAdapter) Build(messages []ChatMessage, model string, maxTokens in
 
 	return &ProtocolRequest{
 		Method:  http.MethodPost,
-		URL:     url,
+		URL:     strings.TrimSpace(a.baseURL),
 		Body:    body,
 		Headers: headers,
 	}, nil
+}
+
+func openAIAudioContentParts(msg ChatMessage) []any {
+	format := ""
+	switch strings.ToLower(msg.MimeType) {
+	case "audio/mpeg", "audio/mp3":
+		format = "mp3"
+	case "audio/wav", "audio/x-wav", "audio/wave":
+		format = "wav"
+	}
+	if format == "" {
+		return openAIFileContentParts(msg, "audio")
+	}
+	return []any{
+		map[string]any{"type": "text", "text": fmt.Sprintf("Analyze the attached audio %s.", msg.Name)},
+		map[string]any{"type": "input_audio", "input_audio": map[string]any{"data": msg.Content, "format": format}},
+	}
+}
+
+func openAIFileContentParts(msg ChatMessage, kind string) []any {
+	mimeType := strings.TrimSpace(msg.MimeType)
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	return []any{
+		map[string]any{"type": "text", "text": fmt.Sprintf("Analyze the attached %s %s.", kind, msg.Name)},
+		map[string]any{"type": "file", "file": map[string]any{
+			"filename":  msg.Name,
+			"file_data": fmt.Sprintf("data:%s;base64,%s", mimeType, msg.Content),
+		}},
+	}
+}
+
+func replaceOpenAIMediaParts(body []byte, mediaParts map[string][]any) ([]byte, error) {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, err
+	}
+	messages, _ := root["messages"].([]any)
+	for _, value := range messages {
+		message, _ := value.(map[string]any)
+		content, _ := message["content"].(string)
+		if parts, ok := mediaParts[content]; ok {
+			message["content"] = parts
+		}
+	}
+	return json.Marshal(root)
 }
 
 func addOpenAIImageDataFields(body []byte) []byte {
@@ -461,10 +534,7 @@ func (a *OpenAIAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				}
 			}
 			if r.Usage != nil {
-				ch <- StreamChunk{
-					TokensIn:  r.Usage.PromptTokens,
-					TokensOut: r.Usage.CompletionTokens,
-				}
+				ch <- r.Usage.chunk()
 			}
 			if choiceCount == 0 || (contentChars == 0 && thinkingChars == 0) {
 				if v, _ := extractContent(payload); v != "" {

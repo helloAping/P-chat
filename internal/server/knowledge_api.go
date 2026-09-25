@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,21 +20,6 @@ import (
 	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 )
-
-var scanJobs sync.Map // map[string]*scanJob 閳?baseName 閳?job state
-
-type scanJob struct {
-	status    string
-	startedAt time.Time
-	current   int // files processed
-	total     int // total files found
-	chunks    int // chunks indexed
-	changed   int
-	skipped   int
-	deleted   int
-	failed    int
-	cancel    context.CancelFunc
-}
 
 type scanProgressResp struct {
 	Chunks  int    `json:"chunks"`
@@ -170,7 +154,7 @@ func (h *Handler) GetKnowledgeModels(c *gin.Context) {
 				Provider:       p.Name,
 				Protocol:       p.GetProtocol(),
 				Model:          m.Name,
-				SupportsVision: m.Capabilities.SupportsVision,
+				SupportsVision: m.Capabilities.SupportsInput(config.MediaImage),
 			})
 		}
 	}
@@ -190,12 +174,12 @@ func (h *Handler) ListKnowledgeBases(c *gin.Context) {
 	for _, b := range h.getCfg().Knowledge.Bases {
 		resp := baseToResp(b)
 		// Enrich with scan job status.
-		if v, ok := scanJobs.Load(b.Name); ok {
-			j := v.(*scanJob)
-			if strings.HasPrefix(j.status, "ok: ") {
+		if j, ok := scanJobs.Load(b.Name); ok {
+			snap := j.snapshot()
+			if strings.HasPrefix(snap.Status, "ok: ") {
 				resp.Status = "ok"
-				resp.DocCount = j.chunks
-			} else if strings.Contains(j.status, "error") {
+				resp.DocCount = snap.Chunks
+			} else if strings.Contains(snap.Status, "error") {
 				resp.Status = "error"
 			} else {
 				resp.Status = "scanning"
@@ -288,7 +272,7 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	v, ok := scanJobs.Load(name)
+	j, ok := scanJobs.Load(name)
 	if !ok {
 		// No active scan — return current section count from wiki store.
 		resp := scanProgressResp{Done: false}
@@ -304,26 +288,26 @@ func (h *Handler) ScanStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, resp)
 		return
 	}
-	j := v.(*scanJob)
+	snap := j.snapshot()
 	resp := scanProgressResp{
-		Chunks:  j.chunks,
-		Current: j.current,
-		Total:   j.total,
-		Changed: j.changed,
-		Skipped: j.skipped,
-		Deleted: j.deleted,
-		Failed:  j.failed,
+		Chunks:  snap.Chunks,
+		Current: snap.Current,
+		Total:   snap.Total,
+		Changed: snap.Changed,
+		Skipped: snap.Skipped,
+		Deleted: snap.Deleted,
+		Failed:  snap.Failed,
 	}
-	if strings.HasPrefix(j.status, "ok: ") {
+	if strings.HasPrefix(snap.Status, "ok: ") {
 		resp.Done = true
 		c.JSON(http.StatusOK, resp)
-	} else if strings.HasPrefix(j.status, "error: ") {
-		resp.Error = strings.TrimPrefix(j.status, "error: ")
+	} else if strings.HasPrefix(snap.Status, "error: ") {
+		resp.Error = strings.TrimPrefix(snap.Status, "error: ")
 		resp.Done = true
 		c.JSON(http.StatusOK, resp)
 	} else {
 		resp.Message = "扫描中..."
-		if j.status == "counting" {
+		if snap.Status == "counting" {
 			resp.Message = "正在统计文件..."
 		}
 		c.JSON(http.StatusOK, resp)
@@ -337,15 +321,12 @@ func (h *Handler) CancelScan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	v, ok := scanJobs.Load(name)
+	j, ok := scanJobs.Load(name)
 	if !ok {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "message": "没有正在进行的扫描"})
 		return
 	}
-	j := v.(*scanJob)
-	if j.cancel != nil {
-		j.cancel()
-	}
+	j.cancelJob()
 	scanJobs.Delete(name)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "scan cancelled"})
 }
@@ -497,6 +478,11 @@ func (h *Handler) DeleteNode(c *gin.Context) {
 // always queried so a strong match in base N is not drowned by
 // weak matches in base 1.
 func (h *Handler) SearchKnowledge(c *gin.Context) {
+	const (
+		maxKnowledgeSearchTopK         = 50
+		maxKnowledgeSearchContentRunes = 2000
+	)
+
 	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
 		return
@@ -518,25 +504,41 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 	if req.TopK <= 0 {
 		req.TopK = 5
 	}
+	requestedTopK := req.TopK
+	if req.TopK > maxKnowledgeSearchTopK {
+		req.TopK = maxKnowledgeSearchTopK
+	}
 
 	kc := h.getCfg().Knowledge
 	if !kc.Enabled || len(kc.Bases) == 0 {
-		c.JSON(http.StatusOK, gin.H{"query": req.Query, "results": []any{}})
+		c.JSON(http.StatusOK, gin.H{
+			"query":   req.Query,
+			"results": []any{},
+			"stats": gin.H{
+				"top_k":      req.TopK,
+				"returned":   0,
+				"truncated":  requestedTopK > req.TopK,
+				"has_more":   false,
+				"candidates": 0,
+			},
+		})
 		return
 	}
 
 	ctx := c.Request.Context()
 	type resultItem struct {
-		Source      string             `json:"source"`
-		Content     string             `json:"content"`
-		Similarity  float64            `json:"similarity"`
-		Rank        int                `json:"rank"`
-		Base        string             `json:"base,omitempty"`
-		Title       string             `json:"title,omitempty"`
-		MatchType   string             `json:"match_type,omitempty"`
-		Query       string             `json:"query,omitempty"`
-		Explanation string             `json:"explanation,omitempty"`
-		Citation    knowledge.Citation `json:"citation"`
+		Source           string             `json:"source"`
+		Content          string             `json:"content"`
+		Similarity       float64            `json:"similarity"`
+		Rank             int                `json:"rank"`
+		Base             string             `json:"base,omitempty"`
+		Title            string             `json:"title,omitempty"`
+		MatchType        string             `json:"match_type,omitempty"`
+		Query            string             `json:"query,omitempty"`
+		Explanation      string             `json:"explanation,omitempty"`
+		Citation         knowledge.Citation `json:"citation"`
+		ContentTruncated bool               `json:"content_truncated,omitempty"`
+		ContentFullChars int                `json:"content_full_chars,omitempty"`
 	}
 
 	// Resolve which bases to search.
@@ -552,6 +554,8 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		queries = []string{req.Query}
 	}
 	var candidates []knowledge.IndexSearchItem
+	var searchedBases []string
+	rawTotal := 0
 	// Per-base window: fetch more than TopK so merge has headroom
 	// after normalisation + dedupe. Cap at 50 (LookupSearch max).
 	perBase := req.TopK * 3
@@ -573,6 +577,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 			log.Printf("[search] open wiki store %q: %v", base.Name, err)
 			continue
 		}
+		searchedBases = append(searchedBases, base.Name)
 		for _, q := range queries {
 			res, err := store.LookupSearch(ctx, q, base.Name, true, 0, 1, perBase)
 			if err != nil {
@@ -582,6 +587,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 			if res == nil {
 				continue
 			}
+			rawTotal += res.Total
 			items := knowledge.TagBase(res.Items, base.Name)
 			for i := range items {
 				if items[i].Query == "" {
@@ -592,9 +598,15 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		}
 	}
 
-	merged := knowledge.MergeAndRerank(candidates, knowledge.MergeOptions{TopK: req.TopK})
+	mergedAll := knowledge.MergeAndRerank(candidates, knowledge.MergeOptions{TopK: len(candidates)})
+	hasMore := len(mergedAll) > req.TopK || rawTotal > len(candidates)
+	merged := mergedAll
+	if len(merged) > req.TopK {
+		merged = merged[:req.TopK]
+	}
 
 	out := make([]resultItem, 0, len(merged))
+	contentTruncated := 0
 	for i, it := range merged {
 		content := it.Overview
 		if len(it.Children) > 0 {
@@ -605,24 +617,32 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		if content == "" {
 			content = it.Title
 		}
+		contentFullChars := len([]rune(content))
+		content, truncated := knowledge.TruncateTextWithFlag(content, maxKnowledgeSearchContentRunes)
+		if truncated {
+			contentTruncated++
+		}
 		citation := knowledge.BuildCitation(it)
 		out = append(out, resultItem{
-			Source:      it.Source,
-			Content:     content,
-			Similarity:  it.Rank,
-			Rank:        i + 1,
-			Base:        it.Base,
-			Title:       it.Title,
-			MatchType:   it.MatchType,
-			Query:       it.Query,
-			Explanation: citation.Explanation,
-			Citation:    citation,
+			Source:           it.Source,
+			Content:          content,
+			Similarity:       it.Rank,
+			Rank:             i + 1,
+			Base:             it.Base,
+			Title:            it.Title,
+			MatchType:        it.MatchType,
+			Query:            it.Query,
+			Explanation:      citation.Explanation,
+			Citation:         citation,
+			ContentTruncated: truncated,
+			ContentFullChars: contentFullChars,
 		})
 	}
 
 	// Grep actual files (appended after ranked hits, not re-ranked).
+	grepAppended := 0
 	if req.Grep != "" {
-		for _, gr := range grepKB(h.getCfg(), req.Grep, req.TopK) {
+		for _, gr := range grepKB(h.getCfg(), req.Grep, req.TopK, want) {
 			if len(out) >= req.TopK {
 				break
 			}
@@ -644,13 +664,36 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 				Explanation: citation.Explanation,
 				Citation:    citation,
 			})
+			grepAppended++
 		}
 	}
 
 	if len(out) > req.TopK {
 		out = out[:req.TopK]
 	}
-	c.JSON(http.StatusOK, gin.H{"query": req.Query, "queries": plan.Queries, "results": out})
+	c.JSON(http.StatusOK, gin.H{
+		"query":   req.Query,
+		"queries": plan.Queries,
+		"results": out,
+		"stats": gin.H{
+			"top_k":                 req.TopK,
+			"requested_top_k":       requestedTopK,
+			"top_k_capped":          requestedTopK > req.TopK,
+			"per_base_limit":        perBase,
+			"bases":                 searchedBases,
+			"bases_searched":        len(searchedBases),
+			"query_count":           len(queries),
+			"raw_matches":           rawTotal,
+			"candidates":            len(candidates),
+			"merged_candidates":     len(mergedAll),
+			"returned":              len(out),
+			"grep_appended":         grepAppended,
+			"content_preview_chars": maxKnowledgeSearchContentRunes,
+			"content_truncated":     contentTruncated,
+			"has_more":              hasMore,
+			"truncated":             hasMore || contentTruncated > 0 || requestedTopK > req.TopK,
+		},
+	})
 }
 
 // (removed: GetEmbedders — vector embedding system deprecated)
@@ -678,20 +721,6 @@ func (h *Handler) AutoIndexKnowledgeBases() {
 // ---- helpers ----
 
 func (h *Handler) startScanJob(name string) error {
-	// Check if a scan is already running. Allow new scan if the
-	// previous job has finished (ok / error status) or is stale
-	// (older than 30min 閳?leftover from a crashed instance).
-	if v, ok := scanJobs.Load(name); ok {
-		j := v.(*scanJob)
-		if strings.HasPrefix(j.status, "ok: ") || strings.HasPrefix(j.status, "error: ") {
-			scanJobs.Delete(name) // completed, allow new scan
-		} else if time.Since(j.startedAt) < 30*time.Minute {
-			return fmt.Errorf("scan running")
-		} else {
-			scanJobs.Delete(name) // stale, clean up
-		}
-	}
-
 	var base *config.KnowledgeBase
 	for i := range h.getCfg().Knowledge.Bases {
 		if h.getCfg().Knowledge.Bases[i].Name == name {
@@ -725,58 +754,57 @@ func (h *Handler) startScanJob(name string) error {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	job := &scanJob{status: "counting", startedAt: time.Now(), cancel: cancel}
-	scanJobs.Store(name, job)
+	job := newScanJob("counting", cancel)
+	stale, claimed := scanJobs.Claim(name, job, time.Now(), 30*time.Minute)
+	if !claimed {
+		cancel()
+		return fmt.Errorf("scan already running")
+	}
+	if stale != nil {
+		stale.cancelJob()
+	}
 
 	go func() {
 		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("[scan %s] panic: %v", name, r)
-				job.status = fmt.Sprintf("error: panic: %v", r)
+				job.setStatus(fmt.Sprintf("error: panic: %v", r))
 			}
 		}()
 
 		store, err := knowledge.GetOrOpenWikiStore(base.Name, basePath)
 		if err != nil {
-			job.status = fmt.Sprintf("error: wiki store: %v", err)
+			job.setStatus(fmt.Sprintf("error: wiki store: %v", err))
 			log.Printf("[scan %s] wiki store: %v", name, err)
 			return
 		}
 
-		fileCount := countIndexableFiles(basePath, base.ExcludePatterns)
-		job.total = fileCount
-		job.current = 0
-		job.status = "running"
+		fileCount := countIndexableFiles(basePath, base)
+		job.startRunning(fileCount)
 
 		if fileCount == 0 {
 			log.Printf("[scan %s] no indexable files found in %s", name, basePath)
 		}
 
 		stats, idxErr := h.indexScan(ctx, store, base, basePath, name, func(current int) {
-			job.current = current
+			job.setCurrent(current)
 		})
-		job.changed = stats.Changed
-		job.skipped = stats.Skipped
-		job.deleted = stats.Deleted
-		job.failed = stats.Failed
+		job.setStats(stats)
 		if idxErr != nil {
-			job.status = fmt.Sprintf("error: %v", idxErr)
+			status := fmt.Sprintf("error: %v", idxErr)
 			if strings.Contains(idxErr.Error(), "delete") && strings.Contains(idxErr.Error(), "re-scan") {
-				job.status += " | 恢复：删除 wiki.db 后重新扫描即可重建索引"
+				status += " | 恢复：删除 wiki.db 后重新扫描即可重建索引"
 			}
+			job.setStatus(status)
 			log.Printf("[scan %s] index scan: %v", name, idxErr)
 			return
 		}
+		if h.agent != nil {
+			h.agent.Reload()
+		}
 
-		job.status = fmt.Sprintf("ok: %d changed, %d skipped, %d deleted, %d failed, %d L3 sections", stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L3)
-		job.total = fileCount
-		job.current = fileCount
-		job.chunks = stats.L3
-		job.changed = stats.Changed
-		job.skipped = stats.Skipped
-		job.deleted = stats.Deleted
-		job.failed = stats.Failed
+		job.finish(fmt.Sprintf("ok: %d changed, %d skipped, %d deleted, %d failed, %d L3 sections", stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L3), fileCount, stats)
 		log.Printf("[scan %s] done: changed=%d skipped=%d deleted=%d failed=%d L2=%d L3=%d", name, stats.Changed, stats.Skipped, stats.Deleted, stats.Failed, stats.L2, stats.L3)
 	}()
 	return nil
@@ -976,6 +1004,9 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 	var files []fileData
 
 	walkErr := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if ctx.Err() != nil {
+			return filepath.SkipAll
+		}
 		if err != nil {
 			stats.Failed++
 			return nil
@@ -985,18 +1016,33 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == ".git" {
 				return filepath.SkipDir
 			}
+			if path != dir {
+				rel, _ := filepath.Rel(dir, path)
+				rel = filepath.ToSlash(rel)
+				var excludePatterns []string
+				if base != nil {
+					excludePatterns = base.ExcludePatterns
+				}
+				if knowledge.ExcludedByPatterns(rel, excludePatterns) {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
 		kind := "text"
-		if knowledge.IsMediaFile(ext, []string{}) != "" {
-			return nil
-		}
-		if !knowledge.IndexableExtensions[ext] || info.Size() > 5*1024*1024 {
+		if !knowledgeBaseAllowsExt(base, ext) || info.Size() > knowledgeBaseMaxFileSize(base) {
 			return nil
 		}
 		rel, _ := filepath.Rel(dir, path)
 		rel = filepath.ToSlash(rel)
+		var excludePatterns []string
+		if base != nil {
+			excludePatterns = base.ExcludePatterns
+		}
+		if knowledge.ExcludedByPatterns(rel, excludePatterns) {
+			return nil
+		}
 		currentSources[rel] = true
 		mtime := info.ModTime().UnixNano()
 		if prev, err := store.GetFileMtime(ctx, baseName, rel); err == nil && prev == mtime {
@@ -1064,6 +1110,9 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 	if walkErr != nil {
 		log.Printf("[index-scan %s] walk error: %v", baseName, walkErr)
 	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 
 	for fi, fd := range files {
 		title := fd.source
@@ -1092,6 +1141,9 @@ func (h *Handler) indexScan(ctx context.Context, store *knowledge.WikiStore, bas
 		return stats, fmt.Errorf("remove stale sources: %w", staleErr)
 	}
 	stats.Deleted = deleted
+	if err := store.RefreshL1Overview(ctx, baseName); err != nil {
+		return stats, fmt.Errorf("refresh l1 overview: %w", err)
+	}
 	if nodes, err := store.ListNodes(ctx, baseName); err == nil {
 		stats.L2, stats.L3 = countIndexedLevels(nodes)
 	} else {
@@ -1137,24 +1189,48 @@ func buildL1Overview(l2Nodes []knowledge.IndexNode) string {
 }
 
 func parseKWAndOverview(indexed string) (keywords, overview string) {
-	// Parse "关键词: a, b, c" and "摘要: ..." from LLM output.
+	if parsed := knowledge.ParseIndexEntry(indexed); parsed != nil {
+		keywords = strings.TrimSpace(parsed.Keywords)
+		overview = strings.TrimSpace(parsed.Overview)
+		if overview == "" {
+			overview = strings.TrimSpace(parsed.SearchHints)
+		}
+		if keywords != "" || overview != "" {
+			return keywords, overview
+		}
+	}
+	// Parse legacy/free-form "关键词: a, b, c" and "摘要: ..." output.
 	for _, line := range strings.Split(indexed, "\n") {
 		line = strings.TrimSpace(line)
-		if (strings.HasPrefix(line, "关键词：") || strings.HasPrefix(line, "关键词:")) && keywords == "" {
-			keywords = strings.TrimSpace(line[strings.IndexRune(line, ':')+1:])
+		idx := strings.IndexAny(line, ":：")
+		if idx < 0 {
+			continue
 		}
-		if (strings.HasPrefix(line, "摘要：") || strings.HasPrefix(line, "摘要:")) && overview == "" {
-			overview = strings.TrimSpace(line[strings.IndexRune(line, ':')+1:])
+		sepLen := 1
+		if strings.HasPrefix(line[idx:], "：") {
+			sepLen = len("：")
+		}
+		label := strings.ToLower(strings.TrimSpace(line[:idx]))
+		value := strings.TrimSpace(line[idx+sepLen:])
+		switch label {
+		case "关键词", "关键字", "keywords":
+			if keywords == "" {
+				keywords = value
+			}
+		case "内容概览", "概览", "摘要", "overview", "summary":
+			if overview == "" {
+				overview = value
+			}
 		}
 	}
 	if overview == "" {
-		overview = truncateText(indexed, 500)
+		overview = knowledge.TruncateText(indexed, 500)
 	}
 	return
 }
 
 // countIndexableFiles walks a directory and counts files eligible for indexing.
-func countIndexableFiles(dir string, excludePatterns []string) int {
+func countIndexableFiles(dir string, base *config.KnowledgeBase) int {
 	count := 0
 	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -1165,18 +1241,32 @@ func countIndexableFiles(dir string, excludePatterns []string) int {
 			if strings.HasPrefix(n, ".") || n == "node_modules" || n == "vendor" || n == ".git" {
 				return filepath.SkipDir
 			}
+			if p != dir {
+				rel, _ := filepath.Rel(dir, p)
+				rel = filepath.ToSlash(rel)
+				var excludePatterns []string
+				if base != nil {
+					excludePatterns = base.ExcludePatterns
+				}
+				if knowledge.ExcludedByPatterns(rel, excludePatterns) {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
-		if info.Size() > 5*1024*1024 {
+		if info.Size() > knowledgeBaseMaxFileSize(base) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(p))
-		if knowledge.IndexableExtensions[ext] {
+		if knowledgeBaseAllowsExt(base, ext) {
 			rel, _ := filepath.Rel(dir, p)
-			for _, pat := range excludePatterns {
-				if matched, _ := filepath.Match(pat, rel); matched {
-					return nil
-				}
+			rel = filepath.ToSlash(rel)
+			var excludePatterns []string
+			if base != nil {
+				excludePatterns = base.ExcludePatterns
+			}
+			if knowledge.ExcludedByPatterns(rel, excludePatterns) {
+				return nil
 			}
 			count++
 		}
@@ -1191,7 +1281,7 @@ type grepResult struct {
 	Content string `json:"content"`
 }
 
-func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
+func grepKB(cfg *config.Config, pattern string, maxResults int, baseFilter map[string]bool) []grepResult {
 	if pattern == "" || maxResults <= 0 {
 		return nil
 	}
@@ -1200,6 +1290,9 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 	kc := cfg.Knowledge
 	for _, base := range kc.Bases {
 		if !base.Enabled {
+			continue
+		}
+		if len(baseFilter) > 0 && !baseFilter[base.Name] {
 			continue
 		}
 		absPath, err := filepath.Abs(base.Path)
@@ -1212,12 +1305,24 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 				if strings.HasPrefix(n, ".") || n == "node_modules" || n == "vendor" || n == ".git" {
 					return filepath.SkipDir
 				}
+				if walkErr == nil && info != nil && info.IsDir() && path != absPath {
+					rel, _ := filepath.Rel(absPath, path)
+					rel = filepath.ToSlash(rel)
+					if knowledge.ExcludedByPatterns(rel, base.ExcludePatterns) {
+						return filepath.SkipDir
+					}
+				}
 				return nil
 			}
 			if !knowledge.IndexableExtensions[strings.ToLower(filepath.Ext(path))] {
 				return nil
 			}
 			if info.Size() > 5*1024*1024 {
+				return nil
+			}
+			rel, _ := filepath.Rel(absPath, path)
+			rel = filepath.ToSlash(rel)
+			if knowledge.ExcludedByPatterns(rel, base.ExcludePatterns) {
 				return nil
 			}
 			f, err := os.Open(path)
@@ -1236,7 +1341,6 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 			for scanner.Scan() && len(out) < maxResults {
 				lineNum++
 				if strings.Contains(strings.ToLower(scanner.Text()), patternLower) {
-					rel, _ := filepath.Rel(absPath, path)
 					out = append(out, grepResult{
 						Path:    rel,
 						Line:    lineNum,
@@ -1252,8 +1356,35 @@ func grepKB(cfg *config.Config, pattern string, maxResults int) []grepResult {
 }
 
 func truncateText(s string, max int) string {
-	if len(s) <= max {
-		return s
+	return knowledge.TruncateText(s, max)
+}
+
+func knowledgeBaseMaxFileSize(base *config.KnowledgeBase) int64 {
+	if base != nil && base.MaxFileSize > 0 {
+		return base.MaxFileSize
 	}
-	return s[:max]
+	return 5 * 1024 * 1024
+}
+
+func knowledgeBaseAllowsExt(base *config.KnowledgeBase, ext string) bool {
+	ext = strings.ToLower(strings.TrimSpace(ext))
+	if ext == "" || !knowledge.IndexableExtensions[ext] {
+		return false
+	}
+	if base == nil || len(base.FileTypes) == 0 {
+		return true
+	}
+	for _, ft := range base.FileTypes {
+		ft = strings.ToLower(strings.TrimSpace(ft))
+		if ft == "" || ft == "text" || ft == "*" {
+			return true
+		}
+		if !strings.HasPrefix(ft, ".") {
+			ft = "." + ft
+		}
+		if ft == ext {
+			return true
+		}
+	}
+	return false
 }

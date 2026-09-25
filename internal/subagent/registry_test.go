@@ -354,7 +354,6 @@ func TestBuiltins_HasCoreAgents(t *testing.T) {
 	// for public GET fetch / search).
 	wantReadTools := map[string]bool{
 		"read_file": true, "list_files": true, "grep": true,
-		"read_docx": true, "read_pdf": true,
 	}
 	for _, b := range bs {
 		if b.Name != "explore" && b.Name != "plan" {

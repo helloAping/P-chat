@@ -10,7 +10,7 @@
 #   .\install.ps1 -RemoveFromPath       # 从用户 PATH 移除 / remove P-Chat from user PATH
 #   .\install.ps1 -Gui                  # 显示可视化安装器 / show the visual installer
 #   .\install.ps1 -Launch               # 安装后启动 / launch P-Chat after installation
-#   .\install.ps1 -Force                # overwrite even when the running install path differs
+#   .\install.ps1 -Force                # 允许覆盖不同的已记录安装路径 / allow overwrite when the recorded install path differs
 #
 # Uninstall: run uninstall.ps1 next to pchat-gui.exe.
 #
@@ -566,10 +566,11 @@ if ($AddToPath -and $RemoveFromPath) {
 # lives under $target, so an install to a different path
 # doesn't accidentally quit an unrelated running install.
 #
-# -Force opts in to killing processes from *any* install
-# dir, not just $target. Without it we leave a running
-# install in another path alone — the user might have
-# pinned a particular version there.
+# -Force 可以覆盖本脚本其他位置的安装目录检查，但不会扩大到 $target 之外的进程。
+# 开发版和其他并行安装必须保持运行。
+# -Force may override install-location checks elsewhere in this script, but it
+# never broadens process termination beyond $target. Dev and parallel installs
+# must remain running.
 $stoppedAny = $false
 Get-Process -Name "pchat-gui","pchat-server","pchat","pchat-updater" -ErrorAction SilentlyContinue |
     ForEach-Object {
@@ -578,12 +579,12 @@ Get-Process -Name "pchat-gui","pchat-server","pchat","pchat-updater" -ErrorActio
             $exeDir = Split-Path -LiteralPath $_.MainModule.FileName -Parent
             $p = (Resolve-Path -LiteralPath $exeDir -ErrorAction Stop).Path
         } catch { return }
-        if ($Force -or $p -eq $target) {
+        if (Test-SamePathText -Left $p -Right ([IO.Path]::GetFullPath($target))) {
             Write-Host "[install] stopping PID=$($_.Id) ($($_.ProcessName)) at $p"
             $_ | Stop-Process -Force -ErrorAction SilentlyContinue
             $script:stoppedAny = $true
         } else {
-            Write-Host "[install] PID=$($_.Id) ($($_.ProcessName)) at $p kept (different install; use -Force to override)"
+            Write-Host "[install] PID=$($_.Id) ($($_.ProcessName)) at $p kept (different runtime root)"
         }
     }
 # Give Windows a moment to actually release the file
@@ -663,7 +664,7 @@ if (-not $Portable) {
     $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\P-Chat"
     New-Item -Path $regPath -Force | Out-Null
     Set-ItemProperty -LiteralPath $regPath -Name "DisplayName"     -Value "P-Chat"
-    Set-ItemProperty -LiteralPath $regPath -Name "DisplayVersion"  -Value "1.0.12"
+    Set-ItemProperty -LiteralPath $regPath -Name "DisplayVersion"  -Value "1.0.13"
     Set-ItemProperty -LiteralPath $regPath -Name "Publisher"       -Value "P-Chat"
     Set-ItemProperty -LiteralPath $regPath -Name "InstallLocation" -Value $target
     Set-ItemProperty -LiteralPath $regPath -Name "UninstallString" -Value "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$target\uninstall.ps1`""

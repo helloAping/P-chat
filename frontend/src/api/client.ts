@@ -1,11 +1,11 @@
-﻿// Lightweight HTTP client for the pchat-server API.
+// Lightweight HTTP client for the pchat-server API.
 // All requests are JSON unless noted. The streaming endpoint
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
 
 import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, STREAM_IDLE_AFTER_LLM_MS, type StreamEventLike } from './sse'
 
-const BASE = '' // same origin; pchat-server serves both UI and API
+const BASE = (import.meta.env?.VITE_PCHAT_BACKEND || '').replace(/\/$/, '')
 
 // mintTraceId returns a fresh P3-3 trace id (8-char hex with
 // the "T-" prefix) for outbound requests. The id flows as the
@@ -44,6 +44,21 @@ function directBackendURL(): string {
   return BASE
 }
 
+// apiURL 使用当前运行环境选定的后端解析非流式或可下载 API 资源。
+// apiURL resolves a non-streaming or downloadable API resource against the
+// backend selected for this runtime profile.
+export function apiURL(path: string): string {
+  return directBackendURL() + path
+}
+
+// waitForAPIURL 等待桌面宿主完成启动握手后再解析 URL；纯浏览器开发可设置
+// VITE_PCHAT_BACKEND。
+// waitForAPIURL waits for the desktop host's startup handshake before resolving
+// a URL. Browser-only development can set VITE_PCHAT_BACKEND.
+export async function waitForAPIURL(path: string): Promise<string> {
+  return (await waitForDirectBackend()) + path
+}
+
 // waitForDirectBackend waits for pchat-gui to publish the child
 // server address. Wails bindings are Promise-based, so the old
 // synchronous probe could miss the address during startup and
@@ -70,6 +85,38 @@ async function waitForDirectBackend(): Promise<string> {
   return directBackendURL()
 }
 
+export type ModelType = 'llm' | 'media_generation'
+export type TurnModePolicy = 'auto' | 'plan' | 'build'
+
+export type GenerationOperation =
+  | 'text_to_image'
+  | 'image_to_image'
+  | 'text_to_video'
+  | 'image_to_video'
+  | 'video_to_video'
+  | 'text_to_speech'
+  | 'text_to_music'
+  | 'text_to_sound'
+  | 'audio_to_audio'
+
+export interface GenerationModelTarget {
+  provider: string
+  model: string
+}
+
+export interface GenerationOperationConfig {
+  endpoint?: string
+  query_endpoint?: string
+  timeout_seconds?: number
+  default_params?: Record<string, unknown>
+}
+
+export interface MediaGenerationModelConfig {
+  adapter?: string
+  api?: GenerationOperationConfig
+  operations: Partial<Record<GenerationOperation, GenerationOperationConfig>>
+}
+
 export interface Session {
   id: string
   title: string
@@ -85,7 +132,12 @@ export interface Session {
   provider?: string
   model?: string
   project_path?: string
+  conversation_state?: 'blank' | 'active' | string
+  has_user_messages?: boolean
+  user_message_count?: number
+  pending_turn_count?: number
   plan_mode?: boolean
+  turn_mode_policy?: TurnModePolicy
   permission_level?: string
   reasoning_effort?: string
   vector_store?: string
@@ -99,6 +151,11 @@ export interface Session {
   auto_continue?: boolean
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  enabled_recognition_capabilities?: MediaKind[]
+  enabled_generation_operations?: GenerationOperation[]
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
 }
 
 export interface Attachment {
@@ -117,6 +174,10 @@ export interface MessageAttachment {
   //             with a text marker, etc.)
   type: 'image_url' | 'audio_url' | 'video_url' | 'text'
   url?: string
+  // Present on optimistic GUI messages. History responses expose the same
+  // upload through /api/v1/uploads/:id, which the rollback adapter can parse.
+  // 前端乐观消息保留上传引用，撤回时无需重新上传附件。
+  upload_id?: string
   text?: string
   name?: string
   mime?: string
@@ -134,23 +195,33 @@ export type MessagePart =
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string; streaming?: boolean }
   | {
+      kind: 'skill'
+      name: string
+      status: 'start' | 'ready' | 'error'
+      scope?: string
+      source?: string
+      dependencies?: string[]
+      error?: string
+    }
+  | {
       kind: 'tool'
       id?: string
       tool_id?: string
       name: string
       args?: string
-      status: 'start' | 'ok' | 'warn' | 'error'
+      status: 'start' | 'ok' | 'warn' | 'error' | 'blocked'
       result?: string
       error?: string
       elapsed?: string
       // result_truncated is true when the server omitted the full
       // payload (>32 KiB) and the full body must be fetched on
       // demand via getToolResult.
-      result_truncated?: boolean
-      // result_full_len is the byte length of the untruncated
-      // result, for labeling the "查看完整输出" affordance.
-      result_full_len?: number
-    }
+        result_truncated?: boolean
+        // result_full_len is the byte length of the untruncated
+        // result, for labeling the "查看完整输出" affordance.
+        result_full_len?: number
+        context_refs?: string[]
+      }
   | {
       kind: 'sub_agent'
       task: string
@@ -180,6 +251,7 @@ export type MessagePart =
 
 export type SubAgentPart = Extract<MessagePart, { kind: 'sub_agent' }>
 export type ToolPart = Extract<MessagePart, { kind: 'tool' }>
+export type SkillPart = Extract<MessagePart, { kind: 'skill' }>
 export type TextPart = Extract<MessagePart, { kind: 'text' }>
 export type ThinkingPart = Extract<MessagePart, { kind: 'thinking' }>
 export type QuestionPart = Extract<MessagePart, { kind: 'question' }>
@@ -292,6 +364,7 @@ export interface SessionMeta {
   model: string
   project_path?: string
   plan_mode?: boolean
+  turn_mode_policy?: TurnModePolicy
   permission_level?: string
   created_at: number
   updated_at: number
@@ -306,12 +379,18 @@ export interface UpdateSessionMetaResponse {
   provider?: string
   model?: string
   plan_mode?: boolean
+  turn_mode_policy?: TurnModePolicy
   permission_level?: string
   reasoning_effort?: string
   vector_store?: string
   knowledge_base?: string
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  enabled_recognition_capabilities?: MediaKind[]
+  enabled_generation_operations?: GenerationOperation[]
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
   created_at?: number
   updated_at?: number
 }
@@ -350,7 +429,7 @@ export const fetchTokenStats = () =>
   jsonFetch<{ stats: TokenStat[] }>('/api/v1/token-stats')
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + url, {
+  const res = await fetch(await waitForAPIURL(url), {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
   })
@@ -362,13 +441,24 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 // --- Health ---
-export const health = () => jsonFetch<{ status: string }>('/api/v1/health')
+export interface RuntimeHealth {
+  status: string
+  profile_id: string
+  profile_name: string
+  instance_id: string
+  pid: number
+}
+
+export const health = () => jsonFetch<RuntimeHealth>('/api/v1/health')
 
 // --- Search ---
-export const searchMessages = (q: string, limit = 20) =>
-  jsonFetch<SearchResponse>(
-    `/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`,
-  )
+export const searchMessages = (q: string, limit = 20, projectPath?: string) => {
+  const params = new URLSearchParams()
+  params.set('q', q)
+  params.set('limit', String(limit))
+  if (projectPath !== undefined) params.set('project_path', projectPath)
+  return jsonFetch<SearchResponse>(`/api/v1/search?${params.toString()}`)
+}
 
 // --- Sessions ---
 export const listSessions = (projectPath: string) =>
@@ -381,11 +471,13 @@ export const getSession = (id: string) =>
 
 export interface CreateSessionOptions {
   project_path?: string
+  reuse_empty?: boolean
   work_mode?: string
   provider?: string
   model?: string
   style?: string
   plan_mode?: boolean
+  turn_mode_policy?: TurnModePolicy
   permission_level?: string
   reasoning_effort?: string
   vector_store?: string
@@ -393,6 +485,11 @@ export interface CreateSessionOptions {
   auto_continue?: boolean
   todo_long_run_mode?: 'off' | 'adaptive' | 'unlimited'
   use_image_recognition?: boolean
+  enabled_recognition_capabilities?: MediaKind[]
+  enabled_generation_operations?: GenerationOperation[]
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
 }
 
 export const createSession = (options: CreateSessionOptions = {}) =>
@@ -410,9 +507,20 @@ export const renameSession = (id: string, title: string) =>
     body: JSON.stringify({ title }),
   })
 
+export interface GenerateSessionTitleOptions {
+  force?: boolean
+  fallback_message?: string
+}
+
+export const generateSessionTitle = (id: string, options: GenerateSessionTitleOptions = {}) =>
+  jsonFetch<Session>(`/api/v1/sessions/${encodeURIComponent(id)}/title`, {
+    method: 'POST',
+    body: JSON.stringify(options),
+  })
+
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; turn_mode_policy: TurnModePolicy; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -470,6 +578,8 @@ export const executePlan = (id: string, planText: string) =>
 export interface ProjectItem {
   name: string
   path: string
+  branch?: string
+  dirty?: boolean
 }
 
 export const listProjects = () =>
@@ -521,7 +631,20 @@ export interface SkillItem {
   name: string
   description: string
   path: string
+  directory?: string
+  scope?: 'project_managed' | 'project_standard' | 'global_managed' | 'user_standard' | string
+  required_skills?: string[]
+  required_bins?: string[]
+  resources?: string[]
   content?: string
+}
+
+export interface SkillDiagnostic {
+  code: string
+  severity: string
+  skill?: string
+  source?: string
+  message: string
 }
 
 export interface SearchSkillItem {
@@ -544,17 +667,39 @@ function skillScopeQuery(opts?: SkillScopeOptions) {
 }
 
 export const listSkills = (opts?: SkillScopeOptions) =>
-  jsonFetch<{ skills: SkillItem[] }>(`/api/v1/skills${skillScopeQuery(opts)}`)
+  jsonFetch<{ skills: SkillItem[]; diagnostics?: SkillDiagnostic[] }>(`/api/v1/skills${skillScopeQuery(opts)}`)
 
 export const getSkill = (name: string, opts?: SkillScopeOptions) =>
   jsonFetch<{ skill: SkillItem }>(`/api/v1/skills/${encodeURIComponent(name)}${skillScopeQuery(opts)}`)
 
+export interface SkillInstallResult {
+  ok: boolean
+  ready: boolean
+  name: string
+  path: string
+  installed?: string[]
+  rolled_back?: boolean
+  diagnostics?: SkillDiagnostic[]
+}
+
 export const installSkill = (name: string, url: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
-  jsonFetch<{ ok: boolean; name: string }>('/api/v1/skills/install', {
+  jsonFetch<SkillInstallResult>('/api/v1/skills/install', {
     method: 'POST',
     body: JSON.stringify({
       name,
       url,
+      scope: opts?.scope,
+      session_id: opts?.sessionId,
+      project_path: opts?.projectPath,
+    }),
+  })
+
+export const importSkillsFromDirectory = (sourcePath: string, name?: string, opts?: SkillScopeOptions & { scope?: 'global' | 'project' }) =>
+  jsonFetch<SkillInstallResult>('/api/v1/skills/install', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: name || '',
+      source_path: sourcePath,
       scope: opts?.scope,
       session_id: opts?.sessionId,
       project_path: opts?.projectPath,
@@ -813,6 +958,8 @@ export function uploadURL(id: string): string {
 // --- Providers / Models ---
 export interface ModelInfo {
   name: string
+  api_endpoint?: string
+  type?: ModelType
   display_name?: string
   description?: string
   default?: boolean
@@ -827,14 +974,69 @@ export interface ModelInfo {
     context_window?: number
     supports_vision?: boolean
     supports_audio?: boolean
+    input_modalities?: MediaKind[]
   }
+  generation?: MediaGenerationModelConfig
+}
+
+export type MediaKind = 'image' | 'video' | 'audio'
+export type ProviderProtocol = 'openai' | 'anthropic' | 'openai_chat' | 'openai_responses' | 'anthropic_messages' | string
+export type ProviderCapability = 'chat' | 'models' | 'image_generation' | 'video_generation' | 'audio_generation' | string
+
+export interface ProviderEndpointDefaults {
+  model_list?: string
+  openai_chat?: string
+  openai_responses?: string
+  anthropic_messages?: string
+  image_generation?: string
+  video_generation?: string
+  audio_generation?: string
+  image_task_query?: string
+  video_task_query?: string
+  audio_task_query?: string
+}
+
+export interface ProviderProtocolPreset {
+  id: ProviderProtocol
+  display_name: string
+  default_base_url?: string
+  endpoint_defaults: ProviderEndpointDefaults
+  disabled_reason?: string
+}
+
+export interface ProviderStrategyVariant {
+  id: string
+  display_name: string
+  description?: string
+  default_base_urls?: Record<string, string>
+}
+
+export interface ProviderModelListPreset {
+  mode: string
+  default_endpoint?: string
+}
+
+export interface ProviderPreset {
+  id: string
+  display_name: string
+  description?: string
+  default_variant?: string
+  variants?: ProviderStrategyVariant[]
+  protocols: ProviderProtocolPreset[]
+  capabilities?: ProviderCapability[]
+  model_list: ProviderModelListPreset
 }
 
 export interface ProviderInfo {
   name: string
-  protocol: 'openai' | 'anthropic' | string
+  provider_id?: string
+  strategy_variant?: string
+  protocol: ProviderProtocol
   base_url: string
+  // Returned only by pre-V12 servers; the settings form reads it as a fallback.
+  api_url?: string
   api_key: string
+  custom_headers?: Record<string, string>
   is_default: boolean
   // Slim view from GET /api/v1/providers.
   model: string
@@ -849,6 +1051,9 @@ export const listProviders = () =>
 // use the same struct.
 export const getProvider = (name: string) =>
   jsonFetch<ProviderInfo>(`/api/v1/providers/${encodeURIComponent(name)}`)
+
+export const fetchProviderPresets = () =>
+  jsonFetch<{ presets: ProviderPreset[] }>('/api/v1/provider-presets')
 
 // --- Style management (app-level CRUD) ---
 export interface StyleInfo {
@@ -992,9 +1197,12 @@ export const runCommand = (name: string, args: string) =>
 // --- App-level provider configuration ---
 export interface AddProviderRequest {
   name: string
-  protocol: 'openai' | 'anthropic'
+  provider_id?: string
+  strategy_variant?: string
+  protocol: ProviderProtocol
   base_url: string
   api_key: string
+  custom_headers?: Record<string, string>
   model: string
 }
 
@@ -1014,15 +1222,36 @@ export const setDefaultProvider = (name: string) =>
     method: 'POST',
   })
 
+export interface ProviderTestResult {
+  ok: boolean
+  provider: string
+  model: string
+  response: string
+  elapsed_ms: number
+}
+
+/** 使用供应商默认模型或指定模型发送 "sayhi"。Send it with the default or an explicit model. */
+export const testProvider = (provider: string, model?: string) =>
+  jsonFetch<ProviderTestResult>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/test`,
+    {
+      method: 'POST',
+      body: JSON.stringify(model ? { model } : {}),
+    },
+  )
+
 // UpdateProviderRequest is the body of the unified
 // PATCH /api/v1/providers/:name. Every field is optional;
 // the server only writes the non-empty ones. Pass set_default
 // (not is_default) to promote a provider to the global default.
 export interface UpdateProviderRequest {
   name?: string
-  protocol?: 'openai' | 'anthropic'
+  provider_id?: string
+  strategy_variant?: string
+  protocol?: ProviderProtocol
   base_url?: string
   api_key?: string
+  custom_headers?: Record<string, string>
   set_default?: boolean
 }
 
@@ -1035,10 +1264,13 @@ export const updateProvider = (name: string, req: UpdateProviderRequest) =>
 // --- Per-model CRUD ---
 export interface AddModelRequest {
   name: string
+  api_endpoint?: string
+  type?: ModelType
   display_name?: string
   description?: string
   max_tokens_context?: number
   max_tokens_output?: number
+  generation?: MediaGenerationModelConfig
 }
 
 export const addModel = (provider: string, req: AddModelRequest) =>
@@ -1048,10 +1280,13 @@ export const addModel = (provider: string, req: AddModelRequest) =>
   )
 
 export interface UpdateModelRequest {
+  api_endpoint?: string
+  type?: ModelType
   display_name?: string
   description?: string
   max_tokens_context?: number
   max_tokens_output?: number
+  generation?: MediaGenerationModelConfig
   clear_all?: boolean
 }
 
@@ -1073,11 +1308,38 @@ export const setDefaultModel = (provider: string, model: string) =>
     { method: 'POST' },
   )
 
+// --- Upstream models ---
+export interface UpstreamModelItem {
+  id: string
+  display_name?: string
+  created: number
+  owned_by: string
+  added: boolean
+  source?: string
+  default_endpoint?: string
+}
+
+export interface UpstreamModelsResponse {
+  models: UpstreamModelItem[]
+  base_url?: string
+  endpoint?: string
+  source?: string
+  default_endpoint?: string
+  error?: string
+  manual_allowed?: boolean
+}
+
+export const fetchUpstreamModels = (provider: string) =>
+  jsonFetch<UpstreamModelsResponse>(
+    `/api/v1/providers/${encodeURIComponent(provider)}/upstream-models`,
+  )
+
 export interface SetCapabilitiesRequest {
   thinking_effort?: 'off' | 'low' | 'medium' | 'high' | ''
   context_window?: number
   supports_vision?: boolean
   supports_audio?: boolean
+  input_modalities?: MediaKind[]
 }
 
 export const setModelCapabilities = (
@@ -1090,35 +1352,10 @@ export const setModelCapabilities = (
     { method: 'PATCH', body: JSON.stringify(req) },
   )
 
-// --- Upstream models ---
-export interface UpstreamModelItem {
-  id: string
-  created: number
-  owned_by: string
-  added: boolean
-}
-
-export const fetchUpstreamModels = (provider: string) =>
-  jsonFetch<{ models: UpstreamModelItem[] }>(
-    `/api/v1/providers/${encodeURIComponent(provider)}/upstream-models`,
-  )
-
-/** Probe upstream /models with ephemeral credentials (add-provider dialog). */
-export const probeUpstreamModels = (body: {
-  base_url?: string
-  api_key: string
-  protocol?: string
-}) =>
-  jsonFetch<{ models: UpstreamModelItem[]; base_url: string }>(
-    '/api/v1/providers/probe-models',
-    { method: 'POST', body: JSON.stringify(body) },
-  )
-
 // --- Streaming send ---
 export interface InlineAttachment {
   // 'image_url' for images, 'audio_url' / 'video_url' for media
-  // the chat bubble can preview, 'text' for file bodies the
-  // model only gets to read as text.
+  // the chat bubble can preview, 'text' for documents and other files.
   type: 'image_url' | 'audio_url' | 'video_url' | 'text'
   // For image_url / audio_url / video_url: the data: URL
   // (e.g. "data:image/png;base64,...") carrying the inline
@@ -1132,7 +1369,10 @@ export interface InlineAttachment {
   // When upload_id is set, `url` is a local preview only and the
   // server reads the bytes from disk.
   upload_id?: string
-  // For text: the file body. For *_url: undefined.
+  // Inline payload used by legacy/non-upload clients. New clients should send
+  // upload_id so the server can validate and read the original attachment.
+  data?: string
+  // Legacy text payload kept for wire compatibility.
   text?: string
   // Original filename, kept around for the chat bubble label and
   // for the backend's debug logs.
@@ -1169,6 +1409,10 @@ export interface SendOptions {
   style?: string
   workMode?: string
   useImageRecognition?: boolean
+  subAgentModelEnabled?: boolean
+  subAgentProvider?: string
+  subAgentModel?: string
+  turnModePolicy?: TurnModePolicy
   // Inline attachments carry the bytes up front so the message
   // is self-contained: the chat bubble shows the image
   // immediately, the backend doesn't need to re-read the file
@@ -1186,7 +1430,145 @@ export interface SendOptions {
   // called on user-initiated aborts (signal.aborted).
   onStreamDrop?: (info: { lastSeq: number; reason: string }) => void
   skill_context?: string
+  active_skills?: string[]
 }
+
+export interface TurnQueuePayload {
+  message: string
+  todo_mode?: 'auto' | 'resume' | 'clear'
+  client_msg_id?: number
+  provider?: string
+  model?: string
+  style?: string
+  work_mode?: string
+  attachments?: InlineAttachment[]
+  use_image_recognition?: boolean
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
+  turn_mode_policy?: TurnModePolicy
+  skill_context?: string
+  active_skills?: string[]
+}
+
+export interface TurnQueueItem {
+  id: number
+  session_id: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
+  message: string
+  client_msg_id: number
+  attachment_count: number
+  error?: string
+  created_at: number
+  updated_at: number
+  started_at?: number
+  finished_at?: number
+  payload?: TurnQueuePayload
+}
+
+export interface TurnQueueListResponse {
+  items: TurnQueueItem[]
+}
+
+export interface TurnQueueItemEnvelope {
+  item: TurnQueueItem
+}
+
+type SendPayloadSource = Pick<SendOptions,
+  | 'message'
+  | 'todo_mode'
+  | 'client_msg_id'
+  | 'provider'
+  | 'model'
+  | 'style'
+  | 'workMode'
+  | 'attachments'
+  | 'useImageRecognition'
+  | 'subAgentModelEnabled'
+  | 'subAgentProvider'
+  | 'subAgentModel'
+  | 'turnModePolicy'
+  | 'skill_context'
+  | 'active_skills'
+>
+
+export function sendPayloadFromOptions(opts: SendPayloadSource): TurnQueuePayload {
+  return {
+    message: opts.message,
+    todo_mode: opts.todo_mode,
+    // client_msg_id is the integer the frontend minted at
+    // send time and stamped onto the local Message as
+    // `msg.id`. The backend uses it as the SQLite row id
+    // for this turn's user message, so rollback/regen
+    // always have a valid id to target.
+    client_msg_id: opts.client_msg_id,
+    provider: opts.provider,
+    model: opts.model,
+    style: opts.style,
+    work_mode: opts.workMode,
+    attachments: opts.attachments,
+    use_image_recognition: opts.useImageRecognition,
+    sub_agent_model_enabled: opts.subAgentModelEnabled,
+    sub_agent_provider: opts.subAgentProvider,
+    sub_agent_model: opts.subAgentModel,
+    turn_mode_policy: opts.turnModePolicy,
+    skill_context: opts.skill_context || '',
+    active_skills: opts.active_skills?.filter(Boolean) || [],
+  }
+}
+
+export const listTurnQueue = (sessionId: string) =>
+  jsonFetch<TurnQueueListResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue`,
+  )
+
+export const enqueueTurnQueueItem = (sessionId: string, payload: TurnQueuePayload) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue`,
+    { method: 'POST', body: JSON.stringify(payload) },
+  )
+
+export const claimNextTurnQueueItem = (sessionId: string) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/claim`,
+    { method: 'POST' },
+  )
+
+export const completeTurnQueueItem = (sessionId: string, queueId: number) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}/complete`,
+    { method: 'POST' },
+  )
+
+export const failTurnQueueItem = (sessionId: string, queueId: number, error: string) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}/fail`,
+    { method: 'POST', body: JSON.stringify({ error }) },
+  )
+
+export const retryTurnQueueItem = (sessionId: string, queueId: number) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}/retry`,
+    { method: 'POST' },
+  )
+
+export const editTurnQueueItem = (sessionId: string, queueId: number, message: string) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}`,
+    { method: 'PATCH', body: JSON.stringify({ message }) },
+  )
+
+export const deleteTurnQueueItem = (sessionId: string, queueId: number) =>
+  jsonFetch<TurnQueueItemEnvelope>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue/${queueId}`,
+    { method: 'DELETE' },
+  )
+
+export const clearTurnQueue = (sessionId: string) =>
+  jsonFetch<{ ok: boolean; cleared: number }>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turn-queue`,
+    { method: 'DELETE' },
+  )
 
 export interface StreamEvent {
   type?: string
@@ -1211,6 +1593,12 @@ export interface StreamEvent {
   // client appends it to the trailing thinking part of the
   // assistant message.
   thinking?: string
+  skill_name?: string
+  skill_status?: 'start' | 'ready' | 'error' | string
+  skill_scope?: string
+  skill_source?: string
+  skill_dependencies?: string[]
+  skill_error?: string
   tool_id?: string
   tool_name?: string
   tool_status?: string
@@ -1236,9 +1624,10 @@ export interface StreamEvent {
   // Structured tool result metadata. These fields supplement the legacy
   // display preview above and remain optional for older servers.
   tool_call_status?: 'ok' | 'error' | 'blocked' | 'waiting' | string
-  tool_summary?: string
-  tool_changed_paths?: string[]
-  tool_retryable?: boolean
+    tool_summary?: string
+    tool_changed_paths?: string[]
+    tool_context_refs?: string[]
+    tool_retryable?: boolean
   tool_requires_user?: boolean
   tool_next_action?: string
   // tool_args is the JSON-encoded arguments string the tool
@@ -1394,25 +1783,7 @@ async function streamMessagesViaFetch(
   opts: SendOptions,
   backend = directBackendURL(),
 ): Promise<void> {
-  const body = JSON.stringify({
-    message: opts.message,
-    todo_mode: opts.todo_mode,
-    // client_msg_id is the integer the frontend minted at
-    // send time and stamped onto the local Message as
-    // `msg.id`. The backend uses it as the SQLite row id
-    // for this turn's user message, so rollback/regen
-    // always have a valid id to target — even when the
-    // SSE `done` event never lands (LLM error, network
-    // drop, quota exhausted, etc.).
-    client_msg_id: opts.client_msg_id,
-    provider: opts.provider,
-    model: opts.model,
-    style: opts.style,
-    work_mode: opts.workMode,
-    attachments: opts.attachments,
-    use_image_recognition: opts.useImageRecognition,
-    skill_context: opts.skill_context || '',
-  })
+  const body = JSON.stringify(sendPayloadFromOptions(opts))
   return consumeStreamRequest({
     url: `${backend}/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
     body,
@@ -1876,6 +2247,8 @@ export interface KnowledgeSearchResult {
   content: string
   similarity: number
   rank: number
+  content_truncated?: boolean
+  content_full_chars?: number
   /** KB-01: originating knowledge base name */
   base?: string
   title?: string
@@ -1889,8 +2262,27 @@ export interface KnowledgeSearchResult {
   citation?: KnowledgeCitation
 }
 
+export interface KnowledgeSearchStats {
+  top_k: number
+  requested_top_k?: number
+  top_k_capped?: boolean
+  per_base_limit?: number
+  bases?: string[]
+  bases_searched?: number
+  query_count?: number
+  raw_matches?: number
+  candidates?: number
+  merged_candidates?: number
+  returned?: number
+  grep_appended?: number
+  content_preview_chars?: number
+  content_truncated?: number
+  has_more?: boolean
+  truncated?: boolean
+}
+
 export const searchKnowledge = (query: string, topK?: number, bases?: string[]) =>
-  jsonFetch<{ query: string; queries?: string[]; results: KnowledgeSearchResult[] }>(
+  jsonFetch<{ query: string; queries?: string[]; results: KnowledgeSearchResult[]; stats?: KnowledgeSearchStats }>(
     '/api/v1/knowledge/search',
     {
       method: 'POST',
@@ -1995,12 +2387,32 @@ export interface VisionRecognitionConfig {
   max_image_bytes: number
 }
 
+export interface RecognitionRouteConfig {
+  enabled: boolean
+  provider: string
+  model: string
+  timeout_seconds: number
+  max_bytes: number
+  available?: boolean
+}
+
+export interface RecognitionConfig {
+  routes: Record<MediaKind, RecognitionRouteConfig>
+}
+
+export interface GenerationConfig {
+  defaults: Partial<Record<GenerationOperation, GenerationModelTarget>>
+  require_confirm: boolean
+}
+
 export interface SystemConfig {
   limits: LimitsConfig
   sub_agent: SubAgentConfig
   work_mode: WorkModeConfig
   ui: UIConfig
   vision_recognition: VisionRecognitionConfig
+  recognition: RecognitionConfig
+  generation: GenerationConfig
 }
 
 export const getSystemConfig = () =>
@@ -2011,6 +2423,25 @@ export const updateSystemConfig = (patch: Record<string, unknown>) =>
     method: 'PATCH',
     body: JSON.stringify(patch),
   })
+
+export interface GenerationOperationOption {
+  operation: GenerationOperation
+  output_kind: MediaKind
+  required_input_kind?: MediaKind
+  available: boolean
+  enabled: boolean
+  default_target?: GenerationModelTarget
+  unavailable_reason?: string
+}
+
+export interface GenerationOptionsResponse {
+  operations: GenerationOperationOption[]
+}
+
+export const getGenerationOptions = (sessionId?: string) =>
+  jsonFetch<GenerationOptionsResponse>(
+    `/api/v1/generation/options${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`,
+  )
 
 // ---- IM bridge settings ----
 

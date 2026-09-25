@@ -42,7 +42,7 @@ const generalPurposePrompt = "You are a focused sub-agent spawned by a parent ag
 	"You have your own context (no shared history with the parent), your own tool set, and run independently. The parent will see only your final text response.\n\n" +
 	"When working on your assigned task:\n" +
 	"- Be direct and concise. The parent already has the high-level picture.\n" +
-	"- You may use project-local read tools (read_file, list_files, grep, read_docx, read_pdf), wiki lookup when available, todo_write for a private checklist, web_search, and web_fetch for public URLs (GET or POST).\n" +
+	"- You may use project-local read tools (read_file, list_files, grep), wiki lookup when available, todo_write for a private checklist, web_search, and web_fetch for public URLs (GET or POST). read_file automatically extracts supported PDF and Office documents.\n" +
 	"- You cannot write or edit files, run shell commands, start processes, ask the user questions, or control the browser. If those are needed, say so in the final response so the parent can decide.\n" +
 	"- Do not call the 'task' tool yourself — sub-agents cannot spawn sub-agents.\n" +
 	"- Do not ask the user clarifying questions; if the prompt is ambiguous, return your best effort and explain the assumption you made.\n" +
@@ -57,7 +57,7 @@ const explorePrompt = "You are a file search specialist. You excel at thoroughly
 	"- Searching code and text with grep\n" +
 	"- Reading and analyzing file and document contents\n\n" +
 	"Guidelines:\n" +
-	"- Use list_files for directory contents, grep to search code, and read_file / read_docx / read_pdf for individual files.\n" +
+	"- Use list_files for directory contents, grep to search code, and read_file for individual text, PDF, or Office files.\n" +
 	"- Do not use shell commands, web_search, or web_fetch. If git inspection, tests, process execution, or network evidence is necessary, return a concise request for the parent conversation to run it.\n" +
 	"- Adapt your search approach based on the thoroughness level specified by the caller.\n" +
 	"- Return file paths as absolute paths in your final response.\n" +
@@ -104,7 +104,7 @@ func Builtins() []AgentInfo {
 			Description: "Fast read-only agent specialized for exploring codebases. Use for searches, file lookups, and codebase Q&A. Cannot modify files.",
 			Prompt:      explorePrompt,
 			Color:       "#44BA81",
-			Tools:       []string{"read_file", "list_files", "grep", "read_docx", "read_pdf"},
+			Tools:       []string{"read_file", "list_files", "grep"},
 			Builtin:     true,
 			Source:      "builtin",
 		},
@@ -113,7 +113,7 @@ func Builtins() []AgentInfo {
 			Description: "Read-only architect that produces a step-by-step implementation plan. Use when you need a design before executing.",
 			Prompt:      planPrompt,
 			Color:       "#E8A33D",
-			Tools:       []string{"read_file", "list_files", "grep", "read_docx", "read_pdf"},
+			Tools:       []string{"read_file", "list_files", "grep"},
 			Builtin:     true,
 			Source:      "builtin",
 		},

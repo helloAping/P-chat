@@ -128,6 +128,21 @@ func TestSubAgentConfig_DenyList(t *testing.T) {
 	}
 }
 
+func TestSubAgentConfig_LegacyToolNamesMatchCanonicalTools(t *testing.T) {
+	whitelist := SubAgentConfig{AllowedTools: []string{"image_recognize", "read_pdf"}}
+	if !whitelist.ToolAllowed("media_recognize") {
+		t.Error("legacy image_recognize whitelist should allow media_recognize")
+	}
+	if !whitelist.ToolAllowed("read_file") {
+		t.Error("legacy read_pdf whitelist should allow read_file")
+	}
+
+	denylist := SubAgentConfig{DeniedTools: []string{"image_recognize"}}
+	if denylist.ToolAllowed("media_recognize") {
+		t.Error("legacy image_recognize denylist should deny media_recognize")
+	}
+}
+
 func TestSubAgentConfig_Timeout(t *testing.T) {
 	c := &SubAgentConfig{}
 	if got := c.TimeoutDuration(); got != 0 {
@@ -330,6 +345,105 @@ func TestAddModel_SetsNewDefaultWhenFirst(t *testing.T) {
 	if !updated.Models[0].Default {
 		t.Error("first added model should be default")
 	}
+	if updated.Models[0].APIEndpoint != "/chat/completions" {
+		t.Errorf("first model API endpoint = %q", updated.Models[0].APIEndpoint)
+	}
+}
+
+func TestDefaultLLMAPIEndpoint_ProtocolAliases(t *testing.T) {
+	cases := map[string]string{
+		"openai":             "/chat/completions",
+		"openai_chat":        "/chat/completions",
+		"openai_responses":   "/responses",
+		"anthropic":          "/messages",
+		"anthropic_messages": "/messages",
+		"":                   "/chat/completions",
+		"OPENAI_RESPONSES":   "/responses",
+	}
+	for protocol, want := range cases {
+		if got := DefaultLLMAPIEndpoint(protocol); got != want {
+			t.Fatalf("DefaultLLMAPIEndpoint(%q) = %q, want %q", protocol, got, want)
+		}
+	}
+}
+
+func TestAddModelNormalizesCustomAPIEndpointSuffix(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{"llm":{"providers":[{"name":"p","protocol":"openai","base_url":"https://example.com/api/v3","api_key":"k"}]}}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := AddModel("p", ModelConfig{Name: "custom", APIEndpoint: "responses"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := updated.FindModel("custom")
+	if custom == nil {
+		t.Fatalf("custom model missing: %#v", updated.Models)
+	}
+	if got := custom.APIEndpoint; got != "/responses" {
+		t.Fatalf("API endpoint = %q", got)
+	}
+	if _, err := AddModel("p", ModelConfig{Name: "absolute", APIEndpoint: "https://other.example/chat"}); err == nil {
+		t.Fatal("absolute per-model API endpoint must be rejected")
+	}
+}
+
+func TestAddModel_RequiresProviderBaseURL(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	if err := AddProvider(ProviderConfig{Name: "media-only", Protocol: "openai", APIKey: "sk-x"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := AddModel("media-only", ModelConfig{Name: "chat-model"}); err == nil || !strings.Contains(err.Error(), "requires base_url") {
+		t.Fatalf("AddModel error = %v, want missing base_url validation", err)
+	}
+}
+
+func TestAddProvider_PersistsProviderStrategyFields(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+
+	if err := AddProvider(ProviderConfig{
+		Name:            "openai-direct",
+		ProviderID:      "OpenAI",
+		StrategyVariant: "Global",
+		Protocol:        "openai_responses",
+		BaseURL:         "https://api.openai.com/v1",
+		APIKey:          "sk-x",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var provider *ProviderConfig
+	for i := range cfg.LLM.Providers {
+		if cfg.LLM.Providers[i].Name == "openai-direct" {
+			provider = &cfg.LLM.Providers[i]
+			break
+		}
+	}
+	if provider == nil {
+		t.Fatalf("openai-direct provider missing: %#v", cfg.LLM.Providers)
+	}
+	if provider.GetProviderID() != "openai" || provider.GetStrategyVariant() != "global" {
+		t.Fatalf("strategy fields = %q/%q", provider.GetProviderID(), provider.GetStrategyVariant())
+	}
+}
+
+func TestProviderConfig_DefaultProviderID(t *testing.T) {
+	provider := ProviderConfig{Name: "legacy", Protocol: "openai"}
+	if got := provider.GetProviderID(); got != ProviderIDCustom {
+		t.Fatalf("GetProviderID() = %q, want %q", got, ProviderIDCustom)
+	}
 }
 
 func TestRemoveModel(t *testing.T) {
@@ -483,6 +597,51 @@ func TestUpdateModel_ClearAll(t *testing.T) {
 	}
 }
 
+func TestUpdateMediaModelRejectsRemovingDefaultedOperation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {"providers": [{
+    "name": "media", "vendor": "minimax", "base_url": "https://api.minimax.io",
+    "models": [{"name": "video", "type": "media_generation", "generation": {"adapter": "minimax", "api":{"endpoint":"/video/generate"}, "operations": {
+      "text_to_video": {}, "image_to_video": {}
+    }}}]
+  }]},
+  "generation": {"defaults": {
+    "text_to_video": {"provider": "media", "model": "video"},
+    "image_to_video": {"provider": "media", "model": "video"}
+  }}
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	_, err := UpdateModel("media", "video", ModelConfig{
+		Type: ModelTypeMediaGeneration,
+		Generation: &MediaGenerationModelConfig{
+			Adapter: "minimax",
+			API:     &GenerationOperationConfig{Endpoint: "/video/generate"},
+			Operations: map[GenerationOperation]GenerationOperationConfig{
+				GenerationTextToVideo: {},
+			},
+		},
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "generation default image_to_video") {
+		t.Fatalf("expected generation default reference error, got %v", err)
+	}
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := cfg.Generation.Defaults[GenerationImageToVideo]; !exists {
+		t.Fatal("rejected update changed the application default")
+	}
+	model := cfg.LLM.Providers[0].FindModel("video")
+	if model == nil || !model.Generation.Supports(GenerationImageToVideo) {
+		t.Fatal("rejected update changed the model capability")
+	}
+}
+
 func TestUpdateModel_NotFound(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
@@ -529,6 +688,8 @@ llm:
           max_tokens_output: 4096
         - name: deepseek-v4-flash
           max_tokens_context: 128000
+subagent:
+  cache_ttl: 7m
 `
 	if err := osWriteFile(yamlPath, yamlContent); err != nil {
 		t.Fatal(err)
@@ -553,6 +714,9 @@ llm:
 	}
 	if p.Models[1].Name != "deepseek-v4-flash" || p.Models[1].MaxTokensContext != 128000 {
 		t.Errorf("migrated model 1 wrong: %+v", p.Models[1])
+	}
+	if cfg.SubAgent.CacheTTL != "7m" {
+		t.Errorf("subagent cache_ttl = %q, want 7m", cfg.SubAgent.CacheTTL)
 	}
 
 	// After migration, the JSON file should exist.
@@ -832,6 +996,65 @@ func TestUpdateProvider_ProtocolInvalid(t *testing.T) {
 	}
 }
 
+func TestUpdateProvider_OpenAIResponsesProtocol(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k", "models":[{"name":"m","api_endpoint":"/chat/completions","default":true}] }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := UpdateProvider("cs", ProviderPatch{Protocol: "openai_responses"})
+	if err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	if updated.GetProtocol() != "openai_responses" {
+		t.Fatalf("protocol = %q", updated.GetProtocol())
+	}
+	if got := updated.Models[0].APIEndpoint; got != "/responses" {
+		t.Fatalf("api_endpoint = %q, want /responses", got)
+	}
+}
+
+func TestUpdateProvider_StrategyFields(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k" }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+	variant := "coding_plan"
+	updated, err := UpdateProvider("cs", ProviderPatch{ProviderID: "volcengine", StrategyVariant: &variant})
+	if err != nil {
+		t.Fatalf("UpdateProvider: %v", err)
+	}
+	if updated.GetProviderID() != "volcengine" || updated.GetStrategyVariant() != "coding_plan" {
+		t.Fatalf("strategy fields = %q/%q", updated.GetProviderID(), updated.GetStrategyVariant())
+	}
+	empty := ""
+	updated, err = UpdateProvider("cs", ProviderPatch{StrategyVariant: &empty})
+	if err != nil {
+		t.Fatalf("clear StrategyVariant: %v", err)
+	}
+	if updated.GetStrategyVariant() != "" {
+		t.Fatalf("strategy variant after clear = %q", updated.GetStrategyVariant())
+	}
+}
+
 // TestUpdateProvider_PartialPatch verifies that omitted
 // fields are left untouched: changing the base URL must not
 // wipe the API key.
@@ -859,6 +1082,53 @@ func TestUpdateProvider_PartialPatch(t *testing.T) {
 	}
 	if updated.APIKey != "sk-original" {
 		t.Errorf("APIKey = %q, want sk-original (must be preserved on partial patch)", updated.APIKey)
+	}
+}
+
+func TestUpdateProvider_CustomHeadersReplaceClearAndValidate(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k", "model": "m", "custom_headers": {"X-Old":"keep"} }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := map[string]string{"X-Session": "{{conversation_id}}", "X-Request-ID": "{{uuid}}"}
+	updated, err := UpdateProvider("cs", ProviderPatch{CustomHeaders: &replacement})
+	if err != nil {
+		t.Fatalf("replace custom headers: %v", err)
+	}
+	if updated.CustomHeaders["X-Old"] != "" || updated.CustomHeaders["X-Session"] != "{{conversation_id}}" {
+		t.Fatalf("CustomHeaders = %#v", updated.CustomHeaders)
+	}
+
+	invalid := map[string]string{"Content-Length": "5"}
+	if _, err := UpdateProvider("cs", ProviderPatch{CustomHeaders: &invalid}); err == nil {
+		t.Fatal("reserved custom header should be rejected")
+	}
+	preserved, err := UpdateProvider("cs", ProviderPatch{BaseURL: "http://new"})
+	if err != nil {
+		t.Fatalf("partial update: %v", err)
+	}
+	if preserved.CustomHeaders["X-Session"] != "{{conversation_id}}" {
+		t.Fatalf("partial update cleared CustomHeaders: %#v", preserved.CustomHeaders)
+	}
+
+	empty := map[string]string{}
+	cleared, err := UpdateProvider("cs", ProviderPatch{CustomHeaders: &empty})
+	if err != nil {
+		t.Fatalf("clear custom headers: %v", err)
+	}
+	if len(cleared.CustomHeaders) != 0 {
+		t.Fatalf("CustomHeaders = %#v, want empty", cleared.CustomHeaders)
 	}
 }
 

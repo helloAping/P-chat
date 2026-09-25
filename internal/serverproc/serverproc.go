@@ -5,6 +5,7 @@ package serverproc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -12,18 +13,22 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/p-chat/pchat/internal/paths"
+	"github.com/p-chat/pchat/runtimeprofile"
 )
 
 // Server wraps a pchat-server subprocess.
 type Server struct {
-	Cmd     *exec.Cmd
-	BaseURL string // http://127.0.0.1:NNNN
-	Port    int
+	Cmd         *exec.Cmd
+	BaseURL     string // http://127.0.0.1:NNNN
+	Port        int
+	Profile     runtimeprofile.Profile
+	InstanceID  string
+	runtimeFile string
 
 	// Auto-restart bookkeeping. All fields below are guarded by
 	// mu and only relevant when opts.MaxRestarts > 0.
@@ -35,8 +40,10 @@ type Server struct {
 
 // Options configures a server launch.
 type Options struct {
-	// Port to bind the server on. 0 = pick from P-Chat's preferred
-	// local range (15150-15159), falling back to an OS-assigned port.
+	// Port 是 server 绑定端口；0 表示由系统分配临时端口，正数端口被占用时
+	// 直接失败。
+	// Port binds the server; 0 requests an ephemeral OS-assigned port, while a
+	// positive value is strict.
 	Port int
 	// ConfigPath is the path passed as --config. Empty = use
 	// the data dir's config.json (preferred) or config.yaml
@@ -65,9 +72,9 @@ type Options struct {
 	RestartBackOff time.Duration
 }
 
-// Start launches pchat-server (if ServerBin is set) and blocks until
-// the HTTP /health endpoint responds 200 OK. Returns the running
-// server handle; caller is responsible for calling Stop.
+// Start 启动 pchat-server，并等待启动公告与 HTTP health 的 profile、instance
+// 和 PID 均匹配；调用方负责对返回句柄调用 Stop。
+// Start launches pchat-server and waits for both startup identity checks.
 func Start(ctx context.Context, opts Options) (*Server, error) {
 	if opts.ServerBin == "" {
 		return nil, errors.New("serverproc: ServerBin is required")
@@ -76,14 +83,24 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 		opts.PingTimeout = 15 * time.Second
 	}
 
-	port := opts.Port
-	if port == 0 {
-		var err error
-		port, err = PickPreferredPort()
-		if err != nil {
-			return nil, fmt.Errorf("pick free port: %w", err)
-		}
+	profile, err := runtimeprofile.Current(paths.GlobalDir())
+	if err != nil {
+		return nil, err
 	}
+	instanceID, err := runtimeprofile.NewInstanceID()
+	if err != nil {
+		return nil, err
+	}
+	runtimeFile, err := runtimeprofile.NewAnnouncementPath()
+	if err != nil {
+		return nil, err
+	}
+	cleanupRuntimeFile := true
+	defer func() {
+		if cleanupRuntimeFile {
+			_ = os.Remove(runtimeFile)
+		}
+	}()
 
 	args := []string{"--config", opts.ConfigPath}
 	if opts.ConfigPath == "" {
@@ -116,19 +133,23 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, opts.ServerBin, args...)
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("PCHAT_PORT=%d", port),
+	childEnv := []string{
+		fmt.Sprintf("PCHAT_PORT=%d", opts.Port),
 		// PCHAT_DATA_HOME (not PCHAT_HOME) — PCHAT_HOME is the
 		// install root set by install.ps1 -AddToPath. Reading
 		// it for the data dir would cause memory / config to
 		// land in the install directory. Pass the resolved
 		// data dir explicitly so the child server agrees with
 		// us regardless of the user's PCHAT_HOME value.
-		"PCHAT_DATA_HOME="+paths.GlobalDir(),
-	)
-	if opts.WebDir != "" {
-		cmd.Env = append(cmd.Env, "PCHAT_WEB_DIR="+opts.WebDir)
+		"PCHAT_DATA_HOME=" + profile.DataHome,
+		runtimeprofile.ProfileEnv + "=" + profile.Name,
+		runtimeprofile.InstanceEnv + "=" + instanceID,
+		runtimeprofile.RuntimeFileEnv + "=" + runtimeFile,
 	}
+	if opts.WebDir != "" {
+		childEnv = append(childEnv, "PCHAT_WEB_DIR="+opts.WebDir)
+	}
+	cmd.Env = overrideEnvironment(os.Environ(), childEnv...)
 	cmd.Stderr = opts.Stderr
 	cmd.Stdout = opts.Stdout
 	if err := cmd.Start(); err != nil {
@@ -136,15 +157,23 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	}
 
 	srv := &Server{
-		Cmd:     cmd,
-		BaseURL: fmt.Sprintf("http://127.0.0.1:%d", port),
-		Port:    port,
-		opts:    opts,
+		Cmd:         cmd,
+		Profile:     profile,
+		InstanceID:  instanceID,
+		runtimeFile: runtimeFile,
+		opts:        opts,
+	}
+	if err := srv.waitAnnouncement(ctx, opts.PingTimeout); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, err
 	}
 	if err := srv.waitReady(ctx, opts.PingTimeout); err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return nil, err
 	}
+	cleanupRuntimeFile = false
 
 	// Launch auto-restart watcher if enabled. The goroutine
 	// blocks on cmd.Wait() and, if Stop() hasn't been called,
@@ -167,20 +196,45 @@ func (s *Server) waitReady(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	healthURL := s.BaseURL + "/api/v1/health"
 	client := &http.Client{Timeout: 500 * time.Millisecond}
+	s.mu.Lock()
+	cmd := s.Cmd
+	instanceID := s.InstanceID
+	s.mu.Unlock()
+	expectedPID := 0
+	if cmd != nil && cmd.Process != nil {
+		expectedPID = cmd.Process.Pid
+	}
 	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("server did not become ready within %v", timeout)
 		}
 		// If the child already exited, give up early.
-		if s.Cmd.ProcessState != nil && s.Cmd.ProcessState.Exited() {
-			return fmt.Errorf("server exited before becoming ready (code %d)", s.Cmd.ProcessState.ExitCode())
+		if cmd != nil && cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+			return fmt.Errorf("server exited before becoming ready (code %d)", cmd.ProcessState.ExitCode())
 		}
 		req, _ := http.NewRequestWithContext(ctx, "GET", healthURL, nil)
 		resp, err := client.Do(req)
 		if err == nil {
-			resp.Body.Close()
 			if resp.StatusCode == 200 {
-				return nil
+				var health struct {
+					Status     string `json:"status"`
+					ProfileID  string `json:"profile_id"`
+					InstanceID string `json:"instance_id"`
+					PID        int    `json:"pid"`
+				}
+				decodeErr := json.NewDecoder(resp.Body).Decode(&health)
+				_ = resp.Body.Close()
+				if decodeErr == nil && health.Status == "ok" && health.ProfileID == s.Profile.ID &&
+					health.InstanceID == instanceID && health.PID == expectedPID {
+					return nil
+				}
+				if decodeErr == nil {
+					return fmt.Errorf("server identity mismatch: got status=%q profile=%q instance=%q pid=%d, want status=%q profile=%q instance=%q pid=%d",
+						health.Status, health.ProfileID, health.InstanceID, health.PID,
+						"ok", s.Profile.ID, instanceID, expectedPID)
+				}
+			} else {
+				_ = resp.Body.Close()
 			}
 		}
 		select {
@@ -190,6 +244,23 @@ func (s *Server) waitReady(ctx context.Context, timeout time.Duration) error {
 			// retry
 		}
 	}
+}
+
+func (s *Server) waitAnnouncement(ctx context.Context, timeout time.Duration) error {
+	s.mu.Lock()
+	cmd := s.Cmd
+	instanceID := s.InstanceID
+	s.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return errors.New("serverproc: child process is unavailable")
+	}
+	announcement, port, err := runtimeprofile.WaitAnnouncement(ctx, s.runtimeFile, s.Profile, instanceID, cmd.Process.Pid, timeout)
+	if err != nil {
+		return err
+	}
+	s.BaseURL = announcement.BaseURL
+	s.Port = port
+	return nil
 }
 
 // Stop tells the restart watcher (if any) that the shutdown is
@@ -211,10 +282,12 @@ func (s *Server) Stop() {
 	}()
 	select {
 	case <-done:
+		_ = os.Remove(s.runtimeFile)
 		return
 	case <-time.After(3 * time.Second):
 		_ = s.Cmd.Process.Kill()
 		<-done
+		_ = os.Remove(s.runtimeFile)
 	}
 }
 
@@ -249,22 +322,32 @@ func (s *Server) watchAndRestart(ctx context.Context) {
 			count, s.opts.MaxRestarts, backOff)
 		time.Sleep(backOff)
 
-		cmd := s.buildCommand(ctx)
+		instanceID, err := runtimeprofile.NewInstanceID()
+		if err != nil {
+			log.Printf("[serverproc] restart %d: create instance identity: %v", count, err)
+			continue
+		}
+		cmd := s.buildCommand(ctx, instanceID)
+		_ = os.Remove(s.runtimeFile)
 		if err := cmd.Start(); err != nil {
 			log.Printf("[serverproc] restart %d: start failed: %v", count, err)
 			continue
 		}
-		old := s.Cmd
 		s.mu.Lock()
 		s.Cmd = cmd
+		s.InstanceID = instanceID
 		s.mu.Unlock()
 
+		if err := s.waitAnnouncement(ctx, s.opts.PingTimeout); err != nil {
+			log.Printf("[serverproc] restart %d: announcement failed: %v", count, err)
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			continue
+		}
 		if err := s.waitReady(ctx, s.opts.PingTimeout); err != nil {
 			log.Printf("[serverproc] restart %d: health check failed: %v", count, err)
 			_ = cmd.Process.Kill()
-			s.mu.Lock()
-			s.Cmd = old
-			s.mu.Unlock()
+			_ = cmd.Wait()
 			continue
 		}
 
@@ -273,9 +356,10 @@ func (s *Server) watchAndRestart(ctx context.Context) {
 	}
 }
 
-// buildCommand constructs an exec.Cmd from the saved opts,
-// reusing the already-assigned port. Meant for restart watcher.
-func (s *Server) buildCommand(ctx context.Context) *exec.Cmd {
+// buildCommand 根据保存的选项和本次进程身份构造 exec.Cmd；当 opts.Port 为 0
+// 时，每次重启均由子进程重新分配临时端口。
+// buildCommand constructs an exec.Cmd for one restart attempt.
+func (s *Server) buildCommand(ctx context.Context, instanceID string) *exec.Cmd {
 	opts := s.opts
 	args := []string{"--config", opts.ConfigPath}
 	if opts.ConfigPath == "" {
@@ -291,13 +375,17 @@ func (s *Server) buildCommand(ctx context.Context) *exec.Cmd {
 		}
 	}
 	cmd := exec.CommandContext(ctx, opts.ServerBin, args...)
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("PCHAT_PORT=%d", s.Port),
-		"PCHAT_DATA_HOME="+paths.GlobalDir(),
-	)
-	if opts.WebDir != "" {
-		cmd.Env = append(cmd.Env, "PCHAT_WEB_DIR="+opts.WebDir)
+	childEnv := []string{
+		fmt.Sprintf("PCHAT_PORT=%d", opts.Port),
+		"PCHAT_DATA_HOME=" + s.Profile.DataHome,
+		runtimeprofile.ProfileEnv + "=" + s.Profile.Name,
+		runtimeprofile.InstanceEnv + "=" + instanceID,
+		runtimeprofile.RuntimeFileEnv + "=" + s.runtimeFile,
 	}
+	if opts.WebDir != "" {
+		childEnv = append(childEnv, "PCHAT_WEB_DIR="+opts.WebDir)
+	}
+	cmd.Env = overrideEnvironment(os.Environ(), childEnv...)
 	cmd.Stderr = opts.Stderr
 	cmd.Stdout = opts.Stdout
 	return cmd
@@ -311,17 +399,6 @@ func terminateSignal() os.Signal {
 		return os.Kill
 	}
 	return os.Interrupt
-}
-
-// PortFromEnv returns the PCHAT_PORT env var (0 if missing). The
-// server uses this to override the configured port.
-func PortFromEnv() int {
-	s := os.Getenv("PCHAT_PORT")
-	if s == "" {
-		return 0
-	}
-	p, _ := strconv.Atoi(s)
-	return p
 }
 
 // WebDirFromEnv returns the PCHAT_WEB_DIR env var (empty if
@@ -338,4 +415,27 @@ func WebDirFromEnv() string {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func overrideEnvironment(environment []string, overrides ...string) []string {
+	keys := make([]string, 0, len(overrides))
+	for _, entry := range overrides {
+		key, _, _ := strings.Cut(entry, "=")
+		keys = append(keys, key)
+	}
+	filtered := make([]string, 0, len(environment)+len(overrides))
+	for _, entry := range environment {
+		key, _, _ := strings.Cut(entry, "=")
+		replaced := false
+		for _, overrideKey := range keys {
+			if strings.EqualFold(key, overrideKey) {
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			filtered = append(filtered, entry)
+		}
+	}
+	return append(filtered, overrides...)
 }

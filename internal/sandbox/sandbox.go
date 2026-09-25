@@ -1,11 +1,11 @@
 // Package sandbox enforces safety rules on tool invocations. It
 // supports two layers:
 //
-//   1. Path protection — write_file / edit_file must not touch a
-//      list of protected paths (e.g. ~/.ssh, /etc, ~/.bashrc).
-//   2. Pattern-based exec checks — exec_command is matched against a
-//      list of regexes. Matches are categorized as "dangerous" and
-//      either blocked outright or held for user confirmation.
+//  1. Path protection — write_file / edit_file must not touch a
+//     list of protected paths (e.g. ~/.ssh, /etc, ~/.bashrc).
+//  2. Pattern-based exec checks — exec_command is matched against a
+//     list of regexes. Matches are categorized as "dangerous" and
+//     either blocked outright or held for user confirmation.
 //
 // The sandbox is process-local: it stores no state and exposes pure
 // functions suitable for concurrent use. The runtime configuration
@@ -62,10 +62,10 @@ func (d Decision) String() string {
 // is stateless and the classification logic is testable without
 // mutating the struct.
 type Sandbox struct {
-	enabled     bool
-	requireMode string // "always" | "dangerous" | "confirm" | "never"
-	maxCmdLen   int
-	protectedDirs []string // resolved absolute paths (no ~ inside)
+	enabled        bool
+	requireMode    string // "always" | "dangerous" | "confirm" | "never"
+	maxCmdLen      int
+	protectedDirs  []string // resolved absolute paths (no ~ inside)
 	protectedGlobs []string // raw globs that we still do a substring match for
 	// protectedWideDirs are broad protected prefixes (e.g. the user's
 	// whole home directory) that must NOT shadow a session's project
@@ -75,8 +75,8 @@ type Sandbox struct {
 	// allow / write confirm) instead of being hard-blocked. Only
 	// specific sensitive dirs like ~/.ssh or /etc remain hard blocks.
 	protectedWideDirs []string
-	execPatterns  []*regexp.Regexp
-	execNames     []string
+	execPatterns      []*regexp.Regexp
+	execNames         []string
 	// extraAllowedDirs is the per-user whitelist (Phase 2
 	// writes to ~/.p-chat/sandbox_whitelist.json). Phase 1
 	// leaves it empty; the field is here so the CheckRead /
@@ -328,8 +328,9 @@ func (s *Sandbox) CheckWriteDecision(path, projectRoot string) tool.SandboxDecis
 	return tool.SandboxDecision(s.CheckWrite(path, projectRoot))
 }
 
+// CheckReadDecision 对 read_file（含旧文档别名）与 list_files 执行读取决策。
 // CheckReadDecision satisfies the expanded tool.SandboxChecker.
-// Added 2026-07 to cover read_file / read_docx / read_pdf /
+// Added 2026-07 to cover read_file (including its legacy document aliases) /
 // list_files (previously these tools bypassed the sandbox).
 func (s *Sandbox) CheckReadDecision(path, projectRoot string) tool.SandboxDecision {
 	return tool.SandboxDecision(s.CheckRead(path, projectRoot))

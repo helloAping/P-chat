@@ -6,7 +6,11 @@
 - `pchat-server.exe` — 独立 HTTP server（自带 web/ 前端）
 - `pchat-gui.exe` — Wails 桌面应用，托管 server 子进程
 
-支持 OpenAI 兼容协议（OpenAI / DeepSeek / Ollama / 通义千问 / 智谱 / 百川 等）和 Anthropic 原生协议（Claude）。三种内置人格（可爱 / 古风 / 科技），可加自定义。
+支持 OpenAI Chat、OpenAI Responses 和 Anthropic Messages 协议，可接入 OpenAI、Claude、DeepSeek、Ollama、通义千问、智谱、百川等服务。三种内置人格（可爱 / 古风 / 科技），也可创建自定义风格。
+
+![P-Chat 当前主界面：项目与会话、聊天区、输入区和右侧检查器](docs/assets/article-2026-09/01-home.png)
+
+> 截图取自 `1.0.13.beta` 的隔离演示环境。`demo-local`、`demo-chat`、`demo-image`、`demo-video`、`warm_demo` 以及示例路径、媒体结果均为 mock 数据，不包含真实 API Key 或账户信息。完整图文流程见 [《P-Chat 安装与使用指南》](docs/p-chat-article-2026-09.md)。
 
 关于作者：
 
@@ -17,27 +21,30 @@
 
 ## 当前进度快照
 
-> 快照日期：2026-07-31。仓库 `VERSION` 当前为 `1.0.8-dev`；`CHANGELOG.md` 已记录到 v1.0.9 的开发项，正式分发版本以 `VERSION` 和 release tag 为准。
+> 快照日期：2026-09-22。仓库 `VERSION` 当前为 `1.0.13.beta`；正式分发版本以 `VERSION` 和 release tag 为准。
 
 P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手形成了比较完整的桌面工作台：
 
 | 模块 | 当前状态 | 说明 |
 | --- | --- | --- |
 | 三端形态 | 已落地 | CLI、独立 HTTP server、Wails 桌面端共用同一套 agent/server 逻辑 |
+| 运行环境隔离 | 已落地 | dev/prod 按 data home 隔离身份与数据；动态端口、启动公告和 health 校验避免端口冲突或误连 |
 | 对话流 | 已落地 | text / thinking / tool / sub-agent parts 结构化渲染，支持 SSE 流式、seq、断线恢复 |
 | Agent 执行 | 已落地 | ReAct 工具循环、并发工具派发、auto-continue、Plan/Build、todo 守卫、stuck-loop 保护 |
-| LLM 协议 | 已落地 | OpenAI 兼容 + Anthropic 原生；自定义 SSE reader 兼容 reasoning / proxy error / 非标准 delta |
+| LLM 协议 | 已落地 | OpenAI Chat / Responses + Anthropic Messages；自定义 SSE reader 兼容 reasoning / proxy error / 非标准 delta |
 | 项目系统 | 已落地 | 多项目注册，项目级 `AGENTS.md` / rules / skills / tools 注入 |
 | 知识库 | 已落地 | 本地 Wiki/FTS5、三层索引树、混合检索、查询分解、多库重排、增量扫描 |
 | 工具体系 | 已落地 | 内置文件/命令/搜索/文档/问题/todo 工具；动态 YAML 工具支持全局与项目级加载 |
 | 浏览器控制 | 已落地 | Chrome/Edge 扩展连接、真实页面导航/点击/输入/截图、多 tab 目标、域名权限策略 |
+| 媒体能力 | 已落地 / 持续扩展 | 图片/视频/音频独立识别路由；图片、视频、语音、音乐、音效等生成能力按模型和会话启用 |
 | 可观测性 | 已落地 | 端到端 trace id、上下文检查器、工具列表抽屉、动态工具加载诊断 |
-| IM 桥接 | 骨架进行中 | `internal/im` 后端抽象、飞书部分入站/出站、Gateway/adapter 基础已在代码中；GUI 设置和完整入站 agent 流程仍需推进 |
+| IM 桥接 | 实验中 / 部分可用 | Gateway/adapter 抽象、飞书 webhook、微信 QR/长轮询、出站切分、GUI 设置入口和事件流已有；跨平台 adapter、鉴权与运行体验仍需继续收口 |
 | MCP 集成 | 基础可用 / 待增强 | 已有 MCP 管理模块和设置入口，工具协议、权限和诊断体验仍在 backlog |
 | 沙箱增强 | 基础已落地 / 待增强 | 命令/写文件确认与浏览器域名策略已接入；Docker 隔离、策略可视化仍未完成 |
+| 导出与自动更新 | 已落地一部分 | 会话导出 HTML/PDF/text、更新检查/下载、updater、安装器和 release manifest 脚本已有 |
 | 发布体验 | 已落地一部分 | Windows 安装器、Linux/macOS 打包脚本、浏览器扩展打包、版本注入已有；跨平台 GUI 构建仍受 Wails/宿主环境限制 |
 
-更细的“已落地能力 + 后续可做事项”维护在 [`docs/feature-opportunities.md`](docs/feature-opportunities.md)。历史设计方案保留在 [`docs/plans/`](docs/plans/)。
+完整的安装、配置与 GUI 使用流程见 [`docs/p-chat-article-2026-09.md`](docs/p-chat-article-2026-09.md)。项目目录、模块职责和运行流总览见 [`docs/project-structure.md`](docs/project-structure.md)。更细的“已落地能力 + 后续可做事项”维护在 [`docs/feature-opportunities.md`](docs/feature-opportunities.md)。历史设计方案保留在 [`docs/plans/`](docs/plans/)。
 
 ### 下一步优先级
 
@@ -101,7 +108,7 @@ pchat-server.exe
 ### 方式 D — 从源码构建
 
 ```powershell
-# 依赖：Go 1.21.13 / Node 24.11 / Wails v2.12
+# 依赖：Go 1.25.0 / Node 24.11 / Wails v2.12
 task build:all      # Windows / Linux / macOS setup 包 + 增量更新 zip
 task build:gui      # 额外：pchat-gui.exe
 task package:gui    # Windows setup 包 + 增量更新 zip
@@ -120,7 +127,7 @@ task build:dev
 #   2. go build → dev-bin/pchat-server.exe
 #   3. go build → dev-bin/pchat.exe
 #   4. wails build-debug → dev-bin/pchat-gui.exe
-#   5. 杀掉旧进程，启动新的 dev-bin/pchat-gui.exe
+#   5. 只停止当前仓库 dev-bin/ 下的旧进程，启动新的 pchat-gui.exe
 ```
 
 `dev-bin/` 这个路径名是固定的 — 二进制启动时按 `internal/paths/devhome.go` 的策略解析数据目录：
@@ -129,9 +136,11 @@ task build:dev
 优先级：PCHAT_DATA_HOME 环境变量 > dev-bin/.p-chat/ > $HOME/.p-chat/
 ```
 
-也就是说跑 `dev-bin/pchat-gui.exe` 时，配置 / 会话 / 技能 / 知识库全都落在 `dev-bin/.p-chat/` 下，跟 `task build:gui` 装到 `%LOCALAPPDATA%` 用的 `$HOME/.p-chat/` 是**隔离的两份**。改源码、删 dev-bin 重跑都不会污染生产数据。改 `dev-bin/.p-chat/config.json` 也不影响安装版。
+也就是说跑 `dev-bin/pchat-gui.exe` 时，配置 / 会话 / 技能 / 知识库全都落在 `dev-bin/.p-chat/` 下，跟 `task build:gui` 装到 `%LOCALAPPDATA%` 用的 `$HOME/.p-chat/` 是**隔离的两份**。运行身份、GUI 单实例锁、托盘窗口、WebView2 本地状态和日志也按数据目录隔离，因此开发版和正式版可以同时打开。改源码、删 dev-bin 重跑都不会污染生产数据，改 `dev-bin/.p-chat/config.json` 也不影响安装版。
 
-源码改完只要再 `task build:dev` 一次就会原地热替换。
+源码改完只要再 `task build:dev` 一次就会原地热替换。重建脚本会核对可执行文件的完整路径，只结束本仓库 `dev-bin/` 下的旧进程，不会按进程名结束已安装的正式版。
+
+端口由 server 自己持有 listener 后再通知 GUI，避免并发启动时的“探测后释放”竞争。正式 GUI 优先使用 `15150-15159`，范围全满则回退到系统临时端口；dev/test 直接使用系统临时端口。GUI 会同时校验 profile、instance 和 PID，不会把另一个环境碰巧返回的 `/health` 当成本次后端。当前维护约定见 [`.agents/docs/infrastructure.md`](.agents/docs/infrastructure.md) 的“Server 进程管理”，设计背景与验收记录见 [`docs/plans/runtime-profile-coexistence.md`](docs/plans/runtime-profile-coexistence.md)。
 
 ### 前置
 
@@ -219,77 +228,86 @@ setup.exe
 
 ### 整体布局
 
-![桌面端主界面](docs/images/p-chat-web/8302c50626454bbf.png)
+当前桌面端采用 **AppRail + 项目内会话侧栏 + 聊天工作区 + 可折叠 Inspector** 的布局；README 顶部的主界面截图展示了完整结构。
 
-```
-┌─────────┬──────────────────────────────────────────┐
-│ 侧边栏   │ 顶栏 (☰ Logo  会话标题 · 项目 · 模型)    │
-│ ┌─────┐ │                                          │
-│ │项目 1│ │           消息列表 (MessageBubble)         │
-│ │项目 2│ │                                          │
-│ │      │ │  user: 帮我看下这个报错                   │
-│ ├─────┤ │  LLM : 好的，先看一下 stack trace…        │
-│ │会话 1│ │  ┌─ read_file ✓ 0.3s ─┐                 │
-│ │会话 2│ │  │  路径: main.go      │                 │
-│ │+ 新  │ │  └────────────────────┘                 │
-│ └─────┘ │                                          │
-│          ├──────────────────────────────────────────┤
-│          │ [模型][风格][模式][推理][计划/构建][权限][知识库]│
-│          │ [________________________________]  ➤  │
-└─────────┴──────────────────────────────────────────┘
-```
+| 区域 | 作用 |
+| --- | --- |
+| **AppRail** | 最左侧固定导航；进入全局会话、项目、应用设置，也可快速新建项目或查看关于信息 |
+| **项目与会话侧栏** | 顶部切换项目，下方搜索、新建和管理当前项目的会话；会话支持重命名、导出、归档与删除 |
+| **聊天工作区** | 渲染文本、思考、Skill、工具和子代理过程；工具结果与生成媒体可展开、复制、查看或下载 |
+| **右侧 Inspector** | 「会话」页集中放工具列表、Trace、生成风格、模型上下文与附件；「项目」页显示路径、Git 和项目操作 |
+| **输入区** | 添加附件、切换模型和会话设置，选择计划/构建与工具权限；`Enter` 发送、`Shift+Enter` 换行、`Esc` 停止 |
 
-**顶栏**：折叠侧边栏、Logo（点回主页）、会话标题 + 项目面包屑、当前模型 badge、工具列表按钮（🔧）、上下文检查器按钮（📊）、最近 trace id（#）。
+### 工作台操作示例
 
-**侧边栏**：项目分组 → 会话列表，每项支持右键重命名 / 归档 / 删除。顶部搜索框（Ctrl+P）跨会话全文搜。
+下列缩略图均可点击查看原图。
 
-**消息区**：每条消息由 `MessageBubble` 渲染，parts 数组支持 `text` / `thinking` / `tool` / `sub_agent` 四种类型。thinking 块可折叠；tool 调用卡片有状态色 + 耗时 + 复制结果按钮；sub-agent 卡片嵌套渲染。
-
-**输入区**：底部一行是会话级选项（模型、风格、工作模式、推理等级、Plan/Build、权限级别、知识库、附件），下面是文本输入框。Enter 发送，Shift+Enter 换行，Esc 停止当前生成。
+| 简单对话（mock） | 当前会话设置 |
+| --- | --- |
+| [![简单对话示例：用户发送 sayHI，助手返回问候](docs/assets/article-2026-09/06-sayhi-chat.png)](docs/assets/article-2026-09/06-sayhi-chat.png) | [![会话设置：工作类型、风格、知识库、思考和媒体能力](docs/assets/article-2026-09/07-session-settings.png)](docs/assets/article-2026-09/07-session-settings.png) |
+| **模型选择器** | **项目切换器** |
+| [![输入区模型选择器：按提供商查找和切换模型](docs/assets/article-2026-09/08-model-picker.png)](docs/assets/article-2026-09/08-model-picker.png) | [![项目切换器：全局会话与项目入口](docs/assets/article-2026-09/09-project-switcher.png)](docs/assets/article-2026-09/09-project-switcher.png) |
+| **新建项目** |  |
+| [![新建项目：选择项目根目录并命名](docs/assets/article-2026-09/10-add-project.png)](docs/assets/article-2026-09/10-add-project.png) | 项目只记录本地目录；创建时不会修改目录内容。项目中的 `AGENTS.md` 会作为上下文读取。 |
 
 ### 设置面板
 
-点击**左侧边栏底部的齿轮图标（⚙ 设置）**（或侧边栏顶部 ⋯ 菜单 → 设置）打开设置面板。左侧导航共 11 个分类，常用如下（完整步骤与截图见 [安装指南 2.3 方式一：GUI 可视化配置](http://www.08ms.cn/article/p-chat)）：
-
-![设置入口：主界面左侧边栏底部的齿轮按钮](docs/images/p-chat-web/97f4e736db78c4d1.png)
+点击最左侧 AppRail 的「设置」打开应用设置。左侧导航共 11 个分类，常用入口如下；完整操作顺序见 [仓库内图文指南](docs/p-chat-article-2026-09.md)，官网版本见 [P-Chat 使用说明](http://www.08ms.cn/article/p-chat)。
 
 | Tab | 作用 |
 | --- | --- |
-| **LLM 提供商** | 增删 provider，配置 base_url / API key / 默认模型，标记模型能力（vision / thinking） |
-| **风格** | 切换说话风格、上传自定义人格 prompt、查看风格记忆 |
-| **系统** | 全局工作模式（coding / daily）、自动压缩、工具结果截断、子代理策略 |
+| **LLM 提供商** | 增删 provider，共享 API key；添加对话模型或媒体生成模型，为媒体模型配置一份共享 API 与多项生成能力 |
+| **风格** | 切换说话风格、创建或编辑自定义人格 Prompt、查看风格记忆 |
+| **系统** | 全局工作模式、媒体识别、各生成能力的默认模型、自动压缩、工具结果截断和子代理策略 |
 | **归档** | 列出已归档会话、恢复或永久删除 |
 | **技能** | 搜索 / 安装 / 卸载 SKILL.md 包，全局 + 项目双层级 |
 | **MCP** | 启停 Model Context Protocol 服务器 |
-| **知识库** | 启用 RAG、配置 embedder、添加向量库、扫描知识库目录 |
+| **知识库** | 启用 RAG、添加知识库目录、扫描 Wiki/FTS5 索引；媒体扫描可选配置模型 |
 | **网络搜索** | 切换 web_search 提供商（Tavily / OpenAI 兼容）、配置 API key、每日配额、测试连接 |
 | **浏览器** | 启用 Chrome 扩展控制、查看已连接浏览器、选择控制目标 tab、域名策略 |
+| **IM 桥接** | 配置实验性的飞书、微信等消息入口并查看连接状态 |
+| **诊断** | 查看运行信息与诊断入口，配合 Trace ID 和日志排查问题 |
 
 #### LLM 提供商
 
-![设置面板全貌：左侧导航 + 右侧「LLM 提供商」页](docs/images/p-chat-web/f97e9cbbe10d9058.png)
+![LLM 提供商设置：供应商、协议、Base URL 和模型管理入口](docs/assets/article-2026-09/02-provider.png)
 
-- **协议**：OpenAI 兼容（绝大多数国内模型都走这个）或 Anthropic 原生（Claude）
-- **Base URL**：OpenAI 兼容用 `https://api.deepseek.com/v1` 这种带 `/v1` 的形式；Anthropic 用 `https://api.anthropic.com`
+- **供应商类型 / 策略**：先选择厂商或 Custom；部分厂商可继续选择普通 API、Coding Plan 等策略变体
+- **请求协议**：按服务商与模型选择 OpenAI Chat、OpenAI Responses 或 Anthropic Messages，不是选择 HTTP/HTTPS
+- **Base URL**：填写供应商公共地址，例如 DeepSeek 为 `https://api.deepseek.com`、Anthropic 为 `https://api.anthropic.com/v1`；模型端点在模型编辑器内单独配置
 - **API key**：从对应平台申请，粘贴进 `sk-...` 输入框
-- **模型**：在 provider 下加多个模型；`⭐` 标记默认模型
-- **能力标记**：vision（支持图片）/ thinking（支持推理）；标记后输入区会显示对应按钮
+- **自定义请求头**：可添加固定值或动态模板；点击「填入示例」会生成会话、消息、UUID、雪花 ID 四种常用请求头
+- **模型类型**：可添加“大语言模型”或“媒体生成模型”；同一 Provider/API key 可混合使用
+- **模型端点**：LLM 默认按协议填入 `/chat/completions`、`/responses` 或 `/messages`，可编辑；媒体模型同样只填写相对于 Base URL 的创建/查询端点后缀
+- **媒体能力**：媒体模型按文生图、图生图、文生视频、图生视频、视频生视频、语音/音乐/音效等能力勾选；同一模型只配置一份端点和超时，调用时按能力提交不同参数。LLM 媒体识别能力可不选，留空即仅文本
+- **获取模型**：从 `Base URL + /models` 拉取模型列表；点击候选项会先打开模型编辑弹窗，确认能力、上下文和端点后才添加
+- **模型**：对话模型可设为聊天默认；生成模型的应用默认在「系统 → 媒体生成」按能力选择
+- **连接测试**：点提供商顶部的「测试默认模型」，或模型行里的「测试」；P-Chat 会向实际选中的模型发送 `sayhi`，并显示模型、耗时和回复摘要
+
+#### 风格
+
+内置风格可直接选择；自定义风格可编辑 Prompt 和记忆，也可从当前会话生成或优化。生成前请检查会话中是否包含不应长期保留的敏感信息。
+
+| 风格库 | 编辑自定义风格 |
+| --- | --- |
+| [![风格列表：内置风格与 mock 自定义风格](docs/assets/article-2026-09/11-style-library.png)](docs/assets/article-2026-09/11-style-library.png) | [![编辑 mock 风格：显示名称、Prompt 和记忆](docs/assets/article-2026-09/12-style-editor.png)](docs/assets/article-2026-09/12-style-editor.png) |
+| **从当前会话生成风格** |  |
+| [![从当前 mock 会话生成或优化风格](docs/assets/article-2026-09/22-style-generate.png)](docs/assets/article-2026-09/22-style-generate.png) | 生成完成后先审核 Prompt 和记忆，再保存并在当前会话中选择。 |
 
 #### 知识库
 
-![知识库](docs/assets/gui-knowledge-base.png)
+![知识库设置：新增本地资料目录并管理索引](docs/assets/article-2026-09/03-knowledge.png)
 
 - 打开「启用知识库」开关
-- 选 embedder（选个支持 embedding 的 provider + 模型，本地可以用 `bge-m3` 之类）
-- 添加向量库（`local` 内置、Qdrant / Chroma / Pinecone 等远程库）
 - 添加知识库目录（指向你要检索的代码 / 文档根），点「扫描」后台索引
-- 回到输入区底部选「知识库」绑定到当前会话
+- 如需扫描图片、音频、视频或 PDF，给该知识库配置 `scan_model` 和媒体类型；纯文本/代码不需要 embedding 或额外模型
+- 回到输入区点击「会话设置」→「知识库」，选择“不使用 / 全部 / 指定知识库”
 
-LLM 在需要时调用 `recall` 工具按需检索。详见 [docs/knowledge.md](docs/knowledge.md)。
+LLM 在需要时调用 `recall` 或 `wiki_lookup` 工具按需检索。详见 [docs/knowledge.md](docs/knowledge.md)。
 
 #### 网络搜索
 
-![网络搜索](docs/assets/gui-websearch.png)
+![网络搜索设置：服务商、配额和连接测试](docs/assets/article-2026-09/04-web-search.png)
 
 - 启用开关
 - 选 provider：Tavily（1000 次/月免费）或 OpenAI 兼容（自配 endpoint，比如 jina.ai / bocha）
@@ -298,20 +316,44 @@ LLM 在需要时调用 `recall` 工具按需检索。详见 [docs/knowledge.md](
 - 超时（Go duration 格式，如 `20s`，上限 60s）
 - **测试连接**按钮：发一个 `test` 查询验证 key 通；成功后状态卡片显示绿色「连接正常」
 
+#### 媒体识别与生成
+
+媒体识别用于理解上传的图片、视频或音频；媒体生成用于产出新内容，两者需要分别配置。先给模型声明实际能力，再设置应用默认模型，最后在当前会话中启用所需能力。
+
+| 媒体识别路由 | 媒体生成模型 |
+| --- | --- |
+| [![系统设置中的图片、视频和音频识别路由](docs/assets/article-2026-09/18-media-recognition.png)](docs/assets/article-2026-09/18-media-recognition.png) | [![提供商中的 mock 图片与视频生成模型](docs/assets/article-2026-09/13-media-model.png)](docs/assets/article-2026-09/13-media-model.png) |
+| **应用默认模型** | **当前会话能力开关** |
+| [![按生成能力选择应用默认模型](docs/assets/article-2026-09/14-media-defaults.png)](docs/assets/article-2026-09/14-media-defaults.png) | [![当前会话按需启用媒体生成能力](docs/assets/article-2026-09/15-media-session.png)](docs/assets/article-2026-09/15-media-session.png) |
+| **mock 文生图结果** | **mock 文生视频结果** |
+| [![mock 文生图结果：预览、附件和下载入口](docs/assets/article-2026-09/16-image-result.png)](docs/assets/article-2026-09/16-image-result.png) | [![mock 文生视频结果：播放器、附件和下载入口](docs/assets/article-2026-09/17-video-result.png)](docs/assets/article-2026-09/17-video-result.png) |
+
+#### MCP
+
+MCP 当前提供基础的服务器管理入口，可配置本地 Stdio 或远程 SSE 服务。先启用全局开关并确认服务器状态，再到右侧 Inspector 的工具列表核对实际暴露的工具。
+
+| MCP 设置入口 | 添加 MCP 服务器 |
+| --- | --- |
+| [![MCP 设置入口：mock 环境中尚未添加服务器](docs/assets/article-2026-09/20-mcp.png)](docs/assets/article-2026-09/20-mcp.png) | [![MCP 添加表单：本地 mock 参数](docs/assets/article-2026-09/21-mcp-add.png)](docs/assets/article-2026-09/21-mcp-add.png) |
+
 ### GUI 操作速查
 
 | 想做什么 | 操作入口 |
 | --- | --- |
-| 切编码 / 日常工作模式 | 输入区上方「工作模式」选择器；全局默认在「设置」→「系统」 |
-| 关 / 换说话风格 | 输入区「风格」选择器；自定义在「设置」→「风格」 |
-| 选本轮知识库 | 输入区「知识库」选择器（不使用 / 全部 / 指定） |
+| 切编码 / 日常工作模式 | 输入区「会话设置」→「类型」；全局默认在「设置」→「系统」 |
+| 关 / 换说话风格 | 输入区「会话设置」→「风格」；自定义在「设置」→「风格」 |
+| 选本轮知识库 | 输入区「会话设置」→「知识库」（不使用 / 全部 / 指定） |
 | 配置知识库目录 | 「设置」→「知识库」→ 添加 → 扫描 |
-| 看可用工具 | 顶栏 🔧 按钮，右侧抽屉列出内置工具 + 加载诊断 |
+| 配置图片/视频/音频生成 | 「设置」→「LLM 提供商」添加媒体生成模型及能力 →「系统 → 媒体生成」选择默认模型 |
+| 在当前对话启用媒体生成 | 输入区「会话设置」→「媒体生成」勾选文生图、图生视频等能力；关闭后工具调用会直接返回“已关闭”，不会请求厂商 |
+| 新建 / 切换项目 | 左上项目切换器；新建项目也可用 AppRail 左下角 `+` |
+| 切换当前模型 | 输入区左下角模型按钮，支持按提供商和模型名搜索 |
+| 看可用工具 | 展开右侧 Inspector →「会话」→「工具列表」，查看内置工具、自定义工具和加载诊断 |
 | 启用浏览器控制 | 「设置」→「浏览器」→ 开开关 → 下载扩展 → chrome://extensions 加载；详见 [浏览器控制](#浏览器控制) |
-| 复制 trace id | 顶栏 `#` 按钮，或错误气泡上的 trace id 按钮 |
+| 复制 trace id | 展开右侧 Inspector →「会话」→「复制 Trace」，或点击错误气泡上的 Trace ID |
 | 重新生成 | assistant 消息底部「重答」按钮，旧版会作为历史版本保留 |
 
-界面操作细节与截图（模型徽章切换、会话设置、风格切换、工具调用可视化、fork / 撤回）见 [安装指南 4.3 界面操作](http://www.08ms.cn/article/p-chat)。
+更完整的第一次对话、项目工作流、附件、知识库、媒体、Skill、MCP 和 CLI 操作见 [仓库内图文指南](docs/p-chat-article-2026-09.md)；官网同步版见 [P-Chat 使用说明](http://www.08ms.cn/article/p-chat)。
 
 ---
 
@@ -328,6 +370,8 @@ P-Chat 通过 Chrome / Edge 扩展操控真实浏览器。LLM 能像人一样导
 5. 「加载已解包扩展」，选刚才解压的目录
 6. 扩展弹窗的「服务器」输入框粘贴 GUI 显示的 HTTP 地址
 7. 回到 P-Chat 的「浏览器」Tab，确认「已连接浏览器」> 0
+
+![浏览器设置：扩展安装、连接状态与目标标签页入口](docs/assets/article-2026-09/05-browser.png)
 
 成功后 15 个 `browser_*` 工具自动注册到当前会话的工具列表里。LLM 在需要时会自己调用，无需手动配置。
 
@@ -351,16 +395,16 @@ P-Chat 通过 Chrome / Edge 扩展操控真实浏览器。LLM 能像人一样导
 | `browser_find` | 按文本或 regex 找元素并返回 ref |
 | `browser_extract` | 抓整页渲染后的可见文本（SPA 内容也能拿到） |
 | `browser_tabs` | 列出 / 新开 / 关闭 / 切换标签页；`action=select` 切换「控制目标」 |
-| `browser_screenshot` | 截当前视口（默认）或整页（`full_page: true`），JPEG quality 80，**返回 base64 嵌入消息气泡** |
+| `browser_screenshot` | 截当前视口（默认）或整页（`full_page: true`），JPEG quality 80；保存为会话归属的本地媒体资产 |
 
 ### 截图怎么嵌入消息
 
 `browser_screenshot` 不走普通 `tool_result` 文本通道 — 它返回的结构体（`tool.CallResult.Image`）会同时干两件事：
 
-1. **给 LLM 看**：作为独立的 `role=user, type=image` ChatMessage 注入对话历史，让 LLM 能像看用户上传的图一样分析截图内容。`tool_result` 文本字段只放占位符 `[截图已截取]`，避免 base64 串把上下文挤爆。
-2. **给用户看**：截图二进制通过 SSE 事件的 `ToolResultFull` 字段送到前端，前端用 `MessageBubble` + `ImageLightbox` 渲染成可点击的缩略图，点开放大查看 / 复制 / 保存。
+1. **给当前 LLM 轮次看**：截图字节只在本次 ReAct 过程中作为 `role=user, type=image` 注入视觉模型；若会话启用了专门识图，则先转换为受约束的事实观察文本。
+2. **给用户和后续轮次用**：Agent 把截图写入本地媒体资产仓库，工具结果只保存会话归属的 `asset_id`、同源 URL 和元数据。前端复用生成媒体结果卡展示缩略图、文件名、全屏查看与下载；后续识别使用 `input_ref`，不会把 base64 反复写入 SQLite 或发送给模型。
 
-完整流程（`internal/tool/registry.go:CallResultImage` + `internal/browser/tools.go:makeHandler`）：扩展端先返回 `data:image/jpeg;base64,...` 的 data URL，后端 `splitDataURL` 拆出 MIME + payload，再走上面的双通道分发。截图的标签页同时会被 `refreshPreferredFromNavigate` 缓存为「控制目标」。
+完整流程（`internal/tool/registry.go:CallResultImage` + `internal/browser/tools.go:makeHandler`）：扩展端先返回 `data:image/jpeg;base64,...`，后端拆出 MIME + payload，Agent 随即实体化为 `/api/v1/generated/:asset_id`。旧会话中的 data/blob 截图仍可展示，但新截图不再以该形式持久化。
 
 ### 选择控制目标标签页
 
@@ -430,7 +474,7 @@ go test ./internal/browser -run E2E -count=1
   "style": { "default": "tech" },
   "memory": { "max_history": -1 },
   "sandbox": { "exec_dangerous_patterns": "...", "write_protected_paths": "..." },
-  "knowledge": { "enabled": false, "embedder": {...}, "vector_stores": [...], "bases": [...] }
+  "knowledge": { "enabled": false, "auto_index": false, "bases": [...] }
 }
 ```
 
@@ -446,11 +490,26 @@ Agent 行为指令文件，注入到 System Prompt：
 ### Skills / Rules
 
 ```
-~/.p-chat/skills/code-review/SKILL.md    # 技能
+~/.p-chat/skills/code-review/SKILL.md    # P-Chat 托管的全局 Skill
+~/.agents/skills/code-review/SKILL.md    # Agent Skills 标准用户目录
+./.p-chat/skills/code-review/SKILL.md    # P-Chat 托管的项目 Skill
+./.agents/skills/code-review/SKILL.md    # Agent Skills 标准项目目录
 ~/.p-chat/rules/code-style.md            # 规则
 ```
 
-技能是按需加载的；规则是全部拼接注入。两者都支持项目级覆盖（`.p-chat/skills/`、`.p-chat/rules/`）。
+Skill 只把名称和描述放进系统索引，正文按需加载；规则仍全部拼接注入。Skill 优先级为
+项目 `.p-chat` → 项目 `.agents` → 全局 `.p-chat` → 用户 `.agents`，同名只使用最高优先级版本。
+
+CLI 可用 `/skills` 查看，用 `/skill docs-tool 创建一份周报` 显式调用；已安装 Skill 也可直接
+使用 `/docs-tool 创建一份周报`。GUI 输入 `/` 后会列出同样的动态 Skill 命令。每次真正加载
+都会在回答前显示 `当前调用 Skill：docs-tool`，随后给出“已就绪”或具体依赖错误。
+
+外部 CLI 或工具提供 Skill 时，应优先把完整包写入 `.agents/skills` 标准目录。如果它只能
+导出到自己的目录，让 P-Chat Agent 调用
+`skill_manage(action=import, source_path=<导出目录>)`：路径可指向单个包或包含多个包的集合；
+传 `name=docs-tool` 时只导入该 Skill 及其在集合内声明的依赖，省略时导入全部。P-Chat 不为
+具体 CLI 内置专用适配器。必须再执行 `skill(action=doctor)` / `/skills` 验证；只有
+`ready=true` 才算完成。新会话会重新扫描。
 
 ### 人格
 
@@ -460,7 +519,7 @@ Agent 行为指令文件，注入到 System Prompt：
 | 古风 墨言 (MoYan) | `--style guofeng` | 雅致 + 引经据典 |
 | 科技风 NEXUS | `--style tech` | 冷静 + 结构化 |
 
-`--style off` 或在 GUI 输入区选「关闭」= 不注入风格 prompt 和记忆。
+`--style off` 或在 GUI 输入区「会话设置」→「风格」选「关闭」= 不注入风格 prompt 和记忆。
 
 ---
 
@@ -468,35 +527,82 @@ Agent 行为指令文件，注入到 System Prompt：
 
 | 协议 | 适用 |
 | --- | --- |
-| `openai` (兼容) | OpenAI、DeepSeek、Ollama、通义千问、智谱、百川 |
-| `anthropic` (原生) | Claude |
+| `openai_chat` | OpenAI Chat Completions 及 DeepSeek、Ollama、通义千问、智谱、百川等兼容服务 |
+| `openai_responses` | OpenAI Responses API 及明确兼容该协议的服务 |
+| `anthropic_messages` | Anthropic Claude Messages API 及明确兼容该协议的服务 |
+
+旧值 `openai` / `anthropic` 仍作为兼容别名读取；新配置建议使用上表中的明确协议 ID。
 
 ### 配置示例
 
-```yaml
-llm:
-  default: "deepseek"
-  providers:
-    - name: "deepseek"
-      protocol: "openai"
-      base_url: "https://api.deepseek.com/v1"
-      api_key: "sk-xxx"
-      model: "deepseek-chat"
-
-    - name: "claude"
-      protocol: "anthropic"
-      base_url: "https://api.anthropic.com"
-      api_key: "sk-ant-xxx"
-      model: "claude-3-5-sonnet-20241022"
-
-    - name: "ollama"
-      protocol: "openai"
-      base_url: "http://localhost:11434/v1"
-      api_key: "ollama"
-      model: "llama3"
+```json
+{
+  "llm": {
+    "default": "deepseek",
+    "providers": [
+      {
+        "name": "deepseek",
+        "provider_id": "deepseek",
+        "protocol": "openai_chat",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "<API Key>",
+        "custom_headers": {
+          "x-opencode-session": "{{conversation_id}}",
+          "x-pchat-message-id": "{{message_id}}",
+          "x-request-id": "{{uuid}}",
+          "x-snowflake-id": "{{snowflake_id}}"
+        },
+        "models": [{
+          "name": "<DeepSeek 模型 ID>",
+          "api_endpoint": "/chat/completions",
+          "default": true
+        }]
+      },
+      {
+        "name": "claude",
+        "provider_id": "anthropic",
+        "protocol": "anthropic_messages",
+        "base_url": "https://api.anthropic.com/v1",
+        "api_key": "<API Key>",
+        "models": [{
+          "name": "<Claude 模型 ID>",
+          "api_endpoint": "/messages",
+          "default": true
+        }]
+      },
+      {
+        "name": "ollama",
+        "provider_id": "custom",
+        "protocol": "openai_chat",
+        "base_url": "http://localhost:11434/v1",
+        "api_key": "ollama",
+        "models": [{
+          "name": "<本机模型 ID>",
+          "api_endpoint": "/chat/completions",
+          "default": true
+        }]
+      }
+    ]
+  }
+}
 ```
 
+`custom_headers` 支持固定字符串，也支持在请求发出前展开以下动态参数：
+
+| 动态参数 | 含义 |
+| --- | --- |
+| `{{conversation_id}}` / `{{session_id}}` | 当前对话 ID |
+| `{{message_id}}` | 当前用户消息 ID；连接测试或模型列表请求没有消息时为空 |
+| `{{trace_id}}` | 当前 P-Chat 链路追踪 ID |
+| `{{uuid}}` | 每次上游请求生成的随机 UUID |
+| `{{snowflake_id}}` | 每次上游请求生成的本地雪花 ID |
+| `{{timestamp}}` / `{{timestamp_ms}}` | 请求时刻的秒 / 毫秒 Unix 时间戳 |
+
+同一次请求里的多个请求头共享同一个 UUID 和雪花 ID。自定义值会覆盖 P-Chat 设置的同名协议请求头，适合需要特殊认证头的兼容网关；`Host`、`Content-Length`、`Connection` 等传输层请求头禁止配置。请求头会用于对话、连接测试、`/models` 与媒体生成 API，但不会转发到生成结果的外部下载地址。
+
 ### 已知坑
+
+- **Base URL 与端点后缀**：Provider 的 `base_url` 可以包含供应商版本前缀（例如火山方舟的 `/api/v3`）；模型的 `api_endpoint` 只填写其后的相对路径。最终请求地址严格为二者拼接，不按厂商猜测路径。
 
 - **08ms.cn 代理**：`cs` provider 走 `http://api-convert.08ms.cn/v1`。quota 耗尽时所有请求会回 5xx，不是 P-Chat 的 bug。
 - **Anthropic 协议**：自定义 header 比较严，`x-api-key` 必须是裸 key，不要带 `Bearer` 前缀。
@@ -515,6 +621,13 @@ llm:
 | GET/PATCH/DELETE | `/sessions/:id` | 获取/更新/归档 |
 | GET | `/sessions/:id/messages` | 历史 |
 | POST | `/sessions/:id/messages` | **发送消息 (SSE)** |
+| GET | `/sessions/:id/snapshot` | SSE 断线恢复快照 |
+| GET | `/sessions/:id/context` | 上下文检查器 |
+| GET | `/sessions/:id/export` | 会话导出 |
+| POST | `/sessions/:id/regenerate` | 从指定用户消息重新生成 |
+| GET/POST/DELETE | `/sessions/:id/turn-queue` | 忙碌会话的排队消息（列表/入队/清空） |
+| GET/POST | `/sessions/:id/subagent-jobs/*` | 异步子代理 job 状态、事件和取消 |
+| POST | `/sessions/:id/cancel-stream` | 停止当前生成 |
 | POST | `/sessions/:id/compress` | 压缩历史 |
 | PATCH | `/sessions/:id/reasoning-effort` | 调推理深度 |
 | DELETE | `/sessions/:id/messages` | 清空 |
@@ -525,15 +638,17 @@ llm:
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/PATCH | `/knowledge/config` | 配置读写 |
-| GET/POST | `/knowledge/stores` | 向量库 |
-| DELETE | `/knowledge/stores/:name` | 删向量库 |
-| POST | `/knowledge/stores/:name/test` | 测试连接 |
+| GET | `/knowledge/models` | 可用于媒体扫描的模型 |
 | GET/POST | `/knowledge/bases` | 知识库 |
 | DELETE | `/knowledge/bases/:name` | 删知识库 |
 | POST | `/knowledge/bases/:name/scan` | 扫描索引 |
+| DELETE | `/knowledge/bases/:name/scan` | 取消扫描 |
 | GET | `/knowledge/bases/:name/scan/status` | 扫描进度 |
-| POST | `/knowledge/search` | 语义搜索 |
-| GET | `/knowledge/embedders` | 可用 embedder |
+| DELETE | `/knowledge/bases/:name/clear` | 清空索引 |
+| GET | `/knowledge/bases/:name/nodes` | 三层索引节点 |
+| GET | `/knowledge/bases/:name/nodes/:id/content` | 节点内容 |
+| DELETE | `/knowledge/bases/:name/nodes/:id` | 删除节点 |
+| POST | `/knowledge/search` | 混合搜索 |
 
 ### 其他
 
@@ -543,9 +658,14 @@ llm:
 | GET/POST/PATCH/DELETE | `/providers` | Provider CRUD |
 | GET/POST/DELETE | `/projects` | 项目目录 |
 | GET/POST/DELETE | `/skills` | 技能 |
+| GET/POST | `/tools` / `/tools/:name/trial` | 工具列表、动态工具诊断、工具试运行 |
 | GET | `/commands` | 斜杠命令列表 |
 | POST | `/uploads` | 上传 |
 | POST | `/mcp/servers` | MCP 服务器 |
+| GET/POST/PATCH | `/browser/*` | 浏览器连接、标签页、扩展下载、域名策略 |
+| GET/PATCH/POST | `/im/*` | IM 健康状态、配置、测试、微信 QR、飞书 webhook、事件流 |
+| GET | `/diagnostics/*` | 内存、配置、heap/goroutine 快照 |
+| GET/POST | `/updates/*` | 版本检查与更新下载 |
 
 ### SSE 发送消息
 
@@ -577,27 +697,33 @@ data: {"type":"done","tokens_in":123,"tokens_out":456,"elapsed":"2.3s"}
 默认开 auto-continue（最多 3 次）。CLI 用 `/auto-continue off` 关；HTTP 用 `PATCH /api/v1/sessions/:id` 设 `{"auto_continue": false}`。
 
 **2. 编码 / 日常工作模式怎么切？**
-GUI：输入区上方「工作模式」选；全局默认在「设置」→「系统」。CLI：`/mode coding` 或 `/mode daily`。
+GUI：输入区「会话设置」→「类型」；全局默认在「设置」→「系统」。CLI：`/mode coding` 或 `/mode daily`。
 
 **3. 不想要说话风格了？**
-GUI：输入区「风格」选「关闭」。CLI：`/style off`。
+GUI：输入区「会话设置」→「风格」选「关闭」。CLI：`/style off`。
 
 **4. 怎么看可用工具？**
-GUI：顶栏 🔧 按钮。CLI：`/tools`。自定义 YAML 工具放 `~/.p-chat/tools/*.yaml` 或项目内 `.p-chat/tools/*.yaml`，加载失败时在抽屉顶部「加载诊断」里看。
+GUI：展开右侧 Inspector，在「会话」页点击「工具列表」。CLI：`/tools`。自定义 YAML 工具放 `~/.p-chat/tools/*.yaml` 或项目内 `.p-chat/tools/*.yaml`，加载失败时在工具列表的「加载诊断」里查看。
 
-**5. 怎么用浏览器控制？**
+**5. 外部 CLI 已安装，为什么新会话仍找不到它提供的 Skill？**
+安装可执行文件不等于安装 Skill。先让该工具把完整 Skill 包导出到 `.agents/skills`，或让
+Agent 调用 `skill_manage(action=import, source_path=<导出目录>)` 导入单包/集合目录。随后调用
+`skill(action=doctor)`，确认结果 `ready=true`。真正调用时界面会明确显示
+`当前调用 Skill：<准确名称>`。
+
+**6. 怎么用浏览器控制？**
 见上方 [浏览器控制](#浏览器控制) 章节：装扩展 → 弹窗填服务器地址 → GUI 看到「已连接浏览器 > 0」→ LLM 自动开始用 `browser_*` 工具。15 个工具的清单、双通道截图嵌入、BR-04 域名策略、控制目标 tab 切换都在那一节。
 
-**6. trace id 在哪看？**
-错误气泡上的 `trace id` 按钮直接复制；顶栏 `#` 按钮是最近一次的。日志在 `~/.p-chat/logs/`（按日期切割，保留 7 天，如 `server-debug-2026-08-02.log`）。
+**7. trace id 在哪看？**
+错误气泡上的 Trace ID 按钮可直接复制；最近一次 Trace 在右侧 Inspector 的「会话」页。日志位于 `~/.p-chat/logs/`（按日期切割，保留 7 天，如 `server-debug-2026-08-02.log`）。
 
-**7. 重答后能看上一版吗？**
+**8. 重答后能看上一版吗？**
 assistant 消息底部「重答」会保留所有历史版本，消息下方出现版本切换条。
 
-**8. 知识库怎么用？**
-「设置」→「知识库」→ 开开关 → 加 base → 扫描 → 输入区选知识库。LLM 自动用 `recall` 工具查。
+**9. 知识库怎么用？**
+「设置」→「知识库」→ 开开关 → 加 base → 扫描 → 输入区「会话设置」→「知识库」选择范围。LLM 自动用 `recall` 工具查。
 
-**9. 多知识库怎么排序？**
+**10. 多知识库怎么排序？**
 各库分别检索 → 分数归一化 → 合并排序 → 去重 → 标注 `base` 来源。
 
 ---
@@ -629,12 +755,14 @@ cd frontend && npx vue-tsc -b
 | 文档 | 什么时候改 |
 | --- | --- |
 | `README.md` | 用户入口、GUI 操作步骤、常见问题、当前进度摘要变化 |
+| `docs/p-chat-article-2026-09.md` | 完整安装与使用流程、截图说明、面向新用户的逐步操作发生变化 |
 | [软件下载页](http://www.08ms.cn/software/p-chat) | 下载当前版本 setup 安装包、增量更新包和全量包 |
 | [网页版说明文档](http://www.08ms.cn/article/p-chat) | 安装、API 厂商接入、CLI/GUI 使用指南（与官网说明同步） |
 | `docs/feature-opportunities.md` | 功能从待办变为已落地、backlog 优先级变化、废弃历史计划 |
 | `CHANGELOG.md` | 版本交付、升级说明、重要 bug 修复和测试覆盖 |
 | `.agents/docs/*.md` | 模块实现细节、关键文件、测试方式、agent 修改入口 |
 | `.agents/docs/INDEX.md` | 新模块、新功能入口或“想改 X 读什么”路径变化 |
+| `docs/project-structure.md` | 目录结构、模块职责、关键运行流、功能状态口径变化 |
 
 `docs/plans/*.md` 只保留历史设计背景；当前状态以 `README.md` 的快照和 `docs/feature-opportunities.md` 为准。
 

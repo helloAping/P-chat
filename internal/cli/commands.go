@@ -105,7 +105,7 @@ func init() {
 			Name: "/provider", Aliases: []string{"/p"}, Description: "查看当前提供商详情",
 			Usage: "/provider",
 			Args: "无参。显示:\n" +
-				"  - 名称 / 协议 / base_url / APIKey (前 4+ 后 4)\n" +
+				"  - 名称 / 协议 / Base URL / APIKey (前 4+ 后 4)\n" +
 				"  - 当前 model + 显示名\n" +
 				"  - 已配置模型数 (多模型时)",
 			Examples: []string{
@@ -117,8 +117,8 @@ func init() {
 			Name: "/setup", Description: "交互式配置提供商 (添加 / 删除 / 设置 Key / 测试)",
 			Usage: "/setup",
 			Args: "无参。命令菜单驱动, 步骤:\n" +
-				"  1. 选动作 (7 个): 添加预设 / 添加自定义 / 设置 Key / 删除 / 测试 / 设默认 / 返回\n" +
-				"  2. 按提示输入 name / base_url / model / key 等\n" +
+				"  1. 选动作: 添加 / 设置 Key / 删除 / 测试 / 设默认 / 返回\n" +
+				"  2. 按提示输入 name / protocol / base_url / model / key 等\n" +
 				"  3. 自动写 ~/.p-chat/config.yaml\n" +
 				"  4. 提示是否切换为新 provider",
 			Examples: []string{
@@ -130,8 +130,7 @@ func init() {
 			Name: "/config", Description: "快速配置 (命令行版本, 不进 REPL 也能用)",
 			Usage: "/config <子命令> [参数]",
 			Args: "provider 管理:\n" +
-				"  add    <name> <base_url> <protocol>   添加 provider (单模型)\n" +
-				"  add    <预设名>                       用预设 (openai/claude/deepseek/...)\n" +
+				"  add    <name> <protocol> <base_url> <model> [api_key] 添加 provider\n" +
 				"  remove <name>                          删除 provider (别名: rm)\n" +
 				"  key    <name> <key>                   设置 API key\n" +
 				"  test   [name]                          测试连接 (默认所有)\n" +
@@ -209,6 +208,27 @@ func init() {
 				"/reason high",
 			},
 			Handler: cmdReasoning,
+		},
+		{
+			Name: "/queue", Aliases: []string{"/qmsg"}, Description: "管理当前会话的排队消息",
+			Usage: "/queue [list|add|edit|run|retry|delete|clear] [参数]",
+			Args: "无参/list            - 列出 queued/running/failed 项\n" +
+				"      add <消息>           - 新增一条待发送消息\n" +
+				"      edit <id> <消息>     - 编辑尚未领取的消息\n" +
+				"      run                  - 按 FIFO 顺序发送全部可执行项\n" +
+				"      retry <id>           - 将失败项重新放回队列\n" +
+				"      delete <id>          - 删除 queued/failed 项（别名: rm）\n" +
+				"      clear                - 清空 queued/failed 项",
+			Examples: []string{
+				"/queue",
+				"/queue add 处理完当前回合后再检查测试",
+				"/queue edit 42 改为只运行单元测试",
+				"/queue run",
+				"/queue retry 42",
+				"/queue delete 42",
+				"/queue clear",
+			},
+			Handler: cmdQueue,
 		},
 		{
 			Name: "/regen", Aliases: []string{"/regenerate"}, Description: "重新生成指定用户消息之后的回复",
@@ -392,6 +412,17 @@ func init() {
 				"/skills",
 			},
 			Handler: cmdSkills,
+		},
+		{
+			Name: "/skill", Description: "明确调用一个 Skill 并发送任务",
+			Usage: "/skill <名称> [任务描述]",
+			Args: "<名称>       - 已安装 Skill 的精确名称\n" +
+				"      [任务描述] - 交给该 Skill 的请求；省略时使用默认帮助请求",
+			Examples: []string{
+				"/skill lark-doc 创建一份周报",
+				"/skill lark-calendar",
+			},
+			Handler: cmdSkillUsage,
 		},
 		{
 			Name: "/rules", Description: "列出已加载的规则",
@@ -683,7 +714,7 @@ func cmdProvider(ctx cliContext, args string) error {
 	if err == nil {
 		fmt.Printf("    名称:     %s\n", view.Name)
 		fmt.Printf("    协议:     %s\n", view.Protocol)
-		fmt.Printf("    BaseURL:  %s\n", view.BaseURL)
+		fmt.Printf("    Base URL: %s\n", view.BaseURL)
 		fmt.Printf("    Model:    %s\n", view.Model)
 		keyDisplay := "(已设置)"
 		if view.APIKey == "" {
@@ -698,7 +729,7 @@ func cmdProvider(ctx cliContext, args string) error {
 		fmt.Printf("    名称:     %s\n", prov)
 		fmt.Printf("    协议:     %s\n", protocol)
 		fmt.Printf("    模型:     %s\n", model)
-		fmt.Printf("    BaseURL:  %s\n", color.HiBlackString("(无详细信息 - HTTP 模式)"))
+		fmt.Printf("    Base URL: %s\n", color.HiBlackString("(无详细信息 - HTTP 模式)"))
 		fmt.Printf("    APIKey:   %s\n", color.HiBlackString("(无详细信息 - HTTP 模式)"))
 	}
 
@@ -885,13 +916,12 @@ func cmdSetup(ctx cliContext, args string) error {
 
 		fmt.Println()
 		actionOptions := []SelectOption{
-			{Label: "添加预设提供商", Value: "1"},
-			{Label: "添加自定义提供商", Value: "2"},
-			{Label: "设置 API Key", Value: "3"},
-			{Label: "删除提供商", Value: "4"},
-			{Label: "测试连接", Value: "5"},
-			{Label: "设置默认提供商", Value: "6"},
-			{Label: "返回", Value: "7"},
+			{Label: "添加提供商", Value: "1"},
+			{Label: "设置 API Key", Value: "2"},
+			{Label: "删除提供商", Value: "3"},
+			{Label: "测试连接", Value: "4"},
+			{Label: "设置默认提供商", Value: "5"},
+			{Label: "返回", Value: "6"},
 		}
 
 		idx, err := Select("  选择操作:", actionOptions)
@@ -903,93 +933,29 @@ func cmdSetup(ctx cliContext, args string) error {
 
 		switch choice {
 		case "1":
-			if err := setupAddPreset(ctx, scanner); err != nil {
-				color.Red("  错误: %v", err)
-			}
-		case "2":
 			if err := setupAddCustom(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "3":
+		case "2":
 			if err := setupSetAPIKey(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "4":
+		case "3":
 			if err := setupRemove(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "5":
+		case "4":
 			if err := setupTest(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "6":
+		case "5":
 			if err := setupSetDefault(ctx, scanner); err != nil {
 				color.Red("  错误: %v", err)
 			}
-		case "7":
+		case "6":
 			return nil
 		}
 	}
-}
-
-func setupAddPreset(ctx cliContext, scanner *bufio.Scanner) error {
-	fmt.Println()
-	color.Cyan("  可用预设:")
-	for i, t := range ProviderTemplates {
-		apiKeyMark := ""
-		if t.HasAPIKey {
-			apiKeyMark = " (需要 API Key)"
-		}
-		fmt.Printf("    %d. %-14s %s%s\n", i+1, t.Name, t.Desc, apiKeyMark)
-	}
-	fmt.Println()
-	fmt.Print("  选择预设序号: ")
-
-	if !scanner.Scan() {
-		return nil
-	}
-	idxStr := strings.TrimSpace(scanner.Text())
-	idx, err := strconv.Atoi(idxStr)
-	if err != nil || idx < 1 || idx > len(ProviderTemplates) {
-		color.HiBlack("  无效选择")
-		return nil
-	}
-
-	tmpl := ProviderTemplates[idx-1]
-
-	// Ask for API key if needed
-	apiKey := ""
-	if tmpl.HasAPIKey {
-		fmt.Printf("  输入 %s 的 API Key (留空跳过): ", tmpl.Name)
-		if !scanner.Scan() {
-			return nil
-		}
-		apiKey = strings.TrimSpace(scanner.Text())
-	}
-
-	// Ask for model selection
-	fmt.Printf("  选择模型 (默认 %s): ", tmpl.Models[0])
-	if !scanner.Scan() {
-		return nil
-	}
-	modelInput := strings.TrimSpace(scanner.Text())
-	model := tmpl.Models[0]
-	if modelInput != "" {
-		model = modelInput
-	}
-
-	if err := ctx.AddProvider(ProviderConfigInput{
-		Name:     tmpl.Name,
-		Protocol: tmpl.Protocol,
-		BaseURL:  tmpl.BaseURL,
-		APIKey:   apiKey,
-		Model:    model,
-	}); err != nil {
-		return err
-	}
-
-	color.Green("  ✓ 已添加: %s / %s [%s]", tmpl.Name, model, tmpl.Protocol)
-	return nil
 }
 
 func setupAddCustom(ctx cliContext, scanner *bufio.Scanner) error {
@@ -1248,7 +1214,7 @@ func cmdConfig(ctx cliContext, args string) error {
 		fmt.Println()
 		fmt.Println("  LLM 提供商:")
 		for _, p := range cfg.LLM.Providers {
-			fmt.Printf("    • %-14s %-28s [%s] %s\n", p.Name, p.Model, p.GetProtocol(), p.BaseURL)
+			fmt.Printf("    • %-14s %-28s [%s] %s\n", p.Name, p.Model, p.GetProtocol(), p.EffectiveBaseURL())
 		}
 		fmt.Println()
 		color.HiBlack("  用法: /config add|remove|key|test|list <args>")
@@ -1563,46 +1529,14 @@ func cmdConfigModelDefault(ctx cliContext, providerName, modelName string) error
 }
 
 func configAddQuick(ctx cliContext, args string) error {
-	// /config add <template> or /config add <name> <protocol> <base_url> <model> [api_key]
+	// /config add <name> <protocol> <base_url> <model> [api_key]
 	if args == "" {
 		color.Cyan("  用法:")
-		fmt.Println("    /config add <预设名>              使用预设添加")
 		fmt.Println("    /config add <name> <protocol> <base_url> <model> [api_key]")
-		fmt.Println()
-		fmt.Print("  可用预设: ")
-		for i, t := range ProviderTemplates {
-			if i > 0 {
-				fmt.Print(", ")
-			}
-			fmt.Print(t.Name)
-		}
-		fmt.Println()
 		return nil
 	}
 
 	parts := strings.Fields(args)
-	if len(parts) == 1 {
-		// Preset mode
-		tmpl := FindTemplate(parts[0])
-		if tmpl == nil {
-			color.Red("  未找到预设: %s", parts[0])
-			return nil
-		}
-		if err := ctx.AddProvider(ProviderConfigInput{
-			Name:     tmpl.Name,
-			Protocol: tmpl.Protocol,
-			BaseURL:  tmpl.BaseURL,
-			Model:    tmpl.Models[0],
-		}); err != nil {
-			return err
-		}
-		color.Green("  ✓ 已添加: %s / %s [%s]", tmpl.Name, tmpl.Models[0], tmpl.Protocol)
-		if tmpl.HasAPIKey {
-			color.Yellow("  提示: 使用 /config key %s <api_key> 设置 API Key", tmpl.Name)
-		}
-		return nil
-	}
-
 	if len(parts) < 4 {
 		color.Red("  参数不足: /config add <name> <protocol> <base_url> <model> [api_key]")
 		return nil
@@ -2278,6 +2212,48 @@ func cmdSkills(ctx cliContext, args string) error {
 	return nil
 }
 
+func parseSkillCommandArgs(args string) (name, prompt string, err error) {
+	parts := strings.Fields(strings.TrimSpace(args))
+	if len(parts) == 0 {
+		return "", "", errors.New("用法: /skill <名称> [任务描述]")
+	}
+	name = parts[0]
+	prompt = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args), name))
+	if prompt == "" {
+		prompt = fmt.Sprintf("请使用 Skill「%s」提供帮助", name)
+	}
+	return name, prompt, nil
+}
+
+func matchInstalledSkillCommand(input string, installed []string) (name, prompt string, ok bool) {
+	trimmed := strings.TrimSpace(input)
+	if !strings.HasPrefix(trimmed, "/") {
+		return "", "", false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(trimmed, "/"), " ", 2)
+	name = strings.TrimSpace(parts[0])
+	for _, candidate := range installed {
+		if candidate != name {
+			continue
+		}
+		if len(parts) == 2 {
+			prompt = strings.TrimSpace(parts[1])
+		}
+		if prompt == "" {
+			prompt = fmt.Sprintf("请使用 Skill「%s」提供帮助", name)
+		}
+		return name, prompt, true
+	}
+	return "", "", false
+}
+
+// cmdSkillUsage 供直接 handler 测试与帮助工具使用；REPL 会拦截 /skill 以复用正常流式渲染。
+// cmdSkillUsage supports handler tests and help; the REPL intercepts /skill for streaming rendering.
+func cmdSkillUsage(_ cliContext, args string) error {
+	_, _, err := parseSkillCommandArgs(args)
+	return err
+}
+
 func cmdRules(ctx cliContext, args string) error {
 	names, err := ctx.ListRules()
 	if err != nil {
@@ -2554,6 +2530,290 @@ func cmdReasoning(ctx cliContext, args string) error {
 	}
 	color.Green("  ✓ 推理强度已设为: %s", actual)
 	return nil
+}
+
+func cmdQueue(ctx cliContext, args string) error {
+	sessionID := ctx.GetCurrentSessionID()
+	if sessionID == "" {
+		return fmt.Errorf("当前没有活动会话")
+	}
+	args = strings.TrimSpace(args)
+	if args == "" || strings.EqualFold(args, "list") || strings.EqualFold(args, "ls") {
+		return printTurnQueue(ctx, sessionID)
+	}
+
+	parts := strings.SplitN(args, " ", 2)
+	action := strings.ToLower(parts[0])
+	rest := ""
+	if len(parts) == 2 {
+		rest = strings.TrimSpace(parts[1])
+	}
+	switch action {
+	case "add":
+		if rest == "" {
+			color.HiBlack("  用法: /queue add <消息>")
+			return nil
+		}
+		now := time.Now()
+		item, err := ctx.EnqueueTurnQueueItem(context.Background(), sessionID, httpcli.TurnQueuePayload{
+			Message:     rest,
+			ClientMsgID: now.UnixMilli()*1000 + now.UnixNano()%1000,
+			Style:       ctx.StyleName(),
+			WorkMode:    ctx.ModeName(),
+			Provider:    ctx.GetCurrentProvider(),
+			Model:       ctx.GetCurrentModel(),
+		})
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已加入队列 #%d", item.ID)
+		color.HiBlack("    使用 /queue run 按顺序发送")
+		return nil
+	case "edit":
+		editArgs := strings.SplitN(rest, " ", 2)
+		if len(editArgs) != 2 || strings.TrimSpace(editArgs[1]) == "" {
+			color.HiBlack("  用法: /queue edit <id> <消息>")
+			return nil
+		}
+		queueID, err := parseQueueID(editArgs[0])
+		if err != nil {
+			color.HiBlack("  用法: /queue edit <id> <消息>")
+			return nil
+		}
+		item, err := ctx.EditTurnQueueItem(context.Background(), sessionID, queueID, strings.TrimSpace(editArgs[1]))
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已更新队列 #%d", item.ID)
+		return nil
+	case "run", "drain":
+		if rest != "" {
+			color.HiBlack("  用法: /queue run")
+			return nil
+		}
+		return runTurnQueue(ctx, sessionID)
+	case "retry":
+		queueID, err := parseQueueID(rest)
+		if err != nil {
+			color.HiBlack("  用法: /queue retry <id>")
+			return nil
+		}
+		item, err := ctx.RetryTurnQueueItem(context.Background(), sessionID, queueID)
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已重新排队 #%d", item.ID)
+		return nil
+	case "delete", "remove", "rm", "del":
+		queueID, err := parseQueueID(rest)
+		if err != nil {
+			color.HiBlack("  用法: /queue delete <id>")
+			return nil
+		}
+		item, err := ctx.DeleteTurnQueueItem(context.Background(), sessionID, queueID)
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已删除队列 #%d", item.ID)
+		return nil
+	case "clear":
+		if rest != "" {
+			color.HiBlack("  用法: /queue clear")
+			return nil
+		}
+		count, err := ctx.ClearTurnQueue(context.Background(), sessionID)
+		if err != nil {
+			return err
+		}
+		color.Green("  ✓ 已清空 %d 条排队消息", count)
+		return nil
+	default:
+		color.HiBlack("  用法: /queue [list|add|edit|run|retry|delete|clear]")
+		return nil
+	}
+}
+
+func printTurnQueue(ctx cliContext, sessionID string) error {
+	items, err := ctx.ListTurnQueueItems(context.Background(), sessionID)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		color.HiBlack("  当前会话没有排队消息")
+		return nil
+	}
+	fmt.Println()
+	color.Cyan("  排队消息 (%d)", len(items))
+	for _, item := range items {
+		status := turnQueueStatusLabel(item.Status)
+		fmt.Printf("    #%-5d [%-6s] %s\n", item.ID, status, compactTurnQueueMessage(item.Message))
+		if item.AttachmentCount > 0 {
+			color.HiBlack("             %d 个附件", item.AttachmentCount)
+		}
+		if item.Error != "" {
+			color.Red("             %s", item.Error)
+		}
+	}
+	fmt.Println()
+	return nil
+}
+
+func runTurnQueue(ctx cliContext, sessionID string) error {
+	for {
+		items, err := ctx.ListTurnQueueItems(context.Background(), sessionID)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			color.Green("  ✓ 队列已发送完毕")
+			return nil
+		}
+		head := items[0]
+		if head.Status == "failed" {
+			color.HiBlack("  队列暂停在失败项 #%d；先使用 /queue retry %d 或 /queue delete %d", head.ID, head.ID, head.ID)
+			return nil
+		}
+		if head.Status == "running" {
+			color.HiBlack("  队列项 #%d 正在由其他客户端发送", head.ID)
+			return nil
+		}
+
+		claimed, err := ctx.ClaimNextTurnQueueItem(context.Background(), sessionID)
+		if err != nil {
+			return err
+		}
+		if claimed.Payload == nil {
+			_, _, failErr := failQueueRun(ctx, sessionID, claimed.ID, "queued payload is missing")
+			return failErr
+		}
+		payload := claimed.Payload
+		req := queuedTurnChatRequest(*payload, ctx, sessionID)
+		ui := NewChatUI(req.Provider, req.Model)
+		streamCtx := context.Background()
+		ui.SetQuestionHandler(sessionID, func(sid string, answers map[string]string) error {
+			return ctx.SubmitQuestionAnswer(streamCtx, sid, answers)
+		})
+		ui.SetConfirmHandler(sessionID, func(sid string, approved bool, action string) error {
+			return ctx.SubmitToolConfirm(streamCtx, sid, approved, action)
+		})
+		ui.PrintBannerHeader(payload.Message)
+
+		stream, err := ctx.ChatQueuedTurn(streamCtx, sessionID, *payload)
+		if err != nil {
+			_, _, _ = failQueueRun(ctx, sessionID, claimed.ID, err.Error())
+			return err
+		}
+		completed := false
+		failure := ""
+		for chunk := range stream {
+			ui.Handle(chunk)
+			if chunk.Error != "" {
+				failure = chunk.Error
+			}
+			if chunk.Done && chunk.Error == "" {
+				completed = true
+			}
+		}
+		ui.Finish()
+		if failure != "" || !completed {
+			if failure == "" {
+				failure = "queued turn did not complete"
+			}
+			_, _, err = failQueueRun(ctx, sessionID, claimed.ID, failure)
+			return err
+		}
+		if _, err := ctx.CompleteTurnQueueItem(context.Background(), sessionID, claimed.ID); err != nil {
+			return err
+		}
+	}
+}
+
+func failQueueRun(ctx cliContext, sessionID string, queueID int64, message string) (httpcli.TurnQueueItem, bool, error) {
+	item, err := ctx.FailTurnQueueItem(context.Background(), sessionID, queueID, message)
+	if err == nil {
+		color.Red("  ✗ 队列 #%d 发送失败：%s", queueID, message)
+	}
+	return item, err == nil, err
+}
+
+func queuedTurnChatRequest(payload httpcli.TurnQueuePayload, ctx cliContext, sessionID string) agent.ChatRequest {
+	provider := strings.TrimSpace(payload.Provider)
+	if provider == "" {
+		provider = ctx.GetCurrentProvider()
+	}
+	model := strings.TrimSpace(payload.Model)
+	if model == "" {
+		model = ctx.GetCurrentModel()
+	}
+	styleName := strings.TrimSpace(payload.Style)
+	if styleName == "" {
+		styleName = ctx.StyleName()
+	}
+	modeName := strings.TrimSpace(payload.WorkMode)
+	if modeName == "" {
+		modeName = ctx.ModeName()
+	}
+	attachments := make([]agent.Attachment, 0, len(payload.Attachments))
+	for _, attachment := range payload.Attachments {
+		data := attachment.Data
+		if data == "" {
+			data = attachment.Text
+		}
+		attachments = append(attachments, agent.Attachment{
+			ID: attachment.ID, UploadID: attachment.UploadID, Name: attachment.Name,
+			Size: attachment.Size, Kind: attachment.Kind, MIME: attachment.MIME,
+			Data: data, URL: attachment.URL,
+		})
+	}
+	useImageRecognition := payload.UseImageRecognition != nil && *payload.UseImageRecognition
+	subAgentEnabled := payload.SubAgentModelEnabled != nil && *payload.SubAgentModelEnabled
+	return agent.ChatRequest{
+		SessionID:           sessionID,
+		Style:               style.Style(styleName),
+		WorkMode:            config.WorkMode(modeName).Normalize(),
+		Provider:            provider,
+		Model:               model,
+		Messages:            []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: payload.Message}},
+		Attachments:         attachments,
+		UseImageRecognition: useImageRecognition,
+		SubagentModel: agent.SubagentModelPreference{
+			Enabled: subAgentEnabled, Provider: payload.SubAgentProvider, Model: payload.SubAgentModel,
+		},
+		ClientMsgID:  payload.ClientMsgID,
+		SkillContext: payload.SkillContext,
+		ActiveSkills: append([]string(nil), payload.ActiveSkills...),
+		TodoMode:     agent.NormalizeTodoMode(payload.TodoMode),
+	}
+}
+
+func parseQueueID(value string) (int64, error) {
+	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("invalid queue id")
+	}
+	return id, nil
+}
+
+func compactTurnQueueMessage(message string) string {
+	message = strings.Join(strings.Fields(message), " ")
+	runes := []rune(message)
+	if len(runes) <= 80 {
+		return message
+	}
+	return string(runes[:77]) + "..."
+}
+
+func turnQueueStatusLabel(status string) string {
+	switch status {
+	case "queued":
+		return "等待"
+	case "running":
+		return "发送中"
+	case "failed":
+		return "失败"
+	default:
+		return status
+	}
 }
 
 func cmdRegen(ctx cliContext, args string) error {

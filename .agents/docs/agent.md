@@ -15,8 +15,11 @@ Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
 | `agent.go` | ReAct 循环、LLM 调用编排、工具派发、事件流控制 | `ChatWithTools()`, `Agent`, `ReloadWithRootIfChanged()` |
-| `parts.go` | 助手消息的结构化 parts 累加器（thinking/tool/sub_agent） | `partsAccumulator`, `snapshotStructural()` |
+| `parts.go` | 助手消息的结构化 parts 累加器（thinking/skill/tool/sub_agent） | `partsAccumulator`, `snapshotStructural()` |
+| `skills.go` | 显式 Skill 加载、依赖合成和生命周期事件 | `loadActiveSkills()` |
 | `attachment.go` | 用户附件（图片/文件）扩展为 ChatMessage | `AttachmentResolver` |
+| `runtime_context.go` | 可持久化的动态上下文快照，变化时仅追加 | `appendRuntimeContext()`, `restoreRuntimeContexts()` |
+| `usage.go` | 单次请求 usage 去重、跨请求累计 | `requestUsage` |
 
 ## 核心概念
 
@@ -24,16 +27,17 @@ Agent 模块是 P-Chat 的核心业务逻辑层，实现 **ReAct 式工具调用
 
 ```
 for round := 1; maxRounds==0 || round<=maxRounds; round++ {
-    1. 构建系统提示词 (style + work_mode + AGENTS + rules + skills)
-    2. 规范化消息 (normalizeToolResults — DeepSeek 兼容)
+    1. 构建稳定系统提示词；动态上下文作为末尾快照，变化时才追加
+	1a. 加载 ChatRequest.ActiveSkills，并先发送可见 skill:start 事件
+    2. 检查工具调用配对；必要时在请求前压缩历史
     3. 调用 LLM Stream → 获取内容/思考/工具调用
     4. 解析工具调用 (原生 tool_calls 或 markdown ```tool_call 块)
     5. 清理 markdown tool_call 块中的文本内容
     6. 若无工具调用 → 完成，退出
     7. 并行执行工具 (goroutine + eventCh 64)
     8. 将工具结果追加到消息列表
-    9. DeepSeek 兼容：工具结果角色 → User
-    10. persistAssistant() — 持久化带 parts 的助手消息
+    9. 保留工具调用、结果的原生角色和顺序
+    10. 按助手文本 → 工具调用 → 工具结果顺序持久化，保留 parts 与原始 thinking
     11. 下一个循环轮次
 }
 ```
@@ -131,22 +135,38 @@ forwarder goroutine:
 
 - **text** — 文本增量追加
 - **thinking** — 思考增量追加（带 streaming flag）
+- **skill** — Skill 加载卡片（start/ready/error，含名称、scope、依赖和错误）
 - **tool** — 工具调用卡片（start/ok/err 状态）
 - **sub_agent** — 嵌套子代理卡片（start/ok/err 状态，含内嵌 parts）
 - **Done** — 清除所有 thinking streaming flag
 
-`persistAssistant()` 调用 `snapshotStructural()` 将 part 持久化到 SQLite（工具和子代理 part → meta["parts"] JSON）。
+`persistAssistant()` 调用 `snapshotStructural()` 将 part 持久化到 SQLite（Skill、工具和子代理 part → meta["parts"] JSON）。
 
-### 3.5 图片提交与历史回看边界
+### 3.1 Skill 调用可见性与加载边界
 
-Agent 在 `ChatWithTools()` 中用 `HistoryMessageCount` 区分“已入库历史前缀”和“当前轮后缀”，图片提交遵循以下规则：
+- `ChatRequest.ActiveSkills` 是 GUI/CLI 显式 `/skill` 激活入口，只传名称，不传整份正文。
+- Agent 在任何 Skill 指令进入 LLM 上下文前先发 `skill:start`，用户看到固定文案
+  `当前调用 Skill：<name>`；成功后发 `ready`，失败发 `error`。
+- 模型自主调用 `skill(action=load)` 时，工具结果带 `SkillInvocation` 元数据；派发层在把
+  工具结果追加到下一轮 LLM 消息前发送同样的 start/ready/error 生命周期。
+- 单回合同名 Skill 去重；依赖正文会随主 Skill 一起加载，但主卡片的 `dependencies[]`
+  明确列出依赖，不制造多个“当前调用”提示。
+
+### 3.5 附件提交、读取与历史回看边界
+
+Agent 在 `ChatWithTools()` 中用 `HistoryMessageCount` 区分“已入库历史前缀”和“当前轮后缀”，附件遵循以下规则：
 
 - 当前轮新上传图片：通过 `ExpandAttachmentsCM()` 展开；普通多模态模式下作为 `TypeImage` 直接提交给当前模型；开启 `use_image_recognition` 时先由识图模型 preflight，主模型只拿识别文本。
 - 重答目标图片：`buildRegenerateMessages()` 会把目标用户消息后面紧跟的图片并入当前轮后缀，因此按当前轮图片处理，会重新提交或重新识别。
-- 历史图片：不再作为原图 payload 反复提交给主模型，`replaceHistoricalImagesWithPlaceholders()` 会把它替换成 system 占位。若有 `upload_id` 且存在可用视觉能力，占位提示 LLM 调 `image_recognize`；否则提示用户重新上传或切换/配置视觉模型。
-- 图像识别工具：没有当前轮图片 preflight 时，历史图片后续追问可以暴露 `image_recognize`。会话开启专门识图配置时用配置模型；未开启时，如果当前对话模型支持视觉，则工具 fallback 到当前 provider/model。
+- 历史图片：不再作为原图 payload 反复提交给主模型，`replaceHistoricalImagesWithPlaceholders()` 会把它替换成 system 占位。若有 `upload_id` 且存在可用视觉能力，占位提示 LLM 调 `media_recognize`；否则提示用户重新上传或切换/配置视觉模型。
+- 媒体识别工具：没有当前轮图片 preflight 时，历史图片后续追问可以暴露 `media_recognize`。会话开启专门识图配置时用配置模型；未开启时，如果当前对话模型支持视觉，则图片 fallback 到当前 provider/model。音频、视频根据媒体类型使用各自配置路由。
+- 子代理识图：父对话存在图片引用时，`task` 工具 context 会携带父会话图片解析器，子代理内部可通过 `media_recognize` 复用父会话图片。会话开启专门识图配置时子代理复用该配置模型，否则仅在子代理当前模型支持视觉时暴露识图能力。
+- 浏览器截图：`browser_screenshot` 在当前模型支持视觉或会话启用专门识图配置时可见。截图字节只保留在当前 ReAct 轮次，Agent 同时将其实体化为会话归属的 `asset_id` 并在工具 part 中持久化引用；启用专门识图配置时先转为事实观察文本，未启用时按多模态图片 payload 注入当前轮次。后续轮次只通过 `media_recognize(input_ref)` 按需读取资产，不重复保存 base64 图片行。
+- 当前轮音频/视频：当前模型明确声明对应输入能力时原生提交；否则仅在会话选择了可用媒体路由时保留显示行并给出 `media_recognize(upload_id)` 引用。两边都不可用时只告知模型存在附件，不允许假装识别。
+- 历史媒体：`replaceAttachmentReferences()` 将历史图片、视频、音频统一替换为不含二进制的 system 引用，根据可用能力指向 `media_recognize`；历史请求不重复携带大媒体 payload。
+- 文档与普通文件：可确定提取的文本、源码、PDF、Word、Excel、PowerPoint 统一保存为 `TypeFile + upload_id` 显示行，并给模型 `read_attachment(upload_id)` 引用；工具执行前再次校验上传属于当前会话。未知二进制只生成“不支持解析”的说明，不复制到项目目录，也不作为原始字节提交给模型。
 
-这保证“围绕同一张历史图片连续纠正/追问”可以通过工具继续识别，同时避免每一轮都把历史图片二进制塞进 LLM 上下文。
+这保证围绕历史媒体或文档连续追问时可以按需调用工具，同时避免每一轮都把附件二进制塞进 LLM 上下文。
 
 ### 4. 计划模式 (Plan Mode)
 
@@ -161,12 +181,25 @@ Agent 在 `ChatWithTools()` 中用 `HistoryMessageCount` 区分“已入库历�
 
 - `style` 只表示说话风格，以及该风格对应的记忆内容。`style=off` 时，`buildStyleBlock()` 返回空，`getStyleMemory()` 也返回空。
 - `work_mode` 表示任务侧重点。`coding` 偏向读写代码、调试、测试、构建、git、code review；`daily` 偏向文档、邮件、会议纪要、摘要、知识检索和计划整理。
-- `buildStaticSystemPrompt()` 的静态段拼装顺序是：`buildStyleBlock()` → `buildWorkModeBlock()` → AGENTS.md → rules → skills → tools → working dir → language。
+- `buildStaticSystemPrompt()` 的静态段拼装顺序是：应用上下文规则 → tools（通用规则在前）→ `buildStyleBlock()` → `buildWorkModeBlock()` → AGENTS.md → rules → Skill catalog 索引 → working dir → host runtime → language。
 - 静态 prompt cache 的 signature 包含 `work_mode`，所以单会话切换 coding/daily 会触发新的系统 prompt。
+- 主代理 working dir 仅注入一次；只有 `PromptOv` 覆盖静态提示词时才另行补充。
+
+### 4.6 动态上下文与供应商缓存
+
+- Todo、知识库索引、显式激活 Skill、风格记忆和最近媒体摘要不再拼入首条 system 消息。它们使用 `pchat_context_<name>` 命名快照，在历史末尾追加，内容未变时不重复追加。
+- 快照仍是内部 `RoleSystem` 消息，带 `origin=runtime_context`、`ui_hidden=true`、`SubmitToLLM=1`，沿用现有消息元数据持久化。相同名字以最新快照为准；清空时追加显式撤销说明。
+- OpenAI adapter 在原位置提交带名称的 system 上下文；Anthropic adapter 将其包装为原位置的 user 内容块，避免把动态内容重新提到顶层 system。两者都使用 `application_context` 包装。
+- Todo 每轮检查，但只在状态或检查点变化时追加。自动压缩后恢复每类最新快照；压缩在下一次请求前执行，避免丢失尚未入库的模型输出。
+- 原生工具调用按流式 `index` 排序，数据库回放保持助手文本、调用和结果顺序。服务端仅对缺失调用记录的旧 `task` 结果执行角色兼容回退。
+- 这是请求前缀稳定性优化，不是本地答案缓存。切模型、工具集合/权限变化、项目规则更新和历史压缩仍可能改变前缀；不能以扩大工具权限来追求命中率。
+- 回归入口：`prompt_cache_test.go` 覆盖 Todo 连续更新与数据库重载后的请求前缀一致性；`todo_guard_test.go` 覆盖完成和清空状态。
 
 ### 5. DeepSeek 兼容性
 
-`normalizeToolResults()` (`agent.go:1531`) 将 ToolCall 类型消息移除，ToolResult 角色改为 User。这是 DeepSeek 模型接受工具结果的必要条件。
+DeepSeek 官方接口保留原生工具调用/结果配对。旧 `normalizeToolResults()` 仅作为已验证的特殊代理兼容回退，目前 `needsNormalizedToolResults()` 不对任何供应商启用。不要为 DeepSeek 全局抹掉工具角色。
+
+DeepSeek 带工具请求从助手消息的 `Meta["thinking"]` 回传原始推理内容，包括跨用户回合的历史文本助手消息；详见 [llm.md](llm.md)。
 
 ### 6. 卡死循环保护
 
@@ -282,3 +315,13 @@ dynamic spec 走 `dynamic.SetSpecs(all)` 在 watcher 每次 reload
 - [subagent.md](subagent.md) — 子代理系统（task 工具）
 - [memory.md](memory.md) — 消息持久化
 - [server.md](server.md) — HTTP API + SSE
+### 3.6 媒体生成授权与提示词
+
+`ChatRequest` 只携带会话启用的 generation operations。Agent 先收窄工具 schema，再构造
+请求级 `generation.Access`；每项能力的可信 dispatch 始终从应用级 `generation.defaults`
+解析，API key 从不进入模型参数。每个工具 context 都携带这份不可变授权。
+
+当前轮附件只把可用的不透明 ID 作为 system 指引公开给模型。对话 LLM 根据用户要求和
+已有上下文直接编写最终生成提示词；需要理解附件时，可先通过视觉能力或
+`media_recognize` 获得事实观察。没有会话级提示词增强或模型覆盖，handler 仍会在厂商
+请求前再次验证能力开关和附件归属。

@@ -57,7 +57,7 @@
 
 执行时子代理强制 `permission_level=ask`，不能弹 confirm。项目内只读和公网 `web_fetch`（GET / POST）可跑；写、执行、私网 URL、提问打回父对话。
 
-内置 `explore` / `plan`：`read_file`、`list_files`、`grep`、`read_docx`、`read_pdf`。`general-purpose` 额外可 `todo_write` / `web_search` / 公网 `web_fetch`。
+内置 `explore` / `plan`：`read_file`、`list_files`、`grep`，其中 `read_file` 自动提取支持的 PDF/Office 文档。`general-purpose` 额外可 `todo_write` / `web_search` / 公网 `web_fetch`；有父会话图片上下文时可使用 `media_recognize`。
 
 ### 5. 缓存
 

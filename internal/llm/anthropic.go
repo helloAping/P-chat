@@ -10,19 +10,28 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/p-chat/pchat/internal/requestheader"
 	"github.com/p-chat/pchat/internal/trace"
 )
 
 const (
-	anthropicVersion = "2023-06-01"
-	anthropicDefaultBaseURL = "https://api.anthropic.com"
+	anthropicVersion        = "2023-06-01"
+	anthropicDefaultBaseURL = "https://api.anthropic.com/v1/messages"
 )
 
 type AnthropicClient struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	httpClient *http.Client
+	baseURL       string
+	apiKey        string
+	model         string
+	customHeaders map[string]string
+	httpClient    *http.Client
+}
+
+// WithCustomHeaders 设置供应商级请求头模板并返回当前客户端。
+// WithCustomHeaders sets provider-level header templates and returns the client.
+func (c *AnthropicClient) WithCustomHeaders(headers map[string]string) *AnthropicClient {
+	c.customHeaders = requestheader.CloneTemplates(headers)
+	return c
 }
 
 func NewAnthropicClient(baseURL, apiKey, model string) *AnthropicClient {
@@ -64,9 +73,10 @@ func (b anthropicBlocksRaw) MarshalJSON() ([]byte, error) {
 }
 
 type anthropicContentBlock struct {
-	Type   string                   `json:"type"`
-	Text   string                   `json:"text,omitempty"`
-	Source *anthropicContentSource  `json:"source,omitempty"`
+	Type     string                  `json:"type"`
+	Text     string                  `json:"text,omitempty"`
+	Thinking string                  `json:"thinking,omitempty"`
+	Source   *anthropicContentSource `json:"source,omitempty"`
 	// Tool use fields
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
@@ -102,13 +112,13 @@ type anthropicTool struct {
 }
 
 type anthropicResponse struct {
-	ID      string                 `json:"id"`
-	Type    string                 `json:"type"`
-	Role    string                 `json:"role"`
-	Content []anthropicContentBlock `json:"content"`
-	Model   string                 `json:"model"`
-	StopReason string             `json:"stop_reason"`
-	Usage   anthropicUsage         `json:"usage"`
+	ID         string                  `json:"id"`
+	Type       string                  `json:"type"`
+	Role       string                  `json:"role"`
+	Content    []anthropicContentBlock `json:"content"`
+	Model      string                  `json:"model"`
+	StopReason string                  `json:"stop_reason"`
+	Usage      anthropicUsage          `json:"usage"`
 }
 
 type anthropicUsage struct {
@@ -118,17 +128,17 @@ type anthropicUsage struct {
 
 // Stream event types
 type anthropicStreamEvent struct {
-	Type    string          `json:"type"`
-	Message json.RawMessage `json:"message,omitempty"`
-	Index   int             `json:"index,omitempty"`
-	Delta   json.RawMessage `json:"delta,omitempty"`
+	Type         string          `json:"type"`
+	Message      json.RawMessage `json:"message,omitempty"`
+	Index        int             `json:"index,omitempty"`
+	Delta        json.RawMessage `json:"delta,omitempty"`
 	ContentBlock json.RawMessage `json:"content_block,omitempty"`
 }
 
 type anthropicContentBlockDelta struct {
-	Type     string `json:"type"`
-	Index    int    `json:"index,omitempty"`
-	Delta    struct {
+	Type  string `json:"type"`
+	Index int    `json:"index,omitempty"`
+	Delta struct {
 		Type     string `json:"type"`
 		Text     string `json:"text,omitempty"`
 		Thinking string `json:"thinking,omitempty"`
@@ -223,8 +233,7 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 			return
 		}
 
-		url := strings.TrimRight(c.baseURL, "/") + "/v1/messages"
-		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimSpace(c.baseURL), bytes.NewReader(body))
 		if err != nil {
 			ch <- StreamChunk{Err: err}
 			return
@@ -241,6 +250,10 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 		// alongside the rest of the request.
 		if tid := trace.FromContext(ctx); tid != "" {
 			req.Header.Set("X-Trace-Id", tid)
+		}
+		if err := requestheader.Apply(ctx, req.Header, c.customHeaders); err != nil {
+			ch <- StreamChunk{Err: fmt.Errorf("apply provider custom headers: %w", err)}
+			return
 		}
 
 		resp, err := c.httpClient.Do(req)
@@ -416,8 +429,7 @@ func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages [
 		return "", err
 	}
 
-	url := strings.TrimRight(c.baseURL, "/") + "/v1/messages"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimSpace(c.baseURL), bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -425,6 +437,12 @@ func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages [
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.apiKey)
 	req.Header.Set("anthropic-version", anthropicVersion)
+	if tid := trace.FromContext(ctx); tid != "" {
+		req.Header.Set("X-Trace-Id", tid)
+	}
+	if err := requestheader.Apply(ctx, req.Header, c.customHeaders); err != nil {
+		return "", fmt.Errorf("apply provider custom headers: %w", err)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

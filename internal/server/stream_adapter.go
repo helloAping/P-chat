@@ -11,7 +11,7 @@ import (
 // toolStatusFromChunkStep was the server-side mirror of
 // internal/agent.toolStatusFromStep. Removed in T06 — both
 // the parts accumulator and the wire mapper now call
-// agent.ToolStatusFromStep so the two stay in lockstep.
+// agent.ToolStatusFromResult so the two stay in lockstep.
 
 func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEvent {
 	ev := StreamEvent{
@@ -69,6 +69,16 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolConfirmJSON = chunk.ToolConfirmJSON
 		return ev
 	}
+	if chunk.SkillName != "" {
+		ev.Type = "skill"
+		ev.SkillName = chunk.SkillName
+		ev.SkillStatus = chunk.SkillStatus
+		ev.SkillScope = chunk.SkillScope
+		ev.SkillSource = chunk.SkillSource
+		ev.SkillDependencies = append([]string(nil), chunk.SkillDependencies...)
+		ev.SkillError = chunk.SkillError
+		return ev
+	}
 	if chunk.Error != "" {
 		ev.Type = "error"
 		ev.Error = chunk.Error
@@ -97,6 +107,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.ToolCallStatus = chunk.ToolCallStatus
 		ev.ToolSummary = chunk.ToolSummary
 		ev.ToolChangedPaths = chunk.ToolChangedPaths
+		ev.ToolContextRefs = chunk.ToolContextRefs
 		ev.ToolRetryable = chunk.ToolRetryable
 		ev.ToolRequiresUser = chunk.ToolRequiresUser
 		ev.ToolNextAction = chunk.ToolNextAction
@@ -105,7 +116,7 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		// status name can't accidentally match. See
 		// internal/agent/parts.go::ToolStatusFromStep for the
 		// single source of truth.
-		ev.ToolStatus = agent.ToolStatusFromStep(chunk.Step, chunk.ToolError)
+		ev.ToolStatus = agent.ToolStatusFromResult(chunk.ToolCallStatus, chunk.Step, chunk.ToolError)
 		return ev
 	}
 	if chunk.Thinking != "" {

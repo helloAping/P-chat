@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,6 +27,7 @@ import (
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
+	"github.com/p-chat/pchat/runtimeprofile"
 )
 
 // streamRecorder wraps httptest.ResponseRecorder with a CloseNotify
@@ -146,6 +150,96 @@ func TestHealth(t *testing.T) {
 	}
 	if body["status"] != "ok" {
 		t.Errorf("status = %v, want ok", body["status"])
+	}
+}
+
+func TestHealthIdentifiesRuntimeProfileAndInstance(t *testing.T) {
+	s, _ := newTestServer(t)
+	profile, err := runtimeprofile.Resolve(filepath.Join(t.TempDir(), ".p-chat"), "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Handler().SetRuntimeIdentity(profile, "instance-test")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var body struct {
+		Status      string `json:"status"`
+		ProfileID   string `json:"profile_id"`
+		ProfileName string `json:"profile_name"`
+		InstanceID  string `json:"instance_id"`
+		PID         int    `json:"pid"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ProfileID != profile.ID || body.ProfileName != "dev" {
+		t.Fatalf("health profile = (%q, %q), want (%q, dev)", body.ProfileID, body.ProfileName, profile.ID)
+	}
+	if body.InstanceID != "instance-test" {
+		t.Fatalf("instance_id = %q, want instance-test", body.InstanceID)
+	}
+	if body.PID != os.Getpid() {
+		t.Fatalf("pid = %d, want %d", body.PID, os.Getpid())
+	}
+}
+
+func TestRunListenerServesOnAlreadyOwnedEphemeralPort(t *testing.T) {
+	s, _ := newTestServer(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Handler().SetListenAddr(listener.Addr().String())
+
+	done := make(chan error, 1)
+	go func() { done <- s.RunListener(listener) }()
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/api/v1/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunListener returned %v after shutdown", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunListener did not stop after shutdown")
+	}
+}
+
+func TestRunListenerWrapsListenerFailure(t *testing.T) {
+	s, _ := newTestServer(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.RunListener(listener)
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("RunListener error = %v, want wrapped net.ErrClosed", err)
+	}
+	if !strings.Contains(err.Error(), "serve HTTP on") {
+		t.Fatalf("RunListener error = %q, want serve context", err)
 	}
 }
 
@@ -286,6 +380,286 @@ func TestListSessions(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&body)
 	if len(body.Sessions) < 2 {
 		t.Errorf("expected >= 2 sessions, got %d", len(body.Sessions))
+	}
+}
+
+func TestCreateSession_ReuseEmptyWithinProject(t *testing.T) {
+	s, _ := newTestServer(t)
+	projectPath := filepath.Join(t.TempDir(), "repo")
+
+	first, status := postSessionBody(t, s, map[string]any{
+		"project_path": projectPath,
+		"reuse_empty":  true,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201", status)
+	}
+	if first.ConversationState != "blank" {
+		t.Fatalf("first state = %q, want blank", first.ConversationState)
+	}
+
+	second, status := postSessionBody(t, s, map[string]any{
+		"project_path": projectPath,
+		"reuse_empty":  true,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("second status = %d, want 200", status)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second id = %q, want reused %q", second.ID, first.ID)
+	}
+}
+
+func TestCreateSession_ReuseEmptyCreatesAfterUserMessage(t *testing.T) {
+	s, _ := newTestServer(t)
+	projectPath := filepath.Join(t.TempDir(), "repo")
+	first, _ := postSessionBody(t, s, map[string]any{
+		"project_path": projectPath,
+		"reuse_empty":  true,
+	})
+	s.handler.store.AddChatMessageTo(first.ID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "hello",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	if err := s.handler.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, status := postSessionBody(t, s, map[string]any{
+		"project_path": projectPath,
+		"reuse_empty":  true,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", status)
+	}
+	if second.ID == first.ID {
+		t.Fatal("expected a new blank session after the first received a user message")
+	}
+	if second.ConversationState != "blank" {
+		t.Fatalf("second state = %q, want blank", second.ConversationState)
+	}
+}
+
+func TestCreateSession_ReuseEmptyTreatsQueuedTurnAsActive(t *testing.T) {
+	s, _ := newTestServer(t)
+	projectPath := filepath.Join(t.TempDir(), "repo")
+	first, _ := postSessionBody(t, s, map[string]any{
+		"project_path": projectPath,
+		"reuse_empty":  true,
+	})
+	payload := []byte(`{"message":"queued","client_msg_id":12345}`)
+	if _, err := s.handler.store.CreateTurnQueueItem(first.ID, payload, "queued", 12345, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	second, status := postSessionBody(t, s, map[string]any{
+		"project_path": projectPath,
+		"reuse_empty":  true,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", status)
+	}
+	if second.ID == first.ID {
+		t.Fatal("expected a new blank session while the first has a queued turn")
+	}
+
+	got, getStatus := getSessionBody(t, s, first.ID)
+	if getStatus != http.StatusOK {
+		t.Fatalf("get first status = %d, want 200", getStatus)
+	}
+	if got.ConversationState != "active" || got.PendingTurnCount != 1 {
+		t.Fatalf("first activity = state %q pending %d, want active/1", got.ConversationState, got.PendingTurnCount)
+	}
+}
+
+func TestCreateSession_ReuseEmptyNormalizesProjectPath(t *testing.T) {
+	s, _ := newTestServer(t)
+	projectPath := filepath.Join(t.TempDir(), "Repo")
+	first, _ := postSessionBody(t, s, map[string]any{
+		"project_path": projectPath,
+		"reuse_empty":  true,
+	})
+	alternatePath := projectPath + string(os.PathSeparator)
+	if runtime.GOOS == "windows" {
+		alternatePath = strings.ToUpper(projectPath) + string(os.PathSeparator)
+	}
+	second, status := postSessionBody(t, s, map[string]any{
+		"project_path": alternatePath,
+		"reuse_empty":  true,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second id = %q, want reused %q", second.ID, first.ID)
+	}
+}
+
+func TestGenerateSessionTitle_UsesSemanticLLM(t *testing.T) {
+	var calls atomic.Int32
+	var requestBody struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+		Stream bool `json:"stream"`
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/v1/chat/completions" {
+			http.Error(w, "bad path", http.StatusNotFound)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"\"标题：修复缓存失效问题。\""}}]}`)
+	}))
+	defer upstream.Close()
+
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "`+upstream.URL+`/v1"`, 1)
+	s, _ := newTestServerWithConfig(t, cfgJSON)
+	created := createSessionPOST(t, s, "")
+	s.store.AddChatMessageTo(created.ID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "帮我排查设置缓存失效导致后台频繁重新加载的问题",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	s.store.AddChatMessageTo(created.ID, llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     "问题集中在 settingCache 的失效时机。",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	if err := s.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+created.ID+"/title", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "修复缓存失效问题" {
+		t.Fatalf("title = %q, want 修复缓存失效问题", got.Title)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls.Load())
+	}
+	if requestBody.Stream {
+		t.Fatal("title generation should use non-streaming requests")
+	}
+	joined, _ := json.Marshal(requestBody.Messages)
+	if !strings.Contains(string(joined), "设置缓存失效") {
+		t.Fatalf("title prompt did not include conversation source: %s", joined)
+	}
+}
+
+func TestGenerateSessionTitle_KeepsExistingTitle(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"Should Not Call"}}]}`)
+	}))
+	defer upstream.Close()
+
+	cfgJSON := strings.Replace(richTestConfigJSON, `"base_url": "http://api-convert.08ms.cn/v1"`,
+		`"base_url": "`+upstream.URL+`/v1"`, 1)
+	s, _ := newTestServerWithConfig(t, cfgJSON)
+	created := createSessionPOST(t, s, `{"title":"用户自定义标题"}`)
+	s.store.AddChatMessageTo(created.ID, llm.ChatMessage{Role: llm.RoleUser, Type: llm.TypeText, Content: "hello", MsgType: llm.MsgTypeText, SubmitToLLM: 1})
+	if err := s.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+created.ID+"/title", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "用户自定义标题" {
+		t.Fatalf("title = %q, want existing title", got.Title)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestGenerateSessionTitle_FallsBackWhenLLMUnavailable(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.handler.agent.SetLLM(nil)
+	created := createSessionPOST(t, s, "")
+	s.store.AddChatMessageTo(created.ID, llm.ChatMessage{
+		Role:        llm.RoleUser,
+		Type:        llm.TypeText,
+		Content:     "你好",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	if err := s.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+created.ID+"/title", nil)
+	s.engine.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "日常对话" {
+		t.Fatalf("title = %q, want 日常对话", got.Title)
+	}
+}
+
+func TestSearchMessages_ProjectParamFiltersCurrentProject(t *testing.T) {
+	s, _ := newTestServer(t)
+	projectAPath := filepath.Join(t.TempDir(), "project-a")
+	projectBPath := filepath.Join(t.TempDir(), "project-b")
+
+	global := createSessionPOST(t, s, "")
+	projectA, _ := postSessionBody(t, s, map[string]any{"project_path": projectAPath})
+	projectB, _ := postSessionBody(t, s, map[string]any{"project_path": projectBPath})
+	s.handler.store.AddChatMessageTo(global.ID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from global"})
+	s.handler.store.AddChatMessageTo(projectA.ID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from project a"})
+	s.handler.store.AddChatMessageTo(projectB.ID, llm.ChatMessage{Role: llm.RoleUser, Content: "needle from project b"})
+	if err := s.handler.store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	projectResults := searchMessagesBody(t, s, "needle", projectAPath)
+	if len(projectResults) != 1 || projectResults[0].ConversationID != projectA.ID {
+		t.Fatalf("project search = %+v, want only %s", projectResults, projectA.ID)
+	}
+	globalResults := searchMessagesBody(t, s, "needle", "")
+	if len(globalResults) != 1 || globalResults[0].ConversationID != global.ID {
+		t.Fatalf("global search = %+v, want only %s", globalResults, global.ID)
 	}
 }
 
@@ -1285,6 +1659,55 @@ func createSessionPOST(t *testing.T, s *Server, body string) SessionResponse {
 	return out
 }
 
+func postSessionBody(t *testing.T, s *Server, body map[string]any) (SessionResponse, int) {
+	t.Helper()
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/v1/sessions", bytes.NewReader(data))
+	r.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, r)
+	var out SessionResponse
+	if w.Body.Len() > 0 {
+		_ = json.NewDecoder(w.Body).Decode(&out)
+	}
+	return out, w.Code
+}
+
+func searchMessagesBody(t *testing.T, s *Server, q, projectPath string) []memory.SearchResult {
+	t.Helper()
+	values := url.Values{}
+	values.Set("q", q)
+	values.Set("limit", "10")
+	values.Set("project_path", projectPath)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/search?"+values.Encode(), nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("search status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Results []memory.SearchResult `json:"results"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	return body.Results
+}
+
+func getSessionBody(t *testing.T, s *Server, id string) (SessionResponse, int) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+id, nil))
+	var out SessionResponse
+	if w.Body.Len() > 0 {
+		_ = json.NewDecoder(w.Body).Decode(&out)
+	}
+	return out, w.Code
+}
+
 func patchSession(t *testing.T, s *Server, id, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()
@@ -1331,13 +1754,13 @@ func TestCreateSession_WithPermissionLevel(t *testing.T) {
 func TestCreateSession_WithInheritedMetaFields(t *testing.T) {
 	s, cfg := newTestServer(t)
 	cfg.Vision.Enabled = true
-	got := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o-mini","style":"cute","work_mode":"daily","plan_mode":true,"permission_level":"auto","reasoning_effort":"high","vector_store":"kb-vector","knowledge_base":"docs","auto_continue":false,"todo_long_run_mode":"unlimited","use_image_recognition":true}`)
+	got := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o-mini","style":"cute","work_mode":"daily","plan_mode":true,"permission_level":"auto","reasoning_effort":"high","vector_store":"kb-vector","knowledge_base":"docs","auto_continue":false,"todo_long_run_mode":"unlimited","use_image_recognition":true,"sub_agent_model_enabled":true,"sub_agent_provider":"cs","sub_agent_model":"doubao-pro"}`)
 	t.Cleanup(func() { tool.SetSessionPermissionLevel(got.ID, "") })
 
 	if got.Provider != "openai" || got.Model != "gpt-4o-mini" || got.Style != "cute" || got.WorkMode != "daily" {
 		t.Fatalf("session picker meta = %+v", got)
 	}
-	if !got.PlanMode || got.PermissionLevel != tool.PermissionAuto || got.ReasoningEffort != "high" {
+	if !got.PlanMode || got.TurnModePolicy != "plan" || got.PermissionLevel != tool.PermissionAuto || got.ReasoningEffort != "high" {
 		t.Fatalf("session execution meta = %+v", got)
 	}
 	if got.VectorStore != "kb-vector" || got.KnowledgeBase != "docs" || got.AutoContinue {
@@ -1345,6 +1768,9 @@ func TestCreateSession_WithInheritedMetaFields(t *testing.T) {
 	}
 	if got.TodoLongRunMode != "unlimited" || !got.UseImageRecognition {
 		t.Fatalf("session long-run/vision meta = %+v", got)
+	}
+	if !got.SubAgentModelEnabled || got.SubAgentProvider != "cs" || got.SubAgentModel != "doubao-pro" {
+		t.Fatalf("session sub-agent model meta = %+v", got)
 	}
 	if live := tool.SessionPermissionLevel(got.ID); live != tool.PermissionAuto {
 		t.Fatalf("live permission = %q, want %q", live, tool.PermissionAuto)
@@ -1362,8 +1788,11 @@ func TestCreateSession_WithInheritedMetaFields(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&reloaded); err != nil {
 		t.Fatalf("decode reload: %v", err)
 	}
-	if reloaded.ReasoningEffort != "high" || reloaded.TodoLongRunMode != "unlimited" || !reloaded.UseImageRecognition || reloaded.AutoContinue {
+	if reloaded.TurnModePolicy != "plan" || reloaded.ReasoningEffort != "high" || reloaded.TodoLongRunMode != "unlimited" || !reloaded.UseImageRecognition || reloaded.AutoContinue {
 		t.Fatalf("reloaded meta = %+v", reloaded)
+	}
+	if !reloaded.SubAgentModelEnabled || reloaded.SubAgentProvider != "cs" || reloaded.SubAgentModel != "doubao-pro" {
+		t.Fatalf("reloaded sub-agent model meta = %+v", reloaded)
 	}
 }
 
@@ -1462,6 +1891,155 @@ func TestPatchSession_PermissionLevelUpdatesLiveToolContext(t *testing.T) {
 	}
 	if got := tool.SessionPermissionLevel(sess.ID); got != tool.PermissionAsk {
 		t.Fatalf("live permission after ask = %q, want %q", got, tool.PermissionAsk)
+	}
+}
+
+func TestPatchSession_PlanModePersists(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, `{"plan_mode":false}`)
+
+	w := patchSession(t, s, sess.ID, `{"plan_mode":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	if !got.PlanMode {
+		t.Fatalf("PlanMode = false, want true")
+	}
+	if got.TurnModePolicy != "plan" {
+		t.Fatalf("TurnModePolicy = %q, want plan", got.TurnModePolicy)
+	}
+
+	for k := range s.Handler().meta {
+		delete(s.Handler().meta, k)
+	}
+	w = httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var reloaded SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&reloaded); err != nil {
+		t.Fatalf("decode reload: %v", err)
+	}
+	if !reloaded.PlanMode {
+		t.Fatalf("reloaded PlanMode = false, want true")
+	}
+	if reloaded.TurnModePolicy != "plan" {
+		t.Fatalf("reloaded TurnModePolicy = %q, want plan", reloaded.TurnModePolicy)
+	}
+
+	w = patchSession(t, s, sess.ID, `{"plan_mode":false}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("decode disable: %v", err)
+	}
+	if got.PlanMode {
+		t.Fatalf("PlanMode = true, want false")
+	}
+	if got.TurnModePolicy != "build" {
+		t.Fatalf("TurnModePolicy = %q, want build", got.TurnModePolicy)
+	}
+}
+
+func TestPatchSession_TurnModePolicyPersists(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, `{"turn_mode_policy":"auto"}`)
+	if sess.TurnModePolicy != "auto" || sess.PlanMode {
+		t.Fatalf("created mode = %+v, want auto with plan_mode=false", sess)
+	}
+
+	w := patchSession(t, s, sess.ID, `{"turn_mode_policy":"plan"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	if got.TurnModePolicy != "plan" || !got.PlanMode {
+		t.Fatalf("patched mode = %+v, want plan with plan_mode=true", got)
+	}
+
+	for k := range s.Handler().meta {
+		delete(s.Handler().meta, k)
+	}
+	w = httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var reloaded SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&reloaded); err != nil {
+		t.Fatalf("decode reload: %v", err)
+	}
+	if reloaded.TurnModePolicy != "plan" || !reloaded.PlanMode {
+		t.Fatalf("reloaded mode = %+v, want plan with plan_mode=true", reloaded)
+	}
+}
+
+func TestExecutePlanClearsPlanModeWithoutDuplicatingPlan(t *testing.T) {
+	s, _ := newTestServer(t)
+	sess := createSessionPOST(t, s, `{"provider":"openai","model":"gpt-4o-mini","style":"cute","plan_mode":true}`)
+	const planText = "1. 先梳理；2. 再实现"
+	s.handler.store.AddChatMessageTo(sess.ID, llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     planText,
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+	})
+	if err := s.handler.store.Flush(); err != nil {
+		t.Fatalf("flush plan: %v", err)
+	}
+
+	for k := range s.Handler().meta {
+		delete(s.Handler().meta, k)
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/v1/sessions/"+sess.ID+"/execute-plan", bytes.NewBufferString(`{"plan_text":"`+planText+`"}`))
+	r.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	msgs := s.handler.store.GetChatMessagesFor(sess.ID, 0)
+	count := 0
+	for _, msg := range msgs {
+		if msg.Role == llm.RoleAssistant && msg.Content == planText {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("assistant plan message count = %d, want 1", count)
+	}
+
+	for k := range s.Handler().meta {
+		delete(s.Handler().meta, k)
+	}
+	w = httptest.NewRecorder()
+	s.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var reloaded SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&reloaded); err != nil {
+		t.Fatalf("decode reload: %v", err)
+	}
+	if reloaded.PlanMode {
+		t.Fatalf("PlanMode = true, want false")
+	}
+	if reloaded.TurnModePolicy != "build" {
+		t.Fatalf("TurnModePolicy = %q, want build", reloaded.TurnModePolicy)
+	}
+	if reloaded.Provider != "openai" || reloaded.Model != "gpt-4o-mini" || reloaded.Style != "cute" {
+		t.Fatalf("session meta was not preserved: %+v", reloaded)
 	}
 }
 
@@ -1660,6 +2238,47 @@ func TestPatchSession_PersistsUseImageRecognition(t *testing.T) {
 	}
 }
 
+func TestPatchSession_PersistsSubAgentModel(t *testing.T) {
+	srv, _ := newTestServer(t)
+	sess := createSessionPOST(t, srv, "")
+	w := patchSession(t, srv, sess.ID, `{"sub_agent_model_enabled":true,"sub_agent_provider":"cs","sub_agent_model":"doubao-pro"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var got SessionResponse
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.SubAgentModelEnabled || got.SubAgentProvider != "cs" || got.SubAgentModel != "doubao-pro" {
+		t.Fatalf("patched sub-agent model meta = %+v", got)
+	}
+
+	for k := range srv.Handler().meta {
+		delete(srv.Handler().meta, k)
+	}
+	w = httptest.NewRecorder()
+	srv.engine.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/sessions/"+sess.ID, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("reload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	got = SessionResponse{}
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.SubAgentModelEnabled || got.SubAgentProvider != "cs" || got.SubAgentModel != "doubao-pro" {
+		t.Fatalf("reloaded sub-agent model meta = %+v", got)
+	}
+}
+
+func TestPatchSession_RejectsBadSubAgentModel(t *testing.T) {
+	srv, _ := newTestServer(t)
+	sess := createSessionPOST(t, srv, "")
+
+	w := patchSession(t, srv, sess.ID, `{"sub_agent_model_enabled":true,"sub_agent_provider":"openai","sub_agent_model":"doubao-pro"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "sub-agent model") {
+		t.Fatalf("body = %s, want sub-agent model validation error", w.Body.String())
+	}
+}
+
 func TestPatchSession_RejectsUseImageRecognitionWhenGloballyDisabled(t *testing.T) {
 	srv, cfg := newTestServer(t)
 	cfg.Vision.Enabled = false
@@ -1671,6 +2290,36 @@ func TestPatchSession_RejectsUseImageRecognitionWhenGloballyDisabled(t *testing.
 	}
 	if !strings.Contains(w.Body.String(), "image recognition is disabled globally") {
 		t.Fatalf("body = %s, want settings path hint", w.Body.String())
+	}
+}
+
+func TestSessionRecognitionCapabilitiesRequireConfiguredRoutes(t *testing.T) {
+	srv, cfg := newTestServer(t)
+	imageAndAudio := []config.MediaKind{config.MediaImage, config.MediaAudio}
+	for providerIndex := range cfg.LLM.Providers {
+		if cfg.LLM.Providers[providerIndex].Name != "openai" {
+			continue
+		}
+		for modelIndex := range cfg.LLM.Providers[providerIndex].Models {
+			if cfg.LLM.Providers[providerIndex].Models[modelIndex].Name == "gpt-4o-mini" {
+				cfg.LLM.Providers[providerIndex].Models[modelIndex].Capabilities.InputModalities = &imageAndAudio
+			}
+		}
+	}
+	cfg.Recognition = config.RecognitionConfig{Routes: map[config.MediaKind]config.RecognitionRoute{
+		config.MediaImage: {Enabled: true, Provider: "openai", Model: "gpt-4o-mini"},
+		config.MediaAudio: {Enabled: true, Provider: "openai", Model: "gpt-4o-mini"},
+		config.MediaVideo: {Enabled: true, Provider: "openai", Model: "gpt-4o-mini"},
+	}}
+
+	sess := createSessionPOST(t, srv, `{"enabled_recognition_capabilities":["image","audio"]}`)
+	if len(sess.EnabledRecognitionCapabilities) != 2 {
+		t.Fatalf("capabilities = %#v", sess.EnabledRecognitionCapabilities)
+	}
+
+	w := patchSession(t, srv, sess.ID, `{"enabled_recognition_capabilities":["video"]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
 	}
 }
 

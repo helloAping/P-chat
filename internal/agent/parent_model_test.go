@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/tool"
 )
 
 // TestParentModel_ContextRoundTrip verifies the (provider,
@@ -21,32 +23,32 @@ func TestParentModel_ContextRoundTrip(t *testing.T) {
 		wantProv, wantModel   string
 	}{
 		{
-			name:      "both set",
+			name:        "both set",
 			setProvider: "openai",
-			setModel:   "gpt-4o-mini",
-			wantProv:   "openai",
-			wantModel:  "gpt-4o-mini",
+			setModel:    "gpt-4o-mini",
+			wantProv:    "openai",
+			wantModel:   "gpt-4o-mini",
 		},
 		{
-			name:      "only model set",
+			name:        "only model set",
 			setProvider: "",
-			setModel:   "claude-haiku-4-5",
-			wantProv:   "",
-			wantModel:  "claude-haiku-4-5",
+			setModel:    "claude-haiku-4-5",
+			wantProv:    "",
+			wantModel:   "claude-haiku-4-5",
 		},
 		{
-			name:      "only provider set",
+			name:        "only provider set",
 			setProvider: "anthropic",
-			setModel:   "",
-			wantProv:   "anthropic",
-			wantModel:  "",
+			setModel:    "",
+			wantProv:    "anthropic",
+			wantModel:   "",
 		},
 		{
-			name:      "neither set — no context value",
+			name:        "neither set — no context value",
 			setProvider: "",
-			setModel:   "",
-			wantProv:   "",
-			wantModel:  "",
+			setModel:    "",
+			wantProv:    "",
+			wantModel:   "",
 		},
 	}
 	for _, tc := range cases {
@@ -75,5 +77,50 @@ func TestParentModel_BothEmptyIsNoOp(t *testing.T) {
 	// can verify the published value is still empty.
 	if _, model := GetParentModel(got); model != "" {
 		t.Errorf("model = %q, want empty", model)
+	}
+}
+
+func TestSubagentModelPreference_ContextRoundTrip(t *testing.T) {
+	base := context.Background()
+	inactive := WithSubagentModelPreference(base, SubagentModelPreference{})
+	if _, ok := GetSubagentModelPreference(inactive); ok {
+		t.Fatal("inactive sub-agent model preference should not be stored")
+	}
+
+	ctx := WithSubagentModelPreference(base, SubagentModelPreference{
+		Enabled:  true,
+		Provider: " openai ",
+		Model:    " gpt-4o-mini ",
+	})
+	got, ok := GetSubagentModelPreference(ctx)
+	if !ok {
+		t.Fatal("sub-agent model preference missing from context")
+	}
+	if got.Provider != "openai" || got.Model != "gpt-4o-mini" {
+		t.Fatalf("preference = %#v, want trimmed provider/model", got)
+	}
+}
+
+func TestSharedImageRecognition_ContextRoundTrip(t *testing.T) {
+	resolver := tool.ImageResolver(func(context.Context, string, string) (tool.ImageRecognitionImage, error) {
+		return tool.ImageRecognitionImage{Name: "x.png"}, nil
+	})
+	base := context.Background()
+	if _, ok := GetSharedImageRecognition(WithSharedImageRecognition(base, SharedImageRecognition{})); ok {
+		t.Fatal("inactive shared image recognition should not be stored")
+	}
+
+	ctx := WithSharedImageRecognition(base, SharedImageRecognition{
+		SessionID:          "parent",
+		HasImageRefs:       true,
+		UseConfiguredModel: true,
+		Resolver:           resolver,
+	})
+	got, ok := GetSharedImageRecognition(ctx)
+	if !ok {
+		t.Fatal("shared image recognition missing from context")
+	}
+	if got.SessionID != "parent" || !got.UseConfiguredModel || got.Resolver == nil {
+		t.Fatalf("shared recognition = %#v", got)
 	}
 }

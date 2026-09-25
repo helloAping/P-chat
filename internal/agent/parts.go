@@ -48,25 +48,27 @@ import (
 //   - "sub_agent" — a nested sub-agent run (Task, Status, Parts)
 //   - "question"  — a user-facing question card (Text=questions JSON,
 //     Name=answers JSON after the user picks)
+//   - "skill"     — 可见的 Skill 调用生命周期 / a visible Skill invocation lifecycle
 //
 // The JSON tags are the wire format. Anything not appropriate for
 // a given Kind is left at the zero value and is dropped by
 // `omitempty` so e.g. a "text" part never carries a stray
 // "elapsed" field.
 type MessagePart struct {
-	Kind       string `json:"kind"`
-	Text       string `json:"text,omitempty"`
-	textBuffer []byte
-	Streaming  bool          `json:"streaming,omitempty"`
-	Name       string        `json:"name,omitempty"`
-	Args       string        `json:"args,omitempty"`
-	Status     string        `json:"status,omitempty"`
-	Result     string        `json:"result,omitempty"`
-	Error      string        `json:"error,omitempty"`
-	Elapsed    string        `json:"elapsed,omitempty"`
-	Task       string        `json:"task,omitempty"`
-	Parts      []MessagePart `json:"parts,omitempty"`
-	ToolID     string        `json:"tool_id,omitempty"`
+	Kind        string `json:"kind"`
+	Text        string `json:"text,omitempty"`
+	textBuffer  []byte
+	Streaming   bool          `json:"streaming,omitempty"`
+	Name        string        `json:"name,omitempty"`
+	Args        string        `json:"args,omitempty"`
+	Status      string        `json:"status,omitempty"`
+	Result      string        `json:"result,omitempty"`
+	Error       string        `json:"error,omitempty"`
+	Elapsed     string        `json:"elapsed,omitempty"`
+	Task        string        `json:"task,omitempty"`
+	Parts       []MessagePart `json:"parts,omitempty"`
+	ToolID      string        `json:"tool_id,omitempty"`
+	ContextRefs []string      `json:"context_refs,omitempty"`
 	// AgentType is the sub-agent's registered name
 	// ("explore", "plan", "general-purpose", or a custom
 	// agent from .p-chat/agent/*.md). Set on sub_agent
@@ -104,6 +106,11 @@ type MessagePart struct {
 	// Defaults to empty (caller should treat as "open" if
 	// missing — old persisted data without the field).
 	QuestionStatus string `json:"question_status,omitempty"`
+	// Skill 生命周期元数据。
+	// Skill lifecycle metadata.
+	Scope        string   `json:"scope,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	Dependencies []string `json:"dependencies,omitempty"`
 }
 
 // Part kind numeric constants for dispatch.
@@ -113,6 +120,7 @@ const (
 	PartKindTool     = 2
 	PartKindSubAgent = 3
 	PartKindQuestion = 4
+	PartKindSkill    = 5
 )
 
 // PartKindMap maps numeric part kind to its string representation.
@@ -122,6 +130,7 @@ var PartKindMap = map[int]string{
 	PartKindTool:     "tool",
 	PartKindSubAgent: "sub_agent",
 	PartKindQuestion: "question",
+	PartKindSkill:    "skill",
 }
 
 // PartKindStr maps string part kind to its numeric representation.
@@ -131,6 +140,7 @@ var PartKindStr = map[string]int{
 	"tool":      PartKindTool,
 	"sub_agent": PartKindSubAgent,
 	"question":  PartKindQuestion,
+	"skill":     PartKindSkill,
 }
 
 // nativeToolCall is the parsed form of a tool call, whether it
@@ -361,6 +371,27 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// Skill 生命周期：每个主 Skill 调用对应一张稳定卡片。
+	// Skill lifecycle: one stable card per primary Skill invocation.
+	if c.SkillName != "" {
+		for i := len(a.parts) - 1; i >= 0; i-- {
+			if a.parts[i].Kind != "skill" || a.parts[i].Name != c.SkillName {
+				continue
+			}
+			a.parts[i].Status = c.SkillStatus
+			a.parts[i].Scope = c.SkillScope
+			a.parts[i].Source = c.SkillSource
+			a.parts[i].Dependencies = append([]string(nil), c.SkillDependencies...)
+			a.parts[i].Error = c.SkillError
+			return
+		}
+		a.parts = append(a.parts, MessagePart{
+			Kind: "skill", Name: c.SkillName, Status: c.SkillStatus, Scope: c.SkillScope,
+			Source: c.SkillSource, Dependencies: append([]string(nil), c.SkillDependencies...), Error: c.SkillError,
+		})
+		return
+	}
+
 	// Sub-agent lifecycle: open / close the nested card BEFORE
 	// any nested events get routed. (Sub-agent events arrive
 	// with SubAgent=true; the SubAgentStatus is the gate.)
@@ -477,7 +508,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	// Tool call: start / ok / warn / error.
 	if c.ToolName != "" {
 		parts, subIdx := a.activePartsFor(c)
-		status := ToolStatusFromStep(c.Step, c.ToolError)
+		status := ToolStatusFromResult(c.ToolCallStatus, c.Step, c.ToolError)
 		if status == "start" {
 			// When a ToolID is present, avoid clobbering an
 			// earlier same-name start part — the ID is the
@@ -516,6 +547,7 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		}
 		// ok / warn / error — exact match by ID, fallback to
 		// name for legacy streams.
+		result := persistedToolResult(c)
 		for i := len(parts) - 1; i >= 0; i-- {
 			p := parts[i]
 			if p.Kind != "tool" || p.Status != "start" {
@@ -524,9 +556,10 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			if c.ToolID != "" && p.ToolID == c.ToolID ||
 				c.ToolID == "" && p.Name == c.ToolName {
 				p.Status = status
-				p.Result = c.ToolResult
+				p.Result = result
 				p.Error = c.ToolError
 				p.Elapsed = c.ToolElapsed
+				p.ContextRefs = append([]string(nil), c.ToolContextRefs...)
 				if c.ToolArgs != "" {
 					p.Args = c.ToolArgs
 				}
@@ -539,14 +572,15 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		// part (defensive: a "ok" with no preceding "start"
 		// can happen if the stream is reset between calls).
 		parts = append(parts, MessagePart{
-			Kind:    "tool",
-			Name:    c.ToolName,
-			Args:    c.ToolArgs,
-			Status:  status,
-			Result:  c.ToolResult,
-			Error:   c.ToolError,
-			Elapsed: c.ToolElapsed,
-			ToolID:  c.ToolID,
+			Kind:        "tool",
+			Name:        c.ToolName,
+			Args:        c.ToolArgs,
+			Status:      status,
+			Result:      result,
+			Error:       c.ToolError,
+			Elapsed:     c.ToolElapsed,
+			ToolID:      c.ToolID,
+			ContextRefs: append([]string(nil), c.ToolContextRefs...),
 		})
 		a.setPartsFor(subIdx, parts)
 		return
@@ -781,6 +815,16 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	}
 }
 
+func persistedToolResult(c ChatStreamChunk) string {
+	switch c.ToolName {
+	case "generate_image", "generate_video", "generate_audio", "browser_screenshot":
+		if c.ToolResultFull != "" {
+			return c.ToolResultFull
+		}
+	}
+	return c.ToolResult
+}
+
 // ToolStatusFromStep is the single source of truth for mapping a
 // tool-dispatch step (e.g. "call-1-ok") to the wire status string
 // the frontend expects ("ok" / "warn" / "error" / "start").
@@ -806,6 +850,17 @@ func ToolStatusFromStep(step, errMsg string) string {
 		return "start"
 	}
 	return status
+}
+
+// ToolStatusFromResult prefers a structured terminal result over the legacy
+// step/error heuristic. In particular, a policy denial remains "blocked"
+// instead of being flattened into a generic error merely because legacy
+// callers also populate ToolError.
+func ToolStatusFromResult(callStatus, step, errMsg string) string {
+	if callStatus == "blocked" {
+		return "blocked"
+	}
+	return ToolStatusFromStep(step, errMsg)
 }
 
 // parseStepStatus extracts the trailing status segment from a
@@ -864,6 +919,7 @@ func cloneMaterializedParts(parts []MessagePart) []MessagePart {
 			out[i].Text = string(parts[i].textBuffer)
 			out[i].textBuffer = nil
 		}
+		out[i].Dependencies = append([]string(nil), parts[i].Dependencies...)
 		out[i].Parts = cloneMaterializedParts(parts[i].Parts)
 	}
 	return out

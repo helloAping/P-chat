@@ -2,7 +2,7 @@
 
 > **状态**：设计定稿（v4），待开工 · **作者**：Claude · **日期**：2026-08-10 · **目标版本**：feat_1.0.11（后续）
 >
-> **目标**：在对话界面右上角提供「生成风格」按钮 + CLI `/stylegen` 指令，基于**当前对话**自动总结生成 AI 风格（persona）：支持**新建**风格或**优化现有**风格；生成跑在**后台隔离任务**（只读快照当前对话，不写原会话），通过 **SSE 流**把阶段进度与生成内容实时推送到弹窗。
+> **目标**：在对话界面右侧检查器的「会话操作」中提供「生成风格」入口 + CLI `/stylegen` 指令，基于**当前对话**自动总结生成 AI 风格（persona）：支持**新建**风格或**优化现有**风格；生成跑在**后台隔离任务**（只读快照当前对话，不写原会话），通过 **SSE 流**把阶段进度与生成内容实时推送到弹窗。
 
 ---
 
@@ -14,7 +14,7 @@ P-Chat 已有完整的风格系统（SQLite `styles` 表 + `style.Manager` CRUD 
 
 ### 1.2 目标（本方案要交付的）
 
-1. **GUI 主入口**：对话界面**右上角**小按钮（TopBar）→ 弹窗，用户填表即可生成风格
+1. **GUI 主入口**：右侧检查器「会话操作」里的小按钮 → 弹窗，用户填表即可生成风格
 2. **CLI 辅入口**：`/stylegen create|optimize` 指令（local / http 双模式）
 3. **双模式**：新建风格 / 优化现有风格（优化时把原 prompt + memory 附上，结合当前对话最新内容补充完善）
 4. **隔离执行**：后台任务**只读**当前对话快照，全程不写原会话（fork=只读快照方案）
@@ -24,7 +24,7 @@ P-Chat 已有完整的风格系统（SQLite `styles` 表 + `style.Manager` CRUD 
 
 | 决策点 | 结论 | 理由 |
 | --- | --- | --- |
-| 触发方式 | GUI 右上角按钮 + CLI 指令 | 用户自主触发，不依赖 LLM 主动提议 |
+| 触发方式 | GUI 右侧检查器按钮 + CLI 指令 | 用户自主触发，不依赖 LLM 主动提议 |
 | 来源对话 | **不可选，恒为当前会话**（按钮所在会话） | 用户明确要求；简单可控 |
 | 风格选择 | 弹窗内可选：新建 或 优化现有 | 双模式 |
 | 隔离方式 | **A：只读快照**（不 fork 新会话） | 用户确认 A；零污染、零写入 |
@@ -37,7 +37,7 @@ P-Chat 已有完整的风格系统（SQLite `styles` 表 + `style.Manager` CRUD 
 ### 1.4 整体数据流
 
 ```
-TopBar 右上角「生成风格」按钮
+InspectorPanel 会话操作「生成风格」按钮
   → StyleGenModal 弹窗（新建/优化 + 名称 + 补充要求；来源对话=当前）
   → POST /api/v1/stylegen   (body: mode/style_id/label/requirement/conversation_id=当前会话)
   → 202 {job_id}，后台 goroutine 跑 stylegen.Generate
@@ -58,7 +58,7 @@ CLI: /stylegen create|optimize ...（local 同步跑打印阶段行 / http 走 A
 | --- | --- | --- | --- |
 | 1 | stylegen 核心生成引擎 | `internal/stylegen/generate.go` | 无（先做纯逻辑） |
 | 2 | JobManager + HTTP/SSE 端点 | `internal/stylegen/jobs.go`、`internal/server/stylegen.go`、`internal/server/server.go` | 任务 1 |
-| 3 | 前端：API 客户端 + 弹窗 + 右上角按钮 | `frontend/src/api/client.ts`、`StyleGenModal.vue`（新）、`TopBar.vue` | 任务 2 |
+| 3 | 前端：API 客户端 + 弹窗 + 检查器入口 | `frontend/src/api/client.ts`、`StyleGenModal.vue`（新）、`InspectorPanel.vue` | 任务 2 |
 | 4 | CLI `/stylegen` 指令 | `internal/cli/commands.go`、`internal/cli/context.go`、`internal/httpcli/client.go` | 任务 1/2 |
 | 5 | 接线 + 测试 + 构建验证 | `cmd/pchat-server/main.go`、各 `*_test.go` | 任务 1-4 |
 
@@ -180,7 +180,7 @@ func Generate(ctx context.Context, deps Deps, p Params, emit func(ProgressEvent)
 
 ---
 
-## 5. 任务 3：前端——API 客户端 + 弹窗 + 右上角按钮
+## 5. 任务 3：前端——API 客户端 + 弹窗 + 检查器入口
 
 ### 5.1 改动内容
 
@@ -197,7 +197,7 @@ func Generate(ctx context.Context, deps Deps, p Params, emit func(ProgressEvent)
   - 提交 → `startStyleGen` → `streamStyleGen` → 进度面板：阶段清单（读取对话→生成人格→生成记忆→保存，勾选/进行中标记）+ 流式内容（thinking 可折叠 + prompt/memory 实时文本）+ 结果卡片（id/label/updated）
   - 「应用到当前会话」→ `updateSessionMeta(currentID, {style})` 立即生效；「去设置查看」/「关闭」
   - 错误态：按 `error_kind` 显示，可重试
-- `frontend/src/components/TopBar.vue`：`topbar-right`（L185 小图标按钮组）加一个 Sparkles 图标小按钮（`NTooltip`「生成风格」），点击开弹窗；`!state.currentID` 时禁用
+- `frontend/src/components/InspectorPanel.vue`：在「会话操作」中加一个 Sparkles 图标小按钮「生成风格」，点击开弹窗；`!state.currentID` 时禁用
 
 ### 5.2 涉及位置
 
@@ -206,14 +206,14 @@ func Generate(ctx context.Context, deps Deps, p Params, emit func(ProgressEvent)
 | `frontend/src/api/client.ts` | 新增 ~40 行 + 复用 SSE 模式（L1243/2010、L735-780） |
 | `frontend/src/api/sse.ts` | **只读复用**现有 SSE 解析 |
 | `frontend/src/components/StyleGenModal.vue`（新） | 弹窗 ~300 行 |
-| `frontend/src/components/TopBar.vue` | `topbar-right`（L185-240 区间）加按钮 ~15 行 |
+| `frontend/src/components/InspectorPanel.vue` | 会话操作区加按钮 ~15 行 |
 | `frontend/src/stores/chat.ts` | **只读复用** `state.currentID`（ContextInspectorDrawer.vue L33 同款用法） |
 | `frontend/src/components/AppSettingsModal.vue` | **参考**：现有风格编辑弹窗（L2830-2915）的样式/字段风格 |
 | `frontend/src/components/AppModal.vue` | **参考/复用**：弹窗容器 |
 
 ### 5.3 改动范围
 
-- 新增 1 个组件 + client.ts 增函数 + TopBar 增按钮；**不改**聊天主链路、不改 chat store
+- 新增 1 个组件 + client.ts 增函数 + InspectorPanel 增按钮；**不改**聊天主链路、不改 chat store
 - CSS 遵循 `frontend-design.md`：scoped + CSS variables（`--accent`/`--bg-2`），禁止硬编码颜色
 - 严格 TS：`npx vue-tsc -b` 必须通过
 
@@ -339,7 +339,7 @@ func Generate(ctx context.Context, deps Deps, p Params, emit func(ProgressEvent)
 - `cd frontend && npx vue-tsc -b && npm run build` 通过
 
 ### 10.2 手工验证
-1. 起 `pchat-server`，打开对话 → 右上角「生成风格」→ 新建：填"温柔老师"+要求 → 观察阶段进度 + 流式内容 → 结果卡片 → 「应用到当前会话」→ 下一轮回复带新风格
+1. 起 `pchat-server`，打开对话 → 右侧检查器「会话操作」里的「生成风格」→ 新建：填"温柔老师"+要求 → 观察阶段进度 + 流式内容 → 结果卡片 → 「应用到当前会话」→ 下一轮回复带新风格
 2. 新建后再跑一次同名/近义名 → 触发 id 冲突提示
 3. 优化自定义风格：选现有 → 改要求 → 预览确认 → 原地更新生效
 4. 优化内置（如 `tech`）→ 提示"内置只读，已另存新风格"，`GET /api/v1/styles` 多出一条新风格，原 `tech` 未变

@@ -14,15 +14,49 @@
 $ErrorActionPreference = "Stop"
 
 $bundle   = "D:\develop\project\P-chat\cmd\pchat-gui\build\bin"
-$install  = Join-Path $env:TEMP "pchat-smoke-install"
+$install  = [IO.Path]::GetFullPath((Join-Path $env:TEMP "pchat-smoke-install"))
+$tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+if (-not $install.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "refusing smoke cleanup outside TEMP: $install"
+}
+$dataHome = Join-Path $install ".p-chat-smoke"
 $log      = Join-Path $env:TEMP "pchat-smoke.log"
-$guiLog   = Join-Path $install "pchat-gui.log"
-$serverLog= Join-Path $install "pchat-server.log"
+$logDir   = Join-Path $dataHome "logs"
 
 function Step($n, $msg) { Write-Host ""; Write-Host "==== [$n] $msg ====" -ForegroundColor Cyan }
 
+function Get-PChatProcessesInDirectory([string] $Directory) {
+    $root = [IO.Path]::GetFullPath($Directory)
+    Get-Process -Name "pchat-gui","pchat-server","pchat","pchat-updater" -ErrorAction SilentlyContinue |
+        Where-Object {
+            try {
+                $exeDir = [IO.Path]::GetFullPath((Split-Path -LiteralPath $_.Path -Parent))
+                $exeDir.Equals($root, [StringComparison]::OrdinalIgnoreCase)
+            } catch { $false }
+        }
+}
+
+function Stop-PChatProcessesInDirectory([string] $Directory) {
+    Get-PChatProcessesInDirectory $Directory |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-SmokeProcessTree($Process) {
+    if ($Process -and -not $Process.HasExited) {
+        & taskkill /T /F /PID $Process.Id 2>&1 | Out-Null
+    }
+    Stop-PChatProcessesInDirectory $install
+}
+
+function Get-LatestRuntimeLog([string] $BaseName) {
+    if (-not (Test-Path -LiteralPath $logDir)) { return $null }
+    return Get-ChildItem -LiteralPath $logDir -Filter "$BaseName-*.log" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+
 # 0. clean previous state
-Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-PChatProcessesInDirectory $install
 Start-Sleep -Milliseconds 500
 if (Test-Path -LiteralPath $install) { Remove-Item -LiteralPath $install -Recurse -Force }
 
@@ -58,12 +92,22 @@ Write-Host "OK: bundle present in $install" -ForegroundColor Green
 
 # 2. launch the installed pchat-gui
 Step 2 "launch pchat-gui.exe from $install"
-Remove-Item -LiteralPath $guiLog,$serverLog -ErrorAction SilentlyContinue
-$proc = Start-Process -FilePath (Join-Path $install "pchat-gui.exe") -PassThru -WindowStyle Hidden
+$previousDataHome = $env:PCHAT_DATA_HOME
+$previousProfile = $env:PCHAT_PROFILE
+try {
+    $env:PCHAT_DATA_HOME = $dataHome
+    $env:PCHAT_PROFILE = "smoke"
+    $proc = Start-Process -FilePath (Join-Path $install "pchat-gui.exe") -PassThru -WindowStyle Hidden
+}
+finally {
+    $env:PCHAT_DATA_HOME = $previousDataHome
+    $env:PCHAT_PROFILE = $previousProfile
+}
 Start-Sleep -Seconds 2
 if ($proc.HasExited) {
     Write-Host "FAIL: pchat-gui exited immediately (code=$($proc.ExitCode))" -ForegroundColor Red
-    if (Test-Path -LiteralPath $guiLog) { Get-Content -LiteralPath $guiLog -Raw | Out-String }
+    $guiLog = Get-LatestRuntimeLog "pchat-gui"
+    if ($guiLog) { Get-Content -LiteralPath $guiLog -Raw | Out-String }
     exit 1
 }
 Write-Host "OK: pchat-gui PID=$($proc.Id) is running" -ForegroundColor Green
@@ -73,17 +117,20 @@ Step 3 "wait for pchat-server to become healthy (max 30s)"
 $port = $null
 $deadline = (Get-Date).AddSeconds(30)
 while ((Get-Date) -lt $deadline) {
-    if (Test-Path -LiteralPath $guiLog) {
-        $m = Select-String -Path $guiLog -Pattern "picked port (\d+)" -ErrorAction SilentlyContinue
+    $guiLog = Get-LatestRuntimeLog "pchat-gui"
+    if ($guiLog) {
+        $m = Select-String -Path $guiLog -Pattern "pchat-server is healthy at .*\(port=(\d+)\)" -ErrorAction SilentlyContinue | Select-Object -Last 1
         if ($m) { $port = [int]$m.Matches[0].Groups[1].Value; break }
     }
     Start-Sleep -Milliseconds 500
 }
 if (-not $port) {
-    Write-Host "FAIL: pchat-gui never picked a port" -ForegroundColor Red
-    if (Test-Path -LiteralPath $guiLog) { Get-Content -LiteralPath $guiLog -Raw | Out-String }
-    if (Test-Path -LiteralPath $serverLog) { Get-Content -LiteralPath $serverLog -Raw | Out-String }
-    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    Write-Host "FAIL: pchat-gui never announced a healthy port" -ForegroundColor Red
+    $guiLog = Get-LatestRuntimeLog "pchat-gui"
+    $serverLog = Get-LatestRuntimeLog "pchat-server"
+    if ($guiLog) { Get-Content -LiteralPath $guiLog -Raw | Out-String }
+    if ($serverLog) { Get-Content -LiteralPath $serverLog -Raw | Out-String }
+    Stop-SmokeProcessTree $proc
     exit 1
 }
 Write-Host "OK: pchat-gui picked port $port" -ForegroundColor Green
@@ -93,10 +140,14 @@ Step 4 "GET http://127.0.0.1:$port/api/v1/health"
 try {
     $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/health" -UseBasicParsing -TimeoutSec 5
     if ($r.StatusCode -ne 200) { throw "status=$($r.StatusCode)" }
+    $health = $r.Content | ConvertFrom-Json
+    if ($health.profile_name -ne "smoke" -or -not $health.profile_id -or -not $health.instance_id) {
+        throw "unexpected runtime identity: $($r.Content)"
+    }
     Write-Host "OK: $($r.Content)" -ForegroundColor Green
 } catch {
     Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
-    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SmokeProcessTree $proc
     exit 1
 }
 
@@ -106,11 +157,14 @@ try {
     $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/v1/providers" -UseBasicParsing -TimeoutSec 5
     if ($r.StatusCode -ne 200) { throw "status=$($r.StatusCode)" }
     $body = $r.Content
-    if ($body -notmatch '"cs"') { throw "providers response missing 'cs': $body" }
-    Write-Host "OK: providers list contains user-configured 'cs' provider" -ForegroundColor Green
+    $providersResponse = $body | ConvertFrom-Json
+    if (-not $providersResponse.providers -or $providersResponse.providers.Count -lt 1) {
+        throw "providers response is empty: $body"
+    }
+    Write-Host "OK: providers list contains $($providersResponse.providers.Count) isolated-profile provider(s)" -ForegroundColor Green
 } catch {
     Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
-    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SmokeProcessTree $proc
     exit 1
 }
 
@@ -123,12 +177,13 @@ try {
     Write-Host "OK: web/index.html served, content-length=$($r.Content.Length)" -ForegroundColor Green
 } catch {
     Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
-    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SmokeProcessTree $proc
     exit 1
 }
 
-# 6a. exercise the upload endpoint: a tiny PNG must be accepted,
-#     classified as image, and stored at ~/.p-chat/uploads/.
+# 6a. 验证上传端点：微型 PNG 必须被接受、识别为图片，并存入 smoke profile 的数据目录。
+#     Exercise the upload endpoint: a tiny PNG must be accepted, classified as
+#     image, and stored under this smoke profile's data home.
 Step "6a" "POST /api/v1/uploads accepts a PNG and returns metadata"
 try {
     # 1x1 transparent PNG (8-byte signature + IHDR + IDAT + IEND)
@@ -165,8 +220,8 @@ try {
         $up = $respBody | ConvertFrom-Json
         if ($up.kind -ne "image") { throw "kind = $($up.kind), want image" }
         if ($up.id.Length -ne 16) { throw "id length = $($up.id.Length), want 16" }
-        if (-not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".p-chat\uploads\$($up.id)-$($up.name)"))) {
-            throw "uploaded file not on disk at ~/.p-chat/uploads/$($up.id)-$($up.name)"
+        if (-not (Test-Path -LiteralPath (Join-Path $dataHome "uploads\$($up.id)-$($up.name)"))) {
+            throw "uploaded file not on disk at $dataHome/uploads/$($up.id)-$($up.name)"
         }
         Write-Host "OK: uploaded id=$($up.id) kind=$($up.kind) size=$($up.size)" -ForegroundColor Green
     } finally {
@@ -174,7 +229,7 @@ try {
     }
 } catch {
     Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
-    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SmokeProcessTree $proc
     exit 1
 }
 
@@ -235,7 +290,7 @@ try {
     Write-Host "OK: PATCH with unknown model → 4xx" -ForegroundColor Green
 } catch {
     Write-Host "FAIL: $($_.Exception.Message)" -ForegroundColor Red
-    $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SmokeProcessTree $proc
     exit 1
 }
 
@@ -244,20 +299,17 @@ Step 7 "stop pchat-gui (kills child pchat-server)"
 # Use taskkill /T /F so the whole process tree dies even if pchat-gui's
 # graceful-shutdown handler doesn't get a chance to run. This is the
 # same behavior the uninstall script relies on.
-& taskkill /T /F /PID $proc.Id 2>&1 | Out-Null
+Stop-SmokeProcessTree $proc
 # Give the kernel a moment to reap.
 for ($i = 0; $i -lt 20; $i++) {
-    $still = Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue
+    $still = Get-PChatProcessesInDirectory $install
     if (-not $still) { break }
     Start-Sleep -Milliseconds 250
 }
-$stillRunning = Get-Process -Name "pchat-gui","pchat-server","pchat" -ErrorAction SilentlyContinue
+$stillRunning = Get-PChatProcessesInDirectory $install
 if ($stillRunning) {
     Write-Host "WARN: $($stillRunning.Count) leftover process(es) - cleaning up" -ForegroundColor Yellow
-    & taskkill /T /F /IM "pchat-server.exe" 2>&1 | Out-Null
-    & taskkill /T /F /IM "pchat-gui.exe"    2>&1 | Out-Null
-    & taskkill /T /F /IM "pchat.exe"        2>&1 | Out-Null
-    & taskkill /T /F /IM "pchat-updater.exe" 2>&1 | Out-Null
+    Stop-PChatProcessesInDirectory $install
 }
 Write-Host "OK: cleanup done" -ForegroundColor Green
 

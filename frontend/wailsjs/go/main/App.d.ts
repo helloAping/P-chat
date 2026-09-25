@@ -8,6 +8,8 @@ export function CancelWindowClose():Promise<void>;
 
 export function ConfirmWindowClose(arg1:string):Promise<void>;
 
+export function GetApplicationTitle():Promise<string>;
+
 export function GetBackendURL():Promise<string>;
 
 export function InstallUpdate(arg1:string,arg2:string):Promise<void>;
@@ -17,6 +19,10 @@ export function OpenExplorer(arg1:string):Promise<void>;
 export function OpenTerminal(arg1:string):Promise<void>;
 
 export function OpenURL(arg1:string):Promise<void>;
+
+export function RequestWindowClose():Promise<void>;
+
+export function SaveDownloadFile(arg1:string,arg2:string):Promise<string>;
 
 export function SaveExportFile(arg1:string,arg2:string,arg3:string):Promise<string>;
 

@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,22 +21,28 @@ import (
 // been removed. The loader still accepts a legacy config.yaml as
 // a one-shot migration source — see Load.
 type Config struct {
-	Server    ServerConfig            `json:"server"`
-	LLM       LLMConfig               `json:"llm"`
-	Style     StyleConfig             `json:"style"`
-	UI        UIConfig                `json:"ui"`
-	WorkMode  WorkModeConfig          `json:"work_mode"`
-	Tools     ToolsConfig             `json:"tools"`
-	Memory    MemoryConfig            `json:"memory"`
-	Sandbox   SandboxConfig           `json:"sandbox"`
-	SubAgent  SubAgentConfig          `json:"subagent"`
-	MCP       MCPConfig               `json:"mcp"`
-	Knowledge KnowledgeConfig         `json:"knowledge"`
-	Limits    LimitsConfig            `json:"limits"`
-	Search    SearchConfig            `json:"search"`
-	Browser   BrowserConfig           `json:"browser"`
-	Vision    VisionRecognitionConfig `json:"vision_recognition"`
-	IM        IMConfig                `json:"im"`
+	Server    ServerConfig    `json:"server"`
+	LLM       LLMConfig       `json:"llm"`
+	Style     StyleConfig     `json:"style"`
+	UI        UIConfig        `json:"ui"`
+	WorkMode  WorkModeConfig  `json:"work_mode"`
+	Tools     ToolsConfig     `json:"tools"`
+	Memory    MemoryConfig    `json:"memory"`
+	Sandbox   SandboxConfig   `json:"sandbox"`
+	SubAgent  SubAgentConfig  `json:"subagent"`
+	MCP       MCPConfig       `json:"mcp"`
+	Knowledge KnowledgeConfig `json:"knowledge"`
+	Limits    LimitsConfig    `json:"limits"`
+	Search    SearchConfig    `json:"search"`
+	Browser   BrowserConfig   `json:"browser"`
+	// Generation selects application defaults for vendor-neutral media tools.
+	Generation GenerationConfig `json:"generation,omitempty"`
+	// Recognition is the canonical media-recognition configuration. Each
+	// media kind can use an independent provider/model route.
+	Recognition RecognitionConfig `json:"recognition,omitempty"`
+	// Vision is retained for pre-V9 configuration compatibility.
+	Vision VisionRecognitionConfig `json:"vision_recognition,omitempty"`
+	IM     IMConfig                `json:"im"`
 	// Dynamic is the P3-2 per-tool config table. The
 	// user writes `dynamic.<tool_name>.config: {…}`
 	// in their config.json and the dynamic tool's
@@ -153,9 +160,10 @@ func (m TodoLongRunMode) AllowsUnlimitedRounds(hasActiveTodos bool) bool {
 
 // SubAgentConfig controls how the `task` tool spawns sub-agents.
 //
+// 可见性先受安全执行集限制，再由允许/拒绝列表继续收窄。
 // Visibility is first capped by the execution-safe set
-// (tool.SubagentMayExpose): local reads, todo_write, web_search, and
-// web_fetch. AllowedTools then further restricts that set; when
+// (tool.SubagentMayExpose): local reads, todo_write, media_recognize,
+// web_search, and web_fetch. AllowedTools then further restricts that set; when
 // empty, all execution-safe parent tools except DeniedTools are
 // passed. The `task` family and `recall` are always excluded.
 //
@@ -212,13 +220,14 @@ func (s SubAgentConfig) CacheTTLDuration() time.Duration {
 // ToolAllowed reports whether the given tool name is allowed for a
 // sub-agent. The `task` tool is never allowed (recursion prevention).
 func (s SubAgentConfig) ToolAllowed(name string) bool {
+	name = canonicalToolPolicyName(name)
 	if name == "task" {
 		return false
 	}
 	// Whitelist has priority: if set, only listed tools pass.
 	if len(s.AllowedTools) > 0 {
 		for _, t := range s.AllowedTools {
-			if t == name {
+			if canonicalToolPolicyName(t) == name {
 				return true
 			}
 		}
@@ -226,11 +235,27 @@ func (s SubAgentConfig) ToolAllowed(name string) bool {
 	}
 	// Otherwise, blacklist.
 	for _, t := range s.DeniedTools {
-		if t == name {
+		if canonicalToolPolicyName(t) == name {
 			return false
 		}
 	}
 	return true
+}
+
+// canonicalToolPolicyName 让持久化的旧允许/拒绝列表在工具合并后继续生效。
+// canonicalToolPolicyName keeps persisted allow/deny lists working after
+// several overlapping tools were collapsed behind canonical contracts.
+func canonicalToolPolicyName(name string) string {
+	switch name {
+	case "image_recognize":
+		return "media_recognize"
+	case "read_docx", "read_pdf":
+		return "read_file"
+	case "start_process":
+		return "exec_command"
+	default:
+		return name
+	}
 }
 
 type ServerConfig struct {
@@ -242,7 +267,7 @@ type ServerConfig struct {
 //
 // `default` selects which provider is used when no provider is
 // requested explicitly. Each provider may expose multiple models
-// (see ProviderConfig) that share the same base URL + API key.
+// (see ProviderConfig) that share the same Base URL + API key.
 type LLMConfig struct {
 	Default   string           `json:"default"`
 	Providers []ProviderConfig `json:"providers"`
@@ -269,19 +294,27 @@ type OutputConfig struct {
 
 // ProviderConfig defines an LLM provider. A single provider can
 // expose multiple models (e.g. "openai" with gpt-4o, gpt-4o-mini, gpt-3.5-turbo)
-// that share the same base URL and API key.
+// that share the same protocol, base URL, and API key. Each model can select
+// its own API endpoint suffix.
 //
 // Use `models` (multi-model) for new entries. The legacy `model`
 // field is still recognized for backward compat: when `models` is
 // empty the value of `model` is used as a single-model provider.
 type ProviderConfig struct {
-	Name     string        `json:"name"`
-	Protocol string        `json:"protocol,omitempty"` // "openai" | "anthropic"
-	Type     string        `json:"type,omitempty"`     // alias for Protocol (backward compat)
-	BaseURL  string        `json:"base_url"`
-	APIKey   string        `json:"api_key"`
-	Model    string        `json:"model,omitempty"` // legacy: single model
-	Models   []ModelConfig `json:"models,omitempty"`
+	Name string `json:"name"`
+	// Vendor and APIURL are retained only for compatibility. New configuration
+	// uses ProviderID + Protocol + BaseURL; request paths live on individual models.
+	Vendor          string            `json:"vendor,omitempty"`
+	ProviderID      string            `json:"provider_id,omitempty"`
+	StrategyVariant string            `json:"strategy_variant,omitempty"`
+	Protocol        string            `json:"protocol,omitempty"` // openai/openai_chat/openai_responses/anthropic/anthropic_messages
+	Type            string            `json:"type,omitempty"`     // alias for Protocol (backward compat)
+	APIURL          string            `json:"api_url,omitempty"`  // legacy complete chat endpoint
+	BaseURL         string            `json:"base_url,omitempty"`
+	APIKey          string            `json:"api_key"`
+	CustomHeaders   map[string]string `json:"custom_headers,omitempty"`
+	Model           string            `json:"model,omitempty"` // legacy: single model
+	Models          []ModelConfig     `json:"models,omitempty"`
 }
 
 // ModelConfig describes a single model under a provider.
@@ -294,6 +327,9 @@ type ProviderConfig struct {
 type ModelConfig struct {
 	// Name is the model identifier sent to the API (e.g. "gpt-4o").
 	Name string `json:"name"`
+	// APIEndpoint is appended to the provider BaseURL. Conversational models
+	// default to the selected protocol's conventional suffix when omitted.
+	APIEndpoint string `json:"api_endpoint,omitempty"`
 	// DisplayName is shown in /model and /config. Optional.
 	DisplayName string `json:"display_name,omitempty"`
 	// Default marks one of the provider's models as the default.
@@ -301,6 +337,11 @@ type ModelConfig struct {
 	Default bool `json:"default,omitempty"`
 	// Description is shown in /model.
 	Description string `json:"description,omitempty"`
+	// Type separates conversational models from media generation models.
+	// Empty is interpreted as llm for backward compatibility.
+	Type ModelType `json:"type,omitempty"`
+	// Generation is populated only for media_generation models.
+	Generation *MediaGenerationModelConfig `json:"generation,omitempty"`
 
 	// MaxTokensContext is the model's input context window size
 	// (informational). Examples: 8192 (gpt-3.5), 128000 (gpt-4o),
@@ -328,6 +369,141 @@ type ModelConfig struct {
 	PricePer1KOutput float64 `json:"price_per_1k_output,omitempty"`
 }
 
+// EffectiveType returns llm for legacy models with no explicit type.
+func (m ModelConfig) EffectiveType() ModelType {
+	if m.Type == "" {
+		return ModelTypeLLM
+	}
+	return m.Type
+}
+
+const (
+	// ProviderIDCustom 是自定义供应商的稳定策略 ID。
+	// ProviderIDCustom is the stable strategy ID for custom providers.
+	ProviderIDCustom = "custom"
+)
+
+const (
+	// ProtocolOpenAI 是旧版 OpenAI Chat 协议别名。
+	// ProtocolOpenAI is the legacy OpenAI Chat protocol alias.
+	ProtocolOpenAI = "openai"
+	// ProtocolAnthropic 是旧版 Anthropic Messages 协议别名。
+	// ProtocolAnthropic is the legacy Anthropic Messages protocol alias.
+	ProtocolAnthropic = "anthropic"
+	// ProtocolOpenAIChat 表示 OpenAI-compatible Chat Completions 协议。
+	// ProtocolOpenAIChat is the OpenAI-compatible Chat Completions protocol.
+	ProtocolOpenAIChat = "openai_chat"
+	// ProtocolOpenAIResponses 表示 OpenAI Responses 协议。
+	// ProtocolOpenAIResponses is the OpenAI Responses protocol.
+	ProtocolOpenAIResponses = "openai_responses"
+	// ProtocolAnthropicMessages 表示 Anthropic Messages 协议。
+	// ProtocolAnthropicMessages is the Anthropic Messages protocol.
+	ProtocolAnthropicMessages = "anthropic_messages"
+)
+
+// NormalizeProviderID 把空供应商类型归一为 custom。
+// NormalizeProviderID maps an empty provider strategy id to custom.
+func NormalizeProviderID(providerID string) string {
+	providerID = strings.ToLower(strings.TrimSpace(providerID))
+	if providerID == "" {
+		return ProviderIDCustom
+	}
+	return providerID
+}
+
+// NormalizeStrategyVariant 归一化同一供应商下的端点/套餐变体。
+// NormalizeStrategyVariant normalizes a provider strategy variant id.
+func NormalizeStrategyVariant(variant string) string {
+	return strings.ToLower(strings.TrimSpace(variant))
+}
+
+// IsValidProviderID 判断供应商类型 ID 是否可写入配置。
+// IsValidProviderID reports whether a provider strategy id is safe to persist.
+func IsValidProviderID(providerID string) bool {
+	return isStableConfigID(NormalizeProviderID(providerID))
+}
+
+// IsValidStrategyVariant 判断策略变体 ID 是否可写入配置；空值表示默认变体。
+// IsValidStrategyVariant reports whether a strategy variant id is safe to persist.
+func IsValidStrategyVariant(variant string) bool {
+	variant = NormalizeStrategyVariant(variant)
+	return variant == "" || isStableConfigID(variant)
+}
+
+func isStableConfigID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// NormalizeProtocol 把旧协议别名归一为新协议 ID。
+// NormalizeProtocol maps legacy protocol aliases to stable protocol IDs.
+func NormalizeProtocol(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "", ProtocolOpenAI, ProtocolOpenAIChat:
+		return ProtocolOpenAIChat
+	case ProtocolOpenAIResponses:
+		return ProtocolOpenAIResponses
+	case ProtocolAnthropic, ProtocolAnthropicMessages:
+		return ProtocolAnthropicMessages
+	default:
+		return strings.ToLower(strings.TrimSpace(protocol))
+	}
+}
+
+// IsSupportedProtocol 判断 provider 配置是否接受该协议。
+// IsSupportedProtocol reports whether protocol is accepted by provider config.
+func IsSupportedProtocol(protocol string) bool {
+	switch NormalizeProtocol(protocol) {
+	case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolAnthropicMessages:
+		return true
+	default:
+		return false
+	}
+}
+
+// ProtocolIsAnthropic 判断协议是否使用 Anthropic Messages 请求/响应格式。
+// ProtocolIsAnthropic reports whether protocol uses Anthropic Messages wire shape.
+func ProtocolIsAnthropic(protocol string) bool {
+	return NormalizeProtocol(protocol) == ProtocolAnthropicMessages
+}
+
+// ProtocolIsOpenAIResponses 判断协议是否使用 OpenAI Responses 请求/响应格式。
+// ProtocolIsOpenAIResponses reports whether protocol uses OpenAI Responses wire shape.
+func ProtocolIsOpenAIResponses(protocol string) bool {
+	return NormalizeProtocol(protocol) == ProtocolOpenAIResponses
+}
+
+// ProtocolIsOpenAICompatible 判断协议是否属于 OpenAI-compatible 鉴权/请求头族。
+// ProtocolIsOpenAICompatible reports whether protocol uses an OpenAI-compatible auth/header family.
+func ProtocolIsOpenAICompatible(protocol string) bool {
+	switch NormalizeProtocol(protocol) {
+	case ProtocolOpenAIChat, ProtocolOpenAIResponses:
+		return true
+	default:
+		return false
+	}
+}
+
+// GetProviderID 返回供应商策略 ID；旧配置缺失时按 Custom 处理。
+// GetProviderID returns the provider strategy ID; legacy configs default to Custom.
+func (p ProviderConfig) GetProviderID() string {
+	return NormalizeProviderID(p.ProviderID)
+}
+
+// GetStrategyVariant 返回同一供应商下的端点/套餐变体。
+// GetStrategyVariant returns the provider strategy variant.
+func (p ProviderConfig) GetStrategyVariant() string {
+	return NormalizeStrategyVariant(p.StrategyVariant)
+}
+
 // GetProtocol returns the protocol, falling back to Type, then "openai".
 func (p ProviderConfig) GetProtocol() string {
 	if p.Protocol != "" {
@@ -339,20 +515,129 @@ func (p ProviderConfig) GetProtocol() string {
 	return "openai"
 }
 
+// DefaultLLMAPIEndpoint 返回新建对话模型默认填入的可编辑端点后缀。
+// DefaultLLMAPIEndpoint returns the editable endpoint suffix offered for a
+// newly-created conversational model.
+func DefaultLLMAPIEndpoint(protocol string) string {
+	switch NormalizeProtocol(protocol) {
+	case ProtocolAnthropicMessages:
+		return "/messages"
+	case ProtocolOpenAIResponses:
+		return "/responses"
+	default:
+		return "/chat/completions"
+	}
+}
+
+// NormalizeAPIEndpointSuffix canonicalizes a model endpoint without turning it
+// into a full URL. Absolute endpoints remain unchanged only so older project
+// overlays can still be read and migrated.
+func NormalizeAPIEndpointSuffix(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.IsAbs() {
+		return endpoint
+	}
+	return "/" + strings.TrimLeft(endpoint, "/")
+}
+
+func validateAPIEndpointSuffix(raw, field string, required bool) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if required {
+			return fmt.Errorf("%s is required", field)
+		}
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || strings.HasPrefix(raw, "//") {
+		return fmt.Errorf("%s must be a relative API path suffix", field)
+	}
+	if parsed.Fragment != "" {
+		return fmt.Errorf("%s must not contain a URL fragment", field)
+	}
+	return nil
+}
+
+// JoinAPIURL combines a provider base URL and a model endpoint suffix. An
+// absolute endpoint is returned unchanged for backward compatibility.
+func JoinAPIURL(baseURL, endpoint string) string {
+	endpoint = NormalizeAPIEndpointSuffix(endpoint)
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.IsAbs() {
+		return endpoint
+	}
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" || endpoint == "" {
+		return baseURL + endpoint
+	}
+	return baseURL + endpoint
+}
+
+// EffectiveBaseURL returns the provider base used for model endpoint joining.
+// The legacy complete api_url form is reduced by its conventional protocol
+// suffix so settings created during the V12 transition remain editable.
+func (p ProviderConfig) EffectiveBaseURL() string {
+	if baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/"); baseURL != "" {
+		return baseURL
+	}
+	apiURL := strings.TrimRight(strings.TrimSpace(p.APIURL), "/")
+	if apiURL == "" {
+		return ""
+	}
+	suffix := strings.ToLower(DefaultLLMAPIEndpoint(p.GetProtocol()))
+	if strings.HasSuffix(strings.ToLower(apiURL), suffix) {
+		return strings.TrimRight(apiURL[:len(apiURL)-len(suffix)], "/")
+	}
+	return apiURL
+}
+
+// ModelAPIURL resolves the exact request URL for one conversational model.
+// New configuration joins BaseURL + model.api_endpoint; the legacy api_url
+// form remains exact until V12 migrates it.
+func (p ProviderConfig) ModelAPIURL(modelName string) string {
+	if strings.TrimSpace(p.BaseURL) == "" && strings.TrimSpace(p.APIURL) != "" {
+		return strings.TrimSpace(p.APIURL)
+	}
+	endpoint := ""
+	for _, model := range p.Models {
+		if model.Name == modelName && model.EffectiveType() == ModelTypeLLM {
+			endpoint = model.APIEndpoint
+			break
+		}
+	}
+	if endpoint == "" {
+		endpoint = DefaultLLMAPIEndpoint(p.GetProtocol())
+	}
+	return JoinAPIURL(p.EffectiveBaseURL(), endpoint)
+}
+
+// EffectiveAPIURL is the compatibility alias for the provider's current
+// default conversational model URL.
+func (p ProviderConfig) EffectiveAPIURL() string {
+	return p.ModelAPIURL(p.EffectiveModel())
+}
+
 // EffectiveModel returns the model identifier that should be used
 // when the user has selected this provider. It looks at `models`
 // (multi-model) first, then falls back to the legacy `model` field.
 // Returns the name of the first model when no default is marked.
 func (p ProviderConfig) EffectiveModel() string {
 	if len(p.Models) > 0 {
-		// Prefer the model marked default=true.
+		// Prefer the conversational model marked default=true. Media models are
+		// selected per generation operation and must never become the chat model.
 		for _, m := range p.Models {
-			if m.Default {
+			if m.EffectiveType() == ModelTypeLLM && m.Default {
 				return m.Name
 			}
 		}
-		// Otherwise the first one.
-		return p.Models[0].Name
+		for _, m := range p.Models {
+			if m.EffectiveType() == ModelTypeLLM {
+				return m.Name
+			}
+		}
+		return ""
 	}
 	return p.Model
 }
@@ -382,16 +667,19 @@ func (p *ProviderConfig) FindModel(name string) *ModelConfig {
 }
 
 // AllModels returns the list of model names for this provider, in
-// user-facing order. Always includes at least one entry (the
-// effective model).
+// user-facing order. Legacy single-model providers synthesize one entry;
+// providers created solely for media models may legitimately return none.
 func (p ProviderConfig) AllModels() []ModelConfig {
 	if len(p.Models) > 0 {
 		out := make([]ModelConfig, len(p.Models))
 		copy(out, p.Models)
 		return out
 	}
+	if strings.TrimSpace(p.Model) == "" {
+		return nil
+	}
 	// Synthesize a single-model entry from the legacy field.
-	return []ModelConfig{{Name: p.Model}}
+	return []ModelConfig{{Name: p.Model, Type: ModelTypeLLM}}
 }
 
 // DisplayModel returns a human-friendly name for the effective model
@@ -491,8 +779,86 @@ type WorkModeConfig struct {
 	Default WorkMode `json:"default"`
 }
 
+// MediaKind identifies a supported multimodal attachment category.
+type MediaKind string
+
+const (
+	MediaImage MediaKind = "image"
+	MediaVideo MediaKind = "video"
+	MediaAudio MediaKind = "audio"
+)
+
+// IsValid reports whether the media kind is part of the capability contract.
+func (m MediaKind) IsValid() bool {
+	switch m {
+	case MediaImage, MediaVideo, MediaAudio:
+		return true
+	default:
+		return false
+	}
+}
+
+// RecognitionRoute selects the model used to recognize one media kind.
+type RecognitionRoute struct {
+	Enabled        bool   `json:"enabled"`
+	Provider       string `json:"provider,omitempty"`
+	Model          string `json:"model,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	MaxBytes       int64  `json:"max_bytes,omitempty"`
+}
+
+// Normalize fills conservative limits shared by recognition routes.
+func (r *RecognitionRoute) Normalize() {
+	if r.TimeoutSeconds <= 0 {
+		r.TimeoutSeconds = 60
+	}
+	if r.MaxBytes <= 0 {
+		r.MaxBytes = 10 << 20
+	}
+}
+
+// Available reports whether this route has enough configuration to be used.
+func (r RecognitionRoute) Available() bool {
+	return r.Enabled && strings.TrimSpace(r.Provider) != "" && strings.TrimSpace(r.Model) != ""
+}
+
+// RecognitionConfig stores independent routes for image, video, and audio.
+type RecognitionConfig struct {
+	Routes map[MediaKind]RecognitionRoute `json:"routes,omitempty"`
+}
+
+// Normalize validates route keys and fills route defaults.
+func (r *RecognitionConfig) Normalize() {
+	if r.Routes == nil {
+		r.Routes = make(map[MediaKind]RecognitionRoute)
+		return
+	}
+	for kind, route := range r.Routes {
+		if !kind.IsValid() {
+			delete(r.Routes, kind)
+			continue
+		}
+		route.Normalize()
+		r.Routes[kind] = route
+	}
+}
+
+// Route returns an available route for kind.
+func (r RecognitionConfig) Route(kind MediaKind) (RecognitionRoute, bool) {
+	if !kind.IsValid() {
+		return RecognitionRoute{}, false
+	}
+	route, ok := r.Routes[kind]
+	if !ok || !route.Available() {
+		return RecognitionRoute{}, false
+	}
+	route.Normalize()
+	return route, true
+}
+
+// VisionRecognitionConfig 选择 media_recognize 图片策略使用的外接多模态模型。
 // VisionRecognitionConfig selects the external multimodal model used by
-// the image_recognize tool. The main chat model can stay text-only; when
+// the media_recognize image strategy. The main chat model can stay text-only; when
 // a session opts in, uploaded images are described through this model and
 // returned to the main conversation as tool text.
 type VisionRecognitionConfig struct {
@@ -510,6 +876,33 @@ func (v *VisionRecognitionConfig) Normalize() {
 	}
 	if v.MaxImageBytes <= 0 {
 		v.MaxImageBytes = 10 << 20
+	}
+}
+
+// NormalizeRecognition initializes canonical recognition routes and imports
+// the legacy vision route when no explicit image route exists.
+func (c *Config) NormalizeRecognition() {
+	c.Recognition.Normalize()
+	if _, exists := c.Recognition.Routes[MediaImage]; !exists {
+		legacy := c.Vision
+		legacy.Normalize()
+		if legacy.Enabled || strings.TrimSpace(legacy.Provider) != "" || strings.TrimSpace(legacy.Model) != "" {
+			c.Recognition.Routes[MediaImage] = RecognitionRoute{
+				Enabled:        legacy.Enabled,
+				Provider:       legacy.Provider,
+				Model:          legacy.Model,
+				TimeoutSeconds: legacy.TimeoutSeconds,
+				MaxBytes:       legacy.MaxImageBytes,
+			}
+		}
+	}
+	c.Recognition.Normalize()
+	if image, exists := c.Recognition.Routes[MediaImage]; exists {
+		c.Vision = VisionRecognitionConfig{
+			Enabled: image.Enabled, Provider: image.Provider, Model: image.Model,
+			TimeoutSeconds: image.TimeoutSeconds, MaxImageBytes: image.MaxBytes,
+		}
+		c.Vision.Normalize()
 	}
 }
 
@@ -912,6 +1305,8 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 	cfg.UI.CloseBehavior = cfg.UI.CloseBehavior.Normalize()
 	cfg.WorkMode.Default = cfg.WorkMode.Default.Normalize()
 	cfg.Vision.Normalize()
+	cfg.NormalizeRecognition()
+	cfg.NormalizeGeneration()
 
 	return cfg, nil
 }
@@ -1054,7 +1449,9 @@ func Default() *Config {
 			TimeoutSeconds: 60,
 			MaxImageBytes:  10 << 20,
 		},
-		IM: DefaultIMConfig(),
+		Recognition: RecognitionConfig{Routes: map[MediaKind]RecognitionRoute{}},
+		Generation:  GenerationConfig{Defaults: map[GenerationOperation]GenerationModelTarget{}},
+		IM:          DefaultIMConfig(),
 	}
 }
 

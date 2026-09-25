@@ -17,9 +17,9 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/generation"
 	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/im/feishu"
-	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -35,6 +35,7 @@ import (
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/upgrade"
 	"github.com/p-chat/pchat/internal/version"
+	"github.com/p-chat/pchat/runtimeprofile"
 	"github.com/spf13/cobra"
 )
 
@@ -143,7 +144,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
-	tool.RegisterWebSearch(toolReg, cfg.Search)
 	// Build the search provider and install it as the
 	// process-global. The tool handler reads it via
 	// search.Global() on every call, so we update it here
@@ -159,15 +159,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		log.Printf("[search] web_search disabled (no provider configured)")
 	}
 	tool.RegisterGrep(toolReg, cfg)
-	if cfg.Knowledge.Enabled {
-		tool.RegisterWiki(toolReg, cfg)
-		// Migrate legacy wiki_sections → three-level index_nodes.
-		var bases []knowledge.BaseRef
-		for _, b := range cfg.Knowledge.Bases {
-			bases = append(bases, knowledge.BaseRef{Name: b.Name, Path: b.Path, Enabled: b.Enabled})
-		}
-		knowledge.EnsureMigrated(bases)
-	}
+	server.SyncConfigDrivenTools(toolReg, cfg)
 
 	// Build the sub-agent catalog. Three sources, in priority
 	// order (last wins):
@@ -203,17 +195,19 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// happens here so the `task` tool is live for every
 	// session from the first turn.
 	asyncMgr := subagent.NewAsyncManager()
+	parentProvider := defaultProviderName(cfg)
 	runner := &subagent.Default{
-		Cfg:            cfg,
-		LLM:            llmClient,
-		StyleMgr:       styleMgr,
-		JobStore:       memStore,
-		ParentTools:    toolReg,
-		ParentStyle:    style.Style(currentStyleName(cfg)),
-		ParentProvider: defaultProviderName(cfg),
-		Registry:       subagentReg,
-		Cache:          subagent.NewCache(cfg.SubAgent.CacheTTLDuration()),
-		Async:          asyncMgr,
+		Cfg:                 cfg,
+		LLM:                 llmClient,
+		StyleMgr:            styleMgr,
+		JobStore:            memStore,
+		ParentTools:         toolReg,
+		ParentStyle:         style.Style(currentStyleName(cfg)),
+		ParentProvider:      parentProvider,
+		ParentProviderModel: defaultProviderModel(cfg, parentProvider),
+		Registry:            subagentReg,
+		Cache:               subagent.NewCache(cfg.SubAgent.CacheTTLDuration()),
+		Async:               asyncMgr,
 	}
 	tt, hh := runner.Tool()
 	toolReg.Register(tt, hh)
@@ -249,6 +243,20 @@ func runServer(cmd *cobra.Command, args []string) error {
 	}
 
 	agt := agent.New(cfg, llmClient, styleMgr, memStore, toolReg)
+	generatedStore := generation.NewLocalAssetStore(paths.GeneratedDir(), "/api/v1/generated")
+	generationResolver := &generation.DiskInputResolver{
+		UploadDir: paths.UploadsDir(),
+		Generated: generatedStore,
+		UploadOwnedBy: func(sessionID, uploadID string) bool {
+			for _, candidate := range memStore.UploadRefsForConversation(sessionID) {
+				if candidate == uploadID {
+					return true
+				}
+			}
+			return false
+		},
+	}
+	agt.SetGenerationExecutor(generation.NewHTTPExecutor(generationResolver, generatedStore))
 	// Expose the sub-agent catalog to the agent's tool
 	// dispatcher so the `task` tool can resolve
 	// subagent_type at call time. The adapter is a thin
@@ -284,6 +292,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 		staticFS = http.Dir(wd)
 	}
 	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
+	srv.Handler().SetGeneratedAssetStore(generatedStore)
+	srv.SetSubagentRunner(runner)
 	srv.Handler().SetSubagentJobCanceller(asyncMgr)
 	srv.Handler().SetSubagentJobEvents(asyncMgr)
 
@@ -328,25 +338,56 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Auto-index knowledge bases on startup (if enabled).
 	srv.Handler().AutoIndexKnowledgeBases()
 
-	// PCHAT_PORT overrides the configured port. This is how the
-	// parent process (pchat / pchat-gui) tells us which ephemeral
-	// port to bind to. The host stays as configured.
-	port := cfg.Server.Port
-	if p := serverproc.PortFromEnv(); p > 0 {
-		port = p
+	// 只绑定一次，并在 Serve 全程持有 listener。PCHAT_PORT=0 直接交给操作系统
+	// 分配端口，避免父子进程间原先“探测—关闭—重新绑定”的竞态。
+	// Bind once and retain the listener through Serve. PCHAT_PORT=0 delegates
+	// allocation to the OS without the old probe-close-rebind race.
+	listener, err := serverproc.Listen(cfg.Server.Host, cfg.Server.Port)
+	if err != nil {
+		return err
 	}
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, port)
+	addr := listener.Addr().String()
+	profile, err := runtimeprofile.Current(paths.GlobalDir())
+	if err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("resolve runtime profile: %w", err)
+	}
+	instanceID := strings.TrimSpace(os.Getenv(runtimeprofile.InstanceEnv))
+	if instanceID == "" {
+		instanceID, err = runtimeprofile.NewInstanceID()
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+	}
+	srv.Handler().SetRuntimeIdentity(profile, instanceID)
+	srv.Handler().SetListenAddr(addr)
+
+	runtimeFile := strings.TrimSpace(os.Getenv(runtimeprofile.RuntimeFileEnv))
+	if runtimeFile != "" {
+		announcement := runtimeprofile.Announcement{
+			ProfileID:   profile.ID,
+			ProfileName: profile.Name,
+			InstanceID:  instanceID,
+			PID:         os.Getpid(),
+			Address:     addr,
+			BaseURL:     "http://" + addr,
+		}
+		if err := runtimeprofile.WriteAnnouncement(runtimeFile, announcement); err != nil {
+			_ = listener.Close()
+			return err
+		}
+		defer os.Remove(runtimeFile)
+	}
+
 	fmt.Printf("P-Chat Server 启动于 http://%s\n", addr)
-	log.Printf("pchat-server version=%s question-tracing=enabled", version.FullString())
+	log.Printf("pchat-server version=%s profile=%s profile_id=%s instance_id=%s question-tracing=enabled",
+		version.FullString(), profile.Name, profile.ID, instanceID)
 	// Surface the active home dir + the strategy that picked
 	// it. The user can grep this in bin/pchat-server.log to
 	// verify dev/prod isolation is set up the way they expect.
 	log.Printf("home dir: %s (strategy: %s)", paths.GlobalDir(), paths.ResolveStrategy())
-	// Tell the handler the real address so the browser extension
-	// UI can display the correct WebSocket URL — critical when
-	// pchat-gui assigns a dynamic port via PCHAT_PORT.
-	srv.Handler().SetListenAddr(addr)
-	return srv.RunAt(addr)
+	return srv.RunListener(listener)
 }
 
 func configToMCP(cfg config.MCPServerConfig) mcp.ServerConfig {
@@ -458,6 +499,21 @@ func defaultProviderName(cfg *config.Config) string {
 	}
 	if len(cfg.LLM.Providers) > 0 {
 		return cfg.LLM.Providers[0].Name
+	}
+	return ""
+}
+
+func defaultProviderModel(cfg *config.Config, provider string) string {
+	if cfg == nil {
+		return ""
+	}
+	if provider == "" {
+		provider = defaultProviderName(cfg)
+	}
+	for _, p := range cfg.LLM.Providers {
+		if p.Name == provider {
+			return p.EffectiveModel()
+		}
 	}
 	return ""
 }

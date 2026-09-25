@@ -20,9 +20,11 @@ import { Check, X, Clipboard, ChevronDown, ChevronRight } from './icons'
 import ThinkingBlock from './ThinkingBlock.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import ToolCallGroup from './ToolCallGroup.vue'
+import QuestionTable from './QuestionTable.vue'
 import LoadingDots from './LoadingDots.vue'
 import TypedText from './TypedText.vue'
 import { groupConsecutiveToolParts } from '../utils/toolPartGrouping'
+import { copyText } from '../utils/clipboard'
 
 const props = defineProps<{ part: SubAgentPart }>()
 
@@ -64,6 +66,7 @@ const agentLabel = computed(() => {
   if (!t) return 'sub-agent'
   return t
 })
+const hasExplicitAgentType = computed(() => Boolean(props.part.agentType))
 
 // Accent color with safe fallback. The server sends
 // either "#RRGGBB" or a CSS color name. We just inject
@@ -79,8 +82,19 @@ const accentStyle = computed(() => {
 })
 
 const titleLabel = computed(() => `${agentLabel.value} · ${props.part.task || '未命名子任务'}`)
+const taskTitle = computed(() => props.part.task || '未命名子任务')
 
-const runModeLabel = computed(() => props.part.runMode === 'async' ? '后台子代理' : '常规子代理')
+const runModeShortLabel = computed(() => props.part.runMode === 'async' ? '后台' : '同步')
+const runModeTitle = computed(() => props.part.runMode === 'async' ? '后台异步执行' : '当前对话内执行')
+const agentMetaLabel = computed(() => {
+  if (!hasExplicitAgentType.value) return runModeShortLabel.value
+  return `${agentLabel.value} · ${runModeShortLabel.value}`
+})
+const agentMetaTitle = computed(() => {
+  const desc = props.part.agentDescription ? ` - ${props.part.agentDescription}` : ''
+  if (!hasExplicitAgentType.value) return `子代理，${runModeTitle.value}${desc}`
+  return `子代理类型: ${agentLabel.value}，${runModeTitle.value}${desc}`
+})
 
 const toolCount = computed(() => props.part.parts.filter(p => p.kind === 'tool').length)
 
@@ -123,11 +137,11 @@ const copyState = ref<'idle' | 'copied' | 'err'>('idle')
 async function copyTaskId() {
   const id = props.part.taskId
   if (!id) return
-  try {
-    await navigator.clipboard.writeText(id)
+  const ok = await copyText(id)
+  if (ok) {
     copyState.value = 'copied'
     setTimeout(() => (copyState.value = 'idle'), 1200)
-  } catch {
+  } else {
     copyState.value = 'err'
     setTimeout(() => (copyState.value = 'idle'), 1200)
   }
@@ -254,17 +268,20 @@ onBeforeUnmount(() => clearStuckTimer())
       @click="toggle"
       :title="open ? '收起子代理消息' : '展开子代理消息'"
     >
-      <span class="sub-icon">{{ agentLabel.charAt(0).toUpperCase() }}</span>
       <span
-        class="sub-run-mode"
+        class="sub-agent-meta"
         :class="'mode-' + (part.runMode === 'async' ? 'async' : 'sync')"
-        :title="part.runMode === 'async' ? '后台异步执行的子代理' : '当前对话内执行的常规子代理'"
-      >{{ runModeLabel }}</span>
+        :title="agentMetaTitle"
+      >
+        <span v-if="hasExplicitAgentType" class="sub-agent-type">{{ agentLabel }}</span>
+        <span v-if="hasExplicitAgentType" class="sub-agent-sep" aria-hidden="true">·</span>
+        <span class="sub-agent-mode">{{ runModeShortLabel }}</span>
+      </span>
       <span class="sub-title-wrap">
         <span
           class="sub-title"
           :title="part.agentDescription ? `${titleLabel} - ${part.agentDescription}` : titleLabel"
-        >{{ titleLabel }}</span>
+        >{{ taskTitle }}</span>
         <span v-if="!open && latestActivity" class="sub-activity">{{ latestActivity }}</span>
       </span>
       <span v-if="part.agentModel" class="sub-model" :title="'model: ' + part.agentModel">{{ part.agentModel }}</span>
@@ -297,11 +314,11 @@ onBeforeUnmount(() => clearStuckTimer())
     <div v-if="open" class="sub-body">
       <div class="sub-body-summary">
         <div class="sub-summary-main">
-          <span class="sub-summary-title">{{ titleLabel }}</span>
+          <span class="sub-summary-title">{{ taskTitle }}</span>
           <span class="sub-summary-status" :class="'status-' + part.status">{{ statusLabel() }}</span>
         </div>
         <div class="sub-summary-meta">
-          <span>{{ runModeLabel }}</span>
+          <span>{{ agentMetaLabel }}</span>
           <span>{{ part.parts.length }} parts</span>
           <span v-if="toolCount > 0">{{ toolCount }} tools</span>
           <span v-if="part.elapsed">{{ part.elapsed }}</span>
@@ -318,17 +335,34 @@ onBeforeUnmount(() => clearStuckTimer())
         :title="`展开更早的 ${hiddenPartCount} 条子代理记录`"
         @click.stop="showEarlierParts"
       >已折叠 {{ hiddenPartCount }} 条过程记录</button>
-      <div v-if="visibleRenderEntries.length" class="sub-stream">
+      <div v-if="visibleRenderEntries.length" class="sub-dialogue-list">
         <div
           v-for="entry in visibleRenderEntries"
           :key="entry.kind === 'tool_group' ? `tool-group-${entry.startIndex}` : entry.index"
-          class="sub-stream-item"
-          :class="entry.kind === 'tool_group' ? 'stream-tool' : `stream-${entry.part.kind}`"
+          class="sub-dialogue-row"
+          :class="entry.kind === 'tool_group' ? 'dialogue-tool' : `dialogue-${entry.part.kind}`"
         >
-          <div class="sub-stream-rail" aria-hidden="true">
-            <span class="sub-stream-dot"></span>
+          <div class="sub-dialogue-avatar" aria-hidden="true">
+            <span v-if="entry.kind === 'tool_group'">T</span>
+            <span v-else-if="entry.part.kind === 'thinking'">R</span>
+            <span v-else-if="entry.part.kind === 'tool'">T</span>
+            <span v-else-if="entry.part.kind === 'question'">Q</span>
+            <span v-else>A</span>
           </div>
-          <div class="sub-stream-content">
+          <div class="sub-dialogue-content">
+            <div class="sub-dialogue-head">
+              <span class="sub-dialogue-name">
+                <template v-if="entry.kind === 'tool_group'">工具批处理</template>
+                <template v-else-if="entry.part.kind === 'thinking'">思考过程</template>
+                <template v-else-if="entry.part.kind === 'tool'">工具调用</template>
+                <template v-else-if="entry.part.kind === 'question'">等待选择</template>
+                <template v-else>子代理回复</template>
+              </span>
+              <span class="sub-dialogue-kind">
+                <template v-if="entry.kind === 'tool_group'">{{ entry.parts.length }} tools</template>
+                <template v-else>{{ entry.part.kind }}</template>
+              </span>
+            </div>
             <ToolCallGroup
               v-if="entry.kind === 'tool_group'"
               :parts="entry.parts"
@@ -379,25 +413,20 @@ onBeforeUnmount(() => clearStuckTimer())
 </template>
 
 <style scoped>
-/* Sub-agent card. Same chrome as ToolCallCard (3px left
- * status rail, surface-2 body, radius-md) but the body
- * has a 1px left border + dashed border-top to nest it
- * visually inside the parent assistant message. The
- * agent's accent color (sub_agent_color) drives the rail
- * tint; falls back to a neutral quaternary border when
- * unset. */
+/* Sub-agent card: compact event-row header plus a nested
+ * conversation view when expanded. The optional accent
+ * color tints chips without adding a heavy vertical rail. */
 .sub-agent-card {
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-left: 3px solid var(--sub-accent, var(--border-strong));
-  border-radius: var(--radius-md);
-  margin: 6px 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  margin: 0;
   overflow: hidden;
-  font-size: 12.5px;
+  font-size: 12px;
 }
-.sub-agent-card.status-start { border-left-color: var(--sub-accent, var(--brand-500)); }
-.sub-agent-card.status-ok    { border-left-color: var(--sub-accent, var(--success-500)); }
-.sub-agent-card.status-err   { border-left-color: var(--sub-accent, var(--error-500)); }
+.sub-agent-card.status-err {
+  border-left: 2px solid var(--error-500);
+}
 
 .sub-header {
   display: flex;
@@ -406,7 +435,8 @@ onBeforeUnmount(() => clearStuckTimer())
   width: 100%;
   background: transparent;
   border: 0;
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-1) var(--space-2);
+  min-height: calc(var(--space-6) - var(--space-1));
   text-align: left;
   cursor: pointer;
   color: var(--text-secondary);
@@ -415,42 +445,38 @@ onBeforeUnmount(() => clearStuckTimer())
   transition: background var(--dur-fast) var(--ease-out);
 }
 .sub-header:hover { background: var(--surface-3); }
-/* The running state used to sweep a background gradient
- * (background-position animation = a full repaint + GPU raster pass
- * every frame). Since 2026-08-06 it's a static surface tint instead —
- * the running signal is carried by the left accent border, the status
- * text and the live parts counter, none of which cost per-frame work. */
+/* Running: static surface tint only — no shimmer / gradient sweep. */
 .sub-header.running {
-  background: var(--surface-3);
+  background: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 6%, var(--surface-2));
 }
-.sub-icon {
-  display: inline-flex;
-  align-items: center; justify-content: center;
-  width: 18px; height: 18px;
-  border-radius: var(--radius-sm);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--sub-accent, var(--brand-500));
-  background: var(--sub-accent-soft, var(--brand-50));
-  flex-shrink: 0;
-}
-.sub-run-mode {
+.sub-agent-meta {
   display: inline-flex;
   align-items: center;
-  padding: 1px 6px;
-  border-radius: var(--radius-pill);
-  border: 1px solid var(--border-subtle);
-  background: var(--surface-3);
+  gap: 4px;
+  max-width: 170px;
   color: var(--text-tertiary);
   font-size: 10.5px;
   line-height: 1.35;
   white-space: nowrap;
   flex-shrink: 0;
 }
-.sub-run-mode.mode-async {
-  border-color: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 24%, var(--border-subtle));
-  background: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 12%, var(--surface-2));
+.sub-agent-meta.mode-async .sub-agent-mode {
   color: var(--sub-accent, var(--brand-500));
+}
+.sub-agent-type {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+}
+.sub-agent-sep {
+  color: var(--text-quaternary);
+}
+.sub-agent-mode {
+  flex-shrink: 0;
+}
+.sub-agent-meta.mode-sync .sub-agent-mode {
+  color: var(--text-tertiary);
 }
 .sub-title-wrap {
   display: flex;
@@ -637,57 +663,86 @@ onBeforeUnmount(() => clearStuckTimer())
   color: var(--text-secondary);
 }
 
-.sub-stream {
+.sub-dialogue-list {
   display: grid;
-  gap: var(--space-4);
-}
-.sub-stream-item {
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
   gap: var(--space-3);
-  position: relative;
 }
-.sub-stream-rail {
-  position: relative;
-  display: flex;
-  justify-content: center;
+.sub-dialogue-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: var(--space-2);
+  align-items: start;
 }
-.sub-stream-rail::before {
-  content: "";
-  position: absolute;
-  top: 14px;
-  bottom: calc(-1 * var(--space-4));
-  width: 1px;
-  background: var(--border-subtle);
-}
-.sub-stream-item:last-child .sub-stream-rail::before {
-  display: none;
-}
-.sub-stream-dot {
-  width: 9px;
-  height: 9px;
-  margin-top: var(--space-2);
-  border: 2px solid var(--surface-1);
+.sub-dialogue-avatar {
+  width: 24px;
+  height: 24px;
+  margin-top: 2px;
   border-radius: var(--radius-pill);
-  background: var(--text-quaternary);
-  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
 }
-.stream-thinking .sub-stream-dot { background: var(--brand-500); }
-.stream-tool .sub-stream-dot { background: var(--success-500); }
-.stream-question .sub-stream-dot { background: var(--warn-500); }
-.stream-text .sub-stream-dot { background: var(--sub-accent, var(--brand-500)); }
-.sub-stream-content {
+.dialogue-text .sub-dialogue-avatar {
+  background: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 10%, var(--surface-2));
+  color: var(--sub-accent, var(--brand-500));
+}
+.dialogue-thinking .sub-dialogue-avatar {
+  color: var(--thinking-icon);
+}
+.dialogue-tool .sub-dialogue-avatar {
+  color: var(--success-500);
+}
+.dialogue-question .sub-dialogue-avatar {
+  color: var(--warn-500);
+}
+.sub-dialogue-content {
   min-width: 0;
+  display: grid;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.sub-dialogue-row:last-child .sub-dialogue-content {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+.sub-dialogue-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.sub-dialogue-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.sub-dialogue-kind {
+  flex-shrink: 0;
+  color: var(--text-quaternary);
+  font-family: var(--font-mono);
 }
 .sub-text-block {
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border-subtle);
-  border-left: 3px solid var(--sub-accent, var(--brand-500));
   border-radius: var(--radius-md);
   background: var(--surface-0);
 }
 .sub-text-block.live {
-  border-left-color: var(--brand-500);
+  border-color: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 24%, var(--border-subtle));
 }
 .sub-text {
   margin: 0;
@@ -719,38 +774,38 @@ onBeforeUnmount(() => clearStuckTimer())
 .sub-text :deep(strong) { color: var(--text-primary); font-weight: 600; }
 .sub-text :deep(em) { color: var(--text-secondary); }
 
-.sub-stream-content :deep(.tool-group) {
+.sub-dialogue-content :deep(.tool-group) {
   margin: 0;
   background: var(--surface-2);
 }
-.sub-stream-content :deep(.tool-group-header) {
+.sub-dialogue-content :deep(.tool-group-header) {
   padding: var(--space-3) var(--space-4);
 }
-.sub-stream-content :deep(.tool-group-preview) {
+.sub-dialogue-content :deep(.tool-group-preview) {
   gap: var(--space-2);
   padding: var(--space-3) var(--space-4);
 }
-.sub-stream-content :deep(.tool-group-row) {
+.sub-dialogue-content :deep(.tool-group-row) {
   min-height: 28px;
   gap: var(--space-3);
 }
-.sub-stream-content :deep(.tool-group-body) {
+.sub-dialogue-content :deep(.tool-group-body) {
   padding: var(--space-3) var(--space-4);
 }
-.sub-stream-content :deep(.tool-card) {
+.sub-dialogue-content :deep(.tool-card) {
   margin: 0 0 var(--space-2);
 }
-.sub-stream-content :deep(.tool-card:last-child) {
+.sub-dialogue-content :deep(.tool-card:last-child) {
   margin-bottom: 0;
 }
-.sub-stream-content :deep(.tool-body) {
+.sub-dialogue-content :deep(.tool-body) {
   padding: var(--space-3) var(--space-4);
 }
-.sub-stream-content :deep(.tool-args pre),
-.sub-stream-content :deep(.tool-result pre),
-.sub-stream-content :deep(.tool-error pre) {
+.sub-dialogue-content :deep(.tool-args pre),
+.sub-dialogue-content :deep(.tool-result pre),
+.sub-dialogue-content :deep(.tool-error pre) {
   padding: var(--space-3);
-  max-height: 320px;
+  max-height: 160px;
 }
 .sub-taskid {
   display: flex;

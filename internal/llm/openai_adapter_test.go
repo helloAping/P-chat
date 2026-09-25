@@ -27,6 +27,20 @@ func mustBuildOpenAI(t *testing.T, a *OpenAIAdapter, msgs []ChatMessage, system 
 	return out
 }
 
+func TestOpenAIAdapterUsesConfiguredEndpointVerbatim(t *testing.T) {
+	endpoint := "https://ark.example/api/v3/custom-chat"
+	req, err := NewOpenAIAdapter(endpoint, "sk-test", "ark").Build(
+		[]ChatMessage{{Role: RoleUser, Type: TypeText, Content: "hi"}},
+		"model", 0, nil, "", 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.URL != endpoint {
+		t.Fatalf("request URL = %q, want exact configured endpoint %q", req.URL, endpoint)
+	}
+}
+
 // TestOpenAIBuild_ParallelToolCalls_Merged is the regression
 // test for the 2026-07-17 incident: the agent emitted 2 parallel
 // list_files tool_calls, the previous adapter produced 2 separate
@@ -313,6 +327,30 @@ func TestOpenAIBuild_EmptyImageDegradesToText(t *testing.T) {
 	body := string(mustBody(a, msgs, ""))
 	if strings.Contains(body, "data:image/png;base64,") || strings.Contains(body, `"type":"image_url"`) {
 		t.Fatalf("empty image must not emit image_url. body=%s", body)
+	}
+}
+
+func TestOpenAIBuild_AudioAndVideoUseMediaContentParts(t *testing.T) {
+	a := NewOpenAIAdapter("https://api.example.com", "sk-test", "test")
+	req, err := a.Build([]ChatMessage{
+		{Role: RoleUser, Type: TypeAudio, Content: "AUDIO", MimeType: "audio/mpeg", Name: "voice.mp3"},
+		{Role: RoleUser, Type: TypeVideo, Content: "VIDEO", MimeType: "video/mp4", Name: "clip.mp4"},
+	}, "test-model", 0, nil, "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	messages := body["messages"].([]any)
+	audioContent := messages[0].(map[string]any)["content"].([]any)
+	videoContent := messages[1].(map[string]any)["content"].([]any)
+	if audioContent[1].(map[string]any)["type"] != "input_audio" {
+		t.Fatalf("audio content = %#v", audioContent)
+	}
+	if videoContent[1].(map[string]any)["type"] != "file" {
+		t.Fatalf("video content = %#v", videoContent)
 	}
 }
 

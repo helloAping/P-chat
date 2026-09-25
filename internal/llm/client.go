@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/requestheader"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/trace"
 	openai "github.com/sashabaranov/go-openai"
@@ -37,6 +38,9 @@ type StreamChunk struct {
 	Err       error
 	TokensIn  int
 	TokensOut int
+	// CacheUsage 仅在上游报告缓存数据时设置，区分未报告与零命中。
+	// CacheUsage distinguishes missing cache telemetry from a reported zero hit.
+	CacheUsage *CacheUsage
 
 	// Native tool calls (from OpenAI tool_calls field).
 	// Each chunk may contain a partial tool call. Collect them via index.
@@ -81,20 +85,37 @@ type ProviderInfo struct {
 }
 
 type providerEntry struct {
-	name      string // provider name (for error messages)
-	protocol  string // "openai" or "anthropic"
-	openai    *openai.Client
-	anthropic *AnthropicClient
-	adapter   ProtocolAdapter // new protocol-agnostic adapter
-	model     string
-	apiKey    string
-	baseURL   string
+	name          string // provider name (for error messages)
+	protocol      string // openai/openai_chat/openai_responses/anthropic/anthropic_messages
+	model         string
+	apiKey        string
+	baseURL       string
+	modelAPIURLs  map[string]string
+	customHeaders map[string]string
 
 	// ResponseHeaderTimeout bounds a stalled request before the server
 	// responds. StreamIdleTimeout only applies after a response is open,
 	// so a long-running response remains valid while it keeps producing data.
 	responseHeaderTimeout time.Duration
 	streamIdleTimeout     time.Duration
+}
+
+func (p *providerEntry) endpointForModel(model string) string {
+	if endpoint := strings.TrimSpace(p.modelAPIURLs[model]); endpoint != "" {
+		return endpoint
+	}
+	return config.JoinAPIURL(p.baseURL, config.DefaultLLMAPIEndpoint(p.protocol))
+}
+
+func (p *providerEntry) adapterForModel(model string) ProtocolAdapter {
+	endpoint := p.endpointForModel(model)
+	if config.ProtocolIsAnthropic(p.protocol) {
+		return NewAnthropicAdapter(endpoint, p.apiKey, p.name)
+	}
+	if config.ProtocolIsOpenAIResponses(p.protocol) {
+		return NewOpenAIResponsesAdapter(endpoint, p.apiKey, p.name)
+	}
+	return NewOpenAIAdapter(endpoint, p.apiKey, p.name)
 }
 
 const (
@@ -290,20 +311,19 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 			protocol:              p.GetProtocol(),
 			model:                 p.EffectiveModel(), // start with the default model
 			apiKey:                p.APIKey,
-			baseURL:               p.BaseURL,
+			baseURL:               p.EffectiveBaseURL(),
+			modelAPIURLs:          make(map[string]string),
+			customHeaders:         requestheader.CloneTemplates(p.CustomHeaders),
 			responseHeaderTimeout: defaultResponseHeaderTimeout,
 			streamIdleTimeout:     defaultStreamIdleTimeout,
 		}
-
-		switch p.GetProtocol() {
-		case "anthropic":
-			entry.anthropic = NewAnthropicClient(p.BaseURL, p.APIKey, p.EffectiveModel())
-			entry.adapter = NewAnthropicAdapter(p.BaseURL, p.APIKey, p.Name)
-		default: // "openai"
-			clientCfg := openai.DefaultConfig(p.APIKey)
-			clientCfg.BaseURL = p.BaseURL
-			entry.openai = openai.NewClientWithConfig(clientCfg)
-			entry.adapter = NewOpenAIAdapter(p.BaseURL, p.APIKey, p.Name)
+		if err := requestheader.ValidateTemplates(entry.customHeaders); err != nil {
+			return fmt.Errorf("provider %q custom_headers: %w", p.Name, err)
+		}
+		for _, model := range p.AllModels() {
+			if model.EffectiveType() == config.ModelTypeLLM {
+				entry.modelAPIURLs[model.Name] = p.ModelAPIURL(model.Name)
+			}
 		}
 
 		c.providers[p.Name] = entry
@@ -385,7 +405,8 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	// System prompt is extracted from messages with role=system
 	// by the adapter; we pass an empty string here since
 	// ChatMessage[] already includes system messages.
-	req, err := p.adapter.Build(messages, model, maxTokens, tools, "", float32(opts.Temperature), float32(opts.TopP))
+	adapter := p.adapterForModel(model)
+	req, err := adapter.Build(messages, model, maxTokens, tools, "", float32(opts.Temperature), float32(opts.TopP))
 	if err != nil {
 		ch := make(chan StreamChunk, 1)
 		ch <- StreamChunk{Err: err}
@@ -434,6 +455,13 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	for k, v := range req.Headers {
 		httpReq.Header.Set(k, v)
 	}
+	if err := requestheader.Apply(ctx, httpReq.Header, p.customHeaders); err != nil {
+		cancelStream()
+		ch := make(chan StreamChunk, 1)
+		ch <- StreamChunk{Err: fmt.Errorf("apply provider custom headers: %w", err)}
+		close(ch)
+		return ch
+	}
 
 	headerTimeout, idleTimeout := streamTimeouts(p)
 	httpClient := streamingHTTPClient(headerTimeout)
@@ -456,7 +484,7 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	}
 
 	body := newIdleTimeoutReader(resp.Body, idleTimeout, cancelStream)
-	return manageStream(ctx, cancelStream, p.name, body, p.adapter.ParseStream(body))
+	return manageStream(ctx, cancelStream, p.name, body, adapter.ParseStream(body))
 }
 
 // ChatCM sends a non-streaming chat-completions request using the
@@ -480,7 +508,8 @@ func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, mes
 		maxTokens = mt
 	}
 
-	req, err := p.adapter.Build(messages, model, maxTokens, nil, "", float32(opts.Temperature), float32(opts.TopP))
+	adapter := p.adapterForModel(model)
+	req, err := adapter.Build(messages, model, maxTokens, nil, "", float32(opts.Temperature), float32(opts.TopP))
 	if err != nil {
 		return "", err
 	}
@@ -511,6 +540,9 @@ func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, mes
 	httpReq.Header.Del("Connection")
 	if tid := trace.FromContext(ctx); tid != "" {
 		httpReq.Header.Set("X-Trace-Id", tid)
+	}
+	if err := requestheader.Apply(ctx, httpReq.Header, p.customHeaders); err != nil {
+		return "", fmt.Errorf("apply provider custom headers: %w", err)
 	}
 
 	resp, err := NewHTTPClient().Do(httpReq)
@@ -551,7 +583,7 @@ func parseNonStreamContent(protocol string, body []byte) (string, error) {
 	if proxyErr := extractProxyError(body); proxyErr != "" {
 		return "", errors.New(proxyErr)
 	}
-	if protocol == "anthropic" {
+	if config.ProtocolIsAnthropic(protocol) {
 		var resp anthropicResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
 			return "", fmt.Errorf("decode anthropic response: %w", err)
@@ -566,6 +598,9 @@ func parseNonStreamContent(protocol string, body []byte) (string, error) {
 			return text, nil
 		}
 		return "", fmt.Errorf("empty response from anthropic")
+	}
+	if config.ProtocolIsOpenAIResponses(protocol) {
+		return parseResponsesNonStreamContent(body)
 	}
 
 	var resp struct {
@@ -625,6 +660,68 @@ func ToolsFromRegistryDef(tools []tool.Tool) []ToolDef {
 	return out
 }
 
+func toolDefsFromOpenAITools(tools []openai.Tool) []ToolDef {
+	out := make([]ToolDef, 0, len(tools))
+	for _, t := range tools {
+		if t.Function == nil {
+			continue
+		}
+		params, _ := json.Marshal(t.Function.Parameters)
+		out = append(out, ToolDef{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			Parameters:  params,
+		})
+	}
+	return out
+}
+
+func chatMessagesFromOpenAI(messages []Message) []ChatMessage {
+	out := make([]ChatMessage, 0, len(messages))
+	for _, m := range messages {
+		role := m.Role
+		if role == "" {
+			role = RoleUser
+		}
+		if len(m.MultiContent) > 0 {
+			for _, part := range m.MultiContent {
+				switch part.Type {
+				case openai.ChatMessagePartTypeText:
+					out = append(out, ChatMessage{Role: role, Type: TypeText, Content: part.Text})
+				case openai.ChatMessagePartTypeImageURL:
+					content := ""
+					mimeType := ""
+					if part.ImageURL != nil {
+						if mime, data, ok := splitOpenAIDataURL(part.ImageURL.URL); ok {
+							mimeType = mime
+							content = data
+						} else {
+							content = part.ImageURL.URL
+						}
+					}
+					out = append(out, ChatMessage{Role: role, Type: TypeImage, Content: content, MimeType: mimeType})
+				}
+			}
+		} else if m.Content != "" {
+			msgType := TypeText
+			if role == openai.ChatMessageRoleTool {
+				msgType = TypeToolResult
+			}
+			out = append(out, ChatMessage{Role: role, Type: msgType, Content: m.Content, ToolID: m.ToolCallID, ToolName: m.Name})
+		}
+		for _, tc := range m.ToolCalls {
+			out = append(out, ChatMessage{
+				Role:      RoleAssistant,
+				Type:      TypeToolCall,
+				ToolID:    tc.ID,
+				ToolName:  tc.Function.Name,
+				ToolInput: tc.Function.Arguments,
+			})
+		}
+	}
+	return out
+}
+
 // disable tool calling.
 func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelName string, messages []Message, tools []openai.Tool, opts ChatOptions) <-chan StreamChunk {
 	p, ok := c.providers[providerName]
@@ -641,7 +738,11 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelN
 		model = p.model
 	}
 
-	if p.protocol == "anthropic" {
+	if config.ProtocolIsOpenAIResponses(p.protocol) {
+		return c.ChatStreamCM(ctx, providerName, model, chatMessagesFromOpenAI(messages), toolDefsFromOpenAITools(tools), opts)
+	}
+
+	if config.ProtocolIsAnthropic(p.protocol) {
 		// Anthropic support for tools is not implemented in this branch.
 		// Resolve max_tokens the same way the OpenAI branch does
 		// (per-model MaxTokensOutput > global opts.MaxTokens > 0)
@@ -650,7 +751,9 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelN
 		if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
 			anthMax = mt
 		}
-		return p.anthropic.ChatStream(ctx, model, messages, anthMax)
+		return NewAnthropicClient(p.endpointForModel(model), p.apiKey, model).
+			WithCustomHeaders(p.customHeaders).
+			ChatStream(ctx, model, messages, anthMax)
 	}
 
 	// OpenAI protocol
@@ -712,8 +815,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			ch <- StreamChunk{Err: fmt.Errorf("marshal openai request: %w", err)}
 			return
 		}
-		endpoint := strings.TrimRight(p.baseURL, "/") + "/chat/completions"
-		httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, endpoint, bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, p.endpointForModel(model), bytes.NewReader(body))
 		if err != nil {
 			ch <- StreamChunk{Err: fmt.Errorf("build openai request: %w", err)}
 			return
@@ -733,6 +835,10 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		}
 		if p.apiKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+		}
+		if err := requestheader.Apply(ctx, httpReq.Header, p.customHeaders); err != nil {
+			ch <- StreamChunk{Err: fmt.Errorf("apply provider custom headers: %w", err)}
+			return
 		}
 		headerTimeout, idleTimeout := streamTimeouts(p)
 		httpClient := streamingHTTPClient(headerTimeout)
@@ -892,10 +998,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			// choices; the SDK hoists it to the top of
 			// the next loop iteration's response.
 			if r.Usage != nil {
-				ch <- StreamChunk{
-					TokensIn:  r.Usage.PromptTokens,
-					TokensOut: r.Usage.CompletionTokens,
-				}
+				ch <- r.Usage.chunk()
 			}
 			// Last-resort fallback: if the standard
 			// struct parser found no content AND no
@@ -1001,9 +1104,14 @@ type openaiStreamToolCallFunc struct {
 }
 
 type openaiStreamUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens     int  `json:"prompt_tokens"`
+	CompletionTokens int  `json:"completion_tokens"`
+	TotalTokens      int  `json:"total_tokens"`
+	CacheHitTokens   *int `json:"prompt_cache_hit_tokens"`
+	CacheMissTokens  *int `json:"prompt_cache_miss_tokens"`
+	PromptDetails    *struct {
+		CachedTokens *int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 func (c *Client) Chat(ctx context.Context, providerName, modelName string, messages []Message) (string, error) {
@@ -1017,7 +1125,11 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		model = p.model
 	}
 
-	if p.protocol == "anthropic" {
+	if config.ProtocolIsOpenAIResponses(p.protocol) {
+		return c.ChatCM(ctx, providerName, model, chatMessagesFromOpenAI(messages), ChatOptions{})
+	}
+
+	if config.ProtocolIsAnthropic(p.protocol) {
 		// Resolve max_tokens: per-model MaxTokensOutput > 0
 		// (Anthropic's API requires a positive value; we don't
 		// consult a global default here — the non-streaming Chat
@@ -1026,10 +1138,13 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		if mt := c.ModelMaxTokensOutput(p.name, model); mt > 0 {
 			anthMax = mt
 		}
-		return p.anthropic.Chat(ctx, model, messages, anthMax)
+		return NewAnthropicClient(p.endpointForModel(model), p.apiKey, model).
+			WithCustomHeaders(p.customHeaders).
+			Chat(ctx, model, messages, anthMax)
 	}
 
-	// OpenAI protocol
+	// OpenAI protocol. The configured API URL is already the complete
+	// chat-completions endpoint; do not let an SDK append a path.
 	req := openai.ChatCompletionRequest{
 		Model:    model,
 		Messages: messages,
@@ -1041,15 +1156,38 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		req.MaxTokens = mt
 	}
 
-	resp, err := p.openai.CreateChatCompletion(ctx, req)
+	body, err := json.Marshal(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("marshal openai request: %w", err)
 	}
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("empty response")
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpointForModel(model), bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build openai request: %w", err)
 	}
-
-	return resp.Choices[0].Message.Content, nil
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	if p.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+	if tid := trace.FromContext(ctx); tid != "" {
+		httpReq.Header.Set("X-Trace-Id", tid)
+	}
+	if err := requestheader.Apply(ctx, httpReq.Header, p.customHeaders); err != nil {
+		return "", fmt.Errorf("apply provider custom headers: %w", err)
+	}
+	resp, err := NewHTTPClient().Do(httpReq)
+	if err != nil {
+		return "", ClassifyAPIError(p.name, err)
+	}
+	defer resp.Body.Close()
+	encoded, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if readErr != nil {
+		return "", ClassifyAPIError(p.name, readErr)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", ClassifyAPIError(p.name, fmt.Errorf("openai http %d: %s", resp.StatusCode, string(encoded)))
+	}
+	return parseNonStreamContent(p.protocol, encoded)
 }
 
 func (c *Client) ProviderNames() []string {
@@ -1096,7 +1234,14 @@ func (c *Client) GetProtocol(providerName string) string {
 func (c *Client) ModelsFor(providerName string) ([]config.ModelConfig, bool) {
 	for _, p := range c.cfgModels {
 		if p.Name == providerName {
-			return p.AllModels(), true
+			all := p.AllModels()
+			models := make([]config.ModelConfig, 0, len(all))
+			for _, model := range all {
+				if model.EffectiveType() == config.ModelTypeLLM {
+					models = append(models, model)
+				}
+			}
+			return models, true
 		}
 	}
 	return nil, false
@@ -1418,10 +1563,11 @@ func injectReasoning(body []byte, protocol, level string) []byte {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return body
 	}
-	switch protocol {
-	case "openai":
+	if config.ProtocolIsOpenAIResponses(protocol) {
+		m["reasoning"] = map[string]any{"effort": level}
+	} else if config.ProtocolIsOpenAICompatible(protocol) {
 		m["reasoning_effort"] = level
-	case "anthropic":
+	} else if config.ProtocolIsAnthropic(protocol) {
 		budget := reasoningBudget(level)
 		m["thinking"] = map[string]any{
 			"type":          "enabled",

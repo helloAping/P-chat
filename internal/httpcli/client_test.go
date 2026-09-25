@@ -63,6 +63,25 @@ func TestClient_PingFails(t *testing.T) {
 	}
 }
 
+func TestClient_ListSkills(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/skills" || r.URL.Query().Get("session_id") != "conv-1" {
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"skills":[{"name":"lark-doc","description":"Lark docs","scope":"user_standard"}]}`))
+	}))
+	defer srv.Close()
+
+	items, err := NewClient(srv.URL).ListSkills(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatalf("ListSkills: %v", err)
+	}
+	if len(items) != 1 || items[0].Name != "lark-doc" || items[0].Scope != "user_standard" {
+		t.Fatalf("items = %+v", items)
+	}
+}
+
 func TestClient_ListSessions_FreshServer(t *testing.T) {
 	// pchat-server auto-creates a "current" session on startup, so a
 	// brand-new server has 1 session, not 0. We verify the list
@@ -132,6 +151,40 @@ func TestClient_CreateListDeleteCycle(t *testing.T) {
 	}
 	if _, err := c.GetSession(ctx, sess.ID); err == nil {
 		t.Error("expected error fetching deleted session")
+	}
+}
+
+func TestClient_TurnQueueEditCycle(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+
+	sess, err := c.CreateSession(ctx, CreateSessionOpts{Title: "queue"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	item, err := c.EnqueueTurnQueueItem(ctx, sess.ID, TurnQueuePayload{
+		Message:     "before",
+		ClientMsgID: 1730000000001601,
+		Style:       "tech",
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	edited, err := c.EditTurnQueueItem(ctx, sess.ID, item.ID, "after")
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if edited.Message != "after" || edited.Status != "queued" {
+		t.Fatalf("unexpected edited item: %+v", edited)
+	}
+	items, err := c.ListTurnQueueItems(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(items) != 1 || items[0].Message != "after" {
+		t.Fatalf("unexpected queue list: %+v", items)
 	}
 }
 
@@ -383,6 +436,7 @@ func TestClient_ModelsForUsesProviderModelList(t *testing.T) {
 		Models: []Model{
 			{Name: "gpt-4o", Default: true},
 			{Name: "gpt-4o-mini", DisplayName: "GPT-4o mini"},
+			{Name: "video-model", Type: "media_generation"},
 		},
 	}})
 
@@ -391,7 +445,7 @@ func TestClient_ModelsForUsesProviderModelList(t *testing.T) {
 		t.Fatal("ModelsFor did not find provider")
 	}
 	if len(models) != 2 || models[1].Name != "gpt-4o-mini" {
-		t.Errorf("models = %#v, want complete provider list", models)
+		t.Errorf("models = %#v, want conversational provider models only", models)
 	}
 }
 

@@ -135,6 +135,17 @@ func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfi
 			PathClass:    classForPath(resolved, projectRoot),
 			RiskLevel:    "low",
 		}, true
+	case "skill_manage":
+		// 安装、导入或移除 Skill 会改变普通项目文件流程之外的 Agent 能力。
+		// Installing, importing, or removing a Skill changes capability outside ordinary project files.
+		// 因此始终向用户明确请求这项权限扩展。
+		// Always make that authority expansion explicit to the user.
+		return confirmTarget{
+			Decision:  tool.SandboxConfirm,
+			Reason:    "skill_manage changes installed agent capabilities",
+			PathClass: "global",
+			RiskLevel: "high",
+		}, true
 	default:
 		// P3-2: dynamic tools. The sandbox decision comes
 		// from the user's YAML `sandbox.exec` field, not

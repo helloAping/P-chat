@@ -317,6 +317,7 @@ func TestVisionHeuristic(t *testing.T) {
 // deepseek-v4-flash and other "modern" multimodal models the
 // user adds via the model editor.
 func TestModelSupportsVision_Config(t *testing.T) {
+	noInputModalities := []config.MediaKind{}
 	cfg := &config.Config{
 		LLM: config.LLMConfig{
 			Providers: []config.ProviderConfig{
@@ -337,6 +338,7 @@ func TestModelSupportsVision_Config(t *testing.T) {
 						// heuristic does NOT recognise as vision
 						// (e.g. an unknown local ollama name).
 						{Name: "llama3-text-only", Capabilities: config.Capabilities{}},
+						{Name: "gpt-4o-explicit-text", Capabilities: config.Capabilities{InputModalities: &noInputModalities}},
 					},
 				},
 			},
@@ -361,6 +363,9 @@ func TestModelSupportsVision_Config(t *testing.T) {
 		// ("llama3-text-only" is a synthetic name that the
 		// heuristic will not recognise as vision-capable.)
 		{"ollama", "llama3-text-only", false},
+		// An explicit empty capability selection is authoritative even when
+		// the model name would otherwise match the vision heuristic.
+		{"ollama", "gpt-4o-explicit-text", false},
 		// Empty capabilities + heuristic textOnly match → false.
 		{"ollama", "deepseek-v3", false},
 		// Provider found, model not in the configured list →
@@ -378,6 +383,45 @@ func TestModelSupportsVision_Config(t *testing.T) {
 		if got != c.want {
 			t.Errorf("modelSupportsVision(%q, %q) = %v, want %v", c.provider, c.model, got, c.want)
 		}
+	}
+}
+
+func TestMediaRecognitionRouteRequiresMatchingModelCapability(t *testing.T) {
+	imageOnly := []config.MediaKind{config.MediaImage}
+	cfg := &config.Config{
+		LLM: config.LLMConfig{Default: "media", Providers: []config.ProviderConfig{{
+			Name: "media", Protocol: "openai", BaseURL: "http://127.0.0.1:1/v1", APIKey: "test",
+			Models: []config.ModelConfig{{Name: "image-only", Default: true, Capabilities: config.Capabilities{InputModalities: &imageOnly}}},
+		}}},
+		Recognition: config.RecognitionConfig{Routes: map[config.MediaKind]config.RecognitionRoute{
+			config.MediaImage: {Enabled: true, Provider: "media", Model: "image-only"},
+			config.MediaAudio: {Enabled: true, Provider: "media", Model: "image-only"},
+		}},
+	}
+	client, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{cfg: cfg, llm: client}
+
+	if _, ok := a.mediaRecognitionRoute(config.MediaImage); !ok {
+		t.Fatal("image route should be available for an image-capable model")
+	}
+	if _, ok := a.mediaRecognitionRoute(config.MediaAudio); ok {
+		t.Fatal("audio route must not be available for an image-only model")
+	}
+}
+
+func TestEffectiveToolRecognitionCapabilitiesAddsImageFallback(t *testing.T) {
+	a := &Agent{}
+	got := a.effectiveToolRecognitionCapabilities(nil, true)
+	if len(got) != 1 || got[0] != config.MediaImage {
+		t.Fatalf("capabilities = %v, want image fallback", got)
+	}
+
+	got = a.effectiveToolRecognitionCapabilities([]config.MediaKind{config.MediaAudio}, true)
+	if len(got) != 1 || got[0] != config.MediaImage {
+		t.Fatalf("unconfigured audio plus image fallback = %v, want only image", got)
 	}
 }
 
@@ -502,7 +546,7 @@ func TestVisionGatedTools(t *testing.T) {
 	}
 
 	// Text-only model: screenshot dropped, everything else kept.
-	got := a.visionGatedTools("cs", "deepseek-v4-flash", base)
+	got := a.visionGatedTools("cs", "deepseek-v4-flash", false, base)
 	if hasShot(got) {
 		t.Error("deepseek-v4-flash (capabilities: {}) must NOT get browser_screenshot")
 	}
@@ -512,7 +556,7 @@ func TestVisionGatedTools(t *testing.T) {
 
 	// Vision models: screenshot stays.
 	for _, m := range []string{"mimo-v2.5", "minimax-m3"} {
-		got := a.visionGatedTools("cs", m, base)
+		got := a.visionGatedTools("cs", m, false, base)
 		if !hasShot(got) {
 			t.Errorf("%s (supports_vision: true) must keep browser_screenshot", m)
 		}
@@ -521,11 +565,15 @@ func TestVisionGatedTools(t *testing.T) {
 		}
 	}
 
+	if !hasShot(a.visionGatedTools("cs", "deepseek-v4-flash", true, base)) {
+		t.Error("image-recognition mode must keep browser_screenshot for text-only main models")
+	}
+
 	// Unknown model / provider: conservative deny.
-	if hasShot(a.visionGatedTools("cs", "some-unknown-model", base)) {
+	if hasShot(a.visionGatedTools("cs", "some-unknown-model", false, base)) {
 		t.Error("unknown model must not get browser_screenshot")
 	}
-	if hasShot(a.visionGatedTools("unknown-provider", "mimo-v2.5", base)) {
+	if hasShot(a.visionGatedTools("unknown-provider", "mimo-v2.5", false, base)) {
 		t.Error("unknown provider must not get browser_screenshot")
 	}
 }
@@ -566,6 +614,27 @@ func TestToolCallSignature(t *testing.T) {
 				t.Errorf("got %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+func TestBuildGenerationPolicyBlockDescribesHardGateAndFinalPrompt(t *testing.T) {
+	policy := buildGenerationPolicyBlock([]config.GenerationOperation{
+		config.GenerationImageToVideo,
+		config.GenerationImageToVideo,
+	})
+	if strings.Count(policy, string(config.GenerationImageToVideo)) != 1 {
+		t.Fatalf("operation should be listed once: %q", policy)
+	}
+	for _, want := range []string{"执行入口会再次校验", "opaque input_ref", "最终生成提示词", "不可信数据"} {
+		if !strings.Contains(policy, want) {
+			t.Fatalf("generation policy missing %q: %q", want, policy)
+		}
+	}
+	if strings.Contains(policy, "prompt_mode") || strings.Contains(policy, "提示词辅助") {
+		t.Fatalf("generation policy still exposes removed prompt-assist controls: %q", policy)
+	}
+	if got := buildGenerationPolicyBlock(nil); got != "" {
+		t.Fatalf("disabled generation policy = %q, want empty", got)
 	}
 }
 

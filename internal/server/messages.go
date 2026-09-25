@@ -69,6 +69,17 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "client_msg_id must be a positive integer"})
 		return
 	}
+	turnModeOverride := false
+	var turnModePolicy agent.TurnModePolicy
+	if req.TurnModePolicy != "" {
+		var ok bool
+		turnModePolicy, ok = agent.ParseTurnModePolicy(req.TurnModePolicy)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": `turn_mode_policy must be "auto", "plan", or "build"`})
+			return
+		}
+		turnModeOverride = true
+	}
 
 	// Serialise all state changes for a session, including the idempotency
 	// lookup below. A retry can arrive after the previous stream completed but
@@ -157,6 +168,20 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	if req.UseImageRecognition != nil {
 		useImageRecognition = h.getCfg().Vision.Enabled && *req.UseImageRecognition
 	}
+	if req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
+		var provider *string
+		var model *string
+		if req.SubAgentProvider != "" {
+			provider = &req.SubAgentProvider
+		}
+		if req.SubAgentModel != "" {
+			model = &req.SubAgentModel
+		}
+		if err := h.applySessionSubAgentModelPatch(id, req.SubAgentModelEnabled, provider, model); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
 	// Hydrate the durable plan before the agent builds its prompt. A
 	// resume request must see the interrupted in_progress item even after
@@ -185,6 +210,9 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	// the per-session variants so concurrent SendMessage calls on
 	// different sessions don't race.
 	meta := h.ensureMetaLoaded(id)
+	if !turnModeOverride {
+		turnModePolicy = agent.NormalizeTurnModePolicy(meta.TurnModePolicy, meta.PlanMode)
+	}
 	histMsgs, compSummary := h.loadHistoryForSend(c.Request.Context(), id, provider, model)
 	msgs := buildLLMMessages(histMsgs)
 	historyMessageCount := len(msgs)
@@ -197,14 +225,17 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	})
 
 	chatReq := agent.ChatRequest{
-		Style:               s,
-		WorkMode:            workMode,
-		Provider:            provider,
-		Model:               model,
-		Messages:            msgs,
-		HistoryMessageCount: historyMessageCount,
-		Attachments:         req.Attachments,
-		UseImageRecognition: useImageRecognition,
+		Style:                   s,
+		WorkMode:                workMode,
+		Provider:                provider,
+		Model:                   model,
+		Messages:                msgs,
+		HistoryMessageCount:     historyMessageCount,
+		Attachments:             req.Attachments,
+		UseImageRecognition:     useImageRecognition,
+		RecognitionCapabilities: h.sessionRecognitionCapabilities(id),
+		GenerationOperations:    h.sessionGenerationOperations(id),
+		SubagentModel:           h.sessionSubAgentModelPreference(id),
 		// Forward the frontend's client-minted row id. The
 		// agent uses it as the explicit SQLite row id for
 		// this turn's user message, so rollback/regen
@@ -217,7 +248,9 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		SessionID:         id,
 		ProjectRoot:       meta.ProjectPath,
 		SkillContext:      req.SkillContext,
-		PlanMode:          meta.PlanMode,
+		ActiveSkills:      append([]string(nil), req.ActiveSkills...),
+		PlanMode:          turnModePolicy == agent.TurnModePlan,
+		TurnModePolicy:    turnModePolicy,
 		PermissionLevel:   meta.PermissionLevel,
 		KBBase:            meta.KnowledgeBase,
 		AutoContinue:      h.sessionAutoContinue(id),

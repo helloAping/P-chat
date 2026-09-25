@@ -10,19 +10,21 @@
 
 ## 0. 当前快照
 
-> 快照日期：2026-07-31。
+> 快照日期：2026-09-22。
 
 | 文档 | 角色 | 使用方式 |
 |---|---|---|
 | `README.md` | 用户入口 + 快速状态摘要 | 面向安装、配置、GUI 操作、常见问题和“当前进度快照”。 |
+| `docs/p-chat-article-2026-09.md` | 完整图文指南 | 面向新用户，串联首次配置、项目、附件、知识库、媒体、Skill/MCP 与 CLI。 |
+| `docs/project-structure.md` | 项目结构与模块职责总览 | 面向维护者，回答目录归属、运行流、功能状态口径和新增功能文档检查。 |
 | `docs/feature-opportunities.md` | 当前项目进度与 backlog 真源 | 判断功能是否已落地、下一步排期看这里。 |
 | `CHANGELOG.md` | 历史开发记录 | 记录各轮交付和改动统计；其中旧阶段计划不自动等于当前 backlog。 |
 | `docs/plans/*.md` | 历史设计方案 | 做实现背景和设计追溯，不作为默认待办清单。 |
 | `.agents/docs/*.md` | agent 维护入口 | 改代码前按模块阅读，里面记录实现细节、关键文件和约束。 |
 
-当前代码侧的主线能力已经覆盖：三端运行形态、结构化 SSE 消息流、ReAct + 子 agent、auto-continue、项目级上下文、知识库三层索引、浏览器控制、动态工具、trace id、上下文检查器和基础 IM/MCP 集成。后续优先级应集中在“安全边界、可解释性、外部集成完整度、发布/文档体验”，而不是重复排期已落地功能。
+当前代码侧的主线能力已经覆盖：三端运行形态、dev/prod 运行隔离与动态端口、结构化 SSE 消息流、ReAct + 子 agent、auto-continue、项目级上下文、知识库三层索引、浏览器控制、动态工具、trace id、上下文检查器、会话导出、自动更新基础能力，以及实验中的 IM/MCP 集成。后续优先级应集中在“安全边界、可解释性、外部集成完整度、发布/文档体验”，而不是重复排期已落地功能。
 
-版本口径：仓库 `VERSION` 当前为 `1.0.8-dev`；`CHANGELOG.md` 已记录到 v1.0.9 的开发项，正式分发版本以 `VERSION` 和 release tag 为准。
+版本口径：仓库 `VERSION` 当前为 `1.0.13.beta`；正式分发版本以 `VERSION` 和 release tag 为准。
 
 ## 1. 已落地
 
@@ -61,6 +63,20 @@
 - 增量扫描优化（KB-05）：按文件 mtime 跳过未变文件、逐文件替换变更文件、清理删除文件，并在扫描状态暴露 changed/skipped/deleted/failed。
 - 项目系统：支持多项目目录注册、项目级 AGENTS.md / rules / skills 注入。
 - Provider / Model / Style 管理：GUI 设置面板已覆盖常见配置入口。
+
+### 1.5 发布、导出与外部入口
+- 会话导出：`internal/export` 支持 HTML/PDF/text 导出，server 暴露 `/api/v1/sessions/:id/export`。
+- 自动更新：`internal/update`、`cmd/pchat-updater`、`frontend/src/api/update.ts` 和 `scripts/package-update-zip.ps1` 已形成检查/下载/替换的基础链路。
+- IM 桥接：`internal/im` 已有 Gateway、飞书、微信 QR/长轮询、出站切分和 GUI `IMSettings.vue` 入口，当前仍按实验能力维护。
+- 浏览器扩展分发：`browser-extension/` 源码和 `scripts/package-browser-ext.ps1` 已接入 build 流程。
+- 诊断接口：`/api/v1/diagnostics/*` 提供内存、配置、heap/goroutine 快照等排查入口。
+
+### 1.6 多环境运行隔离
+
+- runtime profile：由规范化 data home 派生稳定身份，隔离 GUI 单实例锁、托盘窗口、非默认 WebView2 数据、配置、SQLite、日志和运行文件；dev 与正式版可同时打开。
+- 动态端口：正式 GUI 依次尝试 `15150-15159`，全部占用时回退到系统临时端口；dev/test/CLI 直接使用原子分配的临时端口；独立 server 保持配置端口严格绑定。
+- 启动身份校验：server 持有 listener 后原子发布启动公告，父进程同时校验 profile ID、每次启动重新生成的 instance ID 和 PID，再对 `/api/v1/health` 做同样的二次校验。
+- 安全重建：开发脚本仅停止当前仓库 `dev-bin/` 下的进程，安装/卸载脚本仅处理目标安装目录中的进程，不会按进程名误结束其他环境。
 
 ## 2. 可迭代任务明细
 
@@ -138,6 +154,7 @@
 | DOC-02 | 功能状态表 | 标记 `已实现 / 实验中 / 计划中 / 暂缓`，减少历史规划造成的误解。 | `README.md`、本文档、`docs/plans/*.md`。 | 增加状态字段；已完成计划从 backlog 移到已落地；暂缓项写原因。 | 当前文档维护最新状态，历史计划只作参考，不再作为默认待办来源。 | README 路线图和本文档状态一致；已实现功能不会重复排期。 |
 | DOC-03 | 版本升级说明 | 整理“需要重启 GUI / server”的场景，形成发布检查清单。 | `README.md`、`.agents/docs/versioning.md`、`.agents/docs/upgrade.md`、打包脚本。 | 发布文档增加升级步骤、重启条件、兼容性注意事项。 | 每次版本发布前检查配置迁移、server/gui 重启、扩展升级、数据库 schema。 | 用户升级后知道是否需要重启；发布遗漏减少。 |
 | DOC-04 | 用户问题模板 | 为报错反馈提供 trace id、日志位置、复现步骤模板。 | `README.md` FAQ、错误恢复中心、`internal/trace`、日志文档。 | README 增加反馈模板；GUI 错误中心一键复制诊断信息。 | 报错时统一收集 trace id、时间、会话、操作步骤、日志位置，减少来回追问。 | 用户能复制一段完整反馈信息；开发者能按 trace id 定位日志。 |
+| DOC-05 | 项目结构总览（已落地） | 用单页文档梳理顶层目录、源码模块、可执行入口、运行流和功能状态口径。 | `docs/project-structure.md`、`README.md`、`.agents/docs/INDEX.md`、`docs/modules/INDEX.md`。 | 新增结构文档；README 和索引指向该文档。 | 让新维护者先按“目录 → 模块 → 运行流 → 文档真源”建立项目地图，减少从历史 plans 里反推现状。 | 新增或调整目录/功能时有明确同步位置；README 和 agent 索引都能跳到结构总览。 |
 
 ## 3. 已移除或不再作为当前迭代
 
@@ -167,6 +184,7 @@
 ## 5. 任务拆分建议
 
 - 第一批小步：`DOC-01`、`UX-05`、`BR-01`、`DT-01` 已开始落地，当前已完成 README 操作说明、浏览器连接诊断、动态工具加载诊断。
+- 文档结构：`DOC-05` 已落地，后续目录或模块职责变化时同步维护 `docs/project-structure.md`。
 - 浏览器连续增强：BR-02 / BR-03 / BR-04 / BR-05 已落地（协议版本、多 tab、权限策略、模拟扩展 E2E）。
 - 第二批能力：`KB-01`、`KB-02`、`DT-04`、`AG-01`，优先提升 agent 实际可用性和安全边界。
 - 第三批增强：`MCP-01`、`SB-01`，这些涉及跨模块协议或运行环境，建议单独写设计文档后再做。

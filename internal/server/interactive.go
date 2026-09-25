@@ -21,6 +21,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -211,10 +212,10 @@ func (h *Handler) ConfirmResponse(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// ExecutePlan saves a user-reviewed plan as an assistant message
-// and clears plan mode so the next user message triggers actual
-// execution. The frontend should follow up by sending a normal
-// message (e.g. "请按计划执行") via the streaming endpoint.
+// ExecutePlan clears plan mode after the user has reviewed a plan.
+// The reviewed plan is already present in chat history as the previous
+// assistant response; the frontend follows up with a normal user turn
+// (e.g. "请按计划执行") via the streaming endpoint to start building.
 // POST /api/v1/sessions/:id/execute-plan
 
 func (h *Handler) ExecutePlan(c *gin.Context) {
@@ -235,19 +236,11 @@ func (h *Handler) ExecutePlan(c *gin.Context) {
 		return
 	}
 
-	h.store.AddChatMessageTo(id, llm.ChatMessage{
-		Role:        llm.RoleAssistant,
-		Type:        llm.TypeText,
-		Content:     body.PlanText,
-		MsgType:     llm.MsgTypeText,
-		SubmitToLLM: 1,
-	})
-	h.store.Flush()
-
 	// Turn off plan mode for this session.
+	m := h.ensureMetaLoaded(id)
 	h.metaMu.Lock()
-	m := h.meta[id]
 	m.PlanMode = false
+	m.TurnModePolicy = string(agent.TurnModeBuild)
 	h.meta[id] = m
 	h.metaMu.Unlock()
 	h.persistSessionMeta(id, m)
@@ -258,8 +251,10 @@ func (h *Handler) ExecutePlan(c *gin.Context) {
 // --- Project CRUD ---
 
 type projectResponse struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Branch string `json:"branch,omitempty"`
+	Dirty  *bool  `json:"dirty,omitempty"`
 }
 
 // ListProjects GET /api/v1/projects

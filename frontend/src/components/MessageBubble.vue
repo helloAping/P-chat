@@ -27,14 +27,14 @@
 //     shown before the first SSE event arrives, so
 //     the user sees a blinking caret alone in the
 //     bubble as soon as they hit send.
-import { computed, h, nextTick, ref, useTemplateRef, watch } from 'vue'
+import { computed, h, nextTick, ref, useTemplateRef, watch, type Component } from 'vue'
 import { renderMarkdown } from '../utils/markdownCache'
 import { formatMessageTime } from '../utils/format'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
-  ArrowDown, ArrowUp, Pencil, MoreHorizontal, Sparkles,
-  Check, Loader2, XCircle, CornerDownLeft,
+  ArrowDown, ArrowUp, MoreHorizontal, Sparkles,
+  Check, Loader2, XCircle, CornerDownLeft, Maximize2, Play,
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
 
@@ -53,22 +53,34 @@ import RoleAvatar from './RoleAvatar.vue'
 const MAX_MD_INLINE_CHARS = 32 * 1024
 
 const renderMd = renderMarkdown
-import { NDropdown, useMessage, useDialog, type DropdownOption } from 'naive-ui'
+import { NDropdown, useMessage, useDialog, type DropdownMenuProps, type DropdownOption } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import * as api from '../api/client'
 import { state, regenerateMessage, fetchReplies, activateReply } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
+import SkillCallCard from './SkillCallCard.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import ToolCallGroup from './ToolCallGroup.vue'
 import SubAgentCard from './SubAgentCard.vue'
 import QuestionTable from './QuestionTable.vue'
 import ExecOutputCard from './ExecOutputCard.vue'
 import TypedText from './TypedText.vue'
+import GeneratedAssetStrip from './GeneratedAssetStrip.vue'
 import {
   copyImageToClipboard, copyText, downloadBlob, downloadFromUrl,
   extensionForMime, fetchAsBlob,
 } from '../utils/clipboard'
-import { groupConsecutiveToolParts } from '../utils/toolPartGrouping'
+import { messageTextForCopy } from '../utils/messageCopy'
+import { groupConsecutiveToolParts, type PartRenderEntry } from '../utils/toolPartGrouping'
+import {
+  attachmentArtifactFileName,
+  collectMessageGeneratedAttachments,
+} from '../utils/attachmentArtifacts'
+import {
+  getMediaContextTarget,
+  markMediaContextTarget,
+  type MediaContextTarget,
+} from '../utils/mediaContext'
 
 const dialog = useDialog()
 
@@ -82,7 +94,7 @@ const emit = defineEmits<{
 function onRollback() {
   dialog.warning({
     title: '确认撤回',
-    content: '确定撤回此消息及之后的所有回复？此操作可撤销。',
+    content: '确定撤回此消息及之后的所有回复？文字和附件将回到输入框，此操作可撤销。',
     positiveText: '确认撤回',
     negativeText: '取消',
     onPositiveClick: () => {
@@ -168,13 +180,73 @@ const messageContextMenuVisible = ref(false)
 const messageContextMenuX = ref(0)
 const messageContextMenuY = ref(0)
 const messageContextMenuSelection = ref('')
-const messageContextMenuOptions: DropdownOption[] = [
-  {
-    label: '复制',
-    key: 'copy',
-    icon: () => h(Clipboard, { size: 14 }),
-  },
-]
+type MessageContextMenuTarget =
+  | { kind: 'message' }
+  | { kind: 'selection' }
+  | { kind: 'media'; media: MediaContextTarget }
+
+const messageContextMenuTarget = ref<MessageContextMenuTarget>({ kind: 'message' })
+
+function contextMenuIcon(component: Component) {
+  return () => h(component, { size: 14 })
+}
+
+function contextMediaNoun(media: MediaContextTarget): string {
+  if (media.kind === 'image') return '图片'
+  if (media.kind === 'video') return '视频'
+  if (media.kind === 'audio') return '音频'
+  if (media.kind === 'text') return '附件'
+  return '文件'
+}
+
+const messageContextMenuOptions = computed<DropdownOption[]>(() => {
+  const target = messageContextMenuTarget.value
+  const copyMessage: DropdownOption = {
+    label: '复制整条消息',
+    key: 'copy-message',
+    icon: contextMenuIcon(Clipboard),
+  }
+
+  if (target.kind === 'selection') {
+    return [
+      { label: '复制所选文本', key: 'copy-selection', icon: contextMenuIcon(Clipboard) },
+      { type: 'divider', key: 'selection-divider' },
+      copyMessage,
+    ]
+  }
+
+  if (target.kind === 'media') {
+    const media = target.media
+    const noun = contextMediaNoun(media)
+    const options: DropdownOption[] = []
+    if ((media.kind === 'image' && media.url) || media.text) {
+      options.push({
+        label: media.kind === 'image' ? '复制图片' : '复制附件内容',
+        key: 'copy-media',
+        icon: contextMenuIcon(Clipboard),
+      })
+    }
+    if (media.url) {
+      options.push({
+        label: `复制${noun}引用`,
+        key: 'copy-media-reference',
+        icon: contextMenuIcon(Clipboard),
+      })
+    }
+    if (media.url || media.text) {
+      options.push({
+        label: `下载${noun}`,
+        key: 'download-media',
+        icon: contextMenuIcon(Download),
+      })
+    }
+    if (options.length) options.push({ type: 'divider', key: 'media-divider' })
+    options.push(copyMessage)
+    return options
+  }
+
+  return [copyMessage]
+})
 
 function hideMessageContextMenu() {
   messageContextMenuVisible.value = false
@@ -185,6 +257,16 @@ async function onMessageContextMenu(e: MouseEvent) {
   // 菜单显示后焦点可能改变，先保存当前选区。
   // Snapshot the selection before the menu can change focus.
   messageContextMenuSelection.value = window.getSelection()?.toString() ?? ''
+  const mediaTarget = getMediaContextTarget(e)
+  if (mediaTarget) {
+    // 媒体目标优先于页面上可能残留的文本选区。
+    // The clicked media wins over a stale text selection elsewhere on the page.
+    messageContextMenuTarget.value = { kind: 'media', media: mediaTarget }
+  } else if (messageContextMenuSelection.value.trim()) {
+    messageContextMenuTarget.value = { kind: 'selection' }
+  } else {
+    messageContextMenuTarget.value = { kind: 'message' }
+  }
   messageContextMenuVisible.value = false
   messageContextMenuX.value = e.clientX
   messageContextMenuY.value = e.clientY
@@ -194,13 +276,28 @@ async function onMessageContextMenu(e: MouseEvent) {
 
 async function onMessageContextMenuSelect(key: string | number) {
   hideMessageContextMenu()
-  if (key === 'copy') {
-    if (messageContextMenuSelection.value) {
-      const ok = await copyText(messageContextMenuSelection.value)
-      if (ok) toast.success('已复制')
-      else toast.error('复制失败')
+  const target = messageContextMenuTarget.value
+  if (key === 'copy-selection') {
+    const ok = await copyText(messageContextMenuSelection.value)
+    if (ok) toast.success('已复制所选文本')
+    else toast.error('复制失败')
+    return
+  }
+  if (target.kind === 'media') {
+    if (key === 'copy-media') {
+      await copyContextMedia(target.media)
       return
     }
+    if (key === 'copy-media-reference') {
+      await copyContextMediaReference(target.media)
+      return
+    }
+    if (key === 'download-media') {
+      downloadContextMedia(target.media)
+      return
+    }
+  }
+  if (key === 'copy-message') {
     await copyEntireMessage()
   }
 }
@@ -229,7 +326,7 @@ function isLiveTextPart(idx: number, kind: string, parts: MessagePart[] | undefi
 // isLiveThinkingPart mirrors isLiveTextPart: only the
 // very last part AND it must be a thinking part. While
 // streaming, that trailing part renders through
-// `ThinkingBlock` with its shimmer effect; once
+// `ThinkingBlock` (open while live); once
 // streaming ends or a new round appends a non-thinking
 // part, this returns false and the block falls back to
 // its collapsed static view.
@@ -259,12 +356,55 @@ const visibleParts = computed(() => {
   return parts.slice(start).map((part, offset) => ({ part, index: start + offset }))
 })
 const visibleRenderEntries = computed(() => groupConsecutiveToolParts(visibleParts.value))
+
+// Group consecutive tool / skill / sub_agent entries into one
+// visual panel. Thinking stays independent and never enters
+// the event timeline, matching the Calm Workbench transcript.
+type TimelineSegment =
+  | { kind: 'events'; key: string; entries: PartRenderEntry[] }
+  | { kind: 'content'; key: string; entry: PartRenderEntry }
+
+function isProcessRowEntry(entry: PartRenderEntry): boolean {
+  if (entry.kind === 'tool_group') return true
+  const k = entry.part.kind
+  return k === 'skill' || k === 'tool' || k === 'sub_agent'
+}
+
+const visibleTimelineSegments = computed((): TimelineSegment[] => {
+  const segments: TimelineSegment[] = []
+  let eventBuf: PartRenderEntry[] = []
+  const flushEvents = () => {
+    if (!eventBuf.length) return
+    const first = eventBuf[0]
+    const key = first.kind === 'tool_group'
+      ? `events-${first.startIndex}`
+      : `events-${first.index}`
+    segments.push({ kind: 'events', key, entries: eventBuf })
+    eventBuf = []
+  }
+  for (const entry of visibleRenderEntries.value) {
+    if (isProcessRowEntry(entry)) {
+      eventBuf.push(entry)
+      continue
+    }
+    flushEvents()
+    const key = entry.kind === 'tool_group'
+      ? `tool-group-${entry.startIndex}`
+      : `part-${entry.index}`
+    segments.push({ kind: 'content', key, entry })
+  }
+  flushEvents()
+  return segments
+})
+
 function showEarlierParts() {
   revealedEarlierParts.value += PART_RENDER_WINDOW
 }
 
 // The role check: system messages get a special icon.
 const isSystem = computed(() => (props.message.msg_type ?? 0) === 0 && props.message.role === 'system')
+const hasAttachments = computed(() => (props.message.attachments?.length || 0) > 0)
+const hasVisibleUserContent = computed(() => !!props.message.content?.trim())
 
 // For user / system messages, the markdown pipeline
 // renders the whole `content` string. For assistant
@@ -307,6 +447,47 @@ function expandTextPart(index: number) {
 function openLightbox(src: string, alt: string, kind: 'image' | 'video' = 'image') {
   state.lightbox = { show: true, src, alt, kind }
 }
+
+type AttachmentVisualKind = 'image' | 'video' | 'audio' | 'text' | 'file' | 'image_not_supported'
+
+const imageExtensions = new Set([
+  'avif', 'bmp', 'gif', 'heic', 'ico', 'jpeg', 'jpg', 'png', 'svg', 'tif', 'tiff', 'webp',
+])
+const videoExtensions = new Set(['avi', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'webm'])
+const audioExtensions = new Set(['aac', 'flac', 'm4a', 'mp3', 'ogg', 'opus', 'pcm', 'wav', 'wma'])
+
+function attachmentExtension(attachment: MessageAttachment): string {
+  const name = attachment.name?.trim().toLowerCase() || ''
+  const lastDot = name.lastIndexOf('.')
+  if (lastDot < 0 || lastDot === name.length - 1) return ''
+  return name.slice(lastDot + 1)
+}
+
+// Attachment records come from optimistic messages, persisted history and
+// older compatibility payloads. Their wire `type` is not always specific, so
+// rendering must use every available semantic hint before falling back to a
+// generic file card.
+function attachmentVisualKind(attachment: MessageAttachment): AttachmentVisualKind {
+  const kind = attachment.kind?.toLowerCase() || ''
+  if (kind === 'image_not_supported') return 'image_not_supported'
+  if (kind === 'image' || kind === 'video' || kind === 'audio') return kind
+
+  if (attachment.mime?.startsWith('image/')) return 'image'
+  if (attachment.mime?.startsWith('video/')) return 'video'
+  if (attachment.mime?.startsWith('audio/')) return 'audio'
+
+  const extension = attachmentExtension(attachment)
+  if (imageExtensions.has(extension)) return 'image'
+  if (videoExtensions.has(extension)) return 'video'
+  if (audioExtensions.has(extension)) return 'audio'
+
+  if (attachment.type === 'image_url') return 'image'
+  if (attachment.type === 'video_url') return 'video'
+  if (attachment.type === 'audio_url') return 'audio'
+  if (kind === 'text') return 'text'
+  return attachment.text ? 'text' : 'file'
+}
+
 function thumbText(kind?: string) {
   switch (kind) {
     case 'image': return ImageIcon
@@ -317,21 +498,108 @@ function thumbText(kind?: string) {
   }
 }
 
+function attachmentTypeLabel(attachment: MessageAttachment): string {
+  const kind = attachmentVisualKind(attachment)
+  if ((kind === 'image' || kind === 'video') && !attachment.url) return '预览不可用'
+  if (kind === 'image') return '图片'
+  if (kind === 'video') return '视频'
+  if (kind === 'audio') return '音频'
+
+  const extension = attachmentExtension(attachment)
+  const labels: Record<string, string> = {
+    pdf: 'PDF 文档',
+    doc: 'Word 文档', docx: 'Word 文档',
+    ppt: '演示文稿', pptx: '演示文稿',
+    xls: '电子表格', xlsx: '电子表格', csv: '电子表格',
+    md: 'Markdown 文档', txt: '文本附件', json: 'JSON 文件',
+    zip: '压缩文件', rar: '压缩文件', '7z': '压缩文件',
+  }
+  if (labels[extension]) return labels[extension]
+  if (extension) return `${extension.toUpperCase()} 文件`
+  return kind === 'text' ? '文本附件' : '文件附件'
+}
+
 // --- Copy / download for attachments ------------------------
+
+function markMessageAttachmentContextTarget(event: MouseEvent, attachment: MessageAttachment) {
+  markMediaContextTarget(event, {
+    kind: attachmentVisualKind(attachment),
+    url: attachment.url,
+    text: attachment.text,
+    name: attachment.name,
+    mime: attachment.mime,
+  })
+}
+
+function contextMediaFileName(media: MediaContextTarget): string {
+  return attachmentArtifactFileName({
+    kind: media.kind,
+    url: media.url,
+    name: media.name,
+    mime: media.mime,
+  })
+}
+
+async function copyContextMedia(media: MediaContextTarget) {
+  if (media.kind === 'image' && media.url) {
+    try {
+      const blob = await fetchAsBlob(media.url)
+      if (await copyImageToClipboard(blob)) {
+        toast.success('已复制图片')
+        return
+      }
+    } catch { /* 统一在下方反馈。 / Report through the shared feedback below. */ }
+    toast.error('图片复制失败，可复制图片引用或下载')
+    return
+  }
+
+  if (!media.text) {
+    toast.info('没有可复制的附件内容')
+    return
+  }
+  const ok = await copyText(media.text)
+  toast[ok ? 'success' : 'error'](ok ? '已复制附件内容' : '复制失败')
+}
+
+async function copyContextMediaReference(media: MediaContextTarget) {
+  if (!media.url) {
+    toast.info('没有可复制的媒体引用')
+    return
+  }
+  const ok = await copyText(media.url)
+  toast[ok ? 'success' : 'error'](ok ? `已复制${contextMediaNoun(media)}引用` : '复制失败')
+}
+
+function downloadContextMedia(media: MediaContextTarget) {
+  const filename = contextMediaFileName(media)
+  if (media.url) {
+    downloadFromUrl(media.url, filename)
+    toast.success('已开始下载')
+    return
+  }
+  if (media.text) {
+    downloadBlob(new Blob([media.text], { type: media.mime || 'text/plain' }), filename)
+    toast.success('已下载')
+    return
+  }
+  toast.info('没有可下载的内容')
+}
 
 // friendlyAttachmentName picks a sensible filename for a
 // download when the original name is missing or weird.
 function friendlyAttachmentName(a: MessageAttachment): string {
   if (a.name && a.name.trim()) return a.name
-  const mime = a.mime || (a.kind === 'image' ? 'image/png'
-    : a.kind === 'audio' ? 'audio/mpeg'
-    : a.kind === 'video' ? 'video/mp4' : 'text/plain')
-  const stem = a.kind && a.kind !== 'file' ? a.kind : 'attachment'
+  const kind = attachmentVisualKind(a)
+  const mime = a.mime || (kind === 'image' ? 'image/png'
+    : kind === 'audio' ? 'audio/mpeg'
+    : kind === 'video' ? 'video/mp4' : 'text/plain')
+  const stem = kind !== 'file' && kind !== 'image_not_supported' ? kind : 'attachment'
   return `${stem}-${Date.now()}${extensionForMime(mime)}`
 }
 
 async function copyAttachment(a: MessageAttachment) {
-  if (a.type === 'text') {
+  const kind = attachmentVisualKind(a)
+  if (kind === 'text') {
     if (a.text) {
       const ok = await copyText(a.text)
       toast[ok ? 'success' : 'error'](ok ? '已复制' : '复制失败')
@@ -346,7 +614,7 @@ async function copyAttachment(a: MessageAttachment) {
   // via the ClipboardItem API. Audio/video fall back to
   // a regular download (no browser-side clipboard
   // support for those).
-  if (a.type === 'image_url') {
+  if (kind === 'image') {
     try {
       const blob = await fetchAsBlob(a.url)
       const ok = await copyImageToClipboard(blob)
@@ -390,34 +658,13 @@ async function downloadAttachment(a: MessageAttachment) {
 
 // --- Copy whole message -------------------------------------
 
-// messageMarkdownText returns a clean text representation
-// of the message: for user messages that's the raw
-// `content`, for assistant messages it's the joined text
-   // parts. Attachments and tool calls are skipped here —
-// image attachments are picked up separately by
-// copyEntireMessage so the clipboard can carry both the
-// text and the image bytes via the ClipboardItem API.
-function messageMarkdownText(): string {
-  const m = props.message
-  if (m.role === 'user' || m.role === 'system' || m.role === 'tool') {
-    return m.content || ''
-  }
-  if (m.parts && m.parts.length) {
-    return m.parts
-      .filter((p: any) => p.kind === 'text')
-      .map((p: any) => p.text || '')
-      .join('\n\n')
-  }
-  return m.content || ''
-}
-
 // imageAttachmentsOf returns the image_url attachments
 // of the message with non-empty URLs, type-narrowed so
 // the caller can use `.url` without a null check.
 function imageAttachmentsOf(): Array<MessageAttachment & { url: string }> {
   return (props.message.attachments || []).filter(
     (a): a is MessageAttachment & { url: string } =>
-      a.type === 'image_url' && !!a.url,
+      attachmentVisualKind(a) === 'image' && !!a.url,
   )
 }
 
@@ -512,7 +759,7 @@ async function copyEntireMessage() {
   // shouldn't cancel the feedback or restart the timer.
   if (isAction('copy', 'feedback')) return
 
-  const text = messageMarkdownText()
+  const text = messageTextForCopy(props.message)
   const images = imageAttachmentsOf()
 
   // Pure-text path: no images on this message, keep the
@@ -739,7 +986,7 @@ const showTypewriterPlaceholder = computed(() => {
   if (!parts || parts.length === 0) return true
   return !parts.some(p =>
     p.kind === 'text' || p.kind === 'thinking' ||
-    p.kind === 'tool' || p.kind === 'sub_agent',
+    p.kind === 'skill' || p.kind === 'tool' || p.kind === 'sub_agent',
   )
 })
 
@@ -776,6 +1023,11 @@ const showVisionWarn = computed(() =>
 const traceIdChip = computed(() => {
   if (props.message.role !== 'assistant') return ''
   return props.message.traceId || ''
+})
+
+const generatedAttachments = computed(() => {
+  if (props.message.role !== 'assistant' || props.streaming) return []
+  return collectMessageGeneratedAttachments(props.message)
 })
 
 // copyTraceId writes the trace id to the system clipboard
@@ -825,6 +1077,45 @@ const canFork = computed(() =>
 const canRollback = computed(() =>
   props.message.role === 'user' && !props.streaming
 )
+
+function messageActionOption(
+  key: string,
+  label: string,
+  icon: Component,
+  extra: Partial<DropdownOption> = {},
+): DropdownOption {
+  return {
+    key,
+    label: () =>
+      h('span', { class: 'app-action-item' }, [
+        h(icon, { size: 16, class: 'app-action-item__icon' }),
+        h('span', { class: 'app-action-item__label' }, label),
+      ]),
+    ...extra,
+  }
+}
+
+const messageActionMenuOptions = computed<DropdownOption[]>(() => {
+  const options: DropdownOption[] = []
+  if (canFork.value) {
+    options.push(messageActionOption('fork', '创建分支对话', GitBranch))
+  }
+  if (canRollback.value) {
+    options.push(messageActionOption('rollback', '撤回消息及后续回复', Undo2, {
+      props: { class: 'app-action-danger' },
+    }))
+  }
+  return options
+})
+
+const messageActionMenuProps: DropdownMenuProps = () => ({
+  class: 'app-action-menu',
+})
+
+function onMessageActionMenuSelect(key: string | number) {
+  if (key === 'fork') onFork()
+  if (key === 'rollback') onRollback()
+}
 // P1-3: regenerate is only meaningful on the trailing
 // assistant message — regenerating an older reply would
 // leave newer messages in an inconsistent state (the
@@ -1094,45 +1385,107 @@ function findPrecedingUserMessageId(): number {
         <span v-if="streaming" class="bubble-stream-dot" :title="'正在生成'" aria-label="正在生成" />
       </div>
 
-      <div class="bubble">
+      <div class="bubble" :class="{ 'bubble--attachments': hasAttachments }">
         <div v-if="isSystem" class="system-icon">›</div>
         <div class="bubble-body">
           <!-- Attachments (user / tool) -->
-          <div v-if="message.attachments && message.attachments.length" class="attachments">
+          <div
+            v-if="message.attachments && message.attachments.length"
+            class="attachments"
+            :class="{ 'attachments--multi': message.attachments.length > 1 }"
+          >
             <template v-for="(a, i) in message.attachments" :key="i">
-              <div v-if="a.type === 'image_url' && a.url" class="attach-wrap">
-                <img
-                  class="msg-image"
-                  :src="a.url"
-                  :alt="a.name || 'image'"
-                  loading="lazy"
-                  @click="openLightbox(a.url, a.name || 'image', 'image')"
-                />
-                <div class="attach-actions">
-                  <button type="button" class="attach-action-btn" title="复制图片" :aria-label="'复制图片'" @click="copyAttachment(a)">
-                    <Clipboard :size="12" />
+              <div
+                v-if="attachmentVisualKind(a) === 'image' && a.url"
+                class="media-thumbnail media-thumbnail--image"
+                role="button"
+                tabindex="0"
+                :aria-label="`查看图片：${a.name || '图片'}`"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
+                @click="openLightbox(a.url, a.name || 'image', 'image')"
+                @keydown.enter.prevent="openLightbox(a.url, a.name || 'image', 'image')"
+                @keydown.space.prevent="openLightbox(a.url, a.name || 'image', 'image')"
+              >
+	                <img
+	                  class="msg-image"
+	                  :src="a.url"
+	                  :alt="a.name || 'image'"
+	                  loading="lazy"
+	                />
+	                <div class="media-thumbnail-footer">
+	                  <span class="media-thumbnail-name">
+	                    <ImageIcon :size="14" />
+	                    <span>{{ a.name || '图片' }}</span>
+	                  </span>
+	                  <span class="media-thumbnail-meta">{{ attachmentTypeLabel(a) }}</span>
+	                </div>
+	                <div class="media-thumbnail-hint">
+	                  <Maximize2 :size="14" />
+	                  <span>查看大图</span>
+                </div>
+                <div class="attachment-action-bar attachment-action-bar--image">
+                  <button type="button" class="attach-action-btn" title="复制图片" aria-label="复制图片" @click.stop="copyAttachment(a)">
+                    <Clipboard :size="14" />
                   </button>
-                  <button type="button" class="attach-action-btn" title="下载图片" :aria-label="'下载图片'" @click="downloadAttachment(a)">
-                    <Download :size="12" />
+                  <button type="button" class="attach-action-btn" title="下载图片" aria-label="下载图片" @click.stop="downloadAttachment(a)">
+                    <Download :size="14" />
                   </button>
                 </div>
               </div>
-              <div v-else-if="a.type === 'video_url' && a.url" class="attach-wrap">
+              <div
+                v-else-if="attachmentVisualKind(a) === 'video' && a.url"
+                class="media-thumbnail media-thumbnail--video"
+                role="button"
+                tabindex="0"
+                :aria-label="`全屏播放：${a.name || '视频'}`"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
+                @click="openLightbox(a.url, a.name || 'video', 'video')"
+                @keydown.enter.prevent="openLightbox(a.url, a.name || 'video', 'video')"
+                @keydown.space.prevent="openLightbox(a.url, a.name || 'video', 'video')"
+              >
                 <video
                   class="msg-video"
                   :src="a.url"
-                  controls
-                  preload="metadata"
-                  :title="a.name || 'video'"
-                  @click.stop
-                />
-                <div class="attach-actions">
-                  <button type="button" class="attach-action-btn" title="下载视频" :aria-label="'下载视频'" @click="downloadAttachment(a)">
-                    <Download :size="12" />
+                  muted
+                  playsinline
+	                  preload="auto"
+	                  :title="a.name || 'video'"
+	                />
+	                <div class="media-thumbnail-footer">
+	                  <span class="media-thumbnail-name">
+	                    <Film :size="14" />
+	                    <span>{{ a.name || '视频' }}</span>
+	                  </span>
+	                  <span class="media-thumbnail-meta">{{ attachmentTypeLabel(a) }}</span>
+	                </div>
+	                <span class="media-thumbnail-play" aria-hidden="true">
+	                  <Play :size="22" fill="currentColor" />
+	                </span>
+                <div class="media-thumbnail-hint">
+                  <Maximize2 :size="14" />
+                  <span>全屏播放</span>
+                </div>
+                <div class="attachment-action-bar">
+                  <button type="button" class="attach-action-btn" title="下载视频" aria-label="下载视频" @click.stop="downloadAttachment(a)">
+                    <Download :size="14" />
                   </button>
                 </div>
               </div>
-              <div v-else-if="a.type === 'audio_url' && a.url" class="attach-wrap">
+              <div
+                v-else-if="attachmentVisualKind(a) === 'audio' && a.url"
+                class="attachment-audio-card"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
+              >
+                <div class="attachment-card-heading">
+                  <span class="attachment-card-icon"><Volume2 :size="18" /></span>
+                  <span class="attachment-card-info">
+                    <span class="attachment-card-name">{{ a.name || '音频' }}</span>
+                    <span class="attachment-card-meta">{{ attachmentTypeLabel(a) }}</span>
+                  </span>
+                  <button type="button" class="attach-action-btn" title="下载音频" aria-label="下载音频" @click="downloadAttachment(a)">
+                    <Download :size="14" />
+                  </button>
+                </div>
                 <audio
                   class="msg-audio"
                   :src="a.url"
@@ -1140,32 +1493,37 @@ function findPrecedingUserMessageId(): number {
                   preload="metadata"
                   :title="a.name || 'audio'"
                 />
-                <div class="attach-actions">
-                  <button type="button" class="attach-action-btn" title="下载音频" :aria-label="'下载音频'" @click="downloadAttachment(a)">
-                    <Download :size="12" />
-                  </button>
-                </div>
               </div>
               <div
-                v-else-if="a.type === 'text' && a.kind === 'image_not_supported'"
+                v-else-if="attachmentVisualKind(a) === 'image_not_supported'"
                 class="msg-image-warn"
                 :title="a.text"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
               >
                 <AlertTriangle :size="14" class="warn-icon" />
                 <span class="warn-text">{{ shortWarnText(a.text) }}</span>
               </div>
-              <div v-else-if="a.type === 'text'" class="msg-file-wrap">
-                <div class="msg-file" :title="a.text">
-                  <component :is="thumbText(a.kind)" :size="12" class="msg-file-icon" />
-                  {{ a.name || '文件' }}
-                </div>
-                <div class="attach-actions attach-actions-inline">
-                  <button type="button" class="attach-action-btn" title="复制内容" :aria-label="'复制内容'" @click="copyAttachment(a)">
-                    <Clipboard :size="12" />
-                  </button>
-                  <button type="button" class="attach-action-btn" title="下载" :aria-label="'下载'" @click="downloadAttachment(a)">
-                    <Download :size="12" />
-                  </button>
+              <div
+                v-else
+                class="msg-file-wrap"
+                @contextmenu="markMessageAttachmentContextTarget($event, a)"
+              >
+                <div class="attachment-file-card" :title="a.text">
+                  <span class="attachment-card-icon">
+                    <component :is="thumbText(attachmentVisualKind(a))" :size="18" />
+                  </span>
+                  <span class="attachment-card-info">
+                    <span class="attachment-card-name">{{ a.name || '文件' }}</span>
+                    <span class="attachment-card-meta">{{ attachmentTypeLabel(a) }}</span>
+                  </span>
+                  <span class="attachment-card-actions">
+                    <button v-if="a.text" type="button" class="attach-action-btn" title="复制内容" aria-label="复制内容" @click="copyAttachment(a)">
+                      <Clipboard :size="14" />
+                    </button>
+                    <button v-if="a.text || a.url" type="button" class="attach-action-btn" title="下载附件" aria-label="下载附件" @click="downloadAttachment(a)">
+                      <Download :size="14" />
+                    </button>
+                  </span>
                 </div>
               </div>
             </template>
@@ -1212,9 +1570,10 @@ function findPrecedingUserMessageId(): number {
 
           <!-- User / system: markdown of `content` -->
           <div
-            v-if="(message.msg_type ?? 0) === 0 && message.role !== 'assistant'"
+            v-if="(message.msg_type ?? 0) === 0 && message.role !== 'assistant' && (message.role !== 'user' || hasVisibleUserContent)"
             ref="mdBodyEl"
             class="md-body"
+            :class="{ 'user-message-caption': message.role === 'user' && hasAttachments }"
             v-html="userHtml"
             @click="onMarkdownClick"
           />
@@ -1238,40 +1597,50 @@ function findPrecedingUserMessageId(): number {
               >
                 已折叠 {{ hiddenPartCount }} 条过程记录
               </button>
-              <template
-                v-for="entry in visibleRenderEntries"
-                :key="entry.kind === 'tool_group' ? `tool-group-${entry.startIndex}` : entry.index"
-              >
-                <ToolCallGroup
-                  v-if="entry.kind === 'tool_group'"
-                  :parts="entry.parts"
-                />
-                <template v-else>
-                  <ThinkingBlock
-                    v-if="entry.part.kind === 'thinking'"
-                    :part="entry.part"
-                    :default-open="isLiveThinkingPart(entry.index, entry.part.kind, message.parts)"
-                  />
-                  <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
-                  <SubAgentCard v-else-if="entry.part.kind === 'sub_agent'" :part="entry.part" />
-                  <QuestionTable v-else-if="entry.part.kind === 'question'" :part="entry.part" />
-                  <TypedText
-                    v-else-if="entry.part.kind === 'text' && isLiveTextPart(entry.index, entry.part.kind, message.parts)"
-                    :text="entry.part.text || ''"
-                    :active="true"
-                  />
-                  <div v-else-if="entry.part.kind === 'text'">
+	              <template
+	                v-for="segment in visibleTimelineSegments"
+	                :key="segment.key"
+	              >
+	                <div v-if="segment.kind === 'events'" class="event-timeline">
+	                  <template
+	                    v-for="entry in segment.entries"
+	                    :key="entry.kind === 'tool_group' ? `tool-group-${entry.startIndex}` : entry.index"
+	                  >
+	                    <ToolCallGroup
+	                      v-if="entry.kind === 'tool_group'"
+	                      :parts="entry.parts"
+	                    />
+	                    <template v-else-if="entry.kind === 'part'">
+	                      <SkillCallCard v-if="entry.part.kind === 'skill'" :part="entry.part" />
+	                      <ToolCallCard v-else-if="entry.part.kind === 'tool'" :part="entry.part" />
+	                      <SubAgentCard v-else-if="entry.part.kind === 'sub_agent'" :part="entry.part" />
+	                    </template>
+	                  </template>
+	                </div>
+	                <template v-else>
+	                  <ThinkingBlock
+	                    v-if="segment.entry.kind === 'part' && segment.entry.part.kind === 'thinking'"
+	                    :part="segment.entry.part"
+	                    :default-open="isLiveThinkingPart(segment.entry.index, segment.entry.part.kind, message.parts)"
+	                  />
+	                  <QuestionTable v-else-if="segment.entry.kind === 'part' && segment.entry.part.kind === 'question'" :part="segment.entry.part" />
+	                  <TypedText
+	                    v-else-if="segment.entry.kind === 'part' && segment.entry.part.kind === 'text' && isLiveTextPart(segment.entry.index, segment.entry.part.kind, message.parts)"
+	                    :text="segment.entry.part.text || ''"
+	                    :active="true"
+	                  />
+                  <div v-else-if="segment.entry.kind === 'part' && segment.entry.part.kind === 'text'">
                     <div
                       ref="mdBodyEl"
                       class="md-body"
-                      v-html="renderMd(textPartForRender(entry.part))"
+                      v-html="renderMd(textPartForRender(segment.entry.part))"
                       @click="onMarkdownClick"
                     ></div>
                     <button
-                      v-if="textPartTruncated(entry.part) && !textPartExpanded(entry.index)"
+                      v-if="textPartTruncated(segment.entry.part) && !textPartExpanded(segment.entry.index)"
                       class="md-expand-btn"
-                      @click.stop="expandTextPart(entry.index)"
-                    >展开全文 ({{ textPartFullLen(entry.part) }} 字)</button>
+                      @click.stop="expandTextPart(segment.entry.index)"
+                    >展开全文 ({{ textPartFullLen(segment.entry.part) }} 字)</button>
                   </div>
                 </template>
               </template>
@@ -1295,6 +1664,11 @@ function findPrecedingUserMessageId(): number {
               :active="true"
             />
           </template>
+
+          <GeneratedAssetStrip
+            v-if="generatedAttachments.length"
+            :assets="generatedAttachments"
+          />
 
           <!-- P1-4: 上一版回答 chip. Only on archived
                assistant rows — the active row sits
@@ -1352,13 +1726,16 @@ function findPrecedingUserMessageId(): number {
             >▶</button>
           </div>
         </div>
+      </div>
 
-        <!-- Floating action bar: hovers above the bubble on
-             hover, shown for non-streaming messages only. The
-             user role mirrors the action bar to the left of
-             the avatar; assistant / tool mirror to the right
-             of the bubble. Hidden for the system role (no
-             action needed). -->
+      <!-- 消息级操作统一停靠在正文下方；附件只保留预览、复制和下载。
+           Message-level actions share one quiet footer below the content;
+           attachment cards keep only preview/copy/download controls. -->
+      <div
+        v-if="(!isSystem && !streaming) || userTimeText"
+        class="message-footer"
+        :data-role="message.role"
+      >
         <div
           v-if="!isSystem && !streaming"
           class="bubble-actions"
@@ -1376,27 +1753,6 @@ function findPrecedingUserMessageId(): number {
           >
             <Check v-if="isAction('copy', 'feedback')" :size="13" :key="`copy-ok-${pulseKey}`" class="bubble-action-icon" />
             <Clipboard v-else :size="13" :key="`copy-idle-${pulseKey}`" class="bubble-action-icon" />
-          </button>
-          <button
-            v-if="canFork"
-            type="button"
-            class="bubble-action-btn bubble-action-pulse"
-            :key="`fork-${pulseKey}`"
-            title="从此消息创建分支对话"
-            aria-label="创建分支对话"
-            @click="onFork"
-          >
-            <GitBranch :size="13" class="bubble-action-icon" />
-          </button>
-          <button
-            v-if="canRollback"
-            type="button"
-            class="bubble-action-btn bubble-action-rollback"
-            title="撤回此消息及之后的回复"
-            aria-label="撤回消息"
-            @click="onRollback"
-          >
-            <Undo2 :size="13" class="bubble-action-icon" />
           </button>
           <!-- P1-3 regenerate. Only shown on the trailing
                assistant message (we don't allow re-running
@@ -1427,21 +1783,31 @@ function findPrecedingUserMessageId(): number {
             <Loader2 :size="13" :class="regenerating ? 'bubble-action-icon bubble-action-icon--spin' : 'bubble-action-icon'" />
             <span v-if="!regenerating" class="bubble-action-text">重答</span>
           </button>
-          <button
-            type="button"
-            class="bubble-action-btn"
-            title="更多"
-            aria-label="更多"
+          <NDropdown
+            v-if="messageActionMenuOptions.length"
+            trigger="click"
+            placement="bottom-end"
+            size="small"
+            :options="messageActionMenuOptions"
+            :menu-props="messageActionMenuProps"
+            @select="onMessageActionMenuSelect"
           >
-            <MoreHorizontal :size="13" class="bubble-action-icon" />
-          </button>
+            <button
+              type="button"
+              class="bubble-action-btn"
+              title="更多操作"
+              aria-label="更多操作"
+              @click.stop
+            >
+              <MoreHorizontal :size="13" class="bubble-action-icon" />
+            </button>
+          </NDropdown>
         </div>
-      </div>
 
-      <!-- Send time for user messages only. Sits below the
-           bubble, right-aligned to match the row-reverse user
-           bubble. Assistant / system / tool messages skip it. -->
-      <div v-if="userTimeText" class="msg-time">{{ userTimeText }}</div>
+        <!-- Send time for user messages only. It shares the footer baseline
+             with the message tools so neither can cover a small text bubble. -->
+        <div v-if="userTimeText" class="msg-time">{{ userTimeText }}</div>
+      </div>
     </div>
   </div>
 </template>
@@ -1556,17 +1922,32 @@ function findPrecedingUserMessageId(): number {
   min-width: 0;
 }
 .msg.user .bubble {
-  background: var(--brand-500);
-  color: var(--on-brand);
-  padding: 10px 14px;
-  border-radius: 14px;
-  box-shadow: var(--shadow-sm);
+  background: var(--user-bubble-bg, color-mix(in srgb, var(--brand-500) 10%, var(--surface-1)));
+  color: var(--text-primary);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
+  border: 1px solid var(--user-bubble-border, color-mix(in srgb, var(--brand-500) 16%, var(--border-subtle)));
+  box-shadow: none;
   max-width: 80%;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.msg.user .bubble.bubble--attachments {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+  border: 0;
+  max-width: 100%;
+  width: min(100%, clamp(calc(var(--space-8) * 9), 48vw, calc(var(--space-8) * 16)));
 }
 .msg.assistant .bubble {
   background: transparent;
   color: var(--text-primary);
-  padding: 0 4px;
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1.65;
+  letter-spacing: 0;
 }
 .msg.tool .bubble {
   background: var(--surface-2);
@@ -1618,16 +1999,74 @@ function findPrecedingUserMessageId(): number {
   color: var(--text-secondary);
 }
 
-/* Force the markdown body inside a user bubble to inherit
- * the white text color (--on-brand). The default --text-primary
- * would win because of specificity, so we override here.
- * NOTE: this only reaches template-owned elements (the .md-body
- * container itself). Code blocks inside are injected via v-html
- * and carry no [data-v] attribute, so scoped rules never reach
- * their <pre>/<code> — those overrides live in the GLOBAL
- * <style> block below (see .msg.user .md-body pre). */
+/* User bubbles are quiet brand-tinted chips (not solid brand
+ * fills). Markdown inherits --text-primary via color: inherit. */
 .msg.user .bubble-body,
 .msg.user .bubble-body * { color: inherit; }
+.msg.user .bubble--attachments .bubble-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+  color: var(--text-primary);
+}
+.msg.user .bubble--attachments .attachments {
+  display: grid;
+  grid-template-columns: minmax(0, min(calc(var(--space-8) * 10), 100%));
+  align-items: start;
+  justify-content: end;
+  gap: var(--space-2);
+  margin-bottom: 0;
+  width: 100%;
+}
+.msg.user .bubble--attachments .attachments--multi {
+  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-8) * 5), 100%), 1fr));
+}
+.msg.user .bubble--attachments .attachments > :only-child {
+  grid-column: 1 / -1;
+}
+.msg.user .bubble--attachments .user-message-caption {
+  align-self: flex-end;
+  padding: var(--space-2) var(--space-3);
+  background: var(--user-bubble-bg, color-mix(in srgb, var(--brand-500) 10%, var(--surface-1)));
+  color: var(--text-primary);
+  border: 1px solid var(--user-bubble-border, color-mix(in srgb, var(--brand-500) 16%, var(--border-subtle)));
+  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+/* Quiet process panel — tool / skill / sub-agent share one
+ * surface as flat rows. Thinking renders independently. */
+.event-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: var(--space-2) 0;
+  padding: 0;
+  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+}
+.event-timeline > :deep(.tool-card),
+.event-timeline > :deep(.skill-card),
+.event-timeline > :deep(.sub-agent-card),
+.event-timeline > :deep(.tool-group) {
+  margin: 0;
+}
+.event-timeline > :deep(.tool-card + .tool-card),
+.event-timeline > :deep(.skill-card + .skill-card),
+.event-timeline > :deep(.tool-card + .skill-card),
+.event-timeline > :deep(.skill-card + .tool-card),
+.event-timeline > :deep(.tool-card + .sub-agent-card),
+.event-timeline > :deep(.sub-agent-card + .tool-card),
+.event-timeline > :deep(.skill-card + .sub-agent-card),
+.event-timeline > :deep(.sub-agent-card + .skill-card),
+.event-timeline > :deep(.sub-agent-card + .sub-agent-card) {
+  border-top: 1px solid var(--border-subtle);
+}
 
 /* "展开全文" affordance for truncated text parts. */
 .md-expand-btn {
@@ -1642,65 +2081,54 @@ function findPrecedingUserMessageId(): number {
 }
 .md-expand-btn:hover { background: var(--brand-50); }
 
-/* --- Floating action bar -----------------------------------------
- * Anchored to the top-right of the assistant bubble (or
- * top-left of the user bubble, since user is row-reverse).
- * Pill-shaped, shadow-md, hidden until the message is
- * hovered. Renders inside .bubble (which is position:
- * relative) so the absolute offsets are scoped to the
- * bubble. */
-.bubble-actions {
-  position: absolute;
-  top: -14px;
+/* 消息操作与时间使用同一静态底栏，不再覆盖文字或附件。
+ * Message actions and time share one static footer, never overlaying content. */
+.message-footer {
   display: flex;
   align-items: center;
-  gap: 1px;
-  padding: 3px;
-  background: var(--surface-1);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-md);
+  gap: var(--space-1);
+  min-height: var(--space-6);
+  width: 100%;
+}
+.message-footer[data-role="user"] { justify-content: flex-end; }
+.message-footer[data-role="assistant"] { justify-content: flex-start; }
+.bubble-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0;
   opacity: 0;
-  transform: translateY(2px);
+  transform: translateY(calc(-1 * var(--space-1)));
+  pointer-events: none;
   transition: opacity var(--dur-fast) var(--ease-out),
               transform var(--dur-fast) var(--ease-out);
-  /* z-index raised from 5 to 50 in 2026-07-09 to keep the
-   * action bar above Naive UI's tooltip layer (~60) and
-   * the chat window's stream-status bar that recently
-   * started using a sticky positioning context. The
-   * .msg parent (z-index 1) ensures this is scoped to the
-   * current message and does not bleed into adjacent
-   * messages. */
-  z-index: 50;
-  /* Light blur under the pill so it sits on top of the
-   * message content cleanly when overlapping. */
-  backdrop-filter: blur(4px);
 }
-.msg.assistant .bubble-actions { right: 8px; }
-.msg.user .bubble-actions { left: 8px; }
 .msg:hover .bubble-actions,
 .bubble-actions:focus-within {
   opacity: 1;
   transform: translateY(0);
+  pointer-events: auto;
 }
 .bubble-action-btn {
-  width: 26px;
-  height: 24px;
+  width: var(--control-height);
+  height: var(--control-height);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
   color: var(--text-tertiary);
+  box-shadow: none;
   cursor: pointer;
   padding: 0;
   transition: background var(--dur-fast) var(--ease-out),
               color var(--dur-fast) var(--ease-out),
-              transform var(--dur-fast) var(--ease-out);
+              border-color var(--dur-fast) var(--ease-out);
 }
 .bubble-action-btn:hover {
-  background: var(--surface-3);
+  background: var(--surface-2);
+  border-color: var(--border-strong);
   color: var(--text-primary);
 }
 .bubble-action-btn:active {
@@ -1868,80 +2296,333 @@ function findPrecedingUserMessageId(): number {
 .attachments {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 6px;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
 }
-.msg-image {
-  max-width: 100%;
-  max-height: 240px;
-  border-radius: 6px;
-  cursor: zoom-in;
-  background: var(--bg);
-  display: block;
-}
-.msg-image:hover { opacity: 0.92; }
-
-.attach-wrap {
+.media-thumbnail {
   position: relative;
-  display: inline-block;
-  max-width: 100%;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: stretch;
+  justify-content: stretch;
+  gap: var(--space-1);
+  width: 100%;
+  min-width: 0;
+  aspect-ratio: 16 / 10;
+  box-sizing: border-box;
+  padding: var(--space-1);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  cursor: zoom-in;
+  transition: border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
-.attach-wrap:hover .attach-actions,
-.attach-wrap:focus-within .attach-actions { opacity: 1; }
-.attach-actions {
-  position: absolute;
-  top: 4px;
-  right: 4px;
+.media-thumbnail--video {
+  aspect-ratio: 16 / 9;
+  cursor: pointer;
+}
+.media-thumbnail:hover,
+.media-thumbnail:focus-visible {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-md);
+}
+.media-thumbnail:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.media-thumbnail:active { transform: scale(0.995); }
+.msg-image,
+.msg-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.msg-image { object-fit: contain; }
+.msg-video { object-fit: cover; }
+.media-thumbnail-footer {
   display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity var(--dur-fast) var(--ease-out);
-  z-index: 2;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-1) var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
 }
-.attach-actions-inline {
-  position: static;
+.media-thumbnail-name {
   display: inline-flex;
-  vertical-align: middle;
-  margin-left: 4px;
-  opacity: 1;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  flex: 1;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.3;
 }
-.attach-action-btn {
-  width: 24px;
-  height: 24px;
+.media-thumbnail-name svg {
+  flex-shrink: 0;
+  color: var(--brand-600);
+}
+.media-thumbnail-name span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.media-thumbnail-meta {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.media-thumbnail-hint {
+  position: absolute;
+  left: var(--space-2);
+  top: var(--space-2);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0;
+  transform: translateY(var(--space-1));
+  transition: opacity var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+  pointer-events: none;
+}
+.msg.user .bubble-body .media-thumbnail-hint { color: var(--text-primary); }
+.media-thumbnail:hover .media-thumbnail-hint,
+.media-thumbnail:focus-visible .media-thumbnail-hint,
+.media-thumbnail:focus-within .media-thumbnail-hint {
+  opacity: 1;
+  transform: translateY(0);
+}
+.media-thumbnail-play {
+  position: absolute;
+  left: 50%;
+  top: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  width: calc(var(--space-8) + var(--space-2));
+  height: calc(var(--space-8) + var(--space-2));
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
   background: var(--surface-overlay);
-  color: var(--on-brand);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-md);
+  transform: translate(-50%, -50%);
+  transition: transform var(--dur-fast) var(--ease-out);
+  pointer-events: none;
+}
+.msg.user .bubble-body .media-thumbnail-play { color: var(--text-primary); }
+.media-thumbnail--video:hover .media-thumbnail-play {
+  transform: translate(-50%, -50%) scale(1.06);
+}
+.msg.user .media-thumbnail,
+.msg.user .attachment-audio-card,
+.msg.user .msg-file-wrap,
+.msg.user .msg-image-warn {
+  justify-self: end;
+}
+.msg.user .attachment-audio-card,
+.msg.user .msg-file-wrap,
+.msg.user .msg-image-warn {
+  grid-column: 1 / -1;
+}
+.media-thumbnail:hover .attachment-action-bar,
+.media-thumbnail:focus-within .attachment-action-bar {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+.attachment-action-bar {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  transform: translateY(calc(-1 * var(--space-1)));
+  pointer-events: none;
+  transition: opacity var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+  z-index: 3;
+}
+.attachment-action-bar--image {
+  top: var(--space-2);
+  right: var(--space-2);
+  bottom: auto;
+  transform: translateY(calc(-1 * var(--space-1)));
+}
+.media-thumbnail--video .attachment-action-bar {
+  top: var(--space-2);
+  right: var(--space-2);
+  bottom: auto;
+  transform: translateY(calc(-1 * var(--space-1)));
+}
+.attach-action-btn {
+  width: var(--space-7);
+  height: var(--space-7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-primary);
   cursor: pointer;
   font-size: 12px;
   line-height: 1;
   padding: 0;
-  backdrop-filter: blur(2px);
+  transition: background var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
 }
 .attach-action-btn:hover {
-  background: rgba(0, 0, 0, 0.8);
+  background: var(--brand-50);
+  border-color: var(--brand-100);
+  color: var(--brand-600);
 }
-.msg-file {
+.msg.user .bubble-body .attach-action-btn {
+  color: var(--text-primary);
+}
+.msg.user .bubble-body .attach-action-btn:hover {
+  color: var(--brand-600);
+}
+.attach-action-btn:active { transform: scale(0.92); }
+.attach-action-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.attachment-audio-card,
+.attachment-file-card {
+  box-sizing: border-box;
+  width: min(calc(var(--space-8) * 12), 100%);
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  color: var(--text-primary);
+}
+.attachment-audio-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+}
+.attachment-card-heading,
+.attachment-file-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.attachment-file-card { padding: var(--space-2); }
+.attachment-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-8);
+  height: var(--space-8);
   background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  border-radius: 4px;
-  padding: 2px 6px;
-  font-size: 12px;
-  max-width: 100%;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.msg.user .bubble-body .attachment-card-icon { color: var(--text-secondary); }
+.attachment-card-info {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.attachment-card-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.attachment-card-meta {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.msg.user .bubble-body .attachment-card-name { color: var(--text-primary); }
+.msg.user .bubble-body .attachment-card-meta { color: var(--text-tertiary); }
+.attachment-card-actions {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  vertical-align: middle;
-  color: var(--text-secondary);
+  gap: var(--space-1);
+  flex-shrink: 0;
 }
-.msg-file-icon { color: var(--text-tertiary); flex-shrink: 0; }
-.msg-file-wrap { display: inline-flex; align-items: center; max-width: 100%; }
+.msg-audio {
+  display: block;
+  width: 100%;
+  height: var(--space-8);
+  color-scheme: light dark;
+}
+.msg-file-wrap {
+  display: flex;
+  justify-content: flex-end;
+  width: 100%;
+  max-width: 100%;
+}
+.msg.user .bubble-body .attachment-audio-card,
+.msg.user .bubble-body .attachment-file-card {
+  color: var(--text-primary);
+}
+.attachment-file-card:hover,
+.attachment-audio-card:hover {
+  border-color: var(--border-strong);
+}
+.attachment-file-card .attach-action-btn,
+.attachment-audio-card .attach-action-btn {
+  flex-shrink: 0;
+}
+@media (hover: none) {
+  .bubble-actions,
+  .attachment-action-bar {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+  .media-thumbnail-hint {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (max-width: 560px) {
+  .attachment-audio-card,
+  .attachment-file-card {
+    width: 100%;
+  }
+  .media-thumbnail-hint span { display: none; }
+}
 .msg-image-warn {
   display: inline-flex; align-items: center; gap: 6px;
   background: var(--warn-50);
@@ -2103,7 +2784,9 @@ function findPrecedingUserMessageId(): number {
   line-height: 1.4;
   color: var(--text-quaternary);
   font-variant-numeric: tabular-nums;
-  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-1);
   user-select: none;
 }
 .msg.user .msg-time { align-self: flex-end; }

@@ -7,28 +7,36 @@
 // path so the LLM can answer "what is /foo?" questions naturally.
 
 import { h, onMounted, ref, computed, watch, nextTick } from 'vue'
-import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, useDialog, useMessage, type DropdownOption } from 'naive-ui'
+import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, NSelect, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
-  Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
-  Lock, Unlock, Key, Database, Copy, Scissors, ClipboardPaste, TextCursorInput,
-  Settings, HelpCircle,
+  Undo2, FileText, File, Sparkles, ChevronDown,
+  Lock, Unlock, Key, Copy, Scissors, ClipboardPaste, TextCursorInput,
+  Settings, HelpCircle, Trash2, RotateCcw, CornerDownLeft, ChevronRight,
 } from './icons'
 import * as api from '../api/client'
 import {
-  state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments,
+  state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments, waitForPendingAttachments,
   isStreaming,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
-  currentRollbackBanner, currentPendingInput, undoRollback, dismissRollback,
-  currentPendingConfirm, submitToolConfirm,
+  currentRollbackBanner, currentPendingInput, currentPendingInputRevision, currentRollbackDraft,
+  undoRollback, dismissRollback,
+  currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
+  deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
+  hasQueuedTurns, markSessionActive,
+  currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
+  generateSessionTitle,
 } from '../stores/chat'
 import type { PendingAttachment } from '../stores/chat'
-import { stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
+import { Pencil, Check, X } from './icons'
+import { editQueuedTurn, setTurnQueueEditing } from '../stores/chat'
+import { drainQueuedConversationTurns, stopConversationTurn, submitConversationTurn } from '../composables/conversationTurn'
 import { notifyManager } from '../utils/notify'
 import { copyText } from '../utils/clipboard'
+import { dataURLToBlobURL } from '../utils/mediaPreview'
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const inputText = ref('')
@@ -53,22 +61,41 @@ function resizeTextarea() {
 watch(inputText, () => nextTick(resizeTextarea))
 watch(() => currentAttachments.value.length, () => nextTick(resizeTextarea))
 
-// Sync rollback pending input to the textarea.
-watch(currentPendingInput, (val) => {
-  if (val) {
-    inputText.value = val
+// Sync a rollback draft to the textarea. The revision signal is required for
+// attachment-only messages and repeated rollbacks whose caption is unchanged.
+// 撤回纯附件消息时同样要清空旧文字并聚焦输入框。
+watch(
+  () => [state.currentID, currentPendingInputRevision.value] as const,
+  () => {
+    const draft = currentRollbackDraft.value
+    if (!draft) return
+    inputText.value = currentPendingInput.value
     nextTick(() => {
       inputEl.value?.focus()
       resizeTextarea()
     })
+  },
+)
+
+async function onUndoRollback() {
+  const sessionID = state.currentID
+  if (!sessionID) return
+  const draft = currentRollbackDraft.value
+  const shouldClearInjectedText = !!draft && inputText.value === draft.text
+  try {
+    await undoRollback(sessionID)
+    if (shouldClearInjectedText) inputText.value = ''
+  } catch (e: any) {
+    message.error(`撤销失败：${e?.message || e}`)
   }
-})
+}
 
 // Also sync after backspace / clear (send resets inputText to '').
 onMounted(() => nextTick(resizeTextarea))
 const sending = ref(false)
 const sendPreflightSessions = new Set<string>()
 const showSessionConfig = ref(false)
+const showSubAgentModelPicker = ref(false)
 const message = useMessage()
 const dialog = useDialog()
 
@@ -102,22 +129,57 @@ const reasoningEffortOptions = [
   },
 ]
 
-const planMode = computed(() => {
-  if (!state.currentID) return false
-  return state.sessionMeta[state.currentID]?.plan_mode || false
+const turnModePolicy = computed<api.TurnModePolicy>(() => {
+  if (!state.currentID) return 'auto'
+  const meta = state.sessionMeta[state.currentID] || currentMeta.value
+  return meta?.turn_mode_policy || (meta?.plan_mode ? 'plan' : 'build')
 })
 
 async function togglePlanMode() {
   if (!state.currentID) return
-  const next = !planMode.value
+  const next = nextTurnModePolicy(turnModePolicy.value)
   try {
-    await api.updateSessionMeta(state.currentID, { plan_mode: next })
-    state.sessionMeta[state.currentID] = {
-      ...state.sessionMeta[state.currentID],
-      plan_mode: next,
+    const resp = await api.updateSessionMeta(state.currentID, {
+      turn_mode_policy: next,
+      plan_mode: next === 'plan',
+    })
+    const mode = resp.turn_mode_policy || next
+    const id = state.currentID
+    state.sessionMeta[id] = {
+      ...state.sessionMeta[id],
+      turn_mode_policy: mode,
+      plan_mode: resp.plan_mode ?? mode === 'plan',
+    }
+    const session = state.sessions.find(s => s.id === id)
+    if (session) {
+      session.turn_mode_policy = mode
+      session.plan_mode = resp.plan_mode ?? mode === 'plan'
     }
   } catch {}
 }
+
+function nextTurnModePolicy(policy: api.TurnModePolicy): api.TurnModePolicy {
+  if (policy === 'auto') return 'plan'
+  if (policy === 'plan') return 'build'
+  return 'auto'
+}
+
+const turnModeLabel = computed(() => {
+  if (turnModePolicy.value === 'auto') return '自动'
+  if (turnModePolicy.value === 'plan') return '计划'
+  return '构建'
+})
+const turnModeTitle = computed(() => {
+  if (turnModePolicy.value === 'auto') return '当前：自动选择计划或构建'
+  if (turnModePolicy.value === 'plan') return '当前：计划模式'
+  return '当前：构建模式'
+})
+const turnModeAria = computed(() => `模式：${turnModeLabel.value}，点击切换`)
+const turnModeIcon = computed(() => {
+  if (turnModePolicy.value === 'auto') return Sparkles
+  if (turnModePolicy.value === 'plan') return Clipboard
+  return Hammer
+})
 
 const permissionLevel = computed(() => {
   if (!state.currentID) return 'ask'
@@ -159,20 +221,12 @@ function onToggleMute() {
 // --- knowledge base selector ---
 const kbBases = ref<api.KnowledgeBaseItem[]>([])
 const kbOptions = computed(() => [
-  { label: '知识库 · 不使用', value: '__off__' },
-  { label: '知识库 · 全部', value: '__all__' },
-  ...kbBases.value.filter(b => b.enabled).map(b => ({ label: `知识库 · ${b.name}`, value: b.name })),
+  { label: '不使用', value: '__off__' },
+  { label: '全部知识库', value: '__all__' },
+  ...kbBases.value.filter(b => b.enabled).map(b => ({ label: b.name, value: b.name })),
 ])
-const kbMenuOptions = computed<DropdownOption[]>(() =>
-  kbOptions.value.map((opt) => ({
-    label: opt.value === '__off__'
-      ? '不使用知识库'
-      : opt.value === '__all__'
-        ? '全部知识库'
-        : opt.value,
-    key: opt.value,
-    icon: menuIcon(Database),
-  })),
+const kbDropdownOptions = computed<DropdownOption[]>(() =>
+  kbOptions.value.map(option => ({ label: option.label, key: option.value })),
 )
 const kbBase = computed({
   get: () => {
@@ -201,7 +255,7 @@ watch(() => state.kbConfigVersion, () => { loadKBases() })
 
 const commandList = ref<CmdSpec[]>([])
 const skillCommands = ref<CmdSpec[]>([])
-let pendingSkillContext = ''
+let pendingActiveSkills: string[] = []
 
 // Merge local commands that aren't in the server list.
 const LOCAL_COMMANDS: CmdSpec[] = [
@@ -685,7 +739,7 @@ async function renderProviders(): Promise<string> {
       const defTag = p.is_default ? ' <span class="cmd-tag tag-def">默认</span>' : ''
       html += `<div class="cmd-card">
         <div class="cmd-card-head"><strong>${p.name}</strong>${defTag}<span class="cmd-tag tag-prot">${p.protocol}</span></div>
-        <div class="cmd-card-meta">${p.base_url || ''}${modelCount ? ' · ' + modelCount : ''}</div>
+        <div class="cmd-card-meta">${p.base_url || p.api_url || ''}${modelCount ? ' · ' + modelCount : ''}</div>
       </div>`
     }
     html += '</div>'
@@ -709,7 +763,10 @@ async function renderModels(args: string): Promise<string> {
       } else {
         for (const m of models) {
           const defTag = m.default ? ' <span class="cmd-tag tag-def">★</span>' : ''
-          const visionTag = m.capabilities?.supports_vision ? ' <span class="cmd-tag tag-vis">视觉</span>' : ''
+          const configuredCapabilities = m.capabilities?.input_modalities || (m.capabilities?.supports_vision ? ['image' as api.MediaKind] : [])
+          const visionTag = configuredCapabilities.length
+            ? ` <span class="cmd-tag tag-vis">${configuredCapabilities.map(kind => recognitionLabels[kind]).join('/')}</span>`
+            : ''
           const ctx = m.max_tokens_context ? `${fmtK(m.max_tokens_context)} ctx` : ''
           const out = m.max_tokens_output ? `${fmtK(m.max_tokens_output)} out` : ''
           const meta = [ctx, out].filter(Boolean).join(' · ')
@@ -860,47 +917,95 @@ async function clearUnfinishedTodosBeforeSend(id: string): Promise<TodoSendMode 
   }
 }
 
+function buildLocalBubbleAttachments(attachments: PendingAttachment[]): api.MessageAttachment[] {
+  const result: api.MessageAttachment[] = []
+  for (const a of attachments) {
+    if (a._error) continue
+    if (a.kind === 'image' || a.kind === 'audio' || a.kind === 'video') {
+      const type = a.kind === 'image' ? 'image_url' : a.kind === 'audio' ? 'audio_url' : 'video_url'
+      const url = a._file ? URL.createObjectURL(a._file) : dataURLToBlobURL(a._dataURL)
+      const previewURL = url || (a.id ? api.uploadURL(a.id) : '')
+      if (previewURL) result.push({
+        type,
+        url: previewURL,
+        upload_id: a.id || undefined,
+        name: a.name,
+        kind: a.kind,
+        mime: a.mime,
+      })
+      continue
+    }
+    const url = a._file
+      ? URL.createObjectURL(a._file)
+      : a.id
+        ? api.uploadURL(a.id)
+        : dataURLToBlobURL(a._dataURL)
+    result.push({
+      type: 'text',
+      url: url || undefined,
+      text: a.kind === 'text' ? a._dataURL || undefined : undefined,
+      upload_id: a.id || undefined,
+      name: a.name,
+      kind: a.kind,
+      mime: a.mime,
+    })
+  }
+  return result
+}
+
+function buildInlineAttachments(attachments: PendingAttachment[]): api.InlineAttachment[] {
+  const result: api.InlineAttachment[] = []
+  for (const a of attachments) {
+    if (a._error) continue
+    const data = a._dataURL
+    if (a.kind === 'image' || a.kind === 'audio' || a.kind === 'video') {
+      if (!a.id && !data) continue
+      const type = a.kind === 'image' ? 'image_url' : a.kind === 'audio' ? 'audio_url' : 'video_url'
+      result.push({
+        type,
+        url: a.id ? undefined : data,
+        upload_id: a.id || undefined,
+        name: a.name,
+        kind: a.kind,
+        mime: a.mime,
+      })
+      continue
+    }
+    if (!a.id && !data) continue
+    result.push({
+      type: 'text',
+      data: a.id ? undefined : data,
+      upload_id: a.id || undefined,
+      name: a.name,
+      kind: a.kind,
+      mime: a.mime,
+    })
+  }
+  return result
+}
+
 async function send() {
   const raw = inputText.value.trim()
   if (!raw) return
-  if (isStreaming.value) {
-    // 当前会话已有流在进行，直接忽略重复发送。
-    // The active session already has a stream; ignore duplicate sends.
-    return
-  }
   // NOTE: we intentionally do NOT gate on `sending.value`
   // here. That ref is local to this InputArea instance, but
   // multiple conversations can stream in parallel. If session
-  // A is mid-stream, `sending` is true; the user switching to
-  // session B (which is not streaming) should still be able to
-  // send. The send/stop button is already gated on
-  // `isStreaming` (per-session), so double-clicks within the
-  // same session are already impossible.
+  // A is mid-stream, the user switching to session B should
+  // still be able to send. When the current session is already
+  // streaming, this send path persists the new message as a
+  // queued turn instead of dropping it.
 
   if (isSlashLine()) {
     const parsed = parseSlashLine()
     if (parsed) {
-      // Skill commands: load content, merge with user args,
-      // then send as a single message to the LLM.
+      // Skill 命令只选择名称；服务端负责解析生效包、校验依赖并发送生命周期事件。
+      // Skill commands select only a name; the server resolves, validates, and emits lifecycle events.
       if (skillCommands.value.some(c => c.name === parsed.name)) {
-        sending.value = true
-        try {
-          const r = await api.getSkill(parsed.name, state.currentID ? { sessionId: state.currentID } : undefined)
-          const skillContent = r.skill.content || ''
-          const userInput = parsed.args || ''
-          pendingSkillContext = skillContent
-          // Show a clean system note instead of dumping skill content.
-          appendSystemMessage(`已激活技能「${parsed.name}」` + (userInput ? `: ${userInput}` : ''))
-          // Use only the user's input as the visible message.
-          inputText.value = userInput || `请根据技能「${parsed.name}」的内容提供帮助`
-          sending.value = false
-          // Fall through to normal send below.
-        } catch (e: any) {
-          appendSystemMessage(`技能 /${parsed.name} 加载失败: ${e.message}`)
-          sending.value = false
-          inputText.value = ''
-          return
-        }
+        pendingActiveSkills = [parsed.name]
+        const userInput = parsed.args || ''
+        inputText.value = userInput || `请使用 Skill「${parsed.name}」提供帮助`
+        // 继续走下方正常发送流程；SkillCallCard 是 start/ready/error 的事实来源。
+        // Continue through normal send; SkillCallCard is the lifecycle source of truth.
       } else {
         inputText.value = ''
         sending.value = true
@@ -916,7 +1021,8 @@ async function send() {
 
   const preflightSessionID = state.currentID
   let todoMode: TodoSendMode = 'auto'
-  if (preflightSessionID) {
+  const shouldQueueBeforePreflight = currentConversationBusy.value || currentTurnQueue.value.length > 0
+  if (preflightSessionID && !shouldQueueBeforePreflight) {
     if (sendPreflightSessions.has(preflightSessionID)) return
     sendPreflightSessions.add(preflightSessionID)
     let selectedMode: TodoSendMode | null = null
@@ -947,54 +1053,9 @@ async function send() {
   }
   const id = state.currentID
   const meta = currentMeta.value
-  // Build the attachment payload in two directions at once:
-  //   - inlineAttachments: what we send to the server. Images
-  //     are uploaded to /api/v1/uploads first; the wire carries
-  //     { upload_id, name, kind, mime } and NO inline bytes, so
-  //     the server persists an "upl://<id>" reference and the
-  //     request body stays small. Audio/video/text keep the
-  //     inline data URL / text body as before.
-  //   - bubbleAttachments: the same data shaped for the chat
-  //     bubble (the local data URL goes into `url`, the original
-  //     file name into `name`) so the user sees the image right
-  //     away, not after a server round-trip.
-  //
-  // Attachments are read from the *current* session's pending
-  // list — per-session storage means staging files in one
-  // conversation doesn't leak into another when the user
-  // switches.
-  const inlineAttachments: api.InlineAttachment[] = []
-  const bubbleAttachments: api.InlineAttachment[] = []
-  for (const a of currentAttachments.value) {
-    if (a._error) continue
-    const data = a._dataURL
-    if (!data) continue
-    if (a.kind === 'image') {
-      // Image bytes go through the upload endpoint so the
-      // database row stays a small reference. The upload is
-      // parallel-ready and fail-soft: on any error we fall back
-      // to shipping the inline data URL, so a blocked /uploads
-      // request never blocks the user's message.
-      let uploadID: string | undefined
-      try {
-        const up = await api.uploadFile((a as PendingAttachment)._file as File)
-        if (up.size > 0) uploadID = up.id
-      } catch { /* inline fallback below */ }
-      inlineAttachments.push({ type: 'image_url', url: uploadID ? undefined : data, upload_id: uploadID, name: a.name, kind: a.kind, mime: a.mime })
-      bubbleAttachments.push({ type: 'image_url', url: data, name: a.name, kind: a.kind, mime: a.mime })
-    } else if (a.kind === 'audio' || a.kind === 'video') {
-      // Audio and video ride the same wire path as images:
-      // base64 data URL on a *_url attachment type. The LLM
-      // can't actually hear/watch them today (no native
-      // adapter), but the chat bubble renders a player.
-      const wire = a.kind === 'audio' ? 'audio_url' : 'video_url'
-      inlineAttachments.push({ type: wire, url: data, name: a.name, kind: a.kind, mime: a.mime })
-      bubbleAttachments.push({ type: wire, url: data, name: a.name, kind: a.kind, mime: a.mime })
-    } else {
-      inlineAttachments.push({ type: 'text', text: data, name: a.name, kind: a.kind, mime: a.mime })
-      bubbleAttachments.push({ type: 'text', text: data, name: a.name, kind: a.kind, mime: a.mime })
-    }
-  }
+  // Snapshot this session's staged files. Selection owns the single upload;
+  // sending only waits for that work and reuses its upload id.
+  const stagedAttachments = currentAttachments.value.filter(a => !a._error)
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
   // Mint a row id for this user message at send time so
   // rollback and regenerate always have a valid `msg.id`
@@ -1007,59 +1068,71 @@ async function send() {
   // colliding with anything autoincrement produces for
   // assistant messages later in the same session.
   const clientMsgId = Date.now() * 1000 + Math.floor(Math.random() * 1000)
-  // Push the user message WITH id + attachments so the
-  // bubble renders correctly without waiting for the
-  // next history fetch, and so rollback can target the
-  // exact row from the moment the message is sent.
-  // created_at (Unix sec) is stamped locally so the
-  // "send time" footer renders immediately; history
-  // reloads replace it with the server's value.
-  state.sessionMessages[id].push({
-    id: clientMsgId,
-    role: 'user',
-    content: text,
-    created_at: Date.now() / 1000,
-    attachments: bubbleAttachments.length ? bubbleAttachments : undefined,
-  })
-  // Convert inline base64 data: URLs on user-sent image
-  // attachments into blob: URLs. The base64 payload has
-  // already been shipped to the server via the
-  // `inlineAttachments` wire path (a separate Array that
-  // owns the same string references until the stream
-  // completes), but the message bubble renders from
-  // `bubbleAttachments` — swapping those to blob URLs
-  // here means the reactive state holds only a short
-  // blob: reference going forward, not a multi-hundred-KB
-  // base64 string. The Blob itself stays alive via the
-  // `pendingAttachments` `_dataURL` until `clearAttachments`
-  // runs in the finally block below.
-  for (const att of bubbleAttachments) {
-    if (att.url?.startsWith('data:image/')) {
-      try {
-        const commaIdx = att.url.indexOf(',')
-        const b64 = att.url.slice(commaIdx + 1)
-        const mime = att.url.slice(5, commaIdx)
-        const byteChars = atob(b64)
-        const bytes = new Uint8Array(byteChars.length)
-        for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
-        att.url = URL.createObjectURL(new Blob([bytes], { type: mime }))
-      } catch { /* keep original data URL */ }
+  const shouldQueue = currentConversationBusy.value || currentTurnQueue.value.length > 0
+  let optimisticUserMessage: api.Message | null = null
+  if (!shouldQueue) {
+    // The bubble is optimistic: local object URLs render immediately while a
+    // just-selected attachment finishes its existing read/upload task.
+    const bubbleAttachments = buildLocalBubbleAttachments(stagedAttachments)
+    optimisticUserMessage = {
+      id: clientMsgId,
+      role: 'user',
+      content: text,
+      created_at: Date.now() / 1000,
+      attachments: bubbleAttachments.length ? bubbleAttachments : undefined,
     }
+    state.sessionMessages[id].push(optimisticUserMessage)
+    markSessionActive(id, 'message')
+    clearAttachments(id)
+    notifyManager.unlock()
+  } else {
+    markSessionActive(id, 'pending')
   }
-  if (!meta.title) {
-    api.renameSession(id, text.slice(0, 40)).then(() => {
-      const s = state.sessions.find(s => s.id === id)
-      if (s) s.title = text.slice(0, 40)
-    }).catch(() => {})
+
+  await waitForPendingAttachments(stagedAttachments)
+  // Uploads can finish after the optimistic bubble was inserted. Keep the
+  // durable id on that GUI message so an immediate rollback can restore the
+  // same files without reading or uploading them again.
+  optimisticUserMessage?.attachments?.forEach((attachment, index) => {
+    const uploadID = stagedAttachments[index]?.id
+    if (uploadID) attachment.upload_id = uploadID
+  })
+  const inlineAttachments = buildInlineAttachments(stagedAttachments)
+  const activeSkills = pendingActiveSkills.length ? [...pendingActiveSkills] : undefined
+  const turnPayload = api.sendPayloadFromOptions({
+    message: text,
+    client_msg_id: clientMsgId,
+    provider: meta.provider,
+    model: meta.model,
+    style: meta.style,
+    workMode: meta.workMode,
+    useImageRecognition: imageRecognitionEnabled.value,
+    subAgentModelEnabled: !!meta.sub_agent_model_enabled,
+    subAgentProvider: meta.sub_agent_provider || '',
+    subAgentModel: meta.sub_agent_model || '',
+    turnModePolicy: meta.turn_mode_policy || turnModePolicy.value,
+    todo_mode: todoMode,
+    attachments: inlineAttachments,
+    active_skills: activeSkills,
+  })
+  if (shouldQueue) {
+    try {
+      await enqueueTurnQueue(id, turnPayload)
+      clearAttachments(id)
+      pendingActiveSkills = []
+      notifyManager.unlock()
+      message.info('消息已加入队列')
+      maybeDrainTurnQueue()
+    } catch (e: any) {
+      message.error(`加入队列失败：${e?.message || e}`)
+    }
+    return
   }
   inputText.value = ''
-  clearAttachments()
-  // 首次用户交互时解锁 Web Audio（浏览器自动播放策略要求）
-  notifyManager.unlock()
 
   sending.value = true
   try {
-    await submitConversationTurn({
+    const turnResult = await submitConversationTurn({
       sessionId: id,
       message: text,
       // The integer id minted above (and stamped on the
@@ -1070,18 +1143,22 @@ async function send() {
       // the SQLite row id in lockstep, so rollback and
       // regenerate work the instant the user clicks them.
       clientMsgID: clientMsgId,
-    provider: meta.provider,
-    model: meta.model,
-    style: meta.style,
-    workMode: meta.workMode,
-    useImageRecognition: imageRecognitionEnabled.value,
+      provider: meta.provider,
+      model: meta.model,
+      style: meta.style,
+      workMode: meta.workMode,
+      useImageRecognition: imageRecognitionEnabled.value,
+      subAgentModelEnabled: !!meta.sub_agent_model_enabled,
+      subAgentProvider: meta.sub_agent_provider || '',
+      subAgentModel: meta.sub_agent_model || '',
+      turnModePolicy: meta.turn_mode_policy || turnModePolicy.value,
       todoMode,
       attachments: inlineAttachments,
-      skillContext: pendingSkillContext || undefined,
-      // 首个流事件到达后，技能上下文已经提交给服务端。
-      // The first stream event confirms the skill context was submitted.
+      activeSkills,
+      // 首个流事件到达后，Skill 名称已经提交给服务端。
+      // The first stream event confirms the Skill name was submitted.
       onFirstEvent: () => {
-        pendingSkillContext = ''
+        pendingActiveSkills = []
       },
       onServerError: (event) => {
         if (event.suggestion) {
@@ -1091,6 +1168,9 @@ async function send() {
         }
       },
     })
+    if (!turnResult.aborted) {
+      void generateSessionTitle(id, text).catch(() => {})
+    }
   } catch (e: any) {
     if (e.name !== 'AbortError') {
       message.error(`发送失败: ${e.message}`)
@@ -1159,7 +1239,10 @@ async function loadConfig() {
     loadKBases()
     const sc = await api.getSystemConfig()
     state.globalWorkMode = sc.work_mode?.default || 'coding'
-    state.visionRecognitionEnabled = !!sc.vision_recognition?.enabled
+    const availableCapabilities = (['image', 'video', 'audio'] as api.MediaKind[])
+      .filter(kind => !!sc.recognition?.routes?.[kind]?.available)
+    state.recognitionCapabilitiesAvailable = availableCapabilities
+    state.visionRecognitionEnabled = availableCapabilities.includes('image') || !!sc.vision_recognition?.enabled
     const st = await api.getStyles()
     styleOptions.value = [
       { label: '关闭', value: 'off' },
@@ -1207,6 +1290,9 @@ const currentStyleLabel = computed(() => {
   const v = currentStyleValue.value
   return styleOptions.value.find(o => o.value === v)?.label || v
 })
+const styleDropdownOptions = computed<DropdownOption[]>(() =>
+  styleOptions.value.map(option => ({ label: option.label, key: option.value })),
+)
 
 async function onWorkModePick(v: string) {
   if (!state.currentID) return
@@ -1248,34 +1334,273 @@ async function onTodoLongRunPick(v: 'off' | 'adaptive' | 'unlimited') {
   }
 }
 
-const imageRecognitionAvailable = computed(() => !!state.visionRecognitionEnabled)
-
-const imageRecognitionEnabled = computed(() =>
-  imageRecognitionAvailable.value && !!state.sessionMeta[state.currentID]?.use_image_recognition,
+const recognitionLabels: Record<api.MediaKind, string> = {
+  image: '图片',
+  video: '视频',
+  audio: '音频',
+}
+const enabledRecognitionCapabilities = computed(() => {
+  const meta = state.sessionMeta[state.currentID]
+  const configured = meta?.enabled_recognition_capabilities
+    || (meta?.use_image_recognition ? ['image' as api.MediaKind] : [])
+  return configured.filter(kind => state.recognitionCapabilitiesAvailable.includes(kind))
+})
+const recognitionCapabilityDropdownOptions = computed<DropdownOption[]>(() => {
+  const selected = new Set(enabledRecognitionCapabilities.value)
+  return [
+    { label: `${selected.size === 0 ? '✓ ' : ''}关闭`, key: '__off__' },
+    { type: 'divider', key: 'recognition-divider' },
+    ...state.recognitionCapabilitiesAvailable.map(kind => ({
+      label: `${selected.has(kind) ? '✓ ' : ''}${recognitionLabels[kind]}识别`,
+      key: kind,
+    })),
+  ]
+})
+const imageRecognitionEnabled = computed(() => enabledRecognitionCapabilities.value.includes('image'))
+const recognitionCapabilityLabel = computed(() => {
+  if (!state.recognitionCapabilitiesAvailable.length) return '不可用'
+  if (!enabledRecognitionCapabilities.value.length) return '关闭'
+  return '已启用'
+})
+const recognitionCapabilityFirstLabel = computed(() => {
+  const [kind] = enabledRecognitionCapabilities.value
+  return kind ? `${recognitionLabels[kind]}识别` : ''
+})
+const recognitionCapabilityDetail = computed(() =>
+  enabledRecognitionCapabilities.value.length
+    ? enabledRecognitionCapabilities.value.map(kind => `${recognitionLabels[kind]}识别`).join('、')
+    : recognitionCapabilityLabel.value,
 )
 
-const imageRecognitionLabel = computed(() =>
-  imageRecognitionAvailable.value ? (imageRecognitionEnabled.value ? '开' : '关') : '不可用',
-)
-
-async function onImageRecognitionPick(v: boolean) {
+async function onRecognitionCapabilitiesPick(value: api.MediaKind[]) {
   if (!state.currentID) return
-  if (v && !imageRecognitionAvailable.value) {
-    message.warning('请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。', { duration: 5000 })
+  try {
+    const resp = await api.updateSessionMeta(state.currentID, { enabled_recognition_capabilities: value })
+    const id = state.currentID
+    const enabled = resp.enabled_recognition_capabilities ?? value
+    state.sessionMeta[id] = {
+      ...(state.sessionMeta[id] || currentMeta.value),
+      enabled_recognition_capabilities: enabled,
+      use_image_recognition: enabled.includes('image'),
+    }
+    const session = state.sessions.find(s => s.id === id)
+    if (session) {
+      session.enabled_recognition_capabilities = enabled
+      session.use_image_recognition = enabled.includes('image')
+    }
+  } catch (e: any) {
+    message.error(`能力工具设置失败：${e?.message || e}`)
+  }
+}
+
+function toggleRecognitionCapability(value: string | number) {
+  const selected = String(value)
+  if (selected === '__off__') {
+    void onRecognitionCapabilitiesPick([])
+    return
+  }
+  if (!state.recognitionCapabilitiesAvailable.includes(selected as api.MediaKind)) return
+  const current = enabledRecognitionCapabilities.value
+  const next = current.includes(selected as api.MediaKind)
+    ? current.filter(kind => kind !== selected)
+    : [...current, selected as api.MediaKind]
+  void onRecognitionCapabilitiesPick(next)
+}
+
+const generationOptions = ref<api.GenerationOperationOption[]>([])
+const generationOptionsLoading = ref(false)
+const generationLabels: Record<api.GenerationOperation, string> = {
+  text_to_image: '文生图',
+  image_to_image: '图生图',
+  text_to_video: '文生视频',
+  image_to_video: '图生视频',
+  video_to_video: '视频生视频',
+  text_to_speech: '文本转语音',
+  text_to_music: '文生音乐',
+  text_to_sound: '文生音效',
+  audio_to_audio: '音频生音频',
+}
+
+async function loadGenerationOptions() {
+  const sessionID = state.currentID
+  if (!sessionID) {
+    generationOptions.value = []
+    return
+  }
+  generationOptionsLoading.value = true
+  try {
+    const response = await api.getGenerationOptions(sessionID)
+    if (state.currentID === sessionID) generationOptions.value = response.operations || []
+  } catch {
+    if (state.currentID === sessionID) generationOptions.value = []
+  } finally {
+    if (state.currentID === sessionID) generationOptionsLoading.value = false
+  }
+}
+
+watch(() => state.currentID, () => void loadGenerationOptions(), { immediate: true })
+watch(() => state.generationConfigVersion, () => void loadGenerationOptions())
+
+const enabledGenerationOperations = computed(() =>
+  (state.sessionMeta[state.currentID]?.enabled_generation_operations || [])
+    .filter(operation => generationOptions.value.some(item => item.operation === operation && item.available)),
+)
+const generationCapabilityDropdownOptions = computed<DropdownOption[]>(() => {
+  const selected = new Set(enabledGenerationOperations.value)
+  return [
+    { label: `${selected.size === 0 ? '✓ ' : ''}关闭`, key: '__off__' },
+    { type: 'divider', key: 'generation-divider' },
+    ...generationOptions.value.filter(item => item.available).map(item => ({
+      label: `${selected.has(item.operation) ? '✓ ' : ''}${generationLabels[item.operation]}`,
+      key: item.operation,
+    })),
+  ]
+})
+
+const generationCapabilityLabel = computed(() => {
+  if (generationOptionsLoading.value) return '加载中'
+  if (!generationOptions.value.some(item => item.available)) return '不可用'
+  if (!enabledGenerationOperations.value.length) return '关闭'
+  return '已启用'
+})
+const generationCapabilityFirstLabel = computed(() => {
+  const [operation] = enabledGenerationOperations.value
+  return operation ? generationLabels[operation] : ''
+})
+const generationCapabilityDetail = computed(() =>
+  enabledGenerationOperations.value.length
+    ? enabledGenerationOperations.value.map(operation => generationLabels[operation]).join('、')
+    : generationCapabilityLabel.value,
+)
+
+function syncGenerationSession(resp: api.UpdateSessionMetaResponse) {
+  const id = state.currentID
+  const current = state.sessionMeta[id] || currentMeta.value
+  state.sessionMeta[id] = {
+    ...current,
+    enabled_generation_operations: resp.enabled_generation_operations ?? current.enabled_generation_operations ?? [],
+  }
+  const session = state.sessions.find(candidate => candidate.id === id)
+  if (session) {
+    session.enabled_generation_operations = state.sessionMeta[id].enabled_generation_operations
+  }
+}
+
+async function onGenerationCapabilitiesPick(value: api.GenerationOperation[]) {
+  if (!state.currentID) return
+  try {
+    const response = await api.updateSessionMeta(state.currentID, { enabled_generation_operations: value })
+    syncGenerationSession(response)
+    await loadGenerationOptions()
+  } catch (e: any) {
+    message.error(`媒体生成设置失败：${e?.message || e}`)
+  }
+}
+
+function toggleGenerationCapability(value: string | number) {
+  const selected = String(value)
+  if (selected === '__off__') {
+    void onGenerationCapabilitiesPick([])
+    return
+  }
+  const operation = selected as api.GenerationOperation
+  if (!generationOptions.value.some(item => item.operation === operation && item.available)) return
+  const current = enabledGenerationOperations.value
+  const next = current.includes(operation)
+    ? current.filter(item => item !== operation)
+    : [...current, operation]
+  void onGenerationCapabilitiesPick(next)
+}
+
+function providerHasModel(provider: string, model: string): boolean {
+  const p = state.providers.find(x => x.name === provider)
+  const models = (p?.models || []) as api.ModelInfo[]
+  return models.some((m: api.ModelInfo) => m.name === model && (m.type || 'llm') === 'llm')
+}
+
+function firstConfiguredModel(): { provider: string; model: string } | null {
+  const meta = currentMeta.value
+  if (meta.provider && meta.model && providerHasModel(meta.provider, meta.model)) {
+    return { provider: meta.provider, model: meta.model }
+  }
+  if (state.defaultModel?.provider && state.defaultModel?.model) {
+    return { provider: state.defaultModel.provider, model: state.defaultModel.model }
+  }
+  for (const p of state.providers) {
+    const models = ((p.models || []) as api.ModelInfo[]).filter(m => (m.type || 'llm') === 'llm')
+    const m = models.find((x: api.ModelInfo) => x.default) || models[0]
+    if (m?.name) return { provider: p.name, model: m.name }
+  }
+  return null
+}
+
+const subAgentModelEnabled = computed(() =>
+  !!state.sessionMeta[state.currentID]?.sub_agent_model_enabled,
+)
+
+const subAgentModelProvider = computed(() =>
+  state.sessionMeta[state.currentID]?.sub_agent_provider || currentMeta.value.provider || '',
+)
+
+const subAgentModelName = computed(() =>
+  state.sessionMeta[state.currentID]?.sub_agent_model || currentMeta.value.model || '',
+)
+
+const subAgentModelLabel = computed(() =>
+  subAgentModelEnabled.value ? (subAgentModelName.value || '未选择') : '继承',
+)
+
+async function updateSubAgentModelMeta(enabled: boolean, provider: string, modelName: string) {
+  if (!state.currentID) return
+  const resp = await api.updateSessionMeta(state.currentID, {
+    sub_agent_model_enabled: enabled,
+    sub_agent_provider: provider,
+    sub_agent_model: modelName,
+  })
+  const id = state.currentID
+  const nextEnabled = resp.sub_agent_model_enabled ?? enabled
+  const nextProvider = resp.sub_agent_provider ?? provider
+  const nextModel = resp.sub_agent_model ?? modelName
+  state.sessionMeta[id] = {
+    ...(state.sessionMeta[id] || currentMeta.value),
+    sub_agent_model_enabled: nextEnabled,
+    sub_agent_provider: nextProvider,
+    sub_agent_model: nextModel,
+  }
+  const session = state.sessions.find(s => s.id === id)
+  if (session) {
+    session.sub_agent_model_enabled = nextEnabled
+    session.sub_agent_provider = nextProvider
+    session.sub_agent_model = nextModel
+  }
+}
+
+async function onSubAgentModelModePick(enabled: boolean) {
+  if (!state.currentID) return
+  const picked = firstConfiguredModel()
+  let provider = subAgentModelProvider.value || picked?.provider || ''
+  let modelName = subAgentModelName.value || picked?.model || ''
+  if (enabled && !providerHasModel(provider, modelName) && picked) {
+    provider = picked.provider
+    modelName = picked.model
+  }
+  if (enabled && (!provider || !modelName)) {
+    message.warning('请先添加至少一个可用模型。', { duration: 4000 })
     return
   }
   try {
-    const resp = await api.updateSessionMeta(state.currentID, { use_image_recognition: v })
-    const id = state.currentID
-    const enabled = resp.use_image_recognition ?? v
-    state.sessionMeta[id] = {
-      ...(state.sessionMeta[id] || currentMeta.value),
-      use_image_recognition: enabled,
-    }
-    const session = state.sessions.find(s => s.id === id)
-    if (session) session.use_image_recognition = enabled
+    await updateSubAgentModelMeta(enabled, provider, modelName)
   } catch (e: any) {
-    message.error(`图像识别设置失败：${e?.message || e}`)
+    message.error(`子代理模型设置失败：${e?.message || e}`)
+  }
+}
+
+async function onSubAgentModelSelect(sel: { provider: string; model: string }) {
+  if (!state.currentID) return
+  try {
+    await updateSubAgentModelMeta(true, sel.provider, sel.model)
+  } catch (e: any) {
+    message.error(`子代理模型设置失败：${e?.message || e}`)
   }
 }
 
@@ -1304,10 +1629,6 @@ const currentReasoningLabel = computed(() => {
   return REASONING_LABELS[v] || v
 })
 
-const sessionConfigSummary = computed(() =>
-  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 识图${imageRecognitionLabel.value} · 风格${currentStyleLabel.value}`,
-)
-
 // Display label for the knowledge base picker. The "off"
 // and "all" pseudo-bases get short labels so the button
 // stays narrow; a real base name shows as-is.
@@ -1321,6 +1642,10 @@ const currentKBLabel = computed(() => {
   return v
 })
 
+const sessionConfigSummary = computed(() =>
+  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 知识库${currentKBLabel.value} · 识别${recognitionCapabilityLabel.value} · 生成${generationCapabilityLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
+)
+
 // Setter wrappers for the NDropdown @select handler.
 // The handlers receive (key: string | number), but Vue's
 // computed refs don't expose `.value` cleanly from the
@@ -1330,8 +1655,11 @@ const currentKBLabel = computed(() => {
 function pickReasoning(v: string) {
   reasoningEffort.value = v
 }
-function pickKB(v: string) {
-  kbBase.value = v
+function pickStyle(v: string | number) {
+  onStylePick(String(v))
+}
+function pickKB(v: string | number) {
+  kbBase.value = String(v)
 }
 
 // showModelPicker drives the ModelPicker popover. Toggled by
@@ -1344,14 +1672,6 @@ function openModelPicker() {
   if (!state.currentID) return
   showModelPicker.value = true
 }
-
-// showAdvanced toggles the "更多" secondary row that
-// hosts the KB picker. Default collapsed: the KB is a
-// less-touched setting (the user usually picks one KB
-// per project and rarely changes it) so the row stays
-// out of the way. Reasoning used to live here too but
-// was promoted to the input-row in PR #10.
-const showAdvanced = ref(false)
 
 // Permission-level picker: small icon-only popover that
 // shows a 3-option list (always-ask / auto-approve /
@@ -1369,15 +1689,185 @@ const permLabel = computed(() => {
   return '始终询问'
 })
 
+const queuedTurns = computed(() => currentTurnQueue.value)
+const hasFailedQueuedTurn = computed(() => queuedTurns.value.some(item => item.status === 'failed'))
+const queueSignature = computed(() => queuedTurns.value.map(item => `${item.id}:${item.status}`).join('|'))
+const queueDraining = computed(() => !!state.turnQueueDraining[state.currentID])
+const hasPendingQuestion = computed(() => !!currentPendingQuestion.value)
+// Failed items stay expandable even during a question so the user can
+// retry/delete; otherwise question forces the queue into a one-line strip.
+const queueExpanded = computed(() => {
+  if (queuedTurns.value.length === 0) return false
+  if (hasPendingQuestion.value && !hasFailedQueuedTurn.value) return false
+  return state.composerExpandedDock === 'queue'
+})
+const queuePreview = computed(() => {
+  const first = queuedTurns.value[0]
+  if (!first) return ''
+  const text = (first.message || '').trim() || (first.attachment_count > 0 ? `${first.attachment_count} 个附件` : '（空消息）')
+  return text
+})
+const currentConversationBusy = computed(() =>
+  isStreaming.value ||
+  currentSessionWorking.value ||
+  !!state.turnQueueDraining[state.currentID],
+)
+// 队列 draining 本身属于 currentConversationBusy，用于输入区状态。
+// Queue draining is itself part of currentConversationBusy for composer UI.
+// 监听该聚合状态会让 drain 完成后再次触发 drain。
+// Watching that aggregate would make drain completion retrigger another drain.
+const queueDrainBlocked = computed(() =>
+  isStreaming.value ||
+  currentSessionWorking.value,
+)
+const editingQueueId = ref<number | null>(null)
+const editingQueueText = ref('')
+const editingQueueSessionID = ref('')
+const queueEditSaving = ref(false)
+
+function queuedTurnStatusLabel(status: string): string {
+  if (status === 'failed') return '失败'
+  return '等待'
+}
+
+function queuedTurnTitle(item: api.TurnQueueItem): string {
+  const parts = [item.message]
+  if (item.attachment_count > 0) parts.push(`${item.attachment_count} 个附件`)
+  if (item.error) parts.push(item.error)
+  return parts.join('\n')
+}
+
+function toggleQueueExpand() {
+  if (hasPendingQuestion.value && !hasFailedQueuedTurn.value) {
+    if (state.composerExpandedDock === 'queue') setComposerExpandedDock(null)
+    return
+  }
+  toggleComposerExpandedDock('queue')
+}
+
+async function onDeleteQueuedTurn(queueId: number) {
+  if (!state.currentID) return
+  try {
+    await deleteQueuedTurn(state.currentID, queueId)
+    maybeDrainTurnQueue()
+  } catch (e: any) {
+    message.error(`删除排队消息失败：${e?.message || e}`)
+  }
+}
+
+async function onClearQueuedTurns() {
+  if (!state.currentID) return
+  try {
+    await clearQueuedTurns(state.currentID)
+    if (state.composerExpandedDock === 'queue') setComposerExpandedDock(null)
+  } catch (e: any) {
+    message.error(`清空队列失败：${e?.message || e}`)
+  }
+}
+
+async function onRetryQueuedTurn(queueId: number) {
+  if (!state.currentID) return
+  try {
+    await retryQueuedTurn(state.currentID, queueId)
+    maybeDrainTurnQueue()
+  } catch (e: any) {
+    message.error(`重试排队消息失败：${e?.message || e}`)
+  }
+}
+
+function startEditingQueuedTurn(item: api.TurnQueueItem) {
+  if (item.status !== 'queued') return
+  if (editingQueueSessionID.value && editingQueueSessionID.value !== item.session_id) {
+    setTurnQueueEditing(editingQueueSessionID.value, false)
+  }
+  editingQueueId.value = item.id
+  editingQueueText.value = item.message
+  editingQueueSessionID.value = item.session_id
+  setTurnQueueEditing(item.session_id, true)
+}
+
+function clearQueueEditing() {
+  if (editingQueueSessionID.value) {
+    setTurnQueueEditing(editingQueueSessionID.value, false)
+  }
+  editingQueueId.value = null
+  editingQueueText.value = ''
+  editingQueueSessionID.value = ''
+}
+
+function stopEditingQueuedTurn() {
+  clearQueueEditing()
+  maybeDrainTurnQueue()
+}
+
+async function saveEditingQueuedTurn() {
+  const sessionID = editingQueueSessionID.value
+  if (!sessionID || editingQueueId.value === null || queueEditSaving.value) return
+  const messageText = editingQueueText.value.trim()
+  if (!messageText) {
+    message.warning('排队消息不能为空')
+    return
+  }
+  queueEditSaving.value = true
+  try {
+    await editQueuedTurn(sessionID, editingQueueId.value, messageText)
+    message.success('排队消息已更新')
+    clearQueueEditing()
+    if (state.currentID === sessionID) maybeDrainTurnQueue()
+  } catch (e: any) {
+    message.error(`编辑排队消息失败：${e?.message || e}`)
+  } finally {
+    queueEditSaving.value = false
+  }
+}
+
+function maybeDrainTurnQueue() {
+  if (!state.currentID) return
+  if (editingQueueId.value !== null) return
+  if (currentConversationBusy.value || hasFailedQueuedTurn.value) return
+  if (!hasQueuedTurns(state.currentID)) return
+  void drainQueuedConversationTurns(state.currentID).catch((e) => {
+    console.warn('[turn-queue] drain failed:', e)
+  })
+}
+
+watch([() => state.currentID, queueSignature, queueDrainBlocked, () => !!currentPendingConfirm.value], () => {
+  maybeDrainTurnQueue()
+})
+
+// Auto-expand when a queued turn fails so the user can retry/delete.
+watch(hasFailedQueuedTurn, (failed) => {
+  if (failed) setComposerExpandedDock('queue')
+})
+
+// Collapse the queue strip when the list empties or a question takes over
+// (unless a failed item still needs attention).
+watch([() => queuedTurns.value.length, hasPendingQuestion, hasFailedQueuedTurn], () => {
+  if (queuedTurns.value.length === 0 && state.composerExpandedDock === 'queue') {
+    setComposerExpandedDock(null)
+    return
+  }
+  if (hasPendingQuestion.value && !hasFailedQueuedTurn.value && state.composerExpandedDock === 'queue') {
+    setComposerExpandedDock(null)
+  }
+})
+
 // Load the model/style lists once on mount so the two dropdowns
 // are populated even before the user opens any session.
 onMounted(() => {
   loadConfig()
+  maybeDrainTurnQueue()
+})
+
+watch([() => state.currentID, queueSignature], () => {
+  const sessionChanged = !!editingQueueSessionID.value && editingQueueSessionID.value !== state.currentID
+  const itemMissing = editingQueueId.value !== null && !queuedTurns.value.some(item => item.id === editingQueueId.value)
+  if (sessionChanged || itemMissing) clearQueueEditing()
 })
 </script>
 
 <template>
-  <div class="input-area">
+  <div class="input-area" :class="{ 'input-area--has-queue': queuedTurns.length > 0 && !currentRollbackBanner }">
     <NDropdown
       trigger="manual"
       placement="bottom-start"
@@ -1392,9 +1882,131 @@ onMounted(() => {
     <div v-if="currentRollbackBanner" class="rollback-banner">
       <Undo2 :size="14" class="rollback-banner-icon" />
       <span class="rollback-banner-text">已撤回 {{ currentRollbackBanner.count }} 条消息</span>
-      <button class="rollback-banner-undo" @click="undoRollback(state.currentID)">撤销</button>
+      <button class="rollback-banner-undo" @click="onUndoRollback">撤销</button>
       <button class="rollback-banner-dismiss" @click="dismissRollback(state.currentID)" aria-label="关闭">×</button>
     </div>
+
+    <Transition name="fade-up">
+      <div
+        v-if="queuedTurns.length > 0"
+        class="turn-queue"
+        :class="{
+          'turn-queue--blocked': hasFailedQueuedTurn,
+          'turn-queue--expanded': queueExpanded,
+          'turn-queue--question-pending': hasPendingQuestion && !hasFailedQueuedTurn,
+        }"
+      >
+        <div
+          class="turn-queue-summary"
+          role="button"
+          tabindex="0"
+          :aria-expanded="queueExpanded"
+          :title="queueExpanded ? '点击收起' : '点击展开'"
+          @click="toggleQueueExpand"
+          @keydown.enter.prevent="toggleQueueExpand"
+          @keydown.space.prevent="toggleQueueExpand"
+        >
+          <ChevronRight
+            :size="12"
+            class="turn-queue-caret"
+            :class="{ 'turn-queue-caret--open': queueExpanded }"
+          />
+          <CornerDownLeft :size="13" class="turn-queue-icon-static" />
+          <span class="turn-queue-label">{{ queueDraining ? '正在出队' : '排队中' }}</span>
+          <span class="turn-queue-count">{{ queuedTurns.length }}</span>
+          <span class="turn-queue-preview">{{ queuePreview }}</span>
+          <button
+            type="button"
+            class="turn-queue-icon"
+            :disabled="queueDraining"
+            title="清空队列"
+            aria-label="清空队列"
+            @click.stop="onClearQueuedTurns"
+          >
+            <Trash2 :size="13" />
+          </button>
+        </div>
+        <div v-if="queueExpanded" class="turn-queue-list">
+          <div
+            v-for="(item, index) in queuedTurns"
+            :key="item.id"
+            class="turn-queue-item"
+            :class="{ 'turn-queue-item--failed': item.status === 'failed' }"
+            :title="queuedTurnTitle(item)"
+          >
+            <span class="turn-queue-index">{{ index + 1 }}</span>
+            <NInput
+              v-if="editingQueueId === item.id"
+              v-model:value="editingQueueText"
+              class="turn-queue-editor"
+              type="textarea"
+              size="small"
+              :autosize="{ minRows: 1, maxRows: 3 }"
+              :disabled="queueEditSaving"
+              @keydown.enter.exact.prevent="saveEditingQueuedTurn"
+              @keydown.esc.prevent="stopEditingQueuedTurn"
+            />
+            <span v-else class="turn-queue-message">{{ item.message }}</span>
+            <span v-if="item.attachment_count > 0" class="turn-queue-attachments">
+              {{ item.attachment_count }} 附件
+            </span>
+            <span class="turn-queue-status">{{ queuedTurnStatusLabel(item.status) }}</span>
+            <button
+              v-if="editingQueueId === item.id"
+              type="button"
+              class="turn-queue-icon"
+              :disabled="queueEditSaving"
+              title="保存"
+              aria-label="保存排队消息"
+              @click="saveEditingQueuedTurn"
+            >
+              <Check :size="13" />
+            </button>
+            <button
+              v-if="editingQueueId === item.id"
+              type="button"
+              class="turn-queue-icon"
+              :disabled="queueEditSaving"
+              title="取消编辑"
+              aria-label="取消编辑排队消息"
+              @click="stopEditingQueuedTurn"
+            >
+              <X :size="13" />
+            </button>
+            <button
+              v-else-if="item.status === 'failed'"
+              type="button"
+              class="turn-queue-icon"
+              title="重试"
+              aria-label="重试排队消息"
+              @click="onRetryQueuedTurn(item.id)"
+            >
+              <RotateCcw :size="13" />
+            </button>
+            <button
+              v-else
+              type="button"
+              class="turn-queue-icon"
+              title="编辑"
+              aria-label="编辑排队消息"
+              @click="startEditingQueuedTurn(item)"
+            >
+              <Pencil :size="13" />
+            </button>
+            <button
+              v-if="editingQueueId !== item.id"
+              type="button"
+              class="turn-queue-icon"
+              title="删除"
+              aria-label="删除排队消息"
+              @click="onDeleteQueuedTurn(item.id)"
+            >
+              <Trash2 :size="13" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
 
     <!-- Attachments live INSIDE the same input-wrap as the
          textarea but BELOW the input-row, so a pasted image
@@ -1429,23 +2041,22 @@ onMounted(() => {
           @contextmenu="onInputContextMenu"
         ></textarea>
         <button
-          v-if="!isStreaming"
-          class="send-btn"
-          :disabled="!inputText.trim()"
-          @click="send"
-          title="发送 (Enter)"
-          aria-label="发送"
-        >
-          <Send :size="16" />
-        </button>
-        <button
-          v-else
+          v-if="isStreaming"
           class="stop-btn"
           @click="stop"
           title="停止 (Esc)"
           aria-label="停止"
         >
           <Square :size="14" fill="currentColor" />
+        </button>
+        <button
+          class="send-btn"
+          :disabled="!inputText.trim()"
+          @click="send"
+          :title="currentConversationBusy ? '加入队列 (Enter)' : '发送 (Enter)'"
+          :aria-label="currentConversationBusy ? '加入队列' : '发送'"
+        >
+          <Send :size="16" />
         </button>
       </div>
       <div v-if="currentAttachments.length > 0" class="attach-strip">
@@ -1477,15 +2088,13 @@ onMounted(() => {
       type="file"
       multiple
       style="display:none"
-      accept="image/*,audio/*,video/*,text/*,.pdf,.json,.md,.txt,.csv,.yaml,.yml,.go,.py,.js,.ts"
+      accept="image/*,audio/*,video/*,text/*,.pdf,.docx,.docm,.pptx,.pptm,.xlsx,.xlsm,.json,.md,.txt,.csv,.yaml,.yml,.go,.py,.js,.ts"
       @change="onFiles(($event.target as HTMLInputElement).files)"
     />
 
-    <!-- Bottom row: compact high-frequency controls + collapsible
-         "more" section. The four always-visible controls
-         (model / plan / permission / mute) are the ones the
-         user touches on most messages. Reasoning + KB
-         live behind the ⋯ button by default. -->
+    <!-- Bottom row: compact high-frequency controls. Session-scoped
+         settings that need more explanation live behind the
+         会话设置 popover. -->
     <div class="input-bottom">
       <div class="input-primary">
         <!-- Model badge: the current model name with a sparkle
@@ -1535,7 +2144,7 @@ onMounted(() => {
             >
               <Settings :size="13" />
               <span class="ctrl-btn-label">会话设置</span>
-              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 识图{{ imageRecognitionLabel }}</span>
+              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 知识库{{ currentKBLabel }} · 识别{{ recognitionCapabilityLabel }} · 生成{{ generationCapabilityLabel }} · 子代理{{ subAgentModelLabel }}</span>
             </button>
           </template>
           <div class="session-config-popover">
@@ -1544,12 +2153,13 @@ onMounted(() => {
               <span>会话设置</span>
             </div>
 
+            <div class="session-config-grid">
             <div class="session-config-row">
               <div class="session-config-label">
                 <span>风格</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1565,23 +2175,29 @@ onMounted(() => {
                   <div class="session-config-help-popover">
                     <div class="session-config-help-title">风格</div>
                     <p>决定助手在当前会话里的说话方式，比如更活泼、更简洁，或按某个角色来回复。</p>
-                    <p>右上角的“生成风格”按钮可以根据当前对话自动整理一个新风格，也可以优化已有风格，并把相关备注一起保存。</p>
+                    <p>右侧检查器的“会话操作”里可以根据当前对话自动整理一个新风格，也可以优化已有风格，并把相关备注一起保存。</p>
                     <p>这里选中的风格只影响当前会话。想查看、编辑或手动新增风格，可以到“应用设置 > 风格”。</p>
                   </div>
                 </NPopover>
               </div>
-              <div class="session-config-options">
+              <NDropdown
+                trigger="click"
+                placement="bottom-start"
+                :z-index="3200"
+                :options="styleDropdownOptions"
+                @select="pickStyle"
+              >
                 <button
-                  v-for="opt in styleOptions"
-                  :key="opt.value"
                   type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': currentStyleValue === opt.value }"
-                  @click="onStylePick(opt.value)"
+                  class="opt-pick"
+                  data-testid="session-style-dropdown"
+                  :title="`当前风格：${currentStyleLabel}`"
+                  :aria-label="`选择风格，当前为${currentStyleLabel}`"
                 >
-                  {{ opt.label }}
+                  <span class="opt-pick-label">{{ currentStyleLabel }}</span>
+                  <ChevronDown :size="11" class="opt-pick-caret" />
                 </button>
-              </div>
+              </NDropdown>
             </div>
 
             <div class="session-config-row">
@@ -1602,10 +2218,58 @@ onMounted(() => {
 
             <div class="session-config-row">
               <div class="session-config-label">
+                <span>知识库</span>
+                <NPopover
+                  trigger="hover"
+                  placement="top"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="知识库说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">知识库</div>
+                    <p>控制当前会话是否接入本地知识库检索。开启后，助手可以按需调用 wiki_lookup / wiki_list 查找已扫描资料。</p>
+                    <p>“全部知识库”会检索所有已启用知识库；选择单个知识库时，只检索那一个库。</p>
+                    <p>如果没有可用的知识库，请到“应用设置 > 知识库”添加或启用。新增、路径和扫描也在该页面管理。</p>
+                  </div>
+                </NPopover>
+              </div>
+              <div class="session-config-options session-config-options--stacked">
+                <NDropdown
+                  trigger="click"
+                  placement="bottom-start"
+                  :z-index="3200"
+                  :options="kbDropdownOptions"
+                  @select="pickKB"
+                >
+                  <button
+                    type="button"
+                    class="opt-pick"
+                    data-testid="session-knowledge-dropdown"
+                    :title="`当前知识库：${currentKBLabel}`"
+                    :aria-label="`选择知识库，当前为${currentKBLabel}`"
+                  >
+                    <span class="opt-pick-label">{{ currentKBLabel }}</span>
+                    <ChevronDown :size="11" class="opt-pick-caret" />
+                  </button>
+                </NDropdown>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">
                 <span>思考</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1642,10 +2306,10 @@ onMounted(() => {
 
             <div class="session-config-row">
               <div class="session-config-label">
-                <span>图像识别</span>
+                <span>媒体识别</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1653,16 +2317,117 @@ onMounted(() => {
                     <button
                       type="button"
                       class="session-config-help"
-                      aria-label="图像识别说明"
+                      aria-label="媒体识别说明"
                     >
                       <HelpCircle :size="12" />
                     </button>
                   </template>
                   <div class="session-config-help-popover">
-                    <div class="session-config-help-title">图像识别</div>
-                    <p>开启后，助手可以在需要时“看”你上传的图片，比如读图中文字、描述画面、找物体或比较多张图片。</p>
-                    <p>需要先到“应用设置 > 系统 > 图像识别”开启，并选择一个负责看图的模型。</p>
-                    <p>看图会多走一步，可能比普通文字聊天慢一些；如果全局没有配置，这里不能启用。</p>
+                    <div class="session-config-help-title">媒体识别</div>
+                    <p>选择当前会话允许使用的媒体识别能力，可同时启用图片、视频和音频。</p>
+                    <p>每种能力都需要先在“应用设置 > 系统 > 媒体识别”配置独立的供应商和模型。</p>
+                    <p>如果没有可选能力，请先到该页面配置至少一种能力；未完成系统配置的能力不会出现在选择列表中。</p>
+                  </div>
+                </NPopover>
+              </div>
+              <div class="session-config-options session-config-options--stacked">
+                <NDropdown
+                  trigger="click"
+                  placement="bottom-start"
+                  :z-index="3200"
+                  :options="recognitionCapabilityDropdownOptions"
+                  @select="toggleRecognitionCapability"
+                >
+                  <button
+                    type="button"
+                    class="opt-pick"
+                    data-testid="session-recognition-dropdown"
+                    :disabled="!state.recognitionCapabilitiesAvailable.length"
+                    :title="`当前媒体识别能力：${recognitionCapabilityDetail}`"
+                    :aria-label="`选择媒体识别能力，当前为${recognitionCapabilityDetail}`"
+                  >
+                    <span v-if="enabledRecognitionCapabilities.length" class="opt-pick-tags">
+                      <span class="opt-pick-tag opt-pick-tag--name">{{ recognitionCapabilityFirstLabel }}</span>
+                      <span class="opt-pick-tag opt-pick-tag--count">{{ enabledRecognitionCapabilities.length }}</span>
+                    </span>
+                    <span v-else class="opt-pick-label">{{ recognitionCapabilityLabel }}</span>
+                    <ChevronDown :size="11" class="opt-pick-caret" />
+                  </button>
+                </NDropdown>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">
+                <span>媒体生成</span>
+                <NPopover
+                  trigger="hover"
+                  placement="top"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button type="button" class="session-config-help" aria-label="媒体生成说明">
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">媒体生成</div>
+                    <p>只允许当前会话使用已选中的生成能力。关闭后，即使模型尝试调用工具，工具内部也会直接拒绝，不会请求厂商 API。</p>
+                    <p>会话只选择能力；每项能力直接使用应用设置中的默认模型，不提供会话级模型覆盖。如果显示“不可用”，请先到“应用设置 > 系统 > 媒体生成”配置能力的默认模型。</p>
+                    <p>LLM 会根据用户要求与附件内容整理最终提示词，附件仍只通过上传 ID 传给生成工具。</p>
+                  </div>
+                </NPopover>
+              </div>
+              <div class="session-config-options session-config-options--stacked generation-session-options">
+                <NDropdown
+                  trigger="click"
+                  placement="bottom-start"
+                  :z-index="3200"
+                  :options="generationCapabilityDropdownOptions"
+                  @select="toggleGenerationCapability"
+                >
+                  <button
+                    type="button"
+                    class="opt-pick"
+                    data-testid="session-generation-dropdown"
+                    :disabled="generationOptionsLoading || !generationOptions.some(item => item.available)"
+                    :title="`当前媒体生成能力：${generationCapabilityDetail}`"
+                    :aria-label="`选择媒体生成能力，当前为${generationCapabilityDetail}`"
+                  >
+                    <span v-if="enabledGenerationOperations.length" class="opt-pick-tags">
+                      <span class="opt-pick-tag opt-pick-tag--name">{{ generationCapabilityFirstLabel }}</span>
+                      <span class="opt-pick-tag opt-pick-tag--count">{{ enabledGenerationOperations.length }}</span>
+                    </span>
+                    <span v-else class="opt-pick-label">{{ generationCapabilityLabel }}</span>
+                    <ChevronDown :size="11" class="opt-pick-caret" />
+                  </button>
+                </NDropdown>
+              </div>
+            </div>
+
+            <div class="session-config-row">
+              <div class="session-config-label">
+                <span>子代理模型</span>
+                <NPopover
+                  trigger="hover"
+                  placement="top"
+                  :show-arrow="false"
+                  style="padding: 0; background: transparent; box-shadow: none;"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-help"
+                      aria-label="子代理模型说明"
+                    >
+                      <HelpCircle :size="12" />
+                    </button>
+                  </template>
+                  <div class="session-config-help-popover">
+                    <div class="session-config-help-title">子代理模型</div>
+                    <p>默认继承当前主对话模型。开启自定义后，子代理会优先使用这里选择的模型，除非 task 调用或专用子代理自己指定了模型。</p>
+                    <p>适合把探索、规划这类子任务交给更快或更便宜的模型，同时主对话继续使用当前模型。</p>
                   </div>
                 </NPopover>
               </div>
@@ -1670,24 +2435,40 @@ onMounted(() => {
                 <button
                   type="button"
                   class="session-config-choice"
-                  :class="{ 'session-config-choice--active': !imageRecognitionEnabled }"
-                  @click="onImageRecognitionPick(false)"
+                  :class="{ 'session-config-choice--active': !subAgentModelEnabled }"
+                  @click="onSubAgentModelModePick(false)"
                 >
-                  关闭
+                  继承主模型
                 </button>
                 <button
                   type="button"
                   class="session-config-choice"
-                  :class="{ 'session-config-choice--active': imageRecognitionEnabled }"
-                  :disabled="!imageRecognitionAvailable"
-                  :title="imageRecognitionAvailable ? '使用 image_recognize 工具识别图片' : '请先到“应用设置 > 系统 > 图像识别”启用工具'"
-                  @click="onImageRecognitionPick(true)"
+                  :class="{ 'session-config-choice--active': subAgentModelEnabled }"
+                  @click="onSubAgentModelModePick(true)"
                 >
-                  使用工具
+                  自定义
                 </button>
-                <div v-if="!imageRecognitionAvailable" class="session-config-hint">
-                  请先到“应用设置 > 系统 > 图像识别”启用工具，并配置供应商和模型。
-                </div>
+                <ModelPicker
+                  v-if="subAgentModelEnabled"
+                  v-model:show="showSubAgentModelPicker"
+                  :provider="subAgentModelProvider"
+                  :model="subAgentModelName"
+                  :providers="state.providers as any"
+                  @select="onSubAgentModelSelect"
+                >
+                  <template #trigger>
+                    <button
+                      type="button"
+                      class="session-config-choice session-config-choice--model"
+                      :title="`${subAgentModelProvider}/${subAgentModelName}`"
+                      @click="showSubAgentModelPicker = true"
+                    >
+                      <Sparkles :size="12" />
+                      <span class="session-config-choice-label">{{ subAgentModelName || '选择模型' }}</span>
+                      <ChevronDown :size="11" />
+                    </button>
+                  </template>
+                </ModelPicker>
               </div>
             </div>
 
@@ -1696,7 +2477,7 @@ onMounted(() => {
                 <span>长任务</span>
                 <NPopover
                   trigger="hover"
-                  placement="right"
+                  placement="top"
                   :show-arrow="false"
                   style="padding: 0; background: transparent; box-shadow: none;"
                 >
@@ -1729,24 +2510,24 @@ onMounted(() => {
                   {{ opt.label }}
                 </button>
               </div>
-            </div>
-          </div>
-        </NPopover>
+	            </div>
+	            </div>
+	          </div>
+	        </NPopover>
 
-        <!-- Plan mode toggle: stays inline because the user
-             switches it often (planning vs building a feature). -->
-        <button
-          type="button"
-          class="ctrl-btn"
-          :class="{ 'ctrl-btn--active': planMode }"
-          :disabled="!state.currentID"
-          :title="planMode ? '当前：计划模式' : '当前：构建模式'"
-          :aria-label="planMode ? '切换到构建模式' : '切换到计划模式'"
-          @click="togglePlanMode"
-        >
-          <component :is="planMode ? Clipboard : Hammer" :size="13" />
-          <span class="ctrl-btn-label">{{ planMode ? '计划' : '构建' }}</span>
-        </button>
+		        <!-- Turn mode cycles auto / plan / build inline. -->
+		        <button
+		          type="button"
+		          class="ctrl-btn"
+		          :class="{ 'ctrl-btn--active': turnModePolicy !== 'build' }"
+		          :disabled="!state.currentID"
+		          :title="turnModeTitle"
+		          :aria-label="turnModeAria"
+		          @click="togglePlanMode"
+		        >
+		          <component :is="turnModeIcon" :size="13" />
+		          <span class="ctrl-btn-label">{{ turnModeLabel }}</span>
+		        </button>
 
         <!-- Permission picker: icon-only popover. Three
              states map to lock / unlock / key icons. Keeps
@@ -1804,71 +2585,13 @@ onMounted(() => {
         >
           <component :is="mute ? VolumeX : Volume2" :size="13" />
         </button>
-
-        <!-- More toggle: expands the secondary row with
-             the KB picker. The chevron rotates to
-             indicate the expanded state. Reasoning used
-             to live here too but was promoted to the
-             input-row in PR #10 (next to the style
-             picker) because it's a setting the user
-             touches on most tasks; KB stays in "more"
-             because it's changed less often and the
-             label can be long ("知识库 · {name}"),
-             which would crowd the input-row. The
-             expanded state uses the same .opt-pick
-             styling as the input-row pickers so the
-             three read as a coherent family. -->
-        <button
-          type="button"
-          class="ctrl-btn ctrl-btn--more"
-          :class="{ 'ctrl-btn--expanded': showAdvanced }"
-          :title="showAdvanced ? '收起高级选项' : '展开高级选项'"
-          :aria-label="showAdvanced ? '收起高级选项' : '展开高级选项'"
-          :aria-expanded="showAdvanced"
-          @click="showAdvanced = !showAdvanced"
-        >
-          <component :is="showAdvanced ? ChevronUp : ChevronDown" :size="13" />
-          <span class="ctrl-btn-label">更多</span>
-        </button>
       </div>
-
-      <!-- Secondary row: KB picker. Collapsed by default.
-           Uses the same .opt-pick visual treatment as the
-           input-row style + reasoning pickers so it reads
-           as part of the same family, not a different
-           control. The .input-advanced wrapper still
-           provides the surface-1 background + border so
-           the row reads as visually subordinate (a
-           "secondary" surface) even though its controls
-           match the primary surface. -->
-      <Transition name="row-slide">
-        <div v-if="showAdvanced" class="input-advanced">
-          <NDropdown
-            trigger="click"
-            placement="top-end"
-            :options="kbMenuOptions"
-            @select="(key: string | number) => pickKB(String(key))"
-          >
-            <button
-              type="button"
-              class="opt-pick"
-              :disabled="!state.currentID"
-              :title="`知识库: ${currentKBLabel}`"
-              :aria-label="`知识库: ${currentKBLabel}`"
-            >
-              <Database :size="12" class="opt-pick-icon" />
-              <span class="opt-pick-label">{{ currentKBLabel }}</span>
-              <component :is="ChevronDown" :size="11" class="opt-pick-caret" />
-            </button>
-          </NDropdown>
-        </div>
-      </Transition>
 
       <!-- Keyboard hints: live at the very bottom, always
            visible. Aligns to the right so the rest of the
            row has the user's eye path. -->
       <div class="hints">
-        <span><kbd>Enter</kbd> 发送</span>
+        <span><kbd>Enter</kbd> {{ currentConversationBusy ? '排队' : '发送' }}</span>
         <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
         <span><kbd>Esc</kbd> 停止</span>
       </div>
@@ -1920,8 +2643,8 @@ onMounted(() => {
 }
 .attach-chip {
   display: inline-flex; align-items: center; gap: 6px;
-  background: var(--bg-3);
-  border: 1px solid var(--border-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   padding: 4px 6px 4px 4px;
   font-size: 12px;
@@ -1938,15 +2661,15 @@ onMounted(() => {
               background var(--dur-fast) var(--ease-out);
 }
 .attach-chip:hover {
-  border-color: var(--accent);
-  background: var(--bg-2);
+  border-color: var(--brand-500);
+  background: var(--surface-3);
 }
 .attach-chip.uploading { opacity: 0.7; }
-.attach-chip.error { border-color: var(--error); }
+.attach-chip.error { border-color: var(--error-500); }
 .thumb {
-  width: 40px; height: 40px;
-  background: var(--bg-2);
-  border-radius: 6px;
+  width: var(--space-8); height: var(--space-8);
+  background: var(--surface-3);
+  border-radius: var(--radius-sm);
   display: flex; align-items: center; justify-content: center;
   overflow: hidden;
   font-size: 18px;
@@ -1956,11 +2679,11 @@ onMounted(() => {
 .thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; }
 .name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rm {
-  background: none; border: none; color: var(--text-3);
+  background: none; border: none; color: var(--text-tertiary);
   cursor: pointer; padding: 0 4px; font-size: 16px; line-height: 1;
   flex-shrink: 0;
 }
-.rm:hover { color: var(--error); }
+.rm:hover { color: var(--error-500); }
 
 @keyframes chip-appear {
   from { opacity: 0; transform: translateY(-4px) scale(0.95); }
@@ -2013,32 +2736,187 @@ onMounted(() => {
   color: var(--text);
 }
 
+.turn-queue {
+  margin: 0 calc(var(--space-3) * -1) var(--space-2);
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border-subtle);
+  overflow: hidden;
+}
+.turn-queue--blocked {
+  border-bottom-color: var(--warn-500);
+}
+.turn-queue--question-pending .turn-queue-summary {
+  cursor: default;
+}
+.turn-queue--question-pending .turn-queue-caret {
+  opacity: 0.45;
+}
+.turn-queue-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: calc(var(--space-8) - var(--space-2));
+  padding: 0 var(--space-3);
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.turn-queue-summary:hover {
+  background: var(--surface-3);
+}
+.turn-queue-caret {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.turn-queue-caret--open {
+  transform: rotate(90deg);
+}
+.turn-queue-icon-static {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+.turn-queue-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.turn-queue-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--brand-50);
+  color: var(--brand-600);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.turn-queue-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+.turn-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: calc(var(--space-8) * 2.5);
+  overflow-y: auto;
+  background: var(--border-subtle);
+  border-top: 1px solid var(--border-subtle);
+}
+.turn-queue-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: calc(var(--space-8));
+  padding: 0 var(--space-3);
+  background: var(--surface-1);
+}
+.turn-queue-item--failed {
+  background: var(--warn-50);
+}
+.turn-queue-index {
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--text-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.turn-queue-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+.turn-queue-editor {
+  min-width: 0;
+}
+.turn-queue-editor :deep(.n-input__textarea-el) {
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.turn-queue-attachments,
+.turn-queue-status {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.turn-queue-item--failed .turn-queue-status {
+  color: var(--warn-500);
+}
+.turn-queue-icon {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-tertiary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: var(--transition-colors);
+}
+.turn-queue-icon:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.turn-queue-icon:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* The dialog "box": textarea + optional attach strip share a
  * single rounded container. The flex column lets the strip
  * sit on top of the textarea with no gap (the strip's bottom
  * padding + textarea's top margin provides the spacing, and
  * the box's outer border wraps both). */
 .input-wrap {
-  background: var(--bg-input);
-  border: 1px solid var(--border-2);
+  background: var(--surface-input, var(--surface-1));
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  padding: 0 12px 0 12px;
+  padding: 0 var(--space-3) 0 var(--space-3);
   transition: border-color var(--dur-fast) var(--ease-out),
               box-shadow var(--dur-fast) var(--ease-out),
               background var(--dur-fast) var(--ease-out);
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 .input-wrap.has-attachments { padding-top: 0; }
 .input-wrap:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--brand-50);
+  border-color: var(--border-default);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-500) 12%, transparent);
+  background: var(--surface-input, var(--surface-1));
 }
-.input-wrap.dragover { border-color: var(--accent-2); background: var(--bg-3); }
+.input-wrap.dragover {
+  border-color: var(--brand-500);
+  background: color-mix(in srgb, var(--brand-500) 6%, var(--surface-1));
+}
 .input-row {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 .attach-icon-btn {
   width: 32px; height: 32px;
@@ -2060,78 +2938,13 @@ onMounted(() => {
   outline: none;
   resize: none;
   flex: 1;
+  min-width: 0;
+  overflow-x: hidden;
   /* Height is managed by resizeTextarea(). */
   font-family: inherit;
   line-height: 1.5;
   margin: 0;
   padding: 8px 0 8px 0;
-}
-.opt-pick {
-  /* The session-level option pickers (style, reasoning, KB)
-   * share the same visual treatment: a compact pill button
-   * with the current value as a label and a small chevron
-   * on the right. They live in the input-row next to the
-   * textarea, so they need to be narrow and quiet — no
-   * border, no NSelect chrome, just a text label that gets
-   * a subtle background on hover.
-   *
-   * Originally named `.style-pick` (just for the style
-   * picker); renamed to `.opt-pick` in PR #10 when
-   * reasoning and KB were promoted from the "more" advanced
-   * row to the input-row. The `.opt-pick--narrow` modifier
-   * is used for reasoning because its labels (关闭/低/中/高/
-   * 最高) are very short and a smaller min-width keeps the
-   * three pickers visually balanced. */
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 28px;
-  padding: 0 8px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-family: var(--font-mono);
-  cursor: pointer;
-  flex-shrink: 0;
-  white-space: nowrap;
-  min-width: 56px;
-  justify-content: center;
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out);
-}
-.opt-pick:hover:not(:disabled) {
-  background: var(--surface-3);
-  color: var(--text-primary);
-}
-.opt-pick:disabled { opacity: 0.5; cursor: not-allowed; }
-.opt-pick-caret { color: var(--text-tertiary); flex-shrink: 0; }
-.opt-pick-label {
-  /* Cap on label width so a long KB name (e.g.
-   * "知识库 · 我的资料库") doesn't push the send button off
-   * the row. When the label overflows, ellipsis kicks in
-   * and the user can still read the full name in the
-   * dropdown. */
-  max-width: 72px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.opt-pick--narrow {
-  /* Reasoning labels are 1–2 characters, so the regular
-   * 56px min-width looks oversized. Tighter min keeps the
-   * three pickers visually balanced. */
-  min-width: 36px;
-}
-.opt-pick--narrow .opt-pick-label {
-  max-width: 28px;
-}
-/* Small inline icon (e.g. the database glyph on the KB
- * picker). Slightly muted so it doesn't compete with the
- * label. */
-.opt-pick-icon {
-  color: var(--text-tertiary);
-  flex-shrink: 0;
 }
 .send-btn, .stop-btn {
   width: 32px; height: 32px;
@@ -2159,12 +2972,14 @@ onMounted(() => {
   align-items: center;
   gap: 10px;
   margin-left: auto;
-  white-space: nowrap;
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
 }
 .hints kbd {
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   padding: 1px 4px;
   font-family: var(--font-mono);
   font-size: 9.5px;
@@ -2172,72 +2987,42 @@ onMounted(() => {
   margin-right: 2px;
 }
 
-/* NSelects in the advanced row (reasoning + KB). */
 /* The input area's height is determined by its content: the
  * textarea (capped at 4 lines by resizeTextarea()), the
- * attach-strip (capped at 96px internally), and the
- * bottom controls (primary row + the "更多" advanced row
- * when expanded). Each child caps itself, so the area as
- * a whole can grow to whatever's needed without clipping
- * the dialog or pushing the messages-scroll out of the
- * way. The `flex-shrink: 0` ensures the message list
- * above gets compressed first if the viewport is
- * genuinely too small (we'd rather show fewer messages
- * than hide the input). */
+ * attach-strip (capped internally), and the bottom controls.
+ * Each child caps itself, so the area as a whole can grow
+ * to whatever's needed without clipping the dialog or
+ * pushing the messages-scroll out of the way. The
+ * `flex-shrink: 0` ensures the message list above gets
+ * compressed first if the viewport is genuinely too small. */
 .input-area {
-  border-top: 1px solid var(--border);
-  background: var(--bg-2);
-  padding: 8px 12px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  padding: var(--space-2) var(--space-3);
   flex-shrink: 0;
+  min-width: 0;
+  overflow-x: hidden;
+}
+.input-area--has-queue {
+  padding-top: 0;
 }
 .input-bottom {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-top: 6px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  min-width: 0;
 }
 .input-primary {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   flex-wrap: wrap;
-}
-.input-advanced {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding: 6px 8px;
-  background: var(--surface-1);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-}
-
-/* Slide-down transition for the advanced row. Tied to the
- * <Transition name="row-slide"> in the template. The classes
- * are named in the Vue 2 / 3 transition convention. */
-.row-slide-enter-active {
-  transition: max-height var(--dur-base) var(--ease-out),
-              opacity var(--dur-base) var(--ease-out);
+  min-width: 0;
   overflow: hidden;
 }
-.row-slide-leave-active {
-  transition: max-height var(--dur-fast) var(--ease-in),
-              opacity var(--dur-fast) var(--ease-in);
-  overflow: hidden;
-}
-.row-slide-enter-from,
-.row-slide-leave-to {
-  max-height: 0;
-  opacity: 0;
-}
-.row-slide-enter-to,
-.row-slide-leave-from {
-  max-height: 80px;
-  opacity: 1;
-}
 
-/* --- Bottom-row buttons (plan / perm / mute / more) --------------- */
+/* --- Bottom-row buttons (session config / plan / perm / mute) ------ */
 /* Generic pill-button style used for the always-visible
  * bottom-row controls. The button is transparent by
  * default and picks up an active background when the
@@ -2247,9 +3032,9 @@ onMounted(() => {
 .ctrl-btn {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  height: 28px;
-  padding: 0 8px;
+  gap: var(--space-1);
+  height: var(--control-height);
+  padding: 0 var(--space-2);
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
@@ -2283,10 +3068,6 @@ onMounted(() => {
   background: var(--warn-50);
   color: var(--warn-500);
 }
-.ctrl-btn--more.ctrl-btn--expanded {
-  background: var(--surface-2);
-  border-color: var(--border-subtle);
-}
 .ctrl-btn-label {
   font-size: 12px;
   font-weight: 500;
@@ -2301,18 +3082,19 @@ onMounted(() => {
 .model-badge {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  height: 28px;
-  padding: 0 8px 0 8px;
-  background: var(--surface-1);
+  gap: var(--space-1);
+  height: var(--control-height);
+  padding: 0 var(--space-2);
+  background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   color: var(--text-primary);
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
-  flex-shrink: 0;
-  max-width: 220px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 180px;
   transition: background var(--dur-fast) var(--ease-out),
               border-color var(--dur-fast) var(--ease-out);
 }
@@ -2327,7 +3109,8 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 160px;
+  min-width: 0;
+  flex: 1;
   font-family: var(--font-mono);
 }
 .model-badge--unset .model-badge-name { color: var(--text-tertiary); font-style: italic; }
@@ -2336,7 +3119,9 @@ onMounted(() => {
 .session-config-trigger {
   background: var(--surface-1);
   border-color: var(--border-subtle);
-  max-width: 260px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 200px;
 }
 .session-config-trigger:hover:not(:disabled) {
   background: var(--surface-2);
@@ -2351,50 +3136,69 @@ onMounted(() => {
   text-overflow: ellipsis;
 }
 .session-config-popover {
-  width: min(520px, calc(100vw - 32px));
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - (var(--space-4) * 2));
   background: var(--surface-1);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .session-config-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: var(--space-2);
   color: var(--text-primary);
   font-size: 13px;
   font-weight: 600;
-  padding: var(--space-4) var(--space-5) var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-1);
   border-bottom: 1px solid var(--border-subtle);
+}
+.session-config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--border-subtle);
 }
 .session-config-row {
-  display: grid;
-  grid-template-columns: 88px minmax(0, 1fr);
-  gap: var(--space-3);
-  align-items: start;
-  padding: var(--space-3) var(--space-5);
-  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: stretch;
+  padding: var(--space-3);
+  background: var(--surface-1);
+  min-width: 0;
 }
-.session-config-row:last-child {
-  border-bottom: none;
+.session-config-row--span2 {
+  grid-column: 1 / -1;
+}
+@media (max-width: 560px) {
+  .session-config-grid {
+    grid-template-columns: 1fr;
+  }
 }
 .session-config-label {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-1);
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
-  line-height: 30px;
+  line-height: 1.2;
   white-space: nowrap;
 }
 .session-config-help {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   padding: 0;
   background: transparent;
   border: 1px solid transparent;
@@ -2411,7 +3215,7 @@ onMounted(() => {
   color: var(--text-primary);
 }
 .session-config-help-popover {
-  width: 300px;
+  width: 280px;
   padding: var(--space-3);
   background: var(--surface-1);
   border: 1px solid var(--border-default);
@@ -2441,17 +3245,106 @@ onMounted(() => {
 .session-config-options {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-2);
+  gap: var(--space-1);
   min-width: 0;
 }
-.session-config-choice {
-  min-height: 30px;
-  padding: 0 var(--space-3);
-  background: var(--surface-1);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+.session-config-options--select {
+  display: block;
+  width: min(320px, 100%);
+}
+.session-config-options--stacked {
+  flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+}
+.generation-session-options {
+  width: 100%;
+  gap: var(--space-2);
+}
+.opt-pick-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.opt-pick-tag {
+  display: inline-block;
+  min-height: calc(var(--space-4) + var(--space-1));
+  padding: 0 var(--space-1);
+  overflow: hidden;
+  background: var(--brand-50);
+  border: 1px solid var(--brand-100);
+  border-radius: var(--radius-sm);
+  color: var(--brand-600);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: calc(var(--space-4) + var(--space-1));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.opt-pick-tag--name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.opt-pick-tag--count {
+  flex: 0 0 auto;
+  min-width: calc(var(--space-4) + var(--space-2));
+  background: var(--surface-3);
+  border-color: var(--border-subtle);
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.opt-pick {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: calc(var(--space-8) * 4);
+  max-width: 100%;
+  min-height: calc(var(--space-6) + var(--space-1));
+  padding: 0 var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
-  font-size: 12.5px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+.opt-pick:hover {
+  background: var(--surface-3);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+.opt-pick:disabled {
+  background: var(--surface-2);
+  border-color: var(--border-subtle);
+  color: var(--text-disabled);
+  cursor: not-allowed;
+  opacity: 1;
+}
+.opt-pick-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.opt-pick-caret {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+.session-config-choice {
+  min-height: 26px;
+  padding: 0 var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
@@ -2478,14 +3371,20 @@ onMounted(() => {
   color: var(--text-quaternary);
   cursor: not-allowed;
 }
-.session-config-hint {
-  flex-basis: 100%;
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-  line-height: 1.5;
-  padding-top: var(--space-1);
+.session-config-choice--model,
+.session-config-choice--kb {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  min-width: 0;
 }
-
+.session-config-choice-label {
+  min-width: 0;
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 /* --- Permission popover ---------------------------------------- */
 /* The permission picker is an NPopover that anchors to the
  * perm ctrl-btn. The popover body is a list of three

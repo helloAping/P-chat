@@ -4,13 +4,15 @@
 > **技术栈**：Vue 3 + Vite + Pinia + Naive UI + marked  
 > **后端通信**：HTTP REST (JSON) + SSE (Server-Sent Events)
 >
-> **样式规范**：见 [frontend-design.md](frontend-design.md) —— 设计 token、组件规则、强制约束都在那边
+> **样式规范**：见 [frontend-design.md](frontend-design.md) —— 设计 token、组件规则、强制约束都在那边。主界面视觉已锁定为 **Project-Aware Calm Workbench**（`frontend-design.md` **§0.5**）；后续壳层 / 聊天区 / 侧栏 / Inspector / Composer 改动必须遵守。
 
 ## 概述
 
-P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片、问题模态框、设置面板等功能。与 pchat-server 通过同一域名的 `/api/v1/*` 端点通信，SSE 流通过 `fetch()` + `ReadableStream` 消费。
+P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片、问题模态框、设置面板等功能。浏览器部署默认通过同源 `/api/v1/*` 通信；Wails GUI 使用启动握手后注入的 `window.__PCHAT_BACKEND__` 动态地址，SSE 流通过 `fetch()` + `ReadableStream` 消费。
 
-用户向 GUI 操作流程统一写在项目根目录 `README.md` 的「GUI 操作入口速查」和「常见问题」里，例如浏览器控制安装与连接诊断、知识库选择、工作模式切换、风格关闭、工具列表、动态工具 YAML 加载诊断和 trace id 复制。本文件只记录前端实现结构和维护入口。
+`api/client.ts` 的 JSON、上传、下载和 SSE 请求都必须从 `waitForDirectBackend()` / `apiURL()` 解析目标，禁止新增固定本地端口。纯 Vite 浏览器开发如需直连独立 server，显式设置 `VITE_PCHAT_BACKEND=http://127.0.0.1:<实际端口>`；`vite.config.ts` 不提供固定端口代理。
+
+用户向 GUI 操作入口与排障统一写在项目根目录 `README.md` 的「GUI 操作速查」和「常见问题」里；首次配置、项目、附件、知识库、媒体、Skill/MCP 与 CLI 的完整流程写在 [`docs/p-chat-article-2026-09.md`](../../docs/p-chat-article-2026-09.md)。本文件只记录前端实现结构和维护入口。
 
 ## 文件结构
 
@@ -19,14 +21,16 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `api/client.ts` | HTTP+SSE 客户端、类型定义 | `StreamEvent`, `MessagePart`, `streamMessages()`, `sendMessage()` |
 | `stores/chat.ts` | Pinia 状态管理（会话、消息、流） | `appendStreamEvent()`, `useChatStore()` |
 | `utils/markdownCache.ts` | 共享 markdown 渲染 LRU 缓存（MessageBubble / SubAgentCard 共用） | `renderMarkdown()` |
+| `utils/mediaPreview.ts` | data URL 转短生命周期 blob URL，统一保留正确媒体 MIME | `dataURLToBlobURL()` |
 | `main.ts` | 应用入口（Naive UI + Router） | `createApp()` |
 | `App.vue` | 根布局（侧边栏 + 聊天区域） | |
 | `components/ChatWindow.vue` | 聊天窗口（消息列表 + 输入区） | |
-| `components/InputArea.vue` | 输入区域（文本、附件、计划模式） | |
+| `components/InputArea.vue` | 输入区域（文本、附件、计划模式、会话设置） | 风格/知识库下拉选择器 + 回合队列 |
 | `components/MessageBubble.vue` | 单条消息渲染（parts[] 迭代） | |
 | `components/TypedText.vue` | 流式文本渲染（blinking caret） | |
 | `components/ThinkingBlock.vue` | 思考块（可折叠） | |
 | `components/ToolCallCard.vue` | 工具调用卡片（name/args/status/result） | |
+| `components/SkillCallCard.vue` | Skill 调用生命周期卡片，明确显示实际 Skill 名称 | |
 | `components/SubAgentCard.vue` | 子代理嵌套卡片（header + inner parts） | |
 | `components/SessionSidebar.vue` | 会话列表 + 项目选择器 + 设置 | |
 | `components/CommandPalette.vue` | `/` 斜杠命令内联自动补全 | |
@@ -35,7 +39,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/StreamingBar.vue` | 对话页顶部"对话进行中"加载条（transform 滚动渐变，compositor-only） | 绑定 `isStreaming`/`currentSessionWorking` |
 | `components/ImageLightbox.vue` | 全屏图片查看器 | |
 | `components/LoadingDots.vue` | 子代理加载指示器 | |
-| `components/AppSettingsModal.vue` | Provider/Model/Style/知识库管理 | 左右分栏 + KB 三层树视图 + NCollapse |
+| `components/AppSettingsModal.vue` | Provider/Model/Style/知识库管理 | 左右分栏 + provider/model 测试 + KB 三层树视图 + NCollapse |
 
 ## 核心概念
 
@@ -47,6 +51,7 @@ Assistant 消息使用 `parts[]` 数组，每项一个逻辑单元：
 |---|---|---|
 | `text` | TypedText / static md | 流式期间用 TypedText（blinking caret）；完成后用 marked.parse |
 | `thinking` | ThinkingBlock | 可折叠面板，流式期间默认展开 |
+| `skill` | SkillCallCard | 固定显示“当前调用 Skill：name”及 start/ready/error、scope、依赖 |
 | `tool` | ToolCallCard | name, args, status(start/ok/error), result, elapsed |
 | `sub_agent` | SubAgentCard | 嵌套卡片，含自身 parts[] |
 
@@ -60,11 +65,15 @@ pchat-server SSE → fetch() ReadableStream reader
   → JSON.parse → StreamEvent
   → await setTimeout(0)  ← 关键！强制 Vue 在两帧之间 flush
   → appendStreamEvent(id, ev)
-    → 路由到匹配的 part (text/thinking/tool/sub_agent)
+    → 路由到匹配的 part (text/thinking/skill/tool/sub_agent)
     → Vue 响应式 → DOM 更新
 ```
 
 **`setTimeout(0)` 的重要性**：防止同一 TCP 包内的多事件被 Vue 批量合并为一帧渲染（导致文本一次性出现，失去打字机效果）。
+
+GUI 的动态 `/<skill-name> [请求]` 只把名称写入 `active_skills`。服务端解析、依赖检查和
+正文加载结果通过 SkillCallCard 展示；前端不得先写“已激活”系统消息，也不得调用
+`GET /skills/:name` 后把完整 `SKILL.md` 塞进 `skill_context`。
 
 ### 3. appendStreamEvent — 事件路由 (chat.ts:828-1103)
 
@@ -106,13 +115,22 @@ if (ev.sub_agent && ev.sub_agent_task) {
 核心状态：
 - `currentID` — 当前活动会话 ID
 - `sessionMessages[id]` — 消息列表
+- `sessions[].conversation_state` — 服务端返回的会话活动状态；`blank` 会话在同项目内作为唯一空白草稿复用，前端加载列表时只展示每个项目最新的一条 blank。
 - `sessionMeta[id].style` / `sessionMeta[id].workMode` — 单会话说话风格与工作侧重点；`style=off` 表示关闭风格 prompt 和风格记忆注入
+- `sessionMeta[id].enabled_recognition_capabilities` — 会话启用的媒体能力工具（`image` / `video` / `audio`）；新会话只继承仍有可用系统路由的选项
+- `recognitionCapabilitiesAvailable` — `/api/v1/config` 返回的可用媒体识别路由缓存，用于过滤会话多选项
 - `globalWorkMode` — `/api/v1/config.work_mode.default` 的前端缓存，新建/旧会话无覆盖时回落使用
 - `streaming[id]` — 是否正在流式传输
 - `sessionWorking[id]` — 是否忙碌（TodoPanel 控制）
 - `sessionTodos[id]` — 待办列表
 - `pendingQuestion[id]` — 待回答问题（QuestionModal）
 - `pendingConfirm[id]` — 沙箱确认
+
+新建会话按钮先在当前项目的 `state.sessions` 中查找 `conversation_state=blank` 的草稿，
+命中时直接 `switchSession()` 跳转；本地未命中才调用 `POST /sessions`，服务端仍用
+`reuse_empty=true` 做多窗口兜底。普通发送和队列 turn 完成后，前端调用
+`POST /sessions/:id/title` 生成语义标题并同步 `sessions[]` 与 `sessionMeta[id].title`；
+旧的首条消息 `slice(0, 40)` 命名逻辑不得恢复。
 
 ### 7. Phantom Error 过滤
 
@@ -143,6 +161,71 @@ API: GET /api/v1/knowledge/bases/:name/nodes → NodeTreeItem[]
 ```
 
 原始条目卡片 (`wiki_sections`) 保留在树视图下方作为向后兼容层。
+
+### 8.1 Provider / Model 测试
+
+LLM 提供商页复用 `api.testProvider(provider, model?)`：顶部「测试默认模型」省略
+`model`，每个模型行的「测试」传入对应模型 ID。设置页用单一
+`testingTarget` 控制局部 loading、防止重复请求；成功 toast 展示实际模型、耗时和
+回复摘要，失败 toast 展示后端返回的标准化错误。
+
+Provider 基础表单通过 `ProviderHeadersEditor.vue` 编辑供应商级请求头键值行。编辑器提供
+空态添加、重复/非法名称提示、删除与「填入示例」；动态参数说明不再常驻占用表单空间，
+统一收进标题旁的问号帮助浮层，并按「会话与链路 / 请求级生成」展示全部可用参数、
+稳定范围及适用场景。示例包含
+`x-session-id: {{session_id}}`、当前消息 ID、随机 UUID 与雪花 ID。所有文案与示例保持
+供应商中立，不绑定某个代理或订阅服务。现有 Provider
+编辑只在请求头变化时 PATCH `custom_headers`，新增 Provider 随创建请求一并提交。
+
+LLM 提供商新增/编辑表单包含“供应商类型”，该值保存为 `provider_id`，同供应商下的套餐或区域保存为
+`strategy_variant`。设置页从 `/api/v1/provider-presets` 读取选项和默认 Base URL；前端不得重新硬编码
+厂商 endpoint 规则，也不得恢复旧 `vendor` 字段。协议下拉只表达 LLM 请求/响应协议：
+OpenAI Chat、OpenAI Responses、Anthropic Messages。
+
+### 8.2 会话设置下拉选择
+
+`InputArea.vue` 的会话设置中，风格与知识库复用 `NDropdown + .opt-pick`
+模式，只显示当前值和右侧箭头；展开后再列出全部选项。这样风格或知识库数量
+增加时不会撑高设置面板。知识库没有启用项时，选择器仍保留“不使用/全部”。会话设置的所有辅助说明和
+不可用时的配置引导都收入字段标题旁的问号帮助浮层，不在选择器下方占用高度。
+
+风格在创建新会话时继承当前活动会话；没有活动会话时默认为 `off`。媒体识别与媒体生成在同一两列行内
+展示，复用与风格、知识库相同的 `NDropdown + .opt-pick` 多选交互。有已选能力时，选择器内用标签
+展示第一项名称及已选总数；可选项仅包含系统设置中已启用、供应商与模型完整且协议受支持的
+图片/视频/音频路由。
+
+模型编辑器的上下文窗口提供 32K、64K、128K、200K、256K、512K、1M、2M 预设，同时保留自定义 token 输入；原“支持视觉输入”开关改为图片/视频/音频多选能力配置。系统设置“媒体识别”为三条独立路由，每条可单独关闭或指定 provider/model；最大文件限制可用 B、KB、MB、GB 编辑，前端换算后仍以 `max_bytes` 整数字节提交。
+
+### 8.3 附件预览与发送时序
+
+`addAttachment()` 在选择文件时立即插入本地预览占位，并用同一个 `_ready`
+任务完成文件读取和 `/uploads` 上传。普通消息发送时，`InputArea.send()` 先用独立的
+本地 blob URL 插入用户气泡，再等待 `_ready`，随后复用已有 `upload_id` 组装请求；
+发送阶段不得再次调用上传接口。图片、视频、音频、PDF 和 Office 文档都携带同一
+`upload_id` 引用；只有上传失败时才回退到内联数据。非媒体附件不再把 data URL
+误放进 `text` 字段，服务端会把引用持久化并按需交给 `read_attachment`。
+
+所有 data URL 预览统一通过 `utils/mediaPreview.ts` 转换；Blob MIME 只取 data URL
+元数据中第一个分号前的媒体类型，不能把 `;base64` 当作 MIME 的一部分。会话换页、
+消息淘汰或重新加载时必须释放消息附件持有的 blob URL。
+
+撤回用户消息时，GUI 以被点击的用户消息作为草稿来源，同时从撤回响应中合并该回合
+拆开的附件行，将文字和附件原子回填到 `InputArea`。历史 `/uploads/:id` 地址转换为
+已有上传引用，不重新上传；回填附件带撤回来源标记。点击“撤销”时只移除仍属于该
+来源的附件，并且仅当输入文字未被用户修改时清空文字。关闭撤回提示只放弃撤销能力，
+不清空已经回填的草稿。撤销后消息列表使用撤回前已归一化的 GUI 消息恢复，避免附件
+行重新拆成多个气泡。
+
+消息气泡中的附件下载/复制按钮只在附件悬浮或键盘聚焦时显示，并使用统一的浮层、
+边框、阴影与焦点样式。消息级操作保留复制和重答为直接按钮，创建分支、撤回等次级
+操作合并到三点菜单，菜单复用全局 `app-action-menu`。图片使用独立的中性附件卡片，
+随消息发送的说明文字单独显示为用户色气泡；多附件采用自适应网格。用户消息操作与
+时间位于同一静态底部基线，只有附件而没有文字时也使用附件组下方的同一兜底工具栏，
+避免操作栏覆盖小文本气泡或图片内容。
+
+用户气泡的出现不依赖 LLM API。启用媒体能力后，服务端仍会先执行对应能力模型的
+非流式识别，再启动主模型 SSE；前端会实时显示识别 phase，但主回复文本要到主模型
+产生首个 delta 后才出现。这是服务端串行预处理，不是前端等待完整回复后再播放。
 
 ### 9. Round 2 增强 (2026-07-15)
 
@@ -276,9 +359,52 @@ flag + `source` 路径）。`GET /api/v1/tools` 同时返回 `diagnostics[]`，
 流式 renderer 20.5%→10.3%、GPU 11.7%→8.1%。卡死流（`done` 丢失）由传输层
 150s idle watchdog（`idleTimeoutMs`）兜底，无需额外前端看门狗。
 
+### 12. 会话回合队列
+
+- 会话忙碌或已有待处理项时，`InputArea.send()` 把完整发送参数持久化到
+  `/turn-queue`，不提前渲染 user bubble。
+- 入队会立即把当前会话标记为 `active`，避免同项目空白会话复用逻辑把已有待发送用户意图的会话当成草稿。
+- 队列条默认显示一行摘要；展开后支持编辑 queued 消息、删除、失败重试和清空。
+- 编辑调用 `PATCH /turn-queue/:queue_id`；保存时保留队列 ID、FIFO 位置、附件和
+  模型/风格等 payload，只改消息文本。
+- 进入编辑态会暂停客户端自动出队；保存或取消后恢复。服务端仍以
+  `status=queued` 条件更新，兜底处理多客户端领取竞态。
+- failed 项不可直接编辑，需先重试回到 queued；running 项不会出现在可编辑列表。
+
 对话页顶部的 `StreamingBar.vue`（"对话进行中"加载条）同样遵循
 compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
 重复模式实现无缝滚动，无 `background-position` 动画（见 §8.4 例外）。
+
+### 13. 媒体生成配置与结果展示
+
+`AppSettingsModal.vue` 在 Provider 下选择供应商类型、策略变体、协议并填写公共
+`base_url`；供应商选项、默认 Base URL、模型列表与媒体 endpoint 默认值来自
+`GET /api/v1/provider-presets` 和 provider 策略。模型可手工添加，也可通过“获取模型”
+调用策略化模型发现；选择上游模型只会预填普通模型编辑弹窗，用户确认能力、上下文与端点
+后才持久化。它同时支持 `llm/media_generation` 模型类型；LLM 保存可编辑
+`api_endpoint`，媒体模型勾选 operation 能力并保存一份共享端点后缀配置，同时可在
+`operations[operation]` 中保存单能力覆盖。默认值按供应商、协议与能力带入；运行时再与
+Provider Base URL 拼接。系统页“媒体生成”按能力选择应用默认模型。
+
+媒体模型的异步查询后缀支持 `{task_id}` 和供应商文档常用的 `{id}`；界面明确说明该值
+来自创建响应、运行时自动替换，无需手填。创建端点若是查询任务集合的父路径，编辑器会以
+非阻断警告显示推导出的任务集合后缀，帮助发现漏写 `/tasks` 一类配置错误。
+
+`ModelPicker.vue` 和 store 的聊天默认回退只显示 `llm` 模型。
+
+`InputArea.vue` 的会话设置按文生图、图生图、文生视频等 operation 独立开关，选中后直接
+使用系统页配置的应用默认模型，不提供会话级模型覆盖。关闭后不仅从 schema 隐藏，服务端
+工具入口也返回 `blocked`；前端工具卡显示“已关闭”。提示词由当前对话 LLM 根据用户要求
+和上下文一次性整理完成，不提供额外增强开关。
+
+应用设置保存生成默认项，或增删改 Provider / 媒体生成模型后，会递增共享状态中的
+`generationConfigVersion`。`InputArea.vue` 监听该版本并重新请求
+`GET /api/v1/generation/options`，因此当前会话的能力下拉无需切换会话即可同步最新能力矩阵。
+
+`ToolCallCard.vue` 把 `generate_*` 与 `browser_screenshot` 统一归一化为工具媒体资产，并用
+`<img>`、`<video controls>`、`<audio controls>` 展示同源 `/api/v1/generated/:id`。媒体结果
+始终展开为主结果卡；生成参数收进可选详情，底栏统一显示稳定的友好文件名、媒体格式、
+全屏查看和下载按钮。新截图只保存资产引用；data/blob 分支仅用于兼容旧会话。
 
 ## 修改指南
 

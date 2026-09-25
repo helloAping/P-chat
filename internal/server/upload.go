@@ -19,16 +19,13 @@ import (
 // uses this to decide how to feed the file to the model:
 //
 //	image  → OpenAI image_url content block (vision)
-//	audio  → text marker (no native audio wire block in the
-//	         adapters yet — see ExpandAttachmentsCM)
-//	video  → text marker (no native video wire block in any
-//	         adapter today; rendered in the chat bubble as a
-//	         <video> element so the user can still preview it)
-//	text   → text/* or anything we can read as text; appended to
-//	         the user message as a code-fenced block
-//	file   → unknown binary; also appended as a textual marker
-//	         "filename: <name>, size: N" so the model at least
-//	         knows the user attached something.
+//	audio  → native input when the active model declares audio support,
+//	         otherwise a media_recognize upload reference
+//	video  → native input when the active model declares video support,
+//	         otherwise a media_recognize upload reference
+//	text   → a read_attachment upload reference
+//	file   → read_attachment for supported PDF/Office formats, otherwise
+//	         a clear unsupported-format marker
 type uploadKind string
 
 const (

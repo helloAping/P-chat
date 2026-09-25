@@ -13,7 +13,31 @@
 // session switch keeps the user's preference.
 import { computed, ref, watch } from 'vue'
 import type { ToolPart } from '../api/client'
-import { Check, X, AlertTriangle, Loader2, ChevronRight, ChevronDown, Clipboard } from './icons'
+import {
+  Check,
+  X,
+  AlertTriangle,
+  Loader2,
+  ChevronRight,
+  ChevronDown,
+  Clipboard,
+  Download,
+  Maximize2,
+  ImageIcon,
+  Film,
+  Volume2,
+  FileText,
+  File,
+} from './icons'
+import { copyText, downloadBlob, downloadFromUrl } from '../utils/clipboard'
+import {
+  attachmentArtifactFileName,
+  attachmentArtifactSourceLabel,
+  attachmentArtifactTypeLabel,
+  toolGeneratedAssetsFromPart,
+  type ToolGeneratedAsset,
+} from '../utils/attachmentArtifacts'
+import { markMediaContextTarget } from '../utils/mediaContext'
 
 const props = defineProps<{ part: ToolPart }>()
 
@@ -23,11 +47,23 @@ const props = defineProps<{ part: ToolPart }>()
 // fits in a tooltip (~150 chars) is fine open.
 const FOLD_RESULT_MIN_CHARS = 200
 const FOLD_RESULT_MIN_LINES = 4
+const isQuestionTool = computed(() => props.part.name === 'question')
+const isGenerationTool = computed(() => props.part.name.startsWith('generate_'))
+const isBrowserScreenshot = computed(() => props.part.name === 'browser_screenshot')
+const isMediaResultTool = computed(() => isGenerationTool.value || isBrowserScreenshot.value)
+const contextRefs = computed(() => (props.part.context_refs || []).filter(Boolean))
 
 // Whether the result is "long enough" to warrant a
-// default-collapsed state. The args block is not folded —
-// it's typically 1-3 lines and not the noise.
+// default-collapsed state. Short tool details still remain
+// manually foldable; this only controls the initial state.
 const shouldFoldResult = computed(() => {
+  // Errors default to collapsed — a long red log should not
+  // dominate the chat until the user expands it.
+  if (props.part.status === 'error' || props.part.error) return true
+  if (isQuestionTool.value) return false
+  // Generated assets are the primary result, so keep them visible without
+  // making the user expand a JSON-shaped tool response first.
+  if (toolMediaAssets.value.length || isMediaResultTool.value) return false
   const r = props.part.result || ''
   if (r.length >= FOLD_RESULT_MIN_CHARS) return true
   let lines = 0
@@ -40,21 +76,29 @@ const shouldFoldResult = computed(() => {
   return false
 })
 
+const hasVisibleBody = computed(() => {
+  if (isQuestionTool.value) return !!props.part.error
+  return contextRefs.value.length > 0 || !!props.part.args || !!props.part.result || !!props.part.error
+})
+
+const canToggleDetails = computed(() => hasVisibleBody.value)
+
 // open is the visual state. The decision tree is:
-//   1. short result → always open (no fold UI at all)
-//   2. long result + no user choice yet → default to folded
-//   3. long result + user clicked → respect their choice
+//   1. no details → closed (nothing to show)
+//   2. short result + no user choice yet → default to open
+//   3. long result + no user choice yet → default to folded
+//   4. user clicked → respect their choice
 // `userToggled` flips to true the first time the user
 // clicks the header; until then we follow the heuristic.
 const userToggled = ref(false)
 const userWantsOpen = ref(false)
 const open = computed(() => {
-  if (!shouldFoldResult.value) return true
-  if (!userToggled.value) return false
+  if (!canToggleDetails.value) return false
+  if (!userToggled.value) return !shouldFoldResult.value
   return userWantsOpen.value
 })
 function toggle() {
-  if (!shouldFoldResult.value) return
+  if (!canToggleDetails.value) return
   userToggled.value = true
   userWantsOpen.value = !open.value
 }
@@ -114,8 +158,48 @@ const statusLabel = computed(() => {
     case 'ok':    return '完成'
     case 'warn':  return '完成 (有警告)'
     case 'error': return '失败'
+    case 'blocked': return '已关闭'
     default:      return props.part.status
   }
+})
+
+const toolDisplayName = computed(() => isQuestionTool.value ? 'LLM 提问' : props.part.name)
+const toolTitle = computed(() =>
+  isQuestionTool.value ? toolDisplayName.value : `工具调用 · ${toolDisplayName.value}`,
+)
+const toolStatusLabel = computed(() => {
+  if (!isQuestionTool.value) return statusLabel.value
+  switch (props.part.status) {
+    case 'start': return '等待回答…'
+    case 'ok': return '已记录'
+    case 'warn': return '已记录 (有警告)'
+    case 'error': return '失败'
+    case 'blocked': return '已关闭'
+    default: return props.part.status
+  }
+})
+
+// Short one-line error for the collapsed header — avoids a
+// full-bleed red warning panel while still surfacing the failure.
+const shortErrorSummary = computed(() => {
+  const raw = (props.part.error || '').trim()
+  if (!raw) return ''
+  const firstLine = raw.split(/\r?\n/)[0].trim()
+  return firstLine.length > 72 ? `${firstLine.slice(0, 72)}…` : firstLine
+})
+
+const headerSubtitle = computed(() => {
+  if (shortErrorSummary.value) return shortErrorSummary.value
+  if (props.part.status !== 'start' || !props.part.args) return ''
+  try {
+    const parsed = JSON.parse(props.part.args) as Record<string, unknown>
+    const pick = parsed.command || parsed.cmd || parsed.query || parsed.pattern || parsed.path || parsed.url || parsed.expression
+    if (typeof pick === 'string' && pick.trim()) {
+      const one = pick.replace(/\s+/g, ' ').trim()
+      return one.length > 72 ? `${one.slice(0, 72)}…` : one
+    }
+  } catch { /* keep empty */ }
+  return ''
 })
 
 const statusIcon = computed(() => {
@@ -124,6 +208,7 @@ const statusIcon = computed(() => {
     case 'ok':    return Check
     case 'warn':  return AlertTriangle
     case 'error': return X
+    case 'blocked': return X
     default:      return null
   }
 })
@@ -151,26 +236,74 @@ const isDryRun = computed(() => {
   }
 })
 
-// Detect browser screenshot data in the result. The
-// extension returns images either as a raw data: URL
-// (legacy pre-blob conversion) or as
-// `{image: "data:image/jpeg;base64,..."}` JSON.
-// After the store's convertAndStripScreenshots runs,
-// these become `blob:` URLs which the browser <img>
-// handles natively with the same `:src` binding.
-const screenshotURL = computed(() => {
-  const r = props.part.result
-  if (!r) return ''
-  if (r.startsWith('data:image/') || r.startsWith('blob:')) return r
-  try {
-    const obj = JSON.parse(r)
-    if (typeof obj.image === 'string') {
-      const img = obj.image as string
-      if (img.startsWith('data:image/') || img.startsWith('blob:')) return img
-    }
-  } catch { /* not JSON */ }
-  return ''
-})
+// Tool generated assets have one presentation contract. New browser
+// screenshots are materialized by the agent and arrive in the same
+// {assets:[...]} envelope as generated media/file outputs.
+const toolMediaAssets = computed<ToolGeneratedAsset[]>(() => toolGeneratedAssetsFromPart(props.part))
+
+function toolMediaAssetLabel(asset: ToolGeneratedAsset): string {
+  return attachmentArtifactSourceLabel(asset.source)
+}
+
+function toolMediaAssetIcon(asset: ToolGeneratedAsset) {
+  if (asset.kind === 'video') return Film
+  if (asset.kind === 'audio') return Volume2
+  if (asset.kind === 'text') return FileText
+  if (asset.kind === 'file') return File
+  return ImageIcon
+}
+
+function toolMediaAssetFileName(asset: ToolGeneratedAsset): string {
+  return attachmentArtifactFileName({
+    ...asset,
+    mime: asset.mime_type || asset.mime,
+  })
+}
+
+function toolMediaAssetMeta(asset: ToolGeneratedAsset): string {
+  const type = attachmentArtifactTypeLabel({
+    kind: asset.kind,
+    name: asset.name,
+    mime: asset.mime_type || asset.mime,
+    url: asset.url,
+  })
+  return `${toolMediaAssetLabel(asset)} · ${type}`
+}
+
+function canPreviewToolMediaAsset(asset: ToolGeneratedAsset): asset is ToolGeneratedAsset & { url: string; kind: 'image' | 'video' } {
+  return (asset.kind === 'image' || asset.kind === 'video') && !!asset.url
+}
+
+function openToolMediaAsset(asset: ToolGeneratedAsset) {
+  if (!canPreviewToolMediaAsset(asset)) return
+  state.lightbox = {
+    show: true,
+    src: asset.url,
+    alt: toolMediaAssetFileName(asset),
+    kind: asset.kind,
+  }
+}
+
+function downloadToolMediaAsset(asset: ToolGeneratedAsset) {
+  const name = toolMediaAssetFileName(asset)
+  if (asset.url) {
+    downloadFromUrl(asset.url, name)
+    return
+  }
+  if (asset.text) {
+    downloadBlob(new Blob([asset.text], { type: asset.mime_type || asset.mime || 'text/plain' }), name)
+  }
+}
+
+function markToolMediaContextTarget(event: MouseEvent, asset: ToolGeneratedAsset) {
+  markMediaContextTarget(event, {
+    kind: asset.kind,
+    url: asset.url,
+    text: asset.text,
+    name: asset.name,
+    mime: asset.mime_type || asset.mime,
+  })
+}
 
 // Copy result to clipboard. Used both as a header
 // affordance (so the user can grab a long result without
@@ -179,13 +312,13 @@ const screenshotURL = computed(() => {
 // button doesn't toggle the fold.
 const copyState = ref<'idle' | 'copied' | 'err'>('idle')
 async function copyResult() {
-  const r = props.part.result
+  const r = await resultForCopy()
   if (!r) return
-  try {
-    await navigator.clipboard.writeText(r)
+  const ok = await copyText(r)
+  if (ok) {
     copyState.value = 'copied'
     setTimeout(() => (copyState.value = 'idle'), 1200)
-  } catch {
+  } else {
     copyState.value = 'err'
     setTimeout(() => (copyState.value = 'idle'), 1200)
   }
@@ -209,11 +342,12 @@ const truncatedLabel = computed(() => {
   const kb = (len / 1024).toFixed(len >= 1024 * 1024 ? 1 : 0)
   return len >= 1024 * 1024 ? `查看完整输出 (${(len / 1048576).toFixed(1)} MB)` : `查看完整输出 (${kb} KB)`
 })
-async function fetchFullResult() {
-  if (fetchState.value === 'loading' || fetchState.value === 'ok') return
+async function fetchFullResult(): Promise<boolean> {
+  if (fetchState.value === 'ok') return true
+  if (fetchState.value === 'loading') return false
   const sid = state.currentID
   const toolId = props.part.tool_id || props.part.id
-  if (!sid || !toolId) return
+  if (!sid || !toolId) return false
   fetchState.value = 'loading'
   try {
     // Resolve the trailing assistant message id (the SSE done
@@ -233,25 +367,60 @@ async function fetchFullResult() {
     const resp = await api.getToolResult(sid, msgId, toolId)
     fullResult.value = resp.content
     fetchState.value = 'ok'
+    return true
   } catch {
     fetchState.value = 'err'
     setTimeout(() => (fetchState.value = 'idle'), 2000)
+    return false
   }
+}
+
+async function resultForCopy(): Promise<string> {
+  if (resultTruncated.value) {
+    if (fetchState.value === 'ok' && fullResult.value) return fullResult.value
+    const ok = await fetchFullResult()
+    if (ok && fullResult.value) return fullResult.value
+  }
+  return props.part.result || ''
 }
 </script>
 
 <template>
-  <div class="tool-card" :class="['status-' + part.status, { foldable: shouldFoldResult, collapsed: !open }]">
-    <button class="tool-header" @click="toggle" :title="open ? '收起' : '展开'">
+  <!-- question 工具由 QuestionTable 展示；无错误时不渲染，避免双标题。 -->
+  <div
+    v-if="!isQuestionTool || part.error"
+    class="tool-card"
+    :class="['status-' + part.status, { foldable: canToggleDetails, collapsed: !open, 'question-tool': isQuestionTool }]"
+  >
+    <button
+      class="tool-header"
+      @click="toggle"
+      :title="isQuestionTool ? '问题已在下方展示' : canToggleDetails ? (open ? '收起' : '展开') : '无详情'"
+    >
       <span class="tool-icon" :class="part.status">
         <component :is="statusIcon" v-if="statusIcon" :size="11" :class="part.status === 'start' ? 'spin' : ''" />
       </span>
-      <span class="tool-name">{{ part.name }}</span>
-      <span v-if="isDryRun" class="tool-dry-run" title="仅预览,未实际执行">dry-run</span>
-      <span class="tool-status">{{ statusLabel }}</span>
+      <span class="tool-main">
+        <span class="tool-line">
+          <span class="tool-name">{{ toolTitle }}</span>
+          <span v-if="isDryRun" class="tool-dry-run" title="仅预览,未实际执行">dry-run</span>
+          <span
+            v-if="contextRefs.length"
+            class="tool-context-chip"
+            :title="contextRefs.join(', ')"
+          >ctx {{ contextRefs.length }}</span>
+          <span class="tool-status" :class="part.status">{{ toolStatusLabel }}</span>
+        </span>
+        <span
+          v-if="headerSubtitle && !open"
+          class="tool-subtitle"
+          :class="{ error: !!(part.status === 'error' || part.error) }"
+          :title="part.error || headerSubtitle"
+        >{{ headerSubtitle }}</span>
+      </span>
       <span class="tool-elapsed" v-if="part.elapsed">{{ part.elapsed }}</span>
       <span
-        v-if="part.result && shouldFoldResult"
+        v-if="part.result && canToggleDetails"
         class="tool-copy"
         :title="'复制结果'"
         @click.stop="copyResult"
@@ -260,16 +429,94 @@ async function fetchFullResult() {
         <span v-else-if="copyState === 'copied'" class="tool-copy-state">已复制</span>
         <span v-else class="tool-copy-state">失败</span>
       </span>
-      <component :is="open ? ChevronDown : ChevronRight" :size="12" class="tool-caret" />
+      <component
+        v-if="canToggleDetails"
+        :is="open ? ChevronDown : ChevronRight"
+        :size="12"
+        class="tool-caret"
+      />
     </button>
-    <div v-if="open" class="tool-body">
-      <div v-if="part.args" class="tool-args">
+    <div v-if="open && hasVisibleBody" class="tool-body">
+      <div v-if="contextRefs.length" class="tool-context-refs">
+        <span class="tool-section-label">上下文</span>
+        <code v-for="ref in contextRefs" :key="ref">{{ ref }}</code>
+      </div>
+      <details v-if="!isQuestionTool && part.args && isGenerationTool && toolMediaAssets.length" class="generation-request-details">
+        <summary>查看生成参数</summary>
+        <pre>{{ argsPretty }}</pre>
+      </details>
+      <div v-else-if="!isQuestionTool && part.args" class="tool-args">
         <div class="tool-section-label">参数</div>
         <pre>{{ argsPretty }}</pre>
       </div>
-      <div v-if="part.result" class="tool-result">
+      <div v-if="!isQuestionTool && part.result" class="tool-result">
         <div class="tool-section-label">结果</div>
-        <img v-if="screenshotURL" :src="screenshotURL" class="tool-screenshot" loading="lazy" />
+        <div v-if="toolMediaAssets.length" class="generated-assets">
+          <figure
+            v-for="asset in toolMediaAssets"
+            :key="asset.id || asset.url || asset.name || asset.text"
+            class="generated-asset"
+            :class="`generated-asset--${asset.kind}`"
+            @contextmenu="markToolMediaContextTarget($event, asset)"
+          >
+            <button
+              v-if="asset.kind === 'image' && asset.url"
+              class="generated-asset-preview"
+              type="button"
+              :aria-label="`预览 ${toolMediaAssetFileName(asset)}`"
+              @click="openToolMediaAsset(asset)"
+            >
+              <img :src="asset.url" :alt="toolMediaAssetFileName(asset)" loading="lazy" />
+            </button>
+            <div v-else-if="asset.kind === 'video' && asset.url" class="generated-asset-preview generated-asset-preview--video">
+              <video :src="asset.url" controls preload="metadata" />
+            </div>
+            <div v-else-if="asset.kind === 'audio' && asset.url" class="generated-asset-preview generated-asset-preview--audio">
+              <audio :src="asset.url" controls preload="metadata" />
+            </div>
+            <div v-else class="generated-asset-file">
+              <span class="generated-asset-file-icon" aria-hidden="true">
+                <component :is="toolMediaAssetIcon(asset)" :size="18" />
+              </span>
+              <span class="generated-asset-file-copy">
+                <span>{{ attachmentArtifactTypeLabel({ kind: asset.kind, name: asset.name, mime: asset.mime_type || asset.mime, url: asset.url }) }}</span>
+                <span>{{ toolMediaAssetLabel(asset) }}</span>
+              </span>
+            </div>
+            <figcaption class="generated-asset-footer">
+              <span class="generated-asset-identity">
+                <span class="generated-asset-icon" aria-hidden="true">
+                  <component :is="toolMediaAssetIcon(asset)" :size="14" />
+                </span>
+                <span class="generated-asset-copy">
+                  <span class="generated-asset-name" :title="toolMediaAssetFileName(asset)">
+                    {{ toolMediaAssetFileName(asset) }}
+                  </span>
+                  <span class="generated-asset-meta">{{ toolMediaAssetMeta(asset) }}</span>
+                </span>
+              </span>
+              <span class="generated-asset-actions">
+                <button
+                  v-if="canPreviewToolMediaAsset(asset)"
+                  class="generated-asset-action"
+                  type="button"
+                  @click="openToolMediaAsset(asset)"
+                >
+                  <Maximize2 :size="13" />
+                  <span>查看</span>
+                </button>
+                <button
+                  class="generated-asset-action generated-asset-action--download"
+                  type="button"
+                  @click="downloadToolMediaAsset(asset)"
+                >
+                  <Download :size="13" />
+                  <span>下载</span>
+                </button>
+              </span>
+            </figcaption>
+          </figure>
+        </div>
         <pre v-else-if="fetchState === 'ok'">{{ fullResult }}</pre>
         <pre v-else>{{ part.result }}</pre>
         <button
@@ -293,43 +540,56 @@ async function fetchFullResult() {
 </template>
 
 <style scoped>
-/* Tool call card. Matches the unified card spec in
- * frontend-design.md §3 — 3px left status rail, surface-2
- * body, var(--radius-md) corners, dashed border-top
- * separator between header and body. */
+/* Calm timeline row — flat inside .event-timeline panel.
+ * Status via circular icon only (no per-card chrome / nested
+ * white boxes). Error = thin red left edge + short summary. */
 .tool-card {
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  margin: 4px 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  margin: 0;
   overflow: hidden;
-  font-size: 12.5px;
-  transition: border-color var(--dur-fast) var(--ease-out);
+  font-size: 12px;
 }
-.tool-card.status-start { border-left: 3px solid var(--brand-500); }
-.tool-card.status-ok    { border-left: 3px solid var(--success-500); }
-.tool-card.status-warn  { border-left: 3px solid var(--warn-500); }
-.tool-card.status-error { border-left: 3px solid var(--error-500); }
+.tool-card.status-error,
+.tool-card.status-blocked {
+  border-left: 2px solid var(--error-500);
+  padding-left: 2px;
+}
+.tool-card.status-blocked {
+  border-left-color: var(--warn-500);
+}
+.tool-card.question-tool .tool-header { cursor: default; }
+.tool-card.question-tool .tool-name {
+  font-family: var(--font-sans);
+  font-weight: 600;
+}
+.tool-card.question-tool .tool-status {
+  margin-left: auto;
+}
 
 .tool-header {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-start;
+  gap: var(--space-2);
   width: 100%;
   background: transparent;
   border: 0;
-  padding: 5px 12px;
+  padding: var(--space-1) var(--space-2);
+  min-height: calc(var(--space-6) - var(--space-1));
   text-align: left;
   cursor: pointer;
   color: var(--text-secondary);
   font-family: inherit;
   font-size: inherit;
+  border-radius: var(--radius-sm);
   transition: background var(--dur-fast) var(--ease-out);
 }
 .tool-header:hover { background: var(--surface-3); }
 .tool-icon {
   display: inline-flex;
   width: 16px; height: 16px;
+  margin-top: 2px;
   align-items: center; justify-content: center;
   border-radius: 50%;
   flex-shrink: 0;
@@ -347,16 +607,57 @@ async function fetchFullResult() {
   to   { transform: rotate(360deg); }
 }
 .tool-name {
-  font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 500;
   color: var(--text-primary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.tool-status { color: var(--text-tertiary); font-size: 11px; }
+.tool-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tool-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.tool-status { color: var(--text-tertiary); font-size: 11px; flex-shrink: 0; }
+.tool-status.ok { color: var(--success-500); }
+.tool-status.error { color: var(--error-500); }
+.tool-subtitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.tool-subtitle.error { color: var(--error-500); }
+.tool-error-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--error-500);
+  font-size: 11px;
+  line-height: 1.3;
+}
 .tool-elapsed {
   color: var(--text-quaternary);
   font-size: 11px;
-  margin-left: 4px;
+  margin-left: auto;
+  margin-top: 2px;
   font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
 /* P2-4 dry-run chip. Pill-shaped, brand-50
  * background so it reads as "informational" — the
@@ -376,7 +677,19 @@ async function fetchFullResult() {
   margin-left: 4px;
   flex-shrink: 0;
 }
-.tool-caret { margin-left: auto; color: var(--text-tertiary); flex-shrink: 0; }
+.tool-context-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.tool-caret { color: var(--text-tertiary); flex-shrink: 0; margin-top: 2px; }
 
 /* "查看完整输出" affordance for server-truncated results.
  * Compact ghost button under the result body. */
@@ -403,49 +716,261 @@ async function fetchFullResult() {
 }
 
 .tool-body {
-  border-top: 1px dashed var(--border-subtle);
-  padding: 6px 12px 8px;
+  border-top: 1px solid var(--border-subtle);
+  margin-left: calc(var(--space-6) + var(--space-1));
+  padding: var(--space-1) var(--space-2) var(--space-2) var(--space-2);
 }
 .tool-section-label {
   font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0;
   color: var(--text-quaternary);
   margin: 4px 0 2px;
   font-weight: 500;
 }
-.tool-args pre, .tool-result pre, .tool-error pre {
-  margin: 0;
-  padding: 6px 8px;
-  background: var(--surface-0);
-  border: 1px solid var(--border-subtle);
+.tool-context-refs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+}
+.tool-context-refs .tool-section-label {
+  margin: 0 var(--space-1) 0 0;
+}
+.tool-context-refs code {
+  padding: 1px 6px;
   border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-3) 70%, transparent);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+}
+/* Flat monospace — no nested card-in-card boxes. */
+.tool-args pre, .tool-result pre, .tool-error pre, .generation-request-details pre {
+  margin: 0;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--text-secondary);
   white-space: pre-wrap;
   word-wrap: break-word;
-  max-height: 240px;
+  max-height: 160px;
   overflow: auto;
 }
-.tool-error pre {
-  color: var(--error-500);
-  border-color: var(--error-500);
-  background: var(--error-50);
+.tool-error {
+  margin-top: var(--space-1);
+  padding: var(--space-1) 0 var(--space-1) var(--space-2);
+  border-left: 2px solid var(--error-500);
+  border-radius: 0;
+  background: transparent;
 }
-.tool-screenshot {
+.tool-error .tool-section-label {
+  color: var(--error-500);
+  font-weight: 600;
+}
+.tool-error pre {
+  color: var(--error-600, var(--error-500));
+  max-height: 120px;
+}
+.generation-request-details {
+  margin-bottom: var(--space-2);
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+}
+.generation-request-details summary {
+  width: fit-content;
+  margin-bottom: var(--space-1);
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: var(--transition-colors);
+}
+.generation-request-details summary:hover {
+  color: var(--text-primary);
+}
+.generated-assets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-8) * 5), 100%), 1fr));
+  gap: var(--space-2);
+}
+.generated-asset {
+  display: grid;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+}
+.generated-asset-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  min-height: calc(var(--space-8) * 4);
+  aspect-ratio: 16 / 9;
+  padding: 0;
+  overflow: hidden;
+  appearance: none;
+  background: var(--surface-0);
+  border: 0;
+  color: inherit;
+  cursor: zoom-in;
+}
+.generated-asset-preview--video,
+.generated-asset-preview--audio {
+  cursor: default;
+}
+.generated-asset-preview img,
+.generated-asset-preview video {
   display: block;
-  max-width: 100%;
-  max-height: 400px;
+  width: 100%;
+  height: 100%;
+  max-height: calc(var(--space-8) * 10);
+  object-fit: contain;
+  background: var(--surface-0);
+}
+.generated-asset-preview img {
+  transition: transform var(--dur-base) var(--ease-out);
+}
+.generated-asset-preview:hover img {
+  transform: scale(1.01);
+}
+.generated-asset-preview--audio {
+  min-height: 0;
+  aspect-ratio: auto;
+  padding: var(--space-4);
+}
+.generated-asset-preview audio {
+  width: 100%;
+}
+.generated-asset-file {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: calc(var(--space-8) + var(--space-6));
+  padding: var(--space-3);
+  background: var(--surface-0);
+}
+.generated-asset-file-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(var(--space-8) + var(--space-1));
+  height: calc(var(--space-8) + var(--space-1));
+  flex: 0 0 auto;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  margin-top: 4px;
-  cursor: pointer;
-  transition: transform var(--dur-fast) var(--ease-out);
+  background: var(--surface-2);
+  color: var(--brand-600);
 }
-.tool-screenshot:hover {
-  transform: scale(1.02);
+.generated-asset-file-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.generated-asset-file-copy span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.generated-asset-file-copy span:first-child {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.generated-asset-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+  border-top: 1px solid var(--border-subtle);
+}
+.generated-asset-identity {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: var(--space-2);
+}
+.generated-asset-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: calc(var(--space-7) - var(--space-1));
+  height: calc(var(--space-7) - var(--space-1));
+  flex: 0 0 auto;
+  border-radius: var(--radius-sm);
+  background: var(--brand-50);
+  color: var(--brand-600);
+}
+.generated-asset-copy {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+.generated-asset-name {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.generated-asset-meta {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.3;
+}
+.generated-asset-actions {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: var(--space-1);
+  margin-left: auto;
+}
+.generated-asset-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(var(--space-7) - var(--space-1));
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: var(--transition-colors);
+}
+.generated-asset-action:hover {
+  background: var(--surface-3);
+  color: var(--text-primary);
+}
+.generated-asset-action--download {
+  border-color: var(--brand-100);
+  background: var(--brand-50);
+  color: var(--brand-600);
+}
+.generated-asset-action--download:hover {
+  background: var(--brand-100);
+  color: var(--brand-600);
 }
 
 /* P1-1 fold affordances. The foldable class is set when

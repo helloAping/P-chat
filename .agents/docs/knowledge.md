@@ -15,6 +15,7 @@
 | **SHA256 缓存** | 媒体描述 & LLM 文本总结均按内容哈希去重 |
 | **mtime 增量扫描** | 仅处理变更文件，未变文件跳过 |
 | **索引注入 prompt** | L1 级 overview 嵌入系统提示（≤2000 字符），LLM 有目标地检索而非盲目探索 |
+| **排除规则归一化** | `ExcludePatterns` 统一走 slash 路径匹配，扫描、统计、grep 行为一致 |
 | **双表共存** | 旧 `wiki_sections` + 新 `index_nodes` 并存，向后兼容，idempotent 迁移 |
 
 ---
@@ -25,7 +26,7 @@
 ┌─────────────────────────────────────────────────────────┐
 │ 前端                                                        │
 │ ┌──────────────────────┐  ┌────────────────────────────┐ │
-│ │ AppSettingsModal      │  │ InputArea (KB 选择器)        │ │
+│ │ AppSettingsModal      │  │ InputArea 会话设置            │ │
 │ │ · 知识库 Tab           │  │ · __off__ / __all__ / base   │ │
 │ │ · 三层树视图            │  │ · 写入 sessionMeta.knowledge │ │
 │ │ · 扫描/清除按钮         │  │   _base                     │ │
@@ -58,7 +59,7 @@
 │ Tool 层                                                   │
 │ ┌──────────────┐  ┌──────────────┐  ┌────────────────┐ │
 │ │ wiki_lookup   │  │ wiki_list    │  │ grep           │ │
-│ │ · query/base  │  │ · parent_id  │  │ · pattern/base │ │
+│ │ · query/base  │  │ · parent/base│  │ · pattern/base │ │
 │ │ · hybrid+RRF │  │ · 分页       │  │ · filepath.Walk│ │
 │ └──────┬───────┘  └──────┬───────┘  └────────┬───────┘ │
 └────────┼──────────────────┼──────────────────┼─────────┘
@@ -164,10 +165,15 @@ CREATE VIRTUAL TABLE index_fts USING fts5(
 ### 4.1 生命周期
 
 ```go
-func NewWikiStore(name, dir string) (*WikiStore, error)   // 打开/创建 wiki.db
-func GetOrOpenWikiStore(cfg *config.Config, name string)   // 单例缓存
+func NormalizeWikiStoreDir(dir string) (string, error)     // 规范化为稳定绝对目录
+func NewWikiStore(name, dir string) (*WikiStore, error)     // 打开/创建 wiki.db
+func GetOrOpenWikiStore(name, dir string) (*WikiStore, error) // 按规范化目录 + base name 缓存
+func (ws *WikiStore) Dir() string                          // 返回规范化目录
 func (ws *WikiStore) Close() error                         // 关闭连接
+func ExcludedByPatterns(rel string, patterns []string) bool // 统一排除规则匹配
 ```
+
+所有入口（扫描、API handler、对话工具）都应通过 `GetOrOpenWikiStore(name, dir)` 打开库，避免相对路径、`.`/`..` 或符号链接造成同一知识库对应多个 `wiki.db`/SQLite 连接。
 
 ### 4.2 旧表数据写入（wiki_sections）
 
@@ -190,7 +196,7 @@ func (ws *WikiStore) Close() error                         // 关闭连接
 
 | 方法 | 签名 | 用途 |
 |------|------|------|
-| `MigrateBaseToIndex` | `(ctx, base string) (bool, error)` | 创建 index_nodes/contents/index_fts 表，幂等 |
+| `MigrateBaseToIndex` | `(ctx, base string) (int, error)` | 将旧 `wiki_sections` 迁移到三层索引；新库无旧表时返回 0 |
 | `InsertNode` | `(ctx, *IndexNode) (int64, error)` | 写入节点 → 触发器自动同步 FTS |
 | `InsertContent` | `(ctx, *ContentNode) (int64, error)` | 写入内容块 |
 | `LookupSearch` | `(ctx, query, base string, expand bool, level, page, size int)` | KB-02 hybrid+RRF 搜索，返回 match_type |
@@ -198,6 +204,7 @@ func (ws *WikiStore) Close() error                         // 关闭连接
 | `ListNodes` | `(ctx, base string) ([]NodeTreeItem, error)` | 返回整棵树的扁平列表（含 child_count/content_count） |
 | `GetNodeContent` | `(ctx, nodeID int) ([]ContentNode, error)` | 读取节点的内容块 |
 | `GetL1Overview` | `(ctx, base string) (string, error)` | 读取 L1 概览 |
+| `RefreshL1Overview` | `(ctx, base string) error` | 根据当前 L2 文件节点重建 L1 概览，扫描/删除后调用 |
 | `ClearBase` | `(ctx, base string) error` | 清除知识库所有数据（wiki_sections + index 全表） |
 
 ### 4.5 增量扫描缓存
@@ -233,7 +240,7 @@ type KnowledgeBase struct {
     ScanMediaTypes  []string `json:"scan_media_types"`   // ["image","video","audio","pdf"]
     AutoScan        bool     `json:"auto_scan"`
     ExcludePatterns []string `json:"exclude_patterns"`
-    MaxFileSize     int      `json:"max_file_size"`     // 0 = 默认 5MB
+    MaxFileSize     int64    `json:"max_file_size"`     // 0 = 默认 5MB
 }
 ```
 
@@ -281,7 +288,8 @@ walk directory
 ```
 walk directory
   └── process files:
-      ├── EnsureMigrated → 建表 (幂等)
+      ├── 按 file_types / ExcludedByPatterns / max_file_size 过滤候选文件
+      ├── ScanModel 为空时走纯文本解析；配置后才调用 LLM 生成 keywords/overview
       ├── 解析 Markdown ##/### → 拆分为段
       ├── AI 解析 (如配了 ScanModel):
       │   ├── prompt = "为以下段落生成 JSON: {title,keywords,overview}"
@@ -293,7 +301,8 @@ walk directory
       │   └── L3 (section): 一个 per-段落，Title=标题, Keywords/Overview=AI 解析结果
       ├── InsertNode(L2) + InsertNode(L3) + InsertContent(段落正文)
       ├── tokenizeForFTS → FTS5 触发器自动同步
-      └── SetFileMtime
+      ├── SetFileMtime
+      └── RefreshL1Overview
 ```
 
 ### 6.4 mediaScan — 媒体文件扫描
@@ -329,7 +338,15 @@ var MediaTypeExtensions = map[string][]string{
 
 - 每个知识库最多一个活跃 scan job
 - 30 分钟超时自动取消
-- 进度通过 `sync.Map` 共享，前端 800ms 轮询
+- 新扫描必须通过 `scanJobManager.Claim` 原子占用槽位；进度由 `scanJob.snapshot()` 共享，后台扫描写进度和前端 800ms 轮询都必须走带锁方法
+
+### 6.7 ExcludePatterns 规则
+
+- 调用入口：`knowledge.ExcludedByPatterns(rel, patterns)`
+- 路径先归一为 slash 风格：`docs\api.md`、`docs/api.md` 等价
+- 支持 basename pattern：`ignored.md`
+- 支持目录前缀：`docs/**`、`docs\**`、`docs/`
+- 扫描和 grep 遇到被排除目录时直接 `SkipDir`
 
 ---
 
@@ -353,7 +370,7 @@ var MediaTypeExtensions = map[string][]string{
 | `DELETE` | `/api/v1/knowledge/bases/:name/sections/:id` | 删除条目 |
 | `GET` | `/api/v1/knowledge/bases/:name/nodes` | ★ 三层索引节点列表 |
 | `GET` | `/api/v1/knowledge/bases/:name/nodes/:id/content` | ★ 节点内容块 |
-| `POST` | `/api/v1/knowledge/search` | 跨库 FTS5 + grep 联合搜索 |
+| `POST` | `/api/v1/knowledge/search` | 跨库 FTS5 + grep 联合搜索；返回 `stats` 可观测信息 |
 
 ---
 
@@ -375,15 +392,20 @@ var MediaTypeExtensions = map[string][]string{
 | `size` | 20 | 50 | 每页条数 |
 | `expand` | false | — | 展开 children + parent 引用 |
 
+输出头部会包含：
+- `检索统计`: bases / queries / raw_matches / candidates / merged / returned / has_more
+- `输出预算`: overview ≤500 字符，expanded content ≤800 字符/块，并报告被截断的 overview/content 块数量
+
 ### 8.2 `wiki_list`（★ 替代 wiki_index）
 
 ```
-参数: parent_id (optional), page (1), size (50, max 100)
+参数: parent_id (required), base (optional), page (1), size (50, max 100)
 流程: resolveBases → ListChildren(parent_id, page, size) → 返回子节点列表
 ```
 
-- `parent_id=0` → 列出所有 L1（root）节点
-- 用于树形浏览，LLM 按需展开子节点
+- `parent_id=1` → 列出某个知识库 root 下的 L2 文件节点
+- 从 `wiki_lookup` 结果继续展开时传 `base`，避免多知识库下相同 `parent_id` 展开到错误库
+- 不传 `base` 时遍历全部启用知识库并合并结果，用于全库根节点浏览
 
 ### 8.3 `grep`
 
@@ -412,7 +434,7 @@ func resolveBases(kc *KnowledgeConfig, name string) []KnowledgeBase
 ### 9.1 数据流
 
 ```
-InputArea KB 选择器
+InputArea 会话设置 > 知识库
     ↓ sessionMeta.knowledge_base = "__off__" / "__all__" / "base_name"
 POST /api/v1/sessions/:id/messages
     ↓ chatReq.KBBase = meta.KnowledgeBase
@@ -445,7 +467,7 @@ func buildKBIndex(cfg *config.Config, kbBase string) string
 
 1. 解析 `kbBase`，获取 L1 node overview（通过 `GetL1Overview`）
 2. 格式化为 1-2 句简介，追加到 system prompt 末尾
-3. 截断至 2000 字符
+3. 截断至 2000 字符；截断时保留 `wiki_lookup/wiki_list` 使用提示
 4. 缓存 30s（L1 overview 缓存），扫描/清除后 `Reload()` 刷新
 
 ```text
@@ -495,7 +517,7 @@ LLM 收到错误 → 自行决策
 
 ### 11.1 知识库 Tab（`AppSettingsModal.vue`）
 
-左右分栏布局：
+左右分栏布局。详情页 header 后有 `.kb-recall` 召回预览区（`KnowledgeRecallPreview.vue`）：输入问题调用 `/knowledge/search`，按当前库 / 全部知识库两种范围预览实际召回的片段（rank / 标题 / score / 命中类型 / explanation / 内容预览），`:key="kbSelected.name"` 随选库重置。
 
 ```
 ┌─ Provider list (左) ──┬─ Detail pane (右) ───────────────┐
@@ -539,7 +561,7 @@ LLM 收到错误 → 自行决策
 - L3 节点显示 title + overview + content count
 - L1 节点以卡片形式展示 overview 概览
 
-### 11.2 KB 选择器（`InputArea.vue`）
+### 11.2 会话级 KB 选择（`InputArea.vue`）
 
 ```
 [不使用 ▾]
@@ -669,6 +691,7 @@ pchat-server 启动
 | 文件 | 内容 |
 |------|------|
 | `internal/knowledge/wiki_store.go` | WikiStore — SQLite 存储引擎（旧表 + 三层索引 + FTS5 + 触发器） |
+| `internal/knowledge/exclude_patterns.go` | `ExcludePatterns` slash 归一化与 glob/目录匹配 |
 | `internal/knowledge/hybrid.go` | KB-02 hybrid retrieval：lexical + FTS + content LIKE + RRF |
 | `internal/knowledge/query_plan.go` | KB-03 query decomposition：规则型派生查询 |
 | `internal/knowledge/citation.go` | KB-04 citation explainability：结构化来源和解释文本 |
@@ -678,14 +701,16 @@ pchat-server 启动
 | `internal/tool/wiki.go` | `wiki_lookup`（hybrid+RRF + 多库合并）+ `wiki_list` 工具 |
 | `internal/tool/grep.go` | `grep` 工具 |
 | `internal/server/knowledge_api.go` | 知识库 CRUD + 扫描管道 + API 端点 + parseKWAndOverview |
+| `internal/server/knowledge_scan_jobs.go` | 扫描任务状态、快照、取消和并发保护 |
 | `internal/server/handler.go` | sessionMeta/KnowledgeBase 流、SSE 映射 |
 | `internal/server/server.go` | 路由注册（含 /nodes /clear 新路由） |
 | `internal/agent/agent.go` | ChatWithTools、buildKBIndex、4 层 KB off 守卫 |
 | `internal/config/config.go` | KnowledgeBase / KnowledgeConfig 类型定义 |
 | `internal/config/knowledge_config.go` | 配置持久化操作 |
 | `internal/recall/stub.go` | recall 工具 stub |
-| `frontend/src/components/AppSettingsModal.vue` | 知识库 Tab UI（左右分栏 + 三层树视图 + NCollapse） |
-| `frontend/src/components/InputArea.vue` | KB 选择器 UI |
+| `frontend/src/components/AppSettingsModal.vue` | 知识库 Tab UI（左右分栏 + 三层树视图 + NCollapse + 召回预览区） |
+| `frontend/src/components/KnowledgeRecallPreview.vue` | 可复用召回预览面板（结果卡片 + citation 展示） |
+| `frontend/src/components/InputArea.vue` | 会话设置 popover + KB 选择 UI |
 | `frontend/src/api/client.ts` | 前端类型 + API 调用（含 NodeTreeItem + NodeContentItem） |
 | `frontend/src/stores/chat.ts` | sessionMeta 状态管理 |
 

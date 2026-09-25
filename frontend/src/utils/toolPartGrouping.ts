@@ -55,6 +55,15 @@ export function groupConsecutiveToolParts(entries: IndexedPart[], minGroupSize =
       continue
     }
     if (entry.part.kind === 'tool') {
+      // question 工具由 QuestionTable 展示；无错误时跳过，避免与「LLM 提问」卡片重复。
+      // Question tools render via QuestionTable; skip the tool card unless it has an error.
+      if (entry.part.name === 'question') {
+        flushPending()
+        if (entry.part.error) {
+          result.push({ kind: 'part', part: entry.part, index: entry.index })
+        }
+        continue
+      }
       pending.push({ part: entry.part, index: entry.index })
       continue
     }

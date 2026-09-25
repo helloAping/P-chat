@@ -33,8 +33,9 @@ export async function copyText(text: string): Promise<boolean> {
     }
   } catch { /* fall through to legacy path */ }
 
+  let ta: HTMLTextAreaElement | null = null
   try {
-    const ta = document.createElement('textarea')
+    ta = document.createElement('textarea')
     ta.value = text
     ta.setAttribute('readonly', '')
     ta.style.position = 'fixed'
@@ -42,12 +43,15 @@ export async function copyText(text: string): Promise<boolean> {
     ta.style.left = '0'
     ta.style.opacity = '0'
     document.body.appendChild(ta)
+    ta.focus()
     ta.select()
+    ta.setSelectionRange(0, ta.value.length)
     const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
     return ok
   } catch {
     return false
+  } finally {
+    ta?.remove()
   }
 }
 
@@ -76,37 +80,10 @@ export async function copyImageToClipboard(blob: Blob): Promise<boolean> {
   }
 }
 
-// downloadBlob triggers a browser download for the given
-// blob. `filename` is what the user sees in their downloads
-// folder; we synthesise the extension from `mime` when the
-// caller doesn't supply one.
-export function downloadBlob(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.style.display = 'none'
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  // Revoke the object URL on the next tick. Synchronous
-  // revoke can race with the browser's download dispatch
-  // on some engines.
-  setTimeout(() => URL.revokeObjectURL(url), 0)
-}
-
-// downloadFromUrl is the data-URL equivalent of
-// downloadBlob. Use it for already-base64 payloads (the
-// chat attachments are mostly data: URLs).
-export function downloadFromUrl(url: string, filename: string): void {
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.style.display = 'none'
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-}
+// downloadBlob / downloadFromUrl — prefer the desktop save
+// dialog (avoids WebView2's ugly built-in downloads flyout).
+// Browser preview falls back to <a download>.
+export { downloadBlob, downloadFromUrl } from './download'
 
 // fetchAsBlob fetches a URL and resolves to a Blob. Used
 // to materialise data: URLs into a Blob when the caller

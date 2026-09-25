@@ -401,6 +401,78 @@ DROP INDEX IF EXISTS idx_subagent_jobs_status;
 DROP INDEX IF EXISTS idx_subagent_jobs_session_created;
 DROP TABLE IF EXISTS subagent_jobs;`,
 	},
+	{
+		// Migration 12: queued conversation turns.
+		//
+		// `turn_queue` is the durable inbox for user messages submitted
+		// while a session is already streaming. The existing /messages SSE
+		// handler remains the only turn executor; this table only records
+		// the pending request payload, FIFO order, and failure state so the
+		// GUI can drain the queue safely after the current turn finishes.
+		Version: 12,
+		Name:    "turn_queue",
+		Up: `
+CREATE TABLE IF NOT EXISTS turn_queue (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    status           TEXT NOT NULL DEFAULT 'queued',
+    message          TEXT NOT NULL DEFAULT '',
+    payload_json     TEXT NOT NULL DEFAULT '',
+    client_msg_id    INTEGER NOT NULL DEFAULT 0,
+    attachment_count INTEGER NOT NULL DEFAULT 0,
+    error            TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    started_at       INTEGER,
+    finished_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_turn_queue_session_status ON turn_queue(session_id, status, id);`,
+		Down: `
+	DROP INDEX IF EXISTS idx_turn_queue_session_status;
+	DROP TABLE IF EXISTS turn_queue;`,
+	},
+	{
+		// Migration 13: reusable media tool contexts.
+		//
+		// Media recognition and generation tools return data that often needs
+		// to be referenced in a later turn: "use the first column you just
+		// read", "extend the previous video prompt", or "turn that generated
+		// image into a video". Tool results alone are too ephemeral for this:
+		// they are optimized for the current ReAct round and visible UI cards.
+		Version: 13,
+		Name:    "media_contexts",
+		Up: `
+	CREATE TABLE IF NOT EXISTS media_contexts (
+	    id                TEXT PRIMARY KEY,
+	    session_id        TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+	    kind              TEXT NOT NULL,
+	    tool_name         TEXT NOT NULL DEFAULT '',
+	    input_refs_json   TEXT NOT NULL DEFAULT '[]',
+	    output_refs_json  TEXT NOT NULL DEFAULT '[]',
+	    prompt            TEXT NOT NULL DEFAULT '',
+	    result_text       TEXT NOT NULL DEFAULT '',
+	    summary           TEXT NOT NULL DEFAULT '',
+	    structured_json   TEXT NOT NULL DEFAULT '',
+	    context_refs_json TEXT NOT NULL DEFAULT '[]',
+	    tool_call_id      TEXT NOT NULL DEFAULT '',
+		    message_id        INTEGER NOT NULL DEFAULT 0,
+		    regen_group_id    TEXT NOT NULL DEFAULT '',
+		    archived          INTEGER NOT NULL DEFAULT 0,
+		    archive_reason    TEXT NOT NULL DEFAULT '',
+		    created_at        INTEGER NOT NULL
+		);
+	CREATE INDEX IF NOT EXISTS idx_media_contexts_session_created
+	  ON media_contexts(session_id, archived, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_media_contexts_tool_call
+	  ON media_contexts(session_id, tool_call_id);
+	CREATE INDEX IF NOT EXISTS idx_media_contexts_regen_group
+	  ON media_contexts(session_id, regen_group_id, archived);`,
+		Down: `
+	DROP INDEX IF EXISTS idx_media_contexts_regen_group;
+	DROP INDEX IF EXISTS idx_media_contexts_tool_call;
+	DROP INDEX IF EXISTS idx_media_contexts_session_created;
+	DROP TABLE IF EXISTS media_contexts;`,
+	},
 }
 
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (

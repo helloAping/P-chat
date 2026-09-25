@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -23,6 +24,7 @@ import (
 	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/tool"
 	"github.com/p-chat/pchat/internal/tool/dynamic"
 	"github.com/p-chat/pchat/internal/trace"
@@ -74,6 +76,11 @@ func (s *Server) SetIMGateway(gateway *im.Gateway) {
 	s.handler.SetIMGateway(gateway)
 }
 
+// SetSubagentRunner wires the sub-agent runner for config hot reloads.
+func (s *Server) SetSubagentRunner(runner *subagent.Default) {
+	s.handler.SetSubagentRunner(runner)
+}
+
 // New builds the HTTP server. The store is used for session/message
 // persistence. The agent is used for chat calls. The web frontend is
 // served from an embedded filesystem so the binary is self-contained.
@@ -114,8 +121,9 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	// the route. Handlers that need a smaller cap (e.g.
 	// SendMessage) layer their own MaxBytesReader on top.
 	r.Use(maxBodyMiddleware(25 << 20))
-	// Per-IP rate limit. 10 req/s sustained, burst 20.
-	// Generous for human use; rejects runaway clients.
+	// Per-IP rate limit. 10 req/s sustained, burst 20 for non-loopback
+	// clients. Local GUI/CLI traffic can legitimately burst during
+	// startup, queue draining, and shutdown, so loopback requests skip it.
 	r.Use(rateLimitMiddleware())
 
 	// CORS: pchat-server is normally hit same-origin (browser at
@@ -169,6 +177,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/stylegen", h.StyleGenStart)
 		api.GET("/stylegen/:job", h.StyleGenStatus)
 		api.GET("/stylegen/:job/events", h.StyleGenEvents)
+		api.GET("/provider-presets", h.ProviderPresets)
 		api.GET("/providers", h.Providers)
 		api.GET("/providers/:name", h.GetProvider)
 		api.POST("/providers", h.AddProvider)
@@ -183,10 +192,12 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/providers/:name/models/:model/default", h.SetDefaultModel)
 		api.PATCH("/providers/:name/models/:model/capabilities", h.SetCapabilities)
 		api.GET("/providers/:name/upstream-models", h.FetchUpstreamModels)
+		api.POST("/providers/:name/test", h.TestProvider)
 
 		// System config
 		api.GET("/config", h.GetSystemConfig)
 		api.PATCH("/config", h.UpdateSystemConfig)
+		api.GET("/generation/options", h.GenerationOptions)
 
 		// Diagnostics (GUI "诊断 / 内存监控" tab): live memory, monitor
 		// config, and on-demand heap / goroutine snapshot downloads.
@@ -199,6 +210,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// Uploads
 		api.POST("/uploads", h.Upload)
 		api.GET("/uploads/:id", h.GetUpload)
+		api.GET("/generated/:id", h.GetGeneratedAsset)
 
 		// Slash commands
 		api.GET("/commands", h.ListCommands)
@@ -222,6 +234,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// provider/model/style" (pointer fields). The handler
 		// dispatches based on the body.
 		api.PATCH("/sessions/:id", h.UpdateSessionMeta)
+		api.POST("/sessions/:id/title", h.GenerateSessionTitle)
 		api.DELETE("/sessions/:id", h.DeleteSession)
 
 		// Messages
@@ -274,6 +287,15 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/sessions/:id/system-message", h.SaveSystemMessage)
 		api.GET("/sessions/:id/todos", h.GetTodos)
 		api.DELETE("/sessions/:id/todos", h.ClearTodos)
+		api.GET("/sessions/:id/turn-queue", h.ListTurnQueueItems)
+		api.POST("/sessions/:id/turn-queue", h.EnqueueTurnQueueItem)
+		api.DELETE("/sessions/:id/turn-queue", h.ClearTurnQueue)
+		api.POST("/sessions/:id/turn-queue/claim", h.ClaimNextTurnQueueItem)
+		api.PATCH("/sessions/:id/turn-queue/:queue_id", h.EditTurnQueueItem)
+		api.POST("/sessions/:id/turn-queue/:queue_id/complete", h.CompleteTurnQueueItem)
+		api.POST("/sessions/:id/turn-queue/:queue_id/fail", h.FailTurnQueueItem)
+		api.POST("/sessions/:id/turn-queue/:queue_id/retry", h.RetryTurnQueueItem)
+		api.DELETE("/sessions/:id/turn-queue/:queue_id", h.DeleteTurnQueueItem)
 		api.GET("/sessions/:id/subagent-jobs", h.ListSubagentJobs)
 		api.GET("/sessions/:id/subagent-jobs/events", h.SubagentJobEvents)
 		api.GET("/sessions/:id/subagent-jobs/:task_id", h.GetSubagentJob)
@@ -466,6 +488,24 @@ func (s *Server) RunAt(addr string) error {
 		Handler: s.engine,
 	}
 	return s.srv.ListenAndServe()
+}
+
+// RunListener 在调用方已持有的 listener 上提供 HTTP 服务；端口 0 和首选
+// 范围从分配到服务期间不会释放，因此启动过程不存在重新绑定竞态。
+// RunListener serves HTTP on a caller-owned listener without releasing the
+// selected port between allocation and serving.
+func (s *Server) RunListener(listener net.Listener) error {
+	if listener == nil {
+		return fmt.Errorf("server: listener is nil")
+	}
+	s.srv = &http.Server{
+		Addr:    listener.Addr().String(),
+		Handler: s.engine,
+	}
+	if err := s.srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve HTTP on %s: %w", listener.Addr().String(), err)
+	}
+	return nil
 }
 
 // RunWithGracefulShutdown starts the server and blocks until a
@@ -742,11 +782,11 @@ func (r *rateLimiter) evictExpired(maxIdle time.Duration) {
 	}
 }
 
-// rateLimitMiddleware rejects (with 429) requests from IPs that
-// exceed the per-second budget. A 10 req/s burst with 20 burst
-// capacity is generous for human use and the CLI; a script
-// spamming at 100 req/s will start to be rejected within a
-// second.
+// rateLimitMiddleware rejects (with 429) non-loopback requests from IPs that
+// exceed the per-second budget. Loopback is the desktop app's normal control
+// path; startup, queue draining, and shutdown can legitimately fan out dozens
+// of same-process requests in one second, and the body cap plus per-session
+// locks are the relevant local protections.
 func rateLimitMiddleware() gin.HandlerFunc {
 	rl := newRateLimiter(10, 20)
 	go func() {
@@ -761,6 +801,10 @@ func rateLimitMiddleware() gin.HandlerFunc {
 		if err != nil {
 			ip = c.Request.RemoteAddr
 		}
+		if isLoopbackIP(ip) {
+			c.Next()
+			return
+		}
 		if !rl.allow(ip) {
 			c.Header("Retry-After", "1")
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
@@ -770,4 +814,9 @@ func rateLimitMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func isLoopbackIP(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	return ip != nil && ip.IsLoopback()
 }

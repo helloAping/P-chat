@@ -42,6 +42,7 @@ CLI 通过 `httpcli.Client` 连接 pchat-server，消费 SSE 事件流。事件�
 - content → 流式文本打印
 - thinking → 折叠思考块
 - tool → 工具调用进度
+- skill → 固定输出 `当前调用 Skill：<name>`，随后显示 ready/error
 - sub_agent → 缩进度视图
 - phase → 状态消息
 - question → 内联交互式问答（待实现）
@@ -50,6 +51,37 @@ CLI 通过 `httpcli.Client` 连接 pchat-server，消费 SSE 事件流。事件�
 
 `serverproc.Start()` 自动启动 pchat-server 子进程，通过环境变量 `PCHAT_PORT` 通信。
 
+### 4. 会话回合队列
+
+CLI 用 `/queue` 管理与 GUI 相同的持久化 FIFO：
+
+```text
+/queue                         # 列表
+/queue add <消息>              # 入队
+/queue edit <id> <新消息>      # 编辑 queued 项
+/queue run                     # 按 FIFO 连续发送
+/queue retry <id>              # 重试 failed 项
+/queue delete <id>             # 删除 queued/failed 项
+/queue clear                   # 清空 queued/failed 项
+```
+
+`/queue run` 通过 claim/complete/fail 生命周期执行，沿用入队时保存的 provider、
+model、style、work_mode、附件、`active_skills` 等发送参数。遇到 failed/running 队首
+会停止，不越过队首；显式 `false` 的图像识别和子代理开关也按三态值原样转发。
+local / HTTP 两种 `cliContext` adapter 使用同一组命令处理器。local CLI 列表时会恢复
+超过安全窗口的陈旧 running 项，避免上次进程中断后永久卡住队首。
+
+### 5. Skill 命令
+
+```text
+/skills                              # 列出当前项目视图可发现的 Skill
+/skill lark-doc 创建一份周报         # 显式调用
+/lark-doc 创建一份周报                # 已安装 Skill 的动态快捷形式
+```
+
+local 与 HTTP CLI 都通过 catalog 验证动态快捷名称；实际聊天请求只发送
+`ActiveSkills: ["lark-doc"]`。可见 start 事件必须发生在 Skill 正文进入 LLM 上下文之前。
+
 ## 修改指南
 
 ### 要修改 REPL 输入处理
@@ -57,6 +89,7 @@ CLI 通过 `httpcli.Client` 连接 pchat-server，消费 SSE 事件流。事件�
 
 ### 要添加新斜杠命令
 - `commands.go` 中的命令映射表
+- 需要跨 local / HTTP 模式时，同步扩展 `context.go` 与 `internal/httpcli/client.go`
 
 ### 要修改终端渲染
 - `progress.go` (工具调用渲染)

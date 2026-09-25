@@ -30,8 +30,9 @@ type UIConfigPatch struct {
 	CloseBehavior *CloseBehavior `json:"close_behavior,omitempty"`
 }
 
+// VisionRecognitionConfigPatch 是 media_recognize 外接图片模型的部分更新。
 // VisionRecognitionConfigPatch is a partial update for the external image
-// recognition model used by the image_recognize tool.
+// recognition model used by the image strategy of media_recognize.
 type VisionRecognitionConfigPatch struct {
 	Enabled        *bool   `json:"enabled,omitempty"`
 	Provider       *string `json:"provider,omitempty"`
@@ -40,14 +41,37 @@ type VisionRecognitionConfigPatch struct {
 	MaxImageBytes  *int64  `json:"max_image_bytes,omitempty"`
 }
 
+// RecognitionRoutePatch is a partial update for one media route.
+type RecognitionRoutePatch struct {
+	Enabled        *bool   `json:"enabled,omitempty"`
+	Provider       *string `json:"provider,omitempty"`
+	Model          *string `json:"model,omitempty"`
+	TimeoutSeconds *int    `json:"timeout_seconds,omitempty"`
+	MaxBytes       *int64  `json:"max_bytes,omitempty"`
+}
+
+// RecognitionConfigPatch updates independent media recognition routes.
+type RecognitionConfigPatch struct {
+	Routes map[MediaKind]RecognitionRoutePatch `json:"routes,omitempty"`
+}
+
+// GenerationConfigPatch updates application defaults independently for each
+// canonical media operation. An empty target removes that default.
+type GenerationConfigPatch struct {
+	Defaults       map[GenerationOperation]GenerationModelTarget `json:"defaults,omitempty"`
+	RequireConfirm *bool                                         `json:"require_confirm,omitempty"`
+}
+
 // SystemConfigPatch is a partial update for system-level config
 // (limits + subagent + work_mode + ui + vision_recognition).
 type SystemConfigPatch struct {
-	Limits   *LimitsConfigPatch            `json:"limits,omitempty"`
-	SubAgent *SubAgentConfigPatch          `json:"sub_agent,omitempty"`
-	WorkMode *WorkModeConfigPatch          `json:"work_mode,omitempty"`
-	UI       *UIConfigPatch                `json:"ui,omitempty"`
-	Vision   *VisionRecognitionConfigPatch `json:"vision_recognition,omitempty"`
+	Limits      *LimitsConfigPatch            `json:"limits,omitempty"`
+	SubAgent    *SubAgentConfigPatch          `json:"sub_agent,omitempty"`
+	WorkMode    *WorkModeConfigPatch          `json:"work_mode,omitempty"`
+	UI          *UIConfigPatch                `json:"ui,omitempty"`
+	Vision      *VisionRecognitionConfigPatch `json:"vision_recognition,omitempty"`
+	Recognition *RecognitionConfigPatch       `json:"recognition,omitempty"`
+	Generation  *GenerationConfigPatch        `json:"generation,omitempty"`
 }
 
 // UpdateSystemConfig merges a SystemConfigPatch into the persisted config.
@@ -71,6 +95,26 @@ func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
 	}
 	if patch.Vision != nil {
 		mergeVisionRecognition(&cfg.Vision, patch.Vision)
+		cfg.Recognition.Normalize()
+		cfg.Recognition.Routes[MediaImage] = RecognitionRoute{
+			Enabled: cfg.Vision.Enabled, Provider: cfg.Vision.Provider, Model: cfg.Vision.Model,
+			TimeoutSeconds: cfg.Vision.TimeoutSeconds, MaxBytes: cfg.Vision.MaxImageBytes,
+		}
+	}
+	if patch.Recognition != nil {
+		mergeRecognition(&cfg.Recognition, patch.Recognition)
+		if image, ok := cfg.Recognition.Routes[MediaImage]; ok {
+			cfg.Vision = VisionRecognitionConfig{
+				Enabled: image.Enabled, Provider: image.Provider, Model: image.Model,
+				TimeoutSeconds: image.TimeoutSeconds, MaxImageBytes: image.MaxBytes,
+			}
+			cfg.Vision.Normalize()
+		}
+	}
+	if patch.Generation != nil {
+		if err := mergeGeneration(cfg, patch.Generation); err != nil {
+			return nil, err
+		}
 	}
 
 	mgr := NewManager()
@@ -78,6 +122,29 @@ func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
 		return nil, fmt.Errorf("save system config: %w", err)
 	}
 	return cfg, nil
+}
+
+func mergeGeneration(cfg *Config, patch *GenerationConfigPatch) error {
+	if cfg.Generation.Defaults == nil {
+		cfg.Generation.Defaults = make(map[GenerationOperation]GenerationModelTarget)
+	}
+	for operation, target := range patch.Defaults {
+		if !operation.IsValid() {
+			return fmt.Errorf("unsupported generation operation %q", operation)
+		}
+		if !target.Valid() {
+			delete(cfg.Generation.Defaults, operation)
+			continue
+		}
+		if _, _, _, err := cfg.ResolveGenerationTarget(operation, target); err != nil {
+			return err
+		}
+		cfg.Generation.Defaults[operation] = target
+	}
+	if patch.RequireConfirm != nil {
+		cfg.Generation.RequireConfirm = *patch.RequireConfirm
+	}
+	return nil
 }
 
 func mergeLimits(l *LimitsConfig, p *LimitsConfigPatch) {
@@ -145,4 +212,31 @@ func mergeVisionRecognition(v *VisionRecognitionConfig, p *VisionRecognitionConf
 		v.MaxImageBytes = *p.MaxImageBytes
 	}
 	v.Normalize()
+}
+
+func mergeRecognition(target *RecognitionConfig, patch *RecognitionConfigPatch) {
+	target.Normalize()
+	for kind, routePatch := range patch.Routes {
+		if !kind.IsValid() {
+			continue
+		}
+		route := target.Routes[kind]
+		if routePatch.Enabled != nil {
+			route.Enabled = *routePatch.Enabled
+		}
+		if routePatch.Provider != nil {
+			route.Provider = *routePatch.Provider
+		}
+		if routePatch.Model != nil {
+			route.Model = *routePatch.Model
+		}
+		if routePatch.TimeoutSeconds != nil {
+			route.TimeoutSeconds = *routePatch.TimeoutSeconds
+		}
+		if routePatch.MaxBytes != nil {
+			route.MaxBytes = *routePatch.MaxBytes
+		}
+		route.Normalize()
+		target.Routes[kind] = route
+	}
 }

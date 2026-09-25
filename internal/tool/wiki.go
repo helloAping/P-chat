@@ -20,10 +20,16 @@ type wikiLookupArgs struct {
 }
 
 type wikiListArgs struct {
-	ParentID int `json:"parent_id"`
-	Page     int `json:"page,omitempty"`
-	Size     int `json:"size,omitempty"`
+	ParentID int    `json:"parent_id"`
+	Base     string `json:"base,omitempty"`
+	Page     int    `json:"page,omitempty"`
+	Size     int    `json:"size,omitempty"`
 }
+
+const (
+	wikiLookupOverviewRunes = 500
+	wikiLookupContentRunes  = 800
+)
 
 // RegisterWiki registers wiki_lookup and wiki_list tools.
 func RegisterWiki(r *Registry, cfg *config.Config) {
@@ -66,6 +72,7 @@ func RegisterWiki(r *Registry, cfg *config.Config) {
 				"type":        "integer",
 				"description": "父节点 id（L1=1 列出所有文件，L2 节点的 id 列出该文件所有章节）",
 			},
+			"base": StringProp("知识库名称（可选；从 wiki_lookup 结果继续展开时应传来源库，避免多库 node id 冲突）"),
 			"page": map[string]any{
 				"type":        "integer",
 				"description": "页码（默认 1）",
@@ -115,6 +122,7 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 		}
 		var allItems []knowledge.IndexSearchItem
 		rawTotal := 0
+		searchedBases := 0
 		for _, base := range basesToSearch {
 			if !base.Enabled {
 				continue
@@ -123,6 +131,7 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			if err != nil {
 				continue
 			}
+			searchedBases++
 			for _, q := range queries {
 				res, err := store.LookupSearch(ctx, q, base.Name, a.Expand, a.Level, 1, 200)
 				if err != nil {
@@ -142,22 +151,10 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			return &CallResult{Content: "(知识库为空，尚未扫描)"}, nil
 		}
 
-		// Global merge: keep a generous pool then paginate.
-		// TopK = page*size so deeper pages still see globally-ranked items.
-		pool := a.Page * a.Size
-		if pool < a.Size {
-			pool = a.Size
-		}
-		if pool < 50 {
-			pool = 50
-		}
-		mergedAll := knowledge.MergeAndRerank(allItems, knowledge.MergeOptions{TopK: pool})
+		// Global merge: use all fetched candidates so pagination,
+		// has_more, and stats reflect the full local window.
+		mergedAll := knowledge.MergeAndRerank(allItems, knowledge.MergeOptions{TopK: len(allItems)})
 		total := len(mergedAll)
-		if total < rawTotal {
-			// Merge truncates the pool; report at least the pool size
-			// so the LLM knows more may exist beyond this window.
-			total = len(mergedAll)
-		}
 
 		// Paginate the merged+re-ranked results.
 		start := (a.Page - 1) * a.Size
@@ -169,7 +166,59 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			end = len(mergedAll)
 		}
 		mergedItems := mergedAll[start:end]
-		hasMore := end < len(mergedAll) || rawTotal > len(mergedAll)
+		hasMore := end < len(mergedAll) || rawTotal > len(allItems)
+
+		var body strings.Builder
+		overviewTruncated := 0
+		contentBlocks := 0
+		contentTruncated := 0
+		for _, it := range mergedItems {
+			if it.Parent != nil {
+				fmt.Fprintf(&body, "### %s / %s\n", it.Parent.Title, it.Title)
+			} else {
+				fmt.Fprintf(&body, "### %s\n", it.Title)
+			}
+			if it.Base != "" {
+				fmt.Fprintf(&body, "*来源库: %s*\n", it.Base)
+			}
+			citation := knowledge.BuildCitation(it)
+			if it.MatchType != "" {
+				fmt.Fprintf(&body, "*命中: %s*\n", it.MatchType)
+			}
+			if it.Query != "" && it.Query != a.Query {
+				fmt.Fprintf(&body, "*匹配查询: %s*\n", it.Query)
+			}
+			if citation.Explanation != "" {
+				fmt.Fprintf(&body, "*解释: %s*\n", citation.Explanation)
+			}
+			if it.Keywords != "" {
+				fmt.Fprintf(&body, "*关键词: %s*\n", it.Keywords)
+			}
+			if it.Overview != "" {
+				overview, truncated := knowledge.TruncateTextWithFlag(it.Overview, wikiLookupOverviewRunes)
+				if truncated {
+					overviewTruncated++
+					overview += "..."
+				}
+				fmt.Fprintf(&body, "%s\n", overview)
+			}
+			if it.Rank > 0 {
+				fmt.Fprintf(&body, "*(relevance: %.2f)*\n", it.Rank)
+			}
+			if len(it.Children) > 0 {
+				body.WriteString("\n")
+				for _, c := range it.Children {
+					contentBlocks++
+					content, truncated := knowledge.TruncateTextWithFlag(c.Content, wikiLookupContentRunes)
+					if truncated {
+						contentTruncated++
+						content += "\n...(truncated)"
+					}
+					fmt.Fprintf(&body, "> %s\n\n", strings.ReplaceAll(content, "\n", "\n> "))
+				}
+			}
+			body.WriteString("\n")
+		}
 
 		var b strings.Builder
 		if a.Query == "" {
@@ -181,50 +230,11 @@ func makeWikiLookupHandler(cfg *config.Config) ToolHandler {
 			}
 			b.WriteString("\n")
 		}
-		for _, it := range mergedItems {
-			if it.Parent != nil {
-				fmt.Fprintf(&b, "### %s / %s\n", it.Parent.Title, it.Title)
-			} else {
-				fmt.Fprintf(&b, "### %s\n", it.Title)
-			}
-			if it.Base != "" {
-				fmt.Fprintf(&b, "*来源库: %s*\n", it.Base)
-			}
-			citation := knowledge.BuildCitation(it)
-			if it.MatchType != "" {
-				fmt.Fprintf(&b, "*命中: %s*\n", it.MatchType)
-			}
-			if it.Query != "" && it.Query != a.Query {
-				fmt.Fprintf(&b, "*匹配查询: %s*\n", it.Query)
-			}
-			if citation.Explanation != "" {
-				fmt.Fprintf(&b, "*解释: %s*\n", citation.Explanation)
-			}
-			if it.Keywords != "" {
-				fmt.Fprintf(&b, "*关键词: %s*\n", it.Keywords)
-			}
-			if it.Overview != "" {
-				overview := it.Overview
-				if len(overview) > 500 {
-					overview = overview[:500] + "..."
-				}
-				fmt.Fprintf(&b, "%s\n", overview)
-			}
-			if it.Rank > 0 {
-				fmt.Fprintf(&b, "*(relevance: %.2f)*\n", it.Rank)
-			}
-			if len(it.Children) > 0 {
-				b.WriteString("\n")
-				for _, c := range it.Children {
-					content := c.Content
-					if len(content) > 800 {
-						content = content[:800] + "\n...(truncated)"
-					}
-					fmt.Fprintf(&b, "> %s\n\n", strings.ReplaceAll(content, "\n", "\n> "))
-				}
-			}
-			b.WriteString("\n")
-		}
+		fmt.Fprintf(&b, "*检索统计: bases=%d, queries=%d, raw_matches=%d, candidates=%d, merged=%d, returned=%d, has_more=%t*\n",
+			searchedBases, len(queries), rawTotal, len(allItems), len(mergedAll), len(mergedItems), hasMore)
+		fmt.Fprintf(&b, "*输出预算: overview<=%d 字符, expanded_content<=%d 字符/块, expanded_blocks=%d, truncated_overviews=%d, truncated_blocks=%d*\n\n",
+			wikiLookupOverviewRunes, wikiLookupContentRunes, contentBlocks, overviewTruncated, contentTruncated)
+		b.WriteString(body.String())
 		if hasMore {
 			fmt.Fprintf(&b, "*(共 %d 条，继续翻页请用 page=%d)*\n", total, a.Page+1)
 		}
@@ -253,9 +263,14 @@ func makeWikiListHandler(cfg *config.Config) ToolHandler {
 			return &CallResult{Content: "知识库未启用", IsError: true}, nil
 		}
 
-		// Search across all enabled bases.
+		basesToList := resolveBases(kc, a.Base)
+		if len(basesToList) == 0 {
+			return &CallResult{Content: "知识库未配置或不可用", IsError: true}, nil
+		}
+
+		// Search across selected bases.
 		var merged *knowledge.IndexSearchResult
-		for _, base := range kc.Bases {
+		for _, base := range basesToList {
 			if !base.Enabled {
 				continue
 			}
@@ -270,6 +285,7 @@ func makeWikiListHandler(cfg *config.Config) ToolHandler {
 			if res.Total == 0 {
 				continue
 			}
+			res.Items = knowledge.TagBase(res.Items, base.Name)
 			if merged == nil {
 				merged = res
 			} else {
@@ -307,7 +323,11 @@ func makeWikiListHandler(cfg *config.Config) ToolHandler {
 				}
 				fmt.Fprintf(&b, " — %s", overview)
 			}
-			fmt.Fprintf(&b, " *(id=%d, source=%s)*\n", it.ID, it.Source)
+			if it.Base != "" {
+				fmt.Fprintf(&b, " *(id=%d, base=%s, source=%s)*\n", it.ID, it.Base, it.Source)
+			} else {
+				fmt.Fprintf(&b, " *(id=%d, source=%s)*\n", it.ID, it.Source)
+			}
 		}
 		if merged.HasMore {
 			fmt.Fprintf(&b, "\n*(共 %d 条，继续翻页 page=%d)*\n", merged.Total, merged.Page+1)

@@ -1,16 +1,10 @@
 <script setup lang="ts">
-// Collapsible block for the model's chain-of-thought.
-// Default-open while streaming, default-closed once
-// finished. The header swaps between Loader2 (spinning,
-// while streaming) and Lightbulb (done) so the user can
-// tell at a glance whether the model is still reasoning.
-// Both icons come from lucide-vue-next (consistent with
-// the rest of the app's icon system — earlier versions
-// used raw Unicode escapes for these, which broke the
-// icon system and rendered inconsistently across OSes).
+// Independent chain-of-thought block — not a tool event
+// and not part of the execution timeline. Default-open
+// while streaming.
 import { ref, watch } from 'vue'
 import type { ThinkingPart } from '../api/client'
-import { ChevronRight, Lightbulb, Loader2 } from './icons'
+import { Check, ChevronRight, Loader2 } from './icons'
 
 const props = defineProps<{
   part: ThinkingPart
@@ -39,21 +33,19 @@ function toggle() {
     class="thinking-block"
     :class="{ open, streaming: part.streaming }"
   >
-    <button class="thinking-header" @click="toggle" :aria-expanded="open">
+    <button class="thinking-header" type="button" @click="toggle" :aria-expanded="open">
+      <span class="icon" :class="{ streaming: part.streaming }" aria-hidden="true">
+        <Loader2 v-if="part.streaming" :size="11" class="spin" />
+        <Check v-else :size="11" />
+      </span>
+      <span class="label">思考过程</span>
+      <span v-if="part.streaming" class="status">思考中…</span>
+      <span v-else-if="part.text" class="meta">{{ part.text.length }} 字</span>
       <ChevronRight
         :size="12"
         class="caret"
         :class="{ rotated: open }"
       />
-      <span class="icon">
-        <Loader2 v-if="part.streaming" :size="13" class="spin" />
-        <Lightbulb v-else :size="13" />
-      </span>
-      <span class="label">
-        <template v-if="part.streaming">思考中…</template>
-        <template v-else>思考过程</template>
-      </span>
-      <span class="meta" v-if="!part.streaming && part.text">{{ part.text.length }} 字</span>
     </button>
     <div v-if="open" class="thinking-body">
       <pre class="thinking-content">{{ part.text }}</pre>
@@ -62,73 +54,55 @@ function toggle() {
 </template>
 
 <style scoped>
-/* Thinking block. Same chrome as the other "structural"
- * cards (ToolCall, SubAgent, Question) but with no left
- * status rail — thinking is always a neutral preview,
- * not a status-bearing control. Surface flips from
- * transparent → surface-2 when expanded, so the user has
- * a clear visual cue for the open/closed state. */
 .thinking-block {
-  margin: 8px 0;
+  margin: var(--space-2) 0;
+  background: var(--thinking-bg);
+  border: 1px solid var(--thinking-border);
   border-radius: var(--radius-md);
-  background: transparent;
-  border: 1px solid var(--border-subtle);
   overflow: hidden;
-  font-size: 13px;
-  transition: border-color var(--dur-fast) var(--ease-out),
-              background var(--dur-fast) var(--ease-out);
-}
-.thinking-block.open {
-  border-color: var(--border-default);
-  background: var(--surface-2);
-}
-.thinking-block.streaming {
-  border-color: var(--border-default);
-}
-.thinking-block.streaming.open {
-  /* Subtle brand-tinted wash so the user knows reasoning
-   * is in-flight. 4% opacity keeps the tint from looking
-   * like a hard error background. */
-  background: color-mix(in srgb, var(--brand-500) 4%, var(--surface-2));
+  font-size: 12.5px;
 }
 
 .thinking-header {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
+  min-height: 32px;
   border: none;
   background: transparent;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 500;
   color: var(--text-secondary);
   text-align: left;
   user-select: none;
-  transition: color var(--dur-fast) var(--ease-out);
+  border-radius: var(--radius-sm);
+  transition: background var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out);
 }
 .thinking-header:hover {
+  background: color-mix(in srgb, var(--thinking-icon) 8%, transparent);
   color: var(--text-primary);
 }
-.caret {
-  color: var(--text-quaternary);
-  flex-shrink: 0;
-  transition: transform var(--dur-fast) var(--ease-out);
-}
-.caret.rotated { transform: rotate(90deg); }
 .icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 16px;
   height: 16px;
-  color: var(--text-tertiary);
+  border-radius: 50%;
+  background: var(--success-50);
+  color: var(--success-500);
   flex-shrink: 0;
 }
-.thinking-block.streaming .icon { color: var(--brand-500); }
+.icon.streaming {
+  background: color-mix(in srgb, var(--thinking-icon) 12%, var(--surface-2));
+  color: var(--thinking-icon);
+}
 .spin {
-  animation: thinking-spin 1.2s linear infinite;
+  animation: thinking-spin 1.1s linear infinite;
 }
 @keyframes thinking-spin {
   from { transform: rotate(0deg); }
@@ -136,28 +110,43 @@ function toggle() {
 }
 .label {
   flex: 1;
+  min-width: 0;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+.status {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  flex-shrink: 0;
 }
 .meta {
   color: var(--text-quaternary);
   font-size: 11px;
   font-weight: 400;
   font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
+.caret {
+  color: var(--text-quaternary);
+  flex-shrink: 0;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.caret.rotated { transform: rotate(90deg); }
 
 .thinking-body {
   border-top: 1px solid var(--border-subtle);
 }
 .thinking-content {
   margin: 0;
-  padding: 10px 14px;
+  padding: var(--space-3) var(--space-4) var(--space-4) 40px;
   white-space: pre-wrap;
-  word-break: break-all;
+  word-break: break-word;
   overflow-wrap: break-word;
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: 12.5px;
   line-height: 1.6;
-  color: var(--text-tertiary);
-  max-height: 400px;
+  color: var(--text-secondary);
+  max-height: 280px;
   overflow: auto;
   background: transparent;
   border: none;

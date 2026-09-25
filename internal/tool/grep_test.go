@@ -241,6 +241,34 @@ func TestGrepKnowledgeBases_SpecificBase(t *testing.T) {
 	}
 }
 
+func TestGrepKnowledgeBases_RespectsExcludePatterns(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "keep.md"), []byte("shared-token keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docs", "skip.md"), []byte("shared-token skip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Knowledge: config.KnowledgeConfig{
+		Enabled: true,
+		Bases: []config.KnowledgeBase{
+			{Name: "testgrep", Path: dir, Enabled: true, ExcludePatterns: []string{`docs\**`}},
+		},
+	}}
+
+	results := grepKnowledgeBases(context.Background(), cfg, "", "shared-token", 10)
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if strings.Contains(results[0].Content, "skip") {
+		t.Fatalf("excluded file was searched: %+v", results[0])
+	}
+}
+
 func TestGrepKnowledgeBases_Disabled(t *testing.T) {
 	cfg := &config.Config{Knowledge: config.KnowledgeConfig{Enabled: false}}
 	results := grepKnowledgeBases(context.Background(), cfg, "", "anything", 10)

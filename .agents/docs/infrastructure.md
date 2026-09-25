@@ -7,17 +7,18 @@
 **位置**：`internal/style/`  
 **文件**：`manager.go`
 
-管理 LLM 人格风格。每个风格由三部分组成，存储为独立文件：
+管理 LLM 人格风格。当前风格数据存储在 SQLite `styles` 表中：
 
-| 组件 | 文件路径 | 注入方式 |
+| 字段 | 含义 | 注入方式 |
 |---|---|---|
-| Identity | `prompts/identity/{id}.md` | staticPrompt 缓存 |
-| Soul | `prompts/soul/{id}.md` | staticPrompt 缓存 |
-| **Memory** | `prompts/memory/{id}.md` | **每轮动态追加** |
+| `id` / `label` | 风格 ID 与显示名 | GUI/CLI 展示 |
+| `prompt` | 完整人格系统提示词 | staticPrompt 缓存 |
+| `memory` | 用户维护的风格记忆 | 每轮动态追加 |
+| `is_builtin` | 内置风格标记 | 内置风格只读 |
 
-**风格即记忆**：不同人设 = 不同 Identity + Soul + Memory。Memory 修改即时生效，不破坏 LLM prefix-cache。
+内置风格 `cute` / `guofeng` / `tech` 由 `internal/upgrade/prompts/*.md` embed 进二进制，并在升级步骤 V2→V3 seed 到 SQLite。旧版 `prompts/identity`、`prompts/soul`、`prompts/style` 只作为迁移导入来源，不再是当前运行时真源。
 
-`styleMgr.GetMemory(s)` → 读取 → agent.go 动态注入 systemPrompt 末尾（`## 我的上下文`）。
+`styleMgr.GetSystemPrompt(s)` 读取 prompt 进入静态系统提示词；`styleMgr.GetMemory(s)` 读取 memory，在 `agent.go` 中动态注入 systemPrompt 末尾。`style=off` 不注入 prompt，也不注入 memory。
 
 ## 沙箱 (Sandbox)
 
@@ -38,26 +39,64 @@
 ## Skill 技能系统
 
 **位置**：`internal/skill/`  
-**文件**：`skill.go`
+**文件**：`manager.go`（主入口）, `skill.go`（旧接口兼容）
 
-管理可安装的 Skill 定义：
-- `LoadAllWithRoot(root)` — 加载全局 + `<root>/.p-chat/skills` 的 skills（**2026-07 项目根感知**）
-- `LoadAll()` — 旧接口，等价于 `LoadAllWithRoot("")`（向后兼容 CLI 命令）
-- `Install(repoURL)` — 从 GitHub 安装
-- `Delete(name)` — 卸载
-- Skill 内容被注入到系统提示词
-- 合并策略：全局 + 项目都加载，项目同名覆盖全局
+Skill 是包含 `SKILL.md` 及可选 `scripts/`、`references/`、`assets/` 的完整目录包。
+`Manager` 是 Agent、HTTP、CLI 和工具共用的唯一边界：
 
-## Style 风格管理
+```go
+type Manager interface {
+    Catalog(context.Context, CatalogQuery) (Catalog, error)
+    Load(context.Context, LoadRequest) (LoadedSkill, error)
+    Apply(context.Context, ChangeRequest) (ChangeResult, error)
+}
+```
 
-**位置**：`internal/style/`  
-**文件**：`manager.go`
+发现优先级从高到低：
 
-管理 LLM 人格风格：
-- "tech" — 技术专家风格（默认）
-- 用户可定义自定义风格
-- 风格定义加载自 `~/.p-chat/styles/`
-- 风格通过 `Style` 字段嵌入系统提示词
+1. `<project>/.p-chat/skills/<name>/`（项目托管）
+2. `<project>/.agents/skills/<name>/`（Agent Skills 标准项目目录）
+3. `~/.p-chat/skills/<name>/`，实际根由 `PCHAT_HOME` / `PCHAT_DATA_HOME` 解析（P-Chat 全局托管）
+4. `~/.agents/skills/<name>/`（Agent Skills 标准用户目录）
+
+同名 Skill 只选最高优先级版本，较低版本记录在 `shadowed[]`；目录名与
+frontmatter `name` 不一致会产生诊断，但逻辑名称始终以 frontmatter 为准。
+
+`SKILL.md` frontmatter 支持 `requires` 或 `metadata.requires`：
+
+```yaml
+---
+name: docs-tool
+description: 管理在线文档
+metadata:
+  requires:
+    skills: [shared-auth]
+    bins: [vendor-cli]
+---
+```
+
+系统提示词只注入 `Catalog` 的名称、描述和依赖摘要；正文在显式激活或模型调用
+`skill(action=load)` 时按需加载。加载按依赖拓扑顺序合成上下文，并校验依赖 Skill、
+外部可执行文件和资源路径。每次 `Catalog/Load` 都重新扫描，所以外部 CLI 写入标准目录后，
+新会话无需重启即可发现。
+
+安装/导入由 `Apply` 完成：远程安装仅接受 HTTPS GitHub 仓库或目录 URL；本地导入接受
+单个完整 Skill 包目录，或任意外部工具导出的 Skill 集合目录（每个直接子目录都是一个包）。
+集合导入省略 `name` 时导入全部包；提供 `name` 时导入目标及其在该集合内声明的依赖。
+P-Chat 核心不执行外部 CLI，也不为具体供应商维护专用适配器。
+
+安装过程不执行包内脚本；发布使用 staging + rename，并限制整次导入的包数、文件数、总大小
+和单文件大小，拒绝符号链接。单包和集合都先完整 staging，再按事务发布：任一包发布或验证
+失败都会恢复全部旧包；发布/校验窗口由进程级读写锁隔离，`Catalog` / `Load` 不会看到半发布
+状态。完成后必须再次 `Load` 验证；返回 `rolled_back=true` 表示已回滚，不能向用户声称安装
+成功。
+
+外部 CLI 或安装器应优先把完整包写入 `.agents/skills` 标准目录；若只能导出到私有目录，
+则调用 `skill_manage(action=import, source_path=...)`。最后用 `skill(action=doctor)` 或
+`skill(action=list)` 验证。host runtime prompt 会明确告知数据根、四类目录和通用导入契约。
+
+兼容接口 `LoadAllWithRoot()` / `LoadAll()` 仍保留，但同样通过 Manager 发现；不得再新增
+另一套安装、删除或合并逻辑。
 
 ## MCP 服务器集成
 
@@ -117,19 +156,22 @@ API：
 ## Knowledge 知识检索
 
 **位置**：`internal/knowledge/`  
-**文件**：`index.go`, `embed_openai.go`, `embed_local.go`, `embedding.go`, `bits.go`
+**文件**：`index.go`, `indexer.go`, `wiki_store.go`, `hybrid.go`, `merge.go`, `query_plan.go`, `bits.go`
 
 RAG (检索增强生成) 实现：
-- 文本嵌入（OpenAI embedding 或本地模型）
-- 向量索引和相似度搜索
-- 知识分块存储
+- Wiki/FTS5 三层索引
+- 路径、标题、正文、关键词混合检索
+- 多知识库合并重排与引用解释
+- 增量扫描和删除文件清理
+
+知识库细节以 [knowledge.md](knowledge.md) 为准，本文件只保留基础设施入口。
 
 ## Recall 记忆召回
 
 **位置**：`internal/recall/`  
-**文件**：`recall.go`
+**文件**：`engine.go`
 
-从历史对话中召回相关信息，增强 LLM 上下文。
+把知识库搜索结果转换为 Agent 可用上下文，负责查询分解、多库召回、去重和重排。
 
 ## Paths 路径解析
 
@@ -158,11 +200,19 @@ CLI 使用的 HTTP + SSE 客户端，与 pchat-server 通信。
 ## Server 进程管理
 
 **位置**：`internal/serverproc/`  
-**文件**：`serverproc.go`, `detach_windows.go`, `detach_unix.go`
+**文件**：`serverproc.go`, `ports.go`, `detach_windows.go`, `detach_unix.go`
 
-- `Start()` — 自动启动 pchat-server 子进程
+**共享身份模块**：`runtimeprofile/`（独立 Go 1.23 module，供根模块和 Wails GUI 子模块共同引用）
+
+- `Start()` — 自动启动 pchat-server 子进程；传递 profile/instance 身份并等待握手文件
 - `Stop()` — 关闭子进程
+- `Listen()` — server 直接绑定显式端口、端口范围或 `:0`，不经过 probe-close-rebind
+- profile ID 由规范化 data home 派生；不同 data home 可共存，同目录 GUI 共享单实例身份
+- `/api/v1/health` 与启动 announcement 必须同时匹配 profile ID、instance ID 和子进程 PID
 - 跨平台进程分离（Windows `DETACHED_PROCESS` / Unix `setsid`）
+
+当前实现契约以本节为准；设计背景、端口矩阵和验收记录见
+[`docs/plans/runtime-profile-coexistence.md`](../../docs/plans/runtime-profile-coexistence.md)。
 
 ## 路由约定
 

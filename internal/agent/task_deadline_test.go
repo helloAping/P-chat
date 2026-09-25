@@ -13,6 +13,7 @@ import (
 
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
 )
@@ -45,6 +46,11 @@ func TestChatWithTools_TaskContinuesPastTurnDeadlineOnAbortContext(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	turnCtx, turnCancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
+	defer turnCancel()
+	abortCtx, abortCancel := context.WithCancel(context.Background())
+	defer abortCancel()
+
 	registry := tool.NewRegistry()
 	var sawDeadline atomic.Bool
 	registry.Register(tool.Tool{
@@ -54,15 +60,21 @@ func TestChatWithTools_TaskContinuesPastTurnDeadlineOnAbortContext(t *testing.T)
 		if _, ok := ctx.Deadline(); ok {
 			sawDeadline.Store(true)
 		}
-		time.Sleep(150 * time.Millisecond)
+		// 取消父 turn ctx 发生在 task 已经开始之后；如果 task 没有切换到
+		// abortCtx，父回合会提前结束，后续 summary 请求不会发生。
+		// Cancel the parent turn after the task starts. Without detaching to
+		// abortCtx, the parent loop exits before it can request the final summary.
+		turnCancel()
+		time.Sleep(250 * time.Millisecond)
 		return &tool.CallResult{Content: "slow task result"}, nil
 	})
 
 	agt := New(cfg, llmClient, (*style.Manager)(nil), nil, registry)
-	turnCtx, turnCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer turnCancel()
-	abortCtx, abortCancel := context.WithCancel(context.Background())
-	defer abortCancel()
+	// 本测试只验证 task 的截止时间分离；注入空 Skill 目录以隔离用户级磁盘扫描耗时。
+	// This test covers task deadline detachment only; isolate user Skill catalog I/O.
+	agt.SetSkillManager(&recordingSkillManager{load: func(skill.LoadRequest) (skill.LoadedSkill, error) {
+		return skill.LoadedSkill{}, nil
+	}})
 
 	var got strings.Builder
 	for chunk := range agt.ChatWithTools(WithAbortContext(turnCtx, abortCtx), ChatRequest{
@@ -73,7 +85,7 @@ func TestChatWithTools_TaskContinuesPastTurnDeadlineOnAbortContext(t *testing.T)
 	}
 
 	if !strings.Contains(got.String(), "summary after task") {
-		t.Fatalf("final summary missing after slow task; got %q", got.String())
+		t.Fatalf("final summary missing after slow task; got %q, requests=%d, sawDeadline=%v", got.String(), requests.Load(), sawDeadline.Load())
 	}
 	if sawDeadline.Load() {
 		t.Fatal("task handler inherited the parent turn deadline")

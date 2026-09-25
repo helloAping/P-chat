@@ -62,6 +62,51 @@ func TestWikiLookup_DefaultPageSize(t *testing.T) {
 	}
 }
 
+func TestWikiLookup_ReportsStatsAndTruncationBudget(t *testing.T) {
+	dir := t.TempDir()
+	baseName := "test_lookup_stats"
+	store, err := knowledge.NewWikiStore(baseName, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		store.Close()
+		knowledge.CloseWikiStore()
+	})
+
+	nodes := []knowledge.IndexNode{
+		{ID: 1, ParentID: 0, Base: baseName, Level: 1, Title: baseName, Overview: "[Knowledge Base]"},
+		{ID: 2, ParentID: 1, Base: baseName, Level: 2, Source: "guide.md", Kind: "text", SortOrder: 0, Title: "guide.md", Overview: "alpha guide"},
+		{ID: 3, ParentID: 2, Base: baseName, Level: 3, Source: "guide.md", Kind: "text", SortOrder: 0, Title: "Alpha", Keywords: "alpha", Overview: strings.Repeat("概览", 400)},
+	}
+	contents := []knowledge.ContentNode{
+		{NodeID: 3, Content: strings.Repeat("正文", 500), ContentType: "text", SortOrder: 0},
+	}
+	if err := store.ReplaceBaseNodes(context.Background(), baseName, nodes, contents); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Knowledge: config.KnowledgeConfig{
+		Enabled: true,
+		Bases:   []config.KnowledgeBase{{Name: baseName, Path: dir, Enabled: true}},
+	}}
+	handler := makeWikiLookupHandler(cfg)
+	args, _ := json.Marshal(wikiLookupArgs{Query: "alpha", Expand: true, Page: 1, Size: 5})
+	res, err := handler(context.Background(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Content, "*检索统计:") {
+		t.Fatalf("missing search stats:\n%s", res.Content)
+	}
+	if !strings.Contains(res.Content, "truncated_overviews=1") {
+		t.Fatalf("missing overview truncation count:\n%s", res.Content)
+	}
+	if !strings.Contains(res.Content, "truncated_blocks=1") {
+		t.Fatalf("missing content truncation count:\n%s", res.Content)
+	}
+}
+
 func TestWikiLookup_KnowledgeDisabled(t *testing.T) {
 	cfg, cleanup := setupKnowledgeTest(t, "test_disabled")
 	defer cleanup()
@@ -97,6 +142,38 @@ func TestWikiList_DisabledKnowledge(t *testing.T) {
 	res, _ := handler(context.Background(), args)
 	if !res.IsError {
 		t.Error("disabled knowledge should return error for wiki_list")
+	}
+}
+
+func TestWikiList_UsesBaseToAvoidNodeIDCollision(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	seedWikiListBase(t, "test_list_a", dirA, "alpha.md")
+	seedWikiListBase(t, "test_list_b", dirB, "beta.md")
+	defer knowledge.CloseWikiStore()
+
+	cfg := &config.Config{Knowledge: config.KnowledgeConfig{
+		Enabled: true,
+		Bases: []config.KnowledgeBase{
+			{Name: "test_list_a", Path: dirA, Enabled: true},
+			{Name: "test_list_b", Path: dirB, Enabled: true},
+		},
+	}}
+	handler := makeWikiListHandler(cfg)
+
+	args, _ := json.Marshal(wikiListArgs{ParentID: 1, Base: "test_list_b"})
+	res, err := handler(context.Background(), args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("wiki_list returned error: %s", res.Content)
+	}
+	if !strings.Contains(res.Content, "beta.md") || !strings.Contains(res.Content, "base=test_list_b") {
+		t.Fatalf("expected test_list_b result, got:\n%s", res.Content)
+	}
+	if strings.Contains(res.Content, "alpha.md") {
+		t.Fatalf("wiki_list should not merge another base when base is set:\n%s", res.Content)
 	}
 }
 
@@ -141,5 +218,22 @@ func TestResolveBases_Specific(t *testing.T) {
 	result = resolveBases(kc, "a")
 	if len(result) != 1 || !result[0].Enabled {
 		t.Errorf("want enabled 'a', got %v", result)
+	}
+}
+
+func seedWikiListBase(t *testing.T, baseName, dir, fileTitle string) {
+	t.Helper()
+	store, err := knowledge.NewWikiStore(baseName, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	nodes := []knowledge.IndexNode{
+		{ID: 1, ParentID: 0, Base: baseName, Level: 1, Title: baseName, Overview: "[Knowledge Base]"},
+		{ID: 2, ParentID: 1, Base: baseName, Level: 2, Source: fileTitle, Kind: "text", SortOrder: 0, Title: fileTitle, Overview: fileTitle + " (1 chapters)"},
+	}
+	if err := store.ReplaceBaseNodes(context.Background(), baseName, nodes, nil); err != nil {
+		t.Fatal(err)
 	}
 }

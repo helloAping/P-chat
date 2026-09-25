@@ -17,7 +17,6 @@ import (
 )
 
 const (
-	trayWindowClass       = "PChatTrayWindow"
 	trayUID               = 1
 	trayCallbackMsg       = 0x0400 + 121
 	trayShowMainWindowMsg = 0x0400 + 122
@@ -44,6 +43,7 @@ const (
 	nifIcon    = 0x00000002
 	nifTip     = 0x00000004
 
+	rtGroupIcon    = 14
 	imageIcon      = 1
 	lrLoadFromFile = 0x00000010
 	lrDefaultSize  = 0x00000040
@@ -58,33 +58,34 @@ const (
 )
 
 var (
-	kernel32              = windows.NewLazySystemDLL("kernel32.dll")
-	user32                = windows.NewLazySystemDLL("user32.dll")
-	shell32               = windows.NewLazySystemDLL("shell32.dll")
-	procGetModuleHandleW  = kernel32.NewProc("GetModuleHandleW")
-	procRegisterClassExW  = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW   = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW    = user32.NewProc("DefWindowProcW")
-	procDestroyWindow     = user32.NewProc("DestroyWindow")
-	procPostQuitMessage   = user32.NewProc("PostQuitMessage")
-	procGetMessageW       = user32.NewProc("GetMessageW")
-	procTranslateMessage  = user32.NewProc("TranslateMessage")
-	procDispatchMessageW  = user32.NewProc("DispatchMessageW")
-	procPostMessageW      = user32.NewProc("PostMessageW")
-	procLoadImageW        = user32.NewProc("LoadImageW")
-	procLoadIconW         = user32.NewProc("LoadIconW")
-	procDestroyIcon       = user32.NewProc("DestroyIcon")
-	procCreatePopupMenu   = user32.NewProc("CreatePopupMenu")
-	procDestroyMenu       = user32.NewProc("DestroyMenu")
-	procAppendMenuW       = user32.NewProc("AppendMenuW")
-	procTrackPopupMenu    = user32.NewProc("TrackPopupMenu")
-	procGetCursorPos      = user32.NewProc("GetCursorPos")
-	procSetForegroundWnd  = user32.NewProc("SetForegroundWindow")
-	procShellNotifyIconW  = shell32.NewProc("Shell_NotifyIconW")
-	trayWndProc           = syscall.NewCallback(trayWindowProc)
-	trayWindowsMu         sync.Mutex
-	trayWindows           = map[windows.Handle]*trayHandle{}
-	trayClassRegisterOnce sync.Once
+	kernel32               = windows.NewLazySystemDLL("kernel32.dll")
+	user32                 = windows.NewLazySystemDLL("user32.dll")
+	shell32                = windows.NewLazySystemDLL("shell32.dll")
+	procGetModuleHandleW   = kernel32.NewProc("GetModuleHandleW")
+	procEnumResourceNamesW = kernel32.NewProc("EnumResourceNamesW")
+	procRegisterClassExW   = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW    = user32.NewProc("CreateWindowExW")
+	procDefWindowProcW     = user32.NewProc("DefWindowProcW")
+	procDestroyWindow      = user32.NewProc("DestroyWindow")
+	procPostQuitMessage    = user32.NewProc("PostQuitMessage")
+	procGetMessageW        = user32.NewProc("GetMessageW")
+	procTranslateMessage   = user32.NewProc("TranslateMessage")
+	procDispatchMessageW   = user32.NewProc("DispatchMessageW")
+	procPostMessageW       = user32.NewProc("PostMessageW")
+	procLoadImageW         = user32.NewProc("LoadImageW")
+	procLoadIconW          = user32.NewProc("LoadIconW")
+	procDestroyIcon        = user32.NewProc("DestroyIcon")
+	procCreatePopupMenu    = user32.NewProc("CreatePopupMenu")
+	procDestroyMenu        = user32.NewProc("DestroyMenu")
+	procAppendMenuW        = user32.NewProc("AppendMenuW")
+	procTrackPopupMenu     = user32.NewProc("TrackPopupMenu")
+	procGetCursorPos       = user32.NewProc("GetCursorPos")
+	procSetForegroundWnd   = user32.NewProc("SetForegroundWindow")
+	procShellNotifyIconW   = shell32.NewProc("Shell_NotifyIconW")
+	trayWndProc            = syscall.NewCallback(trayWindowProc)
+	trayWindowsMu          sync.Mutex
+	trayWindows            = map[windows.Handle]*trayHandle{}
+	trayClassRegisterOnce  sync.Once
 )
 
 type trayHandle struct {
@@ -175,7 +176,7 @@ func (t *trayHandle) run() {
 	defer runtime.UnlockOSThread()
 
 	instance := getModuleHandle()
-	className, _ := windows.UTF16PtrFromString(trayWindowClass)
+	className, _ := windows.UTF16PtrFromString(trayWindowClassName())
 	trayClassRegisterOnce.Do(func() {
 		wc := wndClassEx{
 			Size:      uint32(unsafe.Sizeof(wndClassEx{})),
@@ -261,7 +262,7 @@ func (t *trayHandle) notifyData() notifyIconData {
 		UCallbackMessage: trayCallbackMsg,
 		HIcon:            t.hicon,
 	}
-	copyUTF16(nid.SzTip[:], "P-Chat")
+	copyUTF16(nid.SzTip[:], applicationTitle())
 	return nid
 }
 
@@ -460,7 +461,36 @@ func getModuleHandle() windows.Handle {
 }
 
 func loadIconFromResource(instance windows.Handle) windows.Handle {
-	h, _, _ := procLoadImageW.Call(uintptr(instance), 1, imageIcon, 0, 0, lrDefaultSize)
+	for _, id := range preferredTrayIconResourceIDs() {
+		if h := loadIconResource(instance, id); h != 0 {
+			return h
+		}
+	}
+
+	var found windows.Handle
+	cb := syscall.NewCallback(func(_ uintptr, _ uintptr, name uintptr, _ uintptr) uintptr {
+		if found != 0 {
+			return 0
+		}
+		if h := loadIconResource(instance, name); h != 0 {
+			found = h
+			return 0
+		}
+		return 1
+	})
+	procEnumResourceNamesW.Call(uintptr(instance), uintptr(rtGroupIcon), cb, 0)
+	return found
+}
+
+func preferredTrayIconResourceIDs() []uintptr {
+	return []uintptr{
+		1, // Common go-winres / windres default.
+		3, // Wails v2 generated icon group in current Windows builds.
+	}
+}
+
+func loadIconResource(instance windows.Handle, name uintptr) windows.Handle {
+	h, _, _ := procLoadImageW.Call(uintptr(instance), name, imageIcon, 0, 0, lrDefaultSize)
 	return windows.Handle(h)
 }
 

@@ -13,6 +13,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -21,11 +23,15 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
+	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
 	"github.com/p-chat/pchat/internal/tool"
+	"github.com/p-chat/pchat/internal/version"
 )
+
+const maxKBIndexPromptRunes = 2000
 
 func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolDefs []llm.ToolDef, availableTools []tool.Tool, projectRoot string, kbEnabled bool) (string, string, error) {
 	// 2026-07: if the session's projectRoot has changed
@@ -37,6 +43,14 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 	// sig-comparison below always finds a miss and rebuilds
 	// the prompt with the new project's skills + rules.
 	a.ReloadWithRootIfChanged(projectRoot)
+	manager := a.skillManager
+	if manager == nil {
+		manager = skill.NewManager()
+	}
+	skillCatalog, err := manager.Catalog(context.Background(), skill.CatalogQuery{ProjectRoot: projectRoot})
+	if err != nil {
+		return "", "", fmt.Errorf("discover Skills: %w", err)
+	}
 	toolNames := make([]string, 0, len(toolDefs))
 	for _, t := range toolDefs {
 		toolNames = append(toolNames, t.Name)
@@ -58,7 +72,7 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 		string(wm),
 		agentsSignatureWithRoot(projectRoot),
 		rulesSignature(a.rules),
-		skillSignature(a.skills),
+		skillCatalogSignature(skillCatalog),
 		strings.Join(toolNames, ","),
 		lang,
 		projectRoot,
@@ -74,6 +88,10 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 	// a flat list so the order and the byte-exact output are
 	// easy to verify.
 	var sb strings.Builder
+	sb.WriteString(runtimeContextPolicy)
+	// 通用规则先于风格和项目内容，扩大跨会话可复用的前缀。
+	// Put shared policies before style and project content to extend reusable prefixes.
+	sb.WriteString(buildToolHintBlock(availableTools, kbEnabled))
 	styleBlock, err := a.buildStyleBlock(s)
 	if err != nil {
 		return "", sig, err
@@ -82,15 +100,24 @@ func (a *Agent) buildStaticSystemPrompt(s style.Style, wm config.WorkMode, toolD
 	sb.WriteString(buildWorkModeBlock(wm))
 	sb.WriteString(agents.LoadAllWithRoot(projectRoot) + "\n---\n\n")
 	sb.WriteString(rules.BuildRulesContext(a.rules) + "\n---\n\n")
-	sb.WriteString(skill.BuildSkillContext(a.skills) + "\n---\n\n")
-	sb.WriteString(buildToolHintBlock(availableTools, kbEnabled))
+	sb.WriteString(skill.BuildCatalogContext(skillCatalog, 8*1024) + "\n---\n\n")
 	sb.WriteString(buildWorkingDirBlock(projectRoot))
+	sb.WriteString(buildHostRuntimeBlock(projectRoot))
 	sb.WriteString(buildLanguageBlock(lang))
 
 	prompt := sb.String()
 	a.staticPrompt = prompt
 	a.staticPromptID = sig
 	return prompt, sig, nil
+}
+
+func skillCatalogSignature(catalog skill.Catalog) string {
+	parts := make([]string, 0, len(catalog.Skills))
+	for _, item := range catalog.Skills {
+		stat, _ := os.Stat(item.Path)
+		parts = append(parts, item.Name+":"+string(item.Scope)+":"+fileSig(stat))
+	}
+	return strings.Join(parts, ",")
 }
 
 // buildStyleBlock returns section 1 (style identity + soul) plus
@@ -162,12 +189,12 @@ func buildToolHintBlock(availableTools []tool.Tool, kbEnabled bool) string {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString(buildToolHint(availableTools))
-	sb.WriteString(buildToolSpecificHints(availableTools, kbEnabled))
-	sb.WriteString(buildAvailableToolsSection(availableTools))
 	sb.WriteString(buildPlatformSection())
 	sb.WriteString(buildConversationContinuitySection())
 	sb.WriteString(buildAttachmentsSection())
+	sb.WriteString(buildToolHint(availableTools))
+	sb.WriteString(buildToolSpecificHints(availableTools, kbEnabled))
+	sb.WriteString(buildAvailableToolsSection(availableTools))
 	return sb.String()
 }
 
@@ -200,7 +227,7 @@ func buildToolSpecificHints(availableTools []tool.Tool, kbEnabled bool) string {
 			"- `wiki_lookup(query=\"\")` — 查询为空时，返回知识库中所有文件目录（L2 列表），按关联度排序。默认每页 20 条，可用 page 翻页。\n" +
 			"- `wiki_lookup(query=\"关键词\")` — 按关键词、标题或概览搜索条目，返回匹配的 L3 章节节点及其所属文件（L2 父节点）。\n" +
 			"- `wiki_lookup(query=\"...\", expand=true)` — 同时返回匹配条目的完整正文内容。\n" +
-			"- `wiki_list(parent_id=N)` — 列出父节点 N 下的所有子节点。L1（id=1）列出所有文件；L2 节点列出该文件所有章节。\n" +
+			"- `wiki_list(parent_id=N, base=\"来源库\")` — 列出父节点 N 下的所有子节点。L1（id=1）列出所有文件；L2 节点列出该文件所有章节。从 `wiki_lookup` 结果继续展开时必须传结果里的 base，避免多知识库下 node id 冲突。\n" +
 			"\n**标准流程：**\n" +
 			"1. 先看系统提示中的一级索引概览，找到可能相关的文件（L2）。\n" +
 			"2. 用 wiki_lookup 搜索关键词或浏览目录定位目标文件/章节。\n" +
@@ -370,9 +397,7 @@ func buildConversationContinuitySection() string {
 	sb.WriteString("- `browser_*` connection error (\"connection closed\", \"browser extension has disconnected\") → ")
 	sb.WriteString("the extension may reconnect. Retry once; if it fails again, tell the user the browser extension disconnected ")
 	sb.WriteString("and ask whether to wait, re-establish the connection, or continue without browser tools\n")
-	sb.WriteString("- `browser_screenshot` captures the viewport and the picture is automatically delivered as a " +
-		"follow-up image message so you can see it directly (requires vision). Text-only models do NOT get " +
-		"browser_screenshot in their tool list — use `browser_extract` to read the rendered page text instead\n")
+	sb.WriteString("- `browser_screenshot` captures the viewport. Vision-capable models receive it as a follow-up image; when session image recognition is enabled, the screenshot is recognized first and returned as factual text. If `browser_screenshot` is absent, use `browser_extract` to read rendered page text instead\n")
 	sb.WriteString("- `browser_snapshot` returns too few elements (e.g. SPA page where content is dynamic divs, not interactive elements) → ")
 	sb.WriteString("use `browser_extract` to get all visible rendered text content\n")
 	sb.WriteString("- Reading page content on a SPA / JavaScript-heavy site → ")
@@ -429,6 +454,27 @@ func buildWorkingDirBlock(projectRoot string) string {
 		"paths against this directory.\n", projectRoot)
 }
 
+// buildHostRuntimeBlock 明确 P-Chat 的 Skill 所有权与安装目录，使模型能正确验证第三方 CLI 安装。
+// buildHostRuntimeBlock makes Skill ownership and install paths explicit for third-party verification.
+func buildHostRuntimeBlock(projectRoot string) string {
+	home, _ := os.UserHomeDir()
+	standardGlobal := filepath.Join(home, ".agents", "skills")
+	var builder strings.Builder
+	builder.WriteString("\n\n---\n\n## Host Runtime\n\n")
+	fmt.Fprintf(&builder, "Host: P-Chat %s\n", version.String())
+	fmt.Fprintf(&builder, "P-Chat data root: `%s`\n", paths.GlobalDir())
+	fmt.Fprintf(&builder, "Managed global Skills: `%s`\n", paths.GlobalSkillsDir())
+	fmt.Fprintf(&builder, "Standard user Skills (auto-discovered): `%s`\n", standardGlobal)
+	if projectRoot != "" {
+		fmt.Fprintf(&builder, "Managed project Skills: `%s`\n", paths.ProjectSkillsDirWithRoot(projectRoot))
+		fmt.Fprintf(&builder, "Standard project Skills (auto-discovered): `%s`\n", filepath.Join(projectRoot, ".agents", "skills"))
+	}
+	builder.WriteString("Use `skill_manage` for managed imports/removals and `skill` for list/load/read_resource/doctor. ")
+	builder.WriteString("When an external CLI or tool provides Skills, first let it export complete Skill packages into a standard `.agents/skills` directory; otherwise import its exported package or collection directory with `skill_manage` action `import` and `source_path`. Omit `name` to import the whole collection, or provide a name to import that Skill with dependencies declared inside the same collection. ")
+	builder.WriteString("Installing an external executable is not proof that its Skills are available: report success only after `skill` action `doctor` or `list` sees the expected Skill and its dependencies.\n")
+	return builder.String()
+}
+
 // buildLanguageBlock returns section 7 (output language hint)
 // or "" if `lang` is unrecognized. The default ("auto" or "")
 // follows the opencode rule of "Respond in the same language as
@@ -458,17 +504,14 @@ func buildLanguageBlock(lang string) string {
 // PromptOv) stays in lock-step with the main-agent wording — any
 // drift between the two will confuse the LLM.
 func appendWorkingDirectoryBlock(projectRoot string) string {
-	return fmt.Sprintf("\n\n---\n\n## Working Directory\n\n"+
-		"Your working directory is fixed at `%s`. exec_command runs here automatically "+
-		"(the work_dir argument is ignored). read_file and write_file resolve relative "+
-		"paths against this directory.\n", projectRoot)
+	return buildWorkingDirBlock(projectRoot)
 }
 
 // buildKBIndex builds the Knowledge Base section of the system prompt.
 // When KBBase is "__all__", all enabled bases are listed. When it's a
 // specific name, only that base's index is shown. If the base has no
-// sections, a placeholder is returned. The output is truncated at 3000
-// characters to avoid prompt explosion. Results are cached for 60s to
+// sections, a placeholder is returned. The output is truncated at 2000
+// characters to avoid prompt explosion. Results are cached for 30s to
 // avoid repeated full-DB scans per message turn.
 // Uses the L1 overview from the three-level index tree.
 func (a *Agent) buildKBIndex(kbBase string) string {
@@ -523,10 +566,18 @@ func (a *Agent) buildKBIndex(kbBase string) string {
 		return result
 	}
 
-	// Append tool usage footer.
-	sb.WriteString("\n\n使用 wiki_lookup(query, page, size) 检索，默认 20 条/页。")
-	sb.WriteString("query=空 浏览目录；query=关键词 搜索匹配；expand=true 获取全文。")
-	result := sb.String()
+	footer := "\n\n使用 wiki_lookup(query, base, page, size) 检索，默认 20 条/页。" +
+		"query=空 浏览目录；query=关键词 搜索匹配；expand=true 获取全文；继续展开节点时用 wiki_list(parent_id, base)。"
+	result := sb.String() + footer
+	if len([]rune(result)) > maxKBIndexPromptRunes {
+		notice := "\n\n[Knowledge Base index truncated; use wiki_lookup/wiki_list for details.]"
+		bodyBudget := maxKBIndexPromptRunes - len([]rune(notice)) - len([]rune(footer))
+		body, _ := knowledge.TruncateTextWithFlag(sb.String(), bodyBudget)
+		result = body + notice + footer
+		if len([]rune(result)) > maxKBIndexPromptRunes {
+			result, _ = knowledge.TruncateTextWithFlag(result, maxKBIndexPromptRunes)
+		}
+	}
 	a.kbIndexCache = result
 	a.kbIndexCacheKey = kbBase
 	a.kbIndexCacheTime = nowUnix

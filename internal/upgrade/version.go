@@ -46,7 +46,42 @@ const (
 	// and Normalize() handles missing values, so no data migration is required.
 	V6 AppVersion = 6
 
+	// V7 — per-session sub-agent model metadata added. JSON fields are
+	// backward compatible, so no data migration is required.
+	V7 AppVersion = 7
+
+	// V8 — durable per-session turn queue table for messages sent while
+	// a conversation is already streaming.
+	V8 AppVersion = 8
+
+	// V9 — model and session media capabilities plus independent
+	// image/video/audio recognition routes.
+	V9 AppVersion = 9
+
+	// V10 — provider models gain an explicit llm/media_generation type and
+	// application-level defaults for canonical media generation operations.
+	V10 AppVersion = 10
+
+	// V11 — media generation models gain one shared API configuration;
+	// operations now declare capabilities instead of duplicating endpoints.
+	V11 AppVersion = 11
+
+	// V12 — providers keep one Base URL while each LLM or media model stores
+	// editable endpoint suffixes; vendor presets are no longer configured.
+	V12 AppVersion = 12
+
+	// V13 — 供应商可持久化经过校验的自定义请求头模板，并按请求展开动态变量。
+	// V13 — providers can persist validated custom request-header templates with
+	// per-request conversation, message, UUID, and Snowflake variables.
+	V13 AppVersion = 13
+
+	// V14 — media recognition and generation calls persist reusable context rows.
+	V14 AppVersion = 14
+
+	// V15 — providers persist provider_id / strategy_variant for strategy presets.
+	V15 AppVersion = 15
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V6
+	Current AppVersion = V15
 )

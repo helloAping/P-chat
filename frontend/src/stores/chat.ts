@@ -7,7 +7,8 @@ import * as api from '../api/client'
 import { notifyManager } from '../utils/notify'
 import { dedupMessagesByKey } from '../utils/messageDedup'
 import { insertAsyncSubAgentAfterTaskTools } from '../utils/subAgentOrder'
-import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem } from '../api/client'
+import { dataURLToBlobURL } from '../utils/mediaPreview'
+import type { Message, Session, UploadMeta, MessageAttachment, MessagePart, SubAgentPart, ToolPart, TodoItem, ProjectItem, QuestionItem, TurnQueueItem, TurnQueuePayload } from '../api/client'
 import { isCurrentStream } from './streamLifecycle'
 import {
   buildInterruptNotice,
@@ -37,6 +38,18 @@ export interface PendingAttachment {
   // MessageBubble renders directly and the backend can pass
   // straight through to the LLM.
   _dataURL?: string
+  // One preparation task owns both local reading and server upload.
+  // The send path awaits this task instead of uploading the file again.
+  _ready?: Promise<void>
+  // Rollback-restored attachments are tagged so undo can remove only the
+  // injected files while preserving anything the user added afterwards.
+  // 撤销撤回时只清理自动回填的附件，不误删用户后来新增的附件。
+  _rollbackSource?: string
+}
+
+type RollbackDraft = {
+  source: string
+  text: string
 }
 
 type SessionPermissionLevel = 'ask' | 'auto' | 'full'
@@ -48,6 +61,7 @@ type SessionMetaState = {
   model: string
   title: string
   plan_mode?: boolean
+  turn_mode_policy?: api.TurnModePolicy
   permission_level?: string
   reasoning_effort?: string
   vector_store?: string
@@ -55,6 +69,11 @@ type SessionMetaState = {
   auto_continue?: boolean
   todo_long_run_mode?: TodoLongRunMode
   use_image_recognition?: boolean
+  enabled_recognition_capabilities?: api.MediaKind[]
+  enabled_generation_operations?: api.GenerationOperation[]
+  sub_agent_model_enabled?: boolean
+  sub_agent_provider?: string
+  sub_agent_model?: string
 }
 
 const LAST_PROJECT_KEY = 'pchat:last-project-path'
@@ -118,6 +137,9 @@ if (typeof window !== 'undefined') {
   }
 }
 
+/** Which composer dock is currently expanded (todo | subagent | queue). */
+export type ComposerExpandedDock = 'todo' | 'subagent' | 'queue' | null
+
 export const state = reactive({
   sessions: [] as Session[],
   currentID: '' as string,
@@ -161,8 +183,21 @@ export const state = reactive({
   lastPermissionLevel: 'ask' as SessionPermissionLevel,
   globalWorkMode: 'coding' as string,
   visionRecognitionEnabled: false,
+  recognitionCapabilitiesAvailable: [] as api.MediaKind[],
   kbConfigVersion: 0, // bumped by settings modal after config changes, watched by InputArea
+  generationConfigVersion: 0, // invalidates the session generation capability matrix after app-setting changes
   sessionTodos: {} as Record<string, TodoItem[]>,
+  // turnQueue 保存当前会话尚未执行的用户消息。
+  // turnQueue stores pending user turns that should run FIFO after streaming ends.
+  turnQueue: {} as Record<string, TurnQueueItem[]>,
+  turnQueueLoading: {} as Record<string, boolean>,
+  turnQueueDraining: {} as Record<string, boolean>,
+  turnQueueEditing: {} as Record<string, boolean>,
+  // Composer dock mutual-exclusion: only one of todo / subagent /
+  // turn-queue may be expanded above the input at a time.
+  // Question dock is outside this set (always takes priority).
+  // 输入区上方 Todo / 子代理 / 排队 互斥展开；Question 不参与互斥但优先让路。
+  composerExpandedDock: null as ComposerExpandedDock,
   // sessionWorking is the per-session "is the LLM mid-turn"
   // flag, derived from the `session_status` SSE event. The
   // TodoPanel state machine reads this to decide whether
@@ -184,18 +219,19 @@ export const state = reactive({
   // flag had to go.
   pendingQuestion: {} as Record<string, { questions: QuestionItem[] }>,
   pendingConfirm: {} as Record<string, Array<{
-  toolName: string
-  args: string
-  reason: string
-  // 2026-07: extended ConfirmRequest fields. All optional
-  // for backward-compat with old server versions that
-  // don't emit them.
-  resolvedPath?: string
-  pathClass?: string
-  riskLevel?: string
-  resolve: (action: api.ConfirmAction) => void
-}>>,
+    toolName: string
+    args: string
+    reason: string
+    // 2026-07: extended ConfirmRequest fields. All optional
+    // for backward-compat with old server versions that
+    // don't emit them.
+    resolvedPath?: string
+    pathClass?: string
+    riskLevel?: string
+    resolve: (action: api.ConfirmAction) => void
+  }>>,
   pendingPlanText: {} as Record<string, string>,
+  turnPlanReview: {} as Record<string, boolean>,
   lightbox: { show: false, src: '', alt: '', kind: 'image' as 'image' | 'video' },
   showSettings: false,
   projects: [] as ProjectItem[],
@@ -209,9 +245,21 @@ export const state = reactive({
   // when the user switches sessions.
   currentTraceId: '' as string,
   // Rollback undo buffer — only the most recent rollback per session.
-  rollbackUndo: {} as Record<string, { messages: Message[]; fromIndex: number } | null>,
+  rollbackUndo: {} as Record<string, {
+    // Raw wire rows go back to the existing undo endpoint.
+    messages: Message[]
+    // The already-normalized GUI rows restore the exact pre-rollback layout.
+    displayMessages: Message[]
+    fromIndex: number
+  } | null>,
   // Pending text to fill into the input area after a rollback.
   pendingInput: {} as Record<string, string>,
+  // Monotonic per-session signal: unlike the text value itself, this changes
+  // even when two consecutive rollbacks restore the same (or empty) caption.
+  pendingInputRevision: {} as Record<string, number>,
+  // Identifies the draft injected by rollback. InputArea uses the text
+  // snapshot to avoid clearing user edits when "undo rollback" is clicked.
+  rollbackDraft: {} as Record<string, RollbackDraft | null>,
   // P0-1: transient banner shown for ~3s when the
   // recoverMissingParts flow successfully merged
   // server-side parts into the trailing assistant
@@ -233,11 +281,11 @@ export const state = reactive({
   // 未送达消息…") while this is true so the user knows
   // the system is doing work, not hanging.
   isRecovering: {} as Record<string, boolean>,
-  // P2-3: context usage snapshot for the TopBar badge. When
+  // P2-3: context usage snapshot for the Inspector context card. When
   // non-null it holds the cached payload + loading/error state
   // for the current session's context utilisation estimate.
-  // `refreshContextUsage` updates it silently; the badge reads
-  // `.data` (and hides on a failed fetch).
+  // `refreshContextUsage` updates it silently; the card reads
+  // `.data` and falls back to an empty state on failed fetches.
   contextInspector: null as null | {
     loading: boolean
     error: string | null
@@ -283,6 +331,22 @@ export const currentTodos = computed(() =>
   state.sessionTodos[state.currentID] || [],
 )
 
+export const currentTurnQueue = computed(() =>
+  (state.turnQueue[state.currentID] || []).filter(item =>
+    item.status === 'queued' || item.status === 'failed',
+  ),
+)
+
+/** Expand a dock (or pass null to collapse all). Mutual-exclusive. */
+export function setComposerExpandedDock(dock: ComposerExpandedDock) {
+  state.composerExpandedDock = dock
+}
+
+/** Toggle a dock: same dock collapses, another dock takes the slot. */
+export function toggleComposerExpandedDock(dock: Exclude<ComposerExpandedDock, null>) {
+  state.composerExpandedDock = state.composerExpandedDock === dock ? null : dock
+}
+
 function normalizePermissionLevel(level: string | undefined): SessionPermissionLevel {
   if (level === 'auto' || level === 'full') return level
   return 'ask'
@@ -298,15 +362,19 @@ export const currentRecoveryBanner = computed(() => {
   return b
 })
 
-// currentSessionWorking — true while the LLM is mid-turn
-// for the current session. The TodoPanel state machine
-// combines this with currentTodos to decide whether to
-// show, hide, or clear the dock.
-export const currentSessionWorking = computed(() =>
-  !!state.sessionWorking[state.currentID] ||
-  (state.sessionBackgroundSubAgentJobs[state.currentID] || 0) > 0 ||
-  !!state.sessionBackgroundHookMerging[state.currentID],
-)
+export function isSessionWorking(id: string): boolean {
+  if (!id) return false
+  return !!state.sessionWorking[id] ||
+    (state.sessionBackgroundSubAgentJobs[id] || 0) > 0 ||
+    !!state.sessionBackgroundHookMerging[id] ||
+    !!state.isRecovering[id]
+}
+
+// currentSessionWorking — true while the current session
+// is still producing or merging turn output. The TodoPanel
+// and input queue both use this single gate so queued
+// messages only run after the whole visible turn settles.
+export const currentSessionWorking = computed(() => isSessionWorking(state.currentID))
 
 export function setSessionBackgroundSubAgentJobs(id: string, count: number) {
   if (!id) return
@@ -315,6 +383,107 @@ export function setSessionBackgroundSubAgentJobs(id: string, count: number) {
   } else {
     delete state.sessionBackgroundSubAgentJobs[id]
   }
+}
+
+function sortTurnQueueItems(items: TurnQueueItem[]): TurnQueueItem[] {
+  return [...items].sort((a, b) => a.id - b.id)
+}
+
+function upsertTurnQueueItem(sessionId: string, item: TurnQueueItem) {
+  if (!sessionId) return
+  const list = state.turnQueue[sessionId] || []
+  const next = list.filter(existing => existing.id !== item.id)
+  if (item.status !== 'done' && item.status !== 'cancelled') {
+    next.push(item)
+  }
+  state.turnQueue[sessionId] = sortTurnQueueItems(next)
+  setSessionPendingTurnCount(sessionId, state.turnQueue[sessionId].length)
+}
+
+export function hasQueuedTurns(sessionId: string): boolean {
+  return (state.turnQueue[sessionId] || []).some(item => item.status === 'queued')
+}
+
+export function hasBlockingTurnQueueFailure(sessionId: string): boolean {
+  return (state.turnQueue[sessionId] || []).some(item => item.status === 'failed')
+}
+
+export function setTurnQueueDraining(sessionId: string, draining: boolean) {
+  if (!sessionId) return
+  if (draining) state.turnQueueDraining[sessionId] = true
+  else delete state.turnQueueDraining[sessionId]
+}
+
+export function setTurnQueueEditing(sessionId: string, editing: boolean) {
+  if (!sessionId) return
+  if (editing) state.turnQueueEditing[sessionId] = true
+  else delete state.turnQueueEditing[sessionId]
+}
+
+export async function loadTurnQueue(sessionId: string): Promise<TurnQueueItem[]> {
+  if (!sessionId) return []
+  state.turnQueueLoading[sessionId] = true
+  try {
+    const response = await api.listTurnQueue(sessionId)
+    const items = sortTurnQueueItems(response.items || [])
+    state.turnQueue[sessionId] = items
+    setSessionPendingTurnCount(sessionId, items.length)
+    return items
+  } catch (e) {
+    console.warn('loadTurnQueue failed:', e)
+    return state.turnQueue[sessionId] || []
+  } finally {
+    delete state.turnQueueLoading[sessionId]
+  }
+}
+
+export async function enqueueTurnQueue(sessionId: string, payload: TurnQueuePayload): Promise<TurnQueueItem> {
+  const response = await api.enqueueTurnQueueItem(sessionId, payload)
+  upsertTurnQueueItem(sessionId, response.item)
+  markSessionActive(sessionId, 'pending')
+  return response.item
+}
+
+export async function claimNextQueuedTurn(sessionId: string): Promise<TurnQueueItem | null> {
+  try {
+    const response = await api.claimNextTurnQueueItem(sessionId)
+    upsertTurnQueueItem(sessionId, response.item)
+    return response.item
+  } catch (e: any) {
+    if (String(e?.message || e).includes('HTTP 404')) return null
+    throw e
+  }
+}
+
+export async function completeQueuedTurn(sessionId: string, queueId: number): Promise<void> {
+  const response = await api.completeTurnQueueItem(sessionId, queueId)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function failQueuedTurn(sessionId: string, queueId: number, error: string): Promise<void> {
+  const response = await api.failTurnQueueItem(sessionId, queueId, error)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function retryQueuedTurn(sessionId: string, queueId: number): Promise<void> {
+  const response = await api.retryTurnQueueItem(sessionId, queueId)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function editQueuedTurn(sessionId: string, queueId: number, message: string): Promise<void> {
+  const response = await api.editTurnQueueItem(sessionId, queueId, message)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function deleteQueuedTurn(sessionId: string, queueId: number): Promise<void> {
+  const response = await api.deleteTurnQueueItem(sessionId, queueId)
+  upsertTurnQueueItem(sessionId, response.item)
+}
+
+export async function clearQueuedTurns(sessionId: string): Promise<void> {
+  await api.clearTurnQueue(sessionId)
+  state.turnQueue[sessionId] = (state.turnQueue[sessionId] || []).filter(item => item.status === 'running')
+  setSessionPendingTurnCount(sessionId, state.turnQueue[sessionId].length)
 }
 
 export function setSessionBackgroundHookMerging(id: string, merging: boolean) {
@@ -366,6 +535,7 @@ export const currentMeta = computed(() => {
     model: def?.model || '',
     title: '',
     plan_mode: false,
+    turn_mode_policy: 'auto' as api.TurnModePolicy,
     permission_level: state.lastPermissionLevel || 'ask',
     reasoning_effort: 'off',
     vector_store: '',
@@ -373,6 +543,11 @@ export const currentMeta = computed(() => {
     auto_continue: true,
     todo_long_run_mode: 'adaptive' as TodoLongRunMode,
     use_image_recognition: false,
+    enabled_recognition_capabilities: [],
+    enabled_generation_operations: [],
+    sub_agent_model_enabled: false,
+    sub_agent_provider: '',
+    sub_agent_model: '',
   }
 })
 
@@ -441,6 +616,129 @@ let _loadedSeq = 0
 // the user can still scroll older pages back in via the infinite
 // scroller.
 const MAX_MESSAGES_PER_SESSION = 300
+
+function normalizeProjectPath(path: string): string {
+  const trimmed = path.trim().replace(/[\\/]+$/, '')
+  if (!trimmed) return ''
+  const normalized = trimmed.replace(/\//g, '\\')
+  if (/^[a-zA-Z]:\\/.test(normalized) || normalized.startsWith('\\\\')) {
+    return normalized.toLowerCase()
+  }
+  return normalized
+}
+
+function isBlankSessionRecord(session: Session): boolean {
+  return session.conversation_state === 'blank'
+    && !session.id.startsWith('im:')
+    && !session.has_user_messages
+    && (session.user_message_count || 0) === 0
+    && (session.pending_turn_count || 0) === 0
+}
+
+function isAutoTitlePlaceholder(title: string): boolean {
+  const value = title.trim()
+  return value === ''
+    || value === '(新会话)'
+    || value === '新会话'
+    || value === '(无标题)'
+    || value === '无标题'
+}
+
+function collapseBlankSessions(sessions: Session[]): Session[] {
+  const seenBlankProjects = new Set<string>()
+  const out: Session[] = []
+  for (const session of sessions) {
+    if (isBlankSessionRecord(session)) {
+      const key = normalizeProjectPath(session.project_path || '')
+      if (seenBlankProjects.has(key)) continue
+      seenBlankProjects.add(key)
+    }
+    out.push(session)
+  }
+  return out
+}
+
+function forEachSessionRecord(id: string, visit: (session: Session) => void) {
+  const seen = new Set<Session>()
+  for (const session of state.sessions) {
+    if (session.id === id && !seen.has(session)) {
+      seen.add(session)
+      visit(session)
+    }
+  }
+  for (const sessions of Object.values(state.projectSessions)) {
+    for (const session of sessions) {
+      if (session.id === id && !seen.has(session)) {
+        seen.add(session)
+        visit(session)
+      }
+    }
+  }
+}
+
+function syncSessionResponse(session: Session) {
+  if (!session?.id) return
+  let seen = false
+  forEachSessionRecord(session.id, (s) => {
+    Object.assign(s, session)
+    seen = true
+  })
+  if (!seen) {
+    state.sessions = collapseBlankSessions([
+      session,
+      ...state.sessions.filter(s => s.id !== session.id),
+    ])
+    state.projectSessions[state.activeProjectPath] = state.sessions
+  }
+  const existingMeta = state.sessionMeta[session.id]
+  state.sessionMeta[session.id] = {
+    ...(existingMeta || {}),
+    title: session.title || '',
+    style: session.style ?? existingMeta?.style ?? 'off',
+    workMode: session.work_mode ?? existingMeta?.workMode ?? state.globalWorkMode ?? 'coding',
+    provider: session.provider ?? existingMeta?.provider ?? '',
+    model: session.model ?? existingMeta?.model ?? '',
+    plan_mode: session.plan_mode ?? existingMeta?.plan_mode ?? false,
+    turn_mode_policy: session.turn_mode_policy ?? existingMeta?.turn_mode_policy ?? (session.plan_mode ? 'plan' : 'build'),
+    permission_level: session.permission_level ?? existingMeta?.permission_level ?? 'ask',
+    reasoning_effort: session.reasoning_effort ?? existingMeta?.reasoning_effort ?? 'off',
+    vector_store: session.vector_store ?? existingMeta?.vector_store ?? '',
+    knowledge_base: session.knowledge_base ?? existingMeta?.knowledge_base ?? '',
+    auto_continue: session.auto_continue ?? existingMeta?.auto_continue ?? true,
+    todo_long_run_mode: session.todo_long_run_mode ?? existingMeta?.todo_long_run_mode ?? 'adaptive',
+    use_image_recognition: session.use_image_recognition ?? existingMeta?.use_image_recognition ?? false,
+    enabled_recognition_capabilities: session.enabled_recognition_capabilities ?? existingMeta?.enabled_recognition_capabilities ?? [],
+    enabled_generation_operations: session.enabled_generation_operations ?? existingMeta?.enabled_generation_operations ?? [],
+    sub_agent_model_enabled: session.sub_agent_model_enabled ?? existingMeta?.sub_agent_model_enabled ?? false,
+    sub_agent_provider: session.sub_agent_provider ?? existingMeta?.sub_agent_provider ?? '',
+    sub_agent_model: session.sub_agent_model ?? existingMeta?.sub_agent_model ?? '',
+  }
+}
+
+function setSessionPendingTurnCount(id: string, count: number) {
+  forEachSessionRecord(id, (session) => {
+    session.pending_turn_count = Math.max(0, count)
+    const hasUser = !!session.has_user_messages || (session.user_message_count || 0) > 0
+    if (!session.id.startsWith('im:') && !hasUser && session.pending_turn_count === 0) {
+      session.conversation_state = 'blank'
+    } else {
+      session.conversation_state = 'active'
+    }
+  })
+}
+
+export function markSessionActive(id: string, source: 'message' | 'pending' = 'message') {
+  if (!id) return
+  forEachSessionRecord(id, (session) => {
+    if (source === 'message') {
+      session.has_user_messages = true
+      session.user_message_count = Math.max(1, session.user_message_count || 0)
+    } else {
+      session.pending_turn_count = Math.max(1, session.pending_turn_count || 0)
+    }
+    session.conversation_state = 'active'
+  })
+}
 
 // capSessionMessages trims sessionMessages[id] to the cap and
 // advances the paging cursor past the dropped rows. Call it after
@@ -552,13 +850,14 @@ async function releaseViewLoad(startedAt: number, minMs: number): Promise<void> 
 export async function loadSessions() {
   const projectPath = state.activeProjectPath
   const { sessions } = await api.listSessions(projectPath)
-  state.projectSessions[projectPath] = sessions
+  const visibleSessions = collapseBlankSessions(sessions)
+  state.projectSessions[projectPath] = visibleSessions
   if (state.activeProjectPath !== projectPath) return
-  state.sessions = sessions
-  const currentInProject = !!state.currentID && sessions.some(s => s.id === state.currentID)
+  state.sessions = visibleSessions
+  const currentInProject = !!state.currentID && visibleSessions.some(s => s.id === state.currentID)
   if (!currentInProject) {
     const last = state.lastSessionByProject[projectPath] || readLastSession(projectPath)
-    const next = sessions.find(s => s.id === last)?.id || sessions[0]?.id || ''
+    const next = visibleSessions.find(s => s.id === last)?.id || visibleSessions[0]?.id || ''
     state.currentID = ''
     if (next) await switchSession(next)
   } else {
@@ -633,6 +932,7 @@ export async function switchSession(id: string) {
 
 async function switchSessionBody(id: string) {
   state.currentID = id
+  state.composerExpandedDock = null
   state.lastSessionByProject[state.activeProjectPath] = id
   rememberLastSession(state.activeProjectPath, id)
   rememberLastProject(state.activeProjectPath)
@@ -721,6 +1021,7 @@ async function switchSessionBody(id: string) {
       model:     s.model || '',
       title:     s.title || '',
       plan_mode: s.plan_mode || false,
+      turn_mode_policy: s.turn_mode_policy || (s.plan_mode ? 'plan' : 'build'),
       permission_level: s.permission_level || 'ask',
       reasoning_effort: s.reasoning_effort || 'off',
       vector_store: s.vector_store || '',
@@ -728,6 +1029,11 @@ async function switchSessionBody(id: string) {
       auto_continue: s.auto_continue ?? true,
       todo_long_run_mode: s.todo_long_run_mode || 'adaptive',
       use_image_recognition: s.use_image_recognition || false,
+      enabled_recognition_capabilities: s.enabled_recognition_capabilities || (s.use_image_recognition ? ['image'] : []),
+      enabled_generation_operations: s.enabled_generation_operations || [],
+      sub_agent_model_enabled: s.sub_agent_model_enabled || false,
+      sub_agent_provider: s.sub_agent_provider || '',
+      sub_agent_model: s.sub_agent_model || '',
     }
     state.lastPermissionLevel = normalizePermissionLevel(state.sessionMeta[id].permission_level)
   }
@@ -738,7 +1044,8 @@ async function switchSessionBody(id: string) {
       state.sessionTodos[id] = t.todos || []
     } catch { /* ignore — server may not have todos yet */ }
   }
-  // P4-x: keep the TopBar context badge in sync with the newly
+  await loadTurnQueue(id)
+  // P4-x: keep the Inspector context card in sync with the newly
   // active session. Silent fetch — the drawer stays closed.
   void refreshContextUsage(id)
 }
@@ -775,6 +1082,12 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
     }
     const r = await api.listMessages(id, opts)
     if (r.messages.length > 0) {
+      // Same scrub as the first-page load: phantom text and
+      // persisted streaming flags must be cleaned on every
+      // history page, not just the initial one.
+      for (const m of r.messages) {
+        if (m.parts) scrubMessagePhantoms(m)
+      }
       // Prepend the new (older) page to the front of the
       // existing message list. The server returns messages
       // oldest-first within the page. We dedup by seq
@@ -848,8 +1161,10 @@ export async function loadProviders() {
       state.defaultModel = null
       return
     }
-    const def = ps.find(p => p.is_default) || ps[0]
-    const m = (def.models || []).find(x => x.default) || (def.models || [])[0]
+    const withChatModels = ps.filter(p => (p.models || []).some(m => (m.type || 'llm') === 'llm'))
+    const def = withChatModels.find(p => p.is_default) || withChatModels[0]
+    const chatModels = (def?.models || []).filter(m => (m.type || 'llm') === 'llm')
+    const m = chatModels.find(x => x.default) || chatModels[0]
     if (def && m) {
       state.defaultModel = { provider: def.name, model: m.name }
     } else if (def && def.model) {
@@ -865,24 +1180,44 @@ export async function loadProviders() {
 
 function buildCreateSessionOptions(): api.CreateSessionOptions {
   const meta = state.sessionMeta[state.currentID] || currentMeta.value
+  // A new conversation inherits the style of the immediately active
+  // conversation. With no active source (fresh app/project), style is off.
+  const inheritedStyle = state.currentID
+    ? (state.sessionMeta[state.currentID]?.style || 'off')
+    : 'off'
+  const requestedCapabilities = meta.enabled_recognition_capabilities || (meta.use_image_recognition ? ['image'] : [])
+  const enabledCapabilities = requestedCapabilities.filter(kind => state.recognitionCapabilitiesAvailable.includes(kind))
   return {
     project_path: state.activeProjectPath || '',
+    reuse_empty: true,
     work_mode: meta.workMode || state.globalWorkMode || 'coding',
     provider: meta.provider || '',
     model: meta.model || '',
-    style: meta.style || 'off',
+    style: inheritedStyle,
     plan_mode: !!meta.plan_mode,
+    turn_mode_policy: meta.turn_mode_policy || (meta.plan_mode ? 'plan' : 'build'),
     permission_level: normalizePermissionLevel(meta.permission_level || state.lastPermissionLevel),
     reasoning_effort: meta.reasoning_effort || 'off',
     vector_store: meta.vector_store || '',
     knowledge_base: meta.knowledge_base || '',
     auto_continue: meta.auto_continue ?? true,
     todo_long_run_mode: meta.todo_long_run_mode || 'adaptive',
-    use_image_recognition: !!meta.use_image_recognition,
+    use_image_recognition: enabledCapabilities.includes('image'),
+    enabled_recognition_capabilities: enabledCapabilities,
+    enabled_generation_operations: meta.enabled_generation_operations || [],
+    sub_agent_model_enabled: !!meta.sub_agent_model_enabled,
+    sub_agent_provider: meta.sub_agent_provider || '',
+    sub_agent_model: meta.sub_agent_model || '',
   }
 }
 
 export async function createSession(): Promise<string> {
+  const reusableBlank = state.sessions.find(isBlankSessionRecord)
+  if (reusableBlank) {
+    await switchSession(reusableBlank.id)
+    return reusableBlank.id
+  }
+
   const created = await api.createSession(buildCreateSessionOptions())
   const id = created.id
   // Fetch the freshly created session's resolved meta from
@@ -907,15 +1242,33 @@ export async function createSession(): Promise<string> {
     title: '(新会话)',
     created_at: Date.now() / 1000,
     updated_at: Date.now() / 1000,
+    conversation_state: 'blank',
+    has_user_messages: false,
+    user_message_count: 0,
+    pending_turn_count: 0,
   }
-  // If the server returned a session with the
-  // already-resolved title (it does — sessionToResponse
-  // always returns the persisted title), use it; otherwise
-  // keep the placeholder.
-  state.sessions.unshift(fresh)
+  // The server may return an existing blank session when
+  // reuse_empty is true. Replace any stale local copy instead of
+  // inserting a duplicate row.
+  state.sessions = collapseBlankSessions([
+    fresh,
+    ...state.sessions.filter(s => s.id !== fresh.id),
+  ])
   state.projectSessions[state.activeProjectPath] = state.sessions
   await switchSession(id)
   return id
+}
+
+export async function generateSessionTitle(id: string, fallbackMessage = ''): Promise<void> {
+  if (!id) return
+  const currentTitle = state.sessionMeta[id]?.title
+    || state.sessions.find(s => s.id === id)?.title
+    || ''
+  if (!isAutoTitlePlaceholder(currentTitle)) return
+  const session = await api.generateSessionTitle(id, {
+    fallback_message: fallbackMessage,
+  })
+  syncSessionResponse(session)
 }
 
 export async function deleteSessionById(id: string) {
@@ -935,6 +1288,11 @@ export async function deleteSessionById(id: string) {
   delete _loadedSessions[id]
   delete state.sessionMeta[id]
   delete state.sessionTodos[id]
+  delete state.turnQueue[id]
+  delete state.turnQueueLoading[id]
+  delete state.turnQueueDraining[id]
+  delete state.turnPlanReview[id]
+  delete state.turnQueueEditing[id]
   delete state.sessionWorking[id]
   delete state.sessionBackgroundSubAgentJobs[id]
   delete state.sessionBackgroundHookMerging[id]
@@ -951,7 +1309,13 @@ export async function deleteSessionById(id: string) {
   for (const a of (state.pendingAttachments[id] || [])) {
     if (a._blobURL) URL.revokeObjectURL(a._blobURL)
   }
+  const rollbackUndo = state.rollbackUndo[id]
+  if (rollbackUndo) revokeSessionBlobUrlsForMessages(rollbackUndo.displayMessages)
   delete state.pendingAttachments[id]
+  delete state.pendingInput[id]
+  delete state.pendingInputRevision[id]
+  delete state.rollbackDraft[id]
+  delete state.rollbackUndo[id]
   delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
@@ -980,7 +1344,14 @@ export async function renameSession(id: string, title: string) {
     s.work_mode = resp.work_mode ?? s.work_mode
     s.provider = resp.provider ?? s.provider
     s.model = resp.model ?? s.model
+    s.plan_mode = resp.plan_mode ?? s.plan_mode
+    s.turn_mode_policy = resp.turn_mode_policy ?? s.turn_mode_policy
     s.use_image_recognition = resp.use_image_recognition ?? s.use_image_recognition
+    s.enabled_recognition_capabilities = resp.enabled_recognition_capabilities ?? s.enabled_recognition_capabilities
+    s.enabled_generation_operations = resp.enabled_generation_operations ?? s.enabled_generation_operations
+    s.sub_agent_model_enabled = resp.sub_agent_model_enabled ?? s.sub_agent_model_enabled
+    s.sub_agent_provider = resp.sub_agent_provider ?? s.sub_agent_provider
+    s.sub_agent_model = resp.sub_agent_model ?? s.sub_agent_model
   }
   if (state.sessionMeta[id]) {
     state.sessionMeta[id] = {
@@ -990,12 +1361,19 @@ export async function renameSession(id: string, title: string) {
       workMode: resp.work_mode ?? state.sessionMeta[id].workMode,
       provider: resp.provider ?? state.sessionMeta[id].provider,
       model: resp.model ?? state.sessionMeta[id].model,
+      plan_mode: resp.plan_mode ?? state.sessionMeta[id].plan_mode,
+      turn_mode_policy: resp.turn_mode_policy ?? state.sessionMeta[id].turn_mode_policy,
       permission_level: resp.permission_level ?? state.sessionMeta[id].permission_level,
       reasoning_effort: resp.reasoning_effort ?? state.sessionMeta[id].reasoning_effort,
       vector_store: resp.vector_store ?? state.sessionMeta[id].vector_store,
       knowledge_base: resp.knowledge_base ?? state.sessionMeta[id].knowledge_base,
       todo_long_run_mode: resp.todo_long_run_mode ?? state.sessionMeta[id].todo_long_run_mode,
       use_image_recognition: resp.use_image_recognition ?? state.sessionMeta[id].use_image_recognition,
+      enabled_recognition_capabilities: resp.enabled_recognition_capabilities ?? state.sessionMeta[id].enabled_recognition_capabilities,
+      enabled_generation_operations: resp.enabled_generation_operations ?? state.sessionMeta[id].enabled_generation_operations,
+      sub_agent_model_enabled: resp.sub_agent_model_enabled ?? state.sessionMeta[id].sub_agent_model_enabled,
+      sub_agent_provider: resp.sub_agent_provider ?? state.sessionMeta[id].sub_agent_provider,
+      sub_agent_model: resp.sub_agent_model ?? state.sessionMeta[id].sub_agent_model,
     }
   }
 }
@@ -1023,9 +1401,89 @@ export function guessKind(name: string, mime: string): string {
   return 'file'
 }
 
-export async function addAttachment(file: File) {
+function uploadIDFromAttachment(attachment: MessageAttachment): string {
+  if (attachment.upload_id) return attachment.upload_id
+  const match = (attachment.url || '').match(/\/api\/v1\/uploads\/([^/?#]+)/)
+  if (!match?.[1]) return ''
+  try {
+    return decodeURIComponent(match[1])
+  } catch {
+    return match[1]
+  }
+}
+
+function pendingAttachmentFromMessage(
+  attachment: MessageAttachment,
+  rollbackSource: string,
+): PendingAttachment {
+  const kind = attachment.kind || guessKind(attachment.name || '', attachment.mime || '')
+  const uploadID = uploadIDFromAttachment(attachment)
+  const originalURL = attachment.url || ''
+  const inlineData = uploadID
+    ? ''
+    : attachment.text || (originalURL.startsWith('data:') ? originalURL : '')
+  const convertedPreview = originalURL.startsWith('data:')
+    ? dataURLToBlobURL(originalURL)
+    : originalURL
+  const ownedBlobURL = convertedPreview?.startsWith('blob:')
+    ? convertedPreview
+    : undefined
+
+  return {
+    id: uploadID,
+    name: attachment.name || '附件',
+    size: 0,
+    mime: attachment.mime || '',
+    kind,
+    _blobURL: ownedBlobURL,
+    _uploading: false,
+    _error: !uploadID && !inlineData,
+    _previewURL: convertedPreview || originalURL,
+    _dataURL: inlineData || undefined,
+    _rollbackSource: rollbackSource,
+  }
+}
+
+function rollbackDraftAttachments(target: Message, deletedMessages: Message[]): MessageAttachment[] {
+  const matchesTarget = (candidate: Message) =>
+    (target.seq && candidate.seq === target.seq)
+    || (target.id && candidate.id === target.id)
+  const targetIndex = deletedMessages.findIndex(matchesTarget)
+  const collected: MessageAttachment[] = []
+
+  // The history UI merges the text row and its following attachment rows into
+  // one message. The rollback endpoint returns those rows separately, so walk
+  // the leading user run until the assistant reply starts and rebuild the same
+  // attachment group entirely on the client.
+  if (targetIndex >= 0) {
+    for (let i = targetIndex; i < deletedMessages.length; i++) {
+      const candidate = deletedMessages[i]
+      if (candidate.role !== 'user') break
+      collected.push(...(candidate.attachments || []))
+    }
+  }
+  if (!collected.length) collected.push(...(target.attachments || []))
+
+  const seen = new Set<string>()
+  return collected.filter((attachment) => {
+    // This is a display-only diagnostic emitted after a rejected image, not
+    // a file the user selected. It must never become a resendable draft item.
+    if (attachment.kind === 'image_not_supported') return false
+    const key = [
+      attachment.upload_id || uploadIDFromAttachment(attachment),
+      attachment.type,
+      attachment.url || '',
+      attachment.name || '',
+    ].join('\u0000')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+export function addAttachment(file: File): Promise<void> {
   const id = state.currentID
-  if (!id) return
+  if (!id) return Promise.resolve()
   if (!state.pendingAttachments[id]) state.pendingAttachments[id] = []
   const guessedKind = guessKind(file.name, file.type || '')
   const blobURL = URL.createObjectURL(file)
@@ -1036,6 +1494,12 @@ export async function addAttachment(file: File) {
     _previewURL: blobURL,
   }
   state.pendingAttachments[id].push(placeholder)
+  const ready = prepareAttachment(placeholder, file, guessedKind)
+  placeholder._ready = ready
+  return ready
+}
+
+async function prepareAttachment(placeholder: PendingAttachment, file: File, guessedKind: string): Promise<void> {
   // Cache a base64 data URL up-front so the message can be
   // displayed + sent without re-reading the file from disk.
   // For text attachments this is just the utf-8 text; for binary
@@ -1066,6 +1530,10 @@ export async function addAttachment(file: File) {
   }
 }
 
+export async function waitForPendingAttachments(attachments: PendingAttachment[]): Promise<void> {
+  await Promise.allSettled(attachments.map(attachment => attachment._ready).filter(Boolean))
+}
+
 // readAsDataURL returns a string suitable for the image_url/url
 // field of an OpenAI multi-part content. For binary files it's
 // the file's data: URL; for text files it's the file's contents
@@ -1094,8 +1562,8 @@ export function removeAttachment(idx: number) {
   arr.splice(idx, 1)
 }
 
-export function clearAttachments() {
-  const id = state.currentID
+export function clearAttachments(sessionID = state.currentID) {
+  const id = sessionID
   if (!id) return
   for (const a of (state.pendingAttachments[id] || [])) {
     if (a._blobURL) URL.revokeObjectURL(a._blobURL)
@@ -1105,8 +1573,10 @@ export function clearAttachments() {
 
 // --- Blob URL helpers ---
 //
-// Browser screenshot tool results arrive as large base64
-// data: URLs (~200–500 KB each). Storing them directly in
+// Legacy browser screenshot tool results arrived as large base64
+// data: URLs (~200–500 KB each). New screenshots are durable
+// /api/v1/generated asset references and bypass this compatibility path.
+// Storing old inline results directly in
 // the reactive Vue store keeps a giant decoded bitmap in
 // WebView2's DOM / decoded-image cache and eventually
 // crashes the renderer. We convert every screenshot to a
@@ -1117,21 +1587,6 @@ export function clearAttachments() {
 //      Chromium can GC independently of the JS heap.
 //   3. Session-level revocation is a simple walkParts over
 //      the messages map rather than hunting for data URLs.
-function dataUrlToBlobUrl(input: string | undefined): string | undefined {
-  if (!input || !input.startsWith('data:image/')) return input
-  try {
-    const commaIdx = input.indexOf(',')
-    const b64 = input.slice(commaIdx + 1)
-    const mime = input.slice(5, commaIdx)
-    const byteChars = atob(b64)
-    const bytes = new Uint8Array(byteChars.length)
-    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
-    return URL.createObjectURL(new Blob([bytes], { type: mime }))
-  } catch {
-    return input
-  }
-}
-
 // convertAndStripScreenshots walks ALL messages in the given
 // session, (1) converts any residual base64 screenshot data
 // URLs into blob: URLs (this happens on the very first load
@@ -1140,8 +1595,8 @@ function dataUrlToBlobUrl(input: string | undefined): string | undefined {
 // globally across the session, not per message — to cap the
 // number of live blob URLs / decoded bitmaps.
 //
-// This is the SINGLE point of entry for screenshot memory
-// management. Called from:
+// This is the single compatibility entry point for legacy inline screenshot
+// memory management. Called from:
 //   - switchSession (after history load)
 //   - loadMoreMessages (after page load)
 //   - the 'done' SSE event (after stream end)
@@ -1192,12 +1647,12 @@ export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERV
         if (p.kind !== 'tool' || !p.result) return
         const r = p.result as string
         if (isB64(r)) {
-          p.result = dataUrlToBlobUrl(r)
+          p.result = dataURLToBlobURL(r)
         } else {
           try {
             const obj = JSON.parse(r)
             if (typeof obj.image === 'string' && isB64(obj.image as string)) {
-              obj.image = dataUrlToBlobUrl(obj.image as string)
+              obj.image = dataURLToBlobURL(obj.image as string)
               p.result = JSON.stringify(obj)
             } else if (typeof obj.image === 'string' && obj.image === PLACEHOLDER_SCREENSHOT) {
               return
@@ -1217,7 +1672,7 @@ export function convertAndStripScreenshots(sessionId: string, keep = MAX_PRESERV
       for (const att of m.attachments) {
         if (!isB64(att.url) && !isBlob(att.url)) continue
         if (isB64(att.url)) {
-          att.url = dataUrlToBlobUrl(att.url)
+          att.url = dataURLToBlobURL(att.url)
         }
         if (isBlob(att.url)) screenshotTargets.push(att)
       }
@@ -1253,21 +1708,22 @@ function revokeSessionBlobUrls(sessionId: string) {
   const msgs = state.sessionMessages[sessionId]
   if (msgs) {
     for (const m of msgs) {
-      if (!m.parts) continue
-      walkParts(m.parts, (p) => {
-        if (p.kind !== 'tool') return
-        const r = p.result
-        if (typeof r === 'string' && r.startsWith('blob:')) {
-          URL.revokeObjectURL(r)
-          return
-        }
-        try {
-          const obj = JSON.parse(r as string)
-          if (typeof obj.image === 'string' && obj.image.startsWith('blob:')) {
-            URL.revokeObjectURL(obj.image as string)
+      if (m.parts) {
+        walkParts(m.parts, (p) => {
+          if (p.kind !== 'tool') return
+          const r = p.result
+          if (typeof r === 'string' && r.startsWith('blob:')) {
+            URL.revokeObjectURL(r)
+            return
           }
-        } catch { /* not JSON */ }
-      })
+          try {
+            const obj = JSON.parse(r as string)
+            if (typeof obj.image === 'string' && obj.image.startsWith('blob:')) {
+              URL.revokeObjectURL(obj.image as string)
+            }
+          } catch { /* not JSON */ }
+        })
+      }
       if (m.attachments) {
         for (const att of m.attachments) {
           if (att.url?.startsWith('blob:')) URL.revokeObjectURL(att.url)
@@ -1299,8 +1755,18 @@ function revokeSessionBlobUrls(sessionId: string) {
 // point that mutates the message body. Anything that wants
 // to feed a stream into the chat goes through this.
 
+export function appendLocalUserMessage(sessionId: string, message: Message) {
+  if (!sessionId) return
+  if (!state.sessionMessages[sessionId]) state.sessionMessages[sessionId] = []
+  state.sessionMessages[sessionId].push(message)
+  markSessionActive(sessionId, 'message')
+  capSessionMessages(sessionId)
+  state.streamRevision[sessionId] = (state.streamRevision[sessionId] || 0) + 1
+}
+
 export function startStream(id: string, ctrl: AbortController) {
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
+  delete state.turnPlanReview[id]
   // Push a placeholder assistant message immediately. The
   // MessageBubble's loading-dots placeholder requires the
   // message object to exist *before* the first content
@@ -1606,7 +2072,15 @@ function scrubPhantomError(s: string): string {
  *  phantom error patterns from text fields. Mutates the
  *  message in place. Used on session load and on the
  *  safety-net `done` handler so a stored phantom from an
- *  older version doesn't reappear. */
+ *  older version doesn't reappear.
+ *
+ *  Also clears any persisted `streaming` flag on thinking
+ *  parts: a turn interrupted before its Done chunk (server
+ *  restart, deadline, kill) could persist streaming=true,
+ *  which replays as a permanent "思考中…" on an idle session
+ *  (ghost reported 2026-09-25). The server scrubs this on
+ *  decode (message_helpers.go scrubStreamingFlags); this is
+ *  the client-side belt-and-braces for older servers. */
 function scrubMessagePhantoms(m: Message) {
   const walk = (parts: MessagePart[] | undefined) => {
     if (!parts) return
@@ -1617,7 +2091,11 @@ function scrubMessagePhantoms(m: Message) {
       } else if (p.kind === 'thinking' && p.text) {
         const scrubbed = scrubPhantomError(p.text)
         if (scrubbed !== p.text) p.text = scrubbed
-      } else if (p.kind === 'sub_agent') {
+      }
+      if (p.kind === 'thinking' && p.streaming) {
+        p.streaming = false
+      }
+      if (p.kind === 'sub_agent') {
         walk(p.parts)
       }
     }
@@ -1867,6 +2345,40 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         }
       }
       break
+    case 'skill': {
+      if (!ev.skill_name) break
+      const parts = sub ? sub.parts : m.parts!
+      closeTrailingThinking(parts)
+      let existing: Extract<MessagePart, { kind: 'skill' }> | undefined
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const part = parts[i]
+        if (part.kind === 'skill' && part.name === ev.skill_name) {
+          existing = part
+          break
+        }
+      }
+      const status = ev.skill_status === 'ready' || ev.skill_status === 'error'
+        ? ev.skill_status
+        : 'start'
+      if (existing) {
+        existing.status = status
+        existing.scope = ev.skill_scope
+        existing.source = ev.skill_source
+        existing.dependencies = ev.skill_dependencies
+        existing.error = ev.skill_error
+      } else {
+        parts.push({
+          kind: 'skill',
+          name: ev.skill_name,
+          status,
+          scope: ev.skill_scope,
+          source: ev.skill_source,
+          dependencies: ev.skill_dependencies,
+          error: ev.skill_error,
+        })
+      }
+      break
+    }
     case 'tool': {
       const parts = sub ? sub.parts : m.parts!
       if (!ev.tool_name) break
@@ -1925,14 +2437,14 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           if ((ev.tool_id && p.tool_id === ev.tool_id) ||
               (!ev.tool_id && p.name === ev.tool_name)) {
             p.status = (ev.tool_status as any) || 'ok'
-            // Convert screenshot base64 data URLs to blob URLs
-            // before storing, so the reactive map never sees the
-            // raw base64 payload (~200–500 KB per screenshot).
-            p.result = dataUrlToBlobUrl(ev.tool_result_full || ev.tool_result)
+            // New screenshots are compact asset JSON; legacy screenshot data
+            // URLs are converted before entering the reactive map.
+            p.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
             p.error = ev.tool_error
             p.elapsed = ev.tool_elapsed
-            if (ev.tool_args) p.args = ev.tool_args
-            // Server-side truncation marker: the full body (>32
+              if (ev.tool_args) p.args = ev.tool_args
+              if (ev.tool_context_refs) p.context_refs = ev.tool_context_refs
+              // Server-side truncation marker: the full body (>32
             // KiB) must be fetched on demand, never stored here.
             if (ev.tool_result_truncated) {
               ;(p as any).result_truncated = true
@@ -1950,12 +2462,13 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             name: ev.tool_name,
             args: ev.tool_args,
             status: (ev.tool_status as any) || 'ok',
-            result: dataUrlToBlobUrl(ev.tool_result_full || ev.tool_result),
+            result: dataURLToBlobURL(ev.tool_result_full || ev.tool_result),
             error: ev.tool_error,
             elapsed: ev.tool_elapsed,
-            result_truncated: ev.tool_result_truncated || undefined,
-            result_full_len: ev.tool_result_full_len,
-          })
+              result_truncated: ev.tool_result_truncated || undefined,
+              result_full_len: ev.tool_result_full_len,
+              context_refs: ev.tool_context_refs,
+            })
         }
         // Enforce the screenshot cap as each image arrives rather
         // than waiting for `done`; a cancelled task otherwise keeps
@@ -2037,8 +2550,11 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     }
-    case 'phase':
-      // Sub-agent lifecycle: open / close the nested card.
+	    case 'phase':
+	      if (!ev.sub_agent && ev.phase === 'plan' && (ev.step === 'plan-mode' || ev.step === 'auto-plan')) {
+	        state.turnPlanReview[id] = true
+	      }
+	      // Sub-agent lifecycle: open / close the nested card.
       // The sub-agent runner emits synthetic start/ok/err
       // phase events with sub_agent=true and
       // sub_agent_status set. These are routed through
@@ -2114,6 +2630,10 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         if (p.kind === 'sub_agent' && p.status === 'start') {
           p.status = 'err'
         }
+        if (p.kind === 'skill' && p.status === 'start') {
+          p.status = 'error'
+          p.error = p.error || 'Skill 加载未完成'
+        }
       })
       // Final phantom scrub. By the time the parent's
       // stream ends, all content + thinking + sub-agent
@@ -2159,13 +2679,14 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
 
       // Plan mode: when the stream ends in plan mode, capture
       // the plan text for review before execution.
-      if (!sub && state.sessionMeta[id]?.plan_mode) {
-        const planText = assembleTextContent(m.parts)
-        if (planText) {
-          state.pendingPlanText[id] = planText
-        }
-      }
-      // P4-x: turn finished — refresh the TopBar context badge
+	      if (!sub && (state.sessionMeta[id]?.plan_mode || state.turnPlanReview[id])) {
+	        const planText = assembleTextContent(m.parts)
+	        if (planText) {
+	          state.pendingPlanText[id] = planText
+	        }
+	      }
+	      delete state.turnPlanReview[id]
+      // P4-x: turn finished — refresh the Inspector context card
       // so the estimate reflects the tokens this turn added.
       void refreshContextUsage(id)
       break
@@ -2546,12 +3067,12 @@ export function appendSystemMessage(text: string) {
   state.sessionMessages[cid].push({ role: 'system', content: scrubPhantomError(text) })
 }
 
-// --- P2-3 context usage (TopBar badge) ---
+// --- P2-3 context usage (Inspector context card) ---
 
 // loadContextInspector pulls the current session's token
 // estimate + utilisation into `state.contextInspector.data`.
-// Errors land in `state.contextInspector.error`; the badge
-// just hides on failure (data is left intact if present).
+// Errors land in `state.contextInspector.error`; the Inspector
+// card falls back to its empty state (data is left intact if present).
 export async function loadContextInspector(sessionId: string): Promise<void> {
   if (!state.contextInspector) {
     state.contextInspector = { loading: true, error: null, data: null }
@@ -2573,14 +3094,14 @@ export async function loadContextInspector(sessionId: string): Promise<void> {
 
 // refreshContextUsage fetches the context utilisation snapshot
 // for the given session. It is the ONLY entry point now — the
-// old drawer that opened on click is gone; the TopBar badge
+// old drawer that opened on click is gone; the Inspector card
 // renders from `state.contextInspector.data`. Called on session
-// switch / after each turn (and on badge click) to keep the
-// badge current. Errors are swallowed — the badge hides.
+// switch / after each turn (and on card click) to keep the
+// estimate current. Errors are swallowed.
 export function refreshContextUsage(sessionId: string) {
   if (!sessionId) return
   if (!state.contextInspector) {
-    // Create the bucket so the badge can read data.
+    // Create the bucket so the context card can read data.
     state.contextInspector = { loading: true, error: null, data: null }
   }
   void loadContextInspector(sessionId)
@@ -2610,7 +3131,7 @@ export function endStream(id: string, ctrl?: AbortController) {
   state.sessionWorking[id] = false
   state.streamRevision[id] = (state.streamRevision[id] || 0) + 1
   // P4-x: stop/abort/regenerate also changes what the next turn
-  // will send — refresh the TopBar context badge. (The normal
+  // will send — refresh the Inspector context card. (The normal
   // `done` path already refreshed in appendStreamEvent, so no
   // double-fetch here.)
   void refreshContextUsage(id)
@@ -2967,11 +3488,19 @@ export const currentAttachments = computed(() =>
 export const currentRollbackBanner = computed(() => {
   const undo = state.rollbackUndo[state.currentID]
   if (!undo || !undo.messages.length) return null
-  return { count: undo.messages.length }
+  return { count: undo.displayMessages.length }
 })
 
 export const currentPendingInput = computed(() =>
   state.pendingInput[state.currentID] || '',
+)
+
+export const currentPendingInputRevision = computed(() =>
+  state.pendingInputRevision[state.currentID] || 0,
+)
+
+export const currentRollbackDraft = computed(() =>
+  state.rollbackDraft[state.currentID] || null,
 )
 
 // rollbackTo deletes the message at the given index (and all later
@@ -3052,13 +3581,26 @@ export async function rollbackTo(sessionId: string, messageIndex: number) {
 
   state.rollbackUndo[sessionId] = {
     messages: deletedMessages,
+    displayMessages: localDeleted,
     fromIndex: messageIndex,
   }
 
   msgs.splice(messageIndex)
 
-  const lastUser = [...deletedMessages].reverse().find(m => m.role === 'user')
-  state.pendingInput[sessionId] = lastUser?.content || ''
+  const rollbackSource = `rollback:${sessionId}:${msg.seq || msg.id}:${Date.now()}`
+  const restoredAttachments = rollbackDraftAttachments(msg, deletedMessages)
+    .map(attachment => pendingAttachmentFromMessage(attachment, rollbackSource))
+
+  // Rollback is an explicit "edit and resend" action, so the recalled message
+  // replaces the current attachment draft as one atomic GUI operation.
+  clearAttachments(sessionId)
+  state.pendingAttachments[sessionId] = restoredAttachments
+  state.pendingInput[sessionId] = msg.content || ''
+  state.pendingInputRevision[sessionId] = (state.pendingInputRevision[sessionId] || 0) + 1
+  state.rollbackDraft[sessionId] = {
+    source: rollbackSource,
+    text: msg.content || '',
+  }
 }
 
 // undoRollback restores the messages deleted by the most recent
@@ -3071,16 +3613,42 @@ export async function undoRollback(sessionId: string) {
 
   const msgs = state.sessionMessages[sessionId]
   if (msgs) {
-    msgs.splice(undo.fromIndex, 0, ...undo.messages)
+    msgs.splice(undo.fromIndex, 0, ...undo.displayMessages)
+  }
+  const draft = state.rollbackDraft[sessionId]
+  if (draft) {
+    const restoredMessageBlobURLs = new Set(
+      undo.displayMessages.flatMap(message =>
+        (message.attachments || [])
+          .map(attachment => attachment.url || '')
+          .filter(url => url.startsWith('blob:')),
+      ),
+    )
+    const kept: PendingAttachment[] = []
+    for (const attachment of state.pendingAttachments[sessionId] || []) {
+      if (attachment._rollbackSource === draft.source) {
+        // A local optimistic attachment can share its blob URL with the
+        // message being restored. In that case ownership returns to the
+        // message list; revoking here would render the restored card blank.
+        if (attachment._blobURL && !restoredMessageBlobURLs.has(attachment._blobURL)) {
+          URL.revokeObjectURL(attachment._blobURL)
+        }
+      } else {
+        kept.push(attachment)
+      }
+    }
+    state.pendingAttachments[sessionId] = kept
   }
   state.rollbackUndo[sessionId] = null
+  state.rollbackDraft[sessionId] = null
   state.pendingInput[sessionId] = ''
 }
 
-// dismissRollback clears the rollback undo buffer and pending
-// input without restoring the deleted messages.
+// dismissRollback only drops the undo capability. The recalled composer draft
+// remains available for editing and resending.
 export function dismissRollback(sessionId: string) {
   state.rollbackUndo[sessionId] = null
+  state.rollbackDraft[sessionId] = null
   state.pendingInput[sessionId] = ''
 }
 

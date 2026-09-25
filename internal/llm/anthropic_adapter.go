@@ -52,6 +52,7 @@ func NewAnthropicAdapter(baseURL, apiKey, providerName string) *AnthropicAdapter
 // for the 2026-07-17 parallel-tool-call upstream rejection).
 func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens int, tools []ToolDef, system string, temperature float32, topP float32) (*ProtocolRequest, error) {
 	var anthropicMsgs []anthropicMessage
+	replayReasoning := len(tools) > 0 && deepSeekReasoningReplay(model, a.baseURL)
 
 	// lastAssistantIdx points to the most recently appended
 	// assistant message. Consecutive assistant text blocks and
@@ -110,6 +111,12 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 	}
 
 	for _, msg := range messages {
+		// Anthropic 不接受中途 system；应用状态作为有边界的上下文留在原位。
+		// Keep application state in place instead of hoisting it into Anthropic's system prefix.
+		if IsRuntimeContext(msg) {
+			msg.Content = runtimeContextContent(msg)
+			msg.Role = RoleUser
+		}
 		// System role messages accumulate into the top-level
 		// system string; they are not sent as messages.
 		if msg.Role == RoleSystem {
@@ -197,7 +204,7 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 
 		case TypeText:
 			role := anthropicRole(msg.Role)
-			if msg.Content == "" {
+			if msg.Content == "" && (!replayReasoning || messageReasoning(msg) == "") {
 				continue
 			}
 			if role == "user" {
@@ -209,14 +216,25 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 			}
 			if role == "assistant" {
 				lastUserContentIdx = -1
+				if thinking := messageReasoning(msg); replayReasoning && thinking != "" {
+					block := anthropicContentBlock{Type: "thinking", Thinking: thinking}
+					if la := lastAssistant(); la != nil {
+						la.Content = append(la.Content, block)
+					} else {
+						anthropicMsgs = append(anthropicMsgs, anthropicMessage{Role: "assistant", Content: anthropicBlocksRaw{block}})
+						lastAssistantIdx = len(anthropicMsgs) - 1
+					}
+				}
 				if la := lastAssistant(); la != nil {
 					// Fold into the previous assistant
 					// message's content array so the wire
 					// shape is [text, tool_use, tool_use]
 					// in one assistant message.
-					la.Content = append(la.Content, anthropicContentBlock{
-						Type: "text", Text: msg.Content,
-					})
+					if msg.Content != "" {
+						la.Content = append(la.Content, anthropicContentBlock{
+							Type: "text", Text: msg.Content,
+						})
+					}
 					continue
 				}
 			} else {
@@ -293,11 +311,9 @@ func (a *AnthropicAdapter) Build(messages []ChatMessage, model string, maxTokens
 		return nil, fmt.Errorf("marshal anthropic request: %w", err)
 	}
 
-	url := strings.TrimRight(a.baseURL, "/") + "/v1/messages"
-
 	return &ProtocolRequest{
 		Method: http.MethodPost,
-		URL:    url,
+		URL:    strings.TrimSpace(a.baseURL),
 		Body:   body,
 		Headers: map[string]string{
 			"Content-Type":      "application/json",

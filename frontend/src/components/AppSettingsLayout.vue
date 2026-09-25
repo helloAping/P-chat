@@ -50,7 +50,6 @@
  *   </AppSettingsLayout>
  */
 import { computed } from 'vue'
-import { NScrollbar } from 'naive-ui'
 import { X as XIcon } from './icons'
 
 interface TabDef {
@@ -63,6 +62,9 @@ interface TabDef {
   /** Optional short description shown under the label on
    * hover (tooltip). Most tabs skip this. */
   description?: string
+  /** Optional group heading. Consecutive tabs with the same
+   * group render under one label; empty/undefined stays flat. */
+  group?: string
 }
 
 const props = withDefaults(defineProps<{
@@ -86,7 +88,7 @@ const props = withDefaults(defineProps<{
   saveLabel?: string
 }>(), {
   current: '',
-  width: 1080,
+  width: 1120,
 })
 
 const emit = defineEmits<{
@@ -114,6 +116,18 @@ const activeName = computed(() => props.current)
 function isActive(name: string) {
   return activeName.value === name
 }
+
+/** Consecutive tabs sharing `group` become one labelled block. */
+const navGroups = computed(() => {
+  const groups: { label: string; tabs: TabDef[] }[] = []
+  for (const t of props.tabs) {
+    const label = t.group || ''
+    const last = groups[groups.length - 1]
+    if (!last || last.label !== label) groups.push({ label, tabs: [t] })
+    else last.tabs.push(t)
+  }
+  return groups
+})
 </script>
 
 <template>
@@ -161,24 +175,32 @@ function isActive(name: string) {
           <!-- Body: nav column + content column -->
           <div class="settings-body">
             <nav class="settings-nav" aria-label="设置分类">
-              <button
-                v-for="t in tabs"
-                :key="t.name"
-                type="button"
-                class="settings-nav-item"
-                :class="{ 'settings-nav-item--active': isActive(t.name) }"
-                :aria-current="isActive(t.name) ? 'page' : undefined"
-                :title="t.description || t.label"
-                @click="pickTab(t.name)"
+              <div
+                v-for="(group, gi) in navGroups"
+                :key="group.label || String(gi)"
+                class="settings-nav-block"
               >
-                <component v-if="t.icon" :is="t.icon" :size="16" class="settings-nav-icon" />
-                <span class="settings-nav-label">{{ t.label }}</span>
-              </button>
+                <div v-if="group.label" class="settings-nav-group">{{ group.label }}</div>
+                <button
+                  v-for="t in group.tabs"
+                  :key="t.name"
+                  type="button"
+                  class="settings-nav-item"
+                  :class="{ 'settings-nav-item--active': isActive(t.name) }"
+                  :aria-current="isActive(t.name) ? 'page' : undefined"
+                  :title="t.description || t.label"
+                  @click="pickTab(t.name)"
+                >
+                  <component v-if="t.icon" :is="t.icon" :size="16" class="settings-nav-icon" />
+                  <span class="settings-nav-label">{{ t.label }}</span>
+                </button>
+              </div>
 
               <!-- Optional footer row pinned to the bottom of
                    the nav (consumers can slot extra entries here;
                    the old "使用文档" link moved to the About
-                   dialog). -->
+                   dialog). Hidden when the slot is empty so the
+                   leftover divider doesn't leave a dead strip. -->
               <div class="settings-nav-footer">
                 <slot name="nav-footer" />
               </div>
@@ -201,11 +223,12 @@ function isActive(name: string) {
   inset: 0;
   z-index: 2000;
   background: var(--surface-overlay);
-  backdrop-filter: blur(6px);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: var(--space-6);
 }
 
 /* --- Window --------------------------------------------------------- */
@@ -298,16 +321,32 @@ function isActive(name: string) {
 .settings-nav {
   width: 200px;
   flex-shrink: 0;
-  padding: 12px 8px;
+  padding: 10px 8px 12px;
   background: var(--surface-1);
   border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
-  /* Use subtle inner shadow when content scrolls so the
-   * nav feels anchored. */
   box-shadow: inset -1px 0 0 var(--border-subtle);
+}
+.settings-nav-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-nav-block + .settings-nav-block {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+.settings-nav-group {
+  padding: 4px 12px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-quaternary);
+  line-height: 1.2;
 }
 .settings-nav-item {
   display: flex;
@@ -352,10 +391,13 @@ function isActive(name: string) {
   white-space: nowrap;
 }
 /* Footer row pinned to the bottom of the nav column. */
-.settings-nav-footer {
+.settings-nav-footer:has(*) {
   margin-top: auto;
   padding-top: 8px;
   border-top: 1px solid var(--border-subtle);
+}
+.settings-nav-footer:not(:has(*)) {
+  display: none;
 }
 
 /* Content column — fills the remaining space.

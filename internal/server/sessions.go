@@ -20,6 +20,7 @@ package server
 // Split from handler.go in T04. Behaviour unchanged.
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
@@ -92,7 +94,14 @@ func (h *Handler) SearchMessages(c *gin.Context) {
 	if limit > 100 {
 		limit = 100
 	}
-	results := h.store.SearchMessages(q, limit)
+	projectPath := c.Query("project_path")
+	hasProjectParam := c.Request.URL.Query().Has("project_path")
+	var results []memory.SearchResult
+	if hasProjectParam {
+		results = h.store.SearchMessagesByProject(q, limit, projectPath)
+	} else {
+		results = h.store.SearchMessages(q, limit)
+	}
 	if results == nil {
 		results = []memory.SearchResult{}
 	}
@@ -136,15 +145,40 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "image recognition is disabled globally; enable it in App Settings > System > Image Recognition first"})
 		return
 	}
-
-	id, err := h.store.NewConversation()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	var recognitionCapabilities []config.MediaKind
+	if req.EnabledRecognitionCapabilities != nil {
+		var err error
+		recognitionCapabilities, err = h.validateRecognitionCapabilities(*req.EnabledRecognitionCapabilities)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.GenerationModelOverrides != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "per-session generation model overrides are no longer supported; configure the default model in App Settings"})
 		return
 	}
-
-	if req.Title != "" {
-		_ = h.store.RenameConversation(id, req.Title)
+	if req.GenerationPromptAssist != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "generation_prompt_assist is no longer supported; the LLM prepares the final prompt"})
+		return
+	}
+	generationOperations := []config.GenerationOperation(nil)
+	if req.EnabledGenerationOperations != nil {
+		generationOperations = append(generationOperations, (*req.EnabledGenerationOperations)...)
+	}
+	var generationErr error
+	generationOperations, generationErr = h.validateGenerationSelection(generationOperations)
+	if generationErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": generationErr.Error()})
+		return
+	}
+	subAgentModelEnabled := false
+	if req.SubAgentModelEnabled != nil {
+		subAgentModelEnabled = *req.SubAgentModelEnabled
+	}
+	if err := h.validateSubAgentModelSelection(subAgentModelEnabled, req.SubAgentProvider, req.SubAgentModel); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 
 	// Resolve the effective provider/model for this new session.
@@ -167,6 +201,36 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model %q not found under provider %q", model, provider)})
 		return
 	}
+	turnModePolicy := agent.NormalizeTurnModePolicy(req.TurnModePolicy, req.PlanMode != nil && *req.PlanMode)
+	if req.TurnModePolicy != "" {
+		var ok bool
+		turnModePolicy, ok = agent.ParseTurnModePolicy(req.TurnModePolicy)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": `turn_mode_policy must be "auto", "plan", or "build"`})
+			return
+		}
+	}
+
+	status := http.StatusCreated
+	var id string
+	var err error
+	if req.ReuseEmpty && strings.TrimSpace(req.Title) == "" {
+		var reused bool
+		id, reused, err = h.store.NewOrReuseBlankConversation(req.ProjectPath)
+		if reused {
+			status = http.StatusOK
+		}
+	} else {
+		id, err = h.store.NewConversation()
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Title != "" {
+		_ = h.store.RenameConversation(id, req.Title)
+	}
 
 	h.setSessionMeta(id, req.Style, provider, model)
 	if req.WorkMode != "" {
@@ -182,11 +246,15 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	if req.VectorStore != "" {
 		_ = h.store.SetConversationVectorStore(id, req.VectorStore)
 	}
-	if req.PlanMode != nil || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil {
+	if req.PlanMode != nil || req.TurnModePolicy != "" || req.ReasoningEffort != "" || req.KnowledgeBase != "" || req.AutoContinue != nil || req.TodoLongRunMode != nil || req.UseImageRecognition != nil || req.EnabledRecognitionCapabilities != nil || req.EnabledGenerationOperations != nil || req.SubAgentModelEnabled != nil || req.SubAgentProvider != "" || req.SubAgentModel != "" {
 		h.metaMu.Lock()
 		m := h.meta[id]
-		if req.PlanMode != nil {
+		if req.TurnModePolicy != "" {
+			m.TurnModePolicy = string(turnModePolicy)
+			m.PlanMode = turnModePolicy == agent.TurnModePlan
+		} else if req.PlanMode != nil {
 			m.PlanMode = *req.PlanMode
+			m.TurnModePolicy = string(agent.NormalizeTurnModePolicy("", *req.PlanMode))
 		}
 		if req.ReasoningEffort != "" {
 			m.ReasoningEffort = req.ReasoningEffort
@@ -203,22 +271,38 @@ func (h *Handler) CreateSession(c *gin.Context) {
 		}
 		if req.UseImageRecognition != nil {
 			m.UseImageRecognition = *req.UseImageRecognition
+			if req.EnabledRecognitionCapabilities == nil {
+				m.RecognitionCapabilities = setRecognitionCapability(m.RecognitionCapabilities, config.MediaImage, *req.UseImageRecognition)
+			}
+		}
+		if req.EnabledRecognitionCapabilities != nil {
+			m.RecognitionCapabilities = append([]config.MediaKind(nil), recognitionCapabilities...)
+			m.UseImageRecognition = containsRecognitionCapability(recognitionCapabilities, config.MediaImage)
+		}
+		if req.EnabledGenerationOperations != nil {
+			m.GenerationOperations = append([]config.GenerationOperation(nil), generationOperations...)
+		}
+		if req.SubAgentModelEnabled != nil {
+			m.SubAgentModelEnabled = *req.SubAgentModelEnabled
+		}
+		if req.SubAgentProvider != "" {
+			m.SubAgentProvider = strings.TrimSpace(req.SubAgentProvider)
+		}
+		if req.SubAgentModel != "" {
+			m.SubAgentModel = strings.TrimSpace(req.SubAgentModel)
 		}
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)
 	}
 
-	// Re-fetch and return the full session record.
-	convs := h.store.ListConversations()
-	for _, cv := range convs {
-		if cv.ID == id {
-			c.JSON(http.StatusCreated, h.sessionToResponse(cv))
-			return
-		}
+	cv, err := h.store.GetConversation(id)
+	if err == nil {
+		c.JSON(status, h.sessionToResponse(cv))
+		return
 	}
 	// Shouldn't happen, but fall back to just returning the id.
-	c.JSON(http.StatusCreated, gin.H{"id": id})
+	c.JSON(status, gin.H{"id": id})
 }
 
 func (h *Handler) GetSession(c *gin.Context) {
@@ -610,6 +694,235 @@ func (h *Handler) RenameSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"renamed": id, "title": req.Title})
 }
 
+const (
+	sessionTitleGenerateTimeout = 12 * time.Second
+	sessionTitleSourceLimit     = 12
+	sessionTitleSourceLineLimit = 8
+	sessionTitleMaxRunes        = 24
+	sessionTitleFallbackRunes   = 40
+)
+
+// GenerateSessionTitle derives and stores a short semantic title for a
+// conversation. It intentionally only overwrites empty/placeholder titles unless
+// Force is set, so user-renamed sessions stay stable.
+func (h *Handler) GenerateSessionTitle(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	cv, err := h.store.GetConversation(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	var req GenerateSessionTitleRequest
+	if err := c.ShouldBindJSON(&req); err != nil && err != io.EOF {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !req.Force && !isAutoTitlePlaceholder(cv.Title) {
+		c.JSON(http.StatusOK, h.sessionToResponse(cv))
+		return
+	}
+
+	source := h.sessionTitleSource(id, req.FallbackMessage)
+	fallback := fallbackSessionTitle(source, req.FallbackMessage)
+	if strings.TrimSpace(source) == "" && fallback == "" {
+		c.JSON(http.StatusOK, h.sessionToResponse(cv))
+		return
+	}
+
+	title := fallback
+	if generated, err := h.generateSemanticSessionTitle(c.Request.Context(), id, source); err == nil && generated != "" {
+		title = generated
+	}
+	if title != "" {
+		latest, err := h.store.GetConversation(id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if req.Force || isAutoTitlePlaceholder(latest.Title) {
+			if err := h.store.RenameConversation(id, title); err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+				return
+			}
+			latest.Title = title
+		}
+		cv = latest
+	}
+	c.JSON(http.StatusOK, h.sessionToResponse(cv))
+}
+
+func (h *Handler) generateSemanticSessionTitle(ctx context.Context, sessionID, source string) (string, error) {
+	if h == nil || h.agent == nil || h.agent.LLM() == nil || strings.TrimSpace(source) == "" {
+		return "", fmt.Errorf("title generation unavailable")
+	}
+	meta := h.ensureMetaLoaded(sessionID)
+	provider := strings.TrimSpace(meta.Provider)
+	if provider == "" {
+		provider = h.getCfg().LLM.Default
+	}
+	if provider == "" {
+		return "", fmt.Errorf("provider is not configured")
+	}
+	model := h.sessionModel(sessionID, provider)
+	ctx, cancel := context.WithTimeout(ctx, sessionTitleGenerateTimeout)
+	defer cancel()
+
+	resp, err := h.agent.LLM().ChatCM(ctx, provider, model, []llm.ChatMessage{
+		{
+			Role:        llm.RoleSystem,
+			Type:        llm.TypeText,
+			Content:     sessionTitleSystemPrompt,
+			SubmitToLLM: 1,
+		},
+		{
+			Role:        llm.RoleUser,
+			Type:        llm.TypeText,
+			Content:     "根据以下对话内容生成标题：\n---\n" + source + "\n---\n只输出标题。",
+			SubmitToLLM: 1,
+		},
+	}, llm.ChatOptions{MaxTokens: 64, ReasoningEffort: "off"})
+	if err != nil {
+		return "", err
+	}
+	title := cleanGeneratedSessionTitle(resp)
+	if title == "" {
+		return "", fmt.Errorf("empty generated title")
+	}
+	return title, nil
+}
+
+const sessionTitleSystemPrompt = `你是 P-Chat 的会话标题生成器。请根据对话内容生成一个短标题。
+要求：
+- 概括用户真正要做的事，保留项目名、错误名、文件名或关键对象。
+- 中文标题建议 6 到 18 个字；英文标题建议 2 到 6 个词；最多 24 个字符。
+- 不要输出解释、编号、Markdown、引号、句号，也不要带“标题：”前缀。
+- 如果内容只是寒暄或无法判断主题，输出“日常对话”。`
+
+func (h *Handler) sessionTitleSource(sessionID, fallbackMessage string) string {
+	if h == nil || h.store == nil {
+		return strings.TrimSpace(fallbackMessage)
+	}
+	msgs, _, _ := h.store.GetChatMessagesWithMetaFor(sessionID, sessionTitleSourceLimit)
+	lines := make([]string, 0, sessionTitleSourceLineLimit)
+	for _, msg := range msgs {
+		if len(lines) >= sessionTitleSourceLineLimit {
+			break
+		}
+		if msg.SubmitToLLM == 0 || msg.Role == llm.RoleSystem || msg.Role == llm.RoleTool {
+			continue
+		}
+		if msg.Type != "" && msg.Type != llm.TypeText {
+			continue
+		}
+		text := normalizeTitleText(msg.Content)
+		if text == "" || strings.HasPrefix(text, "upl://") {
+			continue
+		}
+		role := "用户"
+		if msg.Role == llm.RoleAssistant {
+			role = "助手"
+		} else if msg.Role != llm.RoleUser {
+			continue
+		}
+		lines = append(lines, role+": "+truncateRunes(text, 500))
+	}
+	if len(lines) == 0 {
+		if text := normalizeTitleText(fallbackMessage); text != "" {
+			lines = append(lines, "用户: "+truncateRunes(text, 500))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func isAutoTitlePlaceholder(title string) bool {
+	switch strings.TrimSpace(title) {
+	case "", "(新会话)", "新会话", "(无标题)", "无标题":
+		return true
+	default:
+		return false
+	}
+}
+
+func fallbackSessionTitle(source, fallbackMessage string) string {
+	text := normalizeTitleText(fallbackMessage)
+	if text == "" {
+		for _, line := range strings.Split(source, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if rest, ok := strings.CutPrefix(line, "用户: "); ok {
+				text = rest
+				break
+			}
+			if rest, ok := strings.CutPrefix(line, "用户："); ok {
+				text = rest
+				break
+			}
+		}
+	}
+	if text == "" {
+		return ""
+	}
+	if isGreetingOnly(text) {
+		return "日常对话"
+	}
+	return truncateRunes(cleanGeneratedSessionTitle(text), sessionTitleFallbackRunes)
+}
+
+func cleanGeneratedSessionTitle(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			s = line
+			break
+		}
+	}
+	s = normalizeTitleText(s)
+	s = strings.Trim(s, " \t\r\n\"'“”‘’`*_#[]()（）【】")
+	s = strings.TrimLeft(s, "-*#0123456789.、)） \t")
+	for _, prefix := range []string{"会话标题：", "会话标题:", "标题：", "标题:"} {
+		s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
+	}
+	s = strings.Trim(s, " \t\r\n\"'“”‘’`*_#[]()（）【】")
+	s = strings.TrimRight(s, "。.!！?？；;，,、")
+	s = normalizeTitleText(s)
+	return truncateRunes(s, sessionTitleMaxRunes)
+}
+
+func normalizeTitleText(s string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+}
+
+func isGreetingOnly(s string) bool {
+	switch strings.ToLower(strings.Trim(s, " \t\r\n。.!！?？")) {
+	case "hi", "hello", "hey", "你好", "您好", "在吗", "在么", "哈喽", "嗨":
+		return true
+	default:
+		return false
+	}
+}
+
+func truncateRunes(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= limit {
+		return s
+	}
+	return string(rs[:limit])
+}
+
 // UpdateSessionMeta is the "change provider / model / style without
 // sending a message" endpoint. Bound to PATCH /sessions/:id. The
 // request body uses pointer fields so callers can send partial
@@ -698,6 +1011,43 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if req.GenerationModelOverrides != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "per-session generation model overrides are no longer supported; configure the default model in App Settings"})
+		return
+	}
+	if req.GenerationPromptAssist != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "generation_prompt_assist is no longer supported; the LLM prepares the final prompt"})
+		return
+	}
+	var recognitionCapabilities []config.MediaKind
+	if req.EnabledRecognitionCapabilities != nil {
+		recognitionCapabilities, err = h.validateRecognitionCapabilities(*req.EnabledRecognitionCapabilities)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	currentGeneration := h.ensureMetaLoaded(id)
+	generationOperations := append([]config.GenerationOperation(nil), currentGeneration.GenerationOperations...)
+	if req.EnabledGenerationOperations != nil {
+		generationOperations = append([]config.GenerationOperation(nil), (*req.EnabledGenerationOperations)...)
+	}
+	if req.EnabledGenerationOperations != nil {
+		generationOperations, err = h.validateGenerationSelection(generationOperations)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	var turnModePolicy agent.TurnModePolicy
+	if req.TurnModePolicy != nil {
+		var ok bool
+		turnModePolicy, ok = agent.ParseTurnModePolicy(*req.TurnModePolicy)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": `turn_mode_policy must be "auto", "plan", or "build"`})
+			return
+		}
+	}
 
 	// Validate provider (if specified) before touching meta.
 	provider := h.sessionProvider(id)
@@ -723,6 +1073,20 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 	h.setSessionMeta(id, deref(req.Style), provider, model)
 	if req.WorkMode != nil {
 		h.setSessionMetaWorkMode(id, *req.WorkMode)
+	}
+	if req.TurnModePolicy != nil || req.PlanMode != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		if req.TurnModePolicy != nil {
+			m.TurnModePolicy = string(turnModePolicy)
+			m.PlanMode = turnModePolicy == agent.TurnModePlan
+		} else if req.PlanMode != nil {
+			m.PlanMode = *req.PlanMode
+			m.TurnModePolicy = string(agent.NormalizeTurnModePolicy("", *req.PlanMode))
+		}
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
 	}
 
 	// Handle permission level separately — validate and write directly.
@@ -782,9 +1146,35 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		m.UseImageRecognition = *req.UseImageRecognition
+		if req.EnabledRecognitionCapabilities == nil {
+			m.RecognitionCapabilities = setRecognitionCapability(m.RecognitionCapabilities, config.MediaImage, *req.UseImageRecognition)
+		}
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)
+	}
+	if req.EnabledRecognitionCapabilities != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.RecognitionCapabilities = append([]config.MediaKind(nil), recognitionCapabilities...)
+		m.UseImageRecognition = containsRecognitionCapability(recognitionCapabilities, config.MediaImage)
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
+	if req.EnabledGenerationOperations != nil {
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.GenerationOperations = append([]config.GenerationOperation(nil), generationOperations...)
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
+	if req.SubAgentModelEnabled != nil || req.SubAgentProvider != nil || req.SubAgentModel != nil {
+		if err := h.applySessionSubAgentModelPatch(id, req.SubAgentModelEnabled, req.SubAgentProvider, req.SubAgentModel); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	// Re-read so the response reflects the on-disk truth.
@@ -801,6 +1191,115 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func (h *Handler) validateRecognitionCapabilities(kinds []config.MediaKind) ([]config.MediaKind, error) {
+	result := make([]config.MediaKind, 0, len(kinds))
+	seen := make(map[config.MediaKind]struct{}, len(kinds))
+	for _, kind := range kinds {
+		if !kind.IsValid() {
+			return nil, fmt.Errorf("unsupported recognition capability %q", kind)
+		}
+		if _, exists := seen[kind]; exists {
+			continue
+		}
+		route, available := h.getCfg().Recognition.Route(kind)
+		if !available || !h.recognitionRouteAvailable(kind, route) {
+			return nil, fmt.Errorf("%s recognition is not configured or unavailable", kind)
+		}
+		seen[kind] = struct{}{}
+		result = append(result, kind)
+	}
+	return result, nil
+}
+
+func containsRecognitionCapability(kinds []config.MediaKind, target config.MediaKind) bool {
+	for _, kind := range kinds {
+		if kind == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) validateGenerationSelection(operations []config.GenerationOperation) ([]config.GenerationOperation, error) {
+	normalizedOperations := make([]config.GenerationOperation, 0, len(operations))
+	seen := make(map[config.GenerationOperation]struct{}, len(operations))
+	for _, operation := range operations {
+		if !operation.IsValid() {
+			return nil, fmt.Errorf("unsupported generation operation %q", operation)
+		}
+		if _, ok := seen[operation]; ok {
+			continue
+		}
+		seen[operation] = struct{}{}
+		normalizedOperations = append(normalizedOperations, operation)
+	}
+	for _, operation := range normalizedOperations {
+		if _, _, _, err := h.getCfg().ResolveGenerationTarget(operation, config.GenerationModelTarget{}); err != nil {
+			return nil, fmt.Errorf("cannot enable %s: %w", operation, err)
+		}
+	}
+	return normalizedOperations, nil
+}
+
+func setRecognitionCapability(kinds []config.MediaKind, target config.MediaKind, enabled bool) []config.MediaKind {
+	result := make([]config.MediaKind, 0, len(kinds)+1)
+	for _, kind := range kinds {
+		if kind != target {
+			result = append(result, kind)
+		}
+	}
+	if enabled {
+		result = append(result, target)
+	}
+	return result
+}
+
+func (h *Handler) validateSubAgentModelSelection(enabled bool, provider, model string) error {
+	if !enabled {
+		return nil
+	}
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return fmt.Errorf("sub-agent model override requires provider and model")
+	}
+	if !h.validProvider(provider) {
+		return fmt.Errorf("unknown sub-agent provider %q", provider)
+	}
+	if !h.validModel(provider, model) {
+		return fmt.Errorf("sub-agent model %q not found under provider %q", model, provider)
+	}
+	return nil
+}
+
+func (h *Handler) applySessionSubAgentModelPatch(
+	id string,
+	enabled *bool,
+	provider *string,
+	model *string,
+) error {
+	_ = h.ensureMetaLoaded(id)
+	h.metaMu.Lock()
+	m := h.meta[id]
+	if enabled != nil {
+		m.SubAgentModelEnabled = *enabled
+	}
+	if provider != nil {
+		m.SubAgentProvider = strings.TrimSpace(*provider)
+	}
+	if model != nil {
+		m.SubAgentModel = strings.TrimSpace(*model)
+	}
+	if err := h.validateSubAgentModelSelection(m.SubAgentModelEnabled, m.SubAgentProvider, m.SubAgentModel); err != nil {
+		h.metaMu.Unlock()
+		return err
+	}
+	h.meta[id] = m
+	h.metaMu.Unlock()
+	h.persistSessionMeta(id, m)
+	return nil
 }
 
 // --- Messages ---

@@ -3,6 +3,7 @@ module github.com/p-chat/pchat/cmd/pchat-gui
 go 1.23.0
 
 require (
+	github.com/p-chat/pchat/runtimeprofile v0.0.0
 	github.com/wailsapp/wails/v2 v2.12.0
 	golang.org/x/sys v0.30.0
 )
@@ -38,3 +39,5 @@ require (
 )
 
 // replace github.com/wailsapp/wails/v2 v2.12.0 => D:\develop\golang\global\1.21.13\pkg\mod
+
+replace github.com/p-chat/pchat/runtimeprofile => ../../runtimeprofile

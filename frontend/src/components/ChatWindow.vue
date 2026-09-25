@@ -465,7 +465,11 @@ function messageKey(m: any, i: number): string | number {
     </div>
     <QuestionModal @locate-question="locateOpenQuestion" />
     <TodoPanel />
-    <SubAgentJobsPanel :session-id="state.currentID" @job-terminal="handleSubAgentJobTerminal" />
+    <SubAgentJobsPanel
+      :session-id="state.currentID"
+      @job-terminal="handleSubAgentJobTerminal"
+      @locate-result="jumpToBottom"
+    />
     <InputArea />
     <!-- P1-4: 锚定 FAB (jump-to-user-message). Shown
          when the user is scrolled up beyond the 50px
@@ -517,8 +521,8 @@ function messageKey(m: any, i: number): string | number {
 .recovery-banner {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   background: var(--surface-2);
   border-bottom: 1px solid var(--border-subtle);
   font-size: 12.5px;
@@ -531,14 +535,14 @@ function messageKey(m: any, i: number): string | number {
    the success banner above also covers). */
 .recovery-banner--pending {
   background: var(--surface-2);
-  border-bottom-color: var(--accent, #4a90e2);
+  border-bottom-color: var(--brand-500);
 }
 .recovery-banner--pending .recovery-icon {
   animation: recovery-pulse 1.4s ease-in-out infinite;
   display: inline-block;
 }
 .recovery-banner--interrupt {
-  border-bottom-color: var(--warning);
+  border-bottom-color: var(--warn-500);
 }
 @keyframes recovery-pulse {
   0%, 100% { opacity: 0.5; transform: scale(0.95); }
@@ -625,7 +629,7 @@ function messageKey(m: any, i: number): string | number {
 }
 .messages-scroll::-webkit-scrollbar-thumb {
   background: var(--border-default);
-  border-radius: 4px;
+  border-radius: var(--radius-pill);
 }
 .messages-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--text-quaternary);
@@ -636,7 +640,7 @@ function messageKey(m: any, i: number): string | number {
    * resolve against. The empty state is vertically centred
    * via flex on `.empty` so the page still looks balanced
    * when there are no messages. */
-  padding: 12px 0;
+  padding: var(--space-3) 0;
   display: flex;
   flex-direction: column;
   transition: opacity var(--dur-slow) var(--ease-out),
@@ -705,7 +709,7 @@ function messageKey(m: any, i: number): string | number {
   text-align: center;
   font-size: 12px;
   color: var(--text-4);
-  padding: 8px 0;
+  padding: var(--space-2) 0;
   opacity: 0.7;
 }
 .empty {
@@ -715,8 +719,8 @@ function messageKey(m: any, i: number): string | number {
   justify-content: center;
   height: 100%;
   color: var(--text-3);
-  gap: 8px;
-  padding-top: 120px;
+  gap: var(--space-2);
+  padding-top: calc(var(--space-8) * 3);
   text-align: center;
 }
 .empty-icon { font-size: 48px; color: var(--text-quaternary); display: inline-flex; }
@@ -724,19 +728,17 @@ function messageKey(m: any, i: number): string | number {
 .empty-hint { font-size: 12px; color: var(--text-4); }
 
 /* Floating "jump to latest" button. Anchored to .chat-main's
- * right edge, hovering above the input area. The 130px bottom
- * clears the collapsed TodoPanel (36px) + the typical input
- * area (~82px) + a small visual margin. When the rollback
- * banner is showing or advanced inputs are expanded the input
- * area grows and the button visually sits a bit closer to the
- * top edge of the input — acceptable trade-off vs. measuring
- * the input height from JS. */
+ * right edge, hovering above the input area. The computed bottom
+ * clears collapsed Todo (~36px) + queue summary strip (~32px) +
+ * typical input (~82px) + a small visual margin. When docks
+ * expand the button sits closer to the input top — acceptable
+ * trade-off vs. measuring the composer height from JS. */
 .jump-to-bottom {
   position: absolute;
-  right: 16px;
-  bottom: 130px;
-  width: 36px;
-  height: 36px;
+  right: var(--space-4);
+  bottom: calc(var(--space-8) * 5 + var(--space-2));
+  width: calc(var(--control-height) + var(--space-2));
+  height: calc(var(--control-height) + var(--space-2));
   border-radius: var(--radius-pill);
   background: var(--bg-2);
   border: 1px solid var(--border-default);
@@ -775,7 +777,7 @@ function messageKey(m: any, i: number): string | number {
 }
 
 /* P1-4: 锚定 FAB. Sits stacked above the jump-to-bottom
- * button (bottom: 178px) so the two never overlap. Same
+ * button so the two never overlap. Same
  * size + shape + surface as the jump-to-bottom button
  * (visually consistent floating-button row) but uses
  * ArrowUp — pointing up to "the user message that
@@ -787,10 +789,10 @@ function messageKey(m: any, i: number): string | number {
  * appeared. */
 .anchor-fab {
   position: absolute;
-  right: 16px;
-  bottom: 178px;
-  width: 36px;
-  height: 36px;
+  right: var(--space-4);
+  bottom: calc(var(--space-8) * 6 + var(--space-6));
+  width: calc(var(--control-height) + var(--space-2));
+  height: calc(var(--control-height) + var(--space-2));
   border-radius: var(--radius-pill);
   background: var(--brand-50);
   border: 1px solid var(--brand-100);
@@ -813,7 +815,7 @@ function messageKey(m: any, i: number): string | number {
   transform: translateY(0);
 }
 .anchor-fab:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--brand-500);
   outline-offset: 2px;
 }
 .anchor-btn-enter-active {

@@ -34,6 +34,20 @@ func mustBuildAnthropic(t *testing.T, a *AnthropicAdapter, msgs []ChatMessage, s
 	return out
 }
 
+func TestAnthropicAdapterUsesConfiguredEndpointVerbatim(t *testing.T) {
+	endpoint := "https://proxy.example/custom/messages"
+	req, err := NewAnthropicAdapter(endpoint, "sk-test", "claude").Build(
+		[]ChatMessage{{Role: RoleUser, Type: TypeText, Content: "hi"}},
+		"model", 0, nil, "", 0, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.URL != endpoint {
+		t.Fatalf("request URL = %q, want exact configured endpoint %q", req.URL, endpoint)
+	}
+}
+
 // extractBlocks parses an Anthropic content field (string or
 // array) into a []anthropicContentBlock. Single text messages
 // arrive as `"hello"`, multi-block as `[...]`.

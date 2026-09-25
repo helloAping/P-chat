@@ -6,7 +6,7 @@
 
 ## 概述
 
-Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工具是 LLM 可以调用的函数：执行命令、读写文件、列目录、阅读文档（PDF/DOCX）、待办管理（todo_write）、用户提问（question）、图片识别（image_recognize）。
+Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工具是 LLM 可以调用的函数：执行命令、读写项目文件、读取会话附件、待办管理（todo_write）、用户提问（question）和媒体识别。
 
 ## 文件结构
 
@@ -17,9 +17,7 @@ Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工�
 | `todo.go` | todo_write 工具的持久化钩子 | `PersistTodos`, `LoadTodos` |
 | `question.go` | question 工具（暂停→等待用户回答→恢复） | `handleQuestion()` |
 | `confirm.go` | 沙箱确认机制（阻塞等待用户批准） | `ConfirmRequest`, `WaitForConfirm()` |
-| `fileops.go` | read_file/write_file 的底层实现 | `readFileForTool()`, `writeFile()` |
-| `docx.go` | .docx 读取实现 | `readDocx()` |
-| `pdf.go` | .pdf 读取实现 | `readPdf()` |
+| `fileops.go` | read_file/write_file 的底层实现；按扩展名调用 knowledge 文档提取器 | `readFileForTool()`, `writeFile()` |
 | `dynamic/` | P3-2 用户自定义工具（YAML hot-reload） | `Watch()`, `BuildDynamicHandler()`, `ParseSpec()` |
 
 ## 核心概念
@@ -28,14 +26,17 @@ Tool 模块定义 P-Chat 的工具注册表和所有内置工具的实现。工�
 
 ```go
 type Registry struct {
-    tools map[string]ToolHandler  // 名称 → 处理函数
-    meta  map[string]Tool         // 名称 → 元数据（名称、描述、参数 schema）
+    tools   map[string]ToolHandler  // 名称 → 处理函数
+    meta    map[string]Tool         // 名称 → 元数据（名称、描述、参数 schema）
+    aliases map[string]toolAlias    // 旧名称 → canonical 工具
 }
 
 type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, error)
 ```
 
 - `Register(Tool, ToolHandler)` — 注册工具
+- `RegisterAlias(alias, canonical)` — 注册隐藏兼容别名；可调用但不进入模型 schema
+- `RegisterAliasHandler(alias, canonical, handler)` — 带旧参数/行为适配器的隐藏别名
 - `Get(name)` — 获取处理函数
 - `List()` — 按名称排序的所有工具元数据
 - `Names()` — 所有工具名称（用于子代理工具白名单）
@@ -44,18 +45,30 @@ type ToolHandler func(ctx context.Context, args json.RawMessage) (*CallResult, e
 
 | 工具名称 | 功能 | 关键文件：行号 |
 |---|---|---|
-| `exec_command` | 执行 shell 命令 | registry.go:201, 303 |
-| `read_file` | 读取文本文件 | registry.go:211, 390 |
+| `exec_command` | 执行 shell 命令；`background=true` 时启动受管后台进程 | registry.go, process_manager.go |
+| `read_file` | 读取文本文件，并按扩展名提取 PDF、Word、Excel、PowerPoint | registry.go, fileops.go, knowledge/* |
+| `read_attachment` | 通过本会话 `upload_id` 提取文本、PDF、Word、Excel、PowerPoint 内容 | attachment_read.go, registry.go |
 | `write_file` | 写入/创建文件 | registry.go:223, 440 |
 | `list_files` | 列出目录 | registry.go |
 | `grep` | 在项目根目录精确搜索关键词 | grep.go |
-| `read_docx` | 读取 .docx | registry.go |
-| `read_pdf` | 读取 .pdf | registry.go:240, 555 |
 | `web_fetch` | HTTP 抓取 URL（带 SSRF 防护） | registry.go:275, 749 |
 | `web_search` | 公开网络搜索（snippet+url，可插拔 provider） | websearch.go |
-| `image_recognize` | 识别会话上传图片；优先用系统识图模型，必要时 fallback 到当前视觉模型 | image_recognize.go, registry.go |
+| `media_recognize` | 识别一项或多项同类型图片、视频或音频；按媒体类型选择配置模型，图片可 fallback 到当前视觉模型 | media_recognize.go, agent.go |
+| `generate_image` | 文生图或图生图；内部按 operation 路由到配置模型 | media_generation.go, generation/* |
+| `generate_video` | 文生视频、图生视频或视频生视频 | media_generation.go, generation/* |
+| `generate_audio` | 文字转语音/音乐/音效或音频转音频 | media_generation.go, generation/* |
 | `todo_write` | 管理待办列表 | registry.go:256, todo.go |
 | `question` | 向用户提问并等待 | registry.go:275, question.go |
+| `skill` | 合并 Skill 的 list/inspect/load/read_resource/doctor 只读操作 | skill_tools.go |
+| `skill_manage` | 合并 Skill 的 install/import/remove 变更操作；始终需要确认 | skill_tools.go |
+
+Skill 工具刻意只保留两个模型可见入口，避免把 discover/load/read/doctor/install/import/remove
+拆成大量平铺工具。`skill(action=load)` 的 `CallResult.SkillInvocation` 不是普通展示字段：
+Agent 必须先将其转换为显式 Skill 生命周期事件，再把 Skill 正文交给下一轮 LLM。
+`skill_manage` 只操作托管目录，标准 `.agents/skills` 目录为只读发现源。外部 CLI/工具提供的
+Skill 应先导出为标准包目录；再用 `{"action":"import","source_path":"..."}` 导入单包或
+集合。集合导入提供 `name` 时只导入指定 Skill 及其集合内声明依赖，省略时导入全部。
+具体 CLI 的调用与导出方式不进入 P-Chat 核心，也不新增供应商专用工具。
 
 ### 3. 沙箱集成
 
@@ -93,17 +106,75 @@ type SandboxChecker interface {
 
 `todo_write` 的工具结果通过 `PersistTodos` 持久化到 SQLite。`GET /sessions/:id/todos` 可在服务器重启后重新加载。
 
-### 6.5 图片识别工具
+### 6.5 媒体识别工具
 
-`image_recognize` 在需要回看历史图片且存在可用视觉能力时暴露给 LLM：
-- 当前会话 `use_image_recognition=true`，且系统配置 `vision_recognition.enabled=true`、指定的 provider/model 已存在。
-- 或者当前会话没有开启专门的图像识别模式，但历史上下文里有带 `upload_id` 的图片引用，并且当前对话模型本身支持视觉输入；此时工具使用当前 provider/model 做一次非流式识别。
+`media_recognize` 是图片、视频、音频的唯一模型可见识别入口。新调用优先使用存储无关的
+`input_ref/input_refs`；它既可以指向用户上传，也可以指向截图/生成工具产生的本地资产。
+旧 `upload_id/upload_ids` 参数继续兼容。handler 先校验引用属于当前会话，再根据 MIME
+类型选择执行策略；一次调用中的多个文件必须是同一种媒体类型：
 
-本轮刚上传的图片会先走 preflight：`ExpandAttachmentsCM()` 把图片作为 `SubmitToLLM=0` 的显示/持久化消息保存，agent 随后直接调用系统配置中的多模态模型识别这些“当前轮图片”，并把识别文本作为 system 上下文注入给主模型。该上下文必须标记为视觉/OCR 观察，不是用户指令；本轮主模型不再暴露 `image_recognize`，避免它自行选择错误的历史 `upload_id` 或重复调用。
+- 图片：优先使用会话选择且配置完整的 image 路由；没有独立路由但当前模型支持视觉时，fallback 到当前 provider/model。
+- 音频 / 视频：仅使用会话选择、配置完整且目标模型明确声明对应输入能力的路由。
+- 子代理：只在父会话共享了可验证的图片引用时获得图片识别能力；解析器仍绑定父会话，不能读取任意文件。
 
-没有新图片的后续追问仍可暴露 `image_recognize`：历史图片不会作为原图 payload 反复提交给主模型，而是替换为带 `upload_id` 的安全占位。工具 handler 通过会话上传引用校验 `upload_id` / `upload_ids`，再把一张或多张图片发给系统配置里的多模态模型；如果没有启用专门识图配置，则发给当前会话模型，把识别文本返回给主对话。没有任何可用视觉能力时，占位会要求模型提示用户重新上传图片或切换/配置视觉模型。
+本轮刚上传的图片在 `use_image_recognition=true` 时仍先走 preflight：`ExpandAttachmentsCM()` 把图片作为 `SubmitToLLM=0` 的显示/持久化消息保存，agent 直接调用系统配置中的多模态模型识别，并把事实观察文本作为 system 上下文注入主模型。本轮不暴露识别工具，避免重复调用或选错历史 `upload_id`。
+
+没有新图片的后续追问可暴露 `media_recognize`：历史媒体不会作为原始 payload 反复提交，而是替换为带 `upload_id` 的安全占位。没有任何可用识别能力时，占位会要求模型提示用户重新上传或切换/配置模型。
 
 识图模式优先级高于主模型视觉能力：即使当前主模型支持多模态，只要会话开启 `use_image_recognition` 且系统识图配置可用，当前轮图片二进制都不会发给主模型，避免主模型收到 `image_url` / image block。重答目标消息中的图片按“当前轮图片”处理，会重新识别或重新提交；更早的历史图片仍走占位 + 工具引用。
+
+浏览器 `browser_screenshot` 只有在当前模型支持视觉或会话启用系统识图时暴露。截图原始
+字节只用于当前视觉分析轮次，随后实体化到与媒体生成相同的会话资产仓库；工具 part 仅
+持久化 `asset_id`、同源 URL 与元数据。启用系统识图时先把截图转换为事实观察文本；未启用
+时把原图作为本轮视觉 payload 提交给主模型。后续轮次通过 `input_ref` 按需识别，不重复
+持久化或传输 base64。
+
+旧名称 `image_recognize` 是隐藏兼容别名：历史工具调用和旧白名单仍会映射到 `media_recognize`，但不会同时出现在模型 schema 中。
+
+### 6.6 本地文件统一读取
+
+`read_file` 根据扩展名选择读取策略：普通文本直接读取；PDF 交给 `knowledge.ExtractPDFText()`；DOCX/DOCM、XLSX/XLSM、PPTX/PPTM 交给 `knowledge.ExtractOfficeText()`。结果统一限制为 1 MiB，图片、音视频、压缩包和可执行文件仍明确拒绝。
+
+旧名称 `read_docx`、`read_pdf` 是隐藏兼容别名。用户上传的会话附件仍必须使用 `read_attachment(upload_id)`，不能把上传目录路径交给 `read_file`，以保留会话归属校验。
+
+`start_process` 同样保留为隐藏兼容别名；新调用统一使用 `exec_command(background=true)`。别名使用旧 handler 适配器，因此历史 `start_process` 调用仍会强制后台运行。
+
+### 6.7 会话附件读取工具
+
+`read_attachment` 只接受 `upload_id`，不接受文件系统路径。Agent 注入的 resolver 会先确认该上传引用属于当前会话，再从上传目录解析真实文件，因此模型不能借此读取其他会话或任意本地文件。工具支持普通文本/源码、PDF、DOCX/DOCM、XLSX/XLSM、PPTX/PPTM；未知二进制、旧版 Office 二进制格式等没有确定解析器的类型会明确返回不支持，模型不得声称已读。
+
+当前轮和历史轮的文档都以显示行加 system 引用进入上下文，正文只在模型确实调用 `read_attachment` 后提取。这样附件无需复制进项目目录，也不会把整份 Office/PDF 的二进制或 data URL 塞进提示词。该工具不向子代理暴露。
+
+### 6.8 媒体生成工具与硬开关
+
+`generate_image`、`generate_video`、`generate_audio` 是模型可见的稳定接口，
+厂商差异由 `internal/provider` 策略描述并生成请求 payload，`internal/generation`
+负责输入解析、HTTP 生命周期、轮询和资产落地。模型参数使用 canonical operation 与
+`input_refs`；不接受 URL、路径或 base64。
+
+工具是否出现在 schema 只是第一层体验优化。Agent 的统一派发入口会再次验证当前请求的
+工具允许列表；媒体 handler 还会在调用执行器前验证 operation 属于对应工具、会话已开启、
+目标模型有效、可信 dispatch 已由服务端注入、输入 ID 格式和必需媒体输入。任一条件失败
+返回结构化 `blocked`/`error`，不会请求厂商。不能把关闭能力只实现成 system prompt 隐藏。
+
+输入 ID 在 executor 内按会话归属解析；厂商输出实体化为本地生成资产，工具结果只返回
+`id/kind/mime_type/name/url`。详见
+[媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
+
+媒体执行器优先使用服务端注入的 `provider_id`/`strategy_variant` 选择媒体 JSON dialect；
+火山、MiniMax、Kling/可灵等官方 preset 不再依赖 endpoint 后缀来识别厂商。Custom 与旧配置仍保留
+兼容兜底：对于 `/contents/generations/tasks`、`/images/generations`、MiniMax 常见媒体端点等
+具有明确请求形状的路径，会在内部选择对应媒体 JSON dialect；其余端点回落到协议通用形状。
+图像、视频、音频 payload 规则已经拆到 provider 策略函数，generation 执行器不再承载
+厂商请求体分支。
+异步创建响应中的
+`task_id/taskId/id/job_id` 会被提取并替换查询后缀中的 `{task_id}` 或 `{id}`。查询后缀
+没有占位符时会在提交计费请求前失败；创建与查询路径看起来不一致且创建请求失败时，错误
+会附带可核对的任务集合路径，但不会自动修改用户配置。
+MiniMax H3 / V2 视频接口会使用 `content` 多模态数组、`ratio` 字段和官方模型名大小写；
+旧 MiniMax `/v1/video_generation` 仍保留 `prompt` / `first_frame_image` 形状。
+Kling/可灵媒体接口会使用 `model_name`，图/视频输入写入 `image` / `video` 字段，并将
+data URL 输入剥离为 base64 主体。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 
