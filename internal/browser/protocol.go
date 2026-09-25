@@ -77,6 +77,10 @@ type HelloParams struct {
 	ExtensionVersion string `json:"extension_version,omitempty"`
 	ProtocolVersion  string `json:"protocol_version,omitempty"`
 	ID               string `json:"id,omitempty"` // empty on first connect, set on reconnect
+	// PairToken 是配对凭据（决策票 #3 原型）；空表示尚未配对。
+	// PairToken is the pairing credential (ticket #3 prototype);
+	// empty means the extension is not paired yet.
+	PairToken string `json:"pair_token,omitempty"`
 }
 
 // HelloResponse is sent by the server after accepting a connection.
