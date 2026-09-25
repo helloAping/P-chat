@@ -120,6 +120,15 @@ const regularOptions = computed(() => {
   return q.options.map(opt => ({ ...opt, value: opt.label }))
 })
 
+/** LLM 习惯把「（推荐）」写在 label 末尾；拆出来渲染成徽标，正文不再重复。
+ * LLMs conventionally suffix the recommended option label with （推荐）;
+ * split it off so it renders as a badge instead of inline text. */
+function splitLabel(label: string): { text: string; recommended: boolean } {
+  const m = (label || '').match(/^(.*?)\s*[（(]\s*推荐\s*[)）]\s*$/)
+  if (m && m[1]) return { text: m[1].trim(), recommended: true }
+  return { text: label, recommended: false }
+}
+
 /** Show question text once; skip duplicate header echo. */
 const promptText = computed(() => {
   const q = currentQuestion.value
@@ -182,7 +191,6 @@ const promptText = computed(() => {
             :class="{ 'qopt-sel': isSelected(opt.value) }"
             role="button"
             tabindex="0"
-            :title="opt.description || opt.label"
             @click="selectOption(opt.value)"
             @keydown.enter.prevent="selectOption(opt.value)"
             @keydown.space.prevent="selectOption(opt.value)"
@@ -199,7 +207,13 @@ const promptText = computed(() => {
               tabindex="-1"
               class="qopt-ctrl"
             />
-            <span class="qopt-label">{{ opt.label }}</span>
+            <span class="qopt-text">
+              <span class="qopt-label">
+                {{ splitLabel(opt.label).text }}
+                <span v-if="splitLabel(opt.label).recommended" class="qopt-rec">推荐</span>
+              </span>
+              <span v-if="opt.description" class="qopt-desc">{{ opt.description }}</span>
+            </span>
           </div>
         </div>
 
@@ -371,19 +385,19 @@ const promptText = computed(() => {
   line-height: 1.4;
 }
 
-/* Dense option grid — single-line chips; desc via title tooltip. */
+/* Vertical option list — full label text wraps; description shows as a
+ * secondary line instead of hiding behind a tooltip. */
 .qopts {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 6px;
 }
 .qopt {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   min-width: 0;
-  min-height: 32px;
-  padding: 4px 8px;
+  padding: 6px 8px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: var(--surface-2);
@@ -406,17 +420,45 @@ const promptText = computed(() => {
 .qopt-ctrl {
   flex-shrink: 0;
   pointer-events: none;
+  margin-top: 1px;
+}
+.qopt-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 .qopt-label {
-  min-width: 0;
-  overflow: hidden;
   font-size: 12.5px;
   font-weight: 500;
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.4;
+  white-space: normal;
+  word-break: break-word;
 }
 .qopt-sel .qopt-label { font-weight: 600; }
+.qopt-rec {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  margin-left: var(--space-1);
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--brand-100);
+  color: var(--brand-600);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  vertical-align: 1px;
+}
+.qopt-desc {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 
 .qcustom {
   display: flex;
@@ -477,10 +519,8 @@ const promptText = computed(() => {
     margin-inline: var(--space-2);
     max-height: min(46vh, 400px);
   }
-  .qopts {
-    grid-template-columns: 1fr;
-  }
 }
+
 .question-dock-enter-active {
   transition:
     opacity var(--dur-base) var(--ease-out),

@@ -465,7 +465,11 @@ function messageKey(m: any, i: number): string | number {
     </div>
     <QuestionModal @locate-question="locateOpenQuestion" />
     <TodoPanel />
-    <SubAgentJobsPanel :session-id="state.currentID" @job-terminal="handleSubAgentJobTerminal" />
+    <SubAgentJobsPanel
+      :session-id="state.currentID"
+      @job-terminal="handleSubAgentJobTerminal"
+      @locate-result="jumpToBottom"
+    />
     <InputArea />
     <!-- P1-4: 锚定 FAB (jump-to-user-message). Shown
          when the user is scrolled up beyond the 50px

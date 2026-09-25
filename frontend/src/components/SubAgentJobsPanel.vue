@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { useMessage } from 'naive-ui'
+import { computed, h, onBeforeUnmount, ref, watch } from 'vue'
+import { NButton, useMessage, useNotification } from 'naive-ui'
 import { Activity, AlertCircle, Bot, CheckCircle2, ChevronDown, ChevronUp, Loader2, RotateCw, X, XCircle } from './icons'
 import {
   cancelSubAgentJob,
@@ -17,9 +17,11 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'job-terminal', job: SubAgentJob): void
+  (e: 'locate-result'): void
 }>()
 
 const message = useMessage()
+const notification = useNotification()
 const jobs = ref<SubAgentJob[]>([])
 const loading = ref(false)
 const error = ref('')
@@ -38,6 +40,8 @@ const panelExpanded = computed(() =>
 let pollTimer: number | null = null
 let retryTimer: number | null = null
 let clearTimer: number | null = null
+let notifyTimer: number | null = null
+let notifyBuffer: SubAgentJob[] = []
 let eventCtrl: AbortController | null = null
 let requestSeq = 0
 
@@ -163,12 +167,92 @@ function scheduleClearIfIdle() {
 }
 
 function notifyTerminal(job: SubAgentJob) {
-  if (job.status === 'succeeded') {
-    message.success(`后台子代理已完成：${jobLabel(job)}`)
-  } else if (job.status === 'failed') {
-    message.error(`后台子代理失败：${jobLabel(job)}`)
-  }
   emit('job-terminal', job)
+  // Batch terminal jobs finishing within a short window into a single
+  // notification card per outcome, so bursts don't stack toasts.
+  notifyBuffer.push(job)
+  if (notifyTimer !== null) return
+  notifyTimer = window.setTimeout(() => {
+    notifyTimer = null
+    flushNotifyBuffer()
+  }, 600)
+}
+
+function clearNotifyTimer() {
+  if (notifyTimer !== null) {
+    window.clearTimeout(notifyTimer)
+    notifyTimer = null
+  }
+  notifyBuffer = []
+}
+
+function jobNames(list: SubAgentJob[], max = 3): string {
+  const names = list.map(jobLabel)
+  if (names.length <= max) return names.join('、')
+  return `${names.slice(0, max).join('、')} 等 ${names.length} 个任务`
+}
+
+function flushNotifyBuffer() {
+  const batch = notifyBuffer
+  notifyBuffer = []
+  const succeeded = batch.filter((j) => j.status === 'succeeded')
+  const failed = batch.filter((j) => j.status === 'failed')
+  if (succeeded.length > 0) notifySucceeded(succeeded)
+  if (failed.length > 0) notifyFailed(failed)
+}
+
+function notifySucceeded(list: SubAgentJob[]) {
+  let close: (() => void) | null = null
+  const notice = notification.success({
+    title: list.length === 1 ? '后台子代理已完成' : `${list.length} 个后台子代理已完成`,
+    content: `${jobNames(list)}。结果已写入会话。`,
+    duration: 6000,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'primary',
+        onClick: () => {
+          close?.()
+          emit('locate-result')
+        },
+      },
+      { default: () => '查看结果' },
+    ),
+  })
+  close = () => notice.destroy()
+}
+
+function notifyFailed(list: SubAgentJob[]) {
+  const detail = list
+    .map((j) => {
+      const reason = latestProgress(j)
+      return reason ? `${jobLabel(j)}：${reason}` : jobLabel(j)
+    })
+    .slice(0, 3)
+    .join('；')
+  let close: (() => void) | null = null
+  const notice = notification.error({
+    title: list.length === 1 ? '后台子代理失败' : `${list.length} 个后台子代理失败`,
+    content: detail || '任务执行失败，可展开面板查看详情。',
+    duration: 0,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'error',
+        onClick: () => {
+          close?.()
+          collapsed.value = false
+          setComposerExpandedDock('subagent')
+        },
+      },
+      { default: () => '查看详情' },
+    ),
+  })
+  close = () => notice.destroy()
 }
 
 function handleJobEvent(ev: SubAgentJobEvent) {
@@ -314,6 +398,7 @@ watch(
     if (prev) setSessionBackgroundSubAgentJobs(prev, 0)
     stopEventStream()
     clearPoll()
+    clearNotifyTimer()
     dismissed.value = false
     refresh(true).finally(() => {
       syncBackgroundJobState()
@@ -359,6 +444,7 @@ onBeforeUnmount(() => {
   stopEventStream()
   clearPoll()
   clearAutoClearTimer()
+  clearNotifyTimer()
   requestSeq++
 })
 </script>

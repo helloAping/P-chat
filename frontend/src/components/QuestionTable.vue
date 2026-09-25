@@ -237,7 +237,8 @@ function promptLine(q: QuestionItem): string {
   line-height: 1;
 }
 
-/* Dense wrapping chips — label only, desc via title tooltip. */
+/* Wrapping chips — label may take up to two lines so long option text
+ * (e.g. "…（推荐）") stays readable in the history card. */
 .qt-options {
   display: flex;
   flex-wrap: wrap;
@@ -249,14 +250,15 @@ function promptLine(q: QuestionItem): string {
   gap: 5px;
   max-width: 100%;
   min-width: 0;
-  height: 26px;
-  padding: 0 8px 0 6px;
+  min-height: 26px;
+  height: auto;
+  padding: 3px 8px 3px 6px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: var(--surface-2);
   color: var(--text-secondary);
   font-size: 12px;
-  line-height: 1;
+  line-height: 1.35;
   transition:
     border-color var(--dur-fast) var(--ease-out),
     color var(--dur-fast) var(--ease-out),
@@ -281,7 +283,10 @@ function promptLine(q: QuestionItem): string {
   min-width: 0;
   overflow: hidden;
   color: inherit;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  word-break: break-word;
 }
 </style>
