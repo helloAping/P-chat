@@ -38,6 +38,7 @@ import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
 import IMSettings from './IMSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
+import KnowledgeRecallPreview from './KnowledgeRecallPreview.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
 import AppModal from './AppModal.vue'
 import ProviderHeadersEditor from './ProviderHeadersEditor.vue'
@@ -3825,6 +3826,21 @@ function kbModelSupportsVision(scanModel: string) {
                   </div>
                 </header>
 
+                <section class="kb-recall">
+                  <div class="kb-recall-head">
+                    <span class="kb-recall-title">召回预览</span>
+                    <span class="kb-recall-hint">验证助手实际会召回的知识片段</span>
+                  </div>
+                  <KnowledgeRecallPreview
+                    :key="kbSelected.name"
+                    :scope-options="[
+                      { label: '当前库', bases: [kbSelected.name] },
+                      { label: '全部知识库', bases: [] },
+                    ]"
+                    placeholder="输入问题，预览会召回的知识片段…"
+                  />
+                </section>
+
                 <div
                   v-if="kbScanStatus.has(kbSelected.name)"
                   class="scan-progress"
@@ -5633,6 +5649,31 @@ code {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+/* 全局库详情里的召回预览区 / recall preview section in the global detail pane. */
+.kb-recall {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.kb-recall-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.kb-recall-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+.kb-recall-hint {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
 }
 .kb-header {
   flex-shrink: 0;

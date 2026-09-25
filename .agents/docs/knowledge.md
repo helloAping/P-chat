@@ -517,7 +517,7 @@ LLM 收到错误 → 自行决策
 
 ### 11.1 知识库 Tab（`AppSettingsModal.vue`）
 
-左右分栏布局：
+左右分栏布局。详情页 header 后有 `.kb-recall` 召回预览区（`KnowledgeRecallPreview.vue`）：输入问题调用 `/knowledge/search`，按当前库 / 全部知识库两种范围预览实际召回的片段（rank / 标题 / score / 命中类型 / explanation / 内容预览），`:key="kbSelected.name"` 随选库重置。
 
 ```
 ┌─ Provider list (左) ──┬─ Detail pane (右) ───────────────┐
@@ -708,7 +708,8 @@ pchat-server 启动
 | `internal/config/config.go` | KnowledgeBase / KnowledgeConfig 类型定义 |
 | `internal/config/knowledge_config.go` | 配置持久化操作 |
 | `internal/recall/stub.go` | recall 工具 stub |
-| `frontend/src/components/AppSettingsModal.vue` | 知识库 Tab UI（左右分栏 + 三层树视图 + NCollapse） |
+| `frontend/src/components/AppSettingsModal.vue` | 知识库 Tab UI（左右分栏 + 三层树视图 + NCollapse + 召回预览区） |
+| `frontend/src/components/KnowledgeRecallPreview.vue` | 可复用召回预览面板（结果卡片 + citation 展示） |
 | `frontend/src/components/InputArea.vue` | 会话设置 popover + KB 选择 UI |
 | `frontend/src/api/client.ts` | 前端类型 + API 调用（含 NodeTreeItem + NodeContentItem） |
 | `frontend/src/stores/chat.ts` | sessionMeta 状态管理 |
