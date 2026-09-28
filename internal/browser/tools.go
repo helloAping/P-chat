@@ -161,7 +161,7 @@ func buildToolDefs() []tool.Tool {
 		},
 		{
 			Name:        "browser_evaluate",
-			Description: "Execute a JavaScript expression in the page context via an isolated world (bypasses page CSP). Returns the result as a string. Use for DOM queries, reading __INITIAL_STATE__, etc.",
+			Description: "Execute a JavaScript expression in the page context via an isolated world (bypasses page CSP). Returns the result as a string. Use for DOM queries, reading __INITIAL_STATE__, etc. Read-only by default: expressions that mutate the page or send data (fetch, postMessage, DOM writes, navigation, storage) are blocked unless browser.allow_eval_write=true.",
 			Parameters: tool.ObjectSchema(map[string]any{
 				"expression": tool.StringProp("JavaScript expression to evaluate. Has access to DOM APIs (querySelector, textContent, etc.) and page JS globals."),
 				"browser_id": bidPropOpt,
@@ -360,11 +360,21 @@ func gateBrowserCall(
 	cfg := policyFn()
 	verdict := Decide(cfg, toolName, params, pageURL)
 
-	// evaluate write guard (independent of domain policy).
+	// evaluate write guard (independent of domain policy): with
+	// browser.allow_eval_write=false (the default) expressions that
+	// obviously mutate the page or exfiltrate data are blocked
+	// outright — the config promises read-only evaluate, so this
+	// fails closed instead of asking.
 	if toolName == "browser_evaluate" && !cfg.AllowEvalWrite {
-		// Soft note only — we still allow the call; the extension
-		// side may further restrict. Leave as policy signal for now.
-		_ = cfg.AllowEvalWrite
+		if expr, _ := params["expression"].(string); LooksLikeEvalWrite(expr) {
+			return true, &tool.CallResult{
+				Content: fmt.Sprintf(
+					"E_BROWSER_POLICY: blocked\n  tool: %s\n  url: %s\n  reason: browser.allow_eval_write=false — the expression looks like it writes to the page or sends data (fetch / postMessage / DOM mutation / navigation / storage). Use read-only expressions, or set browser.allow_eval_write=true to allow page-mutating JS.",
+					toolName, pageURL,
+				),
+				IsError: true,
+			}
+		}
 	}
 
 	switch verdict.Decision {

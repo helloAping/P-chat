@@ -9,6 +9,7 @@ package browser
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/config"
@@ -245,4 +246,50 @@ func Decide(cfg PolicyConfig, toolName string, params map[string]any, pageURL st
 		v.Reason = fmt.Sprintf("%s is read-only / low risk", toolName)
 	}
 	return v
+}
+
+// evalWritePatterns lists high-confidence page-mutation / data-exfiltration
+// idioms in JavaScript. Deliberately conservative: plain reads like
+// `document.title`, `el.textContent`, `location.href` (no assignment) or
+// local variable assignment (`const a = ...`) must NOT match.
+var evalWritePatterns = []*regexp.Regexp{
+	// Network exfiltration / code loading.
+	regexp.MustCompile(`\bfetch\s*\(`),
+	regexp.MustCompile(`\bXMLHttpRequest\b`),
+	regexp.MustCompile(`\bsendBeacon\s*\(`),
+	regexp.MustCompile(`\bpostMessage\s*\(`),
+	regexp.MustCompile(`\bwindow\.open\s*\(`),
+	regexp.MustCompile(`\beval\s*\(`),
+	regexp.MustCompile(`\bnew\s+Function\s*\(`),
+	regexp.MustCompile(`\bimport\s*\(`),
+	regexp.MustCompile(`\bdocument\.write(?:ln)?\s*\(`),
+	// Navigation.
+	regexp.MustCompile(`\blocation(?:\.[A-Za-z]+)?\s*=[^=]`),
+	regexp.MustCompile(`\blocation\.(?:assign|replace|reload)\s*\(`),
+	// Storage / cookies.
+	regexp.MustCompile(`\bdocument\.cookie\s*=[^=]`),
+	regexp.MustCompile(`\b(?:localStorage|sessionStorage)\.(?:setItem|removeItem|clear)\s*\(`),
+	regexp.MustCompile(`\bindexedDB\.(?:open|deleteDatabase)\s*\(`),
+	// DOM mutation: property assignment on elements.
+	regexp.MustCompile(`\.(?:innerHTML|outerHTML|textContent|innerText|value|checked|disabled|href|src)\s*=[^=]`),
+	// DOM mutation: method calls (click/submit included — evaluate must
+	// not replace the dedicated browser_click / form tools).
+	regexp.MustCompile(`\.(?:appendChild|removeChild|insertBefore|replaceChild|append|prepend|remove|replaceWith|setAttribute|removeAttribute|submit|click)\s*\(`),
+	// Assignment to globals (window.x = / document.x = / globalThis.x =).
+	regexp.MustCompile(`\b(?:window|document|globalThis)\.[A-Za-z_$][\w$]*\s*=[^=]`),
+}
+
+// LooksLikeEvalWrite reports whether a browser_evaluate expression obviously
+// writes to the page or sends data out. It is a best-effort fail-closed
+// heuristic for browser.allow_eval_write=false: it cannot catch obfuscated
+// writes (e.g. computed member access `el["inner"+"HTML"] = x`), so
+// allow_eval_write=true remains the documented escape hatch for automation
+// that legitimately mutates pages.
+func LooksLikeEvalWrite(expr string) bool {
+	for _, re := range evalWritePatterns {
+		if re.MatchString(expr) {
+			return true
+		}
+	}
+	return false
 }
