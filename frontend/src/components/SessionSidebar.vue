@@ -34,7 +34,7 @@ import { computed, ref, onMounted, watch, h, type Component } from 'vue'
 import { NButton, NInput, NScrollbar, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
-  loadProjects, setActiveProject,
+  loadProjects, setActiveProject, jumpToSearchResult,
 } from '../stores/chat'
 import * as api from '../api/client'
 import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
@@ -313,7 +313,10 @@ function clearSearch() {
 
 function jumpToResult(r: SearchResult) {
   clearSearch()
-  switchSession(r.conversation_id)
+  // SM-01: locate the exact message, not just the session. The store
+  // action switches sessions, pages older history in until the hit is
+  // loaded, then hands off to ChatWindow for scroll + highlight.
+  jumpToSearchResult(r.conversation_id, r.message_id)
 }
 
 // ---------------------------------------------------------------------------

@@ -321,6 +321,12 @@ export const state = reactive({
   // (or flash the empty state while history is in flight).
   viewLoading: false,
   viewLoadingHint: '' as string,
+  // Pending search-result jump target. SessionSidebar's message
+  // search sets this after switching sessions; ChatWindow watches
+  // it, scrolls the matching [data-msg-id] bubble into view, and
+  // flashes a highlight. `ts` makes repeated jumps to the same
+  // message re-trigger the watcher.
+  searchJumpTarget: null as { sessionID: string; messageID: number; ts: number } | null,
 })
 
 export const currentMessages = computed(() =>
@@ -1123,6 +1129,31 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
   } finally {
     paging.loading = false
   }
+}
+
+// jumpToSearchResult switches to the session and locates a specific
+// message (from the sidebar's full-text search). The first history page
+// holds only the 50 most recent messages, so older hits are paged in via
+// loadMoreMessages until the target row is present — then
+// state.searchJumpTarget hands off to ChatWindow, which scrolls the
+// bubble into view and flashes a highlight.
+//
+// The page loop is bounded (40 pages ≈ 2000 rows) so a stale message_id
+// (e.g. the row was deleted after indexing) terminates instead of
+// walking the entire history.
+export async function jumpToSearchResult(sessionID: string, messageID: number): Promise<void> {
+  if (!sessionID || !messageID || messageID <= 0) return
+  await switchSession(sessionID)
+  // switchSession early-returns when the session is already active and
+  // loaded, so by this point sessionMessages[sessionID] reflects at
+  // least the most recent page.
+  for (let i = 0; i < 40; i++) {
+    const msgs = state.sessionMessages[sessionID]
+    if (msgs?.some(m => m.id === messageID)) break
+    const more = await loadMoreMessages(sessionID)
+    if (!more) break
+  }
+  state.searchJumpTarget = { sessionID, messageID, ts: Date.now() }
 }
 
 // refreshLatestMessages merges the newest server-side rows into an already

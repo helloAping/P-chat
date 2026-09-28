@@ -224,6 +224,33 @@ function locateOpenQuestion() {
   el.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
+// SM-01: search-result jump. SessionSidebar's message search hands off
+// via state.searchJumpTarget (after switchSession + paging the target
+// row in). We poll for the bubble's [data-msg-id] node — the messages
+// array is already populated at this point, but a large history page
+// can take a frame or two to reach the DOM — then center it and flash
+// an accent ring so the user can spot the hit.
+watch(() => state.searchJumpTarget, async (target) => {
+  if (!target || target.sessionID !== state.currentID) return
+  for (let i = 0; i < 20; i++) {
+    await nextTick()
+    const el = messagesEl.value?.querySelector(
+      `[data-msg-id="${target.messageID}"]`,
+    ) as HTMLElement | null
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      el.classList.add('search-hit-flash')
+      setTimeout(() => el.classList.remove('search-hit-flash'), 2400)
+      state.searchJumpTarget = null
+      return
+    }
+    await new Promise(r => setTimeout(r, 50))
+  }
+  // Target row never rendered (deleted after indexing, or paged out) —
+  // clear the handoff so a later unrelated render doesn't trigger it.
+  state.searchJumpTarget = null
+})
+
 // onScroll is bound to the messages container. Two jobs:
 //   1. Refresh isAtBottom so the button can show/hide.
 //   2. When the user scrolls within ~80px of the top, kick
@@ -830,5 +857,22 @@ function messageKey(m: any, i: number): string | number {
 .anchor-btn-leave-to {
   opacity: 0;
   transform: translateY(8px);
+}
+
+/* SM-01: search-hit flash. The bubble located via a sidebar search
+   jump gets an accent outline that holds briefly then fades; the
+   class is removed after 2.4s so the animation is strictly one-shot
+   (no continuous compositor cost, per the GPU budget rules). The
+   attribute lives on MessageBubble's root, hence :deep(). */
+:deep(.search-hit-flash) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-lg);
+  animation: search-hit-fade 2.4s var(--ease-out) forwards;
+}
+@keyframes search-hit-fade {
+  0% { outline-color: var(--accent); }
+  70% { outline-color: var(--accent); }
+  100% { outline-color: transparent; }
 }
 </style>
