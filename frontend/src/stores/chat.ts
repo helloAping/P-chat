@@ -2265,6 +2265,24 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         }
       }
       break
+    case 'stream_reset': {
+      // The LLM attempt that produced the current round's
+      // text/thinking deltas failed mid-stream and is being
+      // retried (the backend reset its own accumulators and
+      // re-streams from scratch). Drop every text/thinking part
+      // the failed attempt appended so the retried deltas don't
+      // stack on top of the partial output. Skill / tool /
+      // question parts are kept — they don't belong to the
+      // failed attempt's stream.
+      const parts = sub ? sub.parts : m.parts!
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const k = parts[i].kind
+        if (k === 'text' || k === 'thinking') {
+          parts.splice(i, 1)
+        }
+      }
+      break
+    }
     case 'content_rewrite': {
       // Post-stream redactor rewrote the assistant's trailing
       // text. Replace the existing trailing text part in place

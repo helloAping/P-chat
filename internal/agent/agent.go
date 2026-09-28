@@ -1610,6 +1610,16 @@ type ChatStreamChunk struct {
 	// is "content_rewrite" (handled in chunkToEvent).
 	ContentRewrite string `json:"content_rewrite,omitempty"`
 
+	// StreamReset asks the frontend (and the parts accumulator) to
+	// drop the current round's streamed text/thinking parts because
+	// the LLM attempt that produced them failed mid-stream and the
+	// retry is about to re-stream from scratch. Without this the
+	// retried attempt's deltas would be appended on top of the
+	// failed attempt's partial output — the user sees duplicated
+	// text and the persisted parts carry the same duplication.
+	// Type field on the SSE event is "stream_reset".
+	StreamReset bool `json:"stream_reset,omitempty"`
+
 	// SessionStatus carries the lifecycle state of the chat
 	// turn: "busy" at the start of ChatWithTools, "idle" at
 	// every exit point (success, error, cancel, max-rounds,
@@ -2721,6 +2731,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if ac := AbortContextFrom(ctx); ac != nil {
 				retryCtx = ac
 			}
+			// Snapshot the turn-level token totals before the first
+			// attempt. A mid-stream failure followed by a retry must
+			// roll the totals back to this point — the failed attempt's
+			// usage deltas were already added to totalIn/totalOut and
+			// the retry's fresh requestUsage would add them again.
+			roundStartTotalIn, roundStartTotalOut := totalIn, totalOut
 		att:
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				var usage requestUsage
@@ -2745,6 +2761,39 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						timer.Stop()
 						return
 					case <-timer.C:
+					}
+
+					// Reset every per-attempt accumulator so the retry
+					// re-streams from a clean slate instead of stacking
+					// on top of the failed attempt's partial output:
+					//   - fullContentBuilder/fullThinkingBuilder: final
+					//     reply text (would otherwise be duplicated)
+					//   - argsAccum: tool-call args JSON (would otherwise
+					//     be concatenated into invalid JSON)
+					//   - streamBytes: per-round output budget accounting
+					//   - totalIn/totalOut: roll back the failed attempt's
+					//     usage deltas (usage itself is per-attempt)
+					//   - partsAcc + stream_reset event: drop the partial
+					//     text/thinking parts already shown in the UI
+					hadPartial := fullContentBuilder.Len() > 0 || fullThinkingBuilder.Len() > 0
+					fullContentBuilder.Reset()
+					fullThinkingBuilder.Reset()
+					argsAccum = make(map[int]*nativeToolCall)
+					streamBytes = 0
+					totalIn, totalOut = roundStartTotalIn, roundStartTotalOut
+					if hadPartial {
+						// The UI already carries partial text/thinking
+						// from the failed attempt — tell it to drop them
+						// before the retry's deltas arrive.
+						partsAcc.update(ChatStreamChunk{StreamReset: true})
+						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
+							Phase:       "llm",
+							Step:        "stream-reset",
+							Message:     "上一次尝试中断，已清空部分输出并重试",
+							Round:       roundNum,
+							MaxRound:    maxRounds,
+							StreamReset: true,
+						})
 					}
 				}
 
@@ -2830,7 +2879,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							retryableErr = fmt.Errorf("LLM stream stalled: no data received for %s", stallTimeout)
 							retryableErrKind = llm.KindTimeout
 							cancelStream()
-							break // break inner stream loop → outer retries
+							// Exit the inner stream loop for real. A bare
+							// `break` here would only leave the select, and
+							// the next iteration would consume the
+							// context.Canceled chunk that cancelStream
+							// provokes — misreading it as a fresh terminal
+							// error and returning before the retry ever
+							// runs. Flag the loop closed instead so control
+							// reaches the outer attempt loop.
+							streamOpen = false
+							continue
 						}
 						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 							Phase:     "llm",

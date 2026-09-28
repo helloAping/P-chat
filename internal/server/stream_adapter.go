@@ -129,6 +129,16 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.Content = chunk.Content
 		return ev
 	}
+	// StreamReset: a failed LLM attempt is being retried and the
+	// partial text/thinking it streamed must be dropped from the
+	// live bubble. Routed as its own event type so the chat store
+	// can remove parts rather than append. Must be checked before
+	// the Phase fallthrough — the chunk carries Phase="llm" for
+	// context but is not a status note.
+	if chunk.StreamReset {
+		ev.Type = "stream_reset"
+		return ev
+	}
 	// ContentRewrite: the agent's post-stream redactor rewrote
 	// the assistant's trailing text (e.g. stripped a phantom
 	// vision error). The UI should REPLACE the trailing text

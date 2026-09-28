@@ -754,6 +754,32 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		return
 	}
 
+	// StreamReset: the LLM attempt that produced the current round's
+	// text/thinking deltas failed mid-stream and is being retried.
+	// Drop every text/thinking part accumulated by the failed attempt
+	// so the retry re-streams onto a clean bubble instead of
+	// duplicating content. Skill / tool / question parts are kept:
+	// skill cards are emitted before the stream starts, and tool
+	// parts only exist after a successful stream (tools dispatch
+	// post-Done), so neither can belong to the failed attempt.
+	if c.StreamReset {
+		parts, subIdx := a.activePartsFor(c)
+		kept := parts[:0]
+		for _, p := range parts {
+			if p.Kind == "text" || p.Kind == "thinking" {
+				continue
+			}
+			kept = append(kept, p)
+		}
+		// Zero the tail so the dropped parts' buffers are
+		// garbage-collectable, then store the compacted list.
+		for i := len(kept); i < len(parts); i++ {
+			parts[i] = MessagePart{}
+		}
+		a.setPartsFor(subIdx, kept)
+		return
+	}
+
 	// ContentRewrite: replace the trailing text part in-place
 	// with the rewritten version. The post-stream redactor
 	// (agent.go) emits this AFTER the stream ends to sanitize

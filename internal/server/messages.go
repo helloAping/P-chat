@@ -809,10 +809,11 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 //  5. ToolName 非空          → type:"tool"        (工具调用结果)
 //  6. Thinking 非空          → type:"thinking"    (思考增量)
 //  7. Content 非空           → type:"content"     (文本增量)
-//  8. ContentRewrite 非空    → type:"content_rewrite" (后处理文本重写)
-//  9. ThinkingRewrite 非空   → type:"thinking_rewrite"
-//  10. Phase 非空             → type:"phase"       (子代理开始/结束 + 系统状态)
-//  11. 其他                   → type:"phase"       (心跳)
+//  8. StreamReset == true    → type:"stream_reset"  (LLM 重试，丢弃部分输出)
+//  9. ContentRewrite 非空    → type:"content_rewrite" (后处理文本重写)
+//  10. ThinkingRewrite 非空   → type:"thinking_rewrite"
+//  11. Phase 非空             → type:"phase"       (子代理开始/结束 + 系统状态)
+//  12. 其他                   → type:"phase"       (心跳)
 //
 // Sub_agent 字段在所有分支中无条件拷贝，确保子代理的 content/thinking/tool/phase
 // 事件全部带有 sub_agent=true 标记，前端能正确路由到嵌套 SubAgentCard。
