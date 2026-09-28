@@ -11,7 +11,7 @@ package server
 // the heartbeat interval and heap-dump threshold at runtime via the
 // /api/v1/diagnostics/config endpoint.
 //
-//	PC_PPROF             "0" disables the /debug/pprof endpoint (default on)
+//	PC_PPROF             "1" enables the /debug/pprof endpoint (default off)
 //	PC_MEM_HEARTBEAT_SEC seconds between heartbeat log lines (default 30, 0 = off)
 //	PC_HEAP_DUMP_MB      auto-dump heap profile when heap exceeds this MB
 //	                     (default 1024, 0 = off)
@@ -38,8 +38,12 @@ import (
 // /debug/pprof/* (heap, goroutine, allocs, profile, ...). net/http/pprof
 // registers its handlers on http.DefaultServeMux when imported, so we delegate
 // the whole subtree to it.
+//
+// The endpoint is opt-in (PC_PPROF=1): heap/goroutine snapshots can contain
+// secrets and message content, so an unauthenticated local endpoint must not
+// be on by default.
 func registerPprof(r *gin.Engine) {
-	if os.Getenv("PC_PPROF") == "0" {
+	if os.Getenv("PC_PPROF") != "1" {
 		return
 	}
 	serve := func(w http.ResponseWriter, req *http.Request) {
@@ -113,7 +117,7 @@ func (m *memoryMonitor) config() DiagnosticsConfig {
 	return DiagnosticsConfig{
 		MemHeartbeatSec: m.heartbeatSec,
 		HeapDumpMB:      m.heapDumpMB,
-		PprofEnabled:    os.Getenv("PC_PPROF") != "0",
+		PprofEnabled:    os.Getenv("PC_PPROF") == "1",
 		HeapDumpDir:     m.heapDumpDir,
 	}
 }

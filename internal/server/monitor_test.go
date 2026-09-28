@@ -11,8 +11,8 @@ import (
 )
 
 // TestRegisterPprof verifies the /debug/pprof endpoints are reachable when
-// enabled (default), so the user can capture a live heap/goroutine profile
-// while the server's memory is spiking.
+// explicitly enabled (PC_PPROF=1), so the user can capture a live
+// heap/goroutine profile while the server's memory is spiking.
 func TestRegisterPprof(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("PC_PPROF", "1")
@@ -41,18 +41,22 @@ func TestRegisterPprof(t *testing.T) {
 	}
 }
 
-// TestRegisterPprof_Disabled verifies PC_PPROF=0 turns the endpoint off.
+// TestRegisterPprof_Disabled verifies the endpoint stays off unless
+// PC_PPROF=1: both an explicit "0" and the unset/empty default must disable
+// it, because heap/goroutine snapshots can contain secrets.
 func TestRegisterPprof_Disabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	t.Setenv("PC_PPROF", "0")
-	r := gin.New()
-	registerPprof(r)
+	for _, v := range []string{"0", ""} {
+		t.Setenv("PC_PPROF", v)
+		r := gin.New()
+		registerPprof(r)
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
-	r.ServeHTTP(w, req)
-	if w.Code == http.StatusOK {
-		t.Error("pprof should be disabled when PC_PPROF=0")
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+		r.ServeHTTP(w, req)
+		if w.Code == http.StatusOK {
+			t.Errorf("pprof should be disabled when PC_PPROF=%q (default off)", v)
+		}
 	}
 }
 
@@ -82,7 +86,7 @@ func TestMemoryMonitor_ConfigUpdate(t *testing.T) {
 		t.Fatalf("config = %+v, want heartbeat=11 dump=22", c)
 	}
 	if !c.PprofEnabled {
-		t.Error("pprof should be enabled when PC_PPROF != 0")
+		t.Error("pprof should be enabled when PC_PPROF == 1")
 	}
 
 	sec, mb := 60, 4096

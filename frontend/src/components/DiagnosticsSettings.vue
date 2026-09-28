@@ -199,7 +199,7 @@ onBeforeUnmount(() => {
       <div class="card-head">
         <span class="card-title">监控配置</span>
         <NTag v-if="config" size="small" :type="config.pprof_enabled ? 'success' : 'default'">
-          pprof {{ config.pprof_enabled ? '已开启' : '已关闭 (PC_PPROF=0)' }}
+          pprof {{ config.pprof_enabled ? '已开启' : '已关闭 (PC_PPROF=1 开启)' }}
         </NTag>
       </div>
 
