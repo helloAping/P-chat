@@ -1101,6 +1101,13 @@ func (c *localContext) ScanKBs() (added, updated int, err error) {
 	if c.r.kbManager == nil {
 		return 0, 0, &ErrUnsupported{Op: "ScanKBs"}
 	}
+	// Actually rebuild the index for every enabled base — the previous
+	// implementation only counted existing nodes (ScanStats), so `/kb scan`
+	// returned success without ever scanning anything. KBManager.Scan("")
+	// walks all enabled bases and rewrites their L1/L2/L3 index trees.
+	if err := c.r.kbManager.Scan(""); err != nil {
+		return 0, 0, err
+	}
 	return c.r.kbManager.ScanStats()
 }
 

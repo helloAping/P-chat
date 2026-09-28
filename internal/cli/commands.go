@@ -3055,13 +3055,16 @@ func cmdKB(ctx cliContext, args string) error {
 			color.Red("  ✗ %v", err)
 		}
 	case "scan", "index":
-		if _, _, err := ctx.ScanKBs(); err != nil {
+		added, _, err := ctx.ScanKBs()
+		if err != nil {
 			if isUnsupported(err) {
 				color.HiBlack("  (知识库未初始化)")
 				return nil
 			}
 			color.Red("  ✗ %v", err)
+			return nil
 		}
+		color.Green("  ✓ 索引重建完成：共 %d 个节点", added)
 	default:
 		color.HiBlack("  未知子命令: %s  (list | add | remove | scan)", subcmd)
 	}

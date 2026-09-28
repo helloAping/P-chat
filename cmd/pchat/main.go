@@ -213,6 +213,13 @@ func runREPL(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Wire up the /kb command surface. Without this the local REPL's
+	// kbManager stays nil and every /kb subcommand reports "知识库未初始化".
+	// The manager is attached unconditionally (even when the knowledge
+	// system is disabled) so `/kb add` can flip it on — AddPath enables
+	// cfg.Knowledge.Enabled as part of persisting the new base.
+	repl.SetKBManager(cli.NewKBManager(cfg))
+
 	// Run REPL in a goroutine; listen for SIGINT in the main goroutine
 	// so we can cleanly stop the server on Ctrl+C.
 	replDone := make(chan error, 1)
