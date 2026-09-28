@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -262,7 +263,9 @@ func (a *OpenAIResponsesAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				return
 			}
 			rawEvents++
-			if rawEvents <= 3 {
+			if rawEvents <= 3 && os.Getenv("PC_LLM_DEBUG") == "1" {
+				// Verbatim event dump for proxy debugging; gated
+				// because payloads contain user content.
 				log.Printf("[llm/%s/responses] raw #%d: %s", a.name, rawEvents, string(payload))
 			}
 			if proxyErr := extractProxyError(payload); proxyErr != "" {

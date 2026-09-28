@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -494,7 +495,9 @@ func (a *OpenAIAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				return
 			}
 			rawChunks++
-			if rawChunks <= 3 {
+			if rawChunks <= 3 && os.Getenv("PC_LLM_DEBUG") == "1" {
+				// Verbatim chunk dump for proxy debugging; gated
+				// because payloads contain user content.
 				log.Printf("[llm/%s] raw #%d: %s", a.name, rawChunks, string(payload))
 			}
 

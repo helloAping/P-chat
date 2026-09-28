@@ -861,16 +861,16 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		// "data: " followed by the JSON payload, and a final
 		// "data: [DONE]" sentinel.
 		//
-		// We log the first 3 raw chunks and a final summary
-		// (chunk count / content chars / thinking chars /
-		// parse failures) at the end of the stream. This
-		// is invaluable when debugging proxy gateways (like
-		// api-convert.08ms.cn) that occasionally rename the
-		// standard fields — e.g. an upstream that uses
-		// `delta.text` instead of `delta.content` will
-		// surface a "0 chars received" line at the end of
-		// the stream and the user can copy the raw chunk
-		// dump into the issue tracker.
+		// We log the first 3 raw chunks (only with PC_LLM_DEBUG=1 —
+		// they contain user content) and a final summary (chunk
+		// count / content chars / thinking chars / parse failures)
+		// at the end of the stream. This is invaluable when
+		// debugging proxy gateways (like api-convert.08ms.cn) that
+		// occasionally rename the standard fields — e.g. an
+		// upstream that uses `delta.text` instead of `delta.content`
+		// will surface a "0 chars received" line at the end of the
+		// stream, and with PC_LLM_DEBUG=1 the user can copy the raw
+		// chunk dump into the issue tracker.
 		reader := bufio.NewReaderSize(streamBody, 1<<20)
 		var (
 			rawChunks     int
@@ -917,8 +917,13 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			payload := bytes.TrimPrefix(line, []byte("data: "))
 			if bytes.Equal(payload, []byte("[DONE]")) {
 				ch <- StreamChunk{Done: true}
-				log.Printf("%s[llm/%s/%s] stream ended at [DONE]: chunks=%d content=%d thinking=%d parse_errs=%d",
-					trace.LogPrefix(ctx), p.name, model, rawChunks, contentChars, thinkingChars, parseFailures)
+				// Same gating as the EOF path: the summary is
+				// useful when parsing broke, but a healthy
+				// stream shouldn't fill the log by default.
+				if parseFailures > 0 || os.Getenv("PC_LLM_DEBUG") == "1" {
+					log.Printf("%s[llm/%s/%s] stream ended at [DONE]: chunks=%d content=%d thinking=%d parse_errs=%d",
+						trace.LogPrefix(ctx), p.name, model, rawChunks, contentChars, thinkingChars, parseFailures)
+				}
 				return
 			}
 			rawChunks++
@@ -926,16 +931,22 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 				// Dump the first few raw chunks verbatim so
 				// the field names are visible in the server
 				// log when debugging a misbehaving proxy.
-				log.Printf("%s[llm/%s/%s] raw chunk #%d: %s", trace.LogPrefix(ctx), p.name, model, rawChunks, string(payload))
+				// Gated on PC_LLM_DEBUG=1: payloads contain
+				// user content / reasoning and must not land
+				// on disk by default.
+				if os.Getenv("PC_LLM_DEBUG") == "1" {
+					log.Printf("%s[llm/%s/%s] raw chunk #%d: %s", trace.LogPrefix(ctx), p.name, model, rawChunks, string(payload))
+				}
 			}
 			var r openaiStreamResponse
 			if err := json.Unmarshal(payload, &r); err != nil {
 				// Skip malformed lines (some providers send
 				// keepalive pings or partial JSON during
-				// reconnects).
+				// reconnects). Truncate the payload in the
+				// log — it may carry user-visible content.
 				parseFailures++
 				if parseFailures <= 3 {
-					log.Printf("%s[llm/%s/%s] parse error on chunk #%d: %v payload=%s", trace.LogPrefix(ctx), p.name, model, rawChunks, err, string(payload))
+					log.Printf("%s[llm/%s/%s] parse error on chunk #%d: %v payload=%s", trace.LogPrefix(ctx), p.name, model, rawChunks, err, truncateForLog(payload, 256))
 				}
 				continue
 			}
@@ -1469,8 +1480,11 @@ func extractContent(payload []byte) (string, string) {
 	}
 	// Walker failed — log the payload shape so a misbehaving
 	// proxy can be debugged. Truncate to 512 bytes to avoid
-	// log spam.
-	log.Printf("[llm] extractContent: walker found no match in payload (first 512 bytes): %s", truncateForLog(payload, 512))
+	// log spam, and gate on the debug knob because the payload
+	// may carry user-visible content (same as extractThinking).
+	if os.Getenv("PC_LLM_DEBUG") == "1" {
+		log.Printf("[llm] extractContent: walker found no match in payload (first 512 bytes): %s", truncateForLog(payload, 512))
+	}
 	return "", ""
 }
 
