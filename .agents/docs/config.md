@@ -76,8 +76,9 @@ LLMConfig 核心字段：
 2. 若 `projectRoot` 非空，加载 `<project>/.p-chat/config.json`
 3. 项目配置覆盖全局配置（shallow merge）
 
-显式 `--config <path>` 是最高优先级 overlay。需要从 CLI 修改知识库配置时，
-`KBManager` 必须保留这条活动路径，并调用 `UpdateKnowledgeConfigAt(path, patch)`：
+显式 `--config <path>` 是最高优先级 overlay。CLI `KBManager` 与 `pchat-server` 的知识库
+REST 端点都必须保留这条活动路径，并调用 `UpdateKnowledgeConfigAt(path, patch)` 及对应的
+`AddKnowledgeBaseRecordAt` / `RemoveKnowledgeBaseRecordAt`：
 
 - `path == ""`：沿用全局配置写入；
 - custom path：只更新该 JSON 中显式提交的 `knowledge` 子字段；

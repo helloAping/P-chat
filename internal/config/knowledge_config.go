@@ -132,7 +132,14 @@ func patchKnowledgeOverlay(configPath string, patch KnowledgeConfigPatch) error 
 
 // AddKnowledgeBaseRecord appends a knowledge base config and saves.
 func AddKnowledgeBaseRecord(base KnowledgeBase) error {
-	cfg, err := Load("")
+	return AddKnowledgeBaseRecordAt("", base)
+}
+
+// AddKnowledgeBaseRecordAt 在活动配置路径追加知识库，并保留自定义配置的 overlay 语义。
+// AddKnowledgeBaseRecordAt appends a knowledge base at the active config path
+// while preserving custom-config overlay semantics.
+func AddKnowledgeBaseRecordAt(configPath string, base KnowledgeBase) error {
+	cfg, err := Load(configPath)
 	if err != nil {
 		return err
 	}
@@ -153,14 +160,21 @@ func AddKnowledgeBaseRecord(base KnowledgeBase) error {
 			return fmt.Errorf("knowledge base %q already exists", base.Name)
 		}
 	}
-	cfg.Knowledge.Bases = append(cfg.Knowledge.Bases, base)
-	mgr := NewManager()
-	return mgr.SaveGlobal(cfg)
+	bases := append(append([]KnowledgeBase(nil), cfg.Knowledge.Bases...), base)
+	_, err = UpdateKnowledgeConfigAt(configPath, KnowledgeConfigPatch{Bases: &bases})
+	return err
 }
 
 // RemoveKnowledgeBaseRecord deletes a knowledge base config by name and saves.
 func RemoveKnowledgeBaseRecord(name string) error {
-	cfg, err := Load("")
+	return RemoveKnowledgeBaseRecordAt("", name)
+}
+
+// RemoveKnowledgeBaseRecordAt 从活动配置路径删除知识库，并保留未知及继承字段。
+// RemoveKnowledgeBaseRecordAt deletes a knowledge base at the active config
+// path while preserving unknown and inherited fields.
+func RemoveKnowledgeBaseRecordAt(configPath, name string) error {
+	cfg, err := Load(configPath)
 	if err != nil {
 		return err
 	}
@@ -175,7 +189,8 @@ func RemoveKnowledgeBaseRecord(name string) error {
 	if idx < 0 {
 		return fmt.Errorf("knowledge base %q not found", name)
 	}
-	cfg.Knowledge.Bases = append(bases[:idx], bases[idx+1:]...)
-	mgr := NewManager()
-	return mgr.SaveGlobal(cfg)
+	updatedBases := append([]KnowledgeBase(nil), bases[:idx]...)
+	updatedBases = append(updatedBases, bases[idx+1:]...)
+	_, err = UpdateKnowledgeConfigAt(configPath, KnowledgeConfigPatch{Bases: &updatedBases})
+	return err
 }

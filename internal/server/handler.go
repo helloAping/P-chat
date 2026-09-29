@@ -31,8 +31,13 @@ import (
 // agent and the persistent memory store so that messages and
 // sessions survive across requests.
 type Handler struct {
-	agent      *agent.Agent
-	cfg        atomic.Pointer[config.Config]
+	agent *agent.Agent
+	cfg   atomic.Pointer[config.Config]
+	// configPath 是启动服务器时使用的可选 --config overlay 路径。
+	// configPath is the optional --config overlay used to load this server.
+	// 修改配置的端点必须用它完成持久化和热重载。
+	// Config-mutating endpoints must use it for both persistence and reloads.
+	configPath string
 	store      *memory.Store
 	styleMgr   *style.Manager
 	summarizer *memory.Summarizer
@@ -158,14 +163,23 @@ type sessionMetaBlob struct {
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager) *Handler {
+	return NewHandlerWithConfigPath(a, cfg, store, styleMgr, toolReg, mcpMgr, "")
+}
+
+// NewHandlerWithConfigPath 构造从 configPath 持久化并重载配置的处理器；空路径沿用全局配置。
+// NewHandlerWithConfigPath constructs a handler whose configuration changes
+// are persisted to and reloaded from configPath; an empty path keeps the
+// established global-config behavior.
+func NewHandlerWithConfigPath(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager, configPath string) *Handler {
 	h := &Handler{
-		agent:    a,
-		store:    store,
-		styleMgr: styleMgr,
-		toolReg:  toolReg,
-		mcpMgr:   mcpMgr,
-		wechatQR: im.NewWeChatQRManager(im.WeChatQRClient{}),
-		meta:     make(map[string]sessionMeta),
+		agent:      a,
+		configPath: configPath,
+		store:      store,
+		styleMgr:   styleMgr,
+		toolReg:    toolReg,
+		mcpMgr:     mcpMgr,
+		wechatQR:   im.NewWeChatQRManager(im.WeChatQRClient{}),
+		meta:       make(map[string]sessionMeta),
 	}
 	h.cfg.Store(cfg)
 	h.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
@@ -1340,7 +1354,7 @@ func (h *Handler) reloadAfterConfigChange() {
 	if h.cfg.Load() == nil {
 		return
 	}
-	cfg, err := config.Load("")
+	cfg, err := config.Load(h.configPath)
 	if err != nil {
 		return
 	}

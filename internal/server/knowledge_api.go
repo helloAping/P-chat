@@ -118,7 +118,7 @@ func (h *Handler) UpdateKnowledgeConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	updated, err := config.UpdateKnowledgeConfig(patch)
+	updated, err := config.UpdateKnowledgeConfigAt(h.configPath, patch)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -207,7 +207,7 @@ func (h *Handler) AddKnowledgeBase(c *gin.Context) {
 	}
 
 	base := baseFromResp(req)
-	if err := config.AddKnowledgeBaseRecord(base); err != nil {
+	if err := config.AddKnowledgeBaseRecordAt(h.configPath, base); err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		} else {
@@ -231,7 +231,7 @@ func (h *Handler) RemoveKnowledgeBase(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	if err := config.RemoveKnowledgeBaseRecord(name); err != nil {
+	if err := config.RemoveKnowledgeBaseRecordAt(h.configPath, name); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

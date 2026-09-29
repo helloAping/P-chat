@@ -14,6 +14,10 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 
 `GET /api/v1/health` 成功响应包含 `status`、`profile_id`、`profile_name`、`instance_id`、`pid`。新增启动器或客户端不得只检查 `status=ok` 就认领一个动态端口。
 
+若以 `pchat-server --config <path>` 启动，构造器将该 path 保存在 `Server` 与 `Handler`。知识库
+PATCH/新增/删除及其热重载必须使用这条活动路径，避免错误写回 `~/.p-chat/config.json`；custom
+文件只写入显式修改的 `knowledge` overlay 字段。
+
 ## 文件结构
 
 | 文件 | 职责 | 关键函数/类型 |

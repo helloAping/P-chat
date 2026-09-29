@@ -31,13 +31,14 @@ import (
 )
 
 type Server struct {
-	cfg      *config.Config
-	agent    *agent.Agent
-	store    *memory.Store
-	styleMgr *style.Manager
-	engine   *gin.Engine
-	handler  *Handler
-	srv      *http.Server
+	cfg        *config.Config
+	configPath string
+	agent      *agent.Agent
+	store      *memory.Store
+	styleMgr   *style.Manager
+	engine     *gin.Engine
+	handler    *Handler
+	srv        *http.Server
 
 	// rulesWatchStop stops the file watcher that polls the
 	// rules directories for changes. Started in
@@ -107,6 +108,16 @@ func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store,
 // production pchat-server passes http.FS(embeddedWebFS) so the
 // frontend ships inside the binary and works from any CWD.
 func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, staticFS http.FileSystem, mcpMgr *mcp.Manager) *Server {
+	return NewWithStaticFSAndConfigPath(cfg, agt, store, styleMgr, toolReg, staticFS, mcpMgr, "")
+}
+
+// NewWithStaticFSAndConfigPath 使用显式配置 overlay 路径构造服务器。
+// NewWithStaticFSAndConfigPath constructs a server with an explicit config
+// overlay path.
+// 旧构造器传入空路径以保留全局配置行为；pchat-server 传入 --config，确保写入与热重载使用同一 overlay。
+// Existing constructors pass an empty path to retain global-config behavior;
+// pchat-server passes --config so writes and hot reloads use the same overlay.
+func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, staticFS http.FileSystem, mcpMgr *mcp.Manager, configPath string) *Server {
 	if os.Getenv("PC_HTTP_DEBUG") == "1" {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -149,7 +160,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	// ctx via trace.FromContext.
 	r.Use(traceIDMiddleware())
 
-	h := NewHandler(agt, cfg, store, styleMgr, toolReg, mcpMgr)
+	h := NewHandlerWithConfigPath(agt, cfg, store, styleMgr, toolReg, mcpMgr, configPath)
 
 	// Wire the summarizer so /compress and auto-compact work.
 	if lc := agt.LLM(); lc != nil && cfg.LLM.Default != "" {
@@ -399,7 +410,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		r.StaticFS("/app", staticFS)
 	}
 
-	s := &Server{cfg: cfg, agent: agt, store: store, styleMgr: styleMgr, engine: r, handler: h}
+	s := &Server{cfg: cfg, configPath: configPath, agent: agt, store: store, styleMgr: styleMgr, engine: r, handler: h}
 	// Hot-reload rules when the user edits files in the rules
 	// directories. The agent's Reload() re-reads AGENTS.md,
 	// rules, and skills and rebuilds the cached system prompt.
