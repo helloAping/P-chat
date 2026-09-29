@@ -218,7 +218,7 @@ func runREPL(cmd *cobra.Command, args []string) error {
 	// The manager is attached unconditionally (even when the knowledge
 	// system is disabled) so `/kb add` can flip it on — AddPath enables
 	// cfg.Knowledge.Enabled as part of persisting the new base.
-	repl.SetKBManager(cli.NewKBManager(cfg))
+	repl.SetKBManager(cli.NewKBManager(cfg, cfgFile))
 
 	// Run REPL in a goroutine; listen for SIGINT in the main goroutine
 	// so we can cleanly stop the server on Ctrl+C.

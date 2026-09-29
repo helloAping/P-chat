@@ -13,7 +13,7 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump } from '../stores/chat'
 
 // isRecoveringCurrent mirrors state.isRecovering[currentID].
 // Watched reactively by the recovery-in-progress banner
@@ -224,31 +224,29 @@ function locateOpenQuestion() {
   el.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
-// SM-01: search-result jump. SessionSidebar's message search hands off
-// via state.searchJumpTarget (after switchSession + paging the target
-// row in). We poll for the bubble's [data-msg-id] node — the messages
-// array is already populated at this point, but a large history page
-// can take a frame or two to reach the DOM — then center it and flash
-// an accent ring so the user can spot the hit.
+// 搜索定位只在 Vue 完成本轮 DOM 更新后解析，成功/失败都回传 store。
+// Search navigation resolves only after Vue has applied the current DOM patch;
+// both success and failure settle the store promise so the sidebar never drops
+// an asynchronous error silently.
 watch(() => state.searchJumpTarget, async (target) => {
   if (!target || target.sessionID !== state.currentID) return
-  for (let i = 0; i < 20; i++) {
-    await nextTick()
-    const el = messagesEl.value?.querySelector(
-      `[data-msg-id="${target.messageID}"]`,
-    ) as HTMLElement | null
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      el.classList.add('search-hit-flash')
-      setTimeout(() => el.classList.remove('search-hit-flash'), 2400)
-      state.searchJumpTarget = null
-      return
-    }
-    await new Promise(r => setTimeout(r, 50))
+  await nextTick()
+  if (state.searchJumpTarget?.requestID !== target.requestID) return
+  const el = messagesEl.value?.querySelector(
+    `[data-msg-id="${target.messageID}"]`,
+  ) as HTMLElement | null
+  if (!el) {
+    completeSearchJump(target.requestID, '消息已加载，但页面中没有对应的可见气泡')
+    return
   }
-  // Target row never rendered (deleted after indexing, or paged out) —
-  // clear the handoff so a later unrelated render doesn't trigger it.
-  state.searchJumpTarget = null
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  // 重复点击同一结果时重启单次动画；时长仅由 CSS token 控制。
+  // Restart the one-shot animation for repeated hits; CSS owns its duration.
+  el.classList.remove('search-hit-flash')
+  void el.offsetWidth
+  el.classList.add('search-hit-flash')
+  el.addEventListener('animationend', () => el.classList.remove('search-hit-flash'), { once: true })
+  completeSearchJump(target.requestID)
 })
 
 // onScroll is bound to the messages container. Two jobs:
@@ -330,6 +328,10 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  const searchTarget = state.searchJumpTarget
+  if (searchTarget) {
+    completeSearchJump(searchTarget.requestID, '聊天视图已关闭，未能完成消息定位')
+  }
   // Unregister so the store doesn't keep a reference to a torn-
   // down component's message instance.
   setUIMessageHandler(null)
@@ -859,20 +861,18 @@ function messageKey(m: any, i: number): string | number {
   transform: translateY(8px);
 }
 
-/* SM-01: search-hit flash. The bubble located via a sidebar search
-   jump gets an accent outline that holds briefly then fades; the
-   class is removed after 2.4s so the animation is strictly one-shot
-   (no continuous compositor cost, per the GPU budget rules). The
-   attribute lives on MessageBubble's root, hence :deep(). */
+/* 搜索命中高亮是单次动画，颜色与时长都使用新设计 token。
+   Search highlighting is one-shot and reads both color and duration from
+   current design tokens. The attribute lives on MessageBubble's root. */
 :deep(.search-hit-flash) {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--brand-500);
   outline-offset: 2px;
   border-radius: var(--radius-lg);
-  animation: search-hit-fade 2.4s var(--ease-out) forwards;
+  animation: search-hit-fade var(--dur-highlight) var(--ease-out) forwards;
 }
 @keyframes search-hit-fade {
-  0% { outline-color: var(--accent); }
-  70% { outline-color: var(--accent); }
+  0% { outline-color: var(--brand-500); }
+  70% { outline-color: var(--brand-500); }
   100% { outline-color: transparent; }
 }
 </style>

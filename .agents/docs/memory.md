@@ -43,6 +43,7 @@ type Store struct {
 - `GetChatMessagesFor(convID, limit)` — 获取消息历史
 - `GetChatMessagesWithMetaPage(convID, beforeID, limit)` — 分页查询
 - `GetChatMessagesAfterIDFor(convID, limit, afterID)` — 从某 ID 之后查询
+- `SearchMessages(q, limit)` / `SearchMessagesByProject(...)` — 只搜索未归档会话中可渲染的文本行，过滤 `ui_hidden`、tool/command/附件行和已归档回复
 - `ListConversations()` — 列出所有会话，并通过查询聚合填充 `UserMessageCount` / `PendingTurnCount`，供服务端判断项目内可复用空白会话
 - `SetConversationMeta(convID, meta)` → 写入会话元数据
 
@@ -98,6 +99,10 @@ subagent_jobs: id, task_id, session_id, status, subagent_type, model, descriptio
 
 动态快照沿用 `name=pchat_context_<name>`、`origin`、`ui_hidden` 等既有元数据键，不新增
 数据库字段。助手与工具消息按请求顺序落库，确保下次读取不会把工具结果移到助手文本之前。
+
+搜索可见性必须与历史 API 保持一致：`is_archived=1`、`msg_type` 非文本、
+`role=tool`、`metadata.ui_hidden=true` 和旧版自动续跑 user-style nudge 不得进入搜索结果。
+服务端合并连续 assistant 行时，通过 `source_message_ids[]` 保留原始行身份，供前端把搜索命中映射到可见气泡。
 
 项目空白会话复用不新增 schema 字段。`Conversation.UserMessageCount` 来自
 `messages(role='user', is_archived=0)` 聚合，`PendingTurnCount` 来自

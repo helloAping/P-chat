@@ -2693,8 +2693,8 @@ func runTurnQueue(ctx cliContext, sessionID string) error {
 		ui.SetQuestionHandler(sessionID, func(sid string, answers map[string]string) error {
 			return ctx.SubmitQuestionAnswer(streamCtx, sid, answers)
 		})
-		ui.SetConfirmHandler(sessionID, func(sid string, approved bool, action string) error {
-			return ctx.SubmitToolConfirm(streamCtx, sid, approved, action)
+		ui.SetConfirmHandlerWithID(sessionID, func(sid string, approved bool, action, confirmID string) error {
+			return submitToolConfirmWithID(ctx, streamCtx, sid, approved, action, confirmID)
 		})
 		ui.PrintBannerHeader(payload.Message)
 
@@ -2838,8 +2838,8 @@ func cmdRegen(ctx cliContext, args string) error {
 	ui.SetQuestionHandler(ctx.GetCurrentSessionID(), func(sessionID string, answers map[string]string) error {
 		return ctx.SubmitQuestionAnswer(streamCtx, sessionID, answers)
 	})
-	ui.SetConfirmHandler(ctx.GetCurrentSessionID(), func(sessionID string, approved bool, action string) error {
-		return ctx.SubmitToolConfirm(streamCtx, sessionID, approved, action)
+	ui.SetConfirmHandlerWithID(ctx.GetCurrentSessionID(), func(sessionID string, approved bool, action, confirmID string) error {
+		return submitToolConfirmWithID(ctx, streamCtx, sessionID, approved, action, confirmID)
 	})
 	ui.PrintBannerHeader(fmt.Sprintf("/regen %d", userMessageID))
 	for chunk := range stream {

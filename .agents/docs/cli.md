@@ -15,8 +15,8 @@ CLI 模块实现 P-Chat 的终端交互界面：REPL 循环、命令解析、终
 | `repl.go` | REPL 主循环 | `RunREPL()` |
 | `commands.go` | 斜杠命令处理 | `/help`, `/sessions`, `/tools`, `/config`, `/compress` 等 |
 | `input.go` | 多行输入、文件引用 | `ReadInput()` |
-| `kb.go` | 键盘输入处理、热键 | `handleKey()` |
-| `context.go` | 上下文命令（/add, /clear 等）| |
+| `kb.go` | CLI 知识库配置与本地扫描 | `KBManager` |
+| `context.go` | local / HTTP 命令上下文与 SSE 事件适配 | `cliContext`, `commandContext`, `httpEventToChunk()` |
 | `progress.go` | 终端进度/工具调用渲染 | |
 | `spinner.go` | 加载指示器 | |
 | `selector.go` | 选项选择器 | |
@@ -45,7 +45,13 @@ CLI 通过 `httpcli.Client` 连接 pchat-server，消费 SSE 事件流。事件�
 - skill → 固定输出 `当前调用 Skill：<name>`，随后显示 ready/error
 - sub_agent → 缩进度视图
 - phase → 状态消息
+- stream_reset → 标记上一次失败 attempt 的部分输出作废，并从新区块展示重试结果
 - question → 内联交互式问答（待实现）
+
+终端无法像 GUI 一样可靠删除已经打印的任意多行文本。收到 `stream_reset` 时，
+`ChatUI` 会结束当前文本块、明确提示上方片段已作废，然后从下方重新展示本次重试；
+HTTP 模式由 `httpEventToChunk()` 将 SSE `type=stream_reset` 映射到
+`ChatStreamChunk.StreamReset`。
 
 ### 3. 服务器自动启动
 
@@ -71,7 +77,15 @@ model、style、work_mode、附件、`active_skills` 等发送参数。遇到 fa
 local / HTTP 两种 `cliContext` adapter 使用同一组命令处理器。local CLI 列表时会恢复
 超过安全窗口的陈旧 running 项，避免上次进程中断后永久卡住队首。
 
-### 5. Skill 命令
+### 5. HTTP 会话与本地命令能力组合
+
+生产 CLI 的聊天、会话和流式传输始终通过 `httpContext` 访问
+`pchat-server`。`REPL.asContext()` 仅为斜杠命令叠加 `commandContext`：
+`/kb list|add|remove|scan` 路由到已挂载的本地 `KBManager`，`/recall`
+路由到本地 `recall.Engine`，其他方法继续委托给 HTTP context。这样本地文件能力可用，
+同时不会让聊天或会话操作绕过 server。
+
+### 6. Skill 命令
 
 ```text
 /skills                              # 列出当前项目视图可发现的 Skill
@@ -96,7 +110,8 @@ local 与 HTTP CLI 都通过 catalog 验证动态快捷名称；实际聊天请�
 - `templates.go` (终端模板)
 
 ### 要修改 SSE 事件处理
-- `repl.go` 中的事件适配器
+- `context.go` 的 `httpEventToChunk()`（HTTP SSE → `ChatStreamChunk`）
+- `progress.go` 的 `ChatUI.Handle()`（终端渲染）
 
 ## 相关模块
 

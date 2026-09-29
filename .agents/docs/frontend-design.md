@@ -247,6 +247,7 @@ TitleBar
 | `--dur-fast` | `120ms` | hover、focus |
 | `--dur-base` | `200ms` | 默认 transition；离开动画 |
 | `--dur-slow` | `320ms` | modal / 侧边栏 / 大面板进入 |
+| `--dur-highlight` | `2400ms` | 搜索命中轮廓的单次停留与淡出 |
 | `--transition-colors` | shorthand | hover/focus 的颜色族一次性声明 |
 
 **进入慢、离开快**：enter 用 `--dur-slow/--dur-base` + `--ease-out`，leave 用 `--dur-base/--dur-fast` + `--ease-in`。不要进出共用同一条曲线。

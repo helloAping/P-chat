@@ -264,6 +264,10 @@ export interface TodoItem {
 
 export interface Message {
   id?: number
+  // 服务端会把同一 ReAct 回合的多条 assistant 行合并成一个气泡。
+  // The server folds multiple assistant rows from one ReAct turn into one
+  // bubble. These IDs let an exact search hit resolve to that bubble's anchor.
+  source_message_ids?: number[]
   // Per-conversation logical position. The new stable
   // identity for any cross-render / cross-rollback
   // reference: Vue :key, pagination cursor, undo
@@ -1719,10 +1723,22 @@ export interface StreamEvent {
 
 export type ConfirmAction = 'reject' | 'once' | 'always'
 
-export async function submitConfirmResponse(sessionId: string, approved: boolean, action?: ConfirmAction): Promise<void> {
-  await jsonFetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/confirm-response`, {
+export interface ConfirmResponseResult {
+  ok: boolean
+  confirm_id?: string
+  action?: ConfirmAction
+  explicit?: boolean
+}
+
+export async function submitConfirmResponse(
+  sessionId: string,
+  approved: boolean,
+  action?: ConfirmAction,
+  confirmId?: string,
+): Promise<ConfirmResponseResult> {
+  return jsonFetch<ConfirmResponseResult>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/confirm-response`, {
     method: 'POST',
-    body: JSON.stringify({ approved, action }),
+    body: JSON.stringify({ approved, action, confirm_id: confirmId }),
   })
 }
 
@@ -2740,6 +2756,7 @@ export interface DiagnosticsConfig {
   mem_heartbeat_sec: number
   heap_dump_mb: number
   pprof_enabled: boolean
+  snapshot_enabled: boolean
   heap_dump_dir: string
 }
 

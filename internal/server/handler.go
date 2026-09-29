@@ -679,6 +679,11 @@ type SessionResponse struct {
 // conversation history.
 type MessageResponse struct {
 	ID int64 `json:"id"`
+	// SourceMessageIDs 记录当前可见气泡合并前的数据库行 ID。
+	// SourceMessageIDs lists the database row IDs folded into this visible
+	// bubble, allowing search hits to resolve to the DOM anchor after ReAct
+	// assistant rows or user attachment rows are merged.
+	SourceMessageIDs []int64 `json:"source_message_ids,omitempty"`
 	// Seq is the per-conversation logical position. Unlike
 	// `id` (a global AUTOINCREMENT that's never reused), seq
 	// survives rollback+undo and is the new stable cursor

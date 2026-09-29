@@ -23,10 +23,15 @@ if ($sub -ne 'dev' -and $sub -ne 'build-debug') {
 
 $wailsDir = & "$PSScriptRoot\find-wails.ps1"
 if (-not $wailsDir) {
-    Write-Error "wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@latest"
+    Write-Error "wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0"
     exit 1
 }
 $env:PATH = "$wailsDir;$env:PATH"
+
+& "$PSScriptRoot\assert-wails-version.ps1"
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 switch ($sub) {
     'dev'          { & wails dev; exit $LASTEXITCODE }

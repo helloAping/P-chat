@@ -21,7 +21,7 @@
 
 ## 当前进度快照
 
-> 快照日期：2026-09-22。仓库 `VERSION` 当前为 `1.0.13.beta`；正式分发版本以 `VERSION` 和 release tag 为准。
+> 快照日期：2026-09-28。仓库 `VERSION` 当前为 `1.0.14.beta`；正式分发版本以 `VERSION` 和 release tag 为准。
 
 P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手形成了比较完整的桌面工作台：
 
@@ -31,13 +31,13 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 | 运行环境隔离 | 已落地 | dev/prod 按 data home 隔离身份与数据；动态端口、启动公告和 health 校验避免端口冲突或误连 |
 | 对话流 | 已落地 | text / thinking / tool / sub-agent parts 结构化渲染，支持 SSE 流式、seq、断线恢复 |
 | Agent 执行 | 已落地 | ReAct 工具循环、并发工具派发、auto-continue、Plan/Build、todo 守卫、stuck-loop 保护 |
-| LLM 协议 | 已落地 | OpenAI Chat / Responses + Anthropic Messages；自定义 SSE reader 兼容 reasoning / proxy error / 非标准 delta |
+| LLM 协议 | 已落地 | OpenAI Chat / Responses + Anthropic Messages；自定义 SSE reader 兼容 reasoning / proxy error / 非标准 delta，默认日志不落消息正文 |
 | 项目系统 | 已落地 | 多项目注册，项目级 `AGENTS.md` / rules / skills / tools 注入 |
 | 知识库 | 已落地 | 本地 Wiki/FTS5、三层索引树、混合检索、查询分解、多库重排、增量扫描 |
 | 工具体系 | 已落地 | 内置文件/命令/搜索/文档/问题/todo 工具；动态 YAML 工具支持全局与项目级加载 |
-| 浏览器控制 | 已落地 | Chrome/Edge 扩展连接、真实页面导航/点击/输入/截图、多 tab 目标、域名权限策略 |
+| 浏览器控制 | 已落地 | Chrome/Edge 扩展连接、真实页面导航/点击/输入/截图、多 tab 目标、域名权限策略、evaluate 三态 fail-closed 闸门 |
 | 媒体能力 | 已落地 / 持续扩展 | 图片/视频/音频独立识别路由；图片、视频、语音、音乐、音效等生成能力按模型和会话启用 |
-| 可观测性 | 已落地 | 端到端 trace id、上下文检查器、工具列表抽屉、动态工具加载诊断 |
+| 可观测性 | 已落地 | 端到端 trace id、上下文检查器、工具列表抽屉、动态工具加载诊断；pprof 与快照下载默认关闭 |
 | IM 桥接 | 实验中 / 部分可用 | Gateway/adapter 抽象、飞书 webhook、微信 QR/长轮询、出站切分、GUI 设置入口和事件流已有；跨平台 adapter、鉴权与运行体验仍需继续收口 |
 | MCP 集成 | 基础可用 / 待增强 | 已有 MCP 管理模块和设置入口，工具协议、权限和诊断体验仍在 backlog |
 | 沙箱增强 | 基础已落地 / 待增强 | 命令/写文件确认与浏览器域名策略已接入；Docker 隔离、策略可视化仍未完成 |
@@ -45,6 +45,13 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 | 发布体验 | 已落地一部分 | Windows 安装器、Linux/macOS 打包脚本、浏览器扩展打包、版本注入已有；跨平台 GUI 构建仍受 Wails/宿主环境限制 |
 
 完整的安装、配置与 GUI 使用流程见 [`docs/p-chat-article-2026-09.md`](docs/p-chat-article-2026-09.md)。项目目录、模块职责和运行流总览见 [`docs/project-structure.md`](docs/project-structure.md)。更细的“已落地能力 + 后续可做事项”维护在 [`docs/feature-opportunities.md`](docs/feature-opportunities.md)。历史设计方案保留在 [`docs/plans/`](docs/plans/)。
+
+### 1.0.14.beta 发布摘要
+
+- LLM 重试前清空上一 attempt 的未完成输出；原始 SSE、malformed payload 与 proxy error 日志改为默认无正文，`PC_LLM_DEBUG=1` 也只输出有界、脱敏预览。
+- `browser_evaluate` 默认三态 fail-closed：明确写入硬拒绝、明确只读按正常策略执行、未知 JS 必须逐次显式确认。
+- pprof 与 diagnostics 快照下载默认关闭；显式开启后均只允许 loopback，落盘 profile 使用 owner-only 权限。
+- 恢复 CLI 本地知识库命令，搜索结果支持精确跳转到目标消息，并完成 1.0.14.beta 版本元数据更新。
 
 ### 下一步优先级
 
@@ -108,7 +115,9 @@ pchat-server.exe
 ### 方式 D — 从源码构建
 
 ```powershell
-# 依赖：Go 1.25.0 / Node 24.11 / Wails v2.12
+# 依赖：Go 1.25.0 / Node 24.11 / Wails v2.12.0
+# Wails CLI 必须与 cmd/pchat-gui/go.mod 中的版本完全一致：
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 task build:all      # Windows / Linux / macOS setup 包 + 增量更新 zip
 task build:gui      # 额外：pchat-gui.exe
 task package:gui    # Windows setup 包 + 增量更新 zip
@@ -391,7 +400,7 @@ P-Chat 通过 Chrome / Edge 扩展操控真实浏览器。LLM 能像人一样导
 | `browser_select_option` | 操作 `<select>` 下拉框 |
 | `browser_file_upload` | 走 file input 上传本地文件 |
 | `browser_drag` | 拖拽一个 ref 到另一个 ref |
-| `browser_evaluate` | 在页面隔离上下文执行任意 JS，能读 `__INITIAL_STATE__`、调 DOM API、绕过页面 CSP |
+| `browser_evaluate` | 在页面隔离上下文执行 JS；默认只读，明确副作用硬拒绝，未知表达式需逐次显式确认 |
 | `browser_find` | 按文本或 regex 找元素并返回 ref |
 | `browser_extract` | 抓整页渲染后的可见文本（SPA 内容也能拿到） |
 | `browser_tabs` | 列出 / 新开 / 关闭 / 切换标签页；`action=select` 切换「控制目标」 |
@@ -424,6 +433,7 @@ LLM 也可以在工具参数里显式传 `tab_id` 覆盖。`browser_tabs` 的 `a
 {
   "browser": {
     "enabled": true,
+    "allow_eval_write": false,
     "require_confirm": "dangerous",
     "allowed_hosts": ["localhost", "*.internal.example"],
     "blocked_hosts": ["evil.example"],
@@ -436,12 +446,16 @@ LLM 也可以在工具参数里显式传 `tab_id` 覆盖。`browser_tabs` 的 `a
 | --- | --- |
 | 只读操作（snapshot / extract / find / screenshot / scroll） | 自动通过 |
 | 普通导航 / 点击 | 自动通过 |
-| 表单输入 / 上传 / `browser_evaluate` | 弹确认框，显示目标 URL |
+| 表单输入 / 上传 | 弹确认框，显示目标 URL |
+| `browser_evaluate` 明确只读 | 按正常域名 / `require_confirm` 策略决策 |
+| `browser_evaluate` 明确副作用 | `allow_eval_write=false` 时硬拦截，不弹确认 |
+| `browser_evaluate` 无法证明只读 | 强制逐次确认；allowlist、`never`、`full/auto` 和“始终允许”均不静默跳过 |
 | 命中 `sensitive_hosts`（登录页） | 即使只读也确认 |
 | 命中 `blocked_hosts` | 硬拦截，不确认 |
 | 命中 `allowed_hosts` | 自动通过（仍尊重 blocked） |
 
 - `require_confirm`：`never` / `dangerous`（默认） / `always`
+- `allow_eval_write`：默认 `false`；设为 `true` 仅关闭 evaluate 只读闸门，`blocked_hosts` 与正常高风险确认仍生效
 - 域名匹配大小写不敏感；`*.example.com` 同时匹配 `example.com` 和子域
 - 会话权限 `full` 或 `/unsafe once` 会跳过确认（blocked 仍拦截）
 - 确认弹窗复用 `ToolConfirmModal`，标签「浏览器」，「目标页面」展示 URL
@@ -664,8 +678,14 @@ CLI 可用 `/skills` 查看，用 `/skill docs-tool 创建一份周报` 显式�
 | POST | `/mcp/servers` | MCP 服务器 |
 | GET/POST/PATCH | `/browser/*` | 浏览器连接、标签页、扩展下载、域名策略 |
 | GET/PATCH/POST | `/im/*` | IM 健康状态、配置、测试、微信 QR、飞书 webhook、事件流 |
-| GET | `/diagnostics/*` | 内存、配置、heap/goroutine 快照 |
+| GET/PATCH | `/diagnostics/*` | 内存、配置、heap/goroutine 快照；快照下载默认关闭且仅限 loopback |
 | GET/POST | `/updates/*` | 版本检查与更新下载 |
+
+### 诊断快照安全边界
+
+heap/goroutine profile 可能包含栈参数、路径和运行时元数据。`/debug/pprof/*` 仅在启动前设置 `PC_PPROF=1` 时注册；它和 `/api/v1/diagnostics/snapshot/*` 均始终拒绝非 loopback 的 TCP 客户端，且不信任 `X-Forwarded-For`。快照还需启动前设置 `PC_DIAGNOSTICS_SNAPSHOTS=1`。生成的 profile 使用仅当前用户可读的权限。SEC-01 管理级 capability 尚未覆盖全部 D 类路由前，不要在非本机监听环境开启这些开关。
+
+本地自动 heap profile 由 `PC_HEAP_DUMP_MB` 控制（默认 1024 MB，`0` 关闭）；它不会自动开放 HTTP 下载。
 
 ### SSE 发送消息
 
@@ -725,6 +745,12 @@ assistant 消息底部「重答」会保留所有历史版本，消息下方出�
 
 **10. 多知识库怎么排序？**
 各库分别检索 → 分数归一化 → 合并排序 → 去重 → 标注 `base` 来源。
+
+**11. `PC_LLM_DEBUG=1` 会记录什么？**
+默认日志不记录消息正文或原始 SSE，只记录计数、长度和短 SHA-256 指纹。显式设为 `1` 后会额外记录前三个事件和上游错误体的有界预览，但 API key、Authorization、token、cookie、password、secret 等仍会脱敏。预览仍可能包含普通用户消息，仅在可信本机临时开启，分享日志前请再次检查。
+
+**12. 为什么诊断页的快照按钮不可用？**
+快照下载因敏感性默认关闭。退出 server，在可信本机环境设置 `PC_DIAGNOSTICS_SNAPSHOTS=1` 后重启即可启用；即使开启也只接受 loopback 请求。pprof 使用独立开关 `PC_PPROF=1`。
 
 ---
 

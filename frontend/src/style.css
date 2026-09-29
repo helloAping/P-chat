@@ -198,6 +198,7 @@
   --dur-fast:         120ms;
   --dur-base:         200ms;
   --dur-slow:         320ms;
+  --dur-highlight:    2400ms;
   --transition-colors:
     background-color var(--dur-fast) var(--ease-out),
     color var(--dur-fast) var(--ease-out),
@@ -292,6 +293,9 @@
   --inspector-width:  var(--inspector-user-width, var(--inspector-default-width));
   --project-switcher-width: 320px;
   --event-rail-color: var(--border-default);
+
+  /* 搜索命中轮廓的单次停留动画。 / One-shot search-hit outline. */
+  --dur-highlight:    2400ms;
 
   color-scheme: light;
 }

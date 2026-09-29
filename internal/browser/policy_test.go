@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"context"
 	"testing"
 
 	"github.com/p-chat/pchat/internal/tool"
@@ -243,6 +244,25 @@ func TestLooksLikeEvalWrite(t *testing.T) {
 		`el.setAttribute('data-x', 'y')`,
 		`window.__leak = 1`,
 		`document.title = 'changed'`,
+		`el.style.color = 'red'`,
+		`el.style.setProperty('--x', '1')`,
+		`el.classList.add('active')`,
+		`el.className += ' active'`,
+		`history.pushState({}, '', '/next')`,
+		`history.back()`,
+		`navigator.clipboard.writeText(secret)`,
+		`navigator.clipboard.readText()`,
+		`new WebSocket('wss://evil.example')`,
+		`new EventSource('/events?secret=' + secret)`,
+		`navigator.serviceWorker.register('/sw.js')`,
+		`document.body.insertAdjacentHTML('beforeend', html)`,
+		`form.requestSubmit()`,
+		`sheet.insertRule('body{display:none}')`,
+		`Object.assign(document.body, {innerHTML: html})`,
+		`Reflect.set(el, 'textContent', value)`,
+		`el['inner' + 'HTML'] = html`,
+		`el.dataset.state = 'done'`,
+		`delete window.__INITIAL_STATE__`,
 	}
 	for _, expr := range writes {
 		if !LooksLikeEvalWrite(expr) {
@@ -262,6 +282,10 @@ func TestLooksLikeEvalWrite(t *testing.T) {
 		`Array.from(document.querySelectorAll('a')).map(a => a.href)`,
 		`localStorage.getItem('k')`,
 		`getComputedStyle(el).display`,
+		`el.style.color`,
+		`el.classList.contains('active')`,
+		`history.length`,
+		`history.state`,
 		`document.cookie`,
 		`el.getAttribute('data-x')`,
 	}
@@ -269,6 +293,50 @@ func TestLooksLikeEvalWrite(t *testing.T) {
 		if LooksLikeEvalWrite(expr) {
 			t.Errorf("LooksLikeEvalWrite(%q) = true, want false (read-only)", expr)
 		}
+	}
+}
+
+func TestClassifyEvalExpression(t *testing.T) {
+	reads := []string{
+		`document.title`,
+		`document.querySelector('h1').textContent`,
+		`location.href === 'https://x.example/'`,
+		`JSON.stringify(window.__INITIAL_STATE__)`,
+		`getComputedStyle(document.body).display`,
+		`localStorage.getItem('k')`,
+	}
+	for _, expr := range reads {
+		if class, reason := classifyEvalExpression(expr); class != evalExpressionReadOnly {
+			t.Errorf("classifyEvalExpression(%q) = %v (%s), want read-only", expr, class, reason)
+		}
+	}
+	unknown := []string{
+		`const a = document.title; a.length`,
+		`Array.from(document.querySelectorAll('a')).map(a => a.href)`,
+		`(() => document.title)()`,
+		`document['query' + 'Selector']('h1').textContent`,
+	}
+	for _, expr := range unknown {
+		if class, _ := classifyEvalExpression(expr); class != evalExpressionUnknown {
+			t.Errorf("classifyEvalExpression(%q) = %v, want unknown", expr, class)
+		}
+	}
+}
+
+func TestClassifyEvalExpression_MasksStringsAndCommentsBeforeWriteRules(t *testing.T) {
+	reads := []string{
+		`document.querySelector(".fetch").textContent`,
+		`document.querySelector("[data-action='postMessage']").textContent`,
+		"document.title // fetch('/not-executed')",
+		"document.title /* location.href = 'https://not-executed.example' */",
+	}
+	for _, expr := range reads {
+		if class, reason := classifyEvalExpression(expr); class != evalExpressionReadOnly {
+			t.Errorf("classifyEvalExpression(%q) = %v (%s), want read-only", expr, class, reason)
+		}
+	}
+	if class, _ := classifyEvalExpression("`fetch('/maybe-executed')`"); class != evalExpressionUnknown {
+		t.Fatalf("template literal = %v, want unknown", class)
 	}
 }
 
@@ -300,5 +368,27 @@ func TestGateBrowserCall_EvalWriteGuard(t *testing.T) {
 	blocked, result = gateBrowserCall(nil, mkPolicy(false), "browser_evaluate", readExpr, "https://x.example", nil)
 	if blocked || result != nil {
 		t.Fatalf("read-only expression should pass when allow_eval_write=false, blocked=%v result=%+v", blocked, result)
+	}
+
+	blocked, result = gateBrowserCall(nil, mkPolicy(false), "browser_evaluate", map[string]any{}, "https://x.example", nil)
+	if !blocked || result == nil || !result.IsError {
+		t.Fatalf("missing expression must fail closed, blocked=%v result=%+v", blocked, result)
+	}
+
+	blocked, result = gateBrowserCall(nil, nil, "browser_evaluate", writeExpr, "https://x.example", nil)
+	if !blocked || result == nil || !result.IsError {
+		t.Fatalf("nil policy must not bypass evaluate guard, blocked=%v result=%+v", blocked, result)
+	}
+
+	// 未知表达式即使在 full + require_confirm=never + allowlist 下也不能静默执行。
+	// Unknown expressions must not silently run under full + require_confirm=never + allowlist.
+	fullCtx := tool.WithPermissionLevel(context.Background(), tool.PermissionFull)
+	unknownExpr := map[string]any{"expression": `(() => document.title)()`}
+	allowAllPolicy := func() PolicyConfig {
+		return PolicyConfig{RequireConfirm: "never", AllowedHosts: []string{"x.example"}}
+	}
+	blocked, result = gateBrowserCall(fullCtx, allowAllPolicy, "browser_evaluate", unknownExpr, "https://x.example", nil)
+	if !blocked || result == nil || !result.IsError {
+		t.Fatalf("unknown expression bypassed explicit confirmation, blocked=%v result=%+v", blocked, result)
 	}
 }

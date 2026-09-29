@@ -3413,8 +3413,9 @@ func newConvID() string {
 	return fmt.Sprintf("conv_%d_%d", time.Now().UnixNano(), n)
 }
 
-// SearchMessages performs a simple LIKE-based full-text search
-// across messages in all active (non-archived) conversations.
+// SearchMessages 在所有未归档会话的可见文本消息中执行 LIKE 搜索。
+// SearchMessages performs a LIKE-based search across renderable text messages
+// in all active (non-archived) conversations.
 // Returns up to `limit` results sorted by created_at desc.
 //
 // User input is escaped so that LIKE metacharacters (`%`, `_`)
@@ -3446,16 +3447,20 @@ func (s *Store) searchMessages(q string, limit int, projectPath string, filterPr
 	// each metachar with `\`.
 	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
 
-	query := `SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at, COALESCE(c.metadata, '')
+	// 先在 SQL 层排除已归档回复、工具行和附件行；ui_hidden 需要兼容
+	// bool/string 两种历史元数据形式，因此在 Go 层解析后再过滤。
+	// Exclude archived replies, tool rows, and attachment rows in SQL first.
+	// ui_hidden has historical bool/string encodings, so it is parsed below.
+	query := `SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at,
+				 COALESCE(c.metadata, ''), COALESCE(m.metadata, '')
 			 FROM messages m
 			 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
 			 WHERE m.content LIKE ? ESCAPE '\'
-			 ORDER BY m.created_at DESC`
-	args := []any{"%" + escaped + "%"}
-	if !filterProject {
-		query += ` LIMIT ?`
-		args = append(args, limitOrHuge(limit))
-	}
+			   AND m.is_archived = 0
+			   AND m.msg_type = ?
+			   AND m.role IN (?, ?, ?)
+			 ORDER BY m.created_at DESC, m.id DESC`
+	args := []any{"%" + escaped + "%", llm.MsgTypeText, llm.RoleUser, llm.RoleAssistant, llm.RoleSystem}
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil
@@ -3467,19 +3472,52 @@ func (s *Store) searchMessages(q string, limit int, projectPath string, filterPr
 		var r SearchResult
 		var content string
 		var convMeta string
-		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt, &convMeta); err != nil {
+		var messageMeta string
+		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt, &convMeta, &messageMeta); err != nil {
 			break
 		}
 		if filterProject && !sameConversationProjectPath(conversationProjectPath(convMeta), projectPath) {
 			continue
 		}
+		if searchMessageHidden(messageMeta, r.Role, content) {
+			continue
+		}
 		r.Snippet = snippet(content, q, 120)
 		out = append(out, r)
-		if filterProject && len(out) >= limitOrHuge(limit) {
+		if len(out) >= limitOrHuge(limit) {
 			break
 		}
 	}
 	return out
+}
+
+// searchMessageHidden 使搜索结果与历史消息的可见性规则保持一致。
+// searchMessageHidden keeps search visibility aligned with the history API.
+func searchMessageHidden(rawMeta, role, content string) bool {
+	if role == llm.RoleUser {
+		trimmed := strings.TrimSpace(content)
+		if strings.HasPrefix(trimmed, "⏱ 上一回合因") ||
+			strings.HasPrefix(trimmed, "⚠ 系统检测：你刚才的回复没有调用任何工具") {
+			return true
+		}
+	}
+	if rawMeta == "" {
+		return false
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(rawMeta), &meta); err != nil {
+		return false
+	}
+	switch value := meta["ui_hidden"].(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	case float64:
+		return value != 0
+	default:
+		return false
+	}
 }
 
 // snippet extracts a short window around the first occurrence of

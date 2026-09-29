@@ -132,6 +132,14 @@ trace、UUID、雪花 ID 与时间戳展开 `ProviderConfig.CustomHeaders`。`Ch
 `Apply()`，因此主对话、识别、摘要与连接测试行为一致。自定义请求头最后应用，允许兼容
 网关覆盖 `Authorization`、`x-api-key`、`Content-Type` 等协议字段；传输层字段在保存时拒绝。
 
+#### LLM 日志与 `PC_LLM_DEBUG`
+
+- 默认日志只记录 provider/model、token/字节计数、解析失败次数，以及异常 SSE 的长度和短 SHA-256 指纹；不记录请求消息、响应正文或原始 SSE payload。
+- 只有环境变量严格等于 `PC_LLM_DEBUG=1` 时，才记录前三个 SSE 事件和上游错误体的**有界预览**。预览仍统一脱敏 `api_key`、`Authorization`、`x-api-key`、Bearer/Basic 凭据、token、cookie、password、secret 与实例 capability；任何模式都不输出这些值。
+- malformed SSE 默认只写解析错误、长度和指纹；debug 模式额外写脱敏预览。脱敏覆盖 JSON 递归字段和文本 `Header: value` / `key=value` 形式：包括带厂商前缀且以 `api-key` / `api_key` / `token` / `secret` / `password` / `cookie` / `authorization` 结尾的名称（如 `X-Goog-Api-Key`）。proxy error 默认同样只写元数据，返回给调用方的错误文本不携带上游正文。
+- HTTP 非 2xx 错误保留状态码和响应体长度/指纹用于分类，默认错误链不携带上游正文；显式 debug 才把脱敏预览写入日志。
+- debug 预览在凭据脱敏后仍可能含用户消息或模型回复，仅应在可信本机临时开启；复现结束后移除该环境变量，并在分享日志前再次人工检查。
+
 ### 5. 错误分类
 
 `ClassifyAPIError(err, statusCode)` 将 HTTP 错误映射为 `ErrorKind`：

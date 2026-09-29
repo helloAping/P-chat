@@ -1,6 +1,6 @@
 # 项目结构总览
 
-> 快照日期：2026-09-22。当前 `VERSION` 为 `1.0.13.beta`。
+> 快照日期：2026-09-28。当前 `VERSION` 为 `1.0.14.beta`。
 >
 > 这份文档用于回答“这个仓库每个目录负责什么、改功能先看哪里、功能状态以哪里为准”。更细的模块维护入口见 `.agents/docs/INDEX.md`，用户入口见 `README.md`，完整图文流程见 `docs/p-chat-article-2026-09.md`。
 
@@ -42,8 +42,8 @@
 | 模块 | 位置 | 职责 | 必读文档 |
 | --- | --- | --- | --- |
 | Agent 循环 | `internal/agent/` | ReAct 轮次、工具派发、auto-continue、parts 累加、图片附件上下文 | `.agents/docs/agent.md` |
-| LLM 适配 | `internal/llm/` | OpenAI 兼容 / Anthropic 协议、SSE parser、错误分类、token 估算 | `.agents/docs/llm.md` |
-| HTTP Server | `internal/server/` | REST API、SSE 写循环、会话、上传、配置、browser/IM/MCP 路由 | `.agents/docs/server.md` |
+| LLM 适配 | `internal/llm/` | OpenAI 兼容 / Anthropic 协议、SSE parser、错误分类、token 估算、统一日志脱敏 | `.agents/docs/llm.md` |
+| HTTP Server | `internal/server/` | REST API、SSE 写循环、会话、上传、配置、browser/IM/MCP 与 diagnostics 路由 | `.agents/docs/server.md` |
 | 持久化 | `internal/memory/` | SQLite 会话、消息、metadata、摘要、todo、subagent job、schema 迁移 | `.agents/docs/memory.md` |
 | 工具系统 | `internal/tool/` | 内置工具、确认、问题、图片识别、PDF/DOCX、动态工具桥接 | `.agents/docs/tool.md` |
 | 子代理 | `internal/subagent/` | `task` 工具、同步/异步子代理、工具隔离、后台 job | `.agents/docs/subagent.md` |
@@ -55,7 +55,7 @@
 | 知识库 | `internal/knowledge/` | Wiki/FTS5、三层索引、文件扫描、引用解释 | `.agents/docs/knowledge.md`, `docs/knowledge.md` |
 | Recall | `internal/recall/` | 多库召回、查询分解、合并重排、注入 Agent 上下文 | `.agents/docs/knowledge.md` |
 | 搜索 | `internal/search/` | `web_search` provider、配额、Tavily / OpenAI 兼容接口 | `.agents/docs/tool.md` |
-| 浏览器控制 | `internal/browser/` + `browser-extension/` | 扩展连接、标签页、截图、页面操作、域名权限策略 | `README.md` 浏览器控制章节 |
+| 浏览器控制 | `internal/browser/` + `browser-extension/` | 扩展连接、标签页、截图、页面操作、域名权限策略、evaluate 三态只读闸门 | `README.md` 浏览器控制章节 |
 | IM 桥接 | `internal/im/` | Gateway、Adapter、飞书、微信 QR/长轮询、出站切分 | `.agents/docs/im.md` |
 | MCP | `internal/mcp/` | MCP server 管理、stdio/SSE transport、工具发现基础 | `.agents/docs/infrastructure.md` |
 | 导出 | `internal/export/` | 会话导出 HTML/PDF/text 与清洗 | `internal/server/export.go` |
@@ -81,7 +81,7 @@
 | ServerProc | `internal/serverproc/` | CLI 启停 server 子进程、原子端口绑定与身份校验；GUI 通过 `runtimeprofile/` 复用握手协议 |
 | RotateLog | `internal/rotatelog/` | 日志按日期切割和保留策略 |
 | Version | `internal/version/` | `VERSION` + ldflags + git hash 的统一版本字符串 |
-| Upgrade | `internal/upgrade/` | 用户数据目录结构版本升级，当前 `AppVersion` 为 `V8` |
+| Upgrade | `internal/upgrade/` | 用户数据目录结构版本升级，当前 `AppVersion` 为 `V15` |
 
 ## 4. 前端结构
 
@@ -130,6 +130,7 @@ GUI/CLI 输入
 Chrome/Edge 扩展连接 /api/v1/browser/ws
   -> internal/browser Hub 管理连接和 tab
   -> browser_* 工具按域名策略确认
+  -> browser_evaluate: 副作用 Block / 明确只读按策略 / 未知 JS 强制显式 Confirm
   -> 扩展执行导航/点击/截图
   -> 截图走 CallResultImage 双通道：给 LLM 看，也给 GUI 渲染
 ```
@@ -151,15 +152,23 @@ Chrome/Edge 扩展连接 /api/v1/browser/ws
 | 三端运行 | 已落地 | CLI、server、Wails GUI 共用后端主链路 |
 | 结构化消息流 | 已落地 | text/thinking/tool/sub_agent parts、SSE seq、断线恢复 |
 | Agent 长任务 | 已落地 | todo、auto-continue、回合超时续跑、LLM 阶梯式重试、熔断 |
-| LLM 协议 | 已落地 | OpenAI 兼容 + Anthropic 原生，多模态边界由 Agent 控制 |
+| LLM 协议 | 已落地 | OpenAI 兼容 + Anthropic 原生，多模态边界由 Agent 控制；默认日志无消息正文，debug 预览统一脱敏 |
 | 工具系统 | 已落地 / 持续增强 | 内置工具、动态 YAML 工具、dry-run、确认、工具结果缓存 |
 | 子代理 | 已落地 / 持续增强 | 同步/异步 `task`、后台 job、父级授权隔离、部分结果返回 |
 | 知识库 | 已落地 | 三层索引、混合检索、多库重排、引用解释、增量扫描 |
-| 浏览器控制 | 已落地 | 扩展连接、15 个工具、多 tab、权限策略、E2E 测试 |
+| 浏览器控制 | 已落地 | 扩展连接、15 个工具、多 tab、权限策略、evaluate 三态 fail-closed、E2E 测试 |
 | IM 桥接 | 实验中 / 部分可用 | Gateway、飞书、微信 QR/长轮询、出站切分和 GUI 设置入口已有，跨平台完善仍在推进 |
 | MCP | 基础可用 / 待增强 | 管理入口已有，统一工具确认和诊断体验仍需收口 |
 | 导出与更新 | 已落地一部分 | 会话导出、版本检查、下载、安装器/更新器脚本已有 |
-| 沙箱 | 基础可用 / 待增强 | 命令/写文件/浏览器域名策略已接入，Docker runner 和策略可视化待推进 |
+| 沙箱 | 基础可用 / 待增强 | 命令/写文件/浏览器域名与 evaluate 硬闸门已接入，Docker runner 和策略可视化待推进 |
+
+### 6.1 1.0.14.beta 安全与可靠性收口
+
+- LLM retry 清除失败 attempt 的 partial output，避免重试内容叠加；默认日志只保留计数、长度和不可逆指纹。
+- `PC_LLM_DEBUG=1` 只增加有界、统一脱敏的 payload 预览，不解除 credential redaction。
+- `browser_evaluate` 使用 Block / ReadOnly / Unknown 三态；Unknown 走不受 allowlist、`never`、`full/auto` 影响的显式确认。
+- pprof 与 diagnostics snapshot 均 opt-in 且仅限 TCP loopback（不信任转发头），profile 文件以 owner-only 权限落盘。完整 SEC-01 管理级路由鉴权仍以 `docs/plans/runtime-trust-route-matrix.md` 为边界。
+- CLI 知识库命令恢复，GUI 搜索可精确跳转目标消息。
 
 更细 backlog 和“已落地/待做”判断见 `docs/feature-opportunities.md`。
 

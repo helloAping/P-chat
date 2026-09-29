@@ -195,6 +195,7 @@ func mergeUserAttachmentRows(msgs []MessageResponse) []MessageResponse {
 		if len(merged) > 0 && shouldMergeUserAttachmentRow(merged[len(merged)-1], msg) {
 			prev := &merged[len(merged)-1]
 			prev.Attachments = append(prev.Attachments, msg.Attachments...)
+			prev.SourceMessageIDs = appendUniqueMessageIDs(prev.SourceMessageIDs, msg.SourceMessageIDs...)
 			if strings.TrimSpace(prev.Content) == "" && strings.TrimSpace(msg.Content) != "" {
 				prev.Content = msg.Content
 			}
@@ -534,12 +535,15 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 	}
 	base := run[0]
 	var parts []MessagePart
+	var sourceMessageIDs []int64
 
 	for _, m := range run {
 		parts = append(parts, m.Parts...)
+		sourceMessageIDs = appendUniqueMessageIDs(sourceMessageIDs, m.SourceMessageIDs...)
 	}
 
 	base.Parts = reorderAsyncSubAgentsAfterTaskTools(parts)
+	base.SourceMessageIDs = sourceMessageIDs
 	// `base.Content` is intentionally NOT regenerated from
 	// parts. The MessageBubble component (frontend/src/components/
 	// MessageBubble.vue) renders assistant messages off
@@ -551,6 +555,27 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 	// recomputing Content here would diverge from the
 	// user-visible streaming bubble.
 	return base
+}
+
+// appendUniqueMessageIDs 按原始顺序合并气泡来源 ID，同时去除重复项。
+// appendUniqueMessageIDs preserves source order while removing duplicate IDs.
+func appendUniqueMessageIDs(dst []int64, ids ...int64) []int64 {
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		seen := false
+		for _, existing := range dst {
+			if existing == id {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			dst = append(dst, id)
+		}
+	}
+	return dst
 }
 
 func reorderAsyncSubAgentsAfterTaskTools(parts []MessagePart) []MessagePart {
@@ -736,16 +761,17 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 		created = createds[i]
 	}
 	resp := MessageResponse{
-		ID:           rowID,
-		Seq:          seq,
-		Role:         m.Role,
-		MsgType:      m.MsgType,
-		Content:      m.Content,
-		CreatedAt:    created,
-		Name:         m.Name,
-		SubmitToLLM:  m.SubmitToLLM,
-		RegenGroupID: regenGroupID,
-		IsArchived:   isArchived,
+		ID:               rowID,
+		SourceMessageIDs: appendUniqueMessageIDs(nil, rowID),
+		Seq:              seq,
+		Role:             m.Role,
+		MsgType:          m.MsgType,
+		Content:          m.Content,
+		CreatedAt:        created,
+		Name:             m.Name,
+		SubmitToLLM:      m.SubmitToLLM,
+		RegenGroupID:     regenGroupID,
+		IsArchived:       isArchived,
 	}
 
 	// Attachment messages (image / audio / video / file): compute a data

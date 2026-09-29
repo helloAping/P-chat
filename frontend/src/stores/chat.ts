@@ -219,6 +219,7 @@ export const state = reactive({
   // flag had to go.
   pendingQuestion: {} as Record<string, { questions: QuestionItem[] }>,
   pendingConfirm: {} as Record<string, Array<{
+    confirmID?: string
     toolName: string
     args: string
     reason: string
@@ -324,9 +325,9 @@ export const state = reactive({
   // Pending search-result jump target. SessionSidebar's message
   // search sets this after switching sessions; ChatWindow watches
   // it, scrolls the matching [data-msg-id] bubble into view, and
-  // flashes a highlight. `ts` makes repeated jumps to the same
-  // message re-trigger the watcher.
-  searchJumpTarget: null as { sessionID: string; messageID: number; ts: number } | null,
+  // flashes a highlight. `requestID` makes repeated jumps to the same
+  // message re-trigger the watcher and settle the correct caller.
+  searchJumpTarget: null as { sessionID: string; messageID: number; requestID: number } | null,
 })
 
 export const currentMessages = computed(() =>
@@ -891,6 +892,10 @@ export async function loadProjects() {
 
 export async function setActiveProject(path: string) {
   if (path === state.activeProjectPath) return
+  const activeSearchJump = state.searchJumpTarget
+  if (activeSearchJump) {
+    completeSearchJump(activeSearchJump.requestID, '定位期间项目已切换，请重试')
+  }
   const startedAt = nowMs()
   await acquireViewLoad('正在切换项目…')
   try {
@@ -937,6 +942,10 @@ export async function switchSession(id: string) {
 }
 
 async function switchSessionBody(id: string) {
+  const activeSearchJump = state.searchJumpTarget
+  if (activeSearchJump && activeSearchJump.sessionID !== id) {
+    completeSearchJump(activeSearchJump.requestID, '定位期间会话已切换，请重试')
+  }
   state.currentID = id
   state.composerExpandedDock = null
   state.lastSessionByProject[state.activeProjectPath] = id
@@ -1056,21 +1065,18 @@ async function switchSessionBody(id: string) {
   void refreshContextUsage(id)
 }
 
-// loadMoreMessages fetches the next page of older history
-// for the given session and prepends the result to the
-// in-memory message list. Returns true if more pages remain
-// (caller can chain another loadMoreMessages). Returns false
-// when the session is at the start of its history or when
-// a load is already in flight.
-//
-// Idempotency: if a load is already in flight (e.g. the
-// user scrolled to the top multiple times in quick
-// succession) the second call returns false without making
-// an HTTP request — protects against request amplification
-// from rapid scroll events.
-export async function loadMoreMessages(id: string): Promise<boolean> {
+type LoadMoreMessagesOptions = {
+  throwOnError?: boolean
+}
+
+// 同一会话的并发翻页共享同一个请求，避免滚动加载与搜索定位互相踩踏。
+// Concurrent pagination for one session shares a single request so scroll
+// loading and search-result location cannot race each other's cursor.
+const historyPageLoads = new Map<string, Promise<boolean>>()
+
+async function fetchMoreMessagesPage(id: string): Promise<boolean> {
   const paging = state.sessionPaging[id]
-  if (!paging || !paging.hasMore || paging.loading) return false
+  if (!paging || !paging.hasMore) return false
   paging.loading = true
   try {
     // Prefer the seq-based cursor when the server
@@ -1123,37 +1129,143 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
     paging.oldestId = r.oldest_id
     paging.hasMore = r.has_more
     return r.has_more
-  } catch (e) {
-    console.warn('loadMoreMessages failed:', e)
-    return false
   } finally {
     paging.loading = false
   }
 }
 
-// jumpToSearchResult switches to the session and locates a specific
-// message (from the sidebar's full-text search). The first history page
-// holds only the 50 most recent messages, so older hits are paged in via
-// loadMoreMessages until the target row is present — then
-// state.searchJumpTarget hands off to ChatWindow, which scrolls the
-// bubble into view and flashes a highlight.
-//
-// The page loop is bounded (40 pages ≈ 2000 rows) so a stale message_id
-// (e.g. the row was deleted after indexing) terminates instead of
-// walking the entire history.
+// loadMoreMessages 加载下一页更早历史；搜索定位可要求将错误向上抛出。
+// loadMoreMessages fetches the next older page; search navigation may opt in
+// to propagated failures while ordinary infinite scroll remains best-effort.
+export async function loadMoreMessages(id: string, options: LoadMoreMessagesOptions = {}): Promise<boolean> {
+  let load = historyPageLoads.get(id)
+  if (!load) {
+    load = fetchMoreMessagesPage(id)
+    historyPageLoads.set(id, load)
+    void load.finally(() => {
+      if (historyPageLoads.get(id) === load) historyPageLoads.delete(id)
+    }).catch(() => { /* 由下方的调用者分支处理 / handled by caller branch below */ })
+  }
+  try {
+    return await load
+  } catch (error) {
+    console.warn('loadMoreMessages failed:', error)
+    if (options.throwOnError) throw error
+    return false
+  }
+}
+
+let searchJumpRequestID = 0
+// 5 秒是 DOM 回执丢失时的故障边界，不是高亮动画时长。
+// Five seconds bounds a missing DOM acknowledgement; it is not an animation duration.
+const SEARCH_JUMP_ACK_TIMEOUT_MS = 5000
+let pendingSearchJump: {
+  requestID: number
+  resolve: () => void
+  reject: (error: Error) => void
+  timeout: ReturnType<typeof setTimeout>
+} | null = null
+
+function searchBubbleAnchor(messages: Message[] | undefined, sourceMessageID: number): number | null {
+  const message = messages?.find(candidate =>
+    candidate.id === sourceMessageID || candidate.source_message_ids?.includes(sourceMessageID),
+  )
+  return message?.id && message.id > 0 ? message.id : null
+}
+
+// 缓存会话可能在回合结束时被裁剪过；定位前重置到最新真实分页游标。
+// A cached session may have evicted old rows after a turn completed. Reset to
+// the server's latest real page before walking backwards so hasMore=false from
+// an earlier full-history read cannot make a still-existing hit unreachable.
+async function resetSearchHistoryPaging(sessionID: string) {
+  const page = await api.listMessages(sessionID, { limit: initialHistoryLimit })
+  for (const message of page.messages) {
+    if (message.parts) scrubMessagePhantoms(message)
+  }
+  state.sessionMessages[sessionID] = dedupMessagesByKey(
+    state.sessionMessages[sessionID] || [],
+    page.messages,
+  )
+  state.sessionPaging[sessionID] = {
+    oldestSeq: page.oldest_seq ?? 0,
+    oldestId: page.oldest_id,
+    hasMore: page.has_more,
+    loading: false,
+  }
+  convertAndStripScreenshots(sessionID)
+}
+
+// completeSearchJump 由 ChatWindow 在 DOM 滚动与高亮完成（或失败）后回执。
+// completeSearchJump lets ChatWindow settle the navigation only after the
+// target DOM anchor has actually been scrolled to and highlighted.
+export function completeSearchJump(requestID: number, error?: string) {
+  if (state.searchJumpTarget?.requestID === requestID) {
+    state.searchJumpTarget = null
+  }
+  if (!pendingSearchJump || pendingSearchJump.requestID !== requestID) return
+  const pending = pendingSearchJump
+  pendingSearchJump = null
+  clearTimeout(pending.timeout)
+  if (error) pending.reject(new Error(error))
+  else pending.resolve()
+}
+
+// jumpToSearchResult 切换会话并按真实分页游标加载，直到命中行映射到可见气泡。
+// jumpToSearchResult switches sessions and follows real pagination cursors
+// until the matched database row maps to a visible bubble. There is no fixed
+// page cap; stale/deleted hits and stalled cursors fail explicitly.
 export async function jumpToSearchResult(sessionID: string, messageID: number): Promise<void> {
-  if (!sessionID || !messageID || messageID <= 0) return
+  if (!sessionID || !messageID || messageID <= 0) {
+    throw new Error('搜索结果缺少有效的消息定位信息')
+  }
   await switchSession(sessionID)
+  if (state.currentID !== sessionID) {
+    throw new Error('定位期间会话已切换，请重试')
+  }
   // switchSession early-returns when the session is already active and
   // loaded, so by this point sessionMessages[sessionID] reflects at
   // least the most recent page.
-  for (let i = 0; i < 40; i++) {
-    const msgs = state.sessionMessages[sessionID]
-    if (msgs?.some(m => m.id === messageID)) break
-    const more = await loadMoreMessages(sessionID)
-    if (!more) break
+  const visitedCursors = new Set<string>()
+  let anchorID = searchBubbleAnchor(state.sessionMessages[sessionID], messageID)
+  if (!anchorID) {
+    await resetSearchHistoryPaging(sessionID)
+    anchorID = searchBubbleAnchor(state.sessionMessages[sessionID], messageID)
   }
-  state.searchJumpTarget = { sessionID, messageID, ts: Date.now() }
+  while (!anchorID) {
+    if (state.currentID !== sessionID) {
+      throw new Error('定位期间会话已切换，请重试')
+    }
+    const paging = state.sessionPaging[sessionID]
+    if (!paging?.hasMore) {
+      throw new Error('该消息已被删除、归档或不再可见')
+    }
+    const cursor = paging.oldestSeq > 0
+      ? `seq:${paging.oldestSeq}`
+      : `id:${paging.oldestId}`
+    if (visitedCursors.has(cursor)) {
+      throw new Error('历史分页游标未继续向前推进')
+    }
+    visitedCursors.add(cursor)
+    await loadMoreMessages(sessionID, { throwOnError: true })
+    anchorID = searchBubbleAnchor(state.sessionMessages[sessionID], messageID)
+  }
+
+  if (state.currentID !== sessionID) {
+    throw new Error('定位期间会话已切换，请重试')
+  }
+
+  if (pendingSearchJump) {
+    completeSearchJump(pendingSearchJump.requestID, '已被新的搜索定位请求取代')
+  }
+  const requestID = ++searchJumpRequestID
+  const completion = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      completeSearchJump(requestID, '页面未在预期时间内完成消息定位')
+    }, SEARCH_JUMP_ACK_TIMEOUT_MS)
+    pendingSearchJump = { requestID, resolve, reject, timeout }
+  })
+  state.searchJumpTarget = { sessionID, messageID: anchorID, requestID }
+  await completion
 }
 
 // refreshLatestMessages merges the newest server-side rows into an already
@@ -2153,6 +2265,42 @@ function closeTrailingThinking(parts: MessagePart[] | undefined) {
   }
 }
 
+// 每个 parts 列表都记录当前 LLM 回合开始时的长度，不把运行态边界写入持久化结构。
+// Each parts array remembers the current LLM-round start length without
+// leaking an ephemeral attempt marker into the persisted MessagePart model.
+const streamAttemptStarts = new WeakMap<MessagePart[], number>()
+
+function markStreamAttemptStart(parts: MessagePart[]) {
+  streamAttemptStarts.set(parts, parts.length)
+}
+
+function startsBeforeCurrentAttempt(parts: MessagePart[]): boolean {
+  const start = streamAttemptStarts.get(parts)
+  return start !== undefined && parts.length <= start
+}
+
+function resetCurrentStreamAttempt(parts: MessagePart[]) {
+  const markedStart = streamAttemptStarts.get(parts)
+  if (markedStart !== undefined) {
+    // 只删除当前 round 边界之后的流式文本，保留早先成功的 ReAct 轮次。
+    // Remove streamed prose only after the current round boundary, preserving
+    // successful text/thinking from earlier ReAct rounds in the same bubble.
+    for (let i = parts.length - 1; i >= markedStart; i--) {
+      if (parts[i].kind === 'text' || parts[i].kind === 'thinking') parts.splice(i, 1)
+    }
+    return
+  }
+
+  // 兼容旧服务端：没有 round-start phase 时仅清理连续的尾部流式 part。
+  // Older-server fallback: without a round-start phase, remove only the
+  // contiguous streamed tail and stop at the nearest structural part.
+  while (parts.length > 0) {
+    const kind = parts[parts.length - 1].kind
+    if (kind !== 'text' && kind !== 'thinking') break
+    parts.pop()
+  }
+}
+
 function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null) {
   const parts = (target ?? m.parts)!
   closeTrailingThinking(parts)
@@ -2186,7 +2334,7 @@ function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null
   // globally. The scrub is synchronous so Vue's next
   // tick won't render the phantom.
   const cleanedDelta = scrubPhantomError(delta)
-  if (parts.length === 0 || parts[parts.length - 1].kind !== 'text') {
+  if (parts.length === 0 || parts[parts.length - 1].kind !== 'text' || startsBeforeCurrentAttempt(parts)) {
     if (cleanedDelta.trim()) {
       parts.push({ kind: 'text', text: cleanedDelta })
     }
@@ -2224,7 +2372,7 @@ function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null
 
 function appendThinkingPart(m: Message, delta: string, target?: MessagePart[] | null) {
   const parts = (target ?? m.parts)!
-  if (parts.length === 0 || parts[parts.length - 1].kind !== 'thinking') {
+  if (parts.length === 0 || parts[parts.length - 1].kind !== 'thinking' || startsBeforeCurrentAttempt(parts)) {
     parts.push({ kind: 'thinking', text: delta, streaming: true })
   } else {
     const p = parts[parts.length - 1] as any
@@ -2297,21 +2445,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     case 'stream_reset': {
-      // The LLM attempt that produced the current round's
-      // text/thinking deltas failed mid-stream and is being
-      // retried (the backend reset its own accumulators and
-      // re-streams from scratch). Drop every text/thinking part
-      // the failed attempt appended so the retried deltas don't
-      // stack on top of the partial output. Skill / tool /
-      // question parts are kept — they don't belong to the
-      // failed attempt's stream.
       const parts = sub ? sub.parts : m.parts!
-      for (let i = parts.length - 1; i >= 0; i--) {
-        const k = parts[i].kind
-        if (k === 'text' || k === 'thinking') {
-          parts.splice(i, 1)
-        }
-      }
+      resetCurrentStreamAttempt(parts)
       break
     }
     case 'content_rewrite': {
@@ -2599,11 +2734,17 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       }
       break
     }
-	    case 'phase':
-	      if (!ev.sub_agent && ev.phase === 'plan' && (ev.step === 'plan-mode' || ev.step === 'auto-plan')) {
-	        state.turnPlanReview[id] = true
-	      }
-	      // Sub-agent lifecycle: open / close the nested card.
+    case 'phase':
+      // `round-N` 是新一轮 LLM attempt 的明确边界；重试时只能回滚该边界后的流式 part。
+      // An exact `round-N` phase marks the next LLM attempt boundary; a
+      // retry may roll back only streamed parts appended after this point.
+      if (ev.phase === 'llm' && /^round-\d+$/.test(ev.step || '')) {
+        markStreamAttemptStart(sub ? sub.parts : m.parts!)
+      }
+      if (!ev.sub_agent && ev.phase === 'plan' && (ev.step === 'plan-mode' || ev.step === 'auto-plan')) {
+        state.turnPlanReview[id] = true
+      }
+      // Sub-agent lifecycle: open / close the nested card.
       // The sub-agent runner emits synthetic start/ok/err
       // phase events with sub_agent=true and
       // sub_agent_status set. These are routed through
@@ -2842,6 +2983,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           // ones defensively so an older server that
           // doesn't send them still works.
           const cfm = JSON.parse(ev.tool_confirm_json) as {
+            confirm_id?: string
             tool_name: string
             args: string
             reason: string
@@ -2852,6 +2994,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           new Promise<api.ConfirmAction>((resolve) => {
             if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
             state.pendingConfirm[id].push({
+              confirmID: cfm.confirm_id,
               toolName: cfm.tool_name,
               args: cfm.args,
               reason: cfm.reason,
@@ -2861,7 +3004,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
               resolve,
             })
           }).then((action) => {
-            submitConfirmResponseInner(id, action)
+            submitConfirmResponseInner(id, cfm.confirm_id, action)
           })
           notifyManager.play('confirm')
           notifyManager.notify('沙箱请求', `批准 ${cfm.tool_name}?`)
@@ -3456,10 +3599,10 @@ export function submitQuestionAnswer(answers: Record<string, string>) {
   }
 }
 
-async function submitConfirmResponseInner(id: string, action: api.ConfirmAction) {
+async function submitConfirmResponseInner(id: string, confirmID: string | undefined, action: api.ConfirmAction) {
   try {
-    await api.submitConfirmResponse(id, action !== 'reject', action)
-    if (action === 'always') {
+    const result = await api.submitConfirmResponse(id, action !== 'reject', action, confirmID)
+    if (result.action === 'always' && !result.explicit) {
       state.sessionMeta[id] = {
         ...state.sessionMeta[id],
         permission_level: 'full',
@@ -3467,7 +3610,8 @@ async function submitConfirmResponseInner(id: string, action: api.ConfirmAction)
       state.lastPermissionLevel = 'full'
     }
   } catch {
-    // server already unblocked via resolve
+    // The server keeps an unmatched request pending; a later SSE retry or
+    // session reload can surface it again.
   }
 }
 
@@ -3477,13 +3621,6 @@ export function submitToolConfirm(action: api.ConfirmAction) {
     const pc = items.shift()!
     if (items.length === 0) delete state.pendingConfirm[state.currentID]
     pc.resolve(action)
-    if (action === 'always') {
-      state.sessionMeta[state.currentID] = {
-        ...state.sessionMeta[state.currentID],
-        permission_level: 'full',
-      }
-      state.lastPermissionLevel = 'full'
-    }
   }
 }
 

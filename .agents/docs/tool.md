@@ -94,6 +94,9 @@ type SandboxChecker interface {
 2. 阻塞等待前端 POST /confirm-response
 3. 返回批准/拒绝
 
+`RequireExplicitConfirm()` 用于不能静默授权的动作（例如无法证明只读的
+`browser_evaluate`）：会话 `full/auto`、域名 allowlist、`require_confirm=never` 与“始终允许”缓存均不能绕过，确认通道缺失时拒绝执行。
+
 ### 5. Question 工具 (暂停-恢复)
 
 `handleQuestion()` (`question.go`) 实现异步提问流程：
@@ -175,6 +178,16 @@ MiniMax H3 / V2 视频接口会使用 `content` 多模态数组、`ratio` 字段
 旧 MiniMax `/v1/video_generation` 仍保留 `prompt` / `first_frame_image` 形状。
 Kling/可灵媒体接口会使用 `model_name`，图/视频输入写入 `image` / `video` 字段，并将
 data URL 输入剥离为 base64 主体。
+
+### 6.9 `browser_evaluate` 默认只读闸门（SEC-04）
+
+`browser.allow_eval_write` 默认 `false`。此时 `internal/browser/policy.go` 对 expression 做三态判定，且该判定独立于域名策略和会话权限：
+
+1. **明确副作用** → 硬拒绝。覆盖 DOM 属性/树写入、style/class 修改、表单提交、history/location、clipboard/share、storage/indexedDB/cache、fetch/XHR/WebSocket/EventSource/Worker、postMessage、service worker、动态代码与反射写入等常见入口。
+2. **保守确认的只读表达式** → 进入正常 BR-04 策略。`document.title`、`document.querySelector(...).textContent`、`getComputedStyle(...)`、`history.state`、`localStorage.getItem(...)` 等仍可用。
+3. **无法证明只读** → 必须逐次显式确认。这个确认不会被 `allowed_hosts`、`require_confirm=never`、会话 `full/auto` 或“始终允许”缓存静默跳过；确认通道缺失时 fail closed。
+
+词法判定不是 JavaScript 安全沙箱。需要可信页面自动化写入时，用户必须显式设置 `allow_eval_write=true`；这只关闭 expression 的只读闸门，`blocked_hosts` 和正常 BR-04 确认仍生效。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

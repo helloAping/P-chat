@@ -261,8 +261,9 @@ func isTransientProviderUnavailable(msg string) bool {
 // when msg is not one of those envelopes.
 func parseHTTPStatusError(msg string) (int, string, bool) {
 	const (
-		llmPrefix    = "llm http "
-		openaiPrefix = "openai http "
+		llmPrefix       = "llm http "
+		openaiPrefix    = "openai http "
+		anthropicPrefix = "anthropic http "
 	)
 	var rest string
 	switch {
@@ -270,6 +271,8 @@ func parseHTTPStatusError(msg string) (int, string, bool) {
 		rest = msg[len(llmPrefix):]
 	case strings.HasPrefix(msg, openaiPrefix):
 		rest = msg[len(openaiPrefix):]
+	case strings.HasPrefix(msg, anthropicPrefix):
+		rest = msg[len(anthropicPrefix):]
 	default:
 		return 0, "", false
 	}

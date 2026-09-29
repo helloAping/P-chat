@@ -341,6 +341,8 @@ func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 
 		reader := bufio.NewReaderSize(r, 1<<20)
 		var eventType string
+		rawEvents := 0
+		parseFailures := 0
 		for {
 			line, err := readSSELine(reader)
 			// Single dispatch path. The previous version
@@ -355,7 +357,23 @@ func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				case strings.HasPrefix(line, "event: "):
 					eventType = strings.TrimPrefix(line, "event: ")
 				case strings.HasPrefix(line, "data: "):
-					a.handleStreamEvent(eventType, strings.TrimPrefix(line, "data: "), ch)
+					payload := strings.TrimPrefix(line, "data: ")
+					if payload == "[DONE]" {
+						ch <- StreamChunk{Done: true}
+						return
+					}
+					rawEvents++
+					if rawEvents <= 3 {
+						// 调试模式只记录有界、脱敏预览。Debug mode logs bounded, redacted previews only.
+						logLLMDebugPayload(fmt.Sprintf("[llm/%s/anthropic]", a.name), rawEvents, []byte(payload))
+					}
+					var envelope any
+					if parseErr := json.Unmarshal([]byte(payload), &envelope); parseErr != nil {
+						parseFailures++
+						logMalformedSSE(fmt.Sprintf("[llm/%s/anthropic]", a.name), rawEvents, parseFailures, []byte(payload), parseErr)
+						break
+					}
+					a.handleStreamEvent(eventType, payload, ch)
 					// Comment lines (": something"), id lines,
 					// or unknown fields fall through and are
 					// ignored on the next iteration.
@@ -436,9 +454,9 @@ func (a *AnthropicAdapter) Send(ctx context.Context, req *ProtocolRequest) (*htt
 		return nil, ClassifyAPIError(a.name, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, ClassifyAPIError(a.name, fmt.Errorf("anthropic http %d: %s", resp.StatusCode, string(bodyBytes)))
+		return nil, ClassifyAPIError(a.name, upstreamHTTPError("anthropic", resp.StatusCode, bodyBytes))
 	}
 
 	// Start streaming; the caller reads from the response body
@@ -478,7 +496,7 @@ func (a *AnthropicAdapter) handleStreamEvent(eventType, dataJSON string, ch chan
 			Message string `json:"message"`
 		}
 		if err := json.Unmarshal([]byte(dataJSON), &errResp); err == nil {
-			ch <- StreamChunk{Err: fmt.Errorf("anthropic error: %s", errResp.Message)}
+			ch <- StreamChunk{Err: fmt.Errorf("anthropic error: %s", sanitizeProviderDetail(errResp.Message, 1024))}
 		}
 	}
 }

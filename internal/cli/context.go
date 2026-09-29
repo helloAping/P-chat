@@ -313,6 +313,51 @@ func (e *ErrUnsupported) Error() string {
 	return "operation " + e.Op + " is not supported in HTTP mode"
 }
 
+// commandContext 组合远程会话能力与本地命令能力。commandContext keeps
+// chat/session operations on the HTTP server while routing commands that own
+// local resources (/kb and /recall) through the REPL's attached managers.
+// Embedding the primary context makes every unlisted operation continue to use
+// the server-backed implementation.
+type commandContext struct {
+	cliContext
+	local *localContext
+}
+
+type confirmIDContext interface {
+	SubmitToolConfirmWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error
+}
+
+func submitToolConfirmWithID(ctx cliContext, requestCtx context.Context, sessionID string, approved bool, action, confirmID string) error {
+	if detailed, ok := ctx.(confirmIDContext); ok {
+		return detailed.SubmitToolConfirmWithID(requestCtx, sessionID, approved, action, confirmID)
+	}
+	return ctx.SubmitToolConfirm(requestCtx, sessionID, approved, action)
+}
+
+func (c *commandContext) SubmitToolConfirmWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error {
+	return submitToolConfirmWithID(c.cliContext, ctx, sessionID, approved, action, confirmID)
+}
+
+func (c *commandContext) ListKBs() ([]KBView, error) {
+	return c.local.ListKBs()
+}
+
+func (c *commandContext) AddKB(path string) error {
+	return c.local.AddKB(path)
+}
+
+func (c *commandContext) RemoveKB(path string) error {
+	return c.local.RemoveKB(path)
+}
+
+func (c *commandContext) ScanKBs() (added, updated int, err error) {
+	return c.local.ScanKBs()
+}
+
+func (c *commandContext) Recall(ctx context.Context, query string, topK int) error {
+	return c.local.Recall(ctx, query, topK)
+}
+
 // ====================================================================
 // localContext: backed by direct in-process access (legacy mode)
 // ====================================================================
@@ -457,7 +502,11 @@ func (c *localContext) SubmitQuestionAnswer(ctx context.Context, sessionID strin
 }
 
 func (c *localContext) SubmitToolConfirm(ctx context.Context, sessionID string, approved bool, action string) error {
-	if !tool.SubmitConfirmResponse(sessionID, tool.ConfirmResponse{Approved: approved, Action: action}) {
+	return c.SubmitToolConfirmWithID(ctx, sessionID, approved, action, "")
+}
+
+func (c *localContext) SubmitToolConfirmWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error {
+	if !tool.SubmitConfirmResponse(sessionID, tool.ConfirmResponse{ConfirmID: confirmID, Approved: approved, Action: action}) {
 		return fmt.Errorf("no pending tool confirmation for session %s", sessionID)
 	}
 	return nil
@@ -1101,14 +1150,17 @@ func (c *localContext) ScanKBs() (added, updated int, err error) {
 	if c.r.kbManager == nil {
 		return 0, 0, &ErrUnsupported{Op: "ScanKBs"}
 	}
-	// Actually rebuild the index for every enabled base — the previous
-	// implementation only counted existing nodes (ScanStats), so `/kb scan`
-	// returned success without ever scanning anything. KBManager.Scan("")
-	// walks all enabled bases and rewrites their L1/L2/L3 index trees.
+	// 实际重建每个已启用知识库的索引；旧实现只统计已有节点，并未扫描文件。
+	// Actually rebuild every enabled base; the old implementation only counted
+	// existing nodes and never scanned the files.
 	if err := c.r.kbManager.Scan(""); err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("scan knowledge bases: %w", err)
 	}
-	return c.r.kbManager.ScanStats()
+	added, updated, err = c.r.kbManager.ScanStats()
+	if err != nil {
+		return 0, 0, fmt.Errorf("read knowledge base scan stats: %w", err)
+	}
+	return added, updated, nil
 }
 
 func (c *localContext) Recall(ctx context.Context, query string, topK int) error {
@@ -1125,7 +1177,10 @@ func (c *localContext) Recall(ctx context.Context, query string, topK int) error
 	if effective == nil {
 		effective = context.Background()
 	}
-	return c.r.recallEngine.PrintSearch(effective, query, topK)
+	if err := c.r.recallEngine.PrintSearch(effective, query, topK); err != nil {
+		return fmt.Errorf("search knowledge base: %w", err)
+	}
+	return nil
 }
 
 func (c *localContext) InitProject(dir string) error {
@@ -1322,6 +1377,10 @@ func (c *httpContext) SubmitQuestionAnswer(ctx context.Context, sessionID string
 
 func (c *httpContext) SubmitToolConfirm(ctx context.Context, sessionID string, approved bool, action string) error {
 	return c.c.SubmitConfirmResponse(ctx, sessionID, approved, action)
+}
+
+func (c *httpContext) SubmitToolConfirmWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error {
+	return c.c.SubmitConfirmResponseWithID(ctx, sessionID, approved, action, confirmID)
 }
 
 func (c *httpContext) CompressSession(ctx context.Context, sessionID string) (httpcli.CompressResult, error) {
@@ -1695,8 +1754,9 @@ func lastUserContent(msgs []llm.ChatMessage) string {
 	return ""
 }
 
-// httpEventToChunk converts an HTTP stream event into the
-// agent.ChatStreamChunk shape used by the local UI renderer.
+// httpEventToChunk 将 HTTP 流事件转换为终端渲染器使用的 ChatStreamChunk。
+// httpEventToChunk converts an HTTP stream event into the shape used by the
+// terminal renderer.
 func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 	return agent.ChatStreamChunk{
 		Seq:                   ev.Seq,
@@ -1747,6 +1807,7 @@ func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 		ToolConfirmJSON:       ev.ToolConfirmJSON,
 		ContentRewrite:        ev.ContentRewrite,
 		ThinkingRewrite:       ev.ThinkingRewrite,
+		StreamReset:           ev.Type == "stream_reset",
 		SessionStatus:         ev.SessionStatus,
 	}
 }

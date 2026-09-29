@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -495,18 +494,19 @@ func (a *OpenAIAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				return
 			}
 			rawChunks++
-			if rawChunks <= 3 && os.Getenv("PC_LLM_DEBUG") == "1" {
-				// Verbatim chunk dump for proxy debugging; gated
-				// because payloads contain user content.
-				log.Printf("[llm/%s] raw #%d: %s", a.name, rawChunks, string(payload))
+			if rawChunks <= 3 {
+				// 调试模式只记录有界、脱敏预览。Debug mode logs bounded, redacted previews only.
+				logLLMDebugPayload(fmt.Sprintf("[llm/%s]", a.name), rawChunks, payload)
 			}
 
 			var r openaiStreamResponse
 			if err := json.Unmarshal(payload, &r); err != nil {
 				parseFailures++
+				logMalformedSSE(fmt.Sprintf("[llm/%s]", a.name), rawChunks, parseFailures, payload, err)
 				continue
 			}
 			if proxyErr := extractProxyError(payload); proxyErr != "" {
+				logProxySSE(fmt.Sprintf("[llm/%s]", a.name), rawChunks, payload)
 				ch <- StreamChunk{Err: fmt.Errorf("openai proxy error: %s", proxyErr)}
 				return
 			}
@@ -577,7 +577,7 @@ func (a *OpenAIAdapter) Send(ctx context.Context, req *ProtocolRequest) (<-chan 
 	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, ClassifyAPIError(a.name, fmt.Errorf("openai http %d: %s", resp.StatusCode, string(errBody)))
+		return nil, ClassifyAPIError(a.name, upstreamHTTPError("openai", resp.StatusCode, errBody))
 	}
 
 	return a.ParseStream(resp.Body), nil

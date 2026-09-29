@@ -276,25 +276,39 @@ function handleMenuSelect(key: string) {
 const searchQuery = ref('')
 const searchResults = ref<SearchResult[]>([])
 const searchLoading = ref(false)
+const searchError = ref('')
+const searchJumpingKey = ref('')
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+let searchRequestID = 0
 
-function doSearch() {
+async function doSearch() {
   const q = searchQuery.value.trim()
   if (!q) {
     searchResults.value = []
+    searchError.value = ''
     searchLoading.value = false
     return
   }
+  const requestID = ++searchRequestID
   searchLoading.value = true
-  api.searchMessages(q, 15, state.activeProjectPath).then(
-    r => { searchResults.value = r.results; searchLoading.value = false },
-    () => { searchLoading.value = false },
-  )
+  searchError.value = ''
+  try {
+    const response = await api.searchMessages(q, 15, state.activeProjectPath)
+    if (requestID !== searchRequestID || q !== searchQuery.value.trim()) return
+    searchResults.value = response.results
+  } catch (error) {
+    if (requestID !== searchRequestID) return
+    searchResults.value = []
+    searchError.value = `搜索失败：${updateErrorMessage(error)}`
+  } finally {
+    if (requestID === searchRequestID) searchLoading.value = false
+  }
 }
 
 watch(searchQuery, () => {
   if (searchTimer) clearTimeout(searchTimer)
-  searchTimer = setTimeout(doSearch, 300)
+  searchError.value = ''
+  searchTimer = setTimeout(() => { void doSearch() }, 300)
 })
 
 watch(showAddProject, (show) => {
@@ -307,16 +321,24 @@ watch(showAddProject, (show) => {
 })
 
 function clearSearch() {
+  searchRequestID++
   searchQuery.value = ''
   searchResults.value = []
+  searchError.value = ''
 }
 
-function jumpToResult(r: SearchResult) {
-  clearSearch()
-  // SM-01: locate the exact message, not just the session. The store
-  // action switches sessions, pages older history in until the hit is
-  // loaded, then hands off to ChatWindow for scroll + highlight.
-  jumpToSearchResult(r.conversation_id, r.message_id)
+async function jumpToResult(r: SearchResult) {
+  if (searchJumpingKey.value) return
+  const key = `${r.conversation_id}-${r.message_id}`
+  searchJumpingKey.value = key
+  try {
+    await jumpToSearchResult(r.conversation_id, r.message_id)
+    clearSearch()
+  } catch (error) {
+    message.error(`定位消息失败：${updateErrorMessage(error)}`)
+  } finally {
+    searchJumpingKey.value = ''
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,14 +1044,18 @@ onMounted(() => {
       <NScrollbar class="session-scroll">
         <!-- Search results -->
         <div v-if="searchQuery.trim()" class="search-results">
-          <NSpin :show="searchLoading" size="small">
-            <div v-if="searchResults.length === 0 && !searchLoading" class="search-empty">
+          <NSpin :show="searchLoading || !!searchJumpingKey" size="small">
+            <div v-if="searchError && !searchLoading" class="search-empty search-error">
+              {{ searchError }}
+            </div>
+            <div v-else-if="searchResults.length === 0 && !searchLoading" class="search-empty">
               无匹配结果
             </div>
             <div
               v-for="r in searchResults"
               :key="`${r.conversation_id}-${r.message_id}`"
               class="search-result-item"
+              :class="{ 'is-locating': searchJumpingKey === `${r.conversation_id}-${r.message_id}` }"
               @click="jumpToResult(r)"
             >
               <div class="result-header">
@@ -1662,11 +1688,13 @@ onMounted(() => {
   cursor: pointer; background: var(--surface-2); transition: background var(--dur-fast) var(--ease-out);
 }
 .search-result-item:hover { background: var(--surface-3); }
+.search-result-item.is-locating { opacity: 0.72; cursor: progress; }
 .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
 .result-title { font-size: 12px; font-weight: 600; }
 .result-time { font-size: 10px; color: var(--text-tertiary); }
 .result-snippet { font-size: 12px; color: var(--text-secondary); line-height: 1.4; white-space: pre-wrap; word-break: break-all; }
 .search-empty { text-align: center; padding: 24px; color: var(--text-tertiary); font-size: 13px; }
+.search-error { color: var(--error-500); }
 
 /* --- Footer user card ------------------------------------------------- */
 .user-card {

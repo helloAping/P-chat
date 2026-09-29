@@ -3799,6 +3799,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 										PathClass:    cfmTarget.PathClass,
 										RiskLevel:    cfmTarget.RiskLevel,
 									}
+									if err := tool.PrepareConfirmRequest(&cfm); err != nil {
+										outcomes[i] = toolOutcome{
+											idx:    i,
+											tc:     tc,
+											result: &tool.CallResult{Content: "无法创建工具确认请求", IsError: true},
+										}
+										return
+									}
 									var sessionID string
 									if sid, ok := tctx.Value(tool.SessionIDKey{}).(string); ok {
 										sessionID = sid

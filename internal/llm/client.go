@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -478,7 +477,7 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 		resp.Body.Close()
 		cancelStream()
 		ch := make(chan StreamChunk, 1)
-		ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(errBody)))}
+		ch <- StreamChunk{Err: ClassifyAPIError(p.name, upstreamHTTPError("llm", resp.StatusCode, errBody))}
 		close(ch)
 		return ch
 	}
@@ -556,7 +555,7 @@ func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, mes
 		return "", ClassifyAPIError(p.name, readErr)
 	}
 	if resp.StatusCode >= 400 {
-		return "", ClassifyAPIError(p.name, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(body)))
+		return "", ClassifyAPIError(p.name, upstreamHTTPError("llm", resp.StatusCode, body))
 	}
 	text, err := parseNonStreamContent(p.protocol, body)
 	if err != nil {
@@ -852,7 +851,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		if resp.StatusCode >= 400 {
 			// Read up to 4 KB of body for the error message.
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("openai http %d: %s", resp.StatusCode, string(errBody)))}
+			ch <- StreamChunk{Err: ClassifyAPIError(p.name, upstreamHTTPError("openai", resp.StatusCode, errBody))}
 			return
 		}
 
@@ -861,16 +860,12 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		// "data: " followed by the JSON payload, and a final
 		// "data: [DONE]" sentinel.
 		//
-		// We log the first 3 raw chunks (only with PC_LLM_DEBUG=1 —
-		// they contain user content) and a final summary (chunk
-		// count / content chars / thinking chars / parse failures)
-		// at the end of the stream. This is invaluable when
-		// debugging proxy gateways (like api-convert.08ms.cn) that
-		// occasionally rename the standard fields — e.g. an
-		// upstream that uses `delta.text` instead of `delta.content`
-		// will surface a "0 chars received" line at the end of the
-		// stream, and with PC_LLM_DEBUG=1 the user can copy the raw
-		// chunk dump into the issue tracker.
+		// PC_LLM_DEBUG=1 时记录前三个事件的有界、脱敏预览及最终统计；
+		// 默认只在解析失败时记录无正文元数据。这样既能诊断代理字段漂移，
+		// 也不会把用户消息或凭据默认写入磁盘。
+		// With PC_LLM_DEBUG=1, log bounded, redacted previews of the first
+		// three events plus final counters. Default mode records body-free
+		// metadata only for parse failures, keeping messages and credentials off disk.
 		reader := bufio.NewReaderSize(streamBody, 1<<20)
 		var (
 			rawChunks     int
@@ -896,7 +891,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 					// the per-stream summary on a debug knob
 					// so a normal session doesn't fill the
 					// log.
-					if parseFailures > 0 || os.Getenv("PC_LLM_DEBUG") == "1" {
+					if parseFailures > 0 || llmDebugEnabled() {
 						log.Printf("%s[llm/%s/%s] stream ended: chunks=%d parsed=%d content=%d thinking=%d parse_errs=%d",
 							trace.LogPrefix(ctx), p.name, model, rawChunks, rawChunks-parseFailures, contentChars, thinkingChars, parseFailures)
 					}
@@ -920,7 +915,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 				// Same gating as the EOF path: the summary is
 				// useful when parsing broke, but a healthy
 				// stream shouldn't fill the log by default.
-				if parseFailures > 0 || os.Getenv("PC_LLM_DEBUG") == "1" {
+				if parseFailures > 0 || llmDebugEnabled() {
 					log.Printf("%s[llm/%s/%s] stream ended at [DONE]: chunks=%d content=%d thinking=%d parse_errs=%d",
 						trace.LogPrefix(ctx), p.name, model, rawChunks, contentChars, thinkingChars, parseFailures)
 				}
@@ -928,26 +923,16 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			}
 			rawChunks++
 			if rawChunks <= 3 {
-				// Dump the first few raw chunks verbatim so
-				// the field names are visible in the server
-				// log when debugging a misbehaving proxy.
-				// Gated on PC_LLM_DEBUG=1: payloads contain
-				// user content / reasoning and must not land
-				// on disk by default.
-				if os.Getenv("PC_LLM_DEBUG") == "1" {
-					log.Printf("%s[llm/%s/%s] raw chunk #%d: %s", trace.LogPrefix(ctx), p.name, model, rawChunks, string(payload))
-				}
+				// 调试模式只写有界、脱敏预览；默认模式不写消息正文。
+				// Debug mode logs only bounded, redacted previews; default mode logs no message text.
+				logLLMDebugPayload(fmt.Sprintf("%s[llm/%s/%s]", trace.LogPrefix(ctx), p.name, model), rawChunks, payload)
 			}
 			var r openaiStreamResponse
 			if err := json.Unmarshal(payload, &r); err != nil {
-				// Skip malformed lines (some providers send
-				// keepalive pings or partial JSON during
-				// reconnects). Truncate the payload in the
-				// log — it may carry user-visible content.
+				// 跳过异常行；默认日志只写长度和摘要，调试模式写脱敏预览。
+				// Skip malformed lines; default logs keep metadata, while debug logs a redacted preview.
 				parseFailures++
-				if parseFailures <= 3 {
-					log.Printf("%s[llm/%s/%s] parse error on chunk #%d: %v payload=%s", trace.LogPrefix(ctx), p.name, model, rawChunks, err, truncateForLog(payload, 256))
-				}
+				logMalformedSSE(fmt.Sprintf("%s[llm/%s/%s]", trace.LogPrefix(ctx), p.name, model), rawChunks, parseFailures, payload, err)
 				continue
 			}
 			// If the proxy returned an error envelope
@@ -961,7 +946,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			// assistant reply that is actually a
 			// provider rate-limit / auth error.
 			if proxyErr := extractProxyError(payload); proxyErr != "" {
-				log.Printf("%s[llm/%s/%s] proxy error chunk: %s", trace.LogPrefix(ctx), p.name, model, proxyErr)
+				logProxySSE(fmt.Sprintf("%s[llm/%s/%s]", trace.LogPrefix(ctx), p.name, model), rawChunks, payload)
 				ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("openai proxy error: %s", proxyErr))}
 				return
 			}
@@ -1196,7 +1181,7 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		return "", ClassifyAPIError(p.name, readErr)
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		return "", ClassifyAPIError(p.name, fmt.Errorf("openai http %d: %s", resp.StatusCode, string(encoded)))
+		return "", ClassifyAPIError(p.name, upstreamHTTPError("openai", resp.StatusCode, encoded))
 	}
 	return parseNonStreamContent(p.protocol, encoded)
 }
@@ -1400,16 +1385,16 @@ func extractProxyError(payload []byte) string {
 	}
 	if err := json.Unmarshal(raw, &obj); err == nil && obj.Message != "" {
 		if obj.Code != "" {
-			return fmt.Sprintf("[%s] %s", obj.Code, obj.Message)
+			return sanitizeProviderDetail(fmt.Sprintf("[%s] %s", obj.Code, obj.Message), 1024)
 		}
 		if obj.Type != "" {
-			return fmt.Sprintf("[%s] %s", obj.Type, obj.Message)
+			return sanitizeProviderDetail(fmt.Sprintf("[%s] %s", obj.Type, obj.Message), 1024)
 		}
-		return obj.Message
+		return sanitizeProviderDetail(obj.Message, 1024)
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return sanitizeProviderDetail(s, 1024)
 	}
 	return ""
 }
@@ -1482,8 +1467,8 @@ func extractContent(payload []byte) (string, string) {
 	// proxy can be debugged. Truncate to 512 bytes to avoid
 	// log spam, and gate on the debug knob because the payload
 	// may carry user-visible content (same as extractThinking).
-	if os.Getenv("PC_LLM_DEBUG") == "1" {
-		log.Printf("[llm] extractContent: walker found no match in payload (first 512 bytes): %s", truncateForLog(payload, 512))
+	if llmDebugEnabled() {
+		log.Printf("[llm] extractContent: walker found no match: bytes=%d sha256=%s preview=%s", len(payload), payloadFingerprint(payload), redactedPayloadPreview(payload, 512))
 	}
 	return "", ""
 }
@@ -1500,17 +1485,10 @@ func extractThinking(payload []byte) (string, string) {
 	// field is found, log the payload shape. The vast majority
 	// of streams don't carry thinking at all, so the log is
 	// gated on a debug knob.
-	if os.Getenv("PC_LLM_DEBUG") == "1" {
-		log.Printf("[llm] extractThinking: walker found no match in payload (first 512 bytes): %s", truncateForLog(payload, 512))
+	if llmDebugEnabled() {
+		log.Printf("[llm] extractThinking: walker found no match: bytes=%d sha256=%s preview=%s", len(payload), payloadFingerprint(payload), redactedPayloadPreview(payload, 512))
 	}
 	return "", ""
-}
-
-func truncateForLog(b []byte, max int) string {
-	if len(b) <= max {
-		return string(b)
-	}
-	return string(b[:max]) + "...(truncated)"
 }
 
 func walkForField(v any, names []string, path string, depth, maxDepth, maxResults int) (string, string) {

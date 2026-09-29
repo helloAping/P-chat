@@ -111,12 +111,20 @@ func (r *REPL) SetKBManager(m *KBManager) {
 	r.kbManager = m
 }
 
-// asContext returns a cliContext backed by this REPL.
+// asContext 返回命令处理器使用的上下文。asContext returns the context used
+// by slash-command handlers. HTTP remains authoritative for chat/session
+// operations, while locally attached KB/recall managers stay reachable.
 func (r *REPL) asContext() cliContext {
-	if r.ctx != nil {
-		return r.ctx
+	if r.ctx == nil {
+		return &localContext{r: r}
 	}
-	return &localContext{r: r}
+	if _, ok := r.ctx.(*httpContext); ok {
+		return &commandContext{
+			cliContext: r.ctx,
+			local:      &localContext{r: r},
+		}
+	}
+	return r.ctx
 }
 
 func (r *REPL) Run() error {
@@ -234,8 +242,8 @@ func (r *REPL) chatWithSkills(input string, activeSkills []string) {
 	ui.SetQuestionHandler(r.ctx.GetCurrentSessionID(), func(sid string, answers map[string]string) error {
 		return r.ctx.SubmitQuestionAnswer(ctx, sid, answers)
 	})
-	ui.SetConfirmHandler(r.ctx.GetCurrentSessionID(), func(sid string, approved bool, action string) error {
-		return r.ctx.SubmitToolConfirm(ctx, sid, approved, action)
+	ui.SetConfirmHandlerWithID(r.ctx.GetCurrentSessionID(), func(sid string, approved bool, action, confirmID string) error {
+		return submitToolConfirmWithID(r.ctx, ctx, sid, approved, action, confirmID)
 	})
 	ui.PrintBannerHeader(input)
 

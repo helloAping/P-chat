@@ -80,6 +80,7 @@ GUI 的动态 `/<skill-name> [请求]` 只把名称写入 `active_skills`。服�
 ```typescript
 switch (ev.type) {
     case 'content':        // 追加文本增量 (含 sub_agent 路由)
+    case 'stream_reset':   // LLM 重试：仅回滚当前 round/attempt 的尾部文本与思考
     case 'content_rewrite': // 服务端后处理重写（phantom error 清洗）
     case 'thinking':        // 追加思考增量
     case 'thinking_rewrite': // 思考块重写
@@ -260,6 +261,21 @@ header 的 📋 复制按钮可点（stopPropagation 防 toggle）。
 `regenerateMessage` action：弹掉本地 trailing bubble → 调
 `api.streamRegenerate` → 走正常 stream 路径。auto-continue
 从 0 重新计数（算新 stream）。
+
+#### REL-01 LLM 重试流重置
+
+- 每轮 `phase=llm` 且 `step=round-N` 的事件记录当前 parts 长度，作为本轮 attempt 边界。
+- `stream_reset` 只删除该边界之后的 `text` / `thinking`，不得删除同一气泡内前面已成功的 ReAct 轮次。
+- round 边界保存在前端 `WeakMap` 运行态中，不扩展、不持久化 `MessagePart` 数据结构。
+- 兼容没有 round phase 的旧流时，仅回滚连续的尾部 text/thinking，遇到 tool/skill/question/sub-agent 等结构 part 立即停止。
+
+#### SM-01 搜索结果精确定位
+
+- 历史响应为每个可见气泡返回 `source_message_ids[]`；多轮 assistant 行或用户附件行合并后，搜索命中的原始行 ID 仍能映射到真正的 `[data-msg-id]` DOM 锚点。
+- `jumpToSearchResult()` 先刷新最新历史游标，再按 `oldest_seq` / `oldest_id` 持续加载，直到命中或服务端明确表示无更早数据；不使用固定页数上限。
+- 分页游标停滞、网络错误、行已删除/归档、DOM 锚点缺失都会显式失败；侧边栏保留搜索结果并显示错误，不静默清空。
+- 定位 Promise 在会话切换、ChatWindow 卸载或 5 秒 DOM 回执故障边界到期时主动 reject，避免悬挂。5 秒仅是异常兜底，不是动画时长。
+- 高亮用 `--brand-500` + `--dur-highlight`，并由 `animationend` 移除 class。
 
 ### 10. Round 3 增强 (2026-07-15)
 

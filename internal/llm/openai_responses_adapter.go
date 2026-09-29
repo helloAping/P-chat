@@ -7,9 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"os"
 	"strings"
 )
 
@@ -243,6 +241,7 @@ func (a *OpenAIResponsesAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 		argDeltas := map[int]string{}
 		emittedToolCalls := map[int]bool{}
 		rawEvents := 0
+		parseFailures := 0
 		for {
 			line, err := reader.ReadBytes('\n')
 			if err != nil {
@@ -263,17 +262,19 @@ func (a *OpenAIResponsesAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				return
 			}
 			rawEvents++
-			if rawEvents <= 3 && os.Getenv("PC_LLM_DEBUG") == "1" {
-				// Verbatim event dump for proxy debugging; gated
-				// because payloads contain user content.
-				log.Printf("[llm/%s/responses] raw #%d: %s", a.name, rawEvents, string(payload))
+			if rawEvents <= 3 {
+				// 调试模式只记录有界、脱敏预览。Debug mode logs bounded, redacted previews only.
+				logLLMDebugPayload(fmt.Sprintf("[llm/%s/responses]", a.name), rawEvents, payload)
 			}
 			if proxyErr := extractProxyError(payload); proxyErr != "" {
+				logProxySSE(fmt.Sprintf("[llm/%s/responses]", a.name), rawEvents, payload)
 				ch <- StreamChunk{Err: fmt.Errorf("openai responses proxy error: %s", proxyErr)}
 				return
 			}
 			var ev responsesStreamEvent
 			if err := json.Unmarshal(payload, &ev); err != nil {
+				parseFailures++
+				logMalformedSSE(fmt.Sprintf("[llm/%s/responses]", a.name), rawEvents, parseFailures, payload, err)
 				continue
 			}
 			switch ev.Type {
@@ -342,7 +343,7 @@ func (a *OpenAIResponsesAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				return
 			case "response.failed":
 				if ev.Response != nil && ev.Response.Error != nil {
-					ch <- StreamChunk{Err: errors.New(ev.Response.Error.Message)}
+					ch <- StreamChunk{Err: errors.New(sanitizeProviderDetail(ev.Response.Error.Message, 1024))}
 					return
 				}
 			}

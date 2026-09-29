@@ -77,7 +77,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 
 ### 2. chunkToEvent — 事件映射
 
-`chunkToEvent()` (handler.go:1495-1613) 是服务端到前端的翻译器：
+`chunkToEvent()` (`stream_adapter.go`) 是服务端到前端的翻译器：
 
 ```
 Chunk 字段检查顺序（优先级从高到低）:
@@ -88,13 +88,17 @@ Chunk 字段检查顺序（优先级从高到低）:
   5. ToolName 非空 → type: "tool" (status 由 Step 字符串推导)
   6. Thinking 非空 → type: "thinking"
   7. Content 非空 → type: "content"
-  8. ContentRewrite 非空 → type: "content_rewrite"
-  9. ThinkingRewrite 非空 → type: "thinking_rewrite"
-  10. Phase 非空 → type: "phase"
-  11. 其他 → type: "phase" (心跳)
+  8. StreamReset == true → type: "stream_reset"
+  9. ContentRewrite 非空 → type: "content_rewrite"
+  10. ThinkingRewrite 非空 → type: "thinking_rewrite"
+  11. Phase 非空 → type: "phase"
+  12. 其他 → type: "phase" (心跳)
 ```
 
 **关键设计**：sub_agent 字段（SubAgent/SubAgentTask/SubAgentStatus 等）在所有分支中***无条件拷贝***，使子代理的 content/thinking/tool/phase 事件都能正确路由到嵌套卡片。
+
+`stream_reset` 是重试边界，不是普通 `phase`：收到它的客户端必须丢弃当前 LLM attempt
+已追加的 text/thinking parts，再接收新 attempt 的输出，避免两次不完整输出被拼成一条回复。
 
 ### 3. 会话管理
 
@@ -110,7 +114,7 @@ Chunk 字段检查顺序（优先级从高到低）:
 
 ### 4. 消息管理
 
-- `ListMessages` (GET) — 分页返回历史消息，含 `parts` 解码
+- `ListMessages` (GET) — 分页返回历史消息，含 `parts` 解码和 `source_message_ids`
 - `SendMessage` (POST) — 发送 + SSE 流
 - `SnapshotRecovery` (GET) — **P0-1**：断线恢复用的增量快照
 - `Regenerate` (POST) — **P1-3**：物理截断 user 消息之后的行后重跑
@@ -155,6 +159,7 @@ Skill API：
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
 - `buildMessageResponse()` 会过滤不应渲染的内部行：tool_call/tool_result、媒体附件独立行、`metadata.ui_hidden=true` 的消息，以及旧库中以 `⏱ 上一回合因` / `⚠ 系统检测：你刚才的回复没有调用任何工具` 开头的自动续跑 user-style nudge。内部续跑提示只能影响下一次 LLM 输入，不应在 GUI 里表现成用户重复发送消息。
+- `source_message_ids` 是一个可见气泡合并前的数据库行 ID 列表。搜索 API 只返回上述可渲染消息；前端用该列表把任一命中的原始行定位到合并后的消息 DOM 锚点。
 - `type=skill` SSE 携带 `skill_name`、`skill_status=start|ready|error`、`skill_scope`、
   `skill_source`、`skill_dependencies`、`skill_error`，并作为 `kind=skill` part 持久化。
 
@@ -351,6 +356,8 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 - 高风险动作（type / file_upload / evaluate）与敏感域触发 `tool_confirm` SSE
 - 确认复用 `tool.RequireConfirm` + `ToolConfirmModal`（`path_class=browser`，`resolved_path`=页面 URL）
 - 会话权限 `full` / `/unsafe once` 跳过确认；`blocked_hosts` 仍硬拦截
+- `browser_evaluate` 另有独立三态闸门：明确副作用硬拒绝；明确只读走上述策略；未知 JS 调 `tool.RequireExplicitConfirm` 逐次确认。未知表达式不会被 allowlist、`require_confirm=never`、`full/auto` 或“始终允许”缓存跳过。
+- `allow_eval_write=true` 是可信自动化的显式逃生口，只关闭 evaluate 只读闸门，不覆盖 `blocked_hosts` 或正常高风险确认。
 
 ### 12. 浏览器 E2E（BR-05）
 
@@ -376,6 +383,17 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 首版异步任务在一次工具调用中轮询完成，尚无重启续查/取消端点。详见
 [媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
 
+### 14. Diagnostics 安全边界（SEC-01）
+
+`/api/v1/diagnostics/*` 与 `/debug/pprof/*` 属于 D（管理级诊断）能力；heap/goroutine profile 可能暴露栈参数、路径和运行时元数据。在 SEC-01 的管理级 capability 路由完全接线前，1.0.14.beta 使用额外安全默认值：
+
+- `/debug/pprof/*` 默认不注册，只有启动前设置 `PC_PPROF=1` 才开启；开启后仍只接受 TCP `RemoteAddr` 为 loopback 的客户端，不读取可伪造的 `X-Forwarded-For`。
+- heap/goroutine 下载默认返回 `403 diagnostics_snapshot_disabled`；启动前设置 `PC_DIAGNOSTICS_SNAPSHOTS=1` 后也只接受 loopback 客户端，非本机返回 `403 diagnostics_snapshot_local_only`。
+- 写入磁盘的 `.prof` / `.txt` 使用 owner-only `0600` 权限。`PC_HEAP_DUMP_MB` 控制本地自动 heap profile（默认 1024 MB，`0` 关闭），不会自动开放下载端点。
+- 环境变量闸门是 SEC-01 完整鉴权前的纵深防御，不把 loopback 等同于身份。后续 D 类路由接入管理级 capability 后仍保留 opt-in，除非另有安全评审。
+
+这些开关不改变配置格式、数据目录结构或 SQLite schema，因此不新增 upgrade step。
+
 ## 修改指南
 
 ### 要添加新的 API 端点
@@ -385,7 +403,7 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 
 ### 要修改 SSE 流式推送
 - `SendMessage()` 中的 `c.Stream()` 回调 (handler.go 约 1450 行)
-- `chunkToEvent()` 映射逻辑 (handler.go:1495)
+- `chunkToEvent()` 映射逻辑 (`stream_adapter.go`)
 - 前端 `chat.ts` `appendStreamEvent()` 处理
 
 ### 要修改消息持久化格式

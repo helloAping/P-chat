@@ -1321,11 +1321,17 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 // original config intact instead of producing a truncated/
 // unparseable file.
 func writeConfigJSON(path string, cfg *Config) error {
+	return writeJSONAtomic(path, cfg)
+}
+
+// writeJSONAtomic 以原子替换方式写入任意 JSON 值。writeJSONAtomic writes
+// any JSON value with the same crash-safe replacement used for full configs.
+func writeJSONAtomic(path string, value any) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}

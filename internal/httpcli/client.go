@@ -912,10 +912,18 @@ func (c *Client) SubmitQuestionResponse(ctx context.Context, sessionID string, a
 
 // SubmitConfirmResponse 提交工具执行确认。SubmitConfirmResponse submits a tool execution confirmation.
 func (c *Client) SubmitConfirmResponse(ctx context.Context, sessionID string, approved bool, action string) error {
+	return c.SubmitConfirmResponseWithID(ctx, sessionID, approved, action, "")
+}
+
+// SubmitConfirmResponseWithID submits a confirmation bound to one exact
+// pending request. An empty confirmID keeps compatibility with servers and
+// clients that only ever expose one pending confirmation per session.
+func (c *Client) SubmitConfirmResponseWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error {
 	body := struct {
-		Approved bool   `json:"approved"`
-		Action   string `json:"action,omitempty"`
-	}{Approved: approved, Action: action}
+		ConfirmID string `json:"confirm_id,omitempty"`
+		Approved  bool   `json:"approved"`
+		Action    string `json:"action,omitempty"`
+	}{ConfirmID: confirmID, Approved: approved, Action: action}
 	return c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/confirm-response", body, nil)
 }
 

@@ -120,6 +120,10 @@ async function saveConfig() {
 }
 
 async function onDownload(kind: 'heap' | 'goroutine') {
+  if (!config.value?.snapshot_enabled) {
+    message.warning('诊断快照默认关闭；请在可信本机启动前设置 PC_DIAGNOSTICS_SNAPSHOTS=1')
+    return
+  }
   downloading.value = kind
   try {
     downloadDiagnosticsSnapshot(kind)
@@ -175,7 +179,7 @@ onBeforeUnmount(() => {
           size="small"
           type="primary"
           :loading="downloading === 'heap'"
-          :disabled="downloading !== null"
+          :disabled="downloading !== null || !config?.snapshot_enabled"
           @click="onDownload('heap')"
         >
           拉取堆快照 (.prof)
@@ -183,13 +187,18 @@ onBeforeUnmount(() => {
         <NButton
           size="small"
           :loading="downloading === 'goroutine'"
-          :disabled="downloading !== null"
+          :disabled="downloading !== null || !config?.snapshot_enabled"
           @click="onDownload('goroutine')"
         >
           拉取 goroutine 快照 (.txt)
         </NButton>
         <span class="snapshot-hint">
-          堆快照可用 <code>go tool pprof -top &lt;文件&gt;</code> 查看内存占用最高的方法
+          <template v-if="config?.snapshot_enabled">
+            仅允许本机下载；堆快照可用 <code>go tool pprof -top &lt;文件&gt;</code> 分析
+          </template>
+          <template v-else>
+            默认关闭。仅在可信本机启动前设置 <code>PC_DIAGNOSTICS_SNAPSHOTS=1</code>；快照可能包含敏感运行时信息。
+          </template>
         </span>
       </div>
     </div>
@@ -200,6 +209,9 @@ onBeforeUnmount(() => {
         <span class="card-title">监控配置</span>
         <NTag v-if="config" size="small" :type="config.pprof_enabled ? 'success' : 'default'">
           pprof {{ config.pprof_enabled ? '已开启' : '已关闭 (PC_PPROF=1 开启)' }}
+        </NTag>
+        <NTag v-if="config" size="small" :type="config.snapshot_enabled ? 'warning' : 'default'">
+          快照下载 {{ config.snapshot_enabled ? '已显式开启' : '默认关闭' }}
         </NTag>
       </div>
 

@@ -191,7 +191,7 @@ type MessagePart =
           → 工具派发: goroutine + per-tool eventCh (cap 64)
               → forwarder → partsAcc.update() → main ch
               → tool handler → subagent           (subagent/*)
-          → chunkToEvent(ev) → type mapping      (server/handler.go)
+          → chunkToEvent(ev) → type mapping      (server/stream_adapter.go)
           → SSE: "data: {...}\n\n"               (server/handler.go)
       → 前端 appendStreamEvent()                  (frontend/stores/chat.ts)
         → 路由到 parts (text/thinking/tool/sub_agent)
@@ -201,7 +201,7 @@ type MessagePart =
 
 ### 1.3 SSE 协议
 
-Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（`internal/server/handler.go:1495-1613` `chunkToEvent()`）：
+Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（`internal/server/stream_adapter.go` `chunkToEvent()`）：
 
 | `type` | 触发 | 关键字段 |
 | --- | --- | --- |
@@ -209,6 +209,7 @@ Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（
 | `thinking` | reasoning delta | `thinking` |
 | `skill` | Skill 加载生命周期 | `skill_name`, `skill_status`, `skill_scope`, `skill_dependencies`, `skill_error` |
 | `tool` | 工具调用生命周期 | `tool_name`, `tool_status`, `tool_result`, `tool_args`, `tool_elapsed` |
+| `stream_reset` | LLM attempt 失败后即将重试 | 无正文；客户端必须作废当前 attempt 的 text/thinking，不能和新 attempt 拼接 |
 | `phase` | sub-agent lifecycle / system status | `phase`, `sub_agent_status` |
 | `error` | LLM/transport error | `error`, `error_kind` |
 | `done` | 流结束 | `tokens_in`, `tokens_out`, `elapsed` |
@@ -373,7 +374,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | parts 累加器 | `internal/agent/parts.go` |
 | 流式事件分发 | `frontend/src/stores/chat.ts:828-1103` `appendStreamEvent()` |
 | 共享 markdown 渲染缓存 | `frontend/src/utils/markdownCache.ts` |
-| 后端 SSE 事件映射 | `internal/server/handler.go:1495-1613` `chunkToEvent()` |
+| 后端 SSE 事件映射 | `internal/server/stream_adapter.go` `chunkToEvent()` |
 | 工作模式 `work_mode` 配置 | `internal/config/config.go` `WorkModeConfig` |
 | `work_mode` 提示词段 | `internal/agent/prompt.go` `buildWorkModeBlock()` |
 | `work_mode` per-session 覆盖 | `internal/server/handler.go` `sessionMeta.WorkMode` |
